@@ -1,0 +1,7 @@
+# Build artifacts
+tests/tokenizer_test
+tests/tokenizer_ext_test
+libshellsplit.a
+
+# Object files
+*.o

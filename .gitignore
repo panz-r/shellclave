@@ -1,0 +1,3 @@
+# Fuzzer-generated input corpora
+/shellgate/fuzz/corpus/
+/shellsplit/fuzz/corpus/
