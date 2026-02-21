@@ -5,3 +5,5 @@ libshellsplit.a
 
 # Object files
 *.o
+.cache
+compile_commands.json

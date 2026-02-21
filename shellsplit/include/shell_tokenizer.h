@@ -15,6 +15,7 @@
  * - Subshells and command substitution
  * - Variables: $VAR, ${VAR}, $1, $#, $?, $$
  * - Globbing: *, ?, [abc]
+ * - Arithmetic expansion: $((expr))
  */
 
 /**
@@ -54,29 +55,37 @@ typedef struct {
     const char* start;     // Pointer to start of token in original string
     size_t length;         // Length of token
     size_t position;       // Position in original string
+    bool is_quoted;        // True if token is quoted
+    bool is_escaped;       // True if token contains escapes
 } shell_token_t;
 
 /**
  * Command structure (group of tokens representing one command)
  */
 typedef struct {
-    shell_token_t* tokens; // Array of tokens
+    shell_token_t* tokens;  // Array of tokens
     size_t token_count;    // Number of tokens
     size_t start_pos;      // Start position in original string
     size_t end_pos;        // End position in original string
+    bool has_variables;     // Contains variables ($VAR, ${VAR}, etc.)
+    bool has_globs;        // Contains glob patterns (*, ?, [abc])
+    bool has_subshells;    // Contains subshells ($(cmd), `cmd`)
+    bool has_arithmetic;   // Contains arithmetic expansion ($((expr))
 } shell_command_t;
 
 /**
  * Tokenizer state
  */
 typedef struct {
-    const char* input;     // Input string
-    size_t position;       // Current position
-    size_t length;         // Total length
-    bool in_quotes;        // Currently in quotes
-    bool in_subshell;      // Currently in subshell
-    char quote_char;       // Current quote character
-    int paren_depth;       // Parentheses depth
+    const char* input;       // Input string
+    size_t position;         // Current position
+    size_t length;           // Total length
+    bool in_quotes;          // Currently in quotes
+    bool in_subshell;        // Currently in subshell
+    char quote_char;         // Current quote character
+    int paren_depth;        // Parentheses depth
+    int brace_depth;        // Brace depth for ${VAR}
+    bool in_arithmetic;      // Currently in arithmetic expansion
 } shell_tokenizer_state_t;
 
 /**
@@ -103,5 +112,10 @@ void shell_free_commands(shell_command_t* commands, size_t command_count);
  * Get human-readable token type name
  */
 const char* shell_token_type_name(token_type_t type);
+
+/**
+ * Check if command has shell scripting features
+ */
+bool shell_has_features(shell_command_t* command);
 
 #endif // SHELL_TOKENIZER_H

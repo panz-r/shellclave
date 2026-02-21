@@ -2,7 +2,7 @@
 # ShellSplit - Shell Command Tokenizer and Processor
 # ============================================================================
 # A fast shell command tokenizer that extracts clean commands for DFA validation.
-# Supports pipeline splitting, redirection, variables, and shell features.
+# Supports pipeline splitting, redirection, variables, globs, subshells, arithmetic.
 # ============================================================================
 
 CC = gcc
@@ -13,31 +13,35 @@ SRC_DIR = src
 INC_DIR = include
 TESTS_DIR = tests
 
-# Default target: build tokenizer_test (basic)
+# Default target: build tokenizer_test
 all: $(TESTS_DIR)/tokenizer_test
 
-# Build tokenizer test (basic tokenizer)
+# Generate compile_commands.json for IDE support
+compile_commands.json:
+	@echo '[{' > $@
+	@echo '  "directory": "$(PWD)",' >> $@
+	@echo '  "command": "$(CC) $(CFLAGS) -c -o $(SRC_DIR)/shell_tokenizer.o $(SRC_DIR)/shell_tokenizer.c",' >> $@
+	@echo '  "file": "$(SRC_DIR)/shell_tokenizer.c"' >> $@
+	@echo '},' >> $@
+	@echo '  {' >> $@
+	@echo '  "directory": "$(PWD)",' >> $@
+	@echo '  "command": "$(CC) $(CFLAGS) -c -o $(SRC_DIR)/shell_processor.o $(SRC_DIR)/shell_processor.c",' >> $@
+	@echo '  "file": "$(SRC_DIR)/shell_processor.c"' >> $@
+	@echo '},' >> $@
+	@echo '  {' >> $@
+	@echo '  "directory": "$(PWD)",' >> $@
+	@echo '  "command": "$(CC) $(CFLAGS) -c -o $(SRC_DIR)/shell_transform.o $(SRC_DIR)/shell_transform.c",' >> $@
+	@echo '  "file": "$(SRC_DIR)/shell_transform.c"' >> $@
+	@echo '}]' >> $@
+
+# Build unified tokenizer test (all tests in one)
 $(TESTS_DIR)/tokenizer_test: $(TESTS_DIR)/tokenizer_test.c \
 		$(SRC_DIR)/shell_tokenizer.c $(SRC_DIR)/shell_processor.c \
-		$(INC_DIR)/shell_tokenizer.h $(INC_DIR)/shell_processor.h
-	$(CC) $(CFLAGS) -o $@ $(TESTS_DIR)/tokenizer_test.c \
-		$(SRC_DIR)/shell_tokenizer.c $(SRC_DIR)/shell_processor.c $(LDFLAGS)
-
-# Build extended tokenizer test
-$(TESTS_DIR)/tokenizer_ext_test: $(TESTS_DIR)/tokenizer_ext_test.c \
-		$(SRC_DIR)/shell_tokenizer.c $(SRC_DIR)/shell_tokenizer_ext.c \
-		$(INC_DIR)/shell_tokenizer.h $(INC_DIR)/shell_tokenizer_ext.h
-	$(CC) $(CFLAGS) -o $@ $(TESTS_DIR)/tokenizer_ext_test.c \
-		$(SRC_DIR)/shell_tokenizer.c $(SRC_DIR)/shell_tokenizer_ext.c $(LDFLAGS)
-
-# Build transform test
-$(TESTS_DIR)/transform_test: $(TESTS_DIR)/transform_test.c \
-		$(SRC_DIR)/shell_tokenizer.c $(SRC_DIR)/shell_tokenizer_ext.c \
 		$(SRC_DIR)/shell_transform.c \
-		$(INC_DIR)/shell_tokenizer.h $(INC_DIR)/shell_tokenizer_ext.h \
+		$(INC_DIR)/shell_tokenizer.h $(INC_DIR)/shell_processor.h \
 		$(INC_DIR)/shell_transform.h
-	$(CC) $(CFLAGS) -o $@ $(TESTS_DIR)/transform_test.c \
-		$(SRC_DIR)/shell_tokenizer.c $(SRC_DIR)/shell_tokenizer_ext.c \
+	$(CC) $(CFLAGS) -o $@ $(TESTS_DIR)/tokenizer_test.c \
+		$(SRC_DIR)/shell_tokenizer.c $(SRC_DIR)/shell_processor.c \
 		$(SRC_DIR)/shell_transform.c $(LDFLAGS)
 
 # Build library
@@ -49,19 +53,15 @@ libshellsplit.a: $(SRC_DIR)/shell_tokenizer.c $(SRC_DIR)/shell_processor.c
 
 # Clean
 clean:
-	rm -f $(TESTS_DIR)/tokenizer_test $(TESTS_DIR)/tokenizer_ext_test $(TESTS_DIR)/transform_test
+	rm -f $(TESTS_DIR)/tokenizer_test
 	rm -f $(SRC_DIR)/*.o
 	rm -f libshellsplit.a
+	rm -f compile_commands.json
 
 # Test
-test: $(TESTS_DIR)/tokenizer_test $(TESTS_DIR)/transform_test
-	@echo "Running shell tokenizer tests..."
-	@./$(TESTS_DIR)/tokenizer_test "cat xx | less -G > rsr" > /dev/null 2>&1 && echo "  [PASS] Basic tokenization" || echo "  [FAIL] Basic tokenization"
-	@./$(TESTS_DIR)/tokenizer_test "cat file.txt | grep pattern | sort | uniq" > /dev/null 2>&1 && echo "  [PASS] Pipeline splitting" || echo "  [FAIL] Pipeline splitting"
-	@./$(TESTS_DIR)/tokenizer_test "grep \$$PATTERN *.log" > /dev/null 2>&1 && echo "  [PASS] Variable handling" || echo "  [FAIL] Variable handling"
-	@echo ""
-	@echo "Running transform tests..."
-	@./$(TESTS_DIR)/transform_test > /dev/null 2>&1 && echo "  [PASS] Transform pass" || echo "  [FAIL] Transform pass"
+test: $(TESTS_DIR)/tokenizer_test compile_commands.json
+	@echo "Running unified tokenizer tests..."
+	@./$(TESTS_DIR)/tokenizer_test && echo "  [PASS] All tests" || echo "  [FAIL] Some tests"
 	@echo "Done."
 
 .PHONY: all clean test

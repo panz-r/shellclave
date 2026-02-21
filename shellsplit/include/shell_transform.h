@@ -1,7 +1,7 @@
 #ifndef SHELL_TRANSFORM_H
 #define SHELL_TRANSFORM_H
 
-#include "shell_tokenizer_ext.h"
+#include "shell_tokenizer.h"
 #include <stdbool.h>
 
 /**
@@ -58,7 +58,7 @@ typedef struct {
  * Converts shell constructs to what they semantically represent
  */
 bool shell_transform_command(
-    extended_shell_command_t* extended_cmd,
+    shell_command_t* cmd,
     transformed_command_t** transformed_cmd
 );
 
