@@ -1,7 +1,7 @@
 #ifndef SHELL_PROCESSOR_H
 #define SHELL_PROCESSOR_H
 
-#include "shell_tokenizer.h"
+#include "shell_tokenizer_full.h"
 #include <stdbool.h>
 #include <stddef.h>
 

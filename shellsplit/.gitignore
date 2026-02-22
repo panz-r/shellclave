@@ -1,6 +1,7 @@
 # Build artifacts
 tests/tokenizer_test
 tests/tokenizer_ext_test
+tests/fast_parser_test
 libshellsplit.a
 
 # Object files

@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include "shell_transform.h"
+#include "shell_tokenizer_full.h"
 #include <stdlib.h>
 #include <string.h>
 

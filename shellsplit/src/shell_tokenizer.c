@@ -1,838 +1,502 @@
 #include "shell_tokenizer.h"
 #include <ctype.h>
-#include <stdlib.h>
 #include <string.h>
 
-// Initialize tokenizer state
-void shell_tokenizer_init(shell_tokenizer_state_t* state, const char* input) {
-    if (state == NULL || input == NULL) return;
+/* ============================================================
+ * FAST PARSER IMPLEMENTATION
+ * ============================================================ */
 
-    state->input = input;
-    state->position = 0;
-    state->length = strlen(input);
-    state->in_quotes = false;
-    state->in_subshell = false;
-    state->quote_char = '\0';
-    state->paren_depth = 0;
-    state->brace_depth = 0;
-    state->in_arithmetic = false;
+/**
+ * Check if character is a shell separator
+ */
+static inline bool is_separator(char c) {
+    return c == '|' || c == ';' || c == '&' || c == '<' || c == '>' || c == '\n' || c == '\r';
 }
 
-// Check if character is a shell operator
-static bool is_shell_operator(char c) {
-    return c == '|' || c == '>' || c == '<' || c == '&' ||
-           c == ';' || c == '(' || c == ')' || c == '$' || c == '`' || c == '[';
+/**
+ * Check if at position we have a specific operator
+ */
+static inline bool match_operator(const char* s, size_t len, const char* op) {
+    size_t op_len = strlen(op);
+    if (len < op_len) return false;
+    return strncmp(s, op, op_len) == 0;
 }
 
-// Skip whitespace
-static void skip_whitespace(shell_tokenizer_state_t* state) {
-    while (state->position < state->length && isspace(state->input[state->position])) {
-        state->position++;
-    }
-}
-
-// Handle quotes and escaping
-static bool handle_quotes(shell_tokenizer_state_t* state) {
-    char c = state->input[state->position];
-
-    if (c == '"' || c == '\'') {
-        if (!state->in_quotes) {
-            state->in_quotes = true;
-            state->quote_char = c;
-            state->position++;
-            return true;
-        } else if (c == state->quote_char) {
-            state->in_quotes = false;
-            state->quote_char = '\0';
-            state->position++;
-            return true;
-        }
-    }
-
-    // Handle backslash escaping
-    if (c == '\\' && state->position + 1 < state->length) {
-        state->position += 2;
-        return true;
-    }
-
-    return false;
-}
-
-// Parse variable token
-static bool parse_variable(shell_tokenizer_state_t* state, shell_token_t* token) {
-    if (state->position >= state->length) return false;
-
-    size_t start = state->position;
-    bool is_quoted = state->in_quotes;
-
-    if (state->input[state->position] != '$') {
-        return false;
-    }
-    state->position++;
-
-    // Check for ${VAR} format
-    if (state->position < state->length && state->input[state->position] == '{') {
-        state->position++;
-        state->brace_depth++;
-
-        while (state->position < state->length) {
-            char c = state->input[state->position];
-            if (c == '}') {
-                state->position++;
-                state->brace_depth--;
-                token->type = is_quoted ? TOKEN_VARIABLE_QUOTED : TOKEN_VARIABLE;
-                token->start = state->input + start;
-                token->length = state->position - start;
-                token->position = start;
-                token->is_quoted = is_quoted;
-                token->is_escaped = false;
-                return true;
-            }
-            if (!isalnum(c) && c != '_') {
-                return false;
-            }
-            state->position++;
-        }
-        return false;
-    }
-
-    // Check for special variables ($1, $#, $?, $$)
-    if (state->position < state->length) {
-        char next = state->input[state->position];
-        if (isdigit(next) || next == '#' || next == '?' || next == '$') {
-            state->position++;
-            token->type = is_quoted ? TOKEN_VARIABLE_QUOTED : TOKEN_SPECIAL_VAR;
-            token->start = state->input + start;
-            token->length = state->position - start;
-            token->position = start;
-            token->is_quoted = is_quoted;
-            token->is_escaped = false;
-            return true;
-        }
-    }
-
-    // Simple $VAR format
-    while (state->position < state->length) {
-        char c = state->input[state->position];
-        if (!isalnum(c) && c != '_') {
-            break;
-        }
-        state->position++;
-    }
-
-    if (state->position > start + 1) {
-        token->type = is_quoted ? TOKEN_VARIABLE_QUOTED : TOKEN_VARIABLE;
-        token->start = state->input + start;
-        token->length = state->position - start;
-        token->position = start;
-        token->is_quoted = is_quoted;
-        token->is_escaped = false;
-        return true;
-    }
-
-    return false;
-}
-
-// Parse subshell token
-static bool parse_subshell(shell_tokenizer_state_t* state, shell_token_t* token) {
-    if (state->position >= state->length) return false;
-
-    size_t start = state->position;
-    bool is_quoted = state->in_quotes;
-
-    // Check for $(command) format
-    if (state->input[state->position] == '$' &&
-        state->position + 1 < state->length &&
-        state->input[state->position + 1] == '(') {
-
-        state->position += 2;
-        state->paren_depth++;
-        state->in_subshell = true;
-
-        int depth = 1;
-        while (state->position < state->length && depth > 0) {
-            char c = state->input[state->position];
-            if (c == '(') depth++;
-            if (c == ')') depth--;
-            if (depth > 0) state->position++;
-        }
-
-        if (depth == 0) {
-            token->type = TOKEN_SUBSHELL;
-            token->start = state->input + start;
-            token->length = state->position - start + 1;
-            token->position = start;
-            token->is_quoted = is_quoted;
-            token->is_escaped = false;
-            state->in_subshell = false;
-            state->position++;
-            return true;
-        }
-        return false;
-    }
-
-    // Check for `command` format (legacy)
-    if (state->input[state->position] == '`') {
-        state->position++;
-        state->in_subshell = true;
-
-        while (state->position < state->length) {
-            char c = state->input[state->position];
-            if (c == '`') {
-                state->position++;
-                token->type = TOKEN_SUBSHELL;
-                token->start = state->input + start;
-                token->length = state->position - start;
-                token->position = start;
-                token->is_quoted = is_quoted;
-                token->is_escaped = false;
-                state->in_subshell = false;
-                return true;
-            }
-            state->position++;
-        }
-        return false;
-    }
-
-    return false;
-}
-
-// Check if token contains glob patterns
-static bool is_glob_pattern(const char* str, size_t length) {
-    for (size_t i = 0; i < length; i++) {
-        char c = str[i];
-        if (c == '*' || c == '?' || c == '[') {
-            return true;
-        }
-    }
-    return false;
-}
-
-// Recursively detect features inside a subshell or other complex token
-// Returns true if any features were found
-static bool detect_features_recursive(const char* content, size_t length,
-                                      bool* has_variables, bool* has_globs,
-                                      bool* has_subshells, bool* has_arithmetic) {
-    if (!content || length == 0) return false;
+/**
+ * Detect features in a subcommand range
+ */
+static void detect_features(const char* cmd, uint32_t start, uint32_t len, uint16_t* features) {
+    const char* p = cmd + start;
+    uint32_t i = 0;
+    bool in_single_quotes = false;
+    bool in_double_quotes = false;
+    int arith_depth = 0;
     
-    shell_tokenizer_state_t state;
-    shell_tokenizer_init(&state, content);
-    
-    bool found_features = false;
-    shell_token_t token;
-    
-    while (shell_tokenizer_next(&state, &token)) {
-        switch (token.type) {
-            case TOKEN_VARIABLE:
-            case TOKEN_VARIABLE_QUOTED:
-            case TOKEN_SPECIAL_VAR:
-                if (has_variables) *has_variables = true;
-                found_features = true;
-                break;
-            case TOKEN_GLOB:
-                if (has_globs) *has_globs = true;
-                found_features = true;
-                break;
-            case TOKEN_SUBSHELL:
-                if (has_subshells) *has_subshells = true;
-                found_features = true;
-                // Recursively check inside the subshell
-                if (token.length > 2) {
-                    const char* inner = token.start + 2;  // Skip $(
-                    size_t inner_len = token.length - 3;   // Exclude $( and )
-                    bool inner_has_vars = false, inner_has_globs = false;
-                    bool inner_has_subs = false, inner_has_arith = false;
-                    detect_features_recursive(inner, inner_len,
-                                            &inner_has_vars, &inner_has_globs,
-                                            &inner_has_subs, &inner_has_arith);
-                    if (has_variables && inner_has_vars) *has_variables = true;
-                    if (has_globs && inner_has_globs) *has_globs = true;
-                    if (has_subshells && inner_has_subs) *has_subshells = true;
-                    if (has_arithmetic && inner_has_arith) *has_arithmetic = true;
-                }
-                break;
-            case TOKEN_ARITHMETIC:
-                if (has_arithmetic) *has_arithmetic = true;
-                found_features = true;
-                break;
-            default:
-                break;
-        }
-    }
-    
-    return found_features;
-}
-
-// Get next token
-bool shell_tokenizer_next(shell_tokenizer_state_t* state, shell_token_t* token) {
-    if (state == NULL || token == NULL || state->position >= state->length) {
-        token->type = TOKEN_END;
-        return false;
-    }
-
-    skip_whitespace(state);
-
-    if (state->position >= state->length) {
-        token->type = TOKEN_END;
-        return false;
-    }
-
-    size_t start_pos = state->position;
-    char current_char = state->input[start_pos];
-
-    // Handle quotes first
-    if (handle_quotes(state)) {
-        if (state->in_quotes) {
-            while (state->position < state->length) {
-                if (handle_quotes(state)) {
-                    if (!state->in_quotes) break;
-                } else {
-                    state->position++;
-                }
-            }
-
-            // Check if this is a variable inside quotes
-            const char* token_start = state->input + start_pos + 1;
-            size_t token_length = (state->position - start_pos) - 2;
-
-            if (token_length > 0 && token_start[0] == '$') {
-                shell_tokenizer_state_t temp_state = *state;
-                temp_state.position = start_pos + 1;
-                temp_state.in_quotes = true;
-
-                shell_token_t temp_token;
-                if (parse_variable(&temp_state, &temp_token)) {
-                    token->type = TOKEN_VARIABLE_QUOTED;
-                    token->start = state->input + start_pos;
-                    token->length = state->position - start_pos;
-                    token->position = start_pos;
-                    token->is_quoted = true;
-                    token->is_escaped = false;
-                    return true;
-                }
-            }
-
-            token->type = TOKEN_ARGUMENT;
-            token->start = state->input + start_pos;
-            token->length = state->position - start_pos;
-            token->position = start_pos;
-            token->is_quoted = true;
-            token->is_escaped = false;
-            return true;
-        }
-        current_char = state->input[state->position];
-    }
-
-    // Check for $(( arithmetic expansion first
-    if (current_char == '$' && !state->in_quotes) {
-        if (state->position + 2 < state->length &&
-            state->input[state->position + 1] == '(' && 
-            state->input[state->position + 2] == '(') {
-            size_t start = state->position;
-            state->position += 3;
-            int depth = 2;
-            while (state->position < state->length && depth > 0) {
-                char c = state->input[state->position];
-                if (c == '(') depth++;
-                if (c == ')') depth--;
-                state->position++;
-            }
-            if (depth == 0) {
-                token->type = TOKEN_ARITHMETIC;
-                token->start = state->input + start;
-                token->length = state->position - start;
-                token->position = start;
-                token->is_quoted = false;
-                token->is_escaped = false;
-                return true;
-            }
-            state->position = start;
+    while (i < len) {
+        char c = p[i];
+        
+        // Handle single quotes - no expansion inside
+        if (c == '\'') {
+            in_single_quotes = !in_single_quotes;
+            i++;
+            continue;
         }
         
-        if (parse_variable(state, token)) {
-            return true;
+        if (in_single_quotes) {
+            i++;
+            continue;
         }
-        state->position = start_pos;
-    }
-
-    // Check for subshells
-    if ((current_char == '$' || current_char == '`') && !state->in_quotes) {
-        if (parse_subshell(state, token)) {
-            return true;
+        
+        // Handle double quotes - variables expand, globs don't
+        if (c == '"') {
+            in_double_quotes = !in_double_quotes;
+            i++;
+            continue;
         }
-        current_char = state->input[state->position];
-    }
-
-    // Check for shell operators
-    if (!state->in_quotes && is_shell_operator(current_char)) {
-        if (state->position + 1 < state->length) {
-            char next_char = state->input[state->position + 1];
-
-            if (current_char == '|' && next_char == '|') {
-                token->type = TOKEN_OR;
-                token->start = state->input + state->position;
-                token->length = 2;
-                token->position = state->position;
-                token->is_quoted = false;
-                token->is_escaped = false;
-                state->position += 2;
-                return true;
-            } else if (current_char == '&' && next_char == '&') {
-                token->type = TOKEN_AND;
-                token->start = state->input + state->position;
-                token->length = 2;
-                token->position = state->position;
-                token->is_quoted = false;
-                token->is_escaped = false;
-                state->position += 2;
-                return true;
-            } else if (current_char == '>' && next_char == '>') {
-                token->type = TOKEN_REDIRECT_APPEND;
-                token->start = state->input + state->position;
-                token->length = 2;
-                token->position = state->position;
-                token->is_quoted = false;
-                token->is_escaped = false;
-                state->position += 2;
-                
-                // Check for >>&N (append and redirect)
-                if (state->position < state->length && state->input[state->position] == '&') {
-                    token->length = 3;
-                    state->position++;
-                    if (state->position < state->length &&
-                        (state->input[state->position] == '1' ||
-                         state->input[state->position] == '2')) {
-                        token->length = 4;
-                        state->position++;
-                    }
-                }
-                return true;
-            } else if (current_char == '2' && next_char == '>') {
-                token->type = TOKEN_REDIRECT_ERR;
-                token->start = state->input + state->position;
-                token->length = 2;
-                token->position = state->position;
-                token->is_quoted = false;
-                token->is_escaped = false;
-                state->position += 2;
-                
-                if (state->position < state->length && state->input[state->position] == '&') {
-                    token->length = 3;
-                    state->position++;
-                    if (state->position < state->length &&
-                        (state->input[state->position] == '1' ||
-                         state->input[state->position] == '2')) {
-                        token->length = 4;
-                        state->position++;
-                    }
-                }
-                return true;
-            } else if (current_char == '>' && next_char == '&') {
-                token->type = TOKEN_REDIRECT_ERR;
-                token->start = state->input + state->position;
-                token->length = 2;
-                token->position = state->position;
-                token->is_quoted = false;
-                token->is_escaped = false;
-                state->position += 2;
-                if (state->position < state->length &&
-                    (state->input[state->position] == '1' ||
-                     state->input[state->position] == '2')) {
-                    token->length = 3;
-                    state->position++;
-                }
-                return true;
-            }
+        
+        // Skip escapes
+        if (c == '\\' && i + 1 < len) {
+            i += 2;
+            continue;
         }
-
-        switch (current_char) {
-            case '|':
-                token->type = TOKEN_PIPE;
-                break;
-            case '>':
-                token->type = TOKEN_REDIRECT_OUT;
-                break;
-            case '<':
-                token->type = TOKEN_REDIRECT_IN;
-                // Check for <&N (input duplication)
-                if (state->position + 1 < state->length && state->input[state->position + 1] == '&') {
-                    state->position++;
-                    if (state->position + 1 < state->length &&
-                        (state->input[state->position + 1] == '1' ||
-                         state->input[state->position + 1] == '2')) {
-                        token->length = 3;
-                        state->position++;
-                    } else {
-                        token->length = 2;
-                    }
-                }
-                break;
-            case '&':
-                token->type = TOKEN_AND;
-                break;
-            case ';':
-                token->type = TOKEN_SEMICOLON;
-                break;
-            case '(':
-                token->type = TOKEN_SUBSHELL_START;
-                state->paren_depth++;
-                state->in_subshell = true;
-                break;
-            case ')':
-                token->type = TOKEN_SUBSHELL_END;
-                if (state->paren_depth > 0) state->paren_depth--;
-                if (state->paren_depth == 0) state->in_subshell = false;
-                break;
-            case '[':
-                if (state->position + 1 < state->length) {
-                    size_t bracket_start = state->position;
-                    state->position++;
-                    if (state->position < state->length && 
-                        (state->input[state->position] == '!' || 
-                         state->input[state->position] == '^')) {
-                        state->position++;
-                    }
-                    while (state->position < state->length) {
-                        char c = state->input[state->position];
-                        if (c == ']') {
-                            state->position++;
-                            token->type = TOKEN_GLOB;
-                            token->start = state->input + bracket_start;
-                            token->length = state->position - bracket_start;
-                            token->position = bracket_start;
-                            token->is_quoted = false;
-                            token->is_escaped = false;
-                            return true;
-                        }
-                        if (c == '\\' && state->position + 1 < state->length) {
-                            state->position += 2;
+        
+        // Track arithmetic depth
+        if (c == '$' && i + 1 < len && p[i + 1] == '(' && i + 2 < len && p[i + 2] == '(') {
+            arith_depth++;
+            *features |= SHELL_FEAT_ARITH;
+            i += 3;
+            continue;
+        }
+        if (arith_depth > 0 && c == ')') {
+            arith_depth--;
+            i++;
+            continue;
+        }
+        
+        // Check for features
+        switch (c) {
+            case '$':
+                // Variables expand in double quotes
+                if (i + 1 < len) {
+                    char next = p[i + 1];
+                    if (next == '(') {
+                        if (i + 2 < len && p[i + 2] == '(') {
+                            // $((...)) - arithmetic with optional variables
+                            *features |= SHELL_FEAT_ARITH;
+                            // Also mark as having vars if there are any word characters after ((
+                            if (i + 3 < len) {
+                                char after = p[i + 3];
+                                if (isalpha(after) || after == '_') {
+                                    *features |= SHELL_FEAT_VARS;
+                                }
+                            }
+                            i += 3;
                             continue;
                         }
-                        if (isspace(c) || is_shell_operator(c)) {
-                            break;
-                        }
-                        state->position++;
+                        *features |= SHELL_FEAT_SUBSHELL;
+                    } else if (next == '`') {
+                        *features |= SHELL_FEAT_SUBSHELL;
+                    } else if (next == '{') {
+                        *features |= SHELL_FEAT_VARS;
+                    } else if (isdigit(next) || next == '#' || next == '?' || next == '$') {
+                        *features |= SHELL_FEAT_VARS;
+                    } else if (isalpha(next) || next == '_') {
+                        *features |= SHELL_FEAT_VARS;
                     }
                 }
-                token->type = TOKEN_ARGUMENT;
                 break;
-            case '1':
-            case '2':
-            case '3':
-            case '4':
-            case '5':
-            case '6':
-            case '7':
-            case '8':
-            case '9':
-                if (state->position + 1 < state->length) {
-                    size_t check_pos = state->position + 1;
-                    while (check_pos < state->length && 
-                           isspace(state->input[check_pos])) {
-                        check_pos++;
-                    }
-                    if (check_pos < state->length) {
-                        char after_num = state->input[check_pos];
-                        if (after_num == '>' || after_num == '<') {
-                            if (after_num == '>') {
-                                token->type = TOKEN_REDIRECT_ERR;
-                            } else {
-                                token->type = TOKEN_REDIRECT_IN;
-                            }
-                            token->start = state->input + state->position;
-                            token->length = check_pos - state->position + 1;
-                            token->position = state->position;
-                            token->is_quoted = false;
-                            token->is_escaped = false;
-                            state->position = check_pos + 1;
-                            return true;
-                        }
-                    }
+            case '`':
+                *features |= SHELL_FEAT_SUBSHELL;
+                break;
+            case '*':
+            case '?':
+                // Globs do NOT expand in double quotes
+                if (!in_double_quotes) {
+                    *features |= SHELL_FEAT_GLOBS;
                 }
-                token->type = TOKEN_ARGUMENT;
+                break;
+            case '[':
+                // Globs do NOT expand in double quotes, and not in heredoc context
+                if (!in_double_quotes && !(i > 0 && p[i - 1] == '<')) {
+                    *features |= SHELL_FEAT_GLOBS;
+                }
                 break;
             default:
-                token->type = TOKEN_ARGUMENT;
                 break;
         }
-
-        token->start = state->input + state->position;
-        token->length = 1;
-        token->position = state->position;
-        token->is_quoted = false;
-        token->is_escaped = false;
-        state->position++;
-        return true;
+        
+        i++;
     }
+}
 
-    // Check for digit followed by redirect (e.g., "2>&1" or "2 >&1" with space)
-    if (!state->in_quotes && isdigit(current_char)) {
-        size_t check_pos = state->position + 1;
-        while (check_pos < state->length && isspace(state->input[check_pos])) {
-            check_pos++;
-        }
-        if (check_pos < state->length) {
-            char after_digit = state->input[check_pos];
-            if (after_digit == '>') {
-                token->type = TOKEN_REDIRECT_ERR;
-                token->start = state->input + state->position;
-                token->position = state->position;
-                token->is_quoted = false;
-                token->is_escaped = false;
-                
-                // Check for >&N or >>&N patterns
-                if (check_pos + 1 < state->length && state->input[check_pos + 1] == '&') {
-                    size_t fd_pos = check_pos + 2;
-                    if (fd_pos < state->length && (state->input[fd_pos] == '1' || state->input[fd_pos] == '2')) {
-                        token->length = fd_pos + 1 - state->position;
-                        state->position = fd_pos + 1;
-                    } else {
-                        token->length = check_pos + 1 - state->position;
-                        state->position = check_pos + 1;
-                    }
-                } else {
-                    token->length = check_pos + 1 - state->position;
-                    state->position = check_pos + 1;
-                }
-                return true;
-            } else if (after_digit == '<') {
-                token->type = TOKEN_REDIRECT_IN;
-                token->start = state->input + state->position;
-                token->length = check_pos + 1 - state->position;
-                token->position = state->position;
-                token->is_quoted = false;
-                token->is_escaped = false;
-                state->position = check_pos + 1;
-                return true;
-            }
-        }
+/**
+ * Fast shell command parser - single pass, zero-copy, bounded
+ */
+shell_error_t shell_parse_fast(
+    const char* cmd,
+    size_t cmd_len,
+    const shell_limits_t* limits,
+    shell_parse_result_t* result
+) {
+    // Validate inputs
+    if (!cmd || !result) {
+        return SHELL_EINPUT;
     }
-
-    // Handle regular tokens
-    while (state->position < state->length) {
-        char c = state->input[state->position];
-
-        if (state->in_quotes) {
-            if (handle_quotes(state)) {
-                if (!state->in_quotes) break;
+    
+    if (cmd_len == 0) {
+        result->count = 0;
+        result->status = SHELL_STATUS_OK;
+        return SHELL_OK;
+    }
+    
+    // Use default limits if not provided
+    shell_limits_t local_limits;
+    if (!limits) {
+        local_limits = SHELL_LIMITS_DEFAULT;
+        limits = &local_limits;
+    }
+    
+    // Initialize result
+    memset(result, 0, sizeof(shell_parse_result_t));
+    
+    uint32_t max_cmds = limits->max_subcommands;
+    if (max_cmds > SHELL_MAX_SUBCOMMANDS) {
+        max_cmds = SHELL_MAX_SUBCOMMANDS;
+    }
+    
+    uint32_t max_depth = limits->max_depth;
+    (void)max_depth; // Reserved for future subshell depth tracking
+    
+    // Helper to trim whitespace and record subcommand
+    #define RECORD_SUBCMD(s, e, type_val) do { \
+        uint32_t _s = (s); \
+        uint32_t _e = (e); \
+        while (_s < _e && isspace((unsigned char)cmd[_s])) _s++; \
+        while (_e > _s && isspace((unsigned char)cmd[_e-1])) _e--; \
+        if (_s < _e && subcmd_idx < max_cmds) { \
+            result->cmds[subcmd_idx].start = _s; \
+            result->cmds[subcmd_idx].len = _e - _s; \
+            result->cmds[subcmd_idx].type = (type_val); \
+            result->cmds[subcmd_idx].features = 0; \
+            detect_features(cmd, _s, _e - _s, &result->cmds[subcmd_idx].features); \
+            subcmd_idx++; \
+        } else if (subcmd_idx >= max_cmds) { \
+            result->status = SHELL_STATUS_TRUNCATED; \
+            result->count = subcmd_idx; \
+            return SHELL_ETRUNC; \
+        } \
+    } while(0)
+    
+    uint32_t pos = 0;
+    uint32_t subcmd_start = 0;
+    uint32_t subcmd_idx = 0;
+    uint16_t current_type = SHELL_TYPE_SIMPLE;
+    bool in_quotes = false;
+    char quote_char = 0;
+    
+    while (pos < cmd_len) {
+        char c = cmd[pos];
+        
+        // Handle quotes
+        if (!in_quotes && (c == '"' || c == '\'')) {
+            in_quotes = true;
+            quote_char = c;
+            pos++;
+            continue;
+        }
+        if (in_quotes && c == quote_char) {
+            in_quotes = false;
+            quote_char = 0;
+            pos++;
+            continue;
+        }
+        
+        // Skip content inside quotes
+        if (in_quotes) {
+            // Handle escape in quotes
+            if (c == '\\' && pos + 1 < cmd_len) {
+                pos += 2;
             } else {
-                state->position++;
+                pos++;
             }
-        } else {
-            if (isspace(c) || is_shell_operator(c)) {
-                break;
-            }
-            state->position++;
+            continue;
         }
-    }
-
-    size_t token_length = state->position - start_pos;
-    const char* token_text = state->input + start_pos;
-
-    if (is_glob_pattern(token_text, token_length)) {
-        token->type = TOKEN_GLOB;
-    } else {
-        token->type = TOKEN_COMMAND;
-        for (size_t i = 0; i < start_pos; i++) {
-            if (state->input[i] == '|' || state->input[i] == ';' ||
-                state->input[i] == '&') {
-                token->type = TOKEN_COMMAND;
-                break;
-            }
+        
+        // Handle escapes outside quotes
+        if (c == '\\' && pos + 1 < cmd_len) {
+            pos += 2;
+            continue;
         }
-    }
-
-    token->start = state->input + start_pos;
-    token->length = token_length;
-    token->position = start_pos;
-    token->is_quoted = state->in_quotes;
-    token->is_escaped = false;
-
-    return true;
-}
-
-// Tokenize entire command line into commands
-bool shell_tokenize_commands(const char* input, shell_command_t** commands, size_t* command_count) {
-    if (input == NULL || commands == NULL || command_count == NULL) {
-        return false;
-    }
-
-    shell_tokenizer_state_t state;
-    shell_tokenizer_init(&state, input);
-
-    // First pass: count commands
-    size_t count = 0;
-    bool expect_command = true;
-
-    shell_tokenizer_state_t temp_state = state;
-    shell_token_t token;
-
-    while (shell_tokenizer_next(&temp_state, &token)) {
-        if (expect_command && (token.type == TOKEN_COMMAND || token.type == TOKEN_ARGUMENT || 
-                              token.type == TOKEN_SUBSHELL || token.type == TOKEN_VARIABLE ||
-                              token.type == TOKEN_VARIABLE_QUOTED || token.type == TOKEN_SPECIAL_VAR)) {
-            count++;
-            expect_command = false;
-        }
-
-        if (token.type == TOKEN_PIPE || token.type == TOKEN_SEMICOLON ||
-            token.type == TOKEN_AND || token.type == TOKEN_OR) {
-            expect_command = true;
-        }
-    }
-
-    if (count == 0) {
-        *command_count = 0;
-        return true;
-    }
-
-    *commands = malloc(count * sizeof(shell_command_t));
-    if (*commands == NULL) {
-        return false;
-    }
-
-    // Second pass: tokenize and group into commands
-    shell_tokenizer_init(&state, input);
-    size_t current_command = 0;
-    shell_command_t* current_cmd = &(*commands)[current_command];
-
-    shell_token_t* tokens = malloc(16 * sizeof(shell_token_t));
-    if (tokens == NULL) {
-        free(*commands);
-        return false;
-    }
-    size_t token_capacity = 16;
-
-    current_cmd->tokens = tokens;
-    current_cmd->token_count = 0;
-    current_cmd->start_pos = state.position;
-    current_cmd->end_pos = state.position;
-    current_cmd->has_variables = false;
-    current_cmd->has_globs = false;
-    current_cmd->has_subshells = false;
-    current_cmd->has_arithmetic = false;
-
-    expect_command = true;
-
-    while (shell_tokenizer_next(&state, &token)) {
-        if (expect_command && (token.type == TOKEN_COMMAND || token.type == TOKEN_ARGUMENT ||
-                              token.type == TOKEN_SUBSHELL || token.type == TOKEN_VARIABLE ||
-                              token.type == TOKEN_VARIABLE_QUOTED || token.type == TOKEN_SPECIAL_VAR)) {
-            if (current_cmd->token_count > 0) {
-                if (current_command + 1 < count) {
-                    current_command++;
-                    current_cmd = &(*commands)[current_command];
-                    current_cmd->start_pos = token.position;
-                    current_cmd->end_pos = token.position;
-
-                    tokens = malloc(16 * sizeof(shell_token_t));
-                    if (tokens == NULL) {
-                        shell_free_commands(*commands, current_command);
-                        return false;
-                    }
-                    token_capacity = 16;
-                    current_cmd->tokens = tokens;
-                    current_cmd->token_count = 0;
-                    current_cmd->has_variables = false;
-                    current_cmd->has_globs = false;
-                    current_cmd->has_subshells = false;
-                    current_cmd->has_arithmetic = false;
+        
+        // Check for HEREDOC <<
+        if (c == '<' && pos + 1 < cmd_len && cmd[pos + 1] == '<') {
+            // End current subcommand if it has content (trim whitespace)
+            if (subcmd_idx < max_cmds && subcmd_start < pos) {
+                uint32_t s = subcmd_start;
+                uint32_t e = pos;
+                while (s < e && isspace((unsigned char)cmd[s])) s++;
+                while (e > s && isspace((unsigned char)cmd[e-1])) e--;
+                if (s < e) {
+                    result->cmds[subcmd_idx].start = s;
+                    result->cmds[subcmd_idx].len = e - s;
+                    result->cmds[subcmd_idx].type = current_type;
+                    result->cmds[subcmd_idx].features = 0;
+                    detect_features(cmd, s, e - s, &result->cmds[subcmd_idx].features);
+                    subcmd_idx++;
                 }
             }
-            expect_command = false;
-        }
-
-        if (current_cmd->token_count >= token_capacity) {
-            size_t new_capacity = token_capacity * 2;
-            shell_token_t* new_tokens = realloc(tokens, new_capacity * sizeof(shell_token_t));
-            if (new_tokens == NULL) {
-                shell_free_commands(*commands, current_command + 1);
-                return false;
+            
+            // Start heredoc as new subcommand
+            if (subcmd_idx >= max_cmds) {
+                result->status = SHELL_STATUS_TRUNCATED;
+                result->count = subcmd_idx;
+                return SHELL_ETRUNC;
             }
-            tokens = new_tokens;
-            token_capacity = new_capacity;
-            current_cmd->tokens = tokens;
+            
+            // Find heredoc delimiter (word after <<)
+            uint32_t heredoc_start = pos;
+            pos += 2; // Skip <<
+            
+            // Skip whitespace
+            while (pos < cmd_len && isspace(cmd[pos])) pos++;
+            
+            // Find end of delimiter (whitespace or end)
+            uint32_t delim_start = pos;
+            while (pos < cmd_len && !isspace(cmd[pos]) && cmd[pos] != ';') pos++;
+            uint32_t delim_len = pos - delim_start;
+            
+            if (delim_len == 0) {
+                // No delimiter found - treat as less-than
+                pos = heredoc_start + 1;
+            } else {
+                // Record heredoc subcommand: include << and delimiter
+                result->cmds[subcmd_idx].start = heredoc_start;
+                result->cmds[subcmd_idx].len = (pos - heredoc_start); // << + delimiter
+                result->cmds[subcmd_idx].type = SHELL_TYPE_HEREDOC;
+                result->cmds[subcmd_idx].features = SHELL_FEAT_HEREDOC;
+                subcmd_idx++;
+                
+                // Start next subcommand after delimiter
+                subcmd_start = pos;
+                current_type = SHELL_TYPE_SIMPLE;
+                
+                // Skip whitespace to next token
+                while (pos < cmd_len && isspace(cmd[pos])) pos++;
+                continue;
+            }
         }
-
-        current_cmd->tokens[current_cmd->token_count++] = token;
-
-        // Track shell features
-        switch (token.type) {
-            case TOKEN_VARIABLE:
-            case TOKEN_VARIABLE_QUOTED:
-            case TOKEN_SPECIAL_VAR:
-                current_cmd->has_variables = true;
-                break;
-            case TOKEN_GLOB:
-                current_cmd->has_globs = true;
-                break;
-            case TOKEN_SUBSHELL:
-                current_cmd->has_subshells = true;
-                break;
-            case TOKEN_ARITHMETIC:
-                current_cmd->has_arithmetic = true;
-                break;
-            default:
-                break;
+        
+        // Check for separators
+        if (is_separator(c)) {
+            // Handle &&
+            if (c == '&' && pos + 1 < cmd_len && cmd[pos + 1] == '&') {
+                // End current subcommand (trim whitespace)
+                if (subcmd_start < pos) {
+                    if (subcmd_idx >= max_cmds) {
+                        result->status = SHELL_STATUS_TRUNCATED;
+                        result->count = subcmd_idx;
+                        return SHELL_ETRUNC;
+                    }
+                    uint32_t s = subcmd_start;
+                    uint32_t e = pos;
+                    while (s < e && isspace((unsigned char)cmd[s])) s++;
+                    while (e > s && isspace((unsigned char)cmd[e-1])) e--;
+                    if (s < e) {
+                        result->cmds[subcmd_idx].start = s;
+                        result->cmds[subcmd_idx].len = e - s;
+                        result->cmds[subcmd_idx].type = current_type;
+                        result->cmds[subcmd_idx].features = 0;
+                        detect_features(cmd, s, e - s, &result->cmds[subcmd_idx].features);
+                        subcmd_idx++;
+                    }
+                }
+                
+                // Start new subcommand with AND type
+                pos += 2;
+                subcmd_start = pos;
+                current_type = SHELL_TYPE_AND;
+                continue;
+            }
+            
+            // Handle ||
+            if (c == '|' && pos + 1 < cmd_len && cmd[pos + 1] == '|') {
+                // End current subcommand (trim whitespace)
+                if (subcmd_start < pos) {
+                    if (subcmd_idx >= max_cmds) {
+                        result->status = SHELL_STATUS_TRUNCATED;
+                        result->count = subcmd_idx;
+                        return SHELL_ETRUNC;
+                    }
+                    uint32_t s = subcmd_start;
+                    uint32_t e = pos;
+                    while (s < e && isspace((unsigned char)cmd[s])) s++;
+                    while (e > s && isspace((unsigned char)cmd[e-1])) e--;
+                    if (s < e) {
+                        result->cmds[subcmd_idx].start = s;
+                        result->cmds[subcmd_idx].len = e - s;
+                        result->cmds[subcmd_idx].type = current_type;
+                        result->cmds[subcmd_idx].features = 0;
+                        detect_features(cmd, s, e - s, &result->cmds[subcmd_idx].features);
+                        subcmd_idx++;
+                    }
+                }
+                
+                // Start new subcommand with OR type
+                pos += 2;
+                subcmd_start = pos;
+                current_type = SHELL_TYPE_OR;
+                continue;
+            }
+            
+            // Handle |
+            if (c == '|' && !(pos > 0 && cmd[pos-1] == '>')) {
+                // End current subcommand (trim whitespace)
+                if (subcmd_start < pos) {
+                    if (subcmd_idx >= max_cmds) {
+                        result->status = SHELL_STATUS_TRUNCATED;
+                        result->count = subcmd_idx;
+                        return SHELL_ETRUNC;
+                    }
+                    uint32_t s = subcmd_start;
+                    uint32_t e = pos;
+                    while (s < e && isspace((unsigned char)cmd[s])) s++;
+                    while (e > s && isspace((unsigned char)cmd[e-1])) e--;
+                    if (s < e) {
+                        result->cmds[subcmd_idx].start = s;
+                        result->cmds[subcmd_idx].len = e - s;
+                        result->cmds[subcmd_idx].type = current_type;
+                        result->cmds[subcmd_idx].features = 0;
+                        detect_features(cmd, s, e - s, &result->cmds[subcmd_idx].features);
+                        subcmd_idx++;
+                    }
+                }
+                
+                // Start new subcommand with PIPELINE type
+                pos++;
+                subcmd_start = pos;
+                current_type = SHELL_TYPE_PIPELINE;
+                continue;
+            }
+            
+            // Handle ; and newlines as command separators
+            if (c == ';' || c == '\n' || c == '\r') {
+                // End current subcommand (trim whitespace)
+                if (subcmd_start < pos) {
+                    if (subcmd_idx >= max_cmds) {
+                        result->status = SHELL_STATUS_TRUNCATED;
+                        result->count = subcmd_idx;
+                        return SHELL_ETRUNC;
+                    }
+                    uint32_t s = subcmd_start;
+                    uint32_t e = pos;
+                    while (s < e && isspace((unsigned char)cmd[s])) s++;
+                    while (e > s && isspace((unsigned char)cmd[e-1])) e--;
+                    if (s < e) {
+                        result->cmds[subcmd_idx].start = s;
+                        result->cmds[subcmd_idx].len = e - s;
+                        result->cmds[subcmd_idx].type = current_type;
+                        result->cmds[subcmd_idx].features = 0;
+                        detect_features(cmd, s, e - s, &result->cmds[subcmd_idx].features);
+                        subcmd_idx++;
+                    }
+                }
+                
+                // Start new subcommand with SEMICOLON type
+                pos++;
+                subcmd_start = pos;
+                current_type = SHELL_TYPE_SEMICOLON;
+                continue;
+            }
+            
+            // Handle < and > (redirects) - skip but don't break subcommand
+            if (c == '<' || c == '>') {
+                pos++;
+                // Skip file descriptor number if present
+                while (pos < cmd_len && isdigit(cmd[pos])) pos++;
+                // Skip whitespace
+                while (pos < cmd_len && isspace(cmd[pos])) pos++;
+                continue;
+            }
         }
-
-        if (token.type == TOKEN_PIPE || token.type == TOKEN_SEMICOLON ||
-            token.type == TOKEN_AND || token.type == TOKEN_OR) {
-            expect_command = true;
-            current_cmd->end_pos = token.position + token.length;
-        }
+        
+        pos++;
     }
-
-    if (current_command < count) {
-        (*commands)[current_command].end_pos = state.position;
+    
+    // End final subcommand
+    if (subcmd_start < pos && subcmd_idx < max_cmds) {
+        // Trim trailing whitespace
+        uint32_t end_pos = pos;
+        while (end_pos > subcmd_start && isspace((unsigned char)cmd[end_pos - 1])) {
+            end_pos--;
+        }
+        
+        // Trim leading whitespace  
+        uint32_t start_pos = subcmd_start;
+        while (start_pos < end_pos && isspace((unsigned char)cmd[start_pos])) {
+            start_pos++;
+        }
+        
+        if (start_pos < end_pos) {
+            result->cmds[subcmd_idx].start = start_pos;
+            result->cmds[subcmd_idx].len = end_pos - start_pos;
+            result->cmds[subcmd_idx].type = current_type;
+            result->cmds[subcmd_idx].features = 0;
+            detect_features(cmd, start_pos, end_pos - start_pos,
+                           &result->cmds[subcmd_idx].features);
+            subcmd_idx++;
+        }
+    } else if (subcmd_idx >= max_cmds) {
+        result->status = SHELL_STATUS_TRUNCATED;
+        result->count = subcmd_idx;
+        return SHELL_ETRUNC;
     }
-
-    *command_count = count;
-    return true;
+    
+    result->count = subcmd_idx;
+    result->status = SHELL_STATUS_OK;
+    return SHELL_OK;
 }
 
-// Free tokenized commands
-void shell_free_commands(shell_command_t* commands, size_t command_count) {
-    if (commands == NULL) return;
-
-    for (size_t i = 0; i < command_count; i++) {
-        if (commands[i].tokens != NULL) {
-            free(commands[i].tokens);
-        }
+/**
+ * Copy subcommand to buffer (null-terminated)
+ */
+size_t shell_copy_subcommand(
+    const char* cmd,
+    const shell_range_t* range,
+    char* buf,
+    size_t buf_len
+) {
+    if (!cmd || !range || !buf || buf_len == 0) {
+        return 0;
     }
-    free(commands);
+    
+    if (range->len == 0) {
+        buf[0] = '\0';
+        return 0;
+    }
+    
+    size_t copy_len = range->len;
+    if (copy_len >= buf_len) {
+        copy_len = buf_len - 1;
+    }
+    
+    memcpy(buf, cmd + range->start, copy_len);
+    buf[copy_len] = '\0';
+    return copy_len;
 }
 
-// Get human-readable token type name
-const char* shell_token_type_name(token_type_t type) {
-    switch (type) {
-        case TOKEN_COMMAND: return "COMMAND";
-        case TOKEN_ARGUMENT: return "ARGUMENT";
-        case TOKEN_PIPE: return "PIPE";
-        case TOKEN_REDIRECT_IN: return "REDIRECT_IN";
-        case TOKEN_REDIRECT_OUT: return "REDIRECT_OUT";
-        case TOKEN_REDIRECT_ERR: return "REDIRECT_ERR";
-        case TOKEN_REDIRECT_APPEND: return "REDIRECT_APPEND";
-        case TOKEN_SEMICOLON: return "SEMICOLON";
-        case TOKEN_AND: return "AND";
-        case TOKEN_OR: return "OR";
-        case TOKEN_SUBSHELL_START: return "SUBSHELL_START";
-        case TOKEN_SUBSHELL_END: return "SUBSHELL_END";
-        case TOKEN_VARIABLE: return "VARIABLE";
-        case TOKEN_VARIABLE_QUOTED: return "VARIABLE_QUOTED";
-        case TOKEN_SPECIAL_VAR: return "SPECIAL_VAR";
-        case TOKEN_GLOB: return "GLOB";
-        case TOKEN_SUBSHELL: return "SUBSHELL";
-        case TOKEN_ARITHMETIC: return "ARITHMETIC";
-        case TOKEN_PROCESS_SUB: return "PROCESS_SUB";
-        case TOKEN_END: return "END";
-        default: return "UNKNOWN";
+/**
+ * Get subcommand pointer (not null-terminated)
+ */
+const char* shell_get_subcommand(
+    const char* cmd,
+    const shell_range_t* range,
+    uint32_t* out_len
+) {
+    if (!cmd || !range) {
+        if (out_len) *out_len = 0;
+        return NULL;
     }
-}
-
-// Check if command has shell scripting features
-bool shell_has_features(shell_command_t* command) {
-    if (command == NULL) return false;
-    return command->has_variables || command->has_globs ||
-           command->has_subshells || command->has_arithmetic;
+    
+    if (out_len) *out_len = range->len;
+    return cmd + range->start;
 }

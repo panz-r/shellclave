@@ -1,4 +1,4 @@
-#include "shell_tokenizer.h"
+#include "shell_tokenizer_full.h"
 #include "shell_transform.h"
 #include <stdio.h>
 #include <stdlib.h>

@@ -1,7 +1,7 @@
 #ifndef SHELL_TRANSFORM_H
 #define SHELL_TRANSFORM_H
 
-#include "shell_tokenizer.h"
+#include "shell_tokenizer_full.h"
 #include <stdbool.h>
 
 /**

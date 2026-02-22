@@ -2,120 +2,175 @@
 #define SHELL_TOKENIZER_H
 
 #include <stdbool.h>
+#include <stdint.h>
 #include <stddef.h>
 
 /**
- * Shell Command Tokenizer
- *
- * Tokenizes shell command lines into individual commands, handling:
- * - Pipes (|)
- * - Redirections (>, <, >>, 2>, etc.)
- * - Command separators (&&, ||, ;)
- * - Quoting and escaping
- * - Subshells and command substitution
- * - Variables: $VAR, ${VAR}, $1, $#, $?, $$
- * - Globbing: *, ?, [abc]
- * - Arithmetic expansion: $((expr))
+ * Shell Command Parser - Fast Zero-Copy Variant
+ * 
+ * Two modes:
+ * 1. Fast parser (this API): Single-pass, zero-copy, bounded output
+ * 2. Full parser: Deep tokenization, recursive (see shell_tokenizer_full.h)
+ * 
+ * Fast parser design:
+ * - No dynamic memory allocation
+ * - Caller provides result buffer with max subcommands
+ * - Returns subcommand ranges (indices into original command)
+ * - Truncation reported via return code if input exceeds limits
  */
 
+/* ============================================================
+ * CONSTANTS & LIMITS
+ * ============================================================ */
+
+#define SHELL_MAX_SUBCOMMANDS 64   // Default max subcommands
+#define SHELL_MAX_DEPTH 8           // Default max nesting depth
+
+/* ============================================================
+ * TYPE DEFINITIONS
+ * ============================================================ */
+
 /**
- * Token types - unified enum for all token types
+ * Return codes
  */
 typedef enum {
-    // Basic types
-    TOKEN_COMMAND,      // Command name or path
-    TOKEN_ARGUMENT,     // Command argument
-    TOKEN_PIPE,         // Pipe operator
-    TOKEN_REDIRECT_IN,  // Input redirection
-    TOKEN_REDIRECT_OUT, // Output redirection
-    TOKEN_REDIRECT_ERR, // Error redirection
-    TOKEN_REDIRECT_APPEND, // Append redirection
-    TOKEN_SEMICOLON,    // Command separator
-    TOKEN_AND,          // Logical AND
-    TOKEN_OR,           // Logical OR
-    TOKEN_SUBSHELL_START, // Subshell start
-    TOKEN_SUBSHELL_END,   // Subshell end
-    TOKEN_END,           // End of tokens
-
-    // Extended types
-    TOKEN_VARIABLE,        // $VAR, ${VAR}
-    TOKEN_VARIABLE_QUOTED, // "$VAR", '$VAR'
-    TOKEN_SPECIAL_VAR,     // $1, $#, $?, $$
-    TOKEN_GLOB,            // *.txt, file?
-    TOKEN_SUBSHELL,        // $(command), `command`
-    TOKEN_ARITHMETIC,      // $((expr))
-    TOKEN_PROCESS_SUB      // <(command), >(command)
-} token_type_t;
+    SHELL_OK = 0,          // Success
+    SHELL_EINPUT = -1,     // Invalid input
+    SHELL_ETRUNC = -2,     // Truncated - caller should use fallback
+    SHELL_EPARSE = -3,     // Parse error
+} shell_error_t;
 
 /**
- * Token structure
+ * Status flags (returned in shell_parse_result_t.status)
+ */
+typedef enum {
+    SHELL_STATUS_OK = 0,
+    SHELL_STATUS_TRUNCATED = 1 << 0,  // Limits exceeded, use fallback
+    SHELL_STATUS_ERROR = 1 << 1,     // Parse error
+} shell_status_t;
+
+/**
+ * Subcommand type - what separator started this subcommand
+ * (shifted to upper bits to avoid conflict with features)
+ */
+typedef enum {
+    SHELL_TYPE_SIMPLE     = 0,         // Single command, no separator
+    SHELL_TYPE_PIPELINE   = 1 << 8,   // Followed by |
+    SHELL_TYPE_AND        = 1 << 9,   // Followed by &&
+    SHELL_TYPE_OR         = 1 << 10,  // Followed by ||
+    SHELL_TYPE_SEMICOLON  = 1 << 11,  // Followed by ;
+    SHELL_TYPE_HEREDOC    = 1 << 12,  // Starts with << (heredoc)
+} shell_cmd_type_t;
+
+/**
+ * Subcommand features - what's inside the subcommand
+ */
+typedef enum {
+    SHELL_FEAT_NONE      = 0,
+    SHELL_FEAT_VARS      = 1 << 0,   // $VAR, ${VAR}, $1, etc.
+    SHELL_FEAT_GLOBS     = 1 << 1,   // *, ?, [abc]
+    SHELL_FEAT_SUBSHELL  = 1 << 2,   // $(...), `...`
+    SHELL_FEAT_ARITH     = 1 << 3,   // $((...))
+    SHELL_FEAT_HEREDOC   = 1 << 4,   // << delimiter (in subcommand)
+} shell_cmd_features_t;
+
+/**
+ * Per-call limits for fast parser
  */
 typedef struct {
-    token_type_t type;      // Token type
-    const char* start;     // Pointer to start of token in original string
-    size_t length;         // Length of token
-    size_t position;       // Position in original string
-    bool is_quoted;        // True if token is quoted
-    bool is_escaped;       // True if token contains escapes
-} shell_token_t;
+    uint32_t max_subcommands;   // Max subcommands to return
+    uint32_t max_depth;        // Max nesting depth
+} shell_limits_t;
 
 /**
- * Command structure (group of tokens representing one command)
+ * Default limits
+ */
+static const shell_limits_t SHELL_LIMITS_DEFAULT = {
+    .max_subcommands = SHELL_MAX_SUBCOMMANDS,
+    .max_depth = SHELL_MAX_DEPTH
+};
+
+/**
+ * Zero-copy subcommand - just indices into original command
  */
 typedef struct {
-    shell_token_t* tokens;  // Array of tokens
-    size_t token_count;    // Number of tokens
-    size_t start_pos;      // Start position in original string
-    size_t end_pos;        // End position in original string
-    bool has_variables;     // Contains variables ($VAR, ${VAR}, etc.)
-    bool has_globs;        // Contains glob patterns (*, ?, [abc])
-    bool has_subshells;    // Contains subshells ($(cmd), `cmd`)
-    bool has_arithmetic;   // Contains arithmetic expansion ($((expr))
-} shell_command_t;
+    uint32_t start;     // Index in command string
+    uint32_t len;      // Length
+    uint16_t type;     // shell_cmd_type_t
+    uint16_t features; // shell_cmd_features_t
+} shell_range_t;
 
 /**
- * Tokenizer state
+ * Parse result - caller allocates this
+ * Size: 64 * 8 + 8 = 520 bytes (for 64 max subcommands)
  */
 typedef struct {
-    const char* input;       // Input string
-    size_t position;         // Current position
-    size_t length;           // Total length
-    bool in_quotes;          // Currently in quotes
-    bool in_subshell;        // Currently in subshell
-    char quote_char;         // Current quote character
-    int paren_depth;        // Parentheses depth
-    int brace_depth;        // Brace depth for ${VAR}
-    bool in_arithmetic;      // Currently in arithmetic expansion
-} shell_tokenizer_state_t;
+    shell_range_t cmds[SHELL_MAX_SUBCOMMANDS];  // Subcommand ranges
+    uint32_t count;         // Number of subcommands found
+    uint32_t status;      // shell_status_t flags
+} shell_parse_result_t;
+
+/* ============================================================
+ * FAST PARSER API - Zero-Copy, Bounded
+ * ============================================================ */
 
 /**
- * Initialize tokenizer
+ * Fast shell command parser - single pass, no malloc
+ * 
+ * Parses command string and extracts subcommand ranges.
+ * Uses caller-provided result buffer - no dynamic allocation.
+ * 
+ * @param cmd       Input command string
+ * @param cmd_len   Length of command string
+ * @param limits    Per-call limits (can be NULL for defaults)
+ * @param result    Caller-allocated result buffer
+ * @return          SHELL_OK on success, error code otherwise
+ * 
+ * On SHELL_OK: result->count contains valid subcommands
+ * On SHELL_ETRUNC: result->status has TRUNCATED, caller should use fallback
+ * On SHELL_EINPUT: result->status has ERROR, invalid input
  */
-void shell_tokenizer_init(shell_tokenizer_state_t* state, const char* input);
+shell_error_t shell_parse_fast(
+    const char* cmd,
+    size_t cmd_len,
+    const shell_limits_t* limits,
+    shell_parse_result_t* result
+);
 
 /**
- * Get next token
+ * Copy subcommand to buffer (null-terminated)
+ * 
+ * @param cmd     Original command string
+ * @param range   Subcommand range
+ * @param buf     Output buffer
+ * @param buf_len Buffer size
+ * @return        Bytes written (excluding null), or 0 on error
  */
-bool shell_tokenizer_next(shell_tokenizer_state_t* state, shell_token_t* token);
+size_t shell_copy_subcommand(
+    const char* cmd,
+    const shell_range_t* range,
+    char* buf,
+    size_t buf_len
+);
 
 /**
- * Tokenize entire command line into commands
+ * Get subcommand pointer (not null-terminated)
+ * 
+ * @param cmd     Original command string
+ * @param range   Subcommand range
+ * @param out_len Output parameter for length
+ * @return        Pointer into original command (not null-terminated)
  */
-bool shell_tokenize_commands(const char* input, shell_command_t** commands, size_t* command_count);
+const char* shell_get_subcommand(
+    const char* cmd,
+    const shell_range_t* range,
+    uint32_t* out_len
+);
 
-/**
- * Free tokenized commands
- */
-void shell_free_commands(shell_command_t* commands, size_t command_count);
+/* ============================================================
+ * FULL PARSER API - Deep Tokenization
+ * ============================================================ */
 
-/**
- * Get human-readable token type name
- */
-const char* shell_token_type_name(token_type_t type);
-
-/**
- * Check if command has shell scripting features
- */
-bool shell_has_features(shell_command_t* command);
+/* See shell_tokenizer_full.h for full parser API */
 
 #endif // SHELL_TOKENIZER_H
