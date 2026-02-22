@@ -760,6 +760,373 @@ void test_layer3_features_stress(void) {
 }
 
 /* ============================================================
+ * ADDITIONAL LAYER 1 TESTS - More edge cases and features
+ * ============================================================ */
+
+void test_layer1_more_separators(void) {
+    printf("\n--- Layer 1: More Separators ---\n");
+    
+    shell_parse_result_t result;
+    
+    // Multiple && in sequence
+    extract("a && b && c && d", &result);
+    test_count_only("Multiple && count=4", &result, 4);
+    test_type("Third type=AND", &result, 2, SHELL_TYPE_AND);
+    
+    // Multiple || in sequence
+    extract("a || b || c || d", &result);
+    test_count_only("Multiple || count=4", &result, 4);
+    test_type("Third type=OR", &result, 2, SHELL_TYPE_OR);
+    
+    // Mix of ; and |
+    extract("a ; b | c ; d", &result);
+    test_count_only("Mix ; and | count=4", &result, 4);
+    
+    // Background & is NOT a separator in shell - it's part of the command
+    extract("cmd1 & cmd2", &result);
+    test_count_only("Background & count=1 (not separator)", &result, 1);
+    
+    // && followed by |
+    extract("a && b | c", &result);
+    test_count_only("&& then | count=3", &result, 3);
+}
+
+void test_layer1_more_heredoc(void) {
+    printf("\n--- Layer 1: More HEREDOC Variants ---\n");
+    
+    shell_parse_result_t result;
+    
+    // Strip heredoc (<<-)
+    extract("cat <<- EOF", &result);
+    test_count_at_least("Strip heredoc count>=2", &result, 2);
+    
+    // Quoted delimiter
+    extract("cat << 'EOF'", &result);
+    test_count_at_least("Quoted heredoc count>=2", &result, 2);
+    
+    // Double-quoted delimiter
+    extract("cat << \"EOF\"", &result);
+    test_count_at_least("Double-quoted heredoc count>=2", &result, 2);
+    
+    // Here-string (<<<) - now properly detected as HERESTRING
+    extract("cmd <<< string", &result);
+    test_count_only("Here-string count=2", &result, 2);
+    test_type("Here-string type=HERESTRING", &result, 1, SHELL_TYPE_HERESTRING);
+    test_has_feature("Here-string has HERESTRING feature", &result, 1, SHELL_FEAT_HERESTRING);
+    
+    // Multiple heredocs
+    extract("cat << A << B", &result);
+    test_count_at_least("Multiple heredocs count>=2", &result, 2);
+}
+
+void test_layer1_more_features(void) {
+    printf("\n--- Layer 1: More Feature Combinations ---\n");
+    
+    shell_parse_result_t result;
+    
+    // Array subscript
+    extract("echo ${arr[0]}", &result);
+    test_has_feature("Array subscript has VARS", &result, 0, SHELL_FEAT_VARS);
+    
+    // Parameter expansion
+    extract("echo ${var:-default}", &result);
+    test_has_feature("Param expansion has VARS", &result, 0, SHELL_FEAT_VARS);
+    
+    // Command substitution in variable
+    extract("var=$(echo hi)", &result);
+    test_has_feature("Command sub in var has SUBSHELL", &result, 0, SHELL_FEAT_SUBSHELL);
+    
+    // Arithmetic in variable
+    extract("var=$((1+2))", &result);
+    test_has_feature("Arith in var has ARITH", &result, 0, SHELL_FEAT_ARITH);
+    
+    // Multiple vars in one command
+    extract("echo $a $b $c", &result);
+    test_has_feature("Multiple vars has VARS", &result, 0, SHELL_FEAT_VARS);
+    
+    // Glob in quotes - should NOT detect
+    extract("ls '*.txt'", &result);
+    test_no_feature("Quoted glob not detected", &result, 0, SHELL_FEAT_GLOBS);
+}
+
+void test_layer1_special_chars(void) {
+    printf("\n--- Layer 1: Special Characters ---\n");
+    
+    shell_parse_result_t result;
+    
+    // Colon in path
+    extract("/usr/local/bin:/usr/bin", &result);
+    test_count_only("Colon in path count=1", &result, 1);
+    
+    // Dollar in quoted string
+    extract("echo \"cost is $$$\"", &result);
+    test_count_only("Dollar in quotes count=1", &result, 1);
+    
+    // Backticks
+    extract("echo `date`", &result);
+    test_has_feature("Backticks has SUBSHELL", &result, 0, SHELL_FEAT_SUBSHELL);
+    
+    // Process substitution - <() is NOT a separator, treated as part of command
+    extract("diff <(cmd1) <(cmd2)", &result);
+    test_count_only("Process substitution count=1 (not sep)", &result, 1);
+    
+    // Process substitution with redirect
+    extract("diff <(cmd1) <(cmd2) > out", &result);
+    test_count_only("Process sub+redirect count=1 (not sep)", &result, 1);
+}
+
+void test_layer2_subshell_nesting(void) {
+    printf("\n--- Layer 2: Subshell Nesting ---\n");
+    
+    shell_parse_result_t result;
+    
+    // Nested subshells
+    extract("echo $(echo $(date))", &result);
+    test_count_only("Nested subshells count=1", &result, 1);
+    test_has_feature("Nested subshell has SUBSHELL", &result, 0, SHELL_FEAT_SUBSHELL);
+    
+    // Triple nesting
+    extract("echo $(a $(b $(c)))", &result);
+    test_has_feature("Triple nesting has SUBSHELL", &result, 0, SHELL_FEAT_SUBSHELL);
+    
+    // Subshell with vars
+    extract("x=$(echo $y)", &result);
+    test_has_feature("Subshell+var has both", &result, 0, SHELL_FEAT_SUBSHELL | SHELL_FEAT_VARS);
+    
+    // Backticks nested
+    extract("`echo \`date\` `", &result);
+    test_has_feature("Nested backticks has SUBSHELL", &result, 0, SHELL_FEAT_SUBSHELL);
+}
+
+/* ============================================================
+ * ADDITIONAL LAYER 3 TESTS - More complex/large tests
+ * ============================================================ */
+
+void test_layer3_script_snippets(void) {
+    printf("\n--- Layer 3: Script Snippets ---\n");
+    
+    shell_parse_result_t result;
+    
+    // Function definition
+    extract("function foo { echo hello; }", &result);
+    test_count_at_least("Function def count>=1", &result, 1);
+    
+    // Function with args
+    extract("foo() { cat $1; }", &result);
+    test_count_at_least("Function with args count>=1", &result, 1);
+    
+    // Local variable
+    extract("local x=5; echo $x", &result);
+    test_count_at_least("Local var count>=1", &result, 1);
+    
+    // Export statement
+    extract("export PATH=/usr/bin:$PATH", &result);
+    test_count_only("Export count=1", &result, 1);
+    
+    // Read builtin
+    extract("read line < file", &result);
+    test_count_only("Read builtin count=1", &result, 1);
+}
+
+void test_layer3_complex_conditionals(void) {
+    printf("\n--- Layer 3: Complex Conditionals ---\n");
+    
+    shell_parse_result_t result;
+    
+    // Test with string comparison
+    extract("if [ \"$a\" = \"b\" ]; then echo yes; fi", &result);
+    test_count_at_least("String comparison count>=1", &result, 1);
+    test_has_feature("String comparison has VARS", &result, 0, SHELL_FEAT_VARS);
+    
+    // Test with numeric comparison
+    extract("if [ $x -gt 0 ]; then echo positive; fi", &result);
+    test_has_feature("Numeric comparison has VARS", &result, 0, SHELL_FEAT_VARS);
+    
+    // Test with regex
+    extract("if [[ $x =~ pattern ]]; then match; fi", &result);
+    test_has_feature("Regex match has VARS", &result, 0, SHELL_FEAT_VARS);
+    
+    // Extended test
+    extract("if [[ $str == *.* ]]; then echo ext; fi", &result);
+    test_has_feature("Extended test has VARS+GLOBS", &result, 0, SHELL_FEAT_VARS | SHELL_FEAT_GLOBS);
+}
+
+void test_layer3_complex_loops(void) {
+    printf("\n--- Layer 3: Complex Loops ---\n");
+    
+    shell_parse_result_t result;
+    
+    // C-style for loop - splits into multiple parts by ;
+    extract("for ((i=0; i<10; i++)); do echo $i; done", &result);
+    test_count_at_least("C-for count>=3", &result, 3);
+    // The ARITH is in one of the middle parts, VARS in the echo part
+    
+    // For with glob
+    extract("for f in *.txt; do wc -l $f; done", &result);
+    test_count_at_least("For+glob count>=1", &result, 1);
+    test_has_feature("For+glob has GLOBS+VARS", &result, 0, SHELL_FEAT_GLOBS | SHELL_FEAT_VARS);
+    
+    // While with read
+    extract("while IFS= read -r line; do echo $line; done < file", &result);
+    test_count_at_least("While+read count>=1", &result, 1);
+    
+    // Select menu
+    extract("select opt in a b c; do echo $opt; done", &result);
+    test_count_at_least("Select count>=1", &result, 1);
+}
+
+void test_layer3_command_chains(void) {
+    printf("\n--- Layer 3: Command Chains ---\n");
+    
+    shell_parse_result_t result;
+    
+    // Complex chain with all operators
+    extract("a && b || c | d ; e && f || g | h", &result);
+    test_count_only("Complex chain count=8", &result, 8);
+    
+    // Pipeline in parentheses - grouping, not a subshell feature
+    extract("(a | b | c)", &result);
+    test_count_only("Pipeline in parens count=3 (pipes split)", &result, 3);
+    
+    // Command group
+    extract("{ a; b; c; }", &result);
+    test_count_at_least("Command group count>=1", &result, 1);
+    
+    // Array assignment
+    extract("arr=(one two three)", &result);
+    test_count_only("Array assignment count=1", &result, 1);
+    
+    // Index into array
+    extract("echo ${arr[0]} ${arr[1]}", &result);
+    test_has_feature("Array index has VARS", &result, 0, SHELL_FEAT_VARS);
+}
+
+void test_layer3_realistic_scripts(void) {
+    printf("\n--- Layer 3: Realistic Scripts ---\n");
+    
+    shell_parse_result_t result;
+    
+    // Build script snippet
+    extract("for f in *.c; do gcc -o ${f%.c} $f; done", &result);
+    test_count_at_least("Build script count>=1", &result, 1);
+    test_has_feature("Build script has GLOBS+VARS", &result, 0, SHELL_FEAT_GLOBS | SHELL_FEAT_VARS);
+    
+    // Git-style command
+    extract("git log --oneline -n 10 | head", &result);
+    test_count_only("Git-style count=2", &result, 2);
+    
+    // Docker-style command - quoted string doesn't expand vars
+    extract("docker ps -a --filter \"name=test\" | grep -v CONTAINER", &result);
+    test_count_only("Docker-style count=2", &result, 2);
+    // First part has no VARS because quoted
+    
+    // Make-style command
+    extract("make all 2>&1 | tee build.log", &result);
+    test_count_only("Make-style count=2", &result, 2);
+    
+    // Backup script
+    extract("tar czf backup.tar.gz $(find . -name '*.log') && rm *.log", &result);
+    test_count_at_least("Backup script count>=2", &result, 2);
+    test_has_feature("Backup has SUBSHELL+GLOBS", &result, 0, SHELL_FEAT_SUBSHELL | SHELL_FEAT_GLOBS);
+}
+
+void test_layer3_stress_sequential(void) {
+    printf("\n--- Layer 3: Stress - Sequential Commands ---\n");
+    
+    shell_parse_result_t result;
+    
+    // 30 sequential commands
+    char buf[512] = "cmd1";
+    for (int i = 2; i <= 30; i++) {
+        strcat(buf, " ; cmd");
+        char num[4];
+        snprintf(num, sizeof(num), "%d", i);
+        strcat(buf, num);
+    }
+    extract(buf, &result);
+    test_count_only("30 sequential count=30", &result, 30);
+    
+    // Alternating operators
+    strcpy(buf, "c1 && c2 || c3 && c4 || c5 && c6 || c7 && c8 || c9 && c10");
+    extract(buf, &result);
+    test_count_only("Alternating operators count=10", &result, 10);
+    
+    // Deep nesting
+    extract("echo $((((($x))))))", &result);
+    test_has_feature("Deep nesting has VARS", &result, 0, SHELL_FEAT_VARS);
+    
+    // Many variables
+    extract("echo $a $b $c $d $e $f $g $h $i $j $k $l $m $n $o $p", &result);
+    test_has_feature("Many vars has VARS", &result, 0, SHELL_FEAT_VARS);
+}
+
+void test_layer3_boundary_edge(void) {
+    printf("\n--- Layer 3: Boundary and Edge ---\n");
+    
+    shell_parse_result_t result;
+    shell_limits_t limits;
+    
+    // Exactly at subcommand limit
+    limits.max_subcommands = 5;
+    limits.max_depth = 8;
+    extract_limited("a | b | c | d | e", &limits, &result);
+    test_count_only("At subcommand limit count=5", &result, 5);
+    test("No trunc at limit", !(result.status & SHELL_STATUS_TRUNCATED));
+    
+    // Over subcommand limit
+    extract_limited("a | b | c | d | e | f", &limits, &result);
+    test_count_only("Over subcommand limit count=5", &result, 5);
+    test("Trunc over limit", result.status & SHELL_STATUS_TRUNCATED);
+    
+    // Very small buffer simulation - single char
+    limits.max_subcommands = 1;
+    extract_limited("a | b | c", &limits, &result);
+    test_count_only("Single subcommand limit count=1", &result, 1);
+    
+    // Command with all special chars - pipes and semicolons are separators
+    extract("cmd $VAR * ? [ ] { } ( ) < > | & ; ' \" ` \\", &result);
+    test_count_at_least("All special chars count>=2", &result, 2);
+    test_has_feature("First part has VARS+GLOBS", &result, 0, SHELL_FEAT_VARS | SHELL_FEAT_GLOBS);
+}
+
+void test_layer3_feature_exhaustiveness(void) {
+    printf("\n--- Layer 3: Feature Exhaustiveness ---\n");
+    
+    shell_parse_result_t result;
+    
+    // All features combined
+    extract("x=$((a+b)) && y=$(echo $z) && ls *.log && echo \"$v ${arr[@]}\"", &result);
+    test_count_only("All features combined count=4", &result, 4);
+    test_has_feature("First has ARITH+VARS", &result, 0, SHELL_FEAT_ARITH | SHELL_FEAT_VARS);
+    test_has_feature("Second has SUBSHELL+VARS", &result, 1, SHELL_FEAT_SUBSHELL | SHELL_FEAT_VARS);
+    test_has_feature("Third has GLOBS", &result, 2, SHELL_FEAT_GLOBS);
+    test_has_feature("Fourth has VARS", &result, 3, SHELL_FEAT_VARS);
+    
+    // Multiple features in subshell
+    extract("$(echo $x $((y+z)) *.txt)", &result);
+    test_count_only("Multi-feature subshell count=1", &result, 1);
+    test_has_feature("Multi-feature subshell has all", &result, 0, 
+                     SHELL_FEAT_SUBSHELL | SHELL_FEAT_VARS | SHELL_FEAT_ARITH | SHELL_FEAT_GLOBS);
+    
+    // Heredoc with all features
+    extract("cat << EOF\necho $var\n*.txt\n$((x+1))\nEOF", &result);
+    test_count_at_least("Heredoc+features count>=2", &result, 2);
+    
+    // Deep pipeline with features
+    extract("a | b | c | d | e | f | g | h", &result);
+    test_count_only("Deep pipeline with features count=8", &result, 8);
+    
+    // Long command with all features
+    char buf[512];
+    snprintf(buf, sizeof(buf), 
+             "x=$((a+b)) && y=$(echo $z) && ls *.txt > out.log 2>&1 && "
+             "if [ -f config ]; then source config; fi && "
+             "for f in *.log; do grep ERROR $f >> errors.txt; done");
+    extract(buf, &result);
+    test_count_at_least("Long multi-feature count>=5", &result, 5);
+}
+
+/* ============================================================
  * MAIN
  * ============================================================ */
 
@@ -800,6 +1167,25 @@ int main() {
     test_layer3_whitespace_stress();
     test_layer3_boundary_conditions();
     test_layer3_features_stress();
+    
+    printf("\n=== ADDITIONAL LAYER 1 TESTS ===\n");
+    test_layer1_more_separators();
+    test_layer1_more_heredoc();
+    test_layer1_more_features();
+    test_layer1_special_chars();
+    
+    printf("\n=== ADDITIONAL LAYER 2 TESTS ===\n");
+    test_layer2_subshell_nesting();
+    
+    printf("\n=== ADDITIONAL LAYER 3 TESTS ===\n");
+    test_layer3_script_snippets();
+    test_layer3_complex_conditionals();
+    test_layer3_complex_loops();
+    test_layer3_command_chains();
+    test_layer3_realistic_scripts();
+    test_layer3_stress_sequential();
+    test_layer3_boundary_edge();
+    test_layer3_feature_exhaustiveness();
     
     printf("\n=== SUMMARY ===\n");
     printf("Results: %d/%d passed\n", pass_count, test_count);

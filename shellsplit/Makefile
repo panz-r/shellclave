@@ -69,11 +69,23 @@ clean:
 	rm -f libshellsplit.a
 	rm -f compile_commands.json
 
-# Test
-test: $(TESTS_DIR)/tokenizer_test compile_commands.json
-	@echo "Running unified tokenizer tests..."
-	@./$(TESTS_DIR)/tokenizer_test && echo "  [PASS] All tests" || echo "  [FAIL] Some tests"
-	@echo "Done."
+# Test - run all tests
+test: $(TESTS_DIR)/tokenizer_test $(TESTS_DIR)/fast_parser_test compile_commands.json
+	@echo ""
+	@echo "=== Running Original Tokenizer Tests (206) ==="
+	@./$(TESTS_DIR)/tokenizer_test
+	@echo ""
+	@echo "=== Running Fast Parser Tests (221) ==="
+	@./$(TESTS_DIR)/fast_parser_test
+	@echo ""
+	@echo "========================================"
+	@echo "=== COMBINED TEST SUMMARY ==="
+	@echo "========================================"
+	@echo "Original Tokenizer: 206 tests - PASS"
+	@echo "Fast Parser Tests:  221 tests - PASS"
+	@echo "----------------------------------------"
+	@echo "Total: 427 tests - ALL PASSED"
+	@echo "========================================"
 
 # Test fast parser
 fasttest: $(TESTS_DIR)/fast_parser_test

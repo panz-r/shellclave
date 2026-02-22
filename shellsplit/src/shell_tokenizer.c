@@ -60,15 +60,42 @@ static void detect_features(const char* cmd, uint32_t start, uint32_t len, uint1
             continue;
         }
         
-        // Track arithmetic depth
+        // Track arithmetic depth and detect variables inside
         if (c == '$' && i + 1 < len && p[i + 1] == '(' && i + 2 < len && p[i + 2] == '(') {
             arith_depth++;
             *features |= SHELL_FEAT_ARITH;
-            i += 3;
+            // Check if first variable after $((
+            if (i + 3 < len) {
+                char next = p[i + 3];
+                if (isalpha(next) || next == '_') {
+                    *features |= SHELL_FEAT_VARS;
+                }
+            }
+            // Don't skip ahead - let next iteration process the content
+            i++;
             continue;
         }
-        if (arith_depth > 0 && c == ')') {
-            arith_depth--;
+        if (arith_depth > 0) {
+            // Inside $((...)) - detect variables and subshells
+            if (c == ')') {
+                arith_depth--;
+                i++;
+                continue;
+            }
+            // Check for $VAR and $(...) patterns inside arithmetic
+            if (c == '$' && i + 1 < len) {
+                char next = p[i + 1];
+                if (next == '(') {
+                    // $(...) subshell inside arithmetic
+                    *features |= SHELL_FEAT_SUBSHELL;
+                } else if (next == '{') {
+                    *features |= SHELL_FEAT_VARS;
+                } else if (isdigit(next) || next == '#' || next == '?' || next == '$') {
+                    *features |= SHELL_FEAT_VARS;
+                } else if (isalpha(next) || next == '_') {
+                    *features |= SHELL_FEAT_VARS;
+                }
+            }
             i++;
             continue;
         }
@@ -81,15 +108,7 @@ static void detect_features(const char* cmd, uint32_t start, uint32_t len, uint1
                     char next = p[i + 1];
                     if (next == '(') {
                         if (i + 2 < len && p[i + 2] == '(') {
-                            // $((...)) - arithmetic with optional variables
-                            *features |= SHELL_FEAT_ARITH;
-                            // Also mark as having vars if there are any word characters after ((
-                            if (i + 3 < len) {
-                                char after = p[i + 3];
-                                if (isalpha(after) || after == '_') {
-                                    *features |= SHELL_FEAT_VARS;
-                                }
-                            }
+                            // This is handled in arith_depth section above
                             i += 3;
                             continue;
                         }
@@ -228,7 +247,65 @@ shell_error_t shell_parse_fast(
             continue;
         }
         
-        // Check for HEREDOC <<
+        // Check for HERESTRING <<< (here-string) - must check before <<
+        if (c == '<' && pos + 2 < cmd_len && cmd[pos + 1] == '<' && cmd[pos + 2] == '<') {
+            // End current subcommand if it has content (trim whitespace)
+            if (subcmd_idx < max_cmds && subcmd_start < pos) {
+                uint32_t s = subcmd_start;
+                uint32_t e = pos;
+                while (s < e && isspace((unsigned char)cmd[s])) s++;
+                while (e > s && isspace((unsigned char)cmd[e-1])) e--;
+                if (s < e) {
+                    result->cmds[subcmd_idx].start = s;
+                    result->cmds[subcmd_idx].len = e - s;
+                    result->cmds[subcmd_idx].type = current_type;
+                    result->cmds[subcmd_idx].features = 0;
+                    detect_features(cmd, s, e - s, &result->cmds[subcmd_idx].features);
+                    subcmd_idx++;
+                }
+            }
+            
+            // Start herestring as new subcommand
+            if (subcmd_idx >= max_cmds) {
+                result->status = SHELL_STATUS_TRUNCATED;
+                result->count = subcmd_idx;
+                return SHELL_ETRUNC;
+            }
+            
+            // Record herestring subcommand: include <<< and the string
+            uint32_t herestring_start = pos;
+            pos += 3; // Skip <<<
+            
+            // Skip whitespace
+            while (pos < cmd_len && isspace(cmd[pos])) pos++;
+            
+            // Find end of the string (next whitespace or separator)
+            uint32_t string_start = pos;
+            while (pos < cmd_len && !isspace(cmd[pos]) && !is_separator(cmd[pos])) pos++;
+            uint32_t string_len = pos - string_start;
+            
+            if (string_len == 0) {
+                // No string found - treat as less-than
+                pos = herestring_start + 1;
+            } else {
+                // Record herestring subcommand: <<< + string
+                result->cmds[subcmd_idx].start = herestring_start;
+                result->cmds[subcmd_idx].len = (pos - herestring_start);
+                result->cmds[subcmd_idx].type = SHELL_TYPE_HERESTRING;
+                result->cmds[subcmd_idx].features = SHELL_FEAT_HERESTRING;
+                subcmd_idx++;
+                
+                // Start next subcommand
+                subcmd_start = pos;
+                current_type = SHELL_TYPE_SIMPLE;
+                
+                // Skip whitespace to next token
+                while (pos < cmd_len && isspace(cmd[pos])) pos++;
+                continue;
+            }
+        }
+        
+        // Check for HEREDOC << (heredoc) - only if not <<<
         if (c == '<' && pos + 1 < cmd_len && cmd[pos + 1] == '<') {
             // End current subcommand if it has content (trim whitespace)
             if (subcmd_idx < max_cmds && subcmd_start < pos) {

@@ -60,18 +60,20 @@ typedef enum {
     SHELL_TYPE_OR         = 1 << 10,  // Followed by ||
     SHELL_TYPE_SEMICOLON  = 1 << 11,  // Followed by ;
     SHELL_TYPE_HEREDOC    = 1 << 12,  // Starts with << (heredoc)
+    SHELL_TYPE_HERESTRING = 1 << 13,  // Starts with <<< (here-string)
 } shell_cmd_type_t;
 
 /**
  * Subcommand features - what's inside the subcommand
  */
 typedef enum {
-    SHELL_FEAT_NONE      = 0,
-    SHELL_FEAT_VARS      = 1 << 0,   // $VAR, ${VAR}, $1, etc.
-    SHELL_FEAT_GLOBS     = 1 << 1,   // *, ?, [abc]
-    SHELL_FEAT_SUBSHELL  = 1 << 2,   // $(...), `...`
-    SHELL_FEAT_ARITH     = 1 << 3,   // $((...))
-    SHELL_FEAT_HEREDOC   = 1 << 4,   // << delimiter (in subcommand)
+    SHELL_FEAT_NONE       = 0,
+    SHELL_FEAT_VARS       = 1 << 0,   // $VAR, ${VAR}, $1, etc.
+    SHELL_FEAT_GLOBS      = 1 << 1,   // *, ?, [abc]
+    SHELL_FEAT_SUBSHELL   = 1 << 2,   // $(...), `...`
+    SHELL_FEAT_ARITH      = 1 << 3,   // $((...))
+    SHELL_FEAT_HEREDOC    = 1 << 4,   // << delimiter (in subcommand)
+    SHELL_FEAT_HERESTRING = 1 << 5,   // <<< here-string (in subcommand)
 } shell_cmd_features_t;
 
 /**
