@@ -3,7 +3,8 @@ tests/tokenizer_test
 tests/tokenizer_ext_test
 tests/fast_parser_test
 libshellsplit.a
-
+fuzz/tokenizer_fuzzer
+tests/generator_test
 # Object files
 *.o
 .cache

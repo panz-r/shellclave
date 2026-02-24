@@ -4,6 +4,10 @@
 #include "shell_tokenizer_full.h"
 #include <stdbool.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /**
  * Shell Command Transformer - Converts shell constructs to semantic equivalents
  *
@@ -92,5 +96,9 @@ const char* shell_get_dfa_input(
 bool shell_has_transformations(
     transformed_command_t* cmd
 );
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif // SHELL_TRANSFORM_H

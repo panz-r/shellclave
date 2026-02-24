@@ -5,6 +5,10 @@
 #include <stdbool.h>
 #include <stddef.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /**
  * Shell Command Processor - Proper separation of shell logic and command validation
  *
@@ -78,5 +82,9 @@ bool shell_extract_dfa_inputs(
     size_t* dfa_input_count,     // Number of commands
     bool* has_shell_features     // True if shell features present
 );
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif // SHELL_PROCESSOR_H

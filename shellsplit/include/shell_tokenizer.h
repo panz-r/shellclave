@@ -112,6 +112,11 @@ typedef struct {
     uint32_t status;      // shell_status_t flags
 } shell_parse_result_t;
 
+/* C++ compatibility */
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* ============================================================
  * FAST PARSER API - Zero-Copy, Bounded
  * ============================================================ */
@@ -169,10 +174,10 @@ const char* shell_get_subcommand(
     uint32_t* out_len
 );
 
-/* ============================================================
- * FULL PARSER API - Deep Tokenization
- * ============================================================ */
+/* Full parser section is in shell_tokenizer_full.h */
 
-/* See shell_tokenizer_full.h for full parser API */
+#ifdef __cplusplus
+}
+#endif
 
 #endif // SHELL_TOKENIZER_H

@@ -4,6 +4,10 @@
 #include <stdbool.h>
 #include <stddef.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /**
  * Shell Command Tokenizer
  *
@@ -117,5 +121,9 @@ const char* shell_token_type_name(token_type_t type);
  * Check if command has shell scripting features
  */
 bool shell_has_features(shell_command_t* command);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif // SHELL_TOKENIZER_FULL_H

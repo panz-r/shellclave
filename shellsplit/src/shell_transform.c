@@ -163,6 +163,7 @@ bool shell_transform_command_line(
     transformed_command_t** tcmds = malloc(cmd_count * sizeof(transformed_command_t*));
     if (!tcmds) {
         shell_free_commands(cmds, cmd_count);
+        *transformed_count = 0;
         return false;
     }
 
@@ -174,6 +175,7 @@ bool shell_transform_command_line(
             for (size_t j = 0; j < i; j++) shell_free_transformed_commands(&tcmds[j], 1);
             free(tcmds);
             shell_free_commands(cmds, cmd_count);
+            *transformed_count = success_count;
             return false;
         }
     }

@@ -96,11 +96,21 @@ static bool process_single_command(
 
     if (has_pipes) {
         // This is a pipeline - split into individual commands
-        return split_pipeline_command(basic_cmd, original_line, info);
+        bool success = split_pipeline_command(basic_cmd, original_line, info);
+        if (!success) {
+            free((void*)info->original_command);
+            memset(info, 0, sizeof(shell_command_info_t));
+        }
+        return success;
     }
 
     // Not a pipeline - process as single command
-    return process_single_command_internal(basic_cmd, original_line, info);
+    bool success = process_single_command_internal(basic_cmd, original_line, info);
+    if (!success) {
+        free((void*)info->original_command);
+        memset(info, 0, sizeof(shell_command_info_t));
+    }
+    return success;
 }
 
 // Process single command (not a pipeline)
@@ -265,6 +275,7 @@ bool shell_process_command(
     shell_command_info_t* infos = malloc(basic_count * sizeof(shell_command_info_t));
     if (!infos) {
         shell_free_commands(basic_commands, basic_count);
+        *command_count = 0;
         return false;
     }
 
@@ -273,6 +284,7 @@ bool shell_process_command(
         if (!process_single_command(&basic_commands[i], command_line, &infos[i])) {
             shell_free_command_infos(infos, i);
             shell_free_commands(basic_commands, basic_count);
+            *command_count = i;
             return false;
         }
     }
@@ -333,6 +345,9 @@ bool shell_extract_dfa_inputs(
     size_t count;
 
     if (!shell_process_command(command_line, &infos, &count)) {
+        *dfa_inputs = NULL;
+        *dfa_input_count = 0;
+        *has_shell_features = false;
         return false;
     }
 
@@ -347,6 +362,7 @@ bool shell_extract_dfa_inputs(
     const char** inputs = malloc(count * sizeof(const char*));
     if (!inputs) {
         shell_free_command_infos(infos, count);
+        *dfa_input_count = 0;
         return false;
     }
 
@@ -363,12 +379,20 @@ bool shell_extract_dfa_inputs(
     *dfa_input_count = count;
     *has_shell_features = shell_features;
 
-    // Note: We're transferring ownership of the clean_command strings
-    // The caller must free them when done
+    // Note: We're transferring ownership of the clean_command strings to the caller
+    // The caller gets pointers to the strings in infos[i].clean_command
+    // After this function returns, the caller must free these strings
+    // We must NOT call shell_free_command_infos because it would free clean_command
+    // Instead, we manually free only the parts we still own
+    
+    // Free original_command and shell/command tokens but NOT clean_command
     for (size_t i = 0; i < count; i++) {
-        infos[i].clean_command = NULL; // Prevent double-free
+        free((void*)infos[i].original_command);
+        free(infos[i].shell_tokens);
+        free(infos[i].command_tokens);
+        // Do NOT free infos[i].clean_command - caller owns it now
     }
-    shell_free_command_infos(infos, count);
+    free(infos);
 
     return true;
 }

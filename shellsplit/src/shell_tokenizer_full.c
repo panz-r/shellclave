@@ -688,6 +688,7 @@ bool shell_tokenize_commands(const char* input, shell_command_t** commands, size
 
     *commands = malloc(count * sizeof(shell_command_t));
     if (*commands == NULL) {
+        *command_count = 0;
         return false;
     }
 
@@ -699,6 +700,7 @@ bool shell_tokenize_commands(const char* input, shell_command_t** commands, size
     shell_token_t* tokens = malloc(16 * sizeof(shell_token_t));
     if (tokens == NULL) {
         free(*commands);
+        *command_count = 0;
         return false;
     }
     size_t token_capacity = 16;
@@ -728,6 +730,7 @@ bool shell_tokenize_commands(const char* input, shell_command_t** commands, size
                     tokens = malloc(16 * sizeof(shell_token_t));
                     if (tokens == NULL) {
                         shell_free_commands(*commands, current_command);
+                        *command_count = current_command;
                         return false;
                     }
                     token_capacity = 16;
@@ -747,6 +750,7 @@ bool shell_tokenize_commands(const char* input, shell_command_t** commands, size
             shell_token_t* new_tokens = realloc(tokens, new_capacity * sizeof(shell_token_t));
             if (new_tokens == NULL) {
                 shell_free_commands(*commands, current_command + 1);
+                *command_count = current_command + 1;
                 return false;
             }
             tokens = new_tokens;
