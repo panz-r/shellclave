@@ -88,7 +88,17 @@ static bool parse_variable(shell_tokenizer_state_t* state, shell_token_t* token)
                 token->is_escaped = false;
                 return true;
             }
-            if (!isalnum(c) && c != '_') {
+            // Allow:
+            // - alphanumeric and _ for variable names
+            // - %, # for parameter expansion patterns (${var%%pattern}, ${var%pattern}, ${var#pattern})
+            // - :, -, =, ?, + for parameter expansion operators (${var:-default}, ${var:=default}, etc.)
+            // - ! for indirection (${!var})
+            // - [ for array subscript (${arr[index]})
+            // - @, * for special parameters
+            // - / for pattern substitution (${var/pattern/replace})
+            if (!isalnum(c) && c != '_' && c != '%' && c != '#' && 
+                c != ':' && c != '-' && c != '=' && c != '?' && c != '+' &&
+                c != '!' && c != '[' && c != '@' && c != '*' && c != '/') {
                 return false;
             }
             state->position++;
@@ -96,10 +106,12 @@ static bool parse_variable(shell_tokenizer_state_t* state, shell_token_t* token)
         return false;
     }
 
-    // Check for special variables ($1, $#, $?, $$)
+    // Check for special variables ($1, $#, $?, $$, $!, $@, $*)
     if (state->position < state->length) {
         char next = state->input[state->position];
-        if (isdigit(next) || next == '#' || next == '?' || next == '$') {
+        // Handle: $0-$9, $#, $?, $$, $!, $@, $*
+        if (isdigit(next) || next == '#' || next == '?' || next == '$' || 
+            next == '!' || next == '@' || next == '*') {
             state->position++;
             token->type = is_quoted ? TOKEN_VARIABLE_QUOTED : TOKEN_SPECIAL_VAR;
             token->start = state->input + start;
@@ -164,6 +176,7 @@ static bool parse_subshell(shell_tokenizer_state_t* state, shell_token_t* token)
             token->position = start;
             token->is_quoted = is_quoted;
             token->is_escaped = false;
+            state->paren_depth--;
             state->in_subshell = false;
             state->position++;
             return true;
@@ -174,6 +187,7 @@ static bool parse_subshell(shell_tokenizer_state_t* state, shell_token_t* token)
     // Check for `command` format (legacy)
     if (state->input[state->position] == '`') {
         state->position++;
+        state->paren_depth++;
         state->in_subshell = true;
 
         while (state->position < state->length) {
@@ -186,6 +200,7 @@ static bool parse_subshell(shell_tokenizer_state_t* state, shell_token_t* token)
                 token->position = start;
                 token->is_quoted = is_quoted;
                 token->is_escaped = false;
+                state->paren_depth--;
                 state->in_subshell = false;
                 return true;
             }
@@ -789,6 +804,20 @@ bool shell_tokenize_commands(const char* input, shell_command_t** commands, size
 
     if (current_command < count) {
         (*commands)[current_command].end_pos = state.position;
+    }
+
+    // Check for unclosed quotes, parentheses, or braces - indicates malformed input
+    if (state.in_quotes || state.paren_depth > 0 || state.brace_depth > 0) {
+        // Clean up allocated commands before returning error
+        for (size_t i = 0; i < count; i++) {
+            if ((*commands)[i].tokens != NULL) {
+                free((*commands)[i].tokens);
+            }
+        }
+        free(*commands);
+        *commands = NULL;
+        *command_count = 0;
+        return false;
     }
 
     *command_count = count;

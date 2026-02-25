@@ -90,7 +90,8 @@ static void detect_features(const char* cmd, uint32_t start, uint32_t len, uint1
                     *features |= SHELL_FEAT_SUBSHELL;
                 } else if (next == '{') {
                     *features |= SHELL_FEAT_VARS;
-                } else if (isdigit(next) || next == '#' || next == '?' || next == '$') {
+                } else if (isdigit(next) || next == '#' || next == '?' || next == '$' ||
+                           next == '!' || next == '@' || next == '*') {
                     *features |= SHELL_FEAT_VARS;
                 } else if (isalpha(next) || next == '_') {
                     *features |= SHELL_FEAT_VARS;
@@ -117,7 +118,8 @@ static void detect_features(const char* cmd, uint32_t start, uint32_t len, uint1
                         *features |= SHELL_FEAT_SUBSHELL;
                     } else if (next == '{') {
                         *features |= SHELL_FEAT_VARS;
-                    } else if (isdigit(next) || next == '#' || next == '?' || next == '$') {
+                    } else if (isdigit(next) || next == '#' || next == '?' || next == '$' || 
+                               next == '!' || next == '@' || next == '*') {
                         *features |= SHELL_FEAT_VARS;
                     } else if (isalpha(next) || next == '_') {
                         *features |= SHELL_FEAT_VARS;
@@ -212,6 +214,7 @@ shell_error_t shell_parse_fast(
     uint16_t current_type = SHELL_TYPE_SIMPLE;
     bool in_quotes = false;
     char quote_char = 0;
+    int brace_depth = 0;
     
     while (pos < cmd_len) {
         char c = cmd[pos];
@@ -239,6 +242,37 @@ shell_error_t shell_parse_fast(
                 pos++;
             }
             continue;
+        }
+        
+        // Track brace depth for ${var...}
+        if (c == '{') {
+            brace_depth++;
+        } else if (c == '}' && brace_depth > 0) {
+            brace_depth--;
+        }
+        
+        // Track paren depth for $(...), $((...)), <(...), >(...)
+        if (c == '(') {
+            brace_depth++;
+        } else if (c == ')' && brace_depth > 0) {
+            brace_depth--;
+        }
+        
+        // Handle bare $ - if $ appears at end or isn't followed by a valid variable/subshell character,
+        // it's malformed
+        if (c == '$') {
+            if (pos + 1 >= cmd_len) {
+                // $ at end of input - malformed
+                brace_depth++;
+            } else {
+                char next = cmd[pos + 1];
+                // $ must be followed by alphanumeric, {, (, `, or digit
+                if (!isalpha(next) && next != '_' && next != '{' && next != '(' && 
+                    next != '`' && !isdigit(next)) {
+                    // Malformed $ - increment brace_depth so it will fail the final check
+                    brace_depth++;
+                }
+            }
         }
         
         // Handle escapes outside quotes
@@ -526,6 +560,13 @@ shell_error_t shell_parse_fast(
         result->status = SHELL_STATUS_TRUNCATED;
         result->count = subcmd_idx;
         return SHELL_ETRUNC;
+    }
+    
+    // Check for unclosed quotes or braces - this indicates malformed input
+    if (in_quotes || brace_depth > 0) {
+        result->status = SHELL_STATUS_ERROR;
+        result->count = subcmd_idx;
+        return SHELL_EPARSE;
     }
     
     result->count = subcmd_idx;
