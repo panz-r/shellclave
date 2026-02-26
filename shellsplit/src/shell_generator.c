@@ -3,6 +3,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <ctype.h>
 
 // Forward declarations for API functions
 bool shell_generator_add_command(shell_generator_t* gen);
@@ -958,6 +959,35 @@ char* shell_generator_generate(shell_generator_t* gen, size_t max_len) {
         if (gen->buffer_pos > max_len) {
             break;
         }
+    }
+    
+    // Post-generation validation: detect malformed cases that can occur
+    if (gen->buffer_pos > 0) {
+        char last = gen->buffer[gen->buffer_pos - 1];
+        char second_last = gen->buffer_pos > 1 ? gen->buffer[gen->buffer_pos - 2] : '\0';
+        // Ends with bare $ (not $$ or other valid $ combinations)
+        if (last == '$' && second_last != '$' && second_last != '{' && 
+            second_last != '(' && !isalpha(second_last) && second_last != '_') {
+            gen->has_unclosed_brace = true;
+        }
+    }
+    
+    // Check for unbalanced arithmetic: count $(( and ))
+    int arith_opens = 0;
+    for (size_t i = 0; i + 2 < gen->buffer_pos; i++) {
+        if (gen->buffer[i] == '$' && gen->buffer[i+1] == '(' && gen->buffer[i+2] == '(') {
+            arith_opens++;
+        }
+    }
+    // Count )) - each )) closes one $(( 
+    int arith_closes = 0;
+    for (size_t i = 0; i + 1 < gen->buffer_pos; i++) {
+        if (gen->buffer[i] == ')' && gen->buffer[i+1] == ')') {
+            arith_closes++;
+        }
+    }
+    if (arith_opens > arith_closes) {
+        gen->has_unclosed_paren = true;
     }
     
     append_char(gen, '\0');

@@ -1,0 +1,18 @@
+CXX = clang++
+CC = clang
+CXXFLAGS = -fsanitize=fuzzer,address -I../include -g -O1 -fno-omit-frame-pointer -std=c++11
+CFLAGS = -fsanitize=fuzzer,address -I../include -g -O1 -fno-omit-frame-pointer
+
+LIB_SRC = ../src/shell_tokenizer.c ../src/shell_tokenizer_full.c ../src/shell_transform.c ../src/shell_processor.c
+LIB_OBJS = ../src/shell_tokenizer.o ../src/shell_tokenizer_full.o ../src/shell_transform.o ../src/shell_processor.o
+
+all: tokenizer_fuzzer_asan
+
+tokenizer_fuzzer_asan: tokenizer_fuzzer.cpp $(LIB_OBJS)
+	$(CXX) $(CXXFLAGS) -o $@ $< $(LIB_OBJS) -lm
+
+../src/%.o: ../src/%.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+clean:
+	rm -f tokenizer_fuzzer_asan $(LIB_OBJS)

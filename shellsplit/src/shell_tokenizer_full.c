@@ -16,6 +16,7 @@ void shell_tokenizer_init(shell_tokenizer_state_t* state, const char* input) {
     state->paren_depth = 0;
     state->brace_depth = 0;
     state->in_arithmetic = false;
+    state->arith_depth = 0;
 }
 
 // Check if character is a shell operator
@@ -88,17 +89,50 @@ static bool parse_variable(shell_tokenizer_state_t* state, shell_token_t* token)
                 token->is_escaped = false;
                 return true;
             }
+            
+            // Handle array subscript: ${var[index]}
+            // Subscript may contain: simple index, $VAR, $((expr)), etc.
+            if (c == '[') {
+                int bracket_depth = 1;
+                state->position++;
+                
+                while (state->position < state->length && bracket_depth > 0) {
+                    char bc = state->input[state->position];
+                    
+                    // Handle nested brackets
+                    if (bc == '[') {
+                        bracket_depth++;
+                        state->position++;
+                        continue;
+                    }
+                    if (bc == ']') {
+                        bracket_depth--;
+                        if (bracket_depth > 0) {
+                            state->position++;
+                            continue;
+                        }
+                        // Found closing ], skip it
+                        state->position++;
+                        break;
+                    }
+                    
+                    // Skip other content (including $VAR, $((...)))
+                    state->position++;
+                }
+                // After subscript handling, continue to next iteration to find }
+                continue;
+            }
+            
             // Allow:
             // - alphanumeric and _ for variable names
             // - %, # for parameter expansion patterns (${var%%pattern}, ${var%pattern}, ${var#pattern})
             // - :, -, =, ?, + for parameter expansion operators (${var:-default}, ${var:=default}, etc.)
             // - ! for indirection (${!var})
-            // - [ for array subscript (${arr[index]})
             // - @, * for special parameters
             // - / for pattern substitution (${var/pattern/replace})
             if (!isalnum(c) && c != '_' && c != '%' && c != '#' && 
                 c != ':' && c != '-' && c != '=' && c != '?' && c != '+' &&
-                c != '!' && c != '[' && c != '@' && c != '*' && c != '/') {
+                c != '!' && c != '@' && c != '*' && c != '/') {
                 return false;
             }
             state->position++;
@@ -294,6 +328,7 @@ bool shell_tokenizer_next(shell_tokenizer_state_t* state, shell_token_t* token) 
 
     size_t start_pos = state->position;
     char current_char = state->input[start_pos];
+    bool is_quoted = state->in_quotes;
 
     // Handle quotes first
     if (handle_quotes(state)) {
@@ -340,38 +375,93 @@ bool shell_tokenizer_next(shell_tokenizer_state_t* state, shell_token_t* token) 
 
     // Check for $(( arithmetic expansion first
     if (current_char == '$' && !state->in_quotes) {
+        // Debug: see what we're trying to parse
+        if (state->position + 1 < state->length && state->input[state->position + 1] == '{') {
+            // This is a ${...} variable - try to parse it
+            // Note: parse_variable increments brace_depth when entering ${...}
+            // If it fails, we should NOT restore brace_depth - let final check catch unclosed braces
+            if (parse_variable(state, token)) {
+                return true;
+            }
+            // On failure, reset position but NOT brace_depth - the unclosed brace will be
+            // caught by the final check in shell_tokenize_commands
+            state->position = start_pos;
+        }
         if (state->position + 2 < state->length &&
             state->input[state->position + 1] == '(' && 
             state->input[state->position + 2] == '(') {
             size_t start = state->position;
             state->position += 3;
+            state->arith_depth++;
+            state->in_arithmetic = true;
+            
+            // Track depth for nested $((...))
+            // Note: $(( opens TWO parentheses, so start with depth=2
             int depth = 2;
+            bool found_matching_paren = false;
             while (state->position < state->length && depth > 0) {
                 char c = state->input[state->position];
-                if (c == '(') depth++;
-                if (c == ')') depth--;
+                // Handle nested $((...))
+                if (c == '$' && state->position + 2 < state->length &&
+                    state->input[state->position + 1] == '(' && 
+                    state->input[state->position + 2] == '(') {
+                    // This is a nested $((...))
+                    depth++;
+                    state->arith_depth++;
+                    state->position += 2; // skip $(
+                }
+                if (c == ')') {
+                    depth--;
+                    if (depth == 0) {
+                        found_matching_paren = true;
+                    }
+                    if (depth > 0) {
+                        state->arith_depth--;
+                    }
+                }
                 state->position++;
             }
-            if (depth == 0) {
+            
+            // Only accept if we actually found matching )) - not just reached end of input
+            if (found_matching_paren) {
+                // depth == 0 means we found matching ))
+                // position > start + 3 ensures we consumed at least $(( + one ) beyond the opening
+                // This prevents accepting unclosed $((x+1) which has only one )
                 token->type = TOKEN_ARITHMETIC;
                 token->start = state->input + start;
                 token->length = state->position - start;
                 token->position = start;
                 token->is_quoted = false;
                 token->is_escaped = false;
+                state->arith_depth--;
+                if (state->arith_depth == 0) {
+                    state->in_arithmetic = false;
+                }
                 return true;
             }
+            // Restore state on failure
+            while (state->arith_depth > 0) {
+                state->arith_depth--;
+            }
+            state->in_arithmetic = false;
             state->position = start;
         }
         
-        if (parse_variable(state, token)) {
-            return true;
+        // Only parse variable if not in arithmetic
+        if (!state->in_arithmetic) {
+            // Save brace_depth in case parse_variable modifies it and returns false
+            int saved_brace_depth = state->brace_depth;
+            if (parse_variable(state, token)) {
+                return true;
+            }
+            // Restore brace_depth on failure - parse_variable may have modified it
+            state->brace_depth = saved_brace_depth;
+            state->position = start_pos;
         }
-        state->position = start_pos;
     }
 
-    // Check for subshells
-    if ((current_char == '$' || current_char == '`') && !state->in_quotes) {
+    // Check for subshells (but not if inside arithmetic - they're handled there)
+    if ((current_char == '$' || current_char == '`') && !state->in_quotes && !state->in_arithmetic) {
         if (parse_subshell(state, token)) {
             return true;
         }
@@ -465,9 +555,150 @@ bool shell_tokenizer_next(shell_tokenizer_state_t* state, shell_token_t* token) 
                 token->type = TOKEN_PIPE;
                 break;
             case '>':
+                // Check for process substitution: >(cmd) or >(
+                if (state->position + 1 < state->length && state->input[state->position + 1] == '(') {
+                    // Process substitution: >(
+                    state->position++; // skip >
+                    state->paren_depth++;
+                    state->in_subshell = true;
+                    
+                    // Find matching closing parenthesis
+                    int depth = 1;
+                    size_t cmd_start = state->position + 1;
+                    while (state->position < state->length && depth > 0) {
+                        char c = state->input[state->position];
+                        if (c == '(') depth++;
+                        if (c == ')') depth--;
+                        if (depth > 0) state->position++;
+                    }
+                    
+                    if (depth == 0) {
+                        token->type = TOKEN_PROCESS_SUB;
+                        token->start = state->input + start_pos;
+                        token->length = state->position - start_pos + 1;
+                        token->position = start_pos;
+                        token->is_quoted = is_quoted;
+                        token->is_escaped = false;
+                        state->paren_depth--;
+                        state->in_subshell = false;
+                        state->position++;
+                        return true;
+                    }
+                    // Fall through to normal redirect if parsing failed
+                    state->position = start_pos + 1;
+                }
                 token->type = TOKEN_REDIRECT_OUT;
                 break;
             case '<':
+                // Check for heredoc: <<, process substitution: <(cmd), here-string: <<<
+                if (state->position + 1 < state->length) {
+                    // Check for <<< (here-string)
+                    if (state->input[state->position + 1] == '<' && 
+                        state->position + 2 < state->length &&
+                        state->input[state->position + 2] == '<') {
+                        // Here-string: <<<
+                        state->position += 2; // skip <<
+                        token->type = TOKEN_HERESTRING;
+                        token->start = state->input + start_pos;
+                        token->length = 3;
+                        token->position = start_pos;
+                        token->is_quoted = is_quoted;
+                        token->is_escaped = false;
+                        state->position++;
+                        return true;
+                    }
+                    
+                    // Check for heredoc: <<
+                    if (state->input[state->position + 1] == '<') {
+                        size_t heredoc_start = state->position;
+                        state->position++; // skip first <
+                        
+                        bool stripped_dash = false;
+                        // Check for <<- (dash-stripping heredoc)
+                        if (state->position + 1 < state->length && 
+                            state->input[state->position + 1] == '-') {
+                            stripped_dash = true;
+                            state->position++;
+                        }
+                        
+                        // Parse delimiter (skip whitespace, find word)
+                        while (state->position < state->length && 
+                               isspace((unsigned char)state->input[state->position])) {
+                            state->position++;
+                        }
+                        
+                        size_t delim_start = state->position;
+                        // Determine delimiter type
+                        char delim_char = 0;
+                        if (state->input[state->position] == '\'' || 
+                            state->input[state->position] == '"') {
+                            delim_char = state->input[state->position];
+                            state->position++; // skip quote
+                            delim_start = state->position;
+                        }
+                        
+                        // Find end of delimiter
+                        while (state->position < state->length) {
+                            char c = state->input[state->position];
+                            if (delim_char) {
+                                if (c == delim_char) {
+                                    state->position++; // include closing quote
+                                    break;
+                                }
+                            } else {
+                                if (isspace(c) || c == '|' || c == ';' || c == '&' || c == '>') {
+                                    break;
+                                }
+                            }
+                            state->position++;
+                        }
+                        
+                        size_t delim_end = state->position;
+                        
+                        // Now skip content until delimiter on its own line
+                        // For simplicity, we'll just mark the heredoc and not parse content
+                        // The caller can handle the content separately
+                        
+                        token->type = TOKEN_HEREDOC;
+                        token->start = state->input + heredoc_start;
+                        token->length = delim_end - heredoc_start;
+                        token->position = heredoc_start;
+                        token->is_quoted = (delim_char != 0);
+                        token->is_escaped = false;
+                        return true;
+                    }
+                    
+                    // Check for process substitution: <(
+                    if (state->input[state->position + 1] == '(') {
+                        state->position++; // skip <
+                        state->paren_depth++;
+                        state->in_subshell = true;
+                        
+                        // Find matching closing parenthesis
+                        int depth = 1;
+                        while (state->position < state->length && depth > 0) {
+                            char c = state->input[state->position];
+                            if (c == '(') depth++;
+                            if (c == ')') depth--;
+                            if (depth > 0) state->position++;
+                        }
+                        
+                        if (depth == 0) {
+                            token->type = TOKEN_PROCESS_SUB;
+                            token->start = state->input + start_pos;
+                            token->length = state->position - start_pos + 1;
+                            token->position = start_pos;
+                            token->is_quoted = is_quoted;
+                            token->is_escaped = false;
+                            state->paren_depth--;
+                            state->in_subshell = false;
+                            state->position++;
+                            return true;
+                        }
+                        // Fall through to normal redirect if parsing failed
+                        state->position = start_pos + 1;
+                    }
+                }
                 token->type = TOKEN_REDIRECT_IN;
                 // Check for <&N (input duplication)
                 if (state->position + 1 < state->length && state->input[state->position + 1] == '&') {
@@ -858,6 +1089,8 @@ const char* shell_token_type_name(token_type_t type) {
         case TOKEN_SUBSHELL: return "SUBSHELL";
         case TOKEN_ARITHMETIC: return "ARITHMETIC";
         case TOKEN_PROCESS_SUB: return "PROCESS_SUB";
+        case TOKEN_HEREDOC: return "HEREDOC";
+        case TOKEN_HERESTRING: return "HERESTRING";
         case TOKEN_END: return "END";
         default: return "UNKNOWN";
     }

@@ -215,6 +215,7 @@ shell_error_t shell_parse_fast(
     bool in_quotes = false;
     char quote_char = 0;
     int brace_depth = 0;
+    int arith_depth = 0;  // Track when inside $((...))
     
     while (pos < cmd_len) {
         char c = cmd[pos];
@@ -252,23 +253,41 @@ shell_error_t shell_parse_fast(
         }
         
         // Track paren depth for $(...), $((...)), <(...), >(...)
+        // Note: $(( opens TWO parens - handle specially to avoid double counting
+        if (c == '$' && pos + 2 < cmd_len && cmd[pos + 1] == '(' && cmd[pos + 2] == '(') {
+            // This is $(( - arithmetic expansion, opens TWO parentheses
+            brace_depth += 2;
+            arith_depth += 2;  // Track that we're inside arithmetic
+            pos += 3;  // Skip $(( entirely (3 chars)
+            continue;
+        }
         if (c == '(') {
             brace_depth++;
         } else if (c == ')' && brace_depth > 0) {
             brace_depth--;
+            if (arith_depth > 0) {
+                arith_depth--;  // Decrement arithmetic depth
+            }
         }
         
-        // Handle bare $ - if $ appears at end or isn't followed by a valid variable/subshell character,
-        // it's malformed
+        // Handle bare $ - must be followed by valid characters
+        // $$ (PID), $? (exit status), $# (arg count), $! (last bg pid), 
+        // $*/$@ (positional params) at end ARE valid
         if (c == '$') {
             if (pos + 1 >= cmd_len) {
-                // $ at end of input - malformed
-                brace_depth++;
+                // $ at end - check if this is the second $ of $$
+                if (pos > 0 && cmd[pos - 1] == '$') {
+                    // This is $$ - valid!
+                } else {
+                    // Bare $ at end - malformed
+                    brace_depth++;
+                }
             } else {
                 char next = cmd[pos + 1];
-                // $ must be followed by alphanumeric, {, (, `, or digit
+                // $ must be followed by: alphanumeric, _, {, (, `, digit, or special var chars (*, @, #, ?, !, $)
                 if (!isalpha(next) && next != '_' && next != '{' && next != '(' && 
-                    next != '`' && !isdigit(next)) {
+                    next != '`' && !isdigit(next) && next != '*' && next != '@' && 
+                    next != '#' && next != '?' && next != '!' && next != '$') {
                     // Malformed $ - increment brace_depth so it will fail the final check
                     brace_depth++;
                 }
@@ -281,8 +300,8 @@ shell_error_t shell_parse_fast(
             continue;
         }
         
-        // Check for HERESTRING <<< (here-string) - must check before <<
-        if (c == '<' && pos + 2 < cmd_len && cmd[pos + 1] == '<' && cmd[pos + 2] == '<') {
+        // Check for HERESTRING <<< (here-string) - must check before << and NOT inside arithmetic
+        if (arith_depth == 0 && c == '<' && pos + 2 < cmd_len && cmd[pos + 1] == '<' && cmd[pos + 2] == '<') {
             // End current subcommand if it has content (trim whitespace)
             if (subcmd_idx < max_cmds && subcmd_start < pos) {
                 uint32_t s = subcmd_start;
@@ -339,8 +358,8 @@ shell_error_t shell_parse_fast(
             }
         }
         
-        // Check for HEREDOC << (heredoc) - only if not <<<
-        if (c == '<' && pos + 1 < cmd_len && cmd[pos + 1] == '<') {
+        // Check for HEREDOC << (heredoc) - only if not <<< and NOT inside arithmetic
+        if (arith_depth == 0 && c == '<' && pos + 1 < cmd_len && cmd[pos + 1] == '<') {
             // End current subcommand if it has content (trim whitespace)
             if (subcmd_idx < max_cmds && subcmd_start < pos) {
                 uint32_t s = subcmd_start;
@@ -397,8 +416,9 @@ shell_error_t shell_parse_fast(
             }
         }
         
-        // Check for separators
-        if (is_separator(c)) {
+        
+        // Check for separators (but not if inside arithmetic - there < > are operators)
+        if (arith_depth == 0 && is_separator(c)) {
             // Handle &&
             if (c == '&' && pos + 1 < cmd_len && cmd[pos + 1] == '&') {
                 // End current subcommand (trim whitespace)
@@ -520,7 +540,25 @@ shell_error_t shell_parse_fast(
             }
             
             // Handle < and > (redirects) - skip but don't break subcommand
-            if (c == '<' || c == '>') {
+            // But NOT if inside arithmetic - there they're operators, not redirects
+            if ((c == '<' || c == '>') && arith_depth == 0) {
+                // Check for process substitution: >(cmd) or <(cmd)
+                if (pos + 1 < cmd_len && cmd[pos + 1] == '(') {
+                    // Process substitution - skip the (cmd) part
+                    pos += 2; // skip > or < and (
+                    int depth = 1;
+                    while (pos < cmd_len && depth > 0) {
+                        if (cmd[pos] == '(') depth++;
+                        if (cmd[pos] == ')') depth--;
+                        if (depth > 0) pos++;
+                    }
+                    // Mark that we have process substitution
+                    result->cmds[subcmd_idx].features |= SHELL_FEAT_PROCESS_SUB;
+                    if (current_type == SHELL_TYPE_SIMPLE) {
+                        current_type = SHELL_TYPE_PIPELINE;
+                    }
+                    continue;
+                }
                 pos++;
                 // Skip file descriptor number if present
                 while (pos < cmd_len && isdigit(cmd[pos])) pos++;

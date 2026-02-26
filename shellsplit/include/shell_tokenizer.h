@@ -74,6 +74,7 @@ typedef enum {
     SHELL_FEAT_ARITH      = 1 << 3,   // $((...))
     SHELL_FEAT_HEREDOC    = 1 << 4,   // << delimiter (in subcommand)
     SHELL_FEAT_HERESTRING = 1 << 5,   // <<< here-string (in subcommand)
+    SHELL_FEAT_PROCESS_SUB = 1 << 6,  // <(cmd), >(cmd)
 } shell_cmd_features_t;
 
 /**

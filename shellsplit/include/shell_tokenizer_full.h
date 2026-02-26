@@ -48,7 +48,9 @@ typedef enum {
     TOKEN_GLOB,            // *.txt, file?
     TOKEN_SUBSHELL,        // $(command), `command`
     TOKEN_ARITHMETIC,      // $((expr))
-    TOKEN_PROCESS_SUB      // <(command), >(command)
+    TOKEN_PROCESS_SUB,     // <(command), >(command)
+    TOKEN_HEREDOC,         // << delimiter
+    TOKEN_HERESTRING       // <<< here-string
 } token_type_t;
 
 /**
@@ -90,6 +92,7 @@ typedef struct {
     int paren_depth;        // Parentheses depth
     int brace_depth;        // Brace depth for ${VAR}
     bool in_arithmetic;      // Currently in arithmetic expansion
+    int arith_depth;        // Arithmetic expansion nesting depth ($((...))
 } shell_tokenizer_state_t;
 
 /**

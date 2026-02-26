@@ -1892,14 +1892,14 @@ int main() {
         if (cmds) shell_free_commands(cmds, count);
     }
     
-    // Test 182: Array variable (known limitation - @ treated differently in this context)
+    // Test 182: Array variable - valid shell syntax
     {
         const char* input = "echo ${array[@]}";
         shell_command_t* cmds = NULL;
         size_t count = 0;
         int result = shell_tokenize_commands(input, &cmds, &count);
-        // Array variables are a known limitation - accept if we detect issue (not crash)
-        test("Edge: array variable", !result);  // Expect failure, not crash
+        // Array variables are valid shell syntax - should succeed
+        test("Edge: array variable", result && count == 1);
         if (cmds) shell_free_commands(cmds, count);
     }
     
