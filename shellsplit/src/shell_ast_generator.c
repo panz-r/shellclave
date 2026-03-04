@@ -52,21 +52,10 @@ static const char* VARIABLES[] = {
 
 #define NUM_VARIABLES (sizeof(VARIABLES) / sizeof(VARIABLES[0]))
 
-void shell_ast_generator_init(shell_ast_generator_t* gen, uint64_t seed) {
-    shell_ast_generator_internal_t* g = (shell_ast_generator_internal_t*)gen;
-    if (seed == 0) {
-        seed = (uint64_t)time(NULL);
-    }
-    g->rng_state = seed;
-    g->max_len = 0;
-}
-
 shell_ast_generator_t* shell_ast_generator_create(uint64_t seed) {
-    shell_ast_generator_internal_t* g = (shell_ast_generator_internal_t*)malloc(sizeof(shell_ast_generator_internal_t));
+    shell_ast_generator_internal_t* g = (shell_ast_generator_internal_t*)calloc(1, sizeof(shell_ast_generator_internal_t));
     if (!g) return NULL;
     g->rng_state = seed ? seed : (uint64_t)time(NULL);
-    g->max_len = 0;
-    g->current_ast = NULL;
     return (shell_ast_generator_t*)g;
 }
 

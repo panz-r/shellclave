@@ -300,61 +300,6 @@ static bool is_glob_pattern(const char* str, size_t length) {
     return false;
 }
 
-// Recursively detect features inside a subshell or other complex token
-// Returns true if any features were found
-static bool detect_features_recursive(const char* content, size_t length,
-                                      bool* has_variables, bool* has_globs,
-                                      bool* has_subshells, bool* has_arithmetic) {
-    if (!content || length == 0) return false;
-    
-    shell_tokenizer_state_t state;
-    shell_tokenizer_init(&state, content);
-    
-    bool found_features = false;
-    shell_token_t token;
-    
-    while (shell_tokenizer_next(&state, &token)) {
-        switch (token.type) {
-            case TOKEN_VARIABLE:
-            case TOKEN_VARIABLE_QUOTED:
-            case TOKEN_SPECIAL_VAR:
-                if (has_variables) *has_variables = true;
-                found_features = true;
-                break;
-            case TOKEN_GLOB:
-                if (has_globs) *has_globs = true;
-                found_features = true;
-                break;
-            case TOKEN_SUBSHELL:
-                if (has_subshells) *has_subshells = true;
-                found_features = true;
-                // Recursively check inside the subshell
-                if (token.length > 2) {
-                    const char* inner = token.start + 2;  // Skip $(
-                    size_t inner_len = token.length - 3;   // Exclude $( and )
-                    bool inner_has_vars = false, inner_has_globs = false;
-                    bool inner_has_subs = false, inner_has_arith = false;
-                    detect_features_recursive(inner, inner_len,
-                                            &inner_has_vars, &inner_has_globs,
-                                            &inner_has_subs, &inner_has_arith);
-                    if (has_variables && inner_has_vars) *has_variables = true;
-                    if (has_globs && inner_has_globs) *has_globs = true;
-                    if (has_subshells && inner_has_subs) *has_subshells = true;
-                    if (has_arithmetic && inner_has_arith) *has_arithmetic = true;
-                }
-                break;
-            case TOKEN_ARITHMETIC:
-                if (has_arithmetic) *has_arithmetic = true;
-                found_features = true;
-                break;
-            default:
-                break;
-        }
-    }
-    
-    return found_features;
-}
-
 // Get next token
 bool shell_tokenizer_next(shell_tokenizer_state_t* state, shell_token_t* token) {
     if (state == NULL || token == NULL || state->position >= state->length) {
@@ -622,7 +567,6 @@ bool shell_tokenizer_next(shell_tokenizer_state_t* state, shell_token_t* token) 
                     
                     // Find matching closing parenthesis
                     int depth = 1;
-                    size_t cmd_start = state->position + 1;
                     while (state->position < state->length && depth > 0) {
                         char c = state->input[state->position];
                         if (c == '(') depth++;
@@ -671,11 +615,9 @@ bool shell_tokenizer_next(shell_tokenizer_state_t* state, shell_token_t* token) 
                         size_t heredoc_start = state->position;
                         state->position++; // skip first <
                         
-                        bool stripped_dash = false;
                         // Check for <<- (dash-stripping heredoc)
                         if (state->position + 1 < state->length && 
                             state->input[state->position + 1] == '-') {
-                            stripped_dash = true;
                             state->position++;
                         }
                         
@@ -685,14 +627,12 @@ bool shell_tokenizer_next(shell_tokenizer_state_t* state, shell_token_t* token) 
                             state->position++;
                         }
                         
-                        size_t delim_start = state->position;
                         // Determine delimiter type
                         char delim_char = 0;
                         if (state->input[state->position] == '\'' || 
                             state->input[state->position] == '"') {
                             delim_char = state->input[state->position];
                             state->position++; // skip quote
-                            delim_start = state->position;
                         }
                         
                         // Find end of delimiter

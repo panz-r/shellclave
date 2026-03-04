@@ -16,23 +16,17 @@ TESTS_DIR = tests
 # Default target: build tokenizer_test
 all: $(TESTS_DIR)/tokenizer_test
 
-# Generate compile_commands.json for IDE support
-compile_commands.json:
-	@echo '[{' > $@
-	@echo '  "directory": "$(PWD)",' >> $@
-	@echo '  "command": "$(CC) $(CFLAGS) -c -o $(SRC_DIR)/shell_tokenizer.o $(SRC_DIR)/shell_tokenizer.c",' >> $@
-	@echo '  "file": "$(SRC_DIR)/shell_tokenizer.c"' >> $@
-	@echo '},' >> $@
-	@echo '  {' >> $@
-	@echo '  "directory": "$(PWD)",' >> $@
-	@echo '  "command": "$(CC) $(CFLAGS) -c -o $(SRC_DIR)/shell_processor.o $(SRC_DIR)/shell_processor.c",' >> $@
-	@echo '  "file": "$(SRC_DIR)/shell_processor.c"' >> $@
-	@echo '},' >> $@
-	@echo '  {' >> $@
-	@echo '  "directory": "$(PWD)",' >> $@
-	@echo '  "command": "$(CC) $(CFLAGS) -c -o $(SRC_DIR)/shell_transform.o $(SRC_DIR)/shell_transform.c",' >> $@
-	@echo '  "file": "$(SRC_DIR)/shell_transform.c"' >> $@
-	@echo '}]' >> $@
+# Generate compile_commands.json using bear
+# First compile all source files, then use bear to capture the commands
+compile_commands.json: $(SRC_DIR)/shell_tokenizer.c $(SRC_DIR)/shell_processor.c $(SRC_DIR)/shell_transform.c $(SRC_DIR)/shell_tokenizer_full.c $(SRC_DIR)/shell_ast.c $(SRC_DIR)/shell_ast_generator.c
+	@rm -f $@
+	bear -- $(CC) $(CFLAGS) -c -o $(SRC_DIR)/shell_tokenizer.o $(SRC_DIR)/shell_tokenizer.c
+	bear -- $(CC) $(CFLAGS) -c -o $(SRC_DIR)/shell_processor.o $(SRC_DIR)/shell_processor.c
+	bear -- $(CC) $(CFLAGS) -c -o $(SRC_DIR)/shell_transform.o $(SRC_DIR)/shell_transform.c
+	bear -- $(CC) $(CFLAGS) -c -o $(SRC_DIR)/shell_tokenizer_full.o $(SRC_DIR)/shell_tokenizer_full.c
+	bear -- $(CC) $(CFLAGS) -c -o $(SRC_DIR)/shell_ast.o $(SRC_DIR)/shell_ast.c
+	bear -- $(CC) $(CFLAGS) -c -o $(SRC_DIR)/shell_ast_generator.o $(SRC_DIR)/shell_ast_generator.c
+	@rm -f $(SRC_DIR)/*.o
 
 # Build unified tokenizer test (all tests in one)
 $(TESTS_DIR)/tokenizer_test: $(TESTS_DIR)/tokenizer_test.c \
@@ -53,21 +47,6 @@ $(TESTS_DIR)/fast_parser_test: $(TESTS_DIR)/fast_parser_test.c \
 		$(INC_DIR)/shell_tokenizer.h
 	$(CC) $(CFLAGS) -o $@ $(TESTS_DIR)/fast_parser_test.c \
 		$(SRC_DIR)/shell_tokenizer.c $(LDFLAGS)
-
-# Build generator test
-$(TESTS_DIR)/generator_test: $(TESTS_DIR)/generator_test.c \
-		$(SRC_DIR)/shell_generator.c \
-		$(SRC_DIR)/shell_tokenizer.c $(SRC_DIR)/shell_tokenizer_full.c \
-		$(SRC_DIR)/shell_processor.c \
-		$(SRC_DIR)/shell_transform.c \
-		$(INC_DIR)/shell_generator.h $(INC_DIR)/shell_tokenizer.h \
-		$(INC_DIR)/shell_tokenizer_full.h $(INC_DIR)/shell_processor.h \
-		$(INC_DIR)/shell_transform.h
-	$(CC) $(CFLAGS) -o $@ $(TESTS_DIR)/generator_test.c \
-		$(SRC_DIR)/shell_generator.c \
-		$(SRC_DIR)/shell_tokenizer.c $(SRC_DIR)/shell_tokenizer_full.c \
-		$(SRC_DIR)/shell_processor.c \
-		$(SRC_DIR)/shell_transform.c $(LDFLAGS)
 
 # Build AST generator test
 $(TESTS_DIR)/ast_generator_test: $(TESTS_DIR)/ast_generator_test.c \
@@ -96,7 +75,6 @@ libshellsplit.a: $(SRC_DIR)/shell_tokenizer.c $(SRC_DIR)/shell_processor.c
 clean:
 	rm -f $(TESTS_DIR)/tokenizer_test
 	rm -f $(TESTS_DIR)/fast_parser_test
-	rm -f $(TESTS_DIR)/generator_test
 	rm -f $(TESTS_DIR)/ast_generator_test
 	rm -f $(SRC_DIR)/*.o
 	rm -f libshellsplit.a
