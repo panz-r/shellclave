@@ -17,6 +17,49 @@ void shell_tokenizer_init(shell_tokenizer_state_t* state, const char* input) {
     state->brace_depth = 0;
     state->in_arithmetic = false;
     state->arith_depth = 0;
+    
+    // Initialize keyword tracking
+    state->if_depth = 0;
+    state->loop_depth = 0;
+    state->case_depth = 0;
+}
+
+// Check if at position we have a keyword and update tracking
+static void check_keyword(shell_tokenizer_state_t* state, const char* token_text, size_t token_len) {
+    if (token_text == NULL || token_len == 0) return;
+    
+    // Check for if/then/elif/else/fi
+    if (token_len == 2 && strncmp(token_text, "if", 2) == 0) {
+        state->if_depth++;
+    } else if (token_len == 4) {
+        if (strncmp(token_text, "then", 4) == 0) {
+            // Valid - we're in an if
+        } else if (strncmp(token_text, "else", 4) == 0) {
+            // Valid - we're in an if
+        } else if (strncmp(token_text, "elif", 4) == 0) {
+            // Valid - we're in an if
+        }
+    } else if (token_len == 2 && strncmp(token_text, "fi", 2) == 0) {
+        if (state->if_depth > 0) state->if_depth--;
+    }
+    
+    // Check for loops
+    if (token_len == 5) {
+        if (strncmp(token_text, "while", 5) == 0 || strncmp(token_text, "until", 5) == 0) {
+            state->loop_depth++;
+        }
+    } else if (token_len == 3 && strncmp(token_text, "for", 3) == 0) {
+        state->loop_depth++;
+    } else if (token_len == 4 && strncmp(token_text, "done", 4) == 0) {
+        if (state->loop_depth > 0) state->loop_depth--;
+    }
+    
+    // Check for case
+    if (token_len == 4 && strncmp(token_text, "case", 4) == 0) {
+        state->case_depth++;
+    } else if (token_len == 4 && strncmp(token_text, "esac", 4) == 0) {
+        if (state->case_depth > 0) state->case_depth--;
+    }
 }
 
 // Check if character is a shell operator
@@ -328,8 +371,23 @@ bool shell_tokenizer_next(shell_tokenizer_state_t* state, shell_token_t* token) 
 
     size_t start_pos = state->position;
     char current_char = state->input[start_pos];
+    unsigned char uc = (unsigned char)current_char;
     bool is_quoted = state->in_quotes;
-
+    
+    // Check for invalid characters at start of command:
+    // - Control characters (0x01-0x1F, 0x7F)
+    // - High bytes (0x80-0xFF) - binary data, not valid shell
+    if (start_pos == 0 && !state->in_quotes) {
+        if ((uc >= 0x01 && uc <= 0x1F) || uc == 0x7F || uc >= 0x80) {
+            token->type = TOKEN_END;
+            return false;
+        }
+        
+        // Note: Double keywords like "if if" are VALID shell syntax.
+        // Bash interprets "if if cmd" as: run "if" as a command, use exit status as condition.
+        // We no longer reject these - they're unusual but valid.
+    }
+    
     // Handle quotes first
     if (handle_quotes(state)) {
         if (state->in_quotes) {
@@ -893,7 +951,10 @@ bool shell_tokenizer_next(shell_tokenizer_state_t* state, shell_token_t* token) 
     token->position = start_pos;
     token->is_quoted = state->in_quotes;
     token->is_escaped = false;
-
+    
+    // Track keywords for feature detection
+    check_keyword(state, token_text, token_length);
+    
     return true;
 }
 
@@ -916,7 +977,8 @@ bool shell_tokenize_commands(const char* input, shell_command_t** commands, size
     while (shell_tokenizer_next(&temp_state, &token)) {
         if (expect_command && (token.type == TOKEN_COMMAND || token.type == TOKEN_ARGUMENT || 
                               token.type == TOKEN_SUBSHELL || token.type == TOKEN_VARIABLE ||
-                              token.type == TOKEN_VARIABLE_QUOTED || token.type == TOKEN_SPECIAL_VAR)) {
+                              token.type == TOKEN_VARIABLE_QUOTED || token.type == TOKEN_SPECIAL_VAR ||
+                              token.type == TOKEN_ARITHMETIC)) {
             count++;
             expect_command = false;
         }
@@ -924,6 +986,39 @@ bool shell_tokenize_commands(const char* input, shell_command_t** commands, size
         if (token.type == TOKEN_PIPE || token.type == TOKEN_SEMICOLON ||
             token.type == TOKEN_AND || token.type == TOKEN_OR) {
             expect_command = true;
+        }
+    }
+    
+    // Check for bare separators (e.g., just "|" or ";") - invalid shell syntax
+    // But allow valid redirects like &>, &>>, <<, >>
+    if (count == 0 && input != NULL && input[0] != '\0') {
+        // Check if there's any non-whitespace content that's not just a valid redirect
+        bool has_non_whitespace = false;
+        size_t input_len = strlen(input);
+        for (size_t i = 0; i < input_len; i++) {
+            char c = input[i];
+            if (isspace((unsigned char)c)) continue;
+            
+            // Skip valid redirect operators: &>, &>>, <<, >>
+            if (c == '&' && i + 1 < input_len && (input[i+1] == '>' || input[i+1] == '<')) {
+                i++; // skip the next char
+                continue;
+            }
+            if (c == '<' || c == '>') {
+                // Could be << or >>, check next char
+                if (i + 1 < input_len && (input[i+1] == '<' || input[i+1] == '>')) {
+                    i++; // skip the next char
+                }
+                continue;
+            }
+            
+            // Found actual content
+            has_non_whitespace = true;
+            break;
+        }
+        if (has_non_whitespace) {
+            *command_count = 0;
+            return false;
         }
     }
 
@@ -959,6 +1054,9 @@ bool shell_tokenize_commands(const char* input, shell_command_t** commands, size
     current_cmd->has_globs = false;
     current_cmd->has_subshells = false;
     current_cmd->has_arithmetic = false;
+    current_cmd->has_loops = false;
+    current_cmd->has_conditionals = false;
+    current_cmd->has_case = false;
 
     expect_command = true;
 
@@ -1050,7 +1148,23 @@ bool shell_tokenize_commands(const char* input, shell_command_t** commands, size
         *command_count = 0;
         return false;
     }
-
+    
+    // Add feature flags for loops, conditionals, and case statements
+    // These are tracked during parsing
+    if (count > 0) {
+        for (size_t i = 0; i < count; i++) {
+            if (state.loop_depth > 0) {
+                (*commands)[i].has_loops = true;
+            }
+            if (state.if_depth > 0) {
+                (*commands)[i].has_conditionals = true;
+            }
+            if (state.case_depth > 0) {
+                (*commands)[i].has_case = true;
+            }
+        }
+    }
+    
     *command_count = count;
     return true;
 }

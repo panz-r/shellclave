@@ -86,6 +86,7 @@ void shell_generator_init(shell_generator_t* gen, char* buffer, size_t buffer_si
     gen->buffer_pos = 0;
     gen->rng_state = seed;
     gen->buffer_managed = false;
+    gen->invalid_syntax_probability = 20;  // Default 20%
     reset_metadata(gen);
     if (buffer_size > 0) {
         buffer[0] = '\0';
@@ -98,6 +99,7 @@ void shell_generator_init_heap(shell_generator_t* gen, size_t initial_size, uint
     gen->buffer_pos = 0;
     gen->rng_state = seed;
     gen->buffer_managed = true;
+    gen->invalid_syntax_probability = 20;  // Default 20%
     reset_metadata(gen);
     if (gen->buffer) {
         gen->buffer[0] = '\0';
@@ -171,6 +173,15 @@ void shell_test_case_free(shell_test_case_t* tc) {
     }
 }
 
+void shell_generator_set_invalid_probability(shell_generator_t* gen, uint8_t probability) {
+    if (probability > 100) probability = 100;
+    gen->invalid_syntax_probability = probability;
+}
+
+uint8_t shell_generator_get_invalid_probability(shell_generator_t* gen) {
+    return gen->invalid_syntax_probability;
+}
+
 static bool append_command(shell_generator_t* gen);
 static bool append_simple_command(shell_generator_t* gen);
 static bool append_argument(shell_generator_t* gen);
@@ -221,6 +232,54 @@ static bool append_command(shell_generator_t* gen) {
 }
 
 static bool append_argument(shell_generator_t* gen) {
+    // Check if we should generate invalid syntax
+    bool generate_invalid = random_range(&gen->rng_state, 100) < gen->invalid_syntax_probability;
+    
+    if (generate_invalid) {
+        uint64_t error_type = random_range(&gen->rng_state, 6);
+        switch (error_type) {
+            case 0: {
+                // Unclosed double quote - missing closing "
+                append_char(gen, '"');
+                append_str(gen, "text");
+                // No closing quote - unclosed
+                gen->has_unclosed_quote = true;
+                break;
+            }
+            case 1: {
+                // Unclosed single quote - missing closing '
+                append_char(gen, '\'');
+                append_str(gen, "text");
+                // No closing quote - unclosed
+                gen->has_unclosed_quote = true;
+                break;
+            }
+            case 2: {
+                // Trailing \ before space - incomplete escape
+                append_str(gen, "text\\ ");
+                break;
+            }
+            case 3: {
+                // Unclosed ${ without variable
+                append_str(gen, "${");
+                gen->has_unclosed_brace = true;
+                break;
+            }
+            case 4: {
+                // Unclosed subshell
+                append_str(gen, "$(cmd1 | cmd2");
+                gen->has_unclosed_paren = true;
+                break;
+            }
+            default: {
+                // Trailing \ without escape
+                append_str(gen, "text\\");
+                break;
+            }
+        }
+        return true;
+    }
+    
     uint64_t r = random_range(&gen->rng_state, 100);
     
     if (r < 40) {
@@ -332,6 +391,50 @@ bool shell_generator_add_redirect(shell_generator_t* gen) {
 }
 
 bool shell_generator_add_variable(shell_generator_t* gen) {
+    // Check if we should generate invalid variable syntax
+    bool generate_invalid = random_range(&gen->rng_state, 100) < gen->invalid_syntax_probability;
+    
+    if (generate_invalid) {
+        uint64_t error_type = random_range(&gen->rng_state, 5);
+        switch (error_type) {
+            case 0: {
+                // Bare $ at end (unclosed)
+                append_char(gen, '$');
+                gen->has_unclosed_brace = true;
+                break;
+            }
+            case 1: {
+                // ${VAR without closing brace
+                append_str(gen, "${");
+                append_str(gen, variables[random_range(&gen->rng_state, num_variables)]);
+                gen->has_unclosed_brace = true;
+                break;
+            }
+            case 2: {
+                // $ without valid identifier
+                append_char(gen, '$');
+                append_char(gen, '$');
+                // Random character that's not valid
+                append_char(gen, '@');
+                break;
+            }
+            case 3: {
+                // Trailing $ 
+                append_str(gen, variables[random_range(&gen->rng_state, num_variables)]);
+                append_char(gen, '$');
+                break;
+            }
+            default: {
+                // Empty ${}
+                append_str(gen, "${}");
+                gen->has_unclosed_brace = true;
+                break;
+            }
+        }
+        gen->variable_count++;
+        return true;
+    }
+    
     uint64_t r = random_range(&gen->rng_state, 10);
     
     if (r < 5) {
@@ -530,6 +633,97 @@ static bool append_deep_arithmetic(shell_generator_t* gen, uint64_t max_depth) {
         snprintf(val, sizeof(val), "%lu", (unsigned long)random_range(&gen->rng_state, 100));
         append_str(gen, val);
         return true;
+    }
+    
+    // Check if we should generate invalid arithmetic syntax
+    bool generate_invalid = random_range(&gen->rng_state, 100) < gen->invalid_syntax_probability;
+    
+    if (generate_invalid) {
+        uint64_t error_type = random_range(&gen->rng_state, 6);
+        switch (error_type) {
+            case 0: {
+                // Missing operator: "123 456" instead of "123 + 456"
+                append_str(gen, "$(( ");
+                char val[32];
+                snprintf(val, sizeof(val), "%lu", (unsigned long)random_range(&gen->rng_state, 1000));
+                append_str(gen, val);
+                append_char(gen, ' ');
+                snprintf(val, sizeof(val), "%lu", (unsigned long)random_range(&gen->rng_state, 1000));
+                append_str(gen, val);
+                append_str(gen, " ))");
+                gen->has_unclosed_paren = false;  // Balanced but invalid syntax
+                return true;
+            }
+            case 1: {
+                // Trailing operator: "123 + " without second operand
+                append_str(gen, "$(( ");
+                char val[32];
+                snprintf(val, sizeof(val), "%lu", (unsigned long)random_range(&gen->rng_state, 1000));
+                append_str(gen, val);
+                append_char(gen, ' ');
+                append_str(gen, operators[random_range(&gen->rng_state, num_operators)]);
+                append_str(gen, " ))");
+                return true;
+            }
+            case 2: {
+                // Unbalanced parens around expression
+                append_str(gen, "$(( ");
+                append_char(gen, '(');
+                char val[32];
+                snprintf(val, sizeof(val), "%lu", (unsigned long)random_range(&gen->rng_state, 1000));
+                append_str(gen, val);
+                append_char(gen, ' ');
+                append_str(gen, operators[random_range(&gen->rng_state, num_operators)]);
+                append_char(gen, ' ');
+                snprintf(val, sizeof(val), "%lu", (unsigned long)random_range(&gen->rng_state, 1000));
+                append_str(gen, val);
+                // Missing closing paren
+                append_str(gen, " ))");
+                gen->has_unclosed_paren = true;
+                return true;
+            }
+            case 3: {
+                // ~ operator after number (should be before): "123 ~" invalid
+                append_str(gen, "$(( ");
+                char val[32];
+                snprintf(val, sizeof(val), "%lu", (unsigned long)random_range(&gen->rng_state, 1000));
+                append_str(gen, val);
+                append_char(gen, ' ');
+                append_str(gen, "~ ");
+                snprintf(val, sizeof(val), "%lu", (unsigned long)random_range(&gen->rng_state, 1000));
+                append_str(gen, val);
+                append_str(gen, " ))");
+                return true;
+            }
+            case 4: {
+                // Unclosed $(( 
+                append_str(gen, "$(( ");
+                char val[32];
+                snprintf(val, sizeof(val), "%lu", (unsigned long)random_range(&gen->rng_state, 1000));
+                append_str(gen, val);
+                gen->has_unclosed_paren = true;
+                return true;
+            }
+            default: {
+                // Parenthesis without operator: "(123 + 456)" inside expression
+                append_str(gen, "$(( ");
+                append_char(gen, '(');
+                char val[32];
+                snprintf(val, sizeof(val), "%lu", (unsigned long)random_range(&gen->rng_state, 1000));
+                append_str(gen, val);
+                append_char(gen, ' ');
+                append_str(gen, operators[random_range(&gen->rng_state, num_operators)]);
+                append_char(gen, ' ');
+                snprintf(val, sizeof(val), "%lu", (unsigned long)random_range(&gen->rng_state, 1000));
+                append_str(gen, val);
+                append_char(gen, ')');
+                append_char(gen, ' ');
+                snprintf(val, sizeof(val), "%lu", (unsigned long)random_range(&gen->rng_state, 1000));
+                append_str(gen, val);
+                append_str(gen, " ))");
+                return true;
+            }
+        }
     }
     
     append_str(gen, "$(( ");
@@ -772,10 +966,14 @@ static char* shell_generator_generate_malformed(shell_generator_t* gen, size_t m
             // Unbalanced quotes
             append_char(gen, '"');
             append_str(gen, "text");
-            // Randomly don't close quote
+            // Randomly close or don't close quote
             if (random_range(&gen->rng_state, 2) == 0) {
+                // Closed quote - this is actually VALID shell!
                 append_char(gen, '"');
+                // Not malformed - it's just a quoted command
+                gen->is_malformed = false;
             } else {
+                // Unclosed quote - truly malformed
                 gen->has_unclosed_quote = true;
             }
             break;
@@ -793,7 +991,13 @@ static char* shell_generator_generate_malformed(shell_generator_t* gen, size_t m
             break;
         }
         case 6: {
-            // Truncated/redirection only
+            // Truncated/redirection only - but sometimes add a command before
+            // to make valid shell like "cmd >" or "cmd > file"
+            if (random_range(&gen->rng_state, 3) == 0) {
+                // Add a command first - makes it potentially valid
+                append_str(gen, "cmd");
+                append_char(gen, ' ');
+            }
             for (uint64_t i = 0; i < random_range(&gen->rng_state, 5) + 1; i++) {
                 if (random_range(&gen->rng_state, 2) == 0) {
                     append_char(gen, '>');
@@ -808,7 +1012,11 @@ static char* shell_generator_generate_malformed(shell_generator_t* gen, size_t m
             break;
         }
         case 7: {
-            // Just separators
+            // Just separators - but sometimes add a command before
+            if (random_range(&gen->rng_state, 3) == 0) {
+                append_str(gen, "cmd");
+                append_char(gen, ' ');
+            }
             for (uint64_t i = 0; i < random_range(&gen->rng_state, 8) + 1; i++) {
                 if (random_range(&gen->rng_state, 4) == 0) append_str(gen, "&&");
                 else if (random_range(&gen->rng_state, 3) == 0) append_str(gen, "||");
@@ -821,10 +1029,24 @@ static char* shell_generator_generate_malformed(shell_generator_t* gen, size_t m
             // Variable without name
             append_char(gen, '$');
             if (random_range(&gen->rng_state, 2) == 0) {
+                // ${VAR} - valid if has variable name, invalid if empty
                 append_char(gen, '{');
-                gen->has_unclosed_brace = true;
+                if (random_range(&gen->rng_state, 3) == 0) {
+                    // Empty ${} - invalid
+                    append_char(gen, '}');
+                    gen->has_unclosed_brace = false;  // It's actually balanced, just empty
+                } else {
+                    // ${VAR} - valid variable
+                    append_str(gen, "VAR");
+                    append_char(gen, '}');
+                    gen->has_unclosed_brace = false;
+                    gen->is_malformed = false;  // Actually valid!
+                }
             } else {
-                gen->has_unclosed_brace = true;
+                // $VAR - valid variable reference
+                append_str(gen, "VAR");
+                gen->has_unclosed_brace = false;
+                gen->is_malformed = false;  // Actually valid!
             }
             break;
         }
@@ -961,11 +1183,35 @@ char* shell_generator_generate(shell_generator_t* gen, size_t max_len) {
         }
     }
     
-    // Post-generation validation: detect malformed cases that can occur
+    // Post-generation validation: scan the actual output to verify metadata
+    // This fixes false positives where we marked something as invalid but it actually parsed fine
     if (gen->buffer_pos > 0) {
+        // Scan for quote balance
+        int quote_count = 0;
+        for (size_t i = 0; i < gen->buffer_pos; i++) {
+            if (gen->buffer[i] == '"' || gen->buffer[i] == '\'') {
+                quote_count++;
+            }
+        }
+        // If we marked has_unclosed_quote but quotes are balanced, clear the flag
+        if (gen->has_unclosed_quote && quote_count % 2 == 0) {
+            gen->has_unclosed_quote = false;
+        }
+        
+        // Scan for ${} empty expansion
+        for (size_t i = 0; i + 1 < gen->buffer_pos; i++) {
+            if (gen->buffer[i] == '$' && gen->buffer[i+1] == '{') {
+                // Check if it's ${
+                if (i + 2 < gen->buffer_pos && gen->buffer[i+2] == '}') {
+                    // This is ${} - empty expansion, mark as having unclosed brace
+                    gen->has_unclosed_brace = true;
+                }
+            }
+        }
+        
+        // Check for bare $ at end
         char last = gen->buffer[gen->buffer_pos - 1];
         char second_last = gen->buffer_pos > 1 ? gen->buffer[gen->buffer_pos - 2] : '\0';
-        // Ends with bare $ (not $$ or other valid $ combinations)
         if (last == '$' && second_last != '$' && second_last != '{' && 
             second_last != '(' && !isalpha(second_last) && second_last != '_') {
             gen->has_unclosed_brace = true;
@@ -988,6 +1234,26 @@ char* shell_generator_generate(shell_generator_t* gen, size_t max_len) {
     }
     if (arith_opens > arith_closes) {
         gen->has_unclosed_paren = true;
+    }
+    
+    // Post-validation: If the output has actual command content (not just invalid patterns),
+    // it might be valid shell. Clear is_malformed if we detect valid patterns.
+    if (gen->is_malformed && gen->buffer_pos > 0) {
+        bool has_valid_content = false;
+        
+        // Check for alphanumeric content (potential command names)
+        for (size_t i = 0; i < gen->buffer_pos; i++) {
+            if (isalpha((unsigned char)gen->buffer[i])) {
+                has_valid_content = true;
+                break;
+            }
+        }
+        
+        // If has valid content and no other malformed indicators, it's probably valid
+        if (has_valid_content && !gen->has_unclosed_quote && 
+            !gen->has_unclosed_paren && !gen->has_unclosed_brace) {
+            gen->is_malformed = false;
+        }
     }
     
     append_char(gen, '\0');

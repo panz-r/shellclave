@@ -12,6 +12,9 @@ typedef struct {
     uint64_t rng_state;
     bool buffer_managed;
     
+    // Probability of generating invalid syntax (0-100, default 20)
+    uint8_t invalid_syntax_probability;
+    
     // Metadata tracking - built as command is generated
     uint32_t subcommand_count;
     uint32_t pipeline_count;
@@ -73,5 +76,9 @@ char* shell_generator_generate(shell_generator_t* gen, size_t max_len);
 shell_test_case_t* shell_generator_generate_with_metadata(shell_generator_t* gen, size_t max_len);
 
 void shell_test_case_free(shell_test_case_t* tc);
+
+void shell_generator_set_invalid_probability(shell_generator_t* gen, uint8_t probability);
+
+uint8_t shell_generator_get_invalid_probability(shell_generator_t* gen);
 
 #endif

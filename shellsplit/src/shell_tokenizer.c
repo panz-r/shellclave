@@ -220,6 +220,18 @@ shell_error_t shell_parse_fast(
     while (pos < cmd_len) {
         char c = cmd[pos];
         
+        // Check for invalid characters at start of command:
+        // - Control characters (0x01-0x1F, 0x7F)
+        // - High bytes (0x80-0xFF) - binary data, not valid shell
+        if (pos == 0 && !in_quotes && arith_depth == 0) {
+            unsigned char uc = (unsigned char)c;
+            if ((uc >= 0x01 && uc <= 0x1F) || uc == 0x7F || uc >= 0x80) {
+                result->status = SHELL_STATUS_ERROR;
+                result->count = 0;
+                return SHELL_EPARSE;
+            }
+        }
+        
         // Handle quotes
         if (!in_quotes && (c == '"' || c == '\'')) {
             in_quotes = true;
@@ -604,6 +616,86 @@ shell_error_t shell_parse_fast(
     if (in_quotes || brace_depth > 0) {
         result->status = SHELL_STATUS_ERROR;
         result->count = subcmd_idx;
+        return SHELL_EPARSE;
+    }
+    
+    // Check for invalid shell: bare redirects (>, >>, <, <<, <<<) or bare separators (; | &)
+    // If there's no actual command content, it's invalid shell
+    if (subcmd_idx == 0) {
+        bool has_valid_content = false;
+        for (size_t i = 0; i < cmd_len; i++) {
+            char ch = cmd[i];
+            if (isspace((unsigned char)ch)) continue;
+            
+            // Skip redirect operators
+            if (ch == '<' || ch == '>') {
+                // Check for multi-char redirects: <<, >>, <<<, &>, &>>
+                if (i + 1 < cmd_len && (cmd[i+1] == '<' || cmd[i+1] == '>')) {
+                    i++; // skip second char
+                    // Check for <<< or &>>/&<<
+                    if (i + 1 < cmd_len && (cmd[i+1] == '<' || cmd[i+1] == '>')) {
+                        i++;
+                    }
+                    continue;
+                }
+                // Check for &> or &< 
+                if (ch == '&' && i + 1 < cmd_len) {
+                    i++;
+                    continue;
+                }
+                continue;
+            }
+            
+            // Skip separators
+            if (ch == ';' || ch == '|' || ch == '&') {
+                // Skip && or ||
+                if (i + 1 < cmd_len && cmd[i+1] == ch) {
+                    i++;
+                }
+                continue;
+            }
+            
+            // Found actual content - this is valid
+            has_valid_content = true;
+            break;
+        }
+        
+        if (!has_valid_content) {
+            result->status = SHELL_STATUS_ERROR;
+            result->count = 0;
+            return SHELL_EPARSE;
+        }
+    }
+    
+    // Check for invalid shell: bare redirects (>, >>, <, <<, <<<) or bare separators
+    // If there's no actual command content, it's invalid shell
+    // A valid shell command must have at least one alphanumeric character or special var
+    bool has_command_content = false;
+    for (uint32_t i = 0; i < subcmd_idx; i++) {
+        uint32_t start = result->cmds[i].start;
+        uint32_t len = result->cmds[i].len;
+        
+        // Check if this subcommand has actual content (not just redirect chars)
+        for (uint32_t j = 0; j < len; j++) {
+            char ch = cmd[start + j];
+            // Skip redirect operators and separators
+            if (ch == '<' || ch == '>' || ch == ';' || ch == '|' || ch == '&') {
+                continue;
+            }
+            // Skip whitespace
+            if (isspace((unsigned char)ch)) {
+                continue;
+            }
+            // This subcommand has actual command content
+            has_command_content = true;
+            break;
+        }
+        if (has_command_content) break;
+    }
+    
+    if (!has_command_content) {
+        result->status = SHELL_STATUS_ERROR;
+        result->count = 0;
         return SHELL_EPARSE;
     }
     

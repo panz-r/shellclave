@@ -5,54 +5,44 @@
 #include <sys/time.h>
 #include <unistd.h>
 
-#include "shell_generator.h"
+#include "shell_ast_generator.h"
 #include "shell_tokenizer.h"
 #include "shell_tokenizer_full.h"
 #include "shell_processor.h"
 
 static FILE* crash_log = NULL;
 
-static int verify_metadata(shell_test_case_t* tc, const char* cmd) {
+static int verify_metadata(const char* cmd, size_t cmd_len, bool expects_parse_success) {
     // Parse with fast parser
     shell_parse_result_t result;
     shell_error_t err = shell_parse_fast(cmd, tc->cmd_len, NULL, &result);
     
-    // Expectation 1: If expects_parse_success is true, should return SHELL_OK (0)
-    if (tc->expects_parse_success && err != SHELL_OK) {
-        printf("FAIL: expected parse success but got error %d for: %s\n", err, cmd);
-        return 1;
+    // Test passes if:
+    // 1. Valid command parses successfully (err == SHELL_OK)
+    // 2. Invalid command is correctly rejected (err != SHELL_OK)
+    // Test fails if:
+    // 1. Valid command is incorrectly rejected (expects_parse_success=true but err != SHELL_OK)
+    // 2. Invalid command is incorrectly accepted (expects_parse_success=false but err == SHELL_OK)
+    
+    if (tc->expects_parse_success) {
+        // Expecting success - should parse without error
+        if (err != SHELL_OK) {
+            printf("FAIL: expected parse success but got error %d for: %s\n", err, cmd);
+            return 1;
+        }
+    } else {
+        // Expecting failure - should be rejected with error
+        if (err == SHELL_OK) {
+            printf("FAIL: invalid syntax not detected: %s\n", cmd);
+            return 1;
+        }
     }
     
-    // Expectation 2: If has unclosed quote/paren/brace, should NOT return SHELL_OK
-    // These are the syntactic malformed cases that the parser should catch
-    if ((tc->has_unclosed_quote || tc->has_unclosed_paren || tc->has_unclosed_brace) && err == SHELL_OK) {
-        printf("FAIL: unclosed syntax not detected: %s\n", cmd);
-        return 1;
-    }
-    
-    // Note: is_malformed includes semantic issues (binary, operators-only) that 
-    // the parser isn't designed to detect. Those are not parser bugs.
-    
-    // Expectation 3: If we expect subcommands, parser should find some
+    // Additional check: subcommand count should be reasonable
     if (tc->expected_subcommands > 1 && result.count < 1) {
         printf("FAIL: expected %u subcommands but parser returned %u for: %s\n", 
                tc->expected_subcommands, result.count, cmd);
         return 1;
-    }
-    
-    // Expectation 4: Malformed input with unclosed quote should not crash
-    if (tc->has_unclosed_quote) {
-        // Should handle gracefully (return error, not crash)
-    }
-    
-    // Expectation 5: Unclosed paren should be handled
-    if (tc->has_unclosed_paren) {
-        // Should handle gracefully
-    }
-    
-    // Expectation 6: Unclosed brace should be handled
-    if (tc->has_unclosed_brace) {
-        // Should handle gracefully
     }
     
     // Invariant: Count should be reasonable
@@ -209,13 +199,19 @@ int main(int argc, char* argv[]) {
     
     int passed = 0;
     int failed = 0;
+    int correctly_rejected = 0;
     
     for (int i = 0; i < num_tests; i++) {
         shell_test_case_t* tc = shell_generator_generate_with_metadata(&gen, 4096);
         
         if (tc && tc->command && tc->cmd_len > 0) {
-            if (test_with_metadata(tc) == 0) {
-                passed++;
+            int result = test_with_metadata(tc);
+            if (result == 0) {
+                if (tc->expects_parse_success) {
+                    passed++;
+                } else {
+                    correctly_rejected++;
+                }
             } else {
                 failed++;
                 printf("FAIL: %s\n", tc->command);
@@ -227,8 +223,8 @@ int main(int argc, char* argv[]) {
         if (tc) shell_test_case_free(tc);
         
         if ((i + 1) % 100 == 0 || failed > 0) {
-            printf("Progress: %d/%d (passed: %d, failed: %d)\n", 
-                   i + 1, num_tests, passed, failed);
+            printf("Progress: %d/%d (passed: %d, rejected: %d, failed: %d)\n", 
+                   i + 1, num_tests, passed, correctly_rejected, failed);
         }
     }
     
@@ -240,9 +236,10 @@ int main(int argc, char* argv[]) {
     
     printf("\n=== RESULTS ===\n");
     printf("Total: %d\n", num_tests);
-    printf("Passed: %d\n", passed);
+    printf("Passed (valid commands parsed): %d\n", passed);
+    printf("Correctly rejected (invalid detected): %d\n", correctly_rejected);
     printf("Failed: %d\n", failed);
-    printf("Success rate: %.2f%%\n", (double)passed / num_tests * 100.0);
+    printf("Success rate: %.2f%%\n", (double)(passed + correctly_rejected) / num_tests * 100.0);
     
     if (failed > 0) {
         printf("\nFailing commands saved to: tests/generator_crashes.log\n");

@@ -77,6 +77,9 @@ typedef struct {
     bool has_globs;        // Contains glob patterns (*, ?, [abc])
     bool has_subshells;    // Contains subshells ($(cmd), `cmd`)
     bool has_arithmetic;   // Contains arithmetic expansion ($((expr))
+    bool has_loops;       // Contains loops (while, for, until)
+    bool has_conditionals; // Contains conditionals (if/then/elif/else/fi)
+    bool has_case;        // Contains case statements
 } shell_command_t;
 
 /**
@@ -90,9 +93,14 @@ typedef struct {
     bool in_subshell;        // Currently in subshell
     char quote_char;         // Current quote character
     int paren_depth;        // Parentheses depth
-    int brace_depth;        // Brace depth for ${VAR}
-    bool in_arithmetic;      // Currently in arithmetic expansion
+    int brace_depth;         // Brace depth for ${VAR}
+    bool in_arithmetic;       // Currently in arithmetic expansion
     int arith_depth;        // Arithmetic expansion nesting depth ($((...))
+    
+    // Track keywords for feature detection
+    int if_depth;           // Track if/then/fi nesting
+    int loop_depth;         // Track while/for/until nesting
+    int case_depth;         // Track case/esac nesting
 } shell_tokenizer_state_t;
 
 /**

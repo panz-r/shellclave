@@ -67,14 +67,17 @@ typedef enum {
  * Subcommand features - what's inside the subcommand
  */
 typedef enum {
-    SHELL_FEAT_NONE       = 0,
-    SHELL_FEAT_VARS       = 1 << 0,   // $VAR, ${VAR}, $1, etc.
-    SHELL_FEAT_GLOBS      = 1 << 1,   // *, ?, [abc]
-    SHELL_FEAT_SUBSHELL   = 1 << 2,   // $(...), `...`
-    SHELL_FEAT_ARITH      = 1 << 3,   // $((...))
-    SHELL_FEAT_HEREDOC    = 1 << 4,   // << delimiter (in subcommand)
-    SHELL_FEAT_HERESTRING = 1 << 5,   // <<< here-string (in subcommand)
-    SHELL_FEAT_PROCESS_SUB = 1 << 6,  // <(cmd), >(cmd)
+    SHELL_FEAT_NONE         = 0,
+    SHELL_FEAT_VARS         = 1 << 0,   // $VAR, ${VAR}, $1, etc.
+    SHELL_FEAT_GLOBS        = 1 << 1,   // *, ?, [abc]
+    SHELL_FEAT_SUBSHELL     = 1 << 2,   // $(...), `...`
+    SHELL_FEAT_ARITH        = 1 << 3,   // $((...))
+    SHELL_FEAT_HEREDOC      = 1 << 4,   // << delimiter (in subcommand)
+    SHELL_FEAT_HERESTRING   = 1 << 5,   // <<< here-string (in subcommand)
+    SHELL_FEAT_PROCESS_SUB  = 1 << 6,   // <(cmd), >(cmd)
+    SHELL_FEAT_LOOPS        = 1 << 7,    // while, for, until loops
+    SHELL_FEAT_CONDITIONALS = 1 << 8,    // if/then/elif/else/fi
+    SHELL_FEAT_CASE         = 1 << 9,    // case/esac statements
 } shell_cmd_features_t;
 
 /**

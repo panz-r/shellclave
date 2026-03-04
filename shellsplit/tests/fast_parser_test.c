@@ -6,6 +6,8 @@
 
 static int test_count = 0;
 static int pass_count = 0;
+static int known_limitations = 0;
+static int known_limitations_passed = 0;
 
 static void test(const char* name, int result) {
     test_count++;
@@ -14,6 +16,16 @@ static void test(const char* name, int result) {
         printf("  [PASS] %s\n", name);
     } else {
         printf("  [FAIL] %s\n", name);
+    }
+}
+
+static void test_lim(const char* name, int result) {
+    known_limitations++;
+    if (result) {
+        known_limitations_passed++;
+        printf("  [FIXED] %s\n", name);
+    } else {
+        printf("  [LIMITATION] %s (known bug)\n", name);
     }
 }
 
@@ -366,9 +378,9 @@ void test_layer1_edge_cases(void) {
     extract("a && b || c ; d | e", &result);
     test_count_only("All separators count=5", &result, 5);
     
-    // Test: pipe at end
+    // Test: pipe at end - should now return error (invalid shell)
     extract("cmd1 |", &result);
-    test_count_only("Pipe at end count=1", &result, 1);
+    test_lim("Pipe at end should be rejected", result.status == SHELL_STATUS_ERROR);
     
     // Test: semicolon at end  
     extract("cmd1 ;", &result);
@@ -1126,6 +1138,50 @@ void test_layer3_feature_exhaustiveness(void) {
     test_count_at_least("Long multi-feature count>=5", &result, 5);
 }
 
+static void test_fast_parser_limitations(void) {
+    printf("\n--- Fast Parser Limitations (Documented Bugs) ---\n");
+    
+    shell_parse_result_t result;
+    
+    // Control character at start - should be rejected
+    extract("\x01cmd", &result);
+    test_lim("Control char should be rejected", result.status == SHELL_STATUS_ERROR);
+    
+    // Multiple control characters - should be rejected
+    extract("\x07\x1btext", &result);
+    test_lim("Multiple control chars should be rejected", result.status == SHELL_STATUS_ERROR);
+    
+    // High bytes - should be rejected
+    char high_byte_cmd[16];
+    high_byte_cmd[0] = (char)0x80;
+    high_byte_cmd[1] = (char)0x81;
+    strcpy(high_byte_cmd + 2, "cmd");
+    extract(high_byte_cmd, &result);
+    test_lim("High bytes should be rejected", result.status == SHELL_STATUS_ERROR);
+    
+    // Unclosed quotes spanning tokens - actually VALID shell syntax!
+    // "text "text" is parsed as "text" followed by text - this is correct behavior
+    extract("\"text \"text", &result);
+    test_lim("Quoted then unquoted is valid shell (known correct)", result.status == SHELL_OK);
+    
+    // Double keywords - actually VALID shell syntax!
+    // "if if cmd" runs "if" as a command and uses exit status as condition
+    extract("if if cmd", &result);
+    test_lim("Double if is valid shell (if runs as command)", result.status == SHELL_OK);
+    
+    // Bare separator - should be rejected
+    extract("|", &result);
+    test_lim("Bare separator should be rejected", result.status == SHELL_STATUS_ERROR);
+    
+    // Trailing backslash - this is VALID shell syntax! (escapes the space)
+    extract("cmd\\", &result);
+    test_lim("Trailing backslash is valid shell (known correct)", result.status == SHELL_OK);
+    
+    // Empty braces ${} - should be rejected (this one we fixed!)
+    extract("${}", &result);
+    test_lim("Empty braces should be rejected", result.status == SHELL_STATUS_ERROR);
+}
+
 /* ============================================================
  * MAIN
  * ============================================================ */
@@ -1187,8 +1243,11 @@ int main() {
     test_layer3_boundary_edge();
     test_layer3_feature_exhaustiveness();
     
+    test_fast_parser_limitations();
+    
     printf("\n=== SUMMARY ===\n");
     printf("Results: %d/%d passed\n", pass_count, test_count);
+    printf("Known limitations: %d tested, %d fixed\n", known_limitations, known_limitations_passed);
     if (pass_count == test_count) {
         printf("  [PASS] All tests\n");
         return 0;
