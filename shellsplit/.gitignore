@@ -5,6 +5,7 @@ tests/fast_parser_test
 libshellsplit.a
 fuzz/tokenizer_fuzzer
 tests/generator_test
+tests/ast_generator_test
 # logs
 tests/generator_crashes.log
 # Object files

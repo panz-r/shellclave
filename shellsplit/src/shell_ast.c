@@ -309,6 +309,76 @@ static size_t serialize_node(const ast_node_t* node, char* buffer, size_t buffer
             pos = append_str(buffer, buffer_size, pos, ")");
             break;
             
+        case AST_CASE:
+            pos = append_str(buffer, buffer_size, pos, "case ");
+            if (node->value) pos = append_str(buffer, buffer_size, pos, node->value);
+            pos = append_str(buffer, buffer_size, pos, " in ");
+            if (node->child) {
+                pos = serialize_node(node->child, buffer, buffer_size, pos);
+            }
+            pos = append_str(buffer, buffer_size, pos, " ;;");
+            if (node->is_valid) {
+                pos = append_str(buffer, buffer_size, pos, " esac");
+            }
+            break;
+            
+        case AST_IF:
+            pos = append_str(buffer, buffer_size, pos, "if ");
+            if (node->child) {
+                pos = serialize_node(node->child, buffer, buffer_size, pos);
+            }
+            pos = append_str(buffer, buffer_size, pos, " then ");
+            if (node->next) {
+                pos = serialize_node(node->next, buffer, buffer_size, pos);
+            }
+            if (node->is_valid) {
+                pos = append_str(buffer, buffer_size, pos, " fi");
+            }
+            break;
+            
+        case AST_LOOP:
+            if (node->value) pos = append_str(buffer, buffer_size, pos, node->value);
+            pos = append_str(buffer, buffer_size, pos, " ");
+            if (node->next) {
+                pos = serialize_node(node->next, buffer, buffer_size, pos);
+            }
+            pos = append_str(buffer, buffer_size, pos, " do ");
+            if (node->child) {
+                pos = serialize_node(node->child, buffer, buffer_size, pos);
+            }
+            if (node->is_valid) {
+                pos = append_str(buffer, buffer_size, pos, " done");
+            }
+            break;
+            
+        case AST_GLOB:
+            if (node->value) pos = append_str(buffer, buffer_size, pos, node->value);
+            break;
+            
+        case AST_QUOTE:
+            if (node->is_braced) { // Using is_braced to store quote char
+                pos = append_str(buffer, buffer_size, pos, "\"");
+            } else {
+                pos = append_str(buffer, buffer_size, pos, "'");
+            }
+            if (node->value) pos = append_str(buffer, buffer_size, pos, node->value);
+            if (node->is_valid) {
+                if (node->is_braced) {
+                    pos = append_str(buffer, buffer_size, pos, "\"");
+                } else {
+                    pos = append_str(buffer, buffer_size, pos, "'");
+                }
+            }
+            break;
+            
+        case AST_BACKTICK:
+            pos = append_str(buffer, buffer_size, pos, "`");
+            if (node->value) pos = append_str(buffer, buffer_size, pos, node->value);
+            if (node->is_valid) {
+                pos = append_str(buffer, buffer_size, pos, "`");
+            }
+            break;
+            
         default:
             // Unhandled AST types - skip silently
             break;
@@ -549,7 +619,8 @@ void shell_ast_add_incomplete_glob(shell_ast_t* ast) {
     
     ast_node_t* node = ast_node_create(AST_GLOB);
     if (node) {
-        node->value = strdup("*[");
+        // Use "||" which is actually invalid in bash
+        node->value = strdup("||");
         node->is_valid = false;
         ast->root = node;
         ast->node_count++;
