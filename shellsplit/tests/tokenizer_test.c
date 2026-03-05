@@ -1,5 +1,6 @@
 #include "shell_tokenizer_full.h"
 #include "shell_transform.h"
+#include "shell_processor.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -993,6 +994,73 @@ int main() {
         }
         if (cmds) shell_free_commands(cmds, cmd_count);
     }
+
+    // Test: Transform command line with multiple commands
+    {
+        const char* input = "echo $VAR | grep $PATTERN > output.txt";
+        transformed_command_t** tcmds = NULL;
+        size_t tcount = 0;
+        bool result = shell_transform_command_line(input, &tcmds, &tcount);
+        test("Transform: command line multi-cmd", result && tcount >= 2);
+        if (tcmds && tcount > 0) {
+            for (size_t i = 0; i < tcount; i++) {
+                if (tcmds[i]) {
+                    test("Transform: line has transformations", tcmds[i]->has_transformations);
+                }
+            }
+            shell_free_transformed_commands(tcmds, tcount);
+        }
+    }
+
+    // Test: Transform with empty command line
+    {
+        const char* input = "";
+        transformed_command_t** tcmds = NULL;
+        size_t tcount = 0;
+        bool result = shell_transform_command_line(input, &tcmds, &tcount);
+        test("Transform: empty command line", result && tcount == 0);
+    }
+
+    // Test: shell_has_transformations
+    {
+        const char* input = "ls *.txt";
+        shell_command_t* cmds = NULL;
+        size_t cmd_count = 0;
+        int result = shell_tokenize_commands(input, &cmds, &cmd_count);
+        
+        if (result && cmds && cmd_count > 0) {
+            transformed_command_t* transformed = NULL;
+            result = shell_transform_command(&cmds[0], &transformed);
+            if (transformed) {
+                bool has_trans = shell_has_transformations(transformed);
+                test("Transform: shell_has_transformations", has_trans);
+                free((void*)transformed->original_command);
+                free((void*)transformed->transformed_command);
+                free(transformed);
+            }
+        }
+        if (cmds) shell_free_commands(cmds, cmd_count);
+    }
+
+    // Test: NULL input handling
+    {
+        transformed_command_t** tcmds = NULL;
+        size_t tcount = 0;
+        bool result = shell_transform_command_line(NULL, &tcmds, &tcount);
+        test("Transform: NULL input returns false", !result);
+    }
+
+    // Test: Transform with redirection only
+    {
+        const char* input = "cmd > file.txt 2>&1";
+        transformed_command_t** tcmds = NULL;
+        size_t tcount = 0;
+        bool result = shell_transform_command_line(input, &tcmds, &tcount);
+        test("Transform: redirection only", result && tcount >= 1);
+        if (tcmds && tcount > 0) {
+            shell_free_transformed_commands(tcmds, tcount);
+        }
+    }
     
     printf("\n=== STRESS/CRASH TEST CASES ===\n\n");
     
@@ -1582,6 +1650,91 @@ int main() {
         int result = shell_tokenize_commands(input, &cmds, &count);
         test("Edge: zero length", result && count == 0);
         if (cmds) shell_free_commands(cmds, count);
+    }
+
+    // Test: shell_process_command basic
+    {
+        const char* input = "echo hello | grep world";
+        shell_command_info_t* infos = NULL;
+        size_t count = 0;
+        bool result = shell_process_command(input, &infos, &count);
+        test("Processor: basic pipeline", result && count >= 1);
+        if (infos) {
+            test("Processor: has pipe", infos[0].has_pipe_input || infos[0].has_pipe_output);
+            const char* clean = shell_get_clean_command(&infos[0]);
+            test("Processor: clean command extracted", clean != NULL);
+            shell_free_command_infos(infos, count);
+        }
+    }
+
+    // Test: shell_process_command with redirection
+    {
+        const char* input = "cmd > output.txt 2>&1";
+        shell_command_info_t* infos = NULL;
+        size_t count = 0;
+        bool result = shell_process_command(input, &infos, &count);
+        test("Processor: with redirection", result && count >= 1);
+        if (infos) {
+            test("Processor: has redirections", infos[0].has_redirections);
+            test("Processor: has error redirection", infos[0].has_error_redirection);
+            shell_free_command_infos(infos, count);
+        }
+    }
+
+    // Test: shell_process_command with variables
+    {
+        const char* input = "echo $VAR $NAME";
+        shell_command_info_t* infos = NULL;
+        size_t count = 0;
+        bool result = shell_process_command(input, &infos, &count);
+        test("Processor: with variables", result && count >= 1);
+        if (infos) shell_free_command_infos(infos, count);
+    }
+
+    // Test: shell_has_dangerous_features
+    {
+        const char* input = "cmd | other_cmd";
+        shell_command_info_t* infos = NULL;
+        size_t count = 0;
+        bool result = shell_process_command(input, &infos, &count);
+        if (result && infos && count > 0) {
+            bool dangerous = shell_has_dangerous_features(&infos[0]);
+            test("Processor: dangerous features detected", dangerous);
+            shell_free_command_infos(infos, count);
+        }
+    }
+
+    // Test: shell_extract_dfa_inputs
+    {
+        const char* input = "cmd1 | cmd2 | cmd3";
+        const char** dfa_inputs = NULL;
+        size_t dfa_count = 0;
+        bool has_shell = false;
+        bool result = shell_extract_dfa_inputs(input, &dfa_inputs, &dfa_count, &has_shell);
+        test("Processor: extract dfa inputs", result && dfa_count >= 3);
+        if (dfa_inputs) {
+            for (size_t i = 0; i < dfa_count; i++) {
+                free((void*)dfa_inputs[i]);
+            }
+            free(dfa_inputs);
+        }
+    }
+
+    // Test: NULL handling
+    {
+        shell_command_info_t* infos = NULL;
+        size_t count = 0;
+        bool result = shell_process_command(NULL, &infos, &count);
+        test("Processor: NULL input returns false", !result);
+    }
+
+    // Test: empty input
+    {
+        const char* input = "";
+        shell_command_info_t* infos = NULL;
+        size_t count = 0;
+        bool result = shell_process_command(input, &infos, &count);
+        test("Processor: empty input", result && count == 0);
     }
     
     printf("\n=== PIPELINE/SUBCOMMAND EXTRACTION TESTS ===\n\n");

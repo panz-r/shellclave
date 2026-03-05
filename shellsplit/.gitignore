@@ -11,3 +11,16 @@ tests/generator_crashes.log
 *.o
 .cache
 compile_commands.json
+# Coverage files
+*.gcda
+*.gcno
+*.gcov
+*.gcov.html
+*.func-c.html
+*.func.html
+tests/*.gcda
+tests/*.gcno
+tests/*.gcov.html
+tests/*.func-c.html
+tests/*.func.html
+tests/index-*.html

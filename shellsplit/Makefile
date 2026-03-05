@@ -9,6 +9,10 @@ CC = gcc
 CFLAGS = -Wall -Wextra -Wpedantic -std=c11 -Iinclude -O2 -mcmodel=medium
 LDFLAGS = -lm -mcmodel=medium
 
+# Coverage flags
+COVERAGE_CFLAGS = -fprofile-arcs -ftest-coverage -g
+COVERAGE_LDFLAGS = -fprofile-arcs -ftest-coverage -lm -mcmodel=medium
+
 SRC_DIR = src
 INC_DIR = include
 TESTS_DIR = tests
@@ -106,4 +110,28 @@ fasttest: $(TESTS_DIR)/fast_parser_test
 	@./$(TESTS_DIR)/fast_parser_test && echo "  [PASS] All tests" || echo "  [FAIL] Some tests"
 	@echo "Done."
 
-.PHONY: all clean test fasttest
+# Coverage test - build and run tests with coverage
+coverage: clean
+	@echo "Building with coverage..."
+	$(CC) $(CFLAGS) $(COVERAGE_CFLAGS) -o $(TESTS_DIR)/tokenizer_test $(TESTS_DIR)/tokenizer_test.c \
+		$(SRC_DIR)/shell_tokenizer.c $(SRC_DIR)/shell_tokenizer_full.c \
+		$(SRC_DIR)/shell_processor.c $(SRC_DIR)/shell_transform.c $(COVERAGE_LDFLAGS)
+	$(CC) $(CFLAGS) $(COVERAGE_CFLAGS) -o $(TESTS_DIR)/fast_parser_test $(TESTS_DIR)/fast_parser_test.c \
+		$(SRC_DIR)/shell_tokenizer.c $(COVERAGE_LDFLAGS)
+	$(CC) $(CFLAGS) $(COVERAGE_CFLAGS) -o $(TESTS_DIR)/ast_generator_test $(TESTS_DIR)/ast_generator_test.c \
+		$(SRC_DIR)/shell_ast.c $(SRC_DIR)/shell_ast_generator.c \
+		$(SRC_DIR)/shell_tokenizer.c $(SRC_DIR)/shell_tokenizer_full.c \
+		$(SRC_DIR)/shell_processor.c $(SRC_DIR)/shell_transform.c $(COVERAGE_LDFLAGS)
+	@echo "Running tests with coverage..."
+	@./$(TESTS_DIR)/tokenizer_test >/dev/null 2>&1
+	@./$(TESTS_DIR)/fast_parser_test >/dev/null 2>&1
+	@./$(TESTS_DIR)/ast_generator_test -n 100 >/dev/null 2>&1
+	@echo ""
+	@echo "=== Coverage Report ==="
+	@lcov -c -d . -o coverage.info 2>/dev/null || true
+	@lcov --summary coverage.info 2>/dev/null || true
+	@echo ""
+	@echo "Detailed coverage info in coverage.info"
+	@echo "HTML report: run 'genhtml coverage.info' to generate"
+
+.PHONY: all clean test fasttest coverage

@@ -166,8 +166,8 @@ shell_error_t shell_parse_fast(
     
     if (cmd_len == 0) {
         result->count = 0;
-        result->status = SHELL_STATUS_OK;
-        return SHELL_OK;
+        result->status = SHELL_STATUS_ERROR;
+        return SHELL_EINPUT;
     }
     
     // Use default limits if not provided
@@ -258,9 +258,35 @@ shell_error_t shell_parse_fast(
         }
         
         // Track brace depth for ${var...}
+        // Also track if we have a variable name after ${
+        static int brace_start_pos = -1;
         if (c == '{') {
+            if (brace_depth == 0 && pos > 0 && cmd[pos-1] == '$') {
+                // This is ${ - start of variable expansion, remember position
+                // Content starts AFTER this brace
+                brace_start_pos = pos + 1;
+            }
             brace_depth++;
         } else if (c == '}' && brace_depth > 0) {
+            // Check for empty ${} - no variable name between braces
+            if (brace_start_pos > 0 && brace_depth == 1) {
+                // We're closing the ${...} - check if there's any content
+                // Content starts at brace_start_pos (after ${) and ends at pos (before })
+                bool has_content = false;
+                for (uint32_t i = (uint32_t)brace_start_pos; i < pos; i++) {
+                    if (!isspace((unsigned char)cmd[i])) {
+                        has_content = true;
+                        break;
+                    }
+                }
+                if (!has_content) {
+                    // Empty ${} - malformed
+                    result->status = SHELL_STATUS_ERROR;
+                    result->count = subcmd_idx;
+                    return SHELL_EPARSE;
+                }
+                brace_start_pos = -1;  // Reset
+            }
             brace_depth--;
         }
         
@@ -571,11 +597,35 @@ shell_error_t shell_parse_fast(
                     }
                     continue;
                 }
+                // Check for multi-char redirects: >>, <<, >&, &>, etc.
+                bool is_double_redirect = false;
+                if (pos + 1 < cmd_len && (cmd[pos + 1] == '>' || cmd[pos + 1] == '<')) {
+                    is_double_redirect = true;
+                    pos++; // skip second char of >>
+                }
                 pos++;
-                // Skip file descriptor number if present
-                while (pos < cmd_len && isdigit(cmd[pos])) pos++;
+                // Skip file descriptor number if present (but not after >>)
+                if (!is_double_redirect) {
+                    while (pos < cmd_len && isdigit(cmd[pos])) pos++;
+                }
                 // Skip whitespace
                 while (pos < cmd_len && isspace(cmd[pos])) pos++;
+                // Validate: redirect must be followed by a valid target
+                // Check for end of input or invalid next character
+                if (pos >= cmd_len) {
+                    // No target after redirect - invalid
+                    result->status = SHELL_STATUS_ERROR;
+                    result->count = subcmd_idx;
+                    return SHELL_EPARSE;
+                }
+                char next_ch = cmd[pos];
+                // Redirect target can't be an operator
+                if (next_ch == '<' || next_ch == '>' || next_ch == '|' || 
+                    next_ch == ';' || next_ch == '&' || next_ch == '\n') {
+                    result->status = SHELL_STATUS_ERROR;
+                    result->count = subcmd_idx;
+                    return SHELL_EPARSE;
+                }
                 continue;
             }
         }

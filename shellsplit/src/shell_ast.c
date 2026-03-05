@@ -257,8 +257,9 @@ static size_t serialize_node(const ast_node_t* node, char* buffer, size_t buffer
             if (node->is_append) {
                 pos = append_str(buffer, buffer_size, pos, ">");
             }
-            pos = append_str(buffer, buffer_size, pos, " ");
-            if (node->redirect_target) {
+            // Only add space and target if target is non-empty
+            if (node->redirect_target && node->redirect_target[0] != '\0') {
+                pos = append_str(buffer, buffer_size, pos, " ");
                 pos = append_str(buffer, buffer_size, pos, node->redirect_target);
             }
             break;
@@ -289,8 +290,11 @@ static size_t serialize_node(const ast_node_t* node, char* buffer, size_t buffer
             if (node->child && node->child->value) {
                 pos = append_str(buffer, buffer_size, pos, node->child->value);
             }
-            pos = append_str(buffer, buffer_size, pos, "\n");
-            if (node->value) pos = append_str(buffer, buffer_size, pos, node->value);
+            // Only output closing delimiter if heredoc is valid/closed
+            if (node->is_valid) {
+                pos = append_str(buffer, buffer_size, pos, "\n");
+                if (node->value) pos = append_str(buffer, buffer_size, pos, node->value);
+            }
             break;
             
         case AST_PROCESS_SUB:
@@ -303,6 +307,10 @@ static size_t serialize_node(const ast_node_t* node, char* buffer, size_t buffer
                 pos = serialize_node(node->child, buffer, buffer_size, pos);
             }
             pos = append_str(buffer, buffer_size, pos, ")");
+            break;
+            
+        default:
+            // Unhandled AST types - skip silently
             break;
     }
     
@@ -364,6 +372,7 @@ ast_node_t* shell_ast_add_if(shell_ast_t* ast, ast_node_t* condition, ast_node_t
 
 ast_node_t* shell_ast_add_loop(shell_ast_t* ast, const char* type, const char* var, ast_node_t* list, ast_node_t* body) {
     if (!ast) return NULL;
+    (void)var;  // Reserved for future use
     
     ast_node_t* node = ast_node_create(AST_LOOP);
     if (node) {
@@ -378,6 +387,7 @@ ast_node_t* shell_ast_add_loop(shell_ast_t* ast, const char* type, const char* v
 
 ast_node_t* shell_ast_add_case(shell_ast_t* ast, const char* var, const char* pattern, ast_node_t* body) {
     if (!ast) return NULL;
+    (void)pattern;  // Reserved for future use
     
     ast_node_t* node = ast_node_create(AST_CASE);
     if (node) {
@@ -558,6 +568,14 @@ bool shell_ast_is_valid(const shell_ast_t* ast) {
 bool shell_ast_expects_parse_success(const shell_ast_t* ast) {
     if (!ast) return false;
     // Valid if: has valid structure AND no unclosed syntax
+    // Exception: Heredocs - bash is lenient and accepts unclosed heredocs with warning
+    // So we don't fail on has_valid_structure if the only issue is heredoc
+    if (ast->has_heredoc && !ast->has_valid_structure) {
+        // Only fail if there are OTHER issues besides heredoc
+        return !ast->has_unclosed_quote && 
+               !ast->has_unclosed_paren && 
+               !ast->has_unclosed_brace;
+    }
     return ast->has_valid_structure && 
            !ast->has_unclosed_quote && 
            !ast->has_unclosed_paren && 
