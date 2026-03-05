@@ -697,29 +697,29 @@ shell_error_t shell_parse_fast(
                 continue;
             }
             
-            // Check for "case" as word
+            // Check for "case" as complete word
             if (i + 3 < cmd_len && strncmp(cmd + i, "case", 4) == 0) {
-                // Make sure it's a word boundary (previous char not alphanumeric)
-                if (i == 0 || !isalnum((unsigned char)cmd[i-1])) {
+                bool ok_before = (i == 0 || !isalnum((unsigned char)cmd[i-1]));
+                bool ok_after = (i + 4 >= cmd_len || !isalnum((unsigned char)cmd[i+4]));
+                if (ok_before && ok_after) {
                     has_case = true;
                 }
             }
             
-            // Check for "in" as word (case's in)
+            // Check for "in" as complete word (case's in)
             if (i + 1 < cmd_len && strncmp(cmd + i, "in", 2) == 0) {
-                // Make sure it's a word boundary
-                if (i == 0 || !isalnum((unsigned char)cmd[i-1])) {
-                    // Check if we're in a case statement (after "case")
-                    if (has_case && !has_in) {
-                        has_in = true;
-                    }
+                bool ok_before = (i == 0 || !isalnum((unsigned char)cmd[i-1]));
+                bool ok_after = (i + 2 >= cmd_len || !isalnum((unsigned char)cmd[i+2]));
+                if (ok_before && ok_after && has_case && !has_in) {
+                    has_in = true;
                 }
             }
             
-            // Check for "esac" as word
+            // Check for "esac" as complete word
             if (i + 3 < cmd_len && strncmp(cmd + i, "esac", 4) == 0) {
-                // Make sure it's a word boundary
-                if (i == 0 || !isalnum((unsigned char)cmd[i-1])) {
+                bool ok_before = (i == 0 || !isalnum((unsigned char)cmd[i-1]));
+                bool ok_after = (i + 4 >= cmd_len || !isalnum((unsigned char)cmd[i+4]));
+                if (ok_before && ok_after) {
                     has_esac = true;
                 }
             }
@@ -752,23 +752,29 @@ shell_error_t shell_parse_fast(
                 continue;
             }
             
-            // Check for "while" as word
+            // Check for "while" as complete word
             if (i + 4 < cmd_len && strncmp(cmd + i, "while", 5) == 0) {
-                if (i == 0 || !isalnum((unsigned char)cmd[i-1])) {
+                bool ok_before = (i == 0 || !isalnum((unsigned char)cmd[i-1]));
+                bool ok_after = (i + 5 >= cmd_len || !isalnum((unsigned char)cmd[i+5]));
+                if (ok_before && ok_after) {
                     has_while_until_for = true;
                 }
             }
             
-            // Check for "until" as word
+            // Check for "until" as complete word
             if (i + 4 < cmd_len && strncmp(cmd + i, "until", 5) == 0) {
-                if (i == 0 || !isalnum((unsigned char)cmd[i-1])) {
+                bool ok_before = (i == 0 || !isalnum((unsigned char)cmd[i-1]));
+                bool ok_after = (i + 5 >= cmd_len || !isalnum((unsigned char)cmd[i+5]));
+                if (ok_before && ok_after) {
                     has_while_until_for = true;
                 }
             }
             
-            // Check for "for" as word
+            // Check for "for" as complete word
             if (i + 2 < cmd_len && strncmp(cmd + i, "for", 3) == 0) {
-                if (i == 0 || !isalnum((unsigned char)cmd[i-1])) {
+                bool ok_before = (i == 0 || !isalnum((unsigned char)cmd[i-1]));
+                bool ok_after = (i + 3 >= cmd_len || !isalnum((unsigned char)cmd[i+3]));
+                if (ok_before && ok_after) {
                     has_while_until_for = true;
                     // Check for "for ... in" pattern
                     if (i + 6 < cmd_len && strncmp(cmd + i + 3, " in", 3) == 0) {
@@ -777,35 +783,30 @@ shell_error_t shell_parse_fast(
                 }
             }
             
-            // Check for "do" as word (loop's do)
+            // Check for "do" as complete word (loop's do)
             if (i + 1 < cmd_len && strncmp(cmd + i, "do", 2) == 0) {
-                if (i == 0 || !isalnum((unsigned char)cmd[i-1])) {
-                    // Make sure we have a loop keyword before this do
-                    if (has_while_until_for || has_for_in) {
-                        has_do = true;
-                    }
+                bool ok_before = (i == 0 || !isalnum((unsigned char)cmd[i-1]));
+                bool ok_after = (i + 2 >= cmd_len || !isalnum((unsigned char)cmd[i+2]));
+                if (ok_before && ok_after && (has_while_until_for || has_for_in)) {
+                    has_do = true;
                 }
             }
             
-            // Check for "done" as word
+            // Check for "done" as complete word
             if (i + 3 < cmd_len && strncmp(cmd + i, "done", 4) == 0) {
-                if (i == 0 || !isalnum((unsigned char)cmd[i-1])) {
+                bool ok_before = (i == 0 || !isalnum((unsigned char)cmd[i-1]));
+                bool ok_after = (i + 4 >= cmd_len || !isalnum((unsigned char)cmd[i+4]));
+                if (ok_before && ok_after) {
                     has_done = true;
                 }
             }
         }
         
         // If we have while/until/for with "do" but no "done", it's invalid
-        // But only if we don't have a "for ... in" pattern (that's valid)
         if ((has_while_until_for || has_for_in) && has_do && !has_done) {
             result->status = SHELL_STATUS_ERROR;
             result->count = subcmd_idx;
             return SHELL_EPARSE;
-        }
-        
-        // Also check: if we have "for VAR" without "in" but with "do", it's invalid
-        if (has_while_until_for && !has_for_in && !has_do) {
-            // This is fine - just "while condition" is valid as incomplete
         }
     }
     
@@ -827,25 +828,30 @@ shell_error_t shell_parse_fast(
                 continue;
             }
             
-            // Check for "if" as word
+            // Check for "if" as complete word
+            // Must not be alphanumeric before or after
             if (i + 1 < cmd_len && strncmp(cmd + i, "if", 2) == 0) {
-                if (i == 0 || !isalnum((unsigned char)cmd[i-1])) {
+                bool ok_before = (i == 0 || !isalnum((unsigned char)cmd[i-1]));
+                bool ok_after = (i + 2 >= cmd_len || !isalnum((unsigned char)cmd[i+2]));
+                if (ok_before && ok_after) {
                     has_if = true;
                 }
             }
             
-            // Check for "then" as word
+            // Check for "then" as complete word
             if (i + 3 < cmd_len && strncmp(cmd + i, "then", 4) == 0) {
-                if (i == 0 || !isalnum((unsigned char)cmd[i-1])) {
-                    if (has_if) {
-                        has_then = true;
-                    }
+                bool ok_before = (i == 0 || !isalnum((unsigned char)cmd[i-1]));
+                bool ok_after = (i + 4 >= cmd_len || !isalnum((unsigned char)cmd[i+4]));
+                if (ok_before && ok_after && has_if) {
+                    has_then = true;
                 }
             }
             
-            // Check for "fi" as word
+            // Check for "fi" as complete word
             if (i + 1 < cmd_len && strncmp(cmd + i, "fi", 2) == 0) {
-                if (i == 0 || !isalnum((unsigned char)cmd[i-1])) {
+                bool ok_before = (i == 0 || !isalnum((unsigned char)cmd[i-1]));
+                bool ok_after = (i + 2 >= cmd_len || !isalnum((unsigned char)cmd[i+2]));
+                if (ok_before && ok_after) {
                     has_fi = true;
                 }
             }
