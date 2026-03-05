@@ -217,6 +217,14 @@ shell_error_t shell_parse_fast(
     int brace_depth = 0;
     int arith_depth = 0;  // Track when inside $((...))
     
+    // Track case statement state
+    // Note: These are tracked via keyword scanning at end; kept for potential future use
+    // bool in_case = false;
+    
+    // Track loop state
+    // Note: These are tracked via keyword scanning at end; kept for potential future use
+    // bool in_loop = false;
+    
     while (pos < cmd_len) {
         char c = cmd[pos];
         
@@ -667,6 +675,188 @@ shell_error_t shell_parse_fast(
         result->status = SHELL_STATUS_ERROR;
         result->count = subcmd_idx;
         return SHELL_EPARSE;
+    }
+    
+    // Check for incomplete case statement: "case ... in" without "esac"
+    // Scan for "case" keyword and validate structure
+    {
+        // Look for case...in pattern without esac
+        bool has_case = false;
+        bool has_in = false;
+        bool has_esac = false;
+        
+        for (size_t i = 0; i + 3 < cmd_len; i++) {
+            // Skip quoted sections
+            if (cmd[i] == '\'' || cmd[i] == '"') {
+                char quote = cmd[i];
+                i++;
+                while (i < cmd_len && cmd[i] != quote) {
+                    if (cmd[i] == '\\' && i + 1 < cmd_len) i++;
+                    i++;
+                }
+                continue;
+            }
+            
+            // Check for "case" as word
+            if (i + 3 < cmd_len && strncmp(cmd + i, "case", 4) == 0) {
+                // Make sure it's a word boundary (previous char not alphanumeric)
+                if (i == 0 || !isalnum((unsigned char)cmd[i-1])) {
+                    has_case = true;
+                }
+            }
+            
+            // Check for "in" as word (case's in)
+            if (i + 1 < cmd_len && strncmp(cmd + i, "in", 2) == 0) {
+                // Make sure it's a word boundary
+                if (i == 0 || !isalnum((unsigned char)cmd[i-1])) {
+                    // Check if we're in a case statement (after "case")
+                    if (has_case && !has_in) {
+                        has_in = true;
+                    }
+                }
+            }
+            
+            // Check for "esac" as word
+            if (i + 3 < cmd_len && strncmp(cmd + i, "esac", 4) == 0) {
+                // Make sure it's a word boundary
+                if (i == 0 || !isalnum((unsigned char)cmd[i-1])) {
+                    has_esac = true;
+                }
+            }
+        }
+        
+        // If we have "case ... in" but no "esac", it's invalid
+        if (has_case && has_in && !has_esac) {
+            result->status = SHELL_STATUS_ERROR;
+            result->count = subcmd_idx;
+            return SHELL_EPARSE;
+        }
+    }
+    
+    // Check for incomplete loop: while/until/for without "done"
+    {
+        bool has_while_until_for = false;
+        bool has_do = false;
+        bool has_done = false;
+        bool has_for_in = false;  // for VAR in LIST
+        
+        for (size_t i = 0; i + 2 < cmd_len; i++) {
+            // Skip quoted sections
+            if (cmd[i] == '\'' || cmd[i] == '"') {
+                char quote = cmd[i];
+                i++;
+                while (i < cmd_len && cmd[i] != quote) {
+                    if (cmd[i] == '\\' && i + 1 < cmd_len) i++;
+                    i++;
+                }
+                continue;
+            }
+            
+            // Check for "while" as word
+            if (i + 4 < cmd_len && strncmp(cmd + i, "while", 5) == 0) {
+                if (i == 0 || !isalnum((unsigned char)cmd[i-1])) {
+                    has_while_until_for = true;
+                }
+            }
+            
+            // Check for "until" as word
+            if (i + 4 < cmd_len && strncmp(cmd + i, "until", 5) == 0) {
+                if (i == 0 || !isalnum((unsigned char)cmd[i-1])) {
+                    has_while_until_for = true;
+                }
+            }
+            
+            // Check for "for" as word
+            if (i + 2 < cmd_len && strncmp(cmd + i, "for", 3) == 0) {
+                if (i == 0 || !isalnum((unsigned char)cmd[i-1])) {
+                    has_while_until_for = true;
+                    // Check for "for ... in" pattern
+                    if (i + 6 < cmd_len && strncmp(cmd + i + 3, " in", 3) == 0) {
+                        has_for_in = true;
+                    }
+                }
+            }
+            
+            // Check for "do" as word (loop's do)
+            if (i + 1 < cmd_len && strncmp(cmd + i, "do", 2) == 0) {
+                if (i == 0 || !isalnum((unsigned char)cmd[i-1])) {
+                    // Make sure we have a loop keyword before this do
+                    if (has_while_until_for || has_for_in) {
+                        has_do = true;
+                    }
+                }
+            }
+            
+            // Check for "done" as word
+            if (i + 3 < cmd_len && strncmp(cmd + i, "done", 4) == 0) {
+                if (i == 0 || !isalnum((unsigned char)cmd[i-1])) {
+                    has_done = true;
+                }
+            }
+        }
+        
+        // If we have while/until/for with "do" but no "done", it's invalid
+        // But only if we don't have a "for ... in" pattern (that's valid)
+        if ((has_while_until_for || has_for_in) && has_do && !has_done) {
+            result->status = SHELL_STATUS_ERROR;
+            result->count = subcmd_idx;
+            return SHELL_EPARSE;
+        }
+        
+        // Also check: if we have "for VAR" without "in" but with "do", it's invalid
+        if (has_while_until_for && !has_for_in && !has_do) {
+            // This is fine - just "while condition" is valid as incomplete
+        }
+    }
+    
+    // Check for incomplete if statement: "if ... then" without "fi"
+    {
+        bool has_if = false;
+        bool has_then = false;
+        bool has_fi = false;
+        
+        for (size_t i = 0; i + 1 < cmd_len; i++) {
+            // Skip quoted sections
+            if (cmd[i] == '\'' || cmd[i] == '"') {
+                char quote = cmd[i];
+                i++;
+                while (i < cmd_len && cmd[i] != quote) {
+                    if (cmd[i] == '\\' && i + 1 < cmd_len) i++;
+                    i++;
+                }
+                continue;
+            }
+            
+            // Check for "if" as word
+            if (i + 1 < cmd_len && strncmp(cmd + i, "if", 2) == 0) {
+                if (i == 0 || !isalnum((unsigned char)cmd[i-1])) {
+                    has_if = true;
+                }
+            }
+            
+            // Check for "then" as word
+            if (i + 3 < cmd_len && strncmp(cmd + i, "then", 4) == 0) {
+                if (i == 0 || !isalnum((unsigned char)cmd[i-1])) {
+                    if (has_if) {
+                        has_then = true;
+                    }
+                }
+            }
+            
+            // Check for "fi" as word
+            if (i + 1 < cmd_len && strncmp(cmd + i, "fi", 2) == 0) {
+                if (i == 0 || !isalnum((unsigned char)cmd[i-1])) {
+                    has_fi = true;
+                }
+            }
+        }
+        
+        // If we have "if ... then" but no "fi", it's invalid
+        if (has_if && has_then && !has_fi) {
+            result->status = SHELL_STATUS_ERROR;
+            result->count = subcmd_idx;
+            return SHELL_EPARSE;
+        }
     }
     
     // Check for invalid shell: bare redirects (>, >>, <, <<, <<<) or bare separators (; | &)
