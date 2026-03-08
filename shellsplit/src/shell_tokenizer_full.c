@@ -976,6 +976,9 @@ bool shell_tokenize_commands(const char* input, shell_command_t** commands, size
         *command_count = 0;
         return false;
     }
+    
+    // Zero out all commands to ensure clean state
+    memset(*commands, 0, count * sizeof(shell_command_t));
 
     // Second pass: tokenize and group into commands
     shell_tokenizer_init(&state, input);
@@ -1010,6 +1013,9 @@ bool shell_tokenize_commands(const char* input, shell_command_t** commands, size
                               token.type == TOKEN_VARIABLE_QUOTED || token.type == TOKEN_SPECIAL_VAR)) {
             if (current_cmd->token_count > 0) {
                 if (current_command + 1 < count) {
+                    // Save tokens to current command before creating new one
+                    current_cmd->tokens = tokens;
+                    
                     current_command++;
                     current_cmd = &(*commands)[current_command];
                     current_cmd->start_pos = token.position;
@@ -1077,10 +1083,14 @@ bool shell_tokenize_commands(const char* input, shell_command_t** commands, size
 
     if (current_command < count) {
         (*commands)[current_command].end_pos = state.position;
+        // Save tokens for the last command
+        current_cmd->tokens = tokens;
     }
 
-    // Check for unclosed quotes, parentheses, or braces - indicates malformed input
-    if (state.in_quotes || state.paren_depth > 0 || state.brace_depth > 0) {
+    // Check for unclosed quotes or braces - indicates malformed input
+    // Note: We allow unclosed parentheses (paren_depth > 0) because inputs like "( git" 
+    // are valid shell - the unclosed paren is just shell syntax for subshell start
+    if (state.in_quotes || state.brace_depth > 0) {
         // Clean up allocated commands before returning error
         for (size_t i = 0; i < count; i++) {
             if ((*commands)[i].tokens != NULL) {

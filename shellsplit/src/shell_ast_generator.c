@@ -171,26 +171,6 @@ static ast_node_t* gen_glob(shell_ast_generator_t* gen, shell_ast_t* ast) {
     return shell_ast_add_glob(ast, pattern);
 }
 
-// Generate heredoc: <<DELIM content DELIM
-static ast_node_t* gen_heredoc(shell_ast_generator_t* gen, shell_ast_t* ast) {
-    bool is_closed = (random_range(gen, 10) != 0); // 90% closed
-    const char* delim = "EOF";
-    const char* content = "heredoc content line 1\nline 2\nline 3";
-    
-    ast_node_t* node = shell_ast_add_heredoc(ast, delim, content);
-    if (node && !is_closed) {
-        node->is_valid = false;
-        ast->has_heredoc = true;
-        ast->has_valid_structure = false;
-        // Mark as unclosed by not having child with content
-        if (node->child) {
-            free(node->child);
-            node->child = NULL;
-        }
-    }
-    return node;
-}
-
 // Generate case statement: case VAR in pattern) cmd;; esac
 static ast_node_t* gen_case(shell_ast_generator_t* gen, shell_ast_t* ast) {
     const char* var = gen_random_variable(gen);
@@ -304,74 +284,6 @@ static void gen_compound_with_vars(shell_ast_generator_t* gen, shell_ast_t* ast)
     ast->has_valid_structure = true;
 }
 
-// $((VAR + 1)) && cmd - arithmetic with command
-static void gen_arithmetic_compound(shell_ast_generator_t* gen, shell_ast_t* ast) {
-    ast_node_t* arith = gen_arithmetic(gen, ast);
-    if (arith && !arith->is_valid) {
-        ast->has_unclosed_paren = true;
-        ast->has_valid_structure = false;
-        ast->root = arith;
-        return;
-    }
-    
-    ast_node_t* cmd = gen_command(gen, ast);
-    ast->root = shell_ast_add_sequence(ast, arith, cmd, "&&");
-    ast->has_valid_structure = true;
-    ast->has_arithmetic = true;
-}
-
-// while read line; do echo $line; done < file - loop with redirect
-static void gen_loop_with_redirect(shell_ast_generator_t* gen, shell_ast_t* ast) {
-    ast_node_t* body = gen_command(gen, ast);
-    ast_node_t* var = gen_variable(gen, ast);
-    var->next = body;
-    
-    ast_node_t* list = shell_ast_add_command(ast, "read");
-    ast_node_t* loop = shell_ast_add_loop(ast, "while", "line", list, body);
-    
-    const char* target = gen_random_file(gen);
-    ast_node_t* cmd = shell_ast_add_redirect(ast, body, target, -1, true, false, false);
-    (void)cmd;
-    
-    ast->root = loop;
-    ast->has_valid_structure = true;
-    ast->has_loops = true;
-    ast->has_redirect = true;
-}
-
-// cat <<EOF | grep pattern - heredoc in pipeline
-static void gen_heredoc_in_pipeline(shell_ast_generator_t* gen, shell_ast_t* ast) {
-    ast_node_t* heredoc = gen_heredoc(gen, ast);
-    if (heredoc && !heredoc->is_valid) {
-        ast->root = heredoc;
-        ast->has_valid_structure = false;
-        ast->has_heredoc = true;
-        return;
-    }
-    
-    ast_node_t* cmd1 = shell_ast_add_command(ast, "cat");
-    ast_node_t* cmd2 = shell_ast_add_command(ast, "grep");
-    ast_node_t* pattern = gen_glob(gen, ast); // Use glob as pattern
-    pattern->next = cmd2;
-    
-    ast->root = shell_ast_add_pipeline(ast, cmd1, cmd2);
-    ast->has_valid_structure = true;
-    ast->has_heredoc = true;
-}
-
-// "quoted $VAR" - quoted string with variable
-static void gen_quoted_with_var(shell_ast_generator_t* gen, shell_ast_t* ast) {
-    ast_node_t* cmd = gen_command(gen, ast);
-    ast_node_t* quote = gen_quote(gen, ast);
-    // Force closed for valid case
-    quote->is_valid = true;
-    quote->next = cmd;
-    
-    ast->root = cmd;
-    ast->has_valid_structure = true;
-    ast->has_unclosed_quote = false;
-}
-
 // for f in *.txt; do cat $f; done - glob in loop
 static void gen_glob_in_loop(shell_ast_generator_t* gen, shell_ast_t* ast) {
     ast_node_t* glob = gen_glob(gen, ast);
@@ -468,6 +380,7 @@ static void gen_leading_separator(shell_ast_generator_t* gen, shell_ast_t* ast) 
 
 // Invalid arithmetic: $(( without closing
 static void gen_invalid_arithmetic(shell_ast_generator_t* gen, shell_ast_t* ast) {
+    (void)gen;  // unused parameter
     ast_node_t* node = shell_ast_add_arithmetic(ast, "", true); // Empty unclosed
     if (node) {
         ast->root = node;

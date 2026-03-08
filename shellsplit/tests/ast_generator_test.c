@@ -14,6 +14,7 @@
 static FILE* crash_log = NULL;
 
 static void save_crash(const char* cmd, const char* filename) {
+    (void)filename;  // unused parameter
     if (!crash_log) {
         crash_log = fopen("tests/generator_crashes.log", "w");
     }

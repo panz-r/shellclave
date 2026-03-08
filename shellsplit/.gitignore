@@ -2,16 +2,30 @@
 tests/tokenizer_test
 tests/tokenizer_ext_test
 tests/fast_parser_test
-libshellsplit.a
-fuzz/tokenizer_fuzzer
 tests/generator_test
 tests/ast_generator_test
-# logs
-tests/generator_crashes.log
+libshellsplit.a
+
+# Fuzzing
+fuzz/tokenizer_fuzzer
+fuzz/tokenizer_fuzzer_asan
+fuzz/crash-*
+fuzz/oom-*
+fuzz/leak-*
+fuzz/*.log
+fuzz/logs/
+fuzz/fuzzer_dict.txt
+fuzz/coverage
+fuzz/fuzz-*.log
+
 # Object files
 *.o
 .cache
 compile_commands.json
+
+# Logs
+tests/generator_crashes.log
+
 # Coverage files
 *.gcda
 *.gcno
@@ -25,3 +39,24 @@ tests/*.gcov.html
 tests/*.func-c.html
 tests/*.func.html
 tests/index-*.html
+
+# Coverage reports
+coverage_html/
+coverage.info
+tmp.info
+tmp2.info
+cmd_line
+
+# Generated images
+*.png
+
+# HTML files
+index*.html
+*.html
+
+# Examples
+examples/gen_examples
+examples/gen_examples.c
+
+# Coverage source
+coverage_src.info

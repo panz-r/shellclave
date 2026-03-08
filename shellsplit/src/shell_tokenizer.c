@@ -215,6 +215,7 @@ shell_error_t shell_parse_fast(
     bool in_quotes = false;
     char quote_char = 0;
     int brace_depth = 0;
+    int paren_depth = 0;  // Track regular parentheses ()
     int arith_depth = 0;  // Track when inside $((...))
     
     // Track case statement state
@@ -226,6 +227,8 @@ shell_error_t shell_parse_fast(
     // bool in_loop = false;
     
     while (pos < cmd_len) {
+        // Additional bounds check for safety
+        if (pos >= cmd_len) break;
         char c = cmd[pos];
         
         // Check for invalid characters at start of command:
@@ -307,12 +310,38 @@ shell_error_t shell_parse_fast(
             pos += 3;  // Skip $(( entirely (3 chars)
             continue;
         }
-        if (c == '(') {
-            brace_depth++;
-        } else if (c == ')' && brace_depth > 0) {
-            brace_depth--;
-            if (arith_depth > 0) {
-                arith_depth--;  // Decrement arithmetic depth
+        // Also handle plain (( )) - arithmetic in bash
+        if (c == '(' && pos + 1 < cmd_len && cmd[pos + 1] == '(') {
+            // This is (( - arithmetic
+            brace_depth += 2;
+            arith_depth += 2;
+            pos += 2;  // Skip (( 
+            continue;
+        }
+        if (c == ')') {
+            // Check if closing arithmetic
+            if (brace_depth > 1 && pos > 0 && cmd[pos-1] == ')') {
+                // This might be closing (( 
+                brace_depth--;
+                if (arith_depth > 0) {
+                    arith_depth--;
+                }
+            } else if (brace_depth > 0) {
+                brace_depth--;
+                if (arith_depth > 0) {
+                    arith_depth--;  // Decrement arithmetic depth
+                }
+            }
+        }
+        
+        // Track regular parentheses () for subshell detection
+        // But not inside arithmetic $(( )) or process substitution <( )
+        // Only track when NOT inside arithmetic expansion
+        if (arith_depth == 0) {
+            if (c == '(') {
+                paren_depth++;
+            } else if (c == ')' && paren_depth > 0) {
+                paren_depth--;
             }
         }
         
@@ -598,22 +627,40 @@ shell_error_t shell_parse_fast(
                         if (cmd[pos] == ')') depth--;
                         if (depth > 0) pos++;
                     }
-                    // Mark that we have process substitution
-                    result->cmds[subcmd_idx].features |= SHELL_FEAT_PROCESS_SUB;
+                    // Check if we exited due to unmatched parens (invalid)
+                    if (depth > 0) {
+                        // Unclosed parenthesis - invalid
+                        result->status = SHELL_STATUS_ERROR;
+                        result->count = subcmd_idx;
+                        return SHELL_EPARSE;
+                    }
+                    // Mark that we have process substitution (if we have at least one subcommand)
+                    if (subcmd_idx > 0 && subcmd_idx < max_cmds) {
+                        result->cmds[subcmd_idx - 1].features |= SHELL_FEAT_PROCESS_SUB;
+                    }
                     if (current_type == SHELL_TYPE_SIMPLE) {
                         current_type = SHELL_TYPE_PIPELINE;
                     }
                     continue;
                 }
-                // Check for multi-char redirects: >>, <<, >&, &>, etc.
+                // Check for multi-char redirects: >>, <<, >&, &>, <&, &<, etc.
                 bool is_double_redirect = false;
-                if (pos + 1 < cmd_len && (cmd[pos + 1] == '>' || cmd[pos + 1] == '<')) {
-                    is_double_redirect = true;
-                    pos++; // skip second char of >>
+                bool is_fd_redirect = false;  // >& or <& (file descriptor redirect)
+                if (pos + 1 < cmd_len) {
+                    if (cmd[pos + 1] == '>' || cmd[pos + 1] == '<') {
+                        // >>, <<
+                        is_double_redirect = true;
+                        pos++; // skip second char
+                    } else if (cmd[pos + 1] == '&') {
+                        // >& or <& (fd redirect)
+                        is_fd_redirect = true;
+                        pos++; // skip the &
+                    }
                 }
                 pos++;
-                // Skip file descriptor number if present (but not after >>)
-                if (!is_double_redirect) {
+                // Skip file descriptor number if present (but not after >>, and not for fd redirects)
+                // For 2>file, skip the 2. For 2>&1, don't skip the 1 (it's the target).
+                if (!is_double_redirect && !is_fd_redirect) {
                     while (pos < cmd_len && isdigit(cmd[pos])) pos++;
                 }
                 // Skip whitespace
@@ -626,6 +673,9 @@ shell_error_t shell_parse_fast(
                     result->count = subcmd_idx;
                     return SHELL_EPARSE;
                 }
+                
+                // Check for valid redirect operators: &>, &>>, <&, &<, etc.
+                // These are valid bash redirects (e.g., >&1, 2>&1, &>file)
                 char next_ch = cmd[pos];
                 // Redirect target can't be an operator
                 if (next_ch == '<' || next_ch == '>' || next_ch == '|' || 
@@ -672,6 +722,15 @@ shell_error_t shell_parse_fast(
     
     // Check for unclosed quotes or braces - this indicates malformed input
     if (in_quotes || brace_depth > 0) {
+        result->status = SHELL_STATUS_ERROR;
+        result->count = subcmd_idx;
+        return SHELL_EPARSE;
+    }
+    
+    // Check for unclosed parentheses - indicates invalid input like "( git"
+    // But allow subshell syntax - only reject if paren_depth > 0 AND the content 
+    // doesn't look like a valid subshell (e.g., "( ls )" has matching parens)
+    if (paren_depth > 0) {
         result->status = SHELL_STATUS_ERROR;
         result->count = subcmd_idx;
         return SHELL_EPARSE;
@@ -803,7 +862,18 @@ shell_error_t shell_parse_fast(
         }
         
         // If we have while/until/for with "do" but no "done", it's invalid
-        if ((has_while_until_for || has_for_in) && has_do && !has_done) {
+        // BUT allow C-style for loops: for ((expr; expr; expr))
+        // These have (( without needing do/done
+        bool is_c_style_for = false;
+        for (size_t i = 0; i + 5 < cmd_len; i++) {
+            // Look for "for ((" pattern - C-style for loop
+            if (strncmp(cmd + i, "for ((", 6) == 0) {
+                is_c_style_for = true;
+                break;
+            }
+        }
+        
+        if ((has_while_until_for || has_for_in) && has_do && !has_done && !is_c_style_for) {
             result->status = SHELL_STATUS_ERROR;
             result->count = subcmd_idx;
             return SHELL_EPARSE;
@@ -943,6 +1013,43 @@ shell_error_t shell_parse_fast(
         result->status = SHELL_STATUS_ERROR;
         result->count = 0;
         return SHELL_EPARSE;
+    }
+    
+    // Check for trailing separator: "cmd |" or "cmd ;" or "cmd &" is invalid shell
+    // (unless it's && or || which would connect to another command)
+    if (subcmd_idx > 0) {
+        // Get the last subcommand
+        uint32_t last_start = result->cmds[subcmd_idx - 1].start;
+        uint32_t last_len = result->cmds[subcmd_idx - 1].len;
+        
+        if (last_len > 0) {
+            // Check if the last subcommand ends with |, ;, or &
+            char last_char = cmd[last_start + last_len - 1];
+            if (last_char == '|' || last_char == ';' || last_char == '&') {
+                // Check it's not && or ||
+                if (!(last_len >= 2 && cmd[last_start + last_len - 2] == last_char)) {
+                    // Trailing separator without valid continuation
+                    result->status = SHELL_STATUS_ERROR;
+                    result->count = subcmd_idx;
+                    return SHELL_EPARSE;
+                }
+            }
+        }
+    }
+    
+    // Also check for the case where we have a trailing separator but no subcommand after it
+    // This happens with "cmd |" where the | sets subcmd_start past the end
+    if (subcmd_start >= cmd_len && subcmd_idx > 0) {
+        // The last thing we saw was a separator - check what type
+        // If current_type is PIPELINE/SEMICOLON/AND/OR, we have a trailing separator
+        if (current_type == SHELL_TYPE_PIPELINE || 
+            current_type == SHELL_TYPE_SEMICOLON ||
+            current_type == SHELL_TYPE_AND ||
+            current_type == SHELL_TYPE_OR) {
+            result->status = SHELL_STATUS_ERROR;
+            result->count = subcmd_idx;
+            return SHELL_EPARSE;
+        }
     }
     
     result->count = subcmd_idx;

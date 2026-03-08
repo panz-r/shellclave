@@ -645,7 +645,7 @@ int main() {
                             "fi";
         shell_command_t* cmds = NULL;
         size_t count = 0;
-        int result = shell_tokenize_commands(input, &cmds, &count);
+        shell_tokenize_commands(input, &cmds, &count);
         // Known limitation: PIPESTATUS[0] has unsupported array subscript - always fails
         // Just verify it doesn't crash
         test("Extended tokenizer: build and test pipeline", true);
@@ -772,7 +772,7 @@ int main() {
                             "fi";
         shell_command_t* cmds = NULL;
         size_t count = 0;
-        int result = shell_tokenize_commands(input, &cmds, &count);
+        shell_tokenize_commands(input, &cmds, &count);
         // Known limitation: PIPESTATUS[0] has unsupported array subscript - always fails
         // Just verify it doesn't crash
         test("Extended tokenizer: complete CI/CD pipeline", true);
@@ -1580,7 +1580,6 @@ int main() {
     {
         char* input = malloc(8192);
         strcpy(input, "cmd1 $V1 $V2 $V3 *.txt *.log | ");
-        size_t len = strlen(input);
         for (int i = 0; i < 50; i++) {
             strcat(input, "cmd$((i)) $(echo i) | ");
         }
@@ -2313,7 +2312,7 @@ int main() {
     
     // Test 206: Very long variable name
     {
-        char* input = malloc(2100);
+        char* input = malloc(2101);
         sprintf(input, "echo $");
         memset(input + 5, 'V', 2000);
         input[2100] = '\0';
@@ -2426,7 +2425,7 @@ int main() {
     
     // Test 216: High bytes (binary data) - should be rejected but is accepted
     {
-        const char* input = "\x80\x81cmd";
+        const char input[] = {'\x80', '\x81', 'c', 'm', 'd', '\0'};
         shell_command_t* cmds = NULL;
         size_t count = 0;
         int result = shell_tokenize_commands(input, &cmds, &count);
@@ -2484,7 +2483,7 @@ int main() {
         const char* input = "   ";
         shell_command_t* cmds = NULL;
         size_t count = 0;
-        int result = shell_tokenize_commands(input, &cmds, &count);
+        shell_tokenize_commands(input, &cmds, &count);
         test_lim("Whitespace only returns 0 (known correct)", count == 0);
         if (cmds) shell_free_commands(cmds, count);
     }

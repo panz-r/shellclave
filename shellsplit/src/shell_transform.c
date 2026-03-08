@@ -84,6 +84,12 @@ bool shell_transform_command(shell_command_t* cmd, transformed_command_t** trans
     tcmd->has_transformations = false;
     tcmd->has_shell_syntax = false;
 
+    // Check if command has tokens - if not, we can't transform it
+    if (cmd->token_count == 0 || cmd->tokens == NULL) {
+        free(tcmd);
+        return false;
+    }
+    
     size_t orig_length = cmd->end_pos - cmd->start_pos;
     tcmd->original_command = strndup(cmd->tokens[0].start, orig_length);
     if (!tcmd->original_command) {
@@ -172,7 +178,10 @@ bool shell_transform_command_line(
         if (shell_transform_command(&cmds[i], &tcmds[i])) {
             success_count++;
         } else {
-            for (size_t j = 0; j < i; j++) shell_free_transformed_commands(&tcmds[j], 1);
+            // On failure, free successfully transformed commands
+            for (size_t j = 0; j < success_count; j++) {
+                shell_free_transformed_commands(&tcmds[j], 1);
+            }
             free(tcmds);
             shell_free_commands(cmds, cmd_count);
             *transformed_count = success_count;
@@ -202,7 +211,7 @@ void shell_free_transformed_commands(transformed_command_t** commands, size_t co
             free(commands[i]);
         }
     }
-    free(commands);
+    // Note: don't free(commands) here - caller manages the array memory
 }
 
 const char* shell_get_dfa_input(transformed_command_t* cmd) {
