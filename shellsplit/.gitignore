@@ -5,6 +5,7 @@ tests/fast_parser_test
 tests/generator_test
 tests/ast_generator_test
 tests/entropy_test
+tools/shell_abstract_cli 
 libshellsplit.a
 
 # Fuzzing

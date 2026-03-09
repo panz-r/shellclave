@@ -22,7 +22,7 @@ all: $(TESTS_DIR)/tokenizer_test $(TESTS_DIR)/entropy_test
 
 # Generate compile_commands.json using bear
 # First compile all source files, then use bear to capture the commands
-compile_commands.json: $(SRC_DIR)/shell_tokenizer.c $(SRC_DIR)/shell_processor.c $(SRC_DIR)/shell_transform.c $(SRC_DIR)/shell_tokenizer_full.c $(SRC_DIR)/shell_ast.c $(SRC_DIR)/shell_ast_generator.c
+compile_commands.json: $(SRC_DIR)/shell_tokenizer.c $(SRC_DIR)/shell_processor.c $(SRC_DIR)/shell_transform.c $(SRC_DIR)/shell_tokenizer_full.c $(SRC_DIR)/shell_ast.c $(SRC_DIR)/shell_ast_generator.c $(SRC_DIR)/shell_abstract.c
 	@rm -f $@
 	bear -- $(CC) $(CFLAGS) -c -o $(SRC_DIR)/shell_tokenizer.o $(SRC_DIR)/shell_tokenizer.c
 	bear -- $(CC) $(CFLAGS) -c -o $(SRC_DIR)/shell_processor.o $(SRC_DIR)/shell_processor.c
@@ -30,6 +30,7 @@ compile_commands.json: $(SRC_DIR)/shell_tokenizer.c $(SRC_DIR)/shell_processor.c
 	bear -- $(CC) $(CFLAGS) -c -o $(SRC_DIR)/shell_tokenizer_full.o $(SRC_DIR)/shell_tokenizer_full.c
 	bear -- $(CC) $(CFLAGS) -c -o $(SRC_DIR)/shell_ast.o $(SRC_DIR)/shell_ast.c
 	bear -- $(CC) $(CFLAGS) -c -o $(SRC_DIR)/shell_ast_generator.o $(SRC_DIR)/shell_ast_generator.c
+	bear -- $(CC) $(CFLAGS) -c -o $(SRC_DIR)/shell_abstract.o $(SRC_DIR)/shell_abstract.c
 	@rm -f $(SRC_DIR)/*.o
 
 # Build unified tokenizer test (all tests in one)
@@ -37,13 +38,16 @@ $(TESTS_DIR)/tokenizer_test: $(TESTS_DIR)/tokenizer_test.c \
 		$(SRC_DIR)/shell_tokenizer.c $(SRC_DIR)/shell_tokenizer_full.c \
 		$(SRC_DIR)/shell_processor.c \
 		$(SRC_DIR)/shell_transform.c \
+		$(SRC_DIR)/shell_abstract.c \
 		$(INC_DIR)/shell_tokenizer.h $(INC_DIR)/shell_tokenizer_full.h \
 		$(INC_DIR)/shell_processor.h \
-		$(INC_DIR)/shell_transform.h
+		$(INC_DIR)/shell_transform.h \
+		$(INC_DIR)/shell_abstract.h
 	$(CC) $(CFLAGS) -o $@ $(TESTS_DIR)/tokenizer_test.c \
 		$(SRC_DIR)/shell_tokenizer.c $(SRC_DIR)/shell_tokenizer_full.c \
 		$(SRC_DIR)/shell_processor.c \
-		$(SRC_DIR)/shell_transform.c $(LDFLAGS)
+		$(SRC_DIR)/shell_transform.c \
+		$(SRC_DIR)/shell_abstract.c $(LDFLAGS)
 
 # Build fast parser test
 $(TESTS_DIR)/fast_parser_test: $(TESTS_DIR)/fast_parser_test.c \
@@ -76,6 +80,26 @@ $(TESTS_DIR)/entropy_test: $(TESTS_DIR)/entropy_test.c \
 	$(CC) $(CFLAGS) -DRELATIVE_ENTROPY_NO_MAIN -o $@ $(TESTS_DIR)/entropy_test.c \
 		$(SRC_DIR)/env_screener.c $(SRC_DIR)/relative_permutation_entropy.c $(LDFLAGS)
 
+# Build abstract test
+$(TESTS_DIR)/abstract_test: $(TESTS_DIR)/abstract_test.c \
+		$(SRC_DIR)/shell_abstract.c \
+		$(SRC_DIR)/shell_tokenizer.c $(SRC_DIR)/shell_tokenizer_full.c \
+		$(INC_DIR)/shell_abstract.h \
+		$(INC_DIR)/shell_tokenizer.h $(INC_DIR)/shell_tokenizer_full.h
+	$(CC) $(CFLAGS) -o $@ $(TESTS_DIR)/abstract_test.c \
+		$(SRC_DIR)/shell_abstract.c \
+		$(SRC_DIR)/shell_tokenizer.c $(SRC_DIR)/shell_tokenizer_full.c $(LDFLAGS)
+
+# Build CLI tool
+tools/shell_abstract_cli: tools/shell_abstract_cli.c \
+		$(SRC_DIR)/shell_abstract.c \
+		$(SRC_DIR)/shell_tokenizer.c $(SRC_DIR)/shell_tokenizer_full.c \
+		$(INC_DIR)/shell_abstract.h \
+		$(INC_DIR)/shell_tokenizer.h $(INC_DIR)/shell_tokenizer_full.h
+	$(CC) $(CFLAGS) -o $@ tools/shell_abstract_cli.c \
+		$(SRC_DIR)/shell_abstract.c \
+		$(SRC_DIR)/shell_tokenizer.c $(SRC_DIR)/shell_tokenizer_full.c $(LDFLAGS)
+
 # Build library
 libshellsplit.a: $(SRC_DIR)/shell_tokenizer.c $(SRC_DIR)/shell_processor.c
 	$(CC) $(CFLAGS) -c -o $(SRC_DIR)/shell_tokenizer.o $(SRC_DIR)/shell_tokenizer.c
@@ -89,13 +113,15 @@ clean:
 	rm -f $(TESTS_DIR)/fast_parser_test
 	rm -f $(TESTS_DIR)/ast_generator_test
 	rm -f $(TESTS_DIR)/entropy_test
+	rm -f $(TESTS_DIR)/abstract_test
+	rm -f tools/shell_abstract_cli
 	rm -f $(SRC_DIR)/*.o
 	rm -f libshellsplit.a
 	rm -f compile_commands.json
 	rm -f $(TESTS_DIR)/generator_crashes.log
 
 # Test - run all tests
-test: $(TESTS_DIR)/tokenizer_test $(TESTS_DIR)/fast_parser_test $(TESTS_DIR)/ast_generator_test $(TESTS_DIR)/entropy_test compile_commands.json
+test: $(TESTS_DIR)/tokenizer_test $(TESTS_DIR)/fast_parser_test $(TESTS_DIR)/ast_generator_test $(TESTS_DIR)/abstract_test $(TESTS_DIR)/entropy_test compile_commands.json
 	@echo ""
 	@echo "=== Running Original Tokenizer Tests (215 with 9 limitations) ==="
 	@./$(TESTS_DIR)/tokenizer_test || true
@@ -108,6 +134,8 @@ test: $(TESTS_DIR)/tokenizer_test $(TESTS_DIR)/fast_parser_test $(TESTS_DIR)/ast
 	@echo ""
 	@echo "=== Running Entropy/Screener Tests ==="
 	@./$(TESTS_DIR)/entropy_test || true
+	@echo "=== Running Abstract Engine Tests ==="
+	@./$(TESTS_DIR)/abstract_test || true
 	@echo ""
 	@echo "========================================"
 	@echo "=== COMBINED TEST SUMMARY ==="
