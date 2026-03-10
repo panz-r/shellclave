@@ -4,6 +4,7 @@ tests/tokenizer_ext_test
 tests/fast_parser_test
 tests/generator_test
 tests/ast_generator_test
+tests/entropy_test
 libshellsplit.a
 
 # Fuzzing

@@ -4,6 +4,8 @@
 #include <stdbool.h>
 #include <stddef.h>
 
+#include "relative_permutation_entropy.h"
+
 /**
  * env_screener - Environment Variable Screening Module
  * 
@@ -21,8 +23,8 @@
  * CONFIGURATION (can be overridden)
  * ============================================================ */
 
-#ifndef ENV_SCREENER_ENTROPY_THRESHOLD
-#define ENV_SCREENER_ENTROPY_THRESHOLD 5.0
+#ifndef ENV_SCREENER_POSTERIOR_THRESHOLD
+#define ENV_SCREENER_POSTERIOR_THRESHOLD 0.5
 #endif
 
 #ifndef ENV_SCREENER_MIN_LENGTH
@@ -81,7 +83,7 @@ env_screener_status_t env_screener_scan(
     int *out_indices,
     int capacity,
     int *out_count,
-    double entropy_threshold,
+    double posterior_threshold,
     int min_length
 );
 
@@ -96,6 +98,49 @@ int env_screener_recommended_capacity(void);
  * @return  Comma-separated list of whitelisted variable names
  */
 const char *env_screener_get_whitelist_doc(void);
+
+/**
+ * Calculate combined entropy score for a value
+ * Combines Shannon entropy with relative permutation entropy
+ * @param value  The value to score
+ * @return      Combined score (higher = more likely to be secret)
+ * 
+ * The relative entropy ratio helps distinguish:
+ * - Secrets: high ratio (>1.0) - original is more random than permutations
+ * - Paths: low ratio (<1.0) - original has structure that gets destroyed by permutation
+ */
+double env_screener_combined_score(const char *value);
+
+/**
+ * Calculate combined secret score for a name-value pair
+ * Includes boosts for known secret prefixes and variable name patterns
+ * @param name   Variable name (e.g., "API_KEY", "MY_SECRET") or NULL
+ * @param value  Variable value
+ * @return      Score 0.0-1.0 (higher = more likely to be a secret)
+ */
+double env_screener_combined_score_name(const char *name, const char *value);
+
+/**
+ * Check if value looks like a file path (negative indicator for secrets)
+ * @param value  The value to check
+ * @return      true if value looks like a path
+ */
+bool looks_like_path(const char *value);
+
+/**
+ * Check if value looks like base64 encoded (positive indicator for secrets)
+ * @param value  The value to check
+ * @return      true if value appears to be base64 encoded
+ */
+bool looks_like_base64(const char *value);
+
+/**
+ * Check if value has a known secret prefix
+ * @param value            The value to check
+ * @param out_suffix_entropy  If not NULL, receives entropy of suffix (after prefix)
+ * @return                 true if known prefix detected
+ */
+bool check_secret_prefix(const char *value, double *out_suffix_entropy);
 
 #ifdef __cplusplus
 }

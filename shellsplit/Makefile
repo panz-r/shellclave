@@ -18,7 +18,7 @@ INC_DIR = include
 TESTS_DIR = tests
 
 # Default target: build tokenizer_test
-all: $(TESTS_DIR)/tokenizer_test
+all: $(TESTS_DIR)/tokenizer_test $(TESTS_DIR)/entropy_test
 
 # Generate compile_commands.json using bear
 # First compile all source files, then use bear to capture the commands
@@ -68,6 +68,14 @@ $(TESTS_DIR)/ast_generator_test: $(TESTS_DIR)/ast_generator_test.c \
 		$(SRC_DIR)/shell_processor.c \
 		$(SRC_DIR)/shell_transform.c $(LDFLAGS)
 
+# Build entropy test
+$(TESTS_DIR)/entropy_test: $(TESTS_DIR)/entropy_test.c \
+		$(SRC_DIR)/env_screener.c \
+		$(SRC_DIR)/relative_permutation_entropy.c \
+		$(INC_DIR)/env_screener.h $(INC_DIR)/relative_permutation_entropy.h
+	$(CC) $(CFLAGS) -DRELATIVE_ENTROPY_NO_MAIN -o $@ $(TESTS_DIR)/entropy_test.c \
+		$(SRC_DIR)/env_screener.c $(SRC_DIR)/relative_permutation_entropy.c $(LDFLAGS)
+
 # Build library
 libshellsplit.a: $(SRC_DIR)/shell_tokenizer.c $(SRC_DIR)/shell_processor.c
 	$(CC) $(CFLAGS) -c -o $(SRC_DIR)/shell_tokenizer.o $(SRC_DIR)/shell_tokenizer.c
@@ -80,13 +88,14 @@ clean:
 	rm -f $(TESTS_DIR)/tokenizer_test
 	rm -f $(TESTS_DIR)/fast_parser_test
 	rm -f $(TESTS_DIR)/ast_generator_test
+	rm -f $(TESTS_DIR)/entropy_test
 	rm -f $(SRC_DIR)/*.o
 	rm -f libshellsplit.a
 	rm -f compile_commands.json
 	rm -f $(TESTS_DIR)/generator_crashes.log
 
 # Test - run all tests
-test: $(TESTS_DIR)/tokenizer_test $(TESTS_DIR)/fast_parser_test $(TESTS_DIR)/ast_generator_test compile_commands.json
+test: $(TESTS_DIR)/tokenizer_test $(TESTS_DIR)/fast_parser_test $(TESTS_DIR)/ast_generator_test $(TESTS_DIR)/entropy_test compile_commands.json
 	@echo ""
 	@echo "=== Running Original Tokenizer Tests (215 with 9 limitations) ==="
 	@./$(TESTS_DIR)/tokenizer_test || true
@@ -96,6 +105,9 @@ test: $(TESTS_DIR)/tokenizer_test $(TESTS_DIR)/fast_parser_test $(TESTS_DIR)/ast
 	@echo ""
 	@echo "=== Running AST Generator Tests (100) ==="
 	@./$(TESTS_DIR)/ast_generator_test -n 100 || true
+	@echo ""
+	@echo "=== Running Entropy/Screener Tests ==="
+	@./$(TESTS_DIR)/entropy_test || true
 	@echo ""
 	@echo "========================================"
 	@echo "=== COMBINED TEST SUMMARY ==="
