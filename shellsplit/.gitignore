@@ -8,6 +8,7 @@ tests/entropy_test
 tools/shell_abstract_cli 
 tests/abstract_test 
 libshellsplit.a
+tools/env_screener_demo
 
 # Fuzzing
 fuzz/tokenizer_fuzzer

@@ -18,7 +18,7 @@ INC_DIR = include
 TESTS_DIR = tests
 
 # Default target: build tokenizer_test
-all: $(TESTS_DIR)/tokenizer_test $(TESTS_DIR)/entropy_test
+all: $(TESTS_DIR)/tokenizer_test $(TESTS_DIR)/entropy_test tools/shell_abstract_cli tools/env_screener_demo
 
 # Allow parallel builds with -j
 ifneq ($(MAKECMDGOALS),)
@@ -95,6 +95,14 @@ tools/shell_abstract_cli: tools/shell_abstract_cli.c \
 		$(SRC_DIR)/shell_abstract.c \
 		$(SRC_DIR)/shell_tokenizer.c $(SRC_DIR)/shell_tokenizer_full.c $(LDFLAGS)
 
+# Build env_screener demo tool
+tools/env_screener_demo: tools/env_screener_demo.c \
+		$(SRC_DIR)/env_screener.c \
+		$(SRC_DIR)/relative_permutation_entropy.c \
+		$(INC_DIR)/env_screener.h $(INC_DIR)/relative_permutation_entropy.h
+	$(CC) $(CFLAGS) -DRELATIVE_ENTROPY_NO_MAIN -o $@ tools/env_screener_demo.c \
+		$(SRC_DIR)/env_screener.c $(SRC_DIR)/relative_permutation_entropy.c $(LDFLAGS)
+
 # Build library
 libshellsplit.a: $(SRC_DIR)/shell_tokenizer.c $(SRC_DIR)/shell_processor.c
 	$(CC) $(CFLAGS) -c -o $(SRC_DIR)/shell_tokenizer.o $(SRC_DIR)/shell_tokenizer.c
@@ -110,6 +118,7 @@ clean:
 	rm -f $(TESTS_DIR)/entropy_test
 	rm -f $(TESTS_DIR)/abstract_test
 	rm -f tools/shell_abstract_cli
+	rm -f tools/env_screener_demo
 	rm -f $(SRC_DIR)/*.o
 	rm -f libshellsplit.a
 	rm -f compile_commands.json
