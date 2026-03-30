@@ -378,7 +378,6 @@ bool shell_tokenizer_next(shell_tokenizer_state_t* state, shell_token_t* token) 
 
     // Check for $(( arithmetic expansion first
     if (current_char == '$' && !state->in_quotes) {
-        // Debug: see what we're trying to parse
         if (state->position + 1 < state->length && state->input[state->position + 1] == '{') {
             // This is a ${...} variable - try to parse it
             // Note: parse_variable increments brace_depth when entering ${...}

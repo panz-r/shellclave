@@ -19,9 +19,7 @@ static const char *secret_prefixes[] = {
     "AKIA",      /* AWS access key */
     "api_",      /* Generic API key prefix */
     "apikey",    /* Generic API key */
-    "gho_",      /* GitHub OAuth */
     "ghp_",      /* GitHub personal token */
-    "gho_",      /* GitHub OAuth */
     "glpat-",    /* GitLab personal access token */
     "xoxb-",    /* Slack bot token */
     "xoxa-",    /* Slack user token */

@@ -218,14 +218,6 @@ shell_error_t shell_parse_fast(
     int paren_depth = 0;  // Track regular parentheses ()
     int arith_depth = 0;  // Track when inside $((...))
     
-    // Track case statement state
-    // Note: These are tracked via keyword scanning at end; kept for potential future use
-    // bool in_case = false;
-    
-    // Track loop state
-    // Note: These are tracked via keyword scanning at end; kept for potential future use
-    // bool in_loop = false;
-    
     while (pos < cmd_len) {
         // Additional bounds check for safety
         if (pos >= cmd_len) break;
