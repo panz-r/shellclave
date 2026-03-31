@@ -103,13 +103,6 @@ tools/env_screener_demo: tools/env_screener_demo.c \
 	$(CC) $(CFLAGS) -DRELATIVE_ENTROPY_NO_MAIN -o $@ tools/env_screener_demo.c \
 		$(SRC_DIR)/env_screener.c $(SRC_DIR)/relative_permutation_entropy.c $(LDFLAGS)
 
-# Build library
-libshellsplit.a: $(SRC_DIR)/shell_tokenizer.c $(SRC_DIR)/shell_processor.c
-	$(CC) $(CFLAGS) -c -o $(SRC_DIR)/shell_tokenizer.o $(SRC_DIR)/shell_tokenizer.c
-	$(CC) $(CFLAGS) -c -o $(SRC_DIR)/shell_processor.o $(SRC_DIR)/shell_processor.c
-	ar rcs $@ $(SRC_DIR)/shell_tokenizer.o $(SRC_DIR)/shell_processor.o
-	rm -f $(SRC_DIR)/*.o
-
 # Clean
 clean:
 	rm -f $(TESTS_DIR)/tokenizer_test
@@ -120,7 +113,6 @@ clean:
 	rm -f tools/shell_abstract_cli
 	rm -f tools/env_screener_demo
 	rm -f $(SRC_DIR)/*.o
-	rm -f libshellsplit.a
 	rm -f compile_commands.json
 	rm -f $(TESTS_DIR)/generator_crashes.log
 
