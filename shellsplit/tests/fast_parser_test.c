@@ -163,6 +163,10 @@ void test_layer1_simple_separators(void) {
     test_count_only("Semicolon count=2", &result, 2);
     test_type("Second cmd type=SEMICOLON", &result, 1, SHELL_TYPE_SEMICOLON);
     
+    // Test: semicolon without whitespace (adjacent to words)
+    extract("cmd1;cmd2", &result);
+    test_count_only("Semicolon no-whitespace count=2", &result, 2);
+    
     // Test: double ampersand
     extract("cmd1 && cmd2", &result);
     test_count_only("&& count=2", &result, 2);
