@@ -145,6 +145,26 @@ void test_layer1_basic_inputs(void) {
     extract("ls -la", &result);
     test_count_only("Simple command count=1", &result, 1);
     test_range_eq("Simple command range correct", &result, 0, 0, 6, SHELL_TYPE_SIMPLE, SHELL_FEAT_NONE);
+    
+    // Test: quoted command (single quotes - valid shell syntax to run command with literal name)
+    extract("'ls'", &result);
+    test_count_only("Single-quoted command count=1", &result, 1);
+    
+    // Test: quoted command (double quotes)
+    extract("\"ls\"", &result);
+    test_count_only("Double-quoted command count=1", &result, 1);
+    
+    // Test: quoted command with args
+    extract("'ls' -la", &result);
+    test_count_only("Quoted command with args count=1", &result, 1);
+    
+    // Test: semicolon inside single quotes (should NOT be a separator)
+    extract("'echo hello; world'", &result);
+    test_count_only("Semicolon in quotes count=1", &result, 1);
+    
+    // Test: semicolon inside double quotes (should NOT be a separator)
+    extract("\"echo hello; world\"", &result);
+    test_count_only("Semicolon in double quotes count=1", &result, 1);
 }
 
 void test_layer1_simple_separators(void) {
