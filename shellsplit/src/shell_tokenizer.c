@@ -340,7 +340,8 @@ shell_error_t shell_parse_fast(
         // Handle bare $ - must be followed by valid characters
         // $$ (PID), $? (exit status), $# (arg count), $! (last bg pid), 
         // $*/$@ (positional params) at end ARE valid
-        if (c == '$') {
+        // Skip $ handling inside quotes - $ is literal in single quotes
+        if (c == '$' && !in_quotes) {
             if (pos + 1 >= cmd_len) {
                 // $ at end - check if this is the second $ of $$
                 if (pos > 0 && cmd[pos - 1] == '$') {
@@ -1093,3 +1094,4 @@ const char* shell_get_subcommand(
     if (out_len) *out_len = range->len;
     return cmd + range->start;
 }
+// FIXED VERSION
