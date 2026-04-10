@@ -180,6 +180,7 @@ static bool process_single_command_internal(
     if (shell_count > 0) {
         info->shell_tokens = malloc(shell_count * sizeof(shell_token_t));
         if (!info->shell_tokens) {
+            free(info->clean_command);
             free(shell_tokens);
             free(command_tokens);
             return false;
@@ -191,9 +192,10 @@ static bool process_single_command_internal(
     if (command_count > 0) {
         info->command_tokens = malloc(command_count * sizeof(shell_token_t));
         if (!info->command_tokens) {
+            free(info->clean_command);
+            free(info->shell_tokens);
             free(shell_tokens);
             free(command_tokens);
-            free(info->shell_tokens);
             return false;
         }
         memcpy(info->command_tokens, command_tokens, command_count * sizeof(shell_token_t));
