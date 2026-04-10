@@ -20,11 +20,18 @@ shell_ast_t* shell_ast_create(void) {
     return ast;
 }
 
+static void free_ast_node(ast_node_t* node) {
+    if (!node) return;
+    free_ast_node(node->child);
+    free_ast_node(node->next);
+    free(node->value);
+    free(node->redirect_target);
+    free(node);
+}
+
 void shell_ast_destroy(shell_ast_t* ast) {
     if (!ast) return;
-    
-    // Free all nodes (simplified - just free root for now)
-    // In a full implementation, we'd traverse and free all nodes
+    free_ast_node(ast->root);
     free(ast);
 }
 
