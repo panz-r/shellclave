@@ -918,6 +918,7 @@ bool shell_tokenize_commands(const char* input, shell_command_t** commands, size
                               token.type == TOKEN_SUBSHELL || token.type == TOKEN_VARIABLE ||
                               token.type == TOKEN_VARIABLE_QUOTED || token.type == TOKEN_SPECIAL_VAR ||
                               token.type == TOKEN_ARITHMETIC ||
+                              token.type == TOKEN_GLOB ||
                               token.type == TOKEN_HEREDOC || token.type == TOKEN_HERESTRING ||
                               token.type == TOKEN_REDIRECT_IN || token.type == TOKEN_REDIRECT_OUT ||
                               token.type == TOKEN_REDIRECT_ERR || token.type == TOKEN_REDIRECT_APPEND ||
@@ -1009,7 +1010,8 @@ bool shell_tokenize_commands(const char* input, shell_command_t** commands, size
     while (shell_tokenizer_next(&state, &token)) {
         if (expect_command && (token.type == TOKEN_COMMAND || token.type == TOKEN_ARGUMENT ||
                               token.type == TOKEN_SUBSHELL || token.type == TOKEN_VARIABLE ||
-                              token.type == TOKEN_VARIABLE_QUOTED || token.type == TOKEN_SPECIAL_VAR)) {
+                              token.type == TOKEN_VARIABLE_QUOTED || token.type == TOKEN_SPECIAL_VAR ||
+                              token.type == TOKEN_GLOB)) {
             if (current_cmd->token_count > 0) {
                 if (current_command + 1 < count) {
                     // Save tokens to current command before creating new one

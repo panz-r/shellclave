@@ -174,7 +174,7 @@ static bool is_relative_path(const char* s, size_t len) {
 static bool is_home_path(const char* s, size_t len) {
     if (len == 0) return false;
     if (s[0] == '~') {
-        return len == 1 || s[1] == '/' || (len > 1 && isalpha((unsigned char)s[1]));
+        return len == 1 || s[1] == '/' || (len >= 2 && isalpha((unsigned char)s[1]));
     }
     return false;
 }
@@ -352,6 +352,10 @@ static abstract_type_t get_abstract_type(token_type_t tok_type, const char* text
             (text[0] == '\'' && text[len-1] == '\'')) {
             return ABSTRACT_STR;
         }
+        // Check glob before path (path check catches relative paths with /)
+        if (is_glob_pattern(text, len)) {
+            return ABSTRACT_GB;
+        }
         if (is_absolute_path(text, len)) {
             return ABSTRACT_AP;
         }
@@ -360,10 +364,6 @@ static abstract_type_t get_abstract_type(token_type_t tok_type, const char* text
         }
         if (is_relative_path(text, len)) {
             return ABSTRACT_RP;
-        }
-        // Globs can appear as arguments too
-        if (is_glob_pattern(text, len)) {
-            return ABSTRACT_GB;
         }
     }
     
