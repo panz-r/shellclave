@@ -52,6 +52,44 @@ extern "C" {
 #define SG_BUF_MIN 8192
 
 /* ============================================================
+ * VIOLATION FLAGS (category-encoded)
+ * ============================================================
+ *
+ * Upper 16 bits encode the security domain:
+ *   SG_VIOL_CAT_FILESYSTEM  - attacks on filesystem integrity
+ *   SG_VIOL_CAT_PRIVILEGE   - privilege escalation vectors
+ *   SG_VIOL_CAT_EXFIL       - data exfiltration patterns
+ *
+ * Caller decides what action to take based on these flags.
+ * The violation carries severity only, no enforcement action.
+ */
+
+#define SG_VIOL_CAT_FILESYSTEM  (1u << 16)
+#define SG_VIOL_CAT_PRIVILEGE   (1u << 17)
+#define SG_VIOL_CAT_EXFIL       (1u << 18)
+#define SG_VIOL_CAT_NETWORK     (1u << 19)
+
+/* Filesystem Integrity */
+#define SG_VIOL_WRITE_SENSITIVE   (SG_VIOL_CAT_FILESYSTEM | (1u << 0))
+#define SG_VIOL_REMOVE_SYSTEM     (SG_VIOL_CAT_FILESYSTEM | (1u << 1))
+#define SG_VIOL_PERM_SYSTEM       (SG_VIOL_CAT_FILESYSTEM | (1u << 2))
+
+/* Privilege Escalation */
+#define SG_VIOL_ENV_PRIVILEGED    (SG_VIOL_CAT_PRIVILEGE  | (1u << 0))
+#define SG_VIOL_SHELL_ESCALATION  (SG_VIOL_CAT_PRIVILEGE  | (1u << 1))
+#define SG_VIOL_SUDO_REDIRECT     (SG_VIOL_CAT_PRIVILEGE  | (1u << 2))
+
+/* Data Exfiltration */
+#define SG_VIOL_WRITE_THEN_READ   (SG_VIOL_CAT_EXFIL | (1u << 0))
+#define SG_VIOL_SUBST_SENSITIVE   (SG_VIOL_CAT_EXFIL | (1u << 1))
+#define SG_VIOL_REDIRECT_FANOUT   (SG_VIOL_CAT_EXFIL | (1u << 2))
+
+/* Network */
+#define SG_VIOL_NET_DOWNLOAD_EXEC (SG_VIOL_CAT_NETWORK | (1u << 0))
+
+#define SG_MAX_VIOLATIONS 16
+
+/* ============================================================
  * TYPES
  * ============================================================ */
 
@@ -81,7 +119,21 @@ typedef struct {
     sg_verdict_t verdict;
     const char *command;
     const char *reject_reason;
+
+    uint32_t write_count;
+    uint32_t read_count;
+    uint32_t env_count;
+    uint32_t violation_flags;
 } sg_subcmd_result_t;
+
+/* Single detected violation.  Strings point into output buffer. */
+typedef struct {
+    uint32_t type;
+    uint32_t severity;
+    uint32_t cmd_node_index;
+    const char *description;
+    const char *detail;
+} sg_violation_t;
 
 /* Top-level evaluation result: metadata + pointer array into buffer. */
 typedef struct {
@@ -96,9 +148,54 @@ typedef struct {
 
     uint32_t attention_index;
     bool truncated;
+
+    sg_violation_t violations[SG_MAX_VIOLATIONS];
+    uint32_t       violation_count;
+    uint32_t       violation_flags;
+    bool           has_violations;
 } sg_result_t;
 
 typedef struct sg_gate sg_gate_t;
+
+/* ============================================================
+ * VIOLATION CONFIGURATION
+ * ============================================================ */
+
+#define SG_VIOL_MAX_PATHS   32
+#define SG_VIOL_MAX_NAMES   16
+
+typedef struct {
+    /* Filesystem Integrity */
+    const char *sensitive_write_paths[SG_VIOL_MAX_PATHS];
+    uint32_t    sensitive_write_path_count;
+    const char *sensitive_dirs[SG_VIOL_MAX_PATHS];
+    uint32_t    sensitive_dir_count;
+
+    /* Privilege Escalation */
+    const char *sensitive_env_names[SG_VIOL_MAX_NAMES];
+    uint32_t    sensitive_env_name_count;
+    const char *sensitive_cmd_names[SG_VIOL_MAX_NAMES];
+    uint32_t    sensitive_cmd_name_count;
+
+    /* Data Exfiltration */
+    const char *sensitive_read_paths[SG_VIOL_MAX_PATHS];
+    uint32_t    sensitive_read_path_count;
+    uint32_t    redirect_fanout_threshold;
+
+    /* Network */
+    const char *download_cmds[SG_VIOL_MAX_NAMES];
+    uint32_t    download_cmd_count;
+
+    /* Shell spawn commands */
+    const char *shell_spawn_cmds[SG_VIOL_MAX_NAMES];
+    uint32_t    shell_spawn_cmd_count;
+
+    /* Permission modification commands */
+    const char *perm_mod_cmds[SG_VIOL_MAX_NAMES];
+    uint32_t    perm_mod_cmd_count;
+} sg_violation_config_t;
+
+void sg_violation_config_default(sg_violation_config_t *cfg);
 
 /* ============================================================
  * EXPANSION CALLBACKS
@@ -142,7 +239,10 @@ sg_error_t sg_gate_set_suggestions(sg_gate_t *gate, bool enabled);
 sg_error_t sg_gate_set_expand_var(sg_gate_t *gate,
                                    sg_expand_var_fn fn, void *user_ctx);
 sg_error_t sg_gate_set_expand_glob(sg_gate_t *gate,
-                                    sg_expand_glob_fn fn, void *user_ctx);
+                                     sg_expand_glob_fn fn, void *user_ctx);
+
+sg_error_t sg_gate_set_violation_config(sg_gate_t *gate,
+                                          const sg_violation_config_t *config);
 
 /* ============================================================
  * POLICY MANAGEMENT

