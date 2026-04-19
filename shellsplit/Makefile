@@ -18,7 +18,7 @@ INC_DIR = include
 TESTS_DIR = tests
 
 # Default target: build tokenizer_test
-all: $(TESTS_DIR)/tokenizer_test $(TESTS_DIR)/entropy_test tools/shell_abstract_cli tools/env_screener_demo
+all: $(TESTS_DIR)/tokenizer_test $(TESTS_DIR)/entropy_test tools/shell_abstract_cli tools/env_screener_demo $(TESTS_DIR)/test_depgraph
 
 # Allow parallel builds with -j
 ifneq ($(MAKECMDGOALS),)
@@ -103,6 +103,13 @@ tools/env_screener_demo: tools/env_screener_demo.c \
 	$(CC) $(CFLAGS) -DRELATIVE_ENTROPY_NO_MAIN -o $@ tools/env_screener_demo.c \
 		$(SRC_DIR)/env_screener.c $(SRC_DIR)/relative_permutation_entropy.c $(LDFLAGS)
 
+# Build depgraph test
+$(TESTS_DIR)/test_depgraph: $(TESTS_DIR)/test_depgraph.c \
+		$(SRC_DIR)/shell_depgraph.c $(SRC_DIR)/shell_tokenizer.c \
+		$(INC_DIR)/shell_depgraph.h $(INC_DIR)/shell_tokenizer.h
+	$(CC) $(CFLAGS) -o $@ $(TESTS_DIR)/test_depgraph.c \
+		$(SRC_DIR)/shell_depgraph.c $(SRC_DIR)/shell_tokenizer.c $(LDFLAGS)
+
 # Clean
 clean:
 	rm -f $(TESTS_DIR)/tokenizer_test
@@ -110,6 +117,7 @@ clean:
 	rm -f $(TESTS_DIR)/ast_generator_test
 	rm -f $(TESTS_DIR)/entropy_test
 	rm -f $(TESTS_DIR)/abstract_test
+	rm -f $(TESTS_DIR)/test_depgraph
 	rm -f tools/shell_abstract_cli
 	rm -f tools/env_screener_demo
 	rm -f $(SRC_DIR)/*.o
@@ -117,7 +125,7 @@ clean:
 	rm -f $(TESTS_DIR)/generator_crashes.log
 
 # Test - run all tests
-test: $(TESTS_DIR)/tokenizer_test $(TESTS_DIR)/fast_parser_test $(TESTS_DIR)/ast_generator_test $(TESTS_DIR)/abstract_test $(TESTS_DIR)/entropy_test
+test: $(TESTS_DIR)/tokenizer_test $(TESTS_DIR)/fast_parser_test $(TESTS_DIR)/ast_generator_test $(TESTS_DIR)/abstract_test $(TESTS_DIR)/entropy_test $(TESTS_DIR)/test_depgraph
 	@echo ""
 	@echo "=== Running Original Tokenizer Tests (215 with 9 limitations) ==="
 	@./$(TESTS_DIR)/tokenizer_test || true
@@ -132,6 +140,9 @@ test: $(TESTS_DIR)/tokenizer_test $(TESTS_DIR)/fast_parser_test $(TESTS_DIR)/ast
 	@./$(TESTS_DIR)/entropy_test || true
 	@echo "=== Running Abstract Engine Tests ==="
 	@./$(TESTS_DIR)/abstract_test || true
+	@echo ""
+	@echo "=== Running Depgraph Tests ==="
+	@./$(TESTS_DIR)/test_depgraph || true
 	@echo ""
 	@echo "========================================"
 	@echo "=== COMBINED TEST SUMMARY ==="

@@ -7,6 +7,7 @@ tests/ast_generator_test
 tests/entropy_test
 tools/shell_abstract_cli 
 tests/abstract_test 
+tests/test_depgraph
 libshellsplit.a
 tools/env_screener_demo
 
