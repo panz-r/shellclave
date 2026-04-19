@@ -1,0 +1,10 @@
+build/
+*.o
+*.a
+*.so
+*.dylib
+*.dSYM/
+*.out
+*.gcda
+*.gcno
+*.gcov
