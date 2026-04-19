@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <unistd.h>
 
 static int pass_count = 0;
 static int fail_count = 0;
@@ -17,12 +18,20 @@ static int fail_count = 0;
 #define TEST(name) static void test_##name(void)
 #define RUN(name) do { printf("  %-40s ", #name); int _pf = fail_count; test_##name(); if (fail_count == _pf) { printf("PASS\n"); pass_count++; } } while(0)
 
+static char eval_buf[16384];
+
 static sg_gate_t *gate_with_rules(const char **rules, int count)
 {
     sg_gate_t *g = sg_gate_new();
     for (int i = 0; i < count; i++)
         sg_gate_add_rule(g, rules[i]);
     return g;
+}
+
+static sg_error_t eval_cmd(sg_gate_t *g, const char *cmd, sg_result_t *r)
+{
+    memset(eval_buf, 0, sizeof(eval_buf));
+    return sg_eval(g, cmd, eval_buf, sizeof(eval_buf), r);
 }
 
 /* ============================================================
@@ -40,7 +49,10 @@ TEST(gate_null_safety)
 {
     sg_gate_free(NULL);
     ASSERT(sg_gate_rule_count(NULL) == 0);
-    ASSERT(sg_eval(NULL, "ls", NULL) == SG_ERR_INVALID);
+    char buf[64];
+    sg_result_t r;
+    ASSERT(sg_eval(NULL, "ls", buf, sizeof(buf), NULL) == SG_ERR_INVALID);
+    ASSERT(sg_eval(NULL, "ls", buf, sizeof(buf), &r) == SG_ERR_INVALID);
 }
 
 /* ============================================================
@@ -52,11 +64,13 @@ TEST(allow_simple_command)
     const char *rules[] = { "ls" };
     sg_gate_t *g = gate_with_rules(rules, 1);
     sg_result_t r;
-    sg_error_t err = sg_eval(g, "ls", &r);
+    sg_error_t err = eval_cmd(g, "ls", &r);
     ASSERT(err == SG_OK);
     ASSERT(r.verdict == SG_VERDICT_ALLOW);
     ASSERT(r.subcmd_count == 1);
     ASSERT(r.subcmds[0].matches);
+    ASSERT(r.subcmds[0].command != NULL);
+    ASSERT(strcmp(r.subcmds[0].command, "ls") == 0);
     sg_gate_free(g);
 }
 
@@ -65,9 +79,10 @@ TEST(deny_unknown_command)
     const char *rules[] = { "ls" };
     sg_gate_t *g = gate_with_rules(rules, 1);
     sg_result_t r;
-    sg_error_t err = sg_eval(g, "rm -rf /", &r);
+    sg_error_t err = eval_cmd(g, "rm -rf /", &r);
     ASSERT(err == SG_OK);
     ASSERT(r.verdict == SG_VERDICT_DENY);
+    ASSERT(r.subcmds[0].command != NULL);
     sg_gate_free(g);
 }
 
@@ -76,7 +91,7 @@ TEST(allow_with_args)
     const char *rules[] = { "ls * *" };
     sg_gate_t *g = gate_with_rules(rules, 1);
     sg_result_t r;
-    sg_eval(g, "ls -la /home", &r);
+    eval_cmd(g, "ls -la /home", &r);
     ASSERT(r.verdict == SG_VERDICT_ALLOW);
     sg_gate_free(g);
 }
@@ -85,7 +100,7 @@ TEST(deny_empty_policy)
 {
     sg_gate_t *g = sg_gate_new();
     sg_result_t r;
-    sg_eval(g, "ls", &r);
+    eval_cmd(g, "ls", &r);
     ASSERT(r.verdict == SG_VERDICT_DENY);
     sg_gate_free(g);
 }
@@ -99,9 +114,11 @@ TEST(allow_pipe_both_match)
     const char *rules[] = { "ls", "sort" };
     sg_gate_t *g = gate_with_rules(rules, 2);
     sg_result_t r;
-    sg_eval(g, "ls | sort", &r);
+    eval_cmd(g, "ls | sort", &r);
     ASSERT(r.verdict == SG_VERDICT_ALLOW);
     ASSERT(r.subcmd_count == 2);
+    ASSERT(strcmp(r.subcmds[0].command, "ls") == 0);
+    ASSERT(strcmp(r.subcmds[1].command, "sort") == 0);
     sg_gate_free(g);
 }
 
@@ -110,7 +127,7 @@ TEST(deny_pipe_one_fails)
     const char *rules[] = { "ls" };
     sg_gate_t *g = gate_with_rules(rules, 1);
     sg_result_t r;
-    sg_eval(g, "ls | rm", &r);
+    eval_cmd(g, "ls | rm", &r);
     ASSERT(r.verdict == SG_VERDICT_DENY);
     ASSERT(r.subcmd_count >= 1);
     sg_gate_free(g);
@@ -125,7 +142,7 @@ TEST(allow_semicolon_both_match)
     const char *rules[] = { "ls", "pwd" };
     sg_gate_t *g = gate_with_rules(rules, 2);
     sg_result_t r;
-    sg_eval(g, "ls ; pwd", &r);
+    eval_cmd(g, "ls ; pwd", &r);
     ASSERT(r.verdict == SG_VERDICT_ALLOW);
     sg_gate_free(g);
 }
@@ -135,7 +152,7 @@ TEST(deny_and_first_fails)
     const char *rules[] = { "rm" };
     sg_gate_t *g = gate_with_rules(rules, 1);
     sg_result_t r;
-    sg_eval(g, "rm -rf / && ls", &r);
+    eval_cmd(g, "rm -rf / && ls", &r);
     ASSERT(r.verdict == SG_VERDICT_DENY);
     sg_gate_free(g);
 }
@@ -145,7 +162,7 @@ TEST(deny_or_first_fails)
     const char *rules[] = { "ls" };
     sg_gate_t *g = gate_with_rules(rules, 1);
     sg_result_t r;
-    sg_eval(g, "rm || ls", &r);
+    eval_cmd(g, "rm || ls", &r);
     ASSERT(r.verdict == SG_VERDICT_DENY);
     sg_gate_free(g);
 }
@@ -159,7 +176,7 @@ TEST(allow_wildcard_args)
     const char *rules[] = { "git * * *" };
     sg_gate_t *g = gate_with_rules(rules, 1);
     sg_result_t r;
-    sg_eval(g, "git commit -m hello", &r);
+    eval_cmd(g, "git commit -m hello", &r);
     ASSERT(r.verdict == SG_VERDICT_ALLOW);
     sg_gate_free(g);
 }
@@ -169,7 +186,7 @@ TEST(allow_path_wildcard)
     const char *rules[] = { "cat #path" };
     sg_gate_t *g = gate_with_rules(rules, 1);
     sg_result_t r;
-    sg_eval(g, "cat /etc/passwd", &r);
+    eval_cmd(g, "cat /etc/passwd", &r);
     ASSERT(r.verdict == SG_VERDICT_ALLOW);
     sg_gate_free(g);
 }
@@ -183,9 +200,10 @@ TEST(reject_subshell)
     sg_gate_t *g = sg_gate_new();
     sg_gate_add_rule(g, "echo *");
     sg_result_t r;
-    sg_eval(g, "echo $(whoami)", &r);
+    eval_cmd(g, "echo $(whoami)", &r);
     ASSERT(r.verdict == SG_VERDICT_REJECT);
-    ASSERT(r.subcmds[0].reject_reason[0] != '\0');
+    ASSERT(r.deny_reason != NULL);
+    ASSERT(strstr(r.deny_reason, "command substitution") != NULL);
     sg_gate_free(g);
 }
 
@@ -194,7 +212,7 @@ TEST(reject_heredoc)
     sg_gate_t *g = sg_gate_new();
     sg_gate_add_rule(g, "cat");
     sg_result_t r;
-    sg_eval(g, "cat <<EOF\nhello\nEOF", &r);
+    eval_cmd(g, "cat <<EOF\nhello\nEOF", &r);
     ASSERT(r.verdict == SG_VERDICT_REJECT);
     sg_gate_free(g);
 }
@@ -205,11 +223,44 @@ TEST(reject_heredoc)
 
 TEST(suggestions_on_deny)
 {
-    const char *rules[] = { "git status" };
-    sg_gate_t *g = gate_with_rules(rules, 1);
+    sg_gate_t *g = sg_gate_new();
+    sg_gate_add_rule(g, "git status");
+    sg_gate_add_rule(g, "git log");
     sg_result_t r;
-    sg_eval(g, "git commit", &r);
+    eval_cmd(g, "git commit", &r);
     ASSERT(r.verdict == SG_VERDICT_DENY);
+    sg_gate_free(g);
+}
+
+TEST(suggestions_populated)
+{
+    sg_gate_t *g = sg_gate_new();
+    sg_gate_add_rule(g, "cat #path");
+    sg_gate_add_rule(g, "ls");
+    sg_result_t r;
+    eval_cmd(g, "cat", &r);
+    ASSERT(r.verdict == SG_VERDICT_DENY);
+    if (r.suggestion_count > 0) {
+        ASSERT(r.suggestions[0] != NULL);
+        ASSERT(r.suggestions[0][0] != '\0');
+        ASSERT(strstr(r.suggestions[0], "cat") != NULL);
+    }
+    sg_gate_free(g);
+}
+
+TEST(suggestions_two_offered)
+{
+    sg_gate_t *g = sg_gate_new();
+    sg_gate_add_rule(g, "cat #path");
+    sg_gate_add_rule(g, "cat #path #path");
+    sg_result_t r;
+    eval_cmd(g, "cat", &r);
+    ASSERT(r.verdict == SG_VERDICT_DENY);
+    if (r.suggestion_count >= 2) {
+        ASSERT(r.suggestions[0] != NULL);
+        ASSERT(r.suggestions[1] != NULL);
+        ASSERT(r.suggestions[0] != r.suggestions[1]);
+    }
     sg_gate_free(g);
 }
 
@@ -219,8 +270,9 @@ TEST(suggestions_disabled)
     sg_gate_t *g = gate_with_rules(rules, 1);
     sg_gate_set_suggestions(g, false);
     sg_result_t r;
-    sg_eval(g, "rm", &r);
+    eval_cmd(g, "rm", &r);
     ASSERT(r.verdict == SG_VERDICT_DENY);
+    ASSERT(r.suggestion_count == 0);
     sg_gate_free(g);
 }
 
@@ -232,7 +284,7 @@ TEST(eval_empty_command)
 {
     sg_gate_t *g = sg_gate_new();
     sg_result_t r;
-    sg_error_t err = sg_eval(g, "", &r);
+    sg_error_t err = eval_cmd(g, "", &r);
     ASSERT(err == SG_ERR_INVALID);
     sg_gate_free(g);
 }
@@ -242,7 +294,7 @@ TEST(eval_whitespace_command)
     sg_gate_t *g = sg_gate_new();
     sg_gate_add_rule(g, "ls");
     sg_result_t r;
-    sg_eval(g, "   ", &r);
+    eval_cmd(g, "   ", &r);
     ASSERT(r.verdict == SG_VERDICT_ALLOW);
     sg_gate_free(g);
 }
@@ -251,7 +303,7 @@ TEST(eval_parse_error)
 {
     sg_gate_t *g = sg_gate_new();
     sg_result_t r;
-    sg_eval(g, "echo \"unclosed", &r);
+    eval_cmd(g, "echo \"unclosed", &r);
     ASSERT(r.verdict == SG_VERDICT_REJECT);
     sg_gate_free(g);
 }
@@ -274,7 +326,7 @@ TEST(config_stop_first_fail)
     sg_gate_t *g = gate_with_rules(rules, 1);
     sg_gate_set_stop_mode(g, SG_STOP_FIRST_FAIL);
     sg_result_t r;
-    sg_eval(g, "rm ; ls", &r);
+    eval_cmd(g, "rm ; ls", &r);
     ASSERT(r.subcmd_count == 1);
     ASSERT(!r.subcmds[0].matches);
     sg_gate_free(g);
@@ -286,7 +338,7 @@ TEST(config_eval_all)
     sg_gate_t *g = gate_with_rules(rules, 1);
     sg_gate_set_stop_mode(g, SG_EVAL_ALL);
     sg_result_t r;
-    sg_eval(g, "rm ; ls", &r);
+    eval_cmd(g, "rm ; ls", &r);
     ASSERT(r.subcmd_count == 2);
     ASSERT(!r.subcmds[0].matches);
     ASSERT(r.subcmds[1].matches);
@@ -317,6 +369,114 @@ TEST(remove_nonexistent)
 }
 
 /* ============================================================
+ * SERIALIZATION
+ * ============================================================ */
+
+TEST(save_load_roundtrip)
+{
+    const char *path = "/tmp/shellgate_test_save.txt";
+    sg_gate_t *g = sg_gate_new();
+    sg_gate_add_rule(g, "ls");
+    sg_gate_add_rule(g, "cat #path");
+    sg_gate_add_rule(g, "git * * *");
+    ASSERT(sg_gate_rule_count(g) == 3);
+
+    sg_error_t err = sg_gate_save_policy(g, path);
+    ASSERT(err == SG_OK);
+
+    sg_gate_t *g2 = sg_gate_new();
+    err = sg_gate_load_policy(g2, path);
+    ASSERT(err == SG_OK);
+    ASSERT(sg_gate_rule_count(g2) == 3);
+
+    sg_result_t r;
+    eval_cmd(g2, "ls", &r);
+    ASSERT(r.verdict == SG_VERDICT_ALLOW);
+
+    eval_cmd(g2, "cat /etc/hosts", &r);
+    ASSERT(r.verdict == SG_VERDICT_ALLOW);
+
+    eval_cmd(g2, "rm -rf /", &r);
+    ASSERT(r.verdict == SG_VERDICT_DENY);
+
+    unlink(path);
+    sg_gate_free(g);
+    sg_gate_free(g2);
+}
+
+TEST(save_load_empty)
+{
+    const char *path = "/tmp/shellgate_test_empty.txt";
+    sg_gate_t *g = sg_gate_new();
+    ASSERT(sg_gate_rule_count(g) == 0);
+
+    sg_error_t err = sg_gate_save_policy(g, path);
+    ASSERT(err == SG_OK);
+
+    sg_gate_t *g2 = sg_gate_new();
+    err = sg_gate_load_policy(g2, path);
+    ASSERT(err == SG_OK);
+    ASSERT(sg_gate_rule_count(g2) == 0);
+
+    sg_result_t r;
+    eval_cmd(g2, "ls", &r);
+    ASSERT(r.verdict == SG_VERDICT_DENY);
+
+    unlink(path);
+    sg_gate_free(g);
+    sg_gate_free(g2);
+}
+
+/* ============================================================
+ * BUFFER MANAGEMENT
+ * ============================================================ */
+
+TEST(buffer_overflow_protection)
+{
+    const char *rules[] = { "ls", "sort", "cat", "grep", "awk" };
+    sg_gate_t *g = gate_with_rules(rules, 5);
+    char tiny[4];
+    sg_result_t r;
+    sg_error_t err = sg_eval(g, "ls | sort | cat", tiny, sizeof(tiny), &r);
+    ASSERT(err == SG_ERR_TRUNC);
+    ASSERT(r.truncated == true);
+    sg_gate_free(g);
+}
+
+TEST(buffer_reuse)
+{
+    const char *rules[] = { "ls" };
+    sg_gate_t *g = gate_with_rules(rules, 1);
+    char buf[256];
+
+    memset(buf, 0, sizeof(buf));
+    sg_result_t r1;
+    sg_error_t err = sg_eval(g, "ls", buf, sizeof(buf), &r1);
+    ASSERT(err == SG_OK);
+    ASSERT(r1.verdict == SG_VERDICT_ALLOW);
+    ASSERT(r1.subcmds[0].command != NULL);
+
+    memset(buf, 0, sizeof(buf));
+    sg_result_t r2;
+    err = sg_eval(g, "rm", buf, sizeof(buf), &r2);
+    ASSERT(err == SG_OK);
+    ASSERT(r2.verdict == SG_VERDICT_DENY);
+    ASSERT(r2.subcmds[0].command != NULL);
+
+    sg_gate_free(g);
+}
+
+TEST(buffer_zero_length)
+{
+    sg_gate_t *g = sg_gate_new();
+    char buf[1];
+    sg_result_t r;
+    sg_error_t err = sg_eval(g, "ls", buf, 0, &r);
+    ASSERT(err == SG_ERR_INVALID);
+    sg_gate_free(g);
+}
+
+/* ============================================================
  * VERDICT HELPERS
  * ============================================================ */
 
@@ -325,6 +485,113 @@ TEST(verdict_names)
     ASSERT(strcmp(sg_verdict_name(SG_VERDICT_ALLOW), "ALLOW") == 0);
     ASSERT(strcmp(sg_verdict_name(SG_VERDICT_DENY), "DENY") == 0);
     ASSERT(strcmp(sg_verdict_name(SG_VERDICT_REJECT), "REJECT") == 0);
+}
+
+/* ============================================================
+ * EXPANSION CALLBACKS
+ * ============================================================ */
+
+static size_t expand_home(const char *name, char *buf, size_t buf_size, void *ctx)
+{
+    (void)ctx;
+    if (strcmp(name, "HOME") == 0) {
+        const char *val = "/home/testuser";
+        size_t len = strlen(val);
+        if (len >= buf_size) return 0;
+        memcpy(buf, val, len + 1);
+        return len;
+    }
+    return 0;
+}
+
+static size_t expand_txt_glob(const char *pattern, char *buf, size_t buf_size, void *ctx)
+{
+    (void)ctx;
+    if (strcmp(pattern, "*.txt") == 0) {
+        const char *val = "a.txt b.txt c.txt";
+        size_t len = strlen(val);
+        if (len >= buf_size) return 0;
+        memcpy(buf, val, len + 1);
+        return len;
+    }
+    return 0;
+}
+
+TEST(expand_var_allows_expanded_command)
+{
+    sg_gate_t *g = sg_gate_new();
+    sg_gate_add_rule(g, "ls #path");
+    sg_gate_set_expand_var(g, expand_home, NULL);
+    sg_result_t r;
+    eval_cmd(g, "ls $HOME", &r);
+    ASSERT(r.verdict == SG_VERDICT_ALLOW);
+    ASSERT(r.subcmd_count == 1);
+    ASSERT(r.subcmds[0].command != NULL);
+    ASSERT(strcmp(r.subcmds[0].command, "ls /home/testuser") == 0);
+    sg_gate_free(g);
+}
+
+TEST(expand_var_falls_back_to_raw)
+{
+    sg_gate_t *g = sg_gate_new();
+    sg_gate_add_rule(g, "echo $UNKNOWN");
+    sg_gate_set_expand_var(g, expand_home, NULL);
+    sg_result_t r;
+    eval_cmd(g, "echo $UNKNOWN", &r);
+    ASSERT(r.verdict == SG_VERDICT_ALLOW);
+    ASSERT(r.subcmds[0].command != NULL);
+    ASSERT(strcmp(r.subcmds[0].command, "echo $UNKNOWN") == 0);
+    sg_gate_free(g);
+}
+
+TEST(expand_var_braces)
+{
+    sg_gate_t *g = sg_gate_new();
+    sg_gate_add_rule(g, "ls #path");
+    sg_gate_set_expand_var(g, expand_home, NULL);
+    sg_result_t r;
+    eval_cmd(g, "ls ${HOME}", &r);
+    ASSERT(r.verdict == SG_VERDICT_ALLOW);
+    ASSERT(r.subcmds[0].command != NULL);
+    ASSERT(strcmp(r.subcmds[0].command, "ls /home/testuser") == 0);
+    sg_gate_free(g);
+}
+
+TEST(expand_var_no_callback)
+{
+    sg_gate_t *g = sg_gate_new();
+    sg_gate_add_rule(g, "ls $HOME");
+    sg_result_t r;
+    eval_cmd(g, "ls $HOME", &r);
+    ASSERT(r.verdict == SG_VERDICT_ALLOW);
+    ASSERT(r.subcmds[0].command != NULL);
+    ASSERT(strcmp(r.subcmds[0].command, "ls $HOME") == 0);
+    sg_gate_free(g);
+}
+
+TEST(expand_glob_allows_expanded)
+{
+    sg_gate_t *g = sg_gate_new();
+    sg_gate_add_rule(g, "cat * * *");
+    sg_gate_set_expand_glob(g, expand_txt_glob, NULL);
+    sg_result_t r;
+    eval_cmd(g, "cat *.txt", &r);
+    ASSERT(r.verdict == SG_VERDICT_ALLOW);
+    ASSERT(r.subcmds[0].command != NULL);
+    ASSERT(strstr(r.subcmds[0].command, "a.txt") != NULL);
+    sg_gate_free(g);
+}
+
+TEST(expand_mixed_var_and_plain)
+{
+    sg_gate_t *g = sg_gate_new();
+    sg_gate_add_rule(g, "ls #path project");
+    sg_gate_set_expand_var(g, expand_home, NULL);
+    sg_result_t r;
+    eval_cmd(g, "ls $HOME project", &r);
+    ASSERT(r.verdict == SG_VERDICT_ALLOW);
+    ASSERT(strcmp(r.subcmds[0].command, "ls /home/testuser project") == 0);
+    sg_gate_free(g);
 }
 
 /* ============================================================
@@ -364,6 +631,8 @@ int main(void)
 
     printf("\nSuggestions:\n");
     RUN(suggestions_on_deny);
+    RUN(suggestions_populated);
+    RUN(suggestions_two_offered);
     RUN(suggestions_disabled);
 
     printf("\nEdge cases:\n");
@@ -379,6 +648,23 @@ int main(void)
     printf("\nPolicy management:\n");
     RUN(add_remove_rule);
     RUN(remove_nonexistent);
+
+    printf("\nSerialization:\n");
+    RUN(save_load_roundtrip);
+    RUN(save_load_empty);
+
+    printf("\nBuffer management:\n");
+    RUN(buffer_overflow_protection);
+    RUN(buffer_reuse);
+    RUN(buffer_zero_length);
+
+    printf("\nExpansion callbacks:\n");
+    RUN(expand_var_allows_expanded_command);
+    RUN(expand_var_falls_back_to_raw);
+    RUN(expand_var_braces);
+    RUN(expand_var_no_callback);
+    RUN(expand_glob_allows_expanded);
+    RUN(expand_mixed_var_and_plain);
 
     printf("\nHelpers:\n");
     RUN(verdict_names);
