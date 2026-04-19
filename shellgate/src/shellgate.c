@@ -455,6 +455,45 @@ void sg_violation_config_default(sg_violation_config_t *cfg)
     for (uint32_t i = 0; i < (uint32_t)(sizeof(def_perms)/sizeof(def_perms[0]))
                         && i < SG_VIOL_MAX_NAMES; i++)
         cfg->perm_mod_cmds[cfg->perm_mod_cmd_count++] = def_perms[i];
+
+    static const char *def_secrets[] = {
+        "/.ssh/", ".env", "/.aws/", "/.kube/",
+        "/.npmrc", "/.netrc", "/.pgpass",
+        "/.gitconfig", "/.git-credentials",
+        "/.docker/", "/.vault-token", "/.gnupg/",
+    };
+    for (uint32_t i = 0; i < (uint32_t)(sizeof(def_secrets)/sizeof(def_secrets[0]))
+                        && i < SG_VIOL_MAX_PATHS; i++)
+        cfg->sensitive_secret_paths[cfg->sensitive_secret_path_count++] = def_secrets[i];
+
+    static const char *def_readcmds[] = {
+        "cat", "head", "tail", "less", "more",
+        "base64", "xxd", "od", "strings", "hexdump",
+    };
+    for (uint32_t i = 0; i < (uint32_t)(sizeof(def_readcmds)/sizeof(def_readcmds[0]))
+                        && i < SG_VIOL_MAX_NAMES; i++)
+        cfg->file_reading_cmds[cfg->file_reading_cmd_count++] = def_readcmds[i];
+
+    static const char *def_uploads[] = { "curl", "wget", "scp", "rsync" };
+    for (uint32_t i = 0; i < (uint32_t)(sizeof(def_uploads)/sizeof(def_uploads[0]))
+                        && i < SG_VIOL_MAX_NAMES; i++)
+        cfg->upload_cmds[cfg->upload_cmd_count++] = def_uploads[i];
+
+    static const char *def_listeners[] = {
+        "nc", "ncat", "netcat", "socat",
+        "ngrok", "cloudflared",
+    };
+    for (uint32_t i = 0; i < (uint32_t)(sizeof(def_listeners)/sizeof(def_listeners[0]))
+                        && i < SG_VIOL_MAX_NAMES; i++)
+        cfg->listener_cmds[cfg->listener_cmd_count++] = def_listeners[i];
+
+    static const char *def_profiles[] = {
+        "/.bashrc", "/.profile", "/.zshrc",
+        "/.bash_profile", "/.ssh/authorized_keys", "/.ssh/config",
+    };
+    for (uint32_t i = 0; i < (uint32_t)(sizeof(def_profiles)/sizeof(def_profiles[0]))
+                        && i < SG_VIOL_MAX_PATHS; i++)
+        cfg->shell_profile_paths[cfg->shell_profile_path_count++] = def_profiles[i];
 }
 
 /* ============================================================
@@ -467,6 +506,18 @@ static bool path_has_prefix(const char *path, uint32_t path_len,
     size_t plen = strlen(prefix);
     if (path_len < plen) return false;
     return memcmp(path, prefix, plen) == 0;
+}
+
+static bool path_contains(const char *path, uint32_t path_len,
+                            const char *needle)
+{
+    size_t nlen = strlen(needle);
+    if (path_len < nlen) return false;
+    for (uint32_t i = 0; i <= path_len - nlen; i++) {
+        if (memcmp(path + i, needle, nlen) == 0)
+            return true;
+    }
+    return false;
 }
 
 static bool tok_equals(const char *tok, uint32_t tok_len, const char *str)
@@ -840,6 +891,324 @@ static void sg_violation_scan(const shell_dep_graph_t *graph,
                        SG_VIOL_SUDO_REDIRECT, 80, ni, desc, det);
         node_viols[ni] |= SG_VIOL_SUDO_REDIRECT;
         *violation_flags |= SG_VIOL_SUDO_REDIRECT;
+    }
+
+    /* --- SG_VIOL_READ_SECRETS --- */
+    for (uint32_t ni = 0; ni < graph->node_count; ni++) {
+        const shell_dep_node_t *node = &graph->nodes[ni];
+        if (node->type != SHELL_NODE_CMD || node->cmd.token_count == 0) continue;
+
+        bool is_reader = false;
+        for (uint32_t c = 0; c < cfg->file_reading_cmd_count; c++) {
+            if (tok_equals(node->cmd.tokens[0], node->cmd.token_lens[0],
+                           cfg->file_reading_cmds[c])) {
+                is_reader = true;
+                break;
+            }
+        }
+        if (!is_reader) continue;
+
+        for (uint32_t ei = 0; ei < graph->edge_count; ei++) {
+            const shell_dep_edge_t *e = &graph->edges[ei];
+            if (e->from != ni || e->type != SHELL_EDGE_ARG) continue;
+            const shell_dep_node_t *doc = &graph->nodes[e->to];
+            if (doc->type != SHELL_NODE_DOC || doc->doc.kind != SHELL_DOC_FILE) continue;
+            for (uint32_t p = 0; p < cfg->sensitive_secret_path_count; p++) {
+                if (path_contains(doc->doc.path, doc->doc.path_len,
+                                  cfg->sensitive_secret_paths[p])) {
+                    const char *desc = bw_printf(bw, "reading secret file");
+                    const char *det  = bw_copy(bw, doc->doc.path, doc->doc.path_len);
+                    emit_violation(violations, violation_count, max_violations,
+                                   SG_VIOL_READ_SECRETS, 75, ni, desc, det);
+                    node_viols[ni] |= SG_VIOL_READ_SECRETS;
+                    *violation_flags |= SG_VIOL_READ_SECRETS;
+                    break;
+                }
+            }
+        }
+    }
+
+    /* --- SG_VIOL_NET_UPLOAD --- */
+    for (uint32_t ni = 0; ni < graph->node_count; ni++) {
+        const shell_dep_node_t *node = &graph->nodes[ni];
+        if (node->type != SHELL_NODE_CMD || node->cmd.token_count < 2) continue;
+
+        const char *cmd0 = node->cmd.tokens[0];
+        uint32_t cmd0_len = node->cmd.token_lens[0];
+
+        bool is_upload = false;
+        for (uint32_t c = 0; c < cfg->upload_cmd_count; c++) {
+            if (tok_equals(cmd0, cmd0_len, cfg->upload_cmds[c])) {
+                is_upload = true;
+                break;
+            }
+        }
+        if (!is_upload) continue;
+
+        bool has_upload_flag = false;
+        bool is_scp_upload = false;
+        bool is_rsync_upload = false;
+
+        if (tok_equals(cmd0, cmd0_len, "curl")) {
+            for (uint32_t t = 1; t < node->cmd.token_count; t++) {
+                const char *tok = node->cmd.tokens[t];
+                uint32_t tlen = node->cmd.token_lens[t];
+                if (tok_equals(tok, tlen, "-d") ||
+                    tok_equals(tok, tlen, "--data") ||
+                    tok_equals(tok, tlen, "--data-binary") ||
+                    tok_equals(tok, tlen, "--data-raw") ||
+                    tok_equals(tok, tlen, "--data-urlencode") ||
+                    tok_equals(tok, tlen, "-F") ||
+                    tok_equals(tok, tlen, "--form") ||
+                    tok_equals(tok, tlen, "-T") ||
+                    tok_equals(tok, tlen, "--upload-file")) {
+                    has_upload_flag = true;
+                    break;
+                }
+                if ((tlen >= 3 && tok[0] == '-' && tok[1] == 'd' && tok[2] == '@') ||
+                    (tlen >= 3 && tok[0] == '-' && tok[1] == 'F' && tok[2] == '=') ||
+                    (tlen >= 3 && tok[0] == '-' && tok[1] == 'T' && tok[2] != '\0')) {
+                    has_upload_flag = true;
+                    break;
+                }
+            }
+        } else if (tok_equals(cmd0, cmd0_len, "wget")) {
+            for (uint32_t t = 1; t < node->cmd.token_count; t++) {
+                if (tok_equals(node->cmd.tokens[t], node->cmd.token_lens[t],
+                               "--post-file") ||
+                    tok_equals(node->cmd.tokens[t], node->cmd.token_lens[t],
+                               "--post-data")) {
+                    has_upload_flag = true;
+                    break;
+                }
+            }
+        } else if (tok_equals(cmd0, cmd0_len, "scp")) {
+            const char *last = node->cmd.tokens[node->cmd.token_count - 1];
+            uint32_t last_len = node->cmd.token_lens[node->cmd.token_count - 1];
+            for (uint32_t c = 0; c < last_len; c++) {
+                if (last[c] == ':') {
+                    is_scp_upload = true;
+                    break;
+                }
+            }
+        } else if (tok_equals(cmd0, cmd0_len, "rsync")) {
+            const char *last = node->cmd.tokens[node->cmd.token_count - 1];
+            uint32_t last_len = node->cmd.token_lens[node->cmd.token_count - 1];
+            for (uint32_t c = 0; c < last_len; c++) {
+                if (last[c] == ':') {
+                    is_rsync_upload = true;
+                    break;
+                }
+            }
+        }
+
+        if (!has_upload_flag && !is_scp_upload && !is_rsync_upload) continue;
+
+        const char *desc = bw_printf(bw, "network file upload");
+        const char *det  = bw_printf(bw, "%.*s", (int)cmd0_len, cmd0);
+        emit_violation(violations, violation_count, max_violations,
+                       SG_VIOL_NET_UPLOAD, 85, ni, desc, det);
+        node_viols[ni] |= SG_VIOL_NET_UPLOAD;
+        *violation_flags |= SG_VIOL_NET_UPLOAD;
+    }
+
+    /* --- SG_VIOL_NET_LISTENER --- */
+    for (uint32_t ni = 0; ni < graph->node_count; ni++) {
+        const shell_dep_node_t *node = &graph->nodes[ni];
+        if (node->type != SHELL_NODE_CMD || node->cmd.token_count < 2) continue;
+
+        bool is_listener_cmd = false;
+        for (uint32_t c = 0; c < cfg->listener_cmd_count; c++) {
+            if (tok_equals(node->cmd.tokens[0], node->cmd.token_lens[0],
+                           cfg->listener_cmds[c])) {
+                is_listener_cmd = true;
+                break;
+            }
+        }
+        if (!is_listener_cmd) continue;
+
+        bool has_listen = false;
+        if (tok_equals(node->cmd.tokens[0], node->cmd.token_lens[0], "nc") ||
+            tok_equals(node->cmd.tokens[0], node->cmd.token_lens[0], "ncat") ||
+            tok_equals(node->cmd.tokens[0], node->cmd.token_lens[0], "netcat")) {
+            for (uint32_t t = 1; t < node->cmd.token_count; t++) {
+                if (tok_equals(node->cmd.tokens[t], node->cmd.token_lens[t], "-l") ||
+                    tok_equals(node->cmd.tokens[t], node->cmd.token_lens[t], "--listen")) {
+                    has_listen = true;
+                    break;
+                }
+            }
+        } else if (tok_equals(node->cmd.tokens[0], node->cmd.token_lens[0], "socat")) {
+            for (uint32_t t = 1; t < node->cmd.token_count; t++) {
+                for (uint32_t c = 0; c < node->cmd.token_lens[t]; c++) {
+                    if (node->cmd.tokens[t][c] == 'L' ||
+                        node->cmd.tokens[t][c] == 'l') {
+                        uint32_t remaining = node->cmd.token_lens[t] - c;
+                        if (remaining >= 6 &&
+                            (memcmp(node->cmd.tokens[t] + c, "LISTEN", 6) == 0 ||
+                             memcmp(node->cmd.tokens[t] + c, "listen", 6) == 0)) {
+                            has_listen = true;
+                            break;
+                        }
+                    }
+                }
+                if (has_listen) break;
+            }
+        } else {
+            has_listen = true;
+        }
+
+        if (!has_listen) continue;
+
+        const char *desc = bw_printf(bw, "starting network listener");
+        const char *det  = bw_printf(bw, "%.*s", (int)node->cmd.token_lens[0],
+                                      node->cmd.tokens[0]);
+        emit_violation(violations, violation_count, max_violations,
+                       SG_VIOL_NET_LISTENER, 80, ni, desc, det);
+        node_viols[ni] |= SG_VIOL_NET_LISTENER;
+        *violation_flags |= SG_VIOL_NET_LISTENER;
+    }
+
+    /* --- SG_VIOL_SHELL_OBFUSCATION --- */
+    for (uint32_t ei = 0; ei < graph->edge_count; ei++) {
+        const shell_dep_edge_t *e = &graph->edges[ei];
+        if (e->type != SHELL_EDGE_PIPE) continue;
+        const shell_dep_node_t *src = &graph->nodes[e->from];
+        const shell_dep_node_t *dst = &graph->nodes[e->to];
+        if (src->type != SHELL_NODE_CMD || dst->type != SHELL_NODE_CMD) continue;
+        if (src->cmd.token_count == 0 || dst->cmd.token_count == 0) continue;
+
+        bool is_decoder = false;
+        if (tok_equals(src->cmd.tokens[0], src->cmd.token_lens[0], "base64")) {
+            for (uint32_t t = 1; t < src->cmd.token_count; t++) {
+                if (tok_equals(src->cmd.tokens[t], src->cmd.token_lens[t], "-d") ||
+                    tok_equals(src->cmd.tokens[t], src->cmd.token_lens[t], "--decode")) {
+                    is_decoder = true;
+                    break;
+                }
+            }
+        }
+        if (!is_decoder && tok_equals(src->cmd.tokens[0], src->cmd.token_lens[0], "openssl")) {
+            bool has_enc = false, has_d = false;
+            for (uint32_t t = 1; t < src->cmd.token_count; t++) {
+                if (tok_equals(src->cmd.tokens[t], src->cmd.token_lens[t], "enc"))
+                    has_enc = true;
+                if (tok_equals(src->cmd.tokens[t], src->cmd.token_lens[t], "-d") ||
+                    tok_equals(src->cmd.tokens[t], src->cmd.token_lens[t], "--decode"))
+                    has_d = true;
+            }
+            if (has_enc && has_d) is_decoder = true;
+        }
+        if (!is_decoder) continue;
+
+        bool is_spawn = false;
+        for (uint32_t c = 0; c < cfg->shell_spawn_cmd_count; c++) {
+            if (tok_equals(dst->cmd.tokens[0], dst->cmd.token_lens[0],
+                           cfg->shell_spawn_cmds[c])) {
+                is_spawn = true;
+                break;
+            }
+        }
+        if (!is_spawn) continue;
+
+        const char *desc = bw_printf(bw, "decoded payload piped to shell");
+        const char *det  = bw_printf(bw, "%.*s | %.*s",
+                                      (int)src->cmd.token_lens[0], src->cmd.tokens[0],
+                                      (int)dst->cmd.token_lens[0], dst->cmd.tokens[0]);
+        emit_violation(violations, violation_count, max_violations,
+                       SG_VIOL_SHELL_OBFUSCATION, 90, e->to, desc, det);
+        node_viols[e->to] |= SG_VIOL_SHELL_OBFUSCATION;
+        *violation_flags |= SG_VIOL_SHELL_OBFUSCATION;
+    }
+
+    /* --- SG_VIOL_GIT_DESTRUCTIVE --- */
+    for (uint32_t ni = 0; ni < graph->node_count; ni++) {
+        const shell_dep_node_t *node = &graph->nodes[ni];
+        if (node->type != SHELL_NODE_CMD || node->cmd.token_count < 2) continue;
+        if (!tok_equals(node->cmd.tokens[0], node->cmd.token_lens[0], "git"))
+            continue;
+
+        const char *subcmd = node->cmd.tokens[1];
+        uint32_t subcmd_len = node->cmd.token_lens[1];
+
+        bool destructive = false;
+        if (tok_equals(subcmd, subcmd_len, "push")) {
+            for (uint32_t t = 2; t < node->cmd.token_count; t++) {
+                if (tok_equals(node->cmd.tokens[t], node->cmd.token_lens[t], "--force") ||
+                    tok_equals(node->cmd.tokens[t], node->cmd.token_lens[t], "-f")) {
+                    destructive = true;
+                    break;
+                }
+            }
+        } else if (tok_equals(subcmd, subcmd_len, "clean")) {
+            for (uint32_t t = 2; t < node->cmd.token_count; t++) {
+                if (tok_equals(node->cmd.tokens[t], node->cmd.token_lens[t], "-x") ||
+                    tok_equals(node->cmd.tokens[t], node->cmd.token_lens[t], "-fdx") ||
+                    tok_equals(node->cmd.tokens[t], node->cmd.token_lens[t], "-fx")) {
+                    destructive = true;
+                    break;
+                }
+            }
+        } else if (tok_equals(subcmd, subcmd_len, "filter-branch")) {
+            destructive = true;
+        }
+
+        if (!destructive) continue;
+
+        const char *desc = bw_printf(bw, "destructive git operation");
+        const char *det  = bw_printf(bw, "git %.*s", (int)subcmd_len, subcmd);
+        emit_violation(violations, violation_count, max_violations,
+                       SG_VIOL_GIT_DESTRUCTIVE, 70, ni, desc, det);
+        node_viols[ni] |= SG_VIOL_GIT_DESTRUCTIVE;
+        *violation_flags |= SG_VIOL_GIT_DESTRUCTIVE;
+    }
+
+    /* --- SG_VIOL_PERSISTENCE --- */
+    for (uint32_t ni = 0; ni < graph->node_count; ni++) {
+        const shell_dep_node_t *node = &graph->nodes[ni];
+        if (node->type != SHELL_NODE_CMD || node->cmd.token_count == 0) continue;
+
+        const char *cmd0 = node->cmd.tokens[0];
+        uint32_t cmd0_len = node->cmd.token_lens[0];
+
+        if (tok_equals(cmd0, cmd0_len, "crontab")) {
+            bool is_list = false;
+            for (uint32_t t = 1; t < node->cmd.token_count; t++) {
+                if (tok_equals(node->cmd.tokens[t], node->cmd.token_lens[t], "-l")) {
+                    is_list = true;
+                    break;
+                }
+            }
+            if (!is_list) {
+                const char *desc = bw_printf(bw, "crontab modification");
+                const char *det  = bw_printf(bw, "crontab");
+                emit_violation(violations, violation_count, max_violations,
+                               SG_VIOL_PERSISTENCE, 75, ni, desc, det);
+                node_viols[ni] |= SG_VIOL_PERSISTENCE;
+                *violation_flags |= SG_VIOL_PERSISTENCE;
+            }
+            continue;
+        }
+
+        for (uint32_t ei = 0; ei < graph->edge_count; ei++) {
+            const shell_dep_edge_t *e = &graph->edges[ei];
+            if (e->from != ni) continue;
+            if (e->type != SHELL_EDGE_WRITE && e->type != SHELL_EDGE_APPEND) continue;
+            const shell_dep_node_t *doc = &graph->nodes[e->to];
+            if (doc->type != SHELL_NODE_DOC || doc->doc.kind != SHELL_DOC_FILE) continue;
+            for (uint32_t p = 0; p < cfg->shell_profile_path_count; p++) {
+                if (path_contains(doc->doc.path, doc->doc.path_len,
+                                  cfg->shell_profile_paths[p])) {
+                    const char *desc = bw_printf(bw, "writing to shell profile/ssh config");
+                    const char *det  = bw_copy(bw, doc->doc.path, doc->doc.path_len);
+                    emit_violation(violations, violation_count, max_violations,
+                                   SG_VIOL_PERSISTENCE, 80, ni, desc, det);
+                    node_viols[ni] |= SG_VIOL_PERSISTENCE;
+                    *violation_flags |= SG_VIOL_PERSISTENCE;
+                    break;
+                }
+            }
+        }
     }
 }
 

@@ -239,13 +239,12 @@ static ast_node_t* gen_sequence(shell_ast_generator_t* gen, shell_ast_t* ast) {
 // cmd $VAR *.txt > file - variable + glob + redirect
 static void gen_complex_var_glob_redirect(shell_ast_generator_t* gen, shell_ast_t* ast) {
     ast_node_t* cmd = gen_command(gen, ast);
-    // Add variable as argument
     ast_node_t* var_node = gen_variable(gen, ast);
-    var_node->next = cmd;
-    // Add glob as another argument
     ast_node_t* glob_node = gen_glob(gen, ast);
-    glob_node->next = var_node;
-    // Add redirect
+
+    cmd->child = var_node;
+    var_node->next = glob_node;
+
     const char* target = gen_random_file(gen);
     cmd = shell_ast_add_redirect(ast, cmd, target, -1, false, false, false);
     ast->root = cmd;
@@ -257,12 +256,12 @@ static void gen_complex_var_glob_redirect(shell_ast_generator_t* gen, shell_ast_
 static void gen_subshell_in_pipeline(shell_ast_generator_t* gen, shell_ast_t* ast) {
     ast_node_t* cmd1 = shell_ast_add_command(ast, "echo");
     ast_node_t* subshell = gen_subshell(gen, ast);
-    subshell->next = cmd1;
-    
+    cmd1->child = subshell;
+
     ast_node_t* cmd2 = shell_ast_add_command(ast, "grep");
     ast_node_t* var = gen_variable(gen, ast);
-    var->next = cmd2;
-    
+    cmd2->child = var;
+
     ast->root = shell_ast_add_pipeline(ast, cmd1, cmd2);
     ast->has_valid_structure = true;
     ast->has_subshell = true;
@@ -272,14 +271,11 @@ static void gen_subshell_in_pipeline(shell_ast_generator_t* gen, shell_ast_t* as
 static void gen_compound_with_vars(shell_ast_generator_t* gen, shell_ast_t* ast) {
     ast_node_t* cmd1 = gen_command(gen, ast);
     ast_node_t* var1 = gen_variable(gen, ast);
-    var1->next = cmd1;
-    
+
     ast_node_t* seq1 = shell_ast_add_sequence(ast, cmd1, var1, "&&");
-    
+
     ast_node_t* cmd2 = gen_command(gen, ast);
-    ast_node_t* var2 = gen_variable(gen, ast);
-    var2->next = cmd2;
-    
+
     ast->root = shell_ast_add_sequence(ast, seq1, cmd2, "||");
     ast->has_valid_structure = true;
 }
@@ -289,11 +285,11 @@ static void gen_glob_in_loop(shell_ast_generator_t* gen, shell_ast_t* ast) {
     ast_node_t* glob = gen_glob(gen, ast);
     ast_node_t* body = gen_command(gen, ast);
     ast_node_t* var = gen_variable(gen, ast);
-    var->next = body;
-    
+    body->child = var;
+
     ast_node_t* list = glob;
     ast_node_t* loop = shell_ast_add_loop(ast, "for", "f", list, body);
-    
+
     ast->root = loop;
     ast->has_valid_structure = true;
     ast->has_loops = true;
@@ -501,16 +497,16 @@ static void gen_valid_shell(shell_ast_generator_t* gen, shell_ast_t* ast) {
         // Simple command with optional redirect
         ast->root = gen_command_with_redirects(gen, ast);
     } else if (type < 30) {
-        // Simple command with variable
         ast_node_t* cmd = gen_command(gen, ast);
         ast_node_t* var = gen_variable(gen, ast);
-        var->next = cmd;
+        var->next = cmd->child;
+        cmd->child = var;
         ast->root = cmd;
     } else if (type < 40) {
-        // Command with glob
         ast_node_t* cmd = gen_command(gen, ast);
         ast_node_t* glob = gen_glob(gen, ast);
-        glob->next = cmd;
+        glob->next = cmd->child;
+        cmd->child = glob;
         ast->root = cmd;
     } else if (type < 50) {
         // Pipeline
@@ -536,12 +532,11 @@ static void gen_valid_shell(shell_ast_generator_t* gen, shell_ast_t* ast) {
         ast->root = gen_process_sub(gen, ast);
         ast->has_process_sub = true;
     } else if (type < 84) {
-        // Quoted string
         ast_node_t* cmd = gen_command(gen, ast);
         ast_node_t* quote = gen_quote(gen, ast);
-        // Force closed for valid shell - must also clear the flags that might have been set
         quote->is_valid = true;
-        quote->next = cmd;
+        quote->next = cmd->child;
+        cmd->child = quote;
         ast->root = cmd;
         // Clear flags that might have been set by unclosed quote
         ast->has_unclosed_quote = false;

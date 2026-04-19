@@ -73,19 +73,25 @@ extern "C" {
 #define SG_VIOL_WRITE_SENSITIVE   (SG_VIOL_CAT_FILESYSTEM | (1u << 0))
 #define SG_VIOL_REMOVE_SYSTEM     (SG_VIOL_CAT_FILESYSTEM | (1u << 1))
 #define SG_VIOL_PERM_SYSTEM       (SG_VIOL_CAT_FILESYSTEM | (1u << 2))
+#define SG_VIOL_GIT_DESTRUCTIVE   (SG_VIOL_CAT_FILESYSTEM | (1u << 3))
 
 /* Privilege Escalation */
 #define SG_VIOL_ENV_PRIVILEGED    (SG_VIOL_CAT_PRIVILEGE  | (1u << 0))
 #define SG_VIOL_SHELL_ESCALATION  (SG_VIOL_CAT_PRIVILEGE  | (1u << 1))
 #define SG_VIOL_SUDO_REDIRECT     (SG_VIOL_CAT_PRIVILEGE  | (1u << 2))
+#define SG_VIOL_PERSISTENCE       (SG_VIOL_CAT_PRIVILEGE  | (1u << 3))
 
 /* Data Exfiltration */
 #define SG_VIOL_WRITE_THEN_READ   (SG_VIOL_CAT_EXFIL | (1u << 0))
 #define SG_VIOL_SUBST_SENSITIVE   (SG_VIOL_CAT_EXFIL | (1u << 1))
 #define SG_VIOL_REDIRECT_FANOUT   (SG_VIOL_CAT_EXFIL | (1u << 2))
+#define SG_VIOL_READ_SECRETS      (SG_VIOL_CAT_EXFIL | (1u << 3))
+#define SG_VIOL_SHELL_OBFUSCATION (SG_VIOL_CAT_EXFIL | (1u << 4))
 
 /* Network */
 #define SG_VIOL_NET_DOWNLOAD_EXEC (SG_VIOL_CAT_NETWORK | (1u << 0))
+#define SG_VIOL_NET_UPLOAD        (SG_VIOL_CAT_NETWORK | (1u << 1))
+#define SG_VIOL_NET_LISTENER      (SG_VIOL_CAT_NETWORK | (1u << 2))
 
 #define SG_MAX_VIOLATIONS 16
 
@@ -193,6 +199,24 @@ typedef struct {
     /* Permission modification commands */
     const char *perm_mod_cmds[SG_VIOL_MAX_NAMES];
     uint32_t    perm_mod_cmd_count;
+
+    /* Secret file paths (credential/key files) */
+    const char *sensitive_secret_paths[SG_VIOL_MAX_PATHS];
+    uint32_t    sensitive_secret_path_count;
+    const char *file_reading_cmds[SG_VIOL_MAX_NAMES];
+    uint32_t    file_reading_cmd_count;
+
+    /* Upload commands */
+    const char *upload_cmds[SG_VIOL_MAX_NAMES];
+    uint32_t    upload_cmd_count;
+
+    /* Listener commands */
+    const char *listener_cmds[SG_VIOL_MAX_NAMES];
+    uint32_t    listener_cmd_count;
+
+    /* Shell profile paths */
+    const char *shell_profile_paths[SG_VIOL_MAX_PATHS];
+    uint32_t    shell_profile_path_count;
 } sg_violation_config_t;
 
 void sg_violation_config_default(sg_violation_config_t *cfg);

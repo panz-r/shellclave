@@ -6,12 +6,19 @@
 # ============================================================================
 
 CC = gcc
-CFLAGS = -Wall -Wextra -Wpedantic -std=c11 -Iinclude -O2 -mcmodel=medium
-LDFLAGS = -lm -mcmodel=medium
+
+# -mcmodel=medium is x86-64 only; skip on ARM/other architectures
+MCMODEL :=
+ifeq ($(shell uname -m),x86_64)
+MCMODEL := -mcmodel=medium
+endif
+
+CFLAGS = -Wall -Wextra -Wpedantic -std=c11 -Iinclude -O2 $(MCMODEL)
+LDFLAGS = -lm $(MCMODEL)
 
 # Coverage flags
 COVERAGE_CFLAGS = -fprofile-arcs -ftest-coverage -g
-COVERAGE_LDFLAGS = -fprofile-arcs -ftest-coverage -lm -mcmodel=medium
+COVERAGE_LDFLAGS = -fprofile-arcs -ftest-coverage -lm $(MCMODEL)
 
 SRC_DIR = src
 INC_DIR = include
