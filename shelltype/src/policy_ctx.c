@@ -1,0 +1,171 @@
+#define _GNU_SOURCE
+#define _POSIX_C_SOURCE 200809L
+
+/*
+ * policy_ctx.c - Shared policy context: arena allocator and string pool.
+ *
+ * Multiple policies share a context to deduplicate token strings across
+ * policy sets and allocate all trie nodes from a contiguous arena.
+ */
+
+#include "shelltype.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdbool.h>
+
+#define DEFAULT_ARENA_SIZE (256 * 1024)  /* 256 KB default */
+#define STR_POOL_INIT_CAP  1024
+
+/* ============================================================
+ * ARENA ALLOCATOR
+ * ============================================================ */
+
+typedef struct {
+    char   *base;
+    size_t  size;
+    size_t  used;
+} arena_t;
+
+static bool arena_init(arena_t *a, size_t size)
+{
+    a->base = malloc(size);
+    if (!a->base) return false;
+    a->size = size;
+    a->used = 0;
+    return true;
+}
+
+static void arena_free(arena_t *a)
+{
+    free(a->base);
+    a->base = NULL;
+    a->size = 0;
+    a->used = 0;
+}
+
+static void *arena_alloc(arena_t *a, size_t n)
+{
+    /* Align to 8 bytes */
+    n = (n + 7) & ~(size_t)7;
+    if (a->used + n > a->size) return NULL;
+    void *p = a->base + a->used;
+    a->used += n;
+    return p;
+}
+
+__attribute__((unused))
+static size_t arena_used(const arena_t *a)
+{
+    return a->used;
+}
+
+/* ============================================================
+ * STRING POOL
+ * ============================================================ */
+
+typedef struct {
+    const char **strings;
+    size_t       count;
+    size_t       capacity;
+} str_pool_t;
+
+static bool str_pool_init(str_pool_t *p)
+{
+    p->strings = calloc(STR_POOL_INIT_CAP, sizeof(const char *));
+    if (!p->strings) return false;
+    p->count = 0;
+    p->capacity = STR_POOL_INIT_CAP;
+    return true;
+}
+
+static void str_pool_free(str_pool_t *p)
+{
+    /* Strings are arena-allocated, don't free individually */
+    free((void *)p->strings);
+    p->strings = NULL;
+}
+
+static bool str_pool_grow(str_pool_t *p)
+{
+    size_t new_cap = p->capacity * 2;
+    const char **new_arr = realloc((void *)p->strings, new_cap * sizeof(const char *));
+    if (!new_arr) return false;
+    p->strings = new_arr;
+    p->capacity = new_cap;
+    return true;
+}
+
+/* ============================================================
+ * CONTEXT LIFECYCLE
+ * ============================================================ */
+
+struct st_policy_ctx {
+    arena_t    arena;
+    str_pool_t str_pool;
+};
+
+st_policy_ctx_t *st_policy_ctx_new(void)
+{
+    return st_policy_ctx_new_with_arena(DEFAULT_ARENA_SIZE);
+}
+
+st_policy_ctx_t *st_policy_ctx_new_with_arena(size_t arena_size)
+{
+    st_policy_ctx_t *ctx = malloc(sizeof(st_policy_ctx_t));
+    if (!ctx) return NULL;
+
+    if (!arena_init(&ctx->arena, arena_size)) {
+        free(ctx);
+        return NULL;
+    }
+
+    if (!str_pool_init(&ctx->str_pool)) {
+        arena_free(&ctx->arena);
+        free(ctx);
+        return NULL;
+    }
+
+    return ctx;
+}
+
+void st_policy_ctx_free(st_policy_ctx_t *ctx)
+{
+    if (!ctx) return;
+    str_pool_free(&ctx->str_pool);
+    arena_free(&ctx->arena);
+    free(ctx);
+}
+
+const char *st_policy_ctx_intern(st_policy_ctx_t *ctx, const char *str)
+{
+    if (!ctx || !str) return NULL;
+
+    /* Linear scan for existing string */
+    for (size_t i = 0; i < ctx->str_pool.count; i++) {
+        if (strcmp(ctx->str_pool.strings[i], str) == 0) {
+            return ctx->str_pool.strings[i];
+        }
+    }
+
+    /* Allocate copy in arena */
+    size_t len = strlen(str) + 1;
+    char *copy = arena_alloc(&ctx->arena, len);
+    if (!copy) return NULL;
+    memcpy(copy, str, len);
+
+    /* Add to pool */
+    if (ctx->str_pool.count >= ctx->str_pool.capacity) {
+        if (!str_pool_grow(&ctx->str_pool)) return NULL;
+    }
+    ctx->str_pool.strings[ctx->str_pool.count++] = copy;
+    return copy;
+}
+
+size_t st_policy_ctx_memory_usage(const st_policy_ctx_t *ctx)
+{
+    if (!ctx) return 0;
+    return sizeof(st_policy_ctx_t) + ctx->arena.used
+           + ctx->str_pool.capacity * sizeof(const char *);
+}

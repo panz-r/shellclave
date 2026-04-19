@@ -1,0 +1,28 @@
+# Build artifacts
+obj/
+shelltype-tool
+
+# Test artifacts
+tests/test_cpl
+tests/test_policy
+tests/test_verify
+tests/test_token_types
+tests/test_cpl_integration
+tests/test_policy_compact
+tests/test_filters
+tests/test_shelltype_integration
+tests/test_shelltype
+tests/*.tmp
+tests/test_*.nfa
+tests/test_output.txt
+
+# Editor / IDE
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
