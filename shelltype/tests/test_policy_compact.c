@@ -265,7 +265,7 @@ static int test_verify_no_match(void)
 
     st_eval_result_t r;
     st_error_t err = st_policy_eval(policy, "git push origin main", &r);
-    ASSERT(err == ST_ERR_INVALID);
+    ASSERT(err == ST_OK);
     ASSERT(!r.matches);
     ASSERT(r.matching_pattern == NULL);
 
@@ -317,7 +317,7 @@ static int test_verify_exact_length(void)
 
     st_eval_result_t r;
     st_error_t err = st_policy_eval(policy, "git commit", &r);
-    ASSERT(err == ST_ERR_INVALID);
+    ASSERT(err == ST_OK);
 
     st_policy_free(policy);
     st_policy_ctx_free(ctx);
@@ -360,7 +360,7 @@ static int test_verify_multiple_patterns(void)
     ASSERT_STR_EQ(r.matching_pattern, "docker run -it * *");
 
     err = st_policy_eval(policy, "rm -rf /", &r);
-    ASSERT(err == ST_ERR_INVALID);
+    ASSERT(err == ST_OK);
 
     st_policy_free(policy);
     st_policy_ctx_free(ctx);
@@ -536,7 +536,7 @@ static int test_large_policy(void)
     ASSERT(err == ST_OK);
 
     err = st_policy_eval(policy, "cmd1000 --option x /path/to/file1000", &r);
-    ASSERT(err == ST_ERR_INVALID);
+    ASSERT(err == ST_OK);
 
     size_t alloc = st_policy_memory_usage(policy);
     size_t ws = st_policy_working_set(policy);
@@ -561,7 +561,7 @@ static int test_filter_definite_no(void)
 
     st_eval_result_t r;
     st_error_t err = st_policy_eval(policy, "zzz commit -m hello", &r);
-    ASSERT(err == ST_ERR_INVALID);
+    ASSERT(err == ST_OK);
     ASSERT(!r.matches);
     ASSERT(r.matching_pattern == NULL);
 
@@ -601,7 +601,7 @@ static int test_filter_empty_policy(void)
 
     st_eval_result_t r;
     st_error_t err = st_policy_eval(policy, "anything", &r);
-    ASSERT(err == ST_ERR_INVALID);
+    ASSERT(err == ST_OK);
 
     st_policy_free(policy);
     st_policy_ctx_free(ctx);

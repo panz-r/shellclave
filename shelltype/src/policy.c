@@ -63,7 +63,7 @@ static uint32_t crc32_compute(const void *data, size_t len, uint32_t prev)
 #define MAX_CMD_TOKENS       128
 #define FILTER_POS_LEVELS    4
 #define FILTER_POS_CAPACITY  1024
-#define MINER_LITERAL_THRESHOLD 3
+#define LITERAL_THRESHOLD 3
 
 /* ============================================================
  * CHILD ENTRY — 16 bytes, packed
@@ -825,7 +825,7 @@ st_error_t st_policy_eval(const st_policy_t *policy,
                     n_suggestions = 2;
                 }
             }
-        } else if (wm == 0 && div_node->literal_count >= MINER_LITERAL_THRESHOLD) {
+	} else if (wm == 0 && div_node->literal_count >= LITERAL_THRESHOLD) {
             /* Literal-to-wildcard: classify all existing literals + input token */
             st_token_type_t joined = ST_TYPE_LITERAL;
             uint16_t total = div_node->literal_count;
@@ -876,7 +876,7 @@ st_error_t st_policy_eval(const st_policy_t *policy,
 
     result->suggestion_count = n_suggestions;
     st_free_token_array(&cmd);
-    return ST_ERR_INVALID;
+    return ST_OK;
 }
 
 /* ============================================================
@@ -1153,7 +1153,7 @@ st_error_t st_policy_render_nfa(const st_policy_t *policy,
         .pattern_id_counter = opts ? opts->pattern_id_base : 1,
         .category_mask = opts ? opts->category_mask : 0x01,
         .include_tags = opts ? opts->include_tags : false,
-        .identifier = opts ? opts->identifier : "rbox-miner policy",
+		.identifier = opts ? opts->identifier : "rbox policy",
     };
 
     if (fprintf(fp, "NFA_ALPHABET\n") < 0) { fclose(fp); return ST_ERR_IO; }

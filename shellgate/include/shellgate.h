@@ -108,9 +108,10 @@ typedef enum {
 } sg_error_t;
 
 typedef enum {
-    SG_VERDICT_ALLOW  = 0,
-    SG_VERDICT_DENY   = 1,
-    SG_VERDICT_REJECT = 2,
+    SG_VERDICT_ALLOW        = 0,
+    SG_VERDICT_DENY         = 1,
+    SG_VERDICT_REJECT       = 2,
+    SG_VERDICT_UNDETERMINED = 3,
 } sg_verdict_t;
 
 typedef enum {
@@ -151,6 +152,9 @@ typedef struct {
 
     const char *suggestions[2];
     uint32_t suggestion_count;
+
+    const char *deny_suggestions[2];
+    uint32_t deny_suggestion_count;
 
     uint32_t attention_index;
     bool truncated;
@@ -277,6 +281,9 @@ sg_error_t sg_gate_save_policy(const sg_gate_t *gate, const char *path);
 sg_error_t sg_gate_add_rule(sg_gate_t *gate, const char *pattern);
 sg_error_t sg_gate_remove_rule(sg_gate_t *gate, const char *pattern);
 uint32_t sg_gate_rule_count(const sg_gate_t *gate);
+sg_error_t sg_gate_add_deny_rule(sg_gate_t *gate, const char *pattern);
+sg_error_t sg_gate_remove_deny_rule(sg_gate_t *gate, const char *pattern);
+uint32_t sg_gate_deny_rule_count(const sg_gate_t *gate);
 
 /* ============================================================
  * EVALUATION

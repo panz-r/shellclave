@@ -57,7 +57,7 @@ static int test_verify_no_match(void)
 
     st_eval_result_t r;
     st_error_t err = st_policy_eval(policy, "git push origin main", &r);
-    ASSERT(err == ST_ERR_INVALID);
+    ASSERT(err == ST_OK);
     ASSERT(!r.matches);
     ASSERT(r.matching_pattern == NULL);
 
@@ -78,7 +78,7 @@ static int test_verify_wildcard_single_token(void)
 
     st_eval_result_t r;
     st_error_t err = st_policy_eval(policy, "git commit -m", &r);
-    ASSERT(err == ST_ERR_INVALID);
+    ASSERT(err == ST_OK);
     ASSERT(!r.matches);
 
     st_policy_free(policy);
@@ -132,7 +132,7 @@ static int test_verify_exact_length_shorter_command(void)
 
     st_eval_result_t r;
     st_error_t err = st_policy_eval(policy, "git commit", &r);
-    ASSERT(err == ST_ERR_INVALID);
+    ASSERT(err == ST_OK);
 
     st_policy_free(policy);
     st_policy_ctx_free(ctx);
@@ -147,7 +147,7 @@ static int test_verify_exact_length_longer_command(void)
 
     st_eval_result_t r;
     st_error_t err = st_policy_eval(policy, "git commit -m hello", &r);
-    ASSERT(err == ST_ERR_INVALID);
+    ASSERT(err == ST_OK);
 
     st_policy_free(policy);
     st_policy_ctx_free(ctx);
@@ -182,7 +182,7 @@ static int test_verify_pipeline_no_match_wrong_cmd(void)
 
     st_eval_result_t r;
     st_error_t err = st_policy_eval(policy, "cat file | wc -l", &r);
-    ASSERT(err == ST_ERR_INVALID);
+    ASSERT(err == ST_OK);
 
     st_policy_free(policy);
     st_policy_ctx_free(ctx);
@@ -233,7 +233,7 @@ static int test_verify_multiple_patterns_different_prefixes(void)
     ASSERT_STR_EQ(r.matching_pattern, "cat * | grep *");
 
     err = st_policy_eval(policy, "rm -rf /", &r);
-    ASSERT(err == ST_ERR_INVALID);
+    ASSERT(err == ST_OK);
 
     st_policy_free(policy);
     st_policy_ctx_free(ctx);
@@ -293,7 +293,7 @@ static int test_verify_empty_policy(void)
 
     st_eval_result_t r;
     st_error_t err = st_policy_eval(policy, "git commit", &r);
-    ASSERT(err == ST_ERR_INVALID);
+    ASSERT(err == ST_OK);
 
     st_policy_free(policy);
     st_policy_ctx_free(ctx);
@@ -378,7 +378,7 @@ static int test_verify_after_remove(void)
     st_policy_remove(policy, "git commit -m *");
 
     err = st_policy_eval(policy, "git commit -m fix", &r);
-    ASSERT(err == ST_ERR_INVALID);
+    ASSERT(err == ST_OK);
 
     err = st_policy_eval(policy, "git status", &r);
     ASSERT(err == ST_OK);
@@ -409,7 +409,7 @@ static int test_eval_suggest_accept_loop(void)
 
     /* 2. Verify a non-matching command — should produce suggestions */
     err = st_policy_eval(policy, "git commit -m hello", &r);
-    ASSERT(err == ST_ERR_INVALID);
+    ASSERT(err == ST_OK);
     ASSERT(!r.matches);
     ASSERT(r.suggestion_count == 2);
     ASSERT(strstr(r.suggestions[0].pattern, "git") != NULL);
@@ -427,7 +427,7 @@ static int test_eval_suggest_accept_loop(void)
 
     /* 5. A completely different command should still not match */
     err = st_policy_eval(policy, "rm -rf /", &r);
-    ASSERT(err == ST_ERR_INVALID);
+    ASSERT(err == ST_OK);
     ASSERT(!r.matches);
     ASSERT(r.suggestion_count == 2);
 
@@ -447,7 +447,7 @@ static int test_eval_suggest_variants_loop(void)
     /* Get suggestions for a new command */
     st_eval_result_t r;
     st_error_t err = st_policy_eval(policy, "docker run -it ubuntu bash", &r);
-    ASSERT(err == ST_ERR_INVALID);
+    ASSERT(err == ST_OK);
     ASSERT(!r.matches);
     ASSERT(r.suggestion_count == 2);
 
@@ -539,7 +539,7 @@ static int test_complex_eval_filter_suggest_stress(void)
 
     /* --- 5. Filter reject with suggestions (divergence at position 0) --- */
     err = st_policy_eval(policy, "zzz something", &r);
-    ASSERT(err == ST_ERR_INVALID);
+    ASSERT(err == ST_OK);
     ASSERT(!r.matches);
     ASSERT(r.suggestion_count == 2);
     /* Both suggestions should contain "zzz" since divergence is at position 0 */
@@ -549,7 +549,7 @@ static int test_complex_eval_filter_suggest_stress(void)
     /* --- 6. Filter passes, trie diverges at position 1 --- */
     /* "git" matches at position 0, but "commit" not in children */
     err = st_policy_eval(policy, "git commit -m hello", &r);
-    ASSERT(err == ST_ERR_INVALID);
+    ASSERT(err == ST_OK);
     ASSERT(!r.matches);
     ASSERT(r.suggestion_count == 2);
     /* Suggestion A should have "git commit -m hello" (exact) */
@@ -584,7 +584,7 @@ static int test_complex_eval_filter_suggest_stress(void)
     /* "mycmd -d value" diverges at position 1 where we have
      * 3 literal children: -a, -b, -c */
     err = st_policy_eval(policy, "mycmd -d value", &r);
-    ASSERT(err == ST_ERR_INVALID);
+    ASSERT(err == ST_OK);
     ASSERT(!r.matches);
     ASSERT(r.suggestion_count == 2);
     /* Suggestion B should have a wildcard at position 1 */
@@ -625,7 +625,7 @@ static int test_complex_eval_filter_suggest_stress(void)
 
     /* A completely unrelated command should still be rejected */
     err = st_policy_eval(policy, "totally-unrelated-command", &r);
-    ASSERT(err == ST_ERR_INVALID);
+    ASSERT(err == ST_OK);
     ASSERT(!r.matches);
     ASSERT(r.suggestion_count == 2);
 

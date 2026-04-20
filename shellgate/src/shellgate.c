@@ -100,6 +100,7 @@ static const char *bw_printf(buf_writer_t *w, const char *fmt, ...)
 struct sg_gate {
     st_policy_ctx_t *pctx;
     st_policy_t     *policy;
+    st_policy_t     *deny_policy;
 
     char     cwd[512];
     uint32_t reject_mask;
@@ -130,6 +131,9 @@ sg_gate_t *sg_gate_new(void)
     g->policy = st_policy_new(g->pctx);
     if (!g->policy) { st_policy_ctx_free(g->pctx); free(g); return NULL; }
 
+    g->deny_policy = st_policy_new(g->pctx);
+    if (!g->deny_policy) { st_policy_free(g->policy); st_policy_ctx_free(g->pctx); free(g); return NULL; }
+
     sg_strlcpy(g->cwd, ".", sizeof(g->cwd));
     g->reject_mask = SG_REJECT_MASK_DEFAULT;
     g->stop_mode = SG_STOP_FIRST_FAIL;
@@ -141,8 +145,9 @@ sg_gate_t *sg_gate_new(void)
 void sg_gate_free(sg_gate_t *gate)
 {
     if (!gate) return;
-    if (gate->policy) st_policy_free(gate->policy);
-    if (gate->pctx)   st_policy_ctx_free(gate->pctx);
+    if (gate->policy)       st_policy_free(gate->policy);
+    if (gate->deny_policy)  st_policy_free(gate->deny_policy);
+    if (gate->pctx)         st_policy_ctx_free(gate->pctx);
     free(gate);
 }
 
@@ -245,6 +250,28 @@ uint32_t sg_gate_rule_count(const sg_gate_t *gate)
 {
     if (!gate) return 0;
     return (uint32_t)st_policy_count(gate->policy);
+}
+
+sg_error_t sg_gate_add_deny_rule(sg_gate_t *gate, const char *pattern)
+{
+    if (!gate || !pattern) return SG_ERR_INVALID;
+    st_error_t err = st_policy_add(gate->deny_policy, pattern);
+    if (err != ST_OK) return SG_ERR_INVALID;
+    return SG_OK;
+}
+
+sg_error_t sg_gate_remove_deny_rule(sg_gate_t *gate, const char *pattern)
+{
+    if (!gate || !pattern) return SG_ERR_INVALID;
+    st_error_t err = st_policy_remove(gate->deny_policy, pattern);
+    if (err != ST_OK) return SG_ERR_INVALID;
+    return SG_OK;
+}
+
+uint32_t sg_gate_deny_rule_count(const sg_gate_t *gate)
+{
+    if (!gate) return 0;
+    return (uint32_t)st_policy_count(gate->deny_policy);
 }
 
 /* ============================================================
@@ -1305,37 +1332,67 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd,
         sr->env_count      = cmd_env_count[ni];
         sr->violation_flags = node_viols[ni];
 
-        st_eval_result_t eval;
-        st_error_t eval_err = st_policy_eval(gate->policy, sr->command ? sr->command : "",
-                                              gate->suggestions ? &eval : NULL);
-        if (eval_err != ST_OK) {
-            sr->matches = false;
-            sr->verdict = SG_VERDICT_DENY;
-            sr->reject_reason = bw_copy(&bw, "policy eval error", 17);
-        } else if (eval.matches) {
-            sr->matches = true;
-            sr->verdict = SG_VERDICT_ALLOW;
-        } else {
-            sr->matches = false;
-            sr->verdict = SG_VERDICT_DENY;
+        const char *cmd_str = sr->command ? sr->command : "";
 
-            if (eval.suggestion_count > 0 && out->suggestion_count == 0) {
-                out->suggestions[0] = bw_copy(&bw,
-                    eval.suggestions[0].pattern,
-                    strlen(eval.suggestions[0].pattern));
-                if (out->suggestions[0]) out->suggestion_count++;
+        /* Check deny policy first */
+        st_eval_result_t deny_eval;
+        st_error_t deny_err = st_policy_eval(gate->deny_policy, cmd_str,
+                                              gate->suggestions ? &deny_eval : NULL);
+        if (deny_err == ST_OK && deny_eval.matches) {
+            sr->matches = true;
+            sr->verdict = SG_VERDICT_DENY;
+            sr->reject_reason = bw_copy(&bw, "deny policy match", 17);
+        } else {
+            /* Check allow policy */
+            st_eval_result_t eval;
+            st_error_t eval_err = st_policy_eval(gate->policy, cmd_str,
+                                                  gate->suggestions ? &eval : NULL);
+            if (eval_err != ST_OK) {
+                sr->matches = false;
+                sr->verdict = SG_VERDICT_UNDETERMINED;
+            } else if (eval.matches) {
+                sr->matches = true;
+                sr->verdict = SG_VERDICT_ALLOW;
+            } else {
+                sr->matches = false;
+                sr->verdict = SG_VERDICT_UNDETERMINED;
+
+                if (eval.suggestion_count > 0 && out->suggestion_count == 0) {
+                    out->suggestions[0] = bw_copy(&bw,
+                        eval.suggestions[0].pattern,
+                        strlen(eval.suggestions[0].pattern));
+                    if (out->suggestions[0]) out->suggestion_count++;
+                }
+                if (eval.suggestion_count > 1 && out->suggestion_count == 1) {
+                    out->suggestions[1] = bw_copy(&bw,
+                        eval.suggestions[1].pattern,
+                        strlen(eval.suggestions[1].pattern));
+                    if (out->suggestions[1]) out->suggestion_count++;
+                }
             }
-            if (eval.suggestion_count > 1 && out->suggestion_count == 1) {
-                out->suggestions[1] = bw_copy(&bw,
-                    eval.suggestions[1].pattern,
-                    strlen(eval.suggestions[1].pattern));
-                if (out->suggestions[1]) out->suggestion_count++;
+
+            /* Generate deny suggestions from deny policy */
+            if (deny_err == ST_OK && out->deny_suggestion_count == 0) {
+                if (deny_eval.suggestion_count > 0) {
+                    out->deny_suggestions[0] = bw_copy(&bw,
+                        deny_eval.suggestions[0].pattern,
+                        strlen(deny_eval.suggestions[0].pattern));
+                    if (out->deny_suggestions[0]) out->deny_suggestion_count++;
+                }
+                if (deny_eval.suggestion_count > 1 && out->deny_suggestion_count == 1) {
+                    out->deny_suggestions[1] = bw_copy(&bw,
+                        deny_eval.suggestions[1].pattern,
+                        strlen(deny_eval.suggestions[1].pattern));
+                    if (out->deny_suggestions[1]) out->deny_suggestion_count++;
+                }
             }
         }
 
-        if (!sr->matches && out->deny_reason == NULL) {
-            out->deny_reason = sr->reject_reason ? sr->reject_reason : sr->command;
-            out->attention_index = out->subcmd_count - 1;
+    if (sr->verdict == SG_VERDICT_REJECT || sr->verdict == SG_VERDICT_DENY) {
+            if (out->deny_reason == NULL) {
+                out->deny_reason = sr->reject_reason ? sr->reject_reason : sr->command;
+                out->attention_index = out->subcmd_count - 1;
+            }
         }
 
         if (!sr->matches && gate->stop_mode == SG_STOP_FIRST_FAIL) break;
@@ -1347,12 +1404,23 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd,
         return bw.overflow ? SG_ERR_TRUNC : SG_OK;
     }
 
-    bool all_match = true;
+    bool all_allow = true;
+    bool any_reject = false;
+    bool any_deny = false;
     for (uint32_t i = 0; i < out->subcmd_count; i++) {
-        if (!out->subcmds[i].matches) { all_match = false; break; }
+        if (out->subcmds[i].verdict != SG_VERDICT_ALLOW) all_allow = false;
+        if (out->subcmds[i].verdict == SG_VERDICT_REJECT) any_reject = true;
+        if (out->subcmds[i].verdict == SG_VERDICT_DENY) any_deny = true;
     }
 
-    out->verdict = all_match ? SG_VERDICT_ALLOW : SG_VERDICT_DENY;
+    if (any_reject)
+        out->verdict = SG_VERDICT_REJECT;
+    else if (any_deny)
+        out->verdict = SG_VERDICT_DENY;
+    else if (all_allow)
+        out->verdict = SG_VERDICT_ALLOW;
+    else
+        out->verdict = SG_VERDICT_UNDETERMINED;
     out->truncated = bw.overflow;
     return bw.overflow ? SG_ERR_TRUNC : SG_OK;
 }
@@ -1364,9 +1432,10 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd,
 const char *sg_verdict_name(sg_verdict_t v)
 {
     switch (v) {
-        case SG_VERDICT_ALLOW:  return "ALLOW";
-        case SG_VERDICT_DENY:   return "DENY";
-        case SG_VERDICT_REJECT: return "REJECT";
+        case SG_VERDICT_ALLOW:        return "ALLOW";
+        case SG_VERDICT_DENY:         return "DENY";
+        case SG_VERDICT_REJECT:       return "REJECT";
+        case SG_VERDICT_UNDETERMINED: return "UNDETERMINED";
     }
     return "UNKNOWN";
 }

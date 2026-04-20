@@ -81,7 +81,7 @@ TEST(deny_unknown_command)
     sg_result_t r;
     sg_error_t err = eval_cmd(g, "rm -rf /", &r);
     ASSERT(err == SG_OK);
-    ASSERT(r.verdict == SG_VERDICT_DENY);
+    ASSERT(r.verdict == SG_VERDICT_UNDETERMINED);
     ASSERT(r.subcmds[0].command != NULL);
     sg_gate_free(g);
 }
@@ -101,7 +101,7 @@ TEST(deny_empty_policy)
     sg_gate_t *g = sg_gate_new();
     sg_result_t r;
     eval_cmd(g, "ls", &r);
-    ASSERT(r.verdict == SG_VERDICT_DENY);
+    ASSERT(r.verdict == SG_VERDICT_UNDETERMINED);
     sg_gate_free(g);
 }
 
@@ -128,7 +128,7 @@ TEST(deny_pipe_one_fails)
     sg_gate_t *g = gate_with_rules(rules, 1);
     sg_result_t r;
     eval_cmd(g, "ls | rm", &r);
-    ASSERT(r.verdict == SG_VERDICT_DENY);
+    ASSERT(r.verdict == SG_VERDICT_UNDETERMINED);
     ASSERT(r.subcmd_count >= 1);
     sg_gate_free(g);
 }
@@ -153,7 +153,7 @@ TEST(deny_and_first_fails)
     sg_gate_t *g = gate_with_rules(rules, 1);
     sg_result_t r;
     eval_cmd(g, "rm -rf / && ls", &r);
-    ASSERT(r.verdict == SG_VERDICT_DENY);
+    ASSERT(r.verdict == SG_VERDICT_UNDETERMINED);
     sg_gate_free(g);
 }
 
@@ -163,7 +163,7 @@ TEST(deny_or_first_fails)
     sg_gate_t *g = gate_with_rules(rules, 1);
     sg_result_t r;
     eval_cmd(g, "rm || ls", &r);
-    ASSERT(r.verdict == SG_VERDICT_DENY);
+    ASSERT(r.verdict == SG_VERDICT_UNDETERMINED);
     sg_gate_free(g);
 }
 
@@ -228,7 +228,7 @@ TEST(suggestions_on_deny)
     sg_gate_add_rule(g, "git log");
     sg_result_t r;
     eval_cmd(g, "git commit", &r);
-    ASSERT(r.verdict == SG_VERDICT_DENY);
+    ASSERT(r.verdict == SG_VERDICT_UNDETERMINED);
     sg_gate_free(g);
 }
 
@@ -239,7 +239,7 @@ TEST(suggestions_populated)
     sg_gate_add_rule(g, "ls");
     sg_result_t r;
     eval_cmd(g, "cat", &r);
-    ASSERT(r.verdict == SG_VERDICT_DENY);
+    ASSERT(r.verdict == SG_VERDICT_UNDETERMINED);
     if (r.suggestion_count > 0) {
         ASSERT(r.suggestions[0] != NULL);
         ASSERT(r.suggestions[0][0] != '\0');
@@ -255,7 +255,7 @@ TEST(suggestions_two_offered)
     sg_gate_add_rule(g, "cat #path #path");
     sg_result_t r;
     eval_cmd(g, "cat", &r);
-    ASSERT(r.verdict == SG_VERDICT_DENY);
+    ASSERT(r.verdict == SG_VERDICT_UNDETERMINED);
     if (r.suggestion_count >= 2) {
         ASSERT(r.suggestions[0] != NULL);
         ASSERT(r.suggestions[1] != NULL);
@@ -271,7 +271,7 @@ TEST(suggestions_disabled)
     sg_gate_set_suggestions(g, false);
     sg_result_t r;
     eval_cmd(g, "rm", &r);
-    ASSERT(r.verdict == SG_VERDICT_DENY);
+    ASSERT(r.verdict == SG_VERDICT_UNDETERMINED);
     ASSERT(r.suggestion_count == 0);
     sg_gate_free(g);
 }
@@ -397,7 +397,7 @@ TEST(save_load_roundtrip)
     ASSERT(r.verdict == SG_VERDICT_ALLOW);
 
     eval_cmd(g2, "rm -rf /", &r);
-    ASSERT(r.verdict == SG_VERDICT_DENY);
+    ASSERT(r.verdict == SG_VERDICT_UNDETERMINED);
 
     unlink(path);
     sg_gate_free(g);
@@ -420,7 +420,7 @@ TEST(save_load_empty)
 
     sg_result_t r;
     eval_cmd(g2, "ls", &r);
-    ASSERT(r.verdict == SG_VERDICT_DENY);
+    ASSERT(r.verdict == SG_VERDICT_UNDETERMINED);
 
     unlink(path);
     sg_gate_free(g);
@@ -460,7 +460,7 @@ TEST(buffer_reuse)
     sg_result_t r2;
     err = sg_eval(g, "rm", buf, sizeof(buf), &r2);
     ASSERT(err == SG_OK);
-    ASSERT(r2.verdict == SG_VERDICT_DENY);
+    ASSERT(r2.verdict == SG_VERDICT_UNDETERMINED);
     ASSERT(r2.subcmds[0].command != NULL);
 
     sg_gate_free(g);
@@ -485,6 +485,7 @@ TEST(verdict_names)
     ASSERT(strcmp(sg_verdict_name(SG_VERDICT_ALLOW), "ALLOW") == 0);
     ASSERT(strcmp(sg_verdict_name(SG_VERDICT_DENY), "DENY") == 0);
     ASSERT(strcmp(sg_verdict_name(SG_VERDICT_REJECT), "REJECT") == 0);
+    ASSERT(strcmp(sg_verdict_name(SG_VERDICT_UNDETERMINED), "UNDETERMINED") == 0);
 }
 
 /* ============================================================
