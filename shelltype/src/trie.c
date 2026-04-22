@@ -551,7 +551,8 @@ st_error_t st_load(st_learner_t *learner, const char *path)
         if (!tokens) { free(pattern_copy); fclose(fp); return ST_ERR_MEMORY; }
 
         size_t ti = 0;
-        char *tok = strtok(pattern_copy, " ");
+        char *saveptr = NULL;
+        char *tok = strtok_r(pattern_copy, " ", &saveptr);
         while (tok && ti < token_count) {
             /* Check if it's a type symbol */
             st_token_type_t type = ST_TYPE_LITERAL;
@@ -569,7 +570,7 @@ st_error_t st_load(st_learner_t *learner, const char *path)
             tokens[ti].text = strdup(tok);
             tokens[ti].type = type;
             ti++;
-            tok = strtok(NULL, " ");
+            tok = strtok_r(NULL, " ", &saveptr);
         }
         token_count = ti;
 

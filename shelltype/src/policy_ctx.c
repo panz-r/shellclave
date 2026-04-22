@@ -48,8 +48,17 @@ static void arena_free(arena_t *a)
 static void *arena_alloc(arena_t *a, size_t n)
 {
     /* Align to 8 bytes */
+    if (n > SIZE_MAX - 7) return NULL;
     n = (n + 7) & ~(size_t)7;
-    if (a->used + n > a->size) return NULL;
+    if (a->used + n > a->size) {
+        /* Grow arena: double size, or enough for request + 1KB padding */
+        size_t new_size = a->size * 2;
+        if (new_size < a->used + n) new_size = a->used + n + 1024;
+        char *new_base = realloc(a->base, new_size);
+        if (!new_base) return NULL;
+        a->base = new_base;
+        a->size = new_size;
+    }
     void *p = a->base + a->used;
     a->used += n;
     return p;

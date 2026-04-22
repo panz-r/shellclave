@@ -421,12 +421,11 @@ st_error_t st_normalize_typed(const char *raw_cmd, st_token_array_t *out)
         free(raw_tokens);
         return ST_ERR_MEMORY;
     }
+    out->count = 0;
 
     const char *prev = NULL;
     for (size_t i = 0; i < raw_count; i++) {
         const char *tok = raw_tokens[i];
-        const char *next = (i + 1 < raw_count) ? raw_tokens[i + 1] : NULL;
-        (void)next;
 
         /* Handle --flag=value: split into --flag and value */
         if (tok[0] == '-' && tok[1] == '-') {

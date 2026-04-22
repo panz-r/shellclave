@@ -26,7 +26,7 @@ typedef enum {
     ST_ERR_INVALID     = -1,
     ST_ERR_MEMORY      = -2,
     ST_ERR_IO          = -3,
-    ST_ERR_TRUNCATED   = -4,
+    ST_ERR_FAILED      = -4,
     ST_ERR_FORMAT      = -5,
 } st_error_t;
 
@@ -323,6 +323,7 @@ typedef struct {
     const char *matching_pattern;     /* NULL if no match */
     size_t suggestion_count;          /* 0-2, only filled if !matches */
     st_expand_suggestion_t suggestions[2];
+    st_error_t error;                /* ST_ERR_FAILED if build fails */
 } st_eval_result_t;
 
 /**

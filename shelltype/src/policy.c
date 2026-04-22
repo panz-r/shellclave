@@ -28,18 +28,18 @@
  * ============================================================ */
 
 static uint32_t crc32_table[256];
-static int crc32_table_init = 0;
+static _Atomic int crc32_table_init = 0;
 
 static void crc32_init_table(void)
 {
-    if (crc32_table_init) return;
+    if (__atomic_load_n(&crc32_table_init, __ATOMIC_ACQUIRE)) return;
     for (uint32_t i = 0; i < 256; i++) {
         uint32_t c = i;
         for (int j = 0; j < 8; j++)
             c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
         crc32_table[i] = c;
     }
-    crc32_table_init = 1;
+    __atomic_store_n(&crc32_table_init, 1, __ATOMIC_RELEASE);
 }
 
 static uint32_t crc32_compute(const void *data, size_t len, uint32_t prev)
@@ -59,7 +59,7 @@ static uint32_t crc32_compute(const void *data, size_t len, uint32_t prev)
 #define CHILDREN_ARENA_INIT  4096
 #define STATES_INIT          4096
 #define PATTERN_REG_INIT     256
-#define VERIFY_ALL_RING_CAP  64
+#define VERIFY_ALL_RING_CAP  4096
 #define MAX_CMD_TOKENS       128
 #define FILTER_POS_LEVELS    4
 #define FILTER_POS_CAPACITY  1024
@@ -353,7 +353,8 @@ static st_token_t *parse_pattern(const char *pattern, size_t *out_count)
     if (!tokens) { free(copy); return NULL; }
 
     size_t ti = 0;
-    char *tok = strtok(copy, " ");
+    char *saveptr = NULL;
+    char *tok = strtok_r(copy, " ", &saveptr);
     while (tok && ti < count) {
         st_token_type_t type = ST_TYPE_LITERAL;
         for (int t = 1; t < ST_TYPE_COUNT; t++) {
@@ -368,7 +369,7 @@ static st_token_t *parse_pattern(const char *pattern, size_t *out_count)
         tokens[ti].text = strdup(tok);
         tokens[ti].type = type;
         ti++;
-        tok = strtok(NULL, " ");
+        tok = strtok_r(NULL, " ", &saveptr);
     }
     *out_count = ti;
     free(copy);
@@ -542,6 +543,17 @@ st_error_t st_policy_add(st_policy_t *policy, const char *pattern)
     return ST_OK;
 }
 
+/*
+ * NOTE: This function performs a logical removal only. Since the policy
+ * uses an arena allocator for trie nodes, removed patterns leave their
+ * nodes in place. The pattern_id is unset so the node no longer represents
+ * an active pattern, but the node itself cannot be freed without a
+ * full trie compaction (rebuild from remaining patterns).
+ *
+ * Over time, with many add/remove cycles, unused nodes may accumulate.
+ * If memory pressure becomes an issue, use st_policy_compact() to
+ * rebuild the policy from scratch with only active patterns.
+ */
 st_error_t st_policy_remove(st_policy_t *policy, const char *pattern)
 {
     if (!policy || !pattern || !pattern[0]) return ST_ERR_INVALID;
@@ -776,9 +788,14 @@ st_error_t st_policy_eval(const st_policy_t *policy,
             pat_tokens[i].type = ST_TYPE_LITERAL;
         }
 
-        st_build_pattern(result->suggestions[0].pattern,
+        if (!st_build_pattern(result->suggestions[0].pattern,
                             sizeof(result->suggestions[0].pattern),
-                            pat_tokens, cmd.count);
+                            pat_tokens, cmd.count)) {
+            free(pat_tokens);
+            st_free_token_array(&cmd);
+            result->error = ST_ERR_FAILED;
+            return ST_ERR_FAILED;
+        }
         result->suggestions[0].based_on = based_on;
         result->suggestions[0].confidence = confidence;
         free(pat_tokens);
@@ -816,16 +833,21 @@ st_error_t st_policy_eval(const st_policy_t *policy,
                     pat_tokens[match_depth].text = (char *)st_type_symbol[best_wild];
                     pat_tokens[match_depth].type = best_wild;
 
-                    st_build_pattern(result->suggestions[1].pattern,
+                    if (!st_build_pattern(result->suggestions[1].pattern,
                                         sizeof(result->suggestions[1].pattern),
-                                        pat_tokens, pat_len);
+                                        pat_tokens, pat_len)) {
+                        free(pat_tokens);
+                        st_free_token_array(&cmd);
+                        result->error = ST_ERR_FAILED;
+                        return ST_ERR_FAILED;
+                    }
                     result->suggestions[1].based_on = based_on;
                     result->suggestions[1].confidence = confidence;
                     free(pat_tokens);
                     n_suggestions = 2;
                 }
             }
-	} else if (wm == 0 && div_node->literal_count >= LITERAL_THRESHOLD) {
+    } else if (wm == 0 && div_node->literal_count >= LITERAL_THRESHOLD) {
             /* Literal-to-wildcard: classify all existing literals + input token */
             st_token_type_t joined = ST_TYPE_LITERAL;
             uint16_t total = div_node->literal_count;
@@ -853,9 +875,14 @@ st_error_t st_policy_eval(const st_policy_t *policy,
                         pat_tokens[i].type = cmd.tokens[i].type;
                     }
 
-                    st_build_pattern(result->suggestions[1].pattern,
+                    if (!st_build_pattern(result->suggestions[1].pattern,
                                         sizeof(result->suggestions[1].pattern),
-                                        pat_tokens, pat_len);
+                                        pat_tokens, pat_len)) {
+                        free(pat_tokens);
+                        st_free_token_array(&cmd);
+                        result->error = ST_ERR_FAILED;
+                        return ST_ERR_FAILED;
+                    }
                     result->suggestions[1].based_on = based_on;
                     result->suggestions[1].confidence = confidence;
                     free(pat_tokens);
@@ -866,9 +893,13 @@ st_error_t st_policy_eval(const st_policy_t *policy,
     }
 
     if (n_suggestions < 2) {
-        st_build_pattern(result->suggestions[1].pattern,
+        if (!st_build_pattern(result->suggestions[1].pattern,
                             sizeof(result->suggestions[1].pattern),
-                            cmd.tokens, cmd.count);
+                            cmd.tokens, cmd.count)) {
+            st_free_token_array(&cmd);
+            result->error = ST_ERR_FAILED;
+            return ST_ERR_FAILED;
+        }
         result->suggestions[1].based_on = NULL;
         result->suggestions[1].confidence = confidence;
         n_suggestions = 2;
