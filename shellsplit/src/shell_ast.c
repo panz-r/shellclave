@@ -103,11 +103,11 @@ ast_node_t* shell_ast_add_redirect(shell_ast_t* ast, ast_node_t* cmd, const char
 
 ast_node_t* shell_ast_add_variable(shell_ast_t* ast, const char* name, bool is_braced) {
     if (!ast || !name) return NULL;
-    
+
     ast_node_t* node = ast_node_create(AST_VARIABLE);
     if (node) {
         node->value = strdup(name);
-        node->is_input_redirect = is_braced;  // Reuse field for braced status
+        node->is_braced = is_braced;
         ast->node_count++;
     }
     return node;
@@ -200,11 +200,19 @@ static size_t append_str(char* buffer, size_t buffer_size, size_t pos, const cha
 
 static size_t serialize_node(const ast_node_t* node, char* buffer, size_t buffer_size, size_t pos) {
     if (!node || !buffer || pos >= buffer_size) return pos;
-    
+
     switch (node->type) {
         case AST_COMMAND:
             if (node->value) {
                 pos = append_str(buffer, buffer_size, pos, node->value);
+            }
+            /* Recursively serialize child nodes (args, vars, globs attached as children) */
+            if (node->child) {
+                pos = serialize_node(node->child, buffer, buffer_size, pos);
+            }
+            /* Handle redirects attached via child */
+            if (node->has_redirect && node->child && node->child->type == AST_REDIRECT) {
+                /* Redirect already serialized as part of child */
             }
             break;
             
@@ -272,7 +280,7 @@ static size_t serialize_node(const ast_node_t* node, char* buffer, size_t buffer
             break;
             
         case AST_VARIABLE:
-            if (node->is_input_redirect) {  // braced
+            if (node->is_braced) {
                 pos = append_str(buffer, buffer_size, pos, "${");
                 if (node->value) pos = append_str(buffer, buffer_size, pos, node->value);
                 pos = append_str(buffer, buffer_size, pos, "}");
@@ -411,15 +419,15 @@ char* shell_ast_serialize(const shell_ast_t* ast, char* buffer, size_t buffer_si
 
 ast_node_t* shell_ast_add_command_with_args(shell_ast_t* ast, const char* command, const char** args, size_t num_args) {
     if (!ast || !command) return NULL;
-    
+
     ast_node_t* node = ast_node_create(AST_COMMAND);
     if (node) {
-        // Build command with args
+        /* Build command with args */
         size_t len = strlen(command) + 1;
         for (size_t i = 0; i < num_args; i++) {
-            if (args[i]) len += 1 + strlen(args[i]); // space + arg
+            if (args[i]) len += 1 + strlen(args[i]); /* space + arg */
         }
-        node->value = (char*)malloc(len);
+        node->value = (char*)calloc(1, len);  /* Zero-initialize for safety */
         if (node->value) {
             strcpy(node->value, command);
             for (size_t i = 0; i < num_args; i++) {

@@ -94,6 +94,9 @@ static const char* gen_random_command(shell_ast_generator_t* gen) {
     return COMMANDS[random_range(gen, NUM_COMMANDS)];
 }
 
+/* NOTE: Returns pointer to static buffer, only valid until next call to any
+ * gen_random_* function. Use immediately - shell_ast_add_redirect strdup's
+ * the target so this is safe for the current usage pattern. */
 static const char* gen_random_file(shell_ast_generator_t* gen) {
     static char buf[64];
     snprintf(buf, sizeof(buf), "/tmp/test%u.txt", (unsigned)random_range(gen, 10));

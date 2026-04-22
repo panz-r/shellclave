@@ -5,88 +5,106 @@
 #include "shell_interop.h"
 #include "shell_tokenizer.h"
 
-/* Static result buffer - caller allocates */
-static shell_parse_result_t g_result;
-static char g_cmd_buffer[4096];
+#define SHELL_INTEROP_BUFFER_SIZE 4096
 
-/**
- * Parse a shell command - stores result internally for Go to query
- */
-int shell_interop_parse(const char* cmd, int cmd_len) {
-    if (cmd == NULL || cmd_len <= 0) {
+struct shell_interop_handle {
+    shell_parse_result_t result;
+    char cmd_buffer[SHELL_INTEROP_BUFFER_SIZE];
+};
+
+/* Create a new interop handle */
+shell_interop_handle_t* shell_interop_create(void) {
+    shell_interop_handle_t* handle = calloc(1, sizeof(shell_interop_handle_t));
+    return handle;
+}
+
+/* Destroy an interop handle */
+void shell_interop_destroy(shell_interop_handle_t* handle) {
+    if (handle) {
+        free(handle);
+    }
+}
+
+/* Parse a shell command */
+int shell_interop_parse(shell_interop_handle_t* handle, const char* cmd, int cmd_len) {
+    if (handle == NULL || cmd == NULL || cmd_len <= 0) {
         return 0;
     }
-    
-    /* Copy command to our buffer (null-terminate) */
-    int len = cmd_len;
-    if (len >= (int)sizeof(g_cmd_buffer)) {
-        len = sizeof(g_cmd_buffer) - 1;
+
+    /* Reject commands that exceed buffer capacity */
+    if (cmd_len >= (int)sizeof(handle->cmd_buffer)) {
+        return -1;  /* Error: command too long */
     }
-    memcpy(g_cmd_buffer, cmd, len);
-    g_cmd_buffer[len] = '\0';
-    
+
+    /* Copy command to buffer (null-terminate) */
+    memcpy(handle->cmd_buffer, cmd, cmd_len);
+    handle->cmd_buffer[cmd_len] = '\0';
+
     /* Use default limits */
     shell_limits_t limits = SHELL_LIMITS_DEFAULT;
-    
+
     /* Parse the command */
-    shell_error_t err = shell_parse_fast(g_cmd_buffer, len, &limits, &g_result);
-    
+    shell_error_t err = shell_parse_fast(handle->cmd_buffer, cmd_len, &limits, &handle->result);
+
     if (err != SHELL_OK) {
         return 0;
     }
-    
-    return (int)g_result.count;
+
+    return (int)handle->result.count;
 }
 
 /* Get subcommand count */
-int shell_interop_subcommand_count(void) {
-    return (int)g_result.count;
+int shell_interop_subcommand_count(shell_interop_handle_t* handle) {
+    if (handle == NULL) {
+        return 0;
+    }
+    return (int)handle->result.count;
 }
 
 /* Get type of subcommand i */
-int shell_interop_subcommand_type(int i) {
-    if (i < 0 || i >= (int)g_result.count) {
+int shell_interop_subcommand_type(shell_interop_handle_t* handle, int i) {
+    if (handle == NULL || i < 0 || i >= (int)handle->result.count) {
         return 0;
     }
-    return (int)g_result.cmds[i].type;
+    return (int)handle->result.cmds[i].type;
 }
 
 /* Get features of subcommand i */
-int shell_interop_subcommand_features(int i) {
-    if (i < 0 || i >= (int)g_result.count) {
+int shell_interop_subcommand_features(shell_interop_handle_t* handle, int i) {
+    if (handle == NULL || i < 0 || i >= (int)handle->result.count) {
         return 0;
     }
-    return (int)g_result.cmds[i].features;
+    return (int)handle->result.cmds[i].features;
 }
 
 /* Get start position */
-int shell_interop_subcommand_start(int i) {
-    if (i < 0 || i >= (int)g_result.count) {
+int shell_interop_subcommand_start(shell_interop_handle_t* handle, int i) {
+    if (handle == NULL || i < 0 || i >= (int)handle->result.count) {
         return 0;
     }
-    return (int)g_result.cmds[i].start;
+    return (int)handle->result.cmds[i].start;
 }
 
 /* Get length */
-int shell_interop_subcommand_len(int i) {
-    if (i < 0 || i >= (int)g_result.count) {
+int shell_interop_subcommand_len(shell_interop_handle_t* handle, int i) {
+    if (handle == NULL || i < 0 || i >= (int)handle->result.count) {
         return 0;
     }
-    return (int)g_result.cmds[i].len;
+    return (int)handle->result.cmds[i].len;
 }
 
 /* Get subcommand string - caller must free */
-char* shell_interop_subcommand_str(int i) {
-    if (i < 0 || i >= (int)g_result.count) {
+char* shell_interop_subcommand_str(shell_interop_handle_t* handle, int i) {
+    if (handle == NULL || i < 0 || i >= (int)handle->result.count) {
         return NULL;
     }
-    
-    char* buf = malloc(g_result.cmds[i].len + 1);
+
+    char* buf = malloc(handle->result.cmds[i].len + 1);
     if (buf == NULL) {
         return NULL;
     }
-    
-    shell_copy_subcommand(g_cmd_buffer, &g_result.cmds[i], buf, g_result.cmds[i].len + 1);
+
+    shell_copy_subcommand(handle->cmd_buffer, &handle->result.cmds[i], buf, handle->result.cmds[i].len + 1);
     return buf;
 }
 
@@ -97,13 +115,13 @@ void shell_interop_free_str(char* s) {
     }
 }
 
-/* Get features as string */
+/* Get features as string - caller must free */
 char* shell_interop_features_str(int features) {
     char* buf = malloc(256);
     if (buf == NULL) return NULL;
-    
+
     buf[0] = '\0';
-    
+
     if (features & SHELL_FEAT_VARS) strcat(buf, "VAR ");
     if (features & SHELL_FEAT_GLOBS) strcat(buf, "GLOB ");
     if (features & SHELL_FEAT_SUBSHELL) strcat(buf, "SUBSHELL ");
@@ -114,19 +132,19 @@ char* shell_interop_features_str(int features) {
     if (features & SHELL_FEAT_LOOPS) strcat(buf, "LOOPS ");
     if (features & SHELL_FEAT_CONDITIONALS) strcat(buf, "COND ");
     if (features & SHELL_FEAT_CASE) strcat(buf, "CASE ");
-    
+
     if (buf[0] == '\0') {
         strcpy(buf, "none");
     }
-    
+
     return buf;
 }
 
-/* Get type as string */
+/* Get type as string - caller must free */
 char* shell_interop_type_str(int type) {
     char* buf = malloc(64);
     if (buf == NULL) return NULL;
-    
+
     /* Check type bits */
     if (type & SHELL_TYPE_PIPELINE) {
         strcpy(buf, "PIPE");
@@ -139,6 +157,6 @@ char* shell_interop_type_str(int type) {
     } else {
         strcpy(buf, "SIMPLE");
     }
-    
+
     return buf;
 }
