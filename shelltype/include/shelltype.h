@@ -290,6 +290,7 @@ typedef struct {
 st_policy_ctx_t *st_policy_ctx_new(void);
 st_policy_ctx_t *st_policy_ctx_new_with_arena(size_t arena_size);
 void st_policy_ctx_free(st_policy_ctx_t *ctx);
+void st_policy_ctx_reset(st_policy_ctx_t *ctx);
 const char *st_policy_ctx_intern(st_policy_ctx_t *ctx, const char *str);
 
 /* --- Policy lifecycle --- */
@@ -357,7 +358,8 @@ st_error_t st_policy_render_nfa(const st_policy_t *policy,
 /* --- Serialization --- */
 
 st_error_t st_policy_save(const st_policy_t *policy, const char *path);
-st_error_t st_policy_load(st_policy_t *policy, const char *path);
+st_error_t st_policy_load(st_policy_t *policy, const char *path, bool clear_first);
+st_error_t st_policy_compact(st_policy_t *policy);
 
 /* --- Diagnostics --- */
 

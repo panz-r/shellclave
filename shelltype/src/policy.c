@@ -61,9 +61,9 @@ static uint32_t crc32_compute(const void *data, size_t len, uint32_t prev)
 #define PATTERN_REG_INIT     256
 #define VERIFY_ALL_RING_CAP  4096
 #define MAX_CMD_TOKENS       128
-#define FILTER_POS_LEVELS    4
+#define FILTER_POS_LEVELS    4   /* Shell commands rarely exceed 4 tokens before diverging */
 #define FILTER_POS_CAPACITY  1024
-#define LITERAL_THRESHOLD 3
+#define LITERAL_THRESHOLD 3     /* 3+ literals at divergence point → generalize to wildcard */
 
 /* ============================================================
  * CHILD ENTRY — 16 bytes, packed
@@ -367,6 +367,13 @@ static st_token_t *parse_pattern(const char *pattern, size_t *out_count)
             type = st_classify_token(tok);
         }
         tokens[ti].text = strdup(tok);
+        if (!tokens[ti].text) {
+            for (size_t k = 0; k < ti; k++) free(tokens[k].text);
+            free(tokens);
+            free(copy);
+            *out_count = 0;
+            return NULL;
+        }
         tokens[ti].type = type;
         ti++;
         tok = strtok_r(NULL, " ", &saveptr);
@@ -591,6 +598,62 @@ st_error_t st_policy_remove(st_policy_t *policy, const char *pattern)
 
     policy->epoch++;
     free_pattern_tokens(tokens, token_count);
+    return ST_OK;
+}
+
+/*
+ * Compact the policy by rebuilding from active patterns.
+ * This reclaims arena memory after many add/remove cycles.
+ * The context is reset and all trie nodes are rebuilt.
+ */
+st_error_t st_policy_compact(st_policy_t *policy)
+{
+    if (!policy) return ST_ERR_INVALID;
+
+    if (policy->pattern_count == 0) return ST_OK;
+
+    char **active = malloc(policy->pattern_count * sizeof(char *));
+    if (!active) return ST_ERR_MEMORY;
+
+    size_t n_active = 0;
+    for (size_t i = 0; i < policy->patterns.count; i++) {
+        if (policy->patterns.strings[i] != NULL) {
+            active[n_active++] = strdup(policy->patterns.strings[i]);
+        }
+    }
+
+    if (n_active == 0) {
+        free(active);
+        return ST_OK;
+    }
+
+    st_policy_ctx_reset(policy->ctx);
+
+    for (size_t i = 0; i < policy->states.count; i++) {
+        free(policy->states.states[i].children);
+    }
+    free(policy->states.states);
+    states_array_init(&policy->states);
+    policy->patterns.count = 0;
+    policy->pattern_count = 0;
+    policy->children_count = 0;
+    for (int i = 0; i < FILTER_POS_LEVELS; i++) {
+        vacuum_filter_destroy(policy->pos_filters[i]);
+        policy->pos_filters[i] = NULL;
+        policy->pos_built_epoch[i] = 0;
+    }
+    policy->epoch++;
+
+    for (size_t i = 0; i < n_active; i++) {
+        st_error_t err = st_policy_add(policy, active[i]);
+        if (err != ST_OK) {
+            for (size_t j = 0; j < n_active; j++) free(active[j]);
+            free(active);
+            return err;
+        }
+        free(active[i]);
+    }
+    free(active);
     return ST_OK;
 }
 
@@ -1290,9 +1353,32 @@ st_error_t st_policy_save(const st_policy_t *policy, const char *path)
     return ctx.error;
 }
 
-st_error_t st_policy_load(st_policy_t *policy, const char *path)
+/*
+ * NOTE: By default, st_policy_load appends to an existing policy.
+ * If clear_first is true, the policy is reset before loading (but
+ * arena memory is not freed—only the active pattern set is cleared).
+ */
+st_error_t st_policy_load(st_policy_t *policy, const char *path, bool clear_first)
 {
     if (!policy || !path) return ST_ERR_INVALID;
+
+    if (clear_first) {
+        /* Clear active patterns and state (arena memory retained) */
+        for (size_t i = 0; i < policy->states.count; i++) {
+            free(policy->states.states[i].children);
+            policy->states.states[i].children = NULL;
+        }
+        policy->states.count = 1;
+        policy->patterns.count = 0;
+        policy->pattern_count = 0;
+        policy->children_count = 0;
+        for (int i = 0; i < FILTER_POS_LEVELS; i++) {
+            vacuum_filter_destroy(policy->pos_filters[i]);
+            policy->pos_filters[i] = NULL;
+            policy->pos_built_epoch[i] = 0;
+        }
+        policy->epoch++;
+    }
 
     FILE *fp = fopen(path, "r");
     if (!fp) return ST_ERR_IO;

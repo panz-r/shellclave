@@ -217,7 +217,7 @@ sg_error_t sg_gate_set_violation_config(sg_gate_t *gate,
 sg_error_t sg_gate_load_policy(sg_gate_t *gate, const char *path)
 {
     if (!gate || !path) return SG_ERR_INVALID;
-    st_error_t err = st_policy_load(gate->policy, path);
+    st_error_t err = st_policy_load(gate->policy, path, /*clear_first=*/false);
     if (err != ST_OK) return SG_ERR_INVALID;
     return SG_OK;
 }

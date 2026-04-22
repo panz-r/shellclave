@@ -205,7 +205,7 @@ static int test_policy_save_load(void)
     ASSERT(err == ST_OK);
 
     st_policy_t *policy2 = st_policy_new(ctx);
-    err = st_policy_load(policy2, "tests/test_policy_save.tmp");
+    err = st_policy_load(policy2, "tests/test_policy_save.tmp", false);
     ASSERT(err == ST_OK);
 
     ASSERT(st_policy_count(policy2) == 3);
@@ -227,7 +227,7 @@ static int test_policy_load_empty(void)
 
     st_policy_ctx_t *ctx = st_policy_ctx_new();
     st_policy_t *policy = st_policy_new(ctx);
-    st_error_t err = st_policy_load(policy, "tests/test_policy_empty.tmp");
+    st_error_t err = st_policy_load(policy, "tests/test_policy_empty.tmp", false);
     ASSERT(err == ST_OK);
     ASSERT(st_policy_count(policy) == 0);
     st_policy_free(policy);
@@ -249,7 +249,7 @@ static int test_policy_roundtrip_many_patterns(void)
     st_policy_save(policy1, "tests/test_policy_many.tmp");
 
     st_policy_t *policy2 = st_policy_new(ctx);
-    st_policy_load(policy2, "tests/test_policy_many.tmp");
+    st_policy_load(policy2, "tests/test_policy_many.tmp", false);
     ASSERT(st_policy_count(policy2) == 50);
 
     st_policy_free(policy1);

@@ -444,7 +444,7 @@ static int test_save_load(void)
     ASSERT(err == ST_OK);
 
     st_policy_t *p2 = st_policy_new(ctx);
-    err = st_policy_load(p2, "tests/test_compact_save.tmp");
+    err = st_policy_load(p2, "tests/test_compact_save.tmp", false);
     ASSERT(err == ST_OK);
     ASSERT(st_policy_count(p2) == 3);
 

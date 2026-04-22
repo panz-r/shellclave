@@ -134,7 +134,7 @@ int main(int argc, char *argv[])
             return 1;
         }
 
-        st_error_t err = st_policy_load(policy, policy_file);
+        st_error_t err = st_policy_load(policy, policy_file, false);
         if (err != ST_OK) {
             fprintf(stderr, "Error: failed to load policy from '%s' (%d)\n",
                     policy_file, err);

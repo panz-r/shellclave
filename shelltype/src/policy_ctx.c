@@ -9,6 +9,7 @@
  */
 
 #include "shelltype.h"
+#include "filter_hash.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -52,6 +53,7 @@ static void *arena_alloc(arena_t *a, size_t n)
     n = (n + 7) & ~(size_t)7;
     if (a->used + n > a->size) {
         /* Grow arena: double size, or enough for request + 1KB padding */
+        if (a->size > SIZE_MAX / 2) return NULL;
         size_t new_size = a->size * 2;
         if (new_size < a->used + n) new_size = a->used + n + 1024;
         char *new_base = realloc(a->base, new_size);
@@ -76,14 +78,19 @@ static size_t arena_used(const arena_t *a)
 
 typedef struct {
     const char **strings;
+    uint64_t   *hashes;
     size_t       count;
     size_t       capacity;
 } str_pool_t;
+
+#define HASH_EMPTY 0
 
 static bool str_pool_init(str_pool_t *p)
 {
     p->strings = calloc(STR_POOL_INIT_CAP, sizeof(const char *));
     if (!p->strings) return false;
+    p->hashes = calloc(STR_POOL_INIT_CAP, sizeof(uint64_t));
+    if (!p->hashes) { free((void *)p->strings); return false; }
     p->count = 0;
     p->capacity = STR_POOL_INIT_CAP;
     return true;
@@ -93,15 +100,21 @@ static void str_pool_free(str_pool_t *p)
 {
     /* Strings are arena-allocated, don't free individually */
     free((void *)p->strings);
+    free(p->hashes);
     p->strings = NULL;
+    p->hashes = NULL;
 }
 
 static bool str_pool_grow(str_pool_t *p)
 {
     size_t new_cap = p->capacity * 2;
-    const char **new_arr = realloc((void *)p->strings, new_cap * sizeof(const char *));
-    if (!new_arr) return false;
-    p->strings = new_arr;
+    const char **new_strings = realloc((void *)p->strings, new_cap * sizeof(const char *));
+    if (!new_strings) return false;
+    uint64_t *new_hashes = realloc(p->hashes, new_cap * sizeof(uint64_t));
+    if (!new_hashes) { free(new_strings); return false; }
+    memset(&new_hashes[p->capacity], 0, (new_cap - p->capacity) * sizeof(uint64_t));
+    p->strings = new_strings;
+    p->hashes = new_hashes;
     p->capacity = new_cap;
     return true;
 }
@@ -147,13 +160,33 @@ void st_policy_ctx_free(st_policy_ctx_t *ctx)
     free(ctx);
 }
 
+/*
+ * NOTE: This resets the context for reuse, clearing all interned strings
+ * and freeing the arena. Use this before loading a new policy into
+ * a cleared context. Any previously created policies using this context
+ * become invalid after reset.
+ */
+void st_policy_ctx_reset(st_policy_ctx_t *ctx)
+{
+    if (!ctx) return;
+    free(ctx->arena.base);
+    ctx->arena.base = malloc(DEFAULT_ARENA_SIZE);
+    ctx->arena.size = DEFAULT_ARENA_SIZE;
+    ctx->arena.used = 0;
+    ctx->str_pool.count = 0;
+    memset(ctx->str_pool.hashes, 0, ctx->str_pool.capacity * sizeof(uint64_t));
+}
+
 const char *st_policy_ctx_intern(st_policy_ctx_t *ctx, const char *str)
 {
     if (!ctx || !str) return NULL;
 
-    /* Linear scan for existing string */
+    uint64_t h = filter_hash_fnv1a(str, strlen(str));
+
+    /* Linear scan for existing string (hash array stored for future optimization) */
     for (size_t i = 0; i < ctx->str_pool.count; i++) {
-        if (strcmp(ctx->str_pool.strings[i], str) == 0) {
+        if (ctx->str_pool.hashes[i] == h &&
+            strcmp(ctx->str_pool.strings[i], str) == 0) {
             return ctx->str_pool.strings[i];
         }
     }
@@ -168,6 +201,7 @@ const char *st_policy_ctx_intern(st_policy_ctx_t *ctx, const char *str)
     if (ctx->str_pool.count >= ctx->str_pool.capacity) {
         if (!str_pool_grow(&ctx->str_pool)) return NULL;
     }
+    ctx->str_pool.hashes[ctx->str_pool.count] = h;
     ctx->str_pool.strings[ctx->str_pool.count++] = copy;
     return copy;
 }
