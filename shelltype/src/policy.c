@@ -20,6 +20,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <assert.h>
 #include <errno.h>
 #include <limits.h>
 
@@ -142,6 +143,7 @@ static uint32_t states_array_alloc(states_array_t *a)
         a->states = new_states;
         a->capacity = new_cap;
     }
+    assert(a->count < a->capacity);
     uint32_t idx = (uint32_t)a->count;
     a->states[idx].children = NULL;
     a->states[idx].pattern_id = UINT16_MAX;
@@ -265,6 +267,7 @@ static child_entry_t *find_literal_child(const policy_state_t *node, const char 
 {
     uint16_t n = node->literal_count;
     if (n == 0 || !node->children) return NULL;
+    assert(n <= node->children_cap);
     /* Hybrid: linear scan for small fan-outs, bsearch for larger */
     if (n < 8) {
         for (uint16_t i = 0; i < n; i++) {
@@ -278,6 +281,7 @@ static child_entry_t *find_literal_child(const policy_state_t *node, const char 
 static child_entry_t *find_wildcard_child(const policy_state_t *node, st_token_type_t type)
 {
     if (node->wildcard_count == 0 || !node->children) return NULL;
+    assert(node->literal_count + node->wildcard_count <= node->children_cap);
     if (!(node->wildcard_mask & compat_mask(type))) return NULL;
 
     child_entry_t *base = node->children + node->literal_count;
@@ -294,6 +298,7 @@ static child_entry_t *find_wildcard_child(const policy_state_t *node, st_token_t
 static bool insert_child(policy_state_t *node, st_policy_t *policy,
                          const char *text, st_token_type_t type, uint32_t target)
 {
+    assert(node->literal_count + node->wildcard_count <= node->children_cap);
     bool is_literal = (type == ST_TYPE_LITERAL);
     uint16_t total = node->literal_count + node->wildcard_count;
     uint16_t insert_pos;
@@ -315,6 +320,7 @@ static bool insert_child(policy_state_t *node, st_policy_t *policy,
         }
         if (insert_pos < total && node->children[insert_pos].type == type) return false;
     }
+    assert(insert_pos <= total);
 
     const char *interned = is_literal ? st_policy_ctx_intern(policy->ctx, text) : NULL;
     child_entry_t new_child = { .text = interned, .target = target, .type = (uint8_t)type };
@@ -729,7 +735,7 @@ static const char *st_find_based_on(const st_policy_t *policy, uint32_t state_id
     return NULL;
 }
 
-st_error_t st_policy_eval(const st_policy_t *policy,
+st_error_t st_policy_eval(st_policy_t *policy,
                              const char *raw_cmd,
                              st_eval_result_t *result)
 {
@@ -764,8 +770,7 @@ st_error_t st_policy_eval(const st_policy_t *policy,
     /* Rebuild filters if epoch stale */
     for (size_t i = 0; i < check_len; i++) {
         if (policy->pos_built_epoch[i] != policy->epoch) {
-            st_policy_t *mutable = (st_policy_t *)policy;
-            policy_rebuild_filters(mutable);
+            policy_rebuild_filters(policy);
             break;
         }
     }
@@ -807,6 +812,7 @@ st_error_t st_policy_eval(const st_policy_t *policy,
     uint32_t match_state = 0;
 
     for (size_t i = 0; i < cmd.count; i++) {
+        assert(current < policy->states.count);
         st_token_type_t ctype = cmd.tokens[i].type;
         const char *ctext = cmd.tokens[i].text;
         policy_state_t *node = &policy->states.states[current];
@@ -827,6 +833,7 @@ st_error_t st_policy_eval(const st_policy_t *policy,
         match_depth = i + 1;
         match_state = current;
     }
+    assert(match_depth <= cmd.count);
 
     policy_state_t *end_node = &policy->states.states[current];
     if (match_depth == cmd.count &&
@@ -1375,9 +1382,9 @@ st_error_t st_policy_save(const st_policy_t *policy, const char *path)
  * If clear_first is true, the policy is reset before loading.
  *
  * If clear_first is false and an error occurs (CRC mismatch, parse error,
- * memory failure), the policy may be partially modified. The caller should
- * treat the policy as invalid and call st_policy_free + st_policy_new to
- * recover. For transactional loading, use clear_first=true.
+ * memory failure), the policy counts are rolled back to their pre-load state.
+ * Any arena memory allocated during the failed load is orphaned but will be
+ * reclaimed on st_policy_ctx_reset or when the policy/context is freed.
  */
 st_error_t st_policy_load(st_policy_t *policy, const char *path, bool clear_first)
 {
@@ -1400,6 +1407,10 @@ st_error_t st_policy_load(st_policy_t *policy, const char *path, bool clear_firs
         }
         policy->epoch++;
     }
+
+    /* Save counts for rollback on error (append mode only) */
+    size_t saved_states_count = policy->states.count;
+    size_t saved_patterns_count = policy->patterns.count;
 
     FILE *fp = fopen(path, "r");
     if (!fp) return ST_ERR_IO;
@@ -1462,6 +1473,8 @@ st_error_t st_policy_load(st_policy_t *policy, const char *path, bool clear_firs
         st_error_t err = st_policy_add(policy, line);
         if (err != ST_OK) {
             fclose(fp);
+            policy->states.count = saved_states_count;
+            policy->patterns.count = saved_patterns_count;
             return err;
         }
     }

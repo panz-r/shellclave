@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
+#include <assert.h>
 
 #define DEFAULT_ARENA_SIZE (256 * 1024)  /* 256 KB default */
 #define STR_POOL_INIT_CAP  1024
@@ -51,6 +52,7 @@ static void *arena_alloc(arena_t *a, size_t n)
     /* Align to 8 bytes */
     if (n > SIZE_MAX - 7) return NULL;
     n = (n + 7) & ~(size_t)7;
+    assert(a->used <= a->size);
     if (a->used + n > a->size) {
         /* Grow arena: double size, or enough for request + 1KB padding */
         if (a->size > SIZE_MAX / 2) return NULL;

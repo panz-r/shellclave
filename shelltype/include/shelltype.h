@@ -337,8 +337,11 @@ typedef struct {
  * expansion suggestions in result->suggestions[].
  *
  * Passing NULL for result disables suggestions (verify-only fast path).
+ *
+ * NOTE: This function has side effects — it may rebuild internal
+ * position filters if the policy epoch has changed (cache warming).
  */
-st_error_t st_policy_eval(const st_policy_t *policy,
+st_error_t st_policy_eval(st_policy_t *policy,
                              const char *raw_cmd,
                              st_eval_result_t *result);
 
