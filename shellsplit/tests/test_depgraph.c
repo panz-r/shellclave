@@ -83,12 +83,26 @@ static bool has_edge(const shell_dep_graph_t *g, uint32_t from, uint32_t to,
 
 static shell_dep_error_t parse(const char *cmd, shell_dep_graph_t *g)
 {
+    memset(g, 0, sizeof(*g));
+    char buf[4096];
+    g->buf.data = buf;
+    g->buf.capacity = sizeof(buf);
     return shell_parse_depgraph(cmd, strlen(cmd), ".", NULL, g);
 }
 
 static shell_dep_error_t parse_cwd(const char *cmd, const char *cwd, shell_dep_graph_t *g)
 {
+    memset(g, 0, sizeof(*g));
+    char buf[4096];
+    g->buf.data = buf;
+    g->buf.capacity = sizeof(buf);
     return shell_parse_depgraph(cmd, strlen(cmd), cwd, NULL, g);
+}
+
+static const char *get_cwd_str(const shell_dep_graph_t *g, uint32_t cwd_offset)
+{
+    if (cwd_offset >= g->buf.len) return ".";
+    return g->buf.data + cwd_offset;
 }
 
 /* ============================================================
@@ -325,8 +339,8 @@ TEST(cd_relative)
      shell_dep_graph_t g;
     parse_cwd("cd ../foo && ls", "/home/user", &g);
     ASSERT(count_type(&g, SHELL_NODE_CMD) == 1);
-    ASSERT(g.nodes[0].cmd.cwd != NULL);
-    ASSERT(strstr(g.nodes[0].cmd.cwd, "foo") != NULL);
+    const char *cwd_str = get_cwd_str(&g, g.nodes[0].cmd.cwd);
+    ASSERT(strstr(cwd_str, "foo") != NULL);
     pass_count++;
 }
 
@@ -335,7 +349,8 @@ TEST(cd_absolute)
      shell_dep_graph_t g;
     parse_cwd("cd /tmp && ls", "/home/user", &g);
     ASSERT(count_type(&g, SHELL_NODE_CMD) == 1);
-    ASSERT_STR_EQ(g.nodes[0].cmd.cwd, "/tmp");
+    const char *cwd_str = get_cwd_str(&g, g.nodes[0].cmd.cwd);
+    ASSERT_STR_EQ(cwd_str, "/tmp");
     pass_count++;
 }
 
@@ -344,7 +359,8 @@ TEST(cd_no_args)
      shell_dep_graph_t g;
     parse_cwd("cd && ls", "/home/user", &g);
     ASSERT(count_type(&g, SHELL_NODE_CMD) == 1);
-    ASSERT_STR_EQ(g.nodes[0].cmd.cwd, "$HOME");
+    const char *cwd_str = get_cwd_str(&g, g.nodes[0].cmd.cwd);
+    ASSERT_STR_EQ(cwd_str, "$HOME");
     pass_count++;
 }
 
@@ -353,7 +369,8 @@ TEST(cd_dotdot_normalization)
      shell_dep_graph_t g;
     parse_cwd("cd .. && pwd", "/home/user/docs", &g);
     ASSERT(count_type(&g, SHELL_NODE_CMD) == 1);
-    ASSERT_STR_EQ(g.nodes[0].cmd.cwd, "/home/user");
+    const char *cwd_str = get_cwd_str(&g, g.nodes[0].cmd.cwd);
+    ASSERT_STR_EQ(cwd_str, "/home/user");
     pass_count++;
 }
 
@@ -361,8 +378,9 @@ TEST(cd_default_cwd)
 {
      shell_dep_graph_t g;
     parse("ls", &g);
-    ASSERT(g.nodes[0].cmd.cwd != NULL);
-    ASSERT(g.nodes[0].cmd.cwd[0] == '.');
+    ASSERT(g.nodes[0].cmd.cwd == 0);
+    const char *cwd_str = get_cwd_str(&g, g.nodes[0].cmd.cwd);
+    ASSERT(cwd_str[0] == '.');
     pass_count++;
 }
 

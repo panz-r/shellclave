@@ -1289,6 +1289,9 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd,
 
     /* Step 3: Build depgraph */
     shell_dep_graph_t graph;
+    memset(&graph, 0, sizeof(graph));
+    graph.buf.data = buf;
+    graph.buf.capacity = buf_size;
     shell_dep_error_t derr = shell_parse_depgraph(cmd, cmd_len, gate->cwd, NULL, &graph);
     if (derr != SHELL_DEP_OK) {
         out->verdict = SG_VERDICT_REJECT;

@@ -91,16 +91,27 @@ static const shell_dep_limits_t SHELL_DEP_LIMITS_DEFAULT = {
 };
 
 /**
+ * Linear allocator for variable-length strings in the graph.
+ * Caller provides this buffer; C writes into it.
+ * Access strings via: graph->buf.data + node_string_offset
+ */
+typedef struct {
+    char *data;
+    size_t len;
+    size_t capacity;
+} string_buffer_t;
+
+/**
  * CMD node - an isolated shell command
  *
  * Tokens are zero-copy pointers into the original input string.
- * cwd is the resolved working directory when this command runs (owned copy).
+ * cwd is the offset into graph->buf.data for the resolved working directory.
  */
 typedef struct {
     const char *tokens[SHELL_DEP_MAX_TOKENS];
     uint32_t    token_lens[SHELL_DEP_MAX_TOKENS];
     uint32_t    token_count;
-    const char *cwd;
+    uint32_t    cwd;  /* Offset into graph->buf.data */
 } shell_dep_cmd_t;
 
 /**
@@ -143,6 +154,7 @@ typedef struct {
     shell_dep_edge_t edges[SHELL_DEP_MAX_EDGES];
     uint32_t edge_count;
     uint32_t status;
+    string_buffer_t buf;  /* Arena for variable-length strings */
 } shell_dep_graph_t;
 
 /**
