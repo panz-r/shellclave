@@ -11,6 +11,7 @@
 #include "shell_tokenizer.h"
 #include <ctype.h>
 #include <string.h>
+#include <stdlib.h>
 #include <stdio.h>
 
 /* ============================================================
@@ -56,12 +57,28 @@ const char *shell_dep_doc_kind_name(shell_dep_doc_kind_t kind)
  * ============================================================ */
 
 #define SHELL_DEP_MAX_CWD_LEN     256
-#define SHELL_DEP_MAX_CWD_ENTRIES 16
+#define SHELL_DEP_MAX_CWD_ENTRIES 128
 
 typedef struct {
-    char buf[SHELL_DEP_MAX_CWD_ENTRIES][SHELL_DEP_MAX_CWD_LEN];
-    uint32_t next;
+    char (*buf)[SHELL_DEP_MAX_CWD_LEN];
+    uint32_t count;
+    uint32_t capacity;
 } shell_dep_cwd_buf_t;
+
+static bool cwd_buf_init(shell_dep_cwd_buf_t *b)
+{
+    b->capacity = SHELL_DEP_MAX_CWD_ENTRIES;
+    b->buf = calloc(b->capacity, SHELL_DEP_MAX_CWD_LEN);
+    if (!b->buf) return false;
+    b->count = 0;
+    return true;
+}
+
+static void cwd_buf_free(shell_dep_cwd_buf_t *b)
+{
+    free(b->buf);
+    b->buf = NULL;
+}
 
 static void cwd_normalize(char *path, uint32_t len)
 {
@@ -109,8 +126,15 @@ static const char *cwd_resolve(shell_dep_cwd_buf_t *cwd_buf,
     if (rel[0] == '/') return rel;
     if (strcmp(rel, "$HOME") == 0) return rel;
 
-    char *out = cwd_buf->buf[cwd_buf->next];
-    cwd_buf->next = (cwd_buf->next + 1) % SHELL_DEP_MAX_CWD_ENTRIES;
+    if (cwd_buf->count >= cwd_buf->capacity) {
+        uint32_t new_cap = cwd_buf->capacity * 2;
+        char (*new_buf)[SHELL_DEP_MAX_CWD_LEN] = realloc(cwd_buf->buf, new_cap * SHELL_DEP_MAX_CWD_LEN);
+        if (!new_buf) return rel;
+        cwd_buf->buf = new_buf;
+        cwd_buf->capacity = new_cap;
+    }
+
+    char *out = cwd_buf->buf[cwd_buf->count];
 
     size_t cur_len = strlen(current);
     size_t rel_len = 0;
@@ -126,6 +150,7 @@ static const char *cwd_resolve(shell_dep_cwd_buf_t *cwd_buf,
     out[cur_len + 1 + rel_len] = '\0';
 
     cwd_normalize(out, (uint32_t)(cur_len + 1 + rel_len));
+    cwd_buf->count++;
     return out;
 }
 
@@ -328,7 +353,7 @@ static uint32_t prescan_heredocs(const char *cmd, size_t cmd_len,
     for (uint32_t i = 0; i < result->count; i++) skip[i] = false;
 
     for (uint32_t i = 0; i < result->count && hcount < max_heredocs; i++) {
-        if (!(result->cmds[i].type & (1u << 12))) continue;
+        if (!(result->cmds[i].type & SHELL_TYPE_HEREDOC)) continue;
 
         heredoc_info_t *hd = &heredocs[hcount++];
         hd->marker_idx = i;
@@ -408,7 +433,7 @@ static bool add_doc_file(shell_dep_graph_t *g, uint32_t max_nodes, uint32_t max_
                           shell_dep_edge_dir_t edir,
                           dep_redirect_t redir, uint32_t *status)
 {
-    if (g->node_count >= max_nodes) { *status |= 1u; return false; }
+    if (g->node_count >= max_nodes) { *status |= SHELL_DEP_STATUS_TRUNCATED; return false; }
     shell_dep_node_t *fn = &g->nodes[g->node_count++];
     fn->type = SHELL_NODE_DOC;
     fn->doc.kind = SHELL_DOC_FILE;
@@ -419,7 +444,7 @@ static bool add_doc_file(shell_dep_graph_t *g, uint32_t max_nodes, uint32_t max_
     fn->doc.value = NULL;
     fn->doc.value_len = 0;
 
-    if (g->edge_count >= max_edges) { *status |= 1u; return false; }
+    if (g->edge_count >= max_edges) { *status |= SHELL_DEP_STATUS_TRUNCATED; return false; }
     shell_dep_edge_t *e = &g->edges[g->edge_count++];
     e->type = etype;
     e->dir = edir;
@@ -440,7 +465,7 @@ static bool add_doc_envvar(shell_dep_graph_t *g, uint32_t max_nodes, uint32_t ma
                             const char *value, uint32_t value_len,
                             uint32_t cmd_idx, uint32_t *status)
 {
-    if (g->node_count >= max_nodes) { *status |= 1u; return false; }
+    if (g->node_count >= max_nodes) { *status |= SHELL_DEP_STATUS_TRUNCATED; return false; }
     shell_dep_node_t *en = &g->nodes[g->node_count++];
     en->type = SHELL_NODE_DOC;
     en->doc.kind = SHELL_DOC_ENVVAR;
@@ -451,7 +476,7 @@ static bool add_doc_envvar(shell_dep_graph_t *g, uint32_t max_nodes, uint32_t ma
     en->doc.path = NULL;
     en->doc.path_len = 0;
 
-    if (g->edge_count >= max_edges) { *status |= 1u; return false; }
+    if (g->edge_count >= max_edges) { *status |= SHELL_DEP_STATUS_TRUNCATED; return false; }
     shell_dep_edge_t *e = &g->edges[g->edge_count++];
     e->from = g->node_count - 1;
     e->to = cmd_idx;
@@ -517,14 +542,14 @@ shell_dep_error_t shell_parse_depgraph(
                                         heredocs, SHELL_DEP_MAX_HEREDOCS, skip_buf);
 
     shell_dep_cwd_buf_t cwd_buf;
-    memset(&cwd_buf, 0, sizeof(cwd_buf));
+    if (!cwd_buf_init(&cwd_buf)) return SHELL_DEP_EPARSE;
     const char *cwd = initial_cwd ? initial_cwd : ".";
 
     int32_t last_cmd_idx = -1;
 
     for (uint32_t si = 0; si < fast_result.count; si++) {
         if (skip_buf[si]) {
-            if (fast_result.cmds[si].type & (1u << 12)) {
+            if (fast_result.cmds[si].type & SHELL_TYPE_HEREDOC) {
                 for (uint32_t h = 0; h < hcount; h++) {
                     if (heredocs[h].marker_idx == si)
                         heredocs[h].cmd_node_idx = last_cmd_idx;
@@ -537,7 +562,7 @@ shell_dep_error_t shell_parse_depgraph(
         uint32_t rstart = range->start;
         uint32_t rlen = range->len;
 
-        if (range->type & (1u << 13)) {
+        if (range->type & SHELL_TYPE_HERESTRING) {
             const char *marker = cmd + rstart;
             uint32_t mlen = rlen;
             uint32_t pos = 3;
@@ -638,7 +663,8 @@ shell_dep_error_t shell_parse_depgraph(
             is_export = true;
 
         if (out->node_count >= max_nodes) {
-            out->status |= 1u;
+            out->status |= SHELL_DEP_STATUS_TRUNCATED;
+            cwd_buf_free(&cwd_buf);
             return SHELL_DEP_ETRUNC;
         }
 
@@ -875,6 +901,7 @@ shell_dep_error_t shell_parse_depgraph(
         }
     }
 
+    cwd_buf_free(&cwd_buf);
     return SHELL_DEP_OK;
 }
 

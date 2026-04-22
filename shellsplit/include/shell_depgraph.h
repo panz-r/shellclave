@@ -43,6 +43,11 @@ typedef enum {
 } shell_dep_error_t;
 
 typedef enum {
+    SHELL_DEP_STATUS_OK         = 0,
+    SHELL_DEP_STATUS_TRUNCATED = 1 << 0,
+} shell_dep_status_t;
+
+typedef enum {
     SHELL_NODE_CMD = 0,
     SHELL_NODE_DOC,
 } shell_dep_node_type_t;
@@ -89,7 +94,7 @@ static const shell_dep_limits_t SHELL_DEP_LIMITS_DEFAULT = {
  * CMD node - an isolated shell command
  *
  * Tokens are zero-copy pointers into the original input string.
- * cwd is the resolved working directory when this command runs.
+ * cwd is the resolved working directory when this command runs (owned copy).
  */
 typedef struct {
     const char *tokens[SHELL_DEP_MAX_TOKENS];

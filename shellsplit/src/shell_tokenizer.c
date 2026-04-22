@@ -215,6 +215,7 @@ shell_error_t shell_parse_fast(
     bool in_quotes = false;
     char quote_char = 0;
     int brace_depth = 0;
+    int brace_start_pos = -1;
     int paren_depth = 0;  // Track regular parentheses ()
     int arith_depth = 0;  // Track when inside $((...))
     
@@ -242,27 +243,33 @@ shell_error_t shell_parse_fast(
             pos++;
             continue;
         }
-        if (in_quotes && c == quote_char) {
-            in_quotes = false;
-            quote_char = 0;
-            pos++;
-            continue;
-        }
-        
+
         // Skip content inside quotes
         if (in_quotes) {
-            // Handle escape in quotes
-            if (c == '\\' && pos + 1 < cmd_len) {
-                pos += 2;
-            } else {
+            if (quote_char == '\'') {
+                // Single quotes: no escapes, everything is literal until closing '
+                if (c == '\'') {
+                    in_quotes = false;
+                    quote_char = 0;
+                }
                 pos++;
+            } else {
+                // Double quotes: handle escapes for ", \, $, `
+                if (c == '\\' && pos + 1 < cmd_len) {
+                    pos += 2;  // Skip escaped char
+                } else if (c == '"') {
+                    in_quotes = false;
+                    quote_char = 0;
+                    pos++;
+                } else {
+                    pos++;
+                }
             }
             continue;
         }
         
         // Track brace depth for ${var...}
         // Also track if we have a variable name after ${
-        static int brace_start_pos = -1;
         if (c == '{') {
             if (brace_depth == 0 && pos > 0 && cmd[pos-1] == '$') {
                 // This is ${ - start of variable expansion, remember position
@@ -292,12 +299,11 @@ shell_error_t shell_parse_fast(
             }
             brace_depth--;
         }
-        
-        // Track paren depth for $(...), $((...)), <(...), >(...)
+
+        // Track arithmetic expansion $(( ... )) and (( ... ))
         // Note: $(( opens TWO parens - handle specially to avoid double counting
         if (c == '$' && pos + 2 < cmd_len && cmd[pos + 1] == '(' && cmd[pos + 2] == '(') {
             // This is $(( - arithmetic expansion, opens TWO parentheses
-            brace_depth += 2;
             arith_depth += 2;  // Track that we're inside arithmetic
             pos += 3;  // Skip $(( entirely (3 chars)
             continue;
@@ -305,27 +311,18 @@ shell_error_t shell_parse_fast(
         // Also handle plain (( )) - arithmetic in bash
         if (c == '(' && pos + 1 < cmd_len && cmd[pos + 1] == '(') {
             // This is (( - arithmetic
-            brace_depth += 2;
             arith_depth += 2;
-            pos += 2;  // Skip (( 
+            pos += 2;  // Skip ((
             continue;
         }
         if (c == ')') {
             // Check if closing arithmetic
-            if (brace_depth > 1 && pos > 0 && cmd[pos-1] == ')') {
-                // This might be closing (( 
-                brace_depth--;
-                if (arith_depth > 0) {
-                    arith_depth--;
-                }
-            } else if (brace_depth > 0) {
-                brace_depth--;
-                if (arith_depth > 0) {
-                    arith_depth--;  // Decrement arithmetic depth
-                }
+            if (arith_depth > 0 && pos > 0 && cmd[pos-1] == ')') {
+                // This might be closing (( or $(( - arithmetic
+                arith_depth--;
             }
         }
-        
+
         // Track regular parentheses () for subshell detection
         // But not inside arithmetic $(( )) or process substitution <( )
         // Only track when NOT inside arithmetic expansion
@@ -615,10 +612,27 @@ shell_error_t shell_parse_fast(
                     // Process substitution - skip the (cmd) part
                     pos += 2; // skip > or < and (
                     int depth = 1;
+                    bool in_proc_quote = false;
+                    char proc_quote_char = 0;
                     while (pos < cmd_len && depth > 0) {
-                        if (cmd[pos] == '(') depth++;
-                        if (cmd[pos] == ')') depth--;
-                        if (depth > 0) pos++;
+                        char pc = cmd[pos];
+                        if (!in_proc_quote) {
+                            if (pc == '"' || pc == '\'') {
+                                in_proc_quote = true;
+                                proc_quote_char = pc;
+                            } else if (pc == '(') {
+                                depth++;
+                            } else if (pc == ')') {
+                                depth--;
+                            }
+                        } else {
+                            if (pc == proc_quote_char) {
+                                in_proc_quote = false;
+                            } else if (pc == '\\' && pos + 1 < cmd_len) {
+                                pos++; // skip escaped char
+                            }
+                        }
+                        pos++;
                     }
                     // Check if we exited due to unmatched parens (invalid)
                     if (depth > 0) {
