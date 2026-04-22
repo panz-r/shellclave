@@ -173,8 +173,8 @@ void st_policy_ctx_reset(st_policy_ctx_t *ctx)
     ctx->arena.base = malloc(DEFAULT_ARENA_SIZE);
     ctx->arena.size = DEFAULT_ARENA_SIZE;
     ctx->arena.used = 0;
-    ctx->str_pool.count = 0;
-    memset(ctx->str_pool.hashes, 0, ctx->str_pool.capacity * sizeof(uint64_t));
+    str_pool_free(&ctx->str_pool);
+    str_pool_init(&ctx->str_pool);
 }
 
 const char *st_policy_ctx_intern(st_policy_ctx_t *ctx, const char *str)

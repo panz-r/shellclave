@@ -28,18 +28,18 @@
  * ============================================================ */
 
 static uint32_t crc32_table[256];
-static _Atomic int crc32_table_init = 0;
+static bool crc32_initialized = false;
 
 static void crc32_init_table(void)
 {
-    if (__atomic_load_n(&crc32_table_init, __ATOMIC_ACQUIRE)) return;
+    if (crc32_initialized) return;
     for (uint32_t i = 0; i < 256; i++) {
         uint32_t c = i;
         for (int j = 0; j < 8; j++)
             c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
         crc32_table[i] = c;
     }
-    __atomic_store_n(&crc32_table_init, 1, __ATOMIC_RELEASE);
+    crc32_initialized = true;
 }
 
 static uint32_t crc32_compute(const void *data, size_t len, uint32_t prev)
@@ -221,7 +221,7 @@ struct st_policy {
  * ============================================================ */
 
 static const uint16_t st_compat_mask[ST_TYPE_COUNT] = {
-    /* LITERAL */      (1u << ST_TYPE_ANY),
+    /* LITERAL */      (1u << ST_TYPE_LITERAL) | (1u << ST_TYPE_ANY),
     /* HEXHASH */      (1u << ST_TYPE_HEXHASH) | (1u << ST_TYPE_NUMBER) | (1u << ST_TYPE_VALUE) | (1u << ST_TYPE_ANY),
     /* NUMBER */       (1u << ST_TYPE_NUMBER) | (1u << ST_TYPE_VALUE) | (1u << ST_TYPE_ANY),
     /* IPV4 */         (1u << ST_TYPE_IPV4) | (1u << ST_TYPE_VALUE) | (1u << ST_TYPE_ANY),
@@ -265,6 +265,13 @@ static child_entry_t *find_literal_child(const policy_state_t *node, const char 
 {
     uint16_t n = node->literal_count;
     if (n == 0 || !node->children) return NULL;
+    /* Hybrid: linear scan for small fan-outs, bsearch for larger */
+    if (n < 8) {
+        for (uint16_t i = 0; i < n; i++) {
+            if (strcmp(text, node->children[i].text) == 0) return &node->children[i];
+        }
+        return NULL;
+    }
     return bsearch(text, node->children, n, sizeof(child_entry_t), cmp_literal_child);
 }
 
@@ -415,7 +422,9 @@ static void policy_rebuild_filters(st_policy_t *policy)
 
     /* BFS walk: track (state_idx, depth) pairs */
     typedef struct { uint32_t idx; uint8_t depth; } bfs_q;
-    bfs_q q[STATES_INIT * 2];
+    bfs_q stack_q[128];
+    bfs_q *q = stack_q;
+    size_t q_cap = 128;
     size_t head = 0, tail = 0;
 
     q[tail].idx = 0;
@@ -444,13 +453,21 @@ static void policy_rebuild_filters(st_policy_t *policy)
                 policy->pos_wildcard_mask[d] |= (1u << c->type);
             }
 
-            if (tail < sizeof(q) / sizeof(q[0])) {
-                q[tail].idx = c->target;
-                q[tail].depth = d + 1;
-                tail++;
+            if (tail >= q_cap) {
+                size_t new_cap = q_cap * 2;
+                bfs_q *new_q = realloc(q == stack_q ? NULL : q, new_cap * sizeof(bfs_q));
+                if (!new_q) break;
+                if (q == stack_q) memcpy(new_q, stack_q, sizeof(stack_q));
+                q = new_q;
+                q_cap = new_cap;
             }
+            q[tail].idx = c->target;
+            q[tail].depth = d + 1;
+            tail++;
         }
     }
+
+    if (q != stack_q) free(q);
 
     for (int i = 0; i < FILTER_POS_LEVELS; i++) {
         policy->pos_built_epoch[i] = policy->epoch;
@@ -1355,8 +1372,12 @@ st_error_t st_policy_save(const st_policy_t *policy, const char *path)
 
 /*
  * NOTE: By default, st_policy_load appends to an existing policy.
- * If clear_first is true, the policy is reset before loading (but
- * arena memory is not freed—only the active pattern set is cleared).
+ * If clear_first is true, the policy is reset before loading.
+ *
+ * If clear_first is false and an error occurs (CRC mismatch, parse error,
+ * memory failure), the policy may be partially modified. The caller should
+ * treat the policy as invalid and call st_policy_free + st_policy_new to
+ * recover. For transactional loading, use clear_first=true.
  */
 st_error_t st_policy_load(st_policy_t *policy, const char *path, bool clear_first)
 {

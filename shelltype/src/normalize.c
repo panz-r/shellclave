@@ -200,10 +200,13 @@ static bool is_hex_hash(const char *token)
 {
     size_t len = strlen(token);
     if (len < 8) return false;
+    bool has_alpha = false;
     for (size_t i = 0; i < len; i++) {
-        if (!isxdigit((unsigned char)token[i])) return false;
+        unsigned char c = (unsigned char)token[i];
+        if (!isxdigit(c)) return false;
+        if (isalpha(c)) has_alpha = true;
     }
-    return true;
+    return has_alpha;
 }
 
 static bool is_ipv4(const char *token)
@@ -278,14 +281,14 @@ st_token_type_t st_classify_token(const char *token)
     /* IPv4 */
     if (is_ipv4(token)) return ST_TYPE_IPV4;
 
-    /* Hex hash (8+ hex chars, no 0x prefix for git-style hashes) */
-    if (is_hex_hash(token)) return ST_TYPE_HEXHASH;
-
-    /* Hex number (0x...) */
+    /* Hex number (0x...) - check before hex hash which requires alpha */
     if (is_hex_number(token)) return ST_TYPE_NUMBER;
 
-    /* Decimal number */
+    /* Decimal number - check before hex hash which requires alpha */
     if (is_decimal_number(token)) return ST_TYPE_NUMBER;
+
+    /* Hex hash (8+ hex chars with at least one letter, no 0x prefix) */
+    if (is_hex_hash(token)) return ST_TYPE_HEXHASH;
 
     /* Relative path (has / or ..) */
     if (is_relative_path(token)) return ST_TYPE_REL_PATH;
