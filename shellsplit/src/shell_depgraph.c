@@ -95,45 +95,60 @@ static void cwd_normalize(char *path, uint32_t len)
     path[w] = '\0';
 }
 
-static uint32_t cwd_resolve(string_buffer_t *buf, uint32_t current_offset, const char *rel)
+static uint32_t cwd_resolve_dedup(shell_dep_graph_t *g, uint32_t current_offset, const char *rel)
 {
     if (!rel || rel[0] == '\0') return current_offset;
 
+    const char *current_cwd = g->cwd_buf.data + current_offset;
+    char temp_path[4096];
+    size_t cur_len = strlen(current_cwd);
     size_t rel_len = strlen(rel);
-    if (rel_len + 1 > buf->capacity - buf->len) return current_offset;
 
     if (rel[0] == '/') {
-        memcpy(buf->data + buf->len, rel, rel_len + 1);
-        uint32_t offset = (uint32_t)buf->len;
-        buf->len += rel_len + 1;
-        return offset;
+        if (rel_len >= 4096) return current_offset;
+        memcpy(temp_path, rel, rel_len);
+        temp_path[rel_len] = '\0';
+    } else if (strcmp(rel, "$HOME") == 0) {
+        memcpy(temp_path, "$HOME", 6);
+        temp_path[6] = '\0';
+    } else {
+        size_t rel_end = 0;
+        while (rel[rel_end] != '\0' && rel[rel_end] != ' ' && rel[rel_end] != '\t')
+            rel_end++;
+
+        if (rel_end == 0) return current_offset;
+        if (cur_len + 1 + rel_end >= 4096) return current_offset;
+
+        memcpy(temp_path, current_cwd, cur_len);
+        temp_path[cur_len] = '/';
+        memcpy(temp_path + cur_len + 1, rel, rel_end);
+        temp_path[cur_len + 1 + rel_end] = '\0';
     }
 
-    if (strcmp(rel, "$HOME") == 0) {
-        memcpy(buf->data + buf->len, rel, rel_len + 1);
-        uint32_t offset = (uint32_t)buf->len;
-        buf->len += rel_len + 1;
-        return offset;
+    cwd_normalize(temp_path, (uint32_t)strlen(temp_path));
+    size_t norm_len = strlen(temp_path);
+
+    size_t pos = 0;
+    while (pos < g->cwd_buf.len) {
+        const char *existing = g->cwd_buf.data + pos;
+        size_t existing_len = strlen(existing);
+
+        if (existing_len == norm_len && memcmp(existing, temp_path, norm_len) == 0) {
+            return (uint32_t)pos;
+        }
+
+        pos += existing_len + 1;
     }
 
-    const char *current = buf->data + current_offset;
-    size_t cur_len = strlen(current);
-    size_t rel_end = 0;
-    while (rel[rel_end] != '\0' && rel[rel_end] != ' ' && rel[rel_end] != '\t')
-        rel_end++;
-
-    if (cur_len + 1 + rel_end + 1 > buf->capacity - buf->len)
+    if (g->cwd_buf.len + norm_len + 1 > SHELL_DEP_CWD_BUF_SIZE) {
         return current_offset;
+    }
 
-    memcpy(buf->data + buf->len, current, cur_len);
-    buf->data[buf->len + cur_len] = '/';
-    memcpy(buf->data + buf->len + cur_len + 1, rel, rel_end);
-    buf->data[buf->len + cur_len + 1 + rel_end] = '\0';
+    memcpy(g->cwd_buf.data + g->cwd_buf.len, temp_path, norm_len + 1);
+    uint32_t new_offset = (uint32_t)g->cwd_buf.len;
+    g->cwd_buf.len += norm_len + 1;
 
-    cwd_normalize(buf->data + buf->len, (uint32_t)(cur_len + 1 + rel_end));
-    uint32_t offset = (uint32_t)buf->len;
-    buf->len += cur_len + 1 + rel_end + 1;
-    return offset;
+    return new_offset;
 }
 
 /* ============================================================
@@ -505,7 +520,6 @@ shell_dep_error_t shell_parse_depgraph(
     out->node_count = 0;
     out->edge_count = 0;
     out->status = 0;
-    out->buf.len = 0;
 
     shell_parse_result_t fast_result;
     shell_error_t fast_err = shell_parse_fast(cmd, cmd_len, NULL, &fast_result);
@@ -526,14 +540,16 @@ shell_dep_error_t shell_parse_depgraph(
     uint32_t hcount = prescan_heredocs(cmd, cmd_len, &fast_result,
                                         heredocs, SHELL_DEP_MAX_HEREDOCS, skip_buf);
 
-    /* Initialize output buffer - copy initial_cwd at offset 0 */
-    if (!out->buf.data || out->buf.capacity < 1) return SHELL_DEP_EPARSE;
+    /* Initialize CWD buffer - copy initial_cwd as first entry */
+    memset(&out->cwd_buf, 0, sizeof(out->cwd_buf));
     const char *init_cwd = initial_cwd ? initial_cwd : ".";
     size_t init_len = strlen(init_cwd);
-    if (init_len + 1 > out->buf.capacity) return SHELL_DEP_EPARSE;
-    memcpy(out->buf.data, init_cwd, init_len + 1);
+    if (init_len >= 4096) init_len = 4095;
+    memcpy(out->cwd_buf.data, init_cwd, init_len);
+    out->cwd_buf.data[init_len] = '\0';
+    init_len = strlen(out->cwd_buf.data);
+    out->cwd_buf.len = init_len + 1;
     uint32_t cwd_offset = 0;
-    out->buf.len = init_len + 1;
 
     int32_t last_cmd_idx = -1;
 
@@ -601,9 +617,9 @@ shell_dep_error_t shell_parse_depgraph(
                 uint32_t alen = arg.len < 255 ? arg.len : 255;
                 memcpy(arg_buf, arg.start, alen);
                 arg_buf[alen] = '\0';
-                cwd_offset = cwd_resolve(&out->buf, cwd_offset, arg_buf);
+                cwd_offset = cwd_resolve_dedup(out, cwd_offset, arg_buf);
             } else {
-                cwd_offset = cwd_resolve(&out->buf, cwd_offset, "$HOME");
+                cwd_offset = cwd_resolve_dedup(out, cwd_offset, "$HOME");
             }
             continue;
         }
@@ -660,7 +676,7 @@ shell_dep_error_t shell_parse_depgraph(
         uint32_t cmd_node_idx = out->node_count;
         shell_dep_node_t *node = &out->nodes[out->node_count++];
         node->type = SHELL_NODE_CMD;
-        node->cmd.cwd = cwd_offset;
+        node->cmd.cwd_offset = cwd_offset;
         node->cmd.token_count = 0;
 
         uint32_t ti = 0;
@@ -755,19 +771,17 @@ shell_dep_error_t shell_parse_depgraph(
             if (is_subshell_start(tok)) {
                 uint32_t sub_len = 0;
                 const char *sub_content = extract_subshell_content(tok, &sub_len);
-                const char *sub_cwd = (cwd_offset < out->buf.len) ?
-                    (out->buf.data + cwd_offset) : ".";
+                const char *sub_cwd_str = out->cwd_buf.data + cwd_offset;
                 if (sub_content && sub_len > 0) {
                     shell_dep_graph_t sub_graph;
                     memset(&sub_graph, 0, sizeof(sub_graph));
-                    sub_graph.buf.data = out->buf.data;
-                    sub_graph.buf.capacity = out->buf.capacity;
-                    sub_graph.buf.len = out->buf.len;
                     shell_dep_error_t sub_err = shell_parse_depgraph(
-                        sub_content, sub_len, sub_cwd, limits, &sub_graph
+                        sub_content, sub_len, sub_cwd_str, limits, &sub_graph
                     );
                     if (sub_err == SHELL_DEP_OK && sub_graph.node_count > 0) {
-                        out->buf.len = sub_graph.buf.len;
+                        memcpy(out->cwd_buf.data + out->cwd_buf.len,
+                               sub_graph.cwd_buf.data, sub_graph.cwd_buf.len);
+                        out->cwd_buf.len += sub_graph.cwd_buf.len;
                         int32_t sub_cmd_idx = -1;
                         for (int32_t i = (int32_t)sub_graph.node_count - 1; i >= 0; i--) {
                             if (sub_graph.nodes[i].type == SHELL_NODE_CMD) {
@@ -914,7 +928,8 @@ void shell_dep_graph_dump(const shell_dep_graph_t *g, FILE *fp)
         const shell_dep_node_t *n = &g->nodes[i];
         if (n->type == SHELL_NODE_CMD) {
             fprintf(fp, "  [%u] CMD cwd=\"%s\" tokens=[", i,
-                    g->buf.data + n->cmd.cwd);
+                    n->cmd.cwd_offset < g->cwd_buf.len ?
+                    g->cwd_buf.data + n->cmd.cwd_offset : "?");
             for (uint32_t j = 0; j < n->cmd.token_count; j++) {
                 if (j > 0) fprintf(fp, ", ");
                 fprintf(fp, "\"%.*s\"", n->cmd.token_lens[j], n->cmd.tokens[j]);
@@ -959,11 +974,11 @@ shell_dep_validate_result_t shell_dep_validate(const shell_dep_graph_t *g)
     for (uint32_t i = 0; i < g->node_count && r.error_count < SHELL_DEP_MAX_VALIDATE_ERRORS; i++) {
         const shell_dep_node_t *n = &g->nodes[i];
         if (n->type == SHELL_NODE_CMD) {
-            if (n->cmd.cwd >= g->buf.len) {
+            if (n->cmd.cwd_offset >= g->cwd_buf.len) {
                 r.valid = false;
                 snprintf(r.errors[r.error_count].msg, 96,
-                         "CMD node %u: cwd offset %u >= buf.len %zu",
-                         i, n->cmd.cwd, g->buf.len);
+                         "CMD node %u: cwd_offset %u >= cwd_buf.len %zu",
+                         i, n->cmd.cwd_offset, g->cwd_buf.len);
                 r.error_count++;
             }
         }
