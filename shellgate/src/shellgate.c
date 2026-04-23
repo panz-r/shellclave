@@ -87,6 +87,7 @@ static const char *bw_printf(buf_writer_t *w, const char *fmt, ...)
     if ((size_t)n >= avail) {
         w->used = w->size;
         w->overflow = true;
+        if (w->size > 0) w->base[w->size - 1] = '\0';
     } else {
         w->used += (size_t)n + 1;
     }
@@ -532,7 +533,11 @@ static bool path_has_prefix(const char *path, uint32_t path_len,
 {
     size_t plen = strlen(prefix);
     if (path_len < plen) return false;
-    return memcmp(path, prefix, plen) == 0;
+    if (memcmp(path, prefix, plen) != 0) return false;
+    if (plen > 0 && prefix[plen - 1] == '/') return true;
+    if (path_len == plen) return true;
+    if (path[plen] == '/') return true;
+    return false;
 }
 
 static bool path_contains(const char *path, uint32_t path_len,
@@ -1243,18 +1248,16 @@ static void sg_violation_scan(const shell_dep_graph_t *graph,
  * EVALUATION
  * ============================================================ */
 
-sg_error_t sg_eval(sg_gate_t *gate, const char *cmd,
+sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len,
                    char *buf, size_t buf_size,
                    sg_result_t *out)
 {
     if (!gate || !cmd || !buf || !out) return SG_ERR_INVALID;
     if (buf_size == 0) return SG_ERR_INVALID;
+    if (cmd_len == 0) return SG_ERR_INVALID;
 
     memset(out, 0, sizeof(*out));
     out->verdict = SG_VERDICT_ALLOW;
-
-    size_t cmd_len = strlen(cmd);
-    if (cmd_len == 0) return SG_ERR_INVALID;
 
     buf_writer_t bw;
     bw_init(&bw, buf, buf_size);
@@ -1290,7 +1293,7 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd,
     /* Step 3: Build depgraph */
     shell_dep_graph_t graph;
     memset(&graph, 0, sizeof(graph));
-    shell_dep_error_t derr = shell_parse_depgraph(cmd, cmd_len, gate->cwd, NULL, &graph);
+    shell_dep_error_t derr = shell_parse_depgraph(cmd, cmd_len, gate->cwd, NULL, 0, &graph);
     if (derr != SHELL_DEP_OK) {
         out->verdict = SG_VERDICT_REJECT;
         out->deny_reason = bw_copy(&bw, "depgraph error", 14);

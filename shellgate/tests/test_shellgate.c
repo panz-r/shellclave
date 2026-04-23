@@ -31,7 +31,7 @@ static sg_gate_t *gate_with_rules(const char **rules, int count)
 static sg_error_t eval_cmd(sg_gate_t *g, const char *cmd, sg_result_t *r)
 {
     memset(eval_buf, 0, sizeof(eval_buf));
-    return sg_eval(g, cmd, eval_buf, sizeof(eval_buf), r);
+    return sg_eval(g, cmd, strlen(cmd), eval_buf, sizeof(eval_buf), r);
 }
 
 /* ============================================================
@@ -51,8 +51,8 @@ TEST(gate_null_safety)
     ASSERT(sg_gate_rule_count(NULL) == 0);
     char buf[64];
     sg_result_t r;
-    ASSERT(sg_eval(NULL, "ls", buf, sizeof(buf), NULL) == SG_ERR_INVALID);
-    ASSERT(sg_eval(NULL, "ls", buf, sizeof(buf), &r) == SG_ERR_INVALID);
+    ASSERT(sg_eval(NULL, "ls", 2, buf, sizeof(buf), NULL) == SG_ERR_INVALID);
+    ASSERT(sg_eval(NULL, "ls", 2, buf, sizeof(buf), &r) == SG_ERR_INVALID);
 }
 
 /* ============================================================
@@ -437,7 +437,7 @@ TEST(buffer_overflow_protection)
     sg_gate_t *g = gate_with_rules(rules, 5);
     char tiny[4];
     sg_result_t r;
-    sg_error_t err = sg_eval(g, "ls | sort | cat", tiny, sizeof(tiny), &r);
+    sg_error_t err = sg_eval(g, "ls | sort | cat", 15, tiny, sizeof(tiny), &r);
     ASSERT(err == SG_ERR_TRUNC);
     ASSERT(r.truncated == true);
     sg_gate_free(g);
@@ -451,14 +451,14 @@ TEST(buffer_reuse)
 
     memset(buf, 0, sizeof(buf));
     sg_result_t r1;
-    sg_error_t err = sg_eval(g, "ls", buf, sizeof(buf), &r1);
+    sg_error_t err = sg_eval(g, "ls", 2, buf, sizeof(buf), &r1);
     ASSERT(err == SG_OK);
     ASSERT(r1.verdict == SG_VERDICT_ALLOW);
     ASSERT(r1.subcmds[0].command != NULL);
 
     memset(buf, 0, sizeof(buf));
     sg_result_t r2;
-    err = sg_eval(g, "rm", buf, sizeof(buf), &r2);
+    err = sg_eval(g, "rm", 2, buf, sizeof(buf), &r2);
     ASSERT(err == SG_OK);
     ASSERT(r2.verdict == SG_VERDICT_UNDETERMINED);
     ASSERT(r2.subcmds[0].command != NULL);
@@ -471,7 +471,7 @@ TEST(buffer_zero_length)
     sg_gate_t *g = sg_gate_new();
     char buf[1];
     sg_result_t r;
-    sg_error_t err = sg_eval(g, "ls", buf, 0, &r);
+    sg_error_t err = sg_eval(g, "ls", 2, buf, 0, &r);
     ASSERT(err == SG_ERR_INVALID);
     sg_gate_free(g);
 }

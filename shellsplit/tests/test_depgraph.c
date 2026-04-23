@@ -84,13 +84,13 @@ static bool has_edge(const shell_dep_graph_t *g, uint32_t from, uint32_t to,
 static shell_dep_error_t parse(const char *cmd, shell_dep_graph_t *g)
 {
     memset(g, 0, sizeof(*g));
-    return shell_parse_depgraph(cmd, strlen(cmd), ".", NULL, g);
+    return shell_parse_depgraph(cmd, strlen(cmd), ".", NULL, 0, g);
 }
 
 static shell_dep_error_t parse_cwd(const char *cmd, const char *cwd, shell_dep_graph_t *g)
 {
     memset(g, 0, sizeof(*g));
-    return shell_parse_depgraph(cmd, strlen(cmd), cwd, NULL, g);
+    return shell_parse_depgraph(cmd, strlen(cmd), cwd, NULL, 0, g);
 }
 
 static const char *get_cwd_str(const shell_dep_graph_t *g, uint32_t cwd_offset)
@@ -150,7 +150,7 @@ TEST(whitespace_only)
 {
      shell_dep_graph_t g;
     memset(&g, 0, sizeof(g));
-    shell_dep_error_t err = shell_parse_depgraph("   ", 3, ".", NULL, &g);
+    shell_dep_error_t err = shell_parse_depgraph("   ", 3, ".", NULL, 0, &g);
     ASSERT(err == SHELL_DEP_OK);
     ASSERT(g.node_count == 0);
     pass_count++;
@@ -665,14 +665,14 @@ TEST(basic_herestring)
 TEST(null_input)
 {
      shell_dep_graph_t g;
-    shell_dep_error_t err = shell_parse_depgraph(NULL, 0, ".", NULL, &g);
+    shell_dep_error_t err = shell_parse_depgraph(NULL, 0, ".", NULL, 0, &g);
     ASSERT(err == SHELL_DEP_EINPUT);
     pass_count++;
 }
 
 TEST(null_output)
 {
-     shell_dep_error_t err = shell_parse_depgraph("ls", 2, ".", NULL, NULL);
+     shell_dep_error_t err = shell_parse_depgraph("ls", 2, ".", NULL, 0, NULL);
     ASSERT(err == SHELL_DEP_EINPUT);
     pass_count++;
 }
@@ -680,7 +680,7 @@ TEST(null_output)
 TEST(empty_input)
 {
      shell_dep_graph_t g;
-    shell_dep_error_t err = shell_parse_depgraph("", 0, ".", NULL, &g);
+    shell_dep_error_t err = shell_parse_depgraph("", 0, ".", NULL, 0, &g);
     ASSERT(err == SHELL_DEP_EINPUT);
     pass_count++;
 }
@@ -688,7 +688,7 @@ TEST(empty_input)
 TEST(parse_error)
 {
      shell_dep_graph_t g;
-    shell_dep_error_t err = shell_parse_depgraph("unclosed \"quote", 15, ".", NULL, &g);
+    shell_dep_error_t err = shell_parse_depgraph("unclosed \"quote", 15, ".", NULL, 0, &g);
     ASSERT(err == SHELL_DEP_EPARSE);
     pass_count++;
 }

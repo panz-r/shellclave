@@ -48,6 +48,16 @@ extern "C" {
     (1u << 8) |   /* CONDITIONALS */ \
     (1u << 9) )   /* CASE         */
 
+/* Ensure SG_REJECT_MASK_DEFAULT bits match SHELL_FEAT_* in shell_tokenizer.h */
+_Static_assert((SG_REJECT_MASK_DEFAULT & (1u << 2)) != 0, "SUBSHELL bit mismatch");
+_Static_assert((SG_REJECT_MASK_DEFAULT & (1u << 3)) != 0, "ARITH bit mismatch");
+_Static_assert((SG_REJECT_MASK_DEFAULT & (1u << 4)) != 0, "HEREDOC bit mismatch");
+_Static_assert((SG_REJECT_MASK_DEFAULT & (1u << 5)) != 0, "HERESTRING bit mismatch");
+_Static_assert((SG_REJECT_MASK_DEFAULT & (1u << 6)) != 0, "PROCESS_SUB bit mismatch");
+_Static_assert((SG_REJECT_MASK_DEFAULT & (1u << 7)) != 0, "LOOPS bit mismatch");
+_Static_assert((SG_REJECT_MASK_DEFAULT & (1u << 8)) != 0, "CONDITIONALS bit mismatch");
+_Static_assert((SG_REJECT_MASK_DEFAULT & (1u << 9)) != 0, "CASE bit mismatch");
+
 /* Suggested minimum output buffer size (8 KB fits most commands). */
 #define SG_BUF_MIN 8192
 
@@ -292,16 +302,22 @@ uint32_t sg_gate_deny_rule_count(const sg_gate_t *gate);
 /*
  * Evaluate a raw command string against the loaded policy.
  *
+ * `cmd` / `cmd_len` : raw command string to evaluate.  `cmd` must be
+ *   null-terminated.  `cmd_len` is the length of the command string
+ *   (excluding the null terminator, i.e. strlen(cmd)).
+ *
  * `buf` / `buf_size` : caller-owned output buffer.  All string data
  *   (command texts, reject reasons, suggestions) is packed into this
- *   buffer.  Result pointers reference into it.
+ *   buffer.  Result pointers reference into it.  `buf` must remain
+ *   valid while reading `sg_result_t` string fields.
+ *
  * `out` : result metadata.  On return, subcmds[].command etc. point
  *   into `buf`.
  *
  * Returns SG_OK on success, SG_ERR_TRUNC if the buffer was too small
  *   (partial results are still valid), or SG_ERR_INVALID for bad args.
  */
-sg_error_t sg_eval(sg_gate_t *gate, const char *cmd,
+sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len,
                    char *buf, size_t buf_size,
                    sg_result_t *out);
 

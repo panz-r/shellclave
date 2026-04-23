@@ -32,6 +32,11 @@
 #define SHELL_DEP_MAX_HEREDOCS   8
 #define SHELL_DEP_CWD_BUF_SIZE   16384  /* 16KB buffer for unique CWD strings */
 
+/* CWD buffer must accommodate at least one PATH_MAX-sized path */
+#if defined(PATH_MAX) && PATH_MAX > SHELL_DEP_CWD_BUF_SIZE
+#error "SHELL_DEP_CWD_BUF_SIZE must be >= PATH_MAX"
+#endif
+
 /* ============================================================
  * TYPE DEFINITIONS
  * ============================================================ */
@@ -94,7 +99,7 @@ static const shell_dep_limits_t SHELL_DEP_LIMITS_DEFAULT = {
 /**
  * Fixed-size buffer for unique CWD strings.
  * CWDs are deduplicated and referenced by offset.
- * Supports paths up to PATH_MAX (typically 4096 bytes).
+ * Bounded by SHELL_DEP_CWD_BUF_SIZE (16384 bytes).
  */
 typedef struct {
     char data[SHELL_DEP_CWD_BUF_SIZE];
@@ -181,12 +186,24 @@ extern "C" {
 
 /**
  * Parse a shell command into a dependency graph.
+ *
+ * All pointers in the output graph (tokens, paths, names, values) reference
+ * the original `cmd` string. The caller must ensure `cmd` remains valid and
+ * unmodified for the lifetime of the graph.
+ *
+ * `depth` limits recursion for subshell parsing. Pass 0 for top-level.
+ * Returns SHELL_DEP_EPARSE if depth exceeds 16 (defense-in-depth).
+ *
+ * Note: Subshell extraction does not track quoting inside $(...) or `...`.
+ * Inputs like $(echo ")") may produce incorrect depth counts.
+ * This is acceptable for coarse-grained dependency tracking.
  */
 shell_dep_error_t shell_parse_depgraph(
     const char *cmd,
     size_t cmd_len,
     const char *initial_cwd,
     const shell_dep_limits_t *limits,
+    uint32_t depth,
     shell_dep_graph_t *out
 );
 
