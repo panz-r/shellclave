@@ -9,6 +9,7 @@
  */
 
 #include "shelltype.h"
+#include "arena.h"
 #include "filter_hash.h"
 
 #include <stdio.h>
@@ -21,65 +22,11 @@
 #define STR_POOL_INIT_CAP  1024
 
 /* ============================================================
- * ARENA ALLOCATOR
- * ============================================================ */
-
-typedef struct {
-    char   *base;
-    size_t  size;
-    size_t  used;
-} arena_t;
-
-static bool arena_init(arena_t *a, size_t size)
-{
-    a->base = malloc(size);
-    if (!a->base) return false;
-    a->size = size;
-    a->used = 0;
-    return true;
-}
-
-static void arena_free(arena_t *a)
-{
-    free(a->base);
-    a->base = NULL;
-    a->size = 0;
-    a->used = 0;
-}
-
-static void *arena_alloc(arena_t *a, size_t n)
-{
-    /* Align to 8 bytes */
-    if (n > SIZE_MAX - 7) return NULL;
-    n = (n + 7) & ~(size_t)7;
-    assert(a->used <= a->size);
-    if (a->used + n > a->size) {
-        /* Grow arena: double size, or enough for request + 1KB padding */
-        if (a->size > SIZE_MAX / 2) return NULL;
-        size_t new_size = a->size * 2;
-        if (new_size < a->used + n) new_size = a->used + n + 1024;
-        char *new_base = realloc(a->base, new_size);
-        if (!new_base) return NULL;
-        a->base = new_base;
-        a->size = new_size;
-    }
-    void *p = a->base + a->used;
-    a->used += n;
-    return p;
-}
-
-__attribute__((unused))
-static size_t arena_used(const arena_t *a)
-{
-    return a->used;
-}
-
-/* ============================================================
  * STRING POOL
  * ============================================================ */
 
 typedef struct {
-    const char **strings;
+    const char **slots;
     uint64_t   *hashes;
     size_t       count;
     size_t       capacity;
@@ -89,33 +36,47 @@ typedef struct {
 
 static bool str_pool_init(str_pool_t *p)
 {
-    p->strings = calloc(STR_POOL_INIT_CAP, sizeof(const char *));
-    if (!p->strings) return false;
-    p->hashes = calloc(STR_POOL_INIT_CAP, sizeof(uint64_t));
-    if (!p->hashes) { free((void *)p->strings); return false; }
-    p->count = 0;
     p->capacity = STR_POOL_INIT_CAP;
+    p->slots = calloc(p->capacity, sizeof(const char *));
+    if (!p->slots) return false;
+    p->hashes = calloc(p->capacity, sizeof(uint64_t));
+    if (!p->hashes) { free(p->slots); return false; }
+    p->count = 0;
+    for (size_t i = 0; i < p->capacity; i++) p->hashes[i] = HASH_EMPTY;
     return true;
 }
 
 static void str_pool_free(str_pool_t *p)
 {
-    /* Strings are arena-allocated, don't free individually */
-    free((void *)p->strings);
+    free(p->slots);
     free(p->hashes);
-    p->strings = NULL;
+    p->slots = NULL;
     p->hashes = NULL;
+    p->count = 0;
+    p->capacity = 0;
 }
 
 static bool str_pool_grow(str_pool_t *p)
 {
     size_t new_cap = p->capacity * 2;
-    const char **new_strings = realloc((void *)p->strings, new_cap * sizeof(const char *));
-    if (!new_strings) return false;
-    uint64_t *new_hashes = realloc(p->hashes, new_cap * sizeof(uint64_t));
-    if (!new_hashes) { free(new_strings); return false; }
-    memset(&new_hashes[p->capacity], 0, (new_cap - p->capacity) * sizeof(uint64_t));
-    p->strings = new_strings;
+    const char **new_slots = calloc(new_cap, sizeof(const char *));
+    if (!new_slots) return false;
+    uint64_t *new_hashes = calloc(new_cap, sizeof(uint64_t));
+    if (!new_hashes) { free(new_slots); return false; }
+    for (size_t i = 0; i < new_cap; i++) new_hashes[i] = HASH_EMPTY;
+    for (size_t i = 0; i < p->capacity; i++) {
+        if (p->hashes[i] != HASH_EMPTY) {
+            size_t pos = p->hashes[i] % new_cap;
+            while (new_hashes[pos] != HASH_EMPTY) {
+                pos = (pos + 1) % new_cap;
+            }
+            new_slots[pos] = p->slots[i];
+            new_hashes[pos] = p->hashes[i];
+        }
+    }
+    free(p->slots);
+    free(p->hashes);
+    p->slots = new_slots;
     p->hashes = new_hashes;
     p->capacity = new_cap;
     return true;
@@ -179,32 +140,49 @@ void st_policy_ctx_reset(st_policy_ctx_t *ctx)
     str_pool_init(&ctx->str_pool);
 }
 
+static uint64_t str_pool_hash(const char *str, size_t len)
+{
+    uint64_t h = 14695981039346656037ull;
+    for (size_t i = 0; i < len; i++) {
+        h ^= (uint64_t)(uint8_t)str[i];
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
 const char *st_policy_ctx_intern(st_policy_ctx_t *ctx, const char *str)
 {
     if (!ctx || !str) return NULL;
+    size_t len = strlen(str);
+    if (len == 0) return "";
 
-    uint64_t h = filter_hash_fnv1a(str, strlen(str));
+    uint64_t h = str_pool_hash(str, len);
+    size_t pos = h % ctx->str_pool.capacity;
 
-    /* Linear scan for existing string (hash array stored for future optimization) */
-    for (size_t i = 0; i < ctx->str_pool.count; i++) {
-        if (ctx->str_pool.hashes[i] == h &&
-            strcmp(ctx->str_pool.strings[i], str) == 0) {
-            return ctx->str_pool.strings[i];
+    while (ctx->str_pool.hashes[pos] != HASH_EMPTY) {
+        if (ctx->str_pool.hashes[pos] == h) {
+            const char *existing = ctx->str_pool.slots[pos];
+            if (strcmp(existing, str) == 0) return existing;
+        }
+        pos = (pos + 1) % ctx->str_pool.capacity;
+    }
+
+    if (ctx->str_pool.count >= ctx->str_pool.capacity * 3 / 4) {
+        if (!str_pool_grow(&ctx->str_pool)) return NULL;
+        pos = h % ctx->str_pool.capacity;
+        while (ctx->str_pool.hashes[pos] != HASH_EMPTY) {
+            pos = (pos + 1) % ctx->str_pool.capacity;
         }
     }
 
-    /* Allocate copy in arena */
-    size_t len = strlen(str) + 1;
-    char *copy = arena_alloc(&ctx->arena, len);
+    char *copy = arena_alloc(&ctx->arena, len + 1);
     if (!copy) return NULL;
     memcpy(copy, str, len);
+    copy[len] = '\0';
 
-    /* Add to pool */
-    if (ctx->str_pool.count >= ctx->str_pool.capacity) {
-        if (!str_pool_grow(&ctx->str_pool)) return NULL;
-    }
-    ctx->str_pool.hashes[ctx->str_pool.count] = h;
-    ctx->str_pool.strings[ctx->str_pool.count++] = copy;
+    ctx->str_pool.slots[pos] = copy;
+    ctx->str_pool.hashes[pos] = h;
+    ctx->str_pool.count++;
     return copy;
 }
 

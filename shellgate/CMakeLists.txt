@@ -22,6 +22,7 @@ add_library(shelltype_gate STATIC
     ${SHELLTYPE_DIR}/src/normalize.c
     ${SHELLTYPE_DIR}/src/policy.c
     ${SHELLTYPE_DIR}/src/policy_ctx.c
+    ${SHELLTYPE_DIR}/src/arena.c
     ${SHELLTYPE_DIR}/src/trie.c
     ${SHELLTYPE_DIR}/src/vacuum_filter.c
     ${SHELLTYPE_DIR}/src/filter_hash.c

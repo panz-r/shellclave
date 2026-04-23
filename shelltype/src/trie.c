@@ -16,6 +16,54 @@
 #include <stdbool.h>
 
 /* ============================================================
+ * STRING BUFFER — reusable scratch for suggestion building
+ * ============================================================ */
+
+typedef struct {
+    char   *buf;
+    size_t  len;
+    size_t  cap;
+} st_strbuf_t;
+
+static bool st_strbuf_init(st_strbuf_t *sb, size_t init_cap)
+{
+    sb->buf = malloc(init_cap);
+    if (!sb->buf) return false;
+    sb->buf[0] = '\0';
+    sb->len = 0;
+    sb->cap = init_cap;
+    return true;
+}
+
+static void st_strbuf_clear(st_strbuf_t *sb)
+{
+    sb->buf[0] = '\0';
+    sb->len = 0;
+}
+
+static void st_strbuf_append(st_strbuf_t *sb, const char *str, size_t len)
+{
+    if (sb->len + len + 1 > sb->cap) {
+        size_t new_cap = sb->cap * 2;
+        while (new_cap < sb->len + len + 1) new_cap *= 2;
+        char *new_buf = realloc(sb->buf, new_cap);
+        if (!new_buf) return;
+        sb->buf = new_buf;
+        sb->cap = new_cap;
+    }
+    memcpy(sb->buf + sb->len, str, len);
+    sb->len += len;
+    sb->buf[sb->len] = '\0';
+}
+
+static void st_strbuf_free(st_strbuf_t *sb)
+{
+    free(sb->buf);
+    sb->buf = NULL;
+    sb->len = sb->cap = 0;
+}
+
+/* ============================================================
  * NODE HELPERS
  * ============================================================ */
 
@@ -262,7 +310,7 @@ static char *join_tokens(const char **path, size_t depth)
 }
 
 static void dfs_collect(st_node_t *node, const char **path, size_t depth,
-                        uint32_t parent_count, dfs_ctx_t *ctx)
+                        uint32_t parent_count, dfs_ctx_t *ctx, st_strbuf_t *sb)
 {
     if (!node) return;
     if (depth >= 1024) return;
@@ -303,7 +351,12 @@ static void dfs_collect(st_node_t *node, const char **path, size_t depth,
                 }
             }
 
-            char *pattern = join_tokens(pattern_tokens, depth);
+            st_strbuf_clear(sb);
+            for (size_t j = 0; j < depth; j++) {
+                if (j > 0) st_strbuf_append(sb, " ", 1);
+                st_strbuf_append(sb, pattern_tokens[j], strlen(pattern_tokens[j]));
+            }
+            char *pattern = strdup(sb->buf);
             if (pattern) {
                 if (!st_is_blacklisted(ctx->learner, pattern)) {
                     if (dfs_ctx_ensure(ctx)) {
@@ -322,7 +375,7 @@ static void dfs_collect(st_node_t *node, const char **path, size_t depth,
     }
 
     for (size_t i = 0; i < node->num_children; i++) {
-        dfs_collect(node->children[i], path, depth, node->count, ctx);
+        dfs_collect(node->children[i], path, depth, node->count, ctx, sb);
     }
 }
 
@@ -369,7 +422,13 @@ st_suggestion_t *st_suggest(st_learner_t *learner, size_t *out_count)
     };
 
     const char *path[1024];
-    dfs_collect(learner->trie.root, path, 0, 0, &ctx);
+    st_strbuf_t sb;
+    if (!st_strbuf_init(&sb, 256)) {
+        *out_count = 0;
+        return NULL;
+    }
+    dfs_collect(learner->trie.root, path, 0, 0, &ctx, &sb);
+    st_strbuf_free(&sb);
 
     if (ctx.count == 0) {
         *out_count = 0;
@@ -574,10 +633,11 @@ st_error_t st_load(st_learner_t *learner, const char *path)
         }
         token_count = ti;
 
-        /* Walk/create the trie path and set count directly on the target node.
-         * We do NOT increment intermediate nodes because every saved entry
-         * already has its own count. */
+        /* Walk/create the trie path and increment count on every node.
+         * dfs_collect computes confidence as node_count / parent_count, so every
+         * node on the path must be updated for correct ranking. */
         st_node_t *current = learner->trie.root;
+        current->count += count;
         for (size_t i = 0; i < token_count; i++) {
             st_node_t *child = node_find_child(current, tokens[i].text, tokens[i].type);
             if (!child) {
@@ -602,8 +662,8 @@ st_error_t st_load(st_learner_t *learner, const char *path)
                 current->children[current->num_children++] = child;
             }
             current = child;
+            child->count += count;
         }
-        current->count = count;
 
         for (size_t i = 0; i < token_count; i++) free(tokens[i].text);
         free(tokens);

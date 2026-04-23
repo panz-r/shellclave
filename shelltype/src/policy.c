@@ -14,6 +14,7 @@
  */
 
 #include "shelltype.h"
+#include "arena.h"
 #include "vacuum_filter.h"
 #include "filter_hash.h"
 
@@ -23,6 +24,10 @@
 #include <assert.h>
 #include <errno.h>
 #include <limits.h>
+#include <stdbool.h>
+#include <stdatomic.h>
+#include <stdint.h>
+#include <pthread.h>
 
 /* ============================================================
  * CRC32 (for serialization integrity check)
@@ -82,26 +87,41 @@ typedef struct {
  * ============================================================ */
 
 typedef struct {
-    child_entry_t *children;
+    uint32_t      children_offset;  /* Offset into policy->children_arena.base */
     uint16_t       literal_count;
     uint16_t       wildcard_count;
     uint16_t       pattern_id;
     uint16_t       wildcard_mask;
-    uint16_t       children_cap;
+    uint16_t       children_alloc;   /* Slots allocated from arena */
 } policy_state_t;
 
 /* ============================================================
- * CHILDREN — per-node dynamically allocated array
+ * CHILDREN — offset-based access into policy children_arena
  * ============================================================ */
 
-static child_entry_t *children_grow(child_entry_t *old, uint16_t *cap)
+#define CHILDREN_ARENA_SIZE (64 * 1024)  /* 64KB default */
+
+static inline child_entry_t *child_at(const policy_state_t *node,
+                                     const char *arena_base, uint16_t idx)
 {
-    size_t new_cap = *cap == 0 ? 4 : (size_t)*cap * 2;
-    child_entry_t *new = realloc(old, new_cap * sizeof(child_entry_t));
-    if (!new) return NULL;
-    memset(new + *cap, 0, (new_cap - *cap) * sizeof(child_entry_t));
-    *cap = (uint16_t)new_cap;
-    return new;
+    if (!arena_base || idx >= node->literal_count + node->wildcard_count)
+        return NULL;
+    return (child_entry_t *)(arena_base + node->children_offset) + idx;
+}
+
+static bool children_arena_grow(arena_t *arena, uint32_t *offset,
+                                uint16_t *alloc, uint16_t new_slots)
+{
+    size_t old_bytes = (*alloc) * sizeof(child_entry_t);
+    size_t new_bytes = new_slots * sizeof(child_entry_t);
+    char *old_base = arena->base + *offset;
+    char *new_base = arena_alloc(arena, new_bytes);
+    if (!new_base) return false;
+    memcpy(new_base, old_base, old_bytes);
+    memset(new_base + old_bytes, 0, new_bytes - old_bytes);
+    *offset = (uint32_t)(new_base - arena->base);
+    *alloc = new_slots;
+    return true;
 }
 
 /* ============================================================
@@ -120,16 +140,14 @@ static bool states_array_init(states_array_t *a)
     a->states = calloc(a->capacity, sizeof(policy_state_t));
     if (!a->states) return false;
     a->count = 1;
-    a->states[0].children = NULL;
+    a->states[0].children_offset = 0;
+    a->states[0].children_alloc = 0;
     a->states[0].pattern_id = UINT16_MAX;
     return true;
 }
 
 static void states_array_free(states_array_t *a)
 {
-    for (size_t i = 0; i < a->count; i++) {
-        free(a->states[i].children);
-    }
     free(a->states);
     a->states = NULL;
 }
@@ -145,7 +163,8 @@ static uint32_t states_array_alloc(states_array_t *a)
     }
     assert(a->count < a->capacity);
     uint32_t idx = (uint32_t)a->count;
-    a->states[idx].children = NULL;
+    a->states[idx].children_offset = 0;
+    a->states[idx].children_alloc = 0;
     a->states[idx].pattern_id = UINT16_MAX;
     a->states[idx].literal_count = 0;
     a->states[idx].wildcard_count = 0;
@@ -209,13 +228,14 @@ struct st_policy {
     st_policy_ctx_t   *ctx;
     states_array_t      states;
     pattern_reg_t       patterns;
-    uint64_t            epoch;
+    _Atomic(uint64_t)  epoch;
+    pthread_rwlock_t   rwlock;
+    arena_t             children_arena;  /* Dedicated arena for all children arrays */
     vacuum_filter_t    *pos_filters[FILTER_POS_LEVELS];
     uint16_t            pos_wildcard_mask[FILTER_POS_LEVELS];
     uint64_t            pos_built_epoch[FILTER_POS_LEVELS];
     size_t              pattern_count;
     size_t              children_count;
-    size_t              children_alloc;
 };
 
 /* ============================================================
@@ -248,10 +268,11 @@ static inline uint16_t compat_mask(st_token_type_t t)
  * CHILD ACCESS
  * ============================================================ */
 
-static inline child_entry_t *get_child(const policy_state_t *node, uint16_t idx)
+static inline child_entry_t *get_child(const policy_state_t *node,
+                                       const char *arena_base, uint16_t idx)
 {
-    if (!node->children || idx >= node->literal_count + node->wildcard_count) return NULL;
-    return &node->children[idx];
+    if (!arena_base || idx >= node->literal_count + node->wildcard_count) return NULL;
+    return (child_entry_t *)(arena_base + node->children_offset) + idx;
 }
 
 /* ============================================================
@@ -263,28 +284,33 @@ static int cmp_literal_child(const void *key, const void *entry)
     return strcmp((const char *)key, ((const child_entry_t *)entry)->text);
 }
 
-static child_entry_t *find_literal_child(const policy_state_t *node, const char *text)
+static child_entry_t *find_literal_child(const policy_state_t *node,
+                                         const char *arena_base, const char *text)
 {
     uint16_t n = node->literal_count;
-    if (n == 0 || !node->children) return NULL;
-    assert(n <= node->children_cap);
+    if (n == 0 || !arena_base) return NULL;
+    assert(n <= node->children_alloc);
     /* Hybrid: linear scan for small fan-outs, bsearch for larger */
     if (n < 8) {
+        child_entry_t *children = (child_entry_t *)(arena_base + node->children_offset);
         for (uint16_t i = 0; i < n; i++) {
-            if (strcmp(text, node->children[i].text) == 0) return &node->children[i];
+            if (strcmp(text, children[i].text) == 0) return &children[i];
         }
         return NULL;
     }
-    return bsearch(text, node->children, n, sizeof(child_entry_t), cmp_literal_child);
+    child_entry_t *children = (child_entry_t *)(arena_base + node->children_offset);
+    return bsearch(text, children, n, sizeof(child_entry_t), cmp_literal_child);
 }
 
-static child_entry_t *find_wildcard_child(const policy_state_t *node, st_token_type_t type)
+static child_entry_t *find_wildcard_child(const policy_state_t *node,
+                                         const char *arena_base, st_token_type_t type)
 {
-    if (node->wildcard_count == 0 || !node->children) return NULL;
-    assert(node->literal_count + node->wildcard_count <= node->children_cap);
+    if (node->wildcard_count == 0 || !arena_base) return NULL;
+    assert(node->literal_count + node->wildcard_count <= node->children_alloc);
     if (!(node->wildcard_mask & compat_mask(type))) return NULL;
 
-    child_entry_t *base = node->children + node->literal_count;
+    child_entry_t *children = (child_entry_t *)(arena_base + node->children_offset);
+    child_entry_t *base = children + node->literal_count;
     for (uint16_t i = 0; i < node->wildcard_count; i++) {
         if (st_is_compatible(type, (st_token_type_t)base[i].type)) return &base[i];
     }
@@ -296,47 +322,51 @@ static child_entry_t *find_wildcard_child(const policy_state_t *node, st_token_t
  * ============================================================ */
 
 static bool insert_child(policy_state_t *node, st_policy_t *policy,
-                         const char *text, st_token_type_t type, uint32_t target)
+                         const char *text, st_token_type_t type, uint32_t target, uint8_t depth)
 {
-    assert(node->literal_count + node->wildcard_count <= node->children_cap);
+    assert(node->literal_count + node->wildcard_count <= node->children_alloc);
     bool is_literal = (type == ST_TYPE_LITERAL);
     uint16_t total = node->literal_count + node->wildcard_count;
     uint16_t insert_pos;
+    char *arena_base = policy->children_arena.base;
+    child_entry_t *children = (child_entry_t *)(arena_base + node->children_offset);
 
     if (is_literal) {
         insert_pos = 0;
         for (uint16_t i = 0; i < node->literal_count; i++) {
-            if (strcmp(text, node->children[i].text) < 0) break;
+            if (strcmp(text, children[i].text) < 0) break;
             insert_pos = i + 1;
         }
         if (insert_pos < node->literal_count &&
-            node->children[insert_pos].type == ST_TYPE_LITERAL &&
-            strcmp(text, node->children[insert_pos].text) == 0) return false;
+            children[insert_pos].type == ST_TYPE_LITERAL &&
+            strcmp(text, children[insert_pos].text) == 0) return false;
     } else {
         insert_pos = node->literal_count;
         for (uint16_t i = node->literal_count; i < total; i++) {
-            if (type < node->children[i].type) break;
+            if (type < children[i].type) break;
             insert_pos = i + 1;
         }
-        if (insert_pos < total && node->children[insert_pos].type == type) return false;
+        if (insert_pos < total && children[insert_pos].type == type) return false;
     }
     assert(insert_pos <= total);
 
     const char *interned = is_literal ? st_policy_ctx_intern(policy->ctx, text) : NULL;
     child_entry_t new_child = { .text = interned, .target = target, .type = (uint8_t)type };
 
-    if (total + 1 > node->children_cap) {
-        size_t old_cap = node->children_cap;
-        child_entry_t *grown = children_grow(node->children, &node->children_cap);
-        if (!grown) return false;
-        node->children = grown;
-        policy->children_alloc += node->children_cap - old_cap;
+    if (total + 1 > node->children_alloc) {
+        uint16_t new_alloc = node->children_alloc == 0 ? 4 : node->children_alloc * 2;
+        uint16_t old_alloc = node->children_alloc;
+        if (!children_arena_grow(&policy->children_arena, &node->children_offset, &node->children_alloc, new_alloc)) {
+            return false;
+        }
+        policy->children_count += node->children_alloc - old_alloc;
     }
 
-    memmove(node->children + insert_pos + 1,
-            node->children + insert_pos,
+    children = (child_entry_t *)(policy->children_arena.base + node->children_offset);
+    memmove(children + insert_pos + 1,
+            children + insert_pos,
             (total - insert_pos) * sizeof(child_entry_t));
-    node->children[insert_pos] = new_child;
+    children[insert_pos] = new_child;
     policy->children_count++;
 
     if (is_literal) {
@@ -345,6 +375,16 @@ static bool insert_child(policy_state_t *node, st_policy_t *policy,
         node->wildcard_count++;
         node->wildcard_mask |= (1u << type);
     }
+
+    if (depth < FILTER_POS_LEVELS) {
+        if (type == ST_TYPE_LITERAL) {
+            uint64_t h = filter_hash_fnv1a(text, strlen(text));
+            vacuum_filter_insert(policy->pos_filters[depth], h);
+        } else {
+            policy->pos_wildcard_mask[depth] |= (1u << type);
+        }
+    }
+
     return true;
 }
 
@@ -443,9 +483,10 @@ static void policy_rebuild_filters(st_policy_t *policy)
 
         policy_state_t *node = &policy->states.states[entry.idx];
         uint16_t total = node->literal_count + node->wildcard_count;
+        child_entry_t *children = (child_entry_t *)(policy->children_arena.base + node->children_offset);
 
         for (uint16_t i = 0; i < total; i++) {
-            child_entry_t *c = &node->children[i];
+            child_entry_t *c = &children[i];
             if (c->type == ST_TYPE_LITERAL && !c->text) continue;
 
             uint8_t d = entry.depth;
@@ -497,21 +538,33 @@ st_policy_t *st_policy_new(st_policy_ctx_t *ctx)
     }
 
     policy->ctx = ctx;
-    policy->epoch = 1;
+    atomic_store(&policy->epoch, 1);
     policy->pattern_count = 0;
     policy->children_count = 0;
-    policy->children_alloc = 0;
+    if (!arena_init(&policy->children_arena, CHILDREN_ARENA_SIZE)) {
+        states_array_free(&policy->states);
+        free(policy);
+        return NULL;
+    }
+    if (pthread_rwlock_init(&policy->rwlock, NULL) != 0) {
+        arena_free(&policy->children_arena);
+        states_array_free(&policy->states);
+        free(policy);
+        return NULL;
+    }
     return policy;
 }
 
 void st_policy_free(st_policy_t *policy)
 {
     if (!policy) return;
+    pthread_rwlock_destroy(&policy->rwlock);
     for (int i = 0; i < FILTER_POS_LEVELS; i++) {
         vacuum_filter_destroy(policy->pos_filters[i]);
     }
     pattern_reg_free(&policy->patterns);
     states_array_free(&policy->states);
+    arena_free(&policy->children_arena);
     free(policy);
 }
 
@@ -523,6 +576,65 @@ st_error_t st_policy_add(st_policy_t *policy, const char *pattern)
 {
     if (!policy || !pattern || !pattern[0]) return ST_ERR_INVALID;
 
+    pthread_rwlock_wrlock(&policy->rwlock);
+
+    size_t token_count = 0;
+    st_token_t *tokens = parse_pattern(pattern, &token_count);
+    if (!tokens) { pthread_rwlock_unlock(&policy->rwlock); return ST_ERR_MEMORY; }
+    if (token_count == 0) { free_pattern_tokens(tokens, token_count); pthread_rwlock_unlock(&policy->rwlock); return ST_ERR_INVALID; }
+
+    uint32_t current = 0;
+
+    for (size_t i = 0; i < token_count; i++) {
+        policy_state_t *node = &policy->states.states[current];
+        child_entry_t *existing = NULL;
+        char *arena_base = policy->children_arena.base;
+
+        if (tokens[i].type == ST_TYPE_LITERAL) {
+            existing = find_literal_child(node, arena_base, tokens[i].text);
+        } else {
+            existing = find_wildcard_child(node, arena_base, tokens[i].type);
+        }
+
+        if (existing) {
+            current = existing->target;
+        } else {
+            uint32_t new_state = states_array_alloc(&policy->states);
+            if (new_state == UINT32_MAX) {
+                free_pattern_tokens(tokens, token_count);
+                pthread_rwlock_unlock(&policy->rwlock);
+                return ST_ERR_MEMORY;
+            }
+            if (!insert_child(node, policy,
+                              tokens[i].text, tokens[i].type, new_state, (uint8_t)i)) {
+                free_pattern_tokens(tokens, token_count);
+                pthread_rwlock_unlock(&policy->rwlock);
+                return ST_ERR_MEMORY;
+            }
+            current = new_state;
+        }
+    }
+
+    policy_state_t *node = &policy->states.states[current];
+    if (node->pattern_id == UINT16_MAX) {
+        uint16_t pid = pattern_reg_add(&policy->patterns, policy->ctx, pattern);
+        if (pid == UINT16_MAX) {
+            free_pattern_tokens(tokens, token_count);
+            pthread_rwlock_unlock(&policy->rwlock);
+            return ST_ERR_MEMORY;
+        }
+        node->pattern_id = pid;
+        policy->pattern_count++;
+    }
+
+    policy->epoch++;
+    free_pattern_tokens(tokens, token_count);
+    pthread_rwlock_unlock(&policy->rwlock);
+    return ST_OK;
+}
+
+static st_error_t st_policy_add_one(st_policy_t *policy, const char *pattern)
+{
     size_t token_count = 0;
     st_token_t *tokens = parse_pattern(pattern, &token_count);
     if (!tokens) return ST_ERR_MEMORY;
@@ -533,11 +645,12 @@ st_error_t st_policy_add(st_policy_t *policy, const char *pattern)
     for (size_t i = 0; i < token_count; i++) {
         policy_state_t *node = &policy->states.states[current];
         child_entry_t *existing = NULL;
+        char *arena_base = policy->children_arena.base;
 
         if (tokens[i].type == ST_TYPE_LITERAL) {
-            existing = find_literal_child(node, tokens[i].text);
+            existing = find_literal_child(node, arena_base, tokens[i].text);
         } else {
-            existing = find_wildcard_child(node, tokens[i].type);
+            existing = find_wildcard_child(node, arena_base, tokens[i].type);
         }
 
         if (existing) {
@@ -549,7 +662,7 @@ st_error_t st_policy_add(st_policy_t *policy, const char *pattern)
                 return ST_ERR_MEMORY;
             }
             if (!insert_child(node, policy,
-                              tokens[i].text, tokens[i].type, new_state)) {
+                              tokens[i].text, tokens[i].type, new_state, (uint8_t)i)) {
                 free_pattern_tokens(tokens, token_count);
                 return ST_ERR_MEMORY;
             }
@@ -568,9 +681,31 @@ st_error_t st_policy_add(st_policy_t *policy, const char *pattern)
         policy->pattern_count++;
     }
 
-    policy->epoch++;
     free_pattern_tokens(tokens, token_count);
     return ST_OK;
+}
+
+st_error_t st_policy_batch_add(st_policy_t *policy, const char **patterns, size_t count)
+{
+    if (!policy || !patterns || count == 0) return ST_ERR_INVALID;
+
+    pthread_rwlock_wrlock(&policy->rwlock);
+
+    st_error_t first_err = ST_OK;
+    for (size_t i = 0; i < count; i++) {
+        st_error_t err = st_policy_add_one(policy, patterns[i]);
+        if (err != ST_OK && first_err == ST_OK) {
+            first_err = err;
+        }
+    }
+
+    if (first_err == ST_OK) {
+        policy->epoch++;
+        policy_rebuild_filters(policy);
+    }
+
+    pthread_rwlock_unlock(&policy->rwlock);
+    return first_err;
 }
 
 /*
@@ -588,23 +723,27 @@ st_error_t st_policy_remove(st_policy_t *policy, const char *pattern)
 {
     if (!policy || !pattern || !pattern[0]) return ST_ERR_INVALID;
 
+    pthread_rwlock_wrlock(&policy->rwlock);
+
     size_t token_count = 0;
     st_token_t *tokens = parse_pattern(pattern, &token_count);
-    if (!tokens) return ST_ERR_MEMORY;
-    if (token_count == 0) { free_pattern_tokens(tokens, token_count); return ST_ERR_INVALID; }
+    if (!tokens) { pthread_rwlock_unlock(&policy->rwlock); return ST_ERR_MEMORY; }
+    if (token_count == 0) { free_pattern_tokens(tokens, token_count); pthread_rwlock_unlock(&policy->rwlock); return ST_ERR_INVALID; }
 
     uint32_t current = 0;
 
     for (size_t i = 0; i < token_count; i++) {
         policy_state_t *node = &policy->states.states[current];
         child_entry_t *child = NULL;
+        char *arena_base = policy->children_arena.base;
         if (tokens[i].type == ST_TYPE_LITERAL) {
-            child = find_literal_child(node, tokens[i].text);
+            child = find_literal_child(node, arena_base, tokens[i].text);
         } else {
-            child = find_wildcard_child(node, tokens[i].type);
+            child = find_wildcard_child(node, arena_base, tokens[i].type);
         }
         if (!child) {
             free_pattern_tokens(tokens, token_count);
+            pthread_rwlock_unlock(&policy->rwlock);
             return ST_OK;
         }
         current = child->target;
@@ -613,14 +752,16 @@ st_error_t st_policy_remove(st_policy_t *policy, const char *pattern)
     policy_state_t *node = &policy->states.states[current];
     if (node->pattern_id == UINT16_MAX) {
         free_pattern_tokens(tokens, token_count);
+        pthread_rwlock_unlock(&policy->rwlock);
         return ST_OK;
     }
 
     node->pattern_id = UINT16_MAX;
     policy->pattern_count--;
 
-    policy->epoch++;
+    atomic_fetch_add(&policy->epoch, 1);
     free_pattern_tokens(tokens, token_count);
+    pthread_rwlock_unlock(&policy->rwlock);
     return ST_OK;
 }
 
@@ -635,8 +776,10 @@ st_error_t st_policy_compact(st_policy_t *policy)
 
     if (policy->pattern_count == 0) return ST_OK;
 
+    pthread_rwlock_wrlock(&policy->rwlock);
+
     char **active = malloc(policy->pattern_count * sizeof(char *));
-    if (!active) return ST_ERR_MEMORY;
+    if (!active) { pthread_rwlock_unlock(&policy->rwlock); return ST_ERR_MEMORY; }
 
     size_t n_active = 0;
     for (size_t i = 0; i < policy->patterns.count; i++) {
@@ -647,14 +790,13 @@ st_error_t st_policy_compact(st_policy_t *policy)
 
     if (n_active == 0) {
         free(active);
+        pthread_rwlock_unlock(&policy->rwlock);
         return ST_OK;
     }
 
     st_policy_ctx_reset(policy->ctx);
-
-    for (size_t i = 0; i < policy->states.count; i++) {
-        free(policy->states.states[i].children);
-    }
+    arena_free(&policy->children_arena);
+    arena_init(&policy->children_arena, CHILDREN_ARENA_SIZE);
     free(policy->states.states);
     states_array_init(&policy->states);
     policy->patterns.count = 0;
@@ -665,18 +807,20 @@ st_error_t st_policy_compact(st_policy_t *policy)
         policy->pos_filters[i] = NULL;
         policy->pos_built_epoch[i] = 0;
     }
-    policy->epoch++;
+    atomic_fetch_add(&policy->epoch, 1);
 
     for (size_t i = 0; i < n_active; i++) {
         st_error_t err = st_policy_add(policy, active[i]);
         if (err != ST_OK) {
             for (size_t j = 0; j < n_active; j++) free(active[j]);
             free(active);
+            pthread_rwlock_unlock(&policy->rwlock);
             return err;
         }
         free(active[i]);
     }
     free(active);
+    pthread_rwlock_unlock(&policy->rwlock);
     return ST_OK;
 }
 
@@ -726,8 +870,9 @@ static const char *st_find_based_on(const st_policy_t *policy, uint32_t state_id
         return policy->patterns.strings[state->pattern_id];
 
     uint16_t total = state->literal_count + state->wildcard_count;
+    child_entry_t *children = (child_entry_t *)(policy->children_arena.base + state->children_offset);
     for (uint16_t i = 0; i < total; i++) {
-        child_entry_t *c = &state->children[i];
+        child_entry_t *c = &children[i];
         policy_state_t *child = &policy->states.states[c->target];
         if (child->pattern_id != UINT16_MAX && child->pattern_id < policy->patterns.count)
             return policy->patterns.strings[child->pattern_id];
@@ -741,6 +886,8 @@ st_error_t st_policy_eval(st_policy_t *policy,
 {
     if (!policy || !raw_cmd) return ST_ERR_INVALID;
 
+    pthread_rwlock_rdlock(&policy->rwlock);
+
     if (result) {
         result->matches = false;
         result->matching_pattern = NULL;
@@ -751,10 +898,11 @@ st_error_t st_policy_eval(st_policy_t *policy,
     cmd.tokens = NULL;
     cmd.count = 0;
     st_error_t err = st_normalize_typed(raw_cmd, &cmd);
-    if (err != ST_OK) return err;
+    if (err != ST_OK) { pthread_rwlock_unlock(&policy->rwlock); return err; }
 
     if (cmd.count == 0 || cmd.count > MAX_CMD_TOKENS) {
         st_free_token_array(&cmd);
+        pthread_rwlock_unlock(&policy->rwlock);
         return ST_ERR_INVALID;
     }
 
@@ -763,13 +911,14 @@ st_error_t st_policy_eval(st_policy_t *policy,
      *
      * Runs before the trie walk. Rejects definite no-matches early.
      * Runs in ALL modes (verify-only and suggest).
+     * Epoch comparison drives lazy rebuild — no spin-wait needed.
      * ============================================================ */
     bool filter_rejected = false;
     size_t check_len = cmd.count < FILTER_POS_LEVELS ? cmd.count : FILTER_POS_LEVELS;
 
-    /* Rebuild filters if epoch stale */
+    uint64_t current_epoch = atomic_load(&policy->epoch);
     for (size_t i = 0; i < check_len; i++) {
-        if (policy->pos_built_epoch[i] != policy->epoch) {
+        if (policy->pos_built_epoch[i] != current_epoch) {
             policy_rebuild_filters(policy);
             break;
         }
@@ -817,14 +966,15 @@ st_error_t st_policy_eval(st_policy_t *policy,
         const char *ctext = cmd.tokens[i].text;
         policy_state_t *node = &policy->states.states[current];
         child_entry_t *found = NULL;
+        char *arena_base = policy->children_arena.base;
 
         if (ctype == ST_TYPE_LITERAL)
-            found = find_literal_child(node, ctext);
+            found = find_literal_child(node, arena_base, ctext);
 
         if (!found) {
             uint16_t compat = compat_mask(ctype) & node->wildcard_mask;
             if (compat)
-                found = find_wildcard_child(node, ctype);
+                found = find_wildcard_child(node, arena_base, ctype);
         }
 
         if (!found) break;
@@ -844,12 +994,14 @@ st_error_t st_policy_eval(st_policy_t *policy,
             result->matches = true;
             result->matching_pattern = policy->patterns.strings[end_node->pattern_id];
         }
+        pthread_rwlock_unlock(&policy->rwlock);
         return ST_OK;
     }
 
     /* Verify-only: no match, no suggestions needed */
     if (!result) {
         st_free_token_array(&cmd);
+        pthread_rwlock_unlock(&policy->rwlock);
         return ST_ERR_INVALID;
     }
 
@@ -881,6 +1033,7 @@ st_error_t st_policy_eval(st_policy_t *policy,
             free(pat_tokens);
             st_free_token_array(&cmd);
             result->error = ST_ERR_FAILED;
+            pthread_rwlock_unlock(&policy->rwlock);
             return ST_ERR_FAILED;
         }
         result->suggestions[0].based_on = based_on;
@@ -926,6 +1079,7 @@ st_error_t st_policy_eval(st_policy_t *policy,
                         free(pat_tokens);
                         st_free_token_array(&cmd);
                         result->error = ST_ERR_FAILED;
+                        pthread_rwlock_unlock(&policy->rwlock);
                         return ST_ERR_FAILED;
                     }
                     result->suggestions[1].based_on = based_on;
@@ -934,12 +1088,16 @@ st_error_t st_policy_eval(st_policy_t *policy,
                     n_suggestions = 2;
                 }
             }
-    } else if (wm == 0 && div_node->literal_count >= LITERAL_THRESHOLD) {
+        }
+
+        /* Literal-to-wildcard fallback (independent of wildcard widening) */
+        if (n_suggestions < 2 && wm == 0 && div_node->literal_count >= LITERAL_THRESHOLD) {
             /* Literal-to-wildcard: classify all existing literals + input token */
             st_token_type_t joined = ST_TYPE_LITERAL;
             uint16_t total = div_node->literal_count;
+            child_entry_t *children = (child_entry_t *)(policy->children_arena.base + div_node->children_offset);
             for (uint16_t i = 0; i < total; i++) {
-                child_entry_t *c = &div_node->children[i];
+                child_entry_t *c = &children[i];
                 if (c->type != ST_TYPE_LITERAL) continue;
                 st_token_type_t ct = st_classify_token(c->text);
                 if (joined == ST_TYPE_LITERAL) joined = ct;
@@ -968,6 +1126,7 @@ st_error_t st_policy_eval(st_policy_t *policy,
                         free(pat_tokens);
                         st_free_token_array(&cmd);
                         result->error = ST_ERR_FAILED;
+                        pthread_rwlock_unlock(&policy->rwlock);
                         return ST_ERR_FAILED;
                     }
                     result->suggestions[1].based_on = based_on;
@@ -985,6 +1144,7 @@ st_error_t st_policy_eval(st_policy_t *policy,
                             cmd.tokens, cmd.count)) {
             st_free_token_array(&cmd);
             result->error = ST_ERR_FAILED;
+            pthread_rwlock_unlock(&policy->rwlock);
             return ST_ERR_FAILED;
         }
         result->suggestions[1].based_on = NULL;
@@ -994,6 +1154,7 @@ st_error_t st_policy_eval(st_policy_t *policy,
 
     result->suggestion_count = n_suggestions;
     st_free_token_array(&cmd);
+    pthread_rwlock_unlock(&policy->rwlock);
     return ST_OK;
 }
 
@@ -1063,13 +1224,20 @@ st_error_t st_policy_verify_all(const st_policy_t *policy,
 
         st_token_type_t ctype = cmd.tokens[entry.token_idx].type;
         const char *ctext = cmd.tokens[entry.token_idx].text;
+        char *arena_base = policy->children_arena.base;
 
         if (ctype == ST_TYPE_LITERAL) {
-            child_entry_t *c = find_literal_child(state, ctext);
+            child_entry_t *c = find_literal_child(state, arena_base, ctext);
             if (c) {
+                size_t next_tail = (tail + 1) % VERIFY_ALL_RING_CAP;
+                if (next_tail == head) {
+                    free(matches);
+                    st_free_token_array(&cmd);
+                    return ST_ERR_MEMORY;
+                }
                 ring[tail].state_idx = c->target;
                 ring[tail].token_idx = entry.token_idx + 1;
-                tail = (tail + 1) % VERIFY_ALL_RING_CAP;
+                tail = next_tail;
             }
         }
 
@@ -1077,11 +1245,17 @@ st_error_t st_policy_verify_all(const st_policy_t *policy,
         while (compat) {
             int t = __builtin_ctz(compat);
             compat &= ~(1u << t);
-            child_entry_t *c = find_wildcard_child(state, (st_token_type_t)t);
+            child_entry_t *c = find_wildcard_child(state, arena_base, (st_token_type_t)t);
             if (c) {
+                size_t next_tail = (tail + 1) % VERIFY_ALL_RING_CAP;
+                if (next_tail == head) {
+                    free(matches);
+                    st_free_token_array(&cmd);
+                    return ST_ERR_MEMORY;
+                }
                 ring[tail].state_idx = c->target;
                 ring[tail].token_idx = entry.token_idx + 1;
-                tail = (tail + 1) % VERIFY_ALL_RING_CAP;
+                tail = next_tail;
             }
         }
     }
@@ -1137,7 +1311,7 @@ static void nfa_count_states(nfa_count_ctx_t *ctx, st_policy_t *policy,
     uint16_t total = node->literal_count + node->wildcard_count;
 
     for (uint16_t i = 0; i < total; i++) {
-        child_entry_t *c = get_child(node, i);
+        child_entry_t *c = child_at(node, policy->children_arena.base, i);
         if (!c) continue;
 
         if (need_space) ctx->count++;
@@ -1160,6 +1334,7 @@ static void nfa_dfs_render(nfa_render_ctx_t *ctx, st_policy_t *policy,
 
     policy_state_t *node = &policy->states.states[trie_idx];
     uint16_t total = node->literal_count + node->wildcard_count;
+    child_entry_t *children = (child_entry_t *)(policy->children_arena.base + node->children_offset);
 
     if (total == 0) {
         uint16_t pid = (node->pattern_id != UINT16_MAX) ? (ctx->pattern_id_counter++) : 0;
@@ -1180,8 +1355,7 @@ static void nfa_dfs_render(nfa_render_ctx_t *ctx, st_policy_t *policy,
 
     int trans_count = 0;
     for (uint16_t i = 0; i < total; i++) {
-        child_entry_t *c = get_child(node, i);
-        if (!c) continue;
+        child_entry_t *c = &children[i];
         if (c->type == ST_TYPE_LITERAL) {
             trans_count += (int)strlen(c->text);
         } else {
@@ -1190,7 +1364,6 @@ static void nfa_dfs_render(nfa_render_ctx_t *ctx, st_policy_t *policy,
     }
 
     uint16_t pid = (node->pattern_id != UINT16_MAX) ? (ctx->pattern_id_counter++) : 0;
-
     if (fprintf(ctx->fp, "State %u:\n", nfa_state) < 0) { ctx->error = ST_ERR_IO; return; }
     if (fprintf(ctx->fp, "  CategoryMask: 0x00\n") < 0) { ctx->error = ST_ERR_IO; return; }
     if (fprintf(ctx->fp, "  PatternId: %u\n", pid) < 0) { ctx->error = ST_ERR_IO; return; }
@@ -1205,8 +1378,7 @@ static void nfa_dfs_render(nfa_render_ctx_t *ctx, st_policy_t *policy,
     if (fprintf(ctx->fp, "  Transitions: %d\n", trans_count) < 0) { ctx->error = ST_ERR_IO; return; }
 
     for (uint16_t i = 0; i < total; i++) {
-        child_entry_t *c = get_child(node, i);
-        if (!c) continue;
+        child_entry_t *c = &children[i];
 
         if (need_space) {
             uint32_t space_state = nfa_new_state(ctx);
@@ -1240,16 +1412,17 @@ static void nfa_dfs_render(nfa_render_ctx_t *ctx, st_policy_t *policy,
                     }
                     cur = next;
                 }
-                nfa_dfs_render(ctx, policy, c->target, cur, true);
+                nfa_dfs_render(ctx, policy, c->target, cur, false);
             } else {
                 uint32_t next = nfa_new_state(ctx);
                 if (fprintf(ctx->fp, "    Symbol %d -> %u\n", VSYM_BYTE_ANY, next) < 0) {
                     ctx->error = ST_ERR_IO; return;
                 }
-                nfa_dfs_render(ctx, policy, c->target, next, true);
+                nfa_dfs_render(ctx, policy, c->target, next, false);
             }
         }
     }
+    if (fprintf(ctx->fp, "\n") < 0) { ctx->error = ST_ERR_IO; }
 }
 
 st_error_t st_policy_render_nfa(const st_policy_t *policy,
@@ -1326,6 +1499,7 @@ static void dfs_save(st_policy_t *policy, uint32_t idx, policy_save_ctx_t *ctx)
 
     policy_state_t *node = &policy->states.states[idx];
     uint16_t total = node->literal_count + node->wildcard_count;
+    child_entry_t *children = (child_entry_t *)(policy->children_arena.base + node->children_offset);
 
     if (node->pattern_id != UINT16_MAX && node->pattern_id < policy->patterns.count) {
         const char *pat = policy->patterns.strings[node->pattern_id];
@@ -1340,7 +1514,7 @@ static void dfs_save(st_policy_t *policy, uint32_t idx, policy_save_ctx_t *ctx)
     }
 
     for (uint16_t i = 0; i < total; i++) {
-        child_entry_t *c = get_child(node, i);
+        child_entry_t *c = &children[i];
         if (c) dfs_save(policy, c->target, ctx);
     }
 }
@@ -1391,12 +1565,11 @@ st_error_t st_policy_load(st_policy_t *policy, const char *path, bool clear_firs
     if (!policy || !path) return ST_ERR_INVALID;
 
     if (clear_first) {
-        /* Clear active patterns and state (arena memory retained) */
-        for (size_t i = 0; i < policy->states.count; i++) {
-            free(policy->states.states[i].children);
-            policy->states.states[i].children = NULL;
-        }
-        policy->states.count = 1;
+        /* Clear active patterns and state (reset children arena) */
+        arena_free(&policy->children_arena);
+        arena_init(&policy->children_arena, CHILDREN_ARENA_SIZE);
+        free(policy->states.states);
+        states_array_init(&policy->states);
         policy->patterns.count = 0;
         policy->pattern_count = 0;
         policy->children_count = 0;
@@ -1405,7 +1578,7 @@ st_error_t st_policy_load(st_policy_t *policy, const char *path, bool clear_firs
             policy->pos_filters[i] = NULL;
             policy->pos_built_epoch[i] = 0;
         }
-        policy->epoch++;
+        atomic_fetch_add(&policy->epoch, 1);
     }
 
     /* Save counts for rollback on error (append mode only) */
@@ -1502,7 +1675,7 @@ size_t st_policy_memory_usage(const st_policy_t *policy)
             filter_bytes += vacuum_filter_memory_bytes(policy->pos_filters[i]);
         }
     }
-    return sizeof(st_policy_t) + filter_bytes + states_alloc + policy->children_alloc * sizeof(child_entry_t) + patterns_alloc;
+    return sizeof(st_policy_t) + filter_bytes + states_alloc + policy->children_arena.used + patterns_alloc;
 }
 
 size_t st_policy_working_set(const st_policy_t *policy)

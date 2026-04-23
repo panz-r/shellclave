@@ -268,10 +268,13 @@ typedef struct st_policy_ctx st_policy_ctx_t;
 
 /**
  * Compact policy trie:
- * - Arena-allocated states and children (zero per-node mallocs)
- * - String-interned token text (shared across policies in same context)
+ * - String-interned token text via shared context arena
+ * - States in growable array (realloc); children per-node (realloc)
  * - Sorted children: literals (binary search) + wildcards (type lookup)
  * - Wildcard bitmask for O(1) compatibility pre-filter
+ * - Thread-safe epoch-based filter caching (atomic operations)
+ *
+ * TODO: Migrate children to arena allocation for true zero-per-node-malloc
  */
 typedef struct st_policy st_policy_t;
 
@@ -301,6 +304,7 @@ void st_policy_free(st_policy_t *policy);
 /* --- Pattern management --- */
 
 st_error_t st_policy_add(st_policy_t *policy, const char *pattern);
+st_error_t st_policy_batch_add(st_policy_t *policy, const char **patterns, size_t count);
 st_error_t st_policy_remove(st_policy_t *policy, const char *pattern);
 size_t st_policy_count(const st_policy_t *policy);
 
