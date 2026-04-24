@@ -1145,6 +1145,9 @@ shell_dep_validate_result_t shell_dep_validate(const shell_dep_graph_t *g)
                 ok = ((ft == SHELL_NODE_CMD && tt == SHELL_NODE_DOC) ||
                       (ft == SHELL_NODE_DOC && tt == SHELL_NODE_CMD));
                 break;
+            case SHELL_EDGE_CWD:
+                ok = (ft == SHELL_NODE_CMD && tt == SHELL_NODE_CMD);
+                break;
         }
 
         if (!ok) {
