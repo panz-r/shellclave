@@ -205,11 +205,8 @@ typedef struct sg_gate sg_gate_t;
 /**
  * Violation detection configuration.
  *
- * All path and name arrays must be kept in **sorted order**
- * (lexicographic, C string comparison) for efficient binary search.
- * Path arrays additionally require that shorter prefixes appear
- * before longer paths that have them as a prefix
- * (e.g., "/etc" before "/etc/passwd").
+ * Path and name arrays are scanned linearly (arrays are small, <=32 elements).
+ * Order does not matter for correctness.
  *
  * Violation fields in sg_result_t (violations[], violation_count,
  * violation_flags, violation_dropped_count, has_violations) are
@@ -301,6 +298,18 @@ void sg_gate_free(sg_gate_t *gate);
 /* ============================================================
  * CONFIGURATION
  * ============================================================ */
+
+/*
+ * Strict mode (enabled by default):
+ * The fast parser rejects ambiguous input as a parse error, including:
+ *   - Control characters (0x01-0x1F, 0x7F)
+ *   - High bytes (0x80-0xFF)
+ *   - Unclosed quotes (in strict mode only)
+ *   - Unclosed braces in ${VAR} expressions
+ *
+ * This is always enabled for security hardening.  Permissive mode
+ * (strict_mode=false) is not exposed publicly.
+ */
 
 sg_error_t sg_gate_set_cwd(sg_gate_t *gate, const char *cwd);
 sg_error_t sg_gate_set_reject_mask(sg_gate_t *gate, uint32_t mask);

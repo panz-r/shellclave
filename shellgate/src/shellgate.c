@@ -597,18 +597,13 @@ static bool sg_path_found(const char *path, uint32_t path_len,
                           const char *const *sorted_paths, uint32_t count,
                           uint32_t *out_idx)
 {
-    uint32_t lo = 0, hi = count;
-    while (lo < hi) {
-        uint32_t mid = lo + (hi - lo) / 2;
-        const char *prefix = sorted_paths[mid];
+    for (uint32_t i = 0; i < count; i++) {
+        const char *prefix = sorted_paths[i];
         size_t plen = strlen(prefix);
         if (path_len >= plen && memcmp(path, prefix, plen) == 0) {
-            *out_idx = mid;
+            *out_idx = i;
             return true;
         }
-        int cmp = memcmp(path, prefix, path_len < plen ? path_len : plen);
-        if (cmp < 0) hi = mid;
-        else lo = mid + 1;
     }
     return false;
 }
@@ -631,20 +626,19 @@ static bool tok_equals(const char *tok, uint32_t tok_len, const char *str)
     return tok_len == slen && memcmp(tok, str, slen) == 0;
 }
 
-static bool emit_violation(sg_violation_t *viol, uint32_t *count,
+static void emit_violation(sg_violation_t *viol, uint32_t *count,
                             uint32_t max, uint32_t *dropped,
                             uint32_t type, uint32_t severity,
                             uint32_t cmd_idx, const char *desc, const char *detail)
 {
-    if (*count >= max) { if (dropped) (*dropped)++; return false; }
-    if (!desc || !detail) { if (dropped) (*dropped)++; return false; }
+    if (*count >= max) { if (dropped) (*dropped)++; return; }
+    if (!desc || !detail) { if (dropped) (*dropped)++; return; }
     sg_violation_t *v = &viol[(*count)++];
     v->type           = type;
     v->severity       = severity;
     v->cmd_node_index = cmd_idx;
     v->description    = desc;
     v->detail         = detail;
-    return true;
 }
 
 static bool has_control_flow_path(const shell_dep_graph_t *g,
