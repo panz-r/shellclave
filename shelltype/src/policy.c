@@ -28,6 +28,7 @@
 #include <stdatomic.h>
 #include <stdint.h>
 #include <pthread.h>
+#include <time.h>
 
 /* ============================================================
  * CRC32 (for serialization integrity check)
@@ -489,6 +490,9 @@ static void free_pattern_tokens(st_token_t *tokens, size_t count)
 
 static void policy_rebuild_filters(st_policy_t *policy)
 {
+    struct timespec start, end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
     /* Count distinct literals at each depth first to size filters correctly */
     size_t depth_literal_count[FILTER_POS_LEVELS] = {0};
 
@@ -603,6 +607,13 @@ static void policy_rebuild_filters(st_policy_t *policy)
     for (int i = 0; i < FILTER_POS_LEVELS; i++) {
         policy->pos_built_epoch[i] = atomic_load(&policy->epoch);
     }
+
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    uint64_t elapsed_us = (end.tv_sec - start.tv_sec) * 1000000 +
+                          (end.tv_nsec - start.tv_nsec) / 1000;
+
+    atomic_fetch_add(&policy->stats.filter_rebuild_count, 1);
+    atomic_fetch_add(&policy->stats.filter_rebuild_us, elapsed_us);
 }
 
 /* ============================================================
@@ -671,76 +682,14 @@ void st_policy_free(st_policy_t *policy)
  * ADD / REMOVE
  * ============================================================ */
 
-st_error_t st_policy_add(st_policy_t *policy, const char *pattern)
+/* Internal: add pattern assuming write lock is already held */
+static st_error_t st_policy_add_locked(st_policy_t *policy, const char *pattern)
 {
     if (!policy || !pattern || !pattern[0]) return ST_ERR_INVALID;
 
-    pthread_rwlock_wrlock(&policy->rwlock);
-
     size_t token_count = 0;
     st_token_t *tokens = parse_pattern(pattern, &token_count);
-    /* parse_pattern returns NULL for validation errors or memory failures */
-    if (!tokens) { 
-        pthread_rwlock_unlock(&policy->rwlock); 
-        return ST_ERR_INVALID; /* Validation errors are treated as invalid */
-    }
-    if (token_count == 0) { free_pattern_tokens(tokens, token_count); pthread_rwlock_unlock(&policy->rwlock); return ST_ERR_INVALID; }
-
-    uint32_t current = 0;
-
-    for (size_t i = 0; i < token_count; i++) {
-        policy_state_t *node = &policy->states.states[current];
-        child_entry_t *existing = NULL;
-        char *arena_base = policy->children_arena.base;
-
-        if (tokens[i].type == ST_TYPE_LITERAL) {
-            existing = find_literal_child(node, arena_base, tokens[i].text);
-        } else {
-            existing = find_wildcard_child(node, arena_base, tokens[i].type);
-        }
-
-        if (existing) {
-            current = existing->target;
-        } else {
-            uint32_t new_state = states_array_alloc(&policy->states);
-            if (new_state == UINT32_MAX) {
-                free_pattern_tokens(tokens, token_count);
-                pthread_rwlock_unlock(&policy->rwlock);
-                return ST_ERR_MEMORY;
-            }
-            if (!insert_child(node, policy,
-                              tokens[i].text, tokens[i].type, new_state, (uint8_t)i)) {
-                free_pattern_tokens(tokens, token_count);
-                pthread_rwlock_unlock(&policy->rwlock);
-                return ST_ERR_MEMORY;
-            }
-            current = new_state;
-        }
-    }
-
-    policy_state_t *node = &policy->states.states[current];
-    if (node->pattern_id == UINT16_MAX) {
-        uint16_t pid = pattern_reg_add(&policy->patterns, policy->ctx, pattern);
-        if (pid == UINT16_MAX) {
-            free_pattern_tokens(tokens, token_count);
-            pthread_rwlock_unlock(&policy->rwlock);
-            return ST_ERR_MEMORY;
-        }
-        node->pattern_id = pid;
-        policy->pattern_count++;
-    }
-
-    policy->epoch++;
-    free_pattern_tokens(tokens, token_count);
-    pthread_rwlock_unlock(&policy->rwlock);
-    return ST_OK;
-}
-
-static st_error_t st_policy_add_one(st_policy_t *policy, const char *pattern)
-{
-    size_t token_count = 0;
-    st_token_t *tokens = parse_pattern(pattern, &token_count);
-    if (!tokens) return ST_ERR_MEMORY;
+    if (!tokens) return ST_ERR_INVALID;
     if (token_count == 0) { free_pattern_tokens(tokens, token_count); return ST_ERR_INVALID; }
 
     uint32_t current = 0;
@@ -784,8 +733,20 @@ static st_error_t st_policy_add_one(st_policy_t *policy, const char *pattern)
         policy->pattern_count++;
     }
 
+    policy->epoch++;
     free_pattern_tokens(tokens, token_count);
     return ST_OK;
+}
+
+/* Public: add pattern (acquires write lock) */
+st_error_t st_policy_add(st_policy_t *policy, const char *pattern)
+{
+    if (!policy || !pattern || !pattern[0]) return ST_ERR_INVALID;
+
+    pthread_rwlock_wrlock(&policy->rwlock);
+    st_error_t err = st_policy_add_locked(policy, pattern);
+    pthread_rwlock_unlock(&policy->rwlock);
+    return err;
 }
 
 st_error_t st_policy_batch_add(st_policy_t *policy, const char **patterns, size_t count)
@@ -796,14 +757,13 @@ st_error_t st_policy_batch_add(st_policy_t *policy, const char **patterns, size_
 
     st_error_t first_err = ST_OK;
     for (size_t i = 0; i < count; i++) {
-        st_error_t err = st_policy_add_one(policy, patterns[i]);
+        st_error_t err = st_policy_add_locked(policy, patterns[i]);
         if (err != ST_OK && first_err == ST_OK) {
             first_err = err;
         }
     }
 
     if (first_err == ST_OK) {
-        policy->epoch++;
         policy_rebuild_filters(policy);
     }
 
@@ -905,29 +865,47 @@ st_error_t st_policy_compact(st_policy_t *policy)
         return ST_OK;
     }
 
-    /* Reset context (should succeed since we checked refcount above) */
+    /* Step 2: FULLY tear down policy trie BEFORE resetting context
+     * This ensures no dangling pointers to ctx->arena after reset */
+    for (int i = 0; i < FILTER_POS_LEVELS; i++) {
+        vacuum_filter_destroy(policy->pos_filters[i]);
+        policy->pos_filters[i] = NULL;
+        policy->pos_wildcard_mask[i] = 0;
+        policy->pos_built_epoch[i] = 0;
+    }
+    free(policy->states.states);
+    states_array_init(&policy->states);
+    pattern_reg_free(&policy->patterns);
+    pattern_reg_init(&policy->patterns);
+    arena_free(&policy->children_arena);
+    arena_init(&policy->children_arena, CHILDREN_ARENA_SIZE);
+    policy->pattern_count = 0;
+    policy->children_count = 0;
+
+    /* Step 3: Release context reference so reset can proceed
+     * (trie is torn down, no more references to ctx->arena) */
+    st_policy_ctx_release(policy->ctx);  // refcount: 2 -> 1
+
+    /* Step 4: Reset context (now safe with refcount == 1) */
     st_error_t reset_err = st_policy_ctx_reset(policy->ctx);
     if (reset_err != ST_OK) {
+        /* Re-acquire reference if reset failed */
+        st_policy_ctx_retain(policy->ctx);
+        for (size_t j = 0; j < n_active; j++) free(active[j]);
         free(active);
         pthread_rwlock_unlock(&policy->rwlock);
         return reset_err;
     }
-    arena_free(&policy->children_arena);
-    arena_init(&policy->children_arena, CHILDREN_ARENA_SIZE);
-    free(policy->states.states);
-    states_array_init(&policy->states);
-    policy->patterns.count = 0;
-    policy->pattern_count = 0;
-    policy->children_count = 0;
-    for (int i = 0; i < FILTER_POS_LEVELS; i++) {
-        vacuum_filter_destroy(policy->pos_filters[i]);
-        policy->pos_filters[i] = NULL;
-        policy->pos_built_epoch[i] = 0;
-    }
+
+    /* Re-acquire reference for policy */
+    st_policy_ctx_retain(policy->ctx);  // refcount: 1 -> 2
+
+    /* Step 5: Rebuild trie with collected patterns */
     atomic_fetch_add(&policy->epoch, 1);
 
     for (size_t i = 0; i < n_active; i++) {
-        st_error_t err = st_policy_add(policy, active[i]);
+        /* Use _locked version since we already hold the write lock */
+        st_error_t err = st_policy_add_locked(policy, active[i]);
         if (err != ST_OK) {
             for (size_t j = 0; j < n_active; j++) free(active[j]);
             free(active);
@@ -937,6 +915,38 @@ st_error_t st_policy_compact(st_policy_t *policy)
         free(active[i]);
     }
     free(active);
+    pthread_rwlock_unlock(&policy->rwlock);
+    return ST_OK;
+}
+
+st_error_t st_policy_clear(st_policy_t *policy)
+{
+    if (!policy) return ST_ERR_INVALID;
+
+    pthread_rwlock_wrlock(&policy->rwlock);
+
+    /* Clear filters */
+    for (int i = 0; i < FILTER_POS_LEVELS; i++) {
+        vacuum_filter_destroy(policy->pos_filters[i]);
+        policy->pos_filters[i] = NULL;
+        policy->pos_wildcard_mask[i] = 0;
+        policy->pos_built_epoch[i] = 0;
+    }
+
+    /* Clear states and children arena */
+    free(policy->states.states);
+    states_array_init(&policy->states);
+    arena_free(&policy->children_arena);
+    arena_init(&policy->children_arena, CHILDREN_ARENA_SIZE);
+
+    /* Clear pattern registry */
+    pattern_reg_free(&policy->patterns);
+    pattern_reg_init(&policy->patterns);
+
+    policy->pattern_count = 0;
+    policy->children_count = 0;
+    atomic_fetch_add(&policy->epoch, 1);
+
     pthread_rwlock_unlock(&policy->rwlock);
     return ST_OK;
 }
@@ -2006,19 +2016,18 @@ st_error_t st_policy_simulate_add(const st_policy_t *policy,
  * ============================================================ */
 
 /* 
- * Next-wider type in the lattice, capped at ST_TYPE_WORD.
+ * Next-wider type in the lattice, capped appropriately.
  * 
- * Security: We cap generalization at #w instead of allowing * to prevent
- * over-broad suggestions. The #w type is broad but still restricts to
- * identifier-like tokens rather than matching anything.
+ * Security: We cap generalization at reasonable types to prevent
+ * over-broad suggestions. Path types stay as #path, others may go to #w.
  * 
- * Type hierarchy (with cap):
+ * Type hierarchy (with caps):
  *   #h → #n → #val → #w (cap)
  *   #i → #val → #w (cap)
  *   #w → #w (cap - already at limit)
  *   #q → #qs → #val → #w (cap)
- *   #f → #r → #path → #w (cap)
- *   #p → #path → #w (cap)
+ *   #f → #r → #path → #path (cap - #path is appropriate for paths)
+ *   #p → #path → #path (cap)
  *   #u → #w (cap)
  *   #val → #w (cap)
  */
@@ -2034,7 +2043,7 @@ static st_token_type_t next_wider_type(st_token_type_t t)
         case ST_TYPE_FILENAME:    return ST_TYPE_REL_PATH;
         case ST_TYPE_REL_PATH:    return ST_TYPE_PATH;
         case ST_TYPE_ABS_PATH:    return ST_TYPE_PATH;
-        case ST_TYPE_PATH:        return ST_TYPE_WORD; /* Cap: #path → #w */
+        case ST_TYPE_PATH:        return ST_TYPE_PATH; /* Cap: #path stays as #path */
         case ST_TYPE_URL:         return ST_TYPE_WORD; /* Cap: #u → #w */
         case ST_TYPE_VALUE:       return ST_TYPE_WORD; /* Cap: #val → #w */
         case ST_TYPE_ANY:         return ST_TYPE_ANY;  /* Already at top */

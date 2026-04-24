@@ -168,9 +168,12 @@ st_error_t st_policy_ctx_reset(st_policy_ctx_t *ctx)
 bool st_policy_ctx_is_exclusive(const st_policy_ctx_t *ctx)
 {
     if (!ctx) return false;
-    /* Context is exclusive if refcount is 2 or less: one for original + one for policy.
+    /* Context is exclusive if exactly one policy is using it (refcount == 2).
+     * refcount = 1: no policies (just ctx)
+     * refcount = 2: one policy (safe to compact)
+     * refcount > 2: multiple policies (not exclusive)
      * Compact requires exclusive context so it can safely rebuild the trie. */
-    return atomic_load(&ctx->refcount) <= 2;
+    return atomic_load(&ctx->refcount) == 2;
 }
 
 static uint64_t str_pool_hash(const char *str, size_t len)
@@ -224,4 +227,32 @@ size_t st_policy_ctx_memory_usage(const st_policy_ctx_t *ctx)
     if (!ctx) return 0;
     return sizeof(st_policy_ctx_t) + ctx->arena.used
            + ctx->str_pool.capacity * sizeof(const char *);
+}
+
+st_error_t st_policy_ctx_compact(st_policy_ctx_t *ctx)
+{
+    if (!ctx) return ST_ERR_INVALID;
+    
+    /* Only allow compact if no policies are using the context (refcount == 1) */
+    if (atomic_load(&ctx->refcount) != 1) {
+        return ST_ERR_INVALID;
+    }
+    
+    /* Compact arena: reinit with current used size + 10% overhead for future allocations */
+    size_t compact_size = arena_used(&ctx->arena) + arena_used(&ctx->arena) / 10;
+    if (compact_size < DEFAULT_ARENA_SIZE) compact_size = DEFAULT_ARENA_SIZE;
+    
+    arena_free(&ctx->arena);
+    if (!arena_init(&ctx->arena, compact_size)) {
+        arena_init(&ctx->arena, DEFAULT_ARENA_SIZE);  /* Fallback */
+        return ST_ERR_MEMORY;
+    }
+    
+    /* Compact string pool: reinit to current count */
+    str_pool_free(&ctx->str_pool);
+    if (!str_pool_init(&ctx->str_pool)) {
+        return ST_ERR_MEMORY;
+    }
+    
+    return ST_OK;
 }

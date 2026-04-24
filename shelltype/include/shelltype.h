@@ -329,6 +329,12 @@ const char *st_policy_ctx_intern(st_policy_ctx_t *ctx, const char *str);
  */
 bool st_policy_ctx_is_exclusive(const st_policy_ctx_t *ctx);
 
+/**
+ * Compact the context's arena and string pool to reclaim memory.
+ * Requires refcount == 1 (no policies using the context).
+ */
+st_error_t st_policy_ctx_compact(st_policy_ctx_t *ctx);
+
 /* --- Policy lifecycle --- */
 
 st_policy_t *st_policy_new(st_policy_ctx_t *ctx);
@@ -400,6 +406,7 @@ st_error_t st_policy_render_nfa(const st_policy_t *policy,
 st_error_t st_policy_save(const st_policy_t *policy, const char *path);
 st_error_t st_policy_load(st_policy_t *policy, const char *path, bool clear_first);
 st_error_t st_policy_compact(st_policy_t *policy);
+st_error_t st_policy_clear(st_policy_t *policy);
 
 /* --- Diagnostics --- */
 

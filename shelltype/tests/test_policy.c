@@ -721,7 +721,6 @@ static int test_compact_shared_context_fails(void)
     return 1;
 }
 
-#if 0  /* Disabled - causes hang during compaction */
 /* Test compact succeeds with exclusive context */
 static int test_compact_exclusive_context(void)
 {
@@ -750,7 +749,6 @@ static int test_compact_exclusive_context(void)
     st_policy_ctx_free(ctx);
     return 1;
 }
-#endif
 
 /* Test remove prefix keeps children */
 static int test_remove_prefix_keeps_children(void)
@@ -827,6 +825,76 @@ static int test_filter_rebuild_lazy_trigger(void)
     return 1;
 }
 
+/* Test st_policy_clear removes all patterns */
+static int test_policy_clear(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_policy_t *policy = st_policy_new(ctx);
+
+    st_policy_add(policy, "git status");
+    st_policy_add(policy, "git commit -m *");
+    st_policy_add(policy, "ls -la");
+    ASSERT(st_policy_count(policy) == 3);
+
+    /* Clear should remove all patterns */
+    st_error_t err = st_policy_clear(policy);
+    ASSERT(err == ST_OK);
+    ASSERT(st_policy_count(policy) == 0);
+
+    /* Policy should still work after clear */
+    st_eval_result_t result;
+    err = st_policy_eval(policy, "git status", &result);
+    ASSERT(err == ST_OK);
+    ASSERT(!result.matches);  /* No patterns, no match */
+
+    /* Should be able to add new patterns */
+    err = st_policy_add(policy, "docker ps");
+    ASSERT(err == ST_OK);
+    ASSERT(st_policy_count(policy) == 1);
+
+    err = st_policy_eval(policy, "docker ps", &result);
+    ASSERT(err == ST_OK);
+    ASSERT(result.matches);
+
+    st_policy_free(policy);
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
+/* Test st_policy_ctx_compact works with exclusive context */
+static int test_ctx_compact(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_policy_t *policy = st_policy_new(ctx);
+
+    /* Add some patterns to grow the arena */
+    for (int i = 0; i < 10; i++) {
+        char cmd[64];
+        snprintf(cmd, sizeof(cmd), "git commit -m msg%d", i);
+        st_policy_add(policy, cmd);
+    }
+
+    /* Compact should fail while policy exists (refcount > 1) */
+    st_error_t err = st_policy_ctx_compact(ctx);
+    ASSERT(err == ST_ERR_INVALID);
+
+    st_policy_free(policy);
+
+    /* Now compact should succeed (refcount == 1) */
+    err = st_policy_ctx_compact(ctx);
+    ASSERT(err == ST_OK);
+
+    /* Verify context is still usable */
+    policy = st_policy_new(ctx);
+    ASSERT(policy != NULL);
+    err = st_policy_add(policy, "git status");
+    ASSERT(err == ST_OK);
+
+    st_policy_free(policy);
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
 /* ============================================================
  * MAIN
  * ============================================================ */
@@ -881,8 +949,11 @@ int main(void)
     TEST(test_atomic_stats_single_thread);
     TEST(test_atomic_stats_accuracy);
     TEST(test_compact_shared_context_fails);
+    TEST(test_compact_exclusive_context);
     TEST(test_remove_prefix_keeps_children);
     TEST(test_filter_rebuild_lazy_trigger);
+    TEST(test_policy_clear);
+    TEST(test_ctx_compact);
 
     printf("\n========================================\n");
     printf("Results: %d/%d passed, %d failed\n",
