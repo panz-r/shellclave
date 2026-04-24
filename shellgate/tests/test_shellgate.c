@@ -345,6 +345,48 @@ TEST(config_eval_all)
     sg_gate_free(g);
 }
 
+TEST(config_stop_first_pass)
+{
+    const char *rules[] = { "cat #path" };
+    sg_gate_t *g = gate_with_rules(rules, 1);
+    sg_gate_set_stop_mode(g, SG_STOP_FIRST_PASS);
+    sg_result_t r;
+    eval_cmd(g, "rm ; cat /etc/passwd", &r);
+    ASSERT(r.subcmd_count == 2);
+    ASSERT(!r.subcmds[0].matches);
+    ASSERT(r.subcmds[1].matches);
+    sg_gate_free(g);
+}
+
+TEST(config_stop_first_allow)
+{
+    const char *rules[] = { "ls", "cat" };
+    sg_gate_t *g = gate_with_rules(rules, 2);
+    sg_gate_set_stop_mode(g, SG_STOP_FIRST_ALLOW);
+    sg_result_t r;
+    eval_cmd(g, "ls ; cat /tmp", &r);
+    ASSERT(r.subcmd_count == 1);
+    ASSERT(r.subcmds[0].matches);
+    ASSERT(r.verdict == SG_VERDICT_ALLOW);
+    sg_gate_free(g);
+}
+
+TEST(config_stop_first_deny)
+{
+    sg_gate_t *g = sg_gate_new();
+    sg_gate_add_rule(g, "ls");
+    sg_gate_add_rule(g, "cat #path");
+    sg_gate_add_deny_rule(g, "cat /etc/shadow");
+    sg_gate_set_stop_mode(g, SG_STOP_FIRST_DENY);
+    sg_result_t r;
+    eval_cmd(g, "ls ; cat /etc/shadow", &r);
+    ASSERT(r.subcmd_count == 2);
+    ASSERT(r.subcmds[0].matches);
+    ASSERT(r.subcmds[1].matches);
+    ASSERT(r.verdict == SG_VERDICT_DENY);
+    sg_gate_free(g);
+}
+
 /* ============================================================
  * POLICY MANAGEMENT
  * ============================================================ */
@@ -366,6 +408,52 @@ TEST(remove_nonexistent)
     sg_error_t err = sg_gate_remove_rule(g, "nope");
     ASSERT(err == SG_OK);
     sg_gate_free(g);
+}
+
+TEST(deny_rule_add_remove)
+{
+    sg_gate_t *g = sg_gate_new();
+    ASSERT(sg_gate_deny_rule_count(g) == 0);
+    sg_gate_add_deny_rule(g, "rm");
+    ASSERT(sg_gate_deny_rule_count(g) == 1);
+    sg_gate_add_deny_rule(g, "dd");
+    ASSERT(sg_gate_deny_rule_count(g) == 2);
+    sg_gate_remove_deny_rule(g, "rm");
+    ASSERT(sg_gate_deny_rule_count(g) == 1);
+    sg_gate_remove_deny_rule(g, "dd");
+    ASSERT(sg_gate_deny_rule_count(g) == 0);
+    sg_gate_free(g);
+}
+
+TEST(deny_rule_overrides_allow)
+{
+    sg_gate_t *g = sg_gate_new();
+    sg_gate_add_deny_rule(g, "cat /etc/shadow");
+    sg_gate_add_rule(g, "cat #path");
+    sg_result_t r;
+    eval_cmd(g, "cat /etc/shadow", &r);
+    ASSERT(r.verdict == SG_VERDICT_DENY);
+    sg_gate_free(g);
+}
+
+TEST(deny_rule_save_load)
+{
+    const char *path = "/tmp/shellgate_test_deny.txt";
+    sg_gate_t *g = sg_gate_new();
+    sg_gate_add_rule(g, "cat #path");
+    sg_gate_add_deny_rule(g, "cat /etc/shadow");
+
+    sg_error_t err = sg_gate_save_policy(g, path);
+    ASSERT(err == SG_OK);
+
+    sg_gate_t *g2 = sg_gate_new();
+    err = sg_gate_load_policy(g2, path);
+    ASSERT(err == SG_OK);
+    ASSERT(sg_gate_rule_count(g2) == 1);
+
+    unlink(path);
+    sg_gate_free(g);
+    sg_gate_free(g2);
 }
 
 /* ============================================================
@@ -427,6 +515,23 @@ TEST(save_load_empty)
     sg_gate_free(g2);
 }
 
+TEST(save_load_malformed)
+{
+    const char *path = "/tmp/shellgate_test_malformed.txt";
+    FILE *f = fopen(path, "w");
+    ASSERT(f != NULL);
+    fprintf(f, "NOT A VALID SHELLGATE POLICY FILE\n");
+    fprintf(f, "This is just garbage text that should fail to load\n");
+    fclose(f);
+
+    sg_gate_t *g = sg_gate_new();
+    sg_error_t err = sg_gate_load_policy(g, path);
+    ASSERT(err != SG_OK);
+
+    unlink(path);
+    sg_gate_free(g);
+}
+
 /* ============================================================
  * BUFFER MANAGEMENT
  * ============================================================ */
@@ -486,6 +591,34 @@ TEST(verdict_names)
     ASSERT(strcmp(sg_verdict_name(SG_VERDICT_DENY), "DENY") == 0);
     ASSERT(strcmp(sg_verdict_name(SG_VERDICT_REJECT), "REJECT") == 0);
     ASSERT(strcmp(sg_verdict_name(SG_VERDICT_UNDETERMINED), "UNDETERMINED") == 0);
+}
+
+TEST(eval_size_hint)
+{
+    size_t hint0 = sg_eval_size_hint(0);
+    ASSERT(hint0 > 0);
+
+    size_t hint10 = sg_eval_size_hint(10);
+    ASSERT(hint10 > hint0);
+
+    size_t hint100 = sg_eval_size_hint(100);
+    ASSERT(hint100 > hint10);
+}
+
+TEST(violation_dropped_count)
+{
+    sg_gate_t *g = sg_gate_new();
+    const char *rules[] = { "cat #path" };
+    for (int i = 0; i < 1; i++)
+        sg_gate_add_rule(g, rules[i]);
+
+    char buf[256];
+    sg_result_t r;
+    sg_error_t err = sg_eval(g, "cat /etc/shadow", 16, buf, sizeof(buf), &r);
+    ASSERT(err == SG_OK);
+    ASSERT(r.violation_dropped_count == 0);
+
+    sg_gate_free(g);
 }
 
 /* ============================================================
@@ -1074,14 +1207,21 @@ int main(void)
     RUN(config_cwd);
     RUN(config_stop_first_fail);
     RUN(config_eval_all);
+    RUN(config_stop_first_pass);
+    RUN(config_stop_first_allow);
+    RUN(config_stop_first_deny);
 
     printf("\nPolicy management:\n");
     RUN(add_remove_rule);
     RUN(remove_nonexistent);
+    RUN(deny_rule_add_remove);
+    RUN(deny_rule_overrides_allow);
+    RUN(deny_rule_save_load);
 
     printf("\nSerialization:\n");
     RUN(save_load_roundtrip);
     RUN(save_load_empty);
+    RUN(save_load_malformed);
 
     printf("\nBuffer management:\n");
     RUN(buffer_overflow_protection);
@@ -1132,6 +1272,8 @@ int main(void)
 
     printf("\nHelpers:\n");
     RUN(verdict_names);
+    RUN(eval_size_hint);
+    RUN(violation_dropped_count);
 
     printf("\n========================================\n");
     printf("Results: %d passed, %d failed\n", pass_count, fail_count);
