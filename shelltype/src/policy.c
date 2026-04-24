@@ -477,6 +477,29 @@ static void free_pattern_tokens(st_token_t *tokens, size_t count)
     free(tokens);
 }
 
+/**
+ * Check if pattern B subsumes pattern A.
+ * B subsumes A iff every command accepted by A is also accepted by B.
+ * Requires same length and each token of A compatible with B.
+ * For literals, values must match exactly.
+ */
+static bool pattern_subsumes(const st_token_t *a, size_t a_len,
+                            const st_token_t *b, size_t b_len)
+{
+    if (a_len != b_len) return false;
+    
+    for (size_t i = 0; i < a_len; i++) {
+        /* For literals, values must match exactly */
+        if (a[i].type == ST_TYPE_LITERAL && b[i].type == ST_TYPE_LITERAL) {
+            if (strcmp(a[i].text, b[i].text) != 0) return false;
+        } else {
+            /* For wildcard compatibility, use the type lattice */
+            if (!st_is_compatible(a[i].type, b[i].type)) return false;
+        }
+    }
+    return true;
+}
+
 /* ============================================================
  * PER-POSITION FILTER REBUILD
  *
@@ -857,6 +880,65 @@ st_error_t st_policy_compact(st_policy_t *policy)
         if (policy->patterns.strings[i] != NULL) {
             active[n_active++] = strdup(policy->patterns.strings[i]);
         }
+    }
+
+    if (n_active == 0) {
+        free(active);
+        pthread_rwlock_unlock(&policy->rwlock);
+        return ST_OK;
+    }
+
+    /* Step 1.5: Remove patterns subsumed by more general patterns
+     * B subsumes A iff every command matching A also matches B */
+    if (n_active > 1) {
+        st_token_t **pat_tokens = calloc(n_active, sizeof(st_token_t *));
+        size_t *pat_lens = calloc(n_active, sizeof(size_t));
+        bool *redundant = calloc(n_active, sizeof(bool));
+        size_t orig_n = n_active;  /* Save for cleanup */
+        
+        if (pat_tokens && pat_lens && redundant) {
+            /* Parse all patterns first */
+            for (size_t i = 0; i < orig_n; i++) {
+                pat_tokens[i] = parse_pattern(active[i], &pat_lens[i]);
+            }
+            
+            /* Find subsumed patterns: j subsumes i if j is more general */
+            for (size_t i = 0; i < orig_n; i++) {
+                if (redundant[i] || !pat_tokens[i]) continue;
+                for (size_t j = 0; j < orig_n; j++) {
+                    if (i == j || redundant[j] || !pat_tokens[j]) continue;
+                    if (pattern_subsumes(pat_tokens[i], pat_lens[i],
+                                        pat_tokens[j], pat_lens[j])) {
+                        redundant[i] = true;  /* i is subsumed by j */
+                        break;
+                    }
+                }
+            }
+            
+            /* Compact active array to keep only non-redundant */
+            size_t new_n = 0;
+            for (size_t i = 0; i < orig_n; i++) {
+                if (!redundant[i]) {
+                    active[new_n++] = active[i];
+                } else {
+                    free(active[i]);
+                    active[i] = NULL;
+                }
+            }
+            n_active = new_n;
+        }
+        
+        /* Cleanup parsed tokens */
+        if (pat_tokens) {
+            for (size_t i = 0; i < orig_n; i++) {
+                if (pat_tokens[i]) {
+                    free_pattern_tokens(pat_tokens[i], pat_lens[i]);
+                }
+            }
+            free(pat_tokens);
+        }
+        free(pat_lens);
+        free(redundant);
     }
 
     if (n_active == 0) {

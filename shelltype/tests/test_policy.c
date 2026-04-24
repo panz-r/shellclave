@@ -895,6 +895,56 @@ static int test_ctx_compact(void)
     return 1;
 }
 
+/* Test that compact removes patterns subsumed by more general ones */
+static int test_compact_removes_subsumed(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_policy_t *policy = st_policy_new(ctx);
+
+    /* Add patterns where #w will be subsumed by * at same position */
+    st_policy_add(policy, "git commit -m msg1");
+    st_policy_add(policy, "git commit -m msg2");
+    st_policy_add(policy, "git commit -m msg3");
+    st_policy_add(policy, "git commit -m *");  /* This subsumes the above (same length) */
+
+    ASSERT(st_policy_count(policy) == 4);
+
+    /* Compact should remove the 3 specific patterns, keep the wildcard */
+    st_error_t err = st_policy_compact(policy);
+    ASSERT(err == ST_OK);
+    ASSERT(st_policy_count(policy) == 1);
+
+    /* Verify the remaining pattern matches */
+    st_eval_result_t result;
+    err = st_policy_eval(policy, "git commit -m hello", &result);
+    ASSERT(err == ST_OK);
+    ASSERT(result.matches);
+
+    st_policy_free(policy);
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
+/* Test that compact keeps patterns with different lengths */
+static int test_compact_keeps_different_lengths(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_policy_t *policy = st_policy_new(ctx);
+
+    st_policy_add(policy, "git status");
+    st_policy_add(policy, "git commit -m *");  /* Different length, not subsumed */
+
+    ASSERT(st_policy_count(policy) == 2);
+
+    st_error_t err = st_policy_compact(policy);
+    ASSERT(err == ST_OK);
+    ASSERT(st_policy_count(policy) == 2);  /* Both kept */
+
+    st_policy_free(policy);
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
 /* ============================================================
  * MAIN
  * ============================================================ */
@@ -954,6 +1004,8 @@ int main(void)
     TEST(test_filter_rebuild_lazy_trigger);
     TEST(test_policy_clear);
     TEST(test_ctx_compact);
+    TEST(test_compact_removes_subsumed);
+    TEST(test_compact_keeps_different_lengths);
 
     printf("\n========================================\n");
     printf("Results: %d/%d passed, %d failed\n",
