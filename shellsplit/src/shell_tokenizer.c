@@ -315,12 +315,8 @@ shell_error_t shell_parse_fast(
             pos += 2;  // Skip ((
             continue;
         }
-        if (c == ')') {
-            // Check if closing arithmetic
-            if (arith_depth > 0 && pos > 0 && cmd[pos-1] == ')') {
-                // This might be closing (( or $(( - arithmetic
-                arith_depth--;
-            }
+        if (c == ')' && arith_depth > 0) {
+            arith_depth--;
         }
 
         // Track regular parentheses () for subshell detection
