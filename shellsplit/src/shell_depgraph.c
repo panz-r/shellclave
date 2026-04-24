@@ -684,6 +684,49 @@ shell_dep_error_t shell_parse_depgraph(
         }
 
         if (is_cd) {
+            if (limits->cd_as_cmd && out->node_count < max_nodes) {
+                uint32_t cmd_node_idx = out->node_count;
+                shell_dep_node_t *node = &out->nodes[out->node_count++];
+                node->type = SHELL_NODE_CMD;
+                node->cmd.cwd_offset = cwd_offset;
+                node->cmd.token_count = 0;
+
+                for (uint32_t ti = 0; ti < tokens.count && node->cmd.token_count < max_tokens; ti++) {
+                    node->cmd.tokens[ti] = tokens.tokens[ti].start;
+                    node->cmd.token_lens[ti] = tokens.tokens[ti].len;
+                    node->cmd.token_count++;
+                }
+
+                if (out->edge_count < max_edges) {
+                    shell_dep_edge_t *cwd_edge = &out->edges[out->edge_count++];
+                    cwd_edge->from = cmd_node_idx;
+                    cwd_edge->to = cmd_node_idx;
+                    cwd_edge->type = SHELL_EDGE_CWD;
+                    cwd_edge->dir = SHELL_DIR_FORWARD;
+                }
+
+                for (uint32_t ti = 1; ti < tokens.count; ti++) {
+                    const dep_token_t *tok = &tokens.tokens[ti];
+                    if (token_looks_like_path(tok) && out->node_count < max_nodes && out->edge_count < max_edges) {
+                        shell_dep_node_t *an = &out->nodes[out->node_count++];
+                        an->type = SHELL_NODE_DOC;
+                        an->doc.kind = SHELL_DOC_FILE;
+                        an->doc.path = tok->start;
+                        an->doc.path_len = tok->len;
+                        an->doc.name = NULL;
+                        an->doc.name_len = 0;
+                        an->doc.value = NULL;
+                        an->doc.value_len = 0;
+
+                        shell_dep_edge_t *ae = &out->edges[out->edge_count++];
+                        ae->from = cmd_node_idx;
+                        ae->to = out->node_count - 1;
+                        ae->type = SHELL_EDGE_ARG;
+                        ae->dir = SHELL_DIR_UNDIR;
+                    }
+                }
+            }
+
             if (tokens.count >= 2) {
                 dep_token_t arg = tokens.tokens[1];
                 char arg_buf[256];

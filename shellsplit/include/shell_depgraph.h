@@ -76,6 +76,7 @@ typedef enum {
     SHELL_EDGE_SEQ    = 7,
     SHELL_EDGE_AND    = 8,
     SHELL_EDGE_OR     = 9,
+    SHELL_EDGE_CWD    = 10,
 } shell_dep_edge_type_t;
 
 typedef enum {
@@ -95,13 +96,18 @@ typedef struct {
     uint32_t max_edges;
     uint32_t max_tokens_per_cmd;
     uint32_t cwd_buf_size;   /* 0 = use default SHELL_DEP_CWD_BUF_SIZE */
+    /* cd_as_cmd: when true, 'cd' commands produce CMD nodes (with CWD edge);
+     *            when false (default), cd is processed for CWD side-effects
+     *            but does not produce a node in the graph. */
+    bool cd_as_cmd;
 } shell_dep_limits_t;
 
 static const shell_dep_limits_t SHELL_DEP_LIMITS_DEFAULT = {
     .max_nodes = SHELL_DEP_MAX_NODES,
     .max_edges = SHELL_DEP_MAX_EDGES,
     .max_tokens_per_cmd = SHELL_DEP_MAX_TOKENS,
-    .cwd_buf_size = 0  /* 0 means use default 16384 */
+    .cwd_buf_size = 0,  /* 0 means use default 16384 */
+    .cd_as_cmd = false
 };
 
 /**
