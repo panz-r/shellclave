@@ -72,6 +72,7 @@ typedef enum {
     ST_TYPE_PATH,          /* #path: any path type (#p ∨ #r ∨ #f) */
     ST_TYPE_URL,           /* #u: protocol://... */
     ST_TYPE_VALUE,         /* #val: any scalar (#n ∨ #i ∨ #w ∨ #q ∨ #qs) */
+    ST_TYPE_OPT,           /* #opt: command-line option (-v, --help, -o file) */
     ST_TYPE_ANY,           /* *: everything (top element) */
     ST_TYPE_COUNT          /* number of types */
 } st_token_type_t;

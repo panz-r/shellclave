@@ -35,6 +35,7 @@ const char *st_type_symbol[ST_TYPE_COUNT] = {
     [ST_TYPE_PATH]          = "#path",
     [ST_TYPE_URL]           = "#u",
     [ST_TYPE_VALUE]         = "#val",
+    [ST_TYPE_OPT]           = "#opt",
     [ST_TYPE_ANY]           = "*",
 };
 
@@ -51,6 +52,7 @@ const char *st_type_symbol[ST_TYPE_COUNT] = {
  *   #f ⊂ #r ⊂ #path ⊂ *
  *   #p ⊂ #path ⊂ *
  *   #u ⊂ *
+ *   #opt ⊂ #val ⊂ *
  * ============================================================ */
 
 const st_token_type_t st_type_join[ST_TYPE_COUNT][ST_TYPE_COUNT] = {
@@ -58,72 +60,77 @@ const st_token_type_t st_type_join[ST_TYPE_COUNT][ST_TYPE_COUNT] = {
     { ST_TYPE_LITERAL, ST_TYPE_HEXHASH, ST_TYPE_NUMBER, ST_TYPE_IPV4,
       ST_TYPE_WORD, ST_TYPE_QUOTED, ST_TYPE_QUOTED_SPACE, ST_TYPE_FILENAME,
       ST_TYPE_REL_PATH, ST_TYPE_ABS_PATH, ST_TYPE_PATH, ST_TYPE_ANY,
-      ST_TYPE_VALUE, ST_TYPE_ANY },
+      ST_TYPE_VALUE, ST_TYPE_ANY, ST_TYPE_ANY },
     /* HEXHASH */
     { ST_TYPE_HEXHASH, ST_TYPE_HEXHASH, ST_TYPE_NUMBER, ST_TYPE_VALUE,
       ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE,
       ST_TYPE_ANY,   ST_TYPE_ANY,   ST_TYPE_ANY,  ST_TYPE_ANY,
-      ST_TYPE_VALUE, ST_TYPE_ANY },
+      ST_TYPE_VALUE, ST_TYPE_ANY, ST_TYPE_ANY },
     /* NUMBER */
     { ST_TYPE_NUMBER, ST_TYPE_NUMBER, ST_TYPE_NUMBER, ST_TYPE_VALUE,
       ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE,
       ST_TYPE_ANY,   ST_TYPE_ANY,   ST_TYPE_ANY,  ST_TYPE_ANY,
-      ST_TYPE_VALUE, ST_TYPE_ANY },
+      ST_TYPE_VALUE, ST_TYPE_ANY, ST_TYPE_ANY },
     /* IPV4 */
     { ST_TYPE_IPV4, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_IPV4,
       ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE,
       ST_TYPE_ANY,  ST_TYPE_ANY,  ST_TYPE_ANY,  ST_TYPE_ANY,
-      ST_TYPE_VALUE, ST_TYPE_ANY },
+      ST_TYPE_VALUE, ST_TYPE_ANY, ST_TYPE_ANY },
     /* WORD */
     { ST_TYPE_WORD, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE,
       ST_TYPE_WORD, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE,
       ST_TYPE_ANY,  ST_TYPE_ANY,  ST_TYPE_ANY,  ST_TYPE_ANY,
-      ST_TYPE_VALUE, ST_TYPE_ANY },
+      ST_TYPE_VALUE, ST_TYPE_ANY, ST_TYPE_ANY },
     /* QUOTED */
     { ST_TYPE_QUOTED, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE,
       ST_TYPE_VALUE, ST_TYPE_QUOTED, ST_TYPE_QUOTED_SPACE, ST_TYPE_VALUE,
       ST_TYPE_ANY,  ST_TYPE_ANY,  ST_TYPE_ANY,  ST_TYPE_ANY,
-      ST_TYPE_VALUE, ST_TYPE_ANY },
+      ST_TYPE_VALUE, ST_TYPE_ANY, ST_TYPE_ANY },
     /* QUOTED_SPACE */
     { ST_TYPE_QUOTED_SPACE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE,
       ST_TYPE_VALUE, ST_TYPE_QUOTED_SPACE, ST_TYPE_QUOTED_SPACE, ST_TYPE_VALUE,
       ST_TYPE_ANY,  ST_TYPE_ANY,  ST_TYPE_ANY,  ST_TYPE_ANY,
-      ST_TYPE_VALUE, ST_TYPE_ANY },
+      ST_TYPE_VALUE, ST_TYPE_ANY, ST_TYPE_ANY },
     /* FILENAME */
     { ST_TYPE_FILENAME, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE,
       ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_FILENAME,
       ST_TYPE_REL_PATH, ST_TYPE_PATH, ST_TYPE_PATH, ST_TYPE_ANY,
-      ST_TYPE_VALUE, ST_TYPE_ANY },
+      ST_TYPE_VALUE, ST_TYPE_ANY, ST_TYPE_ANY },
     /* REL_PATH */
     { ST_TYPE_REL_PATH, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY,
       ST_TYPE_ANY,  ST_TYPE_ANY,  ST_TYPE_ANY,  ST_TYPE_REL_PATH,
       ST_TYPE_REL_PATH, ST_TYPE_PATH, ST_TYPE_PATH, ST_TYPE_ANY,
-      ST_TYPE_ANY, ST_TYPE_ANY },
+      ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY },
     /* ABS_PATH */
     { ST_TYPE_ABS_PATH, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY,
       ST_TYPE_ANY,  ST_TYPE_ANY,  ST_TYPE_ANY,  ST_TYPE_PATH,
       ST_TYPE_PATH, ST_TYPE_ABS_PATH, ST_TYPE_PATH, ST_TYPE_ANY,
-      ST_TYPE_ANY, ST_TYPE_ANY },
+      ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY },
     /* PATH */
     { ST_TYPE_PATH, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY,
       ST_TYPE_ANY,  ST_TYPE_ANY,  ST_TYPE_ANY,  ST_TYPE_PATH,
       ST_TYPE_PATH, ST_TYPE_PATH, ST_TYPE_PATH, ST_TYPE_ANY,
-      ST_TYPE_ANY, ST_TYPE_ANY },
+      ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY },
     /* URL */
     { ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY,
       ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY,
       ST_TYPE_ANY,  ST_TYPE_ANY,  ST_TYPE_ANY,  ST_TYPE_URL,
-      ST_TYPE_ANY, ST_TYPE_ANY },
+      ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY },
     /* VALUE */
     { ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE,
       ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE,
       ST_TYPE_ANY,  ST_TYPE_ANY,  ST_TYPE_ANY,  ST_TYPE_ANY,
-      ST_TYPE_VALUE, ST_TYPE_ANY },
+      ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_ANY },
+    /* OPT */
+    { ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY,
+      ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY,
+      ST_TYPE_ANY,  ST_TYPE_ANY,  ST_TYPE_ANY,  ST_TYPE_ANY,
+      ST_TYPE_VALUE, ST_TYPE_OPT, ST_TYPE_ANY },
     /* ANY */
     { ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY,
       ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY,
       ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY,
-      ST_TYPE_ANY, ST_TYPE_ANY },
+      ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY },
 };
 
 /* ============================================================
@@ -138,33 +145,35 @@ const st_token_type_t st_type_join[ST_TYPE_COUNT][ST_TYPE_COUNT] = {
 /* We define it explicitly for clarity: */
 const bool st_type_compatible[ST_TYPE_COUNT][ST_TYPE_COUNT] = {
     /* LITERAL matches only LITERAL and ANY */
-    { true,  false, false, false, false, false, false, false, false, false, false, false, false, true  },
+    { true,  false, false, false, false, false, false, false, false, false, false, false, false, false, true  },
     /* #h matches #h, #n, #val, * */
-    { false, true,  true,  false, false, false, false, false, false, false, false, false, true,  true  },
+    { false, true,  true,  false, false, false, false, false, false, false, false, false, true,  false, true  },
     /* #n matches #n, #val, * */
-    { false, false, true,  false, false, false, false, false, false, false, false, false, true,  true  },
+    { false, false, true,  false, false, false, false, false, false, false, false, false, true,  false, true  },
     /* #i matches #i, #val, * */
-    { false, false, false, true,  false, false, false, false, false, false, false, false, true,  true  },
+    { false, false, false, true,  false, false, false, false, false, false, false, false, true,  false, true  },
     /* #w matches #w, #val, * */
-    { false, false, false, false, true,  false, false, false, false, false, false, false, true,  true  },
+    { false, false, false, false, true,  false, false, false, false, false, false, false, true,  false, true  },
     /* #q matches #q, #qs, #val, * */
-    { false, false, false, false, false, true,  true,  false, false, false, false, false, true,  true  },
+    { false, false, false, false, false, true,  true,  false, false, false, false, false, true,  false, true  },
     /* #qs matches #qs, #val, * */
-    { false, false, false, false, false, false, true,  false, false, false, false, false, true,  true  },
+    { false, false, false, false, false, false, true,  false, false, false, false, false, true,  false, true  },
     /* #f matches #f, #r, #path, * */
-    { false, false, false, false, false, false, false, true,  true,  false, true,  false, false, true  },
+    { false, false, false, false, false, false, false, true,  true,  false, true,  false, false, false, true  },
     /* #r matches #r, #path, * */
-    { false, false, false, false, false, false, false, false, true,  false, true,  false, false, true  },
+    { false, false, false, false, false, false, false, false, true,  false, true,  false, false, false, true  },
     /* #p matches #p, #path, * */
-    { false, false, false, false, false, false, false, false, false, true,  true,  false, false, true  },
+    { false, false, false, false, false, false, false, false, false, true,  true,  false, false, false, true  },
     /* #path matches #path, * */
-    { false, false, false, false, false, false, false, false, false, false, true,  false, false, true  },
+    { false, false, false, false, false, false, false, false, false, false, true,  false, false, false, true  },
     /* #u matches #u, * */
-    { false, false, false, false, false, false, false, false, false, false, false, true,  false, true  },
+    { false, false, false, false, false, false, false, false, false, false, false, true,  false, false, true  },
     /* #val matches #val, * */
-    { false, false, false, false, false, false, false, false, false, false, false, false, true,  true  },
+    { false, false, false, false, false, false, false, false, false, false, false, false, true,  false, true  },
+    /* #opt matches #opt, #val, * */
+    { false, false, false, false, false, false, false, false, false, false, false, false, true,  true,  true  },
     /* * matches * */
-    { false, false, false, false, false, false, false, false, false, false, false, false, false, true  },
+    { false, false, false, false, false, false, false, false, false, false, false, false, false, false, true  },
 };
 
 /* ============================================================
@@ -264,6 +273,27 @@ static bool has_whitespace(const char *token)
     return false;
 }
 
+static bool is_option_token(const char *token)
+{
+    /* Short option: -x (single letter after dash, not digit)
+     * Long option: --word (double dash, then letters/digits/hyphens) */
+    if (token[0] != '-') return false;
+    if (token[1] == '-') {
+        /* Long option: --word or --word=value */
+        if (!token[2]) return false;  /* Just "--" is not an option */
+        for (const char *p = token + 2; *p; p++) {
+            if (isalnum((unsigned char)*p) || *p == '-' || *p == '=') continue;
+            return false;
+        }
+        return true;
+    } else if (token[1] && !isspace((unsigned char)token[1])) {
+        /* Short option: -x (single letter after dash)
+         * Must be alpha, not digit (digits are caught by number classification) */
+        return isalpha((unsigned char)token[1]);
+    }
+    return false;
+}
+
 /* ============================================================
  * PUBLIC: CLASSIFY
  * ============================================================ */
@@ -286,6 +316,9 @@ st_token_type_t st_classify_token(const char *token)
 
     /* Decimal number - check before hex hash which requires alpha */
     if (is_decimal_number(token)) return ST_TYPE_NUMBER;
+
+    /* Option token (-v, --help, -o file) */
+    if (is_option_token(token)) return ST_TYPE_OPT;
 
     /* Hex hash (8+ hex chars with at least one letter, no 0x prefix) */
     if (is_hex_hash(token)) return ST_TYPE_HEXHASH;

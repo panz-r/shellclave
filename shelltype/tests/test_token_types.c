@@ -300,6 +300,40 @@ static int test_classify_literal_percent(void)
     return 1;
 }
 
+/* --- Command-line options --- */
+
+static int test_classify_option_short(void)
+{
+    ASSERT_TYPE("-v", ST_TYPE_OPT);
+    ASSERT_TYPE("-h", ST_TYPE_OPT);
+    ASSERT_TYPE("-x", ST_TYPE_OPT);
+    ASSERT_TYPE("-a", ST_TYPE_OPT);
+    ASSERT_TYPE("-la", ST_TYPE_OPT);  /* stacked flags */
+    ASSERT_TYPE("-rf", ST_TYPE_OPT);  /* stacked flags */
+    return 1;
+}
+
+static int test_classify_option_long(void)
+{
+    ASSERT_TYPE("--help", ST_TYPE_OPT);
+    ASSERT_TYPE("--version", ST_TYPE_OPT);
+    ASSERT_TYPE("--verbose", ST_TYPE_OPT);
+    ASSERT_TYPE("--output=file", ST_TYPE_OPT);
+    ASSERT_TYPE("--max-count=10", ST_TYPE_OPT);
+    ASSERT_TYPE("--name", ST_TYPE_OPT);
+    return 1;
+}
+
+static int test_classify_option_not_option(void)
+{
+    /* Negative numbers are not options */
+    ASSERT_TYPE("-42", ST_TYPE_NUMBER);
+    ASSERT_TYPE("-1", ST_TYPE_NUMBER);
+    ASSERT_TYPE("--", ST_TYPE_LITERAL);  /* just dashes */
+    ASSERT_TYPE("-", ST_TYPE_LITERAL);  /* just dash */
+    return 1;
+}
+
 /* ============================================================
  * JOIN TABLE
  * ============================================================ */
@@ -485,7 +519,7 @@ static int test_normalize_typed_simple(void)
     ASSERT(arr.count == 2);
     ASSERT(arr.tokens[0].type == ST_TYPE_LITERAL);
     ASSERT(strcmp(arr.tokens[0].text, "ls") == 0);
-    ASSERT(arr.tokens[1].type == ST_TYPE_LITERAL);
+    ASSERT(arr.tokens[1].type == ST_TYPE_OPT);  /* -la is now an option */
     st_free_token_array(&arr);
     return 1;
 }
@@ -592,7 +626,7 @@ static int test_normalize_typed_long_flag_value(void)
     ASSERT(arr.count == 4);
     ASSERT(arr.tokens[0].type == ST_TYPE_LITERAL); /* git */
     ASSERT(arr.tokens[1].type == ST_TYPE_LITERAL); /* commit */
-    ASSERT(arr.tokens[2].type == ST_TYPE_LITERAL); /* --message */
+    ASSERT(arr.tokens[2].type == ST_TYPE_OPT);     /* --message is now an option */
     ASSERT(arr.tokens[3].type == ST_TYPE_LITERAL); /* hello (word, not in a variable context) */
     st_free_token_array(&arr);
     return 1;
@@ -767,6 +801,11 @@ int main(void)
     TEST(test_classify_literal_dash);
     TEST(test_classify_literal_special_chars);
     TEST(test_classify_literal_percent);
+
+    printf("\nClassification - Options (#opt):\n");
+    TEST(test_classify_option_short);
+    TEST(test_classify_option_long);
+    TEST(test_classify_option_not_option);
 
     printf("\nJoin table:\n");
     TEST(test_join_reflexive);

@@ -577,14 +577,17 @@ static int test_complex_eval_filter_suggest_stress(void)
     ASSERT(r.suggestion_count == 2 || r.matches);
 
     /* --- 9. Literal-to-wildcard generalization --- */
-    /* Add 3 patterns with different literal tokens at position 1 */
-    st_policy_add(policy, "mycmd -a value");
-    st_policy_add(policy, "mycmd -b value");
-    st_policy_add(policy, "mycmd -c value");
+    /* Add 3 patterns with different WORD tokens at position 1.
+     * Note: we use words like "alpha", "beta", "gamma" rather than short
+     * options like "-a", "-b", "-c", because short options are now classified
+     * as #opt and get merged into a single pattern. */
+    st_policy_add(policy, "mycmd alpha value");
+    st_policy_add(policy, "mycmd beta value");
+    st_policy_add(policy, "mycmd gamma value");
 
-    /* "mycmd -d value" diverges at position 1 where we have
-     * 3 literal children: -a, -b, -c */
-    err = st_policy_eval(policy, "mycmd -d value", &r);
+    /* "mycmd delta value" diverges at position 1 where we have
+     * 3 literal children: alpha, beta, gamma */
+    err = st_policy_eval(policy, "mycmd delta value", &r);
     ASSERT(err == ST_OK);
     ASSERT(!r.matches);
     ASSERT(r.suggestion_count == 2);
@@ -596,7 +599,7 @@ static int test_complex_eval_filter_suggest_stress(void)
     ASSERT(err == ST_OK);
 
     /* Now it should match */
-    err = st_policy_eval(policy, "mycmd -d value", &r);
+    err = st_policy_eval(policy, "mycmd delta value", &r);
     ASSERT(err == ST_OK);
     ASSERT(r.matches);
 

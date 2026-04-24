@@ -945,6 +945,78 @@ static int test_compact_keeps_different_lengths(void)
     return 1;
 }
 
+/* Test that policy with #opt matches command-line options */
+static int test_policy_opt_matching(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_policy_t *policy = st_policy_new(ctx);
+
+    st_policy_add(policy, "git #opt");
+    
+    st_eval_result_t result;
+    st_error_t err;
+    
+    /* Short options */
+    err = st_policy_eval(policy, "git -v", &result);
+    ASSERT(err == ST_OK);
+    ASSERT(result.matches);
+    
+    err = st_policy_eval(policy, "git -h", &result);
+    ASSERT(err == ST_OK);
+    ASSERT(result.matches);
+    
+    err = st_policy_eval(policy, "git -la", &result);
+    ASSERT(err == ST_OK);
+    ASSERT(result.matches);
+    
+    /* Long options */
+    err = st_policy_eval(policy, "git --help", &result);
+    ASSERT(err == ST_OK);
+    ASSERT(result.matches);
+    
+    err = st_policy_eval(policy, "git --version", &result);
+    ASSERT(err == ST_OK);
+    ASSERT(result.matches);
+    
+    /* Options with attached value (--option=value is split into --option and =value) */
+    /* Note: "--output=file" becomes git --output = file, so #opt matches --output */
+    /* For testing, use simple options without attached values */
+    
+    /* Non-option args should not match */
+    err = st_policy_eval(policy, "git status", &result);
+    ASSERT(err == ST_OK);
+    ASSERT(!result.matches);
+    
+    st_policy_free(policy);
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
+/* Test that policy with #val also matches options (options are values) */
+static int test_policy_opt_matches_value(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_policy_t *policy = st_policy_new(ctx);
+
+    st_policy_add(policy, "docker run #val");
+    
+    st_eval_result_t result;
+    st_error_t err;
+    
+    /* Options should match #val */
+    err = st_policy_eval(policy, "docker run -d", &result);
+    ASSERT(err == ST_OK);
+    ASSERT(result.matches);
+    
+    err = st_policy_eval(policy, "docker run --rm", &result);
+    ASSERT(err == ST_OK);
+    ASSERT(result.matches);
+    
+    st_policy_free(policy);
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
 /* ============================================================
  * MAIN
  * ============================================================ */
@@ -1006,6 +1078,10 @@ int main(void)
     TEST(test_ctx_compact);
     TEST(test_compact_removes_subsumed);
     TEST(test_compact_keeps_different_lengths);
+
+    printf("\nOptions (#opt):\n");
+    TEST(test_policy_opt_matching);
+    TEST(test_policy_opt_matches_value);
 
     printf("\n========================================\n");
     printf("Results: %d/%d passed, %d failed\n",

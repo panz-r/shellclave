@@ -268,6 +268,7 @@ static const uint16_t st_compat_mask[ST_TYPE_COUNT] = {
     /* PATH */         (1u << ST_TYPE_PATH) | (1u << ST_TYPE_ANY),
     /* URL */          (1u << ST_TYPE_URL) | (1u << ST_TYPE_ANY),
     /* VALUE */        (1u << ST_TYPE_VALUE) | (1u << ST_TYPE_ANY),
+    /* OPT */          (1u << ST_TYPE_OPT) | (1u << ST_TYPE_VALUE) | (1u << ST_TYPE_ANY),
     /* ANY */          (1u << ST_TYPE_ANY),
 };
 
@@ -2111,7 +2112,8 @@ st_error_t st_policy_simulate_add(const st_policy_t *policy,
  *   #f → #r → #path → #path (cap - #path is appropriate for paths)
  *   #p → #path → #path (cap)
  *   #u → #w (cap)
- *   #val → #w (cap)
+ *   #val → #val (cap)
+ *   #opt → #val → * (cap)
  */
 static st_token_type_t next_wider_type(st_token_type_t t)
 {
@@ -2128,6 +2130,7 @@ static st_token_type_t next_wider_type(st_token_type_t t)
         case ST_TYPE_PATH:        return ST_TYPE_PATH; /* Cap: #path stays as #path */
         case ST_TYPE_URL:         return ST_TYPE_WORD; /* Cap: #u → #w */
         case ST_TYPE_VALUE:       return ST_TYPE_VALUE; /* Cap: #val stays as #val */
+        case ST_TYPE_OPT:         return ST_TYPE_VALUE; /* Cap: #opt → #val */
         case ST_TYPE_ANY:         return ST_TYPE_ANY;  /* Already at top */
         default:                   return t;
     }
