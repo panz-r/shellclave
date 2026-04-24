@@ -114,6 +114,22 @@ static void detect_features(const char* cmd, uint32_t start, uint32_t len, uint1
                             continue;
                         }
                         *features |= SHELL_FEAT_SUBSHELL;
+                        // Check for $(<file) - command substitution with stdin from file
+                        uint32_t paren_depth = 1;
+                        uint32_t j = i + 2;
+                        bool found_stdin_redirect = false;
+                        while (j < len && paren_depth > 0) {
+                            if (p[j] == '(') paren_depth++;
+                            else if (p[j] == ')') paren_depth--;
+                            else if (paren_depth == 1 && p[j] == '<') {
+                                found_stdin_redirect = true;
+                                break;
+                            }
+                            j++;
+                        }
+                        if (found_stdin_redirect) {
+                            *features |= SHELL_FEAT_SUBSHELL_FILE;
+                        }
                     } else if (next == '`') {
                         *features |= SHELL_FEAT_SUBSHELL;
                     } else if (next == '{') {
