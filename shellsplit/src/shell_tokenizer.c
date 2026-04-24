@@ -1108,4 +1108,13 @@ const char* shell_get_subcommand(
     if (out_len) *out_len = range->len;
     return cmd + range->start;
 }
-// FIXED VERSION
+
+const char* shell_error_string(shell_error_t err) {
+    switch (err) {
+        case SHELL_OK:      return "OK";
+        case SHELL_EINPUT:  return "Invalid input";
+        case SHELL_ETRUNC:  return "Truncated (limits exceeded)";
+        case SHELL_EPARSE:  return "Parse error";
+        default:            return "Unknown error";
+    }
+}

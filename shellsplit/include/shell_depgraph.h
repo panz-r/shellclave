@@ -97,6 +97,13 @@ static const shell_dep_limits_t SHELL_DEP_LIMITS_DEFAULT = {
 };
 
 /**
+ * Get human-readable error string for depgraph error code.
+ * @param err  Error code from shell_dep_error_t enum
+ * @return     Static string, never NULL
+ */
+const char* shell_dep_error_string(shell_dep_error_t err);
+
+/**
  * Fixed-size buffer for unique CWD strings.
  * CWDs are deduplicated and referenced by offset.
  * Bounded by SHELL_DEP_CWD_BUF_SIZE (16384 bytes).

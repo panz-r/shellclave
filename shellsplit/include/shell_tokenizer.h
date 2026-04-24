@@ -97,6 +97,13 @@ static const shell_limits_t SHELL_LIMITS_DEFAULT = {
 };
 
 /**
+ * Get human-readable error string for fast parser error code.
+ * @param err  Error code from shell_error_t enum
+ * @return     Static string, never NULL
+ */
+const char* shell_error_string(shell_error_t err);
+
+/**
  * Zero-copy subcommand - just indices into original command
  */
 typedef struct {

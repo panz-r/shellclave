@@ -1115,3 +1115,13 @@ shell_dep_validate_result_t shell_dep_validate(const shell_dep_graph_t *g)
 
     return r;
 }
+
+const char* shell_dep_error_string(shell_dep_error_t err) {
+    switch (err) {
+        case SHELL_DEP_OK:     return "OK";
+        case SHELL_DEP_EINPUT: return "Invalid input";
+        case SHELL_DEP_ETRUNC: return "Truncated (limits exceeded)";
+        case SHELL_DEP_EPARSE: return "Parse error";
+        default:               return "Unknown error";
+    }
+}
