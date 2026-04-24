@@ -934,39 +934,6 @@ void test_layer2_subshell_nesting(void) {
     test_has_feature("Nested backticks has SUBSHELL", &result, 0, SHELL_FEAT_SUBSHELL);
 }
 
-void test_subshell_file(void) {
-    printf("\n--- Subshell File Feature ($( < file)) ---\n");
-    
-    shell_parse_result_t result;
-    
-    // Test cases that should have SHELL_FEAT_SUBSHELL_FILE
-    const char* with_pattern[] = {
-        "$(< /etc/passwd)",
-        "$(<file.txt)",
-        "$(< file.txt)",
-        "echo $(<file.txt)",
-    };
-    
-    for (size_t i = 0; i < sizeof(with_pattern) / sizeof(with_pattern[0]); i++) {
-        extract(with_pattern[i], &result);
-        test_has_feature(with_pattern[i], &result, 0, SHELL_FEAT_SUBSHELL_FILE);
-        test_has_feature(with_pattern[i], &result, 0, SHELL_FEAT_SUBSHELL);
-    }
-    
-    // Test cases that should NOT have SHELL_FEAT_SUBSHELL_FILE
-    const char* without_pattern[] = {
-        "cat < /etc/passwd",     // redirect, not subshell
-        "$(cat /etc/passwd)",    // subshell, but no stdin redirect
-        "$(echo foo)",           // regular subshell
-        "cat <file",             // redirect, not subshell (no parens)
-    };
-    
-    for (size_t i = 0; i < sizeof(without_pattern) / sizeof(without_pattern[0]); i++) {
-        extract(without_pattern[i], &result);
-        test_no_feature(without_pattern[i], &result, 0, SHELL_FEAT_SUBSHELL_FILE);
-    }
-}
-
 /* ============================================================
  * ADDITIONAL LAYER 3 TESTS - More complex/large tests
  * ============================================================ */
@@ -1290,7 +1257,6 @@ int main() {
     
     printf("\n=== ADDITIONAL LAYER 2 TESTS ===\n");
     test_layer2_subshell_nesting();
-    test_subshell_file();
     
     printf("\n=== ADDITIONAL LAYER 3 TESTS ===\n");
     test_layer3_script_snippets();

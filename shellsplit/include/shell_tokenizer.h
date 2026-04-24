@@ -78,7 +78,6 @@ typedef enum {
     SHELL_FEAT_LOOPS        = 1 << 7,    // while, for, until loops
     SHELL_FEAT_CONDITIONALS = 1 << 8,    // if/then/elif/else/fi
     SHELL_FEAT_CASE         = 1 << 9,    // case/esac statements
-    SHELL_FEAT_SUBSHELL_FILE = 1 << 10,  // $(<file) stdin redirect subshell
 } shell_cmd_features_t;
 
 /**
