@@ -84,16 +84,24 @@ typedef enum {
     SHELL_DIR_UNDIR   = 2,
 } shell_dep_edge_dir_t;
 
+/**
+ * Limits for depgraph parsing.
+ * Set cwd_buf_size to 0 to use the default SHELL_DEP_CWD_BUF_SIZE (16384).
+ * The actual buffer in shell_dep_graph_t is always SHELL_DEP_CWD_BUF_SIZE bytes;
+ * cwd_buf_size in limits is the effective bound checked during parsing.
+ */
 typedef struct {
     uint32_t max_nodes;
     uint32_t max_edges;
     uint32_t max_tokens_per_cmd;
+    uint32_t cwd_buf_size;   /* 0 = use default SHELL_DEP_CWD_BUF_SIZE */
 } shell_dep_limits_t;
 
 static const shell_dep_limits_t SHELL_DEP_LIMITS_DEFAULT = {
     .max_nodes = SHELL_DEP_MAX_NODES,
     .max_edges = SHELL_DEP_MAX_EDGES,
     .max_tokens_per_cmd = SHELL_DEP_MAX_TOKENS,
+    .cwd_buf_size = 0  /* 0 means use default 16384 */
 };
 
 /**

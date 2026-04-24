@@ -98,7 +98,7 @@ static void cwd_normalize(char *path, uint32_t len)
     path[w] = '\0';
 }
 
-static uint32_t cwd_resolve_dedup(shell_dep_graph_t *g, uint32_t current_offset, const char *rel)
+static uint32_t cwd_resolve_dedup(shell_dep_graph_t *g, uint32_t current_offset, const char *rel, uint32_t effective_size)
 {
     if (!rel || rel[0] == '\0') return current_offset;
     if (current_offset >= g->cwd_buf.len) return current_offset;
@@ -109,7 +109,7 @@ static uint32_t cwd_resolve_dedup(shell_dep_graph_t *g, uint32_t current_offset,
     size_t rel_len = strlen(rel);
 
     if (rel[0] == '/') {
-        if (rel_len >= SHELL_DEP_CWD_BUF_SIZE) return current_offset;
+        if (rel_len >= effective_size) return current_offset;
         memcpy(temp_path, rel, rel_len);
         temp_path[rel_len] = '\0';
     } else if (strcmp(rel, "$HOME") == 0) {
@@ -121,7 +121,7 @@ static uint32_t cwd_resolve_dedup(shell_dep_graph_t *g, uint32_t current_offset,
             rel_end++;
 
         if (rel_end == 0) return current_offset;
-        if (cur_len + 1 + rel_end >= SHELL_DEP_CWD_BUF_SIZE) return current_offset;
+        if (cur_len + 1 + rel_end >= effective_size) return current_offset;
 
         memcpy(temp_path, current_cwd, cur_len);
         temp_path[cur_len] = '/';
@@ -144,7 +144,7 @@ static uint32_t cwd_resolve_dedup(shell_dep_graph_t *g, uint32_t current_offset,
         pos += existing_len + 1;
     }
 
-    if (g->cwd_buf.len + norm_len + 1 > SHELL_DEP_CWD_BUF_SIZE) {
+    if (g->cwd_buf.len + norm_len + 1 > effective_size) {
         return current_offset;
     }
 
@@ -581,6 +581,11 @@ shell_dep_error_t shell_parse_depgraph(
     if (max_edges > SHELL_DEP_MAX_EDGES) max_edges = SHELL_DEP_MAX_EDGES;
     uint32_t max_tokens = limits->max_tokens_per_cmd;
     if (max_tokens > SHELL_DEP_MAX_TOKENS) max_tokens = SHELL_DEP_MAX_TOKENS;
+    uint32_t effective_cwd_buf_size = limits->cwd_buf_size > 0
+        ? limits->cwd_buf_size
+        : SHELL_DEP_CWD_BUF_SIZE;
+    if (effective_cwd_buf_size > SHELL_DEP_CWD_BUF_SIZE)
+        effective_cwd_buf_size = SHELL_DEP_CWD_BUF_SIZE;
 
     out->node_count = 0;
     out->edge_count = 0;
@@ -609,7 +614,7 @@ shell_dep_error_t shell_parse_depgraph(
     memset(&out->cwd_buf, 0, sizeof(out->cwd_buf));
     const char *init_cwd = initial_cwd ? initial_cwd : ".";
     size_t init_len = strlen(init_cwd);
-    if (init_len >= SHELL_DEP_CWD_BUF_SIZE) init_len = SHELL_DEP_CWD_BUF_SIZE - 1;
+    if (init_len >= effective_cwd_buf_size) init_len = effective_cwd_buf_size - 1;
     memcpy(out->cwd_buf.data, init_cwd, init_len);
     out->cwd_buf.data[init_len] = '\0';
     if (strcmp(init_cwd, ".") != 0) {
@@ -685,9 +690,9 @@ shell_dep_error_t shell_parse_depgraph(
                 uint32_t alen = arg.len < 255 ? arg.len : 255;
                 memcpy(arg_buf, arg.start, alen);
                 arg_buf[alen] = '\0';
-                cwd_offset = cwd_resolve_dedup(out, cwd_offset, arg_buf);
+                cwd_offset = cwd_resolve_dedup(out, cwd_offset, arg_buf, effective_cwd_buf_size);
             } else {
-                cwd_offset = cwd_resolve_dedup(out, cwd_offset, "$HOME");
+                cwd_offset = cwd_resolve_dedup(out, cwd_offset, "$HOME", effective_cwd_buf_size);
             }
             continue;
         }
@@ -848,7 +853,7 @@ shell_dep_error_t shell_parse_depgraph(
                     );
                     if (sub_err == SHELL_DEP_OK && sub_graph.node_count > 0) {
                         uint32_t cwd_offset_shift = out->cwd_buf.len;
-                        if (out->cwd_buf.len + sub_graph.cwd_buf.len <= SHELL_DEP_CWD_BUF_SIZE) {
+                        if (out->cwd_buf.len + sub_graph.cwd_buf.len <= effective_cwd_buf_size) {
                             memcpy(out->cwd_buf.data + out->cwd_buf.len,
                                    sub_graph.cwd_buf.data, sub_graph.cwd_buf.len);
                             out->cwd_buf.len += sub_graph.cwd_buf.len;
