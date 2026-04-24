@@ -78,6 +78,7 @@ typedef enum {
     SHELL_FEAT_LOOPS        = 1 << 7,    // while, for, until loops
     SHELL_FEAT_CONDITIONALS = 1 << 8,    // if/then/elif/else/fi
     SHELL_FEAT_CASE         = 1 << 9,    // case/esac statements
+    SHELL_FEAT_SUBSHELL_FILE = 1 << 10,  // $(<file) - read from file
 } shell_cmd_features_t;
 
 /**
@@ -105,6 +106,32 @@ static const shell_limits_t SHELL_LIMITS_DEFAULT = {
     .max_depth = SHELL_MAX_DEPTH,
     .strict_mode = false
 };
+
+/**
+ * Feature flag set - alternative to bitmask shell_cmd_features_t.
+ * Provides named boolean fields for each feature.
+ * Use shell_get_feature_flags() to populate this struct.
+ */
+typedef struct {
+    bool has_vars;
+    bool has_globs;
+    bool has_subshell;
+    bool has_arith;
+    bool has_heredoc;
+    bool has_herestring;
+    bool has_process_sub;
+    bool has_loops;
+    bool has_conditionals;
+    bool has_case;
+    bool has_subshell_file;
+} shell_feature_flags_t;
+
+/**
+ * Extract feature flags from a subcommand's features bitmask.
+ * @param features  Raw features bitmask from shell_range_t.features
+ * @param flags     Output struct (caller-initialized)
+ */
+void shell_get_feature_flags(uint16_t features, shell_feature_flags_t* flags);
 
 /**
  * Get human-readable error string for fast parser error code.

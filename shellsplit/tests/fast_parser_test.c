@@ -1240,6 +1240,34 @@ static void test_fast_parser_limitations(void) {
 }
 
 /* ============================================================
+ * FEATURE FLAGS API TESTS
+ * ============================================================ */
+
+static void test_feature_flags(void) {
+    printf("\n--- Feature Flags API ---\n");
+    
+    shell_feature_flags_t flags;
+    
+    shell_get_feature_flags(SHELL_FEAT_VARS, &flags);
+    test("has_vars set", flags.has_vars == true);
+    test("has_globs clear", flags.has_globs == false);
+    test("has_subshell clear", flags.has_subshell == false);
+    
+    shell_get_feature_flags(SHELL_FEAT_VARS | SHELL_FEAT_GLOBS, &flags);
+    test("has_vars set", flags.has_vars == true);
+    test("has_globs set", flags.has_globs == true);
+    test("has_subshell clear", flags.has_subshell == false);
+    
+    shell_get_feature_flags(SHELL_FEAT_SUBSHELL_FILE, &flags);
+    test("has_subshell_file set", flags.has_subshell_file == true);
+    test("has_subshell clear (SUBSHELL_FILE doesn't set SUBSHELL)", flags.has_subshell == false);
+    
+    shell_get_feature_flags(SHELL_FEAT_NONE, &flags);
+    test("has_vars clear for NONE", flags.has_vars == false);
+    test("has_globs clear for NONE", flags.has_globs == false);
+}
+
+/* ============================================================
  * MAIN
  * ============================================================ */
 
@@ -1299,6 +1327,9 @@ int main() {
     test_layer3_stress_sequential();
     test_layer3_boundary_edge();
     test_layer3_feature_exhaustiveness();
+    
+    printf("\n=== FEATURE FLAGS API TESTS ===\n");
+    test_feature_flags();
     
     test_fast_parser_limitations();
 

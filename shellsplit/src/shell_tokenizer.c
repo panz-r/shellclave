@@ -1140,3 +1140,18 @@ const char* shell_error_string(shell_error_t err) {
         default:            return "Unknown error";
     }
 }
+
+void shell_get_feature_flags(uint16_t features, shell_feature_flags_t* flags) {
+    if (!flags) return;
+    flags->has_vars = (features & SHELL_FEAT_VARS) != 0;
+    flags->has_globs = (features & SHELL_FEAT_GLOBS) != 0;
+    flags->has_subshell = (features & SHELL_FEAT_SUBSHELL) != 0;
+    flags->has_arith = (features & SHELL_FEAT_ARITH) != 0;
+    flags->has_heredoc = (features & SHELL_FEAT_HEREDOC) != 0;
+    flags->has_herestring = (features & SHELL_FEAT_HERESTRING) != 0;
+    flags->has_process_sub = (features & SHELL_FEAT_PROCESS_SUB) != 0;
+    flags->has_loops = (features & SHELL_FEAT_LOOPS) != 0;
+    flags->has_conditionals = (features & SHELL_FEAT_CONDITIONALS) != 0;
+    flags->has_case = (features & SHELL_FEAT_CASE) != 0;
+    flags->has_subshell_file = (features & SHELL_FEAT_SUBSHELL_FILE) != 0;
+}
