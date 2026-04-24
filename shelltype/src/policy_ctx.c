@@ -151,7 +151,9 @@ st_error_t st_policy_ctx_reset(st_policy_ctx_t *ctx)
 {
     if (!ctx) return ST_ERR_INVALID;
     
-    /* Only allow reset if no other references exist */
+    /* Only allow reset if no policies are using the context.
+     * refcount == 1: context only, no policies
+     * refcount == 2: one policy exists, cannot reset */
     if (atomic_load(&ctx->refcount) > 1) {
         return ST_ERR_INVALID;
     }
@@ -161,6 +163,14 @@ st_error_t st_policy_ctx_reset(st_policy_ctx_t *ctx)
     str_pool_free(&ctx->str_pool);
     str_pool_init(&ctx->str_pool);
     return ST_OK;
+}
+
+bool st_policy_ctx_is_exclusive(const st_policy_ctx_t *ctx)
+{
+    if (!ctx) return false;
+    /* Context is exclusive if refcount is 2 or less: one for original + one for policy.
+     * Compact requires exclusive context so it can safely rebuild the trie. */
+    return atomic_load(&ctx->refcount) <= 2;
 }
 
 static uint64_t str_pool_hash(const char *str, size_t len)

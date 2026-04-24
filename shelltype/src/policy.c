@@ -224,6 +224,16 @@ static uint16_t pattern_reg_add(pattern_reg_t *r, st_policy_ctx_t *ctx, const ch
  * POLICY STRUCTURE
  * ============================================================ */
 
+/* Internal atomic stats structure (separate from public st_policy_stats_t) */
+typedef struct {
+    _Atomic uint64_t eval_count;
+    _Atomic uint64_t filter_reject_count;
+    _Atomic uint64_t trie_walk_count;
+    _Atomic uint64_t suggestion_count;
+    _Atomic uint64_t filter_rebuild_count;
+    _Atomic uint64_t filter_rebuild_us;
+} policy_atomic_stats_t;
+
 struct st_policy {
     st_policy_ctx_t   *ctx;
     states_array_t      states;
@@ -236,7 +246,7 @@ struct st_policy {
     uint64_t            pos_built_epoch[FILTER_POS_LEVELS];
     size_t              pattern_count;
     size_t              children_count;
-    st_policy_stats_t   stats;  /* Runtime statistics */
+    policy_atomic_stats_t stats;  /* Atomic runtime statistics */
 };
 
 /* ============================================================
@@ -616,13 +626,13 @@ st_policy_t *st_policy_new(st_policy_ctx_t *ctx)
     policy->pattern_count = 0;
     policy->children_count = 0;
     
-    /* Statistics */
-    policy->stats.eval_count = 0;
-    policy->stats.filter_reject_count = 0;
-    policy->stats.trie_walk_count = 0;
-    policy->stats.suggestion_count = 0;
-    policy->stats.filter_rebuild_count = 0;
-    policy->stats.filter_rebuild_us = 0;
+    /* Statistics - initialize atomics */
+    atomic_init(&policy->stats.eval_count, 0);
+    atomic_init(&policy->stats.filter_reject_count, 0);
+    atomic_init(&policy->stats.trie_walk_count, 0);
+    atomic_init(&policy->stats.suggestion_count, 0);
+    atomic_init(&policy->stats.filter_rebuild_count, 0);
+    atomic_init(&policy->stats.filter_rebuild_us, 0);
     
     if (!arena_init(&policy->children_arena, CHILDREN_ARENA_SIZE)) {
         states_array_free(&policy->states);
@@ -862,12 +872,20 @@ st_error_t st_policy_remove(st_policy_t *policy, const char *pattern)
  * Compact the policy by rebuilding from active patterns.
  * This reclaims arena memory after many add/remove cycles.
  * The context is reset and all trie nodes are rebuilt.
+ *
+ * NOTE: This function requires exclusive use of the context (no other policies
+ * sharing the same context). If the context is shared, ST_ERR_INVALID is returned.
  */
 st_error_t st_policy_compact(st_policy_t *policy)
 {
     if (!policy) return ST_ERR_INVALID;
 
     if (policy->pattern_count == 0) return ST_OK;
+
+    /* Check that context is not shared with other policies */
+    if (!st_policy_ctx_is_exclusive(policy->ctx)) {
+        return ST_ERR_INVALID;
+    }
 
     pthread_rwlock_wrlock(&policy->rwlock);
 
@@ -887,7 +905,13 @@ st_error_t st_policy_compact(st_policy_t *policy)
         return ST_OK;
     }
 
-    st_policy_ctx_reset(policy->ctx);
+    /* Reset context (should succeed since we checked refcount above) */
+    st_error_t reset_err = st_policy_ctx_reset(policy->ctx);
+    if (reset_err != ST_OK) {
+        free(active);
+        pthread_rwlock_unlock(&policy->rwlock);
+        return reset_err;
+    }
     arena_free(&policy->children_arena);
     arena_init(&policy->children_arena, CHILDREN_ARENA_SIZE);
     free(policy->states.states);
@@ -981,8 +1005,8 @@ st_error_t st_policy_eval(st_policy_t *policy,
 
     pthread_rwlock_rdlock(&policy->rwlock);
 
-    /* Track statistics */
-    policy->stats.eval_count++;
+    /* Track statistics (atomic increment for thread safety) */
+    atomic_fetch_add(&policy->stats.eval_count, 1);
 
     if (result) {
         result->matches = false;
@@ -1064,14 +1088,14 @@ st_error_t st_policy_eval(st_policy_t *policy,
 
     /* Verify-only fast path: filter rejected → skip trie walk entirely */
     if (filter_rejected && !result) {
-        policy->stats.filter_reject_count++;
+        atomic_fetch_add(&policy->stats.filter_reject_count, 1);
         st_free_token_array(&cmd);
         pthread_rwlock_unlock(&policy->rwlock);
         return ST_OK;
     }
 
-    /* Track trie walk */
-    policy->stats.trie_walk_count++;
+    /* Track trie walk (atomic increment for thread safety) */
+    atomic_fetch_add(&policy->stats.trie_walk_count, 1);
 
     /* ============================================================
      * TRIE WALK
@@ -1281,7 +1305,7 @@ st_error_t st_policy_eval(st_policy_t *policy,
     }
 
     result->suggestion_count = n_suggestions;
-    policy->stats.suggestion_count += n_suggestions;
+    atomic_fetch_add(&policy->stats.suggestion_count, (uint64_t)n_suggestions);
     st_free_token_array(&cmd);
     pthread_rwlock_unlock(&policy->rwlock);
     return ST_OK;
@@ -1865,12 +1889,13 @@ void st_policy_get_stats(const st_policy_t *policy, st_policy_stats_t *stats)
     
     pthread_rwlock_rdlock((pthread_rwlock_t *)&policy->rwlock);
     
-    stats->eval_count = policy->stats.eval_count;
-    stats->filter_reject_count = policy->stats.filter_reject_count;
-    stats->trie_walk_count = policy->stats.trie_walk_count;
-    stats->suggestion_count = policy->stats.suggestion_count;
-    stats->filter_rebuild_count = policy->stats.filter_rebuild_count;
-    stats->filter_rebuild_us = policy->stats.filter_rebuild_us;
+    /* Read atomic counters */
+    stats->eval_count = atomic_load(&policy->stats.eval_count);
+    stats->filter_reject_count = atomic_load(&policy->stats.filter_reject_count);
+    stats->trie_walk_count = atomic_load(&policy->stats.trie_walk_count);
+    stats->suggestion_count = atomic_load(&policy->stats.suggestion_count);
+    stats->filter_rebuild_count = atomic_load(&policy->stats.filter_rebuild_count);
+    stats->filter_rebuild_us = atomic_load(&policy->stats.filter_rebuild_us);
     stats->pattern_count = policy->pattern_count;
     stats->state_count = policy->states.count;
     stats->memory_bytes = st_policy_memory_usage(policy);

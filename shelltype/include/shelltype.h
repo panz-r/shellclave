@@ -321,6 +321,14 @@ void st_policy_ctx_release(st_policy_ctx_t *ctx);
 st_error_t st_policy_ctx_reset(st_policy_ctx_t *ctx);
 const char *st_policy_ctx_intern(st_policy_ctx_t *ctx, const char *str);
 
+/* --- Context introspection (internal use) --- */
+
+/**
+ * Check if context is exclusively owned (refcount == 1).
+ * Used by st_policy_compact to verify safe context reset.
+ */
+bool st_policy_ctx_is_exclusive(const st_policy_ctx_t *ctx);
+
 /* --- Policy lifecycle --- */
 
 st_policy_t *st_policy_new(st_policy_ctx_t *ctx);
