@@ -1,3 +1,4 @@
+#define _POSIX_C_SOURCE 200809L
 #include "shell_abstract.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -342,6 +343,68 @@ void test_expansion() {
     }
 }
 
+void test_tilde_expansion(void) {
+    printf("\n=== Tilde Expansion Tests ===\n");
+
+    char* env_with_home[] = {
+        "HOME=/home/testuser",
+        "PATH=/usr/bin:/bin",
+        NULL
+    };
+
+    abstracted_command_t* cmd = NULL;
+    bool ok = shell_abstract_command("ls ~/documents", &cmd);
+    TEST("Abstract command with tilde", ok && cmd != NULL);
+
+    if (cmd) {
+        size_t count = 0;
+        abstract_element_t** elems = shell_get_elements(cmd, &count);
+        bool found_hp = false;
+        for (size_t i = 0; i < count; i++) {
+            if (elems[i]->type == ABSTRACT_HP) {
+                found_hp = true;
+                runtime_context_t ctx = {
+                    .env = env_with_home,
+                    .cwd = "/home/testuser",
+                    .resolve_symlinks = false
+                };
+                char* expanded = shell_expand_element(elems[i], &ctx);
+                TEST("Tilde expanded", expanded != NULL);
+                if (expanded) {
+                    TEST("Tilde expanded correctly",
+                         strcmp(expanded, "/home/testuser/documents") == 0);
+                    free(expanded);
+                }
+            }
+        }
+        TEST("Found ABSTRACT_HP element", found_hp);
+        shell_abstracted_destroy(cmd);
+    }
+
+    char* env_with_root[] = {
+        "HOME=/root",
+        "PATH=/usr/bin:/bin",
+        NULL
+    };
+    ok = shell_abstract_command("ls ~", &cmd);
+    TEST("Abstract bare tilde", ok && cmd != NULL);
+    if (cmd) {
+        abstract_element_t* elem = shell_get_element_by_abstract(cmd, "$HP_1");
+        if (elem) {
+            runtime_context_t ctx = {
+                .env = env_with_root,
+                .cwd = "/root",
+                .resolve_symlinks = false
+            };
+            char* expanded = shell_expand_element(elem, &ctx);
+            TEST("Bare tilde expanded to /root",
+                 expanded && strcmp(expanded, "/root") == 0);
+            if (expanded) free(expanded);
+        }
+        shell_abstracted_destroy(cmd);
+    }
+}
+
 void test_edge_cases() {
     printf("\n=== Edge Case Tests ===\n");
     
@@ -522,6 +585,7 @@ int main(void) {
     test_path_categorization();
     test_name_functions();
     test_expansion();
+    test_tilde_expansion();
     test_edge_cases();
     test_dfa_patterns();
     
