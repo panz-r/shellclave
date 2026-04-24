@@ -92,7 +92,7 @@ typedef struct {
     uint16_t       literal_count;
     uint16_t       wildcard_count;
     uint16_t       pattern_id;
-    uint16_t       wildcard_mask;
+    uint32_t       wildcard_mask;
     uint16_t       children_alloc;   /* Slots allocated from arena */
 } policy_state_t;
 
@@ -243,7 +243,7 @@ struct st_policy {
     pthread_rwlock_t   rwlock;
     arena_t             children_arena;  /* Dedicated arena for all children arrays */
     vacuum_filter_t    *pos_filters[FILTER_POS_LEVELS];
-    uint16_t            pos_wildcard_mask[FILTER_POS_LEVELS];
+    uint32_t             pos_wildcard_mask[FILTER_POS_LEVELS];
     uint64_t            pos_built_epoch[FILTER_POS_LEVELS];
     size_t              pattern_count;
     size_t              children_count;
@@ -254,7 +254,7 @@ struct st_policy {
  * COMPATIBILITY MASK
  * ============================================================ */
 
-static const uint16_t st_compat_mask[ST_TYPE_COUNT] = {
+static const uint32_t st_compat_mask[ST_TYPE_COUNT] = {
     /* LITERAL */      (1u << ST_TYPE_LITERAL) | (1u << ST_TYPE_ANY),
     /* HEXHASH */      (1u << ST_TYPE_HEXHASH) | (1u << ST_TYPE_NUMBER) | (1u << ST_TYPE_VALUE) | (1u << ST_TYPE_ANY),
     /* NUMBER */       (1u << ST_TYPE_NUMBER) | (1u << ST_TYPE_VALUE) | (1u << ST_TYPE_ANY),
@@ -269,10 +269,16 @@ static const uint16_t st_compat_mask[ST_TYPE_COUNT] = {
     /* URL */          (1u << ST_TYPE_URL) | (1u << ST_TYPE_ANY),
     /* VALUE */        (1u << ST_TYPE_VALUE) | (1u << ST_TYPE_ANY),
     /* OPT */          (1u << ST_TYPE_OPT) | (1u << ST_TYPE_VALUE) | (1u << ST_TYPE_ANY),
+    /* UUID */         (1u << ST_TYPE_UUID) | (1u << ST_TYPE_VALUE) | (1u << ST_TYPE_ANY),
+    /* EMAIL */        (1u << ST_TYPE_EMAIL) | (1u << ST_TYPE_VALUE) | (1u << ST_TYPE_ANY),
+    /* HOSTNAME */     (1u << ST_TYPE_HOSTNAME) | (1u << ST_TYPE_VALUE) | (1u << ST_TYPE_ANY),
+    /* PORT */         (1u << ST_TYPE_PORT) | (1u << ST_TYPE_NUMBER) | (1u << ST_TYPE_VALUE) | (1u << ST_TYPE_ANY),
+    /* SIZE */         (1u << ST_TYPE_SIZE) | (1u << ST_TYPE_VALUE) | (1u << ST_TYPE_ANY),
+    /* SEMVER */       (1u << ST_TYPE_SEMVER) | (1u << ST_TYPE_VALUE) | (1u << ST_TYPE_ANY),
     /* ANY */          (1u << ST_TYPE_ANY),
 };
 
-static inline uint16_t compat_mask(st_token_type_t t)
+static inline uint32_t compat_mask(st_token_type_t t)
 {
     return st_compat_mask[t];
 }
@@ -1225,7 +1231,7 @@ st_error_t st_policy_eval(st_policy_t *policy,
             found = find_literal_child(node, arena_base, ctext);
 
         if (!found) {
-            uint16_t compat = compat_mask(ctype) & node->wildcard_mask;
+            uint32_t compat = compat_mask(ctype) & node->wildcard_mask;
             if (compat)
                 found = find_wildcard_child(node, arena_base, ctype);
         }
@@ -1301,11 +1307,11 @@ st_error_t st_policy_eval(st_policy_t *policy,
         st_token_type_t div_type = cmd.tokens[match_depth].type;
         policy_state_t *div_node = &policy->states.states[match_state];
 
-        uint16_t wm = div_node->wildcard_mask;
+        uint32_t wm = div_node->wildcard_mask;
         if (wm != 0 && (compat_mask(div_type) & wm) != 0) {
             /* Wildcard widening: find narrowest compatible wildcard */
             st_token_type_t best_wild = ST_TYPE_ANY;
-            uint16_t compat = compat_mask(div_type) & wm;
+            uint32_t compat = compat_mask(div_type) & wm;
             while (compat) {
                 int t = __builtin_ctz(compat);
                 compat &= ~(1u << t);
@@ -1500,7 +1506,7 @@ st_error_t st_policy_verify_all(const st_policy_t *policy,
             }
         }
 
-        uint16_t compat = compat_mask(ctype) & state->wildcard_mask;
+        uint32_t compat = compat_mask(ctype) & state->wildcard_mask;
         while (compat) {
             int t = __builtin_ctz(compat);
             compat &= ~(1u << t);
@@ -2123,6 +2129,8 @@ st_error_t st_policy_simulate_add(const st_policy_t *policy,
  *   #u → #w (cap)
  *   #val → #val (cap)
  *   #opt → #val → * (cap)
+ *   #uuid, #email, #host, #size, #semver → #val → * (cap)
+ *   #port → #n → #val → * (cap)
  */
 static st_token_type_t next_wider_type(st_token_type_t t)
 {
@@ -2140,6 +2148,12 @@ static st_token_type_t next_wider_type(st_token_type_t t)
         case ST_TYPE_URL:         return ST_TYPE_WORD; /* Cap: #u → #w */
         case ST_TYPE_VALUE:       return ST_TYPE_VALUE; /* Cap: #val stays as #val */
         case ST_TYPE_OPT:         return ST_TYPE_VALUE; /* Cap: #opt → #val */
+        case ST_TYPE_UUID:        return ST_TYPE_VALUE; /* Cap: #uuid → #val */
+        case ST_TYPE_EMAIL:       return ST_TYPE_VALUE; /* Cap: #email → #val */
+        case ST_TYPE_HOSTNAME:     return ST_TYPE_VALUE; /* Cap: #host → #val */
+        case ST_TYPE_PORT:        return ST_TYPE_NUMBER; /* Cap: #port → #n */
+        case ST_TYPE_SIZE:        return ST_TYPE_VALUE; /* Cap: #size → #val */
+        case ST_TYPE_SEMVER:      return ST_TYPE_VALUE; /* Cap: #semver → #val */
         case ST_TYPE_ANY:         return ST_TYPE_ANY;  /* Already at top */
         default:                   return t;
     }

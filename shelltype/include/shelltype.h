@@ -73,6 +73,12 @@ typedef enum {
     ST_TYPE_URL,           /* #u: protocol://... */
     ST_TYPE_VALUE,         /* #val: any scalar (#n ∨ #i ∨ #w ∨ #q ∨ #qs) */
     ST_TYPE_OPT,           /* #opt: command-line option (-v, --help, -o file) */
+    ST_TYPE_UUID,          /* #uuid: UUID format (8-4-4-4-12 hex) */
+    ST_TYPE_EMAIL,         /* #email: user@domain format */
+    ST_TYPE_HOSTNAME,      /* #host: hostname or domain name */
+    ST_TYPE_PORT,          /* #port: port number (1-65535) */
+    ST_TYPE_SIZE,          /* #size: size with suffix (10M, 2GiB) */
+    ST_TYPE_SEMVER,        /* #semver: semantic version (1.2.3-alpha) */
     ST_TYPE_ANY,           /* *: everything (top element) */
     ST_TYPE_COUNT          /* number of types */
 } st_token_type_t;

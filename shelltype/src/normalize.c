@@ -36,6 +36,12 @@ const char *st_type_symbol[ST_TYPE_COUNT] = {
     [ST_TYPE_URL]           = "#u",
     [ST_TYPE_VALUE]         = "#val",
     [ST_TYPE_OPT]           = "#opt",
+    [ST_TYPE_UUID]          = "#uuid",
+    [ST_TYPE_EMAIL]         = "#email",
+    [ST_TYPE_HOSTNAME]      = "#host",
+    [ST_TYPE_PORT]          = "#port",
+    [ST_TYPE_SIZE]          = "#size",
+    [ST_TYPE_SEMVER]        = "#semver",
     [ST_TYPE_ANY]           = "*",
 };
 
@@ -53,84 +59,73 @@ const char *st_type_symbol[ST_TYPE_COUNT] = {
  *   #p ⊂ #path ⊂ *
  *   #u ⊂ *
  *   #opt ⊂ #val ⊂ *
+ *   #uuid, #email, #host, #size, #semver ⊂ #val ⊂ *
+ *   #port ⊂ #n, #port ⊂ #i, #port ⊂ #val ⊂ *
  * ============================================================ */
 
 const st_token_type_t st_type_join[ST_TYPE_COUNT][ST_TYPE_COUNT] = {
-    /* LITERAL */
-    { ST_TYPE_LITERAL, ST_TYPE_HEXHASH, ST_TYPE_NUMBER, ST_TYPE_IPV4,
-      ST_TYPE_WORD, ST_TYPE_QUOTED, ST_TYPE_QUOTED_SPACE, ST_TYPE_FILENAME,
-      ST_TYPE_REL_PATH, ST_TYPE_ABS_PATH, ST_TYPE_PATH, ST_TYPE_ANY,
-      ST_TYPE_VALUE, ST_TYPE_ANY, ST_TYPE_ANY },
-    /* HEXHASH */
-    { ST_TYPE_HEXHASH, ST_TYPE_HEXHASH, ST_TYPE_NUMBER, ST_TYPE_VALUE,
-      ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE,
-      ST_TYPE_ANY,   ST_TYPE_ANY,   ST_TYPE_ANY,  ST_TYPE_ANY,
-      ST_TYPE_VALUE, ST_TYPE_ANY, ST_TYPE_ANY },
-    /* NUMBER */
-    { ST_TYPE_NUMBER, ST_TYPE_NUMBER, ST_TYPE_NUMBER, ST_TYPE_VALUE,
-      ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE,
-      ST_TYPE_ANY,   ST_TYPE_ANY,   ST_TYPE_ANY,  ST_TYPE_ANY,
-      ST_TYPE_VALUE, ST_TYPE_ANY, ST_TYPE_ANY },
-    /* IPV4 */
-    { ST_TYPE_IPV4, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_IPV4,
-      ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE,
-      ST_TYPE_ANY,  ST_TYPE_ANY,  ST_TYPE_ANY,  ST_TYPE_ANY,
-      ST_TYPE_VALUE, ST_TYPE_ANY, ST_TYPE_ANY },
-    /* WORD */
-    { ST_TYPE_WORD, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE,
-      ST_TYPE_WORD, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE,
-      ST_TYPE_ANY,  ST_TYPE_ANY,  ST_TYPE_ANY,  ST_TYPE_ANY,
-      ST_TYPE_VALUE, ST_TYPE_ANY, ST_TYPE_ANY },
-    /* QUOTED */
-    { ST_TYPE_QUOTED, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE,
-      ST_TYPE_VALUE, ST_TYPE_QUOTED, ST_TYPE_QUOTED_SPACE, ST_TYPE_VALUE,
-      ST_TYPE_ANY,  ST_TYPE_ANY,  ST_TYPE_ANY,  ST_TYPE_ANY,
-      ST_TYPE_VALUE, ST_TYPE_ANY, ST_TYPE_ANY },
-    /* QUOTED_SPACE */
-    { ST_TYPE_QUOTED_SPACE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE,
-      ST_TYPE_VALUE, ST_TYPE_QUOTED_SPACE, ST_TYPE_QUOTED_SPACE, ST_TYPE_VALUE,
-      ST_TYPE_ANY,  ST_TYPE_ANY,  ST_TYPE_ANY,  ST_TYPE_ANY,
-      ST_TYPE_VALUE, ST_TYPE_ANY, ST_TYPE_ANY },
-    /* FILENAME */
-    { ST_TYPE_FILENAME, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE,
-      ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_FILENAME,
-      ST_TYPE_REL_PATH, ST_TYPE_PATH, ST_TYPE_PATH, ST_TYPE_ANY,
-      ST_TYPE_VALUE, ST_TYPE_ANY, ST_TYPE_ANY },
-    /* REL_PATH */
-    { ST_TYPE_REL_PATH, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY,
-      ST_TYPE_ANY,  ST_TYPE_ANY,  ST_TYPE_ANY,  ST_TYPE_REL_PATH,
-      ST_TYPE_REL_PATH, ST_TYPE_PATH, ST_TYPE_PATH, ST_TYPE_ANY,
-      ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY },
-    /* ABS_PATH */
-    { ST_TYPE_ABS_PATH, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY,
-      ST_TYPE_ANY,  ST_TYPE_ANY,  ST_TYPE_ANY,  ST_TYPE_PATH,
-      ST_TYPE_PATH, ST_TYPE_ABS_PATH, ST_TYPE_PATH, ST_TYPE_ANY,
-      ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY },
-    /* PATH */
-    { ST_TYPE_PATH, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY,
-      ST_TYPE_ANY,  ST_TYPE_ANY,  ST_TYPE_ANY,  ST_TYPE_PATH,
-      ST_TYPE_PATH, ST_TYPE_PATH, ST_TYPE_PATH, ST_TYPE_ANY,
-      ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY },
-    /* URL */
-    { ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY,
-      ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY,
-      ST_TYPE_ANY,  ST_TYPE_ANY,  ST_TYPE_ANY,  ST_TYPE_URL,
-      ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY },
-    /* VALUE */
-    { ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE,
-      ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE,
-      ST_TYPE_ANY,  ST_TYPE_ANY,  ST_TYPE_ANY,  ST_TYPE_ANY,
-      ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_ANY },
-    /* OPT */
-    { ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY,
-      ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY,
-      ST_TYPE_ANY,  ST_TYPE_ANY,  ST_TYPE_ANY,  ST_TYPE_ANY,
-      ST_TYPE_VALUE, ST_TYPE_OPT, ST_TYPE_ANY },
-    /* ANY */
-    { ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY,
-      ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY,
-      ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY,
-      ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY },
+    /* ST_TYPE_LITERAL */
+    { ST_TYPE_LITERAL, ST_TYPE_HEXHASH, ST_TYPE_NUMBER, ST_TYPE_IPV4, ST_TYPE_WORD, ST_TYPE_QUOTED, ST_TYPE_QUOTED_SPACE, ST_TYPE_FILENAME, ST_TYPE_REL_PATH, ST_TYPE_ABS_PATH, ST_TYPE_PATH, ST_TYPE_URL, ST_TYPE_VALUE, ST_TYPE_OPT, ST_TYPE_UUID, ST_TYPE_EMAIL, ST_TYPE_HOSTNAME, ST_TYPE_PORT, ST_TYPE_SIZE, ST_TYPE_SEMVER, ST_TYPE_ANY },
+
+    /* ST_TYPE_HEXHASH */
+    { ST_TYPE_HEXHASH, ST_TYPE_HEXHASH, ST_TYPE_NUMBER, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_ANY },
+
+    /* ST_TYPE_NUMBER */
+    { ST_TYPE_NUMBER, ST_TYPE_NUMBER, ST_TYPE_NUMBER, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_ANY },
+
+    /* ST_TYPE_IPV4 */
+    { ST_TYPE_IPV4, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_IPV4, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_ANY },
+
+    /* ST_TYPE_WORD */
+    { ST_TYPE_WORD, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_WORD, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_ANY },
+
+    /* ST_TYPE_QUOTED */
+    { ST_TYPE_QUOTED, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_QUOTED, ST_TYPE_QUOTED_SPACE, ST_TYPE_VALUE, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_ANY },
+
+    /* ST_TYPE_QUOTED_SPACE */
+    { ST_TYPE_QUOTED_SPACE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_QUOTED_SPACE, ST_TYPE_QUOTED_SPACE, ST_TYPE_VALUE, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_ANY },
+
+    /* ST_TYPE_FILENAME */
+    { ST_TYPE_FILENAME, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_FILENAME, ST_TYPE_REL_PATH, ST_TYPE_PATH, ST_TYPE_PATH, ST_TYPE_ANY, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_ANY },
+
+    /* ST_TYPE_REL_PATH */
+    { ST_TYPE_REL_PATH, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_REL_PATH, ST_TYPE_REL_PATH, ST_TYPE_PATH, ST_TYPE_PATH, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY },
+
+    /* ST_TYPE_ABS_PATH */
+    { ST_TYPE_ABS_PATH, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_PATH, ST_TYPE_PATH, ST_TYPE_ABS_PATH, ST_TYPE_PATH, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY },
+
+    /* ST_TYPE_PATH */
+    { ST_TYPE_PATH, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_PATH, ST_TYPE_PATH, ST_TYPE_PATH, ST_TYPE_PATH, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY },
+
+    /* ST_TYPE_URL */
+    { ST_TYPE_URL, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_URL, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY },
+
+    /* ST_TYPE_VALUE */
+    { ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_ANY },
+
+    /* ST_TYPE_OPT */
+    { ST_TYPE_OPT, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_VALUE, ST_TYPE_OPT, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_ANY },
+
+    /* ST_TYPE_UUID */
+    { ST_TYPE_UUID, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_UUID, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_ANY },
+
+    /* ST_TYPE_EMAIL */
+    { ST_TYPE_EMAIL, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_EMAIL, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_ANY },
+
+    /* ST_TYPE_HOSTNAME */
+    { ST_TYPE_HOSTNAME, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_HOSTNAME, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_ANY },
+
+    /* ST_TYPE_PORT */
+    { ST_TYPE_PORT, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_PORT, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_ANY },
+
+    /* ST_TYPE_SIZE */
+    { ST_TYPE_SIZE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_SIZE, ST_TYPE_VALUE, ST_TYPE_ANY },
+
+    /* ST_TYPE_SEMVER */
+    { ST_TYPE_SEMVER, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_SEMVER, ST_TYPE_ANY },
+
+    /* ST_TYPE_ANY */
+    { ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY },
 };
 
 /* ============================================================
@@ -144,36 +139,68 @@ const st_token_type_t st_type_join[ST_TYPE_COUNT][ST_TYPE_COUNT] = {
 
 /* We define it explicitly for clarity: */
 const bool st_type_compatible[ST_TYPE_COUNT][ST_TYPE_COUNT] = {
-    /* LITERAL matches only LITERAL and ANY */
-    { true,  false, false, false, false, false, false, false, false, false, false, false, false, false, true  },
-    /* #h matches #h, #n, #val, * */
-    { false, true,  true,  false, false, false, false, false, false, false, false, false, true,  false, true  },
-    /* #n matches #n, #val, * */
-    { false, false, true,  false, false, false, false, false, false, false, false, false, true,  false, true  },
-    /* #i matches #i, #val, * */
-    { false, false, false, true,  false, false, false, false, false, false, false, false, true,  false, true  },
-    /* #w matches #w, #val, * */
-    { false, false, false, false, true,  false, false, false, false, false, false, false, true,  false, true  },
-    /* #q matches #q, #qs, #val, * */
-    { false, false, false, false, false, true,  true,  false, false, false, false, false, true,  false, true  },
-    /* #qs matches #qs, #val, * */
-    { false, false, false, false, false, false, true,  false, false, false, false, false, true,  false, true  },
-    /* #f matches #f, #r, #path, * */
-    { false, false, false, false, false, false, false, true,  true,  false, true,  false, false, false, true  },
-    /* #r matches #r, #path, * */
-    { false, false, false, false, false, false, false, false, true,  false, true,  false, false, false, true  },
-    /* #p matches #p, #path, * */
-    { false, false, false, false, false, false, false, false, false, true,  true,  false, false, false, true  },
-    /* #path matches #path, * */
-    { false, false, false, false, false, false, false, false, false, false, true,  false, false, false, true  },
-    /* #u matches #u, * */
-    { false, false, false, false, false, false, false, false, false, false, false, true,  false, false, true  },
-    /* #val matches #val, * */
-    { false, false, false, false, false, false, false, false, false, false, false, false, true,  false, true  },
-    /* #opt matches #opt, #val, * */
-    { false, false, false, false, false, false, false, false, false, false, false, false, true,  true,  true  },
-    /* * matches * */
-    { false, false, false, false, false, false, false, false, false, false, false, false, false, false, true  },
+    /* ST_TYPE_LITERAL matches only LITERAL and ANY */
+    { true, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, true },
+
+    /* ST_TYPE_HEXHASH matches #h, #n, #val, * */
+    { false, true, true, false, false, false, false, false, false, false, false, false, true, false, false, false, false, false, false, false, true },
+
+    /* ST_TYPE_NUMBER matches #n, #val, * */
+    { false, false, true, false, false, false, false, false, false, false, false, false, true, false, false, false, false, false, false, false, true },
+
+    /* ST_TYPE_IPV4 matches #i, #val, * */
+    { false, false, false, true, false, false, false, false, false, false, false, false, true, false, false, false, false, false, false, false, true },
+
+    /* ST_TYPE_WORD matches #w, #val, * */
+    { false, false, false, false, true, false, false, false, false, false, false, false, true, false, false, false, false, false, false, false, true },
+
+    /* ST_TYPE_QUOTED matches #q, #qs, #val, * */
+    { false, false, false, false, false, true, true, false, false, false, false, false, true, false, false, false, false, false, false, false, true },
+
+    /* ST_TYPE_QUOTED_SPACE matches #qs, #val, * */
+    { false, false, false, false, false, false, true, false, false, false, false, false, true, false, false, false, false, false, false, false, true },
+
+    /* ST_TYPE_FILENAME matches #f, #r, #path, * */
+    { false, false, false, false, false, false, false, true, true, false, true, false, true, false, false, false, false, false, false, false, true },
+
+    /* ST_TYPE_REL_PATH matches #r, #path, * */
+    { false, false, false, false, false, false, false, false, true, false, true, false, false, false, false, false, false, false, false, false, true },
+
+    /* ST_TYPE_ABS_PATH matches #p, #path, * */
+    { false, false, false, false, false, false, false, false, false, true, true, false, false, false, false, false, false, false, false, false, true },
+
+    /* ST_TYPE_PATH matches #path, * */
+    { false, false, false, false, false, false, false, false, false, false, true, false, false, false, false, false, false, false, false, false, true },
+
+    /* ST_TYPE_URL matches #u, * */
+    { false, false, false, false, false, false, false, false, false, false, false, true, false, false, false, false, false, false, false, false, true },
+
+    /* ST_TYPE_VALUE matches #val, * */
+    { false, false, false, false, false, false, false, false, false, false, false, false, true, false, false, false, false, false, false, false, true },
+
+    /* ST_TYPE_OPT matches #opt, #val, * */
+    { false, false, false, false, false, false, false, false, false, false, false, false, true, true, false, false, false, false, false, false, true },
+
+    /* ST_TYPE_UUID matches #uuid, #val, * */
+    { false, false, false, false, false, false, false, false, false, false, false, false, true, false, true, false, false, false, false, false, true },
+
+    /* ST_TYPE_EMAIL matches #email, #val, * */
+    { false, false, false, false, false, false, false, false, false, false, false, false, true, false, false, true, false, false, false, false, true },
+
+    /* ST_TYPE_HOSTNAME matches #host, #val, * */
+    { false, false, false, false, false, false, false, false, false, false, false, false, true, false, false, false, true, false, false, false, true },
+
+    /* ST_TYPE_PORT matches #port, #val, * */
+    { false, false, false, false, false, false, false, false, false, false, false, false, true, false, false, false, false, true, false, false, true },
+
+    /* ST_TYPE_SIZE matches #size, #val, * */
+    { false, false, false, false, false, false, false, false, false, false, false, false, true, false, false, false, false, false, true, false, true },
+
+    /* ST_TYPE_SEMVER matches #semver, #val, * */
+    { false, false, false, false, false, false, false, false, false, false, false, false, true, false, false, false, false, false, false, true, true },
+
+    /* ST_TYPE_ANY matches only * */
+    { false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, true },
 };
 
 /* ============================================================
@@ -294,6 +321,195 @@ static bool is_option_token(const char *token)
     return false;
 }
 
+static bool is_uuid(const char *token)
+{
+    /* UUID format: 8-4-4-4-12 hex digits (e.g., 550e8400-e29b-41d4-a716-446655440000) */
+    size_t len = strlen(token);
+    if (len != 36) return false;
+
+    static const int segments[] = {8, 4, 4, 4, 12};
+    int pos = 0;
+
+    for (int i = 0; i < 5; i++) {
+        for (int j = 0; j < segments[i]; j++) {
+            char c = token[pos++];
+            if (!isxdigit((unsigned char)c)) return false;
+        }
+        if (i < 4) {
+            if (token[pos++] != '-') return false;
+        }
+    }
+    return token[pos] == '\0';
+}
+
+static bool is_email(const char *token)
+{
+    /* Email format: user@domain */
+    const char *at = strchr(token, '@');
+    if (!at) return false;
+    if (at == token) return false;
+    if (at[1] == '\0') return false;
+
+    /* Check user part */
+    for (const char *p = token; p < at; p++) {
+        char c = *p;
+        if (isalnum((unsigned char)c) || c == '.' || c == '_' || c == '-' || c == '+') continue;
+        return false;
+    }
+
+    /* Check domain part */
+    const char *domain = at + 1;
+    if (strchr(domain, '.') == NULL) return false;
+    for (const char *p = domain; *p; p++) {
+        char c = *p;
+        if (isalnum((unsigned char)c) || c == '.' || c == '-') continue;
+        return false;
+    }
+    return true;
+}
+
+static bool is_hostname(const char *token)
+{
+    /* Hostname/domain: alphanumeric with hyphens and dots, starts and ends with alphanumeric, contains hyphen */
+    size_t len = strlen(token);
+    if (len == 0) return false;
+    if (token[0] == '-' || token[len-1] == '-') return false;
+    if (!isalnum((unsigned char)token[0]) || !isalnum((unsigned char)token[len-1])) return false;
+
+    bool has_hyphen = false;
+    bool has_dot = false;
+    for (size_t i = 0; i < len; i++) {
+        char c = token[i];
+        if (c == '-') {
+            has_hyphen = true;
+            if (i > 0 && token[i-1] == '-') return false;
+        } else if (c == '.') {
+            has_dot = true;
+            if (i > 0 && token[i-1] == '.') return false;
+        } else if (!isalnum((unsigned char)c)) {
+            return false;
+        }
+    }
+    return has_hyphen && has_dot;
+}
+
+static bool is_port(const char *token)
+{
+    /* Port: positive integer in range 1-65535 */
+    if (!is_decimal_number(token)) return false;
+    if (token[0] == '-') return false;
+
+    long port = 0;
+    for (const char *p = token; *p; p++) {
+        port = port * 10 + (*p - '0');
+        if (port > 65535) return false;
+    }
+    return port >= 1 && port <= 65535;
+}
+
+static bool is_size(const char *token)
+{
+    /* Size: number followed by suffix (K, M, G, T, Ki, Mi, Gi, Ti, KB, MB, GB, TB, bytes, b) */
+    size_t len = strlen(token);
+    if (len < 2) return false;
+
+    size_t num_end = 0;
+    while (num_end < len && (isdigit((unsigned char)token[num_end]) || token[num_end] == '.')) {
+        num_end++;
+    }
+    if (num_end == 0) return false;
+
+    bool has_digit = false;
+    for (size_t i = 0; i < num_end; i++) {
+        if (isdigit((unsigned char)token[i])) {
+            has_digit = true;
+            break;
+        }
+    }
+    if (!has_digit) return false;
+
+    if (num_end == len) return false;
+
+    const char *suffix = token + num_end;
+
+    if (strcmp(suffix, "Ki") == 0 || strcmp(suffix, "Mi") == 0 ||
+        strcmp(suffix, "Gi") == 0 || strcmp(suffix, "Ti") == 0) {
+        return true;
+    }
+
+    if (strcmp(suffix, "K") == 0 || strcmp(suffix, "M") == 0 ||
+        strcmp(suffix, "G") == 0 || strcmp(suffix, "T") == 0) {
+        return true;
+    }
+
+    if (strcmp(suffix, "KB") == 0 || strcmp(suffix, "MB") == 0 ||
+        strcmp(suffix, "GB") == 0 || strcmp(suffix, "TB") == 0 ||
+        strcmp(suffix, "bytes") == 0 || strcmp(suffix, "b") == 0) {
+        return true;
+    }
+
+    if (strcmp(suffix, "KiB") == 0 || strcmp(suffix, "MiB") == 0 ||
+        strcmp(suffix, "GiB") == 0 || strcmp(suffix, "TiB") == 0) {
+        return true;
+    }
+
+    if (strcmp(suffix, "B") == 0) {
+        return true;
+    }
+
+    return false;
+}
+
+static bool is_semver(const char *token)
+{
+    /* Semantic version: major.minor.patch[-prerelease][+build] */
+    size_t len = strlen(token);
+    if (len < 3) return false;
+
+    const char *p = token;
+    if (!isdigit((unsigned char)*p)) return false;
+
+    while (*p && isdigit((unsigned char)*p)) p++;
+    if (*p != '.') return false;
+    p++;
+
+    if (!isdigit((unsigned char)*p)) return false;
+    while (*p && isdigit((unsigned char)*p)) p++;
+    if (*p != '.') return false;
+    p++;
+
+    if (!isdigit((unsigned char)*p)) return false;
+    while (*p && isdigit((unsigned char)*p)) p++;
+
+    if (*p == '-') {
+        p++;
+        if (!*p) return false;
+        while (*p && *p != '+') {
+            if (isalnum((unsigned char)*p) || *p == '.') {
+                p++;
+            } else if (*p == '-') {
+                return false;
+            } else {
+                return false;
+            }
+        }
+    }
+
+    if (*p == '+') {
+        p++;
+        if (!*p) return false;
+        while (*p) {
+            if (isalnum((unsigned char)*p) || *p == '.') {
+                p++;
+            } else {
+                return false;
+            }
+        }
+    }
+
+    return *p == '\0';
+}
+
 /* ============================================================
  * PUBLIC: CLASSIFY
  * ============================================================ */
@@ -314,8 +530,26 @@ st_token_type_t st_classify_token(const char *token)
     /* Hex number (0x...) - check before hex hash which requires alpha */
     if (is_hex_number(token)) return ST_TYPE_NUMBER;
 
+    /* UUID */
+    if (is_uuid(token)) return ST_TYPE_UUID;
+
+    /* Email */
+    if (is_email(token)) return ST_TYPE_EMAIL;
+
+    /* Hostname */
+    if (is_hostname(token)) return ST_TYPE_HOSTNAME;
+
+    /* Size */
+    if (is_size(token)) return ST_TYPE_SIZE;
+
+    /* Semantic version */
+    if (is_semver(token)) return ST_TYPE_SEMVER;
+
     /* Decimal number - check before hex hash which requires alpha */
     if (is_decimal_number(token)) return ST_TYPE_NUMBER;
+
+    /* Port (numbers 1-65535, after decimal to avoid classification overlap) */
+    if (is_port(token)) return ST_TYPE_PORT;
 
     /* Option token (-v, --help, -o file) */
     if (is_option_token(token)) return ST_TYPE_OPT;
