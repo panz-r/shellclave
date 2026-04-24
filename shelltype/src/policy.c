@@ -897,47 +897,56 @@ st_error_t st_policy_compact(st_policy_t *policy)
         bool *redundant = calloc(n_active, sizeof(bool));
         size_t orig_n = n_active;  /* Save for cleanup */
         
-        if (pat_tokens && pat_lens && redundant) {
-            /* Parse all patterns first */
-            for (size_t i = 0; i < orig_n; i++) {
-                pat_tokens[i] = parse_pattern(active[i], &pat_lens[i]);
+        if (!pat_tokens || !pat_lens || !redundant) {
+            /* Allocation failed - clean up any partial allocations */
+            free(pat_tokens);
+            free(pat_lens);
+            free(redundant);
+            for (size_t i = 0; i < n_active; i++) {
+                free(active[i]);
             }
-            
-            /* Find subsumed patterns: j subsumes i if j is more general */
-            for (size_t i = 0; i < orig_n; i++) {
-                if (redundant[i] || !pat_tokens[i]) continue;
-                for (size_t j = 0; j < orig_n; j++) {
-                    if (i == j || redundant[j] || !pat_tokens[j]) continue;
-                    if (pattern_subsumes(pat_tokens[i], pat_lens[i],
-                                        pat_tokens[j], pat_lens[j])) {
-                        redundant[i] = true;  /* i is subsumed by j */
-                        break;
-                    }
-                }
-            }
-            
-            /* Compact active array to keep only non-redundant */
-            size_t new_n = 0;
-            for (size_t i = 0; i < orig_n; i++) {
-                if (!redundant[i]) {
-                    active[new_n++] = active[i];
-                } else {
-                    free(active[i]);
-                    active[i] = NULL;
-                }
-            }
-            n_active = new_n;
+            free(active);
+            pthread_rwlock_unlock(&policy->rwlock);
+            return ST_ERR_MEMORY;
         }
         
-        /* Cleanup parsed tokens */
-        if (pat_tokens) {
-            for (size_t i = 0; i < orig_n; i++) {
-                if (pat_tokens[i]) {
-                    free_pattern_tokens(pat_tokens[i], pat_lens[i]);
+        /* Parse all patterns first */
+        for (size_t i = 0; i < orig_n; i++) {
+            pat_tokens[i] = parse_pattern(active[i], &pat_lens[i]);
+        }
+        
+        /* Find subsumed patterns: j subsumes i if j is more general */
+        for (size_t i = 0; i < orig_n; i++) {
+            if (redundant[i] || !pat_tokens[i]) continue;
+            for (size_t j = 0; j < orig_n; j++) {
+                if (i == j || redundant[j] || !pat_tokens[j]) continue;
+                if (pattern_subsumes(pat_tokens[i], pat_lens[i],
+                                    pat_tokens[j], pat_lens[j])) {
+                    redundant[i] = true;  /* i is subsumed by j */
+                    break;
                 }
             }
-            free(pat_tokens);
         }
+        
+        /* Compact active array to keep only non-redundant */
+        size_t new_n = 0;
+        for (size_t i = 0; i < orig_n; i++) {
+            if (!redundant[i]) {
+                active[new_n++] = active[i];
+            } else {
+                free(active[i]);
+                active[i] = NULL;
+            }
+        }
+        n_active = new_n;
+        
+        /* Cleanup parsed tokens */
+        for (size_t i = 0; i < orig_n; i++) {
+            if (pat_tokens[i]) {
+                free_pattern_tokens(pat_tokens[i], pat_lens[i]);
+            }
+        }
+        free(pat_tokens);
         free(pat_lens);
         free(redundant);
     }

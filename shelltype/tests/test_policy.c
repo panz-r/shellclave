@@ -496,6 +496,31 @@ static int test_pattern_reject_star_first(void)
     return 1;
 }
 
+/* Test pattern validation: reject adjacent * tokens */
+static int test_pattern_reject_adjacent_star(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_policy_t *policy = st_policy_new(ctx);
+    
+    /* Adjacent * tokens at the start should be rejected */
+    st_error_t err = st_policy_add(policy, "* *");
+    ASSERT(err == ST_ERR_INVALID);
+    
+    /* Valid patterns with * later in the pattern are OK */
+    err = st_policy_add(policy, "git *");
+    ASSERT(err == ST_OK);
+    
+    err = st_policy_add(policy, "docker run -it * *");
+    ASSERT(err == ST_OK);
+    
+    err = st_policy_add(policy, "git * status");
+    ASSERT(err == ST_OK);
+    
+    st_policy_free(policy);
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
 /* Test pattern validation: adjacent wildcards ARE allowed */
 static int test_pattern_adjacent_wildcards_allowed(void)
 {
@@ -1061,6 +1086,7 @@ int main(void)
     TEST(test_ctx_reset_with_active_policy);
     TEST(test_ctx_retain_release);
     TEST(test_pattern_reject_star_first);
+    TEST(test_pattern_reject_adjacent_star);
     TEST(test_pattern_adjacent_wildcards_allowed);
     TEST(test_stats_tracking);
     TEST(test_dot_export);
