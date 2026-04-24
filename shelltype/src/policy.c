@@ -2045,7 +2045,7 @@ static st_token_type_t next_wider_type(st_token_type_t t)
         case ST_TYPE_ABS_PATH:    return ST_TYPE_PATH;
         case ST_TYPE_PATH:        return ST_TYPE_PATH; /* Cap: #path stays as #path */
         case ST_TYPE_URL:         return ST_TYPE_WORD; /* Cap: #u → #w */
-        case ST_TYPE_VALUE:       return ST_TYPE_WORD; /* Cap: #val → #w */
+        case ST_TYPE_VALUE:       return ST_TYPE_VALUE; /* Cap: #val stays as #val */
         case ST_TYPE_ANY:         return ST_TYPE_ANY;  /* Already at top */
         default:                   return t;
     }
