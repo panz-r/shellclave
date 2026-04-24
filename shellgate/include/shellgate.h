@@ -105,6 +105,13 @@ _Static_assert((SG_REJECT_MASK_DEFAULT & (1u << 9)) != 0, "CASE bit mismatch");
 
 #define SG_MAX_VIOLATIONS 16
 
+/* Severity levels for violations (0-100). */
+#define SG_SEVERITY_INFO      30
+#define SG_SEVERITY_LOW       50
+#define SG_SEVERITY_MEDIUM    70
+#define SG_SEVERITY_HIGH      85
+#define SG_SEVERITY_CRITICAL  95
+
 /* ============================================================
  * TYPES
  * ============================================================ */
@@ -168,10 +175,13 @@ typedef struct {
 
     uint32_t attention_index;
     bool truncated;
+    bool subcmd_truncated;
+    bool violation_truncated;
 
     sg_violation_t violations[SG_MAX_VIOLATIONS];
     uint32_t       violation_count;
     uint32_t       violation_flags;
+    uint32_t       violation_dropped_count;
     bool           has_violations;
 } sg_result_t;
 
@@ -311,21 +321,34 @@ uint32_t sg_gate_deny_rule_count(const sg_gate_t *gate);
  *   buffer.  Result pointers reference into it.  `buf` must remain
  *   valid while reading `sg_result_t` string fields.
  *
- * `out` : result metadata.  On return, subcmds[].command etc. point
- *   into `buf`.
+ * Internally, evaluation uses shellsplit's dependency graph which is
+ *   allocated as a function-local stack struct (no dynamic allocation).
+ *   The graph's internal buffers (nodes, edges, tokens, cwd_buf) are
+ *   fixed-size arrays bounded by SHELL_DEP_MAX_* constants (see
+ *   shellsplit/include/shell_depgraph.h).  These are NOT shared across
+ *   calls or threads — each sg_eval call uses its own stack instance.
  *
  * Returns SG_OK on success, SG_ERR_TRUNC if the buffer was too small
  *   (partial results are still valid), or SG_ERR_INVALID for bad args.
  */
 sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len,
-                   char *buf, size_t buf_size,
-                   sg_result_t *out);
+                    char *buf, size_t buf_size,
+                    sg_result_t *out);
+
+/*
+ * Estimate minimum output buffer size needed for a command of `cmd_len` bytes.
+ * Returns a conservative estimate; caller should add margin for expansion
+ * callbacks and violation details.  A +256 byte margin above the returned
+ * value is sufficient for typical workloads.
+ */
+size_t sg_eval_size_hint(size_t cmd_len);
 
 /* ============================================================
  * RESULT HELPERS
  * ============================================================ */
 
 const char *sg_verdict_name(sg_verdict_t v);
+uint32_t sg_result_violation_dropped(const sg_result_t *result);
 
 #ifdef __cplusplus
 }

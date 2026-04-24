@@ -319,12 +319,24 @@ static bool has_glob_chars(const char *tok, size_t len)
  * INTERNAL: BUILD COMMAND STRING WITH OPTIONAL EXPANSION
  * ============================================================ */
 
-#define SG_EXPAND_BUF 1024
+/* Expansion buffer size. Callbacks must respect this limit;
+ * truncation affects policy matching. Increase if commands can
+ * expand to values longer than 4096 bytes. */
+#define SG_EXPAND_BUF 4096
 
 static const char *build_cmd_string(const shell_dep_cmd_t *cmd,
                                      buf_writer_t *bw,
                                      const sg_gate_t *gate)
 {
+    /*
+     * Reconstructs the command by joining tokens with spaces.
+     * Tokens are copied as-is — no additional quoting is applied.
+     * This is intentional: the original shell input already contains
+     * any necessary quoting, and adding quotes around tokens that
+     * contain spaces or special characters would change the meaning
+     * of the reconstructed command.  The goal is a readable display
+     * string, not a round-trippable shell command.
+     */
     if (bw->used >= bw->size) { bw->overflow = true; return NULL; }
 
     size_t start = bw->used;
@@ -559,10 +571,12 @@ static bool tok_equals(const char *tok, uint32_t tok_len, const char *str)
 }
 
 static bool emit_violation(sg_violation_t *viol, uint32_t *count,
-                            uint32_t max, uint32_t type, uint32_t severity,
+                            uint32_t max, uint32_t *dropped,
+                            uint32_t type, uint32_t severity,
                             uint32_t cmd_idx, const char *desc, const char *detail)
 {
-    if (*count >= max) return false;
+    if (*count >= max) { if (dropped) (*dropped)++; return false; }
+    if (!desc || !detail) { if (dropped) (*dropped)++; return false; }
     sg_violation_t *v = &viol[(*count)++];
     v->type           = type;
     v->severity       = severity;
@@ -609,14 +623,16 @@ static void sg_violation_scan(const shell_dep_graph_t *graph,
                                buf_writer_t *bw,
                                sg_violation_t *violations, uint32_t max_violations,
                                uint32_t *violation_count, uint32_t *violation_flags,
+                               uint32_t *violation_dropped,
                                uint32_t *node_viols,
                                uint32_t *cmd_write_count, uint32_t *cmd_read_count,
                                uint32_t *cmd_env_count)
 {
     *violation_count = 0;
     *violation_flags = 0;
+    *violation_dropped = 0;
 
-    for (uint32_t ei = 0; ei < graph->edge_count; ei++) {
+    for (uint32_t ei = 0; ei < graph->edge_count && !bw->overflow; ei++) {
         const shell_dep_edge_t *e = &graph->edges[ei];
         const shell_dep_node_t *from_node = &graph->nodes[e->from];
         const shell_dep_node_t *to_node   = &graph->nodes[e->to];
@@ -641,8 +657,8 @@ static void sg_violation_scan(const shell_dep_graph_t *graph,
                                      cfg->sensitive_write_paths[p])) {
                     const char *desc = bw_printf(bw, "writes to sensitive path");
                     const char *det  = bw_copy(bw, to_node->doc.path, to_node->doc.path_len);
-                    emit_violation(violations, violation_count, max_violations,
-                                   SG_VIOL_WRITE_SENSITIVE, 80, e->from, desc, det);
+                    emit_violation(violations, violation_count, max_violations, violation_dropped,
+                                   SG_VIOL_WRITE_SENSITIVE, SG_SEVERITY_HIGH, e->from, desc, det);
                     node_viols[e->from] |= SG_VIOL_WRITE_SENSITIVE;
                     *violation_flags |= SG_VIOL_WRITE_SENSITIVE;
                     break;
@@ -672,8 +688,8 @@ static void sg_violation_scan(const shell_dep_graph_t *graph,
                         const char *det  = bw_printf(bw, "%.*s before %.*s",
                                                       (int)from_node->doc.name_len, from_node->doc.name,
                                                       (int)cmd0_len, cmd0);
-                        emit_violation(violations, violation_count, max_violations,
-                                       SG_VIOL_ENV_PRIVILEGED, 90, e->to, desc, det);
+                        emit_violation(violations, violation_count, max_violations, violation_dropped,
+                                       SG_VIOL_ENV_PRIVILEGED, SG_SEVERITY_CRITICAL, e->to, desc, det);
                         node_viols[e->to] |= SG_VIOL_ENV_PRIVILEGED;
                         *violation_flags |= SG_VIOL_ENV_PRIVILEGED;
                         break;
@@ -685,7 +701,7 @@ static void sg_violation_scan(const shell_dep_graph_t *graph,
         /* --- SG_VIOL_SUBST_SENSITIVE --- */
         if (e->type == SHELL_EDGE_SUBST) {
             uint32_t sub_cmd = e->from;
-            for (uint32_t ej = 0; ej < graph->edge_count; ej++) {
+            for (uint32_t ej = 0; ej < graph->edge_count && !bw->overflow; ej++) {
                 const shell_dep_edge_t *re = &graph->edges[ej];
                 if (re->to != sub_cmd) continue;
                 if (re->type != SHELL_EDGE_READ && re->type != SHELL_EDGE_ARG) continue;
@@ -696,8 +712,8 @@ static void sg_violation_scan(const shell_dep_graph_t *graph,
                                          cfg->sensitive_read_paths[p])) {
                         const char *desc = bw_printf(bw, "subshell reads sensitive file");
                         const char *det  = bw_copy(bw, doc->doc.path, doc->doc.path_len);
-                        emit_violation(violations, violation_count, max_violations,
-                                       SG_VIOL_SUBST_SENSITIVE, 85, e->to, desc, det);
+                        emit_violation(violations, violation_count, max_violations, violation_dropped,
+                                       SG_VIOL_SUBST_SENSITIVE, SG_SEVERITY_HIGH, e->to, desc, det);
                         node_viols[e->to] |= SG_VIOL_SUBST_SENSITIVE;
                         *violation_flags |= SG_VIOL_SUBST_SENSITIVE;
                         break;
@@ -708,14 +724,14 @@ static void sg_violation_scan(const shell_dep_graph_t *graph,
     }
 
     /* --- SG_VIOL_REMOVE_SYSTEM --- */
-    for (uint32_t ni = 0; ni < graph->node_count; ni++) {
+    for (uint32_t ni = 0; ni < graph->node_count && !bw->overflow; ni++) {
         const shell_dep_node_t *node = &graph->nodes[ni];
         if (node->type != SHELL_NODE_CMD || node->cmd.token_count == 0) continue;
         const char *cmd0 = node->cmd.tokens[0];
         uint32_t cmd0_len = node->cmd.token_lens[0];
         if (!tok_equals(cmd0, cmd0_len, "rm") && !tok_equals(cmd0, cmd0_len, "rmdir"))
             continue;
-        for (uint32_t ei = 0; ei < graph->edge_count; ei++) {
+        for (uint32_t ei = 0; ei < graph->edge_count && !bw->overflow; ei++) {
             const shell_dep_edge_t *e = &graph->edges[ei];
             if (e->from != ni || e->type != SHELL_EDGE_ARG) continue;
             const shell_dep_node_t *doc = &graph->nodes[e->to];
@@ -725,7 +741,7 @@ static void sg_violation_scan(const shell_dep_graph_t *graph,
                                      cfg->sensitive_dirs[d])) {
                     const char *desc = bw_printf(bw, "removal of system directory");
                     const char *det  = bw_copy(bw, doc->doc.path, doc->doc.path_len);
-                    emit_violation(violations, violation_count, max_violations,
+                    emit_violation(violations, violation_count, max_violations, violation_dropped,
                                    SG_VIOL_REMOVE_SYSTEM, 95, ni, desc, det);
                     node_viols[ni] |= SG_VIOL_REMOVE_SYSTEM;
                     *violation_flags |= SG_VIOL_REMOVE_SYSTEM;
@@ -736,13 +752,13 @@ static void sg_violation_scan(const shell_dep_graph_t *graph,
     }
 
     /* --- SG_VIOL_WRITE_THEN_READ --- */
-    for (uint32_t ei = 0; ei < graph->edge_count; ei++) {
+    for (uint32_t ei = 0; ei < graph->edge_count && !bw->overflow; ei++) {
         const shell_dep_edge_t *e1 = &graph->edges[ei];
         if (e1->type != SHELL_EDGE_WRITE && e1->type != SHELL_EDGE_APPEND) continue;
         const shell_dep_node_t *f1 = &graph->nodes[e1->to];
         if (f1->type != SHELL_NODE_DOC || f1->doc.kind != SHELL_DOC_FILE) continue;
 
-        for (uint32_t ej = 0; ej < graph->edge_count; ej++) {
+        for (uint32_t ej = 0; ej < graph->edge_count && !bw->overflow; ej++) {
             const shell_dep_edge_t *e2 = &graph->edges[ej];
             if (e2->type != SHELL_EDGE_READ) continue;
             const shell_dep_node_t *f2 = &graph->nodes[e2->from];
@@ -753,8 +769,8 @@ static void sg_violation_scan(const shell_dep_graph_t *graph,
             if (has_control_flow_path(graph, e1->from, e2->to)) {
                 const char *desc = bw_printf(bw, "write then read of same file");
                 const char *det  = bw_copy(bw, f1->doc.path, f1->doc.path_len);
-                emit_violation(violations, violation_count, max_violations,
-                               SG_VIOL_WRITE_THEN_READ, 60, e2->to, desc, det);
+                emit_violation(violations, violation_count, max_violations, violation_dropped,
+                               SG_VIOL_WRITE_THEN_READ, SG_SEVERITY_MEDIUM, e2->to, desc, det);
                 node_viols[e2->to] |= SG_VIOL_WRITE_THEN_READ;
                 *violation_flags |= SG_VIOL_WRITE_THEN_READ;
                 break;
@@ -763,20 +779,20 @@ static void sg_violation_scan(const shell_dep_graph_t *graph,
     }
 
     /* --- SG_VIOL_REDIRECT_FANOUT --- */
-    for (uint32_t ni = 0; ni < graph->node_count; ni++) {
+    for (uint32_t ni = 0; ni < graph->node_count && !bw->overflow; ni++) {
         if (graph->nodes[ni].type != SHELL_NODE_CMD) continue;
         if (cmd_write_count[ni] > cfg->redirect_fanout_threshold) {
             const char *desc = bw_printf(bw, "excessive redirect fan-out (%u targets)",
                                           cmd_write_count[ni]);
-            emit_violation(violations, violation_count, max_violations,
-                           SG_VIOL_REDIRECT_FANOUT, 40, ni, desc, NULL);
+            emit_violation(violations, violation_count, max_violations, violation_dropped,
+                           SG_VIOL_REDIRECT_FANOUT, SG_SEVERITY_LOW, ni, desc, NULL);
             node_viols[ni] |= SG_VIOL_REDIRECT_FANOUT;
             *violation_flags |= SG_VIOL_REDIRECT_FANOUT;
         }
     }
 
     /* --- SG_VIOL_NET_DOWNLOAD_EXEC --- */
-    for (uint32_t ei = 0; ei < graph->edge_count; ei++) {
+    for (uint32_t ei = 0; ei < graph->edge_count && !bw->overflow; ei++) {
         const shell_dep_edge_t *e = &graph->edges[ei];
         if (e->type != SHELL_EDGE_PIPE) continue;
         const shell_dep_node_t *src = &graph->nodes[e->from];
@@ -808,14 +824,14 @@ static void sg_violation_scan(const shell_dep_graph_t *graph,
         const char *det  = bw_printf(bw, "%.*s | %.*s",
                                       (int)src->cmd.token_lens[0], src->cmd.tokens[0],
                                       (int)dst->cmd.token_lens[0], dst->cmd.tokens[0]);
-        emit_violation(violations, violation_count, max_violations,
-                       SG_VIOL_NET_DOWNLOAD_EXEC, 95, e->to, desc, det);
+        emit_violation(violations, violation_count, max_violations, violation_dropped,
+                       SG_VIOL_NET_DOWNLOAD_EXEC, SG_SEVERITY_CRITICAL, e->to, desc, det);
         node_viols[e->to] |= SG_VIOL_NET_DOWNLOAD_EXEC;
         *violation_flags |= SG_VIOL_NET_DOWNLOAD_EXEC;
     }
 
     /* --- SG_VIOL_PERM_SYSTEM --- */
-    for (uint32_t ni = 0; ni < graph->node_count; ni++) {
+    for (uint32_t ni = 0; ni < graph->node_count && !bw->overflow; ni++) {
         const shell_dep_node_t *node = &graph->nodes[ni];
         if (node->type != SHELL_NODE_CMD || node->cmd.token_count == 0) continue;
 
@@ -838,7 +854,7 @@ static void sg_violation_scan(const shell_dep_graph_t *graph,
         }
         if (!has_recursive) continue;
 
-        for (uint32_t ei = 0; ei < graph->edge_count; ei++) {
+        for (uint32_t ei = 0; ei < graph->edge_count && !bw->overflow; ei++) {
             const shell_dep_edge_t *e = &graph->edges[ei];
             if (e->from != ni || e->type != SHELL_EDGE_ARG) continue;
             const shell_dep_node_t *doc = &graph->nodes[e->to];
@@ -848,8 +864,8 @@ static void sg_violation_scan(const shell_dep_graph_t *graph,
                                     cfg->sensitive_dirs[d])) {
                     const char *desc = bw_printf(bw, "recursive permission change on system dir");
                     const char *det  = bw_copy(bw, doc->doc.path, doc->doc.path_len);
-                    emit_violation(violations, violation_count, max_violations,
-                                   SG_VIOL_PERM_SYSTEM, 85, ni, desc, det);
+                    emit_violation(violations, violation_count, max_violations, violation_dropped,
+                                   SG_VIOL_PERM_SYSTEM, SG_SEVERITY_HIGH, ni, desc, det);
                     node_viols[ni] |= SG_VIOL_PERM_SYSTEM;
                     *violation_flags |= SG_VIOL_PERM_SYSTEM;
                     break;
@@ -859,7 +875,7 @@ static void sg_violation_scan(const shell_dep_graph_t *graph,
     }
 
     /* --- SG_VIOL_SHELL_ESCALATION --- */
-    for (uint32_t ni = 0; ni < graph->node_count; ni++) {
+    for (uint32_t ni = 0; ni < graph->node_count && !bw->overflow; ni++) {
         const shell_dep_node_t *node = &graph->nodes[ni];
         if (node->type != SHELL_NODE_CMD || node->cmd.token_count < 2) continue;
 
@@ -882,14 +898,14 @@ static void sg_violation_scan(const shell_dep_graph_t *graph,
         const char *det  = bw_printf(bw, "%.*s %.*s",
                                       (int)cmd0_len, cmd0,
                                       (int)node->cmd.token_lens[1], node->cmd.tokens[1]);
-        emit_violation(violations, violation_count, max_violations,
-                       SG_VIOL_SHELL_ESCALATION, 90, ni, desc, det);
+        emit_violation(violations, violation_count, max_violations, violation_dropped,
+                       SG_VIOL_SHELL_ESCALATION, SG_SEVERITY_CRITICAL, ni, desc, det);
         node_viols[ni] |= SG_VIOL_SHELL_ESCALATION;
         *violation_flags |= SG_VIOL_SHELL_ESCALATION;
     }
 
     /* --- SG_VIOL_SUDO_REDIRECT --- */
-    for (uint32_t ni = 0; ni < graph->node_count; ni++) {
+    for (uint32_t ni = 0; ni < graph->node_count && !bw->overflow; ni++) {
         const shell_dep_node_t *node = &graph->nodes[ni];
         if (node->type != SHELL_NODE_CMD || node->cmd.token_count == 0) continue;
 
@@ -901,7 +917,7 @@ static void sg_violation_scan(const shell_dep_graph_t *graph,
         bool has_redirect = false;
         const char *target_path = NULL;
         uint32_t target_path_len = 0;
-        for (uint32_t ei = 0; ei < graph->edge_count; ei++) {
+        for (uint32_t ei = 0; ei < graph->edge_count && !bw->overflow; ei++) {
             const shell_dep_edge_t *e = &graph->edges[ei];
             if (e->from != ni) continue;
             if (e->type != SHELL_EDGE_WRITE && e->type != SHELL_EDGE_APPEND) continue;
@@ -919,14 +935,14 @@ static void sg_violation_scan(const shell_dep_graph_t *graph,
         const char *det  = target_path
             ? bw_copy(bw, target_path, target_path_len)
             : bw_printf(bw, "%.*s", (int)cmd0_len, cmd0);
-        emit_violation(violations, violation_count, max_violations,
-                       SG_VIOL_SUDO_REDIRECT, 80, ni, desc, det);
+        emit_violation(violations, violation_count, max_violations, violation_dropped,
+                       SG_VIOL_SUDO_REDIRECT, SG_SEVERITY_HIGH, ni, desc, det);
         node_viols[ni] |= SG_VIOL_SUDO_REDIRECT;
         *violation_flags |= SG_VIOL_SUDO_REDIRECT;
     }
 
     /* --- SG_VIOL_READ_SECRETS --- */
-    for (uint32_t ni = 0; ni < graph->node_count; ni++) {
+    for (uint32_t ni = 0; ni < graph->node_count && !bw->overflow; ni++) {
         const shell_dep_node_t *node = &graph->nodes[ni];
         if (node->type != SHELL_NODE_CMD || node->cmd.token_count == 0) continue;
 
@@ -940,7 +956,7 @@ static void sg_violation_scan(const shell_dep_graph_t *graph,
         }
         if (!is_reader) continue;
 
-        for (uint32_t ei = 0; ei < graph->edge_count; ei++) {
+        for (uint32_t ei = 0; ei < graph->edge_count && !bw->overflow; ei++) {
             const shell_dep_edge_t *e = &graph->edges[ei];
             if (e->from != ni || e->type != SHELL_EDGE_ARG) continue;
             const shell_dep_node_t *doc = &graph->nodes[e->to];
@@ -950,8 +966,8 @@ static void sg_violation_scan(const shell_dep_graph_t *graph,
                                   cfg->sensitive_secret_paths[p])) {
                     const char *desc = bw_printf(bw, "reading secret file");
                     const char *det  = bw_copy(bw, doc->doc.path, doc->doc.path_len);
-                    emit_violation(violations, violation_count, max_violations,
-                                   SG_VIOL_READ_SECRETS, 75, ni, desc, det);
+                    emit_violation(violations, violation_count, max_violations, violation_dropped,
+                                   SG_VIOL_READ_SECRETS, SG_SEVERITY_MEDIUM, ni, desc, det);
                     node_viols[ni] |= SG_VIOL_READ_SECRETS;
                     *violation_flags |= SG_VIOL_READ_SECRETS;
                     break;
@@ -961,7 +977,7 @@ static void sg_violation_scan(const shell_dep_graph_t *graph,
     }
 
     /* --- SG_VIOL_NET_UPLOAD --- */
-    for (uint32_t ni = 0; ni < graph->node_count; ni++) {
+    for (uint32_t ni = 0; ni < graph->node_count && !bw->overflow; ni++) {
         const shell_dep_node_t *node = &graph->nodes[ni];
         if (node->type != SHELL_NODE_CMD || node->cmd.token_count < 2) continue;
 
@@ -1038,14 +1054,14 @@ static void sg_violation_scan(const shell_dep_graph_t *graph,
 
         const char *desc = bw_printf(bw, "network file upload");
         const char *det  = bw_printf(bw, "%.*s", (int)cmd0_len, cmd0);
-        emit_violation(violations, violation_count, max_violations,
-                       SG_VIOL_NET_UPLOAD, 85, ni, desc, det);
+        emit_violation(violations, violation_count, max_violations, violation_dropped,
+                       SG_VIOL_NET_UPLOAD, SG_SEVERITY_HIGH, ni, desc, det);
         node_viols[ni] |= SG_VIOL_NET_UPLOAD;
         *violation_flags |= SG_VIOL_NET_UPLOAD;
     }
 
     /* --- SG_VIOL_NET_LISTENER --- */
-    for (uint32_t ni = 0; ni < graph->node_count; ni++) {
+    for (uint32_t ni = 0; ni < graph->node_count && !bw->overflow; ni++) {
         const shell_dep_node_t *node = &graph->nodes[ni];
         if (node->type != SHELL_NODE_CMD || node->cmd.token_count < 2) continue;
 
@@ -1095,14 +1111,14 @@ static void sg_violation_scan(const shell_dep_graph_t *graph,
         const char *desc = bw_printf(bw, "starting network listener");
         const char *det  = bw_printf(bw, "%.*s", (int)node->cmd.token_lens[0],
                                       node->cmd.tokens[0]);
-        emit_violation(violations, violation_count, max_violations,
-                       SG_VIOL_NET_LISTENER, 80, ni, desc, det);
+        emit_violation(violations, violation_count, max_violations, violation_dropped,
+                       SG_VIOL_NET_LISTENER, SG_SEVERITY_HIGH, ni, desc, det);
         node_viols[ni] |= SG_VIOL_NET_LISTENER;
         *violation_flags |= SG_VIOL_NET_LISTENER;
     }
 
     /* --- SG_VIOL_SHELL_OBFUSCATION --- */
-    for (uint32_t ei = 0; ei < graph->edge_count; ei++) {
+    for (uint32_t ei = 0; ei < graph->edge_count && !bw->overflow; ei++) {
         const shell_dep_edge_t *e = &graph->edges[ei];
         if (e->type != SHELL_EDGE_PIPE) continue;
         const shell_dep_node_t *src = &graph->nodes[e->from];
@@ -1147,14 +1163,14 @@ static void sg_violation_scan(const shell_dep_graph_t *graph,
         const char *det  = bw_printf(bw, "%.*s | %.*s",
                                       (int)src->cmd.token_lens[0], src->cmd.tokens[0],
                                       (int)dst->cmd.token_lens[0], dst->cmd.tokens[0]);
-        emit_violation(violations, violation_count, max_violations,
-                       SG_VIOL_SHELL_OBFUSCATION, 90, e->to, desc, det);
+        emit_violation(violations, violation_count, max_violations, violation_dropped,
+                       SG_VIOL_SHELL_OBFUSCATION, SG_SEVERITY_CRITICAL, e->to, desc, det);
         node_viols[e->to] |= SG_VIOL_SHELL_OBFUSCATION;
         *violation_flags |= SG_VIOL_SHELL_OBFUSCATION;
     }
 
     /* --- SG_VIOL_GIT_DESTRUCTIVE --- */
-    for (uint32_t ni = 0; ni < graph->node_count; ni++) {
+    for (uint32_t ni = 0; ni < graph->node_count && !bw->overflow; ni++) {
         const shell_dep_node_t *node = &graph->nodes[ni];
         if (node->type != SHELL_NODE_CMD || node->cmd.token_count < 2) continue;
         if (!tok_equals(node->cmd.tokens[0], node->cmd.token_lens[0], "git"))
@@ -1189,14 +1205,14 @@ static void sg_violation_scan(const shell_dep_graph_t *graph,
 
         const char *desc = bw_printf(bw, "destructive git operation");
         const char *det  = bw_printf(bw, "git %.*s", (int)subcmd_len, subcmd);
-        emit_violation(violations, violation_count, max_violations,
-                       SG_VIOL_GIT_DESTRUCTIVE, 70, ni, desc, det);
+        emit_violation(violations, violation_count, max_violations, violation_dropped,
+                       SG_VIOL_GIT_DESTRUCTIVE, SG_SEVERITY_MEDIUM, ni, desc, det);
         node_viols[ni] |= SG_VIOL_GIT_DESTRUCTIVE;
         *violation_flags |= SG_VIOL_GIT_DESTRUCTIVE;
     }
 
     /* --- SG_VIOL_PERSISTENCE --- */
-    for (uint32_t ni = 0; ni < graph->node_count; ni++) {
+    for (uint32_t ni = 0; ni < graph->node_count && !bw->overflow; ni++) {
         const shell_dep_node_t *node = &graph->nodes[ni];
         if (node->type != SHELL_NODE_CMD || node->cmd.token_count == 0) continue;
 
@@ -1214,15 +1230,15 @@ static void sg_violation_scan(const shell_dep_graph_t *graph,
             if (!is_list) {
                 const char *desc = bw_printf(bw, "crontab modification");
                 const char *det  = bw_printf(bw, "crontab");
-                emit_violation(violations, violation_count, max_violations,
-                               SG_VIOL_PERSISTENCE, 75, ni, desc, det);
+                emit_violation(violations, violation_count, max_violations, violation_dropped,
+                               SG_VIOL_PERSISTENCE, SG_SEVERITY_MEDIUM, ni, desc, det);
                 node_viols[ni] |= SG_VIOL_PERSISTENCE;
                 *violation_flags |= SG_VIOL_PERSISTENCE;
             }
             continue;
         }
 
-        for (uint32_t ei = 0; ei < graph->edge_count; ei++) {
+        for (uint32_t ei = 0; ei < graph->edge_count && !bw->overflow; ei++) {
             const shell_dep_edge_t *e = &graph->edges[ei];
             if (e->from != ni) continue;
             if (e->type != SHELL_EDGE_WRITE && e->type != SHELL_EDGE_APPEND) continue;
@@ -1233,8 +1249,8 @@ static void sg_violation_scan(const shell_dep_graph_t *graph,
                                   cfg->shell_profile_paths[p])) {
                     const char *desc = bw_printf(bw, "writing to shell profile/ssh config");
                     const char *det  = bw_copy(bw, doc->doc.path, doc->doc.path_len);
-                    emit_violation(violations, violation_count, max_violations,
-                                   SG_VIOL_PERSISTENCE, 80, ni, desc, det);
+                    emit_violation(violations, violation_count, max_violations, violation_dropped,
+                                   SG_VIOL_PERSISTENCE, SG_SEVERITY_HIGH, ni, desc, det);
                     node_viols[ni] |= SG_VIOL_PERSISTENCE;
                     *violation_flags |= SG_VIOL_PERSISTENCE;
                     break;
@@ -1317,19 +1333,37 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len,
         sg_violation_scan(&graph, &gate->viol_config, &bw,
                           out->violations, SG_MAX_VIOLATIONS,
                           &out->violation_count, &out->violation_flags,
+                          &out->violation_dropped_count,
                           node_viols, cmd_write_count, cmd_read_count, cmd_env_count);
         out->has_violations = (out->violation_count > 0);
+        if (bw.overflow) {
+            out->truncated = true;
+            out->violation_truncated = (out->violation_count >= SG_MAX_VIOLATIONS);
+            out->verdict = SG_VERDICT_UNDETERMINED;
+            out->deny_reason = bw_copy(&bw, "output buffer overflow", 22);
+            return SG_ERR_TRUNC;
+        }
     }
 
     /* Step 4: Walk CMD nodes, evaluate each against policy */
-    for (uint32_t ni = 0; ni < graph.node_count && out->subcmd_count < SG_MAX_SUBCMD_RESULTS; ni++) {
+    bool subcmd_truncated = false;
+    for (uint32_t ni = 0; ni < graph.node_count; ni++) {
         const shell_dep_node_t *node = &graph.nodes[ni];
         if (node->type != SHELL_NODE_CMD) continue;
         if (node->cmd.token_count == 0) continue;
 
+        if (out->subcmd_count >= SG_MAX_SUBCMD_RESULTS) {
+            subcmd_truncated = true;
+            break;
+        }
+
         sg_subcmd_result_t *sr = &out->subcmds[out->subcmd_count++];
 
         sr->command = build_cmd_string(&node->cmd, &bw, gate);
+        if (bw.overflow) {
+            out->truncated = true;
+            return SG_ERR_TRUNC;
+        }
 
         sr->write_count    = cmd_write_count[ni];
         sr->read_count     = cmd_read_count[ni];
@@ -1361,33 +1395,41 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len,
                 sr->matches = false;
                 sr->verdict = SG_VERDICT_UNDETERMINED;
 
-                if (eval.suggestion_count > 0 && out->suggestion_count == 0) {
-                    out->suggestions[0] = bw_copy(&bw,
-                        eval.suggestions[0].pattern,
-                        strlen(eval.suggestions[0].pattern));
-                    if (out->suggestions[0]) out->suggestion_count++;
-                }
-                if (eval.suggestion_count > 1 && out->suggestion_count == 1) {
-                    out->suggestions[1] = bw_copy(&bw,
-                        eval.suggestions[1].pattern,
-                        strlen(eval.suggestions[1].pattern));
-                    if (out->suggestions[1]) out->suggestion_count++;
+                if (gate->suggestions) {
+                    if (eval.suggestion_count > 0 && out->suggestion_count == 0) {
+                        out->suggestions[0] = bw_copy(&bw,
+                            eval.suggestions[0].pattern,
+                            strlen(eval.suggestions[0].pattern));
+                        if (out->suggestions[0]) out->suggestion_count++;
+                        else if (bw.overflow) { out->truncated = true; return SG_ERR_TRUNC; }
+                    }
+                    if (eval.suggestion_count > 1 && out->suggestion_count == 1) {
+                        out->suggestions[1] = bw_copy(&bw,
+                            eval.suggestions[1].pattern,
+                            strlen(eval.suggestions[1].pattern));
+                        if (out->suggestions[1]) out->suggestion_count++;
+                        else if (bw.overflow) { out->truncated = true; return SG_ERR_TRUNC; }
+                    }
                 }
             }
 
-            /* Generate deny suggestions from deny policy */
-            if (deny_err == ST_OK && out->deny_suggestion_count == 0) {
-                if (deny_eval.suggestion_count > 0) {
-                    out->deny_suggestions[0] = bw_copy(&bw,
-                        deny_eval.suggestions[0].pattern,
-                        strlen(deny_eval.suggestions[0].pattern));
-                    if (out->deny_suggestions[0]) out->deny_suggestion_count++;
-                }
-                if (deny_eval.suggestion_count > 1 && out->deny_suggestion_count == 1) {
-                    out->deny_suggestions[1] = bw_copy(&bw,
-                        deny_eval.suggestions[1].pattern,
-                        strlen(deny_eval.suggestions[1].pattern));
-                    if (out->deny_suggestions[1]) out->deny_suggestion_count++;
+            if (gate->suggestions) {
+                /* Generate deny suggestions from deny policy */
+                if (deny_err == ST_OK && out->deny_suggestion_count == 0) {
+                    if (deny_eval.suggestion_count > 0) {
+                        out->deny_suggestions[0] = bw_copy(&bw,
+                            deny_eval.suggestions[0].pattern,
+                            strlen(deny_eval.suggestions[0].pattern));
+                        if (out->deny_suggestions[0]) out->deny_suggestion_count++;
+                        else if (bw.overflow) { out->truncated = true; return SG_ERR_TRUNC; }
+                    }
+                    if (deny_eval.suggestion_count > 1 && out->deny_suggestion_count == 1) {
+                        out->deny_suggestions[1] = bw_copy(&bw,
+                            deny_eval.suggestions[1].pattern,
+                            strlen(deny_eval.suggestions[1].pattern));
+                        if (out->deny_suggestions[1]) out->deny_suggestion_count++;
+                        else if (bw.overflow) { out->truncated = true; return SG_ERR_TRUNC; }
+                    }
                 }
             }
         }
@@ -1403,6 +1445,8 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len,
         if (sr->matches && gate->stop_mode == SG_STOP_FIRST_PASS) break;
     }
 
+    out->truncated = bw.overflow || subcmd_truncated;
+    out->subcmd_truncated = subcmd_truncated;
     if (out->subcmd_count == 0) {
         out->verdict = SG_VERDICT_ALLOW;
         return bw.overflow ? SG_ERR_TRUNC : SG_OK;
@@ -1425,13 +1469,17 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len,
         out->verdict = SG_VERDICT_ALLOW;
     else
         out->verdict = SG_VERDICT_UNDETERMINED;
-    out->truncated = bw.overflow;
-    return bw.overflow ? SG_ERR_TRUNC : SG_OK;
+    return (bw.overflow || subcmd_truncated) ? SG_ERR_TRUNC : SG_OK;
 }
 
 /* ============================================================
  * HELPERS
  * ============================================================ */
+
+size_t sg_eval_size_hint(size_t cmd_len)
+{
+    return cmd_len * 4 + 512;
+}
 
 const char *sg_verdict_name(sg_verdict_t v)
 {
@@ -1442,4 +1490,9 @@ const char *sg_verdict_name(sg_verdict_t v)
         case SG_VERDICT_UNDETERMINED: return "UNDETERMINED";
     }
     return "UNKNOWN";
+}
+
+uint32_t sg_result_violation_dropped(const sg_result_t *result)
+{
+    return result ? result->violation_dropped_count : 0;
 }
