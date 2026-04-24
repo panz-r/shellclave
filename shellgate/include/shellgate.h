@@ -202,6 +202,21 @@ typedef struct sg_gate sg_gate_t;
 #define SG_VIOL_MAX_PATHS   32
 #define SG_VIOL_MAX_NAMES   16
 
+/**
+ * Violation detection configuration.
+ *
+ * All path and name arrays must be kept in **sorted order**
+ * (lexicographic, C string comparison) for efficient binary search.
+ * Path arrays additionally require that shorter prefixes appear
+ * before longer paths that have them as a prefix
+ * (e.g., "/etc" before "/etc/passwd").
+ *
+ * Violation fields in sg_result_t (violations[], violation_count,
+ * violation_flags, violation_dropped_count, has_violations) are
+ * always populated from the dependency graph scan, regardless of
+ * the overall verdict.  They reflect what the graph observed,
+ * not what the policy decided.
+ */
 typedef struct {
     /* Filesystem Integrity */
     const char *sensitive_write_paths[SG_VIOL_MAX_PATHS];

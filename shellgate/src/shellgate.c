@@ -443,27 +443,30 @@ static const char *check_features(const shell_parse_result_t *fast,
 
 void sg_violation_config_default(sg_violation_config_t *cfg)
 {
+    /* NOTE: All arrays must be kept in sorted order (lexicographic, C string
+     * comparison) for efficient binary search.  Path arrays additionally require
+     * shorter prefixes before longer paths that have them as a prefix.
+     * The arrays below are already sorted accordingly. */
     static const char *def_write_paths[] = {
-        "/etc/", "/boot/", "/root/", "/lib/", "/usr/lib/",
-        "/sbin/", "/bin/", "/var/lib/", "/proc/", "/sys/",
+        "/bin/", "/boot/", "/etc/", "/lib/", "/proc/",
+        "/root/", "/sbin/", "/sys/", "/usr/lib/", "/var/lib/",
     };
     static const char *def_dirs[] = {
-        "/etc", "/boot", "/root", "/lib", "/usr/lib",
-        "/sbin", "/bin", "/var/lib", "/proc", "/sys",
-        "/usr", "/var", "/opt",
+        "/bin", "/boot", "/etc", "/lib", "/opt",
+        "/proc", "/root", "/sbin", "/sys", "/usr",
+        "/usr/lib", "/var", "/var/lib",
     };
     static const char *def_env[] = {
-        "LD_PRELOAD", "LD_LIBRARY_PATH", "PATH", "IFS",
-        "LD_DEBUG", "ENV", "BASH_ENV",
+        "BASH_ENV", "ENV", "IFS", "LD_DEBUG",
+        "LD_LIBRARY_PATH", "LD_PRELOAD", "PATH",
     };
     static const char *def_cmds[] = {
-        "sudo", "su", "ssh", "scp", "crontab", "passwd",
+        "crontab", "passwd", "scp", "ssh", "su", "sudo",
     };
     static const char *def_reads[] = {
-        "/etc/shadow", "/etc/ssh/", "/etc/gshadow",
-        "/root/.ssh/", "/etc/ca-certificates",
+        "/etc/ca-certificates", "/etc/gshadow", "/etc/shadow",
+        "/etc/ssh/", "/root/.ssh/",
     };
-
     memset(cfg, 0, sizeof(*cfg));
 
     for (uint32_t i = 0; i < (uint32_t)(sizeof(def_write_paths)/sizeof(def_write_paths[0]))
@@ -548,7 +551,7 @@ void sg_violation_config_default(sg_violation_config_t *cfg)
  * ============================================================ */
 
 static bool path_has_prefix(const char *path, uint32_t path_len,
-                              const char *prefix)
+                            const char *prefix)
 {
     size_t plen = strlen(prefix);
     if (path_len < plen) return false;
@@ -559,8 +562,57 @@ static bool path_has_prefix(const char *path, uint32_t path_len,
     return false;
 }
 
+/* Exact-match binary search on sorted null-terminated string array.
+ * Requires array sorted in C string order (lexicographic).
+ * Returns true and sets *out_idx if found. */
+static bool sg_name_found(const char *needle, uint32_t needle_len,
+                         const char *const *sorted_names, uint32_t count,
+                         uint32_t *out_idx)
+{
+    uint32_t lo = 0, hi = count;
+    while (lo < hi) {
+        uint32_t mid = lo + (hi - lo) / 2;
+        const char *candidate = sorted_names[mid];
+        size_t cand_len = strlen(candidate);
+        int cmp = (needle_len < cand_len) ? -1 :
+                  (needle_len > cand_len) ?  1 :
+                  memcmp(needle, candidate, cand_len);
+        if (cmp == 0) {
+            *out_idx = mid;
+            return true;
+        }
+        if (cmp < 0) hi = mid;
+        else lo = mid + 1;
+    }
+    return false;
+}
+
+/* Prefix-match binary search on sorted path array.
+ * Requires sorted order: shorter paths before longer paths that have them as prefix.
+ * path_has_prefix(path, sorted_paths[i]) must be the comparison.
+ * Returns true and sets *out_idx if a matching prefix is found. */
+static bool sg_path_found(const char *path, uint32_t path_len,
+                          const char *const *sorted_paths, uint32_t count,
+                          uint32_t *out_idx)
+{
+    uint32_t lo = 0, hi = count;
+    while (lo < hi) {
+        uint32_t mid = lo + (hi - lo) / 2;
+        const char *prefix = sorted_paths[mid];
+        size_t plen = strlen(prefix);
+        if (path_len >= plen && memcmp(path, prefix, plen) == 0) {
+            *out_idx = mid;
+            return true;
+        }
+        int cmp = memcmp(path, prefix, path_len < plen ? path_len : plen);
+        if (cmp < 0) hi = mid;
+        else lo = mid + 1;
+    }
+    return false;
+}
+
 static bool path_contains(const char *path, uint32_t path_len,
-                            const char *needle)
+                         const char *needle)
 {
     size_t nlen = strlen(needle);
     if (path_len < nlen) return false;
@@ -659,17 +711,16 @@ static void sg_violation_scan(const shell_dep_graph_t *graph,
         /* --- SG_VIOL_WRITE_SENSITIVE --- */
         if ((e->type == SHELL_EDGE_WRITE || e->type == SHELL_EDGE_APPEND)
             && to_node->type == SHELL_NODE_DOC && to_node->doc.kind == SHELL_DOC_FILE) {
-            for (uint32_t p = 0; p < cfg->sensitive_write_path_count; p++) {
-                if (path_has_prefix(to_node->doc.path, to_node->doc.path_len,
-                                     cfg->sensitive_write_paths[p])) {
-                    const char *desc = bw_printf(bw, "writes to sensitive path");
-                    const char *det  = bw_copy(bw, to_node->doc.path, to_node->doc.path_len);
-                    emit_violation(violations, violation_count, max_violations, violation_dropped,
-                                   SG_VIOL_WRITE_SENSITIVE, SG_SEVERITY_HIGH, e->from, desc, det);
-                    node_viols[e->from] |= SG_VIOL_WRITE_SENSITIVE;
-                    *violation_flags |= SG_VIOL_WRITE_SENSITIVE;
-                    break;
-                }
+            uint32_t idx;
+            if (sg_path_found(to_node->doc.path, to_node->doc.path_len,
+                              cfg->sensitive_write_paths, cfg->sensitive_write_path_count,
+                              &idx)) {
+                const char *desc = bw_printf(bw, "writes to sensitive path");
+                const char *det  = bw_copy(bw, to_node->doc.path, to_node->doc.path_len);
+                emit_violation(violations, violation_count, max_violations, violation_dropped,
+                               SG_VIOL_WRITE_SENSITIVE, SG_SEVERITY_HIGH, e->from, desc, det);
+                node_viols[e->from] |= SG_VIOL_WRITE_SENSITIVE;
+                *violation_flags |= SG_VIOL_WRITE_SENSITIVE;
             }
         }
 
@@ -678,29 +729,23 @@ static void sg_violation_scan(const shell_dep_graph_t *graph,
             && from_node->type == SHELL_NODE_DOC && from_node->doc.kind == SHELL_DOC_ENVVAR
             && to_node->type == SHELL_NODE_CMD && to_node->cmd.token_count > 0) {
 
-            bool sensitive_env = false;
-            for (uint32_t n = 0; n < cfg->sensitive_env_name_count; n++) {
-                if (tok_equals(from_node->doc.name, from_node->doc.name_len,
-                               cfg->sensitive_env_names[n])) {
-                    sensitive_env = true;
-                    break;
-                }
-            }
-            if (sensitive_env) {
+            uint32_t idx;
+            if (sg_name_found(from_node->doc.name, from_node->doc.name_len,
+                              cfg->sensitive_env_names, cfg->sensitive_env_name_count,
+                              &idx)) {
                 const char *cmd0 = to_node->cmd.tokens[0];
                 uint32_t cmd0_len = to_node->cmd.token_lens[0];
-                for (uint32_t c = 0; c < cfg->sensitive_cmd_name_count; c++) {
-                    if (tok_equals(cmd0, cmd0_len, cfg->sensitive_cmd_names[c])) {
-                        const char *desc = bw_printf(bw, "sensitive env before privileged cmd");
-                        const char *det  = bw_printf(bw, "%.*s before %.*s",
-                                                      (int)from_node->doc.name_len, from_node->doc.name,
-                                                      (int)cmd0_len, cmd0);
-                        emit_violation(violations, violation_count, max_violations, violation_dropped,
-                                       SG_VIOL_ENV_PRIVILEGED, SG_SEVERITY_CRITICAL, e->to, desc, det);
-                        node_viols[e->to] |= SG_VIOL_ENV_PRIVILEGED;
-                        *violation_flags |= SG_VIOL_ENV_PRIVILEGED;
-                        break;
-                    }
+                if (sg_name_found(cmd0, cmd0_len,
+                                   cfg->sensitive_cmd_names, cfg->sensitive_cmd_name_count,
+                                   &idx)) {
+                    const char *desc = bw_printf(bw, "sensitive env before privileged cmd");
+                    const char *det  = bw_printf(bw, "%.*s before %.*s",
+                                                  (int)from_node->doc.name_len, from_node->doc.name,
+                                                  (int)cmd0_len, cmd0);
+                    emit_violation(violations, violation_count, max_violations, violation_dropped,
+                                   SG_VIOL_ENV_PRIVILEGED, SG_SEVERITY_CRITICAL, e->to, desc, det);
+                    node_viols[e->to] |= SG_VIOL_ENV_PRIVILEGED;
+                    *violation_flags |= SG_VIOL_ENV_PRIVILEGED;
                 }
             }
         }
@@ -714,17 +759,17 @@ static void sg_violation_scan(const shell_dep_graph_t *graph,
                 if (re->type != SHELL_EDGE_READ && re->type != SHELL_EDGE_ARG) continue;
                 const shell_dep_node_t *doc = &graph->nodes[re->from];
                 if (doc->type != SHELL_NODE_DOC || doc->doc.kind != SHELL_DOC_FILE) continue;
-                for (uint32_t p = 0; p < cfg->sensitive_read_path_count; p++) {
-                    if (path_has_prefix(doc->doc.path, doc->doc.path_len,
-                                         cfg->sensitive_read_paths[p])) {
-                        const char *desc = bw_printf(bw, "subshell reads sensitive file");
-                        const char *det  = bw_copy(bw, doc->doc.path, doc->doc.path_len);
-                        emit_violation(violations, violation_count, max_violations, violation_dropped,
-                                       SG_VIOL_SUBST_SENSITIVE, SG_SEVERITY_HIGH, e->to, desc, det);
-                        node_viols[e->to] |= SG_VIOL_SUBST_SENSITIVE;
-                        *violation_flags |= SG_VIOL_SUBST_SENSITIVE;
-                        break;
-                    }
+                uint32_t idx;
+                if (sg_path_found(doc->doc.path, doc->doc.path_len,
+                                  cfg->sensitive_read_paths, cfg->sensitive_read_path_count,
+                                  &idx)) {
+                    const char *desc = bw_printf(bw, "subshell reads sensitive file");
+                    const char *det  = bw_copy(bw, doc->doc.path, doc->doc.path_len);
+                    emit_violation(violations, violation_count, max_violations, violation_dropped,
+                                   SG_VIOL_SUBST_SENSITIVE, SG_SEVERITY_HIGH, e->to, desc, det);
+                    node_viols[e->to] |= SG_VIOL_SUBST_SENSITIVE;
+                    *violation_flags |= SG_VIOL_SUBST_SENSITIVE;
+                    break;
                 }
             }
         }
@@ -743,17 +788,17 @@ static void sg_violation_scan(const shell_dep_graph_t *graph,
             if (e->from != ni || e->type != SHELL_EDGE_ARG) continue;
             const shell_dep_node_t *doc = &graph->nodes[e->to];
             if (doc->type != SHELL_NODE_DOC || doc->doc.kind != SHELL_DOC_FILE) continue;
-            for (uint32_t d = 0; d < cfg->sensitive_dir_count; d++) {
-                if (path_has_prefix(doc->doc.path, doc->doc.path_len,
-                                     cfg->sensitive_dirs[d])) {
-                    const char *desc = bw_printf(bw, "removal of system directory");
-                    const char *det  = bw_copy(bw, doc->doc.path, doc->doc.path_len);
-                    emit_violation(violations, violation_count, max_violations, violation_dropped,
-                                   SG_VIOL_REMOVE_SYSTEM, 95, ni, desc, det);
-                    node_viols[ni] |= SG_VIOL_REMOVE_SYSTEM;
-                    *violation_flags |= SG_VIOL_REMOVE_SYSTEM;
-                    break;
-                }
+            uint32_t idx;
+            if (sg_path_found(doc->doc.path, doc->doc.path_len,
+                              cfg->sensitive_dirs, cfg->sensitive_dir_count,
+                              &idx)) {
+                const char *desc = bw_printf(bw, "removal of system directory");
+                const char *det  = bw_copy(bw, doc->doc.path, doc->doc.path_len);
+                emit_violation(violations, violation_count, max_violations, violation_dropped,
+                               SG_VIOL_REMOVE_SYSTEM, 95, ni, desc, det);
+                node_viols[ni] |= SG_VIOL_REMOVE_SYSTEM;
+                *violation_flags |= SG_VIOL_REMOVE_SYSTEM;
+                break;
             }
         }
     }
@@ -807,25 +852,13 @@ static void sg_violation_scan(const shell_dep_graph_t *graph,
         if (src->type != SHELL_NODE_CMD || dst->type != SHELL_NODE_CMD) continue;
         if (src->cmd.token_count == 0 || dst->cmd.token_count == 0) continue;
 
-        bool is_download = false;
-        for (uint32_t c = 0; c < cfg->download_cmd_count; c++) {
-            if (tok_equals(src->cmd.tokens[0], src->cmd.token_lens[0],
-                           cfg->download_cmds[c])) {
-                is_download = true;
-                break;
-            }
-        }
-        if (!is_download) continue;
-
-        bool is_spawn = false;
-        for (uint32_t c = 0; c < cfg->shell_spawn_cmd_count; c++) {
-            if (tok_equals(dst->cmd.tokens[0], dst->cmd.token_lens[0],
-                           cfg->shell_spawn_cmds[c])) {
-                is_spawn = true;
-                break;
-            }
-        }
-        if (!is_spawn) continue;
+        uint32_t idx;
+        if (!sg_name_found(src->cmd.tokens[0], src->cmd.token_lens[0],
+                            cfg->download_cmds, cfg->download_cmd_count, &idx))
+            continue;
+        if (!sg_name_found(dst->cmd.tokens[0], dst->cmd.token_lens[0],
+                            cfg->shell_spawn_cmds, cfg->shell_spawn_cmd_count, &idx))
+            continue;
 
         const char *desc = bw_printf(bw, "download piped into shell executor");
         const char *det  = bw_printf(bw, "%.*s | %.*s",
@@ -842,15 +875,10 @@ static void sg_violation_scan(const shell_dep_graph_t *graph,
         const shell_dep_node_t *node = &graph->nodes[ni];
         if (node->type != SHELL_NODE_CMD || node->cmd.token_count == 0) continue;
 
-        bool is_perm = false;
-        for (uint32_t c = 0; c < cfg->perm_mod_cmd_count; c++) {
-            if (tok_equals(node->cmd.tokens[0], node->cmd.token_lens[0],
-                           cfg->perm_mod_cmds[c])) {
-                is_perm = true;
-                break;
-            }
-        }
-        if (!is_perm) continue;
+        uint32_t idx;
+        if (!sg_name_found(node->cmd.tokens[0], node->cmd.token_lens[0],
+                           cfg->perm_mod_cmds, cfg->perm_mod_cmd_count, &idx))
+            continue;
 
         bool has_recursive = false;
         for (uint32_t t = 1; t < node->cmd.token_count; t++) {
@@ -866,17 +894,16 @@ static void sg_violation_scan(const shell_dep_graph_t *graph,
             if (e->from != ni || e->type != SHELL_EDGE_ARG) continue;
             const shell_dep_node_t *doc = &graph->nodes[e->to];
             if (doc->type != SHELL_NODE_DOC || doc->doc.kind != SHELL_DOC_FILE) continue;
-            for (uint32_t d = 0; d < cfg->sensitive_dir_count; d++) {
-                if (path_has_prefix(doc->doc.path, doc->doc.path_len,
-                                    cfg->sensitive_dirs[d])) {
-                    const char *desc = bw_printf(bw, "recursive permission change on system dir");
-                    const char *det  = bw_copy(bw, doc->doc.path, doc->doc.path_len);
-                    emit_violation(violations, violation_count, max_violations, violation_dropped,
-                                   SG_VIOL_PERM_SYSTEM, SG_SEVERITY_HIGH, ni, desc, det);
-                    node_viols[ni] |= SG_VIOL_PERM_SYSTEM;
-                    *violation_flags |= SG_VIOL_PERM_SYSTEM;
-                    break;
-                }
+            if (sg_path_found(doc->doc.path, doc->doc.path_len,
+                              cfg->sensitive_dirs, cfg->sensitive_dir_count,
+                              &idx)) {
+                const char *desc = bw_printf(bw, "recursive permission change on system dir");
+                const char *det  = bw_copy(bw, doc->doc.path, doc->doc.path_len);
+                emit_violation(violations, violation_count, max_violations, violation_dropped,
+                               SG_VIOL_PERM_SYSTEM, SG_SEVERITY_HIGH, ni, desc, det);
+                node_viols[ni] |= SG_VIOL_PERM_SYSTEM;
+                *violation_flags |= SG_VIOL_PERM_SYSTEM;
+                break;
             }
         }
     }
@@ -891,24 +918,20 @@ static void sg_violation_scan(const shell_dep_graph_t *graph,
         if (!tok_equals(cmd0, cmd0_len, "sudo") && !tok_equals(cmd0, cmd0_len, "su"))
             continue;
 
-        bool is_spawn = false;
-        for (uint32_t c = 0; c < cfg->shell_spawn_cmd_count; c++) {
-            if (tok_equals(node->cmd.tokens[1], node->cmd.token_lens[1],
-                           cfg->shell_spawn_cmds[c])) {
-                is_spawn = true;
-                break;
+        uint32_t idx;
+        if (tok_equals(cmd0, cmd0_len, "sudo") || tok_equals(cmd0, cmd0_len, "su")) {
+            if (sg_name_found(node->cmd.tokens[1], node->cmd.token_lens[1],
+                               cfg->shell_spawn_cmds, cfg->shell_spawn_cmd_count, &idx)) {
+                const char *desc = bw_printf(bw, "privileged shell spawn");
+                const char *det  = bw_printf(bw, "%.*s %.*s",
+                                              (int)cmd0_len, cmd0,
+                                              (int)node->cmd.token_lens[1], node->cmd.tokens[1]);
+                emit_violation(violations, violation_count, max_violations, violation_dropped,
+                               SG_VIOL_SHELL_ESCALATION, SG_SEVERITY_CRITICAL, ni, desc, det);
+                node_viols[ni] |= SG_VIOL_SHELL_ESCALATION;
+                *violation_flags |= SG_VIOL_SHELL_ESCALATION;
             }
         }
-        if (!is_spawn) continue;
-
-        const char *desc = bw_printf(bw, "privileged shell spawn");
-        const char *det  = bw_printf(bw, "%.*s %.*s",
-                                      (int)cmd0_len, cmd0,
-                                      (int)node->cmd.token_lens[1], node->cmd.tokens[1]);
-        emit_violation(violations, violation_count, max_violations, violation_dropped,
-                       SG_VIOL_SHELL_ESCALATION, SG_SEVERITY_CRITICAL, ni, desc, det);
-        node_viols[ni] |= SG_VIOL_SHELL_ESCALATION;
-        *violation_flags |= SG_VIOL_SHELL_ESCALATION;
     }
 
     /* --- SG_VIOL_SUDO_REDIRECT --- */
