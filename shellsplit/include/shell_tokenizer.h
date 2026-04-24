@@ -86,14 +86,24 @@ typedef enum {
 typedef struct {
     uint32_t max_subcommands;   // Max subcommands to return
     uint32_t max_depth;        // Max nesting depth
+    bool strict_mode;         // true = reject ambiguous/dangerous input as EPARSE
 } shell_limits_t;
+
+/**
+ * strict_mode rejects:
+ * - Unterminated quotes (single or double)
+ * - Unclosed parentheses (except at top-level for subshells)
+ * - Invalid variable syntax (e.g., ${} with empty name)
+ * - Backslash at end of string (line continuation edge cases)
+ */
 
 /**
  * Default limits
  */
 static const shell_limits_t SHELL_LIMITS_DEFAULT = {
     .max_subcommands = SHELL_MAX_SUBCOMMANDS,
-    .max_depth = SHELL_MAX_DEPTH
+    .max_depth = SHELL_MAX_DEPTH,
+    .strict_mode = false
 };
 
 /**

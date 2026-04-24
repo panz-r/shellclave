@@ -726,9 +726,31 @@ shell_error_t shell_parse_fast(
         result->count = subcmd_idx;
         return SHELL_ETRUNC;
     }
-    
+
+    if (limits && limits->strict_mode) {
+        bool in_single = false, in_double = false;
+        for (size_t i = 0; i < cmd_len; i++) {
+            char c = cmd[i];
+            if (c == '\\' && i + 1 < cmd_len) {
+                i++;
+                continue;
+            }
+            if (c == '\'' && !in_double) {
+                in_single = !in_single;
+            } else if (c == '"' && !in_single) {
+                in_double = !in_double;
+            }
+        }
+        if (in_single || in_double) {
+            result->status |= SHELL_STATUS_ERROR;
+            result->count = subcmd_idx;
+            return SHELL_EPARSE;
+        }
+    }
+
     // Check for unclosed quotes or braces - this indicates malformed input
-    if (in_quotes || brace_depth > 0) {
+    // Only in strict mode; permissive mode allows unterminated quotes
+    if ((limits && limits->strict_mode) && (in_quotes || brace_depth > 0)) {
         result->status = SHELL_STATUS_ERROR;
         result->count = subcmd_idx;
         return SHELL_EPARSE;
@@ -737,7 +759,7 @@ shell_error_t shell_parse_fast(
     // Check for unclosed parentheses - indicates invalid input like "( git"
     // But allow subshell syntax - only reject if paren_depth > 0 AND the content 
     // doesn't look like a valid subshell (e.g., "( ls )" has matching parens)
-    if (paren_depth > 0) {
+    if ((limits && limits->strict_mode) && paren_depth > 0) {
         result->status = SHELL_STATUS_ERROR;
         result->count = subcmd_idx;
         return SHELL_EPARSE;

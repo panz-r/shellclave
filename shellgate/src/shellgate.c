@@ -107,6 +107,7 @@ struct sg_gate {
     uint32_t reject_mask;
     sg_stop_mode_t stop_mode;
     bool     suggestions;
+    bool     strict_mode;
 
     sg_expand_var_fn  expand_var_fn;
     void             *expand_var_ctx;
@@ -139,6 +140,7 @@ sg_gate_t *sg_gate_new(void)
     g->reject_mask = SG_REJECT_MASK_DEFAULT;
     g->stop_mode = SG_STOP_FIRST_FAIL;
     g->suggestions = true;
+    g->strict_mode = true;
 
     return g;
 }
@@ -1310,7 +1312,8 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len,
 
     /* Step 1: Fast parse to check features */
     shell_parse_result_t fast;
-    shell_error_t ferr = shell_parse_fast(cmd, cmd_len, NULL, &fast);
+    shell_limits_t lim = { .max_subcommands = 64, .max_depth = 8, .strict_mode = gate->strict_mode };
+    shell_error_t ferr = shell_parse_fast(cmd, cmd_len, &lim, &fast);
     if (ferr == SHELL_EPARSE && fast.count == 0) {
         out->verdict = SG_VERDICT_ALLOW;
         return SG_OK;

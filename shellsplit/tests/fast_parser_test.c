@@ -1163,6 +1163,38 @@ void test_layer3_feature_exhaustiveness(void) {
     test_count_at_least("Long multi-feature count>=5", &result, 5);
 }
 
+static void test_strict_mode(void) {
+    printf("\n--- Strict Mode ---\n");
+
+    shell_parse_result_t result;
+    shell_limits_t strict = { .max_subcommands = 64, .max_depth = 8, .strict_mode = true };
+    shell_limits_t permissive = { .max_subcommands = 64, .max_depth = 8, .strict_mode = false };
+
+    shell_error_t err = shell_parse_fast("echo 'unclosed", strlen("echo 'unclosed"), &strict, &result);
+    test("strict mode rejects unterminated single quote", err == SHELL_EPARSE);
+
+    err = shell_parse_fast("echo \"unclosed", strlen("echo \"unclosed"), &strict, &result);
+    test("strict mode rejects unterminated double quote", err == SHELL_EPARSE);
+
+    err = shell_parse_fast("echo 'unclosed", strlen("echo 'unclosed"), &permissive, &result);
+    test("permissive mode allows unterminated quote", err == SHELL_OK);
+
+    err = shell_parse_fast("echo \"unclosed", strlen("echo \"unclosed"), &permissive, &result);
+    test("permissive mode allows unterminated double quote", err == SHELL_OK);
+
+    err = shell_parse_fast("echo 'valid'", strlen("echo 'valid'"), &strict, &result);
+    test("strict mode allows properly closed single quote", err == SHELL_OK);
+
+    err = shell_parse_fast("echo \"valid\"", strlen("echo \"valid\""), &strict, &result);
+    test("strict mode allows properly closed double quote", err == SHELL_OK);
+
+    err = shell_parse_fast("echo 'hello world'", strlen("echo 'hello world'"), &strict, &result);
+    test("strict mode allows escaped quote in single quotes", err == SHELL_OK);
+
+    err = shell_parse_fast("echo \"a \\\"quoted\\\" string\"", strlen("echo \"a \\\"quoted\\\" string\""), &strict, &result);
+    test("strict mode allows escaped quotes in double quotes", err == SHELL_OK);
+}
+
 static void test_fast_parser_limitations(void) {
     printf("\n--- Fast Parser Limitations (Documented Bugs) ---\n");
     
@@ -1269,7 +1301,9 @@ int main() {
     test_layer3_feature_exhaustiveness();
     
     test_fast_parser_limitations();
-    
+
+    test_strict_mode();
+
     printf("\n=== SUMMARY ===\n");
     printf("Results: %d/%d passed\n", pass_count, test_count);
     printf("Known limitations: %d tested, %d fixed\n", known_limitations, known_limitations_passed);
