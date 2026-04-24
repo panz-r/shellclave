@@ -336,6 +336,13 @@ static const char *build_cmd_string(const shell_dep_cmd_t *cmd,
      * contain spaces or special characters would change the meaning
      * of the reconstructed command.  The goal is a readable display
      * string, not a round-trippable shell command.
+     *
+     * NOTE: Variable expansion (e.g. $FOO -> "a b c") or glob expansion
+     * that produces strings containing spaces will change the token
+     * count of the reconstructed command.  Policy matching is performed
+     * on this flattened string, so such expansions can cause false
+     * negatives or incorrect suggestions.  Callers should be aware of
+     * this limitation when using expansion callbacks.
      */
     if (bw->used >= bw->size) { bw->overflow = true; return NULL; }
 
@@ -1443,6 +1450,8 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len,
 
         if (!sr->matches && gate->stop_mode == SG_STOP_FIRST_FAIL) break;
         if (sr->matches && gate->stop_mode == SG_STOP_FIRST_PASS) break;
+        if (sr->verdict == SG_VERDICT_ALLOW && gate->stop_mode == SG_STOP_FIRST_ALLOW) break;
+        if (sr->verdict == SG_VERDICT_DENY && gate->stop_mode == SG_STOP_FIRST_DENY) break;
     }
 
     out->truncated = bw.overflow || subcmd_truncated;

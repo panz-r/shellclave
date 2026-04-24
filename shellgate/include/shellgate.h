@@ -132,9 +132,11 @@ typedef enum {
 } sg_verdict_t;
 
 typedef enum {
-    SG_STOP_FIRST_FAIL = 0,
-    SG_STOP_FIRST_PASS = 1,
-    SG_EVAL_ALL        = 2,
+    SG_STOP_FIRST_FAIL   = 0,
+    SG_STOP_FIRST_PASS   = 1,  /* stops after first subcommand matching any policy (allow or deny) */
+    SG_STOP_FIRST_ALLOW  = 2,  /* stops after first ALLOW verdict */
+    SG_STOP_FIRST_DENY   = 3,  /* stops after first DENY verdict */
+    SG_EVAL_ALL          = 4,
 } sg_stop_mode_t;
 
 /* Per-subcommand result: lightweight, pointers into output buffer. */
@@ -159,7 +161,13 @@ typedef struct {
     const char *detail;
 } sg_violation_t;
 
-/* Top-level evaluation result: metadata + pointer array into buffer. */
+/* Top-level evaluation result: metadata + pointer array into buffer.
+ *
+ * Violation fields (violations[], violation_count, violation_flags,
+ * violation_dropped_count, has_violations) are always populated from
+ * the dependency graph scan, regardless of the overall verdict.
+ * They reflect what the graph observed, not what the policy decided.
+ */
 typedef struct {
     sg_verdict_t verdict;
     const char *deny_reason;
