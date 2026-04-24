@@ -188,4 +188,34 @@ coverage: clean
 	@echo "Detailed coverage info in coverage.info"
 	@echo "HTML report: run 'genhtml coverage.info' to generate"
 
-.PHONY: all clean test fasttest coverage
+# LibFuzzer build (requires clang with sanitizers)
+FUZZ_CC = clang
+FUZZ_CXX = clang++
+FUZZ_CFLAGS = -fsanitize=fuzzer,address,undefined -g -fsanitize-coverage=trace-pc-guard -I$(INC_DIR)
+FUZZ_LDFLAGS = -fsanitize=fuzzer,address,undefined
+FUZZ_DIR = fuzz
+
+# Build LibFuzzer harness
+fuzz: $(FUZZ_DIR)/tokenizer_fuzzer
+	@echo "Fuzzer built successfully"
+	@echo "Run with: ./fuzz/tokenizer_fuzzer -max_len=8192 -verbosity=1"
+	@echo "For corpus: mkdir -p fuzz/corpus && ./fuzz/tokenizer_fuzzer fuzz/corpus"
+
+$(FUZZ_DIR)/tokenizer_fuzzer: $(FUZZ_DIR)/tokenizer_fuzzer.cpp \
+		$(SRC_DIR)/shell_tokenizer.c $(SRC_DIR)/shell_tokenizer_full.c \
+		$(SRC_DIR)/shell_processor.c $(SRC_DIR)/shell_transform.c \
+		$(SRC_DIR)/shell_abstract.c \
+		$(INC_DIR)/shell_tokenizer.h $(INC_DIR)/shell_tokenizer_full.h \
+		$(INC_DIR)/shell_processor.h $(INC_DIR)/shell_transform.h \
+		$(INC_DIR)/shell_abstract.h
+	$(CC) -c $(CFLAGS) $(FUZZ_CFLAGS) -o shell_tokenizer.o $(SRC_DIR)/shell_tokenizer.c
+	$(CC) -c $(CFLAGS) $(FUZZ_CFLAGS) -o shell_tokenizer_full.o $(SRC_DIR)/shell_tokenizer_full.c
+	$(CC) -c $(CFLAGS) $(FUZZ_CFLAGS) -o shell_processor.o $(SRC_DIR)/shell_processor.c
+	$(CC) -c $(CFLAGS) $(FUZZ_CFLAGS) -o shell_transform.o $(SRC_DIR)/shell_transform.c
+	$(CC) -c $(CFLAGS) $(FUZZ_CFLAGS) -o shell_abstract.o $(SRC_DIR)/shell_abstract.c
+	$(FUZZ_CXX) $(FUZZ_CFLAGS) -o $@ $(FUZZ_DIR)/tokenizer_fuzzer.cpp \
+		shell_tokenizer.o shell_tokenizer_full.o \
+		shell_processor.o shell_transform.o shell_abstract.o $(FUZZ_LDFLAGS)
+	rm -f shell_tokenizer.o shell_tokenizer_full.o shell_processor.o shell_transform.o shell_abstract.o
+
+.PHONY: all clean test fasttest coverage fuzz
