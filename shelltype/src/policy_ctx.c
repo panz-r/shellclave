@@ -17,6 +17,7 @@
 #include <string.h>
 #include <stdbool.h>
 #include <assert.h>
+#include <stdatomic.h>
 
 #define DEFAULT_ARENA_SIZE (256 * 1024)  /* 256 KB default */
 #define STR_POOL_INIT_CAP  1024
@@ -87,8 +88,9 @@ static bool str_pool_grow(str_pool_t *p)
  * ============================================================ */
 
 struct st_policy_ctx {
-    arena_t    arena;
-    str_pool_t str_pool;
+    arena_t         arena;
+    str_pool_t      str_pool;
+    _Atomic unsigned refcount;  /* Reference count for safe cleanup */
 };
 
 st_policy_ctx_t *st_policy_ctx_new(void)
@@ -112,6 +114,7 @@ st_policy_ctx_t *st_policy_ctx_new_with_arena(size_t arena_size)
         return NULL;
     }
 
+    atomic_init(&ctx->refcount, 1);
     return ctx;
 }
 
@@ -123,21 +126,41 @@ void st_policy_ctx_free(st_policy_ctx_t *ctx)
     free(ctx);
 }
 
-/*
- * NOTE: This resets the context for reuse, clearing all interned strings
- * and freeing the arena. Use this before loading a new policy into
- * a cleared context. Any previously created policies using this context
- * become invalid after reset.
- */
-void st_policy_ctx_reset(st_policy_ctx_t *ctx)
+void st_policy_ctx_retain(st_policy_ctx_t *ctx)
 {
     if (!ctx) return;
-    free(ctx->arena.base);
-    ctx->arena.base = malloc(DEFAULT_ARENA_SIZE);
-    ctx->arena.size = DEFAULT_ARENA_SIZE;
-    ctx->arena.used = 0;
+    atomic_fetch_add(&ctx->refcount, 1);
+}
+
+void st_policy_ctx_release(st_policy_ctx_t *ctx)
+{
+    if (!ctx) return;
+    if (atomic_fetch_sub(&ctx->refcount, 1) == 1) {
+        st_policy_ctx_free(ctx);
+    }
+}
+
+/*
+ * Reset the context for reuse, clearing all interned strings and freeing the arena.
+ * Use this before loading a new policy into a cleared context.
+ *
+ * Returns ST_ERR_INVALID if there are active references (policies using this context).
+ * Use st_policy_ctx_release() to drop all references before resetting.
+ */
+st_error_t st_policy_ctx_reset(st_policy_ctx_t *ctx)
+{
+    if (!ctx) return ST_ERR_INVALID;
+    
+    /* Only allow reset if no other references exist */
+    if (atomic_load(&ctx->refcount) > 1) {
+        return ST_ERR_INVALID;
+    }
+    
+    arena_free(&ctx->arena);
+    arena_init(&ctx->arena, DEFAULT_ARENA_SIZE);
     str_pool_free(&ctx->str_pool);
     str_pool_init(&ctx->str_pool);
+    return ST_OK;
 }
 
 static uint64_t str_pool_hash(const char *str, size_t len)

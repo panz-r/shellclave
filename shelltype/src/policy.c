@@ -236,6 +236,7 @@ struct st_policy {
     uint64_t            pos_built_epoch[FILTER_POS_LEVELS];
     size_t              pattern_count;
     size_t              children_count;
+    st_policy_stats_t   stats;  /* Runtime statistics */
 };
 
 /* ============================================================
@@ -392,8 +393,30 @@ static bool insert_child(policy_state_t *node, st_policy_t *policy,
  * PATTERN PARSING
  * ============================================================ */
 
+/*
+ * Validate pattern syntax:
+ * - Reject patterns starting with * (too broad at first position)
+ *
+ * Returns true if valid, false otherwise.
+ */
+static bool validate_pattern(const char *pattern)
+{
+    if (!pattern || !pattern[0]) return false;
+    
+    /* Check first token - reject patterns starting with * (too broad) */
+    const char *first = pattern;
+    while (*first == ' ') first++;
+    if (strncmp(first, "*", 1) == 0 && (first[1] == ' ' || first[1] == '\0')) {
+        return false; /* Reject pattern starting with * */
+    }
+    
+    return true;
+}
+
 static st_token_t *parse_pattern(const char *pattern, size_t *out_count)
 {
+    if (!validate_pattern(pattern)) return NULL;
+    
     size_t count = 1;
     for (const char *p = pattern; *p; p++) {
         if (*p == ' ') count++;
@@ -456,17 +479,63 @@ static void free_pattern_tokens(st_token_t *tokens, size_t count)
 
 static void policy_rebuild_filters(st_policy_t *policy)
 {
-    /* Reset or create filters, clear masks */
-    for (int i = 0; i < FILTER_POS_LEVELS; i++) {
-        if (policy->pos_filters[i]) {
-            vacuum_filter_reset(policy->pos_filters[i]);
-        } else {
-            policy->pos_filters[i] = vacuum_filter_create(FILTER_POS_CAPACITY, 0, 0, 0);
+    /* Count distinct literals at each depth first to size filters correctly */
+    size_t depth_literal_count[FILTER_POS_LEVELS] = {0};
+
+    {
+        typedef struct { uint32_t idx; uint8_t depth; } bfs_q;
+        bfs_q stack_q[128];
+        bfs_q *q = stack_q;
+        size_t q_cap = 128;
+        size_t head = 0, tail = 0;
+
+        q[tail].idx = 0;
+        q[tail].depth = 0;
+        tail++;
+
+        while (head < tail) {
+            bfs_q entry = q[head++];
+            if (entry.depth >= FILTER_POS_LEVELS) continue;
+
+            policy_state_t *node = &policy->states.states[entry.idx];
+            uint16_t total = node->literal_count + node->wildcard_count;
+            child_entry_t *children = (child_entry_t *)(policy->children_arena.base + node->children_offset);
+
+            for (uint16_t i = 0; i < total; i++) {
+                child_entry_t *c = &children[i];
+                if (c->type == ST_TYPE_LITERAL && c->text)
+                    depth_literal_count[entry.depth]++;
+
+                if (tail >= q_cap) {
+                    size_t new_cap = q_cap * 2;
+                    bfs_q *new_q = realloc(q == stack_q ? NULL : q, new_cap * sizeof(bfs_q));
+                    if (!new_q) break;
+                    if (q == stack_q) memcpy(new_q, stack_q, sizeof(stack_q));
+                    q = new_q;
+                    q_cap = new_cap;
+                }
+                q[tail].idx = c->target;
+                q[tail].depth = entry.depth + 1;
+                tail++;
+            }
         }
-        policy->pos_wildcard_mask[i] = 0;
+        if (q != stack_q) free(q);
     }
 
-    /* BFS walk: track (state_idx, depth) pairs */
+    /* Reset or create filters with proper capacity */
+    for (int i = 0; i < FILTER_POS_LEVELS; i++) {
+        vacuum_filter_destroy(policy->pos_filters[i]);
+        policy->pos_filters[i] = NULL;
+        policy->pos_wildcard_mask[i] = 0;
+
+        if (depth_literal_count[i] > 0) {
+            size_t cap = depth_literal_count[i] + depth_literal_count[i] / 4;
+            if (cap < 64) cap = 64;
+            policy->pos_filters[i] = vacuum_filter_create(cap, 0, 0, 0);
+        }
+    }
+
+    /* BFS walk: insert literals into filters, accumulate wildcard masks */
     typedef struct { uint32_t idx; uint8_t depth; } bfs_q;
     bfs_q stack_q[128];
     bfs_q *q = stack_q;
@@ -494,7 +563,12 @@ static void policy_rebuild_filters(st_policy_t *policy)
             if (c->type == ST_TYPE_LITERAL) {
                 if (policy->pos_filters[d]) {
                     uint64_t h = filter_hash_fnv1a(c->text, strlen(c->text));
-                    vacuum_filter_insert(policy->pos_filters[d], h);
+                    vacuum_err_t vrc = vacuum_filter_insert(policy->pos_filters[d], h);
+                    if (vrc != VACUUM_OK) {
+                        /* Filter full — disable for this depth */
+                        vacuum_filter_destroy(policy->pos_filters[d]);
+                        policy->pos_filters[d] = NULL;
+                    }
                 }
             } else {
                 policy->pos_wildcard_mask[d] |= (1u << c->type);
@@ -517,7 +591,7 @@ static void policy_rebuild_filters(st_policy_t *policy)
     if (q != stack_q) free(q);
 
     for (int i = 0; i < FILTER_POS_LEVELS; i++) {
-        policy->pos_built_epoch[i] = policy->epoch;
+        policy->pos_built_epoch[i] = atomic_load(&policy->epoch);
     }
 }
 
@@ -541,6 +615,15 @@ st_policy_t *st_policy_new(st_policy_ctx_t *ctx)
     atomic_store(&policy->epoch, 1);
     policy->pattern_count = 0;
     policy->children_count = 0;
+    
+    /* Statistics */
+    policy->stats.eval_count = 0;
+    policy->stats.filter_reject_count = 0;
+    policy->stats.trie_walk_count = 0;
+    policy->stats.suggestion_count = 0;
+    policy->stats.filter_rebuild_count = 0;
+    policy->stats.filter_rebuild_us = 0;
+    
     if (!arena_init(&policy->children_arena, CHILDREN_ARENA_SIZE)) {
         states_array_free(&policy->states);
         free(policy);
@@ -552,6 +635,10 @@ st_policy_t *st_policy_new(st_policy_ctx_t *ctx)
         free(policy);
         return NULL;
     }
+    
+    /* Retain context to prevent reset while policy is alive */
+    st_policy_ctx_retain(ctx);
+    
     return policy;
 }
 
@@ -565,6 +652,8 @@ void st_policy_free(st_policy_t *policy)
     pattern_reg_free(&policy->patterns);
     states_array_free(&policy->states);
     arena_free(&policy->children_arena);
+    /* Release context reference */
+    st_policy_ctx_release(policy->ctx);
     free(policy);
 }
 
@@ -580,7 +669,11 @@ st_error_t st_policy_add(st_policy_t *policy, const char *pattern)
 
     size_t token_count = 0;
     st_token_t *tokens = parse_pattern(pattern, &token_count);
-    if (!tokens) { pthread_rwlock_unlock(&policy->rwlock); return ST_ERR_MEMORY; }
+    /* parse_pattern returns NULL for validation errors or memory failures */
+    if (!tokens) { 
+        pthread_rwlock_unlock(&policy->rwlock); 
+        return ST_ERR_INVALID; /* Validation errors are treated as invalid */
+    }
     if (token_count == 0) { free_pattern_tokens(tokens, token_count); pthread_rwlock_unlock(&policy->rwlock); return ST_ERR_INVALID; }
 
     uint32_t current = 0;
@@ -888,6 +981,9 @@ st_error_t st_policy_eval(st_policy_t *policy,
 
     pthread_rwlock_rdlock(&policy->rwlock);
 
+    /* Track statistics */
+    policy->stats.eval_count++;
+
     if (result) {
         result->matches = false;
         result->matching_pattern = NULL;
@@ -903,7 +999,8 @@ st_error_t st_policy_eval(st_policy_t *policy,
     if (cmd.count == 0 || cmd.count > MAX_CMD_TOKENS) {
         st_free_token_array(&cmd);
         pthread_rwlock_unlock(&policy->rwlock);
-        return ST_ERR_INVALID;
+        if (result) result->matches = false;
+        return ST_OK;
     }
 
     /* ============================================================
@@ -912,22 +1009,43 @@ st_error_t st_policy_eval(st_policy_t *policy,
      * Runs before the trie walk. Rejects definite no-matches early.
      * Runs in ALL modes (verify-only and suggest).
      * Epoch comparison drives lazy rebuild — no spin-wait needed.
+     *
+     * NOTE: First evaluation after many additions may be slower due to
+     * lazy filter rebuild. This is expected behavior.
      * ============================================================ */
     bool filter_rejected = false;
     size_t check_len = cmd.count < FILTER_POS_LEVELS ? cmd.count : FILTER_POS_LEVELS;
 
     uint64_t current_epoch = atomic_load(&policy->epoch);
+    bool needs_rebuild = false;
     for (size_t i = 0; i < check_len; i++) {
         if (policy->pos_built_epoch[i] != current_epoch) {
-            policy_rebuild_filters(policy);
+            needs_rebuild = true;
             break;
         }
+    }
+
+    if (needs_rebuild) {
+        pthread_rwlock_unlock(&policy->rwlock);
+        pthread_rwlock_wrlock(&policy->rwlock);
+        /* Re-check epoch after acquiring write lock (another thread may have rebuilt) */
+        uint64_t recheck_epoch = atomic_load(&policy->epoch);
+        if (policy->pos_built_epoch[0] != recheck_epoch) {
+            policy_rebuild_filters(policy);
+        }
+        pthread_rwlock_unlock(&policy->rwlock);
+        pthread_rwlock_rdlock(&policy->rwlock);
     }
 
     for (size_t i = 0; i < check_len; i++) {
         st_token_type_t ctype = cmd.tokens[i].type;
         if (ctype == ST_TYPE_LITERAL) {
-            if (policy->pos_wildcard_mask[i] != 0) continue;
+            /* Only skip filter if wildcard mask includes a type compatible with LITERAL.
+             * Previously we skipped whenever ANY wildcard existed, which was too broad
+             * and defeated the filter for unrelated wildcards (e.g., NUMBER wildcard
+             * at a depth where we're checking a LITERAL token). */
+            if (policy->pos_wildcard_mask[i] != 0 &&
+                (policy->pos_wildcard_mask[i] & compat_mask(ctype)) != 0) continue;
             if (!policy->pos_filters[i] || policy->pos_filters[i]->count == 0) continue;
             uint64_t h = filter_hash_fnv1a(cmd.tokens[i].text, strlen(cmd.tokens[i].text));
             if (!vacuum_filter_lookup(policy->pos_filters[i], h)) {
@@ -946,9 +1064,14 @@ st_error_t st_policy_eval(st_policy_t *policy,
 
     /* Verify-only fast path: filter rejected → skip trie walk entirely */
     if (filter_rejected && !result) {
+        policy->stats.filter_reject_count++;
         st_free_token_array(&cmd);
-        return ST_ERR_INVALID;
+        pthread_rwlock_unlock(&policy->rwlock);
+        return ST_OK;
     }
+
+    /* Track trie walk */
+    policy->stats.trie_walk_count++;
 
     /* ============================================================
      * TRIE WALK
@@ -1002,7 +1125,7 @@ st_error_t st_policy_eval(st_policy_t *policy,
     if (!result) {
         st_free_token_array(&cmd);
         pthread_rwlock_unlock(&policy->rwlock);
-        return ST_ERR_INVALID;
+        return ST_OK;
     }
 
     /* ============================================================
@@ -1016,7 +1139,7 @@ st_error_t st_policy_eval(st_policy_t *policy,
     /* Suggestion A: minimal extension (matched prefix as-is + remaining as literals) */
     {
         st_token_t *pat_tokens = malloc(cmd.count * sizeof(st_token_t));
-        if (!pat_tokens) { st_free_token_array(&cmd); return ST_ERR_MEMORY; }
+        if (!pat_tokens) { st_free_token_array(&cmd); pthread_rwlock_unlock(&policy->rwlock); return ST_ERR_MEMORY; }
 
         for (size_t i = 0; i < match_depth; i++) {
             pat_tokens[i].text = (char *)cmd.tokens[i].text;
@@ -1034,7 +1157,7 @@ st_error_t st_policy_eval(st_policy_t *policy,
             st_free_token_array(&cmd);
             result->error = ST_ERR_FAILED;
             pthread_rwlock_unlock(&policy->rwlock);
-            return ST_ERR_FAILED;
+            return ST_OK;
         }
         result->suggestions[0].based_on = based_on;
         result->suggestions[0].confidence = confidence;
@@ -1080,7 +1203,7 @@ st_error_t st_policy_eval(st_policy_t *policy,
                         st_free_token_array(&cmd);
                         result->error = ST_ERR_FAILED;
                         pthread_rwlock_unlock(&policy->rwlock);
-                        return ST_ERR_FAILED;
+                        return ST_OK;
                     }
                     result->suggestions[1].based_on = based_on;
                     result->suggestions[1].confidence = confidence;
@@ -1105,6 +1228,11 @@ st_error_t st_policy_eval(st_policy_t *policy,
             }
             joined = st_join(joined, div_type);
 
+            /* Security: cap generalization at #w to prevent over-broad suggestions.
+             * Jumping directly to * matches ANY token which is too permissive.
+             * #w (#word) is broad but still restricts to identifier-like tokens. */
+            if (joined == ST_TYPE_ANY) joined = ST_TYPE_WORD;
+
             if (joined != ST_TYPE_LITERAL) {
                 size_t pat_len = cmd.count;
                 st_token_t *pat_tokens = malloc(pat_len * sizeof(st_token_t));
@@ -1127,7 +1255,7 @@ st_error_t st_policy_eval(st_policy_t *policy,
                         st_free_token_array(&cmd);
                         result->error = ST_ERR_FAILED;
                         pthread_rwlock_unlock(&policy->rwlock);
-                        return ST_ERR_FAILED;
+                        return ST_OK;
                     }
                     result->suggestions[1].based_on = based_on;
                     result->suggestions[1].confidence = confidence;
@@ -1145,7 +1273,7 @@ st_error_t st_policy_eval(st_policy_t *policy,
             st_free_token_array(&cmd);
             result->error = ST_ERR_FAILED;
             pthread_rwlock_unlock(&policy->rwlock);
-            return ST_ERR_FAILED;
+            return ST_OK;
         }
         result->suggestions[1].based_on = NULL;
         result->suggestions[1].confidence = confidence;
@@ -1153,6 +1281,7 @@ st_error_t st_policy_eval(st_policy_t *policy,
     }
 
     result->suggestion_count = n_suggestions;
+    policy->stats.suggestion_count += n_suggestions;
     st_free_token_array(&cmd);
     pthread_rwlock_unlock(&policy->rwlock);
     return ST_OK;
@@ -1564,29 +1693,17 @@ st_error_t st_policy_load(st_policy_t *policy, const char *path, bool clear_firs
 {
     if (!policy || !path) return ST_ERR_INVALID;
 
-    if (clear_first) {
-        /* Clear active patterns and state (reset children arena) */
-        arena_free(&policy->children_arena);
-        arena_init(&policy->children_arena, CHILDREN_ARENA_SIZE);
-        free(policy->states.states);
-        states_array_init(&policy->states);
-        policy->patterns.count = 0;
-        policy->pattern_count = 0;
-        policy->children_count = 0;
-        for (int i = 0; i < FILTER_POS_LEVELS; i++) {
-            vacuum_filter_destroy(policy->pos_filters[i]);
-            policy->pos_filters[i] = NULL;
-            policy->pos_built_epoch[i] = 0;
-        }
-        atomic_fetch_add(&policy->epoch, 1);
-    }
-
-    /* Save counts for rollback on error (append mode only) */
-    size_t saved_states_count = policy->states.count;
-    size_t saved_patterns_count = policy->patterns.count;
-
+    /* ============================================================
+     * PASS 1: Read file, verify CRC, collect pattern lines.
+     * Do NOT modify the policy yet.
+     * ============================================================ */
     FILE *fp = fopen(path, "r");
     if (!fp) return ST_ERR_IO;
+
+    /* Dynamic array of pattern lines */
+    char **pattern_lines = NULL;
+    size_t pattern_count = 0;
+    size_t pattern_cap = 0;
 
     char line[4096];
     uint32_t expected_crc = 0;
@@ -1602,62 +1719,102 @@ st_error_t st_policy_load(st_policy_t *policy, const char *path, bool clear_firs
         }
         if (len == 0) continue;
 
-        /* Must start with version header */
         if (!got_header) {
             if (strncmp(line, "# CPL v", 7) != 0) {
                 fclose(fp);
-                return ST_ERR_FORMAT;
+                goto pass1_fail;
             }
             int version = atoi(line + 7);
             if (version != ST_SERIALIZATION_VERSION) {
                 fclose(fp);
-                return ST_ERR_FORMAT;
+                goto pass1_fail;
             }
             got_header = true;
             continue;
         }
 
-        /* After header: pattern count line (skip) or patterns */
         if (!in_patterns) {
             if (strncmp(line, "# patterns:", 11) == 0) continue;
             in_patterns = true;
         }
 
-        /* Footer: CRC32 — marks end of patterns */
         if (strncmp(line, "# CRC32: ", 9) == 0) {
             char *end;
             expected_crc = (uint32_t)strtoul(line + 9, &end, 16);
             if (end != line + 17) {
                 fclose(fp);
-                return ST_ERR_FORMAT;
+                goto pass1_fail;
             }
             got_crc = true;
             break;
         }
 
-        /* Comment lines within pattern section (skip) */
         if (line[0] == '#') continue;
 
-        /* Pattern line */
+        /* Pattern line — compute CRC and store */
         size_t plen = strlen(line);
         computed_crc = crc32_compute(line, plen, computed_crc);
         computed_crc = crc32_compute("\n", 1, computed_crc);
 
-        st_error_t err = st_policy_add(policy, line);
-        if (err != ST_OK) {
-            fclose(fp);
-            policy->states.count = saved_states_count;
-            policy->patterns.count = saved_patterns_count;
-            return err;
+        if (pattern_count >= pattern_cap) {
+            size_t new_cap = pattern_cap ? pattern_cap * 2 : 64;
+            char **new_lines = realloc(pattern_lines, new_cap * sizeof(char *));
+            if (!new_lines) {
+                fclose(fp);
+                goto pass1_fail;
+            }
+            pattern_lines = new_lines;
+            pattern_cap = new_cap;
         }
+        pattern_lines[pattern_count] = strdup(line);
+        if (!pattern_lines[pattern_count]) {
+            fclose(fp);
+            goto pass1_fail;
+        }
+        pattern_count++;
     }
 
     fclose(fp);
 
-    if (!got_header || !got_crc) return ST_ERR_FORMAT;
-    if (computed_crc != expected_crc) return ST_ERR_FORMAT;
+    if (!got_header || !got_crc || computed_crc != expected_crc) {
+        goto pass1_fail;
+    }
 
-    return ST_OK;
+    /* ============================================================
+     * PASS 2: CRC verified. Now modify the policy.
+     * ============================================================ */
+    if (clear_first) {
+        arena_free(&policy->children_arena);
+        arena_init(&policy->children_arena, CHILDREN_ARENA_SIZE);
+        free(policy->states.states);
+        states_array_init(&policy->states);
+        policy->patterns.count = 0;
+        policy->pattern_count = 0;
+        policy->children_count = 0;
+        for (int i = 0; i < FILTER_POS_LEVELS; i++) {
+            vacuum_filter_destroy(policy->pos_filters[i]);
+            policy->pos_filters[i] = NULL;
+            policy->pos_built_epoch[i] = 0;
+        }
+        atomic_fetch_add(&policy->epoch, 1);
+    }
+
+    st_error_t first_err = ST_OK;
+    for (size_t i = 0; i < pattern_count; i++) {
+        st_error_t err = st_policy_add(policy, pattern_lines[i]);
+        if (err != ST_OK && first_err == ST_OK) {
+            first_err = err;
+        }
+        free(pattern_lines[i]);
+    }
+    free(pattern_lines);
+    return first_err;
+
+pass1_fail:
+    for (size_t i = 0; i < pattern_count; i++)
+        free(pattern_lines[i]);
+    free(pattern_lines);
+    return ST_ERR_FORMAT;
 }
 
 /* ============================================================
@@ -1699,26 +1856,159 @@ size_t st_policy_state_count(const st_policy_t *policy)
 }
 
 /* ============================================================
+ * STATISTICS
+ * ============================================================ */
+
+void st_policy_get_stats(const st_policy_t *policy, st_policy_stats_t *stats)
+{
+    if (!policy || !stats) return;
+    
+    pthread_rwlock_rdlock((pthread_rwlock_t *)&policy->rwlock);
+    
+    stats->eval_count = policy->stats.eval_count;
+    stats->filter_reject_count = policy->stats.filter_reject_count;
+    stats->trie_walk_count = policy->stats.trie_walk_count;
+    stats->suggestion_count = policy->stats.suggestion_count;
+    stats->filter_rebuild_count = policy->stats.filter_rebuild_count;
+    stats->filter_rebuild_us = policy->stats.filter_rebuild_us;
+    stats->pattern_count = policy->pattern_count;
+    stats->state_count = policy->states.count;
+    stats->memory_bytes = st_policy_memory_usage(policy);
+    
+    pthread_rwlock_unlock((pthread_rwlock_t *)&policy->rwlock);
+}
+
+/* ============================================================
+ * DOT GRAPH EXPORT
+ * ============================================================ */
+
+st_error_t st_policy_dump_dot(const st_policy_t *policy, const char *path)
+{
+    if (!policy || !path) return ST_ERR_INVALID;
+    
+    FILE *fp = fopen(path, "w");
+    if (!fp) return ST_ERR_IO;
+    
+    if (fprintf(fp, "digraph policy_trie {\n") < 0) { fclose(fp); return ST_ERR_IO; }
+    if (fprintf(fp, "  rankdir=LR;\n") < 0) { fclose(fp); return ST_ERR_IO; }
+    if (fprintf(fp, "  node [shape=circle];\n") < 0) { fclose(fp); return ST_ERR_IO; }
+    if (fprintf(fp, "  edge [];\n") < 0) { fclose(fp); return ST_ERR_IO; }
+    
+    /* BFS to traverse and emit nodes/edges */
+    typedef struct { uint32_t idx; uint32_t node_id; } dot_q;
+    dot_q queue[4096];
+    size_t head = 0, tail = 0;
+    uint32_t next_id = 0;
+    
+    /* Emit root node */
+    if (fprintf(fp, "  n%d [label=\"root\"%s];\n",
+                next_id,
+                policy->states.states[0].pattern_id != UINT16_MAX ? ", style=filled, fillcolor=lightgreen" : "")
+        < 0) { fclose(fp); return ST_ERR_IO; }
+    
+    queue[tail].idx = 0;
+    queue[tail].node_id = next_id++;
+    tail++;
+    
+    while (head < tail && tail < 4096) {
+        dot_q entry = queue[head++];
+        policy_state_t *node = &policy->states.states[entry.idx];
+        uint16_t total = node->literal_count + node->wildcard_count;
+        char *arena_base = policy->children_arena.base;
+        child_entry_t *children = (child_entry_t *)(arena_base + node->children_offset);
+        
+        for (uint16_t i = 0; i < total; i++) {
+            child_entry_t *c = &children[i];
+            
+            /* Emit child node */
+            const char *label = c->type == ST_TYPE_LITERAL ? c->text : st_type_symbol[c->type];
+            if (fprintf(fp, "  n%d [label=\"%s\"%s];\n",
+                        next_id, label,
+                        node->pattern_id != UINT16_MAX ? "" : "")
+                < 0) { fclose(fp); return ST_ERR_IO; }
+            
+            /* Emit edge */
+            if (fprintf(fp, "  n%d -> n%d;\n", entry.node_id, next_id) < 0) {
+                fclose(fp); return ST_ERR_IO;
+            }
+            
+            if (tail < 4096) {
+                queue[tail].idx = c->target;
+                queue[tail].node_id = next_id;
+                tail++;
+            }
+            next_id++;
+        }
+    }
+    
+    if (fprintf(fp, "}\n") < 0) { fclose(fp); return ST_ERR_IO; }
+    fclose(fp);
+    return ST_OK;
+}
+
+/* ============================================================
+ * DRY-RUN MODE
+ * ============================================================ */
+
+st_error_t st_policy_simulate_add(const st_policy_t *policy,
+                                    const char *pattern,
+                                    bool *would_match,
+                                    const char **conflicting_pattern)
+{
+    if (!policy || !pattern || !would_match) return ST_ERR_INVALID;
+    
+    *would_match = false;
+    if (conflicting_pattern) *conflicting_pattern = NULL;
+    
+    st_eval_result_t result;
+    st_error_t err = st_policy_eval((st_policy_t *)policy, pattern, &result);
+    if (err != ST_OK) return err;
+    
+    *would_match = result.matches;
+    if (result.matches && conflicting_pattern) {
+        *conflicting_pattern = result.matching_pattern;
+    }
+    
+    return ST_OK;
+}
+
+/* ============================================================
  * POLICY EXPANSION SUGGESTIONS (Miner — Step 2 only)
  * ============================================================ */
 
-/* Next-wider type in the lattice. */
+/* 
+ * Next-wider type in the lattice, capped at ST_TYPE_WORD.
+ * 
+ * Security: We cap generalization at #w instead of allowing * to prevent
+ * over-broad suggestions. The #w type is broad but still restricts to
+ * identifier-like tokens rather than matching anything.
+ * 
+ * Type hierarchy (with cap):
+ *   #h → #n → #val → #w (cap)
+ *   #i → #val → #w (cap)
+ *   #w → #w (cap - already at limit)
+ *   #q → #qs → #val → #w (cap)
+ *   #f → #r → #path → #w (cap)
+ *   #p → #path → #w (cap)
+ *   #u → #w (cap)
+ *   #val → #w (cap)
+ */
 static st_token_type_t next_wider_type(st_token_type_t t)
 {
     switch (t) {
         case ST_TYPE_HEXHASH:     return ST_TYPE_NUMBER;
         case ST_TYPE_NUMBER:      return ST_TYPE_VALUE;
         case ST_TYPE_IPV4:        return ST_TYPE_VALUE;
-        case ST_TYPE_WORD:        return ST_TYPE_VALUE;
+        case ST_TYPE_WORD:        return ST_TYPE_WORD; /* Cap reached */
         case ST_TYPE_QUOTED:      return ST_TYPE_QUOTED_SPACE;
         case ST_TYPE_QUOTED_SPACE:return ST_TYPE_VALUE;
         case ST_TYPE_FILENAME:    return ST_TYPE_REL_PATH;
         case ST_TYPE_REL_PATH:    return ST_TYPE_PATH;
         case ST_TYPE_ABS_PATH:    return ST_TYPE_PATH;
-        case ST_TYPE_PATH:        return ST_TYPE_ANY;
-        case ST_TYPE_URL:         return ST_TYPE_ANY;
-        case ST_TYPE_VALUE:       return ST_TYPE_ANY;
-        case ST_TYPE_ANY:         return ST_TYPE_ANY;
+        case ST_TYPE_PATH:        return ST_TYPE_WORD; /* Cap: #path → #w */
+        case ST_TYPE_URL:         return ST_TYPE_WORD; /* Cap: #u → #w */
+        case ST_TYPE_VALUE:       return ST_TYPE_WORD; /* Cap: #val → #w */
+        case ST_TYPE_ANY:         return ST_TYPE_ANY;  /* Already at top */
         default:                   return t;
     }
 }

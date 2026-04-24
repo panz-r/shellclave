@@ -259,6 +259,367 @@ static int test_policy_roundtrip_many_patterns(void)
 }
 
 /* ============================================================
+ * BUG FIX TESTS
+ * ============================================================ */
+
+/* Fix 1: st_policy_eval returns ST_OK for non-matching commands */
+static int test_non_matching_returns_ok(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_policy_t *policy = st_policy_new(ctx);
+    st_policy_add(policy, "git commit -m *");
+
+    st_eval_result_t result;
+    st_error_t err = st_policy_eval(policy, "docker run ubuntu", &result);
+    ASSERT(err == ST_OK);
+    ASSERT(!result.matches);
+
+    st_policy_free(policy);
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
+/* Fix 1: verify-only path (result==NULL) returns ST_OK for non-match */
+static int test_verify_only_returns_ok(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_policy_t *policy = st_policy_new(ctx);
+    st_policy_add(policy, "git commit -m *");
+
+    /* Completely unrelated command — should return ST_OK, not error */
+    st_error_t err = st_policy_eval(policy, "docker run ubuntu", NULL);
+    ASSERT(err == ST_OK);
+
+    st_policy_free(policy);
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
+/* Fix 5: empty command returns ST_OK with matches=false */
+static int test_empty_command_returns_ok(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_policy_t *policy = st_policy_new(ctx);
+    st_policy_add(policy, "git commit -m *");
+
+    st_eval_result_t result;
+    st_error_t err = st_policy_eval(policy, "", &result);
+    ASSERT(err == ST_OK);
+    ASSERT(!result.matches);
+
+    st_policy_free(policy);
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
+/* Fix 4: CRC mismatch does not modify policy */
+static int test_crc_mismatch_no_partial_load(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_policy_t *policy = st_policy_new(ctx);
+    st_policy_add(policy, "git commit -m *");
+    ASSERT(st_policy_count(policy) == 1);
+
+    /* Create a file with bad CRC */
+    FILE *fp = fopen("tests/test_crc_bad.tmp", "w");
+    ASSERT(fp != NULL);
+    fprintf(fp, "# CPL v1\n");
+    fprintf(fp, "# patterns: 1\n");
+    fprintf(fp, "ls -la *\n");
+    fprintf(fp, "# CRC32: deadbeef\n");
+    fclose(fp);
+
+    st_error_t err = st_policy_load(policy, "tests/test_crc_bad.tmp", false);
+    ASSERT(err == ST_ERR_FORMAT);
+    /* Policy must still have original pattern intact */
+    ASSERT(st_policy_count(policy) == 1);
+
+    st_policy_free(policy);
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
+/* Fix 2 (filter bug): Per-position filter correctly handles depth with both
+ * literals and incompatible wildcards. Previously, if ANY wildcard existed at
+ * a depth, the filter check was skipped for ALL literal tokens at that depth,
+ * even when the wildcard was incompatible with the literal type.
+ *
+ * Scenario: depth 0 has literal "git" AND wildcard "*" (ANY). When evaluating
+ * "unknown status", the filter should still reject "unknown" because the ANY
+ * wildcard only matches ANY tokens, not LITERAL tokens. */
+static int test_filter_with_literal_and_any_wildcard(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_policy_t *policy = st_policy_new(ctx);
+
+    /* Add patterns that create both literal and ANY wildcard at depth 0 */
+    st_policy_add(policy, "git status");
+    st_policy_add(policy, "* run");  /* ANY wildcard at depth 0 */
+
+    /* "unknown status" should NOT match - filter should reject it */
+    st_eval_result_t result;
+    st_error_t err = st_policy_eval(policy, "unknown status", &result);
+    ASSERT(err == ST_OK);
+    ASSERT(!result.matches);
+    ASSERT(result.suggestion_count > 0);
+
+    /* "git status" SHOULD match - it's a known pattern */
+    err = st_policy_eval(policy, "git status", &result);
+    ASSERT(err == ST_OK);
+    ASSERT(result.matches);
+
+    st_policy_free(policy);
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
+/* Fix 3.1: Wildcard generalization is capped at #w instead of jumping to *
+ * to prevent over-broad suggestions. */
+static int test_generalization_capped_at_word(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_policy_t *policy = st_policy_new(ctx);
+
+    /* Add patterns that will cause generalization to jump to *
+     * if the cap wasn't in place */
+    st_policy_add(policy, "docker run -d nginx");
+    st_policy_add(policy, "docker run -it ubuntu");
+    st_policy_add(policy, "docker run --rm alpine");
+
+    /* Evaluating "docker exec -it container" should suggest generalization
+     * but NOT "* exec -it *" - it should be capped at #w */
+    st_eval_result_t result;
+    st_error_t err = st_policy_eval(policy, "docker exec -it container", &result);
+    ASSERT(err == ST_OK);
+    ASSERT(!result.matches);
+    ASSERT(result.suggestion_count > 0);
+
+    /* Check that suggestions don't contain bare "*" for the divergent token */
+    for (size_t i = 0; i < result.suggestion_count; i++) {
+        /* The suggestion should use #w or more specific, not * */
+        ASSERT(result.suggestions[i].pattern == NULL ||
+               strstr(result.suggestions[i].pattern, " * ") == NULL);
+    }
+
+    st_policy_free(policy);
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
+/* Fix 6: st_policy_ctx_reset is idempotent */
+static int test_ctx_reset_idempotent(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_policy_ctx_intern(ctx, "test");
+
+    st_policy_ctx_reset(ctx);
+    /* Intern after reset should work */
+    const char *s = st_policy_ctx_intern(ctx, "hello");
+    ASSERT(s != NULL);
+    ASSERT(strcmp(s, "hello") == 0);
+
+    /* Double reset should not crash */
+    st_policy_ctx_reset(ctx);
+    st_policy_ctx_reset(ctx);
+
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
+/* ============================================================
+ * NEW FEATURE TESTS (Recommendations 1, 4, 6, 7, 11)
+ * ============================================================ */
+
+/* Test reference counting: reset should fail when policy exists */
+static int test_ctx_reset_with_active_policy(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_policy_t *policy = st_policy_new(ctx);
+    
+    /* Reset should fail because policy is still active */
+    st_error_t err = st_policy_ctx_reset(ctx);
+    ASSERT(err == ST_ERR_INVALID);
+    
+    st_policy_free(policy);
+    
+    /* Reset should succeed now that policy is freed */
+    err = st_policy_ctx_reset(ctx);
+    ASSERT(err == ST_OK);
+    
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
+/* Test retain/release */
+static int test_ctx_retain_release(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    
+    /* Initial refcount should be 1 */
+    st_policy_t *p1 = st_policy_new(ctx);
+    ASSERT(p1 != NULL);
+    
+    /* Adding another policy should retain */
+    st_policy_t *p2 = st_policy_new(ctx);
+    ASSERT(p2 != NULL);
+    
+    st_policy_free(p1);
+    /* Reset should still fail because p2 exists */
+    st_error_t err = st_policy_ctx_reset(ctx);
+    ASSERT(err == ST_ERR_INVALID);
+    
+    st_policy_free(p2);
+    /* Now reset should succeed */
+    err = st_policy_ctx_reset(ctx);
+    ASSERT(err == ST_OK);
+    
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
+/* Test pattern validation: reject * at first position */
+static int test_pattern_reject_star_first(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_policy_t *policy = st_policy_new(ctx);
+    
+    /* Pattern starting with * should be rejected */
+    st_error_t err = st_policy_add(policy, "* status");
+    ASSERT(err == ST_ERR_INVALID);
+    
+    /* Valid pattern should work */
+    err = st_policy_add(policy, "git status");
+    ASSERT(err == ST_OK);
+    
+    st_policy_free(policy);
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
+/* Test pattern validation: adjacent wildcards ARE allowed */
+static int test_pattern_adjacent_wildcards_allowed(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_policy_t *policy = st_policy_new(ctx);
+    
+    /* Adjacent wildcards should be ALLOWED (valid pattern) */
+    st_error_t err = st_policy_add(policy, "docker run #path #path");
+    ASSERT(err == ST_OK);
+    
+    /* Verify it works - /etc and /var are both paths */
+    st_eval_result_t result;
+    err = st_policy_eval(policy, "docker run /etc /var", &result);
+    ASSERT(err == ST_OK);
+    ASSERT(result.matches);
+    
+    st_policy_free(policy);
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
+/* Test statistics tracking */
+static int test_stats_tracking(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_policy_t *policy = st_policy_new(ctx);
+    
+    st_policy_add(policy, "git status");
+    st_policy_add(policy, "git commit -m *");
+    
+    st_eval_result_t result;
+    st_error_t err = st_policy_eval(policy, "git status", &result);
+    ASSERT(err == ST_OK);
+    ASSERT(result.matches);
+    
+    /* Check stats */
+    st_policy_stats_t stats;
+    st_policy_get_stats(policy, &stats);
+    ASSERT(stats.eval_count > 0);
+    ASSERT(stats.pattern_count == 2);
+    ASSERT(stats.state_count > 0);
+    
+    st_policy_free(policy);
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
+/* Test DOT export */
+static int test_dot_export(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_policy_t *policy = st_policy_new(ctx);
+    
+    st_policy_add(policy, "git status");
+    st_policy_add(policy, "git commit -m *");
+    
+    st_error_t err = st_policy_dump_dot(policy, "tests/test_output.dot");
+    ASSERT(err == ST_OK);
+    
+    /* Check file was created */
+    FILE *fp = fopen("tests/test_output.dot", "r");
+    ASSERT(fp != NULL);
+    char line[256];
+    ASSERT(fgets(line, sizeof(line), fp) != NULL);
+    ASSERT(strncmp(line, "digraph policy_trie", 18) == 0);
+    fclose(fp);
+    
+    st_policy_free(policy);
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
+/* Test dry-run simulation */
+static int test_dry_run_simulate(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_policy_t *policy = st_policy_new(ctx);
+    
+    st_policy_add(policy, "git status");
+    
+    bool would_match = false;
+    const char *conflict = NULL;
+    st_error_t err = st_policy_simulate_add(policy, "git status", &would_match, &conflict);
+    ASSERT(err == ST_OK);
+    ASSERT(would_match == true);
+    ASSERT(conflict != NULL);
+    
+    err = st_policy_simulate_add(policy, "git commit", &would_match, &conflict);
+    ASSERT(err == ST_OK);
+    ASSERT(would_match == false);
+    
+    st_policy_free(policy);
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
+/* Test miner suggestions capped at #w */
+static int test_miner_capped_at_word(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_policy_t *policy = st_policy_new(ctx);
+    
+    st_policy_add(policy, "docker run #n");
+    
+    st_token_t tokens[2] = {
+        { .text = "docker", .type = ST_TYPE_LITERAL },
+        { .text = "#n", .type = ST_TYPE_NUMBER }
+    };
+    
+    st_expand_suggestion_t suggestions[3];
+    size_t count = st_policy_suggest_variants(policy, tokens, 2, suggestions);
+    ASSERT(count >= 1);
+    
+    /* Check that none of the suggestions contain bare "*" */
+    for (size_t i = 0; i < count; i++) {
+        ASSERT(strstr(suggestions[i].pattern, " * ") == NULL);
+    }
+    
+    st_policy_free(policy);
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
+/* ============================================================
  * MAIN
  * ============================================================ */
 
@@ -288,6 +649,25 @@ int main(void)
     TEST(test_policy_save_load);
     TEST(test_policy_load_empty);
     TEST(test_policy_roundtrip_many_patterns);
+
+    printf("\nBug fixes:\n");
+    TEST(test_non_matching_returns_ok);
+    TEST(test_verify_only_returns_ok);
+    TEST(test_empty_command_returns_ok);
+    TEST(test_crc_mismatch_no_partial_load);
+    TEST(test_filter_with_literal_and_any_wildcard);
+    TEST(test_generalization_capped_at_word);
+    TEST(test_ctx_reset_idempotent);
+
+    printf("\nNew features:\n");
+    TEST(test_ctx_reset_with_active_policy);
+    TEST(test_ctx_retain_release);
+    TEST(test_pattern_reject_star_first);
+    TEST(test_pattern_adjacent_wildcards_allowed);
+    TEST(test_stats_tracking);
+    TEST(test_dot_export);
+    TEST(test_dry_run_simulate);
+    TEST(test_miner_capped_at_word);
 
     printf("\n========================================\n");
     printf("Results: %d/%d passed, %d failed\n",

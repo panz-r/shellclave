@@ -417,6 +417,14 @@ st_error_t st_normalize_typed(const char *raw_cmd, st_token_array_t *out)
     char **raw_tokens = tokenize_command(raw_cmd, &raw_count);
     if (!raw_tokens) return ST_ERR_MEMORY;
 
+    /* Empty command: return empty token array */
+    if (raw_count == 0) {
+        free(raw_tokens);
+        out->tokens = NULL;
+        out->count = 0;
+        return ST_OK;
+    }
+
     /* Worst case: every token splits into 2 (e.g., --flag=value → 2 tokens) */
     out->tokens = calloc(raw_count * 2, sizeof(st_token_t));
     if (!out->tokens) {

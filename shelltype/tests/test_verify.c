@@ -533,9 +533,10 @@ static int test_complex_eval_filter_suggest_stress(void)
     ASSERT_STR_EQ(r.matching_pattern, "docker run -it * *");
 
     /* --- 4. Filter reject in verify-only mode (completely unrelated) --- */
-    /* "zzz" is not in any position 0 filter → filter rejects, no trie walk */
+    /* "zzz" is not in any position 0 filter → filter rejects, no trie walk.
+     * With fixed error semantics, non-match returns ST_OK (not an error). */
     err = st_policy_eval(policy, "zzz something", NULL);
-    ASSERT(err == ST_ERR_INVALID);
+    ASSERT(err == ST_OK);
 
     /* --- 5. Filter reject with suggestions (divergence at position 0) --- */
     err = st_policy_eval(policy, "zzz something", &r);

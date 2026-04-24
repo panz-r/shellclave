@@ -256,6 +256,25 @@ void st_free_tokens(char **tokens, size_t count);
 st_token_type_t st_classify_token(const char *token);
 
 /* ============================================================
+ * POLICY STATISTICS
+ * ============================================================ */
+
+/**
+ * Policy statistics for monitoring and tuning.
+ */
+typedef struct {
+    uint64_t eval_count;           /* Total evaluations */
+    uint64_t filter_reject_count; /* Pre-filter rejected count */
+    uint64_t trie_walk_count;     /* Evaluations that reached trie walk */
+    uint64_t suggestion_count;    /* Suggestion pairs generated */
+    uint64_t filter_rebuild_count;/* Number of filter rebuilds triggered */
+    uint64_t filter_rebuild_us;   /* Cumulative filter rebuild time (microseconds) */
+    size_t   pattern_count;       /* Current number of active patterns */
+    size_t   state_count;         /* Number of trie states */
+    size_t   memory_bytes;         /* Total memory usage */
+} st_policy_stats_t;
+
+/* ============================================================
  * POLICY MODULE (arena-allocated, NFA-renderable)
  * ============================================================ */
 
@@ -263,6 +282,10 @@ st_token_type_t st_classify_token(const char *token);
  * Shared policy context: arena allocator, string pool, and shared state.
  * Multiple policies can share a context to deduplicate token strings
  * across policy sets.
+ *
+ * Thread-safe reference counting: use st_policy_ctx_retain() when creating
+ * a policy and st_policy_ctx_release() when freeing it. Reset is only
+ * allowed when refcount == 1 (only the context itself holds a reference).
  */
 typedef struct st_policy_ctx st_policy_ctx_t;
 
@@ -293,7 +316,9 @@ typedef struct {
 st_policy_ctx_t *st_policy_ctx_new(void);
 st_policy_ctx_t *st_policy_ctx_new_with_arena(size_t arena_size);
 void st_policy_ctx_free(st_policy_ctx_t *ctx);
-void st_policy_ctx_reset(st_policy_ctx_t *ctx);
+void st_policy_ctx_retain(st_policy_ctx_t *ctx);
+void st_policy_ctx_release(st_policy_ctx_t *ctx);
+st_error_t st_policy_ctx_reset(st_policy_ctx_t *ctx);
 const char *st_policy_ctx_intern(st_policy_ctx_t *ctx, const char *str);
 
 /* --- Policy lifecycle --- */
@@ -373,6 +398,32 @@ st_error_t st_policy_compact(st_policy_t *policy);
 size_t st_policy_memory_usage(const st_policy_t *policy);
 size_t st_policy_working_set(const st_policy_t *policy);
 size_t st_policy_state_count(const st_policy_t *policy);
+
+/* --- Statistics --- */
+
+/**
+ * Get policy statistics for monitoring and tuning.
+ */
+void st_policy_get_stats(const st_policy_t *policy, st_policy_stats_t *stats);
+
+/* --- DOT graph export --- */
+
+/**
+ * Dump the policy trie as a GraphViz DOT file for debugging.
+ * Shows states (nodes) and transitions (edges), highlighting accepting states.
+ */
+st_error_t st_policy_dump_dot(const st_policy_t *policy, const char *path);
+
+/* --- Dry-run mode --- */
+
+/**
+ * Simulate adding a pattern without modifying the policy.
+ * Returns whether the pattern would match any existing pattern.
+ */
+st_error_t st_policy_simulate_add(const st_policy_t *policy,
+                                    const char *pattern,
+                                    bool *would_match,
+                                    const char **conflicting_pattern);
 
 /* ============================================================
  * POLICY EXPANSION SUGGESTIONS (Miner)

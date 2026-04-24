@@ -15,6 +15,7 @@ tests/test_shelltype
 tests/*.tmp
 tests/test_*.nfa
 tests/test_output.txt
+tests/test_output.dot
 
 # Editor / IDE
 *.swp
