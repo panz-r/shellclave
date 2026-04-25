@@ -2039,8 +2039,23 @@ void st_policy_free_matches(const char **matches, size_t count)
     free((void *)matches);
 }
 
+
 /* ============================================================
  * NFA RENDERING
+ *
+ * Produces NFA-DSL format compatible with the c-dfa subproject's
+ * nfa2dfa converter. Uses per-state transition arrays to ensure
+ * correct output regardless of DFS traversal order.
+ *
+ * Two-pass approach:
+ *   Pass 1: DFS walk the trie, assign NFA state IDs, collect
+ *           transitions into per-state arrays.
+ *   Pass 2: Write the complete NFA-DSL file with states in order.
+ *
+ * Format:
+ *   NFA_ALPHABET / Identifier / AlphabetSize / States / Initial
+ *   Alphabet: (0-255 byte symbols, 256-260 virtual symbols)
+ *   State blocks: CategoryMask, PatternId, EosTarget, Tags, Transitions
  * ============================================================ */
 
 #define VSYM_BYTE_ANY 256
@@ -2050,145 +2065,192 @@ void st_policy_free_matches(const char **matches, size_t count)
 #define VSYM_TAB      260
 
 typedef struct {
-    FILE *fp;
-    st_error_t error;
+    int symbol;
+    uint32_t target;
+} nfa_trans_t;
+
+typedef struct {
+    bool is_accepting;
+    uint8_t category_mask;
+    uint16_t pattern_id;
+    const char *tag;
+    nfa_trans_t *trans;
+    uint32_t trans_count;
+    uint32_t trans_cap;
+} nfa_state_t;
+
+typedef struct {
+    nfa_state_t *states;
     uint32_t state_count;
-    uint32_t pattern_id_counter;
+    uint32_t state_cap;
+    uint16_t pattern_id_counter;
     uint8_t  category_mask;
     bool     include_tags;
     const char *identifier;
-} nfa_render_ctx_t;
+} nfa_ctx_t;
 
-static uint32_t nfa_new_state(nfa_render_ctx_t *ctx)
+static nfa_ctx_t *nfa_ctx_new(uint8_t cat_mask, bool tags, const char *ident, uint16_t pid_base)
 {
-    return ctx->state_count++;
+    nfa_ctx_t *c = calloc(1, sizeof(*c));
+    if (!c) return NULL;
+    c->state_cap = 256;
+    c->states = calloc(c->state_cap, sizeof(nfa_state_t));
+    if (!c->states) { free(c); return NULL; }
+    c->category_mask = cat_mask;
+    c->include_tags = tags;
+    c->identifier = ident ? ident : "rbox policy";
+    c->pattern_id_counter = pid_base;
+    return c;
 }
 
-typedef struct {
-    uint32_t count;
-} nfa_count_ctx_t;
-
-static void nfa_count_states(nfa_count_ctx_t *ctx, st_policy_t *policy,
-                             uint32_t trie_idx, bool need_space)
+static void nfa_ctx_free(nfa_ctx_t *c)
 {
-    ctx->count++;
+    if (!c) return;
+    for (uint32_t i = 0; i < c->state_count; i++) free(c->states[i].trans);
+    free(c->states);
+    free(c);
+}
 
-    policy_state_t *node = &policy->states.states[trie_idx];
-    uint16_t total = node->literal_count + node->wildcard_count;
-
-    for (uint16_t i = 0; i < total; i++) {
-        child_entry_t *c = child_at(node, policy->children_arena.base, i);
-        if (!c) continue;
-
-        if (need_space) ctx->count++;
-
-        if (c->type == ST_TYPE_LITERAL) {
-            ctx->count += (uint32_t)strlen(c->text);
-        } else {
-            ctx->count += 1;
-        }
-
-        nfa_count_states(ctx, policy, c->target, true);
+static uint32_t nfa_new_state(nfa_ctx_t *c)
+{
+    if (c->state_count >= c->state_cap) {
+        uint32_t nc = c->state_cap * 2;
+        nfa_state_t *ns = realloc(c->states, nc * sizeof(nfa_state_t));
+        if (!ns) return UINT32_MAX;
+        c->states = ns;
+        c->state_cap = nc;
     }
+    uint32_t id = c->state_count++;
+    memset(&c->states[id], 0, sizeof(nfa_state_t));
+    return id;
 }
 
-static void nfa_dfs_render(nfa_render_ctx_t *ctx, st_policy_t *policy,
-                           uint32_t trie_idx, uint32_t nfa_state,
-                           bool need_space)
+static bool nfa_add_trans(nfa_ctx_t *c, uint32_t from, int sym, uint32_t to)
 {
-    if (ctx->error != ST_OK) return;
+    nfa_state_t *s = &c->states[from];
+    if (s->trans_count >= s->trans_cap) {
+        uint32_t nc = s->trans_cap ? s->trans_cap * 2 : 4;
+        nfa_trans_t *nt = realloc(s->trans, nc * sizeof(nfa_trans_t));
+        if (!nt) return false;
+        s->trans = nt;
+        s->trans_cap = nc;
+    }
+    s->trans[s->trans_count].symbol = sym;
+    s->trans[s->trans_count].target = to;
+    s->trans_count++;
+    return true;
+}
 
+/* Pass 1: assign NFA state IDs and collect per-state transitions */
+static bool nfa_build(nfa_ctx_t *c, st_policy_t *policy,
+                      uint32_t trie_idx, uint32_t nfa_state,
+                      bool need_space, uint32_t *trie_map)
+{
     policy_state_t *node = &policy->states.states[trie_idx];
     uint16_t total = node->literal_count + node->wildcard_count;
     child_entry_t *children = (child_entry_t *)(policy->children_arena.base + node->children_offset);
+    nfa_state_t *si = &c->states[nfa_state];
 
-    if (total == 0) {
-        uint16_t pid = (node->pattern_id != UINT16_MAX) ? (ctx->pattern_id_counter++) : 0;
-        if (fprintf(ctx->fp, "State %u:\n", nfa_state) < 0) { ctx->error = ST_ERR_IO; return; }
-        if (fprintf(ctx->fp, "  CategoryMask: 0x%02x\n", ctx->category_mask) < 0) { ctx->error = ST_ERR_IO; return; }
-        if (fprintf(ctx->fp, "  PatternId: %u\n", pid) < 0) { ctx->error = ST_ERR_IO; return; }
-        if (fprintf(ctx->fp, "  EosTarget: yes\n") < 0) { ctx->error = ST_ERR_IO; return; }
-        if (ctx->include_tags && node->pattern_id != UINT16_MAX &&
-            node->pattern_id < policy->patterns.count) {
-            if (fprintf(ctx->fp, "  Tags: %s\n",
-                        policy->patterns.strings[node->pattern_id]) < 0) {
-                ctx->error = ST_ERR_IO; return;
-            }
-        }
-        if (fprintf(ctx->fp, "  Transitions: 0\n\n") < 0) { ctx->error = ST_ERR_IO; }
-        return;
+    if (node->pattern_id != UINT16_MAX) {
+        si->is_accepting = true;
+        si->category_mask = c->category_mask;
+        si->pattern_id = c->pattern_id_counter++;
+        if (c->include_tags && node->pattern_id < policy->patterns.count)
+            si->tag = policy->patterns.strings[node->pattern_id];
     }
-
-    int trans_count = 0;
-    for (uint16_t i = 0; i < total; i++) {
-        child_entry_t *c = &children[i];
-        if (c->type == ST_TYPE_LITERAL) {
-            trans_count += (int)strlen(c->text);
-        } else {
-            trans_count += 1;
-        }
-    }
-
-    uint16_t pid = (node->pattern_id != UINT16_MAX) ? (ctx->pattern_id_counter++) : 0;
-    if (fprintf(ctx->fp, "State %u:\n", nfa_state) < 0) { ctx->error = ST_ERR_IO; return; }
-    if (fprintf(ctx->fp, "  CategoryMask: 0x00\n") < 0) { ctx->error = ST_ERR_IO; return; }
-    if (fprintf(ctx->fp, "  PatternId: %u\n", pid) < 0) { ctx->error = ST_ERR_IO; return; }
-    if (fprintf(ctx->fp, "  EosTarget: no\n") < 0) { ctx->error = ST_ERR_IO; return; }
-    if (ctx->include_tags && node->pattern_id != UINT16_MAX &&
-        node->pattern_id < policy->patterns.count) {
-        if (fprintf(ctx->fp, "  Tags: %s\n",
-                    policy->patterns.strings[node->pattern_id]) < 0) {
-            ctx->error = ST_ERR_IO; return;
-        }
-    }
-    if (fprintf(ctx->fp, "  Transitions: %d\n", trans_count) < 0) { ctx->error = ST_ERR_IO; return; }
 
     for (uint16_t i = 0; i < total; i++) {
-        child_entry_t *c = &children[i];
+        child_entry_t *ch = &children[i];
 
-        if (need_space) {
-            uint32_t space_state = nfa_new_state(ctx);
-            if (fprintf(ctx->fp, "    Symbol %d -> %u\n", VSYM_SPACE, space_state) < 0) {
-                ctx->error = ST_ERR_IO; return;
+        if (ch->type == ST_TYPE_LITERAL) {
+            /* Byte-by-byte chain for literal tokens */
+            uint32_t from = nfa_state;
+            if (need_space) {
+                uint32_t sp = nfa_new_state(c);
+                if (sp == UINT32_MAX) return false;
+                if (!nfa_add_trans(c, from, VSYM_SPACE, sp)) return false;
+                from = sp;
             }
-            if (c->type == ST_TYPE_LITERAL) {
-                uint32_t cur = space_state;
-                for (const char *p = c->text; *p; p++) {
-                    uint32_t next = nfa_new_state(ctx);
-                    if (fprintf(ctx->fp, "    Symbol %d -> %u\n", (unsigned char)*p, next) < 0) {
-                        ctx->error = ST_ERR_IO; return;
+            for (const char *p = ch->text; *p; p++) {
+                uint32_t next;
+                if (*(p + 1) == '\0') {
+                    /* Last char: link to the trie child's NFA state */
+                    if (trie_map[ch->target] == UINT32_MAX) {
+                        uint32_t ns = nfa_new_state(c);
+                        if (ns == UINT32_MAX) return false;
+                        trie_map[ch->target] = ns;
                     }
-                    cur = next;
+                    next = trie_map[ch->target];
+                } else {
+                    next = nfa_new_state(c);
+                    if (next == UINT32_MAX) return false;
                 }
-                nfa_dfs_render(ctx, policy, c->target, cur, true);
-            } else {
-                uint32_t next = nfa_new_state(ctx);
-                if (fprintf(ctx->fp, "    Symbol %d -> %u\n", VSYM_BYTE_ANY, next) < 0) {
-                    ctx->error = ST_ERR_IO; return;
-                }
-                nfa_dfs_render(ctx, policy, c->target, next, true);
+                if (!nfa_add_trans(c, from, (unsigned char)*p, next)) return false;
+                from = next;
             }
         } else {
-            if (c->type == ST_TYPE_LITERAL) {
-                uint32_t cur = nfa_state;
-                for (const char *p = c->text; *p; p++) {
-                    uint32_t next = nfa_new_state(ctx);
-                    if (fprintf(ctx->fp, "    Symbol %d -> %u\n", (unsigned char)*p, next) < 0) {
-                        ctx->error = ST_ERR_IO; return;
-                    }
-                    cur = next;
-                }
-                nfa_dfs_render(ctx, policy, c->target, cur, false);
-            } else {
-                uint32_t next = nfa_new_state(ctx);
-                if (fprintf(ctx->fp, "    Symbol %d -> %u\n", VSYM_BYTE_ANY, next) < 0) {
-                    ctx->error = ST_ERR_IO; return;
-                }
-                nfa_dfs_render(ctx, policy, c->target, next, false);
+            /* Wildcard: VSYM_BYTE_ANY (matches any single token) */
+            uint32_t from = nfa_state;
+            if (need_space) {
+                uint32_t sp = nfa_new_state(c);
+                if (sp == UINT32_MAX) return false;
+                if (!nfa_add_trans(c, from, VSYM_SPACE, sp)) return false;
+                from = sp;
             }
+            if (trie_map[ch->target] == UINT32_MAX) {
+                uint32_t ns = nfa_new_state(c);
+                if (ns == UINT32_MAX) return false;
+                trie_map[ch->target] = ns;
+            }
+            if (!nfa_add_trans(c, from, VSYM_BYTE_ANY, trie_map[ch->target])) return false;
         }
     }
-    if (fprintf(ctx->fp, "\n") < 0) { ctx->error = ST_ERR_IO; }
+
+    /* Recurse into children */
+    for (uint16_t i = 0; i < total; i++) {
+        child_entry_t *ch = &children[i];
+        if (trie_map[ch->target] == UINT32_MAX) continue;
+        if (!nfa_build(c, policy, ch->target, trie_map[ch->target], true, trie_map))
+            return false;
+    }
+    return true;
+}
+
+/* Pass 2: write the NFA-DSL file */
+static bool nfa_write(nfa_ctx_t *c, FILE *fp)
+{
+    if (fprintf(fp, "NFA_ALPHABET\n") < 0) return false;
+    if (fprintf(fp, "Identifier: %s\n", c->identifier) < 0) return false;
+    if (fprintf(fp, "AlphabetSize: 261\n") < 0) return false;
+    if (fprintf(fp, "States: %u\n", c->state_count) < 0) return false;
+    if (fprintf(fp, "Initial: 0\n\n") < 0) return false;
+
+    if (fprintf(fp, "Alphabet:\n") < 0) return false;
+    for (int i = 0; i < 256; i++) {
+        if (fprintf(fp, "  Symbol %d: %d-%d\n", i, i, i) < 0) return false;
+    }
+    if (fprintf(fp, "  Symbol 256: 0-255 (special)\n") < 0) return false;
+    if (fprintf(fp, "  Symbol 257: 1-1 (special)\n") < 0) return false;
+    if (fprintf(fp, "  Symbol 258: 5-5 (special)\n") < 0) return false;
+    if (fprintf(fp, "  Symbol 259: 32-32 (special)\n") < 0) return false;
+    if (fprintf(fp, "  Symbol 260: 9-9 (special)\n\n") < 0) return false;
+
+    for (uint32_t s = 0; s < c->state_count; s++) {
+        nfa_state_t *si = &c->states[s];
+        if (fprintf(fp, "State %u:\n", s) < 0) return false;
+        if (fprintf(fp, "  CategoryMask: 0x%02x\n", si->is_accepting ? si->category_mask : 0) < 0) return false;
+        if (fprintf(fp, "  PatternId: %u\n", si->pattern_id) < 0) return false;
+        if (fprintf(fp, "  EosTarget: %s\n", si->is_accepting ? "yes" : "no") < 0) return false;
+        if (si->tag) {
+            if (fprintf(fp, "  Tags: %s\n", si->tag) < 0) return false;
+        }
+        if (fprintf(fp, "  Transitions: %u\n", si->trans_count) < 0) return false;
+        for (uint32_t t = 0; t < si->trans_count; t++) {
+            if (fprintf(fp, "    Symbol %d -> %u\n", si->trans[t].symbol, si->trans[t].target) < 0) return false;
+        }
+        if (fprintf(fp, "\n") < 0) return false;
+    }
+    return true;
 }
 
 st_error_t st_policy_render_nfa(const st_policy_t *policy,
@@ -2197,42 +2259,53 @@ st_error_t st_policy_render_nfa(const st_policy_t *policy,
 {
     if (!policy || !path) return ST_ERR_INVALID;
 
-    FILE *fp = fopen(path, "w");
-    if (!fp) return ST_ERR_IO;
+    pthread_rwlock_rdlock((pthread_rwlock_t *)&policy->rwlock);
 
-    nfa_count_ctx_t count_ctx = { .count = 0 };
-    nfa_count_states(&count_ctx, (st_policy_t *)policy, 0, false);
-
-    nfa_render_ctx_t ctx = {
-        .fp = fp,
-        .error = ST_OK,
-        .state_count = 0,
-        .pattern_id_counter = opts ? opts->pattern_id_base : 1,
-        .category_mask = opts ? opts->category_mask : 0x01,
-        .include_tags = opts ? opts->include_tags : false,
-		.identifier = opts ? opts->identifier : "rbox policy",
-    };
-
-    if (fprintf(fp, "NFA_ALPHABET\n") < 0) { fclose(fp); return ST_ERR_IO; }
-    if (fprintf(fp, "Identifier: %s\n", ctx.identifier) < 0) { fclose(fp); return ST_ERR_IO; }
-    if (fprintf(fp, "AlphabetSize: 261\n") < 0) { fclose(fp); return ST_ERR_IO; }
-    if (fprintf(fp, "States: %u\n", count_ctx.count) < 0) { fclose(fp); return ST_ERR_IO; }
-    if (fprintf(fp, "Initial: 0\n\n") < 0) { fclose(fp); return ST_ERR_IO; }
-
-    if (fprintf(fp, "Alphabet:\n") < 0) { fclose(fp); return ST_ERR_IO; }
-    for (int i = 0; i < 256; i++) {
-        if (fprintf(fp, "  Symbol %d: %d-%d\n", i, i, i) < 0) { fclose(fp); return ST_ERR_IO; }
+    uint32_t num_trie = (uint32_t)((st_policy_t *)policy)->states.count;
+    uint32_t *trie_map = malloc(num_trie * sizeof(uint32_t));
+    if (!trie_map) {
+        pthread_rwlock_unlock((pthread_rwlock_t *)&policy->rwlock);
+        return ST_ERR_MEMORY;
     }
-    if (fprintf(fp, "  Symbol 256: 0-255 (special)\n") < 0) { fclose(fp); return ST_ERR_IO; }
-    if (fprintf(fp, "  Symbol 257: 1-1 (special)\n") < 0) { fclose(fp); return ST_ERR_IO; }
-    if (fprintf(fp, "  Symbol 258: 5-5 (special)\n") < 0) { fclose(fp); return ST_ERR_IO; }
-    if (fprintf(fp, "  Symbol 259: 32-32 (special)\n") < 0) { fclose(fp); return ST_ERR_IO; }
-    if (fprintf(fp, "  Symbol 260: 9-9 (special)\n\n") < 0) { fclose(fp); return ST_ERR_IO; }
+    for (uint32_t i = 0; i < num_trie; i++) trie_map[i] = UINT32_MAX;
 
-    nfa_dfs_render(&ctx, (st_policy_t *)policy, 0, 0, false);
+    nfa_ctx_t *c = nfa_ctx_new(
+        opts ? opts->category_mask : 0x01,
+        opts ? opts->include_tags : false,
+        opts ? opts->identifier : "rbox policy",
+        opts ? opts->pattern_id_base : 1);
+    if (!c) {
+        free(trie_map);
+        pthread_rwlock_unlock((pthread_rwlock_t *)&policy->rwlock);
+        return ST_ERR_MEMORY;
+    }
 
-    fclose(fp);
-    return ctx.error;
+    trie_map[0] = nfa_new_state(c);
+    if (trie_map[0] == UINT32_MAX) {
+        nfa_ctx_free(c);
+        free(trie_map);
+        pthread_rwlock_unlock((pthread_rwlock_t *)&policy->rwlock);
+        return ST_ERR_MEMORY;
+    }
+
+    bool ok = nfa_build(c, (st_policy_t *)policy, 0, 0, false, trie_map);
+
+    if (ok) {
+        FILE *fp = fopen(path, "w");
+        if (!fp) {
+            nfa_ctx_free(c);
+            free(trie_map);
+            pthread_rwlock_unlock((pthread_rwlock_t *)&policy->rwlock);
+            return ST_ERR_IO;
+        }
+        ok = nfa_write(c, fp);
+        fclose(fp);
+    }
+
+    nfa_ctx_free(c);
+    free(trie_map);
+    pthread_rwlock_unlock((pthread_rwlock_t *)&policy->rwlock);
+    return ok ? ST_OK : ST_ERR_MEMORY;
 }
 
 /* ============================================================
