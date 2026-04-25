@@ -142,3 +142,12 @@ test: $(TEST_TOKEN_TYPES_BIN) $(TEST_BIN) $(TEST_POLICY_BIN) $(TEST_VERIFY_BIN) 
 clean:
 	rm -rf $(OBJDIR) $(TOOL_BIN) $(TEST_BIN) $(TEST_POLICY_BIN) $(TEST_VERIFY_BIN) $(TEST_TOKEN_TYPES_BIN) $(INTEGRATION_BIN) $(COMPACT_POLICY_BIN) $(FILTER_TEST_BIN)
 	rm -f $(TESTDIR)/test_output.txt $(TESTDIR)/test_*.tmp
+
+BENCH_SRC := $(TESTDIR)/bench_policy.c
+BENCH_BIN := $(TESTDIR)/bench_policy
+
+bench: $(BENCH_BIN)
+	@$(BENCH_BIN)
+
+$(BENCH_BIN): $(BENCH_SRC) $(LIB)
+	$(CC) $(CFLAGS) $(INCLUDES) $< -L$(OBJDIR) -lshelltype -lm -o $@

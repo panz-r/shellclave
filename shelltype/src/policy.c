@@ -703,6 +703,7 @@ static st_token_t *parse_pattern(const char *pattern, size_t *out_count)
     char *tok = strtok_r(copy, " ", &saveptr);
     while (tok && ti < count) {
         st_token_type_t type = ST_TYPE_LITERAL;
+        bool matched_prefix = false;
         for (int t = 1; t < ST_TYPE_COUNT; t++) {
             const char *sym = st_type_symbol[t];
             size_t sym_len = strlen(sym);
@@ -711,16 +712,26 @@ static st_token_t *parse_pattern(const char *pattern, size_t *out_count)
                 type = (st_token_type_t)t;
                 break;
             }
-            if (strncmp(tok, sym, sym_len) == 0 && tok[sym_len] == '.' &&
-                tok[sym_len + 1] != '\0' && type_supports_param((st_token_type_t)t)) {
-                /* Parametrized match: e.g., "#path.cfg" — validate parameter */
-                if (!validate_param((st_token_type_t)t, tok + sym_len)) {
-                    /* Invalid parameter — treat as literal */
+            if (strncmp(tok, sym, sym_len) == 0 && tok[sym_len] == '.') {
+                /* Has a parameter suffix */
+                matched_prefix = true;
+                if (type_supports_param((st_token_type_t)t) &&
+                    validate_param((st_token_type_t)t, tok + sym_len)) {
+                    type = (st_token_type_t)t;
                     break;
                 }
-                type = (st_token_type_t)t;
-                break;
+                /* Invalid param or unsupported type -- keep checking other symbols */
             }
+        }
+        /* If a wildcard symbol prefix was matched but no valid parametrized
+         * type was found, reject the pattern (user intended a parametrized wildcard
+         * but provided an invalid parameter). */
+        if (matched_prefix && type == ST_TYPE_LITERAL) {
+            for (size_t k = 0; k < ti; k++) free(tokens[k].text);
+            free(tokens);
+            free(copy);
+            *out_count = 0;
+            return NULL;
         }
         if (type == ST_TYPE_LITERAL) {
             type = st_classify_token(tok);

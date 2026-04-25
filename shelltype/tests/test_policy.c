@@ -1350,19 +1350,11 @@ static int test_param_non_path_type_rejected(void)
     st_policy_ctx_t *ctx = st_policy_ctx_new();
     st_policy_t *policy = st_policy_new(ctx);
 
-    /* #n.cfg should not be treated as parametrized - it's invalid,
-     * so it should fail to parse as a wildcard and be treated as literal */
+    /* #n.cfg: the prefix "#n" is a wildcard symbol but #n does not support
+     * parameters. Since the user wrote a parametrized form of a non-param
+     * type, this is rejected as invalid. */
     st_error_t err = st_policy_add(policy, "cat #n.cfg");
-    ASSERT(err == ST_OK);
-    /* The token "#n.cfg" won't match #n (since #n doesn't support params),
-     * so it falls through to classify which treats it as literal "#n.cfg".
-     * This is acceptable behavior - non-path parametrized wildcards are not
-     * recognized and become literals. */
-
-    /* Verify it doesn't match "cat 42" */
-    st_eval_result_t result;
-    st_policy_eval(policy, "cat 42", &result);
-    ASSERT(!result.matches);
+    ASSERT(err == ST_ERR_INVALID);
 
     st_policy_free(policy);
     st_policy_ctx_free(ctx);
@@ -1649,13 +1641,9 @@ static int test_param_validate_bad_path(void)
     st_policy_ctx_t *ctx = st_policy_ctx_new();
     st_policy_t *policy = st_policy_new(ctx);
 
-    /* Empty parameter after dot → treated as literal, not parametrized */
+    /* Empty parameter after dot → rejected as invalid parametrized wildcard */
     st_error_t err = st_policy_add(policy, "cat #path.");
-    ASSERT(err == ST_OK);
-    /* It's a literal "#path.", not a wildcard, so it shouldn't match */
-    st_eval_result_t r;
-    st_policy_eval(policy, "cat /etc/hosts", &r);
-    ASSERT(!r.matches);
+    ASSERT(err == ST_ERR_INVALID);
 
     st_policy_free(policy);
     st_policy_ctx_free(ctx);
@@ -1667,13 +1655,9 @@ static int test_param_validate_bad_size(void)
     st_policy_ctx_t *ctx = st_policy_ctx_new();
     st_policy_t *policy = st_policy_new(ctx);
 
-    /* "xyz" is not a known size suffix → treated as literal */
+    /* "xyz" is not a known size suffix → rejected */
     st_error_t err = st_policy_add(policy, "dd bs= #size.xyz");
-    ASSERT(err == ST_OK);
-    /* It's a literal "#size.xyz", not a parametrized wildcard */
-    st_eval_result_t r;
-    st_policy_eval(policy, "dd bs=10MiB", &r);
-    ASSERT(!r.matches);
+    ASSERT(err == ST_ERR_INVALID);
 
     st_policy_free(policy);
     st_policy_ctx_free(ctx);
@@ -1685,13 +1669,9 @@ static int test_param_validate_bad_uuid(void)
     st_policy_ctx_t *ctx = st_policy_ctx_new();
     st_policy_t *policy = st_policy_new(ctx);
 
-    /* v3 is not a valid UUID version param → treated as literal */
+    /* v3 is not a valid UUID version param → rejected */
     st_error_t err = st_policy_add(policy, "container #uuid.v3");
-    ASSERT(err == ST_OK);
-    /* Won't match any UUID */
-    st_eval_result_t r;
-    st_policy_eval(policy, "container 6fa459ea-ee8a-3ca4-894e-db77e160355e", &r);
-    ASSERT(!r.matches);
+    ASSERT(err == ST_ERR_INVALID);
 
     st_policy_free(policy);
     st_policy_ctx_free(ctx);
@@ -1703,9 +1683,9 @@ static int test_param_validate_bad_ts(void)
     st_policy_ctx_t *ctx = st_policy_ctx_new();
     st_policy_t *policy = st_policy_new(ctx);
 
-    /* "foo" is not a valid timestamp param → treated as literal */
+    /* "foo" is not a valid timestamp param → rejected */
     st_error_t err = st_policy_add(policy, "log #ts.foo");
-    ASSERT(err == ST_OK);
+    ASSERT(err == ST_ERR_INVALID);
 
     st_eval_result_t r;
     st_policy_eval(policy, "log 2025-04-24", &r);
@@ -1749,15 +1729,9 @@ static int test_validate_valid_parametrized(void)
 
 static int test_validate_invalid_param(void)
 {
-    /* #size.XX is not a valid size suffix, so parse_pattern falls through
-     * to st_classify_token and treats it as a generic type. The pattern
-     * is still syntactically valid — it just won't behave as a SIZE wildcard. */
-    st_pattern_info_t info;
-    st_error_t err = st_validate_pattern("dd #size.XX", &info);
-    ASSERT(err == ST_OK);
-    ASSERT(info.token_count == 2);
-    /* Should NOT be SIZE since the param is invalid */
-    ASSERT(info.token_types[1] != ST_TYPE_SIZE);
+    /* #size.XX is not a valid size suffix → rejected */
+    st_error_t err = st_validate_pattern("dd #size.XX", NULL);
+    ASSERT(err == ST_ERR_INVALID);
     return 1;
 }
 
