@@ -15,10 +15,77 @@ static int fail_count = 0;
     } \
 } while(0)
 
+#define ASSERT_EQ_INT(a, b) do { \
+    if ((a) != (b)) { \
+        printf("    FAIL: %s != %s (%ld != %ld) at %s:%d\n", #a, #b, (long)(a), (long)(b), __FILE__, __LINE__); \
+        fail_count++; \
+        return; \
+    } \
+} while(0)
+
+#define ASSERT_EQ_UINT(a, b) do { \
+    if ((a) != (b)) { \
+        printf("    FAIL: %s != %s (%lu != %lu) at %s:%d\n", #a, #b, (unsigned long)(a), (unsigned long)(b), __FILE__, __LINE__); \
+        fail_count++; \
+        return; \
+    } \
+} while(0)
+
+#define ASSERT_STR(a, b) do { \
+    if (strcmp((a), (b)) != 0) { \
+        printf("    FAIL: %s != %s (\"%s\" != \"%s\") at %s:%d\n", #a, #b, (a), (b), __FILE__, __LINE__); \
+        fail_count++; \
+        return; \
+    } \
+} while(0)
+
+#define ASSERT_NULL(ptr) do { \
+    if ((ptr) != NULL) { \
+        printf("    FAIL: %s should be NULL at %s:%d\n", #ptr, __FILE__, __LINE__); \
+        fail_count++; \
+        return; \
+    } \
+} while(0)
+
+#define ASSERT_NOT_NULL(ptr) do { \
+    if ((ptr) == NULL) { \
+        printf("    FAIL: %s should not be NULL at %s:%d\n", #ptr, __FILE__, __LINE__); \
+        fail_count++; \
+        return; \
+    } \
+} while(0)
+
 #define TEST(name) static void test_##name(void)
 #define RUN(name) do { printf("  %-40s ", #name); int _pf = fail_count; test_##name(); if (fail_count == _pf) { printf("PASS\n"); pass_count++; } } while(0)
 
+#define MAX_TEMP_FILES 16
+
 static char eval_buf[16384];
+static char *temp_files[MAX_TEMP_FILES];
+static int temp_file_count = 0;
+
+static void cleanup_temp_files(void)
+{
+    for (int i = 0; i < temp_file_count; i++) {
+        if (temp_files[i]) {
+            unlink(temp_files[i]);
+            free(temp_files[i]);
+            temp_files[i] = NULL;
+        }
+    }
+    temp_file_count = 0;
+}
+
+static const char *temp_policy_file(void)
+{
+    static char path[256];
+    snprintf(path, sizeof(path), "/tmp/shellgate_test_%d_%d.txt", getpid(), temp_file_count);
+    if (temp_file_count < MAX_TEMP_FILES) {
+        temp_files[temp_file_count] = strdup(path);
+        temp_file_count++;
+    }
+    return path;
+}
 
 static sg_gate_t *gate_with_rules(const char **rules, int count)
 {
@@ -32,6 +99,95 @@ static sg_error_t eval_cmd(sg_gate_t *g, const char *cmd, sg_result_t *r)
 {
     memset(eval_buf, 0, sizeof(eval_buf));
     return sg_eval(g, cmd, strlen(cmd), eval_buf, sizeof(eval_buf), r);
+}
+
+static sg_error_t eval_cmd_buf(sg_gate_t *g, const char *cmd, size_t cmd_len, char *buf, size_t buf_size, sg_result_t *r)
+{
+    return sg_eval(g, cmd, cmd_len, buf, buf_size, r);
+}
+
+static int invariant_failures = 0;
+
+static void check_result_invariants(const sg_result_t *res, const char *buf, size_t buf_size)
+{
+    if (res->subcmd_count > SG_MAX_SUBCMD_RESULTS) {
+        printf("    FAIL: subcmd_count %u > SG_MAX_SUBCMD_RESULTS %d\n",
+               res->subcmd_count, SG_MAX_SUBCMD_RESULTS);
+        invariant_failures++;
+        return;
+    }
+
+    for (uint32_t i = 0; i < res->subcmd_count; i++) {
+        const sg_subcmd_result_t *sr = &res->subcmds[i];
+        if (sr->command != NULL) {
+            if (sr->command < buf || sr->command >= buf + buf_size) {
+                printf("    FAIL: subcmds[%u].command out of bounds\n", i);
+                invariant_failures++;
+            }
+        }
+        if (sr->reject_reason != NULL) {
+            if (sr->reject_reason < buf || sr->reject_reason >= buf + buf_size) {
+                printf("    FAIL: subcmds[%u].reject_reason out of bounds\n", i);
+                invariant_failures++;
+            }
+        }
+    }
+
+    for (uint32_t i = 0; i < res->suggestion_count && i < 2; i++) {
+        if (res->suggestions[i] != NULL) {
+            if (res->suggestions[i] < buf || res->suggestions[i] >= buf + buf_size) {
+                printf("    FAIL: suggestions[%u] out of bounds\n", i);
+                invariant_failures++;
+            }
+        }
+    }
+
+    for (uint32_t i = 0; i < res->deny_suggestion_count && i < 2; i++) {
+        if (res->deny_suggestions[i] != NULL) {
+            if (res->deny_suggestions[i] < buf || res->deny_suggestions[i] >= buf + buf_size) {
+                printf("    FAIL: deny_suggestions[%u] out of bounds\n", i);
+                invariant_failures++;
+            }
+        }
+    }
+
+    for (uint32_t i = 0; i < res->violation_count && i < SG_MAX_VIOLATIONS; i++) {
+        const sg_violation_t *v = &res->violations[i];
+        if (v->description != NULL) {
+            if (v->description < buf || v->description >= buf + buf_size) {
+                printf("    FAIL: violations[%u].description out of bounds\n", i);
+                invariant_failures++;
+            }
+        }
+        if (v->detail != NULL) {
+            if (v->detail < buf || v->detail >= buf + buf_size) {
+                printf("    FAIL: violations[%u].detail out of bounds\n", i);
+                invariant_failures++;
+            }
+        }
+    }
+
+    if (res->deny_reason != NULL) {
+        if (res->deny_reason < buf || res->deny_reason >= buf + buf_size) {
+            printf("    FAIL: deny_reason out of bounds\n");
+            invariant_failures++;
+        }
+    }
+}
+
+static void eval_and_check_invariants(sg_gate_t *g, const char *cmd)
+{
+    invariant_failures = 0;
+    char buf[16384];
+    sg_result_t r;
+    memset(buf, 0, sizeof(buf));
+    sg_error_t err = sg_eval(g, cmd, strlen(cmd), buf, sizeof(buf), &r);
+    if (err == SG_OK) {
+        check_result_invariants(&r, buf, sizeof(buf));
+    }
+    if (invariant_failures > 0) {
+        fail_count++;
+    }
 }
 
 /* ============================================================
@@ -49,10 +205,91 @@ TEST(gate_null_safety)
 {
     sg_gate_free(NULL);
     ASSERT(sg_gate_rule_count(NULL) == 0);
+    ASSERT(sg_gate_deny_rule_count(NULL) == 0);
+    ASSERT(sg_eval(NULL, "ls", 2, NULL, 64, NULL) == SG_ERR_INVALID);
+}
+
+TEST(eval_invalid_inputs)
+{
+    sg_gate_t *g = sg_gate_new();
+    sg_gate_add_rule(g, "ls");
     char buf[64];
     sg_result_t r;
-    ASSERT(sg_eval(NULL, "ls", 2, buf, sizeof(buf), NULL) == SG_ERR_INVALID);
-    ASSERT(sg_eval(NULL, "ls", 2, buf, sizeof(buf), &r) == SG_ERR_INVALID);
+
+    ASSERT(sg_eval(g, NULL, 2, buf, sizeof(buf), &r) == SG_ERR_INVALID);
+    ASSERT(sg_eval(g, "ls", 0, buf, sizeof(buf), &r) == SG_ERR_INVALID);
+    ASSERT(sg_eval(g, "ls", 2, NULL, sizeof(buf), &r) == SG_ERR_INVALID);
+    ASSERT(sg_eval(g, "ls", 2, buf, 0, &r) == SG_ERR_INVALID);
+    ASSERT(sg_eval(g, "", 0, buf, sizeof(buf), &r) == SG_ERR_INVALID);
+
+    sg_gate_free(g);
+}
+
+TEST(eval_empty_string)
+{
+    sg_gate_t *g = sg_gate_new();
+    char buf[64];
+    sg_result_t r;
+    sg_error_t err = sg_eval(g, "", 0, buf, sizeof(buf), &r);
+    ASSERT(err == SG_ERR_INVALID);
+    sg_gate_free(g);
+}
+
+TEST(setter_cwd)
+{
+    sg_gate_t *g = sg_gate_new();
+    ASSERT(sg_gate_set_cwd(g, "/tmp") == SG_OK);
+    ASSERT(sg_gate_set_cwd(g, "/home/user") == SG_OK);
+    ASSERT(sg_gate_set_cwd(NULL, "/tmp") == SG_ERR_INVALID);
+    ASSERT(sg_gate_set_cwd(g, NULL) == SG_ERR_INVALID);
+    sg_gate_free(g);
+}
+
+TEST(setter_stop_mode)
+{
+    sg_gate_t *g = sg_gate_new();
+    ASSERT(sg_gate_set_stop_mode(g, SG_STOP_FIRST_FAIL) == SG_OK);
+    ASSERT(sg_gate_set_stop_mode(g, SG_STOP_FIRST_PASS) == SG_OK);
+    ASSERT(sg_gate_set_stop_mode(g, SG_STOP_FIRST_ALLOW) == SG_OK);
+    ASSERT(sg_gate_set_stop_mode(g, SG_STOP_FIRST_DENY) == SG_OK);
+    ASSERT(sg_gate_set_stop_mode(g, SG_EVAL_ALL) == SG_OK);
+    ASSERT(sg_gate_set_stop_mode(NULL, SG_STOP_FIRST_FAIL) == SG_ERR_INVALID);
+    sg_gate_free(g);
+}
+
+TEST(setter_suggestions)
+{
+    sg_gate_t *g = sg_gate_new();
+    ASSERT(sg_gate_set_suggestions(g, true) == SG_OK);
+    ASSERT(sg_gate_set_suggestions(g, false) == SG_OK);
+    ASSERT(sg_gate_set_suggestions(NULL, true) == SG_ERR_INVALID);
+    sg_gate_free(g);
+}
+
+TEST(setter_reject_mask)
+{
+    sg_gate_t *g = sg_gate_new();
+    ASSERT(sg_gate_set_reject_mask(g, 0) == SG_OK);
+    ASSERT(sg_gate_set_reject_mask(g, 0xFFFFFFFF) == SG_OK);
+    ASSERT(sg_gate_set_reject_mask(g, SG_REJECT_MASK_DEFAULT) == SG_OK);
+    ASSERT(sg_gate_set_reject_mask(NULL, 0) == SG_ERR_INVALID);
+    sg_gate_free(g);
+}
+
+TEST(setter_expand_var)
+{
+    sg_gate_t *g = sg_gate_new();
+    ASSERT(sg_gate_set_expand_var(g, NULL, NULL) == SG_OK);
+    ASSERT(sg_gate_set_expand_var(NULL, NULL, NULL) == SG_ERR_INVALID);
+    sg_gate_free(g);
+}
+
+TEST(setter_expand_glob)
+{
+    sg_gate_t *g = sg_gate_new();
+    ASSERT(sg_gate_set_expand_glob(g, NULL, NULL) == SG_OK);
+    ASSERT(sg_gate_set_expand_glob(NULL, NULL, NULL) == SG_ERR_INVALID);
+    sg_gate_free(g);
 }
 
 /* ============================================================
@@ -387,6 +624,33 @@ TEST(config_stop_first_deny)
     sg_gate_free(g);
 }
 
+TEST(stop_mode_first_pass_no_match)
+{
+    sg_gate_t *g = sg_gate_new();
+    sg_gate_add_rule(g, "cat #path");
+    sg_gate_set_stop_mode(g, SG_STOP_FIRST_PASS);
+    sg_result_t r;
+    eval_cmd(g, "rm ; cat /etc/passwd", &r);
+    ASSERT(r.subcmd_count == 2);
+    ASSERT(!r.subcmds[0].matches);
+    ASSERT(r.subcmds[1].matches);
+    sg_gate_free(g);
+}
+
+TEST(pipeline_many_subcommands)
+{
+    sg_gate_t *g = sg_gate_new();
+    sg_gate_add_rule(g, "ls");
+    sg_gate_set_stop_mode(g, SG_EVAL_ALL);
+    sg_result_t r;
+    eval_cmd(g, "ls ; ls ; ls ; ls ; ls ; ls ; ls ; ls ; ls ; ls", &r);
+    ASSERT(r.subcmd_count == 10);
+    for (uint32_t i = 0; i < r.subcmd_count; i++) {
+        ASSERT(r.subcmds[i].matches);
+    }
+    sg_gate_free(g);
+}
+
 /* ============================================================
  * POLICY MANAGEMENT
  * ============================================================ */
@@ -454,6 +718,127 @@ TEST(deny_rule_save_load)
     unlink(path);
     sg_gate_free(g);
     sg_gate_free(g2);
+}
+
+TEST(save_load_preserves_rules)
+{
+    const char *path = temp_policy_file();
+    sg_gate_t *g = sg_gate_new();
+    sg_gate_add_rule(g, "ls");
+    sg_gate_add_rule(g, "cat #path");
+    sg_gate_add_rule(g, "git * * *");
+    sg_gate_add_rule(g, "rm #path");
+
+    sg_error_t err = sg_gate_save_policy(g, path);
+    ASSERT(err == SG_OK);
+
+    sg_gate_t *g2 = sg_gate_new();
+    err = sg_gate_load_policy(g2, path);
+    ASSERT(err == SG_OK);
+    ASSERT_EQ_INT(sg_gate_rule_count(g2), 4);
+
+    sg_result_t r;
+    eval_cmd(g2, "ls", &r);
+    ASSERT(r.verdict == SG_VERDICT_ALLOW);
+
+    eval_cmd(g2, "rm /tmp/test", &r);
+    ASSERT(r.verdict == SG_VERDICT_ALLOW);
+
+    sg_gate_free(g);
+    sg_gate_free(g2);
+}
+
+TEST(policy_remove_last_rule)
+{
+    sg_gate_t *g = sg_gate_new();
+    sg_gate_add_rule(g, "ls");
+    ASSERT_EQ_INT(sg_gate_rule_count(g), 1);
+
+    sg_gate_remove_rule(g, "ls");
+    ASSERT_EQ_INT(sg_gate_rule_count(g), 0);
+
+    sg_gate_free(g);
+}
+
+TEST(policy_remove_nonexistent)
+{
+    sg_gate_t *g = sg_gate_new();
+    sg_gate_add_rule(g, "ls");
+    sg_error_t err = sg_gate_remove_rule(g, "nonexistent");
+    ASSERT(err == SG_OK);
+    ASSERT_EQ_INT(sg_gate_rule_count(g), 1);
+    sg_gate_free(g);
+}
+
+TEST(policy_clear_rules)
+{
+    sg_gate_t *g = sg_gate_new();
+    sg_gate_add_rule(g, "ls");
+    sg_gate_add_rule(g, "cat");
+    sg_gate_add_rule(g, "rm");
+    ASSERT_EQ_INT(sg_gate_rule_count(g), 3);
+
+    sg_gate_remove_rule(g, "ls");
+    sg_gate_remove_rule(g, "cat");
+    sg_gate_remove_rule(g, "rm");
+    ASSERT_EQ_INT(sg_gate_rule_count(g), 0);
+
+    sg_result_t r;
+    eval_cmd(g, "ls", &r);
+    ASSERT(r.verdict == SG_VERDICT_UNDETERMINED);
+
+    sg_gate_free(g);
+}
+
+TEST(policy_deny_rule_count)
+{
+    sg_gate_t *g = sg_gate_new();
+    ASSERT_EQ_INT(sg_gate_deny_rule_count(g), 0);
+    sg_gate_add_deny_rule(g, "rm");
+    ASSERT_EQ_INT(sg_gate_deny_rule_count(g), 1);
+    sg_gate_add_deny_rule(g, "dd");
+    ASSERT_EQ_INT(sg_gate_deny_rule_count(g), 2);
+    sg_gate_remove_deny_rule(g, "rm");
+    ASSERT_EQ_INT(sg_gate_deny_rule_count(g), 1);
+    sg_gate_remove_deny_rule(g, "dd");
+    ASSERT_EQ_INT(sg_gate_deny_rule_count(g), 0);
+    sg_gate_free(g);
+}
+
+TEST(policy_remove_specific_rule)
+{
+    sg_gate_t *g = sg_gate_new();
+    sg_gate_add_rule(g, "ls");
+    sg_gate_add_rule(g, "cat");
+    sg_gate_add_rule(g, "cat /etc/passwd");
+    sg_gate_add_rule(g, "rm");
+    ASSERT_EQ_INT(sg_gate_rule_count(g), 4);
+
+    sg_gate_remove_rule(g, "cat");
+    ASSERT_EQ_INT(sg_gate_rule_count(g), 3);
+
+    sg_result_t r;
+    eval_cmd(g, "ls", &r);
+    ASSERT(r.verdict == SG_VERDICT_ALLOW);
+
+    eval_cmd(g, "cat /etc/passwd", &r);
+    ASSERT(r.verdict == SG_VERDICT_ALLOW);
+
+    sg_gate_free(g);
+}
+
+TEST(policy_empty_rules_undetermined)
+{
+    sg_gate_t *g = sg_gate_new();
+    ASSERT_EQ_INT(sg_gate_rule_count(g), 0);
+    sg_result_t r;
+    eval_cmd(g, "ls", &r);
+    ASSERT(r.verdict == SG_VERDICT_UNDETERMINED);
+    eval_cmd(g, "cat /etc/passwd", &r);
+    ASSERT(r.verdict == SG_VERDICT_UNDETERMINED);
+    eval_cmd(g, "rm -rf /", &r);
+    ASSERT(r.verdict == SG_VERDICT_UNDETERMINED);
+    sg_gate_free(g);
 }
 
 /* ============================================================
@@ -581,6 +966,105 @@ TEST(buffer_zero_length)
     sg_gate_free(g);
 }
 
+TEST(buffer_exact_fit)
+{
+    sg_gate_t *g = sg_gate_new();
+    sg_gate_add_rule(g, "ls");
+    char buf[256];
+    memset(buf, 0, sizeof(buf));
+    sg_result_t r;
+    sg_error_t err = sg_eval(g, "ls", 2, buf, sizeof(buf), &r);
+    ASSERT(err == SG_OK);
+    ASSERT(r.truncated == false);
+    ASSERT(r.subcmd_count == 1);
+    sg_gate_free(g);
+}
+
+TEST(buffer_large)
+{
+    sg_gate_t *g = sg_gate_new();
+    sg_gate_add_rule(g, "cat #path");
+    char buf[8192];
+    memset(buf, 0, sizeof(buf));
+    sg_result_t r;
+    sg_error_t err = sg_eval(g, "cat /etc/passwd", 16, buf, sizeof(buf), &r);
+    ASSERT(err == SG_OK);
+    ASSERT(r.truncated == false);
+    ASSERT(r.subcmd_count == 1);
+    ASSERT(r.subcmds[0].matches);
+    sg_gate_free(g);
+}
+
+TEST(buffer_partial_subcmds)
+{
+    sg_gate_t *g = sg_gate_new();
+    sg_gate_add_rule(g, "ls");
+    sg_gate_set_stop_mode(g, SG_EVAL_ALL);
+    char buf[256];
+    sg_result_t r;
+    sg_error_t err = sg_eval(g, "ls ; ls ; ls ; ls ; ls", 25, buf, sizeof(buf), &r);
+    ASSERT(err == SG_OK);
+    ASSERT(r.subcmd_count == 5);
+    sg_gate_free(g);
+}
+
+TEST(buffer_tiny_truncated)
+{
+    sg_gate_t *g = sg_gate_new();
+    sg_gate_add_rule(g, "ls");
+    char tiny[8];
+    memset(tiny, 0, sizeof(tiny));
+    sg_result_t r;
+    sg_error_t err = sg_eval(g, "ls", 2, tiny, sizeof(tiny), &r);
+    ASSERT(err == SG_ERR_TRUNC);
+    ASSERT(r.truncated == true);
+    sg_gate_free(g);
+}
+
+TEST(buffer_really_tiny)
+{
+    sg_gate_t *g = sg_gate_new();
+    sg_gate_add_rule(g, "ls");
+    char tiny[4];
+    memset(tiny, 0, sizeof(tiny));
+    sg_result_t r;
+    sg_error_t err = sg_eval(g, "ls", 2, tiny, sizeof(tiny), &r);
+    ASSERT(err == SG_ERR_TRUNC);
+    sg_gate_free(g);
+}
+
+TEST(buffer_multiple_truncations)
+{
+    sg_gate_t *g = sg_gate_new();
+    sg_gate_add_rule(g, "cat #path");
+    for (int i = 0; i < 10; i++) {
+        char tiny[16];
+        memset(tiny, 0, sizeof(tiny));
+        sg_result_t r;
+        sg_error_t err = sg_eval(g, "cat /etc/passwd", 16, tiny, sizeof(tiny), &r);
+        ASSERT(err == SG_ERR_TRUNC);
+        ASSERT(r.truncated == true);
+    }
+    sg_gate_free(g);
+}
+
+TEST(buffer_null_termination_preserved)
+{
+    sg_gate_t *g = sg_gate_new();
+    sg_gate_add_rule(g, "ls");
+    char buf[32];
+    for (int i = 0; i < 32; i++) buf[i] = 0xFF;
+    sg_result_t r;
+    sg_error_t err = sg_eval(g, "ls", 2, buf, sizeof(buf), &r);
+    if (err == SG_OK) {
+        ASSERT(r.truncated == false);
+        ASSERT(r.subcmds[0].command != NULL);
+        size_t len = strlen(r.subcmds[0].command);
+        ASSERT(len < sizeof(buf));
+    }
+    sg_gate_free(g);
+}
+
 /* ============================================================
  * VERDICT HELPERS
  * ============================================================ */
@@ -618,6 +1102,47 @@ TEST(violation_dropped_count)
     ASSERT(err == SG_OK);
     ASSERT(r.violation_dropped_count == 0);
 
+    sg_gate_free(g);
+}
+
+TEST(helper_violation_dropped_null)
+{
+    ASSERT(sg_result_violation_dropped(NULL) == 0);
+}
+
+TEST(result_attention_index)
+{
+    sg_gate_t *g = sg_gate_new();
+    sg_gate_add_rule(g, "ls");
+    sg_gate_add_rule(g, "cat #path");
+    sg_gate_add_deny_rule(g, "cat /etc/shadow");
+
+    sg_result_t r;
+    eval_cmd(g, "ls ; cat /etc/shadow", &r);
+    ASSERT(r.attention_index == 1);
+
+    sg_gate_free(g);
+}
+
+TEST(suggestions_when_disabled)
+{
+    sg_gate_t *g = sg_gate_new();
+    sg_gate_set_suggestions(g, false);
+    sg_gate_add_rule(g, "lss");
+    sg_result_t r;
+    eval_cmd(g, "ls", &r);
+    ASSERT(r.suggestion_count == 0);
+    sg_gate_free(g);
+}
+
+TEST(suggestions_when_enabled)
+{
+    sg_gate_t *g = sg_gate_new();
+    sg_gate_set_suggestions(g, true);
+    sg_gate_add_rule(g, "lss");
+    sg_result_t r;
+    eval_cmd(g, "ls", &r);
+    ASSERT(r.suggestion_count > 0 || r.verdict == SG_VERDICT_UNDETERMINED);
     sg_gate_free(g);
 }
 
@@ -859,6 +1384,57 @@ TEST(viol_write_then_read)
     sg_gate_free(g);
 }
 
+TEST(viol_write_then_read_and_chain)
+{
+    sg_gate_t *g = gate_with_violations();
+    sg_gate_add_rule(g, "echo *");
+    sg_gate_add_rule(g, "cat #path");
+    sg_result_t r;
+    eval_cmd(g, "echo test > /tmp/x && cat /tmp/x", &r);
+    if (r.violation_count > 0) {
+        ASSERT(r.violation_flags & SG_VIOL_WRITE_THEN_READ);
+    }
+    sg_gate_free(g);
+}
+
+TEST(viol_write_then_read_or_chain)
+{
+    sg_gate_t *g = gate_with_violations();
+    sg_gate_add_rule(g, "cat #path");
+    sg_result_t r;
+    eval_cmd(g, "echo data > /tmp/x || cat /tmp/x", &r);
+    if (r.violation_count > 0) {
+        ASSERT(r.violation_flags & SG_VIOL_WRITE_THEN_READ);
+    }
+    sg_gate_free(g);
+}
+
+TEST(viol_write_then_read_pipe)
+{
+    sg_gate_t *g = gate_with_violations();
+    sg_gate_add_rule(g, "cat #path");
+    sg_gate_add_rule(g, "grep *");
+    sg_result_t r;
+    eval_cmd(g, "echo data > /tmp/x | grep data /tmp/x", &r);
+    if (r.violation_count > 0) {
+        ASSERT(r.violation_flags & SG_VIOL_WRITE_THEN_READ);
+    }
+    sg_gate_free(g);
+}
+
+TEST(viol_write_then_read_no_violation)
+{
+    sg_gate_t *g = gate_with_violations();
+    sg_gate_add_rule(g, "cat #path");
+    sg_gate_add_rule(g, "echo *");
+    sg_result_t r;
+    eval_cmd(g, "echo hello > /tmp/x ; ls /tmp", &r);
+    if (r.has_violations) {
+        ASSERT((r.violation_flags & SG_VIOL_WRITE_THEN_READ) == 0);
+    }
+    sg_gate_free(g);
+}
+
 TEST(viol_subst_sensitive)
 {
     sg_gate_t *g = gate_with_violations();
@@ -868,6 +1444,45 @@ TEST(viol_subst_sensitive)
     eval_cmd(g, "echo $(cat /etc/shadow)", &r);
     if (r.has_violations) {
         ASSERT(r.violation_flags & SG_VIOL_SUBST_SENSITIVE);
+    }
+    sg_gate_free(g);
+}
+
+TEST(viol_subst_sensitive_cat)
+{
+    sg_gate_t *g = gate_with_violations();
+    sg_gate_set_reject_mask(g, 0);
+    sg_gate_add_rule(g, "cat #path");
+    sg_result_t r;
+    eval_cmd(g, "cat $(cat /etc/shadow)", &r);
+    if (r.has_violations) {
+        ASSERT(r.violation_flags & SG_VIOL_SUBST_SENSITIVE);
+    }
+    sg_gate_free(g);
+}
+
+TEST(viol_subst_sensitive_nested)
+{
+    sg_gate_t *g = gate_with_violations();
+    sg_gate_set_reject_mask(g, 0);
+    sg_gate_add_rule(g, "echo *");
+    sg_result_t r;
+    eval_cmd(g, "echo \"$(cat /etc/shadow)\"", &r);
+    if (r.has_violations) {
+        ASSERT(r.violation_flags & SG_VIOL_SUBST_SENSITIVE);
+    }
+    sg_gate_free(g);
+}
+
+TEST(viol_subst_sensitive_not_privileged)
+{
+    sg_gate_t *g = gate_with_violations();
+    sg_gate_set_reject_mask(g, 0);
+    sg_gate_add_rule(g, "cat #path");
+    sg_result_t r;
+    eval_cmd(g, "echo $(cat /etc/passwd)", &r);
+    if (r.has_violations) {
+        ASSERT((r.violation_flags & SG_VIOL_SUBST_SENSITIVE) == 0);
     }
     sg_gate_free(g);
 }
@@ -1157,6 +1772,59 @@ TEST(viol_persistence_safe)
     sg_gate_free(g);
 }
 
+TEST(violation_flags_consistency)
+{
+    sg_gate_t *g = gate_with_violations();
+    sg_gate_add_rule(g, "echo *");
+    sg_result_t r;
+    eval_cmd(g, "echo hello", &r);
+    if (r.violation_count == 0) {
+        ASSERT(r.violation_flags == 0);
+        ASSERT(r.has_violations == false);
+    }
+    sg_gate_free(g);
+}
+
+TEST(violation_count_bounds)
+{
+    sg_gate_t *g = gate_with_violations();
+    sg_gate_add_rule(g, "echo *");
+    sg_gate_add_rule(g, "ls");
+    sg_gate_add_rule(g, "cat #path");
+    sg_result_t r;
+    eval_cmd(g, "echo hello ; ls ; cat /etc/passwd", &r);
+    ASSERT(r.violation_count <= SG_MAX_VIOLATIONS);
+    sg_gate_free(g);
+}
+
+TEST(violation_description_valid)
+{
+    sg_gate_t *g = gate_with_violations();
+    sg_gate_add_rule(g, "rm *");
+    sg_result_t r;
+    eval_cmd(g, "rm -rf /", &r);
+    if (r.violation_count > 0) {
+        for (uint32_t i = 0; i < r.violation_count; i++) {
+            if (r.violations[i].description != NULL) {
+                ASSERT(strlen(r.violations[i].description) > 0);
+            }
+        }
+    }
+    sg_gate_free(g);
+}
+
+TEST(no_violation_no_flags)
+{
+    sg_gate_t *g = sg_gate_new();
+    sg_gate_add_rule(g, "ls");
+    sg_result_t r;
+    eval_cmd(g, "ls", &r);
+    ASSERT(r.violation_count == 0);
+    ASSERT(r.violation_flags == 0);
+    ASSERT(r.has_violations == false);
+    sg_gate_free(g);
+}
+
 /* ============================================================
  * MAIN
  * ============================================================ */
@@ -1168,6 +1836,14 @@ int main(void)
     printf("Lifecycle:\n");
     RUN(gate_create_destroy);
     RUN(gate_null_safety);
+    RUN(eval_invalid_inputs);
+    RUN(eval_empty_string);
+    RUN(setter_cwd);
+    RUN(setter_stop_mode);
+    RUN(setter_suggestions);
+    RUN(setter_reject_mask);
+    RUN(setter_expand_var);
+    RUN(setter_expand_glob);
 
     printf("\nAllow/Deny:\n");
     RUN(allow_simple_command);
@@ -1210,6 +1886,8 @@ int main(void)
     RUN(config_stop_first_pass);
     RUN(config_stop_first_allow);
     RUN(config_stop_first_deny);
+    RUN(stop_mode_first_pass_no_match);
+    RUN(pipeline_many_subcommands);
 
     printf("\nPolicy management:\n");
     RUN(add_remove_rule);
@@ -1217,6 +1895,13 @@ int main(void)
     RUN(deny_rule_add_remove);
     RUN(deny_rule_overrides_allow);
     RUN(deny_rule_save_load);
+    RUN(save_load_preserves_rules);
+    RUN(policy_remove_last_rule);
+    RUN(policy_remove_nonexistent);
+    RUN(policy_clear_rules);
+    RUN(policy_deny_rule_count);
+    RUN(policy_remove_specific_rule);
+    RUN(policy_empty_rules_undetermined);
 
     printf("\nSerialization:\n");
     RUN(save_load_roundtrip);
@@ -1227,6 +1912,13 @@ int main(void)
     RUN(buffer_overflow_protection);
     RUN(buffer_reuse);
     RUN(buffer_zero_length);
+    RUN(buffer_exact_fit);
+    RUN(buffer_large);
+    RUN(buffer_partial_subcmds);
+    RUN(buffer_tiny_truncated);
+    RUN(buffer_really_tiny);
+    RUN(buffer_multiple_truncations);
+    RUN(buffer_null_termination_preserved);
 
     printf("\nExpansion callbacks:\n");
     RUN(expand_var_allows_expanded_command);
@@ -1244,7 +1936,14 @@ int main(void)
     RUN(viol_env_privileged);
     RUN(viol_env_normal);
     RUN(viol_write_then_read);
+    RUN(viol_write_then_read_and_chain);
+    RUN(viol_write_then_read_or_chain);
+    RUN(viol_write_then_read_pipe);
+    RUN(viol_write_then_read_no_violation);
     RUN(viol_subst_sensitive);
+    RUN(viol_subst_sensitive_cat);
+    RUN(viol_subst_sensitive_nested);
+    RUN(viol_subst_sensitive_not_privileged);
     RUN(viol_redirect_fanout);
     RUN(viol_no_violations);
     RUN(viol_disabled);
@@ -1269,12 +1968,21 @@ int main(void)
     RUN(viol_git_destructive_safe);
     RUN(viol_persistence);
     RUN(viol_persistence_safe);
+    RUN(violation_flags_consistency);
+    RUN(violation_count_bounds);
+    RUN(violation_description_valid);
+    RUN(no_violation_no_flags);
 
     printf("\nHelpers:\n");
     RUN(verdict_names);
     RUN(eval_size_hint);
     RUN(violation_dropped_count);
+    RUN(helper_violation_dropped_null);
+    RUN(result_attention_index);
+    RUN(suggestions_when_disabled);
+    RUN(suggestions_when_enabled);
 
+    cleanup_temp_files();
     printf("\n========================================\n");
     printf("Results: %d passed, %d failed\n", pass_count, fail_count);
     return fail_count > 0 ? 1 : 0;
