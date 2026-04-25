@@ -73,7 +73,6 @@ CHAINS: List[List[str]] = [
     ["EMAIL", "VALUE", "ANY"],
     ["HOSTNAME", "VALUE", "ANY"],
     ["PORT", "NUMBER", "VALUE", "ANY"],
-    ["PORT", "IPV4", "VALUE", "ANY"],
     ["SIZE", "VALUE", "ANY"],
     ["SEMVER", "VALUE", "ANY"],
     ["TIMESTAMP", "VALUE", "ANY"],

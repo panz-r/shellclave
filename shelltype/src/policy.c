@@ -1396,10 +1396,12 @@ st_error_t st_policy_compact(st_policy_t *policy)
      * (trie is torn down, no more references to ctx->arena) */
     st_policy_ctx_release(policy->ctx);  // refcount: 2 -> 1
 
-    /* Step 4: Reset context (now safe with refcount == 1) */
+    /* Step 4: Reset context (now safe with refcount == 1).
+     * On failure, the policy has an empty trie (torn down in Step 2).
+     * The caller should treat the policy as invalid and recreate it. */
     st_error_t reset_err = st_policy_ctx_reset(policy->ctx);
     if (reset_err != ST_OK) {
-        /* Re-acquire reference if reset failed */
+        /* Re-acquire reference if reset failed; policy has empty trie */
         st_policy_ctx_retain(policy->ctx);
         for (size_t j = 0; j < n_active; j++) free(active[j]);
         free(active);
@@ -1581,9 +1583,17 @@ st_error_t st_policy_eval(st_policy_t *policy,
     if (needs_rebuild) {
         pthread_rwlock_unlock(&policy->rwlock);
         pthread_rwlock_wrlock(&policy->rwlock);
-        /* Re-check epoch after acquiring write lock (another thread may have rebuilt) */
+        /* Re-check all depths after acquiring write lock (another thread
+         * may have rebuilt after a partial epoch update) */
         uint64_t recheck_epoch = atomic_load(&policy->epoch);
-        if (policy->pos_built_epoch[0] != recheck_epoch) {
+        bool still_stale = false;
+        for (size_t i = 0; i < check_len; i++) {
+            if (policy->pos_built_epoch[i] != recheck_epoch) {
+                still_stale = true;
+                break;
+            }
+        }
+        if (still_stale) {
             policy_rebuild_filters(policy);
         }
         pthread_rwlock_unlock(&policy->rwlock);
@@ -1835,7 +1845,7 @@ st_error_t st_policy_eval(st_policy_t *policy,
                             } else if (joined == ST_TYPE_SIZE) {
                                 const char *suf = st_size_suffix(c->text);
                                 if (suf) {
-                                    static char sufbuf[32];
+                                    char sufbuf[32];
                                     size_t slen = strlen(suf);
                                     if (slen + 1 < sizeof(sufbuf)) {
                                         sufbuf[0] = '.';
@@ -2661,7 +2671,7 @@ st_error_t st_policy_dump_dot(const st_policy_t *policy, const char *path)
  * DRY-RUN MODE
  * ============================================================ */
 
-st_error_t st_policy_simulate_add(const st_policy_t *policy,
+st_error_t st_policy_simulate_add(st_policy_t *policy,
                                     const char *pattern,
                                     bool *would_match,
                                     const char **conflicting_pattern)
@@ -2672,7 +2682,7 @@ st_error_t st_policy_simulate_add(const st_policy_t *policy,
     if (conflicting_pattern) *conflicting_pattern = NULL;
     
     st_eval_result_t result;
-    st_error_t err = st_policy_eval((st_policy_t *)policy, pattern, &result);
+    st_error_t err = st_policy_eval(policy, pattern, &result);
     if (err != ST_OK) return err;
     
     *would_match = result.matches;

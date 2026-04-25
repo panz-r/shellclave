@@ -355,8 +355,10 @@ const char *st_policy_ctx_intern(st_policy_ctx_t *ctx, const char *str);
 bool st_policy_ctx_is_exclusive(const st_policy_ctx_t *ctx);
 
 /**
- * Compact the context's arena and string pool to reclaim memory.
- * Requires refcount == 1 (no policies using the context).
+ * Reset the context's arena and string pool to reclaim memory.
+ * Discards all interned strings and arena data. Only safe when no policies
+ * reference this context (refcount == 1). Equivalent to destroying and
+ * recreating the context, but preserves the handle.
  */
 st_error_t st_policy_ctx_compact(st_policy_ctx_t *ctx);
 
@@ -487,8 +489,9 @@ st_error_t st_policy_dump_dot(const st_policy_t *policy, const char *path);
 /**
  * Simulate adding a pattern without modifying the policy.
  * Returns whether the pattern would match any existing pattern.
+ * Note: may trigger lazy filter rebuild, so policy is non-const.
  */
-st_error_t st_policy_simulate_add(const st_policy_t *policy,
+st_error_t st_policy_simulate_add(st_policy_t *policy,
                                     const char *pattern,
                                     bool *would_match,
                                     const char **conflicting_pattern);

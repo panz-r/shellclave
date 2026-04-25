@@ -412,7 +412,7 @@ static void dfs_collect(st_node_t *node, const char **path, size_t depth,
                             } else if (joined == ST_TYPE_SIZE) {
                                 const char *suf = st_size_suffix(node->sample_values[s]);
                                 if (suf) {
-                                    static char sufbuf[32];
+                                    char sufbuf[32];
                                     size_t slen = strlen(suf);
                                     if (slen + 1 < sizeof(sufbuf)) {
                                         sufbuf[0] = '.';
