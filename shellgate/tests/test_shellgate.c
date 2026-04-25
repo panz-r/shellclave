@@ -101,95 +101,6 @@ static sg_error_t eval_cmd(sg_gate_t *g, const char *cmd, sg_result_t *r)
     return sg_eval(g, cmd, strlen(cmd), eval_buf, sizeof(eval_buf), r);
 }
 
-static sg_error_t eval_cmd_buf(sg_gate_t *g, const char *cmd, size_t cmd_len, char *buf, size_t buf_size, sg_result_t *r)
-{
-    return sg_eval(g, cmd, cmd_len, buf, buf_size, r);
-}
-
-static int invariant_failures = 0;
-
-static void check_result_invariants(const sg_result_t *res, const char *buf, size_t buf_size)
-{
-    if (res->subcmd_count > SG_MAX_SUBCMD_RESULTS) {
-        printf("    FAIL: subcmd_count %u > SG_MAX_SUBCMD_RESULTS %d\n",
-               res->subcmd_count, SG_MAX_SUBCMD_RESULTS);
-        invariant_failures++;
-        return;
-    }
-
-    for (uint32_t i = 0; i < res->subcmd_count; i++) {
-        const sg_subcmd_result_t *sr = &res->subcmds[i];
-        if (sr->command != NULL) {
-            if (sr->command < buf || sr->command >= buf + buf_size) {
-                printf("    FAIL: subcmds[%u].command out of bounds\n", i);
-                invariant_failures++;
-            }
-        }
-        if (sr->reject_reason != NULL) {
-            if (sr->reject_reason < buf || sr->reject_reason >= buf + buf_size) {
-                printf("    FAIL: subcmds[%u].reject_reason out of bounds\n", i);
-                invariant_failures++;
-            }
-        }
-    }
-
-    for (uint32_t i = 0; i < res->suggestion_count && i < 2; i++) {
-        if (res->suggestions[i] != NULL) {
-            if (res->suggestions[i] < buf || res->suggestions[i] >= buf + buf_size) {
-                printf("    FAIL: suggestions[%u] out of bounds\n", i);
-                invariant_failures++;
-            }
-        }
-    }
-
-    for (uint32_t i = 0; i < res->deny_suggestion_count && i < 2; i++) {
-        if (res->deny_suggestions[i] != NULL) {
-            if (res->deny_suggestions[i] < buf || res->deny_suggestions[i] >= buf + buf_size) {
-                printf("    FAIL: deny_suggestions[%u] out of bounds\n", i);
-                invariant_failures++;
-            }
-        }
-    }
-
-    for (uint32_t i = 0; i < res->violation_count && i < SG_MAX_VIOLATIONS; i++) {
-        const sg_violation_t *v = &res->violations[i];
-        if (v->description != NULL) {
-            if (v->description < buf || v->description >= buf + buf_size) {
-                printf("    FAIL: violations[%u].description out of bounds\n", i);
-                invariant_failures++;
-            }
-        }
-        if (v->detail != NULL) {
-            if (v->detail < buf || v->detail >= buf + buf_size) {
-                printf("    FAIL: violations[%u].detail out of bounds\n", i);
-                invariant_failures++;
-            }
-        }
-    }
-
-    if (res->deny_reason != NULL) {
-        if (res->deny_reason < buf || res->deny_reason >= buf + buf_size) {
-            printf("    FAIL: deny_reason out of bounds\n");
-            invariant_failures++;
-        }
-    }
-}
-
-static void eval_and_check_invariants(sg_gate_t *g, const char *cmd)
-{
-    invariant_failures = 0;
-    char buf[16384];
-    sg_result_t r;
-    memset(buf, 0, sizeof(buf));
-    sg_error_t err = sg_eval(g, cmd, strlen(cmd), buf, sizeof(buf), &r);
-    if (err == SG_OK) {
-        check_result_invariants(&r, buf, sizeof(buf));
-    }
-    if (invariant_failures > 0) {
-        fail_count++;
-    }
-}
-
 /* ============================================================
  * LIFECYCLE
  * ============================================================ */
@@ -637,6 +548,167 @@ TEST(stop_mode_first_pass_no_match)
     sg_gate_free(g);
 }
 
+TEST(stop_mode_first_fail_blocks_second)
+{
+    sg_gate_t *g = sg_gate_new();
+    sg_gate_add_rule(g, "ls");
+    sg_gate_add_rule(g, "cat #path");
+    sg_gate_set_stop_mode(g, SG_STOP_FIRST_FAIL);
+    sg_result_t r;
+    eval_cmd(g, "rm ; cat /etc/passwd ; ls", &r);
+    ASSERT(r.subcmd_count == 1);
+    ASSERT(!r.subcmds[0].matches);
+    sg_gate_free(g);
+}
+
+TEST(stop_mode_first_pass_stops_on_match)
+{
+    sg_gate_t *g = sg_gate_new();
+    sg_gate_add_rule(g, "echo *");
+    sg_gate_add_rule(g, "ls");
+    sg_gate_set_stop_mode(g, SG_STOP_FIRST_PASS);
+    sg_result_t r;
+    eval_cmd(g, "rm ; ls ; cat /etc/passwd", &r);
+    ASSERT(r.subcmd_count == 2);
+    ASSERT(!r.subcmds[0].matches);
+    ASSERT(r.subcmds[1].matches);
+    ASSERT(r.verdict == SG_VERDICT_UNDETERMINED);
+    sg_gate_free(g);
+}
+
+TEST(stop_mode_first_allow_stops_on_allow)
+{
+    sg_gate_t *g = sg_gate_new();
+    sg_gate_add_rule(g, "ls");
+    sg_gate_add_rule(g, "cat #path");
+    sg_gate_add_rule(g, "rm");
+    sg_gate_set_stop_mode(g, SG_STOP_FIRST_ALLOW);
+    sg_result_t r;
+    eval_cmd(g, "ls ; cat /etc/passwd ; rm -rf /", &r);
+    ASSERT(r.subcmd_count == 1);
+    ASSERT(r.subcmds[0].matches);
+    ASSERT(r.verdict == SG_VERDICT_ALLOW);
+    sg_gate_free(g);
+}
+
+TEST(stop_mode_first_deny_stops_on_deny)
+{
+    sg_gate_t *g = sg_gate_new();
+    sg_gate_add_rule(g, "ls");
+    sg_gate_add_deny_rule(g, "cat /etc/shadow");
+    sg_gate_add_rule(g, "cat #path");
+    sg_gate_set_stop_mode(g, SG_STOP_FIRST_DENY);
+    sg_result_t r;
+    eval_cmd(g, "ls ; cat /etc/shadow ; ls", &r);
+    ASSERT(r.subcmd_count == 2);
+    ASSERT(r.subcmds[0].matches);
+    ASSERT(r.subcmds[1].matches);
+    ASSERT(r.verdict == SG_VERDICT_DENY);
+    sg_gate_free(g);
+}
+
+TEST(stop_mode_first_pass_no_match_continues)
+{
+    sg_gate_t *g = sg_gate_new();
+    sg_gate_add_rule(g, "cat #path");
+    sg_gate_add_rule(g, "echo *");
+    sg_gate_set_stop_mode(g, SG_STOP_FIRST_PASS);
+    sg_result_t r;
+    eval_cmd(g, "rm ; cat /etc/passwd ; echo hello", &r);
+    ASSERT(r.subcmd_count == 2);
+    ASSERT(!r.subcmds[0].matches);
+    ASSERT(r.subcmds[1].matches);
+    sg_gate_free(g);
+}
+
+TEST(stop_mode_eval_all_never_stops_early)
+{
+    sg_gate_t *g = sg_gate_new();
+    sg_gate_add_rule(g, "ls");
+    sg_gate_add_deny_rule(g, "rm /etc/shadow");
+    sg_gate_add_rule(g, "cat #path");
+    sg_gate_set_stop_mode(g, SG_EVAL_ALL);
+    sg_result_t r;
+    eval_cmd(g, "ls ; echo rm ; cat /etc/passwd", &r);
+    ASSERT(r.subcmd_count == 3);
+    ASSERT(r.subcmds[0].matches);
+    ASSERT(!r.subcmds[1].matches);
+    ASSERT(r.subcmds[2].matches);
+    sg_gate_free(g);
+}
+
+TEST(stop_mode_first_allow_with_mixed_allow_undet)
+{
+    sg_gate_t *g = sg_gate_new();
+    sg_gate_add_rule(g, "ls");
+    sg_gate_add_rule(g, "cat #path");
+    sg_gate_set_stop_mode(g, SG_STOP_FIRST_ALLOW);
+    sg_result_t r;
+    eval_cmd(g, "ls ; cat /etc/passwd ; rm -rf /", &r);
+    ASSERT(r.subcmd_count == 1);
+    ASSERT(r.subcmds[0].matches);
+    ASSERT(r.verdict == SG_VERDICT_ALLOW);
+    sg_gate_free(g);
+}
+
+TEST(stop_mode_first_deny_with_later_deny)
+{
+    sg_gate_t *g = sg_gate_new();
+    sg_gate_add_rule(g, "ls");
+    sg_gate_add_rule(g, "cat #path");
+    sg_gate_add_deny_rule(g, "rm");
+    sg_gate_set_stop_mode(g, SG_STOP_FIRST_DENY);
+    sg_result_t r;
+    eval_cmd(g, "ls ; ls ; rm -rf /", &r);
+    ASSERT(r.subcmd_count == 3);
+    ASSERT(r.subcmds[0].matches);
+    ASSERT(r.subcmds[1].matches);
+    ASSERT(!r.subcmds[2].matches);
+    ASSERT(r.verdict == SG_VERDICT_UNDETERMINED);
+    sg_gate_free(g);
+}
+
+TEST(stop_mode_first_fail_includes_first)
+{
+    sg_gate_t *g = sg_gate_new();
+    sg_gate_add_rule(g, "ls");
+    sg_gate_set_stop_mode(g, SG_STOP_FIRST_FAIL);
+    sg_result_t r;
+    eval_cmd(g, "rm ; ls ; ls", &r);
+    ASSERT(r.subcmd_count == 1);
+    ASSERT(!r.subcmds[0].matches);
+    sg_gate_free(g);
+}
+
+TEST(stop_mode_first_pass_three_subcmds)
+{
+    sg_gate_t *g = sg_gate_new();
+    sg_gate_add_rule(g, "cat #path");
+    sg_gate_add_rule(g, "ls");
+    sg_gate_set_stop_mode(g, SG_STOP_FIRST_PASS);
+    sg_result_t r;
+    eval_cmd(g, "echo a ; echo b ; cat /etc/passwd", &r);
+    ASSERT(r.subcmd_count == 3);
+    ASSERT(!r.subcmds[0].matches);
+    ASSERT(!r.subcmds[1].matches);
+    ASSERT(r.subcmds[2].matches);
+    sg_gate_free(g);
+}
+
+TEST(stop_mode_first_allow_four_subcmgs)
+{
+    sg_gate_t *g = sg_gate_new();
+    sg_gate_add_rule(g, "ls");
+    sg_gate_add_rule(g, "whoami");
+    sg_gate_add_rule(g, "pwd");
+    sg_gate_set_stop_mode(g, SG_STOP_FIRST_ALLOW);
+    sg_result_t r;
+    eval_cmd(g, "ls ; whoami ; pwd ; date", &r);
+    ASSERT(r.subcmd_count == 1);
+    ASSERT(r.verdict == SG_VERDICT_ALLOW);
+    sg_gate_free(g);
+}
+
 TEST(pipeline_many_subcommands)
 {
     sg_gate_t *g = sg_gate_new();
@@ -1008,27 +1080,33 @@ TEST(buffer_partial_subcmds)
     sg_gate_free(g);
 }
 
-TEST(buffer_tiny_truncated)
+TEST(buffer_max_subcommands_truncated)
 {
     sg_gate_t *g = sg_gate_new();
     sg_gate_add_rule(g, "ls");
-    char tiny[8];
-    memset(tiny, 0, sizeof(tiny));
+    char buf[4096];
+    memset(buf, 0, sizeof(buf));
     sg_result_t r;
-    sg_error_t err = sg_eval(g, "ls", 2, tiny, sizeof(tiny), &r);
-    ASSERT(err == SG_ERR_TRUNC);
-    ASSERT(r.truncated == true);
+    char cmd[512];
+    int len = 0;
+    for (int i = 0; i < 65; i++) {
+        if (i > 0) { cmd[len++] = ' '; cmd[len++] = ';'; cmd[len++] = ' '; }
+        cmd[len++] = 'l'; cmd[len++] = 's';
+    }
+    sg_eval(g, cmd, len, buf, sizeof(buf), &r);
+    ASSERT(r.subcmd_count == 64);
     sg_gate_free(g);
 }
 
-TEST(buffer_really_tiny)
+TEST(buffer_long_command_truncated)
 {
     sg_gate_t *g = sg_gate_new();
-    sg_gate_add_rule(g, "ls");
-    char tiny[4];
+    sg_gate_add_rule(g, "cat #path");
+    sg_gate_add_deny_rule(g, "rm");
+    char tiny[8];
     memset(tiny, 0, sizeof(tiny));
     sg_result_t r;
-    sg_error_t err = sg_eval(g, "ls", 2, tiny, sizeof(tiny), &r);
+    sg_error_t err = sg_eval(g, "rm -rf /", 8, tiny, sizeof(tiny), &r);
     ASSERT(err == SG_ERR_TRUNC);
     sg_gate_free(g);
 }
@@ -1053,7 +1131,7 @@ TEST(buffer_null_termination_preserved)
     sg_gate_t *g = sg_gate_new();
     sg_gate_add_rule(g, "ls");
     char buf[32];
-    for (int i = 0; i < 32; i++) buf[i] = 0xFF;
+    for (int i = 0; i < 32; i++) buf[i] = (char)0xFF;
     sg_result_t r;
     sg_error_t err = sg_eval(g, "ls", 2, buf, sizeof(buf), &r);
     if (err == SG_OK) {
@@ -1826,6 +1904,263 @@ TEST(no_violation_no_flags)
 }
 
 /* ============================================================
+ * PROPERTY TESTS
+ * ============================================================ */
+
+#define PROPTEST_COUNT   200
+#define PROPTEST_SEED    42
+
+static unsigned int prop_rand_state = PROPTEST_SEED;
+
+static unsigned int prop_next(void)
+{
+    prop_rand_state = prop_rand_state * 1103515245 + 12345;
+    return (prop_rand_state >> 16) & 0x7FFF;
+}
+
+static void prop_reset(void)
+{
+    prop_rand_state = PROPTEST_SEED;
+}
+
+static const char *pick_one(const char * const *arr, size_t len)
+{
+    return arr[prop_next() % len];
+}
+
+static size_t gen_cat_cmd(char *buf, size_t cap)
+{
+    static const char *files[] = {
+        "/etc/passwd", "/etc/hosts", "/tmp/test.txt",
+        "/var/log/syslog", "/home/user/.bashrc", "/dev/null"
+    };
+    const char *f = pick_one(files, sizeof(files)/sizeof(files[0]));
+    return (size_t)snprintf(buf, cap, "cat %s", f);
+}
+
+static size_t gen_ls_cmd(char *buf, size_t cap)
+{
+    static const char *flags[] = { "", "-l", "-la", "-a", "-lh", "-ltr" };
+    static const char *paths[] = { "/tmp", "/var/log", "/home/user", "/etc" };
+    const char *flag = pick_one(flags, sizeof(flags)/sizeof(flags[0]));
+    const char *path = pick_one(paths, sizeof(paths)/sizeof(paths[0]));
+    return (size_t)snprintf(buf, cap, "ls %s %s", flag, path);
+}
+
+static size_t gen_grep_cmd(char *buf, size_t cap)
+{
+    static const char *flags[] = { "", "-i", "-r", "-n", "-l", "-v" };
+    static const char *patts[] = { "error", "warn", "INFO", "DEBUG", "failed" };
+    static const char *paths[] = { "/var/log/syslog", "/tmp/test.log", "/etc/passwd" };
+    const char *flag = pick_one(flags, sizeof(flags)/sizeof(flags[0]));
+    const char *patt = pick_one(patts, sizeof(patts)/sizeof(patts[0]));
+    const char *path = pick_one(paths, sizeof(paths)/sizeof(paths[0]));
+    return (size_t)snprintf(buf, cap, "grep %s %s %s", flag, patt, path);
+}
+
+static size_t gen_git_cmd(char *buf, size_t cap)
+{
+    static const char *cmds[] = {
+        "git status", "git log --oneline -5", "git diff HEAD~1",
+        "git branch -a", "git stash list", "git remote -v",
+        "git show HEAD --stat", "git tag -l", "git reflog -3"
+    };
+    const char *c = pick_one(cmds, sizeof(cmds)/sizeof(cmds[0]));
+    return (size_t)snprintf(buf, cap, "%s", c);
+}
+
+static size_t gen_docker_cmd(char *buf, size_t cap)
+{
+    static const char *cmds[] = {
+        "docker ps", "docker images", "docker ps -a",
+        "docker container ls", "docker volume ls", "docker network ls",
+        "docker ps --format '{{.Names}}'", "docker stats --no-stream"
+    };
+    const char *c = pick_one(cmds, sizeof(cmds)/sizeof(cmds[0]));
+    return (size_t)snprintf(buf, cap, "%s", c);
+}
+
+static size_t gen_curl_cmd(char *buf, size_t cap)
+{
+    static const char *flags[] = { "-s", "-v", "-i", "-o /dev/null" };
+    static const char *urls[] = {
+        "https://api.github.com", "https://httpbin.org/get",
+        "https://localhost:8080/health", "https://example.com"
+    };
+    const char *flag = pick_one(flags, sizeof(flags)/sizeof(flags[0]));
+    const char *url = pick_one(urls, sizeof(urls)/sizeof(urls[0]));
+    return (size_t)snprintf(buf, cap, "curl %s %s", flag, url);
+}
+
+static size_t gen_echo_cmd(char *buf, size_t cap)
+{
+    static const char *msgs[] = { "hello", "world", "test", "ok", "done", "error" };
+    const char *msg = pick_one(msgs, sizeof(msgs)/sizeof(msgs[0]));
+    return (size_t)snprintf(buf, cap, "echo %s", msg);
+}
+
+static size_t gen_pwd_cmd(char *buf, size_t cap)
+{
+    (void)pick_one;
+    return (size_t)snprintf(buf, cap, "pwd");
+}
+
+static size_t gen_whoami_cmd(char *buf, size_t cap)
+{
+    (void)pick_one;
+    return (size_t)snprintf(buf, cap, "whoami");
+}
+
+static size_t gen_date_cmd(char *buf, size_t cap)
+{
+    (void)pick_one;
+    return (size_t)snprintf(buf, cap, "date");
+}
+
+static size_t gen_ps_cmd(char *buf, size_t cap)
+{
+    static const char *flags[] = { "aux", "" };
+    const char *f = pick_one(flags, sizeof(flags)/sizeof(flags[0]));
+    return (size_t)snprintf(buf, cap, "ps %s", f);
+}
+
+static size_t gen_find_cmd(char *buf, size_t cap)
+{
+    static const char *opts[] = { "-type f", "-type d", "-name '*.txt'", "-type f -name '*.log'" };
+    const char *opt = pick_one(opts, sizeof(opts)/sizeof(opts[0]));
+    return (size_t)snprintf(buf, cap, "find /tmp %s -print", opt);
+}
+
+static size_t gen_sort_cmd(char *buf, size_t cap)
+{
+    static const char *flags[] = { "", "-r", "-n" };
+    const char *f = pick_one(flags, sizeof(flags)/sizeof(flags[0]));
+    return (size_t)snprintf(buf, cap, "sort %s", f);
+}
+
+static size_t gen_head_tail_cmd(char *buf, size_t cap)
+{
+    static const char *cmds[] = {
+        "head -5 /etc/passwd", "tail -3 /var/log/syslog",
+        "head -1 /etc/hosts", "tail -1 /etc/passwd"
+    };
+    const char *c = pick_one(cmds, sizeof(cmds)/sizeof(cmds[0]));
+    return (size_t)snprintf(buf, cap, "%s", c);
+}
+
+static size_t gen_wc_cmd(char *buf, size_t cap)
+{
+    static const char *flags[] = { "-l", "-w", "-c" };
+    const char *f = pick_one(flags, sizeof(flags)/sizeof(flags[0]));
+    return (size_t)snprintf(buf, cap, "wc %s", f);
+}
+
+static size_t gen_uniq_cmd(char *buf, size_t cap)
+{
+    static const char *flags[] = { "", "-c", "-d" };
+    const char *f = pick_one(flags, sizeof(flags)/sizeof(flags[0]));
+    return (size_t)snprintf(buf, cap, "uniq %s", f);
+}
+
+static size_t (*generators[])(char*, size_t) = {
+    gen_cat_cmd,
+    gen_ls_cmd,
+    gen_grep_cmd,
+    gen_git_cmd,
+    gen_docker_cmd,
+    gen_curl_cmd,
+    gen_echo_cmd,
+    gen_pwd_cmd,
+    gen_whoami_cmd,
+    gen_date_cmd,
+    gen_ps_cmd,
+    gen_find_cmd,
+    gen_sort_cmd,
+    gen_head_tail_cmd,
+    gen_wc_cmd,
+    gen_uniq_cmd,
+};
+
+static const char *gen_name(size_t idx)
+{
+    static const char *names[] = {
+        "gen_cat_cmd", "gen_ls_cmd", "gen_grep_cmd", "gen_git_cmd",
+        "gen_docker_cmd", "gen_curl_cmd", "gen_echo_cmd", "gen_pwd_cmd",
+        "gen_whoami_cmd", "gen_date_cmd", "gen_ps_cmd", "gen_find_cmd",
+        "gen_sort_cmd", "gen_head_tail_cmd", "gen_wc_cmd", "gen_uniq_cmd"
+    };
+    return names[idx];
+}
+
+static size_t gen_by_index(char *buf, size_t cap, size_t idx)
+{
+    return generators[idx % (sizeof(generators)/sizeof(generators[0]))](buf, cap);
+}
+
+TEST(property_suggestion_leads_to_allow)
+{
+    char cmd_buf[512];
+    char suggestion_buf[512];
+
+    for (size_t gi = 0; gi < sizeof(generators)/sizeof(generators[0]); gi++) {
+        int failures_before = fail_count;
+        prop_reset();
+
+        sg_gate_t *g = sg_gate_new();
+
+        for (int i = 0; i < PROPTEST_COUNT; i++) {
+            memset(cmd_buf, 0, sizeof(cmd_buf));
+            gen_by_index(cmd_buf, sizeof(cmd_buf), gi);
+
+            sg_result_t r;
+            eval_cmd(g, cmd_buf, &r);
+
+            if (r.subcmd_count == 0 || r.subcmds[0].command == NULL) {
+                continue;
+            }
+            if (r.subcmds[0].command[strlen(r.subcmds[0].command)] != '\0') {
+                printf("    FAIL: gen=%s iter=%d result not null-terminated cmd=\"%s\"\n",
+                       gen_name(gi), i, cmd_buf);
+                fail_count++;
+                continue;
+            }
+
+            if (r.verdict == SG_VERDICT_ALLOW) {
+                continue;
+            }
+
+            if (r.verdict != SG_VERDICT_UNDETERMINED) {
+                continue;
+            }
+
+            if (r.suggestion_count == 0 || r.suggestions[0] == NULL) {
+                continue;
+            }
+
+            int pick = prop_next() % r.suggestion_count;
+            snprintf(suggestion_buf, sizeof(suggestion_buf), "%s", r.suggestions[pick]);
+            sg_gate_add_rule(g, suggestion_buf);
+
+            sg_result_t r2;
+            eval_cmd(g, cmd_buf, &r2);
+
+            if (r2.verdict != SG_VERDICT_ALLOW) {
+                printf("    FAIL: gen=%s iter=%d suggestion[%d]=\"%s\" still %d cmd=\"%s\"\n",
+                       gen_name(gi), i, pick, suggestion_buf, r2.verdict, cmd_buf);
+                fail_count++;
+            }
+        }
+
+        sg_gate_free(g);
+
+        if (fail_count == failures_before) {
+            printf("    PASS: %s (%d iterations)\n", gen_name(gi), PROPTEST_COUNT);
+            pass_count++;
+        }
+    }
+}
+
+/* ============================================================
  * MAIN
  * ============================================================ */
 
@@ -1887,6 +2222,17 @@ int main(void)
     RUN(config_stop_first_allow);
     RUN(config_stop_first_deny);
     RUN(stop_mode_first_pass_no_match);
+    RUN(stop_mode_first_fail_blocks_second);
+    RUN(stop_mode_first_pass_stops_on_match);
+    RUN(stop_mode_first_allow_stops_on_allow);
+    RUN(stop_mode_first_deny_stops_on_deny);
+    RUN(stop_mode_first_pass_no_match_continues);
+    RUN(stop_mode_eval_all_never_stops_early);
+    RUN(stop_mode_first_allow_with_mixed_allow_undet);
+    RUN(stop_mode_first_deny_with_later_deny);
+    RUN(stop_mode_first_fail_includes_first);
+    RUN(stop_mode_first_pass_three_subcmds);
+    RUN(stop_mode_first_allow_four_subcmgs);
     RUN(pipeline_many_subcommands);
 
     printf("\nPolicy management:\n");
@@ -1915,8 +2261,8 @@ int main(void)
     RUN(buffer_exact_fit);
     RUN(buffer_large);
     RUN(buffer_partial_subcmds);
-    RUN(buffer_tiny_truncated);
-    RUN(buffer_really_tiny);
+    RUN(buffer_max_subcommands_truncated);
+    RUN(buffer_long_command_truncated);
     RUN(buffer_multiple_truncations);
     RUN(buffer_null_termination_preserved);
 
@@ -1981,6 +2327,10 @@ int main(void)
     RUN(result_attention_index);
     RUN(suggestions_when_disabled);
     RUN(suggestions_when_enabled);
+
+    printf("\nProperty tests:\n");
+    srand(42);
+    RUN(property_suggestion_leads_to_allow);
 
     cleanup_temp_files();
     printf("\n========================================\n");
