@@ -356,8 +356,19 @@ static bool is_email(const char *token)
 
 static bool is_hostname(const char *token)
 {
-    /* Hostname/domain: alphanumeric with hyphens and dots, starts and ends with alphanumeric,
-     * contains at least one dot and at least one hyphen (to distinguish from filenames like "foo.txt"). */
+    /* Hostname/domain: alphanumeric with hyphens and dots, starts and ends
+     * with alphanumeric. Accepted if:
+     *   - has at least one dot AND at least one hyphen, OR
+     *   - has at least one dot AND the last label is a known TLD.
+     * The TLD list is intentionally small (~15 entries) to avoid matching
+     * filenames like "output.txt" or "main.go" while accepting common
+     * domains like "example.com" or "github.io".
+     * Tokens without dots (e.g., "localhost") are covered by #word or #hyp. */
+    static const char *known_tlds[] = {
+        "com", "org", "net", "edu", "gov", "mil", "io", "co",
+        "dev", "app", "cloud", "local", "int", "biz", "info", NULL
+    };
+
     size_t len = strlen(token);
     if (len == 0) return false;
     if (token[0] == '-' || token[len-1] == '-') return false;
@@ -376,7 +387,17 @@ static bool is_hostname(const char *token)
             return false;
         }
     }
-    return has_dot && has_hyphen;
+    if (!has_dot) return false;
+    if (has_hyphen) return true;
+
+    /* No hyphen — check if last label is a known TLD */
+    const char *last_dot = strrchr(token, '.');
+    if (!last_dot) return false;
+    const char *tld = last_dot + 1;
+    for (const char **p = known_tlds; *p; p++) {
+        if (strcasecmp(tld, *p) == 0) return true;
+    }
+    return false;
 }
 
 static bool is_port(const char *token)

@@ -1716,6 +1716,68 @@ static int test_param_validate_bad_ts(void)
     return 1;
 }
 
+/* ============================================================
+ * PATTERN VALIDATION (st_validate_pattern)
+ * ============================================================ */
+
+static int test_validate_valid_literal(void)
+{
+    st_error_t err = st_validate_pattern("git status", NULL);
+    ASSERT(err == ST_OK);
+    return 1;
+}
+
+static int test_test_validate_valid_wildcard(void)
+{
+    st_error_t err = st_validate_pattern("cat #path", NULL);
+    ASSERT(err == ST_OK);
+    return 1;
+}
+
+static int test_validate_valid_parametrized(void)
+{
+    st_pattern_info_t info;
+    st_error_t err = st_validate_pattern("cat #path.cfg", &info);
+    ASSERT(err == ST_OK);
+    ASSERT(info.token_count == 2);
+    ASSERT_STR_EQ(info.token_texts[0], "cat");
+    ASSERT(info.token_types[0] == ST_TYPE_LITERAL);
+    ASSERT_STR_EQ(info.token_texts[1], "#path.cfg");
+    ASSERT(info.token_types[1] == ST_TYPE_PATH);
+    return 1;
+}
+
+static int test_validate_invalid_param(void)
+{
+    /* #size.XX is not a valid size suffix, so parse_pattern falls through
+     * to st_classify_token and treats it as a generic type. The pattern
+     * is still syntactically valid — it just won't behave as a SIZE wildcard. */
+    st_pattern_info_t info;
+    st_error_t err = st_validate_pattern("dd #size.XX", &info);
+    ASSERT(err == ST_OK);
+    ASSERT(info.token_count == 2);
+    /* Should NOT be SIZE since the param is invalid */
+    ASSERT(info.token_types[1] != ST_TYPE_SIZE);
+    return 1;
+}
+
+static int test_validate_empty(void)
+{
+    st_error_t err = st_validate_pattern("", NULL);
+    ASSERT(err == ST_ERR_INVALID);
+
+    err = st_validate_pattern(NULL, NULL);
+    ASSERT(err == ST_ERR_INVALID);
+    return 1;
+}
+
+static int test_validate_reject_star_first(void)
+{
+    st_error_t err = st_validate_pattern("* foo", NULL);
+    ASSERT(err == ST_ERR_INVALID);
+    return 1;
+}
+
 int main(void)
 {
     printf("Running policy unit tests...\n\n");
@@ -1817,6 +1879,14 @@ int main(void)
     TEST(test_param_validate_bad_size);
     TEST(test_param_validate_bad_uuid);
     TEST(test_param_validate_bad_ts);
+
+    printf("\nPattern validation (st_validate_pattern):\n");
+    TEST(test_validate_valid_literal);
+    TEST(test_test_validate_valid_wildcard);
+    TEST(test_validate_valid_parametrized);
+    TEST(test_validate_invalid_param);
+    TEST(test_validate_empty);
+    TEST(test_validate_reject_star_first);
 
     printf("\n========================================\n");
     printf("Results: %d/%d passed, %d failed\n",

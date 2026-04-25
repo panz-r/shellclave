@@ -252,24 +252,34 @@ static int test_classify_url_ftp(void)
     return 1;
 }
 
-/* --- #host: Hostname/domain (has dot AND hyphen, to distinguish from filenames) --- */
+/* --- #host: Hostname/domain (dot required, plus hyphen OR known TLD) --- */
 
 static int test_classify_hostname_hyphenated(void)
 {
-    /* Must have BOTH dot (domain) AND hyphen to be classified as HOSTNAME.
-     * This prevents "output.txt" (dot, no hyphen) from being HOSTNAME instead of FILENAME. */
+    /* Hyphen + dot → always HOSTNAME */
     ASSERT_TYPE("my-host.example.com", ST_TYPE_HOSTNAME);
     ASSERT_TYPE("a-b.c", ST_TYPE_HOSTNAME);
     return 1;
 }
 
+static int test_classify_hostname_tld(void)
+{
+    /* Dot + known TLD (no hyphen) → HOSTNAME */
+    ASSERT_TYPE("example.com", ST_TYPE_HOSTNAME);
+    ASSERT_TYPE("github.io", ST_TYPE_HOSTNAME);
+    ASSERT_TYPE("myapp.dev", ST_TYPE_HOSTNAME);
+    ASSERT_TYPE("server.local", ST_TYPE_HOSTNAME);
+    return 1;
+}
+
 static int test_classify_hostname_no_hyphen(void)
 {
-    /* Domain names WITHOUT hyphen (e.g., "example.com") are NOT classified as HOSTNAME.
-     * They fall through to FILENAME or LITERAL. This is intentional to distinguish
-     * from filenames like "output.txt". Use #val or #word for such patterns. */
-    ASSERT_TYPE("example.com", ST_TYPE_FILENAME);
-    ASSERT_TYPE("github.com", ST_TYPE_FILENAME);
+    /* Dot but NOT a known TLD → falls through to FILENAME.
+     * This prevents "output.txt", "main.go" etc. from being HOSTNAME. */
+    ASSERT_TYPE("output.txt", ST_TYPE_FILENAME);
+    ASSERT_TYPE("build.log", ST_TYPE_FILENAME);
+    ASSERT_TYPE("main.go", ST_TYPE_FILENAME);
+    /* No dot at all → LITERAL (use #word or #hyp) */
     ASSERT_TYPE("localhost", ST_TYPE_LITERAL);
     ASSERT_TYPE("myhost", ST_TYPE_LITERAL);
     return 1;
@@ -917,6 +927,7 @@ int main(void)
 
     printf("\nClassification - Hostname (#host):\n");
     TEST(test_classify_hostname_hyphenated);
+    TEST(test_classify_hostname_tld);
     TEST(test_classify_hostname_no_hyphen);
 
     printf("\nClassification - Quoted (#q, #qs):\n");

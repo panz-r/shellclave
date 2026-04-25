@@ -39,6 +39,7 @@ typedef enum {
 #define ST_DEFAULT_MAX_SUGGESTIONS 20  /* Max suggestions per query */
 #define ST_MAX_PATTERN_LEN     1024    /* Max length of a pattern string */
 #define ST_MAX_TOKEN_LEN       256     /* Max length of a single token */
+#define ST_MAX_CMD_TOKENS      128     /* Max tokens in a command/pattern */
 #define ST_MAX_SAMPLE_VALUES   32      /* Max original values stored per variable node */
 #define ST_INITIAL_CHILDREN_CAP 4      /* Initial capacity for children array */
 
@@ -463,6 +464,25 @@ st_error_t st_policy_simulate_add(const st_policy_t *policy,
                                     const char *pattern,
                                     bool *would_match,
                                     const char **conflicting_pattern);
+
+/* --- Pattern validation --- */
+
+/**
+ * Parsed token details from pattern validation.
+ * Fixed-size buffers — no allocation, no cleanup needed.
+ */
+typedef struct {
+    size_t token_count;                                     /* number of tokens */
+    char token_texts[ST_MAX_CMD_TOKENS][ST_MAX_TOKEN_LEN];  /* token text */
+    st_token_type_t token_types[ST_MAX_CMD_TOKENS];         /* token type */
+} st_pattern_info_t;
+
+/**
+ * Validate pattern syntax and parameter validity without modifying any policy.
+ * If info is non-NULL, fills in parsed token details on success.
+ * Returns ST_OK if valid, ST_ERR_INVALID on bad syntax or unknown parameter.
+ */
+st_error_t st_validate_pattern(const char *pattern, st_pattern_info_t *info);
 
 /* ============================================================
  * POLICY EXPANSION SUGGESTIONS (Miner)

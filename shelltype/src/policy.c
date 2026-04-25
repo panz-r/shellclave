@@ -112,6 +112,12 @@ static inline child_entry_t *child_at(const policy_state_t *node,
     return (child_entry_t *)(arena_base + node->children_offset) + idx;
 }
 
+/* Grow a node's child array within the arena.
+ * Allocates a new (larger) block, copies existing entries, updates the offset.
+ * The old block remains in the arena as unreachable space; it is reclaimed
+ * by st_policy_compact(), which rebuilds the entire trie. This is an acceptable
+ * trade-off: child arrays grow rarely (doubling), and compaction is the
+ * designated reclamation point. */
 static bool children_arena_grow(arena_t *arena, uint32_t *offset,
                                 uint16_t *alloc, uint16_t new_slots)
 {
@@ -908,6 +914,34 @@ static void policy_rebuild_filters(st_policy_t *policy)
 
     atomic_fetch_add(&policy->stats.filter_rebuild_count, 1);
     atomic_fetch_add(&policy->stats.filter_rebuild_us, elapsed_us);
+}
+
+/* ============================================================
+ * PATTERN VALIDATION (public API)
+ * ============================================================ */
+
+st_error_t st_validate_pattern(const char *pattern, st_pattern_info_t *info)
+{
+    if (!pattern || !pattern[0]) return ST_ERR_INVALID;
+
+    size_t token_count = 0;
+    st_token_t *tokens = parse_pattern(pattern, &token_count);
+    if (!tokens || token_count == 0) {
+        free_pattern_tokens(tokens, token_count);
+        return ST_ERR_INVALID;
+    }
+
+    if (info) {
+        info->token_count = token_count;
+        for (size_t i = 0; i < token_count; i++) {
+            strncpy(info->token_texts[i], tokens[i].text, ST_MAX_TOKEN_LEN - 1);
+            info->token_texts[i][ST_MAX_TOKEN_LEN - 1] = '\0';
+            info->token_types[i] = tokens[i].type;
+        }
+    }
+
+    free_pattern_tokens(tokens, token_count);
+    return ST_OK;
 }
 
 /* ============================================================
