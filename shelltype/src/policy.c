@@ -304,27 +304,17 @@ static inline child_entry_t *get_child(const policy_state_t *node,
  * CHILD LOOKUP
  * ============================================================ */
 
-static int cmp_literal_child(const void *key, const void *entry)
-{
-    return strcmp((const char *)key, ((const child_entry_t *)entry)->text);
-}
-
 static child_entry_t *find_literal_child(const policy_state_t *node,
                                          const char *arena_base, const char *text)
 {
     uint16_t n = node->literal_count;
     if (n == 0 || !arena_base) return NULL;
     assert(n <= node->children_alloc);
-    /* Hybrid: linear scan for small fan-outs, bsearch for larger */
-    if (n < 8) {
-        child_entry_t *children = (child_entry_t *)(arena_base + node->children_offset);
-        for (uint16_t i = 0; i < n; i++) {
-            if (strcmp(text, children[i].text) == 0) return &children[i];
-        }
-        return NULL;
-    }
     child_entry_t *children = (child_entry_t *)(arena_base + node->children_offset);
-    return bsearch(text, children, n, sizeof(child_entry_t), cmp_literal_child);
+    for (uint16_t i = 0; i < n; i++) {
+        if (strcmp(text, children[i].text) == 0) return &children[i];
+    }
+    return NULL;
 }
 
 /* ============================================================
@@ -541,6 +531,31 @@ static child_entry_t *find_wildcard_child(const policy_state_t *node,
     return NULL;
 }
 
+/* Find an exact wildcard child for pattern insertion or removal.
+ * Non-parametrized wildcards: text=NULL stored, matches ANY text search.
+ * Parametrized wildcards: full symbol text stored (e.g., "#path.cfg").
+ * Uses exact type + text comparison (strcmp), not param_matches.
+ * This is the correct lookup for add/remove where we want to find
+ * the existing child with the same parametrized parameter (e.g., #size.MiB). */
+static child_entry_t *find_exact_wildcard_child(const policy_state_t *node,
+                                               const char *arena_base,
+                                               st_token_type_t type,
+                                               const char *text)
+{
+    if (node->wildcard_count == 0 || !arena_base) return NULL;
+    child_entry_t *children = (child_entry_t *)(arena_base + node->children_offset);
+    child_entry_t *base = children + node->literal_count;
+    for (uint16_t i = 0; i < node->wildcard_count; i++) {
+        if ((st_token_type_t)base[i].type != type) continue;
+        const char *existing = base[i].text;
+        /* Non-parametrized wildcard (text=NULL stored): matches any text */
+        if (existing == NULL) return &base[i];
+        /* Parametrized wildcard: exact text match required */
+        if (text != NULL && strcmp(text, existing) == 0) return &base[i];
+    }
+    return NULL;
+}
+
 /* ============================================================
  * CHILD INSERTION
  * ============================================================ */
@@ -561,9 +576,10 @@ static bool insert_child(policy_state_t *node, st_policy_t *policy,
             if (strcmp(text, children[i].text) < 0) break;
             insert_pos = i + 1;
         }
-        if (insert_pos < node->literal_count &&
-            children[insert_pos].type == ST_TYPE_LITERAL &&
-            strcmp(text, children[insert_pos].text) == 0) return false;
+        /* Check ALL existing literals for duplicate */
+        for (uint16_t i = 0; i < node->literal_count; i++) {
+            if (children[i].type == ST_TYPE_LITERAL && strcmp(text, children[i].text) == 0) return false;
+        }
     } else {
         insert_pos = node->literal_count;
         for (uint16_t i = node->literal_count; i < total; i++) {
@@ -980,7 +996,7 @@ static st_error_t st_policy_add_locked(st_policy_t *policy, const char *pattern)
         if (tokens[i].type == ST_TYPE_LITERAL) {
             existing = find_literal_child(node, arena_base, tokens[i].text);
         } else {
-            existing = find_wildcard_child(node, arena_base, tokens[i].type, tokens[i].text);
+            existing = find_exact_wildcard_child(node, arena_base, tokens[i].type, tokens[i].text);
         }
 
         if (existing) {
@@ -1000,14 +1016,14 @@ static st_error_t st_policy_add_locked(st_policy_t *policy, const char *pattern)
         }
     }
 
-    policy_state_t *node = &policy->states.states[current];
-    if (node->pattern_id == UINT16_MAX) {
+    policy_state_t *end_node = &policy->states.states[current];
+    if (end_node->pattern_id == UINT16_MAX) {
         uint16_t pid = pattern_reg_add(&policy->patterns, policy->ctx, pattern);
         if (pid == UINT16_MAX) {
             free_pattern_tokens(tokens, token_count);
             return ST_ERR_MEMORY;
         }
-        node->pattern_id = pid;
+        end_node->pattern_id = pid;
         policy->pattern_count++;
     }
 
@@ -1080,7 +1096,7 @@ st_error_t st_policy_remove(st_policy_t *policy, const char *pattern)
         if (tokens[i].type == ST_TYPE_LITERAL) {
             child = find_literal_child(node, arena_base, tokens[i].text);
         } else {
-            child = find_wildcard_child(node, arena_base, tokens[i].type, tokens[i].text);
+            child = find_exact_wildcard_child(node, arena_base, tokens[i].type, tokens[i].text);
         }
         if (!child) {
             free_pattern_tokens(tokens, token_count);

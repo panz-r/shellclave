@@ -356,14 +356,14 @@ static bool is_email(const char *token)
 
 static bool is_hostname(const char *token)
 {
-    /* Hostname/domain: alphanumeric with hyphens and dots, starts and ends with alphanumeric, contains hyphen */
+    /* Hostname/domain: alphanumeric with hyphens and dots, starts and ends with alphanumeric,
+     * contains at least one dot and at least one hyphen (to distinguish from filenames like "foo.txt"). */
     size_t len = strlen(token);
     if (len == 0) return false;
     if (token[0] == '-' || token[len-1] == '-') return false;
     if (!isalnum((unsigned char)token[0]) || !isalnum((unsigned char)token[len-1])) return false;
 
-    bool has_hyphen = false;
-    bool has_dot = false;
+    bool has_dot = false, has_hyphen = false;
     for (size_t i = 0; i < len; i++) {
         char c = token[i];
         if (c == '-') {
@@ -376,7 +376,7 @@ static bool is_hostname(const char *token)
             return false;
         }
     }
-    return has_hyphen && has_dot;
+    return has_dot && has_hyphen;
 }
 
 static bool is_port(const char *token)

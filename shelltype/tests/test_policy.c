@@ -1299,6 +1299,52 @@ static int test_param_duplicate_add(void)
     return 1;
 }
 
+static int test_param_duplicate_non_path(void)
+{
+    /* Non-path parametrized wildcards (size, uuid, timestamp, semver) should also
+     * deduplicate correctly. Previously find_wildcard_child was used for insertion
+     * lookup, which called param_matches() on the wildcard symbol (e.g., "#size.MiB"),
+     * causing it to fail and insert duplicates. */
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_policy_t *policy = st_policy_new(ctx);
+
+    st_policy_add(policy, "cat #size.MiB");
+    st_policy_add(policy, "cat #size.MiB");
+    ASSERT(st_policy_count(policy) == 1);
+
+    st_policy_add(policy, "uuidgen #uuid.v4");
+    st_policy_add(policy, "uuidgen #uuid.v4");
+    ASSERT(st_policy_count(policy) == 2);
+
+    st_policy_add(policy, "date #ts.date");
+    st_policy_add(policy, "date #ts.date");
+    ASSERT(st_policy_count(policy) == 3);
+
+    /* Verify the patterns still match appropriate tokens */
+    st_eval_result_t r;
+    st_error_t err;
+
+    err = st_policy_eval(policy, "cat 100MiB", &r);
+    ASSERT(err == ST_OK);
+    ASSERT(r.matches);
+
+    err = st_policy_eval(policy, "uuidgen 550e8400-e29b-41d4-a716-446655440000", &r);
+    ASSERT(err == ST_OK);
+    ASSERT(r.matches);
+
+    err = st_policy_eval(policy, "date 2024-01-15", &r);
+    ASSERT(err == ST_OK);
+    ASSERT(r.matches);
+
+    /* Different parameters should NOT be deduplicated */
+    st_policy_add(policy, "cat #size.GiB");
+    ASSERT(st_policy_count(policy) == 4);
+
+    st_policy_free(policy);
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
 static int test_param_non_path_type_rejected(void)
 {
     st_policy_ctx_t *ctx = st_policy_ctx_new();
@@ -1746,6 +1792,7 @@ int main(void)
     TEST(test_param_no_extension_no_match);
     TEST(test_param_relpath_match);
     TEST(test_param_duplicate_add);
+    TEST(test_param_duplicate_non_path);
     TEST(test_param_non_path_type_rejected);
 
     printf("\nParametrized size (#size.MiB):\n");
