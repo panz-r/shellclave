@@ -352,6 +352,8 @@ static const char *build_cmd_string(const shell_dep_cmd_t *cmd,
     size_t avail = bw->size - start;
     size_t pos   = 0;
 
+    char exp_buf[SG_EXPAND_BUF];
+
     for (uint32_t i = 0; i < cmd->token_count; i++) {
         if (i > 0 && pos < avail) bw->base[start + pos++] = ' ';
 
@@ -363,11 +365,10 @@ static const char *build_cmd_string(const shell_dep_cmd_t *cmd,
         if (gate->expand_var_fn) {
             char var_name[128];
             if (extract_var_name(text, text_len, var_name, sizeof(var_name))) {
-                char exp[SG_EXPAND_BUF];
-                size_t elen = gate->expand_var_fn(var_name, exp, sizeof(exp),
+                size_t elen = gate->expand_var_fn(var_name, exp_buf, sizeof(exp_buf),
                                                    gate->expand_var_ctx);
                 if (elen > 0) {
-                    text = exp;
+                    text = exp_buf;
                     text_len = elen;
                     expanded = true;
                 }
@@ -383,11 +384,10 @@ static const char *build_cmd_string(const shell_dep_cmd_t *cmd,
                 memcpy(pattern, text, plen);
                 pattern[plen] = '\0';
 
-                char exp[SG_EXPAND_BUF];
-                size_t elen = gate->expand_glob_fn(pattern, exp, sizeof(exp),
+                size_t elen = gate->expand_glob_fn(pattern, exp_buf, sizeof(exp_buf),
                                                     gate->expand_glob_ctx);
                 if (elen > 0) {
-                    text = exp;
+                    text = exp_buf;
                     text_len = elen;
                 }
             }
@@ -1401,8 +1401,7 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len,
 
         /* Check deny policy first */
         st_eval_result_t deny_eval;
-        st_error_t deny_err = st_policy_eval(gate->deny_policy, cmd_str,
-                                              gate->suggestions ? &deny_eval : NULL);
+        st_error_t deny_err = st_policy_eval(gate->deny_policy, cmd_str, &deny_eval);
         if (deny_err == ST_OK && deny_eval.matches) {
             sr->matches = true;
             sr->verdict = SG_VERDICT_DENY;
@@ -1410,8 +1409,7 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len,
         } else {
             /* Check allow policy */
             st_eval_result_t eval;
-            st_error_t eval_err = st_policy_eval(gate->policy, cmd_str,
-                                                  gate->suggestions ? &eval : NULL);
+            st_error_t eval_err = st_policy_eval(gate->policy, cmd_str, &eval);
             if (eval_err != ST_OK) {
                 sr->matches = false;
                 sr->verdict = SG_VERDICT_UNDETERMINED;

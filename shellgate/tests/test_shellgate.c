@@ -1002,7 +1002,7 @@ TEST(buffer_partial_subcmds)
     sg_gate_set_stop_mode(g, SG_EVAL_ALL);
     char buf[256];
     sg_result_t r;
-    sg_error_t err = sg_eval(g, "ls ; ls ; ls ; ls ; ls", 25, buf, sizeof(buf), &r);
+    sg_error_t err = sg_eval(g, "ls ; ls ; ls ; ls ; ls", strlen("ls ; ls ; ls ; ls ; ls"), buf, sizeof(buf), &r);
     ASSERT(err == SG_OK);
     ASSERT(r.subcmd_count == 5);
     sg_gate_free(g);
