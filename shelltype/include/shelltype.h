@@ -442,6 +442,25 @@ st_error_t st_policy_clear(st_policy_t *policy);
  */
 st_error_t st_policy_merge(st_policy_t *dst, const st_policy_t *src);
 
+/* --- Diff --- */
+
+/**
+ * Compare two policies and return lists of added/removed patterns.
+ * Patterns in b but not a are "added"; patterns in a but not b are "removed".
+ * Caller must free the returned arrays with st_free_diff_result().
+ * Takes read lock on both policies.
+ */
+typedef struct {
+    char **added;
+    size_t added_count;
+    char **removed;
+    size_t removed_count;
+} st_policy_diff_t;
+
+st_error_t st_policy_diff(const st_policy_t *a, const st_policy_t *b,
+                          st_policy_diff_t *result);
+void st_free_diff_result(st_policy_diff_t *result);
+
 /* --- Diagnostics --- */
 
 size_t st_policy_memory_usage(const st_policy_t *policy);

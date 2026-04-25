@@ -1867,6 +1867,88 @@ static int test_merge_disjoint(void)
     return 1;
 }
 
+/* ============================================================
+ * POLICY DIFF (st_policy_diff)
+ * ============================================================ */
+
+static int test_diff_identical(void)
+{
+    st_policy_ctx_t *ctx1 = st_policy_ctx_new();
+    st_policy_ctx_t *ctx2 = st_policy_ctx_new();
+    st_policy_t *a = st_policy_new(ctx1);
+    st_policy_t *b = st_policy_new(ctx2);
+
+    st_policy_add(a, "git status");
+    st_policy_add(a, "cat #path");
+    st_policy_add(b, "git status");
+    st_policy_add(b, "cat #path");
+
+    st_policy_diff_t diff;
+    st_error_t err = st_policy_diff(a, b, &diff);
+    ASSERT(err == ST_OK);
+    ASSERT(diff.added_count == 0);
+    ASSERT(diff.removed_count == 0);
+
+    st_free_diff_result(&diff);
+    st_policy_free(a);
+    st_policy_free(b);
+    st_policy_ctx_free(ctx1);
+    st_policy_ctx_free(ctx2);
+    return 1;
+}
+
+static int test_diff_added_and_removed(void)
+{
+    st_policy_ctx_t *ctx1 = st_policy_ctx_new();
+    st_policy_ctx_t *ctx2 = st_policy_ctx_new();
+    st_policy_t *a = st_policy_new(ctx1);
+    st_policy_t *b = st_policy_new(ctx2);
+
+    st_policy_add(a, "git status");
+    st_policy_add(a, "cat #path");
+
+    st_policy_add(b, "git status");
+    st_policy_add(b, "ls");
+
+    st_policy_diff_t diff;
+    st_error_t err = st_policy_diff(a, b, &diff);
+    ASSERT(err == ST_OK);
+    ASSERT(diff.added_count == 1);
+    ASSERT_STR_EQ(diff.added[0], "ls");
+    ASSERT(diff.removed_count == 1);
+    ASSERT_STR_EQ(diff.removed[0], "cat #path");
+
+    st_free_diff_result(&diff);
+    st_policy_free(a);
+    st_policy_free(b);
+    st_policy_ctx_free(ctx1);
+    st_policy_ctx_free(ctx2);
+    return 1;
+}
+
+static int test_diff_empty(void)
+{
+    st_policy_ctx_t *ctx1 = st_policy_ctx_new();
+    st_policy_ctx_t *ctx2 = st_policy_ctx_new();
+    st_policy_t *a = st_policy_new(ctx1);
+    st_policy_t *b = st_policy_new(ctx2);
+
+    st_policy_add(a, "git status");
+
+    st_policy_diff_t diff;
+    st_error_t err = st_policy_diff(a, b, &diff);
+    ASSERT(err == ST_OK);
+    ASSERT(diff.added_count == 0);
+    ASSERT(diff.removed_count == 1);
+
+    st_free_diff_result(&diff);
+    st_policy_free(a);
+    st_policy_free(b);
+    st_policy_ctx_free(ctx1);
+    st_policy_ctx_free(ctx2);
+    return 1;
+}
+
 int main(void)
 {
     printf("Running policy unit tests...\n\n");
@@ -1981,6 +2063,11 @@ int main(void)
     TEST(test_merge_empty_src);
     TEST(test_merge_overlapping);
     TEST(test_merge_disjoint);
+
+    printf("\nPolicy diff (st_policy_diff):\n");
+    TEST(test_diff_identical);
+    TEST(test_diff_added_and_removed);
+    TEST(test_diff_empty);
 
     printf("\n========================================\n");
     printf("Results: %d/%d passed, %d failed\n",

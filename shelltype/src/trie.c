@@ -352,7 +352,9 @@ static void dfs_collect(st_node_t *node, const char **path, size_t depth,
             }
 
             /* For the current node, if it's a wildcard with observed types,
-             * use the join of all observed types */
+             * use frequency-aware widening: prefer the most common specific
+             * type if it dominates (>= 70% of samples), otherwise fall back
+             * to the join of all observed types. */
             char effective_token[32];
             if (node->type != ST_TYPE_LITERAL && node->observed_types != 0) {
                 st_token_type_t joined = ST_TYPE_ANY;
@@ -365,6 +367,32 @@ static void dfs_collect(st_node_t *node, const char **path, size_t depth,
                         }
                     }
                 }
+
+                /* Frequency-aware: classify each sample and count per-type */
+                if (node->num_samples >= 3 && joined != ST_TYPE_ANY) {
+                    uint16_t type_counts[ST_TYPE_COUNT] = {0};
+                    for (size_t s = 0; s < node->num_samples; s++) {
+                        st_token_type_t ct = st_classify_token(node->sample_values[s]);
+                        if (ct < ST_TYPE_COUNT) type_counts[ct]++;
+                    }
+                    /* Find dominant type (must be >= 70% of classified samples) */
+                    size_t total_classified = 0;
+                    for (int t = 0; t < ST_TYPE_COUNT; t++) total_classified += type_counts[t];
+                    if (total_classified >= 3) {
+                        for (int t = ST_TYPE_COUNT - 1; t >= 0; t--) {
+                            if (type_counts[t] > 0 &&
+                                (double)type_counts[t] / (double)total_classified >= 0.7) {
+                                /* Only use the dominant type if it's more specific
+                                 * than the join (i.e., joined ≤ t in the lattice) */
+                                if (st_is_compatible((st_token_type_t)t, joined)) {
+                                    joined = (st_token_type_t)t;
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+
                 if (joined != ST_TYPE_ANY) {
                     snprintf(effective_token, sizeof(effective_token), "%s",
                              st_type_symbol[joined]);

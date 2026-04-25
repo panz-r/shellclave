@@ -1136,6 +1136,83 @@ st_error_t st_policy_merge(st_policy_t *dst, const st_policy_t *src)
     pthread_rwlock_unlock((pthread_rwlock_t *)&src->rwlock);
     return first_err;
 }
+
+static bool pattern_array_contains(const char **arr, size_t count, const char *pat)
+{
+    for (size_t i = 0; i < count; i++) {
+        if (strcmp(arr[i], pat) == 0) return true;
+    }
+    return false;
+}
+
+st_error_t st_policy_diff(const st_policy_t *a, const st_policy_t *b,
+                          st_policy_diff_t *result)
+{
+    if (!a || !b || !result) return ST_ERR_INVALID;
+
+    memset(result, 0, sizeof(*result));
+
+    pthread_rwlock_rdlock((pthread_rwlock_t *)&a->rwlock);
+    pthread_rwlock_rdlock((pthread_rwlock_t *)&b->rwlock);
+
+    size_t a_count = a->patterns.count;
+    size_t b_count = b->patterns.count;
+    const char **a_strs = a->patterns.strings;
+    const char **b_strs = b->patterns.strings;
+
+    size_t added_cap = b_count > 0 ? b_count : 1;
+    char **added = calloc(added_cap, sizeof(char *));
+    if (!added) {
+        pthread_rwlock_unlock((pthread_rwlock_t *)&b->rwlock);
+        pthread_rwlock_unlock((pthread_rwlock_t *)&a->rwlock);
+        return ST_ERR_MEMORY;
+    }
+    size_t added_count = 0;
+    for (size_t i = 0; i < b_count; i++) {
+        if (!pattern_array_contains(a_strs, a_count, b_strs[i])) {
+            added[added_count++] = strdup(b_strs[i]);
+        }
+    }
+
+    size_t removed_cap = a_count > 0 ? a_count : 1;
+    char **removed = calloc(removed_cap, sizeof(char *));
+    if (!removed) {
+        for (size_t i = 0; i < added_count; i++) free(added[i]);
+        free(added);
+        pthread_rwlock_unlock((pthread_rwlock_t *)&b->rwlock);
+        pthread_rwlock_unlock((pthread_rwlock_t *)&a->rwlock);
+        return ST_ERR_MEMORY;
+    }
+    size_t removed_count = 0;
+    for (size_t i = 0; i < a_count; i++) {
+        if (!pattern_array_contains(b_strs, b_count, a_strs[i])) {
+            removed[removed_count++] = strdup(a_strs[i]);
+        }
+    }
+
+    result->added = added;
+    result->added_count = added_count;
+    result->removed = removed;
+    result->removed_count = removed_count;
+
+    pthread_rwlock_unlock((pthread_rwlock_t *)&b->rwlock);
+    pthread_rwlock_unlock((pthread_rwlock_t *)&a->rwlock);
+    return ST_OK;
+}
+
+void st_free_diff_result(st_policy_diff_t *result)
+{
+    if (!result) return;
+    for (size_t i = 0; i < result->added_count; i++) free(result->added[i]);
+    for (size_t i = 0; i < result->removed_count; i++) free(result->removed[i]);
+    free(result->added);
+    free(result->removed);
+    result->added = NULL;
+    result->removed = NULL;
+    result->added_count = 0;
+    result->removed_count = 0;
+}
+
 /*
  * NOTE: This function performs a logical removal only. Since the policy
  * uses an arena allocator for trie nodes, removed patterns leave their
