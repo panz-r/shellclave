@@ -380,6 +380,12 @@ static const uint32_t st_compat_mask[ST_TYPE_COUNT] = {
     /* HASH_ALGO */    (1u << ST_TYPE_HASH_ALGO) | (1u << ST_TYPE_WORD) | (1u << ST_TYPE_VALUE) | (1u << ST_TYPE_ANY),
     /* ENV_VAR */      (1u << ST_TYPE_ENV_VAR) | (1u << ST_TYPE_VALUE) | (1u << ST_TYPE_ANY),
     /* HYPHENATED */    (1u << ST_TYPE_HYPHENATED) | (1u << ST_TYPE_WORD) | (1u << ST_TYPE_VALUE) | (1u << ST_TYPE_ANY),
+    /* BRANCH */       (1u << ST_TYPE_BRANCH) | (1u << ST_TYPE_VALUE) | (1u << ST_TYPE_ANY),
+    /* SHA */          (1u << ST_TYPE_SHA) | (1u << ST_TYPE_HEXHASH) | (1u << ST_TYPE_VALUE) | (1u << ST_TYPE_ANY),
+    /* IMAGE */        (1u << ST_TYPE_IMAGE) | (1u << ST_TYPE_VALUE) | (1u << ST_TYPE_ANY),
+    /* PKG */          (1u << ST_TYPE_PKG) | (1u << ST_TYPE_VALUE) | (1u << ST_TYPE_ANY),
+    /* USER */         (1u << ST_TYPE_USER) | (1u << ST_TYPE_VALUE) | (1u << ST_TYPE_ANY),
+    /* FINGERPRINT */  (1u << ST_TYPE_FINGERPRINT) | (1u << ST_TYPE_VALUE) | (1u << ST_TYPE_ANY),
     /* ANY */          (1u << ST_TYPE_ANY),
 };
 
@@ -434,7 +440,10 @@ static bool type_supports_param(st_token_type_t t)
     return t == ST_TYPE_PATH || t == ST_TYPE_ABS_PATH ||
            t == ST_TYPE_REL_PATH || t == ST_TYPE_FILENAME ||
            t == ST_TYPE_SIZE ||
-           t == ST_TYPE_UUID || t == ST_TYPE_SEMVER || t == ST_TYPE_TIMESTAMP;
+           t == ST_TYPE_UUID || t == ST_TYPE_SEMVER || t == ST_TYPE_TIMESTAMP ||
+           t == ST_TYPE_BRANCH || t == ST_TYPE_SHA ||
+           t == ST_TYPE_IMAGE || t == ST_TYPE_PKG ||
+           t == ST_TYPE_USER || t == ST_TYPE_FINGERPRINT;
 }
 
 /* Extract the parameter from a parametrized wildcard symbol.
@@ -527,6 +536,49 @@ static bool validate_param(st_token_type_t base_type, const char *param)
         return strcasecmp(p, "date") == 0 || strcasecmp(p, "time") == 0 ||
                strcasecmp(p, "datetime") == 0;
 
+    case ST_TYPE_BRANCH:
+        /* Branch prefix: feature, release, hotfix, head, main, etc. */
+        for (; *p; p++) {
+            if (!isalnum((unsigned char)*p) && *p != '-' && *p != '_')
+                return false;
+        }
+        return true;
+
+    case ST_TYPE_SHA:
+        /* SHA length variant: short (7), 40 (SHA-1), 64 (SHA-256) */
+        return strcmp(p, "short") == 0 || strcmp(p, "40") == 0 ||
+               strcmp(p, "64") == 0;
+
+    case ST_TYPE_IMAGE:
+        /* Image name/tag prefix: latest, nginx, ghcr, alpine, etc. */
+        for (; *p; p++) {
+            if (!isalnum((unsigned char)*p) && *p != '.' && *p != '-' &&
+                *p != '_' && *p != '/')
+                return false;
+        }
+        return true;
+
+    case ST_TYPE_PKG:
+        /* Package name prefix: react, types, @types, etc. */
+        for (; *p; p++) {
+            if (!isalnum((unsigned char)*p) && *p != '.' && *p != '-' &&
+                *p != '_' && *p != '@' && *p != '/')
+                return false;
+        }
+        return true;
+
+    case ST_TYPE_USER:
+        /* Known username or category: root, system, etc. */
+        for (; *p; p++) {
+            if (!isalnum((unsigned char)*p) && *p != '-' && *p != '_')
+                return false;
+        }
+        return true;
+
+    case ST_TYPE_FINGERPRINT:
+        /* Fingerprint type: sha256, md5 */
+        return strcasecmp(p, "sha256") == 0 || strcasecmp(p, "md5") == 0;
+
     default:
         return false;
     }
@@ -606,6 +658,85 @@ static bool param_matches(const char *cmd_text, st_token_type_t cmd_type,
             return len >= 19 && (cmd_text[10] == 'T' || cmd_text[10] == ' ');
         }
         return true;  /* unknown format → accept any timestamp */
+    }
+
+    if (wild_type == ST_TYPE_BRANCH) {
+        /* Branch: parameter is a prefix (e.g., ".feature" matches "feature/login") */
+        if (cmd_type != ST_TYPE_BRANCH && cmd_type != ST_TYPE_LITERAL &&
+            cmd_type != ST_TYPE_WORD && cmd_type != ST_TYPE_HYPHENATED)
+            return false;
+        if (!cmd_text) return false;
+        const char *prefix = wparam + 1;  /* skip dot */
+        size_t prefix_len = strlen(prefix);
+        return strncmp(cmd_text, prefix, prefix_len) == 0;
+    }
+
+    if (wild_type == ST_TYPE_SHA) {
+        /* SHA: parameter is length variant (short/40/64) */
+        if (cmd_type != ST_TYPE_SHA && cmd_type != ST_TYPE_HEXHASH)
+            return false;
+        if (!cmd_text) return false;
+        size_t len = strlen(cmd_text);
+        const char *variant = wparam + 1;
+        if (strcmp(variant, "short") == 0) return len == 7;
+        if (strcmp(variant, "40") == 0) return len == 40;
+        if (strcmp(variant, "64") == 0) return len == 64;
+        return true;
+    }
+
+    if (wild_type == ST_TYPE_IMAGE) {
+        /* Image: parameter is name/registry prefix */
+        if (cmd_type != ST_TYPE_IMAGE && cmd_type != ST_TYPE_LITERAL)
+            return false;
+        if (!cmd_text) return false;
+        const char *prefix = wparam + 1;
+        size_t prefix_len = strlen(prefix);
+        return strncmp(cmd_text, prefix, prefix_len) == 0;
+    }
+
+    if (wild_type == ST_TYPE_PKG) {
+        /* Package: parameter is name prefix */
+        if (cmd_type != ST_TYPE_PKG && cmd_type != ST_TYPE_LITERAL)
+            return false;
+        if (!cmd_text) return false;
+        const char *prefix = wparam + 1;
+        size_t prefix_len = strlen(prefix);
+        return strncmp(cmd_text, prefix, prefix_len) == 0;
+    }
+
+    if (wild_type == ST_TYPE_USER) {
+        /* User: parameter is exact username or "system" for known system accounts */
+        if (cmd_type != ST_TYPE_USER && cmd_type != ST_TYPE_LITERAL)
+            return false;
+        if (!cmd_text) return false;
+        const char *name = wparam + 1;
+        if (strcasecmp(name, "system") == 0) {
+            static const char *sys_users[] = {
+                "root", "nobody", "www-data", "daemon", "bin", "sys", "adm",
+                "lp", "mail", "news", "uucp", "man", "proxy", "www", "backup",
+                "list", "irc", "gnats", "systemd", "_apt", "postgres", "mysql",
+                "nginx", "redis", "memcached", "sshd", NULL
+            };
+            for (const char **u = sys_users; *u; u++) {
+                if (strcmp(cmd_text, *u) == 0) return true;
+            }
+            return false;
+        }
+        return strcmp(cmd_text, name) == 0;
+    }
+
+    if (wild_type == ST_TYPE_FINGERPRINT) {
+        /* Fingerprint: parameter is type (sha256/md5) */
+        if (cmd_type != ST_TYPE_FINGERPRINT) return false;
+        if (!cmd_text) return false;
+        const char *fmt = wparam + 1;
+        if (strcasecmp(fmt, "sha256") == 0)
+            return strncmp(cmd_text, "SHA256:", 7) == 0;
+        if (strcasecmp(fmt, "md5") == 0) {
+            size_t len = strlen(cmd_text);
+            return len == 47 && cmd_text[2] == ':' && cmd_text[5] == ':';
+        }
+        return true;
     }
 
     return true;
@@ -3064,7 +3195,8 @@ st_error_t st_policy_simulate_add(st_policy_t *policy,
 static st_token_type_t next_wider_type(st_token_type_t t)
 {
     switch (t) {
-        case ST_TYPE_HEXHASH:     return ST_TYPE_NUMBER;
+        case ST_TYPE_HEXHASH:     return ST_TYPE_SHA;
+        case ST_TYPE_SHA:         return ST_TYPE_VALUE;
         case ST_TYPE_NUMBER:      return ST_TYPE_VALUE;
         case ST_TYPE_IPV4:        return ST_TYPE_VALUE;
         case ST_TYPE_WORD:        return ST_TYPE_WORD; /* Cap reached */
@@ -3087,6 +3219,11 @@ static st_token_type_t next_wider_type(st_token_type_t t)
         case ST_TYPE_HASH_ALGO:   return ST_TYPE_WORD;   /* Cap: #hash → #word */
         case ST_TYPE_ENV_VAR:     return ST_TYPE_VALUE;  /* Cap: #env → #val */
         case ST_TYPE_HYPHENATED:  return ST_TYPE_WORD;   /* Cap: #hyp → #word */
+        case ST_TYPE_BRANCH:      return ST_TYPE_VALUE;  /* Cap: #branch → #val */
+        case ST_TYPE_IMAGE:       return ST_TYPE_VALUE;  /* Cap: #image → #val */
+        case ST_TYPE_PKG:         return ST_TYPE_VALUE;  /* Cap: #pkg → #val */
+        case ST_TYPE_USER:        return ST_TYPE_VALUE;  /* Cap: #user → #val */
+        case ST_TYPE_FINGERPRINT: return ST_TYPE_VALUE;  /* Cap: #fp → #val */
         case ST_TYPE_ANY:         return ST_TYPE_ANY;    /* Already at top */
         default:                  return t;
     }

@@ -22,7 +22,10 @@ static bool trie_type_supports_param(st_token_type_t t)
 {
     return t == ST_TYPE_PATH || t == ST_TYPE_ABS_PATH ||
            t == ST_TYPE_REL_PATH || t == ST_TYPE_FILENAME ||
-           t == ST_TYPE_SIZE;
+           t == ST_TYPE_SIZE ||
+           t == ST_TYPE_BRANCH || t == ST_TYPE_SHA ||
+           t == ST_TYPE_IMAGE || t == ST_TYPE_PKG ||
+           t == ST_TYPE_USER || t == ST_TYPE_FINGERPRINT;
 }
 
 /* ============================================================

@@ -48,6 +48,12 @@ TYPE_ORDER: List[str] = [
     "HASH_ALGO",
     "ENV_VAR",
     "HYPHENATED",
+    "BRANCH",
+    "SHA",
+    "IMAGE",
+    "PKG",
+    "USER",
+    "FINGERPRINT",
     "ANY",
 ]
 
@@ -61,7 +67,7 @@ TYPE_ORDER: List[str] = [
 # and PORT ⊂ IPV4 ⊂ VALUE ⊂ ANY. The union of both chains gives the
 # correct transitive closure: PORT ≤ {NUMBER, IPV4, VALUE, ANY}.
 CHAINS: List[List[str]] = [
-    ["HEXHASH", "NUMBER", "VALUE", "ANY"],
+    ["HEXHASH", "SHA", "VALUE", "ANY"],
     ["IPV4", "VALUE", "ANY"],
     ["WORD", "VALUE", "ANY"],
     ["QUOTED", "QUOTED_SPACE", "VALUE", "ANY"],
@@ -79,6 +85,11 @@ CHAINS: List[List[str]] = [
     ["HASH_ALGO", "WORD", "VALUE", "ANY"],
     ["ENV_VAR", "VALUE", "ANY"],
     ["HYPHENATED", "WORD", "VALUE", "ANY"],
+    ["BRANCH", "VALUE", "ANY"],
+    ["IMAGE", "VALUE", "ANY"],
+    ["PKG", "VALUE", "ANY"],
+    ["USER", "VALUE", "ANY"],
+    ["FINGERPRINT", "VALUE", "ANY"],
 ]
 
 # ------------------------------------------------------------------
@@ -217,6 +228,12 @@ def symbol(name: str) -> str:
         "HASH_ALGO": '"#hash"',
         "ENV_VAR": '"#env"',
         "HYPHENATED": '"#hyp"',
+        "BRANCH": '"#branch"',
+        "SHA": '"#sha"',
+        "IMAGE": '"#image"',
+        "PKG": '"#pkg"',
+        "USER": '"#user"',
+        "FINGERPRINT": '"#fp"',
         "ANY": '"*"',
     }
     return symbols[name]
@@ -256,7 +273,8 @@ def generate_join_table(join: Dict[str, Dict[str, str]]) -> str:
         "VALUE": "VAL", "OPT": "OPT", "UUID": "UUID", "EMAIL": "EMAIL",
         "HOSTNAME": "HOST", "PORT": "PORT", "SIZE": "SIZE", "SEMVER": "SEMV",
         "TIMESTAMP": "TS", "HASH_ALGO": "HASH", "ENV_VAR": "ENV",
-        "HYPHENATED": "HYP", "ANY": "ANY",
+        "HYPHENATED": "HYP", "BRANCH": "BRNCH", "SHA": "SHA", "IMAGE": "IMAG",
+        "PKG": "PKG", "USER": "USER", "FINGERPRINT": "FP", "ANY": "ANY",
     }
     lines = [
         "/* ============================================================",
@@ -265,7 +283,7 @@ def generate_join_table(join: Dict[str, Dict[str, str]]) -> str:
         " * st_type_join[a][b] = narrowest type covering both a and b.",
         " *",
         " * Lattice:",
-        " *   #h ⊂ #n ⊂ #val ⊂ *",
+        " *   #h ⊂ #sha ⊂ #val ⊂ *",
         " *   #i ⊂ #val ⊂ *",
         " *   #w ⊂ #val ⊂ *",
         " *   #q ⊂ #qs ⊂ #val ⊂ *",
@@ -276,6 +294,7 @@ def generate_join_table(join: Dict[str, Dict[str, str]]) -> str:
         " *   #uuid, #email, #host, #size, #semver, #ts, #env ⊂ #val ⊂ *",
         " *   #port ⊂ #n, #port ⊂ #i, #port ⊂ #val ⊂ *",
         " *   #hash, #hyp ⊂ #w ⊂ #val ⊂ *",
+        " *   #branch, #image, #pkg, #user, #fp ⊂ #val ⊂ *",
         " * ============================================================ */",
         "",
         "const st_token_type_t st_type_join[ST_TYPE_COUNT][ST_TYPE_COUNT] = {",

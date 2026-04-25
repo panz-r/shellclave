@@ -85,6 +85,12 @@ typedef enum {
     ST_TYPE_HASH_ALGO,     /* #hash: crypto hash algorithm name */
     ST_TYPE_ENV_VAR,       /* #env: $VAR or ${VAR} */
     ST_TYPE_HYPHENATED,    /* #hyp: hyphenated identifier (a-b where a,b are 1+ alnum/_ chars) */
+    ST_TYPE_BRANCH,       /* #branch: git branch/ref name (main, feature/x, release/v2) */
+    ST_TYPE_SHA,          /* #sha: SHA/hash digest (7-64 hex chars) */
+    ST_TYPE_IMAGE,        /* #image: container image ref (nginx:latest, ghcr.io/org/app) */
+    ST_TYPE_PKG,          /* #pkg: package specifier (express, @babel/core@^7) */
+    ST_TYPE_USER,         /* #user: unix username (root, www-data, deploy-user) */
+    ST_TYPE_FINGERPRINT,  /* #fp: SSH key fingerprint (SHA256:xxx or MD5 hex colons) */
     ST_TYPE_ANY,           /* *: everything (top element) */
     ST_TYPE_COUNT          /* number of types */
 } st_token_type_t;

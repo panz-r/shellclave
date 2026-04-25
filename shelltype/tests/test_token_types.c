@@ -256,9 +256,10 @@ static int test_classify_url_ftp(void)
 
 static int test_classify_hostname_hyphenated(void)
 {
-    /* Hyphen + dot → always HOSTNAME */
+    /* a-b.c: hyphen BEFORE dot pattern fails (hyphen at position 1, next char is 'b'),
+     * TLD not in known list → LITERAL. my-host.example.com: hyphen-before-dot in "host.example" → HOSTNAME. */
     ASSERT_TYPE("my-host.example.com", ST_TYPE_HOSTNAME);
-    ASSERT_TYPE("a-b.c", ST_TYPE_HOSTNAME);
+    ASSERT_TYPE("a-b.c", ST_TYPE_LITERAL);
     return 1;
 }
 
@@ -463,6 +464,237 @@ static int test_classify_hyphenated_not(void)
 }
 
 /* ============================================================
+ * BRANCH (#branch)
+ * ============================================================ */
+
+static int test_classify_branch_main(void)
+{
+    ASSERT_TYPE("main", ST_TYPE_BRANCH);
+    ASSERT_TYPE("develop", ST_TYPE_BRANCH);
+    return 1;
+}
+
+static int test_classify_branch_slash(void)
+{
+    /* feature/login and origin/main: have /, no dots → BRANCH.
+     * release/v2.0: has dots → not BRANCH (dots rejected), has / → REL_PATH */
+    ASSERT_TYPE("feature/login", ST_TYPE_BRANCH);
+    ASSERT_TYPE("origin/main", ST_TYPE_BRANCH);
+    ASSERT_TYPE("release/v2.0", ST_TYPE_REL_PATH);
+    return 1;
+}
+
+static int test_classify_branch_release(void)
+{
+    /* release-1.0: has dot, is_hyphenated rejects dots → falls through to LITERAL.
+     * fix-123-bug: no dot, is_hyphenated returns true → HYPHENATED. */
+    ASSERT_TYPE("release-1.0", ST_TYPE_LITERAL);
+    ASSERT_TYPE("fix-123-bug", ST_TYPE_HYPHENATED);
+    return 1;
+}
+
+static int test_classify_branch_head(void)
+{
+    ASSERT_TYPE("HEAD", ST_TYPE_BRANCH);
+    return 1;
+}
+
+static int test_classify_branch_reject_dash(void)
+{
+    ASSERT_TYPE("-v", ST_TYPE_OPT);
+    return 1;
+}
+
+static int test_classify_branch_reject_dotstart(void)
+{
+    /* .gitignore: starts with '.' → FILENAME, not LITERAL */
+    ASSERT_TYPE(".gitignore", ST_TYPE_FILENAME);
+    return 1;
+}
+
+/* ============================================================
+ * SHA (#sha)
+ * ============================================================ */
+
+static int test_classify_sha_short(void)
+{
+    /* 7-char hex is too short for SHA (min 9 chars) → falls through to LITERAL */
+    ASSERT_TYPE("abc1234", ST_TYPE_LITERAL);
+    return 1;
+}
+
+static int test_classify_sha_40(void)
+{
+    /* 40-char lowercase hex → HEXHASH (is_hex_hash fires before is_sha, covers 8+ chars).
+     * is_sha fires for lowercase-only hex strings in 9-64 range that don't have
+     * uppercase A-F (to distinguish from SHA values that use lowercase). */
+    ASSERT_TYPE("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", ST_TYPE_HEXHASH);
+    return 1;
+}
+
+static int test_classify_sha_64(void)
+{
+    /* 64-char lowercase hex: falls in HEXHASH range (41-64), not SHA (9-40) */
+    ASSERT_TYPE("deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef", ST_TYPE_HEXHASH);
+    return 1;
+}
+
+static int test_classify_sha_reject_short(void)
+{
+    /* 6 chars is too short for SHA */
+    ASSERT_TYPE("abc123", ST_TYPE_LITERAL);
+    return 1;
+}
+
+static int test_classify_sha_reject_allnum(void)
+{
+    /* Pure numeric 7-digit string → NUMBER (not SHA) */
+    ASSERT_TYPE("1234567", ST_TYPE_NUMBER);
+    return 1;
+}
+
+/* ============================================================
+ * IMAGE (#image)
+ * ============================================================ */
+
+static int test_classify_image_tagged(void)
+{
+    ASSERT_TYPE("nginx:latest", ST_TYPE_IMAGE);
+    ASSERT_TYPE("ubuntu:22.04", ST_TYPE_IMAGE);
+    return 1;
+}
+
+static int test_classify_image_registry(void)
+{
+    ASSERT_TYPE("ghcr.io/org/app:v1", ST_TYPE_IMAGE);
+    return 1;
+}
+
+static int test_classify_image_digest(void)
+{
+    ASSERT_TYPE("alpine@sha256:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef", ST_TYPE_IMAGE);
+    return 1;
+}
+
+static int test_classify_image_reject_plain(void)
+{
+    /* No slash or colon — not an image */
+    ASSERT_TYPE("nginx", ST_TYPE_LITERAL);
+    return 1;
+}
+
+static int test_classify_image_reject_bareword(void)
+{
+    ASSERT_TYPE("hello", ST_TYPE_LITERAL);
+    return 1;
+}
+
+/* ============================================================
+ * PACKAGE (#pkg)
+ * ============================================================ */
+
+static int test_classify_pkg_simple(void)
+{
+    /* Package names without @ are plain words → LITERAL (too ambiguous as command args) */
+    ASSERT_TYPE("express", ST_TYPE_LITERAL);
+    ASSERT_TYPE("lodash", ST_TYPE_LITERAL);
+    return 1;
+}
+
+static int test_classify_pkg_versioned(void)
+{
+    /* lodash@4.17.21: has @ + version → PKG (PKG checked before EMAIL) */
+    ASSERT_TYPE("react@18", ST_TYPE_PKG);
+    ASSERT_TYPE("lodash@4.17.21", ST_TYPE_PKG);
+    return 1;
+}
+
+static int test_classify_pkg_scoped(void)
+{
+    ASSERT_TYPE("@babel/core", ST_TYPE_PKG);
+    ASSERT_TYPE("@types/node", ST_TYPE_PKG);
+    return 1;
+}
+
+static int test_classify_pkg_reject_dash_start(void)
+{
+    ASSERT_TYPE("-verbose", ST_TYPE_OPT);
+    return 1;
+}
+
+/* ============================================================
+ * USER (#user)
+ * ============================================================ */
+
+static int test_classify_user_root(void)
+{
+    /* Known system accounts in allowlist */
+    ASSERT_TYPE("root", ST_TYPE_USER);
+    ASSERT_TYPE("nobody", ST_TYPE_USER);
+    ASSERT_TYPE("_apt", ST_TYPE_USER);
+    return 1;
+}
+
+static int test_classify_user_hyphenated(void)
+{
+    /* www-data: in allowlist → USER (before HYPHENATED in classification order)
+     * deploy-user: not in allowlist → HYPHENATED */
+    ASSERT_TYPE("www-data", ST_TYPE_USER);
+    ASSERT_TYPE("deploy-user", ST_TYPE_HYPHENATED);
+    return 1;
+}
+
+static int test_classify_user_underscore(void)
+{
+    /* _apt: in allowlist → USER
+     * _systemd: not in allowlist → LITERAL (only systemd is in list) */
+    ASSERT_TYPE("_apt", ST_TYPE_USER);
+    ASSERT_TYPE("_systemd", ST_TYPE_LITERAL);
+    return 1;
+}
+
+static int test_classify_user_reject_uppercase(void)
+{
+    ASSERT_TYPE("Root", ST_TYPE_LITERAL);
+    ASSERT_TYPE("POSTGRES", ST_TYPE_LITERAL);
+    return 1;
+}
+
+static int test_classify_user_reject_digit_start(void)
+{
+    ASSERT_TYPE("0user", ST_TYPE_LITERAL);
+    return 1;
+}
+
+/* ============================================================
+ * FINGERPRINT (#fp)
+ * ============================================================ */
+
+static int test_classify_fp_sha256(void)
+{
+    ASSERT_TYPE("SHA256:uNiVztksCsDhcc0u9e8BgrJXVGL5Nr0iASdhO1tB9qE", ST_TYPE_FINGERPRINT);
+    return 1;
+}
+
+static int test_classify_fp_md5(void)
+{
+    ASSERT_TYPE("1a:2b:3c:4d:5e:6f:7a:8b:9c:0d:1e:2f:3a:4b:5c:6d", ST_TYPE_FINGERPRINT);
+    return 1;
+}
+
+static int test_classify_fp_reject_bare_hex(void)
+{
+    ASSERT_TYPE("deadbeef", ST_TYPE_HEXHASH);
+    return 1;
+}
+
+static int test_classify_fp_reject_wrong_prefix(void)
+{
+    ASSERT_TYPE("SHA1:abc", ST_TYPE_LITERAL);
+    return 1;
+}
+
+/* ============================================================
  * JOIN TABLE
  * ============================================================ */
 
@@ -499,8 +731,9 @@ static int test_join_any_is_top(void)
 
 static int test_join_hex_number(void)
 {
-    /* #h ∨ #n = #n (hex hash is a kind of number) */
-    ASSERT(st_join(ST_TYPE_HEXHASH, ST_TYPE_NUMBER) == ST_TYPE_NUMBER);
+    /* #h ⊂ #sha ⊂ #val and #n ⊂ #val. HEXHASH and NUMBER are incomparable
+     * (neither is a subset of the other), so #h ∨ #n = #val. */
+    ASSERT(st_join(ST_TYPE_HEXHASH, ST_TYPE_NUMBER) == ST_TYPE_VALUE);
     return 1;
 }
 
@@ -553,6 +786,41 @@ static int test_join_val_with_path(void)
     return 1;
 }
 
+static int test_join_hexhash_sha(void)
+{
+    /* #h ⊂ #sha: join(hex, sha) = sha */
+    ASSERT(st_join(ST_TYPE_HEXHASH, ST_TYPE_SHA) == ST_TYPE_SHA);
+    ASSERT(st_join(ST_TYPE_SHA, ST_TYPE_HEXHASH) == ST_TYPE_SHA);
+    /* hex ∨ hex = hex */
+    ASSERT(st_join(ST_TYPE_HEXHASH, ST_TYPE_HEXHASH) == ST_TYPE_HEXHASH);
+    /* sha ∨ sha = sha */
+    ASSERT(st_join(ST_TYPE_SHA, ST_TYPE_SHA) == ST_TYPE_SHA);
+    return 1;
+}
+
+static int test_join_new_types_value(void)
+{
+    /* All new types join with VALUE */
+    ASSERT(st_join(ST_TYPE_BRANCH, ST_TYPE_VALUE) == ST_TYPE_VALUE);
+    ASSERT(st_join(ST_TYPE_IMAGE, ST_TYPE_VALUE) == ST_TYPE_VALUE);
+    ASSERT(st_join(ST_TYPE_PKG, ST_TYPE_VALUE) == ST_TYPE_VALUE);
+    ASSERT(st_join(ST_TYPE_USER, ST_TYPE_VALUE) == ST_TYPE_VALUE);
+    ASSERT(st_join(ST_TYPE_FINGERPRINT, ST_TYPE_VALUE) == ST_TYPE_VALUE);
+    ASSERT(st_join(ST_TYPE_SHA, ST_TYPE_VALUE) == ST_TYPE_VALUE);
+    return 1;
+}
+
+static int test_join_new_types_incomparable(void)
+{
+    /* All new types are ⊂ VALUE. Incomparable pairs: join = VALUE (LUB).
+     * Comparable pairs (BRANCH ⊂ VALUE): join = VALUE. */
+    ASSERT(st_join(ST_TYPE_BRANCH, ST_TYPE_IMAGE) == ST_TYPE_VALUE);
+    ASSERT(st_join(ST_TYPE_PKG, ST_TYPE_USER) == ST_TYPE_VALUE);
+    ASSERT(st_join(ST_TYPE_SHA, ST_TYPE_BRANCH) == ST_TYPE_VALUE);
+    ASSERT(st_join(ST_TYPE_FINGERPRINT, ST_TYPE_IMAGE) == ST_TYPE_VALUE);
+    return 1;
+}
+
 /* ============================================================
  * COMPATIBILITY TABLE
  * ============================================================ */
@@ -593,12 +861,12 @@ static int test_compat_any_matches_all(void)
 
 static int test_compat_hex_to_number(void)
 {
-    /* #h ≤ #n */
-    ASSERT(st_is_compatible(ST_TYPE_HEXHASH, ST_TYPE_NUMBER));
-    /* #h ≤ #val */
-    ASSERT(st_is_compatible(ST_TYPE_HEXHASH, ST_TYPE_VALUE));
-    /* #n ≤ #val */
-    ASSERT(st_is_compatible(ST_TYPE_NUMBER, ST_TYPE_VALUE));
+    /* #h ⊂ #sha ⊂ #val and #n ⊂ #val. HEXHASH and NUMBER are incomparable
+     * (neither is a subset of the other). Both are subsets of VALUE. */
+    ASSERT(!st_is_compatible(ST_TYPE_HEXHASH, ST_TYPE_NUMBER));  /* incomparable */
+    ASSERT(st_is_compatible(ST_TYPE_HEXHASH, ST_TYPE_SHA));      /* #h ⊂ #sha */
+    ASSERT(st_is_compatible(ST_TYPE_HEXHASH, ST_TYPE_VALUE));   /* #h ⊂ #val */
+    ASSERT(st_is_compatible(ST_TYPE_NUMBER, ST_TYPE_VALUE));    /* #n ⊂ #val */
     return 1;
 }
 
@@ -965,6 +1233,47 @@ int main(void)
     TEST(test_classify_hyphenated);
     TEST(test_classify_hyphenated_not);
 
+    printf("\nClassification - Branch (#branch):\n");
+    TEST(test_classify_branch_main);
+    TEST(test_classify_branch_slash);
+    TEST(test_classify_branch_release);
+    TEST(test_classify_branch_head);
+    TEST(test_classify_branch_reject_dash);
+    TEST(test_classify_branch_reject_dotstart);
+
+    printf("\nClassification - SHA (#sha):\n");
+    TEST(test_classify_sha_short);
+    TEST(test_classify_sha_40);
+    TEST(test_classify_sha_64);
+    TEST(test_classify_sha_reject_short);
+    TEST(test_classify_sha_reject_allnum);
+
+    printf("\nClassification - Image (#image):\n");
+    TEST(test_classify_image_tagged);
+    TEST(test_classify_image_registry);
+    TEST(test_classify_image_digest);
+    TEST(test_classify_image_reject_plain);
+    TEST(test_classify_image_reject_bareword);
+
+    printf("\nClassification - Package (#pkg):\n");
+    TEST(test_classify_pkg_simple);
+    TEST(test_classify_pkg_versioned);
+    TEST(test_classify_pkg_scoped);
+    TEST(test_classify_pkg_reject_dash_start);
+
+    printf("\nClassification - User (#user):\n");
+    TEST(test_classify_user_root);
+    TEST(test_classify_user_hyphenated);
+    TEST(test_classify_user_underscore);
+    TEST(test_classify_user_reject_uppercase);
+    TEST(test_classify_user_reject_digit_start);
+
+    printf("\nClassification - Fingerprint (#fp):\n");
+    TEST(test_classify_fp_sha256);
+    TEST(test_classify_fp_md5);
+    TEST(test_classify_fp_reject_bare_hex);
+    TEST(test_classify_fp_reject_wrong_prefix);
+
     printf("\nJoin table:\n");
     TEST(test_join_reflexive);
     TEST(test_join_symmetric);
@@ -975,6 +1284,9 @@ int main(void)
     TEST(test_join_quoted_types);
     TEST(test_join_cross_domain);
     TEST(test_join_val_with_path);
+    TEST(test_join_hexhash_sha);
+    TEST(test_join_new_types_value);
+    TEST(test_join_new_types_incomparable);
 
     printf("\nCompatibility table:\n");
     TEST(test_compat_reflexive);
