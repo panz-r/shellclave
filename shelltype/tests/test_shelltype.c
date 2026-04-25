@@ -570,6 +570,41 @@ static int test_normalize_hash(void)
 }
 
 /* ============================================================
+ * LEARNER PARAMETRIZED SUGGESTIONS
+ * ============================================================ */
+
+static int test_suggest_path_ext(void)
+{
+    /* Feed many .cfg paths and verify learner suggests #p.cfg */
+    st_learner_t *learner = st_learner_new(3, 0.05);
+
+    /* Feed 5 commands with .cfg absolute paths */
+    for (int i = 0; i < 5; i++) {
+        char cmd[64];
+        snprintf(cmd, sizeof(cmd), "cat /etc/file%d.cfg", i);
+        st_feed(learner, cmd);
+    }
+
+    size_t count = 0;
+    st_suggestion_t *suggestions = st_suggest(learner, &count);
+    ASSERT(count > 0);
+
+    /* Find the suggestion containing "#p.cfg" */
+    bool found = false;
+    for (size_t i = 0; i < count; i++) {
+        if (strstr(suggestions[i].pattern, "#p.cfg") != NULL) {
+            found = true;
+            break;
+        }
+    }
+    ASSERT(found);
+
+    st_free_suggestions(suggestions, count);
+    st_learner_free(learner);
+    return 1;
+}
+
+/* ============================================================
  * MAIN
  * ============================================================ */
 
@@ -618,6 +653,9 @@ int main(void)
     TEST(test_empty_command);
     TEST(test_null_command);
     TEST(test_suggest_empty_trie);
+
+    printf("\nLearner parametrized suggestions:\n");
+    TEST(test_suggest_path_ext);
 
     printf("\n========================================\n");
     printf("Results: %d/%d passed, %d failed\n",

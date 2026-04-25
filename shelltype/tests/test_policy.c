@@ -1043,8 +1043,632 @@ static int test_policy_opt_matches_value(void)
 }
 
 /* ============================================================
- * MAIN
+ * PARAMETRIZED WILDCARDS (#path.cfg etc.)
  * ============================================================ */
+
+static int test_param_add_path_ext(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_policy_t *policy = st_policy_new(ctx);
+    ASSERT(policy != NULL);
+
+    st_error_t err = st_policy_add(policy, "cat #path.cfg");
+    ASSERT(err == ST_OK);
+    ASSERT(st_policy_count(policy) == 1);
+
+    st_policy_free(policy);
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
+static int test_param_match_correct_ext(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_policy_t *policy = st_policy_new(ctx);
+
+    st_policy_add(policy, "cat #path.cfg");
+
+    st_eval_result_t result;
+    st_error_t err = st_policy_eval(policy, "cat /etc/app.cfg", &result);
+    ASSERT(err == ST_OK);
+    ASSERT(result.matches);
+    ASSERT_STR_EQ(result.matching_pattern, "cat #path.cfg");
+
+    st_policy_free(policy);
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
+static int test_param_no_match_wrong_ext(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_policy_t *policy = st_policy_new(ctx);
+
+    st_policy_add(policy, "cat #path.cfg");
+
+    st_eval_result_t result;
+    st_error_t err = st_policy_eval(policy, "cat /etc/app.log", &result);
+    ASSERT(err == ST_OK);
+    ASSERT(!result.matches);
+
+    st_policy_free(policy);
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
+static int test_param_unparametrized_subsumes(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_policy_t *policy = st_policy_new(ctx);
+
+    st_policy_add(policy, "cat #path");
+
+    /* #path should match any path including .cfg */
+    st_eval_result_t result;
+    st_error_t err = st_policy_eval(policy, "cat /etc/app.cfg", &result);
+    ASSERT(err == ST_OK);
+    ASSERT(result.matches);
+
+    st_policy_free(policy);
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
+static int test_param_coexist_different_ext(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_policy_t *policy = st_policy_new(ctx);
+
+    st_policy_add(policy, "cat #path.cfg");
+    st_policy_add(policy, "cat #path.log");
+    ASSERT(st_policy_count(policy) == 2);
+
+    /* .cfg matches cfg pattern */
+    st_eval_result_t r1;
+    st_policy_eval(policy, "cat /etc/app.cfg", &r1);
+    ASSERT(r1.matches);
+
+    /* .log matches log pattern */
+    st_eval_result_t r2;
+    st_policy_eval(policy, "cat /var/sys.log", &r2);
+    ASSERT(r2.matches);
+
+    /* .txt matches neither */
+    st_eval_result_t r3;
+    st_policy_eval(policy, "cat /etc/app.txt", &r3);
+    ASSERT(!r3.matches);
+
+    st_policy_free(policy);
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
+static int test_param_coexist_with_unparametrized(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_policy_t *policy = st_policy_new(ctx);
+
+    st_policy_add(policy, "cat #path.cfg");
+    st_policy_add(policy, "cat #path");
+
+    /* .cfg matches both patterns (parametrized first) */
+    st_eval_result_t r1;
+    st_policy_eval(policy, "cat /etc/app.cfg", &r1);
+    ASSERT(r1.matches);
+
+    /* .log matches #path (unparametrized) */
+    st_eval_result_t r2;
+    st_policy_eval(policy, "cat /etc/app.log", &r2);
+    ASSERT(r2.matches);
+
+    st_policy_free(policy);
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
+static int test_param_compact_subsumes(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_policy_t *policy = st_policy_new(ctx);
+
+    /* #path subsumes #path.cfg */
+    st_policy_add(policy, "cat #path.cfg");
+    st_policy_add(policy, "cat #path");
+    ASSERT(st_policy_count(policy) == 2);
+
+    st_error_t err = st_policy_compact(policy);
+    ASSERT(err == ST_OK);
+    ASSERT(st_policy_count(policy) == 1);
+
+    /* Should still match .cfg */
+    st_eval_result_t result;
+    st_policy_eval(policy, "cat /etc/app.cfg", &result);
+    ASSERT(result.matches);
+
+    st_policy_free(policy);
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
+static int test_param_compact_different_ext_keeps_both(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_policy_t *policy = st_policy_new(ctx);
+
+    /* #path.cfg and #path.log are incomparable */
+    st_policy_add(policy, "cat #path.cfg");
+    st_policy_add(policy, "cat #path.log");
+    ASSERT(st_policy_count(policy) == 2);
+
+    st_error_t err = st_policy_compact(policy);
+    ASSERT(err == ST_OK);
+    ASSERT(st_policy_count(policy) == 2);
+
+    st_policy_free(policy);
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
+static int test_param_serialization_roundtrip(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_policy_t *policy = st_policy_new(ctx);
+
+    st_policy_add(policy, "cat #path.cfg");
+    st_policy_add(policy, "cat #path.log");
+
+    const char *path = "/tmp/test_param_serialization.tmp";
+    st_error_t err = st_policy_save(policy, path);
+    ASSERT(err == ST_OK);
+
+    /* Load into a new policy */
+    st_policy_t *policy2 = st_policy_new(ctx);
+    err = st_policy_load(policy2, path, true);
+    ASSERT(err == ST_OK);
+    ASSERT(st_policy_count(policy2) == 2);
+
+    /* Verify matching still works */
+    st_eval_result_t r1;
+    st_policy_eval(policy2, "cat /etc/app.cfg", &r1);
+    ASSERT(r1.matches);
+    ASSERT_STR_EQ(r1.matching_pattern, "cat #path.cfg");
+
+    st_eval_result_t r2;
+    st_policy_eval(policy2, "cat /var/sys.log", &r2);
+    ASSERT(r2.matches);
+    ASSERT_STR_EQ(r2.matching_pattern, "cat #path.log");
+
+    st_eval_result_t r3;
+    st_policy_eval(policy2, "cat /etc/app.txt", &r3);
+    ASSERT(!r3.matches);
+
+    st_policy_free(policy2);
+    st_policy_free(policy);
+    st_policy_ctx_free(ctx);
+    remove(path);
+    return 1;
+}
+
+static int test_param_no_extension_no_match(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_policy_t *policy = st_policy_new(ctx);
+
+    st_policy_add(policy, "cat #path.cfg");
+
+    /* Path without extension should not match #path.cfg */
+    st_eval_result_t result;
+    st_error_t err = st_policy_eval(policy, "cat /etc/hosts", &result);
+    ASSERT(err == ST_OK);
+    ASSERT(!result.matches);
+
+    st_policy_free(policy);
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
+static int test_param_relpath_match(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_policy_t *policy = st_policy_new(ctx);
+
+    st_policy_add(policy, "cat #path.cfg");
+
+    /* Relative paths ending in .cfg should also match #path.cfg */
+    st_eval_result_t result;
+    st_error_t err = st_policy_eval(policy, "cat src/app.cfg", &result);
+    ASSERT(err == ST_OK);
+    ASSERT(result.matches);
+
+    st_policy_free(policy);
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
+static int test_param_duplicate_add(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_policy_t *policy = st_policy_new(ctx);
+
+    st_policy_add(policy, "cat #path.cfg");
+    st_policy_add(policy, "cat #path.cfg");
+    ASSERT(st_policy_count(policy) == 1);
+
+    st_policy_free(policy);
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
+static int test_param_non_path_type_rejected(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_policy_t *policy = st_policy_new(ctx);
+
+    /* #n.cfg should not be treated as parametrized - it's invalid,
+     * so it should fail to parse as a wildcard and be treated as literal */
+    st_error_t err = st_policy_add(policy, "cat #n.cfg");
+    ASSERT(err == ST_OK);
+    /* The token "#n.cfg" won't match #n (since #n doesn't support params),
+     * so it falls through to classify which treats it as literal "#n.cfg".
+     * This is acceptable behavior - non-path parametrized wildcards are not
+     * recognized and become literals. */
+
+    /* Verify it doesn't match "cat 42" */
+    st_eval_result_t result;
+    st_policy_eval(policy, "cat 42", &result);
+    ASSERT(!result.matches);
+
+    st_policy_free(policy);
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
+/* --- Phase 1: Size parametrization --- */
+
+static int test_param_size_add(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_policy_t *policy = st_policy_new(ctx);
+
+    /* Pattern must match the normalized command form.
+     * "bs=10MiB" normalizes to "bs=" + "#size" */
+    st_error_t err = st_policy_add(policy, "dd bs= #size.MiB");
+    ASSERT(err == ST_OK);
+    ASSERT(st_policy_count(policy) == 1);
+
+    st_policy_free(policy);
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
+static int test_param_size_match(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_policy_t *policy = st_policy_new(ctx);
+
+    st_policy_add(policy, "dd bs= #size.MiB");
+
+    st_eval_result_t r1;
+    st_policy_eval(policy, "dd bs=10MiB", &r1);
+    ASSERT(r1.matches);
+
+    /* Wrong suffix */
+    st_eval_result_t r3;
+    st_policy_eval(policy, "dd bs=10G", &r3);
+    ASSERT(!r3.matches);
+
+    st_policy_free(policy);
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
+static int test_param_size_coexist(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_policy_t *policy = st_policy_new(ctx);
+
+    st_policy_add(policy, "dd bs= #size.MiB");
+    st_policy_add(policy, "dd bs= #size.G");
+    ASSERT(st_policy_count(policy) == 2);
+
+    st_eval_result_t r1;
+    st_policy_eval(policy, "dd bs=10MiB", &r1);
+    ASSERT(r1.matches);
+
+    st_eval_result_t r2;
+    st_policy_eval(policy, "dd bs=2G", &r2);
+    ASSERT(r2.matches);
+
+    st_eval_result_t r3;
+    st_policy_eval(policy, "dd bs=10K", &r3);
+    ASSERT(!r3.matches);
+
+    st_policy_free(policy);
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
+static int test_param_size_compact_keeps_both(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_policy_t *policy = st_policy_new(ctx);
+
+    st_policy_add(policy, "dd bs= #size.MiB");
+    st_policy_add(policy, "dd bs= #size.G");
+
+    st_error_t err = st_policy_compact(policy);
+    ASSERT(err == ST_OK);
+    ASSERT(st_policy_count(policy) == 2);
+
+    st_policy_free(policy);
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
+static int test_param_size_compact_subsumed(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_policy_t *policy = st_policy_new(ctx);
+
+    st_policy_add(policy, "dd bs= #size.MiB");
+    st_policy_add(policy, "dd bs= #size");
+
+    st_error_t err = st_policy_compact(policy);
+    ASSERT(err == ST_OK);
+    ASSERT(st_policy_count(policy) == 1);
+
+    /* Generic #size should still match MiB tokens */
+    st_eval_result_t r;
+    st_policy_eval(policy, "dd bs=10MiB", &r);
+    ASSERT(r.matches);
+
+    st_policy_free(policy);
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
+/* --- Phase 1b: UUID/SEMVER/TIMESTAMP parametrization --- */
+
+static int test_param_uuid_v4(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_policy_t *policy = st_policy_new(ctx);
+
+    st_policy_add(policy, "container #uuid.v4");
+
+    /* v4 UUID matches */
+    st_eval_result_t r1;
+    st_policy_eval(policy, "container 550e8400-e29b-41d4-a716-446655440000", &r1);
+    ASSERT(r1.matches);
+
+    /* v3 UUID does NOT match */
+    st_eval_result_t r2;
+    st_policy_eval(policy, "container 6fa459ea-ee8a-3ca4-894e-db77e160355e", &r2);
+    ASSERT(!r2.matches);
+
+    st_policy_free(policy);
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
+static int test_param_uuid_unparametrized(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_policy_t *policy = st_policy_new(ctx);
+
+    st_policy_add(policy, "container #uuid");
+
+    /* Any UUID matches unparametrized */
+    st_eval_result_t r1;
+    st_policy_eval(policy, "container 550e8400-e29b-41d4-a716-446655440000", &r1);
+    ASSERT(r1.matches);
+
+    st_eval_result_t r2;
+    st_policy_eval(policy, "container 6fa459ea-ee8a-3ca4-894e-db77e160355e", &r2);
+    ASSERT(r2.matches);
+
+    st_policy_free(policy);
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
+static int test_param_uuid_coexist(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_policy_t *policy = st_policy_new(ctx);
+
+    st_policy_add(policy, "container #uuid.v4");
+    st_policy_add(policy, "container #uuid.v5");
+    ASSERT(st_policy_count(policy) == 2);
+
+    st_eval_result_t r1;
+    st_policy_eval(policy, "container 550e8400-e29b-41d4-a716-446655440000", &r1);
+    ASSERT(r1.matches);
+
+    st_eval_result_t r2;
+    st_policy_eval(policy, "container 4be33a94-0c5b-5516-a922-d07dedd59172", &r2);
+    ASSERT(r2.matches);
+
+    /* v3 matches neither */
+    st_eval_result_t r3;
+    st_policy_eval(policy, "container 6fa459ea-ee8a-3ca4-894e-db77e160355e", &r3);
+    ASSERT(!r3.matches);
+
+    st_policy_free(policy);
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
+static int test_param_uuid_compact(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_policy_t *policy = st_policy_new(ctx);
+
+    st_policy_add(policy, "container #uuid.v4");
+    st_policy_add(policy, "container #uuid");
+
+    st_error_t err = st_policy_compact(policy);
+    ASSERT(err == ST_OK);
+    ASSERT(st_policy_count(policy) == 1);
+
+    st_policy_free(policy);
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
+static int test_param_semver(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_policy_t *policy = st_policy_new(ctx);
+
+    st_policy_add(policy, "install #semver.major");
+
+    /* Any semver matches (parameter is informational) */
+    st_eval_result_t r;
+    st_policy_eval(policy, "install 1.2.3", &r);
+    ASSERT(r.matches);
+
+    st_policy_free(policy);
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
+static int test_param_ts_date(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_policy_t *policy = st_policy_new(ctx);
+
+    st_policy_add(policy, "log #ts.date");
+
+    st_eval_result_t r1;
+    st_policy_eval(policy, "log 2025-04-24", &r1);
+    ASSERT(r1.matches);
+
+    /* Time does not match date-only pattern */
+    st_eval_result_t r2;
+    st_policy_eval(policy, "log 15:30:00", &r2);
+    ASSERT(!r2.matches);
+
+    st_policy_free(policy);
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
+static int test_param_ts_time(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_policy_t *policy = st_policy_new(ctx);
+
+    st_policy_add(policy, "log #ts.time");
+
+    st_eval_result_t r1;
+    st_policy_eval(policy, "log 15:30:00", &r1);
+    ASSERT(r1.matches);
+
+    /* Date does not match time-only pattern */
+    st_eval_result_t r2;
+    st_policy_eval(policy, "log 2025-04-24", &r2);
+    ASSERT(!r2.matches);
+
+    st_policy_free(policy);
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
+static int test_param_ts_datetime(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_policy_t *policy = st_policy_new(ctx);
+
+    st_policy_add(policy, "log #ts.datetime");
+
+    st_eval_result_t r1;
+    st_policy_eval(policy, "log 2025-04-24T15:30:00Z", &r1);
+    ASSERT(r1.matches);
+
+    /* Date-only does not match datetime pattern */
+    st_eval_result_t r2;
+    st_policy_eval(policy, "log 2025-04-24", &r2);
+    ASSERT(!r2.matches);
+
+    st_policy_free(policy);
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
+/* --- Phase 2: Parameter validation --- */
+
+static int test_param_validate_bad_path(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_policy_t *policy = st_policy_new(ctx);
+
+    /* Empty parameter after dot → treated as literal, not parametrized */
+    st_error_t err = st_policy_add(policy, "cat #path.");
+    ASSERT(err == ST_OK);
+    /* It's a literal "#path.", not a wildcard, so it shouldn't match */
+    st_eval_result_t r;
+    st_policy_eval(policy, "cat /etc/hosts", &r);
+    ASSERT(!r.matches);
+
+    st_policy_free(policy);
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
+static int test_param_validate_bad_size(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_policy_t *policy = st_policy_new(ctx);
+
+    /* "xyz" is not a known size suffix → treated as literal */
+    st_error_t err = st_policy_add(policy, "dd bs= #size.xyz");
+    ASSERT(err == ST_OK);
+    /* It's a literal "#size.xyz", not a parametrized wildcard */
+    st_eval_result_t r;
+    st_policy_eval(policy, "dd bs=10MiB", &r);
+    ASSERT(!r.matches);
+
+    st_policy_free(policy);
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
+static int test_param_validate_bad_uuid(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_policy_t *policy = st_policy_new(ctx);
+
+    /* v3 is not a valid UUID version param → treated as literal */
+    st_error_t err = st_policy_add(policy, "container #uuid.v3");
+    ASSERT(err == ST_OK);
+    /* Won't match any UUID */
+    st_eval_result_t r;
+    st_policy_eval(policy, "container 6fa459ea-ee8a-3ca4-894e-db77e160355e", &r);
+    ASSERT(!r.matches);
+
+    st_policy_free(policy);
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
+static int test_param_validate_bad_ts(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_policy_t *policy = st_policy_new(ctx);
+
+    /* "foo" is not a valid timestamp param → treated as literal */
+    st_error_t err = st_policy_add(policy, "log #ts.foo");
+    ASSERT(err == ST_OK);
+
+    st_eval_result_t r;
+    st_policy_eval(policy, "log 2025-04-24", &r);
+    ASSERT(!r.matches);
+
+    st_policy_free(policy);
+    st_policy_ctx_free(ctx);
+    return 1;
+}
 
 int main(void)
 {
@@ -1108,6 +1732,44 @@ int main(void)
     printf("\nOptions (#opt):\n");
     TEST(test_policy_opt_matching);
     TEST(test_policy_opt_matches_value);
+
+    printf("\nParametrized wildcards (#path.cfg):\n");
+    TEST(test_param_add_path_ext);
+    TEST(test_param_match_correct_ext);
+    TEST(test_param_no_match_wrong_ext);
+    TEST(test_param_unparametrized_subsumes);
+    TEST(test_param_coexist_different_ext);
+    TEST(test_param_coexist_with_unparametrized);
+    TEST(test_param_compact_subsumes);
+    TEST(test_param_compact_different_ext_keeps_both);
+    TEST(test_param_serialization_roundtrip);
+    TEST(test_param_no_extension_no_match);
+    TEST(test_param_relpath_match);
+    TEST(test_param_duplicate_add);
+    TEST(test_param_non_path_type_rejected);
+
+    printf("\nParametrized size (#size.MiB):\n");
+    TEST(test_param_size_add);
+    TEST(test_param_size_match);
+    TEST(test_param_size_coexist);
+    TEST(test_param_size_compact_keeps_both);
+    TEST(test_param_size_compact_subsumed);
+
+    printf("\nParametrized uuid/semver/timestamp:\n");
+    TEST(test_param_uuid_v4);
+    TEST(test_param_uuid_unparametrized);
+    TEST(test_param_uuid_coexist);
+    TEST(test_param_uuid_compact);
+    TEST(test_param_semver);
+    TEST(test_param_ts_date);
+    TEST(test_param_ts_time);
+    TEST(test_param_ts_datetime);
+
+    printf("\nParameter validation:\n");
+    TEST(test_param_validate_bad_path);
+    TEST(test_param_validate_bad_size);
+    TEST(test_param_validate_bad_uuid);
+    TEST(test_param_validate_bad_ts);
 
     printf("\n========================================\n");
     printf("Results: %d/%d passed, %d failed\n",

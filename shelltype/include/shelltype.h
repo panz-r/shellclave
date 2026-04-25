@@ -55,6 +55,7 @@ typedef enum {
  *   #u ⊂ *
  *
  * #f and #w are incomparable (a filename is not a word, a word is not a filename).
+ * #hash, #hyp ⊂ #w ⊂ #val ⊂ *
  * Ambiguous tokens (e.g., "Makefile" could be #w or #f) require user disambiguation.
  * ============================================================ */
 
@@ -79,6 +80,10 @@ typedef enum {
     ST_TYPE_PORT,          /* #port: port number (1-65535) */
     ST_TYPE_SIZE,          /* #size: size with suffix (10M, 2GiB) */
     ST_TYPE_SEMVER,        /* #semver: semantic version (1.2.3-alpha) */
+    ST_TYPE_TIMESTAMP,     /* #ts: ISO 8601 date/time */
+    ST_TYPE_HASH_ALGO,     /* #hash: crypto hash algorithm name */
+    ST_TYPE_ENV_VAR,       /* #env: $VAR or ${VAR} */
+    ST_TYPE_HYPHENATED,    /* #hyp: hyphenated identifier (a-b where a,b are 1+ alnum/_ chars) */
     ST_TYPE_ANY,           /* *: everything (top element) */
     ST_TYPE_COUNT          /* number of types */
 } st_token_type_t;
@@ -261,6 +266,18 @@ void st_free_tokens(char **tokens, size_t count);
  * Returns ST_TYPE_LITERAL if no wildcard type matches.
  */
 st_token_type_t st_classify_token(const char *token);
+
+/**
+ * Extract the file extension from a path (including dot).
+ * Returns NULL if no extension found.
+ */
+const char *st_path_extension(const char *text);
+
+/**
+ * Extract the size suffix from a size token.
+ * Returns pointer after last digit/dot, or NULL if no suffix.
+ */
+const char *st_size_suffix(const char *text);
 
 /* ============================================================
  * POLICY STATISTICS

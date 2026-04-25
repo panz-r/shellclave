@@ -21,7 +21,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <assert.h>
+#include <ctype.h>
 #include <errno.h>
 #include <limits.h>
 #include <stdbool.h>
@@ -275,6 +277,10 @@ static const uint32_t st_compat_mask[ST_TYPE_COUNT] = {
     /* PORT */         (1u << ST_TYPE_PORT) | (1u << ST_TYPE_NUMBER) | (1u << ST_TYPE_VALUE) | (1u << ST_TYPE_ANY),
     /* SIZE */         (1u << ST_TYPE_SIZE) | (1u << ST_TYPE_VALUE) | (1u << ST_TYPE_ANY),
     /* SEMVER */       (1u << ST_TYPE_SEMVER) | (1u << ST_TYPE_VALUE) | (1u << ST_TYPE_ANY),
+    /* TIMESTAMP */     (1u << ST_TYPE_TIMESTAMP) | (1u << ST_TYPE_VALUE) | (1u << ST_TYPE_ANY),
+    /* HASH_ALGO */    (1u << ST_TYPE_HASH_ALGO) | (1u << ST_TYPE_WORD) | (1u << ST_TYPE_VALUE) | (1u << ST_TYPE_ANY),
+    /* ENV_VAR */      (1u << ST_TYPE_ENV_VAR) | (1u << ST_TYPE_VALUE) | (1u << ST_TYPE_ANY),
+    /* HYPHENATED */    (1u << ST_TYPE_HYPHENATED) | (1u << ST_TYPE_WORD) | (1u << ST_TYPE_VALUE) | (1u << ST_TYPE_ANY),
     /* ANY */          (1u << ST_TYPE_ANY),
 };
 
@@ -321,8 +327,205 @@ static child_entry_t *find_literal_child(const policy_state_t *node,
     return bsearch(text, children, n, sizeof(child_entry_t), cmp_literal_child);
 }
 
+/* ============================================================
+ * PARAMETRIZED WILDCARD MATCHING
+ *
+ * A parametrized wildcard has the form "#path.cfg" or "#size.MiB" where:
+ *   - base type is ST_TYPE_PATH (or other path/size types)
+ *   - parameter is ".cfg" (extension) or ".MiB" (size suffix)
+ *
+ * The child entry stores the base type and full symbol text.
+ * During matching, we extract the relevant part from the command token
+ * and compare it against the wildcard's parameter.
+ * ============================================================ */
+
+/* Check if a base type supports parametrization. */
+static bool type_supports_param(st_token_type_t t)
+{
+    return t == ST_TYPE_PATH || t == ST_TYPE_ABS_PATH ||
+           t == ST_TYPE_REL_PATH || t == ST_TYPE_FILENAME ||
+           t == ST_TYPE_SIZE ||
+           t == ST_TYPE_UUID || t == ST_TYPE_SEMVER || t == ST_TYPE_TIMESTAMP;
+}
+
+/* Extract the parameter from a parametrized wildcard symbol.
+ * E.g., "#path.cfg" → ".cfg", "#size.MiB" → ".MiB", "#path" → NULL. */
+static const char *wildcard_param(const char *wild_text, st_token_type_t wild_type)
+{
+    if (!wild_text || !type_supports_param(wild_type)) return NULL;
+    const char *sym = st_type_symbol[wild_type];
+    size_t sym_len = strlen(sym);
+    if (strncmp(wild_text, sym, sym_len) != 0) return NULL;
+    if (wild_text[sym_len] == '.' && wild_text[sym_len + 1] != '\0')
+        return wild_text + sym_len;  /* includes the dot */
+    return NULL;
+}
+
+/* Extract the file extension from a path (including dot).
+ * "/etc/app.cfg" → ".cfg", "app" → NULL. */
+const char *st_path_extension(const char *text)
+{
+    if (!text) return NULL;
+    const char *dot = strrchr(text, '.');
+    if (!dot || dot == text) return NULL;
+    if (dot[1] == '\0') return NULL;
+    if (strchr(dot, '/') != NULL) return NULL;
+    return dot;
+}
+
+/* Extract the size suffix from a size token.
+ * "10MiB" → "MiB", "2G" → "G", "42" → NULL.
+ * Returns pointer into the token after the last digit/dot. */
+const char *st_size_suffix(const char *text)
+{
+    if (!text) return NULL;
+    const char *p = text;
+    /* skip optional negative sign */
+    if (*p == '-') p++;
+    /* skip digits and dots */
+    while (*p && (isdigit((unsigned char)*p) || *p == '.')) p++;
+    if (*p == '\0') return NULL;  /* no suffix */
+    return p;
+}
+
+/* ============================================================
+ * PARAMETER VALIDATION
+ *
+ * Called from parse_pattern() to reject malformed parameters.
+ * Returns true if the parameter is valid for the given base type.
+ * ============================================================ */
+
+static bool validate_param(st_token_type_t base_type, const char *param)
+{
+    /* param includes the leading dot: ".cfg", ".MiB" etc. */
+    if (!param || param[0] != '.' || param[1] == '\0') return false;
+    const char *p = param + 1;  /* skip dot */
+
+    switch (base_type) {
+    case ST_TYPE_PATH:
+    case ST_TYPE_ABS_PATH:
+    case ST_TYPE_REL_PATH:
+    case ST_TYPE_FILENAME:
+        /* Alphanumeric, dots, and hyphens allowed; no spaces or slashes */
+        for (; *p; p++) {
+            if (!isalnum((unsigned char)*p) && *p != '.' && *p != '-' && *p != '_')
+                return false;
+        }
+        return true;
+
+    case ST_TYPE_SIZE: {
+        /* Must be a known size suffix (case-insensitive) */
+        static const char *size_params[] = {
+            "K", "M", "G", "T", "Ki", "Mi", "Gi", "Ti",
+            "KB", "MB", "GB", "TB", "B", "b", "bytes",
+            "KiB", "MiB", "GiB", "TiB"
+        };
+        for (size_t i = 0; i < sizeof(size_params)/sizeof(size_params[0]); i++) {
+            if (strcasecmp(p, size_params[i]) == 0) return true;
+        }
+        return false;
+    }
+
+    case ST_TYPE_UUID:
+        return strcasecmp(p, "v4") == 0 || strcasecmp(p, "v5") == 0 ||
+               strcmp(p, "4") == 0 || strcmp(p, "5") == 0;
+
+    case ST_TYPE_SEMVER:
+        return strcasecmp(p, "major") == 0 || strcasecmp(p, "minor") == 0 ||
+               strcasecmp(p, "patch") == 0 || strcmp(p, "*") == 0;
+
+    case ST_TYPE_TIMESTAMP:
+        return strcasecmp(p, "date") == 0 || strcasecmp(p, "time") == 0 ||
+               strcasecmp(p, "datetime") == 0;
+
+    default:
+        return false;
+    }
+}
+
+/* ============================================================
+ * PARAMETRIZED MATCHING
+ * ============================================================ */
+
+/* Check if a command token matches a (possibly parametrized) wildcard child.
+ * Returns true for non-parametrized wildcards (text == NULL or no parameter). */
+static bool param_matches(const char *cmd_text, st_token_type_t cmd_type,
+                          const char *wild_text, st_token_type_t wild_type)
+{
+    const char *wparam = wildcard_param(wild_text, wild_type);
+    if (!wparam) return true;  /* non-parametrized → any match */
+
+    if (wild_type == ST_TYPE_PATH || wild_type == ST_TYPE_ABS_PATH ||
+        wild_type == ST_TYPE_REL_PATH || wild_type == ST_TYPE_FILENAME) {
+        /* Path types: match by file extension */
+        if (cmd_type != ST_TYPE_ABS_PATH && cmd_type != ST_TYPE_REL_PATH &&
+            cmd_type != ST_TYPE_FILENAME && cmd_type != ST_TYPE_PATH)
+            return false;
+        if (!cmd_text) return false;
+        const char *cmd_ext = st_path_extension(cmd_text);
+        if (!cmd_ext) return false;
+        return strcmp(cmd_ext, wparam) == 0;
+    }
+
+    if (wild_type == ST_TYPE_SIZE) {
+        /* Size type: match by suffix (case-insensitive) */
+        if (cmd_type != ST_TYPE_SIZE) return false;
+        if (!cmd_text) return false;
+        const char *cmd_suf = st_size_suffix(cmd_text);
+        if (!cmd_suf) return false;
+        /* wparam includes leading dot: ".MiB" — compare after the dot */
+        return strcasecmp(cmd_suf, wparam + 1) == 0;
+    }
+
+    if (wild_type == ST_TYPE_UUID) {
+        /* UUID: match by version digit */
+        if (cmd_type != ST_TYPE_UUID) return false;
+        if (!cmd_text) return false;
+        /* UUID format: xxxxxxxx-xxxx-Vxxx-xxxx-xxxxxxxxxxxx (V at position 14) */
+        size_t len = strlen(cmd_text);
+        if (len != 36 || cmd_text[8] != '-' || cmd_text[13] != '-' ||
+            cmd_text[18] != '-' || cmd_text[23] != '-')
+            return false;
+        char version = cmd_text[14];
+        /* wparam is ".v4" or ".4" — accept both */
+        const char *expected = wparam + 1;  /* skip dot */
+        if (tolower((unsigned char)expected[0]) == 'v') expected++;
+        return version == expected[0] && expected[1] == '\0';
+    }
+
+    if (wild_type == ST_TYPE_SEMVER) {
+        /* Semver: parameter is informational, matches any semver */
+        return cmd_type == ST_TYPE_SEMVER;
+    }
+
+    if (wild_type == ST_TYPE_TIMESTAMP) {
+        /* Timestamp: match by format */
+        if (cmd_type != ST_TYPE_TIMESTAMP) return false;
+        if (!cmd_text) return false;
+        size_t len = strlen(cmd_text);
+        const char *fmt = wparam + 1;  /* skip dot */
+        if (strcasecmp(fmt, "date") == 0) {
+            /* YYYY-MM-DD: exactly 10 chars, '-' at 4 and 7 */
+            return len == 10 && cmd_text[4] == '-' && cmd_text[7] == '-';
+        }
+        if (strcasecmp(fmt, "time") == 0) {
+            /* HH:MM:SS: exactly 8 chars, ':' at 2 and 5 */
+            return len == 8 && cmd_text[2] == ':' && cmd_text[5] == ':';
+        }
+        if (strcasecmp(fmt, "datetime") == 0) {
+            /* Combined: at least 19 chars with T or space separator */
+            return len >= 19 && (cmd_text[10] == 'T' || cmd_text[10] == ' ');
+        }
+        return true;  /* unknown format → accept any timestamp */
+    }
+
+    return true;
+}
+
 static child_entry_t *find_wildcard_child(const policy_state_t *node,
-                                         const char *arena_base, st_token_type_t type)
+                                         const char *arena_base,
+                                         st_token_type_t type,
+                                         const char *cmd_text)
 {
     if (node->wildcard_count == 0 || !arena_base) return NULL;
     assert(node->literal_count + node->wildcard_count <= node->children_alloc);
@@ -331,7 +534,9 @@ static child_entry_t *find_wildcard_child(const policy_state_t *node,
     child_entry_t *children = (child_entry_t *)(arena_base + node->children_offset);
     child_entry_t *base = children + node->literal_count;
     for (uint16_t i = 0; i < node->wildcard_count; i++) {
-        if (st_is_compatible(type, (st_token_type_t)base[i].type)) return &base[i];
+        if (st_is_compatible(type, (st_token_type_t)base[i].type) &&
+            param_matches(cmd_text, type, base[i].text, (st_token_type_t)base[i].type))
+            return &base[i];
     }
     return NULL;
 }
@@ -365,11 +570,24 @@ static bool insert_child(policy_state_t *node, st_policy_t *policy,
             if (type < children[i].type) break;
             insert_pos = i + 1;
         }
-        if (insert_pos < total && children[insert_pos].type == type) return false;
+        /* Duplicate check: same base type AND same text (handles parametrized) */
+        if (insert_pos < total && children[insert_pos].type == type) {
+            bool is_param = text && strchr(text, '.');
+            if (!is_param) return false;  /* non-parametrized: same type = dup */
+            /* Parametrized: check if same parameter */
+            if (children[insert_pos].text != NULL && text != NULL &&
+                strcmp(children[insert_pos].text, text) == 0) return false;
+        }
     }
     assert(insert_pos <= total);
 
-    const char *interned = is_literal ? st_policy_ctx_intern(policy->ctx, text) : NULL;
+    const char *interned;
+    if (is_literal) {
+        interned = st_policy_ctx_intern(policy->ctx, text);
+    } else {
+        /* Store full symbol for parametrized wildcards (e.g., "#path.cfg") */
+        interned = (text && strchr(text, '.')) ? st_policy_ctx_intern(policy->ctx, text) : NULL;
+    }
     child_entry_t new_child = { .text = interned, .target = target, .type = (uint8_t)type };
 
     if (total + 1 > node->children_alloc) {
@@ -452,7 +670,20 @@ static st_token_t *parse_pattern(const char *pattern, size_t *out_count)
     while (tok && ti < count) {
         st_token_type_t type = ST_TYPE_LITERAL;
         for (int t = 1; t < ST_TYPE_COUNT; t++) {
-            if (strcmp(tok, st_type_symbol[t]) == 0) {
+            const char *sym = st_type_symbol[t];
+            size_t sym_len = strlen(sym);
+            if (strncmp(tok, sym, sym_len) == 0 && tok[sym_len] == '\0') {
+                /* Exact match: e.g., "#path" */
+                type = (st_token_type_t)t;
+                break;
+            }
+            if (strncmp(tok, sym, sym_len) == 0 && tok[sym_len] == '.' &&
+                tok[sym_len + 1] != '\0' && type_supports_param((st_token_type_t)t)) {
+                /* Parametrized match: e.g., "#path.cfg" — validate parameter */
+                if (!validate_param((st_token_type_t)t, tok + sym_len)) {
+                    /* Invalid parameter — treat as literal */
+                    break;
+                }
                 type = (st_token_type_t)t;
                 break;
             }
@@ -489,12 +720,16 @@ static void free_pattern_tokens(st_token_t *tokens, size_t count)
  * B subsumes A iff every command accepted by A is also accepted by B.
  * Requires same length and each token of A compatible with B.
  * For literals, values must match exactly.
+ * For parametrized wildcards:
+ *   - #path subsumes #path.cfg (generic subsumes specific)
+ *   - #path.cfg does NOT subsume #path (specific does not subsume generic)
+ *   - #path.cfg does NOT subsume #path.log (different params are incomparable)
  */
 static bool pattern_subsumes(const st_token_t *a, size_t a_len,
                             const st_token_t *b, size_t b_len)
 {
     if (a_len != b_len) return false;
-    
+
     for (size_t i = 0; i < a_len; i++) {
         /* For literals, values must match exactly */
         if (a[i].type == ST_TYPE_LITERAL && b[i].type == ST_TYPE_LITERAL) {
@@ -502,6 +737,19 @@ static bool pattern_subsumes(const st_token_t *a, size_t a_len,
         } else {
             /* For wildcard compatibility, use the type lattice */
             if (!st_is_compatible(a[i].type, b[i].type)) return false;
+            /* Parametrized wildcard subsumption check */
+            const char *a_param = wildcard_param(a[i].text, a[i].type);
+            const char *b_param = wildcard_param(b[i].text, b[i].type);
+            if (a_param && b_param) {
+                /* Both parametrized: must have same parameter */
+                if (strcmp(a_param, b_param) != 0) return false;
+            } else if (a_param && !b_param) {
+                /* a is parametrized, b is not: b subsumes a (OK) */
+            } else if (!a_param && b_param) {
+                /* a is not parametrized, b is: b is more specific, cannot subsume a */
+                return false;
+            }
+            /* else: neither parametrized, type compatibility already checked */
         }
     }
     return true;
@@ -732,7 +980,7 @@ static st_error_t st_policy_add_locked(st_policy_t *policy, const char *pattern)
         if (tokens[i].type == ST_TYPE_LITERAL) {
             existing = find_literal_child(node, arena_base, tokens[i].text);
         } else {
-            existing = find_wildcard_child(node, arena_base, tokens[i].type);
+            existing = find_wildcard_child(node, arena_base, tokens[i].type, tokens[i].text);
         }
 
         if (existing) {
@@ -832,7 +1080,7 @@ st_error_t st_policy_remove(st_policy_t *policy, const char *pattern)
         if (tokens[i].type == ST_TYPE_LITERAL) {
             child = find_literal_child(node, arena_base, tokens[i].text);
         } else {
-            child = find_wildcard_child(node, arena_base, tokens[i].type);
+            child = find_wildcard_child(node, arena_base, tokens[i].type, tokens[i].text);
         }
         if (!child) {
             free_pattern_tokens(tokens, token_count);
@@ -1055,21 +1303,30 @@ size_t st_policy_count(const st_policy_t *policy)
     return policy->pattern_count;
 }
 
-/* Build a pattern string from typed tokens into a fixed-size buffer.
- * 
- * Special handling for first token: always output as literal to avoid
- * suggesting wildcards like #p for the command/binary name itself.
- * e.g., /bin/sh -c 'git diff' should suggest '/bin/sh -c #qs' not '#p -c #qs' */
+/* ============================================================
+ * VERIFICATION + SUGGESTIONS (unified)
+ * ============================================================ */
+
+/* Select the display text for a token: use the original text for
+ * parametrized wildcards (e.g., "#path.cfg"), otherwise use the
+ * type symbol for plain wildcards. */
+static const char *token_display_text(const st_token_t *tok)
+{
+    if (tok->type == ST_TYPE_LITERAL)
+        return tok->text;
+    /* If text contains a parameter (e.g., "#path.cfg"), use it */
+    if (tok->text && strchr(tok->text, '.') && type_supports_param(tok->type))
+        return tok->text;
+    return st_type_symbol[tok->type];
+}
+
+/* Build a pattern string from typed tokens into a fixed-size buffer. */
 static bool st_build_pattern(char *buf, size_t buf_size,
                                  const st_token_t *tokens, size_t count)
 {
     size_t total_len = 0;
     for (size_t i = 0; i < count; i++) {
-        /* First token (command/binary) is always output as literal */
-        const char *part = (i == 0) ? tokens[i].text
-                                     : (tokens[i].type == ST_TYPE_LITERAL
-                                            ? tokens[i].text
-                                            : st_type_symbol[tokens[i].type]);
+        const char *part = token_display_text(&tokens[i]);
         total_len += strlen(part) + (i > 0 ? 1 : 0);
     }
     if (total_len + 1 > buf_size) return false;
@@ -1077,11 +1334,7 @@ static bool st_build_pattern(char *buf, size_t buf_size,
     char *p = buf;
     for (size_t i = 0; i < count; i++) {
         if (i > 0) *p++ = ' ';
-        /* First token (command/binary) is always output as literal */
-        const char *part = (i == 0) ? tokens[i].text
-                                    : (tokens[i].type == ST_TYPE_LITERAL
-                                           ? tokens[i].text
-                                           : st_type_symbol[tokens[i].type]);
+        const char *part = token_display_text(&tokens[i]);
         size_t len = strlen(part);
         memcpy(p, part, len);
         p += len;
@@ -1233,7 +1486,7 @@ st_error_t st_policy_eval(st_policy_t *policy,
         if (!found) {
             uint32_t compat = compat_mask(ctype) & node->wildcard_mask;
             if (compat)
-                found = find_wildcard_child(node, arena_base, ctype);
+                found = find_wildcard_child(node, arena_base, ctype, ctext);
         }
 
         if (!found) break;
@@ -1397,6 +1650,90 @@ st_error_t st_policy_eval(st_policy_t *policy,
                     result->suggestions[1].confidence = confidence;
                     free(pat_tokens);
                     n_suggestions = 2;
+
+                    /* Refinement: if all literal children share a common extension
+                     * (paths) or suffix (sizes), suggest the parametrized wildcard
+                     * instead of the generic one. */
+                    if (n_suggestions == 2 && type_supports_param(joined)) {
+                        const char *common_param = NULL;
+                        bool all_match = true;
+                        uint16_t n_literals = 0;
+
+                        for (uint16_t i = 0; i < total && all_match; i++) {
+                            child_entry_t *c = &children[i];
+                            if (c->type != ST_TYPE_LITERAL) continue;
+                            n_literals++;
+
+                            const char *ext = NULL;
+                            if (joined == ST_TYPE_PATH || joined == ST_TYPE_ABS_PATH ||
+                                joined == ST_TYPE_REL_PATH || joined == ST_TYPE_FILENAME) {
+                                ext = st_path_extension(c->text);
+                            } else if (joined == ST_TYPE_SIZE) {
+                                const char *suf = st_size_suffix(c->text);
+                                if (suf) {
+                                    static char sufbuf[32];
+                                    size_t slen = strlen(suf);
+                                    if (slen + 1 < sizeof(sufbuf)) {
+                                        sufbuf[0] = '.';
+                                        memcpy(sufbuf + 1, suf, slen + 1);
+                                        ext = sufbuf;
+                                    }
+                                }
+                            }
+
+                            if (!ext) { all_match = false; break; }
+                            if (!common_param) common_param = ext;
+                            else if (strcmp(ext, common_param) != 0) { all_match = false; break; }
+                        }
+
+                        /* Also check the divergent command token */
+                        if (all_match && common_param && n_literals >= LITERAL_THRESHOLD) {
+                            const char *cmd_ext = NULL;
+                            if (joined == ST_TYPE_PATH || joined == ST_TYPE_ABS_PATH ||
+                                joined == ST_TYPE_REL_PATH || joined == ST_TYPE_FILENAME) {
+                                cmd_ext = st_path_extension(cmd.tokens[match_depth].text);
+                            } else if (joined == ST_TYPE_SIZE) {
+                                const char *suf = st_size_suffix(cmd.tokens[match_depth].text);
+                                if (suf) {
+                                    static char csufbuf[32];
+                                    size_t slen = strlen(suf);
+                                    if (slen + 1 < sizeof(csufbuf)) {
+                                        csufbuf[0] = '.';
+                                        memcpy(csufbuf + 1, suf, slen + 1);
+                                        cmd_ext = csufbuf;
+                                    }
+                                }
+                            }
+                            if (!cmd_ext || strcmp(cmd_ext, common_param) != 0)
+                                all_match = false;
+                        }
+
+                        if (all_match && common_param && n_literals >= LITERAL_THRESHOLD) {
+                            /* Build parametrized wildcard symbol */
+                            char param_sym[64];
+                            snprintf(param_sym, sizeof(param_sym), "%s%s",
+                                     st_type_symbol[joined], common_param);
+
+                            size_t pat_len2 = cmd.count;
+                            st_token_t *pat_tokens2 = malloc(pat_len2 * sizeof(st_token_t));
+                            if (pat_tokens2) {
+                                for (size_t i = 0; i < match_depth; i++) {
+                                    pat_tokens2[i].text = (char *)cmd.tokens[i].text;
+                                    pat_tokens2[i].type = cmd.tokens[i].type;
+                                }
+                                pat_tokens2[match_depth].text = param_sym;
+                                pat_tokens2[match_depth].type = joined;
+                                for (size_t i = match_depth + 1; i < cmd.count; i++) {
+                                    pat_tokens2[i].text = (char *)cmd.tokens[i].text;
+                                    pat_tokens2[i].type = cmd.tokens[i].type;
+                                }
+                                st_build_pattern(result->suggestions[1].pattern,
+                                                sizeof(result->suggestions[1].pattern),
+                                                pat_tokens2, pat_len2);
+                                free(pat_tokens2);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1510,7 +1847,7 @@ st_error_t st_policy_verify_all(const st_policy_t *policy,
         while (compat) {
             int t = __builtin_ctz(compat);
             compat &= ~(1u << t);
-            child_entry_t *c = find_wildcard_child(state, arena_base, (st_token_type_t)t);
+            child_entry_t *c = find_wildcard_child(state, arena_base, (st_token_type_t)t, ctext);
             if (c) {
                 size_t next_tail = (tail + 1) % VERIFY_ALL_RING_CAP;
                 if (next_tail == head) {
@@ -2113,12 +2450,12 @@ st_error_t st_policy_simulate_add(const st_policy_t *policy,
  * POLICY EXPANSION SUGGESTIONS (Miner — Step 2 only)
  * ============================================================ */
 
-/* 
+/*
  * Next-wider type in the lattice, capped appropriately.
- * 
+ *
  * Security: We cap generalization at reasonable types to prevent
  * over-broad suggestions. Path types stay as #path, others may go to #w.
- * 
+ *
  * Type hierarchy (with caps):
  *   #h → #n → #val → #w (cap)
  *   #i → #val → #w (cap)
@@ -2129,8 +2466,9 @@ st_error_t st_policy_simulate_add(const st_policy_t *policy,
  *   #u → #w (cap)
  *   #val → #val (cap)
  *   #opt → #val → * (cap)
- *   #uuid, #email, #host, #size, #semver → #val → * (cap)
+ *   #uuid, #email, #host, #size, #semver, #ts, #env → #val → * (cap)
  *   #port → #n → #val → * (cap)
+ *   #hash, #hyp → #word → #val → * (cap)
  */
 static st_token_type_t next_wider_type(st_token_type_t t)
 {
@@ -2150,12 +2488,16 @@ static st_token_type_t next_wider_type(st_token_type_t t)
         case ST_TYPE_OPT:         return ST_TYPE_VALUE; /* Cap: #opt → #val */
         case ST_TYPE_UUID:        return ST_TYPE_VALUE; /* Cap: #uuid → #val */
         case ST_TYPE_EMAIL:       return ST_TYPE_VALUE; /* Cap: #email → #val */
-        case ST_TYPE_HOSTNAME:     return ST_TYPE_VALUE; /* Cap: #host → #val */
+        case ST_TYPE_HOSTNAME:    return ST_TYPE_VALUE; /* Cap: #host → #val */
         case ST_TYPE_PORT:        return ST_TYPE_NUMBER; /* Cap: #port → #n */
         case ST_TYPE_SIZE:        return ST_TYPE_VALUE; /* Cap: #size → #val */
         case ST_TYPE_SEMVER:      return ST_TYPE_VALUE; /* Cap: #semver → #val */
-        case ST_TYPE_ANY:         return ST_TYPE_ANY;  /* Already at top */
-        default:                   return t;
+        case ST_TYPE_TIMESTAMP:   return ST_TYPE_VALUE; /* Cap: #ts → #val */
+        case ST_TYPE_HASH_ALGO:   return ST_TYPE_WORD;   /* Cap: #hash → #word */
+        case ST_TYPE_ENV_VAR:     return ST_TYPE_VALUE;  /* Cap: #env → #val */
+        case ST_TYPE_HYPHENATED:  return ST_TYPE_WORD;   /* Cap: #hyp → #word */
+        case ST_TYPE_ANY:         return ST_TYPE_ANY;    /* Already at top */
+        default:                  return t;
     }
 }
 

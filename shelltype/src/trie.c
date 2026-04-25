@@ -14,6 +14,16 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
+#include <ctype.h>
+
+/* Check if a type supports parametrized wildcards.
+ * Mirrors type_supports_param() in policy.c. */
+static bool trie_type_supports_param(st_token_type_t t)
+{
+    return t == ST_TYPE_PATH || t == ST_TYPE_ABS_PATH ||
+           t == ST_TYPE_REL_PATH || t == ST_TYPE_FILENAME ||
+           t == ST_TYPE_SIZE;
+}
 
 /* ============================================================
  * STRING BUFFER — reusable scratch for suggestion building
@@ -161,6 +171,17 @@ static bool trie_insert_with_count(st_node_t *root,
         /* Track observed types at this position */
         if (tokens[i].type != ST_TYPE_LITERAL) {
             child->observed_types |= (1u << tokens[i].type);
+            /* Store original value as sample (for parametrized suggestions) */
+            if (child->num_samples < ST_MAX_SAMPLE_VALUES) {
+                char **new_vals = realloc(child->sample_values,
+                    (child->num_samples + 1) * sizeof(char *));
+                if (new_vals) {
+                    child->sample_values = new_vals;
+                    child->sample_values[child->num_samples] = strdup(tokens[i].text);
+                    if (child->sample_values[child->num_samples])
+                        child->num_samples++;
+                }
+            }
         }
         current = child;
     }
@@ -348,6 +369,39 @@ static void dfs_collect(st_node_t *node, const char **path, size_t depth,
                     snprintf(effective_token, sizeof(effective_token), "%s",
                              st_type_symbol[joined]);
                     pattern_tokens[depth - 1] = effective_token;
+
+                    /* Check if all sample values share a common extension/suffix
+                     * for parametrized wildcard suggestion */
+                    if (node->num_samples >= 2 && trie_type_supports_param(joined)) {
+                        const char *common_ext = NULL;
+                        bool all_same = true;
+
+                        for (size_t s = 0; s < node->num_samples && all_same; s++) {
+                            const char *ext = NULL;
+                            if (joined == ST_TYPE_PATH || joined == ST_TYPE_ABS_PATH ||
+                                joined == ST_TYPE_REL_PATH || joined == ST_TYPE_FILENAME) {
+                                ext = st_path_extension(node->sample_values[s]);
+                            } else if (joined == ST_TYPE_SIZE) {
+                                const char *suf = st_size_suffix(node->sample_values[s]);
+                                if (suf) {
+                                    static char sufbuf[32];
+                                    size_t slen = strlen(suf);
+                                    if (slen + 1 < sizeof(sufbuf)) {
+                                        sufbuf[0] = '.';
+                                        memcpy(sufbuf + 1, suf, slen + 1);
+                                        ext = sufbuf;
+                                    }
+                                }
+                            }
+                            if (!ext) { all_same = false; break; }
+                            if (!common_ext) common_ext = ext;
+                            else if (strcmp(ext, common_ext) != 0) all_same = false;
+                        }
+
+                        if (all_same && common_ext)
+                            snprintf(effective_token, sizeof(effective_token), "%s%s",
+                                     st_type_symbol[joined], common_ext);
+                    }
                 }
             }
 

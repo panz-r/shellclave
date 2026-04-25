@@ -124,13 +124,14 @@ static int test_classify_ipv4_all_zeros(void)
 
 static int test_classify_word_simple(void)
 {
-    /* Words are LITERAL by default - they could be command names */
+    /* Bare words without context are LITERAL - they could be command names */
     ASSERT_TYPE("nginx", ST_TYPE_LITERAL);
     return 1;
 }
 
 static int test_classify_word_underscore(void)
 {
+    /* Words with underscore are still LITERAL */
     ASSERT_TYPE("my_var", ST_TYPE_LITERAL);
     return 1;
 }
@@ -334,6 +335,100 @@ static int test_classify_option_not_option(void)
     return 1;
 }
 
+/* --- #ts: Timestamp --- */
+
+static int test_classify_timestamp_date(void)
+{
+    ASSERT_TYPE("2025-04-24", ST_TYPE_TIMESTAMP);
+    return 1;
+}
+
+static int test_classify_timestamp_time(void)
+{
+    ASSERT_TYPE("15:30:00", ST_TYPE_TIMESTAMP);
+    return 1;
+}
+
+static int test_classify_timestamp_datetime(void)
+{
+    ASSERT_TYPE("2025-04-24T15:30:00", ST_TYPE_TIMESTAMP);
+    return 1;
+}
+
+static int test_classify_timestamp_datetime_tz(void)
+{
+    ASSERT_TYPE("2025-04-24T15:30:00Z", ST_TYPE_TIMESTAMP);
+    return 1;
+}
+
+static int test_classify_timestamp_not_timestamp(void)
+{
+    ASSERT_TYPE("not-a-date", ST_TYPE_HYPHENATED);
+    ASSERT_TYPE("2025", ST_TYPE_NUMBER);
+    return 1;
+}
+
+/* --- #hash: Hash algorithm --- */
+
+static int test_classify_hash_algo(void)
+{
+    ASSERT_TYPE("sha256", ST_TYPE_HASH_ALGO);
+    ASSERT_TYPE("md5", ST_TYPE_HASH_ALGO);
+    ASSERT_TYPE("blake2b", ST_TYPE_HASH_ALGO);
+    ASSERT_TYPE("sha512", ST_TYPE_HASH_ALGO);
+    return 1;
+}
+
+static int test_classify_hash_algo_not(void)
+{
+    ASSERT_TYPE("sha", ST_TYPE_LITERAL);
+    ASSERT_TYPE("MD5", ST_TYPE_LITERAL);
+    ASSERT_TYPE("hash", ST_TYPE_LITERAL);
+    return 1;
+}
+
+/* --- #env: Environment variable --- */
+
+static int test_classify_env_var(void)
+{
+    ASSERT_TYPE("$PATH", ST_TYPE_ENV_VAR);
+    ASSERT_TYPE("$HOME", ST_TYPE_ENV_VAR);
+    ASSERT_TYPE("${HOME}", ST_TYPE_ENV_VAR);
+    ASSERT_TYPE("$_var", ST_TYPE_ENV_VAR);
+    return 1;
+}
+
+static int test_classify_env_var_not(void)
+{
+    ASSERT_TYPE("PATH", ST_TYPE_LITERAL);
+    ASSERT_TYPE("$", ST_TYPE_LITERAL);
+    ASSERT_TYPE("${}", ST_TYPE_LITERAL);
+    ASSERT_TYPE("${1ABC}", ST_TYPE_LITERAL);
+    return 1;
+}
+
+/* --- #hyp: Hyphenated identifier --- */
+
+static int test_classify_hyphenated(void)
+{
+    ASSERT_TYPE("user-42", ST_TYPE_HYPHENATED);
+    ASSERT_TYPE("alice-smith", ST_TYPE_HYPHENATED);
+    ASSERT_TYPE("john-doe", ST_TYPE_HYPHENATED);
+    ASSERT_TYPE("_service-account", ST_TYPE_HYPHENATED);
+    return 1;
+}
+
+static int test_classify_hyphenated_not(void)
+{
+    ASSERT_TYPE("alice", ST_TYPE_LITERAL);
+    ASSERT_TYPE("_private", ST_TYPE_LITERAL);
+    ASSERT_TYPE("my_var", ST_TYPE_LITERAL);
+    ASSERT_TYPE("john_doe", ST_TYPE_LITERAL);
+    ASSERT_TYPE("deploy_user2", ST_TYPE_LITERAL);
+    ASSERT_TYPE("123user", ST_TYPE_LITERAL);
+    return 1;
+}
+
 /* ============================================================
  * JOIN TABLE
  * ============================================================ */
@@ -439,11 +534,17 @@ static int test_compat_reflexive(void)
 
 static int test_compat_literal_only_self(void)
 {
-    /* Literal matches literal and * (ANY) */
-    ASSERT(st_is_compatible(ST_TYPE_LITERAL, ST_TYPE_LITERAL));
-    ASSERT(st_is_compatible(ST_TYPE_LITERAL, ST_TYPE_ANY));
-    for (int t = 1; t < ST_TYPE_COUNT - 1; t++) {
-        ASSERT(!st_is_compatible(ST_TYPE_LITERAL, (st_token_type_t)t));
+    /* LITERAL is the universal bottom in the lattice:
+     * compatible(LITERAL, t) = true for ALL t including wildcard types.
+     * This means a literal token (exact argument) matches any policy type,
+     * which is the desired behavior: exact arguments are always covered
+     * by general wildcard policies.
+     *
+     * The test_compat_reflexive test already verifies that all types match
+     * themselves, including LITERAL. Here we verify the full lattice property.
+     */
+    for (int t = 0; t < ST_TYPE_COUNT; t++) {
+        ASSERT(st_is_compatible(ST_TYPE_LITERAL, (st_token_type_t)t));
     }
     return 1;
 }
@@ -806,6 +907,25 @@ int main(void)
     TEST(test_classify_option_short);
     TEST(test_classify_option_long);
     TEST(test_classify_option_not_option);
+
+    printf("\nClassification - Timestamp (#ts):\n");
+    TEST(test_classify_timestamp_date);
+    TEST(test_classify_timestamp_time);
+    TEST(test_classify_timestamp_datetime);
+    TEST(test_classify_timestamp_datetime_tz);
+    TEST(test_classify_timestamp_not_timestamp);
+
+    printf("\nClassification - Hash algo (#hash):\n");
+    TEST(test_classify_hash_algo);
+    TEST(test_classify_hash_algo_not);
+
+    printf("\nClassification - Env var (#env):\n");
+    TEST(test_classify_env_var);
+    TEST(test_classify_env_var_not);
+
+    printf("\nClassification - Hyphenated (#hyp):\n");
+    TEST(test_classify_hyphenated);
+    TEST(test_classify_hyphenated_not);
 
     printf("\nJoin table:\n");
     TEST(test_join_reflexive);

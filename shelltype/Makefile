@@ -4,6 +4,15 @@ CC      ?= gcc
 CFLAGS  := -Wall -Wextra -Werror -pedantic -std=c11 -O2 -g
 LDFLAGS :=
 
+# Regenerate normalize.c tables from declarative lattice definition.
+# Usage: make gen-tables
+gen-tables:
+	@echo "Regenerating normalize.c tables..."
+	@python3 tools/gen_lattice_tables.py > /tmp/gen_out.txt
+	@python3 -c 'import sys; c=open("src/normalize.c").read(); g=open("/tmp/gen_out.txt").read(); o_start=c.find("/* ============================================================\n * JOIN TABLE"); o_end=c.find("/* ============================================================\n * CLASSIFICATION HELPERS"); g_start=g.find("/* ============================================================\n * JOIN TABLE"); g_end=g.find("/* ============================================================\n * CLASSIFICATION HELPERS"); sys.stdout.write(c[:o_start]+g[g_start:g_end]+"\n"+c[o_end:])' > /tmp/normalize_new.c
+	@mv /tmp/normalize_new.c src/normalize.c
+	@echo "Done. Review changes with: git diff src/normalize.c"
+
 INCLUDES := -Iinclude
 
 SRCDIR  := src

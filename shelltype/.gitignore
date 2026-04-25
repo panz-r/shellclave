@@ -1,6 +1,7 @@
 # Build artifacts
 obj/
 shelltype-tool
+tools/__pycache__/
 
 # Test artifacts
 tests/test_cpl
