@@ -183,50 +183,141 @@ static uint32_t states_array_alloc(states_array_t *a)
 }
 
 /* ============================================================
- * PATTERN REGISTRY
+ * PATTERN REGISTRY (entry-based with token storage)
  * ============================================================ */
 
+/* Forward declaration — defined after parse_pattern */
+static void free_pattern_tokens(st_token_t *tokens, size_t count);
+
 typedef struct {
-    const char **strings;
-    size_t       count;
-    size_t       capacity;
+    const char   *pattern;      /* interned string */
+    st_token_t   *tokens;       /* malloc'd parsed tokens (NULL if inactive) */
+    size_t        token_count;
+    bool          active;
+} pattern_entry_t;
+
+typedef struct {
+    pattern_entry_t *entries;
+    size_t           count;
+    size_t           capacity;
 } pattern_reg_t;
 
 static bool pattern_reg_init(pattern_reg_t *r)
 {
     r->capacity = PATTERN_REG_INIT;
-    r->strings = calloc(r->capacity, sizeof(const char *));
-    if (!r->strings) return false;
+    r->entries = calloc(r->capacity, sizeof(pattern_entry_t));
+    if (!r->entries) return false;
     r->count = 0;
     return true;
 }
 
 static void pattern_reg_free(pattern_reg_t *r)
 {
-    free((void *)r->strings);
-    r->strings = NULL;
+    if (!r->entries) return;
+    for (size_t i = 0; i < r->count; i++) {
+        if (r->entries[i].tokens) {
+            free_pattern_tokens(r->entries[i].tokens, r->entries[i].token_count);
+            r->entries[i].tokens = NULL;
+        }
+    }
+    free(r->entries);
+    r->entries = NULL;
 }
 
 static bool pattern_reg_grow(pattern_reg_t *r)
 {
     size_t new_cap = r->capacity * 2;
-    const char **new_strings = realloc((void *)r->strings, new_cap * sizeof(const char *));
-    if (!new_strings) return false;
-    r->strings = new_strings;
+    pattern_entry_t *new_entries = realloc(r->entries, new_cap * sizeof(pattern_entry_t));
+    if (!new_entries) return false;
+    memset(new_entries + r->capacity, 0, (new_cap - r->capacity) * sizeof(pattern_entry_t));
+    r->entries = new_entries;
     r->capacity = new_cap;
     return true;
 }
 
-static uint16_t pattern_reg_add(pattern_reg_t *r, st_policy_ctx_t *ctx, const char *pattern)
+static uint16_t pattern_reg_add(pattern_reg_t *r, st_policy_ctx_t *ctx,
+                                const char *pattern,
+                                st_token_t *tokens, size_t token_count)
 {
     if (r->count >= r->capacity) {
         if (!pattern_reg_grow(r)) return UINT16_MAX;
     }
     const char *interned = st_policy_ctx_intern(ctx, pattern);
     if (!interned) return UINT16_MAX;
+
+    /* Deep-copy the tokens array */
+    st_token_t *tok_copy = calloc(token_count, sizeof(st_token_t));
+    if (!tok_copy) return UINT16_MAX;
+    for (size_t i = 0; i < token_count; i++) {
+        tok_copy[i].text = strdup(tokens[i].text);
+        if (!tok_copy[i].text) {
+            for (size_t k = 0; k < i; k++) free(tok_copy[k].text);
+            free(tok_copy);
+            return UINT16_MAX;
+        }
+        tok_copy[i].type = tokens[i].type;
+    }
+
     uint16_t id = (uint16_t)r->count;
-    r->strings[r->count++] = interned;
+    r->entries[id].pattern = interned;
+    r->entries[id].tokens = tok_copy;
+    r->entries[id].token_count = token_count;
+    r->entries[id].active = true;
+    r->count++;
     return id;
+}
+
+static void pattern_reg_deactivate(pattern_reg_t *r, uint16_t id)
+{
+    if (id >= r->count) return;
+    if (r->entries[id].tokens) {
+        free_pattern_tokens(r->entries[id].tokens, r->entries[id].token_count);
+        r->entries[id].tokens = NULL;
+    }
+    r->entries[id].active = false;
+    r->entries[id].pattern = NULL;
+}
+
+/* ============================================================
+ * LENGTH BUCKET INDEX
+ * ============================================================ */
+
+typedef struct {
+    uint16_t *indices;
+    size_t    count;
+    size_t    capacity;
+} len_bucket_t;
+
+static void len_bucket_free(len_bucket_t *b)
+{
+    free(b->indices);
+    b->indices = NULL;
+    b->count = 0;
+    b->capacity = 0;
+}
+
+static bool len_bucket_add(len_bucket_t *b, uint16_t pattern_id)
+{
+    if (b->count >= b->capacity) {
+        size_t new_cap = b->capacity == 0 ? 8 : b->capacity * 2;
+        uint16_t *new_indices = realloc(b->indices, new_cap * sizeof(uint16_t));
+        if (!new_indices) return false;
+        b->indices = new_indices;
+        b->capacity = new_cap;
+    }
+    b->indices[b->count++] = pattern_id;
+    return true;
+}
+
+static void len_bucket_remove(len_bucket_t *b, uint16_t pattern_id)
+{
+    for (size_t i = 0; i < b->count; i++) {
+        if (b->indices[i] == pattern_id) {
+            b->indices[i] = b->indices[b->count - 1];
+            b->count--;
+            return;
+        }
+    }
 }
 
 /* ============================================================
@@ -253,6 +344,8 @@ struct st_policy {
     vacuum_filter_t    *pos_filters[FILTER_POS_LEVELS];
     uint32_t             pos_wildcard_mask[FILTER_POS_LEVELS];
     uint64_t            pos_built_epoch[FILTER_POS_LEVELS];
+    len_bucket_t       *len_buckets;     /* Length-indexed pattern buckets */
+    size_t              num_buckets;     /* ST_MAX_CMD_TOKENS + 1 */
     size_t              pattern_count;
     size_t              children_count;
     policy_atomic_stats_t stats;  /* Atomic runtime statistics */
@@ -529,6 +622,15 @@ static child_entry_t *find_wildcard_child(const policy_state_t *node,
 
     child_entry_t *children = (child_entry_t *)(arena_base + node->children_offset);
     child_entry_t *base = children + node->literal_count;
+
+    /* First pass: prefer non-parametrized wildcards (more general, covers all cases) */
+    for (uint16_t i = 0; i < node->wildcard_count; i++) {
+        if (st_is_compatible(type, (st_token_type_t)base[i].type) &&
+            !wildcard_param(base[i].text, (st_token_type_t)base[i].type))
+            return &base[i];
+    }
+
+    /* Second pass: try parametrized wildcards */
     for (uint16_t i = 0; i < node->wildcard_count; i++) {
         if (st_is_compatible(type, (st_token_type_t)base[i].type) &&
             param_matches(cmd_text, type, base[i].text, (st_token_type_t)base[i].type))
@@ -761,10 +863,31 @@ static void free_pattern_tokens(st_token_t *tokens, size_t count)
 }
 
 /**
+ * Check if a token is an explicit wildcard — i.e., the user typed a type
+ * symbol like "#path" or "#opt", as opposed to a literal value like "-v"
+ * that was merely classified into a wildcard type.
+ * Returns true if the token text matches a type symbol or is parametrized.
+ */
+static bool is_explicit_wildcard(const char *text, st_token_type_t type)
+{
+    if (type == ST_TYPE_LITERAL) return false;
+    if (type == ST_TYPE_ANY) return true;  /* * is always a wildcard */
+    const char *sym = st_type_symbol[type];
+    size_t sym_len = strlen(sym);
+    /* Exact match: "#opt" */
+    if (strcmp(text, sym) == 0) return true;
+    /* Parametrized: "#path.cfg" */
+    if (strncmp(text, sym, sym_len) == 0 && text[sym_len] == '.') return true;
+    return false;
+}
+
+/**
  * Check if pattern B subsumes pattern A.
  * B subsumes A iff every command accepted by A is also accepted by B.
  * Requires same length and each token of A compatible with B.
  * For literals, values must match exactly.
+ * A classified-literal token (e.g., "-v" typed as-is, classified as OPT)
+ * is NOT considered a wildcard for subsumption — it must match exactly.
  * For parametrized wildcards:
  *   - #path subsumes #path.cfg (generic subsumes specific)
  *   - #path.cfg does NOT subsume #path (specific does not subsume generic)
@@ -776,17 +899,19 @@ static bool pattern_subsumes(const st_token_t *a, size_t a_len,
     if (a_len != b_len) return false;
 
     for (size_t i = 0; i < a_len; i++) {
-        /* For literals, values must match exactly */
-        if (a[i].type == ST_TYPE_LITERAL && b[i].type == ST_TYPE_LITERAL) {
+        bool a_wild = is_explicit_wildcard(a[i].text, a[i].type);
+        bool b_wild = is_explicit_wildcard(b[i].text, b[i].type);
+
+        if (!a_wild && !b_wild) {
+            /* Both are concrete values: must match exactly */
             if (strcmp(a[i].text, b[i].text) != 0) return false;
-        } else {
-            /* For wildcard compatibility, use the type lattice */
+        } else if (a_wild && b_wild) {
+            /* Both are wildcards: check type compatibility */
             if (!st_is_compatible(a[i].type, b[i].type)) return false;
             /* Parametrized wildcard subsumption check */
             const char *a_param = wildcard_param(a[i].text, a[i].type);
             const char *b_param = wildcard_param(b[i].text, b[i].type);
             if (a_param && b_param) {
-                /* Both parametrized: must have same parameter */
                 if (strcmp(a_param, b_param) != 0) return false;
             } else if (a_param && !b_param) {
                 /* a is parametrized, b is not: b subsumes a (OK) */
@@ -794,7 +919,12 @@ static bool pattern_subsumes(const st_token_t *a, size_t a_len,
                 /* a is not parametrized, b is: b is more specific, cannot subsume a */
                 return false;
             }
-            /* else: neither parametrized, type compatibility already checked */
+        } else if (!a_wild && b_wild) {
+            /* a is concrete, b is wildcard: b can subsume a if compatible */
+            if (!st_is_compatible(a[i].type, b[i].type)) return false;
+        } else {
+            /* a is wildcard, b is concrete: b cannot subsume a */
+            return false;
         }
     }
     return true;
@@ -987,7 +1117,17 @@ st_policy_t *st_policy_new(st_policy_ctx_t *ctx)
     atomic_store(&policy->epoch, 1);
     policy->pattern_count = 0;
     policy->children_count = 0;
-    
+
+    /* Length buckets for incremental subsumption */
+    policy->num_buckets = ST_MAX_CMD_TOKENS + 1;
+    policy->len_buckets = calloc(policy->num_buckets, sizeof(len_bucket_t));
+    if (!policy->len_buckets) {
+        pattern_reg_free(&policy->patterns);
+        states_array_free(&policy->states);
+        free(policy);
+        return NULL;
+    }
+
     /* Statistics - initialize atomics */
     atomic_init(&policy->stats.eval_count, 0);
     atomic_init(&policy->stats.filter_reject_count, 0);
@@ -1024,6 +1164,11 @@ void st_policy_free(st_policy_t *policy)
     pattern_reg_free(&policy->patterns);
     states_array_free(&policy->states);
     arena_free(&policy->children_arena);
+    if (policy->len_buckets) {
+        for (size_t i = 0; i < policy->num_buckets; i++)
+            len_bucket_free(&policy->len_buckets[i]);
+        free(policy->len_buckets);
+    }
     /* Release context reference */
     st_policy_ctx_release(policy->ctx);
     free(policy);
@@ -1033,7 +1178,16 @@ void st_policy_free(st_policy_t *policy)
  * ADD / REMOVE
  * ============================================================ */
 
-/* Internal: add pattern assuming write lock is already held */
+/* Forward declaration */
+static st_error_t remove_pattern_by_id_locked(st_policy_t *policy, uint16_t pid);
+
+/* Internal: add pattern assuming write lock is already held.
+ *
+ * Performs incremental subsumption checks:
+ *   1. If the new pattern is subsumed by an existing pattern, it is rejected.
+ *   2. If the new pattern subsumes existing patterns, they are removed.
+ * Only compares patterns of the same token length.
+ */
 static st_error_t st_policy_add_locked(st_policy_t *policy, const char *pattern)
 {
     if (!policy || !pattern || !pattern[0]) return ST_ERR_INVALID;
@@ -1042,7 +1196,60 @@ static st_error_t st_policy_add_locked(st_policy_t *policy, const char *pattern)
     st_token_t *tokens = parse_pattern(pattern, &token_count);
     if (!tokens) return ST_ERR_INVALID;
     if (token_count == 0) { free_pattern_tokens(tokens, token_count); return ST_ERR_INVALID; }
+    if (token_count > ST_MAX_CMD_TOKENS) { free_pattern_tokens(tokens, token_count); return ST_ERR_INVALID; }
 
+    /* --- Incremental subsumption check --- */
+    len_bucket_t *bucket = &policy->len_buckets[token_count];
+
+    /* Step 1: Check if new pattern is subsumed by an existing pattern */
+    for (size_t bi = 0; bi < bucket->count; bi++) {
+        uint16_t eid = bucket->indices[bi];
+        pattern_entry_t *entry = &policy->patterns.entries[eid];
+        if (!entry->active || !entry->tokens) continue;
+        /* B subsumes A: every command matching A also matches B.
+         * Here A = new pattern, B = existing entry.
+         * If existing entry subsumes new, new is redundant. */
+        if (pattern_subsumes(tokens, token_count, entry->tokens, entry->token_count)) {
+            free_pattern_tokens(tokens, token_count);
+            return ST_OK;
+        }
+    }
+
+    /* Step 2: Check if new pattern subsumes existing patterns.
+     * Collect indices to remove first (avoid iterator invalidation). */
+    uint16_t *to_remove = NULL;
+    size_t to_remove_count = 0;
+    size_t to_remove_cap = 0;
+
+    for (size_t bi = 0; bi < bucket->count; bi++) {
+        uint16_t eid = bucket->indices[bi];
+        pattern_entry_t *entry = &policy->patterns.entries[eid];
+        if (!entry->active || !entry->tokens) continue;
+        /* A = existing entry, B = new pattern.
+         * If new pattern subsumes existing, existing is redundant. */
+        if (pattern_subsumes(entry->tokens, entry->token_count, tokens, token_count)) {
+            if (to_remove_count >= to_remove_cap) {
+                size_t new_cap = to_remove_cap == 0 ? 8 : to_remove_cap * 2;
+                uint16_t *new_arr = realloc(to_remove, new_cap * sizeof(uint16_t));
+                if (!new_arr) {
+                    free(to_remove);
+                    free_pattern_tokens(tokens, token_count);
+                    return ST_ERR_MEMORY;
+                }
+                to_remove = new_arr;
+                to_remove_cap = new_cap;
+            }
+            to_remove[to_remove_count++] = eid;
+        }
+    }
+
+    /* Remove subsumed patterns */
+    for (size_t ri = 0; ri < to_remove_count; ri++) {
+        remove_pattern_by_id_locked(policy, to_remove[ri]);
+    }
+    free(to_remove);
+
+    /* --- Trie insertion (existing logic) --- */
     uint32_t current = 0;
     bool needs_filter_rebuild = false;
 
@@ -1078,17 +1285,190 @@ static st_error_t st_policy_add_locked(st_policy_t *policy, const char *pattern)
 
     policy_state_t *end_node = &policy->states.states[current];
     if (end_node->pattern_id == UINT16_MAX) {
-        uint16_t pid = pattern_reg_add(&policy->patterns, policy->ctx, pattern);
+        uint16_t pid = pattern_reg_add(&policy->patterns, policy->ctx,
+                                       pattern, tokens, token_count);
         if (pid == UINT16_MAX) {
             free_pattern_tokens(tokens, token_count);
             return ST_ERR_MEMORY;
         }
         end_node->pattern_id = pid;
         policy->pattern_count++;
+
+        /* Add to length bucket */
+        if (token_count < policy->num_buckets) {
+            len_bucket_add(&policy->len_buckets[token_count], pid);
+        }
     }
 
     if (needs_filter_rebuild) policy->epoch++;
     free_pattern_tokens(tokens, token_count);
+    return ST_OK;
+}
+
+/* Remove a child entry from a trie node's children array.
+ * Shifts subsequent entries to fill the gap. */
+static void remove_child_from_node(policy_state_t *node, st_policy_t *policy,
+                                   uint16_t child_idx, bool is_literal)
+{
+    child_entry_t *children = (child_entry_t *)(policy->children_arena.base + node->children_offset);
+    uint16_t total = node->literal_count + node->wildcard_count;
+
+    /* Shift entries to fill the gap */
+    memmove(children + child_idx, children + child_idx + 1,
+            (total - child_idx - 1) * sizeof(child_entry_t));
+    memset(children + total - 1, 0, sizeof(child_entry_t));
+
+    if (is_literal) {
+        node->literal_count--;
+    } else {
+        node->wildcard_count--;
+        /* Recompute wildcard mask */
+        node->wildcard_mask = 0;
+        child_entry_t *wild_base = children + node->literal_count;
+        for (uint16_t i = 0; i < node->wildcard_count; i++) {
+            node->wildcard_mask |= (1u << wild_base[i].type);
+        }
+    }
+}
+
+/* Internal: remove a pattern by its registry ID, assuming write lock is held.
+ * Walks the trie using the stored tokens, removes child entries along the path
+ * (only if the target state has no other children and no other pattern_id),
+ * unsets pattern_id, removes from length bucket, and deactivates the entry.
+ *
+ * For incremental subsumption, this removes the dead trie path to prevent
+ * it from shadowing the new more-general pattern. */
+static st_error_t remove_pattern_by_id_locked(st_policy_t *policy, uint16_t pid)
+{
+    if (!policy || pid >= policy->patterns.count) return ST_ERR_INVALID;
+    pattern_entry_t *entry = &policy->patterns.entries[pid];
+    if (!entry->active) return ST_OK;
+
+    /* Track the path through the trie so we can prune dead nodes */
+    typedef struct { uint32_t state_idx; uint16_t child_idx; bool is_literal; } path_step_t;
+    path_step_t *path = malloc(entry->token_count * sizeof(path_step_t));
+    if (!path) return ST_ERR_MEMORY;
+
+    uint32_t current = 0;
+    for (size_t i = 0; i < entry->token_count; i++) {
+        policy_state_t *node = &policy->states.states[current];
+        child_entry_t *child = NULL;
+        char *arena_base = policy->children_arena.base;
+
+        path[i].state_idx = current;
+        path[i].is_literal = (entry->tokens[i].type == ST_TYPE_LITERAL);
+
+        if (path[i].is_literal) {
+            /* Find literal child index */
+            uint16_t n = node->literal_count;
+            child_entry_t *children = (child_entry_t *)(arena_base + node->children_offset);
+            for (uint16_t ci = 0; ci < n; ci++) {
+                if (strcmp(entry->tokens[i].text, children[ci].text) == 0) {
+                    child = &children[ci];
+                    path[i].child_idx = ci;
+                    break;
+                }
+            }
+        } else {
+            /* Find exact wildcard child index */
+            child = find_exact_wildcard_child(node, arena_base,
+                                              entry->tokens[i].type, entry->tokens[i].text);
+            if (child) {
+                uint16_t ci = (uint16_t)(child - (child_entry_t *)(arena_base + node->children_offset));
+                path[i].child_idx = ci;
+            }
+        }
+
+        if (!child) {
+            free(path);
+            return ST_OK;
+        }
+        current = child->target;
+    }
+
+    /* Unset the pattern_id on the end node */
+    policy_state_t *end_node = &policy->states.states[current];
+    if (end_node->pattern_id != pid) {
+        free(path);
+        return ST_OK;
+    }
+    end_node->pattern_id = UINT16_MAX;
+
+    /* Prune dead nodes from leaf to root.
+     * A node can be pruned if it has no children, no pattern_id, and is not the root. */
+
+    /* Simple pruning: remove child entries from the path, starting from the leaf.
+     * Only remove if the target state has no children and no pattern_id. */
+    for (size_t i = entry->token_count; i > 0; i--) {
+        size_t step = i - 1;
+        uint32_t state_idx = path[step].state_idx;
+        policy_state_t *node = &policy->states.states[state_idx];
+
+        /* Find the child that we followed at this step.
+         * Note: child_idx may be stale if earlier steps removed children from this node.
+         * Re-find by matching the entry tokens. */
+        uint16_t child_idx = UINT16_MAX;
+        child_entry_t *children = (child_entry_t *)(policy->children_arena.base + node->children_offset);
+        uint16_t total = node->literal_count + node->wildcard_count;
+
+        if (path[step].is_literal) {
+            for (uint16_t ci = 0; ci < node->literal_count; ci++) {
+                if (strcmp(entry->tokens[step].text, children[ci].text) == 0) {
+                    child_idx = ci;
+                    break;
+                }
+            }
+        } else {
+            for (uint16_t ci = node->literal_count; ci < total; ci++) {
+                if ((st_token_type_t)children[ci].type == entry->tokens[step].type) {
+                    /* Check exact match for parametrized wildcards */
+                    if (entry->tokens[step].text && children[ci].text &&
+                        strcmp(entry->tokens[step].text, children[ci].text) == 0) {
+                        child_idx = ci;
+                        break;
+                    }
+                    if (!entry->tokens[step].text && !children[ci].text) {
+                        child_idx = ci;
+                        break;
+                    }
+                    /* For non-parametrized, text in entry->tokens is the symbol (e.g., "#path") */
+                    if (entry->tokens[step].text && !children[ci].text) {
+                        /* Entry has symbol text but trie stores NULL for non-parametrized.
+                         * Check if this is a non-parametrized wildcard by checking if entry
+                         * text is just the type symbol. */
+                        const char *sym = st_type_symbol[entry->tokens[step].type];
+                        if (strcmp(entry->tokens[step].text, sym) == 0) {
+                            child_idx = ci;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (child_idx == UINT16_MAX) break;  /* Already removed or can't find */
+
+        uint32_t target = children[child_idx].target;
+        policy_state_t *target_state = &policy->states.states[target];
+
+        /* Only remove the child if the target state is a dead end */
+        if (target_state->pattern_id == UINT16_MAX &&
+            target_state->literal_count == 0 &&
+            target_state->wildcard_count == 0) {
+            remove_child_from_node(node, policy, child_idx, path[step].is_literal);
+        }
+    }
+
+    /* Remove from length bucket */
+    if (entry->token_count < policy->num_buckets) {
+        len_bucket_remove(&policy->len_buckets[entry->token_count], pid);
+    }
+
+    /* Deactivate and free tokens */
+    pattern_reg_deactivate(&policy->patterns, pid);
+    policy->pattern_count--;
+
+    free(path);
     return ST_OK;
 }
 
@@ -1135,7 +1515,8 @@ st_error_t st_policy_merge(st_policy_t *dst, const st_policy_t *src)
     st_error_t first_err = ST_OK;
     size_t src_count = src->patterns.count;
     for (size_t i = 0; i < src_count; i++) {
-        const char *pat = src->patterns.strings[i];
+        if (!src->patterns.entries[i].active) continue;
+        const char *pat = src->patterns.entries[i].pattern;
         if (!pat) continue;
         st_error_t err = st_policy_add_locked(dst, pat);
         if (err != ST_OK && err != ST_ERR_INVALID && first_err == ST_OK) {
@@ -1148,10 +1529,10 @@ st_error_t st_policy_merge(st_policy_t *dst, const st_policy_t *src)
     return first_err;
 }
 
-static bool pattern_array_contains(const char **arr, size_t count, const char *pat)
+static bool pattern_array_contains_entry(const pattern_entry_t *entries, size_t count, const char *pat)
 {
     for (size_t i = 0; i < count; i++) {
-        if (strcmp(arr[i], pat) == 0) return true;
+        if (entries[i].active && strcmp(entries[i].pattern, pat) == 0) return true;
     }
     return false;
 }
@@ -1168,9 +1549,10 @@ st_error_t st_policy_diff(const st_policy_t *a, const st_policy_t *b,
 
     size_t a_count = a->patterns.count;
     size_t b_count = b->patterns.count;
-    const char **a_strs = a->patterns.strings;
-    const char **b_strs = b->patterns.strings;
+    const pattern_entry_t *a_entries = a->patterns.entries;
+    const pattern_entry_t *b_entries = b->patterns.entries;
 
+    /* Collect patterns in b that are not in a */
     size_t added_cap = b_count > 0 ? b_count : 1;
     char **added = calloc(added_cap, sizeof(char *));
     if (!added) {
@@ -1180,11 +1562,13 @@ st_error_t st_policy_diff(const st_policy_t *a, const st_policy_t *b,
     }
     size_t added_count = 0;
     for (size_t i = 0; i < b_count; i++) {
-        if (!pattern_array_contains(a_strs, a_count, b_strs[i])) {
-            added[added_count++] = strdup(b_strs[i]);
+        if (!b_entries[i].active) continue;
+        if (!pattern_array_contains_entry(a_entries, a_count, b_entries[i].pattern)) {
+            added[added_count++] = strdup(b_entries[i].pattern);
         }
     }
 
+    /* Collect patterns in a that are not in b */
     size_t removed_cap = a_count > 0 ? a_count : 1;
     char **removed = calloc(removed_cap, sizeof(char *));
     if (!removed) {
@@ -1196,8 +1580,9 @@ st_error_t st_policy_diff(const st_policy_t *a, const st_policy_t *b,
     }
     size_t removed_count = 0;
     for (size_t i = 0; i < a_count; i++) {
-        if (!pattern_array_contains(b_strs, b_count, a_strs[i])) {
-            removed[removed_count++] = strdup(a_strs[i]);
+        if (!a_entries[i].active) continue;
+        if (!pattern_array_contains_entry(b_entries, b_count, a_entries[i].pattern)) {
+            removed[removed_count++] = strdup(a_entries[i].pattern);
         }
     }
 
@@ -1272,8 +1657,18 @@ st_error_t st_policy_remove(st_policy_t *policy, const char *pattern)
         return ST_OK;
     }
 
+    uint16_t pid = node->pattern_id;
     node->pattern_id = UINT16_MAX;
     policy->pattern_count--;
+
+    /* Remove from length bucket and deactivate registry entry */
+    if (pid < policy->patterns.count) {
+        pattern_entry_t *entry = &policy->patterns.entries[pid];
+        if (entry->token_count < policy->num_buckets) {
+            len_bucket_remove(&policy->len_buckets[entry->token_count], pid);
+        }
+        pattern_reg_deactivate(&policy->patterns, pid);
+    }
 
     atomic_fetch_add(&policy->epoch, 1);
     free_pattern_tokens(tokens, token_count);
@@ -1307,8 +1702,8 @@ st_error_t st_policy_compact(st_policy_t *policy)
 
     size_t n_active = 0;
     for (size_t i = 0; i < policy->patterns.count; i++) {
-        if (policy->patterns.strings[i] != NULL) {
-            active[n_active++] = strdup(policy->patterns.strings[i]);
+        if (policy->patterns.entries[i].active) {
+            active[n_active++] = strdup(policy->patterns.entries[i].pattern);
         }
     }
 
@@ -1318,76 +1713,9 @@ st_error_t st_policy_compact(st_policy_t *policy)
         return ST_OK;
     }
 
-    /* Step 1.5: Remove patterns subsumed by more general patterns
-     * B subsumes A iff every command matching A also matches B */
-    if (n_active > 1) {
-        st_token_t **pat_tokens = calloc(n_active, sizeof(st_token_t *));
-        size_t *pat_lens = calloc(n_active, sizeof(size_t));
-        bool *redundant = calloc(n_active, sizeof(bool));
-        size_t orig_n = n_active;  /* Save for cleanup */
-        
-        if (!pat_tokens || !pat_lens || !redundant) {
-            /* Allocation failed - clean up any partial allocations */
-            free(pat_tokens);
-            free(pat_lens);
-            free(redundant);
-            for (size_t i = 0; i < n_active; i++) {
-                free(active[i]);
-            }
-            free(active);
-            pthread_rwlock_unlock(&policy->rwlock);
-            return ST_ERR_MEMORY;
-        }
-        
-        /* Parse all patterns first */
-        for (size_t i = 0; i < orig_n; i++) {
-            pat_tokens[i] = parse_pattern(active[i], &pat_lens[i]);
-        }
-        
-        /* Find subsumed patterns: j subsumes i if j is more general */
-        for (size_t i = 0; i < orig_n; i++) {
-            if (redundant[i] || !pat_tokens[i]) continue;
-            for (size_t j = 0; j < orig_n; j++) {
-                if (i == j || redundant[j] || !pat_tokens[j]) continue;
-                if (pattern_subsumes(pat_tokens[i], pat_lens[i],
-                                    pat_tokens[j], pat_lens[j])) {
-                    redundant[i] = true;  /* i is subsumed by j */
-                    break;
-                }
-            }
-        }
-        
-        /* Compact active array to keep only non-redundant */
-        size_t new_n = 0;
-        for (size_t i = 0; i < orig_n; i++) {
-            if (!redundant[i]) {
-                active[new_n++] = active[i];
-            } else {
-                free(active[i]);
-                active[i] = NULL;
-            }
-        }
-        n_active = new_n;
-        
-        /* Cleanup parsed tokens */
-        for (size_t i = 0; i < orig_n; i++) {
-            if (pat_tokens[i]) {
-                free_pattern_tokens(pat_tokens[i], pat_lens[i]);
-            }
-        }
-        free(pat_tokens);
-        free(pat_lens);
-        free(redundant);
-    }
+    /* No batch subsumption needed — incremental on add handles it */
 
-    if (n_active == 0) {
-        free(active);
-        pthread_rwlock_unlock(&policy->rwlock);
-        return ST_OK;
-    }
-
-    /* Step 2: FULLY tear down policy trie BEFORE resetting context
-     * This ensures no dangling pointers to ctx->arena after reset */
+    /* FULLY tear down policy trie BEFORE resetting context */
     for (int i = 0; i < FILTER_POS_LEVELS; i++) {
         vacuum_filter_destroy(policy->pos_filters[i]);
         policy->pos_filters[i] = NULL;
@@ -1398,21 +1726,20 @@ st_error_t st_policy_compact(st_policy_t *policy)
     states_array_init(&policy->states);
     pattern_reg_free(&policy->patterns);
     pattern_reg_init(&policy->patterns);
+    /* Clear length buckets */
+    for (size_t i = 0; i < policy->num_buckets; i++)
+        len_bucket_free(&policy->len_buckets[i]);
     arena_free(&policy->children_arena);
     arena_init(&policy->children_arena, CHILDREN_ARENA_SIZE);
     policy->pattern_count = 0;
     policy->children_count = 0;
 
-    /* Step 3: Release context reference so reset can proceed
-     * (trie is torn down, no more references to ctx->arena) */
-    st_policy_ctx_release(policy->ctx);  // refcount: 2 -> 1
+    /* Release context reference so reset can proceed */
+    st_policy_ctx_release(policy->ctx);
 
-    /* Step 4: Reset context (now safe with refcount == 1).
-     * On failure, the policy has an empty trie (torn down in Step 2).
-     * The caller should treat the policy as invalid and recreate it. */
+    /* Reset context */
     st_error_t reset_err = st_policy_ctx_reset(policy->ctx);
     if (reset_err != ST_OK) {
-        /* Re-acquire reference if reset failed; policy has empty trie */
         st_policy_ctx_retain(policy->ctx);
         for (size_t j = 0; j < n_active; j++) free(active[j]);
         free(active);
@@ -1421,13 +1748,12 @@ st_error_t st_policy_compact(st_policy_t *policy)
     }
 
     /* Re-acquire reference for policy */
-    st_policy_ctx_retain(policy->ctx);  // refcount: 1 -> 2
+    st_policy_ctx_retain(policy->ctx);
 
-    /* Step 5: Rebuild trie with collected patterns */
+    /* Rebuild trie with collected patterns */
     atomic_fetch_add(&policy->epoch, 1);
 
     for (size_t i = 0; i < n_active; i++) {
-        /* Use _locked version since we already hold the write lock */
         st_error_t err = st_policy_add_locked(policy, active[i]);
         if (err != ST_OK) {
             for (size_t j = 0; j < n_active; j++) free(active[j]);
@@ -1465,6 +1791,10 @@ st_error_t st_policy_clear(st_policy_t *policy)
     /* Clear pattern registry */
     pattern_reg_free(&policy->patterns);
     pattern_reg_init(&policy->patterns);
+
+    /* Clear length buckets */
+    for (size_t i = 0; i < policy->num_buckets; i++)
+        len_bucket_free(&policy->len_buckets[i]);
 
     policy->pattern_count = 0;
     policy->children_count = 0;
@@ -1526,7 +1856,7 @@ static const char *st_find_based_on(const st_policy_t *policy, uint32_t state_id
 {
     policy_state_t *state = &policy->states.states[state_idx];
     if (state->pattern_id != UINT16_MAX && state->pattern_id < policy->patterns.count)
-        return policy->patterns.strings[state->pattern_id];
+        return policy->patterns.entries[state->pattern_id].pattern;
 
     uint16_t total = state->literal_count + state->wildcard_count;
     child_entry_t *children = (child_entry_t *)(policy->children_arena.base + state->children_offset);
@@ -1534,7 +1864,7 @@ static const char *st_find_based_on(const st_policy_t *policy, uint32_t state_id
         child_entry_t *c = &children[i];
         policy_state_t *child = &policy->states.states[c->target];
         if (child->pattern_id != UINT16_MAX && child->pattern_id < policy->patterns.count)
-            return policy->patterns.strings[child->pattern_id];
+            return policy->patterns.entries[child->pattern_id].pattern;
     }
     return NULL;
 }
@@ -1689,7 +2019,7 @@ st_error_t st_policy_eval(st_policy_t *policy,
         st_free_token_array(&cmd);
         if (result) {
             result->matches = true;
-            result->matching_pattern = policy->patterns.strings[end_node->pattern_id];
+            result->matching_pattern = policy->patterns.entries[end_node->pattern_id].pattern;
         }
         pthread_rwlock_unlock(&policy->rwlock);
         return ST_OK;
@@ -2004,7 +2334,7 @@ st_error_t st_policy_verify_all(const st_policy_t *policy,
                     matches = new_matches;
                     match_cap = new_cap;
                 }
-                matches[match_n++] = policy->patterns.strings[state->pattern_id];
+                matches[match_n++] = policy->patterns.entries[state->pattern_id].pattern;
             }
             continue;
         }
@@ -2177,7 +2507,7 @@ static bool nfa_build(nfa_ctx_t *c, st_policy_t *policy,
         si->category_mask = c->category_mask;
         si->pattern_id = c->pattern_id_counter++;
         if (c->include_tags && node->pattern_id < policy->patterns.count)
-            si->tag = policy->patterns.strings[node->pattern_id];
+            si->tag = policy->patterns.entries[node->pattern_id].pattern;
     }
 
     for (uint16_t i = 0; i < total; i++) {
@@ -2362,7 +2692,7 @@ static void dfs_save(st_policy_t *policy, uint32_t idx, policy_save_ctx_t *ctx)
     child_entry_t *children = (child_entry_t *)(policy->children_arena.base + node->children_offset);
 
     if (node->pattern_id != UINT16_MAX && node->pattern_id < policy->patterns.count) {
-        const char *pat = policy->patterns.strings[node->pattern_id];
+        const char *pat = policy->patterns.entries[node->pattern_id].pattern;
         size_t len = strlen(pat);
         if (fprintf(ctx->fp, "%s\n", pat) < 0) {
             ctx->error = ST_ERR_IO;
@@ -2519,7 +2849,10 @@ st_error_t st_policy_load(st_policy_t *policy, const char *path, bool clear_firs
         arena_init(&policy->children_arena, CHILDREN_ARENA_SIZE);
         free(policy->states.states);
         states_array_init(&policy->states);
-        policy->patterns.count = 0;
+        pattern_reg_free(&policy->patterns);
+        pattern_reg_init(&policy->patterns);
+        for (size_t i = 0; i < policy->num_buckets; i++)
+            len_bucket_free(&policy->len_buckets[i]);
         policy->pattern_count = 0;
         policy->children_count = 0;
         for (int i = 0; i < FILTER_POS_LEVELS; i++) {
@@ -2556,7 +2889,7 @@ size_t st_policy_memory_usage(const st_policy_t *policy)
 {
     if (!policy) return 0;
     size_t states_alloc = policy->states.capacity * sizeof(policy_state_t);
-    size_t patterns_alloc = policy->patterns.capacity * sizeof(const char *);
+    size_t patterns_alloc = policy->patterns.capacity * sizeof(pattern_entry_t);
     size_t filter_bytes = 0;
     for (int i = 0; i < FILTER_POS_LEVELS; i++) {
         if (policy->pos_filters[i]) {
@@ -2570,7 +2903,7 @@ size_t st_policy_working_set(const st_policy_t *policy)
 {
     if (!policy) return 0;
     size_t states_used = policy->states.count * sizeof(policy_state_t);
-    size_t patterns_used = policy->patterns.count * sizeof(const char *);
+    size_t patterns_used = policy->patterns.count * sizeof(pattern_entry_t);
     size_t filter_bytes = 0;
     for (int i = 0; i < FILTER_POS_LEVELS; i++) {
         if (policy->pos_filters[i]) {

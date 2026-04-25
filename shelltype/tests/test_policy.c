@@ -920,28 +920,27 @@ static int test_ctx_compact(void)
     return 1;
 }
 
-/* Test that compact removes patterns subsumed by more general ones */
+/* Test that incremental subsumption removes patterns subsumed by more general ones.
+ * With incremental subsumption, adding `git commit -m *` after the literals
+ * immediately removes them — no compact needed. */
 static int test_compact_removes_subsumed(void)
 {
     st_policy_ctx_t *ctx = st_policy_ctx_new();
     st_policy_t *policy = st_policy_new(ctx);
 
-    /* Add patterns where #w will be subsumed by * at same position */
+    /* Add literal patterns */
     st_policy_add(policy, "git commit -m msg1");
     st_policy_add(policy, "git commit -m msg2");
     st_policy_add(policy, "git commit -m msg3");
-    st_policy_add(policy, "git commit -m *");  /* This subsumes the above (same length) */
+    ASSERT(st_policy_count(policy) == 3);
 
-    ASSERT(st_policy_count(policy) == 4);
-
-    /* Compact should remove the 3 specific patterns, keep the wildcard */
-    st_error_t err = st_policy_compact(policy);
-    ASSERT(err == ST_OK);
+    /* Adding the wildcard immediately subsumes the 3 specific patterns */
+    st_policy_add(policy, "git commit -m *");
     ASSERT(st_policy_count(policy) == 1);
 
     /* Verify the remaining pattern matches */
     st_eval_result_t result;
-    err = st_policy_eval(policy, "git commit -m hello", &result);
+    st_error_t err = st_policy_eval(policy, "git commit -m hello", &result);
     ASSERT(err == ST_OK);
     ASSERT(result.matches);
 
@@ -1143,6 +1142,8 @@ static int test_param_coexist_different_ext(void)
     return 1;
 }
 
+/* With incremental subsumption, adding `cat #path` after `cat #path.cfg`
+ * subsumes the parametrized pattern. Only `cat #path` remains. */
 static int test_param_coexist_with_unparametrized(void)
 {
     st_policy_ctx_t *ctx = st_policy_ctx_new();
@@ -1151,12 +1152,15 @@ static int test_param_coexist_with_unparametrized(void)
     st_policy_add(policy, "cat #path.cfg");
     st_policy_add(policy, "cat #path");
 
-    /* .cfg matches both patterns (parametrized first) */
+    /* #path subsumes #path.cfg, so only one pattern remains */
+    ASSERT(st_policy_count(policy) == 1);
+
+    /* .cfg still matches via #path */
     st_eval_result_t r1;
     st_policy_eval(policy, "cat /etc/app.cfg", &r1);
     ASSERT(r1.matches);
 
-    /* .log matches #path (unparametrized) */
+    /* .log matches #path */
     st_eval_result_t r2;
     st_policy_eval(policy, "cat /etc/app.log", &r2);
     ASSERT(r2.matches);
@@ -1171,11 +1175,12 @@ static int test_param_compact_subsumes(void)
     st_policy_ctx_t *ctx = st_policy_ctx_new();
     st_policy_t *policy = st_policy_new(ctx);
 
-    /* #path subsumes #path.cfg */
+    /* #path subsumes #path.cfg — incremental subsumption removes #path.cfg */
     st_policy_add(policy, "cat #path.cfg");
     st_policy_add(policy, "cat #path");
-    ASSERT(st_policy_count(policy) == 2);
+    ASSERT(st_policy_count(policy) == 1);
 
+    /* Compact just reclaims arena memory, no subsumption change */
     st_error_t err = st_policy_compact(policy);
     ASSERT(err == ST_OK);
     ASSERT(st_policy_count(policy) == 1);
@@ -1923,6 +1928,302 @@ static int test_diff_empty(void)
     return 1;
 }
 
+/* ============================================================
+ * INCREMENTAL SUBSUMPTION TESTS
+ * ============================================================ */
+
+/* Adding a specific pattern after a general one: rejected (subsumed) */
+static int test_incr_subsumed_by_existing(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_policy_t *policy = st_policy_new(ctx);
+
+    st_policy_add(policy, "git *");
+    st_error_t err = st_policy_add(policy, "git status");
+    ASSERT(err == ST_OK);
+    ASSERT(st_policy_count(policy) == 1);
+
+    /* The general pattern still matches */
+    st_eval_result_t result;
+    err = st_policy_eval(policy, "git status", &result);
+    ASSERT(err == ST_OK);
+    ASSERT(result.matches);
+    ASSERT_STR_EQ(result.matching_pattern, "git *");
+
+    st_policy_free(policy);
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
+/* Adding a general pattern after specific ones: specifics are removed */
+static int test_incr_subsumes_existing(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_policy_t *policy = st_policy_new(ctx);
+
+    st_policy_add(policy, "git status");
+    st_policy_add(policy, "git commit");
+    ASSERT(st_policy_count(policy) == 2);
+
+    /* Adding the wildcard removes the two specifics */
+    st_error_t err = st_policy_add(policy, "git *");
+    ASSERT(err == ST_OK);
+    ASSERT(st_policy_count(policy) == 1);
+
+    /* Both commands still match via the wildcard */
+    st_eval_result_t result;
+    err = st_policy_eval(policy, "git status", &result);
+    ASSERT(err == ST_OK);
+    ASSERT(result.matches);
+
+    err = st_policy_eval(policy, "git commit", &result);
+    ASSERT(err == ST_OK);
+    ASSERT(result.matches);
+
+    st_policy_free(policy);
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
+/* Patterns of different lengths are never compared */
+static int test_incr_keeps_different_lengths(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_policy_t *policy = st_policy_new(ctx);
+
+    st_policy_add(policy, "git status");
+    st_policy_add(policy, "git commit -m *");
+    ASSERT(st_policy_count(policy) == 2);
+
+    /* `git *` only subsumes same-length (2-token) patterns */
+    st_policy_add(policy, "git *");
+    ASSERT(st_policy_count(policy) == 2);  /* `git commit -m *` kept */
+
+    st_eval_result_t result;
+    st_error_t err = st_policy_eval(policy, "git commit -m fix", &result);
+    ASSERT(err == ST_OK);
+    ASSERT(result.matches);
+
+    st_policy_free(policy);
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
+/* Parametrized wildcard subsumed by generic: #path.cfg subsumed by #path */
+static int test_incr_parametrized(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_policy_t *policy = st_policy_new(ctx);
+
+    st_policy_add(policy, "cat #path.cfg");
+    ASSERT(st_policy_count(policy) == 1);
+
+    /* #path subsumes #path.cfg */
+    st_error_t err = st_policy_add(policy, "cat #path");
+    ASSERT(err == ST_OK);
+    ASSERT(st_policy_count(policy) == 1);
+
+    /* Both .cfg and .log match via #path */
+    st_eval_result_t r1;
+    st_policy_eval(policy, "cat /etc/app.cfg", &r1);
+    ASSERT(r1.matches);
+
+    st_eval_result_t r2;
+    st_policy_eval(policy, "cat /etc/app.log", &r2);
+    ASSERT(r2.matches);
+
+    st_policy_free(policy);
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
+/* #opt wildcard subsumes a classified-literal option.
+ * Note: two OPT-type tokens at the same trie node can't coexist
+ * (trie design: one wildcard child per type per node). So we test
+ * with a single literal option. */
+static int test_incr_opt_wildcard(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_policy_t *policy = st_policy_new(ctx);
+
+    st_policy_add(policy, "git -v");
+    ASSERT(st_policy_count(policy) == 1);
+
+    /* git #opt subsumes git -v (#opt is an explicit wildcard, -v is classified literal) */
+    st_error_t err = st_policy_add(policy, "git #opt");
+    ASSERT(err == ST_OK);
+    ASSERT(st_policy_count(policy) == 1);
+
+    st_eval_result_t r;
+    err = st_policy_eval(policy, "git -v", &r);
+    ASSERT(err == ST_OK);
+    ASSERT(r.matches);
+
+    /* Also matches other options */
+    err = st_policy_eval(policy, "git --help", &r);
+    ASSERT(err == ST_OK);
+    ASSERT(r.matches);
+
+    st_policy_free(policy);
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
+/* Stress test: 100 literals subsumed by one wildcard */
+static int test_incr_stress(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_policy_t *policy = st_policy_new(ctx);
+
+    for (int i = 0; i < 100; i++) {
+        char pattern[64];
+        snprintf(pattern, sizeof(pattern), "cmd arg%d", i);
+        st_policy_add(policy, pattern);
+    }
+    ASSERT(st_policy_count(policy) == 100);
+
+    /* Adding a wildcard subsumes all 100 literals */
+    st_error_t err = st_policy_add(policy, "cmd *");
+    ASSERT(err == ST_OK);
+    ASSERT(st_policy_count(policy) == 1);
+
+    /* All 100 variants still match */
+    st_eval_result_t result;
+    err = st_policy_eval(policy, "cmd arg42", &result);
+    ASSERT(err == ST_OK);
+    ASSERT(result.matches);
+    ASSERT_STR_EQ(result.matching_pattern, "cmd *");
+
+    st_policy_free(policy);
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
+/* Removal cleans up length bucket properly */
+static int test_incr_remove_cleans_bucket(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_policy_t *policy = st_policy_new(ctx);
+
+    st_policy_add(policy, "git status");
+    st_policy_add(policy, "git commit");
+    st_policy_add(policy, "git *");
+    ASSERT(st_policy_count(policy) == 1);
+
+    /* Remove the remaining pattern */
+    st_error_t err = st_policy_remove(policy, "git *");
+    ASSERT(err == ST_OK);
+    ASSERT(st_policy_count(policy) == 0);
+
+    /* Adding a specific after removal should work */
+    err = st_policy_add(policy, "git status");
+    ASSERT(err == ST_OK);
+    ASSERT(st_policy_count(policy) == 1);
+
+    st_eval_result_t result;
+    err = st_policy_eval(policy, "git status", &result);
+    ASSERT(err == ST_OK);
+    ASSERT(result.matches);
+
+    st_policy_free(policy);
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
+/* batch_add also triggers incremental subsumption */
+static int test_incr_batch_add(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_policy_t *policy = st_policy_new(ctx);
+
+    const char *batch[] = {
+        "git status",
+        "git commit",
+        "git pull",
+        "git *"
+    };
+    st_error_t err = st_policy_batch_add(policy, batch, 4);
+    ASSERT(err == ST_OK);
+    /* git * subsumes the other 3 */
+    ASSERT(st_policy_count(policy) == 1);
+
+    st_eval_result_t result;
+    err = st_policy_eval(policy, "git status", &result);
+    ASSERT(err == ST_OK);
+    ASSERT(result.matches);
+
+    st_policy_free(policy);
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
+/* Wildcard subsumption along the type lattice.
+ * #f (filename) ⊂ #r (relpath) ⊂ #path, and #p (abspath) ⊂ #path.
+ * Adding #r after #f: #r subsumes #f (filename is compatible with relpath).
+ * Adding #p after #r: #p and #r are incomparable (different branches).
+ * Adding #path subsumes everything.
+ */
+static int test_incr_wildcard_same_length(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_policy_t *policy = st_policy_new(ctx);
+
+    st_policy_add(policy, "cat #f");    /* filename */
+    ASSERT(st_policy_count(policy) == 1);
+
+    /* #r subsumes #f (filename ⊂ relpath) */
+    st_policy_add(policy, "cat #r");
+    ASSERT(st_policy_count(policy) == 1);
+
+    /* #p is incomparable with #r, so both coexist */
+    st_policy_add(policy, "cat #p");
+    ASSERT(st_policy_count(policy) == 2);
+
+    /* #path subsumes both #r and #p */
+    st_policy_add(policy, "cat #path");
+    ASSERT(st_policy_count(policy) == 1);
+
+    st_eval_result_t r;
+    st_policy_eval(policy, "cat /etc/hosts", &r);
+    ASSERT(r.matches);
+
+    st_policy_eval(policy, "cat src/app.c", &r);
+    ASSERT(r.matches);
+
+    st_policy_free(policy);
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
+/* No cross-length subsumption: patterns with different token counts are independent */
+static int test_incr_no_cross_length_subsumption(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_policy_t *policy = st_policy_new(ctx);
+
+    st_policy_add(policy, "git");
+    st_policy_add(policy, "git status");
+    st_policy_add(policy, "git commit -m *");
+    ASSERT(st_policy_count(policy) == 3);
+
+    /* `git *` (2 tokens) should NOT subsume `git` (1 token) */
+    st_policy_add(policy, "git *");
+    ASSERT(st_policy_count(policy) == 3);  /* git and git commit -m * kept */
+
+    st_eval_result_t r;
+    st_error_t err = st_policy_eval(policy, "git", &r);
+    ASSERT(err == ST_OK);
+    ASSERT(r.matches);
+
+    err = st_policy_eval(policy, "git commit -m fix", &r);
+    ASSERT(err == ST_OK);
+    ASSERT(r.matches);
+
+    st_policy_free(policy);
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
 int main(void)
 {
     printf("Running policy unit tests...\n\n");
@@ -2042,6 +2343,18 @@ int main(void)
     TEST(test_diff_identical);
     TEST(test_diff_added_and_removed);
     TEST(test_diff_empty);
+
+    printf("\nIncremental subsumption:\n");
+    TEST(test_incr_subsumed_by_existing);
+    TEST(test_incr_subsumes_existing);
+    TEST(test_incr_keeps_different_lengths);
+    TEST(test_incr_parametrized);
+    TEST(test_incr_opt_wildcard);
+    TEST(test_incr_stress);
+    TEST(test_incr_remove_cleans_bucket);
+    TEST(test_incr_batch_add);
+    TEST(test_incr_wildcard_same_length);
+    TEST(test_incr_no_cross_length_subsumption);
 
     printf("\n========================================\n");
     printf("Results: %d/%d passed, %d failed\n",
