@@ -1778,6 +1778,95 @@ static int test_validate_reject_star_first(void)
     return 1;
 }
 
+/* ============================================================
+ * POLICY MERGE (st_policy_merge)
+ * ============================================================ */
+
+static int test_merge_empty_src(void)
+{
+    st_policy_ctx_t *ctx1 = st_policy_ctx_new();
+    st_policy_ctx_t *ctx2 = st_policy_ctx_new();
+    st_policy_t *dst = st_policy_new(ctx1);
+    st_policy_t *src = st_policy_new(ctx2);
+
+    st_policy_add(dst, "git status");
+
+    st_error_t err = st_policy_merge(dst, src);
+    ASSERT(err == ST_OK);
+    ASSERT(st_policy_count(dst) == 1);
+
+    st_policy_free(dst);
+    st_policy_free(src);
+    st_policy_ctx_free(ctx1);
+    st_policy_ctx_free(ctx2);
+    return 1;
+}
+
+static int test_merge_overlapping(void)
+{
+    st_policy_ctx_t *ctx1 = st_policy_ctx_new();
+    st_policy_ctx_t *ctx2 = st_policy_ctx_new();
+    st_policy_t *dst = st_policy_new(ctx1);
+    st_policy_t *src = st_policy_new(ctx2);
+
+    st_policy_add(dst, "git status");
+    st_policy_add(dst, "git commit -m *");
+
+    st_policy_add(src, "git status");
+    st_policy_add(src, "git pull");
+
+    st_error_t err = st_policy_merge(dst, src);
+    ASSERT(err == ST_OK);
+    /* git status is duplicate, git pull is new */
+    ASSERT(st_policy_count(dst) == 3);
+
+    /* Verify merged patterns match correctly */
+    st_eval_result_t r;
+    st_policy_eval(dst, "git status", &r);
+    ASSERT(r.matches);
+    st_policy_eval(dst, "git pull", &r);
+    ASSERT(r.matches);
+    st_policy_eval(dst, "git commit -m \"hello\"", &r);
+    ASSERT(r.matches);
+
+    st_policy_free(dst);
+    st_policy_free(src);
+    st_policy_ctx_free(ctx1);
+    st_policy_ctx_free(ctx2);
+    return 1;
+}
+
+static int test_merge_disjoint(void)
+{
+    st_policy_ctx_t *ctx1 = st_policy_ctx_new();
+    st_policy_ctx_t *ctx2 = st_policy_ctx_new();
+    st_policy_t *dst = st_policy_new(ctx1);
+    st_policy_t *src = st_policy_new(ctx2);
+
+    st_policy_add(dst, "git status");
+
+    st_policy_add(src, "ls");
+    st_policy_add(src, "cat #path");
+
+    st_error_t err = st_policy_merge(dst, src);
+    ASSERT(err == ST_OK);
+    ASSERT(st_policy_count(dst) == 3);
+
+    st_eval_result_t r;
+    st_policy_eval(dst, "git status", &r);
+    ASSERT(r.matches);
+    st_policy_eval(dst, "ls", &r);
+    ASSERT(r.matches);
+    st_policy_eval(dst, "cat /etc/hosts", &r);
+    ASSERT(r.matches);
+
+    st_policy_free(dst);
+    st_policy_free(src);
+    st_policy_ctx_free(ctx1);
+    st_policy_ctx_free(ctx2);
+    return 1;
+}
+
 int main(void)
 {
     printf("Running policy unit tests...\n\n");
@@ -1887,6 +1976,11 @@ int main(void)
     TEST(test_validate_invalid_param);
     TEST(test_validate_empty);
     TEST(test_validate_reject_star_first);
+
+    printf("\nPolicy merge (st_policy_merge):\n");
+    TEST(test_merge_empty_src);
+    TEST(test_merge_overlapping);
+    TEST(test_merge_disjoint);
 
     printf("\n========================================\n");
     printf("Results: %d/%d passed, %d failed\n",

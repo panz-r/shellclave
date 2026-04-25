@@ -433,6 +433,15 @@ st_error_t st_policy_load(st_policy_t *policy, const char *path, bool clear_firs
 st_error_t st_policy_compact(st_policy_t *policy);
 st_error_t st_policy_clear(st_policy_t *policy);
 
+/* --- Merge --- */
+
+/**
+ * Merge all patterns from src into dst. Duplicates are skipped.
+ * Takes write lock on dst, read lock on src.
+ * Returns ST_OK on success, or the first error encountered.
+ */
+st_error_t st_policy_merge(st_policy_t *dst, const st_policy_t *src);
+
 /* --- Diagnostics --- */
 
 size_t st_policy_memory_usage(const st_policy_t *policy);

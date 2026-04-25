@@ -566,7 +566,8 @@ static child_entry_t *find_exact_wildcard_child(const policy_state_t *node,
  * CHILD INSERTION
  * ============================================================ */
 
-static bool insert_child(policy_state_t *node, st_policy_t *policy,
+/* Returns: -1 = allocation failure, 0 = success (filter updated), 1 = success (filter needs rebuild) */
+static int insert_child(policy_state_t *node, st_policy_t *policy,
                          const char *text, st_token_type_t type, uint32_t target, uint8_t depth)
 {
     assert(node->literal_count + node->wildcard_count <= node->children_alloc);
@@ -575,6 +576,7 @@ static bool insert_child(policy_state_t *node, st_policy_t *policy,
     uint16_t insert_pos;
     char *arena_base = policy->children_arena.base;
     child_entry_t *children = (child_entry_t *)(arena_base + node->children_offset);
+    int filter_status = 0;
 
     if (is_literal) {
         insert_pos = 0;
@@ -584,7 +586,7 @@ static bool insert_child(policy_state_t *node, st_policy_t *policy,
         }
         /* Check ALL existing literals for duplicate */
         for (uint16_t i = 0; i < node->literal_count; i++) {
-            if (children[i].type == ST_TYPE_LITERAL && strcmp(text, children[i].text) == 0) return false;
+            if (children[i].type == ST_TYPE_LITERAL && strcmp(text, children[i].text) == 0) return -1;
         }
     } else {
         insert_pos = node->literal_count;
@@ -595,10 +597,10 @@ static bool insert_child(policy_state_t *node, st_policy_t *policy,
         /* Duplicate check: same base type AND same text (handles parametrized) */
         if (insert_pos < total && children[insert_pos].type == type) {
             bool is_param = text && strchr(text, '.');
-            if (!is_param) return false;  /* non-parametrized: same type = dup */
+            if (!is_param) return -1;  /* non-parametrized: same type = dup */
             /* Parametrized: check if same parameter */
             if (children[insert_pos].text != NULL && text != NULL &&
-                strcmp(children[insert_pos].text, text) == 0) return false;
+                strcmp(children[insert_pos].text, text) == 0) return -1;
         }
     }
     assert(insert_pos <= total);
@@ -616,7 +618,7 @@ static bool insert_child(policy_state_t *node, st_policy_t *policy,
         uint16_t new_alloc = node->children_alloc == 0 ? 4 : node->children_alloc * 2;
         uint16_t old_alloc = node->children_alloc;
         if (!children_arena_grow(&policy->children_arena, &node->children_offset, &node->children_alloc, new_alloc)) {
-            return false;
+            return -1;
         }
         policy->children_count += node->children_alloc - old_alloc;
     }
@@ -637,14 +639,24 @@ static bool insert_child(policy_state_t *node, st_policy_t *policy,
 
     if (depth < FILTER_POS_LEVELS) {
         if (type == ST_TYPE_LITERAL) {
-            uint64_t h = filter_hash_fnv1a(text, strlen(text));
-            vacuum_filter_insert(policy->pos_filters[depth], h);
+            if (policy->pos_filters[depth]) {
+                uint64_t h = filter_hash_fnv1a(text, strlen(text));
+                vacuum_err_t vrc = vacuum_filter_insert(policy->pos_filters[depth], h);
+                if (vrc != VACUUM_OK) {
+                    vacuum_filter_destroy(policy->pos_filters[depth]);
+                    policy->pos_filters[depth] = NULL;
+                    filter_status = 1;
+                }
+            } else {
+                /* Filter not yet built for this depth — needs rebuild */
+                filter_status = 1;
+            }
         } else {
             policy->pos_wildcard_mask[depth] |= (1u << type);
         }
     }
 
-    return true;
+    return filter_status;
 }
 
 /* ============================================================
@@ -1021,6 +1033,7 @@ static st_error_t st_policy_add_locked(st_policy_t *policy, const char *pattern)
     if (token_count == 0) { free_pattern_tokens(tokens, token_count); return ST_ERR_INVALID; }
 
     uint32_t current = 0;
+    bool needs_filter_rebuild = false;
 
     for (size_t i = 0; i < token_count; i++) {
         policy_state_t *node = &policy->states.states[current];
@@ -1041,11 +1054,13 @@ static st_error_t st_policy_add_locked(st_policy_t *policy, const char *pattern)
                 free_pattern_tokens(tokens, token_count);
                 return ST_ERR_MEMORY;
             }
-            if (!insert_child(node, policy,
-                              tokens[i].text, tokens[i].type, new_state, (uint8_t)i)) {
+            int rc = insert_child(node, policy,
+                              tokens[i].text, tokens[i].type, new_state, (uint8_t)i);
+            if (rc < 0) {
                 free_pattern_tokens(tokens, token_count);
                 return ST_ERR_MEMORY;
             }
+            if (rc == 1) needs_filter_rebuild = true;
             current = new_state;
         }
     }
@@ -1061,7 +1076,7 @@ static st_error_t st_policy_add_locked(st_policy_t *policy, const char *pattern)
         policy->pattern_count++;
     }
 
-    policy->epoch++;
+    if (needs_filter_rebuild) policy->epoch++;
     free_pattern_tokens(tokens, token_count);
     return ST_OK;
 }
@@ -1099,6 +1114,28 @@ st_error_t st_policy_batch_add(st_policy_t *policy, const char **patterns, size_
     return first_err;
 }
 
+st_error_t st_policy_merge(st_policy_t *dst, const st_policy_t *src)
+{
+    if (!dst || !src) return ST_ERR_INVALID;
+
+    pthread_rwlock_rdlock((pthread_rwlock_t *)&src->rwlock);
+    pthread_rwlock_wrlock(&dst->rwlock);
+
+    st_error_t first_err = ST_OK;
+    size_t src_count = src->patterns.count;
+    for (size_t i = 0; i < src_count; i++) {
+        const char *pat = src->patterns.strings[i];
+        if (!pat) continue;
+        st_error_t err = st_policy_add_locked(dst, pat);
+        if (err != ST_OK && err != ST_ERR_INVALID && first_err == ST_OK) {
+            first_err = err;
+        }
+    }
+
+    pthread_rwlock_unlock(&dst->rwlock);
+    pthread_rwlock_unlock((pthread_rwlock_t *)&src->rwlock);
+    return first_err;
+}
 /*
  * NOTE: This function performs a logical removal only. Since the policy
  * uses an arena allocator for trie nodes, removed patterns leave their

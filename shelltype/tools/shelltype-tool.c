@@ -48,6 +48,9 @@ static void print_usage(const char *prog)
     fprintf(stderr, "\n");
     fprintf(stderr, "Other:\n");
     fprintf(stderr, "  --normalize <cmd>    Show normalised form of a command\n");
+    fprintf(stderr, "  --normalize-typed <cmd> Show typed tokens (text + type)\n");
+    fprintf(stderr, "  --validate <pat>     Validate pattern syntax, show parsed tokens\n");
+    fprintf(stderr, "  --stats <file>       Show policy statistics\n");
     fprintf(stderr, "  -h, --help           Show this help\n");
 }
 
@@ -61,6 +64,9 @@ int main(int argc, char *argv[])
     const char *policy_file = NULL;
     const char *verify_cmd = NULL;
     const char *verify_file = NULL;
+    const char *validate_pat = NULL;
+    const char *stats_file = NULL;
+    const char *normalize_typed_cmd = NULL;
     bool do_suggest = false;
     uint32_t min_support = ST_DEFAULT_MIN_SUPPORT;
     double min_confidence = ST_DEFAULT_MIN_CONFIDENCE;
@@ -79,6 +85,9 @@ int main(int argc, char *argv[])
         { "policy",         required_argument, 0, 'P' },
         { "verify",         required_argument, 0, 'v' },
         { "verify-file",    required_argument, 0, 'V' },
+        { "validate",       required_argument, 0, 't' },
+        { "stats",          required_argument, 0, 'T' },
+        { "normalize-typed",required_argument, 0, 'N' },
         { "help",           no_argument,       0, 'h' },
         { 0, 0, 0, 0 }
     };
@@ -98,6 +107,9 @@ int main(int argc, char *argv[])
             case 'P': policy_file = optarg; break;
             case 'v': verify_cmd = optarg; break;
             case 'V': verify_file = optarg; break;
+            case 't': validate_pat = optarg; break;
+            case 'T': stats_file = optarg; break;
+            case 'N': normalize_typed_cmd = optarg; break;
             case 'h':
                 print_usage(argv[0]);
                 return 0;
@@ -123,6 +135,71 @@ int main(int argc, char *argv[])
         }
         printf("\n");
         st_free_tokens(tokens, count);
+        return 0;
+    }
+
+    /* Normalize-typed mode */
+    if (normalize_typed_cmd) {
+        st_token_array_t arr = { NULL, 0 };
+        st_error_t err = st_normalize_typed(normalize_typed_cmd, &arr);
+        if (err != ST_OK) {
+            fprintf(stderr, "Error: normalisation failed (%d)\n", err);
+            return 1;
+        }
+        for (size_t i = 0; i < arr.count; i++) {
+            const char *sym = st_type_symbol[arr.tokens[i].type];
+            printf("  [%zu] %-30s type=%-4d (%s)\n",
+                   i, arr.tokens[i].text, arr.tokens[i].type,
+                   sym[0] ? sym : "LITERAL");
+        }
+        st_free_token_array(&arr);
+        return 0;
+    }
+
+    /* Validate pattern mode */
+    if (validate_pat) {
+        st_pattern_info_t info;
+        st_error_t err = st_validate_pattern(validate_pat, &info);
+        if (err != ST_OK) {
+            fprintf(stderr, "INVALID: %s\n", validate_pat);
+            return 1;
+        }
+        printf("VALID: %s (%zu tokens)\n", validate_pat, info.token_count);
+        for (size_t i = 0; i < info.token_count; i++) {
+            const char *sym = st_type_symbol[info.token_types[i]];
+            printf("  [%zu] %-30s type=%-4d (%s)\n",
+                   i, info.token_texts[i], info.token_types[i],
+                   sym[0] ? sym : "LITERAL");
+        }
+        return 0;
+    }
+
+    /* Stats mode */
+    if (stats_file) {
+        st_policy_t *policy = st_policy_new(st_policy_ctx_new());
+        if (!policy) {
+            fprintf(stderr, "Error: failed to create policy\n");
+            return 1;
+        }
+        st_error_t err = st_policy_load(policy, stats_file, false);
+        if (err != ST_OK) {
+            fprintf(stderr, "Error: failed to load policy from '%s' (%d)\n",
+                    stats_file, err);
+            st_policy_free(policy);
+            return 1;
+        }
+        st_policy_stats_t stats;
+        st_policy_get_stats(policy, &stats);
+        printf("Policy statistics:\n");
+        printf("  Patterns:        %zu\n", stats.pattern_count);
+        printf("  States:          %zu\n", stats.state_count);
+        printf("  Memory usage:    %zu bytes\n", stats.memory_bytes);
+        printf("  Evaluations:     %lu\n", (unsigned long)stats.eval_count);
+        printf("  Filter rejects:  %lu\n", (unsigned long)stats.filter_reject_count);
+        printf("  Trie walks:      %lu\n", (unsigned long)stats.trie_walk_count);
+        printf("  Filter rebuilds: %lu\n", (unsigned long)stats.filter_rebuild_count);
+        printf("  Rebuild time:    %lu us\n", (unsigned long)stats.filter_rebuild_us);
+        st_policy_free(policy);
         return 0;
     }
 
