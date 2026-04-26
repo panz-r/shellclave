@@ -428,6 +428,22 @@ sg_error_t sg_gate_set_anomaly_adaptive(sg_gate_t *gate,
 sg_error_t sg_gate_set_anomaly_k_factor(sg_gate_t *gate, double k);
 
 /*
+ * Set the type sequence cache size (default 0 = disabled).
+ *
+ * When cache_size > 0, an LRU cache stores type sequences for recently
+ * evaluated commands, avoiding recomputation of shell_build_type_sequence
+ * on repeated commands. The cache evicts the least-recently-used entry
+ * when full.
+ *
+ * Call before or after sg_gate_enable_anomaly. Setting cache_size=0
+ * frees the cache.
+ *
+ * Returns SG_ERR_INVALID if gate is NULL or cache_size > 8192.
+ * Returns SG_ERR_MEMORY if allocation fails.
+ */
+sg_error_t sg_gate_set_anomaly_cache_size(sg_gate_t *gate, size_t cache_size);
+
+/*
  * Save the anomaly model to a file.
  * Returns SG_ERR_INVALID if anomaly detection is not enabled,
  * or SG_ERR_IO on file error.

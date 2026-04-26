@@ -98,6 +98,110 @@ static const char *bw_printf(buf_writer_t *w, const char *fmt, ...)
 }
 
 /* ============================================================
+ * TYPE SEQUENCE LRU CACHE
+ *
+ * Simple array-based LRU: MRU at end, LRU at front.
+ * On insert, move to end. On eviction, remove front.
+ * Linear scan for lookup (O(n), n ≤ 8192, acceptable).
+ * ============================================================ */
+
+typedef struct {
+    char  *key;     /* command string (owned) */
+    char  *value;   /* type sequence string (owned) */
+    size_t key_len;
+} lru_entry_t;
+
+typedef struct {
+    lru_entry_t *entries;
+    size_t       capacity;   /* max entries */
+    size_t       count;      /* current entries */
+} type_cache_t;
+
+static void type_cache_clear(type_cache_t *c)
+{
+    if (!c->entries) return;
+    for (size_t i = 0; i < c->count; i++) {
+        free(c->entries[i].key);
+        free(c->entries[i].value);
+    }
+    c->count = 0;
+}
+
+static void type_cache_free(type_cache_t *c)
+{
+    type_cache_clear(c);
+    free(c->entries);
+    c->entries  = NULL;
+    c->capacity = 0;
+}
+
+/* Lookup by key. Returns pointer to cached value string, or NULL.
+ * On hit, moves entry to MRU position (end of array). */
+static char *type_cache_lookup(type_cache_t *c, const char *key, size_t key_len)
+{
+    if (!c->entries || c->count == 0) return NULL;
+    for (size_t i = 0; i < c->count; i++) {
+        if (c->entries[i].key_len == key_len &&
+            memcmp(c->entries[i].key, key, key_len) == 0) {
+            /* Hit: move to end (MRU) by swapping with last element */
+            if (i < c->count - 1) {
+                lru_entry_t tmp = c->entries[i];
+                c->entries[i] = c->entries[c->count - 1];
+                c->entries[c->count - 1] = tmp;
+            }
+            return c->entries[c->count - 1].value;
+        }
+    }
+    return NULL;
+}
+
+/* Insert or update. Evicts LRU (front) if full.
+ * Takes ownership of value on success; caller must NOT free it.
+ * Returns true on success, false on allocation failure. */
+static bool type_cache_insert(type_cache_t *c, const char *key, size_t key_len,
+                               char *value)
+{
+    if (c->capacity == 0) return false;
+
+    /* Check if key already exists (update) */
+    for (size_t i = 0; i < c->count; i++) {
+        if (c->entries[i].key_len == key_len &&
+            memcmp(c->entries[i].key, key, key_len) == 0) {
+            free(c->entries[i].value);
+            c->entries[i].value = value;
+            /* Move to end (MRU) */
+            if (i < c->count - 1) {
+                lru_entry_t tmp = c->entries[i];
+                c->entries[i] = c->entries[c->count - 1];
+                c->entries[c->count - 1] = tmp;
+            }
+            return true;
+        }
+    }
+
+    /* Evict LRU (index 0) if full */
+    if (c->count >= c->capacity) {
+        free(c->entries[0].key);
+        free(c->entries[0].value);
+        /* Shift remaining entries left */
+        memmove(&c->entries[0], &c->entries[1], (c->count - 1) * sizeof(lru_entry_t));
+        c->count--;
+    }
+
+    /* Insert at end */
+    char *key_copy = malloc(key_len + 1);
+    if (!key_copy) return false;
+    memcpy(key_copy, key, key_len);
+    key_copy[key_len] = '\0';
+
+    c->entries[c->count].key     = key_copy;
+    c->entries[c->count].key_len = key_len;
+    c->entries[c->count].value   = value;
+    c->count++;
+    return true;
+}
+
+/* ============================================================
  * GATE STATE
  * ============================================================ */
 
@@ -139,6 +243,9 @@ struct sg_gate {
     size_t              anomaly_score_idx;      /* next write position (circular) */
     bool                anomaly_adaptive_armed; /* window is full, threshold is computed */
     double              anomaly_fixed_threshold;/* saved fixed threshold for fallback */
+
+    /* Type sequence LRU cache */
+    type_cache_t        anomaly_type_cache;   /* LRU cache for type sequences */
 };
 
 /* ============================================================
@@ -180,6 +287,7 @@ void sg_gate_free(sg_gate_t *gate)
     if (gate->anomaly_model) sg_anomaly_model_free(gate->anomaly_model);
     if (gate->anomaly_model_type) sg_anomaly_model_free(gate->anomaly_model_type);
     free(gate->anomaly_score_buf);
+    type_cache_free(&gate->anomaly_type_cache);
     if (gate->policy)       st_policy_free(gate->policy);
     if (gate->deny_policy)  st_policy_free(gate->deny_policy);
     if (gate->pctx)         st_policy_ctx_free(gate->pctx);
@@ -304,6 +412,7 @@ void sg_gate_disable_anomaly(sg_gate_t *gate)
     gate->anomaly_score_count = 0;
     gate->anomaly_score_idx = 0;
     gate->anomaly_adaptive_armed = false;
+    type_cache_clear(&gate->anomaly_type_cache);
 }
 
 sg_error_t sg_gate_set_anomaly_update_mode(sg_gate_t *gate,
@@ -429,6 +538,29 @@ sg_error_t sg_gate_set_anomaly_k_factor(sg_gate_t *gate, double k)
     /* Recompute threshold if already armed */
     if (gate->anomaly_adaptive_armed)
         adaptive_recompute_threshold(gate);
+    return SG_OK;
+}
+
+sg_error_t sg_gate_set_anomaly_cache_size(sg_gate_t *gate, size_t cache_size)
+{
+    if (!gate) return SG_ERR_INVALID;
+    if (cache_size > 8192) return SG_ERR_INVALID;
+
+    if (cache_size == 0) {
+        type_cache_free(&gate->anomaly_type_cache);
+        return SG_OK;
+    }
+
+    /* Allocate new entries array */
+    lru_entry_t *new_entries = calloc(cache_size, sizeof(lru_entry_t));
+    if (!new_entries) return SG_ERR_MEMORY;
+
+    /* Free old cache */
+    type_cache_free(&gate->anomaly_type_cache);
+
+    gate->anomaly_type_cache.entries  = new_entries;
+    gate->anomaly_type_cache.capacity = cache_size;
+    gate->anomaly_type_cache.count    = 0;
     return SG_OK;
 }
 
@@ -1648,17 +1780,34 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len,
     }
 
     /* Build type sequence tokens for hybrid anomaly detection.
-     * For each CMD node, produce a type-sequence string (e.g. "cat AP").
-     * Uses shell_build_type_sequence on the full command to get per-subcommand
-     * type strings. This allocates memory (acceptable for optional anomaly path). */
+     * Uses shell_build_type_sequence on the full command. An LRU cache
+     * avoids recomputation for repeated commands. The cache stores immutable
+     * copies; strtok_r tokenization operates on a mutable working copy. */
     char *type_seq_buf = NULL;
     const char *type_seq[SHELL_DEP_MAX_NODES];
     size_t type_count = 0;
 
     if (gate->anomaly_enabled && gate->anomaly_model_type && cmd_count > 0) {
-        type_seq_buf = shell_build_type_sequence(cmd);
+        const char *cached = type_cache_lookup(&gate->anomaly_type_cache,
+                                                cmd, cmd_len);
+        if (cached) {
+            type_seq_buf = strdup(cached);
+        } else {
+            char *raw = shell_build_type_sequence(cmd);
+            if (raw) {
+                /* Store immutable copy in cache before strtok_r mutates */
+                if (gate->anomaly_type_cache.capacity > 0) {
+                    char *for_cache = strdup(raw);
+                    if (for_cache) {
+                        if (!type_cache_insert(&gate->anomaly_type_cache,
+                                                cmd, cmd_len, for_cache))
+                            free(for_cache);
+                    }
+                }
+                type_seq_buf = raw;
+            }
+        }
         if (type_seq_buf) {
-            /* Tokenize by space to get individual type tokens */
             char *saveptr = NULL;
             char *tok = strtok_r(type_seq_buf, " ", &saveptr);
             while (tok && type_count < SHELL_DEP_MAX_NODES) {

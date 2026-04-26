@@ -2745,6 +2745,135 @@ TEST(anomaly_adaptive_null_safety)
     /* No crash = pass */
 }
 
+TEST(anomaly_cache_basic)
+{
+    /* Enable cache and verify it works with repeated commands */
+    sg_gate_t *g = sg_gate_new();
+    sg_gate_enable_anomaly(g, 5.0, 0.1, -10.0);
+    sg_gate_set_anomaly_cache_size(g, 16);
+    sg_gate_add_rule(g, "ls");
+    sg_gate_add_rule(g, "cd");
+    sg_gate_add_rule(g, "pwd");
+
+    sg_result_t r;
+    /* First call: cache miss, computes and caches */
+    eval_cmd(g, "ls ; cd /tmp ; pwd", &r);
+    ASSERT(r.anomaly_score >= 0.0);
+
+    /* Second call: cache hit, should produce same result */
+    eval_cmd(g, "ls ; cd /tmp ; pwd", &r);
+    ASSERT(r.anomaly_score >= 0.0);
+    ASSERT(!isnan(r.anomaly_score));
+
+    sg_gate_free(g);
+}
+
+TEST(anomaly_cache_hit)
+{
+    /* Verify cache hit produces same type sequence scoring */
+    sg_gate_t *g = sg_gate_new();
+    sg_gate_enable_anomaly(g, 5.0, 0.1, -10.0);
+    sg_gate_set_anomaly_cache_size(g, 64);
+    sg_gate_add_rule(g, "ls");
+    sg_gate_add_rule(g, "cd");
+    sg_gate_add_rule(g, "pwd");
+
+    sg_result_t r;
+    /* Train */
+    for (int i = 0; i < 20; i++)
+        eval_cmd(g, "ls ; cd /tmp ; pwd", &r);
+
+    /* Score after training — should be consistent */
+    eval_cmd(g, "ls ; cd /tmp ; pwd", &r);
+    double score_cached = r.anomaly_score;
+
+    eval_cmd(g, "ls ; cd /tmp ; pwd", &r);
+    double score_again = r.anomaly_score;
+
+    /* Both calls should produce identical scores */
+    ASSERT(fabs(score_cached - score_again) < 0.0001);
+
+    sg_gate_free(g);
+}
+
+TEST(anomaly_cache_eviction)
+{
+    /* Fill cache beyond capacity, verify eviction works */
+    sg_gate_t *g = sg_gate_new();
+    sg_gate_enable_anomaly(g, 5.0, 0.1, -10.0);
+    sg_gate_set_anomaly_cache_size(g, 4);  /* tiny cache */
+    sg_gate_add_rule(g, "ls");
+    sg_gate_add_rule(g, "cd");
+    sg_gate_add_rule(g, "pwd");
+    sg_gate_add_rule(g, "cat");
+    sg_gate_add_rule(g, "grep");
+
+    sg_result_t r;
+    /* Issue 6 different commands — should evict oldest */
+    eval_cmd(g, "ls ; cd /tmp ; pwd", &r);
+    eval_cmd(g, "cat /etc/hosts ; ls ; pwd", &r);
+    eval_cmd(g, "grep root /etc/passwd ; cat ; ls", &r);
+    eval_cmd(g, "pwd ; ls ; cd /home", &r);
+    eval_cmd(g, "ls ; cat /tmp ; grep test", &r);
+    eval_cmd(g, "cd /var ; ls ; pwd", &r);
+
+    /* All should produce valid scores */
+    ASSERT(!isnan(r.anomaly_score));
+
+    /* Re-evaluate first command — should be a cache miss (evicted) */
+    eval_cmd(g, "ls ; cd /tmp ; pwd", &r);
+    ASSERT(r.anomaly_score >= 0.0);
+
+    sg_gate_free(g);
+}
+
+TEST(anomaly_cache_disabled)
+{
+    /* With cache_size=0, shell_build_type_sequence called each time */
+    sg_gate_t *g = sg_gate_new();
+    sg_gate_enable_anomaly(g, 5.0, 0.1, -10.0);
+    /* cache not enabled (default) */
+    sg_gate_add_rule(g, "ls");
+
+    sg_result_t r;
+    eval_cmd(g, "ls ; cd /tmp ; pwd", &r);
+    eval_cmd(g, "ls ; cd /tmp ; pwd", &r);
+    ASSERT(r.anomaly_score >= 0.0);
+
+    sg_gate_free(g);
+}
+
+TEST(anomaly_cache_null_safety)
+{
+    sg_gate_set_anomaly_cache_size(NULL, 16);
+    sg_gate_set_anomaly_cache_size(NULL, 0);
+    /* No crash = pass */
+}
+
+TEST(anomaly_cache_resize)
+{
+    /* Enable cache, then resize to 0 (free), then re-enable */
+    sg_gate_t *g = sg_gate_new();
+    sg_gate_enable_anomaly(g, 5.0, 0.1, -10.0);
+    sg_gate_add_rule(g, "ls");
+
+    sg_gate_set_anomaly_cache_size(g, 16);
+    sg_result_t r;
+    eval_cmd(g, "ls ; cd /tmp ; pwd", &r);
+
+    /* Resize to 0 (disable cache) */
+    sg_gate_set_anomaly_cache_size(g, 0);
+    eval_cmd(g, "ls ; cd /tmp ; pwd", &r);
+    ASSERT(r.anomaly_score >= 0.0);
+
+    /* Re-enable with different size */
+    sg_gate_set_anomaly_cache_size(g, 32);
+    eval_cmd(g, "ls ; cd /tmp ; pwd", &r);
+    ASSERT(r.anomaly_score >= 0.0);
+
+    sg_gate_free(g);
+}
+
 /* ============================================================
  * TYPE SEQUENCE TESTS
  * ============================================================ */
@@ -3029,6 +3158,14 @@ int main(void)
     RUN(anomaly_adaptive_disable);
     RUN(anomaly_adaptive_save_load);
     RUN(anomaly_adaptive_null_safety);
+
+    printf("\nType sequence cache:\n");
+    RUN(anomaly_cache_basic);
+    RUN(anomaly_cache_hit);
+    RUN(anomaly_cache_eviction);
+    RUN(anomaly_cache_disabled);
+    RUN(anomaly_cache_null_safety);
+    RUN(anomaly_cache_resize);
 
     printf("\nType sequence:\n");
     RUN(type_seq_simple_command);
