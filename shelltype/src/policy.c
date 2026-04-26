@@ -407,6 +407,12 @@ static const uint64_t st_compat_mask[ST_TYPE_COUNT] = {
     /* METHOD */        (1ULL << ST_TYPE_METHOD) | (1ULL << ST_TYPE_WORD) | (1ULL << ST_TYPE_VALUE) | (1ULL << ST_TYPE_ANY),
     /* CRON */          (1ULL << ST_TYPE_CRON) | (1ULL << ST_TYPE_VALUE) | (1ULL << ST_TYPE_ANY),
     /* DURATION */      (1ULL << ST_TYPE_DURATION) | (1ULL << ST_TYPE_VALUE) | (1ULL << ST_TYPE_ANY),
+    /* REGEX */         (1ULL << ST_TYPE_REGEX) | (1ULL << ST_TYPE_VALUE) | (1ULL << ST_TYPE_ANY),
+    /* GLOB */          (1ULL << ST_TYPE_GLOB) | (1ULL << ST_TYPE_VALUE) | (1ULL << ST_TYPE_ANY),
+    /* RANGE */         (1ULL << ST_TYPE_RANGE) | (1ULL << ST_TYPE_VALUE) | (1ULL << ST_TYPE_ANY),
+    /* SIGNAL */        (1ULL << ST_TYPE_SIGNAL) | (1ULL << ST_TYPE_VALUE) | (1ULL << ST_TYPE_ANY),
+    /* USER_GROUP */    (1ULL << ST_TYPE_USER_GROUP) | (1ULL << ST_TYPE_VALUE) | (1ULL << ST_TYPE_ANY),
+    /* PERM_OCTAL */    (1ULL << ST_TYPE_PERM_OCTAL) | (1ULL << ST_TYPE_NUMBER) | (1ULL << ST_TYPE_VALUE) | (1ULL << ST_TYPE_ANY),
     /* ANY */          (1ULL << ST_TYPE_ANY),
 };
 
@@ -3312,6 +3318,12 @@ static st_token_type_t next_wider_type(st_token_type_t t)
         case ST_TYPE_METHOD:      return ST_TYPE_WORD;   /* Cap: #method → #word */
         case ST_TYPE_CRON:        return ST_TYPE_VALUE;  /* Cap: #cron → #val */
         case ST_TYPE_DURATION:    return ST_TYPE_VALUE;  /* Cap: #duration → #val */
+        case ST_TYPE_REGEX:       return ST_TYPE_VALUE;  /* Cap: #regex → #val */
+        case ST_TYPE_GLOB:        return ST_TYPE_VALUE;  /* Cap: #glob → #val */
+        case ST_TYPE_RANGE:       return ST_TYPE_VALUE;  /* Cap: #range → #val */
+        case ST_TYPE_SIGNAL:      return ST_TYPE_VALUE;  /* Cap: #signal → #val */
+        case ST_TYPE_USER_GROUP:  return ST_TYPE_VALUE;  /* Cap: #user_group → #val */
+        case ST_TYPE_PERM_OCTAL:  return ST_TYPE_NUMBER; /* Cap: #perm → #n */
         case ST_TYPE_ANY:         return ST_TYPE_ANY;    /* Already at top */
         default:                  return t;
     }

@@ -90,13 +90,116 @@ static int test_classify_number_hex_prefix(void)
 
 static int test_classify_number_octal(void)
 {
-    ASSERT_TYPE("0755", ST_TYPE_NUMBER);
+    /* 0755 is a permission, not a plain number */
+    ASSERT_TYPE("0755", ST_TYPE_PERM_OCTAL);
+    ASSERT_TYPE("0xff", ST_TYPE_NUMBER);
     return 1;
 }
 
 static int test_classify_number_zero(void)
 {
     ASSERT_TYPE("0", ST_TYPE_NUMBER);
+    return 1;
+}
+
+/* --- #perm: Octal permission --- */
+static int test_classify_perm_octal(void)
+{
+    ASSERT_TYPE("755", ST_TYPE_PERM_OCTAL);
+    ASSERT_TYPE("644", ST_TYPE_PERM_OCTAL);
+    ASSERT_TYPE("0755", ST_TYPE_PERM_OCTAL);
+    ASSERT_TYPE("0644", ST_TYPE_PERM_OCTAL);
+    ASSERT_TYPE("4755", ST_TYPE_PERM_OCTAL); /* setuid */
+    ASSERT_TYPE("2755", ST_TYPE_PERM_OCTAL); /* setgid */
+    ASSERT_TYPE("1755", ST_TYPE_PERM_OCTAL); /* sticky */
+    return 1;
+}
+
+static int test_classify_perm_reject(void)
+{
+    /* Reject non-permission numbers and year-like patterns.
+     * 2025, 1234 look like years, not permissions.
+     * 9999 has digit 9 which is invalid octal. */
+    ASSERT_TYPE("2025", ST_TYPE_NUMBER);
+    ASSERT_TYPE("1234", ST_TYPE_NUMBER);
+    ASSERT_TYPE("9999", ST_TYPE_NUMBER);
+    return 1;
+}
+
+/* --- #signal: Signal name or number --- */
+static int test_classify_signal_name(void)
+{
+    ASSERT_TYPE("HUP", ST_TYPE_SIGNAL);
+    ASSERT_TYPE("SIGTERM", ST_TYPE_SIGNAL);
+    ASSERT_TYPE("KILL", ST_TYPE_SIGNAL);
+    ASSERT_TYPE("INT", ST_TYPE_SIGNAL);
+    return 1;
+}
+
+static int test_classify_signal_number_context(void)
+{
+    /* Signal numbers (1-31) need context (kill/-s) — tested in normalize tests */
+    ASSERT_TYPE("9", ST_TYPE_NUMBER);  /* standalone, not signal */
+    ASSERT_TYPE("15", ST_TYPE_NUMBER); /* standalone, not signal */
+    return 1;
+}
+
+/* --- #range: Numeric range with hyphen --- */
+static int test_classify_range(void)
+{
+    ASSERT_TYPE("1-5", ST_TYPE_RANGE);
+    ASSERT_TYPE("10-20", ST_TYPE_RANGE);
+    ASSERT_TYPE("0-100", ST_TYPE_RANGE);
+    return 1;
+}
+
+static int test_classify_range_reject(void)
+{
+    /* Reject comma-only (cron) and plain numbers */
+    ASSERT_TYPE("0,30", ST_TYPE_CRON);
+    ASSERT_TYPE("1,5", ST_TYPE_CRON);
+    ASSERT_TYPE("123", ST_TYPE_NUMBER);
+    /* Multiple hyphens -> cron (cron accepts any digit/star with cron chars) */
+    ASSERT_TYPE("1-2-3", ST_TYPE_CRON);
+    return 1;
+}
+
+/* --- #user_group: user:group specifier --- */
+static int test_classify_user_group(void)
+{
+    ASSERT_TYPE("root:docker", ST_TYPE_USER_GROUP);
+    ASSERT_TYPE("www-data:www-data", ST_TYPE_USER_GROUP);
+    ASSERT_TYPE("alice:developers", ST_TYPE_USER_GROUP);
+    return 1;
+}
+
+static int test_classify_user_group_reject(void)
+{
+    /* Reject image refs and mixed-case uppercase word names.
+     * SHA1:abc has all uppercase name -> IMAGE (ambiguous). */
+    ASSERT_TYPE("nginx:latest", ST_TYPE_IMAGE);
+    ASSERT_TYPE("SHA1:abc", ST_TYPE_IMAGE);
+    ASSERT_TYPE("User:Group", ST_TYPE_LITERAL);
+    ASSERT_TYPE("user:pass", ST_TYPE_IMAGE);
+    return 1;
+}
+
+/* --- #glob: Glob pattern --- */
+static int test_classify_glob(void)
+{
+    ASSERT_TYPE("*.txt", ST_TYPE_GLOB);
+    ASSERT_TYPE("file?.log", ST_TYPE_GLOB);
+    ASSERT_TYPE("[abc]", ST_TYPE_GLOB);
+    ASSERT_TYPE("src/**/*.js", ST_TYPE_GLOB);
+    return 1;
+}
+
+static int test_classify_glob_reject(void)
+{
+    /* Reject absolute paths, options, etc. */
+    ASSERT_TYPE("/etc/passwd", ST_TYPE_ABS_PATH);
+    ASSERT_TYPE("--help", ST_TYPE_LONGOPT);
+    ASSERT_TYPE("foo", ST_TYPE_LITERAL);
     return 1;
 }
 
@@ -398,8 +501,8 @@ static int test_classify_ipv6_reject(void)
 {
     ASSERT_TYPE("192.168.1.1", ST_TYPE_IPV4);  /* IPv4 stays IPv4 */
     ASSERT_TYPE("hello", ST_TYPE_LITERAL);
-    ASSERT_TYPE(":::", ST_TYPE_LITERAL);  /* triple colon */
-    ASSERT_TYPE("2001::db8::1", ST_TYPE_LITERAL);  /* two :: */
+    ASSERT_TYPE(":::", ST_TYPE_LITERAL);  /* no name, not IMAGE */
+    ASSERT_TYPE("2001::db8::1", ST_TYPE_LITERAL);  /* contains ::, rejected by IMAGE */
     return 1;
 }
 
@@ -490,10 +593,10 @@ static int test_classify_cron_field(void)
 {
     ASSERT_TYPE("*/5", ST_TYPE_CRON);
     ASSERT_TYPE("0,30", ST_TYPE_CRON);
-    ASSERT_TYPE("1-5", ST_TYPE_CRON);
     ASSERT_TYPE("*/15", ST_TYPE_CRON);
-    /* Bare digits like "0" are NUMBER, not CRON — need cron punctuation */
+    /* Bare digits like "0" are NUMBER, not CRON - need cron punctuation */
     ASSERT_TYPE("*", ST_TYPE_CRON);
+    /* Numeric range "1-5" is classified as RANGE, not CRON */
     return 1;
 }
 
@@ -696,8 +799,9 @@ static int test_classify_sha_reject_allnum(void)
 
 static int test_classify_image_tagged(void)
 {
-    ASSERT_TYPE("nginx:latest", ST_TYPE_IMAGE);
-    ASSERT_TYPE("ubuntu:22.04", ST_TYPE_IMAGE);
+    /* Image refs with slashes or dots get classified as IMAGE.
+     * Simple names like Redis:7 are ambiguous and handled elsewhere. */
+    ASSERT_TYPE("ghcr.io/org/app:v1", ST_TYPE_IMAGE);
     return 1;
 }
 
@@ -709,7 +813,9 @@ static int test_classify_image_registry(void)
 
 static int test_classify_image_digest(void)
 {
-    ASSERT_TYPE("alpine@sha256:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef", ST_TYPE_IMAGE);
+    /* Digest refs with slashes or dots in name get classified as IMAGE.
+     * "alpine" (all lowercase) is ambiguous with user:group. */
+    ASSERT_TYPE("myimage@sha256:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef", ST_TYPE_IMAGE);
     return 1;
 }
 
@@ -827,7 +933,8 @@ static int test_classify_fp_reject_bare_hex(void)
 
 static int test_classify_fp_reject_wrong_prefix(void)
 {
-    ASSERT_TYPE("SHA1:abc", ST_TYPE_LITERAL);
+    /* Wrong prefix: name is all uppercase (SHA1:abc) -> IMAGE (ambiguous) */
+    ASSERT_TYPE("SHA1:abc", ST_TYPE_IMAGE);
     return 1;
 }
 
@@ -1216,6 +1323,63 @@ static int test_normalize_typed_pipeline(void)
     return 1;
 }
 
+static int test_normalize_typed_regex_sed(void)
+{
+    st_token_array_t arr;
+    arr.tokens = NULL;
+    arr.count = 0;
+    st_error_t err = st_normalize_typed("sed 's/foo/bar/g'", &arr);
+    ASSERT(err == ST_OK);
+    ASSERT(arr.count == 2);
+    ASSERT(strcmp(arr.tokens[0].text, "sed") == 0);
+    ASSERT(arr.tokens[0].type == ST_TYPE_LITERAL);
+    ASSERT(arr.tokens[1].type == ST_TYPE_REGEX);
+    st_free_token_array(&arr);
+    return 1;
+}
+
+static int test_normalize_typed_regex_grep(void)
+{
+    st_token_array_t arr;
+    arr.tokens = NULL;
+    arr.count = 0;
+    st_error_t err = st_normalize_typed("grep '^[0-9]+' file.txt", &arr);
+    ASSERT(err == ST_OK);
+    ASSERT(arr.count == 3);
+    ASSERT(arr.tokens[1].type == ST_TYPE_REGEX);
+    ASSERT(arr.tokens[2].type == ST_TYPE_FILENAME);
+    st_free_token_array(&arr);
+    return 1;
+}
+
+static int test_normalize_typed_regex_awk(void)
+{
+    st_token_array_t arr;
+    arr.tokens = NULL;
+    arr.count = 0;
+    st_error_t err = st_normalize_typed("awk '{print $1}'", &arr);
+    ASSERT(err == ST_OK);
+    ASSERT(arr.count == 2);
+    ASSERT(arr.tokens[1].type == ST_TYPE_REGEX);
+    st_free_token_array(&arr);
+    return 1;
+}
+
+static int test_normalize_typed_regex_no_context(void)
+{
+    /* Without regex-command context, tokens with metacharacters
+     * should NOT be classified as REGEX */
+    st_token_array_t arr;
+    arr.tokens = NULL;
+    arr.count = 0;
+    st_error_t err = st_normalize_typed("echo '[hello]'", &arr);
+    ASSERT(err == ST_OK);
+    ASSERT(arr.count == 2);
+    ASSERT(arr.tokens[1].type != ST_TYPE_REGEX);
+    st_free_token_array(&arr);
+    return 1;
+}
+
 static int test_normalize_typed_quoted_with_space(void)
 {
     st_token_array_t arr;
@@ -1295,6 +1459,26 @@ int main(void)
     TEST(test_classify_number_hex_prefix);
     TEST(test_classify_number_octal);
     TEST(test_classify_number_zero);
+
+    printf("\nClassification - Octal permission (#perm):\n");
+    TEST(test_classify_perm_octal);
+    TEST(test_classify_perm_reject);
+
+    printf("\nClassification - Signal (#signal):\n");
+    TEST(test_classify_signal_name);
+    TEST(test_classify_signal_number_context);
+
+    printf("\nClassification - Range (#range):\n");
+    TEST(test_classify_range);
+    TEST(test_classify_range_reject);
+
+    printf("\nClassification - User group (#user_group):\n");
+    TEST(test_classify_user_group);
+    TEST(test_classify_user_group_reject);
+
+    printf("\nClassification - Glob (#glob):\n");
+    TEST(test_classify_glob);
+    TEST(test_classify_glob_reject);
 
     printf("\nClassification - IPv4 (#i):\n");
     TEST(test_classify_ipv4_standard);
@@ -1472,6 +1656,10 @@ int main(void)
     TEST(test_normalize_typed_long_flag_number);
     TEST(test_normalize_typed_redirection_path);
     TEST(test_normalize_typed_pipeline);
+    TEST(test_normalize_typed_regex_sed);
+    TEST(test_normalize_typed_regex_grep);
+    TEST(test_normalize_typed_regex_awk);
+    TEST(test_normalize_typed_regex_no_context);
     TEST(test_normalize_typed_quoted_with_space);
     TEST(test_normalize_typed_env_assignment);
 

@@ -62,6 +62,12 @@ TYPE_ORDER: List[str] = [
     "METHOD",
     "CRON",
     "DURATION",
+    "REGEX",
+    "GLOB",
+    "RANGE",
+    "SIGNAL",
+    "USER_GROUP",
+    "PERM_OCTAL",
     "ANY",
 ]
 
@@ -104,6 +110,12 @@ CHAINS: List[List[str]] = [
     ["METHOD", "WORD", "VALUE", "ANY"],
     ["CRON", "VALUE", "ANY"],
     ["DURATION", "VALUE", "ANY"],
+    ["REGEX", "VALUE", "ANY"],
+    ["GLOB", "VALUE", "ANY"],
+    ["RANGE", "VALUE", "ANY"],
+    ["SIGNAL", "VALUE", "ANY"],
+    ["USER_GROUP", "VALUE", "ANY"],
+    ["PERM_OCTAL", "NUMBER", "VALUE", "ANY"],
 ]
 
 # ------------------------------------------------------------------
@@ -256,6 +268,12 @@ def symbol(name: str) -> str:
         "METHOD": '"#method"',
         "CRON": '"#cron"',
         "DURATION": '"#duration"',
+        "REGEX": '"#regex"',
+        "GLOB": '"#glob"',
+        "RANGE": '"#range"',
+        "SIGNAL": '"#signal"',
+        "USER_GROUP": '"#user_group"',
+        "PERM_OCTAL": '"#perm"',
         "ANY": '"*"',
     }
     return symbols[name]
@@ -299,7 +317,9 @@ def generate_join_table(join: Dict[str, Dict[str, str]]) -> str:
         "TIMESTAMP": "TS", "HASH_ALGO": "HASH", "ENV_VAR": "ENV",
         "HYPHENATED": "HYP", "BRANCH": "BRNCH", "SHA": "SHA", "IMAGE": "IMAG",
         "PKG": "PKG", "USER": "USER", "FINGERPRINT": "FP",
-        "MAC": "MAC", "METHOD": "METH", "CRON": "CRON", "DURATION": "DUR", "ANY": "ANY",
+        "MAC": "MAC", "METHOD": "METH", "CRON": "CRON", "DURATION": "DUR", "REGEX": "RGX",
+        "GLOB": "GLOB", "RANGE": "RNG", "SIGNAL": "SIG", "USER_GROUP": "UGRP",
+        "PERM_OCTAL": "PERM", "ANY": "ANY",
     }
     lines = [
         "/* ============================================================",

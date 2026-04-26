@@ -60,7 +60,8 @@ const char *st_error_string(st_error_t err);
  *   #p ⊂ #path ⊂ *
  *   #u ⊂ *
  *   #method ⊂ #w ⊂ #val ⊂ *
- *   #mac, #cron, #duration ⊂ #val ⊂ *
+ *   #mac, #cron, #duration, #regex, #glob, #range, #signal,
+ *   #user_group, #perm ⊂ #val ⊂ *
  *
  * #f and #w are incomparable (a filename is not a word, a word is not a filename).
  * #hash, #hyp ⊂ #w ⊂ #val ⊂ *
@@ -106,6 +107,12 @@ typedef enum {
     ST_TYPE_METHOD,        /* #method: HTTP method (GET, POST, PUT, etc.) */
     ST_TYPE_CRON,          /* #cron: cron schedule field */
     ST_TYPE_DURATION,      /* #duration: time duration (30s, 1.5h, 100ms) */
+    ST_TYPE_REGEX,          /* #regex: regular expression pattern */
+    ST_TYPE_GLOB,           /* #glob: glob pattern (*.txt, file?.log) */
+    ST_TYPE_RANGE,          /* #range: numeric range (1-5, 0,30) */
+    ST_TYPE_SIGNAL,         /* #signal: signal name/number (HUP, SIGTERM, 9) */
+    ST_TYPE_USER_GROUP,     /* #user_group: user:group spec (root:docker) */
+    ST_TYPE_PERM_OCTAL,     /* #perm: octal permission (755, 0644) */
     ST_TYPE_ANY,           /* *: everything (top element) */
     ST_TYPE_COUNT          /* number of types */
 } st_token_type_t;
