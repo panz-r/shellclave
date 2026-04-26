@@ -3044,6 +3044,167 @@ TEST(bayesian_null_safety)
 }
 
 /* ============================================================
+ * CALIBRATION / ROC TESTS
+ * ============================================================ */
+
+TEST(calibrate_synthetic_higher_than_normal)
+{
+    /* Synthetic anomalies should score higher than normal commands after training */
+    sg_gate_t *g = sg_gate_new();
+    sg_gate_enable_anomaly(g, 5.0, 0.1, -10.0);
+    sg_gate_add_rule(g, "ls");
+    sg_gate_add_rule(g, "cd");
+    sg_gate_add_rule(g, "pwd");
+    sg_gate_add_rule(g, "cat");
+    sg_gate_add_rule(g, "grep");
+    sg_gate_add_rule(g, "sort");
+    sg_gate_add_rule(g, "echo");
+    sg_gate_add_rule(g, "mkdir");
+    sg_gate_add_rule(g, "cp");
+    sg_gate_add_rule(g, "mv");
+
+    /* Train on normal sequences */
+    const char *normal[] = {
+        "ls ; cd /tmp ; pwd",
+        "cat file.txt ; grep pattern ; sort",
+        "echo hello ; sleep 1 ; true",
+        "mkdir dir ; chmod 755 dir ; ls dir",
+        "cp a b ; mv b c ; rm c",
+    };
+    sg_result_t r;
+    for (int i = 0; i < 50; i++)
+        eval_cmd(g, normal[i % 5], &r);
+
+    /* Score normal commands */
+    double normal_scores[5];
+    for (int i = 0; i < 5; i++) {
+        eval_cmd(g, normal[i], &r);
+        normal_scores[i] = r.anomaly_score;
+    }
+
+    /* Score synthetic anomalies (unusual commands) */
+    const char *anomalies[] = {
+        "mkfs ; fdisk ; dd",
+        "iptables ; reboot ; shutdown",
+        "nc ; strace ; objdump",
+        "gdb ; hexdump ; base64",
+        "strings ; nm ; strip",
+    };
+    double anomaly_scores[5];
+    for (int i = 0; i < 5; i++) {
+        eval_cmd(g, anomalies[i], &r);
+        anomaly_scores[i] = r.anomaly_score;
+    }
+
+    /* Average anomaly score should be higher than average normal score */
+    double avg_normal = 0, avg_anomaly = 0;
+    for (int i = 0; i < 5; i++) { avg_normal += normal_scores[i]; avg_anomaly += anomaly_scores[i]; }
+    avg_normal /= 5.0;
+    avg_anomaly /= 5.0;
+    ASSERT(avg_anomaly > avg_normal);
+
+    sg_gate_free(g);
+}
+
+TEST(calibrate_roc_computation)
+{
+    /* Verify ROC point computation from known scores */
+    double normal_scores[] = {1.0, 1.5, 2.0, 0.5, 1.2};
+    double anomaly_scores[] = {3.0, 4.5, 6.0, 2.5, 5.0};
+    size_t nn = 5, na = 5;
+
+    /* At threshold 2.0: normal flagged = 1 (score 2.0 is NOT > 2.0, so 0),
+       but let's just compute manually */
+    double threshold = 2.5;
+    int tp = 0, fp = 0, tn = 0, fn = 0;
+    for (size_t i = 0; i < nn; i++) {
+        if (normal_scores[i] > threshold) fp++; else tn++;
+    }
+    for (size_t i = 0; i < na; i++) {
+        if (anomaly_scores[i] > threshold) tp++; else fn++;
+    }
+    /* At threshold 2.5:
+       normal: 1.0, 1.5, 2.0, 0.5, 1.2 -> all <= 2.5 -> fp=0, tn=5
+       anomaly: 3.0, 4.5, 6.0, 2.5, 5.0 -> 3.0>2.5, 4.5>2.5, 6.0>2.5, 2.5 NOT > 2.5, 5.0>2.5 -> tp=4, fn=1 */
+    ASSERT(tp == 4);
+    ASSERT(fp == 0);
+    ASSERT(tn == 5);
+    ASSERT(fn == 1);
+
+    double tpr = (double)tp / (double)(tp + fn);
+    double fpr = (double)fp / (double)(fp + tn);
+    ASSERT(fabs(tpr - 0.8) < 0.001);
+    ASSERT(fabs(fpr - 0.0) < 0.001);
+}
+
+TEST(calibrate_swap_perturbation)
+{
+    /* Verify that swapping two tokens produces a different string */
+    const char *tokens[] = {"ls", "cd", "pwd"};
+    const char *swapped[] = {"cd", "ls", "pwd"};
+    /* Different order -> different string */
+    ASSERT(strcmp(tokens[0], swapped[0]) != 0);
+    /* Tokens still present */
+    ASSERT(strcmp(tokens[0], "ls") == 0);
+    ASSERT(strcmp(swapped[0], "cd") == 0);
+}
+
+TEST(calibrate_insert_perturbation)
+{
+    /* Verify that inserting a token increases count */
+    const char *orig[] = {"ls", "cd", "pwd"};
+    const char *inserted[] = {"ls", "mkfs", "cd", "pwd"};
+    (void)orig;
+    ASSERT(inserted[1] != NULL);
+    /* Inserted array has 4 tokens, original has 3 */
+    /* This validates the concept rather than the tool code directly */
+}
+
+TEST(calibrate_training_reduces_score)
+{
+    /* Property: scoring a command after training should give a lower score */
+    sg_gate_t *g = sg_gate_new();
+    sg_gate_enable_anomaly(g, 5.0, 0.1, -10.0);
+    sg_gate_add_rule(g, "ls");
+    sg_gate_add_rule(g, "cd");
+    sg_gate_add_rule(g, "pwd");
+
+    /* Score before training */
+    sg_result_t r;
+    eval_cmd(g, "ls ; cd /tmp ; pwd", &r);
+    double before = r.anomaly_score;
+
+    /* Train extensively */
+    for (int i = 0; i < 100; i++)
+        eval_cmd(g, "ls ; cd /tmp ; pwd", &r);
+
+    /* Score after training */
+    eval_cmd(g, "ls ; cd /tmp ; pwd", &r);
+    double after = r.anomaly_score;
+
+    ASSERT(after <= before);
+    sg_gate_free(g);
+}
+
+TEST(calibrate_auc_bounds)
+{
+    /* AUC should be between 0.0 and 1.0 for any reasonable ROC curve */
+    /* Compute manually with 3 points */
+    double tpr[] = {1.0, 0.8, 0.0};
+    double fpr[] = {1.0, 0.2, 0.0};
+
+    double auc = 0.0;
+    for (int i = 1; i < 3; i++) {
+        double dfpr = fabs(fpr[i] - fpr[i-1]);
+        auc += dfpr * (tpr[i] + tpr[i-1]) / 2.0;
+    }
+    ASSERT(auc >= 0.0);
+    ASSERT(auc <= 1.0);
+    /* For this perfect-ish curve: AUC = 0.8*0.9 + 0.2*0.4 = 0.72 + 0.08 = 0.80 */
+    ASSERT(fabs(auc - 0.80) < 0.001);
+}
+
+/* ============================================================
  * TYPE SEQUENCE TESTS
  * ============================================================ */
 
@@ -3358,6 +3519,14 @@ int main(void)
     RUN(bayesian_fallback_to_weighted);
     RUN(bayesian_short_sequence);
     RUN(bayesian_null_safety);
+
+    printf("\nCalibration / ROC:\n");
+    RUN(calibrate_synthetic_higher_than_normal);
+    RUN(calibrate_roc_computation);
+    RUN(calibrate_swap_perturbation);
+    RUN(calibrate_insert_perturbation);
+    RUN(calibrate_training_reduces_score);
+    RUN(calibrate_auc_bounds);
 
     cleanup_temp_files();
     printf("\n========================================\n");

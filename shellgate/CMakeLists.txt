@@ -69,6 +69,11 @@ add_executable(anomaly_demo
 )
 target_link_libraries(anomaly_demo PRIVATE shellgate)
 
+add_executable(anomaly_calibrate
+    tools/anomaly_calibrate.c
+)
+target_link_libraries(anomaly_calibrate PRIVATE shellgate)
+
 include(CTest)
 add_test(NAME shellgate COMMAND test_shellgate)
 
