@@ -201,9 +201,15 @@ typedef struct {
      *
      * anomaly_detected: true if anomaly_score > threshold.
      *                    Always false for sequences with < 3 commands.
+     *
+     * anomaly_score_raw:  score from the raw command name model (bits/cmd).
+     * anomaly_score_type: score from the type sequence model (bits/cmd).
+     *                      0.0 if type model is disabled or seq < 3 commands.
      */
     bool    anomaly_detected;
     double  anomaly_score;
+    double  anomaly_score_raw;
+    double  anomaly_score_type;
 } sg_result_t;
 
 typedef struct sg_gate sg_gate_t;

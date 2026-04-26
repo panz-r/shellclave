@@ -2875,6 +2875,85 @@ TEST(anomaly_cache_resize)
 }
 
 /* ============================================================
+ * SEPARATE SCORE TESTS
+ * ============================================================ */
+
+TEST(anomaly_separate_scores_basic)
+{
+    /* Both raw and type scores should be populated after training */
+    sg_gate_t *g = sg_gate_new();
+    sg_gate_enable_anomaly(g, 5.0, 0.1, -10.0);
+    sg_gate_add_rule(g, "ls");
+    sg_gate_add_rule(g, "cd");
+    sg_gate_add_rule(g, "pwd");
+
+    sg_result_t r;
+    for (int i = 0; i < 10; i++)
+        eval_cmd(g, "ls ; cd /tmp ; pwd", &r);
+
+    eval_cmd(g, "ls ; cd /tmp ; pwd", &r);
+    /* Both scores should be finite (not INFINITY or NaN) */
+    ASSERT(isfinite(r.anomaly_score_raw));
+    ASSERT(isfinite(r.anomaly_score_type));
+    ASSERT(r.anomaly_score_raw >= 0.0);
+    ASSERT(r.anomaly_score_type >= 0.0);
+
+    /* Combined should equal weighted sum */
+    double expected = r.anomaly_score_raw * 0.5 + r.anomaly_score_type * 0.5;
+    ASSERT(fabs(r.anomaly_score - expected) < 0.0001);
+
+    /* Score an unseen command — raw score should be higher */
+    eval_cmd(g, "gcc ; make ; test", &r);
+    ASSERT(isfinite(r.anomaly_score_raw));
+    ASSERT(r.anomaly_score_raw > 0.0);
+
+    sg_gate_free(g);
+}
+
+TEST(anomaly_separate_scores_type_disabled)
+{
+    /* With weight_type=0, combined score should equal raw score */
+    sg_gate_t *g = sg_gate_new();
+    sg_gate_enable_anomaly(g, 5.0, 0.1, -10.0);
+    sg_gate_set_anomaly_weights(g, 1.0, 0.0);
+    sg_gate_add_rule(g, "ls");
+    sg_gate_add_rule(g, "cd");
+    sg_gate_add_rule(g, "pwd");
+    sg_gate_add_rule(g, "gcc");
+    sg_gate_add_rule(g, "make");
+
+    sg_result_t r;
+    for (int i = 0; i < 10; i++) {
+        eval_cmd(g, "ls ; cd /tmp ; pwd", &r);
+        eval_cmd(g, "gcc ; make ; ls", &r);
+    }
+
+    /* Evaluate with unseen commands to get non-zero scores */
+    eval_cmd(g, "gcc ; make ; test", &r);
+    ASSERT(isfinite(r.anomaly_score_raw));
+    /* combined = raw * 1.0 + type * 0.0 */
+    ASSERT(fabs(r.anomaly_score - r.anomaly_score_raw) < 0.0001);
+
+    sg_gate_free(g);
+}
+
+TEST(anomaly_separate_scores_short_seq)
+{
+    /* Short sequences (< 3 commands) should have score 0.0 for all fields */
+    sg_gate_t *g = sg_gate_new();
+    sg_gate_enable_anomaly(g, 5.0, 0.1, -10.0);
+    sg_gate_add_rule(g, "ls");
+
+    sg_result_t r;
+    eval_cmd(g, "ls", &r);
+    ASSERT(r.anomaly_score == 0.0);
+    ASSERT(r.anomaly_score_raw == 0.0);
+    ASSERT(r.anomaly_score_type == 0.0);
+
+    sg_gate_free(g);
+}
+
+/* ============================================================
  * TYPE SEQUENCE TESTS
  * ============================================================ */
 
@@ -3166,6 +3245,11 @@ int main(void)
     RUN(anomaly_cache_disabled);
     RUN(anomaly_cache_null_safety);
     RUN(anomaly_cache_resize);
+
+    printf("\nSeparate scores:\n");
+    RUN(anomaly_separate_scores_basic);
+    RUN(anomaly_separate_scores_type_disabled);
+    RUN(anomaly_separate_scores_short_seq);
 
     printf("\nType sequence:\n");
     RUN(type_seq_simple_command);

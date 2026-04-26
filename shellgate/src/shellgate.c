@@ -1824,8 +1824,13 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len,
                             ? sg_anomaly_score(gate->anomaly_model_type, type_seq, type_count)
                             : 0.0;
 
+        out->anomaly_score_raw = score_raw;
+        out->anomaly_score_type = score_type;
+
         if (cmd_count < 3) {
             out->anomaly_score = 0.0;
+            out->anomaly_score_raw = 0.0;
+            out->anomaly_score_type = 0.0;
             out->anomaly_detected = false;
         } else {
             /* Product of probabilities in log-space = weighted sum of bits */
