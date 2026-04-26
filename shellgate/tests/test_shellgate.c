@@ -2405,6 +2405,44 @@ TEST(anomaly_stress_test)
     sg_gate_free(g);
 }
 
+TEST(anomaly_property_test)
+{
+    /* Property test: verify that unseen commands score higher than trained commands */
+    sg_gate_t *g = sg_gate_new();
+    sg_gate_enable_anomaly(g, 5.0, 0.1, -10.0);
+    sg_gate_add_rule(g, "ls");
+    sg_gate_add_rule(g, "cd");
+    sg_gate_add_rule(g, "pwd");
+
+    sg_result_t r;
+
+    /* Train extensively on normal sequences */
+    const char *normal_seqs[] = {
+        "ls ; cd /tmp ; pwd",
+        "ls ; pwd ; cd /home",
+        "pwd ; ls ; cd /tmp",
+    };
+    for (int i = 0; i < 50; i++) {
+        eval_cmd(g, normal_seqs[i % 3], &r);
+    }
+
+    /* Score trained sequence - should have low score */
+    eval_cmd(g, "ls ; cd /tmp ; pwd", &r);
+    double trained_score = r.anomaly_score;
+    ASSERT(!isinf(trained_score));
+    ASSERT(trained_score >= 0.0);
+
+    /* Score sequence with completely unseen commands - should be higher */
+    eval_cmd(g, "vim ; emacs ; nano", &r);
+    double unseen_score = r.anomaly_score;
+    ASSERT(!isinf(unseen_score));
+
+    /* Unseen should be more anomalous (higher score) than trained */
+    ASSERT(unseen_score > trained_score);
+
+    sg_gate_free(g);
+}
+
 TEST(anomaly_null_safety)
 {
     /* These should not crash */
@@ -2599,6 +2637,7 @@ int main(void)
     RUN(anomaly_short_sequence_scoring);
     RUN(anomaly_save_load);
     RUN(anomaly_stress_test);
+    RUN(anomaly_property_test);
     RUN(anomaly_null_safety);
 
     cleanup_temp_files();
