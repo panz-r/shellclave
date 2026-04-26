@@ -1133,9 +1133,10 @@ st_error_t st_normalize_typed(const char *raw_cmd, st_token_array_t *out)
             const char *eq = strchr(tok + 2, '=');
             if (eq) {
                 size_t flag_len = (size_t)(eq - tok);
-                out->tokens[out->count].text = strndup(tok, flag_len);
-                if (!out->tokens[out->count].text) goto fail;
-                out->tokens[out->count].type = ST_TYPE_LITERAL;
+                char *flag_text = strndup(tok, flag_len);
+                if (!flag_text) goto fail;
+                out->tokens[out->count].text = flag_text;
+                out->tokens[out->count].type = st_classify_token(flag_text);
                 out->count++;
 
                 out->tokens[out->count].text = strdup(eq + 1);

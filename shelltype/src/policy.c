@@ -3259,7 +3259,8 @@ st_error_t st_policy_simulate_add(st_policy_t *policy,
  *   #p → #path → #path (cap)
  *   #u → #w (cap)
  *   #val → #val (cap)
- *   #opt → #val → * (cap)
+ *   #sopt → #opt → #val (cap)
+ *   #lopt → #opt → #val (cap)
  *   #uuid, #email, #host, #size, #semver, #ts, #env → #val → * (cap)
  *   #port → #n → #val → * (cap)
  *   #hash, #hyp → #word → #val → * (cap)
@@ -3280,7 +3281,9 @@ static st_token_type_t next_wider_type(st_token_type_t t)
         case ST_TYPE_PATH:        return ST_TYPE_PATH; /* Cap: #path stays as #path */
         case ST_TYPE_URL:         return ST_TYPE_WORD; /* Cap: #u → #w */
         case ST_TYPE_VALUE:       return ST_TYPE_VALUE; /* Cap: #val stays as #val */
-        case ST_TYPE_OPT:         return ST_TYPE_VALUE; /* Cap: #opt → #val */
+        case ST_TYPE_SHORTOPT:    return ST_TYPE_OPT;    /* #sopt → #opt */
+        case ST_TYPE_LONGOPT:     return ST_TYPE_OPT;    /* #lopt → #opt */
+        case ST_TYPE_OPT:         return ST_TYPE_VALUE;  /* Cap: #opt → #val */
         case ST_TYPE_UUID:        return ST_TYPE_VALUE; /* Cap: #uuid → #val */
         case ST_TYPE_EMAIL:       return ST_TYPE_VALUE; /* Cap: #email → #val */
         case ST_TYPE_HOSTNAME:    return ST_TYPE_VALUE; /* Cap: #host → #val */
