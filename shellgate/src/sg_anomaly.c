@@ -289,6 +289,7 @@ struct sg_anomaly_model {
     double   unk_prior;
     size_t   vocab_size;  /* number of unique unigrams */
     bool     oom;         /* true if any allocation failed */
+    size_t   unk_count;   /* count of unseen commands for probability estimation */
 };
 
 sg_anomaly_model_t *sg_anomaly_model_new(void)
@@ -338,7 +339,19 @@ void sg_anomaly_model_clear_error(sg_anomaly_model_t *model)
  *
  * Compute log P(curr | p2, p1) in bits with backoff.
  * Uses O(1) context total lookups from bi_ctx and tri_ctx hashes.
+ * For unseen commands, computes probability from unk_count and vocab.
  * ============================================================ */
+
+/* Compute log probability of unknown command in bits */
+static double unk_logprob(const sg_anomaly_model_t *m)
+{
+    /* P_unk = (unk_count + alpha) / (total_uni + unk_count + alpha * (V + 1)) */
+    double V_plus_1 = (double)m->vocab_size + 1.0;
+    double numer = (double)m->unk_count + m->alpha;
+    double denom = (double)m->total_uni + m->unk_count + m->alpha * V_plus_1;
+    if (denom <= 0) return m->unk_prior;  /* fallback if no data */
+    return log(numer / denom) / M_LN2;   /* in bits */
+}
 
 static double trigram_logprob(const sg_anomaly_model_t *m,
                                const char *p2, const char *p1, const char *curr)
@@ -349,7 +362,7 @@ static double trigram_logprob(const sg_anomaly_model_t *m,
 
     /* Try trigram */
     size_t key_len = build_trigram_key(key, sizeof(key), p2, p1, curr);
-    if (key_len == 0) return m->unk_prior;
+    if (key_len == 0) return unk_logprob(m);
 
     size_t tri_count = hash_get(&m->tri, key, key_len);
     if (tri_count > 0) {
@@ -363,7 +376,7 @@ static double trigram_logprob(const sg_anomaly_model_t *m,
 
     /* Backoff to bigram: P(curr | p1) */
     key_len = build_bigram_key(key, sizeof(key), p1, curr);
-    if (key_len == 0) return m->unk_prior;
+    if (key_len == 0) return unk_logprob(m);
 
     size_t bi_count = hash_get(&m->bi, key, key_len);
     if (bi_count > 0) {
@@ -383,7 +396,8 @@ static double trigram_logprob(const sg_anomaly_model_t *m,
         return log(numer / denom) / M_LN2;
     }
 
-    return m->unk_prior;
+    /* Unknown command - use computed UNK probability */
+    return unk_logprob(m);
 }
 
 /* ============================================================
@@ -423,8 +437,19 @@ void sg_anomaly_update(sg_anomaly_model_t *model,
     /* Update unigrams */
     for (size_t i = 0; i < len; i++) {
         size_t cmd_len = strlen(seq[i]) + 1;
-        if (!hash_inc(&model->uni, seq[i], cmd_len, 1))
-            model->oom = true;
+        /* Check if command is already known */
+        size_t existing = hash_get(&model->uni, seq[i], cmd_len);
+        if (existing > 0) {
+            /* Known command - increment normally */
+            if (!hash_inc(&model->uni, seq[i], cmd_len, 1))
+                model->oom = true;
+        } else {
+            /* New command - increment UNK count */
+            model->unk_count++;
+            /* Also add to vocabulary (promote after first sighting) */
+            if (!hash_inc(&model->uni, seq[i], cmd_len, 1))
+                model->oom = true;
+        }
     }
 
     /* Update bigrams and their context totals */
@@ -494,10 +519,10 @@ int sg_anomaly_save(const sg_anomaly_model_t *model, const char *path)
     if (!f) return -1;
 
     fprintf(f, "# anomaly-model-v3\n");
-    fprintf(f, "# %.17g %.17g %zu %zu %zu %zu\n",
+    fprintf(f, "# %.17g %.17g %zu %zu %zu %zu %zu\n",
             model->alpha, model->unk_prior,
             model->total_uni, model->total_bi, model->total_tri,
-            model->vocab_size);
+            model->vocab_size, model->unk_count);
 
     /* Write unigrams */
     for (size_t i = 0; i < model->uni.capacity; i++) {
@@ -567,6 +592,7 @@ int sg_anomaly_load(sg_anomaly_model_t *model, const char *path)
     model->total_bi = 0;
     model->total_tri = 0;
     model->vocab_size = 0;
+    model->unk_count = 0;
     model->oom = false;
     hash_init(&model->uni);
     hash_init(&model->bi);
@@ -587,13 +613,16 @@ int sg_anomaly_load(sg_anomaly_model_t *model, const char *path)
         if (!fgets(line, sizeof(line), f)) break;
         if (strncmp(line, "# anomaly-model-v3", 17) != 0) {
             double alpha = 0, unk_prior = 0;
-            size_t tu = 0, tb = 0, tt = 0, vocab = 0;
-            int n = sscanf(line + 1, " %lf %lf %zu %zu %zu %zu",
-                           &alpha, &unk_prior, &tu, &tb, &tt, &vocab);
+            size_t tu = 0, tb = 0, tt = 0, vocab = 0, unk = 0;
+            int n = sscanf(line + 1, " %lf %lf %zu %zu %zu %zu %zu",
+                           &alpha, &unk_prior, &tu, &tb, &tt, &vocab, &unk);
             if (n >= 2) { model->alpha = alpha; model->unk_prior = unk_prior; }
             if (n >= 6) {
                 model->total_uni = tu; model->total_bi = tb;
                 model->total_tri = tt; model->vocab_size = vocab;
+            }
+            if (n >= 7) {
+                model->unk_count = unk;
             }
         }
     }
@@ -670,6 +699,11 @@ size_t sg_anomaly_uni_count(const sg_anomaly_model_t *model, const char *cmd)
     return hash_get(&model->uni, cmd, cmd_len);
 }
 
+size_t sg_anomaly_unk_count(const sg_anomaly_model_t *model)
+{
+    return model ? model->unk_count : 0;
+}
+
 void sg_anomaly_reset(sg_anomaly_model_t *model)
 {
     if (!model) return;
@@ -682,6 +716,7 @@ void sg_anomaly_reset(sg_anomaly_model_t *model)
     model->total_bi = 0;
     model->total_tri = 0;
     model->vocab_size = 0;
+    model->unk_count = 0;
     model->oom = false;
     hash_init(&model->uni);
     hash_init(&model->bi);

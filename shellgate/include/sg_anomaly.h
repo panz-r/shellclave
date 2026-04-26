@@ -149,6 +149,9 @@ size_t sg_anomaly_total_tri(const sg_anomaly_model_t *model);
 /* Get unigram count for a command.  Returns 0 if never seen. */
 size_t sg_anomaly_uni_count(const sg_anomaly_model_t *model, const char *cmd);
 
+/* Get count of unseen commands (for UNK probability estimation). */
+size_t sg_anomaly_unk_count(const sg_anomaly_model_t *model);
+
 /* Clear all counts and reset to a fresh model.
  * Hyperparameters (alpha, unk_prior) are preserved. */
 void sg_anomaly_reset(sg_anomaly_model_t *model);
