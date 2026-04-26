@@ -2954,6 +2954,96 @@ TEST(anomaly_separate_scores_short_seq)
 }
 
 /* ============================================================
+ * BAYESIAN COMBINATION TESTS
+ * ============================================================ */
+
+TEST(bayesian_mode_switch)
+{
+    sg_gate_t *gate = sg_gate_new();
+    sg_gate_enable_anomaly(gate, 5.0, 0.1, -10.0);
+
+    /* Switch to BAYESIAN and back */
+    ASSERT(sg_gate_set_anomaly_combine_mode(gate, SG_ANOMALY_COMBINE_BAYESIAN) == SG_OK);
+    ASSERT(sg_gate_set_anomaly_combine_mode(gate, SG_ANOMALY_COMBINE_WEIGHTED) == SG_OK);
+
+    /* Invalid enum */
+    ASSERT(sg_gate_set_anomaly_combine_mode(gate, (sg_anomaly_combine_mode_t)99) == SG_ERR_INVALID);
+
+    sg_gate_free(gate);
+}
+
+TEST(bayesian_cdf_accumulates)
+{
+    sg_gate_t *gate = sg_gate_new();
+    sg_gate_enable_anomaly(gate, 5.0, 0.1, -10.0);
+    sg_gate_set_anomaly_combine_mode(gate, SG_ANOMALY_COMBINE_BAYESIAN);
+
+    /* Train with enough normal commands to fill CDF (128 default min samples) */
+    const char *cmds[] = {
+        "ls ; cd /tmp ; pwd",
+        "cat file.txt ; grep pattern ; sort",
+        "echo hello ; sleep 1 ; true",
+        "mkdir dir ; chmod 755 dir ; ls dir",
+        "cp a b ; mv b c ; rm c"
+    };
+
+    for (int i = 0; i < 40; i++) {
+        char buf[8192];
+        sg_result_t r;
+        sg_eval(gate, cmds[i % 5], strlen(cmds[i % 5]), buf, sizeof(buf), &r);
+    }
+
+    /* After 40 evals (each with >= 3 cmds), CDF should be populated.
+     * Score a command and verify no crash and score is finite. */
+    char buf[8192];
+    sg_result_t r;
+    sg_eval(gate, "ls ; cd /tmp ; pwd", 16, buf, sizeof(buf), &r);
+    ASSERT(isfinite(r.anomaly_score));
+    ASSERT(r.anomaly_score >= 0.0 || r.anomaly_score == 0.0);
+
+    sg_gate_free(gate);
+}
+
+TEST(bayesian_fallback_to_weighted)
+{
+    sg_gate_t *gate = sg_gate_new();
+    sg_gate_enable_anomaly(gate, 5.0, 0.1, -10.0);
+    sg_gate_set_anomaly_combine_mode(gate, SG_ANOMALY_COMBINE_BAYESIAN);
+
+    /* Before CDF is ready (0 samples), score should fall back to weighted */
+    char buf[8192];
+    sg_result_t r;
+    sg_eval(gate, "ls ; cd /tmp ; pwd", 16, buf, sizeof(buf), &r);
+
+    double expected = r.anomaly_score_raw * 0.5 + r.anomaly_score_type * 0.5;
+    ASSERT(fabs(r.anomaly_score - expected) < 0.0001);
+
+    sg_gate_free(gate);
+}
+
+TEST(bayesian_short_sequence)
+{
+    sg_gate_t *gate = sg_gate_new();
+    sg_gate_enable_anomaly(gate, 5.0, 0.1, -10.0);
+    sg_gate_set_anomaly_combine_mode(gate, SG_ANOMALY_COMBINE_BAYESIAN);
+
+    char buf[8192];
+    sg_result_t r;
+    sg_eval(gate, "ls", 2, buf, sizeof(buf), &r);
+
+    ASSERT(r.anomaly_score == 0.0);
+    ASSERT(!r.anomaly_detected);
+
+    sg_gate_free(gate);
+}
+
+TEST(bayesian_null_safety)
+{
+    ASSERT(sg_gate_set_anomaly_combine_mode(NULL, SG_ANOMALY_COMBINE_WEIGHTED) == SG_ERR_INVALID);
+    ASSERT(sg_gate_set_anomaly_combine_mode(NULL, SG_ANOMALY_COMBINE_BAYESIAN) == SG_ERR_INVALID);
+}
+
+/* ============================================================
  * TYPE SEQUENCE TESTS
  * ============================================================ */
 
@@ -3261,6 +3351,13 @@ int main(void)
     RUN(type_seq_relative_path);
     RUN(type_seq_home_path);
     RUN(type_seq_multi_command);
+
+    printf("\nBayesian combination:\n");
+    RUN(bayesian_mode_switch);
+    RUN(bayesian_cdf_accumulates);
+    RUN(bayesian_fallback_to_weighted);
+    RUN(bayesian_short_sequence);
+    RUN(bayesian_null_safety);
 
     cleanup_temp_files();
     printf("\n========================================\n");

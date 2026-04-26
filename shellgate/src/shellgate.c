@@ -16,6 +16,10 @@
 #include <stdarg.h>
 #include <math.h>
 
+#define CDF_NUM_BUCKETS 128
+#define CDF_MAX_SCORE  50.0
+#define CDF_DEFAULT_MIN_SAMPLES 128
+
 /* ============================================================
  * PORTABLE strlcpy
  * ============================================================ */
@@ -135,6 +139,9 @@ static void type_cache_free(type_cache_t *c)
     c->capacity = 0;
 }
 
+/* Forward declaration (defined after adaptive threshold helpers) */
+static void cdf_free(sg_gate_t *gate);
+
 /* Lookup by key. Returns pointer to cached value string, or NULL.
  * On hit, moves entry to MRU position (end of array). */
 static char *type_cache_lookup(type_cache_t *c, const char *key, size_t key_len)
@@ -233,6 +240,14 @@ struct sg_gate {
     bool                anomaly_update_on_non_anomaly;  /* don't learn from anomalous commands */
     double              anomaly_weight_raw;             /* weight for raw score (default 0.5) */
     double              anomaly_weight_type;            /* weight for type score (default 0.5) */
+    sg_anomaly_combine_mode_t anomaly_combine_mode;    /* WEIGHTED or BAYESIAN (default WEIGHTED) */
+
+    /* Bayesian CDF histograms */
+    size_t              cdf_bucket_count;               /* minimum samples before Bayesian is ready */
+    size_t              cdf_raw_count;                  /* observed normal samples (raw) */
+    size_t              cdf_type_count;                 /* observed normal samples (type) */
+    size_t             *cdf_raw_hist;                   /* histogram buckets for raw scores */
+    size_t             *cdf_type_hist;                  /* histogram buckets for type scores */
 
     /* Adaptive threshold */
     bool                anomaly_adaptive;       /* use adaptive threshold (default false) */
@@ -288,6 +303,7 @@ void sg_gate_free(sg_gate_t *gate)
     if (gate->anomaly_model_type) sg_anomaly_model_free(gate->anomaly_model_type);
     free(gate->anomaly_score_buf);
     type_cache_free(&gate->anomaly_type_cache);
+    cdf_free(gate);
     if (gate->policy)       st_policy_free(gate->policy);
     if (gate->deny_policy)  st_policy_free(gate->deny_policy);
     if (gate->pctx)         st_policy_ctx_free(gate->pctx);
@@ -381,6 +397,7 @@ sg_error_t sg_gate_enable_anomaly(sg_gate_t *gate,
     gate->anomaly_update_on_non_anomaly = true;
     gate->anomaly_weight_raw = 0.5;
     gate->anomaly_weight_type = 0.5;
+    gate->anomaly_combine_mode = SG_ANOMALY_COMBINE_WEIGHTED;
     gate->anomaly_fixed_threshold = threshold;
     /* Reset adaptive state (preserve adaptive flag and k_factor across re-enable) */
     gate->anomaly_score_count = 0;
@@ -413,6 +430,7 @@ void sg_gate_disable_anomaly(sg_gate_t *gate)
     gate->anomaly_score_idx = 0;
     gate->anomaly_adaptive_armed = false;
     type_cache_clear(&gate->anomaly_type_cache);
+    cdf_free(gate);
 }
 
 sg_error_t sg_gate_set_anomaly_update_mode(sg_gate_t *gate,
@@ -561,6 +579,82 @@ sg_error_t sg_gate_set_anomaly_cache_size(sg_gate_t *gate, size_t cache_size)
     gate->anomaly_type_cache.entries  = new_entries;
     gate->anomaly_type_cache.capacity = cache_size;
     gate->anomaly_type_cache.count    = 0;
+    return SG_OK;
+}
+
+/* ============================================================
+ * BAYESIAN CDF HELPERS
+ * ============================================================ */
+
+static void cdf_record(size_t *hist, size_t *total, double score)
+{
+    if (!hist) return;
+    if (!isfinite(score) || score < 0.0) return;
+    size_t bucket = (size_t)(score / CDF_MAX_SCORE * CDF_NUM_BUCKETS);
+    if (bucket >= CDF_NUM_BUCKETS) bucket = CDF_NUM_BUCKETS - 1;
+    hist[bucket]++;
+    (*total)++;
+}
+
+static double cdf_log_odds(const size_t *hist, size_t total, double score)
+{
+    if (!hist || total == 0) return 0.0;
+    if (!isfinite(score) || score < 0.0) return 0.0;
+
+    size_t bucket = (size_t)(score / CDF_MAX_SCORE * CDF_NUM_BUCKETS);
+    if (bucket >= CDF_NUM_BUCKETS) bucket = CDF_NUM_BUCKETS - 1;
+
+    /* Count entries at or below this bucket = empirical CDF numerator */
+    size_t cum = 0;
+    for (size_t i = 0; i <= bucket; i++)
+        cum += hist[i];
+
+    double f = (double)cum / (double)total;          /* F(x) */
+    double eps = 1.0 / (double)(total + 1);           /* smoothing */
+    double p_normal = f + eps;
+    double p_anomaly = (1.0 - f) + eps;
+
+    return log(p_anomaly / p_normal);                 /* log-odds */
+}
+
+static void cdf_free(sg_gate_t *gate)
+{
+    free(gate->cdf_raw_hist);
+    free(gate->cdf_type_hist);
+    gate->cdf_raw_hist = NULL;
+    gate->cdf_type_hist = NULL;
+    gate->cdf_raw_count = 0;
+    gate->cdf_type_count = 0;
+}
+
+static bool cdf_ready(const sg_gate_t *gate)
+{
+    size_t min_samples = gate->cdf_bucket_count;
+    return gate->cdf_raw_count >= min_samples &&
+           gate->cdf_type_count >= min_samples;
+}
+
+sg_error_t sg_gate_set_anomaly_combine_mode(sg_gate_t *gate,
+                                              sg_anomaly_combine_mode_t mode)
+{
+    if (!gate) return SG_ERR_INVALID;
+    if (mode != SG_ANOMALY_COMBINE_WEIGHTED &&
+        mode != SG_ANOMALY_COMBINE_BAYESIAN)
+        return SG_ERR_INVALID;
+
+    if (mode == SG_ANOMALY_COMBINE_BAYESIAN && !gate->cdf_raw_hist) {
+        gate->cdf_raw_hist = calloc(CDF_NUM_BUCKETS, sizeof(size_t));
+        gate->cdf_type_hist = calloc(CDF_NUM_BUCKETS, sizeof(size_t));
+        if (!gate->cdf_raw_hist || !gate->cdf_type_hist) {
+            cdf_free(gate);
+            return SG_ERR_MEMORY;
+        }
+        gate->cdf_bucket_count = gate->anomaly_window_size > 0
+                                  ? gate->anomaly_window_size
+                                  : CDF_DEFAULT_MIN_SAMPLES;
+    }
+
+    gate->anomaly_combine_mode = mode;
     return SG_OK;
 }
 
@@ -1833,9 +1927,19 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len,
             out->anomaly_score_type = 0.0;
             out->anomaly_detected = false;
         } else {
-            /* Product of probabilities in log-space = weighted sum of bits */
-            out->anomaly_score = score_raw * gate->anomaly_weight_raw
-                               + score_type * gate->anomaly_weight_type;
+            if (gate->anomaly_combine_mode == SG_ANOMALY_COMBINE_BAYESIAN &&
+                cdf_ready(gate)) {
+                /* Bayesian: log-odds from empirical CDF per model */
+                double lr_raw  = cdf_log_odds(gate->cdf_raw_hist,
+                                              gate->cdf_raw_count, score_raw);
+                double lr_type = cdf_log_odds(gate->cdf_type_hist,
+                                              gate->cdf_type_count, score_type);
+                out->anomaly_score = lr_raw + lr_type;
+            } else {
+                /* Weighted sum in bit-space (default, or fallback) */
+                out->anomaly_score = score_raw * gate->anomaly_weight_raw
+                                   + score_type * gate->anomaly_weight_type;
+            }
             /* Choose effective threshold: adaptive if armed, else fixed */
             double eff_threshold = gate->anomaly_threshold;
             if (gate->anomaly_adaptive && !gate->anomaly_adaptive_armed)
@@ -1986,6 +2090,15 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len,
         /* Record normal scores for adaptive threshold (before update, using current model) */
         if (gate->anomaly_adaptive && !out->anomaly_detected && isfinite(out->anomaly_score) && cmd_count >= 3)
             adaptive_record_score(gate, out->anomaly_score);
+
+        /* Record per-model CDF for Bayesian combination */
+        if (gate->anomaly_combine_mode == SG_ANOMALY_COMBINE_BAYESIAN &&
+            !out->anomaly_detected && cmd_count >= 3) {
+            cdf_record(gate->cdf_raw_hist, &gate->cdf_raw_count,
+                       out->anomaly_score_raw);
+            cdf_record(gate->cdf_type_hist, &gate->cdf_type_count,
+                       out->anomaly_score_type);
+        }
 
         if (should_update) {
             sg_anomaly_update(gate->anomaly_model, cmd_seq, cmd_count);

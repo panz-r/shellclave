@@ -404,6 +404,28 @@ sg_error_t sg_gate_set_anomaly_weights(sg_gate_t *gate,
                                          double weight_raw,
                                          double weight_type);
 
+/* Combination mode for raw and type anomaly scores.
+ *
+ * SG_ANOMALY_COMBINE_WEIGHTED (default):
+ *   combined = w_raw * score_raw + w_type * score_type
+ *   Scores in bits/command; threshold is compared directly.
+ *
+ * SG_ANOMALY_COMBINE_BAYESIAN:
+ *   Each model's score is converted to a log-odds ratio using an empirical
+ *   CDF built from observed normal scores, then combined by summation in
+ *   log-odds space.  Falls back to WEIGHTED until enough normal scores have
+ *   been observed (anomaly_window_size samples, or 128 if adaptive is off).
+ */
+typedef enum {
+    SG_ANOMALY_COMBINE_WEIGHTED = 0,
+    SG_ANOMALY_COMBINE_BAYESIAN = 1
+} sg_anomaly_combine_mode_t;
+
+/* Set the score combination method.  Default: WEIGHTED.
+ * Returns SG_ERR_INVALID if gate is NULL. */
+sg_error_t sg_gate_set_anomaly_combine_mode(sg_gate_t *gate,
+                                              sg_anomaly_combine_mode_t mode);
+
 /*
  * Enable or disable adaptive threshold mode.
  *
