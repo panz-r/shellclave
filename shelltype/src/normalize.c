@@ -65,7 +65,7 @@ const char *st_type_symbol[ST_TYPE_COUNT] = {
  * st_type_join[a][b] = narrowest type covering both a and b.
  *
  * Lattice:
- *   #h ⊂ #sha ⊂ #val ⊂ *
+ *   #sha ⊂ #h ⊂ #val ⊂ *
  *   #i ⊂ #val ⊂ *
  *   #w ⊂ #val ⊂ *
  *   #q ⊂ #qs ⊂ #val ⊂ *
@@ -84,7 +84,7 @@ const st_token_type_t st_type_join[ST_TYPE_COUNT][ST_TYPE_COUNT] = {
     /* ST_TYPE_LITERAL */
     { ST_TYPE_LITERAL, ST_TYPE_HEXHASH, ST_TYPE_NUMBER, ST_TYPE_IPV4, ST_TYPE_WORD, ST_TYPE_QUOTED, ST_TYPE_QUOTED_SPACE, ST_TYPE_FILENAME, ST_TYPE_REL_PATH, ST_TYPE_ABS_PATH, ST_TYPE_PATH, ST_TYPE_URL, ST_TYPE_VALUE, ST_TYPE_OPT, ST_TYPE_UUID, ST_TYPE_EMAIL, ST_TYPE_HOSTNAME, ST_TYPE_PORT, ST_TYPE_SIZE, ST_TYPE_SEMVER, ST_TYPE_TIMESTAMP, ST_TYPE_HASH_ALGO, ST_TYPE_ENV_VAR, ST_TYPE_HYPHENATED, ST_TYPE_BRANCH, ST_TYPE_SHA, ST_TYPE_IMAGE, ST_TYPE_PKG, ST_TYPE_USER, ST_TYPE_FINGERPRINT, ST_TYPE_ANY },
     /* ST_TYPE_HEXHASH */
-    { ST_TYPE_HEXHASH, ST_TYPE_HEXHASH, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_SHA, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_ANY },
+    { ST_TYPE_HEXHASH, ST_TYPE_HEXHASH, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_HEXHASH, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_ANY },
     /* ST_TYPE_NUMBER */
     { ST_TYPE_NUMBER, ST_TYPE_VALUE, ST_TYPE_NUMBER, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_NUMBER, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_ANY },
     /* ST_TYPE_IPV4 */
@@ -132,7 +132,7 @@ const st_token_type_t st_type_join[ST_TYPE_COUNT][ST_TYPE_COUNT] = {
     /* ST_TYPE_BRANCH */
     { ST_TYPE_BRANCH, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_BRANCH, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_ANY },
     /* ST_TYPE_SHA */
-    { ST_TYPE_SHA, ST_TYPE_SHA, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_SHA, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_ANY },
+    { ST_TYPE_SHA, ST_TYPE_HEXHASH, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_SHA, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_ANY },
     /* ST_TYPE_IMAGE */
     { ST_TYPE_IMAGE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_IMAGE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_VALUE, ST_TYPE_ANY },
     /* ST_TYPE_PKG */
@@ -157,8 +157,8 @@ const st_token_type_t st_type_join[ST_TYPE_COUNT][ST_TYPE_COUNT] = {
 const bool st_type_compatible[ST_TYPE_COUNT][ST_TYPE_COUNT] = {
     /* ST_TYPE_LITERAL matches: LITERAL, HEXHASH, NUMBER, IPV4, WORD, QUOTED, QUOTED_SPACE, FILENAME, REL_PATH, ABS_PATH, PATH, URL, VALUE, OPT, UUID, EMAIL, HOSTNAME, PORT, SIZE, SEMVER, TIMESTAMP, HASH_ALGO, ENV_VAR, HYPHENATED, BRANCH, SHA, IMAGE, PKG, USER, FINGERPRINT, ANY */
     { true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true },
-    /* ST_TYPE_HEXHASH matches: HEXHASH, VALUE, SHA, ANY */
-    { false, true, false, false, false, false, false, false, false, false, false, false, true, false, false, false, false, false, false, false, false, false, false, false, false, true, false, false, false, false, true },
+    /* ST_TYPE_HEXHASH matches: HEXHASH, VALUE, ANY */
+    { false, true, false, false, false, false, false, false, false, false, false, false, true, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, true },
     /* ST_TYPE_NUMBER matches: NUMBER, VALUE, ANY */
     { false, false, true, false, false, false, false, false, false, false, false, false, true, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, true },
     /* ST_TYPE_IPV4 matches: IPV4, VALUE, ANY */
@@ -205,8 +205,8 @@ const bool st_type_compatible[ST_TYPE_COUNT][ST_TYPE_COUNT] = {
     { false, false, false, false, true, false, false, false, false, false, false, false, true, false, false, false, false, false, false, false, false, false, false, true, false, false, false, false, false, false, true },
     /* ST_TYPE_BRANCH matches: VALUE, BRANCH, ANY */
     { false, false, false, false, false, false, false, false, false, false, false, false, true, false, false, false, false, false, false, false, false, false, false, false, true, false, false, false, false, false, true },
-    /* ST_TYPE_SHA matches: VALUE, SHA, ANY */
-    { false, false, false, false, false, false, false, false, false, false, false, false, true, false, false, false, false, false, false, false, false, false, false, false, false, true, false, false, false, false, true },
+    /* ST_TYPE_SHA matches: HEXHASH, VALUE, SHA, ANY */
+    { false, true, false, false, false, false, false, false, false, false, false, false, true, false, false, false, false, false, false, false, false, false, false, false, false, true, false, false, false, false, true },
     /* ST_TYPE_IMAGE matches: VALUE, IMAGE, ANY */
     { false, false, false, false, false, false, false, false, false, false, false, false, true, false, false, false, false, false, false, false, false, false, false, false, false, false, true, false, false, false, true },
     /* ST_TYPE_PKG matches: VALUE, PKG, ANY */

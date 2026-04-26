@@ -70,7 +70,7 @@ static uint32_t crc32_compute(const void *data, size_t len, uint32_t prev)
 #define PATTERN_REG_INIT     256
 #define VERIFY_ALL_RING_CAP  4096
 #define MAX_CMD_TOKENS       128
-#define FILTER_POS_LEVELS    4   /* Shell commands rarely exceed 4 tokens before diverging */
+#define FILTER_POS_LEVELS    8   /* Shell commands rarely exceed 8 tokens before diverging */
 #define FILTER_POS_CAPACITY  1024
 #define LITERAL_THRESHOLD 3     /* 3+ literals at divergence point → generalize to wildcard */
 
@@ -88,6 +88,19 @@ typedef struct {
 /* ============================================================
  * POLICY STATE — 16 bytes, fixed size
  * ============================================================ */
+
+const char *st_error_string(st_error_t err)
+{
+    switch (err) {
+    case ST_OK:           return "ok";
+    case ST_ERR_INVALID:  return "invalid";
+    case ST_ERR_MEMORY:   return "memory";
+    case ST_ERR_IO:       return "io";
+    case ST_ERR_FAILED:   return "failed";
+    case ST_ERR_FORMAT:   return "format";
+    default:              return "unknown";
+    }
+}
 
 typedef struct {
     uint32_t      children_offset;  /* Offset into policy->children_arena.base */
@@ -1003,6 +1016,7 @@ static bool is_explicit_wildcard(const char *text, st_token_type_t type)
 {
     if (type == ST_TYPE_LITERAL) return false;
     if (type == ST_TYPE_ANY) return true;  /* * is always a wildcard */
+    if (!text) return false;  /* defensive: NULL text is not a wildcard */
     const char *sym = st_type_symbol[type];
     size_t sym_len = strlen(sym);
     /* Exact match: "#opt" */
@@ -1639,6 +1653,7 @@ st_error_t st_policy_batch_add(st_policy_t *policy, const char **patterns, size_
 st_error_t st_policy_merge(st_policy_t *dst, const st_policy_t *src)
 {
     if (!dst || !src) return ST_ERR_INVALID;
+    if (dst == src) return ST_ERR_INVALID;  /* self-merge would deadlock */
 
     pthread_rwlock_rdlock((pthread_rwlock_t *)&src->rwlock);
     pthread_rwlock_wrlock(&dst->rwlock);
@@ -3179,7 +3194,7 @@ st_error_t st_policy_simulate_add(st_policy_t *policy,
  * over-broad suggestions. Path types stay as #path, others may go to #w.
  *
  * Type hierarchy (with caps):
- *   #h → #n → #val → #w (cap)
+ *   #sha → #h → #val → #w (cap)
  *   #i → #val → #w (cap)
  *   #w → #w (cap - already at limit)
  *   #q → #qs → #val → #w (cap)
@@ -3195,8 +3210,8 @@ st_error_t st_policy_simulate_add(st_policy_t *policy,
 static st_token_type_t next_wider_type(st_token_type_t t)
 {
     switch (t) {
-        case ST_TYPE_HEXHASH:     return ST_TYPE_SHA;
-        case ST_TYPE_SHA:         return ST_TYPE_VALUE;
+        case ST_TYPE_SHA:         return ST_TYPE_HEXHASH;
+        case ST_TYPE_HEXHASH:     return ST_TYPE_VALUE;
         case ST_TYPE_NUMBER:      return ST_TYPE_VALUE;
         case ST_TYPE_IPV4:        return ST_TYPE_VALUE;
         case ST_TYPE_WORD:        return ST_TYPE_WORD; /* Cap reached */

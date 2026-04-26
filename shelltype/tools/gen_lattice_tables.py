@@ -67,7 +67,7 @@ TYPE_ORDER: List[str] = [
 # and PORT ⊂ IPV4 ⊂ VALUE ⊂ ANY. The union of both chains gives the
 # correct transitive closure: PORT ≤ {NUMBER, IPV4, VALUE, ANY}.
 CHAINS: List[List[str]] = [
-    ["HEXHASH", "SHA", "VALUE", "ANY"],
+    ["SHA", "HEXHASH", "VALUE", "ANY"],
     ["IPV4", "VALUE", "ANY"],
     ["WORD", "VALUE", "ANY"],
     ["QUOTED", "QUOTED_SPACE", "VALUE", "ANY"],
@@ -283,7 +283,7 @@ def generate_join_table(join: Dict[str, Dict[str, str]]) -> str:
         " * st_type_join[a][b] = narrowest type covering both a and b.",
         " *",
         " * Lattice:",
-        " *   #h ⊂ #sha ⊂ #val ⊂ *",
+        " *   #sha ⊂ #h ⊂ #val ⊂ *",
         " *   #i ⊂ #val ⊂ *",
         " *   #w ⊂ #val ⊂ *",
         " *   #q ⊂ #qs ⊂ #val ⊂ *",

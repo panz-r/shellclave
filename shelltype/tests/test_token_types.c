@@ -731,8 +731,8 @@ static int test_join_any_is_top(void)
 
 static int test_join_hex_number(void)
 {
-    /* #h ⊂ #sha ⊂ #val and #n ⊂ #val. HEXHASH and NUMBER are incomparable
-     * (neither is a subset of the other), so #h ∨ #n = #val. */
+    /* #sha ⊂ #h ⊂ #val and #n ⊂ #val. SHA and NUMBER are incomparable
+     * (neither is a subset of the other), so #sha ∨ #n = #val. */
     ASSERT(st_join(ST_TYPE_HEXHASH, ST_TYPE_NUMBER) == ST_TYPE_VALUE);
     return 1;
 }
@@ -788,9 +788,9 @@ static int test_join_val_with_path(void)
 
 static int test_join_hexhash_sha(void)
 {
-    /* #h ⊂ #sha: join(hex, sha) = sha */
-    ASSERT(st_join(ST_TYPE_HEXHASH, ST_TYPE_SHA) == ST_TYPE_SHA);
-    ASSERT(st_join(ST_TYPE_SHA, ST_TYPE_HEXHASH) == ST_TYPE_SHA);
+    /* #sha ⊂ #h: join(sha, hex) = hex (hex is the wider type) */
+    ASSERT(st_join(ST_TYPE_SHA, ST_TYPE_HEXHASH) == ST_TYPE_HEXHASH);
+    ASSERT(st_join(ST_TYPE_HEXHASH, ST_TYPE_SHA) == ST_TYPE_HEXHASH);
     /* hex ∨ hex = hex */
     ASSERT(st_join(ST_TYPE_HEXHASH, ST_TYPE_HEXHASH) == ST_TYPE_HEXHASH);
     /* sha ∨ sha = sha */
@@ -861,10 +861,11 @@ static int test_compat_any_matches_all(void)
 
 static int test_compat_hex_to_number(void)
 {
-    /* #h ⊂ #sha ⊂ #val and #n ⊂ #val. HEXHASH and NUMBER are incomparable
+    /* #sha ⊂ #h ⊂ #val and #n ⊂ #val. SHA and NUMBER are incomparable
      * (neither is a subset of the other). Both are subsets of VALUE. */
     ASSERT(!st_is_compatible(ST_TYPE_HEXHASH, ST_TYPE_NUMBER));  /* incomparable */
-    ASSERT(st_is_compatible(ST_TYPE_HEXHASH, ST_TYPE_SHA));      /* #h ⊂ #sha */
+    ASSERT(!st_is_compatible(ST_TYPE_HEXHASH, ST_TYPE_SHA));     /* #h is NOT ⊂ #sha (hex is wider) */
+    ASSERT(st_is_compatible(ST_TYPE_SHA, ST_TYPE_HEXHASH));      /* #sha ⊂ #h */
     ASSERT(st_is_compatible(ST_TYPE_HEXHASH, ST_TYPE_VALUE));   /* #h ⊂ #val */
     ASSERT(st_is_compatible(ST_TYPE_NUMBER, ST_TYPE_VALUE));    /* #n ⊂ #val */
     return 1;

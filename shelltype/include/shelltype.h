@@ -30,6 +30,11 @@ typedef enum {
     ST_ERR_FORMAT      = -5,
 } st_error_t;
 
+/**
+ * Return a human-readable string for an st_error_t code.
+ */
+const char *st_error_string(st_error_t err);
+
 /* ============================================================
  * CONSTANTS
  * ============================================================ */
