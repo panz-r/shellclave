@@ -67,7 +67,7 @@ static int test_realistic_git_workflow(void)
     for (size_t i = 0; i < count; i++) {
         if (strstr(suggestions[i].pattern, "git") &&
             strstr(suggestions[i].pattern, "commit") &&
-            strstr(suggestions[i].pattern, "#opt")) {
+            (strstr(suggestions[i].pattern, "#sopt") || strstr(suggestions[i].pattern, "#opt"))) {
             found_commit = true;
             ASSERT(suggestions[i].count == 5);
             break;
@@ -186,7 +186,7 @@ static int test_incremental_learning(void)
     bool found_batch1 = false;
     for (size_t i = 0; i < count1; i++) {
         if (strstr(s1[i].pattern, "ls") &&
-            strstr(s1[i].pattern, "#opt")) {
+            (strstr(s1[i].pattern, "#sopt") || strstr(s1[i].pattern, "#opt"))) {
             found_batch1 = true;
             break;
         }
@@ -206,7 +206,7 @@ static int test_incremental_learning(void)
     bool found_batch2 = false;
     for (size_t i = 0; i < count2; i++) {
         if (strstr(s2[i].pattern, "ls") &&
-            strstr(s2[i].pattern, "#opt")) {
+            (strstr(s2[i].pattern, "#sopt") || strstr(s2[i].pattern, "#opt"))) {
             found_batch2 = true;
             ASSERT(s2[i].count == 6);
             break;

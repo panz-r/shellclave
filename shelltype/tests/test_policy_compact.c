@@ -483,7 +483,7 @@ static int test_memory_usage(void)
         snprintf(cmd, sizeof(cmd), "ls -la /path/to/dir%d", i);
         st_policy_add(policy, cmd);
     }
-    ASSERT(st_policy_count(policy) == 101);
+    ASSERT(st_policy_count(policy) == 150);
 
     size_t filled = st_policy_memory_usage(policy);
     ASSERT(filled > empty);

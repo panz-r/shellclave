@@ -339,23 +339,23 @@ static int test_classify_literal_percent(void)
 
 static int test_classify_option_short(void)
 {
-    ASSERT_TYPE("-v", ST_TYPE_OPT);
-    ASSERT_TYPE("-h", ST_TYPE_OPT);
-    ASSERT_TYPE("-x", ST_TYPE_OPT);
-    ASSERT_TYPE("-a", ST_TYPE_OPT);
-    ASSERT_TYPE("-la", ST_TYPE_OPT);  /* stacked flags */
-    ASSERT_TYPE("-rf", ST_TYPE_OPT);  /* stacked flags */
+    ASSERT_TYPE("-v", ST_TYPE_SHORTOPT);
+    ASSERT_TYPE("-h", ST_TYPE_SHORTOPT);
+    ASSERT_TYPE("-x", ST_TYPE_SHORTOPT);
+    ASSERT_TYPE("-a", ST_TYPE_SHORTOPT);
+    ASSERT_TYPE("-la", ST_TYPE_SHORTOPT);  /* stacked flags */
+    ASSERT_TYPE("-rf", ST_TYPE_SHORTOPT);  /* stacked flags */
     return 1;
 }
 
 static int test_classify_option_long(void)
 {
-    ASSERT_TYPE("--help", ST_TYPE_OPT);
-    ASSERT_TYPE("--version", ST_TYPE_OPT);
-    ASSERT_TYPE("--verbose", ST_TYPE_OPT);
-    ASSERT_TYPE("--output=file", ST_TYPE_OPT);
-    ASSERT_TYPE("--max-count=10", ST_TYPE_OPT);
-    ASSERT_TYPE("--name", ST_TYPE_OPT);
+    ASSERT_TYPE("--help", ST_TYPE_LONGOPT);
+    ASSERT_TYPE("--version", ST_TYPE_LONGOPT);
+    ASSERT_TYPE("--verbose", ST_TYPE_LONGOPT);
+    ASSERT_TYPE("--output=file", ST_TYPE_LONGOPT);
+    ASSERT_TYPE("--max-count=10", ST_TYPE_LONGOPT);
+    ASSERT_TYPE("--name", ST_TYPE_LONGOPT);
     return 1;
 }
 
@@ -501,7 +501,7 @@ static int test_classify_branch_head(void)
 
 static int test_classify_branch_reject_dash(void)
 {
-    ASSERT_TYPE("-v", ST_TYPE_OPT);
+    ASSERT_TYPE("-v", ST_TYPE_SHORTOPT);
     return 1;
 }
 
@@ -618,7 +618,7 @@ static int test_classify_pkg_scoped(void)
 
 static int test_classify_pkg_reject_dash_start(void)
 {
-    ASSERT_TYPE("-verbose", ST_TYPE_OPT);
+    ASSERT_TYPE("-verbose", ST_TYPE_SHORTOPT);
     return 1;
 }
 
@@ -922,7 +922,7 @@ static int test_normalize_typed_simple(void)
     ASSERT(arr.count == 2);
     ASSERT(arr.tokens[0].type == ST_TYPE_LITERAL);
     ASSERT(strcmp(arr.tokens[0].text, "ls") == 0);
-    ASSERT(arr.tokens[1].type == ST_TYPE_OPT);  /* -la is now an option */
+    ASSERT(arr.tokens[1].type == ST_TYPE_SHORTOPT);  /* -la is a short option */
     st_free_token_array(&arr);
     return 1;
 }
@@ -1029,7 +1029,7 @@ static int test_normalize_typed_long_flag_value(void)
     ASSERT(arr.count == 4);
     ASSERT(arr.tokens[0].type == ST_TYPE_LITERAL); /* git */
     ASSERT(arr.tokens[1].type == ST_TYPE_LITERAL); /* commit */
-    ASSERT(arr.tokens[2].type == ST_TYPE_OPT);     /* --message is now an option */
+    ASSERT(arr.tokens[2].type == ST_TYPE_LONGOPT);  /* --message is a long option */
     ASSERT(arr.tokens[3].type == ST_TYPE_LITERAL); /* hello (word, not in a variable context) */
     st_free_token_array(&arr);
     return 1;

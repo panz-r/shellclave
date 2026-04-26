@@ -37,10 +37,10 @@ static int test_normalize_simple(void)
     size_t count = 0;
     st_error_t err = st_normalize("ls -la", &tokens, &count);
     ASSERT(err == ST_OK);
-    /* -la is now classified as an option (#opt) */
+    /* -la is now classified as a short option (#sopt) */
     ASSERT(count == 2);
     ASSERT_STR_EQ(tokens[0], "ls");
-    ASSERT_STR_EQ(tokens[1], "#opt");
+    ASSERT_STR_EQ(tokens[1], "#sopt");
     st_free_tokens(tokens, count);
     return 1;
 }
@@ -64,11 +64,11 @@ static int test_normalize_flag_value_long(void)
     size_t count = 0;
     st_error_t err = st_normalize("git commit --message \"hello world\"", &tokens, &count);
     ASSERT(err == ST_OK);
-    /* git, commit, --message (now #opt), * */
+    /* git, commit, --message (now #lopt), * */
     ASSERT(count >= 3);
     ASSERT_STR_EQ(tokens[0], "git");
     ASSERT_STR_EQ(tokens[1], "commit");
-    ASSERT_STR_EQ(tokens[2], "#opt");
+    ASSERT_STR_EQ(tokens[2], "#lopt");
     /* Next token should be the wildcard */
     ASSERT(count >= 4);
     ASSERT_STR_EQ(tokens[3], "#qs");
@@ -82,11 +82,11 @@ static int test_normalize_flag_value_short(void)
     size_t count = 0;
     st_error_t err = st_normalize("git commit -m msg", &tokens, &count);
     ASSERT(err == ST_OK);
-    /* -m is now classified as an option (#opt); msg is kept as literal */
+    /* -m is now classified as a short option (#sopt); msg is kept as literal */
     ASSERT(count == 4);
     ASSERT_STR_EQ(tokens[0], "git");
     ASSERT_STR_EQ(tokens[1], "commit");
-    ASSERT_STR_EQ(tokens[2], "#opt");
+    ASSERT_STR_EQ(tokens[2], "#sopt");
     ASSERT_STR_EQ(tokens[3], "msg");
     st_free_tokens(tokens, count);
     return 1;
@@ -145,7 +145,7 @@ static int test_normalize_number(void)
     ASSERT(err == ST_OK);
     ASSERT(count >= 4);
     ASSERT_STR_EQ(tokens[0], "head");
-    ASSERT_STR_EQ(tokens[1], "#opt");  /* -n is now an option */
+    ASSERT_STR_EQ(tokens[1], "#sopt");  /* -n is a short option */
     ASSERT_STR_EQ(tokens[2], "#n");
     st_free_tokens(tokens, count);
     return 1;
@@ -199,11 +199,11 @@ static int test_normalize_long_flag_equals(void)
     size_t count = 0;
     st_error_t err = st_normalize("gcc -o myprog main.c", &tokens, &count);
     ASSERT(err == ST_OK);
-    /* -o is now classified as an option (#opt); the value follows as literal.
+    /* -o is now classified as a short option (#sopt); the value follows as literal.
      * main.c is classified as #f (filename). */
     ASSERT(count == 4);
     ASSERT_STR_EQ(tokens[0], "gcc");
-    ASSERT_STR_EQ(tokens[1], "#opt");
+    ASSERT_STR_EQ(tokens[1], "#sopt");
     ASSERT_STR_EQ(tokens[2], "myprog");
     ASSERT_STR_EQ(tokens[3], "#f");
     st_free_tokens(tokens, count);
@@ -291,11 +291,11 @@ static int test_suggest_basic(void)
     ASSERT(suggestions != NULL);
     ASSERT(count > 0);
 
-    /* The pattern "ls #opt #p" should be among suggestions (since -l is now an option) */
+    /* The pattern "ls #sopt #p" should be among suggestions (since -l is now a short option) */
     bool found = false;
     for (size_t i = 0; i < count; i++) {
         if (strstr(suggestions[i].pattern, "ls") &&
-            strstr(suggestions[i].pattern, "#opt") &&
+            (strstr(suggestions[i].pattern, "#sopt") || strstr(suggestions[i].pattern, "#opt")) &&
             strstr(suggestions[i].pattern, "#p")) {
             found = true;
             ASSERT(suggestions[i].count == 5);

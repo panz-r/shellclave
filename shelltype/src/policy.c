@@ -107,7 +107,7 @@ typedef struct {
     uint16_t       literal_count;
     uint16_t       wildcard_count;
     uint16_t       pattern_id;
-    uint32_t       wildcard_mask;
+    uint64_t       wildcard_mask;    /* uint64_t to support ST_TYPE_ANY=32 without overflow */
     uint16_t       children_alloc;   /* Slots allocated from arena */
 } policy_state_t;
 
@@ -355,7 +355,7 @@ struct st_policy {
     pthread_rwlock_t   rwlock;
     arena_t             children_arena;  /* Dedicated arena for all children arrays */
     vacuum_filter_t    *pos_filters[FILTER_POS_LEVELS];
-    uint32_t             pos_wildcard_mask[FILTER_POS_LEVELS];
+    uint64_t            pos_wildcard_mask[FILTER_POS_LEVELS];  /* uint64_t for ST_TYPE_ANY=32 */
     uint64_t            pos_built_epoch[FILTER_POS_LEVELS];
     len_bucket_t       *len_buckets;     /* Length-indexed pattern buckets */
     size_t              num_buckets;     /* ST_MAX_CMD_TOKENS + 1 */
@@ -368,41 +368,43 @@ struct st_policy {
  * COMPATIBILITY MASK
  * ============================================================ */
 
-static const uint32_t st_compat_mask[ST_TYPE_COUNT] = {
-    /* LITERAL */      (1u << ST_TYPE_LITERAL) | (1u << ST_TYPE_ANY),
-    /* HEXHASH */      (1u << ST_TYPE_HEXHASH) | (1u << ST_TYPE_NUMBER) | (1u << ST_TYPE_VALUE) | (1u << ST_TYPE_ANY),
-    /* NUMBER */       (1u << ST_TYPE_NUMBER) | (1u << ST_TYPE_VALUE) | (1u << ST_TYPE_ANY),
-    /* IPV4 */         (1u << ST_TYPE_IPV4) | (1u << ST_TYPE_VALUE) | (1u << ST_TYPE_ANY),
-    /* WORD */         (1u << ST_TYPE_WORD) | (1u << ST_TYPE_VALUE) | (1u << ST_TYPE_ANY),
-    /* QUOTED */       (1u << ST_TYPE_QUOTED) | (1u << ST_TYPE_QUOTED_SPACE) | (1u << ST_TYPE_VALUE) | (1u << ST_TYPE_ANY),
-    /* QUOTED_SPACE */ (1u << ST_TYPE_QUOTED_SPACE) | (1u << ST_TYPE_VALUE) | (1u << ST_TYPE_ANY),
-    /* FILENAME */     (1u << ST_TYPE_FILENAME) | (1u << ST_TYPE_REL_PATH) | (1u << ST_TYPE_PATH) | (1u << ST_TYPE_ANY),
-    /* REL_PATH */     (1u << ST_TYPE_REL_PATH) | (1u << ST_TYPE_PATH) | (1u << ST_TYPE_ANY),
-    /* ABS_PATH */     (1u << ST_TYPE_ABS_PATH) | (1u << ST_TYPE_PATH) | (1u << ST_TYPE_ANY),
-    /* PATH */         (1u << ST_TYPE_PATH) | (1u << ST_TYPE_ANY),
-    /* URL */          (1u << ST_TYPE_URL) | (1u << ST_TYPE_ANY),
-    /* VALUE */        (1u << ST_TYPE_VALUE) | (1u << ST_TYPE_ANY),
-    /* OPT */          (1u << ST_TYPE_OPT) | (1u << ST_TYPE_VALUE) | (1u << ST_TYPE_ANY),
-    /* UUID */         (1u << ST_TYPE_UUID) | (1u << ST_TYPE_VALUE) | (1u << ST_TYPE_ANY),
-    /* EMAIL */        (1u << ST_TYPE_EMAIL) | (1u << ST_TYPE_VALUE) | (1u << ST_TYPE_ANY),
-    /* HOSTNAME */     (1u << ST_TYPE_HOSTNAME) | (1u << ST_TYPE_VALUE) | (1u << ST_TYPE_ANY),
-    /* PORT */         (1u << ST_TYPE_PORT) | (1u << ST_TYPE_NUMBER) | (1u << ST_TYPE_VALUE) | (1u << ST_TYPE_ANY),
-    /* SIZE */         (1u << ST_TYPE_SIZE) | (1u << ST_TYPE_VALUE) | (1u << ST_TYPE_ANY),
-    /* SEMVER */       (1u << ST_TYPE_SEMVER) | (1u << ST_TYPE_VALUE) | (1u << ST_TYPE_ANY),
-    /* TIMESTAMP */     (1u << ST_TYPE_TIMESTAMP) | (1u << ST_TYPE_VALUE) | (1u << ST_TYPE_ANY),
-    /* HASH_ALGO */    (1u << ST_TYPE_HASH_ALGO) | (1u << ST_TYPE_WORD) | (1u << ST_TYPE_VALUE) | (1u << ST_TYPE_ANY),
-    /* ENV_VAR */      (1u << ST_TYPE_ENV_VAR) | (1u << ST_TYPE_VALUE) | (1u << ST_TYPE_ANY),
-    /* HYPHENATED */    (1u << ST_TYPE_HYPHENATED) | (1u << ST_TYPE_WORD) | (1u << ST_TYPE_VALUE) | (1u << ST_TYPE_ANY),
-    /* BRANCH */       (1u << ST_TYPE_BRANCH) | (1u << ST_TYPE_VALUE) | (1u << ST_TYPE_ANY),
-    /* SHA */          (1u << ST_TYPE_SHA) | (1u << ST_TYPE_HEXHASH) | (1u << ST_TYPE_VALUE) | (1u << ST_TYPE_ANY),
-    /* IMAGE */        (1u << ST_TYPE_IMAGE) | (1u << ST_TYPE_VALUE) | (1u << ST_TYPE_ANY),
-    /* PKG */          (1u << ST_TYPE_PKG) | (1u << ST_TYPE_VALUE) | (1u << ST_TYPE_ANY),
-    /* USER */         (1u << ST_TYPE_USER) | (1u << ST_TYPE_VALUE) | (1u << ST_TYPE_ANY),
-    /* FINGERPRINT */  (1u << ST_TYPE_FINGERPRINT) | (1u << ST_TYPE_VALUE) | (1u << ST_TYPE_ANY),
-    /* ANY */          (1u << ST_TYPE_ANY),
+static const uint64_t st_compat_mask[ST_TYPE_COUNT] = {
+    /* LITERAL */      (1ULL << ST_TYPE_LITERAL) | (1ULL << ST_TYPE_ANY),
+    /* HEXHASH */      (1ULL << ST_TYPE_HEXHASH) | (1ULL << ST_TYPE_NUMBER) | (1ULL << ST_TYPE_VALUE) | (1ULL << ST_TYPE_ANY),
+    /* NUMBER */       (1ULL << ST_TYPE_NUMBER) | (1ULL << ST_TYPE_VALUE) | (1ULL << ST_TYPE_ANY),
+    /* IPV4 */         (1ULL << ST_TYPE_IPV4) | (1ULL << ST_TYPE_VALUE) | (1ULL << ST_TYPE_ANY),
+    /* WORD */         (1ULL << ST_TYPE_WORD) | (1ULL << ST_TYPE_VALUE) | (1ULL << ST_TYPE_ANY),
+    /* QUOTED */       (1ULL << ST_TYPE_QUOTED) | (1ULL << ST_TYPE_QUOTED_SPACE) | (1ULL << ST_TYPE_VALUE) | (1ULL << ST_TYPE_ANY),
+    /* QUOTED_SPACE */ (1ULL << ST_TYPE_QUOTED_SPACE) | (1ULL << ST_TYPE_VALUE) | (1ULL << ST_TYPE_ANY),
+    /* FILENAME */     (1ULL << ST_TYPE_FILENAME) | (1ULL << ST_TYPE_REL_PATH) | (1ULL << ST_TYPE_PATH) | (1ULL << ST_TYPE_ANY),
+    /* REL_PATH */     (1ULL << ST_TYPE_REL_PATH) | (1ULL << ST_TYPE_PATH) | (1ULL << ST_TYPE_ANY),
+    /* ABS_PATH */     (1ULL << ST_TYPE_ABS_PATH) | (1ULL << ST_TYPE_PATH) | (1ULL << ST_TYPE_ANY),
+    /* PATH */         (1ULL << ST_TYPE_PATH) | (1ULL << ST_TYPE_ANY),
+    /* URL */          (1ULL << ST_TYPE_URL) | (1ULL << ST_TYPE_ANY),
+    /* VALUE */        (1ULL << ST_TYPE_VALUE) | (1ULL << ST_TYPE_ANY),
+    /* SHORTOPT */     (1ULL << ST_TYPE_SHORTOPT) | (1ULL << ST_TYPE_OPT) | (1ULL << ST_TYPE_VALUE) | (1ULL << ST_TYPE_ANY),
+    /* LONGOPT */      (1ULL << ST_TYPE_LONGOPT) | (1ULL << ST_TYPE_OPT) | (1ULL << ST_TYPE_VALUE) | (1ULL << ST_TYPE_ANY),
+    /* OPT */          (1ULL << ST_TYPE_OPT) | (1ULL << ST_TYPE_SHORTOPT) | (1ULL << ST_TYPE_LONGOPT) | (1ULL << ST_TYPE_VALUE) | (1ULL << ST_TYPE_ANY),
+    /* UUID */         (1ULL << ST_TYPE_UUID) | (1ULL << ST_TYPE_VALUE) | (1ULL << ST_TYPE_ANY),
+    /* EMAIL */        (1ULL << ST_TYPE_EMAIL) | (1ULL << ST_TYPE_VALUE) | (1ULL << ST_TYPE_ANY),
+    /* HOSTNAME */     (1ULL << ST_TYPE_HOSTNAME) | (1ULL << ST_TYPE_VALUE) | (1ULL << ST_TYPE_ANY),
+    /* PORT */         (1ULL << ST_TYPE_PORT) | (1ULL << ST_TYPE_NUMBER) | (1ULL << ST_TYPE_VALUE) | (1ULL << ST_TYPE_ANY),
+    /* SIZE */         (1ULL << ST_TYPE_SIZE) | (1ULL << ST_TYPE_VALUE) | (1ULL << ST_TYPE_ANY),
+    /* SEMVER */       (1ULL << ST_TYPE_SEMVER) | (1ULL << ST_TYPE_VALUE) | (1ULL << ST_TYPE_ANY),
+    /* TIMESTAMP */     (1ULL << ST_TYPE_TIMESTAMP) | (1ULL << ST_TYPE_VALUE) | (1ULL << ST_TYPE_ANY),
+    /* HASH_ALGO */    (1ULL << ST_TYPE_HASH_ALGO) | (1ULL << ST_TYPE_WORD) | (1ULL << ST_TYPE_VALUE) | (1ULL << ST_TYPE_ANY),
+    /* ENV_VAR */      (1ULL << ST_TYPE_ENV_VAR) | (1ULL << ST_TYPE_VALUE) | (1ULL << ST_TYPE_ANY),
+    /* HYPHENATED */    (1ULL << ST_TYPE_HYPHENATED) | (1ULL << ST_TYPE_WORD) | (1ULL << ST_TYPE_VALUE) | (1ULL << ST_TYPE_ANY),
+    /* BRANCH */       (1ULL << ST_TYPE_BRANCH) | (1ULL << ST_TYPE_VALUE) | (1ULL << ST_TYPE_ANY),
+    /* SHA */          (1ULL << ST_TYPE_SHA) | (1ULL << ST_TYPE_HEXHASH) | (1ULL << ST_TYPE_VALUE) | (1ULL << ST_TYPE_ANY),
+    /* IMAGE */        (1ULL << ST_TYPE_IMAGE) | (1ULL << ST_TYPE_VALUE) | (1ULL << ST_TYPE_ANY),
+    /* PKG */          (1ULL << ST_TYPE_PKG) | (1ULL << ST_TYPE_VALUE) | (1ULL << ST_TYPE_ANY),
+    /* USER */         (1ULL << ST_TYPE_USER) | (1ULL << ST_TYPE_VALUE) | (1ULL << ST_TYPE_ANY),
+    /* FINGERPRINT */  (1ULL << ST_TYPE_FINGERPRINT) | (1ULL << ST_TYPE_VALUE) | (1ULL << ST_TYPE_ANY),
+    /* ANY */          (1ULL << ST_TYPE_ANY),
 };
 
-static inline uint32_t compat_mask(st_token_type_t t)
+static inline uint64_t compat_mask(st_token_type_t t)
 {
     return st_compat_mask[t];
 }
@@ -812,12 +814,19 @@ static child_entry_t *find_exact_wildcard_child(const policy_state_t *node,
  * CHILD INSERTION
  * ============================================================ */
 
+/* Forward declaration for is_explicit_wildcard (used by insert_child) */
+static bool is_explicit_wildcard(const char *text, st_token_type_t type);
+
 /* Returns: -1 = allocation failure, 0 = success (filter updated), 1 = success (filter needs rebuild) */
 static int insert_child(policy_state_t *node, st_policy_t *policy,
                          const char *text, st_token_type_t type, uint32_t target, uint8_t depth)
 {
     assert(node->literal_count + node->wildcard_count <= node->children_alloc);
-    bool is_literal = (type == ST_TYPE_LITERAL);
+    /* Use is_explicit_wildcard to determine storage class.
+     * Classified tokens like "-v" (SHORTOPT) are stored as literal children
+     * (match by text). Only explicit wildcard symbols like "#opt" are
+     * stored as wildcard children (match by type). */
+    bool is_literal = !is_explicit_wildcard(text, type);
     uint16_t total = node->literal_count + node->wildcard_count;
     uint16_t insert_pos;
     char *arena_base = policy->children_arena.base;
@@ -880,7 +889,7 @@ static int insert_child(policy_state_t *node, st_policy_t *policy,
         node->literal_count++;
     } else {
         node->wildcard_count++;
-        node->wildcard_mask |= (1u << type);
+        node->wildcard_mask |= (1ULL << type);
     }
 
     if (depth < FILTER_POS_LEVELS) {
@@ -898,7 +907,7 @@ static int insert_child(policy_state_t *node, st_policy_t *policy,
                 filter_status = 1;
             }
         } else {
-            policy->pos_wildcard_mask[depth] |= (1u << type);
+            policy->pos_wildcard_mask[depth] |= (1ULL << type);
         }
     }
 
@@ -1051,25 +1060,31 @@ static bool pattern_subsumes(const st_token_t *a, size_t a_len,
             /* Both are concrete values: must match exactly */
             if (strcmp(a[i].text, b[i].text) != 0) return false;
         } else if (a_wild && b_wild) {
-            /* Both are wildcards: check type compatibility */
-            if (!st_is_compatible(a[i].type, b[i].type)) return false;
+            /* Both are wildcards: B's type must be compatible with A's type.
+             * For A to subsume B: A is more general, B's type must be subtype of A's type. */
+            if (!st_is_compatible(b[i].type, a[i].type)) return false;
             /* Parametrized wildcard subsumption check */
             const char *a_param = wildcard_param(a[i].text, a[i].type);
             const char *b_param = wildcard_param(b[i].text, b[i].type);
             if (a_param && b_param) {
                 if (strcmp(a_param, b_param) != 0) return false;
             } else if (a_param && !b_param) {
-                /* a is parametrized, b is not: b subsumes a (OK) */
-            } else if (!a_param && b_param) {
-                /* a is not parametrized, b is: b is more specific, cannot subsume a */
+                /* a is parametrized, b is not: a is more specific, cannot subsume b */
                 return false;
+            } else if (!a_param && b_param) {
+                /* a is not parametrized, b is: a is more general, OK */
             }
         } else if (!a_wild && b_wild) {
-            /* a is concrete, b is wildcard: b can subsume a if compatible */
-            if (!st_is_compatible(a[i].type, b[i].type)) return false;
-        } else {
-            /* a is wildcard, b is concrete: b cannot subsume a */
+            /* a is concrete, b is wildcard: a cannot subsume b
+             * (every command matching concrete A matches it exactly,
+             * but B is a wildcard that accepts MORE commands,
+             * so A does NOT subsume B) */
             return false;
+        } else {
+            /* a is wildcard, b is concrete: a can subsume b if a's type covers b's type.
+             * For A (wildcard) to subsume B (concrete): A must be as general as B's type.
+             * Check: st_is_compatible(B.type, A.type) — B's type must be subtype of A's type. */
+            if (!st_is_compatible(b[i].type, a[i].type)) return false;
         }
     }
     return true;
@@ -1183,7 +1198,7 @@ static void policy_rebuild_filters(st_policy_t *policy)
                     }
                 }
             } else {
-                policy->pos_wildcard_mask[d] |= (1u << c->type);
+                policy->pos_wildcard_mask[d] |= (1ULL << c->type);
             }
 
             if (tail >= q_cap) {
@@ -1351,10 +1366,10 @@ static st_error_t st_policy_add_locked(st_policy_t *policy, const char *pattern)
         uint16_t eid = bucket->indices[bi];
         pattern_entry_t *entry = &policy->patterns.entries[eid];
         if (!entry->active || !entry->tokens) continue;
-        /* B subsumes A: every command matching A also matches B.
-         * Here A = new pattern, B = existing entry.
-         * If existing entry subsumes new, new is redundant. */
-        if (pattern_subsumes(tokens, token_count, entry->tokens, entry->token_count)) {
+        /* A = existing entry, B = new pattern.
+         * If existing (A) subsumes new (B), new is redundant.
+         * Check: does existing subsume new? pattern_subsumes(existing, new) */
+        if (pattern_subsumes(entry->tokens, entry->token_count, tokens, token_count)) {
             free_pattern_tokens(tokens, token_count);
             return ST_OK;
         }
@@ -1370,9 +1385,10 @@ static st_error_t st_policy_add_locked(st_policy_t *policy, const char *pattern)
         uint16_t eid = bucket->indices[bi];
         pattern_entry_t *entry = &policy->patterns.entries[eid];
         if (!entry->active || !entry->tokens) continue;
-        /* A = existing entry, B = new pattern.
-         * If new pattern subsumes existing, existing is redundant. */
-        if (pattern_subsumes(entry->tokens, entry->token_count, tokens, token_count)) {
+        /* A = new pattern, B = existing entry.
+         * If new pattern (A) subsumes existing (B), existing is redundant.
+         * Check: does new subsume existing? pattern_subsumes(new, existing) */
+        if (pattern_subsumes(tokens, token_count, entry->tokens, entry->token_count)) {
             if (to_remove_count >= to_remove_cap) {
                 size_t new_cap = to_remove_cap == 0 ? 8 : to_remove_cap * 2;
                 uint16_t *new_arr = realloc(to_remove, new_cap * sizeof(uint16_t));
@@ -1403,7 +1419,13 @@ static st_error_t st_policy_add_locked(st_policy_t *policy, const char *pattern)
         child_entry_t *existing = NULL;
         char *arena_base = policy->children_arena.base;
 
-        if (tokens[i].type == ST_TYPE_LITERAL) {
+        /* Use is_explicit_wildcard to determine storage class.
+         * Tokens like "-v" (SHORTOPT) are classified types but NOT explicit wildcards,
+         * so they should be stored as literal children (match by text).
+         * Tokens like "#opt" (OPT) ARE explicit wildcards, stored as wildcard children. */
+        bool is_wild = is_explicit_wildcard(tokens[i].text, tokens[i].type);
+
+        if (!is_wild) {
             existing = find_literal_child(node, arena_base, tokens[i].text);
         } else {
             existing = find_exact_wildcard_child(node, arena_base, tokens[i].type, tokens[i].text);
@@ -1471,7 +1493,7 @@ static void remove_child_from_node(policy_state_t *node, st_policy_t *policy,
         node->wildcard_mask = 0;
         child_entry_t *wild_base = children + node->literal_count;
         for (uint16_t i = 0; i < node->wildcard_count; i++) {
-            node->wildcard_mask |= (1u << wild_base[i].type);
+            node->wildcard_mask |= (1ULL << wild_base[i].type);
         }
     }
 }
@@ -1501,7 +1523,7 @@ static st_error_t remove_pattern_by_id_locked(st_policy_t *policy, uint16_t pid)
         char *arena_base = policy->children_arena.base;
 
         path[i].state_idx = current;
-        path[i].is_literal = (entry->tokens[i].type == ST_TYPE_LITERAL);
+        path[i].is_literal = !is_explicit_wildcard(entry->tokens[i].text, entry->tokens[i].type);
 
         if (path[i].is_literal) {
             /* Find literal child index */
@@ -1783,7 +1805,8 @@ st_error_t st_policy_remove(st_policy_t *policy, const char *pattern)
         policy_state_t *node = &policy->states.states[current];
         child_entry_t *child = NULL;
         char *arena_base = policy->children_arena.base;
-        if (tokens[i].type == ST_TYPE_LITERAL) {
+        bool is_wild = is_explicit_wildcard(tokens[i].text, tokens[i].type);
+        if (!is_wild) {
             child = find_literal_child(node, arena_base, tokens[i].text);
         } else {
             child = find_exact_wildcard_child(node, arena_base, tokens[i].type, tokens[i].text);
@@ -2141,15 +2164,42 @@ st_error_t st_policy_eval(st_policy_t *policy,
         child_entry_t *found = NULL;
         char *arena_base = policy->children_arena.base;
 
-        if (ctype == ST_TYPE_LITERAL)
-            found = find_literal_child(node, arena_base, ctext);
+        /* Check literal children first (text match). This handles classified literals
+         * like "-v" stored as LITERAL with type=SHORTOPT in the child entry.
+         * For intermediate tokens, always accept a literal match.
+         * For the last token, only accept if the target has a pattern_id
+         * (handles case where subsumption removed the pattern but kept the trie entry). */
+        {
+            uint16_t n = node->literal_count;
+            child_entry_t *children = (child_entry_t *)(arena_base + node->children_offset);
+            for (uint16_t ci = 0; ci < n; ci++) {
+                if (strcmp(ctext, children[ci].text) == 0) {
+                    /* For last token, require target has a pattern_id */
+                    if (i == cmd.count - 1) {
+                        uint32_t target = children[ci].target;
+                        policy_state_t *target_state = &policy->states.states[target];
+                        if (target_state->pattern_id != UINT16_MAX &&
+                            target_state->pattern_id < policy->patterns.count) {
+                            found = &children[ci];
+                            break;
+                        }
+                    } else {
+                        found = &children[ci];
+                        break;
+                    }
+                }
+            }
+        }
 
+        /* If no literal match (or literal target has no pattern for last token),
+         * check wildcard children. The wildcard_mask indicates which wildcard
+         * types are present at this node. compat_mask(ctype) gives the types that
+         * ctype accepts (e.g., SHORTOPT accepts OPT). */
         if (!found) {
-            uint32_t compat = compat_mask(ctype) & node->wildcard_mask;
+            uint64_t compat = compat_mask(ctype) & node->wildcard_mask;
             if (compat)
                 found = find_wildcard_child(node, arena_base, ctype, ctext);
         }
-
         if (!found) break;
 
         current = found->target;
@@ -2221,14 +2271,14 @@ st_error_t st_policy_eval(st_policy_t *policy,
         st_token_type_t div_type = cmd.tokens[match_depth].type;
         policy_state_t *div_node = &policy->states.states[match_state];
 
-        uint32_t wm = div_node->wildcard_mask;
+        uint64_t wm = div_node->wildcard_mask;
         if (wm != 0 && (compat_mask(div_type) & wm) != 0) {
             /* Wildcard widening: find narrowest compatible wildcard */
             st_token_type_t best_wild = ST_TYPE_ANY;
-            uint32_t compat = compat_mask(div_type) & wm;
+            uint64_t compat = compat_mask(div_type) & wm;
             while (compat) {
-                int t = __builtin_ctz(compat);
-                compat &= ~(1u << t);
+                int t = __builtin_ctzll(compat);
+                compat &= ~(1ULL << t);
                 st_token_type_t wt = (st_token_type_t)t;
                 st_token_type_t joined = st_join(wt, div_type);
                 if (best_wild == ST_TYPE_ANY || st_is_compatible(joined, best_wild))
@@ -2489,25 +2539,32 @@ st_error_t st_policy_verify_all(const st_policy_t *policy,
         const char *ctext = cmd.tokens[entry.token_idx].text;
         char *arena_base = policy->children_arena.base;
 
-        if (ctype == ST_TYPE_LITERAL) {
-            child_entry_t *c = find_literal_child(state, arena_base, ctext);
-            if (c) {
-                size_t next_tail = (tail + 1) % VERIFY_ALL_RING_CAP;
-                if (next_tail == head) {
-                    free(matches);
-                    st_free_token_array(&cmd);
-                    return ST_ERR_MEMORY;
+        {
+            /* Check literal children by text match (regardless of command token type).
+             * Tokens like "-m" may be classified as SHORTOPT but stored as literal
+             * children in the trie with text="-m". */
+            uint16_t n = state->literal_count;
+            child_entry_t *children = (child_entry_t *)(arena_base + state->children_offset);
+            for (uint16_t ci = 0; ci < n; ci++) {
+                if (strcmp(ctext, children[ci].text) == 0) {
+                    size_t next_tail = (tail + 1) % VERIFY_ALL_RING_CAP;
+                    if (next_tail == head) {
+                        free(matches);
+                        st_free_token_array(&cmd);
+                        return ST_ERR_MEMORY;
+                    }
+                    ring[tail].state_idx = children[ci].target;
+                    ring[tail].token_idx = entry.token_idx + 1;
+                    tail = next_tail;
+                    break;
                 }
-                ring[tail].state_idx = c->target;
-                ring[tail].token_idx = entry.token_idx + 1;
-                tail = next_tail;
             }
         }
 
-        uint32_t compat = compat_mask(ctype) & state->wildcard_mask;
+        uint64_t compat = compat_mask(ctype) & state->wildcard_mask;
         while (compat) {
-            int t = __builtin_ctz(compat);
-            compat &= ~(1u << t);
+            int t = __builtin_ctzll(compat);
+            compat &= ~(1ULL << t);
             child_entry_t *c = find_wildcard_child(state, arena_base, (st_token_type_t)t, ctext);
             if (c) {
                 size_t next_tail = (tail + 1) % VERIFY_ALL_RING_CAP;

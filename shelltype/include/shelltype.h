@@ -79,7 +79,9 @@ typedef enum {
     ST_TYPE_PATH,          /* #path: any path type (#p ∨ #r ∨ #f) */
     ST_TYPE_URL,           /* #u: protocol://... */
     ST_TYPE_VALUE,         /* #val: any scalar (#n ∨ #i ∨ #w ∨ #q ∨ #qs) */
-    ST_TYPE_OPT,           /* #opt: command-line option (-v, --help, -o file) */
+    ST_TYPE_SHORTOPT,     /* #sopt: short option (-v, -la, -rf) */
+    ST_TYPE_LONGOPT,      /* #lopt: long option (--help, --verbose) */
+    ST_TYPE_OPT,          /* #opt: any option (#sopt ∨ #lopt) */
     ST_TYPE_UUID,          /* #uuid: UUID format (8-4-4-4-12 hex) */
     ST_TYPE_EMAIL,         /* #email: user@domain format */
     ST_TYPE_HOSTNAME,      /* #host: hostname or domain name */
