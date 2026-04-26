@@ -911,6 +911,57 @@ size_t sg_anomaly_unk_count(const sg_anomaly_model_t *model)
     return model ? model->unk_count : 0;
 }
 
+double sg_anomaly_kn_discount(const sg_anomaly_model_t *model)
+{
+    return model ? model->kn_discount : 0.0;
+}
+
+size_t sg_anomaly_bi_count(const sg_anomaly_model_t *model,
+                             const char *prev, const char *curr)
+{
+    if (!model || !prev || !curr) return 0;
+    char key[1024];
+    size_t key_len = build_bigram_key(key, sizeof(key), prev, curr);
+    return key_len > 0 ? hash_get(&model->bi, key, key_len) : 0;
+}
+
+size_t sg_anomaly_tri_count(const sg_anomaly_model_t *model,
+                              const char *p2, const char *p1, const char *curr)
+{
+    if (!model || !p2 || !p1 || !curr) return 0;
+    char key[1024];
+    size_t key_len = build_trigram_key(key, sizeof(key), p2, p1, curr);
+    return key_len > 0 ? hash_get(&model->tri, key, key_len) : 0;
+}
+
+size_t sg_anomaly_quad_count(const sg_anomaly_model_t *model,
+                               const char *p3, const char *p2,
+                               const char *p1, const char *curr)
+{
+    if (!model || !p3 || !p2 || !p1 || !curr) return 0;
+    char key[2048];
+    size_t key_len = build_4gram_key(key, sizeof(key), p3, p2, p1, curr);
+    return key_len > 0 ? hash_get(&model->quad, key, key_len) : 0;
+}
+
+size_t sg_anomaly_total_contexts(const sg_anomaly_model_t *model)
+{
+    if (!model) return 0;
+    return model->bi_ctx.len + model->tri_ctx.len + model->quad_ctx.len;
+}
+
+bool sg_anomaly_has_observed(const sg_anomaly_model_t *model,
+                               const char **seq, size_t len)
+{
+    if (!model || !seq || len == 0) return false;
+    /* Check unigrams first */
+    for (size_t i = 0; i < len; i++) {
+        if (seq[i] && hash_get(&model->uni, seq[i], strlen(seq[i]) + 1) > 0)
+            return true;
+    }
+    return false;
+}
+
 void sg_anomaly_reset(sg_anomaly_model_t *model)
 {
     if (!model) return;

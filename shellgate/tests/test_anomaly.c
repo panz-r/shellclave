@@ -760,6 +760,102 @@ TEST(quad_long_sequence_scoring)
 }
 
 /* ============================================================
+ * INTROSPECTION TESTS
+ * ============================================================ */
+
+TEST(introspection_kn_discount)
+{
+    sg_anomaly_model_t *m = sg_anomaly_model_new();
+    ASSERT_EQ_DBL(sg_anomaly_kn_discount(m), 0.5, 0.001);
+    sg_anomaly_model_free(m);
+}
+
+TEST(introspection_bi_count)
+{
+    sg_anomaly_model_t *m = sg_anomaly_model_new();
+    const char *seq[] = { "ls", "cd", "pwd" };
+    sg_anomaly_update(m, seq, 3);
+    sg_anomaly_update(m, seq, 3);
+
+    ASSERT_EQ_INT(sg_anomaly_bi_count(m, "ls", "cd"), 2);
+    ASSERT_EQ_INT(sg_anomaly_bi_count(m, "cd", "pwd"), 2);
+    ASSERT_EQ_INT(sg_anomaly_bi_count(m, "pwd", "ls"), 0);
+    ASSERT_EQ_INT(sg_anomaly_bi_count(m, "xxx", "yyy"), 0);
+
+    sg_anomaly_model_free(m);
+}
+
+TEST(introspection_tri_count)
+{
+    sg_anomaly_model_t *m = sg_anomaly_model_new();
+    const char *seq[] = { "ls", "cd", "pwd" };
+    sg_anomaly_update(m, seq, 3);
+    sg_anomaly_update(m, seq, 3);
+    sg_anomaly_update(m, seq, 3);
+
+    ASSERT_EQ_INT(sg_anomaly_tri_count(m, "ls", "cd", "pwd"), 3);
+    ASSERT_EQ_INT(sg_anomaly_tri_count(m, "cd", "pwd", "xxx"), 0);
+
+    sg_anomaly_model_free(m);
+}
+
+TEST(introspection_quad_count)
+{
+    sg_anomaly_model_t *m = sg_anomaly_model_new();
+    const char *seq[] = { "a", "b", "c", "d" };
+    sg_anomaly_update(m, seq, 4);
+    sg_anomaly_update(m, seq, 4);
+
+    ASSERT_EQ_INT(sg_anomaly_quad_count(m, "a", "b", "c", "d"), 2);
+    ASSERT_EQ_INT(sg_anomaly_quad_count(m, "x", "y", "z", "w"), 0);
+
+    sg_anomaly_model_free(m);
+}
+
+TEST(introspection_total_contexts)
+{
+    sg_anomaly_model_t *m = sg_anomaly_model_new();
+    ASSERT_EQ_INT(sg_anomaly_total_contexts(m), 0);
+
+    const char *seq[] = { "a", "b", "c", "d" };
+    sg_anomaly_update(m, seq, 4);
+
+    size_t ctx = sg_anomaly_total_contexts(m);
+    ASSERT(ctx > 0);
+
+    sg_anomaly_model_free(m);
+}
+
+TEST(introspection_has_observed)
+{
+    sg_anomaly_model_t *m = sg_anomaly_model_new();
+    const char *seq[] = { "ls", "cd", "pwd" };
+    sg_anomaly_update(m, seq, 3);
+
+    const char *seen[] = { "ls" };
+    ASSERT(sg_anomaly_has_observed(m, seen, 1));
+
+    const char *unseen[] = { "gcc" };
+    ASSERT(!sg_anomaly_has_observed(m, unseen, 1));
+
+    /* Mixed: at least one seen */
+    const char *mixed[] = { "gcc", "ls" };
+    ASSERT(sg_anomaly_has_observed(m, mixed, 2));
+
+    sg_anomaly_model_free(m);
+}
+
+TEST(introspection_null_safety)
+{
+    ASSERT_EQ_DBL(sg_anomaly_kn_discount(NULL), 0.0, 0.001);
+    ASSERT_EQ_INT(sg_anomaly_bi_count(NULL, "a", "b"), 0);
+    ASSERT_EQ_INT(sg_anomaly_tri_count(NULL, "a", "b", "c"), 0);
+    ASSERT_EQ_INT(sg_anomaly_quad_count(NULL, "a", "b", "c", "d"), 0);
+    ASSERT_EQ_INT(sg_anomaly_total_contexts(NULL), 0);
+    ASSERT(!sg_anomaly_has_observed(NULL, NULL, 0));
+}
+
+/* ============================================================
  * MAIN
  * ============================================================ */
 
@@ -816,6 +912,15 @@ int main(void)
     RUN(quad_4gram_short_sequence);
     RUN(quad_save_load_roundtrip);
     RUN(quad_long_sequence_scoring);
+
+    printf("\nIntrospection tests:\n");
+    RUN(introspection_kn_discount);
+    RUN(introspection_bi_count);
+    RUN(introspection_tri_count);
+    RUN(introspection_quad_count);
+    RUN(introspection_total_contexts);
+    RUN(introspection_has_observed);
+    RUN(introspection_null_safety);
 
     printf("\n%d passed, %d failed\n", pass_count, fail_count);
     return fail_count > 0 ? 1 : 0;

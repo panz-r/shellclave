@@ -155,6 +155,29 @@ size_t sg_anomaly_uni_count(const sg_anomaly_model_t *model, const char *cmd);
 /* Get count of unseen commands (for UNK probability estimation). */
 size_t sg_anomaly_unk_count(const sg_anomaly_model_t *model);
 
+/* Get the Kneser-Ney absolute discount parameter (default 0.5). */
+double sg_anomaly_kn_discount(const sg_anomaly_model_t *model);
+
+/* Get bigram count for (prev, curr). Returns 0 if never seen. */
+size_t sg_anomaly_bi_count(const sg_anomaly_model_t *model,
+                             const char *prev, const char *curr);
+
+/* Get trigram count for (p2, p1, curr). Returns 0 if never seen. */
+size_t sg_anomaly_tri_count(const sg_anomaly_model_t *model,
+                              const char *p2, const char *p1, const char *curr);
+
+/* Get 4-gram count for (p3, p2, p1, curr). Returns 0 if never seen. */
+size_t sg_anomaly_quad_count(const sg_anomaly_model_t *model,
+                               const char *p3, const char *p2,
+                               const char *p1, const char *curr);
+
+/* Get total number of unique n-gram contexts across all levels. */
+size_t sg_anomaly_total_contexts(const sg_anomaly_model_t *model);
+
+/* Check if any command in the sequence has been observed by the model. */
+bool sg_anomaly_has_observed(const sg_anomaly_model_t *model,
+                               const char **seq, size_t len);
+
 /* Clear all counts and reset to a fresh model.
  * Hyperparameters (alpha, unk_prior) are preserved. */
 void sg_anomaly_reset(sg_anomaly_model_t *model);
