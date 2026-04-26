@@ -5,6 +5,7 @@
  */
 
 #include "shellgate.h"
+#include "sg_anomaly.h"
 #include "shell_tokenizer.h"
 #include "shell_depgraph.h"
 #include "shelltype.h"
@@ -116,6 +117,13 @@ struct sg_gate {
 
     bool                  viol_enabled;
     sg_violation_config_t viol_config;
+
+    /* Anomaly detection */
+    sg_anomaly_model_t *anomaly_model;
+    bool                anomaly_enabled;
+    double              anomaly_threshold;
+    bool                anomaly_update_only_on_allow;
+    bool                anomaly_update_on_non_anomaly;  /* don't learn from anomalous commands */
 };
 
 /* ============================================================
@@ -142,12 +150,17 @@ sg_gate_t *sg_gate_new(void)
     g->suggestions = true;
     g->strict_mode = true;
 
+    /* Anomaly detection defaults */
+    g->anomaly_update_only_on_allow = false;
+    g->anomaly_update_on_non_anomaly = true;
+
     return g;
 }
 
 void sg_gate_free(sg_gate_t *gate)
 {
     if (!gate) return;
+    if (gate->anomaly_model) sg_anomaly_model_free(gate->anomaly_model);
     if (gate->policy)       st_policy_free(gate->policy);
     if (gate->deny_policy)  st_policy_free(gate->deny_policy);
     if (gate->pctx)         st_policy_ctx_free(gate->pctx);
@@ -211,6 +224,81 @@ sg_error_t sg_gate_set_violation_config(sg_gate_t *gate,
     gate->viol_enabled = true;
     gate->viol_config = *config;
     return SG_OK;
+}
+
+/* ============================================================
+ * ANOMALY DETECTION CONFIGURATION
+ * ============================================================ */
+
+sg_error_t sg_gate_enable_anomaly(sg_gate_t *gate,
+                                    double threshold,
+                                    double alpha,
+                                    double unk_prior)
+{
+    if (!gate) return SG_ERR_INVALID;
+    if (gate->anomaly_model)
+        sg_anomaly_model_free(gate->anomaly_model);
+    gate->anomaly_model = sg_anomaly_model_new_ex(alpha, unk_prior);
+    if (!gate->anomaly_model) return SG_ERR_MEMORY;
+    gate->anomaly_enabled = true;
+    gate->anomaly_threshold = threshold;
+    gate->anomaly_update_only_on_allow = false;
+    gate->anomaly_update_on_non_anomaly = true;
+    return SG_OK;
+}
+
+void sg_gate_disable_anomaly(sg_gate_t *gate)
+{
+    if (!gate) return;
+    if (gate->anomaly_model) {
+        sg_anomaly_model_free(gate->anomaly_model);
+        gate->anomaly_model = NULL;
+    }
+    gate->anomaly_enabled = false;
+}
+
+sg_error_t sg_gate_set_anomaly_update_mode(sg_gate_t *gate,
+                                             bool update_only_on_allow)
+{
+    if (!gate) return SG_ERR_INVALID;
+    gate->anomaly_update_only_on_allow = update_only_on_allow;
+    return SG_OK;
+}
+
+sg_error_t sg_gate_set_anomaly_update_on_non_anomaly(sg_gate_t *gate,
+                                                      bool skip_on_anomaly)
+{
+    if (!gate) return SG_ERR_INVALID;
+    gate->anomaly_update_on_non_anomaly = skip_on_anomaly;
+    return SG_OK;
+}
+
+sg_error_t sg_gate_save_anomaly_model(const sg_gate_t *gate, const char *path)
+{
+    if (!gate || !path) return SG_ERR_INVALID;
+    if (!gate->anomaly_enabled || !gate->anomaly_model) return SG_ERR_INVALID;
+    if (sg_anomaly_save(gate->anomaly_model, path) != 0) return SG_ERR_IO;
+    return SG_OK;
+}
+
+sg_error_t sg_gate_load_anomaly_model(sg_gate_t *gate, const char *path)
+{
+    if (!gate || !path) return SG_ERR_INVALID;
+    if (!gate->anomaly_enabled || !gate->anomaly_model) return SG_ERR_INVALID;
+    if (sg_anomaly_load(gate->anomaly_model, path) != 0) return SG_ERR_IO;
+    return SG_OK;
+}
+
+bool sg_gate_anomaly_had_error(const sg_gate_t *gate)
+{
+    if (!gate || !gate->anomaly_model) return false;
+    return sg_anomaly_model_had_error(gate->anomaly_model);
+}
+
+size_t sg_gate_anomaly_vocab_size(const sg_gate_t *gate)
+{
+    if (!gate || !gate->anomaly_model) return 0;
+    return sg_anomaly_vocab_size(gate->anomaly_model);
 }
 
 /* ============================================================
@@ -552,18 +640,6 @@ void sg_violation_config_default(sg_violation_config_t *cfg)
  * VIOLATION SCANNING HELPERS
  * ============================================================ */
 
-static bool path_has_prefix(const char *path, uint32_t path_len,
-                            const char *prefix)
-{
-    size_t plen = strlen(prefix);
-    if (path_len < plen) return false;
-    if (memcmp(path, prefix, plen) != 0) return false;
-    if (plen > 0 && prefix[plen - 1] == '/') return true;
-    if (path_len == plen) return true;
-    if (path[plen] == '/') return true;
-    return false;
-}
-
 /* Exact-match binary search on sorted null-terminated string array.
  * Requires array sorted in C string order (lexicographic).
  * Returns true and sets *out_idx if found. */
@@ -589,9 +665,9 @@ static bool sg_name_found(const char *needle, uint32_t needle_len,
     return false;
 }
 
-/* Prefix-match binary search on sorted path array.
- * Requires sorted order: shorter paths before longer paths that have them as prefix.
- * path_has_prefix(path, sorted_paths[i]) must be the comparison.
+/* Prefix-match linear search on sorted path array.
+ * For small arrays (max 32 entries), linear search is faster than binary search
+ * due to better cache locality. The array is kept sorted (shorter paths first).
  * Returns true and sets *out_idx if a matching prefix is found. */
 static bool sg_path_found(const char *path, uint32_t path_len,
                           const char *const *sorted_paths, uint32_t count,
@@ -1372,6 +1448,31 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len,
         }
     }
 
+    /* Extract command sequence from graph (used for anomaly detection and learning) */
+    const char *cmd_seq[SHELL_DEP_MAX_NODES];
+    size_t cmd_count = 0;
+    for (uint32_t ni = 0; ni < graph.node_count; ni++) {
+        const shell_dep_node_t *node = &graph.nodes[ni];
+        if (node->type == SHELL_NODE_CMD && node->cmd.token_count > 0)
+            cmd_seq[cmd_count++] = node->cmd.tokens[0];
+    }
+
+    /* Anomaly detection: score the command sequence */
+    if (gate->anomaly_enabled && gate->anomaly_model && cmd_count > 0) {
+        out->anomaly_score = sg_anomaly_score(gate->anomaly_model, cmd_seq, cmd_count);
+        /* For short sequences (< 3 commands), scoring is undefined (INFINITY).
+         * Treat as non-anomalous so the model can still learn unigrams/bigrams. */
+        if (cmd_count < 3) {
+            out->anomaly_score = 0.0;
+            out->anomaly_detected = false;
+        } else {
+            out->anomaly_detected = (out->anomaly_score > gate->anomaly_threshold);
+        }
+    } else if (gate->anomaly_enabled && gate->anomaly_model) {
+        out->anomaly_score = 0.0;
+        out->anomaly_detected = false;
+    }
+
     /* Step 4: Walk CMD nodes, evaluate each against policy */
     bool subcmd_truncated = false;
     for (uint32_t ni = 0; ni < graph.node_count; ni++) {
@@ -1496,6 +1597,23 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len,
         out->verdict = SG_VERDICT_ALLOW;
     else
         out->verdict = SG_VERDICT_UNDETERMINED;
+
+    /* Deferred anomaly model update — after verdict is known */
+    if (gate->anomaly_enabled && gate->anomaly_model && cmd_count > 0) {
+        bool should_update = false;
+        if (!gate->anomaly_update_only_on_allow) {
+            /* Always update, but skip if anomalous and flag is set */
+            should_update = !out->anomaly_detected || !gate->anomaly_update_on_non_anomaly;
+        } else if (out->verdict == SG_VERDICT_ALLOW) {
+            /* Only update on ALLOW verdict */
+            should_update = !out->anomaly_detected || !gate->anomaly_update_on_non_anomaly;
+        }
+
+        if (should_update) {
+            sg_anomaly_update(gate->anomaly_model, cmd_seq, cmd_count);
+        }
+    }
+
     return (bw.overflow || subcmd_truncated) ? SG_ERR_TRUNC : SG_OK;
 }
 

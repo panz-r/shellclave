@@ -122,6 +122,7 @@ typedef enum {
     SG_ERR_MEMORY    = -2,
     SG_ERR_PARSE     = -3,
     SG_ERR_TRUNC     = -4,
+    SG_ERR_IO        = -5,
 } sg_error_t;
 
 typedef enum {
@@ -191,6 +192,18 @@ typedef struct {
     uint32_t       violation_flags;
     uint32_t       violation_dropped_count;
     bool           has_violations;
+
+    /* Anomaly detection */
+    /*
+     * anomaly_score: bits per command (higher = more anomalous).
+     *                 0.0 for sequences < 3 commands.
+     *                 INFINITY if model cannot score (e.g., empty model).
+     *
+     * anomaly_detected: true if anomaly_score > threshold.
+     *                    Always false for sequences with < 3 commands.
+     */
+    bool    anomaly_detected;
+    double  anomaly_score;
 } sg_result_t;
 
 typedef struct sg_gate sg_gate_t;
@@ -294,6 +307,104 @@ typedef size_t (*sg_expand_glob_fn)(const char *pattern,
 
 sg_gate_t *sg_gate_new(void);
 void sg_gate_free(sg_gate_t *gate);
+
+/* ============================================================
+ * ANOMALY DETECTION CONFIGURATION
+ * ============================================================ */
+
+/*
+ * Enable statistical anomaly detection on the gate.
+ *
+ * The model uses a trigram language model with backoff to detect unusual
+ * command sequences.  Each sg_eval call scores the command sequence and
+ * sets anomaly_score/anomaly_detected in the result.
+ *
+ * Parameters:
+ *   threshold   : score above this (bits/command) triggers anomaly_detected.
+ *                 Recommended starting value: 5.0.  See threshold guide below.
+ *   alpha       : smoothing parameter for Dirichlet smoothing.  Try 0.1.
+ *   unk_prior   : log-probability of unseen command in bits.  Try -10.0.
+ *
+ * A model is created with these hyperparameters.  Initially empty
+ * (no anomaly detection utility until enough commands are observed).
+ *
+ * Returns SG_ERR_MEMORY if allocation fails.
+ *
+ * =======================================================================
+ * THRESHOLD TUNING GUIDE
+ * =======================================================================
+ *   2.0-3.0 : Sensitive — catches unusual but not necessarily malicious.
+ *             Higher false positive rate.  Good for learning environments.
+ *   4.0-5.0 : Balanced — recommended starting point for most workloads.
+ *             Reasonable trade-off between sensitivity and specificity.
+ *   7.0+    : Conservative — only very anomalous sequences flagged.
+ *             Lower false positive rate.  Good for production environments.
+ *
+ * =======================================================================
+ * SCORING BEHAVIOR
+ * =======================================================================
+ * - score is in bits per command (higher = more anomalous)
+ * - sequences with < 3 commands: anomaly_score = 0.0, anomaly_detected = false
+ *   (scoring requires at least one trigram, but short sequences still
+ *   contribute to unigram/bigram learning)
+ * - INFINITY score means model cannot score (e.g., empty model)
+ * - model learns from sequences unless anomaly_detected=true and
+ *   anomaly_update_on_non_anomaly is enabled (default: true, skip anomalous)
+ * =======================================================================
+ */
+sg_error_t sg_gate_enable_anomaly(sg_gate_t *gate,
+                                    double threshold,
+                                    double alpha,
+                                    double unk_prior);
+
+/* Disable anomaly detection.  Frees the model. */
+void sg_gate_disable_anomaly(sg_gate_t *gate);
+
+/*
+ * Set update mode for anomaly learning.
+ *
+ * If `update_only_on_allow` is true, the model is only updated when
+ * the overall verdict is SG_VERDICT_ALLOW (not on deny/reject).
+ * Default: false (model is updated on every sg_eval call regardless
+ * of verdict, as long as anomaly_detected is false).
+ */
+sg_error_t sg_gate_set_anomaly_update_mode(sg_gate_t *gate,
+                                             bool update_only_on_allow);
+
+/*
+ * Set whether to skip learning from anomalous commands.
+ * If `skip_on_anomaly` is true, the model is NOT updated when
+ * `anomaly_detected` is true (score exceeds threshold), even if
+ * the verdict is ALLOW.  This prevents poisoning the model with
+ * suspicious commands.
+ * Default: true (skip anomalous commands).
+ */
+sg_error_t sg_gate_set_anomaly_update_on_non_anomaly(sg_gate_t *gate,
+                                                      bool skip_on_anomaly);
+
+/*
+ * Save the anomaly model to a file.
+ * Returns SG_ERR_INVALID if anomaly detection is not enabled,
+ * or SG_ERR_IO on file error.
+ */
+sg_error_t sg_gate_save_anomaly_model(const sg_gate_t *gate, const char *path);
+
+/*
+ * Load the anomaly model from a file.
+ * Returns SG_ERR_INVALID if anomaly detection is not enabled,
+ * or SG_ERR_IO on file error.
+ */
+sg_error_t sg_gate_load_anomaly_model(sg_gate_t *gate, const char *path);
+
+/*
+ * Returns true if the anomaly model has had an allocation failure.
+ */
+bool sg_gate_anomaly_had_error(const sg_gate_t *gate);
+
+/*
+ * Returns the number of unique commands in the anomaly model.
+ */
+size_t sg_gate_anomaly_vocab_size(const sg_gate_t *gate);
 
 /* ============================================================
  * CONFIGURATION

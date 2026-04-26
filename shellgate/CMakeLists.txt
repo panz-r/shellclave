@@ -40,8 +40,12 @@ target_link_libraries(shelltype_gate PUBLIC m)
 # ── shellgate library ─────────────────────────────────────────
 add_library(shellgate STATIC
     src/shellgate.c
+    src/sg_anomaly.c
 )
-target_include_directories(shellgate PUBLIC ${CMAKE_SOURCE_DIR}/include)
+target_include_directories(shellgate PUBLIC
+    ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}/include
+)
 target_link_libraries(shellgate PUBLIC shellsplit_gate shelltype_gate)
 
 # ── Tests ─────────────────────────────────────────────────────
@@ -51,6 +55,11 @@ add_executable(test_shellgate
     tests/test_shellgate.c
 )
 target_link_libraries(test_shellgate PRIVATE shellgate)
+
+add_executable(test_anomaly
+    tests/test_anomaly.c
+)
+target_link_libraries(test_anomaly PRIVATE shellgate)
 
 include(CTest)
 add_test(NAME shellgate COMMAND test_shellgate)
