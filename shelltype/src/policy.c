@@ -372,7 +372,9 @@ static const uint64_t st_compat_mask[ST_TYPE_COUNT] = {
     /* LITERAL */      (1ULL << ST_TYPE_LITERAL) | (1ULL << ST_TYPE_ANY),
     /* HEXHASH */      (1ULL << ST_TYPE_HEXHASH) | (1ULL << ST_TYPE_NUMBER) | (1ULL << ST_TYPE_VALUE) | (1ULL << ST_TYPE_ANY),
     /* NUMBER */       (1ULL << ST_TYPE_NUMBER) | (1ULL << ST_TYPE_VALUE) | (1ULL << ST_TYPE_ANY),
-    /* IPV4 */         (1ULL << ST_TYPE_IPV4) | (1ULL << ST_TYPE_VALUE) | (1ULL << ST_TYPE_ANY),
+    /* IPV4 */         (1ULL << ST_TYPE_IPV4) | (1ULL << ST_TYPE_IPADDR) | (1ULL << ST_TYPE_VALUE) | (1ULL << ST_TYPE_ANY),
+    /* IPV6 */         (1ULL << ST_TYPE_IPV6) | (1ULL << ST_TYPE_IPADDR) | (1ULL << ST_TYPE_VALUE) | (1ULL << ST_TYPE_ANY),
+    /* IPADDR */       (1ULL << ST_TYPE_IPADDR) | (1ULL << ST_TYPE_IPV4) | (1ULL << ST_TYPE_IPV6) | (1ULL << ST_TYPE_VALUE) | (1ULL << ST_TYPE_ANY),
     /* WORD */         (1ULL << ST_TYPE_WORD) | (1ULL << ST_TYPE_VALUE) | (1ULL << ST_TYPE_ANY),
     /* QUOTED */       (1ULL << ST_TYPE_QUOTED) | (1ULL << ST_TYPE_QUOTED_SPACE) | (1ULL << ST_TYPE_VALUE) | (1ULL << ST_TYPE_ANY),
     /* QUOTED_SPACE */ (1ULL << ST_TYPE_QUOTED_SPACE) | (1ULL << ST_TYPE_VALUE) | (1ULL << ST_TYPE_ANY),
@@ -401,6 +403,10 @@ static const uint64_t st_compat_mask[ST_TYPE_COUNT] = {
     /* PKG */          (1ULL << ST_TYPE_PKG) | (1ULL << ST_TYPE_VALUE) | (1ULL << ST_TYPE_ANY),
     /* USER */         (1ULL << ST_TYPE_USER) | (1ULL << ST_TYPE_VALUE) | (1ULL << ST_TYPE_ANY),
     /* FINGERPRINT */  (1ULL << ST_TYPE_FINGERPRINT) | (1ULL << ST_TYPE_VALUE) | (1ULL << ST_TYPE_ANY),
+    /* MAC */           (1ULL << ST_TYPE_MAC) | (1ULL << ST_TYPE_VALUE) | (1ULL << ST_TYPE_ANY),
+    /* METHOD */        (1ULL << ST_TYPE_METHOD) | (1ULL << ST_TYPE_WORD) | (1ULL << ST_TYPE_VALUE) | (1ULL << ST_TYPE_ANY),
+    /* CRON */          (1ULL << ST_TYPE_CRON) | (1ULL << ST_TYPE_VALUE) | (1ULL << ST_TYPE_ANY),
+    /* DURATION */      (1ULL << ST_TYPE_DURATION) | (1ULL << ST_TYPE_VALUE) | (1ULL << ST_TYPE_ANY),
     /* ANY */          (1ULL << ST_TYPE_ANY),
 };
 
@@ -3252,7 +3258,7 @@ st_error_t st_policy_simulate_add(st_policy_t *policy,
  *
  * Type hierarchy (with caps):
  *   #sha → #h → #val → #w (cap)
- *   #i → #val → #w (cap)
+ *   #i, #ipv6 → #ipaddr → #val → #w (cap)
  *   #w → #w (cap - already at limit)
  *   #q → #qs → #val → #w (cap)
  *   #f → #r → #path → #path (cap - #path is appropriate for paths)
@@ -3263,7 +3269,8 @@ st_error_t st_policy_simulate_add(st_policy_t *policy,
  *   #lopt → #opt → #val (cap)
  *   #uuid, #email, #host, #size, #semver, #ts, #env → #val → * (cap)
  *   #port → #n → #val → * (cap)
- *   #hash, #hyp → #word → #val → * (cap)
+ *   #hash, #hyp, #method → #word → #val → * (cap)
+ *   #mac, #cron, #duration → #val → * (cap)
  */
 static st_token_type_t next_wider_type(st_token_type_t t)
 {
@@ -3271,7 +3278,9 @@ static st_token_type_t next_wider_type(st_token_type_t t)
         case ST_TYPE_SHA:         return ST_TYPE_HEXHASH;
         case ST_TYPE_HEXHASH:     return ST_TYPE_VALUE;
         case ST_TYPE_NUMBER:      return ST_TYPE_VALUE;
-        case ST_TYPE_IPV4:        return ST_TYPE_VALUE;
+        case ST_TYPE_IPV4:        return ST_TYPE_IPADDR;
+        case ST_TYPE_IPV6:        return ST_TYPE_IPADDR;
+        case ST_TYPE_IPADDR:      return ST_TYPE_VALUE;
         case ST_TYPE_WORD:        return ST_TYPE_WORD; /* Cap reached */
         case ST_TYPE_QUOTED:      return ST_TYPE_QUOTED_SPACE;
         case ST_TYPE_QUOTED_SPACE:return ST_TYPE_VALUE;
@@ -3299,6 +3308,10 @@ static st_token_type_t next_wider_type(st_token_type_t t)
         case ST_TYPE_PKG:         return ST_TYPE_VALUE;  /* Cap: #pkg → #val */
         case ST_TYPE_USER:        return ST_TYPE_VALUE;  /* Cap: #user → #val */
         case ST_TYPE_FINGERPRINT: return ST_TYPE_VALUE;  /* Cap: #fp → #val */
+        case ST_TYPE_MAC:         return ST_TYPE_VALUE;  /* Cap: #mac → #val */
+        case ST_TYPE_METHOD:      return ST_TYPE_WORD;   /* Cap: #method → #word */
+        case ST_TYPE_CRON:        return ST_TYPE_VALUE;  /* Cap: #cron → #val */
+        case ST_TYPE_DURATION:    return ST_TYPE_VALUE;  /* Cap: #duration → #val */
         case ST_TYPE_ANY:         return ST_TYPE_ANY;    /* Already at top */
         default:                  return t;
     }

@@ -28,6 +28,8 @@ TYPE_ORDER: List[str] = [
     "HEXHASH",
     "NUMBER",
     "IPV4",
+    "IPV6",
+    "IPADDR",
     "WORD",
     "QUOTED",
     "QUOTED_SPACE",
@@ -56,6 +58,10 @@ TYPE_ORDER: List[str] = [
     "PKG",
     "USER",
     "FINGERPRINT",
+    "MAC",
+    "METHOD",
+    "CRON",
+    "DURATION",
     "ANY",
 ]
 
@@ -70,7 +76,8 @@ TYPE_ORDER: List[str] = [
 # correct transitive closure: PORT ≤ {NUMBER, IPV4, VALUE, ANY}.
 CHAINS: List[List[str]] = [
     ["SHA", "HEXHASH", "VALUE", "ANY"],
-    ["IPV4", "VALUE", "ANY"],
+    ["IPV4", "IPADDR", "VALUE", "ANY"],
+    ["IPV6", "IPADDR", "VALUE", "ANY"],
     ["WORD", "VALUE", "ANY"],
     ["QUOTED", "QUOTED_SPACE", "VALUE", "ANY"],
     ["FILENAME", "REL_PATH", "PATH", "ANY"],
@@ -93,6 +100,10 @@ CHAINS: List[List[str]] = [
     ["PKG", "VALUE", "ANY"],
     ["USER", "VALUE", "ANY"],
     ["FINGERPRINT", "VALUE", "ANY"],
+    ["MAC", "VALUE", "ANY"],
+    ["METHOD", "WORD", "VALUE", "ANY"],
+    ["CRON", "VALUE", "ANY"],
+    ["DURATION", "VALUE", "ANY"],
 ]
 
 # ------------------------------------------------------------------
@@ -211,6 +222,8 @@ def symbol(name: str) -> str:
         "HEXHASH": '"#h"',
         "NUMBER": '"#n"',
         "IPV4": '"#i"',
+        "IPV6": '"#ipv6"',
+        "IPADDR": '"#ipaddr"',
         "WORD": '"#w"',
         "QUOTED": '"#q"',
         "QUOTED_SPACE": '"#qs"',
@@ -239,6 +252,10 @@ def symbol(name: str) -> str:
         "PKG": '"#pkg"',
         "USER": '"#user"',
         "FINGERPRINT": '"#fp"',
+        "MAC": '"#mac"',
+        "METHOD": '"#method"',
+        "CRON": '"#cron"',
+        "DURATION": '"#duration"',
         "ANY": '"*"',
     }
     return symbols[name]
@@ -273,6 +290,7 @@ def header_comment() -> str:
 def generate_join_table(join: Dict[str, Dict[str, str]]) -> str:
     abbrevs = {
         "LITERAL": "LIT", "HEXHASH": "HEX", "NUMBER": "NUM", "IPV4": "IPV4",
+        "IPV6": "IPV6", "IPADDR": "IPAD",
         "WORD": "WORD", "QUOTED": "QOT", "QUOTED_SPACE": "QS", "FILENAME": "FILE",
         "REL_PATH": "REL", "ABS_PATH": "ABS", "PATH": "PATH", "URL": "URL",
         "VALUE": "VAL", "SHORTOPT": "SOPT", "LONGOPT": "LOPT", "OPT": "OPT",
@@ -280,7 +298,8 @@ def generate_join_table(join: Dict[str, Dict[str, str]]) -> str:
         "HOSTNAME": "HOST", "PORT": "PORT", "SIZE": "SIZE", "SEMVER": "SEMV",
         "TIMESTAMP": "TS", "HASH_ALGO": "HASH", "ENV_VAR": "ENV",
         "HYPHENATED": "HYP", "BRANCH": "BRNCH", "SHA": "SHA", "IMAGE": "IMAG",
-        "PKG": "PKG", "USER": "USER", "FINGERPRINT": "FP", "ANY": "ANY",
+        "PKG": "PKG", "USER": "USER", "FINGERPRINT": "FP",
+        "MAC": "MAC", "METHOD": "METH", "CRON": "CRON", "DURATION": "DUR", "ANY": "ANY",
     }
     lines = [
         "/* ============================================================",
@@ -291,6 +310,7 @@ def generate_join_table(join: Dict[str, Dict[str, str]]) -> str:
         " * Lattice:",
         " *   #sha ⊂ #h ⊂ #val ⊂ *",
         " *   #i ⊂ #val ⊂ *",
+        " *   #i, #ipv6 ⊂ #ipaddr ⊂ #val ⊂ *",
         " *   #w ⊂ #val ⊂ *",
         " *   #q ⊂ #qs ⊂ #val ⊂ *",
         " *   #f ⊂ #r ⊂ #path ⊂ *",
@@ -299,8 +319,8 @@ def generate_join_table(join: Dict[str, Dict[str, str]]) -> str:
         " *   #sopt, #lopt ⊂ #opt ⊂ #val ⊂ *",
         " *   #uuid, #email, #host, #size, #semver, #ts, #env ⊂ #val ⊂ *",
         " *   #port ⊂ #n, #port ⊂ #i, #port ⊂ #val ⊂ *",
-        " *   #hash, #hyp ⊂ #w ⊂ #val ⊂ *",
-        " *   #branch, #image, #pkg, #user, #fp ⊂ #val ⊂ *",
+        " *   #hash, #hyp, #method ⊂ #w ⊂ #val ⊂ *",
+        " *   #mac, #cron, #duration, #branch, #image, #pkg, #user, #fp ⊂ #val ⊂ *",
         " * ============================================================ */",
         "",
         "const st_token_type_t st_type_join[ST_TYPE_COUNT][ST_TYPE_COUNT] = {",

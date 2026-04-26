@@ -2069,6 +2069,36 @@ static int test_incr_opt_wildcard(void)
     return 1;
 }
 
+/* #ipaddr subsumes both #ipv4 and #ipv6 */
+static int test_incr_ipaddr_subsumes(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_policy_t *policy = st_policy_new(ctx);
+
+    st_policy_add(policy, "ping #i");
+    st_policy_add(policy, "ping #ipv6");
+    ASSERT(st_policy_count(policy) == 2);
+
+    /* #ipaddr subsumes both #i and #ipv6 */
+    st_error_t err = st_policy_add(policy, "ping #ipaddr");
+    ASSERT(err == ST_OK);
+    ASSERT(st_policy_count(policy) == 1);
+
+    /* Both IPv4 and IPv6 commands match */
+    st_eval_result_t r;
+    err = st_policy_eval(policy, "ping 192.168.1.1", &r);
+    ASSERT(err == ST_OK);
+    ASSERT(r.matches);
+
+    err = st_policy_eval(policy, "ping ::1", &r);
+    ASSERT(err == ST_OK);
+    ASSERT(r.matches);
+
+    st_policy_free(policy);
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
 /* Stress test: 100 literals subsumed by one wildcard */
 static int test_incr_stress(void)
 {
@@ -2350,6 +2380,7 @@ int main(void)
     TEST(test_incr_keeps_different_lengths);
     TEST(test_incr_parametrized);
     TEST(test_incr_opt_wildcard);
+    TEST(test_incr_ipaddr_subsumes);
     TEST(test_incr_stress);
     TEST(test_incr_remove_cleans_bucket);
     TEST(test_incr_batch_add);

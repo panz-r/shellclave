@@ -53,12 +53,14 @@ const char *st_error_string(st_error_t err);
  *
  * Ordering (⊂ = strict subset):
  *   #h ⊂ #n ⊂ #val ⊂ *
- *   #i ⊂ #val ⊂ *
+ *   #i, #ipv6 ⊂ #ipaddr ⊂ #val ⊂ *
  *   #w ⊂ #val ⊂ *
  *   #q ⊂ #qs ⊂ #val ⊂ *
  *   #f ⊂ #r ⊂ #path ⊂ *
  *   #p ⊂ #path ⊂ *
  *   #u ⊂ *
+ *   #method ⊂ #w ⊂ #val ⊂ *
+ *   #mac, #cron, #duration ⊂ #val ⊂ *
  *
  * #f and #w are incomparable (a filename is not a word, a word is not a filename).
  * #hash, #hyp ⊂ #w ⊂ #val ⊂ *
@@ -70,6 +72,8 @@ typedef enum {
     ST_TYPE_HEXHASH,       /* #h: 8+ hex chars (e.g., deadbeef) */
     ST_TYPE_NUMBER,        /* #n: decimal, hex, octal integers */
     ST_TYPE_IPV4,          /* #i: dotted decimal (192.168.1.1) */
+    ST_TYPE_IPV6,          /* #ipv6: IPv6 address (2001:db8::1, ::1) */
+    ST_TYPE_IPADDR,        /* #ipaddr: any IP address (#i ∨ #ipv6) */
     ST_TYPE_WORD,          /* #w: [a-zA-Z_][a-zA-Z0-9_]* */
     ST_TYPE_QUOTED,        /* #q: quoted string, no whitespace */
     ST_TYPE_QUOTED_SPACE,  /* #qs: quoted string with whitespace */
@@ -98,6 +102,10 @@ typedef enum {
     ST_TYPE_PKG,          /* #pkg: package specifier (express, @babel/core@^7) */
     ST_TYPE_USER,         /* #user: unix username (root, www-data, deploy-user) */
     ST_TYPE_FINGERPRINT,  /* #fp: SSH key fingerprint (SHA256:xxx or MD5 hex colons) */
+    ST_TYPE_MAC,           /* #mac: MAC address (aa:bb:cc:dd:ee:ff) */
+    ST_TYPE_METHOD,        /* #method: HTTP method (GET, POST, PUT, etc.) */
+    ST_TYPE_CRON,          /* #cron: cron schedule field */
+    ST_TYPE_DURATION,      /* #duration: time duration (30s, 1.5h, 100ms) */
     ST_TYPE_ANY,           /* *: everything (top element) */
     ST_TYPE_COUNT          /* number of types */
 } st_token_type_t;

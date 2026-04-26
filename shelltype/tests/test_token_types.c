@@ -369,6 +369,143 @@ static int test_classify_option_not_option(void)
     return 1;
 }
 
+/* --- #ipv6: IPv6 address --- */
+
+static int test_classify_ipv6_full(void)
+{
+    ASSERT_TYPE("2001:0db8:85a3:0000:0000:8a2e:0370:7334", ST_TYPE_IPV6);
+    ASSERT_TYPE("2001:db8:85a3:0:0:8a2e:370:7334", ST_TYPE_IPV6);
+    return 1;
+}
+
+static int test_classify_ipv6_compressed(void)
+{
+    ASSERT_TYPE("::1", ST_TYPE_IPV6);
+    ASSERT_TYPE("2001:db8::1", ST_TYPE_IPV6);
+    ASSERT_TYPE("::", ST_TYPE_IPV6);
+    ASSERT_TYPE("fe80::", ST_TYPE_IPV6);
+    return 1;
+}
+
+static int test_classify_ipv6_zone(void)
+{
+    ASSERT_TYPE("fe80::1%eth0", ST_TYPE_IPV6);
+    ASSERT_TYPE("::1%lo", ST_TYPE_IPV6);
+    return 1;
+}
+
+static int test_classify_ipv6_reject(void)
+{
+    ASSERT_TYPE("192.168.1.1", ST_TYPE_IPV4);  /* IPv4 stays IPv4 */
+    ASSERT_TYPE("hello", ST_TYPE_LITERAL);
+    ASSERT_TYPE(":::", ST_TYPE_LITERAL);  /* triple colon */
+    ASSERT_TYPE("2001::db8::1", ST_TYPE_LITERAL);  /* two :: */
+    return 1;
+}
+
+/* --- #ipaddr: not returned from classification (wildcard only) --- */
+
+/* --- #mac: MAC address --- */
+
+static int test_classify_mac_colon(void)
+{
+    ASSERT_TYPE("aa:bb:cc:dd:ee:ff", ST_TYPE_MAC);
+    ASSERT_TYPE("00:11:22:33:44:55", ST_TYPE_MAC);
+    ASSERT_TYPE("AA:BB:CC:DD:EE:FF", ST_TYPE_MAC);
+    return 1;
+}
+
+static int test_classify_mac_hyphen(void)
+{
+    ASSERT_TYPE("aa-bb-cc-dd-ee-ff", ST_TYPE_MAC);
+    ASSERT_TYPE("00-11-22-33-44-55", ST_TYPE_MAC);
+    return 1;
+}
+
+static int test_classify_mac_reject(void)
+{
+    ASSERT_TYPE("aa:bb:cc", ST_TYPE_IMAGE);  /* looks like image ref host:port */
+    ASSERT_TYPE("gg:hh:ii:jj:kk:ll", ST_TYPE_IMAGE);  /* looks like image ref */
+    ASSERT_TYPE("aa:bb:cc:dd:ee", ST_TYPE_IMAGE);  /* looks like image ref */
+    return 1;
+}
+
+/* --- #method: HTTP method --- */
+
+static int test_classify_method_get(void)
+{
+    ASSERT_TYPE("GET", ST_TYPE_METHOD);
+    ASSERT_TYPE("POST", ST_TYPE_METHOD);
+    ASSERT_TYPE("PUT", ST_TYPE_METHOD);
+    ASSERT_TYPE("DELETE", ST_TYPE_METHOD);
+    ASSERT_TYPE("PATCH", ST_TYPE_METHOD);
+    return 1;
+}
+
+static int test_classify_method_case(void)
+{
+    /* Only uppercase matches; but HEAD goes to BRANCH (checked first for git) */
+    ASSERT_TYPE("get", ST_TYPE_LITERAL);
+    ASSERT_TYPE("Get", ST_TYPE_LITERAL);
+    ASSERT_TYPE("HEAD", ST_TYPE_BRANCH);  /* git branch check takes priority */
+    ASSERT_TYPE("head", ST_TYPE_LITERAL);
+    ASSERT_TYPE("OPTIONS", ST_TYPE_METHOD);
+    return 1;
+}
+
+/* --- #duration: Time duration --- */
+
+static int test_classify_duration_seconds(void)
+{
+    ASSERT_TYPE("30s", ST_TYPE_DURATION);
+    ASSERT_TYPE("1s", ST_TYPE_DURATION);
+    ASSERT_TYPE("0s", ST_TYPE_DURATION);
+    return 1;
+}
+
+static int test_classify_duration_units(void)
+{
+    ASSERT_TYPE("1.5h", ST_TYPE_DURATION);
+    ASSERT_TYPE("100ms", ST_TYPE_DURATION);
+    ASSERT_TYPE("500ns", ST_TYPE_DURATION);
+    ASSERT_TYPE("10us", ST_TYPE_DURATION);
+    ASSERT_TYPE("7d", ST_TYPE_DURATION);
+    ASSERT_TYPE("2w", ST_TYPE_DURATION);
+    ASSERT_TYPE("45m", ST_TYPE_DURATION);
+    return 1;
+}
+
+static int test_classify_duration_reject(void)
+{
+    ASSERT_TYPE("30M", ST_TYPE_SIZE);     /* M is a size suffix */
+    ASSERT_TYPE("1Ki", ST_TYPE_SIZE);     /* Ki is a size suffix */
+    ASSERT_TYPE("abc", ST_TYPE_LITERAL);
+    ASSERT_TYPE("s", ST_TYPE_LITERAL);    /* no number */
+    return 1;
+}
+
+/* --- #cron: Cron schedule field --- */
+
+static int test_classify_cron_field(void)
+{
+    ASSERT_TYPE("*/5", ST_TYPE_CRON);
+    ASSERT_TYPE("0,30", ST_TYPE_CRON);
+    ASSERT_TYPE("1-5", ST_TYPE_CRON);
+    ASSERT_TYPE("*/15", ST_TYPE_CRON);
+    /* Bare digits like "0" are NUMBER, not CRON — need cron punctuation */
+    ASSERT_TYPE("*", ST_TYPE_CRON);
+    return 1;
+}
+
+static int test_classify_cron_reject(void)
+{
+    ASSERT_TYPE("-", ST_TYPE_LITERAL);    /* bare hyphen */
+    ASSERT_TYPE("--", ST_TYPE_LITERAL);   /* double dash */
+    ASSERT_TYPE(",", ST_TYPE_LITERAL);    /* bare comma */
+    ASSERT_TYPE("abc", ST_TYPE_LITERAL);  /* has letters */
+    return 1;
+}
+
 /* --- #ts: Timestamp --- */
 
 static int test_classify_timestamp_date(void)
@@ -1214,6 +1351,30 @@ int main(void)
     TEST(test_classify_option_short);
     TEST(test_classify_option_long);
     TEST(test_classify_option_not_option);
+
+    printf("\nClassification - IPv6 (#ipv6):\n");
+    TEST(test_classify_ipv6_full);
+    TEST(test_classify_ipv6_compressed);
+    TEST(test_classify_ipv6_zone);
+    TEST(test_classify_ipv6_reject);
+
+    printf("\nClassification - MAC (#mac):\n");
+    TEST(test_classify_mac_colon);
+    TEST(test_classify_mac_hyphen);
+    TEST(test_classify_mac_reject);
+
+    printf("\nClassification - HTTP Method (#method):\n");
+    TEST(test_classify_method_get);
+    TEST(test_classify_method_case);
+
+    printf("\nClassification - Duration (#duration):\n");
+    TEST(test_classify_duration_seconds);
+    TEST(test_classify_duration_units);
+    TEST(test_classify_duration_reject);
+
+    printf("\nClassification - Cron (#cron):\n");
+    TEST(test_classify_cron_field);
+    TEST(test_classify_cron_reject);
 
     printf("\nClassification - Timestamp (#ts):\n");
     TEST(test_classify_timestamp_date);
