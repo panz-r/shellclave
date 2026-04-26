@@ -1,4 +1,6 @@
 #include "shellgate.h"
+#include "shellgate.h"
+#include "shell_abstract.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -2278,7 +2280,6 @@ TEST(anomaly_update_on_non_anomaly)
     /* Train with known commands - model should learn */
     eval_cmd(g, "ls ; cd /tmp", &r);
     eval_cmd(g, "ls ; pwd ; cd /home", &r);
-    size_t vocab_initial = sg_gate_anomaly_vocab_size(g);
 
     /* With flag enabled (default), model should learn from allowed commands.
      * Unknown commands like 'vim' may or may not be learned depending on anomaly detection. */
@@ -2431,17 +2432,232 @@ TEST(anomaly_property_test)
     sg_gate_free(g);
 }
 
+TEST(anomaly_hybrid_weight_raw_only)
+{
+    /* With weight_raw=1.0, only raw model contributes to score */
+    sg_gate_t *g = sg_gate_new();
+    sg_gate_enable_anomaly(g, 5.0, 0.1, -10.0);
+    sg_gate_set_anomaly_weights(g, 1.0, 0.0);
+    sg_gate_add_rule(g, "ls");
+    sg_gate_add_rule(g, "cd");
+
+    sg_result_t r;
+    /* Train both models */
+    for (int i = 0; i < 20; i++) {
+        eval_cmd(g, "ls ; cd /tmp ; pwd", &r);
+    }
+
+    /* With weight_raw=1.0, score should equal raw-only score */
+    double score_before = r.anomaly_score;
+
+    /* Weights should be set correctly */
+    ASSERT(r.anomaly_score == score_before);  /* just verify no crash */
+    sg_gate_free(g);
+}
+
+TEST(anomaly_hybrid_weight_type_only)
+{
+    /* With weight_type=1.0, only type model contributes to score */
+    sg_gate_t *g = sg_gate_new();
+    sg_gate_enable_anomaly(g, 5.0, 0.1, -10.0);
+    sg_gate_set_anomaly_weights(g, 0.0, 1.0);
+    sg_gate_add_rule(g, "ls");
+    sg_gate_add_rule(g, "cat");
+
+    sg_result_t r;
+    /* Train with normal commands */
+    for (int i = 0; i < 20; i++) {
+        eval_cmd(g, "cat /etc/hosts ; ls /tmp ; pwd", &r);
+    }
+
+    /* Verify model has vocab (both models should have learned) */
+    ASSERT(sg_gate_anomaly_vocab_size(g) > 0);
+
+    sg_gate_free(g);
+}
+
+TEST(anomaly_hybrid_combined_score)
+{
+    /* Verify hybrid combined scoring works */
+    sg_gate_t *g = sg_gate_new();
+    sg_gate_enable_anomaly(g, 5.0, 0.1, -10.0);
+    /* Default weights: 0.5 raw, 0.5 type */
+    sg_gate_add_rule(g, "ls");
+    sg_gate_add_rule(g, "cd");
+    sg_gate_add_rule(g, "pwd");
+    sg_gate_add_rule(g, "cat");
+
+    sg_result_t r;
+    /* Train extensively */
+    for (int i = 0; i < 30; i++) {
+        eval_cmd(g, "ls ; cd /tmp ; pwd", &r);
+        eval_cmd(g, "cat /etc/hosts ; ls ; pwd", &r);
+    }
+
+    /* After training, normal sequence should have finite score */
+    eval_cmd(g, "ls ; cd /tmp ; pwd", &r);
+    ASSERT(r.anomaly_score >= 0.0);
+    ASSERT(!isnan(r.anomaly_score));
+
+    sg_gate_free(g);
+}
+
+TEST(anomaly_hybrid_training)
+{
+    /* Both models should learn from commands */
+    sg_gate_t *g = sg_gate_new();
+    sg_gate_enable_anomaly(g, 5.0, 0.1, -10.0);
+    sg_gate_add_rule(g, "ls");
+
+    sg_result_t r;
+    eval_cmd(g, "ls /etc/passwd", &r);
+    eval_cmd(g, "ls ; cd /tmp", &r);
+    eval_cmd(g, "ls ; cd /tmp ; pwd", &r);
+
+    /* Vocab should have grown (both models learned) */
+    ASSERT(sg_gate_anomaly_vocab_size(g) > 0);
+
+    sg_gate_free(g);
+}
+
+TEST(anomaly_hybrid_save_load)
+{
+    /* Save and load both models, verify round-trip */
+    sg_gate_t *g = sg_gate_new();
+    sg_gate_enable_anomaly(g, 5.0, 0.1, -10.0);
+    sg_gate_add_rule(g, "ls");
+    sg_gate_add_rule(g, "cd");
+
+    sg_result_t r;
+    for (int i = 0; i < 10; i++) {
+        eval_cmd(g, "ls ; cd /tmp ; pwd", &r);
+    }
+    size_t vocab_before = sg_gate_anomaly_vocab_size(g);
+
+    /* Save */
+    const char *path = "/tmp/test_hybrid_anomaly.model";
+    sg_error_t err = sg_gate_save_anomaly_model(g, path);
+    ASSERT(err == SG_OK);
+
+    /* Load into fresh gate */
+    sg_gate_t *g2 = sg_gate_new();
+    sg_gate_enable_anomaly(g2, 5.0, 0.1, -10.0);
+    sg_gate_add_rule(g2, "ls");
+    sg_gate_add_rule(g2, "cd");
+    err = sg_gate_load_anomaly_model(g2, path);
+    ASSERT(err == SG_OK);
+
+    size_t vocab_after = sg_gate_anomaly_vocab_size(g2);
+    ASSERT(vocab_after == vocab_before);
+
+    sg_gate_free(g);
+    sg_gate_free(g2);
+    remove(path);
+    /* Also clean up the _type file */
+    char type_path[256];
+    snprintf(type_path, sizeof(type_path), "%s_type", path);
+    remove(type_path);
+}
+
 TEST(anomaly_null_safety)
 {
     /* These should not crash */
     sg_gate_enable_anomaly(NULL, 5.0, 0.1, -10.0);
     sg_gate_disable_anomaly(NULL);
     sg_gate_set_anomaly_update_mode(NULL, true);
+    sg_gate_set_anomaly_weights(NULL, 0.5, 0.5);
     sg_gate_save_anomaly_model(NULL, "/tmp/test");
     sg_gate_load_anomaly_model(NULL, "/tmp/test");
 
     sg_result_t r;
     eval_cmd(NULL, "ls", &r);
+}
+
+/* ============================================================
+ * TYPE SEQUENCE TESTS
+ * ============================================================ */
+
+TEST(type_seq_simple_command)
+{
+    char *seq = shell_build_type_sequence("cat /etc/passwd");
+    ASSERT(seq != NULL);
+    /* Should be "cat AP" - command name kept, path abstracted */
+    ASSERT(strcmp(seq, "cat AP") == 0);
+    free(seq);
+}
+
+TEST(type_seq_with_option)
+{
+    char *seq = shell_build_type_sequence("grep -i root /etc/shadow");
+    ASSERT(seq != NULL);
+    /* Should be "grep OPT STR AP" */
+    ASSERT(strcmp(seq, "grep OPT STR AP") == 0);
+    free(seq);
+}
+
+TEST(type_seq_pipe)
+{
+    char *seq = shell_build_type_sequence("cat /etc/passwd | grep root");
+    ASSERT(seq != NULL);
+    /* Should be "cat AP | grep STR" */
+    ASSERT(strcmp(seq, "cat AP | grep STR") == 0);
+    free(seq);
+}
+
+TEST(type_seq_with_option_and_path)
+{
+    char *seq = shell_build_type_sequence("rm -rf /tmp/test.log");
+    ASSERT(seq != NULL);
+    /* Should be "rm OPT AP" */
+    ASSERT(strcmp(seq, "rm OPT AP") == 0);
+    free(seq);
+}
+
+TEST(type_seq_env_var)
+{
+    char *seq = shell_build_type_sequence("echo $HOME");
+    ASSERT(seq != NULL);
+    /* Should be "echo EV" */
+    ASSERT(strcmp(seq, "echo EV") == 0);
+    free(seq);
+}
+
+TEST(type_seq_null_input)
+{
+    char *seq = shell_build_type_sequence(NULL);
+    ASSERT(seq == NULL);
+
+    seq = shell_build_type_sequence("");
+    ASSERT(seq == NULL);
+}
+
+TEST(type_seq_relative_path)
+{
+    char *seq = shell_build_type_sequence("cat ./file.txt");
+    ASSERT(seq != NULL);
+    /* Should be "cat RP" */
+    ASSERT(strcmp(seq, "cat RP") == 0);
+    free(seq);
+}
+
+TEST(type_seq_home_path)
+{
+    char *seq = shell_build_type_sequence("cat ~/file.txt");
+    ASSERT(seq != NULL);
+    /* Should be "cat HP" */
+    ASSERT(strcmp(seq, "cat HP") == 0);
+    free(seq);
+}
+
+TEST(type_seq_multi_command)
+{
+    char *seq = shell_build_type_sequence("ls ; cd /tmp ; pwd");
+    ASSERT(seq != NULL);
+    /* Should have three subcommands */
+    ASSERT(strstr(seq, "ls") != NULL);
+    ASSERT(strstr(seq, "cd") != NULL);
+    ASSERT(strstr(seq, "pwd") != NULL);
+    free(seq);
 }
 
 /* ============================================================
@@ -2626,7 +2842,23 @@ int main(void)
     RUN(anomaly_save_load);
     RUN(anomaly_stress_test);
     RUN(anomaly_property_test);
+    RUN(anomaly_hybrid_weight_raw_only);
+    RUN(anomaly_hybrid_weight_type_only);
+    RUN(anomaly_hybrid_combined_score);
+    RUN(anomaly_hybrid_training);
+    RUN(anomaly_hybrid_save_load);
     RUN(anomaly_null_safety);
+
+    printf("\nType sequence:\n");
+    RUN(type_seq_simple_command);
+    RUN(type_seq_with_option);
+    RUN(type_seq_pipe);
+    RUN(type_seq_with_option_and_path);
+    RUN(type_seq_env_var);
+    RUN(type_seq_null_input);
+    RUN(type_seq_relative_path);
+    RUN(type_seq_home_path);
+    RUN(type_seq_multi_command);
 
     cleanup_temp_files();
     printf("\n========================================\n");

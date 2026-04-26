@@ -621,6 +621,145 @@ TEST(edge_short_sequence_scoring)
 }
 
 /* ============================================================
+ * KN DISCOUNT TESTS
+ * ============================================================ */
+
+TEST(kn_discount_basic)
+{
+    /* Verify KN discount produces finite scores for trained sequences */
+    sg_anomaly_model_t *m = sg_anomaly_model_new_ex(0.1, -10.0);
+
+    const char *seq[] = { "ls", "cd", "pwd" };
+    for (int i = 0; i < 10; i++)
+        sg_anomaly_update(m, seq, 3);
+
+    double score = sg_anomaly_score(m, seq, 3);
+    ASSERT(!isinf(score));
+    ASSERT(score >= 0.0);
+    /* KN should produce lower scores for well-trained sequences */
+    ASSERT(score < 5.0);
+
+    sg_anomaly_model_free(m);
+}
+
+TEST(kn_discount_unseen_higher)
+{
+    /* KN: unseen command sequences should score higher than seen ones */
+    sg_anomaly_model_t *m = sg_anomaly_model_new_ex(0.1, -10.0);
+
+    const char *seq[] = { "ls", "cd", "pwd" };
+    for (int i = 0; i < 20; i++)
+        sg_anomaly_update(m, seq, 3);
+
+    double score_seen = sg_anomaly_score(m, seq, 3);
+
+    const char *unseen[] = { "gcc", "make", "test" };
+    double score_unseen = sg_anomaly_score(m, unseen, 3);
+
+    ASSERT(!isinf(score_unseen));
+    ASSERT(score_unseen > score_seen);
+
+    sg_anomaly_model_free(m);
+}
+
+TEST(kn_discount_with_4gram_context)
+{
+    /* Train a 4-command sequence, verify 4-grams are recorded */
+    sg_anomaly_model_t *m = sg_anomaly_model_new_ex(0.1, -10.0);
+
+    const char *seq[] = { "ls", "cd", "pwd", "git" };
+    for (int i = 0; i < 10; i++)
+        sg_anomaly_update(m, seq, 4);
+
+    ASSERT(sg_anomaly_total_quad(m) > 0);
+
+    /* Score the trained 4-sequence */
+    double score = sg_anomaly_score(m, seq, 4);
+    ASSERT(!isinf(score));
+    ASSERT(score >= 0.0);
+
+    /* An unseen 4-sequence should be higher */
+    const char *bad[] = { "ls", "cd", "pwd", "rm_dash_rf" };
+    double bad_score = sg_anomaly_score(m, bad, 4);
+    ASSERT(!isinf(bad_score));
+    ASSERT(bad_score > score);
+
+    sg_anomaly_model_free(m);
+}
+
+TEST(quad_4gram_short_sequence)
+{
+    /* Sequences of len < 4 should still work (use trigram backoff) */
+    sg_anomaly_model_t *m = sg_anomaly_model_new_ex(0.1, -10.0);
+
+    const char *seq3[] = { "ls", "cd", "pwd" };
+    sg_anomaly_update(m, seq3, 3);
+
+    /* No 4-grams from 3-sequence */
+    ASSERT(sg_anomaly_total_quad(m) == 0);
+    ASSERT(sg_anomaly_total_tri(m) > 0);
+
+    /* Scoring should work fine */
+    double score = sg_anomaly_score(m, seq3, 3);
+    ASSERT(!isinf(score));
+
+    sg_anomaly_model_free(m);
+}
+
+TEST(quad_save_load_roundtrip)
+{
+    /* Verify 4-grams survive save/load */
+    sg_anomaly_model_t *m = sg_anomaly_model_new_ex(0.1, -10.0);
+
+    const char *seq[] = { "a", "b", "c", "d", "e" };
+    for (int i = 0; i < 5; i++)
+        sg_anomaly_update(m, seq, 5);
+
+    ASSERT(sg_anomaly_total_quad(m) > 0);
+    double score_before = sg_anomaly_score(m, seq, 5);
+
+    const char *path = "/tmp/test_quad_save.model";
+    ASSERT(sg_anomaly_save(m, path) == 0);
+
+    sg_anomaly_model_t *m2 = sg_anomaly_model_new();
+    ASSERT(sg_anomaly_load(m2, path) == 0);
+
+    ASSERT(sg_anomaly_total_quad(m2) == sg_anomaly_total_quad(m));
+    double score_after = sg_anomaly_score(m2, seq, 5);
+    ASSERT_EQ_DBL(score_before, score_after, 0.001);
+
+    sg_anomaly_model_free(m);
+    sg_anomaly_model_free(m2);
+    unlink(path);
+}
+
+TEST(quad_long_sequence_scoring)
+{
+    /* 5-command sequence uses both 4-grams and trigrams */
+    sg_anomaly_model_t *m = sg_anomaly_model_new_ex(0.1, -10.0);
+
+    const char *seq[] = { "ls", "cd", "pwd", "git", "make" };
+    for (int i = 0; i < 20; i++)
+        sg_anomaly_update(m, seq, 5);
+
+    /* Should have both 4-grams and trigrams */
+    ASSERT(sg_anomaly_total_quad(m) > 0);
+    ASSERT(sg_anomaly_total_tri(m) > 0);
+
+    double score = sg_anomaly_score(m, seq, 5);
+    ASSERT(!isinf(score));
+    ASSERT(score >= 0.0);
+
+    /* Replaced last command with unseen should score higher */
+    const char *bad[] = { "ls", "cd", "pwd", "git", "NEVER_SEEN_BEFORE" };
+    double bad_score = sg_anomaly_score(m, bad, 5);
+    ASSERT(!isinf(bad_score));
+    ASSERT(bad_score > score);
+
+    sg_anomaly_model_free(m);
+}
+
+/* ============================================================
  * MAIN
  * ============================================================ */
 
@@ -669,6 +808,14 @@ int main(void)
     RUN(edge_single_command_update);
     RUN(edge_two_command_update);
     RUN(edge_short_sequence_scoring);
+
+    printf("\nKneser-Ney tests:\n");
+    RUN(kn_discount_basic);
+    RUN(kn_discount_unseen_higher);
+    RUN(kn_discount_with_4gram_context);
+    RUN(quad_4gram_short_sequence);
+    RUN(quad_save_load_roundtrip);
+    RUN(quad_long_sequence_scoring);
 
     printf("\n%d passed, %d failed\n", pass_count, fail_count);
     return fail_count > 0 ? 1 : 0;

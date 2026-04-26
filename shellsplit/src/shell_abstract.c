@@ -943,3 +943,117 @@ void shell_abstracted_destroy(abstracted_command_t* cmd) {
     
     free(cmd);
 }
+
+/* ============================================================
+ * Lightweight Type Sequence Generation
+ *
+ * Builds a compact type sequence without creating a full
+ * abstracted_command_t. Uses the same classification logic
+ * but skips element creation and data extraction.
+ * ============================================================ */
+
+char* shell_build_type_sequence(const char* command)
+{
+    if (!command || command[0] == '\0') return NULL;
+
+    shell_command_t* cmds = NULL;
+    size_t cmd_count = 0;
+
+    if (!shell_tokenize_commands(command, &cmds, &cmd_count))
+        return NULL;
+
+    if (cmd_count == 0) {
+        shell_free_commands(cmds, cmd_count);
+        return NULL;
+    }
+
+    /* Allocate output buffer (generous size) */
+    size_t buf_size = 1024;
+    char* buf = malloc(buf_size);
+    if (!buf) {
+        shell_free_commands(cmds, cmd_count);
+        return NULL;
+    }
+
+    size_t pos = 0;
+    for (size_t c = 0; c < cmd_count; c++) {
+        shell_command_t* cmd = &cmds[c];
+
+        /* Add separator between subcommands */
+        if (c > 0) {
+            if (pos + 3 < buf_size) {
+                buf[pos++] = ' ';
+                buf[pos++] = '|';
+                buf[pos++] = ' ';
+            }
+        }
+
+        for (size_t i = 0; i < cmd->token_count; i++) {
+            shell_token_t* tok = &cmd->tokens[i];
+            const char* text = tok->start;
+            size_t len = tok->length;
+
+            /* Skip control tokens (pipe, semicolon, etc.) */
+            if (tok->type == TOKEN_PIPE || tok->type == TOKEN_SEMICOLON ||
+                tok->type == TOKEN_AND || tok->type == TOKEN_OR ||
+                tok->type == TOKEN_END ||
+                tok->type == TOKEN_REDIRECT_IN || tok->type == TOKEN_REDIRECT_OUT ||
+                tok->type == TOKEN_REDIRECT_ERR || tok->type == TOKEN_REDIRECT_APPEND)
+                continue;
+
+            /* Add space separator (skip if already preceded by space) */
+            if (pos > 0 && pos < buf_size && buf[pos - 1] != ' ')
+                buf[pos++] = ' ';
+
+            if (i == 0) {
+                /* First token = command name, keep literal */
+                size_t copy = len;
+                if (pos + copy >= buf_size) copy = buf_size - pos - 1;
+                memcpy(buf + pos, text, copy);
+                pos += copy;
+            } else {
+                /* Check for options first (- short, -- long) */
+                bool is_opt = false;
+                if (len >= 2 && text[0] == '-') {
+                    is_opt = true;
+                }
+
+                const char* abbrev;
+                if (is_opt) {
+                    abbrev = "OPT";
+                } else {
+                    /* Classify using abstraction type */
+                    abstract_type_t ab = get_abstract_type(tok->type, text, len);
+                    switch (ab) {
+                        case ABSTRACT_EV:    abbrev = "EV"; break;
+                        case ABSTRACT_PV:    abbrev = "PV"; break;
+                        case ABSTRACT_SV:    abbrev = "SV"; break;
+                        case ABSTRACT_AP:    abbrev = "AP"; break;
+                        case ABSTRACT_RP:    abbrev = "RP"; break;
+                        case ABSTRACT_HP:    abbrev = "HP"; break;
+                        case ABSTRACT_GB:    abbrev = "GB"; break;
+                        case ABSTRACT_CS:    abbrev = "CS"; break;
+                        case ABSTRACT_AR:    abbrev = "AR"; break;
+                        case ABSTRACT_STR:   abbrev = "STR"; break;
+                        case ABSTRACT_REDIR: abbrev = "RD"; break;
+                        default:             abbrev = "STR"; break;
+                    }
+                }
+
+                size_t alen = strlen(abbrev);
+                if (pos + alen >= buf_size) alen = buf_size - pos - 1;
+                memcpy(buf + pos, abbrev, alen);
+                pos += alen;
+            }
+        }
+    }
+
+    if (pos >= buf_size) pos = buf_size - 1;
+    buf[pos] = '\0';
+
+    shell_free_commands(cmds, cmd_count);
+
+    /* Shrink to fit */
+    char* result = realloc(buf, pos + 1);
+    return result ? result : buf;
+}

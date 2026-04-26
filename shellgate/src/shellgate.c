@@ -8,6 +8,7 @@
 #include "sg_anomaly.h"
 #include "shell_tokenizer.h"
 #include "shell_depgraph.h"
+#include "shell_abstract.h"
 #include "shelltype.h"
 #include <stdlib.h>
 #include <string.h>
@@ -119,11 +120,14 @@ struct sg_gate {
     sg_violation_config_t viol_config;
 
     /* Anomaly detection */
-    sg_anomaly_model_t *anomaly_model;
+    sg_anomaly_model_t *anomaly_model;       /* raw command name model */
+    sg_anomaly_model_t *anomaly_model_type;  /* type sequence model (NULL if disabled) */
     bool                anomaly_enabled;
     double              anomaly_threshold;
     bool                anomaly_update_only_on_allow;
     bool                anomaly_update_on_non_anomaly;  /* don't learn from anomalous commands */
+    double              anomaly_weight_raw;             /* weight for raw score (default 0.5) */
+    double              anomaly_weight_type;            /* weight for type score (default 0.5) */
 };
 
 /* ============================================================
@@ -153,6 +157,8 @@ sg_gate_t *sg_gate_new(void)
     /* Anomaly detection defaults */
     g->anomaly_update_only_on_allow = false;
     g->anomaly_update_on_non_anomaly = true;
+    g->anomaly_weight_raw = 0.5;
+    g->anomaly_weight_type = 0.5;
 
     return g;
 }
@@ -161,6 +167,7 @@ void sg_gate_free(sg_gate_t *gate)
 {
     if (!gate) return;
     if (gate->anomaly_model) sg_anomaly_model_free(gate->anomaly_model);
+    if (gate->anomaly_model_type) sg_anomaly_model_free(gate->anomaly_model_type);
     if (gate->policy)       st_policy_free(gate->policy);
     if (gate->deny_policy)  st_policy_free(gate->deny_policy);
     if (gate->pctx)         st_policy_ctx_free(gate->pctx);
@@ -238,12 +245,22 @@ sg_error_t sg_gate_enable_anomaly(sg_gate_t *gate,
     if (!gate) return SG_ERR_INVALID;
     if (gate->anomaly_model)
         sg_anomaly_model_free(gate->anomaly_model);
+    if (gate->anomaly_model_type)
+        sg_anomaly_model_free(gate->anomaly_model_type);
     gate->anomaly_model = sg_anomaly_model_new_ex(alpha, unk_prior);
     if (!gate->anomaly_model) return SG_ERR_MEMORY;
+    gate->anomaly_model_type = sg_anomaly_model_new_ex(alpha, unk_prior);
+    if (!gate->anomaly_model_type) {
+        sg_anomaly_model_free(gate->anomaly_model);
+        gate->anomaly_model = NULL;
+        return SG_ERR_MEMORY;
+    }
     gate->anomaly_enabled = true;
     gate->anomaly_threshold = threshold;
     gate->anomaly_update_only_on_allow = false;
     gate->anomaly_update_on_non_anomaly = true;
+    gate->anomaly_weight_raw = 0.5;
+    gate->anomaly_weight_type = 0.5;
     return SG_OK;
 }
 
@@ -253,6 +270,10 @@ void sg_gate_disable_anomaly(sg_gate_t *gate)
     if (gate->anomaly_model) {
         sg_anomaly_model_free(gate->anomaly_model);
         gate->anomaly_model = NULL;
+    }
+    if (gate->anomaly_model_type) {
+        sg_anomaly_model_free(gate->anomaly_model_type);
+        gate->anomaly_model_type = NULL;
     }
     gate->anomaly_enabled = false;
 }
@@ -273,11 +294,37 @@ sg_error_t sg_gate_set_anomaly_update_on_non_anomaly(sg_gate_t *gate,
     return SG_OK;
 }
 
+sg_error_t sg_gate_set_anomaly_weights(sg_gate_t *gate,
+                                         double weight_raw,
+                                         double weight_type)
+{
+    if (!gate) return SG_ERR_INVALID;
+    if (weight_raw < 0.0 || weight_type < 0.0) return SG_ERR_INVALID;
+    /* Weights must sum to approximately 1.0 */
+    double sum = weight_raw + weight_type;
+    if (sum < 0.99 || sum > 1.01) return SG_ERR_INVALID;
+    gate->anomaly_weight_raw = weight_raw;
+    gate->anomaly_weight_type = weight_type;
+    return SG_OK;
+}
+
 sg_error_t sg_gate_save_anomaly_model(const sg_gate_t *gate, const char *path)
 {
     if (!gate || !path) return SG_ERR_INVALID;
     if (!gate->anomaly_enabled || !gate->anomaly_model) return SG_ERR_INVALID;
     if (sg_anomaly_save(gate->anomaly_model, path) != 0) return SG_ERR_IO;
+    /* Save type model to {path}_type */
+    if (gate->anomaly_model_type) {
+        size_t plen = strlen(path);
+        char *type_path = malloc(plen + 6);  /* "_type" + NUL */
+        if (!type_path) return SG_ERR_MEMORY;
+        memcpy(type_path, path, plen);
+        memcpy(type_path + plen, "_type", 5);
+        type_path[plen + 5] = '\0';
+        int rc = sg_anomaly_save(gate->anomaly_model_type, type_path);
+        free(type_path);
+        if (rc != 0) return SG_ERR_IO;
+    }
     return SG_OK;
 }
 
@@ -286,6 +333,25 @@ sg_error_t sg_gate_load_anomaly_model(sg_gate_t *gate, const char *path)
     if (!gate || !path) return SG_ERR_INVALID;
     if (!gate->anomaly_enabled || !gate->anomaly_model) return SG_ERR_INVALID;
     if (sg_anomaly_load(gate->anomaly_model, path) != 0) return SG_ERR_IO;
+    /* Load type model from {path}_type if it exists */
+    if (gate->anomaly_model_type) {
+        size_t plen = strlen(path);
+        char *type_path = malloc(plen + 6);
+        if (!type_path) return SG_ERR_MEMORY;
+        memcpy(type_path, path, plen);
+        memcpy(type_path + plen, "_type", 5);
+        type_path[plen + 5] = '\0';
+        /* Graceful: if type file doesn't exist, that's OK */
+        FILE *f = fopen(type_path, "rb");
+        if (f) {
+            fclose(f);
+            if (sg_anomaly_load(gate->anomaly_model_type, type_path) != 0) {
+                free(type_path);
+                return SG_ERR_IO;
+            }
+        }
+        free(type_path);
+    }
     return SG_OK;
 }
 
@@ -1457,15 +1523,41 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len,
             cmd_seq[cmd_count++] = node->cmd.tokens[0];
     }
 
-    /* Anomaly detection: score the command sequence */
+    /* Build type sequence tokens for hybrid anomaly detection.
+     * For each CMD node, produce a type-sequence string (e.g. "cat AP").
+     * Uses shell_build_type_sequence on the full command to get per-subcommand
+     * type strings. This allocates memory (acceptable for optional anomaly path). */
+    char *type_seq_buf = NULL;
+    const char *type_seq[SHELL_DEP_MAX_NODES];
+    size_t type_count = 0;
+
+    if (gate->anomaly_enabled && gate->anomaly_model_type && cmd_count > 0) {
+        type_seq_buf = shell_build_type_sequence(cmd);
+        if (type_seq_buf) {
+            /* Tokenize by space to get individual type tokens */
+            char *saveptr = NULL;
+            char *tok = strtok_r(type_seq_buf, " ", &saveptr);
+            while (tok && type_count < SHELL_DEP_MAX_NODES) {
+                type_seq[type_count++] = tok;
+                tok = strtok_r(NULL, " ", &saveptr);
+            }
+        }
+    }
+
+    /* Anomaly detection: score the command sequence with hybrid model */
     if (gate->anomaly_enabled && gate->anomaly_model && cmd_count > 0) {
-        out->anomaly_score = sg_anomaly_score(gate->anomaly_model, cmd_seq, cmd_count);
-        /* For short sequences (< 3 commands), scoring is undefined (INFINITY).
-         * Treat as non-anomalous so the model can still learn unigrams/bigrams. */
+        double score_raw = sg_anomaly_score(gate->anomaly_model, cmd_seq, cmd_count);
+        double score_type = (gate->anomaly_model_type && type_count > 0)
+                            ? sg_anomaly_score(gate->anomaly_model_type, type_seq, type_count)
+                            : 0.0;
+
         if (cmd_count < 3) {
             out->anomaly_score = 0.0;
             out->anomaly_detected = false;
         } else {
+            /* Product of probabilities in log-space = weighted sum of bits */
+            out->anomaly_score = score_raw * gate->anomaly_weight_raw
+                               + score_type * gate->anomaly_weight_type;
             out->anomaly_detected = (out->anomaly_score > gate->anomaly_threshold);
         }
     } else if (gate->anomaly_enabled && gate->anomaly_model) {
@@ -1611,8 +1703,14 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len,
 
         if (should_update) {
             sg_anomaly_update(gate->anomaly_model, cmd_seq, cmd_count);
+            /* Also update type sequence model */
+            if (gate->anomaly_model_type && type_count > 0)
+                sg_anomaly_update(gate->anomaly_model_type, type_seq, type_count);
         }
     }
+
+    /* Free type sequence buffer */
+    free(type_seq_buf);
 
     return (bw.overflow || subcmd_truncated) ? SG_ERR_TRUNC : SG_OK;
 }

@@ -251,6 +251,33 @@ const char* shell_path_category_name(path_category_t cat);
  */
 void shell_abstracted_destroy(abstracted_command_t* cmd);
 
+/* ============================================================
+ * Lightweight Type Sequence Generation
+ * ============================================================ */
+
+/**
+ * Build a compact type sequence for a command.
+ *
+ * Returns a heap-allocated string of space-separated tokens:
+ *   "cat /etc/passwd"       ->  "cat AP"
+ *   "grep -i root file.txt" ->  "grep OPT STR RP"
+ *   "rm -rf /tmp/star.log"  ->  "rm OPT GB"
+ *   "echo $HOME"            ->  "echo EV"
+ *
+ * For multi-command pipelines (|, ;, &&, ||), returns one
+ * sequence per subcommand, joined by " | ":
+ *   "cat /etc/passwd | grep root" -> "cat AP | grep STR"
+ *
+ * Token types: AP=abs_path, RP=rel_path, HP=home_path,
+ *   GB=glob, EV=env_var, PV=pos_var, SV=spec_var,
+ *   CS=cmd_subst, AR=arith, STR=string, OPT=option.
+ * Command names (first token of each subcommand) are kept literal.
+ *
+ * Caller must free the returned string.
+ * Returns NULL on error or empty input.
+ */
+char* shell_build_type_sequence(const char* command);
+
 #ifdef __cplusplus
 }
 #endif

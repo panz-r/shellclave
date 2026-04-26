@@ -383,6 +383,22 @@ sg_error_t sg_gate_set_anomaly_update_on_non_anomaly(sg_gate_t *gate,
                                                       bool skip_on_anomaly);
 
 /*
+ * Set weights for hybrid anomaly scoring.
+ *
+ * The combined score is:
+ *   combined = weight_raw * score_raw + weight_type * score_type
+ *
+ * Weights must be non-negative and sum to 1.0.
+ * Default: weight_raw=0.5, weight_type=0.5.
+ *
+ * To disable the type model, set weight_type=0.0 and weight_raw=1.0.
+ * To use only the type model, set weight_raw=0.0 and weight_type=1.0.
+ */
+sg_error_t sg_gate_set_anomaly_weights(sg_gate_t *gate,
+                                         double weight_raw,
+                                         double weight_type);
+
+/*
  * Save the anomaly model to a file.
  * Returns SG_ERR_INVALID if anomaly detection is not enabled,
  * or SG_ERR_IO on file error.

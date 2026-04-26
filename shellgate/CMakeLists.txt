@@ -17,10 +17,12 @@ add_compile_options(-Wall -Wextra -Wpedantic)
 set(SHELLSPLIT_DIR   ${CMAKE_SOURCE_DIR}/../shellsplit)
 set(SHELLTYPE_DIR    ${CMAKE_SOURCE_DIR}/../shelltype)
 
-# shellsplit: only the fast tokenizer + depgraph (zero alloc)
+# shellsplit: fast tokenizer + depgraph (zero alloc) + full tokenizer + abstract
 add_library(shellsplit_gate STATIC
     ${SHELLSPLIT_DIR}/src/shell_tokenizer.c
     ${SHELLSPLIT_DIR}/src/shell_depgraph.c
+    ${SHELLSPLIT_DIR}/src/shell_tokenizer_full.c
+    ${SHELLSPLIT_DIR}/src/shell_abstract.c
 )
 target_include_directories(shellsplit_gate PUBLIC ${SHELLSPLIT_DIR}/include)
 

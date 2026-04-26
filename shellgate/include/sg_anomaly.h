@@ -146,6 +146,9 @@ size_t sg_anomaly_total_bi(const sg_anomaly_model_t *model);
 /* Total number of trigram observations. */
 size_t sg_anomaly_total_tri(const sg_anomaly_model_t *model);
 
+/* Total number of 4-gram observations. */
+size_t sg_anomaly_total_quad(const sg_anomaly_model_t *model);
+
 /* Get unigram count for a command.  Returns 0 if never seen. */
 size_t sg_anomaly_uni_count(const sg_anomaly_model_t *model, const char *cmd);
 

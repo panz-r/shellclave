@@ -1,17 +1,20 @@
 /*
  * sg_anomaly.c - Statistical Anomaly Detection
  *
- * Trigram language model with backoff.  All strings are owned by the model.
+ * 4-gram language model with Kneser-Ney absolute discounting and
+ * backoff to trigram/bigram/unigram.  All strings are owned by the model.
  * Context totals are maintained incrementally for O(1) probability lookups.
+ *
+ * Kneser-Ney discounting:
+ *   For observed n-grams:  P_KN(w|ctx) = max(0, c - D) / c_ctx + D * |unique_cont| / c_ctx * P_KN_lower(w|ctx')
+ *   For unobserved:        Back off to lower-order model
+ *   D = absolute discount (default 0.5)
  *
  * Serialisation uses a binary format with length-prefixed keys:
  *   Header (text):  # anomaly-model-v3\n
- *                   # alpha unk_prior total_uni total_bi total_tri vocab_size\n
+ *                   # alpha unk_prior D total_uni total_bi total_tri total_quad vocab_size unk_count\n
  *   Entry (binary): uint8_t type; uint32_t key_len; uint8_t key[key_len]; uint64_t count; uint8_t nl;
- *   type values: 1='U', 2='B', 3='T'
- *
- * Key storage: length-prefixed (key_len bytes + trailing NUL) to preserve
- * embedded NULs in bigram/trigram keys. Hash operations use byte-wise comparison.
+ *   type values: 1='U', 2='B', 3='T', 4='Q'
  */
 
 #include "sg_anomaly.h"
@@ -272,6 +275,50 @@ static size_t extract_trigram_ctx_len(const char *key, size_t max_len)
     return i + 1; /* include trailing NUL in context */
 }
 
+static size_t build_4gram_key(char *buf, size_t buf_size,
+                               const char *p3, const char *p2,
+                               const char *p1, const char *curr)
+{
+    size_t p3len = strlen(p3);
+    size_t p2len = strlen(p2);
+    size_t p1len = strlen(p1);
+    size_t clen = strlen(curr);
+    if (p3len == 0 || p2len == 0 || p1len == 0 || clen == 0) return 0;
+    if (p3len + 1 + p2len + 1 + p1len + 1 + clen + 1 > buf_size) return 0;
+    char *dst = buf;
+    memcpy(dst, p3, p3len); dst[p3len] = '\0'; dst += p3len + 1;
+    memcpy(dst, p2, p2len); dst[p2len] = '\0'; dst += p2len + 1;
+    memcpy(dst, p1, p1len); dst[p1len] = '\0'; dst += p1len + 1;
+    memcpy(dst, curr, clen); dst[clen] = '\0';
+    return p3len + 1 + p2len + 1 + p1len + 1 + clen + 1;
+}
+
+static size_t build_4gram_ctx(char *buf, size_t buf_size,
+                               const char *p3, const char *p2, const char *p1)
+{
+    size_t p3len = strlen(p3);
+    size_t p2len = strlen(p2);
+    size_t p1len = strlen(p1);
+    if (p3len == 0 || p2len == 0 || p1len == 0) return 0;
+    if (p3len + 1 + p2len + 1 + p1len + 2 > buf_size) return 0;
+    char *dst = buf;
+    memcpy(dst, p3, p3len); dst[p3len] = '\0'; dst += p3len + 1;
+    memcpy(dst, p2, p2len); dst[p2len] = '\0'; dst += p2len + 1;
+    memcpy(dst, p1, p1len); dst[p1len] = '\0';
+    return p3len + 1 + p2len + 1 + p1len + 2;
+}
+
+static size_t extract_4gram_ctx_len(const char *key, size_t max_len)
+{
+    size_t i = 0;
+    /* skip 3 NUL-terminated strings */
+    for (int n = 0; n < 3; n++) {
+        while (i < max_len && key[i] != '\0') i++;
+        i++; /* skip NUL */
+    }
+    return i + 1; /* include trailing NUL in context */
+}
+
 /* ============================================================
  * MODEL
  * ============================================================ */
@@ -280,13 +327,17 @@ struct sg_anomaly_model {
     hash_t   uni;         /* unigram counts */
     hash_t   bi;          /* bigram counts: key = "prev\0curr" */
     hash_t   tri;         /* trigram counts: key = "p2\0p1\0curr" */
+    hash_t   quad;        /* 4-gram counts: key = "p3\0p2\0p1\0curr" */
     hash_t   bi_ctx;      /* bigram context totals: key = "prev\0", value = sum */
     hash_t   tri_ctx;     /* trigram context totals: key = "p2\0p1\0", value = sum */
+    hash_t   quad_ctx;    /* 4-gram context totals: key = "p3\0p2\0p1\0", value = sum */
     size_t   total_uni;
     size_t   total_bi;
     size_t   total_tri;
-    double   alpha;
-    double   unk_prior;
+    size_t   total_quad;
+    double   alpha;       /* Dirichlet smoothing (used when KN data insufficient) */
+    double   unk_prior;   /* fallback log-prob for unseen commands */
+    double   kn_discount; /* Kneser-Ney absolute discount (default 0.5) */
     size_t   vocab_size;  /* number of unique unigrams */
     bool     oom;         /* true if any allocation failed */
     size_t   unk_count;   /* count of unseen commands for probability estimation */
@@ -303,13 +354,16 @@ sg_anomaly_model_t *sg_anomaly_model_new_ex(double alpha, double unk_prior)
     if (!m) return NULL;
     m->alpha = alpha;
     m->unk_prior = unk_prior;
+    m->kn_discount = 0.5;
     m->vocab_size = 0;
     m->oom = false;
     hash_init(&m->uni);
     hash_init(&m->bi);
     hash_init(&m->tri);
+    hash_init(&m->quad);
     hash_init(&m->bi_ctx);
     hash_init(&m->tri_ctx);
+    hash_init(&m->quad_ctx);
     return m;
 }
 
@@ -319,8 +373,10 @@ void sg_anomaly_model_free(sg_anomaly_model_t *model)
     hash_free(&model->uni);
     hash_free(&model->bi);
     hash_free(&model->tri);
+    hash_free(&model->quad);
     hash_free(&model->bi_ctx);
     hash_free(&model->tri_ctx);
+    hash_free(&model->quad_ctx);
     free(model);
 }
 
@@ -335,11 +391,19 @@ void sg_anomaly_model_clear_error(sg_anomaly_model_t *model)
 }
 
 /* ============================================================
- * PROBABILITY CALCULATION
+ * PROBABILITY CALCULATION — Kneser-Ney with 4-gram backoff
  *
- * Compute log P(curr | p2, p1) in bits with backoff.
- * Uses O(1) context total lookups from bi_ctx and tri_ctx hashes.
- * For unseen commands, computes probability from unk_count and vocab.
+ * Compute log P(curr | p3, p2, p1) in bits using KN discounting.
+ * Backoff chain: 4-gram → trigram → bigram → unigram → UNK.
+ *
+ * KN formula (for each n-gram level):
+ *   P_KN(w | ctx) = max(0, c(ctx,w) - D) / c(ctx)
+ *                   + D * |{w': c(ctx,w')>0}| / c(ctx) * P_KN_lower(w)
+ *
+ * The lower-order continuation probability uses the number of
+ * distinct contexts in which w has appeared (not raw count).
+ * For simplicity, we use raw counts as a proxy for continuation
+ * counts in the first iteration.
  * ============================================================ */
 
 /* Compute log probability of unknown command in bits */
@@ -353,55 +417,129 @@ static double unk_logprob(const sg_anomaly_model_t *m)
     return log(numer / denom) / M_LN2;   /* in bits */
 }
 
-static double trigram_logprob(const sg_anomaly_model_t *m,
-                               const char *p2, const char *p1, const char *curr)
+/* Count number of unique n-gram continuations from a context hash.
+ * This scans the hash table for entries whose key starts with ctx.
+ * Used for KN discount weight computation.
+ * For large tables this is O(n); acceptable for anomaly model sizes. */
+static size_t count_unique_continuations(const hash_t *h,
+                                          const char *ctx, size_t ctx_len)
 {
-    char key[1024];
-    char ctx[512];
-    double V = m->vocab_size > 0 ? (double)m->vocab_size : 1.0;
-
-    /* Try trigram */
-    size_t key_len = build_trigram_key(key, sizeof(key), p2, p1, curr);
-    if (key_len == 0) return unk_logprob(m);
-
-    size_t tri_count = hash_get(&m->tri, key, key_len);
-    if (tri_count > 0) {
-        size_t ctx_len = build_trigram_ctx(ctx, sizeof(ctx), p2, p1);
-        size_t ctx_total = ctx_len > 0 ? hash_get(&m->tri_ctx, ctx, ctx_len) : 0;
-        if (ctx_total == 0) ctx_total = tri_count;
-        double denom = (double)ctx_total + m->alpha * V;
-        double numer = (double)tri_count + m->alpha;
-        return log(numer / denom) / M_LN2;
+    size_t count = 0;
+    for (size_t i = 0; i < h->capacity; i++) {
+        if (h->entries[i].key_data == NULL) continue;
+        if (h->entries[i].key_len < ctx_len) continue;
+        if (memcmp(h->entries[i].key_data, ctx, ctx_len) == 0)
+            count++;
     }
+    return count;
+}
 
-    /* Backoff to bigram: P(curr | p1) */
-    key_len = build_bigram_key(key, sizeof(key), p1, curr);
-    if (key_len == 0) return unk_logprob(m);
+/*
+ * KN probability at a given n-gram level.
+ *
+ * key, key_len:    the full n-gram key (e.g., "p2\0p1\0curr")
+ * ctx, ctx_len:    the context suffix (e.g., "p2\0p1\0")
+ * n_count:         count of this specific n-gram
+ * ctx_total:       sum of all counts sharing this context
+ * n_table:         the hash table to count unique continuations from
+ * Returns log probability in bits.
+ */
+static double kn_level_logprob(const sg_anomaly_model_t *m,
+                                size_t n_count, size_t ctx_total,
+                                const hash_t *n_table,
+                                const char *ctx, size_t ctx_len,
+                                double lower_logprob)
+{
+    double D = m->kn_discount;
 
-    size_t bi_count = hash_get(&m->bi, key, key_len);
-    if (bi_count > 0) {
-        size_t ctx_len = build_bigram_ctx(ctx, sizeof(ctx), p1);
-        size_t ctx_total = ctx_len > 0 ? hash_get(&m->bi_ctx, ctx, ctx_len) : 0;
-        if (ctx_total == 0) ctx_total = bi_count;
-        double denom = (double)ctx_total + m->alpha * V;
-        double numer = (double)bi_count + m->alpha;
-        return log(numer / denom) / M_LN2;
-    }
+    if (ctx_total == 0) return lower_logprob;
 
-    /* Backoff to unigram: P(curr) */
+    /* Number of unique continuations from this context */
+    size_t unique_cont = count_unique_continuations(n_table, ctx, ctx_len);
+
+    /* Discounted probability mass for observed n-gram */
+    double disc_count = (double)n_count - D;
+    if (disc_count < 0) disc_count = 0;
+
+    /* Interpolation weight (probability mass for lower-order) */
+    double lambda = D * (double)unique_cont / (double)ctx_total;
+
+    /* Combined probability */
+    double p_observed = disc_count / (double)ctx_total;
+    double p_lower = lambda * exp(lower_logprob * M_LN2);  /* convert bits→prob */
+
+    double p_total = p_observed + p_lower;
+    if (p_total <= 0) return unk_logprob(m);
+    return log(p_total) / M_LN2;
+}
+
+static double kn_logprob(const sg_anomaly_model_t *m,
+                          const char *p3, const char *p2,
+                          const char *p1, const char *curr)
+{
+    char key[2048];
+    char ctx[1024];
+    size_t key_len, ctx_len;
+
+    /* === Level 1: Unigram (base) === */
     size_t uni_count = hash_get(&m->uni, curr, strlen(curr) + 1);
+    double unigram_lp;
     if (uni_count > 0) {
-        double denom = (double)m->total_uni + m->alpha * V;
+        double denom = (double)m->total_uni + m->alpha * (double)m->vocab_size;
         double numer = (double)uni_count + m->alpha;
-        return log(numer / denom) / M_LN2;
+        unigram_lp = log(numer / denom) / M_LN2;
+    } else {
+        unigram_lp = unk_logprob(m);
     }
 
-    /* Unknown command - use computed UNK probability */
-    return unk_logprob(m);
+    /* === Level 2: Bigram === */
+    key_len = build_bigram_key(key, sizeof(key), p1, curr);
+    size_t bi_count = key_len > 0 ? hash_get(&m->bi, key, key_len) : 0;
+    double bigram_lp;
+    if (bi_count > 0) {
+        ctx_len = build_bigram_ctx(ctx, sizeof(ctx), p1);
+        size_t bi_ctx_total = ctx_len > 0 ? hash_get(&m->bi_ctx, ctx, ctx_len) : 0;
+        if (bi_ctx_total == 0) bi_ctx_total = bi_count;
+        bigram_lp = kn_level_logprob(m, bi_count, bi_ctx_total,
+                                      &m->bi, ctx, ctx_len, unigram_lp);
+    } else {
+        bigram_lp = unigram_lp;
+    }
+
+    /* === Level 3: Trigram === */
+    key_len = build_trigram_key(key, sizeof(key), p2, p1, curr);
+    size_t tri_count = key_len > 0 ? hash_get(&m->tri, key, key_len) : 0;
+    double trigram_lp;
+    if (tri_count > 0) {
+        ctx_len = build_trigram_ctx(ctx, sizeof(ctx), p2, p1);
+        size_t tri_ctx_total = ctx_len > 0 ? hash_get(&m->tri_ctx, ctx, ctx_len) : 0;
+        if (tri_ctx_total == 0) tri_ctx_total = tri_count;
+        trigram_lp = kn_level_logprob(m, tri_count, tri_ctx_total,
+                                       &m->tri, ctx, ctx_len, bigram_lp);
+    } else {
+        trigram_lp = bigram_lp;
+    }
+
+    /* === Level 4: 4-gram === */
+    key_len = build_4gram_key(key, sizeof(key), p3, p2, p1, curr);
+    size_t quad_count = key_len > 0 ? hash_get(&m->quad, key, key_len) : 0;
+    if (quad_count > 0) {
+        ctx_len = build_4gram_ctx(ctx, sizeof(ctx), p3, p2, p1);
+        size_t quad_ctx_total = ctx_len > 0 ? hash_get(&m->quad_ctx, ctx, ctx_len) : 0;
+        if (quad_ctx_total == 0) quad_ctx_total = quad_count;
+        return kn_level_logprob(m, quad_count, quad_ctx_total,
+                                 &m->quad, ctx, ctx_len, trigram_lp);
+    }
+
+    return trigram_lp;
 }
 
 /* ============================================================
  * SCORING
+ *
+ * Uses 4-gram KN backoff for sequences of len >= 4,
+ * trigram KN backoff for len == 3.
+ * Returns INFINITY for len < 3 (need at least one trigram).
  * ============================================================ */
 
 double sg_anomaly_score(const sg_anomaly_model_t *model,
@@ -412,11 +550,23 @@ double sg_anomaly_score(const sg_anomaly_model_t *model,
     if (model->total_uni == 0) return INFINITY;
 
     double total_bits = 0.0;
-    for (size_t i = 2; i < len; i++) {
-        double lp = trigram_logprob(model, seq[i-2], seq[i-1], seq[i]);
+    size_t scored = 0;
+
+    if (len >= 4) {
+        /* Score using 4-gram context from i=3 onward */
+        for (size_t i = 3; i < len; i++) {
+            double lp = kn_logprob(model, seq[i-3], seq[i-2], seq[i-1], seq[i]);
+            total_bits -= lp;
+            scored++;
+        }
+    } else {
+        /* len == 3: score one trigram using empty p3 */
+        double lp = kn_logprob(model, "", seq[0], seq[1], seq[2]);
         total_bits -= lp;
+        scored = 1;
     }
-    return total_bits / (double)(len - 2);
+
+    return scored > 0 ? total_bits / (double)scored : INFINITY;
 }
 
 /* ============================================================
@@ -484,9 +634,28 @@ void sg_anomaly_update(sg_anomaly_model_t *model,
         }
     }
 
+    /* Update 4-grams and their context totals */
+    for (size_t i = 3; i < len; i++) {
+        char key[2048];
+        size_t key_len = build_4gram_key(key, sizeof(key),
+                                          seq[i-3], seq[i-2], seq[i-1], seq[i]);
+        if (key_len > 0) {
+            if (!hash_inc(&model->quad, key, key_len, 1))
+                model->oom = true;
+            char ctx[1024];
+            size_t ctx_len = build_4gram_ctx(ctx, sizeof(ctx),
+                                              seq[i-3], seq[i-2], seq[i-1]);
+            if (ctx_len > 0) {
+                if (!hash_inc(&model->quad_ctx, ctx, ctx_len, 1))
+                    model->oom = true;
+            }
+        }
+    }
+
     model->total_uni  = model->uni.total;
     model->total_bi  = model->bi.total;
     model->total_tri = model->tri.total;
+    model->total_quad = model->quad.total;
     model->vocab_size = model->uni.len;
 }
 
@@ -510,6 +679,7 @@ void sg_anomaly_update(sg_anomaly_model_t *model,
 #define BINARY_TYPE_UNI   1
 #define BINARY_TYPE_BI    2
 #define BINARY_TYPE_TRI   3
+#define BINARY_TYPE_QUAD  4
 
 int sg_anomaly_save(const sg_anomaly_model_t *model, const char *path)
 {
@@ -519,10 +689,10 @@ int sg_anomaly_save(const sg_anomaly_model_t *model, const char *path)
     if (!f) return -1;
 
     fprintf(f, "# anomaly-model-v3\n");
-    fprintf(f, "# %.17g %.17g %zu %zu %zu %zu %zu\n",
-            model->alpha, model->unk_prior,
+    fprintf(f, "# %.17g %.17g %.17g %zu %zu %zu %zu %zu %zu\n",
+            model->alpha, model->unk_prior, model->kn_discount,
             model->total_uni, model->total_bi, model->total_tri,
-            model->vocab_size, model->unk_count);
+            model->total_quad, model->vocab_size, model->unk_count);
 
     /* Write unigrams */
     for (size_t i = 0; i < model->uni.capacity; i++) {
@@ -575,6 +745,23 @@ int sg_anomaly_save(const sg_anomaly_model_t *model, const char *path)
         }
     }
 
+    /* Write 4-grams */
+    for (size_t i = 0; i < model->quad.capacity; i++) {
+        if (model->quad.entries[i].key_data == NULL) continue;
+        uint8_t type = BINARY_TYPE_QUAD;
+        uint32_t key_len = (uint32_t)model->quad.entries[i].key_len;
+        uint64_t count = (uint64_t)model->quad.entries[i].count;
+        uint8_t nl = '\n';
+        if (fwrite(&type, 1, 1, f) != 1 ||
+            fwrite(&key_len, 4, 1, f) != 1 ||
+            fwrite(model->quad.entries[i].key_data, 1, key_len, f) != key_len ||
+            fwrite(&count, 8, 1, f) != 1 ||
+            fwrite(&nl, 1, 1, f) != 1) {
+            fclose(f);
+            return -1;
+        }
+    }
+
     fclose(f);
     return 0;
 }
@@ -586,19 +773,24 @@ int sg_anomaly_load(sg_anomaly_model_t *model, const char *path)
     hash_free(&model->uni);
     hash_free(&model->bi);
     hash_free(&model->tri);
+    hash_free(&model->quad);
     hash_free(&model->bi_ctx);
     hash_free(&model->tri_ctx);
+    hash_free(&model->quad_ctx);
     model->total_uni = 0;
     model->total_bi = 0;
     model->total_tri = 0;
+    model->total_quad = 0;
     model->vocab_size = 0;
     model->unk_count = 0;
     model->oom = false;
     hash_init(&model->uni);
     hash_init(&model->bi);
     hash_init(&model->tri);
+    hash_init(&model->quad);
     hash_init(&model->bi_ctx);
     hash_init(&model->tri_ctx);
+    hash_init(&model->quad_ctx);
 
     FILE *f = fopen(path, "rb");
     if (!f) return -1;
@@ -612,16 +804,19 @@ int sg_anomaly_load(sg_anomaly_model_t *model, const char *path)
         ungetc(ch, f);
         if (!fgets(line, sizeof(line), f)) break;
         if (strncmp(line, "# anomaly-model-v3", 17) != 0) {
-            double alpha = 0, unk_prior = 0;
-            size_t tu = 0, tb = 0, tt = 0, vocab = 0, unk = 0;
-            int n = sscanf(line + 1, " %lf %lf %zu %zu %zu %zu %zu",
-                           &alpha, &unk_prior, &tu, &tb, &tt, &vocab, &unk);
+            double alpha = 0, unk_prior = 0, kn_discount = 0;
+            size_t tu = 0, tb = 0, tt = 0, tq = 0, vocab = 0, unk = 0;
+            int n = sscanf(line + 1, " %lf %lf %lf %zu %zu %zu %zu %zu %zu",
+                           &alpha, &unk_prior, &kn_discount,
+                           &tu, &tb, &tt, &tq, &vocab, &unk);
             if (n >= 2) { model->alpha = alpha; model->unk_prior = unk_prior; }
-            if (n >= 6) {
-                model->total_uni = tu; model->total_bi = tb;
-                model->total_tri = tt; model->vocab_size = vocab;
-            }
+            if (n >= 3 && kn_discount > 0) model->kn_discount = kn_discount;
             if (n >= 7) {
+                model->total_uni = tu; model->total_bi = tb;
+                model->total_tri = tt; model->total_quad = tq;
+                model->vocab_size = vocab;
+            }
+            if (n >= 9) {
                 model->unk_count = unk;
             }
         }
@@ -661,6 +856,13 @@ int sg_anomaly_load(sg_anomaly_model_t *model, const char *path)
             if (ctx_len > 0) {
                 if (!hash_inc(&model->tri_ctx, keybuf, ctx_len, (size_t)count)) model->oom = true;
             }
+        } else if (type == BINARY_TYPE_QUAD) {
+            if (!hash_inc(&model->quad, keybuf, key_len, (size_t)count)) model->oom = true;
+            /* Rebuild 4-gram context total */
+            size_t ctx_len = extract_4gram_ctx_len(keybuf, key_len);
+            if (ctx_len > 0) {
+                if (!hash_inc(&model->quad_ctx, keybuf, ctx_len, (size_t)count)) model->oom = true;
+            }
         }
     }
 
@@ -692,6 +894,11 @@ size_t sg_anomaly_total_tri(const sg_anomaly_model_t *model)
     return model ? model->total_tri : 0;
 }
 
+size_t sg_anomaly_total_quad(const sg_anomaly_model_t *model)
+{
+    return model ? model->total_quad : 0;
+}
+
 size_t sg_anomaly_uni_count(const sg_anomaly_model_t *model, const char *cmd)
 {
     if (!model || !cmd) return 0;
@@ -710,19 +917,24 @@ void sg_anomaly_reset(sg_anomaly_model_t *model)
     hash_free(&model->uni);
     hash_free(&model->bi);
     hash_free(&model->tri);
+    hash_free(&model->quad);
     hash_free(&model->bi_ctx);
     hash_free(&model->tri_ctx);
+    hash_free(&model->quad_ctx);
     model->total_uni = 0;
     model->total_bi = 0;
     model->total_tri = 0;
+    model->total_quad = 0;
     model->vocab_size = 0;
     model->unk_count = 0;
     model->oom = false;
     hash_init(&model->uni);
     hash_init(&model->bi);
     hash_init(&model->tri);
+    hash_init(&model->quad);
     hash_init(&model->bi_ctx);
     hash_init(&model->tri_ctx);
+    hash_init(&model->quad_ctx);
 }
 
 /* Apply decay to a hash table: multiply all counts by scale factor.
@@ -757,13 +969,16 @@ void sg_anomaly_model_decay(sg_anomaly_model_t *model, double scale)
     hash_decay(&model->uni, scale);
     hash_decay(&model->bi, scale);
     hash_decay(&model->tri, scale);
+    hash_decay(&model->quad, scale);
     hash_decay(&model->bi_ctx, scale);
     hash_decay(&model->tri_ctx, scale);
+    hash_decay(&model->quad_ctx, scale);
 
     /* Recalculate totals (approximate after decay) */
     model->total_uni = model->uni.total;
     model->total_bi = model->bi.total;
     model->total_tri = model->tri.total;
+    model->total_quad = model->quad.total;
     model->vocab_size = model->uni.len;
 }
 
@@ -796,13 +1011,16 @@ size_t sg_anomaly_model_prune(sg_anomaly_model_t *model, size_t min_count)
     removed += hash_prune(&model->uni, min_count);
     removed += hash_prune(&model->bi, min_count);
     removed += hash_prune(&model->tri, min_count);
+    removed += hash_prune(&model->quad, min_count);
     removed += hash_prune(&model->bi_ctx, min_count);
     removed += hash_prune(&model->tri_ctx, min_count);
+    removed += hash_prune(&model->quad_ctx, min_count);
 
     /* Recalculate totals */
     model->total_uni = model->uni.total;
     model->total_bi = model->bi.total;
     model->total_tri = model->tri.total;
+    model->total_quad = model->quad.total;
     model->vocab_size = model->uni.len;
 
     return removed;
@@ -858,8 +1076,10 @@ bool sg_anomaly_model_compact(sg_anomaly_model_t *model)
     did_compact |= hash_compact(&model->uni);
     did_compact |= hash_compact(&model->bi);
     did_compact |= hash_compact(&model->tri);
+    did_compact |= hash_compact(&model->quad);
     did_compact |= hash_compact(&model->bi_ctx);
     did_compact |= hash_compact(&model->tri_ctx);
+    did_compact |= hash_compact(&model->quad_ctx);
 
     return did_compact;
 }
