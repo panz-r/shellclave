@@ -164,6 +164,11 @@ void sg_anomaly_model_decay(sg_anomaly_model_t *model, double scale);
  * Use to reduce model size and remove noise from rare patterns. */
 size_t sg_anomaly_model_prune(sg_anomaly_model_t *model, size_t min_count);
 
+/* Rehash tables to smaller capacity if load factor is below 0.25.
+ * Call after decay or prune to recover memory.
+ * Returns true if any table was compacted, false otherwise. */
+bool sg_anomaly_model_compact(sg_anomaly_model_t *model);
+
 #ifdef __cplusplus
 }
 #endif

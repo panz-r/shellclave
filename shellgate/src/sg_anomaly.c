@@ -772,3 +772,59 @@ size_t sg_anomaly_model_prune(sg_anomaly_model_t *model, size_t min_count)
 
     return removed;
 }
+
+/* Compact a hash table by rehashing to a smaller capacity if load factor is low.
+ * Returns true if compaction happened, false otherwise. */
+static bool hash_compact(hash_t *h)
+{
+    if (!h || h->capacity <= 16) return false;
+
+    double load = (double)h->len / (double)h->capacity;
+    if (load >= 0.25) return false;
+
+    /* Calculate new capacity: smallest power of 2 >= len * 2 (for 0.5 load target) */
+    size_t new_cap = 16;
+    while (new_cap < h->len * 2 && new_cap < h->capacity / 2) {
+        new_cap *= 2;
+    }
+    if (new_cap >= h->capacity) return false;
+
+    hash_entry_t *new_entries = calloc(new_cap, sizeof(new_entries[0]));
+    if (!new_entries) return false;
+
+    /* Rehash all entries */
+    for (size_t i = 0; i < h->capacity; i++) {
+        if (h->entries[i].key_data == NULL) continue;
+
+        size_t pos = hash_key_bytes(h->entries[i].key_data,
+                                    h->entries[i].key_len, new_cap);
+        for (size_t probe = 0; probe < new_cap; probe++) {
+            size_t idx = (pos + probe) & (new_cap - 1);
+            if (new_entries[idx].key_data == NULL) {
+                new_entries[idx].key_data = h->entries[i].key_data;
+                new_entries[idx].key_len = h->entries[i].key_len;
+                new_entries[idx].count = h->entries[i].count;
+                break;
+            }
+        }
+    }
+
+    free(h->entries);
+    h->entries = new_entries;
+    h->capacity = new_cap;
+    return true;
+}
+
+bool sg_anomaly_model_compact(sg_anomaly_model_t *model)
+{
+    if (!model) return false;
+
+    bool did_compact = false;
+    did_compact |= hash_compact(&model->uni);
+    did_compact |= hash_compact(&model->bi);
+    did_compact |= hash_compact(&model->tri);
+    did_compact |= hash_compact(&model->bi_ctx);
+    did_compact |= hash_compact(&model->tri_ctx);
+
+    return did_compact;
+}

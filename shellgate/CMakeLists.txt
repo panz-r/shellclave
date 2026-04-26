@@ -61,6 +61,12 @@ add_executable(test_anomaly
 )
 target_link_libraries(test_anomaly PRIVATE shellgate)
 
+# ── Tools ─────────────────────────────────────────────────────
+add_executable(anomaly_demo
+    tools/anomaly_demo.c
+)
+target_link_libraries(anomaly_demo PRIVATE shellgate)
+
 include(CTest)
 add_test(NAME shellgate COMMAND test_shellgate)
 
