@@ -14,6 +14,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdarg.h>
+#include <math.h>
 
 /* ============================================================
  * PORTABLE strlcpy
@@ -128,6 +129,16 @@ struct sg_gate {
     bool                anomaly_update_on_non_anomaly;  /* don't learn from anomalous commands */
     double              anomaly_weight_raw;             /* weight for raw score (default 0.5) */
     double              anomaly_weight_type;            /* weight for type score (default 0.5) */
+
+    /* Adaptive threshold */
+    bool                anomaly_adaptive;       /* use adaptive threshold (default false) */
+    size_t              anomaly_window_size;    /* rolling window capacity (default 1000) */
+    double              anomaly_k_factor;       /* stddev multiplier (default 3.0) */
+    double             *anomaly_score_buf;      /* circular buffer of normal scores */
+    size_t              anomaly_score_count;    /* entries currently in buffer */
+    size_t              anomaly_score_idx;      /* next write position (circular) */
+    bool                anomaly_adaptive_armed; /* window is full, threshold is computed */
+    double              anomaly_fixed_threshold;/* saved fixed threshold for fallback */
 };
 
 /* ============================================================
@@ -168,6 +179,7 @@ void sg_gate_free(sg_gate_t *gate)
     if (!gate) return;
     if (gate->anomaly_model) sg_anomaly_model_free(gate->anomaly_model);
     if (gate->anomaly_model_type) sg_anomaly_model_free(gate->anomaly_model_type);
+    free(gate->anomaly_score_buf);
     if (gate->policy)       st_policy_free(gate->policy);
     if (gate->deny_policy)  st_policy_free(gate->deny_policy);
     if (gate->pctx)         st_policy_ctx_free(gate->pctx);
@@ -261,6 +273,17 @@ sg_error_t sg_gate_enable_anomaly(sg_gate_t *gate,
     gate->anomaly_update_on_non_anomaly = true;
     gate->anomaly_weight_raw = 0.5;
     gate->anomaly_weight_type = 0.5;
+    gate->anomaly_fixed_threshold = threshold;
+    /* Reset adaptive state (preserve adaptive flag and k_factor across re-enable) */
+    gate->anomaly_score_count = 0;
+    gate->anomaly_score_idx = 0;
+    gate->anomaly_adaptive_armed = false;
+    if (gate->anomaly_adaptive && !gate->anomaly_score_buf) {
+        gate->anomaly_window_size = 1000;
+        gate->anomaly_k_factor = 3.0;
+        gate->anomaly_score_buf = calloc(1000, sizeof(double));
+        if (!gate->anomaly_score_buf) return SG_ERR_MEMORY;
+    }
     return SG_OK;
 }
 
@@ -276,6 +299,11 @@ void sg_gate_disable_anomaly(sg_gate_t *gate)
         gate->anomaly_model_type = NULL;
     }
     gate->anomaly_enabled = false;
+    free(gate->anomaly_score_buf);
+    gate->anomaly_score_buf = NULL;
+    gate->anomaly_score_count = 0;
+    gate->anomaly_score_idx = 0;
+    gate->anomaly_adaptive_armed = false;
 }
 
 sg_error_t sg_gate_set_anomaly_update_mode(sg_gate_t *gate,
@@ -305,6 +333,102 @@ sg_error_t sg_gate_set_anomaly_weights(sg_gate_t *gate,
     if (sum < 0.99 || sum > 1.01) return SG_ERR_INVALID;
     gate->anomaly_weight_raw = weight_raw;
     gate->anomaly_weight_type = weight_type;
+    return SG_OK;
+}
+
+/* ============================================================
+ * ADAPTIVE THRESHOLD
+ *
+ * Maintains a circular buffer of scores from non-anomalous commands.
+ * Threshold is computed as mean + k * stddev of the window.
+ * Falls back to the fixed threshold until the window is full.
+ * ============================================================ */
+
+static void adaptive_recompute_threshold(sg_gate_t *gate)
+{
+    if (!gate->anomaly_score_buf || gate->anomaly_score_count == 0) return;
+
+    /* Compute mean */
+    double sum = 0.0;
+    size_t n = gate->anomaly_score_count < gate->anomaly_window_size
+               ? gate->anomaly_score_count : gate->anomaly_window_size;
+    for (size_t i = 0; i < n; i++)
+        sum += gate->anomaly_score_buf[i];
+    double mean = sum / (double)n;
+
+    /* Compute stddev */
+    double var_sum = 0.0;
+    for (size_t i = 0; i < n; i++) {
+        double diff = gate->anomaly_score_buf[i] - mean;
+        var_sum += diff * diff;
+    }
+    double stddev = sqrt(var_sum / (double)n);
+
+    gate->anomaly_threshold = mean + gate->anomaly_k_factor * stddev;
+}
+
+static void adaptive_record_score(sg_gate_t *gate, double score)
+{
+    if (!gate->anomaly_score_buf) return;
+    if (!isfinite(score)) return;
+
+    gate->anomaly_score_buf[gate->anomaly_score_idx] = score;
+    gate->anomaly_score_idx = (gate->anomaly_score_idx + 1) % gate->anomaly_window_size;
+    gate->anomaly_score_count++;
+
+    /* Arm adaptive threshold once window is full */
+    if (!gate->anomaly_adaptive_armed &&
+        gate->anomaly_score_count >= gate->anomaly_window_size) {
+        gate->anomaly_adaptive_armed = true;
+    }
+
+    /* Recompute threshold */
+    if (gate->anomaly_adaptive_armed) {
+        adaptive_recompute_threshold(gate);
+    }
+}
+
+sg_error_t sg_gate_set_anomaly_adaptive(sg_gate_t *gate,
+                                         bool adaptive, size_t window_size)
+{
+    if (!gate) return SG_ERR_INVALID;
+    if (adaptive && window_size == 0) return SG_ERR_INVALID;
+
+    if (!adaptive) {
+        gate->anomaly_adaptive = false;
+        gate->anomaly_adaptive_armed = false;
+        gate->anomaly_threshold = gate->anomaly_fixed_threshold;
+        free(gate->anomaly_score_buf);
+        gate->anomaly_score_buf = NULL;
+        gate->anomaly_score_count = 0;
+        gate->anomaly_score_idx = 0;
+        return SG_OK;
+    }
+
+    /* Allocate new buffer */
+    double *new_buf = calloc(window_size, sizeof(double));
+    if (!new_buf) return SG_ERR_MEMORY;
+
+    /* Free old buffer */
+    free(gate->anomaly_score_buf);
+    gate->anomaly_score_buf = new_buf;
+    gate->anomaly_window_size = window_size;
+    gate->anomaly_score_count = 0;
+    gate->anomaly_score_idx = 0;
+    gate->anomaly_adaptive = true;
+    gate->anomaly_adaptive_armed = false;
+    /* Threshold stays as fixed until window fills */
+    return SG_OK;
+}
+
+sg_error_t sg_gate_set_anomaly_k_factor(sg_gate_t *gate, double k)
+{
+    if (!gate) return SG_ERR_INVALID;
+    if (k < 0.0) return SG_ERR_INVALID;
+    gate->anomaly_k_factor = k;
+    /* Recompute threshold if already armed */
+    if (gate->anomaly_adaptive_armed)
+        adaptive_recompute_threshold(gate);
     return SG_OK;
 }
 
@@ -1558,7 +1682,11 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len,
             /* Product of probabilities in log-space = weighted sum of bits */
             out->anomaly_score = score_raw * gate->anomaly_weight_raw
                                + score_type * gate->anomaly_weight_type;
-            out->anomaly_detected = (out->anomaly_score > gate->anomaly_threshold);
+            /* Choose effective threshold: adaptive if armed, else fixed */
+            double eff_threshold = gate->anomaly_threshold;
+            if (gate->anomaly_adaptive && !gate->anomaly_adaptive_armed)
+                eff_threshold = gate->anomaly_fixed_threshold;
+            out->anomaly_detected = (out->anomaly_score > eff_threshold);
         }
     } else if (gate->anomaly_enabled && gate->anomaly_model) {
         out->anomaly_score = 0.0;
@@ -1700,6 +1828,10 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len,
             /* Only update on ALLOW verdict */
             should_update = !out->anomaly_detected || !gate->anomaly_update_on_non_anomaly;
         }
+
+        /* Record normal scores for adaptive threshold (before update, using current model) */
+        if (gate->anomaly_adaptive && !out->anomaly_detected && isfinite(out->anomaly_score) && cmd_count >= 3)
+            adaptive_record_score(gate, out->anomaly_score);
 
         if (should_update) {
             sg_anomaly_update(gate->anomaly_model, cmd_seq, cmd_count);

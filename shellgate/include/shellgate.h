@@ -399,6 +399,35 @@ sg_error_t sg_gate_set_anomaly_weights(sg_gate_t *gate,
                                          double weight_type);
 
 /*
+ * Enable or disable adaptive threshold mode.
+ *
+ * When adaptive=true:
+ *   - A rolling window of `window_size` scores from non-anomalous commands
+ *     is maintained.
+ *   - The threshold is computed as mean + k * stddev of the window.
+ *   - Until the window is full, the fixed threshold (from sg_gate_enable_anomaly)
+ *     is used as fallback.
+ *
+ * When adaptive=false:
+ *   - Reverts to the fixed threshold.
+ *   - Frees the window buffer.
+ *
+ * Returns SG_ERR_INVALID if gate is NULL, or if adaptive=true and window_size==0.
+ * Returns SG_ERR_MEMORY if buffer allocation fails.
+ */
+sg_error_t sg_gate_set_anomaly_adaptive(sg_gate_t *gate,
+                                         bool adaptive, size_t window_size);
+
+/*
+ * Set the k multiplier for the adaptive threshold (default 3.0).
+ * Threshold = mean + k * stddev.
+ *
+ * Only meaningful when adaptive threshold is enabled.
+ * Returns SG_ERR_INVALID if gate is NULL or k < 0.
+ */
+sg_error_t sg_gate_set_anomaly_k_factor(sg_gate_t *gate, double k);
+
+/*
  * Save the anomaly model to a file.
  * Returns SG_ERR_INVALID if anomaly detection is not enabled,
  * or SG_ERR_IO on file error.
