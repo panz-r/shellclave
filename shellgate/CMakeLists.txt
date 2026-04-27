@@ -117,10 +117,4 @@ else()
     message(STATUS "libFuzzer not available — fuzz_shellgate uses stdin driver")
 endif()
 
-# Seed corpus: copy tests/corpus/ into build dir for easy access
-add_custom_command(TARGET fuzz_shellgate POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_directory
-        ${CMAKE_SOURCE_DIR}/tests/corpus
-        ${CMAKE_BINARY_DIR}/corpus
-    COMMENT "Copying seed corpus to build directory"
-)
+# No corpus copying — fuzzer references tests/corpus/ directly
