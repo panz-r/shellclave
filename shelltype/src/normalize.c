@@ -1673,6 +1673,164 @@ st_error_t st_normalize_typed(const char *raw_cmd, st_token_array_t *out)
             continue;
         }
 
+        /* Parametrized wildcards: classify base type first, then override text
+         * for recognized parametrized forms (e.g., sha256 → #hash.sha256).
+         * This runs for every token; specific cases are handled here. */
+        {
+            st_token_type_t base_type = st_classify_token(tok);
+            char *text = strdup(tok);
+            if (!text) goto fail;
+            out->tokens[out->count].text = text;
+            out->tokens[out->count].type = base_type;
+
+            /* Try each parametrized form in order. Only replace text if matched. */
+            char buf[64];
+
+            /* Check for already-parametrized tokens (#sha.40, #hash.sha256, etc.)
+             * These may be classified as other types (FILENAME) due to dot in name.
+             * Handle them before checking base_type to ensure correct symbol. */
+            if (strncmp(tok, "#sha.", 5) == 0 && strlen(tok) > 5) {
+                /* Already has #sha. prefix - verify it's valid and use as-is */
+                const char *variant = tok + 5;
+                if (strcmp(variant, "short") == 0 || strcmp(variant, "40") == 0 ||
+                    strcmp(variant, "64") == 0) {
+                    out->tokens[out->count].type = ST_TYPE_SHA;
+                    /* Text is already correct (#sha.40) */
+                }
+            }
+            else if (strncmp(tok, "#hash.", 6) == 0 && strlen(tok) > 6) {
+                /* Already has #hash. prefix - use as-is */
+                out->tokens[out->count].type = ST_TYPE_HASH_ALGO;
+            }
+            else if (strncmp(tok, "#image.", 7) == 0 && strlen(tok) > 7) {
+                /* Already has #image. prefix - use as-is */
+                out->tokens[out->count].type = ST_TYPE_IMAGE;
+            }
+            else if (strncmp(tok, "#pkg.", 5) == 0 && strlen(tok) > 5) {
+                /* Already has #pkg. prefix - use as-is */
+                out->tokens[out->count].type = ST_TYPE_PKG;
+            }
+            else if (strncmp(tok, "#duration.", 10) == 0 && strlen(tok) > 10) {
+                /* Already has #duration. prefix - use as-is */
+                out->tokens[out->count].type = ST_TYPE_DURATION;
+            }
+            else if (strncmp(tok, "#signal.", 8) == 0 && strlen(tok) > 8) {
+                /* Already has #signal. prefix - use as-is */
+                out->tokens[out->count].type = ST_TYPE_SIGNAL;
+            }
+            else if (strncmp(tok, "#branch.", 8) == 0 && strlen(tok) > 8) {
+                /* Already has #branch. prefix - use as-is */
+                out->tokens[out->count].type = ST_TYPE_BRANCH;
+            }
+            else if (strncmp(tok, "#range.", 7) == 0) {
+                /* Already has #range. prefix - use as-is */
+                out->tokens[out->count].type = ST_TYPE_RANGE;
+            }
+            else if (strncmp(tok, "#perm.", 6) == 0) {
+                /* Already has #perm. prefix - use as-is */
+                out->tokens[out->count].type = ST_TYPE_PERM_OCTAL;
+            }
+
+            /* Now handle tokens classified by base_type */
+            if (base_type == ST_TYPE_HASH_ALGO) {
+                /* Known hash algorithms: token IS the algorithm name */
+                snprintf(buf, sizeof(buf), "#hash.%s", tok);
+                free(text);
+                out->tokens[out->count].text = strdup(buf);
+                if (!out->tokens[out->count].text) goto fail;
+            }
+            else if (base_type == ST_TYPE_IMAGE) {
+                /* Extract registry prefix (first / before : or @) */
+                const char *slash = strchr(tok, '/');
+                const char *colon = strchr(tok, ':');
+                const char *at = strchr(tok, '@');
+                const char *first_sep = colon ? colon : at;
+                if (slash && (!first_sep || slash < first_sep)) {
+                    size_t reg_len = (size_t)(slash - tok);
+                    snprintf(buf, sizeof(buf), "#image.%.*s", (int)reg_len, tok);
+                    free(text);
+                    out->tokens[out->count].text = strdup(buf);
+                    if (!out->tokens[out->count].text) goto fail;
+                }
+            }
+            else if (base_type == ST_TYPE_PKG) {
+                /* Scoped packages: @scope/name → scope = name part after @ before / */
+                if (tok[0] == '@') {
+                    const char *slash = strchr(tok, '/');
+                    if (slash) {
+                        size_t scope_len = (size_t)(slash - tok - 1);
+                        if (scope_len > 0 && scope_len < sizeof(buf) - 8) {
+                            snprintf(buf, sizeof(buf), "#pkg.@%.*s", (int)scope_len, tok + 1);
+                            free(text);
+                            out->tokens[out->count].text = strdup(buf);
+                            if (!out->tokens[out->count].text) goto fail;
+                        }
+                    }
+                }
+            }
+            else if (base_type == ST_TYPE_BRANCH) {
+                /* Branch prefix: feature/login → prefix = part before / */
+                const char *slash = strchr(tok, '/');
+                if (slash) {
+                    size_t prefix_len = (size_t)(slash - tok);
+                    snprintf(buf, sizeof(buf), "#branch.%.*s", (int)prefix_len, tok);
+                    free(text);
+                    out->tokens[out->count].text = strdup(buf);
+                    if (!out->tokens[out->count].text) goto fail;
+                }
+            }
+            else if (base_type == ST_TYPE_SHA) {
+                /* SHA length variant */
+                size_t len = strlen(tok);
+                const char *variant;
+                if (len == 7) variant = "short";
+                else if (len == 40) variant = "40";
+                else if (len == 64) variant = "64";
+                else variant = NULL;
+                if (variant) {
+                    snprintf(buf, sizeof(buf), "#sha.%s", variant);
+                    free(text);
+                    out->tokens[out->count].text = strdup(buf);
+                    if (!out->tokens[out->count].text) goto fail;
+                }
+            }
+            else if (base_type == ST_TYPE_DURATION) {
+                /* Duration unit suffix */
+                const char *p = tok;
+                if (*p == '-') p++;
+                while (*p && (isdigit((unsigned char)*p) || *p == '.')) p++;
+                if (*p) {
+                    snprintf(buf, sizeof(buf), "#duration.%s", p);
+                    free(text);
+                    out->tokens[out->count].text = strdup(buf);
+                    if (!out->tokens[out->count].text) goto fail;
+                }
+            }
+            else if (base_type == ST_TYPE_SIGNAL) {
+                /* Signal name: strip SIG prefix, use bare name */
+                const char *sig = tok;
+                if (strncmp(sig, "SIG", 3) == 0) sig += 3;
+                snprintf(buf, sizeof(buf), "#signal.%s", sig);
+                free(text);
+                out->tokens[out->count].text = strdup(buf);
+                if (!out->tokens[out->count].text) goto fail;
+            }
+            else if (base_type == ST_TYPE_RANGE) {
+                free(text);
+                out->tokens[out->count].text = strdup("#range.step");
+                if (!out->tokens[out->count].text) goto fail;
+            }
+            else if (base_type == ST_TYPE_PERM_OCTAL) {
+                free(text);
+                out->tokens[out->count].text = strdup("#perm.bits");
+                if (!out->tokens[out->count].text) goto fail;
+            }
+
+            out->count++;
+            prev = tok;
+            continue;
+        }
+
         /* Default: classify the token */
         out->tokens[out->count].text = strdup(tok);
         if (!out->tokens[out->count].text) goto fail;

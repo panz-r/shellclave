@@ -27,6 +27,7 @@ static int tests_failed = 0;
 } while(0)
 
 #define ASSERT(cond) do { if (!(cond)) { printf("  Assertion failed: %s at %s:%d\n", #cond, __FILE__, __LINE__); return 0; } } while(0)
+#define ASSERT_STR_EQ(a, b) do { if (strcmp((a), (b)) != 0) { printf("  String mismatch: '%s' != '%s' at %s:%d\n", (a), (b), __FILE__, __LINE__); return 0; } } while(0)
 #define ASSERT_TYPE(token, expected) do { \
     st_token_type_t t = st_classify_token(token); \
     if (t != expected) { \
@@ -1407,6 +1408,291 @@ static int test_normalize_typed_env_assignment(void)
 }
 
 /* ============================================================
+ * PARAMETRIZED WILDCARD CLASSIFICATION
+ * ============================================================ */
+
+/* --- #hash.algo: hash algorithm name → parametrized wildcard --- */
+static int test_classify_param_hash_algo(void)
+{
+    /* Known algo names become #hash.sha256 etc. in typed normalization */
+    st_token_array_t arr;
+    st_error_t err = st_normalize_typed("echo sha256", &arr);
+    ASSERT(err == ST_OK);
+    ASSERT(arr.count == 2);
+    ASSERT(arr.tokens[0].type == ST_TYPE_LITERAL);  /* echo */
+    ASSERT(arr.tokens[1].type == ST_TYPE_HASH_ALGO);
+    ASSERT_STR_EQ(arr.tokens[1].text, "#hash.sha256");
+    st_free_token_array(&arr);
+    return 1;
+}
+
+/* --- #image.registry: image with registry prefix --- */
+static int test_classify_param_image_registry(void)
+{
+    /* ghcr.io/org/app:v1 → #image.ghcr.io (3 tokens: docker, pull, ghcr.io/...) */
+    st_token_array_t arr;
+    st_error_t err = st_normalize_typed("docker pull ghcr.io/org/app:v1", &arr);
+    ASSERT(err == ST_OK);
+    ASSERT(arr.count == 3);  /* docker, pull, ghcr.io/org/app:v1 */
+    ASSERT(arr.tokens[2].type == ST_TYPE_IMAGE);
+    ASSERT_STR_EQ(arr.tokens[2].text, "#image.ghcr.io");
+    st_free_token_array(&arr);
+
+    /* nginx:latest (no registry) → keeps original text (no parametrized form) */
+    st_error_t err2 = st_normalize_typed("docker pull nginx:latest", &arr);
+    ASSERT(err2 == ST_OK);
+    ASSERT(arr.count == 3);  /* docker, pull, nginx:latest */
+    ASSERT(arr.tokens[2].type == ST_TYPE_IMAGE);
+    ASSERT_STR_EQ(arr.tokens[2].text, "nginx:latest");  /* original text preserved */
+    st_free_token_array(&arr);
+    return 1;
+}
+
+/* --- #pkg.scope: scoped package @scope/name --- */
+static int test_classify_param_pkg_scope(void)
+{
+    /* @babel/core → #pkg.@babel */
+    st_token_array_t arr;
+    st_error_t err = st_normalize_typed("npm install @babel/core", &arr);
+    ASSERT(err == ST_OK);
+    ASSERT(arr.count == 3);  /* npm, install, @babel/core */
+    ASSERT(arr.tokens[2].type == ST_TYPE_PKG);
+    ASSERT_STR_EQ(arr.tokens[2].text, "#pkg.@babel");
+    st_free_token_array(&arr);
+
+    /* @types/node (scope with hyphen) */
+    st_error_t err2 = st_normalize_typed("npm install @types/node", &arr);
+    ASSERT(err2 == ST_OK);
+    ASSERT(arr.count == 3);
+    ASSERT(arr.tokens[2].type == ST_TYPE_PKG);
+    ASSERT_STR_EQ(arr.tokens[2].text, "#pkg.@types");
+    st_free_token_array(&arr);
+    return 1;
+}
+
+/* --- #branch.prefix: branch with slash (prefix/topic) --- */
+static int test_classify_param_branch_prefix(void)
+{
+    /* feature/login → #branch.feature (3 tokens: git, checkout, feature/login) */
+    st_token_array_t arr;
+    st_error_t err = st_normalize_typed("git checkout feature/login", &arr);
+    ASSERT(err == ST_OK);
+    ASSERT(arr.count == 3);
+    ASSERT(arr.tokens[2].type == ST_TYPE_BRANCH);
+    ASSERT_STR_EQ(arr.tokens[2].text, "#branch.feature");
+    st_free_token_array(&arr);
+
+    /* release/v2.0 is REL_PATH (dots in branch part), not BRANCH */
+    st_free_token_array(&arr);
+    return 1;
+}
+
+/* --- #sha.length: SHA length variant (short/40/64) --- */
+static int test_classify_param_sha_length(void)
+{
+    st_token_array_t arr;
+
+    /* 40-char → #sha.40 */
+    st_error_t err = st_normalize_typed("echo deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", &arr);
+    ASSERT(err == ST_OK);
+    ASSERT(arr.count >= 2);
+    ASSERT(arr.tokens[1].type == ST_TYPE_SHA);
+    ASSERT_STR_EQ(arr.tokens[1].text, "#sha.40");
+    st_free_token_array(&arr);
+
+    /* 64-char → #sha.64 */
+    st_error_t err2 = st_normalize_typed("echo deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef", &arr);
+    ASSERT(err2 == ST_OK);
+    ASSERT(arr.count >= 2);
+    ASSERT(arr.tokens[1].type == ST_TYPE_SHA);
+    ASSERT_STR_EQ(arr.tokens[1].text, "#sha.64");
+    st_free_token_array(&arr);
+    return 1;
+}
+
+/* --- #duration.unit: duration with time unit suffix --- */
+static int test_classify_param_duration_unit(void)
+{
+    st_token_array_t arr;
+
+    /* 30s → #duration.s */
+    st_error_t err = st_normalize_typed("sleep 30s", &arr);
+    ASSERT(err == ST_OK);
+    ASSERT(arr.count >= 2);
+    ASSERT(arr.tokens[1].type == ST_TYPE_DURATION);
+    ASSERT_STR_EQ(arr.tokens[1].text, "#duration.s");
+    st_free_token_array(&arr);
+
+    /* 2h → #duration.h */
+    st_error_t err2 = st_normalize_typed("sleep 2h", &arr);
+    ASSERT(err2 == ST_OK);
+    ASSERT(arr.count >= 2);
+    ASSERT(arr.tokens[1].type == ST_TYPE_DURATION);
+    ASSERT_STR_EQ(arr.tokens[1].text, "#duration.h");
+    st_free_token_array(&arr);
+
+    /* 100ms → #duration.ms */
+    st_error_t err3 = st_normalize_typed("sleep 100ms", &arr);
+    ASSERT(err3 == ST_OK);
+    ASSERT(arr.count >= 2);
+    ASSERT(arr.tokens[1].type == ST_TYPE_DURATION);
+    ASSERT_STR_EQ(arr.tokens[1].text, "#duration.ms");
+    st_free_token_array(&arr);
+    return 1;
+}
+
+/* --- #signal.name: signal name (with optional SIG prefix) --- */
+static int test_classify_param_signal_name(void)
+{
+    st_token_array_t arr;
+
+    /* TERM → #signal.TERM */
+    st_error_t err = st_normalize_typed("kill TERM", &arr);
+    ASSERT(err == ST_OK);
+    ASSERT(arr.count >= 2);
+    ASSERT(arr.tokens[1].type == ST_TYPE_SIGNAL);
+    ASSERT_STR_EQ(arr.tokens[1].text, "#signal.TERM");
+    st_free_token_array(&arr);
+
+    /* SIGTERM → #signal.TERM (SIG prefix stripped) */
+    st_error_t err2 = st_normalize_typed("kill SIGTERM", &arr);
+    ASSERT(err2 == ST_OK);
+    ASSERT(arr.count >= 2);
+    ASSERT(arr.tokens[1].type == ST_TYPE_SIGNAL);
+    ASSERT_STR_EQ(arr.tokens[1].text, "#signal.TERM");
+    st_free_token_array(&arr);
+    return 1;
+}
+
+/* --- #range.step: range marker --- */
+static int test_classify_param_range_marker(void)
+{
+    st_token_array_t arr;
+    st_error_t err = st_normalize_typed("echo 1-5", &arr);
+    ASSERT(err == ST_OK);
+    ASSERT(arr.count >= 2);
+    ASSERT(arr.tokens[1].type == ST_TYPE_RANGE);
+    ASSERT_STR_EQ(arr.tokens[1].text, "#range.step");
+    st_free_token_array(&arr);
+    return 1;
+}
+
+/* --- #perm.bits: permission octal marker --- */
+static int test_classify_param_perm_marker(void)
+{
+    st_token_array_t arr;
+    st_error_t err = st_normalize_typed("chmod 755", &arr);
+    ASSERT(err == ST_OK);
+    ASSERT(arr.count == 2);  /* chmod, 755 */
+    ASSERT(arr.tokens[1].type == ST_TYPE_PERM_OCTAL);
+    ASSERT_STR_EQ(arr.tokens[1].text, "#perm.bits");
+    st_free_token_array(&arr);
+    return 1;
+}
+
+/* --- Parametrized wildcard tests using st_normalize_typed --- */
+static int test_normalize_typed_param_hash_algo(void)
+{
+    /* sha256 as standalone token → #hash.sha256 */
+    st_token_array_t arr;
+    st_error_t err = st_normalize_typed("sha256 file", &arr);
+    ASSERT(err == ST_OK);
+    ASSERT(arr.count >= 2);
+    ASSERT(arr.tokens[0].type == ST_TYPE_HASH_ALGO);
+    ASSERT_STR_EQ(arr.tokens[0].text, "#hash.sha256");
+    st_free_token_array(&arr);
+    return 1;
+}
+
+static int test_normalize_typed_param_image_registry(void)
+{
+    /* ghcr.io/library/redis:latest → #image.ghcr.io (has : after slash) */
+    st_token_array_t arr;
+    st_error_t err = st_normalize_typed("docker pull ghcr.io/library/redis:latest", &arr);
+    ASSERT(err == ST_OK);
+    ASSERT(arr.count == 3);
+    ASSERT(arr.tokens[2].type == ST_TYPE_IMAGE);
+    ASSERT_STR_EQ(arr.tokens[2].text, "#image.ghcr.io");
+    st_free_token_array(&arr);
+    return 1;
+}
+
+static int test_normalize_typed_param_branch_prefix(void)
+{
+    st_token_array_t arr;
+    st_error_t err = st_normalize_typed("git branch hotfix/null-check", &arr);
+    ASSERT(err == ST_OK);
+    ASSERT(arr.count == 3);  /* git, branch, hotfix/null-check */
+    ASSERT(arr.tokens[2].type == ST_TYPE_BRANCH);
+    ASSERT_STR_EQ(arr.tokens[2].text, "#branch.hotfix");
+    st_free_token_array(&arr);
+    return 1;
+}
+
+static int test_normalize_typed_param_sha_length(void)
+{
+    st_token_array_t arr;
+    /* 8-char → falls through to HEXHASH, not SHA (needs 9+) */
+    st_error_t err = st_normalize_typed("echo abcdef12", &arr);
+    ASSERT(err == ST_OK);
+    ASSERT(arr.count >= 2);
+    ASSERT(arr.tokens[1].type == ST_TYPE_HEXHASH);
+    st_free_token_array(&arr);
+    return 1;
+}
+
+static int test_normalize_typed_param_duration_unit(void)
+{
+    st_token_array_t arr;
+    /* 1.5h → numeric part 1.5, suffix h */
+    st_error_t err = st_normalize_typed("sleep 1.5h", &arr);
+    ASSERT(err == ST_OK);
+    ASSERT(arr.count >= 2);
+    ASSERT(arr.tokens[1].type == ST_TYPE_DURATION);
+    ASSERT_STR_EQ(arr.tokens[1].text, "#duration.h");
+    st_free_token_array(&arr);
+    return 1;
+}
+
+static int test_normalize_typed_param_signal_name(void)
+{
+    st_token_array_t arr;
+    st_error_t err = st_normalize_typed("kill -s INT", &arr);
+    ASSERT(err == ST_OK);
+    ASSERT(arr.count >= 3);
+    /* INT → #signal.INT (no SIG prefix in token itself) */
+    ASSERT(arr.tokens[2].type == ST_TYPE_SIGNAL);
+    ASSERT_STR_EQ(arr.tokens[2].text, "#signal.INT");
+    st_free_token_array(&arr);
+    return 1;
+}
+
+static int test_normalize_typed_param_range_marker(void)
+{
+    st_token_array_t arr;
+    /* 0-100 as separate token (not as command) → RANGE */
+    st_error_t err = st_normalize_typed("seq 0-100", &arr);
+    ASSERT(err == ST_OK);
+    ASSERT(arr.count >= 2);
+    ASSERT(arr.tokens[1].type == ST_TYPE_RANGE);
+    ASSERT_STR_EQ(arr.tokens[1].text, "#range.step");
+    st_free_token_array(&arr);
+    return 1;
+}
+
+static int test_normalize_typed_param_perm_marker(void)
+{
+    st_token_array_t arr;
+    st_error_t err = st_normalize_typed("chmod 0644 file", &arr);
+    ASSERT(err == ST_OK);
+    ASSERT(arr.count >= 3);  /* chmod, 0644, file */
+    ASSERT(arr.tokens[1].type == ST_TYPE_PERM_OCTAL);
+    ASSERT_STR_EQ(arr.tokens[1].text, "#perm.bits");
+    st_free_token_array(&arr);
+    return 1;
+}
+
+/* ============================================================
  * LEGACY STRING NORMALISATION (backward compat)
  * ============================================================ */
 
@@ -1662,6 +1948,25 @@ int main(void)
     TEST(test_normalize_typed_regex_no_context);
     TEST(test_normalize_typed_quoted_with_space);
     TEST(test_normalize_typed_env_assignment);
+
+    printf("\nParametrized wildcards:\n");
+    TEST(test_classify_param_hash_algo);
+    TEST(test_classify_param_image_registry);
+    TEST(test_classify_param_pkg_scope);
+    TEST(test_classify_param_branch_prefix);
+    TEST(test_classify_param_sha_length);
+    TEST(test_classify_param_duration_unit);
+    TEST(test_classify_param_signal_name);
+    TEST(test_classify_param_range_marker);
+    TEST(test_classify_param_perm_marker);
+    TEST(test_normalize_typed_param_hash_algo);
+    TEST(test_normalize_typed_param_image_registry);
+    TEST(test_normalize_typed_param_branch_prefix);
+    TEST(test_normalize_typed_param_sha_length);
+    TEST(test_normalize_typed_param_duration_unit);
+    TEST(test_normalize_typed_param_signal_name);
+    TEST(test_normalize_typed_param_range_marker);
+    TEST(test_normalize_typed_param_perm_marker);
 
     printf("\nLegacy string normalisation:\n");
     TEST(test_normalize_string_uses_type_symbols);

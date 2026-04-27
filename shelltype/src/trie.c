@@ -360,10 +360,10 @@ static void dfs_collect(st_node_t *node, const char **path, size_t depth,
              * to the join of all observed types. */
             char effective_token[32];
             if (node->type != ST_TYPE_LITERAL && node->observed_types != 0) {
-                st_token_type_t joined = ST_TYPE_ANY;
+                st_token_type_t joined = ST_TYPE_COUNT;  /* sentinel: not yet set */
                 for (int t = 0; t < ST_TYPE_COUNT; t++) {
                     if (node->observed_types & (1u << t)) {
-                        if (joined == ST_TYPE_ANY) {
+                        if (joined == ST_TYPE_COUNT) {
                             joined = (st_token_type_t)t;
                         } else {
                             joined = st_join(joined, (st_token_type_t)t);
@@ -372,7 +372,7 @@ static void dfs_collect(st_node_t *node, const char **path, size_t depth,
                 }
 
                 /* Frequency-aware: classify each sample and count per-type */
-                if (node->num_samples >= 3 && joined != ST_TYPE_ANY) {
+                if (node->num_samples >= 3 && joined != ST_TYPE_COUNT) {
                     uint16_t type_counts[ST_TYPE_COUNT] = {0};
                     for (size_t s = 0; s < node->num_samples; s++) {
                         st_token_type_t ct = st_classify_token(node->sample_values[s]);
@@ -396,7 +396,7 @@ static void dfs_collect(st_node_t *node, const char **path, size_t depth,
                     }
                 }
 
-                if (joined != ST_TYPE_ANY) {
+                if (joined != ST_TYPE_COUNT) {
                     snprintf(effective_token, sizeof(effective_token), "%s",
                              st_type_symbol[joined]);
                     pattern_tokens[depth - 1] = effective_token;

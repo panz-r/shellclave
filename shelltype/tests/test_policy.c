@@ -1470,6 +1470,460 @@ static int test_param_size_compact_subsumed(void)
     return 1;
 }
 
+/* ============================================================
+ * PHASE 2: NEW PARAMETRIZED TYPES (#hash.algo, #image.registry,
+ * #pkg.scope, #branch.prefix, #sha.length, #duration.unit,
+ * #signal.name, #range.step, #perm.bits)
+ * ============================================================ */
+
+/* --- #hash.algo: hash algorithm name --- */
+static int test_param_hash_algo_match(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_policy_t *policy = st_policy_new(ctx);
+
+    st_error_t err = st_policy_add(policy, "sha256sum #hash.sha256");
+    ASSERT(err == ST_OK);
+
+    /* sha256 algorithm matches (#hash.sha256 matches sha256 as algorithm name) */
+    st_eval_result_t r1;
+    st_policy_eval(policy, "sha256sum sha256", &r1);
+    ASSERT(r1.matches);
+
+    /* md5 algorithm does NOT match sha256 policy */
+    st_eval_result_t r2;
+    st_policy_eval(policy, "md5sum md5", &r2);
+    ASSERT(!r2.matches);
+
+    st_policy_free(policy);
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
+static int test_param_hash_algo_wildcard(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_policy_t *policy = st_policy_new(ctx);
+
+    st_error_t err = st_policy_add(policy, "echo #hash");
+    ASSERT(err == ST_OK);
+
+    /* Any hash algo matches generic #hash */
+    st_eval_result_t r1;
+    st_policy_eval(policy, "echo sha256", &r1);
+    ASSERT(r1.matches);
+
+    st_eval_result_t r2;
+    st_policy_eval(policy, "echo md5", &r2);
+    ASSERT(r2.matches);
+
+    st_policy_free(policy);
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
+static int test_param_hash_algo_invalid_param(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_policy_t *policy = st_policy_new(ctx);
+
+    /* Invalid algo name → ST_ERR_INVALID */
+    st_error_t err = st_policy_add(policy, "echo #hash.invalid");
+    ASSERT(err == ST_ERR_INVALID);
+
+    st_policy_free(policy);
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
+/* --- #image.registry: image with registry prefix --- */
+static int test_param_image_registry_match(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_policy_t *policy = st_policy_new(ctx);
+
+    st_error_t err = st_policy_add(policy, "docker pull #image.ghcr.io");
+    ASSERT(err == ST_OK);
+
+    /* ghcr.io registry matches */
+    st_eval_result_t r1;
+    st_policy_eval(policy, "docker pull ghcr.io/org/app:v1", &r1);
+    ASSERT(r1.matches);
+
+    /* docker.io registry does NOT match ghcr.io */
+    st_eval_result_t r2;
+    st_policy_eval(policy, "docker pull docker.io/library/redis", &r2);
+    ASSERT(!r2.matches);
+
+    st_policy_free(policy);
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
+static int test_param_image_wildcard(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_policy_t *policy = st_policy_new(ctx);
+
+    st_error_t err = st_policy_add(policy, "docker pull #image");
+    ASSERT(err == ST_OK);
+
+    /* Any image matches generic #image */
+    st_eval_result_t r1;
+    st_policy_eval(policy, "docker pull ghcr.io/org/app:v1", &r1);
+    ASSERT(r1.matches);
+
+    st_eval_result_t r2;
+    st_policy_eval(policy, "docker pull nginx:latest", &r2);
+    ASSERT(r2.matches);
+
+    st_policy_free(policy);
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
+/* --- #pkg.scope: scoped package --- */
+static int test_param_pkg_scope_match(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_policy_t *policy = st_policy_new(ctx);
+
+    st_error_t err = st_policy_add(policy, "npm install #pkg.@babel");
+    ASSERT(err == ST_OK);
+
+    /* @babel scope matches */
+    st_eval_result_t r1;
+    st_policy_eval(policy, "npm install @babel/core", &r1);
+    ASSERT(r1.matches);
+
+    /* @types scope does NOT match @babel */
+    st_eval_result_t r2;
+    st_policy_eval(policy, "npm install @types/node", &r2);
+    ASSERT(!r2.matches);
+
+    st_policy_free(policy);
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
+static int test_param_pkg_wildcard(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_policy_t *policy = st_policy_new(ctx);
+
+    st_error_t err = st_policy_add(policy, "npm install #pkg");
+    ASSERT(err == ST_OK);
+
+    /* Any package matches generic #pkg (only scoped @name packages classify as PKG) */
+    st_eval_result_t r1;
+    st_policy_eval(policy, "npm install @babel/core", &r1);
+    ASSERT(r1.matches);
+
+    st_eval_result_t r2;
+    st_policy_eval(policy, "npm install express", &r2);
+    ASSERT(!r2.matches);  /* plain word is LITERAL, not compatible with PKG */
+
+    st_policy_free(policy);
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
+/* --- #branch.prefix: branch with slash --- */
+static int test_param_branch_prefix_match(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_policy_t *policy = st_policy_new(ctx);
+
+    st_error_t err = st_policy_add(policy, "git checkout #branch.feature");
+    ASSERT(err == ST_OK);
+
+    /* feature prefix matches */
+    st_eval_result_t r1;
+    st_policy_eval(policy, "git checkout feature/login", &r1);
+    ASSERT(r1.matches);
+
+    /* release prefix does NOT match feature */
+    st_eval_result_t r2;
+    st_policy_eval(policy, "git checkout release/v1", &r2);
+    ASSERT(!r2.matches);
+
+    st_policy_free(policy);
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
+static int test_param_branch_wildcard(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_policy_t *policy = st_policy_new(ctx);
+
+    st_error_t err = st_policy_add(policy, "git checkout #branch");
+    ASSERT(err == ST_OK);
+
+    /* Any branch matches generic #branch */
+    st_eval_result_t r1;
+    st_policy_eval(policy, "git checkout feature/login", &r1);
+    ASSERT(r1.matches);
+
+    st_eval_result_t r2;
+    st_policy_eval(policy, "git checkout main", &r2);
+    ASSERT(r2.matches);
+
+    st_policy_free(policy);
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
+/* --- #sha.length: SHA length variant --- */
+static int test_param_sha_length_match(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_policy_t *policy = st_policy_new(ctx);
+
+    st_error_t err = st_policy_add(policy, "echo #sha.40");
+    ASSERT(err == ST_OK);
+
+    /* 40-char SHA matches */
+    st_eval_result_t r1;
+    st_policy_eval(policy, "echo deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", &r1);
+    ASSERT(r1.matches);
+
+    /* 7-char short does NOT match 40 */
+    st_eval_result_t r2;
+    st_policy_eval(policy, "echo abcdef1", &r2);
+    ASSERT(!r2.matches);
+
+    st_policy_free(policy);
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
+static int test_param_sha_length_invalid(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_policy_t *policy = st_policy_new(ctx);
+
+    /* Invalid length → ST_ERR_INVALID */
+    st_error_t err = st_policy_add(policy, "echo #sha.128");
+    ASSERT(err == ST_ERR_INVALID);
+
+    st_policy_free(policy);
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
+/* --- #duration.unit: duration with time unit --- */
+static int test_param_duration_unit_match(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_policy_t *policy = st_policy_new(ctx);
+
+    st_error_t err = st_policy_add(policy, "sleep #duration.s");
+    ASSERT(err == ST_OK);
+
+    /* seconds duration matches */
+    st_eval_result_t r1;
+    st_policy_eval(policy, "sleep 30s", &r1);
+    ASSERT(r1.matches);
+
+    /* hours duration does NOT match seconds */
+    st_eval_result_t r2;
+    st_policy_eval(policy, "sleep 2h", &r2);
+    ASSERT(!r2.matches);
+
+    st_policy_free(policy);
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
+static int test_param_duration_unit_invalid(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_policy_t *policy = st_policy_new(ctx);
+
+    /* Invalid unit → ST_ERR_INVALID */
+    st_error_t err = st_policy_add(policy, "sleep #duration.xx");
+    ASSERT(err == ST_ERR_INVALID);
+
+    st_policy_free(policy);
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
+/* --- #signal.name: signal name --- */
+static int test_param_signal_name_match(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_policy_t *policy = st_policy_new(ctx);
+
+    st_error_t err = st_policy_add(policy, "kill #signal.TERM");
+    ASSERT(err == ST_OK);
+
+    /* TERM matches */
+    st_eval_result_t r1;
+    st_policy_eval(policy, "kill TERM", &r1);
+    ASSERT(r1.matches);
+
+    /* SIGTERM also matches (SIG prefix stripped) */
+    st_eval_result_t r2;
+    st_policy_eval(policy, "kill SIGTERM", &r2);
+    ASSERT(r2.matches);
+
+    /* INT does NOT match TERM */
+    st_eval_result_t r3;
+    st_policy_eval(policy, "kill INT", &r3);
+    ASSERT(!r3.matches);
+
+    st_policy_free(policy);
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
+static int test_param_signal_name_invalid(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_policy_t *policy = st_policy_new(ctx);
+
+    /* Invalid signal name → ST_ERR_INVALID */
+    st_error_t err = st_policy_add(policy, "kill #signal.FOOBAR");
+    ASSERT(err == ST_ERR_INVALID);
+
+    st_policy_free(policy);
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
+/* --- #range.step: range marker (param ignored) --- */
+static int test_param_range_step_marker(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_policy_t *policy = st_policy_new(ctx);
+
+    st_error_t err = st_policy_add(policy, "seq #range.step");
+    ASSERT(err == ST_OK);
+
+    /* Any range matches (param ignored) */
+    st_eval_result_t r1;
+    st_policy_eval(policy, "seq 1-5", &r1);
+    ASSERT(r1.matches);
+
+    st_eval_result_t r2;
+    st_policy_eval(policy, "seq 0-100", &r2);
+    ASSERT(r2.matches);
+
+    st_policy_free(policy);
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
+/* --- #perm.bits: permission marker (param ignored) --- */
+static int test_param_perm_bits_marker(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_policy_t *policy = st_policy_new(ctx);
+
+    st_error_t err = st_policy_add(policy, "chmod #perm.bits");
+    ASSERT(err == ST_OK);
+
+    /* Any permission matches (param ignored) */
+    st_eval_result_t r1;
+    st_policy_eval(policy, "chmod 755", &r1);
+    ASSERT(r1.matches);
+
+    st_eval_result_t r2;
+    st_policy_eval(policy, "chmod 0644", &r2);
+    ASSERT(r2.matches);
+
+    st_policy_free(policy);
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
+/* --- Validation tests for new types --- */
+static int test_param_validate_new_types(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+
+    /* #hash.algo: valid algos accepted */
+    st_pattern_info_t info;
+    st_error_t err = st_validate_pattern("echo #hash.sha256", &info);
+    ASSERT(err == ST_OK);
+
+    /* #hash.algo: invalid algo rejected */
+    err = st_validate_pattern("echo #hash.foo", &info);
+    ASSERT(err == ST_ERR_INVALID);
+
+    /* #duration.unit: valid units accepted */
+    err = st_validate_pattern("sleep #duration.s", &info);
+    ASSERT(err == ST_OK);
+
+    /* #duration.unit: invalid unit rejected */
+    err = st_validate_pattern("sleep #duration.xx", &info);
+    ASSERT(err == ST_ERR_INVALID);
+
+    /* #signal.name: valid signals accepted */
+    err = st_validate_pattern("kill #signal.TERM", &info);
+    ASSERT(err == ST_OK);
+
+    /* #signal.name: invalid signal rejected */
+    err = st_validate_pattern("kill #signal.FOOBAR", &info);
+    ASSERT(err == ST_ERR_INVALID);
+
+    /* #range.step: only "step" accepted */
+    err = st_validate_pattern("seq #range.step", &info);
+    ASSERT(err == ST_OK);
+    err = st_validate_pattern("seq #range.invalid", &info);
+    ASSERT(err == ST_ERR_INVALID);
+
+    /* #perm.bits: only "bits" accepted */
+    err = st_validate_pattern("chmod #perm.bits", &info);
+    ASSERT(err == ST_OK);
+    err = st_validate_pattern("chmod #perm.foo", &info);
+    ASSERT(err == ST_ERR_INVALID);
+
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
+/* --- Subsumption for parametrized types --- */
+static int test_param_subsume_specific_to_generic(void)
+{
+    /* Specific parametrized patterns should be subsumed by generic ones */
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_policy_t *policy = st_policy_new(ctx);
+
+    st_policy_add(policy, "kill #signal.TERM");
+    ASSERT(st_policy_count(policy) == 1);
+
+    st_policy_add(policy, "kill #signal");  /* should subsume #signal.TERM */
+    ASSERT(st_policy_count(policy) == 1);
+
+    st_eval_result_t r;
+    st_policy_eval(policy, "kill INT", &r);
+    ASSERT(r.matches);  /* INT matches generic #signal */
+
+    st_policy_free(policy);
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
+static int test_param_subsume_via_same_base(void)
+{
+    /* Patterns with same base type but different params should NOT subsume each other */
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_policy_t *policy = st_policy_new(ctx);
+
+    st_policy_add(policy, "kill #signal.TERM");
+    ASSERT(st_policy_count(policy) == 1);
+
+    st_policy_add(policy, "kill #signal.INT");  /* different param, both stay */
+    ASSERT(st_policy_count(policy) == 2);
+
+    st_policy_free(policy);
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
 /* --- Phase 1b: UUID/SEMVER/TIMESTAMP parametrization --- */
 
 static int test_param_uuid_v4(void)
@@ -2339,6 +2793,28 @@ int main(void)
     TEST(test_param_size_coexist);
     TEST(test_param_size_compact_keeps_both);
     TEST(test_param_size_compact_subsumed);
+
+    printf("\nNew parametrized wildcards (#hash, #image, #pkg, #branch, #sha, #duration, #signal, #range, #perm):\n");
+    TEST(test_param_hash_algo_match);
+    TEST(test_param_hash_algo_wildcard);
+    TEST(test_param_hash_algo_invalid_param);
+    TEST(test_param_image_registry_match);
+    TEST(test_param_image_wildcard);
+    TEST(test_param_pkg_scope_match);
+    TEST(test_param_pkg_wildcard);
+    TEST(test_param_branch_prefix_match);
+    TEST(test_param_branch_wildcard);
+    TEST(test_param_sha_length_match);
+    TEST(test_param_sha_length_invalid);
+    TEST(test_param_duration_unit_match);
+    TEST(test_param_duration_unit_invalid);
+    TEST(test_param_signal_name_match);
+    TEST(test_param_signal_name_invalid);
+    TEST(test_param_range_step_marker);
+    TEST(test_param_perm_bits_marker);
+    TEST(test_param_validate_new_types);
+    TEST(test_param_subsume_specific_to_generic);
+    TEST(test_param_subsume_via_same_base);
 
     printf("\nParametrized uuid/semver/timestamp:\n");
     TEST(test_param_uuid_v4);

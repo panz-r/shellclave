@@ -470,7 +470,10 @@ static bool type_supports_param(st_token_type_t t)
            t == ST_TYPE_UUID || t == ST_TYPE_SEMVER || t == ST_TYPE_TIMESTAMP ||
            t == ST_TYPE_BRANCH || t == ST_TYPE_SHA ||
            t == ST_TYPE_IMAGE || t == ST_TYPE_PKG ||
-           t == ST_TYPE_USER || t == ST_TYPE_FINGERPRINT;
+           t == ST_TYPE_USER || t == ST_TYPE_FINGERPRINT ||
+           t == ST_TYPE_HASH_ALGO || t == ST_TYPE_DURATION ||
+           t == ST_TYPE_SIGNAL || t == ST_TYPE_RANGE ||
+           t == ST_TYPE_PERM_OCTAL;
 }
 
 /* Extract the parameter from a parametrized wildcard symbol.
@@ -606,6 +609,56 @@ static bool validate_param(st_token_type_t base_type, const char *param)
         /* Fingerprint type: sha256, md5 */
         return strcasecmp(p, "sha256") == 0 || strcasecmp(p, "md5") == 0;
 
+    case ST_TYPE_HASH_ALGO: {
+        /* Hash algorithm name: md5, sha1, sha224, sha256, sha384, sha512,
+         * blake2b, blake2s, ripemd160, whirlpool */
+        static const char *algos[] = {
+            "md5", "sha1", "sha224", "sha256", "sha384", "sha512",
+            "blake2b", "blake2s", "ripemd160", "whirlpool"
+        };
+        for (size_t i = 0; i < sizeof(algos)/sizeof(algos[0]); i++) {
+            if (strcasecmp(p, algos[i]) == 0) return true;
+        }
+        return false;
+    }
+
+    case ST_TYPE_DURATION: {
+        /* Time unit: ns, us, ms, s, m, h, d, w (case-insensitive) */
+        static const char *units[] = { "ns", "us", "ms", "s", "m", "h", "d", "w" };
+        for (size_t i = 0; i < sizeof(units)/sizeof(units[0]); i++) {
+            if (strcasecmp(p, units[i]) == 0) return true;
+        }
+        return false;
+    }
+
+    case ST_TYPE_SIGNAL: {
+        /* Signal name: HUP, INT, TERM, etc. (with or without SIG prefix) */
+        static const char *signals[] = {
+            "HUP", "INT", "QUIT", "ILL", "TRAP", "ABRT", "BUS", "FPE", "KILL",
+            "USR1", "SEGV", "USR2", "PIPE", "ALRM", "TERM", "STKFLT", "CHLD",
+            "CONT", "STOP", "TSTP", "TTIN", "TTOU", "URG", "XCPU", "XFSZ",
+            "VTALRM", "PROF", "WINCH", "POLL", "PWR", "SYS", NULL
+        };
+        for (const char **s = signals; *s; s++) {
+            if (strcasecmp(p, *s) == 0) return true;
+        }
+        /* Also accept with SIG prefix */
+        if (strncasecmp(p, "SIG", 3) == 0) {
+            for (const char **s = signals; *s; s++) {
+                if (strcasecmp(p + 3, *s) == 0) return true;
+            }
+        }
+        return false;
+    }
+
+    case ST_TYPE_RANGE:
+        /* Range step marker: accept only "step" */
+        return strcmp(p, "step") == 0;
+
+    case ST_TYPE_PERM_OCTAL:
+        /* Permission class marker: accept only "bits" */
+        return strcmp(p, "bits") == 0;
+
     default:
         return false;
     }
@@ -688,23 +741,39 @@ static bool param_matches(const char *cmd_text, st_token_type_t cmd_type,
     }
 
     if (wild_type == ST_TYPE_BRANCH) {
-        /* Branch: parameter is a prefix (e.g., ".feature" matches "feature/login") */
+        /* Branch: parameter is a prefix (e.g., ".feature" matches "feature/login").
+         * Also handles parametrized command tokens (#branch.feature). */
         if (cmd_type != ST_TYPE_BRANCH && cmd_type != ST_TYPE_LITERAL &&
             cmd_type != ST_TYPE_WORD && cmd_type != ST_TYPE_HYPHENATED)
             return false;
         if (!cmd_text) return false;
         const char *prefix = wparam + 1;  /* skip dot */
         size_t prefix_len = strlen(prefix);
+        /* If command token is parametrized (#branch.xxx), use its prefix */
+        if (cmd_type == ST_TYPE_BRANCH && strncmp(cmd_text, "#branch.", 8) == 0) {
+            /* Extract prefix from command: for #branch.xxx, prefix is before / if present */
+            const char *cmd_prefix = cmd_text + 8;  /* skip "#branch." */
+            const char *slash = strchr(cmd_prefix, '/');
+            size_t cmd_prefix_len = slash ? (size_t)(slash - cmd_prefix) : strlen(cmd_prefix);
+            return cmd_prefix_len == prefix_len && strncmp(cmd_prefix, prefix, prefix_len) == 0;
+        }
         return strncmp(cmd_text, prefix, prefix_len) == 0;
     }
 
     if (wild_type == ST_TYPE_SHA) {
-        /* SHA: parameter is length variant (short/40/64) */
-        if (cmd_type != ST_TYPE_SHA && cmd_type != ST_TYPE_HEXHASH)
+        /* SHA: parameter is length variant (short/40/64).
+         * Also handles parametrized command tokens (#sha.40). */
+        if (cmd_type != ST_TYPE_SHA && cmd_type != ST_TYPE_HEXHASH && cmd_type != ST_TYPE_LITERAL)
             return false;
         if (!cmd_text) return false;
-        size_t len = strlen(cmd_text);
         const char *variant = wparam + 1;
+        /* If command token is parametrized (#sha.xxx), extract from it.
+         * Check first 5 chars: "#sha." prefix = 5 chars. */
+        if (strncmp(cmd_text, "#sha.", 5) == 0 && cmd_text[5] != '\0') {
+            const char *cmd_variant = cmd_text + 5;
+            return strcasecmp(cmd_variant, variant) == 0;
+        }
+        size_t len = strlen(cmd_text);
         if (strcmp(variant, "short") == 0) return len == 7;
         if (strcmp(variant, "40") == 0) return len == 40;
         if (strcmp(variant, "64") == 0) return len == 64;
@@ -712,31 +781,46 @@ static bool param_matches(const char *cmd_text, st_token_type_t cmd_type,
     }
 
     if (wild_type == ST_TYPE_IMAGE) {
-        /* Image: parameter is name/registry prefix */
+        /* Image: parameter is name/registry prefix.
+         * Also handles parametrized command tokens (#image.xxx). */
         if (cmd_type != ST_TYPE_IMAGE && cmd_type != ST_TYPE_LITERAL)
             return false;
         if (!cmd_text) return false;
         const char *prefix = wparam + 1;
         size_t prefix_len = strlen(prefix);
+        /* If command token is parametrized, extract prefix from it */
+        if (cmd_type == ST_TYPE_IMAGE && strncmp(cmd_text, "#image.", 7) == 0) {
+            return strcasecmp(cmd_text + 7, prefix) == 0;
+        }
         return strncmp(cmd_text, prefix, prefix_len) == 0;
     }
 
     if (wild_type == ST_TYPE_PKG) {
-        /* Package: parameter is name prefix */
+        /* Package: parameter is name prefix.
+         * Also handles parametrized command tokens (#pkg.@scope). */
         if (cmd_type != ST_TYPE_PKG && cmd_type != ST_TYPE_LITERAL)
             return false;
         if (!cmd_text) return false;
         const char *prefix = wparam + 1;
         size_t prefix_len = strlen(prefix);
+        /* If command token is parametrized, extract prefix from it */
+        if (cmd_type == ST_TYPE_PKG && strncmp(cmd_text, "#pkg.", 5) == 0) {
+            return strcasecmp(cmd_text + 5, prefix) == 0;
+        }
         return strncmp(cmd_text, prefix, prefix_len) == 0;
     }
 
     if (wild_type == ST_TYPE_USER) {
-        /* User: parameter is exact username or "system" for known system accounts */
+        /* User: parameter is exact username or "system" for known system accounts.
+         * Also handles parametrized command tokens (#user.xxx). */
         if (cmd_type != ST_TYPE_USER && cmd_type != ST_TYPE_LITERAL)
             return false;
         if (!cmd_text) return false;
         const char *name = wparam + 1;
+        /* If command token is parametrized, extract name from it */
+        if (cmd_type == ST_TYPE_USER && strncmp(cmd_text, "#user.", 6) == 0) {
+            return strcmp(cmd_text + 6, name) == 0;
+        }
         if (strcasecmp(name, "system") == 0) {
             static const char *sys_users[] = {
                 "root", "nobody", "www-data", "daemon", "bin", "sys", "adm",
@@ -764,6 +848,139 @@ static bool param_matches(const char *cmd_text, st_token_type_t cmd_type,
             return len == 47 && cmd_text[2] == ':' && cmd_text[5] == ':';
         }
         return true;
+    }
+
+    if (wild_type == ST_TYPE_HASH_ALGO) {
+        /* Hash algo: command token is the algorithm name or parametrized wildcard.
+         * E.g., policy "#hash.sha256" matches:
+         *   - command token "sha256" (type HASH_ALGO, text "sha256")
+         *   - command token "#hash.sha256" (type HASH_ALGO, text "#hash.sha256")
+         */
+        if (cmd_type != ST_TYPE_HASH_ALGO) return false;
+        if (!cmd_text) return false;
+        const char *expected_algo = wparam + 1;  /* "sha256" from "#hash.sha256" */
+        /* If command token text is parametrized (#hash.xxx), extract algo from it.
+         * Otherwise use the token text directly (it's the algorithm name). */
+        const char *algo_from_cmd = cmd_text;
+        const char *cmd_sym = st_type_symbol[cmd_type];  /* "#hash" */
+        size_t cmd_sym_len = strlen(cmd_sym);
+        if (strncmp(cmd_text, cmd_sym, cmd_sym_len) == 0 && cmd_text[cmd_sym_len] == '.') {
+            algo_from_cmd = cmd_text + cmd_sym_len + 1;  /* skip "#hash." */
+        }
+        return strcasecmp(algo_from_cmd, expected_algo) == 0;
+    }
+
+    if (wild_type == ST_TYPE_HASH_ALGO) {
+        /* Hash algo: command token is the algorithm name or parametrized wildcard.
+         * E.g., policy "#hash.sha256" matches:
+         *   - command token "sha256" (type HASH_ALGO, text "sha256")
+         *   - command token "#hash.sha256" (type HASH_ALGO, text "#hash.sha256")
+         */
+        if (cmd_type != ST_TYPE_HASH_ALGO) return false;
+        if (!cmd_text) return false;
+        const char *expected_algo = wparam + 1;  /* "sha256" from "#hash.sha256" */
+        /* If command token text is parametrized (#hash.xxx), extract algo from it.
+         * Otherwise use the token text directly (it's the algorithm name). */
+        const char *algo_from_cmd = cmd_text;
+        const char *cmd_sym = st_type_symbol[cmd_type];  /* "#hash" */
+        size_t cmd_sym_len = strlen(cmd_sym);
+        if (strncmp(cmd_text, cmd_sym, cmd_sym_len) == 0 && cmd_text[cmd_sym_len] == '.') {
+            algo_from_cmd = cmd_text + cmd_sym_len + 1;  /* skip "#hash." */
+        }
+        return strcasecmp(algo_from_cmd, expected_algo) == 0;
+    }
+
+    if (wild_type == ST_TYPE_SIGNAL) {
+        /* Signal: command token is the signal name or parametrized wildcard.
+         * Policy "#signal.TERM" matches "TERM", "SIGTERM", "#signal.TERM". */
+        if (cmd_type != ST_TYPE_SIGNAL && cmd_type != ST_TYPE_NUMBER) return false;
+        if (!cmd_text) return false;
+        const char *sig_name = wparam + 1;
+        /* Extract signal name from command token */
+        const char *cmd_sig = cmd_text;
+        /* Check for parametrized form (#signal.xxx) */
+        const char *cmd_sym = st_type_symbol[cmd_type];
+        size_t cmd_sym_len = strlen(cmd_sym);
+        if (strncmp(cmd_text, cmd_sym, cmd_sym_len) == 0 && cmd_text[cmd_sym_len] == '.') {
+            cmd_sig = cmd_text + cmd_sym_len + 1;  /* skip "#signal." */
+        }
+        /* Strip SIG prefix if present in command token */
+        if (strncmp(cmd_sig, "SIG", 3) == 0) cmd_sig += 3;
+        /* Also strip SIG prefix from parameter */
+        if (strncmp(sig_name, "SIG", 3) == 0) sig_name += 3;
+        return strcasecmp(cmd_sig, sig_name) == 0;
+    }
+
+    if (wild_type == ST_TYPE_DURATION) {
+        /* Duration: command token may be parametrized (#duration.s) or plain (30s).
+         * Policy "#duration.s" matches "30s" and "#duration.s" alike. */
+        if (cmd_type != ST_TYPE_DURATION && cmd_type != ST_TYPE_SIZE && cmd_type != ST_TYPE_LITERAL)
+            return false;
+        if (!cmd_text) return false;
+        /* If command token is parametrized (#duration.xxx), extract from it */
+        if (strncmp(cmd_text, "#duration.", 10) == 0) {
+            return strcasecmp(cmd_text + 10, wparam + 1) == 0;
+        }
+        /* Extract unit from command token (plain 30s, 1.5h, etc.) */
+        const char *p = cmd_text;
+        if (*p == '-') p++;
+        while (*p && (*p == '#' || isdigit((unsigned char)*p) || *p == '.')) {
+            /* Skip parametrized prefix (#duration.) or digits/dot */
+            if (*p == '#') {
+                /* Parametrized: skip "#duration." prefix */
+                const char *sym = st_type_symbol[cmd_type];
+                size_t sym_len = strlen(sym);
+                if (strncmp(p, sym, sym_len) == 0 && p[sym_len] == '.') {
+                    p += sym_len + 1;
+                    break;
+                }
+            }
+            p++;
+        }
+        while (*p && (isdigit((unsigned char)*p) || *p == '.')) p++;
+        if (*p == '\0') return false;
+        return strcasecmp(p, wparam + 1) == 0;
+    }
+
+    if (wild_type == ST_TYPE_SIGNAL) {
+        /* Signal: command token is the signal name or parametrized wildcard.
+         * Policy "#signal.TERM" matches "TERM", "SIGTERM", "#signal.TERM". */
+        if (cmd_type != ST_TYPE_SIGNAL && cmd_type != ST_TYPE_NUMBER && cmd_type != ST_TYPE_LITERAL)
+            return false;
+        if (!cmd_text) return false;
+        const char *sig_name = wparam + 1;
+        /* Extract signal name from command token */
+        const char *cmd_sig = cmd_text;
+        /* Check for parametrized form (#signal.xxx) */
+        if (strncmp(cmd_text, "#signal.", 8) == 0) {
+            cmd_sig = cmd_text + 8;  /* skip "#signal." */
+        }
+        /* Strip SIG prefix if present in command token */
+        if (strncmp(cmd_sig, "SIG", 3) == 0) cmd_sig += 3;
+        /* Also strip SIG prefix from parameter */
+        if (strncmp(sig_name, "SIG", 3) == 0) sig_name += 3;
+        return strcasecmp(cmd_sig, sig_name) == 0;
+    }
+
+    if (wild_type == ST_TYPE_RANGE) {
+        /* Range step marker: param is ignored, matches any range token.
+         * Also handles parametrized command tokens (#range.step). */
+        if (cmd_type == ST_TYPE_RANGE) return true;
+        if (cmd_type == ST_TYPE_LITERAL) {
+            /* Check if it's a parametrized range token (#range.step) */
+            if (strncmp(cmd_text, "#range.", 7) == 0) return true;
+        }
+        return false;
+    }
+
+    if (wild_type == ST_TYPE_PERM_OCTAL) {
+        /* Permission marker: param is ignored, matches any perm token.
+         * Also handles parametrized command tokens (#perm.bits). */
+        if (cmd_type == ST_TYPE_PERM_OCTAL) return true;
+        if (cmd_type == ST_TYPE_LITERAL) {
+            if (strncmp(cmd_text, "#perm.", 6) == 0) return true;
+        }
+        return false;
     }
 
     return true;
@@ -2512,9 +2729,12 @@ st_error_t st_policy_verify_all(const st_policy_t *policy,
         return ST_OK;
     }
 
+    pthread_rwlock_rdlock((pthread_rwlock_t *)&policy->rwlock);
+
     const char **matches = NULL;
     size_t match_cap = 0;
     size_t match_n = 0;
+    st_error_t result = ST_OK;
 
     bfs_entry_t ring[VERIFY_ALL_RING_CAP];
     size_t head = 0, tail = 0;
@@ -2535,9 +2755,8 @@ st_error_t st_policy_verify_all(const st_policy_t *policy,
                     size_t new_cap = match_cap == 0 ? 8 : match_cap * 2;
                     const char **new_matches = realloc(matches, new_cap * sizeof(const char *));
                     if (!new_matches) {
-                        free(matches);
-                        st_free_token_array(&cmd);
-                        return ST_ERR_MEMORY;
+                        result = ST_ERR_MEMORY;
+                        goto cleanup;
                     }
                     matches = new_matches;
                     match_cap = new_cap;
@@ -2561,9 +2780,8 @@ st_error_t st_policy_verify_all(const st_policy_t *policy,
                 if (strcmp(ctext, children[ci].text) == 0) {
                     size_t next_tail = (tail + 1) % VERIFY_ALL_RING_CAP;
                     if (next_tail == head) {
-                        free(matches);
-                        st_free_token_array(&cmd);
-                        return ST_ERR_MEMORY;
+                        result = ST_ERR_MEMORY;
+                        goto cleanup;
                     }
                     ring[tail].state_idx = children[ci].target;
                     ring[tail].token_idx = entry.token_idx + 1;
@@ -2581,9 +2799,8 @@ st_error_t st_policy_verify_all(const st_policy_t *policy,
             if (c) {
                 size_t next_tail = (tail + 1) % VERIFY_ALL_RING_CAP;
                 if (next_tail == head) {
-                    free(matches);
-                    st_free_token_array(&cmd);
-                    return ST_ERR_MEMORY;
+                    result = ST_ERR_MEMORY;
+                    goto cleanup;
                 }
                 ring[tail].state_idx = c->target;
                 ring[tail].token_idx = entry.token_idx + 1;
@@ -2592,7 +2809,14 @@ st_error_t st_policy_verify_all(const st_policy_t *policy,
         }
     }
 
+cleanup:
+    pthread_rwlock_unlock((pthread_rwlock_t *)&policy->rwlock);
     st_free_token_array(&cmd);
+
+    if (result != ST_OK) {
+        free(matches);
+        return result;
+    }
 
     *matching_patterns = matches;
     *match_count = match_n;
@@ -2931,7 +3155,7 @@ st_error_t st_policy_save(const st_policy_t *policy, const char *path)
     FILE *fp = fopen(path, "w");
     if (!fp) return ST_ERR_IO;
 
-    /* Header */
+    /* Header (no lock needed - just writing constants) */
     if (fprintf(fp, "# CPL v%d\n", ST_SERIALIZATION_VERSION) < 0) {
         fclose(fp);
         return ST_ERR_IO;
@@ -2941,9 +3165,14 @@ st_error_t st_policy_save(const st_policy_t *policy, const char *path)
         return ST_ERR_IO;
     }
 
+    /* Read lock for trie traversal */
+    pthread_rwlock_rdlock((pthread_rwlock_t *)&policy->rwlock);
+
     /* Patterns with running CRC */
     policy_save_ctx_t ctx = { .fp = fp, .error = ST_OK, .crc = 0, .pattern_count = 0 };
     dfs_save((st_policy_t *)policy, 0, &ctx);
+
+    pthread_rwlock_unlock((pthread_rwlock_t *)&policy->rwlock);
 
     /* Footer: CRC32 */
     if (ctx.error == ST_OK) {
@@ -3058,7 +3287,10 @@ st_error_t st_policy_load(st_policy_t *policy, const char *path, bool clear_firs
 
     /* ============================================================
      * PASS 2: CRC verified. Now modify the policy.
+     * Acquire write lock for entire operation.
      * ============================================================ */
+    pthread_rwlock_wrlock(&policy->rwlock);
+
     if (clear_first) {
         arena_free(&policy->children_arena);
         arena_init(&policy->children_arena, CHILDREN_ARENA_SIZE);
@@ -3080,13 +3312,16 @@ st_error_t st_policy_load(st_policy_t *policy, const char *path, bool clear_firs
 
     st_error_t first_err = ST_OK;
     for (size_t i = 0; i < pattern_count; i++) {
-        st_error_t err = st_policy_add(policy, pattern_lines[i]);
+        st_error_t err = st_policy_add_locked(policy, pattern_lines[i]);
         if (err != ST_OK && first_err == ST_OK) {
             first_err = err;
         }
         free(pattern_lines[i]);
     }
     free(pattern_lines);
+
+    pthread_rwlock_unlock(&policy->rwlock);
+
     return first_err;
 
 pass1_fail:
