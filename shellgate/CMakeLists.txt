@@ -94,17 +94,33 @@ if(VALGRIND)
 endif()
 
 # ── Fuzzing ─────────────────────────────────────────────────────
-option(ENABLE_FUZZING "Enable fuzzing build" OFF)
+# Always built alongside other targets to stay in sync.
+# With libFuzzer: run as ./fuzz_shellgate -runs=N corpus/
+# Without:        echo 'cmd' | ./fuzz_shellgate   (stdin smoke test)
 
-if(ENABLE_FUZZING)
-    find_package(Fuzzer)
-    if(Fuzzer_FOUND)
-        add_executable(fuzz_shellgate_corpus tests/fuzz_shellgate.c)
-        target_link_libraries(fuzz_shellgate_corpus PRIVATE shellgate Fuzzer::Fuzzer)
-        target_include_directories(fuzz_shellgate_corpus PRIVATE
-            ${CMAKE_SOURCE_DIR}/include
-        )
-        target_compile_options(fuzz_shellgate_corpus PRIVATE -fsanitize=address,undefined)
-        target_link_options(fuzz_shellgate_corpus PRIVATE -fsanitize=address,undefined)
-    endif()
+add_executable(fuzz_shellgate tests/fuzz_shellgate.c)
+target_link_libraries(fuzz_shellgate PRIVATE shellgate)
+
+# Try to enable libFuzzer (provides FuzzerMain + coverage-guided mutation)
+# check_c_compiler_flag fails because it links a stub without LLVMFuzzerTestOneInput,
+# so check for the flag directly
+include(CheckCSourceCompiles)
+set(CMAKE_REQUIRED_FLAGS "-fsanitize=fuzzer")
+check_c_source_compiles("int LLVMFuzzerTestOneInput(const char*d,long s){return 0;}" HAS_LIBFUZZER)
+unset(CMAKE_REQUIRED_FLAGS)
+if(HAS_LIBFUZZER)
+    target_compile_options(fuzz_shellgate PRIVATE "-fsanitize=fuzzer")
+    target_link_options(fuzz_shellgate PRIVATE "-fsanitize=fuzzer")
+    target_compile_definitions(fuzz_shellgate PRIVATE HAS_LIBFUZZER)
+    message(STATUS "libFuzzer enabled for fuzz_shellgate")
+else()
+    message(STATUS "libFuzzer not available — fuzz_shellgate uses stdin driver")
 endif()
+
+# Seed corpus: copy tests/corpus/ into build dir for easy access
+add_custom_command(TARGET fuzz_shellgate POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+        ${CMAKE_SOURCE_DIR}/tests/corpus
+        ${CMAKE_BINARY_DIR}/corpus
+    COMMENT "Copying seed corpus to build directory"
+)
