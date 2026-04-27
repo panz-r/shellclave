@@ -1048,8 +1048,8 @@ static bool is_explicit_wildcard(const char *text, st_token_type_t type)
 }
 
 /**
- * Check if pattern B subsumes pattern A.
- * B subsumes A iff every command accepted by A is also accepted by B.
+ * Check if pattern A subsumes pattern B.
+ * Returns true if every command accepted by B is also accepted by A.
  * Requires same length and each token of A compatible with B.
  * For literals, values must match exactly.
  * A classified-literal token (e.g., "-v" typed as-is, classified as OPT)

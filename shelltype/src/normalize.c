@@ -924,17 +924,16 @@ static bool is_branch(const char *token)
 
 static bool is_sha(const char *token)
 {
-    /* SHA/hash digest: 9-64 lowercase hex chars (avoids collision with
-     * is_hex_hash at 8 chars; 7-char falls through to LITERAL). */
+    /* SHA/hash digest: 9-64 lowercase hex chars (a-f only, no A-F).
+     * This distinguishes SHA from HEXHASH which accepts mixed case. */
     size_t len = strlen(token);
     if (len < 9 || len > 64) return false;
-    bool has_alpha = false;
     for (size_t i = 0; i < len; i++) {
         unsigned char c = (unsigned char)token[i];
-        if (!isxdigit(c)) return false;
-        if ((c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) has_alpha = true;
+        /* Must be lowercase hex digit */
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
     }
-    return has_alpha;
+    return true;
 }
 
 static bool is_image(const char *token)
@@ -1387,14 +1386,12 @@ st_token_type_t st_classify_token(const char *token)
     if (is_short_option(token)) return ST_TYPE_SHORTOPT;
     if (is_long_option(token)) return ST_TYPE_LONGOPT;
 
-    /* Hex hash (8+ hex chars with at least one letter, no 0x prefix) -
-     * Check BEFORE SHA so 8-char → HEXHASH, 9+ char → HEXHASH.
-     * SHA is a narrow type (lowercase-only, 9-64) and fires only when
-     * HEXHASH doesn't match (i.e., for lowercase hex with embedded SHA hashes). */
-    if (is_hex_hash(token)) return ST_TYPE_HEXHASH;
-
-    /* SHA/hash digest (9-64 lowercase hex chars) */
+    /* SHA/hash digest (9-64 lowercase hex chars) - checked before hex_hash
+     * so e.g. 40-char sha256 digest -> SHA, not HEXHASH. */
     if (is_sha(token)) return ST_TYPE_SHA;
+
+    /* Hex hash (8+ hex chars with at least one letter, no 0x prefix) */
+    if (is_hex_hash(token)) return ST_TYPE_HEXHASH;
 
     /* User:group specifier (root:docker) - before image (also has colon) */
     if (is_user_group(token)) return ST_TYPE_USER_GROUP;

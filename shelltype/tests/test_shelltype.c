@@ -559,7 +559,9 @@ static int test_normalize_hash(void)
 {
     char **tokens = NULL;
     size_t count = 0;
-    st_error_t err = st_normalize("git show a1b2c3d4e5f6a7b8", &tokens, &count);
+    /* 16-char mixed-case hex (has uppercase) → HEXHASH.
+     * Lowercase-only hex like "deadbeef12345678" → SHA. */
+    st_error_t err = st_normalize("git show A1B2C3D4e5f6a7b8", &tokens, &count);
     ASSERT(err == ST_OK);
     ASSERT(count >= 3);
     ASSERT_STR_EQ(tokens[0], "git");

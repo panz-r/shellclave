@@ -57,7 +57,9 @@ static int test_classify_hexhash_mixed(void)
 
 static int test_classify_hexhash_long(void)
 {
-    ASSERT_TYPE("a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6", ST_TYPE_HEXHASH);
+    /* 32-char lowercase hex → SHA (9-64 lowercase hex is SHA).
+     * Mixed-case hex like "a1B2..." → HEXHASH. */
+    ASSERT_TYPE("a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6", ST_TYPE_SHA);
     return 1;
 }
 
@@ -65,6 +67,29 @@ static int test_classify_hexhash_too_short(void)
 {
     /* 7 hex chars is too short for #h - falls through to LITERAL */
     ASSERT_TYPE("deadbee", ST_TYPE_LITERAL);
+    return 1;
+}
+
+/* --- #sha: SHA digest (lowercase hex, 9-64 chars) --- */
+
+static int test_classify_sha_40(void)
+{
+    /* 40-char lowercase hex (sha256) → SHA (checked before HEXHASH) */
+    ASSERT_TYPE("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", ST_TYPE_SHA);
+    return 1;
+}
+
+static int test_classify_sha_64(void)
+{
+    /* 64-char lowercase hex (sha512) → SHA */
+    ASSERT_TYPE("deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef", ST_TYPE_SHA);
+    return 1;
+}
+
+static int test_classify_sha_reject_hexhash(void)
+{
+    /* 8-char hex → HEXHASH, not SHA (SHA requires 9+ chars) */
+    ASSERT_TYPE("deadbeef", ST_TYPE_HEXHASH);
     return 1;
 }
 
@@ -763,36 +788,6 @@ static int test_classify_sha_short(void)
     return 1;
 }
 
-static int test_classify_sha_40(void)
-{
-    /* 40-char lowercase hex → HEXHASH (is_hex_hash fires before is_sha, covers 8+ chars).
-     * is_sha fires for lowercase-only hex strings in 9-64 range that don't have
-     * uppercase A-F (to distinguish from SHA values that use lowercase). */
-    ASSERT_TYPE("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", ST_TYPE_HEXHASH);
-    return 1;
-}
-
-static int test_classify_sha_64(void)
-{
-    /* 64-char lowercase hex: falls in HEXHASH range (41-64), not SHA (9-40) */
-    ASSERT_TYPE("deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef", ST_TYPE_HEXHASH);
-    return 1;
-}
-
-static int test_classify_sha_reject_short(void)
-{
-    /* 6 chars is too short for SHA */
-    ASSERT_TYPE("abc123", ST_TYPE_LITERAL);
-    return 1;
-}
-
-static int test_classify_sha_reject_allnum(void)
-{
-    /* Pure numeric 7-digit string → NUMBER (not SHA) */
-    ASSERT_TYPE("1234567", ST_TYPE_NUMBER);
-    return 1;
-}
-
 /* ============================================================
  * IMAGE (#image)
  * ============================================================ */
@@ -1203,10 +1198,11 @@ static int test_normalize_typed_hexhash(void)
     st_token_array_t arr;
     arr.tokens = NULL;
     arr.count = 0;
+    /* 16-char lowercase hex → SHA (is_sha fires first for lowercase hex 9-64) */
     st_error_t err = st_normalize_typed("git show deadbeef12345678", &arr);
     ASSERT(err == ST_OK);
     ASSERT(arr.count == 3);
-    ASSERT(arr.tokens[2].type == ST_TYPE_HEXHASH);
+    ASSERT(arr.tokens[2].type == ST_TYPE_SHA);
     st_free_token_array(&arr);
     return 1;
 }
@@ -1453,6 +1449,11 @@ int main(void)
     TEST(test_classify_hexhash_long);
     TEST(test_classify_hexhash_too_short);
 
+    printf("\nClassification - SHA (#sha):\n");
+    TEST(test_classify_sha_40);
+    TEST(test_classify_sha_64);
+    TEST(test_classify_sha_reject_hexhash);  /* 8-char → HEXHASH, not SHA */
+
     printf("\nClassification - Number (#n):\n");
     TEST(test_classify_number_decimal);
     TEST(test_classify_number_negative);
@@ -1591,8 +1592,7 @@ int main(void)
     TEST(test_classify_sha_short);
     TEST(test_classify_sha_40);
     TEST(test_classify_sha_64);
-    TEST(test_classify_sha_reject_short);
-    TEST(test_classify_sha_reject_allnum);
+    TEST(test_classify_sha_reject_hexhash);
 
     printf("\nClassification - Image (#image):\n");
     TEST(test_classify_image_tagged);
