@@ -391,6 +391,11 @@ static char **tokenize_command(const char *raw_cmd, size_t *out_count)
                *p != '|' && *p != '>' && *p != '<' && *p != '&') {
             p++;
         }
+        /* If no characters were consumed (e.g. standalone '&' or other
+         * special char not handled above), treat as single-char token */
+        if (p == start && *p) {
+            p++;
+        }
         tokens[count] = strndup(start, (size_t)(p - start));
         if (!tokens[count]) goto fail;
         count++;

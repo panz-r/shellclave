@@ -74,13 +74,12 @@ int LLVMFuzzerInitialize(int *argc, char ***argv)
     (void)argc;
     (void)argv;
     shared_gate = sg_gate_new();
-    if (shared_gate) {
-        sg_gate_enable_anomaly(shared_gate, 5.0, 0.1, -10.0);
-        /* Disable model updates — fuzz inputs should not pollute the model,
-         * which would cause unbounded hash table growth and OOM */
-        sg_gate_set_anomaly_update_on_non_anomaly(shared_gate, false);
-        train_model(shared_gate);
-    }
+    /* Note: anomaly detection NOT enabled here.  Enabling it causes
+     * unbounded hash table growth from fuzz inputs (each sg_eval call
+     * updates the model).  The fuzzer exercises the parser, tokenizer,
+     * depgraph, abstract type system, and policy evaluation instead.
+     * Anomaly detection fuzzing requires a separate harness with
+     * bounded model lifecycle. */
     return 0;
 }
 
