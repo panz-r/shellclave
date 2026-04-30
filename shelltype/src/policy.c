@@ -947,19 +947,21 @@ size_t st_policy_count(const st_policy_t *policy)
     return policy->pattern_count;
 }
 
-/* ============================================================
- * VERIFICATION + SUGGESTIONS (unified)
- * ============================================================ */
-
-/* Build a pattern string from typed tokens into a fixed-size buffer. */
+/* Build a pattern string from typed tokens into a fixed-size buffer.
+ * 
+ * Special handling for first token: always output as literal to avoid
+ * suggesting wildcards like #p for the command/binary name itself.
+ * e.g., /bin/sh -c 'git diff' should suggest '/bin/sh -c #qs' not '#p -c #qs' */
 static bool st_build_pattern(char *buf, size_t buf_size,
                                  const st_token_t *tokens, size_t count)
 {
     size_t total_len = 0;
     for (size_t i = 0; i < count; i++) {
-        const char *part = tokens[i].type == ST_TYPE_LITERAL
-            ? tokens[i].text
-            : st_type_symbol[tokens[i].type];
+        /* First token (command/binary) is always output as literal */
+        const char *part = (i == 0) ? tokens[i].text
+                                     : (tokens[i].type == ST_TYPE_LITERAL
+                                            ? tokens[i].text
+                                            : st_type_symbol[tokens[i].type]);
         total_len += strlen(part) + (i > 0 ? 1 : 0);
     }
     if (total_len + 1 > buf_size) return false;
@@ -967,9 +969,11 @@ static bool st_build_pattern(char *buf, size_t buf_size,
     char *p = buf;
     for (size_t i = 0; i < count; i++) {
         if (i > 0) *p++ = ' ';
-        const char *part = tokens[i].type == ST_TYPE_LITERAL
-            ? tokens[i].text
-            : st_type_symbol[tokens[i].type];
+        /* First token (command/binary) is always output as literal */
+        const char *part = (i == 0) ? tokens[i].text
+                                    : (tokens[i].type == ST_TYPE_LITERAL
+                                           ? tokens[i].text
+                                           : st_type_symbol[tokens[i].type]);
         size_t len = strlen(part);
         memcpy(p, part, len);
         p += len;
