@@ -16,6 +16,14 @@ add_compile_options(-Wall -Wextra -Wpedantic)
 # ── Dependencies ──────────────────────────────────────────────
 set(SHELLSPLIT_DIR   ${CMAKE_SOURCE_DIR}/../shellsplit)
 set(SHELLTYPE_DIR    ${CMAKE_SOURCE_DIR}/../shelltype)
+set(DRAUGR_DIR       ${CMAKE_SOURCE_DIR}/../draugr)
+set(XXHASH_DIR       ${CMAKE_SOURCE_DIR}/../vendor/xxhash)
+
+add_subdirectory(${DRAUGR_DIR} ${CMAKE_BINARY_DIR}/draugr)
+
+add_library(xxhash STATIC ${XXHASH_DIR}/xxhash.c)
+target_include_directories(xxhash PUBLIC ${XXHASH_DIR})
+target_compile_definitions(xxhash PRIVATE XXH_STATIC_LINKING_ONLY)
 
 # shellsplit: fast tokenizer + depgraph (zero alloc) + full tokenizer + abstract
 add_library(shellsplit_gate STATIC
@@ -46,9 +54,10 @@ add_library(shellgate STATIC
 )
 target_include_directories(shellgate PUBLIC
     ${CMAKE_SOURCE_DIR}/include
-    ${CMAKE_SOURCE_DIR}/include
+    ${DRAUGR_DIR}/include
+    ${XXHASH_DIR}
 )
-target_link_libraries(shellgate PUBLIC shellsplit_gate shelltype_gate)
+target_link_libraries(shellgate PUBLIC shellsplit_gate shelltype_gate draugr xxhash)
 
 # ── Tests ─────────────────────────────────────────────────────
 enable_testing()

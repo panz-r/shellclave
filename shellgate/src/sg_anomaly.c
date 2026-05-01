@@ -18,6 +18,9 @@
  */
 
 #include "sg_anomaly.h"
+#include <draugr/ht.h>
+#define XXH_STATIC_LINKING_ONLY
+#include <xxhash.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -26,163 +29,37 @@
 #include <stdint.h>
 
 /* ============================================================
- * HASH MAP WITH LENGTH-PREFIXED KEYS
+ * COUNT TABLE HELPERS (wrapping draugr ht_table_t)
  *
- * Open-addressing with power-of-2 capacity and linear probing.
- * Keys are stored as owned length-prefixed blobs (not null-terminated strings).
- * hash_inc returns false if allocation failed or table is full.
+ * Maps byte[] key -> int64_t count using Robin-Hood probing with
+ * graveyard tombstones. Hash via xxhash3.
  * ============================================================ */
 
-#define HASH_LOAD 0.75
-
-typedef struct {
-    char   *key_data;   /* owned length-prefixed key (key_len bytes, no extra NUL) */
-    size_t  key_len;     /* length of key_data */
-    size_t  count;      /* observation count */
-} hash_entry_t;
-
-typedef struct {
-    hash_entry_t *entries;
-    size_t       capacity;  /* power of 2 */
-    size_t       len;      /* occupied entries */
-    size_t       total;    /* sum of all counts (for backoff) */
-} hash_t;
-
-/* MurmurHash3 64-bit finalizer */
-static uint64_t fmix64(uint64_t h)
-{
-    h ^= h >> 33;
-    h *= 0xff51afd7ed558ccdULL;
-    h ^= h >> 33;
-    h *= 0xc4ceb9fe1a85ec53ULL;
-    h ^= h >> 33;
-    return h;
+static uint64_t anomaly_hash_fn(const void *key, size_t key_len, void *user_ctx) {
+    (void)user_ctx;
+    return XXH3_64bits(key, key_len);
 }
 
-/* Hash a length-prefixed key */
-static uint64_t hash_key_bytes(const char *key, size_t key_len, size_t cap)
-{
-    uint64_t h = 0xcbf29ce484222325ULL;
-    for (size_t i = 0; i < key_len; i++) {
-        h ^= (uint8_t)key[i];
-        h *= 0x100000001b3ULL;
-    }
-    return fmix64(h) & (cap - 1);
+static ht_table_t *count_table_create(void) {
+    return ht_create(NULL, anomaly_hash_fn, NULL, NULL);
 }
 
-/* Compare two length-prefixed keys (no null-terminator needed) */
-static bool hash_key_eq(const char *a, size_t a_len, const char *b, size_t b_len)
-{
-    if (a_len != b_len) return false;
-    return memcmp(a, b, a_len) == 0;
-}
-
-static size_t hash_get(const hash_t *h, const char *key, size_t key_len)
-{
-    if (h->capacity == 0) return 0;
-    size_t pos = hash_key_bytes(key, key_len, h->capacity);
-    for (size_t probe = 0; probe < h->capacity; probe++) {
-        size_t idx = (pos + probe) & (h->capacity - 1);
-        hash_entry_t *e = &h->entries[idx];
-        if (e->key_data == NULL) return 0;
-        if (hash_key_eq(e->key_data, e->key_len, key, key_len)) return e->count;
-    }
-    return 0;
-}
-
-static bool hash_grow(hash_t *h)
-{
-    size_t new_cap = h->capacity == 0 ? 16 : h->capacity * 2;
-    hash_entry_t *new_entries = calloc(new_cap, sizeof(new_entries[0]));
-    if (!new_entries) return false;
-
-    for (size_t i = 0; i < h->capacity; i++) {
-        hash_entry_t *e = &h->entries[i];
-        if (e->key_data == NULL) continue;
-        size_t pos = hash_key_bytes(e->key_data, e->key_len, new_cap);
-        for (size_t probe = 0; probe < new_cap; probe++) {
-            size_t idx = (pos + probe) & (new_cap - 1);
-            if (new_entries[idx].key_data == NULL) {
-                new_entries[idx].key_data = malloc(e->key_len);
-                if (!new_entries[idx].key_data) {
-                    /* Partial growth - free what we allocated and fail */
-                    for (size_t j = 0; j < new_cap; j++) free(new_entries[j].key_data);
-                    free(new_entries);
-                    return false;
-                }
-                memcpy(new_entries[idx].key_data, e->key_data, e->key_len);
-                new_entries[idx].key_len = e->key_len;
-                new_entries[idx].count = e->count;
-                break;
-            }
-        }
-    }
-    for (size_t i = 0; i < h->capacity; i++) free(h->entries[i].key_data);
-    free(h->entries);
-    h->entries = new_entries;
-    h->capacity = new_cap;
+static bool count_inc(ht_table_t *t, const char *key, size_t key_len,
+                       int64_t inc, size_t *total) {
+    uint64_t hash = anomaly_hash_fn(key, key_len, NULL);
+    bool ok;
+    ht_inc_with_hash(t, hash, key, key_len, inc, &ok);
+    if (!ok) return false;
+    *total += (size_t)inc;
     return true;
 }
 
-static void hash_free(hash_t *h)
-{
-    if (!h) return;
-    for (size_t i = 0; i < h->capacity; i++) {
-        free(h->entries[i].key_data);
-    }
-    free(h->entries);
-    h->entries = NULL;
-    h->capacity = 0;
-    h->len = 0;
-    h->total = 0;
-}
-
-static void hash_init(hash_t *h)
-{
-    h->entries = NULL;
-    h->capacity = 0;
-    h->len = 0;
-    h->total = 0;
-}
-
-/*
- * Returns false if:
- *   - allocation failed (OOM), or
- *   - table is full (no empty slot found after probing all capacity entries)
- * On false return, the caller should set model->oom.
- */
-static bool hash_inc(hash_t *h, const char *key, size_t key_len, size_t inc)
-{
-    if (h->capacity == 0) {
-        if (!hash_grow(h)) return false;
-    }
-
-    if (h->len + 1 > (size_t)((double)h->capacity * HASH_LOAD)) {
-        if (!hash_grow(h)) { /* continue on failure */ }
-    }
-
-    size_t pos = hash_key_bytes(key, key_len, h->capacity);
-    for (size_t probe = 0; probe < h->capacity; probe++) {
-        size_t idx = (pos + probe) & (h->capacity - 1);
-        hash_entry_t *e = &h->entries[idx];
-        if (e->key_data == NULL) {
-            e->key_data = malloc(key_len);
-            if (!e->key_data) return false;
-            memcpy(e->key_data, key, key_len);
-            e->key_len = key_len;
-            e->count = inc;
-            h->len++;
-            h->total += inc;
-            return true;
-        }
-        if (hash_key_eq(e->key_data, e->key_len, key, key_len)) {
-            e->count += inc;
-            h->total += inc;
-            return true;
-        }
-    }
-    /* Table full — no empty slot found */
-    return false;
+static size_t count_get(const ht_table_t *t, const char *key, size_t key_len) {
+    size_t val_len = 0;
+    const void *found = ht_find(t, key, key_len, &val_len);
+    if (found && val_len == sizeof(int64_t))
+        return (size_t)(*(const int64_t *)found);
+    return 0;
 }
 
 /* ============================================================
@@ -324,13 +201,13 @@ static size_t extract_4gram_ctx_len(const char *key, size_t max_len)
  * ============================================================ */
 
 struct sg_anomaly_model {
-    hash_t   uni;         /* unigram counts */
-    hash_t   bi;          /* bigram counts: key = "prev\0curr" */
-    hash_t   tri;         /* trigram counts: key = "p2\0p1\0curr" */
-    hash_t   quad;        /* 4-gram counts: key = "p3\0p2\0p1\0curr" */
-    hash_t   bi_ctx;      /* bigram context totals: key = "prev\0", value = sum */
-    hash_t   tri_ctx;     /* trigram context totals: key = "p2\0p1\0", value = sum */
-    hash_t   quad_ctx;    /* 4-gram context totals: key = "p3\0p2\0p1\0", value = sum */
+    ht_table_t *uni;         /* unigram counts */
+    ht_table_t *bi;          /* bigram counts: key = "prev\0curr" */
+    ht_table_t *tri;         /* trigram counts: key = "p2\0p1\0curr" */
+    ht_table_t *quad;        /* 4-gram counts: key = "p3\0p2\0p1\0curr" */
+    ht_table_t *bi_ctx;      /* bigram context totals: key = "prev\0", value = sum */
+    ht_table_t *tri_ctx;     /* trigram context totals: key = "p2\0p1\0", value = sum */
+    ht_table_t *quad_ctx;    /* 4-gram context totals: key = "p3\0p2\0p1\0", value = sum */
     size_t   total_uni;
     size_t   total_bi;
     size_t   total_tri;
@@ -357,26 +234,35 @@ sg_anomaly_model_t *sg_anomaly_model_new_ex(double alpha, double unk_prior)
     m->kn_discount = 0.5;
     m->vocab_size = 0;
     m->oom = false;
-    hash_init(&m->uni);
-    hash_init(&m->bi);
-    hash_init(&m->tri);
-    hash_init(&m->quad);
-    hash_init(&m->bi_ctx);
-    hash_init(&m->tri_ctx);
-    hash_init(&m->quad_ctx);
+    m->uni     = count_table_create();
+    m->bi      = count_table_create();
+    m->tri     = count_table_create();
+    m->quad    = count_table_create();
+    m->bi_ctx  = count_table_create();
+    m->tri_ctx = count_table_create();
+    m->quad_ctx = count_table_create();
+    if (!m->uni || !m->bi || !m->tri || !m->quad ||
+        !m->bi_ctx || !m->tri_ctx || !m->quad_ctx) {
+        ht_destroy(m->uni);     ht_destroy(m->bi);
+        ht_destroy(m->tri);     ht_destroy(m->quad);
+        ht_destroy(m->bi_ctx);  ht_destroy(m->tri_ctx);
+        ht_destroy(m->quad_ctx);
+        free(m);
+        return NULL;
+    }
     return m;
 }
 
 void sg_anomaly_model_free(sg_anomaly_model_t *model)
 {
     if (!model) return;
-    hash_free(&model->uni);
-    hash_free(&model->bi);
-    hash_free(&model->tri);
-    hash_free(&model->quad);
-    hash_free(&model->bi_ctx);
-    hash_free(&model->tri_ctx);
-    hash_free(&model->quad_ctx);
+    ht_destroy(model->uni);
+    ht_destroy(model->bi);
+    ht_destroy(model->tri);
+    ht_destroy(model->quad);
+    ht_destroy(model->bi_ctx);
+    ht_destroy(model->tri_ctx);
+    ht_destroy(model->quad_ctx);
     free(model);
 }
 
@@ -391,10 +277,10 @@ void sg_anomaly_model_clear_error(sg_anomaly_model_t *model)
 }
 
 /* ============================================================
- * PROBABILITY CALCULATION — Kneser-Ney with 4-gram backoff
+ * PROBABILITY CALCULATION - Kneser-Ney with 4-gram backoff
  *
  * Compute log P(curr | p3, p2, p1) in bits using KN discounting.
- * Backoff chain: 4-gram → trigram → bigram → unigram → UNK.
+ * Backoff chain: 4-gram -> trigram -> bigram -> unigram -> UNK.
  *
  * KN formula (for each n-gram level):
  *   P_KN(w | ctx) = max(0, c(ctx,w) - D) / c(ctx)
@@ -421,14 +307,18 @@ static double unk_logprob(const sg_anomaly_model_t *m)
  * This scans the hash table for entries whose key starts with ctx.
  * Used for KN discount weight computation.
  * For large tables this is O(n); acceptable for anomaly model sizes. */
-static size_t count_unique_continuations(const hash_t *h,
+static size_t count_unique_continuations(const ht_table_t *t,
                                           const char *ctx, size_t ctx_len)
 {
     size_t count = 0;
-    for (size_t i = 0; i < h->capacity; i++) {
-        if (h->entries[i].key_data == NULL) continue;
-        if (h->entries[i].key_len < ctx_len) continue;
-        if (memcmp(h->entries[i].key_data, ctx, ctx_len) == 0)
+    ht_iter_t iter = ht_iter_begin(t);
+    const void *key;
+    size_t key_len;
+    const void *val;
+    size_t val_len;
+    while (ht_iter_next((ht_table_t *)t, &iter, &key, &key_len, &val, &val_len)) {
+        if (key_len < ctx_len) continue;
+        if (memcmp(key, ctx, ctx_len) == 0)
             count++;
     }
     return count;
@@ -446,7 +336,7 @@ static size_t count_unique_continuations(const hash_t *h,
  */
 static double kn_level_logprob(const sg_anomaly_model_t *m,
                                 size_t n_count, size_t ctx_total,
-                                const hash_t *n_table,
+                                const ht_table_t *n_table,
                                 const char *ctx, size_t ctx_len,
                                 double lower_logprob)
 {
@@ -466,7 +356,7 @@ static double kn_level_logprob(const sg_anomaly_model_t *m,
 
     /* Combined probability */
     double p_observed = disc_count / (double)ctx_total;
-    double p_lower = lambda * exp(lower_logprob * M_LN2);  /* convert bits→prob */
+    double p_lower = lambda * exp(lower_logprob * M_LN2);  /* convert bits->prob */
 
     double p_total = p_observed + p_lower;
     if (p_total <= 0) return unk_logprob(m);
@@ -482,7 +372,7 @@ static double kn_logprob(const sg_anomaly_model_t *m,
     size_t key_len, ctx_len;
 
     /* === Level 1: Unigram (base) === */
-    size_t uni_count = hash_get(&m->uni, curr, strlen(curr) + 1);
+    size_t uni_count = count_get(m->uni, curr, strlen(curr) + 1);
     double unigram_lp;
     if (uni_count > 0) {
         double denom = (double)m->total_uni + m->alpha * (double)m->vocab_size;
@@ -494,41 +384,41 @@ static double kn_logprob(const sg_anomaly_model_t *m,
 
     /* === Level 2: Bigram === */
     key_len = build_bigram_key(key, sizeof(key), p1, curr);
-    size_t bi_count = key_len > 0 ? hash_get(&m->bi, key, key_len) : 0;
+    size_t bi_count = key_len > 0 ? count_get(m->bi, key, key_len) : 0;
     double bigram_lp;
     if (bi_count > 0) {
         ctx_len = build_bigram_ctx(ctx, sizeof(ctx), p1);
-        size_t bi_ctx_total = ctx_len > 0 ? hash_get(&m->bi_ctx, ctx, ctx_len) : 0;
+        size_t bi_ctx_total = ctx_len > 0 ? count_get(m->bi_ctx, ctx, ctx_len) : 0;
         if (bi_ctx_total == 0) bi_ctx_total = bi_count;
         bigram_lp = kn_level_logprob(m, bi_count, bi_ctx_total,
-                                      &m->bi, ctx, ctx_len, unigram_lp);
+                                      m->bi, ctx, ctx_len, unigram_lp);
     } else {
         bigram_lp = unigram_lp;
     }
 
     /* === Level 3: Trigram === */
     key_len = build_trigram_key(key, sizeof(key), p2, p1, curr);
-    size_t tri_count = key_len > 0 ? hash_get(&m->tri, key, key_len) : 0;
+    size_t tri_count = key_len > 0 ? count_get(m->tri, key, key_len) : 0;
     double trigram_lp;
     if (tri_count > 0) {
         ctx_len = build_trigram_ctx(ctx, sizeof(ctx), p2, p1);
-        size_t tri_ctx_total = ctx_len > 0 ? hash_get(&m->tri_ctx, ctx, ctx_len) : 0;
+        size_t tri_ctx_total = ctx_len > 0 ? count_get(m->tri_ctx, ctx, ctx_len) : 0;
         if (tri_ctx_total == 0) tri_ctx_total = tri_count;
         trigram_lp = kn_level_logprob(m, tri_count, tri_ctx_total,
-                                       &m->tri, ctx, ctx_len, bigram_lp);
+                                       m->tri, ctx, ctx_len, bigram_lp);
     } else {
         trigram_lp = bigram_lp;
     }
 
     /* === Level 4: 4-gram === */
     key_len = build_4gram_key(key, sizeof(key), p3, p2, p1, curr);
-    size_t quad_count = key_len > 0 ? hash_get(&m->quad, key, key_len) : 0;
+    size_t quad_count = key_len > 0 ? count_get(m->quad, key, key_len) : 0;
     if (quad_count > 0) {
         ctx_len = build_4gram_ctx(ctx, sizeof(ctx), p3, p2, p1);
-        size_t quad_ctx_total = ctx_len > 0 ? hash_get(&m->quad_ctx, ctx, ctx_len) : 0;
+        size_t quad_ctx_total = ctx_len > 0 ? count_get(m->quad_ctx, ctx, ctx_len) : 0;
         if (quad_ctx_total == 0) quad_ctx_total = quad_count;
         return kn_level_logprob(m, quad_count, quad_ctx_total,
-                                 &m->quad, ctx, ctx_len, trigram_lp);
+                                 m->quad, ctx, ctx_len, trigram_lp);
     }
 
     return trigram_lp;
@@ -576,7 +466,7 @@ double sg_anomaly_score(const sg_anomaly_model_t *model,
  * Note: sg_anomaly_score() returns INFINITY for sequences with
  * len < 3 (cannot form any trigrams). However, this update
  * function still adds unigrams and bigrams for shorter sequences.
- * This is intentional — the model learns from partial sequences.
+ * This is intentional -- the model learns from partial sequences.
  * ============================================================ */
 
 void sg_anomaly_update(sg_anomaly_model_t *model,
@@ -584,20 +474,24 @@ void sg_anomaly_update(sg_anomaly_model_t *model,
 {
     if (!model || !seq || len == 0) return;
 
+    /* Dummy total for context tables (we don't track their totals separately) */
+    size_t _ctx_total = 0;
+    (void)_ctx_total;
+
     /* Update unigrams */
     for (size_t i = 0; i < len; i++) {
         size_t cmd_len = strlen(seq[i]) + 1;
         /* Check if command is already known */
-        size_t existing = hash_get(&model->uni, seq[i], cmd_len);
+        size_t existing = count_get(model->uni, seq[i], cmd_len);
         if (existing > 0) {
             /* Known command - increment normally */
-            if (!hash_inc(&model->uni, seq[i], cmd_len, 1))
+            if (!count_inc(model->uni, seq[i], cmd_len, 1, &model->total_uni))
                 model->oom = true;
         } else {
             /* New command - increment UNK count */
             model->unk_count++;
             /* Also add to vocabulary (promote after first sighting) */
-            if (!hash_inc(&model->uni, seq[i], cmd_len, 1))
+            if (!count_inc(model->uni, seq[i], cmd_len, 1, &model->total_uni))
                 model->oom = true;
         }
     }
@@ -607,12 +501,12 @@ void sg_anomaly_update(sg_anomaly_model_t *model,
         char key[512];
         size_t key_len = build_bigram_key(key, sizeof(key), seq[i-1], seq[i]);
         if (key_len > 0) {
-            if (!hash_inc(&model->bi, key, key_len, 1))
+            if (!count_inc(model->bi, key, key_len, 1, &model->total_bi))
                 model->oom = true;
             char ctx[256];
             size_t ctx_len = build_bigram_ctx(ctx, sizeof(ctx), seq[i-1]);
             if (ctx_len > 0) {
-                if (!hash_inc(&model->bi_ctx, ctx, ctx_len, 1))
+                if (!count_inc(model->bi_ctx, ctx, ctx_len, 1, &_ctx_total))
                     model->oom = true;
             }
         }
@@ -623,12 +517,12 @@ void sg_anomaly_update(sg_anomaly_model_t *model,
         char key[1024];
         size_t key_len = build_trigram_key(key, sizeof(key), seq[i-2], seq[i-1], seq[i]);
         if (key_len > 0) {
-            if (!hash_inc(&model->tri, key, key_len, 1))
+            if (!count_inc(model->tri, key, key_len, 1, &model->total_tri))
                 model->oom = true;
             char ctx[512];
             size_t ctx_len = build_trigram_ctx(ctx, sizeof(ctx), seq[i-2], seq[i-1]);
             if (ctx_len > 0) {
-                if (!hash_inc(&model->tri_ctx, ctx, ctx_len, 1))
+                if (!count_inc(model->tri_ctx, ctx, ctx_len, 1, &_ctx_total))
                     model->oom = true;
             }
         }
@@ -640,27 +534,23 @@ void sg_anomaly_update(sg_anomaly_model_t *model,
         size_t key_len = build_4gram_key(key, sizeof(key),
                                           seq[i-3], seq[i-2], seq[i-1], seq[i]);
         if (key_len > 0) {
-            if (!hash_inc(&model->quad, key, key_len, 1))
+            if (!count_inc(model->quad, key, key_len, 1, &model->total_quad))
                 model->oom = true;
             char ctx[1024];
             size_t ctx_len = build_4gram_ctx(ctx, sizeof(ctx),
                                               seq[i-3], seq[i-2], seq[i-1]);
             if (ctx_len > 0) {
-                if (!hash_inc(&model->quad_ctx, ctx, ctx_len, 1))
+                if (!count_inc(model->quad_ctx, ctx, ctx_len, 1, &_ctx_total))
                     model->oom = true;
             }
         }
     }
 
-    model->total_uni  = model->uni.total;
-    model->total_bi  = model->bi.total;
-    model->total_tri = model->tri.total;
-    model->total_quad = model->quad.total;
-    model->vocab_size = model->uni.len;
+    model->vocab_size = ht_size(model->uni);
 }
 
 /* ============================================================
- * SERIALISATION — Binary Format v3
+ * SERIALISATION - Binary Format v3
  *
  * Header (text, for easy inspection):
  *   # anomaly-model-v3\n
@@ -673,13 +563,36 @@ void sg_anomaly_update(sg_anomaly_model_t *model,
  *   uint64_t count;
  *   uint8_t  nl;          // '\n'
  *
- * bi_ctx and tri_ctx totals are NOT serialised — rebuilt from bi/tri on load.
+ * bi_ctx and tri_ctx totals are NOT serialised -- rebuilt from bi/tri on load.
  * ============================================================ */
 
 #define BINARY_TYPE_UNI   1
 #define BINARY_TYPE_BI    2
 #define BINARY_TYPE_TRI   3
 #define BINARY_TYPE_QUAD  4
+
+static int save_table(FILE *f, ht_table_t *t, uint8_t type)
+{
+    ht_iter_t iter = ht_iter_begin(t);
+    const void *key;
+    size_t key_len;
+    const void *val;
+    size_t val_len;
+    uint8_t nl = '\n';
+    while (ht_iter_next(t, &iter, &key, &key_len, &val, &val_len)) {
+        if (val_len != sizeof(int64_t)) continue;
+        int64_t count_i64 = *(const int64_t *)val;
+        uint32_t kl = (uint32_t)key_len;
+        uint64_t count_u64 = (uint64_t)count_i64;
+        if (fwrite(&type, 1, 1, f) != 1 ||
+            fwrite(&kl, 4, 1, f) != 1 ||
+            fwrite(key, 1, kl, f) != kl ||
+            fwrite(&count_u64, 8, 1, f) != 1 ||
+            fwrite(&nl, 1, 1, f) != 1)
+            return -1;
+    }
+    return 0;
+}
 
 int sg_anomaly_save(const sg_anomaly_model_t *model, const char *path)
 {
@@ -694,72 +607,12 @@ int sg_anomaly_save(const sg_anomaly_model_t *model, const char *path)
             model->total_uni, model->total_bi, model->total_tri,
             model->total_quad, model->vocab_size, model->unk_count);
 
-    /* Write unigrams */
-    for (size_t i = 0; i < model->uni.capacity; i++) {
-        if (model->uni.entries[i].key_data == NULL) continue;
-        uint8_t type = BINARY_TYPE_UNI;
-        uint32_t key_len = (uint32_t)model->uni.entries[i].key_len;
-        uint64_t count = (uint64_t)model->uni.entries[i].count;
-        uint8_t nl = '\n';
-        if (fwrite(&type, 1, 1, f) != 1 ||
-            fwrite(&key_len, 4, 1, f) != 1 ||
-            fwrite(model->uni.entries[i].key_data, 1, key_len, f) != key_len ||
-            fwrite(&count, 8, 1, f) != 1 ||
-            fwrite(&nl, 1, 1, f) != 1) {
-            fclose(f);
-            return -1;
-        }
-    }
-
-    /* Write bigrams */
-    for (size_t i = 0; i < model->bi.capacity; i++) {
-        if (model->bi.entries[i].key_data == NULL) continue;
-        uint8_t type = BINARY_TYPE_BI;
-        uint32_t key_len = (uint32_t)model->bi.entries[i].key_len;
-        uint64_t count = (uint64_t)model->bi.entries[i].count;
-        uint8_t nl = '\n';
-        if (fwrite(&type, 1, 1, f) != 1 ||
-            fwrite(&key_len, 4, 1, f) != 1 ||
-            fwrite(model->bi.entries[i].key_data, 1, key_len, f) != key_len ||
-            fwrite(&count, 8, 1, f) != 1 ||
-            fwrite(&nl, 1, 1, f) != 1) {
-            fclose(f);
-            return -1;
-        }
-    }
-
-    /* Write trigrams */
-    for (size_t i = 0; i < model->tri.capacity; i++) {
-        if (model->tri.entries[i].key_data == NULL) continue;
-        uint8_t type = BINARY_TYPE_TRI;
-        uint32_t key_len = (uint32_t)model->tri.entries[i].key_len;
-        uint64_t count = (uint64_t)model->tri.entries[i].count;
-        uint8_t nl = '\n';
-        if (fwrite(&type, 1, 1, f) != 1 ||
-            fwrite(&key_len, 4, 1, f) != 1 ||
-            fwrite(model->tri.entries[i].key_data, 1, key_len, f) != key_len ||
-            fwrite(&count, 8, 1, f) != 1 ||
-            fwrite(&nl, 1, 1, f) != 1) {
-            fclose(f);
-            return -1;
-        }
-    }
-
-    /* Write 4-grams */
-    for (size_t i = 0; i < model->quad.capacity; i++) {
-        if (model->quad.entries[i].key_data == NULL) continue;
-        uint8_t type = BINARY_TYPE_QUAD;
-        uint32_t key_len = (uint32_t)model->quad.entries[i].key_len;
-        uint64_t count = (uint64_t)model->quad.entries[i].count;
-        uint8_t nl = '\n';
-        if (fwrite(&type, 1, 1, f) != 1 ||
-            fwrite(&key_len, 4, 1, f) != 1 ||
-            fwrite(model->quad.entries[i].key_data, 1, key_len, f) != key_len ||
-            fwrite(&count, 8, 1, f) != 1 ||
-            fwrite(&nl, 1, 1, f) != 1) {
-            fclose(f);
-            return -1;
-        }
+    if (save_table(f, model->uni, BINARY_TYPE_UNI) < 0 ||
+        save_table(f, model->bi, BINARY_TYPE_BI) < 0 ||
+        save_table(f, model->tri, BINARY_TYPE_TRI) < 0 ||
+        save_table(f, model->quad, BINARY_TYPE_QUAD) < 0) {
+        fclose(f);
+        return -1;
     }
 
     fclose(f);
@@ -770,13 +623,13 @@ int sg_anomaly_load(sg_anomaly_model_t *model, const char *path)
 {
     if (!model || !path) { errno = EINVAL; return -1; }
 
-    hash_free(&model->uni);
-    hash_free(&model->bi);
-    hash_free(&model->tri);
-    hash_free(&model->quad);
-    hash_free(&model->bi_ctx);
-    hash_free(&model->tri_ctx);
-    hash_free(&model->quad_ctx);
+    ht_destroy(model->uni);
+    ht_destroy(model->bi);
+    ht_destroy(model->tri);
+    ht_destroy(model->quad);
+    ht_destroy(model->bi_ctx);
+    ht_destroy(model->tri_ctx);
+    ht_destroy(model->quad_ctx);
     model->total_uni = 0;
     model->total_bi = 0;
     model->total_tri = 0;
@@ -784,13 +637,13 @@ int sg_anomaly_load(sg_anomaly_model_t *model, const char *path)
     model->vocab_size = 0;
     model->unk_count = 0;
     model->oom = false;
-    hash_init(&model->uni);
-    hash_init(&model->bi);
-    hash_init(&model->tri);
-    hash_init(&model->quad);
-    hash_init(&model->bi_ctx);
-    hash_init(&model->tri_ctx);
-    hash_init(&model->quad_ctx);
+    model->uni     = count_table_create();
+    model->bi      = count_table_create();
+    model->tri     = count_table_create();
+    model->quad    = count_table_create();
+    model->bi_ctx  = count_table_create();
+    model->tri_ctx = count_table_create();
+    model->quad_ctx = count_table_create();
 
     FILE *f = fopen(path, "rb");
     if (!f) return -1;
@@ -812,8 +665,9 @@ int sg_anomaly_load(sg_anomaly_model_t *model, const char *path)
             if (n >= 2) { model->alpha = alpha; model->unk_prior = unk_prior; }
             if (n >= 3 && kn_discount > 0) model->kn_discount = kn_discount;
             if (n >= 7) {
-                model->total_uni = tu; model->total_bi = tb;
-                model->total_tri = tt; model->total_quad = tq;
+                /* Totals are rebuilt from binary entries by count_inc;
+                 * just keep vocab_size from header. */
+                (void)tu; (void)tb; (void)tt; (void)tq;
                 model->vocab_size = vocab;
             }
             if (n >= 9) {
@@ -821,6 +675,10 @@ int sg_anomaly_load(sg_anomaly_model_t *model, const char *path)
             }
         }
     }
+
+    /* Dummy total for context table increments during load */
+    size_t _ctx_total = 0;
+    (void)_ctx_total;
 
     /* Read binary entries */
     while (1) {
@@ -841,27 +699,34 @@ int sg_anomaly_load(sg_anomaly_model_t *model, const char *path)
         if (fread(&nl, 1, 1, f) != 1) break;
 
         if (type == BINARY_TYPE_UNI) {
-            if (!hash_inc(&model->uni, keybuf, key_len, (size_t)count)) model->oom = true;
+            if (!count_inc(model->uni, keybuf, key_len, (int64_t)count, &model->total_uni))
+                model->oom = true;
         } else if (type == BINARY_TYPE_BI) {
-            if (!hash_inc(&model->bi, keybuf, key_len, (size_t)count)) model->oom = true;
+            if (!count_inc(model->bi, keybuf, key_len, (int64_t)count, &model->total_bi))
+                model->oom = true;
             /* Rebuild bigram context total */
             size_t ctx_len = extract_bigram_ctx_len(keybuf, key_len);
             if (ctx_len > 0) {
-                if (!hash_inc(&model->bi_ctx, keybuf, ctx_len, (size_t)count)) model->oom = true;
+                if (!count_inc(model->bi_ctx, keybuf, ctx_len, (int64_t)count, &_ctx_total))
+                    model->oom = true;
             }
         } else if (type == BINARY_TYPE_TRI) {
-            if (!hash_inc(&model->tri, keybuf, key_len, (size_t)count)) model->oom = true;
+            if (!count_inc(model->tri, keybuf, key_len, (int64_t)count, &model->total_tri))
+                model->oom = true;
             /* Rebuild trigram context total */
             size_t ctx_len = extract_trigram_ctx_len(keybuf, key_len);
             if (ctx_len > 0) {
-                if (!hash_inc(&model->tri_ctx, keybuf, ctx_len, (size_t)count)) model->oom = true;
+                if (!count_inc(model->tri_ctx, keybuf, ctx_len, (int64_t)count, &_ctx_total))
+                    model->oom = true;
             }
         } else if (type == BINARY_TYPE_QUAD) {
-            if (!hash_inc(&model->quad, keybuf, key_len, (size_t)count)) model->oom = true;
+            if (!count_inc(model->quad, keybuf, key_len, (int64_t)count, &model->total_quad))
+                model->oom = true;
             /* Rebuild 4-gram context total */
             size_t ctx_len = extract_4gram_ctx_len(keybuf, key_len);
             if (ctx_len > 0) {
-                if (!hash_inc(&model->quad_ctx, keybuf, ctx_len, (size_t)count)) model->oom = true;
+                if (!count_inc(model->quad_ctx, keybuf, ctx_len, (int64_t)count, &_ctx_total))
+                    model->oom = true;
             }
         }
     }
@@ -876,7 +741,7 @@ int sg_anomaly_load(sg_anomaly_model_t *model, const char *path)
 
 size_t sg_anomaly_vocab_size(const sg_anomaly_model_t *model)
 {
-    return model ? model->uni.len : 0;
+    return model ? ht_size(model->uni) : 0;
 }
 
 size_t sg_anomaly_total_uni(const sg_anomaly_model_t *model)
@@ -903,7 +768,7 @@ size_t sg_anomaly_uni_count(const sg_anomaly_model_t *model, const char *cmd)
 {
     if (!model || !cmd) return 0;
     size_t cmd_len = strlen(cmd) + 1;
-    return hash_get(&model->uni, cmd, cmd_len);
+    return count_get(model->uni, cmd, cmd_len);
 }
 
 size_t sg_anomaly_unk_count(const sg_anomaly_model_t *model)
@@ -922,7 +787,7 @@ size_t sg_anomaly_bi_count(const sg_anomaly_model_t *model,
     if (!model || !prev || !curr) return 0;
     char key[1024];
     size_t key_len = build_bigram_key(key, sizeof(key), prev, curr);
-    return key_len > 0 ? hash_get(&model->bi, key, key_len) : 0;
+    return key_len > 0 ? count_get(model->bi, key, key_len) : 0;
 }
 
 size_t sg_anomaly_tri_count(const sg_anomaly_model_t *model,
@@ -931,7 +796,7 @@ size_t sg_anomaly_tri_count(const sg_anomaly_model_t *model,
     if (!model || !p2 || !p1 || !curr) return 0;
     char key[1024];
     size_t key_len = build_trigram_key(key, sizeof(key), p2, p1, curr);
-    return key_len > 0 ? hash_get(&model->tri, key, key_len) : 0;
+    return key_len > 0 ? count_get(model->tri, key, key_len) : 0;
 }
 
 size_t sg_anomaly_quad_count(const sg_anomaly_model_t *model,
@@ -941,13 +806,13 @@ size_t sg_anomaly_quad_count(const sg_anomaly_model_t *model,
     if (!model || !p3 || !p2 || !p1 || !curr) return 0;
     char key[2048];
     size_t key_len = build_4gram_key(key, sizeof(key), p3, p2, p1, curr);
-    return key_len > 0 ? hash_get(&model->quad, key, key_len) : 0;
+    return key_len > 0 ? count_get(model->quad, key, key_len) : 0;
 }
 
 size_t sg_anomaly_total_contexts(const sg_anomaly_model_t *model)
 {
     if (!model) return 0;
-    return model->bi_ctx.len + model->tri_ctx.len + model->quad_ctx.len;
+    return ht_size(model->bi_ctx) + ht_size(model->tri_ctx) + ht_size(model->quad_ctx);
 }
 
 bool sg_anomaly_has_observed(const sg_anomaly_model_t *model,
@@ -956,7 +821,7 @@ bool sg_anomaly_has_observed(const sg_anomaly_model_t *model,
     if (!model || !seq || len == 0) return false;
     /* Check unigrams first */
     for (size_t i = 0; i < len; i++) {
-        if (seq[i] && hash_get(&model->uni, seq[i], strlen(seq[i]) + 1) > 0)
+        if (seq[i] && count_get(model->uni, seq[i], strlen(seq[i]) + 1) > 0)
             return true;
     }
     return false;
@@ -965,13 +830,13 @@ bool sg_anomaly_has_observed(const sg_anomaly_model_t *model,
 void sg_anomaly_reset(sg_anomaly_model_t *model)
 {
     if (!model) return;
-    hash_free(&model->uni);
-    hash_free(&model->bi);
-    hash_free(&model->tri);
-    hash_free(&model->quad);
-    hash_free(&model->bi_ctx);
-    hash_free(&model->tri_ctx);
-    hash_free(&model->quad_ctx);
+    ht_destroy(model->uni);
+    ht_destroy(model->bi);
+    ht_destroy(model->tri);
+    ht_destroy(model->quad);
+    ht_destroy(model->bi_ctx);
+    ht_destroy(model->tri_ctx);
+    ht_destroy(model->quad_ctx);
     model->total_uni = 0;
     model->total_bi = 0;
     model->total_tri = 0;
@@ -979,79 +844,135 @@ void sg_anomaly_reset(sg_anomaly_model_t *model)
     model->vocab_size = 0;
     model->unk_count = 0;
     model->oom = false;
-    hash_init(&model->uni);
-    hash_init(&model->bi);
-    hash_init(&model->tri);
-    hash_init(&model->quad);
-    hash_init(&model->bi_ctx);
-    hash_init(&model->tri_ctx);
-    hash_init(&model->quad_ctx);
+    model->uni     = count_table_create();
+    model->bi      = count_table_create();
+    model->tri     = count_table_create();
+    model->quad    = count_table_create();
+    model->bi_ctx  = count_table_create();
+    model->tri_ctx = count_table_create();
+    model->quad_ctx = count_table_create();
 }
 
 /* Apply decay to a hash table: multiply all counts by scale factor.
  * Entries with count < 0.5 are removed (effectively zero).
- * Returns number of entries removed. */
-static size_t hash_decay(hash_t *h, double scale)
+ * Uses two-pass: collect keys to remove, then remove them. */
+static size_t table_decay(ht_table_t *t, double scale)
 {
-    if (!h || scale <= 0.0 || scale >= 1.0) return 0;
+    if (!t || scale <= 0.0 || scale >= 1.0) return 0;
 
-    size_t removed = 0;
-    for (size_t i = 0; i < h->capacity; i++) {
-        if (h->entries[i].key_data == NULL) continue;
+    size_t remove_cap = 64;
+    size_t remove_len = 0;
+    struct { const void *key; size_t key_len; } *remove_list =
+        malloc(remove_cap * sizeof(*remove_list));
+    if (!remove_list) return 0;
 
-        h->entries[i].count = (size_t)((double)h->entries[i].count * scale);
-        if (h->entries[i].count < 1) {
-            /* Remove this entry */
-            free(h->entries[i].key_data);
-            h->entries[i].key_data = NULL;
-            h->entries[i].key_len = 0;
-            h->entries[i].count = 0;
-            h->len--;
-            removed++;
+    ht_iter_t iter = ht_iter_begin(t);
+    const void *key; size_t key_len; const void *val; size_t val_len;
+    while (ht_iter_next(t, &iter, &key, &key_len, &val, &val_len)) {
+        if (val_len != sizeof(int64_t)) continue;
+        int64_t old_count = *(const int64_t *)val;
+        int64_t new_count = (int64_t)((double)old_count * scale);
+        if (new_count < 1) {
+            if (remove_len >= remove_cap) {
+                remove_cap *= 2;
+                void *tmp = realloc(remove_list, remove_cap * sizeof(*remove_list));
+                if (!tmp) break;
+                remove_list = tmp;
+            }
+            remove_list[remove_len].key = key;
+            remove_list[remove_len].key_len = key_len;
+            remove_len++;
+        } else {
+            uint64_t hash = anomaly_hash_fn(key, key_len, NULL);
+            ht_upsert_with_hash(t, hash, key, key_len, &new_count, sizeof(new_count));
         }
     }
-    return removed;
+    for (size_t i = 0; i < remove_len; i++)
+        ht_remove(t, remove_list[i].key, remove_list[i].key_len);
+    free(remove_list);
+    return remove_len;
 }
 
 void sg_anomaly_model_decay(sg_anomaly_model_t *model, double scale)
 {
     if (!model || scale <= 0.0 || scale >= 1.0) return;
 
-    hash_decay(&model->uni, scale);
-    hash_decay(&model->bi, scale);
-    hash_decay(&model->tri, scale);
-    hash_decay(&model->quad, scale);
-    hash_decay(&model->bi_ctx, scale);
-    hash_decay(&model->tri_ctx, scale);
-    hash_decay(&model->quad_ctx, scale);
+    table_decay(model->uni, scale);
+    table_decay(model->bi, scale);
+    table_decay(model->tri, scale);
+    table_decay(model->quad, scale);
+    table_decay(model->bi_ctx, scale);
+    table_decay(model->tri_ctx, scale);
+    table_decay(model->quad_ctx, scale);
 
     /* Recalculate totals (approximate after decay) */
-    model->total_uni = model->uni.total;
-    model->total_bi = model->bi.total;
-    model->total_tri = model->tri.total;
-    model->total_quad = model->quad.total;
-    model->vocab_size = model->uni.len;
+    model->total_uni = 0;
+    model->total_bi = 0;
+    model->total_tri = 0;
+    model->total_quad = 0;
+    model->vocab_size = ht_size(model->uni);
+
+    /* Re-sum totals from tables */
+    {
+        ht_iter_t iter;
+        const void *k; size_t kl; const void *v; size_t vl;
+        iter = ht_iter_begin(model->uni);
+        while (ht_iter_next(model->uni, &iter, &k, &kl, &v, &vl)) {
+            if (vl == sizeof(int64_t))
+                model->total_uni += (size_t)(*(const int64_t *)v);
+        }
+        iter = ht_iter_begin(model->bi);
+        while (ht_iter_next(model->bi, &iter, &k, &kl, &v, &vl)) {
+            if (vl == sizeof(int64_t))
+                model->total_bi += (size_t)(*(const int64_t *)v);
+        }
+        iter = ht_iter_begin(model->tri);
+        while (ht_iter_next(model->tri, &iter, &k, &kl, &v, &vl)) {
+            if (vl == sizeof(int64_t))
+                model->total_tri += (size_t)(*(const int64_t *)v);
+        }
+        iter = ht_iter_begin(model->quad);
+        while (ht_iter_next(model->quad, &iter, &k, &kl, &v, &vl)) {
+            if (vl == sizeof(int64_t))
+                model->total_quad += (size_t)(*(const int64_t *)v);
+        }
+    }
 }
 
 /* Remove entries with count less than min_count from a hash table.
- * Returns number of entries removed. */
-static size_t hash_prune(hash_t *h, size_t min_count)
+ * Returns number of entries removed.
+ * Uses two-pass: collect keys to remove, then remove them. */
+static size_t table_prune(ht_table_t *t, size_t min_count)
 {
-    if (!h || min_count == 0) return 0;
+    if (!t || min_count == 0) return 0;
 
-    size_t removed = 0;
-    for (size_t i = 0; i < h->capacity; i++) {
-        if (h->entries[i].key_data == NULL) continue;
-        if (h->entries[i].count < min_count) {
-            free(h->entries[i].key_data);
-            h->entries[i].key_data = NULL;
-            h->entries[i].key_len = 0;
-            h->entries[i].count = 0;
-            h->len--;
-            removed++;
+    size_t remove_cap = 64;
+    size_t remove_len = 0;
+    struct { const void *key; size_t key_len; } *remove_list =
+        malloc(remove_cap * sizeof(*remove_list));
+    if (!remove_list) return 0;
+
+    ht_iter_t iter = ht_iter_begin(t);
+    const void *key; size_t key_len; const void *val; size_t val_len;
+    while (ht_iter_next(t, &iter, &key, &key_len, &val, &val_len)) {
+        if (val_len != sizeof(int64_t)) continue;
+        int64_t count = *(const int64_t *)val;
+        if ((size_t)count < min_count) {
+            if (remove_len >= remove_cap) {
+                remove_cap *= 2;
+                void *tmp = realloc(remove_list, remove_cap * sizeof(*remove_list));
+                if (!tmp) break;
+                remove_list = tmp;
+            }
+            remove_list[remove_len].key = key;
+            remove_list[remove_len].key_len = key_len;
+            remove_len++;
         }
     }
-    return removed;
+    for (size_t i = 0; i < remove_len; i++)
+        ht_remove(t, remove_list[i].key, remove_list[i].key_len);
+    free(remove_list);
+    return remove_len;
 }
 
 size_t sg_anomaly_model_prune(sg_anomaly_model_t *model, size_t min_count)
@@ -1059,64 +980,48 @@ size_t sg_anomaly_model_prune(sg_anomaly_model_t *model, size_t min_count)
     if (!model || min_count == 0) return 0;
 
     size_t removed = 0;
-    removed += hash_prune(&model->uni, min_count);
-    removed += hash_prune(&model->bi, min_count);
-    removed += hash_prune(&model->tri, min_count);
-    removed += hash_prune(&model->quad, min_count);
-    removed += hash_prune(&model->bi_ctx, min_count);
-    removed += hash_prune(&model->tri_ctx, min_count);
-    removed += hash_prune(&model->quad_ctx, min_count);
+    removed += table_prune(model->uni, min_count);
+    removed += table_prune(model->bi, min_count);
+    removed += table_prune(model->tri, min_count);
+    removed += table_prune(model->quad, min_count);
+    removed += table_prune(model->bi_ctx, min_count);
+    removed += table_prune(model->tri_ctx, min_count);
+    removed += table_prune(model->quad_ctx, min_count);
 
     /* Recalculate totals */
-    model->total_uni = model->uni.total;
-    model->total_bi = model->bi.total;
-    model->total_tri = model->tri.total;
-    model->total_quad = model->quad.total;
-    model->vocab_size = model->uni.len;
+    model->total_uni = 0;
+    model->total_bi = 0;
+    model->total_tri = 0;
+    model->total_quad = 0;
+    model->vocab_size = ht_size(model->uni);
 
-    return removed;
-}
-
-/* Compact a hash table by rehashing to a smaller capacity if load factor is low.
- * Returns true if compaction happened, false otherwise. */
-static bool hash_compact(hash_t *h)
-{
-    if (!h || h->capacity <= 16) return false;
-
-    double load = (double)h->len / (double)h->capacity;
-    if (load >= 0.25) return false;
-
-    /* Calculate new capacity: smallest power of 2 >= len * 2 (for 0.5 load target) */
-    size_t new_cap = 16;
-    while (new_cap < h->len * 2 && new_cap < h->capacity / 2) {
-        new_cap *= 2;
-    }
-    if (new_cap >= h->capacity) return false;
-
-    hash_entry_t *new_entries = calloc(new_cap, sizeof(new_entries[0]));
-    if (!new_entries) return false;
-
-    /* Rehash all entries */
-    for (size_t i = 0; i < h->capacity; i++) {
-        if (h->entries[i].key_data == NULL) continue;
-
-        size_t pos = hash_key_bytes(h->entries[i].key_data,
-                                    h->entries[i].key_len, new_cap);
-        for (size_t probe = 0; probe < new_cap; probe++) {
-            size_t idx = (pos + probe) & (new_cap - 1);
-            if (new_entries[idx].key_data == NULL) {
-                new_entries[idx].key_data = h->entries[i].key_data;
-                new_entries[idx].key_len = h->entries[i].key_len;
-                new_entries[idx].count = h->entries[i].count;
-                break;
-            }
+    /* Re-sum totals from tables */
+    {
+        ht_iter_t iter;
+        const void *k; size_t kl; const void *v; size_t vl;
+        iter = ht_iter_begin(model->uni);
+        while (ht_iter_next(model->uni, &iter, &k, &kl, &v, &vl)) {
+            if (vl == sizeof(int64_t))
+                model->total_uni += (size_t)(*(const int64_t *)v);
+        }
+        iter = ht_iter_begin(model->bi);
+        while (ht_iter_next(model->bi, &iter, &k, &kl, &v, &vl)) {
+            if (vl == sizeof(int64_t))
+                model->total_bi += (size_t)(*(const int64_t *)v);
+        }
+        iter = ht_iter_begin(model->tri);
+        while (ht_iter_next(model->tri, &iter, &k, &kl, &v, &vl)) {
+            if (vl == sizeof(int64_t))
+                model->total_tri += (size_t)(*(const int64_t *)v);
+        }
+        iter = ht_iter_begin(model->quad);
+        while (ht_iter_next(model->quad, &iter, &k, &kl, &v, &vl)) {
+            if (vl == sizeof(int64_t))
+                model->total_quad += (size_t)(*(const int64_t *)v);
         }
     }
 
-    free(h->entries);
-    h->entries = new_entries;
-    h->capacity = new_cap;
-    return true;
+    return removed;
 }
 
 bool sg_anomaly_model_compact(sg_anomaly_model_t *model)
@@ -1124,13 +1029,15 @@ bool sg_anomaly_model_compact(sg_anomaly_model_t *model)
     if (!model) return false;
 
     bool did_compact = false;
-    did_compact |= hash_compact(&model->uni);
-    did_compact |= hash_compact(&model->bi);
-    did_compact |= hash_compact(&model->tri);
-    did_compact |= hash_compact(&model->quad);
-    did_compact |= hash_compact(&model->bi_ctx);
-    did_compact |= hash_compact(&model->tri_ctx);
-    did_compact |= hash_compact(&model->quad_ctx);
+    ht_compact(model->uni);
+    ht_compact(model->bi);
+    ht_compact(model->tri);
+    ht_compact(model->quad);
+    ht_compact(model->bi_ctx);
+    ht_compact(model->tri_ctx);
+    ht_compact(model->quad_ctx);
+    /* ht_compact returns void, assume compaction happened if tables exist */
+    did_compact = (model->uni != NULL);
 
     return did_compact;
 }
