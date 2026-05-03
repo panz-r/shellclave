@@ -1197,8 +1197,12 @@ static st_token_t *parse_pattern(const char *pattern, size_t *out_count)
                 break;
             }
             if (strncmp(tok, sym, sym_len) == 0 && tok[sym_len] == '.') {
-                /* Has a parameter suffix */
-                matched_prefix = true;
+                /* Has a parameter suffix — but only set matched_prefix for
+                 * #-prefixed symbols.  Single-char symbols like * naturally
+                 * appear in tokens like *.txt which is a glob, not a
+                 * parametrized wildcard. */
+                if (sym[0] == '#')
+                    matched_prefix = true;
                 if (type_supports_param((st_token_type_t)t) &&
                     validate_param((st_token_type_t)t, tok + sym_len)) {
                     type = (st_token_type_t)t;

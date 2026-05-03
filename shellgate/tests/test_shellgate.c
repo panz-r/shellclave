@@ -2100,6 +2100,38 @@ static size_t gen_by_index(char *buf, size_t cap, size_t idx)
     return generators[idx % (sizeof(generators)/sizeof(generators[0]))](buf, cap);
 }
 
+TEST(glob_pattern_in_rule)
+{
+    /* Regression: patterns with glob tokens (*.txt) were rejected by
+     * parse_pattern because *.txt matched the * (ANY) symbol prefix
+     * and .txt was treated as an invalid parameter suffix. */
+    {
+        sg_gate_t *g = sg_gate_new();
+        ASSERT(sg_gate_add_rule(g, "echo *.txt") == SG_OK);
+        sg_result_t r;
+        eval_cmd(g, "echo *.txt", &r);
+        ASSERT(r.verdict == SG_VERDICT_ALLOW);
+        sg_gate_free(g);
+    }
+    {
+        sg_gate_t *g = sg_gate_new();
+        ASSERT(sg_gate_add_rule(g, "find #p #sopt *.txt -print") == SG_OK);
+        sg_result_t r;
+        eval_cmd(g, "find /tmp -name '*.txt' -print", &r);
+        ASSERT(r.verdict == SG_VERDICT_ALLOW);
+        sg_gate_free(g);
+    }
+    {
+        sg_gate_t *g = sg_gate_new();
+        ASSERT(sg_gate_add_rule(g, "find #p #sopt #glob -print") == SG_OK);
+        sg_result_t r;
+        eval_cmd(g, "find /tmp -name '*.txt' -print", &r);
+        ASSERT(r.verdict == SG_VERDICT_ALLOW);
+        sg_gate_free(g);
+    }
+    pass_count++;
+}
+
 TEST(property_suggestion_leads_to_allow)
 {
     char cmd_buf[512];
@@ -3458,6 +3490,7 @@ int main(void)
     RUN(result_attention_index);
     RUN(suggestions_when_disabled);
     RUN(suggestions_when_enabled);
+    RUN(glob_pattern_in_rule);
 
     printf("\nProperty tests:\n");
     srand(42);
