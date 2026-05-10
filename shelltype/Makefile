@@ -21,7 +21,7 @@ TESTDIR := tests
 OBJDIR  := obj
 
 # Library sources
-LIB_SRCS := $(SRCDIR)/normalize.c $(SRCDIR)/trie.c $(SRCDIR)/policy.c $(SRCDIR)/policy_ctx.c $(SRCDIR)/arena.c $(SRCDIR)/vacuum_filter.c $(SRCDIR)/filter_hash.c
+LIB_SRCS := $(SRCDIR)/normalize.c $(SRCDIR)/trie.c $(SRCDIR)/policy.c $(SRCDIR)/policy_ctx.c $(SRCDIR)/trie_variants.c $(SRCDIR)/arena.c $(SRCDIR)/vacuum_filter.c $(SRCDIR)/filter_hash.c
 LIB_SRCS_ALL := $(LIB_SRCS)
 LIB_OBJS := $(patsubst $(SRCDIR)/%.c,$(OBJDIR)/%.o,$(LIB_SRCS_ALL))
 

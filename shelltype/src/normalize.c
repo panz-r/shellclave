@@ -1423,6 +1423,19 @@ st_token_type_t st_classify_token(const char *token)
 }
 
 /* ============================================================
+ * PUBLIC: PATTERN TOKEN CLASSIFICATION
+ * ============================================================ */
+
+st_token_type_t st_type_from_pattern_token(const char *token)
+{
+    if (!token || token[0] != '#') return ST_TYPE_LITERAL;
+    for (int t = 1; t < ST_TYPE_COUNT; t++) {
+        if (strcmp(token, st_type_symbol[t]) == 0) return (st_token_type_t)t;
+    }
+    return ST_TYPE_LITERAL;
+}
+
+/* ============================================================
  * TOKENISATION
  * ============================================================ */
 

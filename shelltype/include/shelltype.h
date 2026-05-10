@@ -47,6 +47,7 @@ const char *st_error_string(st_error_t err);
 #define ST_MAX_CMD_TOKENS      128     /* Max tokens in a command/pattern */
 #define ST_MAX_SAMPLE_VALUES   32      /* Max original values stored per variable node */
 #define ST_INITIAL_CHILDREN_CAP 4      /* Initial capacity for children array */
+#define ST_MAX_TOKEN_VARIANTS    8      /* Max type variants for edit UI */
 
 /* ============================================================
  * TOKEN TYPE LATTICE
@@ -295,6 +296,13 @@ void st_free_tokens(char **tokens, size_t count);
  * Returns ST_TYPE_LITERAL if no wildcard type matches.
  */
 st_token_type_t st_classify_token(const char *token);
+
+/**
+ * Classify a pattern token string (e.g., "#val", "*") into its st_token_type_t.
+ * Returns ST_TYPE_LITERAL if token is NULL, empty, or doesn't start with '#'.
+ * Used by the type-lattice walker and trie-based variant collection.
+ */
+st_token_type_t st_type_from_pattern_token(const char *token);
 
 /**
  * Extract the file extension from a path (including dot).
@@ -554,10 +562,58 @@ st_error_t st_validate_pattern(const char *pattern, st_pattern_info_t *info);
  *
  * Caller allocates out[3]. No cleanup needed.
  */
+/* Single token variant for edit UI (one option in the list) */
+typedef struct st_token_variant {
+    st_token_type_t type;       /* The type to suggest */
+    const char *type_symbol;   /* e.g., "#path", "#val", "*" */
+    const char *sample_value;  /* Optional sample from history (can be NULL) */
+} st_token_variant_t;
+
 size_t st_policy_suggest_variants(const st_policy_t *policy,
                                     const st_token_t *tokens,
                                     size_t token_count,
                                     st_expand_suggestion_t out[3]);
+/* ============================================================
+ * TOKEN VARIANT EDITING (for TUI edit mode)
+ * ============================================================ */
+
+/**
+ * Suggest type variants for editing a specific token position in a pattern.
+ * 
+ * Given a pattern with tokens and an edit position, walks the learner trie
+ * to find observed type variants at that position. Returns options from more
+ * specific to more general, including the wildcard (*) as most general.
+ *
+ * @param learner    The learner/trie context
+ * @param pattern_tokens  Array of pattern token strings (e.g., ["git", "#p"])
+ * @param token_count    Number of tokens in pattern
+ * @param edit_pos       Position to edit (0-indexed)
+ * @param out_variants   Output array (caller allocates ST_MAX_TOKEN_VARIANTS entries)
+ * @return Number of variants written to out_variants
+ */
+size_t st_policy_suggest_token_variants(
+    st_learner_t *learner,
+    const char **pattern_tokens,
+    size_t token_count,
+    size_t edit_pos,
+    st_token_variant_t *out_variants);
+
+/**
+ * Apply a type change to a pattern at a given position.
+ * 
+ * @param learner      The learner context (unused, kept for future expansion)
+ * @param pattern_tokens  Original pattern tokens
+ * @param token_count     Number of tokens
+ * @param edit_pos        Position to change
+ * @param new_type        New type to set at that position
+ * @return Newly allocated string with the type applied (caller must free)
+ */
+char *st_policy_apply_type_at(
+    st_learner_t *learner,
+    const char **pattern_tokens,
+    size_t token_count,
+    size_t edit_pos,
+    st_token_type_t new_type);
 
 #ifdef __cplusplus
 }

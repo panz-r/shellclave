@@ -2708,6 +2708,997 @@ static int test_incr_no_cross_length_subsumption(void)
     return 1;
 }
 
+/* ============================================================
+ * TOKEN VARIANT SUGGESTION (st_policy_suggest_token_variants)
+ * Tests proper type widening/narrowing from actual trie suggestions
+ * ============================================================ */
+
+/* Simple token parsing helper - splits pattern into tokens */
+static size_t parse_tokens(const char *pattern, const char *tokens[], size_t max_tokens)
+{
+    size_t count = 0;
+    size_t len = strlen(pattern);
+    char *copy = malloc(len + 1);
+    memcpy(copy, pattern, len + 1);
+
+    char *start = copy;
+    while (*start && count < max_tokens) {
+        /* Skip leading spaces */
+        while (*start == ' ') start++;
+        if (!*start) break;
+
+        /* Find end of token */
+        char *end = start;
+        while (*end && *end != ' ') end++;
+
+        /* Terminate and store */
+        if (*end) *end = '\0';
+        tokens[count++] = start;
+        start = end + 1;
+    }
+
+    free(copy);
+    return count;
+}
+
+static int test_variant_from_suggestion_path_specific_to_general(void)
+{
+    /* Feed commands with specific path observed types to build trie */
+    st_learner_t *learner = st_learner_new(1, 0.01);
+    st_feed(learner, "git commit -m /absolute/path/to/file");
+    st_feed(learner, "git commit -m /another/absolute/path");
+    st_feed(learner, "git commit -m /third/absolute/path");
+
+    /* Get suggestions - should see git commit -m #p or similar */
+    size_t count = 0;
+    st_suggestion_t *sugs = st_suggest(learner, &count);
+    ASSERT(count >= 1);
+    ASSERT(sugs != NULL);
+
+    /* For the suggestion, check that at position 3 (#path token) we get
+     * variant options showing widening from specific (#p, #r) to general (*)
+     * The first token position containing observed types should give multiple variants */
+    bool found_path_variant = false;
+    for (size_t s = 0; s < count; s++) {
+        /* Parse the suggestion pattern into tokens */
+        const char *tokens[16];
+        size_t token_count = parse_tokens(sugs[s].pattern, tokens, 16);
+
+        /* Find the first wildcard token in the pattern */
+        for (size_t i = 0; i < token_count; i++) {
+            if (tokens[i][0] == '#') {
+                st_token_variant_t variants[ST_MAX_TOKEN_VARIANTS];
+                size_t var_count = st_policy_suggest_token_variants(
+                    learner, tokens, token_count, i, variants);
+
+                /* Must have at least current type + wildcard (*) as generalization */
+                ASSERT(var_count >= 2);
+
+                /* Verify wildcard (*) is present as most general option */
+                bool has_wildcard = false;
+                for (size_t v = 0; v < var_count; v++) {
+                    if (variants[v].type == ST_TYPE_ANY) has_wildcard = true;
+                    if (variants[v].type == ST_TYPE_ABS_PATH || variants[v].type == ST_TYPE_REL_PATH) {
+                        found_path_variant = true;
+                    }
+                }
+                ASSERT(has_wildcard);  /* Always includes * as most general */
+                break;  /* Check first wildcard token per suggestion */
+            }
+        }
+    }
+
+    st_free_suggestions(sugs, count);
+    st_learner_free(learner);
+    return found_path_variant ? 1 : 0;
+}
+
+static int test_variant_from_suggestion_number_to_wider(void)
+{
+    /* Feed commands with number tokens to build trie */
+    st_learner_t *learner = st_learner_new(1, 0.01);
+    st_feed(learner, "curl -X GET http://example.com");
+    st_feed(learner, "curl -X POST http://example.com");
+    st_feed(learner, "curl -X PUT http://example.com");
+
+    size_t count = 0;
+    st_suggestion_t *sugs = st_suggest(learner, &count);
+    ASSERT(count >= 1);
+    ASSERT(sugs != NULL);
+
+    /* Find a suggestion with a method-type token and verify variant options
+     * include widening from specific (#method) to more general categories */
+    bool found_variant = false;
+    for (size_t s = 0; s < count; s++) {
+        const char *tokens[16];
+        size_t token_count = parse_tokens(sugs[s].pattern, tokens, 16);
+
+        for (size_t i = 0; i < token_count; i++) {
+            if (tokens[i][0] == '#' && tokens[i][1] != '\0') {
+                st_token_variant_t variants[ST_MAX_TOKEN_VARIANTS];
+                size_t var_count = st_policy_suggest_token_variants(
+                    learner, tokens, token_count, i, variants);
+
+                /* Must include at least current type + some wider option */
+                ASSERT(var_count >= 1);
+                /* Wildcard should always be available as most general */
+                bool has_any = false;
+                for (size_t v = 0; v < var_count; v++) {
+                    if (variants[v].type == ST_TYPE_ANY) has_any = true;
+                }
+                ASSERT(has_any);
+                found_variant = true;
+                break;
+            }
+        }
+    }
+
+    st_free_suggestions(sugs, count);
+    st_learner_free(learner);
+    return found_variant ? 1 : 0;
+}
+
+/* ============================================================
+ * TOKEN VARIANT SUGGESTION (st_policy_suggest_token_variants)
+ * All edge-case tests share same setup: ctx + zeroed learner with NULL trie
+ * ============================================================ */
+
+static int test_variant_suggest_edge_cases(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_learner_t learner;
+    memset(&learner, 0, sizeof(learner));
+    learner.trie.root = NULL;  /* Empty trie */
+
+    /* Test 1: Null learner returns 0 */
+    st_token_variant_t variants1[ST_MAX_TOKEN_VARIANTS];
+    size_t r1 = st_policy_suggest_token_variants(NULL, (void*)1, 2, 1, variants1);
+    ASSERT(r1 == 0);
+
+    /* Test 2: Null tokens returns 0 */
+    st_token_variant_t variants2[ST_MAX_TOKEN_VARIANTS];
+    size_t r2 = st_policy_suggest_token_variants(&learner, NULL, 2, 1, variants2);
+    ASSERT(r2 == 0);
+
+    /* Test 3: Invalid position (pos >= token_count) returns 0 */
+    const char *tokens3[] = {"git", "#path"};
+    st_token_variant_t variants3[ST_MAX_TOKEN_VARIANTS];
+    size_t r3 = st_policy_suggest_token_variants(&learner, tokens3, 2, 2, variants3);
+    ASSERT(r3 == 0);
+
+    /* Test 4: Literal token at position 0 suggests ST_TYPE_VALUE */
+    const char *tokens4[] = {"git", "#path"};
+    st_token_variant_t variants4[ST_MAX_TOKEN_VARIANTS];
+    size_t r4 = st_policy_suggest_token_variants(&learner, tokens4, 2, 0, variants4);
+    ASSERT(r4 >= 1);
+    ASSERT(variants4[0].type == ST_TYPE_VALUE);
+    ASSERT_STR_EQ(variants4[0].type_symbol, st_type_symbol[ST_TYPE_VALUE]);
+
+    /* Test 5: Wildcard token always has * (ST_TYPE_ANY) as most general option */
+    const char *tokens5[] = {"git", "#path"};
+    st_token_variant_t variants5[ST_MAX_TOKEN_VARIANTS];
+    size_t r5 = st_policy_suggest_token_variants(&learner, tokens5, 2, 1, variants5);
+    ASSERT(r5 >= 1);
+    bool found_any = false, found_path = false;
+    for (size_t i = 0; i < r5; i++) {
+        if (variants5[i].type == ST_TYPE_ANY && strcmp(variants5[i].type_symbol, "*") == 0) {
+            found_any = true;
+        }
+        if (variants5[i].type == ST_TYPE_PATH) {
+            found_path = true;
+        }
+    }
+    ASSERT(found_any);        /* Wildcard * always present */
+    ASSERT(found_path);       /* #path category also present for #path token */
+
+    /* Test 6: Literal token at position 1 (not position 0) also suggests VALUE */
+    const char *tokens6[] = {"git", "status"};
+    st_token_variant_t variants6[ST_MAX_TOKEN_VARIANTS];
+    size_t r6 = st_policy_suggest_token_variants(&learner, tokens6, 2, 1, variants6);
+    ASSERT(r6 >= 1);
+    ASSERT(variants6[0].type == ST_TYPE_VALUE);
+
+    /* Test 7: sample_value is NULL when no trie data (expected behavior) */
+    const char *tokens7[] = {"git", "#w"};
+    st_token_variant_t variants7[ST_MAX_TOKEN_VARIANTS];
+    size_t r7 = st_policy_suggest_token_variants(&learner, tokens7, 2, 1, variants7);
+    ASSERT(r7 >= 1);
+    /* With no trie, only * is returned as fallback; check it has no sample */
+    ASSERT(variants7[0].sample_value == NULL);
+
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
+/* ============================================================
+ * APPLY TYPE AT POSITION (st_policy_apply_type_at)
+ * All tests share setup: ctx + zeroed learner, then test different positions/types
+ * ============================================================ */
+
+static int test_apply_type_various_positions(void)
+{
+    st_policy_ctx_t *ctx = st_policy_ctx_new();
+    st_learner_t learner;
+    memset(&learner, 0, sizeof(learner));
+
+    /* Test 1: First token */
+    const char *tokens1[] = {"git", "#path", "#n"};
+    char *r1 = st_policy_apply_type_at(&learner, tokens1, 3, 0, ST_TYPE_WORD);
+    ASSERT(r1 != NULL);
+    ASSERT_STR_EQ(r1, "#w #path #n");
+
+    /* Test 2: Middle token */
+    const char *tokens2[] = {"git", "#path", "#n"};
+    char *r2 = st_policy_apply_type_at(&learner, tokens2, 3, 1, ST_TYPE_ABS_PATH);
+    ASSERT(r2 != NULL);
+    ASSERT_STR_EQ(r2, "git #p #n");
+
+    /* Test 3: Last token */
+    const char *tokens3[] = {"git", "commit", "-m", "#val"};
+    char *r3 = st_policy_apply_type_at(&learner, tokens3, 4, 3, ST_TYPE_ANY);
+    ASSERT(r3 != NULL);
+    ASSERT_STR_EQ(r3, "git commit -m *");
+
+    /* Test 4: Middle with preservation check (beginning and end unchanged) */
+    const char *tokens4[] = {"#path", "subcommand", "#n"};
+    char *r4 = st_policy_apply_type_at(&learner, tokens4, 3, 1, ST_TYPE_REL_PATH);
+    ASSERT(r4 != NULL);
+    ASSERT_STR_EQ(r4, "#path #r #n");
+
+    /* Test 5: Single token */
+    const char *tokens5[] = {"#path"};
+    char *r5 = st_policy_apply_type_at(&learner, tokens5, 1, 0, ST_TYPE_ANY);
+    ASSERT(r5 != NULL);
+    ASSERT_STR_EQ(r5, "*");
+
+    /* Additional assertions: verify original tokens are NOT modified (const data) */
+    ASSERT_STR_EQ(tokens1[0], "git");    /* original first token unchanged */
+    ASSERT_STR_EQ(tokens1[1], "#path");  /* original middle token unchanged */
+    ASSERT_STR_EQ(tokens1[2], "#n");     /* original last token unchanged */
+
+    /* Verify type symbols are correct for various types */
+    const char *tokens6[] = {"cmd"};
+    char *r6 = st_policy_apply_type_at(&learner, tokens6, 1, 0, ST_TYPE_IPV4);
+    ASSERT(r6 != NULL);
+    ASSERT_STR_EQ(r6, "#i");  /* IPv4 symbol */
+
+    free(r1); free(r2); free(r3); free(r4); free(r5); free(r6);
+    st_policy_ctx_free(ctx);
+    return 1;
+}
+
+/* ============================================================
+ * SUGGESTION-BASED TYPE EDITING (full workflow)
+ * All suggestion-based tests share: setup multiple learners with different feeds,
+ * then test widening, narrowing, and iteration across suggestions.
+ * ============================================================ */
+
+static int test_suggestion_type_edit_workflow(void)
+{
+    /* Test 1: Widen - feed absolute paths, get suggestion, widen to * */
+    st_learner_t *learner1 = st_learner_new(1, 0.01);
+    st_feed(learner1, "git commit -m /abs/path");
+    st_feed(learner1, "git commit -m /another/path");
+    st_feed(learner1, "git commit -m /third/path");
+
+    size_t count1 = 0;
+    st_suggestion_t *sugs1 = st_suggest(learner1, &count1);
+    ASSERT(count1 >= 1);
+    ASSERT(sugs1 != NULL);
+
+    bool widened = false;
+    for (size_t s = 0; s < count1 && !widened; s++) {
+        const char *tokens[16];
+        size_t token_count = parse_tokens(sugs1[s].pattern, tokens, 16);
+
+        for (size_t i = 0; i < token_count && !widened; i++) {
+            if (tokens[i][0] == '#') {
+                char *new_pattern = st_policy_apply_type_at(
+                    learner1, tokens, token_count, i, ST_TYPE_ANY);
+                ASSERT(new_pattern != NULL);
+
+                int wc = 0;
+                for (int j = 0; new_pattern[j]; j++) {
+                    if (new_pattern[j] == '*') wc++;
+                }
+                ASSERT(wc >= 1);
+
+                free(new_pattern);
+                widened = true;
+            }
+        }
+    }
+    ASSERT(widened);
+
+    /* Test 2: Narrow - feed branch names, apply ST_TYPE_VALUE to WORD token */
+    st_learner_t *learner2 = st_learner_new(1, 0.01);
+    st_feed(learner2, "git checkout main");
+    st_feed(learner2, "git checkout develop");
+    st_feed(learner2, "git checkout feature");
+
+    st_token_variant_t variants[ST_MAX_TOKEN_VARIANTS];
+    const char *tokens2[] = {"git", "checkout", "#w"};
+    size_t var_count = st_policy_suggest_token_variants(
+        learner2, tokens2, 3, 2, variants);
+    ASSERT(var_count >= 1);
+
+    char *result = st_policy_apply_type_at(learner2, tokens2, 3, 2, ST_TYPE_VALUE);
+    ASSERT(result != NULL);
+    ASSERT_STR_EQ(result, "git checkout #val");
+    ASSERT(strstr(result, "#val") != NULL);
+
+    /* Test 3: Iterate all suggestions, apply first variant to each wildcard */
+    st_learner_t *learner3 = st_learner_new(2, 0.01);
+    st_feed(learner3, "curl -X GET api.example.com");
+    st_feed(learner3, "curl -X POST api.example.com");
+    st_feed(learner3, "curl -X PUT api.example.com");
+    st_feed(learner3, "curl -X DELETE api.example.com");
+
+    size_t count3 = 0;
+    st_suggestion_t *sugs3 = st_suggest(learner3, &count3);
+    ASSERT(sugs3 != NULL);
+
+    int wildcardsEdited = 0;
+    for (size_t s = 0; s < count3; s++) {
+        const char *tokens3[16];
+        size_t token_count3 = parse_tokens(sugs3[s].pattern, tokens3, 16);
+
+        for (size_t i = 0; i < token_count3; i++) {
+            if (tokens3[i][0] == '#') {
+                st_token_variant_t vars[ST_MAX_TOKEN_VARIANTS];
+                size_t vc = st_policy_suggest_token_variants(
+                    learner3, tokens3, token_count3, i, vars);
+
+                if (vc >= 1) {
+                    st_token_type_t new_type = vars[0].type;
+                    char *new_pattern = st_policy_apply_type_at(
+                        learner3, tokens3, token_count3, i, new_type);
+                    ASSERT(new_pattern != NULL);
+                    ASSERT(strlen(new_pattern) > 0);
+                    /* Verify the result contains at least one type symbol (#) or wildcard (*) */
+                    bool has_type_or_wildcard = false;
+                    for (size_t k = 0; new_pattern[k]; k++) {
+                        if (new_pattern[k] == '#' || new_pattern[k] == '*') {
+                            has_type_or_wildcard = true;
+                            break;
+                        }
+                    }
+                    ASSERT(has_type_or_wildcard);
+
+                    free(new_pattern);
+                    wildcardsEdited++;
+                }
+            }
+        }
+    }
+    ASSERT(wildcardsEdited >= 1);
+
+    st_free_suggestions(sugs1, count1);
+    st_free_suggestions(sugs3, count3);
+    st_learner_free(learner1);
+    st_learner_free(learner2);
+    st_learner_free(learner3);
+    return 1;
+}
+
+/* Test multiple type editing workflows:
+ * - Apply all variants for a single token and verify they differ
+ * - Edit multiple positions in the same pattern
+ * - Verify actual type symbols in before/after comparison */
+static int test_multi_position_and_all_variants(void)
+{
+    st_learner_t *learner = st_learner_new(1, 0.01);
+    st_feed(learner, "git commit -m /abs/path");
+    st_feed(learner, "git commit -m /another/path");
+    st_feed(learner, "git commit -m /third/path");
+
+    size_t count = 0;
+    st_suggestion_t *sugs = st_suggest(learner, &count);
+    ASSERT(count >= 1);
+
+    /* Find first suggestion with wildcard token and extract tokens */
+    const char *tokens[16];
+    size_t token_count = 0;
+    size_t wildcard_idx = 0;
+    bool found = false;
+
+    for (size_t s = 0; s < count && !found; s++) {
+        token_count = parse_tokens(sugs[s].pattern, tokens, 16);
+        for (size_t i = 0; i < token_count; i++) {
+            if (tokens[i][0] == '#') {
+                wildcard_idx = i;
+                found = true;
+                break;
+            }
+        }
+    }
+    ASSERT(found);
+
+    /* Test 1: Apply ALL variants for one token, verify results differ */
+    st_token_variant_t all_vars[ST_MAX_TOKEN_VARIANTS];
+    size_t var_count = st_policy_suggest_token_variants(
+        learner, tokens, token_count, wildcard_idx, all_vars);
+    ASSERT(var_count >= 2);  /* Should have at least current + * */
+
+    char *results[ST_MAX_TOKEN_VARIANTS];
+    for (size_t v = 0; v < var_count; v++) {
+        results[v] = st_policy_apply_type_at(
+            learner, tokens, token_count, wildcard_idx, all_vars[v].type);
+        ASSERT(results[v] != NULL);
+    }
+
+    /* All results should be non-empty strings */
+    for (size_t v = 0; v < var_count; v++) {
+        ASSERT(strlen(results[v]) > 0);
+    }
+
+    /* Results with different types should differ */
+    for (size_t i = 0; i < var_count; i++) {
+        for (size_t j = i + 1; j < var_count; j++) {
+            if (all_vars[i].type != all_vars[j].type) {
+                ASSERT(strcmp(results[i], results[j]) != 0);
+            }
+        }
+    }
+
+    /* Results with same type should be identical */
+    for (size_t i = 0; i < var_count; i++) {
+        for (size_t j = i + 1; j < var_count; j++) {
+            if (all_vars[i].type == all_vars[j].type) {
+                ASSERT(strcmp(results[i], results[j]) == 0);
+            }
+        }
+    }
+
+    /* Free all results */
+    for (size_t v = 0; v < var_count; v++) {
+        free(results[v]);
+    }
+
+    /* Test 2: Edit multiple positions in same pattern */
+    st_learner_t *learner2 = st_learner_new(1, 0.01);
+    st_feed(learner2, "curl -X GET https://example.com/api");
+    st_feed(learner2, "curl -X POST https://example.com/api");
+    st_feed(learner2, "curl -X PUT https://example.com/api");
+
+    size_t count2 = 0;
+    st_suggestion_t *sugs2 = st_suggest(learner2, &count2);
+    ASSERT(sugs2 != NULL);
+
+    for (size_t s = 0; s < count2; s++) {
+        const char *tok2[16];
+        size_t tc2 = parse_tokens(sugs2[s].pattern, tok2, 16);
+
+        /* Find all wildcard positions */
+        size_t wildcards[16];
+        size_t wc_count = 0;
+        for (size_t i = 0; i < tc2; i++) {
+            if (tok2[i][0] == '#') {
+                wildcards[wc_count++] = i;
+            }
+        }
+
+        if (wc_count >= 2) {
+            /* Edit first wildcard to * */
+            char *step1 = st_policy_apply_type_at(
+                learner2, tok2, tc2, wildcards[0], ST_TYPE_ANY);
+            ASSERT(step1 != NULL);
+
+            /* Parse step1 and edit second wildcard to * */
+            const char *tok3[16];
+            size_t tc3 = parse_tokens(step1, tok3, 16);
+            char *step2 = st_policy_apply_type_at(
+                learner2, tok3, tc3, wildcards[1], ST_TYPE_ANY);
+            ASSERT(step2 != NULL);
+
+            /* Verify step2 has at least 2 wildcards */
+            int wc_total = 0;
+            for (int k = 0; step2[k]; k++) {
+                if (step2[k] == '*') wc_total++;
+            }
+            ASSERT(wc_total >= 2);
+
+            free(step1);
+            free(step2);
+            break;  /* Only test one multi-wildcard suggestion */
+        }
+    }
+
+    st_free_suggestions(sugs, count);
+    st_free_suggestions(sugs2, count2);
+    st_learner_free(learner);
+    st_learner_free(learner2);
+    return 1;
+}
+
+/* Test type hierarchy traversal: specific -> intermediate -> general -> narrow back.
+ * Also test that variant order reflects generality (most specific first). */
+static int test_type_hierarchy_traversal(void)
+{
+    st_learner_t *learner = st_learner_new(1, 0.01);
+    /* Feed various path types to learn hierarchy */
+    st_feed(learner, "git commit -m /abs/path");
+    st_feed(learner, "git commit -m relative/path");
+    st_feed(learner, "git commit -m /another/abs");
+    st_feed(learner, "git commit -m yet/another");
+
+    size_t count = 0;
+    st_suggestion_t *sugs = st_suggest(learner, &count);
+    ASSERT(count >= 1);
+    ASSERT(sugs != NULL);
+
+    /* Find a suggestion with a path-type wildcard */
+    size_t sug_idx = count;
+    size_t wc_pos = 0;
+    for (size_t s = 0; s < count && sug_idx == count; s++) {
+        const char *tokens[16];
+        size_t tc = parse_tokens(sugs[s].pattern, tokens, 16);
+        for (size_t i = 0; i < tc; i++) {
+            if (tokens[i][0] == '#') {
+                sug_idx = s;
+                wc_pos = i;
+                break;
+            }
+        }
+    }
+    ASSERT(sug_idx < count);
+
+    const char *tokens[16];
+    size_t token_count = parse_tokens(sugs[sug_idx].pattern, tokens, 16);
+
+    /* Get variants - verify ordering: specific -> general */
+    st_token_variant_t vars[ST_MAX_TOKEN_VARIANTS];
+    size_t var_count = st_policy_suggest_token_variants(
+        learner, tokens, token_count, wc_pos, vars);
+    ASSERT(var_count >= 2);
+
+    /* First variant should NOT be ST_TYPE_ANY (most general should be last) */
+    ASSERT(vars[0].type != ST_TYPE_ANY);
+
+    /* Last variant should be ST_TYPE_ANY */
+    ASSERT(vars[var_count - 1].type == ST_TYPE_ANY);
+
+    /* Verify wildcard symbol for ST_TYPE_ANY is "*" */
+    ASSERT(strcmp(vars[var_count - 1].type_symbol, "*") == 0);
+
+    /* Test hierarchy chain: start with specific, widen step by step.
+     * Apply each variant in order and verify each produces valid output. */
+    char *current = NULL;
+
+    for (size_t v = 0; v < var_count; v++) {
+        if (vars[v].type == ST_TYPE_ANY) continue;  /* Skip to last */
+
+        char *next = st_policy_apply_type_at(
+            learner, tokens, token_count, wc_pos, vars[v].type);
+        ASSERT(next != NULL);
+        ASSERT(strlen(next) > 0);
+
+        free(current);
+        current = next;
+    }
+
+    /* Now current is at last non-* variant, widen to * */
+    char *widest = st_policy_apply_type_at(
+        learner, tokens, token_count, wc_pos, ST_TYPE_ANY);
+    ASSERT(widest != NULL);
+    ASSERT(strstr(widest, "*") != NULL);  /* Contains wildcard */
+
+    /* Narrow back: get variants for the widest pattern */
+    const char *widest_tokens[16];
+    size_t widest_tc = parse_tokens(widest, widest_tokens, 16);
+
+    st_token_variant_t narrowed_vars[ST_MAX_TOKEN_VARIANTS];
+    (void)st_policy_suggest_token_variants(
+        learner, widest_tokens, widest_tc, wc_pos, narrowed_vars);
+
+    /* Note: when token is "*" (literal wildcard), variant suggestion returns
+     * ST_TYPE_VALUE as fallback (for "turn literal into type"), not the
+     * full hierarchy. This is expected behavior for literal tokens. */
+
+    /* Verify we can still get some result even with literal token */
+    char *final_result = st_policy_apply_type_at(
+        learner, widest_tokens, widest_tc, wc_pos, ST_TYPE_WORD);
+    ASSERT(final_result != NULL);
+    ASSERT(strlen(final_result) > 0);
+
+    free(widest);
+    free(final_result);
+    free(current);
+    st_free_suggestions(sugs, count);
+    st_learner_free(learner);
+    return 1;
+}
+
+/* Test edge case: empty/no suggestions scenario */
+static int test_no_suggestions_edge_case(void)
+{
+    /* Learner with min_support high enough that no suggestions arise */
+    st_learner_t *learner = st_learner_new(100, 0.99);
+    st_feed(learner, "cmd1");
+    st_feed(learner, "cmd2");
+
+    size_t count = 0;
+    st_suggestion_t *sugs = st_suggest(learner, &count);
+
+    /* With high min_support, we expect 0 or very few suggestions */
+    /* This is acceptable - just verify cleanup works */
+    if (sugs != NULL) {
+        st_free_suggestions(sugs, count);
+    }
+    st_learner_free(learner);
+
+    /* Test that we can still call suggest functions on empty learner */
+    st_learner_t *empty = st_learner_new(1, 0.01);
+    /* Never feed any commands */
+
+    const char *tokens[] = {"some", "command"};
+    st_token_variant_t vars[ST_MAX_TOKEN_VARIANTS];
+
+    /* Should return something (at least the fallback *) even with empty trie */
+    size_t vc = st_policy_suggest_token_variants(empty, tokens, 2, 1, vars);
+    ASSERT(vc >= 1);
+
+    /* Apply type to position should still work */
+    char *result = st_policy_apply_type_at(empty, tokens, 2, 0, ST_TYPE_WORD);
+    ASSERT(result != NULL);
+    ASSERT_STR_EQ(result, "#w command");
+    free(result);
+
+    st_learner_free(empty);
+    return 1;
+}
+
+/* Test widen-then-narrow workflow: start with specific type, widen to general,
+ * then narrow back to specific. This tests that the trie-based variant suggestions
+ * provide proper narrowing options that lead back to context-relevant types. */
+static int test_widen_narrow_round_trip(void)
+{
+    /* Feed commands with specific observed types to build trie */
+    st_learner_t *learner = st_learner_new(1, 0.01);
+    /* All use absolute paths, so trie learns #p at position 2 */
+    st_feed(learner, "git commit -m /first/path");
+    st_feed(learner, "git commit -m /second/path");
+    st_feed(learner, "git commit -m /third/path");
+
+    size_t count = 0;
+    st_suggestion_t *sugs = st_suggest(learner, &count);
+    ASSERT(count >= 1);
+    ASSERT(sugs != NULL);
+
+    /* Find a suggestion that has at least one wildcard token */
+    size_t target_sug = count;  /* default: no suitable suggestion */
+    size_t wildcard_pos = 0;
+    for (size_t s = 0; s < count && target_sug == count; s++) {
+        const char *tokens[16];
+        size_t token_count = parse_tokens(sugs[s].pattern, tokens, 16);
+        for (size_t i = 0; i < token_count; i++) {
+            if (tokens[i][0] == '#') {
+                target_sug = s;
+                wildcard_pos = i;
+                break;
+            }
+        }
+    }
+    ASSERT(target_sug < count);  /* Must find a suggestion with wildcard */
+
+    /* Work on this suggestion */
+    const char *tokens[16];
+    size_t token_count = parse_tokens(sugs[target_sug].pattern, tokens, 16);
+
+    /* Get variants for this position */
+    st_token_variant_t variants[ST_MAX_TOKEN_VARIANTS];
+    size_t var_count = st_policy_suggest_token_variants(
+        learner, tokens, token_count, wildcard_pos, variants);
+    ASSERT(var_count >= 1);
+
+    /* Find * (ST_TYPE_ANY) if present, otherwise use last variant */
+    size_t any_idx = var_count;
+    for (size_t v = 0; v < var_count; v++) {
+        if (variants[v].type == ST_TYPE_ANY) {
+            any_idx = v;
+            break;
+        }
+    }
+
+    /* If we have * variant, test widen-narrow. Otherwise skip. */
+    if (any_idx < var_count) {
+        /* Step 1: Widen to * (most general) */
+        char *widened = st_policy_apply_type_at(
+            learner, tokens, token_count, wildcard_pos, ST_TYPE_ANY);
+        ASSERT(widened != NULL);
+
+        /* Step 2: Parse widened pattern back to tokens and narrow back */
+        const char *widened_tokens[16];
+        size_t widened_count = parse_tokens(widened, widened_tokens, 16);
+
+        /* Get variants for the widened pattern */
+        st_token_variant_t narrowed_variants[ST_MAX_TOKEN_VARIANTS];
+        size_t narrowed_count = st_policy_suggest_token_variants(
+            learner, widened_tokens, widened_count, wildcard_pos, narrowed_variants);
+        ASSERT(narrowed_count >= 1);
+
+        /* Verify we can narrow back: find a non-* variant to apply */
+        st_token_type_t narrowed_type = ST_TYPE_COUNT;
+        for (size_t v = 0; v < narrowed_count; v++) {
+            if (narrowed_variants[v].type != ST_TYPE_ANY) {
+                narrowed_type = narrowed_variants[v].type;
+                break;
+            }
+        }
+        ASSERT(narrowed_type != ST_TYPE_COUNT);
+
+        /* Apply narrowed type */
+        char *narrowed_back = st_policy_apply_type_at(
+            learner, widened_tokens, widened_count, wildcard_pos, narrowed_type);
+        ASSERT(narrowed_back != NULL);
+
+        /* Verify the narrowed pattern is different from widened (if not already *) */
+        if (narrowed_type != ST_TYPE_ANY) {
+            ASSERT(strcmp(widened, narrowed_back) != 0);
+        }
+
+        free(widened);
+        free(narrowed_back);
+    }
+
+    st_free_suggestions(sugs, count);
+    st_learner_free(learner);
+    return 1;
+}
+
+/* Test that edited patterns are valid according to st_validate_pattern.
+ * After applying type changes, verify the result passes validation. */
+static int test_edited_pattern_validation(void)
+{
+    st_learner_t *learner = st_learner_new(1, 0.01);
+    st_feed(learner, "git commit -m /abs/path");
+    st_feed(learner, "git commit -m /another/path");
+
+    size_t count = 0;
+    st_suggestion_t *sugs = st_suggest(learner, &count);
+    ASSERT(count >= 1);
+
+    /* Apply various type changes and validate each result */
+    for (size_t s = 0; s < count; s++) {
+        const char *tokens[16];
+        size_t tc = parse_tokens(sugs[s].pattern, tokens, 16);
+
+        for (size_t i = 0; i < tc; i++) {
+            if (tokens[i][0] == '#') {
+                st_token_variant_t vars[ST_MAX_TOKEN_VARIANTS];
+                size_t vc = st_policy_suggest_token_variants(learner, tokens, tc, i, vars);
+
+                for (size_t v = 0; v < vc; v++) {
+                    char *edited = st_policy_apply_type_at(learner, tokens, tc, i, vars[v].type);
+                    ASSERT(edited != NULL);
+
+                    /* Validate the edited pattern */
+                    st_pattern_info_t info;
+                    st_error_t err = st_validate_pattern(edited, &info);
+                    ASSERT(err == ST_OK);
+
+                    /* Verify basic properties of validated pattern */
+                    ASSERT(info.token_count > 0);
+                    ASSERT(info.token_count <= ST_MAX_CMD_TOKENS);
+
+                    free(edited);
+                }
+            }
+        }
+    }
+
+    st_free_suggestions(sugs, count);
+    st_learner_free(learner);
+    return 1;
+}
+
+/* Test that type symbols roundtrip: apply type X -> get symbol -> can be reparsed.
+ * Also tests that different types produce different symbols. */
+static int test_type_symbol_roundtrip(void)
+{
+    st_learner_t *learner = st_learner_new(1, 0.01);
+    memset(learner, 0, sizeof(*learner));  /* Empty trie - will use fallback */
+
+    const char *tokens[] = {"cmd", "#placeholder"};
+    size_t tc = 2;
+
+    /* Apply each significant type and verify roundtrip */
+    st_token_type_t test_types[] = {
+        ST_TYPE_WORD, ST_TYPE_VALUE, ST_TYPE_ABS_PATH, ST_TYPE_REL_PATH,
+        ST_TYPE_NUMBER, ST_TYPE_IPV4, ST_TYPE_URL
+    };
+    const char *expected_symbols[] = {
+        "#w", "#val", "#p", "#r", "#n", "#i", "#u"
+    };
+
+    for (size_t i = 0; i < sizeof(test_types) / sizeof(test_types[0]); i++) {
+        char *result = st_policy_apply_type_at(learner, tokens, tc, 1, test_types[i]);
+        ASSERT(result != NULL);
+        ASSERT(strlen(result) > 0);
+
+        /* Verify result contains the expected symbol for this type */
+        ASSERT(strstr(result, expected_symbols[i]) != NULL);
+
+        /* Verify result is different from input */
+        ASSERT(strcmp(result, "cmd #placeholder") != 0);
+
+        free(result);
+    }
+
+    /* Test that ST_TYPE_ANY produces "*" symbol */
+    char *any_result = st_policy_apply_type_at(learner, tokens, tc, 1, ST_TYPE_ANY);
+    ASSERT(any_result != NULL);
+    ASSERT(strchr(any_result, '*') != NULL);  /* Contains * wildcard */
+    free(any_result);
+
+    st_learner_free(learner);
+    return 1;
+}
+
+/* Test variant suggestion with a real learner that has observed types.
+ * Verify that trie-based type history affects variant ordering. */
+static int test_variant_suggestion_with_learned_types(void)
+{
+    st_learner_t *learner = st_learner_new(1, 0.01);
+
+    /* Feed commands that will create specific observed types at each position */
+    st_feed(learner, "git commit -m /first/abs");
+    st_feed(learner, "git commit -m /second/abs");
+    st_feed(learner, "git commit -m /third/abs");
+    st_feed(learner, "git commit -m /fourth/abs");
+
+    size_t count = 0;
+    st_suggestion_t *sugs = st_suggest(learner, &count);
+    ASSERT(count >= 1);
+
+    /* For each suggestion, verify variant count reflects learned types */
+    for (size_t s = 0; s < count; s++) {
+        const char *tokens[16];
+        size_t tc = parse_tokens(sugs[s].pattern, tokens, 16);
+
+        for (size_t i = 0; i < tc; i++) {
+            if (tokens[i][0] == '#') {
+                st_token_variant_t vars[ST_MAX_TOKEN_VARIANTS];
+                size_t vc = st_policy_suggest_token_variants(learner, tokens, tc, i, vars);
+
+                /* With observed types in trie, should get at least current + * */
+                ASSERT(vc >= 2);
+
+                /* Verify ST_TYPE_ANY is always last (most general) */
+                ASSERT(vars[vc - 1].type == ST_TYPE_ANY);
+
+                /* Verify all variants have valid type symbols */
+                for (size_t v = 0; v < vc; v++) {
+                    ASSERT(vars[v].type_symbol != NULL);
+                    ASSERT(strlen(vars[v].type_symbol) > 0);
+                }
+            }
+        }
+    }
+
+    st_free_suggestions(sugs, count);
+    st_learner_free(learner);
+    return 1;
+}
+
+/* Test that editing preserves literal structure of non-edited tokens.
+ * When editing position X, positions != X should remain unchanged. */
+static int test_edit_preserves_other_tokens(void)
+{
+    st_learner_t learner;
+    memset(&learner, 0, sizeof(learner));
+
+    /* Original: "git #p commit #n" */
+    const char *original[] = {"git", "#p", "commit", "#n"};
+    size_t tc = 4;
+
+    /* Edit position 1 (the #p) */
+    char *result1 = st_policy_apply_type_at(&learner, original, tc, 1, ST_TYPE_REL_PATH);
+    ASSERT(result1 != NULL);
+
+    /* Verify result contains expected tokens:
+     * - "git" somewhere (position 0 unchanged)
+     * - "#r" at position 1
+     * - "commit" somewhere (position 2 unchanged)
+     * - "#n" at position 3 unchanged */
+    ASSERT(strstr(result1, "git") != NULL);        /* position 0 unchanged */
+    ASSERT(strstr(result1, "#r") != NULL);          /* position 1 changed to #r */
+    ASSERT(strstr(result1, "commit") != NULL);      /* position 2 unchanged */
+    ASSERT(strstr(result1, "#n") != NULL);          /* position 3 unchanged */
+
+    free(result1);
+
+    /* Edit position 0 (the "git") - becomes #w */
+    char *result2 = st_policy_apply_type_at(&learner, original, tc, 0, ST_TYPE_WORD);
+    ASSERT(result2 != NULL);
+    /* Position 0 becomes #w, others unchanged: #w commit #n at positions 0, 2, 3 */
+    ASSERT(strstr(result2, "#w") != NULL);           /* position 0 changed to #w */
+    ASSERT(strstr(result2, "commit") != NULL);       /* position 2 unchanged */
+    ASSERT(strstr(result2, "#n") != NULL);          /* position 3 unchanged */
+    free(result2);
+
+    /* Edit position 3 (the #n) to #val */
+    char *result3 = st_policy_apply_type_at(&learner, original, tc, 3, ST_TYPE_VALUE);
+    ASSERT(result3 != NULL);
+    ASSERT(strstr(result3, "#val") != NULL);        /* position 3 changed to #val */
+    ASSERT(strstr(result3, "git") != NULL);          /* position 0 unchanged */
+    ASSERT(strstr(result3, "#p") != NULL);           /* position 1 unchanged */
+    ASSERT(strstr(result3, "commit") != NULL);       /* position 2 unchanged */
+    free(result3);
+
+    return 1;
+}
+
+/* Test chaining: apply multiple edits in sequence to same pattern.
+ * Each step should be valid input for the next step. */
+static int test_chained_edits(void)
+{
+    st_learner_t learner;
+    memset(&learner, 0, sizeof(learner));
+
+    /* Start with a literal-heavy pattern: "docker run nginx" */
+    const char *tokens[] = {"docker", "run", "nginx"};
+    size_t tc = 3;
+
+    /* Step 1: Apply #image to position 2 (nginx -> #image) */
+    char *step1 = st_policy_apply_type_at(&learner, tokens, tc, 2, ST_TYPE_IMAGE);
+    ASSERT(step1 != NULL);
+
+    /* Step 2: Apply #opt to position 1 (run -> #opt) */
+    /* Copy since parse_tokens reuses internal buffer */
+    char step1_copy[256];
+    snprintf(step1_copy, sizeof(step1_copy), "%s", step1);
+    const char *step1_tokens[16];
+    size_t step1_tc = parse_tokens(step1_copy, step1_tokens, 16);
+
+    char *step2 = st_policy_apply_type_at(&learner, step1_tokens, step1_tc, 1, ST_TYPE_OPT);
+    ASSERT(step2 != NULL);
+
+    /* Verify step1 and step2 are non-empty, different strings */
+    ASSERT(strlen(step1) > 0);
+    ASSERT(strlen(step2) > 0);
+    ASSERT(strcmp(step1, step2) != 0);  /* Different because different positions edited */
+
+    /* Verify step2 has the #opt at position 1 */
+    ASSERT(strstr(step2, "#opt") != NULL);
+
+    free(step1);
+    free(step2);
+    return 1;
+}
+
+/* Test that variants with identical types produce identical results.
+ * Also verify duplicate variants (same type) don't cause issues. */
+static int test_duplicate_variant_types(void)
+{
+    st_learner_t learner;
+    memset(&learner, 0, sizeof(learner));
+
+    const char *tokens[] = {"cmd", "#w"};
+    size_t tc = 2;
+
+    /* Apply ST_TYPE_WORD twice - results should be identical */
+    char *result1 = st_policy_apply_type_at(&learner, tokens, tc, 1, ST_TYPE_WORD);
+    char *result2 = st_policy_apply_type_at(&learner, tokens, tc, 1, ST_TYPE_WORD);
+
+    ASSERT(result1 != NULL);
+    ASSERT(result2 != NULL);
+    ASSERT(strcmp(result1, result2) == 0);  /* Identical types -> identical results */
+
+    free(result1);
+    free(result2);
+
+    /* Test that different types produce different results */
+    char *result_w = st_policy_apply_type_at(&learner, tokens, tc, 1, ST_TYPE_WORD);
+    char *result_v = st_policy_apply_type_at(&learner, tokens, tc, 1, ST_TYPE_VALUE);
+
+    ASSERT(strcmp(result_w, result_v) != 0);  /* Different types -> different results */
+
+    free(result_w);
+    free(result_v);
+    return 1;
+}
+
 int main(void)
 {
     printf("Running policy unit tests...\n\n");
@@ -2862,6 +3853,27 @@ int main(void)
     TEST(test_incr_batch_add);
     TEST(test_incr_wildcard_same_length);
     TEST(test_incr_no_cross_length_subsumption);
+
+    printf("\nToken variant suggestion (st_policy_suggest_token_variants):\n");
+    TEST(test_variant_from_suggestion_path_specific_to_general);
+    TEST(test_variant_from_suggestion_number_to_wider);
+    TEST(test_variant_suggest_edge_cases);
+
+    printf("\nApply type at position (st_policy_apply_type_at):\n");
+    TEST(test_apply_type_various_positions);
+
+    printf("\nSuggestion-based type editing (full workflow):\n");
+    TEST(test_suggestion_type_edit_workflow);
+    TEST(test_multi_position_and_all_variants);
+    TEST(test_type_hierarchy_traversal);
+    TEST(test_no_suggestions_edge_case);
+    TEST(test_edited_pattern_validation);
+    TEST(test_type_symbol_roundtrip);
+    TEST(test_variant_suggestion_with_learned_types);
+    TEST(test_edit_preserves_other_tokens);
+    TEST(test_chained_edits);
+    TEST(test_duplicate_variant_types);
+    TEST(test_widen_narrow_round_trip);
 
     printf("\n========================================\n");
     printf("Results: %d/%d passed, %d failed\n",

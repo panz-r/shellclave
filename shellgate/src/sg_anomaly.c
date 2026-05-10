@@ -46,6 +46,7 @@ static ht_table_t *count_table_create(void) {
 
 static bool count_inc(ht_table_t *t, const char *key, size_t key_len,
                        int64_t inc, size_t *total) {
+    if (!t) return false;
     uint64_t hash = anomaly_hash_fn(key, key_len, NULL);
     bool ok;
     ht_inc_with_hash(t, hash, key, key_len, inc, &ok);

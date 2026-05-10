@@ -569,12 +569,12 @@ sg_error_t sg_gate_set_anomaly_cache_size(sg_gate_t *gate, size_t cache_size)
         return SG_OK;
     }
 
+    /* Free old cache before allocating new (avoids leak if allocation fails) */
+    type_cache_free(&gate->anomaly_type_cache);
+
     /* Allocate new entries array */
     lru_entry_t *new_entries = calloc(cache_size, sizeof(lru_entry_t));
     if (!new_entries) return SG_ERR_MEMORY;
-
-    /* Free old cache */
-    type_cache_free(&gate->anomaly_type_cache);
 
     gate->anomaly_type_cache.entries  = new_entries;
     gate->anomaly_type_cache.capacity = cache_size;
@@ -715,6 +715,118 @@ size_t sg_gate_anomaly_vocab_size(const sg_gate_t *gate)
 {
     if (!gate || !gate->anomaly_model) return 0;
     return sg_anomaly_vocab_size(gate->anomaly_model);
+}
+
+/* ============================================================
+ * SUGGESTION TOKEN VARIANTS
+ * ============================================================ */
+
+/*
+ * Given a suggestion pattern string and a token position, return type variants for editing.
+ * Chain: literal → most_specific (via st_classify_token) → ...
+ *        ... → suggested_wildcard (from suggestion) → ... → #any
+ *
+ * Variants walk from more specific to more general.
+ * st_type_join gives the widening direction toward ST_TYPE_ANY.
+ */
+size_t sg_gate_suggestion_token_variants_at(
+    sg_gate_t *gate,
+    const char *pattern,
+    size_t edit_pos,
+    st_token_variant_t *out_variants,
+    size_t max_variants)
+{
+    (void)gate; /* reserved for future use (learner-based observed types) */
+    if (!pattern || !out_variants || max_variants == 0) return 0;
+    if (pattern[0] == '\0') return 0;
+
+    /* Parse suggestion pattern into tokens */
+    char pattern_copy[ST_MAX_PATTERN_LEN];
+    strncpy(pattern_copy, pattern, sizeof(pattern_copy) - 1);
+    pattern_copy[sizeof(pattern_copy) - 1] = '\0';
+
+    const char *tokens[ST_MAX_CMD_TOKENS];
+    size_t token_count = 0;
+    char *save = NULL;
+    char *tok = strtok_r(pattern_copy, " ", &save);
+    while (tok && token_count < ST_MAX_CMD_TOKENS) {
+        tokens[token_count++] = tok;
+        tok = strtok_r(NULL, " ", &save);
+    }
+    if (token_count == 0 || edit_pos >= token_count) return 0;
+
+    const char *target_tok = tokens[edit_pos];
+
+    /* Determine the starting type:
+     * - If target token is already a wildcard, use that type
+     * - If literal, classify it via st_classify_token to get most specific type */
+    st_token_type_t start_type = st_type_from_pattern_token(target_tok);
+    if (start_type == ST_TYPE_LITERAL) {
+        start_type = st_classify_token(target_tok);
+    }
+
+    /* Build chain: [literal, start_type, ..., suggested_wildcard, ..., ST_TYPE_ANY]
+     * First position is always the literal text */
+    size_t out = 0;
+
+    /* Variant 0: the literal itself */
+    out_variants[out].type = ST_TYPE_LITERAL;
+    out_variants[out].type_symbol = target_tok;
+    out_variants[out].sample_value = NULL;
+    out++;
+
+    /* Variant 1: most specific type for this literal (st_classify_token result) */
+    if (out < max_variants && start_type != ST_TYPE_LITERAL) {
+        out_variants[out].type = start_type;
+        out_variants[out].type_symbol = st_type_symbol[start_type];
+        out_variants[out].sample_value = NULL;
+        out++;
+    }
+
+    /* Remaining variants: walk from start_type toward ST_TYPE_ANY via st_type_join.
+     * We use st_is_compatible to find the next wider type. The join of start_type
+     * and any type gives the next wider type in the lattice.
+     *
+     * We collect seen types to avoid duplicates. Start from the most specific
+     * (after literal and classification), then progressively widen. */
+    bool seen[ST_TYPE_COUNT] = {false};
+    if (start_type != ST_TYPE_LITERAL) seen[start_type] = true;
+
+    st_token_type_t current = start_type;
+
+    /* Widen until we reach ST_TYPE_ANY */
+    while (current != ST_TYPE_ANY) {
+        st_token_type_t next_wide = ST_TYPE_ANY;
+        /* Find the narrowest type that is wider than current (join of current and each candidate) */
+        for (st_token_type_t t = ST_TYPE_LITERAL + 1; t < ST_TYPE_COUNT; t++) {
+            if (t == current || seen[t]) continue;
+            st_token_type_t joined = st_type_join[current][t];
+            if (joined != current && !seen[joined]) {
+                /* joined is wider than current — track the narrowest such option */
+                if (next_wide == ST_TYPE_ANY || st_is_compatible(joined, next_wide)) {
+                    next_wide = joined;
+                }
+            }
+        }
+        if (next_wide == ST_TYPE_ANY || next_wide == current) break;
+        seen[next_wide] = true;
+        out_variants[out].type = next_wide;
+        out_variants[out].type_symbol = st_type_symbol[next_wide];
+        out_variants[out].sample_value = NULL;
+        out++;
+        if (out >= max_variants) break;
+        current = next_wide;
+    }
+
+    /* Final variant: ST_TYPE_ANY (only if not already seen) */
+    if (out < max_variants && !seen[ST_TYPE_ANY]) {
+        out_variants[out].type = ST_TYPE_ANY;
+        out_variants[out].type_symbol = "*";
+        out_variants[out].sample_value = NULL;
+        out++;
+    }
+
+    return out;
 }
 
 /* ============================================================
@@ -1136,16 +1248,19 @@ static void emit_violation(sg_violation_t *viol, uint32_t *count,
 static bool has_control_flow_path(const shell_dep_graph_t *g,
                                     uint32_t from, uint32_t to)
 {
-    bool visited[SHELL_DEP_MAX_NODES];
-    memset(visited, 0, sizeof(visited));
-    uint32_t stack[SHELL_DEP_MAX_NODES];
-    uint32_t sp = 0;
+    if (from == to) return true;
+    bool *visited = calloc(g->node_count, sizeof(bool));
+    if (!visited) return false;
+    uint32_t *stack = malloc(g->node_count * sizeof(uint32_t));
+    if (!stack) { free(visited); return false; }
+
+    size_t sp = 0;
     stack[sp++] = from;
     visited[from] = true;
 
     while (sp > 0) {
         uint32_t cur = stack[--sp];
-        if (cur == to) return true;
+        if (cur == to) { free(visited); free(stack); return true; }
         for (uint32_t i = 0; i < g->edge_count; i++) {
             const shell_dep_edge_t *e = &g->edges[i];
             if (e->from != cur) continue;
@@ -1158,6 +1273,8 @@ static bool has_control_flow_path(const shell_dep_graph_t *g,
             }
         }
     }
+    free(visited);
+    free(stack);
     return false;
 }
 
