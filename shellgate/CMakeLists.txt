@@ -19,8 +19,6 @@ set(SHELLTYPE_DIR    ${CMAKE_SOURCE_DIR}/../shelltype)
 set(DRAUGR_DIR       ${CMAKE_SOURCE_DIR}/../draugr)
 set(XXHASH_DIR       ${CMAKE_SOURCE_DIR}/../vendor/xxhash)
 
-add_subdirectory(${DRAUGR_DIR} ${CMAKE_BINARY_DIR}/draugr)
-
 add_library(xxhash STATIC ${XXHASH_DIR}/xxhash.c)
 target_include_directories(xxhash PUBLIC ${XXHASH_DIR})
 target_compile_definitions(xxhash PRIVATE XXH_STATIC_LINKING_ONLY)
@@ -57,7 +55,8 @@ target_include_directories(shellgate PUBLIC
     ${DRAUGR_DIR}/include
     ${XXHASH_DIR}
 )
-target_link_libraries(shellgate PUBLIC shellsplit_gate shelltype_gate draugr xxhash)
+target_link_libraries(shellgate PUBLIC shellsplit_gate shelltype_gate
+    ${DRAUGR_DIR}/build/libdraugr.a xxhash)
 
 # ── Tests ─────────────────────────────────────────────────────
 enable_testing()
