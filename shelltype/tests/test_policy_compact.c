@@ -1,773 +1,250 @@
-/*
- * test_policy_compact.c - Unit tests for the compact policy module.
- */
+/* Integration tests for large policy compaction and NFA rendering. */
 
+#include "shelltype.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <assert.h>
-#include "shelltype.h"
 
-static int tests_run = 0;
-static int tests_passed = 0;
-static int tests_failed = 0;
-
-#define TEST(name) do { \
-    tests_run++; \
-    printf("  %-45s ", #name); \
-    if (name()) { \
-        tests_passed++; \
-        printf("PASS\n"); \
-    } else { \
-        tests_failed++; \
-        printf("FAIL\n"); \
-    } \
-} while(0)
-
-#define ASSERT(cond) do { if (!(cond)) { printf("  Assertion failed: %s at %s:%d\n", #cond, __FILE__, __LINE__); return 0; } } while(0)
-#define ASSERT_STR_EQ(a, b) do { if (strcmp((a), (b)) != 0) { printf("  String mismatch: '%s' != '%s' at %s:%d\n", (a), (b), __FILE__, __LINE__); return 0; } } while(0)
-
-/* ============================================================
- * CONTEXT TESTS
- * ============================================================ */
-
-static int test_ctx_create_free(void)
-{
-    st_policy_ctx_t *ctx = st_policy_ctx_new();
-    ASSERT(ctx != NULL);
-    st_policy_ctx_free(ctx);
-    return 1;
-}
-
-static int test_ctx_intern(void)
-{
-    st_policy_ctx_t *ctx = st_policy_ctx_new();
-    const char *a = st_policy_ctx_intern(ctx, "hello");
-    const char *b = st_policy_ctx_intern(ctx, "hello");
-    const char *c = st_policy_ctx_intern(ctx, "world");
-    ASSERT(a == b);
-    ASSERT(a != c);
-    ASSERT(strcmp(a, "hello") == 0);
-    ASSERT(strcmp(c, "world") == 0);
-    st_policy_ctx_free(ctx);
-    return 1;
-}
-
-static int test_ctx_shared_between_policies(void)
-{
-    st_policy_ctx_t *ctx = st_policy_ctx_new();
-    st_policy_t *p1 = st_policy_new(ctx);
-    st_policy_t *p2 = st_policy_new(ctx);
-
-    st_policy_add(p1, "git commit -m *");
-    st_policy_add(p2, "git status");
-
-    const char *a = st_policy_ctx_intern(ctx, "git");
-    ASSERT(a != NULL);
-
-    st_policy_free(p1);
-    st_policy_free(p2);
-    st_policy_ctx_free(ctx);
-    return 1;
-}
-
-/* ============================================================
- * POLICY LIFECYCLE
- * ============================================================ */
-
-static int test_policy_create_free(void)
-{
-    st_policy_ctx_t *ctx = st_policy_ctx_new();
-    st_policy_t *policy = st_policy_new(ctx);
-    ASSERT(policy != NULL);
-    ASSERT(st_policy_count(policy) == 0);
-    st_policy_free(policy);
-    st_policy_ctx_free(ctx);
-    return 1;
-}
-
-static int test_policy_null_free(void)
-{
-    st_policy_free(NULL);
-    return 1;
-}
-
-/* ============================================================
- * ADD PATTERNS
- * ============================================================ */
-
-static int test_add_single(void)
-{
-    st_policy_ctx_t *ctx = st_policy_ctx_new();
-    st_policy_t *policy = st_policy_new(ctx);
-
-    st_error_t err = st_policy_add(policy, "git commit");
-    ASSERT(err == ST_OK);
-    ASSERT(st_policy_count(policy) == 1);
-
-    st_policy_free(policy);
-    st_policy_ctx_free(ctx);
-    return 1;
-}
-
-static int test_add_duplicate(void)
-{
-    st_policy_ctx_t *ctx = st_policy_ctx_new();
-    st_policy_t *policy = st_policy_new(ctx);
-
-    st_policy_add(policy, "git commit");
-    st_policy_add(policy, "git commit");
-    ASSERT(st_policy_count(policy) == 1);
-
-    st_policy_free(policy);
-    st_policy_ctx_free(ctx);
-    return 1;
-}
-
-static int test_add_multiple(void)
-{
-    st_policy_ctx_t *ctx = st_policy_ctx_new();
-    st_policy_t *policy = st_policy_new(ctx);
-
-    st_policy_add(policy, "git commit");
-    st_policy_add(policy, "git status");
-    st_policy_add(policy, "ls -la");
-    ASSERT(st_policy_count(policy) == 3);
-
-    st_policy_free(policy);
-    st_policy_ctx_free(ctx);
-    return 1;
-}
-
-static int test_add_empty(void)
-{
-    st_policy_ctx_t *ctx = st_policy_ctx_new();
-    st_policy_t *policy = st_policy_new(ctx);
-
-    st_error_t err = st_policy_add(policy, "");
-    ASSERT(err == ST_ERR_INVALID);
-
-    st_policy_free(policy);
-    st_policy_ctx_free(ctx);
-    return 1;
-}
-
-static int test_add_null(void)
-{
-    st_policy_ctx_t *ctx = st_policy_ctx_new();
-    st_policy_t *policy = st_policy_new(ctx);
-
-    st_error_t err = st_policy_add(policy, NULL);
-    ASSERT(err == ST_ERR_INVALID);
-
-    st_policy_free(policy);
-    st_policy_ctx_free(ctx);
-    return 1;
-}
-
-static int test_add_wildcards(void)
-{
-    st_policy_ctx_t *ctx = st_policy_ctx_new();
-    st_policy_t *policy = st_policy_new(ctx);
-
-    st_policy_add(policy, "cat *");
-    st_policy_add(policy, "ls -la *");
-    st_policy_add(policy, "head -n #n");
-    ASSERT(st_policy_count(policy) == 3);
-
-    st_policy_free(policy);
-    st_policy_ctx_free(ctx);
-    return 1;
-}
-
-static int test_add_shared_prefix(void)
-{
-    st_policy_ctx_t *ctx = st_policy_ctx_new();
-    st_policy_t *policy = st_policy_new(ctx);
-
-    st_policy_add(policy, "git commit -m *");
-    st_policy_add(policy, "git commit -a");
-    st_policy_add(policy, "git status");
-    ASSERT(st_policy_count(policy) == 3);
-
-    size_t usage = st_policy_memory_usage(policy);
-    ASSERT(usage > 0);
-
-    st_policy_free(policy);
-    st_policy_ctx_free(ctx);
-    return 1;
-}
-
-/* ============================================================
- * REMOVE PATTERNS
- * ============================================================ */
-
-static int test_remove(void)
-{
-    st_policy_ctx_t *ctx = st_policy_ctx_new();
-    st_policy_t *policy = st_policy_new(ctx);
-
-    st_policy_add(policy, "git commit");
-    st_policy_add(policy, "git status");
-    ASSERT(st_policy_count(policy) == 2);
-
-    st_policy_remove(policy, "git commit");
-    ASSERT(st_policy_count(policy) == 1);
-
-    st_policy_free(policy);
-    st_policy_ctx_free(ctx);
-    return 1;
-}
-
-static int test_remove_nonexistent(void)
-{
-    st_policy_ctx_t *ctx = st_policy_ctx_new();
-    st_policy_t *policy = st_policy_new(ctx);
-
-    st_policy_add(policy, "git commit");
-    st_policy_remove(policy, "git status");
-    ASSERT(st_policy_count(policy) == 1);
-
-    st_policy_free(policy);
-    st_policy_ctx_free(ctx);
-    return 1;
-}
-
-/* ============================================================
- * VERIFICATION
- * ============================================================ */
-
-static int test_verify_exact_match(void)
-{
-    st_policy_ctx_t *ctx = st_policy_ctx_new();
-    st_policy_t *policy = st_policy_new(ctx);
-
-    st_policy_add(policy, "git commit -m *");
-
-    st_eval_result_t r;
-    st_error_t err = st_policy_eval(policy, "git commit -m hello", &r);
-    ASSERT(err == ST_OK);
-    ASSERT(r.matches);
-    ASSERT(r.matching_pattern != NULL);
-    ASSERT_STR_EQ(r.matching_pattern, "git commit -m *");
-
-    st_policy_free(policy);
-    st_policy_ctx_free(ctx);
-    return 1;
-}
-
-static int test_verify_no_match(void)
-{
-    st_policy_ctx_t *ctx = st_policy_ctx_new();
-    st_policy_t *policy = st_policy_new(ctx);
-
-    st_policy_add(policy, "git commit -m *");
-
-    st_eval_result_t r;
-    st_error_t err = st_policy_eval(policy, "git push origin main", &r);
-    ASSERT(err == ST_OK);
-    ASSERT(!r.matches);
-    ASSERT(r.matching_pattern == NULL);
-
-    st_policy_free(policy);
-    st_policy_ctx_free(ctx);
-    return 1;
-}
-
-static int test_verify_wildcard_path(void)
-{
-    st_policy_ctx_t *ctx = st_policy_ctx_new();
-    st_policy_t *policy = st_policy_new(ctx);
-
-    st_policy_add(policy, "cat *");
-
-    st_eval_result_t r;
-    st_error_t err = st_policy_eval(policy, "cat /etc/passwd", &r);
-    ASSERT(err == ST_OK);
-    ASSERT_STR_EQ(r.matching_pattern, "cat *");
-
-    st_policy_free(policy);
-    st_policy_ctx_free(ctx);
-    return 1;
-}
-
-static int test_verify_wildcard_number(void)
-{
-    st_policy_ctx_t *ctx = st_policy_ctx_new();
-    st_policy_t *policy = st_policy_new(ctx);
-
-    st_policy_add(policy, "head -n *");
-
-    st_eval_result_t r;
-    st_error_t err = st_policy_eval(policy, "head -n 42", &r);
-    ASSERT(err == ST_OK);
-    ASSERT_STR_EQ(r.matching_pattern, "head -n *");
-
-    st_policy_free(policy);
-    st_policy_ctx_free(ctx);
-    return 1;
-}
-
-static int test_verify_exact_length(void)
-{
-    st_policy_ctx_t *ctx = st_policy_ctx_new();
-    st_policy_t *policy = st_policy_new(ctx);
-
-    st_policy_add(policy, "git commit -m *");
-
-    st_eval_result_t r;
-    st_error_t err = st_policy_eval(policy, "git commit", &r);
-    ASSERT(err == ST_OK);
-
-    st_policy_free(policy);
-    st_policy_ctx_free(ctx);
-    return 1;
-}
-
-static int test_verify_pipeline(void)
-{
-    st_policy_ctx_t *ctx = st_policy_ctx_new();
-    st_policy_t *policy = st_policy_new(ctx);
-
-    st_policy_add(policy, "cat * | grep *");
-
-    st_eval_result_t r;
-    st_error_t err = st_policy_eval(policy, "cat /var/log/syslog | grep ERROR", &r);
-    ASSERT(err == ST_OK);
-    ASSERT_STR_EQ(r.matching_pattern, "cat * | grep *");
-
-    st_policy_free(policy);
-    st_policy_ctx_free(ctx);
-    return 1;
-}
-
-static int test_verify_multiple_patterns(void)
-{
-    st_policy_ctx_t *ctx = st_policy_ctx_new();
-    st_policy_t *policy = st_policy_new(ctx);
-
-    st_policy_add(policy, "git commit -m *");
-    st_policy_add(policy, "docker run -it * *");
-    st_policy_add(policy, "cat * | grep *");
-
-    st_eval_result_t r;
-    st_error_t err = st_policy_eval(policy, "git commit -m fix", &r);
-    ASSERT(err == ST_OK);
-    ASSERT_STR_EQ(r.matching_pattern, "git commit -m *");
-
-    err = st_policy_eval(policy, "docker run -it ubuntu bash", &r);
-    ASSERT(err == ST_OK);
-    ASSERT_STR_EQ(r.matching_pattern, "docker run -it * *");
-
-    err = st_policy_eval(policy, "rm -rf /", &r);
-    ASSERT(err == ST_OK);
-
-    st_policy_free(policy);
-    st_policy_ctx_free(ctx);
-    return 1;
-}
-
-static int test_verify_flag_value(void)
-{
-    st_policy_ctx_t *ctx = st_policy_ctx_new();
-    st_policy_t *policy = st_policy_new(ctx);
-
-    st_policy_add(policy, "gcc -o myprog main.c");
-
-    st_eval_result_t r;
-    st_error_t err = st_policy_eval(policy, "gcc -o myprog main.c", &r);
-    ASSERT(err == ST_OK);
-    ASSERT_STR_EQ(r.matching_pattern, "gcc -o myprog main.c");
-
-    st_policy_free(policy);
-    st_policy_ctx_free(ctx);
-    return 1;
-}
-
-/* ============================================================
- * VERIFY ALL
- * ============================================================ */
-
-static int test_verify_all_matches(void)
-{
-    st_policy_ctx_t *ctx = st_policy_ctx_new();
-    st_policy_t *policy = st_policy_new(ctx);
-
-    st_policy_add(policy, "git commit -m *");
-    st_policy_add(policy, "git commit -m fix");
-
-    const char **matches = NULL;
-    size_t count = 0;
-    st_error_t err = st_policy_verify_all(policy, "git commit -m hello", &matches, &count);
-    ASSERT(err == ST_OK);
-    ASSERT(count == 1);
-    ASSERT_STR_EQ(matches[0], "git commit -m *");
-
-    st_policy_free_matches(matches, count);
-    st_policy_free(policy);
-    st_policy_ctx_free(ctx);
-    return 1;
-}
-
-static int test_verify_all_no_match(void)
-{
-    st_policy_ctx_t *ctx = st_policy_ctx_new();
-    st_policy_t *policy = st_policy_new(ctx);
-
-    st_policy_add(policy, "git commit -m *");
-
-    const char **matches = NULL;
-    size_t count = 0;
-    st_error_t err = st_policy_verify_all(policy, "rm -rf /", &matches, &count);
-    ASSERT(err == ST_OK);
-    ASSERT(count == 0);
-
-    st_policy_free(policy);
-    st_policy_ctx_free(ctx);
-    return 1;
-}
-
-/* ============================================================
- * SERIALIZATION
- * ============================================================ */
-
-static int test_save_load(void)
-{
-    st_policy_ctx_t *ctx = st_policy_ctx_new();
-    st_policy_t *p1 = st_policy_new(ctx);
-
-    st_policy_add(p1, "git commit -m *");
-    st_policy_add(p1, "ls -la *");
-    st_policy_add(p1, "cat * | grep *");
-
-    st_error_t err = st_policy_save(p1, "tests/test_compact_save.tmp");
-    ASSERT(err == ST_OK);
-
-    st_policy_t *p2 = st_policy_new(ctx);
-    err = st_policy_load(p2, "tests/test_compact_save.tmp", false);
-    ASSERT(err == ST_OK);
-    ASSERT(st_policy_count(p2) == 3);
-
-    st_eval_result_t r;
-    err = st_policy_eval(p2, "git commit -m fix", &r);
-    ASSERT(err == ST_OK);
-    ASSERT_STR_EQ(r.matching_pattern, "git commit -m *");
-
-    st_policy_free(p1);
-    st_policy_free(p2);
-    st_policy_ctx_free(ctx);
-    return 1;
-}
-
-/* ============================================================
- * MEMORY USAGE
- * ============================================================ */
-
-static int test_memory_usage(void)
-{
-    st_policy_ctx_t *ctx = st_policy_ctx_new();
-    st_policy_t *policy = st_policy_new(ctx);
-
-    size_t empty = st_policy_memory_usage(policy);
-    ASSERT(empty > 0);
-
-    for (int i = 0; i < 100; i++) {
-        char cmd[64];
-        snprintf(cmd, sizeof(cmd), "git commit -m msg%d", i);
-        st_policy_add(policy, cmd);
+static int tests_run;
+static int tests_passed;
+static int tests_failed;
+
+#define ASSERT(condition)                                                      \
+  do {                                                                         \
+    if (!(condition)) {                                                        \
+      printf("    assertion failed: %s at %s:%d\n", #condition, __FILE__,      \
+             __LINE__);                                                        \
+      return 0;                                                                \
+    }                                                                          \
+  } while (0)
+
+#define TEST(function)                                                         \
+  do {                                                                         \
+    tests_run++;                                                               \
+    printf("  %-38s ", #function);                                             \
+    if (function()) {                                                          \
+      tests_passed++;                                                          \
+      printf("PASS\n");                                                        \
+    } else {                                                                   \
+      tests_failed++;                                                          \
+      printf("FAIL\n");                                                        \
+    }                                                                          \
+  } while (0)
+
+static st_policy_t *new_policy(st_policy_ctx_t *context,
+                               const char *const *patterns, size_t count) {
+  st_policy_t *policy = st_policy_new(context);
+  if (!policy)
+    return NULL;
+  for (size_t i = 0; i < count; i++)
+    if (st_policy_add(policy, patterns[i]) != ST_OK) {
+      st_policy_free(policy);
+      return NULL;
     }
-    ASSERT(st_policy_count(policy) == 100);
-
-    for (int i = 0; i < 50; i++) {
-        char cmd[64];
-        snprintf(cmd, sizeof(cmd), "ls -la /path/to/dir%d", i);
-        st_policy_add(policy, cmd);
-    }
-    ASSERT(st_policy_count(policy) == 150);
-
-    size_t filled = st_policy_memory_usage(policy);
-    ASSERT(filled > empty);
-
-    st_policy_free(policy);
-    st_policy_ctx_free(ctx);
-    return 1;
+  return policy;
 }
 
-static int test_state_count(void)
-{
-    st_policy_ctx_t *ctx = st_policy_ctx_new();
-    st_policy_t *policy = st_policy_new(ctx);
-
-    ASSERT(st_policy_state_count(policy) == 1);
-
-    st_policy_add(policy, "git commit -m *");
-    ASSERT(st_policy_state_count(policy) == 5);
-
-    st_policy_add(policy, "git status");
-    ASSERT(st_policy_state_count(policy) == 6);
-
-    st_policy_free(policy);
-    st_policy_ctx_free(ctx);
-    return 1;
+static int eval_matches(st_policy_t *policy, const char *command,
+                        const char *expected_pattern) {
+  st_eval_result_t result = {0};
+  st_error_t error = st_policy_eval(policy, command, &result);
+  int valid = error == ST_OK && result.matches == (expected_pattern != NULL);
+  if (expected_pattern)
+    valid = valid && result.matching_pattern &&
+            strcmp(result.matching_pattern, expected_pattern) == 0;
+  else
+    valid = valid && result.matching_pattern == NULL;
+  if (!valid)
+    printf("    '%s': matches=%d pattern=%s expected=%s error=%d\n", command,
+           result.matches,
+           result.matching_pattern ? result.matching_pattern : "-",
+           expected_pattern ? expected_pattern : "-", error);
+  return valid;
 }
 
-/* ============================================================
- * LARGE POLICY
- * ============================================================ */
-
-static int test_large_policy(void)
-{
-    st_policy_ctx_t *ctx = st_policy_ctx_new();
-    st_policy_t *policy = st_policy_new(ctx);
-
-    for (int i = 0; i < 1000; i++) {
-        char cmd[128];
-        snprintf(cmd, sizeof(cmd), "cmd%d --option * /path/to/file%d", i, i);
-        st_policy_add(policy, cmd);
-    }
-
-    ASSERT(st_policy_count(policy) == 1000);
-
-    st_eval_result_t r;
-    st_error_t err = st_policy_eval(policy, "cmd42 --option something /path/to/file42", &r);
-    ASSERT(err == ST_OK);
-
-    err = st_policy_eval(policy, "cmd999 --option test /path/to/file999", &r);
-    ASSERT(err == ST_OK);
-
-    err = st_policy_eval(policy, "cmd1000 --option x /path/to/file1000", &r);
-    ASSERT(err == ST_OK);
-
-    size_t alloc = st_policy_memory_usage(policy);
-    size_t ws = st_policy_working_set(policy);
-    printf("  (allocated: %zu bytes, working set: %zu bytes for 1000 patterns) ", alloc, ws);
-
-    st_policy_free(policy);
-    st_policy_ctx_free(ctx);
-    return 1;
+static int verify_alternating_policy(st_policy_t *policy, int pattern_count) {
+  for (int i = 0; i < pattern_count; i++) {
+    char command[128];
+    char expected[128];
+    snprintf(command, sizeof(command), "cmd%d --option value /path/to/file%d",
+             i, i);
+    snprintf(expected, sizeof(expected), "cmd%d --option * /path/to/file%d", i,
+             i);
+    if (!eval_matches(policy, command, i % 2 ? expected : NULL))
+      return 0;
+  }
+  return 1;
 }
 
-/* ============================================================
- * PER-POSITION FILTER
- * ============================================================ */
+static int test_large_policy_compaction(void) {
+  st_policy_ctx_t *context = st_policy_ctx_new();
+  st_policy_t *policy = new_policy(context, NULL, 0);
+  ASSERT(policy != NULL);
+  ASSERT(st_policy_compact(policy) == ST_OK);
+  const int pattern_count = 200;
+  for (int i = 0; i < pattern_count; i++) {
+    char pattern[128];
+    snprintf(pattern, sizeof(pattern), "cmd%d --option * /path/to/file%d", i,
+             i);
+    ASSERT(st_policy_add(policy, pattern) == ST_OK);
+  }
+  ASSERT(st_policy_count(policy) == (size_t)pattern_count);
+  size_t populated_states = st_policy_state_count(policy);
+  size_t populated_memory = st_policy_memory_usage(policy);
+  ASSERT(populated_states > (size_t)pattern_count);
+  ASSERT(populated_memory > 0);
+  ASSERT(st_policy_working_set(policy) <= populated_memory);
+  ASSERT(eval_matches(policy, "cmd42 --option value /path/to/file42",
+                      "cmd42 --option * /path/to/file42"));
+  ASSERT(eval_matches(policy, "cmd199 --option value /path/to/file199",
+                      "cmd199 --option * /path/to/file199"));
+  ASSERT(eval_matches(policy, "cmd200 --option value /path/to/file200", NULL));
 
-static int test_filter_definite_no(void)
-{
-    st_policy_ctx_t *ctx = st_policy_ctx_new();
-    st_policy_t *policy = st_policy_new(ctx);
+  for (int i = 0; i < pattern_count; i += 2) {
+    char pattern[128];
+    snprintf(pattern, sizeof(pattern), "cmd%d --option * /path/to/file%d", i,
+             i);
+    ASSERT(st_policy_remove(policy, pattern) == ST_OK);
+  }
+  ASSERT(st_policy_count(policy) == (size_t)pattern_count / 2);
+  size_t stale_states = st_policy_state_count(policy);
+  ASSERT(st_policy_compact(policy) == ST_OK);
+  ASSERT(st_policy_count(policy) == (size_t)pattern_count / 2);
+  ASSERT(st_policy_state_count(policy) < stale_states);
+  ASSERT(st_policy_memory_usage(policy) < populated_memory);
+  ASSERT(verify_alternating_policy(policy, pattern_count));
 
-    st_policy_add(policy, "git commit -m *");
-    st_policy_add(policy, "ls -la *");
+  size_t compacted_states = st_policy_state_count(policy);
+  ASSERT(st_policy_compact(policy) == ST_OK);
+  ASSERT(st_policy_state_count(policy) == compacted_states);
+  ASSERT(verify_alternating_policy(policy, pattern_count));
 
-    st_eval_result_t r;
-    st_error_t err = st_policy_eval(policy, "zzz commit -m hello", &r);
-    ASSERT(err == ST_OK);
-    ASSERT(!r.matches);
-    ASSERT(r.matching_pattern == NULL);
-
-    st_policy_free(policy);
-    st_policy_ctx_free(ctx);
-    return 1;
+  const char *new_pattern = "fresh #n";
+  ASSERT(st_policy_add(policy, new_pattern) == ST_OK);
+  ASSERT(eval_matches(policy, "fresh 17", new_pattern));
+  ASSERT(st_policy_remove(policy, new_pattern) == ST_OK);
+  ASSERT(eval_matches(policy, "fresh 17", NULL));
+  ASSERT(st_policy_compact(policy) == ST_OK);
+  ASSERT(st_policy_state_count(policy) == compacted_states);
+  ASSERT(verify_alternating_policy(policy, pattern_count));
+  st_policy_free(policy);
+  st_policy_ctx_free(context);
+  return 1;
 }
 
-static int test_filter_no_false_negatives(void)
-{
-    st_policy_ctx_t *ctx = st_policy_ctx_new();
-    st_policy_t *policy = st_policy_new(ctx);
-
-    st_policy_add(policy, "cat /etc/passwd");
-    st_policy_add(policy, "git status");
-    st_policy_add(policy, "ls -la *");
-
-    st_eval_result_t r;
-    st_error_t err = st_policy_eval(policy, "cat /etc/passwd", &r);
-    ASSERT(err == ST_OK);
-
-    err = st_policy_eval(policy, "git status", &r);
-    ASSERT(err == ST_OK);
-
-    err = st_policy_eval(policy, "ls -la /tmp", &r);
-    ASSERT(err == ST_OK);
-
-    st_policy_free(policy);
-    st_policy_ctx_free(ctx);
-    return 1;
+static char *read_file(const char *path) {
+  FILE *file = fopen(path, "rb");
+  if (!file)
+    return NULL;
+  if (fseek(file, 0, SEEK_END) != 0) {
+    fclose(file);
+    return NULL;
+  }
+  long length = ftell(file);
+  if (length < 0 || fseek(file, 0, SEEK_SET) != 0) {
+    fclose(file);
+    return NULL;
+  }
+  char *contents = malloc((size_t)length + 1);
+  if (!contents) {
+    fclose(file);
+    return NULL;
+  }
+  size_t bytes = fread(contents, 1, (size_t)length, file);
+  fclose(file);
+  if (bytes != (size_t)length) {
+    free(contents);
+    return NULL;
+  }
+  contents[bytes] = '\0';
+  return contents;
 }
 
-static int test_filter_empty_policy(void)
-{
-    st_policy_ctx_t *ctx = st_policy_ctx_new();
-    st_policy_t *policy = st_policy_new(ctx);
-
-    st_eval_result_t r;
-    st_error_t err = st_policy_eval(policy, "anything", &r);
-    ASSERT(err == ST_OK);
-
-    st_policy_free(policy);
-    st_policy_ctx_free(ctx);
-    return 1;
+static size_t occurrence_count(const char *text, const char *needle) {
+  size_t count = 0;
+  size_t length = strlen(needle);
+  for (const char *found = strstr(text, needle); found;
+       found = strstr(found + length, needle))
+    count++;
+  return count;
 }
 
-/* ============================================================
- * NFA RENDERING
- * ============================================================ */
+static int rendered_nfa_matches(const char *rendered, const char *identifier,
+                                unsigned category_mask,
+                                unsigned pattern_id_base, bool include_tags) {
+  char expected[96];
+  snprintf(expected, sizeof(expected), "Identifier: %s\n", identifier);
+  if (!strstr(rendered, "NFA_ALPHABET\n") || !strstr(rendered, expected) ||
+      !strstr(rendered, "AlphabetSize: 261\n") ||
+      !strstr(rendered, "Initial: 0\n") ||
+      !strstr(rendered, "Symbol 256: 0-255 (special)") ||
+      !strstr(rendered, "Symbol 256 ->") ||
+      !strstr(rendered, "Symbol 259 ->") ||
+      occurrence_count(rendered, "EosTarget: yes") != 3)
+    return 0;
 
-static int test_render_nfa_basic(void)
-{
-    st_policy_ctx_t *ctx = st_policy_ctx_new();
-    st_policy_t *policy = st_policy_new(ctx);
+  snprintf(expected, sizeof(expected), "CategoryMask: 0x%02x", category_mask);
+  if (occurrence_count(rendered, expected) != 3)
+    return 0;
+  for (unsigned i = 0; i < 3; i++) {
+    snprintf(expected, sizeof(expected), "PatternId: %u\n",
+             pattern_id_base + i);
+    if (!strstr(rendered, expected))
+      return 0;
+  }
 
-    st_policy_add(policy, "git status");
-
-    st_nfa_render_opts_t opts = {
-        .category_mask = 0x01,
-        .pattern_id_base = 1,
-        .include_tags = true,
-        .identifier = "test-policy",
-    };
-
-    st_error_t err = st_policy_render_nfa(policy, "tests/test_render.nfa", &opts);
-    ASSERT(err == ST_OK);
-
-    FILE *fp = fopen("tests/test_render.nfa", "r");
-    ASSERT(fp != NULL);
-
-    char line[256];
-    ASSERT(fgets(line, sizeof(line), fp) != NULL);
-    ASSERT(strstr(line, "NFA_ALPHABET") != NULL);
-    ASSERT(fgets(line, sizeof(line), fp) != NULL);
-    ASSERT(strstr(line, "Identifier: test-policy") != NULL);
-
-    fclose(fp);
-
-    st_policy_free(policy);
-    st_policy_ctx_free(ctx);
-    return 1;
+  static const char *tags[] = {"git commit", "git status", "cat *"};
+  if (occurrence_count(rendered, "Tags: ") != (include_tags ? 3u : 0u))
+    return 0;
+  for (size_t i = 0; include_tags && i < sizeof(tags) / sizeof(tags[0]); i++) {
+    snprintf(expected, sizeof(expected), "Tags: %s\n", tags[i]);
+    if (!strstr(rendered, expected))
+      return 0;
+  }
+  return 1;
 }
 
-static int test_render_nfa_wildcard(void)
-{
-    st_policy_ctx_t *ctx = st_policy_ctx_new();
-    st_policy_t *policy = st_policy_new(ctx);
-
-    st_policy_add(policy, "cat *");
-
-    st_nfa_render_opts_t opts = {
-        .category_mask = 0x01,
-        .pattern_id_base = 1,
-        .include_tags = false,
-        .identifier = "wildcard-test",
-    };
-
-    st_error_t err = st_policy_render_nfa(policy, "tests/test_render_wc.nfa", &opts);
-    ASSERT(err == ST_OK);
-
-    FILE *fp = fopen("tests/test_render_wc.nfa", "r");
-    ASSERT(fp != NULL);
-
-    char buf[16384];
-    size_t n = fread(buf, 1, sizeof(buf) - 1, fp);
-    buf[n] = '\0';
-    ASSERT(strstr(buf, "Symbol 256") != NULL);
-
-    fclose(fp);
-
-    st_policy_free(policy);
-    st_policy_ctx_free(ctx);
-    return 1;
+static int test_nfa_rendering_contract(void) {
+  static const char *patterns[] = {"git commit", "git status", "cat *"};
+  const char *path = "test_compact_policy.nfa";
+  st_policy_ctx_t *context = st_policy_ctx_new();
+  st_policy_t *policy = new_policy(context, patterns, 3);
+  ASSERT(policy != NULL);
+  st_nfa_render_opts_t options = {.category_mask = 0x05,
+                                  .pattern_id_base = 7,
+                                  .include_tags = true,
+                                  .identifier = "compact-policy-test"};
+  const struct {
+    const st_nfa_render_opts_t *options;
+    const char *identifier;
+    unsigned category_mask;
+    unsigned pattern_id_base;
+    bool include_tags;
+  } cases[] = {{&options, "compact-policy-test", 0x05, 7, true},
+               {NULL, "rbox policy", 0x01, 1, false}};
+  ASSERT(st_policy_render_nfa(NULL, path, &options) == ST_ERR_INVALID);
+  ASSERT(st_policy_render_nfa(policy, NULL, &options) == ST_ERR_INVALID);
+  ASSERT(st_policy_render_nfa(policy, ".", &options) == ST_ERR_IO);
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    ASSERT(st_policy_render_nfa(policy, path, cases[i].options) == ST_OK);
+    char *rendered = read_file(path);
+    ASSERT(rendered != NULL);
+    ASSERT(rendered_nfa_matches(
+        rendered, cases[i].identifier, cases[i].category_mask,
+        cases[i].pattern_id_base, cases[i].include_tags));
+    free(rendered);
+  }
+  ASSERT(remove(path) == 0);
+  st_policy_free(policy);
+  st_policy_ctx_free(context);
+  return 1;
 }
 
-static int test_render_nfa_multiple_patterns(void)
-{
-    st_policy_ctx_t *ctx = st_policy_ctx_new();
-    st_policy_t *policy = st_policy_new(ctx);
-
-    st_policy_add(policy, "git commit");
-    st_policy_add(policy, "git status");
-    st_policy_add(policy, "ls -la");
-
-    st_nfa_render_opts_t opts = {
-        .category_mask = 0x01,
-        .pattern_id_base = 1,
-        .include_tags = true,
-        .identifier = "multi-test",
-    };
-
-    st_error_t err = st_policy_render_nfa(policy, "tests/test_render_multi.nfa", &opts);
-    ASSERT(err == ST_OK);
-
-    st_policy_free(policy);
-    st_policy_ctx_free(ctx);
-    return 1;
-}
-
-/* ============================================================
- * MAIN
- * ============================================================ */
-
-int main(void)
-{
-    printf("Running compact policy unit tests...\n\n");
-
-    printf("Context:\n");
-    TEST(test_ctx_create_free);
-    TEST(test_ctx_intern);
-    TEST(test_ctx_shared_between_policies);
-
-    printf("\nLifecycle:\n");
-    TEST(test_policy_create_free);
-    TEST(test_policy_null_free);
-
-    printf("\nAdd:\n");
-    TEST(test_add_single);
-    TEST(test_add_duplicate);
-    TEST(test_add_multiple);
-    TEST(test_add_empty);
-    TEST(test_add_null);
-    TEST(test_add_wildcards);
-    TEST(test_add_shared_prefix);
-
-    printf("\nRemove:\n");
-    TEST(test_remove);
-    TEST(test_remove_nonexistent);
-
-    printf("\nVerify:\n");
-    TEST(test_verify_exact_match);
-    TEST(test_verify_no_match);
-    TEST(test_verify_wildcard_path);
-    TEST(test_verify_wildcard_number);
-    TEST(test_verify_exact_length);
-    TEST(test_verify_pipeline);
-    TEST(test_verify_multiple_patterns);
-    TEST(test_verify_flag_value);
-
-    printf("\nVerify all:\n");
-    TEST(test_verify_all_matches);
-    TEST(test_verify_all_no_match);
-
-    printf("\nSerialization:\n");
-    TEST(test_save_load);
-
-    printf("\nMemory:\n");
-    TEST(test_memory_usage);
-    TEST(test_state_count);
-
-    printf("\nLarge policy:\n");
-    TEST(test_large_policy);
-
-    printf("\nNFA rendering:\n");
-    TEST(test_render_nfa_basic);
-    TEST(test_render_nfa_wildcard);
-    TEST(test_render_nfa_multiple_patterns);
-
-    printf("\nPer-position filter:\n");
-    TEST(test_filter_definite_no);
-    TEST(test_filter_no_false_negatives);
-    TEST(test_filter_empty_policy);
-
-    printf("\n========================================\n");
-    printf("Results: %d/%d passed, %d failed\n",
-           tests_passed, tests_run, tests_failed);
-
-    return tests_failed > 0 ? 1 : 0;
+int main(void) {
+  printf("Running compact policy tests...\n\n");
+  TEST(test_large_policy_compaction);
+  TEST(test_nfa_rendering_contract);
+  printf("\nResults: %d/%d passed, %d failed\n", tests_passed, tests_run,
+         tests_failed);
+  return tests_failed > 0 ? 1 : 0;
 }

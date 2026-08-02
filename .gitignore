@@ -1,3 +1,51 @@
+# Local task and contributor notes
+TASK.md
+commitmsgstyle.md
+
+# CMake and generated build trees
+/build*/
+/cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+CTestTestfile.cmake
+cmake_install.cmake
+compile_commands.json
+install_manifest.txt
+Testing/
+
+# Compilers, coverage, sanitizers, and fuzzers
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+*.o
+*.obj
+*.gcda
+*.gcno
+*.gcov
+coverage.info
+coverage/
+htmlcov/
+core
+core.*
+crash-*
+leak-*
+
 # Fuzzer-generated input corpora
 /shellgate/fuzz/corpus/
 /shellsplit/fuzz/corpus/
+
+# Test scratch files and generated diagrams/logs
+*.tmp
+*.log
+*.nfa
+*.dot
+shellsplit/tests/generator_crashes.log
+
+# Editors and operating systems
+.cache/
+.idea/
+.vscode/
+*~
+.DS_Store

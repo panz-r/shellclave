@@ -261,6 +261,7 @@ ro_command_result_t ro_validate_command_line(
 
     // Clean up
     shell_free_transformed_commands(cmds, count);
+    free(cmds);
     return overall_result;
 }
 ```

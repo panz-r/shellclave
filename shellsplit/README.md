@@ -19,14 +19,10 @@ Output:
 ## Quick Start
 
 ```bash
-# Build
-make
-
-# Test
-make test
-
-# Clean
-make clean
+# From the repository root
+cmake -S . -B build
+cmake --build build
+ctest --test-dir build --output-on-failure
 ```
 
 ## Features
@@ -81,17 +77,11 @@ See `docs/` for detailed documentation:
 
 ```
 shellsplit/
-├── include/           # Public headers
-│   ├── shell_tokenizer.h
-│   ├── shell_processor.h
-│   ├── shell_transform.h
-│   └── shell_tokenizer_ext.h
-├── src/              # Implementation
-│   ├── shell_tokenizer.c
-│   ├── shell_processor.c
-│   ├── shell_transform.c
-│   └── shell_tokenizer_ext.c
-├── tests/            # Test code
-│   └── tokenizer_test.c
-└── docs/             # Documentation
+├── include/           # Installed Shellsplit API
+├── src/               # Production library implementation
+├── tests/
+│   └── generator/     # Test-only AST and deterministic instance generator
+├── tools/             # Demonstration and command-line programs
+├── fuzz/              # libFuzzer harness and local run helpers
+└── docs/              # Design and syntax documentation
 ```

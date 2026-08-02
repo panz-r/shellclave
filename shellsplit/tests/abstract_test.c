@@ -3,596 +3,453 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <assert.h>
 
-static int passed = 0;
-static int failed = 0;
+static int passed;
+static int failed;
 
-#define TEST(name, cond) do { \
-    if (cond) { \
-        printf("  [PASS] %s\n", name); \
-        passed++; \
-    } else { \
-        printf("  [FAIL] %s\n", name); \
-        failed++; \
-    } \
-} while(0)
+#define TEST(name, condition)                                                  \
+  do {                                                                         \
+    if (condition) {                                                           \
+      printf("  [PASS] %s\n", name);                                           \
+      passed++;                                                                \
+    } else {                                                                   \
+      printf("  [FAIL] %s\n", name);                                           \
+      failed++;                                                                \
+    }                                                                          \
+  } while (0)
 
-void test_basic_abstraction() {
-    printf("\n=== Basic Abstraction Tests ===\n");
-    
-    // Test 1: Simple command with environment variable
-    {
-        abstracted_command_t* result = NULL;
-        bool ok = shell_abstract_command("echo $PATH", &result);
-        TEST("Abstract env var", ok && result != NULL);
-        if (result) {
-            TEST("Abstracted form contains $EV_1", 
-                 strstr(result->abstracted, "$EV_1") != NULL);
-            TEST("Has variables flag", shell_has_variables(result));
-            shell_abstracted_destroy(result);
-        }
-    }
-    
-    // Test 2: Command with absolute path
-    {
-        abstracted_command_t* result = NULL;
-        bool ok = shell_abstract_command("cat /etc/passwd", &result);
-        TEST("Abstract absolute path", ok && result != NULL);
-        if (result) {
-            TEST("Abstracted form contains $AP_1", 
-                 strstr(result->abstracted, "$AP_1") != NULL);
-            TEST("Has paths flag", shell_has_paths(result));
-            TEST("Has abs_paths flag", shell_has_abs_paths(result));
-            shell_abstracted_destroy(result);
-        }
-    }
-    
-    // Test 3: Command with relative path
-    {
-        abstracted_command_t* result = NULL;
-        bool ok = shell_abstract_command("cat ./foo.txt", &result);
-        TEST("Abstract relative path", ok && result != NULL);
-        if (result) {
-            TEST("Abstracted form contains $RP_1", 
-                 strstr(result->abstracted, "$RP_1") != NULL);
-            TEST("Has rel_paths flag", shell_has_rel_paths(result));
-            shell_abstracted_destroy(result);
-        }
-    }
-    
-    // Test 4: Command with home path
-    {
-        abstracted_command_t* result = NULL;
-        bool ok = shell_abstract_command("ls ~/documents", &result);
-        TEST("Abstract home path", ok && result != NULL);
-        if (result) {
-            TEST("Abstracted form contains $HP_1", 
-                 strstr(result->abstracted, "$HP_1") != NULL);
-            TEST("Has home_paths flag", shell_has_home_paths(result));
-            shell_abstracted_destroy(result);
-        }
-    }
-    
-    // Test 5: Command with glob
-    {
-        abstracted_command_t* result = NULL;
-        bool ok = shell_abstract_command("ls *.txt", &result);
-        TEST("Abstract glob", ok && result != NULL);
-        if (result) {
-            TEST("Abstracted form contains $GB_1", 
-                 strstr(result->abstracted, "$GB_1") != NULL);
-            TEST("Has globs flag", shell_has_globs(result));
-            shell_abstracted_destroy(result);
-        }
-    }
-    
-    // Test 6: Command with positional variable
-    {
-        abstracted_command_t* result = NULL;
-        bool ok = shell_abstract_command("echo $1", &result);
-        TEST("Abstract positional var", ok && result != NULL);
-        if (result) {
-            TEST("Abstracted form contains $PV_1", 
-                 strstr(result->abstracted, "$PV_1") != NULL);
-            TEST("Has pos_vars flag", shell_has_pos_vars(result));
-            shell_abstracted_destroy(result);
-        }
-    }
-    
-    // Test 7: Command with special variable
-    {
-        abstracted_command_t* result = NULL;
-        bool ok = shell_abstract_command("echo $?", &result);
-        TEST("Abstract special var", ok && result != NULL);
-        if (result) {
-            TEST("Abstracted form contains $SV_1", 
-                 strstr(result->abstracted, "$SV_1") != NULL);
-            TEST("Has special_vars flag", shell_has_special_vars(result));
-            shell_abstracted_destroy(result);
-        }
-    }
+enum {
+  FLAG_VARIABLES = 1u << 0,
+  FLAG_POS_VARS = 1u << 1,
+  FLAG_SPECIAL_VARS = 1u << 2,
+  FLAG_GLOBS = 1u << 3,
+  FLAG_PATHS = 1u << 4,
+  FLAG_ABS_PATHS = 1u << 5,
+  FLAG_REL_PATHS = 1u << 6,
+  FLAG_HOME_PATHS = 1u << 7,
+  FLAG_CMD_SUBST = 1u << 8,
+  FLAG_ARITHMETIC = 1u << 9,
+  FLAG_STRINGS = 1u << 10,
+  FLAG_REDIRECTS = 1u << 11,
+};
+
+static unsigned feature_mask(abstracted_command_t *command) {
+  return (shell_has_variables(command) ? FLAG_VARIABLES : 0) |
+         (shell_has_pos_vars(command) ? FLAG_POS_VARS : 0) |
+         (shell_has_special_vars(command) ? FLAG_SPECIAL_VARS : 0) |
+         (shell_has_globs(command) ? FLAG_GLOBS : 0) |
+         (shell_has_paths(command) ? FLAG_PATHS : 0) |
+         (shell_has_abs_paths(command) ? FLAG_ABS_PATHS : 0) |
+         (shell_has_rel_paths(command) ? FLAG_REL_PATHS : 0) |
+         (shell_has_home_paths(command) ? FLAG_HOME_PATHS : 0) |
+         (shell_has_cmd_subst(command) ? FLAG_CMD_SUBST : 0) |
+         (shell_has_arithmetic(command) ? FLAG_ARITHMETIC : 0) |
+         (shell_has_strings(command) ? FLAG_STRINGS : 0) |
+         (shell_has_redirects(command) ? FLAG_REDIRECTS : 0);
 }
 
-void test_combined_abstraction() {
-    printf("\n=== Combined Abstraction Tests ===\n");
-    
-    // Test: Multiple elements of same type
-    {
-        abstracted_command_t* result = NULL;
-        bool ok = shell_abstract_command("grep $USER $HOME/file $PATH", &result);
-        TEST("Multiple vars get unique indices", ok && result != NULL);
-        if (result) {
-            // 4 tokens: grep, $USER, $HOME/file, $PATH -> 3 abstractable elements
-            TEST("Has $EV_1", strstr(result->abstracted, "$EV_1") != NULL);
-            TEST("Has $EV_2", strstr(result->abstracted, "$EV_2") != NULL);
-            TEST("Has $EV_3", strstr(result->abstracted, "$EV_3") != NULL);
-            TEST("Element count is 4", result->element_count == 4);
-            shell_abstracted_destroy(result);
-        }
-    }
-    
-    // Test: Mix of different types
-    {
-        abstracted_command_t* result = NULL;
-        bool ok = shell_abstract_command("grep -i $PATTERN /etc/*.conf ~user/*.txt", &result);
-        TEST("Mixed types", ok && result != NULL);
-        if (result) {
-            TEST("Has $EV_1", strstr(result->abstracted, "$EV_1") != NULL);
-            TEST("Has $GB_1", strstr(result->abstracted, "$GB_1") != NULL);
-            TEST("Has $GB_2", strstr(result->abstracted, "$GB_2") != NULL);
-            TEST("Has variables", shell_has_variables(result));
-            TEST("Has globs", shell_has_globs(result));
-            TEST("Has no paths", !shell_has_paths(result));
-            shell_abstracted_destroy(result);
-        }
-    }
-    
-    // Test: Command with command substitution
-    {
-        abstracted_command_t* result = NULL;
-        bool ok = shell_abstract_command("cat $(cat file.txt)", &result);
-        TEST("Command substitution", ok && result != NULL);
-        if (result) {
-            TEST("Has $CS_1", strstr(result->abstracted, "$CS_1") != NULL);
-            TEST("Has cmd_subst flag", shell_has_cmd_subst(result));
-            shell_abstracted_destroy(result);
-        }
-    }
-    
-    // Test: Command with backtick substitution
-    {
-        abstracted_command_t* result = NULL;
-        bool ok = shell_abstract_command("echo `date`", &result);
-        TEST("Backtick substitution", ok && result != NULL);
-        if (result) {
-            TEST("Has $CS_1", strstr(result->abstracted, "$CS_1") != NULL);
-            shell_abstracted_destroy(result);
-        }
-    }
-    
-    // Test: Command with arithmetic
-    {
-        abstracted_command_t* result = NULL;
-        bool ok = shell_abstract_command("echo $((x+1))", &result);
-        TEST("Arithmetic expansion", ok && result != NULL);
-        if (result) {
-            TEST("Has $AR_1", strstr(result->abstracted, "$AR_1") != NULL);
-            TEST("Has arithmetic flag", shell_has_arithmetic(result));
-            shell_abstracted_destroy(result);
-        }
-    }
-    
-    // Test: Command with quoted string
-    {
-        abstracted_command_t* result = NULL;
-        bool ok = shell_abstract_command("echo \"hello world\"", &result);
-        TEST("Quoted string", ok && result != NULL);
-        if (result) {
-            TEST("Has $STR_1", strstr(result->abstracted, "$STR_1") != NULL);
-            TEST("Has strings flag", shell_has_strings(result));
-            shell_abstracted_destroy(result);
-        }
-    }
+static bool validate_elements(const char *input, abstracted_command_t *result) {
+  size_t count = 0;
+  abstract_element_t **elements = shell_get_elements(result, &count);
+  bool valid = count == result->element_count && elements == result->elements &&
+               shell_get_element_at(result, count) == NULL;
+  size_t input_len = strlen(input);
+
+  for (size_t i = 0; valid && i < count; i++) {
+    abstract_element_t *element = elements[i];
+    valid = element && element == shell_get_element_at(result, i) &&
+            element ==
+                shell_get_element_by_abstract(result, element->abstraction) &&
+            element->start < element->end && element->end <= input_len &&
+            strlen(element->original) == element->end - element->start &&
+            memcmp(element->original, input + element->start,
+                   element->end - element->start) == 0 &&
+            (i == 0 || elements[i - 1]->start <= element->start);
+  }
+  return valid;
 }
 
-void test_element_access() {
-    printf("\n=== Element Access Tests ===\n");
-    
-    {
-        abstracted_command_t* result = NULL;
-        bool ok = shell_abstract_command("cat $HOME/file.txt /etc/passwd *.log", &result);
-        TEST("Element access setup", ok && result != NULL);
-        
-        if (result) {
-            size_t count = 0;
-            shell_get_elements(result, &count);
-            TEST("Get element count", count == 4);
-            
-            // Test element by abstract - $EV_1 is $HOME/file
-            abstract_element_t* elem = shell_get_element_by_abstract(result, "$EV_1");
-            TEST("Get element by $EV_1", elem != NULL);
-            if (elem) {
-                TEST("Element original is $HOME", 
-                     strcmp(elem->original, "$HOME") == 0);
-                TEST("Element data.var.name is HOME",
-                     elem->data.var.name && strcmp(elem->data.var.name, "HOME") == 0);
-            }
-            
-            // Test element by index
-            elem = shell_get_element_at(result, 0);
-            TEST("Get element at 0", elem != NULL);
-            
-            // Test get original
-            const char* orig = shell_get_original(result);
-            TEST("Get original", orig != NULL && strlen(orig) > 0);
-            
-            // Test get abstracted
-            const char* abst = shell_get_abstracted(result);
-            TEST("Get abstracted", abst != NULL && strlen(abst) > 0);
-            
-            shell_abstracted_destroy(result);
-        }
-    }
+static void test_abstraction_matrix(void) {
+  printf("\n=== Exact Abstraction Matrix ===\n");
+
+  static const struct {
+    const char *name;
+    const char *input;
+    const char *expected;
+    size_t elements;
+    unsigned flags;
+  } cases[] = {
+      {"literal command", "ls -la", "ls -la", 0, 0},
+      {"environment variable", "echo $PATH", "echo $EV_1", 1, FLAG_VARIABLES},
+      {"absolute path", "cat /etc/passwd", "cat $AP_1", 1,
+       FLAG_PATHS | FLAG_ABS_PATHS},
+      {"relative path", "cat ./foo.txt", "cat $RP_1", 1,
+       FLAG_PATHS | FLAG_REL_PATHS},
+      {"parent-relative path", "cat ../foo.txt", "cat $RP_1", 1,
+       FLAG_PATHS | FLAG_REL_PATHS},
+      {"home path", "ls ~/documents", "ls $HP_1", 1,
+       FLAG_PATHS | FLAG_HOME_PATHS},
+      {"glob", "ls *.txt", "ls $GB_1", 1, FLAG_GLOBS},
+      {"positional parameter boundaries", "echo $1 $10 ${10}",
+       "echo $PV_1 $PV_20 $PV_3", 3, FLAG_VARIABLES | FLAG_POS_VARS},
+      {"special parameter family", "echo $? $$ $# $! $@ $* $-",
+       "echo $SV_1 $SV_2 $SV_3 $SV_4 $SV_5 $SV_6 $SV_7", 7,
+       FLAG_VARIABLES | FLAG_SPECIAL_VARS},
+      {"command substitution", "cat $(cat file.txt)", "cat $CS_1", 1,
+       FLAG_CMD_SUBST},
+      {"backtick substitution", "echo `date`", "echo $CS_1", 1, FLAG_CMD_SUBST},
+      {"arithmetic expansion", "echo $((x+1))", "echo $AR_1", 1,
+       FLAG_ARITHMETIC},
+      {"quoted string", "echo \"hello world\"", "echo $STR_1", 1, FLAG_STRINGS},
+      {"quoted variable", "echo \"$USER\"", "echo $EV_1", 1, FLAG_VARIABLES},
+      {"embedded quoted variable", "echo \"prefix ${NAME} suffix\"",
+       "echo $EV_1", 1, FLAG_VARIABLES},
+      {"multiple variables", "grep $USER $HOME/file $PATH",
+       "grep $EV_1 $EV_2$AP_1 $EV_3", 4,
+       FLAG_VARIABLES | FLAG_PATHS | FLAG_ABS_PATHS},
+      {"mixed variables and globs", "grep -i $PATTERN /etc/*.conf ~user/*.txt",
+       "grep -i $EV_1 $GB_1 $GB_2", 3, FLAG_VARIABLES | FLAG_GLOBS},
+      {"path glob", "ls /var/log/*.log", "ls $GB_1", 1, FLAG_GLOBS},
+      {"find expression", "find /var -name *.log -mtime +7",
+       "find $AP_1 -name $GB_1 -mtime +7", 2,
+       FLAG_PATHS | FLAG_ABS_PATHS | FLAG_GLOBS},
+      {"pipeline with adjacent abstractions",
+       "tail -f /var/log/$APP.log | grep -i error | head -n 100",
+       "tail -f $AP_1$EV_1.log | grep -i error | head -n 100", 2,
+       FLAG_VARIABLES | FLAG_PATHS | FLAG_ABS_PATHS},
+      {"later sequence stages are abstracted",
+       "echo ok && cat /etc/$FILE || diff <(left) >(right)",
+       "echo ok && cat $AP_1$EV_1 || diff $CS_1 $CS_2", 4,
+       FLAG_VARIABLES | FLAG_PATHS | FLAG_ABS_PATHS | FLAG_CMD_SUBST},
+      {"redirection targets", "cat < /tmp/in >out 2>> err 2>&1",
+       "cat < $RD_1 >$RD_2 2>> $RD_3 2>&1", 3, FLAG_REDIRECTS},
+      {"here-string target", "cat <<< \"$VALUE\"", "cat <<< $RD_1", 1,
+       FLAG_REDIRECTS},
+      {"heredoc is redirection", "cat <<EOF\npayload\nEOF",
+       "cat <<EOF\npayload\nEOF", 0, FLAG_REDIRECTS},
+  };
+
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    abstracted_command_t *result = NULL;
+    bool ok = shell_abstract_command(cases[i].input, &result);
+    bool valid = ok && result &&
+                 strcmp(shell_get_original(result), cases[i].input) == 0 &&
+                 strcmp(shell_get_abstracted(result), cases[i].expected) == 0 &&
+                 result->element_count == cases[i].elements &&
+                 feature_mask(result) == cases[i].flags &&
+                 validate_elements(cases[i].input, result);
+    if (!valid && result)
+      printf("    got '%s', elements=%zu, flags=0x%x\n", result->abstracted,
+             result->element_count, feature_mask(result));
+    TEST(cases[i].name, valid);
+    shell_abstracted_destroy(result);
+  }
 }
 
-void test_path_categorization() {
-    printf("\n=== Path Categorization Tests ===\n");
-    
-    TEST("Category / is ROOT", shell_get_path_category("/") == PATH_ROOT);
-    TEST("Category /etc is ETC", shell_get_path_category("/etc") == PATH_ETC);
-    TEST("Category /etc/ is ETC", shell_get_path_category("/etc/") == PATH_ETC);
-    TEST("Category /etc/passwd is ETC", shell_get_path_category("/etc/passwd") == PATH_ETC);
-    TEST("Category /var is VAR", shell_get_path_category("/var") == PATH_VAR);
-    TEST("Category /var/log is VAR", shell_get_path_category("/var/log") == PATH_VAR);
-    TEST("Category /usr is USR", shell_get_path_category("/usr") == PATH_USR);
-    TEST("Category /home is HOME", shell_get_path_category("/home") == PATH_HOME);
-    TEST("Category /home/user is HOME", shell_get_path_category("/home/user") == PATH_HOME);
-    TEST("Category /root is HOME", shell_get_path_category("/root") == PATH_HOME);
-    TEST("Category /tmp is TMP", shell_get_path_category("/tmp") == PATH_TMP);
-    TEST("Category /proc is PROC", shell_get_path_category("/proc") == PATH_PROC);
-    TEST("Category /sys is SYS", shell_get_path_category("/sys") == PATH_SYS);
-    TEST("Category /dev is DEV", shell_get_path_category("/dev") == PATH_DEV);
-    TEST("Category /opt is OPT", shell_get_path_category("/opt") == PATH_OPT);
-    TEST("Category relative is OTHER", shell_get_path_category("relative") == PATH_OTHER);
-    TEST("Category empty is OTHER", shell_get_path_category("") == PATH_OTHER);
+static void test_element_metadata(void) {
+  printf("\n=== Element Metadata Matrix ===\n");
+
+  enum detail_kind { VARIABLE, PATH, GLOB, SUBSTITUTION };
+  static const struct {
+    const char *name;
+    const char *input;
+    const char *key;
+    abstract_type_t type;
+    const char *original;
+    enum detail_kind detail_kind;
+    const char *detail;
+    bool property;
+    bool secondary_property;
+  } cases[] = {
+      {"braced variable metadata", "echo ${USER}", "$EV_1", ABSTRACT_EV,
+       "${USER}", VARIABLE, "USER", true, false},
+      {"quoted variable metadata", "echo \"$USER\"", "$EV_1", ABSTRACT_EV,
+       "\"$USER\"", VARIABLE, "USER", false, true},
+      {"trailing-slash path metadata", "ls /etc/", "$AP_1", ABSTRACT_AP,
+       "/etc/", PATH, "/etc/", true, false},
+      {"path glob metadata", "ls /var/log/*.log", "$GB_1", ABSTRACT_GB,
+       "/var/log/*.log", GLOB, "/var/log/*.log", true, false},
+      {"command substitution metadata", "cat $(printf hi)", "$CS_1",
+       ABSTRACT_CS, "$(printf hi)", SUBSTITUTION, "printf hi", false, false},
+  };
+
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    abstracted_command_t *result = NULL;
+    bool valid = shell_abstract_command(cases[i].input, &result) && result;
+    abstract_element_t *element =
+        valid ? shell_get_element_by_abstract(result, cases[i].key) : NULL;
+    valid = valid && element && element->type == cases[i].type &&
+            strcmp(element->original, cases[i].original) == 0;
+    if (valid) {
+      switch (cases[i].detail_kind) {
+      case VARIABLE:
+        valid = element->data.var.name &&
+                strcmp(element->data.var.name, cases[i].detail) == 0 &&
+                element->data.var.is_braced == cases[i].property &&
+                element->data.var.is_quoted == cases[i].secondary_property;
+        break;
+      case PATH:
+        valid = element->data.path.path &&
+                strcmp(element->data.path.path, cases[i].detail) == 0 &&
+                element->data.path.ends_with_slash == cases[i].property;
+        break;
+      case GLOB:
+        valid = element->data.glob.pattern &&
+                strcmp(element->data.glob.pattern, cases[i].detail) == 0 &&
+                element->data.glob.has_slash == cases[i].property;
+        break;
+      case SUBSTITUTION:
+        valid = element->data.cmd_subst.content &&
+                strcmp(element->data.cmd_subst.content, cases[i].detail) == 0;
+        break;
+      }
+    }
+    TEST(cases[i].name, valid);
+    shell_abstracted_destroy(result);
+  }
 }
 
-void test_name_functions() {
-    printf("\n=== Name Function Tests ===\n");
-    
-    TEST("Abstract type name EV", strcmp(shell_abstract_type_name(ABSTRACT_EV), "EV") == 0);
-    TEST("Abstract type name PV", strcmp(shell_abstract_type_name(ABSTRACT_PV), "PV") == 0);
-    TEST("Abstract type name SV", strcmp(shell_abstract_type_name(ABSTRACT_SV), "SV") == 0);
-    TEST("Abstract type name AP", strcmp(shell_abstract_type_name(ABSTRACT_AP), "AP") == 0);
-    TEST("Abstract type name RP", strcmp(shell_abstract_type_name(ABSTRACT_RP), "RP") == 0);
-    TEST("Abstract type name HP", strcmp(shell_abstract_type_name(ABSTRACT_HP), "HP") == 0);
-    TEST("Abstract type name GB", strcmp(shell_abstract_type_name(ABSTRACT_GB), "GB") == 0);
-    TEST("Abstract type name CS", strcmp(shell_abstract_type_name(ABSTRACT_CS), "CS") == 0);
-    TEST("Abstract type name AR", strcmp(shell_abstract_type_name(ABSTRACT_AR), "AR") == 0);
-    TEST("Abstract type name STR", strcmp(shell_abstract_type_name(ABSTRACT_STR), "STR") == 0);
-    
-    TEST("Path category name ETC", strcmp(shell_path_category_name(PATH_ETC), "ETC") == 0);
-    TEST("Path category name VAR", strcmp(shell_path_category_name(PATH_VAR), "VAR") == 0);
-    TEST("Path category name HOME", strcmp(shell_path_category_name(PATH_HOME), "HOME") == 0);
+static void test_classification_matrix(void) {
+  printf("\n=== Raw Token Classification Matrix ===\n");
+
+  static const struct {
+    const char *text;
+    token_type_t expected;
+  } cases[] = {{"$HOME", TOKEN_VARIABLE},    {"${HOME}", TOKEN_VARIABLE},
+               {"$1", TOKEN_SPECIAL_VAR},    {"$10", TOKEN_SPECIAL_VAR},
+               {"${10}", TOKEN_SPECIAL_VAR}, {"$?", TOKEN_SPECIAL_VAR},
+               {"$$", TOKEN_SPECIAL_VAR},    {"$#", TOKEN_SPECIAL_VAR},
+               {"$!", TOKEN_SPECIAL_VAR},    {"$@", TOKEN_SPECIAL_VAR},
+               {"$*", TOKEN_SPECIAL_VAR},    {"$-", TOKEN_SPECIAL_VAR},
+               {"$!x", TOKEN_ARGUMENT},      {"$@x", TOKEN_ARGUMENT},
+               {"$*x", TOKEN_ARGUMENT},      {"$(date)", TOKEN_SUBSHELL},
+               {"`date`", TOKEN_SUBSHELL},   {"$((1+2))", TOKEN_ARITHMETIC},
+               {"*.txt", TOKEN_GLOB},        {"/etc/passwd", TOKEN_ARGUMENT},
+               {"\"text\"", TOKEN_ARGUMENT}, {"plain", TOKEN_ARGUMENT}};
+
+  bool valid = shell_classify_raw_token(NULL, 0) == TOKEN_END;
+  for (size_t i = 0; valid && i < sizeof(cases) / sizeof(cases[0]); i++)
+    valid = shell_classify_raw_token(cases[i].text, strlen(cases[i].text)) ==
+            cases[i].expected;
+  TEST("all public raw-token classifications", valid);
 }
 
-void test_expansion() {
-    printf("\n=== Runtime Expansion Tests ===\n");
-    
-    // Create a mock environment
-    char* env[] = {
-        "HOME=/home/testuser",
-        "PATH=/usr/bin:/bin",
-        "USER=testuser",
-        NULL
-    };
-    
-    runtime_context_t ctx = {
-        .env = env,
-        .cwd = "/home/testuser",
-        .resolve_symlinks = false
-    };
-    
-    // Test env variable expansion
-    {
-        abstracted_command_t* result = NULL;
-        bool ok = shell_abstract_command("echo $USER $HOME", &result);
-        TEST("Setup for expansion", ok && result != NULL);
-        
-        if (result) {
-            ok = shell_expand_all_elements(result, &ctx);
-            TEST("Expand all elements", ok);
-            
-            // Find the USER element
-            abstract_element_t* elem = shell_get_element_by_abstract(result, "$EV_1");
-            if (elem) {
-                TEST("USER expanded to testuser", 
-                     elem->expanded && strcmp(elem->expanded, "testuser") == 0);
-            }
-            
-            // Find the HOME element
-            elem = shell_get_element_by_abstract(result, "$EV_2");
-            if (elem) {
-                TEST("HOME expanded to /home/testuser", 
-                     elem->expanded && strcmp(elem->expanded, "/home/testuser") == 0);
-            }
-            
-            shell_abstracted_destroy(result);
-        }
-    }
-    
-    // Test home path expansion
-    {
-        abstracted_command_t* result = NULL;
-        bool ok = shell_abstract_command("ls ~/documents", &result);
-        TEST("Setup for home path expansion", ok && result != NULL);
-        
-        if (result) {
-            ok = shell_expand_all_elements(result, &ctx);
-            TEST("Expand home path", ok);
-            
-            abstract_element_t* elem = shell_get_element_by_abstract(result, "$HP_1");
-            if (elem) {
-                TEST("~/documents expanded correctly", 
-                     elem->expanded && strcmp(elem->expanded, "/home/testuser/documents") == 0);
-            }
-            
-            shell_abstracted_destroy(result);
-        }
-    }
+static void test_path_and_name_matrices(void) {
+  printf("\n=== Path and Name Matrices ===\n");
+
+  static const struct {
+    const char *path;
+    path_category_t category;
+  } paths[] = {{"/", PATH_ROOT},
+               {"/etc/passwd", PATH_ETC},
+               {"/var/log", PATH_VAR},
+               {"/usr/bin", PATH_USR},
+               {"/home/user", PATH_HOME},
+               {"/root", PATH_HOME},
+               {"/tmp/file", PATH_TMP},
+               {"/proc/self", PATH_PROC},
+               {"/sys/kernel", PATH_SYS},
+               {"/dev/null", PATH_DEV},
+               {"/opt/app", PATH_OPT},
+               {"/srv/data", PATH_SRV},
+               {"/run/service", PATH_RUN},
+               {"/sysroot/etc", PATH_SYSROOT},
+               {"/boot/vmlinuz", PATH_BOOT},
+               {"/mnt/disk", PATH_MNT},
+               {"/media/disk", PATH_MEDIA},
+               {"/.snapshots/1", PATH_SNAPSHOT},
+               {"/etcetera", PATH_OTHER},
+               {"/runway", PATH_OTHER},
+               {"/snapshots/1", PATH_OTHER},
+               {"/unknown", PATH_OTHER},
+               {"relative", PATH_OTHER},
+               {"", PATH_OTHER},
+               {NULL, PATH_OTHER}};
+  static const char *abstract_names[] = {"EV", "PV", "SV", "AP",  "RP", "HP",
+                                         "GB", "CS", "AR", "STR", "RD"};
+  static const char *path_names[] = {
+      "ROOT",    "ETC",  "VAR", "USR",   "HOME",     "TMP",
+      "PROC",    "SYS",  "DEV", "OPT",   "SRV",      "RUN",
+      "SYSROOT", "BOOT", "MNT", "MEDIA", "SNAPSHOT", "OTHER"};
+
+  bool valid = true;
+  for (size_t i = 0; valid && i < sizeof(paths) / sizeof(paths[0]); i++)
+    valid = shell_get_path_category(paths[i].path) == paths[i].category;
+  TEST("all path categories and boundary forms", valid);
+
+  valid = true;
+  for (size_t i = 0;
+       valid && i < sizeof(abstract_names) / sizeof(abstract_names[0]); i++)
+    valid = strcmp(shell_abstract_type_name((abstract_type_t)i),
+                   abstract_names[i]) == 0;
+  valid = valid &&
+          strcmp(shell_abstract_type_name((abstract_type_t)-1), "UNKNOWN") == 0;
+  TEST("all abstract type names", valid);
+
+  valid = true;
+  for (size_t i = 0; valid && i < sizeof(path_names) / sizeof(path_names[0]);
+       i++)
+    valid = strcmp(shell_path_category_name((path_category_t)i),
+                   path_names[i]) == 0;
+  valid = valid &&
+          strcmp(shell_path_category_name((path_category_t)-1), "UNKNOWN") == 0;
+  TEST("all path category names", valid);
 }
 
-void test_tilde_expansion(void) {
-    printf("\n=== Tilde Expansion Tests ===\n");
+static void test_runtime_expansion(void) {
+  printf("\n=== Runtime Expansion Matrix ===\n");
 
-    char* env_with_home[] = {
-        "HOME=/home/testuser",
-        "PATH=/usr/bin:/bin",
-        NULL
-    };
+  char *environment[] = {"HOME=/home/testuser", "USER=testuser", NULL};
+  runtime_context_t context = {
+      .env = environment, .cwd = "/home/testuser", .resolve_symlinks = false};
+  static const struct {
+    const char *input;
+    const char *key;
+    const char *expected;
+    const char *cwd;
+  } cases[] = {{"echo $USER", "$EV_1", "testuser", NULL},
+               {"echo \"$USER\"", "$EV_1", "testuser", NULL},
+               {"echo $HOME", "$EV_1", "/home/testuser", NULL},
+               {"ls ~/documents", "$HP_1", "/home/testuser/documents", NULL},
+               {"ls ~", "$HP_1", "/home/testuser", NULL},
+               {"cat /etc/passwd", "$AP_1", "/etc/passwd", NULL},
+               {"cat ./file", "$RP_1", "/tmp/./file", "/tmp/"},
+               {"echo $MISSING", "$EV_1", NULL, NULL},
+               {"echo \"prefix $USER\"", "$EV_1", NULL, NULL},
+               {"echo \"literal\"", "$STR_1", NULL, NULL}};
 
-    abstracted_command_t* cmd = NULL;
-    bool ok = shell_abstract_command("ls ~/documents", &cmd);
-    TEST("Abstract command with tilde", ok && cmd != NULL);
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    abstracted_command_t *result = NULL;
+    bool valid = shell_abstract_command(cases[i].input, &result) && result;
+    abstract_element_t *element =
+        valid ? shell_get_element_by_abstract(result, cases[i].key) : NULL;
+    context.cwd = cases[i].cwd ? (char *)cases[i].cwd : "/home/testuser";
+    char *expanded = element ? shell_expand_element(element, &context) : NULL;
+    valid = cases[i].expected
+                ? expanded && strcmp(expanded, cases[i].expected) == 0
+                : expanded == NULL;
+    TEST(cases[i].input, valid);
+    free(expanded);
+    shell_abstracted_destroy(result);
+  }
 
-    if (cmd) {
-        size_t count = 0;
-        abstract_element_t** elems = shell_get_elements(cmd, &count);
-        bool found_hp = false;
-        for (size_t i = 0; i < count; i++) {
-            if (elems[i]->type == ABSTRACT_HP) {
-                found_hp = true;
-                runtime_context_t ctx = {
-                    .env = env_with_home,
-                    .cwd = "/home/testuser",
-                    .resolve_symlinks = false
-                };
-                char* expanded = shell_expand_element(elems[i], &ctx);
-                TEST("Tilde expanded", expanded != NULL);
-                if (expanded) {
-                    TEST("Tilde expanded correctly",
-                         strcmp(expanded, "/home/testuser/documents") == 0);
-                    free(expanded);
-                }
-            }
-        }
-        TEST("Found ABSTRACT_HP element", found_hp);
-        shell_abstracted_destroy(cmd);
-    }
+  context.cwd = "/home/testuser";
 
-    char* env_with_root[] = {
-        "HOME=/root",
-        "PATH=/usr/bin:/bin",
-        NULL
-    };
-    ok = shell_abstract_command("ls ~", &cmd);
-    TEST("Abstract bare tilde", ok && cmd != NULL);
-    if (cmd) {
-        abstract_element_t* elem = shell_get_element_by_abstract(cmd, "$HP_1");
-        if (elem) {
-            runtime_context_t ctx = {
-                .env = env_with_root,
-                .cwd = "/root",
-                .resolve_symlinks = false
-            };
-            char* expanded = shell_expand_element(elem, &ctx);
-            TEST("Bare tilde expanded to /root",
-                 expanded && strcmp(expanded, "/root") == 0);
-            if (expanded) free(expanded);
-        }
-        shell_abstracted_destroy(cmd);
-    }
+  abstracted_command_t *path_result = NULL;
+  context.resolve_symlinks = true;
+  bool valid =
+      shell_abstract_command("cat /tmp/../tmp", &path_result) && path_result;
+  abstract_element_t *path =
+      valid ? shell_get_element_by_abstract(path_result, "$AP_1") : NULL;
+  char *resolved = path ? shell_expand_element(path, &context) : NULL;
+  valid = valid && resolved && strcmp(resolved, "/tmp") == 0;
+  TEST("path expansion optionally resolves canonical paths", valid);
+  free(resolved);
+  shell_abstracted_destroy(path_result);
+  context.resolve_symlinks = false;
+
+  abstracted_command_t *result = NULL;
+  valid = shell_abstract_command("echo $USER $HOME", &result) && result &&
+          shell_expand_all_elements(result, &context);
+  abstract_element_t *user =
+      valid ? shell_get_element_by_abstract(result, "$EV_1") : NULL;
+  abstract_element_t *home =
+      valid ? shell_get_element_by_abstract(result, "$EV_2") : NULL;
+  valid = valid && user && user->expanded && home && home->expanded &&
+          strcmp(user->expanded, "testuser") == 0 &&
+          strcmp(home->expanded, "/home/testuser") == 0;
+  TEST("expand all elements stores every result", valid);
+
+  char *empty_environment[] = {NULL};
+  context.env = empty_environment;
+  valid = shell_expand_all_elements(result, &context) && user && home &&
+          user->expanded == NULL && home->expanded == NULL;
+  TEST("re-expansion clears stale values", valid);
+  shell_abstracted_destroy(result);
 }
 
-void test_edge_cases() {
-    printf("\n=== Edge Case Tests ===\n");
-    
-    // Empty command
-    {
-        abstracted_command_t* result = NULL;
-        bool ok = shell_abstract_command("", &result);
-        TEST("Empty command returns false", !ok);
-        if (result) shell_abstracted_destroy(result);
-    }
-    
-    // Simple command with no special tokens
-    {
-        abstracted_command_t* result = NULL;
-        bool ok = shell_abstract_command("ls -la", &result);
-        TEST("Simple command no abstraction", ok && result != NULL);
-        if (result) {
-            TEST("Original preserved", strcmp(result->original, "ls -la") == 0);
-            TEST("No elements", result->element_count == 0);
-            TEST("Abstracted equals original", strcmp(result->abstracted, "ls -la") == 0);
-            shell_abstracted_destroy(result);
-        }
-    }
-    
-    // Braced variable
-    {
-        abstracted_command_t* result = NULL;
-        bool ok = shell_abstract_command("echo ${USER}", &result);
-        TEST("Braced variable", ok && result != NULL);
-        if (result) {
-            TEST("Abstracted contains $EV_1", strstr(result->abstracted, "$EV_1") != NULL);
-            // Check element data
-            abstract_element_t* elem = shell_get_element_by_abstract(result, "$EV_1");
-            if (elem) {
-                TEST("Braced var name correct", 
-                     elem->data.var.name && strcmp(elem->data.var.name, "USER") == 0);
-                TEST("Is braced", elem->data.var.is_braced);
-            }
-            shell_abstracted_destroy(result);
-        }
-    }
-    
-    // Path with trailing slash
-    {
-        abstracted_command_t* result = NULL;
-        bool ok = shell_abstract_command("ls /etc/", &result);
-        TEST("Path with trailing slash", ok && result != NULL);
-        if (result) {
-            abstract_element_t* elem = shell_get_element_by_abstract(result, "$AP_1");
-            if (elem) {
-                TEST("Path ends with slash flag", elem->data.path.ends_with_slash);
-            }
-            shell_abstracted_destroy(result);
-        }
-    }
-    
-    // Relative path with ../
-    {
-        abstracted_command_t* result = NULL;
-        bool ok = shell_abstract_command("cat ../foo.txt", &result);
-        TEST("Relative path with ..", ok && result != NULL);
-        if (result) {
-            TEST("Abstracted contains $RP_1", strstr(result->abstracted, "$RP_1") != NULL);
-            shell_abstracted_destroy(result);
-        }
-    }
-    
-    // Glob with slash
-    {
-        abstracted_command_t* result = NULL;
-        bool ok = shell_abstract_command("ls /var/log/*.log", &result);
-        TEST("Glob with path", ok && result != NULL);
-        if (result) {
-            // Tokenized as single glob token -> single abstract element
-            TEST("Element count is 1", result->element_count == 1);
-            shell_abstracted_destroy(result);
-        }
-    }
-    
-    // Multiple digits in positional var
-    {
-        abstracted_command_t* result = NULL;
-        bool ok = shell_abstract_command("echo ${10}", &result);
-        TEST("Multi-digit positional var", ok && result != NULL);
-        if (result) {
-            TEST("Abstracted contains $PV_1", strstr(result->abstracted, "$PV_1") != NULL);
-            shell_abstracted_destroy(result);
-        }
-    }
-    
-    // Quoted variable
-    {
-        abstracted_command_t* result = NULL;
-        bool ok = shell_abstract_command("echo \"$USER\"", &result);
-        TEST("Quoted variable", ok && result != NULL);
-        if (result) {
-            // Should still abstract the variable
-            TEST("Has variables", shell_has_variables(result));
-            shell_abstracted_destroy(result);
-        }
-    }
+static void test_invalid_and_null_inputs(void) {
+  printf("\n=== Invalid and Null Inputs ===\n");
+
+  abstracted_command_t *result = (abstracted_command_t *)1;
+  bool valid = !shell_abstract_command("", &result) && result == NULL;
+  result = (abstracted_command_t *)1;
+  valid = valid && !shell_abstract_command(NULL, &result) && result == NULL &&
+          !shell_abstract_command("echo", NULL);
+  TEST("abstraction rejects invalid inputs", valid);
+
+  size_t count = 7;
+  valid = shell_get_abstracted(NULL) == NULL &&
+          shell_get_original(NULL) == NULL &&
+          shell_get_elements(NULL, &count) == NULL && count == 7 &&
+          shell_get_elements(NULL, NULL) == NULL &&
+          shell_get_element_at(NULL, 0) == NULL &&
+          shell_get_element_by_abstract(NULL, "$EV_1") == NULL &&
+          shell_expand_element(NULL, NULL) == NULL &&
+          !shell_expand_all_elements(NULL, NULL) &&
+          !shell_has_redirects(NULL) && feature_mask(NULL) == 0;
+  TEST("query and expansion APIs are null-safe", valid);
+  shell_abstracted_destroy(NULL);
 }
 
-void test_dfa_patterns() {
-    printf("\n=== DFA Pattern Matching Tests ===\n");
-    
-    // These tests verify the abstracted form can be used for DFA matching
-    
-    // grep pattern
-    {
-        abstracted_command_t* result = NULL;
-        bool ok = shell_abstract_command("grep $PATTERN /etc/passwd", &result);
-        TEST("grep command abstraction", ok && result != NULL);
-        if (result) {
-            printf("    Original:   %s\n", result->original);
-            printf("    Abstracted: %s\n", result->abstracted);
-            // The DFA would match this as a "file-read" command
-            shell_abstracted_destroy(result);
-        }
-    }
-    
-    // cat with multiple paths
-    {
-        abstracted_command_t* result = NULL;
-        bool ok = shell_abstract_command("cat /etc/passwd /etc/hosts", &result);
-        TEST("cat multiple files", ok && result != NULL);
-        if (result) {
-            printf("    Original:   %s\n", result->original);
-            printf("    Abstracted: %s\n", result->abstracted);
-            shell_abstracted_destroy(result);
-        }
-    }
-    
-    // find command
-    {
-        abstracted_command_t* result = NULL;
-        bool ok = shell_abstract_command("find /var -name *.log -mtime +7", &result);
-        TEST("find command", ok && result != NULL);
-        if (result) {
-            printf("    Original:   %s\n", result->original);
-            printf("    Abstracted: %s\n", result->abstracted);
-            shell_abstracted_destroy(result);
-        }
-    }
-    
-    // Variable as filename
-    {
-        abstracted_command_t* result = NULL;
-        bool ok = shell_abstract_command("cat $FILE", &result);
-        TEST("Variable as filename", ok && result != NULL);
-        if (result) {
-            printf("    Original:   %s\n", result->original);
-            printf("    Abstracted: %s\n", result->abstracted);
-            shell_abstracted_destroy(result);
-        }
-    }
-    
-    // Complex real-world command
-    {
-        abstracted_command_t* result = NULL;
-        bool ok = shell_abstract_command("tail -f /var/log/$APP.log | grep -i error | head -n 100", &result);
-        TEST("Complex pipeline", ok && result != NULL);
-        if (result) {
-            printf("    Original:   %s\n", result->original);
-            printf("    Abstracted: %s\n", result->abstracted);
-            shell_abstracted_destroy(result);
-        }
-    }
+static void test_type_sequence_matrix(void) {
+  printf("\n=== Type Sequence Matrix ===\n");
+
+  static const struct {
+    const char *command;
+    const char *expected;
+  } cases[] = {
+      {"cat /etc/passwd", "cat AP"},
+      {"grep -i root /etc/shadow", "grep OPT STR AP"},
+      {"cat /etc/passwd | grep root", "cat AP | grep STR"},
+      {"ls ; cd /tmp && pwd || echo done", "ls | cd AP | pwd | echo STR"},
+      {"echo $HOME", "echo EV"},
+      {"$COMMAND argument", "EV STR"},
+      {"echo $1 $? *.c $((1+2))", "echo PV SV GB AR"},
+      {"cat ./file.txt ~/file.txt", "cat RP HP"},
+      {"echo hi > out", "echo STR"},
+      {"> out echo hi", "echo STR"},
+      {"cat <<EOF\npayload\nEOF", "cat"},
+      {"diff <(left) >(right)", "diff CS CS"},
+  };
+
+  bool valid = shell_build_type_sequence(NULL) == NULL &&
+               shell_build_type_sequence("") == NULL;
+  for (size_t i = 0; valid && i < sizeof(cases) / sizeof(cases[0]); i++) {
+    char *sequence = shell_build_type_sequence(cases[i].command);
+    valid = sequence && strcmp(sequence, cases[i].expected) == 0;
+    if (!valid && sequence)
+      printf("    command '%s': got '%s', expected '%s'\n", cases[i].command,
+             sequence, cases[i].expected);
+    free(sequence);
+  }
+  TEST("canonical sequences preserve clean command semantics", valid);
+
+  char long_command[700] = "echo";
+  char long_expected[1400] = "echo";
+  for (size_t i = 0; i < 300; i++) {
+    strcat(long_command, " x");
+    strcat(long_expected, " STR");
+  }
+  char *sequence = shell_build_type_sequence(long_command);
+  valid = sequence && strcmp(sequence, long_expected) == 0;
+  TEST("type sequence grows for 300 arguments", valid);
+  free(sequence);
 }
 
 int main(void) {
-    printf("=== Shell Abstract Tests ===\n");
-    printf("Testing abstraction engine for shell command rewriting\n\n");
-    
-    test_basic_abstraction();
-    test_combined_abstraction();
-    test_element_access();
-    test_path_categorization();
-    test_name_functions();
-    test_expansion();
-    test_tilde_expansion();
-    test_edge_cases();
-    test_dfa_patterns();
-    
-    printf("\n=== Summary ===\n");
-    printf("Passed: %d\n", passed);
-    printf("Failed: %d\n", failed);
-    printf("Total:  %d\n", passed + failed);
-    
-    return failed > 0 ? 1 : 0;
+  printf("=== Shell Abstraction Tests ===\n");
+
+  test_abstraction_matrix();
+  test_element_metadata();
+  test_classification_matrix();
+  test_path_and_name_matrices();
+  test_runtime_expansion();
+  test_invalid_and_null_inputs();
+  test_type_sequence_matrix();
+
+  printf("\n=== Summary ===\n");
+  printf("Passed: %d\nFailed: %d\nTotal:  %d\n", passed, failed,
+         passed + failed);
+  return failed > 0 ? 1 : 0;
 }

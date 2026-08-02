@@ -18,19 +18,23 @@
 #define SHELL_DEPGRAPH_H
 
 #include <stdbool.h>
-#include <stdint.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 /* ============================================================
  * CONSTANTS & LIMITS
  * ============================================================ */
 
-#define SHELL_DEP_MAX_NODES      128
-#define SHELL_DEP_MAX_EDGES      256
-#define SHELL_DEP_MAX_TOKENS     32
-#define SHELL_DEP_MAX_HEREDOCS   8
-#define SHELL_DEP_CWD_BUF_SIZE   16384  /* 16KB buffer for unique CWD strings */
+#define SHELL_DEP_MAX_NODES 128
+#define SHELL_DEP_MAX_EDGES 256
+#define SHELL_DEP_MAX_TOKENS 32
+#define SHELL_DEP_MAX_HEREDOCS 8
+#define SHELL_DEP_CWD_BUF_SIZE 16384 /* 16KB buffer for unique CWD strings */
 
 /* CWD buffer must accommodate at least one PATH_MAX-sized path */
 #if defined(PATH_MAX) && PATH_MAX > SHELL_DEP_CWD_BUF_SIZE
@@ -42,80 +46,78 @@
  * ============================================================ */
 
 typedef enum {
-    SHELL_DEP_OK      =  0,
-    SHELL_DEP_EINPUT  = -1,
-    SHELL_DEP_ETRUNC  = -2,
-    SHELL_DEP_EPARSE  = -3,
+  SHELL_DEP_OK = 0,
+  SHELL_DEP_EINPUT = -1,
+  SHELL_DEP_ETRUNC = -2,
+  SHELL_DEP_EPARSE = -3,
 } shell_dep_error_t;
 
 typedef enum {
-    SHELL_DEP_STATUS_OK         = 0,
-    SHELL_DEP_STATUS_TRUNCATED = 1 << 0,
+  SHELL_DEP_STATUS_OK = 0,
+  SHELL_DEP_STATUS_TRUNCATED = 1 << 0,
+  SHELL_DEP_STATUS_ERROR = 1 << 1,
 } shell_dep_status_t;
 
 typedef enum {
-    SHELL_NODE_CMD = 0,
-    SHELL_NODE_DOC,
+  SHELL_NODE_CMD = 0,
+  SHELL_NODE_DOC,
 } shell_dep_node_type_t;
 
 typedef enum {
-    SHELL_DOC_FILE        = 0,
-    SHELL_DOC_HEREDOC     = 1,
-    SHELL_DOC_HERESTRING  = 2,
-    SHELL_DOC_ENVVAR      = 3,
+  SHELL_DOC_FILE = 0,
+  SHELL_DOC_HEREDOC = 1,
+  SHELL_DOC_HERESTRING = 2,
+  SHELL_DOC_ENVVAR = 3,
 } shell_dep_doc_kind_t;
 
 typedef enum {
-    SHELL_EDGE_READ   = 0,
-    SHELL_EDGE_WRITE  = 1,
-    SHELL_EDGE_APPEND = 2,
-    SHELL_EDGE_PIPE   = 3,
-    SHELL_EDGE_ARG    = 4,
-    SHELL_EDGE_ENV    = 5,
-    SHELL_EDGE_SUBST  = 6,
-    SHELL_EDGE_SEQ    = 7,
-    SHELL_EDGE_AND    = 8,
-    SHELL_EDGE_OR     = 9,
-    SHELL_EDGE_CWD    = 10,
+  SHELL_EDGE_READ = 0,
+  SHELL_EDGE_WRITE = 1,
+  SHELL_EDGE_APPEND = 2,
+  SHELL_EDGE_PIPE = 3,
+  SHELL_EDGE_ARG = 4,
+  SHELL_EDGE_ENV = 5,
+  SHELL_EDGE_SUBST = 6,
+  SHELL_EDGE_SEQ = 7,
+  SHELL_EDGE_AND = 8,
+  SHELL_EDGE_OR = 9,
+  SHELL_EDGE_CWD = 10,
 } shell_dep_edge_type_t;
 
 typedef enum {
-    SHELL_DIR_FORWARD = 0,
-    SHELL_DIR_BIDIR   = 1,
-    SHELL_DIR_UNDIR   = 2,
+  SHELL_DIR_FORWARD = 0,
+  SHELL_DIR_BIDIR = 1,
+  SHELL_DIR_UNDIR = 2,
 } shell_dep_edge_dir_t;
 
 /**
  * Limits for depgraph parsing.
  * Set cwd_buf_size to 0 to use the default SHELL_DEP_CWD_BUF_SIZE (16384).
- * The actual buffer in shell_dep_graph_t is always SHELL_DEP_CWD_BUF_SIZE bytes;
- * cwd_buf_size in limits is the effective bound checked during parsing.
+ * The actual buffer in shell_dep_graph_t is always SHELL_DEP_CWD_BUF_SIZE
+ * bytes; cwd_buf_size in limits is the effective bound checked during parsing.
  */
 typedef struct {
-    uint32_t max_nodes;
-    uint32_t max_edges;
-    uint32_t max_tokens_per_cmd;
-    uint32_t cwd_buf_size;   /* 0 = use default SHELL_DEP_CWD_BUF_SIZE */
-    /* cd_as_cmd: when true, 'cd' commands produce CMD nodes (with CWD edge);
-     *            when false (default), cd is processed for CWD side-effects
-     *            but does not produce a node in the graph. */
-    bool cd_as_cmd;
+  uint32_t max_nodes;
+  uint32_t max_edges;
+  uint32_t max_tokens_per_cmd;
+  uint32_t cwd_buf_size; /* 0 = use default SHELL_DEP_CWD_BUF_SIZE */
+  /* cd_as_cmd: when true, 'cd' commands produce CMD nodes (with CWD edge);
+   *            when false (default), cd is processed for CWD side-effects
+   *            but does not produce a node in the graph. */
+  bool cd_as_cmd;
 } shell_dep_limits_t;
 
 static const shell_dep_limits_t SHELL_DEP_LIMITS_DEFAULT = {
-    .max_nodes = SHELL_DEP_MAX_NODES,
-    .max_edges = SHELL_DEP_MAX_EDGES,
-    .max_tokens_per_cmd = SHELL_DEP_MAX_TOKENS,
-    .cwd_buf_size = 0,  /* 0 means use default 16384 */
-    .cd_as_cmd = false
-};
+    SHELL_DEP_MAX_NODES, SHELL_DEP_MAX_EDGES, SHELL_DEP_MAX_TOKENS,
+    0, /* cwd_buf_size: use default 16384 */
+    false};
 
 /**
  * Get human-readable error string for depgraph error code.
  * @param err  Error code from shell_dep_error_t enum
  * @return     Static string, never NULL
  */
-const char* shell_dep_error_string(shell_dep_error_t err);
+const char *shell_dep_error_string(shell_dep_error_t err);
 
 /**
  * Fixed-size buffer for unique CWD strings.
@@ -123,21 +125,22 @@ const char* shell_dep_error_string(shell_dep_error_t err);
  * Bounded by SHELL_DEP_CWD_BUF_SIZE (16384 bytes).
  */
 typedef struct {
-    char data[SHELL_DEP_CWD_BUF_SIZE];
-    size_t len;
+  char data[SHELL_DEP_CWD_BUF_SIZE];
+  size_t len;
 } shell_dep_cwd_buf_t;
 
 /**
  * CMD node - an isolated shell command
  *
  * Tokens are zero-copy pointers into the original input string.
- * cwd_offset is the offset into graph->cwd_buf.data for the resolved working directory.
+ * cwd_offset is the offset into graph->cwd_buf.data for the resolved working
+ * directory.
  */
 typedef struct {
-    const char *tokens[SHELL_DEP_MAX_TOKENS];
-    uint32_t    token_lens[SHELL_DEP_MAX_TOKENS];
-    uint32_t    token_count;
-    uint32_t    cwd_offset;  /* Offset into graph->cwd_buf.data */
+  const char *tokens[SHELL_DEP_MAX_TOKENS];
+  uint32_t token_lens[SHELL_DEP_MAX_TOKENS];
+  uint32_t token_count;
+  uint32_t cwd_offset; /* Offset into graph->cwd_buf.data */
 } shell_dep_cmd_t;
 
 /**
@@ -150,37 +153,37 @@ typedef struct {
  *   ENVVAR:    name/name_len, value/value_len
  */
 typedef struct {
-    shell_dep_doc_kind_t kind;
-    const char *path;
-    uint32_t    path_len;
-    const char *name;
-    uint32_t    name_len;
-    const char *value;
-    uint32_t    value_len;
+  shell_dep_doc_kind_t kind;
+  const char *path;
+  uint32_t path_len;
+  const char *name;
+  uint32_t name_len;
+  const char *value;
+  uint32_t value_len;
 } shell_dep_doc_t;
 
 typedef struct {
-    shell_dep_node_type_t type;
-    union {
-        shell_dep_cmd_t  cmd;
-        shell_dep_doc_t  doc;
-    };
+  shell_dep_node_type_t type;
+  union {
+    shell_dep_cmd_t cmd;
+    shell_dep_doc_t doc;
+  };
 } shell_dep_node_t;
 
 typedef struct {
-    uint32_t from;
-    uint32_t to;
-    shell_dep_edge_type_t type;
-    shell_dep_edge_dir_t  dir;
+  uint32_t from;
+  uint32_t to;
+  shell_dep_edge_type_t type;
+  shell_dep_edge_dir_t dir;
 } shell_dep_edge_t;
 
 typedef struct {
-    shell_dep_node_t nodes[SHELL_DEP_MAX_NODES];
-    uint32_t node_count;
-    shell_dep_edge_t edges[SHELL_DEP_MAX_EDGES];
-    uint32_t edge_count;
-    uint32_t status;
-    shell_dep_cwd_buf_t cwd_buf;  /* Fixed 16KB buffer for unique CWD strings */
+  shell_dep_node_t nodes[SHELL_DEP_MAX_NODES];
+  uint32_t node_count;
+  shell_dep_edge_t edges[SHELL_DEP_MAX_EDGES];
+  uint32_t edge_count;
+  uint32_t status;
+  shell_dep_cwd_buf_t cwd_buf; /* Fixed 16KB buffer for unique CWD strings */
 } shell_dep_graph_t;
 
 /**
@@ -189,17 +192,13 @@ typedef struct {
 #define SHELL_DEP_MAX_VALIDATE_ERRORS 16
 
 typedef struct {
-    bool valid;
-    uint32_t error_count;
-    struct {
-        uint32_t edge_idx;
-        char msg[96];
-    } errors[SHELL_DEP_MAX_VALIDATE_ERRORS];
+  bool valid;
+  uint32_t error_count;
+  struct {
+    uint32_t edge_idx;
+    char msg[96];
+  } errors[SHELL_DEP_MAX_VALIDATE_ERRORS];
 } shell_dep_validate_result_t;
-
-#ifdef __cplusplus
-extern "C" {
-#endif
 
 /* ============================================================
  * API
@@ -214,19 +213,19 @@ extern "C" {
  *
  * `depth` limits recursion for subshell parsing. Pass 0 for top-level.
  * Returns SHELL_DEP_EPARSE if depth exceeds 16 (defense-in-depth).
+ * Returns SHELL_DEP_ETRUNC and sets SHELL_DEP_STATUS_TRUNCATED when a caller
+ * limit or fixed parser limit prevents the complete graph from being stored.
+ * On input or parse errors, writable output counts are cleared and
+ * SHELL_DEP_STATUS_ERROR is set.
  *
  * Note: Subshell extraction does not track quoting inside $(...) or `...`.
  * Inputs like $(echo ")") may produce incorrect depth counts.
  * This is acceptable for coarse-grained dependency tracking.
  */
-shell_dep_error_t shell_parse_depgraph(
-    const char *cmd,
-    size_t cmd_len,
-    const char *initial_cwd,
-    const shell_dep_limits_t *limits,
-    uint32_t depth,
-    shell_dep_graph_t *out
-);
+shell_dep_error_t shell_parse_depgraph(const char *cmd, size_t cmd_len,
+                                       const char *initial_cwd,
+                                       const shell_dep_limits_t *limits,
+                                       uint32_t depth, shell_dep_graph_t *out);
 
 const char *shell_dep_edge_type_name(shell_dep_edge_type_t type);
 const char *shell_dep_node_type_name(shell_dep_node_type_t type);

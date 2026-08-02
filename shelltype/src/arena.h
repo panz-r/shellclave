@@ -1,13 +1,13 @@
 #ifndef ARENA_H
 #define ARENA_H
 
-#include <stddef.h>
 #include <stdbool.h>
+#include <stddef.h>
 
 typedef struct {
-    char   *base;
-    size_t  size;
-    size_t  used;
+  char *base;
+  size_t size;
+  size_t used;
 } arena_t;
 
 /*
@@ -25,8 +25,8 @@ typedef struct {
  * Operational expectations:
  * - Normal workload: arena grows once at startup, stays stable
  * - High churn: arena grows 2x per resize until st_policy_compact() resets it
- * - Compact: call st_policy_compact() periodically (e.g., cron or after bulk load)
- *   to reclaim memory. Compact resets the arena and rebuilds filters.
+ * - Compact: call st_policy_compact() periodically (e.g., cron or after bulk
+ * load) to reclaim memory. Compact resets the arena and rebuilds filters.
  *
  * Thread safety:
  * - Arena itself is NOT thread-safe. Caller must hold appropriate lock.

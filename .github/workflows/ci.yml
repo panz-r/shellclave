@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - cc: gcc
+            cxx: g++
+            build_type: Debug
+          - cc: gcc
+            cxx: g++
+            build_type: Release
+          - cc: clang
+            cxx: clang++
+            build_type: Debug
+          - cc: clang
+            cxx: clang++
+            build_type: Release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Configure
+        run: >-
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          -DCMAKE_C_COMPILER=${{ matrix.cc }}
+          -DCMAKE_CXX_COMPILER=${{ matrix.cxx }}
+      - name: Build
+        run: cmake --build build --parallel 2
+      - name: Test, install, and consume
+        run: ctest --test-dir build --output-on-failure
+
+  sanitizers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - run: >-
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+          -DSHELLCLAVE_ENABLE_SANITIZERS=ON
+      - run: cmake --build build --parallel 2
+      - run: ctest --test-dir build --output-on-failure
+
+  static-analysis:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install Clang Static Analyzer
+        run: sudo apt-get update && sudo apt-get install --yes clang-format clang-tools
+      - name: Configure
+        run: cmake -S . -B build
+      - name: Check formatting
+        run: cmake --build build --target format-check
+      - name: Analyze
+        run: cmake --build build --target clang-analyze
+
+  fuzz-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - run: >-
+          cmake -S . -B build -DBUILD_TESTING=OFF
+          -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+          -DSHELLCLAVE_BUILD_FUZZERS=ON
+      - run: cmake --build build --parallel 2
+      - run: build/fuzz_shellgate -runs=1000 build/fuzz-corpus/shellgate
+      - run: build/fuzz_shellsplit -runs=1000 build/fuzz-corpus/shellsplit

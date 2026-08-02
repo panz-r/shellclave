@@ -1,80 +1,24 @@
-# ShellGate Test Suite
+# Shellgate tests
 
-## Running Tests
+Shellgate's unit and anomaly tests are part of the root CMake test suite:
 
-### Standard Tests
-
-```bash
-cd build
-make -j4
-./test_shellgate
+```sh
+cmake -S ../.. -B ../../build
+cmake --build ../../build
+ctest --test-dir ../../build --output-on-failure
 ```
 
-Or via CMake:
+The fuzz harness, corpus, dictionary, and long-running helper scripts live in
+`shellgate/fuzz/`. Build the harness with Clang and libFuzzer:
 
-```bash
-cd build
-ctest
+```sh
+cmake -S ../.. -B ../../build-fuzz \
+  -DCMAKE_C_COMPILER=clang \
+  -DCMAKE_CXX_COMPILER=clang++ \
+  -DSHELLCLAVE_BUILD_FUZZERS=ON
+cmake --build ../../build-fuzz --target fuzz_shellgate
+../../build-fuzz/fuzz_shellgate ../fuzz/corpus -runs=10000
 ```
 
-### Valgrind (Memory Checking)
-
-```bash
-make valgrind-shellgate
-```
-
-### Code Coverage
-
-Requires `lcov` and `genhtml`:
-
-```bash
-cd build
-cmake -DENABLE_COVERAGE=ON ..
-make -j4
-make coverage-shellgate
-# Report generated at: build/coverage_html/index.html
-```
-
-## Test Categories
-
-| Category | Description |
-|----------|-------------|
-| Lifecycle | Gate creation/destruction, NULL safety |
-| Configuration | CWD, stop modes, suggestions |
-| Buffer Management | Truncation, overflow, null termination |
-| Expansion Callbacks | Variable and glob expansion |
-| Violation Scanning | Security violation detection |
-| Policy Management | Rule add/remove, save/load |
-| Serialization | Policy persistence |
-
-## Fuzzing
-
-Requires libFuzzer:
-
-```bash
-cd build
-cmake -DENABLE_FUZZING=ON ..
-make fuzz_shellgate_corpus
-./fuzz_shellgate_corpus -runs=10000 corpus_dir/
-```
-
-## Adding Tests
-
-Tests are defined using macros:
-
-```c
-TEST(test_name)
-{
-    // test body
-    ASSERT(condition);
-}
-
-RUN(test_name);
-```
-
-Use `ASSERT_EQ_INT(a, b)` for integer comparison, `ASSERT_STR(a, b)` for strings.
-
-## Coverage Target
-
-The shellgate library (shellgate.c) aims for 90%+ line coverage.
-Current coverage: ~83% (some internal static functions are hard to reach without specific error conditions).
+`shellgate/fuzz/run_fuzzing_4h.sh` configures the same root build and runs a
+managed, multi-worker session.

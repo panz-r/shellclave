@@ -1,0 +1,6 @@
+[submodule "deps/draugr"]
+	path = deps/draugr
+	url = https://github.com/panz-r/draugr-repo.git
+[submodule "deps/xxhash"]
+	path = deps/xxhash
+	url = https://github.com/Cyan4973/xxHash.git

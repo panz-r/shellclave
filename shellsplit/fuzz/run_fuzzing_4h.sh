@@ -1,95 +1,38 @@
 #!/bin/bash
-# Run fuzzing session for 4 hours with full protection
-# Usage: ./run_fuzzing_4h.sh
+# Run the Shellsplit libFuzzer harness. Defaults to two workers for four hours.
 
-set -e
+set -euo pipefail
 
-DURATION=14400  # 4 hours in seconds
-MEMORY_LIMIT="${FUZZ_MEMORY_LIMIT:-8G}"
+WORKERS="${1:-2}"
+DURATION="${2:-14400}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+BUILD_DIR="${FUZZ_BUILD_DIR:-$REPO_ROOT/build-fuzz}"
+LOG_DIR="$SCRIPT_DIR/logs/$(date +%Y%m%d_%H%M%S)"
+FUZZER_BIN="$BUILD_DIR/fuzz_shellsplit"
+CORPUS_DIR="$BUILD_DIR/fuzz-corpus/shellsplit"
 
-# Create log directory
-LOG_DIR="logs/$(date +%Y%m%d_%H%M%S)"
-mkdir -p "$LOG_DIR"
+mkdir -p "$LOG_DIR" "$SCRIPT_DIR/crashes"
 
-echo "========================================"
-echo "ShellSplit Fuzzing Session"
-echo "========================================"
-echo "Fuzzer: tokenizer_fuzzer"
-echo "Duration: 4 hours"
-echo "Memory limit: $MEMORY_LIMIT"
-echo "Log directory: $LOG_DIR"
-echo "========================================"
+cmake -S "$REPO_ROOT" -B "$BUILD_DIR" \
+  -DCMAKE_BUILD_TYPE=Debug \
+  -DCMAKE_C_COMPILER=clang \
+  -DCMAKE_CXX_COMPILER=clang++ \
+  -DBUILD_TESTING=OFF \
+  -DSHELLCLAVE_BUILD_TOOLS=OFF \
+  -DSHELLCLAVE_BUILD_FUZZERS=ON
+cmake --build "$BUILD_DIR" --target fuzz_shellsplit
 
-# Function to cleanup on exit
-cleanup() {
-    echo ""
-    echo "========================================"
-    echo "Fuzzing session ending"
-    echo "========================================"
-    # Kill watchdog if running
-    if [ -n "$WATCHDOG_PID" ]; then
-        kill "$WATCHDOG_PID" 2>/dev/null || true
-        wait "$WATCHDOG_PID" 2>/dev/null || true
-    fi
-    # Show summary
-    if [ -f "$LOG_DIR/crashes.log" ]; then
-        echo "Crashes found: $(wc -l < "$LOG_DIR/crashes.log")"
-    fi
-}
-trap cleanup EXIT INT TERM
-
-# Check if fuzzer exists
-if [ ! -f "./tokenizer_fuzzer" ]; then
-    echo "Fuzzer not found: ./tokenizer_fuzzer"
-    echo "Building..."
-    make
-fi
-
-# Build fuzzer command
 FUZZER_ARGS=(
-    "corpus/seed"
-    "-artifact_prefix=crashes/tokenizer_"
-    "-max_len=4096"
-    "-max_total_time=$DURATION"
-    "-jobs=2"
-    "-workers=2"
-    "-print_final_stats=1"
-    "-rss_limit_mb=4096"
+  "$CORPUS_DIR"
+  "-artifact_prefix=$SCRIPT_DIR/crashes/tokenizer_"
+  "-max_len=4096"
+  "-max_total_time=$DURATION"
+  "-jobs=$WORKERS"
+  "-workers=$WORKERS"
+  "-print_final_stats=1"
+  "-rss_limit_mb=4096"
 )
 
-# Note: dictionary not used - libFuzzer dictionary format incompatible
-
-echo ""
-echo "Starting fuzzer: ./tokenizer_fuzzer ${FUZZER_ARGS[*]}"
-echo ""
-
-# Start the fuzzer in cgroup
-./run_in_cgroup.sh "./tokenizer_fuzzer" "${FUZZER_ARGS[@]}" 2>&1 | tee "$LOG_DIR/fuzzer.log" &
-FUZZER_PID=$!
-
-# Start memory watchdog
-WATCHDOG_TARGET_PID=$FUZZER_PID ./memory_watchdog.sh 2>&1 | tee "$LOG_DIR/watchdog.log" &
-WATCHDOG_PID=$!
-
-echo "Fuzzer PID: $FUZZER_PID"
-echo "Watchdog PID: $WATCHDOG_PID"
-echo ""
-echo "To monitor progress: tail -f $LOG_DIR/fuzzer.log"
-echo "To stop gracefully: kill -TERM $FUZZER_PID"
-echo ""
-
-# Wait for fuzzer to complete
-wait "$FUZZER_PID"
-FUZZER_EXIT=$?
-
-echo ""
-echo "Fuzzer exited with code: $FUZZER_EXIT"
-
-# Show final stats
-if [ -f "$LOG_DIR/fuzzer.log" ]; then
-    echo ""
-    echo "Final statistics:"
-    grep -E "(Done|runs|cov|corp|units|slowest|max|rss)" "$LOG_DIR/fuzzer.log" | tail -20 || true
-fi
-
-exit $FUZZER_EXIT
+echo "Running $FUZZER_BIN for $DURATION seconds with $WORKERS workers"
+"$FUZZER_BIN" "${FUZZER_ARGS[@]}" 2>&1 | tee "$LOG_DIR/fuzzer.log"

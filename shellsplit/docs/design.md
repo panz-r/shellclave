@@ -31,7 +31,6 @@ Raw Command → Fast Parser → Depgraph → Abstraction → DFA Match
 ```c
 typedef struct {
     uint32_t max_subcommands;
-    uint32_t max_depth;
     bool strict_mode;
 } shell_limits_t;
 ```
@@ -119,23 +118,28 @@ LibFuzzer harness at `fuzz/tokenizer_fuzzer.cpp` tests all parsers:
 
 Build with:
 ```bash
-make fuzz CC=clang CXX=clang++
+cmake -S . -B build-fuzz -DCMAKE_C_COMPILER=clang \
+  -DCMAKE_CXX_COMPILER=clang++ -DSHELLCLAVE_BUILD_FUZZERS=ON \
+  -DBUILD_TESTING=OFF
+cmake --build build-fuzz --target fuzz_shellsplit
 ```
 
 Run:
 ```bash
-./fuzz/tokenizer_fuzzer -max_len=8192 -verbosity=1
+mkdir -p build-fuzz/fuzz-corpus/shellsplit
+build-fuzz/fuzz_shellsplit -max_len=8192 -verbosity=1 \
+  build-fuzz/fuzz-corpus/shellsplit
 ```
 
 ## Build System
 
-Plain Makefile — no CMake or autotools.
+The repository-root CMake project configures, builds, tests, installs, and
+generates the compile database.
 
 ```bash
-make          # Build all targets
-make test     # Run all tests
-make clean    # Remove artifacts
-make coverage # Build with coverage
+cmake -S . -B build
+cmake --build build
+ctest --test-dir build --output-on-failure
 ```
 
 ## Error Handling

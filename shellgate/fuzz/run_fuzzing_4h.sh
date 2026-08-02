@@ -5,14 +5,18 @@
 # Usage: ./run_fuzzing_4h.sh [workers] [duration_seconds]
 # Default: 2 workers, 4 hours
 
-set -e
+set -euo pipefail
 
 WORKERS="${1:-2}"
 DURATION="${2:-14400}"
 MEMORY_LIMIT="${FUZZ_MEMORY_LIMIT:-8G}"
 
+WATCHDOG_PID=""
+FUZZER_PID=""
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BUILD_DIR="${FUZZ_BUILD_DIR:-$SCRIPT_DIR/../build_fuzz}"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+BUILD_DIR="${FUZZ_BUILD_DIR:-$REPO_ROOT/build-fuzz}"
 
 LOG_DIR="$SCRIPT_DIR/logs/$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$LOG_DIR"
@@ -58,12 +62,17 @@ if [ ! -f "$FUZZER_BIN" ]; then
     echo "Fuzzer not found at $FUZZER_BIN"
     echo "Building with CMake (clang required for libFuzzer)..."
     mkdir -p "$BUILD_DIR"
-    cmake -S "$SCRIPT_DIR/.." -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE=Debug -DCMAKE_C_COMPILER=clang
+    cmake -S "$REPO_ROOT" -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE=Debug \
+        -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+        -DBUILD_TESTING=OFF -DSHELLCLAVE_BUILD_TOOLS=OFF \
+        -DSHELLCLAVE_BUILD_FUZZERS=ON
     cmake --build "$BUILD_DIR" --target fuzz_shellgate
 fi
 
-# Corpus lives in tests/corpus/ — the single source of truth, committed to git
-CORPUS_DIR="$SCRIPT_DIR/../tests/corpus"
+# CMake creates this build-local directory even when a fresh clone has no
+# source corpus.
+CORPUS_DIR="$BUILD_DIR/fuzz-corpus/shellgate"
+mkdir -p "$CORPUS_DIR"
 
 FUZZER_ARGS=(
     "$CORPUS_DIR"
@@ -90,20 +99,8 @@ HAS_LIBFUZZER=false
 timeout -s KILL 3 "$FUZZER_BIN" -help=1 > /dev/null 2>&1 && HAS_LIBFUZZER=true
 
 if [ "$HAS_LIBFUZZER" = "false" ]; then
-    echo "fuzz_shellgate was built without libFuzzer (likely gcc)."
-    echo "Rebuilding with clang..."
-    rm -rf "$BUILD_DIR"
-    mkdir -p "$BUILD_DIR"
-    cmake -S "$SCRIPT_DIR/.." -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE=Debug -DCMAKE_C_COMPILER=clang 2>&1
-    cmake --build "$BUILD_DIR" --target fuzz_shellgate 2>&1
-    # Re-check
-    FUZZER_BIN="$BUILD_DIR/fuzz_shellgate"
-    timeout -s KILL 3 "$FUZZER_BIN" -help=1 > /dev/null 2>&1 && HAS_LIBFUZZER=true
-fi
-
-if [ "$HAS_LIBFUZZER" = "false" ]; then
-    echo "ERROR: libFuzzer still not available after clang rebuild."
-    echo "Install clang with libFuzzer support."
+    echo "ERROR: $FUZZER_BIN was not built with libFuzzer."
+    echo "Use a fresh FUZZ_BUILD_DIR or configure it with Clang."
     exit 1
 fi
 

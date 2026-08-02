@@ -148,8 +148,7 @@ if [ $# -lt 1 ]; then
     echo "  FUZZ_MEMORY_HIGH - High watermark for early pressure (default: 80%)"
     echo ""
     echo "Examples:"
-    echo "  $0 ./dfa_eval_fuzzer corpus/ -max_total_time=60"
-    echo "  FUZZ_MEMORY_LIMIT=4G FUZZ_MEMORY_HIGH=90% $0 make run-dfa"
+    echo "  $0 build-fuzz/fuzz_shellgate build-fuzz/fuzz-corpus/shellgate -max_total_time=60"
     exit 1
 fi
 

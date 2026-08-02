@@ -1,927 +1,457 @@
-/*
- * test_anomaly.c - Unit tests for sg_anomaly
- */
+/* Unit tests for the standalone anomaly model. */
 
+#define _POSIX_C_SOURCE 200809L
 #include "sg_anomaly.h"
-#include <stdio.h>
-#include <string.h>
-#include <stdlib.h>
+#include <errno.h>
 #include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 
-static int pass_count = 0;
-static int fail_count = 0;
+static int pass_count;
+static int fail_count;
 
-#define ASSERT(cond) do { \
-    if (!(cond)) { \
-        printf("    FAIL: %s at %s:%d\n", #cond, __FILE__, __LINE__); \
-        fail_count++; \
-        return; \
-    } \
-} while (0)
+#define ASSERT(condition)                                                      \
+  do {                                                                         \
+    if (!(condition)) {                                                        \
+      printf("    FAIL: %s at %s:%d\n", #condition, __FILE__, __LINE__);       \
+      fail_count++;                                                            \
+      return;                                                                  \
+    }                                                                          \
+  } while (0)
 
-#define ASSERT_EQ_INT(a, b) do { \
-    if ((a) != (b)) { \
-        printf("    FAIL: %s != %s (%ld != %ld) at %s:%d\n", #a, #b, \
-               (long)(a), (long)(b), __FILE__, __LINE__); \
-        fail_count++; \
-        return; \
-    } \
-} while (0)
+#define ASSERT_EQ_INT(actual, expected)                                        \
+  do {                                                                         \
+    if ((actual) != (expected)) {                                              \
+      printf("    FAIL: %s != %s (%ld != %ld) at %s:%d\n", #actual, #expected, \
+             (long)(actual), (long)(expected), __FILE__, __LINE__);            \
+      fail_count++;                                                            \
+      return;                                                                  \
+    }                                                                          \
+  } while (0)
 
-#define ASSERT_EQ_DBL(a, b, eps) do { \
-    if (fabs((a) - (b)) > (eps)) { \
-        printf("    FAIL: %s != %s (%.6f != %.6f) at %s:%d\n", #a, #b, \
-               (double)(a), (double)(b), __FILE__, __LINE__); \
-        fail_count++; \
-        return; \
-    } \
-} while (0)
-
-#define ASSERT_STR(a, b) do { \
-    if (strcmp((a), (b)) != 0) { \
-        printf("    FAIL: %s != %s (\"%s\" != \"%s\") at %s:%d\n", #a, #b, (a), (b), __FILE__, __LINE__); \
-        fail_count++; \
-        return; \
-    } \
-} while (0)
+#define ASSERT_EQ_DBL(actual, expected, epsilon)                               \
+  do {                                                                         \
+    if (fabs((actual) - (expected)) > (epsilon)) {                             \
+      printf("    FAIL: %s != %s (%.9f != %.9f) at %s:%d\n", #actual,          \
+             #expected, (double)(actual), (double)(expected), __FILE__,        \
+             __LINE__);                                                        \
+      fail_count++;                                                            \
+      return;                                                                  \
+    }                                                                          \
+  } while (0)
 
 #define TEST(name) static void test_##name(void)
-#define RUN(name) do { \
-    printf("  %-40s ", #name); \
-    int _pf = fail_count; \
-    test_##name(); \
-    if (fail_count == _pf) { printf("PASS\n"); pass_count++; } \
-} while (0)
+#define RUN(name)                                                              \
+  do {                                                                         \
+    printf("  %-38s ", #name);                                                 \
+    int previous_failures = fail_count;                                        \
+    test_##name();                                                             \
+    if (fail_count == previous_failures) {                                     \
+      printf("PASS\n");                                                        \
+      pass_count++;                                                            \
+    }                                                                          \
+  } while (0)
 
-/* ============================================================
- * LIFECYCLE
- * ============================================================ */
+static const char *commands[] = {"a", "b", "c", "d", "e"};
 
-TEST(anomaly_model_new_default)
-{
-    sg_anomaly_model_t *m = sg_anomaly_model_new();
-    ASSERT(m != NULL);
-    ASSERT_EQ_INT(sg_anomaly_total_uni(m), 0);
-    ASSERT_EQ_INT(sg_anomaly_vocab_size(m), 0);
-    sg_anomaly_model_free(m);
+static void update_repeated(sg_anomaly_model_t *model, const char **seq,
+                            size_t length, size_t repetitions) {
+  for (size_t i = 0; i < repetitions; i++)
+    sg_anomaly_update(model, seq, length);
 }
 
-TEST(anomaly_model_new_ex)
-{
-    sg_anomaly_model_t *m = sg_anomaly_model_new_ex(0.5, -5.0);
-    ASSERT(m != NULL);
-    sg_anomaly_model_free(m);
+TEST(lifecycle_and_null_safety) {
+  sg_anomaly_model_t *model = sg_anomaly_model_new();
+  ASSERT(model != NULL);
+  ASSERT_EQ_INT(sg_anomaly_vocab_size(model), 0);
+  ASSERT_EQ_INT(sg_anomaly_total_uni(model), 0);
+  ASSERT_EQ_INT(sg_anomaly_total_bi(model), 0);
+  ASSERT_EQ_INT(sg_anomaly_total_tri(model), 0);
+  ASSERT_EQ_INT(sg_anomaly_total_quad(model), 0);
+  ASSERT_EQ_INT(sg_anomaly_total_contexts(model), 0);
+  ASSERT_EQ_INT(sg_anomaly_unk_count(model), 0);
+  ASSERT_EQ_DBL(sg_anomaly_kn_discount(model), 0.5, 0.000001);
+  ASSERT(!sg_anomaly_model_had_error(model));
+
+  const char *invalid_sequences[][3] = {
+      {"a", NULL, "c"},
+      {"a", "", "c"},
+  };
+  sg_anomaly_update(model, commands, 5);
+  for (size_t i = 0;
+       i < sizeof(invalid_sequences) / sizeof(invalid_sequences[0]); i++) {
+    ASSERT(isinf(sg_anomaly_score(model, invalid_sequences[i], 3)));
+    ASSERT(!sg_anomaly_has_observed(model, invalid_sequences[i], 3));
+    sg_anomaly_update(model, invalid_sequences[i], 3);
+    ASSERT_EQ_INT(sg_anomaly_total_uni(model), 5);
+  }
+  sg_anomaly_update(NULL, commands, 5);
+  sg_anomaly_model_decay(NULL, 0.5);
+  sg_anomaly_model_clear_error(NULL);
+  sg_anomaly_model_free(NULL);
+  ASSERT(isinf(sg_anomaly_score(NULL, commands, 5)));
+  ASSERT(isinf(sg_anomaly_score(model, NULL, 5)));
+  ASSERT_EQ_INT(sg_anomaly_vocab_size(NULL), 0);
+  ASSERT_EQ_INT(sg_anomaly_total_uni(NULL), 0);
+  ASSERT_EQ_INT(sg_anomaly_total_bi(NULL), 0);
+  ASSERT_EQ_INT(sg_anomaly_total_tri(NULL), 0);
+  ASSERT_EQ_INT(sg_anomaly_total_quad(NULL), 0);
+  ASSERT_EQ_INT(sg_anomaly_total_contexts(NULL), 0);
+  ASSERT_EQ_INT(sg_anomaly_unk_count(NULL), 0);
+  ASSERT_EQ_INT(sg_anomaly_uni_count(NULL, "a"), 0);
+  ASSERT_EQ_INT(sg_anomaly_bi_count(NULL, "a", "b"), 0);
+  ASSERT_EQ_INT(sg_anomaly_tri_count(NULL, "a", "b", "c"), 0);
+  ASSERT_EQ_INT(sg_anomaly_quad_count(NULL, "a", "b", "c", "d"), 0);
+  ASSERT_EQ_DBL(sg_anomaly_kn_discount(NULL), 0.0, 0.0);
+  ASSERT(!sg_anomaly_has_observed(NULL, commands, 5));
+  ASSERT_EQ_INT(sg_anomaly_model_prune(NULL, 2), 0);
+  ASSERT(!sg_anomaly_model_compact(NULL));
+  ASSERT_EQ_INT(sg_anomaly_save(NULL, "/tmp/unused"), -1);
+  ASSERT_EQ_INT(sg_anomaly_load(NULL, "/tmp/unused"), -1);
+  sg_anomaly_model_free(model);
 }
 
-TEST(anomaly_model_free_null)
-{
-    sg_anomaly_model_free(NULL);
+TEST(update_count_matrix) {
+  for (size_t length = 1; length <= 5; length++) {
+    sg_anomaly_model_t *model = sg_anomaly_model_new();
+    ASSERT(model != NULL);
+    update_repeated(model, commands, length, 3);
+
+    ASSERT_EQ_INT(sg_anomaly_vocab_size(model), length);
+    ASSERT_EQ_INT(sg_anomaly_total_uni(model), length * 3);
+    ASSERT_EQ_INT(sg_anomaly_total_bi(model),
+                  length > 1 ? (length - 1) * 3 : 0);
+    ASSERT_EQ_INT(sg_anomaly_total_tri(model),
+                  length > 2 ? (length - 2) * 3 : 0);
+    ASSERT_EQ_INT(sg_anomaly_total_quad(model),
+                  length > 3 ? (length - 3) * 3 : 0);
+    ASSERT_EQ_INT(sg_anomaly_uni_count(model, "a"), 3);
+    ASSERT_EQ_INT(sg_anomaly_uni_count(model, "missing"), 0);
+    ASSERT_EQ_INT(sg_anomaly_bi_count(model, "a", "b"), length > 1 ? 3 : 0);
+    ASSERT_EQ_INT(sg_anomaly_tri_count(model, "a", "b", "c"),
+                  length > 2 ? 3 : 0);
+    ASSERT_EQ_INT(sg_anomaly_quad_count(model, "a", "b", "c", "d"),
+                  length > 3 ? 3 : 0);
+    ASSERT((length < 3) == isinf(sg_anomaly_score(model, commands, length)));
+    ASSERT(sg_anomaly_has_observed(model, commands, length));
+    const char *unseen[] = {"missing"};
+    ASSERT(!sg_anomaly_has_observed(model, unseen, 1));
+    sg_anomaly_model_free(model);
+  }
+
+  char storage[4][SG_ANOMALY_MAX_COMMAND_LENGTH + 1];
+  const char *boundary[4];
+  for (size_t i = 0; i < 4; i++) {
+    memset(storage[i], 'a', SG_ANOMALY_MAX_COMMAND_LENGTH);
+    storage[i][SG_ANOMALY_MAX_COMMAND_LENGTH - 1] = (char)('a' + i);
+    storage[i][SG_ANOMALY_MAX_COMMAND_LENGTH] = '\0';
+    boundary[i] = storage[i];
+  }
+  sg_anomaly_model_t *model = sg_anomaly_model_new();
+  ASSERT(model != NULL);
+  sg_anomaly_update(model, boundary, 4);
+  ASSERT_EQ_INT(sg_anomaly_total_uni(model), 4);
+  ASSERT_EQ_INT(sg_anomaly_total_bi(model), 3);
+  ASSERT_EQ_INT(sg_anomaly_total_tri(model), 2);
+  ASSERT_EQ_INT(sg_anomaly_total_quad(model), 1);
+  ASSERT_EQ_INT(sg_anomaly_quad_count(model, boundary[0], boundary[1],
+                                      boundary[2], boundary[3]),
+                1);
+  ASSERT(isfinite(sg_anomaly_score(model, boundary, 4)));
+
+  char too_long[SG_ANOMALY_MAX_COMMAND_LENGTH + 2];
+  memset(too_long, 'x', sizeof(too_long) - 1);
+  too_long[sizeof(too_long) - 1] = '\0';
+  const char *invalid[] = {boundary[0], boundary[1], too_long};
+  sg_anomaly_update(model, invalid, 3);
+  ASSERT_EQ_INT(sg_anomaly_total_uni(model), 4);
+  /* An over-long name is never learned, so it must score as an unknown command
+   * rather than returning INFINITY, which callers read as "cannot score" and
+   * would let it bypass anomaly detection entirely. */
+  double over_long_score = sg_anomaly_score(model, invalid, 3);
+  ASSERT(isfinite(over_long_score));
+  const char *known[] = {boundary[0], boundary[1], boundary[2]};
+  ASSERT(over_long_score > sg_anomaly_score(model, known, 3));
+  ASSERT_EQ_INT(sg_anomaly_uni_count(model, too_long), 0);
+  sg_anomaly_model_free(model);
 }
 
-/* ============================================================
- * UPDATE AND SCORE
- * ============================================================ */
+TEST(score_discrimination_matrix) {
+  for (size_t length = 3; length <= 5; length++) {
+    sg_anomaly_model_t *model = sg_anomaly_model_new_ex(0.1, -10.0);
+    ASSERT(model != NULL);
+    sg_anomaly_update(model, commands, length);
+    double initial_score = sg_anomaly_score(model, commands, length);
+    update_repeated(model, commands, length, 19);
 
-TEST(update_and_score_single_trigram)
-{
-    sg_anomaly_model_t *m = sg_anomaly_model_new();
-    const char *seq[] = { "git", "status", "ls" };
-    sg_anomaly_update(m, seq, 3);
-
-    ASSERT_EQ_INT(sg_anomaly_total_uni(m), 3);
-    ASSERT_EQ_INT(sg_anomaly_vocab_size(m), 3);
-    ASSERT_EQ_INT(sg_anomaly_total_bi(m), 2);
-    ASSERT_EQ_INT(sg_anomaly_total_tri(m), 1);
-
-    double score = sg_anomaly_score(m, seq, 3);
-    ASSERT(!isinf(score));
-    ASSERT(score >= 0.0);
-
-    sg_anomaly_model_free(m);
+    double known_score = sg_anomaly_score(model, commands, length);
+    const char *partly_unseen[5];
+    memcpy(partly_unseen, commands, sizeof(partly_unseen));
+    partly_unseen[length - 1] = "never-seen";
+    const char *fully_unseen[] = {"v", "w", "x", "y", "z"};
+    double partial_score = sg_anomaly_score(model, partly_unseen, length);
+    double unseen_score = sg_anomaly_score(model, fully_unseen, length);
+    ASSERT(isfinite(known_score) && known_score >= 0.0);
+    ASSERT(known_score < initial_score);
+    ASSERT(isfinite(partial_score) && partial_score > known_score);
+    ASSERT(isfinite(unseen_score) && unseen_score > known_score);
+    sg_anomaly_model_free(model);
+  }
 }
 
-TEST(score_returns_infinity_for_len_lt_3)
-{
-    sg_anomaly_model_t *m = sg_anomaly_model_new();
-    const char *seq1[] = { "git" };
-    const char *seq2[] = { "git", "status" };
+TEST(backoff_levels_are_usable) {
+  const char *sequence[] = {"ls", "cd", "pwd"};
+  sg_anomaly_model_t *unigram_model = sg_anomaly_model_new_ex(0.1, -10.0);
+  sg_anomaly_model_t *bigram_model = sg_anomaly_model_new_ex(0.1, -10.0);
+  ASSERT(unigram_model && bigram_model);
 
-    ASSERT(isinf(sg_anomaly_score(m, seq1, 1)));
-    ASSERT(isinf(sg_anomaly_score(m, seq2, 2)));
+  for (size_t i = 0; i < 3; i++)
+    sg_anomaly_update(unigram_model, &sequence[i], 1);
+  sg_anomaly_update(bigram_model, sequence, 2);
+  sg_anomaly_update(bigram_model, sequence + 1, 2);
 
-    sg_anomaly_update(m, seq2, 2);
-    ASSERT(isinf(sg_anomaly_score(m, seq1, 1)));
-    ASSERT(isinf(sg_anomaly_score(m, seq2, 2)));
-
-    sg_anomaly_model_free(m);
+  ASSERT(isfinite(sg_anomaly_score(unigram_model, sequence, 3)));
+  ASSERT(isfinite(sg_anomaly_score(bigram_model, sequence, 3)));
+  ASSERT_EQ_INT(sg_anomaly_total_tri(unigram_model), 0);
+  ASSERT_EQ_INT(sg_anomaly_total_tri(bigram_model), 0);
+  ASSERT_EQ_INT(sg_anomaly_total_bi(bigram_model), 2);
+  sg_anomaly_model_free(unigram_model);
+  sg_anomaly_model_free(bigram_model);
 }
 
-TEST(score_returns_infinity_when_model_empty)
-{
-    sg_anomaly_model_t *m = sg_anomaly_model_new();
-    const char *seq[] = { "git", "status", "ls" };
-    ASSERT(isinf(sg_anomaly_score(m, seq, 3)));
-    sg_anomaly_model_free(m);
+TEST(model_owns_string_copies) {
+  sg_anomaly_model_t *model = sg_anomaly_model_new();
+  ASSERT(model != NULL);
+  char *owned[] = {strdup("gcc"), strdup("make"), strdup("git")};
+  ASSERT(owned[0] && owned[1] && owned[2]);
+  const char *sequence[] = {owned[0], owned[1], owned[2]};
+  sg_anomaly_update(model, sequence, 3);
+  for (size_t i = 0; i < 3; i++)
+    free(owned[i]);
+
+  const char *probe[] = {"gcc", "make", "git"};
+  ASSERT_EQ_INT(sg_anomaly_vocab_size(model), 3);
+  for (size_t i = 0; i < 3; i++)
+    ASSERT_EQ_INT(sg_anomaly_uni_count(model, probe[i]), 1);
+  ASSERT(isfinite(sg_anomaly_score(model, probe, 3)));
+  sg_anomaly_model_free(model);
 }
 
-TEST(known_sequence_has_low_score)
-{
-    sg_anomaly_model_t *m = sg_anomaly_model_new();
+TEST(save_load_roundtrip) {
+  char path[] = "/tmp/shellclave-anomaly-XXXXXX";
+  int fd = mkstemp(path);
+  ASSERT(fd >= 0);
+  close(fd);
 
-    /* Train on repeated pattern */
-    const char *seq1[] = { "ls", "cd", "pwd" };
-    const char *seq2[] = { "ls", "cd", "pwd" };
-    const char *seq3[] = { "ls", "cd", "pwd" };
+  sg_anomaly_model_t *source = sg_anomaly_model_new_ex(0.5, -8.0);
+  sg_anomaly_model_t *loaded = sg_anomaly_model_new();
+  ASSERT(source && loaded);
+  update_repeated(source, commands, 5, 5);
+  const char *unseen[] = {"v", "w", "x", "y", "z"};
+  double known_score = sg_anomaly_score(source, commands, 5);
+  double unseen_score = sg_anomaly_score(source, unseen, 5);
 
-    sg_anomaly_update(m, seq1, 3);
-    sg_anomaly_update(m, seq2, 3);
-    sg_anomaly_update(m, seq3, 3);
+  ASSERT_EQ_INT(sg_anomaly_save(source, path), 0);
+  if (access("/dev/full", W_OK) == 0) {
+    errno = 0;
+    ASSERT_EQ_INT(sg_anomaly_save(source, "/dev/full"), -1);
+    ASSERT(errno != 0);
+  }
+  ASSERT_EQ_INT(sg_anomaly_load(loaded, path), 0);
+  ASSERT_EQ_INT(sg_anomaly_load(loaded, path), 0);
+  ASSERT_EQ_INT(sg_anomaly_vocab_size(loaded), 5);
+  ASSERT_EQ_INT(sg_anomaly_total_uni(loaded), 25);
+  ASSERT_EQ_INT(sg_anomaly_total_bi(loaded), 20);
+  ASSERT_EQ_INT(sg_anomaly_total_tri(loaded), 15);
+  ASSERT_EQ_INT(sg_anomaly_total_quad(loaded), 10);
+  ASSERT_EQ_INT(sg_anomaly_unk_count(loaded), sg_anomaly_unk_count(source));
+  ASSERT_EQ_DBL(sg_anomaly_score(loaded, commands, 5), known_score, 0.000001);
+  ASSERT_EQ_DBL(sg_anomaly_score(loaded, unseen, 5), unseen_score, 0.000001);
+  ASSERT_EQ_DBL(sg_anomaly_kn_discount(loaded), sg_anomaly_kn_discount(source),
+                0.000001);
 
-    double score = sg_anomaly_score(m, seq1, 3);
-    ASSERT(!isinf(score));
-    ASSERT(score >= 0.0);
-    ASSERT(score < 5.0);  /* Should be low for known pattern */
+  FILE *fixture = fopen(path, "rb");
+  ASSERT(fixture != NULL);
+  ASSERT(fseek(fixture, 0, SEEK_END) == 0);
+  long file_length = ftell(fixture);
+  ASSERT(file_length > 0 && fseek(fixture, 0, SEEK_SET) == 0);
+  size_t valid_size = (size_t)file_length;
+  unsigned char *valid = malloc(valid_size);
+  ASSERT(valid != NULL);
+  ASSERT(fread(valid, 1, valid_size, fixture) == valid_size);
+  ASSERT(fclose(fixture) == 0);
 
-    sg_anomaly_model_free(m);
-}
+  size_t binary_offset = 0;
+  unsigned newlines = 0;
+  while (binary_offset < valid_size && newlines < 2)
+    if (valid[binary_offset++] == '\n')
+      newlines++;
+  ASSERT(newlines == 2 && binary_offset < valid_size);
 
-TEST(unseen_command_has_higher_score)
-{
-    sg_anomaly_model_t *m = sg_anomaly_model_new();
+  double preserved_score = sg_anomaly_score(loaded, commands, 5);
+  ASSERT(unlink(path) == 0);
+  errno = 0;
+  ASSERT_EQ_INT(sg_anomaly_load(loaded, path), -1);
+  ASSERT_EQ_INT(errno, ENOENT);
+  ASSERT_EQ_DBL(sg_anomaly_score(loaded, commands, 5), preserved_score,
+                0.000001);
 
-    /* Train on a specific pattern */
-    const char *seen_seq[] = { "ls", "cd", "pwd" };
-    sg_anomaly_update(m, seen_seq, 3);
-    sg_anomaly_update(m, seen_seq, 3);
-    sg_anomaly_update(m, seen_seq, 3);
-
-    /* Score a known sequence */
-    double known_score = sg_anomaly_score(m, seen_seq, 3);
-
-    /* Score an unknown sequence */
-    const char *unknown_seq[] = { "gcc", "make", "git" };
-    double unknown_score = sg_anomaly_score(m, unknown_seq, 3);
-
-    /* Unknown should generally be higher (more anomalous) */
-    ASSERT(!isinf(unknown_score));
-    ASSERT(unknown_score > known_score);
-
-    sg_anomaly_model_free(m);
-}
-
-/* ============================================================
- * STRING OWNERSHIP
- * ============================================================ */
-
-TEST(model_owns_string_copies)
-{
-    sg_anomaly_model_t *m = sg_anomaly_model_new();
-
-    /* Allocate some command names on the heap */
-    char *cmd1 = strdup("gcc");
-    char *cmd2 = strdup("make");
-    char *cmd3 = strdup("git");
-
-    const char *seq[] = { cmd1, cmd2, cmd3 };
-    sg_anomaly_update(m, seq, 3);
-
-    /* Free the caller's copies */
-    free(cmd1);
-    free(cmd2);
-    free(cmd3);
-
-    /* Model should still have the data */
-    ASSERT_EQ_INT(sg_anomaly_vocab_size(m), 3);
-    ASSERT_EQ_INT(sg_anomaly_uni_count(m, "gcc"), 1);
-    ASSERT_EQ_INT(sg_anomaly_uni_count(m, "make"), 1);
-    ASSERT_EQ_INT(sg_anomaly_uni_count(m, "git"), 1);
-
-    /* And score should work */
-    const char *test_seq[] = { "gcc", "make", "git" };
-    double score = sg_anomaly_score(m, test_seq, 3);
-    ASSERT(!isinf(score));
-
-    sg_anomaly_model_free(m);
-}
-
-/* ============================================================
- * MULTIPLE UPDATES ACCUMULATE
- * ============================================================ */
-
-TEST(multiple_updates_accumulate)
-{
-    sg_anomaly_model_t *m = sg_anomaly_model_new();
-
-    const char *seq[] = { "ls", "cd", "pwd" };
-
-    sg_anomaly_update(m, seq, 3);
-    ASSERT_EQ_INT(sg_anomaly_uni_count(m, "ls"), 1);
-
-    sg_anomaly_update(m, seq, 3);
-    ASSERT_EQ_INT(sg_anomaly_uni_count(m, "ls"), 2);
-
-    sg_anomaly_update(m, seq, 3);
-    ASSERT_EQ_INT(sg_anomaly_uni_count(m, "ls"), 3);
-    ASSERT_EQ_INT(sg_anomaly_total_uni(m), 9);
-
-    sg_anomaly_model_free(m);
-}
-
-/* ============================================================
- * SAVE AND LOAD ROUNDTRIP
- * ============================================================ */
-
-TEST(save_load_roundtrip_unigrams)
-{
-    sg_anomaly_model_t *m = sg_anomaly_model_new();
-    const char *seq[] = { "ls", "cd", "pwd", "gcc", "make" };
-    sg_anomaly_update(m, seq, 5);
-
-    ASSERT_EQ_INT(sg_anomaly_save(m, "/tmp/test_anomaly_uni.txt"), 0);
-
-    sg_anomaly_model_t *m2 = sg_anomaly_model_new();
-    ASSERT_EQ_INT(sg_anomaly_load(m2, "/tmp/test_anomaly_uni.txt"), 0);
-
-    ASSERT_EQ_INT(sg_anomaly_vocab_size(m2), 5);
-    ASSERT_EQ_INT(sg_anomaly_total_uni(m2), 5);
-    ASSERT_EQ_INT(sg_anomaly_uni_count(m2, "ls"), 1);
-    ASSERT_EQ_INT(sg_anomaly_uni_count(m2, "make"), 1);
-
-    /* Score should be identical */
-    double score1 = sg_anomaly_score(m, seq, 5);
-    double score2 = sg_anomaly_score(m2, seq, 5);
-    ASSERT_EQ_DBL(score1, score2, 0.001);
-
-    sg_anomaly_model_free(m);
-    sg_anomaly_model_free(m2);
-    unlink("/tmp/test_anomaly_uni.txt");
-}
-
-TEST(save_load_roundtrip_bigrams)
-{
-    sg_anomaly_model_t *m = sg_anomaly_model_new();
-    const char *seq[] = { "ls", "cd", "pwd" };
-    for (int i = 0; i < 10; i++)
-        sg_anomaly_update(m, seq, 3);
-
-    ASSERT_EQ_INT(sg_anomaly_save(m, "/tmp/test_anomaly_bi.txt"), 0);
-
-    sg_anomaly_model_t *m2 = sg_anomaly_model_new();
-    ASSERT_EQ_INT(sg_anomaly_load(m2, "/tmp/test_anomaly_bi.txt"), 0);
-
-    ASSERT_EQ_INT(sg_anomaly_total_bi(m2), 20);
-    ASSERT_EQ_INT(sg_anomaly_total_tri(m2), 10);
-
-    sg_anomaly_model_free(m);
-    sg_anomaly_model_free(m2);
-    unlink("/tmp/test_anomaly_bi.txt");
-}
-
-TEST(save_load_preserves_hyperparameters)
-{
-    sg_anomaly_model_t *m = sg_anomaly_model_new_ex(0.5, -8.0);
-    const char *seq[] = { "ls", "cd", "pwd" };
-    sg_anomaly_update(m, seq, 3);
-
-    ASSERT_EQ_INT(sg_anomaly_save(m, "/tmp/test_anomaly_hp.txt"), 0);
-
-    sg_anomaly_model_t *m2 = sg_anomaly_model_new();  /* default params */
-    ASSERT_EQ_INT(sg_anomaly_load(m2, "/tmp/test_anomaly_hp.txt"), 0);
-
-    /* After load, hyperparameters should be restored */
-    /* We can verify through the save file */
-    FILE *f = fopen("/tmp/test_anomaly_hp.txt", "r");
-    ASSERT(f != NULL);
-    char line[256];
-    int found_hp = 0;
-    while (fgets(line, sizeof(line), f)) {
-        if (line[0] == '#' && strchr(line, '.')) {
-            /* Check it contains our values */
-            if (strstr(line, "0.5") && strstr(line, "-8")) {
-                found_hp = 1;
-            }
-        }
+  enum corruption { EMPTY, BAD_MAGIC, TRUNCATED, BAD_TYPE, BAD_NEWLINE };
+  static const enum corruption corruptions[] = {EMPTY, BAD_MAGIC, TRUNCATED,
+                                                BAD_TYPE, BAD_NEWLINE};
+  for (size_t i = 0; i < sizeof(corruptions) / sizeof(corruptions[0]); i++) {
+    unsigned char *data = malloc(valid_size);
+    ASSERT(data != NULL);
+    memcpy(data, valid, valid_size);
+    size_t size = valid_size;
+    switch (corruptions[i]) {
+    case EMPTY:
+      size = 0;
+      break;
+    case BAD_MAGIC:
+      data[0] = '!';
+      break;
+    case TRUNCATED:
+      size--;
+      break;
+    case BAD_TYPE:
+      data[binary_offset] = 99;
+      break;
+    case BAD_NEWLINE:
+      data[size - 1] = 'X';
+      break;
     }
-    fclose(f);
-    ASSERT(found_hp);
+    fixture = fopen(path, "wb");
+    ASSERT(fixture != NULL);
+    ASSERT(fwrite(data, 1, size, fixture) == size);
+    ASSERT(fclose(fixture) == 0);
+    free(data);
 
-    sg_anomaly_model_free(m);
-    sg_anomaly_model_free(m2);
-    unlink("/tmp/test_anomaly_hp.txt");
+    errno = 0;
+    ASSERT_EQ_INT(sg_anomaly_load(loaded, path), -1);
+    ASSERT_EQ_INT(errno, EPROTO);
+    ASSERT_EQ_INT(sg_anomaly_vocab_size(loaded), 5);
+    ASSERT_EQ_INT(sg_anomaly_total_uni(loaded), 25);
+    ASSERT_EQ_DBL(sg_anomaly_score(loaded, commands, 5), preserved_score,
+                  0.000001);
+  }
+
+  fixture = fopen(path, "wb");
+  ASSERT(fixture != NULL);
+  ASSERT(fwrite(valid, 1, valid_size, fixture) == valid_size);
+  ASSERT(fclose(fixture) == 0);
+  free(valid);
+  ASSERT_EQ_INT(sg_anomaly_load(loaded, path), 0);
+  ASSERT_EQ_DBL(sg_anomaly_score(loaded, commands, 5), known_score, 0.000001);
+
+  sg_anomaly_model_free(source);
+  sg_anomaly_model_free(loaded);
+  unlink(path);
 }
 
-/* ============================================================
- * RESET
- * ============================================================ */
-
-TEST(reset_clears_all_counts)
-{
-    sg_anomaly_model_t *m = sg_anomaly_model_new();
-    const char *seq[] = { "ls", "cd", "pwd" };
-    sg_anomaly_update(m, seq, 3);
-
-    ASSERT_EQ_INT(sg_anomaly_total_uni(m), 3);
-    ASSERT_EQ_INT(sg_anomaly_vocab_size(m), 3);
-
-    sg_anomaly_reset(m);
-
-    ASSERT_EQ_INT(sg_anomaly_total_uni(m), 0);
-    ASSERT_EQ_INT(sg_anomaly_vocab_size(m), 0);
-    ASSERT_EQ_INT(sg_anomaly_total_bi(m), 0);
-    ASSERT_EQ_INT(sg_anomaly_total_tri(m), 0);
-    ASSERT(isinf(sg_anomaly_score(m, seq, 3)));
-
-    sg_anomaly_model_free(m);
+TEST(reset_and_error_state) {
+  sg_anomaly_model_t *model = sg_anomaly_model_new();
+  ASSERT(model != NULL);
+  update_repeated(model, commands, 5, 3);
+  ASSERT(!sg_anomaly_model_had_error(model));
+  sg_anomaly_model_clear_error(model);
+  ASSERT(!sg_anomaly_model_had_error(model));
+  sg_anomaly_reset(model);
+  ASSERT(!sg_anomaly_model_had_error(model));
+  ASSERT_EQ_INT(sg_anomaly_vocab_size(model), 0);
+  ASSERT_EQ_INT(sg_anomaly_total_uni(model), 0);
+  ASSERT_EQ_INT(sg_anomaly_total_bi(model), 0);
+  ASSERT_EQ_INT(sg_anomaly_total_tri(model), 0);
+  ASSERT_EQ_INT(sg_anomaly_total_quad(model), 0);
+  ASSERT_EQ_INT(sg_anomaly_total_contexts(model), 0);
+  ASSERT(isinf(sg_anomaly_score(model, commands, 5)));
+  sg_anomaly_model_free(model);
 }
 
-/* ============================================================
- * ACCESSORS
- * ============================================================ */
+TEST(decay_matrix) {
+  sg_anomaly_model_t *model = sg_anomaly_model_new();
+  ASSERT(model != NULL);
+  update_repeated(model, commands, 5, 4);
+  ASSERT_EQ_INT(sg_anomaly_unk_count(model), 5);
+  static const double invalid_scales[] = {0.0, 1.0, -0.5, 2.0};
+  for (size_t i = 0; i < sizeof(invalid_scales) / sizeof(invalid_scales[0]);
+       i++)
+    sg_anomaly_model_decay(model, invalid_scales[i]);
+  ASSERT_EQ_INT(sg_anomaly_total_uni(model), 20);
+  ASSERT_EQ_INT(sg_anomaly_total_quad(model), 8);
 
-TEST(accessors_null_safety)
-{
-    ASSERT_EQ_INT(sg_anomaly_vocab_size(NULL), 0);
-    ASSERT_EQ_INT(sg_anomaly_total_uni(NULL), 0);
-    ASSERT_EQ_INT(sg_anomaly_total_bi(NULL), 0);
-    ASSERT_EQ_INT(sg_anomaly_total_tri(NULL), 0);
-    ASSERT_EQ_INT(sg_anomaly_uni_count(NULL, "ls"), 0);
+  sg_anomaly_model_decay(model, 0.5);
+  ASSERT_EQ_INT(sg_anomaly_vocab_size(model), 5);
+  ASSERT_EQ_INT(sg_anomaly_total_uni(model), 10);
+  ASSERT_EQ_INT(sg_anomaly_total_bi(model), 8);
+  ASSERT_EQ_INT(sg_anomaly_total_tri(model), 6);
+  ASSERT_EQ_INT(sg_anomaly_total_quad(model), 4);
+  ASSERT_EQ_INT(sg_anomaly_unk_count(model), 2);
+  for (size_t i = 0; i < 5; i++)
+    ASSERT_EQ_INT(sg_anomaly_uni_count(model, commands[i]), 2);
+  ASSERT(isfinite(sg_anomaly_score(model, commands, 5)));
+  sg_anomaly_model_free(model);
 }
 
-TEST(uni_count_nonexistent)
-{
-    sg_anomaly_model_t *m = sg_anomaly_model_new();
-    const char *seq[] = { "ls", "cd", "pwd" };
-    sg_anomaly_update(m, seq, 3);
-
-    ASSERT_EQ_INT(sg_anomaly_uni_count(m, "nonexistent"), 0);
-    ASSERT_EQ_INT(sg_anomaly_uni_count(m, "ls"), 1);
-    ASSERT_EQ_INT(sg_anomaly_uni_count(m, "git"), 0);
-
-    sg_anomaly_model_free(m);
+TEST(decay_removes_large_rare_model) {
+  enum { COMMAND_COUNT = 96 };
+  char storage[COMMAND_COUNT][16];
+  const char *sequence[COMMAND_COUNT];
+  for (size_t i = 0; i < COMMAND_COUNT; i++) {
+    snprintf(storage[i], sizeof(storage[i]), "cmd%03zu", i);
+    sequence[i] = storage[i];
+  }
+  sg_anomaly_model_t *model = sg_anomaly_model_new();
+  ASSERT(model != NULL);
+  sg_anomaly_update(model, sequence, COMMAND_COUNT);
+  ASSERT_EQ_INT(sg_anomaly_vocab_size(model), COMMAND_COUNT);
+  sg_anomaly_model_decay(model, 0.5);
+  ASSERT_EQ_INT(sg_anomaly_vocab_size(model), 0);
+  ASSERT_EQ_INT(sg_anomaly_total_uni(model), 0);
+  ASSERT_EQ_INT(sg_anomaly_total_bi(model), 0);
+  ASSERT_EQ_INT(sg_anomaly_total_tri(model), 0);
+  ASSERT_EQ_INT(sg_anomaly_total_quad(model), 0);
+  ASSERT_EQ_INT(sg_anomaly_total_contexts(model), 0);
+  sg_anomaly_model_free(model);
 }
 
-/* ============================================================
- * EDGE CASES
- * ============================================================ */
-
-TEST(empty_sequence_update)
-{
-    sg_anomaly_model_t *m = sg_anomaly_model_new();
-    const char *seq[] = { "ls", "cd", "pwd" };
-    sg_anomaly_update(m, seq, 0);  /* no-op */
-    ASSERT_EQ_INT(sg_anomaly_total_uni(m), 0);
-    sg_anomaly_model_free(m);
+TEST(prune_and_compact_preserve_common_behavior) {
+  const char *common[] = {"ls", "cd", "pwd", "echo"};
+  const char *rare[] = {"gcc", "make", "test", "install"};
+  sg_anomaly_model_t *model = sg_anomaly_model_new();
+  ASSERT(model != NULL);
+  update_repeated(model, common, 4, 4);
+  sg_anomaly_update(model, rare, 4);
+  ASSERT(sg_anomaly_model_prune(model, 2) > 0);
+  ASSERT_EQ_INT(sg_anomaly_vocab_size(model), 4);
+  ASSERT_EQ_INT(sg_anomaly_total_uni(model), 16);
+  ASSERT_EQ_INT(sg_anomaly_total_bi(model), 12);
+  ASSERT_EQ_INT(sg_anomaly_total_tri(model), 8);
+  ASSERT_EQ_INT(sg_anomaly_total_quad(model), 4);
+  ASSERT_EQ_INT(sg_anomaly_uni_count(model, "gcc"), 0);
+  ASSERT_EQ_INT(sg_anomaly_quad_count(model, "gcc", "make", "test", "install"),
+                0);
+  ASSERT_EQ_INT(sg_anomaly_model_prune(model, 0), 0);
+  double score = sg_anomaly_score(model, common, 4);
+  ASSERT(sg_anomaly_model_compact(model));
+  ASSERT_EQ_DBL(sg_anomaly_score(model, common, 4), score, 0.000001);
+  sg_anomaly_model_free(model);
 }
 
-TEST(null_model_update)
-{
-    const char *seq[] = { "ls", "cd", "pwd" };
-    sg_anomaly_update(NULL, seq, 3);  /* no-op, no crash */
-}
-
-TEST(score_with_null_model)
-{
-    const char *seq[] = { "ls", "cd", "pwd" };
-    ASSERT(isinf(sg_anomaly_score(NULL, seq, 3)));
-}
-
-TEST(score_with_null_seq)
-{
-    sg_anomaly_model_t *m = sg_anomaly_model_new();
-    ASSERT(isinf(sg_anomaly_score(m, NULL, 3)));
-    sg_anomaly_model_free(m);
-}
-
-/* ============================================================
- * ERROR STATE TESTS
- * ============================================================ */
-
-TEST(oom_flag_initially_false)
-{
-    sg_anomaly_model_t *m = sg_anomaly_model_new();
-    ASSERT(!sg_anomaly_model_had_error(m));
-    sg_anomaly_model_free(m);
-}
-
-TEST(oom_flag_cleared_by_reset)
-{
-    sg_anomaly_model_t *m = sg_anomaly_model_new();
-    /* Force some updates */
-    const char *seq[] = { "ls", "cd", "pwd" };
-    sg_anomaly_update(m, seq, 3);
-    ASSERT(!sg_anomaly_model_had_error(m));
-    sg_anomaly_reset(m);
-    ASSERT(!sg_anomaly_model_had_error(m));
-    sg_anomaly_model_free(m);
-}
-
-TEST(clear_error_works)
-{
-    sg_anomaly_model_t *m = sg_anomaly_model_new();
-    sg_anomaly_model_clear_error(m);
-    ASSERT(!sg_anomaly_model_had_error(m));
-    sg_anomaly_model_free(m);
-}
-
-/* ============================================================
- * BACKOFF TESTS
- *
- * Verify that the backoff chain works correctly:
- * Trigram not seen → bigram → unigram → unk_prior
- * ============================================================ */
-
-TEST(backoff_to_bigram)
-{
-    /* Train only bigrams, no trigrams */
-    sg_anomaly_model_t *m = sg_anomaly_model_new_ex(0.1, -10.0);
-    /* Single sequence with unique commands */
-    const char *seq[] = { "ls", "cd", "pwd" };
-    sg_anomaly_update(m, seq, 3);
-
-    /* Check that bigram count exists */
-    /* We can infer backoff is used when trigram is unseen but bigram is seen */
-    /* Score should be finite (using unigram backoff) */
-    double score = sg_anomaly_score(m, seq, 3);
-    ASSERT(!isinf(score));
-    ASSERT(score >= 0.0);
-
-    sg_anomaly_model_free(m);
-}
-
-TEST(unigram_only_fallback)
-{
-    /* Train with single commands, no sequences */
-    sg_anomaly_model_t *m = sg_anomaly_model_new_ex(0.1, -10.0);
-
-    const char *s1[] = { "ls" };
-    const char *s2[] = { "cd" };
-    const char *s3[] = { "pwd" };
-
-    sg_anomaly_update(m, s1, 1);
-    sg_anomaly_update(m, s2, 1);
-    sg_anomaly_update(m, s3, 1);
-
-    /* Score a sequence - should use unigram backoff only */
-    const char *seq[] = { "ls", "cd", "pwd" };
-    double score = sg_anomaly_score(m, seq, 3);
-    ASSERT(!isinf(score));
-    ASSERT(score >= 0.0);
-
-    sg_anomaly_model_free(m);
-}
-
-/* ============================================================
- * SAVE/LOAD CONTEXT TOTALS PRESERVED
- * ============================================================ */
-
-TEST(save_load_preserves_context_totals)
-{
-    sg_anomaly_model_t *m = sg_anomaly_model_new_ex(0.1, -10.0);
-
-    /* Train a sequence that creates bigram context totals */
-    const char *seq[] = { "ls", "cd", "pwd" };
-    for (int i = 0; i < 5; i++)
-        sg_anomaly_update(m, seq, 3);
-
-    /* Score before save */
-    double score_before = sg_anomaly_score(m, seq, 3);
-
-    /* Save and load */
-    ASSERT_EQ_INT(sg_anomaly_save(m, "/tmp/test_ctx_save.txt"), 0);
-    sg_anomaly_model_free(m);
-
-    sg_anomaly_model_t *m2 = sg_anomaly_model_new_ex(0.1, -10.0);
-    ASSERT_EQ_INT(sg_anomaly_load(m2, "/tmp/test_ctx_save.txt"), 0);
-
-    /* Scores should be identical after load */
-    double score_after = sg_anomaly_score(m2, seq, 3);
-    ASSERT_EQ_DBL(score_before, score_after, 0.001);
-
-    sg_anomaly_model_free(m2);
-    unlink("/tmp/test_ctx_save.txt");
-}
-
-/* ============================================================
- * PROBABILITY CONSISTENCY
- * ============================================================ */
-
-TEST(score_is_average_negative_log_prob)
-{
-    sg_anomaly_model_t *m = sg_anomaly_model_new_ex(0.1, -10.0);
-
-    /* Train on a known sequence many times */
-    const char *seq[] = { "ls", "cd", "pwd" };
-    for (int i = 0; i < 100; i++)
-        sg_anomaly_update(m, seq, 3);
-
-    /* After extensive training, the sequence should have very low score */
-    double score = sg_anomaly_score(m, seq, 3);
-    ASSERT(!isinf(score));
-    ASSERT(score >= 0.0);
-    /* With 100 training rounds, trigram should be well-established */
-    /* Score should be reasonable (not extremely high) */
-
-    sg_anomaly_model_free(m);
-}
-
-/* ============================================================
- * BACKOFF CHAIN VERIFICATION
- * ============================================================ */
-
-TEST(backoff_chain)
-{
-    /* Verify backoff: unseen commands trigger unk_prior
-     * Train with specific commands, then probe with unseen ones */
-    sg_anomaly_model_t *m = sg_anomaly_model_new_ex(0.1, -10.0);
-
-    /* Train with known sequences */
-    const char *seqs[][3] = {
-        { "ls", "cd", "pwd" },
-        { "cd", "pwd", "gcc" },
-        { "pwd", "gcc", "make" },
-    };
-    for (size_t i = 0; i < 3; i++)
-        sg_anomaly_update(m, seqs[i], 3);
-
-    /* Score known sequence - should have low (non-anomalous) score */
-    const char *known[] = { "ls", "cd", "pwd" };
-    double score_known = sg_anomaly_score(m, known, 3);
-    ASSERT(!isinf(score_known));
-    ASSERT(score_known >= 0.0);
-
-    /* Score sequence with unseen command - should still be finite
-     * (uses unk_prior for unknown command) */
-    const char *probe[] = { "cd", "pwd", "neverheardof" };
-    double score_unseen = sg_anomaly_score(m, probe, 3);
-    ASSERT(!isinf(score_unseen));
-    ASSERT(score_unseen >= 0.0);
-
-    /* Sequence with unseen should be more anomalous than known */
-    ASSERT(score_unseen > score_known);
-
-    sg_anomaly_model_free(m);
-}
-
-/* ============================================================
- * EDGE CASES: SHORT SEQUENCES
- * ============================================================ */
-
-TEST(edge_single_command_update)
-{
-    /* Update with single command, verify unigram count */
-    sg_anomaly_model_t *m = sg_anomaly_model_new();
-    const char *seq[] = { "ls" };
-    sg_anomaly_update(m, seq, 1);
-
-    ASSERT(sg_anomaly_vocab_size(m) == 1);
-    ASSERT(sg_anomaly_total_uni(m) == 1);
-    ASSERT(sg_anomaly_uni_count(m, "ls") == 1);
-
-    sg_anomaly_model_free(m);
-}
-
-TEST(edge_two_command_update)
-{
-    /* Update with two commands, verify unigram + bigram counts */
-    sg_anomaly_model_t *m = sg_anomaly_model_new();
-    const char *seq[] = { "cd", "pwd" };
-    sg_anomaly_update(m, seq, 2);
-
-    /* Should have 2 unigrams and 1 bigram */
-    ASSERT(sg_anomaly_vocab_size(m) == 2);
-    ASSERT(sg_anomaly_total_uni(m) == 2);
-    ASSERT(sg_anomaly_total_bi(m) == 1);
-
-    sg_anomaly_model_free(m);
-}
-
-TEST(edge_short_sequence_scoring)
-{
-    /* Verify INFINITY for len < 3 */
-    sg_anomaly_model_t *m = sg_anomaly_model_new();
-    const char *seq1[] = { "ls" };
-    const char *seq2[] = { "ls", "cd" };
-
-    /* Score short sequences - should be INFINITY */
-    ASSERT(isinf(sg_anomaly_score(m, seq1, 1)));
-    ASSERT(isinf(sg_anomaly_score(m, seq2, 2)));
-
-    /* Train and verify short sequences still score as INFINITY */
-    const char *train[] = { "ls", "cd", "pwd" };
-    sg_anomaly_update(m, train, 3);
-    ASSERT(isinf(sg_anomaly_score(m, seq1, 1)));
-    ASSERT(isinf(sg_anomaly_score(m, seq2, 2)));
-
-    /* Normal 3+ sequence should score normally */
-    const char *seq3[] = { "ls", "cd", "pwd" };
-    ASSERT(!isinf(sg_anomaly_score(m, seq3, 3)));
-
-    sg_anomaly_model_free(m);
-}
-
-/* ============================================================
- * KN DISCOUNT TESTS
- * ============================================================ */
-
-TEST(kn_discount_basic)
-{
-    /* Verify KN discount produces finite scores for trained sequences */
-    sg_anomaly_model_t *m = sg_anomaly_model_new_ex(0.1, -10.0);
-
-    const char *seq[] = { "ls", "cd", "pwd" };
-    for (int i = 0; i < 10; i++)
-        sg_anomaly_update(m, seq, 3);
-
-    double score = sg_anomaly_score(m, seq, 3);
-    ASSERT(!isinf(score));
-    ASSERT(score >= 0.0);
-    /* KN should produce lower scores for well-trained sequences */
-    ASSERT(score < 5.0);
-
-    sg_anomaly_model_free(m);
-}
-
-TEST(kn_discount_unseen_higher)
-{
-    /* KN: unseen command sequences should score higher than seen ones */
-    sg_anomaly_model_t *m = sg_anomaly_model_new_ex(0.1, -10.0);
-
-    const char *seq[] = { "ls", "cd", "pwd" };
-    for (int i = 0; i < 20; i++)
-        sg_anomaly_update(m, seq, 3);
-
-    double score_seen = sg_anomaly_score(m, seq, 3);
-
-    const char *unseen[] = { "gcc", "make", "test" };
-    double score_unseen = sg_anomaly_score(m, unseen, 3);
-
-    ASSERT(!isinf(score_unseen));
-    ASSERT(score_unseen > score_seen);
-
-    sg_anomaly_model_free(m);
-}
-
-TEST(kn_discount_with_4gram_context)
-{
-    /* Train a 4-command sequence, verify 4-grams are recorded */
-    sg_anomaly_model_t *m = sg_anomaly_model_new_ex(0.1, -10.0);
-
-    const char *seq[] = { "ls", "cd", "pwd", "git" };
-    for (int i = 0; i < 10; i++)
-        sg_anomaly_update(m, seq, 4);
-
-    ASSERT(sg_anomaly_total_quad(m) > 0);
-
-    /* Score the trained 4-sequence */
-    double score = sg_anomaly_score(m, seq, 4);
-    ASSERT(!isinf(score));
-    ASSERT(score >= 0.0);
-
-    /* An unseen 4-sequence should be higher */
-    const char *bad[] = { "ls", "cd", "pwd", "rm_dash_rf" };
-    double bad_score = sg_anomaly_score(m, bad, 4);
-    ASSERT(!isinf(bad_score));
-    ASSERT(bad_score > score);
-
-    sg_anomaly_model_free(m);
-}
-
-TEST(quad_4gram_short_sequence)
-{
-    /* Sequences of len < 4 should still work (use trigram backoff) */
-    sg_anomaly_model_t *m = sg_anomaly_model_new_ex(0.1, -10.0);
-
-    const char *seq3[] = { "ls", "cd", "pwd" };
-    sg_anomaly_update(m, seq3, 3);
-
-    /* No 4-grams from 3-sequence */
-    ASSERT(sg_anomaly_total_quad(m) == 0);
-    ASSERT(sg_anomaly_total_tri(m) > 0);
-
-    /* Scoring should work fine */
-    double score = sg_anomaly_score(m, seq3, 3);
-    ASSERT(!isinf(score));
-
-    sg_anomaly_model_free(m);
-}
-
-TEST(quad_save_load_roundtrip)
-{
-    /* Verify 4-grams survive save/load */
-    sg_anomaly_model_t *m = sg_anomaly_model_new_ex(0.1, -10.0);
-
-    const char *seq[] = { "a", "b", "c", "d", "e" };
-    for (int i = 0; i < 5; i++)
-        sg_anomaly_update(m, seq, 5);
-
-    ASSERT(sg_anomaly_total_quad(m) > 0);
-    double score_before = sg_anomaly_score(m, seq, 5);
-
-    const char *path = "/tmp/test_quad_save.model";
-    ASSERT(sg_anomaly_save(m, path) == 0);
-
-    sg_anomaly_model_t *m2 = sg_anomaly_model_new();
-    ASSERT(sg_anomaly_load(m2, path) == 0);
-
-    ASSERT(sg_anomaly_total_quad(m2) == sg_anomaly_total_quad(m));
-    double score_after = sg_anomaly_score(m2, seq, 5);
-    ASSERT_EQ_DBL(score_before, score_after, 0.001);
-
-    sg_anomaly_model_free(m);
-    sg_anomaly_model_free(m2);
-    unlink(path);
-}
-
-TEST(quad_long_sequence_scoring)
-{
-    /* 5-command sequence uses both 4-grams and trigrams */
-    sg_anomaly_model_t *m = sg_anomaly_model_new_ex(0.1, -10.0);
-
-    const char *seq[] = { "ls", "cd", "pwd", "git", "make" };
-    for (int i = 0; i < 20; i++)
-        sg_anomaly_update(m, seq, 5);
-
-    /* Should have both 4-grams and trigrams */
-    ASSERT(sg_anomaly_total_quad(m) > 0);
-    ASSERT(sg_anomaly_total_tri(m) > 0);
-
-    double score = sg_anomaly_score(m, seq, 5);
-    ASSERT(!isinf(score));
-    ASSERT(score >= 0.0);
-
-    /* Replaced last command with unseen should score higher */
-    const char *bad[] = { "ls", "cd", "pwd", "git", "NEVER_SEEN_BEFORE" };
-    double bad_score = sg_anomaly_score(m, bad, 5);
-    ASSERT(!isinf(bad_score));
-    ASSERT(bad_score > score);
-
-    sg_anomaly_model_free(m);
-}
-
-/* ============================================================
- * INTROSPECTION TESTS
- * ============================================================ */
-
-TEST(introspection_kn_discount)
-{
-    sg_anomaly_model_t *m = sg_anomaly_model_new();
-    ASSERT_EQ_DBL(sg_anomaly_kn_discount(m), 0.5, 0.001);
-    sg_anomaly_model_free(m);
-}
-
-TEST(introspection_bi_count)
-{
-    sg_anomaly_model_t *m = sg_anomaly_model_new();
-    const char *seq[] = { "ls", "cd", "pwd" };
-    sg_anomaly_update(m, seq, 3);
-    sg_anomaly_update(m, seq, 3);
-
-    ASSERT_EQ_INT(sg_anomaly_bi_count(m, "ls", "cd"), 2);
-    ASSERT_EQ_INT(sg_anomaly_bi_count(m, "cd", "pwd"), 2);
-    ASSERT_EQ_INT(sg_anomaly_bi_count(m, "pwd", "ls"), 0);
-    ASSERT_EQ_INT(sg_anomaly_bi_count(m, "xxx", "yyy"), 0);
-
-    sg_anomaly_model_free(m);
-}
-
-TEST(introspection_tri_count)
-{
-    sg_anomaly_model_t *m = sg_anomaly_model_new();
-    const char *seq[] = { "ls", "cd", "pwd" };
-    sg_anomaly_update(m, seq, 3);
-    sg_anomaly_update(m, seq, 3);
-    sg_anomaly_update(m, seq, 3);
-
-    ASSERT_EQ_INT(sg_anomaly_tri_count(m, "ls", "cd", "pwd"), 3);
-    ASSERT_EQ_INT(sg_anomaly_tri_count(m, "cd", "pwd", "xxx"), 0);
-
-    sg_anomaly_model_free(m);
-}
-
-TEST(introspection_quad_count)
-{
-    sg_anomaly_model_t *m = sg_anomaly_model_new();
-    const char *seq[] = { "a", "b", "c", "d" };
-    sg_anomaly_update(m, seq, 4);
-    sg_anomaly_update(m, seq, 4);
-
-    ASSERT_EQ_INT(sg_anomaly_quad_count(m, "a", "b", "c", "d"), 2);
-    ASSERT_EQ_INT(sg_anomaly_quad_count(m, "x", "y", "z", "w"), 0);
-
-    sg_anomaly_model_free(m);
-}
-
-TEST(introspection_total_contexts)
-{
-    sg_anomaly_model_t *m = sg_anomaly_model_new();
-    ASSERT_EQ_INT(sg_anomaly_total_contexts(m), 0);
-
-    const char *seq[] = { "a", "b", "c", "d" };
-    sg_anomaly_update(m, seq, 4);
-
-    size_t ctx = sg_anomaly_total_contexts(m);
-    ASSERT(ctx > 0);
-
-    sg_anomaly_model_free(m);
-}
-
-TEST(introspection_has_observed)
-{
-    sg_anomaly_model_t *m = sg_anomaly_model_new();
-    const char *seq[] = { "ls", "cd", "pwd" };
-    sg_anomaly_update(m, seq, 3);
-
-    const char *seen[] = { "ls" };
-    ASSERT(sg_anomaly_has_observed(m, seen, 1));
-
-    const char *unseen[] = { "gcc" };
-    ASSERT(!sg_anomaly_has_observed(m, unseen, 1));
-
-    /* Mixed: at least one seen */
-    const char *mixed[] = { "gcc", "ls" };
-    ASSERT(sg_anomaly_has_observed(m, mixed, 2));
-
-    sg_anomaly_model_free(m);
-}
-
-TEST(introspection_null_safety)
-{
-    ASSERT_EQ_DBL(sg_anomaly_kn_discount(NULL), 0.0, 0.001);
-    ASSERT_EQ_INT(sg_anomaly_bi_count(NULL, "a", "b"), 0);
-    ASSERT_EQ_INT(sg_anomaly_tri_count(NULL, "a", "b", "c"), 0);
-    ASSERT_EQ_INT(sg_anomaly_quad_count(NULL, "a", "b", "c", "d"), 0);
-    ASSERT_EQ_INT(sg_anomaly_total_contexts(NULL), 0);
-    ASSERT(!sg_anomaly_has_observed(NULL, NULL, 0));
-}
-
-/* ============================================================
- * MAIN
- * ============================================================ */
-
-int main(void)
-{
-    printf("sg_anomaly unit tests\n");
-
-    RUN(anomaly_model_new_default);
-    RUN(anomaly_model_new_ex);
-    RUN(anomaly_model_free_null);
-    RUN(update_and_score_single_trigram);
-    RUN(score_returns_infinity_for_len_lt_3);
-    RUN(score_returns_infinity_when_model_empty);
-    RUN(known_sequence_has_low_score);
-    RUN(unseen_command_has_higher_score);
-    RUN(model_owns_string_copies);
-    RUN(multiple_updates_accumulate);
-    RUN(save_load_roundtrip_unigrams);
-    RUN(save_load_roundtrip_bigrams);
-    RUN(save_load_preserves_hyperparameters);
-    RUN(reset_clears_all_counts);
-    RUN(accessors_null_safety);
-    RUN(uni_count_nonexistent);
-    RUN(empty_sequence_update);
-    RUN(null_model_update);
-    RUN(score_with_null_model);
-    RUN(score_with_null_seq);
-
-    printf("\nError state tests:\n");
-    RUN(oom_flag_initially_false);
-    RUN(oom_flag_cleared_by_reset);
-    RUN(clear_error_works);
-
-    printf("\nBackoff tests:\n");
-    RUN(backoff_to_bigram);
-    RUN(unigram_only_fallback);
-
-    printf("\nContext totals tests:\n");
-    RUN(save_load_preserves_context_totals);
-    RUN(score_is_average_negative_log_prob);
-
-    printf("\nBackoff chain tests:\n");
-    RUN(backoff_chain);
-
-    printf("\nEdge case tests:\n");
-    RUN(edge_single_command_update);
-    RUN(edge_two_command_update);
-    RUN(edge_short_sequence_scoring);
-
-    printf("\nKneser-Ney tests:\n");
-    RUN(kn_discount_basic);
-    RUN(kn_discount_unseen_higher);
-    RUN(kn_discount_with_4gram_context);
-    RUN(quad_4gram_short_sequence);
-    RUN(quad_save_load_roundtrip);
-    RUN(quad_long_sequence_scoring);
-
-    printf("\nIntrospection tests:\n");
-    RUN(introspection_kn_discount);
-    RUN(introspection_bi_count);
-    RUN(introspection_tri_count);
-    RUN(introspection_quad_count);
-    RUN(introspection_total_contexts);
-    RUN(introspection_has_observed);
-    RUN(introspection_null_safety);
-
-    printf("\n%d passed, %d failed\n", pass_count, fail_count);
-    return fail_count > 0 ? 1 : 0;
+int main(void) {
+  printf("sg_anomaly unit tests\n");
+  RUN(lifecycle_and_null_safety);
+  RUN(update_count_matrix);
+  RUN(score_discrimination_matrix);
+  RUN(backoff_levels_are_usable);
+  RUN(model_owns_string_copies);
+  RUN(save_load_roundtrip);
+  RUN(reset_and_error_state);
+  RUN(decay_matrix);
+  RUN(decay_removes_large_rare_model);
+  RUN(prune_and_compact_preserve_common_behavior);
+  printf("\n%d passed, %d failed\n", pass_count, fail_count);
+  return fail_count > 0 ? 1 : 0;
 }
