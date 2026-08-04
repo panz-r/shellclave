@@ -55,10 +55,22 @@ Learn command shapes:
 
 ```c
 #include <shelltype.h>
+#include <stdio.h>
 
 st_learner_t *learner = st_learner_new(2, 0.5);
 if (learner != NULL) {
     (void)st_feed(learner, "git status --short");
+    (void)st_feed(learner, "git status --short");
+    (void)st_feed(learner, "git log --oneline");
+
+    size_t count = 0;
+    st_suggestion_t *suggestions = st_suggest(learner, &count);
+    for (size_t i = 0; i < count; ++i) {
+        printf("%s (count=%u, confidence=%.2f)\n",
+               suggestions[i].pattern, suggestions[i].count,
+               suggestions[i].confidence);
+    }
+    st_free_suggestions(suggestions, count);
     st_learner_free(learner);
 }
 ```
@@ -68,15 +80,21 @@ Evaluate a gate rule:
 ```c
 #include <shellgate.h>
 #include <string.h>
+#include <stdio.h>
 
 sg_gate_t *gate = sg_gate_new();
-char output[SG_DEFAULT_BUF_SIZE];
+const char command[] = "git status --short";
+char output[4096];
 sg_result_t result;
 if (gate != NULL) {
-    (void)sg_gate_add_rule(gate, "git status #opt");
-    sg_error_t error = sg_eval(gate, "git status --short",
-                               strlen("git status --short"),
-                               output, sizeof output, &result);
+    sg_error_t error = sg_gate_add_rule(gate, "git status #opt");
+    if (error == SG_OK) {
+        error = sg_eval(gate, command, strlen(command), output,
+                        sizeof output, &result);
+        if (error == SG_OK || error == SG_ERR_TRUNC) {
+            printf("verdict: %d\n", result.verdict);
+        }
+    }
     sg_gate_free(gate);
 }
 ```
@@ -130,8 +148,8 @@ cmake -S . -B build-analyze
 cmake --build build-analyze --target clang-analyze
 ```
 
-Fuzz corpus directories are ignored. A fresh clone starts with no corpus
-entries; fuzzer discoveries, coverage reports, and crash logs are gitignored.
+A fresh clone starts with no corpus entries; fuzzer discoveries, coverage
+reports, and crash logs are gitignored.
 
 ## Dependencies
 
