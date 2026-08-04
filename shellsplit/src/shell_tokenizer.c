@@ -29,7 +29,7 @@ static void detect_features(const char *cmd, uint32_t start, uint32_t len,
     char c = p[i];
 
     // Handle single quotes - no expansion inside
-    if (c == '\'') {
+    if (c == '\'' && !in_double_quotes) {
       in_single_quotes = !in_single_quotes;
       i++;
       continue;
@@ -41,7 +41,7 @@ static void detect_features(const char *cmd, uint32_t start, uint32_t len,
     }
 
     // Handle double quotes - variables expand, globs don't
-    if (c == '"') {
+    if (c == '"' && !in_single_quotes) {
       in_double_quotes = !in_double_quotes;
       i++;
       continue;
@@ -96,6 +96,11 @@ static void detect_features(const char *cmd, uint32_t start, uint32_t len,
     }
 
     // Check for features
+    if ((c == '<' || c == '>') && i + 1 < len && p[i + 1] == '(') {
+      *features |= SHELL_FEAT_PROCESS_SUB;
+      i++;
+      continue;
+    }
     switch (c) {
     case '$':
       // Variables expand in double quotes

@@ -247,9 +247,13 @@ TEST(basic_evaluation_matrix) {
       {{"rm"},
        "rm -rf / && ls",
        SG_VERDICT_UNDETERMINED,
-       {{"rm -rf /", false}},
-       1},
-      {{"ls"}, "rm || ls", SG_VERDICT_UNDETERMINED, {{"rm", false}}, 1},
+       {{"rm -rf /", false}, {"ls", false}},
+       2},
+      {{"ls"},
+       "rm || ls",
+       SG_VERDICT_UNDETERMINED,
+       {{"rm", false}, {"ls", true}},
+       2},
       {{"git * * *"},
        "git commit -m hello",
        SG_VERDICT_ALLOW,
@@ -293,12 +297,54 @@ TEST(basic_evaluation_matrix) {
 TEST(reject_subshell) {
   sg_gate_t *g = sg_gate_new();
   ASSERT_SG_OK(sg_gate_add_rule(g, "echo *"));
+  ASSERT_SG_OK(sg_gate_add_rule(g, "whoami"));
   sg_result_t r;
   ASSERT_SG_OK(eval_cmd(g, "echo $(whoami)", &r));
-  ASSERT(r.verdict == SG_VERDICT_REJECT);
-  ASSERT(r.deny_reason != NULL);
-  ASSERT(strstr(r.deny_reason, "command substitution") != NULL);
+  ASSERT(r.verdict == SG_VERDICT_ALLOW_CONDITIONAL);
+  ASSERT(r.requires_substitution_evaluation);
+  ASSERT_SG_OK(sg_gate_add_deny_rule(g, "whoami"));
+  ASSERT_SG_OK(eval_cmd(g, "echo $(whoami)", &r));
+  ASSERT(r.verdict == SG_VERDICT_DENY);
   sg_gate_free(g);
+}
+
+TEST(conditional_substitution_matrix) {
+  static const struct {
+    const char *command;
+    const char *outer_rule;
+    const char *inner_rule;
+    sg_verdict_t expected;
+    bool conditional;
+    uint32_t reject_mask;
+  } cases[] = {
+      {"echo $(whoami)", "echo *", "whoami", SG_VERDICT_ALLOW_CONDITIONAL, true,
+       0},
+      {"cat <(whoami)", "cat", "whoami", SG_VERDICT_ALLOW_CONDITIONAL, true, 0},
+      {"echo $(whoami)", "echo *", NULL, SG_VERDICT_UNDETERMINED, true, 0},
+      {"echo $(whoami)", "echo *", "whoami", SG_VERDICT_REJECT, false,
+       (1u << 2)},
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    sg_gate_t *g = sg_gate_new();
+    ASSERT(g != NULL);
+    ASSERT_SG_OK(sg_gate_add_rule(g, cases[i].outer_rule));
+    if (cases[i].inner_rule)
+      ASSERT_SG_OK(sg_gate_add_rule(g, cases[i].inner_rule));
+    if (cases[i].reject_mask)
+      ASSERT_SG_OK(sg_gate_set_reject_mask(g, cases[i].reject_mask));
+    sg_result_t result;
+    ASSERT_SG_OK(eval_cmd(g, cases[i].command, &result));
+    ASSERT(result.verdict == cases[i].expected);
+    ASSERT(result.requires_substitution_evaluation == cases[i].conditional);
+    if (cases[i].conditional) {
+      ASSERT(result.subcmd_count >= 2);
+      bool linked = false;
+      for (uint32_t j = 0; j < result.subcmd_count; j++)
+        linked |= result.subcmds[j].substitution_parent_index >= 0;
+      ASSERT(linked);
+    }
+    sg_gate_free(g);
+  }
 }
 
 TEST(reject_heredoc) {
@@ -375,7 +421,7 @@ TEST(eval_whitespace_command) {
 TEST(eval_parse_error) {
   sg_gate_t *g = sg_gate_new();
   sg_result_t r;
-  ASSERT_SG_OK(eval_cmd(g, "echo \"unclosed", &r));
+  ASSERT(eval_cmd(g, "echo \"unclosed", &r) == SG_ERR_PARSE);
   ASSERT(r.verdict == SG_VERDICT_REJECT);
   sg_gate_free(g);
 }
@@ -680,8 +726,12 @@ TEST(save_load_malformed) {
   fclose(f);
 
   sg_gate_t *g = sg_gate_new();
+  ASSERT_SG_OK(sg_gate_add_rule(g, "ls"));
   sg_error_t err = sg_gate_load_policy(g, path);
   ASSERT(err != SG_OK);
+  sg_result_t result;
+  ASSERT_SG_OK(eval_cmd(g, "ls", &result));
+  ASSERT(result.verdict == SG_VERDICT_ALLOW);
 
   unlink(path);
   sg_gate_free(g);
@@ -1178,6 +1228,8 @@ TEST(violation_configuration_matrix) {
         break;
       }
     ASSERT(record != NULL);
+    ASSERT(record->category_flags != 0);
+    ASSERT(result.violation_type_flags & cases[i].expected_flag);
     if (!cases[i].detail_contains)
       ASSERT(record->detail == NULL);
     else
@@ -1215,8 +1267,10 @@ TEST(violation_absence_matrix) {
   static const struct {
     bool enabled;
     const char *command;
-  } cases[] = {
-      {true, "ls -la"}, {false, "ls"}, {false, "echo hello > /etc/badfile"}};
+  } cases[] = {{true, "ls -la"},
+               {true, "echo hello > /etcx/badfile"},
+               {false, "ls"},
+               {false, "echo hello > /etc/badfile"}};
 
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
     sg_gate_t *gate = cases[i].enabled ? gate_with_violations() : sg_gate_new();
@@ -2189,6 +2243,7 @@ int main(void) {
 
   printf("\nFeature rejection:\n");
   RUN(reject_subshell);
+  RUN(conditional_substitution_matrix);
   RUN(reject_heredoc);
 
   printf("\nSuggestions:\n");

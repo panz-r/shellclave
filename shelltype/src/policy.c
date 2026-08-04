@@ -33,6 +33,7 @@
 #include <string.h>
 #include <strings.h>
 #include <time.h>
+#include <unistd.h>
 
 /* ============================================================
  * CRC32 (for serialization integrity check)
@@ -3274,17 +3275,37 @@ st_error_t st_policy_save(const st_policy_t *policy, const char *path) {
   if (!policy || !path)
     return ST_ERR_INVALID;
 
-  FILE *fp = fopen(path, "w");
-  if (!fp)
+  char *tmp_path = malloc(strlen(path) + 8);
+  if (!tmp_path)
+    return ST_ERR_MEMORY;
+  sprintf(tmp_path, "%s.XXXXXX", path);
+  int fd = mkstemp(tmp_path);
+  if (fd < 0) {
+    free(tmp_path);
     return ST_ERR_IO;
+  }
+  FILE *fp = fdopen(fd, "w");
+  if (!fp) {
+    close(fd);
+    unlink(tmp_path);
+    free(tmp_path);
+    return ST_ERR_IO;
+  }
 
   /* Header (no lock needed - just writing constants) */
   if (fprintf(fp, "# CPL v%d\n", ST_SERIALIZATION_VERSION) < 0) {
     fclose(fp);
+    unlink(tmp_path);
+    free(tmp_path);
     return ST_ERR_IO;
   }
-  if (fprintf(fp, "# patterns: %zu\n", policy->pattern_count) < 0) {
+  pthread_rwlock_rdlock((pthread_rwlock_t *)&policy->rwlock);
+  size_t snapshot_count = policy->pattern_count;
+  pthread_rwlock_unlock((pthread_rwlock_t *)&policy->rwlock);
+  if (fprintf(fp, "# patterns: %zu\n", snapshot_count) < 0) {
     fclose(fp);
+    unlink(tmp_path);
+    free(tmp_path);
     return ST_ERR_IO;
   }
 
@@ -3305,7 +3326,13 @@ st_error_t st_policy_save(const st_policy_t *policy, const char *path) {
     }
   }
 
-  fclose(fp);
+  if (fflush(fp) != 0 || fclose(fp) != 0)
+    ctx.error = ST_ERR_IO;
+  if (ctx.error == ST_OK && rename(tmp_path, path) != 0)
+    ctx.error = ST_ERR_IO;
+  if (ctx.error != ST_OK)
+    unlink(tmp_path);
+  free(tmp_path);
   return ctx.error;
 }
 
@@ -3414,44 +3441,83 @@ st_error_t st_policy_load(st_policy_t *policy, const char *path,
     goto pass1_fail;
   }
 
-  /* ============================================================
-   * PASS 2: CRC verified. Now modify the policy.
-   * Acquire write lock for entire operation.
-   * ============================================================ */
+  /* PASS 2: build a complete replacement off to the side. The live policy is
+   * untouched until every pattern has been accepted. */
+  st_policy_t *staged = st_policy_new(policy->ctx);
+  if (!staged)
+    goto pass2_memory_fail;
+  if (!clear_first) {
+    st_error_t merge_err = st_policy_merge(staged, policy);
+    if (merge_err != ST_OK) {
+      st_policy_free(staged);
+      goto pass2_memory_fail;
+    }
+  }
+
+  const char **lines = (const char **)pattern_lines;
+  st_error_t add_err = pattern_count == 0
+                           ? ST_OK
+                           : st_policy_batch_add(staged, lines, pattern_count);
+  if (add_err != ST_OK) {
+    st_policy_free(staged);
+    goto pass2_error;
+  }
+
   pthread_rwlock_wrlock(&policy->rwlock);
+  states_array_t old_states = policy->states;
+  pattern_reg_t old_patterns = policy->patterns;
+  arena_t old_arena = policy->children_arena;
+  len_bucket_t *old_buckets = policy->len_buckets;
+  size_t old_num_buckets = policy->num_buckets;
+  size_t old_pattern_count = policy->pattern_count;
+  size_t old_children_count = policy->children_count;
+  vacuum_filter_t *old_filters[FILTER_POS_LEVELS];
+  uint64_t old_wildcards[FILTER_POS_LEVELS];
+  uint64_t old_filter_epochs[FILTER_POS_LEVELS];
+  memcpy(old_filters, policy->pos_filters, sizeof old_filters);
+  memcpy(old_wildcards, policy->pos_wildcard_mask, sizeof old_wildcards);
+  memcpy(old_filter_epochs, policy->pos_built_epoch, sizeof old_filter_epochs);
 
-  if (clear_first) {
-    arena_free(&policy->children_arena);
-    arena_init(&policy->children_arena, CHILDREN_ARENA_SIZE);
-    free(policy->states.states);
-    states_array_init(&policy->states);
-    pattern_reg_free(&policy->patterns);
-    pattern_reg_init(&policy->patterns);
-    for (size_t i = 0; i < policy->num_buckets; i++)
-      len_bucket_free(&policy->len_buckets[i]);
-    policy->pattern_count = 0;
-    policy->children_count = 0;
-    for (int i = 0; i < FILTER_POS_LEVELS; i++) {
-      vacuum_filter_destroy(policy->pos_filters[i]);
-      policy->pos_filters[i] = NULL;
-      policy->pos_built_epoch[i] = 0;
-    }
-    atomic_fetch_add(&policy->epoch, 1);
-  }
-
-  st_error_t first_err = ST_OK;
-  for (size_t i = 0; i < pattern_count; i++) {
-    st_error_t err = st_policy_add_locked(policy, pattern_lines[i]);
-    if (err != ST_OK && first_err == ST_OK) {
-      first_err = err;
-    }
-    free(pattern_lines[i]);
-  }
-  free(pattern_lines);
-
+  policy->states = staged->states;
+  policy->patterns = staged->patterns;
+  policy->children_arena = staged->children_arena;
+  policy->len_buckets = staged->len_buckets;
+  policy->num_buckets = staged->num_buckets;
+  policy->pattern_count = staged->pattern_count;
+  policy->children_count = staged->children_count;
+  memcpy(policy->pos_filters, staged->pos_filters, sizeof policy->pos_filters);
+  memcpy(policy->pos_wildcard_mask, staged->pos_wildcard_mask,
+         sizeof policy->pos_wildcard_mask);
+  memcpy(policy->pos_built_epoch, staged->pos_built_epoch,
+         sizeof policy->pos_built_epoch);
+  atomic_fetch_add(&policy->epoch, 1);
   pthread_rwlock_unlock(&policy->rwlock);
 
-  return first_err;
+  staged->states = old_states;
+  staged->patterns = old_patterns;
+  staged->children_arena = old_arena;
+  staged->len_buckets = old_buckets;
+  staged->num_buckets = old_num_buckets;
+  staged->pattern_count = old_pattern_count;
+  staged->children_count = old_children_count;
+  memcpy(staged->pos_filters, old_filters, sizeof old_filters);
+  memcpy(staged->pos_wildcard_mask, old_wildcards, sizeof old_wildcards);
+  memcpy(staged->pos_built_epoch, old_filter_epochs, sizeof old_filter_epochs);
+  free(pattern_lines);
+  st_policy_free(staged);
+  return ST_OK;
+
+pass2_memory_fail:
+  for (size_t i = 0; i < pattern_count; i++)
+    free(pattern_lines[i]);
+  free(pattern_lines);
+  return ST_ERR_MEMORY;
+
+pass2_error:
+  for (size_t i = 0; i < pattern_count; i++)
+    free(pattern_lines[i]);
+  free(pattern_lines);
+  return add_err;
 
 pass1_fail:
   for (size_t i = 0; i < pattern_count; i++)

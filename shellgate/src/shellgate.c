@@ -10,6 +10,7 @@
 #include "shell_depgraph.h"
 #include "shell_tokenizer.h"
 #include "shelltype.h"
+#include <ctype.h>
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -283,7 +284,7 @@ sg_gate_t *sg_gate_new(void) {
 
   sg_strlcpy(g->cwd, ".", sizeof(g->cwd));
   g->reject_mask = SG_REJECT_MASK_DEFAULT;
-  g->stop_mode = SG_STOP_FIRST_FAIL;
+  g->stop_mode = SG_EVAL_ALL;
   g->suggestions = true;
   g->strict_mode = true;
 
@@ -1343,7 +1344,12 @@ static bool sg_path_found(const char *path, uint32_t path_len,
   for (uint32_t i = 0; i < count; i++) {
     const char *prefix = sorted_paths[i];
     size_t plen = strlen(prefix);
-    if (path_len >= plen && memcmp(path, prefix, plen) == 0) {
+    if (plen == 0)
+      continue;
+    bool exact = path_len == plen;
+    bool child =
+        path_len > plen && (prefix[plen - 1] == '/' || path[plen] == '/');
+    if ((exact || child) && memcmp(path, prefix, plen) == 0) {
       *out_idx = i;
       return true;
     }
@@ -1456,6 +1462,8 @@ static bool su_spawns_shell(const shell_dep_node_t *node,
   return false;
 }
 
+static uint32_t sg_violation_categories(uint32_t types);
+
 static void emit_violation(sg_violation_t *viol, uint32_t *count, uint32_t max,
                            uint32_t *dropped, uint32_t type, uint32_t severity,
                            uint32_t cmd_idx, const char *desc,
@@ -1472,6 +1480,7 @@ static void emit_violation(sg_violation_t *viol, uint32_t *count, uint32_t max,
   }
   sg_violation_t *v = &viol[(*count)++];
   v->type = type;
+  v->category_flags = sg_violation_categories(type);
   v->severity = severity;
   v->cmd_node_index = cmd_idx;
   v->description = desc;
@@ -2215,6 +2224,24 @@ sg_violation_scan(const shell_dep_graph_t *graph,
   }
 }
 
+static uint32_t sg_violation_categories(uint32_t types) {
+  uint32_t categories = 0;
+  if (types & (SG_VIOL_WRITE_SENSITIVE | SG_VIOL_REMOVE_SYSTEM |
+               SG_VIOL_PERM_SYSTEM | SG_VIOL_GIT_DESTRUCTIVE))
+    categories |= SG_VIOL_CAT_FILESYSTEM;
+  if (types & (SG_VIOL_ENV_PRIVILEGED | SG_VIOL_SHELL_ESCALATION |
+               SG_VIOL_SUDO_REDIRECT | SG_VIOL_PERSISTENCE))
+    categories |= SG_VIOL_CAT_PRIVILEGE;
+  if (types & (SG_VIOL_WRITE_THEN_READ | SG_VIOL_SUBST_SENSITIVE |
+               SG_VIOL_REDIRECT_FANOUT | SG_VIOL_READ_SECRETS |
+               SG_VIOL_SHELL_OBFUSCATION))
+    categories |= SG_VIOL_CAT_EXFIL;
+  if (types &
+      (SG_VIOL_NET_DOWNLOAD_EXEC | SG_VIOL_NET_UPLOAD | SG_VIOL_NET_LISTENER))
+    categories |= SG_VIOL_CAT_NETWORK;
+  return categories;
+}
+
 /* ============================================================
  * EVALUATION
  * ============================================================ */
@@ -2240,9 +2267,24 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len, char *buf,
                         .strict_mode = gate->strict_mode};
   shell_error_t ferr = shell_parse_fast(cmd, cmd_len, &lim, &fast);
   bool parse_truncated = ferr == SHELL_ETRUNC;
-  if (ferr == SHELL_EPARSE && fast.count == 0) {
+  bool whitespace_only = true;
+  for (size_t i = 0; i < cmd_len; i++) {
+    if (!isspace((unsigned char)cmd[i])) {
+      whitespace_only = false;
+      break;
+    }
+  }
+  if (whitespace_only) {
     out->verdict = SG_VERDICT_ALLOW;
     return SG_OK;
+  }
+  if (ferr == SHELL_EPARSE && fast.count == 0) {
+    out->verdict = SG_VERDICT_REJECT;
+    out->deny_reason = bw_copy(&bw, "parse error", 11);
+    out->subcmd_count = 1;
+    out->subcmds[0].verdict = SG_VERDICT_REJECT;
+    out->subcmds[0].reject_reason = out->deny_reason;
+    return SG_ERR_PARSE;
   }
   if (ferr == SHELL_EPARSE) {
     out->verdict = SG_VERDICT_REJECT;
@@ -2250,7 +2292,7 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len, char *buf,
     out->subcmd_count = 1;
     out->subcmds[0].verdict = SG_VERDICT_REJECT;
     out->subcmds[0].reject_reason = out->deny_reason;
-    return SG_OK;
+    return SG_ERR_PARSE;
   }
 
   /* Step 2: Feature rejection */
@@ -2277,7 +2319,7 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len, char *buf,
     out->subcmd_count = 1;
     out->subcmds[0].verdict = SG_VERDICT_REJECT;
     out->subcmds[0].reject_reason = out->deny_reason;
-    return SG_OK;
+    return SG_ERR_PARSE;
   }
 
   /* Step 3.5: Violation scan on the depgraph */
@@ -2296,6 +2338,10 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len, char *buf,
                       &out->violation_flags, &out->violation_dropped_count,
                       node_viols, cmd_write_count, cmd_read_count,
                       cmd_env_count);
+    out->violation_type_flags = out->violation_flags;
+    out->violation_category_flags =
+        sg_violation_categories(out->violation_type_flags);
+    out->violation_flags = out->violation_type_flags;
     out->has_violations = (out->violation_count > 0);
     out->violation_truncated = (out->violation_dropped_count > 0);
     if (bw.overflow) {
@@ -2423,6 +2469,9 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len, char *buf,
    * parser. Preserve the fast parser's truncation signal so a complete-looking
    * 64-entry result can never be mistaken for evaluation of the whole input. */
   bool subcmd_truncated = parse_truncated || depgraph_truncated;
+  uint32_t node_result_index[SHELL_DEP_MAX_NODES];
+  for (uint32_t i = 0; i < SHELL_DEP_MAX_NODES; i++)
+    node_result_index[i] = UINT32_MAX;
   for (uint32_t ni = 0; ni < graph.node_count; ni++) {
     const shell_dep_node_t *node = &graph.nodes[ni];
     if (node->type != SHELL_NODE_CMD)
@@ -2436,6 +2485,8 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len, char *buf,
     }
 
     sg_subcmd_result_t *sr = &out->subcmds[out->subcmd_count++];
+    node_result_index[ni] = out->subcmd_count - 1;
+    sr->substitution_parent_index = -1;
 
     sr->command = build_cmd_string(&node->cmd, &bw, gate);
     if (bw.overflow) {
@@ -2447,7 +2498,9 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len, char *buf,
     sr->write_count = cmd_write_count[ni];
     sr->read_count = cmd_read_count[ni];
     sr->env_count = cmd_env_count[ni];
-    sr->violation_flags = node_viols[ni];
+    sr->violation_type_flags = node_viols[ni];
+    sr->violation_category_flags = sg_violation_categories(node_viols[ni]);
+    sr->violation_flags = sr->violation_type_flags;
 
     const char *cmd_str = sr->command ? sr->command : "";
 
@@ -2455,7 +2508,11 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len, char *buf,
     st_eval_result_t deny_eval;
     st_error_t deny_err =
         st_policy_eval(gate->deny_policy, cmd_str, &deny_eval);
-    if (deny_err == ST_OK && deny_eval.matches) {
+    if (deny_err != ST_OK) {
+      sr->matches = false;
+      sr->verdict = SG_VERDICT_UNDETERMINED;
+      sr->reject_reason = bw_copy(&bw, "deny policy evaluation failed", 29);
+    } else if (deny_eval.matches) {
       sr->matches = true;
       sr->verdict = SG_VERDICT_DENY;
       sr->reject_reason = bw_copy(&bw, "deny policy match", 17);
@@ -2549,6 +2606,27 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len, char *buf,
       break;
   }
 
+  /* Substitution edges describe a dependency from the nested command to its
+   * containing command.  Resolve result-array indices after all commands have
+   * been visited because nested nodes precede their parent in the graph. */
+  for (uint32_t ei = 0; ei < graph.edge_count; ei++) {
+    const shell_dep_edge_t *edge = &graph.edges[ei];
+    if (edge->type != SHELL_EDGE_SUBST || edge->from >= graph.node_count ||
+        edge->to >= graph.node_count)
+      continue;
+    uint32_t child = node_result_index[edge->from];
+    uint32_t parent = node_result_index[edge->to];
+    if (child == UINT32_MAX || parent == UINT32_MAX)
+      continue;
+    out->subcmds[child].substitution_parent_index = (int32_t)parent;
+    out->subcmds[parent].requires_substitution_evaluation = true;
+    out->requires_substitution_evaluation = true;
+    if (out->subcmds[parent].verdict == SG_VERDICT_ALLOW &&
+        (out->subcmds[child].verdict == SG_VERDICT_ALLOW ||
+         out->subcmds[child].verdict == SG_VERDICT_ALLOW_CONDITIONAL))
+      out->subcmds[parent].verdict = SG_VERDICT_ALLOW_CONDITIONAL;
+  }
+
   out->truncated = bw.overflow || subcmd_truncated;
   out->subcmd_truncated = subcmd_truncated;
   if (out->subcmd_count == 0) {
@@ -2565,11 +2643,15 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len, char *buf,
   }
 
   bool all_allow = true;
+  bool any_conditional = false;
   bool any_reject = false;
   bool any_deny = false;
   for (uint32_t i = 0; i < out->subcmd_count; i++) {
-    if (out->subcmds[i].verdict != SG_VERDICT_ALLOW)
+    if (out->subcmds[i].verdict != SG_VERDICT_ALLOW &&
+        out->subcmds[i].verdict != SG_VERDICT_ALLOW_CONDITIONAL)
       all_allow = false;
+    if (out->subcmds[i].verdict == SG_VERDICT_ALLOW_CONDITIONAL)
+      any_conditional = true;
     if (out->subcmds[i].verdict == SG_VERDICT_REJECT)
       any_reject = true;
     if (out->subcmds[i].verdict == SG_VERDICT_DENY)
@@ -2581,7 +2663,9 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len, char *buf,
   else if (any_deny)
     out->verdict = SG_VERDICT_DENY;
   else if (all_allow)
-    out->verdict = SG_VERDICT_ALLOW;
+    out->verdict = (out->requires_substitution_evaluation || any_conditional)
+                       ? SG_VERDICT_ALLOW_CONDITIONAL
+                       : SG_VERDICT_ALLOW;
   else
     out->verdict = SG_VERDICT_UNDETERMINED;
 
@@ -2647,6 +2731,8 @@ const char *sg_verdict_name(sg_verdict_t v) {
     return "REJECT";
   case SG_VERDICT_UNDETERMINED:
     return "UNDETERMINED";
+  case SG_VERDICT_ALLOW_CONDITIONAL:
+    return "ALLOW_CONDITIONAL";
   }
   return "UNKNOWN";
 }

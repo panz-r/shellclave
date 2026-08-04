@@ -387,19 +387,26 @@ static dep_redirect_t classify_redirect(const dep_token_t *tok) {
 
 static bool find_subshell(const dep_token_t *tok, dep_token_t *subshell) {
   bool in_single_quote = false;
+  bool in_double_quote = false;
   for (uint32_t i = 0; i < tok->len; i++) {
     uint32_t backslashes = 0;
     for (uint32_t j = i; j > 0 && tok->start[j - 1] == '\\'; j--)
       backslashes++;
     bool escaped = (backslashes % 2) != 0;
-    if (tok->start[i] == '\'' && !escaped) {
+    if (tok->start[i] == '\'' && !in_double_quote && !escaped) {
       in_single_quote = !in_single_quote;
+      continue;
+    }
+    if (tok->start[i] == '"' && !in_single_quote && !escaped) {
+      in_double_quote = !in_double_quote;
       continue;
     }
     if (in_single_quote || escaped)
       continue;
-    if ((tok->start[i] == '`') || (tok->start[i] == '$' && i + 1 < tok->len &&
-                                   tok->start[i + 1] == '(')) {
+    if ((tok->start[i] == '`') ||
+        ((tok->start[i] == '$' || tok->start[i] == '<' ||
+          tok->start[i] == '>') &&
+         i + 1 < tok->len && tok->start[i + 1] == '(')) {
       subshell->start = tok->start + i;
       subshell->len = tok->len - i;
       return true;
@@ -410,7 +417,9 @@ static bool find_subshell(const dep_token_t *tok, dep_token_t *subshell) {
 
 static const char *extract_subshell_content(const dep_token_t *tok,
                                             uint32_t *out_len) {
-  if (tok->len >= 2 && tok->start[0] == '$' && tok->start[1] == '(') {
+  if (tok->len >= 2 &&
+      (tok->start[0] == '$' || tok->start[0] == '<' || tok->start[0] == '>') &&
+      tok->start[1] == '(') {
     int depth = 1;
     uint32_t i = 2;
     bool in_quote = false;
@@ -701,9 +710,20 @@ shell_dep_error_t shell_parse_depgraph(const char *cmd, size_t cmd_len,
 
   shell_parse_result_t fast_result;
   shell_error_t fast_err = shell_parse_fast(cmd, cmd_len, NULL, &fast_result);
-  if (fast_err == SHELL_EPARSE && fast_result.count == 0) {
+  bool whitespace_only = true;
+  for (uint32_t i = 0; i < cmd_len; i++) {
+    if (!isspace((unsigned char)cmd[i])) {
+      whitespace_only = false;
+      break;
+    }
+  }
+  if (whitespace_only) {
     out->status = 0;
     return SHELL_DEP_OK;
+  }
+  if (fast_err == SHELL_EPARSE && fast_result.count == 0) {
+    out->status = SHELL_DEP_STATUS_ERROR;
+    return SHELL_DEP_EPARSE;
   }
   if (fast_err == SHELL_EPARSE) {
     out->status = SHELL_DEP_STATUS_ERROR;
@@ -1009,6 +1029,57 @@ shell_dep_error_t shell_parse_depgraph(const char *cmd, size_t cmd_len,
           continue;
         if (ti < tokens.count) {
           const dep_token_t *target = &tokens.tokens[ti];
+
+          /* Process substitution is tokenized as a redirect followed by a
+           * parenthesized target. Treat that target as a substitution
+           * dependency instead of a filesystem path. */
+          if ((redir == DEP_REDIRECT_IN || redir == DEP_REDIRECT_OUT) &&
+              target->len >= 2 && target->start[0] == '(' &&
+              target->start[target->len - 1] == ')') {
+            const char *sub_content = target->start + 1;
+            uint32_t sub_len = target->len - 2;
+            shell_dep_graph_t sub_graph;
+            memset(&sub_graph, 0, sizeof(sub_graph));
+            shell_dep_error_t sub_err = shell_parse_depgraph(
+                sub_content, sub_len, out->cwd_buf.data + cwd_offset, limits,
+                depth + 1, &sub_graph);
+            if (sub_err == SHELL_DEP_ETRUNC)
+              out->status |= SHELL_DEP_STATUS_TRUNCATED;
+            if (sub_err == SHELL_DEP_OK && sub_graph.node_count > 0) {
+              int32_t sub_cmd_idx = -1;
+              for (int32_t si = (int32_t)sub_graph.node_count - 1; si >= 0;
+                   si--)
+                if (sub_graph.nodes[si].type == SHELL_NODE_CMD) {
+                  sub_cmd_idx = si;
+                  break;
+                }
+              uint32_t needed_edges =
+                  sub_graph.edge_count + (sub_cmd_idx >= 0 ? 1u : 0u);
+              if (sub_graph.node_count <= max_nodes - out->node_count &&
+                  needed_edges <= max_edges - out->edge_count) {
+                uint32_t node_offset = out->node_count;
+                for (uint32_t si = 0; si < sub_graph.node_count; si++)
+                  out->nodes[out->node_count++] = sub_graph.nodes[si];
+                for (uint32_t si = 0; si < sub_graph.edge_count; si++) {
+                  shell_dep_edge_t *copy = &out->edges[out->edge_count++];
+                  *copy = sub_graph.edges[si];
+                  copy->from += node_offset;
+                  copy->to += node_offset;
+                }
+                if (sub_cmd_idx >= 0) {
+                  shell_dep_edge_t *subst = &out->edges[out->edge_count++];
+                  subst->from = node_offset + (uint32_t)sub_cmd_idx;
+                  subst->to = cmd_node_idx;
+                  subst->type = SHELL_EDGE_SUBST;
+                  subst->dir = SHELL_DIR_FORWARD;
+                }
+              } else {
+                out->status |= SHELL_DEP_STATUS_TRUNCATED;
+              }
+            }
+            ti++;
+            continue;
+          }
 
           shell_dep_edge_type_t etype;
           shell_dep_edge_dir_t edir = SHELL_DIR_FORWARD;

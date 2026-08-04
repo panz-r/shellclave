@@ -10,8 +10,8 @@ command policy.
 - **shellsplit** provides bounded, zero-copy parsing plus a richer allocating
   tokenizer, command abstraction, transforms, and dependency graphs.
 - **shelltype** learns typed command patterns and evaluates serialized policy.
-- **shellgate** combines both libraries into an allow/deny gate with structural
-  violation checks and optional statistical anomaly scoring.
+- **shellgate** combines both libraries into an allow/deny gate with advisory
+  lexical violation checks and optional statistical anomaly scoring.
 
 ## Requirements and build
 
@@ -91,7 +91,7 @@ if (gate != NULL) {
     if (error == SG_OK) {
         error = sg_eval(gate, command, strlen(command), output,
                         sizeof output, &result);
-        if (error == SG_OK || error == SG_ERR_TRUNC) {
+        if (error == SG_OK) {
             printf("verdict: %d\n", result.verdict);
         }
     }

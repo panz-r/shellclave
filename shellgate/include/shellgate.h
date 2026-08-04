@@ -30,11 +30,9 @@ extern "C" {
 /* Feature flags that cause immediate rejection by default.
  * These are the same bits as SHELL_FEAT_* in shell_tokenizer.h. */
 #define SG_REJECT_MASK_DEFAULT                                                 \
-  ((1u << 2) | /* SUBSHELL     */                                              \
-   (1u << 3) | /* ARITH        */                                              \
+  ((1u << 3) | /* ARITH        */                                              \
    (1u << 4) | /* HEREDOC      */                                              \
    (1u << 5) | /* HERESTRING   */                                              \
-   (1u << 6) | /* PROCESS_SUB  */                                              \
    (1u << 7) | /* LOOPS        */                                              \
    (1u << 8) | /* CONDITIONALS */                                              \
    (1u << 9))  /* CASE         */
@@ -45,16 +43,12 @@ extern "C" {
 #else
 #define SG_STATIC_ASSERT _Static_assert
 #endif
-SG_STATIC_ASSERT((SG_REJECT_MASK_DEFAULT & (1u << 2)) != 0,
-                 "SUBSHELL bit mismatch");
 SG_STATIC_ASSERT((SG_REJECT_MASK_DEFAULT & (1u << 3)) != 0,
                  "ARITH bit mismatch");
 SG_STATIC_ASSERT((SG_REJECT_MASK_DEFAULT & (1u << 4)) != 0,
                  "HEREDOC bit mismatch");
 SG_STATIC_ASSERT((SG_REJECT_MASK_DEFAULT & (1u << 5)) != 0,
                  "HERESTRING bit mismatch");
-SG_STATIC_ASSERT((SG_REJECT_MASK_DEFAULT & (1u << 6)) != 0,
-                 "PROCESS_SUB bit mismatch");
 SG_STATIC_ASSERT((SG_REJECT_MASK_DEFAULT & (1u << 7)) != 0,
                  "LOOPS bit mismatch");
 SG_STATIC_ASSERT((SG_REJECT_MASK_DEFAULT & (1u << 8)) != 0,
@@ -67,16 +61,14 @@ SG_STATIC_ASSERT((SG_REJECT_MASK_DEFAULT & (1u << 9)) != 0,
 #define SG_BUF_MIN 8192
 
 /* ============================================================
- * VIOLATION FLAGS (category-encoded)
+ * VIOLATION FLAGS
  * ============================================================
  *
- * Upper 16 bits encode the security domain:
- *   SG_VIOL_CAT_FILESYSTEM  - attacks on filesystem integrity
- *   SG_VIOL_CAT_PRIVILEGE   - privilege escalation vectors
- *   SG_VIOL_CAT_EXFIL       - data exfiltration patterns
+ * Category and type masks are independent. Type bits are globally unique;
+ * callers can test exact membership without category-bit collisions.
  *
- * Caller decides what action to take based on these flags.
- * The violation carries severity only, no enforcement action.
+ * Caller decides what action to take based on these flags. These are advisory
+ * lexical observations, not filesystem containment or enforcement actions.
  */
 
 #define SG_VIOL_CAT_FILESYSTEM (1u << 16)
@@ -85,28 +77,28 @@ SG_STATIC_ASSERT((SG_REJECT_MASK_DEFAULT & (1u << 9)) != 0,
 #define SG_VIOL_CAT_NETWORK (1u << 19)
 
 /* Filesystem Integrity */
-#define SG_VIOL_WRITE_SENSITIVE (SG_VIOL_CAT_FILESYSTEM | (1u << 0))
-#define SG_VIOL_REMOVE_SYSTEM (SG_VIOL_CAT_FILESYSTEM | (1u << 1))
-#define SG_VIOL_PERM_SYSTEM (SG_VIOL_CAT_FILESYSTEM | (1u << 2))
-#define SG_VIOL_GIT_DESTRUCTIVE (SG_VIOL_CAT_FILESYSTEM | (1u << 3))
+#define SG_VIOL_WRITE_SENSITIVE (1u << 0)
+#define SG_VIOL_REMOVE_SYSTEM (1u << 1)
+#define SG_VIOL_PERM_SYSTEM (1u << 2)
+#define SG_VIOL_GIT_DESTRUCTIVE (1u << 3)
 
 /* Privilege Escalation */
-#define SG_VIOL_ENV_PRIVILEGED (SG_VIOL_CAT_PRIVILEGE | (1u << 0))
-#define SG_VIOL_SHELL_ESCALATION (SG_VIOL_CAT_PRIVILEGE | (1u << 1))
-#define SG_VIOL_SUDO_REDIRECT (SG_VIOL_CAT_PRIVILEGE | (1u << 2))
-#define SG_VIOL_PERSISTENCE (SG_VIOL_CAT_PRIVILEGE | (1u << 3))
+#define SG_VIOL_ENV_PRIVILEGED (1u << 4)
+#define SG_VIOL_SHELL_ESCALATION (1u << 5)
+#define SG_VIOL_SUDO_REDIRECT (1u << 6)
+#define SG_VIOL_PERSISTENCE (1u << 7)
 
 /* Data Exfiltration */
-#define SG_VIOL_WRITE_THEN_READ (SG_VIOL_CAT_EXFIL | (1u << 0))
-#define SG_VIOL_SUBST_SENSITIVE (SG_VIOL_CAT_EXFIL | (1u << 1))
-#define SG_VIOL_REDIRECT_FANOUT (SG_VIOL_CAT_EXFIL | (1u << 2))
-#define SG_VIOL_READ_SECRETS (SG_VIOL_CAT_EXFIL | (1u << 3))
-#define SG_VIOL_SHELL_OBFUSCATION (SG_VIOL_CAT_EXFIL | (1u << 4))
+#define SG_VIOL_WRITE_THEN_READ (1u << 8)
+#define SG_VIOL_SUBST_SENSITIVE (1u << 9)
+#define SG_VIOL_REDIRECT_FANOUT (1u << 10)
+#define SG_VIOL_READ_SECRETS (1u << 11)
+#define SG_VIOL_SHELL_OBFUSCATION (1u << 12)
 
 /* Network */
-#define SG_VIOL_NET_DOWNLOAD_EXEC (SG_VIOL_CAT_NETWORK | (1u << 0))
-#define SG_VIOL_NET_UPLOAD (SG_VIOL_CAT_NETWORK | (1u << 1))
-#define SG_VIOL_NET_LISTENER (SG_VIOL_CAT_NETWORK | (1u << 2))
+#define SG_VIOL_NET_DOWNLOAD_EXEC (1u << 13)
+#define SG_VIOL_NET_UPLOAD (1u << 14)
+#define SG_VIOL_NET_LISTENER (1u << 15)
 
 #define SG_MAX_VIOLATIONS 16
 
@@ -135,6 +127,7 @@ typedef enum {
   SG_VERDICT_DENY = 1,
   SG_VERDICT_REJECT = 2,
   SG_VERDICT_UNDETERMINED = 3,
+  SG_VERDICT_ALLOW_CONDITIONAL = 4,
 } sg_verdict_t;
 
 typedef enum {
@@ -156,12 +149,18 @@ typedef struct {
   uint32_t write_count;
   uint32_t read_count;
   uint32_t env_count;
+  bool requires_substitution_evaluation;
+  int32_t substitution_parent_index;
+  uint32_t violation_category_flags;
+  uint32_t violation_type_flags;
+  /* Deprecated alias retained for source compatibility. */
   uint32_t violation_flags;
 } sg_subcmd_result_t;
 
 /* Single detected violation.  Strings point into output buffer. */
 typedef struct {
   uint32_t type;
+  uint32_t category_flags;
   uint32_t severity;
   uint32_t cmd_node_index;
   const char *description;
@@ -170,7 +169,8 @@ typedef struct {
 
 /* Top-level evaluation result: metadata + pointer array into buffer.
  *
- * Violation fields (violations[], violation_count, violation_flags,
+ * Violation fields (violations[], violation_count, violation_category_flags,
+ * violation_type_flags,
  * violation_dropped_count, has_violations) are always populated from
  * the dependency graph scan, regardless of the overall verdict.
  * They reflect what the graph observed, not what the policy decided.
@@ -195,6 +195,10 @@ typedef struct {
 
   sg_violation_t violations[SG_MAX_VIOLATIONS];
   uint32_t violation_count;
+  uint32_t violation_category_flags;
+  uint32_t violation_type_flags;
+  bool requires_substitution_evaluation;
+  /* Deprecated alias retained for source compatibility. */
   uint32_t violation_flags;
   uint32_t violation_dropped_count;
   bool has_violations;
@@ -237,7 +241,8 @@ typedef struct sg_gate sg_gate_t;
  * Order does not matter for correctness.
  *
  * Violation fields in sg_result_t (violations[], violation_count,
- * violation_flags, violation_dropped_count, has_violations) are
+ * violation_category_flags, violation_type_flags, violation_dropped_count,
+ * has_violations) are
  * always populated from the dependency graph scan, regardless of
  * the overall verdict.  They reflect what the graph observed,
  * not what the policy decided.
@@ -524,12 +529,17 @@ uint32_t sg_gate_deny_rule_count(const sg_gate_t *gate);
  *   buffer.  Result pointers reference into it.  `buf` must remain
  *   valid while reading `sg_result_t` string fields.
  *
- * Returns SG_OK on success, SG_ERR_TRUNC if the output buffer or bounded
+ * A result with `SG_VERDICT_ALLOW_CONDITIONAL` contains a substitution
+ * dependency. `sg` does not assume Bash or any other executor; the caller
+ * decides whether its execution mode can honor that dependency.
+ *
+ * Returns SG_OK on success, SG_ERR_PARSE for malformed input, SG_ERR_TRUNC if
+ * the output buffer or bounded
  *   subcommand result array was too small (partial results are still valid),
  *   or SG_ERR_INVALID for bad args.  Inspect `truncated`, `subcmd_truncated`,
  *   and `violation_truncated` to identify the truncated result category.
- *   When truncation leaves no subcommands at all, nothing was evaluated and
- *   the verdict is SG_VERDICT_UNDETERMINED rather than SG_VERDICT_ALLOW.
+ *   Coverage truncation leaves the verdict SG_VERDICT_UNDETERMINED rather than
+ *   authorizing the evaluated prefix.
  */
 sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len, char *buf,
                    size_t buf_size, sg_result_t *out);

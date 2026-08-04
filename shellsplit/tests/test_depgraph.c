@@ -421,6 +421,8 @@ TEST(subshell_matrix) {
       {"echo panz", 1, 0, 0},
       {"echo $(cat /etc/hosts)", 2, 1, 1},
       {"echo $(date) $(whoami)", 3, 2, 0},
+      {"cat <(whoami)", 2, 1, 0},
+      {"echo \"'$(id)", 2, 1, 0},
   };
 
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
@@ -545,6 +547,9 @@ TEST(parse_error) {
   shell_dep_error_t err =
       shell_parse_depgraph("unclosed \"quote", 15, ".", NULL, 0, &g);
   ASSERT(err == SHELL_DEP_OK); // permissive, not EPARSE
+  const char invalid[] = "\x80";
+  ASSERT(shell_parse_depgraph(invalid, sizeof(invalid) - 1, ".", NULL, 0, &g) ==
+         SHELL_DEP_EPARSE);
   pass_count++;
 }
 
