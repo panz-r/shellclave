@@ -1298,7 +1298,9 @@ int main(void) {
 
   printf("\n=== PIPELINE/SUBCOMMAND EXTRACTION TESTS ===\n\n");
 #define STAGES(name, input, count, vars, globs, subs, arith)                   \
-  { {name, input, count}, vars, globs, subs, arith }
+  {                                                                            \
+    {name, input, count}, vars, globs, subs, arith                             \
+  }
   static const stage_case_t pipeline_cases[] = {
       STAGES("Pipeline: basic 3-stage", "cat file.txt | grep pattern | sort", 3,
              0, 0, 0, 0),

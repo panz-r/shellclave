@@ -293,7 +293,8 @@ if(PROJECT_IS_TOP_LEVEL)
     "${CMAKE_CURRENT_SOURCE_DIR}/tests/*.cpp")
   list(SORT SHELLCLAVE_FORMAT_SOURCES)
   find_program(SHELLCLAVE_CLANG_FORMAT
-    NAMES clang-format clang-format-21 clang-format-20 clang-format-19 clang-format-18)
+    NAMES clang-format-21 clang-format-20 clang-format-19 clang-format-18
+          clang-format)
   if(SHELLCLAVE_CLANG_FORMAT)
     add_custom_target(format
       COMMAND ${SHELLCLAVE_CLANG_FORMAT} -i ${SHELLCLAVE_FORMAT_SOURCES}
