@@ -47,3 +47,4 @@ for fuzzer in fuzz_shellgate fuzz_shellsplit; do
 done
 
 echo "pre-push: all checks passed"
+echo "pre-push: build artifacts preserved in $build_root"
