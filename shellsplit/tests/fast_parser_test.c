@@ -436,6 +436,7 @@ void test_layer1_edge_cases(void) {
   // Test: semicolon at end
   extract("cmd1 ;", &result);
   test_count_only("Semicolon at end count=1", &result, 1);
+  test("Semicolon at end is accepted", result.status == SHELL_STATUS_OK);
 
   // Test: redirect handled
   extract("cmd > file", &result);

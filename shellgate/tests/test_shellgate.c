@@ -1,4 +1,5 @@
 #include "shell_abstract.h"
+#include "shell_tokenizer.h"
 #include "shellgate.h"
 #include <math.h>
 #include <stdio.h>
@@ -168,6 +169,11 @@ TEST(setter_matrix) {
   ASSERT(g != NULL);
   for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); i++)
     ASSERT(sg_gate_set_cwd(g, paths[i]) == SG_OK);
+  char long_cwd[513];
+  memset(long_cwd, 'x', sizeof(long_cwd) - 1);
+  long_cwd[sizeof(long_cwd) - 1] = '\0';
+  ASSERT(sg_gate_set_cwd(g, "/stable") == SG_OK);
+  ASSERT(sg_gate_set_cwd(g, long_cwd) == SG_ERR_TRUNC);
   for (size_t i = 0; i < sizeof(modes) / sizeof(modes[0]); i++)
     ASSERT(sg_gate_set_stop_mode(g, modes[i]) == SG_OK);
   for (size_t i = 0; i < sizeof(masks) / sizeof(masks[0]); i++)
@@ -980,6 +986,84 @@ TEST(expansion_callback_matrix) {
     ASSERT(result.subcmd_count == 1);
     ASSERT_STR(result.subcmds[0].command, cases[i].expanded);
     sg_gate_free(g);
+  }
+}
+
+static size_t expand_invalid_length(const char *name, char *buf,
+                                    size_t buf_size, void *ctx) {
+  (void)name;
+  (void)buf;
+  (void)ctx;
+  return buf_size;
+}
+
+static size_t expand_requested_length(const char *name, char *buf,
+                                      size_t buf_size, void *ctx) {
+  (void)name;
+  size_t length = *(const size_t *)ctx;
+  if (length < buf_size) {
+    memset(buf, 'x', length);
+    buf[length] = '\0';
+  }
+  return length;
+}
+
+TEST(expansion_bounds_matrix) {
+  static const struct {
+    size_t returned_length;
+    bool truncated;
+  } cases[] = {{4095, false}, {4096, true}};
+  sg_result_t result;
+
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    sg_gate_t *gate = sg_gate_new();
+    ASSERT(gate != NULL);
+    ASSERT_SG_OK(sg_gate_add_rule(gate, "echo *"));
+    ASSERT_SG_OK(sg_gate_set_expand_var(gate, expand_requested_length,
+                                        (void *)&cases[i].returned_length));
+
+    sg_error_t error = eval_cmd(gate, "echo $VALUE", &result);
+    ASSERT((error == SG_ERR_TRUNC) == cases[i].truncated);
+    ASSERT(result.truncated == cases[i].truncated);
+    if (cases[i].truncated)
+      ASSERT(result.verdict == SG_VERDICT_UNDETERMINED);
+    else
+      ASSERT(result.verdict == SG_VERDICT_ALLOW);
+    sg_gate_free(gate);
+  }
+
+  sg_gate_t *gate = sg_gate_new();
+  ASSERT(gate != NULL);
+  ASSERT_SG_OK(sg_gate_add_rule(gate, "echo *"));
+  ASSERT_SG_OK(sg_gate_set_expand_var(gate, NULL, NULL));
+  ASSERT_SG_OK(sg_gate_set_expand_glob(gate, expand_invalid_length, NULL));
+  char long_glob[320];
+  memcpy(long_glob, "echo ", 5);
+  memset(long_glob + 5, '*', 300);
+  long_glob[305] = '\0';
+  ASSERT(eval_cmd(gate, long_glob, &result) == SG_ERR_TRUNC);
+  ASSERT(result.truncated);
+  ASSERT(result.verdict == SG_VERDICT_UNDETERMINED);
+  sg_gate_free(gate);
+}
+
+TEST(reject_mask_feature_matrix) {
+  static const struct {
+    const char *command;
+    uint32_t feature;
+  } cases[] = {
+      {"echo $VALUE", SHELL_FEAT_VARS},
+      {"echo *.txt", SHELL_FEAT_GLOBS},
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    sg_gate_t *gate = sg_gate_new();
+    ASSERT(gate != NULL);
+    ASSERT_SG_OK(sg_gate_add_rule(gate, "echo *"));
+    ASSERT_SG_OK(sg_gate_set_reject_mask(gate, cases[i].feature));
+    sg_result_t result;
+    ASSERT_SG_OK(eval_cmd(gate, cases[i].command, &result));
+    ASSERT(result.verdict == SG_VERDICT_REJECT);
+    sg_gate_free(gate);
   }
 }
 
@@ -2258,6 +2342,7 @@ int main(void) {
   printf("\nConfiguration:\n");
   RUN(stop_mode_matrix);
   RUN(pipeline_many_subcommands);
+  RUN(reject_mask_feature_matrix);
 
   printf("\nPolicy management:\n");
   RUN(policy_mutation_matrix);
@@ -2272,6 +2357,7 @@ int main(void) {
 
   printf("\nExpansion callbacks:\n");
   RUN(expansion_callback_matrix);
+  RUN(expansion_bounds_matrix);
 
   printf("\nViolation scanning:\n");
   RUN(violation_rule_matrix);

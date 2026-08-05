@@ -1094,8 +1094,8 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
     return SHELL_EPARSE;
   }
 
-  // Check for trailing separator: "cmd |" or "cmd ;" or "cmd &" is invalid
-  // shell (unless it's && or || which would connect to another command)
+  // A trailing semicolon terminates the command list and is valid shell
+  // syntax. Other trailing operators still require a following command.
   if (subcmd_idx > 0) {
     // Get the last subcommand
     uint32_t last_start = result->cmds[subcmd_idx - 1].start;
@@ -1123,9 +1123,8 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
     // The last thing we saw was a separator - check what type
     // If current_type is PIPELINE/SEMICOLON/AND/OR, we have a trailing
     // separator
-    if (current_type == SHELL_TYPE_PIPELINE ||
-        current_type == SHELL_TYPE_SEMICOLON ||
-        current_type == SHELL_TYPE_AND || current_type == SHELL_TYPE_OR) {
+    if (current_type == SHELL_TYPE_PIPELINE || current_type == SHELL_TYPE_AND ||
+        current_type == SHELL_TYPE_OR) {
       result->status = SHELL_STATUS_ERROR;
       result->count = subcmd_idx;
       return SHELL_EPARSE;

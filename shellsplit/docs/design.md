@@ -37,6 +37,11 @@ typedef struct {
 
 **Error codes:** SHELL_OK, SHELL_EINPUT, SHELL_ETRUNC, SHELL_EPARSE
 
+The bounded parser supports `|`, `&&`, `||`, and `;` command separators. A
+single trailing `;` is accepted as a command-list terminator; trailing pipes
+and logical operators are rejected. The parser is lexical and bounded rather
+than a complete POSIX shell grammar.
+
 **Feature flags:**
 - SHELL_FEAT_VARS, SHELL_FEAT_GLOBS, SHELL_FEAT_SUBSHELL
 - SHELL_FEAT_ARITH, SHELL_FEAT_HEREDOC, SHELL_FEAT_HERESTRING

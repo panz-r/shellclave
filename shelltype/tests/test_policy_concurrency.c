@@ -92,6 +92,13 @@ static void *policy_reader(void *opaque) {
       record_failure(args->failures, "policy count", args->id, i);
       break;
     }
+    size_t memory = st_policy_memory_usage(args->policy);
+    size_t working = st_policy_working_set(args->policy);
+    size_t states = st_policy_state_count(args->policy);
+    if (memory == 0 || working > memory || states == 0) {
+      record_failure(args->failures, "policy diagnostics", args->id, i);
+      break;
+    }
   }
   return NULL;
 }

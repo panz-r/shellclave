@@ -718,6 +718,13 @@ bool shell_abstract_command(const char *command,
       case ABSTRACT_GB:
         detail_ok = elem->data.glob.pattern != NULL;
         break;
+      case ABSTRACT_CS:
+        detail_ok = tok->length < 4 || elem->data.cmd_subst.content != NULL;
+        break;
+      case ABSTRACT_AR:
+      case ABSTRACT_STR:
+        detail_ok = tok->length < 2 || elem->data.cmd_subst.content != NULL;
+        break;
       default:
         break;
       }

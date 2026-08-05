@@ -40,22 +40,19 @@
  * ============================================================ */
 
 static uint32_t crc32_table[256];
-static bool crc32_initialized = false;
+static pthread_once_t crc32_once = PTHREAD_ONCE_INIT;
 
-static void crc32_init_table(void) {
-  if (crc32_initialized)
-    return;
+static void crc32_init_table_once(void) {
   for (uint32_t i = 0; i < 256; i++) {
     uint32_t c = i;
     for (int j = 0; j < 8; j++)
       c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
     crc32_table[i] = c;
   }
-  crc32_initialized = true;
 }
 
 static uint32_t crc32_compute(const void *data, size_t len, uint32_t prev) {
-  crc32_init_table();
+  (void)pthread_once(&crc32_once, crc32_init_table_once);
   uint32_t c = prev ^ 0xFFFFFFFFu;
   const uint8_t *p = (const uint8_t *)data;
   for (size_t i = 0; i < len; i++)
@@ -2142,18 +2139,23 @@ st_error_t st_policy_diff(const st_policy_t *a, const st_policy_t *b,
     return ST_ERR_MEMORY;
   }
   size_t added_count = 0;
+  char **removed = NULL;
+  size_t removed_count = 0;
   for (size_t i = 0; i < b_count; i++) {
     if (!b_entries[i].active)
       continue;
     if (!pattern_array_contains_entry(a_entries, a_count,
                                       b_entries[i].pattern)) {
-      added[added_count++] = strdup(b_entries[i].pattern);
+      added[added_count] = strdup(b_entries[i].pattern);
+      if (!added[added_count])
+        goto diff_memory_fail;
+      added_count++;
     }
   }
 
   /* Collect patterns in a that are not in b */
   size_t removed_cap = a_count > 0 ? a_count : 1;
-  char **removed = calloc(removed_cap, sizeof(char *));
+  removed = calloc(removed_cap, sizeof(char *));
   if (!removed) {
     for (size_t i = 0; i < added_count; i++)
       free(added[i]);
@@ -2162,13 +2164,15 @@ st_error_t st_policy_diff(const st_policy_t *a, const st_policy_t *b,
     pthread_rwlock_unlock((pthread_rwlock_t *)&first->rwlock);
     return ST_ERR_MEMORY;
   }
-  size_t removed_count = 0;
   for (size_t i = 0; i < a_count; i++) {
     if (!a_entries[i].active)
       continue;
     if (!pattern_array_contains_entry(b_entries, b_count,
                                       a_entries[i].pattern)) {
-      removed[removed_count++] = strdup(a_entries[i].pattern);
+      removed[removed_count] = strdup(a_entries[i].pattern);
+      if (!removed[removed_count])
+        goto diff_memory_fail;
+      removed_count++;
     }
   }
 
@@ -2180,6 +2184,20 @@ st_error_t st_policy_diff(const st_policy_t *a, const st_policy_t *b,
   pthread_rwlock_unlock((pthread_rwlock_t *)&second->rwlock);
   pthread_rwlock_unlock((pthread_rwlock_t *)&first->rwlock);
   return ST_OK;
+
+diff_memory_fail:
+  for (size_t i = 0; i < added_count; i++)
+    free(added[i]);
+  free(added);
+  if (removed) {
+    for (size_t i = 0; i < removed_count; i++)
+      free(removed[i]);
+    free(removed);
+  }
+  memset(result, 0, sizeof(*result));
+  pthread_rwlock_unlock((pthread_rwlock_t *)&second->rwlock);
+  pthread_rwlock_unlock((pthread_rwlock_t *)&first->rwlock);
+  return ST_ERR_MEMORY;
 }
 
 void st_free_diff_result(st_policy_diff_t *result) {
@@ -2306,6 +2324,13 @@ st_error_t st_policy_compact(st_policy_t *policy) {
   for (size_t i = 0; i < policy->patterns.count; i++) {
     if (policy->patterns.entries[i].active) {
       active[n_active++] = strdup(policy->patterns.entries[i].pattern);
+      if (!active[n_active - 1]) {
+        for (size_t j = 0; j < n_active - 1; j++)
+          free(active[j]);
+        free(active);
+        pthread_rwlock_unlock(&policy->rwlock);
+        return ST_ERR_MEMORY;
+      }
     }
   }
 
@@ -3503,6 +3528,8 @@ st_error_t st_policy_load(st_policy_t *policy, const char *path,
   memcpy(staged->pos_filters, old_filters, sizeof old_filters);
   memcpy(staged->pos_wildcard_mask, old_wildcards, sizeof old_wildcards);
   memcpy(staged->pos_built_epoch, old_filter_epochs, sizeof old_filter_epochs);
+  for (size_t i = 0; i < pattern_count; i++)
+    free(pattern_lines[i]);
   free(pattern_lines);
   st_policy_free(staged);
   return ST_OK;
@@ -3530,9 +3557,7 @@ pass1_fail:
  * DIAGNOSTICS
  * ============================================================ */
 
-size_t st_policy_memory_usage(const st_policy_t *policy) {
-  if (!policy)
-    return 0;
+static size_t policy_memory_usage_unlocked(const st_policy_t *policy) {
   size_t states_alloc = policy->states.capacity * sizeof(policy_state_t);
   size_t patterns_alloc = policy->patterns.capacity * sizeof(pattern_entry_t);
   size_t filter_bytes = 0;
@@ -3545,9 +3570,7 @@ size_t st_policy_memory_usage(const st_policy_t *policy) {
          policy->children_arena.used + patterns_alloc;
 }
 
-size_t st_policy_working_set(const st_policy_t *policy) {
-  if (!policy)
-    return 0;
+static size_t policy_working_set_unlocked(const st_policy_t *policy) {
   size_t states_used = policy->states.count * sizeof(policy_state_t);
   size_t patterns_used = policy->patterns.count * sizeof(pattern_entry_t);
   size_t filter_bytes = 0;
@@ -3560,10 +3583,31 @@ size_t st_policy_working_set(const st_policy_t *policy) {
          policy->children_count * sizeof(child_entry_t) + patterns_used;
 }
 
+size_t st_policy_memory_usage(const st_policy_t *policy) {
+  if (!policy)
+    return 0;
+  pthread_rwlock_rdlock((pthread_rwlock_t *)&policy->rwlock);
+  size_t result = policy_memory_usage_unlocked(policy);
+  pthread_rwlock_unlock((pthread_rwlock_t *)&policy->rwlock);
+  return result;
+}
+
+size_t st_policy_working_set(const st_policy_t *policy) {
+  if (!policy)
+    return 0;
+  pthread_rwlock_rdlock((pthread_rwlock_t *)&policy->rwlock);
+  size_t result = policy_working_set_unlocked(policy);
+  pthread_rwlock_unlock((pthread_rwlock_t *)&policy->rwlock);
+  return result;
+}
+
 size_t st_policy_state_count(const st_policy_t *policy) {
   if (!policy)
     return 0;
-  return policy->states.count;
+  pthread_rwlock_rdlock((pthread_rwlock_t *)&policy->rwlock);
+  size_t result = policy->states.count;
+  pthread_rwlock_unlock((pthread_rwlock_t *)&policy->rwlock);
+  return result;
 }
 
 /* ============================================================
@@ -3586,7 +3630,7 @@ void st_policy_get_stats(const st_policy_t *policy, st_policy_stats_t *stats) {
   stats->filter_rebuild_us = atomic_load(&policy->stats.filter_rebuild_us);
   stats->pattern_count = policy->pattern_count;
   stats->state_count = policy->states.count;
-  stats->memory_bytes = st_policy_memory_usage(policy);
+  stats->memory_bytes = policy_memory_usage_unlocked(policy);
 
   pthread_rwlock_unlock((pthread_rwlock_t *)&policy->rwlock);
 }

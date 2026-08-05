@@ -306,15 +306,19 @@ void sg_violation_config_default(sg_violation_config_t *cfg);
  * Variable expansion callback.  Write the expanded value of `name`
  * into `buf` (at most `buf_size` bytes including NUL).
  * Return the number of bytes written (excluding NUL), or 0 if
- * the variable cannot be expanded.
+ * the variable cannot be expanded. Returning a value >= `buf_size`
+ * is invalid and causes the evaluation to fail closed.
  */
 typedef size_t (*sg_expand_var_fn)(const char *name, char *buf, size_t buf_size,
                                    void *user_ctx);
 
 /*
  * Glob expansion callback.  Write a space-separated list of
- * matches for `pattern` into `buf`.  Return bytes written
- * (excluding NUL), or 0 if no matches.
+ * matches for `pattern` into `buf`. Return bytes written
+ * (excluding NUL), or 0 if no matches. Patterns longer than 255 bytes
+ * are not passed to the callback; the evaluation reports SG_ERR_TRUNC.
+ * Returning a value >= `buf_size` is invalid and causes the evaluation
+ * to fail closed.
  */
 typedef size_t (*sg_expand_glob_fn)(const char *pattern, char *buf,
                                     size_t buf_size, void *user_ctx);
@@ -485,6 +489,8 @@ size_t sg_gate_anomaly_vocab_size(const sg_gate_t *gate);
  *
  * This is always enabled for security hardening.  Permissive mode
  * (strict_mode=false) is not exposed publicly.
+ * `sg_gate_set_cwd()` returns SG_ERR_TRUNC and preserves the previous value
+ * when `cwd` does not fit the gate's fixed storage.
  */
 
 sg_error_t sg_gate_set_cwd(sg_gate_t *gate, const char *cwd);
@@ -497,6 +503,11 @@ sg_error_t sg_gate_set_expand_var(sg_gate_t *gate, sg_expand_var_fn fn,
 sg_error_t sg_gate_set_expand_glob(sg_gate_t *gate, sg_expand_glob_fn fn,
                                    void *user_ctx);
 
+/*
+ * Stores a shallow copy of `config`. All strings referenced by its arrays
+ * must remain valid and unchanged until the gate is destroyed or another
+ * violation configuration is installed.
+ */
 sg_error_t sg_gate_set_violation_config(sg_gate_t *gate,
                                         const sg_violation_config_t *config);
 

@@ -85,7 +85,8 @@ typedef struct {
 
 /**
  * Strict mode rejects unterminated quotes, substitutions, parentheses, and
- * invalid parameter expansions.
+ * invalid parameter expansions. A single trailing semicolon is accepted as
+ * a command-list terminator; trailing pipes and logical operators are not.
  */
 
 /**

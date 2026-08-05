@@ -193,7 +193,10 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
 
   sg_error_t err =
       sg_eval(g, cmd.data(), cmd.size(), result_buf.data(), buf_size, &result);
-  if (err != SG_OK && err != SG_ERR_TRUNC && err != SG_ERR_MEMORY)
+  /* Arbitrary bytes routinely form malformed shell syntax. Parse errors are
+   * expected outcomes of the public evaluator, not harness failures. */
+  if (err != SG_OK && err != SG_ERR_PARSE && err != SG_ERR_TRUNC &&
+      err != SG_ERR_MEMORY)
     invariant_failure("unexpected sg_eval error");
   if (err == SG_ERR_MEMORY)
     return 0;

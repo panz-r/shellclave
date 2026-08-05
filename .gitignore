@@ -4,6 +4,7 @@ commitmsgstyle.md
 
 # CMake and generated build trees
 /build*/
+/\.pre-push-build/
 /cmake-build-*/
 CMakeCache.txt
 CMakeFiles/

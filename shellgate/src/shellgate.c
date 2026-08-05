@@ -323,6 +323,8 @@ void sg_gate_free(sg_gate_t *gate) {
 sg_error_t sg_gate_set_cwd(sg_gate_t *gate, const char *cwd) {
   if (!gate || !cwd)
     return SG_ERR_INVALID;
+  if (strlen(cwd) >= sizeof(gate->cwd))
+    return SG_ERR_TRUNC;
   sg_strlcpy(gate->cwd, cwd, sizeof(gate->cwd));
   return SG_OK;
 }
@@ -1055,10 +1057,10 @@ static bool has_glob_chars(const char *tok, size_t len) {
  * INTERNAL: BUILD COMMAND STRING WITH OPTIONAL EXPANSION
  * ============================================================ */
 
-/* Expansion buffer size. Callbacks must respect this limit;
- * truncation affects policy matching. Increase if commands can
- * expand to values longer than 4096 bytes. */
+/* Expansion buffer size. Callbacks must return at most this many bytes minus
+ * one for the terminating NUL. */
 #define SG_EXPAND_BUF 4096
+#define SG_GLOB_PATTERN_BUF 256
 
 static const char *build_cmd_string(const shell_dep_cmd_t *cmd,
                                     buf_writer_t *bw, const sg_gate_t *gate) {
@@ -1104,6 +1106,10 @@ static const char *build_cmd_string(const shell_dep_cmd_t *cmd,
         size_t elen = gate->expand_var_fn(var_name, exp_buf, sizeof(exp_buf),
                                           gate->expand_var_ctx);
         if (elen > 0) {
+          if (elen >= sizeof(exp_buf)) {
+            bw->overflow = true;
+            return NULL;
+          }
           text = exp_buf;
           text_len = elen;
           expanded = true;
@@ -1114,15 +1120,22 @@ static const char *build_cmd_string(const shell_dep_cmd_t *cmd,
     /* Try glob expansion (only if variable expansion didn't fire) */
     if (!expanded && gate->expand_glob_fn) {
       if (has_glob_chars(text, text_len)) {
-        char pattern[256];
-        size_t plen =
-            text_len < sizeof(pattern) - 1 ? text_len : sizeof(pattern) - 1;
+        if (text_len >= SG_GLOB_PATTERN_BUF) {
+          bw->overflow = true;
+          return NULL;
+        }
+        char pattern[SG_GLOB_PATTERN_BUF];
+        size_t plen = text_len;
         memcpy(pattern, text, plen);
         pattern[plen] = '\0';
 
         size_t elen = gate->expand_glob_fn(pattern, exp_buf, sizeof(exp_buf),
                                            gate->expand_glob_ctx);
         if (elen > 0) {
+          if (elen >= sizeof(exp_buf)) {
+            bw->overflow = true;
+            return NULL;
+          }
           text = exp_buf;
           text_len = elen;
         }
@@ -1163,6 +1176,9 @@ static const char *check_features(const shell_parse_result_t *fast,
       {SHELL_FEAT_LOOPS, "loop"},
       {SHELL_FEAT_CONDITIONALS, "conditional"},
       {SHELL_FEAT_CASE, "case statement"},
+      {SHELL_FEAT_VARS, "variable expansion"},
+      {SHELL_FEAT_GLOBS, "glob expansion"},
+      {SHELL_FEAT_SUBSHELL_FILE, "file command substitution"},
   };
 
   for (uint32_t si = 0; si < fast->count; si++) {
@@ -2491,6 +2507,7 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len, char *buf,
     sr->command = build_cmd_string(&node->cmd, &bw, gate);
     if (bw.overflow) {
       out->truncated = true;
+      out->verdict = SG_VERDICT_UNDETERMINED;
       free(type_seq_buf);
       return SG_ERR_TRUNC;
     }
@@ -2538,6 +2555,7 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len, char *buf,
               out->suggestion_count++;
             else if (bw.overflow) {
               out->truncated = true;
+              out->verdict = SG_VERDICT_UNDETERMINED;
               free(type_seq_buf);
               return SG_ERR_TRUNC;
             }
@@ -2549,6 +2567,7 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len, char *buf,
               out->suggestion_count++;
             else if (bw.overflow) {
               out->truncated = true;
+              out->verdict = SG_VERDICT_UNDETERMINED;
               free(type_seq_buf);
               return SG_ERR_TRUNC;
             }
@@ -2567,6 +2586,7 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len, char *buf,
               out->deny_suggestion_count++;
             else if (bw.overflow) {
               out->truncated = true;
+              out->verdict = SG_VERDICT_UNDETERMINED;
               free(type_seq_buf);
               return SG_ERR_TRUNC;
             }
@@ -2580,6 +2600,7 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len, char *buf,
               out->deny_suggestion_count++;
             else if (bw.overflow) {
               out->truncated = true;
+              out->verdict = SG_VERDICT_UNDETERMINED;
               free(type_seq_buf);
               return SG_ERR_TRUNC;
             }

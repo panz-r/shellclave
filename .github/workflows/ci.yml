@@ -65,6 +65,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes wget
           wget --https-only --output-document=/tmp/llvm.sh https://apt.llvm.org/llvm.sh
+          printf '%s  /tmp/llvm.sh\n' \
+            '9474ecd78b52aba6e923976b1e9773f5613027cc7e237b9956986cb536e02a36' \
+            | sha256sum --check --strict -
           chmod 755 /tmp/llvm.sh
           sudo /tmp/llvm.sh 21
           sudo apt-get install --yes clang-format-21 clang-tools-21
