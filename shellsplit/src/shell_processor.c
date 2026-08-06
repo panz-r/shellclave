@@ -2,6 +2,7 @@
 #include "shell_processor.h"
 #include "shell_tokenizer_full.h"
 #include <ctype.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -63,10 +64,17 @@ static char *build_clean_command(shell_token_t *tokens, size_t count) {
   // Calculate total length needed
   size_t total_length = 0;
   for (size_t i = 0; i < count; i++) {
+    if (tokens[i].length > SIZE_MAX - total_length)
+      return NULL;
     total_length += tokens[i].length;
-    if (i > 0)
+    if (i > 0) {
+      if (total_length == SIZE_MAX)
+        return NULL;
       total_length++; // Space between arguments
+    }
   }
+  if (total_length == SIZE_MAX)
+    return NULL;
 
   // Allocate buffer
   char *buffer = malloc(total_length + 1);
@@ -127,6 +135,8 @@ static bool process_single_command_internal(shell_command_t *basic_cmd,
   bool consume_redirection_operand = false;
 
   // Allocate temporary arrays
+  if (basic_cmd->token_count > SIZE_MAX / sizeof(shell_token_t))
+    return false;
   shell_tokens = malloc(basic_cmd->token_count * sizeof(shell_token_t));
   command_tokens = malloc(basic_cmd->token_count * sizeof(shell_token_t));
   if (!shell_tokens || !command_tokens) {
@@ -182,6 +192,12 @@ static bool process_single_command_internal(shell_command_t *basic_cmd,
 
   // Copy tokens to info structure
   if (shell_count > 0) {
+    if (shell_count > SIZE_MAX / sizeof(shell_token_t)) {
+      clear_command_info(info);
+      free(shell_tokens);
+      free(command_tokens);
+      return false;
+    }
     info->shell_tokens = malloc(shell_count * sizeof(shell_token_t));
     if (!info->shell_tokens) {
       free((void *)info->clean_command);
@@ -196,6 +212,12 @@ static bool process_single_command_internal(shell_command_t *basic_cmd,
   }
 
   if (command_count > 0) {
+    if (command_count > SIZE_MAX / sizeof(shell_token_t)) {
+      clear_command_info(info);
+      free(shell_tokens);
+      free(command_tokens);
+      return false;
+    }
     info->command_tokens = malloc(command_count * sizeof(shell_token_t));
     if (!info->command_tokens) {
       free((void *)info->clean_command);
@@ -247,35 +269,39 @@ static bool own_token_text(shell_command_t *basic_cmd,
 }
 
 // Main processing function
-bool shell_process_command(const char *command_line,
-                           shell_command_info_t **command_infos,
-                           size_t *command_count) {
+shell_process_status_t shell_process_command(
+    const char *command_line, const shell_process_limits_t *limits,
+    shell_command_info_t **command_infos, size_t *command_count) {
   if (!command_infos || !command_count)
-    return false;
+    return SHELL_PROCESS_EINPUT;
   *command_infos = NULL;
   *command_count = 0;
   if (!command_line)
-    return false;
+    return SHELL_PROCESS_EINPUT;
 
   // First, tokenize normally
   shell_command_t *basic_commands;
   size_t basic_count;
 
   if (!shell_tokenize_commands(command_line, &basic_commands, &basic_count)) {
-    return false;
+    return SHELL_PROCESS_EPARSE;
   }
 
   if (basic_count == 0) {
-    return true;
+    return SHELL_PROCESS_OK;
   }
 
   // Allocate command info array
+  if (basic_count > SIZE_MAX / sizeof(shell_command_info_t)) {
+    shell_free_commands(basic_commands, basic_count);
+    return SHELL_PROCESS_EOVERFLOW;
+  }
   shell_command_info_t *infos =
       malloc(basic_count * sizeof(shell_command_info_t));
   if (!infos) {
     shell_free_commands(basic_commands, basic_count);
     *command_count = 0;
-    return false;
+    return SHELL_PROCESS_ENOMEM;
   }
 
   // Process each command
@@ -283,16 +309,42 @@ bool shell_process_command(const char *command_line,
     if (!process_single_command(&basic_commands[i], command_line, &infos[i])) {
       shell_free_command_infos(infos, i);
       shell_free_commands(basic_commands, basic_count);
-      return false;
+      return SHELL_PROCESS_ENOMEM;
     }
     if (i > 0 && infos[i - 1].has_pipe_output)
       infos[i].has_pipe_input = true;
   }
 
+  if (limits) {
+    size_t total_output = 0;
+    for (size_t i = 0; i < basic_count; i++) {
+      size_t original_length = strlen(infos[i].original_command);
+      size_t clean_length = strlen(infos[i].clean_command);
+      if (original_length > limits->max_string_bytes ||
+          clean_length > limits->max_string_bytes) {
+        shell_free_command_infos(infos, basic_count);
+        shell_free_commands(basic_commands, basic_count);
+        return SHELL_PROCESS_EOUTPUT_LIMIT;
+      }
+      if (original_length > SIZE_MAX - total_output ||
+          clean_length > SIZE_MAX - total_output - original_length) {
+        shell_free_command_infos(infos, basic_count);
+        shell_free_commands(basic_commands, basic_count);
+        return SHELL_PROCESS_EOVERFLOW;
+      }
+      total_output += original_length + clean_length;
+    }
+    if (total_output > limits->max_total_bytes) {
+      shell_free_command_infos(infos, basic_count);
+      shell_free_commands(basic_commands, basic_count);
+      return SHELL_PROCESS_EOUTPUT_LIMIT;
+    }
+  }
+
   shell_free_commands(basic_commands, basic_count);
   *command_infos = infos;
   *command_count = basic_count;
-  return true;
+  return SHELL_PROCESS_OK;
 }
 
 // Free command info structures
@@ -333,33 +385,41 @@ bool shell_has_dangerous_features(shell_command_info_t *info) {
 }
 
 // Process command line and extract DFA inputs
-bool shell_extract_dfa_inputs(const char *command_line,
-                              const char ***dfa_inputs, size_t *dfa_input_count,
-                              bool *has_shell_features) {
+shell_process_status_t
+shell_extract_dfa_inputs(const char *command_line,
+                         const shell_process_limits_t *limits,
+                         const char ***dfa_inputs, size_t *dfa_input_count,
+                         bool *has_shell_features) {
   if (!dfa_inputs || !dfa_input_count || !has_shell_features)
-    return false;
+    return SHELL_PROCESS_EINPUT;
   *dfa_inputs = NULL;
   *dfa_input_count = 0;
   *has_shell_features = false;
   if (!command_line)
-    return false;
+    return SHELL_PROCESS_EINPUT;
 
   shell_command_info_t *infos;
   size_t count;
 
-  if (!shell_process_command(command_line, &infos, &count)) {
-    return false;
+  shell_process_status_t process_status =
+      shell_process_command(command_line, limits, &infos, &count);
+  if (process_status != SHELL_PROCESS_OK) {
+    return process_status;
   }
 
   if (count == 0) {
-    return true;
+    return SHELL_PROCESS_OK;
   }
 
   // Allocate array for DFA inputs
+  if (count > SIZE_MAX / sizeof(const char *)) {
+    shell_free_command_infos(infos, count);
+    return SHELL_PROCESS_EOVERFLOW;
+  }
   const char **inputs = malloc(count * sizeof(const char *));
   if (!inputs) {
     shell_free_command_infos(infos, count);
-    return false;
+    return SHELL_PROCESS_ENOMEM;
   }
 
   // Extract clean commands and check for shell features
@@ -390,5 +450,5 @@ bool shell_extract_dfa_inputs(const char *command_line,
   }
   free(infos);
 
-  return true;
+  return SHELL_PROCESS_OK;
 }

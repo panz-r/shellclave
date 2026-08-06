@@ -1,0 +1,1 @@
+if [[ "$x" == *.txt ]]; then echo yes; else echo no; fi

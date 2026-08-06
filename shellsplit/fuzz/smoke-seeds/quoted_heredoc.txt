@@ -1,0 +1,4 @@
+cat << 'EOF'
+$HOME
+*.txt
+EOF

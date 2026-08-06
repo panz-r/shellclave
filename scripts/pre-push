@@ -37,14 +37,11 @@ fi
 echo "pre-push: configuring fuzz build"
 cmake -S . -B "$fuzz_build" -DCMAKE_BUILD_TYPE=Debug \
   -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
-  -DSHELLCLAVE_BUILD_FUZZERS=ON
-cmake --build "$fuzz_build" --target fuzz_shellgate fuzz_shellsplit
-
-for fuzzer in fuzz_shellgate fuzz_shellsplit; do
-  echo "pre-push: fuzz smoke ($fuzzer, $fuzz_runs runs)"
-  "$fuzz_build/$fuzzer" -runs="$fuzz_runs" \
-    "$fuzz_build/fuzz-corpus/${fuzzer#fuzz_}"
-done
+  -DSHELLCLAVE_BUILD_FUZZERS=ON \
+  -DSHELLCLAVE_FUZZ_RUNS="$fuzz_runs" \
+  -DSHELLCLAVE_FUZZ_MAX_LEN=8192
+echo "pre-push: unified fuzz smoke (shellsplit and shellgate, $fuzz_runs runs)"
+cmake --build "$fuzz_build" --target fuzz-smoke
 
 echo "pre-push: all checks passed"
 echo "pre-push: build artifacts preserved in $build_root"

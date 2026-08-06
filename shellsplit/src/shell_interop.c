@@ -60,6 +60,10 @@ int shell_interop_parse(shell_interop_handle_t *handle, const char *cmd,
       shell_parse_fast(handle->cmd_buffer, cmd_len, &limits, &handle->result);
 
   if (err != SHELL_OK) {
+    /* A failed parse must not expose the partially populated result produced
+     * while the fast parser was examining the input. */
+    memset(&handle->result, 0, sizeof(handle->result));
+    handle->cmd_buffer[0] = '\0';
     return 0;
   }
 
@@ -159,6 +163,8 @@ char *shell_interop_features_str(int features) {
     strcat(buf, "CASE ");
   if (features & SHELL_FEAT_SUBSHELL_FILE)
     strcat(buf, "SUBSHELL_FILE ");
+  if (features & SHELL_FEAT_PIPELINE)
+    strcat(buf, "PIPELINE ");
 
   if (buf[0] == '\0') {
     strcpy(buf, "none");
@@ -186,6 +192,8 @@ char *shell_interop_type_str(int type) {
     strcpy(buf, "HEREDOC");
   } else if (type & SHELL_TYPE_HERESTRING) {
     strcpy(buf, "HERESTRING");
+  } else if (type & SHELL_TYPE_SUBSTITUTION) {
+    strcpy(buf, "SUBSTITUTION");
   } else {
     strcpy(buf, "SIMPLE");
   }

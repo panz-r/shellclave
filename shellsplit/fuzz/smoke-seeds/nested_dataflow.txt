@@ -1,0 +1,1 @@
+cat <(printf '%s' "$(id)") | sed 's/root/user/'

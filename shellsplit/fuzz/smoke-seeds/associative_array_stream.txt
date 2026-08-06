@@ -1,0 +1,1 @@
+declare -A counts; while IFS=: read -r key value; do counts["$key"]=$(( value + 1 )); done < <(printf '%s\\n' 'a:1' 'b:2' | sort); for key in "${!counts[@]}"; do printf '%s=%s\\n' "$key" "${counts[$key]}"; done

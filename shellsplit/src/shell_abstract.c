@@ -284,10 +284,13 @@ token_type_t shell_classify_raw_token(const char *text, size_t len) {
  */
 static char *make_abstraction(abstract_type_t type, size_t index) {
   const char *type_str = ABSTRACT_TYPE_NAMES[type];
-  char *result = malloc(strlen(type_str) + 20);
+  int needed = snprintf(NULL, 0, "$%s_%zu", type_str, index);
+  if (needed < 0)
+    return NULL;
+  char *result = malloc((size_t)needed + 1);
   if (!result)
     return NULL;
-  sprintf(result, "$%s_%zu", type_str, index);
+  snprintf(result, (size_t)needed + 1, "$%s_%zu", type_str, index);
   return result;
 }
 
@@ -405,19 +408,28 @@ static char *build_abstracted_command(const char *original,
   // Calculate output size
   size_t output_size = 1; // null terminator
   for (size_t i = 0; i < element_count; i++) {
-    output_size += strlen(elements[i]->abstraction);
+    size_t length = strlen(elements[i]->abstraction);
+    if (length > SIZE_MAX - output_size)
+      return NULL;
+    output_size += length;
   }
 
   // Add non-abstracted parts
   size_t last_end = 0;
   for (size_t i = 0; i < element_count; i++) {
     if (elements[i]->start > last_end) {
-      output_size += elements[i]->start - last_end;
+      size_t length = elements[i]->start - last_end;
+      if (length > SIZE_MAX - output_size)
+        return NULL;
+      output_size += length;
     }
     last_end = elements[i]->end;
   }
   if (last_end < orig_len) {
-    output_size += orig_len - last_end;
+    size_t length = orig_len - last_end;
+    if (length > SIZE_MAX - output_size)
+      return NULL;
+    output_size += length;
   }
 
   char *result = malloc(output_size);
@@ -935,7 +947,10 @@ static char *join_path(const char *base, const char *path) {
   size_t base_len = strlen(base);
   size_t path_len = strlen(path);
   bool needs_slash = base_len > 0 && base[base_len - 1] != '/';
-  char *result = malloc(base_len + path_len + (needs_slash ? 2 : 1));
+  size_t extra = needs_slash ? 2 : 1;
+  if (base_len > SIZE_MAX - path_len || base_len + path_len > SIZE_MAX - extra)
+    return NULL;
+  char *result = malloc(base_len + path_len + extra);
   if (!result)
     return NULL;
   memcpy(result, base, base_len);
@@ -1140,7 +1155,8 @@ char *shell_build_type_sequence(const char *command) {
   shell_command_info_t *cmds = NULL;
   size_t cmd_count = 0;
 
-  if (!shell_process_command(command, &cmds, &cmd_count))
+  if (shell_process_command(command, NULL, &cmds, &cmd_count) !=
+      SHELL_PROCESS_OK)
     return NULL;
 
   if (cmd_count == 0) {

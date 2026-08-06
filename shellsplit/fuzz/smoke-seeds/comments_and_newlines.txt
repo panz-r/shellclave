@@ -1,0 +1,3 @@
+echo one # ignored comment
+echo two
+echo 'not # a comment'

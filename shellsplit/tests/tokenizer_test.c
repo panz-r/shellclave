@@ -340,13 +340,15 @@ static void run_processor_cases(const processor_case_t *cases, size_t count) {
   for (size_t i = 0; i < count; i++) {
     shell_command_info_t *infos = NULL;
     size_t command_count = 0;
-    bool processed =
-        shell_process_command(cases[i].input, &infos, &command_count);
+    shell_process_status_t process_status =
+        shell_process_command(cases[i].input, NULL, &infos, &command_count);
     const char **dfa_inputs = NULL;
     size_t dfa_count = 0;
     bool has_shell_features = false;
-    bool extracted = shell_extract_dfa_inputs(cases[i].input, &dfa_inputs,
-                                              &dfa_count, &has_shell_features);
+    shell_process_status_t extract_status = shell_extract_dfa_inputs(
+        cases[i].input, NULL, &dfa_inputs, &dfa_count, &has_shell_features);
+    bool processed = process_status == SHELL_PROCESS_OK;
+    bool extracted = extract_status == SHELL_PROCESS_OK;
     bool valid = processed && extracted &&
                  command_count == cases[i].command_count &&
                  dfa_count == cases[i].command_count &&
@@ -404,7 +406,8 @@ static void run_transform_line_cases(const transform_line_case_t *cases,
     transformed_command_t **commands = NULL;
     size_t command_count = 0;
     bool transformed =
-        shell_transform_command_line(cases[i].input, &commands, &command_count);
+        shell_transform_command_line(cases[i].input, NULL, &commands,
+                                     &command_count) == SHELL_TRANSFORM_OK;
     bool valid = transformed && command_count == cases[i].command_count &&
                  (command_count == 0 || commands != NULL);
     for (size_t j = 0; valid && j < command_count; j++) {
@@ -803,7 +806,8 @@ int main(void) {
         TRANSFORM_SUBSHELL, TRANSFORM_VARIABLE, TRANSFORM_SUBSHELL};
     transformed_command_t **commands = NULL;
     size_t count = 0;
-    bool valid = shell_transform_command_line(input, &commands, &count) &&
+    bool valid = shell_transform_command_line(input, NULL, &commands, &count) ==
+                     SHELL_TRANSFORM_OK &&
                  count == 1 && commands && commands[0] &&
                  commands[0]->token_count == sizeof(types) / sizeof(types[0]);
     memset(input, 'X', strlen(input));
@@ -960,36 +964,58 @@ int main(void) {
     size_t count = SIZE_MAX;
     bool valid = true;
 
-    if (shell_transform_command_line(NULL, &commands, &count) ||
+    if (shell_transform_command_line(NULL, NULL, &commands, &count) !=
+            SHELL_TRANSFORM_EINPUT ||
         commands != NULL || count != 0)
       valid = false;
     commands = sentinel;
     count = SIZE_MAX;
     if (shell_transform_command_line("\x01"
                                      "cmd",
-                                     &commands, &count) ||
+                                     NULL, &commands,
+                                     &count) != SHELL_TRANSFORM_EPARSE ||
         commands != NULL || count != 0)
       valid = false;
-    if (shell_transform_command_line("echo", NULL, &count))
+    if (shell_transform_command_line("echo", NULL, NULL, &count) !=
+        SHELL_TRANSFORM_EINPUT)
       valid = false;
-    if (shell_transform_command_line("echo", &commands, NULL))
+    if (shell_transform_command_line("echo", NULL, &commands, NULL) !=
+        SHELL_TRANSFORM_EINPUT)
       valid = false;
-    if (shell_transform_command(NULL, &command) || command != NULL)
+    if (shell_transform_command(NULL, NULL, &command) !=
+            SHELL_TRANSFORM_EINPUT ||
+        command != NULL)
       valid = false;
     command = (transformed_command_t *)(uintptr_t)1;
-    if (shell_transform_command(&empty, &command) || command != NULL)
+    if (shell_transform_command(&empty, NULL, &command) !=
+            SHELL_TRANSFORM_EINPUT ||
+        command != NULL)
       valid = false;
-    if (shell_transform_command(&empty, NULL))
+    if (shell_transform_command(&empty, NULL, NULL) != SHELL_TRANSFORM_EINPUT)
       valid = false;
     for (size_t i = 0; i < sizeof(malformed) / sizeof(malformed[0]); i++) {
       command = (transformed_command_t *)(uintptr_t)1;
-      if (shell_transform_command(&malformed[i], &command) || command != NULL)
+      if (shell_transform_command(&malformed[i], NULL, &command) ==
+              SHELL_TRANSFORM_OK ||
+          command != NULL)
         valid = false;
     }
     if (shell_get_dfa_input(NULL) != NULL || shell_has_transformations(NULL))
       valid = false;
     shell_free_transformed_command(NULL);
     test("Transform: failure contracts clear writable outputs", valid);
+  }
+
+  {
+    transformed_command_t **commands = (transformed_command_t **)(uintptr_t)1;
+    size_t count = SIZE_MAX;
+    const shell_transform_limits_t tiny = {3, 3};
+    shell_transform_status_t status =
+        shell_transform_command_line("echo $NAME", &tiny, &commands, &count);
+    bool valid = status == SHELL_TRANSFORM_EOUTPUT_LIMIT && commands == NULL &&
+                 count == 0;
+    test("Transform: explicit output limits report rejection", valid);
+    shell_free_transformed_commands(commands, count);
   }
 
   printf("\n=== STRESS/CRASH TEST CASES ===\n\n");
@@ -1228,7 +1254,8 @@ int main(void) {
     char input[] = "cat < in | grep x > out";
     shell_command_info_t *infos = NULL;
     size_t count = 0;
-    bool processed = shell_process_command(input, &infos, &count);
+    bool processed =
+        shell_process_command(input, NULL, &infos, &count) == SHELL_PROCESS_OK;
     memset(input, 'X', sizeof(input) - 1);
     bool valid =
         processed && count == 2 && infos &&
@@ -1251,14 +1278,16 @@ int main(void) {
     const char **inputs = (const char **)(uintptr_t)1;
     size_t count = SIZE_MAX;
     bool has_shell = true;
-    bool process_result = shell_process_command(NULL, &infos, &count);
-    bool process_valid = !process_result && infos == NULL && count == 0;
+    shell_process_status_t process_result =
+        shell_process_command(NULL, NULL, &infos, &count);
+    bool process_valid =
+        process_result != SHELL_PROCESS_OK && infos == NULL && count == 0;
     count = SIZE_MAX;
-    bool extract_result =
-        shell_extract_dfa_inputs(NULL, &inputs, &count, &has_shell);
+    shell_process_status_t extract_result =
+        shell_extract_dfa_inputs(NULL, NULL, &inputs, &count, &has_shell);
     test("Processor: NULL input clears every writable output",
-         process_valid && !extract_result && inputs == NULL && count == 0 &&
-             !has_shell);
+         process_valid && extract_result != SHELL_PROCESS_OK &&
+             inputs == NULL && count == 0 && !has_shell);
 
     infos = (shell_command_info_t *)(uintptr_t)1;
     inputs = (const char **)(uintptr_t)1;
@@ -1266,15 +1295,17 @@ int main(void) {
     has_shell = true;
     process_result = shell_process_command("\x01"
                                            "cmd",
-                                           &infos, &count);
-    process_valid = !process_result && infos == NULL && count == 0;
+                                           NULL, &infos, &count);
+    process_valid =
+        process_result != SHELL_PROCESS_OK && infos == NULL && count == 0;
     count = SIZE_MAX;
-    extract_result = shell_extract_dfa_inputs("\x01"
-                                              "cmd",
-                                              &inputs, &count, &has_shell);
+    extract_result =
+        shell_extract_dfa_inputs("\x01"
+                                 "cmd",
+                                 NULL, &inputs, &count, &has_shell);
     test("Processor: rejected input clears every writable output",
-         process_valid && !extract_result && inputs == NULL && count == 0 &&
-             !has_shell);
+         process_valid && extract_result != SHELL_PROCESS_OK &&
+             inputs == NULL && count == 0 && !has_shell);
   }
 
   {
@@ -1282,18 +1313,29 @@ int main(void) {
     const char **inputs = NULL;
     size_t count = 0;
     bool has_shell = false;
-    bool rejected[] = {
-        shell_process_command("echo", NULL, &count),
-        shell_process_command("echo", &infos, NULL),
-        shell_extract_dfa_inputs("echo", NULL, &count, &has_shell),
-        shell_extract_dfa_inputs("echo", &inputs, NULL, &has_shell),
-        shell_extract_dfa_inputs("echo", &inputs, &count, NULL),
+    shell_process_status_t rejected[] = {
+        shell_process_command("echo", NULL, NULL, &count),
+        shell_process_command("echo", NULL, &infos, NULL),
+        shell_extract_dfa_inputs("echo", NULL, NULL, &count, &has_shell),
+        shell_extract_dfa_inputs("echo", NULL, &inputs, NULL, &has_shell),
+        shell_extract_dfa_inputs("echo", NULL, &inputs, &count, NULL),
     };
     bool valid = shell_get_clean_command(NULL) == NULL &&
                  !shell_has_dangerous_features(NULL);
     for (size_t i = 0; i < sizeof(rejected) / sizeof(rejected[0]); i++)
-      valid = valid && !rejected[i];
+      valid = valid && rejected[i] != SHELL_PROCESS_OK;
     test("Processor: NULL output and accessor contracts", valid);
+  }
+
+  {
+    shell_command_info_t *infos = (shell_command_info_t *)(uintptr_t)1;
+    size_t count = SIZE_MAX;
+    const shell_process_limits_t tiny = {3, 3};
+    shell_process_status_t status =
+        shell_process_command("echo value", &tiny, &infos, &count);
+    test("Processor: explicit output limits report rejection",
+         status == SHELL_PROCESS_EOUTPUT_LIMIT && infos == NULL && count == 0);
+    shell_free_command_infos(infos, count);
   }
 
   printf("\n=== PIPELINE/SUBCOMMAND EXTRACTION TESTS ===\n\n");

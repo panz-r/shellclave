@@ -1,0 +1,1 @@
+test -f input && cat input || echo missing

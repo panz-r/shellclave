@@ -1,0 +1,1 @@
+(printf '%s\\n' one | sed 's/o/O/' | sort)

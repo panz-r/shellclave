@@ -74,10 +74,15 @@ static bool extract_subshell_command(
     char* inner_text = strndup(inner_start, inner_length);
 
     // Transform the inner command (recursive)
-    if (!shell_transform_command_line(inner_text, inner_command, 1)) {
+    transformed_command_t **inner_commands = NULL;
+    size_t inner_count = 0;
+    if (shell_transform_command_line(inner_text, NULL, &inner_commands,
+                                     &inner_count) != SHELL_TRANSFORM_OK) {
         free(inner_text);
         return false;
     }
+    *inner_command = inner_count == 1 ? inner_commands[0] : NULL;
+    free(inner_commands);
 
     free(inner_text);
     return true;
@@ -238,7 +243,8 @@ ro_command_result_t ro_validate_command_line(
     // Transform command line
     transformed_command_t** cmds;
     size_t count;
-    if (!shell_transform_command_line(command_line, &cmds, &count)) {
+    if (shell_transform_command_line(command_line, NULL, &cmds, &count) !=
+        SHELL_TRANSFORM_OK) {
         return RO_CMD_ERROR;
     }
 

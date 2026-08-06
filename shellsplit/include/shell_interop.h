@@ -35,16 +35,20 @@ void shell_interop_destroy(shell_interop_handle_t *handle);
  *   SHELL_FEAT_CONDITIONALS  = 0x100 // if/then/else/fi
  *   SHELL_FEAT_CASE          = 0x200 // case/esac
  *   SHELL_FEAT_SUBSHELL_FILE = 0x400 // $(<file)
+ *   SHELL_FEAT_PIPELINE       = 0x800 // literal | pipeline construct
  *
- * Command types (upper bits of type) describe the separator preceding the
- * subcommand:
+ * Command types (upper bits of type) describe the operator or structural
+ * marker associated with one subcommand. The outer separator takes precedence
+ * when a subcommand also contains a nested substitution; inspect features for
+ * the nested syntax:
  *   SHELL_TYPE_SIMPLE     = 0x0000 // First or standalone command
- *   SHELL_TYPE_PIPELINE   = 0x0100 // Preceded by |
+ *   SHELL_TYPE_PIPELINE   = 0x0100 // Preceded by literal |
  *   SHELL_TYPE_AND        = 0x0200 // Preceded by &&
  *   SHELL_TYPE_OR         = 0x0400 // Preceded by ||
  *   SHELL_TYPE_SEMICOLON  = 0x0800 // Preceded by ;
  *   SHELL_TYPE_HEREDOC    = 0x1000 // Starts with <<
  *   SHELL_TYPE_HERESTRING = 0x2000 // Starts with <<<
+ *   SHELL_TYPE_SUBSTITUTION = 0x4000 // Command/process substitution operator
  *
  * `cmd` points to exactly `cmd_len` bytes and need not be null-terminated.
  * Embedded NUL bytes are rejected because they are not valid shell input.

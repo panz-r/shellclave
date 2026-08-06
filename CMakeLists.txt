@@ -257,13 +257,25 @@ if(SHELLCLAVE_BUILD_FUZZERS)
   target_link_libraries(fuzz_shellgate PRIVATE shellgate)
 
   foreach(fuzzer_name IN ITEMS shellgate shellsplit)
-    set(fuzzer_corpus_source
-      "${CMAKE_CURRENT_SOURCE_DIR}/${fuzzer_name}/fuzz/corpus")
-    set(fuzzer_corpus_destination
-      "${CMAKE_CURRENT_BINARY_DIR}/fuzz-corpus/${fuzzer_name}")
-    file(MAKE_DIRECTORY "${fuzzer_corpus_destination}")
-    if(EXISTS "${fuzzer_corpus_source}")
-      file(COPY "${fuzzer_corpus_source}/" DESTINATION "${fuzzer_corpus_destination}")
+    set(smoke_seed_dir
+      "${CMAKE_CURRENT_SOURCE_DIR}/${fuzzer_name}/fuzz/smoke-seeds")
+    file(GLOB smoke_seed_files CONFIGURE_DEPENDS
+      "${smoke_seed_dir}/*")
+    list(LENGTH smoke_seed_files smoke_seed_count)
+    if(smoke_seed_count GREATER 61)
+      message(FATAL_ERROR
+        "${fuzzer_name} smoke seed set exceeds the 61-file limit")
+    endif()
+    set(smoke_seed_bytes 0)
+    foreach(smoke_seed IN LISTS smoke_seed_files)
+      if(NOT IS_DIRECTORY "${smoke_seed}")
+        file(SIZE "${smoke_seed}" smoke_seed_size)
+        math(EXPR smoke_seed_bytes "${smoke_seed_bytes}+${smoke_seed_size}")
+      endif()
+    endforeach()
+    if(smoke_seed_bytes GREATER 1048576)
+      message(FATAL_ERROR
+        "${fuzzer_name} smoke seed set exceeds the 1 MiB size limit")
     endif()
   endforeach()
 
@@ -275,6 +287,36 @@ if(SHELLCLAVE_BUILD_FUZZERS)
   foreach(fuzzer IN ITEMS fuzz_shellgate fuzz_shellsplit)
     target_compile_options(${fuzzer} PRIVATE -Wall -Wextra -Wpedantic)
   endforeach()
+
+  set(SHELLCLAVE_FUZZ_RUNS "1000" CACHE STRING
+      "Number of libFuzzer smoke-test runs")
+  set(SHELLCLAVE_FUZZ_MAX_LEN "8192" CACHE STRING
+      "Maximum libFuzzer input length for smoke tests")
+  # Smoke tests use only the bounded seed sets below. Generated successful
+  # inputs are kept in a disposable per-run corpus by the wrapper.
+  add_custom_target(fuzz-shellsplit-smoke
+    COMMAND /bin/bash ${CMAKE_CURRENT_SOURCE_DIR}/scripts/run_fuzz_smoke.sh
+      $<TARGET_FILE:fuzz_shellsplit>
+      ${CMAKE_CURRENT_SOURCE_DIR}/shellsplit/fuzz/smoke-seeds
+      ${CMAKE_CURRENT_BINARY_DIR}/fuzz-smoke-corpus/shellsplit
+      ${SHELLCLAVE_FUZZ_RUNS}
+      ${SHELLCLAVE_FUZZ_MAX_LEN}
+      ${CMAKE_CURRENT_BINARY_DIR}/fuzz-artifacts/smoke/shellsplit_
+    DEPENDS fuzz_shellsplit
+    COMMENT "Running the unified Shellsplit fuzzer")
+  add_custom_target(fuzz-shellgate-smoke
+    COMMAND /bin/bash ${CMAKE_CURRENT_SOURCE_DIR}/scripts/run_fuzz_smoke.sh
+      $<TARGET_FILE:fuzz_shellgate>
+      ${CMAKE_CURRENT_SOURCE_DIR}/shellgate/fuzz/smoke-seeds
+      ${CMAKE_CURRENT_BINARY_DIR}/fuzz-smoke-corpus/shellgate
+      ${SHELLCLAVE_FUZZ_RUNS}
+      ${SHELLCLAVE_FUZZ_MAX_LEN}
+      ${CMAKE_CURRENT_BINARY_DIR}/fuzz-artifacts/smoke/shellgate_
+    DEPENDS fuzz_shellgate
+    COMMENT "Running the Shellgate fuzzer")
+  add_custom_target(fuzz-smoke
+    DEPENDS fuzz-shellsplit-smoke fuzz-shellgate-smoke
+    COMMENT "Running all repository fuzz smoke tests")
 endif()
 
 if(PROJECT_IS_TOP_LEVEL)

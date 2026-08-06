@@ -30,6 +30,23 @@ typedef struct {
   bool has_error_redirection;    // Has error redirection (2>)
 } shell_command_info_t;
 
+typedef enum {
+  SHELL_PROCESS_OK = 0,
+  SHELL_PROCESS_EINPUT,
+  SHELL_PROCESS_EPARSE,
+  SHELL_PROCESS_ENOMEM,
+  SHELL_PROCESS_EOVERFLOW,
+  SHELL_PROCESS_EOUTPUT_LIMIT
+} shell_process_status_t;
+
+/* Limits apply to each returned string and to the aggregate output of one
+ * call.  A NULL limits pointer means unbounded output.  Sizes exclude the
+ * terminating NUL. */
+typedef struct {
+  size_t max_string_bytes;
+  size_t max_total_bytes;
+} shell_process_limits_t;
+
 /**
  * Process shell command with proper separation
  *
@@ -37,9 +54,9 @@ typedef struct {
  * command metadata owns all text it refers to and remains valid independently
  * of command_line. On failure, writable outputs are set to NULL and zero.
  */
-bool shell_process_command(const char *command_line,
-                           shell_command_info_t **command_infos,
-                           size_t *command_count);
+shell_process_status_t shell_process_command(
+    const char *command_line, const shell_process_limits_t *limits,
+    shell_command_info_t **command_infos, size_t *command_count);
 
 /**
  * Free command info structures
@@ -64,8 +81,8 @@ bool shell_has_dangerous_features(shell_command_info_t *info);
  * string and the containing array. On failure, writable outputs are set to
  * NULL, zero, and false.
  */
-bool shell_extract_dfa_inputs(
-    const char *command_line,
+shell_process_status_t shell_extract_dfa_inputs(
+    const char *command_line, const shell_process_limits_t *limits,
     const char ***dfa_inputs, // Array of clean commands
     size_t *dfa_input_count,  // Number of commands
     bool *has_shell_features  // True if shell features present

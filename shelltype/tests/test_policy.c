@@ -13,6 +13,17 @@
 static int tests_run = 0;
 static int tests_passed = 0;
 static int tests_failed = 0;
+static char policy_temp_paths[3][256];
+
+static void cleanup_policy_temp_files(void) {
+  for (size_t i = 0;
+       i < sizeof(policy_temp_paths) / sizeof(policy_temp_paths[0]); i++) {
+    if (policy_temp_paths[i][0] != '\0') {
+      (void)unlink(policy_temp_paths[i]);
+      policy_temp_paths[i][0] = '\0';
+    }
+  }
+}
 
 #define TEST(name)                                                             \
   do {                                                                         \
@@ -144,6 +155,7 @@ static int test_policy_persistence_transitions(void) {
   int fd = mkstemp(path);
   ASSERT(fd >= 0);
   ASSERT(close(fd) == 0);
+  snprintf(policy_temp_paths[0], sizeof(policy_temp_paths[0]), "%s", path);
 
   st_policy_ctx_t *ctx = st_policy_ctx_new();
   st_policy_t *source = st_policy_new(ctx);
@@ -511,6 +523,7 @@ static int test_dot_export(void) {
   int fd = mkstemp(path);
   ASSERT(fd >= 0);
   ASSERT(close(fd) == 0);
+  snprintf(policy_temp_paths[1], sizeof(policy_temp_paths[1]), "%s", path);
   st_policy_ctx_t *ctx = st_policy_ctx_new();
   st_policy_t *policy = st_policy_new(ctx);
   ASSERT(policy != NULL);
@@ -819,6 +832,7 @@ static int test_param_path_lifecycle(void) {
                         {"cat /etc/app.txt", NULL},
                         {"cat /etc/hosts", NULL}};
   const char *path = "test_param_policy.tmp";
+  snprintf(policy_temp_paths[2], sizeof(policy_temp_paths[2]), "%s", path);
   st_policy_ctx_t *ctx = st_policy_ctx_new();
   st_policy_ctx_t *loaded_ctx = st_policy_ctx_new();
   st_policy_t *policy = st_policy_new(ctx);
@@ -1710,6 +1724,7 @@ static int test_apply_type_matrix(void) {
 }
 
 int main(void) {
+  atexit(cleanup_policy_temp_files);
   printf("Running policy unit tests...\n\n");
 
   printf("Lifecycle and mutation:\n");

@@ -1,0 +1,1 @@
+case "${MODE:-scan}" in scan) for ((i=0; i<3; i++)); do value=$(printf '%s\\n' "$i" | tee >(cat >&2) | tr -d '\\n'); (( value == 1 )) && break; done;; *) echo skip;; esac

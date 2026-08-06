@@ -13,6 +13,7 @@ MEMORY_LIMIT="${FUZZ_MEMORY_LIMIT:-8G}"
 
 WATCHDOG_PID=""
 FUZZER_PID=""
+SESSION_DIR=""
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -49,33 +50,32 @@ cleanup() {
         kill -TERM "$FUZZER_PID" 2>/dev/null || true
     fi
     # Fallback: kill any remaining fuzz_shellgate processes we spawned
-    pkill -TERM -f "fuzz_shellgate.*corpus" 2>/dev/null || true
+    pkill -TERM -f "fuzz_shellgate.*fuzz-session-shellgate" 2>/dev/null || true
     sleep 1
     # Force kill anything still alive
-    pkill -KILL -f "fuzz_shellgate.*corpus" 2>/dev/null || true
+    pkill -KILL -f "fuzz_shellgate.*fuzz-session-shellgate" 2>/dev/null || true
+    if [ -n "$SESSION_DIR" ]; then
+        rm -rf "$SESSION_DIR"
+    fi
 }
 trap cleanup EXIT INT TERM
 
-# Build fuzzer if needed (uses CMake)
 FUZZER_BIN="$BUILD_DIR/fuzz_shellgate"
-if [ ! -f "$FUZZER_BIN" ]; then
-    echo "Fuzzer not found at $FUZZER_BIN"
-    echo "Building with CMake (clang required for libFuzzer)..."
-    mkdir -p "$BUILD_DIR"
-    cmake -S "$REPO_ROOT" -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE=Debug \
-        -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
-        -DBUILD_TESTING=OFF -DSHELLCLAVE_BUILD_TOOLS=OFF \
-        -DSHELLCLAVE_BUILD_FUZZERS=ON
-    cmake --build "$BUILD_DIR" --target fuzz_shellgate
-fi
+echo "Configuring and rebuilding fuzz_shellgate (clang required for libFuzzer)..."
+cmake -S "$REPO_ROOT" -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE=Debug \
+    -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+    -DBUILD_TESTING=OFF -DSHELLCLAVE_BUILD_TOOLS=OFF \
+    -DSHELLCLAVE_BUILD_FUZZERS=ON
+cmake --build "$BUILD_DIR" --target fuzz_shellgate
 
-# CMake creates this build-local directory even when a fresh clone has no
-# source corpus.
-CORPUS_DIR="$BUILD_DIR/fuzz-corpus/shellgate"
-mkdir -p "$CORPUS_DIR"
+SEED_DIR="$SCRIPT_DIR/smoke-seeds"
+SESSION_ROOT="$BUILD_DIR/fuzz-session-shellgate"
+mkdir -p "$SESSION_ROOT"
+SESSION_DIR="$(mktemp -d "$SESSION_ROOT/XXXXXX")"
 
 FUZZER_ARGS=(
-    "$CORPUS_DIR"
+    "$SESSION_DIR"
+    "$SEED_DIR"
     "-artifact_prefix=$SCRIPT_DIR/crashes/shellgate_"
     "-max_len=4096"
     "-max_total_time=$DURATION"

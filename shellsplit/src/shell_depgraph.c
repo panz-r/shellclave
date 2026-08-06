@@ -676,6 +676,16 @@ shell_dep_error_t shell_parse_depgraph(const char *cmd, size_t cmd_len,
     return SHELL_DEP_EINPUT;
   }
 
+  /* All graph offsets and traversal indices are 32-bit.  Reject an
+   * unrepresentable length before the whitespace scan below can narrow it. */
+  if (cmd_len > UINT32_MAX) {
+    out->node_count = 0;
+    out->edge_count = 0;
+    out->status = SHELL_DEP_STATUS_ERROR;
+    out->cwd_buf.len = 0;
+    return SHELL_DEP_EINPUT;
+  }
+
   if (depth > 16) {
     out->node_count = 0;
     out->edge_count = 0;
@@ -703,6 +713,17 @@ shell_dep_error_t shell_parse_depgraph(const char *cmd, size_t cmd_len,
       limits->cwd_buf_size > 0 ? limits->cwd_buf_size : SHELL_DEP_CWD_BUF_SIZE;
   if (effective_cwd_buf_size > SHELL_DEP_CWD_BUF_SIZE)
     effective_cwd_buf_size = SHELL_DEP_CWD_BUF_SIZE;
+
+  /* A CWD entry always needs at least one byte for its NUL terminator and one
+   * byte for the root representation.  Do not let the later subtraction
+   * underflow for an explicitly undersized caller bound. */
+  if (effective_cwd_buf_size < 2) {
+    out->node_count = 0;
+    out->edge_count = 0;
+    out->status = SHELL_DEP_STATUS_ERROR;
+    out->cwd_buf.len = 0;
+    return SHELL_DEP_EINPUT;
+  }
 
   out->node_count = 0;
   out->edge_count = 0;

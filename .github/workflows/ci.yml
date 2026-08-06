@@ -89,5 +89,4 @@ jobs:
           -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
           -DSHELLCLAVE_BUILD_FUZZERS=ON
       - run: cmake --build build --parallel 2
-      - run: build/fuzz_shellgate -runs=1000 build/fuzz-corpus/shellgate
-      - run: build/fuzz_shellsplit -runs=1000 build/fuzz-corpus/shellsplit
+      - run: cmake --build build --target fuzz-smoke

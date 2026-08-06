@@ -1,0 +1,1 @@
+function classify() { local input="$1"; case "$input" in *.log) printf '%s\\n' "$input";; *) printf '%s\\n' "$input";; esac; }; arr=($(printf '%s\\n' a b | sort)); for item in "${arr[@]}"; do classify "$item"; done; diff <(printf '%s\\n' "${arr[@]}") >(cat > /tmp/out)

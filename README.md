@@ -135,11 +135,12 @@ cmake --build build --target clang-analyze
 cmake -S . -B build-fuzz -DCMAKE_C_COMPILER=clang \
   -DCMAKE_CXX_COMPILER=clang++ -DSHELLCLAVE_BUILD_FUZZERS=ON \
   -DBUILD_TESTING=OFF
-cmake --build build-fuzz
-mkdir -p build-fuzz/fuzz-corpus/shellgate build-fuzz/fuzz-corpus/shellsplit
-build-fuzz/fuzz_shellgate -runs=1000 build-fuzz/fuzz-corpus/shellgate
-build-fuzz/fuzz_shellsplit -runs=1000 build-fuzz/fuzz-corpus/shellsplit
+cmake --build build-fuzz --target fuzz-smoke
 ```
+
+The `fuzz-smoke` target runs the unified Shellsplit fuzzer and the Shellgate
+fuzzer. The Shellsplit fuzzer exercises all Shellsplit parser and helper APIs
+from that single target.
 
 Run the Clang Static Analyzer:
 

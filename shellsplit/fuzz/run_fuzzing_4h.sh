@@ -10,9 +10,13 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 BUILD_DIR="${FUZZ_BUILD_DIR:-$REPO_ROOT/build-fuzz}"
 LOG_DIR="$SCRIPT_DIR/logs/$(date +%Y%m%d_%H%M%S)"
 FUZZER_BIN="$BUILD_DIR/fuzz_shellsplit"
-CORPUS_DIR="$BUILD_DIR/fuzz-corpus/shellsplit"
+SEED_DIR="$SCRIPT_DIR/smoke-seeds"
+SESSION_ROOT="$BUILD_DIR/fuzz-session-shellsplit"
 
-mkdir -p "$LOG_DIR" "$SCRIPT_DIR/crashes"
+mkdir -p "$LOG_DIR" "$SCRIPT_DIR/crashes" "$SESSION_ROOT"
+SESSION_DIR="$(mktemp -d "$SESSION_ROOT/XXXXXX")"
+cleanup() { rm -rf "$SESSION_DIR"; }
+trap cleanup EXIT INT TERM
 
 cmake -S "$REPO_ROOT" -B "$BUILD_DIR" \
   -DCMAKE_BUILD_TYPE=Debug \
@@ -24,7 +28,8 @@ cmake -S "$REPO_ROOT" -B "$BUILD_DIR" \
 cmake --build "$BUILD_DIR" --target fuzz_shellsplit
 
 FUZZER_ARGS=(
-  "$CORPUS_DIR"
+  "$SESSION_DIR"
+  "$SEED_DIR"
   "-artifact_prefix=$SCRIPT_DIR/crashes/tokenizer_"
   "-max_len=4096"
   "-max_total_time=$DURATION"

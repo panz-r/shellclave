@@ -61,7 +61,7 @@ static void detect_features(const char *cmd, uint32_t start, uint32_t len,
       // Check if first variable after $((
       if (i + 3 < len) {
         char next = p[i + 3];
-        if (isalpha(next) || next == '_') {
+        if (isalpha((unsigned char)next) || next == '_') {
           *features |= SHELL_FEAT_VARS;
         }
       }
@@ -84,10 +84,11 @@ static void detect_features(const char *cmd, uint32_t start, uint32_t len,
           *features |= SHELL_FEAT_SUBSHELL;
         } else if (next == '{') {
           *features |= SHELL_FEAT_VARS;
-        } else if (isdigit(next) || next == '#' || next == '?' || next == '$' ||
-                   next == '!' || next == '@' || next == '*') {
+        } else if (isdigit((unsigned char)next) || next == '#' || next == '?' ||
+                   next == '$' || next == '!' || next == '@' || next == '*' ||
+                   next == '-') {
           *features |= SHELL_FEAT_VARS;
-        } else if (isalpha(next) || next == '_') {
+        } else if (isalpha((unsigned char)next) || next == '_') {
           *features |= SHELL_FEAT_VARS;
         }
       }
@@ -117,10 +118,11 @@ static void detect_features(const char *cmd, uint32_t start, uint32_t len,
           *features |= SHELL_FEAT_SUBSHELL;
         } else if (next == '{') {
           *features |= SHELL_FEAT_VARS;
-        } else if (isdigit(next) || next == '#' || next == '?' || next == '$' ||
-                   next == '!' || next == '@' || next == '*') {
+        } else if (isdigit((unsigned char)next) || next == '#' || next == '?' ||
+                   next == '$' || next == '!' || next == '@' || next == '*' ||
+                   next == '-') {
           *features |= SHELL_FEAT_VARS;
-        } else if (isalpha(next) || next == '_') {
+        } else if (isalpha((unsigned char)next) || next == '_') {
           *features |= SHELL_FEAT_VARS;
         }
       }
@@ -146,6 +148,112 @@ static void detect_features(const char *cmd, uint32_t start, uint32_t len,
     }
 
     i++;
+  }
+}
+
+/* Detect control-flow and file-substitution features in one subcommand.
+ * This is intentionally lexical: the fast parser reports feature presence,
+ * while the full parser remains responsible for detailed shell structure. */
+static void detect_control_features(const char *cmd, uint32_t start,
+                                    uint32_t len, uint16_t *features) {
+  const char *p = cmd + start;
+  uint32_t word_start = UINT32_MAX;
+  bool in_single = false;
+  bool in_double = false;
+
+  for (uint32_t i = 0; i <= len; i++) {
+    char c = i < len ? p[i] : ' ';
+    if (in_single) {
+      if (c == '\'')
+        in_single = false;
+      continue;
+    }
+    if (in_double) {
+      if (c == '"')
+        in_double = false;
+      else if (c == '\\' && i + 1 < len)
+        i++;
+      continue;
+    }
+    if (c == '\'') {
+      in_single = true;
+      if (word_start != UINT32_MAX) {
+        word_start = UINT32_MAX;
+      }
+      continue;
+    }
+    if (c == '"') {
+      in_double = true;
+      if (word_start != UINT32_MAX)
+        word_start = UINT32_MAX;
+      continue;
+    }
+    if (c == '\\' && i + 1 < len) {
+      if (word_start == UINT32_MAX)
+        word_start = i;
+      i++;
+      continue;
+    }
+
+    if (isalnum((unsigned char)c) || c == '_') {
+      if (word_start == UINT32_MAX)
+        word_start = i;
+      continue;
+    }
+
+    if (word_start != UINT32_MAX) {
+      size_t word_len = i - word_start;
+      const char *word = p + word_start;
+      if ((word_len == 5 && memcmp(word, "while", 5) == 0) ||
+          (word_len == 5 && memcmp(word, "until", 5) == 0) ||
+          (word_len == 3 && memcmp(word, "for", 3) == 0))
+        *features |= SHELL_FEAT_LOOPS;
+      if ((word_len == 2 && memcmp(word, "if", 2) == 0) ||
+          (word_len == 4 && memcmp(word, "then", 4) == 0) ||
+          (word_len == 4 && memcmp(word, "elif", 4) == 0) ||
+          (word_len == 4 && memcmp(word, "else", 4) == 0) ||
+          (word_len == 2 && memcmp(word, "fi", 2) == 0))
+        *features |= SHELL_FEAT_CONDITIONALS;
+      if ((word_len == 4 && memcmp(word, "case", 4) == 0) ||
+          (word_len == 2 && memcmp(word, "in", 2) == 0) ||
+          (word_len == 4 && memcmp(word, "esac", 4) == 0))
+        *features |= SHELL_FEAT_CASE;
+      word_start = UINT32_MAX;
+    }
+
+    if (c == '$' && i + 1 < len && p[i + 1] == '(') {
+      uint32_t j = i + 2;
+      while (j < len && isspace((unsigned char)p[j]))
+        j++;
+      if (j < len && p[j] == '<')
+        *features |= SHELL_FEAT_SUBSHELL_FILE;
+    }
+  }
+}
+
+static void detect_all_features(const char *cmd, uint32_t start, uint32_t len,
+                                uint16_t *features) {
+  detect_features(cmd, start, len, features);
+  detect_control_features(cmd, start, len, features);
+}
+
+/* Complete metadata that depends on the full set of recorded ranges. This is
+ * also used on truncation so retained ranges have the same metadata as they
+ * would in an otherwise identical complete parse. */
+static void normalize_result_metadata(shell_parse_result_t *result) {
+  for (uint32_t i = 0; i < result->count; i++) {
+    if (result->cmds[i].type == SHELL_TYPE_SIMPLE &&
+        (result->cmds[i].features & SHELL_FEAT_SUBSHELL)) {
+      result->cmds[i].type = SHELL_TYPE_SUBSTITUTION;
+    }
+  }
+
+  for (uint32_t i = 0; i < result->count; i++) {
+    if (result->cmds[i].type == SHELL_TYPE_PIPELINE) {
+      result->cmds[i].features |= SHELL_FEAT_PIPELINE;
+      if (i > 0)
+        result->cmds[i - 1].features |= SHELL_FEAT_PIPELINE;
+    }
   }
 }
 
@@ -204,12 +312,13 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
       result->cmds[subcmd_idx].len = _e - _s;                                  \
       result->cmds[subcmd_idx].type = (type_val);                              \
       result->cmds[subcmd_idx].features = 0;                                   \
-      detect_features(cmd, _s, _e - _s, &result->cmds[subcmd_idx].features);   \
+      detect_all_features(cmd, _s, _e - _s,                                    \
+                          &result->cmds[subcmd_idx].features);                 \
       subcmd_idx++;                                                            \
     } else if (subcmd_idx >= max_cmds) {                                       \
       result->status = SHELL_STATUS_TRUNCATED;                                 \
       result->count = subcmd_idx;                                              \
-      return SHELL_ETRUNC;                                                     \
+      goto truncated;                                                          \
     }                                                                          \
   } while (0)
 
@@ -354,13 +463,24 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
         char next = cmd[pos + 1];
         // $ must be followed by: alphanumeric, _, {, (, `, digit, or special
         // var chars (*, @, #, ?, !, $)
-        if (!isalpha(next) && next != '_' && next != '{' && next != '(' &&
-            next != '`' && !isdigit(next) && next != '*' && next != '@' &&
-            next != '#' && next != '?' && next != '!' && next != '$') {
+        if (!isalpha((unsigned char)next) && next != '_' && next != '{' &&
+            next != '(' && next != '`' && !isdigit((unsigned char)next) &&
+            next != '*' && next != '@' && next != '#' && next != '?' &&
+            next != '!' && next != '$') {
           // Malformed $ - increment brace_depth so it will fail the final check
           brace_depth++;
         }
       }
+    }
+
+    /* Command and backtick substitutions compose multiple processes. Keep
+     * their concrete syntax in the feature mask and classify a standalone
+     * subcommand with the substitution operator type. */
+    if (current_type == SHELL_TYPE_SIMPLE &&
+        ((c == '$' && pos + 1 < cmd_len && cmd[pos + 1] == '(' &&
+          !(pos + 2 < cmd_len && cmd[pos + 2] == '(')) ||
+         (c == '`' && !(in_quotes && quote_char == '\'')))) {
+      current_type = SHELL_TYPE_SUBSTITUTION;
     }
 
     // Handle escapes outside quotes
@@ -386,7 +506,8 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
           result->cmds[subcmd_idx].len = e - s;
           result->cmds[subcmd_idx].type = current_type;
           result->cmds[subcmd_idx].features = 0;
-          detect_features(cmd, s, e - s, &result->cmds[subcmd_idx].features);
+          detect_all_features(cmd, s, e - s,
+                              &result->cmds[subcmd_idx].features);
           subcmd_idx++;
         }
       }
@@ -395,7 +516,7 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
       if (subcmd_idx >= max_cmds) {
         result->status = SHELL_STATUS_TRUNCATED;
         result->count = subcmd_idx;
-        return SHELL_ETRUNC;
+        goto truncated;
       }
 
       // Record herestring subcommand: include <<< and the string
@@ -403,12 +524,13 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
       pos += 3; // Skip <<<
 
       // Skip whitespace
-      while (pos < cmd_len && isspace(cmd[pos]))
+      while (pos < cmd_len && isspace((unsigned char)cmd[pos]))
         pos++;
 
       // Find end of the string (next whitespace or separator)
       uint32_t string_start = pos;
-      while (pos < cmd_len && !isspace(cmd[pos]) && !is_separator(cmd[pos]))
+      while (pos < cmd_len && !isspace((unsigned char)cmd[pos]) &&
+             !is_separator(cmd[pos]))
         pos++;
       uint32_t string_len = pos - string_start;
 
@@ -428,7 +550,7 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
         current_type = SHELL_TYPE_SIMPLE;
 
         // Skip whitespace to next token
-        while (pos < cmd_len && isspace(cmd[pos]))
+        while (pos < cmd_len && isspace((unsigned char)cmd[pos]))
           pos++;
         continue;
       }
@@ -451,7 +573,8 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
           result->cmds[subcmd_idx].len = e - s;
           result->cmds[subcmd_idx].type = current_type;
           result->cmds[subcmd_idx].features = 0;
-          detect_features(cmd, s, e - s, &result->cmds[subcmd_idx].features);
+          detect_all_features(cmd, s, e - s,
+                              &result->cmds[subcmd_idx].features);
           subcmd_idx++;
         }
       }
@@ -460,7 +583,7 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
       if (subcmd_idx >= max_cmds) {
         result->status = SHELL_STATUS_TRUNCATED;
         result->count = subcmd_idx;
-        return SHELL_ETRUNC;
+        goto truncated;
       }
 
       // Find heredoc delimiter (word after <<)
@@ -468,12 +591,13 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
       pos += 2; // Skip <<
 
       // Skip whitespace
-      while (pos < cmd_len && isspace(cmd[pos]))
+      while (pos < cmd_len && isspace((unsigned char)cmd[pos]))
         pos++;
 
       // Find end of delimiter (whitespace or end)
       uint32_t delim_start = pos;
-      while (pos < cmd_len && !isspace(cmd[pos]) && cmd[pos] != ';')
+      while (pos < cmd_len && !isspace((unsigned char)cmd[pos]) &&
+             cmd[pos] != ';')
         pos++;
       uint32_t delim_len = pos - delim_start;
 
@@ -493,7 +617,7 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
         current_type = SHELL_TYPE_SIMPLE;
 
         // Skip whitespace to next token
-        while (pos < cmd_len && isspace(cmd[pos]))
+        while (pos < cmd_len && isspace((unsigned char)cmd[pos]))
           pos++;
         continue;
       }
@@ -509,7 +633,7 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
           if (subcmd_idx >= max_cmds) {
             result->status = SHELL_STATUS_TRUNCATED;
             result->count = subcmd_idx;
-            return SHELL_ETRUNC;
+            goto truncated;
           }
           uint32_t s = subcmd_start;
           uint32_t e = pos;
@@ -522,7 +646,8 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
             result->cmds[subcmd_idx].len = e - s;
             result->cmds[subcmd_idx].type = current_type;
             result->cmds[subcmd_idx].features = 0;
-            detect_features(cmd, s, e - s, &result->cmds[subcmd_idx].features);
+            detect_all_features(cmd, s, e - s,
+                                &result->cmds[subcmd_idx].features);
             subcmd_idx++;
           }
         }
@@ -541,7 +666,7 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
           if (subcmd_idx >= max_cmds) {
             result->status = SHELL_STATUS_TRUNCATED;
             result->count = subcmd_idx;
-            return SHELL_ETRUNC;
+            goto truncated;
           }
           uint32_t s = subcmd_start;
           uint32_t e = pos;
@@ -554,7 +679,8 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
             result->cmds[subcmd_idx].len = e - s;
             result->cmds[subcmd_idx].type = current_type;
             result->cmds[subcmd_idx].features = 0;
-            detect_features(cmd, s, e - s, &result->cmds[subcmd_idx].features);
+            detect_all_features(cmd, s, e - s,
+                                &result->cmds[subcmd_idx].features);
             subcmd_idx++;
           }
         }
@@ -573,7 +699,7 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
           if (subcmd_idx >= max_cmds) {
             result->status = SHELL_STATUS_TRUNCATED;
             result->count = subcmd_idx;
-            return SHELL_ETRUNC;
+            goto truncated;
           }
           uint32_t s = subcmd_start;
           uint32_t e = pos;
@@ -586,12 +712,15 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
             result->cmds[subcmd_idx].len = e - s;
             result->cmds[subcmd_idx].type = current_type;
             result->cmds[subcmd_idx].features = 0;
-            detect_features(cmd, s, e - s, &result->cmds[subcmd_idx].features);
+            detect_all_features(cmd, s, e - s,
+                                &result->cmds[subcmd_idx].features);
             subcmd_idx++;
           }
         }
 
         // Start new subcommand with PIPELINE type
+        if (subcmd_idx > 0)
+          result->cmds[subcmd_idx - 1].features |= SHELL_FEAT_PIPELINE;
         pos++;
         subcmd_start = pos;
         current_type = SHELL_TYPE_PIPELINE;
@@ -605,7 +734,7 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
           if (subcmd_idx >= max_cmds) {
             result->status = SHELL_STATUS_TRUNCATED;
             result->count = subcmd_idx;
-            return SHELL_ETRUNC;
+            goto truncated;
           }
           uint32_t s = subcmd_start;
           uint32_t e = pos;
@@ -618,7 +747,8 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
             result->cmds[subcmd_idx].len = e - s;
             result->cmds[subcmd_idx].type = current_type;
             result->cmds[subcmd_idx].features = 0;
-            detect_features(cmd, s, e - s, &result->cmds[subcmd_idx].features);
+            detect_all_features(cmd, s, e - s,
+                                &result->cmds[subcmd_idx].features);
             subcmd_idx++;
           }
         }
@@ -673,7 +803,7 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
             result->cmds[subcmd_idx - 1].features |= SHELL_FEAT_PROCESS_SUB;
           }
           if (current_type == SHELL_TYPE_SIMPLE) {
-            current_type = SHELL_TYPE_PIPELINE;
+            current_type = SHELL_TYPE_SUBSTITUTION;
           }
           continue;
         }
@@ -696,11 +826,11 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
         // fd redirects) For 2>file, skip the 2. For 2>&1, don't skip the 1
         // (it's the target).
         if (!is_double_redirect && !is_fd_redirect) {
-          while (pos < cmd_len && isdigit(cmd[pos]))
+          while (pos < cmd_len && isdigit((unsigned char)cmd[pos]))
             pos++;
         }
         // Skip whitespace
-        while (pos < cmd_len && isspace(cmd[pos]))
+        while (pos < cmd_len && isspace((unsigned char)cmd[pos]))
           pos++;
         // Validate: redirect must be followed by a valid target
         // Check for end of input or invalid next character
@@ -747,14 +877,14 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
       result->cmds[subcmd_idx].len = end_pos - start_pos;
       result->cmds[subcmd_idx].type = current_type;
       result->cmds[subcmd_idx].features = 0;
-      detect_features(cmd, start_pos, end_pos - start_pos,
-                      &result->cmds[subcmd_idx].features);
+      detect_all_features(cmd, start_pos, end_pos - start_pos,
+                          &result->cmds[subcmd_idx].features);
       subcmd_idx++;
     }
   } else if (subcmd_idx >= max_cmds) {
     result->status = SHELL_STATUS_TRUNCATED;
     result->count = subcmd_idx;
-    return SHELL_ETRUNC;
+    goto truncated;
   }
 
   if (limits && limits->strict_mode) {
@@ -1132,8 +1262,15 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
   }
 
   result->count = subcmd_idx;
+  normalize_result_metadata(result);
   result->status = SHELL_STATUS_OK;
   return SHELL_OK;
+
+truncated:
+  result->count = subcmd_idx;
+  normalize_result_metadata(result);
+  result->status = SHELL_STATUS_TRUNCATED;
+  return SHELL_ETRUNC;
 }
 
 /**
@@ -1205,4 +1342,5 @@ void shell_get_feature_flags(uint16_t features, shell_feature_flags_t *flags) {
   flags->has_conditionals = (features & SHELL_FEAT_CONDITIONALS) != 0;
   flags->has_case = (features & SHELL_FEAT_CASE) != 0;
   flags->has_subshell_file = (features & SHELL_FEAT_SUBSHELL_FILE) != 0;
+  flags->has_pipeline = (features & SHELL_FEAT_PIPELINE) != 0;
 }

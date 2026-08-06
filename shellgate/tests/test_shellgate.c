@@ -99,14 +99,19 @@ static void cleanup_temp_files(void) {
   temp_file_count = 0;
 }
 
+static void register_temp_file(const char *path) {
+  if (temp_file_count >= MAX_TEMP_FILES)
+    return;
+  temp_files[temp_file_count] = strdup(path);
+  if (temp_files[temp_file_count] != NULL)
+    temp_file_count++;
+}
+
 static const char *temp_policy_file(void) {
   static char path[256];
   snprintf(path, sizeof(path), "/tmp/shellgate_test_%d_%d.txt", getpid(),
            temp_file_count);
-  if (temp_file_count < MAX_TEMP_FILES) {
-    temp_files[temp_file_count] = strdup(path);
-    temp_file_count++;
-  }
+  register_temp_file(path);
   return path;
 }
 
@@ -703,6 +708,7 @@ TEST(save_load_roundtrip) {
 
 TEST(save_load_empty) {
   const char *path = "/tmp/shellgate_test_empty.txt";
+  register_temp_file(path);
   sg_gate_t *g = sg_gate_new();
   ASSERT(sg_gate_rule_count(g) == 0);
 
@@ -725,6 +731,7 @@ TEST(save_load_empty) {
 
 TEST(save_load_malformed) {
   const char *path = "/tmp/shellgate_test_malformed.txt";
+  register_temp_file(path);
   FILE *f = fopen(path, "w");
   ASSERT(f != NULL);
   fprintf(f, "NOT A VALID SHELLGATE POLICY FILE\n");
@@ -1054,6 +1061,11 @@ TEST(reject_mask_feature_matrix) {
   } cases[] = {
       {"echo $VALUE", SHELL_FEAT_VARS},
       {"echo *.txt", SHELL_FEAT_GLOBS},
+      {"while true", SHELL_FEAT_LOOPS},
+      {"if true", SHELL_FEAT_CONDITIONALS},
+      {"case value", SHELL_FEAT_CASE},
+      {"echo $(<file)", SHELL_FEAT_SUBSHELL_FILE},
+      {"echo data | cat", SHELL_FEAT_PIPELINE},
   };
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
     sg_gate_t *gate = sg_gate_new();
@@ -1801,6 +1813,7 @@ TEST(anomaly_model_roundtrip) {
   const char *path = temp_policy_file();
   char type_path[320];
   snprintf(type_path, sizeof(type_path), "%s_type", path);
+  register_temp_file(type_path);
   ASSERT(sg_gate_save_anomaly_model(g, path) == SG_OK);
   ASSERT(access(type_path, F_OK) == 0);
 
@@ -2315,6 +2328,7 @@ TEST(bayesian_combination_transitions) {
  * ============================================================ */
 
 int main(void) {
+  atexit(cleanup_temp_files);
   printf("shellgate tests\n\n");
 
   printf("Lifecycle:\n");

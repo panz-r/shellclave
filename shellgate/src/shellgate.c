@@ -1179,6 +1179,7 @@ static const char *check_features(const shell_parse_result_t *fast,
       {SHELL_FEAT_VARS, "variable expansion"},
       {SHELL_FEAT_GLOBS, "glob expansion"},
       {SHELL_FEAT_SUBSHELL_FILE, "file command substitution"},
+      {SHELL_FEAT_PIPELINE, "pipeline"},
   };
 
   for (uint32_t si = 0; si < fast->count; si++) {

@@ -127,7 +127,8 @@ static int verify_command(const char *cmd, size_t cmd_len,
 
   shell_command_info_t *infos = NULL;
   size_t info_count = 0;
-  bool proc_ok = shell_process_command(cmd, &infos, &info_count);
+  bool proc_ok =
+      shell_process_command(cmd, NULL, &infos, &info_count) == SHELL_PROCESS_OK;
 
   int failed = 0;
   if (expects_parse_success && (!full_ok || !proc_ok)) {

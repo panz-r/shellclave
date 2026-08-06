@@ -24,7 +24,8 @@ static void test_parse_matrix(void) {
     int required_features;
   } expected[] = {
       {"echo $USER", SHELL_TYPE_SIMPLE, SHELL_FEAT_VARS},
-      {"grep *.txt", SHELL_TYPE_PIPELINE, SHELL_FEAT_GLOBS},
+      {"grep *.txt", SHELL_TYPE_PIPELINE,
+       SHELL_FEAT_GLOBS | SHELL_FEAT_PIPELINE},
       {"pwd", SHELL_TYPE_AND, 0},
   };
 
@@ -73,6 +74,8 @@ static void test_failure_and_length_boundaries(void) {
                  {"echo ok", 0, 0},
                  {"echo ok", -1, 0},
                  {"${}", 3, 0},
+                 {"cat <<EOF\n?tenregaed inpuat <<\n",
+                  (int)(sizeof("cat <<EOF\n?tenregaed inpuat <<\n") - 1), 0},
                  {embedded_nul, (int)sizeof(embedded_nul), 0}};
   for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
     CHECK(shell_interop_parse(handle, "echo ok", 7) == 1);
@@ -151,7 +154,8 @@ static void test_accessors_and_conversions(void) {
                {SHELL_TYPE_OR, "OR"},
                {SHELL_TYPE_SEMICOLON, "SEMICOLON"},
                {SHELL_TYPE_HEREDOC, "HEREDOC"},
-               {SHELL_TYPE_HERESTRING, "HERESTRING"}};
+               {SHELL_TYPE_HERESTRING, "HERESTRING"},
+               {SHELL_TYPE_SUBSTITUTION, "SUBSTITUTION"}};
   for (size_t i = 0; i < sizeof(types) / sizeof(types[0]); i++) {
     char *name = shell_interop_type_str(types[i].type);
     CHECK(name != NULL && strcmp(name, types[i].name) == 0);
@@ -172,6 +176,7 @@ static void test_accessors_and_conversions(void) {
       {SHELL_FEAT_CONDITIONALS, "COND "},
       {SHELL_FEAT_CASE, "CASE "},
       {SHELL_FEAT_SUBSHELL_FILE, "SUBSHELL_FILE "},
+      {SHELL_FEAT_PIPELINE, "PIPELINE "},
   };
   int all_features = 0;
   char all_names[256] = "";

@@ -1,5 +1,6 @@
 #include "shell_tokenizer_full.h"
 #include <ctype.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -80,7 +81,7 @@ static bool is_shell_operator(char c) {
 // Skip whitespace
 static void skip_whitespace(shell_tokenizer_state_t *state) {
   while (state->position < state->length &&
-         isspace(state->input[state->position])) {
+         isspace((unsigned char)state->input[state->position])) {
     state->position++;
   }
 }
@@ -187,9 +188,9 @@ static bool parse_variable(shell_tokenizer_state_t *state,
       // - ! for indirection (${!var})
       // - @, * for special parameters
       // - / for pattern substitution (${var/pattern/replace})
-      if (!isalnum(c) && c != '_' && c != '%' && c != '#' && c != ':' &&
-          c != '-' && c != '=' && c != '?' && c != '+' && c != '!' &&
-          c != '@' && c != '*' && c != '/') {
+      if (!isalnum((unsigned char)c) && c != '_' && c != '%' && c != '#' &&
+          c != ':' && c != '-' && c != '=' && c != '?' && c != '+' &&
+          c != '!' && c != '@' && c != '*' && c != '/') {
         return false;
       }
       state->position++;
@@ -201,8 +202,9 @@ static bool parse_variable(shell_tokenizer_state_t *state,
   if (state->position < state->length) {
     char next = state->input[state->position];
     // Handle: $0-$9, $#, $?, $$, $!, $@, $*, $-
-    if (isdigit(next) || next == '#' || next == '?' || next == '$' ||
-        next == '!' || next == '@' || next == '*' || next == '-') {
+    if (isdigit((unsigned char)next) || next == '#' || next == '?' ||
+        next == '$' || next == '!' || next == '@' || next == '*' ||
+        next == '-') {
       state->position++;
       token->type = is_quoted ? TOKEN_VARIABLE_QUOTED : TOKEN_SPECIAL_VAR;
       token->start = state->input + start;
@@ -217,7 +219,7 @@ static bool parse_variable(shell_tokenizer_state_t *state,
   // Simple $VAR format
   while (state->position < state->length) {
     char c = state->input[state->position];
-    if (!isalnum(c) && c != '_') {
+    if (!isalnum((unsigned char)c) && c != '_') {
       break;
     }
     state->position++;
@@ -777,7 +779,7 @@ bool shell_tokenizer_next(shell_tokenizer_state_t *state,
             state->position += 2;
             continue;
           }
-          if (isspace(c) || is_shell_operator(c)) {
+          if (isspace((unsigned char)c) || is_shell_operator(c)) {
             break;
           }
           state->position++;
@@ -813,12 +815,13 @@ bool shell_tokenizer_next(shell_tokenizer_state_t *state,
   // compatibility with the historical tokenizer convention (for example,
   // "2 >&1"), even though a POSIX IO number is normally adjacent to the
   // operator.
-  if (!state->in_quotes && isdigit(current_char)) {
+  if (!state->in_quotes && isdigit((unsigned char)current_char)) {
     size_t check_pos = state->position;
     while (check_pos < state->length &&
            isdigit((unsigned char)state->input[check_pos]))
       check_pos++;
-    while (check_pos < state->length && isspace(state->input[check_pos])) {
+    while (check_pos < state->length &&
+           isspace((unsigned char)state->input[check_pos])) {
       check_pos++;
     }
     if (check_pos < state->length) {
@@ -859,7 +862,7 @@ bool shell_tokenizer_next(shell_tokenizer_state_t *state,
         state->position++;
       }
     } else {
-      if (isspace(c) || is_shell_operator(c)) {
+      if (isspace((unsigned char)c) || is_shell_operator(c)) {
         break;
       }
       state->position++;
@@ -974,6 +977,8 @@ bool shell_tokenize_commands(const char *input, shell_command_t **commands,
     return true;
   }
 
+  if (count > SIZE_MAX / sizeof(shell_command_t))
+    return false;
   *commands = malloc(count * sizeof(shell_command_t));
   if (*commands == NULL) {
     return false;
@@ -1050,6 +1055,12 @@ bool shell_tokenize_commands(const char *input, shell_command_t **commands,
     }
 
     if (current_cmd->token_count >= token_capacity) {
+      if (token_capacity > SIZE_MAX / 2 ||
+          token_capacity * 2 > SIZE_MAX / sizeof(shell_token_t)) {
+        shell_free_commands(*commands, current_command + 1);
+        *commands = NULL;
+        return false;
+      }
       size_t new_capacity = token_capacity * 2;
       shell_token_t *new_tokens =
           realloc(tokens, new_capacity * sizeof(shell_token_t));

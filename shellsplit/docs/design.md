@@ -129,11 +129,10 @@ cmake -S . -B build-fuzz -DCMAKE_C_COMPILER=clang \
 cmake --build build-fuzz --target fuzz_shellsplit
 ```
 
-Run:
+Run the bounded session target (successful discoveries are disposable;
+crashes are written to the fuzzer artifact directory):
 ```bash
-mkdir -p build-fuzz/fuzz-corpus/shellsplit
-build-fuzz/fuzz_shellsplit -max_len=8192 -verbosity=1 \
-  build-fuzz/fuzz-corpus/shellsplit
+cmake --build build-fuzz --target fuzz-shellsplit-smoke
 ```
 
 ## Build System

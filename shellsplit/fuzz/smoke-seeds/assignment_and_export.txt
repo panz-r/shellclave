@@ -1,0 +1,1 @@
+VAR=one OTHER="two words" export PATH="$PATH:/opt/bin"; env

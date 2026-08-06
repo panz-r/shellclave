@@ -1,4 +1,5 @@
 #include "shell_depgraph.h"
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -538,6 +539,24 @@ TEST(empty_input) {
   pass_count++;
 }
 
+TEST(adversarial_limits) {
+  shell_dep_graph_t g;
+  shell_dep_limits_t limits = SHELL_DEP_LIMITS_DEFAULT;
+  limits.cwd_buf_size = 1;
+  memset(&g, 0xA5, sizeof(g));
+  ASSERT(shell_parse_depgraph("x", 1, ".", &limits, 0, &g) == SHELL_DEP_EINPUT);
+  ASSERT(g.node_count == 0 && g.edge_count == 0 &&
+         g.status == SHELL_DEP_STATUS_ERROR && g.cwd_buf.len == 0);
+#if SIZE_MAX > UINT32_MAX
+  memset(&g, 0xA5, sizeof(g));
+  ASSERT(shell_parse_depgraph("x", (size_t)UINT32_MAX + 1, ".", NULL, 0, &g) ==
+         SHELL_DEP_EINPUT);
+  ASSERT(g.node_count == 0 && g.edge_count == 0 &&
+         g.status == SHELL_DEP_STATUS_ERROR && g.cwd_buf.len == 0);
+#endif
+  pass_count++;
+}
+
 TEST(parse_error) {
   shell_dep_graph_t g;
   // Depgraph is permissive by design - unclosed quotes are allowed.
@@ -791,6 +810,7 @@ int main(int argc, char **argv) {
   RUN(null_input);
   RUN(null_output);
   RUN(empty_input);
+  RUN(adversarial_limits);
   RUN(parse_error);
   RUN(limit_matrix);
 

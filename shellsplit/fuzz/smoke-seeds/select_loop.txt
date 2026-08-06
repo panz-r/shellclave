@@ -1,0 +1,1 @@
+select opt in one two; do echo "$opt"; break; done

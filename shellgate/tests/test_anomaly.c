@@ -11,6 +11,14 @@
 
 static int pass_count;
 static int fail_count;
+static char anomaly_temp_path[256];
+
+static void cleanup_anomaly_temp_file(void) {
+  if (anomaly_temp_path[0] != '\0') {
+    (void)unlink(anomaly_temp_path);
+    anomaly_temp_path[0] = '\0';
+  }
+}
 
 #define ASSERT(condition)                                                      \
   do {                                                                         \
@@ -244,6 +252,7 @@ TEST(save_load_roundtrip) {
   int fd = mkstemp(path);
   ASSERT(fd >= 0);
   close(fd);
+  snprintf(anomaly_temp_path, sizeof(anomaly_temp_path), "%s", path);
 
   sg_anomaly_model_t *source = sg_anomaly_model_new_ex(0.5, -8.0);
   sg_anomaly_model_t *loaded = sg_anomaly_model_new();
@@ -441,6 +450,7 @@ TEST(prune_and_compact_preserve_common_behavior) {
 }
 
 int main(void) {
+  atexit(cleanup_anomaly_temp_file);
   printf("sg_anomaly unit tests\n");
   RUN(lifecycle_and_null_safety);
   RUN(update_count_matrix);

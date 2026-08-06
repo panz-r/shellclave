@@ -10,10 +10,8 @@
  *     -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
  *   cmake --build ../../build-fuzz --target fuzz_shellgate
  *
- * Run:
- *   ../../build-fuzz/fuzz_shellgate -max_total_time=300 \
- *     -artifact_prefix=../../build-fuzz/fuzz-artifacts/shellgate/ \
- *     ../../build-fuzz/fuzz-corpus/shellgate
+ * Run a bounded session (successful discoveries are disposable):
+ *   ./shellgate/fuzz/run_fuzzing_4h.sh 1 300
  */
 
 #include <fuzzer/FuzzedDataProvider.h>

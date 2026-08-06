@@ -1,4 +1,5 @@
 #include "shell_tokenizer.h"
+#include "shell_tokenizer_full.h"
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -157,7 +158,7 @@ void test_layer1_simple_separators(void) {
   extract("cmd1 | cmd2", &result);
   test_count_only("Single pipe count=2", &result, 2);
   test_range_eq("First cmd after pipe", &result, 0, 0, 4, SHELL_TYPE_SIMPLE,
-                SHELL_FEAT_NONE);
+                SHELL_FEAT_PIPELINE);
   test_type("Second cmd type=PIPELINE", &result, 1, SHELL_TYPE_PIPELINE);
 
   // Test: semicolon
@@ -193,9 +194,9 @@ void test_layer1_whitespace_trimming(void) {
   // Test: whitespace around pipe
   extract("  cmd1  |  cmd2  ", &result);
   test_range_eq("First piped command trimmed", &result, 0, 2, 4,
-                SHELL_TYPE_SIMPLE, SHELL_FEAT_NONE);
+                SHELL_TYPE_SIMPLE, SHELL_FEAT_PIPELINE);
   test_range_eq("Second piped command trimmed", &result, 1, 11, 4,
-                SHELL_TYPE_PIPELINE, SHELL_FEAT_NONE);
+                SHELL_TYPE_PIPELINE, SHELL_FEAT_PIPELINE);
 
   // Test: multiple spaces - still single command (whitespace separates args,
   // not subcommands)
@@ -260,9 +261,9 @@ static void test_feature_matrix(void) {
       {"plain filename", "ls file.txt", 1, NO_CHECK, 0, 0, 0, SHELL_FEAT_GLOBS},
       {"heredoc bracket content", "cat << EOF\n[content]\nEOF", 4, NO_CHECK, 0,
        NO_CHECK, 0, 0},
-      {"dollar subshell", "echo $(date)", 1, NO_CHECK, 0, 0,
+      {"dollar subshell", "echo $(date)", 1, 0, SHELL_TYPE_SUBSTITUTION, 0,
        SHELL_FEAT_SUBSHELL, 0},
-      {"backtick subshell", "echo `date`", 1, NO_CHECK, 0, 0,
+      {"backtick subshell", "echo `date`", 1, 0, SHELL_TYPE_SUBSTITUTION, 0,
        SHELL_FEAT_SUBSHELL, 0},
       {"arithmetic", "echo $((1+2))", 1, NO_CHECK, 0, 0, SHELL_FEAT_ARITH, 0},
       {"arithmetic variables", "echo $((x + y))", 1, NO_CHECK, 0, 0,
@@ -280,10 +281,20 @@ static void test_feature_matrix(void) {
        SHELL_FEAT_ARITH, 0},
       {"double-quoted variable", "echo \"$VAR\"", 1, NO_CHECK, 0, 0,
        SHELL_FEAT_VARS, 0},
-      {"single quote inside double substitution", "echo \"'$(id)\"", 1,
-       NO_CHECK, 0, 0, SHELL_FEAT_SUBSHELL, 0},
-      {"first-command process substitution", "cat <(id)", 1, NO_CHECK, 0, 0,
-       SHELL_FEAT_PROCESS_SUB, 0},
+      {"single quote inside double substitution", "echo \"'$(id)\"", 1, 0,
+       SHELL_TYPE_SUBSTITUTION, 0, SHELL_FEAT_SUBSHELL, 0},
+      {"first-command process substitution", "cat <(id)", 1, 0,
+       SHELL_TYPE_SUBSTITUTION, 0, SHELL_FEAT_PROCESS_SUB, 0},
+      {"process substitution after AND", "echo ok && cat <(id)", 2, 1,
+       SHELL_TYPE_AND, 0, SHELL_FEAT_PROCESS_SUB, 0},
+      {"special option variable", "echo $-", 1, NO_CHECK, 0, 0, SHELL_FEAT_VARS,
+       0},
+      {"loop feature", "while true", 1, NO_CHECK, 0, 0, SHELL_FEAT_LOOPS, 0},
+      {"conditional feature", "if true", 1, NO_CHECK, 0, 0,
+       SHELL_FEAT_CONDITIONALS, 0},
+      {"case feature", "case value", 1, NO_CHECK, 0, 0, SHELL_FEAT_CASE, 0},
+      {"file command substitution", "echo $(<file)", 1, NO_CHECK, 0, 0,
+       SHELL_FEAT_SUBSHELL | SHELL_FEAT_SUBSHELL_FILE, 0},
       {"single-quoted variable", "echo '$VAR'", 1, NO_CHECK, 0, 0, 0,
        SHELL_FEAT_VARS},
       {"double-quoted glob", "echo \"*.txt\"", 1, NO_CHECK, 0, 0, 0,
@@ -403,6 +414,20 @@ void test_layer1_error_handling(void) {
        result.status & SHELL_STATUS_TRUNCATED);
   test_count_only("Truncated count=1", &result, 1);
 
+  shell_error_t trunc_error =
+      shell_parse_fast("cmd1 | cmd2", strlen("cmd1 | cmd2"), &limits, &result);
+  test("Truncated pipeline returns SHELL_ETRUNC", trunc_error == SHELL_ETRUNC);
+  test("Truncated pipeline preserves feature metadata",
+       result.cmds[0].features & SHELL_FEAT_PIPELINE);
+
+  trunc_error = shell_parse_fast("echo $(id); pwd", strlen("echo $(id); pwd"),
+                                 &limits, &result);
+  test("Truncated substitution returns SHELL_ETRUNC",
+       trunc_error == SHELL_ETRUNC);
+  test("Truncated substitution preserves type metadata",
+       result.cmds[0].type == SHELL_TYPE_SUBSTITUTION &&
+           (result.cmds[0].features & SHELL_FEAT_SUBSHELL));
+
   // Test: NULL result
   shell_error_t err = shell_parse_fast("cmd", 3, NULL, NULL);
   test("NULL result returns SHELL_EINPUT", err == SHELL_EINPUT);
@@ -414,6 +439,87 @@ void test_layer1_error_handling(void) {
        err == SHELL_EINPUT && result.count == 0 &&
            result.status == SHELL_STATUS_ERROR);
 #endif
+}
+
+void test_adversarial_bytes(void) {
+  static const unsigned char cases[][8] = {
+      {'e', 'c', 'h', 'o', ' ', 0x80, 0, 0},
+      {'e', 'c', 'h', 'o', ' ', '\'', 0xFF, 0},
+      {'$', '(', '(', 'x', 0xFE, ')', ')', 0},
+      {'e', 'c', 'h', 'o', ' ', 0x01, 0, 0},
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    shell_parse_result_t result;
+    size_t length = 0;
+    while (length < sizeof(cases[i]) && cases[i][length] != 0)
+      length++;
+    shell_error_t err =
+        shell_parse_fast((const char *)cases[i], length, NULL, &result);
+    test("adversarial bytes produce a documented parser result",
+         err == SHELL_OK || err == SHELL_EPARSE || err == SHELL_ETRUNC);
+    test("adversarial byte result remains bounded",
+         result.count <= SHELL_MAX_SUBCOMMANDS);
+  }
+}
+
+void test_dialect_oracle(void) {
+  static const struct {
+    const char *input;
+    uint32_t count;
+    uint16_t first_type;
+    uint16_t second_type;
+  } cases[] = {
+      {"ls", 1, SHELL_TYPE_SIMPLE, SHELL_TYPE_SIMPLE},
+      {"ls | wc", 2, SHELL_TYPE_SIMPLE, SHELL_TYPE_PIPELINE},
+      {"ls && pwd", 2, SHELL_TYPE_SIMPLE, SHELL_TYPE_AND},
+      {"ls || pwd", 2, SHELL_TYPE_SIMPLE, SHELL_TYPE_OR},
+      {"echo 'a|b'", 1, SHELL_TYPE_SIMPLE, SHELL_TYPE_SIMPLE},
+      {"echo \"a; b\"", 1, SHELL_TYPE_SIMPLE, SHELL_TYPE_SIMPLE},
+      {"echo $(id)", 1, SHELL_TYPE_SUBSTITUTION, SHELL_TYPE_SIMPLE},
+      {"echo $((1+2))", 1, SHELL_TYPE_SIMPLE, SHELL_TYPE_SIMPLE},
+      {"cmd ;", 1, SHELL_TYPE_SIMPLE, SHELL_TYPE_SIMPLE},
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    shell_parse_result_t fast = {0};
+    shell_error_t error =
+        shell_parse_fast(cases[i].input, strlen(cases[i].input), NULL, &fast);
+    shell_command_t *commands = NULL;
+    size_t command_count = 0;
+    bool full_ok =
+        shell_tokenize_commands(cases[i].input, &commands, &command_count);
+    char name[96];
+    snprintf(name, sizeof(name), "dialect oracle: %s", cases[i].input);
+    test(name, error == SHELL_OK && fast.count == cases[i].count &&
+                   fast.cmds[0].type == cases[i].first_type &&
+                   (cases[i].count < 2 ||
+                    fast.cmds[1].type == cases[i].second_type) &&
+                   full_ok && command_count == cases[i].count);
+    shell_free_commands(commands, command_count);
+  }
+
+  static const char *strict_errors[] = {"echo 'x", "echo \"x", "$(("};
+  for (size_t i = 0; i < sizeof(strict_errors) / sizeof(strict_errors[0]);
+       i++) {
+    shell_limits_t strict = {SHELL_MAX_SUBCOMMANDS, true};
+    shell_parse_result_t result = {0};
+    shell_error_t error = shell_parse_fast(
+        strict_errors[i], strlen(strict_errors[i]), &strict, &result);
+    test("strict dialect rejects incomplete syntax",
+         error == SHELL_EPARSE && result.status == SHELL_STATUS_ERROR);
+  }
+
+  const char non_ascii[] = "echo \xC3\xA9";
+  shell_parse_result_t result = {0};
+  shell_error_t error =
+      shell_parse_fast(non_ascii, sizeof(non_ascii) - 1, NULL, &result);
+  test("fast parser rejects non-ASCII shell text",
+       error == SHELL_EPARSE && result.count == 0);
+  shell_command_t *commands = NULL;
+  size_t command_count = 0;
+  test("full tokenizer rejects non-ASCII shell text",
+       !shell_tokenize_commands(non_ascii, &commands, &command_count) &&
+           commands == NULL && command_count == 0);
+  shell_free_commands(commands, command_count);
 }
 
 void test_layer1_edge_cases(void) {
@@ -459,6 +565,10 @@ void test_layer1_type_values(void) {
   // Verify type values are distinct
   extract("cmd1", &result);
   test("SIMPLE type value", result.cmds[0].type == SHELL_TYPE_SIMPLE);
+
+  extract("echo $(id)", &result);
+  test("SUBSTITUTION type value",
+       result.cmds[0].type == SHELL_TYPE_SUBSTITUTION);
 
   extract("cmd1 | cmd2", &result);
   test("PIPELINE type value", result.cmds[1].type == SHELL_TYPE_PIPELINE);
@@ -1188,7 +1298,8 @@ static uint16_t feature_flags_mask(const shell_feature_flags_t *flags) {
          (flags->has_loops ? SHELL_FEAT_LOOPS : 0) |
          (flags->has_conditionals ? SHELL_FEAT_CONDITIONALS : 0) |
          (flags->has_case ? SHELL_FEAT_CASE : 0) |
-         (flags->has_subshell_file ? SHELL_FEAT_SUBSHELL_FILE : 0);
+         (flags->has_subshell_file ? SHELL_FEAT_SUBSHELL_FILE : 0) |
+         (flags->has_pipeline ? SHELL_FEAT_PIPELINE : 0);
 }
 
 static void test_feature_flags(void) {
@@ -1207,6 +1318,7 @@ static void test_feature_flags(void) {
       SHELL_FEAT_CONDITIONALS,
       SHELL_FEAT_CASE,
       SHELL_FEAT_SUBSHELL_FILE,
+      SHELL_FEAT_PIPELINE,
       SHELL_FEAT_VARS | SHELL_FEAT_GLOBS,
       (uint16_t)((SHELL_FEAT_SUBSHELL_FILE << 1) - 1),
   };
@@ -1235,6 +1347,8 @@ int main(void) {
   test_feature_matrix();
   test_layer1_utility_functions();
   test_layer1_error_handling();
+  test_adversarial_bytes();
+  test_dialect_oracle();
   test_layer1_edge_cases();
   test_layer1_type_values();
 

@@ -1,0 +1,1 @@
+for ((i=0; i<4; i++)); do data=$(printf '%s\\n' "$i" | tr -d '\\n'); [[ "$data" == 2 ]] && continue; printf '%s\\n' "$data"; done 2>&1 | while read item; do echo "item:$item"; done

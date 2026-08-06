@@ -11,6 +11,14 @@
 static int tests_run;
 static int tests_passed;
 static int tests_failed;
+static char learner_temp_path[256];
+
+static void cleanup_learner_temp_file(void) {
+  if (learner_temp_path[0] != '\0') {
+    (void)unlink(learner_temp_path);
+    learner_temp_path[0] = '\0';
+  }
+}
 
 #define ASSERT(condition)                                                      \
   do {                                                                         \
@@ -310,6 +318,7 @@ static int test_serialization_roundtrip_and_validation(void) {
   int fd = mkstemp(path);
   ASSERT(fd >= 0);
   close(fd);
+  snprintf(learner_temp_path, sizeof(learner_temp_path), "%s", path);
 
   st_learner_t *source = st_learner_new(3, 0.0);
   st_learner_t *loaded = st_learner_new(3, 0.0);
@@ -394,6 +403,7 @@ static int test_empty_and_null_apis(void) {
 }
 
 int main(void) {
+  atexit(cleanup_learner_temp_file);
   printf("Running shelltype unit tests...\n\n");
   TEST(test_normalization_matrix);
   TEST(test_learner_state_transitions);

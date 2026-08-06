@@ -95,6 +95,9 @@ typedef enum {
  * Set cwd_buf_size to 0 to use the default SHELL_DEP_CWD_BUF_SIZE (16384).
  * The actual buffer in shell_dep_graph_t is always SHELL_DEP_CWD_BUF_SIZE
  * bytes; cwd_buf_size in limits is the effective bound checked during parsing.
+ * Values from 2 through the buffer maximum are valid. A value of 1 is
+ * rejected because even the NUL-terminated root path cannot fit; 0 selects
+ * the default.
  */
 typedef struct {
   uint32_t max_nodes;

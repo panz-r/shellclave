@@ -1,0 +1,1 @@
+function scan() { local file="$1"; grep -E '^(INFO|WARN|ERROR)' "$file" 2>&1 | tee >(sort > sorted.log) | awk '{print $1}' | while read tag; do echo "tag:$tag"; done; }; scan "${LOGFILE:-app.log}"

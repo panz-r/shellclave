@@ -1,0 +1,1 @@
+result=$(( $(printf '%s' "$BASE" | wc -c) + ${OFFSET:-1} )); test "$result" -gt 0 && printf '%s\\n' "$result" > result.txt || printf '%s\\n' "empty" 2>/dev/null; echo "status:$?"

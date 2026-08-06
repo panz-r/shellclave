@@ -1,0 +1,1 @@
+if [ -f "${CONFIG:-config}" ]; then for f in *.log; do count=$(grep -E 'ERROR|WARN' "$f" 2>/dev/null | wc -l); (( count > 0 )) && echo "$f:$count" || continue; done; else cat <<< "missing" | sed 's/missing/none/'; fi

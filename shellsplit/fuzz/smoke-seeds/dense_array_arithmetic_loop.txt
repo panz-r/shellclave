@@ -1,0 +1,1 @@
+values=($(printf '%s\\n' one two three | sort)); total=$(( ${#values[@]} + ${OFFSET:-0} )); for value in "${values[@]}"; do [[ "$value" == t* ]] && echo "$value:$total" || continue; done

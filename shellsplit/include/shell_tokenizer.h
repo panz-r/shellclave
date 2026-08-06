@@ -44,17 +44,18 @@ typedef enum {
 } shell_status_t;
 
 /**
- * Subcommand type - what separator started this subcommand
+ * Subcommand type - the operator associated with this subcommand
  * (shifted to upper bits to avoid conflict with features)
  */
 typedef enum {
-  SHELL_TYPE_SIMPLE = 0,           // Single command, no separator
-  SHELL_TYPE_PIPELINE = 1 << 8,    // Preceded by |
-  SHELL_TYPE_AND = 1 << 9,         // Preceded by &&
-  SHELL_TYPE_OR = 1 << 10,         // Preceded by ||
-  SHELL_TYPE_SEMICOLON = 1 << 11,  // Preceded by ;
-  SHELL_TYPE_HEREDOC = 1 << 12,    // Starts with << (heredoc)
-  SHELL_TYPE_HERESTRING = 1 << 13, // Starts with <<< (here-string)
+  SHELL_TYPE_SIMPLE = 0,             // Single command, no separator
+  SHELL_TYPE_PIPELINE = 1 << 8,      // Preceded by literal |
+  SHELL_TYPE_AND = 1 << 9,           // Preceded by &&
+  SHELL_TYPE_OR = 1 << 10,           // Preceded by ||
+  SHELL_TYPE_SEMICOLON = 1 << 11,    // Preceded by ;
+  SHELL_TYPE_HEREDOC = 1 << 12,      // Starts with << (heredoc)
+  SHELL_TYPE_HERESTRING = 1 << 13,   // Starts with <<< (here-string)
+  SHELL_TYPE_SUBSTITUTION = 1 << 14, // Command/process substitution operator
 } shell_cmd_type_t;
 
 /**
@@ -73,6 +74,7 @@ typedef enum {
   SHELL_FEAT_CONDITIONALS = 1 << 8,   // if/then/elif/else/fi
   SHELL_FEAT_CASE = 1 << 9,           // case/esac statements
   SHELL_FEAT_SUBSHELL_FILE = 1 << 10, // $(<file) - read from file
+  SHELL_FEAT_PIPELINE = 1 << 11,      // literal | pipeline construct
 } shell_cmd_features_t;
 
 /**
@@ -117,6 +119,7 @@ typedef struct {
   bool has_conditionals;
   bool has_case;
   bool has_subshell_file;
+  bool has_pipeline;
 } shell_feature_flags_t;
 
 /**

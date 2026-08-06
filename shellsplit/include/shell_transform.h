@@ -46,23 +46,42 @@ typedef struct {
   bool has_shell_syntax;           // Has shell syntax
 } transformed_command_t;
 
+typedef enum {
+  SHELL_TRANSFORM_OK = 0,
+  SHELL_TRANSFORM_EINPUT,
+  SHELL_TRANSFORM_EPARSE,
+  SHELL_TRANSFORM_ENOMEM,
+  SHELL_TRANSFORM_EOVERFLOW,
+  SHELL_TRANSFORM_EOUTPUT_LIMIT
+} shell_transform_status_t;
+
+/* Limits apply to each returned string and to the aggregate output of one
+ * call.  A NULL limits pointer means unbounded output.  Sizes exclude the
+ * terminating NUL. */
+typedef struct {
+  size_t max_string_bytes;
+  size_t max_total_bytes;
+} shell_transform_limits_t;
+
 /**
  * Transform shell command to semantic equivalent
  *
  * Converts shell constructs to what they semantically represent
  * On failure, *transformed_cmd is set to NULL when the output pointer is valid.
  */
-bool shell_transform_command(shell_command_t *cmd,
-                             transformed_command_t **transformed_cmd);
+shell_transform_status_t
+shell_transform_command(shell_command_t *cmd,
+                        const shell_transform_limits_t *limits,
+                        transformed_command_t **transformed_cmd);
 
 /**
  * Transform entire command line
  *
  * On failure, writable outputs are reset to NULL and zero.
  */
-bool shell_transform_command_line(const char *command_line,
-                                  transformed_command_t ***transformed_cmds,
-                                  size_t *transformed_count);
+shell_transform_status_t shell_transform_command_line(
+    const char *command_line, const shell_transform_limits_t *limits,
+    transformed_command_t ***transformed_cmds, size_t *transformed_count);
 
 /**
  * Free one transformed command.
