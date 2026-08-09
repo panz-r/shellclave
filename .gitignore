@@ -30,8 +30,6 @@ coverage/
 htmlcov/
 core
 core.*
-crash-*
-leak-*
 
 # Fuzzer-generated input corpora
 /shellgate/fuzz/corpus/

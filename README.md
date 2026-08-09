@@ -149,8 +149,10 @@ cmake -S . -B build-analyze
 cmake --build build-analyze --target clang-analyze
 ```
 
-A fresh clone starts with no corpus entries; fuzzer discoveries, coverage
-reports, and crash logs are gitignored.
+The fixed smoke seed corpora are tracked. Generated fuzzing corpora and
+coverage reports stay in build directories and are ignored. Crash artifacts
+are deliberately neither ignored nor tracked: a new crash appears in
+`git status` for inspection and triage.
 
 ## Dependencies
 
@@ -159,5 +161,4 @@ download dependencies. Parent projects may provide existing `draugr`,
 `xxhash`, or `xxHash::xxhash` targets before adding Shellclave. Revisions and
 licenses are recorded in [THIRD_PARTY.md](THIRD_PARTY.md).
 
-Contributions are described in [CONTRIBUTING.md](CONTRIBUTING.md). Releases and
-notable changes are tracked in [CHANGELOG.md](CHANGELOG.md).
+Contributions are described in [CONTRIBUTING.md](CONTRIBUTING.md).

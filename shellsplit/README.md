@@ -1,10 +1,14 @@
 # ShellSplit
 
-A fast shell command tokenizer that extracts clean commands for DFA validation. Supports pipeline splitting, redirection, variables, and shell features.
+A fast shell command tokenizer and bounded parser for shell command lines.
+It preserves source ranges, identifies shell features, and provides richer
+allocating tokenization, abstraction, transformation, and dependency-graph
+APIs.
 
 ## Overview
 
-ShellSplit parses shell commands and extracts individual commands for validation by the c-dfa pattern matching engine.
+ShellSplit parses shell commands and extracts individual command stages for
+callers that perform their own policy or pattern evaluation.
 
 ```
 Input: "cat file.txt | grep pattern | sort | uniq"
@@ -34,12 +38,24 @@ ctest --test-dir build --output-on-failure
 | Pipelines | `cmd1 \| cmd2 \| cmd3` | ✅ |
 | Redirection | `> file`, `< input`, `>> append` | ✅ |
 | Command Substitution | `$(cmd)`, `` `cmd` `` | ✅ |
+| Arithmetic Expansion | `$((expr))` | ✅ |
+| Process Substitution | `<(cmd)`, `>(cmd)` | ✅ |
+| Here Documents | `<<EOF`, `<<-EOF` | ✅ |
+| Here Strings | `<<< word` | ✅ |
+| Composition | `;`, `&&`, `||`, and pipelines | ✅ |
+| Control Features | loops, conditionals, and `case` | ✅ |
+
+The fast parser is zero-copy and bounded rather than a complete POSIX shell
+grammar. It reports parse errors and output truncation through return codes;
+callers must handle those results explicitly.
 
 ## Usage
 
 ```c
-#include "shell_tokenizer.h"
-#include "shell_processor.h"
+#include "shell_tokenizer_full.h"
+#include <stdio.h>
+
+const char input[] = "cat file | grep pattern";
 
 // Tokenize a shell command
 shell_command_t* commands;
@@ -54,24 +70,6 @@ if (shell_tokenize_commands("cat file | grep pattern", &commands, &command_count
     shell_free_commands(commands, command_count);
 }
 ```
-
-## Integration with c-dfa
-
-ShellSplit is designed to work with c-dfa:
-
-1. **ShellSplit** - Tokenizes shell commands, extracts clean commands
-2. **c-dfa** - Validates extracted commands against patterns
-
-```
-Shell Command → ShellSplit → Clean Commands → c-dfa Validation
-```
-
-## Documentation
-
-See `docs/` for detailed documentation:
-- `SHELL_SUPPORT_SUMMARY.md` - Feature summary
-- `SHELL_SYNTAX_ANALYSIS.md` - Performance analysis
-- `SUBSHELL_ANALYSIS.md` - Subshell handling
 
 ## File Structure
 

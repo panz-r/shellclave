@@ -14,9 +14,6 @@ tools/env_screener_demo
 # Fuzzing
 fuzz/tokenizer_fuzzer
 fuzz/tokenizer_fuzzer_asan
-fuzz/crash-*
-fuzz/oom-*
-fuzz/leak-*
 fuzz/*.log
 fuzz/logs/
 fuzz/fuzzer_dict.txt
