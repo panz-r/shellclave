@@ -18,9 +18,7 @@
 extern "C" {
 #endif
 
-/* ============================================================
- * TYPES
- * ============================================================ */
+/* --- TYPES --- */
 
 /* Opaque anomaly model.  All memory is owned and freed on destroy. */
 typedef struct sg_anomaly_model sg_anomaly_model_t;
@@ -30,9 +28,7 @@ typedef struct sg_anomaly_model sg_anomaly_model_t;
  * serialized n-gram key limit. */
 #define SG_ANOMALY_MAX_COMMAND_LENGTH 1023
 
-/* ============================================================
- * ERROR STATE
- * ============================================================ */
+/* --- ERROR STATE --- */
 
 /*
  * Returns true if the model encountered an allocation failure
@@ -46,9 +42,7 @@ bool sg_anomaly_model_had_error(const sg_anomaly_model_t *model);
  */
 void sg_anomaly_model_clear_error(sg_anomaly_model_t *model);
 
-/* ============================================================
- * LIFECYCLE
- * ============================================================ */
+/* --- LIFECYCLE --- */
 
 /* Create a new model with default hyperparameters.
  * Returns NULL on allocation failure. */
@@ -65,9 +59,7 @@ sg_anomaly_model_t *sg_anomaly_model_new_ex(double alpha, double unk_prior);
 /* Free all memory associated with the model. */
 void sg_anomaly_model_free(sg_anomaly_model_t *model);
 
-/* ============================================================
- * SCORING
- * ============================================================ */
+/* --- SCORING --- */
 
 /*
  * Score a command sequence.
@@ -89,9 +81,7 @@ void sg_anomaly_model_free(sg_anomaly_model_t *model);
 double sg_anomaly_score(const sg_anomaly_model_t *model, const char **seq,
                         size_t len);
 
-/* ============================================================
- * UPDATE (LEARNING)
- * ============================================================ */
+/* --- UPDATE (LEARNING) --- */
 
 /*
  * Update the model with a command sequence.
@@ -108,9 +98,7 @@ double sg_anomaly_score(const sg_anomaly_model_t *model, const char **seq,
  */
 void sg_anomaly_update(sg_anomaly_model_t *model, const char **seq, size_t len);
 
-/* ============================================================
- * SERIALISATION
- * ============================================================ */
+/* --- SERIALISATION --- */
 
 /*
  * Save the model to a versioned binary file.
@@ -127,9 +115,7 @@ int sg_anomaly_save(const sg_anomaly_model_t *model, const char *path);
  */
 int sg_anomaly_load(sg_anomaly_model_t *model, const char *path);
 
-/* ============================================================
- * ACCESSORS
- * ============================================================ */
+/* --- ACCESSORS --- */
 
 /* Total number of unique commands observed (unigram vocabulary). */
 size_t sg_anomaly_vocab_size(const sg_anomaly_model_t *model);

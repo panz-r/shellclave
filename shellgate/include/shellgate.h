@@ -21,9 +21,7 @@
 extern "C" {
 #endif
 
-/* ============================================================
- * CONSTANTS
- * ============================================================ */
+/* --- CONSTANTS --- */
 
 #define SG_MAX_SUBCMD_RESULTS 64
 
@@ -60,16 +58,7 @@ SG_STATIC_ASSERT((SG_REJECT_MASK_DEFAULT & (1u << 9)) != 0,
 /* Suggested output-buffer capacity. */
 #define SG_BUF_MIN 8192
 
-/* ============================================================
- * VIOLATION FLAGS
- * ============================================================
- *
- * Category and type masks are independent. Type bits are globally unique;
- * callers can test exact membership without category-bit collisions.
- *
- * Caller decides what action to take based on these flags. These are advisory
- * lexical observations, not filesystem containment or enforcement actions.
- */
+/* --- VIOLATION FLAGS --- */
 
 #define SG_VIOL_CAT_FILESYSTEM (1u << 16)
 #define SG_VIOL_CAT_PRIVILEGE (1u << 17)
@@ -109,9 +98,7 @@ SG_STATIC_ASSERT((SG_REJECT_MASK_DEFAULT & (1u << 9)) != 0,
 #define SG_SEVERITY_HIGH 85
 #define SG_SEVERITY_CRITICAL 95
 
-/* ============================================================
- * TYPES
- * ============================================================ */
+/* --- TYPES --- */
 
 typedef enum {
   SG_OK = 0,
@@ -227,9 +214,7 @@ typedef struct {
 
 typedef struct sg_gate sg_gate_t;
 
-/* ============================================================
- * VIOLATION CONFIGURATION
- * ============================================================ */
+/* --- VIOLATION CONFIGURATION --- */
 
 #define SG_VIOL_MAX_PATHS 32
 #define SG_VIOL_MAX_NAMES 16
@@ -298,9 +283,7 @@ typedef struct {
 
 void sg_violation_config_default(sg_violation_config_t *cfg);
 
-/* ============================================================
- * EXPANSION CALLBACKS
- * ============================================================ */
+/* --- EXPANSION CALLBACKS --- */
 
 /*
  * Variable expansion callback.  Write the expanded value of `name`
@@ -323,16 +306,12 @@ typedef size_t (*sg_expand_var_fn)(const char *name, char *buf, size_t buf_size,
 typedef size_t (*sg_expand_glob_fn)(const char *pattern, char *buf,
                                     size_t buf_size, void *user_ctx);
 
-/* ============================================================
- * LIFECYCLE
- * ============================================================ */
+/* --- LIFECYCLE --- */
 
 sg_gate_t *sg_gate_new(void);
 void sg_gate_free(sg_gate_t *gate);
 
-/* ============================================================
- * ANOMALY DETECTION CONFIGURATION
- * ============================================================ */
+/* --- ANOMALY DETECTION CONFIGURATION --- */
 
 /*
  * Enable statistical anomaly detection on the gate.
@@ -475,9 +454,7 @@ bool sg_gate_anomaly_had_error(const sg_gate_t *gate);
  */
 size_t sg_gate_anomaly_vocab_size(const sg_gate_t *gate);
 
-/* ============================================================
- * CONFIGURATION
- * ============================================================ */
+/* --- CONFIGURATION --- */
 
 /*
  * Strict mode (enabled by default):
@@ -511,9 +488,7 @@ sg_error_t sg_gate_set_expand_glob(sg_gate_t *gate, sg_expand_glob_fn fn,
 sg_error_t sg_gate_set_violation_config(sg_gate_t *gate,
                                         const sg_violation_config_t *config);
 
-/* ============================================================
- * POLICY MANAGEMENT
- * ============================================================ */
+/* --- POLICY MANAGEMENT --- */
 
 sg_error_t sg_gate_load_policy(sg_gate_t *gate, const char *path);
 sg_error_t sg_gate_save_policy(const sg_gate_t *gate, const char *path);
@@ -524,9 +499,7 @@ sg_error_t sg_gate_add_deny_rule(sg_gate_t *gate, const char *pattern);
 sg_error_t sg_gate_remove_deny_rule(sg_gate_t *gate, const char *pattern);
 uint32_t sg_gate_deny_rule_count(const sg_gate_t *gate);
 
-/* ============================================================
- * EVALUATION
- * ============================================================ */
+/* --- EVALUATION --- */
 
 /*
  * Evaluate a raw command string against the loaded policy.
@@ -541,8 +514,8 @@ uint32_t sg_gate_deny_rule_count(const sg_gate_t *gate);
  *   valid while reading `sg_result_t` string fields.
  *
  * A result with `SG_VERDICT_ALLOW_CONDITIONAL` contains a substitution
- * dependency. `sg` does not assume Bash or any other executor; the caller
- * decides whether its execution mode can honor that dependency.
+ * dependency. This API does not assume Bash or any specific executor; the
+ * caller decides whether its execution mode can honor that dependency.
  *
  * Returns SG_OK on success, SG_ERR_PARSE for malformed input, SG_ERR_TRUNC if
  * the output buffer or bounded
@@ -562,9 +535,7 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len, char *buf,
  */
 size_t sg_eval_size_hint(size_t cmd_len);
 
-/* ============================================================
- * SUGGESTION TOKEN VARIANTS (for TUI edit mode)
- * ============================================================ */
+/* --- SUGGESTION TOKEN VARIANTS (for TUI edit mode) --- */
 
 /**
  * Given a suggestion pattern and a token position, return the observed
@@ -587,9 +558,7 @@ size_t sg_gate_suggestion_token_variants_at(sg_gate_t *gate,
                                             st_token_variant_t *out_variants,
                                             size_t max_variants);
 
-/* ============================================================
- * RESULT HELPERS
- * ============================================================ */
+/* --- RESULT HELPERS --- */
 
 const char *sg_verdict_name(sg_verdict_t v);
 uint32_t sg_result_violation_dropped(const sg_result_t *result);

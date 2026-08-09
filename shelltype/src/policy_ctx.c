@@ -24,9 +24,7 @@
 #define DEFAULT_ARENA_SIZE (256 * 1024) /* 256 KB default */
 #define STR_POOL_INIT_CAP 1024
 
-/* ============================================================
- * STRING POOL
- * ============================================================ */
+/* --- STRING POOL --- */
 
 typedef struct {
   const char **slots;
@@ -121,9 +119,7 @@ static bool str_pool_grow(str_pool_t *p) {
   return true;
 }
 
-/* ============================================================
- * CONTEXT LIFECYCLE
- * ============================================================ */
+/* --- CONTEXT LIFECYCLE --- */
 
 struct st_policy_ctx {
   str_pool_t str_pool;

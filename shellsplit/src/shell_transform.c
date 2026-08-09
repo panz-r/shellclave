@@ -120,7 +120,7 @@ shell_transform_command(shell_command_t *cmd,
   tcmd->has_transformations = false;
   tcmd->has_shell_syntax = false;
 
-  // Check if command has tokens - if not, we can't transform it
+  // Validate tokenized input exists before constructing transformed output.
   if (cmd->token_count == 0 || cmd->tokens == NULL) {
     free(tcmd);
     return SHELL_TRANSFORM_EINPUT;

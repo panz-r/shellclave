@@ -51,9 +51,7 @@ static bool verbose = false;
     }                                                                          \
   } while (0)
 
-/* ============================================================
- * HELPERS
- * ============================================================ */
+/* --- HELPERS --- */
 
 static uint32_t count_type(const shell_dep_graph_t *g,
                            shell_dep_node_type_t type) {
@@ -107,9 +105,7 @@ static const char *get_cwd_str(const shell_dep_graph_t *g,
   return g->cwd_buf.data + cwd_offset;
 }
 
-/* ============================================================
- * BASIC COMMANDS
- * ============================================================ */
+/* --- BASIC COMMANDS --- */
 
 TEST(basic_command_matrix) {
   static const struct {
@@ -153,9 +149,7 @@ TEST(token_zero_copy) {
   pass_count++;
 }
 
-/* ============================================================
- * OPERATORS
- * ============================================================ */
+/* --- OPERATORS --- */
 
 TEST(operator_matrix) {
   static const struct {
@@ -197,9 +191,7 @@ TEST(operator_matrix) {
   pass_count++;
 }
 
-/* ============================================================
- * REDIRECTS
- * ============================================================ */
+/* --- REDIRECTS --- */
 
 TEST(redirect_matrix) {
   static const struct {
@@ -260,9 +252,7 @@ TEST(redirect_matrix) {
   pass_count++;
 }
 
-/* ============================================================
- * CWD TRACKING
- * ============================================================ */
+/* --- CWD TRACKING --- */
 
 TEST(cwd_matrix) {
   static const struct {
@@ -297,9 +287,7 @@ TEST(cwd_matrix) {
   pass_count++;
 }
 
-/* ============================================================
- * ENVIRONMENT VARIABLES
- * ============================================================ */
+/* --- ENVIRONMENT VARIABLES --- */
 
 TEST(environment_matrix) {
   static const struct {
@@ -362,9 +350,7 @@ TEST(environment_matrix) {
   pass_count++;
 }
 
-/* ============================================================
- * FILE ARGUMENTS
- * ============================================================ */
+/* --- FILE ARGUMENTS --- */
 
 TEST(file_argument_matrix) {
   static const struct {
@@ -404,9 +390,7 @@ TEST(file_argument_matrix) {
   pass_count++;
 }
 
-/* ============================================================
- * SUBSHELLS
- * ============================================================ */
+/* --- SUBSHELLS --- */
 
 TEST(subshell_matrix) {
   static const struct {
@@ -446,9 +430,7 @@ TEST(subshell_matrix) {
   pass_count++;
 }
 
-/* ============================================================
- * HEREDOCS AND HERESTRINGS
- * ============================================================ */
+/* --- HEREDOCS AND HERESTRINGS --- */
 
 TEST(inline_document_matrix) {
   static const struct {
@@ -509,9 +491,7 @@ TEST(inline_document_matrix) {
   pass_count++;
 }
 
-/* ============================================================
- * ERROR HANDLING
- * ============================================================ */
+/* --- ERROR HANDLING --- */
 
 TEST(null_input) {
   shell_dep_graph_t g;
@@ -647,9 +627,7 @@ TEST(limit_matrix) {
   pass_count++;
 }
 
-/* ============================================================
- * GRAPH INTEGRITY
- * ============================================================ */
+/* --- GRAPH INTEGRITY --- */
 
 TEST(validation_matrix) {
   static const char *valid_commands[] = {
@@ -707,9 +685,7 @@ TEST(validation_matrix) {
   pass_count++;
 }
 
-/* ============================================================
- * COMPLEX COMMANDS
- * ============================================================ */
+/* --- COMPLEX COMMANDS --- */
 
 TEST(graph_dump_contract) {
   FILE *output = tmpfile();
@@ -771,9 +747,7 @@ TEST(name_helpers) {
   pass_count++;
 }
 
-/* ============================================================
- * MAIN
- * ============================================================ */
+/* --- MAIN --- */
 
 int main(int argc, char **argv) {
   if (argc > 1 && strcmp(argv[1], "-v") == 0)

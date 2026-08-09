@@ -10,9 +10,7 @@
 #include <string.h>
 #include <unistd.h>
 
-/* ============================================================
- * Internal Helpers
- * ============================================================ */
+/* --- Internal Helpers --- */
 
 static const char *ABSTRACT_TYPE_NAMES[] = {"EV", "PV", "SV", "AP",  "RP", "HP",
                                             "GB", "CS", "AR", "STR", "RD"};
@@ -22,9 +20,7 @@ static const char *PATH_CATEGORY_NAMES[] = {
     "PROC",    "SYS",  "DEV", "OPT",   "SRV",      "RUN",
     "SYSROOT", "BOOT", "MNT", "MEDIA", "SNAPSHOT", "OTHER"};
 
-/* ============================================================
- * Token Classification Helpers
- * ============================================================ */
+/* --- Token Classification Helpers --- */
 
 /**
  * Check if string is a special variable ($?, $$, $#, etc.)
@@ -130,9 +126,6 @@ static bool is_absolute_path(const char *s, size_t len) {
 
 /**
  * Check if string is a relative path
- */
-/**
- * Check if string is a relative path (using length)
  */
 static bool is_relative_path(const char *s, size_t len) {
   if (len == 0)
@@ -275,9 +268,7 @@ token_type_t shell_classify_raw_token(const char *text, size_t len) {
   return TOKEN_ARGUMENT;
 }
 
-/* ============================================================
- * Abstraction Helpers
- * ============================================================ */
+/* --- ABSTRACTION HELPERS --- */
 
 /**
  * Create abstraction string for a type and index
@@ -387,9 +378,7 @@ static abstract_type_t get_abstract_type(token_type_t tok_type,
   return -1; // Not abstractable
 }
 
-/* ============================================================
- * Build Abstracted Command
- * ============================================================ */
+/* --- BUILD ABSTRACTED COMMAND --- */
 
 /**
  * Build the abstracted command string from sorted elements
@@ -405,7 +394,8 @@ static char *build_abstracted_command(const char *original,
     return strdup(original);
   }
 
-  // Calculate output size
+  // Compute required output size, including abstracted segments and untouched
+  // spans.
   size_t output_size = 1; // null terminator
   for (size_t i = 0; i < element_count; i++) {
     size_t length = strlen(elements[i]->abstraction);
@@ -436,7 +426,7 @@ static char *build_abstracted_command(const char *original,
   if (!result)
     return NULL;
 
-  // Build result
+  // Construct transformed output by merging original text and abstractions.
   size_t dst = 0;
   size_t src = 0;
 
@@ -497,9 +487,7 @@ static void free_abstract_element(abstract_element_t *elem) {
   free(elem);
 }
 
-/* ============================================================
- * Main Abstraction Function
- * ============================================================ */
+/* --- MAIN ABSTRACTION FUNCTION --- */
 
 bool shell_abstract_command(const char *command,
                             abstracted_command_t **result) {
@@ -523,7 +511,7 @@ bool shell_abstract_command(const char *command,
     return false;
   }
 
-  // Allocate result
+  // Allocate output structure for the transformed command result.
   abstracted_command_t *abst = calloc(1, sizeof(abstracted_command_t));
   if (!abst) {
     shell_free_commands(cmds, cmd_count);
@@ -840,9 +828,7 @@ bool shell_abstract_command(const char *command,
   return true;
 }
 
-/* ============================================================
- * Query Functions
- * ============================================================ */
+/* --- QUERY FUNCTIONS --- */
 
 const char *shell_get_abstracted(abstracted_command_t *cmd) {
   return cmd ? cmd->abstracted : NULL;
@@ -930,9 +916,7 @@ abstract_element_t *shell_get_element_by_abstract(abstracted_command_t *cmd,
   return NULL;
 }
 
-/* ============================================================
- * Runtime Expansion
- * ============================================================ */
+/* --- RUNTIME EXPANSION --- */
 
 static char *finish_expanded_path(char *path, runtime_context_t *ctx) {
   if (!path || !ctx->resolve_symlinks)
@@ -1045,9 +1029,7 @@ bool shell_expand_all_elements(abstracted_command_t *cmd,
   return true;
 }
 
-/* ============================================================
- * Utility Functions
- * ============================================================ */
+/* --- UTILITY FUNCTIONS --- */
 
 path_category_t shell_get_path_category(const char *resolved_path) {
   if (!resolved_path || resolved_path[0] != '/') {
@@ -1118,9 +1100,7 @@ const char *shell_path_category_name(path_category_t cat) {
   return "UNKNOWN";
 }
 
-/* ============================================================
- * Cleanup
- * ============================================================ */
+/* --- CLEANUP --- */
 
 void shell_abstracted_destroy(abstracted_command_t *cmd) {
   if (!cmd)
@@ -1140,13 +1120,7 @@ void shell_abstracted_destroy(abstracted_command_t *cmd) {
   free(cmd);
 }
 
-/* ============================================================
- * Lightweight Type Sequence Generation
- *
- * Builds a compact type sequence without creating a full
- * abstracted_command_t. Uses the same classification logic
- * but skips element creation and data extraction.
- * ============================================================ */
+/* --- LIGHTWEIGHT TYPE SEQUENCE GENERATION --- */
 
 char *shell_build_type_sequence(const char *command) {
   if (!command || command[0] == '\0')

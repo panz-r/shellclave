@@ -27,9 +27,7 @@ static bool trie_type_supports_param(st_token_type_t t) {
          t == ST_TYPE_USER || t == ST_TYPE_FINGERPRINT;
 }
 
-/* ============================================================
- * STRING BUFFER — reusable scratch for suggestion building
- * ============================================================ */
+/* --- STRING BUFFER --- */
 
 typedef struct {
   char *buf;
@@ -74,9 +72,7 @@ static void st_strbuf_free(st_strbuf_t *sb) {
   sb->len = sb->cap = 0;
 }
 
-/* ============================================================
- * NODE HELPERS
- * ============================================================ */
+/* --- NODE HELPERS --- */
 
 static st_node_t *node_new(const char *token, st_token_type_t type) {
   st_node_t *node = calloc(1, sizeof(st_node_t));
@@ -147,9 +143,7 @@ static st_node_t *node_find_child(st_node_t *node, const char *token,
   return NULL;
 }
 
-/* ============================================================
- * TRIE INSERTION
- * ============================================================ */
+/* --- TRIE INSERTION --- */
 
 static bool trie_insert_with_count(st_node_t *root, st_token_t *tokens,
                                    size_t count, uint32_t increment) {
@@ -195,9 +189,7 @@ static bool trie_insert(st_node_t *root, st_token_t *tokens, size_t count) {
   return trie_insert_with_count(root, tokens, count, 1);
 }
 
-/* ============================================================
- * PUBLIC API – LIFECYCLE
- * ============================================================ */
+/* --- PUBLIC API – LIFECYCLE --- */
 
 st_learner_t *st_learner_new(uint32_t min_support, double min_confidence) {
   st_learner_t *learner = calloc(1, sizeof(st_learner_t));
@@ -232,9 +224,7 @@ void st_learner_free(st_learner_t *learner) {
   free(learner);
 }
 
-/* ============================================================
- * PUBLIC API – FEED
- * ============================================================ */
+/* --- PUBLIC API – FEED --- */
 
 st_error_t st_feed(st_learner_t *learner, const char *raw_cmd) {
   if (!learner || !raw_cmd || !raw_cmd[0])
@@ -273,9 +263,7 @@ st_error_t st_feed_parsed(st_learner_t *learner, const char *raw_cmd,
   return ST_OK;
 }
 
-/* ============================================================
- * PUBLIC API – SUGGESTIONS
- * ============================================================ */
+/* --- PUBLIC API – SUGGESTIONS --- */
 
 typedef struct {
   char *pattern;
@@ -588,9 +576,7 @@ void st_free_suggestions(st_suggestion_t *suggestions, size_t count) {
   free(suggestions);
 }
 
-/* ============================================================
- * PUBLIC API – BLACKLIST
- * ============================================================ */
+/* --- PUBLIC API – BLACKLIST --- */
 
 static bool blacklist_ensure(st_learner_t *learner) {
   if (learner->blacklist_capacity > learner->blacklist_count)
@@ -629,9 +615,7 @@ bool st_is_blacklisted(const st_learner_t *learner, const char *pattern) {
   return false;
 }
 
-/* ============================================================
- * PUBLIC API – SERIALISATION
- * ============================================================ */
+/* --- PUBLIC API – SERIALISATION --- */
 
 typedef struct {
   FILE *fp;

@@ -16,7 +16,9 @@ extern "C" {
 
 typedef struct shell_interop_handle shell_interop_handle_t;
 
-/* Create/destroy handle */
+/* Create/destroy an interop parsing handle. Creation allocates parser state;
+ * destroy releases it once parsing and result access are complete.
+ */
 shell_interop_handle_t *shell_interop_create(void);
 void shell_interop_destroy(shell_interop_handle_t *handle);
 
@@ -56,22 +58,26 @@ void shell_interop_destroy(shell_interop_handle_t *handle);
 int shell_interop_parse(shell_interop_handle_t *handle, const char *cmd,
                         int cmd_len);
 
-/* Get the number of subcommands from last parse */
+/* Return the number of subcommands from the most recent successful parse. */
 int shell_interop_subcommand_count(shell_interop_handle_t *handle);
 
-/* Get type of subcommand i (0-indexed) */
+/* Return the command-subtype for subcommand index i (SHELL_TYPE_* flags), or 0
+ * on invalid input. */
 int shell_interop_subcommand_type(shell_interop_handle_t *handle, int i);
 
-/* Get features of subcommand i */
+/* Return the feature bitmask describing shell features in subcommand index i,
+ * or 0 on invalid input. */
 int shell_interop_subcommand_features(shell_interop_handle_t *handle, int i);
 
-/* Get start position of subcommand i in original string */
+/* Return byte offset where subcommand i starts in the original command string.
+ */
 int shell_interop_subcommand_start(shell_interop_handle_t *handle, int i);
 
-/* Get length of subcommand i */
+/* Return the byte length of subcommand i in the original command string. */
 int shell_interop_subcommand_len(shell_interop_handle_t *handle, int i);
 
-/* Get the subcommand string (caller must free via shell_interop_free_str) */
+/* Return heap-allocated copy of subcommand i text.
+   Caller must free the result with shell_interop_free_str(). */
 char *shell_interop_subcommand_str(shell_interop_handle_t *handle, int i);
 
 /* Free a string returned by shell_interop_*_str functions */

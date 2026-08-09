@@ -118,9 +118,7 @@ static const char *gen_random_arithmetic(shell_ast_generator_t *gen) {
   return ARITHMETIC_EXPRS[random_range(gen, NUM_ARITHMETIC)];
 }
 
-// ============================================================
-// Phase 1: Generator functions for each AST type
-// ============================================================
+/* --- PHASE 1: GENERATOR FUNCTIONS FOR EACH AST TYPE --- */
 
 static ast_node_t *gen_command(shell_ast_generator_t *gen, shell_ast_t *ast) {
   return shell_ast_add_command(ast, gen_random_command(gen));
@@ -249,9 +247,7 @@ static ast_node_t *gen_sequence(shell_ast_generator_t *gen, shell_ast_t *ast) {
   return shell_ast_add_sequence(ast, cmd1, cmd2, sep);
 }
 
-// ============================================================
-// Phase 2: Complex combinations
-// ============================================================
+/* --- PHASE 2: COMPLEX COMBINATIONS --- */
 
 // cmd $VAR *.txt > file - variable + glob + redirect
 static void gen_complex_var_glob_redirect(shell_ast_generator_t *gen,
@@ -316,9 +312,7 @@ static void gen_glob_in_loop(shell_ast_generator_t *gen, shell_ast_t *ast) {
   ast->has_glob = true;
 }
 
-// ============================================================
-// Phase 3: Invalid cases - more comprehensive
-// ============================================================
+/* --- PHASE 3: INVALID CASES - MORE COMPREHENSIVE --- */
 
 // Unclosed heredoc without closing delimiter
 static void gen_unclosed_heredoc(shell_ast_generator_t *gen, shell_ast_t *ast) {
@@ -474,9 +468,7 @@ static void gen_incomplete_loop(shell_ast_generator_t *gen, shell_ast_t *ast) {
   }
 }
 
-// ============================================================
-// Main generator functions
-// ============================================================
+/* --- MAIN GENERATOR FUNCTIONS --- */
 
 static void gen_valid_shell(shell_ast_generator_t *gen, shell_ast_t *ast) {
   int type = random_range(gen, 100);

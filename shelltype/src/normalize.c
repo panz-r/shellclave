@@ -23,9 +23,7 @@
 #include <string.h>
 #include <strings.h>
 
-/* ============================================================
- * TYPE SYMBOLS
- * ============================================================ */
+/* --- TYPE SYMBOLS --- */
 
 const char *st_type_symbol[ST_TYPE_COUNT] = {
     [ST_TYPE_LITERAL] = "",
@@ -75,8 +73,7 @@ const char *st_type_symbol[ST_TYPE_COUNT] = {
     [ST_TYPE_ANY] = "*",
 };
 
-/* ============================================================
- * JOIN TABLE
+/* --- JOIN TABLE ---
  *
  * st_type_join[a][b] = narrowest type covering both a and b.
  *
@@ -94,7 +91,7 @@ const char *st_type_symbol[ST_TYPE_COUNT] = {
  *   #port ⊂ #n, #port ⊂ #i, #port ⊂ #val ⊂ *
  *   #hash, #hyp, #method ⊂ #w ⊂ #val ⊂ *
  *   #mac, #cron, #duration, #branch, #image, #pkg, #user, #fp ⊂ #val ⊂ *
- * ============================================================ */
+ */
 
 const st_token_type_t st_type_join[ST_TYPE_COUNT][ST_TYPE_COUNT] = {
     /*                LIT   HEX   NUM   IPV4  IPV6  IPAD  WORD  QOT   QS    FILE
@@ -637,14 +634,13 @@ const st_token_type_t st_type_join[ST_TYPE_COUNT][ST_TYPE_COUNT] = {
      ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY, ST_TYPE_ANY},
 };
 
-/* ============================================================
- * COMPATIBILITY TABLE
+/* --- COMPATIBILITY TABLE ---
  *
  * st_type_compatible[cmd_type][policy_type] = true iff cmd_type ≤ policy_type.
  * A command token of cmd_type matches a policy node of policy_type.
  *
  * Derived from the same lattice via transitive closure.
- * ============================================================ */
+ */
 
 const bool st_type_compatible[ST_TYPE_COUNT][ST_TYPE_COUNT] = {
     /* ST_TYPE_LITERAL matches: LITERAL, HEXHASH, NUMBER, IPV4, IPV6, IPADDR,
@@ -923,9 +919,7 @@ const bool st_type_compatible[ST_TYPE_COUNT][ST_TYPE_COUNT] = {
      false, false, false, false, false, false, false, false, true},
 };
 
-/* ============================================================
- * CLASSIFICATION HELPERS
- * ============================================================ */
+/* --- CLASSIFICATION HELPERS --- */
 
 static bool is_decimal_number(const char *token) {
   if (!token[0])
@@ -1962,9 +1956,7 @@ static bool is_fingerprint(const char *token) {
   return true;
 }
 
-/* ============================================================
- * REGEX DETECTION HELPERS (context-aware)
- * ============================================================ */
+/* --- REGEX DETECTION HELPERS (context-aware) --- */
 
 static bool is_regex_context(const char *prev) {
   static const char *cmds[] = {"sed",   "awk", "perl", "grep", "egrep",
@@ -1993,9 +1985,7 @@ static bool has_regex_metachar(const char *token) {
   return false;
 }
 
-/* ============================================================
- * GLOB, RANGE, SIGNAL, USER_GROUP, PERM_OCTAL DETECTION
- * ============================================================ */
+/* --- GLOB, RANGE, SIGNAL, USER_GROUP, PERM_OCTAL DETECTION --- */
 
 static bool is_glob_pattern(const char *token) {
   /* Must contain at least one of * ? [ and no shell operators.
@@ -2224,9 +2214,7 @@ static bool is_perm_octal(const char *token) {
   return true;
 }
 
-/* ============================================================
- * PUBLIC: CLASSIFY
- * ============================================================ */
+/* --- PUBLIC: CLASSIFY --- */
 
 st_token_type_t st_classify_token(const char *token) {
   if (!token || !token[0])
@@ -2389,9 +2377,7 @@ st_token_type_t st_classify_token(const char *token) {
   return ST_TYPE_LITERAL;
 }
 
-/* ============================================================
- * PUBLIC: PATTERN TOKEN CLASSIFICATION
- * ============================================================ */
+/* --- PUBLIC: PATTERN TOKEN CLASSIFICATION --- */
 
 st_token_type_t st_type_from_pattern_token(const char *token) {
   if (!token)
@@ -2407,9 +2393,7 @@ st_token_type_t st_type_from_pattern_token(const char *token) {
   return ST_TYPE_LITERAL;
 }
 
-/* ============================================================
- * TOKENISATION
- * ============================================================ */
+/* --- TOKENISATION --- */
 
 static char **tokenize_command(const char *raw_cmd, size_t *out_count) {
   size_t len = strlen(raw_cmd);
@@ -2540,9 +2524,7 @@ fail:
   return NULL;
 }
 
-/* ============================================================
- * PUBLIC API: TYPED NORMALISATION
- * ============================================================ */
+/* --- PUBLIC API: TYPED NORMALISATION --- */
 
 st_error_t st_normalize_typed(const char *raw_cmd, st_token_array_t *out) {
   if (!raw_cmd || !out)
@@ -2902,9 +2884,7 @@ void st_free_token_array(st_token_array_t *arr) {
   arr->count = 0;
 }
 
-/* ============================================================
- * PUBLIC API: LEGACY STRING NORMALISATION
- * ============================================================ */
+/* --- PUBLIC API: LEGACY STRING NORMALISATION --- */
 
 st_error_t st_normalize(const char *raw_cmd, char ***out_tokens,
                         size_t *out_token_count) {

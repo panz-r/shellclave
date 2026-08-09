@@ -9,7 +9,8 @@ extern "C" {
 #endif
 
 /**
- * Converts tokenized shell constructs into strings for DFA consumers.
+ * Converts tokenized shell constructs into transformed strings for downstream
+ * use.
  */
 
 /**
@@ -28,9 +29,10 @@ typedef enum {
  * Transformed token
  */
 typedef struct {
-  const char *original;    // Owned, NUL-terminated original token text
-  const char *transformed; // Owned/aliased NUL-terminated DFA token text
-  transform_type_t type;   // Type of transformation
+  const char *original; // Owned, NUL-terminated original token text
+  const char
+      *transformed;      // Owned/aliased NUL-terminated transformed token text
+  transform_type_t type; // Type of transformation
   bool is_shell_construct; // True if this was shell syntax
 } transformed_token_t;
 
@@ -39,7 +41,7 @@ typedef struct {
  */
 typedef struct {
   const char *original_command;    // Original command
-  const char *transformed_command; // Command for DFA validation
+  const char *transformed_command; // Command text after token-level transforms
   transformed_token_t *tokens;     // Transformed tokens
   size_t token_count;              // Number of tokens
   bool has_transformations;        // Has any transformations
@@ -96,12 +98,13 @@ void shell_free_transformed_commands(transformed_command_t **commands,
                                      size_t count);
 
 /**
- * Get DFA input from transformed command
+ * Get transformed command text for downstream processing.
  */
 const char *shell_get_dfa_input(transformed_command_t *cmd);
 
 /**
- * Check if command has shell transformations
+ * Return true when the transformed command has any shell-derived
+ * normalizations.
  */
 bool shell_has_transformations(transformed_command_t *cmd);
 

@@ -35,9 +35,7 @@ static int tests_failed = 0;
     }                                                                          \
   } while (0)
 
-/* ============================================================
- * TYPE CLASSIFICATION
- * ============================================================ */
+/* --- TYPE CLASSIFICATION --- */
 
 static int test_classification_matrix(void) {
   static const struct {
@@ -300,9 +298,7 @@ static int test_classification_matrix(void) {
   return 1;
 }
 
-/* ============================================================
- * JOIN TABLE
- * ============================================================ */
+/* --- JOIN TABLE --- */
 
 static int test_type_lattice(void) {
   static const struct {
@@ -593,9 +589,7 @@ static int test_public_helper_matrix(void) {
   return 1;
 }
 
-/* ============================================================
- * MAIN
- * ============================================================ */
+/* --- MAIN --- */
 
 int main(void) {
   printf("Running token type tests...\n\n");

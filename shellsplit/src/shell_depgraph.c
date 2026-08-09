@@ -17,9 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* ============================================================
- * NAME HELPERS
- * ============================================================ */
+/* --- NAME HELPERS --- */
 
 static const char *dep_edge_names[] = {
     "READ",  "WRITE", "APPEND", "PIPE", "ARG", "ENV",
@@ -59,9 +57,7 @@ const char *shell_dep_doc_kind_name(shell_dep_doc_kind_t kind) {
   return dep_doc_names[kind];
 }
 
-/* ============================================================
- * CWD RESOLUTION
- * ============================================================ */
+/* --- CWD RESOLUTION --- */
 
 static void cwd_normalize(char *path, uint32_t len) {
   if (len == 0)
@@ -180,9 +176,7 @@ static uint32_t cwd_resolve_dedup(shell_dep_graph_t *g, uint32_t current_offset,
   return new_offset;
 }
 
-/* ============================================================
- * LIGHTWEIGHT TOKENIZER
- * ============================================================ */
+/* --- LIGHTWEIGHT TOKENIZER --- */
 
 typedef struct {
   const char *start;
@@ -338,9 +332,7 @@ static bool scan_tokens(const char *cmd, uint32_t range_start,
   return pos < end;
 }
 
-/* ============================================================
- * TOKEN CLASSIFICATION HELPERS
- * ============================================================ */
+/* --- TOKEN CLASSIFICATION HELPERS --- */
 
 static bool is_env_assign(const dep_token_t *tok) {
   if (tok->len < 3)
@@ -486,9 +478,7 @@ static bool token_looks_like_path(const dep_token_t *tok) {
   return false;
 }
 
-/* ============================================================
- * HEREDOC PRE-SCAN
- * ============================================================ */
+/* --- HEREDOC PRE-SCAN --- */
 
 typedef struct {
   uint32_t marker_idx;
@@ -592,9 +582,7 @@ static uint32_t prescan_heredocs(const char *cmd, size_t cmd_len,
   return hcount;
 }
 
-/* ============================================================
- * NODE/EDGE BUILDER HELPERS
- * ============================================================ */
+/* --- NODE/EDGE BUILDER HELPERS --- */
 
 static bool add_doc_file(shell_dep_graph_t *g, uint32_t max_nodes,
                          uint32_t max_edges, const char *path,
@@ -658,9 +646,7 @@ static bool add_doc_envvar(shell_dep_graph_t *g, uint32_t max_nodes,
   return true;
 }
 
-/* ============================================================
- * MAIN PARSER
- * ============================================================ */
+/* --- MAIN PARSER --- */
 
 shell_dep_error_t shell_parse_depgraph(const char *cmd, size_t cmd_len,
                                        const char *initial_cwd,
@@ -1300,9 +1286,7 @@ shell_dep_error_t shell_parse_depgraph(const char *cmd, size_t cmd_len,
                                                     : SHELL_DEP_OK;
 }
 
-/* ============================================================
- * GRAPH UTILITIES
- * ============================================================ */
+/* --- GRAPH UTILITIES --- */
 
 void shell_dep_graph_dump(const shell_dep_graph_t *g, FILE *fp) {
   fprintf(fp, "Graph: %u nodes, %u edges, status=0x%x\n", g->node_count,

@@ -21,9 +21,7 @@
 #define CDF_MAX_SCORE 50.0
 #define CDF_DEFAULT_MIN_SAMPLES 128
 
-/* ============================================================
- * PORTABLE strlcpy
- * ============================================================ */
+/* --- PORTABLE strlcpy --- */
 
 static size_t sg_strlcpy(char *dst, const char *src, size_t size) {
   size_t slen = strlen(src);
@@ -35,9 +33,7 @@ static size_t sg_strlcpy(char *dst, const char *src, size_t size) {
   return slen;
 }
 
-/* ============================================================
- * OUTPUT BUFFER WRITER
- * ============================================================ */
+/* --- OUTPUT BUFFER WRITER --- */
 
 typedef struct {
   char *base;
@@ -100,13 +96,7 @@ static const char *bw_printf(buf_writer_t *w, const char *fmt, ...) {
   return result;
 }
 
-/* ============================================================
- * TYPE SEQUENCE LRU CACHE
- *
- * Simple array-based LRU: MRU at end, LRU at front.
- * On insert, move to end. On eviction, remove front.
- * Linear scan for lookup (O(n), n ≤ 8192, acceptable).
- * ============================================================ */
+/* --- TYPE SEQUENCE LRU CACHE --- */
 
 typedef struct {
   char *key;   /* command string (owned) */
@@ -137,11 +127,7 @@ static void type_cache_free(type_cache_t *c) {
   c->capacity = 0;
 }
 
-/* Forward declaration (defined after adaptive threshold helpers) */
 static void cdf_free(sg_gate_t *gate);
-
-/* Lookup by key. Returns pointer to cached value string, or NULL.
- * On hit, moves entry to MRU position (end of array). */
 static char *type_cache_lookup(type_cache_t *c, const char *key,
                                size_t key_len) {
   if (!c->entries || c->count == 0)
@@ -149,8 +135,6 @@ static char *type_cache_lookup(type_cache_t *c, const char *key,
   for (size_t i = 0; i < c->count; i++) {
     if (c->entries[i].key_len == key_len &&
         memcmp(c->entries[i].key, key, key_len) == 0) {
-      /* Hit: move to end (MRU), preserving the age order of every entry
-       * between this one and the previous MRU. */
       if (i < c->count - 1) {
         lru_entry_t tmp = c->entries[i];
         memmove(&c->entries[i], &c->entries[i + 1],
@@ -171,17 +155,14 @@ static bool type_cache_insert(type_cache_t *c, const char *key, size_t key_len,
   if (c->capacity == 0)
     return false;
 
-  /* Evict LRU (index 0) if full */
   if (c->count >= c->capacity) {
     free(c->entries[0].key);
     free(c->entries[0].value);
-    /* Shift remaining entries left */
     memmove(&c->entries[0], &c->entries[1],
             (c->count - 1) * sizeof(lru_entry_t));
     c->count--;
   }
 
-  /* Insert at end */
   char *key_copy = malloc(key_len + 1);
   if (!key_copy)
     return false;
@@ -195,9 +176,7 @@ static bool type_cache_insert(type_cache_t *c, const char *key, size_t key_len,
   return true;
 }
 
-/* ============================================================
- * GATE STATE
- * ============================================================ */
+/* --- GATE STATE --- */
 
 struct sg_gate {
   st_policy_ctx_t *pctx;
@@ -252,9 +231,7 @@ struct sg_gate {
   type_cache_t anomaly_type_cache; /* LRU cache for type sequences */
 };
 
-/* ============================================================
- * LIFECYCLE
- * ============================================================ */
+/* --- LIFECYCLE --- */
 
 sg_gate_t *sg_gate_new(void) {
   sg_gate_t *g = calloc(1, sizeof(*g));
@@ -316,9 +293,7 @@ void sg_gate_free(sg_gate_t *gate) {
   free(gate);
 }
 
-/* ============================================================
- * CONFIGURATION
- * ============================================================ */
+/* --- CONFIGURATION --- */
 
 sg_error_t sg_gate_set_cwd(sg_gate_t *gate, const char *cwd) {
   if (!gate || !cwd)
@@ -419,9 +394,7 @@ sg_error_t sg_gate_set_violation_config(sg_gate_t *gate,
   return SG_OK;
 }
 
-/* ============================================================
- * ANOMALY DETECTION CONFIGURATION
- * ============================================================ */
+/* --- ANOMALY DETECTION CONFIGURATION --- */
 
 sg_error_t sg_gate_enable_anomaly(sg_gate_t *gate, double threshold,
                                   double alpha, double unk_prior) {
@@ -528,13 +501,7 @@ sg_error_t sg_gate_set_anomaly_weights(sg_gate_t *gate, double weight_raw,
   return SG_OK;
 }
 
-/* ============================================================
- * ADAPTIVE THRESHOLD
- *
- * Maintains a circular buffer of scores from non-anomalous commands.
- * Threshold is computed as mean + k * stddev of the window.
- * Falls back to the fixed threshold until the window is full.
- * ============================================================ */
+/* --- ADAPTIVE THRESHOLD --- */
 
 static void adaptive_recompute_threshold(sg_gate_t *gate) {
   if (!gate->anomaly_score_buf || gate->anomaly_score_count == 0)
@@ -601,7 +568,7 @@ sg_error_t sg_gate_set_anomaly_adaptive(sg_gate_t *gate, bool adaptive,
     return SG_OK;
   }
 
-  /* Allocate new buffer */
+  /* Allocate a new rolling anomaly score buffer sized for window_size. */
   double *new_buf = calloc(window_size, sizeof(double));
   if (!new_buf)
     return SG_ERR_MEMORY;
@@ -655,9 +622,7 @@ sg_error_t sg_gate_set_anomaly_cache_size(sg_gate_t *gate, size_t cache_size) {
   return SG_OK;
 }
 
-/* ============================================================
- * BAYESIAN CDF HELPERS
- * ============================================================ */
+/* --- BAYESIAN CDF HELPERS --- */
 
 static void cdf_record(size_t *hist, size_t *total, double score) {
   if (!hist)
@@ -824,9 +789,7 @@ size_t sg_gate_anomaly_vocab_size(const sg_gate_t *gate) {
   return sg_anomaly_vocab_size(gate->anomaly_model);
 }
 
-/* ============================================================
- * SUGGESTION TOKEN VARIANTS
- * ============================================================ */
+/* --- SUGGESTION TOKEN VARIANTS --- */
 
 /*
  * Given a suggestion pattern string and a token position, return type variants
@@ -942,9 +905,7 @@ size_t sg_gate_suggestion_token_variants_at(sg_gate_t *gate,
   return out;
 }
 
-/* ============================================================
- * POLICY MANAGEMENT
- * ============================================================ */
+/* --- POLICY MANAGEMENT --- */
 
 sg_error_t sg_gate_load_policy(sg_gate_t *gate, const char *path) {
   if (!gate || !path)
@@ -1012,9 +973,7 @@ uint32_t sg_gate_deny_rule_count(const sg_gate_t *gate) {
   return (uint32_t)st_policy_count(gate->deny_policy);
 }
 
-/* ============================================================
- * INTERNAL: TOKEN EXPANSION HELPERS
- * ============================================================ */
+/* --- INTERNAL: TOKEN EXPANSION HELPERS --- */
 
 static bool extract_var_name(const char *tok, size_t len, char *name_out,
                              size_t name_max) {
@@ -1053,9 +1012,7 @@ static bool has_glob_chars(const char *tok, size_t len) {
   return false;
 }
 
-/* ============================================================
- * INTERNAL: BUILD COMMAND STRING WITH OPTIONAL EXPANSION
- * ============================================================ */
+/* --- INTERNAL: BUILD COMMAND STRING WITH OPTIONAL EXPANSION --- */
 
 /* Expansion buffer size. Callbacks must return at most this many bytes minus
  * one for the terminating NUL. */
@@ -1158,9 +1115,7 @@ static const char *build_cmd_string(const shell_dep_cmd_t *cmd,
   return bw->base + start;
 }
 
-/* ============================================================
- * INTERNAL: CHECK FEATURES FROM FAST PARSER AGAINST REJECT MASK
- * ============================================================ */
+/* --- INTERNAL: CHECK FEATURES FROM FAST PARSER AGAINST REJECT MASK --- */
 
 static const char *check_features(const shell_parse_result_t *fast,
                                   uint32_t reject_mask, uint32_t *bad_idx) {
@@ -1195,9 +1150,7 @@ static const char *check_features(const shell_parse_result_t *fast,
   return NULL;
 }
 
-/* ============================================================
- * VIOLATION DEFAULT CONFIG
- * ============================================================ */
+/* --- VIOLATION DEFAULT CONFIG --- */
 
 void sg_violation_config_default(sg_violation_config_t *cfg) {
   /* Arrays are kept in a stable human-readable order. Lookup is linear because
@@ -1330,9 +1283,7 @@ void sg_violation_config_default(sg_violation_config_t *cfg) {
     cfg->shell_profile_paths[cfg->shell_profile_path_count++] = def_profiles[i];
 }
 
-/* ============================================================
- * VIOLATION SCANNING HELPERS
- * ============================================================ */
+/* --- VIOLATION SCANNING HELPERS --- */
 
 /* Exact-match search on a small configured string array. Configuration arrays
  * are public and capped at SG_VIOL_MAX_NAMES, so lookup must not depend on a
@@ -1546,9 +1497,7 @@ static bool has_control_flow_path(const shell_dep_graph_t *g, uint32_t from,
   return false;
 }
 
-/* ============================================================
- * VIOLATION SCANNING ENGINE
- * ============================================================ */
+/* --- VIOLATION SCANNING ENGINE --- */
 
 static void
 sg_violation_scan(const shell_dep_graph_t *graph,
@@ -2259,9 +2208,7 @@ static uint32_t sg_violation_categories(uint32_t types) {
   return categories;
 }
 
-/* ============================================================
- * EVALUATION
- * ============================================================ */
+/* --- EVALUATION --- */
 
 sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len, char *buf,
                    size_t buf_size, sg_result_t *out) {
@@ -2733,9 +2680,7 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len, char *buf,
   return (bw.overflow || subcmd_truncated) ? SG_ERR_TRUNC : SG_OK;
 }
 
-/* ============================================================
- * HELPERS
- * ============================================================ */
+/* --- HELPERS --- */
 
 size_t sg_eval_size_hint(size_t cmd_len) {
   if (cmd_len > (SIZE_MAX - 512) / 4)

@@ -14,15 +14,11 @@ extern "C" {
  * dynamic allocation. See shell_tokenizer_full.h for allocating tokenization.
  */
 
-/* ============================================================
- * CONSTANTS & LIMITS
- * ============================================================ */
+/* --- CONSTANTS AND LIMITS --- */
 
 #define SHELL_MAX_SUBCOMMANDS 64 // Default max subcommands
 
-/* ============================================================
- * TYPE DEFINITIONS
- * ============================================================ */
+/* --- TYPE DEFINITIONS --- */
 
 /**
  * Return codes
@@ -148,7 +144,7 @@ typedef struct {
 
 /**
  * Parse result - caller allocates this
- * Size: 64 * 8 + 8 = 520 bytes (for 64 max subcommands)
+ * Size: 64 * 12 + 8 = 776 bytes (for 64 max subcommands)
  */
 typedef struct {
   shell_range_t cmds[SHELL_MAX_SUBCOMMANDS]; // Subcommand ranges
@@ -156,9 +152,7 @@ typedef struct {
   uint32_t status;                           // shell_status_t flags
 } shell_parse_result_t;
 
-/* ============================================================
- * FAST PARSER API - Zero-Copy, Bounded
- * ============================================================ */
+/* --- FAST PARSER API --- */
 
 /**
  * Fast shell command parser - zero-copy, no malloc

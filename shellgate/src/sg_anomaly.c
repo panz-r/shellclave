@@ -6,9 +6,11 @@
  * Context totals are maintained incrementally for O(1) probability lookups.
  *
  * Kneser-Ney discounting:
- *   For observed n-grams:  P_KN(w|ctx) = max(0, c - D) / c_ctx + D *
- * |unique_cont| / c_ctx * P_KN_lower(w|ctx') For unobserved:        Back off to
- * lower-order model D = absolute discount (default 0.5)
+ *   Observed n-grams:
+ *     P_KN(w|ctx) = max(0, c - D) / c_ctx
+ *                  + D * |unique_cont| / c_ctx * P_KN_lower(w|ctx')
+ *   Unobserved n-grams: back off to lower-order model.
+ *   D = absolute discount (default 0.5)
  *
  * Serialisation uses a binary format with length-prefixed keys:
  *   Header (text):  # anomaly-model-v3\n
@@ -31,12 +33,7 @@
 
 #define SG_ANOMALY_MAX_KEY_LENGTH ((SG_ANOMALY_MAX_COMMAND_LENGTH + 1U) * 4U)
 
-/* ============================================================
- * COUNT TABLE HELPERS (wrapping draugr ht_table_t)
- *
- * Maps byte[] key -> int64_t count using Robin-Hood probing with
- * graveyard tombstones. Hash via xxhash3.
- * ============================================================ */
+/* --- COUNT TABLE HELPERS --- */
 
 static uint64_t anomaly_hash_fn(const void *key, size_t key_len,
                                 void *user_ctx) {
@@ -75,16 +72,7 @@ static size_t count_get(const ht_table_t *t, const char *key, size_t key_len) {
   return 0;
 }
 
-/* ============================================================
- * KEY BUILDING HELPERS
- *
- * Bigram key:  "prev\0curr"  (key_len = plen + 1 + clen + 1)
- * Trigram key: "p2\0p1\0curr" (key_len = p2len + 1 + p1len + 1 + clen + 1)
- * Context suffix for bigram: "prev\0"  (all bigrams starting with prev)
- * Context suffix for trigram: "p2\0p1\0" (all trigrams starting with p2,p1)
- *
- * All functions return the key length (0 on truncation or empty input).
- * ============================================================ */
+/* --- KEY BUILDING HELPERS --- */
 
 static size_t build_bigram_key(char *buf, size_t buf_size, const char *prev,
                                const char *curr) {
@@ -218,7 +206,7 @@ static size_t build_4gram_ctx(char *buf, size_t buf_size, const char *p3,
 
 static size_t extract_4gram_ctx_len(const char *key, size_t max_len) {
   size_t i = 0;
-  /* skip 3 NUL-terminated strings */
+  /* Skip three leading NUL-terminated context strings: p3, p2, and p1. */
   for (int n = 0; n < 3; n++) {
     while (i < max_len && key[i] != '\0')
       i++;
@@ -227,9 +215,7 @@ static size_t extract_4gram_ctx_len(const char *key, size_t max_len) {
   return i; /* include the final component's terminating NUL */
 }
 
-/* ============================================================
- * MODEL
- * ============================================================ */
+/* --- MODEL --- */
 
 struct sg_anomaly_model {
   ht_table_t *uni;    /* unigram counts */
@@ -310,21 +296,7 @@ void sg_anomaly_model_clear_error(sg_anomaly_model_t *model) {
     model->oom = false;
 }
 
-/* ============================================================
- * PROBABILITY CALCULATION - Kneser-Ney with 4-gram backoff
- *
- * Compute log P(curr | p3, p2, p1) in bits using KN discounting.
- * Backoff chain: 4-gram -> trigram -> bigram -> unigram -> UNK.
- *
- * KN formula (for each n-gram level):
- *   P_KN(w | ctx) = max(0, c(ctx,w) - D) / c(ctx)
- *                   + D * |{w': c(ctx,w')>0}| / c(ctx) * P_KN_lower(w)
- *
- * The lower-order continuation probability uses the number of
- * distinct contexts in which w has appeared (not raw count).
- * For simplicity, we use raw counts as a proxy for continuation
- * counts in the first iteration.
- * ============================================================ */
+/* --- PROBABILITY CALCULATION --- */
 
 /* Compute log probability of unknown command in bits */
 static double unk_logprob(const sg_anomaly_model_t *m) {
@@ -404,7 +376,7 @@ static double kn_logprob(const sg_anomaly_model_t *m, const char *p3,
   char ctx[SG_ANOMALY_MAX_KEY_LENGTH];
   size_t key_len, ctx_len;
 
-  /* === Level 1: Unigram (base) === */
+  /* --- Level 1: Unigram (base) --- */
   size_t uni_count = count_get(m->uni, curr, strlen(curr) + 1);
   double unigram_lp;
   if (uni_count > 0) {
@@ -415,7 +387,7 @@ static double kn_logprob(const sg_anomaly_model_t *m, const char *p3,
     unigram_lp = unk_logprob(m);
   }
 
-  /* === Level 2: Bigram === */
+  /* --- Level 2: Bigram --- */
   key_len = build_bigram_key(key, sizeof(key), p1, curr);
   size_t bi_count = key_len > 0 ? count_get(m->bi, key, key_len) : 0;
   double bigram_lp;
@@ -430,7 +402,7 @@ static double kn_logprob(const sg_anomaly_model_t *m, const char *p3,
     bigram_lp = unigram_lp;
   }
 
-  /* === Level 3: Trigram === */
+  /* --- Level 3: Trigram --- */
   key_len = build_trigram_key(key, sizeof(key), p2, p1, curr);
   size_t tri_count = key_len > 0 ? count_get(m->tri, key, key_len) : 0;
   double trigram_lp;
@@ -446,7 +418,7 @@ static double kn_logprob(const sg_anomaly_model_t *m, const char *p3,
     trigram_lp = bigram_lp;
   }
 
-  /* === Level 4: 4-gram === */
+  /* --- Level 4: 4-gram --- */
   key_len = build_4gram_key(key, sizeof(key), p3, p2, p1, curr);
   size_t quad_count = key_len > 0 ? count_get(m->quad, key, key_len) : 0;
   if (quad_count > 0) {
@@ -462,13 +434,7 @@ static double kn_logprob(const sg_anomaly_model_t *m, const char *p3,
   return trigram_lp;
 }
 
-/* ============================================================
- * SCORING
- *
- * Uses 4-gram KN backoff for sequences of len >= 4,
- * trigram KN backoff for len == 3.
- * Returns INFINITY for len < 3 (need at least one trigram).
- * ============================================================ */
+/* --- SCORING --- */
 
 static bool command_is_scorable(const char *command) {
   return command && command[0] != '\0';
@@ -532,15 +498,7 @@ double sg_anomaly_score(const sg_anomaly_model_t *model, const char **seq,
   return scored > 0 ? total_bits / (double)scored : INFINITY;
 }
 
-/* ============================================================
- * UPDATE (LEARNING)
- * ============================================================
- *
- * Note: sg_anomaly_score() returns INFINITY for sequences with
- * len < 3 (cannot form any trigrams). However, this update
- * function still adds unigrams and bigrams for shorter sequences.
- * This is intentional -- the model learns from partial sequences.
- * ============================================================ */
+/* --- UPDATE --- */
 
 void sg_anomaly_update(sg_anomaly_model_t *model, const char **seq,
                        size_t len) {
@@ -624,22 +582,7 @@ void sg_anomaly_update(sg_anomaly_model_t *model, const char **seq,
   model->vocab_size = ht_size(model->uni);
 }
 
-/* ============================================================
- * SERIALISATION - Binary Format v3
- *
- * Header (text, for easy inspection):
- *   # anomaly-model-v3\n
- *   # alpha unk_prior total_uni total_bi total_tri vocab_size\n
- *
- * Entry (binary):
- *   uint8_t  type;       // 1='U', 2='B', 3='T'
- *   uint32_t key_len;     // bytes of key (including embedded NULs)
- *   uint8_t  key[key_len];
- *   uint64_t count;
- *   uint8_t  nl;          // '\n'
- *
- * bi_ctx and tri_ctx totals are NOT serialised -- rebuilt from bi/tri on load.
- * ============================================================ */
+/* --- SERIALISATION --- */
 
 #define BINARY_TYPE_UNI 1
 #define BINARY_TYPE_BI 2
@@ -848,9 +791,7 @@ int sg_anomaly_load(sg_anomaly_model_t *model, const char *path) {
   return result;
 }
 
-/* ============================================================
- * ACCESSORS
- * ============================================================ */
+/* --- ACCESSORS --- */
 
 size_t sg_anomaly_vocab_size(const sg_anomaly_model_t *model) {
   return model ? ht_size(model->uni) : 0;

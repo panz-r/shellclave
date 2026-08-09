@@ -2,9 +2,7 @@
 #include <ctype.h>
 #include <string.h>
 
-/* ============================================================
- * FAST PARSER IMPLEMENTATION
- * ============================================================ */
+/* --- FAST PARSER IMPLEMENTATION --- */
 
 /**
  * Check if character is a shell separator
@@ -96,7 +94,7 @@ static void detect_features(const char *cmd, uint32_t start, uint32_t len,
       continue;
     }
 
-    // Check for features
+    // Detect shell features in each character after expansion handling.
     if ((c == '<' || c == '>') && i + 1 < len && p[i + 1] == '(') {
       *features |= SHELL_FEAT_PROCESS_SUB;
       i++;
@@ -298,7 +296,7 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
     max_cmds = SHELL_MAX_SUBCOMMANDS;
   }
 
-// Helper to trim whitespace and record subcommand
+  // Helper to trim outer whitespace and emit one parsed subcommand record.
 #define RECORD_SUBCMD(s, e, type_val)                                          \
   do {                                                                         \
     uint32_t _s = (s);                                                         \
@@ -333,10 +331,8 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
   int paren_depth = 0; // Track regular parentheses ()
   int arith_depth = 0; // Track when inside $((...))
 
+  // Scan the command one byte at a time, maintaining quote and feature state.
   while (pos < cmd_len) {
-    // Additional bounds check for safety
-    if (pos >= cmd_len)
-      break;
     char c = cmd[pos];
 
     // Reject binary/non-shell bytes throughout unquoted shell syntax.  Shell
@@ -419,14 +415,14 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
     // Note: $(( opens TWO parens - handle specially to avoid double counting
     if (c == '$' && pos + 2 < cmd_len && cmd[pos + 1] == '(' &&
         cmd[pos + 2] == '(') {
-      // This is $(( - arithmetic expansion, opens TWO parentheses
+      // This is $((...)) - arithmetic expansion, opens TWO parentheses
       arith_depth += 2; // Track that we're inside arithmetic
       pos += 3;         // Skip $(( entirely (3 chars)
       continue;
     }
     // Also handle plain (( )) - arithmetic in bash
     if (c == '(' && pos + 1 < cmd_len && cmd[pos + 1] == '(') {
-      // This is (( - arithmetic
+      // This is ((...)) - arithmetic
       arith_depth += 2;
       pos += 2; // Skip ((
       continue;
@@ -1142,8 +1138,8 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
     }
   }
 
-  // Check for invalid shell: bare redirects (>, >>, <, <<, <<<) or bare
-  // separators (; | &) If there's no actual command content, it's invalid shell
+  // Reject input that is only redirects/separators with no actual command
+  // content.
   if (subcmd_idx == 0) {
     bool has_valid_content = false;
     for (size_t i = 0; i < cmd_len; i++) {
@@ -1191,9 +1187,8 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
     }
   }
 
-  // Check for invalid shell: bare redirects (>, >>, <, <<, <<<) or bare
-  // separators If there's no actual command content, it's invalid shell A valid
-  // shell command must have at least one alphanumeric character or special var
+  // Ensure each parsed subcommand has real content beyond redirect/separator
+  // syntax.
   bool has_command_content = false;
   for (uint32_t i = 0; i < subcmd_idx; i++) {
     uint32_t start = result->cmds[i].start;
@@ -1247,8 +1242,8 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
   }
 
   // Also check for the case where we have a trailing separator but no
-  // subcommand after it This happens with "cmd |" where the | sets subcmd_start
-  // past the end
+  // subcommand after it. This happens with "cmd |" where the | sets
+  // subcmd_start past the end.
   if (subcmd_start >= cmd_len && subcmd_idx > 0) {
     // The last thing we saw was a separator - check what type
     // If current_type is PIPELINE/SEMICOLON/AND/OR, we have a trailing

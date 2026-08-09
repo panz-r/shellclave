@@ -453,7 +453,7 @@ char *shell_ast_serialize(const shell_ast_t *ast, char *buffer,
   return buffer;
 }
 
-// ==== Additional builder functions =====
+/* --- ADDITIONAL BUILDER FUNCTIONS --- */
 
 ast_node_t *shell_ast_add_command_with_args(shell_ast_t *ast,
                                             const char *command,
@@ -582,7 +582,7 @@ ast_node_t *shell_ast_add_glob(shell_ast_t *ast, const char *pattern) {
   return node;
 }
 
-// ==== Invalid pattern generators =====
+/* --- INVALID PATTERN GENERATORS --- */
 
 void shell_ast_add_binary(shell_ast_t *ast) {
   if (!ast)
@@ -724,7 +724,7 @@ void shell_ast_add_incomplete_glob(shell_ast_t *ast) {
   }
 }
 
-// ==== Metadata getters =====
+/* --- METADATA GETTERS --- */
 
 bool shell_ast_is_valid(const shell_ast_t *ast) {
   if (!ast)

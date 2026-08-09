@@ -17,7 +17,6 @@ static bool contains_invalid_shell_byte(const char *input) {
   return false;
 }
 
-// Initialize tokenizer state
 void shell_tokenizer_init(shell_tokenizer_state_t *state, const char *input) {
   if (state == NULL)
     return;
@@ -28,29 +27,27 @@ void shell_tokenizer_init(shell_tokenizer_state_t *state, const char *input) {
       contains_invalid_shell_byte(state->input) ? 0 : strlen(state->input);
 }
 
-// Check if at position we have a keyword and update tracking
 static void check_keyword(shell_tokenizer_state_t *state,
                           const char *token_text, size_t token_len) {
   if (token_text == NULL || token_len == 0)
     return;
 
-  // Check for if/then/elif/else/fi
+  // Track control-flow keywords for depth validation.
+  // then/else/elif are recognized as flow keywords but do not directly adjust
+  // depth here.
   if (token_len == 2 && strncmp(token_text, "if", 2) == 0) {
     state->if_depth++;
   } else if (token_len == 4) {
-    if (strncmp(token_text, "then", 4) == 0) {
-      // Valid - we're in an if
-    } else if (strncmp(token_text, "else", 4) == 0) {
-      // Valid - we're in an if
-    } else if (strncmp(token_text, "elif", 4) == 0) {
-      // Valid - we're in an if
+    if (strncmp(token_text, "then", 4) == 0 ||
+        strncmp(token_text, "else", 4) == 0 ||
+        strncmp(token_text, "elif", 4) == 0) {
+      /* no depth change */
     }
   } else if (token_len == 2 && strncmp(token_text, "fi", 2) == 0) {
     if (state->if_depth > 0)
       state->if_depth--;
   }
 
-  // Check for loops
   if (token_len == 5) {
     if (strncmp(token_text, "while", 5) == 0 ||
         strncmp(token_text, "until", 5) == 0) {
@@ -63,7 +60,6 @@ static void check_keyword(shell_tokenizer_state_t *state,
       state->loop_depth--;
   }
 
-  // Check for case
   if (token_len == 4 && strncmp(token_text, "case", 4) == 0) {
     state->case_depth++;
   } else if (token_len == 4 && strncmp(token_text, "esac", 4) == 0) {
@@ -72,13 +68,11 @@ static void check_keyword(shell_tokenizer_state_t *state,
   }
 }
 
-// Check if character is a shell operator
 static bool is_shell_operator(char c) {
   return c == '|' || c == '>' || c == '<' || c == '&' || c == ';' || c == '(' ||
          c == ')' || c == '$' || c == '`' || c == '[';
 }
 
-// Skip whitespace
 static void skip_whitespace(shell_tokenizer_state_t *state) {
   while (state->position < state->length &&
          isspace((unsigned char)state->input[state->position])) {
@@ -86,7 +80,6 @@ static void skip_whitespace(shell_tokenizer_state_t *state) {
   }
 }
 
-// Handle quotes and escaping
 static bool handle_quotes(shell_tokenizer_state_t *state) {
   char c = state->input[state->position];
 
@@ -104,7 +97,6 @@ static bool handle_quotes(shell_tokenizer_state_t *state) {
     }
   }
 
-  // Handle backslash escaping
   if (c == '\\' && state->position + 1 < state->length) {
     state->position += 2;
     return true;
@@ -113,7 +105,6 @@ static bool handle_quotes(shell_tokenizer_state_t *state) {
   return false;
 }
 
-// Parse variable token
 static bool parse_variable(shell_tokenizer_state_t *state,
                            shell_token_t *token) {
   if (state->position >= state->length)
@@ -127,7 +118,6 @@ static bool parse_variable(shell_tokenizer_state_t *state,
   }
   state->position++;
 
-  // Check for ${VAR} format
   if (state->position < state->length && state->input[state->position] == '{') {
     state->position++;
     state->brace_depth++;
@@ -146,7 +136,6 @@ static bool parse_variable(shell_tokenizer_state_t *state,
         return true;
       }
 
-      // Handle array subscript: ${var[index]}
       // Subscript may contain: simple index, $VAR, $((expr)), etc.
       if (c == '[') {
         int bracket_depth = 1;
@@ -167,15 +156,12 @@ static bool parse_variable(shell_tokenizer_state_t *state,
               state->position++;
               continue;
             }
-            // Found closing ], skip it
             state->position++;
             break;
           }
 
-          // Skip other content (including $VAR, $((...)))
           state->position++;
         }
-        // After subscript handling, continue to next iteration to find }
         continue;
       }
 
@@ -198,7 +184,6 @@ static bool parse_variable(shell_tokenizer_state_t *state,
     return false;
   }
 
-  // Check for special variables ($1, $#, $?, $$, $!, $@, $*, $-)
   if (state->position < state->length) {
     char next = state->input[state->position];
     // Handle: $0-$9, $#, $?, $$, $!, $@, $*, $-
@@ -216,7 +201,6 @@ static bool parse_variable(shell_tokenizer_state_t *state,
     }
   }
 
-  // Simple $VAR format
   while (state->position < state->length) {
     char c = state->input[state->position];
     if (!isalnum((unsigned char)c) && c != '_') {
@@ -397,7 +381,6 @@ static bool token_has_unescaped_dollar(const shell_token_t *token) {
   return false;
 }
 
-// Parse subshell token
 static bool parse_subshell(shell_tokenizer_state_t *state,
                            shell_token_t *token) {
   if (state->position >= state->length)
@@ -406,7 +389,7 @@ static bool parse_subshell(shell_tokenizer_state_t *state,
   size_t start = state->position;
   bool is_quoted = state->in_quotes;
 
-  // Check for $(command) format
+  // Parse command substitution: `$(...)`.
   if (state->input[state->position] == '$' &&
       state->position + 1 < state->length &&
       state->input[state->position + 1] == '(') {
@@ -441,7 +424,7 @@ static bool parse_subshell(shell_tokenizer_state_t *state,
     return false;
   }
 
-  // Check for `command` format (legacy)
+  // Parse legacy backtick command substitution (`...`).
   if (state->input[state->position] == '`') {
     state->position++;
     state->paren_depth++;
@@ -469,7 +452,7 @@ static bool parse_subshell(shell_tokenizer_state_t *state,
   return false;
 }
 
-// Check if token contains glob patterns
+// Check whether token text contains shell glob wildcards (`*`, `?`, `[`).
 static bool is_glob_pattern(const char *str, size_t length) {
   for (size_t i = 0; i < length; i++) {
     char c = str[i];
@@ -489,7 +472,6 @@ static size_t scan_descriptor_target(const char *input, size_t position,
   return position;
 }
 
-// Get next token
 bool shell_tokenizer_next(shell_tokenizer_state_t *state,
                           shell_token_t *token) {
   if (token == NULL)
@@ -512,9 +494,8 @@ bool shell_tokenizer_next(shell_tokenizer_state_t *state,
   char current_char = state->input[start_pos];
   bool is_quoted = state->in_quotes;
 
-  // Invalid bytes are rejected by initialization so token iteration cannot
-  // yield a partial stream.  Double keywords such as "if if" remain valid:
-  // Bash can execute the first "if" as a command for the condition.
+  // Invalid bytes are rejected before tokenization, so this tokenizer never
+  // yields a partial stream for malformed byte sequences.
 
   // Handle quotes first
   char opening_quote = current_char;
@@ -545,7 +526,7 @@ bool shell_tokenizer_next(shell_tokenizer_state_t *state,
     current_char = state->input[state->position];
   }
 
-  // Check for $(( arithmetic expansion first
+  // Parse arithmetic expansion: `$((...))` first.
   if (current_char == '$' && !state->in_quotes) {
     if (state->position + 1 < state->length &&
         state->input[state->position + 1] == '{') {
@@ -591,9 +572,9 @@ bool shell_tokenizer_next(shell_tokenizer_state_t *state,
       // input
       if (found_matching_paren) {
         // depth == 0 means we found matching ))
-        // position > start + 3 ensures we consumed at least $(( + one ) beyond
-        // the opening This prevents accepting unclosed $((x+1) which has only
-        // one )
+        // position > start + 3 ensures we consumed at least "$((" and one )
+        // beyond the opening pair. This prevents accepting unclosed $((x+1)
+        // which has one )
         token->type = TOKEN_ARITHMETIC;
         token->start = state->input + start;
         token->length = state->position - start;
@@ -850,7 +831,6 @@ bool shell_tokenizer_next(shell_tokenizer_state_t *state,
     }
   }
 
-  // Handle regular tokens
   while (state->position < state->length) {
     char c = state->input[state->position];
 
@@ -891,13 +871,11 @@ bool shell_tokenizer_next(shell_tokenizer_state_t *state,
   token->is_quoted = state->in_quotes;
   token->is_escaped = false;
 
-  // Track keywords for feature detection
   check_keyword(state, token_text, token_length);
 
   return true;
 }
 
-// Tokenize entire command line into commands
 bool shell_tokenize_commands(const char *input, shell_command_t **commands,
                              size_t *command_count) {
   if (commands == NULL || command_count == NULL)
@@ -910,7 +888,6 @@ bool shell_tokenize_commands(const char *input, shell_command_t **commands,
   shell_tokenizer_state_t state;
   shell_tokenizer_init(&state, input);
 
-  // First pass: count commands
   size_t count = 0;
   bool expect_command = true;
 
@@ -938,11 +915,7 @@ bool shell_tokenize_commands(const char *input, shell_command_t **commands,
     }
   }
 
-  // Check for bare separators (e.g., just "|" or ";") - invalid shell syntax
-  // But allow valid redirects like &>, &>>, <<, >>
   if (count == 0 && input != NULL && input[0] != '\0') {
-    // Check if there's any non-whitespace content that's not just a valid
-    // redirect
     bool has_non_whitespace = false;
     size_t input_len = strlen(input);
     for (size_t i = 0; i < input_len; i++) {
@@ -950,21 +923,18 @@ bool shell_tokenize_commands(const char *input, shell_command_t **commands,
       if (isspace((unsigned char)c))
         continue;
 
-      // Skip valid redirect operators: &>, &>>, <<, >>
       if (c == '&' && i + 1 < input_len &&
           (input[i + 1] == '>' || input[i + 1] == '<')) {
         i++; // skip the next char
         continue;
       }
       if (c == '<' || c == '>') {
-        // Could be << or >>, check next char
         if (i + 1 < input_len && (input[i + 1] == '<' || input[i + 1] == '>')) {
           i++; // skip the next char
         }
         continue;
       }
 
-      // Found actual content
       has_non_whitespace = true;
       break;
     }
@@ -984,10 +954,8 @@ bool shell_tokenize_commands(const char *input, shell_command_t **commands,
     return false;
   }
 
-  // Zero out all commands to ensure clean state
   memset(*commands, 0, count * sizeof(shell_command_t));
 
-  // Second pass: tokenize and group into commands
   shell_tokenizer_init(&state, input);
   size_t current_command = 0;
   shell_command_t *current_cmd = &(*commands)[current_command];
@@ -1028,7 +996,6 @@ bool shell_tokenize_commands(const char *input, shell_command_t **commands,
          token.type == TOKEN_SPECIAL_VAR || token.type == TOKEN_GLOB)) {
       if (current_cmd->token_count > 0) {
         if (current_command + 1 < count) {
-          // Save tokens to current command before creating new one
           current_cmd->tokens = tokens;
 
           current_command++;
@@ -1076,7 +1043,6 @@ bool shell_tokenize_commands(const char *input, shell_command_t **commands,
 
     current_cmd->tokens[current_cmd->token_count++] = token;
 
-    // Track shell features
     switch (token.type) {
     case TOKEN_VARIABLE:
     case TOKEN_VARIABLE_QUOTED:
@@ -1111,7 +1077,6 @@ bool shell_tokenize_commands(const char *input, shell_command_t **commands,
 
   if (current_command < count) {
     (*commands)[current_command].end_pos = state.position;
-    // Save tokens for the last command
     current_cmd->tokens = tokens;
   }
 

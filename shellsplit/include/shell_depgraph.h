@@ -26,9 +26,7 @@
 extern "C" {
 #endif
 
-/* ============================================================
- * CONSTANTS & LIMITS
- * ============================================================ */
+/* --- CONSTANTS AND LIMITS --- */
 
 #define SHELL_DEP_MAX_NODES 128
 #define SHELL_DEP_MAX_EDGES 256
@@ -41,9 +39,7 @@ extern "C" {
 #error "SHELL_DEP_CWD_BUF_SIZE must be >= PATH_MAX"
 #endif
 
-/* ============================================================
- * TYPE DEFINITIONS
- * ============================================================ */
+/* --- TYPE DEFINITIONS --- */
 
 typedef enum {
   SHELL_DEP_OK = 0,
@@ -203,9 +199,7 @@ typedef struct {
   } errors[SHELL_DEP_MAX_VALIDATE_ERRORS];
 } shell_dep_validate_result_t;
 
-/* ============================================================
- * API
- * ============================================================ */
+/* --- API --- */
 
 /**
  * Parse a shell command into a dependency graph.

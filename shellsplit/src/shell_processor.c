@@ -6,7 +6,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-// Helper: Check if token is shell operator
 static bool is_shell_operator_token(shell_token_t *token) {
   return token->type == TOKEN_PIPE || token->type == TOKEN_REDIRECT_IN ||
          token->type == TOKEN_REDIRECT_OUT ||
@@ -35,10 +34,8 @@ static bool redirection_consumes_next_token(const shell_token_t *token) {
   return last == '<' || last == '>';
 }
 
-// Helper: Build clean command string from tokens
 static char *build_clean_command(shell_token_t *tokens, size_t count);
 
-// Forward declarations
 static bool process_single_command_internal(shell_command_t *basic_cmd,
                                             const char *original_line,
                                             shell_command_info_t *info);
@@ -55,13 +52,11 @@ static void clear_command_info(shell_command_info_t *info) {
   memset(info, 0, sizeof(*info));
 }
 
-// Helper: Build clean command string from tokens
 static char *build_clean_command(shell_token_t *tokens, size_t count) {
   if (count == 0) {
     return strdup("");
   }
 
-  // Calculate total length needed
   size_t total_length = 0;
   for (size_t i = 0; i < count; i++) {
     if (tokens[i].length > SIZE_MAX - total_length)
@@ -70,18 +65,16 @@ static char *build_clean_command(shell_token_t *tokens, size_t count) {
     if (i > 0) {
       if (total_length == SIZE_MAX)
         return NULL;
-      total_length++; // Space between arguments
+      total_length++;
     }
   }
   if (total_length == SIZE_MAX)
     return NULL;
 
-  // Allocate buffer
   char *buffer = malloc(total_length + 1);
   if (!buffer)
     return NULL;
 
-  // Build command string
   char *pos = buffer;
   for (size_t i = 0; i < count; i++) {
     if (i > 0) {
@@ -95,17 +88,14 @@ static char *build_clean_command(shell_token_t *tokens, size_t count) {
   return buffer;
 }
 
-// Process single command with shell/command separation
 static bool process_single_command(shell_command_t *basic_cmd,
                                    const char *original_line,
                                    shell_command_info_t *info) {
   if (!basic_cmd || !info)
     return false;
 
-  // Initialize info
   memset(info, 0, sizeof(shell_command_info_t));
 
-  // Store original command
   size_t orig_length = basic_cmd->end_pos - basic_cmd->start_pos;
   info->original_command =
       strndup(original_line + basic_cmd->start_pos, orig_length);
@@ -121,20 +111,17 @@ static bool process_single_command(shell_command_t *basic_cmd,
   return success;
 }
 
-// Process single command (not a pipeline)
 static bool process_single_command_internal(shell_command_t *basic_cmd,
                                             const char *original_line,
                                             shell_command_info_t *info) {
-  (void)original_line; // Unused
+  (void)original_line;
 
-  // Separate shell tokens from command tokens
   shell_token_t *shell_tokens = NULL;
   shell_token_t *command_tokens = NULL;
   size_t shell_count = 0;
   size_t command_count = 0;
   bool consume_redirection_operand = false;
 
-  // Allocate temporary arrays
   if (basic_cmd->token_count > SIZE_MAX / sizeof(shell_token_t))
     return false;
   shell_tokens = malloc(basic_cmd->token_count * sizeof(shell_token_t));
@@ -145,15 +132,12 @@ static bool process_single_command_internal(shell_command_t *basic_cmd,
     return false;
   }
 
-  // Classify tokens
   for (size_t i = 0; i < basic_cmd->token_count; i++) {
     shell_token_t *token = &basic_cmd->tokens[i];
 
     if (is_shell_operator_token(token)) {
-      // Shell operator
       shell_tokens[shell_count++] = *token;
 
-      // Track shell features
       switch (token->type) {
       case TOKEN_PIPE:
         info->has_pipe_output = true;
@@ -177,12 +161,10 @@ static bool process_single_command_internal(shell_command_t *basic_cmd,
     } else if (consume_redirection_operand) {
       consume_redirection_operand = false;
     } else {
-      // Command token
       command_tokens[command_count++] = *token;
     }
   }
 
-  // Build clean command string
   info->clean_command = build_clean_command(command_tokens, command_count);
   if (!info->clean_command) {
     free(shell_tokens);
@@ -190,7 +172,6 @@ static bool process_single_command_internal(shell_command_t *basic_cmd,
     return false;
   }
 
-  // Copy tokens to info structure
   if (shell_count > 0) {
     if (shell_count > SIZE_MAX / sizeof(shell_token_t)) {
       clear_command_info(info);
@@ -268,7 +249,6 @@ static bool own_token_text(shell_command_t *basic_cmd,
                        info->original_command, command_length);
 }
 
-// Main processing function
 shell_process_status_t shell_process_command(
     const char *command_line, const shell_process_limits_t *limits,
     shell_command_info_t **command_infos, size_t *command_count) {
@@ -279,7 +259,6 @@ shell_process_status_t shell_process_command(
   if (!command_line)
     return SHELL_PROCESS_EINPUT;
 
-  // First, tokenize normally
   shell_command_t *basic_commands;
   size_t basic_count;
 
@@ -291,7 +270,6 @@ shell_process_status_t shell_process_command(
     return SHELL_PROCESS_OK;
   }
 
-  // Allocate command info array
   if (basic_count > SIZE_MAX / sizeof(shell_command_info_t)) {
     shell_free_commands(basic_commands, basic_count);
     return SHELL_PROCESS_EOVERFLOW;
@@ -304,7 +282,6 @@ shell_process_status_t shell_process_command(
     return SHELL_PROCESS_ENOMEM;
   }
 
-  // Process each command
   for (size_t i = 0; i < basic_count; i++) {
     if (!process_single_command(&basic_commands[i], command_line, &infos[i])) {
       shell_free_command_infos(infos, i);
@@ -347,7 +324,6 @@ shell_process_status_t shell_process_command(
   return SHELL_PROCESS_OK;
 }
 
-// Free command info structures
 void shell_free_command_infos(shell_command_info_t *infos, size_t count) {
   if (!infos)
     return;
@@ -358,12 +334,11 @@ void shell_free_command_infos(shell_command_info_t *infos, size_t count) {
   free(infos);
 }
 
-// Get clean command for DFA validation
 const char *shell_get_clean_command(shell_command_info_t *info) {
   return info ? info->clean_command : NULL;
 }
 
-// Check if command has dangerous shell features
+// Check for shell features that require explicit downstream handling.
 bool shell_has_dangerous_features(shell_command_info_t *info) {
   if (!info)
     return false;
@@ -373,9 +348,10 @@ bool shell_has_dangerous_features(shell_command_info_t *info) {
       info->has_error_redirection)
     return true;
 
-  /* Command and process substitutions are retained in the clean command so
-   * the DFA can validate the surrounding argument. They still execute shell
-   * code and therefore require shell-aware handling by the caller. */
+  /* Command and process substitutions are kept in clean text so downstream
+   * validators still see the surrounding context. They can execute shell
+   * code, so callers must handle them explicitly.
+   */
   for (size_t i = 0; i < info->command_token_count; i++) {
     token_type_t type = info->command_tokens[i].type;
     if (type == TOKEN_SUBSHELL || type == TOKEN_PROCESS_SUB)
@@ -384,7 +360,9 @@ bool shell_has_dangerous_features(shell_command_info_t *info) {
   return false;
 }
 
-// Process command line and extract DFA inputs
+// Parse command line and return clean per-command inputs for downstream
+// processing, while reporting whether shell features are present for
+// caller-side handling.
 shell_process_status_t
 shell_extract_dfa_inputs(const char *command_line,
                          const shell_process_limits_t *limits,
@@ -411,7 +389,6 @@ shell_extract_dfa_inputs(const char *command_line,
     return SHELL_PROCESS_OK;
   }
 
-  // Allocate array for DFA inputs
   if (count > SIZE_MAX / sizeof(const char *)) {
     shell_free_command_infos(infos, count);
     return SHELL_PROCESS_EOVERFLOW;
@@ -422,7 +399,6 @@ shell_extract_dfa_inputs(const char *command_line,
     return SHELL_PROCESS_ENOMEM;
   }
 
-  // Extract clean commands and check for shell features
   bool shell_features = false;
   for (size_t i = 0; i < count; i++) {
     inputs[i] = shell_get_clean_command(&infos[i]);
@@ -435,18 +411,10 @@ shell_extract_dfa_inputs(const char *command_line,
   *dfa_input_count = count;
   *has_shell_features = shell_features;
 
-  // Note: We're transferring ownership of the clean_command strings to the
-  // caller The caller gets pointers to the strings in infos[i].clean_command
-  // After this function returns, the caller must free these strings
-  // We must NOT call shell_free_command_infos because it would free
-  // clean_command Instead, we manually free only the parts we still own
-
-  // Free original_command and shell/command tokens but NOT clean_command
   for (size_t i = 0; i < count; i++) {
     free((void *)infos[i].original_command);
     free(infos[i].shell_tokens);
     free(infos[i].command_tokens);
-    // Do NOT free infos[i].clean_command - caller owns it now
   }
   free(infos);
 

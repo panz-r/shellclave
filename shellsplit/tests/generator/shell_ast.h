@@ -34,7 +34,8 @@ typedef struct ast_node {
   bool is_append;          // true for >>
   bool is_stderr_redirect; // true for 2>
   bool is_valid;           // false if this node makes the AST invalid
-  bool is_braced;          // true for ${VAR}, false for $VAR
+  bool is_braced;          // true for ${VAR}, false for $VAR; for quote nodes,
+                           // true means double quote, false means single quote
   bool has_redirect;       // has redirect attached
   bool is_closing;         // for if/fi, case/esac, etc.
 } ast_node_t;
@@ -128,7 +129,7 @@ ast_node_t *shell_ast_add_backtick(shell_ast_t *ast, const char *content,
 // Glob pattern
 ast_node_t *shell_ast_add_glob(shell_ast_t *ast, const char *pattern);
 
-// ==== Generator-specific invalid patterns ====
+/* --- GENERATOR-SPECIFIC INVALID PATTERNS --- */
 
 // Binary/control chars embedded
 void shell_ast_add_binary(shell_ast_t *ast);
@@ -157,7 +158,7 @@ void shell_ast_add_separators_only(shell_ast_t *ast);
 // Incomplete glob
 void shell_ast_add_incomplete_glob(shell_ast_t *ast);
 
-// ==== Metadata getters =====
+/* --- METADATA GETTERS --- */
 
 // Check if the AST represents valid shell
 bool shell_ast_is_valid(const shell_ast_t *ast);

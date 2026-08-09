@@ -15,9 +15,7 @@ extern "C" {
  * entropy metrics. It does not modify the environment or allocate memory.
  */
 
-/* ============================================================
- * CONFIGURATION (can be overridden)
- * ============================================================ */
+/* --- CONFIGURATION --- */
 
 #ifndef ENV_SCREENER_POSTERIOR_THRESHOLD
 #define ENV_SCREENER_POSTERIOR_THRESHOLD 0.5
@@ -27,9 +25,7 @@ extern "C" {
 #define ENV_SCREENER_MIN_LENGTH 24
 #endif
 
-/* ============================================================
- * RETURN CODES
- * ============================================================ */
+/* --- RETURN CODES --- */
 
 typedef enum {
   ENV_SCREENER_OK = 0,
@@ -37,9 +33,7 @@ typedef enum {
   ENV_SCREENER_ERROR = -1
 } env_screener_status_t;
 
-/* ============================================================
- * API FUNCTIONS
- * ============================================================ */
+/* --- API FUNCTIONS --- */
 
 /**
  * Calculate Shannon entropy of a string

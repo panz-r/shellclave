@@ -138,9 +138,7 @@ static int test_policy_mutation_lifecycle(void) {
   return 1;
 }
 
-/* ============================================================
- * SERIALIZATION
- * ============================================================ */
+/* --- SERIALIZATION --- */
 
 static int test_policy_persistence_transitions(void) {
   static const char *patterns[] = {"git", "git commit -m *", "ls -l *",
@@ -214,9 +212,7 @@ static int test_policy_persistence_transitions(void) {
   return 1;
 }
 
-/* ============================================================
- * BUG FIX TESTS
- * ============================================================ */
+/* --- BUG FIX TESTS --- */
 
 /* Fix 1: st_policy_eval returns ST_OK for non-matching commands */
 static int test_non_matching_returns_ok(void) {
@@ -575,9 +571,7 @@ static int test_dry_run_simulate(void) {
   return 1;
 }
 
-/* ============================================================
- * CONCURRENCY AND ATOMIC TESTS
- * ============================================================ */
+/* --- CONCURRENCY AND ATOMIC TESTS --- */
 
 static int test_statistics_transitions(void) {
   st_policy_ctx_t *ctx = st_policy_ctx_new();
@@ -926,11 +920,9 @@ static int test_param_size_lifecycle(void) {
   return 1;
 }
 
-/* ============================================================
- * PHASE 2: NEW PARAMETRIZED TYPES (#hash.algo, #image.registry,
+/* --- PHASE 2: NEW PARAMETRIZED TYPES (#hash.algo, #image.registry,
  * #pkg.scope, #branch.prefix, #sha.length, #duration.unit,
- * #signal.name, #range.step, #perm.bits)
- * ============================================================ */
+ * #signal.name, #range.step, #perm.bits) --- */
 
 /* --- Subsumption for parametrized types --- */
 static int test_param_subsume_specific_to_generic(void) {
@@ -1179,9 +1171,7 @@ static int test_param_validation_matrix(void) {
   return 1;
 }
 
-/* ============================================================
- * PATTERN VALIDATION (st_validate_pattern)
- * ============================================================ */
+/* --- PATTERN VALIDATION (st_validate_pattern) --- */
 
 static int test_validate_pattern_matrix(void) {
   static const struct {
@@ -1209,9 +1199,7 @@ static int test_validate_pattern_matrix(void) {
   return 1;
 }
 
-/* ============================================================
- * POLICY MERGE (st_policy_merge)
- * ============================================================ */
+/* --- POLICY MERGE (st_policy_merge) --- */
 
 static int add_patterns(st_policy_t *policy, const char *const *patterns,
                         size_t count) {
@@ -1292,9 +1280,7 @@ static int test_merge_matrix(void) {
   return 1;
 }
 
-/* ============================================================
- * POLICY DIFF (st_policy_diff)
- * ============================================================ */
+/* --- POLICY DIFF (st_policy_diff) --- */
 
 static int string_set_is(char *const *actual, size_t actual_count,
                          const char *const *expected, size_t expected_count) {
@@ -1388,9 +1374,7 @@ static int test_diff_matrix_and_symmetry(void) {
   return 1;
 }
 
-/* ============================================================
- * INCREMENTAL SUBSUMPTION TESTS
- * ============================================================ */
+/* --- INCREMENTAL SUBSUMPTION TESTS --- */
 
 static int test_incremental_subsumption_matrix(void) {
   static const struct {
@@ -1643,11 +1627,9 @@ static int test_token_variant_matrix(void) {
   return 1;
 }
 
-/* ============================================================
- * APPLY TYPE AT POSITION (st_policy_apply_type_at)
- * All tests share setup: ctx + zeroed learner, then test different
- * positions/types
- * ============================================================ */
+/* --- APPLY TYPE AT POSITION (st_policy_apply_type_at) --- */
+/* All tests share setup: ctx + zeroed learner, then test different
+ * positions/types. */
 
 static int test_apply_type_matrix(void) {
   static const char *three[] = {"git", "#path", "#n"};

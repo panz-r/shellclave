@@ -98,9 +98,7 @@ static void extract_limited(const char *input, shell_limits_t *limits,
   shell_parse_fast(input, strlen(input), limits, result);
 }
 
-/* ============================================================
- * LAYER 1: UNIT TESTS - One feature at a time
- * ============================================================ */
+/* --- LAYER 1: UNIT TESTS - One feature at a time --- */
 
 void test_layer1_basic_inputs(void) {
   printf("\n--- Layer 1: Basic Inputs ---\n");
@@ -587,9 +585,7 @@ void test_layer1_type_values(void) {
        result.count > 1 && result.cmds[1].type == SHELL_TYPE_HEREDOC);
 }
 
-/* ============================================================
- * LAYER 2: INTERACTION TESTS - Multiple features
- * ============================================================ */
+/* --- LAYER 2: INTERACTION TESTS - MULTIPLE FEATURES --- */
 
 void test_layer2_heredoc_with_features(void) {
   printf("\n--- Layer 2: HEREDOC with Features ---\n");
@@ -681,9 +677,7 @@ void test_layer2_mixed_commands(void) {
   test_has_feature("Has ARITH", &result, 0, SHELL_FEAT_ARITH);
 }
 
-/* ============================================================
- * LAYER 3: LARGE/COMPLEX TESTS
- * ============================================================ */
+/* --- LAYER 3: LARGE/COMPLEX TESTS --- */
 
 void test_layer3_real_world_commands(void) {
   printf("\n--- Layer 3: Real World Commands ---\n");
@@ -877,9 +871,7 @@ void test_layer3_features_stress(void) {
   // No ARITH in this command - removed test
 }
 
-/* ============================================================
- * ADDITIONAL LAYER 1 TESTS - More edge cases and features
- * ============================================================ */
+/* --- ADDITIONAL LAYER 1 TESTS --- */
 
 void test_layer1_more_separators(void) {
   printf("\n--- Layer 1: More Separators ---\n");
@@ -964,9 +956,7 @@ void test_layer1_special_chars(void) {
   test_count_only("Process sub+redirect count=1 (not sep)", &result, 1);
 }
 
-/* ============================================================
- * ADDITIONAL LAYER 3 TESTS - More complex/large tests
- * ============================================================ */
+/* --- ADDITIONAL LAYER 3 TESTS --- */
 
 void test_layer3_script_snippets(void) {
   printf("\n--- Layer 3: Script Snippets ---\n");
@@ -1283,9 +1273,7 @@ static void test_fast_parser_limitations(void) {
   }
 }
 
-/* ============================================================
- * FEATURE FLAGS API TESTS
- * ============================================================ */
+/* --- FEATURE FLAGS API TESTS --- */
 
 static uint16_t feature_flags_mask(const shell_feature_flags_t *flags) {
   return (flags->has_vars ? SHELL_FEAT_VARS : 0) |
@@ -1331,9 +1319,7 @@ static void test_feature_flags(void) {
   }
 }
 
-/* ============================================================
- * MAIN
- * ============================================================ */
+/* --- MAIN --- */
 
 int main(void) {
   printf("=== FAST PARSER API TESTS ===\n");

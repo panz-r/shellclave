@@ -10,15 +10,13 @@ extern "C" {
 #endif
 
 /**
- * Builds abstract command strings and extracted elements for DFA consumers.
+ * Builds abstract command strings and extracted elements for downstream use.
  */
 
-/* ============================================================
- * PHASE 1: Extended Token Classification (extends tokenizer types)
- * ============================================================ */
+/* --- PHASE 1: EXTENDED TOKEN CLASSIFICATION --- */
 
 /**
- * Abstract type for DFA matching - maps to internal abstract indices
+ * Abstract token kind used by downstream validation logic.
  */
 typedef enum {
   ABSTRACT_EV,   // Environment variable: $FOO → $EV_1
@@ -121,9 +119,7 @@ typedef struct {
   bool has_arithmetic;
 } abstracted_command_t;
 
-/* ============================================================
- * PHASE 2: Abstraction Functions
- * ============================================================ */
+/* --- PHASE 2: ABSTRACTION FUNCTIONS --- */
 
 /**
  * Classify a raw token string (no tokenization needed)
@@ -140,7 +136,7 @@ token_type_t shell_classify_raw_token(const char *text, size_t len);
 bool shell_abstract_command(const char *command, abstracted_command_t **result);
 
 /**
- * Get the abstracted form for DFA matching
+ * Get the abstracted form for downstream processing
  */
 const char *shell_get_abstracted(abstracted_command_t *cmd);
 
@@ -183,9 +179,7 @@ abstract_element_t *shell_get_element_by_abstract(abstracted_command_t *cmd,
 abstract_element_t *shell_get_element_at(abstracted_command_t *cmd,
                                          size_t index);
 
-/* ============================================================
- * PHASE 3: Runtime Expansion (Optional)
- * ============================================================ */
+/* --- PHASE 3: RUNTIME EXPANSION (OPTIONAL) --- */
 
 /**
  * Runtime context for expansion
@@ -208,9 +202,7 @@ char *shell_expand_element(abstract_element_t *elem, runtime_context_t *ctx);
 bool shell_expand_all_elements(abstracted_command_t *cmd,
                                runtime_context_t *ctx);
 
-/* ============================================================
- * Utility Functions
- * ============================================================ */
+/* --- UTILITY FUNCTIONS --- */
 
 /**
  * Get path category from resolved path
@@ -227,18 +219,14 @@ const char *shell_abstract_type_name(abstract_type_t type);
  */
 const char *shell_path_category_name(path_category_t cat);
 
-/* ============================================================
- * Cleanup
- * ============================================================ */
+/* --- CLEANUP --- */
 
 /**
  * Free abstracted command and all elements
  */
 void shell_abstracted_destroy(abstracted_command_t *cmd);
 
-/* ============================================================
- * Lightweight Type Sequence Generation
- * ============================================================ */
+/* --- LIGHTWEIGHT TYPE SEQUENCE GENERATION --- */
 
 /**
  * Build a compact type sequence for a command.

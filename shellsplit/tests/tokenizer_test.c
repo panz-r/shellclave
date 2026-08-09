@@ -1547,9 +1547,7 @@ int main(void) {
     shell_free_commands(cmds, count);
   }
 
-  // ============================================================
-  // PARSER REGRESSION TESTS
-  // ============================================================
+  /* --- PARSER REGRESSION TESTS --- */
 
   printf("\n=== PARSER REGRESSION TESTS ===\n\n");
 

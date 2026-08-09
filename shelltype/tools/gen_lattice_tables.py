@@ -322,9 +322,8 @@ def generate_join_table(join: Dict[str, Dict[str, str]]) -> str:
         "PERM_OCTAL": "PERM", "ANY": "ANY",
     }
     lines = [
-        "/* ============================================================",
-        " * JOIN TABLE",
-        " *",
+        "/* --- JOIN TABLE --- */",
+        "/*",
         " * st_type_join[a][b] = narrowest type covering both a and b.",
         " *",
         " * Lattice:",
@@ -341,7 +340,7 @@ def generate_join_table(join: Dict[str, Dict[str, str]]) -> str:
         " *   #port ⊂ #n, #port ⊂ #i, #port ⊂ #val ⊂ *",
         " *   #hash, #hyp, #method ⊂ #w ⊂ #val ⊂ *",
         " *   #mac, #cron, #duration, #branch, #image, #pkg, #user, #fp ⊂ #val ⊂ *",
-        " * ============================================================ */",
+        " */",
         "",
         "const st_token_type_t st_type_join[ST_TYPE_COUNT][ST_TYPE_COUNT] = {",
         "    /*                " + "  ".join(f"{abbrevs[t]:4}" for t in TYPE_ORDER) + " */",
@@ -356,14 +355,13 @@ def generate_join_table(join: Dict[str, Dict[str, str]]) -> str:
 
 def generate_compat_table(le_matrix: Dict[str, Dict[str, bool]]) -> str:
     lines = [
-        "/* ============================================================",
-        " * COMPATIBILITY TABLE",
-        " *",
+        "/* --- COMPATIBILITY TABLE --- */",
+        "/*",
         " * st_type_compatible[cmd_type][policy_type] = true iff cmd_type ≤ policy_type.",
         " * A command token of cmd_type matches a policy node of policy_type.",
         " *",
         " * Derived from the same lattice via transitive closure.",
-        " * ============================================================ */",
+        " */",
         "",
         "const bool st_type_compatible[ST_TYPE_COUNT][ST_TYPE_COUNT] = {",
     ]
@@ -467,9 +465,8 @@ def main() -> None:
     print("#include <string.h>")
     print("#include <strings.h>")
     print()
-    print("/* ============================================================")
-    print(" * TYPE SYMBOLS")
-    print(" * ============================================================ */")
+    print("/* --- TYPE SYMBOLS --- */")
+    print("/* Generated symbol aliases for join/compat table generation. */")
     print()
     print(generate_symbol_table())
     print()
@@ -477,9 +474,7 @@ def main() -> None:
     print()
     print(generate_compat_table(le_matrix))
     print()
-    print("/* ============================================================")
-    print(" * CLASSIFICATION HELPERS")
-    print(" * ============================================================ */")
+    print("/* --- CLASSIFICATION HELPERS --- */")
     print("/* NOTE: The following section (classification helpers + public API)")
     print(" * is NOT generated. It follows the table section above.")
     print(" * Copy it from the original normalize.c file.")

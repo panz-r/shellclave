@@ -35,9 +35,7 @@
 #include <time.h>
 #include <unistd.h>
 
-/* ============================================================
- * CRC32 (for serialization integrity check)
- * ============================================================ */
+/* --- CRC32 (for serialization integrity check) --- */
 
 static uint32_t crc32_table[256];
 static pthread_once_t crc32_once = PTHREAD_ONCE_INIT;
@@ -60,9 +58,7 @@ static uint32_t crc32_compute(const void *data, size_t len, uint32_t prev) {
   return c ^ 0xFFFFFFFFu;
 }
 
-/* ============================================================
- * COMPATIBILITY MASK
- * ============================================================ */
+/* --- COMPATIBILITY MASK --- */
 
 #define CHILDREN_ARENA_INIT 4096
 #define STATES_INIT 4096
@@ -73,9 +69,7 @@ static uint32_t crc32_compute(const void *data, size_t len, uint32_t prev) {
   8 /* Shell commands rarely exceed 8 tokens before diverging */
 #define FILTER_POS_CAPACITY 1024
 
-/* ============================================================
- * CHILD ENTRY — 16 bytes, packed
- * ============================================================ */
+/* --- CHILD ENTRY — 16 bytes, packed --- */
 
 typedef struct {
   const char *text;
@@ -84,9 +78,7 @@ typedef struct {
   uint8_t _pad[3];
 } child_entry_t;
 
-/* ============================================================
- * POLICY STATE — 16 bytes, fixed size
- * ============================================================ */
+/* --- POLICY STATE — 16 bytes, fixed size --- */
 
 const char *st_error_string(st_error_t err) {
   switch (err) {
@@ -117,9 +109,7 @@ typedef struct {
   uint16_t children_alloc; /* Slots allocated from arena */
 } policy_state_t;
 
-/* ============================================================
- * CHILDREN — offset-based access into policy children_arena
- * ============================================================ */
+/* --- CHILDREN — offset-based access into policy children_arena --- */
 
 #define CHILDREN_ARENA_SIZE (64 * 1024) /* 64KB default */
 
@@ -146,9 +136,7 @@ static bool children_arena_grow(arena_t *arena, uint32_t *offset,
   return true;
 }
 
-/* ============================================================
- * STATES ARRAY
- * ============================================================ */
+/* --- STATES ARRAY --- */
 
 typedef struct {
   policy_state_t *states;
@@ -195,9 +183,7 @@ static uint32_t states_array_alloc(states_array_t *a) {
   return idx;
 }
 
-/* ============================================================
- * PATTERN REGISTRY (entry-based with token storage)
- * ============================================================ */
+/* --- PATTERN REGISTRY (entry-based with token storage) --- */
 
 /* Forward declaration — defined after parse_pattern */
 static void free_pattern_tokens(st_token_t *tokens, size_t count);
@@ -296,9 +282,7 @@ static void pattern_reg_deactivate(pattern_reg_t *r, uint16_t id) {
   r->entries[id].pattern = NULL;
 }
 
-/* ============================================================
- * LENGTH BUCKET INDEX
- * ============================================================ */
+/* --- LENGTH BUCKET INDEX --- */
 
 typedef struct {
   uint16_t *indices;
@@ -336,9 +320,7 @@ static void len_bucket_remove(len_bucket_t *b, uint16_t pattern_id) {
   }
 }
 
-/* ============================================================
- * POLICY STRUCTURE
- * ============================================================ */
+/* --- POLICY STRUCTURE --- */
 
 /* Internal atomic stats structure (separate from public st_policy_stats_t) */
 typedef struct {
@@ -368,15 +350,15 @@ struct st_policy {
   policy_atomic_stats_t stats; /* Atomic runtime statistics */
 };
 
-/* ============================================================
- * RUNTIME MATCH MASK
- * ============================================================ */
-
-/* Runtime policy matching is intentionally stricter than the lattice relation.
+/* --- RUNTIME MATCH MASK ---
+ *
+ * Runtime policy matching is intentionally stricter than the lattice relation.
  * LITERAL is the lattice bottom for joins and subsumption, but an unclassified
  * command token must not satisfy typed policies such as #n or #opt. Union
  * command types also accept their concrete policy forms. Each row therefore
- * lists policy wildcard types accepted by a classified command token. */
+ * lists policy wildcard types accepted by a classified command token.
+ */
+
 static const uint64_t st_runtime_match_mask[ST_TYPE_COUNT] = {
     /* LITERAL */ (1ULL << ST_TYPE_LITERAL) | (1ULL << ST_TYPE_ANY),
     /* HEXHASH */ (1ULL << ST_TYPE_HEXHASH) | (1ULL << ST_TYPE_NUMBER) |
@@ -471,13 +453,9 @@ static inline uint64_t runtime_match_mask(st_token_type_t t) {
   return st_runtime_match_mask[t];
 }
 
-/* ============================================================
- * CHILD ACCESS
- * ============================================================ */
+/* --- CHILD ACCESS --- */
 
-/* ============================================================
- * CHILD LOOKUP
- * ============================================================ */
+/* --- CHILD LOOKUP --- */
 
 static child_entry_t *find_literal_child(const policy_state_t *node,
                                          const char *arena_base,
@@ -495,8 +473,7 @@ static child_entry_t *find_literal_child(const policy_state_t *node,
   return NULL;
 }
 
-/* ============================================================
- * PARAMETRIZED WILDCARD MATCHING
+/* --- PARAMETRIZED WILDCARD MATCHING ---
  *
  * A parametrized wildcard has the form "#path.cfg" or "#size.MiB" where:
  *   - base type is ST_TYPE_PATH (or other path/size types)
@@ -505,7 +482,7 @@ static child_entry_t *find_literal_child(const policy_state_t *node,
  * The child entry stores the base type and full symbol text.
  * During matching, we extract the relevant part from the command token
  * and compare it against the wildcard's parameter.
- * ============================================================ */
+ */
 
 /* Check if a base type supports parametrization. */
 static bool type_supports_param(st_token_type_t t) {
@@ -568,12 +545,11 @@ const char *st_size_suffix(const char *text) {
   return p;
 }
 
-/* ============================================================
- * PARAMETER VALIDATION
+/* --- PARAMETER VALIDATION ---
  *
  * Called from parse_pattern() to reject malformed parameters.
  * Returns true if the parameter is valid for the given base type.
- * ============================================================ */
+ */
 
 static bool validate_param(st_token_type_t base_type, const char *param) {
   /* param includes the leading dot: ".cfg", ".MiB" etc. */
@@ -717,9 +693,7 @@ static bool validate_param(st_token_type_t base_type, const char *param) {
   }
 }
 
-/* ============================================================
- * PARAMETRIZED MATCHING
- * ============================================================ */
+/* --- PARAMETRIZED MATCHING --- */
 
 /* Check if a command token matches a (possibly parametrized) wildcard child.
  * Returns true for non-parametrized wildcards (text == NULL or no parameter).
@@ -1103,9 +1077,7 @@ static child_entry_t *find_exact_wildcard_child(const policy_state_t *node,
   return NULL;
 }
 
-/* ============================================================
- * CHILD INSERTION
- * ============================================================ */
+/* --- CHILD INSERTION --- */
 
 /* Forward declaration for is_explicit_wildcard (used by insert_child) */
 static bool is_explicit_wildcard(const char *text, st_token_type_t type);
@@ -1220,9 +1192,7 @@ static int insert_child(policy_state_t *node, st_policy_t *policy,
   return filter_status;
 }
 
-/* ============================================================
- * PATTERN PARSING
- * ============================================================ */
+/* --- PATTERN PARSING --- */
 
 /*
  * Validate pattern syntax:
@@ -1419,8 +1389,7 @@ static bool pattern_subsumes(const st_token_t *a, size_t a_len,
   return true;
 }
 
-/* ============================================================
- * PER-POSITION FILTER REBUILD
+/* --- PER-POSITION FILTER REBUILD ---
  *
  * BFS-walk the trie up to depth FILTER_POS_LEVELS (4).
  * At each depth N, collect all children across all nodes at that depth:
@@ -1428,7 +1397,7 @@ static bool pattern_subsumes(const st_token_t *a, size_t a_len,
  *   - Wildcards → OR into pos_wildcard_mask[N]
  *
  * Called lazily when pos_built_epoch[N] != policy->epoch.
- * ============================================================ */
+ */
 
 static void policy_rebuild_filters(st_policy_t *policy) {
   struct timespec start, end;
@@ -1577,9 +1546,7 @@ static void policy_rebuild_filters(st_policy_t *policy) {
   atomic_fetch_add(&policy->stats.filter_rebuild_us, elapsed_us);
 }
 
-/* ============================================================
- * PATTERN VALIDATION (public API)
- * ============================================================ */
+/* --- PATTERN VALIDATION (public API) --- */
 
 st_error_t st_validate_pattern(const char *pattern, st_pattern_info_t *info) {
   if (!pattern || !pattern[0])
@@ -1605,9 +1572,7 @@ st_error_t st_validate_pattern(const char *pattern, st_pattern_info_t *info) {
   return ST_OK;
 }
 
-/* ============================================================
- * LIFECYCLE
- * ============================================================ */
+/* --- LIFECYCLE --- */
 
 st_policy_t *st_policy_new(st_policy_ctx_t *ctx) {
   if (!ctx)
@@ -1688,9 +1653,7 @@ void st_policy_free(st_policy_t *policy) {
   free(policy);
 }
 
-/* ============================================================
- * ADD / REMOVE
- * ============================================================ */
+/* --- ADD / REMOVE --- */
 
 /* Forward declaration */
 static st_error_t remove_pattern_by_id_locked(st_policy_t *policy,
@@ -2439,9 +2402,7 @@ size_t st_policy_count(const st_policy_t *policy) {
   return count;
 }
 
-/* ============================================================
- * VERIFICATION + SUGGESTIONS (unified)
- * ============================================================ */
+/* --- VERIFICATION + SUGGESTIONS (unified) --- */
 
 /* Select the display text for a token: use the original text for
  * parametrized wildcards (e.g., "#path.cfg"), otherwise use the
@@ -2534,8 +2495,7 @@ st_error_t st_policy_eval(st_policy_t *policy, const char *raw_cmd,
     return ST_OK;
   }
 
-  /* ============================================================
-   * PER-POSITION FILTER PRE-CHECK
+  /* --- PER-POSITION FILTER PRE-CHECK ---
    *
    * Runs before the trie walk. Rejects definite no-matches early.
    * Runs in ALL modes (verify-only and suggest).
@@ -2543,7 +2503,7 @@ st_error_t st_policy_eval(st_policy_t *policy, const char *raw_cmd,
    *
    * NOTE: First evaluation after many additions may be slower due to
    * lazy filter rebuild. This is expected behavior.
-   * ============================================================ */
+   */
   bool filter_rejected = false;
   size_t check_len =
       cmd.count < FILTER_POS_LEVELS ? cmd.count : FILTER_POS_LEVELS;
@@ -2606,12 +2566,11 @@ st_error_t st_policy_eval(st_policy_t *policy, const char *raw_cmd,
   /* Track trie walk (atomic increment for thread safety) */
   atomic_fetch_add(&policy->stats.trie_walk_count, 1);
 
-  /* ============================================================
-   * TRIE WALK
+  /* --- TRIE WALK ---
    *
    * Still needed even when filter rejected — we need match_depth
    * and match_state to produce useful suggestions.
-   * ============================================================ */
+   */
   uint32_t current = 0;
   size_t match_depth = 0;
   uint32_t match_state = 0;
@@ -2690,11 +2649,10 @@ st_error_t st_policy_eval(st_policy_t *policy, const char *raw_cmd,
     return ST_OK;
   }
 
-  /* ============================================================
-   * SUGGESTION GENERATION
+  /* --- SUGGESTION GENERATION ---
    *
    * Uses existing cmd.tokens — no re-normalize, no trie re-walk.
-   * ============================================================ */
+   */
   double confidence = (double)match_depth / (double)cmd.count;
   const char *based_on = st_find_based_on(policy, match_state);
 
@@ -2805,9 +2763,7 @@ st_error_t st_policy_eval(st_policy_t *policy, const char *raw_cmd,
   return ST_OK;
 }
 
-/* ============================================================
- * VERIFY ALL
- * ============================================================ */
+/* --- VERIFY ALL --- */
 
 typedef struct {
   uint32_t state_idx;
@@ -2940,8 +2896,7 @@ void st_policy_free_matches(const char **matches, size_t count) {
   free((void *)matches);
 }
 
-/* ============================================================
- * NFA RENDERING
+/* --- NFA RENDERING ---
  *
  * Produces NFA-DSL format compatible with the c-dfa subproject's
  * nfa2dfa converter. Uses per-state transition arrays to ensure
@@ -2956,7 +2911,7 @@ void st_policy_free_matches(const char **matches, size_t count) {
  *   NFA_ALPHABET / Identifier / AlphabetSize / States / Initial
  *   Alphabet: (0-255 byte symbols, 256-260 virtual symbols)
  *   State blocks: CategoryMask, PatternId, EosTarget, Tags, Transitions
- * ============================================================ */
+ */
 
 #define VSYM_BYTE_ANY 256
 #define VSYM_EPS 257
@@ -3242,8 +3197,7 @@ st_error_t st_policy_render_nfa(const st_policy_t *policy, const char *path,
   return ok ? ST_OK : ST_ERR_MEMORY;
 }
 
-/* ============================================================
- * SERIALIZATION
+/* --- SERIALIZATION ---
  *
  * Format:
  *   # CPL v1
@@ -3255,7 +3209,7 @@ st_error_t st_policy_render_nfa(const st_policy_t *policy, const char *path,
  *
  * Version 1: one pattern per line, no wildcards in comments.
  * Vacuum filter state is NOT persisted — rebuilt on load.
- * ============================================================ */
+ */
 
 #define ST_SERIALIZATION_VERSION 1
 
@@ -3375,10 +3329,9 @@ st_error_t st_policy_load(st_policy_t *policy, const char *path,
   if (!policy || !path)
     return ST_ERR_INVALID;
 
-  /* ============================================================
-   * PASS 1: Read file, verify CRC, collect pattern lines.
+  /* --- PASS 1: Read file, verify CRC, collect pattern lines ---
    * Do NOT modify the policy yet.
-   * ============================================================ */
+   */
   FILE *fp = fopen(path, "r");
   if (!fp)
     return ST_ERR_IO;
@@ -3553,9 +3506,7 @@ pass1_fail:
   return ST_ERR_FORMAT;
 }
 
-/* ============================================================
- * DIAGNOSTICS
- * ============================================================ */
+/* --- DIAGNOSTICS --- */
 
 static size_t policy_memory_usage_unlocked(const st_policy_t *policy) {
   size_t states_alloc = policy->states.capacity * sizeof(policy_state_t);
@@ -3610,9 +3561,7 @@ size_t st_policy_state_count(const st_policy_t *policy) {
   return result;
 }
 
-/* ============================================================
- * STATISTICS
- * ============================================================ */
+/* --- STATISTICS --- */
 
 void st_policy_get_stats(const st_policy_t *policy, st_policy_stats_t *stats) {
   if (!policy || !stats)
@@ -3635,9 +3584,7 @@ void st_policy_get_stats(const st_policy_t *policy, st_policy_stats_t *stats) {
   pthread_rwlock_unlock((pthread_rwlock_t *)&policy->rwlock);
 }
 
-/* ============================================================
- * DOT GRAPH EXPORT
- * ============================================================ */
+/* --- DOT GRAPH EXPORT --- */
 
 st_error_t st_policy_dump_dot(const st_policy_t *policy, const char *path) {
   if (!policy || !path)
@@ -3729,9 +3676,7 @@ st_error_t st_policy_dump_dot(const st_policy_t *policy, const char *path) {
   return ST_OK;
 }
 
-/* ============================================================
- * DRY-RUN MODE
- * ============================================================ */
+/* --- DRY-RUN MODE --- */
 
 st_error_t st_policy_simulate_add(st_policy_t *policy, const char *pattern,
                                   bool *would_match,
@@ -3756,9 +3701,7 @@ st_error_t st_policy_simulate_add(st_policy_t *policy, const char *pattern,
   return ST_OK;
 }
 
-/* ============================================================
- * POLICY EXPANSION SUGGESTIONS (Miner — Step 2 only)
- * ============================================================ */
+/* --- POLICY EXPANSION SUGGESTIONS (Miner — Step 2 only) --- */
 
 /*
  * Next-wider type in the lattice, capped appropriately.

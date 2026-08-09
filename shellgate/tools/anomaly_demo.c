@@ -103,7 +103,7 @@ int main(int argc, char **argv) {
   bool do_prune = false;
   bool do_compact = false;
 
-  /* Parse arguments */
+  /* Parse CLI options and positional options into runtime settings. */
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
       model_path = argv[++i];

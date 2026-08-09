@@ -133,9 +133,7 @@ static sg_error_t eval_cmd(sg_gate_t *g, const char *cmd, sg_result_t *r) {
   return sg_eval(g, cmd, strlen(cmd), eval_buf, sizeof(eval_buf), r);
 }
 
-/* ============================================================
- * LIFECYCLE
- * ============================================================ */
+/* --- LIFECYCLE --- */
 
 TEST(gate_lifecycle_and_null_safety) {
   sg_gate_t *g = sg_gate_new();
@@ -213,13 +211,7 @@ TEST(setter_matrix) {
   sg_gate_free(g);
 }
 
-/* ============================================================
- * BASIC EVALUATION
- *
- * A pipeline here is the abstract sequence of commands separated by any
- * sequencing point (|, ;, &&, or ||). The gate evaluates that sequence; it
- * does not reproduce the shell's conditional execution semantics.
- * ============================================================ */
+/* --- BASIC EVALUATION --- */
 
 TEST(basic_evaluation_matrix) {
   static const struct {
@@ -301,9 +293,7 @@ TEST(basic_evaluation_matrix) {
   }
 }
 
-/* ============================================================
- * FEATURE REJECTION
- * ============================================================ */
+/* --- FEATURE REJECTION --- */
 
 TEST(reject_subshell) {
   sg_gate_t *g = sg_gate_new();
@@ -367,9 +357,7 @@ TEST(reject_heredoc) {
   sg_gate_free(g);
 }
 
-/* ============================================================
- * SUGGESTIONS
- * ============================================================ */
+/* --- SUGGESTIONS --- */
 
 TEST(suggestion_matrix) {
   static const struct {
@@ -408,9 +396,7 @@ TEST(suggestion_matrix) {
   }
 }
 
-/* ============================================================
- * EDGE CASES
- * ============================================================ */
+/* --- EDGE CASES --- */
 
 TEST(eval_empty_command) {
   sg_gate_t *g = sg_gate_new();
@@ -437,9 +423,7 @@ TEST(eval_parse_error) {
   sg_gate_free(g);
 }
 
-/* ============================================================
- * CONFIGURATION
- * ============================================================ */
+/* --- CONFIGURATION --- */
 
 TEST(stop_mode_matrix) {
   static const struct {
@@ -580,9 +564,7 @@ TEST(pipeline_many_subcommands) {
   sg_gate_free(g);
 }
 
-/* ============================================================
- * POLICY MANAGEMENT
- * ============================================================ */
+/* --- POLICY MANAGEMENT --- */
 
 TEST(policy_mutation_matrix) {
   enum policy_action {
@@ -668,9 +650,7 @@ TEST(policy_mutation_matrix) {
   sg_gate_free(g);
 }
 
-/* ============================================================
- * SERIALIZATION
- * ============================================================ */
+/* --- SERIALIZATION --- */
 
 TEST(save_load_roundtrip) {
   const char *path = temp_policy_file();
@@ -750,9 +730,7 @@ TEST(save_load_malformed) {
   sg_gate_free(g);
 }
 
-/* ============================================================
- * BUFFER MANAGEMENT
- * ============================================================ */
+/* --- BUFFER MANAGEMENT --- */
 
 TEST(buffer_contract_matrix) {
   static const struct {
@@ -824,9 +802,7 @@ TEST(buffer_contract_matrix) {
   sg_gate_free(g);
 }
 
-/* ============================================================
- * VERDICT HELPERS
- * ============================================================ */
+/* --- VERDICT HELPERS --- */
 
 TEST(helper_contracts) {
   static const struct {
@@ -919,9 +895,7 @@ TEST(suggestion_token_variant_contract) {
   sg_gate_free(gate);
 }
 
-/* ============================================================
- * EXPANSION CALLBACKS
- * ============================================================ */
+/* --- EXPANSION CALLBACKS --- */
 
 static size_t expand_home(const char *name, char *buf, size_t buf_size,
                           void *ctx) {
@@ -1079,9 +1053,7 @@ TEST(reject_mask_feature_matrix) {
   }
 }
 
-/* ============================================================
- * VIOLATION SCANNING
- * ============================================================ */
+/* --- VIOLATION SCANNING --- */
 
 static sg_gate_t *gate_with_violations(void) {
   static const char *rules[] = {
@@ -1385,9 +1357,7 @@ TEST(violation_absence_matrix) {
   }
 }
 
-/* ============================================================
- * PROPERTY TESTS
- * ============================================================ */
+/* --- PROPERTY TESTS --- */
 
 #define PROPTEST_COUNT 200
 #define PROPTEST_SEED 42
@@ -1641,9 +1611,7 @@ TEST(property_suggestion_leads_to_allow) {
   ASSERT(total_round_trips > 0);
 }
 
-/* ============================================================
- * ANOMALY DETECTION TESTS
- * ============================================================ */
+/* --- ANOMALY DETECTION TESTS --- */
 
 TEST(anomaly_enable_disable) {
   sg_gate_t *g = sg_gate_new();
@@ -2158,9 +2126,7 @@ TEST(anomaly_cache_equivalence_matrix) {
   sg_gate_free(control);
 }
 
-/* ============================================================
- * SEPARATE SCORE TESTS
- * ============================================================ */
+/* --- SEPARATE SCORE TESTS --- */
 
 TEST(anomaly_separate_scores_basic) {
   /* Both raw and type scores should be populated after training */
@@ -2269,9 +2235,7 @@ TEST(output_overflow_with_type_model_does_not_leak) {
   sg_gate_free(g);
 }
 
-/* ============================================================
- * BAYESIAN COMBINATION TESTS
- * ============================================================ */
+/* --- BAYESIAN COMBINATION TESTS --- */
 
 TEST(bayesian_combination_transitions) {
   static const char *normal[] = {
@@ -2323,9 +2287,7 @@ TEST(bayesian_combination_transitions) {
   sg_gate_free(g);
 }
 
-/* ============================================================
- * MAIN
- * ============================================================ */
+/* --- MAIN --- */
 
 int main(void) {
   atexit(cleanup_temp_files);

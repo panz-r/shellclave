@@ -170,7 +170,7 @@ static bool perturb_shuffle(const char **tokens, size_t count, char *out,
   const char *copy[MAX_TOKENS];
   for (size_t i = 0; i < count; i++)
     copy[i] = tokens[i];
-  /* Fisher-Yates */
+  /* Shuffle token copies in-place using Fisher-Yates. */
   for (size_t i = count - 1; i > 0; i--) {
     size_t j = rand_uint(rng) % (i + 1);
     const char *tmp = copy[i];
@@ -441,7 +441,7 @@ int main(int argc, char **argv) {
     }
   }
 
-  /* Open output */
+  /* Open requested output target (stdout by default). */
   FILE *out = stdout;
   if (output_path) {
     out = fopen(output_path, "w");
@@ -451,7 +451,7 @@ int main(int argc, char **argv) {
     }
   }
 
-  /* Output results */
+  /* Write calibration output in the requested format. */
   if (strcmp(fmt, "json") == 0) {
     fprintf(out, "{\n");
     fprintf(out, "  \"normal_count\": %zu,\n", normal_count);
@@ -501,7 +501,7 @@ int main(int argc, char **argv) {
   if (output_path)
     fclose(out);
 
-  /* Cleanup */
+  /* Release temporary buffers before returning. */
   for (size_t i = 0; i < normal_count; i++)
     free(normal_cmds[i]);
   free(normal_cmds);

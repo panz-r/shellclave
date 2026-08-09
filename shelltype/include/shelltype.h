@@ -18,9 +18,7 @@
 extern "C" {
 #endif
 
-/* ============================================================
- * ERROR CODES
- * ============================================================ */
+/* --- ERROR CODES --- */
 
 typedef enum {
   ST_OK = 0,
@@ -36,9 +34,7 @@ typedef enum {
  */
 const char *st_error_string(st_error_t err);
 
-/* ============================================================
- * CONSTANTS
- * ============================================================ */
+/* --- CONSTANTS --- */
 
 #define ST_DEFAULT_MIN_SUPPORT 5       /* Minimum count to suggest a rule */
 #define ST_DEFAULT_MIN_CONFIDENCE 0.05 /* Minimum confidence threshold */
@@ -51,9 +47,9 @@ const char *st_error_string(st_error_t err);
 #define ST_INITIAL_CHILDREN_CAP 4 /* Initial capacity for children array */
 #define ST_MAX_TOKEN_VARIANTS 8   /* Max type variants for edit UI */
 
-/* ============================================================
- * TOKEN TYPE LATTICE
- *
+/* --- TOKEN TYPE LATTICE --- */
+
+/*
  * Ordering (⊂ = strict subset):
  *   #h ⊂ #n ⊂ #val ⊂ *
  *   #i, #ipv6 ⊂ #ipaddr ⊂ #val ⊂ *
@@ -67,9 +63,10 @@ const char *st_error_string(st_error_t err);
  *   #user_group, #perm ⊂ #val ⊂ *
  *
  * #f and #w are incomparable (a filename is not a word, a word is not a
- * filename). #hash, #hyp ⊂ #w ⊂ #val ⊂ * Ambiguous tokens (e.g., "Makefile"
- * could be #w or #f) require user disambiguation.
- * ============================================================ */
+ * filename). #hash, #hyp ⊂ #w ⊂ #val ⊂ *
+ * Ambiguous tokens (e.g., "Makefile") could be #w or #f and require user
+ * disambiguation.
+ */
 
 typedef enum {
   ST_TYPE_LITERAL = 0,  /* Exact string match (bottom element) */
@@ -159,9 +156,7 @@ static inline bool st_is_compatible(st_token_type_t cmd_type,
   return st_type_compatible[cmd_type][policy_type];
 }
 
-/* ============================================================
- * TYPED TOKEN
- * ============================================================ */
+/* --- TYPED TOKEN --- */
 
 /**
  * A token with its classified type.
@@ -179,9 +174,7 @@ typedef struct st_token_array {
   size_t count;
 } st_token_array_t;
 
-/* ============================================================
- * DATA STRUCTURES (Learner Trie)
- * ============================================================ */
+/* --- DATA STRUCTURES (Learner Trie) --- */
 
 /**
  * A node in the Normalised Command Trie.
@@ -229,47 +222,35 @@ typedef struct st_learner {
   size_t blacklist_capacity;
 } st_learner_t;
 
-/* ============================================================
- * LIFECYCLE
- * ============================================================ */
+/* --- LIFECYCLE --- */
 
 st_learner_t *st_learner_new(uint32_t min_support, double min_confidence);
 void st_learner_free(st_learner_t *learner);
 
-/* ============================================================
- * FEEDING COMMANDS
- * ============================================================ */
+/* --- FEEDING COMMANDS --- */
 
 st_error_t st_feed(st_learner_t *learner, const char *raw_cmd);
 st_error_t st_feed_parsed(st_learner_t *learner, const char *raw_cmd,
                           const void *parse);
 
-/* ============================================================
- * SUGGESTIONS
- * ============================================================ */
+/* --- SUGGESTIONS --- */
 
 /* Returns NULL and clears out_count when no suggestions can be produced or
  * the learner is invalid. */
 st_suggestion_t *st_suggest(st_learner_t *learner, size_t *out_count);
 void st_free_suggestions(st_suggestion_t *suggestions, size_t count);
 
-/* ============================================================
- * BLACKLIST
- * ============================================================ */
+/* --- BLACKLIST --- */
 
 st_error_t st_blacklist_add(st_learner_t *learner, const char *pattern);
 bool st_is_blacklisted(const st_learner_t *learner, const char *pattern);
 
-/* ============================================================
- * SERIALISATION
- * ============================================================ */
+/* --- SERIALISATION --- */
 
 st_error_t st_save(const st_learner_t *learner, const char *path);
 st_error_t st_load(st_learner_t *learner, const char *path);
 
-/* ============================================================
- * NORMALISATION (public for testing)
- * ============================================================ */
+/* --- NORMALISATION (public for testing) --- */
 
 /**
  * Normalise a raw command string into an array of typed tokens.
@@ -321,9 +302,7 @@ const char *st_path_extension(const char *text);
  */
 const char *st_size_suffix(const char *text);
 
-/* ============================================================
- * POLICY STATISTICS
- * ============================================================ */
+/* --- POLICY STATISTICS --- */
 
 /**
  * Policy statistics for monitoring and tuning.
@@ -341,9 +320,7 @@ typedef struct {
   size_t memory_bytes;   /* Total memory usage */
 } st_policy_stats_t;
 
-/* ============================================================
- * POLICY MODULE (arena-allocated, NFA-renderable)
- * ============================================================ */
+/* --- POLICY MODULE (arena-allocated, NFA-renderable) --- */
 
 /**
  * Shared policy context: stable chunk allocator, string pool, and shared state.
@@ -552,9 +529,7 @@ typedef struct {
  */
 st_error_t st_validate_pattern(const char *pattern, st_pattern_info_t *info);
 
-/* ============================================================
- * POLICY EXPANSION SUGGESTIONS (Miner)
- * ============================================================ */
+/* --- POLICY EXPANSION SUGGESTIONS (Miner) --- */
 
 /**
  * Step 2: Given a chosen pattern (as typed tokens), suggest up to 3
@@ -573,9 +548,7 @@ typedef struct st_token_variant {
 size_t st_policy_suggest_variants(const st_policy_t *policy,
                                   const st_token_t *tokens, size_t token_count,
                                   st_expand_suggestion_t out[3]);
-/* ============================================================
- * TOKEN VARIANT EDITING (for TUI edit mode)
- * ============================================================ */
+/* --- TOKEN VARIANT EDITING (for TUI edit mode) --- */
 
 /**
  * Suggest type variants for editing a specific token position in a pattern.

@@ -10,20 +10,19 @@ struct shell_interop_handle {
   char cmd_buffer[SHELL_INTEROP_BUFFER_SIZE];
 };
 
-/* Create a new interop handle */
 shell_interop_handle_t *shell_interop_create(void) {
   shell_interop_handle_t *handle = calloc(1, sizeof(shell_interop_handle_t));
   return handle;
 }
 
-/* Destroy an interop handle */
+/* Release interop parser state allocated by shell_interop_create(). */
 void shell_interop_destroy(shell_interop_handle_t *handle) {
   if (handle) {
     free(handle);
   }
 }
 
-/* Parse a shell command */
+/* Parse command text and run fast parsing into the interop handle result. */
 int shell_interop_parse(shell_interop_handle_t *handle, const char *cmd,
                         int cmd_len) {
   if (handle == NULL) {
@@ -55,7 +54,7 @@ int shell_interop_parse(shell_interop_handle_t *handle, const char *cmd,
   /* Use default limits */
   shell_limits_t limits = SHELL_LIMITS_DEFAULT;
 
-  /* Parse the command */
+  /* Run parser over buffered command and populate handle->result. */
   shell_error_t err =
       shell_parse_fast(handle->cmd_buffer, cmd_len, &limits, &handle->result);
 

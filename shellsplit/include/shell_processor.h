@@ -10,15 +10,16 @@ extern "C" {
 #endif
 
 /**
- * Extracts command-stage text and shell syntax metadata for DFA consumers.
+ * Parsed command metadata for downstream consumers.
  */
 
 /**
- * Shell command structure with separated concerns
+ * Parsed shell command metadata, including original/clean text and tokenized
+ * details.
  */
 typedef struct {
   const char *original_command; // Owned full command-stage text
-  const char *clean_command;    // Owned command without shell syntax (for DFA)
+  const char *clean_command;    // Owned command text with shell syntax removed
   // Token text points into original_command, and positions are relative to it.
   shell_token_t *shell_tokens;   // Shell operators and redirections
   size_t shell_token_count;      // Number of shell tokens
@@ -59,14 +60,15 @@ shell_process_status_t shell_process_command(
     shell_command_info_t **command_infos, size_t *command_count);
 
 /**
- * Free command info structures
+ * Free shell_command_info_t values and associated owned allocations.
+ * Safe to call with a NULL pointer.
  */
 void shell_free_command_infos(shell_command_info_t *infos, size_t count);
 
 /**
- * Get clean command for DFA validation
+ * Get clean command text
  *
- * Returns command string without shell syntax
+ * Returns shell-stripped command text, or NULL for NULL input.
  */
 const char *shell_get_clean_command(shell_command_info_t *info);
 
@@ -77,9 +79,10 @@ const char *shell_get_clean_command(shell_command_info_t *info);
 bool shell_has_dangerous_features(shell_command_info_t *info);
 
 /**
- * Process command line and extract DFA inputs. The caller owns each returned
- * string and the containing array. On failure, writable outputs are set to
- * NULL, zero, and false.
+ * Parse command line and return clean per-command inputs for downstream
+ * processing, while reporting whether shell features are present for
+ * caller-side handling. The caller owns each returned string and the containing
+ * array. On failure, writable outputs are set to NULL, zero, and false.
  */
 shell_process_status_t shell_extract_dfa_inputs(
     const char *command_line, const shell_process_limits_t *limits,
