@@ -317,8 +317,8 @@ static int test_serialization_roundtrip_and_validation(void) {
   char path[] = "/tmp/shelltype-learner-XXXXXX";
   int fd = mkstemp(path);
   ASSERT(fd >= 0);
-  close(fd);
   snprintf(learner_temp_path, sizeof(learner_temp_path), "%s", path);
+  close(fd);
 
   st_learner_t *source = st_learner_new(3, 0.0);
   st_learner_t *loaded = st_learner_new(3, 0.0);

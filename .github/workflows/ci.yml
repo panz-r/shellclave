@@ -65,8 +65,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes wget ca-certificates gnupg lsb-release
           sudo mkdir -p /usr/share/keyrings
-          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key \
-            | gpg --dearmor \
+          LLVM_KEY_FILE="$(mktemp)"
+          cleanup_llvm_key() { rm -f "$LLVM_KEY_FILE"; }
+          trap cleanup_llvm_key EXIT
+          wget -qO "$LLVM_KEY_FILE" https://apt.llvm.org/llvm-snapshot.gpg.key
+          gpg --dearmor < "$LLVM_KEY_FILE" \
             | sudo tee /usr/share/keyrings/llvm-toolchain-21.gpg >/dev/null
           source /etc/os-release
           LLVM_DISTRO="${VERSION_CODENAME:-$(lsb_release -sc)}"

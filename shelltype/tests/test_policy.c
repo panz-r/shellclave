@@ -152,8 +152,8 @@ static int test_policy_persistence_transitions(void) {
   char path[] = "/tmp/shelltype-policy-XXXXXX";
   int fd = mkstemp(path);
   ASSERT(fd >= 0);
-  ASSERT(close(fd) == 0);
   snprintf(policy_temp_paths[0], sizeof(policy_temp_paths[0]), "%s", path);
+  ASSERT(close(fd) == 0);
 
   st_policy_ctx_t *ctx = st_policy_ctx_new();
   st_policy_t *source = st_policy_new(ctx);
@@ -518,8 +518,8 @@ static int test_dot_export(void) {
   char path[] = "/tmp/shelltype-policy-dot-XXXXXX";
   int fd = mkstemp(path);
   ASSERT(fd >= 0);
-  ASSERT(close(fd) == 0);
   snprintf(policy_temp_paths[1], sizeof(policy_temp_paths[1]), "%s", path);
+  ASSERT(close(fd) == 0);
   st_policy_ctx_t *ctx = st_policy_ctx_new();
   st_policy_t *policy = st_policy_new(ctx);
   ASSERT(policy != NULL);

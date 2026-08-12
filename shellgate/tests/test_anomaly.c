@@ -251,8 +251,8 @@ TEST(save_load_roundtrip) {
   char path[] = "/tmp/shellclave-anomaly-XXXXXX";
   int fd = mkstemp(path);
   ASSERT(fd >= 0);
-  close(fd);
   snprintf(anomaly_temp_path, sizeof(anomaly_temp_path), "%s", path);
+  close(fd);
 
   sg_anomaly_model_t *source = sg_anomaly_model_new_ex(0.5, -8.0);
   sg_anomaly_model_t *loaded = sg_anomaly_model_new();
