@@ -1,0 +1,9 @@
+2copy /tmp/a
+2copy /tmp/b
+=copy #path
+8container #uuid.v4
+8container #uuid.v5
+;merge policies
+<diff policies
+>copy #path
+?copy /tmp/a

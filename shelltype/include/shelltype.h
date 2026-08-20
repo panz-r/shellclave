@@ -27,6 +27,7 @@ typedef enum {
   ST_ERR_IO = -3,
   ST_ERR_FAILED = -4,
   ST_ERR_FORMAT = -5,
+  ST_ERR_LIMIT = -6,
 } st_error_t;
 
 /**
@@ -51,7 +52,8 @@ const char *st_error_string(st_error_t err);
 
 /*
  * Ordering (⊂ = strict subset):
- *   #h ⊂ #n ⊂ #val ⊂ *
+ *   #sha ⊂ #h ⊂ #val ⊂ *
+ *   #n ⊂ #val ⊂ *
  *   #i, #ipv6 ⊂ #ipaddr ⊂ #val ⊂ *
  *   #w ⊂ #val ⊂ *
  *   #q ⊂ #qs ⊂ #val ⊂ *
@@ -181,13 +183,16 @@ typedef struct st_token_array {
  * Each node represents one token in a normalised command sequence.
  */
 typedef struct st_node {
-  char *token;               /* Normalised token text or type symbol */
-  st_token_type_t type;      /* Token type (ST_TYPE_LITERAL for exact match) */
-  uint32_t count;            /* Number of commands reaching this node */
-  uint64_t observed_types;   /* Bitmask of types observed at this position */
-  char **sample_values;      /* Original token values seen (for debugging) */
-  size_t num_samples;        /* Number of samples stored */
-  struct st_node **children; /* Array of child pointers */
+  char *token;             /* Normalised token text or type symbol */
+  st_token_type_t type;    /* Token type (ST_TYPE_LITERAL for exact match) */
+  uint32_t count;          /* Number of commands reaching this node */
+  uint64_t observed_types; /* Bitmask of types observed at this position */
+  char **sample_values;    /* Original token values seen (for debugging) */
+  size_t num_samples;      /* Number of samples stored */
+  uint32_t metadata_observations; /* Typed values considered for metadata */
+  uint16_t common_metadata;       /* Internal closed-vocabulary metadata id */
+  bool metadata_mixed;            /* Metadata differed or was unavailable */
+  struct st_node **children;      /* Array of child pointers */
   size_t num_children;
   size_t children_capacity;
 } st_node_t;
@@ -204,9 +209,9 @@ typedef struct st_trie {
  * A suggestion candidate generated from the trie.
  */
 typedef struct st_suggestion {
-  char *pattern;     /* e.g., "git commit -m #n" */
-  uint32_t count;    /* Number of commands matching this pattern */
-  double confidence; /* Relative confidence (node.count / parent.count) */
+  char *pattern;     /* Complete policy rule, e.g. "git commit -m #n" */
+  uint32_t count;    /* Number of learned commands fully matched by the rule */
+  double confidence; /* Support relative to commands at its divergence */
 } st_suggestion_t;
 
 /**
@@ -229,14 +234,19 @@ void st_learner_free(st_learner_t *learner);
 
 /* --- FEEDING COMMANDS --- */
 
+/* Feed operations are atomic: on error the learner is unchanged. raw_cmd is
+ * one already-isolated, execute-program-style subcommand, not a compound shell
+ * program. Tokens at or above ST_MAX_TOKEN_LEN are rejected. Use
+ * st_feed_parsed when exact token boundaries are already available. */
 st_error_t st_feed(st_learner_t *learner, const char *raw_cmd);
 st_error_t st_feed_parsed(st_learner_t *learner, const char *raw_cmd,
                           const void *parse);
 
 /* --- SUGGESTIONS --- */
 
-/* Returns NULL and clears out_count when no suggestions can be produced or
- * the learner is invalid. */
+/* Returns complete policy rules, never command prefixes. Returns NULL and
+ * clears out_count when no suggestions can be produced or the learner is
+ * invalid. */
 st_suggestion_t *st_suggest(st_learner_t *learner, size_t *out_count);
 void st_free_suggestions(st_suggestion_t *suggestions, size_t count);
 
@@ -247,6 +257,10 @@ bool st_is_blacklisted(const st_learner_t *learner, const char *pattern);
 
 /* --- SERIALISATION --- */
 
+/* Learner state uses the strict v3 node format; older formats are rejected.
+ * Successful saves use synchronized same-directory atomic replacement.
+ * Concurrent saves to the same destination require external synchronization.
+ */
 st_error_t st_save(const st_learner_t *learner, const char *path);
 st_error_t st_load(st_learner_t *learner, const char *path);
 
@@ -255,6 +269,11 @@ st_error_t st_load(st_learner_t *learner, const char *path);
 /**
  * Normalise a raw command string into an array of typed tokens.
  * Each token is classified into the most specific type in the lattice.
+ * Token text remains the complete concrete input token; it is never replaced
+ * with a synthesized wildcard or metadata-bearing symbol.
+ * The input is one already-isolated, execute-program-style subcommand. Shell
+ * control flow and compound command isolation belong to an upstream parser.
+ * Commands with more than ST_MAX_CMD_TOKENS tokens return ST_ERR_INVALID.
  *
  * The caller must free the returned array with st_free_token_array().
  */
@@ -336,8 +355,17 @@ typedef struct st_policy_ctx st_policy_ctx_t;
 
 /**
  * Opaque policy trie stored in a shared policy context.
+ *
+ * Concurrent logical readers of a stable policy are supported, including
+ * evaluation, verification, diagnostics, save, and graph export. Although
+ * evaluation may warm internal caches, it remains a logical read operation.
+ * Pattern mutation, load, merge, compaction, clear, and destruction require
+ * external serialization against every other operation on that policy.
  */
 typedef struct st_policy st_policy_t;
+
+/* The policy trie stores active pattern identifiers in 16 bits. */
+#define ST_MAX_POLICY_PATTERNS UINT16_MAX
 
 /**
  * NFA render options.
@@ -384,6 +412,7 @@ void st_policy_free(st_policy_t *policy);
 /* --- Pattern management --- */
 
 st_error_t st_policy_add(st_policy_t *policy, const char *pattern);
+/* Adds all patterns atomically; on failure the policy is unchanged. */
 st_error_t st_policy_batch_add(st_policy_t *policy, const char **patterns,
                                size_t count);
 st_error_t st_policy_remove(st_policy_t *policy, const char *pattern);
@@ -397,6 +426,9 @@ size_t st_policy_count(const st_policy_t *policy);
  */
 typedef struct {
   char pattern[ST_MAX_PATTERN_LEN];
+  /* Borrowed from policy storage. Valid only while the owning policy remains
+   * stable; mutation, load, clear, compaction, or destruction invalidates it.
+   */
   const char *based_on; /* Existing pattern this extends, or NULL */
   double confidence;    /* matched_prefix_tokens / total_cmd_tokens */
 } st_expand_suggestion_t;
@@ -406,6 +438,9 @@ typedef struct {
  */
 typedef struct {
   bool matches;
+  /* Borrowed from policy storage. Valid only while the owning policy remains
+   * stable; mutation, load, clear, compaction, or destruction invalidates it.
+   */
   const char *matching_pattern; /* NULL if no match */
   size_t suggestion_count;      /* 0-2, only filled if !matches */
   st_expand_suggestion_t suggestions[2];
@@ -415,8 +450,12 @@ typedef struct {
 /**
  * Unified evaluate + suggest.
  *
- * Walks the policy trie with the command. If it matches, sets
+ * Walks the policy trie with one already-isolated, execute-program-style
+ * subcommand. Compound shell syntax must be split by an upstream parser. If it
+ * matches, sets
  * result->matches=true and result->matching_pattern.
+ * When several patterns match, matching_pattern is the narrowest pattern;
+ * equivalent or incomparable matches are ordered lexicographically.
  *
  * If it doesn't match and result is non-NULL, generates up to 2
  * expansion suggestions in result->suggestions[].
@@ -439,11 +478,21 @@ void st_policy_free_matches(const char **matches, size_t count);
 
 /* --- NFA rendering --- */
 
+/* Provisional Shellclave-to-c-dfa graph export. Each typed transition contains
+ * one predefined lattice symbol plus an optional canonical metadata
+ * annotation. Metadata is not a new lattice element and is never copied from
+ * concrete token text. The interchange format is not yet stable. Successful
+ * renders use synchronized same-directory atomic replacement. */
 st_error_t st_policy_render_nfa(const st_policy_t *policy, const char *path,
                                 const st_nfa_render_opts_t *opts);
 
 /* --- Serialization --- */
 
+/* A successful save synchronizes the complete temporary file, atomically
+ * replaces path, and synchronizes its parent directory. ST_ERR_IO after the
+ * atomic replacement can leave either the previous or new complete file
+ * durable across a crash. Concurrent saves to the same path require external
+ * synchronization. */
 st_error_t st_policy_save(const st_policy_t *policy, const char *path);
 st_error_t st_policy_load(st_policy_t *policy, const char *path,
                           bool clear_first);
@@ -455,7 +504,8 @@ st_error_t st_policy_clear(st_policy_t *policy);
 /**
  * Merge all patterns from src into dst. Duplicates are skipped.
  * Takes write lock on dst, read lock on src.
- * Returns ST_OK on success, or the first error encountered.
+ * The merge is atomic: on failure, dst is unchanged. Returns ST_OK on success
+ * or the error that prevented the merge.
  */
 st_error_t st_policy_merge(st_policy_t *dst, const st_policy_t *src);
 
@@ -503,8 +553,10 @@ st_error_t st_policy_dump_dot(const st_policy_t *policy, const char *path);
 
 /**
  * Simulate adding a pattern without modifying the policy.
- * Returns whether the pattern would match any existing pattern.
- * Note: may trigger lazy filter rebuild, so policy is non-const.
+ * Reports whether an existing pattern subsumes the proposed pattern. When it
+ * does, conflicting_pattern receives the canonical existing pattern that
+ * makes the proposal redundant. A broader proposal that would replace an
+ * existing narrower pattern is not reported as redundant.
  */
 st_error_t st_policy_simulate_add(st_policy_t *policy, const char *pattern,
                                   bool *would_match,
@@ -540,11 +592,16 @@ st_error_t st_validate_pattern(const char *pattern, st_pattern_info_t *info);
  */
 /* Single token variant for edit UI (one option in the list) */
 typedef struct st_token_variant {
-  st_token_type_t type;     /* The type to suggest */
-  const char *type_symbol;  /* e.g., "#path", "#val", "*" */
+  st_token_type_t type;    /* The type to suggest */
+  const char *type_symbol; /* Static type symbol, e.g. "#path" or "*" */
+  /* Borrowed from learner storage. Valid only while the learner remains
+   * stable; feeding, loading, or destruction may invalidate it. */
   const char *sample_value; /* Optional sample from history (can be NULL) */
 } st_token_variant_t;
 
+/* Returns zero and clears all three outputs if an allocation fails, any
+ * candidate exceeds ST_MAX_PATTERN_LEN, or an input token cannot be represented
+ * faithfully by the space-delimited policy grammar. */
 size_t st_policy_suggest_variants(const st_policy_t *policy,
                                   const st_token_t *tokens, size_t token_count,
                                   st_expand_suggestion_t out[3]);
@@ -554,8 +611,13 @@ size_t st_policy_suggest_variants(const st_policy_t *policy,
  * Suggest type variants for editing a specific token position in a pattern.
  *
  * Given a pattern with tokens and an edit position, walks the learner trie
- * to find observed type variants at that position. Returns options from more
- * specific to more general, including the wildcard (*) as most general.
+ * to find observed type variants at that position. The current type is kept
+ * first when it was observed. Remaining alternatives are deterministic and
+ * ordered from more specific to more general; incomparable alternatives use
+ * st_token_type_t order as a stable tie-break. If the result is truncated,
+ * that same order decides which alternatives are retained. Except at command
+ * position zero, where policy grammar forbids it, the wildcard (*) is always
+ * the final, most-general option.
  *
  * @param learner    The learner/trie context
  * @param pattern_tokens  Array of pattern token strings (e.g., ["git", "#p"])
@@ -563,7 +625,8 @@ size_t st_policy_suggest_variants(const st_policy_t *policy,
  * @param edit_pos       Position to edit (0-indexed)
  * @param out_variants   Output array (caller allocates ST_MAX_TOKEN_VARIANTS
  * entries)
- * @return Number of variants written to out_variants
+ * @return Number of variants written to out_variants, or zero if the input
+ *         token array cannot be represented by policy grammar
  */
 size_t st_policy_suggest_token_variants(st_learner_t *learner,
                                         const char **pattern_tokens,

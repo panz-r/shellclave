@@ -1,0 +1,4 @@
+copy #path.cfg
+copy /tmp/config.cfg
+copy #path.cfg
+compact

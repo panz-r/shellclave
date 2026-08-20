@@ -54,6 +54,21 @@ jobs:
       - run: cmake --build build --parallel 2
       - run: ctest --test-dir build --output-on-failure
 
+  thread-sanitizer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - run: >-
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+          -DSHELLCLAVE_ENABLE_TSAN=ON
+      - run: cmake --build build --parallel 2 --target shelltype_policy_concurrency_test
+      - run: >-
+          ctest --test-dir build -R '^shelltype_policy_concurrency_test$'
+          --output-on-failure
+
   static-analysis:
     runs-on: ubuntu-latest
     steps:
@@ -96,3 +111,28 @@ jobs:
           -DSHELLCLAVE_BUILD_FUZZERS=ON
       - run: cmake --build build --parallel 2
       - run: cmake --build build --target fuzz-smoke
+
+  coverage-report:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - run: python3 -m pip install gcovr
+      - run: >-
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+          -DSHELLCLAVE_ENABLE_COVERAGE=ON
+      - run: cmake --build build --parallel 2
+      - run: ctest --test-dir build -R '^shelltype_' --output-on-failure
+      - name: Produce Shelltype coverage reports
+        run: >-
+          gcovr --root . --filter shelltype/src --print-summary
+          --gcov-ignore-parse-errors=negative_hits.warn_once_per_file
+          --fail-under-line 89 --fail-under-branch 79
+          --txt=coverage.txt --xml-pretty --xml=coverage.xml
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shelltype-coverage
+          path: |
+            coverage.txt
+            coverage.xml

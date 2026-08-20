@@ -16,12 +16,15 @@
 
 #include "shelltype.h"
 
+#include <arpa/inet.h>
 #include <ctype.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+
+#include "alloc.h"
 
 /* --- TYPE SYMBOLS --- */
 
@@ -88,7 +91,7 @@ const char *st_type_symbol[ST_TYPE_COUNT] = {
  *   #u ⊂ *
  *   #sopt, #lopt ⊂ #opt ⊂ #val ⊂ *
  *   #uuid, #email, #host, #size, #semver, #ts, #env ⊂ #val ⊂ *
- *   #port ⊂ #n, #port ⊂ #i, #port ⊂ #val ⊂ *
+ *   #port ⊂ #n ⊂ #val ⊂ *
  *   #hash, #hyp, #method ⊂ #w ⊂ #val ⊂ *
  *   #mac, #cron, #duration, #branch, #image, #pkg, #user, #fp ⊂ #val ⊂ *
  */
@@ -992,77 +995,29 @@ static bool is_ipv6(const char *token) {
    * and optional zone index (%iface).
    * Examples: 2001:db8::1, ::1, fe80::1%eth0, ::ffff:192.168.1.1 */
   size_t len = strlen(token);
-  if (len < 2 || len > 45)
+  if (len < 2)
     return false;
 
-  /* Must not start or end with ':' unless it's '::' */
-  if (token[0] == ':' && token[1] != ':')
-    return false;
-  if (len > 1 && token[len - 1] == ':') {
-    if (len < 2 || token[len - 2] != ':')
-      return false;
-  }
-
-  /* Check for zone index (%eth0) */
+  /* inet_pton does not accept an RFC 4007 zone identifier, so validate and
+   * remove it before parsing the address proper. */
   const char *zone = strchr(token, '%');
   if (zone) {
-    /* Zone must be at end, and rest must be valid ident */
-    size_t zone_len = strlen(zone + 1);
-    if (zone_len == 0)
+    if (zone == token || zone[1] == '\0' || strchr(zone + 1, '%'))
       return false;
     for (const char *z = zone + 1; *z; z++) {
-      if (!isalnum((unsigned char)*z))
+      if (!isalnum((unsigned char)*z) && *z != '_' && *z != '.' && *z != '-')
         return false;
     }
-    /* Check address part before zone */
-    size_t addr_len = (size_t)(zone - token);
-    char *addr = strndup(token, addr_len);
-    bool result = is_ipv6(addr);
-    free(addr);
-    return result;
   }
 
-  /* Count colons and groups */
-  int colon_count = 0;
-  int groups = 0;
-  int double_colon = 0;
-  const char *p = token;
-
-  while (*p) {
-    if (*p == ':') {
-      colon_count++;
-      if (p[1] == ':') {
-        double_colon++;
-        if (double_colon > 1)
-          return false;
-        p += 2;
-        /* Reject triple colon (:::) */
-        if (*p == ':')
-          return false;
-        groups++; /* empty group counts */
-        continue;
-      }
-      p++;
-    } else if (isxdigit((unsigned char)*p)) {
-      /* Read hex group */
-      int digits = 0;
-      while (*p && isxdigit((unsigned char)*p)) {
-        digits++;
-        p++;
-        if (digits > 4)
-          return false;
-      }
-      groups++;
-    } else {
-      return false;
-    }
-  }
-
-  if (double_colon) {
-    return groups >= 1 && groups <= 8;
-  }
-  /* Without ::, must have exactly 8 groups and 7 colons */
-  return groups == 8 && colon_count == 7;
+  size_t address_len = zone ? (size_t)(zone - token) : len;
+  if (address_len == 0 || address_len >= INET6_ADDRSTRLEN)
+    return false;
+  char address[INET6_ADDRSTRLEN];
+  memcpy(address, token, address_len);
+  address[address_len] = '\0';
+  struct in6_addr parsed;
+  return inet_pton(AF_INET6, address, &parsed) == 1;
 }
 
 static bool is_mac(const char *token) {
@@ -1197,9 +1152,11 @@ static bool is_url(const char *token) {
     return false;
   if (colon[1] != '/' || colon[2] != '/')
     return false;
-  /* Check protocol part is alphabetic */
-  for (const char *p = token; p < colon; p++) {
-    if (!isalpha((unsigned char)*p))
+  /* RFC 3986 scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." ). */
+  if (colon == token || !isalpha((unsigned char)token[0]))
+    return false;
+  for (const char *p = token + 1; p < colon; p++) {
+    if (!isalnum((unsigned char)*p) && *p != '+' && *p != '-' && *p != '.')
       return false;
   }
   return true;
@@ -2527,6 +2484,10 @@ fail:
 /* --- PUBLIC API: TYPED NORMALISATION --- */
 
 st_error_t st_normalize_typed(const char *raw_cmd, st_token_array_t *out) {
+  if (out) {
+    out->tokens = NULL;
+    out->count = 0;
+  }
   if (!raw_cmd || !out)
     return ST_ERR_INVALID;
 
@@ -2543,6 +2504,13 @@ st_error_t st_normalize_typed(const char *raw_cmd, st_token_array_t *out) {
     return ST_OK;
   }
 
+  if (raw_count > ST_MAX_CMD_TOKENS ||
+      raw_count > SIZE_MAX / (2 * sizeof(st_token_t))) {
+    for (size_t i = 0; i < raw_count; i++)
+      free(raw_tokens[i]);
+    free(raw_tokens);
+    return ST_ERR_INVALID;
+  }
   /* Worst case: every token splits into 2 (e.g., --flag=value → 2 tokens) */
   out->tokens = calloc(raw_count * 2, sizeof(st_token_t));
   if (!out->tokens) {
@@ -2689,166 +2657,9 @@ st_error_t st_normalize_typed(const char *raw_cmd, st_token_array_t *out) {
       continue;
     }
 
-    /* Parametrized wildcards: classify base type first, then override text
-     * for recognized parametrized forms (e.g., sha256 → #hash.sha256).
-     * This runs for every token; specific cases are handled here. */
-    {
-      st_token_type_t base_type = st_classify_token(tok);
-      char *text = strdup(tok);
-      if (!text)
-        goto fail;
-      out->tokens[out->count].text = text;
-      out->tokens[out->count].type = base_type;
-
-      /* Try each parametrized form in order. Only replace text if matched. */
-      char buf[64];
-
-      /* Check for already-parametrized tokens (#sha.40, #hash.sha256, etc.)
-       * These may be classified as other types (FILENAME) due to dot in name.
-       * Handle them before checking base_type to ensure correct symbol. */
-      if (strncmp(tok, "#sha.", 5) == 0 && strlen(tok) > 5) {
-        /* Already has #sha. prefix - verify it's valid and use as-is */
-        const char *variant = tok + 5;
-        if (strcmp(variant, "short") == 0 || strcmp(variant, "40") == 0 ||
-            strcmp(variant, "64") == 0) {
-          out->tokens[out->count].type = ST_TYPE_SHA;
-          /* Text is already correct (#sha.40) */
-        }
-      } else if (strncmp(tok, "#hash.", 6) == 0 && strlen(tok) > 6) {
-        /* Already has #hash. prefix - use as-is */
-        out->tokens[out->count].type = ST_TYPE_HASH_ALGO;
-      } else if (strncmp(tok, "#image.", 7) == 0 && strlen(tok) > 7) {
-        /* Already has #image. prefix - use as-is */
-        out->tokens[out->count].type = ST_TYPE_IMAGE;
-      } else if (strncmp(tok, "#pkg.", 5) == 0 && strlen(tok) > 5) {
-        /* Already has #pkg. prefix - use as-is */
-        out->tokens[out->count].type = ST_TYPE_PKG;
-      } else if (strncmp(tok, "#duration.", 10) == 0 && strlen(tok) > 10) {
-        /* Already has #duration. prefix - use as-is */
-        out->tokens[out->count].type = ST_TYPE_DURATION;
-      } else if (strncmp(tok, "#signal.", 8) == 0 && strlen(tok) > 8) {
-        /* Already has #signal. prefix - use as-is */
-        out->tokens[out->count].type = ST_TYPE_SIGNAL;
-      } else if (strncmp(tok, "#branch.", 8) == 0 && strlen(tok) > 8) {
-        /* Already has #branch. prefix - use as-is */
-        out->tokens[out->count].type = ST_TYPE_BRANCH;
-      } else if (strncmp(tok, "#range.", 7) == 0) {
-        /* Already has #range. prefix - use as-is */
-        out->tokens[out->count].type = ST_TYPE_RANGE;
-      } else if (strncmp(tok, "#perm.", 6) == 0) {
-        /* Already has #perm. prefix - use as-is */
-        out->tokens[out->count].type = ST_TYPE_PERM_OCTAL;
-      }
-
-      /* Now handle tokens classified by base_type */
-      if (base_type == ST_TYPE_HASH_ALGO) {
-        /* Known hash algorithms: token IS the algorithm name */
-        snprintf(buf, sizeof(buf), "#hash.%s", tok);
-        free(text);
-        out->tokens[out->count].text = strdup(buf);
-        if (!out->tokens[out->count].text)
-          goto fail;
-      } else if (base_type == ST_TYPE_IMAGE) {
-        /* Extract registry prefix (first / before : or @) */
-        const char *slash = strchr(tok, '/');
-        const char *colon = strchr(tok, ':');
-        const char *at = strchr(tok, '@');
-        const char *first_sep = colon ? colon : at;
-        if (slash && (!first_sep || slash < first_sep)) {
-          size_t reg_len = (size_t)(slash - tok);
-          snprintf(buf, sizeof(buf), "#image.%.*s", (int)reg_len, tok);
-          free(text);
-          out->tokens[out->count].text = strdup(buf);
-          if (!out->tokens[out->count].text)
-            goto fail;
-        }
-      } else if (base_type == ST_TYPE_PKG) {
-        /* Scoped packages: @scope/name → scope = name part after @ before / */
-        if (tok[0] == '@') {
-          const char *slash = strchr(tok, '/');
-          if (slash) {
-            size_t scope_len = (size_t)(slash - tok - 1);
-            if (scope_len > 0 && scope_len < sizeof(buf) - 8) {
-              snprintf(buf, sizeof(buf), "#pkg.@%.*s", (int)scope_len, tok + 1);
-              free(text);
-              out->tokens[out->count].text = strdup(buf);
-              if (!out->tokens[out->count].text)
-                goto fail;
-            }
-          }
-        }
-      } else if (base_type == ST_TYPE_BRANCH) {
-        /* Branch prefix: feature/login → prefix = part before / */
-        const char *slash = strchr(tok, '/');
-        if (slash) {
-          size_t prefix_len = (size_t)(slash - tok);
-          snprintf(buf, sizeof(buf), "#branch.%.*s", (int)prefix_len, tok);
-          free(text);
-          out->tokens[out->count].text = strdup(buf);
-          if (!out->tokens[out->count].text)
-            goto fail;
-        }
-      } else if (base_type == ST_TYPE_SHA) {
-        /* SHA length variant */
-        size_t len = strlen(tok);
-        const char *variant;
-        if (len == 7)
-          variant = "short";
-        else if (len == 40)
-          variant = "40";
-        else if (len == 64)
-          variant = "64";
-        else
-          variant = NULL;
-        if (variant) {
-          snprintf(buf, sizeof(buf), "#sha.%s", variant);
-          free(text);
-          out->tokens[out->count].text = strdup(buf);
-          if (!out->tokens[out->count].text)
-            goto fail;
-        }
-      } else if (base_type == ST_TYPE_DURATION) {
-        /* Duration unit suffix */
-        const char *p = tok;
-        if (*p == '-')
-          p++;
-        while (*p && (isdigit((unsigned char)*p) || *p == '.'))
-          p++;
-        if (*p) {
-          snprintf(buf, sizeof(buf), "#duration.%s", p);
-          free(text);
-          out->tokens[out->count].text = strdup(buf);
-          if (!out->tokens[out->count].text)
-            goto fail;
-        }
-      } else if (base_type == ST_TYPE_SIGNAL) {
-        /* Signal name: strip SIG prefix, use bare name */
-        const char *sig = tok;
-        if (strncmp(sig, "SIG", 3) == 0)
-          sig += 3;
-        snprintf(buf, sizeof(buf), "#signal.%s", sig);
-        free(text);
-        out->tokens[out->count].text = strdup(buf);
-        if (!out->tokens[out->count].text)
-          goto fail;
-      } else if (base_type == ST_TYPE_RANGE) {
-        free(text);
-        out->tokens[out->count].text = strdup("#range.step");
-        if (!out->tokens[out->count].text)
-          goto fail;
-      } else if (base_type == ST_TYPE_PERM_OCTAL) {
-        free(text);
-        out->tokens[out->count].text = strdup("#perm.bits");
-        if (!out->tokens[out->count].text)
-          goto fail;
-      }
-
-      out->count++;
-      prev = tok;
-      continue;
-    }
-
-    /* Default: classify the token */
+    /* Concrete text and its lattice type are separate. Parameters are closed
+     * policy metadata; normalization must never synthesize a wildcard symbol
+     * by copying characters from a concrete value. */
     out->tokens[out->count].text = strdup(tok);
     if (!out->tokens[out->count].text)
       goto fail;
@@ -2860,6 +2671,14 @@ st_error_t st_normalize_typed(const char *raw_cmd, st_token_array_t *out) {
   for (size_t i = 0; i < raw_count; i++)
     free(raw_tokens[i]);
   free(raw_tokens);
+  if (out->count > ST_MAX_CMD_TOKENS) {
+    for (size_t i = 0; i < out->count; i++)
+      free(out->tokens[i].text);
+    free(out->tokens);
+    out->tokens = NULL;
+    out->count = 0;
+    return ST_ERR_INVALID;
+  }
   return ST_OK;
 
 fail:
@@ -2888,6 +2707,10 @@ void st_free_token_array(st_token_array_t *arr) {
 
 st_error_t st_normalize(const char *raw_cmd, char ***out_tokens,
                         size_t *out_token_count) {
+  if (out_tokens)
+    *out_tokens = NULL;
+  if (out_token_count)
+    *out_token_count = 0;
   if (!raw_cmd || !out_tokens || !out_token_count)
     return ST_ERR_INVALID;
 
@@ -2899,8 +2722,6 @@ st_error_t st_normalize(const char *raw_cmd, char ***out_tokens,
     return err;
 
   if (typed.count == 0) {
-    *out_tokens = NULL;
-    *out_token_count = 0;
     st_free_token_array(&typed);
     return ST_OK;
   }

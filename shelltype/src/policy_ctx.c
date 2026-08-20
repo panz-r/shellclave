@@ -21,6 +21,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "alloc.h"
+
 #define DEFAULT_ARENA_SIZE (256 * 1024) /* 256 KB default */
 #define STR_POOL_INIT_CAP 1024
 
@@ -248,10 +250,30 @@ st_error_t st_policy_ctx_reset(st_policy_ctx_t *ctx) {
   return context_reset_with_refcount(ctx, 1);
 }
 
-st_error_t st_policy_ctx_reset_for_policy(st_policy_ctx_t *ctx) {
-  if (!ctx)
+st_error_t st_policy_ctx_swap_storage(st_policy_ctx_t *destination,
+                                      st_policy_ctx_t *replacement) {
+  if (!destination || !replacement || destination == replacement)
     return ST_ERR_INVALID;
-  return context_reset_with_refcount(ctx, 2);
+  pthread_mutex_lock(&destination->lock);
+  pthread_mutex_lock(&replacement->lock);
+  if (atomic_load(&destination->refcount) != 2 ||
+      atomic_load(&replacement->refcount) != 2) {
+    pthread_mutex_unlock(&replacement->lock);
+    pthread_mutex_unlock(&destination->lock);
+    return ST_ERR_INVALID;
+  }
+  str_pool_t pool = destination->str_pool;
+  destination->str_pool = replacement->str_pool;
+  replacement->str_pool = pool;
+  str_chunk_t *chunks = destination->str_chunks;
+  destination->str_chunks = replacement->str_chunks;
+  replacement->str_chunks = chunks;
+  size_t chunk_size = destination->chunk_size;
+  destination->chunk_size = replacement->chunk_size;
+  replacement->chunk_size = chunk_size;
+  pthread_mutex_unlock(&replacement->lock);
+  pthread_mutex_unlock(&destination->lock);
+  return ST_OK;
 }
 
 bool st_policy_ctx_is_exclusive(const st_policy_ctx_t *ctx) {

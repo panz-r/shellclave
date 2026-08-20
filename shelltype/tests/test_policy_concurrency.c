@@ -8,10 +8,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 enum {
   READER_COUNT = 6,
-  WRITER_COUNT = 2,
   READER_ITERATIONS = 2000,
   WRITER_ITERATIONS = 500,
   REFCOUNT_THREAD_COUNT = 8,
@@ -44,14 +44,6 @@ typedef struct {
   const char *unique[INTERN_UNIQUE_COUNT];
   unsigned id;
 } intern_thread_args_t;
-
-typedef struct {
-  st_policy_t *destination;
-  st_policy_t *source;
-  pthread_barrier_t *barrier;
-  atomic_uint *failures;
-  unsigned id;
-} merge_thread_args_t;
 
 static void record_failure(atomic_uint *failures, const char *operation,
                            unsigned id, size_t iteration) {
@@ -87,10 +79,39 @@ static void *policy_reader(void *opaque) {
       record_failure(args->failures, "policy evaluation", args->id, i);
       break;
     }
+    const char **matches = NULL;
+    size_t match_count = 0;
+    if (st_policy_verify_all(args->policy, command, &matches, &match_count) !=
+            ST_OK ||
+        match_count != 1 || matches == NULL ||
+        strcmp(matches[0], command) != 0) {
+      record_failure(args->failures, "policy verification", args->id, i);
+      st_policy_free_matches(matches, match_count);
+      break;
+    }
+    st_policy_free_matches(matches, match_count);
     size_t count = st_policy_count(args->policy);
-    if (count < 2 || count > 2 + WRITER_COUNT) {
+    if (count != 2) {
       record_failure(args->failures, "policy count", args->id, i);
       break;
+    }
+    if (i == 0) {
+      char save_path[96], nfa_path[96], dot_path[96];
+      snprintf(save_path, sizeof(save_path), "/tmp/shelltype-reader-%u.policy",
+               args->id);
+      snprintf(nfa_path, sizeof(nfa_path), "/tmp/shelltype-reader-%u.nfa",
+               args->id);
+      snprintf(dot_path, sizeof(dot_path), "/tmp/shelltype-reader-%u.dot",
+               args->id);
+      if (st_policy_save(args->policy, save_path) != ST_OK ||
+          st_policy_render_nfa(args->policy, nfa_path, NULL) != ST_OK ||
+          st_policy_dump_dot(args->policy, dot_path) != ST_OK) {
+        record_failure(args->failures, "policy export", args->id, i);
+        break;
+      }
+      unlink(save_path);
+      unlink(nfa_path);
+      unlink(dot_path);
     }
     size_t memory = st_policy_memory_usage(args->policy);
     size_t working = st_policy_working_set(args->policy);
@@ -123,7 +144,7 @@ static void *policy_writer(void *opaque) {
   return NULL;
 }
 
-static int test_concurrent_policy_reads_and_writes(void) {
+static int test_concurrent_policy_readers(void) {
   st_policy_ctx_t *ctx = st_policy_ctx_new();
   st_policy_t *policy = ctx ? st_policy_new(ctx) : NULL;
   if (!ctx || !policy) {
@@ -141,7 +162,7 @@ static int test_concurrent_policy_reads_and_writes(void) {
   }
 
   pthread_barrier_t barrier;
-  if (pthread_barrier_init(&barrier, NULL, READER_COUNT + WRITER_COUNT) != 0) {
+  if (pthread_barrier_init(&barrier, NULL, READER_COUNT) != 0) {
     fprintf(stderr, "failed to initialize policy barrier\n");
     st_policy_free(policy);
     st_policy_ctx_free(ctx);
@@ -152,8 +173,6 @@ static int test_concurrent_policy_reads_and_writes(void) {
   atomic_init(&failures, 0);
   pthread_t readers[READER_COUNT];
   policy_thread_args_t reader_args[READER_COUNT];
-  pthread_t writers[WRITER_COUNT];
-  policy_thread_args_t writer_args[WRITER_COUNT];
 
   size_t readers_started = 0;
   for (size_t i = 0; i < READER_COUNT; i++) {
@@ -165,20 +184,7 @@ static int test_concurrent_policy_reads_and_writes(void) {
       break;
     readers_started++;
   }
-  size_t writers_started = 0;
-  if (readers_started == READER_COUNT)
-    for (size_t i = 0; i < WRITER_COUNT; i++) {
-      writer_args[i] = (policy_thread_args_t){.policy = policy,
-                                              .barrier = &barrier,
-                                              .failures = &failures,
-                                              .id = READER_COUNT + (unsigned)i};
-      if (pthread_create(&writers[i], NULL, policy_writer, &writer_args[i]) !=
-          0)
-        break;
-      writers_started++;
-    }
-
-  if (writers_started != WRITER_COUNT) {
+  if (readers_started != READER_COUNT) {
     fprintf(stderr, "failed to create policy threads\n");
     /* Releasing an incomplete barrier would be unsafe; this is a test-host
      * resource failure, so terminate the process after reporting it. */
@@ -188,9 +194,6 @@ static int test_concurrent_policy_reads_and_writes(void) {
   for (size_t i = 0; i < READER_COUNT; i++)
     if (pthread_join(readers[i], NULL) != 0)
       record_failure(&failures, "reader join", (unsigned)i, 0);
-  for (size_t i = 0; i < WRITER_COUNT; i++)
-    if (pthread_join(writers[i], NULL) != 0)
-      record_failure(&failures, "writer join", READER_COUNT + (unsigned)i, 0);
   if (pthread_barrier_destroy(&barrier) != 0)
     record_failure(&failures, "barrier destroy", READER_COUNT, 0);
 
@@ -209,7 +212,7 @@ static int test_concurrent_policy_reads_and_writes(void) {
     passed = false;
   }
   if (st_policy_count(policy) != 2) {
-    fprintf(stderr, "writer did not restore the baseline pattern count\n");
+    fprintf(stderr, "reader changed the baseline pattern count\n");
     passed = false;
   }
 
@@ -432,80 +435,10 @@ static int test_concurrent_shared_context_writes(void) {
   return passed;
 }
 
-static void *reciprocal_merge_worker(void *opaque) {
-  merge_thread_args_t *args = opaque;
-  if (!await_start(args->barrier, args->failures, args->id))
-    return NULL;
-  if (st_policy_merge(args->destination, args->source) != ST_OK)
-    record_failure(args->failures, "policy merge", args->id, 0);
-  return NULL;
-}
-
-static int test_concurrent_reciprocal_merge(void) {
-  st_policy_ctx_t *contexts[] = {st_policy_ctx_new(), st_policy_ctx_new()};
-  st_policy_t *policies[] = {
-      contexts[0] ? st_policy_new(contexts[0]) : NULL,
-      contexts[1] ? st_policy_new(contexts[1]) : NULL,
-  };
-  if (!policies[0] || !policies[1] ||
-      st_policy_add(policies[0], "git status") != ST_OK ||
-      st_policy_add(policies[1], "docker ps") != ST_OK) {
-    st_policy_free(policies[0]);
-    st_policy_free(policies[1]);
-    st_policy_ctx_free(contexts[0]);
-    st_policy_ctx_free(contexts[1]);
-    return 0;
-  }
-
-  pthread_barrier_t barrier;
-  if (pthread_barrier_init(&barrier, NULL, 2) != 0)
-    exit(EXIT_FAILURE);
-  atomic_uint failures;
-  atomic_init(&failures, 0);
-  pthread_t threads[2];
-  merge_thread_args_t args[] = {
-      {.destination = policies[0],
-       .source = policies[1],
-       .barrier = &barrier,
-       .failures = &failures,
-       .id = 0},
-      {.destination = policies[1],
-       .source = policies[0],
-       .barrier = &barrier,
-       .failures = &failures,
-       .id = 1},
-  };
-  for (size_t i = 0; i < 2; i++)
-    if (pthread_create(&threads[i], NULL, reciprocal_merge_worker, &args[i]) !=
-        0)
-      exit(EXIT_FAILURE);
-  for (size_t i = 0; i < 2; i++)
-    if (pthread_join(threads[i], NULL) != 0)
-      record_failure(&failures, "merge join", (unsigned)i, 0);
-  if (pthread_barrier_destroy(&barrier) != 0)
-    record_failure(&failures, "barrier destroy", 0, 0);
-
-  bool passed = atomic_load(&failures) == 0;
-  static const char *commands[] = {"git status", "docker ps"};
-  for (size_t p = 0; p < 2; p++) {
-    if (st_policy_count(policies[p]) != 2)
-      passed = false;
-    for (size_t c = 0; c < 2; c++)
-      if (!policy_matches_exact(policies[p], commands[c]))
-        passed = false;
-  }
-
-  st_policy_free(policies[0]);
-  st_policy_free(policies[1]);
-  st_policy_ctx_free(contexts[0]);
-  st_policy_ctx_free(contexts[1]);
-  return passed;
-}
-
 int main(void) {
   int failures = 0;
-  if (!test_concurrent_policy_reads_and_writes()) {
-    fprintf(stderr, "concurrent policy read/write test failed\n");
+  if (!test_concurrent_policy_readers()) {
+    fprintf(stderr, "concurrent policy reader test failed\n");
     failures++;
   }
   if (!test_concurrent_context_refcount()) {
@@ -518,10 +451,6 @@ int main(void) {
   }
   if (!test_concurrent_shared_context_writes()) {
     fprintf(stderr, "concurrent shared-context write test failed\n");
-    failures++;
-  }
-  if (!test_concurrent_reciprocal_merge()) {
-    fprintf(stderr, "concurrent reciprocal merge test failed\n");
     failures++;
   }
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;

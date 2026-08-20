@@ -7,6 +7,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "alloc.h"
+
 bool arena_init(arena_t *a, size_t size) {
   a->base = malloc(size);
   if (!a->base)
@@ -49,6 +51,28 @@ void *arena_alloc(arena_t *a, size_t n) {
   void *p = a->base + a->used;
   a->used += n;
   return p;
+}
+
+bool arena_reserve(arena_t *a, size_t additional) {
+  if (additional > SIZE_MAX - a->used)
+    return false;
+  size_t required = a->used + additional;
+  if (required <= a->size)
+    return true;
+  size_t new_size = a->size;
+  while (new_size < required) {
+    if (new_size > SIZE_MAX / 2) {
+      new_size = required;
+      break;
+    }
+    new_size *= 2;
+  }
+  char *new_base = realloc(a->base, new_size);
+  if (!new_base)
+    return false;
+  a->base = new_base;
+  a->size = new_size;
+  return true;
 }
 
 size_t arena_used(const arena_t *a) { return a->used; }

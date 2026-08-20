@@ -97,6 +97,20 @@ target_include_directories(shelltype PUBLIC
 target_link_libraries(shelltype PRIVATE m PUBLIC Threads::Threads)
 set_target_properties(shelltype PROPERTIES EXPORT_NAME shelltype)
 
+if(BUILD_TESTING)
+  add_library(shelltype_test ${SHELLTYPE_SOURCES}
+    shelltype/tests/test_allocator.c shelltype/tests/test_io.c)
+  shellclave_project_target(shelltype_test)
+  target_compile_definitions(shelltype_test PRIVATE
+    SHELLTYPE_TEST_ALLOCATOR SHELLTYPE_TEST_IO)
+  target_include_directories(shelltype_test PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/shelltype/include
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shelltype/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/shelltype/tests
+            deps/draugr/include)
+  target_link_libraries(shelltype_test PRIVATE m PUBLIC Threads::Threads)
+endif()
+
 set(SHELLGATE_SOURCES shellgate/src/shellgate.c shellgate/src/sg_anomaly.c)
 add_library(shellgate ${SHELLGATE_SOURCES})
 add_library(Shellclave::shellgate ALIAS shellgate)
@@ -148,15 +162,24 @@ if(BUILD_TESTING)
   shellclave_add_test(shellsplit_entropy_test shellsplit/tests/entropy_test.c shellsplit)
   shellclave_add_test(shellsplit_depgraph_test shellsplit/tests/test_depgraph.c shellsplit)
   shellclave_add_test(shellsplit_interop_test shellsplit/tests/interop_test.c shellsplit)
-  shellclave_add_test(shelltype_token_types_test shelltype/tests/test_token_types.c shelltype)
-  shellclave_add_test(shelltype_unit_test shelltype/tests/test_shelltype.c shelltype)
-  shellclave_add_test(shelltype_arena_test shelltype/tests/test_arena.c shelltype)
-  target_include_directories(shelltype_arena_test PRIVATE shelltype/src)
-  shellclave_add_test(shelltype_policy_test shelltype/tests/test_policy.c shelltype)
-  shellclave_add_test(shelltype_policy_concurrency_test shelltype/tests/test_policy_concurrency.c shelltype)
-  shellclave_add_test(shelltype_verify_test shelltype/tests/test_verify.c shelltype)
-  shellclave_add_test(shelltype_integration_test shelltype/tests/test_shelltype_integration.c shelltype)
-  shellclave_add_test(shelltype_compact_policy_test shelltype/tests/test_policy_compact.c shelltype)
+  shellclave_add_test(shelltype_token_types_test shelltype/tests/test_token_types.c shelltype_test)
+  shellclave_add_test(shelltype_unit_test shelltype/tests/test_shelltype.c shelltype_test)
+  shellclave_add_test(shelltype_arena_test shelltype/tests/test_arena.c shelltype_test)
+  target_include_directories(shelltype_arena_test PRIVATE shelltype/src shelltype/tests)
+  shellclave_add_test(shelltype_policy_test shelltype/tests/test_policy.c shelltype_test)
+  shellclave_add_test(shelltype_policy_concurrency_test shelltype/tests/test_policy_concurrency.c shelltype_test)
+  shellclave_add_test(shelltype_verify_test shelltype/tests/test_verify.c shelltype_test)
+  shellclave_add_test(shelltype_integration_test shelltype/tests/test_shelltype_integration.c shelltype_test)
+  shellclave_add_test(shelltype_compact_policy_test shelltype/tests/test_policy_compact.c shelltype_test)
+  target_include_directories(shelltype_compact_policy_test PRIVATE shelltype/src)
+  shellclave_add_test(shelltype_policy_model_test shelltype/tests/test_policy_model.c shelltype_test)
+  shellclave_add_test(shelltype_policy_capacity_test shelltype/tests/test_policy_capacity.c shelltype_test)
+  set_tests_properties(shelltype_policy_capacity_test PROPERTIES TIMEOUT 300)
+  foreach(shelltype_test_target IN ITEMS shelltype_token_types_test shelltype_unit_test
+      shelltype_policy_test shelltype_policy_concurrency_test shelltype_verify_test
+      shelltype_integration_test shelltype_compact_policy_test)
+    target_include_directories(${shelltype_test_target} PRIVATE shelltype/tests)
+  endforeach()
   shellclave_add_test(shellgate_unit_test shellgate/tests/test_shellgate.c shellgate)
   shellclave_add_test(shellgate_anomaly_test shellgate/tests/test_anomaly.c shellgate)
 
@@ -256,7 +279,7 @@ if(SHELLCLAVE_BUILD_FUZZERS)
   target_link_options(fuzz_shellgate PRIVATE -fsanitize=fuzzer,address,undefined)
   target_link_libraries(fuzz_shellgate PRIVATE shellgate)
 
-  foreach(fuzzer_name IN ITEMS shellgate shellsplit)
+  foreach(fuzzer_name IN ITEMS shellgate shellsplit shelltype)
     set(smoke_seed_dir
       "${CMAKE_CURRENT_SOURCE_DIR}/${fuzzer_name}/fuzz/smoke-seeds")
     file(GLOB smoke_seed_files CONFIGURE_DEPENDS
@@ -284,7 +307,12 @@ if(SHELLCLAVE_BUILD_FUZZERS)
   target_compile_options(fuzz_shellsplit PRIVATE -fsanitize=fuzzer,address,undefined)
   target_link_options(fuzz_shellsplit PRIVATE -fsanitize=fuzzer,address,undefined)
   target_link_libraries(fuzz_shellsplit PRIVATE shellsplit)
-  foreach(fuzzer IN ITEMS fuzz_shellgate fuzz_shellsplit)
+  add_executable(fuzz_shelltype shelltype/fuzz/fuzz_shelltype.cpp)
+  target_compile_features(fuzz_shelltype PRIVATE cxx_std_11)
+  target_compile_options(fuzz_shelltype PRIVATE -fsanitize=fuzzer,address,undefined)
+  target_link_options(fuzz_shelltype PRIVATE -fsanitize=fuzzer,address,undefined)
+  target_link_libraries(fuzz_shelltype PRIVATE shelltype)
+  foreach(fuzzer IN ITEMS fuzz_shellgate fuzz_shellsplit fuzz_shelltype)
     target_compile_options(${fuzzer} PRIVATE -Wall -Wextra -Wpedantic)
   endforeach()
 
@@ -314,8 +342,18 @@ if(SHELLCLAVE_BUILD_FUZZERS)
       ${CMAKE_CURRENT_BINARY_DIR}/fuzz-artifacts/smoke/shellgate_
     DEPENDS fuzz_shellgate
     COMMENT "Running the Shellgate fuzzer")
+  add_custom_target(fuzz-shelltype-smoke
+    COMMAND /bin/bash ${CMAKE_CURRENT_SOURCE_DIR}/scripts/run_fuzz_smoke.sh
+      $<TARGET_FILE:fuzz_shelltype>
+      ${CMAKE_CURRENT_SOURCE_DIR}/shelltype/fuzz/smoke-seeds
+      ${CMAKE_CURRENT_BINARY_DIR}/fuzz-smoke-corpus/shelltype
+      ${SHELLCLAVE_FUZZ_RUNS}
+      ${SHELLCLAVE_FUZZ_MAX_LEN}
+      ${CMAKE_CURRENT_BINARY_DIR}/fuzz-artifacts/smoke/shelltype_
+    DEPENDS fuzz_shelltype
+    COMMENT "Running the Shelltype fuzzer")
   add_custom_target(fuzz-smoke
-    DEPENDS fuzz-shellsplit-smoke fuzz-shellgate-smoke
+    DEPENDS fuzz-shellsplit-smoke fuzz-shellgate-smoke fuzz-shelltype-smoke
     COMMENT "Running all repository fuzz smoke tests")
 endif()
 

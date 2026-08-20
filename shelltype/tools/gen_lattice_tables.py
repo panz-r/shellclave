@@ -77,9 +77,7 @@ TYPE_ORDER: List[str] = [
 # This means a literal token matches ANY wildcard policy type.
 # Every other type is INCOMPARABLE with LITERAL.
 #
-# PORT appears in two separate chains: PORT ⊂ NUMBER ⊂ VALUE ⊂ ANY
-# and PORT ⊂ IPV4 ⊂ VALUE ⊂ ANY. The union of both chains gives the
-# correct transitive closure: PORT ≤ {NUMBER, IPV4, VALUE, ANY}.
+# PORT is a numeric subtype: PORT ⊂ NUMBER ⊂ VALUE ⊂ ANY.
 CHAINS: List[List[str]] = [
     ["SHA", "HEXHASH", "VALUE", "ANY"],
     ["IPV4", "IPADDR", "VALUE", "ANY"],
@@ -337,7 +335,7 @@ def generate_join_table(join: Dict[str, Dict[str, str]]) -> str:
         " *   #u ⊂ *",
         " *   #sopt, #lopt ⊂ #opt ⊂ #val ⊂ *",
         " *   #uuid, #email, #host, #size, #semver, #ts, #env ⊂ #val ⊂ *",
-        " *   #port ⊂ #n, #port ⊂ #i, #port ⊂ #val ⊂ *",
+        " *   #port ⊂ #n ⊂ #val ⊂ *",
         " *   #hash, #hyp, #method ⊂ #w ⊂ #val ⊂ *",
         " *   #mac, #cron, #duration, #branch, #image, #pkg, #user, #fp ⊂ #val ⊂ *",
         " */",

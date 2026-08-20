@@ -24,11 +24,9 @@ int main(void) {
   }
   size_t suggestion_count = 0;
   st_suggestion_t *suggestions = st_suggest(learner, &suggestion_count);
-  if (!suggestions || suggestion_count != 2 ||
-      strcmp(suggestions[0].pattern, "echo") != 0 ||
-      suggestions[0].count != 1 || suggestions[0].confidence != 1.0 ||
-      strcmp(suggestions[1].pattern, "echo hello") != 0 ||
-      suggestions[1].count != 1 || suggestions[1].confidence != 1.0) {
+  if (!suggestions || suggestion_count != 1 ||
+      strcmp(suggestions[0].pattern, "echo hello") != 0 ||
+      suggestions[0].count != 1 || suggestions[0].confidence != 1.0) {
     st_free_suggestions(suggestions, suggestion_count);
     st_learner_free(learner);
     return 3;

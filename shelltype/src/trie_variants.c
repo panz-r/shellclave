@@ -12,11 +12,15 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "alloc.h"
+
+_Static_assert(ST_TYPE_COUNT <= 64,
+               "token variant collection requires a 64-bit type mask");
+
 /* Collect observed types at target position in trie. */
 static void collect_variants_at(st_node_t *node, const char **pattern_tokens,
                                 size_t pattern_count, size_t target_pos,
-                                size_t depth, st_token_type_t *collected_types,
-                                size_t *type_count) {
+                                size_t depth, uint64_t *observed_types) {
   if (!node || depth >= pattern_count)
     return;
 
@@ -29,14 +33,7 @@ static void collect_variants_at(st_node_t *node, const char **pattern_tokens,
       for (int t = 1; t < ST_TYPE_COUNT; t++) {
         if (!(observed & (1ULL << t)) || t == ST_TYPE_ANY)
           continue;
-        bool found = false;
-        for (size_t j = 0; j < *type_count; j++)
-          if (collected_types[j] == (st_token_type_t)t) {
-            found = true;
-            break;
-          }
-        if (!found && *type_count < ST_MAX_TOKEN_VARIANTS - 1)
-          collected_types[(*type_count)++] = (st_token_type_t)t;
+        *observed_types |= 1ULL << t;
       }
     }
     return;
@@ -51,7 +48,7 @@ static void collect_variants_at(st_node_t *node, const char **pattern_tokens,
       if (child->type == ST_TYPE_LITERAL &&
           strcmp(child->token, current_token) == 0) {
         collect_variants_at(child, pattern_tokens, pattern_count, target_pos,
-                            depth + 1, collected_types, type_count);
+                            depth + 1, observed_types);
         return;
       }
     }
@@ -66,8 +63,60 @@ static void collect_variants_at(st_node_t *node, const char **pattern_tokens,
     if (child->type != ST_TYPE_LITERAL &&
         st_is_compatible(child->type, current_type))
       collect_variants_at(child, pattern_tokens, pattern_count, target_pos,
-                          depth + 1, collected_types, type_count);
+                          depth + 1, observed_types);
   }
+}
+
+/* Pick the lowest-enum minimal element of the remaining lattice subset.  A
+ * strict subtype must be emitted before its supertypes; enum order provides a
+ * deterministic total order only where the lattice leaves types incomparable.
+ */
+static st_token_type_t most_specific_remaining(uint64_t remaining) {
+  for (int candidate = ST_TYPE_LITERAL + 1; candidate < ST_TYPE_ANY;
+       candidate++) {
+    if (!(remaining & (1ULL << candidate)))
+      continue;
+    bool has_stricter = false;
+    for (int other = ST_TYPE_LITERAL + 1; other < ST_TYPE_ANY; other++) {
+      if (other == candidate || !(remaining & (1ULL << other)))
+        continue;
+      if (st_is_compatible((st_token_type_t)other,
+                           (st_token_type_t)candidate) &&
+          !st_is_compatible((st_token_type_t)candidate,
+                            (st_token_type_t)other)) {
+        has_stricter = true;
+        break;
+      }
+    }
+    if (!has_stricter)
+      return (st_token_type_t)candidate;
+  }
+  return ST_TYPE_COUNT;
+}
+
+static bool pattern_tokens_are_representable(const char **pattern_tokens,
+                                             size_t token_count) {
+  char pattern[ST_MAX_PATTERN_LEN];
+  size_t used = 0;
+
+  for (size_t i = 0; i < token_count; i++) {
+    const char *token = pattern_tokens[i];
+    if (!token || !token[0] || strchr(token, ' '))
+      return false;
+    size_t length = strlen(token);
+    size_t separator = i != 0 ? 1 : 0;
+    if (used + separator + length >= sizeof(pattern))
+      return false;
+    if (separator)
+      pattern[used++] = ' ';
+    memcpy(pattern + used, token, length);
+    used += length;
+  }
+  pattern[used] = '\0';
+
+  st_pattern_info_t info = {0};
+  return st_validate_pattern(pattern, &info) == ST_OK &&
+         info.token_count == token_count;
 }
 
 /* Suggest type variants for editing a pattern token. */
@@ -75,30 +124,30 @@ size_t st_policy_suggest_token_variants(st_learner_t *learner,
                                         const char **pattern_tokens,
                                         size_t token_count, size_t edit_pos,
                                         st_token_variant_t *out_variants) {
-  if (!learner || !pattern_tokens || !out_variants || edit_pos >= token_count)
+  if (out_variants)
+    memset(out_variants, 0, ST_MAX_TOKEN_VARIANTS * sizeof(*out_variants));
+  if (!learner || !pattern_tokens || !out_variants || token_count == 0 ||
+      token_count > ST_MAX_CMD_TOKENS || edit_pos >= token_count)
     return 0;
-  for (size_t i = 0; i < token_count; i++) {
-    if (!pattern_tokens[i])
-      return 0;
-  }
+  if (!pattern_tokens_are_representable(pattern_tokens, token_count))
+    return 0;
 
-  st_token_type_t collected[ST_MAX_TOKEN_VARIANTS];
-  size_t type_count = 0;
+  uint64_t observed_types = 0;
 
   /* Walk trie to collect observed types */
   collect_variants_at(learner->trie.root, pattern_tokens, token_count, edit_pos,
-                      0, collected, &type_count);
+                      0, &observed_types);
 
   /* If no observed types, use current type */
-  if (type_count == 0) {
+  if (observed_types == 0) {
     st_token_type_t current_type =
         st_type_from_pattern_token(pattern_tokens[edit_pos]);
     if (current_type != ST_TYPE_LITERAL && current_type != ST_TYPE_ANY) {
-      collected[type_count++] = current_type;
+      observed_types |= 1ULL << current_type;
     } else {
       /* Literal -> suggest turning into a type */
       if (current_type == ST_TYPE_LITERAL)
-        collected[type_count++] = ST_TYPE_VALUE;
+        observed_types |= 1ULL << ST_TYPE_VALUE;
     }
   }
 
@@ -108,25 +157,26 @@ size_t st_policy_suggest_token_variants(st_learner_t *learner,
       st_type_from_pattern_token(pattern_tokens[edit_pos]);
 
   /* Add current type first */
-  for (size_t i = 0; current_type != ST_TYPE_ANY && i < type_count; i++) {
-    if (collected[i] == current_type) {
-      out_variants[out_count].type = current_type;
-      out_variants[out_count].type_symbol = st_type_symbol[current_type];
-      out_variants[out_count].sample_value = NULL;
-      out_count++;
-      break;
-    }
+  if (current_type != ST_TYPE_ANY && current_type < ST_TYPE_COUNT &&
+      (observed_types & (1ULL << current_type))) {
+    out_variants[out_count].type = current_type;
+    out_variants[out_count].type_symbol = st_type_symbol[current_type];
+    out_variants[out_count].sample_value = NULL;
+    out_count++;
+    observed_types &= ~(1ULL << current_type);
   }
 
-  /* Add remaining types */
-  for (size_t i = 0; i < type_count && out_count < ST_MAX_TOKEN_VARIANTS - 1;
-       i++) {
-    if (collected[i] != current_type && collected[i] != ST_TYPE_ANY) {
-      out_variants[out_count].type = collected[i];
-      out_variants[out_count].type_symbol = st_type_symbol[collected[i]];
-      out_variants[out_count].sample_value = NULL;
-      out_count++;
-    }
+  /* Add remaining observed types in a deterministic linear extension of the
+   * lattice.  Truncation therefore cannot depend on feed order. */
+  while (observed_types && out_count < ST_MAX_TOKEN_VARIANTS - 1) {
+    st_token_type_t selected = most_specific_remaining(observed_types);
+    if (selected == ST_TYPE_COUNT)
+      break;
+    out_variants[out_count].type = selected;
+    out_variants[out_count].type_symbol = st_type_symbol[selected];
+    out_variants[out_count].sample_value = NULL;
+    out_count++;
+    observed_types &= ~(1ULL << selected);
   }
 
   /* Add general categories for common types */
@@ -163,8 +213,10 @@ size_t st_policy_suggest_token_variants(st_learner_t *learner,
     }
   }
 
-  /* Reserve the final slot for exactly one wildcard, the most general type. */
-  if (out_count < ST_MAX_TOKEN_VARIANTS) {
+  /* Reserve the final slot for exactly one wildcard, the most general type.
+   * A leading wildcard is not valid policy grammar, so never suggest it for
+   * the command position. */
+  if (edit_pos != 0 && out_count < ST_MAX_TOKEN_VARIANTS) {
     out_variants[out_count].type = ST_TYPE_ANY;
     out_variants[out_count].type_symbol = "*";
     out_variants[out_count].sample_value = NULL;
@@ -181,7 +233,8 @@ char *st_policy_apply_type_at(st_learner_t *learner,
                               size_t edit_pos, st_token_type_t new_type) {
   (void)learner;
   if (!pattern_tokens || token_count == 0 || edit_pos >= token_count ||
-      new_type <= ST_TYPE_LITERAL || new_type >= ST_TYPE_COUNT)
+      token_count > ST_MAX_CMD_TOKENS || new_type <= ST_TYPE_LITERAL ||
+      new_type >= ST_TYPE_COUNT)
     return NULL;
   for (size_t i = 0; i < token_count; i++) {
     if (!pattern_tokens[i])

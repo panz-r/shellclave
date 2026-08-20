@@ -3,7 +3,7 @@
 
 #include "shelltype.h"
 
-/* Reset storage while the calling policy keeps its context reference. */
-st_error_t st_policy_ctx_reset_for_policy(st_policy_ctx_t *ctx);
+st_error_t st_policy_ctx_swap_storage(st_policy_ctx_t *destination,
+                                      st_policy_ctx_t *replacement);
 
 #endif

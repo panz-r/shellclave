@@ -40,7 +40,7 @@ cmake -S . -B "$fuzz_build" -DCMAKE_BUILD_TYPE=Debug \
   -DSHELLCLAVE_BUILD_FUZZERS=ON \
   -DSHELLCLAVE_FUZZ_RUNS="$fuzz_runs" \
   -DSHELLCLAVE_FUZZ_MAX_LEN=8192
-echo "pre-push: unified fuzz smoke (shellsplit and shellgate, $fuzz_runs runs)"
+echo "pre-push: unified fuzz smoke (shellsplit, shelltype, and shellgate, $fuzz_runs runs)"
 cmake --build "$fuzz_build" --target fuzz-smoke
 
 echo "pre-push: all checks passed"

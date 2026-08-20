@@ -35,6 +35,11 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "alloc.h"
+#include "io.h"
+#include "metadata.h"
+#include "read_line.h"
+
 /* --- CRC32 (for serialization integrity check) --- */
 
 static uint32_t crc32_table[256];
@@ -63,7 +68,6 @@ static uint32_t crc32_compute(const void *data, size_t len, uint32_t prev) {
 #define CHILDREN_ARENA_INIT 4096
 #define STATES_INIT 4096
 #define PATTERN_REG_INIT 256
-#define VERIFY_ALL_RING_CAP 4096
 #define MAX_CMD_TOKENS 128
 #define FILTER_POS_LEVELS                                                      \
   8 /* Shell commands rarely exceed 8 tokens before diverging */
@@ -94,6 +98,8 @@ const char *st_error_string(st_error_t err) {
     return "failed";
   case ST_ERR_FORMAT:
     return "format";
+  case ST_ERR_LIMIT:
+    return "limit";
   default:
     return "unknown";
   }
@@ -126,6 +132,8 @@ static bool children_arena_grow(arena_t *arena, uint32_t *offset,
   uint32_t old_offset = *offset;
   char *new_base = arena_alloc(arena, new_bytes);
   if (!new_base)
+    return false;
+  if ((size_t)(new_base - arena->base) > UINT32_MAX)
     return false;
   /* arena_alloc may move the arena, so resolve the old offset afterward. */
   char *old_base = arena->base + old_offset;
@@ -183,6 +191,26 @@ static uint32_t states_array_alloc(states_array_t *a) {
   return idx;
 }
 
+static bool states_array_reserve(states_array_t *a, size_t additional) {
+  if (additional > SIZE_MAX - a->count)
+    return false;
+  size_t required = a->count + additional;
+  if (required <= a->capacity)
+    return true;
+  size_t new_cap = a->capacity;
+  while (new_cap < required) {
+    if (new_cap > SIZE_MAX / 2)
+      return false;
+    new_cap *= 2;
+  }
+  policy_state_t *states = realloc(a->states, new_cap * sizeof(*states));
+  if (!states)
+    return false;
+  a->states = states;
+  a->capacity = new_cap;
+  return true;
+}
+
 /* --- PATTERN REGISTRY (entry-based with token storage) --- */
 
 /* Forward declaration — defined after parse_pattern */
@@ -236,38 +264,63 @@ static bool pattern_reg_grow(pattern_reg_t *r) {
   return true;
 }
 
-static uint16_t pattern_reg_add(pattern_reg_t *r, st_policy_ctx_t *ctx,
-                                const char *pattern, st_token_t *tokens,
-                                size_t token_count) {
-  if (r->count >= r->capacity) {
-    if (!pattern_reg_grow(r))
-      return UINT16_MAX;
+static bool pattern_reg_reserve(pattern_reg_t *r) {
+  for (size_t i = 0; i < r->count; i++) {
+    if (!r->entries[i].active)
+      return true;
   }
+  if (r->count >= ST_MAX_POLICY_PATTERNS)
+    return false;
+  return r->count < r->capacity || pattern_reg_grow(r);
+}
+
+static bool pattern_entry_prepare(st_policy_ctx_t *ctx, const char *pattern,
+                                  const st_token_t *tokens, size_t token_count,
+                                  pattern_entry_t *prepared) {
+  memset(prepared, 0, sizeof(*prepared));
   const char *interned = st_policy_ctx_intern(ctx, pattern);
   if (!interned)
-    return UINT16_MAX;
+    return false;
 
-  /* Deep-copy the tokens array */
   st_token_t *tok_copy = calloc(token_count, sizeof(st_token_t));
   if (!tok_copy)
-    return UINT16_MAX;
+    return false;
   for (size_t i = 0; i < token_count; i++) {
     tok_copy[i].text = strdup(tokens[i].text);
     if (!tok_copy[i].text) {
       for (size_t k = 0; k < i; k++)
         free(tok_copy[k].text);
       free(tok_copy);
-      return UINT16_MAX;
+      return false;
     }
     tok_copy[i].type = tokens[i].type;
   }
 
-  uint16_t id = (uint16_t)r->count;
-  r->entries[id].pattern = interned;
-  r->entries[id].tokens = tok_copy;
-  r->entries[id].token_count = token_count;
-  r->entries[id].active = true;
-  r->count++;
+  prepared->pattern = interned;
+  prepared->tokens = tok_copy;
+  prepared->token_count = token_count;
+  prepared->active = true;
+  return true;
+}
+
+static uint16_t pattern_reg_commit(pattern_reg_t *r,
+                                   pattern_entry_t *prepared) {
+  size_t slot = r->count;
+  for (size_t i = 0; i < r->count; i++) {
+    if (!r->entries[i].active) {
+      slot = i;
+      break;
+    }
+  }
+  if (slot == r->count &&
+      (r->count >= ST_MAX_POLICY_PATTERNS || r->count >= r->capacity))
+    return UINT16_MAX;
+
+  uint16_t id = (uint16_t)slot;
+  r->entries[id] = *prepared;
+  memset(prepared, 0, sizeof(*prepared));
+  if (slot == r->count)
+    r->count++;
   return id;
 }
 
@@ -307,6 +360,26 @@ static bool len_bucket_add(len_bucket_t *b, uint16_t pattern_id) {
     b->capacity = new_cap;
   }
   b->indices[b->count++] = pattern_id;
+  return true;
+}
+
+static bool len_bucket_reserve(len_bucket_t *b, size_t additional) {
+  if (additional > SIZE_MAX - b->count)
+    return false;
+  size_t required = b->count + additional;
+  if (required <= b->capacity)
+    return true;
+  size_t new_cap = b->capacity == 0 ? 8 : b->capacity;
+  while (new_cap < required) {
+    if (new_cap > SIZE_MAX / 2)
+      return false;
+    new_cap *= 2;
+  }
+  uint16_t *indices = realloc(b->indices, new_cap * sizeof(*indices));
+  if (!indices)
+    return false;
+  b->indices = indices;
+  b->capacity = new_cap;
   return true;
 }
 
@@ -473,41 +546,20 @@ static child_entry_t *find_literal_child(const policy_state_t *node,
   return NULL;
 }
 
-/* --- PARAMETRIZED WILDCARD MATCHING ---
- *
- * A parametrized wildcard has the form "#path.cfg" or "#size.MiB" where:
- *   - base type is ST_TYPE_PATH (or other path/size types)
- *   - parameter is ".cfg" (extension) or ".MiB" (size suffix)
- *
- * The child entry stores the base type and full symbol text.
- * During matching, we extract the relevant part from the command token
- * and compare it against the wildcard's parameter.
- */
+/* --- CLOSED WILDCARD METADATA MATCHING --- */
 
 /* Check if a base type supports parametrization. */
 static bool type_supports_param(st_token_type_t t) {
-  return t == ST_TYPE_PATH || t == ST_TYPE_ABS_PATH || t == ST_TYPE_REL_PATH ||
-         t == ST_TYPE_FILENAME || t == ST_TYPE_SIZE || t == ST_TYPE_UUID ||
-         t == ST_TYPE_SEMVER || t == ST_TYPE_TIMESTAMP || t == ST_TYPE_BRANCH ||
-         t == ST_TYPE_SHA || t == ST_TYPE_IMAGE || t == ST_TYPE_PKG ||
-         t == ST_TYPE_USER || t == ST_TYPE_FINGERPRINT ||
-         t == ST_TYPE_HASH_ALGO || t == ST_TYPE_DURATION ||
-         t == ST_TYPE_SIGNAL || t == ST_TYPE_RANGE || t == ST_TYPE_PERM_OCTAL;
+  return st_type_supports_metadata(t);
 }
 
 /* Extract the parameter from a parametrized wildcard symbol.
  * E.g., "#path.cfg" → ".cfg", "#size.MiB" → ".MiB", "#path" → NULL. */
 static const char *wildcard_param(const char *wild_text,
                                   st_token_type_t wild_type) {
-  if (!wild_text || !type_supports_param(wild_type))
-    return NULL;
-  const char *sym = st_type_symbol[wild_type];
-  size_t sym_len = strlen(sym);
-  if (strncmp(wild_text, sym, sym_len) != 0)
-    return NULL;
-  if (wild_text[sym_len] == '.' && wild_text[sym_len + 1] != '\0')
-    return wild_text + sym_len; /* includes the dot */
-  return NULL;
+  const st_metadata_entry_t *metadata =
+      st_wildcard_metadata(wild_text, wild_type);
+  return metadata ? wild_text + strlen(st_type_symbol[wild_type]) : NULL;
 }
 
 /* Extract the file extension from a path (including dot).
@@ -552,504 +604,97 @@ const char *st_size_suffix(const char *text) {
  */
 
 static bool validate_param(st_token_type_t base_type, const char *param) {
-  /* param includes the leading dot: ".cfg", ".MiB" etc. */
   if (!param || param[0] != '.' || param[1] == '\0')
     return false;
-  const char *p = param + 1; /* skip dot */
-
-  switch (base_type) {
-  case ST_TYPE_PATH:
-  case ST_TYPE_ABS_PATH:
-  case ST_TYPE_REL_PATH:
-  case ST_TYPE_FILENAME:
-    /* Alphanumeric, dots, and hyphens allowed; no spaces or slashes */
-    for (; *p; p++) {
-      if (!isalnum((unsigned char)*p) && *p != '.' && *p != '-' && *p != '_')
-        return false;
-    }
-    return true;
-
-  case ST_TYPE_SIZE: {
-    /* Must be a known size suffix (case-insensitive) */
-    static const char *size_params[] = {
-        "K",  "M",  "G", "T", "Ki",    "Mi",  "Gi",  "Ti",  "KB", "MB",
-        "GB", "TB", "B", "b", "bytes", "KiB", "MiB", "GiB", "TiB"};
-    for (size_t i = 0; i < sizeof(size_params) / sizeof(size_params[0]); i++) {
-      if (strcasecmp(p, size_params[i]) == 0)
-        return true;
-    }
-    return false;
-  }
-
-  case ST_TYPE_UUID:
-    return strcasecmp(p, "v4") == 0 || strcasecmp(p, "v5") == 0 ||
-           strcmp(p, "4") == 0 || strcmp(p, "5") == 0;
-
-  case ST_TYPE_SEMVER:
-    return strcasecmp(p, "major") == 0 || strcasecmp(p, "minor") == 0 ||
-           strcasecmp(p, "patch") == 0 || strcmp(p, "*") == 0;
-
-  case ST_TYPE_TIMESTAMP:
-    return strcasecmp(p, "date") == 0 || strcasecmp(p, "time") == 0 ||
-           strcasecmp(p, "datetime") == 0;
-
-  case ST_TYPE_BRANCH:
-    /* Branch prefix: feature, release, hotfix, head, main, etc. */
-    for (; *p; p++) {
-      if (!isalnum((unsigned char)*p) && *p != '-' && *p != '_')
-        return false;
-    }
-    return true;
-
-  case ST_TYPE_SHA:
-    /* SHA length variant: short (7), 40 (SHA-1), 64 (SHA-256) */
-    return strcmp(p, "short") == 0 || strcmp(p, "40") == 0 ||
-           strcmp(p, "64") == 0;
-
-  case ST_TYPE_IMAGE:
-    /* Image name/tag prefix: latest, nginx, ghcr, alpine, etc. */
-    for (; *p; p++) {
-      if (!isalnum((unsigned char)*p) && *p != '.' && *p != '-' && *p != '_' &&
-          *p != '/')
-        return false;
-    }
-    return true;
-
-  case ST_TYPE_PKG:
-    /* Package name prefix: react, types, @types, etc. */
-    for (; *p; p++) {
-      if (!isalnum((unsigned char)*p) && *p != '.' && *p != '-' && *p != '_' &&
-          *p != '@' && *p != '/')
-        return false;
-    }
-    return true;
-
-  case ST_TYPE_USER:
-    /* Known username or category: root, system, etc. */
-    for (; *p; p++) {
-      if (!isalnum((unsigned char)*p) && *p != '-' && *p != '_')
-        return false;
-    }
-    return true;
-
-  case ST_TYPE_FINGERPRINT:
-    /* Fingerprint type: sha256, md5 */
-    return strcasecmp(p, "sha256") == 0 || strcasecmp(p, "md5") == 0;
-
-  case ST_TYPE_HASH_ALGO: {
-    /* Hash algorithm name: md5, sha1, sha224, sha256, sha384, sha512,
-     * blake2b, blake2s, ripemd160, whirlpool */
-    static const char *algos[] = {"md5",       "sha1",     "sha224",  "sha256",
-                                  "sha384",    "sha512",   "blake2b", "blake2s",
-                                  "ripemd160", "whirlpool"};
-    for (size_t i = 0; i < sizeof(algos) / sizeof(algos[0]); i++) {
-      if (strcasecmp(p, algos[i]) == 0)
-        return true;
-    }
-    return false;
-  }
-
-  case ST_TYPE_DURATION: {
-    /* Time unit: ns, us, ms, s, m, h, d, w (case-insensitive) */
-    static const char *units[] = {"ns", "us", "ms", "s", "m", "h", "d", "w"};
-    for (size_t i = 0; i < sizeof(units) / sizeof(units[0]); i++) {
-      if (strcasecmp(p, units[i]) == 0)
-        return true;
-    }
-    return false;
-  }
-
-  case ST_TYPE_SIGNAL: {
-    /* Signal name: HUP, INT, TERM, etc. (with or without SIG prefix) */
-    static const char *signals[] = {
-        "HUP",  "INT",    "QUIT", "ILL",   "TRAP", "ABRT", "BUS",  "FPE",
-        "KILL", "USR1",   "SEGV", "USR2",  "PIPE", "ALRM", "TERM", "STKFLT",
-        "CHLD", "CONT",   "STOP", "TSTP",  "TTIN", "TTOU", "URG",  "XCPU",
-        "XFSZ", "VTALRM", "PROF", "WINCH", "POLL", "PWR",  "SYS",  NULL};
-    for (const char **s = signals; *s; s++) {
-      if (strcasecmp(p, *s) == 0)
-        return true;
-    }
-    /* Also accept with SIG prefix */
-    if (strncasecmp(p, "SIG", 3) == 0) {
-      for (const char **s = signals; *s; s++) {
-        if (strcasecmp(p + 3, *s) == 0)
-          return true;
-      }
-    }
-    return false;
-  }
-
-  case ST_TYPE_RANGE:
-    /* Range step marker: accept only "step" */
-    return strcmp(p, "step") == 0;
-
-  case ST_TYPE_PERM_OCTAL:
-    /* Permission class marker: accept only "bits" */
-    return strcmp(p, "bits") == 0;
-
-  default:
-    return false;
-  }
+  return st_metadata_lookup(base_type, param + 1) != NULL;
 }
 
 /* --- PARAMETRIZED MATCHING --- */
+
+static bool closed_metadata_matches(const char *cmd_text,
+                                    st_token_type_t cmd_type,
+                                    const char *wild_text,
+                                    st_token_type_t wild_type) {
+  const st_metadata_entry_t *metadata =
+      st_wildcard_metadata(wild_text, wild_type);
+  if (!metadata)
+    return true;
+
+  if (wild_type == ST_TYPE_SIZE) {
+    const char *suffix =
+        cmd_type == ST_TYPE_SIZE ? st_size_suffix(cmd_text) : NULL;
+    const st_metadata_entry_t *observed =
+        st_metadata_lookup(ST_TYPE_SIZE, suffix);
+    return observed && observed->id == metadata->id;
+  }
+  if (wild_type == ST_TYPE_UUID) {
+    if (cmd_type != ST_TYPE_UUID || !cmd_text || strlen(cmd_text) != 36)
+      return false;
+    return (metadata->id == ST_META_UUID_V4 && cmd_text[14] == '4') ||
+           (metadata->id == ST_META_UUID_V5 && cmd_text[14] == '5');
+  }
+  if (wild_type == ST_TYPE_SEMVER)
+    return cmd_type == ST_TYPE_SEMVER;
+  if (wild_type == ST_TYPE_TIMESTAMP) {
+    if (cmd_type != ST_TYPE_TIMESTAMP || !cmd_text)
+      return false;
+    size_t len = strlen(cmd_text);
+    if (metadata->id == ST_META_TIMESTAMP_DATE)
+      return len == 10 && cmd_text[4] == '-' && cmd_text[7] == '-';
+    if (metadata->id == ST_META_TIMESTAMP_TIME)
+      return len == 8 && cmd_text[2] == ':' && cmd_text[5] == ':';
+    return metadata->id == ST_META_TIMESTAMP_DATETIME && len >= 19 &&
+           (cmd_text[10] == 'T' || cmd_text[10] == ' ');
+  }
+  if (wild_type == ST_TYPE_SHA) {
+    if ((cmd_type != ST_TYPE_SHA && cmd_type != ST_TYPE_HEXHASH) || !cmd_text)
+      return false;
+    size_t len = strlen(cmd_text);
+    for (size_t i = 0; i < len; i++)
+      if (!isxdigit((unsigned char)cmd_text[i]))
+        return false;
+    return (metadata->id == ST_META_SHA_SHORT && len == 7) ||
+           (metadata->id == ST_META_SHA_40 && len == 40) ||
+           (metadata->id == ST_META_SHA_64 && len == 64);
+  }
+  if (wild_type == ST_TYPE_FINGERPRINT) {
+    if (cmd_type != ST_TYPE_FINGERPRINT || !cmd_text)
+      return false;
+    if (metadata->id == ST_META_FINGERPRINT_SHA256)
+      return strncmp(cmd_text, "SHA256:", 7) == 0;
+    return metadata->id == ST_META_FINGERPRINT_MD5 && strlen(cmd_text) == 47 &&
+           cmd_text[2] == ':' && cmd_text[5] == ':';
+  }
+  if (wild_type == ST_TYPE_DURATION) {
+    if (cmd_type != ST_TYPE_DURATION || !cmd_text)
+      return false;
+    const char *suffix = cmd_text;
+    if (*suffix == '-')
+      suffix++;
+    while (*suffix && (isdigit((unsigned char)*suffix) || *suffix == '.'))
+      suffix++;
+    const st_metadata_entry_t *observed =
+        st_metadata_lookup(ST_TYPE_DURATION, suffix);
+    return observed && observed->id == metadata->id;
+  }
+  if (wild_type == ST_TYPE_RANGE)
+    return cmd_type == ST_TYPE_RANGE;
+  if (wild_type == ST_TYPE_PERM_OCTAL)
+    return cmd_type == ST_TYPE_PERM_OCTAL;
+  return false;
+}
 
 /* Check if a command token matches a (possibly parametrized) wildcard child.
  * Returns true for non-parametrized wildcards (text == NULL or no parameter).
  */
 static bool param_matches(const char *cmd_text, st_token_type_t cmd_type,
                           const char *wild_text, st_token_type_t wild_type) {
-  const char *wparam = wildcard_param(wild_text, wild_type);
-  if (!wparam)
-    return true; /* non-parametrized → any match */
-
-  if (wild_type == ST_TYPE_PATH || wild_type == ST_TYPE_ABS_PATH ||
-      wild_type == ST_TYPE_REL_PATH || wild_type == ST_TYPE_FILENAME) {
-    /* Path types: match by file extension */
-    if (cmd_type != ST_TYPE_ABS_PATH && cmd_type != ST_TYPE_REL_PATH &&
-        cmd_type != ST_TYPE_FILENAME && cmd_type != ST_TYPE_PATH)
-      return false;
-    if (!cmd_text)
-      return false;
-    const char *cmd_ext = st_path_extension(cmd_text);
-    if (!cmd_ext)
-      return false;
-    return strcmp(cmd_ext, wparam) == 0;
-  }
-
-  if (wild_type == ST_TYPE_SIZE) {
-    /* Size type: match by suffix (case-insensitive) */
-    if (cmd_type != ST_TYPE_SIZE)
-      return false;
-    if (!cmd_text)
-      return false;
-    const char *cmd_suf = st_size_suffix(cmd_text);
-    if (!cmd_suf)
-      return false;
-    /* wparam includes leading dot: ".MiB" — compare after the dot */
-    return strcasecmp(cmd_suf, wparam + 1) == 0;
-  }
-
-  if (wild_type == ST_TYPE_UUID) {
-    /* UUID: match by version digit */
-    if (cmd_type != ST_TYPE_UUID)
-      return false;
-    if (!cmd_text)
-      return false;
-    /* UUID format: xxxxxxxx-xxxx-Vxxx-xxxx-xxxxxxxxxxxx (V at position 14) */
-    size_t len = strlen(cmd_text);
-    if (len != 36 || cmd_text[8] != '-' || cmd_text[13] != '-' ||
-        cmd_text[18] != '-' || cmd_text[23] != '-')
-      return false;
-    char version = cmd_text[14];
-    /* wparam is ".v4" or ".4" — accept both */
-    const char *expected = wparam + 1; /* skip dot */
-    if (tolower((unsigned char)expected[0]) == 'v')
-      expected++;
-    return version == expected[0] && expected[1] == '\0';
-  }
-
-  if (wild_type == ST_TYPE_SEMVER) {
-    /* Semver: parameter is informational, matches any semver */
-    return cmd_type == ST_TYPE_SEMVER;
-  }
-
-  if (wild_type == ST_TYPE_TIMESTAMP) {
-    /* Timestamp: match by format */
-    if (cmd_type != ST_TYPE_TIMESTAMP)
-      return false;
-    if (!cmd_text)
-      return false;
-    size_t len = strlen(cmd_text);
-    const char *fmt = wparam + 1; /* skip dot */
-    if (strcasecmp(fmt, "date") == 0) {
-      /* YYYY-MM-DD: exactly 10 chars, '-' at 4 and 7 */
-      return len == 10 && cmd_text[4] == '-' && cmd_text[7] == '-';
-    }
-    if (strcasecmp(fmt, "time") == 0) {
-      /* HH:MM:SS: exactly 8 chars, ':' at 2 and 5 */
-      return len == 8 && cmd_text[2] == ':' && cmd_text[5] == ':';
-    }
-    if (strcasecmp(fmt, "datetime") == 0) {
-      /* Combined: at least 19 chars with T or space separator */
-      return len >= 19 && (cmd_text[10] == 'T' || cmd_text[10] == ' ');
-    }
-    return true; /* unknown format → accept any timestamp */
-  }
-
-  if (wild_type == ST_TYPE_BRANCH) {
-    /* Branch: parameter is a prefix (e.g., ".feature" matches "feature/login").
-     * Also handles parametrized command tokens (#branch.feature). */
-    if (cmd_type != ST_TYPE_BRANCH && cmd_type != ST_TYPE_LITERAL &&
-        cmd_type != ST_TYPE_WORD && cmd_type != ST_TYPE_HYPHENATED)
-      return false;
-    if (!cmd_text)
-      return false;
-    const char *prefix = wparam + 1; /* skip dot */
-    size_t prefix_len = strlen(prefix);
-    /* If command token is parametrized (#branch.xxx), use its prefix */
-    if (cmd_type == ST_TYPE_BRANCH && strncmp(cmd_text, "#branch.", 8) == 0) {
-      /* Extract prefix from command: for #branch.xxx, prefix is before / if
-       * present */
-      const char *cmd_prefix = cmd_text + 8; /* skip "#branch." */
-      const char *slash = strchr(cmd_prefix, '/');
-      size_t cmd_prefix_len =
-          slash ? (size_t)(slash - cmd_prefix) : strlen(cmd_prefix);
-      return cmd_prefix_len == prefix_len &&
-             strncmp(cmd_prefix, prefix, prefix_len) == 0;
-    }
-    return strncmp(cmd_text, prefix, prefix_len) == 0;
-  }
-
-  if (wild_type == ST_TYPE_SHA) {
-    /* SHA: parameter is length variant (short/40/64).
-     * Also handles parametrized command tokens (#sha.40). */
-    if (cmd_type != ST_TYPE_SHA && cmd_type != ST_TYPE_HEXHASH &&
-        cmd_type != ST_TYPE_LITERAL)
-      return false;
-    if (!cmd_text)
-      return false;
-    const char *variant = wparam + 1;
-    /* If command token is parametrized (#sha.xxx), extract from it.
-     * Check first 5 chars: "#sha." prefix = 5 chars. */
-    if (strncmp(cmd_text, "#sha.", 5) == 0 && cmd_text[5] != '\0') {
-      const char *cmd_variant = cmd_text + 5;
-      return strcasecmp(cmd_variant, variant) == 0;
-    }
-    size_t len = strlen(cmd_text);
-    if (strcmp(variant, "short") == 0)
-      return len == 7;
-    if (strcmp(variant, "40") == 0)
-      return len == 40;
-    if (strcmp(variant, "64") == 0)
-      return len == 64;
-    return true;
-  }
-
-  if (wild_type == ST_TYPE_IMAGE) {
-    /* Image: parameter is name/registry prefix.
-     * Also handles parametrized command tokens (#image.xxx). */
-    if (cmd_type != ST_TYPE_IMAGE && cmd_type != ST_TYPE_LITERAL)
-      return false;
-    if (!cmd_text)
-      return false;
-    const char *prefix = wparam + 1;
-    size_t prefix_len = strlen(prefix);
-    /* If command token is parametrized, extract prefix from it */
-    if (cmd_type == ST_TYPE_IMAGE && strncmp(cmd_text, "#image.", 7) == 0) {
-      return strcasecmp(cmd_text + 7, prefix) == 0;
-    }
-    return strncmp(cmd_text, prefix, prefix_len) == 0;
-  }
-
-  if (wild_type == ST_TYPE_PKG) {
-    /* Package: parameter is name prefix.
-     * Also handles parametrized command tokens (#pkg.@scope). */
-    if (cmd_type != ST_TYPE_PKG && cmd_type != ST_TYPE_LITERAL)
-      return false;
-    if (!cmd_text)
-      return false;
-    const char *prefix = wparam + 1;
-    size_t prefix_len = strlen(prefix);
-    /* If command token is parametrized, extract prefix from it */
-    if (cmd_type == ST_TYPE_PKG && strncmp(cmd_text, "#pkg.", 5) == 0) {
-      return strcasecmp(cmd_text + 5, prefix) == 0;
-    }
-    return strncmp(cmd_text, prefix, prefix_len) == 0;
-  }
-
-  if (wild_type == ST_TYPE_USER) {
-    /* User: parameter is exact username or "system" for known system accounts.
-     * Also handles parametrized command tokens (#user.xxx). */
-    if (cmd_type != ST_TYPE_USER && cmd_type != ST_TYPE_LITERAL)
-      return false;
-    if (!cmd_text)
-      return false;
-    const char *name = wparam + 1;
-    /* If command token is parametrized, extract name from it */
-    if (cmd_type == ST_TYPE_USER && strncmp(cmd_text, "#user.", 6) == 0) {
-      return strcmp(cmd_text + 6, name) == 0;
-    }
-    if (strcasecmp(name, "system") == 0) {
-      static const char *sys_users[] = {
-          "root",      "nobody", "www-data", "daemon", "bin",   "sys",
-          "adm",       "lp",     "mail",     "news",   "uucp",  "man",
-          "proxy",     "www",    "backup",   "list",   "irc",   "gnats",
-          "systemd",   "_apt",   "postgres", "mysql",  "nginx", "redis",
-          "memcached", "sshd",   NULL};
-      for (const char **u = sys_users; *u; u++) {
-        if (strcmp(cmd_text, *u) == 0)
-          return true;
-      }
-      return false;
-    }
-    return strcmp(cmd_text, name) == 0;
-  }
-
-  if (wild_type == ST_TYPE_FINGERPRINT) {
-    /* Fingerprint: parameter is type (sha256/md5) */
-    if (cmd_type != ST_TYPE_FINGERPRINT)
-      return false;
-    if (!cmd_text)
-      return false;
-    const char *fmt = wparam + 1;
-    if (strcasecmp(fmt, "sha256") == 0)
-      return strncmp(cmd_text, "SHA256:", 7) == 0;
-    if (strcasecmp(fmt, "md5") == 0) {
-      size_t len = strlen(cmd_text);
-      return len == 47 && cmd_text[2] == ':' && cmd_text[5] == ':';
-    }
-    return true;
-  }
-
-  if (wild_type == ST_TYPE_HASH_ALGO) {
-    /* Hash algo: command token is the algorithm name or parametrized wildcard.
-     * E.g., policy "#hash.sha256" matches:
-     *   - command token "sha256" (type HASH_ALGO, text "sha256")
-     *   - command token "#hash.sha256" (type HASH_ALGO, text "#hash.sha256")
-     */
-    if (cmd_type != ST_TYPE_HASH_ALGO)
-      return false;
-    if (!cmd_text)
-      return false;
-    const char *expected_algo = wparam + 1; /* "sha256" from "#hash.sha256" */
-    /* If command token text is parametrized (#hash.xxx), extract algo from it.
-     * Otherwise use the token text directly (it's the algorithm name). */
-    const char *algo_from_cmd = cmd_text;
-    const char *cmd_sym = st_type_symbol[cmd_type]; /* "#hash" */
-    size_t cmd_sym_len = strlen(cmd_sym);
-    if (strncmp(cmd_text, cmd_sym, cmd_sym_len) == 0 &&
-        cmd_text[cmd_sym_len] == '.') {
-      algo_from_cmd = cmd_text + cmd_sym_len + 1; /* skip "#hash." */
-    }
-    return strcasecmp(algo_from_cmd, expected_algo) == 0;
-  }
-
-  if (wild_type == ST_TYPE_SIGNAL) {
-    /* Signal: command token is the signal name or parametrized wildcard.
-     * Policy "#signal.TERM" matches "TERM", "SIGTERM", "#signal.TERM". */
-    if (cmd_type != ST_TYPE_SIGNAL && cmd_type != ST_TYPE_NUMBER)
-      return false;
-    if (!cmd_text)
-      return false;
-    const char *sig_name = wparam + 1;
-    /* Extract signal name from command token */
-    const char *cmd_sig = cmd_text;
-    /* Check for parametrized form (#signal.xxx) */
-    const char *cmd_sym = st_type_symbol[cmd_type];
-    size_t cmd_sym_len = strlen(cmd_sym);
-    if (strncmp(cmd_text, cmd_sym, cmd_sym_len) == 0 &&
-        cmd_text[cmd_sym_len] == '.') {
-      cmd_sig = cmd_text + cmd_sym_len + 1; /* skip "#signal." */
-    }
-    /* Strip SIG prefix if present in command token */
-    if (strncmp(cmd_sig, "SIG", 3) == 0)
-      cmd_sig += 3;
-    /* Also strip SIG prefix from parameter */
-    if (strncmp(sig_name, "SIG", 3) == 0)
-      sig_name += 3;
-    return strcasecmp(cmd_sig, sig_name) == 0;
-  }
-
-  if (wild_type == ST_TYPE_DURATION) {
-    /* Duration: command token may be parametrized (#duration.s) or plain (30s).
-     * Policy "#duration.s" matches "30s" and "#duration.s" alike. */
-    if (cmd_type != ST_TYPE_DURATION && cmd_type != ST_TYPE_SIZE &&
-        cmd_type != ST_TYPE_LITERAL)
-      return false;
-    if (!cmd_text)
-      return false;
-    /* If command token is parametrized (#duration.xxx), extract from it */
-    if (strncmp(cmd_text, "#duration.", 10) == 0) {
-      return strcasecmp(cmd_text + 10, wparam + 1) == 0;
-    }
-    /* Extract unit from command token (plain 30s, 1.5h, etc.) */
-    const char *p = cmd_text;
-    if (*p == '-')
-      p++;
-    while (*p && (*p == '#' || isdigit((unsigned char)*p) || *p == '.')) {
-      /* Skip parametrized prefix (#duration.) or digits/dot */
-      if (*p == '#') {
-        /* Parametrized: skip "#duration." prefix */
-        const char *sym = st_type_symbol[cmd_type];
-        size_t sym_len = strlen(sym);
-        if (strncmp(p, sym, sym_len) == 0 && p[sym_len] == '.') {
-          p += sym_len + 1;
-          break;
-        }
-      }
-      p++;
-    }
-    while (*p && (isdigit((unsigned char)*p) || *p == '.'))
-      p++;
-    if (*p == '\0')
-      return false;
-    return strcasecmp(p, wparam + 1) == 0;
-  }
-
-  if (wild_type == ST_TYPE_RANGE) {
-    /* Range step marker: param is ignored, matches any range token.
-     * Also handles parametrized command tokens (#range.step). */
-    if (cmd_type == ST_TYPE_RANGE)
-      return true;
-    if (cmd_type == ST_TYPE_LITERAL) {
-      /* Check if it's a parametrized range token (#range.step) */
-      if (strncmp(cmd_text, "#range.", 7) == 0)
-        return true;
-    }
-    return false;
-  }
-
-  if (wild_type == ST_TYPE_PERM_OCTAL) {
-    /* Permission marker: param is ignored, matches any perm token.
-     * Also handles parametrized command tokens (#perm.bits). */
-    if (cmd_type == ST_TYPE_PERM_OCTAL)
-      return true;
-    if (cmd_type == ST_TYPE_LITERAL) {
-      if (strncmp(cmd_text, "#perm.", 6) == 0)
-        return true;
-    }
-    return false;
-  }
-
-  return true;
-}
-
-static child_entry_t *find_wildcard_child(const policy_state_t *node,
-                                          const char *arena_base,
-                                          st_token_type_t type,
-                                          const char *cmd_text) {
-  if (node->wildcard_count == 0 || !arena_base)
-    return NULL;
-  assert(node->literal_count + node->wildcard_count <= node->children_alloc);
-  if (!(node->wildcard_mask & runtime_match_mask(type)))
-    return NULL;
-
-  child_entry_t *children =
-      (child_entry_t *)(arena_base + node->children_offset);
-  child_entry_t *base = children + node->literal_count;
-
-  /* First pass: prefer non-parametrized wildcards (more general, covers all
-   * cases) */
-  for (uint16_t i = 0; i < node->wildcard_count; i++) {
-    if (st_is_compatible(type, (st_token_type_t)base[i].type) &&
-        !wildcard_param(base[i].text, (st_token_type_t)base[i].type))
-      return &base[i];
-  }
-
-  /* Second pass: try parametrized wildcards */
-  for (uint16_t i = 0; i < node->wildcard_count; i++) {
-    if (st_is_compatible(type, (st_token_type_t)base[i].type) &&
-        param_matches(cmd_text, type, base[i].text,
-                      (st_token_type_t)base[i].type))
-      return &base[i];
-  }
-  return NULL;
+  return closed_metadata_matches(cmd_text, cmd_type, wild_text, wild_type);
 }
 
 /* Find an exact wildcard child for pattern insertion or removal.
- * Non-parametrized wildcards: text=NULL stored, matches ANY text search.
+ * Non-parametrized wildcards: text=NULL stored, matches only a
+ * non-parametrized search.
  * Parametrized wildcards: full symbol text stored (e.g., "#path.cfg").
  * Uses exact type + text comparison (strcmp), not param_matches.
  * This is the correct lookup for add/remove where we want to find
@@ -1067,11 +712,13 @@ static child_entry_t *find_exact_wildcard_child(const policy_state_t *node,
     if ((st_token_type_t)base[i].type != type)
       continue;
     const char *existing = base[i].text;
-    /* Non-parametrized wildcard (text=NULL stored): matches any text */
-    if (existing == NULL)
+    /* Do not let a request for #type.parameter resolve to the generic #type
+     * child. In particular, removing an absent subtype must not remove its
+     * surviving generic rule. */
+    if (existing == NULL && wildcard_param(text, type) == NULL)
       return &base[i];
     /* Parametrized wildcard: exact text match required */
-    if (text != NULL && strcmp(text, existing) == 0)
+    if (existing != NULL && text != NULL && strcmp(text, existing) == 0)
       return &base[i];
   }
   return NULL;
@@ -1142,10 +789,14 @@ static int insert_child(policy_state_t *node, st_policy_t *policy,
                    ? st_policy_ctx_intern(policy->ctx, text)
                    : NULL;
   }
+  if ((is_literal || (text && strchr(text, '.'))) && !interned)
+    return -1;
   child_entry_t new_child = {
       .text = interned, .target = target, .type = (uint8_t)type};
 
   if (total + 1 > node->children_alloc) {
+    if (node->children_alloc > UINT16_MAX / 2)
+      return -1;
     uint16_t new_alloc =
         node->children_alloc == 0 ? 4 : node->children_alloc * 2;
     uint16_t old_alloc = node->children_alloc;
@@ -1204,6 +855,10 @@ static bool validate_pattern(const char *pattern) {
   if (!pattern || !pattern[0])
     return false;
 
+  for (const unsigned char *p = (const unsigned char *)pattern; *p; p++)
+    if ((*p < 0x20 && *p != ' ') || *p == 0x7f)
+      return false;
+
   /* Check first token - reject patterns starting with * (too broad) */
   const char *first = pattern;
   while (*first == ' ')
@@ -1215,23 +870,53 @@ static bool validate_pattern(const char *pattern) {
   return true;
 }
 
-static st_token_t *parse_pattern(const char *pattern, size_t *out_count) {
+static st_token_t *parse_pattern(const char *pattern, size_t *out_count,
+                                 st_error_t *out_error) {
+  if (out_error)
+    *out_error = ST_ERR_INVALID;
   if (!validate_pattern(pattern))
     return NULL;
 
-  size_t count = 1;
+  /* Keep the parser contract aligned with the fixed-size public metadata
+   * buffers.  Reject before allocating or copying so validation cannot
+   * truncate token text or write past st_pattern_info_t. */
+  size_t pattern_len = strlen(pattern);
+  if (pattern_len >= ST_MAX_PATTERN_LEN)
+    return NULL;
+
+  size_t count = 0;
+  size_t token_len = 0;
   for (const char *p = pattern; *p; p++) {
-    if (*p == ' ')
-      count++;
+    if (*p == ' ') {
+      if (token_len != 0) {
+        if (token_len >= ST_MAX_TOKEN_LEN)
+          return NULL;
+        count++;
+        token_len = 0;
+      }
+    } else {
+      token_len++;
+    }
   }
+  if (token_len >= ST_MAX_TOKEN_LEN)
+    return NULL;
+  if (token_len != 0)
+    count++;
+  if (count == 0 || count > ST_MAX_CMD_TOKENS)
+    return NULL;
 
   char *copy = strdup(pattern);
-  if (!copy)
+  if (!copy) {
+    if (out_error)
+      *out_error = ST_ERR_MEMORY;
     return NULL;
+  }
 
   st_token_t *tokens = calloc(count, sizeof(st_token_t));
   if (!tokens) {
     free(copy);
+    if (out_error)
+      *out_error = ST_ERR_MEMORY;
     return NULL;
   }
 
@@ -1241,6 +926,8 @@ static st_token_t *parse_pattern(const char *pattern, size_t *out_count) {
   while (tok && ti < count) {
     st_token_type_t type = ST_TYPE_LITERAL;
     bool matched_prefix = false;
+    char canonical_token[ST_MAX_TOKEN_LEN];
+    const char *token_text = tok;
     for (int t = 1; t < ST_TYPE_COUNT; t++) {
       const char *sym = st_type_symbol[t];
       size_t sym_len = strlen(sym);
@@ -1256,8 +943,17 @@ static st_token_t *parse_pattern(const char *pattern, size_t *out_count) {
          * parametrized wildcard. */
         if (sym[0] == '#')
           matched_prefix = true;
-        if (type_supports_param((st_token_type_t)t) &&
+        const st_metadata_entry_t *metadata =
+            st_metadata_lookup((st_token_type_t)t, tok + sym_len + 1);
+        if (type_supports_param((st_token_type_t)t) && metadata &&
             validate_param((st_token_type_t)t, tok + sym_len)) {
+          int written = snprintf(canonical_token, sizeof(canonical_token),
+                                 "%s.%s", sym, metadata->name);
+          if (written < 0 || (size_t)written >= sizeof(canonical_token)) {
+            matched_prefix = true;
+            break;
+          }
+          token_text = canonical_token;
           type = (st_token_type_t)t;
           break;
         }
@@ -1275,16 +971,18 @@ static st_token_t *parse_pattern(const char *pattern, size_t *out_count) {
       *out_count = 0;
       return NULL;
     }
-    if (type == ST_TYPE_LITERAL) {
-      type = st_classify_token(tok);
-    }
-    tokens[ti].text = strdup(tok);
+    /* Concrete spellings are exact policy literals.  Classification belongs
+     * to command tokens; only an explicit wildcard spelling gives a policy
+     * token wildcard semantics. */
+    tokens[ti].text = strdup(token_text);
     if (!tokens[ti].text) {
       for (size_t k = 0; k < ti; k++)
         free(tokens[k].text);
       free(tokens);
       free(copy);
       *out_count = 0;
+      if (out_error)
+        *out_error = ST_ERR_MEMORY;
       return NULL;
     }
     tokens[ti].type = type;
@@ -1382,7 +1080,9 @@ static bool pattern_subsumes(const st_token_t *a, size_t a_len,
        * type. For A (wildcard) to subsume B (concrete): A must be as general as
        * B's type. Check: st_is_compatible(B.type, A.type) — B's type must be
        * subtype of A's type. */
-      if (!st_is_compatible(b[i].type, a[i].type))
+      st_token_type_t concrete_type = st_classify_token(b[i].text);
+      if (!(runtime_match_mask(concrete_type) & (1ULL << a[i].type)) ||
+          !param_matches(b[i].text, concrete_type, a[i].text, a[i].type))
         return false;
     }
   }
@@ -1402,88 +1102,26 @@ static bool pattern_subsumes(const st_token_t *a, size_t a_len,
 static void policy_rebuild_filters(st_policy_t *policy) {
   struct timespec start, end;
   clock_gettime(CLOCK_MONOTONIC, &start);
-
-  /* Count distinct literals at each depth first to size filters correctly */
-  size_t depth_literal_count[FILTER_POS_LEVELS] = {0};
-
-  {
-    typedef struct {
-      uint32_t idx;
-      uint8_t depth;
-    } bfs_q;
-    bfs_q stack_q[128];
-    bfs_q *q = stack_q;
-    size_t q_cap = 128;
-    size_t head = 0, tail = 0;
-
-    q[tail].idx = 0;
-    q[tail].depth = 0;
-    tail++;
-
-    while (head < tail) {
-      bfs_q entry = q[head++];
-      if (entry.depth >= FILTER_POS_LEVELS)
-        continue;
-
-      policy_state_t *node = &policy->states.states[entry.idx];
-      uint16_t total = node->literal_count + node->wildcard_count;
-      child_entry_t *children = (child_entry_t *)(policy->children_arena.base +
-                                                  node->children_offset);
-
-      for (uint16_t i = 0; i < total; i++) {
-        child_entry_t *c = &children[i];
-        if (c->type == ST_TYPE_LITERAL && c->text)
-          depth_literal_count[entry.depth]++;
-
-        if (tail >= q_cap) {
-          size_t new_cap = q_cap * 2;
-          bfs_q *new_q =
-              realloc(q == stack_q ? NULL : q, new_cap * sizeof(bfs_q));
-          if (!new_q)
-            break;
-          if (q == stack_q)
-            memcpy(new_q, stack_q, sizeof(stack_q));
-          q = new_q;
-          q_cap = new_cap;
-        }
-        q[tail].idx = c->target;
-        q[tail].depth = entry.depth + 1;
-        tail++;
-      }
-    }
-    if (q != stack_q)
-      free(q);
-  }
-
-  /* Reset or create filters with proper capacity */
-  for (int i = 0; i < FILTER_POS_LEVELS; i++) {
-    vacuum_filter_destroy(policy->pos_filters[i]);
-    policy->pos_filters[i] = NULL;
-    policy->pos_wildcard_mask[i] = 0;
-
-    if (depth_literal_count[i] > 0) {
-      size_t cap = depth_literal_count[i] + depth_literal_count[i] / 4;
-      if (cap < 64)
-        cap = 64;
-      policy->pos_filters[i] = vacuum_filter_create(cap, 0, 0, 0);
-    }
-  }
-
-  /* BFS walk: insert literals into filters, accumulate wildcard masks */
   typedef struct {
     uint32_t idx;
     uint8_t depth;
   } bfs_q;
-  bfs_q stack_q[128];
-  bfs_q *q = stack_q;
-  size_t q_cap = 128;
+  vacuum_filter_t *new_filters[FILTER_POS_LEVELS] = {0};
+  uint64_t new_wildcard_masks[FILTER_POS_LEVELS] = {0};
+  bfs_q *q = malloc(policy->states.count * sizeof(*q));
   size_t head = 0, tail = 0;
+  bool complete = q != NULL;
 
-  q[tail].idx = 0;
-  q[tail].depth = 0;
-  tail++;
+  size_t cap = policy->states.count + policy->states.count / 4;
+  if (cap < 64)
+    cap = 64;
+  for (int i = 0; complete && i < FILTER_POS_LEVELS; i++)
+    new_filters[i] = vacuum_filter_create(cap, 0, 0, 0);
 
-  while (head < tail) {
+  if (complete)
+    q[tail++] = (bfs_q){.idx = 0, .depth = 0};
+
+  while (complete && head < tail) {
     bfs_q entry = q[head++];
     if (entry.depth >= FILTER_POS_LEVELS)
       continue;
@@ -1501,41 +1139,37 @@ static void policy_rebuild_filters(st_policy_t *policy) {
       uint8_t d = entry.depth;
 
       if (c->type == ST_TYPE_LITERAL) {
-        if (policy->pos_filters[d]) {
+        if (new_filters[d]) {
           uint64_t h = filter_hash_fnv1a(c->text, strlen(c->text));
-          vacuum_err_t vrc = vacuum_filter_insert(policy->pos_filters[d], h);
+          vacuum_err_t vrc = vacuum_filter_insert(new_filters[d], h);
           if (vrc != VACUUM_OK) {
-            /* Filter full — disable for this depth */
-            vacuum_filter_destroy(policy->pos_filters[d]);
-            policy->pos_filters[d] = NULL;
+            /* A disabled filter is conservative: it cannot reject a match. */
+            vacuum_filter_destroy(new_filters[d]);
+            new_filters[d] = NULL;
           }
         }
       } else {
-        policy->pos_wildcard_mask[d] |= (1ULL << c->type);
+        new_wildcard_masks[d] |= (1ULL << c->type);
       }
 
-      if (tail >= q_cap) {
-        size_t new_cap = q_cap * 2;
-        bfs_q *new_q =
-            realloc(q == stack_q ? NULL : q, new_cap * sizeof(bfs_q));
-        if (!new_q)
-          break;
-        if (q == stack_q)
-          memcpy(new_q, stack_q, sizeof(stack_q));
-        q = new_q;
-        q_cap = new_cap;
+      if (tail >= policy->states.count) {
+        complete = false;
+        break;
       }
-      q[tail].idx = c->target;
-      q[tail].depth = d + 1;
-      tail++;
+      q[tail++] = (bfs_q){.idx = c->target, .depth = d + 1};
     }
   }
 
-  if (q != stack_q)
-    free(q);
+  free(q);
 
+  uint64_t epoch = atomic_load(&policy->epoch);
   for (int i = 0; i < FILTER_POS_LEVELS; i++) {
-    policy->pos_built_epoch[i] = atomic_load(&policy->epoch);
+    vacuum_filter_destroy(policy->pos_filters[i]);
+    policy->pos_filters[i] = complete ? new_filters[i] : NULL;
+    policy->pos_wildcard_mask[i] = complete ? new_wildcard_masks[i] : 0;
+    policy->pos_built_epoch[i] = epoch;
+    if (!complete)
+      vacuum_filter_destroy(new_filters[i]);
   }
 
   clock_gettime(CLOCK_MONOTONIC, &end);
@@ -1549,14 +1183,17 @@ static void policy_rebuild_filters(st_policy_t *policy) {
 /* --- PATTERN VALIDATION (public API) --- */
 
 st_error_t st_validate_pattern(const char *pattern, st_pattern_info_t *info) {
+  if (info)
+    memset(info, 0, sizeof(*info));
   if (!pattern || !pattern[0])
     return ST_ERR_INVALID;
 
   size_t token_count = 0;
-  st_token_t *tokens = parse_pattern(pattern, &token_count);
+  st_error_t parse_error = ST_ERR_INVALID;
+  st_token_t *tokens = parse_pattern(pattern, &token_count, &parse_error);
   if (!tokens || token_count == 0) {
     free_pattern_tokens(tokens, token_count);
-    return ST_ERR_INVALID;
+    return parse_error;
   }
 
   if (info) {
@@ -1616,12 +1253,16 @@ st_policy_t *st_policy_new(st_policy_ctx_t *ctx) {
   atomic_init(&policy->stats.filter_rebuild_us, 0);
 
   if (!arena_init(&policy->children_arena, CHILDREN_ARENA_SIZE)) {
+    free(policy->len_buckets);
+    pattern_reg_free(&policy->patterns);
     states_array_free(&policy->states);
     free(policy);
     return NULL;
   }
   if (pthread_rwlock_init(&policy->rwlock, NULL) != 0) {
     arena_free(&policy->children_arena);
+    free(policy->len_buckets);
+    pattern_reg_free(&policy->patterns);
     states_array_free(&policy->states);
     free(policy);
     return NULL;
@@ -1659,6 +1300,23 @@ void st_policy_free(st_policy_t *policy) {
 static st_error_t remove_pattern_by_id_locked(st_policy_t *policy,
                                               uint16_t pid);
 
+static bool canonical_pattern_text(const st_token_t *tokens, size_t count,
+                                   char out[ST_MAX_PATTERN_LEN]) {
+  size_t used = 0;
+  for (size_t i = 0; i < count; i++) {
+    size_t length = strlen(tokens[i].text);
+    size_t separator = i == 0 ? 0 : 1;
+    if (used + separator + length >= ST_MAX_PATTERN_LEN)
+      return false;
+    if (separator)
+      out[used++] = ' ';
+    memcpy(out + used, tokens[i].text, length);
+    used += length;
+  }
+  out[used] = '\0';
+  return true;
+}
+
 /* Internal: add pattern assuming write lock is already held.
  *
  * Performs incremental subsumption checks:
@@ -1672,9 +1330,10 @@ static st_error_t st_policy_add_locked(st_policy_t *policy,
     return ST_ERR_INVALID;
 
   size_t token_count = 0;
-  st_token_t *tokens = parse_pattern(pattern, &token_count);
+  st_error_t parse_error = ST_ERR_INVALID;
+  st_token_t *tokens = parse_pattern(pattern, &token_count, &parse_error);
   if (!tokens)
-    return ST_ERR_INVALID;
+    return parse_error;
   if (token_count == 0) {
     free_pattern_tokens(tokens, token_count);
     return ST_ERR_INVALID;
@@ -1683,7 +1342,11 @@ static st_error_t st_policy_add_locked(st_policy_t *policy,
     free_pattern_tokens(tokens, token_count);
     return ST_ERR_INVALID;
   }
-
+  char canonical_pattern[ST_MAX_PATTERN_LEN];
+  if (!canonical_pattern_text(tokens, token_count, canonical_pattern)) {
+    free_pattern_tokens(tokens, token_count);
+    return ST_ERR_INVALID;
+  }
   /* --- Incremental subsumption check --- */
   len_bucket_t *bucket = &policy->len_buckets[token_count];
 
@@ -1734,11 +1397,60 @@ static st_error_t st_policy_add_locked(st_policy_t *policy,
     }
   }
 
-  /* Remove subsumed patterns */
-  for (size_t ri = 0; ri < to_remove_count; ri++) {
-    remove_pattern_by_id_locked(policy, to_remove[ri]);
+  if (policy->pattern_count >= ST_MAX_POLICY_PATTERNS && to_remove_count == 0) {
+    free(to_remove);
+    free_pattern_tokens(tokens, token_count);
+    return ST_ERR_LIMIT;
   }
-  free(to_remove);
+  bool reuse_subsumed_slot =
+      policy->patterns.count >= ST_MAX_POLICY_PATTERNS && to_remove_count != 0;
+
+  /* Find the first absent trie edge. Every following token needs one state
+   * and one child array. Reserve all fallible structural allocations before
+   * removing subsumed rules or publishing a new edge. */
+  uint32_t probe = 0;
+  size_t first_missing = token_count;
+  size_t arena_bytes = 0;
+  for (size_t i = 0; i < token_count; i++) {
+    policy_state_t *node = &policy->states.states[probe];
+    bool is_wild = is_explicit_wildcard(tokens[i].text, tokens[i].type);
+    child_entry_t *child =
+        is_wild ? find_exact_wildcard_child(node, policy->children_arena.base,
+                                            tokens[i].type, tokens[i].text)
+                : find_literal_child(node, policy->children_arena.base,
+                                     tokens[i].text);
+    if (!child) {
+      first_missing = i;
+      break;
+    }
+    probe = child->target;
+  }
+  size_t missing = token_count - first_missing;
+  if (missing > 0) {
+    policy_state_t *parent = &policy->states.states[probe];
+    uint16_t total = parent->literal_count + parent->wildcard_count;
+    if (total + 1 > parent->children_alloc) {
+      if (parent->children_alloc > UINT16_MAX / 2) {
+        free(to_remove);
+        free_pattern_tokens(tokens, token_count);
+        return ST_ERR_LIMIT;
+      }
+      uint16_t slots = parent->children_alloc == 0
+                           ? 4
+                           : (uint16_t)(parent->children_alloc * 2);
+      arena_bytes += (size_t)slots * sizeof(child_entry_t) + 7;
+    }
+    if (missing > 1)
+      arena_bytes += (missing - 1) * (4 * sizeof(child_entry_t) + 7);
+  }
+  if (!states_array_reserve(&policy->states, missing) ||
+      !arena_reserve(&policy->children_arena, arena_bytes) ||
+      (!reuse_subsumed_slot && !pattern_reg_reserve(&policy->patterns)) ||
+      !len_bucket_reserve(bucket, 1)) {
+    free(to_remove);
+    free_pattern_tokens(tokens, token_count);
+    return ST_ERR_MEMORY;
+  }
 
   /* --- Trie insertion (existing logic) --- */
   uint32_t current = 0;
@@ -1768,12 +1480,17 @@ static st_error_t st_policy_add_locked(st_policy_t *policy,
     } else {
       uint32_t new_state = states_array_alloc(&policy->states);
       if (new_state == UINT32_MAX) {
+        free(to_remove);
         free_pattern_tokens(tokens, token_count);
         return ST_ERR_MEMORY;
       }
+      /* states_array_alloc() may realloc the state array. Re-resolve the
+       * parent by index before using it again. */
+      node = &policy->states.states[current];
       int rc = insert_child(node, policy, tokens[i].text, tokens[i].type,
                             new_state, (uint8_t)i);
       if (rc < 0) {
+        free(to_remove);
         free_pattern_tokens(tokens, token_count);
         return ST_ERR_MEMORY;
       }
@@ -1785,20 +1502,39 @@ static st_error_t st_policy_add_locked(st_policy_t *policy,
 
   policy_state_t *end_node = &policy->states.states[current];
   if (end_node->pattern_id == UINT16_MAX) {
-    uint16_t pid = pattern_reg_add(&policy->patterns, policy->ctx, pattern,
-                                   tokens, token_count);
-    if (pid == UINT16_MAX) {
+    pattern_entry_t prepared;
+    if (!pattern_entry_prepare(policy->ctx, canonical_pattern, tokens,
+                               token_count, &prepared)) {
+      free(to_remove);
       free_pattern_tokens(tokens, token_count);
       return ST_ERR_MEMORY;
+    }
+    if (reuse_subsumed_slot) {
+      for (size_t ri = 0; ri < to_remove_count; ri++)
+        remove_pattern_by_id_locked(policy, to_remove[ri]);
+      to_remove_count = 0;
+    }
+    uint16_t pid = pattern_reg_commit(&policy->patterns, &prepared);
+    if (pid == UINT16_MAX) {
+      free_pattern_tokens(prepared.tokens, prepared.token_count);
+      free(to_remove);
+      free_pattern_tokens(tokens, token_count);
+      return ST_ERR_LIMIT;
     }
     end_node->pattern_id = pid;
     policy->pattern_count++;
 
     /* Add to length bucket */
-    if (token_count < policy->num_buckets) {
-      len_bucket_add(&policy->len_buckets[token_count], pid);
-    }
+    bool added = len_bucket_add(&policy->len_buckets[token_count], pid);
+    assert(added);
   }
+
+  /* Only now remove rules subsumed by the successfully published pattern.
+   * Removal is allocation-free, so no later failure can expose a partial
+   * semantic update. */
+  for (size_t ri = 0; ri < to_remove_count; ri++)
+    remove_pattern_by_id_locked(policy, to_remove[ri]);
+  free(to_remove);
 
   if (needs_filter_rebuild)
     policy->epoch++;
@@ -1853,9 +1589,7 @@ static st_error_t remove_pattern_by_id_locked(st_policy_t *policy,
     uint16_t child_idx;
     bool is_literal;
   } path_step_t;
-  path_step_t *path = malloc(entry->token_count * sizeof(path_step_t));
-  if (!path)
-    return ST_ERR_MEMORY;
+  path_step_t path[ST_MAX_CMD_TOKENS];
 
   uint32_t current = 0;
   for (size_t i = 0; i < entry->token_count; i++) {
@@ -1892,7 +1626,6 @@ static st_error_t remove_pattern_by_id_locked(st_policy_t *policy,
     }
 
     if (!child) {
-      free(path);
       return ST_OK;
     }
     current = child->target;
@@ -1901,7 +1634,6 @@ static st_error_t remove_pattern_by_id_locked(st_policy_t *policy,
   /* Unset the pattern_id on the end node */
   policy_state_t *end_node = &policy->states.states[current];
   if (end_node->pattern_id != pid) {
-    free(path);
     return ST_OK;
   }
   end_node->pattern_id = UINT16_MAX;
@@ -1983,7 +1715,6 @@ static st_error_t remove_pattern_by_id_locked(st_policy_t *policy,
   pattern_reg_deactivate(&policy->patterns, pid);
   policy->pattern_count--;
 
-  free(path);
   return ST_OK;
 }
 
@@ -1991,7 +1722,6 @@ static st_error_t remove_pattern_by_id_locked(st_policy_t *policy,
 st_error_t st_policy_add(st_policy_t *policy, const char *pattern) {
   if (!policy || !pattern || !pattern[0])
     return ST_ERR_INVALID;
-
   pthread_rwlock_wrlock(&policy->rwlock);
   st_error_t err = st_policy_add_locked(policy, pattern);
   pthread_rwlock_unlock(&policy->rwlock);
@@ -2004,19 +1734,71 @@ st_error_t st_policy_batch_add(st_policy_t *policy, const char **patterns,
     return ST_ERR_INVALID;
 
   pthread_rwlock_wrlock(&policy->rwlock);
+  /* Build a complete replacement while the live policy remains untouched.
+   * Besides making batches atomic, this prevents a failed insertion after
+   * arena growth from leaving unreachable state in the live policy. */
+  st_policy_t *staged = st_policy_new(policy->ctx);
+  if (!staged) {
+    pthread_rwlock_unlock(&policy->rwlock);
+    return ST_ERR_MEMORY;
+  }
 
   st_error_t first_err = ST_OK;
-  for (size_t i = 0; i < count; i++) {
-    st_error_t err = st_policy_add_locked(policy, patterns[i]);
-    if (err != ST_OK && first_err == ST_OK) {
-      first_err = err;
-    }
+  for (size_t i = 0; i < policy->patterns.count; i++) {
+    if (!policy->patterns.entries[i].active)
+      continue;
+    first_err =
+        st_policy_add_locked(staged, policy->patterns.entries[i].pattern);
+    if (first_err != ST_OK)
+      break;
   }
+  for (size_t i = 0; first_err == ST_OK && i < count; i++)
+    first_err = st_policy_add_locked(staged, patterns[i]);
 
   if (first_err == ST_OK) {
-    policy_rebuild_filters(policy);
-  }
+    states_array_t old_states = policy->states;
+    pattern_reg_t old_patterns = policy->patterns;
+    arena_t old_arena = policy->children_arena;
+    len_bucket_t *old_buckets = policy->len_buckets;
+    size_t old_num_buckets = policy->num_buckets;
+    size_t old_pattern_count = policy->pattern_count;
+    size_t old_children_count = policy->children_count;
+    vacuum_filter_t *old_filters[FILTER_POS_LEVELS];
+    uint64_t old_wildcards[FILTER_POS_LEVELS];
+    uint64_t old_filter_epochs[FILTER_POS_LEVELS];
+    memcpy(old_filters, policy->pos_filters, sizeof old_filters);
+    memcpy(old_wildcards, policy->pos_wildcard_mask, sizeof old_wildcards);
+    memcpy(old_filter_epochs, policy->pos_built_epoch,
+           sizeof old_filter_epochs);
 
+    policy->states = staged->states;
+    policy->patterns = staged->patterns;
+    policy->children_arena = staged->children_arena;
+    policy->len_buckets = staged->len_buckets;
+    policy->num_buckets = staged->num_buckets;
+    policy->pattern_count = staged->pattern_count;
+    policy->children_count = staged->children_count;
+    memcpy(policy->pos_filters, staged->pos_filters,
+           sizeof policy->pos_filters);
+    memcpy(policy->pos_wildcard_mask, staged->pos_wildcard_mask,
+           sizeof policy->pos_wildcard_mask);
+    memcpy(policy->pos_built_epoch, staged->pos_built_epoch,
+           sizeof policy->pos_built_epoch);
+    atomic_fetch_add(&policy->epoch, 1);
+
+    staged->states = old_states;
+    staged->patterns = old_patterns;
+    staged->children_arena = old_arena;
+    staged->len_buckets = old_buckets;
+    staged->num_buckets = old_num_buckets;
+    staged->pattern_count = old_pattern_count;
+    staged->children_count = old_children_count;
+    memcpy(staged->pos_filters, old_filters, sizeof old_filters);
+    memcpy(staged->pos_wildcard_mask, old_wildcards, sizeof old_wildcards);
+    memcpy(staged->pos_built_epoch, old_filter_epochs,
+           sizeof old_filter_epochs);
+  }
+  st_policy_free(staged);
   pthread_rwlock_unlock(&policy->rwlock);
   return first_err;
 }
@@ -2025,42 +1807,40 @@ st_error_t st_policy_merge(st_policy_t *dst, const st_policy_t *src) {
   if (!dst || !src)
     return ST_ERR_INVALID;
   if (dst == src)
-    return ST_ERR_INVALID; /* self-merge would deadlock */
+    return ST_OK;
 
-  /* Every operation involving two policies must acquire their locks in the
-   * same address order. Otherwise concurrent A<-B and B<-A operations can
-   * deadlock. */
-  bool dst_first = (uintptr_t)&dst->rwlock < (uintptr_t)&src->rwlock;
-  if (dst_first) {
-    pthread_rwlock_wrlock(&dst->rwlock);
-    pthread_rwlock_rdlock((pthread_rwlock_t *)&src->rwlock);
-  } else {
-    pthread_rwlock_rdlock((pthread_rwlock_t *)&src->rwlock);
-    pthread_rwlock_wrlock(&dst->rwlock);
+  /* Snapshot source strings before mutating the destination. batch_add then
+   * provides the atomic replacement: any failure leaves dst unchanged. */
+  pthread_rwlock_rdlock((pthread_rwlock_t *)&src->rwlock);
+  size_t count = src->pattern_count;
+  char **patterns = count ? calloc(count, sizeof(*patterns)) : NULL;
+  if (count && !patterns) {
+    pthread_rwlock_unlock((pthread_rwlock_t *)&src->rwlock);
+    return ST_ERR_MEMORY;
   }
-
-  st_error_t first_err = ST_OK;
-  size_t src_count = src->patterns.count;
-  for (size_t i = 0; i < src_count; i++) {
+  size_t copied = 0;
+  for (size_t i = 0; i < src->patterns.count; i++) {
     if (!src->patterns.entries[i].active)
       continue;
-    const char *pat = src->patterns.entries[i].pattern;
-    if (!pat)
-      continue;
-    st_error_t err = st_policy_add_locked(dst, pat);
-    if (err != ST_OK && err != ST_ERR_INVALID && first_err == ST_OK) {
-      first_err = err;
+    patterns[copied] = strdup(src->patterns.entries[i].pattern);
+    if (!patterns[copied]) {
+      for (size_t j = 0; j < copied; j++)
+        free(patterns[j]);
+      free(patterns);
+      pthread_rwlock_unlock((pthread_rwlock_t *)&src->rwlock);
+      return ST_ERR_MEMORY;
     }
+    copied++;
   }
+  pthread_rwlock_unlock((pthread_rwlock_t *)&src->rwlock);
 
-  if (dst_first) {
-    pthread_rwlock_unlock((pthread_rwlock_t *)&src->rwlock);
-    pthread_rwlock_unlock(&dst->rwlock);
-  } else {
-    pthread_rwlock_unlock(&dst->rwlock);
-    pthread_rwlock_unlock((pthread_rwlock_t *)&src->rwlock);
-  }
-  return first_err;
+  st_error_t result =
+      copied == 0 ? ST_OK
+                  : st_policy_batch_add(dst, (const char **)patterns, copied);
+  for (size_t i = 0; i < copied; i++)
+    free(patterns[i]);
+  free(patterns);
+  return result;
 }
 
 static bool pattern_array_contains_entry(const pattern_entry_t *entries,
@@ -2178,17 +1958,10 @@ void st_free_diff_result(st_policy_diff_t *result) {
   result->removed_count = 0;
 }
 
-/*
- * NOTE: This function performs a logical removal only. Since the policy
- * uses an arena allocator for trie nodes, removed patterns leave their
- * nodes in place. The pattern_id is unset so the node no longer represents
- * an active pattern, but the node itself cannot be freed without a
- * full trie compaction (rebuild from remaining patterns).
- *
- * Over time, with many add/remove cycles, unused nodes may accumulate.
- * If memory pressure becomes an issue, use st_policy_compact() to
- * rebuild the policy from scratch with only active patterns.
- */
+/* Remove the exact active registry entry and prune dead transitions along its
+ * trie path. Arena storage is reclaimed only by st_policy_compact(), but dead
+ * generic wildcard transitions must not remain in the graph: they would
+ * otherwise shadow a more-specific parameter branch added later. */
 st_error_t st_policy_remove(st_policy_t *policy, const char *pattern) {
   if (!policy || !pattern || !pattern[0])
     return ST_ERR_INVALID;
@@ -2196,10 +1969,11 @@ st_error_t st_policy_remove(st_policy_t *policy, const char *pattern) {
   pthread_rwlock_wrlock(&policy->rwlock);
 
   size_t token_count = 0;
-  st_token_t *tokens = parse_pattern(pattern, &token_count);
+  st_error_t parse_error = ST_ERR_INVALID;
+  st_token_t *tokens = parse_pattern(pattern, &token_count, &parse_error);
   if (!tokens) {
     pthread_rwlock_unlock(&policy->rwlock);
-    return ST_ERR_MEMORY;
+    return parse_error;
   }
   if (token_count == 0) {
     free_pattern_tokens(tokens, token_count);
@@ -2207,49 +1981,17 @@ st_error_t st_policy_remove(st_policy_t *policy, const char *pattern) {
     return ST_ERR_INVALID;
   }
 
-  uint32_t current = 0;
-
-  for (size_t i = 0; i < token_count; i++) {
-    policy_state_t *node = &policy->states.states[current];
-    child_entry_t *child = NULL;
-    char *arena_base = policy->children_arena.base;
-    bool is_wild = is_explicit_wildcard(tokens[i].text, tokens[i].type);
-    if (!is_wild) {
-      child = find_literal_child(node, arena_base, tokens[i].text);
-    } else {
-      child = find_exact_wildcard_child(node, arena_base, tokens[i].type,
-                                        tokens[i].text);
-    }
-    if (!child) {
-      free_pattern_tokens(tokens, token_count);
-      pthread_rwlock_unlock(&policy->rwlock);
-      return ST_OK;
-    }
-    current = child->target;
-  }
-
-  policy_state_t *node = &policy->states.states[current];
-  if (node->pattern_id == UINT16_MAX) {
-    free_pattern_tokens(tokens, token_count);
-    pthread_rwlock_unlock(&policy->rwlock);
-    return ST_OK;
-  }
-
-  uint16_t pid = node->pattern_id;
-  node->pattern_id = UINT16_MAX;
-  policy->pattern_count--;
-
-  /* Remove from length bucket and deactivate registry entry */
-  if (pid < policy->patterns.count) {
-    pattern_entry_t *entry = &policy->patterns.entries[pid];
-    if (entry->token_count < policy->num_buckets) {
-      len_bucket_remove(&policy->len_buckets[entry->token_count], pid);
-    }
-    pattern_reg_deactivate(&policy->patterns, pid);
-  }
-
-  atomic_fetch_add(&policy->epoch, 1);
   free_pattern_tokens(tokens, token_count);
+  for (size_t i = 0; i < policy->patterns.count; i++) {
+    pattern_entry_t *entry = &policy->patterns.entries[i];
+    if (!entry->active || strcmp(entry->pattern, pattern) != 0)
+      continue;
+    st_error_t error = remove_pattern_by_id_locked(policy, (uint16_t)i);
+    if (error == ST_OK)
+      atomic_fetch_add(&policy->epoch, 1);
+    pthread_rwlock_unlock(&policy->rwlock);
+    return error;
+  }
   pthread_rwlock_unlock(&policy->rwlock);
   return ST_OK;
 }
@@ -2303,57 +2045,71 @@ st_error_t st_policy_compact(st_policy_t *policy) {
     return ST_OK;
   }
 
-  /* No batch subsumption needed — incremental on add handles it */
-
-  /* Atomically verify that this is still the only policy before invalidating
-   * any interned pointers. A concurrently created policy either retains the
-   * old storage first (and makes this fail without modifying the policy), or
-   * waits until the reset has installed the replacement storage. */
-  st_error_t reset_err = st_policy_ctx_reset_for_policy(policy->ctx);
-  if (reset_err != ST_OK) {
-    for (size_t j = 0; j < n_active; j++)
-      free(active[j]);
+  st_policy_ctx_t *replacement_ctx = st_policy_ctx_new();
+  st_policy_t *staged = replacement_ctx ? st_policy_new(replacement_ctx) : NULL;
+  if (!staged) {
+    for (size_t i = 0; i < n_active; i++)
+      free(active[i]);
     free(active);
+    st_policy_ctx_free(replacement_ctx);
     pthread_rwlock_unlock(&policy->rwlock);
-    return reset_err;
+    return ST_ERR_MEMORY;
   }
 
-  /* Fully tear down the policy trie after the context reset. No reader can
-   * observe its now-invalid interned pointers while the write lock is held. */
-  for (int i = 0; i < FILTER_POS_LEVELS; i++) {
-    vacuum_filter_destroy(policy->pos_filters[i]);
-    policy->pos_filters[i] = NULL;
-    policy->pos_wildcard_mask[i] = 0;
-    policy->pos_built_epoch[i] = 0;
-  }
-  free(policy->states.states);
-  states_array_init(&policy->states);
-  pattern_reg_free(&policy->patterns);
-  pattern_reg_init(&policy->patterns);
-  /* Clear length buckets */
-  for (size_t i = 0; i < policy->num_buckets; i++)
-    len_bucket_free(&policy->len_buckets[i]);
-  arena_free(&policy->children_arena);
-  arena_init(&policy->children_arena, CHILDREN_ARENA_SIZE);
-  policy->pattern_count = 0;
-  policy->children_count = 0;
-
-  /* Rebuild trie with collected patterns */
-  atomic_fetch_add(&policy->epoch, 1);
-
+  st_error_t build_error = ST_OK;
   for (size_t i = 0; i < n_active; i++) {
-    st_error_t err = st_policy_add_locked(policy, active[i]);
-    if (err != ST_OK) {
-      for (size_t j = 0; j < n_active; j++)
-        free(active[j]);
-      free(active);
-      pthread_rwlock_unlock(&policy->rwlock);
-      return err;
-    }
-    free(active[i]);
+    build_error = st_policy_add(staged, active[i]);
+    if (build_error != ST_OK)
+      break;
   }
+  for (size_t i = 0; i < n_active; i++)
+    free(active[i]);
   free(active);
+  if (build_error != ST_OK) {
+    st_policy_free(staged);
+    st_policy_ctx_free(replacement_ctx);
+    pthread_rwlock_unlock(&policy->rwlock);
+    return build_error;
+  }
+
+  st_error_t swap_error =
+      st_policy_ctx_swap_storage(policy->ctx, replacement_ctx);
+  if (swap_error != ST_OK) {
+    st_policy_free(staged);
+    st_policy_ctx_free(replacement_ctx);
+    pthread_rwlock_unlock(&policy->rwlock);
+    return swap_error;
+  }
+
+#define SWAP_FIELD(field, type)                                                \
+  do {                                                                         \
+    type temporary = policy->field;                                            \
+    policy->field = staged->field;                                             \
+    staged->field = temporary;                                                 \
+  } while (0)
+  SWAP_FIELD(states, states_array_t);
+  SWAP_FIELD(patterns, pattern_reg_t);
+  SWAP_FIELD(children_arena, arena_t);
+  SWAP_FIELD(len_buckets, len_bucket_t *);
+  SWAP_FIELD(num_buckets, size_t);
+  SWAP_FIELD(pattern_count, size_t);
+  SWAP_FIELD(children_count, size_t);
+#undef SWAP_FIELD
+  for (int i = 0; i < FILTER_POS_LEVELS; i++) {
+    vacuum_filter_t *filter = policy->pos_filters[i];
+    policy->pos_filters[i] = staged->pos_filters[i];
+    staged->pos_filters[i] = filter;
+    uint64_t mask = policy->pos_wildcard_mask[i];
+    policy->pos_wildcard_mask[i] = staged->pos_wildcard_mask[i];
+    staged->pos_wildcard_mask[i] = mask;
+    uint64_t epoch = policy->pos_built_epoch[i];
+    policy->pos_built_epoch[i] = staged->pos_built_epoch[i];
+    staged->pos_built_epoch[i] = epoch;
+  }
+  atomic_fetch_add(&policy->epoch, 1);
   pthread_rwlock_unlock(&policy->rwlock);
+  st_policy_free(staged);
+  st_policy_ctx_free(replacement_ctx);
   return ST_OK;
 }
 
@@ -2371,19 +2127,23 @@ st_error_t st_policy_clear(st_policy_t *policy) {
     policy->pos_built_epoch[i] = 0;
   }
 
-  /* Clear states and children arena */
-  free(policy->states.states);
-  states_array_init(&policy->states);
-  arena_free(&policy->children_arena);
-  arena_init(&policy->children_arena, CHILDREN_ARENA_SIZE);
+  /* Retain allocated storage so clear cannot fail halfway through. */
+  memset(policy->states.states, 0,
+         policy->states.capacity * sizeof(*policy->states.states));
+  policy->states.count = 1;
+  policy->states.states[0].pattern_id = UINT16_MAX;
+  policy->children_arena.used = 0;
 
-  /* Clear pattern registry */
-  pattern_reg_free(&policy->patterns);
-  pattern_reg_init(&policy->patterns);
+  for (size_t i = 0; i < policy->patterns.count; i++) {
+    free_pattern_tokens(policy->patterns.entries[i].tokens,
+                        policy->patterns.entries[i].token_count);
+  }
+  memset(policy->patterns.entries, 0,
+         policy->patterns.capacity * sizeof(*policy->patterns.entries));
+  policy->patterns.count = 0;
 
-  /* Clear length buckets */
   for (size_t i = 0; i < policy->num_buckets; i++)
-    len_bucket_free(&policy->len_buckets[i]);
+    policy->len_buckets[i].count = 0;
 
   policy->pattern_count = 0;
   policy->children_count = 0;
@@ -2440,30 +2200,194 @@ static bool st_build_pattern(char *buf, size_t buf_size,
   return true;
 }
 
-/* Collect the pattern string at the deepest accepting state reachable
- * from state_idx (checks state itself, then one BFS level). */
-static const char *st_find_based_on(const st_policy_t *policy,
-                                    uint32_t state_idx) {
-  policy_state_t *state = &policy->states.states[state_idx];
-  if (state->pattern_id != UINT16_MAX &&
-      state->pattern_id < policy->patterns.count)
-    return policy->patterns.entries[state->pattern_id].pattern;
+typedef struct {
+  uint32_t state_idx;
+  uint8_t token_idx;
+} match_entry_t;
 
-  uint16_t total = state->literal_count + state->wildcard_count;
-  child_entry_t *children =
-      (child_entry_t *)(policy->children_arena.base + state->children_offset);
-  for (uint16_t i = 0; i < total; i++) {
-    child_entry_t *c = &children[i];
-    policy_state_t *child = &policy->states.states[c->target];
-    if (child->pattern_id != UINT16_MAX &&
-        child->pattern_id < policy->patterns.count)
-      return policy->patterns.entries[child->pattern_id].pattern;
+static bool pattern_entry_preferred(const pattern_entry_t *candidate,
+                                    const pattern_entry_t *current) {
+  bool current_covers_candidate =
+      pattern_subsumes(current->tokens, current->token_count, candidate->tokens,
+                       candidate->token_count);
+  bool candidate_covers_current =
+      pattern_subsumes(candidate->tokens, candidate->token_count,
+                       current->tokens, current->token_count);
+  if (current_covers_candidate != candidate_covers_current)
+    return current_covers_candidate;
+  return strcmp(candidate->pattern, current->pattern) < 0;
+}
+
+typedef struct {
+  uint32_t stack[64];
+  uint32_t *states;
+  size_t count;
+  size_t capacity;
+  size_t depth;
+} match_frontier_t;
+
+static void match_frontier_init(match_frontier_t *frontier) {
+  frontier->states = frontier->stack;
+  frontier->count = 0;
+  frontier->capacity = sizeof(frontier->stack) / sizeof(frontier->stack[0]);
+  frontier->depth = 0;
+}
+
+static void match_frontier_free(match_frontier_t *frontier) {
+  if (frontier->states != frontier->stack)
+    free(frontier->states);
+  match_frontier_init(frontier);
+}
+
+static bool match_frontier_append(match_frontier_t *frontier,
+                                  uint32_t state_idx) {
+  if (frontier->count == frontier->capacity) {
+    size_t grown_capacity = frontier->capacity * 2;
+    uint32_t *grown = malloc(grown_capacity * sizeof(*grown));
+    if (!grown)
+      return false;
+    memcpy(grown, frontier->states, frontier->count * sizeof(*grown));
+    if (frontier->states != frontier->stack)
+      free(frontier->states);
+    frontier->states = grown;
+    frontier->capacity = grown_capacity;
   }
-  return NULL;
+  frontier->states[frontier->count++] = state_idx;
+  return true;
+}
+
+static bool match_queue_append(match_entry_t **queue, match_entry_t *stack,
+                               size_t *tail, size_t *capacity,
+                               match_entry_t entry) {
+  if (*tail == *capacity) {
+    size_t grown_capacity = *capacity * 2;
+    match_entry_t *grown = malloc(grown_capacity * sizeof(*grown));
+    if (!grown)
+      return false;
+    memcpy(grown, *queue, *tail * sizeof(*grown));
+    if (*queue != stack)
+      free(*queue);
+    *queue = grown;
+    *capacity = grown_capacity;
+  }
+  (*queue)[(*tail)++] = entry;
+  return true;
+}
+
+static st_error_t matching_walk_locked(const st_policy_t *policy,
+                                       const st_token_array_t *cmd,
+                                       match_frontier_t *frontier,
+                                       const char **best) {
+  *best = NULL;
+  match_frontier_init(frontier);
+  size_t queue_cap = 64;
+  match_entry_t stack_queue[64];
+  match_entry_t *queue = stack_queue;
+  size_t head = 0, tail = 1;
+  queue[0] = (match_entry_t){0, 0};
+  const pattern_entry_t *best_entry = NULL;
+
+  while (head < tail) {
+    match_entry_t entry = queue[head++];
+    policy_state_t *state = &policy->states.states[entry.state_idx];
+    if (entry.token_idx > frontier->depth) {
+      frontier->depth = entry.token_idx;
+      frontier->count = 0;
+    }
+    if (entry.token_idx == frontier->depth &&
+        !match_frontier_append(frontier, entry.state_idx))
+      goto memory_failure;
+    if (entry.token_idx == cmd->count) {
+      if (state->pattern_id != UINT16_MAX &&
+          state->pattern_id < policy->patterns.count) {
+        const pattern_entry_t *candidate =
+            &policy->patterns.entries[state->pattern_id];
+        if (!best_entry || pattern_entry_preferred(candidate, best_entry))
+          best_entry = candidate;
+      }
+      continue;
+    }
+
+    st_token_type_t type = cmd->tokens[entry.token_idx].type;
+    const char *text = cmd->tokens[entry.token_idx].text;
+    child_entry_t *children =
+        (child_entry_t *)(policy->children_arena.base + state->children_offset);
+    for (uint16_t i = 0; i < state->literal_count; i++)
+      if (strcmp(text, children[i].text) == 0) {
+        if (!match_queue_append(
+                &queue, stack_queue, &tail, &queue_cap,
+                (match_entry_t){children[i].target, entry.token_idx + 1}))
+          goto memory_failure;
+        break;
+      }
+    child_entry_t *wild = children + state->literal_count;
+    for (uint16_t i = 0; i < state->wildcard_count; i++) {
+      child_entry_t *child = &wild[i];
+      if (!(runtime_match_mask(type) & (1ULL << child->type)) ||
+          !param_matches(text, type, child->text, (st_token_type_t)child->type))
+        continue;
+      if (!match_queue_append(
+              &queue, stack_queue, &tail, &queue_cap,
+              (match_entry_t){child->target, entry.token_idx + 1}))
+        goto memory_failure;
+    }
+  }
+  if (queue != stack_queue)
+    free(queue);
+  if (best_entry)
+    *best = best_entry->pattern;
+  return ST_OK;
+
+memory_failure:
+  if (queue != stack_queue)
+    free(queue);
+  match_frontier_free(frontier);
+  return ST_ERR_MEMORY;
+}
+
+static void nearest_pattern_visit(const st_policy_t *policy, uint32_t state_idx,
+                                  size_t depth, size_t *best_depth,
+                                  const pattern_entry_t **best) {
+  const policy_state_t *state = &policy->states.states[state_idx];
+  if (depth > *best_depth)
+    return;
+  if (state->pattern_id != UINT16_MAX &&
+      state->pattern_id < policy->patterns.count) {
+    const pattern_entry_t *candidate =
+        &policy->patterns.entries[state->pattern_id];
+    if (!*best || depth < *best_depth ||
+        (depth == *best_depth && pattern_entry_preferred(candidate, *best))) {
+      *best = candidate;
+      *best_depth = depth;
+    }
+    return;
+  }
+  uint16_t total = state->literal_count + state->wildcard_count;
+  const child_entry_t *children =
+      (const child_entry_t *)(policy->children_arena.base +
+                              state->children_offset);
+  for (uint16_t i = 0; i < total; i++)
+    nearest_pattern_visit(policy, children[i].target, depth + 1, best_depth,
+                          best);
+}
+
+static const char *st_find_based_on(const st_policy_t *policy,
+                                    const match_frontier_t *frontier) {
+  size_t best_depth = SIZE_MAX;
+  const pattern_entry_t *best = NULL;
+  for (size_t i = 0; i < frontier->count; i++)
+    nearest_pattern_visit(policy, frontier->states[i], 0, &best_depth, &best);
+  return best ? best->pattern : NULL;
 }
 
 st_error_t st_policy_eval(st_policy_t *policy, const char *raw_cmd,
                           st_eval_result_t *result) {
+  if (result) {
+    result->matches = false;
+    result->matching_pattern = NULL;
+    result->suggestion_count = 0;
+    result->error = ST_OK;
+  }
   if (!policy || !raw_cmd)
     return ST_ERR_INVALID;
 
@@ -2476,6 +2400,7 @@ st_error_t st_policy_eval(st_policy_t *policy, const char *raw_cmd,
     result->matches = false;
     result->matching_pattern = NULL;
     result->suggestion_count = 0;
+    result->error = ST_OK;
   }
 
   st_token_array_t cmd;
@@ -2571,72 +2496,22 @@ st_error_t st_policy_eval(st_policy_t *policy, const char *raw_cmd,
    * Still needed even when filter rejected — we need match_depth
    * and match_state to produce useful suggestions.
    */
-  uint32_t current = 0;
-  size_t match_depth = 0;
-  uint32_t match_state = 0;
-
-  for (size_t i = 0; i < cmd.count; i++) {
-    assert(current < policy->states.count);
-    st_token_type_t ctype = cmd.tokens[i].type;
-    const char *ctext = cmd.tokens[i].text;
-    policy_state_t *node = &policy->states.states[current];
-    child_entry_t *found = NULL;
-    char *arena_base = policy->children_arena.base;
-
-    /* Check literal children first (text match). This handles classified
-     * literals like "-v" stored as LITERAL with type=SHORTOPT in the child
-     * entry. For intermediate tokens, always accept a literal match. For the
-     * last token, only accept if the target has a pattern_id (handles case
-     * where subsumption removed the pattern but kept the trie entry). */
-    {
-      uint16_t n = node->literal_count;
-      child_entry_t *children =
-          (child_entry_t *)(arena_base + node->children_offset);
-      for (uint16_t ci = 0; ci < n; ci++) {
-        if (strcmp(ctext, children[ci].text) == 0) {
-          /* For last token, require target has a pattern_id */
-          if (i == cmd.count - 1) {
-            uint32_t target = children[ci].target;
-            policy_state_t *target_state = &policy->states.states[target];
-            if (target_state->pattern_id != UINT16_MAX &&
-                target_state->pattern_id < policy->patterns.count) {
-              found = &children[ci];
-              break;
-            }
-          } else {
-            found = &children[ci];
-            break;
-          }
-        }
-      }
-    }
-
-    /* If no literal match (or literal target has no pattern for last token),
-     * check wildcard children. The wildcard_mask indicates which wildcard
-     * types are present at this node. runtime_match_mask(ctype) gives the types
-     * that ctype accepts (e.g., SHORTOPT accepts OPT). */
-    if (!found) {
-      uint64_t compat = runtime_match_mask(ctype) & node->wildcard_mask;
-      if (compat)
-        found = find_wildcard_child(node, arena_base, ctype, ctext);
-    }
-    if (!found)
-      break;
-
-    current = found->target;
-    match_depth = i + 1;
-    match_state = current;
+  match_frontier_t frontier;
+  const char *best_pattern = NULL;
+  err = matching_walk_locked(policy, &cmd, &frontier, &best_pattern);
+  if (err != ST_OK) {
+    st_free_token_array(&cmd);
+    pthread_rwlock_unlock(&policy->rwlock);
+    return err;
   }
+  size_t match_depth = frontier.depth;
   assert(match_depth <= cmd.count);
-
-  policy_state_t *end_node = &policy->states.states[current];
-  if (match_depth == cmd.count && end_node->pattern_id != UINT16_MAX &&
-      end_node->pattern_id < policy->patterns.count) {
+  if (best_pattern) {
+    match_frontier_free(&frontier);
     st_free_token_array(&cmd);
     if (result) {
       result->matches = true;
-      result->matching_pattern =
-          policy->patterns.entries[end_node->pattern_id].pattern;
+      result->matching_pattern = best_pattern;
     }
     pthread_rwlock_unlock(&policy->rwlock);
     return ST_OK;
@@ -2644,6 +2519,7 @@ st_error_t st_policy_eval(st_policy_t *policy, const char *raw_cmd,
 
   /* Verify-only: no match, no suggestions needed */
   if (!result) {
+    match_frontier_free(&frontier);
     st_free_token_array(&cmd);
     pthread_rwlock_unlock(&policy->rwlock);
     return ST_OK;
@@ -2654,7 +2530,14 @@ st_error_t st_policy_eval(st_policy_t *policy, const char *raw_cmd,
    * Uses existing cmd.tokens — no re-normalize, no trie re-walk.
    */
   double confidence = (double)match_depth / (double)cmd.count;
-  const char *based_on = st_find_based_on(policy, match_state);
+  const char *based_on =
+      match_depth == 0 ? NULL : st_find_based_on(policy, &frontier);
+  uint64_t divergence_wildcard_mask = 0;
+  if (match_depth < cmd.count)
+    for (size_t i = 0; i < frontier.count; i++)
+      divergence_wildcard_mask |=
+          policy->states.states[frontier.states[i]].wildcard_mask;
+  match_frontier_free(&frontier);
 
   /* Suggestion A: minimal extension (matched prefix as-is + remaining as
    * literals) */
@@ -2694,9 +2577,7 @@ st_error_t st_policy_eval(st_policy_t *policy, const char *raw_cmd,
 
   if (match_depth < cmd.count) {
     st_token_type_t div_type = cmd.tokens[match_depth].type;
-    policy_state_t *div_node = &policy->states.states[match_state];
-
-    uint64_t wm = div_node->wildcard_mask;
+    uint64_t wm = divergence_wildcard_mask;
     if (wm != 0 && (runtime_match_mask(div_type) & wm) != 0) {
       /* Wildcard widening: find narrowest compatible wildcard */
       st_token_type_t best_wild = ST_TYPE_ANY;
@@ -2799,16 +2680,18 @@ st_error_t st_policy_verify_all(const st_policy_t *policy, const char *raw_cmd,
   size_t match_n = 0;
   st_error_t result = ST_OK;
 
-  bfs_entry_t ring[VERIFY_ALL_RING_CAP];
-  size_t head = 0, tail = 0;
+  size_t queue_cap = 64;
+  bfs_entry_t *queue = malloc(queue_cap * sizeof(*queue));
+  if (!queue) {
+    result = ST_ERR_MEMORY;
+    goto cleanup;
+  }
+  size_t head = 0, tail = 1;
+  queue[0].state_idx = 0;
+  queue[0].token_idx = 0;
 
-  ring[tail].state_idx = 0;
-  ring[tail].token_idx = 0;
-  tail = (tail + 1) % VERIFY_ALL_RING_CAP;
-
-  while (head != tail) {
-    bfs_entry_t entry = ring[head];
-    head = (head + 1) % VERIFY_ALL_RING_CAP;
+  while (head < tail) {
+    bfs_entry_t entry = queue[head++];
 
     policy_state_t *state = &policy->states.states[entry.state_idx];
 
@@ -2845,39 +2728,60 @@ st_error_t st_policy_verify_all(const st_policy_t *policy, const char *raw_cmd,
           (child_entry_t *)(arena_base + state->children_offset);
       for (uint16_t ci = 0; ci < n; ci++) {
         if (strcmp(ctext, children[ci].text) == 0) {
-          size_t next_tail = (tail + 1) % VERIFY_ALL_RING_CAP;
-          if (next_tail == head) {
-            result = ST_ERR_MEMORY;
-            goto cleanup;
+          if (tail == queue_cap) {
+            if (queue_cap > SIZE_MAX / 2 ||
+                queue_cap * 2 > SIZE_MAX / sizeof(*queue)) {
+              result = ST_ERR_MEMORY;
+              goto cleanup;
+            }
+            size_t new_cap = queue_cap * 2;
+            bfs_entry_t *grown = realloc(queue, new_cap * sizeof(*queue));
+            if (!grown) {
+              result = ST_ERR_MEMORY;
+              goto cleanup;
+            }
+            queue = grown;
+            queue_cap = new_cap;
           }
-          ring[tail].state_idx = children[ci].target;
-          ring[tail].token_idx = entry.token_idx + 1;
-          tail = next_tail;
+          queue[tail].state_idx = children[ci].target;
+          queue[tail].token_idx = entry.token_idx + 1;
+          tail++;
           break;
         }
       }
     }
 
-    uint64_t compat = runtime_match_mask(ctype) & state->wildcard_mask;
-    while (compat) {
-      int t = __builtin_ctzll(compat);
-      compat &= ~(1ULL << t);
-      child_entry_t *c =
-          find_wildcard_child(state, arena_base, (st_token_type_t)t, ctext);
-      if (c) {
-        size_t next_tail = (tail + 1) % VERIFY_ALL_RING_CAP;
-        if (next_tail == head) {
-          result = ST_ERR_MEMORY;
-          goto cleanup;
+    child_entry_t *children =
+        (child_entry_t *)(arena_base + state->children_offset);
+    child_entry_t *wild = children + state->literal_count;
+    for (uint16_t wi = 0; wi < state->wildcard_count; wi++) {
+      child_entry_t *c = &wild[wi];
+      if ((runtime_match_mask(ctype) & (1ULL << c->type)) &&
+          param_matches(ctext, ctype, c->text, (st_token_type_t)c->type)) {
+        if (tail == queue_cap) {
+          if (queue_cap > SIZE_MAX / 2 ||
+              queue_cap * 2 > SIZE_MAX / sizeof(*queue)) {
+            result = ST_ERR_MEMORY;
+            goto cleanup;
+          }
+          size_t new_cap = queue_cap * 2;
+          bfs_entry_t *grown = realloc(queue, new_cap * sizeof(*queue));
+          if (!grown) {
+            result = ST_ERR_MEMORY;
+            goto cleanup;
+          }
+          queue = grown;
+          queue_cap = new_cap;
         }
-        ring[tail].state_idx = c->target;
-        ring[tail].token_idx = entry.token_idx + 1;
-        tail = next_tail;
+        queue[tail].state_idx = c->target;
+        queue[tail].token_idx = entry.token_idx + 1;
+        tail++;
       }
     }
   }
 
 cleanup:
+  free(queue);
   pthread_rwlock_unlock((pthread_rwlock_t *)&policy->rwlock);
   st_free_token_array(&cmd);
 
@@ -2927,7 +2831,7 @@ typedef struct {
 typedef struct {
   bool is_accepting;
   uint8_t category_mask;
-  uint16_t pattern_id;
+  uint32_t pattern_id;
   const char *tag;
   nfa_trans_t *trans;
   uint32_t trans_count;
@@ -2938,14 +2842,14 @@ typedef struct {
   nfa_state_t *states;
   uint32_t state_count;
   uint32_t state_cap;
-  uint16_t pattern_id_counter;
+  uint32_t pattern_id_counter;
   uint8_t category_mask;
   bool include_tags;
   const char *identifier;
 } nfa_ctx_t;
 
 static nfa_ctx_t *nfa_ctx_new(uint8_t cat_mask, bool tags, const char *ident,
-                              uint16_t pid_base) {
+                              uint32_t pid_base) {
   nfa_ctx_t *c = calloc(1, sizeof(*c));
   if (!c)
     return NULL;
@@ -3001,6 +2905,61 @@ static bool nfa_add_trans(nfa_ctx_t *c, uint32_t from, int sym, uint32_t to) {
   return true;
 }
 
+static bool nfa_add_literal(nfa_ctx_t *c, uint32_t from, const char *text,
+                            uint32_t target) {
+  for (const unsigned char *p = (const unsigned char *)text; *p; p++) {
+    uint32_t next = p[1] == '\0' ? target : nfa_new_state(c);
+    if (next == UINT32_MAX || !nfa_add_trans(c, from, *p, next))
+      return false;
+    from = next;
+  }
+  return true;
+}
+
+static bool nfa_add_wildcard(nfa_ctx_t *c, uint32_t from,
+                             const child_entry_t *child, uint32_t target) {
+  if (child->type == ST_TYPE_ANY) {
+    uint32_t token = nfa_new_state(c);
+    if (token == UINT32_MAX)
+      return false;
+    for (int byte = 1; byte < 256; byte++) {
+      if (byte == ' ' || byte == '\t')
+        continue;
+      if (!nfa_add_trans(c, from, byte, token) ||
+          !nfa_add_trans(c, token, byte, token))
+        return false;
+    }
+    if (!nfa_add_trans(c, token, VSYM_EPS, target))
+      return false;
+    return true;
+  }
+
+  char parameter_buffer[32];
+  const char *parameter = NULL;
+  const st_metadata_entry_t *metadata =
+      st_wildcard_metadata(child->text, child->type);
+  if (metadata) {
+    int parameter_length = snprintf(parameter_buffer, sizeof(parameter_buffer),
+                                    ".%s", metadata->name);
+    if (parameter_length < 0 ||
+        (size_t)parameter_length >= sizeof(parameter_buffer))
+      return false;
+    parameter = parameter_buffer;
+  }
+  for (int command_type = 1; command_type < ST_TYPE_ANY; command_type++) {
+    if (!st_is_compatible((st_token_type_t)command_type, child->type))
+      continue;
+    char normalized[ST_MAX_TOKEN_LEN];
+    int written =
+        snprintf(normalized, sizeof(normalized), "%s%s",
+                 st_type_symbol[command_type], parameter ? parameter : "");
+    if (written < 0 || (size_t)written >= sizeof(normalized) ||
+        !nfa_add_literal(c, from, normalized, target))
+      return false;
+  }
+  return true;
+}
+
 /* Pass 1: assign NFA state IDs and collect per-state transitions */
 static bool nfa_build(nfa_ctx_t *c, st_policy_t *policy, uint32_t trie_idx,
                       uint32_t nfa_state, bool need_space, uint32_t *trie_map) {
@@ -3032,26 +2991,14 @@ static bool nfa_build(nfa_ctx_t *c, st_policy_t *policy, uint32_t trie_idx,
           return false;
         from = sp;
       }
-      for (const char *p = ch->text; *p; p++) {
-        uint32_t next;
-        if (*(p + 1) == '\0') {
-          /* Last char: link to the trie child's NFA state */
-          if (trie_map[ch->target] == UINT32_MAX) {
-            uint32_t ns = nfa_new_state(c);
-            if (ns == UINT32_MAX)
-              return false;
-            trie_map[ch->target] = ns;
-          }
-          next = trie_map[ch->target];
-        } else {
-          next = nfa_new_state(c);
-          if (next == UINT32_MAX)
-            return false;
-        }
-        if (!nfa_add_trans(c, from, (unsigned char)*p, next))
+      if (trie_map[ch->target] == UINT32_MAX) {
+        uint32_t ns = nfa_new_state(c);
+        if (ns == UINT32_MAX)
           return false;
-        from = next;
+        trie_map[ch->target] = ns;
       }
+      if (!nfa_add_literal(c, from, ch->text, trie_map[ch->target]))
+        return false;
     } else {
       /* Wildcard: VSYM_BYTE_ANY (matches any single token) */
       uint32_t from = nfa_state;
@@ -3069,7 +3016,7 @@ static bool nfa_build(nfa_ctx_t *c, st_policy_t *policy, uint32_t trie_idx,
           return false;
         trie_map[ch->target] = ns;
       }
-      if (!nfa_add_trans(c, from, VSYM_BYTE_ANY, trie_map[ch->target]))
+      if (!nfa_add_wildcard(c, from, ch, trie_map[ch->target]))
         return false;
     }
   }
@@ -3148,7 +3095,20 @@ st_error_t st_policy_render_nfa(const st_policy_t *policy, const char *path,
   if (!policy || !path)
     return ST_ERR_INVALID;
 
+  const char *identifier = opts ? opts->identifier : NULL;
+  if (identifier)
+    for (const unsigned char *p = (const unsigned char *)identifier; *p; p++)
+      if (*p < 0x20 || *p == 0x7f)
+        return ST_ERR_INVALID;
+
   pthread_rwlock_rdlock((pthread_rwlock_t *)&policy->rwlock);
+
+  uint32_t pattern_id_base = opts ? opts->pattern_id_base : 1;
+  if (policy->pattern_count > 0 &&
+      pattern_id_base > UINT32_MAX - (policy->pattern_count - 1)) {
+    pthread_rwlock_unlock((pthread_rwlock_t *)&policy->rwlock);
+    return ST_ERR_LIMIT;
+  }
 
   uint32_t num_trie = (uint32_t)((st_policy_t *)policy)->states.count;
   uint32_t *trie_map = malloc(num_trie * sizeof(uint32_t));
@@ -3159,10 +3119,9 @@ st_error_t st_policy_render_nfa(const st_policy_t *policy, const char *path,
   for (uint32_t i = 0; i < num_trie; i++)
     trie_map[i] = UINT32_MAX;
 
-  nfa_ctx_t *c = nfa_ctx_new(opts ? opts->category_mask : 0x01,
-                             opts ? opts->include_tags : false,
-                             opts ? opts->identifier : "rbox policy",
-                             opts ? opts->pattern_id_base : 1);
+  nfa_ctx_t *c = nfa_ctx_new(
+      opts ? opts->category_mask : 0x01, opts ? opts->include_tags : false,
+      opts ? opts->identifier : "rbox policy", pattern_id_base);
   if (!c) {
     free(trie_map);
     pthread_rwlock_unlock((pthread_rwlock_t *)&policy->rwlock);
@@ -3178,23 +3137,32 @@ st_error_t st_policy_render_nfa(const st_policy_t *policy, const char *path,
   }
 
   bool ok = nfa_build(c, (st_policy_t *)policy, 0, 0, false, trie_map);
+  bool io_error = false;
 
+  st_atomic_output_t output = {0};
   if (ok) {
-    FILE *fp = fopen(path, "w");
-    if (!fp) {
+    st_atomic_output_result_t begin = st_atomic_output_begin(path, &output);
+    if (begin != ST_ATOMIC_OUTPUT_OK) {
       nfa_ctx_free(c);
       free(trie_map);
       pthread_rwlock_unlock((pthread_rwlock_t *)&policy->rwlock);
-      return ST_ERR_IO;
+      return begin == ST_ATOMIC_OUTPUT_MEMORY ? ST_ERR_MEMORY : ST_ERR_IO;
     }
-    ok = nfa_write(c, fp);
-    fclose(fp);
+    ok = nfa_write(c, output.stream);
+    if (!ok)
+      io_error = true;
+    if (ok && st_atomic_output_commit(&output) != 0) {
+      ok = false;
+      io_error = true;
+    } else if (!ok) {
+      st_atomic_output_discard(&output);
+    }
   }
 
   nfa_ctx_free(c);
   free(trie_map);
   pthread_rwlock_unlock((pthread_rwlock_t *)&policy->rwlock);
-  return ok ? ST_OK : ST_ERR_MEMORY;
+  return ok ? ST_OK : (io_error ? ST_ERR_IO : ST_ERR_MEMORY);
 }
 
 /* --- SERIALIZATION ---
@@ -3207,7 +3175,8 @@ st_error_t st_policy_render_nfa(const st_policy_t *policy, const char *path,
  *   ...
  *   # CRC32: <hex>
  *
- * Version 1: one pattern per line, no wildcards in comments.
+ * Version 1: one pattern per line. Patterns beginning with '#' use the
+ * "# pattern: " escape so they cannot be mistaken for format comments.
  * Vacuum filter state is NOT persisted — rebuilt on load.
  */
 
@@ -3234,7 +3203,8 @@ static void dfs_save(st_policy_t *policy, uint32_t idx,
       node->pattern_id < policy->patterns.count) {
     const char *pat = policy->patterns.entries[node->pattern_id].pattern;
     size_t len = strlen(pat);
-    if (fprintf(ctx->fp, "%s\n", pat) < 0) {
+    const char *line_prefix = pat[0] == '#' ? "# pattern: " : "";
+    if (fprintf(ctx->fp, "%s%s\n", line_prefix, pat) < 0) {
       ctx->error = ST_ERR_IO;
       return;
     }
@@ -3254,42 +3224,27 @@ st_error_t st_policy_save(const st_policy_t *policy, const char *path) {
   if (!policy || !path)
     return ST_ERR_INVALID;
 
-  char *tmp_path = malloc(strlen(path) + 8);
-  if (!tmp_path)
-    return ST_ERR_MEMORY;
-  sprintf(tmp_path, "%s.XXXXXX", path);
-  int fd = mkstemp(tmp_path);
-  if (fd < 0) {
-    free(tmp_path);
-    return ST_ERR_IO;
-  }
-  FILE *fp = fdopen(fd, "w");
-  if (!fp) {
-    close(fd);
-    unlink(tmp_path);
-    free(tmp_path);
-    return ST_ERR_IO;
-  }
+  st_atomic_output_t output;
+  st_atomic_output_result_t begin = st_atomic_output_begin(path, &output);
+  if (begin != ST_ATOMIC_OUTPUT_OK)
+    return begin == ST_ATOMIC_OUTPUT_MEMORY ? ST_ERR_MEMORY : ST_ERR_IO;
+  FILE *fp = output.stream;
 
-  /* Header (no lock needed - just writing constants) */
-  if (fprintf(fp, "# CPL v%d\n", ST_SERIALIZATION_VERSION) < 0) {
-    fclose(fp);
-    unlink(tmp_path);
-    free(tmp_path);
-    return ST_ERR_IO;
-  }
+  /* Keep the metadata count and trie traversal under one read lock so a
+   * concurrent mutation cannot produce an internally inconsistent file. */
   pthread_rwlock_rdlock((pthread_rwlock_t *)&policy->rwlock);
   size_t snapshot_count = policy->pattern_count;
-  pthread_rwlock_unlock((pthread_rwlock_t *)&policy->rwlock);
-  if (fprintf(fp, "# patterns: %zu\n", snapshot_count) < 0) {
-    fclose(fp);
-    unlink(tmp_path);
-    free(tmp_path);
+
+  if (fprintf(fp, "# CPL v%d\n", ST_SERIALIZATION_VERSION) < 0) {
+    pthread_rwlock_unlock((pthread_rwlock_t *)&policy->rwlock);
+    st_atomic_output_discard(&output);
     return ST_ERR_IO;
   }
-
-  /* Read lock for trie traversal */
-  pthread_rwlock_rdlock((pthread_rwlock_t *)&policy->rwlock);
+  if (fprintf(fp, "# patterns: %zu\n", snapshot_count) < 0) {
+    pthread_rwlock_unlock((pthread_rwlock_t *)&policy->rwlock);
+    st_atomic_output_discard(&output);
+    return ST_ERR_IO;
+  }
 
   /* Patterns with running CRC */
   policy_save_ctx_t ctx = {
@@ -3305,13 +3260,12 @@ st_error_t st_policy_save(const st_policy_t *policy, const char *path) {
     }
   }
 
-  if (fflush(fp) != 0 || fclose(fp) != 0)
-    ctx.error = ST_ERR_IO;
-  if (ctx.error == ST_OK && rename(tmp_path, path) != 0)
-    ctx.error = ST_ERR_IO;
-  if (ctx.error != ST_OK)
-    unlink(tmp_path);
-  free(tmp_path);
+  if (ctx.error == ST_OK) {
+    if (st_atomic_output_commit(&output) != 0)
+      ctx.error = ST_ERR_IO;
+  } else {
+    st_atomic_output_discard(&output);
+  }
   return ctx.error;
 }
 
@@ -3344,11 +3298,15 @@ st_error_t st_policy_load(st_policy_t *policy, const char *path,
   char line[4096];
   uint32_t expected_crc = 0;
   uint32_t computed_crc = 0;
+  size_t declared_count = 0;
+  bool got_pattern_count = false;
   bool got_header = false;
   bool got_crc = false;
   bool in_patterns = false;
+  st_error_t pass1_error = ST_ERR_FORMAT;
 
-  while (fgets(line, sizeof(line), fp)) {
+  st_line_status_t line_status;
+  while ((line_status = st_read_line(fp, line, sizeof(line))) == ST_LINE_OK) {
     size_t len = strlen(line);
     while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
       line[--len] = '\0';
@@ -3358,12 +3316,10 @@ st_error_t st_policy_load(st_policy_t *policy, const char *path,
 
     if (!got_header) {
       if (strncmp(line, "# CPL v", 7) != 0) {
-        fclose(fp);
         goto pass1_fail;
       }
       int version = atoi(line + 7);
       if (version != ST_SERIALIZATION_VERSION) {
-        fclose(fp);
         goto pass1_fail;
       }
       got_header = true;
@@ -3371,8 +3327,15 @@ st_error_t st_policy_load(st_policy_t *policy, const char *path,
     }
 
     if (!in_patterns) {
-      if (strncmp(line, "# patterns:", 11) == 0)
+      if (strncmp(line, "# patterns:", 11) == 0) {
+        char *end = NULL;
+        unsigned long long value = strtoull(line + 11, &end, 10);
+        if (end == line + 11 || *end != '\0' || value > SIZE_MAX)
+          goto pass1_fail;
+        declared_count = (size_t)value;
+        got_pattern_count = true;
         continue;
+      }
       in_patterns = true;
     }
 
@@ -3380,42 +3343,70 @@ st_error_t st_policy_load(st_policy_t *policy, const char *path,
       char *end;
       expected_crc = (uint32_t)strtoul(line + 9, &end, 16);
       if (end != line + 17) {
-        fclose(fp);
         goto pass1_fail;
       }
       got_crc = true;
       break;
     }
 
-    if (line[0] == '#')
+    const char *pattern_line = line;
+    if (strncmp(line, "# pattern: ", 11) == 0)
+      pattern_line = line + 11;
+    else if (line[0] == '#')
       continue;
 
     /* Pattern line — compute CRC and store */
-    size_t plen = strlen(line);
-    computed_crc = crc32_compute(line, plen, computed_crc);
+    size_t plen = strlen(pattern_line);
+    computed_crc = crc32_compute(pattern_line, plen, computed_crc);
     computed_crc = crc32_compute("\n", 1, computed_crc);
 
     if (pattern_count >= pattern_cap) {
       size_t new_cap = pattern_cap ? pattern_cap * 2 : 64;
       char **new_lines = realloc(pattern_lines, new_cap * sizeof(char *));
       if (!new_lines) {
-        fclose(fp);
+        pass1_error = ST_ERR_MEMORY;
         goto pass1_fail;
       }
       pattern_lines = new_lines;
       pattern_cap = new_cap;
     }
-    pattern_lines[pattern_count] = strdup(line);
+    pattern_lines[pattern_count] = strdup(pattern_line);
     if (!pattern_lines[pattern_count]) {
-      fclose(fp);
+      pass1_error = ST_ERR_MEMORY;
       goto pass1_fail;
     }
     pattern_count++;
   }
 
-  fclose(fp);
+  if (line_status != ST_LINE_EOF && line_status != ST_LINE_OK) {
+    pass1_error = line_status == ST_LINE_IO ? ST_ERR_IO : ST_ERR_FORMAT;
+    goto pass1_fail;
+  }
 
-  if (!got_header || !got_crc || computed_crc != expected_crc) {
+  if (got_crc) {
+    while ((line_status = st_read_line(fp, line, sizeof(line))) == ST_LINE_OK) {
+      size_t trailing_len = strlen(line);
+      while (trailing_len > 0 &&
+             (line[trailing_len - 1] == '\n' || line[trailing_len - 1] == '\r'))
+        line[--trailing_len] = '\0';
+      if (trailing_len != 0 && line[0] != '#') {
+        goto pass1_fail;
+      }
+    }
+    if (line_status != ST_LINE_EOF) {
+      pass1_error = line_status == ST_LINE_IO ? ST_ERR_IO : ST_ERR_FORMAT;
+      goto pass1_fail;
+    }
+  }
+  if (fclose(fp) != 0) {
+    fp = NULL;
+    pass1_error = ST_ERR_IO;
+    goto pass1_fail;
+  }
+  fp = NULL;
+
+  if (!got_header || !got_pattern_count || !got_crc ||
+      declared_count != pattern_count || computed_crc != expected_crc) {
     goto pass1_fail;
   }
 
@@ -3500,10 +3491,12 @@ pass2_error:
   return add_err;
 
 pass1_fail:
+  if (fp)
+    fclose(fp);
   for (size_t i = 0; i < pattern_count; i++)
     free(pattern_lines[i]);
   free(pattern_lines);
-  return ST_ERR_FORMAT;
+  return pass1_error;
 }
 
 /* --- DIAGNOSTICS --- */
@@ -3586,28 +3579,58 @@ void st_policy_get_stats(const st_policy_t *policy, st_policy_stats_t *stats) {
 
 /* --- DOT GRAPH EXPORT --- */
 
+static bool dot_write_label(FILE *fp, const char *label) {
+  if (fputc('"', fp) == EOF)
+    return false;
+  for (const unsigned char *p = (const unsigned char *)label; *p; p++) {
+    if (*p == '"' || *p == '\\') {
+      if (fputc('\\', fp) == EOF)
+        return false;
+    } else if (*p == '\n' || *p == '\r' || *p == '\t') {
+      if (fputc('\\', fp) == EOF ||
+          fputc(*p == '\n' ? 'n' : (*p == '\r' ? 'r' : 't'), fp) == EOF)
+        return false;
+      continue;
+    } else if (*p < 0x20 || *p == 0x7f) {
+      if (fprintf(fp, "\\x%02x", *p) < 0)
+        return false;
+      continue;
+    }
+    if (fputc(*p, fp) == EOF)
+      return false;
+  }
+  return fputc('"', fp) != EOF;
+}
+
 st_error_t st_policy_dump_dot(const st_policy_t *policy, const char *path) {
   if (!policy || !path)
     return ST_ERR_INVALID;
 
+  pthread_rwlock_rdlock((pthread_rwlock_t *)&policy->rwlock);
   FILE *fp = fopen(path, "w");
-  if (!fp)
+  if (!fp) {
+    pthread_rwlock_unlock((pthread_rwlock_t *)&policy->rwlock);
     return ST_ERR_IO;
+  }
 
   if (fprintf(fp, "digraph policy_trie {\n") < 0) {
     fclose(fp);
+    pthread_rwlock_unlock((pthread_rwlock_t *)&policy->rwlock);
     return ST_ERR_IO;
   }
   if (fprintf(fp, "  rankdir=LR;\n") < 0) {
     fclose(fp);
+    pthread_rwlock_unlock((pthread_rwlock_t *)&policy->rwlock);
     return ST_ERR_IO;
   }
   if (fprintf(fp, "  node [shape=circle];\n") < 0) {
     fclose(fp);
+    pthread_rwlock_unlock((pthread_rwlock_t *)&policy->rwlock);
     return ST_ERR_IO;
   }
   if (fprintf(fp, "  edge [];\n") < 0) {
     fclose(fp);
+    pthread_rwlock_unlock((pthread_rwlock_t *)&policy->rwlock);
     return ST_ERR_IO;
   }
 
@@ -3616,16 +3639,26 @@ st_error_t st_policy_dump_dot(const st_policy_t *policy, const char *path) {
     uint32_t idx;
     uint32_t node_id;
   } dot_q;
-  dot_q queue[4096];
+  size_t queue_cap = 256;
+  dot_q *queue = malloc(queue_cap * sizeof(*queue));
+  if (!queue) {
+    fclose(fp);
+    pthread_rwlock_unlock((pthread_rwlock_t *)&policy->rwlock);
+    return ST_ERR_MEMORY;
+  }
   size_t head = 0, tail = 0;
   uint32_t next_id = 0;
 
   /* Emit root node */
-  if (fprintf(fp, "  n%d [label=\"root\"%s];\n", next_id,
+  if (fprintf(fp, "  n%d [label=", next_id) < 0 ||
+      !dot_write_label(fp, "root") ||
+      fprintf(fp, "%s];\n",
               policy->states.states[0].pattern_id != UINT16_MAX
                   ? ", style=filled, fillcolor=lightgreen"
                   : "") < 0) {
+    free(queue);
     fclose(fp);
+    pthread_rwlock_unlock((pthread_rwlock_t *)&policy->rwlock);
     return ST_ERR_IO;
   }
 
@@ -3633,7 +3666,7 @@ st_error_t st_policy_dump_dot(const st_policy_t *policy, const char *path) {
   queue[tail].node_id = next_id++;
   tail++;
 
-  while (head < tail && tail < 4096) {
+  while (head < tail) {
     dot_q entry = queue[head++];
     policy_state_t *node = &policy->states.states[entry.idx];
     uint16_t total = node->literal_count + node->wildcard_count;
@@ -3645,35 +3678,59 @@ st_error_t st_policy_dump_dot(const st_policy_t *policy, const char *path) {
       child_entry_t *c = &children[i];
 
       /* Emit child node */
-      const char *label =
-          c->type == ST_TYPE_LITERAL ? c->text : st_type_symbol[c->type];
-      if (fprintf(fp, "  n%d [label=\"%s\"%s];\n", next_id, label,
-                  node->pattern_id != UINT16_MAX ? "" : "") < 0) {
+      /* Classified command tokens are stored as literal children with text;
+       * only plain wildcard children omit text. */
+      const char *label = c->text ? c->text : st_type_symbol[c->type];
+      policy_state_t *child = &policy->states.states[c->target];
+      if (fprintf(fp, "  n%d [label=", next_id) < 0 ||
+          !dot_write_label(fp, label) ||
+          fprintf(fp, "%s];\n",
+                  child->pattern_id != UINT16_MAX
+                      ? ", style=filled, fillcolor=lightgreen"
+                      : "") < 0) {
+        free(queue);
         fclose(fp);
+        pthread_rwlock_unlock((pthread_rwlock_t *)&policy->rwlock);
         return ST_ERR_IO;
       }
 
       /* Emit edge */
       if (fprintf(fp, "  n%d -> n%d;\n", entry.node_id, next_id) < 0) {
+        free(queue);
         fclose(fp);
+        pthread_rwlock_unlock((pthread_rwlock_t *)&policy->rwlock);
         return ST_ERR_IO;
       }
 
-      if (tail < 4096) {
-        queue[tail].idx = c->target;
-        queue[tail].node_id = next_id;
-        tail++;
+      if (tail == queue_cap) {
+        size_t new_cap = queue_cap * 2;
+        dot_q *grown = realloc(queue, new_cap * sizeof(*queue));
+        if (!grown) {
+          free(queue);
+          fclose(fp);
+          pthread_rwlock_unlock((pthread_rwlock_t *)&policy->rwlock);
+          return ST_ERR_MEMORY;
+        }
+        queue = grown;
+        queue_cap = new_cap;
       }
+      queue[tail].idx = c->target;
+      queue[tail].node_id = next_id;
+      tail++;
       next_id++;
     }
   }
 
+  free(queue);
+
   if (fprintf(fp, "}\n") < 0) {
     fclose(fp);
+    pthread_rwlock_unlock((pthread_rwlock_t *)&policy->rwlock);
     return ST_ERR_IO;
   }
-  fclose(fp);
-  return ST_OK;
+  st_error_t result = fclose(fp) == 0 ? ST_OK : ST_ERR_IO;
+  pthread_rwlock_unlock((pthread_rwlock_t *)&policy->rwlock);
+  return result;
 }
 
 /* --- DRY-RUN MODE --- */
@@ -3681,150 +3738,79 @@ st_error_t st_policy_dump_dot(const st_policy_t *policy, const char *path) {
 st_error_t st_policy_simulate_add(st_policy_t *policy, const char *pattern,
                                   bool *would_match,
                                   const char **conflicting_pattern) {
+  if (would_match)
+    *would_match = false;
+  if (conflicting_pattern)
+    *conflicting_pattern = NULL;
   if (!policy || !pattern || !would_match)
     return ST_ERR_INVALID;
 
-  *would_match = false;
-  if (conflicting_pattern)
-    *conflicting_pattern = NULL;
-
-  st_eval_result_t result;
-  st_error_t err = st_policy_eval(policy, pattern, &result);
-  if (err != ST_OK)
-    return err;
-
-  *would_match = result.matches;
-  if (result.matches && conflicting_pattern) {
-    *conflicting_pattern = result.matching_pattern;
+  size_t token_count = 0;
+  st_error_t parse_error = ST_ERR_INVALID;
+  st_token_t *tokens = parse_pattern(pattern, &token_count, &parse_error);
+  if (!tokens)
+    return parse_error;
+  if (token_count == 0 || token_count > ST_MAX_CMD_TOKENS) {
+    free_pattern_tokens(tokens, token_count);
+    return ST_ERR_INVALID;
   }
 
+  pthread_rwlock_rdlock(&policy->rwlock);
+  const pattern_entry_t *best = NULL;
+  len_bucket_t *bucket = &policy->len_buckets[token_count];
+  for (size_t i = 0; i < bucket->count; i++) {
+    pattern_entry_t *entry = &policy->patterns.entries[bucket->indices[i]];
+    if (!entry->active || !entry->tokens ||
+        !pattern_subsumes(entry->tokens, entry->token_count, tokens,
+                          token_count))
+      continue;
+    if (!best || pattern_entry_preferred(entry, best))
+      best = entry;
+  }
+  *would_match = best != NULL;
+  if (best && conflicting_pattern)
+    *conflicting_pattern = best->pattern;
+  pthread_rwlock_unlock(&policy->rwlock);
+
+  free_pattern_tokens(tokens, token_count);
   return ST_OK;
 }
 
 /* --- POLICY EXPANSION SUGGESTIONS (Miner — Step 2 only) --- */
 
-/*
- * Next-wider type in the lattice, capped appropriately.
- *
- * Security: We cap generalization at reasonable types to prevent
- * over-broad suggestions. Path types stay as #path, others may go to #w.
- *
- * Type hierarchy (with caps):
- *   #sha → #h → #val → #w (cap)
- *   #i, #ipv6 → #ipaddr → #val → #w (cap)
- *   #w → #w (cap - already at limit)
- *   #q → #qs → #val → #w (cap)
- *   #f → #r → #path → #path (cap - #path is appropriate for paths)
- *   #p → #path → #path (cap)
- *   #u → #w (cap)
- *   #val → #val (cap)
- *   #sopt → #opt → #val (cap)
- *   #lopt → #opt → #val (cap)
- *   #uuid, #email, #host, #size, #semver, #ts, #env → #val → * (cap)
- *   #port → #n → #val → * (cap)
- *   #hash, #hyp, #method → #word → #val → * (cap)
- *   #mac, #cron, #duration → #val → * (cap)
- */
-static st_token_type_t next_wider_type(st_token_type_t t) {
-  switch (t) {
-  case ST_TYPE_SHA:
-    return ST_TYPE_HEXHASH;
-  case ST_TYPE_HEXHASH:
-    return ST_TYPE_VALUE;
-  case ST_TYPE_NUMBER:
-    return ST_TYPE_VALUE;
-  case ST_TYPE_IPV4:
-    return ST_TYPE_IPADDR;
-  case ST_TYPE_IPV6:
-    return ST_TYPE_IPADDR;
-  case ST_TYPE_IPADDR:
-    return ST_TYPE_VALUE;
-  case ST_TYPE_WORD:
-    return ST_TYPE_WORD; /* Cap reached */
-  case ST_TYPE_QUOTED:
-    return ST_TYPE_QUOTED_SPACE;
-  case ST_TYPE_QUOTED_SPACE:
-    return ST_TYPE_VALUE;
-  case ST_TYPE_FILENAME:
-    return ST_TYPE_REL_PATH;
-  case ST_TYPE_REL_PATH:
-    return ST_TYPE_PATH;
-  case ST_TYPE_ABS_PATH:
-    return ST_TYPE_PATH;
-  case ST_TYPE_PATH:
-    return ST_TYPE_PATH; /* Cap: #path stays as #path */
-  case ST_TYPE_URL:
-    return ST_TYPE_WORD; /* Cap: #u → #w */
-  case ST_TYPE_VALUE:
-    return ST_TYPE_VALUE; /* Cap: #val stays as #val */
-  case ST_TYPE_SHORTOPT:
-    return ST_TYPE_OPT; /* #sopt → #opt */
-  case ST_TYPE_LONGOPT:
-    return ST_TYPE_OPT; /* #lopt → #opt */
-  case ST_TYPE_OPT:
-    return ST_TYPE_VALUE; /* Cap: #opt → #val */
-  case ST_TYPE_UUID:
-    return ST_TYPE_VALUE; /* Cap: #uuid → #val */
-  case ST_TYPE_EMAIL:
-    return ST_TYPE_VALUE; /* Cap: #email → #val */
-  case ST_TYPE_HOSTNAME:
-    return ST_TYPE_VALUE; /* Cap: #host → #val */
-  case ST_TYPE_PORT:
-    return ST_TYPE_NUMBER; /* Cap: #port → #n */
-  case ST_TYPE_SIZE:
-    return ST_TYPE_VALUE; /* Cap: #size → #val */
-  case ST_TYPE_SEMVER:
-    return ST_TYPE_VALUE; /* Cap: #semver → #val */
-  case ST_TYPE_TIMESTAMP:
-    return ST_TYPE_VALUE; /* Cap: #ts → #val */
-  case ST_TYPE_HASH_ALGO:
-    return ST_TYPE_WORD; /* Cap: #hash → #word */
-  case ST_TYPE_ENV_VAR:
-    return ST_TYPE_VALUE; /* Cap: #env → #val */
-  case ST_TYPE_HYPHENATED:
-    return ST_TYPE_WORD; /* Cap: #hyp → #word */
-  case ST_TYPE_BRANCH:
-    return ST_TYPE_VALUE; /* Cap: #branch → #val */
-  case ST_TYPE_IMAGE:
-    return ST_TYPE_VALUE; /* Cap: #image → #val */
-  case ST_TYPE_PKG:
-    return ST_TYPE_VALUE; /* Cap: #pkg → #val */
-  case ST_TYPE_USER:
-    return ST_TYPE_VALUE; /* Cap: #user → #val */
-  case ST_TYPE_FINGERPRINT:
-    return ST_TYPE_VALUE; /* Cap: #fp → #val */
-  case ST_TYPE_MAC:
-    return ST_TYPE_VALUE; /* Cap: #mac → #val */
-  case ST_TYPE_METHOD:
-    return ST_TYPE_WORD; /* Cap: #method → #word */
-  case ST_TYPE_CRON:
-    return ST_TYPE_VALUE; /* Cap: #cron → #val */
-  case ST_TYPE_DURATION:
-    return ST_TYPE_VALUE; /* Cap: #duration → #val */
-  case ST_TYPE_REGEX:
-    return ST_TYPE_VALUE; /* Cap: #regex → #val */
-  case ST_TYPE_GLOB:
-    return ST_TYPE_VALUE; /* Cap: #glob → #val */
-  case ST_TYPE_RANGE:
-    return ST_TYPE_VALUE; /* Cap: #range → #val */
-  case ST_TYPE_SIGNAL:
-    return ST_TYPE_VALUE; /* Cap: #signal → #val */
-  case ST_TYPE_USER_GROUP:
-    return ST_TYPE_VALUE; /* Cap: #user_group → #val */
-  case ST_TYPE_PERM_OCTAL:
-    return ST_TYPE_NUMBER; /* Cap: #perm → #n */
-  case ST_TYPE_ANY:
-    return ST_TYPE_ANY; /* Already at top */
-  default:
-    return t;
+static bool is_safe_immediate_cover(st_token_type_t type,
+                                    st_token_type_t candidate) {
+  if (type == candidate || candidate == ST_TYPE_ANY ||
+      !st_is_compatible(type, candidate))
+    return false;
+  for (int i = ST_TYPE_LITERAL + 1; i < ST_TYPE_COUNT; i++) {
+    st_token_type_t intermediate = (st_token_type_t)i;
+    if (intermediate != type && intermediate != candidate &&
+        st_is_compatible(type, intermediate) &&
+        st_is_compatible(intermediate, candidate))
+      return false;
   }
+  return true;
 }
 
 size_t st_policy_suggest_variants(const st_policy_t *policy,
                                   const st_token_t *tokens, size_t token_count,
                                   st_expand_suggestion_t out[3]) {
-  if (!policy || !tokens || !out || token_count == 0)
+  if (out)
+    memset(out, 0, 3 * sizeof(*out));
+  if (!policy || !tokens || !out || token_count == 0 ||
+      token_count > ST_MAX_CMD_TOKENS)
     return 0;
+  for (size_t i = 0; i < token_count; i++) {
+    if (!tokens[i].text || tokens[i].type < ST_TYPE_LITERAL ||
+        tokens[i].type >= ST_TYPE_COUNT)
+      return 0;
+    if (tokens[i].text[0] == '\0' ||
+        strpbrk(tokens[i].text, " \t\r\n\v\f") != NULL ||
+        (tokens[i].type == ST_TYPE_LITERAL &&
+         st_type_from_pattern_token(tokens[i].text) != ST_TYPE_LITERAL))
+      return 0;
+  }
 
   /* Variant 0: exact match as literal */
   {
@@ -3835,8 +3821,13 @@ size_t st_policy_suggest_variants(const st_policy_t *policy,
       lit_tokens[i].text = (char *)tokens[i].text;
       lit_tokens[i].type = ST_TYPE_LITERAL;
     }
-    st_build_pattern(out[0].pattern, sizeof(out[0].pattern), lit_tokens,
-                     token_count);
+    if (!st_build_pattern(out[0].pattern, sizeof(out[0].pattern), lit_tokens,
+                          token_count) ||
+        st_validate_pattern(out[0].pattern, NULL) != ST_OK) {
+      free(lit_tokens);
+      memset(out, 0, 3 * sizeof(*out));
+      return 0;
+    }
     out[0].based_on = NULL;
     out[0].confidence = 1.0;
     free(lit_tokens);
@@ -3848,24 +3839,35 @@ size_t st_policy_suggest_variants(const st_policy_t *policy,
     if (tokens[i].type == ST_TYPE_LITERAL)
       continue;
 
-    st_token_type_t wider = next_wider_type(tokens[i].type);
-    if (wider == tokens[i].type)
-      continue;
+    for (int candidate = ST_TYPE_LITERAL + 1;
+         candidate < ST_TYPE_COUNT && n_variants < 3; candidate++) {
+      st_token_type_t wider = (st_token_type_t)candidate;
+      if (!is_safe_immediate_cover(tokens[i].type, wider))
+        continue;
 
-    st_token_t *pat_tokens = malloc(token_count * sizeof(st_token_t));
-    if (!pat_tokens)
-      continue;
-    for (size_t j = 0; j < token_count; j++)
-      pat_tokens[j] = tokens[j];
-    pat_tokens[i].text = (char *)st_type_symbol[wider];
-    pat_tokens[i].type = wider;
+      st_token_t *pat_tokens = malloc(token_count * sizeof(st_token_t));
+      if (!pat_tokens) {
+        memset(out, 0, 3 * sizeof(*out));
+        return 0;
+      }
+      for (size_t j = 0; j < token_count; j++)
+        pat_tokens[j] = tokens[j];
+      pat_tokens[i].text = (char *)st_type_symbol[wider];
+      pat_tokens[i].type = wider;
 
-    st_build_pattern(out[n_variants].pattern, sizeof(out[n_variants].pattern),
-                     pat_tokens, token_count);
-    out[n_variants].based_on = NULL;
-    out[n_variants].confidence = 1.0;
-    free(pat_tokens);
-    n_variants++;
+      if (!st_build_pattern(out[n_variants].pattern,
+                            sizeof(out[n_variants].pattern), pat_tokens,
+                            token_count) ||
+          st_validate_pattern(out[n_variants].pattern, NULL) != ST_OK) {
+        free(pat_tokens);
+        memset(out, 0, 3 * sizeof(*out));
+        return 0;
+      }
+      out[n_variants].based_on = NULL;
+      out[n_variants].confidence = 1.0;
+      free(pat_tokens);
+      n_variants++;
+    }
   }
 
   return n_variants;

@@ -36,6 +36,7 @@ typedef struct {
 bool arena_init(arena_t *a, size_t size);
 void arena_free(arena_t *a);
 void *arena_alloc(arena_t *a, size_t n);
+bool arena_reserve(arena_t *a, size_t additional);
 size_t arena_used(const arena_t *a);
 
 #endif /* ARENA_H */

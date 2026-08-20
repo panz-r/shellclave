@@ -49,14 +49,50 @@ typedef struct {
 static int suggestions_equal(const st_suggestion_t *actual, size_t actual_count,
                              const expected_suggestion_t *expected,
                              size_t expected_count) {
-  if (actual_count != expected_count || (expected_count > 0 && !actual))
+  if (actual_count != expected_count || (expected_count > 0 && !actual)) {
+    fprintf(stderr, "suggestion count: actual=%zu expected=%zu\n", actual_count,
+            expected_count);
+    for (size_t i = 0; actual && i < actual_count; i++)
+      fprintf(stderr, "  %s (%u, %.3f)\n", actual[i].pattern, actual[i].count,
+              actual[i].confidence);
     return 0;
+  }
   for (size_t i = 0; i < expected_count; i++)
     if (!actual[i].pattern ||
         strcmp(actual[i].pattern, expected[i].pattern) != 0 ||
         actual[i].count != expected[i].count ||
         fabs(actual[i].confidence - expected[i].confidence) > 0.000001)
       return 0;
+  return 1;
+}
+
+static int suggestions_replay_exactly(const st_suggestion_t *suggestions,
+                                      size_t suggestion_count,
+                                      const char *const *commands,
+                                      size_t command_count) {
+  for (size_t i = 0; i < suggestion_count; i++) {
+    st_policy_ctx_t *context = st_policy_ctx_new();
+    st_policy_t *policy = context ? st_policy_new(context) : NULL;
+    if (!policy || st_policy_add(policy, suggestions[i].pattern) != ST_OK) {
+      st_policy_free(policy);
+      st_policy_ctx_free(context);
+      return 0;
+    }
+    uint32_t matches = 0;
+    for (size_t command = 0; command < command_count; command++) {
+      st_eval_result_t result = {0};
+      if (st_policy_eval(policy, commands[command], &result) != ST_OK) {
+        st_policy_free(policy);
+        st_policy_ctx_free(context);
+        return 0;
+      }
+      matches += result.matches;
+    }
+    st_policy_free(policy);
+    st_policy_ctx_free(context);
+    if (matches != suggestions[i].count)
+      return 0;
+  }
   return 1;
 }
 
@@ -77,17 +113,8 @@ static int test_realistic_workload_matrix(void) {
       "docker run -it python python3",
   };
   static const expected_suggestion_t expected[] = {
-      {"git commit", 5, 1.0},
-      {"git commit #sopt", 5, 1.0},
       {"git commit #sopt #hyp", 5, 1.0},
-      {"cat #p", 4, 1.0},
-      {"cat #p |", 4, 1.0},
-      {"cat #p | grep", 4, 1.0},
-      {"docker run", 4, 1.0},
-      {"docker run #sopt", 4, 1.0},
-      {"git", 5, 5.0 / 13.0},
-      {"cat", 4, 4.0 / 13.0},
-      {"docker", 4, 4.0 / 13.0},
+      {"cat #p | grep *", 4, 1.0},
   };
 
   st_learner_t *learner = st_learner_new(3, 0.0);
@@ -97,6 +124,8 @@ static int test_realistic_workload_matrix(void) {
   st_suggestion_t *suggestions = st_suggest(learner, &count);
   ASSERT(suggestions_equal(suggestions, count, expected,
                            sizeof(expected) / sizeof(expected[0])));
+  ASSERT(suggestions_replay_exactly(suggestions, count, commands,
+                                    sizeof(commands) / sizeof(commands[0])));
   st_free_suggestions(suggestions, count);
   st_learner_free(learner);
   return 1;
@@ -114,26 +143,11 @@ static int test_large_dataset_ranking(void) {
       {"systemctl restart service-%d", 10},
   };
   static const expected_suggestion_t expected[] = {
-      {"grep #sopt", 30, 1.0},
-      {"grep #sopt #hyp", 30, 1.0},
       {"grep #sopt #hyp #p", 30, 1.0},
-      {"cat #p.txt", 25, 1.0},
-      {"cat #p |", 25, 1.0},
-      {"cat #p | wc", 25, 1.0},
       {"cat #p | wc #sopt", 25, 1.0},
-      {"find #p", 20, 1.0},
-      {"find #p #sopt", 20, 1.0},
-      {"docker run", 15, 1.0},
-      {"docker run #sopt", 15, 1.0},
-      {"docker run #sopt #hyp", 15, 1.0},
+      {"find #p #sopt *", 20, 1.0},
       {"docker run #sopt #hyp bash", 15, 1.0},
-      {"systemctl restart", 10, 1.0},
       {"systemctl restart #hyp", 10, 1.0},
-      {"grep", 30, 0.30},
-      {"cat", 25, 0.25},
-      {"find", 20, 0.20},
-      {"docker", 15, 0.15},
-      {"systemctl", 10, 0.10},
   };
   st_learner_t *learner = st_learner_new(5, 0.01);
   ASSERT(learner != NULL);
@@ -150,6 +164,20 @@ static int test_large_dataset_ranking(void) {
   st_suggestion_t *suggestions = st_suggest(learner, &count);
   ASSERT(suggestions_equal(suggestions, count, expected,
                            sizeof(expected) / sizeof(expected[0])));
+  const char *commands[100];
+  char command_storage[100][128];
+  size_t command_count = 0;
+  for (size_t family = 0; family < sizeof(families) / sizeof(families[0]);
+       family++)
+    for (int i = 0; i < families[family].count; i++) {
+      snprintf(command_storage[command_count],
+               sizeof(command_storage[command_count]), families[family].format,
+               i);
+      commands[command_count] = command_storage[command_count];
+      command_count++;
+    }
+  ASSERT(
+      suggestions_replay_exactly(suggestions, count, commands, command_count));
   st_free_suggestions(suggestions, count);
   st_learner_free(learner);
   return 1;

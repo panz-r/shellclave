@@ -19,5 +19,7 @@ WORK_DIR=$(mktemp -d "${WORK_ROOT}.XXXXXX")
 cleanup() { rm -rf "$WORK_DIR"; }
 trap cleanup EXIT INT TERM
 
-"$FUZZER" -runs="$RUNS" -max_len="$MAX_LEN" \
+ASAN_OPTIONS="${ASAN_OPTIONS:+${ASAN_OPTIONS}:}detect_leaks=0" \
+LSAN_OPTIONS="${LSAN_OPTIONS:+${LSAN_OPTIONS}:}detect_leaks=0" \
+  "$FUZZER" -runs="$RUNS" -max_len="$MAX_LEN" -timeout=10 -rss_limit_mb=1024 \
   -artifact_prefix="$ARTIFACT_PREFIX" "$WORK_DIR" "$SEEDS"

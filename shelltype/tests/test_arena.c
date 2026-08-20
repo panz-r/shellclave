@@ -3,6 +3,7 @@
  */
 
 #include "arena.h"
+#include "test_allocator.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -47,6 +48,24 @@ int main(void) {
   ASSERT(memcmp(arena.base, "\xa5\xa5\xa5\xa5\xa5\xa5\xa5\xa5", 8) == 0);
   ASSERT((unsigned char)arena.base[capacity - 1] == 0x5a);
 
+  size_t used_before_reserve = arena.used;
+  size_t size_before_reserve = arena.size;
+  ASSERT(arena_reserve(&arena, 0));
+  ASSERT(arena.used == used_before_reserve &&
+         arena.size == size_before_reserve);
+  ASSERT(arena_reserve(&arena, arena.size));
+  ASSERT(arena.used == used_before_reserve && arena.size > size_before_reserve);
+  ASSERT(memcmp(arena.base, "\xa5\xa5\xa5\xa5\xa5\xa5\xa5\xa5", 8) == 0);
+  ASSERT((unsigned char)arena.base[capacity - 1] == 0x5a);
+
+  size_t reserved_size = arena.size;
+  st_test_alloc_fail_at(1);
+  ASSERT(!arena_reserve(&arena, reserved_size));
+  st_test_alloc_reset();
+  ASSERT(arena.used == used_before_reserve && arena.size == reserved_size);
+  ASSERT(!arena_reserve(&arena, SIZE_MAX));
+  ASSERT(arena.used == used_before_reserve && arena.size == reserved_size);
+
   static const struct {
     size_t size;
     size_t used;
@@ -71,6 +90,5 @@ int main(void) {
   ASSERT(arena.base == NULL);
   ASSERT(arena.size == 0);
   ASSERT(arena_used(&arena) == 0);
-  arena_free(&arena);
   return 0;
 }
