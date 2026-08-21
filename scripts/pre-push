@@ -1,47 +1,86 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+readonly stamp_version=shellclave-pre-push-v1
+readonly fuzz_runs=1000
+readonly fuzz_max_len=8192
+
 repo_root=$(git rev-parse --show-toplevel)
 cd "$repo_root"
 
-build_root=${SHELLCLAVE_PREPUSH_BUILD_ROOT:-"$repo_root/.pre-push-build"}
-normal_build="$build_root/normal"
-asan_build="$build_root/asan"
-fuzz_build="$build_root/fuzz"
-fuzz_runs=${SHELLCLAVE_PREPUSH_FUZZ_RUNS:-1000}
+stamp_path=$(git rev-parse --git-path shellclave-pre-push-verification)
+zero_oid=$(git hash-object --stdin </dev/null | tr '0-9a-f' '0')
+updates=()
+signed_version=
+signed_commit=
+signed_digest=
 
-if ! command -v cmake >/dev/null 2>&1; then
-  echo "pre-push: cmake is required" >&2
-  exit 1
+# Consume Git's complete ref-update stream before invoking any child process.
+while IFS= read -r update || [ -n "$update" ]; do
+  updates+=("$update")
+done
+
+stamp_digest() {
+  printf '%s\n' "$stamp_version" "$1" "fuzz-runs=$fuzz_runs" \
+    "fuzz-max-len=$fuzz_max_len" | sha256sum | awk '{print $1}'
+}
+
+require_stamp() {
+  if [ ! -f "$stamp_path" ]; then
+    echo "pre-push: no verified commit; run ./scripts/verify-push" >&2
+    exit 1
+  fi
+
+  local lines=()
+  mapfile -t lines <"$stamp_path"
+  if [ "${#lines[@]}" -ne 1 ]; then
+    echo "pre-push: malformed verification stamp; run ./scripts/verify-push" >&2
+    exit 1
+  fi
+
+  local extra=
+  read -r signed_version signed_commit signed_digest extra <<<"${lines[0]}"
+  if [ "$signed_version" != "$stamp_version" ] || [ -n "$extra" ] ||
+    [ "${#signed_commit}" -ne "${#zero_oid}" ] ||
+    [[ ! "$signed_commit" =~ ^[0-9a-f]+$ ]] ||
+    ! git cat-file -e "$signed_commit^{commit}" 2>/dev/null ||
+    [ "$signed_digest" != "$(stamp_digest "$signed_commit")" ]; then
+    echo "pre-push: invalid verification stamp; run ./scripts/verify-push" >&2
+    exit 1
+  fi
+}
+
+needs_stamp=false
+for update in "${updates[@]}"; do
+  read -r local_ref local_oid remote_ref remote_oid extra <<<"$update"
+  if [ -n "${extra:-}" ] || [ -z "${remote_oid:-}" ]; then
+    echo "pre-push: malformed ref update from Git" >&2
+    exit 1
+  fi
+  if [ "$local_oid" != "$zero_oid" ]; then
+    needs_stamp=true
+  fi
+done
+
+if [ "$needs_stamp" = false ]; then
+  exit 0
 fi
+require_stamp
 
-echo "pre-push: configuring normal build"
-cmake -S . -B "$normal_build" -DCMAKE_BUILD_TYPE=Debug
-cmake --build "$normal_build"
-cmake --build "$normal_build" --target format-check clang-analyze
-ctest --test-dir "$normal_build" --output-on-failure
+for update in "${updates[@]}"; do
+  read -r local_ref local_oid remote_ref remote_oid <<<"$update"
+  if [ "$local_oid" = "$zero_oid" ]; then
+    continue
+  fi
+  pushed_commit=$(git rev-parse --verify "$local_oid^{commit}" 2>/dev/null) || {
+    echo "pre-push: $local_ref does not resolve to a commit" >&2
+    exit 1
+  }
+  if [ "$pushed_commit" != "$signed_commit" ]; then
+    echo "pre-push: ${pushed_commit:0:12} is not verified" >&2
+    echo "pre-push: run ./scripts/verify-push at the commit being pushed" >&2
+    exit 1
+  fi
+done
 
-echo "pre-push: configuring sanitizer build"
-cmake -S . -B "$asan_build" -DCMAKE_BUILD_TYPE=Debug \
-  -DSHELLCLAVE_ENABLE_SANITIZERS=ON
-cmake --build "$asan_build"
-ASAN_OPTIONS=${ASAN_OPTIONS:-detect_leaks=1} \
-LSAN_OPTIONS=${LSAN_OPTIONS:-detect_leaks=1} \
-ctest --test-dir "$asan_build" --output-on-failure
-
-if ! command -v clang >/dev/null 2>&1 || ! command -v clang++ >/dev/null 2>&1; then
-  echo "pre-push: clang and clang++ are required for fuzz smoke tests" >&2
-  exit 1
-fi
-
-echo "pre-push: configuring fuzz build"
-cmake -S . -B "$fuzz_build" -DCMAKE_BUILD_TYPE=Debug \
-  -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
-  -DSHELLCLAVE_BUILD_FUZZERS=ON \
-  -DSHELLCLAVE_FUZZ_RUNS="$fuzz_runs" \
-  -DSHELLCLAVE_FUZZ_MAX_LEN=8192
-echo "pre-push: unified fuzz smoke (shellsplit, shelltype, and shellgate, $fuzz_runs runs)"
-cmake --build "$fuzz_build" --target fuzz-smoke
-
-echo "pre-push: all checks passed"
-echo "pre-push: build artifacts preserved in $build_root"
+echo "pre-push: verified commit ${signed_commit:0:12}"

@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly stamp_version=shellclave-pre-push-v1
+readonly fuzz_runs=1000
+readonly fuzz_max_len=8192
+
+repo_root=$(git rev-parse --show-toplevel)
+cd "$repo_root"
+
+build_root=${SHELLCLAVE_PREPUSH_BUILD_ROOT:-"$repo_root/.pre-push-build"}
+normal_build="$build_root/normal"
+asan_build="$build_root/asan"
+fuzz_build="$build_root/fuzz"
+stamp_path=$(git rev-parse --git-path shellclave-pre-push-verification)
+
+stamp_digest() {
+  printf '%s\n' "$stamp_version" "$1" "fuzz-runs=$fuzz_runs" \
+    "fuzz-max-len=$fuzz_max_len" | sha256sum | awk '{print $1}'
+}
+
+require_clean_sources() {
+  if ! git diff --quiet --ignore-submodules=all ||
+    ! git diff --cached --quiet --ignore-submodules=all; then
+    echo "verify-push: tracked files must be committed before verification" >&2
+    return 1
+  fi
+
+  while IFS= read -r status; do
+    if [ -n "$status" ] && [ "${status:0:1}" != " " ]; then
+      echo "verify-push: submodule does not match the committed revision:" >&2
+      echo "  $status" >&2
+      return 1
+    fi
+  done < <(git submodule status --recursive)
+
+  if ! git submodule foreach --quiet --recursive \
+    'test -z "$(git status --porcelain --untracked-files=all)"'; then
+    echo "verify-push: submodule worktrees must be clean" >&2
+    return 1
+  fi
+}
+
+for command in cmake ctest clang clang++ sha256sum awk; do
+  if ! command -v "$command" >/dev/null 2>&1; then
+    echo "verify-push: $command is required" >&2
+    exit 1
+  fi
+done
+
+require_clean_sources
+verified_commit=$(git rev-parse --verify HEAD^{commit})
+
+echo "verify-push: configuring normal build"
+cmake -S . -B "$normal_build" -DCMAKE_BUILD_TYPE=Debug
+cmake --build "$normal_build"
+cmake --build "$normal_build" --target format-check clang-analyze
+ctest --test-dir "$normal_build" --output-on-failure
+
+echo "verify-push: configuring sanitizer build"
+cmake -S . -B "$asan_build" -DCMAKE_BUILD_TYPE=Debug \
+  -DSHELLCLAVE_ENABLE_SANITIZERS=ON
+cmake --build "$asan_build"
+ASAN_OPTIONS=${ASAN_OPTIONS:-detect_leaks=1} \
+LSAN_OPTIONS=${LSAN_OPTIONS:-detect_leaks=1} \
+  ctest --test-dir "$asan_build" --output-on-failure
+
+echo "verify-push: configuring fuzz build"
+cmake -S . -B "$fuzz_build" -DCMAKE_BUILD_TYPE=Debug \
+  -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+  -DSHELLCLAVE_BUILD_FUZZERS=ON \
+  -DSHELLCLAVE_FUZZ_RUNS="$fuzz_runs" \
+  -DSHELLCLAVE_FUZZ_MAX_LEN="$fuzz_max_len"
+echo "verify-push: unified fuzz smoke (shellsplit, shelltype, and shellgate, $fuzz_runs runs)"
+cmake --build "$fuzz_build" --target fuzz-smoke
+
+require_clean_sources
+if [ "$(git rev-parse --verify HEAD^{commit})" != "$verified_commit" ]; then
+  echo "verify-push: HEAD changed during verification" >&2
+  exit 1
+fi
+
+stamp_directory=$(dirname "$stamp_path")
+mkdir -p "$stamp_directory"
+temporary_stamp=$(mktemp "$stamp_path.XXXXXX")
+cleanup() { rm -f "$temporary_stamp"; }
+trap cleanup EXIT INT TERM
+printf '%s %s %s\n' "$stamp_version" "$verified_commit" \
+  "$(stamp_digest "$verified_commit")" >"$temporary_stamp"
+mv "$temporary_stamp" "$stamp_path"
+trap - EXIT INT TERM
+
+echo "verify-push: all checks passed"
+echo "verify-push: signed commit ${verified_commit:0:12}"
+echo "verify-push: build artifacts preserved in $build_root"
