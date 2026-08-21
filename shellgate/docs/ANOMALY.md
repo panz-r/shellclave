@@ -145,8 +145,12 @@ Sequences with < 3 commands are not scored for anomaly detection (score = 0, det
 
 - Model owns all memory (hash tables with length-prefixed keys)
 - Use `sg_gate_anomaly_had_error()` to check for OOM conditions
-- Save/load with `sg_gate_save_anomaly_model()` / `sg_gate_load_anomaly_model()`
-- Type model is saved alongside raw model at `{path}_type`
+- Save/load both models atomically with `sg_gate_save_anomaly_model()` /
+  `sg_gate_load_anomaly_model()`.
+- Gate persistence uses one checksummed bundle containing the raw and type
+  models. It does not read standalone v3 model files or the former `_type`
+  sidecar layout. The lower-level `sg_anomaly_save()` / `sg_anomaly_load()`
+  APIs continue to use the standalone single-model v3 format.
 
 ## Long-Running Model Maintenance
 

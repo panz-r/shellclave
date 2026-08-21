@@ -21,8 +21,10 @@
  */
 
 #include "sg_anomaly.h"
+#include "sg_anomaly_internal.h"
 #include <draugr/ht.h>
 #define XXH_STATIC_LINKING_ONLY
+#include "sg_alloc.h"
 #include <errno.h>
 #include <math.h>
 #include <stdint.h>
@@ -30,6 +32,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <xxhash.h>
+
+#ifdef SHELLGATE_TEST_ANOMALY_OPS
+#include "test_sg_failures.h"
+#define SG_ANOMALY_OP_FAILED() sg_test_anomaly_op_should_fail()
+#else
+#define SG_ANOMALY_OP_FAILED() false
+#endif
 
 #define SG_ANOMALY_MAX_KEY_LENGTH ((SG_ANOMALY_MAX_COMMAND_LENGTH + 1U) * 4U)
 
@@ -42,12 +51,16 @@ static uint64_t anomaly_hash_fn(const void *key, size_t key_len,
 }
 
 static ht_table_t *count_table_create(void) {
+  if (SG_ANOMALY_OP_FAILED())
+    return NULL;
   return ht_create(NULL, anomaly_hash_fn, NULL, NULL);
 }
 
 static bool count_inc(ht_table_t *t, const char *key, size_t key_len,
                       int64_t inc, size_t *total) {
   if (!t)
+    return false;
+  if (SG_ANOMALY_OP_FAILED())
     return false;
   uint64_t hash = anomaly_hash_fn(key, key_len, NULL);
   bool ok;
@@ -610,6 +623,24 @@ static int save_table(FILE *f, ht_table_t *t, uint8_t type) {
   return 0;
 }
 
+int sg_anomaly_write_stream(const sg_anomaly_model_t *model, FILE *f) {
+  if (!model || !f) {
+    errno = EINVAL;
+    return -1;
+  }
+  if (fprintf(f, "# anomaly-model-v3\n") < 0 ||
+      fprintf(f, "# %.17g %.17g %.17g %zu %zu %zu %zu %zu %zu\n", model->alpha,
+              model->unk_prior, model->kn_discount, model->total_uni,
+              model->total_bi, model->total_tri, model->total_quad,
+              model->vocab_size, model->unk_count) < 0 ||
+      save_table(f, model->uni, BINARY_TYPE_UNI) < 0 ||
+      save_table(f, model->bi, BINARY_TYPE_BI) < 0 ||
+      save_table(f, model->tri, BINARY_TYPE_TRI) < 0 ||
+      save_table(f, model->quad, BINARY_TYPE_QUAD) < 0 || fflush(f) != 0)
+    return -1;
+  return 0;
+}
+
 int sg_anomaly_save(const sg_anomaly_model_t *model, const char *path) {
   if (!model || !path) {
     errno = EINVAL;
@@ -620,17 +651,7 @@ int sg_anomaly_save(const sg_anomaly_model_t *model, const char *path) {
   if (!f)
     return -1;
 
-  int result = 0;
-  if (fprintf(f, "# anomaly-model-v3\n") < 0 ||
-      fprintf(f, "# %.17g %.17g %.17g %zu %zu %zu %zu %zu %zu\n", model->alpha,
-              model->unk_prior, model->kn_discount, model->total_uni,
-              model->total_bi, model->total_tri, model->total_quad,
-              model->vocab_size, model->unk_count) < 0 ||
-      save_table(f, model->uni, BINARY_TYPE_UNI) < 0 ||
-      save_table(f, model->bi, BINARY_TYPE_BI) < 0 ||
-      save_table(f, model->tri, BINARY_TYPE_TRI) < 0 ||
-      save_table(f, model->quad, BINARY_TYPE_QUAD) < 0 || fflush(f) != 0)
-    result = -1;
+  int result = sg_anomaly_write_stream(model, f);
 
   if (fclose(f) != 0)
     result = -1;
@@ -758,6 +779,30 @@ static int load_anomaly_stream(sg_anomaly_model_t *model, FILE *f) {
   return 0;
 }
 
+int sg_anomaly_read_stream(sg_anomaly_model_t *model, FILE *f) {
+  if (!model || !f) {
+    errno = EINVAL;
+    return -1;
+  }
+  sg_anomaly_model_t *loaded =
+      sg_anomaly_model_new_ex(model->alpha, model->unk_prior);
+  if (!loaded) {
+    errno = ENOMEM;
+    return -1;
+  }
+
+  int result = load_anomaly_stream(loaded, f);
+  int saved_errno = errno;
+  if (result == 0) {
+    sg_anomaly_model_t previous = *model;
+    *model = *loaded;
+    *loaded = previous;
+  }
+  sg_anomaly_model_free(loaded);
+  errno = saved_errno;
+  return result;
+}
+
 int sg_anomaly_load(sg_anomaly_model_t *model, const char *path) {
   if (!model || !path) {
     errno = EINVAL;
@@ -767,26 +812,12 @@ int sg_anomaly_load(sg_anomaly_model_t *model, const char *path) {
   FILE *f = fopen(path, "rb");
   if (!f)
     return -1;
-  sg_anomaly_model_t *loaded =
-      sg_anomaly_model_new_ex(model->alpha, model->unk_prior);
-  if (!loaded) {
-    fclose(f);
-    errno = ENOMEM;
-    return -1;
-  }
-
-  int result = load_anomaly_stream(loaded, f);
+  int result = sg_anomaly_read_stream(model, f);
   int saved_errno = errno;
   if (fclose(f) != 0 && result == 0) {
     result = -1;
     saved_errno = errno;
   }
-  if (result == 0) {
-    sg_anomaly_model_t previous = *model;
-    *model = *loaded;
-    *loaded = previous;
-  }
-  sg_anomaly_model_free(loaded);
   errno = saved_errno;
   return result;
 }

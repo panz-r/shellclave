@@ -126,8 +126,11 @@ echo "Monitor: tail -f $LOG_DIR/fuzzer.log"
 echo "Stop gracefully: kill -TERM $FUZZER_PID"
 echo ""
 
-wait "$FUZZER_PID"
-FUZZER_EXIT=$?
+if wait "$FUZZER_PID"; then
+    FUZZER_EXIT=0
+else
+    FUZZER_EXIT=$?
+fi
 
 echo ""
 echo "Fuzzer exited with code: $FUZZER_EXIT"

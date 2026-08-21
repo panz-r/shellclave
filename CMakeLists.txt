@@ -112,38 +112,54 @@ if(BUILD_TESTING)
 endif()
 
 set(SHELLGATE_SOURCES shellgate/src/shellgate.c shellgate/src/sg_anomaly.c)
-add_library(shellgate ${SHELLGATE_SOURCES})
+
+function(shellclave_configure_shellgate_target target shelltype_target)
+  add_library(${target} ${SHELLGATE_SOURCES})
+  shellclave_project_target(${target})
+  target_include_directories(${target} PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/shellgate/include>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/shellclave>)
+  target_link_libraries(${target} PUBLIC shellsplit ${shelltype_target} PRIVATE m)
+
+  # Reuse dependency targets supplied by a parent. In a standalone build,
+  # compile the pinned private implementations into Shellgate so installed
+  # static archives do not expose third-party targets to consumers.
+  if(TARGET draugr)
+    target_link_libraries(${target} PRIVATE $<BUILD_INTERFACE:draugr>)
+  else()
+    if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/deps/draugr/src/ht.c")
+      message(FATAL_ERROR
+        "deps/draugr is missing; clone with --recurse-submodules")
+    endif()
+    target_sources(${target} PRIVATE deps/draugr/src/ht.c
+      deps/draugr/src/ht_cache.c deps/draugr/src/util.c)
+    target_include_directories(${target} PRIVATE deps/draugr/include)
+    target_compile_definitions(${target} PRIVATE DRAUGR_USE_MALLOC)
+  endif()
+  if(TARGET xxHash::xxhash)
+    target_link_libraries(${target} PRIVATE $<BUILD_INTERFACE:xxHash::xxhash>)
+  elseif(TARGET xxhash)
+    target_link_libraries(${target} PRIVATE $<BUILD_INTERFACE:xxhash>)
+  else()
+    if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/deps/xxhash/xxhash.c")
+      message(FATAL_ERROR
+        "deps/xxhash is missing; clone with --recurse-submodules")
+    endif()
+    target_sources(${target} PRIVATE deps/xxhash/xxhash.c)
+    target_include_directories(${target} PRIVATE deps/xxhash)
+  endif()
+endfunction()
+
+shellclave_configure_shellgate_target(shellgate shelltype)
 add_library(Shellclave::shellgate ALIAS shellgate)
-shellclave_project_target(shellgate)
-target_include_directories(shellgate PUBLIC
-  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/shellgate/include>
-  $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/shellclave>)
-target_link_libraries(shellgate PUBLIC shellsplit shelltype PRIVATE m)
 set_target_properties(shellgate PROPERTIES EXPORT_NAME shellgate)
 
-# Reuse dependency targets supplied by a parent. In a standalone build, compile
-# the pinned private implementations into shellgate so installed static archives
-# do not expose third-party targets to consumers.
-if(TARGET draugr)
-  target_link_libraries(shellgate PRIVATE $<BUILD_INTERFACE:draugr>)
-else()
-  if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/deps/draugr/src/ht.c")
-    message(FATAL_ERROR "deps/draugr is missing; clone with --recurse-submodules")
-  endif()
-  target_sources(shellgate PRIVATE deps/draugr/src/ht.c deps/draugr/src/ht_cache.c deps/draugr/src/util.c)
-  target_include_directories(shellgate PRIVATE deps/draugr/include)
-  target_compile_definitions(shellgate PRIVATE DRAUGR_USE_MALLOC)
-endif()
-if(TARGET xxHash::xxhash)
-  target_link_libraries(shellgate PRIVATE $<BUILD_INTERFACE:xxHash::xxhash>)
-elseif(TARGET xxhash)
-  target_link_libraries(shellgate PRIVATE $<BUILD_INTERFACE:xxhash>)
-else()
-  if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/deps/xxhash/xxhash.c")
-    message(FATAL_ERROR "deps/xxhash is missing; clone with --recurse-submodules")
-  endif()
-  target_sources(shellgate PRIVATE deps/xxhash/xxhash.c)
-  target_include_directories(shellgate PRIVATE deps/xxhash)
+if(BUILD_TESTING)
+  shellclave_configure_shellgate_target(shellgate_test shelltype_test)
+  target_sources(shellgate_test PRIVATE shellgate/tests/test_sg_failures.c)
+  target_compile_definitions(shellgate_test PRIVATE
+    SHELLGATE_TEST_ALLOCATOR SHELLGATE_TEST_ANOMALY_OPS SHELLGATE_TEST_IO)
+  target_include_directories(shellgate_test PRIVATE shellgate/tests)
 endif()
 
 function(shellclave_add_test name source library)
@@ -180,8 +196,12 @@ if(BUILD_TESTING)
       shelltype_integration_test shelltype_compact_policy_test)
     target_include_directories(${shelltype_test_target} PRIVATE shelltype/tests)
   endforeach()
-  shellclave_add_test(shellgate_unit_test shellgate/tests/test_shellgate.c shellgate)
-  shellclave_add_test(shellgate_anomaly_test shellgate/tests/test_anomaly.c shellgate)
+  shellclave_add_test(shellgate_unit_test shellgate/tests/test_shellgate.c shellgate_test)
+  shellclave_add_test(shellgate_anomaly_test shellgate/tests/test_anomaly.c shellgate_test)
+  target_include_directories(shellgate_unit_test PRIVATE shelltype/tests)
+  set_tests_properties(shellgate_unit_test PROPERTIES LABELS shellgate)
+  set_tests_properties(shellgate_anomaly_test PROPERTIES
+    LABELS "shellgate;anomaly")
 
   foreach(header IN LISTS SHELLCLAVE_PUBLIC_HEADERS)
     get_filename_component(header_name "${header}" NAME)
@@ -242,6 +262,19 @@ if(BUILD_TESTING)
         -DSHELLCLAVE_CXX_COMPILER=${CMAKE_CXX_COMPILER}
         -DSHELLCLAVE_BUILD_TYPE=${CMAKE_BUILD_TYPE}
         -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/test_embedded.cmake)
+    if(PROJECT_IS_TOP_LEVEL)
+      add_test(NAME shellgate_component_configure
+        COMMAND ${CMAKE_COMMAND}
+          -DSHELLCLAVE_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+          -DSHELLCLAVE_BINARY_DIR=${CMAKE_CURRENT_BINARY_DIR}
+          -DSHELLCLAVE_GENERATOR=${CMAKE_GENERATOR}
+          -DSHELLCLAVE_C_COMPILER=${CMAKE_C_COMPILER}
+          -DSHELLCLAVE_CXX_COMPILER=${CMAKE_CXX_COMPILER}
+          -DSHELLCLAVE_CTEST_COMMAND=${CMAKE_CTEST_COMMAND}
+          -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/test_shellgate_component.cmake)
+      set_tests_properties(shellgate_component_configure PROPERTIES
+        LABELS cmake)
+    endif()
   endif()
 endif()
 
@@ -269,8 +302,10 @@ if(SHELLCLAVE_BUILD_BENCHMARKS)
 endif()
 
 if(SHELLCLAVE_BUILD_FUZZERS)
-  if(NOT CMAKE_C_COMPILER_ID MATCHES "Clang")
-    message(FATAL_ERROR "SHELLCLAVE_BUILD_FUZZERS requires Clang/libFuzzer")
+  if(NOT CMAKE_C_COMPILER_ID MATCHES "Clang" OR
+      NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    message(FATAL_ERROR
+      "SHELLCLAVE_BUILD_FUZZERS requires Clang for both C and C++")
   endif()
   add_executable(fuzz_shellgate shellgate/fuzz/fuzz_shellgate.cpp)
   target_compile_definitions(fuzz_shellgate PRIVATE HAS_LIBFUZZER)

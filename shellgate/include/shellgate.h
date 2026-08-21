@@ -179,6 +179,10 @@ typedef struct {
   bool truncated;
   bool subcmd_truncated;
   bool violation_truncated;
+  /* True when the configured stop mode deliberately left parsed
+   * subcommands unevaluated. The verdict then describes only the evaluated
+   * prefix; this is distinct from capacity or output truncation. */
+  bool short_circuited;
 
   sg_violation_t violations[SG_MAX_VIOLATIONS];
   uint32_t violation_count;
@@ -431,16 +435,17 @@ sg_error_t sg_gate_set_anomaly_k_factor(sg_gate_t *gate, double k);
 sg_error_t sg_gate_set_anomaly_cache_size(sg_gate_t *gate, size_t cache_size);
 
 /*
- * Save the anomaly model to a file.
- * Returns SG_ERR_INVALID if anomaly detection is not enabled,
- * or SG_ERR_IO on file error.
+ * Atomically save the raw and type anomaly models as one versioned bundle.
+ * The bundle is intentionally not compatible with standalone sg_anomaly v3
+ * files or the former `{path}_type` sidecar convention.
  */
 sg_error_t sg_gate_save_anomaly_model(const sg_gate_t *gate, const char *path);
 
 /*
- * Load the anomaly model from a file.
- * Returns SG_ERR_INVALID if anomaly detection is not enabled,
- * or SG_ERR_IO on file error.
+ * Transactionally load both anomaly models from a gate bundle. Existing
+ * models are preserved on every failure. Returns SG_ERR_PARSE for malformed
+ * or incompatible bundles, SG_ERR_MEMORY for allocation failure, and
+ * SG_ERR_IO for filesystem failure.
  */
 sg_error_t sg_gate_load_anomaly_model(sg_gate_t *gate, const char *path);
 
@@ -490,8 +495,14 @@ sg_error_t sg_gate_set_violation_config(sg_gate_t *gate,
 
 /* --- POLICY MANAGEMENT --- */
 
+/* Loads and atomically appends rules to the existing allow policy. Malformed
+ * policy data returns SG_ERR_PARSE; allocation and I/O failures preserve the
+ * current policy and return SG_ERR_MEMORY and SG_ERR_IO respectively. */
 sg_error_t sg_gate_load_policy(sg_gate_t *gate, const char *path);
+/* Policy persistence reports allocation and I/O failures distinctly. */
 sg_error_t sg_gate_save_policy(const sg_gate_t *gate, const char *path);
+/* Invalid patterns and policy capacity limits return SG_ERR_INVALID;
+ * allocation failures return SG_ERR_MEMORY without changing the policy. */
 sg_error_t sg_gate_add_rule(sg_gate_t *gate, const char *pattern);
 sg_error_t sg_gate_remove_rule(sg_gate_t *gate, const char *pattern);
 uint32_t sg_gate_rule_count(const sg_gate_t *gate);
@@ -524,6 +535,10 @@ uint32_t sg_gate_deny_rule_count(const sg_gate_t *gate);
  *   and `violation_truncated` to identify the truncated result category.
  *   Coverage truncation leaves the verdict SG_VERDICT_UNDETERMINED rather than
  *   authorizing the evaluated prefix.
+ *
+ * Early-stop modes preserve their prefix verdict. When parsed subcommands
+ * remain unevaluated, `short_circuited` is true; callers authorizing the whole
+ * input must require it to be false.
  */
 sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len, char *buf,
                    size_t buf_size, sg_result_t *out);

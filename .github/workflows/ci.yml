@@ -124,10 +124,12 @@ jobs:
           -DSHELLCLAVE_ENABLE_COVERAGE=ON
       - run: cmake --build build --parallel 2
       - run: ctest --test-dir build -R '^shelltype_' --output-on-failure
+      - run: ctest --test-dir build -L shellgate --output-on-failure
       - name: Produce Shelltype coverage reports
         run: >-
           gcovr --root . --filter shelltype/src --print-summary
           --gcov-ignore-parse-errors=negative_hits.warn_once_per_file
+          --gcov-ignore-parse-errors=suspicious_hits.warn_once_per_file
           --fail-under-line 89 --fail-under-branch 79
           --txt=coverage.txt --xml-pretty --xml=coverage.xml
       - uses: actions/upload-artifact@v4
@@ -136,3 +138,18 @@ jobs:
           path: |
             coverage.txt
             coverage.xml
+      - name: Produce Shellgate coverage reports
+        run: >-
+          gcovr --root . --filter shellgate/src --print-summary
+          --merge-mode-functions=merge-use-line-min
+          --gcov-ignore-parse-errors=negative_hits.warn_once_per_file
+          --gcov-ignore-parse-errors=suspicious_hits.warn_once_per_file
+          --fail-under-line 90 --fail-under-branch 73
+          --txt=shellgate-coverage.txt --xml-pretty
+          --xml=shellgate-coverage.xml
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shellgate-coverage
+          path: |
+            shellgate-coverage.txt
+            shellgate-coverage.xml

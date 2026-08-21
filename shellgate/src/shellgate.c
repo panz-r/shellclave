@@ -6,6 +6,8 @@
 
 #include "shellgate.h"
 #include "sg_anomaly.h"
+#include "sg_anomaly_internal.h"
+#include "sg_io.h"
 #include "shell_abstract.h"
 #include "shell_depgraph.h"
 #include "shell_tokenizer.h"
@@ -16,6 +18,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#define XXH_STATIC_LINKING_ONLY
+#include "sg_alloc.h"
+#include <xxhash.h>
 
 #define CDF_NUM_BUCKETS 128
 #define CDF_MAX_SCORE 50.0
@@ -608,14 +613,13 @@ sg_error_t sg_gate_set_anomaly_cache_size(sg_gate_t *gate, size_t cache_size) {
     return SG_OK;
   }
 
-  /* Free old cache before allocating new (avoids leak if allocation fails) */
-  type_cache_free(&gate->anomaly_type_cache);
-
-  /* Allocate new entries array */
   lru_entry_t *new_entries = calloc(cache_size, sizeof(lru_entry_t));
   if (!new_entries)
     return SG_ERR_MEMORY;
 
+  /* Install only after allocation succeeds so failure preserves the existing
+   * cache and its observable hit behavior. */
+  type_cache_free(&gate->anomaly_type_cache);
   gate->anomaly_type_cache.entries = new_entries;
   gate->anomaly_type_cache.capacity = cache_size;
   gate->anomaly_type_cache.count = 0;
@@ -698,89 +702,221 @@ sg_error_t sg_gate_set_anomaly_combine_mode(sg_gate_t *gate,
   return SG_OK;
 }
 
+#define SG_BUNDLE_HEADER_SIZE 32U
+static const unsigned char sg_bundle_magic[8] = {'S', 'G', 'A', 'B',
+                                                 'N', 'D', 'L', '1'};
+
+static void store_u64_le(unsigned char *dst, uint64_t value) {
+  for (unsigned i = 0; i < 8; i++)
+    dst[i] = (unsigned char)(value >> (i * 8));
+}
+
+static uint64_t load_u64_le(const unsigned char *src) {
+  uint64_t value = 0;
+  for (unsigned i = 0; i < 8; i++)
+    value |= (uint64_t)src[i] << (i * 8);
+  return value;
+}
+
+static sg_error_t errno_to_gate_error(void) {
+  return errno == ENOMEM ? SG_ERR_MEMORY : SG_ERR_IO;
+}
+
+static int stream_size(FILE *stream, uint64_t *size) {
+  if (fseek(stream, 0, SEEK_END) != 0)
+    return -1;
+  long end = ftell(stream);
+  if (end < 0)
+    return -1;
+  *size = (uint64_t)end;
+  return fseek(stream, 0, SEEK_SET);
+}
+
+static int copy_stream(FILE *from, FILE *to, uint64_t count,
+                       XXH3_state_t *hash) {
+  unsigned char buffer[16384];
+  while (count > 0) {
+    size_t chunk = count < sizeof(buffer) ? (size_t)count : sizeof(buffer);
+    if (fread(buffer, 1, chunk, from) != chunk ||
+        (to && fwrite(buffer, 1, chunk, to) != chunk) ||
+        (hash && XXH3_64bits_update(hash, buffer, chunk) == XXH_ERROR))
+      return -1;
+    count -= chunk;
+  }
+  return 0;
+}
+
 sg_error_t sg_gate_save_anomaly_model(const sg_gate_t *gate, const char *path) {
-  if (!gate || !path)
+  if (!gate || !path || !gate->anomaly_enabled || !gate->anomaly_model ||
+      !gate->anomaly_model_type)
     return SG_ERR_INVALID;
-  if (!gate->anomaly_enabled || !gate->anomaly_model)
-    return SG_ERR_INVALID;
-  if (sg_anomaly_save(gate->anomaly_model, path) != 0)
+
+  FILE *raw = tmpfile();
+  FILE *type = tmpfile();
+  if (!raw || !type) {
+    if (raw)
+      fclose(raw);
+    if (type)
+      fclose(type);
+    return errno_to_gate_error();
+  }
+  errno = 0;
+  uint64_t raw_size = 0, type_size = 0;
+  if (sg_anomaly_write_stream(gate->anomaly_model, raw) != 0 ||
+      sg_anomaly_write_stream(gate->anomaly_model_type, type) != 0 ||
+      stream_size(raw, &raw_size) != 0 || stream_size(type, &type_size) != 0 ||
+      raw_size > UINT64_MAX - type_size) {
+    sg_error_t error = errno_to_gate_error();
+    fclose(raw);
+    fclose(type);
+    return error;
+  }
+
+  sg_atomic_output_t output;
+  sg_atomic_output_result_t begin = sg_atomic_output_begin(path, &output);
+  if (begin != SG_ATOMIC_OUTPUT_OK) {
+    fclose(raw);
+    fclose(type);
+    return begin == SG_ATOMIC_OUTPUT_MEMORY ? SG_ERR_MEMORY : SG_ERR_IO;
+  }
+
+  XXH3_state_t *hash = XXH3_createState();
+  if (!hash) {
+    sg_atomic_output_discard(&output);
+    fclose(raw);
+    fclose(type);
+    return SG_ERR_MEMORY;
+  }
+  XXH3_64bits_reset(hash);
+  unsigned char header[SG_BUNDLE_HEADER_SIZE] = {0};
+  memcpy(header, sg_bundle_magic, sizeof(sg_bundle_magic));
+  store_u64_le(header + 8, raw_size);
+  store_u64_le(header + 16, type_size);
+  int failed =
+      fwrite(header, 1, sizeof(header), output.stream) != sizeof(header) ||
+      copy_stream(raw, output.stream, raw_size, hash) != 0 ||
+      copy_stream(type, output.stream, type_size, hash) != 0;
+  if (!failed) {
+    store_u64_le(header + 24, XXH3_64bits_digest(hash));
+    failed = fseek(output.stream, 0, SEEK_SET) != 0 ||
+             fwrite(header, 1, sizeof(header), output.stream) != sizeof(header);
+  }
+  XXH3_freeState(hash);
+  fclose(raw);
+  fclose(type);
+  if (failed || sg_atomic_output_commit(&output) != 0) {
+    if (output.temporary_path)
+      sg_atomic_output_discard(&output);
     return SG_ERR_IO;
-  /* Save type model to {path}_type */
-  if (gate->anomaly_model_type) {
-    size_t plen = strlen(path);
-    char *type_path = malloc(plen + 6); /* "_type" + NUL */
-    if (!type_path)
-      return SG_ERR_MEMORY;
-    memcpy(type_path, path, plen);
-    memcpy(type_path + plen, "_type", 5);
-    type_path[plen + 5] = '\0';
-    int rc = sg_anomaly_save(gate->anomaly_model_type, type_path);
-    free(type_path);
-    if (rc != 0)
-      return SG_ERR_IO;
   }
   return SG_OK;
 }
 
 sg_error_t sg_gate_load_anomaly_model(sg_gate_t *gate, const char *path) {
-  if (!gate || !path)
-    return SG_ERR_INVALID;
-  if (!gate->anomaly_enabled || !gate->anomaly_model)
+  if (!gate || !path || !gate->anomaly_enabled || !gate->anomaly_model ||
+      !gate->anomaly_model_type)
     return SG_ERR_INVALID;
 
-  sg_anomaly_model_t *loaded_raw = sg_anomaly_model_new();
-  if (!loaded_raw)
+  FILE *bundle = fopen(path, "rb");
+  if (!bundle)
+    return errno_to_gate_error();
+  unsigned char header[SG_BUNDLE_HEADER_SIZE];
+  if (fread(header, 1, sizeof(header), bundle) != sizeof(header)) {
+    bool io_error = ferror(bundle) != 0;
+    fclose(bundle);
+    return io_error ? SG_ERR_IO : SG_ERR_PARSE;
+  }
+  uint64_t raw_size = load_u64_le(header + 8);
+  uint64_t type_size = load_u64_le(header + 16);
+  uint64_t expected_hash = load_u64_le(header + 24);
+  uint64_t file_size = 0;
+  if (memcmp(header, sg_bundle_magic, sizeof(sg_bundle_magic)) != 0 ||
+      raw_size == 0 || type_size == 0 || raw_size > UINT64_MAX - type_size ||
+      raw_size + type_size > UINT64_MAX - SG_BUNDLE_HEADER_SIZE ||
+      stream_size(bundle, &file_size) != 0) {
+    fclose(bundle);
+    return SG_ERR_PARSE;
+  }
+  if (file_size != SG_BUNDLE_HEADER_SIZE + raw_size + type_size ||
+      fseek(bundle, SG_BUNDLE_HEADER_SIZE, SEEK_SET) != 0) {
+    fclose(bundle);
+    return SG_ERR_PARSE;
+  }
+
+  XXH3_state_t *hash = XXH3_createState();
+  if (!hash) {
+    fclose(bundle);
     return SG_ERR_MEMORY;
-  if (sg_anomaly_load(loaded_raw, path) != 0) {
-    sg_anomaly_model_free(loaded_raw);
+  }
+  XXH3_64bits_reset(hash);
+  int hash_failed = copy_stream(bundle, NULL, raw_size + type_size, hash) != 0;
+  uint64_t actual_hash = XXH3_64bits_digest(hash);
+  XXH3_freeState(hash);
+  if (hash_failed || actual_hash != expected_hash ||
+      fseek(bundle, SG_BUNDLE_HEADER_SIZE, SEEK_SET) != 0) {
+    fclose(bundle);
+    return hash_failed ? SG_ERR_IO : SG_ERR_PARSE;
+  }
+
+  FILE *raw = tmpfile();
+  FILE *type = tmpfile();
+  if (!raw || !type) {
+    if (raw)
+      fclose(raw);
+    if (type)
+      fclose(type);
+    fclose(bundle);
+    return errno_to_gate_error();
+  }
+  int copy_failed = copy_stream(bundle, raw, raw_size, NULL) != 0 ||
+                    copy_stream(bundle, type, type_size, NULL) != 0 ||
+                    fseek(raw, 0, SEEK_SET) != 0 ||
+                    fseek(type, 0, SEEK_SET) != 0;
+  fclose(bundle);
+  if (copy_failed) {
+    fclose(raw);
+    fclose(type);
     return SG_ERR_IO;
   }
 
-  sg_anomaly_model_t *loaded_type = NULL;
-  /* Load type model from {path}_type if it exists */
-  if (gate->anomaly_model_type) {
-    size_t plen = strlen(path);
-    char *type_path = malloc(plen + 6);
-    if (!type_path) {
-      sg_anomaly_model_free(loaded_raw);
+  sg_anomaly_model_t *loaded_raw = sg_anomaly_model_new();
+  sg_anomaly_model_t *loaded_type = sg_anomaly_model_new();
+  if (!loaded_raw || !loaded_type) {
+    sg_anomaly_model_free(loaded_raw);
+    sg_anomaly_model_free(loaded_type);
+    fclose(raw);
+    fclose(type);
+    return SG_ERR_MEMORY;
+  }
+  errno = 0;
+  int raw_result = sg_anomaly_read_stream(loaded_raw, raw);
+  int raw_errno = errno;
+  errno = 0;
+  int type_result = sg_anomaly_read_stream(loaded_type, type);
+  int type_errno = errno;
+  fclose(raw);
+  fclose(type);
+  if (raw_result != 0 || type_result != 0) {
+    sg_anomaly_model_free(loaded_raw);
+    sg_anomaly_model_free(loaded_type);
+    if (raw_errno == ENOMEM || type_errno == ENOMEM)
       return SG_ERR_MEMORY;
-    }
-    memcpy(type_path, path, plen);
-    memcpy(type_path + plen, "_type", 5);
-    type_path[plen + 5] = '\0';
-    /* Graceful: if type file doesn't exist, that's OK */
-    FILE *f = fopen(type_path, "rb");
-    if (f) {
-      fclose(f);
-      loaded_type = sg_anomaly_model_new();
-      if (!loaded_type) {
-        free(type_path);
-        sg_anomaly_model_free(loaded_raw);
-        return SG_ERR_MEMORY;
-      }
-      if (sg_anomaly_load(loaded_type, type_path) != 0) {
-        free(type_path);
-        sg_anomaly_model_free(loaded_type);
-        sg_anomaly_model_free(loaded_raw);
-        return SG_ERR_IO;
-      }
-    }
-    free(type_path);
+    return SG_ERR_PARSE;
   }
 
   sg_anomaly_model_free(gate->anomaly_model);
+  sg_anomaly_model_free(gate->anomaly_model_type);
   gate->anomaly_model = loaded_raw;
-  if (loaded_type) {
-    sg_anomaly_model_free(gate->anomaly_model_type);
-    gate->anomaly_model_type = loaded_type;
-  }
+  gate->anomaly_model_type = loaded_type;
+  type_cache_clear(&gate->anomaly_type_cache);
   return SG_OK;
 }
 
 bool sg_gate_anomaly_had_error(const sg_gate_t *gate) {
   if (!gate || !gate->anomaly_model)
     return false;
-  return sg_anomaly_model_had_error(gate->anomaly_model);
+  return sg_anomaly_model_had_error(gate->anomaly_model) ||
+         sg_anomaly_model_had_error(gate->anomaly_model_type);
 }
 
 size_t sg_gate_anomaly_vocab_size(const sg_gate_t *gate) {
@@ -907,40 +1043,63 @@ size_t sg_gate_suggestion_token_variants_at(sg_gate_t *gate,
 
 /* --- POLICY MANAGEMENT --- */
 
+static sg_error_t policy_mutation_error(st_error_t error) {
+  switch (error) {
+  case ST_OK:
+    return SG_OK;
+  case ST_ERR_MEMORY:
+    return SG_ERR_MEMORY;
+  case ST_ERR_IO:
+    return SG_ERR_IO;
+  case ST_ERR_INVALID:
+  case ST_ERR_FAILED:
+  case ST_ERR_FORMAT:
+  case ST_ERR_LIMIT:
+    return SG_ERR_INVALID;
+  }
+  return SG_ERR_INVALID;
+}
+
+static sg_error_t policy_load_error(st_error_t error) {
+  switch (error) {
+  case ST_OK:
+    return SG_OK;
+  case ST_ERR_MEMORY:
+    return SG_ERR_MEMORY;
+  case ST_ERR_IO:
+    return SG_ERR_IO;
+  case ST_ERR_INVALID:
+  case ST_ERR_FAILED:
+  case ST_ERR_FORMAT:
+  case ST_ERR_LIMIT:
+    return SG_ERR_PARSE;
+  }
+  return SG_ERR_PARSE;
+}
+
 sg_error_t sg_gate_load_policy(sg_gate_t *gate, const char *path) {
   if (!gate || !path)
     return SG_ERR_INVALID;
-  st_error_t err = st_policy_load(gate->policy, path, /*clear_first=*/false);
-  if (err != ST_OK)
-    return SG_ERR_INVALID;
-  return SG_OK;
+  return policy_load_error(
+      st_policy_load(gate->policy, path, /*clear_first=*/false));
 }
 
 sg_error_t sg_gate_save_policy(const sg_gate_t *gate, const char *path) {
   if (!gate || !path)
     return SG_ERR_INVALID;
-  st_error_t err = st_policy_save(gate->policy, path);
-  if (err != ST_OK)
-    return SG_ERR_INVALID;
-  return SG_OK;
+  return policy_mutation_error(st_policy_save(gate->policy, path));
 }
 
 sg_error_t sg_gate_add_rule(sg_gate_t *gate, const char *pattern) {
   if (!gate || !pattern)
     return SG_ERR_INVALID;
-  st_error_t err = st_policy_add(gate->policy, pattern);
-  if (err != ST_OK)
-    return SG_ERR_INVALID;
-  return SG_OK;
+  return policy_mutation_error(st_policy_add(gate->policy, pattern));
 }
 
 sg_error_t sg_gate_remove_rule(sg_gate_t *gate, const char *pattern) {
   if (!gate || !pattern)
     return SG_ERR_INVALID;
-  st_error_t err = st_policy_remove(gate->policy, pattern);
-  if (err != ST_OK)
-    return SG_ERR_INVALID;
-  return SG_OK;
+  return policy_mutation_error(st_policy_remove(gate->policy, pattern));
 }
 
 uint32_t sg_gate_rule_count(const sg_gate_t *gate) {
@@ -952,19 +1111,13 @@ uint32_t sg_gate_rule_count(const sg_gate_t *gate) {
 sg_error_t sg_gate_add_deny_rule(sg_gate_t *gate, const char *pattern) {
   if (!gate || !pattern)
     return SG_ERR_INVALID;
-  st_error_t err = st_policy_add(gate->deny_policy, pattern);
-  if (err != ST_OK)
-    return SG_ERR_INVALID;
-  return SG_OK;
+  return policy_mutation_error(st_policy_add(gate->deny_policy, pattern));
 }
 
 sg_error_t sg_gate_remove_deny_rule(sg_gate_t *gate, const char *pattern) {
   if (!gate || !pattern)
     return SG_ERR_INVALID;
-  st_error_t err = st_policy_remove(gate->deny_policy, pattern);
-  if (err != ST_OK)
-    return SG_ERR_INVALID;
-  return SG_OK;
+  return policy_mutation_error(st_policy_remove(gate->deny_policy, pattern));
 }
 
 uint32_t sg_gate_deny_rule_count(const sg_gate_t *gate) {
@@ -1459,14 +1612,10 @@ static bool has_control_flow_path(const shell_dep_graph_t *g, uint32_t from,
                                   uint32_t to) {
   if (from == to)
     return true;
-  bool *visited = calloc(g->node_count, sizeof(bool));
-  if (!visited)
+  if (g->node_count > SHELL_DEP_MAX_NODES)
     return false;
-  uint32_t *stack = malloc(g->node_count * sizeof(uint32_t));
-  if (!stack) {
-    free(visited);
-    return false;
-  }
+  bool visited[SHELL_DEP_MAX_NODES] = {false};
+  uint32_t stack[SHELL_DEP_MAX_NODES];
 
   size_t sp = 0;
   stack[sp++] = from;
@@ -1474,11 +1623,8 @@ static bool has_control_flow_path(const shell_dep_graph_t *g, uint32_t from,
 
   while (sp > 0) {
     uint32_t cur = stack[--sp];
-    if (cur == to) {
-      free(visited);
-      free(stack);
+    if (cur == to)
       return true;
-    }
     for (uint32_t i = 0; i < g->edge_count; i++) {
       const shell_dep_edge_t *e = &g->edges[i];
       if (e->from != cur)
@@ -1492,8 +1638,6 @@ static bool has_control_flow_path(const shell_dep_graph_t *g, uint32_t from,
       }
     }
   }
-  free(visited);
-  free(stack);
   return false;
 }
 
@@ -2248,6 +2392,11 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len, char *buf,
     out->subcmd_count = 1;
     out->subcmds[0].verdict = SG_VERDICT_REJECT;
     out->subcmds[0].reject_reason = out->deny_reason;
+    if (bw.overflow) {
+      out->truncated = true;
+      out->verdict = SG_VERDICT_UNDETERMINED;
+      return SG_ERR_TRUNC;
+    }
     return SG_ERR_PARSE;
   }
   if (ferr == SHELL_EPARSE) {
@@ -2256,6 +2405,11 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len, char *buf,
     out->subcmd_count = 1;
     out->subcmds[0].verdict = SG_VERDICT_REJECT;
     out->subcmds[0].reject_reason = out->deny_reason;
+    if (bw.overflow) {
+      out->truncated = true;
+      out->verdict = SG_VERDICT_UNDETERMINED;
+      return SG_ERR_TRUNC;
+    }
     return SG_ERR_PARSE;
   }
 
@@ -2268,6 +2422,11 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len, char *buf,
     out->subcmd_count = 1;
     out->subcmds[0].verdict = SG_VERDICT_REJECT;
     out->subcmds[0].reject_reason = out->deny_reason;
+    if (bw.overflow) {
+      out->truncated = true;
+      out->verdict = SG_VERDICT_UNDETERMINED;
+      return SG_ERR_TRUNC;
+    }
     return SG_OK;
   }
 
@@ -2283,6 +2442,11 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len, char *buf,
     out->subcmd_count = 1;
     out->subcmds[0].verdict = SG_VERDICT_REJECT;
     out->subcmds[0].reject_reason = out->deny_reason;
+    if (bw.overflow) {
+      out->truncated = true;
+      out->verdict = SG_VERDICT_UNDETERMINED;
+      return SG_ERR_TRUNC;
+    }
     return SG_ERR_PARSE;
   }
 
@@ -2340,6 +2504,11 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len, char *buf,
         type_cache_lookup(&gate->anomaly_type_cache, cmd, cmd_len);
     if (cached) {
       type_seq_buf = strdup(cached);
+      /* Cache storage is only an optimization. If copying a hit fails, retry
+       * the authoritative builder instead of silently dropping the type
+       * anomaly signal. */
+      if (!type_seq_buf)
+        type_seq_buf = shell_build_type_sequence(cmd);
     } else {
       char *raw = shell_build_type_sequence(cmd);
       if (raw) {
@@ -2433,6 +2602,8 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len, char *buf,
    * parser. Preserve the fast parser's truncation signal so a complete-looking
    * 64-entry result can never be mistaken for evaluation of the whole input. */
   bool subcmd_truncated = parse_truncated || depgraph_truncated;
+  bool stopped_early = false;
+  sg_error_t evaluation_error = SG_OK;
   uint32_t node_result_index[SHELL_DEP_MAX_NODES];
   for (uint32_t i = 0; i < SHELL_DEP_MAX_NODES; i++)
     node_result_index[i] = UINT32_MAX;
@@ -2477,6 +2648,8 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len, char *buf,
       sr->matches = false;
       sr->verdict = SG_VERDICT_UNDETERMINED;
       sr->reject_reason = bw_copy(&bw, "deny policy evaluation failed", 29);
+      evaluation_error =
+          deny_err == ST_ERR_MEMORY ? SG_ERR_MEMORY : SG_ERR_PARSE;
     } else if (deny_eval.matches) {
       sr->matches = true;
       sr->verdict = SG_VERDICT_DENY;
@@ -2488,6 +2661,8 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len, char *buf,
       if (eval_err != ST_OK) {
         sr->matches = false;
         sr->verdict = SG_VERDICT_UNDETERMINED;
+        evaluation_error =
+            eval_err == ST_ERR_MEMORY ? SG_ERR_MEMORY : SG_ERR_PARSE;
       } else if (eval.matches) {
         sr->matches = true;
         sr->verdict = SG_VERDICT_ALLOW;
@@ -2564,16 +2739,27 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len, char *buf,
       }
     }
 
-    if (!sr->matches && gate->stop_mode == SG_STOP_FIRST_FAIL)
+    if (!sr->matches && gate->stop_mode == SG_STOP_FIRST_FAIL) {
+      stopped_early = true;
       break;
-    if (sr->matches && gate->stop_mode == SG_STOP_FIRST_PASS)
+    }
+    if (sr->matches && gate->stop_mode == SG_STOP_FIRST_PASS) {
+      stopped_early = true;
       break;
+    }
     if (sr->verdict == SG_VERDICT_ALLOW &&
-        gate->stop_mode == SG_STOP_FIRST_ALLOW)
+        gate->stop_mode == SG_STOP_FIRST_ALLOW) {
+      stopped_early = true;
       break;
-    if (sr->verdict == SG_VERDICT_DENY && gate->stop_mode == SG_STOP_FIRST_DENY)
+    }
+    if (sr->verdict == SG_VERDICT_DENY &&
+        gate->stop_mode == SG_STOP_FIRST_DENY) {
+      stopped_early = true;
       break;
+    }
   }
+
+  out->short_circuited = stopped_early && out->subcmd_count < cmd_count;
 
   /* Substitution edges describe a dependency from the nested command to its
    * containing command.  Resolve result-array indices after all commands have
@@ -2598,6 +2784,13 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len, char *buf,
 
   out->truncated = bw.overflow || subcmd_truncated;
   out->subcmd_truncated = subcmd_truncated;
+  if (subcmd_truncated) {
+    /* The retained prefix cannot authorize a command composition whose tail
+     * was not evaluated. Partial subcommand details remain available. */
+    out->verdict = SG_VERDICT_UNDETERMINED;
+    free(type_seq_buf);
+    return SG_ERR_TRUNC;
+  }
   if (out->subcmd_count == 0) {
     /* Truncation that leaves no subcommands means nothing was evaluated at all.
      * Reporting ALLOW/SG_OK would fail open on input the gate never inspected,
@@ -2638,6 +2831,12 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len, char *buf,
   else
     out->verdict = SG_VERDICT_UNDETERMINED;
 
+  if (evaluation_error != SG_OK) {
+    out->verdict = SG_VERDICT_UNDETERMINED;
+    free(type_seq_buf);
+    return evaluation_error;
+  }
+
   /* Deferred anomaly model update — after verdict is known */
   if (gate->anomaly_enabled && gate->anomaly_model && cmd_count > 0) {
     bool should_update = false;
@@ -2677,7 +2876,7 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len, char *buf,
   /* Free type sequence buffer */
   free(type_seq_buf);
 
-  return (bw.overflow || subcmd_truncated) ? SG_ERR_TRUNC : SG_OK;
+  return bw.overflow ? SG_ERR_TRUNC : SG_OK;
 }
 
 /* --- HELPERS --- */

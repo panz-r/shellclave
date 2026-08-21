@@ -9,6 +9,15 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
+The component redirect is also directly configurable. Its top-level CTest
+file discovers the same Shellgate tests:
+
+```sh
+cmake -S shellgate -B build-shellgate -DSHELLCLAVE_BUILD_TOOLS=OFF
+cmake --build build-shellgate
+ctest --test-dir build-shellgate -L shellgate --output-on-failure
+```
+
 Build and run the Shellgate fuzz smoke target with Clang and libFuzzer:
 
 ```sh
