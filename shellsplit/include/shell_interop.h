@@ -38,6 +38,7 @@ void shell_interop_destroy(shell_interop_handle_t *handle);
  *   SHELL_FEAT_CASE          = 0x200 // case/esac
  *   SHELL_FEAT_SUBSHELL_FILE = 0x400 // $(<file)
  *   SHELL_FEAT_PIPELINE       = 0x800 // literal | pipeline construct
+ *   SHELL_FEAT_GROUP          = 0x1000 // parenthesized command group
  *
  * Command types (upper bits of type) describe the operator or structural
  * marker associated with one subcommand. The outer separator takes precedence
@@ -51,6 +52,7 @@ void shell_interop_destroy(shell_interop_handle_t *handle);
  *   SHELL_TYPE_HEREDOC    = 0x1000 // Starts with <<
  *   SHELL_TYPE_HERESTRING = 0x2000 // Starts with <<<
  *   SHELL_TYPE_SUBSTITUTION = 0x4000 // Command/process substitution operator
+ *   SHELL_TYPE_BACKGROUND = 0x8000 // Background command separator (&)
  *
  * `cmd` points to exactly `cmd_len` bytes and need not be null-terminated.
  * Embedded NUL bytes are rejected because they are not valid shell input.

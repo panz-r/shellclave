@@ -20,13 +20,14 @@
 /* --- NAME HELPERS --- */
 
 static const char *dep_edge_names[] = {
-    "READ",  "WRITE", "APPEND", "PIPE", "ARG", "ENV",
-    "SUBST", "SEQ",   "AND",    "OR",   "CWD",
+    "READ", "WRITE", "APPEND", "PIPE", "ARG",        "ENV",   "SUBST",
+    "SEQ",  "AND",   "OR",     "CWD",  "BACKGROUND", "GROUP",
 };
 
 static const char *dep_node_names[] = {
     "CMD",
     "DOC",
+    "GROUP",
 };
 
 static const char *dep_doc_names[] = {
@@ -188,6 +189,18 @@ typedef struct {
   uint32_t count;
 } dep_token_list_t;
 
+/* A delimiter is escaped only when preceded by an odd-length run of
+ * backslashes. The scanner and extractor must agree on this rule or an even
+ * run can make a real closing delimiter look like ordinary data. */
+static bool dep_char_escaped(const char *text, uint32_t pos) {
+  uint32_t backslashes = 0;
+  while (pos > 0 && text[pos - 1] == '\\') {
+    backslashes++;
+    pos--;
+  }
+  return (backslashes & 1u) != 0;
+}
+
 static uint32_t scan_redirect_token(const char *cmd, uint32_t pos,
                                     uint32_t end) {
   uint32_t cursor = pos;
@@ -215,6 +228,7 @@ static bool scan_tokens(const char *cmd, uint32_t range_start,
   out->count = 0;
   uint32_t pos = range_start;
   uint32_t end = range_start + range_len;
+  bool process_sub_target = false;
 
   while (pos < end && out->count < SHELL_DEP_MAX_TOKENS) {
     while (pos < end && isspace((unsigned char)cmd[pos]))
@@ -227,13 +241,38 @@ static bool scan_tokens(const char *cmd, uint32_t range_start,
 
     if (redirect_end != pos) {
       pos = redirect_end;
+      process_sub_target = pos < end && cmd[pos] == '(';
+    } else if (process_sub_target && cmd[pos] == '(') {
+      int depth = 1;
+      bool in_quote = false;
+      char quote_char = 0;
+      process_sub_target = false;
+      pos++;
+      while (pos < end && depth > 0) {
+        if (!in_quote) {
+          if ((cmd[pos] == '\'' || cmd[pos] == '"') &&
+              !dep_char_escaped(cmd, pos)) {
+            in_quote = true;
+            quote_char = cmd[pos];
+          } else if (cmd[pos] == '(' && !dep_char_escaped(cmd, pos)) {
+            depth++;
+          } else if (cmd[pos] == ')' && !dep_char_escaped(cmd, pos)) {
+            depth--;
+          }
+        } else if (cmd[pos] == quote_char && !dep_char_escaped(cmd, pos)) {
+          in_quote = false;
+        }
+        pos++;
+      }
     } else if (cmd[pos] == '\'') {
+      process_sub_target = false;
       pos++;
       while (pos < end && cmd[pos] != '\'')
         pos++;
       if (pos < end)
         pos++;
     } else if (cmd[pos] == '"') {
+      process_sub_target = false;
       pos++;
       while (pos < end && cmd[pos] != '"') {
         if (cmd[pos] == '\\' && pos + 1 < end)
@@ -243,8 +282,10 @@ static bool scan_tokens(const char *cmd, uint32_t range_start,
       if (pos < end)
         pos++;
     } else if (cmd[pos] == '\\' && pos + 1 < end) {
+      process_sub_target = false;
       pos += 2;
     } else {
+      process_sub_target = false;
       while (pos < end) {
         char c = cmd[pos];
         if (isspace((unsigned char)c))
@@ -256,19 +297,19 @@ static bool scan_tokens(const char *cmd, uint32_t range_start,
           char quote_char = 0;
           while (pos < end && depth > 0) {
             if (!in_quote) {
-              if (cmd[pos] == '"' || cmd[pos] == '\'') {
+              if ((cmd[pos] == '"' || cmd[pos] == '\'') &&
+                  !dep_char_escaped(cmd, pos)) {
                 in_quote = true;
                 quote_char = cmd[pos];
-              } else if (cmd[pos] == '(') {
+              } else if (cmd[pos] == '(' && !dep_char_escaped(cmd, pos)) {
                 depth++;
-              } else if (cmd[pos] == ')') {
+              } else if (cmd[pos] == ')' && !dep_char_escaped(cmd, pos)) {
                 depth--;
                 if (depth == 0)
                   break;
               }
             } else {
-              if (cmd[pos] == quote_char &&
-                  !(pos > 0 && cmd[pos - 1] == '\\')) {
+              if (cmd[pos] == quote_char && !dep_char_escaped(cmd, pos)) {
                 in_quote = false;
               }
             }
@@ -284,16 +325,16 @@ static bool scan_tokens(const char *cmd, uint32_t range_start,
           char quote_char = 0;
           while (pos < end) {
             if (!in_quote) {
-              if (cmd[pos] == '"' || cmd[pos] == '\'') {
+              if ((cmd[pos] == '"' || cmd[pos] == '\'') &&
+                  !dep_char_escaped(cmd, pos)) {
                 in_quote = true;
                 quote_char = cmd[pos];
-              } else if (cmd[pos] == '`') {
+              } else if (cmd[pos] == '`' && !dep_char_escaped(cmd, pos)) {
                 pos++;
                 break;
               }
             } else {
-              if (cmd[pos] == quote_char &&
-                  !(pos > 0 && cmd[pos - 1] == '\\')) {
+              if (cmd[pos] == quote_char && !dep_char_escaped(cmd, pos)) {
                 in_quote = false;
               }
             }
@@ -377,7 +418,19 @@ static dep_redirect_t classify_redirect(const dep_token_t *tok) {
   return DEP_REDIRECT_NONE;
 }
 
-static bool find_subshell(const dep_token_t *tok, dep_token_t *subshell) {
+static const char *extract_subshell_content(const dep_token_t *tok,
+                                            uint32_t *out_len);
+
+/* Return the next executable substitution at or after min_offset.  A token
+ * may contain several adjacent or embedded substitutions (for example
+ * "$(one)$(two)").  The old single-result helper silently dropped every
+ * substitution after the first one.  Rescanning from the token start keeps
+ * quote state correct while skipping complete substitutions, including their
+ * nested contents. */
+static bool find_subshell_at_or_after(const dep_token_t *tok,
+                                      uint32_t min_offset,
+                                      dep_token_t *subshell,
+                                      uint32_t *span_len) {
   bool in_single_quote = false;
   bool in_double_quote = false;
   for (uint32_t i = 0; i < tok->len; i++) {
@@ -398,12 +451,33 @@ static bool find_subshell(const dep_token_t *tok, dep_token_t *subshell) {
     if ((tok->start[i] == '`') ||
         ((tok->start[i] == '$' || tok->start[i] == '<' ||
           tok->start[i] == '>') &&
-         i + 1 < tok->len && tok->start[i + 1] == '(')) {
-      subshell->start = tok->start + i;
-      subshell->len = tok->len - i;
-      return true;
+         i + 1 < tok->len && tok->start[i + 1] == '(' &&
+         !(tok->start[i] == '$' && i + 2 < tok->len &&
+           tok->start[i + 2] == '('))) {
+      dep_token_t candidate = {tok->start + i, tok->len - i};
+      uint32_t content_len = 0;
+      const char *content = extract_subshell_content(&candidate, &content_len);
+      uint32_t candidate_span = 1;
+      if (content) {
+        candidate_span = (uint32_t)(content - candidate.start) + content_len;
+        if (candidate.start[0] != '`')
+          candidate_span++; /* closing ')' */
+        else
+          candidate_span++; /* closing '`' */
+      }
+      if (i >= min_offset) {
+        subshell->start = candidate.start;
+        subshell->len = candidate_span;
+        *span_len = candidate_span;
+        return true;
+      }
+      /* Skip the whole outer construct so nested substitutions are not
+       * reported as siblings.  Malformed constructs still make progress. */
+      if (candidate_span > 1 && candidate_span <= tok->len - i)
+        i += candidate_span - 1;
     }
   }
+  *span_len = 0;
   return false;
 }
 
@@ -418,17 +492,17 @@ static const char *extract_subshell_content(const dep_token_t *tok,
     char quote_char = 0;
     while (i < tok->len && depth > 0) {
       if (!in_quote) {
-        if (tok->start[i] == '"' || tok->start[i] == '\'') {
+        if ((tok->start[i] == '"' || tok->start[i] == '\'') &&
+            !dep_char_escaped(tok->start, i)) {
           in_quote = true;
           quote_char = tok->start[i];
-        } else if (tok->start[i] == '(') {
+        } else if (tok->start[i] == '(' && !dep_char_escaped(tok->start, i)) {
           depth++;
-        } else if (tok->start[i] == ')') {
+        } else if (tok->start[i] == ')' && !dep_char_escaped(tok->start, i)) {
           depth--;
         }
       } else {
-        if (tok->start[i] == quote_char &&
-            !(i > 0 && tok->start[i - 1] == '\\')) {
+        if (tok->start[i] == quote_char && !dep_char_escaped(tok->start, i)) {
           in_quote = false;
         }
       }
@@ -445,16 +519,16 @@ static const char *extract_subshell_content(const dep_token_t *tok,
     char quote_char = 0;
     while (i < tok->len) {
       if (!in_quote) {
-        if (tok->start[i] == '"' || tok->start[i] == '\'') {
+        if ((tok->start[i] == '"' || tok->start[i] == '\'') &&
+            !dep_char_escaped(tok->start, i)) {
           in_quote = true;
           quote_char = tok->start[i];
-        } else if (tok->start[i] == '`') {
+        } else if (tok->start[i] == '`' && !dep_char_escaped(tok->start, i)) {
           *out_len = i - 1;
           return tok->start + 1;
         }
       } else {
-        if (tok->start[i] == quote_char &&
-            !(i > 0 && tok->start[i - 1] == '\\')) {
+        if (tok->start[i] == quote_char && !dep_char_escaped(tok->start, i)) {
           in_quote = false;
         }
       }
@@ -474,6 +548,115 @@ static bool token_looks_like_path(const dep_token_t *tok) {
   for (uint32_t i = 0; i < tok->len; i++) {
     if (tok->start[i] == '/' || tok->start[i] == '.')
       return true;
+  }
+  return false;
+}
+
+static bool dep_word_is(const char *start, uint32_t length, const char *word) {
+  return strlen(word) == length && memcmp(start, word, length) == 0;
+}
+
+/* The fast parser exposes feature bits for shell control keywords.  The
+ * dependency graph represents parenthesized groups, but it cannot represent
+ * function definitions, brace groups, case clauses, or loop execution scope.
+ * Reject those complete constructs rather than turning their clauses into
+ * independent command nodes and allowing a caller to mistake a partial graph
+ * for a full parse. */
+static bool dep_has_unsupported_structure(const char *cmd, size_t cmd_len) {
+  bool in_single = false;
+  bool in_double = false;
+  bool saw_case = false;
+  bool command_start = true;
+  size_t i = 0;
+  while (i < cmd_len) {
+    char c = cmd[i];
+    if (in_single) {
+      if (c == '\'')
+        in_single = false;
+      i++;
+      continue;
+    }
+    if (in_double) {
+      if (c == '\\' && i + 1 < cmd_len) {
+        i += 2;
+        continue;
+      }
+      if (c == '"')
+        in_double = false;
+      i++;
+      continue;
+    }
+    if (c == '\'') {
+      in_single = true;
+      i++;
+      continue;
+    }
+    if (c == '"') {
+      in_double = true;
+      i++;
+      continue;
+    }
+
+    if (c == '{' || c == '}') {
+      bool before_boundary =
+          i == 0 || isspace((unsigned char)cmd[i - 1]) || cmd[i - 1] == ';';
+      bool after_boundary = i + 1 == cmd_len ||
+                            isspace((unsigned char)cmd[i + 1]) ||
+                            cmd[i + 1] == ';';
+      if (command_start && before_boundary && after_boundary &&
+          !(c == '{' && i > 0 && cmd[i - 1] == '$'))
+        return true;
+    }
+
+    if (c == '(' && i + 1 < cmd_len && cmd[i + 1] == ')' &&
+        !(i > 0 && cmd[i - 1] == '$')) {
+      size_t next = i + 2;
+      while (next < cmd_len && isspace((unsigned char)cmd[next]))
+        next++;
+      if (next < cmd_len && cmd[next] == '{')
+        return true;
+    }
+
+    if (isalpha((unsigned char)c) || c == '_') {
+      size_t start = i++;
+      while (i < cmd_len && (isalnum((unsigned char)cmd[i]) || cmd[i] == '_'))
+        i++;
+      uint32_t length = (uint32_t)(i - start);
+      if (command_start && dep_word_is(cmd + start, length, "function"))
+        return true;
+      if (saw_case && dep_word_is(cmd + start, length, "esac"))
+        return true;
+      if (command_start && dep_word_is(cmd + start, length, "case")) {
+        saw_case = true;
+        command_start = false;
+        continue;
+      }
+      if (saw_case && dep_word_is(cmd + start, length, "in"))
+        return true;
+      if (command_start && dep_word_is(cmd + start, length, "for")) {
+        size_t next = i;
+        while (next < cmd_len && isspace((unsigned char)cmd[next]))
+          next++;
+        if (next + 1 < cmd_len && cmd[next] == '(' && cmd[next + 1] == '(')
+          return true;
+      }
+      command_start = false;
+      continue;
+    }
+    if (c == ';' || c == '\n' || c == '\r' || c == '|') {
+      saw_case = false;
+      command_start = true;
+    }
+    if (c == '&' && i + 1 < cmd_len && cmd[i + 1] == '&') {
+      saw_case = false;
+      command_start = true;
+      i++;
+    } else if (c == '|') {
+      /* A single pipe was handled above; || is handled as one separator. */
+      if (i + 1 < cmd_len && cmd[i + 1] == '|')
+        i++;
+    }
+    i++;
   }
   return false;
 }
@@ -736,6 +919,10 @@ shell_dep_error_t shell_parse_depgraph(const char *cmd, size_t cmd_len,
     out->status = SHELL_DEP_STATUS_ERROR;
     return SHELL_DEP_EPARSE;
   }
+  if (dep_has_unsupported_structure(cmd, cmd_len)) {
+    out->status = SHELL_DEP_STATUS_ERROR;
+    return SHELL_DEP_EPARSE;
+  }
   out->status = fast_result.status;
 
   if (fast_result.count == 0)
@@ -768,6 +955,7 @@ shell_dep_error_t shell_parse_depgraph(const char *cmd, size_t cmd_len,
   init_len = strlen(out->cwd_buf.data);
   out->cwd_buf.len = init_len + 1;
   uint32_t cwd_offset = 0;
+  bool cwd_known = true;
 
   int32_t last_cmd_idx = -1;
 
@@ -839,6 +1027,9 @@ shell_dep_error_t shell_parse_depgraph(const char *cmd, size_t cmd_len,
         shell_dep_node_t *node = &out->nodes[out->node_count++];
         node->type = SHELL_NODE_CMD;
         node->cmd.cwd_offset = cwd_offset;
+        node->cmd.group_depth = range->group_depth;
+        node->cmd.backgrounded = (range->features & SHELL_FEAT_BACKGROUND) != 0;
+        node->cmd.cwd_known = cwd_known;
         node->cmd.token_count = 0;
         if (tokens.count > max_tokens)
           out->status |= SHELL_DEP_STATUS_TRUNCATED;
@@ -885,7 +1076,21 @@ shell_dep_error_t shell_parse_depgraph(const char *cmd, size_t cmd_len,
       } else if (limits->cd_as_cmd)
         out->status |= SHELL_DEP_STATUS_TRUNCATED;
 
-      if (tokens.count >= 2) {
+      bool cwd_isolated = range->group_depth > 0 ||
+                          (range->features & SHELL_FEAT_BACKGROUND) != 0;
+      bool next_conditional = false;
+      if (si + 1 < fast_result.count) {
+        uint16_t next_type = fast_result.cmds[si + 1].type;
+        next_conditional =
+            next_type == SHELL_TYPE_AND || next_type == SHELL_TYPE_OR;
+        cwd_isolated = cwd_isolated || next_type == SHELL_TYPE_PIPELINE ||
+                       next_type == SHELL_TYPE_BACKGROUND ||
+                       next_type == SHELL_TYPE_SUBSTITUTION;
+      }
+      if (range->type == SHELL_TYPE_AND || range->type == SHELL_TYPE_OR)
+        cwd_known = false;
+
+      if (tokens.count >= 2 && !cwd_isolated && cwd_known) {
         dep_token_t arg = tokens.tokens[1];
         char arg_buf[256];
         if (arg.len >= sizeof(arg_buf)) {
@@ -896,10 +1101,12 @@ shell_dep_error_t shell_parse_depgraph(const char *cmd, size_t cmd_len,
           cwd_offset = cwd_resolve_dedup(out, cwd_offset, arg_buf,
                                          effective_cwd_buf_size, &out->status);
         }
-      } else {
+      } else if (!cwd_isolated && cwd_known) {
         cwd_offset = cwd_resolve_dedup(out, cwd_offset, "$HOME",
                                        effective_cwd_buf_size, &out->status);
       }
+      if (next_conditional)
+        cwd_known = false;
       continue;
     }
 
@@ -962,6 +1169,10 @@ shell_dep_error_t shell_parse_depgraph(const char *cmd, size_t cmd_len,
     shell_dep_node_t *node = &out->nodes[out->node_count++];
     node->type = SHELL_NODE_CMD;
     node->cmd.cwd_offset = cwd_offset;
+    node->cmd.group_depth = range->group_depth;
+    node->cmd.backgrounded = (range->features & SHELL_FEAT_BACKGROUND) != 0;
+    node->cmd.cwd_known = cwd_known && range->type != SHELL_TYPE_AND &&
+                          range->type != SHELL_TYPE_OR;
     node->cmd.token_count = 0;
     if (tokens.count > max_tokens)
       out->status |= SHELL_DEP_STATUS_TRUNCATED;
@@ -1050,35 +1261,71 @@ shell_dep_error_t shell_parse_depgraph(const char *cmd, size_t cmd_len,
             shell_dep_error_t sub_err = shell_parse_depgraph(
                 sub_content, sub_len, out->cwd_buf.data + cwd_offset, limits,
                 depth + 1, &sub_graph);
+            if (sub_err == SHELL_DEP_EPARSE || sub_err == SHELL_DEP_EINPUT) {
+              out->node_count = 0;
+              out->edge_count = 0;
+              out->status = SHELL_DEP_STATUS_ERROR;
+              out->cwd_buf.len = 0;
+              return SHELL_DEP_EPARSE;
+            }
             if (sub_err == SHELL_DEP_ETRUNC)
               out->status |= SHELL_DEP_STATUS_TRUNCATED;
             if (sub_err == SHELL_DEP_OK && sub_graph.node_count > 0) {
-              int32_t sub_cmd_idx = -1;
-              for (int32_t si = (int32_t)sub_graph.node_count - 1; si >= 0;
-                   si--)
-                if (sub_graph.nodes[si].type == SHELL_NODE_CMD) {
-                  sub_cmd_idx = si;
-                  break;
-                }
-              uint32_t needed_edges =
-                  sub_graph.edge_count + (sub_cmd_idx >= 0 ? 1u : 0u);
-              if (sub_graph.node_count <= max_nodes - out->node_count &&
-                  needed_edges <= max_edges - out->edge_count) {
+              uint32_t root_count = 0;
+              for (uint32_t si = 0; si < sub_graph.node_count; si++) {
+                if (sub_graph.nodes[si].type != SHELL_NODE_CMD)
+                  continue;
+                bool has_parent = false;
+                for (uint32_t ei = 0; ei < sub_graph.edge_count; ei++)
+                  if (sub_graph.edges[ei].type == SHELL_EDGE_SUBST &&
+                      sub_graph.edges[ei].from == si) {
+                    has_parent = true;
+                    break;
+                  }
+                if (!has_parent)
+                  root_count++;
+              }
+              uint32_t needed_edges = sub_graph.edge_count + root_count;
+              bool fits = sub_graph.node_count <= max_nodes - out->node_count &&
+                          needed_edges <= max_edges - out->edge_count &&
+                          sub_graph.cwd_buf.len <=
+                              effective_cwd_buf_size - out->cwd_buf.len;
+              if (fits) {
+                uint32_t cwd_offset_shift = (uint32_t)out->cwd_buf.len;
+                memcpy(out->cwd_buf.data + out->cwd_buf.len,
+                       sub_graph.cwd_buf.data, sub_graph.cwd_buf.len);
+                out->cwd_buf.len += sub_graph.cwd_buf.len;
                 uint32_t node_offset = out->node_count;
-                for (uint32_t si = 0; si < sub_graph.node_count; si++)
-                  out->nodes[out->node_count++] = sub_graph.nodes[si];
+                for (uint32_t si = 0; si < sub_graph.node_count; si++) {
+                  out->nodes[out->node_count] = sub_graph.nodes[si];
+                  if (out->nodes[out->node_count].type == SHELL_NODE_CMD)
+                    out->nodes[out->node_count].cmd.cwd_offset +=
+                        cwd_offset_shift;
+                  out->node_count++;
+                }
                 for (uint32_t si = 0; si < sub_graph.edge_count; si++) {
                   shell_dep_edge_t *copy = &out->edges[out->edge_count++];
                   *copy = sub_graph.edges[si];
                   copy->from += node_offset;
                   copy->to += node_offset;
                 }
-                if (sub_cmd_idx >= 0) {
-                  shell_dep_edge_t *subst = &out->edges[out->edge_count++];
-                  subst->from = node_offset + (uint32_t)sub_cmd_idx;
-                  subst->to = cmd_node_idx;
-                  subst->type = SHELL_EDGE_SUBST;
-                  subst->dir = SHELL_DIR_FORWARD;
+                for (uint32_t si = 0; si < sub_graph.node_count; si++) {
+                  if (sub_graph.nodes[si].type != SHELL_NODE_CMD)
+                    continue;
+                  bool has_parent = false;
+                  for (uint32_t ei = 0; ei < sub_graph.edge_count; ei++)
+                    if (sub_graph.edges[ei].type == SHELL_EDGE_SUBST &&
+                        sub_graph.edges[ei].from == si) {
+                      has_parent = true;
+                      break;
+                    }
+                  if (!has_parent) {
+                    shell_dep_edge_t *subst = &out->edges[out->edge_count++];
+                    subst->from = node_offset + si;
+                    subst->to = cmd_node_idx;
+                    subst->type = SHELL_EDGE_SUBST;
+                    subst->dir = SHELL_DIR_FORWARD;
+                  }
                 }
               } else {
                 out->status |= SHELL_DEP_STATUS_TRUNCATED;
@@ -1113,8 +1360,13 @@ shell_dep_error_t shell_parse_depgraph(const char *cmd, size_t cmd_len,
         continue;
       }
 
+      uint32_t subshell_offset = 0;
       dep_token_t subshell_token;
-      if (find_subshell(tok, &subshell_token)) {
+      uint32_t subshell_span = 0;
+      bool had_subshell = false;
+      while (find_subshell_at_or_after(tok, subshell_offset, &subshell_token,
+                                       &subshell_span)) {
+        had_subshell = true;
         uint32_t sub_len = 0;
         const char *sub_content =
             extract_subshell_content(&subshell_token, &sub_len);
@@ -1124,18 +1376,31 @@ shell_dep_error_t shell_parse_depgraph(const char *cmd, size_t cmd_len,
           memset(&sub_graph, 0, sizeof(sub_graph));
           shell_dep_error_t sub_err = shell_parse_depgraph(
               sub_content, sub_len, sub_cwd_str, limits, depth + 1, &sub_graph);
+          if (sub_err == SHELL_DEP_EPARSE || sub_err == SHELL_DEP_EINPUT) {
+            out->node_count = 0;
+            out->edge_count = 0;
+            out->status = SHELL_DEP_STATUS_ERROR;
+            out->cwd_buf.len = 0;
+            return SHELL_DEP_EPARSE;
+          }
           if (sub_err == SHELL_DEP_ETRUNC)
             out->status |= SHELL_DEP_STATUS_TRUNCATED;
           if (sub_err == SHELL_DEP_OK && sub_graph.node_count > 0) {
-            int32_t sub_cmd_idx = -1;
-            for (int32_t i = (int32_t)sub_graph.node_count - 1; i >= 0; i--) {
-              if (sub_graph.nodes[i].type == SHELL_NODE_CMD) {
-                sub_cmd_idx = i;
-                break;
-              }
+            uint32_t root_count = 0;
+            for (uint32_t i = 0; i < sub_graph.node_count; i++) {
+              if (sub_graph.nodes[i].type != SHELL_NODE_CMD)
+                continue;
+              bool has_parent = false;
+              for (uint32_t j = 0; j < sub_graph.edge_count; j++)
+                if (sub_graph.edges[j].type == SHELL_EDGE_SUBST &&
+                    sub_graph.edges[j].from == i) {
+                  has_parent = true;
+                  break;
+                }
+              if (!has_parent)
+                root_count++;
             }
-            uint32_t required_edges =
-                sub_graph.edge_count + (sub_cmd_idx >= 0 ? 1u : 0u);
+            uint32_t required_edges = sub_graph.edge_count + root_count;
             bool fits = sub_graph.node_count <= max_nodes - out->node_count &&
                         required_edges <= max_edges - out->edge_count &&
                         sub_graph.cwd_buf.len <=
@@ -1164,18 +1429,36 @@ shell_dep_error_t shell_parse_depgraph(const char *cmd, size_t cmd_len,
                 e->dir = sub_graph.edges[i].dir;
               }
 
-              if (sub_cmd_idx >= 0) {
-                shell_dep_edge_t *se = &out->edges[out->edge_count++];
-                se->from = node_offset + (uint32_t)sub_cmd_idx;
-                se->to = cmd_node_idx;
-                se->type = SHELL_EDGE_SUBST;
-                se->dir = SHELL_DIR_FORWARD;
+              for (uint32_t i = 0; i < sub_graph.node_count; i++) {
+                if (sub_graph.nodes[i].type != SHELL_NODE_CMD)
+                  continue;
+                bool has_parent = false;
+                for (uint32_t j = 0; j < sub_graph.edge_count; j++)
+                  if (sub_graph.edges[j].type == SHELL_EDGE_SUBST &&
+                      sub_graph.edges[j].from == i) {
+                    has_parent = true;
+                    break;
+                  }
+                if (!has_parent) {
+                  shell_dep_edge_t *se = &out->edges[out->edge_count++];
+                  se->from = node_offset + i;
+                  se->to = cmd_node_idx;
+                  se->type = SHELL_EDGE_SUBST;
+                  se->dir = SHELL_DIR_FORWARD;
+                }
               }
             } else
               out->status |= SHELL_DEP_STATUS_TRUNCATED;
           }
         }
 
+        uint32_t relative_start = (uint32_t)(subshell_token.start - tok->start);
+        if (subshell_span == 0 || relative_start > tok->len - subshell_span)
+          break;
+        subshell_offset = relative_start + subshell_span;
+      }
+
+      if (had_subshell) {
         if (node->cmd.token_count < max_tokens) {
           uint32_t idx = node->cmd.token_count++;
           node->cmd.tokens[idx] = tok->start;
@@ -1232,11 +1515,20 @@ shell_dep_error_t shell_parse_depgraph(const char *cmd, size_t cmd_len,
         edge->type = SHELL_EDGE_AND;
       else if (stype == (1u << 10))
         edge->type = SHELL_EDGE_OR;
+      else if (stype == SHELL_TYPE_BACKGROUND)
+        edge->type = SHELL_EDGE_BACKGROUND;
+      else if (range->group_depth > 0 &&
+               out->nodes[last_cmd_idx].cmd.group_depth > 0)
+        edge->type = SHELL_EDGE_GROUP;
       else
         edge->type = SHELL_EDGE_SEQ;
     } else if (last_cmd_idx >= 0)
       out->status |= SHELL_DEP_STATUS_TRUNCATED;
 
+    if (si + 1 < fast_result.count &&
+        (fast_result.cmds[si + 1].type == SHELL_TYPE_AND ||
+         fast_result.cmds[si + 1].type == SHELL_TYPE_OR))
+      cwd_known = false;
     last_cmd_idx = (int32_t)cmd_node_idx;
   }
 
@@ -1306,6 +1598,9 @@ void shell_dep_graph_dump(const shell_dep_graph_t *g, FILE *fp) {
         fprintf(fp, "\"%.*s\"", n->cmd.token_lens[j], n->cmd.tokens[j]);
       }
       fprintf(fp, "]\n");
+    } else if (n->type == SHELL_NODE_GROUP) {
+      fprintf(fp, "  [%u] GROUP span=\"%.*s\" parent=%u\n", i, n->group.length,
+              n->group.start ? n->group.start : "", n->group.parent);
     } else {
       fprintf(fp, "  [%u] DOC %s", i, shell_dep_doc_kind_name(n->doc.kind));
       if (n->doc.kind == SHELL_DOC_FILE && n->doc.path) {
@@ -1380,6 +1675,8 @@ shell_dep_validate_result_t shell_dep_validate(const shell_dep_graph_t *g) {
     case SHELL_EDGE_AND:
     case SHELL_EDGE_OR:
     case SHELL_EDGE_SUBST:
+    case SHELL_EDGE_BACKGROUND:
+    case SHELL_EDGE_GROUP:
       ok = (ft == SHELL_NODE_CMD && tt == SHELL_NODE_CMD);
       break;
     case SHELL_EDGE_READ:

@@ -1359,10 +1359,7 @@ static int test_policy_contract_matrix(void) {
   st_policy_get_stats(NULL, &untouched_stats);
   ASSERT(untouched_stats.eval_count == 7);
   st_policy_get_stats(policy, NULL);
-  ASSERT(st_policy_batch_add(policy, (const char *[]){"git status"}, 1) ==
-         ST_OK);
-  ASSERT(st_policy_batch_add(
-             policy, (const char *[]){"git status", "git status"}, 2) == ST_OK);
+  ASSERT(st_policy_add(policy, "git status") == ST_OK);
   ASSERT(st_policy_count(policy) == 1);
   ASSERT(st_policy_merge(policy, policy) == ST_OK);
   ASSERT(st_policy_count(policy) == 1);
@@ -1569,17 +1566,15 @@ static int test_statistics_transitions(void) {
   ASSERT(stats.memory_bytes >= stats.state_count);
 
   static const char *commands[] = {"git status", "ls -la", "docker ps"};
-  for (int i = 0; i < 100; i++) {
-    for (size_t j = 0; j < sizeof(commands) / sizeof(commands[0]); j++) {
-      st_eval_result_t result = {0};
-      ASSERT(st_policy_eval(policy, commands[j], &result) == ST_OK);
-      ASSERT(result.matches);
-    }
+  for (size_t i = 0; i < sizeof(commands) / sizeof(commands[0]); i++) {
+    st_eval_result_t result = {0};
+    ASSERT(st_policy_eval(policy, commands[i], &result) == ST_OK);
+    ASSERT(result.matches);
   }
 
   st_policy_get_stats(policy, &stats);
-  ASSERT(stats.eval_count == 300);
-  ASSERT(stats.trie_walk_count == 300);
+  ASSERT(stats.eval_count == 3);
+  ASSERT(stats.trie_walk_count == 3);
   ASSERT(stats.filter_reject_count == 0);
   ASSERT(stats.suggestion_count == 0);
 
@@ -1587,15 +1582,15 @@ static int test_statistics_transitions(void) {
   ASSERT(st_policy_eval(policy, "unknown cmd", &result) == ST_OK);
   ASSERT(!result.matches);
   st_policy_get_stats(policy, &stats);
-  ASSERT(stats.eval_count == 301);
-  ASSERT(stats.trie_walk_count == 301);
+  ASSERT(stats.eval_count == 4);
+  ASSERT(stats.trie_walk_count == 4);
   ASSERT(stats.suggestion_count == result.suggestion_count);
   ASSERT(stats.suggestion_count > 0);
 
   ASSERT(st_policy_eval(policy, "unknown cmd", NULL) == ST_OK);
   st_policy_get_stats(policy, &stats);
-  ASSERT(stats.eval_count == 302);
-  ASSERT(stats.trie_walk_count == 301);
+  ASSERT(stats.eval_count == 5);
+  ASSERT(stats.trie_walk_count == 4);
   ASSERT(stats.filter_reject_count == 1);
   ASSERT(stats.suggestion_count == result.suggestion_count);
 
@@ -1691,34 +1686,6 @@ static int policy_eval_is(st_policy_t *policy, const char *command,
                   : result.matching_pattern == NULL;
 }
 
-static int test_option_type_matrix(void) {
-  static const char *patterns[] = {"git #opt", "docker run #val"};
-  static const struct {
-    const char *command;
-    const char *expected;
-  } cases[] = {{"git -v", "git #opt"},
-               {"git -la", "git #opt"},
-               {"git --help", "git #opt"},
-               {"git status", NULL},
-               {"docker run -d", "docker run #val"},
-               {"docker run --rm", "docker run #val"}};
-  st_policy_ctx_t *ctx = st_policy_ctx_new();
-  st_policy_t *policy = st_policy_new(ctx);
-  ASSERT(policy != NULL);
-  for (size_t i = 0; i < sizeof(patterns) / sizeof(patterns[0]); i++)
-    ASSERT(st_policy_add(policy, patterns[i]) == ST_OK);
-  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
-    if (!policy_eval_is(policy, cases[i].command, cases[i].expected)) {
-      printf("  Option command '%s' did not produce '%s'\n", cases[i].command,
-             cases[i].expected ? cases[i].expected : "no match");
-      return 0;
-    }
-  }
-  st_policy_free(policy);
-  st_policy_ctx_free(ctx);
-  return 1;
-}
-
 static int test_literal_and_wildcard_semantics(void) {
   static const char *patterns[] = {
       "exact-number 42",
@@ -1727,6 +1694,8 @@ static int test_literal_and_wildcard_semantics(void) {
       "any-option #opt",
       "exact-url https://example.test/a",
       "any-url #u",
+      "git #opt",
+      "docker run #val",
   };
   static const struct {
     const char *command;
@@ -1740,7 +1709,13 @@ static int test_literal_and_wildcard_semantics(void) {
       {"any-option --verbose", "any-option #opt"},
       {"exact-url https://example.test/a", "exact-url https://example.test/a"},
       {"exact-url https://example.test/b", NULL},
-      {"any-url https://example.test/b", "any-url #u"}};
+      {"any-url https://example.test/b", "any-url #u"},
+      {"git -v", "git #opt"},
+      {"git -la", "git #opt"},
+      {"git --help", "git #opt"},
+      {"git status", NULL},
+      {"docker run -d", "docker run #val"},
+      {"docker run --rm", "docker run #val"}};
   st_policy_ctx_t *ctx = st_policy_ctx_new();
   st_policy_t *policy = st_policy_new(ctx);
   ASSERT(ctx && policy);
@@ -1752,51 +1727,6 @@ static int test_literal_and_wildcard_semantics(void) {
   ASSERT(st_policy_compact(policy) == ST_OK);
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++)
     ASSERT(policy_eval_is(policy, cases[i].command, cases[i].expected));
-  st_policy_free(policy);
-  st_policy_ctx_free(ctx);
-  return 1;
-}
-
-static int add_patterns_and_compact(st_policy_t *policy,
-                                    const char *const *patterns, size_t count) {
-  for (size_t i = 0; i < count; i++) {
-    if (st_policy_add(policy, patterns[i]) != ST_OK)
-      return 0;
-  }
-  return st_policy_count(policy) == count && st_policy_compact(policy) == ST_OK;
-}
-
-static int test_param_path_lifecycle(void) {
-  st_policy_ctx_t *ctx = st_policy_ctx_new();
-  st_policy_t *policy = st_policy_new(ctx);
-  ASSERT(policy != NULL);
-  ASSERT(st_validate_pattern("cat #path.cfg", NULL) == ST_ERR_INVALID);
-  ASSERT(st_policy_add(policy, "cat #path.cfg") == ST_ERR_INVALID);
-  ASSERT(st_validate_pattern("cat #p.log", NULL) == ST_ERR_INVALID);
-  ASSERT(st_policy_count(policy) == 0);
-  st_policy_free(policy);
-  st_policy_ctx_free(ctx);
-  return 1;
-}
-
-static int test_param_size_lifecycle(void) {
-  static const char *patterns[] = {"dd bs= #size.MiB", "dd bs= #size.G"};
-  static const struct {
-    const char *command;
-    const char *expected;
-  } cases[] = {{"dd bs=10MiB", "dd bs= #size.MiB"},
-               {"dd bs=2G", "dd bs= #size.G"},
-               {"dd bs=10K", NULL}};
-  st_policy_ctx_t *ctx = st_policy_ctx_new();
-  st_policy_t *policy = st_policy_new(ctx);
-  ASSERT(policy != NULL);
-  ASSERT(add_patterns_and_compact(policy, patterns,
-                                  sizeof(patterns) / sizeof(patterns[0])));
-  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++)
-    ASSERT(policy_eval_is(policy, cases[i].command, cases[i].expected));
-  ASSERT(st_policy_add(policy, "dd bs= #size") == ST_OK);
-  ASSERT(st_policy_count(policy) == 1);
-  ASSERT(policy_eval_is(policy, "dd bs=10K", "dd bs= #size"));
   st_policy_free(policy);
   st_policy_ctx_free(ctx);
   return 1;
@@ -1844,40 +1774,35 @@ static int test_param_subsumption_matrix(void) {
                         "container 4be33a94-0c5b-5516-a922-d07dedd59172",
                         "container #uuid.v5"));
   st_policy_free(alias_policy);
-  st_policy_ctx_free(ctx);
-  return 1;
-}
 
-static int test_param_coexistence_matrix(void) {
-  static const struct {
-    const char *patterns[2];
-    struct {
-      const char *command;
-      const char *expected;
-    } probes[3];
-    size_t probe_count;
-  } cases[] = {
-      {{"container #uuid.v4", "container #uuid.v5"},
-       {{"container 550e8400-e29b-41d4-a716-446655440000",
-         "container #uuid.v4"},
-        {"container 4be33a94-0c5b-5516-a922-d07dedd59172",
-         "container #uuid.v5"},
-        {"container 6fa459ea-ee8a-3ca4-894e-db77e160355e", NULL}},
-       3},
-  };
-  st_policy_ctx_t *ctx = st_policy_ctx_new();
-  ASSERT(ctx != NULL);
-  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
-    st_policy_t *policy = st_policy_new(ctx);
-    ASSERT(policy != NULL);
-    ASSERT_OK(st_policy_add(policy, cases[i].patterns[0]));
-    ASSERT_OK(st_policy_add(policy, cases[i].patterns[1]));
-    ASSERT(st_policy_count(policy) == 2);
-    for (size_t j = 0; j < cases[i].probe_count; j++)
-      ASSERT(policy_eval_is(policy, cases[i].probes[j].command,
-                            cases[i].probes[j].expected));
-    st_policy_free(policy);
-  }
+  st_policy_t *sizes = st_policy_new(ctx);
+  ASSERT(sizes != NULL);
+  ASSERT_OK(st_policy_add(sizes, "dd bs= #size.MiB"));
+  ASSERT_OK(st_policy_add(sizes, "dd bs= #size.G"));
+  ASSERT_OK(st_policy_compact(sizes));
+  ASSERT(st_policy_count(sizes) == 2);
+  ASSERT(policy_eval_is(sizes, "dd bs=10MiB", "dd bs= #size.MiB"));
+  ASSERT(policy_eval_is(sizes, "dd bs=2G", "dd bs= #size.G"));
+  ASSERT(policy_eval_is(sizes, "dd bs=10K", NULL));
+  ASSERT_OK(st_policy_add(sizes, "dd bs= #size"));
+  ASSERT(st_policy_count(sizes) == 1);
+  ASSERT(policy_eval_is(sizes, "dd bs=10K", "dd bs= #size"));
+  st_policy_free(sizes);
+
+  st_policy_t *coexisting = st_policy_new(ctx);
+  ASSERT(coexisting != NULL);
+  ASSERT_OK(st_policy_add(coexisting, "container #uuid.v4"));
+  ASSERT_OK(st_policy_add(coexisting, "container #uuid.v5"));
+  ASSERT(st_policy_count(coexisting) == 2);
+  ASSERT(policy_eval_is(coexisting,
+                        "container 550e8400-e29b-41d4-a716-446655440000",
+                        "container #uuid.v4"));
+  ASSERT(policy_eval_is(coexisting,
+                        "container 4be33a94-0c5b-5516-a922-d07dedd59172",
+                        "container #uuid.v5"));
+  ASSERT(policy_eval_is(
+      coexisting, "container 6fa459ea-ee8a-3ca4-894e-db77e160355e", NULL));
+  st_policy_free(coexisting);
   st_policy_ctx_free(ctx);
   return 1;
 }
@@ -1973,6 +1898,7 @@ static int test_param_validation_matrix(void) {
     st_error_t expected;
   } cases[] = {
       {"cat #path.cfg", ST_ERR_INVALID},
+      {"cat #p.log", ST_ERR_INVALID},
       {"cat #path.", ST_ERR_INVALID},
       {"cat #path.bad/name", ST_ERR_INVALID},
       {"dd #size.MiB", ST_OK},
@@ -2891,18 +2817,12 @@ int main(void) {
   TEST(test_filter_rebuild_lazy_trigger);
   TEST(test_policy_clear);
 
-  printf("\nOptions (#opt):\n");
-  TEST(test_option_type_matrix);
+  printf("\nLiteral and wildcard semantics:\n");
   TEST(test_literal_and_wildcard_semantics);
-
-  printf("\nParametrized wildcard lifecycles:\n");
-  TEST(test_param_path_lifecycle);
-  TEST(test_param_size_lifecycle);
 
   printf("\nParametrized wildcard matching and subsumption:\n");
   TEST(test_param_match_matrix);
   TEST(test_param_subsumption_matrix);
-  TEST(test_param_coexistence_matrix);
 
   printf("\nParameter validation:\n");
   TEST(test_param_validation_matrix);

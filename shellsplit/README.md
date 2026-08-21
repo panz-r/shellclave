@@ -43,11 +43,23 @@ ctest --test-dir build --output-on-failure
 | Here Documents | `<<EOF`, `<<-EOF` | ✅ |
 | Here Strings | `<<< word` | ✅ |
 | Composition | `;`, `&&`, `||`, and pipelines | ✅ |
+| Comments | `# comment` through the end of a line | ✅ |
+| Background execution | `cmd & next` | ✅ |
+| Parenthesized groups | `(cmd1; cmd2)` with nesting metadata | ✅ |
 | Control Features | loops, conditionals, and `case` | ✅ |
 
 The fast parser is zero-copy and bounded rather than a complete POSIX shell
 grammar. It reports parse errors and output truncation through return codes;
 callers must handle those results explicitly.
+
+Feature bits for control keywords are lexical indicators. The dependency graph
+represents simple commands, sequencing, pipelines, parenthesized groups,
+background execution, and executable substitutions. Heredoc bodies remain
+data. CWD metadata is propagated only through sequential lists; pipeline,
+background, group, and substitution execution do not mutate the surrounding
+CWD, and conditional joins are marked unknown when their paths can differ.
+Bash-specific combined redirects such as `&>` are rejected by the bounded
+dialect.
 
 ## Usage
 

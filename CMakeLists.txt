@@ -78,6 +78,18 @@ target_include_directories(shellsplit PUBLIC
 target_link_libraries(shellsplit PRIVATE m)
 set_target_properties(shellsplit PROPERTIES EXPORT_NAME shellsplit)
 
+if(BUILD_TESTING)
+  add_library(shellsplit_test ${SHELLSPLIT_SOURCES}
+    shellsplit/tests/test_allocator.c)
+  shellclave_project_target(shellsplit_test)
+  target_compile_definitions(shellsplit_test PRIVATE SHELLSPLIT_TEST_ALLOCATOR)
+  target_include_directories(shellsplit_test PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/shellsplit/include
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shellsplit/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/shellsplit/tests)
+  target_link_libraries(shellsplit_test PRIVATE m)
+endif()
+
 set(SHELLTYPE_SOURCES
   shelltype/src/arena.c
   shelltype/src/filter_hash.c
@@ -172,12 +184,17 @@ endfunction()
 if(BUILD_TESTING)
   file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests")
   file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests/headers")
-  shellclave_add_test(shellsplit_tokenizer_test shellsplit/tests/tokenizer_test.c shellsplit)
-  shellclave_add_test(shellsplit_fast_parser_test shellsplit/tests/fast_parser_test.c shellsplit)
-  shellclave_add_test(shellsplit_abstract_test shellsplit/tests/abstract_test.c shellsplit)
-  shellclave_add_test(shellsplit_entropy_test shellsplit/tests/entropy_test.c shellsplit)
-  shellclave_add_test(shellsplit_depgraph_test shellsplit/tests/test_depgraph.c shellsplit)
-  shellclave_add_test(shellsplit_interop_test shellsplit/tests/interop_test.c shellsplit)
+  shellclave_add_test(shellsplit_tokenizer_test shellsplit/tests/tokenizer_test.c shellsplit_test)
+  shellclave_add_test(shellsplit_fast_parser_test shellsplit/tests/fast_parser_test.c shellsplit_test)
+  shellclave_add_test(shellsplit_abstract_test shellsplit/tests/abstract_test.c shellsplit_test)
+  shellclave_add_test(shellsplit_entropy_test shellsplit/tests/entropy_test.c shellsplit_test)
+  shellclave_add_test(shellsplit_depgraph_test shellsplit/tests/test_depgraph.c shellsplit_test)
+  shellclave_add_test(shellsplit_interop_test shellsplit/tests/interop_test.c shellsplit_test)
+  foreach(shellsplit_test_target IN ITEMS shellsplit_tokenizer_test
+      shellsplit_fast_parser_test shellsplit_abstract_test shellsplit_entropy_test
+      shellsplit_depgraph_test shellsplit_interop_test)
+    target_include_directories(${shellsplit_test_target} PRIVATE shellsplit/tests)
+  endforeach()
   shellclave_add_test(shelltype_token_types_test shelltype/tests/test_token_types.c shelltype_test)
   shellclave_add_test(shelltype_unit_test shelltype/tests/test_shelltype.c shelltype_test)
   shellclave_add_test(shelltype_arena_test shelltype/tests/test_arena.c shelltype_test)
@@ -339,6 +356,7 @@ if(SHELLCLAVE_BUILD_FUZZERS)
 
   add_executable(fuzz_shellsplit shellsplit/fuzz/tokenizer_fuzzer.cpp)
   target_compile_features(fuzz_shellsplit PRIVATE cxx_std_11)
+  target_include_directories(fuzz_shellsplit PRIVATE shellsplit/tests)
   target_compile_options(fuzz_shellsplit PRIVATE -fsanitize=fuzzer,address,undefined)
   target_link_options(fuzz_shellsplit PRIVATE -fsanitize=fuzzer,address,undefined)
   target_link_libraries(fuzz_shellsplit PRIVATE shellsplit)

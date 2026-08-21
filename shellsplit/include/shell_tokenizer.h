@@ -52,6 +52,7 @@ typedef enum {
   SHELL_TYPE_HEREDOC = 1 << 12,      // Starts with << (heredoc)
   SHELL_TYPE_HERESTRING = 1 << 13,   // Starts with <<< (here-string)
   SHELL_TYPE_SUBSTITUTION = 1 << 14, // Command/process substitution operator
+  SHELL_TYPE_BACKGROUND = 1 << 15,   // Preceded by a background '&'
 } shell_cmd_type_t;
 
 /**
@@ -59,18 +60,20 @@ typedef enum {
  */
 typedef enum {
   SHELL_FEAT_NONE = 0,
-  SHELL_FEAT_VARS = 1 << 0,           // $VAR, ${VAR}, $1, etc.
-  SHELL_FEAT_GLOBS = 1 << 1,          // *, ?, [abc]
-  SHELL_FEAT_SUBSHELL = 1 << 2,       // $(...), `...`
-  SHELL_FEAT_ARITH = 1 << 3,          // $((...))
-  SHELL_FEAT_HEREDOC = 1 << 4,        // << delimiter (in subcommand)
-  SHELL_FEAT_HERESTRING = 1 << 5,     // <<< here-string (in subcommand)
-  SHELL_FEAT_PROCESS_SUB = 1 << 6,    // <(cmd), >(cmd)
-  SHELL_FEAT_LOOPS = 1 << 7,          // while, for, until loops
-  SHELL_FEAT_CONDITIONALS = 1 << 8,   // if/then/elif/else/fi
-  SHELL_FEAT_CASE = 1 << 9,           // case/esac statements
-  SHELL_FEAT_SUBSHELL_FILE = 1 << 10, // $(<file) - read from file
-  SHELL_FEAT_PIPELINE = 1 << 11,      // literal | pipeline construct
+  SHELL_FEAT_VARS = 1 << 0,                  // $VAR, ${VAR}, $1, etc.
+  SHELL_FEAT_GLOBS = 1 << 1,                 // *, ?, [abc]
+  SHELL_FEAT_SUBSHELL = 1 << 2,              // $(...), `...`
+  SHELL_FEAT_ARITH = 1 << 3,                 // $((...))
+  SHELL_FEAT_HEREDOC = 1 << 4,               // << delimiter (in subcommand)
+  SHELL_FEAT_HERESTRING = 1 << 5,            // <<< here-string (in subcommand)
+  SHELL_FEAT_PROCESS_SUB = 1 << 6,           // <(cmd), >(cmd)
+  SHELL_FEAT_LOOPS = 1 << 7,                 // while, for, until loops
+  SHELL_FEAT_CONDITIONALS = 1 << 8,          // if/then/elif/else/fi
+  SHELL_FEAT_CASE = 1 << 9,                  // case/esac statements
+  SHELL_FEAT_SUBSHELL_FILE = 1 << 10,        // $(<file) - read from file
+  SHELL_FEAT_PIPELINE = 1 << 11,             // literal | pipeline construct
+  SHELL_FEAT_GROUP = UINT32_C(1) << 12,      // Parenthesized command group
+  SHELL_FEAT_BACKGROUND = UINT32_C(1) << 13, // Background execution
 } shell_cmd_features_t;
 
 /**
@@ -116,6 +119,8 @@ typedef struct {
   bool has_case;
   bool has_subshell_file;
   bool has_pipeline;
+  bool has_group;
+  bool has_background;
 } shell_feature_flags_t;
 
 /**
@@ -123,7 +128,7 @@ typedef struct {
  * @param features  Raw features bitmask from shell_range_t.features
  * @param flags     Output struct; NULL is ignored
  */
-void shell_get_feature_flags(uint16_t features, shell_feature_flags_t *flags);
+void shell_get_feature_flags(uint32_t features, shell_feature_flags_t *flags);
 
 /**
  * Get human-readable error string for fast parser error code.
@@ -136,10 +141,11 @@ const char *shell_error_string(shell_error_t err);
  * Zero-copy subcommand - just indices into original command
  */
 typedef struct {
-  uint32_t start;    // Index in command string
-  uint32_t len;      // Length
-  uint16_t type;     // shell_cmd_type_t
-  uint16_t features; // shell_cmd_features_t
+  uint32_t start;       // Index in command string
+  uint32_t len;         // Length
+  uint16_t type;        // shell_cmd_type_t
+  uint32_t features;    // shell_cmd_features_t
+  uint16_t group_depth; // Parenthesized command-group nesting depth
 } shell_range_t;
 
 /**

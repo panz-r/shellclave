@@ -1,3 +1,4 @@
+#include "depgraph_invariants.h"
 #include "shell_depgraph.h"
 #include <stdint.h>
 #include <stdio.h>
@@ -84,6 +85,16 @@ static int find_first_cmd(const shell_dep_graph_t *g) {
   for (uint32_t i = 0; i < g->node_count; i++)
     if (g->nodes[i].type == SHELL_NODE_CMD)
       return (int)i;
+  return -1;
+}
+
+static int find_nth_cmd(const shell_dep_graph_t *g, uint32_t ordinal) {
+  for (uint32_t i = 0; i < g->node_count; i++) {
+    if (g->nodes[i].type != SHELL_NODE_CMD)
+      continue;
+    if (ordinal-- == 0)
+      return (int)i;
+  }
   return -1;
 }
 
@@ -287,6 +298,95 @@ TEST(cwd_matrix) {
   pass_count++;
 }
 
+TEST(composition_metadata_matrix) {
+  static const struct {
+    const char *command;
+    uint32_t commands;
+    shell_dep_edge_type_t edge;
+    bool first_background;
+    uint16_t first_group_depth;
+  } cases[] = {
+      {"echo one & echo two", 2, SHELL_EDGE_BACKGROUND, true, 0},
+      {"(echo one; echo two)", 2, SHELL_EDGE_GROUP, false, 1},
+      {"(echo one; echo two); echo three", 3, SHELL_EDGE_SEQ, false, 1},
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    shell_dep_graph_t g;
+    ASSERT(parse(cases[i].command, &g) == SHELL_DEP_OK);
+    ASSERT(count_type(&g, SHELL_NODE_CMD) == cases[i].commands);
+    if (count_edge_type(&g, cases[i].edge) < 1) {
+      printf("    case %zu missing edge %s (nodes=%u edges=%u)\n", i,
+             shell_dep_edge_type_name(cases[i].edge), g.node_count,
+             g.edge_count);
+      shell_dep_graph_dump(&g, stdout);
+      fail_count++;
+      return;
+    }
+    int first = find_first_cmd(&g);
+    ASSERT(first >= 0);
+    ASSERT(g.nodes[first].cmd.backgrounded == cases[i].first_background);
+    ASSERT(g.nodes[first].cmd.group_depth == cases[i].first_group_depth);
+    ASSERT(shell_dep_validate(&g).valid);
+  }
+
+  shell_dep_graph_t g;
+  shell_dep_limits_t cwd_limits = SHELL_DEP_LIMITS_DEFAULT;
+  cwd_limits.cd_as_cmd = true;
+  memset(&g, 0, sizeof(g));
+  ASSERT(shell_parse_depgraph("cd /tmp | pwd", strlen("cd /tmp | pwd"), ".",
+                              &cwd_limits, 0, &g) == SHELL_DEP_OK);
+  ASSERT(count_type(&g, SHELL_NODE_CMD) == 2);
+  ASSERT_STR_EQ(get_cwd_str(&g, g.nodes[find_nth_cmd(&g, 1)].cmd.cwd_offset),
+                ".");
+  memset(&g, 0, sizeof(g));
+  ASSERT(shell_parse_depgraph("cd /tmp & pwd", strlen("cd /tmp & pwd"), ".",
+                              &cwd_limits, 0, &g) == SHELL_DEP_OK);
+  ASSERT(count_type(&g, SHELL_NODE_CMD) == 2);
+  ASSERT_STR_EQ(get_cwd_str(&g, g.nodes[find_nth_cmd(&g, 1)].cmd.cwd_offset),
+                ".");
+  ASSERT(g.nodes[find_nth_cmd(&g, 0)].cmd.backgrounded);
+  ASSERT(g.nodes[find_nth_cmd(&g, 1)].cmd.cwd_known);
+  memset(&g, 0, sizeof(g));
+  ASSERT(shell_parse_depgraph("cd /tmp; pwd", strlen("cd /tmp; pwd"), ".",
+                              &cwd_limits, 0, &g) == SHELL_DEP_OK);
+  ASSERT(count_type(&g, SHELL_NODE_CMD) == 2);
+  ASSERT_STR_EQ(get_cwd_str(&g, g.nodes[find_nth_cmd(&g, 1)].cmd.cwd_offset),
+                "/tmp");
+  memset(&g, 0, sizeof(g));
+  ASSERT(shell_parse_depgraph("(cd /tmp; pwd); pwd",
+                              strlen("(cd /tmp; pwd); pwd"), ".", &cwd_limits,
+                              0, &g) == SHELL_DEP_OK);
+  ASSERT(count_type(&g, SHELL_NODE_CMD) == 3);
+  ASSERT_STR_EQ(get_cwd_str(&g, g.nodes[find_nth_cmd(&g, 2)].cmd.cwd_offset),
+                ".");
+  memset(&g, 0, sizeof(g));
+  ASSERT(shell_parse_depgraph("cd /tmp && pwd; pwd",
+                              strlen("cd /tmp && pwd; pwd"), ".", &cwd_limits,
+                              0, &g) == SHELL_DEP_OK);
+  ASSERT(count_type(&g, SHELL_NODE_CMD) == 3);
+  ASSERT(!g.nodes[find_nth_cmd(&g, 1)].cmd.cwd_known);
+  pass_count++;
+}
+
+TEST(comment_matrix) {
+  static const struct {
+    const char *command;
+    uint32_t command_count;
+    uint32_t file_count;
+  } cases[] = {
+      {"echo # | rm", 1, 0},
+      {"echo # /etc/passwd\npwd", 2, 0},
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    shell_dep_graph_t graph;
+    ASSERT(parse(cases[i].command, &graph) == SHELL_DEP_OK);
+    ASSERT(count_type(&graph, SHELL_NODE_CMD) == cases[i].command_count);
+    ASSERT(count_doc_kind(&graph, SHELL_DOC_FILE) == cases[i].file_count);
+    ASSERT(shell_dep_validate(&graph).valid);
+  }
+  pass_count++;
+}
+
 /* --- ENVIRONMENT VARIABLES --- */
 
 TEST(environment_matrix) {
@@ -430,6 +530,197 @@ TEST(subshell_matrix) {
   pass_count++;
 }
 
+TEST(nested_composition_matrix) {
+  static const struct {
+    const char *name;
+    const char *command;
+    const char *commands[5];
+    int32_t parents[5];
+    uint32_t command_count;
+    uint32_t pipe_count;
+    uint32_t read_count;
+  } cases[] = {
+      {"nested command substitution",
+       "echo $(printf x $(whoami))",
+       {"echo", "printf", "whoami"},
+       {-1, 0, 1},
+       3,
+       0,
+       0},
+      {"sibling command substitutions",
+       "echo $(id) $(pwd)",
+       {"echo", "id", "pwd"},
+       {-1, 0, 0},
+       3,
+       0,
+       0},
+      {"adjacent command substitutions",
+       "echo $(id)$(pwd)",
+       {"echo", "id", "pwd"},
+       {-1, 0, 0},
+       3,
+       0,
+       0},
+      {"embedded adjacent substitutions",
+       "echo prefix$(id)suffix$(pwd)",
+       {"echo", "id", "pwd"},
+       {-1, 0, 0},
+       3,
+       0,
+       0},
+      {"mixed substitution forms",
+       "echo $(id)`pwd`",
+       {"echo", "id", "pwd"},
+       {-1, 0, 0},
+       3,
+       0,
+       0},
+      {"substitution inside arithmetic",
+       "echo $(( $(id) + 1 ))",
+       {"echo", "id"},
+       {-1, 0},
+       2,
+       0,
+       0},
+      {"escaped closing parenthesis",
+       "echo $(printf \\))",
+       {"echo", "printf"},
+       {-1, 0},
+       2,
+       0,
+       0},
+      {"quoted closing parenthesis",
+       "echo $(printf ')')",
+       {"echo", "printf"},
+       {-1, 0},
+       2,
+       0,
+       0},
+      {"escaped closing backtick",
+       "echo `printf \\``",
+       {"echo", "printf"},
+       {-1, 0},
+       2,
+       0,
+       0},
+      {"adjacent substitutions in double quotes",
+       "echo \"$(id)$(pwd)\"",
+       {"echo", "id", "pwd"},
+       {-1, 0, 0},
+       3,
+       0,
+       0},
+      {"odd escaped substitution delimiter",
+       "echo \\$(id)",
+       {"echo"},
+       {-1},
+       1,
+       0,
+       0},
+      {"even escaped substitution delimiter",
+       "echo \\\\$(id)",
+       {"echo", "id"},
+       {-1, 0},
+       2,
+       0,
+       0},
+      {"quoted process substitution",
+       "cat <(printf '%s' '(x)') | sort",
+       {"cat", "printf", "sort"},
+       {-1, 0, -1},
+       3,
+       1,
+       0},
+      {"odd escaped process close",
+       "cat <(printf \\))",
+       {"cat", "printf"},
+       {-1, 0},
+       2,
+       0,
+       0},
+      {"even escaped process close",
+       "cat <(printf \\\\)",
+       {"cat", "printf"},
+       {-1, 0},
+       2,
+       0,
+       0},
+      {"nested process substitution",
+       "cat <(sort <(cat /tmp/a))",
+       {"cat", "sort", "cat"},
+       {-1, 0, 1},
+       3,
+       0,
+       0},
+      {"pipeline inside substitution",
+       "echo $(cat /tmp/a | sort)",
+       {"echo", "cat", "sort"},
+       {-1, 0, 0},
+       3,
+       1,
+       0},
+      {"redirect inside substitution",
+       "echo $(sort < /tmp/a)",
+       {"echo", "sort"},
+       {-1, 0},
+       2,
+       0,
+       1},
+  };
+
+  for (size_t ci = 0; ci < sizeof(cases) / sizeof(cases[0]); ci++) {
+    shell_dep_graph_t graph;
+    shell_dep_error_t error = parse(cases[ci].command, &graph);
+    ASSERT(error == SHELL_DEP_OK);
+    bool valid = shellsplit_test_depgraph_invariants(
+        cases[ci].command, strlen(cases[ci].command), error, &graph,
+        &SHELL_DEP_LIMITS_DEFAULT);
+    if (!valid) {
+      printf("    invariant failure: %s\n", cases[ci].name);
+      shell_dep_graph_dump(&graph, stdout);
+    }
+    ASSERT(valid);
+    uint32_t actual_commands = count_type(&graph, SHELL_NODE_CMD);
+    if (actual_commands != cases[ci].command_count) {
+      printf("    %s: got %u commands, expected %u\n", cases[ci].name,
+             actual_commands, cases[ci].command_count);
+      shell_dep_graph_dump(&graph, stdout);
+    }
+    ASSERT(actual_commands == cases[ci].command_count);
+    ASSERT(count_edge_type(&graph, SHELL_EDGE_PIPE) == cases[ci].pipe_count);
+    ASSERT(count_edge_type(&graph, SHELL_EDGE_READ) == cases[ci].read_count);
+
+    uint32_t command_nodes[5];
+    uint32_t command_count = 0;
+    for (uint32_t i = 0; i < graph.node_count; i++)
+      if (graph.nodes[i].type == SHELL_NODE_CMD)
+        command_nodes[command_count++] = i;
+    ASSERT(command_count == cases[ci].command_count);
+
+    for (uint32_t i = 0; i < command_count; i++) {
+      const shell_dep_cmd_t *command = &graph.nodes[command_nodes[i]].cmd;
+      ASSERT(command->token_count > 0);
+      ASSERT_STRN_EQ(command->tokens[0], command->token_lens[0],
+                     cases[ci].commands[i]);
+      int32_t parent = -1;
+      for (uint32_t edge = 0; edge < graph.edge_count; edge++) {
+        if (graph.edges[edge].type != SHELL_EDGE_SUBST ||
+            graph.edges[edge].from != command_nodes[i])
+          continue;
+        ASSERT(parent == -1);
+        for (uint32_t candidate = 0; candidate < command_count; candidate++)
+          if (command_nodes[candidate] == graph.edges[edge].to)
+            parent = (int32_t)candidate;
+      }
+      if (parent != cases[ci].parents[i])
+        printf("    %s command %u: parent %d, expected %d\n", cases[ci].name, i,
+               parent, cases[ci].parents[i]);
+      ASSERT(parent == cases[ci].parents[i]);
+    }
+  }
+  pass_count++;
+}
+
 /* --- HEREDOCS AND HERESTRINGS --- */
 
 TEST(inline_document_matrix) {
@@ -448,6 +739,9 @@ TEST(inline_document_matrix) {
        "DELIM", "line1\nline2"},
       {"cat <<EOF | sort\nhello\nEOF", SHELL_DOC_HEREDOC, 2, 0, 1, 0, "EOF",
        "hello"},
+      {"cat <<EOF\n$(id)\nEOF", SHELL_DOC_HEREDOC, 1, 0, 0, 0, "EOF", "$(id)"},
+      {"cat <<EOF\nbody\nEOF && pwd", SHELL_DOC_HEREDOC, 2, 0, 0, 0, "EOF",
+       "body"},
       {"cat <<EOF > out.txt\nhello\nEOF", SHELL_DOC_HEREDOC, 1, 1, 0, 1, "EOF",
        "hello"},
       {"cat <<-'EOF'\n\tsecret\n\tEOF", SHELL_DOC_HEREDOC, 1, 0, 0, 0, "EOF",
@@ -552,6 +846,54 @@ TEST(parse_error) {
   pass_count++;
 }
 
+TEST(dialect_boundary_matrix) {
+  static const char *cases[] = {
+      "{ echo hi; }",
+      "foo() { echo hi; }",
+      "case value in x) echo x ;; esac",
+      "for ((i=0; i<2; i++)); do echo $i; done",
+      "cmd &>file",
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    shell_dep_graph_t graph;
+    shell_dep_error_t error = parse(cases[i], &graph);
+    ASSERT(error == SHELL_DEP_EPARSE);
+    ASSERT(graph.status == SHELL_DEP_STATUS_ERROR);
+    ASSERT(graph.node_count == 0 && graph.edge_count == 0);
+  }
+
+  /* Reserved words are only structural at command position.  Keeping them
+   * as ordinary arguments prevents the boundary guard from rejecting valid
+   * literal data merely because it contains a keyword spelling. */
+  static const char *literal_cases[] = {
+      "echo function", "echo case", "echo esac", "echo for",
+      "echo in",       "echo {",    "echo }"};
+  for (size_t i = 0; i < sizeof(literal_cases) / sizeof(literal_cases[0]);
+       i++) {
+    shell_dep_graph_t graph;
+    shell_dep_error_t error = parse(literal_cases[i], &graph);
+    ASSERT(error == SHELL_DEP_OK);
+    ASSERT(graph.status == SHELL_DEP_STATUS_OK);
+    ASSERT(graph.node_count == 1);
+  }
+  pass_count++;
+}
+
+TEST(nested_parse_error_matrix) {
+  static const char *cases[] = {
+      "echo $(case value in x)",
+      "cat <(for ((i=0; i<1; i++)); do echo x; done)",
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    shell_dep_graph_t graph;
+    shell_dep_error_t error = parse(cases[i], &graph);
+    ASSERT(error == SHELL_DEP_EPARSE);
+    ASSERT(graph.status == SHELL_DEP_STATUS_ERROR);
+    ASSERT(graph.node_count == 0 && graph.edge_count == 0);
+  }
+  pass_count++;
+}
+
 TEST(limit_matrix) {
   static const struct {
     const char *command;
@@ -624,6 +966,51 @@ TEST(limit_matrix) {
   ASSERT(count_edge_type(&g, SHELL_EDGE_AND) == 1);
   ASSERT_STR_EQ(get_cwd_str(&g, g.nodes[2].cmd.cwd_offset), "/tmp");
   ASSERT(shell_dep_validate(&g).valid);
+  pass_count++;
+}
+
+TEST(nested_limit_cross_product) {
+  static const char command[] =
+      "echo $(cat /tmp/a | sort) && cat <(printf x) | wc";
+  static const struct {
+    uint32_t nodes;
+    uint32_t edges;
+    uint32_t tokens;
+    uint32_t cwd;
+    shell_dep_error_t expected;
+  } bounds[] = {
+      {1, 0, 1, 2, SHELL_DEP_ETRUNC},
+      {2, 1, 2, 4, SHELL_DEP_ETRUNC},
+      {4, 3, 4, 8, SHELL_DEP_ETRUNC},
+      {8, 8, 8, 32, SHELL_DEP_OK},
+      {SHELL_DEP_MAX_NODES, SHELL_DEP_MAX_EDGES, SHELL_DEP_MAX_TOKENS,
+       SHELL_DEP_CWD_BUF_SIZE, SHELL_DEP_OK},
+  };
+
+  for (size_t i = 0; i < sizeof(bounds) / sizeof(bounds[0]); i++) {
+    shell_dep_limits_t limits = {bounds[i].nodes, bounds[i].edges,
+                                 bounds[i].tokens, bounds[i].cwd, false};
+    shell_dep_graph_t graph;
+    shell_dep_error_t error =
+        shell_parse_depgraph(command, strlen(command), ".", &limits, 0, &graph);
+    if (error != bounds[i].expected)
+      printf("    nested limit row %zu: got %s, expected %s\n", i,
+             shell_dep_error_string(error),
+             shell_dep_error_string(bounds[i].expected));
+    ASSERT(error == bounds[i].expected);
+    ASSERT(shellsplit_test_depgraph_invariants(command, strlen(command), error,
+                                               &graph, &limits));
+  }
+
+  for (uint32_t depth = 15; depth <= 17; depth++) {
+    static const char nested[] = "echo $(echo $(id))";
+    shell_dep_graph_t graph;
+    shell_dep_error_t error = shell_parse_depgraph(
+        nested, strlen(nested), ".", &SHELL_DEP_LIMITS_DEFAULT, depth, &graph);
+    ASSERT(error == SHELL_DEP_EPARSE);
+    ASSERT(shellsplit_test_depgraph_invariants(
+        nested, strlen(nested), error, &graph, &SHELL_DEP_LIMITS_DEFAULT));
+  }
   pass_count++;
 }
 
@@ -719,8 +1106,9 @@ TEST(graph_dump_contract) {
 TEST(name_helpers) {
   static const char *edge_names[] = {"READ", "WRITE", "APPEND", "PIPE",
                                      "ARG",  "ENV",   "SUBST",  "SEQ",
-                                     "AND",  "OR",    "CWD"},
-                    *node_names[] = {"CMD", "DOC"},
+                                     "AND",  "OR",    "CWD",    "BACKGROUND",
+                                     "GROUP"},
+                    *node_names[] = {"CMD", "DOC", "GROUP"},
                     *doc_names[] = {"FILE", "HEREDOC", "HERESTRING", "ENVVAR"},
                     *error_names[] = {"OK", "Invalid input",
                                       "Truncated (limits exceeded)",
@@ -767,6 +1155,8 @@ int main(int argc, char **argv) {
 
   printf("\nCWD Tracking:\n");
   RUN(cwd_matrix);
+  RUN(composition_metadata_matrix);
+  RUN(comment_matrix);
 
   printf("\nEnvironment Variables:\n");
   RUN(environment_matrix);
@@ -776,6 +1166,7 @@ int main(int argc, char **argv) {
 
   printf("\nSubshells:\n");
   RUN(subshell_matrix);
+  RUN(nested_composition_matrix);
 
   printf("\nHeredocs and herestrings:\n");
   RUN(inline_document_matrix);
@@ -786,7 +1177,10 @@ int main(int argc, char **argv) {
   RUN(empty_input);
   RUN(adversarial_limits);
   RUN(parse_error);
+  RUN(dialect_boundary_matrix);
+  RUN(nested_parse_error_matrix);
   RUN(limit_matrix);
+  RUN(nested_limit_cross_product);
 
   printf("\nGraph Integrity:\n");
   RUN(validation_matrix);

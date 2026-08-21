@@ -1,5 +1,6 @@
 #include "shell_interop.h"
 #include "shell_tokenizer.h"
+#include "test_allocator.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -155,7 +156,8 @@ static void test_accessors_and_conversions(void) {
                {SHELL_TYPE_SEMICOLON, "SEMICOLON"},
                {SHELL_TYPE_HEREDOC, "HEREDOC"},
                {SHELL_TYPE_HERESTRING, "HERESTRING"},
-               {SHELL_TYPE_SUBSTITUTION, "SUBSTITUTION"}};
+               {SHELL_TYPE_SUBSTITUTION, "SUBSTITUTION"},
+               {SHELL_TYPE_BACKGROUND, "BACKGROUND"}};
   for (size_t i = 0; i < sizeof(types) / sizeof(types[0]); i++) {
     char *name = shell_interop_type_str(types[i].type);
     CHECK(name != NULL && strcmp(name, types[i].name) == 0);
@@ -177,6 +179,8 @@ static void test_accessors_and_conversions(void) {
       {SHELL_FEAT_CASE, "CASE "},
       {SHELL_FEAT_SUBSHELL_FILE, "SUBSHELL_FILE "},
       {SHELL_FEAT_PIPELINE, "PIPELINE "},
+      {SHELL_FEAT_GROUP, "GROUP "},
+      {SHELL_FEAT_BACKGROUND, "BACKGROUND "},
   };
   int all_features = 0;
   char all_names[256] = "";
@@ -207,11 +211,37 @@ static void test_accessors_and_conversions(void) {
   shell_interop_destroy(handle);
 }
 
+static void test_allocation_failures(void) {
+  shellsplit_test_alloc_fail_at(1);
+  CHECK(shell_interop_create() == NULL);
+  shellsplit_test_alloc_reset();
+
+  shell_interop_handle_t *handle = shell_interop_create();
+  CHECK(handle != NULL && shell_interop_parse(handle, "echo $USER", 10) == 1);
+  if (!handle)
+    return;
+
+  shellsplit_test_alloc_fail_at(1);
+  CHECK(shell_interop_subcommand_str(handle, 0) == NULL);
+  shellsplit_test_alloc_fail_at(1);
+  CHECK(shell_interop_features_str(SHELL_FEAT_VARS) == NULL);
+  shellsplit_test_alloc_fail_at(1);
+  CHECK(shell_interop_type_str(SHELL_TYPE_SIMPLE) == NULL);
+  shellsplit_test_alloc_reset();
+
+  CHECK(shell_interop_subcommand_count(handle) == 1);
+  char *copy = shell_interop_subcommand_str(handle, 0);
+  CHECK(copy != NULL && strcmp(copy, "echo $USER") == 0);
+  shell_interop_free_str(copy);
+  shell_interop_destroy(handle);
+}
+
 int main(void) {
   test_parse_matrix();
   test_failure_and_length_boundaries();
   test_bounded_input_and_handle_isolation();
   test_accessors_and_conversions();
+  test_allocation_failures();
   if (failures)
     fprintf(stderr, "%d interop checks failed\n", failures);
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;

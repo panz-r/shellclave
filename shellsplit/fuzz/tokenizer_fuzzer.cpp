@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "depgraph_invariants.h"
 #include "env_screener.h"
 #include "relative_permutation_entropy.h"
 #include "shell_abstract.h"
@@ -80,22 +81,24 @@ static int validate_fast_result(const char *input, size_t length,
   static const uint16_t valid_types =
       SHELL_TYPE_PIPELINE | SHELL_TYPE_AND | SHELL_TYPE_OR |
       SHELL_TYPE_SEMICOLON | SHELL_TYPE_HEREDOC | SHELL_TYPE_HERESTRING |
-      SHELL_TYPE_SUBSTITUTION;
-  static const uint16_t valid_features =
+      SHELL_TYPE_SUBSTITUTION | SHELL_TYPE_BACKGROUND;
+  static const uint32_t valid_features =
       SHELL_FEAT_VARS | SHELL_FEAT_GLOBS | SHELL_FEAT_SUBSHELL |
       SHELL_FEAT_ARITH | SHELL_FEAT_HEREDOC | SHELL_FEAT_HERESTRING |
       SHELL_FEAT_PROCESS_SUB | SHELL_FEAT_LOOPS | SHELL_FEAT_CONDITIONALS |
-      SHELL_FEAT_CASE | SHELL_FEAT_SUBSHELL_FILE | SHELL_FEAT_PIPELINE;
+      SHELL_FEAT_CASE | SHELL_FEAT_SUBSHELL_FILE | SHELL_FEAT_PIPELINE |
+      SHELL_FEAT_GROUP | SHELL_FEAT_BACKGROUND;
   for (uint32_t i = 0; i < result->count; i++) {
     const shell_range_t *r = &result->cmds[i];
     bool known_type =
         r->type == SHELL_TYPE_SIMPLE || r->type == SHELL_TYPE_PIPELINE ||
         r->type == SHELL_TYPE_AND || r->type == SHELL_TYPE_OR ||
         r->type == SHELL_TYPE_SEMICOLON || r->type == SHELL_TYPE_HEREDOC ||
-        r->type == SHELL_TYPE_HERESTRING || r->type == SHELL_TYPE_SUBSTITUTION;
+        r->type == SHELL_TYPE_HERESTRING ||
+        r->type == SHELL_TYPE_SUBSTITUTION || r->type == SHELL_TYPE_BACKGROUND;
     if (r->len == 0 || r->start > length || r->len > length - r->start ||
         !known_type || (r->type & (uint16_t)~valid_types) != 0 ||
-        (r->features & (uint16_t)~valid_features) != 0) {
+        (r->features & ~valid_features) != 0) {
       if (g_verbose)
         fprintf(stderr,
                 "\n=== FAST PARSER ERROR: Invalid range at idx %u ===\n", i);
@@ -152,7 +155,7 @@ static int test_fixed_oracles(void) {
     uint32_t count;
     uint16_t first_type;
     uint16_t second_type;
-    uint16_t features;
+    uint32_t features;
   };
   static const oracle_case cases[] = {
       {"ls", 1, SHELL_TYPE_SIMPLE, SHELL_TYPE_SIMPLE, 0},
@@ -162,6 +165,14 @@ static int test_fixed_oracles(void) {
       {"ls || pwd", 2, SHELL_TYPE_SIMPLE, SHELL_TYPE_OR, 0},
       {"echo 'a|b'", 1, SHELL_TYPE_SIMPLE, SHELL_TYPE_SIMPLE, 0},
       {"echo $(id)", 1, SHELL_TYPE_SUBSTITUTION, SHELL_TYPE_SIMPLE,
+       SHELL_FEAT_SUBSHELL},
+      {"echo $(id)$(pwd)", 1, SHELL_TYPE_SUBSTITUTION, SHELL_TYPE_SIMPLE,
+       SHELL_FEAT_SUBSHELL},
+      {"echo prefix$(id)suffix$(pwd)", 1, SHELL_TYPE_SUBSTITUTION,
+       SHELL_TYPE_SIMPLE, SHELL_FEAT_SUBSHELL},
+      {"echo $(id)`pwd`", 1, SHELL_TYPE_SUBSTITUTION, SHELL_TYPE_SIMPLE,
+       SHELL_FEAT_SUBSHELL},
+      {"echo \"$(id)$(pwd)\"", 1, SHELL_TYPE_SUBSTITUTION, SHELL_TYPE_SIMPLE,
        SHELL_FEAT_SUBSHELL},
       {"echo $((1+2))", 1, SHELL_TYPE_SIMPLE, SHELL_TYPE_SIMPLE,
        SHELL_FEAT_ARITH},
@@ -176,6 +187,11 @@ static int test_fixed_oracles(void) {
       {"case value", 1, SHELL_TYPE_SIMPLE, SHELL_TYPE_SIMPLE, SHELL_FEAT_CASE},
       {"echo $(<file)", 1, SHELL_TYPE_SUBSTITUTION, SHELL_TYPE_SIMPLE,
        SHELL_FEAT_SUBSHELL | SHELL_FEAT_SUBSHELL_FILE},
+      {"echo ok # ignored\npwd", 2, SHELL_TYPE_SIMPLE, SHELL_TYPE_SEMICOLON, 0},
+      {"echo one & echo two", 2, SHELL_TYPE_SIMPLE, SHELL_TYPE_BACKGROUND,
+       SHELL_FEAT_BACKGROUND},
+      {"(echo one; echo two)", 2, SHELL_TYPE_SIMPLE, SHELL_TYPE_SEMICOLON,
+       SHELL_FEAT_GROUP},
   };
   for (const oracle_case &item : cases) {
     shell_parse_result_t fast = {};
@@ -193,6 +209,73 @@ static int test_fixed_oracles(void) {
     if (!ok || command_count != item.count)
       return 1;
   }
+  struct dep_oracle_case {
+    const char *input;
+    uint32_t command_count;
+    uint32_t substitution_edges;
+  };
+  static const dep_oracle_case dep_cases[] = {
+      {"echo $(id)", 2, 1},
+      {"echo $(id)$(pwd)", 3, 2},
+      {"echo prefix$(id)suffix$(pwd)", 3, 2},
+      {"echo $(id)`pwd`", 3, 2},
+      {"echo $(( $(id) + 1 ))", 2, 1},
+      {"echo \\$(id)", 1, 0},
+      {"echo \\\\$(id)", 2, 1},
+      {"echo \"$(id)$(pwd)\"", 3, 2},
+      {"cat <(printf \\))", 2, 1},
+      {"cat <(printf \\\\)", 2, 1},
+  };
+  for (const dep_oracle_case &item : dep_cases) {
+    shell_dep_graph_t graph = {};
+    if (shell_parse_depgraph(item.input, strlen(item.input), ".", NULL, 0,
+                             &graph) != SHELL_DEP_OK ||
+        !shellsplit_test_depgraph_invariants(item.input, strlen(item.input),
+                                             SHELL_DEP_OK, &graph,
+                                             &SHELL_DEP_LIMITS_DEFAULT))
+      return 1;
+    uint32_t command_count = 0;
+    uint32_t substitution_edges = 0;
+    for (uint32_t i = 0; i < graph.node_count; i++)
+      command_count += graph.nodes[i].type == SHELL_NODE_CMD;
+    for (uint32_t i = 0; i < graph.edge_count; i++)
+      substitution_edges += graph.edges[i].type == SHELL_EDGE_SUBST;
+    if (command_count != item.command_count ||
+        substitution_edges != item.substitution_edges)
+      return 1;
+  }
+  struct composition_oracle {
+    const char *input;
+    uint32_t command_count;
+    shell_dep_edge_type_t edge;
+    uint16_t group_depth;
+    bool backgrounded;
+  };
+  static const composition_oracle composition_cases[] = {
+      {"echo one & echo two", 2, SHELL_EDGE_BACKGROUND, 0, true},
+      {"(echo one; echo two)", 2, SHELL_EDGE_GROUP, 1, false},
+      {"echo one | echo two", 2, SHELL_EDGE_PIPE, 0, false},
+  };
+  for (const composition_oracle &item : composition_cases) {
+    shell_dep_graph_t graph = {};
+    if (shell_parse_depgraph(item.input, strlen(item.input), ".", NULL, 0,
+                             &graph) != SHELL_DEP_OK)
+      return 1;
+    uint32_t command_count = 0;
+    bool edge_seen = false;
+    for (uint32_t i = 0; i < graph.node_count; i++) {
+      if (graph.nodes[i].type != SHELL_NODE_CMD)
+        continue;
+      if (command_count++ == 0 &&
+          (graph.nodes[i].cmd.group_depth != item.group_depth ||
+           graph.nodes[i].cmd.backgrounded != item.backgrounded))
+        return 1;
+    }
+    for (uint32_t i = 0; i < graph.edge_count; i++)
+      edge_seen = edge_seen || graph.edges[i].type == item.edge;
+    if (command_count != item.command_count || !edge_seen)
+      return 1;
+  }
   static const char *const invalid[] = {"echo é"};
   for (const char *input : invalid) {
     shell_parse_result_t fast = {};
@@ -206,6 +289,34 @@ static int test_fixed_oracles(void) {
       return 1;
     }
     shell_free_commands(commands, command_count);
+  }
+  static const char *const unsupported_nested_documents[] = {
+      "echo $(cat <<EOF\nbody\nEOF)",
+      "echo $(cat <<'EOF'\n$(id)\nEOF) && pwd",
+      "cat <(cat <<EOF\nbody\nEOF)",
+  };
+  for (const char *input : unsupported_nested_documents) {
+    shell_parse_result_t fast = {};
+    if (shell_parse_fast(input, strlen(input), NULL, &fast) != SHELL_EPARSE ||
+        !(fast.status & SHELL_STATUS_ERROR))
+      return 1;
+    shell_dep_graph_t graph = {};
+    if (shell_parse_depgraph(input, strlen(input), ".", NULL, 0, &graph) !=
+            SHELL_DEP_EPARSE ||
+        graph.status != SHELL_DEP_STATUS_ERROR)
+      return 1;
+  }
+  static const char *const unsupported_nested_structures[] = {
+      "echo $(case value in x)",
+      "cat <(for ((i=0; i<1; i++)); do echo x; done)",
+  };
+  for (const char *input : unsupported_nested_structures) {
+    shell_dep_graph_t graph = {};
+    if (shell_parse_depgraph(input, strlen(input), ".", NULL, 0, &graph) !=
+            SHELL_DEP_EPARSE ||
+        graph.status != SHELL_DEP_STATUS_ERROR || graph.node_count != 0 ||
+        graph.edge_count != 0)
+      return 1;
   }
   struct full_feature_case {
     const char *input;
@@ -334,83 +445,14 @@ static int test_structured_variants(const char *input, size_t length,
   return 0;
 }
 
-static bool range_in_input(const char *input, size_t length, const char *ptr,
-                           uint32_t span) {
-  if (!ptr)
-    return span == 0;
-  uintptr_t begin = (uintptr_t)input;
-  uintptr_t end = begin + length;
-  uintptr_t value = (uintptr_t)ptr;
-  return value >= begin && value <= end && span <= end - value;
-}
-
 static int validate_depgraph(const char *input, size_t length,
                              shell_dep_error_t error,
                              const shell_dep_graph_t *graph,
                              const shell_dep_limits_t *limits) {
-  uint32_t max_nodes = limits->max_nodes < SHELL_DEP_MAX_NODES
-                           ? limits->max_nodes
-                           : SHELL_DEP_MAX_NODES;
-  uint32_t max_edges = limits->max_edges < SHELL_DEP_MAX_EDGES
-                           ? limits->max_edges
-                           : SHELL_DEP_MAX_EDGES;
-  uint32_t max_tokens = limits->max_tokens_per_cmd < SHELL_DEP_MAX_TOKENS
-                            ? limits->max_tokens_per_cmd
-                            : SHELL_DEP_MAX_TOKENS;
-  uint32_t max_cwd =
-      limits->cwd_buf_size == 0
-          ? SHELL_DEP_CWD_BUF_SIZE
-          : std::min(limits->cwd_buf_size, (uint32_t)SHELL_DEP_CWD_BUF_SIZE);
-  if (error != SHELL_DEP_OK && error != SHELL_DEP_EINPUT &&
-      error != SHELL_DEP_ETRUNC && error != SHELL_DEP_EPARSE)
-    return 1;
-  if ((error == SHELL_DEP_OK && graph->status != SHELL_DEP_STATUS_OK) ||
-      (error == SHELL_DEP_ETRUNC &&
-       !(graph->status & SHELL_DEP_STATUS_TRUNCATED)) ||
-      ((error == SHELL_DEP_EINPUT || error == SHELL_DEP_EPARSE) &&
-       graph->status != SHELL_DEP_STATUS_ERROR) ||
-      graph->node_count > max_nodes || graph->edge_count > max_edges ||
-      graph->cwd_buf.len > SHELL_DEP_CWD_BUF_SIZE ||
-      graph->cwd_buf.len > max_cwd ||
-      (graph->cwd_buf.len > 0 &&
-       graph->cwd_buf.data[graph->cwd_buf.len - 1] != '\0'))
-    return 1;
-
-  if (error == SHELL_DEP_EINPUT || error == SHELL_DEP_EPARSE)
-    return graph->node_count != 0 || graph->edge_count != 0;
-  if (!shell_dep_validate(graph).valid)
-    return 1;
-
-  for (uint32_t i = 0; i < graph->edge_count; i++) {
-    const shell_dep_edge_t *edge = &graph->edges[i];
-    if (edge->from >= graph->node_count || edge->to >= graph->node_count ||
-        edge->type > SHELL_EDGE_CWD || edge->dir > SHELL_DIR_UNDIR)
-      return 1;
-  }
-
-  for (uint32_t i = 0; i < graph->node_count; i++) {
-    const shell_dep_node_t *node = &graph->nodes[i];
-    if (node->type == SHELL_NODE_CMD) {
-      if (node->cmd.token_count > max_tokens)
-        return 1;
-      if (node->cmd.cwd_offset >= graph->cwd_buf.len ||
-          !memchr(graph->cwd_buf.data + node->cmd.cwd_offset, '\0',
-                  graph->cwd_buf.len - node->cmd.cwd_offset))
-        return 1;
-      for (uint32_t j = 0; j < node->cmd.token_count; j++)
-        if (!range_in_input(input, length, node->cmd.tokens[j],
-                            node->cmd.token_lens[j]))
-          return 1;
-      continue;
-    }
-    if (node->type != SHELL_NODE_DOC || node->doc.kind < SHELL_DOC_FILE ||
-        node->doc.kind > SHELL_DOC_ENVVAR ||
-        !range_in_input(input, length, node->doc.path, node->doc.path_len) ||
-        !range_in_input(input, length, node->doc.name, node->doc.name_len) ||
-        !range_in_input(input, length, node->doc.value, node->doc.value_len))
-      return 1;
-  }
-  return 0;
+  return shellsplit_test_depgraph_invariants(input, length, error, graph,
+                                             limits)
+             ? 0
+             : 1;
 }
 
 static int test_depgraph(const char *input, size_t length, const char *cwd,
@@ -500,7 +542,8 @@ static int test_tokenizer_state(const char *input, size_t length) {
         token.position > length || token.length > length - token.position ||
         token.start != input + token.position || token.position < previous_end)
       return 1;
-    iterated.push_back(token);
+    if (token.type != TOKEN_GROUP_START && token.type != TOKEN_GROUP_END)
+      iterated.push_back(token);
     previous_end = token.position + token.length;
   }
   if (!terminated)
@@ -510,6 +553,10 @@ static int test_tokenizer_state(const char *input, size_t length) {
   size_t command_count = 0;
   bool full_ok = shell_tokenize_commands(input, &commands, &command_count);
   if (!full_ok) {
+    shell_free_commands(commands, command_count);
+    return 0;
+  }
+  if (command_count == 0) {
     shell_free_commands(commands, command_count);
     return 0;
   }

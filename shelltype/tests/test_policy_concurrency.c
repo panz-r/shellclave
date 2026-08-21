@@ -20,6 +20,8 @@ enum {
   INTERN_THREAD_COUNT = 6,
   INTERN_UNIQUE_COUNT = 1536,
   INTERN_SHARED_COUNT = 8,
+  MIXED_READER_COUNT = 4,
+  MIXED_WRITER_COUNT = 2,
 };
 
 typedef struct {
@@ -91,7 +93,7 @@ static void *policy_reader(void *opaque) {
     }
     st_policy_free_matches(matches, match_count);
     size_t count = st_policy_count(args->policy);
-    if (count != 2) {
+    if (count < 2) {
       record_failure(args->failures, "policy count", args->id, i);
       break;
     }
@@ -219,6 +221,69 @@ static int test_concurrent_policy_readers(void) {
   st_policy_free(policy);
   st_policy_ctx_free(ctx);
   return passed;
+}
+
+static int test_concurrent_same_policy_readers_and_writer(void) {
+  st_policy_ctx_t *ctx = st_policy_ctx_new();
+  st_policy_t *policy = ctx ? st_policy_new(ctx) : NULL;
+  if (!ctx || !policy)
+    goto setup_failed;
+  if (st_policy_add(policy, "git status") != ST_OK ||
+      st_policy_add(policy, "docker ps") != ST_OK)
+    goto setup_failed;
+
+  enum { THREAD_COUNT = MIXED_READER_COUNT + MIXED_WRITER_COUNT };
+  pthread_barrier_t barrier;
+  if (pthread_barrier_init(&barrier, NULL, THREAD_COUNT) != 0)
+    goto setup_failed;
+  atomic_uint failures;
+  atomic_init(&failures, 0);
+  pthread_t threads[THREAD_COUNT];
+  policy_thread_args_t args[THREAD_COUNT];
+  size_t started = 0;
+  for (size_t i = 0; i < MIXED_READER_COUNT; i++) {
+    args[started] = (policy_thread_args_t){.policy = policy,
+                                           .barrier = &barrier,
+                                           .failures = &failures,
+                                           .id = (unsigned)i};
+    if (pthread_create(&threads[started], NULL, policy_reader,
+                       &args[started]) != 0)
+      break;
+    started++;
+  }
+  for (size_t i = 0;
+       i < MIXED_WRITER_COUNT && started == MIXED_READER_COUNT + i; i++) {
+    args[started] =
+        (policy_thread_args_t){.policy = policy,
+                               .barrier = &barrier,
+                               .failures = &failures,
+                               .id = (unsigned)(MIXED_READER_COUNT + i)};
+    if (pthread_create(&threads[started], NULL, policy_writer,
+                       &args[started]) != 0)
+      break;
+    started++;
+  }
+  if (started != THREAD_COUNT)
+    exit(EXIT_FAILURE);
+
+  for (size_t i = 0; i < THREAD_COUNT; i++)
+    if (pthread_join(threads[i], NULL) != 0)
+      record_failure(&failures, "mixed thread join", (unsigned)i, 0);
+  if (pthread_barrier_destroy(&barrier) != 0)
+    record_failure(&failures, "mixed barrier destroy", 0, 0);
+
+  bool passed = atomic_load(&failures) == 0;
+  passed = passed && policy_matches_exact(policy, "git status") &&
+           policy_matches_exact(policy, "docker ps") &&
+           st_policy_count(policy) == 2;
+  st_policy_free(policy);
+  st_policy_ctx_free(ctx);
+  return passed;
+
+setup_failed:
+  st_policy_free(policy);
+  st_policy_ctx_free(ctx);
+  return 0;
 }
 
 static void *refcount_worker(void *opaque) {
@@ -439,6 +504,10 @@ int main(void) {
   int failures = 0;
   if (!test_concurrent_policy_readers()) {
     fprintf(stderr, "concurrent policy reader test failed\n");
+    failures++;
+  }
+  if (!test_concurrent_same_policy_readers_and_writer()) {
+    fprintf(stderr, "concurrent same-policy reader/writer test failed\n");
     failures++;
   }
   if (!test_concurrent_context_refcount()) {

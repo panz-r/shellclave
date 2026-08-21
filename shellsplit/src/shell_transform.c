@@ -1,6 +1,8 @@
 #define _POSIX_C_SOURCE 200809L
 #include "shell_transform.h"
+#include "alloc.h"
 #include "shell_tokenizer_full.h"
+#include <errno.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -13,7 +15,8 @@ static bool is_shell_syntax_token(token_type_t type) {
   return type == TOKEN_PIPE || type == TOKEN_REDIRECT_IN ||
          type == TOKEN_REDIRECT_OUT || type == TOKEN_REDIRECT_ERR ||
          type == TOKEN_REDIRECT_APPEND || type == TOKEN_SEMICOLON ||
-         type == TOKEN_AND || type == TOKEN_OR ||
+         type == TOKEN_AND || type == TOKEN_BACKGROUND || type == TOKEN_OR ||
+         type == TOKEN_GROUP_START || type == TOKEN_GROUP_END ||
          type == TOKEN_SUBSHELL_START || type == TOKEN_SUBSHELL_END ||
          type == TOKEN_HEREDOC || type == TOKEN_HERESTRING ||
          type == TOKEN_PROCESS_SUB;
@@ -277,8 +280,9 @@ shell_transform_status_t shell_transform_command_line(
   shell_command_t *cmds = NULL;
   size_t cmd_count = 0;
 
+  errno = 0;
   if (!shell_tokenize_commands(command_line, &cmds, &cmd_count))
-    return SHELL_TRANSFORM_EPARSE;
+    return errno == ENOMEM ? SHELL_TRANSFORM_ENOMEM : SHELL_TRANSFORM_EPARSE;
 
   if (cmd_count == 0) {
     return SHELL_TRANSFORM_OK;

@@ -1,7 +1,9 @@
 #define _POSIX_C_SOURCE 200809L
 #include "shell_processor.h"
+#include "alloc.h"
 #include "shell_tokenizer_full.h"
 #include <ctype.h>
+#include <errno.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -12,7 +14,9 @@ static bool is_shell_operator_token(shell_token_t *token) {
          token->type == TOKEN_REDIRECT_ERR ||
          token->type == TOKEN_REDIRECT_APPEND ||
          token->type == TOKEN_SEMICOLON || token->type == TOKEN_AND ||
-         token->type == TOKEN_OR || token->type == TOKEN_SUBSHELL_START ||
+         token->type == TOKEN_BACKGROUND || token->type == TOKEN_OR ||
+         token->type == TOKEN_GROUP_START || token->type == TOKEN_GROUP_END ||
+         token->type == TOKEN_SUBSHELL_START ||
          token->type == TOKEN_SUBSHELL_END || token->type == TOKEN_HEREDOC ||
          token->type == TOKEN_HERESTRING;
 }
@@ -262,9 +266,9 @@ shell_process_status_t shell_process_command(
   shell_command_t *basic_commands;
   size_t basic_count;
 
-  if (!shell_tokenize_commands(command_line, &basic_commands, &basic_count)) {
-    return SHELL_PROCESS_EPARSE;
-  }
+  errno = 0;
+  if (!shell_tokenize_commands(command_line, &basic_commands, &basic_count))
+    return errno == ENOMEM ? SHELL_PROCESS_ENOMEM : SHELL_PROCESS_EPARSE;
 
   if (basic_count == 0) {
     return SHELL_PROCESS_OK;

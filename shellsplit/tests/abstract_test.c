@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include "shell_abstract.h"
+#include "test_allocator.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -144,6 +145,49 @@ static void test_abstraction_matrix(void) {
     TEST(cases[i].name, valid);
     shell_abstracted_destroy(result);
   }
+}
+
+static void test_abstraction_allocation_failures(void) {
+  static const char input[] =
+      "echo $USER /etc/passwd *.txt $(date) $((x+1)) >output";
+  abstracted_command_t *probe = NULL;
+  shellsplit_test_alloc_reset();
+  TEST("allocation probe succeeds", shell_abstract_command(input, &probe));
+  size_t allocations = shellsplit_test_alloc_count();
+  TEST("allocation probe exercises multiple allocations", allocations > 4);
+  shell_abstracted_destroy(probe);
+
+  for (size_t fail_at = 1; fail_at <= allocations; fail_at++) {
+    abstracted_command_t *result = (abstracted_command_t *)(void *)1;
+    shellsplit_test_alloc_fail_at(fail_at);
+    bool success = shell_abstract_command(input, &result);
+    shellsplit_test_alloc_reset();
+    TEST("abstraction allocation failure leaves no result",
+         !success && result == NULL);
+    shell_abstracted_destroy(result);
+  }
+
+  shellsplit_test_alloc_reset();
+  char *sequence = shell_build_type_sequence(input);
+  allocations = shellsplit_test_alloc_count();
+  TEST("type-sequence allocation probe succeeds",
+       sequence != NULL && allocations > 0);
+  free(sequence);
+  bool sequence_failures_are_safe = true;
+  bool observed_failure = false;
+  for (size_t fail_at = 1; fail_at <= allocations; fail_at++) {
+    shellsplit_test_alloc_fail_at(fail_at);
+    sequence = shell_build_type_sequence(input);
+    size_t attempted = shellsplit_test_alloc_count();
+    shellsplit_test_alloc_reset();
+    observed_failure |= sequence == NULL;
+    if (attempted < fail_at ||
+        (sequence && strcmp(sequence, "echo EV AP GB CS AR") != 0))
+      sequence_failures_are_safe = false;
+    free(sequence);
+  }
+  TEST("type-sequence allocation failures are atomic or recoverable",
+       sequence_failures_are_safe && observed_failure);
 }
 
 static void test_element_metadata(void) {
@@ -441,6 +485,7 @@ int main(void) {
   printf("=== Shell Abstraction Tests ===\n");
 
   test_abstraction_matrix();
+  test_abstraction_allocation_failures();
   test_element_metadata();
   test_classification_matrix();
   test_path_and_name_matrices();

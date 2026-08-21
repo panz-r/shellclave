@@ -1,5 +1,6 @@
 #include "env_screener.h"
 #include "relative_permutation_entropy.h"
+#include "test_allocator.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -87,6 +88,24 @@ static int test_permutation_boundaries_and_ranges(void) {
     ASSERT(isfinite(values[i]) && values[i] >= 0.0);
   ASSERT(values[0] <= log2(strlen(long_input)));
   ASSERT(values[1] <= 8.0);
+  return 1;
+}
+
+static int test_permutation_allocation_failures(void) {
+  static const char input[] = "abcdefghijklmnopqrstuvwxyz0123456789";
+  for (size_t fail_at = 1; fail_at <= 2; fail_at++) {
+    shellsplit_test_alloc_fail_at(fail_at);
+    ASSERT(isnan(permutation_entropy(input, 7, 2)));
+    shellsplit_test_alloc_fail_at(fail_at);
+    ASSERT(isnan(relative_entropy_ratio(input, 7, 2)));
+    shellsplit_test_alloc_fail_at(fail_at);
+    ASSERT(isnan(permutation_conditional_entropy(input, 7)));
+    shellsplit_test_alloc_fail_at(fail_at);
+    ASSERT(isnan(relative_conditional_entropy(input, 7)));
+  }
+  shellsplit_test_alloc_reset();
+  ASSERT(isfinite(permutation_entropy(input, 7, 2)));
+  ASSERT(isfinite(permutation_conditional_entropy(input, 7)));
   return 1;
 }
 
@@ -240,6 +259,7 @@ int main(void) {
   printf("Running entropy and environment-screening tests...\n\n");
   TEST(test_known_entropy_values);
   TEST(test_permutation_boundaries_and_ranges);
+  TEST(test_permutation_allocation_failures);
   TEST(test_posterior_regression_matrix);
   TEST(test_detector_matrices);
   TEST(test_environment_scan_contract);

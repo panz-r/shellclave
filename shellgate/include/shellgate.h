@@ -138,6 +138,9 @@ typedef struct {
   uint32_t env_count;
   bool requires_substitution_evaluation;
   int32_t substitution_parent_index;
+  int32_t group_parent_index; /* Reserved for a future explicit group node. */
+  uint16_t group_depth;       /* Parenthesized group nesting depth. */
+  bool backgrounded;          /* Command runs in the background via '&'. */
   uint32_t violation_category_flags;
   uint32_t violation_type_flags;
   /* Deprecated alias retained for source compatibility. */

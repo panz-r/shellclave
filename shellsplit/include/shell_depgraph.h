@@ -6,7 +6,8 @@
  *
  * Consumes the output of the fast tokenizer (shell_parse_fast).
  * Produces a linearized, topologically-sorted graph of CMD and DOC
- * nodes with directed/undirected edges.
+ * nodes with directed/undirected edges. Group and background composition
+ * remains explicit in command metadata and composition edges.
  *
  * Design principles:
  * - Zero-copy: tokens point into original input string
@@ -57,6 +58,7 @@ typedef enum {
 typedef enum {
   SHELL_NODE_CMD = 0,
   SHELL_NODE_DOC,
+  SHELL_NODE_GROUP, /* Reserved; current groups use CMD metadata and edges. */
 } shell_dep_node_type_t;
 
 typedef enum {
@@ -78,6 +80,8 @@ typedef enum {
   SHELL_EDGE_AND = 8,
   SHELL_EDGE_OR = 9,
   SHELL_EDGE_CWD = 10,
+  SHELL_EDGE_BACKGROUND = 11,
+  SHELL_EDGE_GROUP = 12,
 } shell_dep_edge_type_t;
 
 typedef enum {
@@ -139,8 +143,19 @@ typedef struct {
   const char *tokens[SHELL_DEP_MAX_TOKENS];
   uint32_t token_lens[SHELL_DEP_MAX_TOKENS];
   uint32_t token_count;
-  uint32_t cwd_offset; /* Offset into graph->cwd_buf.data */
+  uint32_t cwd_offset;  /* Offset into graph->cwd_buf.data */
+  uint16_t group_depth; /* Parenthesized command-group nesting depth */
+  bool backgrounded;    /* Command runs asynchronously */
+  bool cwd_known;       /* False when branch composition makes CWD ambiguous */
 } shell_dep_cmd_t;
+
+typedef struct {
+  /* Reserved for a future explicit group node; current graphs expose group
+   * spans through each CMD node's group_depth and SHELL_EDGE_GROUP edges. */
+  const char *start; /* Opening parenthesis in the original input */
+  uint32_t length;   /* Complete group span, including delimiters */
+  uint32_t parent;   /* Parent group node, or UINT32_MAX */
+} shell_dep_group_t;
 
 /**
  * DOC node - a data artifact
@@ -166,6 +181,7 @@ typedef struct {
   union {
     shell_dep_cmd_t cmd;
     shell_dep_doc_t doc;
+    shell_dep_group_t group;
   };
 } shell_dep_node_t;
 
@@ -215,9 +231,10 @@ typedef struct {
  * On input or parse errors, writable output counts are cleared and
  * SHELL_DEP_STATUS_ERROR is set.
  *
- * Note: Subshell extraction does not track quoting inside $(...) or `...`.
- * Inputs like $(echo ")") may produce incorrect depth counts.
- * This is acceptable for coarse-grained dependency tracking.
+ * Subshell extraction tracks simple single/double quotes and odd/even
+ * backslash escapes while finding delimiters. It is not a complete shell
+ * grammar; malformed structures are rejected instead of being represented as
+ * a partial graph.
  */
 shell_dep_error_t shell_parse_depgraph(const char *cmd, size_t cmd_len,
                                        const char *initial_cwd,

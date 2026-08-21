@@ -160,6 +160,12 @@ static bool type_cache_insert(type_cache_t *c, const char *key, size_t key_len,
   if (c->capacity == 0)
     return false;
 
+  char *key_copy = malloc(key_len + 1);
+  if (!key_copy)
+    return false;
+  memcpy(key_copy, key, key_len);
+  key_copy[key_len] = '\0';
+
   if (c->count >= c->capacity) {
     free(c->entries[0].key);
     free(c->entries[0].value);
@@ -167,12 +173,6 @@ static bool type_cache_insert(type_cache_t *c, const char *key, size_t key_len,
             (c->count - 1) * sizeof(lru_entry_t));
     c->count--;
   }
-
-  char *key_copy = malloc(key_len + 1);
-  if (!key_copy)
-    return false;
-  memcpy(key_copy, key, key_len);
-  key_copy[key_len] = '\0';
 
   c->entries[c->count].key = key_copy;
   c->entries[c->count].key_len = key_len;
@@ -1288,10 +1288,12 @@ static const char *check_features(const shell_parse_result_t *fast,
       {SHELL_FEAT_GLOBS, "glob expansion"},
       {SHELL_FEAT_SUBSHELL_FILE, "file command substitution"},
       {SHELL_FEAT_PIPELINE, "pipeline"},
+      {SHELL_FEAT_GROUP, "parenthesized command group"},
+      {SHELL_FEAT_BACKGROUND, "background execution"},
   };
 
   for (uint32_t si = 0; si < fast->count; si++) {
-    uint16_t fbits = fast->cmds[si].features;
+    uint32_t fbits = fast->cmds[si].features;
     for (int k = 0; k < (int)(sizeof(feats) / sizeof(feats[0])); k++) {
       if ((fbits & feats[k].bit) && (reject_mask & feats[k].bit)) {
         if (bad_idx)
@@ -1630,7 +1632,8 @@ static bool has_control_flow_path(const shell_dep_graph_t *g, uint32_t from,
       if (e->from != cur)
         continue;
       if (e->type != SHELL_EDGE_SEQ && e->type != SHELL_EDGE_AND &&
-          e->type != SHELL_EDGE_OR && e->type != SHELL_EDGE_PIPE)
+          e->type != SHELL_EDGE_OR && e->type != SHELL_EDGE_PIPE &&
+          e->type != SHELL_EDGE_BACKGROUND && e->type != SHELL_EDGE_GROUP)
         continue;
       if (!visited[e->to]) {
         visited[e->to] = true;
@@ -2622,6 +2625,9 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len, char *buf,
     sg_subcmd_result_t *sr = &out->subcmds[out->subcmd_count++];
     node_result_index[ni] = out->subcmd_count - 1;
     sr->substitution_parent_index = -1;
+    sr->group_parent_index = -1;
+    sr->group_depth = node->cmd.group_depth;
+    sr->backgrounded = node->cmd.backgrounded;
 
     sr->command = build_cmd_string(&node->cmd, &bw, gate);
     if (bw.overflow) {

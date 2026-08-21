@@ -1,4 +1,5 @@
 #include "shell_tokenizer_full.h"
+#include "alloc.h"
 #include <ctype.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -78,6 +79,18 @@ static void skip_whitespace(shell_tokenizer_state_t *state) {
          isspace((unsigned char)state->input[state->position])) {
     state->position++;
   }
+}
+
+static bool comment_starts_at(const shell_tokenizer_state_t *state,
+                              size_t position) {
+  if (!state || position >= state->length || state->input[position] != '#')
+    return false;
+  if (position == 0)
+    return true;
+  char previous = state->input[position - 1];
+  return isspace((unsigned char)previous) || previous == ';' ||
+         previous == '|' || previous == '&' || previous == '(' ||
+         previous == ')';
 }
 
 static bool handle_quotes(shell_tokenizer_state_t *state) {
@@ -484,10 +497,32 @@ bool shell_tokenizer_next(shell_tokenizer_state_t *state,
     return false;
   }
 
-  skip_whitespace(state);
-
-  if (state->position >= state->length) {
-    return false;
+  for (;;) {
+    if (state->position >= state->length)
+      return false;
+    if (!state->in_quotes && (state->input[state->position] == '\n' ||
+                              state->input[state->position] == '\r')) {
+      size_t newline = state->position++;
+      if (state->input[newline] == '\r' && state->position < state->length &&
+          state->input[state->position] == '\n')
+        state->position++;
+      token->type = TOKEN_SEMICOLON;
+      token->start = state->input + newline;
+      token->length = state->position - newline;
+      token->position = newline;
+      return true;
+    }
+    skip_whitespace(state);
+    if (state->position >= state->length)
+      return false;
+    if (!state->in_quotes && comment_starts_at(state, state->position)) {
+      while (state->position < state->length &&
+             state->input[state->position] != '\n' &&
+             state->input[state->position] != '\r')
+        state->position++;
+      continue;
+    }
+    break;
   }
 
   size_t start_pos = state->position;
@@ -718,18 +753,20 @@ bool shell_tokenizer_next(shell_tokenizer_state_t *state,
       }
       break;
     case '&':
-      token->type = TOKEN_AND;
+      token->type = TOKEN_BACKGROUND;
       break;
     case ';':
       token->type = TOKEN_SEMICOLON;
       break;
     case '(':
-      token->type = TOKEN_SUBSHELL_START;
+      token->type = TOKEN_GROUP_START;
       state->paren_depth++;
       state->in_subshell = true;
+      token->group_depth = (size_t)state->paren_depth;
       break;
     case ')':
-      token->type = TOKEN_SUBSHELL_END;
+      token->type = TOKEN_GROUP_END;
+      token->group_depth = (size_t)state->paren_depth;
       if (state->paren_depth > 0)
         state->paren_depth--;
       if (state->paren_depth == 0)
@@ -870,6 +907,7 @@ bool shell_tokenizer_next(shell_tokenizer_state_t *state,
   token->position = start_pos;
   token->is_quoted = state->in_quotes;
   token->is_escaped = false;
+  token->group_depth = (size_t)state->paren_depth;
 
   check_keyword(state, token_text, token_length);
 
@@ -910,7 +948,8 @@ bool shell_tokenize_commands(const char *input, shell_command_t **commands,
     }
 
     if (token.type == TOKEN_PIPE || token.type == TOKEN_SEMICOLON ||
-        token.type == TOKEN_AND || token.type == TOKEN_OR) {
+        token.type == TOKEN_AND || token.type == TOKEN_BACKGROUND ||
+        token.type == TOKEN_OR) {
       expect_command = true;
     }
   }
@@ -972,6 +1011,7 @@ bool shell_tokenize_commands(const char *input, shell_command_t **commands,
   current_cmd->token_count = 0;
   current_cmd->start_pos = state.position;
   current_cmd->end_pos = state.position;
+  current_cmd->group_depth = 0;
   current_cmd->has_variables = false;
   current_cmd->has_globs = false;
   current_cmd->has_subshells = false;
@@ -979,16 +1019,31 @@ bool shell_tokenize_commands(const char *input, shell_command_t **commands,
   current_cmd->has_loops = false;
   current_cmd->has_conditionals = false;
   current_cmd->has_case = false;
+  current_cmd->has_groups = false;
+  current_cmd->has_background = false;
 
   expect_command = true;
   bool saw_loop = false;
   bool saw_conditional = false;
   bool saw_case = false;
+  bool closed_group_at_end = false;
 
   while (shell_tokenizer_next(&state, &token)) {
+    closed_group_at_end = token.type == TOKEN_GROUP_END;
     saw_loop = saw_loop || state.loop_depth > 0;
     saw_conditional = saw_conditional || state.if_depth > 0;
     saw_case = saw_case || state.case_depth > 0;
+    if (token.type == TOKEN_GROUP_START || token.type == TOKEN_GROUP_END) {
+      current_cmd->has_groups = true;
+      if (token.group_depth > current_cmd->group_depth)
+        current_cmd->group_depth = token.group_depth;
+      if (token.type == TOKEN_GROUP_START && current_cmd->token_count == 0) {
+        current_cmd->start_pos = token.position + 1;
+      } else if (token.type == TOKEN_GROUP_END) {
+        current_cmd->end_pos = token.position;
+      }
+      continue;
+    }
     if (expect_command &&
         (token.type == TOKEN_COMMAND || token.type == TOKEN_ARGUMENT ||
          token.type == TOKEN_SUBSHELL || token.type == TOKEN_VARIABLE ||
@@ -1016,7 +1071,12 @@ bool shell_tokenize_commands(const char *input, shell_command_t **commands,
           current_cmd->has_globs = false;
           current_cmd->has_subshells = false;
           current_cmd->has_arithmetic = false;
+          current_cmd->group_depth = state.paren_depth;
+          current_cmd->has_groups = false;
+          current_cmd->has_background = false;
         }
+      } else if (current_cmd->has_groups) {
+        current_cmd->start_pos = token.position;
       }
       expect_command = false;
     }
@@ -1055,6 +1115,13 @@ bool shell_tokenize_commands(const char *input, shell_command_t **commands,
     case TOKEN_SUBSHELL:
       current_cmd->has_subshells = true;
       break;
+    case TOKEN_GROUP_START:
+    case TOKEN_GROUP_END:
+      current_cmd->has_groups = true;
+      break;
+    case TOKEN_BACKGROUND:
+      current_cmd->has_background = true;
+      break;
     case TOKEN_ARITHMETIC:
       current_cmd->has_arithmetic = true;
       break;
@@ -1069,14 +1136,16 @@ bool shell_tokenize_commands(const char *input, shell_command_t **commands,
       current_cmd->has_variables = true;
 
     if (token.type == TOKEN_PIPE || token.type == TOKEN_SEMICOLON ||
-        token.type == TOKEN_AND || token.type == TOKEN_OR) {
+        token.type == TOKEN_AND || token.type == TOKEN_BACKGROUND ||
+        token.type == TOKEN_OR) {
       expect_command = true;
       current_cmd->end_pos = token.position + token.length;
     }
   }
 
   if (current_command < count) {
-    (*commands)[current_command].end_pos = state.position;
+    if (!closed_group_at_end)
+      (*commands)[current_command].end_pos = state.position;
     current_cmd->tokens = tokens;
   }
 
@@ -1146,12 +1215,18 @@ const char *shell_token_type_name(token_type_t type) {
     return "SEMICOLON";
   case TOKEN_AND:
     return "AND";
+  case TOKEN_BACKGROUND:
+    return "BACKGROUND";
   case TOKEN_OR:
     return "OR";
   case TOKEN_SUBSHELL_START:
     return "SUBSHELL_START";
   case TOKEN_SUBSHELL_END:
     return "SUBSHELL_END";
+  case TOKEN_GROUP_START:
+    return "GROUP_START";
+  case TOKEN_GROUP_END:
+    return "GROUP_END";
   case TOKEN_VARIABLE:
     return "VARIABLE";
   case TOKEN_VARIABLE_QUOTED:

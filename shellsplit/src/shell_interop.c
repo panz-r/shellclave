@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "alloc.h"
 #include "shell_interop.h"
 #include "shell_tokenizer.h"
 
@@ -164,6 +165,10 @@ char *shell_interop_features_str(int features) {
     strcat(buf, "SUBSHELL_FILE ");
   if (features & SHELL_FEAT_PIPELINE)
     strcat(buf, "PIPELINE ");
+  if (features & SHELL_FEAT_GROUP)
+    strcat(buf, "GROUP ");
+  if (features & SHELL_FEAT_BACKGROUND)
+    strcat(buf, "BACKGROUND ");
 
   if (buf[0] == '\0') {
     strcpy(buf, "none");
@@ -193,6 +198,8 @@ char *shell_interop_type_str(int type) {
     strcpy(buf, "HERESTRING");
   } else if (type & SHELL_TYPE_SUBSTITUTION) {
     strcpy(buf, "SUBSTITUTION");
+  } else if (type & SHELL_TYPE_BACKGROUND) {
+    strcpy(buf, "BACKGROUND");
   } else {
     strcpy(buf, "SIMPLE");
   }

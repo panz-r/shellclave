@@ -1,5 +1,6 @@
 #define _XOPEN_SOURCE 700
 #include "shell_abstract.h"
+#include "alloc.h"
 #include "shell_processor.h"
 #include "shell_tokenizer_full.h"
 #include <ctype.h>

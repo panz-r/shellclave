@@ -1,6 +1,7 @@
 #include "shell_processor.h"
 #include "shell_tokenizer_full.h"
 #include "shell_transform.h"
+#include "test_allocator.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -47,9 +48,12 @@ static void test_token_type_names(void) {
       "REDIRECT_APPEND",
       "SEMICOLON",
       "AND",
+      "BACKGROUND",
       "OR",
       "SUBSHELL_START",
       "SUBSHELL_END",
+      "GROUP_START",
+      "GROUP_END",
       "END",
       "VARIABLE",
       "VARIABLE_QUOTED",
@@ -68,6 +72,37 @@ static void test_token_type_names(void) {
           strcmp(shell_token_type_name((token_type_t)(TOKEN_HERESTRING + 1)),
                  "UNKNOWN") == 0;
   test("Token type names cover every enum value", valid);
+}
+
+static void test_composition_metadata(void) {
+  shell_command_t *commands = NULL;
+  size_t count = 0;
+  bool ok =
+      shell_tokenize_commands("echo ok # | ignored\npwd", &commands, &count) &&
+      count == 2 && commands[0].token_count >= 2 &&
+      commands[0].tokens[0].start[0] == 'e' &&
+      commands[0].tokens[1].start[0] == 'o' &&
+      commands[1].tokens[0].start[0] == 'p';
+  shell_free_commands(commands, count);
+  test("Comments hide operators and preserve following command", ok);
+
+  commands = NULL;
+  count = 0;
+  ok = shell_tokenize_commands("first & second", &commands, &count) &&
+       count == 2 && commands[0].has_background &&
+       commands[1].tokens[0].type == TOKEN_COMMAND;
+  shell_free_commands(commands, count);
+  test("Background separator is represented without losing commands", ok);
+
+  commands = NULL;
+  count = 0;
+  ok = shell_tokenize_commands("(one; two)", &commands, &count) && count == 2 &&
+       commands[0].has_groups && commands[1].has_groups &&
+       commands[0].group_depth == 1 && commands[1].group_depth == 1 &&
+       commands[0].start_pos == 1 && commands[1].start_pos == 6 &&
+       commands[1].end_pos == 9;
+  shell_free_commands(commands, count);
+  test("Parenthesized groups retain command spans and depth", ok);
 }
 
 static bool is_cleared_end_token(const shell_token_t *token) {
@@ -439,8 +474,129 @@ static void run_transform_line_cases(const transform_line_case_t *cases,
   }
 }
 
+static void test_tokenize_allocation_failures(void) {
+  static const char input[] =
+      "echo a b c d e f g h i j k l m n o p q r ; printf x ; sort";
+  shell_command_t *commands = NULL;
+  size_t count = 0;
+  shellsplit_test_alloc_reset();
+  bool success = shell_tokenize_commands(input, &commands, &count);
+  size_t allocations = shellsplit_test_alloc_count();
+  test("Allocation probe tokenizes multiple grown commands",
+       success && count == 3 && allocations >= 5);
+  shell_free_commands(commands, count);
+
+  bool atomic = true;
+  for (size_t fail_at = 1; fail_at <= allocations; fail_at++) {
+    commands = (shell_command_t *)(void *)1;
+    count = SIZE_MAX;
+    shellsplit_test_alloc_fail_at(fail_at);
+    success = shell_tokenize_commands(input, &commands, &count);
+    shellsplit_test_alloc_reset();
+    if (success || commands != NULL || count != 0) {
+      atomic = false;
+      shell_free_commands(commands, count);
+      break;
+    }
+  }
+  test("Tokenizer allocation failures clear outputs", atomic);
+}
+
+static void test_processor_allocation_failures(void) {
+  static const char input[] =
+      "echo $USER a b c d e f g h i j k l m n o p | grep '*.txt'";
+  shell_command_info_t *infos = NULL;
+  size_t count = 0;
+  shellsplit_test_alloc_reset();
+  shell_process_status_t status =
+      shell_process_command(input, NULL, &infos, &count);
+  size_t allocations = shellsplit_test_alloc_count();
+  test("Processor allocation probe succeeds",
+       status == SHELL_PROCESS_OK && count == 2 && allocations > 5);
+  shell_free_command_infos(infos, count);
+
+  bool atomic = true;
+  for (size_t fail_at = 1; fail_at <= allocations; fail_at++) {
+    infos = (shell_command_info_t *)(void *)1;
+    count = SIZE_MAX;
+    shellsplit_test_alloc_fail_at(fail_at);
+    status = shell_process_command(input, NULL, &infos, &count);
+    shellsplit_test_alloc_reset();
+    if (status != SHELL_PROCESS_ENOMEM || infos != NULL || count != 0) {
+      atomic = false;
+      shell_free_command_infos(infos, count);
+      break;
+    }
+  }
+  test("Processor allocation failures report ENOMEM and clear outputs", atomic);
+
+  const char **inputs = NULL;
+  bool has_features = false;
+  shellsplit_test_alloc_reset();
+  status =
+      shell_extract_dfa_inputs(input, NULL, &inputs, &count, &has_features);
+  allocations = shellsplit_test_alloc_count();
+  test("DFA extraction allocation probe succeeds",
+       status == SHELL_PROCESS_OK && count == 2 && has_features &&
+           allocations > 5);
+  free_dfa_inputs(inputs, count);
+
+  atomic = true;
+  for (size_t fail_at = 1; fail_at <= allocations; fail_at++) {
+    inputs = (const char **)(void *)1;
+    count = SIZE_MAX;
+    has_features = true;
+    shellsplit_test_alloc_fail_at(fail_at);
+    status =
+        shell_extract_dfa_inputs(input, NULL, &inputs, &count, &has_features);
+    shellsplit_test_alloc_reset();
+    if (status != SHELL_PROCESS_ENOMEM || inputs != NULL || count != 0 ||
+        has_features) {
+      atomic = false;
+      free_dfa_inputs(inputs, count);
+      break;
+    }
+  }
+  test("DFA extraction allocation failures are atomic", atomic);
+}
+
+static void test_transform_allocation_failures(void) {
+  static const char input[] =
+      "echo $USER a b c d e f g h i j k l m n o p | grep '*.txt'";
+  transformed_command_t **commands = NULL;
+  size_t count = 0;
+  shellsplit_test_alloc_reset();
+  shell_transform_status_t status =
+      shell_transform_command_line(input, NULL, &commands, &count);
+  size_t allocations = shellsplit_test_alloc_count();
+  test("Transform allocation probe succeeds",
+       status == SHELL_TRANSFORM_OK && count == 2 && allocations > 5);
+  shell_free_transformed_commands(commands, count);
+  free(commands);
+
+  bool atomic = true;
+  for (size_t fail_at = 1; fail_at <= allocations; fail_at++) {
+    commands = (transformed_command_t **)(void *)1;
+    count = SIZE_MAX;
+    shellsplit_test_alloc_fail_at(fail_at);
+    status = shell_transform_command_line(input, NULL, &commands, &count);
+    shellsplit_test_alloc_reset();
+    if (status != SHELL_TRANSFORM_ENOMEM || commands != NULL || count != 0) {
+      atomic = false;
+      shell_free_transformed_commands(commands, count);
+      free(commands);
+      break;
+    }
+  }
+  test("Transform allocation failures report ENOMEM and clear outputs", atomic);
+}
+
 int main(void) {
+  test_tokenize_allocation_failures();
+  test_processor_allocation_failures();
+  test_transform_allocation_failures();
   test_token_type_names();
+  test_composition_metadata();
   static const iterator_case_t iterator_cases[] = {
       {"Tokenizer iterator: empty input", "", 0, {0}, {NULL}, 0, 0, 0},
       {"Tokenizer iterator: whitespace exhaustion",

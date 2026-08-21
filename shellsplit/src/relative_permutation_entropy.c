@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "alloc.h"
 #include "relative_permutation_entropy.h"
 
 // Function to compute Shannon entropy for n-grams

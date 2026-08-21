@@ -15,6 +15,7 @@ extern "C" {
  * - Pipes (|)
  * - Redirections (>, <, >>, 2>, etc.)
  * - Command separators (&&, ||, ;)
+ * - Comments, background separators (&), and parenthesized groups
  * - Quoting and escaping
  * - Subshells and command substitution
  * - Variables: $VAR, ${VAR}, $1, $#, $?, $$, $!, $@, $*, $-
@@ -36,9 +37,12 @@ typedef enum {
   TOKEN_REDIRECT_APPEND, // Append redirection
   TOKEN_SEMICOLON,       // Command separator
   TOKEN_AND,             // Logical AND
+  TOKEN_BACKGROUND,      // Background command separator (&)
   TOKEN_OR,              // Logical OR
   TOKEN_SUBSHELL_START,  // Subshell start
   TOKEN_SUBSHELL_END,    // Subshell end
+  TOKEN_GROUP_START,     // Parenthesized command-group start
+  TOKEN_GROUP_END,       // Parenthesized command-group end
   TOKEN_END,             // End of tokens
 
   // Extended types
@@ -57,12 +61,13 @@ typedef enum {
  * Token structure
  */
 typedef struct {
-  token_type_t type; // Token type
-  const char *start; // Pointer to start of token in original string
-  size_t length;     // Length of token
-  size_t position;   // Position in original string
-  bool is_quoted;    // True if token is quoted
-  bool is_escaped;   // True if token contains escapes
+  token_type_t type;  // Token type
+  const char *start;  // Pointer to start of token in original string
+  size_t length;      // Length of token
+  size_t position;    // Position in original string
+  bool is_quoted;     // True if token is quoted
+  bool is_escaped;    // True if token contains escapes
+  size_t group_depth; // Parenthesized command-group nesting depth
 } shell_token_t;
 
 /**
@@ -73,6 +78,7 @@ typedef struct {
   size_t token_count;    // Number of tokens
   size_t start_pos;      // Start position in original string
   size_t end_pos;        // End position in original string
+  size_t group_depth;    // Parenthesized command-group nesting depth
   bool has_variables;    // Contains variables ($VAR, ${VAR}, etc.)
   bool has_globs;        // Contains glob patterns (*, ?, [abc])
   bool has_subshells;    // Contains subshells ($(cmd), `cmd`)
@@ -80,6 +86,8 @@ typedef struct {
   bool has_loops;        // Contains loops (while, for, until)
   bool has_conditionals; // Contains conditionals (if/then/elif/else/fi)
   bool has_case;         // Contains case statements
+  bool has_groups;       // Contains parenthesized command groups
+  bool has_background;   // Contains background execution
 } shell_command_t;
 
 /**
