@@ -1218,6 +1218,27 @@ TEST(buffer_contract_matrix) {
   sg_gate_free(g);
 }
 
+TEST(final_diagnostic_truncation_fails_closed) {
+  const char *rules[] = {"lss"};
+  sg_gate_t *gate = gate_with_rules(rules, 1);
+  ASSERT(gate != NULL);
+  ASSERT_SG_OK(sg_gate_set_suggestions(gate, true));
+
+  bool exercised = false;
+  for (size_t buffer_size = 1; buffer_size <= 64; buffer_size++) {
+    char buffer[64];
+    sg_result_t result;
+    sg_error_t error = sg_eval(gate, "ls", 2, buffer, buffer_size, &result);
+    ASSERT(result.truncated == (error == SG_ERR_TRUNC));
+    if (error == SG_ERR_TRUNC && result.suggestion_count > 0) {
+      exercised = true;
+      ASSERT(result.verdict == SG_VERDICT_UNDETERMINED);
+    }
+  }
+  ASSERT(exercised);
+  sg_gate_free(gate);
+}
+
 /* --- VERDICT HELPERS --- */
 
 TEST(helper_contracts) {
@@ -1394,6 +1415,16 @@ static size_t expand_requested_length(const char *name, char *buf,
   return length;
 }
 
+static size_t expand_oversized_length(const char *name, char *buf,
+                                      size_t buf_size, void *ctx) {
+  (void)name;
+  (void)buf;
+  (void)ctx;
+  return buf_size + 1;
+}
+
+static sg_gate_t *gate_with_violations(void);
+
 TEST(expansion_bounds_matrix) {
   static const struct {
     size_t returned_length;
@@ -1430,6 +1461,73 @@ TEST(expansion_bounds_matrix) {
   ASSERT(eval_cmd(gate, long_glob, &result) == SG_ERR_TRUNC);
   ASSERT(result.truncated);
   ASSERT(result.verdict == SG_VERDICT_UNDETERMINED);
+  sg_gate_free(gate);
+}
+
+TEST(truncation_cross_product_matrix) {
+  sg_gate_t *gate = gate_with_violations();
+  ASSERT(gate != NULL);
+  ASSERT_SG_OK(sg_gate_add_rule(gate, "id"));
+  ASSERT_SG_OK(sg_gate_add_rule(gate, "pwd"));
+  ASSERT_SG_OK(sg_gate_set_stop_mode(gate, SG_EVAL_ALL));
+  ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
+
+  struct {
+    const char *command;
+    size_t buffer_size;
+    sg_error_t expected_error;
+    sg_verdict_t expected_verdict;
+    uint32_t expected_count;
+  } cases[] = {
+      {"echo $(id)$(pwd)", 4096, SG_OK, SG_VERDICT_ALLOW_CONDITIONAL, 3},
+      {"echo $(id)$(pwd)", 16, SG_ERR_TRUNC, SG_VERDICT_UNDETERMINED, 1},
+      {"cat /etc/passwd ; echo $(id)", 4096, SG_OK,
+       SG_VERDICT_ALLOW_CONDITIONAL, 3},
+      {"cat /etc/passwd ; echo $(id)", 12, SG_ERR_TRUNC,
+       SG_VERDICT_UNDETERMINED, 1},
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    char buffer[4096];
+    sg_result_t result;
+    sg_error_t error = sg_eval(gate, cases[i].command, strlen(cases[i].command),
+                               buffer, cases[i].buffer_size, &result);
+    ASSERT(error == cases[i].expected_error);
+    ASSERT(result.verdict == cases[i].expected_verdict);
+    ASSERT(result.subcmd_count == cases[i].expected_count);
+    ASSERT(result.truncated == (error == SG_ERR_TRUNC));
+    if (error == SG_ERR_TRUNC)
+      ASSERT(result.verdict != SG_VERDICT_ALLOW &&
+             result.verdict != SG_VERDICT_ALLOW_CONDITIONAL);
+  }
+
+  ASSERT_SG_OK(sg_gate_set_expand_var(gate, expand_oversized_length, NULL));
+  char buffer[4096];
+  sg_result_t result;
+  ASSERT(sg_eval(gate, "echo $VALUE", strlen("echo $VALUE"), buffer,
+                 sizeof(buffer), &result) == SG_ERR_TRUNC);
+  ASSERT(result.truncated && result.verdict == SG_VERDICT_UNDETERMINED);
+
+  char many_writes[2048] = {0};
+  size_t used = 0;
+  for (size_t i = 0; i < SG_MAX_VIOLATIONS + 4; i++) {
+    int written =
+        snprintf(many_writes + used, sizeof(many_writes) - used,
+                 "%secho x > /etc/truncation-%zu", i == 0 ? "" : " ; ", i);
+    ASSERT(written > 0 && (size_t)written < sizeof(many_writes) - used);
+    used += (size_t)written;
+  }
+  ASSERT_SG_OK(sg_gate_set_expand_var(gate, NULL, NULL));
+  ASSERT(sg_eval(gate, many_writes, used, buffer, sizeof(buffer), &result) ==
+         SG_OK);
+  ASSERT(!result.truncated);
+  ASSERT(result.violation_truncated);
+  ASSERT(result.violation_count <= SG_MAX_VIOLATIONS);
+  ASSERT(result.violation_dropped_count > 0);
+  ASSERT(result.violation_flags == result.violation_type_flags);
+  char small_buffer[32];
+  ASSERT(sg_eval(gate, many_writes, used, small_buffer, sizeof(small_buffer),
+                 &result) == SG_ERR_TRUNC);
+  ASSERT(result.truncated && result.verdict == SG_VERDICT_UNDETERMINED);
   sg_gate_free(gate);
 }
 
@@ -2378,6 +2476,13 @@ TEST(anomaly_bundle_corruption_matrix) {
 TEST(anomaly_bundle_failure_atomicity) {
   const char *path = temp_policy_file();
   ASSERT(path != NULL);
+  char stale_path[320];
+  ASSERT(snprintf(stale_path, sizeof(stale_path), "%s.stale", path) > 0);
+  FILE *stale = fopen(stale_path, "wb");
+  ASSERT(stale != NULL);
+  ASSERT(fputs("incomplete anomaly bundle", stale) >= 0);
+  ASSERT(fclose(stale) == 0);
+  register_temp_file(stale_path);
   sg_gate_t *first = sg_gate_new();
   sg_gate_t *second = sg_gate_new();
   ASSERT(first != NULL && second != NULL);
@@ -2401,6 +2506,7 @@ TEST(anomaly_bundle_failure_atomicity) {
     sg_test_io_fail_at(i);
     ASSERT(sg_gate_save_anomaly_model(second, path) == SG_ERR_IO);
     sg_test_io_reset();
+    ASSERT(access(stale_path, F_OK) == 0);
 
     sg_gate_t *loaded = sg_gate_new();
     ASSERT(loaded != NULL);
@@ -2416,6 +2522,7 @@ TEST(anomaly_bundle_failure_atomicity) {
 
   ASSERT(chmod(path, 0640) == 0);
   ASSERT_SG_OK(sg_gate_save_anomaly_model(second, path));
+  ASSERT(access(stale_path, F_OK) == 0);
   struct stat status;
   ASSERT(stat(path, &status) == 0);
   ASSERT((status.st_mode & 0777) == 0640);
@@ -3060,10 +3167,12 @@ int main(void) {
 
   printf("\nBuffer management:\n");
   RUN(buffer_contract_matrix);
+  RUN(final_diagnostic_truncation_fails_closed);
 
   printf("\nExpansion callbacks:\n");
   RUN(expansion_callback_matrix);
   RUN(expansion_bounds_matrix);
+  RUN(truncation_cross_product_matrix);
 
   printf("\nViolation scanning:\n");
   RUN(violation_rule_matrix);

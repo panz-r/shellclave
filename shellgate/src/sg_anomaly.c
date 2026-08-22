@@ -907,30 +907,122 @@ bool sg_anomaly_has_observed(const sg_anomaly_model_t *model, const char **seq,
   return false;
 }
 
-void sg_anomaly_reset(sg_anomaly_model_t *model) {
-  if (!model)
-    return;
-  ht_destroy(model->uni);
-  ht_destroy(model->bi);
-  ht_destroy(model->tri);
-  ht_destroy(model->quad);
-  ht_destroy(model->bi_ctx);
-  ht_destroy(model->tri_ctx);
-  ht_destroy(model->quad_ctx);
+typedef struct {
+  ht_table_t *uni;
+  ht_table_t *bi;
+  ht_table_t *tri;
+  ht_table_t *quad;
+  ht_table_t *bi_ctx;
+  ht_table_t *tri_ctx;
+  ht_table_t *quad_ctx;
+} anomaly_tables_t;
+
+static anomaly_tables_t anomaly_tables_from_model(sg_anomaly_model_t *model) {
+  return (anomaly_tables_t){model->uni,     model->bi,     model->tri,
+                            model->quad,    model->bi_ctx, model->tri_ctx,
+                            model->quad_ctx};
+}
+
+static void anomaly_tables_destroy(anomaly_tables_t *tables) {
+  ht_destroy(tables->uni);
+  ht_destroy(tables->bi);
+  ht_destroy(tables->tri);
+  ht_destroy(tables->quad);
+  ht_destroy(tables->bi_ctx);
+  ht_destroy(tables->tri_ctx);
+  ht_destroy(tables->quad_ctx);
+  memset(tables, 0, sizeof(*tables));
+}
+
+static ht_table_t *count_table_clone(const ht_table_t *source) {
+  ht_table_t *copy = count_table_create();
+  if (!copy)
+    return NULL;
+
+  ht_iter_t iter = ht_iter_begin((ht_table_t *)source);
+  const void *key;
+  size_t key_len;
+  const void *value;
+  size_t value_len;
+  while (ht_iter_next((ht_table_t *)source, &iter, &key, &key_len, &value,
+                      &value_len)) {
+    if (SG_ANOMALY_OP_FAILED() ||
+        ht_upsert_with_hash(copy, anomaly_hash_fn(key, key_len, NULL), key,
+                            key_len, value, value_len) == HT_INSERT_FAILED) {
+      ht_destroy(copy);
+      return NULL;
+    }
+  }
+  return copy;
+}
+
+static bool anomaly_tables_clone(const anomaly_tables_t *source,
+                                 anomaly_tables_t *copy) {
+  memset(copy, 0, sizeof(*copy));
+  const ht_table_t *sources[] = {
+      source->uni,    source->bi,      source->tri,     source->quad,
+      source->bi_ctx, source->tri_ctx, source->quad_ctx};
+  ht_table_t **destinations[] = {&copy->uni,     &copy->bi,     &copy->tri,
+                                 &copy->quad,    &copy->bi_ctx, &copy->tri_ctx,
+                                 &copy->quad_ctx};
+  for (size_t i = 0; i < sizeof(sources) / sizeof(sources[0]); i++) {
+    *destinations[i] = count_table_clone(sources[i]);
+    if (!*destinations[i]) {
+      anomaly_tables_destroy(copy);
+      return false;
+    }
+  }
+  return true;
+}
+
+static void anomaly_replace_model(sg_anomaly_model_t *model,
+                                  sg_anomaly_model_t *staged) {
+  sg_anomaly_model_t previous = *model;
+  *model = *staged;
+  *staged = previous;
+  sg_anomaly_model_free(staged);
+}
+
+static void anomaly_recalculate_totals(sg_anomaly_model_t *model) {
   model->total_uni = 0;
   model->total_bi = 0;
   model->total_tri = 0;
   model->total_quad = 0;
-  model->vocab_size = 0;
-  model->unk_count = 0;
-  model->oom = false;
-  model->uni = count_table_create();
-  model->bi = count_table_create();
-  model->tri = count_table_create();
-  model->quad = count_table_create();
-  model->bi_ctx = count_table_create();
-  model->tri_ctx = count_table_create();
-  model->quad_ctx = count_table_create();
+  model->vocab_size = ht_size(model->uni);
+
+  ht_table_t *tables[] = {model->uni, model->bi, model->tri, model->quad};
+  size_t *totals[] = {&model->total_uni, &model->total_bi, &model->total_tri,
+                      &model->total_quad};
+  for (size_t table_index = 0; table_index < 4; table_index++) {
+    ht_iter_t iter = ht_iter_begin(tables[table_index]);
+    const void *key;
+    size_t key_len;
+    const void *value;
+    size_t value_len;
+    while (ht_iter_next(tables[table_index], &iter, &key, &key_len, &value,
+                        &value_len)) {
+      (void)key;
+      (void)key_len;
+      if (value_len == sizeof(int64_t))
+        *totals[table_index] += (size_t)count_value(value);
+    }
+  }
+}
+
+sg_anomaly_status_t sg_anomaly_reset(sg_anomaly_model_t *model) {
+  if (!model)
+    return SG_ANOMALY_ERR_INVALID;
+
+  sg_anomaly_model_t *staged =
+      sg_anomaly_model_new_ex(model->alpha, model->unk_prior);
+  if (!staged) {
+    model->oom = true;
+    return SG_ANOMALY_ERR_MEMORY;
+  }
+  staged->kn_discount = model->kn_discount;
+  staged->oom = false;
+  anomaly_replace_model(model, staged);
+  return SG_ANOMALY_OK;
 }
 
 typedef struct {
@@ -984,10 +1076,13 @@ static bool table_decay(ht_table_t *t, double scale) {
   bool success = true;
   for (size_t i = 0; i < change_len; i++) {
     if (changes[i].count < 1) {
-      ht_remove(t, changes[i].key, changes[i].key_len);
+      if (SG_ANOMALY_OP_FAILED() ||
+          ht_remove(t, changes[i].key, changes[i].key_len) == 0)
+        success = false;
     } else {
       uint64_t hash = anomaly_hash_fn(changes[i].key, changes[i].key_len, NULL);
-      if (ht_upsert_with_hash(t, hash, changes[i].key, changes[i].key_len,
+      if (SG_ANOMALY_OP_FAILED() ||
+          ht_upsert_with_hash(t, hash, changes[i].key, changes[i].key_len,
                               &changes[i].count,
                               sizeof(changes[i].count)) == HT_INSERT_FAILED)
         success = false;
@@ -997,60 +1092,50 @@ static bool table_decay(ht_table_t *t, double scale) {
   return success;
 }
 
-void sg_anomaly_model_decay(sg_anomaly_model_t *model, double scale) {
-  if (!model || scale <= 0.0 || scale >= 1.0)
-    return;
+sg_anomaly_status_t sg_anomaly_model_decay(sg_anomaly_model_t *model,
+                                           double scale) {
+  if (!model || !isfinite(scale) || scale <= 0.0 || scale > 1.0)
+    return SG_ANOMALY_ERR_INVALID;
+  if (scale == 1.0)
+    return SG_ANOMALY_OK;
 
-  bool success = table_decay(model->uni, scale);
-  success = table_decay(model->bi, scale) && success;
-  success = table_decay(model->tri, scale) && success;
-  success = table_decay(model->quad, scale) && success;
-  success = table_decay(model->bi_ctx, scale) && success;
-  success = table_decay(model->tri_ctx, scale) && success;
-  success = table_decay(model->quad_ctx, scale) && success;
-  if (!success)
+  sg_anomaly_model_t *staged = calloc(1, sizeof(*staged));
+  if (!staged) {
     model->oom = true;
+    return SG_ANOMALY_ERR_MEMORY;
+  }
+  *staged = *model;
+  staged->uni = staged->bi = staged->tri = staged->quad = NULL;
+  staged->bi_ctx = staged->tri_ctx = staged->quad_ctx = NULL;
+  anomaly_tables_t source = anomaly_tables_from_model(model);
+  anomaly_tables_t copy;
+  if (!anomaly_tables_clone(&source, &copy)) {
+    free(staged);
+    model->oom = true;
+    return SG_ANOMALY_ERR_MEMORY;
+  }
+  staged->uni = copy.uni;
+  staged->bi = copy.bi;
+  staged->tri = copy.tri;
+  staged->quad = copy.quad;
+  staged->bi_ctx = copy.bi_ctx;
+  staged->tri_ctx = copy.tri_ctx;
+  staged->quad_ctx = copy.quad_ctx;
 
-  /* The unknown-command mass participates in fallback probability, so it must
-   * age with the observed n-gram counts. Match table_decay's truncation rule.
-   */
-  model->unk_count = (size_t)((double)model->unk_count * scale);
-
-  /* Recalculate totals (approximate after decay) */
-  model->total_uni = 0;
-  model->total_bi = 0;
-  model->total_tri = 0;
-  model->total_quad = 0;
-  model->vocab_size = ht_size(model->uni);
-
-  /* Re-sum totals from tables */
-  {
-    ht_iter_t iter;
-    const void *k;
-    size_t kl;
-    const void *v;
-    size_t vl;
-    iter = ht_iter_begin(model->uni);
-    while (ht_iter_next(model->uni, &iter, &k, &kl, &v, &vl)) {
-      if (vl == sizeof(int64_t))
-        model->total_uni += (size_t)count_value(v);
-    }
-    iter = ht_iter_begin(model->bi);
-    while (ht_iter_next(model->bi, &iter, &k, &kl, &v, &vl)) {
-      if (vl == sizeof(int64_t))
-        model->total_bi += (size_t)count_value(v);
-    }
-    iter = ht_iter_begin(model->tri);
-    while (ht_iter_next(model->tri, &iter, &k, &kl, &v, &vl)) {
-      if (vl == sizeof(int64_t))
-        model->total_tri += (size_t)count_value(v);
-    }
-    iter = ht_iter_begin(model->quad);
-    while (ht_iter_next(model->quad, &iter, &k, &kl, &v, &vl)) {
-      if (vl == sizeof(int64_t))
-        model->total_quad += (size_t)count_value(v);
+  ht_table_t *tables[] = {staged->uni,     staged->bi,     staged->tri,
+                          staged->quad,    staged->bi_ctx, staged->tri_ctx,
+                          staged->quad_ctx};
+  for (size_t i = 0; i < sizeof(tables) / sizeof(tables[0]); i++) {
+    if (!table_decay(tables[i], scale)) {
+      sg_anomaly_model_free(staged);
+      model->oom = true;
+      return SG_ANOMALY_ERR_MEMORY;
     }
   }
+  staged->unk_count = (size_t)((double)staged->unk_count * scale);
+  anomaly_recalculate_totals(staged);
+  anomaly_replace_model(model, staged);
+  return SG_ANOMALY_OK;
 }
 
 /* Remove entries with count less than min_count from a hash table.
@@ -1092,64 +1177,66 @@ static size_t table_prune(ht_table_t *t, size_t min_count, bool *success) {
     }
   }
   for (size_t i = 0; i < remove_len; i++)
-    ht_remove(t, remove_list[i].key, remove_list[i].key_len);
+    if (SG_ANOMALY_OP_FAILED() ||
+        ht_remove(t, remove_list[i].key, remove_list[i].key_len) == 0) {
+      free_count_changes(remove_list, remove_len);
+      *success = false;
+      return 0;
+    }
   free_count_changes(remove_list, remove_len);
   return remove_len;
 }
 
-size_t sg_anomaly_model_prune(sg_anomaly_model_t *model, size_t min_count) {
-  if (!model || min_count == 0)
-    return 0;
-
-  bool success = true;
-  size_t removed = 0;
-  removed += table_prune(model->uni, min_count, &success);
-  removed += table_prune(model->bi, min_count, &success);
-  removed += table_prune(model->tri, min_count, &success);
-  removed += table_prune(model->quad, min_count, &success);
-  removed += table_prune(model->bi_ctx, min_count, &success);
-  removed += table_prune(model->tri_ctx, min_count, &success);
-  removed += table_prune(model->quad_ctx, min_count, &success);
-  if (!success)
-    model->oom = true;
-
-  /* Recalculate totals */
-  model->total_uni = 0;
-  model->total_bi = 0;
-  model->total_tri = 0;
-  model->total_quad = 0;
-  model->vocab_size = ht_size(model->uni);
-
-  /* Re-sum totals from tables */
-  {
-    ht_iter_t iter;
-    const void *k;
-    size_t kl;
-    const void *v;
-    size_t vl;
-    iter = ht_iter_begin(model->uni);
-    while (ht_iter_next(model->uni, &iter, &k, &kl, &v, &vl)) {
-      if (vl == sizeof(int64_t))
-        model->total_uni += (size_t)count_value(v);
-    }
-    iter = ht_iter_begin(model->bi);
-    while (ht_iter_next(model->bi, &iter, &k, &kl, &v, &vl)) {
-      if (vl == sizeof(int64_t))
-        model->total_bi += (size_t)count_value(v);
-    }
-    iter = ht_iter_begin(model->tri);
-    while (ht_iter_next(model->tri, &iter, &k, &kl, &v, &vl)) {
-      if (vl == sizeof(int64_t))
-        model->total_tri += (size_t)count_value(v);
-    }
-    iter = ht_iter_begin(model->quad);
-    while (ht_iter_next(model->quad, &iter, &k, &kl, &v, &vl)) {
-      if (vl == sizeof(int64_t))
-        model->total_quad += (size_t)count_value(v);
-    }
+sg_anomaly_status_t sg_anomaly_model_prune(sg_anomaly_model_t *model,
+                                           size_t min_count, size_t *removed) {
+  if (!model || !removed)
+    return SG_ANOMALY_ERR_INVALID;
+  if (min_count == 0) {
+    *removed = 0;
+    return SG_ANOMALY_OK;
   }
 
-  return removed;
+  sg_anomaly_model_t *staged = calloc(1, sizeof(*staged));
+  if (!staged) {
+    model->oom = true;
+    return SG_ANOMALY_ERR_MEMORY;
+  }
+  *staged = *model;
+  staged->uni = staged->bi = staged->tri = staged->quad = NULL;
+  staged->bi_ctx = staged->tri_ctx = staged->quad_ctx = NULL;
+  anomaly_tables_t source = anomaly_tables_from_model(model);
+  anomaly_tables_t copy;
+  if (!anomaly_tables_clone(&source, &copy)) {
+    free(staged);
+    model->oom = true;
+    return SG_ANOMALY_ERR_MEMORY;
+  }
+  staged->uni = copy.uni;
+  staged->bi = copy.bi;
+  staged->tri = copy.tri;
+  staged->quad = copy.quad;
+  staged->bi_ctx = copy.bi_ctx;
+  staged->tri_ctx = copy.tri_ctx;
+  staged->quad_ctx = copy.quad_ctx;
+
+  bool success = true;
+  size_t count = 0;
+  count += table_prune(staged->uni, min_count, &success);
+  count += table_prune(staged->bi, min_count, &success);
+  count += table_prune(staged->tri, min_count, &success);
+  count += table_prune(staged->quad, min_count, &success);
+  count += table_prune(staged->bi_ctx, min_count, &success);
+  count += table_prune(staged->tri_ctx, min_count, &success);
+  count += table_prune(staged->quad_ctx, min_count, &success);
+  if (!success) {
+    sg_anomaly_model_free(staged);
+    model->oom = true;
+    return SG_ANOMALY_ERR_MEMORY;
+  }
+  anomaly_recalculate_totals(staged);
+  anomaly_replace_model(model, staged);
+  *removed = count;
+  return SG_ANOMALY_OK;
 }
 
 bool sg_anomaly_model_compact(sg_anomaly_model_t *model) {

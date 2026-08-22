@@ -23,6 +23,13 @@ extern "C" {
 /* Opaque anomaly model.  All memory is owned and freed on destroy. */
 typedef struct sg_anomaly_model sg_anomaly_model_t;
 
+/* Results returned by maintenance operations. */
+typedef enum {
+  SG_ANOMALY_OK = 0,
+  SG_ANOMALY_ERR_INVALID = -1,
+  SG_ANOMALY_ERR_MEMORY = -2,
+} sg_anomaly_status_t;
+
 /* Maximum command-name length accepted by update, scoring, and lookup APIs.
  * Four maximum-length commands and their terminators fit exactly in the
  * serialized n-gram key limit. */
@@ -161,20 +168,25 @@ bool sg_anomaly_has_observed(const sg_anomaly_model_t *model, const char **seq,
                              size_t len);
 
 /* Clear all counts and reset to a fresh model.
- * Hyperparameters (alpha, unk_prior) are preserved. */
-void sg_anomaly_reset(sg_anomaly_model_t *model);
+ * Hyperparameters are preserved. The operation is atomic: on failure the
+ * existing counts remain unchanged. */
+sg_anomaly_status_t sg_anomaly_reset(sg_anomaly_model_t *model);
 
 /* Apply exponential decay to all counts.
  * Scale should be between 0.0 and 1.0 (e.g., 0.99 for 1% decay).
  * Entries with count < 1 after scaling are removed.
  * Use periodically to prevent unbounded memory growth in long-running
  * processes. */
-void sg_anomaly_model_decay(sg_anomaly_model_t *model, double scale);
+/* Returns SG_ANOMALY_ERR_INVALID for a null model or scale outside (0, 1]. */
+sg_anomaly_status_t sg_anomaly_model_decay(sg_anomaly_model_t *model,
+                                           double scale);
 
 /* Remove n-grams with count less than min_count.
- * Returns total number of entries removed from all hash tables.
+ * On success, writes the total number of entries removed to `removed`.
+ * The operation is atomic: on failure the model and `*removed` are unchanged.
  * Use to reduce model size and remove noise from rare patterns. */
-size_t sg_anomaly_model_prune(sg_anomaly_model_t *model, size_t min_count);
+sg_anomaly_status_t sg_anomaly_model_prune(sg_anomaly_model_t *model,
+                                           size_t min_count, size_t *removed);
 
 /* Rebuild all hash tables to compact their internal storage.
  * Call after decay or prune to recover memory.

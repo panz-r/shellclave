@@ -116,8 +116,9 @@ void validate_result(const sg_result_t *result, sg_error_t error,
         result->verdict == SG_VERDICT_ALLOW_CONDITIONAL)) ||
       result->violation_flags != result->violation_type_flags ||
       result->has_violations != (result->violation_count != 0) ||
-      !valid_buffer_string(result->deny_reason, buffer, buffer_size))
+      !valid_buffer_string(result->deny_reason, buffer, buffer_size)) {
     invariant_failure("result field outside its documented bounds");
+  }
 
   bool linked_substitution = false;
   for (uint32_t i = 0; i < result->subcmd_count; i++) {
@@ -209,6 +210,76 @@ bool results_equal(const sg_result_t &left, const sg_result_t &right) {
       return false;
   }
   return true;
+}
+
+/* A compact, parser-independent semantic reference set. These cases describe
+ * the supported shell dialect rather than duplicating the production parser:
+ * each executable substitution must become one command node, point at its
+ * containing command, and contribute to conditional allowance exactly once. */
+void run_semantic_reference_oracles() {
+  struct oracle_case {
+    const char *input;
+    const char *const *rules;
+    size_t rule_count;
+    uint32_t command_count;
+    int32_t parents[4];
+    sg_verdict_t verdict;
+  };
+  static const char *const echo_id_pwd[] = {"echo *", "id", "pwd"};
+  static const char *const nested[] = {"echo *", "echo $(printf x $(id))",
+                                       "printf x $(id)", "id"};
+  static const char *const process[] = {"cat", "sort", "cat #path"};
+  static const char *const quoted[] = {"echo *", "id"};
+  static const oracle_case cases[] = {
+      {"echo $(id)$(pwd)",
+       echo_id_pwd,
+       3,
+       3,
+       {-1, 0, 0},
+       SG_VERDICT_ALLOW_CONDITIONAL},
+      {"echo $(printf x $(id))",
+       nested,
+       4,
+       3,
+       {-1, 0, 1},
+       SG_VERDICT_ALLOW_CONDITIONAL},
+      {"cat <(sort <(cat /tmp/a))",
+       process,
+       3,
+       3,
+       {-1, 0, 1},
+       SG_VERDICT_ALLOW_CONDITIONAL},
+      {"echo \"$(id)\"",
+       quoted,
+       2,
+       2,
+       {-1, 0, -1},
+       SG_VERDICT_ALLOW_CONDITIONAL},
+  };
+
+  for (const oracle_case &item : cases) {
+    sg_gate_t *gate = sg_gate_new();
+    if (!gate || sg_gate_set_reject_mask(gate, 0) != SG_OK ||
+        sg_gate_set_stop_mode(gate, SG_EVAL_ALL) != SG_OK)
+      invariant_failure("semantic oracle gate setup failed");
+    for (size_t i = 0; i < item.rule_count; i++)
+      if (sg_gate_add_rule(gate, item.rules[i]) != SG_OK)
+        invariant_failure("semantic oracle rule setup failed");
+
+    char buffer[4096];
+    sg_result_t result = {};
+    sg_error_t error = sg_eval(gate, item.input, std::strlen(item.input),
+                               buffer, sizeof(buffer), &result);
+    if (error != SG_OK || result.verdict != item.verdict ||
+        result.subcmd_count != item.command_count ||
+        result.requires_substitution_evaluation !=
+            (item.verdict == SG_VERDICT_ALLOW_CONDITIONAL))
+      invariant_failure("semantic oracle verdict or command count mismatch");
+    for (uint32_t i = 0; i < item.command_count; i++)
+      if (result.subcmds[i].substitution_parent_index != item.parents[i])
+        invariant_failure("semantic oracle parent relationship mismatch");
+    sg_gate_free(gate);
+  }
 }
 
 void validate_gate_pair(sg_gate_t *left, sg_gate_t *right) {
@@ -424,6 +495,11 @@ extern "C" int LLVMFuzzerInitialize(int *argc, char ***argv) {
 }
 
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+  static bool semantic_oracles_checked = false;
+  if (!semantic_oracles_checked) {
+    run_semantic_reference_oracles();
+    semantic_oracles_checked = true;
+  }
   if (size == 0)
     return 0;
 

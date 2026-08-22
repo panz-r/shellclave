@@ -2,6 +2,7 @@
 
 #define _POSIX_C_SOURCE 200809L
 #include "sg_anomaly.h"
+#include "test_sg_failures.h"
 #include <errno.h>
 #include <math.h>
 #include <stdio.h>
@@ -64,6 +65,35 @@ static void cleanup_anomaly_temp_file(void) {
 
 static const char *commands[] = {"a", "b", "c", "d", "e"};
 
+typedef struct {
+  size_t vocab;
+  size_t total_uni;
+  size_t total_bi;
+  size_t total_tri;
+  size_t total_quad;
+  size_t contexts;
+  size_t unk;
+  double score;
+} anomaly_snapshot_t;
+
+static anomaly_snapshot_t snapshot_model(const sg_anomaly_model_t *model) {
+  return (anomaly_snapshot_t){
+      sg_anomaly_vocab_size(model), sg_anomaly_total_uni(model),
+      sg_anomaly_total_bi(model),   sg_anomaly_total_tri(model),
+      sg_anomaly_total_quad(model), sg_anomaly_total_contexts(model),
+      sg_anomaly_unk_count(model),  sg_anomaly_score(model, commands, 5)};
+}
+
+static bool snapshot_equal(anomaly_snapshot_t before,
+                           anomaly_snapshot_t after) {
+  return before.vocab == after.vocab && before.total_uni == after.total_uni &&
+         before.total_bi == after.total_bi &&
+         before.total_tri == after.total_tri &&
+         before.total_quad == after.total_quad &&
+         before.contexts == after.contexts && before.unk == after.unk &&
+         fabs(before.score - after.score) < 0.000001;
+}
+
 static void update_repeated(sg_anomaly_model_t *model, const char **seq,
                             size_t length, size_t repetitions) {
   for (size_t i = 0; i < repetitions; i++)
@@ -96,7 +126,7 @@ TEST(lifecycle_and_null_safety) {
     ASSERT_EQ_INT(sg_anomaly_total_uni(model), 5);
   }
   sg_anomaly_update(NULL, commands, 5);
-  sg_anomaly_model_decay(NULL, 0.5);
+  ASSERT_EQ_INT(sg_anomaly_model_decay(NULL, 0.5), SG_ANOMALY_ERR_INVALID);
   sg_anomaly_model_clear_error(NULL);
   sg_anomaly_model_free(NULL);
   ASSERT(isinf(sg_anomaly_score(NULL, commands, 5)));
@@ -114,7 +144,9 @@ TEST(lifecycle_and_null_safety) {
   ASSERT_EQ_INT(sg_anomaly_quad_count(NULL, "a", "b", "c", "d"), 0);
   ASSERT_EQ_DBL(sg_anomaly_kn_discount(NULL), 0.0, 0.0);
   ASSERT(!sg_anomaly_has_observed(NULL, commands, 5));
-  ASSERT_EQ_INT(sg_anomaly_model_prune(NULL, 2), 0);
+  size_t removed = 0;
+  ASSERT_EQ_INT(sg_anomaly_model_prune(NULL, 2, &removed),
+                SG_ANOMALY_ERR_INVALID);
   ASSERT(!sg_anomaly_model_compact(NULL));
   ASSERT_EQ_INT(sg_anomaly_save(NULL, "/tmp/unused"), -1);
   ASSERT_EQ_INT(sg_anomaly_load(NULL, "/tmp/unused"), -1);
@@ -367,7 +399,7 @@ TEST(reset_and_error_state) {
   ASSERT(!sg_anomaly_model_had_error(model));
   sg_anomaly_model_clear_error(model);
   ASSERT(!sg_anomaly_model_had_error(model));
-  sg_anomaly_reset(model);
+  ASSERT_EQ_INT(sg_anomaly_reset(model), SG_ANOMALY_OK);
   ASSERT(!sg_anomaly_model_had_error(model));
   ASSERT_EQ_INT(sg_anomaly_vocab_size(model), 0);
   ASSERT_EQ_INT(sg_anomaly_total_uni(model), 0);
@@ -379,19 +411,91 @@ TEST(reset_and_error_state) {
   sg_anomaly_model_free(model);
 }
 
+TEST(maintenance_failures_are_atomic) {
+  const size_t operation_count = 3;
+  for (size_t operation = 0; operation < operation_count; operation++) {
+    size_t allocation_failures = 0;
+    size_t operation_failures = 0;
+    sg_anomaly_model_t *probe = sg_anomaly_model_new();
+    ASSERT(probe != NULL);
+    update_repeated(probe, commands, 5, 4);
+    sg_test_alloc_reset();
+    sg_test_anomaly_op_reset();
+    size_t probe_removed = 0;
+    sg_anomaly_status_t probe_status;
+    if (operation == 0)
+      probe_status = sg_anomaly_reset(probe);
+    else if (operation == 1)
+      probe_status = sg_anomaly_model_decay(probe, 0.5);
+    else
+      probe_status = sg_anomaly_model_prune(probe, 2, &probe_removed);
+    ASSERT_EQ_INT(probe_status, SG_ANOMALY_OK);
+    allocation_failures = sg_test_alloc_count();
+    operation_failures = sg_test_anomaly_op_count();
+    sg_anomaly_model_free(probe);
+
+    for (size_t fail_at = 1; fail_at <= allocation_failures; fail_at++) {
+      sg_anomaly_model_t *model = sg_anomaly_model_new();
+      ASSERT(model != NULL);
+      update_repeated(model, commands, 5, 4);
+      anomaly_snapshot_t before = snapshot_model(model);
+      sg_test_alloc_fail_at(fail_at);
+      sg_test_anomaly_op_reset();
+      size_t removed = 123;
+      sg_anomaly_status_t status =
+          operation == 0   ? sg_anomaly_reset(model)
+          : operation == 1 ? sg_anomaly_model_decay(model, 0.5)
+                           : sg_anomaly_model_prune(model, 2, &removed);
+      sg_test_alloc_reset();
+      sg_test_anomaly_op_reset();
+      if (status == SG_ANOMALY_ERR_MEMORY) {
+        ASSERT(snapshot_equal(before, snapshot_model(model)));
+        if (operation == 2)
+          ASSERT_EQ_INT(removed, 123);
+        ASSERT(sg_anomaly_model_had_error(model));
+      }
+      sg_anomaly_model_free(model);
+    }
+
+    for (size_t fail_at = 1; fail_at <= operation_failures; fail_at++) {
+      sg_anomaly_model_t *model = sg_anomaly_model_new();
+      ASSERT(model != NULL);
+      update_repeated(model, commands, 5, 4);
+      anomaly_snapshot_t before = snapshot_model(model);
+      sg_test_alloc_reset();
+      sg_test_anomaly_op_fail_at(fail_at);
+      size_t removed = 123;
+      sg_anomaly_status_t status =
+          operation == 0   ? sg_anomaly_reset(model)
+          : operation == 1 ? sg_anomaly_model_decay(model, 0.5)
+                           : sg_anomaly_model_prune(model, 2, &removed);
+      sg_test_anomaly_op_reset();
+      if (status == SG_ANOMALY_ERR_MEMORY) {
+        ASSERT(snapshot_equal(before, snapshot_model(model)));
+        if (operation == 2)
+          ASSERT_EQ_INT(removed, 123);
+        ASSERT(sg_anomaly_model_had_error(model));
+      }
+      sg_anomaly_model_free(model);
+    }
+  }
+}
+
 TEST(decay_matrix) {
   sg_anomaly_model_t *model = sg_anomaly_model_new();
   ASSERT(model != NULL);
   update_repeated(model, commands, 5, 4);
   ASSERT_EQ_INT(sg_anomaly_unk_count(model), 5);
-  static const double invalid_scales[] = {0.0, 1.0, -0.5, 2.0};
+  static const double invalid_scales[] = {0.0, -0.5, 2.0};
   for (size_t i = 0; i < sizeof(invalid_scales) / sizeof(invalid_scales[0]);
        i++)
-    sg_anomaly_model_decay(model, invalid_scales[i]);
+    ASSERT_EQ_INT(sg_anomaly_model_decay(model, invalid_scales[i]),
+                  SG_ANOMALY_ERR_INVALID);
+  ASSERT_EQ_INT(sg_anomaly_model_decay(model, 1.0), SG_ANOMALY_OK);
   ASSERT_EQ_INT(sg_anomaly_total_uni(model), 20);
   ASSERT_EQ_INT(sg_anomaly_total_quad(model), 8);
 
-  sg_anomaly_model_decay(model, 0.5);
+  ASSERT_EQ_INT(sg_anomaly_model_decay(model, 0.5), SG_ANOMALY_OK);
   ASSERT_EQ_INT(sg_anomaly_vocab_size(model), 5);
   ASSERT_EQ_INT(sg_anomaly_total_uni(model), 10);
   ASSERT_EQ_INT(sg_anomaly_total_bi(model), 8);
@@ -416,7 +520,7 @@ TEST(decay_removes_large_rare_model) {
   ASSERT(model != NULL);
   sg_anomaly_update(model, sequence, COMMAND_COUNT);
   ASSERT_EQ_INT(sg_anomaly_vocab_size(model), COMMAND_COUNT);
-  sg_anomaly_model_decay(model, 0.5);
+  ASSERT_EQ_INT(sg_anomaly_model_decay(model, 0.5), SG_ANOMALY_OK);
   ASSERT_EQ_INT(sg_anomaly_vocab_size(model), 0);
   ASSERT_EQ_INT(sg_anomaly_total_uni(model), 0);
   ASSERT_EQ_INT(sg_anomaly_total_bi(model), 0);
@@ -433,7 +537,9 @@ TEST(prune_and_compact_preserve_common_behavior) {
   ASSERT(model != NULL);
   update_repeated(model, common, 4, 4);
   sg_anomaly_update(model, rare, 4);
-  ASSERT(sg_anomaly_model_prune(model, 2) > 0);
+  size_t removed = 0;
+  ASSERT_EQ_INT(sg_anomaly_model_prune(model, 2, &removed), SG_ANOMALY_OK);
+  ASSERT(removed > 0);
   ASSERT_EQ_INT(sg_anomaly_vocab_size(model), 4);
   ASSERT_EQ_INT(sg_anomaly_total_uni(model), 16);
   ASSERT_EQ_INT(sg_anomaly_total_bi(model), 12);
@@ -442,7 +548,8 @@ TEST(prune_and_compact_preserve_common_behavior) {
   ASSERT_EQ_INT(sg_anomaly_uni_count(model, "gcc"), 0);
   ASSERT_EQ_INT(sg_anomaly_quad_count(model, "gcc", "make", "test", "install"),
                 0);
-  ASSERT_EQ_INT(sg_anomaly_model_prune(model, 0), 0);
+  ASSERT_EQ_INT(sg_anomaly_model_prune(model, 0, &removed), SG_ANOMALY_OK);
+  ASSERT_EQ_INT(removed, 0);
   double score = sg_anomaly_score(model, common, 4);
   ASSERT(sg_anomaly_model_compact(model));
   ASSERT_EQ_DBL(sg_anomaly_score(model, common, 4), score, 0.000001);
@@ -459,6 +566,7 @@ int main(void) {
   RUN(model_owns_string_copies);
   RUN(save_load_roundtrip);
   RUN(reset_and_error_state);
+  RUN(maintenance_failures_are_atomic);
   RUN(decay_matrix);
   RUN(decay_removes_large_rare_model);
   RUN(prune_and_compact_preserve_common_behavior);

@@ -216,6 +216,7 @@ if(BUILD_TESTING)
   shellclave_add_test(shellgate_unit_test shellgate/tests/test_shellgate.c shellgate_test)
   shellclave_add_test(shellgate_anomaly_test shellgate/tests/test_anomaly.c shellgate_test)
   target_include_directories(shellgate_unit_test PRIVATE shelltype/tests)
+  target_include_directories(shellgate_anomaly_test PRIVATE shellgate/tests)
   set_tests_properties(shellgate_unit_test PROPERTIES LABELS shellgate)
   set_tests_properties(shellgate_anomaly_test PROPERTIES
     LABELS "shellgate;anomaly")

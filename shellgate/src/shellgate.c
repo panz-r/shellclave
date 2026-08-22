@@ -2882,7 +2882,16 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len, char *buf,
   /* Free type sequence buffer */
   free(type_seq_buf);
 
-  return bw.overflow ? SG_ERR_TRUNC : SG_OK;
+  if (bw.overflow) {
+    /* A diagnostic write may truncate without aborting the current command
+     * walk. The retained policy verdict is not safe to report when the caller
+     * cannot inspect the complete result. */
+    out->truncated = true;
+    out->verdict = SG_VERDICT_UNDETERMINED;
+    return SG_ERR_TRUNC;
+  }
+
+  return SG_OK;
 }
 
 /* --- HELPERS --- */

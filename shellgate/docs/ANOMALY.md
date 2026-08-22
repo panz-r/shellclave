@@ -168,10 +168,12 @@ Apply exponential decay to "forget" old patterns:
 
 ```c
 /* Apply 1% decay (scale = 0.99) */
-sg_anomaly_model_decay(model, 0.99);
+if (sg_anomaly_model_decay(model, 0.99) != SG_ANOMALY_OK)
+    handle_maintenance_failure();
 
 /* Apply 10% decay (scale = 0.90) */
-sg_anomaly_model_decay(model, 0.90);
+if (sg_anomaly_model_decay(model, 0.90) != SG_ANOMALY_OK)
+    handle_maintenance_failure();
 ```
 
 Call this periodically (e.g., hourly) in long-running processes.
@@ -182,7 +184,9 @@ Remove rare n-grams to reduce model size:
 
 ```c
 /* Remove n-grams that appeared fewer than 3 times */
-size_t removed = sg_anomaly_model_prune(model, 3);
+size_t removed = 0;
+if (sg_anomaly_model_prune(model, 3, &removed) != SG_ANOMALY_OK)
+    handle_maintenance_failure();
 printf("Removed %zu rare entries\n", removed);
 ```
 

@@ -151,14 +151,23 @@ int main(int argc, char **argv) {
   /* Handle maintenance operations */
   if (do_decay) {
     printf("Applying decay (scale=%.2f)...\n", decay_scale);
-    sg_anomaly_model_decay(model, decay_scale);
+    if (sg_anomaly_model_decay(model, decay_scale) != SG_ANOMALY_OK) {
+      fprintf(stderr, "anomaly decay failed\n");
+      sg_anomaly_model_free(model);
+      return 1;
+    }
     printf("After decay: vocab=%zu, total_uni=%zu\n",
            sg_anomaly_vocab_size(model), sg_anomaly_total_uni(model));
   }
 
   if (do_prune) {
     printf("Pruning entries with count < %zu...\n", prune_min);
-    size_t removed = sg_anomaly_model_prune(model, prune_min);
+    size_t removed = 0;
+    if (sg_anomaly_model_prune(model, prune_min, &removed) != SG_ANOMALY_OK) {
+      fprintf(stderr, "anomaly prune failed\n");
+      sg_anomaly_model_free(model);
+      return 1;
+    }
     printf("Removed %zu entries\n", removed);
   }
 

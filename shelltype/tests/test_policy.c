@@ -638,6 +638,64 @@ static int test_policy_save_crash_boundaries(void) {
   return 1;
 }
 
+static int test_policy_save_recovery_ignores_stale_temps(void) {
+  char path[] = "/tmp/shelltype-policy-recovery-XXXXXX";
+  int fd = mkstemp(path);
+  ASSERT(fd >= 0 && close(fd) == 0);
+  snprintf(policy_temp_paths[0], sizeof(policy_temp_paths[0]), "%s", path);
+
+  char stale_path[sizeof(path) + 16];
+  ASSERT(snprintf(stale_path, sizeof(stale_path), "%s.stale", path) > 0);
+  FILE *stale = fopen(stale_path, "wb");
+  ASSERT(stale != NULL);
+  ASSERT(fputs("incomplete temporary policy", stale) >= 0);
+  ASSERT(fclose(stale) == 0);
+  snprintf(policy_temp_paths[1], sizeof(policy_temp_paths[1]), "%s",
+           stale_path);
+
+  st_policy_ctx_t *ctx = st_policy_ctx_new();
+  st_policy_t *old_policy = ctx ? st_policy_new(ctx) : NULL;
+  st_policy_t *new_policy = ctx ? st_policy_new(ctx) : NULL;
+  ASSERT(ctx && old_policy && new_policy);
+  ASSERT_OK(st_policy_add(old_policy, "old 42"));
+  ASSERT_OK(st_policy_add(new_policy, "new #n"));
+  ASSERT_OK(st_policy_save(old_policy, path));
+
+  st_test_io_reset();
+  ASSERT_OK(st_policy_save(new_policy, path));
+  size_t operation_count = st_test_io_count();
+  ASSERT(operation_count > 0);
+  for (size_t fail_at = 1; fail_at <= operation_count; fail_at++) {
+    ASSERT_OK(st_policy_save(old_policy, path));
+    st_test_io_fail_at(fail_at);
+    st_error_t error = st_policy_save(new_policy, path);
+    st_test_io_reset();
+    ASSERT(error == ST_ERR_IO);
+    ASSERT(access(stale_path, F_OK) == 0);
+
+    st_policy_ctx_t *loaded_ctx = st_policy_ctx_new();
+    st_policy_t *loaded = loaded_ctx ? st_policy_new(loaded_ctx) : NULL;
+    ASSERT(loaded != NULL);
+    ASSERT(st_policy_load(loaded, path, true) == ST_OK);
+    ASSERT(policy_matches(loaded, "old 42", true) ||
+           policy_matches(loaded, "new 7", true));
+    st_policy_free(loaded);
+    st_policy_ctx_free(loaded_ctx);
+  }
+  ASSERT_OK(st_policy_save(new_policy, path));
+  st_policy_ctx_t *loaded_ctx = st_policy_ctx_new();
+  st_policy_t *loaded = loaded_ctx ? st_policy_new(loaded_ctx) : NULL;
+  ASSERT(loaded != NULL && st_policy_load(loaded, path, true) == ST_OK);
+  ASSERT(policy_matches(loaded, "new 7", true));
+  ASSERT(access(stale_path, F_OK) == 0);
+  st_policy_free(loaded);
+  st_policy_ctx_free(loaded_ctx);
+  st_policy_free(old_policy);
+  st_policy_free(new_policy);
+  st_policy_ctx_free(ctx);
+  return 1;
+}
+
 static int test_policy_load_rejects_binary_and_overlong_lines(void) {
   char path[] = "/tmp/shelltype-policy-load-XXXXXX";
   int fd = mkstemp(path);
@@ -2789,6 +2847,7 @@ int main(void) {
   TEST(test_policy_save_determinism_and_compaction);
   TEST(test_policy_save_io_failures_are_atomic);
   TEST(test_policy_save_crash_boundaries);
+  TEST(test_policy_save_recovery_ignores_stale_temps);
   TEST(test_policy_load_rejects_binary_and_overlong_lines);
 
   printf("\nEvaluation and suggestions:\n");

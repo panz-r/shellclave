@@ -536,8 +536,8 @@ uint32_t sg_gate_deny_rule_count(const sg_gate_t *gate);
  *   subcommand result array was too small (partial results are still valid),
  *   or SG_ERR_INVALID for bad args.  Inspect `truncated`, `subcmd_truncated`,
  *   and `violation_truncated` to identify the truncated result category.
- *   Coverage truncation leaves the verdict SG_VERDICT_UNDETERMINED rather than
- *   authorizing the evaluated prefix.
+ *   Any truncated result leaves the verdict SG_VERDICT_UNDETERMINED rather
+ *   than authorizing incomplete output or an evaluated prefix.
  *
  * Early-stop modes preserve their prefix verdict. When parsed subcommands
  * remain unevaluated, `short_circuited` is true; callers authorizing the whole
