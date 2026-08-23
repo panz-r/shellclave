@@ -353,7 +353,7 @@ st_error_t st_feed(st_learner_t *learner, const char *raw_cmd) {
   st_token_array_t typed;
   typed.tokens = NULL;
   typed.count = 0;
-  st_error_t err = st_normalize_typed(raw_cmd, &typed);
+  st_error_t err = st_classify(raw_cmd, &typed);
   if (err != ST_OK)
     return err;
   if (!learner_tokens_valid(typed.tokens, typed.count)) {

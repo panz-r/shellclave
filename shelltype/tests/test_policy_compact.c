@@ -489,7 +489,7 @@ static size_t parsed_nfa_matches_typed(const parsed_nfa_t *nfa,
                                        const char **matches,
                                        size_t match_capacity) {
   st_token_array_t tokens = {0};
-  if (st_normalize_typed(command, &tokens) != ST_OK)
+  if (st_classify(command, &tokens) != ST_OK)
     return 0;
   typed_nfa_ctx_t ctx = {.nfa = nfa,
                          .tokens = &tokens,

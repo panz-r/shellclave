@@ -147,6 +147,24 @@ static sg_error_t eval_cmd(sg_gate_t *g, const char *cmd, sg_result_t *r) {
 /* --- LIFECYCLE --- */
 
 TEST(gate_api_contract_matrix) {
+  sg_test_alloc_fail_at(1);
+  ASSERT(sg_gate_new() == NULL);
+  sg_test_alloc_reset();
+
+  st_test_alloc_reset();
+  sg_gate_t *allocation_probe = sg_gate_new();
+  ASSERT(allocation_probe != NULL);
+  size_t construction_allocations = st_test_alloc_count();
+  st_test_alloc_reset();
+  sg_gate_free(allocation_probe);
+  ASSERT(construction_allocations > 0);
+  for (size_t fail_at = 1; fail_at <= construction_allocations; fail_at++) {
+    st_test_alloc_fail_at(fail_at);
+    allocation_probe = sg_gate_new();
+    st_test_alloc_reset();
+    ASSERT(allocation_probe == NULL);
+  }
+
   sg_gate_t *g = sg_gate_new();
   ASSERT(g != NULL);
   ASSERT(!sg_gate_anomaly_had_error(NULL));
@@ -154,6 +172,10 @@ TEST(gate_api_contract_matrix) {
   sg_gate_free(NULL);
   ASSERT(sg_gate_rule_count(NULL) == 0);
   ASSERT(sg_gate_deny_rule_count(NULL) == 0);
+  ASSERT(sg_gate_load_policy(NULL, "/tmp/unused") == SG_ERR_INVALID);
+  ASSERT(sg_gate_load_policy(g, NULL) == SG_ERR_INVALID);
+  ASSERT(sg_gate_save_policy(NULL, "/tmp/unused") == SG_ERR_INVALID);
+  ASSERT(sg_gate_save_policy(g, NULL) == SG_ERR_INVALID);
   ASSERT(sg_eval(NULL, "ls", 2, NULL, 64, NULL) == SG_ERR_INVALID);
   ASSERT_SG_OK(sg_gate_add_rule(g, "ls"));
   char buf[64];
@@ -1136,6 +1158,29 @@ TEST(buffer_contract_matrix) {
   const char *rules[] = {"ls", "sort", "cat #path"};
   sg_gate_t *g = gate_with_rules(rules, 3);
   ASSERT_SG_OK(sg_gate_add_deny_rule(g, "rm"));
+
+  ASSERT_SG_OK(sg_gate_set_reject_mask(g, SHELL_FEAT_VARS));
+  char feature_buffer[4];
+  sg_result_t feature_result;
+  ASSERT(sg_eval(g, "echo $VALUE", strlen("echo $VALUE"), feature_buffer,
+                 sizeof(feature_buffer), &feature_result) == SG_ERR_TRUNC);
+  ASSERT(feature_result.truncated);
+  ASSERT(feature_result.verdict == SG_VERDICT_UNDETERMINED);
+  ASSERT_SG_OK(sg_gate_set_reject_mask(g, SG_REJECT_MASK_DEFAULT));
+
+  static const char *diagnostic_commands[] = {
+      "echo $(id)", "echo $(case value in x)", "echo 'unterminated"};
+  for (size_t i = 0;
+       i < sizeof(diagnostic_commands) / sizeof(diagnostic_commands[0]); i++) {
+    char buffer[4];
+    sg_result_t result;
+    ASSERT(sg_eval(g, diagnostic_commands[i], strlen(diagnostic_commands[i]),
+                   buffer, sizeof(buffer), &result) == SG_ERR_TRUNC);
+    ASSERT(result.truncated);
+    ASSERT(result.verdict == SG_VERDICT_UNDETERMINED);
+    ASSERT(memchr(buffer, '\0', sizeof(buffer)) != NULL);
+  }
+
   for (size_t repeat = 0; repeat < 2; repeat++) {
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
       char buffer[16];
@@ -1144,6 +1189,7 @@ TEST(buffer_contract_matrix) {
       ASSERT(sg_eval(g, cases[i].command, strlen(cases[i].command), buffer,
                      cases[i].buffer_size, &r) == SG_ERR_TRUNC);
       ASSERT(r.truncated);
+      ASSERT(r.verdict == SG_VERDICT_UNDETERMINED);
       ASSERT(memchr(buffer, '\0', cases[i].buffer_size) != NULL);
     }
   }
@@ -1167,7 +1213,12 @@ TEST(buffer_contract_matrix) {
 
   char one_byte_buffer[1];
   sg_result_t result;
+  ASSERT(sg_eval(NULL, "ls", 2, one_byte_buffer, 1, &result) == SG_ERR_INVALID);
+  ASSERT(sg_eval(g, NULL, 2, one_byte_buffer, 1, &result) == SG_ERR_INVALID);
+  ASSERT(sg_eval(g, "ls", 2, NULL, 1, &result) == SG_ERR_INVALID);
+  ASSERT(sg_eval(g, "ls", 2, one_byte_buffer, 1, NULL) == SG_ERR_INVALID);
   ASSERT(sg_eval(g, "ls", 2, one_byte_buffer, 0, &result) == SG_ERR_INVALID);
+  ASSERT(sg_eval(g, "", 0, one_byte_buffer, 1, &result) == SG_ERR_INVALID);
 
   char large_buffer[4096] = {0};
   char cmd[512];
@@ -2759,6 +2810,15 @@ TEST(anomaly_configuration_validation) {
   ASSERT(sg_gate_set_anomaly_cache_size(g, 8193) == SG_ERR_INVALID);
   ASSERT(sg_gate_set_anomaly_combine_mode(g, (sg_anomaly_combine_mode_t)99) ==
          SG_ERR_INVALID);
+  sg_test_alloc_fail_at(1);
+  ASSERT(sg_gate_set_anomaly_adaptive(g, true, 8) == SG_ERR_MEMORY);
+  sg_test_alloc_reset();
+  for (size_t fail_at = 1; fail_at <= 2; fail_at++) {
+    sg_test_alloc_fail_at(fail_at);
+    ASSERT(sg_gate_set_anomaly_combine_mode(g, SG_ANOMALY_COMBINE_BAYESIAN) ==
+           SG_ERR_MEMORY);
+    sg_test_alloc_reset();
+  }
   ASSERT(sg_gate_save_anomaly_model(g, NULL) == SG_ERR_INVALID);
   ASSERT(sg_gate_load_anomaly_model(g, NULL) == SG_ERR_INVALID);
   sg_gate_free(g);

@@ -134,7 +134,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         break;
       case 1: {
         st_token_array_t tokens = {};
-        if (st_normalize_typed(text.c_str(), &tokens) == ST_OK) {
+        if (st_classify(text.c_str(), &tokens) == ST_OK) {
           for (size_t i = 0; i < tokens.count; i++) {
             require(tokens.tokens[i].text != nullptr);
             if (tokens.tokens[i].text[0] == '#')
@@ -279,8 +279,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
       }
       case 15: {
         st_token_array_t tokens = {};
-        if (st_normalize_typed(text.c_str(), &tokens) == ST_OK &&
-            tokens.count != 0) {
+        if (st_classify(text.c_str(), &tokens) == ST_OK && tokens.count != 0) {
           std::vector<const char *> pattern_tokens;
           for (size_t i = 0; i < tokens.count; i++)
             pattern_tokens.push_back(tokens.tokens[i].text);

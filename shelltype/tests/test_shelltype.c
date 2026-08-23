@@ -139,7 +139,7 @@ static int test_feed_is_atomic(void) {
   }
 
   st_token_array_t parsed = {0};
-  ASSERT(st_normalize_typed("git push /tmp/repository", &parsed) == ST_OK);
+  ASSERT(st_classify("git push /tmp/repository", &parsed) == ST_OK);
   probe = baseline_learner();
   ASSERT(probe != NULL);
   st_test_alloc_reset();
@@ -205,7 +205,7 @@ static int test_learner_state_transitions(void) {
   ASSERT(learner->trie.total_commands == 5);
 
   st_token_array_t parsed = {0};
-  ASSERT(st_normalize_typed("curl /tmp/data", &parsed) == ST_OK);
+  ASSERT(st_classify("curl /tmp/data", &parsed) == ST_OK);
   ASSERT(st_feed_parsed(learner, "curl /tmp/data", &parsed) == ST_OK);
   st_free_token_array(&parsed);
   ASSERT(learner->trie.total_commands == 6);

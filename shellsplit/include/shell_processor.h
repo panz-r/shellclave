@@ -19,7 +19,10 @@ extern "C" {
  */
 typedef struct {
   const char *original_command; // Owned full command-stage text
-  const char *clean_command;    // Owned command text with shell syntax removed
+  // Owned canonical processed subcommand: shell control/redirection syntax is
+  // removed, quote fragments and escapes are assembled, and argument
+  // boundaries are retained with canonical quoting for downstream consumers.
+  const char *clean_command;
   // Token text points into original_command, and positions are relative to it.
   shell_token_t *shell_tokens;   // Shell operators and redirections
   size_t shell_token_count;      // Number of shell tokens
@@ -51,9 +54,11 @@ typedef struct {
 /**
  * Process shell command with proper separation
  *
- * Extracts clean commands and separates shell logic. On success, returned
- * command metadata owns all text it refers to and remains valid independently
- * of command_line. On failure, writable outputs are set to NULL and zero.
+ * Extracts canonical processed subcommands and separates shell logic. On
+ * success, returned command metadata owns all text it refers to and remains
+ * valid independently of command_line. `clean_command` is suitable for
+ * st_classify(); it is not raw shell source. On failure, writable
+ * outputs are set to NULL and zero.
  */
 shell_process_status_t shell_process_command(
     const char *command_line, const shell_process_limits_t *limits,
@@ -68,7 +73,7 @@ void shell_free_command_infos(shell_command_info_t *infos, size_t count);
 /**
  * Get clean command text
  *
- * Returns shell-stripped command text, or NULL for NULL input.
+ * Returns the canonical processed subcommand, or NULL for NULL input.
  */
 const char *shell_get_clean_command(shell_command_info_t *info);
 
@@ -79,10 +84,12 @@ const char *shell_get_clean_command(shell_command_info_t *info);
 bool shell_has_dangerous_features(shell_command_info_t *info);
 
 /**
- * Parse command line and return clean per-command inputs for downstream
- * processing, while reporting whether shell features are present for
- * caller-side handling. The caller owns each returned string and the containing
- * array. On failure, writable outputs are set to NULL, zero, and false.
+ * Parse command line and return canonical processed subcommands for downstream
+ * classification, while reporting whether shell features are present for
+ * caller-side handling. Quote fragments and escapes are already assembled;
+ * consumers must not treat these strings as arbitrary shell source. The caller
+ * owns each returned string and the containing array. On failure, writable
+ * outputs are set to NULL, zero, and false.
  */
 shell_process_status_t shell_extract_dfa_inputs(
     const char *command_line, const shell_process_limits_t *limits,

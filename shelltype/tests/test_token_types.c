@@ -292,10 +292,26 @@ static int test_classification_matrix(void) {
       {"1.2.3-01", ST_TYPE_SEMVER},
       {"550e8400-e29b-41d4-a716-44665544000g", ST_TYPE_UUID},
       {"alice@example", ST_TYPE_EMAIL},
+      {"@example.com", ST_TYPE_EMAIL},
+      {"alice@", ST_TYPE_EMAIL},
+      {"ali!ce@example.com", ST_TYPE_EMAIL},
+      {"alice@example!.com", ST_TYPE_EMAIL},
+      {"host..example.com", ST_TYPE_HOSTNAME},
+      {"host--name.example", ST_TYPE_HOSTNAME},
       {"2025-02-29", ST_TYPE_TIMESTAMP},
       {"2025-04-31", ST_TYPE_TIMESTAMP},
       {"2025-04-24T15:30:00garbage", ST_TYPE_TIMESTAMP},
+      {"2025-04-24T15:30:00+24:00", ST_TYPE_TIMESTAMP},
+      {"2025-04-24T15:30:00+01:60", ST_TYPE_TIMESTAMP},
       {"24:00:00", ST_TYPE_TIMESTAMP},
+      {"${BAD-NAME}", ST_TYPE_ENV_VAR},
+      {"$9BAD", ST_TYPE_ENV_VAR},
+      {"@scope", ST_TYPE_PKG},
+      {"@scope/", ST_TYPE_PKG},
+      {"package@", ST_TYPE_PKG},
+      {"image@sha256:abcd", ST_TYPE_IMAGE},
+      {"SHA256:short", ST_TYPE_FINGERPRINT},
+      {"[unterminated", ST_TYPE_GLOB},
       {"://example.com", ST_TYPE_URL},
       {"1http://example.com", ST_TYPE_URL},
       {"ht*tp://example.com", ST_TYPE_URL},
@@ -313,8 +329,8 @@ static int test_classification_matrix(void) {
 static int generated_token_is(const char *token, st_token_type_t expected) {
   st_token_array_t normalized = {0};
   if (st_classify_token(token) != expected ||
-      st_normalize_typed(token, &normalized) != ST_OK ||
-      normalized.count != 1 || normalized.tokens[0].type != expected ||
+      st_classify(token, &normalized) != ST_OK || normalized.count != 1 ||
+      normalized.tokens[0].type != expected ||
       strcmp(normalized.tokens[0].text, token) != 0) {
     st_free_token_array(&normalized);
     return 0;
@@ -526,6 +542,14 @@ static int test_normalization_matrix(void) {
        "tool\t--output\tfile.txt",
        {ST_TYPE_LITERAL, ST_TYPE_LONGOPT, ST_TYPE_FILENAME},
        3},
+      {"tool --output=",
+       "tool\t--output\t",
+       {ST_TYPE_LITERAL, ST_TYPE_LONGOPT, ST_TYPE_LITERAL},
+       3},
+      {"export EMPTY=",
+       "export\tEMPTY=\t",
+       {ST_TYPE_LITERAL, ST_TYPE_LITERAL, ST_TYPE_LITERAL},
+       3},
       {"echo sha256", "echo\tsha256", {ST_TYPE_LITERAL, ST_TYPE_HASH_ALGO}, 2},
       {"docker pull ghcr.io/org/app:v1",
        "docker\tpull\tghcr.io/org/app:v1",
@@ -573,6 +597,18 @@ static int test_normalization_matrix(void) {
         ST_TYPE_LITERAL, ST_TYPE_LITERAL, ST_TYPE_LITERAL, ST_TYPE_LITERAL,
         ST_TYPE_LITERAL},
        13},
+      {"cmd 2>err 2>>log &>all &>>append >&fd",
+       "cmd\t2>\terr\t2>>\tlog\t&>\tall\t&>>\tappend\t>&\tfd",
+       {ST_TYPE_LITERAL, ST_TYPE_LITERAL, ST_TYPE_LITERAL, ST_TYPE_LITERAL,
+        ST_TYPE_LITERAL, ST_TYPE_LITERAL, ST_TYPE_LITERAL, ST_TYPE_LITERAL,
+        ST_TYPE_LITERAL, ST_TYPE_LITERAL, ST_TYPE_LITERAL},
+       11},
+      {"cmd 2>&1 3>&- 4<&- <&0 >&10 >>&9 12>>log 1>out",
+       "cmd\t2>&1\t3>&-\t4<&-\t<&0\t>&10\t>>&9\t12>>\tlog\t1>\tout",
+       {ST_TYPE_LITERAL, ST_TYPE_LITERAL, ST_TYPE_LITERAL, ST_TYPE_LITERAL,
+        ST_TYPE_LITERAL, ST_TYPE_LITERAL, ST_TYPE_LITERAL, ST_TYPE_LITERAL,
+        ST_TYPE_LITERAL, ST_TYPE_LITERAL, ST_TYPE_LITERAL},
+       11},
       {"echo 'unterminated",
        "echo\tunterminated",
        {ST_TYPE_LITERAL, ST_TYPE_LITERAL},
@@ -581,7 +617,7 @@ static int test_normalization_matrix(void) {
 
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
     st_token_array_t typed = {0};
-    ASSERT(st_normalize_typed(cases[i].command, &typed) == ST_OK);
+    ASSERT(st_classify(cases[i].command, &typed) == ST_OK);
     ASSERT(typed.count == cases[i].count);
     const char *expected_text = cases[i].text;
     for (size_t j = 0; j < typed.count; j++) {
@@ -617,9 +653,9 @@ static int test_normalization_boundaries(void) {
   st_token_array_t typed = {(st_token_t *)1, 99};
   char **legacy = (char **)1;
   size_t count = 99;
-  ASSERT(st_normalize_typed(NULL, &typed) == ST_ERR_INVALID);
+  ASSERT(st_classify(NULL, &typed) == ST_ERR_INVALID);
   ASSERT(typed.tokens == NULL && typed.count == 0);
-  ASSERT(st_normalize_typed("echo ok", NULL) == ST_ERR_INVALID);
+  ASSERT(st_classify("echo ok", NULL) == ST_ERR_INVALID);
   ASSERT(st_normalize(NULL, &legacy, &count) == ST_ERR_INVALID);
   ASSERT(legacy == NULL && count == 0);
   legacy = (char **)1;
@@ -636,7 +672,7 @@ static int test_normalization_boundaries(void) {
   for (size_t i = 0; i < sizeof(operators) - 1; i++)
     operators[i] = i % 2 == 0 ? '|' : '&';
   operators[sizeof(operators) - 1] = '\0';
-  ASSERT(st_normalize_typed(operators, &typed) == ST_OK);
+  ASSERT(st_classify(operators, &typed) == ST_OK);
   ASSERT(typed.count == sizeof(operators) - 1);
   for (size_t i = 0; i < typed.count; i++) {
     ASSERT(typed.tokens[i].type == ST_TYPE_LITERAL);
@@ -652,7 +688,7 @@ static int test_normalization_boundaries(void) {
     many[used++] = ' ';
   }
   many[used - 1] = '\0';
-  ASSERT(st_normalize_typed(many, &typed) == ST_ERR_INVALID);
+  ASSERT(st_classify(many, &typed) == ST_ERR_INVALID);
   ASSERT(typed.tokens == NULL && typed.count == 0);
 
   char long_token[ST_MAX_TOKEN_LEN + 2];
@@ -662,7 +698,7 @@ static int test_normalization_boundaries(void) {
   snprintf(long_command, sizeof(long_command), "echo %s", long_token);
   /* Expansion callbacks may legitimately produce long scalar values; the
    * token-length constant constrains classification helpers, not input. */
-  ASSERT(st_normalize_typed(long_command, &typed) == ST_OK);
+  ASSERT(st_classify(long_command, &typed) == ST_OK);
   ASSERT(typed.count == 2 &&
          strlen(typed.tokens[1].text) == ST_MAX_TOKEN_LEN + 1);
   st_free_token_array(&typed);
@@ -670,9 +706,10 @@ static int test_normalization_boundaries(void) {
 }
 
 static int test_normalization_allocation_failures(void) {
+  static const char input[] = "grep 'a.*b' 2>&1 --output=log EMPTY= kill -s 9";
   st_token_array_t probe = {0};
   st_test_alloc_reset();
-  ASSERT(st_normalize_typed("echo /tmp/value --flag", &probe) == ST_OK);
+  ASSERT(st_classify(input, &probe) == ST_OK);
   size_t allocations = st_test_alloc_count();
   ASSERT(allocations > 0);
   st_free_token_array(&probe);
@@ -681,7 +718,7 @@ static int test_normalization_allocation_failures(void) {
   for (size_t fail_at = 1; fail_at <= allocations; fail_at++) {
     st_token_array_t typed = {(st_token_t *)1, 99};
     st_test_alloc_fail_at(fail_at);
-    st_error_t err = st_normalize_typed("echo /tmp/value --flag", &typed);
+    st_error_t err = st_classify(input, &typed);
     st_test_alloc_reset();
     if (err == ST_ERR_MEMORY) {
       observed = true;
@@ -696,8 +733,7 @@ static int test_normalization_allocation_failures(void) {
   char **legacy_probe = NULL;
   size_t legacy_count = 0;
   st_test_alloc_reset();
-  ASSERT(st_normalize("echo /tmp/value --flag", &legacy_probe, &legacy_count) ==
-         ST_OK);
+  ASSERT(st_normalize(input, &legacy_probe, &legacy_count) == ST_OK);
   size_t legacy_allocations = st_test_alloc_count();
   ASSERT(legacy_probe != NULL && legacy_count > 0 && legacy_allocations > 0);
   st_free_tokens(legacy_probe, legacy_count);
@@ -706,7 +742,7 @@ static int test_normalization_allocation_failures(void) {
     char **tokens = (char **)1;
     size_t count = 99;
     st_test_alloc_fail_at(fail_at);
-    st_error_t err = st_normalize("echo /tmp/value --flag", &tokens, &count);
+    st_error_t err = st_normalize(input, &tokens, &count);
     st_test_alloc_reset();
     if (err == ST_ERR_MEMORY) {
       observed = true;

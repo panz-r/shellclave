@@ -59,8 +59,7 @@ static void print_usage(const char *prog) {
   fprintf(stderr, "\n");
   fprintf(stderr, "Other:\n");
   fprintf(stderr, "  --normalize <cmd>    Show normalised form of a command\n");
-  fprintf(stderr,
-          "  --normalize-typed <cmd> Show typed tokens (text + type)\n");
+  fprintf(stderr, "  --classify <cmd> Show typed tokens (text + type)\n");
   fprintf(
       stderr,
       "  --validate <pat>     Validate pattern syntax, show parsed tokens\n");
@@ -79,7 +78,7 @@ int main(int argc, char *argv[]) {
   const char *verify_file = NULL;
   const char *validate_pat = NULL;
   const char *stats_file = NULL;
-  const char *normalize_typed_cmd = NULL;
+  const char *classify_cmd = NULL;
   bool do_suggest = false;
   uint32_t min_support = ST_DEFAULT_MIN_SUPPORT;
   double min_confidence = ST_DEFAULT_MIN_CONFIDENCE;
@@ -100,7 +99,7 @@ int main(int argc, char *argv[]) {
       {"verify-file", required_argument, 0, 'V'},
       {"validate", required_argument, 0, 't'},
       {"stats", required_argument, 0, 'T'},
-      {"normalize-typed", required_argument, 0, 'N'},
+      {"classify", required_argument, 0, 'N'},
       {"help", no_argument, 0, 'h'},
       {0, 0, 0, 0}};
 
@@ -150,7 +149,7 @@ int main(int argc, char *argv[]) {
       stats_file = optarg;
       break;
     case 'N':
-      normalize_typed_cmd = optarg;
+      classify_cmd = optarg;
       break;
     case 'h':
       print_usage(argv[0]);
@@ -181,10 +180,10 @@ int main(int argc, char *argv[]) {
     return 0;
   }
 
-  /* Normalize-typed mode */
-  if (normalize_typed_cmd) {
+  /* Classify mode */
+  if (classify_cmd) {
     st_token_array_t arr = {NULL, 0};
-    st_error_t err = st_normalize_typed(normalize_typed_cmd, &arr);
+    st_error_t err = st_classify(classify_cmd, &arr);
     if (err != ST_OK) {
       fprintf(stderr, "Error: normalisation failed (%d)\n", err);
       return 1;

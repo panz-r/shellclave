@@ -911,16 +911,9 @@ static int test_processor(const char *input) {
         free_dfa_inputs(dfa_inputs, dfa_input_count);
         return 1;
       }
-      if (info->command_tokens) {
-        size_t expected_length = info->command_token_count - 1;
-        for (size_t j = 0; j < info->command_token_count; j++)
-          expected_length += info->command_tokens[j].length;
-        if (info->clean_command[expected_length] != '\0') {
-          shell_free_command_infos(infos, command_count);
-          free_dfa_inputs(dfa_inputs, dfa_input_count);
-          return 1;
-        }
-      }
+      /* clean_command is a canonical processed serialization. Quote-fragment
+       * assembly and escaped arguments mean its byte length intentionally need
+       * not equal the sum of the raw source spans. */
       expected_features |= shell_has_dangerous_features(info);
     }
   }

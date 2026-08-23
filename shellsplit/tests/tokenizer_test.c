@@ -1,4 +1,5 @@
 #include "shell_processor.h"
+#include "shell_tokenizer.h"
 #include "shell_tokenizer_full.h"
 #include "shell_transform.h"
 #include "test_allocator.h"
@@ -72,6 +73,22 @@ static void test_token_type_names(void) {
           strcmp(shell_token_type_name((token_type_t)(TOKEN_HERESTRING + 1)),
                  "UNKNOWN") == 0;
   test("Token type names cover every enum value", valid);
+}
+
+static void test_error_strings(void) {
+  static const struct {
+    shell_error_t error;
+    const char *text;
+  } cases[] = {{SHELL_OK, "OK"},
+               {SHELL_EINPUT, "Invalid input"},
+               {SHELL_ETRUNC, "Truncated (limits exceeded)"},
+               {SHELL_EPARSE, "Parse error"},
+               {(shell_error_t)1, "Unknown error"}};
+  bool valid = true;
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++)
+    valid =
+        valid && strcmp(shell_error_string(cases[i].error), cases[i].text) == 0;
+  test("Fast-parser error strings cover known and unknown values", valid);
 }
 
 static void test_composition_metadata(void) {
@@ -591,11 +608,117 @@ static void test_transform_allocation_failures(void) {
   test("Transform allocation failures report ENOMEM and clear outputs", atomic);
 }
 
+static void test_output_limit_boundaries(void) {
+  static const char input[] = "echo one ; printf two";
+  shell_command_info_t *infos = NULL;
+  size_t count = 0;
+  shell_process_status_t process_status =
+      shell_process_command(input, NULL, &infos, &count);
+  size_t process_max = 0;
+  size_t process_total = 0;
+  for (size_t i = 0; process_status == SHELL_PROCESS_OK && i < count; i++) {
+    size_t original = strlen(infos[i].original_command);
+    size_t clean = strlen(infos[i].clean_command);
+    if (original > process_max)
+      process_max = original;
+    if (clean > process_max)
+      process_max = clean;
+    process_total += original + clean;
+  }
+  shell_free_command_infos(infos, count);
+
+  shell_process_limits_t process_limits = {process_max, process_total};
+  infos = NULL;
+  count = 0;
+  bool process_valid = process_status == SHELL_PROCESS_OK &&
+                       shell_process_command(input, &process_limits, &infos,
+                                             &count) == SHELL_PROCESS_OK;
+  shell_free_command_infos(infos, count);
+  process_limits.max_string_bytes--;
+  infos = (shell_command_info_t *)(uintptr_t)1;
+  count = SIZE_MAX;
+  process_valid =
+      process_valid &&
+      shell_process_command(input, &process_limits, &infos, &count) ==
+          SHELL_PROCESS_EOUTPUT_LIMIT &&
+      infos == NULL && count == 0;
+  process_limits.max_string_bytes = process_max;
+  process_limits.max_total_bytes--;
+  infos = (shell_command_info_t *)(uintptr_t)1;
+  count = SIZE_MAX;
+  process_valid =
+      process_valid &&
+      shell_process_command(input, &process_limits, &infos, &count) ==
+          SHELL_PROCESS_EOUTPUT_LIMIT &&
+      infos == NULL && count == 0;
+  test("Processor output limits accept exact bounds and reject overflow",
+       process_valid);
+
+  transformed_command_t **commands = NULL;
+  size_t transformed_count = 0;
+  shell_transform_status_t transform_status =
+      shell_transform_command_line(input, NULL, &commands, &transformed_count);
+  size_t transform_max = 0;
+  size_t transform_total = 0;
+  for (size_t i = 0;
+       transform_status == SHELL_TRANSFORM_OK && i < transformed_count; i++) {
+    size_t lengths[2] = {strlen(commands[i]->original_command),
+                         strlen(commands[i]->transformed_command)};
+    for (size_t j = 0; j < 2; j++) {
+      if (lengths[j] > transform_max)
+        transform_max = lengths[j];
+      transform_total += lengths[j];
+    }
+    for (size_t j = 0; j < commands[i]->token_count; j++) {
+      size_t original = strlen(commands[i]->tokens[j].original);
+      size_t transformed = strlen(commands[i]->tokens[j].transformed);
+      if (original > transform_max)
+        transform_max = original;
+      if (transformed > transform_max)
+        transform_max = transformed;
+      transform_total += original + transformed;
+    }
+  }
+  shell_free_transformed_commands(commands, transformed_count);
+  free(commands);
+
+  shell_transform_limits_t transform_limits = {transform_max, transform_total};
+  commands = NULL;
+  transformed_count = 0;
+  bool transform_valid =
+      transform_status == SHELL_TRANSFORM_OK &&
+      shell_transform_command_line(input, &transform_limits, &commands,
+                                   &transformed_count) == SHELL_TRANSFORM_OK;
+  shell_free_transformed_commands(commands, transformed_count);
+  free(commands);
+  transform_limits.max_string_bytes--;
+  commands = (transformed_command_t **)(uintptr_t)1;
+  transformed_count = SIZE_MAX;
+  transform_valid = transform_valid &&
+                    shell_transform_command_line(
+                        input, &transform_limits, &commands,
+                        &transformed_count) == SHELL_TRANSFORM_EOUTPUT_LIMIT &&
+                    commands == NULL && transformed_count == 0;
+  transform_limits.max_string_bytes = transform_max;
+  transform_limits.max_total_bytes--;
+  commands = (transformed_command_t **)(uintptr_t)1;
+  transformed_count = SIZE_MAX;
+  transform_valid = transform_valid &&
+                    shell_transform_command_line(
+                        input, &transform_limits, &commands,
+                        &transformed_count) == SHELL_TRANSFORM_EOUTPUT_LIMIT &&
+                    commands == NULL && transformed_count == 0;
+  test("Transform output limits enforce exact call-wide aggregate bounds",
+       transform_valid);
+}
+
 int main(void) {
   test_tokenize_allocation_failures();
   test_processor_allocation_failures();
   test_transform_allocation_failures();
+  test_output_limit_boundaries();
   test_token_type_names();
+  test_error_strings();
   test_composition_metadata();
   static const iterator_case_t iterator_cases[] = {
       {"Tokenizer iterator: empty input", "", 0, {0}, {NULL}, 0, 0, 0},
@@ -1385,6 +1508,27 @@ int main(void) {
        1,
        {"echo $VAR $NAME"},
        {"echo $VAR $NAME"},
+       {0},
+       0},
+      {"Processor: assembles quote fragments and escaped spaces",
+       "echo foo\"bar\" a\\ b pre' mid 'post",
+       1,
+       {"echo foo\"bar\" a\\ b pre' mid 'post"},
+       {"echo foobar \"a b\" \"pre mid post\""},
+       {0},
+       0},
+      {"Processor: preserves empty and quoted operator arguments",
+       "printf '' \"\" '>'",
+       1,
+       {"printf '' \"\" '>'"},
+       {"printf \"\" \"\" \">\""},
+       {0},
+       0},
+      {"Processor: canonicalizes literal quote and backslash arguments",
+       "printf 'a\"b' \"c'd\" 'x\\y'",
+       1,
+       {"printf 'a\"b' \"c'd\" 'x\\y'"},
+       {"printf \"a\\\"b\" \"c'd\" \"x\\\\y\""},
        {0},
        0},
       {"Processor: command substitution is shell execution",

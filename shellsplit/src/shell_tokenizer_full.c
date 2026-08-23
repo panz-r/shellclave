@@ -528,6 +528,7 @@ bool shell_tokenizer_next(shell_tokenizer_state_t *state,
   size_t start_pos = state->position;
   char current_char = state->input[start_pos];
   bool is_quoted = state->in_quotes;
+  bool word_had_quotes = false;
 
   // Invalid bytes are rejected before tokenization, so this tokenizer never
   // yields a partial stream for malformed byte sequences.
@@ -535,6 +536,7 @@ bool shell_tokenizer_next(shell_tokenizer_state_t *state,
   // Handle quotes first
   char opening_quote = current_char;
   if (handle_quotes(state)) {
+    word_had_quotes = true;
     if (state->in_quotes) {
       while (state->position < state->length) {
         if (handle_quotes(state)) {
@@ -545,18 +547,22 @@ bool shell_tokenizer_next(shell_tokenizer_state_t *state,
         }
       }
 
-      token->type = TOKEN_ARGUMENT;
-      token->start = state->input + start_pos;
-      token->length = state->position - start_pos;
-      token->position = start_pos;
-      token->is_quoted = true;
-      token->is_escaped = false;
-      /* Variables expand anywhere inside double quotes. Classifying the whole
-       * shell word as variable-bearing lets downstream transformation remain
-       * conservative without splitting one argument into several. */
-      if (opening_quote == '"' && quoted_token_has_variable(token))
-        token->type = TOKEN_VARIABLE_QUOTED;
-      return true;
+      if (state->position == state->length ||
+          isspace((unsigned char)state->input[state->position]) ||
+          is_shell_operator(state->input[state->position])) {
+        token->type = TOKEN_ARGUMENT;
+        token->start = state->input + start_pos;
+        token->length = state->position - start_pos;
+        token->position = start_pos;
+        token->is_quoted = true;
+        token->is_escaped = false;
+        /* Variables expand anywhere inside double quotes. Classifying the
+         * whole shell word as variable-bearing lets downstream transformation
+         * remain conservative without splitting one argument into several. */
+        if (opening_quote == '"' && quoted_token_has_variable(token))
+          token->type = TOKEN_VARIABLE_QUOTED;
+        return true;
+      }
     }
     current_char = state->input[state->position];
   }
@@ -873,12 +879,20 @@ bool shell_tokenizer_next(shell_tokenizer_state_t *state,
 
     if (state->in_quotes) {
       if (handle_quotes(state)) {
-        if (!state->in_quotes)
-          break;
+        continue;
       } else {
         state->position++;
       }
     } else {
+      if (c == '\\' && state->position + 1 < state->length) {
+        state->position += 2;
+        continue;
+      }
+      if (c == '\'' || c == '"') {
+        word_had_quotes = true;
+        (void)handle_quotes(state);
+        continue;
+      }
       if (isspace((unsigned char)c) || is_shell_operator(c)) {
         break;
       }
@@ -905,8 +919,8 @@ bool shell_tokenizer_next(shell_tokenizer_state_t *state,
   token->start = state->input + start_pos;
   token->length = token_length;
   token->position = start_pos;
-  token->is_quoted = state->in_quotes;
-  token->is_escaped = false;
+  token->is_quoted = word_had_quotes;
+  token->is_escaped = memchr(token_text, '\\', token_length) != NULL;
   token->group_depth = (size_t)state->paren_depth;
 
   check_keyword(state, token_text, token_length);

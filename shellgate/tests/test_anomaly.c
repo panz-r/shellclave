@@ -448,12 +448,13 @@ TEST(maintenance_failures_are_atomic) {
                            : sg_anomaly_model_prune(model, 2, &removed);
       sg_test_alloc_reset();
       sg_test_anomaly_op_reset();
-      if (status == SG_ANOMALY_ERR_MEMORY) {
-        ASSERT(snapshot_equal(before, snapshot_model(model)));
-        if (operation == 2)
-          ASSERT_EQ_INT(removed, 123);
-        ASSERT(sg_anomaly_model_had_error(model));
-      }
+      ASSERT_EQ_INT(status, SG_ANOMALY_ERR_MEMORY);
+      ASSERT(snapshot_equal(before, snapshot_model(model)));
+      if (operation == 2)
+        ASSERT_EQ_INT(removed, 123);
+      ASSERT(sg_anomaly_model_had_error(model));
+      sg_anomaly_model_clear_error(model);
+      ASSERT(!sg_anomaly_model_had_error(model));
       sg_anomaly_model_free(model);
     }
 
@@ -470,12 +471,13 @@ TEST(maintenance_failures_are_atomic) {
           : operation == 1 ? sg_anomaly_model_decay(model, 0.5)
                            : sg_anomaly_model_prune(model, 2, &removed);
       sg_test_anomaly_op_reset();
-      if (status == SG_ANOMALY_ERR_MEMORY) {
-        ASSERT(snapshot_equal(before, snapshot_model(model)));
-        if (operation == 2)
-          ASSERT_EQ_INT(removed, 123);
-        ASSERT(sg_anomaly_model_had_error(model));
-      }
+      ASSERT_EQ_INT(status, SG_ANOMALY_ERR_MEMORY);
+      ASSERT(snapshot_equal(before, snapshot_model(model)));
+      if (operation == 2)
+        ASSERT_EQ_INT(removed, 123);
+      ASSERT(sg_anomaly_model_had_error(model));
+      sg_anomaly_model_clear_error(model);
+      ASSERT(!sg_anomaly_model_had_error(model));
       sg_anomaly_model_free(model);
     }
   }
@@ -486,7 +488,8 @@ TEST(decay_matrix) {
   ASSERT(model != NULL);
   update_repeated(model, commands, 5, 4);
   ASSERT_EQ_INT(sg_anomaly_unk_count(model), 5);
-  static const double invalid_scales[] = {0.0, -0.5, 2.0};
+  static const double invalid_scales[] = {0.0, -0.5,     2.0,
+                                          NAN, INFINITY, -INFINITY};
   for (size_t i = 0; i < sizeof(invalid_scales) / sizeof(invalid_scales[0]);
        i++)
     ASSERT_EQ_INT(sg_anomaly_model_decay(model, invalid_scales[i]),

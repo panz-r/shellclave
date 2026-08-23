@@ -2005,7 +2005,7 @@ static bool is_signal(const char *token) {
   /* Numeric signals 1-31: only match if clearly signal-like context.
    * Standalone numbers like "2" are just numbers, not signals.
    * Signal numbers are typically after "kill" or "-s" which is handled
-   * by context in st_normalize_typed. */
+   * by context in st_classify. */
   return false;
 }
 
@@ -2352,6 +2352,49 @@ st_token_type_t st_type_from_pattern_token(const char *token) {
 
 /* --- TOKENISATION --- */
 
+static size_t redirection_length(const char *text) {
+  const char *p = text;
+  if (*p == '&' && p[1] == '>')
+    return p[2] == '>' ? 3 : 2;
+
+  while (isdigit((unsigned char)*p))
+    p++;
+  if (*p != '>' && *p != '<')
+    return 0;
+  p++;
+  if (p[-1] == '>' && *p == '>')
+    p++;
+  if (*p == '&') {
+    p++;
+    if (*p == '-')
+      p++;
+    else
+      while (isdigit((unsigned char)*p))
+        p++;
+  }
+  return (size_t)(p - text);
+}
+
+static bool is_redirection_token(const char *text) {
+  size_t length = redirection_length(text);
+  return length != 0 && text[length] == '\0';
+}
+
+static char *duplicate_processed_quoted(const char *text, size_t length,
+                                        char quote) {
+  char *decoded = malloc(length + 1);
+  if (!decoded)
+    return NULL;
+  size_t out = 0;
+  for (size_t i = 0; i < length; i++) {
+    if (quote == '"' && text[i] == '\\' && i + 1 < length)
+      i++;
+    decoded[out++] = text[i];
+  }
+  decoded[out] = '\0';
+  return decoded;
+}
+
 static char **tokenize_command(const char *raw_cmd, size_t *out_count) {
   size_t len = strlen(raw_cmd);
   /* In the worst case every byte is a standalone control operator. */
@@ -2397,42 +2440,15 @@ static char **tokenize_command(const char *raw_cmd, size_t *out_count) {
     }
 
     /* Check for redirection operators */
-    bool found_redir = false;
-    const char *redir_start = p;
-    if (*p == '&' && (p[1] == '>' || (p[1] == '>' && p[2] == '>'))) {
-      size_t rlen = (p[2] == '>') ? 3 : 2;
-      tokens[count] = strndup(redir_start, rlen);
+    size_t redirect_length = redirection_length(p);
+    if (redirect_length != 0) {
+      tokens[count] = strndup(p, redirect_length);
       if (!tokens[count])
         goto fail;
       count++;
-      p += rlen;
-      found_redir = true;
-    } else if (*p == '2' && (p[1] == '>' || (p[1] == '>' && p[2] == '>'))) {
-      size_t rlen = (p[2] == '>') ? 3 : 2;
-      tokens[count] = strndup(redir_start, rlen);
-      if (!tokens[count])
-        goto fail;
-      count++;
-      p += rlen;
-      found_redir = true;
-    } else if (*p == '>' && p[1] == '>') {
-      tokens[count] = strdup(">>");
-      if (!tokens[count])
-        goto fail;
-      count++;
-      p += 2;
-      found_redir = true;
-    } else if (*p == '>' || *p == '<') {
-      char buf[3] = {*p, '\0', '\0'};
-      tokens[count] = strdup(buf);
-      if (!tokens[count])
-        goto fail;
-      count++;
-      p++;
-      found_redir = true;
-    }
-    if (found_redir)
+      p += redirect_length;
       continue;
+    }
 
     /* Quoted string */
     char quote = 0;
@@ -2445,7 +2461,8 @@ static char **tokenize_command(const char *raw_cmd, size_t *out_count) {
           p++;
         p++;
       }
-      tokens[count] = strndup(start, (size_t)(p - start));
+      tokens[count] =
+          duplicate_processed_quoted(start, (size_t)(p - start), quote);
       if (!tokens[count])
         goto fail;
       count++;
@@ -2481,18 +2498,19 @@ fail:
   return NULL;
 }
 
-/* --- PUBLIC API: TYPED NORMALISATION --- */
+/* --- PUBLIC API: PROCESSED-SUBCOMMAND CLASSIFICATION --- */
 
-st_error_t st_normalize_typed(const char *raw_cmd, st_token_array_t *out) {
+st_error_t st_classify(const char *processed_subcommand,
+                       st_token_array_t *out) {
   if (out) {
     out->tokens = NULL;
     out->count = 0;
   }
-  if (!raw_cmd || !out)
+  if (!processed_subcommand || !out)
     return ST_ERR_INVALID;
 
   size_t raw_count = 0;
-  char **raw_tokens = tokenize_command(raw_cmd, &raw_count);
+  char **raw_tokens = tokenize_command(processed_subcommand, &raw_count);
   if (!raw_tokens)
     return ST_ERR_MEMORY;
 
@@ -2584,11 +2602,7 @@ st_error_t st_normalize_typed(const char *raw_cmd, st_token_array_t *out) {
     /* Pipes and redirections are structural literals */
     if (strcmp(tok, "|") == 0 || strcmp(tok, "||") == 0 ||
         strcmp(tok, "&&") == 0 || strcmp(tok, ";") == 0 ||
-        strcmp(tok, "&") == 0 || strcmp(tok, ">") == 0 ||
-        strcmp(tok, ">>") == 0 || strcmp(tok, "<") == 0 ||
-        strcmp(tok, "2>") == 0 || strcmp(tok, "2>>") == 0 ||
-        strcmp(tok, "&>") == 0 || strcmp(tok, "&>>") == 0 ||
-        strcmp(tok, ">&") == 0) {
+        strcmp(tok, "&") == 0 || is_redirection_token(tok)) {
       out->tokens[out->count].text = strdup(tok);
       if (!out->tokens[out->count].text)
         goto fail;
@@ -2614,10 +2628,7 @@ st_error_t st_normalize_typed(const char *raw_cmd, st_token_array_t *out) {
     }
 
     /* Token after a redirection operator → value */
-    if (prev && (strcmp(prev, ">") == 0 || strcmp(prev, ">>") == 0 ||
-                 strcmp(prev, "<") == 0 || strcmp(prev, "2>") == 0 ||
-                 strcmp(prev, "2>>") == 0 || strcmp(prev, "&>") == 0 ||
-                 strcmp(prev, "&>>") == 0 || strcmp(prev, ">&") == 0)) {
+    if (prev && is_redirection_token(prev)) {
       out->tokens[out->count].text = strdup(tok);
       if (!out->tokens[out->count].text)
         goto fail;
@@ -2705,19 +2716,19 @@ void st_free_token_array(st_token_array_t *arr) {
 
 /* --- PUBLIC API: LEGACY STRING NORMALISATION --- */
 
-st_error_t st_normalize(const char *raw_cmd, char ***out_tokens,
+st_error_t st_normalize(const char *processed_subcommand, char ***out_tokens,
                         size_t *out_token_count) {
   if (out_tokens)
     *out_tokens = NULL;
   if (out_token_count)
     *out_token_count = 0;
-  if (!raw_cmd || !out_tokens || !out_token_count)
+  if (!processed_subcommand || !out_tokens || !out_token_count)
     return ST_ERR_INVALID;
 
   st_token_array_t typed;
   typed.tokens = NULL;
   typed.count = 0;
-  st_error_t err = st_normalize_typed(raw_cmd, &typed);
+  st_error_t err = st_classify(processed_subcommand, &typed);
   if (err != ST_OK)
     return err;
 

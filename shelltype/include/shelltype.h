@@ -169,7 +169,7 @@ typedef struct st_token {
 } st_token_t;
 
 /**
- * Array of typed tokens returned by st_normalize_typed().
+ * Array of typed tokens returned by st_classify().
  */
 typedef struct st_token_array {
   st_token_t *tokens;
@@ -264,20 +264,24 @@ bool st_is_blacklisted(const st_learner_t *learner, const char *pattern);
 st_error_t st_save(const st_learner_t *learner, const char *path);
 st_error_t st_load(st_learner_t *learner, const char *path);
 
-/* --- NORMALISATION (public for testing) --- */
+/* --- CLASSIFICATION --- */
 
 /**
- * Normalise a raw command string into an array of typed tokens.
+ * Map a processed subcommand into an array of typed tokens.
  * Each token is classified into the most specific type in the lattice.
  * Token text remains the complete concrete input token; it is never replaced
  * with a synthesized wildcard or metadata-bearing symbol.
- * The input is one already-isolated, execute-program-style subcommand. Shell
- * control flow and compound command isolation belong to an upstream parser.
+ * `processed_subcommand` must be one clean subcommand produced by Shellsplit
+ * (for example `shell_command_info_t.clean_command` or an entry returned by
+ * `shell_extract_dfa_inputs`). It is not arbitrary shell source. Shellsplit is
+ * responsible for shell tokenization, control-flow isolation, redirection
+ * removal, quote-fragment assembly, and escape processing. This function only
+ * separates the canonical processed arguments and assigns lattice types.
  * Commands with more than ST_MAX_CMD_TOKENS tokens return ST_ERR_INVALID.
  *
  * The caller must free the returned array with st_free_token_array().
  */
-st_error_t st_normalize_typed(const char *raw_cmd, st_token_array_t *out);
+st_error_t st_classify(const char *processed_subcommand, st_token_array_t *out);
 
 /**
  * Free a typed token array.
@@ -285,10 +289,10 @@ st_error_t st_normalize_typed(const char *raw_cmd, st_token_array_t *out);
 void st_free_token_array(st_token_array_t *arr);
 
 /**
- * Legacy: normalise into string tokens (backward compatible).
+ * Legacy: map a Shellsplit-processed subcommand into string tokens.
  * Wildcard tokens use their type symbol (e.g., "#n", "#p", "*").
  */
-st_error_t st_normalize(const char *raw_cmd, char ***out_tokens,
+st_error_t st_normalize(const char *processed_subcommand, char ***out_tokens,
                         size_t *out_token_count);
 
 /**

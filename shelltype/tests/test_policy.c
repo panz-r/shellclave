@@ -1070,7 +1070,7 @@ static int test_suggestion_contracts(void) {
   }
 
   st_token_array_t quoted_space = {0};
-  ASSERT(st_normalize_typed("echo \"two words\"", &quoted_space) == ST_OK);
+  ASSERT(st_classify("echo \"two words\"", &quoted_space) == ST_OK);
   ASSERT(quoted_space.count == 2 &&
          quoted_space.tokens[1].type == ST_TYPE_QUOTED_SPACE);
   memset(variants, 0xa5, sizeof(variants));

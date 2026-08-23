@@ -38,6 +38,32 @@ void shell_free_transformed_command(transformed_command_t *command) {
   free(command);
 }
 
+static shell_transform_status_t
+measure_transformed_command(const transformed_command_t *command,
+                            size_t *total_output) {
+  size_t total = 0;
+  const char *command_strings[] = {command->original_command,
+                                   command->transformed_command};
+  for (size_t i = 0; i < 2; i++) {
+    size_t length = strlen(command_strings[i]);
+    if (length > SIZE_MAX - total)
+      return SHELL_TRANSFORM_EOVERFLOW;
+    total += length;
+  }
+  for (size_t i = 0; i < command->token_count; i++) {
+    const char *token_strings[] = {command->tokens[i].original,
+                                   command->tokens[i].transformed};
+    for (size_t j = 0; j < 2; j++) {
+      size_t length = strlen(token_strings[j]);
+      if (length > SIZE_MAX - total)
+        return SHELL_TRANSFORM_EOVERFLOW;
+      total += length;
+    }
+  }
+  *total_output = total;
+  return SHELL_TRANSFORM_OK;
+}
+
 static transformed_token_t create_transformed_token(const char *original,
                                                     const char *transformed,
                                                     transform_type_t type,
@@ -233,11 +259,7 @@ shell_transform_command(shell_command_t *cmd,
     return build_status;
   }
 
-  size_t total_output = orig_length;
   size_t transformed_length = strlen(tcmd->transformed_command);
-  if (transformed_length > SIZE_MAX - total_output)
-    goto overflow;
-  total_output += transformed_length;
   if (limits && transformed_length > limits->max_string_bytes)
     goto output_limit;
   for (size_t i = 0; i < tcmd->token_count; i++) {
@@ -246,13 +268,10 @@ shell_transform_command(shell_command_t *cmd,
     if (limits && (original_length > limits->max_string_bytes ||
                    token_length > limits->max_string_bytes))
       goto output_limit;
-    if (original_length > SIZE_MAX - total_output)
-      goto overflow;
-    total_output += original_length;
-    if (token_length > SIZE_MAX - total_output)
-      goto overflow;
-    total_output += token_length;
   }
+  size_t total_output = 0;
+  if (measure_transformed_command(tcmd, &total_output) != SHELL_TRANSFORM_OK)
+    goto overflow;
   if (limits && total_output > limits->max_total_bytes)
     goto output_limit;
 
@@ -300,19 +319,33 @@ shell_transform_status_t shell_transform_command_line(
   }
 
   size_t success_count = 0;
+  size_t total_output = 0;
   for (size_t i = 0; i < cmd_count; i++) {
     shell_transform_status_t status =
         shell_transform_command(&cmds[i], limits, &tcmds[i]);
     if (status == SHELL_TRANSFORM_OK) {
-      success_count++;
-    } else {
-      // On failure, free successfully transformed commands
-      for (size_t j = 0; j < success_count; j++)
-        shell_free_transformed_command(tcmds[j]);
-      free(tcmds);
-      shell_free_commands(cmds, cmd_count);
-      return status;
+      size_t command_output = 0;
+      status = measure_transformed_command(tcmds[i], &command_output);
+      if (status == SHELL_TRANSFORM_OK) {
+        if (command_output > SIZE_MAX - total_output) {
+          status = SHELL_TRANSFORM_EOVERFLOW;
+        } else {
+          total_output += command_output;
+          if (limits && total_output > limits->max_total_bytes)
+            status = SHELL_TRANSFORM_EOUTPUT_LIMIT;
+        }
+      }
+      if (status == SHELL_TRANSFORM_OK) {
+        success_count++;
+        continue;
+      }
+      shell_free_transformed_command(tcmds[i]);
     }
+    for (size_t j = 0; j < success_count; j++)
+      shell_free_transformed_command(tcmds[j]);
+    free(tcmds);
+    shell_free_commands(cmds, cmd_count);
+    return status;
   }
 
   *transformed_cmds = tcmds;

@@ -203,6 +203,13 @@ if(BUILD_TESTING)
   shellclave_add_test(shelltype_policy_concurrency_test shelltype/tests/test_policy_concurrency.c shelltype_test)
   shellclave_add_test(shelltype_verify_test shelltype/tests/test_verify.c shelltype_test)
   shellclave_add_test(shelltype_integration_test shelltype/tests/test_shelltype_integration.c shelltype_test)
+  add_executable(processed_subcommand_integration_test
+    tests/test_processed_subcommand.c)
+  shellclave_project_target(processed_subcommand_integration_test)
+  target_link_libraries(processed_subcommand_integration_test PRIVATE
+    shellsplit_test shelltype_test)
+  add_test(NAME processed_subcommand_integration_test
+    COMMAND processed_subcommand_integration_test)
   shellclave_add_test(shelltype_compact_policy_test shelltype/tests/test_policy_compact.c shelltype_test)
   target_include_directories(shelltype_compact_policy_test PRIVATE shelltype/src)
   shellclave_add_test(shelltype_policy_model_test shelltype/tests/test_policy_model.c shelltype_test)
@@ -215,11 +222,17 @@ if(BUILD_TESTING)
   endforeach()
   shellclave_add_test(shellgate_unit_test shellgate/tests/test_shellgate.c shellgate_test)
   shellclave_add_test(shellgate_anomaly_test shellgate/tests/test_anomaly.c shellgate_test)
+  shellclave_add_test(shellgate_io_test shellgate/tests/test_sg_io.c shellgate_test)
+  target_compile_definitions(shellgate_io_test PRIVATE
+    SHELLGATE_TEST_ALLOCATOR SHELLGATE_TEST_IO)
+  target_include_directories(shellgate_io_test PRIVATE
+    shellgate/src shellgate/tests)
   target_include_directories(shellgate_unit_test PRIVATE shelltype/tests)
   target_include_directories(shellgate_anomaly_test PRIVATE shellgate/tests)
   set_tests_properties(shellgate_unit_test PROPERTIES LABELS shellgate)
   set_tests_properties(shellgate_anomaly_test PROPERTIES
     LABELS "shellgate;anomaly")
+  set_tests_properties(shellgate_io_test PROPERTIES LABELS shellgate)
 
   foreach(header IN LISTS SHELLCLAVE_PUBLIC_HEADERS)
     get_filename_component(header_name "${header}" NAME)

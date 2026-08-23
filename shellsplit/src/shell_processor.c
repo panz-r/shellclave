@@ -40,6 +40,51 @@ static bool redirection_consumes_next_token(const shell_token_t *token) {
 
 static char *build_clean_command(shell_token_t *tokens, size_t count);
 
+static char *decode_shell_word(const char *text, size_t length,
+                               size_t *decoded_length) {
+  char *decoded = malloc(length + 1);
+  if (!decoded)
+    return NULL;
+  size_t out = 0;
+  char quote = 0;
+  for (size_t i = 0; i < length; i++) {
+    char c = text[i];
+    if (quote == 0 && (c == '\'' || c == '"')) {
+      quote = c;
+      continue;
+    }
+    if (quote != 0 && c == quote) {
+      quote = 0;
+      continue;
+    }
+    if (c == '\\' && quote != '\'' && i + 1 < length) {
+      char next = text[i + 1];
+      if (quote == 0 || next == '$' || next == '`' || next == '"' ||
+          next == '\\' || next == '\n') {
+        if (next != '\n')
+          decoded[out++] = next;
+        i++;
+        continue;
+      }
+    }
+    decoded[out++] = c;
+  }
+  decoded[out] = '\0';
+  *decoded_length = out;
+  return decoded;
+}
+
+static bool processed_word_needs_quotes(const char *word, size_t length) {
+  if (length == 0)
+    return true;
+  for (size_t i = 0; i < length; i++) {
+    unsigned char c = (unsigned char)word[i];
+    if (isspace(c) || strchr("|&;<>'\"\\", c))
+      return true;
+  }
+  return false;
+}
+
 static bool process_single_command_internal(shell_command_t *basic_cmd,
                                             const char *original_line,
                                             shell_command_info_t *info);
@@ -61,35 +106,88 @@ static char *build_clean_command(shell_token_t *tokens, size_t count) {
     return strdup("");
   }
 
+  char **words = calloc(count, sizeof(*words));
+  size_t *lengths = calloc(count, sizeof(*lengths));
+  bool *preserve_raw = calloc(count, sizeof(*preserve_raw));
+  if (!words || !lengths || !preserve_raw) {
+    free(words);
+    free(lengths);
+    free(preserve_raw);
+    return NULL;
+  }
+
   size_t total_length = 0;
   for (size_t i = 0; i < count; i++) {
-    if (tokens[i].length > SIZE_MAX - total_length)
-      return NULL;
-    total_length += tokens[i].length;
+    preserve_raw[i] = tokens[i].type == TOKEN_SUBSHELL ||
+                      tokens[i].type == TOKEN_PROCESS_SUB ||
+                      tokens[i].type == TOKEN_ARITHMETIC;
+    words[i] =
+        preserve_raw[i]
+            ? strndup(tokens[i].start, tokens[i].length)
+            : decode_shell_word(tokens[i].start, tokens[i].length, &lengths[i]);
+    if (!words[i])
+      goto fail;
+    if (preserve_raw[i])
+      lengths[i] = tokens[i].length;
+    size_t encoded_length = lengths[i];
+    if (!preserve_raw[i] && processed_word_needs_quotes(words[i], lengths[i])) {
+      if (encoded_length > SIZE_MAX - 2)
+        goto fail;
+      encoded_length += 2;
+      for (size_t j = 0; j < lengths[i]; j++)
+        if (words[i][j] == '"' || words[i][j] == '\\') {
+          if (encoded_length == SIZE_MAX)
+            goto fail;
+          encoded_length++;
+        }
+    }
+    if (encoded_length > SIZE_MAX - total_length)
+      goto fail;
+    total_length += encoded_length;
     if (i > 0) {
       if (total_length == SIZE_MAX)
-        return NULL;
+        goto fail;
       total_length++;
     }
   }
   if (total_length == SIZE_MAX)
-    return NULL;
+    goto fail;
 
   char *buffer = malloc(total_length + 1);
   if (!buffer)
-    return NULL;
+    goto fail;
 
   char *pos = buffer;
   for (size_t i = 0; i < count; i++) {
-    if (i > 0) {
+    if (i > 0)
       *pos++ = ' ';
+    bool quote =
+        !preserve_raw[i] && processed_word_needs_quotes(words[i], lengths[i]);
+    if (quote)
+      *pos++ = '"';
+    for (size_t j = 0; j < lengths[i]; j++) {
+      if (quote && (words[i][j] == '"' || words[i][j] == '\\'))
+        *pos++ = '\\';
+      *pos++ = words[i][j];
     }
-    memcpy(pos, tokens[i].start, tokens[i].length);
-    pos += tokens[i].length;
+    if (quote)
+      *pos++ = '"';
+    free(words[i]);
   }
   *pos = '\0';
+  free(words);
+  free(lengths);
+  free(preserve_raw);
 
   return buffer;
+
+fail:
+  for (size_t i = 0; i < count; i++)
+    free(words[i]);
+  free(words);
+  free(lengths);
+  free(preserve_raw);
+  return NULL;
 }
 
 static bool process_single_command(shell_command_t *basic_cmd,

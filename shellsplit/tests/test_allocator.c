@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #define _POSIX_C_SOURCE 200809L
 
 #include "test_allocator.h"
@@ -44,4 +45,8 @@ void *shellsplit_test_realloc(void *pointer, size_t size) {
 
 char *shellsplit_test_strdup(const char *value) {
   return allocation_fails() ? NULL : strdup(value);
+}
+
+char *shellsplit_test_strndup(const char *value, size_t length) {
+  return allocation_fails() ? NULL : strndup(value, length);
 }

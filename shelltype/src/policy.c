@@ -2406,7 +2406,7 @@ st_error_t st_policy_eval(st_policy_t *policy, const char *raw_cmd,
   st_token_array_t cmd;
   cmd.tokens = NULL;
   cmd.count = 0;
-  st_error_t err = st_normalize_typed(raw_cmd, &cmd);
+  st_error_t err = st_classify(raw_cmd, &cmd);
   if (err != ST_OK) {
     pthread_rwlock_unlock(&policy->rwlock);
     return err;
@@ -2664,7 +2664,7 @@ st_error_t st_policy_verify_all(const st_policy_t *policy, const char *raw_cmd,
   st_token_array_t cmd;
   cmd.tokens = NULL;
   cmd.count = 0;
-  st_error_t err = st_normalize_typed(raw_cmd, &cmd);
+  st_error_t err = st_classify(raw_cmd, &cmd);
   if (err != ST_OK)
     return err;
 

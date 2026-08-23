@@ -41,3 +41,7 @@ void *st_test_realloc(void *ptr, size_t size) {
 char *st_test_strdup(const char *value) {
   return should_fail() ? NULL : strdup(value);
 }
+
+char *st_test_strndup(const char *value, size_t length) {
+  return should_fail() ? NULL : strndup(value, length);
+}
