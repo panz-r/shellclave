@@ -114,6 +114,7 @@ static int test_contract_boundaries(void) {
   memset(long_path, 'x', sizeof(long_path) - 1);
   long_path[sizeof(long_path) - 1] = '\0';
   CHECK(sg_sync_parent_directory(long_path) == -1);
+  CHECK(sg_sync_parent_directory("/") == 0);
 
   char relative[128];
   snprintf(relative, sizeof(relative), "shellgate-relative-%ld",

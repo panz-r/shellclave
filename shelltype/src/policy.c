@@ -17,6 +17,7 @@
 #include "arena.h"
 #include "draugr/vacuum_filter.h"
 #include "filter_hash.h"
+#include "netpattern.h"
 #include "policy_ctx.h"
 #include "shelltype.h"
 
@@ -36,32 +37,10 @@
 #include <unistd.h>
 
 #include "alloc.h"
+#include "crc32.h"
 #include "io.h"
 #include "metadata.h"
 #include "read_line.h"
-
-/* --- CRC32 (for serialization integrity check) --- */
-
-static uint32_t crc32_table[256];
-static pthread_once_t crc32_once = PTHREAD_ONCE_INIT;
-
-static void crc32_init_table_once(void) {
-  for (uint32_t i = 0; i < 256; i++) {
-    uint32_t c = i;
-    for (int j = 0; j < 8; j++)
-      c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
-    crc32_table[i] = c;
-  }
-}
-
-static uint32_t crc32_compute(const void *data, size_t len, uint32_t prev) {
-  (void)pthread_once(&crc32_once, crc32_init_table_once);
-  uint32_t c = prev ^ 0xFFFFFFFFu;
-  const uint8_t *p = (const uint8_t *)data;
-  for (size_t i = 0; i < len; i++)
-    c = crc32_table[(c ^ p[i]) & 0xFF] ^ (c >> 8);
-  return c ^ 0xFFFFFFFFu;
-}
 
 /* --- COMPATIBILITY MASK --- */
 
@@ -597,18 +576,6 @@ const char *st_size_suffix(const char *text) {
   return p;
 }
 
-/* --- PARAMETER VALIDATION ---
- *
- * Called from parse_pattern() to reject malformed parameters.
- * Returns true if the parameter is valid for the given base type.
- */
-
-static bool validate_param(st_token_type_t base_type, const char *param) {
-  if (!param || param[0] != '.' || param[1] == '\0')
-    return false;
-  return st_metadata_lookup(base_type, param + 1) != NULL;
-}
-
 /* --- PARAMETRIZED MATCHING --- */
 
 static bool closed_metadata_matches(const char *cmd_text,
@@ -843,157 +810,6 @@ static int insert_child(policy_state_t *node, st_policy_t *policy,
   return filter_status;
 }
 
-/* --- PATTERN PARSING --- */
-
-/*
- * Validate pattern syntax:
- * - Reject patterns starting with * (too broad at first position)
- *
- * Returns true if valid, false otherwise.
- */
-static bool validate_pattern(const char *pattern) {
-  if (!pattern || !pattern[0])
-    return false;
-
-  for (const unsigned char *p = (const unsigned char *)pattern; *p; p++)
-    if ((*p < 0x20 && *p != ' ') || *p == 0x7f)
-      return false;
-
-  /* Check first token - reject patterns starting with * (too broad) */
-  const char *first = pattern;
-  while (*first == ' ')
-    first++;
-  if (strncmp(first, "*", 1) == 0 && (first[1] == ' ' || first[1] == '\0')) {
-    return false; /* Reject pattern starting with * */
-  }
-
-  return true;
-}
-
-static st_token_t *parse_pattern(const char *pattern, size_t *out_count,
-                                 st_error_t *out_error) {
-  if (out_error)
-    *out_error = ST_ERR_INVALID;
-  if (!validate_pattern(pattern))
-    return NULL;
-
-  /* Keep the parser contract aligned with the fixed-size public metadata
-   * buffers.  Reject before allocating or copying so validation cannot
-   * truncate token text or write past st_pattern_info_t. */
-  size_t pattern_len = strlen(pattern);
-  if (pattern_len >= ST_MAX_PATTERN_LEN)
-    return NULL;
-
-  size_t count = 0;
-  size_t token_len = 0;
-  for (const char *p = pattern; *p; p++) {
-    if (*p == ' ') {
-      if (token_len != 0) {
-        if (token_len >= ST_MAX_TOKEN_LEN)
-          return NULL;
-        count++;
-        token_len = 0;
-      }
-    } else {
-      token_len++;
-    }
-  }
-  if (token_len >= ST_MAX_TOKEN_LEN)
-    return NULL;
-  if (token_len != 0)
-    count++;
-  if (count == 0 || count > ST_MAX_CMD_TOKENS)
-    return NULL;
-
-  char *copy = strdup(pattern);
-  if (!copy) {
-    if (out_error)
-      *out_error = ST_ERR_MEMORY;
-    return NULL;
-  }
-
-  st_token_t *tokens = calloc(count, sizeof(st_token_t));
-  if (!tokens) {
-    free(copy);
-    if (out_error)
-      *out_error = ST_ERR_MEMORY;
-    return NULL;
-  }
-
-  size_t ti = 0;
-  char *saveptr = NULL;
-  char *tok = strtok_r(copy, " ", &saveptr);
-  while (tok && ti < count) {
-    st_token_type_t type = ST_TYPE_LITERAL;
-    bool matched_prefix = false;
-    char canonical_token[ST_MAX_TOKEN_LEN];
-    const char *token_text = tok;
-    for (int t = 1; t < ST_TYPE_COUNT; t++) {
-      const char *sym = st_type_symbol[t];
-      size_t sym_len = strlen(sym);
-      if (strncmp(tok, sym, sym_len) == 0 && tok[sym_len] == '\0') {
-        /* Exact match: e.g., "#path" */
-        type = (st_token_type_t)t;
-        break;
-      }
-      if (strncmp(tok, sym, sym_len) == 0 && tok[sym_len] == '.') {
-        /* Has a parameter suffix — but only set matched_prefix for
-         * #-prefixed symbols.  Single-char symbols like * naturally
-         * appear in tokens like *.txt which is a glob, not a
-         * parametrized wildcard. */
-        if (sym[0] == '#')
-          matched_prefix = true;
-        const st_metadata_entry_t *metadata =
-            st_metadata_lookup((st_token_type_t)t, tok + sym_len + 1);
-        if (type_supports_param((st_token_type_t)t) && metadata &&
-            validate_param((st_token_type_t)t, tok + sym_len)) {
-          int written = snprintf(canonical_token, sizeof(canonical_token),
-                                 "%s.%s", sym, metadata->name);
-          if (written < 0 || (size_t)written >= sizeof(canonical_token)) {
-            matched_prefix = true;
-            break;
-          }
-          token_text = canonical_token;
-          type = (st_token_type_t)t;
-          break;
-        }
-        /* Invalid param or unsupported type -- keep checking other symbols */
-      }
-    }
-    /* If a wildcard symbol prefix was matched but no valid parametrized
-     * type was found, reject the pattern (user intended a parametrized wildcard
-     * but provided an invalid parameter). */
-    if (matched_prefix && type == ST_TYPE_LITERAL) {
-      for (size_t k = 0; k < ti; k++)
-        free(tokens[k].text);
-      free(tokens);
-      free(copy);
-      *out_count = 0;
-      return NULL;
-    }
-    /* Concrete spellings are exact policy literals.  Classification belongs
-     * to command tokens; only an explicit wildcard spelling gives a policy
-     * token wildcard semantics. */
-    tokens[ti].text = strdup(token_text);
-    if (!tokens[ti].text) {
-      for (size_t k = 0; k < ti; k++)
-        free(tokens[k].text);
-      free(tokens);
-      free(copy);
-      *out_count = 0;
-      if (out_error)
-        *out_error = ST_ERR_MEMORY;
-      return NULL;
-    }
-    tokens[ti].type = type;
-    ti++;
-    tok = strtok_r(NULL, " ", &saveptr);
-  }
-  *out_count = ti;
-  free(copy);
-  return tokens;
-}
-
 static void free_pattern_tokens(st_token_t *tokens, size_t count) {
   if (!tokens)
     return;
@@ -1182,18 +998,19 @@ static void policy_rebuild_filters(st_policy_t *policy) {
 
 /* --- PATTERN VALIDATION (public API) --- */
 
-st_error_t st_validate_pattern(const char *pattern, st_pattern_info_t *info) {
+st_error_t st_validate_netpattern(const char *pattern,
+                                  st_pattern_info_t *info) {
   if (info)
     memset(info, 0, sizeof(*info));
-  if (!pattern || !pattern[0])
-    return ST_ERR_INVALID;
-
-  size_t token_count = 0;
-  st_error_t parse_error = ST_ERR_INVALID;
-  st_token_t *tokens = parse_pattern(pattern, &token_count, &parse_error);
-  if (!tokens || token_count == 0) {
+  st_token_array_t decoded = {0};
+  st_error_t decode_error = st_netpattern_decode(pattern, &decoded);
+  if (decode_error != ST_OK)
+    return decode_error;
+  size_t token_count = decoded.count;
+  st_token_t *tokens = decoded.tokens;
+  if (token_count != 0 && tokens[0].type == ST_TYPE_ANY) {
     free_pattern_tokens(tokens, token_count);
-    return parse_error;
+    return ST_ERR_INVALID;
   }
 
   if (info) {
@@ -1300,23 +1117,6 @@ void st_policy_free(st_policy_t *policy) {
 static st_error_t remove_pattern_by_id_locked(st_policy_t *policy,
                                               uint16_t pid);
 
-static bool canonical_pattern_text(const st_token_t *tokens, size_t count,
-                                   char out[ST_MAX_PATTERN_LEN]) {
-  size_t used = 0;
-  for (size_t i = 0; i < count; i++) {
-    size_t length = strlen(tokens[i].text);
-    size_t separator = i == 0 ? 0 : 1;
-    if (used + separator + length >= ST_MAX_PATTERN_LEN)
-      return false;
-    if (separator)
-      out[used++] = ' ';
-    memcpy(out + used, tokens[i].text, length);
-    used += length;
-  }
-  out[used] = '\0';
-  return true;
-}
-
 /* Internal: add pattern assuming write lock is already held.
  *
  * Performs incremental subsumption checks:
@@ -1329,21 +1129,21 @@ static st_error_t st_policy_add_locked(st_policy_t *policy,
   if (!policy || !pattern || !pattern[0])
     return ST_ERR_INVALID;
 
-  size_t token_count = 0;
-  st_error_t parse_error = ST_ERR_INVALID;
-  st_token_t *tokens = parse_pattern(pattern, &token_count, &parse_error);
-  if (!tokens)
-    return parse_error;
+  st_token_array_t decoded = {0};
+  st_error_t decode_error = st_netpattern_decode(pattern, &decoded);
+  if (decode_error != ST_OK)
+    return decode_error;
+  size_t token_count = decoded.count;
+  st_token_t *tokens = decoded.tokens;
+  if (token_count != 0 && tokens[0].type == ST_TYPE_ANY) {
+    free_pattern_tokens(tokens, token_count);
+    return ST_ERR_INVALID;
+  }
   if (token_count == 0) {
     free_pattern_tokens(tokens, token_count);
     return ST_ERR_INVALID;
   }
   if (token_count > ST_MAX_CMD_TOKENS) {
-    free_pattern_tokens(tokens, token_count);
-    return ST_ERR_INVALID;
-  }
-  char canonical_pattern[ST_MAX_PATTERN_LEN];
-  if (!canonical_pattern_text(tokens, token_count, canonical_pattern)) {
     free_pattern_tokens(tokens, token_count);
     return ST_ERR_INVALID;
   }
@@ -1502,13 +1302,23 @@ static st_error_t st_policy_add_locked(st_policy_t *policy,
 
   policy_state_t *end_node = &policy->states.states[current];
   if (end_node->pattern_id == UINT16_MAX) {
+    char *stored_pattern = NULL;
+    st_error_t encode_error =
+        st_netpattern_encode(tokens, token_count, &stored_pattern);
+    if (encode_error != ST_OK) {
+      free(to_remove);
+      free_pattern_tokens(tokens, token_count);
+      return encode_error;
+    }
     pattern_entry_t prepared;
-    if (!pattern_entry_prepare(policy->ctx, canonical_pattern, tokens,
-                               token_count, &prepared)) {
+    if (!pattern_entry_prepare(policy->ctx, stored_pattern, tokens, token_count,
+                               &prepared)) {
+      free(stored_pattern);
       free(to_remove);
       free_pattern_tokens(tokens, token_count);
       return ST_ERR_MEMORY;
     }
+    free(stored_pattern);
     if (reuse_subsumed_slot) {
       for (size_t ri = 0; ri < to_remove_count; ri++)
         remove_pattern_by_id_locked(policy, to_remove[ri]);
@@ -1719,7 +1529,7 @@ static st_error_t remove_pattern_by_id_locked(st_policy_t *policy,
 }
 
 /* Public: add pattern (acquires write lock) */
-st_error_t st_policy_add(st_policy_t *policy, const char *pattern) {
+st_error_t st_policy_add_netpattern(st_policy_t *policy, const char *pattern) {
   if (!policy || !pattern || !pattern[0])
     return ST_ERR_INVALID;
   pthread_rwlock_wrlock(&policy->rwlock);
@@ -1728,8 +1538,9 @@ st_error_t st_policy_add(st_policy_t *policy, const char *pattern) {
   return err;
 }
 
-st_error_t st_policy_batch_add(st_policy_t *policy, const char **patterns,
-                               size_t count) {
+st_error_t st_policy_batch_add_netpatterns(st_policy_t *policy,
+                                           const char **patterns,
+                                           size_t count) {
   if (!policy || !patterns || count == 0)
     return ST_ERR_INVALID;
 
@@ -1834,9 +1645,9 @@ st_error_t st_policy_merge(st_policy_t *dst, const st_policy_t *src) {
   }
   pthread_rwlock_unlock((pthread_rwlock_t *)&src->rwlock);
 
-  st_error_t result =
-      copied == 0 ? ST_OK
-                  : st_policy_batch_add(dst, (const char **)patterns, copied);
+  st_error_t result = copied == 0 ? ST_OK
+                                  : st_policy_batch_add_netpatterns(
+                                        dst, (const char **)patterns, copied);
   for (size_t i = 0; i < copied; i++)
     free(patterns[i]);
   free(patterns);
@@ -1962,37 +1773,47 @@ void st_free_diff_result(st_policy_diff_t *result) {
  * trie path. Arena storage is reclaimed only by st_policy_compact(), but dead
  * generic wildcard transitions must not remain in the graph: they would
  * otherwise shadow a more-specific parameter branch added later. */
-st_error_t st_policy_remove(st_policy_t *policy, const char *pattern) {
+st_error_t st_policy_remove_netpattern(st_policy_t *policy,
+                                       const char *pattern) {
   if (!policy || !pattern || !pattern[0])
     return ST_ERR_INVALID;
 
   pthread_rwlock_wrlock(&policy->rwlock);
 
-  size_t token_count = 0;
-  st_error_t parse_error = ST_ERR_INVALID;
-  st_token_t *tokens = parse_pattern(pattern, &token_count, &parse_error);
-  if (!tokens) {
+  st_token_array_t decoded = {0};
+  st_error_t decode_error = st_netpattern_decode(pattern, &decoded);
+  if (decode_error != ST_OK) {
     pthread_rwlock_unlock(&policy->rwlock);
-    return parse_error;
+    return decode_error;
   }
+  size_t token_count = decoded.count;
+  st_token_t *tokens = decoded.tokens;
   if (token_count == 0) {
     free_pattern_tokens(tokens, token_count);
     pthread_rwlock_unlock(&policy->rwlock);
     return ST_ERR_INVALID;
   }
-
+  char *canonical = NULL;
+  st_error_t encode_error =
+      st_netpattern_encode(tokens, token_count, &canonical);
   free_pattern_tokens(tokens, token_count);
+  if (encode_error != ST_OK) {
+    pthread_rwlock_unlock(&policy->rwlock);
+    return encode_error;
+  }
   for (size_t i = 0; i < policy->patterns.count; i++) {
     pattern_entry_t *entry = &policy->patterns.entries[i];
-    if (!entry->active || strcmp(entry->pattern, pattern) != 0)
+    if (!entry->active || strcmp(entry->pattern, canonical) != 0)
       continue;
     st_error_t error = remove_pattern_by_id_locked(policy, (uint16_t)i);
     if (error == ST_OK)
       atomic_fetch_add(&policy->epoch, 1);
     pthread_rwlock_unlock(&policy->rwlock);
+    free(canonical);
     return error;
   }
   pthread_rwlock_unlock(&policy->rwlock);
+  free(canonical);
   return ST_OK;
 }
 
@@ -2058,7 +1879,7 @@ st_error_t st_policy_compact(st_policy_t *policy) {
 
   st_error_t build_error = ST_OK;
   for (size_t i = 0; i < n_active; i++) {
-    build_error = st_policy_add(staged, active[i]);
+    build_error = st_policy_add_netpattern(staged, active[i]);
     if (build_error != ST_OK)
       break;
   }
@@ -2176,27 +1997,26 @@ static const char *token_display_text(const st_token_t *tok) {
   return st_type_symbol[tok->type];
 }
 
-/* Build a pattern string from typed tokens into a fixed-size buffer. */
+/* Build a canonical netpattern from typed suggestion tokens. */
 static bool st_build_pattern(char *buf, size_t buf_size,
                              const st_token_t *tokens, size_t count) {
-  size_t total_len = 0;
-  for (size_t i = 0; i < count; i++) {
-    const char *part = token_display_text(&tokens[i]);
-    total_len += strlen(part) + (i > 0 ? 1 : 0);
-  }
-  if (total_len + 1 > buf_size)
+  st_token_t display[ST_MAX_CMD_TOKENS];
+  if (count == 0 || count > ST_MAX_CMD_TOKENS)
     return false;
-
-  char *p = buf;
   for (size_t i = 0; i < count; i++) {
-    if (i > 0)
-      *p++ = ' ';
-    const char *part = token_display_text(&tokens[i]);
-    size_t len = strlen(part);
-    memcpy(p, part, len);
-    p += len;
+    display[i] = tokens[i];
+    display[i].text = (char *)token_display_text(&tokens[i]);
   }
-  *p = '\0';
+  char *encoded = NULL;
+  if (st_netpattern_encode(display, count, &encoded) != ST_OK)
+    return false;
+  size_t length = strlen(encoded);
+  if (length + 1 > buf_size) {
+    free(encoded);
+    return false;
+  }
+  memcpy(buf, encoded, length + 1);
+  free(encoded);
   return true;
 }
 
@@ -2215,7 +2035,7 @@ static bool pattern_entry_preferred(const pattern_entry_t *candidate,
                        current->tokens, current->token_count);
   if (current_covers_candidate != candidate_covers_current)
     return current_covers_candidate;
-  return strcmp(candidate->pattern, current->pattern) < 0;
+  return st_netpattern_compare(candidate->pattern, current->pattern) < 0;
 }
 
 typedef struct {
@@ -2380,7 +2200,7 @@ static const char *st_find_based_on(const st_policy_t *policy,
   return best ? best->pattern : NULL;
 }
 
-st_error_t st_policy_eval(st_policy_t *policy, const char *raw_cmd,
+st_error_t st_policy_eval(st_policy_t *policy, const char *netargv,
                           st_eval_result_t *result) {
   if (result) {
     result->matches = false;
@@ -2388,7 +2208,7 @@ st_error_t st_policy_eval(st_policy_t *policy, const char *raw_cmd,
     result->suggestion_count = 0;
     result->error = ST_OK;
   }
-  if (!policy || !raw_cmd)
+  if (!policy || !netargv)
     return ST_ERR_INVALID;
 
   pthread_rwlock_rdlock(&policy->rwlock);
@@ -2406,7 +2226,7 @@ st_error_t st_policy_eval(st_policy_t *policy, const char *raw_cmd,
   st_token_array_t cmd;
   cmd.tokens = NULL;
   cmd.count = 0;
-  st_error_t err = st_classify(raw_cmd, &cmd);
+  st_error_t err = st_classify(netargv, &cmd);
   if (err != ST_OK) {
     pthread_rwlock_unlock(&policy->rwlock);
     return err;
@@ -2651,20 +2471,20 @@ typedef struct {
   uint8_t token_idx;
 } bfs_entry_t;
 
-st_error_t st_policy_verify_all(const st_policy_t *policy, const char *raw_cmd,
+st_error_t st_policy_verify_all(const st_policy_t *policy, const char *netargv,
                                 const char ***matching_patterns,
                                 size_t *match_count) {
   if (matching_patterns)
     *matching_patterns = NULL;
   if (match_count)
     *match_count = 0;
-  if (!policy || !raw_cmd || !matching_patterns || !match_count)
+  if (!policy || !netargv || !matching_patterns || !match_count)
     return ST_ERR_INVALID;
 
   st_token_array_t cmd;
   cmd.tokens = NULL;
   cmd.count = 0;
-  st_error_t err = st_classify(raw_cmd, &cmd);
+  st_error_t err = st_classify(netargv, &cmd);
   if (err != ST_OK)
     return err;
 
@@ -3074,7 +2894,12 @@ static bool nfa_write(nfa_ctx_t *c, FILE *fp) {
     if (fprintf(fp, "  EosTarget: %s\n", si->is_accepting ? "yes" : "no") < 0)
       return false;
     if (si->tag) {
-      if (fprintf(fp, "  Tags: %s\n", si->tag) < 0)
+      char *cpl_tag = NULL;
+      if (st_netpattern_to_cpl(si->tag, &cpl_tag) != ST_OK)
+        return false;
+      int written = fprintf(fp, "  Tags: %s\n", cpl_tag);
+      free(cpl_tag);
+      if (written < 0)
         return false;
     }
     if (fprintf(fp, "  Transitions: %u\n", si->trans_count) < 0)
@@ -3167,20 +2992,20 @@ st_error_t st_policy_render_nfa(const st_policy_t *policy, const char *path,
 
 /* --- SERIALIZATION ---
  *
- * Format:
- *   # CPL v1
+ * Version 2 stores canonical netpatterns in an additional netstring frame:
+ *
+ *   # shelltype-policy v2
  *   # patterns: <count>
- *   <pattern line 1>
- *   <pattern line 2>
+ *   <byte-length>:<canonical-netpattern>,\n
  *   ...
  *   # CRC32: <hex>
  *
- * Version 1: one pattern per line. Patterns beginning with '#' use the
- * "# pattern: " escape so they cannot be mistaken for format comments.
- * Vacuum filter state is NOT persisted — rebuilt on load.
+ * The CRC covers every complete framed record including its trailing newline.
+ * The length frame makes embedded whitespace and newlines unambiguous. Version
+ * 1 line-oriented CPL files remain loadable and are canonicalized on import.
  */
 
-#define ST_SERIALIZATION_VERSION 1
+#define ST_SERIALIZATION_VERSION 2
 
 typedef struct {
   FILE *fp;
@@ -3203,13 +3028,16 @@ static void dfs_save(st_policy_t *policy, uint32_t idx,
       node->pattern_id < policy->patterns.count) {
     const char *pat = policy->patterns.entries[node->pattern_id].pattern;
     size_t len = strlen(pat);
-    const char *line_prefix = pat[0] == '#' ? "# pattern: " : "";
-    if (fprintf(ctx->fp, "%s%s\n", line_prefix, pat) < 0) {
+    char prefix[32];
+    int prefix_len = snprintf(prefix, sizeof(prefix), "%zu:", len);
+    if (prefix_len < 0 || (size_t)prefix_len >= sizeof(prefix) ||
+        fprintf(ctx->fp, "%s%s,\n", prefix, pat) < 0) {
       ctx->error = ST_ERR_IO;
       return;
     }
-    ctx->crc = crc32_compute(pat, len, ctx->crc);
-    ctx->crc = crc32_compute("\n", 1, ctx->crc);
+    ctx->crc = st_crc32_update(prefix, (size_t)prefix_len, ctx->crc);
+    ctx->crc = st_crc32_update(pat, len, ctx->crc);
+    ctx->crc = st_crc32_update(",\n", 2, ctx->crc);
     ctx->pattern_count++;
   }
 
@@ -3235,7 +3063,7 @@ st_error_t st_policy_save(const st_policy_t *policy, const char *path) {
   pthread_rwlock_rdlock((pthread_rwlock_t *)&policy->rwlock);
   size_t snapshot_count = policy->pattern_count;
 
-  if (fprintf(fp, "# CPL v%d\n", ST_SERIALIZATION_VERSION) < 0) {
+  if (fprintf(fp, "# shelltype-policy v%d\n", ST_SERIALIZATION_VERSION) < 0) {
     pthread_rwlock_unlock((pthread_rwlock_t *)&policy->rwlock);
     st_atomic_output_discard(&output);
     return ST_ERR_IO;
@@ -3286,14 +3114,13 @@ st_error_t st_policy_load(st_policy_t *policy, const char *path,
   /* --- PASS 1: Read file, verify CRC, collect pattern lines ---
    * Do NOT modify the policy yet.
    */
-  FILE *fp = fopen(path, "r");
+  FILE *fp = fopen(path, "rb");
   if (!fp)
     return ST_ERR_IO;
 
   /* Dynamic array of pattern lines */
   char **pattern_lines = NULL;
   size_t pattern_count = 0;
-  size_t pattern_cap = 0;
 
   char line[4096];
   uint32_t expected_crc = 0;
@@ -3302,102 +3129,135 @@ st_error_t st_policy_load(st_policy_t *policy, const char *path,
   bool got_pattern_count = false;
   bool got_header = false;
   bool got_crc = false;
-  bool in_patterns = false;
   st_error_t pass1_error = ST_ERR_FORMAT;
 
   st_line_status_t line_status;
-  while ((line_status = st_read_line(fp, line, sizeof(line))) == ST_LINE_OK) {
-    size_t len = strlen(line);
-    while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
-      line[--len] = '\0';
+  line_status = st_read_line(fp, line, sizeof(line));
+  if (line_status != ST_LINE_OK) {
+    if (line_status == ST_LINE_IO)
+      pass1_error = ST_ERR_IO;
+    goto pass1_fail;
+  }
+  size_t header_len = strlen(line);
+  while (header_len > 0 &&
+         (line[header_len - 1] == '\n' || line[header_len - 1] == '\r'))
+    line[--header_len] = '\0';
+
+  if (strcmp(line, "# shelltype-policy v2") == 0) {
+    got_header = true;
+    line_status = st_read_line(fp, line, sizeof(line));
+    if (line_status != ST_LINE_OK) {
+      if (line_status == ST_LINE_IO)
+        pass1_error = ST_ERR_IO;
+      goto pass1_fail;
     }
-    if (len == 0)
-      continue;
+    size_t count_len = strlen(line);
+    while (count_len > 0 &&
+           (line[count_len - 1] == '\n' || line[count_len - 1] == '\r'))
+      line[--count_len] = '\0';
+    if (strncmp(line, "# patterns:", 11) != 0)
+      goto pass1_fail;
+    char *count_end = NULL;
+    unsigned long long count_value = strtoull(line + 11, &count_end, 10);
+    if (count_end == line + 11 || *count_end != '\0' ||
+        count_value > ST_MAX_POLICY_PATTERNS)
+      goto pass1_fail;
+    declared_count = (size_t)count_value;
+    got_pattern_count = true;
 
-    if (!got_header) {
-      if (strncmp(line, "# CPL v", 7) != 0) {
-        goto pass1_fail;
-      }
-      int version = atoi(line + 7);
-      if (version != ST_SERIALIZATION_VERSION) {
-        goto pass1_fail;
-      }
-      got_header = true;
-      continue;
-    }
-
-    if (!in_patterns) {
-      if (strncmp(line, "# patterns:", 11) == 0) {
-        char *end = NULL;
-        unsigned long long value = strtoull(line + 11, &end, 10);
-        if (end == line + 11 || *end != '\0' || value > SIZE_MAX)
-          goto pass1_fail;
-        declared_count = (size_t)value;
-        got_pattern_count = true;
-        continue;
-      }
-      in_patterns = true;
-    }
-
-    if (strncmp(line, "# CRC32: ", 9) == 0) {
-      char *end;
-      expected_crc = (uint32_t)strtoul(line + 9, &end, 16);
-      if (end != line + 17) {
-        goto pass1_fail;
-      }
-      got_crc = true;
-      break;
-    }
-
-    const char *pattern_line = line;
-    if (strncmp(line, "# pattern: ", 11) == 0)
-      pattern_line = line + 11;
-    else if (line[0] == '#')
-      continue;
-
-    /* Pattern line — compute CRC and store */
-    size_t plen = strlen(pattern_line);
-    computed_crc = crc32_compute(pattern_line, plen, computed_crc);
-    computed_crc = crc32_compute("\n", 1, computed_crc);
-
-    if (pattern_count >= pattern_cap) {
-      size_t new_cap = pattern_cap ? pattern_cap * 2 : 64;
-      char **new_lines = realloc(pattern_lines, new_cap * sizeof(char *));
-      if (!new_lines) {
+    if (declared_count != 0) {
+      pattern_lines = calloc(declared_count, sizeof(*pattern_lines));
+      if (!pattern_lines) {
         pass1_error = ST_ERR_MEMORY;
         goto pass1_fail;
       }
-      pattern_lines = new_lines;
-      pattern_cap = new_cap;
     }
-    pattern_lines[pattern_count] = strdup(pattern_line);
-    if (!pattern_lines[pattern_count]) {
-      pass1_error = ST_ERR_MEMORY;
-      goto pass1_fail;
-    }
-    pattern_count++;
-  }
-
-  if (line_status != ST_LINE_EOF && line_status != ST_LINE_OK) {
-    pass1_error = line_status == ST_LINE_IO ? ST_ERR_IO : ST_ERR_FORMAT;
-    goto pass1_fail;
-  }
-
-  if (got_crc) {
-    while ((line_status = st_read_line(fp, line, sizeof(line))) == ST_LINE_OK) {
-      size_t trailing_len = strlen(line);
-      while (trailing_len > 0 &&
-             (line[trailing_len - 1] == '\n' || line[trailing_len - 1] == '\r'))
-        line[--trailing_len] = '\0';
-      if (trailing_len != 0 && line[0] != '#') {
+    for (size_t record_index = 0; record_index < declared_count;
+         record_index++) {
+      char prefix[32];
+      size_t prefix_len = 0, payload_len = 0;
+      int ch = fgetc(fp);
+      if (ch == EOF || !isdigit((unsigned char)ch)) {
+        if (ferror(fp))
+          pass1_error = ST_ERR_IO;
         goto pass1_fail;
       }
+      bool leading_zero = ch == '0';
+      do {
+        if (prefix_len + 1 >= sizeof(prefix))
+          goto pass1_fail;
+        prefix[prefix_len++] = (char)ch;
+        unsigned digit = (unsigned)(ch - '0');
+        if (payload_len > (SIZE_MAX - digit) / 10)
+          goto pass1_fail;
+        payload_len = payload_len * 10 + digit;
+        ch = fgetc(fp);
+      } while (ch != EOF && isdigit((unsigned char)ch));
+      if (ch != ':' || (leading_zero && prefix_len != 1) || payload_len == 0 ||
+          payload_len >= ST_MAX_NETPATTERN_LEN)
+        goto pass1_fail;
+      prefix[prefix_len++] = ':';
+      char *payload = malloc(payload_len + 1);
+      if (!payload) {
+        pass1_error = ST_ERR_MEMORY;
+        goto pass1_fail;
+      }
+      if (fread(payload, 1, payload_len, fp) != payload_len) {
+        free(payload);
+        pass1_error = ferror(fp) ? ST_ERR_IO : ST_ERR_FORMAT;
+        goto pass1_fail;
+      }
+      payload[payload_len] = '\0';
+      int comma = fgetc(fp), newline = fgetc(fp);
+      if (comma != ',' || newline != '\n') {
+        free(payload);
+        if (ferror(fp))
+          pass1_error = ST_ERR_IO;
+        goto pass1_fail;
+      }
+      st_token_array_t decoded_pattern = {0};
+      st_error_t decode_error = st_netpattern_decode(payload, &decoded_pattern);
+      st_free_token_array(&decoded_pattern);
+      if (decode_error != ST_OK) {
+        free(payload);
+        if (decode_error == ST_ERR_MEMORY)
+          pass1_error = ST_ERR_MEMORY;
+        goto pass1_fail;
+      }
+      computed_crc = st_crc32_update(prefix, prefix_len, computed_crc);
+      computed_crc = st_crc32_update(payload, payload_len, computed_crc);
+      computed_crc = st_crc32_update(",\n", 2, computed_crc);
+      pattern_lines[pattern_count++] = payload;
     }
-    if (line_status != ST_LINE_EOF) {
-      pass1_error = line_status == ST_LINE_IO ? ST_ERR_IO : ST_ERR_FORMAT;
+    line_status = st_read_line(fp, line, sizeof(line));
+    if (line_status != ST_LINE_OK) {
+      if (line_status == ST_LINE_IO)
+        pass1_error = ST_ERR_IO;
       goto pass1_fail;
     }
+    size_t footer_len = strlen(line);
+    while (footer_len > 0 &&
+           (line[footer_len - 1] == '\n' || line[footer_len - 1] == '\r'))
+      line[--footer_len] = '\0';
+    if (strncmp(line, "# CRC32: ", 9) != 0 || footer_len != 17)
+      goto pass1_fail;
+    char *crc_end = NULL;
+    unsigned long crc_value = strtoul(line + 9, &crc_end, 16);
+    if (crc_end != line + 17 || *crc_end != '\0' || crc_value > UINT32_MAX)
+      goto pass1_fail;
+    expected_crc = (uint32_t)crc_value;
+    got_crc = true;
+    int trailing = fgetc(fp);
+    if (trailing != EOF || ferror(fp)) {
+      if (ferror(fp))
+        pass1_error = ST_ERR_IO;
+      goto pass1_fail;
+    }
+    goto pass1_complete;
   }
+
+  goto pass1_fail;
+pass1_complete:
   if (fclose(fp) != 0) {
     fp = NULL;
     pass1_error = ST_ERR_IO;
@@ -3424,9 +3284,10 @@ st_error_t st_policy_load(st_policy_t *policy, const char *path,
   }
 
   const char **lines = (const char **)pattern_lines;
-  st_error_t add_err = pattern_count == 0
-                           ? ST_OK
-                           : st_policy_batch_add(staged, lines, pattern_count);
+  st_error_t add_err =
+      pattern_count == 0
+          ? ST_OK
+          : st_policy_batch_add_netpatterns(staged, lines, pattern_count);
   if (add_err != ST_OK) {
     st_policy_free(staged);
     goto pass2_error;
@@ -3735,22 +3596,25 @@ st_error_t st_policy_dump_dot(const st_policy_t *policy, const char *path) {
 
 /* --- DRY-RUN MODE --- */
 
-st_error_t st_policy_simulate_add(st_policy_t *policy, const char *pattern,
-                                  bool *would_match,
-                                  const char **conflicting_pattern) {
+st_error_t st_policy_simulate_add_netpattern(st_policy_t *policy,
+                                             const char *netpattern,
+                                             bool *would_match,
+                                             const char **conflicting_pattern) {
   if (would_match)
     *would_match = false;
   if (conflicting_pattern)
     *conflicting_pattern = NULL;
-  if (!policy || !pattern || !would_match)
+  if (!policy || !netpattern || !would_match)
     return ST_ERR_INVALID;
 
-  size_t token_count = 0;
-  st_error_t parse_error = ST_ERR_INVALID;
-  st_token_t *tokens = parse_pattern(pattern, &token_count, &parse_error);
-  if (!tokens)
-    return parse_error;
-  if (token_count == 0 || token_count > ST_MAX_CMD_TOKENS) {
+  st_token_array_t decoded = {0};
+  st_error_t decode_error = st_netpattern_decode(netpattern, &decoded);
+  if (decode_error != ST_OK)
+    return decode_error;
+  st_token_t *tokens = decoded.tokens;
+  size_t token_count = decoded.count;
+  if (token_count == 0 || token_count > ST_MAX_CMD_TOKENS ||
+      tokens[0].type == ST_TYPE_ANY) {
     free_pattern_tokens(tokens, token_count);
     return ST_ERR_INVALID;
   }
@@ -3805,11 +3669,6 @@ size_t st_policy_suggest_variants(const st_policy_t *policy,
     if (!tokens[i].text || tokens[i].type < ST_TYPE_LITERAL ||
         tokens[i].type >= ST_TYPE_COUNT)
       return 0;
-    if (tokens[i].text[0] == '\0' ||
-        strpbrk(tokens[i].text, " \t\r\n\v\f") != NULL ||
-        (tokens[i].type == ST_TYPE_LITERAL &&
-         st_type_from_pattern_token(tokens[i].text) != ST_TYPE_LITERAL))
-      return 0;
   }
 
   /* Variant 0: exact match as literal */
@@ -3823,7 +3682,7 @@ size_t st_policy_suggest_variants(const st_policy_t *policy,
     }
     if (!st_build_pattern(out[0].pattern, sizeof(out[0].pattern), lit_tokens,
                           token_count) ||
-        st_validate_pattern(out[0].pattern, NULL) != ST_OK) {
+        st_validate_netpattern(out[0].pattern, NULL) != ST_OK) {
       free(lit_tokens);
       memset(out, 0, 3 * sizeof(*out));
       return 0;
@@ -3858,7 +3717,7 @@ size_t st_policy_suggest_variants(const st_policy_t *policy,
       if (!st_build_pattern(out[n_variants].pattern,
                             sizeof(out[n_variants].pattern), pat_tokens,
                             token_count) ||
-          st_validate_pattern(out[n_variants].pattern, NULL) != ST_OK) {
+          st_validate_netpattern(out[n_variants].pattern, NULL) != ST_OK) {
         free(pat_tokens);
         memset(out, 0, 3 * sizeof(*out));
         return 0;

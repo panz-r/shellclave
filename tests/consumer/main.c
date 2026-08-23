@@ -2,6 +2,7 @@
 #include <shellgate.h>
 #include <shelltype.h>
 
+#include <stdlib.h>
 #include <string.h>
 
 int main(void) {
@@ -18,19 +19,24 @@ int main(void) {
     return 1;
 
   st_learner_t *learner = st_learner_new(1, 0.01);
-  if (!learner || st_feed(learner, "echo hello") != ST_OK) {
+  if (!learner || st_feed(learner, "4:echo,5:hello,") != ST_OK) {
     st_learner_free(learner);
     return 2;
   }
   size_t suggestion_count = 0;
   st_suggestion_t *suggestions = st_suggest(learner, &suggestion_count);
-  if (!suggestions || suggestion_count != 1 ||
-      strcmp(suggestions[0].pattern, "echo hello") != 0 ||
-      suggestions[0].count != 1 || suggestions[0].confidence != 1.0) {
+  char *suggestion_cpl = NULL;
+  if (suggestions && suggestion_count == 1)
+    (void)st_netpattern_to_cpl(suggestions[0].pattern, &suggestion_cpl);
+  if (!suggestions || suggestion_count != 1 || !suggestion_cpl ||
+      strcmp(suggestion_cpl, "echo hello") != 0 || suggestions[0].count != 1 ||
+      suggestions[0].confidence != 1.0) {
+    free(suggestion_cpl);
     st_free_suggestions(suggestions, suggestion_count);
     st_learner_free(learner);
     return 3;
   }
+  free(suggestion_cpl);
   st_free_suggestions(suggestions, suggestion_count);
   st_learner_free(learner);
 

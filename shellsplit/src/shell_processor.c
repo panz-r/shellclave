@@ -5,6 +5,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -72,6 +73,19 @@ static char *decode_shell_word(const char *text, size_t length,
   decoded[out] = '\0';
   *decoded_length = out;
   return decoded;
+}
+
+shell_process_status_t shell_decode_word(const char *text, size_t length,
+                                         char **decoded,
+                                         size_t *decoded_length) {
+  if (decoded)
+    *decoded = NULL;
+  if (decoded_length)
+    *decoded_length = 0;
+  if (!text || !decoded || !decoded_length)
+    return SHELL_PROCESS_EINPUT;
+  *decoded = decode_shell_word(text, length, decoded_length);
+  return *decoded ? SHELL_PROCESS_OK : SHELL_PROCESS_ENOMEM;
 }
 
 static bool processed_word_needs_quotes(const char *word, size_t length) {
@@ -440,6 +454,91 @@ const char *shell_get_clean_command(shell_command_info_t *info) {
   return info ? info->clean_command : NULL;
 }
 
+static size_t decimal_digits(size_t value) {
+  size_t digits = 1;
+  while (value >= 10) {
+    value /= 10;
+    digits++;
+  }
+  return digits;
+}
+
+shell_process_status_t
+shell_render_netargv(const shell_command_info_t *info,
+                     const shell_process_limits_t *limits, char **netargv) {
+  if (netargv)
+    *netargv = NULL;
+  if (!info || !netargv)
+    return SHELL_PROCESS_EINPUT;
+  size_t count = info->command_token_count;
+  char **words = count ? calloc(count, sizeof(*words)) : NULL;
+  size_t *lengths = count ? calloc(count, sizeof(*lengths)) : NULL;
+  if (count && (!words || !lengths)) {
+    free(words);
+    free(lengths);
+    return SHELL_PROCESS_ENOMEM;
+  }
+  size_t total = 0;
+  shell_process_status_t status = SHELL_PROCESS_OK;
+  size_t built = 0;
+  for (; built < count; built++) {
+    const shell_token_t *token = &info->command_tokens[built];
+    bool preserve = token->type == TOKEN_SUBSHELL ||
+                    token->type == TOKEN_PROCESS_SUB ||
+                    token->type == TOKEN_ARITHMETIC;
+    words[built] = preserve ? strndup(token->start, token->length)
+                            : decode_shell_word(token->start, token->length,
+                                                &lengths[built]);
+    if (!words[built]) {
+      status = SHELL_PROCESS_ENOMEM;
+      goto fail_render;
+    }
+    if (preserve)
+      lengths[built] = token->length;
+    size_t framing = decimal_digits(lengths[built]) + 2;
+    if (lengths[built] > SIZE_MAX - framing ||
+        total > SIZE_MAX - lengths[built] - framing) {
+      status = SHELL_PROCESS_EOVERFLOW;
+      built++;
+      goto fail_render;
+    }
+    total += lengths[built] + framing;
+  }
+  if (limits &&
+      (total > limits->max_string_bytes || total > limits->max_total_bytes)) {
+    status = SHELL_PROCESS_EOUTPUT_LIMIT;
+    goto fail_render;
+  }
+  char *encoded = malloc(total + 1);
+  if (!encoded) {
+    status = SHELL_PROCESS_ENOMEM;
+    goto fail_render;
+  }
+  char *position = encoded;
+  for (size_t i = 0; i < count; i++) {
+    int written =
+        snprintf(position, decimal_digits(lengths[i]) + 2, "%zu:", lengths[i]);
+    position += (size_t)written;
+    memcpy(position, words[i], lengths[i]);
+    position += lengths[i];
+    *position++ = ',';
+  }
+  *position = '\0';
+  for (size_t i = 0; i < count; i++)
+    free(words[i]);
+  free(words);
+  free(lengths);
+  *netargv = encoded;
+  return SHELL_PROCESS_OK;
+
+fail_render:
+  for (size_t i = 0; i < built; i++)
+    free(words[i]);
+  free(words);
+  free(lengths);
+  return status;
+}
+
 // Check for shell features that require explicit downstream handling.
 bool shell_has_dangerous_features(shell_command_info_t *info) {
   if (!info)
@@ -521,4 +620,63 @@ shell_extract_dfa_inputs(const char *command_line,
   free(infos);
 
   return SHELL_PROCESS_OK;
+}
+
+shell_process_status_t
+shell_extract_netargv_inputs(const char *command_line,
+                             const shell_process_limits_t *limits,
+                             const char ***netargv_inputs, size_t *input_count,
+                             bool *has_shell_features) {
+  if (!netargv_inputs || !input_count || !has_shell_features)
+    return SHELL_PROCESS_EINPUT;
+  *netargv_inputs = NULL;
+  *input_count = 0;
+  *has_shell_features = false;
+  if (!command_line)
+    return SHELL_PROCESS_EINPUT;
+  shell_command_info_t *infos = NULL;
+  size_t count = 0;
+  shell_process_status_t status =
+      shell_process_command(command_line, limits, &infos, &count);
+  if (status != SHELL_PROCESS_OK)
+    return status;
+  const char **inputs = count ? calloc(count, sizeof(*inputs)) : NULL;
+  if (count && !inputs) {
+    shell_free_command_infos(infos, count);
+    return SHELL_PROCESS_ENOMEM;
+  }
+  size_t aggregate = 0;
+  size_t built = 0;
+  for (; built < count; built++) {
+    if (shell_has_dangerous_features(&infos[built]))
+      *has_shell_features = true;
+    status =
+        shell_render_netargv(&infos[built], limits, (char **)&inputs[built]);
+    if (status != SHELL_PROCESS_OK)
+      goto fail_inputs;
+    size_t length = strlen(inputs[built]);
+    if (aggregate > SIZE_MAX - length) {
+      status = SHELL_PROCESS_EOVERFLOW;
+      built++;
+      goto fail_inputs;
+    }
+    aggregate += length;
+    if (limits && aggregate > limits->max_total_bytes) {
+      status = SHELL_PROCESS_EOUTPUT_LIMIT;
+      built++;
+      goto fail_inputs;
+    }
+  }
+  shell_free_command_infos(infos, count);
+  *netargv_inputs = inputs;
+  *input_count = count;
+  return SHELL_PROCESS_OK;
+
+fail_inputs:
+  for (size_t i = 0; i < built; i++)
+    free((void *)inputs[i]);
+  free(inputs);
+  shell_free_command_infos(infos, count);
+  *has_shell_features = false;
+  return status;
 }

@@ -1,7 +1,7 @@
 /*
  * shelltype-tool.c - Shelltype policy CLI tool.
  *
- * Reads allowed commands from a file (one per line), builds a trie,
+ * Reads length-framed canonical netargv records, builds a trie,
  * and outputs suggested policy rules.
  *
  * Usage:
@@ -15,11 +15,64 @@
 
 #include <getopt.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "shelltype.h"
+
+/* Read one outer netstring whose payload is a complete canonical netargv. */
+static int read_netargv_record(FILE *stream, char **out) {
+  *out = NULL;
+  int first = fgetc(stream);
+  if (first == EOF)
+    return ferror(stream) ? -1 : 0;
+  if (first < '0' || first > '9')
+    return -1;
+
+  size_t length = (size_t)(first - '0');
+  if (first == '0') {
+    if (fgetc(stream) != ':')
+      return -1;
+  } else {
+    int ch;
+    while ((ch = fgetc(stream)) != ':') {
+      if (ch < '0' || ch > '9' || length > (SIZE_MAX - (size_t)(ch - '0')) / 10)
+        return -1;
+      length = length * 10 + (size_t)(ch - '0');
+    }
+  }
+  if (length == SIZE_MAX)
+    return -1;
+  char *record = malloc(length + 1);
+  if (!record)
+    return -1;
+  if (fread(record, 1, length, stream) != length || fgetc(stream) != ',' ||
+      memchr(record, '\0', length) != NULL) {
+    free(record);
+    return -1;
+  }
+  record[length] = '\0';
+  *out = record;
+  return 1;
+}
+
+static void free_policy(st_policy_t *policy, st_policy_ctx_t *context) {
+  st_policy_free(policy);
+  st_policy_ctx_release(context);
+}
+
+static int print_match(const char *prefix, const char *netpattern) {
+  char *cpl = NULL;
+  if (!netpattern || st_netpattern_to_cpl(netpattern, &cpl) != ST_OK) {
+    free(cpl);
+    return -1;
+  }
+  int result = printf("%s%s)\n", prefix, cpl);
+  free(cpl);
+  return result < 0 ? -1 : 0;
+}
 
 static void print_usage(const char *prog) {
   fprintf(stderr, "Usage: %s [options]\n", prog);
@@ -30,7 +83,7 @@ static void print_usage(const char *prog) {
   fprintf(stderr, "\n");
   fprintf(stderr, "Learning mode:\n");
   fprintf(stderr,
-          "  --input <file>       Input file with one command per line\n");
+          "  --input <file>       Outer-netstring-framed netargv file\n");
   fprintf(stderr, "  --suggest            Generate and print suggestions\n");
   fprintf(stderr,
           "  --min-support <N>    Minimum occurrence count (default: %d)\n",
@@ -48,18 +101,14 @@ static void print_usage(const char *prog) {
   fprintf(stderr, "  --load <file>        Load learner state from file\n");
   fprintf(stderr, "\n");
   fprintf(stderr, "Policy mode:\n");
+  fprintf(stderr, "  --policy <file>      Load a canonical v2 policy file\n");
+  fprintf(stderr, "  --verify <netargv>   Verify canonical netstring argv "
+                  "against policy\n");
   fprintf(stderr,
-          "  --policy <file>      Load policy file (one pattern per line)\n");
-  fprintf(
-      stderr,
-      "  --verify <cmd>       Verify a single command against the policy\n");
-  fprintf(
-      stderr,
-      "  --verify-file <file> Verify commands from a file (one per line)\n");
+          "  --verify-file <file> Verify outer-netstring-framed netargv\n");
   fprintf(stderr, "\n");
   fprintf(stderr, "Other:\n");
-  fprintf(stderr, "  --normalize <cmd>    Show normalised form of a command\n");
-  fprintf(stderr, "  --classify <cmd> Show typed tokens (text + type)\n");
+  fprintf(stderr, "  --classify <netargv> Classify canonical netstring argv\n");
   fprintf(
       stderr,
       "  --validate <pat>     Validate pattern syntax, show parsed tokens\n");
@@ -72,7 +121,6 @@ int main(int argc, char *argv[]) {
   const char *output_file = NULL;
   const char *save_file = NULL;
   const char *load_file = NULL;
-  const char *normalize_cmd = NULL;
   const char *policy_file = NULL;
   const char *verify_cmd = NULL;
   const char *verify_file = NULL;
@@ -93,7 +141,6 @@ int main(int argc, char *argv[]) {
       {"output", required_argument, 0, 'o'},
       {"save", required_argument, 0, 'S'},
       {"load", required_argument, 0, 'L'},
-      {"normalize", required_argument, 0, 'n'},
       {"policy", required_argument, 0, 'P'},
       {"verify", required_argument, 0, 'v'},
       {"verify-file", required_argument, 0, 'V'},
@@ -130,9 +177,6 @@ int main(int argc, char *argv[]) {
     case 'L':
       load_file = optarg;
       break;
-    case 'n':
-      normalize_cmd = optarg;
-      break;
     case 'P':
       policy_file = optarg;
       break;
@@ -160,26 +204,6 @@ int main(int argc, char *argv[]) {
     }
   }
 
-  /* Normalize-only mode */
-  if (normalize_cmd) {
-    char **tokens = NULL;
-    size_t count = 0;
-    st_error_t err = st_normalize(normalize_cmd, &tokens, &count);
-    if (err != ST_OK) {
-      fprintf(stderr, "Error: normalisation failed (%d)\n", err);
-      return 1;
-    }
-    printf("Normalised: ");
-    for (size_t i = 0; i < count; i++) {
-      if (i > 0)
-        printf(" ");
-      printf("%s", tokens[i]);
-    }
-    printf("\n");
-    st_free_tokens(tokens, count);
-    return 0;
-  }
-
   /* Classify mode */
   if (classify_cmd) {
     st_token_array_t arr = {NULL, 0};
@@ -200,7 +224,11 @@ int main(int argc, char *argv[]) {
   /* Validate pattern mode */
   if (validate_pat) {
     st_pattern_info_t info;
-    st_error_t err = st_validate_pattern(validate_pat, &info);
+    char *netpattern = NULL;
+    st_error_t err = st_netpattern_from_cpl(validate_pat, &netpattern);
+    if (err == ST_OK)
+      err = st_validate_netpattern(netpattern, &info);
+    free(netpattern);
     if (err != ST_OK) {
       fprintf(stderr, "INVALID: %s\n", validate_pat);
       return 1;
@@ -216,8 +244,10 @@ int main(int argc, char *argv[]) {
 
   /* Stats mode */
   if (stats_file) {
-    st_policy_t *policy = st_policy_new(st_policy_ctx_new());
+    st_policy_ctx_t *context = st_policy_ctx_new();
+    st_policy_t *policy = context ? st_policy_new(context) : NULL;
     if (!policy) {
+      st_policy_ctx_release(context);
       fprintf(stderr, "Error: failed to create policy\n");
       return 1;
     }
@@ -225,7 +255,7 @@ int main(int argc, char *argv[]) {
     if (err != ST_OK) {
       fprintf(stderr, "Error: failed to load policy from '%s' (%d)\n",
               stats_file, err);
-      st_policy_free(policy);
+      free_policy(policy, context);
       return 1;
     }
     st_policy_stats_t stats;
@@ -242,14 +272,16 @@ int main(int argc, char *argv[]) {
            (unsigned long)stats.filter_rebuild_count);
     printf("  Rebuild time:    %lu us\n",
            (unsigned long)stats.filter_rebuild_us);
-    st_policy_free(policy);
+    free_policy(policy, context);
     return 0;
   }
 
   /* Policy verify mode */
   if (policy_file) {
-    st_policy_t *policy = st_policy_new(st_policy_ctx_new());
+    st_policy_ctx_t *context = st_policy_ctx_new();
+    st_policy_t *policy = context ? st_policy_new(context) : NULL;
     if (!policy) {
+      st_policy_ctx_release(context);
       fprintf(stderr, "Error: failed to create policy\n");
       return 1;
     }
@@ -258,7 +290,7 @@ int main(int argc, char *argv[]) {
     if (err != ST_OK) {
       fprintf(stderr, "Error: failed to load policy from '%s' (%d)\n",
               policy_file, err);
-      st_policy_free(policy);
+      free_policy(policy, context);
       return 1;
     }
 
@@ -267,63 +299,87 @@ int main(int argc, char *argv[]) {
 
     /* Single command verify */
     if (verify_cmd) {
-      st_eval_result_t r;
+      st_eval_result_t r = {0};
       err = st_policy_eval(policy, verify_cmd, &r);
+      if (err != ST_OK) {
+        fprintf(stderr, "Error: invalid netargv (%d)\n", err);
+        free_policy(policy, context);
+        return 1;
+      }
       if (r.matches) {
-        printf("ALLOW (matched: %s)\n",
-               r.matching_pattern ? r.matching_pattern : "(unknown)");
+        if (print_match("ALLOW (matched: ", r.matching_pattern) != 0) {
+          fprintf(stderr, "Error: failed to render matching netpattern\n");
+          free_policy(policy, context);
+          return 1;
+        }
       } else {
         printf("DENY\n");
       }
-      st_policy_free(policy);
+      free_policy(policy, context);
       return 0;
     }
 
     /* File verify */
     if (verify_file) {
-      FILE *fp = fopen(verify_file, "r");
+      FILE *fp = fopen(verify_file, "rb");
       if (!fp) {
         fprintf(stderr, "Error: cannot open '%s'\n", verify_file);
-        st_policy_free(policy);
+        free_policy(policy, context);
         return 1;
       }
 
-      char line[4096];
-      int line_count = 0;
+      int record_count = 0;
       int allow_count = 0;
       int deny_count = 0;
-      while (fgets(line, sizeof(line), fp)) {
-        size_t len = strlen(line);
-        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r'))
-          line[--len] = '\0';
-        if (len == 0)
-          continue;
-        if (line[0] == '#')
-          continue;
-
-        st_eval_result_t r;
-        err = st_policy_eval(policy, line, &r);
-        if (r.matches) {
-          printf("ALLOW: %-60s (matched: %s)\n", line,
-                 r.matching_pattern ? r.matching_pattern : "(unknown)");
+      char *record = NULL;
+      int read_status;
+      while ((read_status = read_netargv_record(fp, &record)) == 1) {
+        st_eval_result_t r = {0};
+        err = st_policy_eval(policy, record, &r);
+        if (err != ST_OK) {
+          fprintf(stderr, "Error: invalid netargv record %d (%d)\n",
+                  record_count + 1, err);
+          free(record);
+          fclose(fp);
+          free_policy(policy, context);
+          return 1;
+        } else if (r.matches) {
+          char prefix[64];
+          snprintf(prefix, sizeof(prefix),
+                   "ALLOW: record %-6d (matched: ", record_count + 1);
+          if (print_match(prefix, r.matching_pattern) != 0) {
+            fprintf(stderr, "Error: failed to render matching netpattern\n");
+            free(record);
+            fclose(fp);
+            free_policy(policy, context);
+            return 1;
+          }
           allow_count++;
         } else {
-          printf("DENY:  %s\n", line);
+          printf("DENY:  record %d\n", record_count + 1);
           deny_count++;
         }
-        line_count++;
+        free(record);
+        record = NULL;
+        record_count++;
       }
+      free(record);
       fclose(fp);
+      if (read_status < 0) {
+        fprintf(stderr, "Error: malformed framed input '%s'\n", verify_file);
+        free_policy(policy, context);
+        return 1;
+      }
 
-      fprintf(stderr, "\nSummary: %d commands, %d ALLOW, %d DENY\n", line_count,
-              allow_count, deny_count);
-      st_policy_free(policy);
+      fprintf(stderr, "\nSummary: %d commands, %d ALLOW, %d DENY\n",
+              record_count, allow_count, deny_count);
+      free_policy(policy, context);
       return 0;
     }
 
     fprintf(stderr,
             "Error: --verify or --verify-file required with --policy\n");
-    st_policy_free(policy);
+    free_policy(policy, context);
     return 1;
   }
 
@@ -355,39 +411,38 @@ int main(int argc, char *argv[]) {
 
   /* Feed commands from input file */
   if (input_file) {
-    FILE *fp = fopen(input_file, "r");
+    FILE *fp = fopen(input_file, "rb");
     if (!fp) {
       fprintf(stderr, "Error: cannot open '%s'\n", input_file);
       st_learner_free(learner);
       return 1;
     }
 
-    char line[4096];
-    int line_count = 0;
+    int record_count = 0;
     int error_count = 0;
-    while (fgets(line, sizeof(line), fp)) {
-      size_t len = strlen(line);
-      while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
-        line[--len] = '\0';
-      }
-      if (len == 0)
-        continue;
-      if (line[0] == '#')
-        continue;
-
-      st_error_t err = st_feed(learner, line);
+    char *record = NULL;
+    int read_status;
+    while ((read_status = read_netargv_record(fp, &record)) == 1) {
+      st_error_t err = st_feed(learner, record);
       if (err != ST_OK) {
         error_count++;
-        if (error_count <= 3) {
-          fprintf(stderr, "Warning: failed to feed line %d: %s\n",
-                  line_count + 1, line);
-        }
+        if (error_count <= 3)
+          fprintf(stderr, "Warning: failed to feed record %d (%d)\n",
+                  record_count + 1, err);
       }
-      line_count++;
+      free(record);
+      record = NULL;
+      record_count++;
     }
+    free(record);
     fclose(fp);
+    if (read_status < 0) {
+      fprintf(stderr, "Error: malformed framed input '%s'\n", input_file);
+      st_learner_free(learner);
+      return 1;
+    }
 
-    fprintf(stderr, "Fed %d commands (%d errors)\n", line_count, error_count);
+    fprintf(stderr, "Fed %d commands (%d errors)\n", record_count, error_count);
     fprintf(stderr, "Total commands in trie: %u\n",
             learner->trie.total_commands);
   }
@@ -415,9 +470,13 @@ int main(int argc, char *argv[]) {
               "Top %zu suggestions (min_support=%u, min_confidence=%.2f):\n",
               sug_count, min_support, min_confidence);
       for (size_t i = 0; i < sug_count; i++) {
+        char *cpl = NULL;
+        if (st_netpattern_to_cpl(suggestions[i].pattern, &cpl) != ST_OK)
+          cpl = strdup("<invalid netpattern>");
         fprintf(out, "%3zu. %-50s (count=%u, confidence=%.2f)\n", i + 1,
-                suggestions[i].pattern, suggestions[i].count,
+                cpl ? cpl : "<allocation failure>", suggestions[i].count,
                 suggestions[i].confidence);
+        free(cpl);
       }
     }
 

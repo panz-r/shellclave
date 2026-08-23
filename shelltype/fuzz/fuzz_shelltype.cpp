@@ -14,6 +14,22 @@ static void require(bool condition) {
     std::abort();
 }
 
+static std::string one_arg_netargv(const std::string &input) {
+  size_t length = input.find('\0');
+  if (length == std::string::npos)
+    length = input.size();
+  return std::to_string(length) + ":" + input.substr(0, length) + ",";
+}
+
+static std::string canonical_pattern(const std::string &cpl) {
+  char *encoded = nullptr;
+  if (st_netpattern_from_cpl(cpl.c_str(), &encoded) != ST_OK)
+    return {};
+  std::string result(encoded);
+  std::free(encoded);
+  return result;
+}
+
 static void check_eval_is_verified(st_policy_t *policy, const char *command) {
   st_eval_result_t result = {};
   if (st_policy_eval(policy, command, &result) != ST_OK)
@@ -78,14 +94,14 @@ static void check_suggestions_replay(const st_suggestion_t *suggestions,
                                      const std::vector<std::string> &history) {
   for (size_t suggestion = 0; suggestion < suggestion_count; suggestion++) {
     require(suggestions != nullptr && suggestions[suggestion].pattern);
-    require(st_validate_pattern(suggestions[suggestion].pattern, nullptr) ==
+    require(st_validate_netpattern(suggestions[suggestion].pattern, nullptr) ==
             ST_OK);
     require(suggestions[suggestion].confidence >= 0.0 &&
             suggestions[suggestion].confidence <= 1.0);
     st_policy_ctx_t *context = st_policy_ctx_new();
     st_policy_t *policy = context ? st_policy_new(context) : nullptr;
-    require(policy &&
-            st_policy_add(policy, suggestions[suggestion].pattern) == ST_OK);
+    require(policy && st_policy_add_netpattern(
+                          policy, suggestions[suggestion].pattern) == ST_OK);
     uint32_t matches = 0;
     for (const std::string &command : history) {
       st_eval_result_t result = {};
@@ -122,19 +138,21 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
   size_t offset = 0;
   while (offset < size) {
     size_t end = offset;
-    while (end < size && data[end] != '\n' && end - offset < ST_MAX_PATTERN_LEN)
+    while (end < size && data[end] != '\n' &&
+           end - offset < ST_MAX_NETPATTERN_LEN)
       end++;
     if (end > offset) {
       uint8_t operation = data[offset] % 16;
       std::string text(reinterpret_cast<const char *>(data + offset + 1),
                        end - offset - 1);
+      std::string netargv = one_arg_netargv(text);
       switch (operation) {
       case 0:
         (void)st_classify_token(text.c_str());
         break;
       case 1: {
         st_token_array_t tokens = {};
-        if (st_classify(text.c_str(), &tokens) == ST_OK) {
+        if (st_classify(netargv.c_str(), &tokens) == ST_OK) {
           for (size_t i = 0; i < tokens.count; i++) {
             require(tokens.tokens[i].text != nullptr);
             if (tokens.tokens[i].text[0] == '#')
@@ -144,7 +162,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
           bool concrete_source = true;
           for (size_t i = 0; i < tokens.count; i++) {
             st_pattern_info_t token_info = {};
-            if (st_validate_pattern(tokens.tokens[i].text, &token_info) ==
+            if (st_validate_netpattern(tokens.tokens[i].text, &token_info) ==
                     ST_OK &&
                 token_info.token_count == 1 &&
                 token_info.token_types[0] != ST_TYPE_LITERAL)
@@ -154,15 +172,17 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
               policy, tokens.tokens, tokens.count, variants);
           for (size_t i = 0; i < variant_count; i++) {
             st_pattern_info_t info = {};
-            require(st_validate_pattern(variants[i].pattern, &info) == ST_OK);
+            require(st_validate_netpattern(variants[i].pattern, &info) ==
+                    ST_OK);
             st_policy_ctx_t *variant_context = st_policy_ctx_new();
             st_policy_t *variant_policy =
                 variant_context ? st_policy_new(variant_context) : nullptr;
             if (variant_policy &&
-                st_policy_add(variant_policy, variants[i].pattern) == ST_OK) {
+                st_policy_add_netpattern(variant_policy, variants[i].pattern) ==
+                    ST_OK) {
               st_eval_result_t result = {};
-              require(st_policy_eval(variant_policy, text.c_str(), &result) ==
-                      ST_OK);
+              require(st_policy_eval(variant_policy, netargv.c_str(),
+                                     &result) == ST_OK);
               if (concrete_source && !result.matches)
                 std::fprintf(stderr,
                              "variant did not match source: pattern='%s' "
@@ -179,29 +199,34 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         break;
       }
       case 2: {
+        std::string pattern = canonical_pattern(text);
+        const char *input = pattern.empty() ? text.c_str() : pattern.c_str();
         st_pattern_info_t info = {};
-        (void)st_validate_pattern(text.c_str(), &info);
-        (void)st_policy_add(policy, text.c_str());
+        (void)st_validate_netpattern(input, &info);
+        (void)st_policy_add_netpattern(policy, input);
         break;
       }
-      case 3:
-        (void)st_policy_remove(policy, text.c_str());
+      case 3: {
+        std::string pattern = canonical_pattern(text);
+        (void)st_policy_remove_netpattern(
+            policy, pattern.empty() ? text.c_str() : pattern.c_str());
         break;
+      }
       case 4: {
-        check_eval_is_verified(policy, text.c_str());
+        check_eval_is_verified(policy, netargv.c_str());
         break;
       }
       case 5: {
         const char **matches = nullptr;
         size_t count = 0;
-        (void)st_policy_verify_all(policy, text.c_str(), &matches, &count);
+        (void)st_policy_verify_all(policy, netargv.c_str(), &matches, &count);
         st_policy_free_matches(matches, count);
         break;
       }
       case 6:
-        if (st_feed(learner, text.c_str()) == ST_OK) {
+        if (st_feed(learner, netargv.c_str()) == ST_OK) {
           if (learner_history.size() < 64)
-            learner_history.push_back(text);
+            learner_history.push_back(netargv);
           else
             learner_history_complete = false;
         }
@@ -210,13 +235,13 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         st_eval_result_t before = {};
         st_eval_result_t after = {};
         size_t before_count = st_policy_count(policy);
-        (void)st_policy_eval(policy, text.c_str(), &before);
+        (void)st_policy_eval(policy, netargv.c_str(), &before);
         std::string before_pattern = before.matches && before.matching_pattern
                                          ? before.matching_pattern
                                          : "";
         if (st_policy_compact(policy) == ST_OK) {
           require(st_policy_count(policy) == before_count);
-          require(st_policy_eval(policy, text.c_str(), &after) == ST_OK);
+          require(st_policy_eval(policy, netargv.c_str(), &after) == ST_OK);
           require(before.matches == after.matches);
           if (before.matches)
             require(after.matching_pattern &&
@@ -224,20 +249,26 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         }
         break;
       }
-      case 8:
-        (void)st_policy_add(policy_b, text.c_str());
+      case 8: {
+        std::string pattern = canonical_pattern(text);
+        (void)st_policy_add_netpattern(
+            policy_b, pattern.empty() ? text.c_str() : pattern.c_str());
         break;
-      case 9:
-        (void)st_policy_remove(policy_b, text.c_str());
+      }
+      case 9: {
+        std::string pattern = canonical_pattern(text);
+        (void)st_policy_remove_netpattern(
+            policy_b, pattern.empty() ? text.c_str() : pattern.c_str());
         break;
+      }
       case 10:
-        check_eval_is_verified(policy_b, text.c_str());
+        check_eval_is_verified(policy_b, netargv.c_str());
         break;
       case 11: {
         st_policy_t *destination = (text.size() & 1u) ? policy : policy_b;
         st_policy_t *source = destination == policy ? policy_b : policy;
         (void)st_policy_merge(destination, source);
-        check_eval_is_verified(destination, text.c_str());
+        check_eval_is_verified(destination, netargv.c_str());
         break;
       }
       case 12: {
@@ -255,9 +286,12 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         break;
       }
       case 13: {
-        const char *batch[] = {text.c_str(), "fuzz batch"};
+        std::string first = canonical_pattern(text);
+        std::string second = canonical_pattern("fuzz batch");
+        const char *batch[] = {first.empty() ? text.c_str() : first.c_str(),
+                               second.c_str()};
         size_t before = st_policy_count(policy);
-        st_error_t error = st_policy_batch_add(policy, batch, 2);
+        st_error_t error = st_policy_batch_add_netpatterns(policy, batch, 2);
         if (error != ST_OK)
           require(st_policy_count(policy) == before);
         else
@@ -268,8 +302,10 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         size_t before = st_policy_count(policy);
         bool redundant = false;
         const char *conflict = nullptr;
-        (void)st_policy_simulate_add(policy, text.c_str(), &redundant,
-                                     &conflict);
+        std::string pattern = canonical_pattern(text);
+        (void)st_policy_simulate_add_netpattern(
+            policy, pattern.empty() ? text.c_str() : pattern.c_str(),
+            &redundant, &conflict);
         require(st_policy_count(policy) == before);
         if (!text.empty() && (static_cast<unsigned char>(text[0]) & 1u) != 0) {
           require(st_policy_clear(policy_b) == ST_OK);
@@ -279,20 +315,21 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
       }
       case 15: {
         st_token_array_t tokens = {};
-        if (st_classify(text.c_str(), &tokens) == ST_OK && tokens.count != 0) {
-          std::vector<const char *> pattern_tokens;
-          for (size_t i = 0; i < tokens.count; i++)
-            pattern_tokens.push_back(tokens.tokens[i].text);
+        if (st_classify(netargv.c_str(), &tokens) == ST_OK &&
+            tokens.count != 0) {
           st_token_variant_t variants[ST_MAX_TOKEN_VARIANTS] = {};
-          size_t count = st_policy_suggest_token_variants(
-              learner, pattern_tokens.data(), pattern_tokens.size(),
-              pattern_tokens.size() - 1, variants);
+          size_t count = st_learner_suggest_token_variants(
+              learner, &tokens, tokens.count - 1, variants);
+          char *pattern = nullptr;
+          require(st_netpattern_encode(tokens.tokens, tokens.count, &pattern) ==
+                  ST_OK);
           for (size_t i = 0; i < count; i++) {
-            char *edited = st_policy_apply_type_at(
-                learner, pattern_tokens.data(), pattern_tokens.size(),
-                pattern_tokens.size() - 1, variants[i].type);
+            char *edited = nullptr;
+            require(st_netpattern_apply_type_at(pattern, tokens.count - 1,
+                                                variants[i].type,
+                                                &edited) == ST_OK);
             require(edited != nullptr);
-            st_error_t validation = st_validate_pattern(edited, nullptr);
+            st_error_t validation = st_validate_netpattern(edited, nullptr);
             if (validation != ST_OK)
               std::fprintf(
                   stderr,
@@ -303,6 +340,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
             require(validation == ST_OK);
             std::free(edited);
           }
+          std::free(pattern);
         }
         st_free_token_array(&tokens);
         break;
@@ -422,7 +460,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
             require(before[i].count == after[i].count);
             require(before[i].confidence == after[i].confidence);
             st_pattern_info_t info = {};
-            require(st_validate_pattern(after[i].pattern, &info) == ST_OK);
+            require(st_validate_netpattern(after[i].pattern, &info) == ST_OK);
           }
           st_free_suggestions(after, after_count);
         }
@@ -437,13 +475,17 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         roundtrip_context ? st_policy_new(roundtrip_context) : nullptr;
     if (roundtrip) {
       st_eval_result_t result = {};
-      require(st_policy_eval(roundtrip, "fuzz probe", &result) == ST_OK);
+      std::string probe_pattern = canonical_pattern("fuzz probe");
+      require(!probe_pattern.empty());
+      require(st_policy_eval(roundtrip, "4:fuzz,5:probe,", &result) == ST_OK);
       require(!result.matches);
-      require(st_policy_add(roundtrip, "fuzz probe") == ST_OK);
-      require(st_policy_eval(roundtrip, "fuzz probe", &result) == ST_OK);
+      require(st_policy_add_netpattern(roundtrip, probe_pattern.c_str()) ==
+              ST_OK);
+      require(st_policy_eval(roundtrip, "4:fuzz,5:probe,", &result) == ST_OK);
       require(result.matches);
-      require(st_policy_remove(roundtrip, "fuzz probe") == ST_OK);
-      require(st_policy_eval(roundtrip, "fuzz probe", &result) == ST_OK);
+      require(st_policy_remove_netpattern(roundtrip, probe_pattern.c_str()) ==
+              ST_OK);
+      require(st_policy_eval(roundtrip, "4:fuzz,5:probe,", &result) == ST_OK);
       require(!result.matches);
     }
     st_policy_free(roundtrip);

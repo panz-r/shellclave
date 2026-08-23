@@ -7,6 +7,7 @@
 
 #include "shelltype.h"
 #include "test_allocator.h"
+#include "test_netargv.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -14,6 +15,12 @@
 static int tests_run = 0;
 static int tests_passed = 0;
 static int tests_failed = 0;
+
+static void st_free_tokens(char **tokens, size_t count) {
+  for (size_t i = 0; i < count; i++)
+    free(tokens[i]);
+  free(tokens);
+}
 
 #define TEST(name)                                                             \
   do {                                                                         \
@@ -329,7 +336,7 @@ static int test_classification_matrix(void) {
 static int generated_token_is(const char *token, st_token_type_t expected) {
   st_token_array_t normalized = {0};
   if (st_classify_token(token) != expected ||
-      st_classify(token, &normalized) != ST_OK || normalized.count != 1 ||
+      test_st_classify(token, &normalized) != ST_OK || normalized.count != 1 ||
       normalized.tokens[0].type != expected ||
       strcmp(normalized.tokens[0].text, token) != 0) {
     st_free_token_array(&normalized);
@@ -435,12 +442,8 @@ static int test_type_lattice(void) {
       {ST_TYPE_FINGERPRINT, ST_TYPE_VALUE, ST_TYPE_VALUE, true, false},
   };
 
-  ASSERT(st_type_from_pattern_token(NULL) == ST_TYPE_LITERAL);
-  ASSERT(st_type_from_pattern_token("literal") == ST_TYPE_LITERAL);
-  for (int t = 0; t < ST_TYPE_COUNT; t++) {
+  for (int t = 0; t < ST_TYPE_COUNT; t++)
     ASSERT(st_type_symbol[t] != NULL);
-    ASSERT(st_type_from_pattern_token(st_type_symbol[t]) == (st_token_type_t)t);
-  }
 
   /* Pin the intended hierarchy as well as checking its algebra below. */
   for (size_t i = 0; i < sizeof(semantic_cases) / sizeof(semantic_cases[0]);
@@ -484,6 +487,133 @@ static int test_type_lattice(void) {
   return 1;
 }
 
+static int test_classifier_adversarial_branch_matrix(void) {
+  static const char *const tokens[] = {
+      "0000-01-01",
+      "2023-02-29",
+      "2024-02-30",
+      "2024-13-01",
+      "2024-00-01",
+      "2024-01-00",
+      "2024-01-32",
+      "2000-02-29",
+      "1900-02-29",
+      "2100-02-29",
+      "2024-01-01T24:00:00",
+      "2024-01-01T23:60:00",
+      "2024-01-01T23:59:60",
+      "2024-01-01t23:59:59z",
+      "2024-01-01 23:59:59+2359",
+      "2024-01-01T23:59:59-24:00",
+      "2024-01-01T23:59:59+12:60",
+      "2024-01-01T23:59:59UTC",
+      "24:00:00",
+      "23:60:00",
+      "23:59:60",
+      "ab:59:59",
+      "${A",
+      "${A}",
+      "${_A1}",
+      "${A-B}",
+      "$1A",
+      "$A-B",
+      "",
+      "-branch",
+      "/branch",
+      ".branch",
+      "feature/",
+      "feature//x",
+      "feature/x_",
+      "feature/x.y",
+      "feature/x!y",
+      "singlebranch",
+      "User:tag",
+      "A1:tag",
+      "name::tag",
+      "name@md5:value",
+      "name@sha256:bad",
+      ("name@sha256:"
+       "gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg"),
+      "name without tag",
+      "-image:tag",
+      ".image:tag",
+      "@",
+      "@scope",
+      "@scope/",
+      "@scope/na!me",
+      "@scope/name@",
+      "@scope/name@1!",
+      "name@",
+      "name@alpha",
+      "name@1!",
+      "bad!name@1",
+      "name@^1",
+      "name@~1",
+      "name@<1",
+      "name@>1",
+      "name@=1",
+      "@scope/name@^1",
+      "@scope/name@~1",
+      "@scope/name@<1",
+      "@scope/name@>1",
+      "@scope/name@=1",
+      "abcdefghijklmnopqrstuvwxyzabcdefg",
+      "Baduser",
+      "user!name",
+      "SHA256:short",
+      "SHA256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa!",
+      "zz:2b:3c:4d:5e:6f:7a:8b:9c:0d:1e:2f:3a:4b:5c:6d",
+      "1a:zz:3c:4d:5e:6f:7a:8b:9c:0d:1e:2f:3a:4b:5c:6d",
+      "1a-2b:3c:4d:5e:6f:7a:8b:9c:0d:1e:2f:3a:4b:5c:6d",
+      "-*.txt",
+      "/*.txt",
+      "[abc",
+      "a*|b",
+      "a?b",
+      "a[b]c",
+      ":group",
+      "user:",
+      "user:group:extra",
+      "user.name:group",
+      "user/group:group",
+      "User-name:group",
+      "unknown:group",
+      "root:GROUP",
+      "root:gr!oup",
+      "128",
+      "399",
+      "0123",
+      "1234",
+      "2014",
+      "8888",
+      "7777",
+  };
+  for (size_t i = 0; i < sizeof(tokens) / sizeof(tokens[0]); i++) {
+    st_token_type_t type = st_classify_token(tokens[i]);
+    ASSERT((unsigned)type < ST_TYPE_COUNT);
+  }
+  return 1;
+}
+
+static int test_contextual_adversarial_branch_matrix(void) {
+  static const char *const commands[] = {
+      "kill 0",       "kill 1",        "kill 31",        "kill 32",
+      "kill -1",      "-s 9",          "-s 0",           "grep plain",
+      "grep a+",      "sed s/a/b/",    "awk [a]",        "perl a?",
+      "egrep a|b",    "fgrep a*",      "rg a$",          "ag a^",
+      "cmd -e a+",    "cmd -E a+",     "cmd -P a+",      "cmd -pe a+",
+      "cmd -ne a+",   "cmd -pie a+",   "cmd -nle a+",    "cmd -F a+",
+      "A=1 command",  "A-B=1 command", "=value command", "--flag value",
+      "--flag=value", "--flag=",       "--=value",
+  };
+  for (size_t i = 0; i < sizeof(commands) / sizeof(commands[0]); i++) {
+    st_token_array_t typed = {0};
+    ASSERT(test_st_classify(commands[i], &typed) == ST_OK);
+    st_free_token_array(&typed);
+  }
+  return 1;
+}
+
 static int test_normalization_matrix(void) {
   static const struct {
     const char *command;
@@ -511,16 +641,11 @@ static int test_normalization_matrix(void) {
         ST_TYPE_LITERAL},
        5},
       {"one&&two || three; four & five",
-       "one\t&&\ttwo\t||\tthree\t;\tfour\t&\tfive",
+       "one&&two\t||\tthree;\tfour\t&\tfive",
        {ST_TYPE_LITERAL, ST_TYPE_LITERAL, ST_TYPE_LITERAL, ST_TYPE_LITERAL,
-        ST_TYPE_LITERAL, ST_TYPE_LITERAL, ST_TYPE_LITERAL, ST_TYPE_LITERAL,
-        ST_TYPE_LITERAL},
-       9},
-      {";;;;;;;;",
-       ";\t;\t;\t;\t;\t;\t;\t;",
-       {ST_TYPE_LITERAL, ST_TYPE_LITERAL, ST_TYPE_LITERAL, ST_TYPE_LITERAL,
-        ST_TYPE_LITERAL, ST_TYPE_LITERAL, ST_TYPE_LITERAL, ST_TYPE_LITERAL},
-       8},
+        ST_TYPE_LITERAL, ST_TYPE_LITERAL},
+       6},
+      {";;;;;;;;", ";;;;;;;;", {ST_TYPE_LITERAL}, 1},
       {"ls > /tmp/out.txt",
        "ls\t>\t/tmp/out.txt",
        {ST_TYPE_LITERAL, ST_TYPE_LITERAL, ST_TYPE_ABS_PATH},
@@ -582,33 +707,23 @@ static int test_normalization_matrix(void) {
        "chmod\t0644\tfile",
        {ST_TYPE_LITERAL, ST_TYPE_PERM_OCTAL, ST_TYPE_LITERAL},
        3},
-      {"echo a\\ b",
-       "echo\ta\\\tb",
-       {ST_TYPE_LITERAL, ST_TYPE_LITERAL, ST_TYPE_LITERAL},
-       3},
+      {"echo a\\ b", "echo\ta b", {ST_TYPE_LITERAL, ST_TYPE_QUOTED_SPACE}, 2},
       {"printf '' \"\" x",
        "printf\t\t\tx",
        {ST_TYPE_LITERAL, ST_TYPE_LITERAL, ST_TYPE_LITERAL, ST_TYPE_LITERAL},
        4},
-      {"a||b&&c>>out<in;d&e",
-       "a\t||\tb\t&&\tc\t>>\tout\t<\tin\t;\td\t&\te",
+      {"a||b&&c>>out<in;d&e", "a||b&&c>>out<in;d&e", {ST_TYPE_LITERAL}, 1},
+      {"cmd 2>err 2>>log &>all &>>append >&fd",
+       "cmd\t2>err\t2>>log\t&>all\t&>>append\t>&fd",
        {ST_TYPE_LITERAL, ST_TYPE_LITERAL, ST_TYPE_LITERAL, ST_TYPE_LITERAL,
-        ST_TYPE_LITERAL, ST_TYPE_LITERAL, ST_TYPE_LITERAL, ST_TYPE_LITERAL,
+        ST_TYPE_LITERAL, ST_TYPE_LITERAL},
+       6},
+      {"cmd 2>&1 3>&- 4<&- <&0 >&10 >>&9 12>>log 1>out",
+       "cmd\t2>&1\t3>&-\t4<&-\t<&0\t>&10\t>>&9\t12>>log\t1>out",
+       {ST_TYPE_LITERAL, ST_TYPE_LITERAL, ST_TYPE_LITERAL, ST_TYPE_LITERAL,
         ST_TYPE_LITERAL, ST_TYPE_LITERAL, ST_TYPE_LITERAL, ST_TYPE_LITERAL,
         ST_TYPE_LITERAL},
-       13},
-      {"cmd 2>err 2>>log &>all &>>append >&fd",
-       "cmd\t2>\terr\t2>>\tlog\t&>\tall\t&>>\tappend\t>&\tfd",
-       {ST_TYPE_LITERAL, ST_TYPE_LITERAL, ST_TYPE_LITERAL, ST_TYPE_LITERAL,
-        ST_TYPE_LITERAL, ST_TYPE_LITERAL, ST_TYPE_LITERAL, ST_TYPE_LITERAL,
-        ST_TYPE_LITERAL, ST_TYPE_LITERAL, ST_TYPE_LITERAL},
-       11},
-      {"cmd 2>&1 3>&- 4<&- <&0 >&10 >>&9 12>>log 1>out",
-       "cmd\t2>&1\t3>&-\t4<&-\t<&0\t>&10\t>>&9\t12>>\tlog\t1>\tout",
-       {ST_TYPE_LITERAL, ST_TYPE_LITERAL, ST_TYPE_LITERAL, ST_TYPE_LITERAL,
-        ST_TYPE_LITERAL, ST_TYPE_LITERAL, ST_TYPE_LITERAL, ST_TYPE_LITERAL,
-        ST_TYPE_LITERAL, ST_TYPE_LITERAL, ST_TYPE_LITERAL},
-       11},
+       9},
       {"echo 'unterminated",
        "echo\tunterminated",
        {ST_TYPE_LITERAL, ST_TYPE_LITERAL},
@@ -617,8 +732,13 @@ static int test_normalization_matrix(void) {
 
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
     st_token_array_t typed = {0};
-    ASSERT(st_classify(cases[i].command, &typed) == ST_OK);
-    ASSERT(typed.count == cases[i].count);
+    ASSERT(test_st_classify(cases[i].command, &typed) == ST_OK);
+    if (typed.count != cases[i].count) {
+      printf("  normalization case '%s': got %zu tokens, expected %zu\n",
+             cases[i].command, typed.count, cases[i].count);
+      st_free_token_array(&typed);
+      return 0;
+    }
     const char *expected_text = cases[i].text;
     for (size_t j = 0; j < typed.count; j++) {
       size_t expected_length = strcspn(expected_text, "\t");
@@ -634,7 +754,8 @@ static int test_normalization_matrix(void) {
 
     char **legacy = NULL;
     size_t legacy_count = 99;
-    ASSERT(st_normalize(cases[i].command, &legacy, &legacy_count) == ST_OK);
+    ASSERT(test_st_normalize(cases[i].command, &legacy, &legacy_count) ==
+           ST_OK);
     ASSERT(legacy_count == cases[i].count);
     ASSERT(cases[i].count != 0 || legacy == NULL);
     for (size_t j = 0; j < legacy_count; j++) {
@@ -653,32 +774,28 @@ static int test_normalization_boundaries(void) {
   st_token_array_t typed = {(st_token_t *)1, 99};
   char **legacy = (char **)1;
   size_t count = 99;
-  ASSERT(st_classify(NULL, &typed) == ST_ERR_INVALID);
+  ASSERT(test_st_classify(NULL, &typed) == ST_ERR_INVALID);
   ASSERT(typed.tokens == NULL && typed.count == 0);
-  ASSERT(st_classify("echo ok", NULL) == ST_ERR_INVALID);
-  ASSERT(st_normalize(NULL, &legacy, &count) == ST_ERR_INVALID);
+  ASSERT(test_st_classify("echo ok", NULL) == ST_ERR_INVALID);
+  ASSERT(test_st_normalize(NULL, &legacy, &count) == ST_ERR_INVALID);
   ASSERT(legacy == NULL && count == 0);
   legacy = (char **)1;
   count = 99;
-  ASSERT(st_normalize("echo ok", NULL, &count) == ST_ERR_INVALID);
+  ASSERT(test_st_normalize("echo ok", NULL, &count) == ST_ERR_INVALID);
   ASSERT(count == 0);
-  ASSERT(st_normalize("echo ok", &legacy, NULL) == ST_ERR_INVALID);
+  ASSERT(test_st_normalize("echo ok", &legacy, NULL) == ST_ERR_INVALID);
   ASSERT(legacy == NULL);
 
-  /* Alternating operators cannot combine into || or &&.  Every input byte
-   * therefore produces a structural token, which exercises tokenizer
-   * capacity independently of ordinary-word tokenisation. */
+  /* Shelltype never re-tokenizes argv elements, including operator-looking
+   * text. */
   char operators[129];
   for (size_t i = 0; i < sizeof(operators) - 1; i++)
     operators[i] = i % 2 == 0 ? '|' : '&';
   operators[sizeof(operators) - 1] = '\0';
-  ASSERT(st_classify(operators, &typed) == ST_OK);
-  ASSERT(typed.count == sizeof(operators) - 1);
-  for (size_t i = 0; i < typed.count; i++) {
-    ASSERT(typed.tokens[i].type == ST_TYPE_LITERAL);
-    ASSERT(typed.tokens[i].text[0] == operators[i]);
-    ASSERT(typed.tokens[i].text[1] == '\0');
-  }
+  ASSERT(test_st_classify(operators, &typed) == ST_OK);
+  ASSERT(typed.count == 1);
+  ASSERT(typed.tokens[0].type == ST_TYPE_LITERAL);
+  ASSERT(strcmp(typed.tokens[0].text, operators) == 0);
   st_free_token_array(&typed);
 
   char many[(ST_MAX_CMD_TOKENS + 1) * 2 + 1];
@@ -688,7 +805,7 @@ static int test_normalization_boundaries(void) {
     many[used++] = ' ';
   }
   many[used - 1] = '\0';
-  ASSERT(st_classify(many, &typed) == ST_ERR_INVALID);
+  ASSERT(test_st_classify(many, &typed) == ST_ERR_LIMIT);
   ASSERT(typed.tokens == NULL && typed.count == 0);
 
   char long_token[ST_MAX_TOKEN_LEN + 2];
@@ -698,7 +815,7 @@ static int test_normalization_boundaries(void) {
   snprintf(long_command, sizeof(long_command), "echo %s", long_token);
   /* Expansion callbacks may legitimately produce long scalar values; the
    * token-length constant constrains classification helpers, not input. */
-  ASSERT(st_classify(long_command, &typed) == ST_OK);
+  ASSERT(test_st_classify(long_command, &typed) == ST_OK);
   ASSERT(typed.count == 2 &&
          strlen(typed.tokens[1].text) == ST_MAX_TOKEN_LEN + 1);
   st_free_token_array(&typed);
@@ -709,7 +826,7 @@ static int test_normalization_allocation_failures(void) {
   static const char input[] = "grep 'a.*b' 2>&1 --output=log EMPTY= kill -s 9";
   st_token_array_t probe = {0};
   st_test_alloc_reset();
-  ASSERT(st_classify(input, &probe) == ST_OK);
+  ASSERT(test_st_classify(input, &probe) == ST_OK);
   size_t allocations = st_test_alloc_count();
   ASSERT(allocations > 0);
   st_free_token_array(&probe);
@@ -718,7 +835,7 @@ static int test_normalization_allocation_failures(void) {
   for (size_t fail_at = 1; fail_at <= allocations; fail_at++) {
     st_token_array_t typed = {(st_token_t *)1, 99};
     st_test_alloc_fail_at(fail_at);
-    st_error_t err = st_classify(input, &typed);
+    st_error_t err = test_st_classify(input, &typed);
     st_test_alloc_reset();
     if (err == ST_ERR_MEMORY) {
       observed = true;
@@ -733,7 +850,7 @@ static int test_normalization_allocation_failures(void) {
   char **legacy_probe = NULL;
   size_t legacy_count = 0;
   st_test_alloc_reset();
-  ASSERT(st_normalize(input, &legacy_probe, &legacy_count) == ST_OK);
+  ASSERT(test_st_normalize(input, &legacy_probe, &legacy_count) == ST_OK);
   size_t legacy_allocations = st_test_alloc_count();
   ASSERT(legacy_probe != NULL && legacy_count > 0 && legacy_allocations > 0);
   st_free_tokens(legacy_probe, legacy_count);
@@ -742,7 +859,7 @@ static int test_normalization_allocation_failures(void) {
     char **tokens = (char **)1;
     size_t count = 99;
     st_test_alloc_fail_at(fail_at);
-    st_error_t err = st_normalize(input, &tokens, &count);
+    st_error_t err = test_st_normalize(input, &tokens, &count);
     st_test_alloc_reset();
     if (err == ST_ERR_MEMORY) {
       observed = true;
@@ -797,6 +914,215 @@ static int test_public_helper_matrix(void) {
   return 1;
 }
 
+static int test_netargv_contract(void) {
+  st_token_array_t typed = {(st_token_t *)1, 99};
+  ASSERT(st_classify("6:printf,9:two words,0:,1:>,", &typed) == ST_OK);
+  ASSERT(typed.count == 4);
+  ASSERT(strcmp(typed.tokens[0].text, "printf") == 0);
+  ASSERT(strcmp(typed.tokens[1].text, "two words") == 0);
+  ASSERT(strcmp(typed.tokens[2].text, "") == 0);
+  ASSERT(strcmp(typed.tokens[3].text, ">") == 0);
+  st_free_token_array(&typed);
+
+  static const char *const malformed[] = {
+      "01:x,", "-1:x,", "+1:x,", "1x,", "1:x", "2:x,", "0:;", "x",
+  };
+  for (size_t i = 0; i < sizeof(malformed) / sizeof(malformed[0]); i++) {
+    typed.tokens = (st_token_t *)1;
+    typed.count = 99;
+    ASSERT(st_classify(malformed[i], &typed) == ST_ERR_FORMAT);
+    ASSERT(typed.tokens == NULL && typed.count == 0);
+  }
+  ASSERT(st_classify("", &typed) == ST_OK);
+  ASSERT(typed.tokens == NULL && typed.count == 0);
+
+  ASSERT(st_classify("999999999999999999999999999999999999:x,", &typed) ==
+         ST_ERR_LIMIT);
+  ASSERT(st_classify("1:x,x", &typed) == ST_ERR_FORMAT);
+
+  char too_many[ST_MAX_CMD_TOKENS * 4 + 2] = {0};
+  for (size_t i = 0; i <= ST_MAX_CMD_TOKENS; i++)
+    strcat(too_many, "0:,");
+  ASSERT(st_classify(too_many, &typed) == ST_ERR_LIMIT);
+
+  char split_overflow[1024] = {0};
+  for (size_t i = 0; i < ST_MAX_CMD_TOKENS / 2 + 1; i++)
+    strcat(split_overflow, "3:A=1,");
+  ASSERT(st_classify(split_overflow, &typed) == ST_ERR_INVALID);
+  ASSERT(typed.tokens == NULL && typed.count == 0);
+  return 1;
+}
+
+static int test_netpattern_cpl_contract(void) {
+  char *roundtrip = NULL;
+  static const struct {
+    const char *cpl;
+    const char *canonical_cpl;
+  } cases[] = {
+      {"printf \"two words\" \"\" #n \"#n\" \"*\"",
+       "printf \"two words\" \"\" #n \"#n\" \"*\""},
+      {"echo \"outer \\\"inner\\\" text\"",
+       "echo \"outer \\\"inner\\\" text\""},
+      {"echo \"line\\nfeed\" \"\\u20ac\"", "echo \"line\\nfeed\" €"},
+      {"echo \"\\b\\f\\r\\t\\u007f\"", "echo \"\\b\\f\\r\\t\\u007f\""},
+      {"echo \"\\u00a2\" \"\\u20ac\" \"\\ud83d\\ude00\"", "echo ¢ € 😀"},
+      {"echo \"quote: \\\" slash: \\\\\"", "echo \"quote: \\\" slash: \\\\\""},
+      {"echo \"#unknown\" \"#CRC16:\"", "echo \"#unknown\" \"#CRC16:\""},
+      {"id #uuid.4", "id #uuid.v4"},
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    char *netpattern = NULL;
+    char *rendered = NULL;
+    ASSERT(st_netpattern_from_cpl(cases[i].cpl, &netpattern) == ST_OK);
+    ASSERT(netpattern != NULL);
+    ASSERT(st_netpattern_to_cpl(netpattern, &rendered) == ST_OK);
+    ASSERT(rendered != NULL && strcmp(rendered, cases[i].canonical_cpl) == 0);
+    char *again = NULL;
+    ASSERT(st_netpattern_from_cpl(rendered, &again) == ST_OK);
+    ASSERT(strcmp(netpattern, again) == 0);
+    free(again);
+    free(rendered);
+    free(netpattern);
+  }
+  static const char *const invalid[] = {
+      NULL,
+      "",
+      "   ",
+      "echo \"unterminated",
+      "echo pre\"mid\"",
+      "echo \"\\x41\"",
+      "echo \"\\u0000\"",
+      "echo \"\\ud800\"",
+      "echo \"\\udc00\"",
+      "echo \"\\ud800x\"",
+      "echo \"\\ud800\\u0000\"",
+      "echo \"\\u0x00\"",
+      "echo \"\\u123\"",
+      "echo \"x\"tail",
+      "echo \\\\value",
+      "echo bare\\value",
+      "echo bare\"value",
+      "echo \"line\nfeed\"",
+      "echo bare\tvalue",
+  };
+  for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
+    char *netpattern = (char *)1;
+    ASSERT(st_netpattern_from_cpl(invalid[i], &netpattern) == ST_ERR_INVALID);
+    ASSERT(netpattern == NULL);
+  }
+  st_token_array_t decoded = {0};
+  ASSERT(st_netpattern_decode("9:1:T,2:#n,,", &decoded) == ST_OK);
+  st_free_token_array(&decoded);
+  ASSERT(st_netpattern_decode("09:1:T,2:#n,,", &decoded) == ST_ERR_FORMAT);
+  ASSERT(st_netpattern_decode("14:1:T,7:#uuid.4,,", &decoded) == ST_ERR_FORMAT);
+
+  ASSERT(st_netpattern_decode(NULL, &decoded) == ST_ERR_INVALID);
+  ASSERT(st_netpattern_decode("9:1:X,2:#n,,", &decoded) == ST_ERR_FORMAT);
+  ASSERT(st_netpattern_decode("9:1:T,2:no,,", &decoded) == ST_ERR_FORMAT);
+  ASSERT(st_netpattern_decode("8:1:L,1:x,", &decoded) == ST_ERR_FORMAT);
+  ASSERT(st_netpattern_decode("8:1:L,1:x,,junk", &decoded) == ST_ERR_FORMAT);
+  ASSERT(st_netpattern_decode("x", &decoded) == ST_ERR_FORMAT);
+  ASSERT(st_netpattern_decode("0:,", &decoded) == ST_ERR_FORMAT);
+  ASSERT(st_netpattern_decode("999999999999999999999999999999999999:x,",
+                              &decoded) == ST_ERR_LIMIT);
+  ASSERT(st_netpattern_decode("08:1:L,1:x,,", &decoded) == ST_ERR_FORMAT);
+  ASSERT(st_netpattern_decode("9:01:L,1:x,,", &decoded) == ST_ERR_FORMAT);
+  ASSERT(st_netpattern_decode("9:1:L,01:x,,", &decoded) == ST_ERR_FORMAT);
+  ASSERT(st_netpattern_decode("9:1:T,1:*, ,", &decoded) == ST_ERR_FORMAT);
+  ASSERT(st_netpattern_to_cpl(NULL, &roundtrip) == ST_ERR_INVALID);
+  ASSERT(st_netpattern_to_cpl("x", &roundtrip) == ST_ERR_FORMAT);
+
+  st_token_t invalid_token = {.text = NULL, .type = ST_TYPE_LITERAL};
+  ASSERT(st_netpattern_encode(NULL, 1, &roundtrip) == ST_ERR_INVALID);
+  ASSERT(st_netpattern_encode(&invalid_token, 1, &roundtrip) == ST_ERR_INVALID);
+  invalid_token.text = "#n";
+  invalid_token.type = ST_TYPE_PATH;
+  ASSERT(st_netpattern_encode(&invalid_token, 1, &roundtrip) == ST_ERR_FORMAT);
+  ASSERT(st_netpattern_encode(&invalid_token, ST_MAX_CMD_TOKENS + 1,
+                              &roundtrip) == ST_ERR_INVALID);
+
+  char too_many_records[2048] = {0};
+  for (size_t i = 0; i <= ST_MAX_CMD_TOKENS; i++)
+    strcat(too_many_records, "7:1:L,0:,,");
+  ASSERT(st_netpattern_decode(too_many_records, &decoded) == ST_ERR_LIMIT);
+
+  char too_many_words[ST_MAX_CMD_TOKENS * 2 + 2] = {0};
+  for (size_t i = 0; i <= ST_MAX_CMD_TOKENS; i++)
+    strcat(too_many_words, i == 0 ? "x" : " x");
+  ASSERT(st_netpattern_from_cpl(too_many_words, &roundtrip) == ST_ERR_INVALID);
+
+  char controls[ST_MAX_TOKEN_LEN];
+  memset(controls, 1, sizeof(controls) - 1);
+  controls[sizeof(controls) - 1] = '\0';
+  st_token_t expansive_tokens[4];
+  for (size_t i = 0; i < 4; i++)
+    expansive_tokens[i] =
+        (st_token_t){.text = controls, .type = ST_TYPE_LITERAL};
+  char *expansive = NULL, *expansive_cpl = NULL;
+  ASSERT(st_netpattern_encode(expansive_tokens, 4, &expansive) == ST_OK);
+  ASSERT(st_netpattern_to_cpl(expansive, &expansive_cpl) == ST_OK);
+  ASSERT(strlen(expansive_cpl) > 1024);
+  ASSERT(st_netpattern_from_cpl(expansive_cpl, &roundtrip) == ST_OK);
+  ASSERT(strcmp(expansive, roundtrip) == 0);
+  free(roundtrip);
+  free(expansive_cpl);
+  free(expansive);
+
+  /* Every codec stage must clear outputs and release partial allocations. */
+  char *canonical = NULL;
+  ASSERT(st_netpattern_from_cpl("echo \"two words\" #n", &canonical) == ST_OK);
+  for (size_t fail_at = 1; fail_at <= 8; fail_at++) {
+    char *output = (char *)1;
+    st_test_alloc_fail_at(fail_at);
+    st_error_t error = st_netpattern_from_cpl("echo \"two words\" #n", &output);
+    st_test_alloc_reset();
+    ASSERT(error == ST_ERR_MEMORY || error == ST_OK);
+    if (error == ST_ERR_MEMORY)
+      ASSERT(output == NULL);
+    free(output);
+
+    st_token_array_t failed = {(st_token_t *)1, 99};
+    st_test_alloc_fail_at(fail_at);
+    error = st_netpattern_decode(canonical, &failed);
+    st_test_alloc_reset();
+    ASSERT(error == ST_ERR_MEMORY || error == ST_OK);
+    if (error == ST_ERR_MEMORY)
+      ASSERT(failed.tokens == NULL && failed.count == 0);
+    st_free_token_array(&failed);
+
+    output = (char *)1;
+    st_test_alloc_fail_at(fail_at);
+    error = st_netpattern_to_cpl(canonical, &output);
+    st_test_alloc_reset();
+    ASSERT(error == ST_ERR_MEMORY || error == ST_OK);
+    if (error == ST_ERR_MEMORY)
+      ASSERT(output == NULL);
+    free(output);
+  }
+  free(canonical);
+  return 1;
+}
+
+static int test_canonical_policy_boundary(void) {
+  st_policy_ctx_t *context = st_policy_ctx_new();
+  st_policy_t *policy = st_policy_new(context);
+  ASSERT(context != NULL && policy != NULL);
+
+  ASSERT(st_validate_netpattern("git status", NULL) == ST_ERR_FORMAT);
+  ASSERT(st_policy_add_netpattern(policy, "git status") == ST_ERR_FORMAT);
+
+  char *netpattern = NULL;
+  ASSERT(st_netpattern_from_cpl("git status", &netpattern) == ST_OK);
+  ASSERT(st_validate_netpattern(netpattern, NULL) == ST_OK);
+  ASSERT(st_policy_add_netpattern(policy, netpattern) == ST_OK);
+  ASSERT(st_policy_count(policy) == 1);
+
+  free(netpattern);
+  st_policy_free(policy);
+  st_policy_ctx_release(context);
+  return 1;
+}
+
 /* --- MAIN --- */
 
 int main(void) {
@@ -805,6 +1131,8 @@ int main(void) {
   printf("Classification matrix:\n");
   TEST(test_classification_matrix);
   TEST(test_generated_classification_boundaries);
+  TEST(test_classifier_adversarial_branch_matrix);
+  TEST(test_contextual_adversarial_branch_matrix);
 
   printf("\nType lattice:\n");
   TEST(test_type_lattice);
@@ -813,6 +1141,9 @@ int main(void) {
   TEST(test_normalization_matrix);
   TEST(test_normalization_boundaries);
   TEST(test_normalization_allocation_failures);
+  TEST(test_netargv_contract);
+  TEST(test_netpattern_cpl_contract);
+  TEST(test_canonical_policy_boundary);
   TEST(test_public_helper_matrix);
 
   printf("\n========================================\n");

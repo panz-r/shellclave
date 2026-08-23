@@ -18,7 +18,8 @@ _Static_assert(ST_TYPE_COUNT <= 64,
                "token variant collection requires a 64-bit type mask");
 
 /* Collect observed types at target position in trie. */
-static void collect_variants_at(st_node_t *node, const char **pattern_tokens,
+static void collect_variants_at(st_node_t *node,
+                                const st_token_t *pattern_tokens,
                                 size_t pattern_count, size_t target_pos,
                                 size_t depth, uint64_t *observed_types) {
   if (!node || depth >= pattern_count)
@@ -39,8 +40,8 @@ static void collect_variants_at(st_node_t *node, const char **pattern_tokens,
     return;
   }
 
-  const char *current_token = pattern_tokens[depth];
-  st_token_type_t current_type = st_type_from_pattern_token(current_token);
+  const char *current_token = pattern_tokens[depth].text;
+  st_token_type_t current_type = pattern_tokens[depth].type;
 
   if (current_type == ST_TYPE_LITERAL) {
     for (size_t i = 0; i < node->num_children; i++) {
@@ -94,54 +95,37 @@ static st_token_type_t most_specific_remaining(uint64_t remaining) {
   return ST_TYPE_COUNT;
 }
 
-static bool pattern_tokens_are_representable(const char **pattern_tokens,
-                                             size_t token_count) {
-  char pattern[ST_MAX_PATTERN_LEN];
-  size_t used = 0;
-
-  for (size_t i = 0; i < token_count; i++) {
-    const char *token = pattern_tokens[i];
-    if (!token || !token[0] || strchr(token, ' '))
-      return false;
-    size_t length = strlen(token);
-    size_t separator = i != 0 ? 1 : 0;
-    if (used + separator + length >= sizeof(pattern))
-      return false;
-    if (separator)
-      pattern[used++] = ' ';
-    memcpy(pattern + used, token, length);
-    used += length;
-  }
-  pattern[used] = '\0';
-
-  st_pattern_info_t info = {0};
-  return st_validate_pattern(pattern, &info) == ST_OK &&
-         info.token_count == token_count;
+static bool pattern_tokens_are_representable(const st_token_array_t *pattern) {
+  char *encoded = NULL;
+  st_error_t error =
+      st_netpattern_encode(pattern->tokens, pattern->count, &encoded);
+  free(encoded);
+  return error == ST_OK;
 }
 
 /* Suggest type variants for editing a pattern token. */
-size_t st_policy_suggest_token_variants(st_learner_t *learner,
-                                        const char **pattern_tokens,
-                                        size_t token_count, size_t edit_pos,
-                                        st_token_variant_t *out_variants) {
+size_t st_learner_suggest_token_variants(st_learner_t *learner,
+                                         const st_token_array_t *pattern,
+                                         size_t edit_pos,
+                                         st_token_variant_t *out_variants) {
   if (out_variants)
     memset(out_variants, 0, ST_MAX_TOKEN_VARIANTS * sizeof(*out_variants));
-  if (!learner || !pattern_tokens || !out_variants || token_count == 0 ||
-      token_count > ST_MAX_CMD_TOKENS || edit_pos >= token_count)
+  if (!learner || !pattern || !pattern->tokens || !out_variants ||
+      pattern->count == 0 || pattern->count > ST_MAX_CMD_TOKENS ||
+      edit_pos >= pattern->count)
     return 0;
-  if (!pattern_tokens_are_representable(pattern_tokens, token_count))
+  if (!pattern_tokens_are_representable(pattern))
     return 0;
 
   uint64_t observed_types = 0;
 
   /* Walk trie to collect observed types */
-  collect_variants_at(learner->trie.root, pattern_tokens, token_count, edit_pos,
-                      0, &observed_types);
+  collect_variants_at(learner->trie.root, pattern->tokens, pattern->count,
+                      edit_pos, 0, &observed_types);
 
   /* If no observed types, use current type */
   if (observed_types == 0) {
-    st_token_type_t current_type =
-        st_type_from_pattern_token(pattern_tokens[edit_pos]);
+    st_token_type_t current_type = pattern->tokens[edit_pos].type;
     if (current_type != ST_TYPE_LITERAL && current_type != ST_TYPE_ANY) {
       observed_types |= 1ULL << current_type;
     } else {
@@ -153,8 +137,7 @@ size_t st_policy_suggest_token_variants(st_learner_t *learner,
 
   /* Build variant list */
   size_t out_count = 0;
-  st_token_type_t current_type =
-      st_type_from_pattern_token(pattern_tokens[edit_pos]);
+  st_token_type_t current_type = pattern->tokens[edit_pos].type;
 
   /* Add current type first */
   if (current_type != ST_TYPE_ANY && current_type < ST_TYPE_COUNT &&
@@ -228,49 +211,27 @@ size_t st_policy_suggest_token_variants(st_learner_t *learner,
 
 /* Apply a type change to a pattern at a given position. Caller must free
  * result. */
-char *st_policy_apply_type_at(st_learner_t *learner,
-                              const char **pattern_tokens, size_t token_count,
-                              size_t edit_pos, st_token_type_t new_type) {
-  (void)learner;
-  if (!pattern_tokens || token_count == 0 || edit_pos >= token_count ||
-      token_count > ST_MAX_CMD_TOKENS || new_type <= ST_TYPE_LITERAL ||
+st_error_t st_netpattern_apply_type_at(const char *netpattern, size_t edit_pos,
+                                       st_token_type_t new_type,
+                                       char **out_netpattern) {
+  if (out_netpattern)
+    *out_netpattern = NULL;
+  if (!netpattern || !out_netpattern || new_type <= ST_TYPE_LITERAL ||
       new_type >= ST_TYPE_COUNT)
-    return NULL;
-  for (size_t i = 0; i < token_count; i++) {
-    if (!pattern_tokens[i])
-      return NULL;
+    return ST_ERR_INVALID;
+  st_token_array_t decoded = {0};
+  st_error_t error = st_netpattern_decode(netpattern, &decoded);
+  if (error != ST_OK)
+    return error;
+  if (edit_pos >= decoded.count) {
+    st_free_token_array(&decoded);
+    return ST_ERR_INVALID;
   }
-
-  size_t buf_size = ST_MAX_PATTERN_LEN;
-  char *result = malloc(buf_size);
-  if (!result)
-    return NULL;
-  result[0] = '\0';
-
-  char *ptr = result;
-  size_t remain = buf_size;
-
-  for (size_t i = 0; i < token_count; i++) {
-    if (i > 0) {
-      int written = snprintf(ptr, remain, " ");
-      if (written < 0 || (size_t)written >= remain) {
-        free(result);
-        return NULL;
-      }
-      ptr += written;
-      remain -= (size_t)written;
-    }
-    const char *tok =
-        (i == edit_pos) ? st_type_symbol[new_type] : pattern_tokens[i];
-    if (!tok)
-      tok = "";
-    int written = snprintf(ptr, remain, "%s", tok);
-    if (written < 0 || (size_t)written >= remain) {
-      free(result);
-      return NULL;
-    }
-    ptr += written;
-    remain -= (size_t)written;
-  }
-  return result;
+  char *old_text = decoded.tokens[edit_pos].text;
+  decoded.tokens[edit_pos].text = (char *)st_type_symbol[new_type];
+  decoded.tokens[edit_pos].type = new_type;
+  error = st_netpattern_encode(decoded.tokens, decoded.count, out_netpattern);
+  decoded.tokens[edit_pos].text = old_text;
+  st_free_token_array(&decoded);
+  return error;
 }

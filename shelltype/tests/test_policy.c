@@ -7,6 +7,7 @@
 #include "shelltype.h"
 #include "test_allocator.h"
 #include "test_io.h"
+#include "test_netargv.h"
 #include <glob.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -59,10 +60,71 @@ static void cleanup_policy_temp_files(void) {
   } while (0)
 #define ASSERT_OK(expression) ASSERT((expression) == ST_OK)
 
+static int pattern_is_cpl(const char *actual, const char *expected_cpl) {
+  if (!actual || !expected_cpl)
+    return actual == expected_cpl;
+  char *expected = NULL;
+  int equal = st_netpattern_from_cpl(expected_cpl, &expected) == ST_OK &&
+              strcmp(actual, expected) == 0;
+  free(expected);
+  return equal;
+}
+
+static st_token_type_t test_pattern_token_type(const char *token) {
+  if (!token)
+    return ST_TYPE_LITERAL;
+  for (int type = ST_TYPE_LITERAL; type < ST_TYPE_COUNT; type++)
+    if (strcmp(token, st_type_symbol[type]) == 0)
+      return (st_token_type_t)type;
+  return ST_TYPE_LITERAL;
+}
+
+/* Legacy-shaped test adapters keep the existing lattice matrices readable
+ * while exercising the canonical 0.3 APIs underneath. */
+static size_t st_policy_suggest_token_variants(st_learner_t *learner,
+                                               const char **tokens,
+                                               size_t count, size_t edit_pos,
+                                               st_token_variant_t *out) {
+  st_token_t typed[ST_MAX_CMD_TOKENS];
+  if (!tokens || count > ST_MAX_CMD_TOKENS)
+    return st_learner_suggest_token_variants(learner, NULL, edit_pos, out);
+  for (size_t i = 0; i < count; i++)
+    typed[i] = (st_token_t){.text = (char *)tokens[i],
+                            .type = test_pattern_token_type(tokens[i])};
+  st_token_array_t pattern = {.tokens = typed, .count = count};
+  return st_learner_suggest_token_variants(learner, &pattern, edit_pos, out);
+}
+
+static char *st_policy_apply_type_at(st_learner_t *learner, const char **tokens,
+                                     size_t count, size_t edit_pos,
+                                     st_token_type_t new_type) {
+  (void)learner;
+  if (!tokens || count == 0 || count > ST_MAX_CMD_TOKENS)
+    return NULL;
+  st_token_t typed[ST_MAX_CMD_TOKENS];
+  for (size_t i = 0; i < count; i++) {
+    if (!tokens[i])
+      return NULL;
+    typed[i] = (st_token_t){.text = (char *)tokens[i],
+                            .type = test_pattern_token_type(tokens[i])};
+  }
+  char *pattern = NULL, *changed = NULL, *cpl = NULL;
+  if (st_netpattern_encode(typed, count, &pattern) != ST_OK ||
+      st_netpattern_apply_type_at(pattern, edit_pos, new_type, &changed) !=
+          ST_OK ||
+      st_netpattern_to_cpl(changed, &cpl) != ST_OK) {
+    free(cpl);
+    cpl = NULL;
+  }
+  free(changed);
+  free(pattern);
+  return cpl;
+}
+
 static int policy_matches(st_policy_t *policy, const char *command,
                           bool expected) {
   st_eval_result_t result = {0};
-  return st_policy_eval(policy, command, &result) == ST_OK &&
+  return test_st_policy_eval(policy, command, &result) == ST_OK &&
          result.matches == expected;
 }
 
@@ -99,7 +161,7 @@ static int test_isolated_subcommand_match_boundaries(void) {
     st_policy_ctx_t *ctx = st_policy_ctx_new();
     st_policy_t *policy = ctx ? st_policy_new(ctx) : NULL;
     ASSERT(policy != NULL);
-    ASSERT(st_policy_add(policy, cases[i].pattern) == ST_OK);
+    ASSERT(test_st_policy_add(policy, cases[i].pattern) == ST_OK);
     for (size_t j = 0; j < cases[i].command_count; j++)
       ASSERT(
           policy_matches(policy, cases[i].commands[j], cases[i].expected[j]));
@@ -149,10 +211,10 @@ static void remove_policy_save_temps(const char *path) {
 static int suggestion_is(const st_expand_suggestion_t *suggestion,
                          const char *pattern, const char *based_on,
                          double confidence) {
-  int matches = strcmp(suggestion->pattern, pattern) == 0 &&
+  int matches = pattern_is_cpl(suggestion->pattern, pattern) &&
                 ((suggestion->based_on == NULL && based_on == NULL) ||
                  (suggestion->based_on != NULL && based_on != NULL &&
-                  strcmp(suggestion->based_on, based_on) == 0)) &&
+                  pattern_is_cpl(suggestion->based_on, based_on))) &&
                 suggestion->confidence == confidence;
   if (!matches)
     printf("    suggestion actual={%s, %s, %.17g} expected={%s, %s, %.17g}\n",
@@ -193,13 +255,14 @@ static int test_policy_mutation_lifecycle(void) {
   ASSERT(ctx != NULL);
   ASSERT(st_policy_new(NULL) == NULL);
   ASSERT(st_policy_count(NULL) == 0);
-  ASSERT(st_policy_add(NULL, "git") == ST_ERR_INVALID);
-  ASSERT(st_policy_remove(NULL, "git") == ST_ERR_INVALID);
+  ASSERT(test_st_policy_add(NULL, "git") == ST_ERR_INVALID);
+  ASSERT(test_st_policy_remove(NULL, "git") == ST_ERR_INVALID);
 
   st_policy_t *policy = st_policy_new(ctx);
   ASSERT(policy != NULL);
   for (size_t i = 0; i < sizeof(additions) / sizeof(additions[0]); i++) {
-    ASSERT(st_policy_add(policy, additions[i].pattern) == additions[i].error);
+    ASSERT(test_st_policy_add(policy, additions[i].pattern) ==
+           additions[i].error);
     ASSERT(st_policy_count(policy) == additions[i].count);
   }
   ASSERT(policy_matches(policy, "git", true));
@@ -209,7 +272,8 @@ static int test_policy_mutation_lifecycle(void) {
   ASSERT(policy_matches(policy, "cat input | grep error", true));
 
   for (size_t i = 0; i < sizeof(removals) / sizeof(removals[0]); i++) {
-    ASSERT(st_policy_remove(policy, removals[i].pattern) == removals[i].error);
+    ASSERT(test_st_policy_remove(policy, removals[i].pattern) ==
+           removals[i].error);
     ASSERT(st_policy_count(policy) == removals[i].count);
     if (i == 3) {
       ASSERT(policy_matches(policy, "git", true));
@@ -236,7 +300,7 @@ static int test_policy_persistence_transitions(void) {
                                    "ls -l *",
                                    "cat * | grep *",
                                    "#uuid.v4 inspect",
-                                   "#CRC16: 00000000"};
+                                   "\"#CRC16:\" 00000000"};
   static const char *probes[] = {"git",
                                  "git commit -m message",
                                  "ls -l /tmp",
@@ -257,13 +321,18 @@ static int test_policy_persistence_transitions(void) {
   st_policy_t *empty = st_policy_new(ctx);
   ASSERT(ctx && source && loaded && empty);
   for (size_t i = 0; i < sizeof(patterns) / sizeof(patterns[0]); i++)
-    ASSERT(st_policy_add(source, patterns[i]) == ST_OK);
+    ASSERT(test_st_policy_add(source, patterns[i]) == ST_OK);
+  char *framed_pattern = NULL;
+  ASSERT(st_netpattern_from_cpl("printf \"\" \"line\\nfeed\"",
+                                &framed_pattern) == ST_OK);
+  ASSERT(test_st_policy_add(source, framed_pattern) == ST_OK);
+  free(framed_pattern);
   for (int i = 0; i < 50; i++) {
     char pattern[64];
     snprintf(pattern, sizeof(pattern), "cmd%d arg%d *", i, i);
-    ASSERT(st_policy_add(source, pattern) == ST_OK);
+    ASSERT(test_st_policy_add(source, pattern) == ST_OK);
   }
-  const size_t source_count = sizeof(patterns) / sizeof(patterns[0]) + 50;
+  const size_t source_count = sizeof(patterns) / sizeof(patterns[0]) + 51;
   ASSERT(st_policy_count(source) == source_count);
   ASSERT(st_policy_save(NULL, path) == ST_ERR_INVALID);
   ASSERT(st_policy_save(source, NULL) == ST_ERR_INVALID);
@@ -273,16 +342,20 @@ static int test_policy_persistence_transitions(void) {
 
   st_test_alloc_reset();
   ASSERT(st_policy_clear(loaded) == ST_OK);
-  ASSERT(st_policy_add(loaded, "preserve value") == ST_OK);
+  ASSERT(test_st_policy_add(loaded, "preserve value") == ST_OK);
   st_test_alloc_reset();
   ASSERT(st_policy_load(loaded, path, true) == ST_OK);
   size_t load_allocations = st_test_alloc_count();
   ASSERT(load_allocations > 0);
+  st_eval_result_t framed_result = {0};
+  ASSERT(test_st_policy_eval(loaded, "printf '' 'line\nfeed'",
+                             &framed_result) == ST_OK);
+  ASSERT(framed_result.matches);
 
   bool load_failure_observed = false;
   for (size_t fail_at = 1; fail_at <= load_allocations; fail_at++) {
     ASSERT(st_policy_clear(loaded) == ST_OK);
-    ASSERT(st_policy_add(loaded, "preserve value") == ST_OK);
+    ASSERT(test_st_policy_add(loaded, "preserve value") == ST_OK);
     size_t before = st_policy_count(loaded);
     st_test_alloc_fail_at(fail_at);
     st_error_t load_err = st_policy_load(loaded, path, true);
@@ -302,7 +375,7 @@ static int test_policy_persistence_transitions(void) {
   }
   ASSERT(load_failure_observed);
   ASSERT(st_policy_clear(loaded) == ST_OK);
-  ASSERT(st_policy_add(loaded, "docker run *") == ST_OK);
+  ASSERT(test_st_policy_add(loaded, "docker run *") == ST_OK);
 
   /* The declared count is part of the file contract, not advisory metadata. */
   FILE *rewrite = fopen(path, "r+");
@@ -372,13 +445,13 @@ static int test_policy_save_determinism_and_compaction(void) {
            second_path);
   ASSERT(close(first_fd) == 0 && close(second_fd) == 0);
 
-  static const char *patterns[] = {"echo 'a\\\"b'", "copy #path", "run #n",
+  static const char *patterns[] = {"echo \"a\\\"b\"", "copy #path", "run #n",
                                    "cat * | grep *"};
   st_policy_ctx_t *ctx = st_policy_ctx_new();
   st_policy_t *policy = ctx ? st_policy_new(ctx) : NULL;
   ASSERT(ctx != NULL && policy != NULL);
   for (size_t i = 0; i < sizeof(patterns) / sizeof(patterns[0]); i++)
-    ASSERT(st_policy_add(policy, patterns[i]) == ST_OK);
+    ASSERT(test_st_policy_add(policy, patterns[i]) == ST_OK);
   ASSERT(st_policy_save(policy, first_path) == ST_OK);
   ASSERT(st_policy_compact(policy) == ST_OK);
   ASSERT(st_policy_save(policy, second_path) == ST_OK);
@@ -387,6 +460,9 @@ static int test_policy_save_determinism_and_compaction(void) {
   size_t first_length = 0, second_length = 0;
   ASSERT(read_policy_file(first_path, first, sizeof(first), &first_length));
   ASSERT(read_policy_file(second_path, second, sizeof(second), &second_length));
+  static const char v2_header[] = "# shelltype-policy v2\n";
+  ASSERT(first_length >= sizeof(v2_header) - 1 &&
+         memcmp(first, v2_header, sizeof(v2_header) - 1) == 0);
   ASSERT(first_length == second_length &&
          memcmp(first, second, first_length) == 0);
   /* The quoted pattern exercises serialization text/escaping; the remaining
@@ -397,7 +473,7 @@ static int test_policy_save_determinism_and_compaction(void) {
     const char *command = i == 1
                               ? "copy /tmp/file"
                               : (i == 2 ? "run 42" : "cat input | grep error");
-    st_error_t error = st_policy_eval(policy, command, &result);
+    st_error_t error = test_st_policy_eval(policy, command, &result);
     if (error != ST_OK || !result.matches)
       printf("    save case %zu command '%s' error=%d pattern=%s\n", i, command,
              error, result.matching_pattern ? result.matching_pattern : "-");
@@ -419,8 +495,8 @@ static int test_policy_load_read_failures_preserve_state(void) {
   st_policy_ctx_t *source_context = st_policy_ctx_new();
   st_policy_t *source = source_context ? st_policy_new(source_context) : NULL;
   ASSERT(source != NULL);
-  ASSERT(st_policy_add(source, "replacement #n") == ST_OK);
-  ASSERT(st_policy_add(source, "replacement #uuid.v4") == ST_OK);
+  ASSERT(test_st_policy_add(source, "replacement #n") == ST_OK);
+  ASSERT(test_st_policy_add(source, "replacement #uuid.v4") == ST_OK);
   ASSERT(st_policy_save(source, path) == ST_OK);
 
   st_policy_ctx_t *probe_context = st_policy_ctx_new();
@@ -439,14 +515,14 @@ static int test_policy_load_read_failures_preserve_state(void) {
       st_policy_ctx_t *context = st_policy_ctx_new();
       st_policy_t *policy = context ? st_policy_new(context) : NULL;
       ASSERT(policy != NULL);
-      ASSERT(st_policy_add(policy, "preserve value") == ST_OK);
+      ASSERT(test_st_policy_add(policy, "preserve value") == ST_OK);
       st_test_read_fail_at(fail_at);
       ASSERT(st_policy_load(policy, path, clear_first != 0) == ST_ERR_IO);
       st_test_io_reset();
       ASSERT(st_policy_count(policy) == 1);
       ASSERT(policy_matches(policy, "preserve value", true));
       ASSERT(policy_matches(policy, "replacement 42", false));
-      ASSERT(st_policy_add(policy, "after failure") == ST_OK);
+      ASSERT(test_st_policy_add(policy, "after failure") == ST_OK);
       st_policy_free(policy);
       st_policy_ctx_free(context);
     }
@@ -454,7 +530,7 @@ static int test_policy_load_read_failures_preserve_state(void) {
     st_policy_ctx_t *context = st_policy_ctx_new();
     st_policy_t *policy = context ? st_policy_new(context) : NULL;
     ASSERT(policy != NULL);
-    ASSERT(st_policy_add(policy, "preserve value") == ST_OK);
+    ASSERT(test_st_policy_add(policy, "preserve value") == ST_OK);
     st_test_io_fail_at(1);
     ASSERT(st_policy_load(policy, path, clear_first != 0) == ST_ERR_IO);
     st_test_io_reset();
@@ -479,17 +555,17 @@ static int test_append_load_subsumption_failures_are_atomic(void) {
   st_policy_ctx_t *source_context = st_policy_ctx_new();
   st_policy_t *source = source_context ? st_policy_new(source_context) : NULL;
   ASSERT(source != NULL);
-  ASSERT(st_policy_add(source, "copy #path") == ST_OK);
-  ASSERT(st_policy_add(source, "incoming #n") == ST_OK);
+  ASSERT(test_st_policy_add(source, "copy #path") == ST_OK);
+  ASSERT(test_st_policy_add(source, "incoming #n") == ST_OK);
   ASSERT(st_policy_save(source, path) == ST_OK);
 
   st_test_alloc_reset();
   st_policy_ctx_t *probe_context = st_policy_ctx_new();
   st_policy_t *probe = probe_context ? st_policy_new(probe_context) : NULL;
   ASSERT(probe != NULL);
-  ASSERT(st_policy_add(probe, "copy /tmp/a") == ST_OK);
-  ASSERT(st_policy_add(probe, "copy /tmp/b") == ST_OK);
-  ASSERT(st_policy_add(probe, "keep command") == ST_OK);
+  ASSERT(test_st_policy_add(probe, "copy /tmp/a") == ST_OK);
+  ASSERT(test_st_policy_add(probe, "copy /tmp/b") == ST_OK);
+  ASSERT(test_st_policy_add(probe, "keep command") == ST_OK);
   st_test_alloc_reset();
   ASSERT(st_policy_load(probe, path, false) == ST_OK);
   size_t allocations = st_test_alloc_count();
@@ -506,9 +582,9 @@ static int test_append_load_subsumption_failures_are_atomic(void) {
     st_policy_ctx_t *context = st_policy_ctx_new();
     st_policy_t *policy = context ? st_policy_new(context) : NULL;
     ASSERT(policy != NULL);
-    ASSERT(st_policy_add(policy, "copy /tmp/a") == ST_OK);
-    ASSERT(st_policy_add(policy, "copy /tmp/b") == ST_OK);
-    ASSERT(st_policy_add(policy, "keep command") == ST_OK);
+    ASSERT(test_st_policy_add(policy, "copy /tmp/a") == ST_OK);
+    ASSERT(test_st_policy_add(policy, "copy /tmp/b") == ST_OK);
+    ASSERT(test_st_policy_add(policy, "keep command") == ST_OK);
     st_test_alloc_fail_at(fail_at);
     st_error_t error = st_policy_load(policy, path, false);
     st_test_alloc_reset();
@@ -544,8 +620,8 @@ static int test_policy_save_io_failures_are_atomic(void) {
   st_policy_ctx_t *ctx = st_policy_ctx_new();
   st_policy_t *policy = ctx ? st_policy_new(ctx) : NULL;
   ASSERT(ctx != NULL && policy != NULL);
-  ASSERT_OK(st_policy_add(policy, "git status"));
-  ASSERT_OK(st_policy_add(policy, "container #uuid.v4"));
+  ASSERT_OK(test_st_policy_add(policy, "git status"));
+  ASSERT_OK(test_st_policy_add(policy, "container #uuid.v4"));
 
   st_test_io_reset();
   ASSERT_OK(st_policy_save(policy, path));
@@ -565,7 +641,7 @@ static int test_policy_save_io_failures_are_atomic(void) {
     st_test_io_reset();
     ASSERT(error == ST_ERR_IO);
 
-    char contents[128];
+    char contents[4096];
     size_t length = 0;
     ASSERT(read_policy_file(path, contents, sizeof(contents), &length));
     bool old_file = length == sizeof(sentinel) - 1 &&
@@ -598,8 +674,8 @@ static int test_policy_save_crash_boundaries(void) {
   st_policy_t *old_policy = ctx ? st_policy_new(ctx) : NULL;
   st_policy_t *new_policy = ctx ? st_policy_new(ctx) : NULL;
   ASSERT(ctx && old_policy && new_policy);
-  ASSERT_OK(st_policy_add(old_policy, "old 42"));
-  ASSERT_OK(st_policy_add(new_policy, "new #n"));
+  ASSERT_OK(test_st_policy_add(old_policy, "old 42"));
+  ASSERT_OK(test_st_policy_add(new_policy, "new #n"));
 
   st_test_io_reset();
   ASSERT_OK(st_policy_save(new_policy, path));
@@ -657,8 +733,8 @@ static int test_policy_save_recovery_ignores_stale_temps(void) {
   st_policy_t *old_policy = ctx ? st_policy_new(ctx) : NULL;
   st_policy_t *new_policy = ctx ? st_policy_new(ctx) : NULL;
   ASSERT(ctx && old_policy && new_policy);
-  ASSERT_OK(st_policy_add(old_policy, "old 42"));
-  ASSERT_OK(st_policy_add(new_policy, "new #n"));
+  ASSERT_OK(test_st_policy_add(old_policy, "old 42"));
+  ASSERT_OK(test_st_policy_add(new_policy, "new #n"));
   ASSERT_OK(st_policy_save(old_policy, path));
 
   st_test_io_reset();
@@ -705,7 +781,7 @@ static int test_policy_load_rejects_binary_and_overlong_lines(void) {
   st_policy_ctx_t *ctx = st_policy_ctx_new();
   st_policy_t *policy = ctx ? st_policy_new(ctx) : NULL;
   ASSERT(ctx != NULL && policy != NULL);
-  ASSERT_OK(st_policy_add(policy, "preserve value"));
+  ASSERT_OK(test_st_policy_add(policy, "preserve value"));
 
   static const unsigned char binary[] =
       "# CPL v1\n# patterns: 1\ngit\0evil\n# CRC32: 00000000\n";
@@ -745,15 +821,15 @@ static int test_evaluation_contract_matrix(void) {
       {"docker run ubuntu", true}, {"docker run ubuntu", false}, {"", true}};
   st_policy_ctx_t *ctx = st_policy_ctx_new();
   st_policy_t *policy = st_policy_new(ctx);
-  ASSERT_OK(st_policy_add(policy, "git commit -m *"));
+  ASSERT_OK(test_st_policy_add(policy, "git commit -m *"));
 
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
     st_eval_result_t result = {.matches = true,
                                .matching_pattern = (const char *)1,
                                .suggestion_count = 2,
                                .error = ST_ERR_FAILED};
-    st_error_t error = st_policy_eval(policy, cases[i].command,
-                                      cases[i].provide_result ? &result : NULL);
+    st_error_t error = test_st_policy_eval(
+        policy, cases[i].command, cases[i].provide_result ? &result : NULL);
     ASSERT(error == ST_OK);
     if (cases[i].provide_result)
       ASSERT(!result.matches && result.matching_pattern == NULL);
@@ -769,7 +845,7 @@ static int test_invalid_inputs_clear_results(void) {
                              .matching_pattern = (const char *)1,
                              .suggestion_count = 2,
                              .error = ST_ERR_FAILED};
-  ASSERT(st_policy_eval(NULL, "git status", &result) == ST_ERR_INVALID);
+  ASSERT(test_st_policy_eval(NULL, "git status", &result) == ST_ERR_INVALID);
   ASSERT(!result.matches && result.matching_pattern == NULL &&
          result.suggestion_count == 0 && result.error == ST_OK);
 
@@ -780,7 +856,7 @@ static int test_invalid_inputs_clear_results(void) {
   result.matching_pattern = (const char *)1;
   result.suggestion_count = 2;
   result.error = ST_ERR_FAILED;
-  ASSERT(st_policy_eval(policy, NULL, &result) == ST_ERR_INVALID);
+  ASSERT(test_st_policy_eval(policy, NULL, &result) == ST_ERR_INVALID);
   ASSERT(!result.matches && result.matching_pattern == NULL &&
          result.suggestion_count == 0 && result.error == ST_OK);
   st_policy_free(policy);
@@ -840,12 +916,12 @@ static int test_filter_wildcard_compatibility_matrix(void) {
     st_policy_t *policy = st_policy_new(ctx);
     ASSERT(policy != NULL);
     if (cases[i].with_literal)
-      ASSERT(st_policy_add(policy, "git status") == ST_OK);
-    ASSERT(st_policy_add(policy, cases[i].wildcard_pattern) == ST_OK);
+      ASSERT(test_st_policy_add(policy, "git status") == ST_OK);
+    ASSERT(test_st_policy_add(policy, cases[i].wildcard_pattern) == ST_OK);
 
     st_policy_stats_t before = {0}, after = {0};
     st_policy_get_stats(policy, &before);
-    ASSERT(st_policy_eval(policy, cases[i].command, NULL) == ST_OK);
+    ASSERT(test_st_policy_eval(policy, cases[i].command, NULL) == ST_OK);
     st_policy_get_stats(policy, &after);
     ASSERT(after.eval_count == before.eval_count + 1);
     if (after.filter_reject_count !=
@@ -861,7 +937,7 @@ static int test_filter_wildcard_compatibility_matrix(void) {
     }
 
     st_eval_result_t result = {0};
-    ASSERT(st_policy_eval(policy, cases[i].command, &result) == ST_OK);
+    ASSERT(test_st_policy_eval(policy, cases[i].command, &result) == ST_OK);
     ASSERT(!result.matches);
     ASSERT(result.suggestion_count == cases[i].suggestion_count);
     for (size_t j = 0; j < result.suggestion_count; j++)
@@ -880,7 +956,7 @@ static int assert_prefilter_never_rejects_matches(st_policy_t *policy,
   for (size_t i = 0; i < count; i++) {
     st_policy_stats_t before = {0}, after = {0};
     st_policy_get_stats(policy, &before);
-    ASSERT_OK(st_policy_eval(policy, commands[i], NULL));
+    ASSERT_OK(test_st_policy_eval(policy, commands[i], NULL));
     st_policy_get_stats(policy, &after);
     ASSERT(after.filter_reject_count == before.filter_reject_count);
     ASSERT(after.trie_walk_count == before.trie_walk_count + 1);
@@ -903,15 +979,15 @@ static int test_prefilter_match_invariant_across_lifecycle(void) {
   st_policy_t *policy = ctx ? st_policy_new(ctx) : NULL;
   ASSERT(ctx != NULL && policy != NULL);
   for (size_t i = 0; i < 4; i++)
-    ASSERT_OK(st_policy_add(policy, patterns[i]));
+    ASSERT_OK(test_st_policy_add(policy, patterns[i]));
   ASSERT(assert_prefilter_never_rejects_matches(policy, commands, 4));
   ASSERT_OK(st_policy_compact(policy));
   ASSERT(assert_prefilter_never_rejects_matches(policy, commands, 4));
   ASSERT_OK(st_policy_save(policy, path));
   ASSERT_OK(st_policy_load(policy, path, true));
   ASSERT(assert_prefilter_never_rejects_matches(policy, commands, 4));
-  ASSERT_OK(st_policy_remove(policy, patterns[1]));
-  ASSERT_OK(st_policy_add(policy, patterns[1]));
+  ASSERT_OK(test_st_policy_remove(policy, patterns[1]));
+  ASSERT_OK(test_st_policy_add(policy, patterns[1]));
   ASSERT(assert_prefilter_never_rejects_matches(policy, commands, 4));
 
   st_policy_free(policy);
@@ -925,12 +1001,13 @@ static int test_suggestion_contracts(void) {
   st_policy_ctx_t *ctx = st_policy_ctx_new();
   st_policy_t *policy = st_policy_new(ctx);
   ASSERT(policy != NULL);
-  ASSERT_OK(st_policy_add(policy, "docker run -d nginx"));
-  ASSERT_OK(st_policy_add(policy, "docker run -it ubuntu"));
-  ASSERT_OK(st_policy_add(policy, "docker run --rm alpine"));
+  ASSERT_OK(test_st_policy_add(policy, "docker run -d nginx"));
+  ASSERT_OK(test_st_policy_add(policy, "docker run -it ubuntu"));
+  ASSERT_OK(test_st_policy_add(policy, "docker run --rm alpine"));
 
   st_eval_result_t result = {0};
-  ASSERT(st_policy_eval(policy, "docker exec -it container", &result) == ST_OK);
+  ASSERT(test_st_policy_eval(policy, "docker exec -it container", &result) ==
+         ST_OK);
   ASSERT(!result.matches);
   ASSERT(result.suggestion_count == 2);
   ASSERT(suggestion_is(&result.suggestions[0], "docker exec -it container",
@@ -996,18 +1073,20 @@ static int test_suggestion_contracts(void) {
     size_t count = st_policy_suggest_variants(policy, tokens, 2, variants);
     ASSERT(count == (variant_cases[i].wider_pattern ? 2 : 1));
     char exact[64];
-    snprintf(exact, sizeof(exact), "docker %s", variant_cases[i].symbol);
+    snprintf(exact, sizeof(exact), "docker \"%s\"", variant_cases[i].symbol);
     ASSERT(suggestion_is(&variants[0], exact, NULL, 1.0));
     if (variant_cases[i].wider_pattern)
       ASSERT(suggestion_is(&variants[1], variant_cases[i].wider_pattern, NULL,
                            1.0));
     if (variant_cases[i].wider_pattern) {
-      const char *symbol = strrchr(variants[1].pattern, ' ');
-      ASSERT(symbol != NULL);
-      st_token_type_t wider = st_type_from_pattern_token(symbol + 1);
+      st_token_array_t decoded = {0};
+      ASSERT(st_netpattern_decode(variants[1].pattern, &decoded) == ST_OK);
+      ASSERT(decoded.count == 2);
+      st_token_type_t wider = decoded.tokens[1].type;
       ASSERT(wider != ST_TYPE_LITERAL && wider != ST_TYPE_ANY &&
              wider != variant_cases[i].type &&
              st_is_compatible(variant_cases[i].type, wider));
+      st_free_token_array(&decoded);
       for (int candidate = ST_TYPE_HEXHASH; candidate < ST_TYPE_COUNT;
            candidate++) {
         st_token_type_t intermediate = (st_token_type_t)candidate;
@@ -1036,7 +1115,7 @@ static int test_suggestion_contracts(void) {
     ASSERT(variants[i].pattern[0] == '\0' && variants[i].based_on == NULL &&
            variants[i].confidence == 0.0);
 
-  char oversized[ST_MAX_PATTERN_LEN];
+  char oversized[ST_MAX_NETPATTERN_LEN];
   memset(oversized, 'x', sizeof(oversized) - 1);
   oversized[sizeof(oversized) - 1] = '\0';
   st_token_t overlong[] = {
@@ -1053,11 +1132,6 @@ static int test_suggestion_contracts(void) {
       {.text = NULL, .type = ST_TYPE_LITERAL},
       {.text = "value", .type = ST_TYPE_COUNT},
       {.text = "value", .type = (st_token_type_t)-1},
-      {.text = "", .type = ST_TYPE_LITERAL},
-      {.text = "two words", .type = ST_TYPE_LITERAL},
-      {.text = "two\twords", .type = ST_TYPE_LITERAL},
-      {.text = "#n", .type = ST_TYPE_LITERAL},
-      {.text = "*", .type = ST_TYPE_LITERAL},
   };
   for (size_t i = 0; i < sizeof(invalid_tokens) / sizeof(invalid_tokens[0]);
        i++) {
@@ -1070,15 +1144,16 @@ static int test_suggestion_contracts(void) {
   }
 
   st_token_array_t quoted_space = {0};
-  ASSERT(st_classify("echo \"two words\"", &quoted_space) == ST_OK);
+  ASSERT(test_st_classify("echo \"two words\"", &quoted_space) == ST_OK);
   ASSERT(quoted_space.count == 2 &&
          quoted_space.tokens[1].type == ST_TYPE_QUOTED_SPACE);
   memset(variants, 0xa5, sizeof(variants));
   ASSERT(st_policy_suggest_variants(policy, quoted_space.tokens,
-                                    quoted_space.count, variants) == 0);
-  for (size_t i = 0; i < 3; i++)
-    ASSERT(variants[i].pattern[0] == '\0' && variants[i].based_on == NULL &&
-           variants[i].confidence == 0.0);
+                                    quoted_space.count, variants) >= 1);
+  st_token_array_t exact = {0};
+  ASSERT(st_netpattern_decode(variants[0].pattern, &exact) == ST_OK);
+  ASSERT(exact.count == 2 && strcmp(exact.tokens[1].text, "two words") == 0);
+  st_free_token_array(&exact);
   st_free_token_array(&quoted_space);
 
   st_test_alloc_reset();
@@ -1147,19 +1222,20 @@ static int test_branching_suggestions_are_lifecycle_independent(void) {
     policies[order] = st_policy_new(contexts[order]);
     ASSERT(contexts[order] && policies[order]);
     for (size_t i = 0; i < 3; i++)
-      ASSERT(st_policy_add(policies[order], patterns[orders[order][i]]) ==
+      ASSERT(test_st_policy_add(policies[order], patterns[orders[order][i]]) ==
              ST_OK);
     st_eval_result_t actual = {0};
-    ASSERT(st_policy_eval(policies[order], command, &actual) == ST_OK);
+    ASSERT(test_st_policy_eval(policies[order], command, &actual) == ST_OK);
     ASSERT(!actual.matches && actual.suggestion_count > 0);
     if (order > 0) {
       st_eval_result_t reference = {0};
-      ASSERT(st_policy_eval(policies[0], command, &reference) == ST_OK);
+      ASSERT(test_st_policy_eval(policies[0], command, &reference) == ST_OK);
       ASSERT(suggestions_equal(&reference, &actual));
       ASSERT(st_policy_compact(policies[order]) == ST_OK);
       st_eval_result_t compacted = {0};
-      ASSERT(st_policy_eval(policies[order], command, &compacted) == ST_OK);
-      ASSERT(st_policy_eval(policies[0], command, &reference) == ST_OK);
+      ASSERT(test_st_policy_eval(policies[order], command, &compacted) ==
+             ST_OK);
+      ASSERT(test_st_policy_eval(policies[0], command, &reference) == ST_OK);
       ASSERT(suggestions_equal(&reference, &compacted));
     }
   }
@@ -1171,8 +1247,8 @@ static int test_branching_suggestions_are_lifecycle_independent(void) {
          st_policy_load(loaded, path, true) == ST_OK);
   st_eval_result_t reference = {0};
   st_eval_result_t loaded_result = {0};
-  ASSERT(st_policy_eval(policies[0], command, &reference) == ST_OK);
-  ASSERT(st_policy_eval(loaded, command, &loaded_result) == ST_OK);
+  ASSERT(test_st_policy_eval(policies[0], command, &reference) == ST_OK);
+  ASSERT(test_st_policy_eval(loaded, command, &loaded_result) == ST_OK);
   ASSERT(suggestions_equal(&reference, &loaded_result));
 
   st_policy_free(loaded);
@@ -1190,12 +1266,13 @@ static int test_eval_allocation_failures_clear_result(void) {
   st_policy_ctx_t *ctx = st_policy_ctx_new();
   st_policy_t *policy = ctx ? st_policy_new(ctx) : NULL;
   ASSERT(ctx != NULL && policy != NULL);
-  ASSERT(st_policy_add(policy, "docker run -d nginx") == ST_OK);
-  ASSERT(st_policy_add(policy, "docker run -it ubuntu") == ST_OK);
+  ASSERT(test_st_policy_add(policy, "docker run -d nginx") == ST_OK);
+  ASSERT(test_st_policy_add(policy, "docker run -it ubuntu") == ST_OK);
 
   st_test_alloc_reset();
   st_eval_result_t probe = {0};
-  ASSERT(st_policy_eval(policy, "docker exec -it container", &probe) == ST_OK);
+  ASSERT(test_st_policy_eval(policy, "docker exec -it container", &probe) ==
+         ST_OK);
   size_t allocations = st_test_alloc_count();
   ASSERT(allocations > 0);
 
@@ -1207,7 +1284,7 @@ static int test_eval_allocation_failures_clear_result(void) {
                                .error = ST_ERR_FAILED};
     st_test_alloc_fail_at(fail_at);
     st_error_t error =
-        st_policy_eval(policy, "docker exec -it container", &result);
+        test_st_policy_eval(policy, "docker exec -it container", &result);
     st_test_alloc_reset();
     if (error == ST_ERR_MEMORY) {
       observed_failure = true;
@@ -1262,16 +1339,16 @@ static int test_context_and_compaction_transitions(void) {
   st_policy_t *p1 = st_policy_new(ctx);
   ASSERT(p1 != NULL);
   ASSERT(st_policy_ctx_is_exclusive(ctx));
-  ASSERT(st_policy_add(p1, "git status") == ST_OK);
-  ASSERT(st_policy_add(p1, "git commit -m *") == ST_OK);
-  ASSERT(st_policy_add(p1, "ls -la") == ST_OK);
+  ASSERT(test_st_policy_add(p1, "git status") == ST_OK);
+  ASSERT(test_st_policy_add(p1, "git commit -m *") == ST_OK);
+  ASSERT(test_st_policy_add(p1, "ls -la") == ST_OK);
   ASSERT(st_policy_ctx_reset(ctx) == ST_ERR_INVALID);
   ASSERT(st_policy_ctx_compact(ctx) == ST_ERR_INVALID);
 
   st_policy_t *p2 = st_policy_new(ctx);
   ASSERT(p2 != NULL);
   ASSERT(!st_policy_ctx_is_exclusive(ctx));
-  ASSERT(st_policy_add(p2, "docker ps") == ST_OK);
+  ASSERT(test_st_policy_add(p2, "docker ps") == ST_OK);
   ASSERT(st_policy_compact(p1) == ST_ERR_INVALID);
   ASSERT(policy_matches(p1, "git commit -m fix", true));
   ASSERT(policy_matches(p2, "docker ps", true));
@@ -1293,7 +1370,7 @@ static int test_context_and_compaction_transitions(void) {
   ASSERT(second != NULL && strcmp(second, "reused") == 0);
   p1 = st_policy_new(ctx);
   ASSERT(p1 != NULL);
-  ASSERT(st_policy_add(p1, "new policy") == ST_OK);
+  ASSERT(test_st_policy_add(p1, "new policy") == ST_OK);
   ASSERT(policy_matches(p1, "new policy", true));
   st_policy_free(p1);
   st_policy_ctx_free(ctx);
@@ -1397,7 +1474,7 @@ static int test_context_and_policy_construction_failures(void) {
              NULL);
       continue;
     }
-    ASSERT(st_policy_add(policy, "constructed safely") == ST_OK);
+    ASSERT(test_st_policy_add(policy, "constructed safely") == ST_OK);
     st_policy_free(policy);
   }
   ASSERT(policy_failure_observed);
@@ -1409,7 +1486,7 @@ static int test_policy_contract_matrix(void) {
   st_policy_ctx_t *ctx = st_policy_ctx_new();
   st_policy_t *policy = ctx ? st_policy_new(ctx) : NULL;
   ASSERT(ctx != NULL && policy != NULL);
-  ASSERT(st_policy_remove(policy, "missing") == ST_OK);
+  ASSERT(test_st_policy_remove(policy, "missing") == ST_OK);
   ASSERT(st_policy_memory_usage(NULL) == 0);
   ASSERT(st_policy_working_set(NULL) == 0);
   ASSERT(st_policy_state_count(NULL) == 0);
@@ -1417,7 +1494,7 @@ static int test_policy_contract_matrix(void) {
   st_policy_get_stats(NULL, &untouched_stats);
   ASSERT(untouched_stats.eval_count == 7);
   st_policy_get_stats(policy, NULL);
-  ASSERT(st_policy_add(policy, "git status") == ST_OK);
+  ASSERT(test_st_policy_add(policy, "git status") == ST_OK);
   ASSERT(st_policy_count(policy) == 1);
   ASSERT(st_policy_merge(policy, policy) == ST_OK);
   ASSERT(st_policy_count(policy) == 1);
@@ -1453,8 +1530,8 @@ static int test_pattern_validation_matrix(void) {
     st_policy_ctx_t *ctx = st_policy_ctx_new();
     st_policy_t *policy = st_policy_new(ctx);
     ASSERT(policy != NULL);
-    ASSERT(st_validate_pattern(cases[i].pattern, NULL) == cases[i].error);
-    ASSERT(st_policy_add(policy, cases[i].pattern) == cases[i].error);
+    ASSERT(test_st_validate_pattern(cases[i].pattern, NULL) == cases[i].error);
+    ASSERT(test_st_policy_add(policy, cases[i].pattern) == cases[i].error);
     ASSERT(st_policy_count(policy) == (cases[i].error == ST_OK));
     if (cases[i].probe && !policy_matches(policy, cases[i].probe, true)) {
       printf("  validation case %zu did not match probe '%s'\n", i,
@@ -1468,28 +1545,28 @@ static int test_pattern_validation_matrix(void) {
   /* The metadata-producing path must preserve exact token text and base type,
    * while validation failures clear the entire output structure. */
   st_pattern_info_t info;
-  ASSERT(st_validate_pattern("cat #size.MiB", &info) == ST_OK);
+  ASSERT(test_st_validate_pattern("cat #size.MiB", &info) == ST_OK);
   ASSERT(info.token_count == 2);
   ASSERT_STR_EQ(info.token_texts[0], "cat");
   ASSERT(info.token_types[0] == ST_TYPE_LITERAL);
   ASSERT_STR_EQ(info.token_texts[1], "#size.MiB");
   ASSERT(info.token_types[1] == ST_TYPE_SIZE);
   memset(&info, 0xa5, sizeof(info));
-  ASSERT(st_validate_pattern("dd #size.XX", &info) == ST_ERR_INVALID);
+  ASSERT(test_st_validate_pattern("dd #size.XX", &info) == ST_ERR_INVALID);
   ASSERT(info.token_count == 0);
   for (size_t i = 0; i < ST_MAX_CMD_TOKENS; i++)
     ASSERT(info.token_texts[i][0] == '\0' && info.token_types[i] == 0);
 
-  char too_long[ST_MAX_PATTERN_LEN + 1];
+  char too_long[ST_MAX_NETPATTERN_LEN + 1];
   memset(too_long, 'x', sizeof(too_long) - 1);
   too_long[sizeof(too_long) - 1] = '\0';
   memset(&info, 0xa5, sizeof(info));
-  ASSERT(st_validate_pattern(too_long, &info) == ST_ERR_INVALID);
+  ASSERT(test_st_validate_pattern(too_long, &info) == ST_ERR_INVALID);
   ASSERT(info.token_count == 0 && info.token_texts[0][0] == '\0');
   st_policy_ctx_t *limit_ctx = st_policy_ctx_new();
   st_policy_t *limit_policy = st_policy_new(limit_ctx);
   ASSERT(limit_ctx != NULL && limit_policy != NULL);
-  ASSERT(st_policy_add(limit_policy, too_long) == ST_ERR_INVALID);
+  ASSERT(test_st_policy_add(limit_policy, too_long) == ST_ERR_INVALID);
   ASSERT(st_policy_count(limit_policy) == 0);
 
   char too_long_token[ST_MAX_TOKEN_LEN + 3];
@@ -1497,8 +1574,8 @@ static int test_pattern_validation_matrix(void) {
   too_long_token[1] = ' ';
   memset(too_long_token + 2, 'y', ST_MAX_TOKEN_LEN);
   too_long_token[ST_MAX_TOKEN_LEN + 2] = '\0';
-  ASSERT(st_validate_pattern(too_long_token, NULL) == ST_ERR_INVALID);
-  ASSERT(st_policy_add(limit_policy, too_long_token) == ST_ERR_INVALID);
+  ASSERT(test_st_validate_pattern(too_long_token, NULL) == ST_ERR_INVALID);
+  ASSERT(test_st_policy_add(limit_policy, too_long_token) == ST_ERR_INVALID);
   ASSERT(st_policy_count(limit_policy) == 0);
 
   char too_many[(ST_MAX_CMD_TOKENS + 1) * 2 + 1];
@@ -1508,13 +1585,14 @@ static int test_pattern_validation_matrix(void) {
     too_many[used++] = ' ';
   }
   too_many[used - 1] = '\0';
-  ASSERT(st_validate_pattern(too_many, NULL) == ST_ERR_INVALID);
-  ASSERT(st_policy_add(limit_policy, too_many) == ST_ERR_INVALID);
+  ASSERT(test_st_validate_pattern(too_many, NULL) == ST_ERR_INVALID);
+  ASSERT(test_st_policy_add(limit_policy, too_many) == ST_ERR_INVALID);
   ASSERT(st_policy_count(limit_policy) == 0);
 
-  ASSERT(st_policy_add(limit_policy, "preserved pattern") == ST_OK);
+  ASSERT(test_st_policy_add(limit_policy, "preserved pattern") == ST_OK);
   const char *hostile_batch[] = {"new pattern", "bad\npattern"};
-  ASSERT(st_policy_batch_add(limit_policy, hostile_batch, 2) == ST_ERR_INVALID);
+  ASSERT(test_st_policy_batch_add(limit_policy, hostile_batch, 2) ==
+         ST_ERR_INVALID);
   ASSERT(st_policy_count(limit_policy) == 1);
   ASSERT(policy_matches(limit_policy, "preserved pattern", true));
   ASSERT(policy_matches(limit_policy, "new pattern", false));
@@ -1534,9 +1612,9 @@ static int test_dot_export(void) {
   st_policy_ctx_t *ctx = st_policy_ctx_new();
   st_policy_t *policy = st_policy_new(ctx);
   ASSERT(policy != NULL);
-  ASSERT(st_policy_add(policy, "git status") == ST_OK);
-  ASSERT(st_policy_add(policy, "git commit -m *") == ST_OK);
-  ASSERT(st_policy_add(policy, "echo 'a\"b'") == ST_OK);
+  ASSERT(test_st_policy_add(policy, "git status") == ST_OK);
+  ASSERT(test_st_policy_add(policy, "git commit -m *") == ST_OK);
+  ASSERT(test_st_policy_add(policy, "echo \"a\\\"b\"") == ST_OK);
   ASSERT(st_policy_dump_dot(NULL, path) == ST_ERR_INVALID);
   ASSERT(st_policy_dump_dot(policy, NULL) == ST_ERR_INVALID);
   ASSERT(st_policy_dump_dot(policy, path) == ST_OK);
@@ -1565,8 +1643,8 @@ static int test_dry_run_simulate(void) {
   st_policy_ctx_t *ctx = st_policy_ctx_new();
   st_policy_t *policy = st_policy_new(ctx);
 
-  ASSERT_OK(st_policy_add(policy, "git #w"));
-  ASSERT_OK(st_policy_add(policy, "cat #size.MiB"));
+  ASSERT_OK(test_st_policy_add(policy, "git #w"));
+  ASSERT_OK(test_st_policy_add(policy, "cat #size.MiB"));
 
   static const struct {
     const char *proposal;
@@ -1579,27 +1657,33 @@ static int test_dry_run_simulate(void) {
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
     bool redundant = !cases[i].redundant;
     const char *conflict = (const char *)1;
-    ASSERT(st_policy_simulate_add(policy, cases[i].proposal, &redundant,
-                                  &conflict) == ST_OK);
+    char *proposal = NULL;
+    ASSERT(st_netpattern_from_cpl(cases[i].proposal, &proposal) == ST_OK);
+    ASSERT(st_policy_simulate_add_netpattern(policy, proposal, &redundant,
+                                             &conflict) == ST_OK);
+    free(proposal);
     ASSERT(redundant == cases[i].redundant);
     ASSERT((!conflict && !cases[i].conflict) ||
            (conflict && cases[i].conflict &&
-            strcmp(conflict, cases[i].conflict) == 0));
+            pattern_is_cpl(conflict, cases[i].conflict)));
   }
 
   bool redundant_without_conflict = false;
-  ASSERT(st_policy_simulate_add(policy, "git status",
-                                &redundant_without_conflict, NULL) == ST_OK);
+  char *proposal = NULL;
+  ASSERT(st_netpattern_from_cpl("git status", &proposal) == ST_OK);
+  ASSERT(st_policy_simulate_add_netpattern(
+             policy, proposal, &redundant_without_conflict, NULL) == ST_OK);
   ASSERT(!redundant_without_conflict);
 
   bool redundant = true;
   const char *conflict = (const char *)1;
-  ASSERT(st_policy_simulate_add(policy, "", &redundant, &conflict) ==
-         ST_ERR_INVALID);
+  ASSERT(st_policy_simulate_add_netpattern(policy, "", &redundant, &conflict) ==
+         ST_ERR_FORMAT);
   ASSERT(!redundant && conflict == NULL);
-  ASSERT(st_policy_simulate_add(policy, "git status", NULL, &conflict) ==
+  ASSERT(st_policy_simulate_add_netpattern(policy, proposal, NULL, &conflict) ==
          ST_ERR_INVALID);
   ASSERT(conflict == NULL);
+  free(proposal);
 
   st_policy_free(policy);
   st_policy_ctx_free(ctx);
@@ -1612,9 +1696,9 @@ static int test_statistics_transitions(void) {
   st_policy_ctx_t *ctx = st_policy_ctx_new();
   st_policy_t *policy = st_policy_new(ctx);
   ASSERT(policy != NULL);
-  ASSERT(st_policy_add(policy, "git status") == ST_OK);
-  ASSERT(st_policy_add(policy, "ls -la") == ST_OK);
-  ASSERT(st_policy_add(policy, "docker ps") == ST_OK);
+  ASSERT(test_st_policy_add(policy, "git status") == ST_OK);
+  ASSERT(test_st_policy_add(policy, "ls -la") == ST_OK);
+  ASSERT(test_st_policy_add(policy, "docker ps") == ST_OK);
 
   st_policy_stats_t stats = {0};
   st_policy_get_stats(policy, &stats);
@@ -1626,7 +1710,7 @@ static int test_statistics_transitions(void) {
   static const char *commands[] = {"git status", "ls -la", "docker ps"};
   for (size_t i = 0; i < sizeof(commands) / sizeof(commands[0]); i++) {
     st_eval_result_t result = {0};
-    ASSERT(st_policy_eval(policy, commands[i], &result) == ST_OK);
+    ASSERT(test_st_policy_eval(policy, commands[i], &result) == ST_OK);
     ASSERT(result.matches);
   }
 
@@ -1637,7 +1721,7 @@ static int test_statistics_transitions(void) {
   ASSERT(stats.suggestion_count == 0);
 
   st_eval_result_t result = {0};
-  ASSERT(st_policy_eval(policy, "unknown cmd", &result) == ST_OK);
+  ASSERT(test_st_policy_eval(policy, "unknown cmd", &result) == ST_OK);
   ASSERT(!result.matches);
   st_policy_get_stats(policy, &stats);
   ASSERT(stats.eval_count == 4);
@@ -1645,7 +1729,7 @@ static int test_statistics_transitions(void) {
   ASSERT(stats.suggestion_count == result.suggestion_count);
   ASSERT(stats.suggestion_count > 0);
 
-  ASSERT(st_policy_eval(policy, "unknown cmd", NULL) == ST_OK);
+  ASSERT(test_st_policy_eval(policy, "unknown cmd", NULL) == ST_OK);
   st_policy_get_stats(policy, &stats);
   ASSERT(stats.eval_count == 5);
   ASSERT(stats.trie_walk_count == 4);
@@ -1663,19 +1747,19 @@ static int test_filter_rebuild_lazy_trigger(void) {
   st_policy_t *policy = st_policy_new(ctx);
 
   /* Add patterns - triggers filter build */
-  ASSERT_OK(st_policy_add(policy, "git status"));
-  ASSERT_OK(st_policy_add(policy, "git commit -m *"));
+  ASSERT_OK(test_st_policy_add(policy, "git status"));
+  ASSERT_OK(test_st_policy_add(policy, "git commit -m *"));
 
   st_policy_stats_t stats1;
   st_policy_get_stats(policy, &stats1);
 
   /* Add more patterns - epoch changes, next eval triggers rebuild */
-  ASSERT_OK(st_policy_add(policy, "ls -la"));
-  ASSERT_OK(st_policy_add(policy, "docker run *"));
+  ASSERT_OK(test_st_policy_add(policy, "ls -la"));
+  ASSERT_OK(test_st_policy_add(policy, "docker run *"));
 
   /* First eval should trigger rebuild */
   st_eval_result_t result;
-  ASSERT_OK(st_policy_eval(policy, "docker ps", &result));
+  ASSERT_OK(test_st_policy_eval(policy, "docker ps", &result));
 
   st_policy_stats_t stats2;
   st_policy_get_stats(policy, &stats2);
@@ -1684,7 +1768,7 @@ static int test_filter_rebuild_lazy_trigger(void) {
   ASSERT(stats2.filter_rebuild_count > stats1.filter_rebuild_count);
 
   /* Second eval should not trigger rebuild */
-  ASSERT_OK(st_policy_eval(policy, "docker ps", &result));
+  ASSERT_OK(test_st_policy_eval(policy, "docker ps", &result));
 
   st_policy_stats_t stats3;
   st_policy_get_stats(policy, &stats3);
@@ -1701,9 +1785,9 @@ static int test_policy_clear(void) {
   st_policy_ctx_t *ctx = st_policy_ctx_new();
   st_policy_t *policy = st_policy_new(ctx);
 
-  ASSERT_OK(st_policy_add(policy, "git status"));
-  ASSERT_OK(st_policy_add(policy, "git commit -m *"));
-  ASSERT_OK(st_policy_add(policy, "ls -la"));
+  ASSERT_OK(test_st_policy_add(policy, "git status"));
+  ASSERT_OK(test_st_policy_add(policy, "git commit -m *"));
+  ASSERT_OK(test_st_policy_add(policy, "ls -la"));
   ASSERT(st_policy_count(policy) == 3);
 
   /* Clear must not need fresh storage to restore the empty root. */
@@ -1715,16 +1799,16 @@ static int test_policy_clear(void) {
 
   /* Policy should still work after clear */
   st_eval_result_t result;
-  err = st_policy_eval(policy, "git status", &result);
+  err = test_st_policy_eval(policy, "git status", &result);
   ASSERT(err == ST_OK);
   ASSERT(!result.matches); /* No patterns, no match */
 
   /* Should be able to add new patterns */
-  err = st_policy_add(policy, "docker ps");
+  err = test_st_policy_add(policy, "docker ps");
   ASSERT(err == ST_OK);
   ASSERT(st_policy_count(policy) == 1);
 
-  err = st_policy_eval(policy, "docker ps", &result);
+  err = test_st_policy_eval(policy, "docker ps", &result);
   ASSERT(err == ST_OK);
   ASSERT(result.matches);
 
@@ -1736,11 +1820,11 @@ static int test_policy_clear(void) {
 static int policy_eval_is(st_policy_t *policy, const char *command,
                           const char *expected) {
   st_eval_result_t result;
-  if (st_policy_eval(policy, command, &result) != ST_OK ||
+  if (test_st_policy_eval(policy, command, &result) != ST_OK ||
       result.matches != (expected != NULL))
     return 0;
   return expected ? result.matching_pattern &&
-                        strcmp(result.matching_pattern, expected) == 0
+                        pattern_is_cpl(result.matching_pattern, expected)
                   : result.matching_pattern == NULL;
 }
 
@@ -1778,10 +1862,29 @@ static int test_literal_and_wildcard_semantics(void) {
   st_policy_t *policy = st_policy_new(ctx);
   ASSERT(ctx && policy);
   for (size_t i = 0; i < sizeof(patterns) / sizeof(patterns[0]); i++)
-    ASSERT(st_policy_add(policy, patterns[i]) == ST_OK);
+    ASSERT(test_st_policy_add(policy, patterns[i]) == ST_OK);
   ASSERT(st_policy_count(policy) == sizeof(patterns) / sizeof(patterns[0]));
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++)
     ASSERT(policy_eval_is(policy, cases[i].command, cases[i].expected));
+
+  static const char *const quoted[] = {"echo \"#n\"", "printf \"\"",
+                                       "say \"two words\""};
+  for (size_t i = 0; i < sizeof(quoted) / sizeof(quoted[0]); i++) {
+    char *netpattern = NULL;
+    ASSERT(st_netpattern_from_cpl(quoted[i], &netpattern) == ST_OK);
+    ASSERT(test_st_policy_add(policy, netpattern) == ST_OK);
+    free(netpattern);
+  }
+  st_eval_result_t quoted_result = {0};
+  ASSERT(test_st_policy_eval(policy, "echo #n", &quoted_result) == ST_OK &&
+         quoted_result.matches);
+  ASSERT(test_st_policy_eval(policy, "echo 42", &quoted_result) == ST_OK &&
+         !quoted_result.matches);
+  ASSERT(test_st_policy_eval(policy, "printf ''", &quoted_result) == ST_OK &&
+         quoted_result.matches);
+  ASSERT(test_st_policy_eval(policy, "say 'two words'", &quoted_result) ==
+             ST_OK &&
+         quoted_result.matches);
   ASSERT(st_policy_compact(policy) == ST_OK);
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++)
     ASSERT(policy_eval_is(policy, cases[i].command, cases[i].expected));
@@ -1807,27 +1910,27 @@ static int test_param_subsumption_matrix(void) {
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
     st_policy_t *policy = st_policy_new(ctx);
     ASSERT(policy != NULL);
-    ASSERT_OK(st_policy_add(policy, cases[i].specific));
-    ASSERT_OK(st_policy_add(policy, cases[i].generic));
+    ASSERT_OK(test_st_policy_add(policy, cases[i].specific));
+    ASSERT_OK(test_st_policy_add(policy, cases[i].generic));
     ASSERT(st_policy_count(policy) == 1);
     ASSERT_OK(st_policy_compact(policy));
     ASSERT(st_policy_count(policy) == 1);
 
     st_eval_result_t result = {0};
-    ASSERT_OK(st_policy_eval(policy, cases[i].probe, &result));
+    ASSERT_OK(test_st_policy_eval(policy, cases[i].probe, &result));
     ASSERT(result.matches && result.matching_pattern != NULL);
-    ASSERT_STR_EQ(result.matching_pattern, cases[i].generic);
-    ASSERT_OK(st_policy_remove(policy, cases[i].specific));
+    ASSERT(pattern_is_cpl(result.matching_pattern, cases[i].generic));
+    ASSERT_OK(test_st_policy_remove(policy, cases[i].specific));
     ASSERT(st_policy_count(policy) == 1);
     ASSERT(policy_eval_is(policy, cases[i].probe, cases[i].generic));
     st_policy_free(policy);
   }
   st_pattern_info_t alias_info = {0};
-  ASSERT(st_validate_pattern("container #uuid.5", &alias_info) == ST_OK);
+  ASSERT(test_st_validate_pattern("container #uuid.5", &alias_info) == ST_OK);
   ASSERT_STR_EQ(alias_info.token_texts[1], "#uuid.v5");
   st_policy_t *alias_policy = st_policy_new(ctx);
   ASSERT(alias_policy != NULL);
-  ASSERT_OK(st_policy_add(alias_policy, "container #uuid.5"));
+  ASSERT_OK(test_st_policy_add(alias_policy, "container #uuid.5"));
   ASSERT(policy_eval_is(alias_policy,
                         "container 4be33a94-0c5b-5516-a922-d07dedd59172",
                         "container #uuid.v5"));
@@ -1835,22 +1938,22 @@ static int test_param_subsumption_matrix(void) {
 
   st_policy_t *sizes = st_policy_new(ctx);
   ASSERT(sizes != NULL);
-  ASSERT_OK(st_policy_add(sizes, "dd bs= #size.MiB"));
-  ASSERT_OK(st_policy_add(sizes, "dd bs= #size.G"));
+  ASSERT_OK(test_st_policy_add(sizes, "dd bs= #size.MiB"));
+  ASSERT_OK(test_st_policy_add(sizes, "dd bs= #size.G"));
   ASSERT_OK(st_policy_compact(sizes));
   ASSERT(st_policy_count(sizes) == 2);
   ASSERT(policy_eval_is(sizes, "dd bs=10MiB", "dd bs= #size.MiB"));
   ASSERT(policy_eval_is(sizes, "dd bs=2G", "dd bs= #size.G"));
   ASSERT(policy_eval_is(sizes, "dd bs=10K", NULL));
-  ASSERT_OK(st_policy_add(sizes, "dd bs= #size"));
+  ASSERT_OK(test_st_policy_add(sizes, "dd bs= #size"));
   ASSERT(st_policy_count(sizes) == 1);
   ASSERT(policy_eval_is(sizes, "dd bs=10K", "dd bs= #size"));
   st_policy_free(sizes);
 
   st_policy_t *coexisting = st_policy_new(ctx);
   ASSERT(coexisting != NULL);
-  ASSERT_OK(st_policy_add(coexisting, "container #uuid.v4"));
-  ASSERT_OK(st_policy_add(coexisting, "container #uuid.v5"));
+  ASSERT_OK(test_st_policy_add(coexisting, "container #uuid.v4"));
+  ASSERT_OK(test_st_policy_add(coexisting, "container #uuid.v5"));
   ASSERT(st_policy_count(coexisting) == 2);
   ASSERT(policy_eval_is(coexisting,
                         "container 550e8400-e29b-41d4-a716-446655440000",
@@ -1920,21 +2023,23 @@ static int test_param_match_matrix(void) {
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
     st_policy_t *policy = st_policy_new(ctx);
     ASSERT(policy != NULL);
-    ASSERT(st_policy_add(policy, cases[i].pattern) == ST_OK);
+    ASSERT(test_st_policy_add(policy, cases[i].pattern) == ST_OK);
     ASSERT(st_policy_count(policy) == 1);
     for (size_t j = 0; j < 3 && cases[i].accepted[j]; j++) {
       st_eval_result_t result;
-      ASSERT(st_policy_eval(policy, cases[i].accepted[j], &result) == ST_OK);
+      ASSERT(test_st_policy_eval(policy, cases[i].accepted[j], &result) ==
+             ST_OK);
       if (!result.matches) {
         printf("  Pattern '%s' rejected '%s'\n", cases[i].pattern,
                cases[i].accepted[j]);
         return 0;
       }
-      ASSERT_STR_EQ(result.matching_pattern, cases[i].pattern);
+      ASSERT(pattern_is_cpl(result.matching_pattern, cases[i].pattern));
     }
     for (size_t j = 0; j < 2 && cases[i].rejected[j]; j++) {
       st_eval_result_t result;
-      ASSERT(st_policy_eval(policy, cases[i].rejected[j], &result) == ST_OK);
+      ASSERT(test_st_policy_eval(policy, cases[i].rejected[j], &result) ==
+             ST_OK);
       if (result.matches) {
         printf("  Pattern '%s' unexpectedly accepted '%s'\n", cases[i].pattern,
                cases[i].rejected[j]);
@@ -2004,11 +2109,12 @@ static int test_param_validation_matrix(void) {
   ASSERT(ctx != NULL);
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
     st_pattern_info_t info;
-    ASSERT(st_validate_pattern(cases[i].pattern, &info) == cases[i].expected);
+    ASSERT(test_st_validate_pattern(cases[i].pattern, &info) ==
+           cases[i].expected);
 
     st_policy_t *policy = st_policy_new(ctx);
     ASSERT(policy != NULL);
-    ASSERT(st_policy_add(policy, cases[i].pattern) == cases[i].expected);
+    ASSERT(test_st_policy_add(policy, cases[i].pattern) == cases[i].expected);
     ASSERT(st_policy_count(policy) == (cases[i].expected == ST_OK ? 1 : 0));
     st_policy_free(policy);
   }
@@ -2021,7 +2127,7 @@ static int test_param_validation_matrix(void) {
 static int add_patterns(st_policy_t *policy, const char *const *patterns,
                         size_t count) {
   for (size_t i = 0; i < count; i++)
-    if (st_policy_add(policy, patterns[i]) != ST_OK)
+    if (test_st_policy_add(policy, patterns[i]) != ST_OK)
       return 0;
   return 1;
 }
@@ -2166,7 +2272,7 @@ static int string_set_is(char *const *actual, size_t actual_count,
   for (size_t i = 0; i < expected_count; i++) {
     int found = 0;
     for (size_t j = 0; j < actual_count; j++)
-      if (strcmp(actual[j], expected[i]) == 0) {
+      if (pattern_is_cpl(actual[j], expected[i])) {
         found = 1;
         break;
       }
@@ -2370,7 +2476,7 @@ static int test_incremental_subsumption_matrix(void) {
     st_policy_t *policy = st_policy_new(ctx);
     ASSERT(policy != NULL);
     for (size_t j = 0; j < cases[i].addition_count; j++) {
-      ASSERT(st_policy_add(policy, cases[i].additions[j]) == ST_OK);
+      ASSERT(test_st_policy_add(policy, cases[i].additions[j]) == ST_OK);
       ASSERT(st_policy_count(policy) == cases[i].counts[j]);
     }
     for (size_t j = 0; j < cases[i].probe_count; j++)
@@ -2391,12 +2497,12 @@ static int test_incr_stress(void) {
   for (int i = 0; i < 100; i++) {
     char pattern[64];
     snprintf(pattern, sizeof(pattern), "cmd arg%d", i);
-    ASSERT(st_policy_add(policy, pattern) == ST_OK);
+    ASSERT(test_st_policy_add(policy, pattern) == ST_OK);
   }
   ASSERT(st_policy_count(policy) == 100);
 
   /* Adding a wildcard subsumes all 100 literals */
-  st_error_t err = st_policy_add(policy, "cmd *");
+  st_error_t err = test_st_policy_add(policy, "cmd *");
   ASSERT(err == ST_OK);
   ASSERT(st_policy_count(policy) == 1);
 
@@ -2416,14 +2522,14 @@ static int test_incremental_batch_remove_readd(void) {
   ASSERT(policy != NULL);
 
   const char *batch[] = {"git status", "git commit", "git pull", "git *"};
-  ASSERT(st_policy_batch_add(policy, batch, 4) == ST_OK);
+  ASSERT(test_st_policy_batch_add(policy, batch, 4) == ST_OK);
   ASSERT(st_policy_count(policy) == 1);
   ASSERT(policy_eval_is(policy, "git status", "git *"));
 
-  ASSERT(st_policy_remove(policy, "git *") == ST_OK);
+  ASSERT(test_st_policy_remove(policy, "git *") == ST_OK);
   ASSERT(st_policy_count(policy) == 0);
 
-  ASSERT(st_policy_add(policy, "git status") == ST_OK);
+  ASSERT(test_st_policy_add(policy, "git status") == ST_OK);
   ASSERT(st_policy_count(policy) == 1);
   ASSERT(policy_eval_is(policy, "git status", "git status"));
 
@@ -2436,26 +2542,26 @@ static int test_batch_add_is_atomic(void) {
   st_policy_ctx_t *ctx = st_policy_ctx_new();
   st_policy_t *policy = ctx ? st_policy_new(ctx) : NULL;
   ASSERT(policy != NULL);
-  ASSERT(st_policy_add(policy, "git status") == ST_OK);
-  ASSERT(st_policy_batch_add(NULL, (const char *[]){"invalid"}, 1) ==
+  ASSERT(test_st_policy_add(policy, "git status") == ST_OK);
+  ASSERT(test_st_policy_batch_add(NULL, (const char *[]){"invalid"}, 1) ==
          ST_ERR_INVALID);
-  ASSERT(st_policy_batch_add(policy, NULL, 0) == ST_ERR_INVALID);
-  ASSERT(st_policy_batch_add(policy, NULL, 1) == ST_ERR_INVALID);
+  ASSERT(test_st_policy_batch_add(policy, NULL, 0) == ST_ERR_INVALID);
+  ASSERT(test_st_policy_batch_add(policy, NULL, 1) == ST_ERR_INVALID);
 
   const char *invalid_middle[] = {"docker ps", NULL, "ls -la"};
-  ASSERT(st_policy_batch_add(policy, invalid_middle, 3) == ST_ERR_INVALID);
+  ASSERT(test_st_policy_batch_add(policy, invalid_middle, 3) == ST_ERR_INVALID);
   ASSERT(st_policy_count(policy) == 1);
   ASSERT(policy_eval_is(policy, "git status", "git status"));
   ASSERT(policy_eval_is(policy, "docker ps", NULL));
   ASSERT(policy_eval_is(policy, "ls -la", NULL));
 
   const char *valid[] = {"docker ps", "git status", "cat #path"};
-  ASSERT(st_policy_batch_add(policy, valid, 3) == ST_OK);
+  ASSERT(test_st_policy_batch_add(policy, valid, 3) == ST_OK);
   ASSERT(st_policy_count(policy) == 3);
   ASSERT(policy_eval_is(policy, "docker ps", "docker ps"));
   ASSERT(policy_eval_is(policy, "cat /tmp/input", "cat #path"));
 
-  ASSERT(st_policy_batch_add(policy, valid, 0) == ST_ERR_INVALID);
+  ASSERT(test_st_policy_batch_add(policy, valid, 0) == ST_ERR_INVALID);
   st_policy_free(policy);
   st_policy_ctx_free(ctx);
   return 1;
@@ -2471,7 +2577,7 @@ static int test_batch_add_allocation_failures_are_atomic(void) {
   ASSERT(probe_context != NULL && probe_policy != NULL);
   ASSERT(add_patterns(probe_policy, initial, 3));
   st_test_alloc_reset();
-  ASSERT(st_policy_batch_add(probe_policy, batch, 3) == ST_OK);
+  ASSERT(test_st_policy_batch_add(probe_policy, batch, 3) == ST_OK);
   size_t allocations = st_test_alloc_count();
   ASSERT(allocations > 0);
   st_policy_free(probe_policy);
@@ -2487,7 +2593,7 @@ static int test_batch_add_allocation_failures_are_atomic(void) {
     ASSERT(add_patterns(policy, initial, 3));
     size_t before = st_policy_count(policy);
     st_test_alloc_fail_at(fail_at);
-    st_error_t err = st_policy_batch_add(policy, batch, 3);
+    st_error_t err = test_st_policy_batch_add(policy, batch, 3);
     st_test_alloc_reset();
     if (err == ST_ERR_MEMORY) {
       observed_failure = true;
@@ -2513,10 +2619,10 @@ static int test_add_allocation_failures_are_atomic(void) {
   st_policy_t *probe_policy =
       probe_context ? st_policy_new(probe_context) : NULL;
   ASSERT(probe_context != NULL && probe_policy != NULL);
-  ASSERT(st_policy_add(probe_policy, "copy /tmp/a") == ST_OK);
-  ASSERT(st_policy_add(probe_policy, "copy /tmp/b") == ST_OK);
+  ASSERT(test_st_policy_add(probe_policy, "copy /tmp/a") == ST_OK);
+  ASSERT(test_st_policy_add(probe_policy, "copy /tmp/b") == ST_OK);
   st_test_alloc_reset();
-  ASSERT(st_policy_add(probe_policy, "copy #path") == ST_OK);
+  ASSERT(test_st_policy_add(probe_policy, "copy #path") == ST_OK);
   size_t allocations = st_test_alloc_count();
   ASSERT(allocations > 0);
   st_policy_free(probe_policy);
@@ -2528,11 +2634,11 @@ static int test_add_allocation_failures_are_atomic(void) {
     st_policy_ctx_t *context = st_policy_ctx_new();
     st_policy_t *policy = context ? st_policy_new(context) : NULL;
     ASSERT(policy != NULL);
-    ASSERT(st_policy_add(policy, "copy /tmp/a") == ST_OK);
-    ASSERT(st_policy_add(policy, "copy /tmp/b") == ST_OK);
+    ASSERT(test_st_policy_add(policy, "copy /tmp/a") == ST_OK);
+    ASSERT(test_st_policy_add(policy, "copy /tmp/b") == ST_OK);
 
     st_test_alloc_fail_at(fail_at);
-    st_error_t err = st_policy_add(policy, "copy #path");
+    st_error_t err = test_st_policy_add(policy, "copy #path");
     st_test_alloc_reset();
     if (err == ST_ERR_MEMORY) {
       observed_failure = true;
@@ -2629,7 +2735,7 @@ static int test_token_variant_matrix(void) {
   char *edited_command =
       st_policy_apply_type_at(&empty, command_tokens, 1, 0, variants[0].type);
   ASSERT(edited_command != NULL);
-  ASSERT(st_validate_pattern(edited_command, NULL) == ST_OK);
+  ASSERT(test_st_validate_pattern(edited_command, NULL) == ST_OK);
   free(edited_command);
 
   const char *valid[] = {"cmd", "#w"};
@@ -2643,9 +2749,9 @@ static int test_token_variant_matrix(void) {
   ASSERT(st_policy_suggest_token_variants(&empty, with_null, 2, 1, variants) ==
          0);
   ASSERT(st_policy_suggest_token_variants(&empty, with_control, 2, 1,
-                                          variants) == 0);
+                                          variants) > 0);
   ASSERT(st_policy_suggest_token_variants(&empty, with_separator, 2, 1,
-                                          variants) == 0);
+                                          variants) > 0);
   const char *too_many_tokens[ST_MAX_CMD_TOKENS + 1];
   for (size_t i = 0; i < sizeof(too_many_tokens) / sizeof(too_many_tokens[0]);
        i++)
@@ -2661,15 +2767,16 @@ static int test_token_variant_matrix(void) {
 
   st_learner_t *learner = st_learner_new(1, 0.0);
   ASSERT(learner != NULL);
-  ASSERT(st_feed(learner, "git commit -m /first/path") == ST_OK);
-  ASSERT(st_feed(learner, "git commit -m /second/path") == ST_OK);
-  ASSERT(st_feed(learner, "git commit -m ../relative/path") == ST_OK);
-  ASSERT(st_feed(learner, "curl -X GET https://one.example") == ST_OK);
-  ASSERT(st_feed(learner, "curl -X POST https://two.example") == ST_OK);
-  ASSERT(st_feed(learner, "curl -X 42 https://number.example") == ST_OK);
-  ASSERT(st_feed(learner, "branch 42 /number/path") == ST_OK);
-  ASSERT(st_feed(learner, "branch https://example.test ../url/path") == ST_OK);
-  ASSERT(st_feed(learner, "branch 7 ../number/relative") == ST_OK);
+  ASSERT(test_st_feed(learner, "git commit -m /first/path") == ST_OK);
+  ASSERT(test_st_feed(learner, "git commit -m /second/path") == ST_OK);
+  ASSERT(test_st_feed(learner, "git commit -m ../relative/path") == ST_OK);
+  ASSERT(test_st_feed(learner, "curl -X GET https://one.example") == ST_OK);
+  ASSERT(test_st_feed(learner, "curl -X POST https://two.example") == ST_OK);
+  ASSERT(test_st_feed(learner, "curl -X 42 https://number.example") == ST_OK);
+  ASSERT(test_st_feed(learner, "branch 42 /number/path") == ST_OK);
+  ASSERT(test_st_feed(learner, "branch https://example.test ../url/path") ==
+         ST_OK);
+  ASSERT(test_st_feed(learner, "branch 7 ../number/relative") == ST_OK);
 
   const char *learned_path[] = {"git", "commit", "#sopt", "#p"};
   const char *narrow_path[] = {"git", "commit", "#sopt", "*"};
@@ -2697,7 +2804,7 @@ static int test_token_variant_matrix(void) {
   };
   for (size_t i = 0;
        i < sizeof(saturation_commands) / sizeof(saturation_commands[0]); i++)
-    ASSERT(st_feed(learner, saturation_commands[i]) == ST_OK);
+    ASSERT(test_st_feed(learner, saturation_commands[i]) == ST_OK);
   const char *saturated[] = {"probe", "#n"};
   size_t saturated_count =
       st_policy_suggest_token_variants(learner, saturated, 2, 1, variants);
@@ -2719,9 +2826,9 @@ static int test_token_variant_matrix(void) {
     ASSERT(permuted != NULL);
     for (size_t i = 0;
          i < sizeof(saturation_commands) / sizeof(saturation_commands[0]); i++)
-      ASSERT(
-          st_feed(permuted, saturation_commands[saturation_orders[order][i]]) ==
-          ST_OK);
+      ASSERT(test_st_feed(permuted,
+                          saturation_commands[saturation_orders[order][i]]) ==
+             ST_OK);
     st_token_variant_t reordered[ST_MAX_TOKEN_VARIANTS];
     size_t reordered_count =
         st_policy_suggest_token_variants(permuted, saturated, 2, 1, reordered);
@@ -2738,7 +2845,7 @@ static int test_token_variant_matrix(void) {
         st_policy_apply_type_at(learner, learned_path, 4, 3, variants[i].type);
     ASSERT(edited != NULL);
     st_pattern_info_t info;
-    ASSERT(st_validate_pattern(edited, &info) == ST_OK);
+    ASSERT(test_st_validate_pattern(edited, &info) == ST_OK);
     ASSERT(info.token_count == 4);
     free(edited);
   }
@@ -2802,7 +2909,7 @@ static int test_apply_type_matrix(void) {
   ASSERT(st_policy_apply_type_at(NULL, three, 3, 0, ST_TYPE_COUNT) == NULL);
   ASSERT(st_policy_apply_type_at(NULL, with_null, 2, 0, ST_TYPE_WORD) == NULL);
 
-  char oversized[ST_MAX_PATTERN_LEN];
+  char oversized[ST_MAX_NETPATTERN_LEN];
   memset(oversized, 'x', sizeof(oversized));
   oversized[sizeof(oversized) - 1] = '\0';
   const char *too_long[] = {oversized, "tail"};

@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "shelltype.h"
+#include "test_netargv.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -8,6 +9,16 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+
+static bool pattern_is_cpl(const char *actual, const char *cpl) {
+  if (!actual || !cpl)
+    return actual == cpl;
+  char *encoded = NULL;
+  bool equal = st_netpattern_from_cpl(cpl, &encoded) == ST_OK &&
+               strcmp(actual, encoded) == 0;
+  free(encoded);
+  return equal;
+}
 
 static const char *const patterns[] = {
     "git status",
@@ -190,10 +201,10 @@ static int cross_policy_matches_model(st_policy_t *actual, const bool *active,
           active[i] && (cross_patterns[i].matches & PROBE_BIT(probe)) ? 1u : 0u;
     const char *selected = reference_selected(active, probe);
     st_eval_result_t result = {0};
-    if (st_policy_eval(actual, cross_probes[probe], &result) != ST_OK ||
+    if (test_st_policy_eval(actual, cross_probes[probe], &result) != ST_OK ||
         result.matches != (selected != NULL) ||
         ((result.matching_pattern == NULL) != (selected == NULL)) ||
-        (selected && strcmp(result.matching_pattern, selected) != 0)) {
+        (selected && !pattern_is_cpl(result.matching_pattern, selected))) {
       fprintf(stderr, "cross seed %u step %zu probe %zu: eval differs\n", seed,
               step, probe);
       fprintf(stderr, "  actual=%s expected=%s\n",
@@ -204,8 +215,8 @@ static int cross_policy_matches_model(st_policy_t *actual, const bool *active,
 
     const char **matches = NULL;
     size_t match_count = 0;
-    if (st_policy_verify_all(actual, cross_probes[probe], &matches,
-                             &match_count) != ST_OK ||
+    if (test_st_policy_verify_all(actual, cross_probes[probe], &matches,
+                                  &match_count) != ST_OK ||
         match_count != expected_match_count) {
       st_policy_free_matches(matches, match_count);
       return 0;
@@ -216,7 +227,7 @@ static int cross_policy_matches_model(st_policy_t *actual, const bool *active,
         continue;
       bool found = false;
       for (size_t j = 0; j < match_count; j++)
-        found = found || strcmp(matches[j], cross_patterns[i].pattern) == 0;
+        found = found || pattern_is_cpl(matches[j], cross_patterns[i].pattern);
       if (!found) {
         st_policy_free_matches(matches, match_count);
         return 0;
@@ -244,17 +255,18 @@ static int run_cross_policy_model(const char *replace_path,
                       (sizeof(cross_patterns) / sizeof(cross_patterns[0]));
       uint32_t operation = random_next(&state) % 9;
       if (operation <= 1) {
-        if (st_policy_add(actual, cross_patterns[index].pattern) != ST_OK)
+        if (test_st_policy_add(actual, cross_patterns[index].pattern) != ST_OK)
           return 0;
         reference_add(active, index);
       } else if (operation == 2) {
-        if (st_policy_remove(actual, cross_patterns[index].pattern) != ST_OK)
+        if (test_st_policy_remove(actual, cross_patterns[index].pattern) !=
+            ST_OK)
           return 0;
         active[index] = false;
       } else if (operation == 3) {
         const char *batch[] = {cross_patterns[index].pattern,
                                cross_patterns[second].pattern};
-        if (st_policy_batch_add(actual, batch, 2) != ST_OK)
+        if (test_st_policy_batch_add(actual, batch, 2) != ST_OK)
           return 0;
         reference_add(active, index);
         reference_add(active, second);
@@ -273,8 +285,9 @@ static int run_cross_policy_model(const char *replace_path,
         st_policy_ctx_t *source_ctx = st_policy_ctx_new();
         st_policy_t *source = source_ctx ? st_policy_new(source_ctx) : NULL;
         if (!source ||
-            st_policy_add(source, cross_patterns[index].pattern) != ST_OK ||
-            st_policy_add(source, cross_patterns[second].pattern) != ST_OK)
+            test_st_policy_add(source, cross_patterns[index].pattern) !=
+                ST_OK ||
+            test_st_policy_add(source, cross_patterns[second].pattern) != ST_OK)
           return 0;
         st_error_t err;
         if (operation == 7) {
@@ -365,10 +378,10 @@ static int policy_matches_model(st_policy_t *actual, const bool *active,
   for (size_t i = 0; i < sizeof(probes) / sizeof(probes[0]); i++) {
     const char *expected = expected_pattern(active, i);
     st_eval_result_t result = {0};
-    if (st_policy_eval(actual, probes[i], &result) != ST_OK ||
+    if (test_st_policy_eval(actual, probes[i], &result) != ST_OK ||
         result.matches != (expected != NULL) ||
         ((result.matching_pattern == NULL) != (expected == NULL)) ||
-        (expected && strcmp(result.matching_pattern, expected) != 0)) {
+        (expected && !pattern_is_cpl(result.matching_pattern, expected))) {
       fprintf(stderr, "seed %u step %zu probe %zu: evaluation differs\n", seed,
               step, i);
       fprintf(stderr, "  actual=%s expected=%s\n",
@@ -378,10 +391,10 @@ static int policy_matches_model(st_policy_t *actual, const bool *active,
     }
     const char **matches = NULL;
     size_t match_count = 0;
-    if (st_policy_verify_all(actual, probes[i], &matches, &match_count) !=
+    if (test_st_policy_verify_all(actual, probes[i], &matches, &match_count) !=
             ST_OK ||
         match_count != (expected ? 1u : 0u) ||
-        (expected && strcmp(matches[0], expected) != 0)) {
+        (expected && !pattern_is_cpl(matches[0], expected))) {
       st_policy_free_matches(matches, match_count);
       return 0;
     }
@@ -417,12 +430,12 @@ int main(void) {
       switch (operation) {
       case 0:
       case 1:
-        if (st_policy_add(actual, patterns[index]) != ST_OK)
+        if (test_st_policy_add(actual, patterns[index]) != ST_OK)
           return 1;
         model_add(active, index);
         break;
       case 2:
-        if (st_policy_remove(actual, patterns[index]) != ST_OK)
+        if (test_st_policy_remove(actual, patterns[index]) != ST_OK)
           return 1;
         active[index] = false;
         break;
@@ -430,7 +443,7 @@ int main(void) {
         size_t second =
             random_next(&state) % (sizeof(patterns) / sizeof(patterns[0]));
         const char *batch[] = {patterns[index], patterns[second]};
-        if (st_policy_batch_add(actual, batch, 2) != ST_OK)
+        if (test_st_policy_batch_add(actual, batch, 2) != ST_OK)
           return 1;
         model_add(active, index);
         model_add(active, second);

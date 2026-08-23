@@ -56,8 +56,9 @@ typedef struct {
  *
  * Extracts canonical processed subcommands and separates shell logic. On
  * success, returned command metadata owns all text it refers to and remains
- * valid independently of command_line. `clean_command` is suitable for
- * st_classify(); it is not raw shell source. On failure, writable
+ * valid independently of command_line. `clean_command` is a human-readable
+ * canonical rendering; use shell_render_netargv() for an unambiguous machine
+ * interface. On failure, writable
  * outputs are set to NULL and zero.
  */
 shell_process_status_t shell_process_command(
@@ -77,6 +78,18 @@ void shell_free_command_infos(shell_command_info_t *infos, size_t count);
  */
 const char *shell_get_clean_command(shell_command_info_t *info);
 
+/** Decode one already-isolated shell word, assembling quote fragments and
+ * escapes. This is exposed for zero-copy parser consumers. */
+shell_process_status_t shell_decode_word(const char *text, size_t length,
+                                         char **decoded,
+                                         size_t *decoded_length);
+
+/** Encode one command's already-processed arguments as concatenated canonical
+ * netstrings. The caller owns *netargv. */
+shell_process_status_t
+shell_render_netargv(const shell_command_info_t *info,
+                     const shell_process_limits_t *limits, char **netargv);
+
 /**
  * Check if a command uses shell operators, redirections, or execution-bearing
  * substitutions that require shell-aware handling.
@@ -84,12 +97,12 @@ const char *shell_get_clean_command(shell_command_info_t *info);
 bool shell_has_dangerous_features(shell_command_info_t *info);
 
 /**
- * Parse command line and return canonical processed subcommands for downstream
- * classification, while reporting whether shell features are present for
- * caller-side handling. Quote fragments and escapes are already assembled;
- * consumers must not treat these strings as arbitrary shell source. The caller
- * owns each returned string and the containing array. On failure, writable
- * outputs are set to NULL, zero, and false.
+ * Compatibility API returning human-readable canonical processed subcommands.
+ * Quote fragments and escapes are assembled, but the rendering is not an
+ * unambiguous argv transport when values contain spaces or are empty. New
+ * machine consumers should use shell_extract_netargv_inputs(). The caller owns
+ * each returned string and the containing array. On failure, writable outputs
+ * are set to NULL, zero, and false.
  */
 shell_process_status_t shell_extract_dfa_inputs(
     const char *command_line, const shell_process_limits_t *limits,
@@ -97,6 +110,14 @@ shell_process_status_t shell_extract_dfa_inputs(
     size_t *dfa_input_count,  // Number of commands
     bool *has_shell_features  // True if shell features present
 );
+
+/** Parse a command line and return one canonical netstring argv per isolated
+ * subcommand. Existing clean-text extraction remains available unchanged. */
+shell_process_status_t
+shell_extract_netargv_inputs(const char *command_line,
+                             const shell_process_limits_t *limits,
+                             const char ***netargv_inputs, size_t *input_count,
+                             bool *has_shell_features);
 
 #ifdef __cplusplus
 }

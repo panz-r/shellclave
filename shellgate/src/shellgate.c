@@ -10,6 +10,7 @@
 #include "sg_io.h"
 #include "shell_abstract.h"
 #include "shell_depgraph.h"
+#include "shell_processor.h"
 #include "shell_tokenizer.h"
 #include "shelltype.h"
 #include <ctype.h>
@@ -73,6 +74,15 @@ static const char *bw_copy(buf_writer_t *w, const char *src, size_t src_len) {
   if (src_len > copy)
     w->overflow = true;
   return result;
+}
+
+static const char *bw_copy_policy_cpl(buf_writer_t *w, const char *netpattern) {
+  char *cpl = NULL;
+  if (st_netpattern_to_cpl(netpattern, &cpl) != ST_OK)
+    return NULL;
+  const char *copy = bw_copy(w, cpl, strlen(cpl));
+  free(cpl);
+  return copy;
 }
 
 static const char *bw_printf(buf_writer_t *w, const char *fmt, ...) {
@@ -946,29 +956,26 @@ size_t sg_gate_suggestion_token_variants_at(sg_gate_t *gate,
   if (pattern[0] == '\0')
     return 0;
 
-  /* Parse suggestion pattern into tokens */
-  char pattern_copy[ST_MAX_PATTERN_LEN];
-  strncpy(pattern_copy, pattern, sizeof(pattern_copy) - 1);
-  pattern_copy[sizeof(pattern_copy) - 1] = '\0';
-
-  const char *tokens[ST_MAX_CMD_TOKENS];
-  size_t token_count = 0;
-  char *save = NULL;
-  char *tok = strtok_r(pattern_copy, " ", &save);
-  while (tok && token_count < ST_MAX_CMD_TOKENS) {
-    tokens[token_count++] = tok;
-    tok = strtok_r(NULL, " ", &save);
-  }
-  if (token_count == 0 || edit_pos >= token_count)
+  char *netpattern = NULL;
+  st_token_array_t decoded = {0};
+  if (st_netpattern_from_cpl(pattern, &netpattern) != ST_OK ||
+      st_netpattern_decode(netpattern, &decoded) != ST_OK) {
+    free(netpattern);
     return 0;
+  }
+  free(netpattern);
+  if (edit_pos >= decoded.count) {
+    st_free_token_array(&decoded);
+    return 0;
+  }
 
-  const char *target_tok = tokens[edit_pos];
+  const char *target_tok = decoded.tokens[edit_pos].text;
 
   /* Determine the starting type:
    * - If target token is already a wildcard, use that type
    * - If literal, classify it via st_classify_token to get most specific type
    */
-  st_token_type_t start_type = st_type_from_pattern_token(target_tok);
+  st_token_type_t start_type = decoded.tokens[edit_pos].type;
   if (start_type == ST_TYPE_LITERAL) {
     start_type = st_classify_token(target_tok);
   }
@@ -1038,6 +1045,7 @@ size_t sg_gate_suggestion_token_variants_at(sg_gate_t *gate,
     out++;
   }
 
+  st_free_token_array(&decoded);
   return out;
 }
 
@@ -1058,6 +1066,24 @@ static sg_error_t policy_mutation_error(st_error_t error) {
     return SG_ERR_INVALID;
   }
   return SG_ERR_INVALID;
+}
+
+static st_error_t policy_add_cpl(st_policy_t *policy, const char *cpl) {
+  char *netpattern = NULL;
+  st_error_t error = st_netpattern_from_cpl(cpl, &netpattern);
+  if (error == ST_OK)
+    error = st_policy_add_netpattern(policy, netpattern);
+  free(netpattern);
+  return error;
+}
+
+static st_error_t policy_remove_cpl(st_policy_t *policy, const char *cpl) {
+  char *netpattern = NULL;
+  st_error_t error = st_netpattern_from_cpl(cpl, &netpattern);
+  if (error == ST_OK)
+    error = st_policy_remove_netpattern(policy, netpattern);
+  free(netpattern);
+  return error;
 }
 
 static sg_error_t policy_load_error(st_error_t error) {
@@ -1093,13 +1119,13 @@ sg_error_t sg_gate_save_policy(const sg_gate_t *gate, const char *path) {
 sg_error_t sg_gate_add_rule(sg_gate_t *gate, const char *pattern) {
   if (!gate || !pattern)
     return SG_ERR_INVALID;
-  return policy_mutation_error(st_policy_add(gate->policy, pattern));
+  return policy_mutation_error(policy_add_cpl(gate->policy, pattern));
 }
 
 sg_error_t sg_gate_remove_rule(sg_gate_t *gate, const char *pattern) {
   if (!gate || !pattern)
     return SG_ERR_INVALID;
-  return policy_mutation_error(st_policy_remove(gate->policy, pattern));
+  return policy_mutation_error(policy_remove_cpl(gate->policy, pattern));
 }
 
 uint32_t sg_gate_rule_count(const sg_gate_t *gate) {
@@ -1111,13 +1137,13 @@ uint32_t sg_gate_rule_count(const sg_gate_t *gate) {
 sg_error_t sg_gate_add_deny_rule(sg_gate_t *gate, const char *pattern) {
   if (!gate || !pattern)
     return SG_ERR_INVALID;
-  return policy_mutation_error(st_policy_add(gate->deny_policy, pattern));
+  return policy_mutation_error(policy_add_cpl(gate->deny_policy, pattern));
 }
 
 sg_error_t sg_gate_remove_deny_rule(sg_gate_t *gate, const char *pattern) {
   if (!gate || !pattern)
     return SG_ERR_INVALID;
-  return policy_mutation_error(st_policy_remove(gate->deny_policy, pattern));
+  return policy_mutation_error(policy_remove_cpl(gate->deny_policy, pattern));
 }
 
 uint32_t sg_gate_deny_rule_count(const sg_gate_t *gate) {
@@ -1172,8 +1198,40 @@ static bool has_glob_chars(const char *tok, size_t len) {
 #define SG_EXPAND_BUF 4096
 #define SG_GLOB_PATTERN_BUF 256
 
+static bool append_netarg(char **encoded, size_t *length, size_t *capacity,
+                          const char *text, size_t text_length) {
+  int prefix = snprintf(NULL, 0, "%zu:", text_length);
+  if (prefix < 0 || text_length > SIZE_MAX - (size_t)prefix - 2 ||
+      *length > SIZE_MAX - text_length - (size_t)prefix - 2)
+    return false;
+  size_t needed = *length + (size_t)prefix + text_length + 2;
+  if (needed > *capacity) {
+    size_t grown = *capacity ? *capacity : 64;
+    while (grown < needed) {
+      if (grown > SIZE_MAX / 2) {
+        grown = needed;
+        break;
+      }
+      grown *= 2;
+    }
+    char *replacement = realloc(*encoded, grown);
+    if (!replacement)
+      return false;
+    *encoded = replacement;
+    *capacity = grown;
+  }
+  int written = sprintf(*encoded + *length, "%zu:", text_length);
+  *length += (size_t)written;
+  memcpy(*encoded + *length, text, text_length);
+  *length += text_length;
+  (*encoded)[(*length)++] = ',';
+  (*encoded)[*length] = '\0';
+  return true;
+}
+
 static const char *build_cmd_string(const shell_dep_cmd_t *cmd,
-                                    buf_writer_t *bw, const sg_gate_t *gate) {
+                                    buf_writer_t *bw, const sg_gate_t *gate,
+                                    char **netargv) {
   /*
    * Reconstructs the command by joining tokens with spaces.
    * Tokens are copied as-is — no additional quoting is applied.
@@ -1183,17 +1241,17 @@ static const char *build_cmd_string(const shell_dep_cmd_t *cmd,
    * of the reconstructed command.  The goal is a readable display
    * string, not a round-trippable shell command.
    *
-   * NOTE: Variable expansion (e.g. $FOO -> "a b c") or glob expansion
-   * that produces strings containing spaces will change the token
-   * count of the reconstructed command.  Policy matching is performed
-   * on this flattened string, so such expansions can cause false
-   * negatives or incorrect suggestions.  Callers should be aware of
-   * this limitation when using expansion callbacks.
+   * Policy matching uses netargv below, so an expansion containing spaces is
+   * still exactly one argument.
    */
   if (bw->used >= bw->size) {
     bw->overflow = true;
     return NULL;
   }
+
+  *netargv = NULL;
+  size_t net_length = 0;
+  size_t net_capacity = 0;
 
   size_t start = bw->used;
   size_t avail = bw->size - start;
@@ -1248,9 +1306,40 @@ static const char *build_cmd_string(const shell_dep_cmd_t *cmd,
           }
           text = exp_buf;
           text_len = elen;
+          expanded = true;
         }
       }
     }
+
+    char *decoded = NULL;
+    size_t decoded_length = 0;
+    const char *policy_text = text;
+    size_t policy_length = text_len;
+    if (!expanded) {
+      if (shell_decode_word(text, text_len, &decoded, &decoded_length) !=
+          SHELL_PROCESS_OK) {
+        free(*netargv);
+        *netargv = NULL;
+        bw->overflow = true;
+        return NULL;
+      }
+      policy_text = decoded;
+      policy_length = decoded_length;
+    } else if (memchr(text, '\0', text_len) != NULL) {
+      free(*netargv);
+      *netargv = NULL;
+      bw->overflow = true;
+      return NULL;
+    }
+    if (!append_netarg(netargv, &net_length, &net_capacity, policy_text,
+                       policy_length)) {
+      free(decoded);
+      free(*netargv);
+      *netargv = NULL;
+      bw->overflow = true;
+      return NULL;
+    }
+    free(decoded);
 
     if (pos + text_len >= avail) {
       size_t writable = avail > pos + 1 ? avail - pos - 1 : 0;
@@ -2629,8 +2718,10 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len, char *buf,
     sr->group_depth = node->cmd.group_depth;
     sr->backgrounded = node->cmd.backgrounded;
 
-    sr->command = build_cmd_string(&node->cmd, &bw, gate);
+    char *policy_netargv = NULL;
+    sr->command = build_cmd_string(&node->cmd, &bw, gate, &policy_netargv);
     if (bw.overflow) {
+      free(policy_netargv);
       out->truncated = true;
       out->verdict = SG_VERDICT_UNDETERMINED;
       free(type_seq_buf);
@@ -2644,12 +2735,10 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len, char *buf,
     sr->violation_category_flags = sg_violation_categories(node_viols[ni]);
     sr->violation_flags = sr->violation_type_flags;
 
-    const char *cmd_str = sr->command ? sr->command : "";
-
     /* Check deny policy first */
     st_eval_result_t deny_eval;
     st_error_t deny_err =
-        st_policy_eval(gate->deny_policy, cmd_str, &deny_eval);
+        st_policy_eval(gate->deny_policy, policy_netargv, &deny_eval);
     if (deny_err != ST_OK) {
       sr->matches = false;
       sr->verdict = SG_VERDICT_UNDETERMINED;
@@ -2663,7 +2752,7 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len, char *buf,
     } else {
       /* Check allow policy */
       st_eval_result_t eval;
-      st_error_t eval_err = st_policy_eval(gate->policy, cmd_str, &eval);
+      st_error_t eval_err = st_policy_eval(gate->policy, policy_netargv, &eval);
       if (eval_err != ST_OK) {
         sr->matches = false;
         sr->verdict = SG_VERDICT_UNDETERMINED;
@@ -2678,25 +2767,27 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len, char *buf,
 
         if (gate->suggestions) {
           if (eval.suggestion_count > 0 && out->suggestion_count == 0) {
-            out->suggestions[0] = bw_copy(&bw, eval.suggestions[0].pattern,
-                                          strlen(eval.suggestions[0].pattern));
+            out->suggestions[0] =
+                bw_copy_policy_cpl(&bw, eval.suggestions[0].pattern);
             if (out->suggestions[0])
               out->suggestion_count++;
             else if (bw.overflow) {
               out->truncated = true;
               out->verdict = SG_VERDICT_UNDETERMINED;
+              free(policy_netargv);
               free(type_seq_buf);
               return SG_ERR_TRUNC;
             }
           }
           if (eval.suggestion_count > 1 && out->suggestion_count == 1) {
-            out->suggestions[1] = bw_copy(&bw, eval.suggestions[1].pattern,
-                                          strlen(eval.suggestions[1].pattern));
+            out->suggestions[1] =
+                bw_copy_policy_cpl(&bw, eval.suggestions[1].pattern);
             if (out->suggestions[1])
               out->suggestion_count++;
             else if (bw.overflow) {
               out->truncated = true;
               out->verdict = SG_VERDICT_UNDETERMINED;
+              free(policy_netargv);
               free(type_seq_buf);
               return SG_ERR_TRUNC;
             }
@@ -2709,13 +2800,13 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len, char *buf,
         if (deny_err == ST_OK && out->deny_suggestion_count == 0) {
           if (deny_eval.suggestion_count > 0) {
             out->deny_suggestions[0] =
-                bw_copy(&bw, deny_eval.suggestions[0].pattern,
-                        strlen(deny_eval.suggestions[0].pattern));
+                bw_copy_policy_cpl(&bw, deny_eval.suggestions[0].pattern);
             if (out->deny_suggestions[0])
               out->deny_suggestion_count++;
             else if (bw.overflow) {
               out->truncated = true;
               out->verdict = SG_VERDICT_UNDETERMINED;
+              free(policy_netargv);
               free(type_seq_buf);
               return SG_ERR_TRUNC;
             }
@@ -2723,13 +2814,13 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len, char *buf,
           if (deny_eval.suggestion_count > 1 &&
               out->deny_suggestion_count == 1) {
             out->deny_suggestions[1] =
-                bw_copy(&bw, deny_eval.suggestions[1].pattern,
-                        strlen(deny_eval.suggestions[1].pattern));
+                bw_copy_policy_cpl(&bw, deny_eval.suggestions[1].pattern);
             if (out->deny_suggestions[1])
               out->deny_suggestion_count++;
             else if (bw.overflow) {
               out->truncated = true;
               out->verdict = SG_VERDICT_UNDETERMINED;
+              free(policy_netargv);
               free(type_seq_buf);
               return SG_ERR_TRUNC;
             }
@@ -2737,6 +2828,7 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len, char *buf,
         }
       }
     }
+    free(policy_netargv);
 
     if (sr->verdict == SG_VERDICT_REJECT || sr->verdict == SG_VERDICT_DENY) {
       if (out->deny_reason == NULL) {

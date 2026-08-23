@@ -1,6 +1,7 @@
 #define _XOPEN_SOURCE 700
 
 #include "shelltype.h"
+#include "test_netargv.h"
 
 #include <pthread.h>
 #include <sched.h>
@@ -9,6 +10,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+
+static int pattern_is_cpl(const char *actual, const char *cpl) {
+  char *encoded = NULL;
+  int equal = actual && cpl && st_netpattern_from_cpl(cpl, &encoded) == ST_OK &&
+              strcmp(actual, encoded) == 0;
+  free(encoded);
+  return equal;
+}
 
 enum {
   READER_COUNT = 6,
@@ -65,9 +74,9 @@ static bool await_start(pthread_barrier_t *barrier, atomic_uint *failures,
 
 static bool policy_matches_exact(st_policy_t *policy, const char *command) {
   st_eval_result_t result = {0};
-  return st_policy_eval(policy, command, &result) == ST_OK && result.matches &&
-         result.matching_pattern &&
-         strcmp(result.matching_pattern, command) == 0;
+  return test_st_policy_eval(policy, command, &result) == ST_OK &&
+         result.matches && result.matching_pattern &&
+         pattern_is_cpl(result.matching_pattern, command);
 }
 
 static void *policy_reader(void *opaque) {
@@ -83,10 +92,10 @@ static void *policy_reader(void *opaque) {
     }
     const char **matches = NULL;
     size_t match_count = 0;
-    if (st_policy_verify_all(args->policy, command, &matches, &match_count) !=
-            ST_OK ||
+    if (test_st_policy_verify_all(args->policy, command, &matches,
+                                  &match_count) != ST_OK ||
         match_count != 1 || matches == NULL ||
-        strcmp(matches[0], command) != 0) {
+        !pattern_is_cpl(matches[0], command)) {
       record_failure(args->failures, "policy verification", args->id, i);
       st_policy_free_matches(matches, match_count);
       break;
@@ -134,11 +143,11 @@ static void *policy_writer(void *opaque) {
   for (size_t i = 0; i < WRITER_ITERATIONS; i++) {
     char pattern[64];
     snprintf(pattern, sizeof(pattern), "temporary%u_%zu value", args->id, i);
-    if (st_policy_add(args->policy, pattern) != ST_OK) {
+    if (test_st_policy_add(args->policy, pattern) != ST_OK) {
       record_failure(args->failures, "policy add", args->id, i);
       break;
     }
-    if (st_policy_remove(args->policy, pattern) != ST_OK) {
+    if (test_st_policy_remove(args->policy, pattern) != ST_OK) {
       record_failure(args->failures, "policy remove", args->id, i);
       break;
     }
@@ -155,8 +164,8 @@ static int test_concurrent_policy_readers(void) {
     st_policy_ctx_free(ctx);
     return 0;
   }
-  if (st_policy_add(policy, "git status") != ST_OK ||
-      st_policy_add(policy, "docker ps") != ST_OK) {
+  if (test_st_policy_add(policy, "git status") != ST_OK ||
+      test_st_policy_add(policy, "docker ps") != ST_OK) {
     fprintf(stderr, "failed to add baseline patterns\n");
     st_policy_free(policy);
     st_policy_ctx_free(ctx);
@@ -228,8 +237,8 @@ static int test_concurrent_same_policy_readers_and_writer(void) {
   st_policy_t *policy = ctx ? st_policy_new(ctx) : NULL;
   if (!ctx || !policy)
     goto setup_failed;
-  if (st_policy_add(policy, "git status") != ST_OK ||
-      st_policy_add(policy, "docker ps") != ST_OK)
+  if (test_st_policy_add(policy, "git status") != ST_OK ||
+      test_st_policy_add(policy, "docker ps") != ST_OK)
     goto setup_failed;
 
   enum { THREAD_COUNT = MIXED_READER_COUNT + MIXED_WRITER_COUNT };
@@ -361,7 +370,7 @@ static int test_concurrent_context_refcount(void) {
 
   st_policy_t *policy = st_policy_new(ctx);
   st_error_t add_result =
-      policy ? st_policy_add(policy, "echo ok") : ST_ERR_MEMORY;
+      policy ? test_st_policy_add(policy, "echo ok") : ST_ERR_MEMORY;
   size_t policy_count = policy ? st_policy_count(policy) : 0;
   bool policy_usable = policy && add_result == ST_OK && policy_count == 1 &&
                        policy_matches_exact(policy, "echo ok");
@@ -489,7 +498,7 @@ static int test_concurrent_shared_context_writes(void) {
   static const char *patterns[] = {"left final", "right final"};
   for (size_t i = 0; i < 2; i++) {
     if (st_policy_count(policies[i]) != 0 ||
-        st_policy_add(policies[i], patterns[i]) != ST_OK ||
+        test_st_policy_add(policies[i], patterns[i]) != ST_OK ||
         !policy_matches_exact(policies[i], patterns[i]))
       passed = false;
   }

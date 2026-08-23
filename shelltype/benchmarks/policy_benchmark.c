@@ -24,6 +24,25 @@ static double now_sec(void) {
   return ts.tv_sec + ts.tv_nsec * 1e-9;
 }
 
+static void add_cpl(st_policy_t *policy, const char *cpl) {
+  char *netpattern = NULL;
+  if (st_netpattern_from_cpl(cpl, &netpattern) != ST_OK ||
+      st_policy_add_netpattern(policy, netpattern) != ST_OK) {
+    fprintf(stderr, "failed to add benchmark pattern: %s\n", cpl);
+    free(netpattern);
+    exit(EXIT_FAILURE);
+  }
+  free(netpattern);
+}
+
+static void encode_two(char *output, size_t capacity, const char *first,
+                       const char *second) {
+  int written = snprintf(output, capacity, "%zu:%s,%zu:%s,", strlen(first),
+                         first, strlen(second), second);
+  if (written < 0 || (size_t)written >= capacity)
+    exit(EXIT_FAILURE);
+}
+
 int main(void) {
   st_policy_ctx_t *ctx = st_policy_ctx_new();
   st_policy_t *policy = st_policy_new(ctx);
@@ -32,23 +51,29 @@ int main(void) {
   char buf[256];
   for (int i = 0; i < 200; i++) {
     snprintf(buf, sizeof(buf), "cmd%d arg", i);
-    st_policy_add(policy, buf);
+    add_cpl(policy, buf);
   }
   for (int i = 0; i < 100; i++) {
     snprintf(buf, sizeof(buf), "svc%d #path", i);
-    st_policy_add(policy, buf);
+    add_cpl(policy, buf);
   }
   for (int i = 0; i < 100; i++) {
     snprintf(buf, sizeof(buf), "tool%d #val", i);
-    st_policy_add(policy, buf);
+    add_cpl(policy, buf);
   }
   for (int i = 0; i < 50; i++) {
-    snprintf(buf, sizeof(buf), "cat #path.cfg");
-    st_policy_add(policy, buf);
+    snprintf(buf, sizeof(buf), "id%d #uuid.v4", i);
+    add_cpl(policy, buf);
   }
   for (int i = 0; i < 50; i++) {
-    snprintf(buf, sizeof(buf), "dd #size.MiB");
-    st_policy_add(policy, buf);
+    snprintf(buf, sizeof(buf), "dd%d #size.MiB", i);
+    add_cpl(policy, buf);
+  }
+
+  if (st_policy_count(policy) != N_PATTERNS) {
+    fprintf(stderr, "benchmark policy has %zu patterns, expected %d\n",
+            st_policy_count(policy), N_PATTERNS);
+    return EXIT_FAILURE;
   }
 
   printf("Policy: %zu patterns, %zu states\n", st_policy_count(policy),
@@ -56,15 +81,18 @@ int main(void) {
 
   /* Warm up (triggers lazy filter rebuild) */
   st_eval_result_t r;
-  st_policy_eval(policy, "cmd0 arg", &r);
+  char netargv[512];
+  encode_two(netargv, sizeof(netargv), "cmd0", "arg");
+  st_policy_eval(policy, netargv, &r);
 
   /* Measure matching evaluations */
   double t0 = now_sec();
   int match_count = 0;
   for (int i = 0; i < N_EVALS; i++) {
     int idx = i % 200;
-    snprintf(buf, sizeof(buf), "cmd%d arg", idx);
-    st_policy_eval(policy, buf, &r);
+    snprintf(buf, sizeof(buf), "cmd%d", idx);
+    encode_two(netargv, sizeof(netargv), buf, "arg");
+    st_policy_eval(policy, netargv, &r);
     if (r.matches)
       match_count++;
   }
@@ -74,8 +102,9 @@ int main(void) {
   t0 = now_sec();
   int miss_count = 0;
   for (int i = 0; i < N_EVALS; i++) {
-    snprintf(buf, sizeof(buf), "nonexist%d baz", i);
-    st_policy_eval(policy, buf, &r);
+    snprintf(buf, sizeof(buf), "nonexist%d", i);
+    encode_two(netargv, sizeof(netargv), buf, "baz");
+    st_policy_eval(policy, netargv, &r);
     if (!r.matches)
       miss_count++;
   }
@@ -86,8 +115,9 @@ int main(void) {
   int wild_count = 0;
   for (int i = 0; i < N_EVALS; i++) {
     int idx = i % 100;
-    snprintf(buf, sizeof(buf), "svc%d /etc/hosts", idx);
-    st_policy_eval(policy, buf, &r);
+    snprintf(buf, sizeof(buf), "svc%d", idx);
+    encode_two(netargv, sizeof(netargv), buf, "/etc/hosts");
+    st_policy_eval(policy, netargv, &r);
     if (r.matches)
       wild_count++;
   }

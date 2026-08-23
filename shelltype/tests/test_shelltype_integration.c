@@ -1,6 +1,7 @@
 /* End-to-end tests for suggestion ranking across mixed command workloads. */
 
 #include "shelltype.h"
+#include "test_netargv.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -35,7 +36,7 @@ static int tests_failed;
 static int feed_all(st_learner_t *learner, const char *const *commands,
                     size_t count) {
   for (size_t i = 0; i < count; i++)
-    if (st_feed(learner, commands[i]) != ST_OK)
+    if (test_st_feed(learner, commands[i]) != ST_OK)
       return 0;
   return learner->trie.total_commands == count;
 }
@@ -57,12 +58,17 @@ static int suggestions_equal(const st_suggestion_t *actual, size_t actual_count,
               actual[i].confidence);
     return 0;
   }
-  for (size_t i = 0; i < expected_count; i++)
-    if (!actual[i].pattern ||
-        strcmp(actual[i].pattern, expected[i].pattern) != 0 ||
-        actual[i].count != expected[i].count ||
+  for (size_t i = 0; i < expected_count; i++) {
+    char *expected_pattern = NULL;
+    int same = actual[i].pattern &&
+               st_netpattern_from_cpl(expected[i].pattern, &expected_pattern) ==
+                   ST_OK &&
+               strcmp(actual[i].pattern, expected_pattern) == 0;
+    free(expected_pattern);
+    if (!same || actual[i].count != expected[i].count ||
         fabs(actual[i].confidence - expected[i].confidence) > 0.000001)
       return 0;
+  }
   return 1;
 }
 
@@ -73,7 +79,8 @@ static int suggestions_replay_exactly(const st_suggestion_t *suggestions,
   for (size_t i = 0; i < suggestion_count; i++) {
     st_policy_ctx_t *context = st_policy_ctx_new();
     st_policy_t *policy = context ? st_policy_new(context) : NULL;
-    if (!policy || st_policy_add(policy, suggestions[i].pattern) != ST_OK) {
+    if (!policy ||
+        test_st_policy_add(policy, suggestions[i].pattern) != ST_OK) {
       st_policy_free(policy);
       st_policy_ctx_free(context);
       return 0;
@@ -81,7 +88,7 @@ static int suggestions_replay_exactly(const st_suggestion_t *suggestions,
     uint32_t matches = 0;
     for (size_t command = 0; command < command_count; command++) {
       st_eval_result_t result = {0};
-      if (st_policy_eval(policy, commands[command], &result) != ST_OK) {
+      if (test_st_policy_eval(policy, commands[command], &result) != ST_OK) {
         st_policy_free(policy);
         st_policy_ctx_free(context);
         return 0;
@@ -156,7 +163,7 @@ static int test_large_dataset_ranking(void) {
     for (int i = 0; i < families[family].count; i++) {
       char command[128];
       snprintf(command, sizeof(command), families[family].format, i);
-      ASSERT(st_feed(learner, command) == ST_OK);
+      ASSERT(test_st_feed(learner, command) == ST_OK);
     }
   ASSERT(learner->trie.total_commands == 100);
 

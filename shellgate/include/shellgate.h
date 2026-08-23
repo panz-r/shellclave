@@ -556,15 +556,11 @@ size_t sg_eval_size_hint(size_t cmd_len);
 /* --- SUGGESTION TOKEN VARIANTS (for TUI edit mode) --- */
 
 /**
- * Given a suggestion pattern and a token position, return the observed
- * type variants at that position from the policy trie.
- *
- * Walks gate->pctx trie using the pattern. At edit_pos, reads
- * child->observed_types and returns types from most-specific to most-general:
- * [current_type, ..., *].
+ * Given a human CPL suggestion and a token position, return the possible type
+ * variants at that position, ordered from literal/specific to general.
  *
  * @param gate         The gate (policy from gate->policy)
- * @param pattern      Suggestion pattern string (e.g., "timeout #num ls")
+ * @param pattern      Human CPL pattern (e.g., "timeout #n ls")
  * @param edit_pos     Token position to get variants for (0-indexed)
  * @param out_variants Output array (caller allocates, ST_MAX_TOKEN_VARIANTS)
  * @param max_variants Capacity of out_variants

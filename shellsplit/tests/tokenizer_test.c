@@ -1531,6 +1531,20 @@ int main(void) {
        {"printf \"a\\\"b\" \"c'd\" \"x\\\\y\""},
        {0},
        0},
+      {"Processor: assembles adjacent empty quote fragments",
+       "printf foo''bar ''foo foo''",
+       1,
+       {"printf foo''bar ''foo foo''"},
+       {"printf foobar foo foo"},
+       {0},
+       0},
+      {"Processor: removes escaped newlines while assembling words",
+       "printf a\\\nb \"c\\\nd\"",
+       1,
+       {"printf a\\\nb \"c\\\nd\""},
+       {"printf ab cd"},
+       {0},
+       0},
       {"Processor: command substitution is shell execution",
        "echo $(id) `whoami`",
        1,
@@ -1932,6 +1946,24 @@ int main(void) {
       }
     }
     test("Unmatched glob bracket keeps tokens within input", in_bounds);
+  }
+
+  {
+    const char **inputs = NULL;
+    size_t count = 0;
+    bool features = false;
+    shell_process_status_t status =
+        shell_extract_netargv_inputs("printf '' foo\"bar\" 'two words' '>'",
+                                     NULL, &inputs, &count, &features);
+    bool valid =
+        status == SHELL_PROCESS_OK && count == 1 && !features &&
+        strcmp(inputs[0], "6:printf,0:,6:foobar,9:two words,1:>,") == 0;
+    test("Netargv rendering preserves exact argument boundaries", valid);
+    if (inputs) {
+      for (size_t i = 0; i < count; i++)
+        free((void *)inputs[i]);
+    }
+    free(inputs);
   }
 
   printf("\n=== SUMMARY ===\n");

@@ -2,6 +2,7 @@
 
 #include "shelltype.h"
 #include "test_allocator.h"
+#include "test_netargv.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -9,6 +10,16 @@
 static int tests_run;
 static int tests_passed;
 static int tests_failed;
+
+static int pattern_is_cpl(const char *actual, const char *cpl) {
+  if (!actual || !cpl)
+    return actual == cpl;
+  char *encoded = NULL;
+  int equal = st_netpattern_from_cpl(cpl, &encoded) == ST_OK &&
+              strcmp(actual, encoded) == 0;
+  free(encoded);
+  return equal;
+}
 
 #define ASSERT(condition)                                                      \
   do {                                                                         \
@@ -38,7 +49,7 @@ static st_policy_t *new_policy(st_policy_ctx_t *context,
   if (!policy)
     return NULL;
   for (size_t i = 0; i < count; i++)
-    if (st_policy_add(policy, patterns[i]) != ST_OK) {
+    if (test_st_policy_add(policy, patterns[i]) != ST_OK) {
       st_policy_free(policy);
       return NULL;
     }
@@ -74,8 +85,8 @@ static int test_verify_all_matrix(void) {
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
     const char **matches = NULL;
     size_t count = 99;
-    ASSERT(st_policy_verify_all(policy, cases[i].command, &matches, &count) ==
-           ST_OK);
+    ASSERT(test_st_policy_verify_all(policy, cases[i].command, &matches,
+                                     &count) == ST_OK);
     ASSERT(count == cases[i].count);
     ASSERT((count == 0) == (matches == NULL));
     for (size_t j = 0; j < count; j++) {
@@ -85,7 +96,7 @@ static int test_verify_all_matrix(void) {
     for (size_t j = 0; j < cases[i].count; j++) {
       bool found = false;
       for (size_t k = 0; k < count; k++)
-        found = found || strcmp(matches[k], cases[i].expected[j]) == 0;
+        found = found || pattern_is_cpl(matches[k], cases[i].expected[j]);
       ASSERT(found);
     }
     st_policy_free_matches(matches, count);
@@ -93,7 +104,7 @@ static int test_verify_all_matrix(void) {
 
   const char **matches = (const char **)1;
   size_t count = 99;
-  ASSERT(st_policy_verify_all(policy, "", &matches, &count) == ST_OK);
+  ASSERT(test_st_policy_verify_all(policy, "", &matches, &count) == ST_OK);
   ASSERT(matches == NULL && count == 0);
   const struct {
     const st_policy_t *policy;
@@ -107,9 +118,9 @@ static int test_verify_all_matrix(void) {
   for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
     matches = (const char **)1;
     count = 99;
-    ASSERT(st_policy_verify_all(invalid[i].policy, invalid[i].command,
-                                invalid[i].give_matches ? &matches : NULL,
-                                invalid[i].give_count ? &count : NULL) ==
+    ASSERT(test_st_policy_verify_all(invalid[i].policy, invalid[i].command,
+                                     invalid[i].give_matches ? &matches : NULL,
+                                     invalid[i].give_count ? &count : NULL) ==
            ST_ERR_INVALID);
     ASSERT(!invalid[i].give_matches || matches == NULL);
     ASSERT(!invalid[i].give_count || count == 0);
@@ -130,18 +141,19 @@ static int test_verify_and_precedence_matrix(void) {
 
     const char **matches = NULL;
     size_t count = 0;
-    ASSERT(st_policy_verify_all(policy, "x 1 2", &matches, &count) == ST_OK);
+    ASSERT(test_st_policy_verify_all(policy, "x 1 2", &matches, &count) ==
+           ST_OK);
     ASSERT(count == 2);
     ASSERT(matches != NULL);
-    ASSERT(strcmp(matches[0], "x #n #val") == 0);
-    ASSERT(strcmp(matches[1], "x #val #n") == 0);
+    ASSERT(pattern_is_cpl(matches[0], "x #n #val"));
+    ASSERT(pattern_is_cpl(matches[1], "x #val #n"));
     st_policy_free_matches(matches, count);
 
     for (size_t phase = 0; phase < 2; phase++) {
       st_eval_result_t result = {0};
-      ASSERT(st_policy_eval(policy, "x 1 2", &result) == ST_OK);
+      ASSERT(test_st_policy_eval(policy, "x 1 2", &result) == ST_OK);
       ASSERT(result.matches && result.matching_pattern != NULL);
-      ASSERT(strcmp(result.matching_pattern, "x #n #val") == 0);
+      ASSERT(pattern_is_cpl(result.matching_pattern, "x #n #val"));
       if (phase == 0)
         ASSERT(st_policy_compact(policy) == ST_OK);
     }
@@ -160,8 +172,8 @@ static int test_verify_all_allocation_failures_clear_outputs(void) {
   st_test_alloc_reset();
   const char **probe_matches = NULL;
   size_t probe_count = 0;
-  ASSERT(st_policy_verify_all(policy, "x 1 2", &probe_matches, &probe_count) ==
-         ST_OK);
+  ASSERT(test_st_policy_verify_all(policy, "x 1 2", &probe_matches,
+                                   &probe_count) == ST_OK);
   ASSERT(probe_matches != NULL && probe_count == 2);
   size_t allocations = st_test_alloc_count();
   ASSERT(allocations > 0);
@@ -172,7 +184,8 @@ static int test_verify_all_allocation_failures_clear_outputs(void) {
     const char **matches = (const char **)1;
     size_t count = 99;
     st_test_alloc_fail_at(fail_at);
-    st_error_t err = st_policy_verify_all(policy, "x 1 2", &matches, &count);
+    st_error_t err =
+        test_st_policy_verify_all(policy, "x 1 2", &matches, &count);
     st_test_alloc_reset();
     if (err == ST_ERR_MEMORY) {
       observed = true;
@@ -199,25 +212,25 @@ static int test_semver_informational_coexistence(void) {
 
   const char **matches = NULL;
   size_t count = 0;
-  ASSERT(st_policy_verify_all(policy, "install 1.2.3", &matches, &count) ==
+  ASSERT(test_st_policy_verify_all(policy, "install 1.2.3", &matches, &count) ==
          ST_OK);
   ASSERT(count == 4);
   for (size_t p = 0; p < 4; p++) {
     bool found = false;
     for (size_t m = 0; m < count; m++)
-      found = found || strcmp(patterns[p], matches[m]) == 0;
+      found = found || pattern_is_cpl(matches[m], patterns[p]);
     ASSERT(found);
   }
   st_policy_free_matches(matches, count);
 
   st_eval_result_t result = {0};
-  ASSERT(st_policy_eval(policy, "install 1.2.3", &result) == ST_OK);
+  ASSERT(test_st_policy_eval(policy, "install 1.2.3", &result) == ST_OK);
   ASSERT(result.matches &&
-         strcmp(result.matching_pattern, "install #semver.*") == 0);
+         pattern_is_cpl(result.matching_pattern, "install #semver.*"));
   ASSERT(st_policy_compact(policy) == ST_OK);
-  ASSERT(st_policy_eval(policy, "install 2.0.0-alpha", &result) == ST_OK);
+  ASSERT(test_st_policy_eval(policy, "install 2.0.0-alpha", &result) == ST_OK);
   ASSERT(result.matches &&
-         strcmp(result.matching_pattern, "install #semver.*") == 0);
+         pattern_is_cpl(result.matching_pattern, "install #semver.*"));
 
   st_policy_free(policy);
   st_policy_ctx_free(context);
@@ -228,15 +241,15 @@ static int test_verify_high_fanout_growth(void) {
   st_policy_ctx_t *context = st_policy_ctx_new();
   st_policy_t *policy = st_policy_new(context);
   ASSERT(context && policy);
-  char expected[ST_MAX_PATTERN_LEN] = {0};
+  char expected[ST_MAX_NETPATTERN_LEN] = {0};
   size_t pattern_count = 0;
   for (unsigned mask = 0; mask < (1u << 9); mask++) {
     if (__builtin_popcount(mask) != 4)
       continue;
-    char pattern[ST_MAX_PATTERN_LEN] = "x";
+    char pattern[ST_MAX_NETPATTERN_LEN] = "x";
     for (unsigned pos = 0; pos < 9; pos++)
       strcat(pattern, (mask & (1u << pos)) ? " #n" : " #val");
-    ASSERT(st_policy_add(policy, pattern) == ST_OK);
+    ASSERT(test_st_policy_add(policy, pattern) == ST_OK);
     if (expected[0] == '\0' || strcmp(pattern, expected) < 0)
       strcpy(expected, pattern);
     pattern_count++;
@@ -245,21 +258,21 @@ static int test_verify_high_fanout_growth(void) {
   const char *command = "x 1 2 3 4 5 6 7 8 9";
   const char **matches = NULL;
   size_t count = 0;
-  ASSERT(st_policy_verify_all(policy, command, &matches, &count) == ST_OK);
+  ASSERT(test_st_policy_verify_all(policy, command, &matches, &count) == ST_OK);
   ASSERT(count == 126);
   st_policy_free_matches(matches, count);
   st_eval_result_t result = {0};
-  ASSERT(st_policy_eval(policy, command, &result) == ST_OK);
-  ASSERT(result.matches && strcmp(result.matching_pattern, expected) == 0);
+  ASSERT(test_st_policy_eval(policy, command, &result) == ST_OK);
+  ASSERT(result.matches && pattern_is_cpl(result.matching_pattern, expected));
 
   st_test_alloc_reset();
-  ASSERT(st_policy_eval(policy, command, &result) == ST_OK);
+  ASSERT(test_st_policy_eval(policy, command, &result) == ST_OK);
   size_t eval_allocations = st_test_alloc_count();
   bool eval_failure_observed = false;
   for (size_t fail_at = 1; fail_at <= eval_allocations; fail_at++) {
     memset(&result, 0xa5, sizeof(result));
     st_test_alloc_fail_at(fail_at);
-    st_error_t error = st_policy_eval(policy, command, &result);
+    st_error_t error = test_st_policy_eval(policy, command, &result);
     st_test_alloc_reset();
     if (error == ST_ERR_MEMORY) {
       eval_failure_observed = true;
@@ -267,13 +280,13 @@ static int test_verify_high_fanout_growth(void) {
              result.suggestion_count == 0 && result.error == ST_OK);
     } else {
       ASSERT(error == ST_OK && result.matches && result.matching_pattern &&
-             strcmp(result.matching_pattern, expected) == 0);
+             pattern_is_cpl(result.matching_pattern, expected));
     }
   }
   ASSERT(eval_failure_observed);
 
   st_test_alloc_reset();
-  ASSERT(st_policy_verify_all(policy, command, &matches, &count) == ST_OK);
+  ASSERT(test_st_policy_verify_all(policy, command, &matches, &count) == ST_OK);
   size_t allocations = st_test_alloc_count();
   st_policy_free_matches(matches, count);
   bool observed = false;
@@ -281,7 +294,8 @@ static int test_verify_high_fanout_growth(void) {
     matches = (const char **)1;
     count = 99;
     st_test_alloc_fail_at(fail_at);
-    st_error_t error = st_policy_verify_all(policy, command, &matches, &count);
+    st_error_t error =
+        test_st_policy_verify_all(policy, command, &matches, &count);
     st_test_alloc_reset();
     if (error == ST_ERR_MEMORY) {
       observed = true;
@@ -300,10 +314,10 @@ static int test_verify_high_fanout_growth(void) {
 static int suggestion_is(const st_expand_suggestion_t *suggestion,
                          const char *pattern, const char *based_on,
                          double confidence) {
-  int matches = strcmp(suggestion->pattern, pattern) == 0 &&
+  int matches = pattern_is_cpl(suggestion->pattern, pattern) &&
                 ((suggestion->based_on == NULL && based_on == NULL) ||
                  (suggestion->based_on != NULL && based_on != NULL &&
-                  strcmp(suggestion->based_on, based_on) == 0)) &&
+                  pattern_is_cpl(suggestion->based_on, based_on))) &&
                 suggestion->confidence == confidence;
   if (!matches)
     printf("    suggestion actual={%s, %s, %.17g} expected={%s, %s, %.17g}\n",
@@ -344,7 +358,7 @@ static int test_suggestion_round_trip_matrix(void) {
   ASSERT(policy != NULL);
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
     st_eval_result_t result = {0};
-    ASSERT(st_policy_eval(policy, cases[i].command, &result) == ST_OK);
+    ASSERT(test_st_policy_eval(policy, cases[i].command, &result) == ST_OK);
     ASSERT(!result.matches && result.matching_pattern == NULL);
     ASSERT(result.suggestion_count == 2);
     for (size_t j = 0; j < result.suggestion_count; j++) {
@@ -354,8 +368,8 @@ static int test_suggestion_round_trip_matrix(void) {
       st_policy_t *accepted = new_policy(context, &cases[i].suggestions[j], 1);
       ASSERT(accepted != NULL);
       st_eval_result_t accepted_result = {0};
-      ASSERT(st_policy_eval(accepted, cases[i].command, &accepted_result) ==
-             ST_OK);
+      ASSERT(test_st_policy_eval(accepted, cases[i].command,
+                                 &accepted_result) == ST_OK);
       ASSERT(accepted_result.matches &&
              accepted_result.matching_pattern != NULL);
       st_policy_free(accepted);

@@ -2334,185 +2334,86 @@ st_token_type_t st_classify_token(const char *token) {
   return ST_TYPE_LITERAL;
 }
 
-/* --- PUBLIC: PATTERN TOKEN CLASSIFICATION --- */
+/* --- CANONICAL NETSTRING ARGV DECODING --- */
 
-st_token_type_t st_type_from_pattern_token(const char *token) {
-  if (!token)
-    return ST_TYPE_LITERAL;
-  if (strcmp(token, "*") == 0)
-    return ST_TYPE_ANY;
-  if (token[0] != '#')
-    return ST_TYPE_LITERAL;
-  for (int t = 1; t < ST_TYPE_COUNT; t++) {
-    if (strcmp(token, st_type_symbol[t]) == 0)
-      return (st_token_type_t)t;
-  }
-  return ST_TYPE_LITERAL;
-}
-
-/* --- TOKENISATION --- */
-
-static size_t redirection_length(const char *text) {
-  const char *p = text;
-  if (*p == '&' && p[1] == '>')
-    return p[2] == '>' ? 3 : 2;
-
-  while (isdigit((unsigned char)*p))
-    p++;
-  if (*p != '>' && *p != '<')
-    return 0;
-  p++;
-  if (p[-1] == '>' && *p == '>')
-    p++;
-  if (*p == '&') {
-    p++;
-    if (*p == '-')
-      p++;
-    else
-      while (isdigit((unsigned char)*p))
-        p++;
-  }
-  return (size_t)(p - text);
-}
-
-static bool is_redirection_token(const char *text) {
-  size_t length = redirection_length(text);
-  return length != 0 && text[length] == '\0';
-}
-
-static char *duplicate_processed_quoted(const char *text, size_t length,
-                                        char quote) {
-  char *decoded = malloc(length + 1);
-  if (!decoded)
-    return NULL;
-  size_t out = 0;
-  for (size_t i = 0; i < length; i++) {
-    if (quote == '"' && text[i] == '\\' && i + 1 < length)
-      i++;
-    decoded[out++] = text[i];
-  }
-  decoded[out] = '\0';
-  return decoded;
-}
-
-static char **tokenize_command(const char *raw_cmd, size_t *out_count) {
-  size_t len = strlen(raw_cmd);
-  /* In the worst case every byte is a standalone control operator. */
-  size_t max_tokens = len + 1;
-  char **tokens = calloc(max_tokens, sizeof(char *));
-  if (!tokens)
-    return NULL;
-
+static st_error_t decode_netargv(const char *netargv, char ***out_tokens,
+                                 size_t *out_count) {
+  *out_tokens = NULL;
+  *out_count = 0;
+  size_t encoded_length = strlen(netargv);
+  size_t offset = 0;
   size_t count = 0;
-  const char *p = raw_cmd;
+  char **tokens = NULL;
 
-  while (*p) {
-    while (*p && isspace((unsigned char)*p))
-      p++;
-    if (!*p)
-      break;
+  while (offset < encoded_length) {
+    if (count == ST_MAX_CMD_TOKENS)
+      goto limit;
+    size_t length = 0;
+    if (!isdigit((unsigned char)netargv[offset]))
+      goto format;
+    if (netargv[offset] == '0' && offset + 1 < encoded_length &&
+        isdigit((unsigned char)netargv[offset + 1]))
+      goto format;
+    do {
+      unsigned digit = (unsigned)(netargv[offset] - '0');
+      if (length > (SIZE_MAX - digit) / 10)
+        goto limit;
+      length = length * 10 + digit;
+      offset++;
+    } while (offset < encoded_length &&
+             isdigit((unsigned char)netargv[offset]));
+    if (offset >= encoded_length || netargv[offset++] != ':')
+      goto format;
+    if (length >= encoded_length - offset || netargv[offset + length] != ',')
+      goto format;
 
-    /* Preserve shell sequencing points as individual structural tokens. */
-    if (*p == '|') {
-      size_t length = p[1] == '|' ? 2 : 1;
-      tokens[count] = strndup(p, length);
-      if (!tokens[count])
-        goto fail;
-      count++;
-      p += length;
-      continue;
-    }
-    if (*p == '&' && p[1] == '&') {
-      tokens[count] = strdup("&&");
-      if (!tokens[count])
-        goto fail;
-      count++;
-      p += 2;
-      continue;
-    }
-    if (*p == ';') {
-      tokens[count] = strdup(";");
-      if (!tokens[count])
-        goto fail;
-      count++;
-      p++;
-      continue;
-    }
-
-    /* Check for redirection operators */
-    size_t redirect_length = redirection_length(p);
-    if (redirect_length != 0) {
-      tokens[count] = strndup(p, redirect_length);
-      if (!tokens[count])
-        goto fail;
-      count++;
-      p += redirect_length;
-      continue;
-    }
-
-    /* Quoted string */
-    char quote = 0;
-    if (*p == '"' || *p == '\'') {
-      quote = *p;
-      p++;
-      const char *start = p;
-      while (*p && *p != quote) {
-        if (*p == '\\' && p[1])
-          p++;
-        p++;
-      }
-      tokens[count] =
-          duplicate_processed_quoted(start, (size_t)(p - start), quote);
-      if (!tokens[count])
-        goto fail;
-      count++;
-      if (*p == quote)
-        p++;
-      continue;
-    }
-
-    /* Regular token */
-    const char *start = p;
-    while (*p && !isspace((unsigned char)*p) && *p != '|' && *p != '>' &&
-           *p != '<' && *p != '&' && *p != ';') {
-      p++;
-    }
-    /* If no characters were consumed (e.g. standalone '&' or other
-     * special char not handled above), treat as single-char token */
-    if (p == start && *p) {
-      p++;
-    }
-    tokens[count] = strndup(start, (size_t)(p - start));
+    char **grown = realloc(tokens, (count + 1) * sizeof(*tokens));
+    if (!grown)
+      goto memory;
+    tokens = grown;
+    tokens[count] = strndup(netargv + offset, length);
     if (!tokens[count])
-      goto fail;
+      goto memory;
     count++;
+    offset += length + 1;
   }
 
+  *out_tokens = tokens;
   *out_count = count;
-  return tokens;
+  return ST_OK;
 
-fail:
+format:
   for (size_t i = 0; i < count; i++)
     free(tokens[i]);
   free(tokens);
-  return NULL;
+  return ST_ERR_FORMAT;
+limit:
+  for (size_t i = 0; i < count; i++)
+    free(tokens[i]);
+  free(tokens);
+  return ST_ERR_LIMIT;
+memory:
+  for (size_t i = 0; i < count; i++)
+    free(tokens[i]);
+  free(tokens);
+  return ST_ERR_MEMORY;
 }
 
-/* --- PUBLIC API: PROCESSED-SUBCOMMAND CLASSIFICATION --- */
+/* --- PUBLIC API: NETSTRING ARGV CLASSIFICATION --- */
 
-st_error_t st_classify(const char *processed_subcommand,
-                       st_token_array_t *out) {
+st_error_t st_classify(const char *netargv, st_token_array_t *out) {
   if (out) {
     out->tokens = NULL;
     out->count = 0;
   }
-  if (!processed_subcommand || !out)
+  if (!netargv || !out)
     return ST_ERR_INVALID;
 
   size_t raw_count = 0;
-  char **raw_tokens = tokenize_command(processed_subcommand, &raw_count);
-  if (!raw_tokens)
-    return ST_ERR_MEMORY;
+  char **raw_tokens = NULL;
+  st_error_t decode_error = decode_netargv(netargv, &raw_tokens, &raw_count);
+  if (decode_error != ST_OK)
+    return decode_error;
 
   /* Empty command: return empty token array */
   if (raw_count == 0) {
@@ -2599,36 +2500,12 @@ st_error_t st_classify(const char *processed_subcommand,
       continue;
     }
 
-    /* Pipes and redirections are structural literals */
-    if (strcmp(tok, "|") == 0 || strcmp(tok, "||") == 0 ||
-        strcmp(tok, "&&") == 0 || strcmp(tok, ";") == 0 ||
-        strcmp(tok, "&") == 0 || is_redirection_token(tok)) {
-      out->tokens[out->count].text = strdup(tok);
-      if (!out->tokens[out->count].text)
-        goto fail;
-      out->tokens[out->count].type = ST_TYPE_LITERAL;
-      out->count++;
-      prev = tok;
-      continue;
-    }
-
     /* Long flag (--something) followed by a separate token → next token is a
      * value. Short flags (-X, -la) are kept as literals; we don't generalise
      * their values. */
     if (prev && prev[0] == '-' && prev[1] == '-' &&
         strchr(prev + 2, '=') == NULL) {
       /* This token is a value after a long flag */
-      out->tokens[out->count].text = strdup(tok);
-      if (!out->tokens[out->count].text)
-        goto fail;
-      out->tokens[out->count].type = st_classify_token(tok);
-      out->count++;
-      prev = tok;
-      continue;
-    }
-
-    /* Token after a redirection operator → value */
-    if (prev && is_redirection_token(prev)) {
       out->tokens[out->count].text = strdup(tok);
       if (!out->tokens[out->count].text)
         goto fail;
@@ -2712,62 +2589,4 @@ void st_free_token_array(st_token_array_t *arr) {
   free(arr->tokens);
   arr->tokens = NULL;
   arr->count = 0;
-}
-
-/* --- PUBLIC API: LEGACY STRING NORMALISATION --- */
-
-st_error_t st_normalize(const char *processed_subcommand, char ***out_tokens,
-                        size_t *out_token_count) {
-  if (out_tokens)
-    *out_tokens = NULL;
-  if (out_token_count)
-    *out_token_count = 0;
-  if (!processed_subcommand || !out_tokens || !out_token_count)
-    return ST_ERR_INVALID;
-
-  st_token_array_t typed;
-  typed.tokens = NULL;
-  typed.count = 0;
-  st_error_t err = st_classify(processed_subcommand, &typed);
-  if (err != ST_OK)
-    return err;
-
-  if (typed.count == 0) {
-    st_free_token_array(&typed);
-    return ST_OK;
-  }
-
-  char **tokens = calloc(typed.count, sizeof(char *));
-  if (!tokens) {
-    st_free_token_array(&typed);
-    return ST_ERR_MEMORY;
-  }
-
-  for (size_t i = 0; i < typed.count; i++) {
-    if (typed.tokens[i].type == ST_TYPE_LITERAL) {
-      tokens[i] = strdup(typed.tokens[i].text);
-    } else {
-      tokens[i] = strdup(st_type_symbol[typed.tokens[i].type]);
-    }
-    if (!tokens[i]) {
-      for (size_t j = 0; j < i; j++)
-        free(tokens[j]);
-      free(tokens);
-      st_free_token_array(&typed);
-      return ST_ERR_MEMORY;
-    }
-  }
-
-  *out_tokens = tokens;
-  *out_token_count = typed.count;
-  st_free_token_array(&typed);
-  return ST_OK;
-}
-
-void st_free_tokens(char **tokens, size_t count) {
-  if (!tokens)
-    return;
-  for (size_t i = 0; i < count; i++)
-    free(tokens[i]);
-  free(tokens);
 }

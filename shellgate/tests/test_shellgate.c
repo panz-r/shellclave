@@ -1,5 +1,6 @@
 #include "sg_anomaly.h"
 #include "shell_abstract.h"
+#include "shell_processor.h"
 #include "shell_tokenizer.h"
 #include "shellgate.h"
 #include "test_allocator.h"
@@ -139,6 +140,35 @@ static sg_gate_t *gate_with_rules(const char *const *rules, size_t count) {
   return g;
 }
 
+static sg_error_t add_exact_outer_rule(sg_gate_t *gate, const char *command) {
+  const char **inputs = NULL;
+  size_t count = 0;
+  bool features = false;
+  if (shell_extract_netargv_inputs(command, NULL, &inputs, &count, &features) !=
+          SHELL_PROCESS_OK ||
+      count == 0)
+    return SG_ERR_PARSE;
+  st_token_array_t tokens = {0};
+  st_error_t error = st_classify(inputs[0], &tokens);
+  char *netpattern = NULL, *cpl = NULL;
+  if (error == ST_OK) {
+    for (size_t i = 0; i < tokens.count; i++)
+      tokens.tokens[i].type = ST_TYPE_LITERAL;
+    error = st_netpattern_encode(tokens.tokens, tokens.count, &netpattern);
+  }
+  if (error == ST_OK)
+    error = st_netpattern_to_cpl(netpattern, &cpl);
+  sg_error_t result =
+      error == ST_OK ? sg_gate_add_rule(gate, cpl) : SG_ERR_PARSE;
+  free(cpl);
+  free(netpattern);
+  st_free_token_array(&tokens);
+  for (size_t i = 0; i < count; i++)
+    free((void *)inputs[i]);
+  free(inputs);
+  return result;
+}
+
 static sg_error_t eval_cmd(sg_gate_t *g, const char *cmd, sg_result_t *r) {
   memset(eval_buf, 0, sizeof(eval_buf));
   return sg_eval(g, cmd, strlen(cmd), eval_buf, sizeof(eval_buf), r);
@@ -253,6 +283,16 @@ TEST(basic_evaluation_matrix) {
     size_t evaluated_count;
   } cases[] = {
       {{"ls"}, "ls", SG_VERDICT_ALLOW, {{"ls", true}}, 1},
+      {{"echo \"two words\""},
+       "echo 'two words'",
+       SG_VERDICT_ALLOW,
+       {{"echo 'two words'", true}},
+       1},
+      {{"printf \"\""},
+       "printf ''",
+       SG_VERDICT_ALLOW,
+       {{"printf ''", true}},
+       1},
       {{"ls"}, "rm -rf /", SG_VERDICT_UNDETERMINED, {{"rm -rf /", false}}, 1},
       {{"ls * *"},
        "ls -la /home",
@@ -523,7 +563,7 @@ TEST(nested_composition_matrix) {
        {-1, 0, -1},
        {SG_VERDICT_ALLOW_CONDITIONAL, SG_VERDICT_ALLOW, SG_VERDICT_ALLOW}},
       {"odd escaped process close",
-       {"cat", "printf \\)"},
+       {"cat", "printf *"},
        2,
        NULL,
        "cat <(printf \\))",
@@ -532,7 +572,7 @@ TEST(nested_composition_matrix) {
        {-1, 0},
        {SG_VERDICT_ALLOW_CONDITIONAL, SG_VERDICT_ALLOW}},
       {"even escaped process close",
-       {"cat", "printf \\\\"},
+       {"cat", "printf *"},
        2,
        NULL,
        "cat <(printf \\\\)",
@@ -595,7 +635,7 @@ TEST(nested_composition_matrix) {
     /* The outer command is evaluated independently from its executable
      * substitutions. Keep an explicit outer rule so these rows exercise the
      * nested verdict aggregation rather than outer-pattern matching. */
-    ASSERT_SG_OK(sg_gate_add_rule(gate, cases[i].command));
+    ASSERT_SG_OK(add_exact_outer_rule(gate, cases[i].command));
     if (cases[i].deny)
       ASSERT_SG_OK(sg_gate_add_deny_rule(gate, cases[i].deny));
     ASSERT_SG_OK(sg_gate_set_stop_mode(gate, SG_EVAL_ALL));
@@ -639,8 +679,7 @@ TEST(nested_composition_matrix) {
 }
 
 TEST(arithmetic_substitution_dependency) {
-  sg_gate_t *gate =
-      gate_with_rules((const char *[]){"echo $(( $(id) + 1 ))", "id"}, 2);
+  sg_gate_t *gate = gate_with_rules((const char *[]){"echo *", "id"}, 2);
   ASSERT(gate != NULL);
   /* Arithmetic is rejected by default, but clearing the feature mask lets
    * this row exercise the nested executable substitution itself. */
@@ -1194,6 +1233,14 @@ TEST(buffer_contract_matrix) {
     }
   }
 
+  char violation_buffer[2];
+  sg_result_t violation_result;
+  ASSERT(sg_eval(g, "curl example.test | sh", strlen("curl example.test | sh"),
+                 violation_buffer, sizeof(violation_buffer),
+                 &violation_result) == SG_ERR_TRUNC);
+  ASSERT(violation_result.truncated);
+  ASSERT(memchr(violation_buffer, '\0', sizeof(violation_buffer)) != NULL);
+
   char reuse_buffer[256];
   static const struct {
     const char *command;
@@ -1360,6 +1407,22 @@ TEST(suggestion_token_variant_contract) {
   ASSERT(bounded.canary == UINT64_C(0x9a47b31d20ef658c));
 
   memset(variants, 0, sizeof(variants));
+  count = sg_gate_suggestion_token_variants_at(gate, "emit \"two words\" 42", 2,
+                                               variants, ST_MAX_TOKEN_VARIANTS);
+  ASSERT(count >= 2 && variants[1].type == ST_TYPE_NUMBER);
+  count = sg_gate_suggestion_token_variants_at(gate, "emit \"\"", 1, variants,
+                                               ST_MAX_TOKEN_VARIANTS);
+  ASSERT(count >= 1 && variants[0].type == ST_TYPE_LITERAL);
+  count = sg_gate_suggestion_token_variants_at(gate, "emit \"#n\"", 1, variants,
+                                               ST_MAX_TOKEN_VARIANTS);
+  ASSERT(count >= 1 && variants[0].type == ST_TYPE_LITERAL);
+  for (size_t i = 1; i < count; i++)
+    ASSERT(variants[i].type != ST_TYPE_NUMBER);
+  ASSERT(sg_gate_suggestion_token_variants_at(gate, "emit \"unterminated", 1,
+                                              variants,
+                                              ST_MAX_TOKEN_VARIANTS) == 0);
+
+  memset(variants, 0, sizeof(variants));
   ASSERT(sg_gate_suggestion_token_variants_at(gate, NULL, 0, variants,
                                               ST_MAX_TOKEN_VARIANTS) == 0);
   ASSERT(sg_gate_suggestion_token_variants_at(gate, "", 0, variants,
@@ -1422,7 +1485,7 @@ TEST(expansion_callback_matrix) {
       {"ls #path", "ls ${HOME}", "ls /context/home", home_context,
        EXPAND_VARIABLE},
       {"ls $HOME", "ls $HOME", "ls $HOME", NULL, EXPAND_NONE},
-      {"cat * * *", "cat *.txt", "cat one.txt two.txt three.txt", glob_context,
+      {"cat *", "cat *.txt", "cat one.txt two.txt three.txt", glob_context,
        EXPAND_GLOB},
       {"ls #path project", "ls $HOME project", "ls /context/home project",
        home_context, EXPAND_VARIABLE},

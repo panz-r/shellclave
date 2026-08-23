@@ -1,6 +1,7 @@
 /* Unit tests for the standalone anomaly model. */
 
 #define _POSIX_C_SOURCE 200809L
+#include "../src/sg_anomaly_internal.h"
 #include "sg_anomaly.h"
 #include "test_sg_failures.h"
 #include <errno.h>
@@ -112,6 +113,11 @@ TEST(lifecycle_and_null_safety) {
   ASSERT_EQ_INT(sg_anomaly_unk_count(model), 0);
   ASSERT_EQ_DBL(sg_anomaly_kn_discount(model), 0.5, 0.000001);
   ASSERT(!sg_anomaly_model_had_error(model));
+  size_t empty_removed = 99;
+  ASSERT_EQ_INT(sg_anomaly_model_prune(model, 2, &empty_removed),
+                SG_ANOMALY_OK);
+  ASSERT_EQ_INT(empty_removed, 0);
+  ASSERT_EQ_INT(sg_anomaly_reset(NULL), SG_ANOMALY_ERR_INVALID);
 
   const char *invalid_sequences[][3] = {
       {"a", NULL, "c"},
@@ -142,8 +148,41 @@ TEST(lifecycle_and_null_safety) {
   ASSERT_EQ_INT(sg_anomaly_bi_count(NULL, "a", "b"), 0);
   ASSERT_EQ_INT(sg_anomaly_tri_count(NULL, "a", "b", "c"), 0);
   ASSERT_EQ_INT(sg_anomaly_quad_count(NULL, "a", "b", "c", "d"), 0);
+  char oversized[8192];
+  memset(oversized, 'x', sizeof(oversized) - 1);
+  oversized[sizeof(oversized) - 1] = '\0';
+  ASSERT_EQ_INT(sg_anomaly_bi_count(model, "", "b"), 0);
+  ASSERT_EQ_INT(sg_anomaly_bi_count(model, oversized, "b"), 0);
+  ASSERT_EQ_INT(sg_anomaly_tri_count(model, "", "b", "c"), 0);
+  ASSERT_EQ_INT(sg_anomaly_tri_count(model, oversized, "b", "c"), 0);
+  ASSERT_EQ_INT(sg_anomaly_quad_count(model, "", "b", "c", "d"), 0);
+  ASSERT_EQ_INT(sg_anomaly_quad_count(model, oversized, "b", "c", "d"), 0);
+  const char *oversized_sequence[] = {oversized, "b", "c", "d"};
+  ASSERT(isfinite(sg_anomaly_score(model, oversized_sequence, 4)));
+  const char *oversized_middle[] = {"a", oversized, "c", "d"};
+  const char *oversized_late[] = {"a", "b", oversized, "d"};
+  const char *oversized_last[] = {"a", "b", "c", oversized};
+  ASSERT(isfinite(sg_anomaly_score(model, oversized_middle, 4)));
+  ASSERT(isfinite(sg_anomaly_score(model, oversized_late, 4)));
+  ASSERT(isfinite(sg_anomaly_score(model, oversized_last, 4)));
   ASSERT_EQ_DBL(sg_anomaly_kn_discount(NULL), 0.0, 0.0);
   ASSERT(!sg_anomaly_has_observed(NULL, commands, 5));
+  ASSERT(!sg_anomaly_has_observed(model, NULL, 5));
+  FILE *stream = tmpfile();
+  ASSERT(stream != NULL);
+  ASSERT_EQ_INT(sg_anomaly_write_stream(NULL, stream), -1);
+  ASSERT_EQ_INT(sg_anomaly_write_stream(model, NULL), -1);
+  ASSERT_EQ_INT(sg_anomaly_read_stream(NULL, stream), -1);
+  ASSERT_EQ_INT(sg_anomaly_read_stream(model, NULL), -1);
+  rewind(stream);
+  ASSERT_EQ_INT(sg_anomaly_read_stream(model, stream), -1);
+  int close_result = fclose(stream);
+  ASSERT_EQ_INT(close_result, 0);
+  FILE *read_only = fopen("/dev/null", "rb");
+  ASSERT(read_only != NULL);
+  ASSERT_EQ_INT(sg_anomaly_write_stream(model, read_only), -1);
+  close_result = fclose(read_only);
+  ASSERT_EQ_INT(close_result, 0);
   size_t removed = 0;
   ASSERT_EQ_INT(sg_anomaly_model_prune(NULL, 2, &removed),
                 SG_ANOMALY_ERR_INVALID);
