@@ -20,41 +20,32 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "shell_netstring.h"
 #include "shelltype.h"
 
 /* Read one outer netstring whose payload is a complete canonical netargv. */
 static int read_netargv_record(FILE *stream, char **out) {
-  *out = NULL;
-  int first = fgetc(stream);
-  if (first == EOF)
-    return ferror(stream) ? -1 : 0;
-  if (first < '0' || first > '9')
+  unsigned char *record = NULL;
+  size_t record_length = 0;
+  shell_netstring_status_t status =
+      shell_netstring_read_stream(stream, 0, &record, &record_length);
+  if (status == SHELL_NETSTRING_DONE)
+    return 0;
+  if (status != SHELL_NETSTRING_OK)
     return -1;
-
-  size_t length = (size_t)(first - '0');
-  if (first == '0') {
-    if (fgetc(stream) != ':')
-      return -1;
-  } else {
-    int ch;
-    while ((ch = fgetc(stream)) != ':') {
-      if (ch < '0' || ch > '9' || length > (SIZE_MAX - (size_t)(ch - '0')) / 10)
-        return -1;
-      length = length * 10 + (size_t)(ch - '0');
-    }
-  }
-  if (length == SIZE_MAX)
-    return -1;
-  char *record = malloc(length + 1);
-  if (!record)
-    return -1;
-  if (fread(record, 1, length, stream) != length || fgetc(stream) != ',' ||
-      memchr(record, '\0', length) != NULL) {
+  shell_netstring_iter_t iter;
+  shell_netstring_view_t view;
+  if (shell_netstring_iter_init(&iter, record, record_length) !=
+          SHELL_NETSTRING_OK ||
+      shell_netstring_iter_next(&iter, &view) != SHELL_NETSTRING_OK ||
+      view.record_length != record_length ||
+      memchr(view.payload, '\0', view.payload_length) != NULL) {
     free(record);
     return -1;
   }
-  record[length] = '\0';
-  *out = record;
+  memmove(record, view.payload, view.payload_length);
+  record[view.payload_length] = '\0';
+  *out = (char *)record;
   return 1;
 }
 
@@ -101,7 +92,7 @@ static void print_usage(const char *prog) {
   fprintf(stderr, "  --load <file>        Load learner state from file\n");
   fprintf(stderr, "\n");
   fprintf(stderr, "Policy mode:\n");
-  fprintf(stderr, "  --policy <file>      Load a canonical v2 policy file\n");
+  fprintf(stderr, "  --policy <file>      Load a canonical v3 policy file\n");
   fprintf(stderr, "  --verify <netargv>   Verify canonical netstring argv "
                   "against policy\n");
   fprintf(stderr,

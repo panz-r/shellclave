@@ -118,7 +118,10 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-      - run: python3 -m pip install gcovr
+      # Pin the parser behavior used by the report commands below. GCC can
+      # emit both wrapped negative counters and counters above 2^32; gcovr
+      # 8.6 can handle both warning classes in one invocation.
+      - run: python3 -m pip install gcovr==8.6
       - run: >-
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
           -DSHELLCLAVE_ENABLE_COVERAGE=ON
@@ -129,6 +132,7 @@ jobs:
           gcovr --root . --filter shellsplit/src --print-summary
           --merge-mode-functions=merge-use-line-min
           --gcov-ignore-parse-errors=negative_hits.warn_once_per_file
+          --gcov-ignore-parse-errors=suspicious_hits.warn_once_per_file
           --fail-under-line 93 --fail-under-branch 80 --fail-under-function 100
           --txt=shellsplit-coverage.txt --xml-pretty
           --xml=shellsplit-coverage.xml
@@ -143,6 +147,7 @@ jobs:
           gcovr --root . --filter shelltype/src --print-summary
           --merge-mode-functions=merge-use-line-min
           --gcov-ignore-parse-errors=negative_hits.warn_once_per_file
+          --gcov-ignore-parse-errors=suspicious_hits.warn_once_per_file
           --fail-under-line 91 --fail-under-branch 82 --fail-under-function 100
           --txt=coverage.txt --xml-pretty --xml=coverage.xml
       - uses: actions/upload-artifact@v4
@@ -156,6 +161,7 @@ jobs:
           gcovr --root . --filter shellgate/src --print-summary
           --merge-mode-functions=merge-use-line-min
           --gcov-ignore-parse-errors=negative_hits.warn_once_per_file
+          --gcov-ignore-parse-errors=suspicious_hits.warn_once_per_file
           --fail-under-line 93 --fail-under-branch 77 --fail-under-function 100
           --txt=shellgate-coverage.txt --xml-pretty
           --xml=shellgate-coverage.xml

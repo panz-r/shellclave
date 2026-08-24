@@ -22,12 +22,16 @@
 #include <ctype.h>
 #include <math.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
 #include "sg_anomaly.h"
+#include "shell_abstract.h"
+#include "shell_netstring.h"
+#include "shell_processor.h"
 #include "shellgate.h"
 
 #define MAX_LINE 4096
@@ -56,6 +60,24 @@ typedef struct {
   double tpr, fpr, precision, f1;
 } roc_point_t;
 
+typedef struct {
+  char *raw_netseq;
+  char *type_netseq;
+  size_t count;
+} corpus_record_t;
+
+typedef shell_netstring_view_t netseq_span_t;
+
+static void free_corpus(corpus_record_t *records, size_t count) {
+  if (!records)
+    return;
+  for (size_t i = 0; i < count; i++) {
+    free(records[i].raw_netseq);
+    free(records[i].type_netseq);
+  }
+  free(records);
+}
+
 static char *trim(char *s) {
   while (isspace((unsigned char)*s))
     s++;
@@ -68,38 +90,74 @@ static char *trim(char *s) {
   return s;
 }
 
-static size_t tokenize_cmd(const char *line, char **tokens, size_t max_tokens,
-                           char *buf, size_t buf_size) {
-  size_t count = 0;
-  strncpy(buf, line, buf_size - 1);
-  buf[buf_size - 1] = '\0';
-  char *saveptr;
-  char *token = strtok_r(buf, " \t\r\n", &saveptr);
-  while (token && count < max_tokens) {
-    tokens[count++] = token;
-    token = strtok_r(NULL, " \t\r\n", &saveptr);
+static bool collect_netseq_views(const char *netseq, size_t length,
+                                 netseq_span_t *out, size_t capacity,
+                                 size_t *count) {
+  *count = 0;
+  shell_netstring_iter_t iter;
+  if (shell_netstring_iter_init(&iter, netseq, length) != SHELL_NETSTRING_OK)
+    return false;
+  shell_netstring_status_t status;
+  shell_netstring_view_t view;
+  for (;;) {
+    status = shell_netstring_iter_next(&iter, &view);
+    if (status != SHELL_NETSTRING_OK)
+      break;
+    if (*count == capacity)
+      return false;
+    out[(*count)++] = view;
   }
-  return count;
+  return status == SHELL_NETSTRING_DONE;
 }
 
-/* Build a semicolon-separated command string from token array */
-static size_t build_cmd_str(const char **tokens, size_t count, char *out,
-                            size_t out_size) {
-  size_t pos = 0;
-  for (size_t i = 0; i < count && pos < out_size - 1; i++) {
-    size_t tlen = strlen(tokens[i]);
-    if (pos + tlen + 2 >= out_size)
-      break;
-    if (i > 0) {
-      out[pos++] = ' ';
-      out[pos++] = ';';
-      out[pos++] = ' ';
-    }
-    memcpy(out + pos, tokens[i], tlen);
-    pos += tlen;
+static bool rare_spans(const char *command, netseq_span_t *raw,
+                       netseq_span_t *type, char raw_buf[64],
+                       char type_buf[80]) {
+  size_t length = strlen(command);
+  size_t raw_written = 0;
+  if (shell_netstring_write(raw_buf, 64, command, length, &raw_written) !=
+      SHELL_NETSTRING_OK)
+    return false;
+  size_t type_written = 0;
+  if (shell_netstring_write(type_buf, 80, raw_buf, raw_written,
+                            &type_written) != SHELL_NETSTRING_OK)
+    return false;
+  *raw = (netseq_span_t){(const unsigned char *)raw_buf, raw_written, NULL, 0};
+  *type =
+      (netseq_span_t){(const unsigned char *)type_buf, type_written, NULL, 0};
+  return true;
+}
+
+static char *render_selection(const netseq_span_t *spans, size_t count,
+                              const size_t *order, const char *rare_command,
+                              bool type_sequence) {
+  char raw_buf[64], type_buf[80];
+  netseq_span_t rare_raw, rare_type;
+  if (rare_command &&
+      !rare_spans(rare_command, &rare_raw, &rare_type, raw_buf, type_buf))
+    return NULL;
+  size_t total = 0;
+  for (size_t i = 0; i < count; i++) {
+    netseq_span_t span = order[i] == SIZE_MAX
+                             ? (type_sequence ? rare_type : rare_raw)
+                             : spans[order[i]];
+    if (span.record_length > SIZE_MAX - total)
+      return NULL;
+    total += span.record_length;
   }
-  out[pos] = '\0';
-  return pos;
+  char *out = malloc(total + 1);
+  if (!out)
+    return NULL;
+  size_t used = 0;
+  for (size_t i = 0; i < count; i++) {
+    netseq_span_t span = order[i] == SIZE_MAX
+                             ? (type_sequence ? rare_type : rare_raw)
+                             : spans[order[i]];
+    memcpy(out + used, span.record, span.record_length);
+    used += span.record_length;
+  }
+  out[used] = '\0';
+  return out;
 }
 
 static unsigned int rand_uint(unsigned int *state) {
@@ -108,8 +166,7 @@ static unsigned int rand_uint(unsigned int *state) {
 }
 
 /* Perturbation: swap two adjacent commands */
-static bool perturb_swap(const char **tokens, size_t count, char *out,
-                         size_t out_size, unsigned int *rng) {
+static bool perturb_swap(size_t *order, size_t count, unsigned int *rng) {
   if (count < 2)
     return false;
   /* Pick two random positions to swap */
@@ -118,76 +175,69 @@ static bool perturb_swap(const char **tokens, size_t count, char *out,
   if (a == b)
     b = (b + 1) % count;
 
-  const char *copy[MAX_TOKENS];
   for (size_t i = 0; i < count; i++)
-    copy[i] = tokens[i];
-  const char *tmp = copy[a];
-  copy[a] = copy[b];
-  copy[b] = tmp;
-  build_cmd_str(copy, count, out, out_size);
+    order[i] = i;
+  size_t tmp = order[a];
+  order[a] = order[b];
+  order[b] = tmp;
   return true;
 }
 
 /* Perturbation: insert a random rare command */
-static bool perturb_insert(const char **tokens, size_t count, char *out,
-                           size_t out_size, unsigned int *rng) {
+static bool perturb_insert(size_t *order, size_t *out_count, size_t count,
+                           unsigned int *rng) {
   if (count < 2)
     return false;
-  const char *copy[MAX_TOKENS + 2];
+  if (count >= MAX_TOKENS)
+    return false;
   size_t insert_pos = rand_uint(rng) % (count + 1);
   size_t j = 0;
-  for (size_t i = 0; i < count && j < MAX_TOKENS; i++) {
+  for (size_t i = 0; i < count; i++) {
     if (i == insert_pos) {
-      copy[j++] = rare_cmds[rand_uint(rng) % NUM_RARE];
+      order[j++] = SIZE_MAX;
     }
-    copy[j++] = tokens[i];
+    order[j++] = i;
   }
-  if (insert_pos == count && j < MAX_TOKENS)
-    copy[j++] = rare_cmds[rand_uint(rng) % NUM_RARE];
-  build_cmd_str(copy, j, out, out_size);
+  if (insert_pos == count)
+    order[j++] = SIZE_MAX;
+  *out_count = j;
   return true;
 }
 
 /* Perturbation: substitute one command with a rare one */
-static bool perturb_substitute(const char **tokens, size_t count, char *out,
-                               size_t out_size, unsigned int *rng) {
+static bool perturb_substitute(size_t *order, size_t count, unsigned int *rng) {
   if (count == 0)
     return false;
-  const char *copy[MAX_TOKENS];
   size_t pos = rand_uint(rng) % count;
   for (size_t i = 0; i < count; i++) {
-    copy[i] = (i == pos) ? rare_cmds[rand_uint(rng) % NUM_RARE] : tokens[i];
+    order[i] = i == pos ? SIZE_MAX : i;
   }
-  build_cmd_str(copy, count, out, out_size);
   return true;
 }
 
 /* Perturbation: shuffle all tokens */
-static bool perturb_shuffle(const char **tokens, size_t count, char *out,
-                            size_t out_size, unsigned int *rng) {
+static bool perturb_shuffle(size_t *order, size_t count, unsigned int *rng) {
   if (count < 2)
     return false;
-  const char *copy[MAX_TOKENS];
   for (size_t i = 0; i < count; i++)
-    copy[i] = tokens[i];
+    order[i] = i;
   /* Shuffle token copies in-place using Fisher-Yates. */
   for (size_t i = count - 1; i > 0; i--) {
     size_t j = rand_uint(rng) % (i + 1);
-    const char *tmp = copy[i];
-    copy[i] = copy[j];
-    copy[j] = tmp;
+    size_t tmp = order[i];
+    order[i] = order[j];
+    order[j] = tmp;
   }
   /* Check that shuffle actually changed something */
   bool changed = false;
   for (size_t i = 0; i < count; i++) {
-    if (copy[i] != tokens[i]) {
+    if (order[i] != i) {
       changed = true;
       break;
     }
   }
   if (!changed)
     return false;
-  build_cmd_str(copy, count, out, out_size);
   return true;
 }
 
@@ -266,15 +316,29 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  /* Load normal corpus */
+  sg_gate_t *gate = sg_gate_new();
+  if (!gate || sg_gate_enable_anomaly(gate, 5.0, 0.1, -10.0) != SG_OK) {
+    sg_gate_free(gate);
+    fprintf(stderr, "Cannot create anomaly gate\n");
+    return 1;
+  }
+
+  /* Load and train from the normal shell-source corpus. */
   FILE *fp = fopen(normal_path, "r");
   if (!fp) {
     fprintf(stderr, "Cannot open %s: ", normal_path);
     perror(NULL);
+    sg_gate_free(gate);
     return 1;
   }
 
-  char **normal_cmds = calloc(MAX_CMDS, sizeof(char *));
+  corpus_record_t *normal = calloc(MAX_CMDS, sizeof(*normal));
+  if (!normal) {
+    fclose(fp);
+    sg_gate_free(gate);
+    fprintf(stderr, "Cannot allocate corpus storage\n");
+    return 1;
+  }
   size_t normal_count = 0;
   char line[MAX_LINE];
 
@@ -282,26 +346,36 @@ int main(int argc, char **argv) {
     char *cmd = trim(line);
     if (!*cmd)
       continue;
-    normal_cmds[normal_count++] = strdup(cmd);
+    char *raw = NULL, *type = NULL;
+    size_t raw_count = 0, type_count = 0;
+    if (shell_build_command_netseq(cmd, NULL, &raw, &raw_count) !=
+            SHELL_PROCESS_OK ||
+        shell_build_type_netseq(cmd, NULL, &type, &type_count) !=
+            SHELL_PROCESS_OK ||
+        raw_count == 0 || raw_count != type_count) {
+      free(raw);
+      free(type);
+      continue;
+    }
+    char buf[8192];
+    sg_result_t result;
+    if (sg_eval(gate, cmd, strlen(cmd), buf, sizeof(buf), &result) != SG_OK) {
+      free(raw);
+      free(type);
+      continue;
+    }
+    normal[normal_count++] = (corpus_record_t){raw, type, raw_count};
   }
   fclose(fp);
 
   if (normal_count == 0) {
     fprintf(stderr, "No commands in corpus\n");
+    free_corpus(normal, normal_count);
+    sg_gate_free(gate);
     return 1;
   }
   fprintf(stderr, "Loaded %zu normal commands\n", normal_count);
 
-  /* Create gate and train model */
-  sg_gate_t *gate = sg_gate_new();
-  sg_gate_enable_anomaly(gate, 5.0, 0.1, -10.0);
-
-  /* Allow all commands for training */
-  for (size_t i = 0; i < normal_count; i++) {
-    char buf[8192];
-    sg_result_t r;
-    sg_eval(gate, normal_cmds[i], strlen(normal_cmds[i]), buf, sizeof(buf), &r);
-  }
   fprintf(stderr, "Model trained (vocab=%zu)\n",
           sg_gate_anomaly_vocab_size(gate));
 
@@ -312,73 +386,89 @@ int main(int argc, char **argv) {
 
   /* Score normal commands */
   double *normal_scores = calloc(normal_count, sizeof(double));
+  if (!normal_scores) {
+    fprintf(stderr, "Cannot allocate normal scores\n");
+    free_corpus(normal, normal_count);
+    sg_gate_free(gate);
+    return 1;
+  }
   for (size_t i = 0; i < normal_count; i++) {
-    char buf[8192];
-    sg_result_t r;
-    sg_eval(gate, normal_cmds[i], strlen(normal_cmds[i]), buf, sizeof(buf), &r);
-    normal_scores[i] = r.anomaly_score;
+    sg_anomaly_sequence_score_t score = {0};
+    if (sg_gate_score_anomaly_netseq(
+            gate, normal[i].raw_netseq, strlen(normal[i].raw_netseq),
+            normal[i].type_netseq, strlen(normal[i].type_netseq),
+            &score) != SG_OK) {
+      fprintf(stderr, "Cannot score canonical corpus record\n");
+      free(normal_scores);
+      free_corpus(normal, normal_count);
+      sg_gate_free(gate);
+      return 1;
+    }
+    normal_scores[i] = score.combined_score;
   }
 
   /* Generate and score synthetic anomalies */
-  char **synth_cmds = calloc(MAX_SYNTHTETIC, sizeof(char *));
   double *synth_scores = calloc(MAX_SYNTHTETIC, sizeof(double));
+  if (!synth_scores) {
+    fprintf(stderr, "Cannot allocate synthetic scores\n");
+    free(normal_scores);
+    free_corpus(normal, normal_count);
+    sg_gate_free(gate);
+    return 1;
+  }
   size_t synth_count = 0;
 
-  char tok_buf[MAX_LINE];
-  char *tok_ptrs[MAX_TOKENS];
-  char synth_buf[MAX_LINE];
-
   for (size_t i = 0; i < normal_count && synth_count < MAX_SYNTHTETIC; i++) {
-    strncpy(tok_buf, normal_cmds[i], sizeof(tok_buf) - 1);
-    tok_buf[sizeof(tok_buf) - 1] = '\0';
-    size_t tcount = tokenize_cmd(normal_cmds[i], (char **)tok_ptrs, MAX_TOKENS,
-                                 tok_buf, sizeof(tok_buf));
-    if (tcount < 2)
+    if (normal[i].count < 2 || normal[i].count > MAX_TOKENS)
       continue;
-
-    /* We need the original tokens as strings for perturbation */
-    char *orig_dup = strdup(normal_cmds[i]);
-    char *saveptr;
-    const char *tokens[MAX_TOKENS];
-    char *tok = strtok_r(orig_dup, " \t\r\n;", &saveptr);
-    size_t ntok = 0;
-    while (tok && ntok < MAX_TOKENS) {
-      tokens[ntok++] = tok;
-      tok = strtok_r(NULL, " \t\r\n;", &saveptr);
-    }
+    netseq_span_t raw_spans[MAX_TOKENS], type_spans[MAX_TOKENS];
+    size_t raw_count = 0, type_count = 0;
+    if (!collect_netseq_views(normal[i].raw_netseq,
+                              strlen(normal[i].raw_netseq), raw_spans,
+                              MAX_TOKENS, &raw_count) ||
+        !collect_netseq_views(normal[i].type_netseq,
+                              strlen(normal[i].type_netseq), type_spans,
+                              MAX_TOKENS, &type_count) ||
+        raw_count != normal[i].count || type_count != raw_count)
+      continue;
 
     for (int n = 0; n < num_synth_per_cmd && synth_count < MAX_SYNTHTETIC;
          n++) {
+      size_t order[MAX_TOKENS + 1];
+      size_t selected_count = raw_count;
+      const char *rare = rare_cmds[rand_uint(&rng) % NUM_RARE];
       bool ok = false;
 
       if (ptype == PERTURB_SWAP || ptype == PERTURB_ALL) {
-        ok = perturb_swap(tokens, ntok, synth_buf, sizeof(synth_buf), &rng);
+        ok = perturb_swap(order, raw_count, &rng);
       }
       if (!ok && (ptype == PERTURB_INSERT || ptype == PERTURB_ALL)) {
-        ok = perturb_insert(tokens, ntok, synth_buf, sizeof(synth_buf), &rng);
+        ok = perturb_insert(order, &selected_count, raw_count, &rng);
       }
       if (!ok && (ptype == PERTURB_SUBSTITUTE || ptype == PERTURB_ALL)) {
-        ok = perturb_substitute(tokens, ntok, synth_buf, sizeof(synth_buf),
-                                &rng);
+        ok = perturb_substitute(order, raw_count, &rng);
       }
       if (!ok && (ptype == PERTURB_SHUFFLE || ptype == PERTURB_ALL)) {
-        ok = perturb_shuffle(tokens, ntok, synth_buf, sizeof(synth_buf), &rng);
+        ok = perturb_shuffle(order, raw_count, &rng);
       }
-      if (!ok) {
-        free(orig_dup);
+      if (!ok)
+        continue;
+      char *raw =
+          render_selection(raw_spans, selected_count, order, rare, false);
+      char *type =
+          render_selection(type_spans, selected_count, order, rare, true);
+      if (!raw || !type) {
+        free(raw);
+        free(type);
         continue;
       }
-
-      synth_cmds[synth_count] = strdup(synth_buf);
-
-      /* Score the synthetic anomaly */
-      char buf[8192];
-      sg_result_t r;
-      sg_eval(gate, synth_buf, strlen(synth_buf), buf, sizeof(buf), &r);
-      synth_scores[synth_count] = r.anomaly_score;
-      synth_count++;
+      sg_anomaly_sequence_score_t score = {0};
+      if (sg_gate_score_anomaly_netseq(gate, raw, strlen(raw), type,
+                                       strlen(type), &score) == SG_OK)
+        synth_scores[synth_count++] = score.combined_score;
+      free(raw);
+      free(type);
     }
-    free(orig_dup);
   }
 
   fprintf(stderr, "Generated %zu synthetic anomalies\n", synth_count);
@@ -388,6 +478,14 @@ int main(int argc, char **argv) {
   if (num_thresholds > 1000)
     num_thresholds = 1000;
   roc_point_t *roc = calloc(num_thresholds, sizeof(roc_point_t));
+  if (!roc) {
+    fprintf(stderr, "Cannot allocate ROC output\n");
+    free(synth_scores);
+    free(normal_scores);
+    free_corpus(normal, normal_count);
+    sg_gate_free(gate);
+    return 1;
+  }
 
   for (size_t t = 0; t < num_thresholds; t++) {
     double threshold = t_start + t * t_step;
@@ -447,6 +545,11 @@ int main(int argc, char **argv) {
     out = fopen(output_path, "w");
     if (!out) {
       fprintf(stderr, "Cannot open output: %s\n", output_path);
+      free(roc);
+      free(synth_scores);
+      free(normal_scores);
+      free_corpus(normal, normal_count);
+      sg_gate_free(gate);
       return 1;
     }
   }
@@ -502,13 +605,8 @@ int main(int argc, char **argv) {
     fclose(out);
 
   /* Release temporary buffers before returning. */
-  for (size_t i = 0; i < normal_count; i++)
-    free(normal_cmds[i]);
-  free(normal_cmds);
+  free_corpus(normal, normal_count);
   free(normal_scores);
-  for (size_t i = 0; i < synth_count; i++)
-    free(synth_cmds[i]);
-  free(synth_cmds);
   free(synth_scores);
   free(roc);
   sg_gate_free(gate);

@@ -227,6 +227,20 @@ static int test_expressive_literal_suggestions(void) {
   return 1;
 }
 
+static int test_compound_option_suggestion(void) {
+  st_learner_t *learner = st_learner_new(2, 0.0);
+  ASSERT(learner != NULL);
+  ASSERT(test_st_feed(learner, "tool --output=/tmp/one") == ST_OK);
+  ASSERT(test_st_feed(learner, "tool --output=/var/two") == ST_OK);
+  size_t count = 0;
+  st_suggestion_t *suggestions = st_suggest(learner, &count);
+  ASSERT(suggestions != NULL);
+  ASSERT(find_suggestion(suggestions, count, "tool --output={#p}"));
+  st_free_suggestions(suggestions, count);
+  st_learner_free(learner);
+  return 1;
+}
+
 static int test_learner_state_transitions(void) {
   st_learner_t *learner = st_learner_new(1, 0.0);
   ASSERT(learner && learner->trie.root);
@@ -1125,31 +1139,31 @@ static int test_serialization_roundtrip_and_validation(void) {
   }
 
   static const char *const malformed_framed[] = {
-      "# shelltype-learner v4\n# total-commands: x\n# nodes: 0\n"
+      "# shelltype-learner v5\n# total-commands: x\n# nodes: 0\n"
       "# CRC32: 00000000\n",
-      "# shelltype-learner v4\n# total-commands: 0x\n# nodes: 0\n"
+      "# shelltype-learner v5\n# total-commands: 0x\n# nodes: 0\n"
       "# CRC32: 00000000\n",
-      "# shelltype-learner v4\n# total-commands: 0\n# nodes: x\n"
+      "# shelltype-learner v5\n# total-commands: 0\n# nodes: x\n"
       "# CRC32: 00000000\n",
-      "# shelltype-learner v4\n# total-commands: 0\n# nodes: 4294967295\n"
+      "# shelltype-learner v5\n# total-commands: 0\n# nodes: 4294967295\n"
       "# CRC32: 00000000\n",
-      "# shelltype-learner v4\n# total-commands: 0\n# nodes: 0\n"
+      "# shelltype-learner v5\n# total-commands: 0\n# nodes: 0\n"
       "# CRC32: 0000000X\n",
-      "# shelltype-learner v4\n# total-commands: 0\n# nodes: 0\n"
+      "# shelltype-learner v5\n# total-commands: 0\n# nodes: 0\n"
       "# CRC32: 00000000\ntrailing\n",
-      "# shelltype-learner v4\n# total-commands: 1\n# nodes: 0\n"
+      "# shelltype-learner v5\n# total-commands: 1\n# nodes: 0\n"
       "# CRC32: 00000000\n",
-      "# shelltype-learner v4\n# total-commands: 0\n# nodes: 1\n"
+      "# shelltype-learner v5\n# total-commands: 0\n# nodes: 1\n"
       "# CRC32: 00000000\n",
-      "# shelltype-learner v4\n# total-commands: 1\n# nodes: 1\n"
+      "# shelltype-learner v5\n# total-commands: 1\n# nodes: 1\n"
       "4:1:x,,\n# CRC32: 00000000\n",
-      "# shelltype-learner v4\n# total-commands: 1\n# nodes: 1\n"
+      "# shelltype-learner v5\n# total-commands: 1\n# nodes: 1\n"
       "31:1:2,1:0,1:L,1:0,1:1,0:,1:0,1:x,,\n# CRC32: 00000000\n",
-      "# shelltype-learner v4\n# total-commands: 1\n# nodes: 1\n"
+      "# shelltype-learner v5\n# total-commands: 1\n# nodes: 1\n"
       "31:1:1,1:0,1:L,1:1,1:1,0:,1:0,1:x,,\n# CRC32: 00000000\n",
-      "# shelltype-learner v4\n# total-commands: 1\n# nodes: 1\n"
+      "# shelltype-learner v5\n# total-commands: 1\n# nodes: 1\n"
       "33:1:1,1:0,1:T,1:6,1:1,1:-,1:1,1:x,,\n# CRC32: 00000000\n",
-      "# shelltype-learner v4\n# total-commands: 1\n# nodes: 1\n"
+      "# shelltype-learner v5\n# total-commands: 1\n# nodes: 1\n"
       "33:1:1,1:0,1:L,1:0,1:1,1:!,1:0,1:x,,\n# CRC32: 00000000\n",
   };
   for (size_t i = 0; i < sizeof(malformed_framed) / sizeof(malformed_framed[0]);
@@ -1804,6 +1818,7 @@ int main(void) {
   TEST(test_learner_save_crash_boundaries);
   TEST(test_feed_is_atomic);
   TEST(test_expressive_literal_suggestions);
+  TEST(test_compound_option_suggestion);
   printf("\nResults: %d/%d passed, %d failed\n", tests_passed, tests_run,
          tests_failed);
   return tests_failed > 0 ? 1 : 0;

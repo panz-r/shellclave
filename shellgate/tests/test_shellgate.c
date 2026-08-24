@@ -13,6 +13,12 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+/* shellgate_test links shellsplit_test so this regression can fault the
+ * allocation made while building canonical anomaly netsequences. */
+void shellsplit_test_alloc_fail_at(size_t allocation_index);
+void shellsplit_test_alloc_reset(void);
+size_t shellsplit_test_alloc_count(void);
+
 static int pass_count = 0;
 static int fail_count = 0;
 
@@ -141,15 +147,19 @@ static sg_gate_t *gate_with_rules(const char *const *rules, size_t count) {
 }
 
 static sg_error_t add_exact_outer_rule(sg_gate_t *gate, const char *command) {
-  const char **inputs = NULL;
+  shell_command_info_t *commands = NULL;
   size_t count = 0;
-  bool features = false;
-  if (shell_extract_netargv_inputs(command, NULL, &inputs, &count, &features) !=
+  if (shell_process_command(command, NULL, &commands, &count) !=
           SHELL_PROCESS_OK ||
       count == 0)
     return SG_ERR_PARSE;
+  char *netargv = NULL;
+  if (shell_render_netargv(&commands[0], NULL, &netargv) != SHELL_PROCESS_OK) {
+    shell_free_command_infos(commands, count);
+    return SG_ERR_PARSE;
+  }
   st_token_array_t tokens = {0};
-  st_error_t error = st_classify(inputs[0], &tokens);
+  st_error_t error = st_classify(netargv, &tokens);
   char *netpattern = NULL, *cpl = NULL;
   if (error == ST_OK) {
     for (size_t i = 0; i < tokens.count; i++)
@@ -163,9 +173,8 @@ static sg_error_t add_exact_outer_rule(sg_gate_t *gate, const char *command) {
   free(cpl);
   free(netpattern);
   st_free_token_array(&tokens);
-  for (size_t i = 0; i < count; i++)
-    free((void *)inputs[i]);
-  free(inputs);
+  free(netargv);
+  shell_free_command_infos(commands, count);
   return result;
 }
 
@@ -241,8 +250,8 @@ TEST(setter_matrix) {
     ASSERT(sg_gate_set_reject_mask(g, masks[i]) == SG_OK);
   ASSERT(sg_gate_set_suggestions(g, true) == SG_OK);
   ASSERT(sg_gate_set_suggestions(g, false) == SG_OK);
-  ASSERT(sg_gate_set_expand_var(g, NULL, NULL) == SG_OK);
-  ASSERT(sg_gate_set_expand_glob(g, NULL, NULL) == SG_OK);
+  ASSERT(sg_gate_set_expand_var_netargv(g, NULL, NULL) == SG_OK);
+  ASSERT(sg_gate_set_expand_glob_netargv(g, NULL, NULL) == SG_OK);
   sg_violation_config_t config;
   sg_violation_config_default(&config);
   ASSERT(sg_gate_set_violation_config(g, &config) == SG_OK);
@@ -262,8 +271,8 @@ TEST(setter_matrix) {
          SG_ERR_INVALID);
   ASSERT(sg_gate_set_suggestions(NULL, true) == SG_ERR_INVALID);
   ASSERT(sg_gate_set_reject_mask(NULL, 0) == SG_ERR_INVALID);
-  ASSERT(sg_gate_set_expand_var(NULL, NULL, NULL) == SG_ERR_INVALID);
-  ASSERT(sg_gate_set_expand_glob(NULL, NULL, NULL) == SG_ERR_INVALID);
+  ASSERT(sg_gate_set_expand_var_netargv(NULL, NULL, NULL) == SG_ERR_INVALID);
+  ASSERT(sg_gate_set_expand_glob_netargv(NULL, NULL, NULL) == SG_ERR_INVALID);
   ASSERT(sg_gate_set_violation_config(NULL, &config) == SG_ERR_INVALID);
   ASSERT(sg_gate_set_violation_config(g, NULL) == SG_ERR_INVALID);
   sg_gate_free(g);
@@ -351,14 +360,40 @@ TEST(basic_evaluation_matrix) {
     ASSERT(!result.truncated);
     for (size_t j = 0; j < cases[i].evaluated_count; j++) {
       ASSERT(result.subcmds[j].command != NULL);
+      ASSERT(result.subcmds[j].netargv != NULL);
+      ASSERT(strlen(result.subcmds[j].netargv) ==
+             result.subcmds[j].netargv_length);
+      st_token_array_t decoded = {0};
+      ASSERT(st_classify(result.subcmds[j].netargv, &decoded) == ST_OK);
+      ASSERT(decoded.count > 0);
+      st_free_token_array(&decoded);
       ASSERT_STR(result.subcmds[j].command, cases[i].evaluated[j].command);
       ASSERT(result.subcmds[j].matches == cases[i].evaluated[j].matches);
       ASSERT(result.subcmds[j].verdict == (cases[i].evaluated[j].matches
                                                ? SG_VERDICT_ALLOW
                                                : SG_VERDICT_UNDETERMINED));
     }
+    if (i == 1)
+      ASSERT_STR(result.subcmds[0].netargv, "4:echo,9:two words,");
+    if (i == 2)
+      ASSERT_STR(result.subcmds[0].netargv, "6:printf,0:,");
     sg_gate_free(g);
   }
+
+  sg_gate_t *g = sg_gate_new();
+  ASSERT(g != NULL);
+  sg_result_t result = {0};
+  char diagnostic[32];
+  ASSERT(sg_eval(g, "foo() { echo x; }", 17, diagnostic, sizeof(diagnostic),
+                 &result) == SG_ERR_PARSE);
+  ASSERT(result.verdict == SG_VERDICT_REJECT);
+  ASSERT(strcmp(diagnostic, "depgraph error") == 0);
+  char truncated[4];
+  ASSERT(sg_eval(g, "{ echo x; }", 11, truncated, sizeof(truncated), &result) ==
+         SG_ERR_TRUNC);
+  ASSERT(result.truncated);
+  ASSERT(result.verdict == SG_VERDICT_UNDETERMINED);
+  sg_gate_free(g);
 }
 
 /* --- FEATURE REJECTION --- */
@@ -1437,40 +1472,52 @@ TEST(suggestion_token_variant_contract) {
 
 /* --- EXPANSION CALLBACKS --- */
 
-static size_t expand_home(const char *name, char *buf, size_t buf_size,
-                          void *ctx) {
-  if (strcmp(name, "HOME") == 0) {
-    const char *val = ctx;
-    if (!val)
-      return 0;
-    size_t len = strlen(val);
-    if (len >= buf_size)
-      return 0;
-    memcpy(buf, val, len + 1);
-    return len;
-  }
-  return 0;
+static sg_expand_status_t expand_canonical(const char *name, char *buf,
+                                           size_t buf_size, size_t *length,
+                                           void *ctx) {
+  (void)name;
+  const char *encoded = ctx;
+  if (!encoded)
+    return SG_EXPAND_UNRESOLVED;
+  size_t encoded_length = strlen(encoded);
+  if (encoded_length >= buf_size)
+    return SG_EXPAND_FAILED;
+  memcpy(buf, encoded, encoded_length + 1);
+  *length = encoded_length;
+  return SG_EXPAND_RESOLVED;
 }
 
-static size_t expand_txt_glob(const char *pattern, char *buf, size_t buf_size,
-                              void *ctx) {
-  if (strcmp(pattern, "*.txt") == 0) {
-    const char *val = ctx;
-    if (!val)
-      return 0;
-    size_t len = strlen(val);
-    if (len >= buf_size)
-      return 0;
-    memcpy(buf, val, len + 1);
-    return len;
-  }
-  return 0;
+static sg_expand_status_t expand_home_canonical(const char *name, char *buf,
+                                                size_t buf_size, size_t *length,
+                                                void *ctx) {
+  return strcmp(name, "HOME") == 0
+             ? expand_canonical(name, buf, buf_size, length, ctx)
+             : SG_EXPAND_UNRESOLVED;
+}
+
+static sg_expand_status_t expand_txt_canonical(const char *pattern, char *buf,
+                                               size_t buf_size, size_t *length,
+                                               void *ctx) {
+  return strcmp(pattern, "*.txt") == 0
+             ? expand_canonical(pattern, buf, buf_size, length, ctx)
+             : SG_EXPAND_UNRESOLVED;
+}
+
+static sg_expand_status_t expand_invalid_canonical(const char *name, char *buf,
+                                                   size_t buf_size,
+                                                   size_t *length, void *ctx) {
+  (void)name;
+  (void)buf;
+  (void)buf_size;
+  (void)ctx;
+  *length = 0;
+  return (sg_expand_status_t)2;
 }
 
 TEST(expansion_callback_matrix) {
   enum expansion_kind { EXPAND_NONE, EXPAND_VARIABLE, EXPAND_GLOB };
-  static char home_context[] = "/context/home";
-  static char glob_context[] = "one.txt two.txt three.txt";
+  static char home_context[] = "13:/context/home,";
+  static char glob_context[] = "7:one.txt,7:two.txt,9:three.txt,";
   static const struct {
     const char *rule;
     const char *input;
@@ -1485,7 +1532,7 @@ TEST(expansion_callback_matrix) {
       {"ls #path", "ls ${HOME}", "ls /context/home", home_context,
        EXPAND_VARIABLE},
       {"ls $HOME", "ls $HOME", "ls $HOME", NULL, EXPAND_NONE},
-      {"cat *", "cat *.txt", "cat one.txt two.txt three.txt", glob_context,
+      {"cat * * *", "cat *.txt", "cat one.txt two.txt three.txt", glob_context,
        EXPAND_GLOB},
       {"ls #path project", "ls $HOME project", "ls /context/home project",
        home_context, EXPAND_VARIABLE},
@@ -1496,10 +1543,11 @@ TEST(expansion_callback_matrix) {
     ASSERT(g != NULL);
     ASSERT_SG_OK(sg_gate_add_rule(g, cases[i].rule));
     if (cases[i].kind == EXPAND_VARIABLE)
-      ASSERT_SG_OK(sg_gate_set_expand_var(g, expand_home, cases[i].context));
+      ASSERT_SG_OK(sg_gate_set_expand_var_netargv(g, expand_home_canonical,
+                                                  cases[i].context));
     else if (cases[i].kind == EXPAND_GLOB)
-      ASSERT_SG_OK(
-          sg_gate_set_expand_glob(g, expand_txt_glob, cases[i].context));
+      ASSERT_SG_OK(sg_gate_set_expand_glob_netargv(g, expand_txt_canonical,
+                                                   cases[i].context));
 
     sg_result_t result;
     ASSERT(eval_cmd(g, cases[i].input, &result) == SG_OK);
@@ -1508,33 +1556,91 @@ TEST(expansion_callback_matrix) {
     ASSERT_STR(result.subcmds[0].command, cases[i].expanded);
     sg_gate_free(g);
   }
+
+  sg_gate_t *canonical = sg_gate_new();
+  ASSERT(canonical != NULL);
+  ASSERT_SG_OK(sg_gate_add_rule(canonical, "cat #f #f"));
+  ASSERT_SG_OK(sg_gate_set_expand_glob_netargv(canonical, expand_canonical,
+                                               "7:one.txt,7:two.txt,"));
+  sg_result_t result;
+  ASSERT_SG_OK(eval_cmd(canonical, "cat *.txt", &result));
+  ASSERT(result.verdict == SG_VERDICT_ALLOW);
+  ASSERT_STR(result.subcmds[0].netargv, "3:cat,7:one.txt,7:two.txt,");
+  sg_gate_free(canonical);
+
+  canonical = sg_gate_new();
+  ASSERT(canonical != NULL);
+  ASSERT_SG_OK(sg_gate_add_rule(canonical, "echo \"two words\""));
+  ASSERT_SG_OK(sg_gate_set_expand_var_netargv(canonical, expand_canonical,
+                                              "9:two words,"));
+  ASSERT_SG_OK(eval_cmd(canonical, "echo $VALUE", &result));
+  ASSERT(result.verdict == SG_VERDICT_ALLOW);
+  ASSERT_STR(result.subcmds[0].netargv, "4:echo,9:two words,");
+  ASSERT_STR(result.subcmds[0].command, "echo two words");
+  ASSERT(strcmp(result.subcmds[0].command, result.subcmds[0].netargv) != 0);
+  sg_gate_free(canonical);
+
+  canonical = sg_gate_new();
+  ASSERT(canonical != NULL);
+  ASSERT_SG_OK(sg_gate_add_rule(canonical, "echo tail"));
+  ASSERT_SG_OK(sg_gate_set_expand_var_netargv(canonical, expand_canonical, ""));
+  ASSERT_SG_OK(eval_cmd(canonical, "echo $DROP tail", &result));
+  ASSERT(result.verdict == SG_VERDICT_ALLOW);
+  ASSERT_STR(result.subcmds[0].netargv, "4:echo,4:tail,");
+  sg_gate_free(canonical);
+
+  canonical = sg_gate_new();
+  ASSERT(canonical != NULL);
+  ASSERT_SG_OK(sg_gate_add_rule(canonical, "echo \"\" tail"));
+  ASSERT_SG_OK(
+      sg_gate_set_expand_var_netargv(canonical, expand_canonical, "0:,"));
+  ASSERT_SG_OK(eval_cmd(canonical, "echo $EMPTY tail", &result));
+  ASSERT_STR(result.subcmds[0].netargv, "4:echo,0:,4:tail,");
+  ASSERT(result.verdict == SG_VERDICT_ALLOW);
+  sg_gate_free(canonical);
+
+  canonical = sg_gate_new();
+  ASSERT(canonical != NULL);
+  ASSERT_SG_OK(
+      sg_gate_set_expand_var_netargv(canonical, expand_canonical, "3:bad"));
+  ASSERT(eval_cmd(canonical, "echo $BAD", &result) == SG_ERR_EXPAND);
+  sg_gate_free(canonical);
+
+  canonical = sg_gate_new();
+  ASSERT(canonical != NULL);
+  ASSERT_SG_OK(sg_gate_set_expand_var_netargv(canonical,
+                                              expand_invalid_canonical, NULL));
+  ASSERT(eval_cmd(canonical, "echo $BAD", &result) == SG_ERR_EXPAND);
+  sg_gate_free(canonical);
 }
 
-static size_t expand_invalid_length(const char *name, char *buf,
-                                    size_t buf_size, void *ctx) {
+static sg_expand_status_t expand_requested_length(const char *name, char *buf,
+                                                  size_t buf_size,
+                                                  size_t *length, void *ctx) {
   (void)name;
-  (void)buf;
-  (void)ctx;
-  return buf_size;
-}
-
-static size_t expand_requested_length(const char *name, char *buf,
-                                      size_t buf_size, void *ctx) {
-  (void)name;
-  size_t length = *(const size_t *)ctx;
-  if (length < buf_size) {
-    memset(buf, 'x', length);
-    buf[length] = '\0';
+  size_t requested = *(const size_t *)ctx;
+  *length = requested;
+  if (requested == 4095 && requested < buf_size) {
+    int prefix = snprintf(buf, buf_size, "4089:");
+    if (prefix != 5)
+      return SG_EXPAND_FAILED;
+    memset(buf + prefix, 'x', 4089);
+    buf[4094] = ',';
+    buf[4095] = '\0';
+    return SG_EXPAND_RESOLVED;
   }
-  return length;
+  return SG_EXPAND_FAILED;
 }
 
-static size_t expand_oversized_length(const char *name, char *buf,
-                                      size_t buf_size, void *ctx) {
+static sg_expand_status_t expand_failed(const char *name, char *buf,
+                                        size_t buf_size, size_t *length,
+                                        void *ctx) {
   (void)name;
   (void)buf;
+  (void)buf_size;
+  (void)length;
   (void)ctx;
-  return buf_size + 1;
+  return SG_EXPAND_FAILED;
 }
 
 static sg_gate_t *gate_with_violations(void);
@@ -1542,21 +1648,21 @@ static sg_gate_t *gate_with_violations(void);
 TEST(expansion_bounds_matrix) {
   static const struct {
     size_t returned_length;
-    bool truncated;
-  } cases[] = {{4095, false}, {4096, true}};
+    sg_error_t expected_error;
+  } cases[] = {{4095, SG_OK}, {4096, SG_ERR_EXPAND}};
   sg_result_t result;
 
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
     sg_gate_t *gate = sg_gate_new();
     ASSERT(gate != NULL);
     ASSERT_SG_OK(sg_gate_add_rule(gate, "echo *"));
-    ASSERT_SG_OK(sg_gate_set_expand_var(gate, expand_requested_length,
-                                        (void *)&cases[i].returned_length));
+    ASSERT_SG_OK(sg_gate_set_expand_var_netargv(
+        gate, expand_requested_length, (void *)&cases[i].returned_length));
 
     sg_error_t error = eval_cmd(gate, "echo $VALUE", &result);
-    ASSERT((error == SG_ERR_TRUNC) == cases[i].truncated);
-    ASSERT(result.truncated == cases[i].truncated);
-    if (cases[i].truncated)
+    ASSERT(error == cases[i].expected_error);
+    ASSERT(!result.truncated);
+    if (error != SG_OK)
       ASSERT(result.verdict == SG_VERDICT_UNDETERMINED);
     else
       ASSERT(result.verdict == SG_VERDICT_ALLOW);
@@ -1566,8 +1672,8 @@ TEST(expansion_bounds_matrix) {
   sg_gate_t *gate = sg_gate_new();
   ASSERT(gate != NULL);
   ASSERT_SG_OK(sg_gate_add_rule(gate, "echo *"));
-  ASSERT_SG_OK(sg_gate_set_expand_var(gate, NULL, NULL));
-  ASSERT_SG_OK(sg_gate_set_expand_glob(gate, expand_invalid_length, NULL));
+  ASSERT_SG_OK(sg_gate_set_expand_var_netargv(gate, NULL, NULL));
+  ASSERT_SG_OK(sg_gate_set_expand_glob_netargv(gate, expand_failed, NULL));
   char long_glob[320];
   memcpy(long_glob, "echo ", 5);
   memset(long_glob + 5, '*', 300);
@@ -1614,12 +1720,12 @@ TEST(truncation_cross_product_matrix) {
              result.verdict != SG_VERDICT_ALLOW_CONDITIONAL);
   }
 
-  ASSERT_SG_OK(sg_gate_set_expand_var(gate, expand_oversized_length, NULL));
+  ASSERT_SG_OK(sg_gate_set_expand_var_netargv(gate, expand_failed, NULL));
   char buffer[4096];
   sg_result_t result;
   ASSERT(sg_eval(gate, "echo $VALUE", strlen("echo $VALUE"), buffer,
-                 sizeof(buffer), &result) == SG_ERR_TRUNC);
-  ASSERT(result.truncated && result.verdict == SG_VERDICT_UNDETERMINED);
+                 sizeof(buffer), &result) == SG_ERR_EXPAND);
+  ASSERT(!result.truncated && result.verdict == SG_VERDICT_UNDETERMINED);
 
   char many_writes[2048] = {0};
   size_t used = 0;
@@ -1630,7 +1736,7 @@ TEST(truncation_cross_product_matrix) {
     ASSERT(written > 0 && (size_t)written < sizeof(many_writes) - used);
     used += (size_t)written;
   }
-  ASSERT_SG_OK(sg_gate_set_expand_var(gate, NULL, NULL));
+  ASSERT_SG_OK(sg_gate_set_expand_var_netargv(gate, NULL, NULL));
   ASSERT(sg_eval(gate, many_writes, used, buffer, sizeof(buffer), &result) ==
          SG_OK);
   ASSERT(!result.truncated);
@@ -2496,11 +2602,12 @@ TEST(anomaly_model_roundtrip) {
   ASSERT(eval_cmd(invalid, "one ; two ; three ; four", &actual) == SG_OK);
   ASSERT_EQ_UINT(sg_gate_anomaly_vocab_size(invalid), 4);
 
-  /* Gate persistence intentionally rejects standalone v3 model files. */
+  /* Gate persistence intentionally rejects standalone single-model files. */
   sg_anomaly_model_t *legacy = sg_anomaly_model_new();
   ASSERT(legacy != NULL);
-  const char *legacy_seq[] = {"one", "two", "three"};
-  sg_anomaly_update(legacy, legacy_seq, 3);
+  const char legacy_seq[] = "3:one,3:two,5:three,";
+  ASSERT(sg_anomaly_update_netseq(legacy, legacy_seq, sizeof(legacy_seq) - 1) ==
+         SG_ANOMALY_OK);
   ASSERT(sg_anomaly_save(legacy, path) == 0);
   sg_anomaly_model_free(legacy);
   ASSERT(sg_gate_load_anomaly_model(invalid, path) == SG_ERR_PARSE);
@@ -2723,9 +2830,10 @@ TEST(anomaly_allocation_failure_matrix) {
 
   sg_anomaly_model_t *raw_probe = sg_anomaly_model_new();
   ASSERT(raw_probe != NULL);
-  const char *raw_sequence[] = {"gcc", "make", "test"};
+  const char raw_sequence[] = "3:gcc,4:make,4:test,";
   sg_test_anomaly_op_reset();
-  sg_anomaly_update(raw_probe, raw_sequence, 3);
+  ASSERT(sg_anomaly_update_netseq(raw_probe, raw_sequence,
+                                  sizeof(raw_sequence) - 1) == SG_ANOMALY_OK);
   size_t raw_operation_count = sg_test_anomaly_op_count();
   sg_test_anomaly_op_reset();
   sg_anomaly_model_free(raw_probe);
@@ -2820,6 +2928,41 @@ TEST(anomaly_weight_matrix) {
     ASSERT(fabs(result.anomaly_score - expected) < 1e-12);
     sg_gate_free(g);
   }
+}
+
+TEST(anomaly_netseq_score_contract) {
+  static const char *training = "cat /etc/hosts ; grep root ; sort";
+  static const char *probe = "cat /tmp/x ; grep error ; sort";
+  sg_gate_t *gate = sg_gate_new();
+  ASSERT(gate != NULL);
+  ASSERT_SG_OK(sg_gate_enable_anomaly(gate, 100.0, 0.1, -10.0));
+  sg_result_t result;
+  for (int i = 0; i < 8; i++)
+    ASSERT_SG_OK(eval_cmd(gate, training, &result));
+  ASSERT_SG_OK(sg_gate_set_anomaly_update_mode(gate, true));
+  ASSERT_SG_OK(eval_cmd(gate, probe, &result));
+
+  char *raw = NULL, *type = NULL;
+  size_t raw_count = 0, type_count = 0;
+  ASSERT(shell_build_command_netseq(probe, NULL, &raw, &raw_count) ==
+         SHELL_PROCESS_OK);
+  ASSERT(shell_build_type_netseq(probe, NULL, &type, &type_count) ==
+         SHELL_PROCESS_OK);
+  sg_anomaly_sequence_score_t score = {0};
+  ASSERT_SG_OK(sg_gate_score_anomaly_netseq(gate, raw, strlen(raw), type,
+                                            strlen(type), &score));
+  ASSERT(score.command_count == raw_count && raw_count == type_count);
+  ASSERT(score.raw_score == result.anomaly_score_raw);
+  ASSERT(score.type_score == result.anomaly_score_type);
+  ASSERT(score.combined_score == result.anomaly_score);
+  ASSERT(score.detected == result.anomaly_detected);
+  ASSERT(sg_gate_score_anomaly_netseq(gate, raw, strlen(raw), "4:cat,", 6,
+                                      &score) == SG_ERR_PARSE);
+  ASSERT(sg_gate_score_anomaly_netseq(NULL, raw, strlen(raw), type,
+                                      strlen(type), &score) == SG_ERR_INVALID);
+  free(raw);
+  free(type);
+  sg_gate_free(gate);
 }
 
 TEST(anomaly_configuration_validation) {
@@ -3075,6 +3218,39 @@ TEST(anomaly_cache_allocation_failure_matrix) {
   }
 }
 
+TEST(anomaly_type_netseq_allocation_failure) {
+  static const char *command = "cat a ; grep b ; sort";
+  sg_gate_t *probe = anomaly_gate_with_cache(1);
+  ASSERT(probe != NULL);
+  sg_result_t result;
+  ASSERT_SG_OK(eval_cmd(probe, command, &result));
+
+  /* Force the cache-copy optimization to fall back to the authoritative type
+   * builder, then measure its Shellsplit allocations. */
+  sg_test_alloc_fail_at(1);
+  shellsplit_test_alloc_reset();
+  ASSERT_SG_OK(eval_cmd(probe, command, &result));
+  size_t builder_allocations = shellsplit_test_alloc_count();
+  sg_test_alloc_reset();
+  shellsplit_test_alloc_reset();
+  ASSERT(builder_allocations > 0);
+  sg_gate_free(probe);
+
+  for (size_t fail_at = 1; fail_at <= builder_allocations; fail_at++) {
+    sg_gate_t *gate = anomaly_gate_with_cache(1);
+    ASSERT(gate != NULL);
+    ASSERT_SG_OK(eval_cmd(gate, command, &result));
+    sg_test_alloc_fail_at(1);
+    shellsplit_test_alloc_fail_at(fail_at);
+    sg_error_t error = eval_cmd(gate, command, &result);
+    sg_test_alloc_reset();
+    shellsplit_test_alloc_reset();
+    ASSERT(error == SG_ERR_MEMORY);
+    ASSERT(result.verdict == SG_VERDICT_UNDETERMINED);
+    sg_gate_free(gate);
+  }
+}
+
 TEST(anomaly_cache_model_transition_matrix) {
   const char *path = temp_policy_file();
   ASSERT(path != NULL);
@@ -3323,6 +3499,7 @@ int main(void) {
   RUN(anomaly_allocation_failure_matrix);
   RUN(anomaly_calibration_matrix);
   RUN(anomaly_weight_matrix);
+  RUN(anomaly_netseq_score_contract);
   RUN(anomaly_configuration_validation);
 
   printf("\nAdaptive threshold:\n");
@@ -3331,6 +3508,7 @@ int main(void) {
   printf("\nType sequence cache:\n");
   RUN(anomaly_cache_equivalence_matrix);
   RUN(anomaly_cache_allocation_failure_matrix);
+  RUN(anomaly_type_netseq_allocation_failure);
   RUN(anomaly_cache_model_transition_matrix);
 
   printf("\nSeparate scores:\n");

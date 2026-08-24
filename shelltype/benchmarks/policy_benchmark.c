@@ -8,11 +8,13 @@
  * Run: build/shelltype_policy_benchmark
  */
 #define _POSIX_C_SOURCE 199309L
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
+#include "shell_netstring.h"
 #include "shelltype.h"
 
 #define N_PATTERNS 500
@@ -37,10 +39,25 @@ static void add_cpl(st_policy_t *policy, const char *cpl) {
 
 static void encode_two(char *output, size_t capacity, const char *first,
                        const char *second) {
-  int written = snprintf(output, capacity, "%zu:%s,%zu:%s,", strlen(first),
-                         first, strlen(second), second);
-  if (written < 0 || (size_t)written >= capacity)
+  size_t first_length = strlen(first), second_length = strlen(second);
+  size_t first_record = 0, second_record = 0;
+  if (shell_netstring_encoded_length(first_length, &first_record) !=
+          SHELL_NETSTRING_OK ||
+      shell_netstring_encoded_length(second_length, &second_record) !=
+          SHELL_NETSTRING_OK ||
+      first_record > SIZE_MAX - second_record ||
+      first_record + second_record >= capacity)
     exit(EXIT_FAILURE);
+  size_t written = 0;
+  if (shell_netstring_write(output, capacity, first, first_length, &written) !=
+      SHELL_NETSTRING_OK)
+    exit(EXIT_FAILURE);
+  size_t second_written = 0;
+  if (shell_netstring_write(output + written, capacity - written, second,
+                            second_length,
+                            &second_written) != SHELL_NETSTRING_OK)
+    exit(EXIT_FAILURE);
+  output[written + second_written] = '\0';
 }
 
 int main(void) {

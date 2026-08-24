@@ -18,6 +18,7 @@ set(expected_headers
   shell_abstract.h
   shell_depgraph.h
   shell_interop.h
+  shell_netstring.h
   shell_processor.h
   shell_tokenizer.h
   shell_tokenizer_full.h

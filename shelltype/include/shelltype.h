@@ -168,6 +168,14 @@ static inline bool st_is_compatible(st_token_type_t cmd_type,
 typedef struct st_token {
   char *text; /* Token text (for literals) or type symbol (for wildcards) */
   st_token_type_t type; /* Classified type */
+  /* A compound token still occupies exactly one argv position. Its concrete
+   * or policy value is prefix + capture + suffix. The first implementation is
+   * deliberately bounded to one classified/typed capture. */
+  bool compound;
+  char *prefix;
+  char *capture;
+  char *suffix;
+  st_token_type_t capture_type;
 } st_token_t;
 
 /**
@@ -264,10 +272,9 @@ bool st_is_netpattern_blacklisted(const st_learner_t *learner,
 
 /* --- SERIALISATION --- */
 
-/* Learner state uses the strict framed v4 format. Each node is an outer
+/* Learner state uses the strict framed v5 format. Each node is an outer
  * netstring containing canonical netstring fields, and the record stream is
- * protected by a declared count and CRC32. Older and provisional v4 formats
- * are rejected.
+ * protected by a declared count and CRC32. Older formats are rejected.
  * Successful saves use synchronized same-directory atomic replacement.
  * Concurrent saves to the same destination require external synchronization.
  */
@@ -496,7 +503,7 @@ st_error_t st_policy_render_nfa(const st_policy_t *policy, const char *path,
 
 /* --- Serialization --- */
 
-/* Save and load use the canonical length-framed v2 policy format exclusively.
+/* Save and load use the canonical length-framed v3 policy format exclusively.
  * A successful save synchronizes the complete temporary file, atomically
  * replaces path, and synchronizes its parent directory. ST_ERR_IO after the
  * atomic replacement can leave either the previous or new complete file

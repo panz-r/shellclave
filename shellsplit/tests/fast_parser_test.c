@@ -633,11 +633,11 @@ void test_dialect_oracle(void) {
            command < fast.count && command < command_count &&
            command < info_count;
            command++)
-        printf("      %u fast='%.*s' full=[%zu,%zu) info='%s' clean='%s'\n",
-               command, fast.cmds[command].len,
+        printf("      %u fast='%.*s' full=[%zu,%zu) info='%s'\n", command,
+               fast.cmds[command].len,
                cases[i].input + fast.cmds[command].start,
                commands[command].start_pos, commands[command].end_pos,
-               infos[command].original_command, infos[command].clean_command);
+               infos[command].original_command);
     char name[96];
     snprintf(name, sizeof(name), "dialect oracle: %s", cases[i].input);
     bool valid =

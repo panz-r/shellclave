@@ -14,6 +14,7 @@
  * definition and regenerate.
  */
 
+#include "shell_netstring.h"
 #include "shelltype.h"
 
 #include <arpa/inet.h>
@@ -2336,67 +2337,27 @@ st_token_type_t st_classify_token(const char *token) {
 
 /* --- CANONICAL NETSTRING ARGV DECODING --- */
 
-static st_error_t decode_netargv(const char *netargv, char ***out_tokens,
-                                 size_t *out_count) {
-  *out_tokens = NULL;
-  *out_count = 0;
+static st_error_t validate_netargv(const char *netargv, size_t *out_count) {
   size_t encoded_length = strlen(netargv);
-  size_t offset = 0;
   size_t count = 0;
-  char **tokens = NULL;
-
-  while (offset < encoded_length) {
+  shell_netstring_iter_t iter;
+  if (shell_netstring_iter_init(&iter, netargv, encoded_length) !=
+      SHELL_NETSTRING_OK)
+    return ST_ERR_FORMAT;
+  shell_netstring_view_t view;
+  shell_netstring_status_t status;
+  while ((status = shell_netstring_iter_next(&iter, &view)) ==
+         SHELL_NETSTRING_OK) {
     if (count == ST_MAX_CMD_TOKENS)
-      goto limit;
-    size_t length = 0;
-    if (!isdigit((unsigned char)netargv[offset]))
-      goto format;
-    if (netargv[offset] == '0' && offset + 1 < encoded_length &&
-        isdigit((unsigned char)netargv[offset + 1]))
-      goto format;
-    do {
-      unsigned digit = (unsigned)(netargv[offset] - '0');
-      if (length > (SIZE_MAX - digit) / 10)
-        goto limit;
-      length = length * 10 + digit;
-      offset++;
-    } while (offset < encoded_length &&
-             isdigit((unsigned char)netargv[offset]));
-    if (offset >= encoded_length || netargv[offset++] != ':')
-      goto format;
-    if (length >= encoded_length - offset || netargv[offset + length] != ',')
-      goto format;
-
-    char **grown = realloc(tokens, (count + 1) * sizeof(*tokens));
-    if (!grown)
-      goto memory;
-    tokens = grown;
-    tokens[count] = strndup(netargv + offset, length);
-    if (!tokens[count])
-      goto memory;
+      return ST_ERR_LIMIT;
     count++;
-    offset += length + 1;
   }
-
-  *out_tokens = tokens;
+  if (status == SHELL_NETSTRING_EOVERFLOW)
+    return ST_ERR_LIMIT;
+  if (status != SHELL_NETSTRING_DONE)
+    return ST_ERR_FORMAT;
   *out_count = count;
   return ST_OK;
-
-format:
-  for (size_t i = 0; i < count; i++)
-    free(tokens[i]);
-  free(tokens);
-  return ST_ERR_FORMAT;
-limit:
-  for (size_t i = 0; i < count; i++)
-    free(tokens[i]);
-  free(tokens);
-  return ST_ERR_LIMIT;
-memory:
-  for (size_t i = 0; i < count; i++)
-    free(tokens[i]);
-  free(tokens);
-  return ST_ERR_MEMORY;
 }
 
 /* --- PUBLIC API: NETSTRING ARGV CLASSIFICATION --- */
@@ -2410,95 +2371,35 @@ st_error_t st_classify(const char *netargv, st_token_array_t *out) {
     return ST_ERR_INVALID;
 
   size_t raw_count = 0;
-  char **raw_tokens = NULL;
-  st_error_t decode_error = decode_netargv(netargv, &raw_tokens, &raw_count);
+  st_error_t decode_error = validate_netargv(netargv, &raw_count);
   if (decode_error != ST_OK)
     return decode_error;
 
   /* Empty command: return empty token array */
   if (raw_count == 0) {
-    free(raw_tokens);
-    out->tokens = NULL;
-    out->count = 0;
     return ST_OK;
   }
 
-  if (raw_count > ST_MAX_CMD_TOKENS ||
-      raw_count > SIZE_MAX / (2 * sizeof(st_token_t))) {
-    for (size_t i = 0; i < raw_count; i++)
-      free(raw_tokens[i]);
-    free(raw_tokens);
-    return ST_ERR_INVALID;
-  }
-  /* Worst case: every token splits into 2 (e.g., --flag=value → 2 tokens) */
-  out->tokens = calloc(raw_count * 2, sizeof(st_token_t));
-  if (!out->tokens) {
-    for (size_t i = 0; i < raw_count; i++)
-      free(raw_tokens[i]);
-    free(raw_tokens);
+  out->tokens = calloc(raw_count, sizeof(st_token_t));
+  if (!out->tokens)
     return ST_ERR_MEMORY;
-  }
   out->count = 0;
 
   const char *prev = NULL;
+  shell_netstring_iter_t iter;
+  if (shell_netstring_iter_init(&iter, netargv, strlen(netargv)) !=
+      SHELL_NETSTRING_OK)
+    goto fail;
   for (size_t i = 0; i < raw_count; i++) {
-    const char *tok = raw_tokens[i];
-
-    /* Handle --flag=value: split into --flag and value */
-    if (tok[0] == '-' && tok[1] == '-') {
-      const char *eq = strchr(tok + 2, '=');
-      if (eq) {
-        size_t flag_len = (size_t)(eq - tok);
-        char *flag_text = strndup(tok, flag_len);
-        if (!flag_text)
-          goto fail;
-        out->tokens[out->count].text = flag_text;
-        out->tokens[out->count].type = st_classify_token(flag_text);
-        out->count++;
-
-        out->tokens[out->count].text = strdup(eq + 1);
-        if (!out->tokens[out->count].text)
-          goto fail;
-        out->tokens[out->count].type = st_classify_token(eq + 1);
-        out->count++;
-
-        prev = tok;
-        continue;
-      }
-    }
-
-    /* Handle env assignment: VAR=value → VAR= + value */
-    bool is_env = false;
-    const char *eq = strchr(tok, '=');
-    if (eq && eq != tok) {
-      is_env = true;
-      for (const char *c = tok; c < eq; c++) {
-        if (!isalnum((unsigned char)*c) && *c != '_') {
-          is_env = false;
-          break;
-        }
-      }
-    }
-    if (is_env) {
-      size_t var_len = (size_t)(eq - tok);
-      out->tokens[out->count].text = malloc(var_len + 2);
-      if (!out->tokens[out->count].text)
-        goto fail;
-      memcpy(out->tokens[out->count].text, tok, var_len);
-      out->tokens[out->count].text[var_len] = '=';
-      out->tokens[out->count].text[var_len + 1] = '\0';
-      out->tokens[out->count].type = ST_TYPE_LITERAL;
-      out->count++;
-
-      out->tokens[out->count].text = strdup(eq + 1);
-      if (!out->tokens[out->count].text)
-        goto fail;
-      out->tokens[out->count].type = st_classify_token(eq + 1);
-      out->count++;
-
-      prev = tok;
-      continue;
-    }
+    shell_netstring_view_t view;
+    if (shell_netstring_iter_next(&iter, &view) != SHELL_NETSTRING_OK)
+      goto fail;
+    const char *payload = (const char *)view.payload;
+    size_t length = view.payload_length;
+    char *tok = strndup(payload, length);
+    if (!tok)
+      goto fail;
+    out->tokens[out->count].text = tok;
 
     /* Long flag (--something) followed by a separate token → next token is a
      * value. Short flags (-X, -la) are kept as literals; we don't generalise
@@ -2506,9 +2407,6 @@ st_error_t st_classify(const char *netargv, st_token_array_t *out) {
     if (prev && prev[0] == '-' && prev[1] == '-' &&
         strchr(prev + 2, '=') == NULL) {
       /* This token is a value after a long flag */
-      out->tokens[out->count].text = strdup(tok);
-      if (!out->tokens[out->count].text)
-        goto fail;
       out->tokens[out->count].type = st_classify_token(tok);
       out->count++;
       prev = tok;
@@ -2520,9 +2418,6 @@ st_error_t st_classify(const char *netargv, st_token_array_t *out) {
         is_decimal_number(tok) && tok[0] != '-') {
       long n = strtol(tok, NULL, 10);
       if (n >= 1 && n <= 31) {
-        out->tokens[out->count].text = strdup(tok);
-        if (!out->tokens[out->count].text)
-          goto fail;
         out->tokens[out->count].type = ST_TYPE_SIGNAL;
         out->count++;
         prev = tok;
@@ -2536,9 +2431,6 @@ st_error_t st_classify(const char *netargv, st_token_array_t *out) {
      * Requires either metacharacters or at least 2 slashes (sed-style). */
     if (prev && is_regex_context(prev) &&
         (has_regex_metachar(tok) || strchr(tok, '/') != NULL)) {
-      out->tokens[out->count].text = strdup(tok);
-      if (!out->tokens[out->count].text)
-        goto fail;
       out->tokens[out->count].type = ST_TYPE_REGEX;
       out->count++;
       prev = tok;
@@ -2548,25 +2440,16 @@ st_error_t st_classify(const char *netargv, st_token_array_t *out) {
     /* Concrete text and its lattice type are separate. Parameters are closed
      * policy metadata; normalization must never synthesize a wildcard symbol
      * by copying characters from a concrete value. */
-    out->tokens[out->count].text = strdup(tok);
-    if (!out->tokens[out->count].text)
-      goto fail;
     out->tokens[out->count].type = st_classify_token(tok);
+    /* Compound candidates remain one concrete argv literal. Their internal
+     * value may be generalized later without turning it into another trie
+     * position or classifying the whole spelling from an embedded slash. */
+    if (strchr(tok, '=') != NULL)
+      out->tokens[out->count].type = ST_TYPE_LITERAL;
     out->count++;
     prev = tok;
   }
 
-  for (size_t i = 0; i < raw_count; i++)
-    free(raw_tokens[i]);
-  free(raw_tokens);
-  if (out->count > ST_MAX_CMD_TOKENS) {
-    for (size_t i = 0; i < out->count; i++)
-      free(out->tokens[i].text);
-    free(out->tokens);
-    out->tokens = NULL;
-    out->count = 0;
-    return ST_ERR_INVALID;
-  }
   return ST_OK;
 
 fail:
@@ -2575,17 +2458,18 @@ fail:
   free(out->tokens);
   out->tokens = NULL;
   out->count = 0;
-  for (size_t i = 0; i < raw_count; i++)
-    free(raw_tokens[i]);
-  free(raw_tokens);
   return ST_ERR_MEMORY;
 }
 
 void st_free_token_array(st_token_array_t *arr) {
   if (!arr)
     return;
-  for (size_t i = 0; i < arr->count; i++)
+  for (size_t i = 0; i < arr->count; i++) {
     free(arr->tokens[i].text);
+    free(arr->tokens[i].prefix);
+    free(arr->tokens[i].capture);
+    free(arr->tokens[i].suffix);
+  }
   free(arr->tokens);
   arr->tokens = NULL;
   arr->count = 0;

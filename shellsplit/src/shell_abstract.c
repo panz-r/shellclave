@@ -1,6 +1,7 @@
 #define _XOPEN_SOURCE 700
 #include "shell_abstract.h"
 #include "alloc.h"
+#include "shell_netstring.h"
 #include "shell_processor.h"
 #include "shell_tokenizer_full.h"
 #include <ctype.h>
@@ -1123,137 +1124,160 @@ void shell_abstracted_destroy(abstracted_command_t *cmd) {
 
 /* --- LIGHTWEIGHT TYPE SEQUENCE GENERATION --- */
 
-char *shell_build_type_sequence(const char *command) {
-  if (!command || command[0] == '\0')
-    return NULL;
-
-  shell_command_info_t *cmds = NULL;
-  size_t cmd_count = 0;
-
-  if (shell_process_command(command, NULL, &cmds, &cmd_count) !=
-      SHELL_PROCESS_OK)
-    return NULL;
-
-  if (cmd_count == 0) {
-    shell_free_command_infos(cmds, cmd_count);
-    return NULL;
+static const char *token_abbreviation(const shell_token_t *token) {
+  if (token->length >= 2 && token->start[0] == '-')
+    return "OPT";
+  abstract_type_t type =
+      get_abstract_type(token->type, token->start, token->length);
+  switch (type) {
+  case ABSTRACT_EV:
+    return "EV";
+  case ABSTRACT_PV:
+    return "PV";
+  case ABSTRACT_SV:
+    return "SV";
+  case ABSTRACT_AP:
+    return "AP";
+  case ABSTRACT_RP:
+    return "RP";
+  case ABSTRACT_HP:
+    return "HP";
+  case ABSTRACT_GB:
+    return "GB";
+  case ABSTRACT_CS:
+    return "CS";
+  case ABSTRACT_AR:
+    return "AR";
+  case ABSTRACT_REDIR:
+    return "RD";
+  case ABSTRACT_STR:
+  default:
+    return "STR";
   }
+}
 
-  /* Every input byte can expand to at most a three-letter abbreviation plus
-   * its separating space. */
-  size_t input_len = strlen(command);
-  if (input_len > (SIZE_MAX - 1) / 4) {
-    shell_free_command_infos(cmds, cmd_count);
-    return NULL;
-  }
-  size_t buf_size = input_len * 4 + 1;
-  char *buf = malloc(buf_size);
-  if (!buf) {
-    shell_free_command_infos(cmds, cmd_count);
-    return NULL;
-  }
+shell_process_status_t
+shell_build_type_netseq(const char *command,
+                        const shell_process_limits_t *limits, char **netseq,
+                        size_t *subcommand_count) {
+  if (netseq)
+    *netseq = NULL;
+  if (subcommand_count)
+    *subcommand_count = 0;
+  if (!command || !netseq || !subcommand_count)
+    return SHELL_PROCESS_EINPUT;
 
-  size_t pos = 0;
-  for (size_t c = 0; c < cmd_count; c++) {
-    shell_command_info_t *cmd = &cmds[c];
+  shell_command_info_t *commands = NULL;
+  size_t count = 0;
+  shell_process_status_t status =
+      shell_process_command(command, limits, &commands, &count);
+  if (status != SHELL_PROCESS_OK)
+    return status;
 
-    /* This is an abstract pipeline, not a reproduction of shell syntax. Each
-     * marker means only that another command stage follows. Canonicalizing |,
-     * ;, &&, and || here lets structurally equivalent sequences share an
-     * anomaly-model key. Call shell_parse_fast() on the original command and
-     * inspect cmds[c].type when the concrete operator is needed. */
-    if (c > 0) {
-      buf[pos++] = ' ';
-      buf[pos++] = '|';
-      buf[pos++] = ' ';
+  size_t outer_length = 0;
+  for (size_t c = 0; c < count; c++) {
+    if (commands[c].command_token_count == 0) {
+      status = SHELL_PROCESS_EPARSE;
+      goto fail_type_netseq;
     }
-
-    for (size_t i = 0; i < cmd->command_token_count; i++) {
-      shell_token_t *tok = &cmd->command_tokens[i];
-      const char *text = tok->start;
-      size_t len = tok->length;
-
-      /* Add space separator (skip if already preceded by space) */
-      if (pos > 0 && pos < buf_size && buf[pos - 1] != ' ')
-        buf[pos++] = ' ';
-
-      if (i == 0 &&
-          (tok->type == TOKEN_COMMAND || tok->type == TOKEN_ARGUMENT)) {
-        /* Keep a literal command name. Dynamic command names remain typed. */
-        size_t copy = len;
-        if (pos + copy >= buf_size)
-          copy = buf_size - pos - 1;
-        memcpy(buf + pos, text, copy);
-        pos += copy;
-      } else {
-        /* Check for options first (- short, -- long) */
-        bool is_opt = false;
-        if (len >= 2 && text[0] == '-') {
-          is_opt = true;
-        }
-
-        const char *abbrev;
-        if (is_opt) {
-          abbrev = "OPT";
-        } else {
-          /* Classify using abstraction type */
-          abstract_type_t ab = get_abstract_type(tok->type, text, len);
-          switch (ab) {
-          case ABSTRACT_EV:
-            abbrev = "EV";
-            break;
-          case ABSTRACT_PV:
-            abbrev = "PV";
-            break;
-          case ABSTRACT_SV:
-            abbrev = "SV";
-            break;
-          case ABSTRACT_AP:
-            abbrev = "AP";
-            break;
-          case ABSTRACT_RP:
-            abbrev = "RP";
-            break;
-          case ABSTRACT_HP:
-            abbrev = "HP";
-            break;
-          case ABSTRACT_GB:
-            abbrev = "GB";
-            break;
-          case ABSTRACT_CS:
-            abbrev = "CS";
-            break;
-          case ABSTRACT_AR:
-            abbrev = "AR";
-            break;
-          case ABSTRACT_STR:
-            abbrev = "STR";
-            break;
-          case ABSTRACT_REDIR:
-            abbrev = "RD";
-            break;
-          default:
-            abbrev = "STR";
-            break;
-          }
-        }
-
-        size_t alen = strlen(abbrev);
-        if (pos + alen >= buf_size)
-          alen = buf_size - pos - 1;
-        memcpy(buf + pos, abbrev, alen);
-        pos += alen;
+    size_t inner_length = 0;
+    const shell_token_t *executable = &commands[c].command_tokens[0];
+    size_t decoded_length = 0;
+    status = shell_measure_decoded_word(executable->start, executable->length,
+                                        &decoded_length);
+    if (status != SHELL_PROCESS_OK)
+      goto fail_type_netseq;
+    if (decoded_length == 0) {
+      status = SHELL_PROCESS_EPARSE;
+      goto fail_type_netseq;
+    }
+    if (shell_netstring_encoded_length(decoded_length, &inner_length) !=
+        SHELL_NETSTRING_OK) {
+      status = SHELL_PROCESS_EOVERFLOW;
+      goto fail_type_netseq;
+    }
+    for (size_t i = 1; i < commands[c].command_token_count; i++) {
+      const char *abbreviation =
+          token_abbreviation(&commands[c].command_tokens[i]);
+      size_t length = strlen(abbreviation);
+      size_t framed = 0;
+      if (shell_netstring_encoded_length(length, &framed) !=
+              SHELL_NETSTRING_OK ||
+          inner_length > SIZE_MAX - framed) {
+        status = SHELL_PROCESS_EOVERFLOW;
+        goto fail_type_netseq;
       }
+      inner_length += framed;
     }
+    size_t framed = 0;
+    if (shell_netstring_encoded_length(inner_length, &framed) !=
+        SHELL_NETSTRING_OK) {
+      status = SHELL_PROCESS_EOVERFLOW;
+      goto fail_type_netseq;
+    }
+    if (outer_length > SIZE_MAX - framed) {
+      status = SHELL_PROCESS_EOVERFLOW;
+      goto fail_type_netseq;
+    }
+    outer_length += framed;
   }
+  if (limits && (outer_length > limits->max_string_bytes ||
+                 outer_length > limits->max_total_bytes)) {
+    status = SHELL_PROCESS_EOUTPUT_LIMIT;
+    goto fail_type_netseq;
+  }
+  char *outer = malloc(outer_length + 1);
+  if (!outer) {
+    status = SHELL_PROCESS_ENOMEM;
+    goto fail_type_netseq;
+  }
+  char *position = outer;
+  for (size_t c = 0; c < count; c++) {
+    size_t inner_length = 0;
+    const shell_token_t *executable = &commands[c].command_tokens[0];
+    size_t decoded_length = 0;
+    (void)shell_measure_decoded_word(executable->start, executable->length,
+                                     &decoded_length);
+    (void)shell_netstring_encoded_length(decoded_length, &inner_length);
+    for (size_t i = 1; i < commands[c].command_token_count; i++) {
+      size_t length =
+          strlen(token_abbreviation(&commands[c].command_tokens[i]));
+      size_t framed = 0;
+      (void)shell_netstring_encoded_length(length, &framed);
+      inner_length += framed;
+    }
+    size_t outer_prefix = 0, executable_prefix = 0;
+    (void)shell_netstring_write_prefix(position, SIZE_MAX, inner_length,
+                                       &outer_prefix);
+    position += outer_prefix;
+    (void)shell_netstring_write_prefix(position, SIZE_MAX, decoded_length,
+                                       &executable_prefix);
+    position += executable_prefix;
+    size_t written = 0;
+    (void)shell_write_decoded_word(executable->start, executable->length,
+                                   position, decoded_length, &written);
+    position += written;
+    *position++ = ',';
+    for (size_t i = 1; i < commands[c].command_token_count; i++) {
+      const char *abbreviation =
+          token_abbreviation(&commands[c].command_tokens[i]);
+      size_t length = strlen(abbreviation);
+      size_t prefix = 0;
+      (void)shell_netstring_write_prefix(position, SIZE_MAX, length, &prefix);
+      position += prefix;
+      memcpy(position, abbreviation, length);
+      position += length;
+      *position++ = ',';
+    }
+    *position++ = ',';
+  }
+  *position = '\0';
+  shell_free_command_infos(commands, count);
+  *netseq = outer;
+  *subcommand_count = count;
+  return SHELL_PROCESS_OK;
 
-  if (pos >= buf_size)
-    pos = buf_size - 1;
-  buf[pos] = '\0';
-
-  shell_free_command_infos(cmds, cmd_count);
-
-  /* Shrink to fit */
-  char *result = realloc(buf, pos + 1);
-  return result ? result : buf;
+fail_type_netseq:
+  shell_free_command_infos(commands, count);
+  return status;
 }

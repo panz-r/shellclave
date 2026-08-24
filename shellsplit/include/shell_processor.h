@@ -14,15 +14,10 @@ extern "C" {
  */
 
 /**
- * Parsed shell command metadata, including original/clean text and tokenized
- * details.
+ * Parsed shell command metadata, including original text and tokenized details.
  */
 typedef struct {
   const char *original_command; // Owned full command-stage text
-  // Owned canonical processed subcommand: shell control/redirection syntax is
-  // removed, quote fragments and escapes are assembled, and argument
-  // boundaries are retained with canonical quoting for downstream consumers.
-  const char *clean_command;
   // Token text points into original_command, and positions are relative to it.
   shell_token_t *shell_tokens;   // Shell operators and redirections
   size_t shell_token_count;      // Number of shell tokens
@@ -54,12 +49,11 @@ typedef struct {
 /**
  * Process shell command with proper separation
  *
- * Extracts canonical processed subcommands and separates shell logic. On
+ * Separates shell logic from command arguments. On
  * success, returned command metadata owns all text it refers to and remains
- * valid independently of command_line. `clean_command` is a human-readable
- * canonical rendering; use shell_render_netargv() for an unambiguous machine
- * interface. On failure, writable
- * outputs are set to NULL and zero.
+ * valid independently of command_line. Use shell_render_netargv() for the
+ * canonical processed-subcommand representation. On failure, writable outputs
+ * are set to NULL and zero.
  */
 shell_process_status_t shell_process_command(
     const char *command_line, const shell_process_limits_t *limits,
@@ -71,15 +65,24 @@ shell_process_status_t shell_process_command(
  */
 void shell_free_command_infos(shell_command_info_t *infos, size_t count);
 
-/**
- * Get clean command text
- *
- * Returns the canonical processed subcommand, or NULL for NULL input.
- */
-const char *shell_get_clean_command(shell_command_info_t *info);
+/** Measure the decoded payload of one already-isolated shell word, assembling
+ * quote fragments and escapes. This is not shell tokenization: callers must
+ * isolate the word before calling it. */
+shell_process_status_t shell_measure_decoded_word(const char *text,
+                                                  size_t length,
+                                                  size_t *decoded_length);
 
-/** Decode one already-isolated shell word, assembling quote fragments and
- * escapes. This is exposed for zero-copy parser consumers. */
+/** Write the decoded payload of one already-isolated shell word into caller
+ * storage. The destination is a byte buffer, not a C string; it must provide
+ * at least the length returned by shell_measure_decoded_word(). */
+shell_process_status_t shell_write_decoded_word(const char *text, size_t length,
+                                                char *destination,
+                                                size_t destination_size,
+                                                size_t *written);
+
+/** Decode one already-isolated shell word into an owned C string, assembling
+ * quote fragments and escapes. Prefer the measure/write pair when the decoded
+ * bytes will be written directly into another representation. */
 shell_process_status_t shell_decode_word(const char *text, size_t length,
                                          char **decoded,
                                          size_t *decoded_length);
@@ -96,28 +99,22 @@ shell_render_netargv(const shell_command_info_t *info,
  */
 bool shell_has_dangerous_features(shell_command_info_t *info);
 
-/**
- * Compatibility API returning human-readable canonical processed subcommands.
- * Quote fragments and escapes are assembled, but the rendering is not an
- * unambiguous argv transport when values contain spaces or are empty. New
- * machine consumers should use shell_extract_netargv_inputs(). The caller owns
- * each returned string and the containing array. On failure, writable outputs
- * are set to NULL, zero, and false.
- */
-shell_process_status_t shell_extract_dfa_inputs(
+/** Parse a command line and return one outer netstring whose payload records
+ * are the canonical netargv values for each isolated subcommand. This is the
+ * single-buffer machine transport for subcommand collections. The caller owns
+ * *netargv_sequence. */
+shell_process_status_t shell_extract_netargv_sequence(
     const char *command_line, const shell_process_limits_t *limits,
-    const char ***dfa_inputs, // Array of clean commands
-    size_t *dfa_input_count,  // Number of commands
-    bool *has_shell_features  // True if shell features present
-);
+    char **netargv_sequence, size_t *subcommand_count,
+    bool *has_shell_features);
 
-/** Parse a command line and return one canonical netstring argv per isolated
- * subcommand. Existing clean-text extraction remains available unchanged. */
+/** Parse shell source and return one canonical netstring record per isolated
+ * decoded executable name. This is the raw command sequence consumed by
+ * anomaly models. */
 shell_process_status_t
-shell_extract_netargv_inputs(const char *command_line,
-                             const shell_process_limits_t *limits,
-                             const char ***netargv_inputs, size_t *input_count,
-                             bool *has_shell_features);
+shell_build_command_netseq(const char *command_line,
+                           const shell_process_limits_t *limits,
+                           char **command_netseq, size_t *subcommand_count);
 
 #ifdef __cplusplus
 }

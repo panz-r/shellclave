@@ -13,7 +13,7 @@
  *   D = absolute discount (default 0.5)
  *
  * Serialisation uses a binary format with length-prefixed keys:
- *   Header (text):  # anomaly-model-v3\n
+ *   Header (text):  # anomaly-model-v5\n
  *                   # alpha unk_prior D total_uni total_bi total_tri total_quad
  * vocab_size unk_count\n Entry (binary): uint8_t type; uint32_t key_len;
  * uint8_t key[key_len]; uint64_t count; uint8_t nl; type values: 1='U', 2='B',
@@ -22,6 +22,7 @@
 
 #include "sg_anomaly.h"
 #include "sg_anomaly_internal.h"
+#include "shell_netstring.h"
 #include <draugr/ht.h>
 #define XXH_STATIC_LINKING_ONLY
 #include "sg_alloc.h"
@@ -464,135 +465,156 @@ static bool command_is_valid(const char *command) {
              SG_ANOMALY_MAX_COMMAND_LENGTH;
 }
 
-static bool sequence_is_scorable(const char **seq, size_t len) {
-  if (!seq)
-    return false;
-  for (size_t i = 0; i < len; i++)
-    if (!command_is_scorable(seq[i]))
-      return false;
-  return true;
+static sg_anomaly_status_t netstring_status(shell_netstring_status_t status) {
+  if (status == SHELL_NETSTRING_OK || status == SHELL_NETSTRING_DONE)
+    return SG_ANOMALY_OK;
+  return status == SHELL_NETSTRING_EOVERFLOW ? SG_ANOMALY_ERR_LIMIT
+                                             : SG_ANOMALY_ERR_FORMAT;
 }
 
-static bool sequence_is_valid(const char **seq, size_t len) {
-  if (!seq)
-    return false;
-  for (size_t i = 0; i < len; i++)
-    if (!command_is_valid(seq[i]))
-      return false;
-  return true;
+static sg_anomaly_status_t validate_netseq(const char *netseq, size_t length,
+                                           bool enforce_item_limit,
+                                           size_t *count) {
+  *count = 0;
+  if ((!netseq && length != 0) || (netseq && memchr(netseq, '\0', length)))
+    return SG_ANOMALY_ERR_FORMAT;
+  shell_netstring_iter_t iter;
+  shell_netstring_status_t net_status =
+      shell_netstring_iter_init(&iter, netseq, length);
+  if (net_status != SHELL_NETSTRING_OK)
+    return netstring_status(net_status);
+  shell_netstring_view_t view;
+  while ((net_status = shell_netstring_iter_next(&iter, &view)) ==
+         SHELL_NETSTRING_OK) {
+    if (view.payload_length == 0)
+      return SG_ANOMALY_ERR_FORMAT;
+    if (enforce_item_limit &&
+        view.payload_length > SG_ANOMALY_MAX_COMMAND_LENGTH)
+      return SG_ANOMALY_ERR_LIMIT;
+    (*count)++;
+  }
+  return net_status == SHELL_NETSTRING_DONE ? SG_ANOMALY_OK
+                                            : netstring_status(net_status);
 }
 
-double sg_anomaly_score(const sg_anomaly_model_t *model, const char **seq,
-                        size_t len) {
-  if (!model || !sequence_is_scorable(seq, len))
-    return INFINITY;
-  if (len < 3)
-    return INFINITY;
-  if (model->total_uni == 0)
-    return INFINITY;
+sg_anomaly_status_t sg_anomaly_netseq_count(const char *netseq, size_t length,
+                                            bool enforce_item_limit,
+                                            size_t *count) {
+  if (!count || !netseq)
+    return SG_ANOMALY_ERR_INVALID;
+  return validate_netseq(netseq, length, enforce_item_limit, count);
+}
 
+sg_anomaly_status_t sg_anomaly_score_netseq(const sg_anomaly_model_t *model,
+                                            const char *netseq,
+                                            size_t netseq_length,
+                                            double *score) {
+  if (score)
+    *score = INFINITY;
+  if (!model || !netseq || !score)
+    return SG_ANOMALY_ERR_INVALID;
+  size_t count = 0;
+  sg_anomaly_status_t status =
+      validate_netseq(netseq, netseq_length, false, &count);
+  if (status != SG_ANOMALY_OK)
+    return status;
+  if (count < 3 || model->total_uni == 0)
+    return SG_ANOMALY_OK;
+  char window[4][SG_ANOMALY_MAX_COMMAND_LENGTH + 2];
+  shell_netstring_iter_t iter;
+  if (shell_netstring_iter_init(&iter, netseq, netseq_length) !=
+      SHELL_NETSTRING_OK)
+    return SG_ANOMALY_ERR_FORMAT;
   double total_bits = 0.0;
-  size_t scored = 0;
-
-  if (len >= 4) {
-    /* Score using 4-gram context from i=3 onward */
-    for (size_t i = 3; i < len; i++) {
-      double lp = kn_logprob(model, seq[i - 3], seq[i - 2], seq[i - 1], seq[i]);
-      total_bits -= lp;
+  size_t seen = 0, scored = 0;
+  shell_netstring_view_t view;
+  while (shell_netstring_iter_next(&iter, &view) == SHELL_NETSTRING_OK) {
+    const char *payload = (const char *)view.payload;
+    size_t length = view.payload_length;
+    size_t slot = seen % 4;
+    size_t copy = length > SG_ANOMALY_MAX_COMMAND_LENGTH
+                      ? SG_ANOMALY_MAX_COMMAND_LENGTH + 1U
+                      : length;
+    memcpy(window[slot], payload, copy);
+    window[slot][copy] = '\0';
+    seen++;
+    if (seen >= 4) {
+      total_bits -=
+          kn_logprob(model, window[(seen - 4) % 4], window[(seen - 3) % 4],
+                     window[(seen - 2) % 4], window[(seen - 1) % 4]);
       scored++;
     }
-  } else {
-    /* len == 3: score one trigram using empty p3 */
-    double lp = kn_logprob(model, "", seq[0], seq[1], seq[2]);
-    total_bits -= lp;
+  }
+  if (seen == 3) {
+    total_bits -= kn_logprob(model, "", window[0], window[1], window[2]);
     scored = 1;
   }
-
-  return scored > 0 ? total_bits / (double)scored : INFINITY;
+  *score = total_bits / (double)scored;
+  return SG_ANOMALY_OK;
 }
 
-/* --- UPDATE --- */
-
-void sg_anomaly_update(sg_anomaly_model_t *model, const char **seq,
-                       size_t len) {
-  if (!model || len == 0 || !sequence_is_valid(seq, len))
-    return;
-
-  /* Dummy total for context tables (we don't track their totals separately) */
-  size_t _ctx_total = 0;
-  (void)_ctx_total;
-
-  /* Update unigrams */
-  for (size_t i = 0; i < len; i++) {
-    size_t cmd_len = strlen(seq[i]) + 1;
-    /* Check if command is already known */
-    size_t existing = count_get(model->uni, seq[i], cmd_len);
-    if (existing > 0) {
-      /* Known command - increment normally */
-      if (!count_inc(model->uni, seq[i], cmd_len, 1, &model->total_uni))
-        model->oom = true;
-    } else {
-      /* New command - increment UNK count */
+sg_anomaly_status_t sg_anomaly_update_netseq(sg_anomaly_model_t *model,
+                                             const char *netseq,
+                                             size_t netseq_length) {
+  if (!model || !netseq)
+    return SG_ANOMALY_ERR_INVALID;
+  size_t count = 0;
+  sg_anomaly_status_t status =
+      validate_netseq(netseq, netseq_length, true, &count);
+  if (status != SG_ANOMALY_OK)
+    return status;
+  char window[4][SG_ANOMALY_MAX_COMMAND_LENGTH + 1];
+  shell_netstring_iter_t iter;
+  if (shell_netstring_iter_init(&iter, netseq, netseq_length) !=
+      SHELL_NETSTRING_OK)
+    return SG_ANOMALY_ERR_FORMAT;
+  shell_netstring_view_t view;
+  size_t seen = 0, ctx_total = 0;
+  while (shell_netstring_iter_next(&iter, &view) == SHELL_NETSTRING_OK) {
+    const char *payload = (const char *)view.payload;
+    size_t length = view.payload_length;
+    size_t slot = seen % 4;
+    memcpy(window[slot], payload, length);
+    window[slot][length] = '\0';
+    const char *curr = window[slot];
+    if (count_get(model->uni, curr, length + 1) == 0)
       model->unk_count++;
-      /* Also add to vocabulary (promote after first sighting) */
-      if (!count_inc(model->uni, seq[i], cmd_len, 1, &model->total_uni))
+    if (!count_inc(model->uni, curr, length + 1, 1, &model->total_uni))
+      model->oom = true;
+    seen++;
+    if (seen >= 2) {
+      const char *p1 = window[(seen - 2) % 4];
+      char key[SG_ANOMALY_MAX_KEY_LENGTH], ctx[SG_ANOMALY_MAX_KEY_LENGTH];
+      size_t key_len = build_bigram_key(key, sizeof(key), p1, curr);
+      size_t ctx_len = build_bigram_ctx(ctx, sizeof(ctx), p1);
+      if (!count_inc(model->bi, key, key_len, 1, &model->total_bi) ||
+          !count_inc(model->bi_ctx, ctx, ctx_len, 1, &ctx_total))
+        model->oom = true;
+    }
+    if (seen >= 3) {
+      const char *p2 = window[(seen - 3) % 4];
+      const char *p1 = window[(seen - 2) % 4];
+      char key[SG_ANOMALY_MAX_KEY_LENGTH], ctx[SG_ANOMALY_MAX_KEY_LENGTH];
+      size_t key_len = build_trigram_key(key, sizeof(key), p2, p1, curr);
+      size_t ctx_len = build_trigram_ctx(ctx, sizeof(ctx), p2, p1);
+      if (!count_inc(model->tri, key, key_len, 1, &model->total_tri) ||
+          !count_inc(model->tri_ctx, ctx, ctx_len, 1, &ctx_total))
+        model->oom = true;
+    }
+    if (seen >= 4) {
+      const char *p3 = window[(seen - 4) % 4];
+      const char *p2 = window[(seen - 3) % 4];
+      const char *p1 = window[(seen - 2) % 4];
+      char key[SG_ANOMALY_MAX_KEY_LENGTH], ctx[SG_ANOMALY_MAX_KEY_LENGTH];
+      size_t key_len = build_4gram_key(key, sizeof(key), p3, p2, p1, curr);
+      size_t ctx_len = build_4gram_ctx(ctx, sizeof(ctx), p3, p2, p1);
+      if (!count_inc(model->quad, key, key_len, 1, &model->total_quad) ||
+          !count_inc(model->quad_ctx, ctx, ctx_len, 1, &ctx_total))
         model->oom = true;
     }
   }
-
-  /* Update bigrams and their context totals */
-  for (size_t i = 1; i < len; i++) {
-    char key[SG_ANOMALY_MAX_KEY_LENGTH];
-    size_t key_len = build_bigram_key(key, sizeof(key), seq[i - 1], seq[i]);
-    if (key_len > 0) {
-      if (!count_inc(model->bi, key, key_len, 1, &model->total_bi))
-        model->oom = true;
-      char ctx[SG_ANOMALY_MAX_KEY_LENGTH];
-      size_t ctx_len = build_bigram_ctx(ctx, sizeof(ctx), seq[i - 1]);
-      if (ctx_len > 0) {
-        if (!count_inc(model->bi_ctx, ctx, ctx_len, 1, &_ctx_total))
-          model->oom = true;
-      }
-    }
-  }
-
-  /* Update trigrams and their context totals */
-  for (size_t i = 2; i < len; i++) {
-    char key[SG_ANOMALY_MAX_KEY_LENGTH];
-    size_t key_len =
-        build_trigram_key(key, sizeof(key), seq[i - 2], seq[i - 1], seq[i]);
-    if (key_len > 0) {
-      if (!count_inc(model->tri, key, key_len, 1, &model->total_tri))
-        model->oom = true;
-      char ctx[SG_ANOMALY_MAX_KEY_LENGTH];
-      size_t ctx_len =
-          build_trigram_ctx(ctx, sizeof(ctx), seq[i - 2], seq[i - 1]);
-      if (ctx_len > 0) {
-        if (!count_inc(model->tri_ctx, ctx, ctx_len, 1, &_ctx_total))
-          model->oom = true;
-      }
-    }
-  }
-
-  /* Update 4-grams and their context totals */
-  for (size_t i = 3; i < len; i++) {
-    char key[SG_ANOMALY_MAX_KEY_LENGTH];
-    size_t key_len = build_4gram_key(key, sizeof(key), seq[i - 3], seq[i - 2],
-                                     seq[i - 1], seq[i]);
-    if (key_len > 0) {
-      if (!count_inc(model->quad, key, key_len, 1, &model->total_quad))
-        model->oom = true;
-      char ctx[SG_ANOMALY_MAX_KEY_LENGTH];
-      size_t ctx_len =
-          build_4gram_ctx(ctx, sizeof(ctx), seq[i - 3], seq[i - 2], seq[i - 1]);
-      if (ctx_len > 0) {
-        if (!count_inc(model->quad_ctx, ctx, ctx_len, 1, &_ctx_total))
-          model->oom = true;
-      }
-    }
-  }
-
   model->vocab_size = ht_size(model->uni);
+  return model->oom ? SG_ANOMALY_ERR_MEMORY : SG_ANOMALY_OK;
 }
 
 /* --- SERIALISATION --- */
@@ -628,7 +650,7 @@ int sg_anomaly_write_stream(const sg_anomaly_model_t *model, FILE *f) {
     errno = EINVAL;
     return -1;
   }
-  if (fprintf(f, "# anomaly-model-v3\n") < 0 ||
+  if (fprintf(f, "# anomaly-model-v5\n") < 0 ||
       fprintf(f, "# %.17g %.17g %.17g %zu %zu %zu %zu %zu %zu\n", model->alpha,
               model->unk_prior, model->kn_discount, model->total_uni,
               model->total_bi, model->total_tri, model->total_quad,
@@ -680,8 +702,8 @@ static bool serialized_line_end(const char *text) {
 static int load_anomaly_stream(sg_anomaly_model_t *model, FILE *f) {
   char line[256];
   if (!fgets(line, sizeof(line), f) ||
-      (strcmp(line, "# anomaly-model-v3\n") != 0 &&
-       strcmp(line, "# anomaly-model-v3\r\n") != 0)) {
+      (strcmp(line, "# anomaly-model-v5\n") != 0 &&
+       strcmp(line, "# anomaly-model-v5\r\n") != 0)) {
     errno = EPROTO;
     return -1;
   }
@@ -895,16 +917,38 @@ size_t sg_anomaly_total_contexts(const sg_anomaly_model_t *model) {
          ht_size(model->quad_ctx);
 }
 
-bool sg_anomaly_has_observed(const sg_anomaly_model_t *model, const char **seq,
-                             size_t len) {
-  if (!model || len == 0 || !sequence_is_valid(seq, len))
-    return false;
-  /* Check unigrams first */
-  for (size_t i = 0; i < len; i++) {
-    if (count_get(model->uni, seq[i], strlen(seq[i]) + 1) > 0)
-      return true;
+sg_anomaly_status_t
+sg_anomaly_has_observed_netseq(const sg_anomaly_model_t *model,
+                               const char *netseq, size_t netseq_length,
+                               bool *observed) {
+  if (observed)
+    *observed = false;
+  if (!model || !netseq || !observed)
+    return SG_ANOMALY_ERR_INVALID;
+  size_t count = 0;
+  sg_anomaly_status_t status =
+      validate_netseq(netseq, netseq_length, false, &count);
+  if (status != SG_ANOMALY_OK)
+    return status;
+  shell_netstring_iter_t iter;
+  if (shell_netstring_iter_init(&iter, netseq, netseq_length) !=
+      SHELL_NETSTRING_OK)
+    return SG_ANOMALY_ERR_FORMAT;
+  shell_netstring_view_t view;
+  while (shell_netstring_iter_next(&iter, &view) == SHELL_NETSTRING_OK) {
+    const char *payload = (const char *)view.payload;
+    size_t length = view.payload_length;
+    if (length > SG_ANOMALY_MAX_COMMAND_LENGTH)
+      continue;
+    char command[SG_ANOMALY_MAX_COMMAND_LENGTH + 1];
+    memcpy(command, payload, length);
+    command[length] = '\0';
+    if (count_get(model->uni, command, length + 1) > 0) {
+      *observed = true;
+      break;
+    }
   }
-  return false;
+  return SG_ANOMALY_OK;
 }
 
 typedef struct {

@@ -107,6 +107,7 @@ typedef enum {
   SG_ERR_PARSE = -3,
   SG_ERR_TRUNC = -4,
   SG_ERR_IO = -5,
+  SG_ERR_EXPAND = -6,
 } sg_error_t;
 
 typedef enum {
@@ -130,7 +131,12 @@ typedef enum {
 typedef struct {
   bool matches;
   sg_verdict_t verdict;
+  /* Readable diagnostic display only. It is lossy and must never be parsed. */
   const char *command;
+  /* Canonical argv used for policy evaluation and all programmatic handling.
+   * This is authoritative. Both pointers refer into the caller buffer. */
+  const char *netargv;
+  size_t netargv_length;
   const char *reject_reason;
 
   uint32_t write_count;
@@ -292,26 +298,22 @@ void sg_violation_config_default(sg_violation_config_t *cfg);
 
 /* --- EXPANSION CALLBACKS --- */
 
-/*
- * Variable expansion callback.  Write the expanded value of `name`
- * into `buf` (at most `buf_size` bytes including NUL).
- * Return the number of bytes written (excluding NUL), or 0 if
- * the variable cannot be expanded. Returning a value >= `buf_size`
- * is invalid and causes the evaluation to fail closed.
- */
-typedef size_t (*sg_expand_var_fn)(const char *name, char *buf, size_t buf_size,
-                                   void *user_ctx);
+/* Canonical expansion callbacks. A resolved callback writes already-resolved
+ * argument values as one complete canonical netargv: "" means zero arguments
+ * and "0:,..." represents an empty argument. The buffer is not shell source
+ * and is never reparsed. Failed or malformed results make sg_eval return
+ * SG_ERR_EXPAND. */
+typedef enum {
+  SG_EXPAND_UNRESOLVED = 0,
+  SG_EXPAND_RESOLVED = 1,
+  SG_EXPAND_FAILED = -1,
+} sg_expand_status_t;
 
-/*
- * Glob expansion callback.  Write a space-separated list of
- * matches for `pattern` into `buf`. Return bytes written
- * (excluding NUL), or 0 if no matches. Patterns longer than 255 bytes
- * are not passed to the callback; the evaluation reports SG_ERR_TRUNC.
- * Returning a value >= `buf_size` is invalid and causes the evaluation
- * to fail closed.
- */
-typedef size_t (*sg_expand_glob_fn)(const char *pattern, char *buf,
-                                    size_t buf_size, void *user_ctx);
+typedef sg_expand_status_t (*sg_expand_netargv_fn)(const char *name_or_pattern,
+                                                   char *netargv,
+                                                   size_t netargv_size,
+                                                   size_t *netargv_length,
+                                                   void *user_ctx);
 
 /* --- LIFECYCLE --- */
 
@@ -387,10 +389,30 @@ typedef enum {
   SG_ANOMALY_COMBINE_BAYESIAN = 1
 } sg_anomaly_combine_mode_t;
 
+/* Read-only result from scoring paired canonical anomaly sequences. */
+typedef struct {
+  double combined_score;
+  double raw_score;
+  double type_score;
+  bool detected;
+  size_t command_count;
+} sg_anomaly_sequence_score_t;
+
 /* Set the score combination method.  Default: WEIGHTED.
  * Returns SG_ERR_INVALID if gate is NULL. */
 sg_error_t sg_gate_set_anomaly_combine_mode(sg_gate_t *gate,
                                             sg_anomaly_combine_mode_t mode);
+
+/* Score matching outer netstring sequences using the gate's configured raw
+ * and type models. This does not update either model, adaptive thresholds,
+ * Bayesian histograms, or caches. Both sequences must be canonical and have
+ * the same number of command records. */
+sg_error_t sg_gate_score_anomaly_netseq(const sg_gate_t *gate,
+                                        const char *raw_netseq,
+                                        size_t raw_length,
+                                        const char *type_netseq,
+                                        size_t type_length,
+                                        sg_anomaly_sequence_score_t *out);
 
 /*
  * Enable or disable adaptive threshold mode.
@@ -425,7 +447,7 @@ sg_error_t sg_gate_set_anomaly_k_factor(sg_gate_t *gate, double k);
  * Set the type sequence cache size (default 0 = disabled).
  *
  * When cache_size > 0, an LRU cache stores type sequences for recently
- * evaluated commands, avoiding recomputation of shell_build_type_sequence
+ * evaluated commands, avoiding recomputation of shell_build_type_netseq
  * on repeated commands. The cache evicts the least-recently-used entry
  * when full.
  *
@@ -439,7 +461,7 @@ sg_error_t sg_gate_set_anomaly_cache_size(sg_gate_t *gate, size_t cache_size);
 
 /*
  * Atomically save the raw and type anomaly models as one versioned bundle.
- * The bundle is intentionally not compatible with standalone sg_anomaly v3
+ * The v2 bundle is intentionally not compatible with standalone sg_anomaly
  * files or the former `{path}_type` sidecar convention.
  */
 sg_error_t sg_gate_save_anomaly_model(const sg_gate_t *gate, const char *path);
@@ -483,10 +505,12 @@ sg_error_t sg_gate_set_reject_mask(sg_gate_t *gate, uint32_t mask);
 sg_error_t sg_gate_set_stop_mode(sg_gate_t *gate, sg_stop_mode_t mode);
 sg_error_t sg_gate_set_suggestions(sg_gate_t *gate, bool enabled);
 
-sg_error_t sg_gate_set_expand_var(sg_gate_t *gate, sg_expand_var_fn fn,
-                                  void *user_ctx);
-sg_error_t sg_gate_set_expand_glob(sg_gate_t *gate, sg_expand_glob_fn fn,
-                                   void *user_ctx);
+sg_error_t sg_gate_set_expand_var_netargv(sg_gate_t *gate,
+                                          sg_expand_netargv_fn fn,
+                                          void *user_ctx);
+sg_error_t sg_gate_set_expand_glob_netargv(sg_gate_t *gate,
+                                           sg_expand_netargv_fn fn,
+                                           void *user_ctx);
 
 /*
  * Stores a shallow copy of `config`. All strings referenced by its arrays

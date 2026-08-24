@@ -1,6 +1,7 @@
 #ifndef SHELL_ABSTRACT_H
 #define SHELL_ABSTRACT_H
 
+#include "shell_processor.h"
 #include "shell_tokenizer_full.h"
 #include <stdbool.h>
 #include <stddef.h>
@@ -226,40 +227,15 @@ const char *shell_path_category_name(path_category_t cat);
  */
 void shell_abstracted_destroy(abstracted_command_t *cmd);
 
-/* --- LIGHTWEIGHT TYPE SEQUENCE GENERATION --- */
-
-/**
- * Build a compact type sequence for a command.
- *
- * Returns a heap-allocated string of space-separated tokens:
- *   "cat /etc/passwd"       ->  "cat AP"
- *   "grep -i root file.txt" ->  "grep OPT STR RP"
- *   "rm -rf /tmp/star.log"  ->  "rm OPT GB"
- *   "echo $HOME"            ->  "echo EV"
- *
- * For multi-command expressions, returns one abstract pipeline sequence. The
- * `|` between stages is a canonical sequence marker: it means "followed by
- * another command stage", not necessarily a literal shell pipe. Concrete
- * `|`, `;`, `&&`, and `||` operators intentionally normalize to the same
- * marker so structurally equivalent command sequences share a model key:
- *   "cat /etc/passwd | grep root" -> "cat AP | grep STR"
- *   "make && make test"           -> "make | make STR"
- *
- * To recover the concrete sequencing operator represented by each marker,
- * parse the original command with shell_parse_fast(). For marker N (between
- * stages N and N+1), inspect result.cmds[N+1].type: SHELL_TYPE_PIPELINE,
- * SHELL_TYPE_SEMICOLON, SHELL_TYPE_AND, or SHELL_TYPE_OR. The first stage has
- * type SHELL_TYPE_SIMPLE because no operator precedes it.
- *
- * Token types: AP=abs_path, RP=rel_path, HP=home_path,
- *   GB=glob, EV=env_var, PV=pos_var, SV=spec_var,
- *   CS=cmd_subst, AR=arith, STR=string, OPT=option.
- * Command names (first token of each subcommand) are kept literal.
- *
- * Caller must free the returned string.
- * Returns NULL on error or empty input.
- */
-char *shell_build_type_sequence(const char *command);
+/** Build a canonical anomaly type sequence. Each outer netstring represents
+ * one isolated subcommand and contains a nested netargv signature: the first
+ * element is the decoded executable name and remaining elements are abstract
+ * type symbols. Operators between subcommands are intentionally normalized to
+ * sequence order. */
+shell_process_status_t
+shell_build_type_netseq(const char *command,
+                        const shell_process_limits_t *limits, char **netseq,
+                        size_t *subcommand_count);
 
 #ifdef __cplusplus
 }

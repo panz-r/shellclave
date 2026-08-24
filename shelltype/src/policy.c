@@ -19,6 +19,7 @@
 #include "filter_hash.h"
 #include "netpattern.h"
 #include "policy_ctx.h"
+#include "shell_netstring.h"
 #include "shelltype.h"
 
 #include <assert.h>
@@ -58,7 +59,8 @@ typedef struct {
   const char *text;
   uint32_t target;
   uint8_t type;
-  uint8_t _pad[3];
+  uint8_t compound;
+  uint8_t _pad[2];
 } child_entry_t;
 
 /* --- POLICY STATE — 16 bytes, fixed size --- */
@@ -273,6 +275,17 @@ static bool pattern_entry_prepare(st_policy_ctx_t *ctx, const char *pattern,
       return false;
     }
     tok_copy[i].type = tokens[i].type;
+    tok_copy[i].compound = tokens[i].compound;
+    tok_copy[i].capture_type = tokens[i].capture_type;
+    if (tokens[i].compound) {
+      tok_copy[i].prefix = strdup(tokens[i].prefix);
+      tok_copy[i].capture = strdup(tokens[i].capture);
+      tok_copy[i].suffix = strdup(tokens[i].suffix);
+      if (!tok_copy[i].prefix || !tok_copy[i].capture || !tok_copy[i].suffix) {
+        free_pattern_tokens(tok_copy, token_count);
+        return false;
+      }
+    }
   }
 
   prepared->pattern = interned;
@@ -394,6 +407,7 @@ struct st_policy {
   vacuum_filter_t *pos_filters[FILTER_POS_LEVELS];
   uint64_t
       pos_wildcard_mask[FILTER_POS_LEVELS]; /* uint64_t for ST_TYPE_ANY=32 */
+  bool pos_has_compound[FILTER_POS_LEVELS];
   uint64_t pos_built_epoch[FILTER_POS_LEVELS];
   len_bucket_t *len_buckets; /* Length-indexed pattern buckets */
   size_t num_buckets;        /* ST_MAX_CMD_TOKENS + 1 */
@@ -511,7 +525,7 @@ static inline uint64_t runtime_match_mask(st_token_type_t t) {
 
 static child_entry_t *find_literal_child(const policy_state_t *node,
                                          const char *arena_base,
-                                         const char *text) {
+                                         const char *text, bool compound) {
   uint16_t n = node->literal_count;
   if (n == 0 || !arena_base)
     return NULL;
@@ -519,7 +533,7 @@ static child_entry_t *find_literal_child(const policy_state_t *node,
   child_entry_t *children =
       (child_entry_t *)(arena_base + node->children_offset);
   for (uint16_t i = 0; i < n; i++) {
-    if (strcmp(text, children[i].text) == 0)
+    if (children[i].compound == compound && strcmp(text, children[i].text) == 0)
       return &children[i];
   }
   return NULL;
@@ -699,14 +713,16 @@ static bool is_explicit_wildcard(const char *text, st_token_type_t type);
 /* Returns: -1 = allocation failure, 0 = success (filter updated), 1 = success
  * (filter needs rebuild) */
 static int insert_child(policy_state_t *node, st_policy_t *policy,
-                        const char *text, st_token_type_t type, uint32_t target,
+                        const st_token_t *token, uint32_t target,
                         uint8_t depth) {
+  const char *text = token->text;
+  st_token_type_t type = token->type;
   assert(node->literal_count + node->wildcard_count <= node->children_alloc);
   /* Use is_explicit_wildcard to determine storage class.
    * Classified tokens like "-v" (SHORTOPT) are stored as literal children
    * (match by text). Only explicit wildcard symbols like "#opt" are
    * stored as wildcard children (match by type). */
-  bool is_literal = !is_explicit_wildcard(text, type);
+  bool is_literal = token->compound || !is_explicit_wildcard(text, type);
   uint16_t total = node->literal_count + node->wildcard_count;
   uint16_t insert_pos;
   char *arena_base = policy->children_arena.base;
@@ -723,7 +739,7 @@ static int insert_child(policy_state_t *node, st_policy_t *policy,
     }
     /* Check ALL existing literals for duplicate */
     for (uint16_t i = 0; i < node->literal_count; i++) {
-      if (children[i].type == ST_TYPE_LITERAL &&
+      if (children[i].compound == token->compound &&
           strcmp(text, children[i].text) == 0)
         return -1;
     }
@@ -758,8 +774,10 @@ static int insert_child(policy_state_t *node, st_policy_t *policy,
   }
   if ((is_literal || (text && strchr(text, '.'))) && !interned)
     return -1;
-  child_entry_t new_child = {
-      .text = interned, .target = target, .type = (uint8_t)type};
+  child_entry_t new_child = {.text = interned,
+                             .target = target,
+                             .type = (uint8_t)type,
+                             .compound = token->compound};
 
   if (total + 1 > node->children_alloc) {
     if (node->children_alloc > UINT16_MAX / 2)
@@ -789,7 +807,10 @@ static int insert_child(policy_state_t *node, st_policy_t *policy,
   }
 
   if (depth < FILTER_POS_LEVELS) {
-    if (type == ST_TYPE_LITERAL) {
+    if (token->compound) {
+      policy->pos_has_compound[depth] = true;
+      filter_status = 1;
+    } else if (type == ST_TYPE_LITERAL) {
       if (policy->pos_filters[depth]) {
         uint64_t h = filter_hash_fnv1a(text, strlen(text));
         vacuum_err_t vrc = vacuum_filter_insert(policy->pos_filters[depth], h);
@@ -813,8 +834,12 @@ static int insert_child(policy_state_t *node, st_policy_t *policy,
 static void free_pattern_tokens(st_token_t *tokens, size_t count) {
   if (!tokens)
     return;
-  for (size_t i = 0; i < count; i++)
+  for (size_t i = 0; i < count; i++) {
     free(tokens[i].text);
+    free(tokens[i].prefix);
+    free(tokens[i].capture);
+    free(tokens[i].suffix);
+  }
   free(tokens);
 }
 
@@ -860,6 +885,24 @@ static bool pattern_subsumes(const st_token_t *a, size_t a_len,
     return false;
 
   for (size_t i = 0; i < a_len; i++) {
+    if (a[i].compound || b[i].compound) {
+      if (a[i].compound && b[i].compound) {
+        if (strcmp(a[i].prefix, b[i].prefix) != 0 ||
+            strcmp(a[i].suffix, b[i].suffix) != 0 ||
+            !st_is_compatible(b[i].capture_type, a[i].capture_type))
+          return false;
+        const char *a_param = wildcard_param(a[i].capture, a[i].capture_type);
+        const char *b_param = wildcard_param(b[i].capture, b[i].capture_type);
+        if ((a_param && !b_param) ||
+            (a_param && b_param && strcmp(a_param, b_param) != 0))
+          return false;
+        continue;
+      }
+      if (!a[i].compound && is_explicit_wildcard(a[i].text, a[i].type) &&
+          a[i].type == ST_TYPE_ANY)
+        continue;
+      return false;
+    }
     bool a_wild = is_explicit_wildcard(a[i].text, a[i].type);
     bool b_wild = is_explicit_wildcard(b[i].text, b[i].type);
 
@@ -924,6 +967,7 @@ static void policy_rebuild_filters(st_policy_t *policy) {
   } bfs_q;
   vacuum_filter_t *new_filters[FILTER_POS_LEVELS] = {0};
   uint64_t new_wildcard_masks[FILTER_POS_LEVELS] = {0};
+  bool new_has_compound[FILTER_POS_LEVELS] = {0};
   bfs_q *q = malloc(policy->states.count * sizeof(*q));
   size_t head = 0, tail = 0;
   bool complete = q != NULL;
@@ -954,7 +998,9 @@ static void policy_rebuild_filters(st_policy_t *policy) {
 
       uint8_t d = entry.depth;
 
-      if (c->type == ST_TYPE_LITERAL) {
+      if (c->compound) {
+        new_has_compound[d] = true;
+      } else if (c->type == ST_TYPE_LITERAL) {
         if (new_filters[d]) {
           uint64_t h = filter_hash_fnv1a(c->text, strlen(c->text));
           vacuum_err_t vrc = vacuum_filter_insert(new_filters[d], h);
@@ -983,6 +1029,7 @@ static void policy_rebuild_filters(st_policy_t *policy) {
     vacuum_filter_destroy(policy->pos_filters[i]);
     policy->pos_filters[i] = complete ? new_filters[i] : NULL;
     policy->pos_wildcard_mask[i] = complete ? new_wildcard_masks[i] : 0;
+    policy->pos_has_compound[i] = complete ? new_has_compound[i] : true;
     policy->pos_built_epoch[i] = epoch;
     if (!complete)
       vacuum_filter_destroy(new_filters[i]);
@@ -1008,7 +1055,8 @@ st_error_t st_validate_netpattern(const char *pattern,
     return decode_error;
   size_t token_count = decoded.count;
   st_token_t *tokens = decoded.tokens;
-  if (token_count != 0 && tokens[0].type == ST_TYPE_ANY) {
+  if (token_count != 0 &&
+      (tokens[0].type == ST_TYPE_ANY || tokens[0].compound)) {
     free_pattern_tokens(tokens, token_count);
     return ST_ERR_INVALID;
   }
@@ -1135,7 +1183,8 @@ static st_error_t st_policy_add_locked(st_policy_t *policy,
     return decode_error;
   size_t token_count = decoded.count;
   st_token_t *tokens = decoded.tokens;
-  if (token_count != 0 && tokens[0].type == ST_TYPE_ANY) {
+  if (token_count != 0 &&
+      (tokens[0].type == ST_TYPE_ANY || tokens[0].compound)) {
     free_pattern_tokens(tokens, token_count);
     return ST_ERR_INVALID;
   }
@@ -1218,7 +1267,7 @@ static st_error_t st_policy_add_locked(st_policy_t *policy,
         is_wild ? find_exact_wildcard_child(node, policy->children_arena.base,
                                             tokens[i].type, tokens[i].text)
                 : find_literal_child(node, policy->children_arena.base,
-                                     tokens[i].text);
+                                     tokens[i].text, tokens[i].compound);
     if (!child) {
       first_missing = i;
       break;
@@ -1269,7 +1318,8 @@ static st_error_t st_policy_add_locked(st_policy_t *policy,
     bool is_wild = is_explicit_wildcard(tokens[i].text, tokens[i].type);
 
     if (!is_wild) {
-      existing = find_literal_child(node, arena_base, tokens[i].text);
+      existing = find_literal_child(node, arena_base, tokens[i].text,
+                                    tokens[i].compound);
     } else {
       existing = find_exact_wildcard_child(node, arena_base, tokens[i].type,
                                            tokens[i].text);
@@ -1287,8 +1337,7 @@ static st_error_t st_policy_add_locked(st_policy_t *policy,
       /* states_array_alloc() may realloc the state array. Re-resolve the
        * parent by index before using it again. */
       node = &policy->states.states[current];
-      int rc = insert_child(node, policy, tokens[i].text, tokens[i].type,
-                            new_state, (uint8_t)i);
+      int rc = insert_child(node, policy, &tokens[i], new_state, (uint8_t)i);
       if (rc < 0) {
         free(to_remove);
         free_pattern_tokens(tokens, token_count);
@@ -1417,7 +1466,8 @@ static st_error_t remove_pattern_by_id_locked(st_policy_t *policy,
       child_entry_t *children =
           (child_entry_t *)(arena_base + node->children_offset);
       for (uint16_t ci = 0; ci < n; ci++) {
-        if (strcmp(entry->tokens[i].text, children[ci].text) == 0) {
+        if (children[ci].compound == entry->tokens[i].compound &&
+            strcmp(entry->tokens[i].text, children[ci].text) == 0) {
           child = &children[ci];
           path[i].child_idx = ci;
           break;
@@ -1923,6 +1973,9 @@ st_error_t st_policy_compact(st_policy_t *policy) {
     uint64_t mask = policy->pos_wildcard_mask[i];
     policy->pos_wildcard_mask[i] = staged->pos_wildcard_mask[i];
     staged->pos_wildcard_mask[i] = mask;
+    bool compound = policy->pos_has_compound[i];
+    policy->pos_has_compound[i] = staged->pos_has_compound[i];
+    staged->pos_has_compound[i] = compound;
     uint64_t epoch = policy->pos_built_epoch[i];
     policy->pos_built_epoch[i] = staged->pos_built_epoch[i];
     staged->pos_built_epoch[i] = epoch;
@@ -1945,6 +1998,7 @@ st_error_t st_policy_clear(st_policy_t *policy) {
     vacuum_filter_destroy(policy->pos_filters[i]);
     policy->pos_filters[i] = NULL;
     policy->pos_wildcard_mask[i] = 0;
+    policy->pos_has_compound[i] = false;
     policy->pos_built_epoch[i] = 0;
   }
 
@@ -2094,6 +2148,51 @@ static bool match_queue_append(match_entry_t **queue, match_entry_t *stack,
   return true;
 }
 
+static bool compound_child_matches(const child_entry_t *child,
+                                   const char *text) {
+  if (!child->compound || !child->text || !text)
+    return false;
+  const char *open = strchr(child->text, '{');
+  const char *close = open ? strchr(open + 1, '}') : NULL;
+  if (!open || !close)
+    return false;
+  size_t prefix_length = (size_t)(open - child->text);
+  size_t suffix_length = strlen(close + 1);
+  size_t text_length = strlen(text);
+  if (text_length < prefix_length + suffix_length ||
+      memcmp(text, child->text, prefix_length) != 0 ||
+      memcmp(text + text_length - suffix_length, close + 1, suffix_length) != 0)
+    return false;
+  size_t capture_length = text_length - prefix_length - suffix_length;
+  if (capture_length >= ST_MAX_TOKEN_LEN)
+    return false;
+  char capture[ST_MAX_TOKEN_LEN];
+  memcpy(capture, text + prefix_length, capture_length);
+  capture[capture_length] = '\0';
+  size_t symbol_length = (size_t)(close - open - 1);
+  if (symbol_length >= ST_MAX_TOKEN_LEN)
+    return false;
+  char symbol[ST_MAX_TOKEN_LEN];
+  memcpy(symbol, open + 1, symbol_length);
+  symbol[symbol_length] = '\0';
+  st_token_type_t wild_type = ST_TYPE_LITERAL;
+  for (int candidate = ST_TYPE_LITERAL + 1; candidate < ST_TYPE_COUNT;
+       candidate++) {
+    const char *base = st_type_symbol[candidate];
+    size_t base_length = strlen(base);
+    if (strcmp(symbol, base) == 0 || (strncmp(symbol, base, base_length) == 0 &&
+                                      symbol[base_length] == '.')) {
+      wild_type = (st_token_type_t)candidate;
+      break;
+    }
+  }
+  if (wild_type == ST_TYPE_LITERAL)
+    return false;
+  st_token_type_t concrete_type = st_classify_token(capture);
+  return (runtime_match_mask(concrete_type) & (1ULL << wild_type)) != 0 &&
+         param_matches(capture, concrete_type, symbol, wild_type);
+}
+
 static st_error_t matching_walk_locked(const st_policy_t *policy,
                                        const st_token_array_t *cmd,
                                        match_frontier_t *frontier,
@@ -2133,7 +2232,8 @@ static st_error_t matching_walk_locked(const st_policy_t *policy,
     child_entry_t *children =
         (child_entry_t *)(policy->children_arena.base + state->children_offset);
     for (uint16_t i = 0; i < state->literal_count; i++)
-      if (strcmp(text, children[i].text) == 0) {
+      if ((!children[i].compound && strcmp(text, children[i].text) == 0) ||
+          compound_child_matches(&children[i], text)) {
         if (!match_queue_append(
                 &queue, stack_queue, &tail, &queue_cap,
                 (match_entry_t){children[i].target, entry.token_idx + 1}))
@@ -2283,6 +2383,8 @@ st_error_t st_policy_eval(st_policy_t *policy, const char *netargv,
   }
 
   for (size_t i = 0; i < check_len; i++) {
+    if (policy->pos_has_compound[i])
+      continue;
     st_token_type_t ctype = cmd.tokens[i].type;
     /* A compatible wildcard may match without an exact literal. Otherwise an
      * available literal filter must contain this exact token, irrespective of
@@ -2362,7 +2464,7 @@ st_error_t st_policy_eval(st_policy_t *policy, const char *netargv,
   /* Suggestion A: minimal extension (matched prefix as-is + remaining as
    * literals) */
   {
-    st_token_t *pat_tokens = malloc(cmd.count * sizeof(st_token_t));
+    st_token_t *pat_tokens = calloc(cmd.count, sizeof(st_token_t));
     if (!pat_tokens) {
       st_free_token_array(&cmd);
       pthread_rwlock_unlock(&policy->rwlock);
@@ -2413,7 +2515,7 @@ st_error_t st_policy_eval(st_policy_t *policy, const char *netargv,
 
       if (best_wild != ST_TYPE_ANY) {
         size_t pat_len = match_depth + 1;
-        st_token_t *pat_tokens = malloc(pat_len * sizeof(st_token_t));
+        st_token_t *pat_tokens = calloc(pat_len, sizeof(st_token_t));
         if (pat_tokens) {
           for (size_t i = 0; i < match_depth; i++) {
             pat_tokens[i].text = (char *)cmd.tokens[i].text;
@@ -2992,9 +3094,10 @@ st_error_t st_policy_render_nfa(const st_policy_t *policy, const char *path,
 
 /* --- SERIALIZATION ---
  *
- * Version 2 stores canonical netpatterns in an additional netstring frame:
+ * Version 3 stores canonical netpatterns, including compound argument
+ * records, in an additional netstring frame:
  *
- *   # shelltype-policy v2
+ *   # shelltype-policy v3
  *   # patterns: <count>
  *   <byte-length>:<canonical-netpattern>,\n
  *   ...
@@ -3005,7 +3108,7 @@ st_error_t st_policy_render_nfa(const st_policy_t *policy, const char *path,
  * 1 line-oriented CPL files remain loadable and are canonicalized on import.
  */
 
-#define ST_SERIALIZATION_VERSION 2
+#define ST_SERIALIZATION_VERSION 3
 
 typedef struct {
   FILE *fp;
@@ -3029,13 +3132,18 @@ static void dfs_save(st_policy_t *policy, uint32_t idx,
     const char *pat = policy->patterns.entries[node->pattern_id].pattern;
     size_t len = strlen(pat);
     char prefix[32];
-    int prefix_len = snprintf(prefix, sizeof(prefix), "%zu:", len);
-    if (prefix_len < 0 || (size_t)prefix_len >= sizeof(prefix) ||
-        fprintf(ctx->fp, "%s%s,\n", prefix, pat) < 0) {
+    size_t prefix_len = 0;
+    if (shell_netstring_write_prefix(prefix, sizeof(prefix) - 1, len,
+                                     &prefix_len) != SHELL_NETSTRING_OK) {
       ctx->error = ST_ERR_IO;
       return;
     }
-    ctx->crc = st_crc32_update(prefix, (size_t)prefix_len, ctx->crc);
+    prefix[prefix_len] = '\0';
+    if (fprintf(ctx->fp, "%s%s,\n", prefix, pat) < 0) {
+      ctx->error = ST_ERR_IO;
+      return;
+    }
+    ctx->crc = st_crc32_update(prefix, prefix_len, ctx->crc);
     ctx->crc = st_crc32_update(pat, len, ctx->crc);
     ctx->crc = st_crc32_update(",\n", 2, ctx->crc);
     ctx->pattern_count++;
@@ -3143,7 +3251,7 @@ st_error_t st_policy_load(st_policy_t *policy, const char *path,
          (line[header_len - 1] == '\n' || line[header_len - 1] == '\r'))
     line[--header_len] = '\0';
 
-  if (strcmp(line, "# shelltype-policy v2") == 0) {
+  if (strcmp(line, "# shelltype-policy v3") == 0) {
     got_header = true;
     line_status = st_read_line(fp, line, sizeof(line));
     if (line_status != ST_LINE_OK) {
@@ -3174,47 +3282,43 @@ st_error_t st_policy_load(st_policy_t *policy, const char *path,
     }
     for (size_t record_index = 0; record_index < declared_count;
          record_index++) {
-      char prefix[32];
-      size_t prefix_len = 0, payload_len = 0;
-      int ch = fgetc(fp);
-      if (ch == EOF || !isdigit((unsigned char)ch)) {
+      unsigned char *record = NULL;
+      size_t record_length = 0;
+      shell_netstring_status_t net_status = shell_netstring_read_stream(
+          fp, ST_MAX_NETPATTERN_LEN + 32, &record, &record_length);
+      if (net_status != SHELL_NETSTRING_OK) {
+        pass1_error = net_status == SHELL_NETSTRING_ENOMEM      ? ST_ERR_MEMORY
+                      : net_status == SHELL_NETSTRING_EIO       ? ST_ERR_IO
+                      : net_status == SHELL_NETSTRING_EOVERFLOW ? ST_ERR_LIMIT
+                                                                : ST_ERR_FORMAT;
+        goto pass1_fail;
+      }
+      shell_netstring_iter_t iter;
+      shell_netstring_view_t view, end_view;
+      if (shell_netstring_iter_init(&iter, record, record_length) !=
+              SHELL_NETSTRING_OK ||
+          shell_netstring_iter_next(&iter, &view) != SHELL_NETSTRING_OK ||
+          view.record_length != record_length ||
+          shell_netstring_iter_next(&iter, &end_view) != SHELL_NETSTRING_DONE ||
+          view.payload_length == 0 ||
+          view.payload_length >= ST_MAX_NETPATTERN_LEN ||
+          memchr(view.payload, '\0', view.payload_length)) {
+        free(record);
+        goto pass1_fail;
+      }
+      int newline = fgetc(fp);
+      if (newline != '\n') {
+        free(record);
         if (ferror(fp))
           pass1_error = ST_ERR_IO;
         goto pass1_fail;
       }
-      bool leading_zero = ch == '0';
-      do {
-        if (prefix_len + 1 >= sizeof(prefix))
-          goto pass1_fail;
-        prefix[prefix_len++] = (char)ch;
-        unsigned digit = (unsigned)(ch - '0');
-        if (payload_len > (SIZE_MAX - digit) / 10)
-          goto pass1_fail;
-        payload_len = payload_len * 10 + digit;
-        ch = fgetc(fp);
-      } while (ch != EOF && isdigit((unsigned char)ch));
-      if (ch != ':' || (leading_zero && prefix_len != 1) || payload_len == 0 ||
-          payload_len >= ST_MAX_NETPATTERN_LEN)
-        goto pass1_fail;
-      prefix[prefix_len++] = ':';
-      char *payload = malloc(payload_len + 1);
-      if (!payload) {
-        pass1_error = ST_ERR_MEMORY;
-        goto pass1_fail;
-      }
-      if (fread(payload, 1, payload_len, fp) != payload_len) {
-        free(payload);
-        pass1_error = ferror(fp) ? ST_ERR_IO : ST_ERR_FORMAT;
-        goto pass1_fail;
-      }
-      payload[payload_len] = '\0';
-      int comma = fgetc(fp), newline = fgetc(fp);
-      if (comma != ',' || newline != '\n') {
-        free(payload);
-        if (ferror(fp))
-          pass1_error = ST_ERR_IO;
-        goto pass1_fail;
-      }
+      size_t payload_len = view.payload_length;
+      computed_crc = st_crc32_update(record, record_length, computed_crc);
+      computed_crc = st_crc32_update("\n", 1, computed_crc);
+      memmove(record, view.payload, payload_len);
+      record[payload_len] = '\0';
+      char *payload = (char *)record;
       st_token_array_t decoded_pattern = {0};
       st_error_t decode_error = st_netpattern_decode(payload, &decoded_pattern);
       st_free_token_array(&decoded_pattern);
@@ -3224,9 +3328,6 @@ st_error_t st_policy_load(st_policy_t *policy, const char *path,
           pass1_error = ST_ERR_MEMORY;
         goto pass1_fail;
       }
-      computed_crc = st_crc32_update(prefix, prefix_len, computed_crc);
-      computed_crc = st_crc32_update(payload, payload_len, computed_crc);
-      computed_crc = st_crc32_update(",\n", 2, computed_crc);
       pattern_lines[pattern_count++] = payload;
     }
     line_status = st_read_line(fp, line, sizeof(line));
@@ -3673,7 +3774,7 @@ size_t st_policy_suggest_variants(const st_policy_t *policy,
 
   /* Variant 0: exact match as literal */
   {
-    st_token_t *lit_tokens = malloc(token_count * sizeof(st_token_t));
+    st_token_t *lit_tokens = calloc(token_count, sizeof(st_token_t));
     if (!lit_tokens)
       return 0;
     for (size_t i = 0; i < token_count; i++) {
@@ -3704,7 +3805,7 @@ size_t st_policy_suggest_variants(const st_policy_t *policy,
       if (!is_safe_immediate_cover(tokens[i].type, wider))
         continue;
 
-      st_token_t *pat_tokens = malloc(token_count * sizeof(st_token_t));
+      st_token_t *pat_tokens = calloc(token_count, sizeof(st_token_t));
       if (!pat_tokens) {
         memset(out, 0, 3 * sizeof(*out));
         return 0;

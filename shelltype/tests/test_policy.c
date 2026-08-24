@@ -460,9 +460,9 @@ static int test_policy_save_determinism_and_compaction(void) {
   size_t first_length = 0, second_length = 0;
   ASSERT(read_policy_file(first_path, first, sizeof(first), &first_length));
   ASSERT(read_policy_file(second_path, second, sizeof(second), &second_length));
-  static const char v2_header[] = "# shelltype-policy v2\n";
-  ASSERT(first_length >= sizeof(v2_header) - 1 &&
-         memcmp(first, v2_header, sizeof(v2_header) - 1) == 0);
+  static const char v3_header[] = "# shelltype-policy v3\n";
+  ASSERT(first_length >= sizeof(v3_header) - 1 &&
+         memcmp(first, v3_header, sizeof(v3_header) - 1) == 0);
   ASSERT(first_length == second_length &&
          memcmp(first, second, first_length) == 0);
   /* The quoted pattern exercises serialization text/escaping; the remaining
@@ -788,6 +788,28 @@ static int test_policy_load_rejects_binary_and_overlong_lines(void) {
   FILE *fp = fopen(path, "wb");
   ASSERT(fp != NULL);
   ASSERT(fwrite(binary, 1, sizeof(binary) - 1, fp) == sizeof(binary) - 1);
+  ASSERT(fclose(fp) == 0);
+  ASSERT(st_policy_load(policy, path, true) == ST_ERR_FORMAT);
+  ASSERT(st_policy_count(policy) == 1);
+  ASSERT(policy_matches(policy, "preserve value", true));
+
+  static const char *const malformed_v3[] = {"01:x,\n", "3:ab,\n"};
+  for (size_t i = 0; i < sizeof(malformed_v3) / sizeof(malformed_v3[0]); i++) {
+    fp = fopen(path, "wb");
+    ASSERT(fp != NULL);
+    ASSERT(fputs("# shelltype-policy v3\n# patterns: 1\n", fp) >= 0);
+    ASSERT(fputs(malformed_v3[i], fp) >= 0);
+    ASSERT(fclose(fp) == 0);
+    ASSERT(st_policy_load(policy, path, true) == ST_ERR_FORMAT);
+    ASSERT(st_policy_count(policy) == 1);
+    ASSERT(policy_matches(policy, "preserve value", true));
+  }
+
+  static const unsigned char nul_v3[] =
+      "# shelltype-policy v3\n# patterns: 1\n3:a\0b,\n";
+  fp = fopen(path, "wb");
+  ASSERT(fp != NULL);
+  ASSERT(fwrite(nul_v3, 1, sizeof(nul_v3) - 1, fp) == sizeof(nul_v3) - 1);
   ASSERT(fclose(fp) == 0);
   ASSERT(st_policy_load(policy, path, true) == ST_ERR_FORMAT);
   ASSERT(st_policy_count(policy) == 1);
@@ -1938,17 +1960,29 @@ static int test_param_subsumption_matrix(void) {
 
   st_policy_t *sizes = st_policy_new(ctx);
   ASSERT(sizes != NULL);
-  ASSERT_OK(test_st_policy_add(sizes, "dd bs= #size.MiB"));
-  ASSERT_OK(test_st_policy_add(sizes, "dd bs= #size.G"));
+  ASSERT_OK(test_st_policy_add(sizes, "dd bs={#size.MiB}"));
+  ASSERT_OK(test_st_policy_add(sizes, "dd bs={#size.G}"));
   ASSERT_OK(st_policy_compact(sizes));
   ASSERT(st_policy_count(sizes) == 2);
-  ASSERT(policy_eval_is(sizes, "dd bs=10MiB", "dd bs= #size.MiB"));
-  ASSERT(policy_eval_is(sizes, "dd bs=2G", "dd bs= #size.G"));
+  ASSERT(policy_eval_is(sizes, "dd bs=10MiB", "dd bs={#size.MiB}"));
+  ASSERT(policy_eval_is(sizes, "dd bs=2G", "dd bs={#size.G}"));
   ASSERT(policy_eval_is(sizes, "dd bs=10K", NULL));
-  ASSERT_OK(test_st_policy_add(sizes, "dd bs= #size"));
+  ASSERT_OK(test_st_policy_add(sizes, "dd bs={#size}"));
   ASSERT(st_policy_count(sizes) == 1);
-  ASSERT(policy_eval_is(sizes, "dd bs=10K", "dd bs= #size"));
+  ASSERT(policy_eval_is(sizes, "dd bs=10K", "dd bs={#size}"));
   st_policy_free(sizes);
+
+  st_policy_t *compound = st_policy_new(ctx);
+  ASSERT(compound != NULL);
+  ASSERT_OK(test_st_policy_add(compound, "tool --output={#path}"));
+  ASSERT(policy_eval_is(compound, "tool --output=/tmp/result",
+                        "tool --output={#path}"));
+  ASSERT(policy_eval_is(compound, "tool '--output=/tmp/a b'",
+                        "tool --output={#path}"));
+  ASSERT(policy_eval_is(compound, "tool --output= /tmp/result", NULL));
+  ASSERT(policy_eval_is(compound, "tool --output /tmp/result", NULL));
+  ASSERT(policy_eval_is(compound, "tool '--output=#path'", NULL));
+  st_policy_free(compound);
 
   st_policy_t *coexisting = st_policy_new(ctx);
   ASSERT(coexisting != NULL);

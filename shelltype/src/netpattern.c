@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include "metadata.h"
+#include "shell_netstring.h"
 #include "shelltype.h"
 
 #include <ctype.h>
@@ -185,15 +186,6 @@ memory:
   return ST_ERR_MEMORY;
 }
 
-static size_t digits(size_t value) {
-  size_t result = 1;
-  while (value >= 10) {
-    value /= 10;
-    result++;
-  }
-  return result;
-}
-
 static st_token_type_t wildcard_type(const char *text) {
   if (strcmp(text, "*") == 0)
     return ST_TYPE_ANY;
@@ -234,6 +226,45 @@ static const char *canonical_wildcard(const char *text,
   return written > 0 && written < ST_MAX_TOKEN_LEN ? buffer : NULL;
 }
 
+static st_error_t encode_tagged_record(char tag, const char *value,
+                                       size_t value_length, char **out,
+                                       size_t *out_length) {
+  size_t tag_length = 0, value_record_length = 0;
+  if (shell_netstring_encoded_length(1, &tag_length) != SHELL_NETSTRING_OK ||
+      shell_netstring_encoded_length(value_length, &value_record_length) !=
+          SHELL_NETSTRING_OK ||
+      tag_length > SIZE_MAX - value_record_length)
+    return ST_ERR_LIMIT;
+  size_t payload_length = tag_length + value_record_length;
+  size_t total = 0;
+  if (shell_netstring_encoded_length(payload_length, &total) !=
+      SHELL_NETSTRING_OK)
+    return ST_ERR_LIMIT;
+  char *record = malloc(total + 1);
+  if (!record)
+    return ST_ERR_MEMORY;
+  size_t used = 0, written = 0;
+  if (shell_netstring_write_prefix(record, total, payload_length, &used) !=
+          SHELL_NETSTRING_OK ||
+      shell_netstring_write(record + used, total - used, &tag, 1, &written) !=
+          SHELL_NETSTRING_OK) {
+    free(record);
+    return ST_ERR_LIMIT;
+  }
+  used += written;
+  if (shell_netstring_write(record + used, total - used, value, value_length,
+                            &written) != SHELL_NETSTRING_OK) {
+    free(record);
+    return ST_ERR_LIMIT;
+  }
+  used += written;
+  record[used++] = ',';
+  record[used] = '\0';
+  *out = record;
+  *out_length = used;
+  return ST_OK;
+}
+
 st_error_t st_netpattern_encode(const st_token_t *tokens, size_t count,
                                 char **out_netpattern) {
   if (out_netpattern)
@@ -241,45 +272,114 @@ st_error_t st_netpattern_encode(const st_token_t *tokens, size_t count,
   if (!tokens || count == 0 || count > ST_MAX_CMD_TOKENS || !out_netpattern)
     return ST_ERR_INVALID;
 
-  const char *values[ST_MAX_CMD_TOKENS];
-  char canonical[ST_MAX_CMD_TOKENS][ST_MAX_TOKEN_LEN];
-  char tags[ST_MAX_CMD_TOKENS];
+  char *records[ST_MAX_CMD_TOKENS] = {0};
+  size_t record_lengths[ST_MAX_CMD_TOKENS] = {0};
   size_t total = 0;
   for (size_t i = 0; i < count; i++) {
-    if (!tokens[i].text)
-      return ST_ERR_INVALID;
-    size_t length = strlen(tokens[i].text);
-    if (length >= ST_MAX_TOKEN_LEN)
+    st_error_t error = ST_OK;
+    if (tokens[i].compound) {
+      if (!tokens[i].prefix || !tokens[i].capture || !tokens[i].suffix ||
+          tokens[i].capture_type <= ST_TYPE_LITERAL ||
+          tokens[i].capture_type >= ST_TYPE_COUNT ||
+          (tokens[i].prefix[0] == '\0' && tokens[i].suffix[0] == '\0')) {
+        error = ST_ERR_INVALID;
+      } else {
+        char canonical[ST_MAX_TOKEN_LEN];
+        st_token_type_t type = ST_TYPE_LITERAL;
+        const char *wild =
+            canonical_wildcard(tokens[i].capture, &type, canonical);
+        if (!wild || type != tokens[i].capture_type)
+          error = ST_ERR_FORMAT;
+        char *parts[3] = {0};
+        size_t part_lengths[3] = {0};
+        size_t part_count = 0, nested_length = 0;
+        if (error == ST_OK && tokens[i].prefix[0]) {
+          error = encode_tagged_record(
+              'L', tokens[i].prefix, strlen(tokens[i].prefix),
+              &parts[part_count], &part_lengths[part_count]);
+          if (error == ST_OK)
+            part_count++;
+        }
+        if (error == ST_OK) {
+          error =
+              encode_tagged_record('T', wild, strlen(wild), &parts[part_count],
+                                   &part_lengths[part_count]);
+          if (error == ST_OK)
+            part_count++;
+        }
+        if (error == ST_OK && tokens[i].suffix[0]) {
+          error = encode_tagged_record(
+              'L', tokens[i].suffix, strlen(tokens[i].suffix),
+              &parts[part_count], &part_lengths[part_count]);
+          if (error == ST_OK)
+            part_count++;
+        }
+        for (size_t p = 0; p < part_count; p++)
+          nested_length += part_lengths[p];
+        char *nested = error == ST_OK ? malloc(nested_length + 1) : NULL;
+        if (error == ST_OK && !nested)
+          error = ST_ERR_MEMORY;
+        size_t used = 0;
+        if (nested) {
+          for (size_t p = 0; p < part_count; p++) {
+            memcpy(nested + used, parts[p], part_lengths[p]);
+            used += part_lengths[p];
+          }
+          nested[used] = '\0';
+          error = encode_tagged_record('C', nested, nested_length, &records[i],
+                                       &record_lengths[i]);
+        }
+        free(nested);
+        for (size_t p = 0; p < part_count; p++)
+          free(parts[p]);
+      }
+    } else {
+      if (!tokens[i].text)
+        error = ST_ERR_INVALID;
+      else if (strlen(tokens[i].text) >= ST_MAX_TOKEN_LEN)
+        error = ST_ERR_LIMIT;
+      else {
+        char canonical[ST_MAX_TOKEN_LEN];
+        st_token_type_t type = ST_TYPE_LITERAL;
+        const char *wild = canonical_wildcard(tokens[i].text, &type, canonical);
+        bool typed = tokens[i].type != ST_TYPE_LITERAL && wild != NULL;
+        if (typed && type != tokens[i].type)
+          error = ST_ERR_FORMAT;
+        else
+          error = encode_tagged_record(typed ? 'T' : 'L',
+                                       typed ? wild : tokens[i].text,
+                                       strlen(typed ? wild : tokens[i].text),
+                                       &records[i], &record_lengths[i]);
+      }
+    }
+    if (error != ST_OK) {
+      for (size_t j = 0; j <= i; j++)
+        free(records[j]);
+      return error;
+    }
+    if (total > SIZE_MAX - record_lengths[i]) {
+      for (size_t j = 0; j <= i; j++)
+        free(records[j]);
       return ST_ERR_LIMIT;
-    st_token_type_t type = ST_TYPE_LITERAL;
-    const char *wild = canonical_wildcard(tokens[i].text, &type, canonical[i]);
-    bool typed = tokens[i].type != ST_TYPE_LITERAL && wild != NULL;
-    if (typed && type != tokens[i].type)
-      return ST_ERR_FORMAT;
-    tags[i] = typed ? 'T' : 'L';
-    values[i] = typed ? wild : tokens[i].text;
-    length = strlen(values[i]);
-    size_t record = 4 + digits(length) + 2 + length;
-    if (record > SIZE_MAX - digits(record) - 2 ||
-        total > SIZE_MAX - record - digits(record) - 2)
-      return ST_ERR_LIMIT;
-    total += digits(record) + 2 + record;
+    }
+    total += record_lengths[i];
   }
-  if (total >= ST_MAX_NETPATTERN_LEN)
+  if (total >= ST_MAX_NETPATTERN_LEN) {
+    for (size_t i = 0; i < count; i++)
+      free(records[i]);
     return ST_ERR_LIMIT;
+  }
   char *encoded = malloc(total + 1);
-  if (!encoded)
+  if (!encoded) {
+    for (size_t i = 0; i < count; i++)
+      free(records[i]);
     return ST_ERR_MEMORY;
+  }
   size_t used = 0;
   for (size_t i = 0; i < count; i++) {
-    size_t length = strlen(values[i]);
-    size_t record = 4 + digits(length) + 2 + length;
-    used += (size_t)sprintf(encoded + used, "%zu:1:%c,%zu:", record, tags[i],
-                            length);
-    memcpy(encoded + used, values[i], length);
-    used += length;
-    encoded[used++] = ',';
-    encoded[used++] = ',';
+    memcpy(encoded + used, records[i], record_lengths[i]);
+    used += record_lengths[i];
+    free(records[i]);
   }
   encoded[used] = '\0';
   *out_netpattern = encoded;
@@ -297,18 +397,61 @@ st_error_t st_netpattern_from_cpl(const char *cpl, char **out_netpattern) {
   if (error != ST_OK)
     return error;
   st_token_t tokens[ST_MAX_CMD_TOKENS];
+  memset(tokens, 0, sizeof(tokens));
   for (size_t i = 0; i < count; i++) {
+    if (!words[i].literal) {
+      char *open = strchr(words[i].text, '{');
+      char *close = open ? strchr(open + 1, '}') : NULL;
+      if (open || close) {
+        if (!open || !close || strchr(open + 1, '{') ||
+            strchr(close + 1, '}') || close[1] == '{') {
+          error = ST_ERR_INVALID;
+          goto cpl_done;
+        }
+        size_t capture_length = (size_t)(close - open - 1);
+        char *capture = strndup(open + 1, capture_length);
+        if (!capture) {
+          error = ST_ERR_MEMORY;
+          goto cpl_done;
+        }
+        st_token_type_t capture_type = wildcard_type(capture);
+        if (capture_type == ST_TYPE_LITERAL ||
+            (open == words[i].text && close[1] == '\0')) {
+          free(capture);
+          error = ST_ERR_INVALID;
+          goto cpl_done;
+        }
+        tokens[i].text = words[i].text;
+        tokens[i].type = ST_TYPE_LITERAL;
+        tokens[i].compound = true;
+        tokens[i].prefix =
+            strndup(words[i].text, (size_t)(open - words[i].text));
+        tokens[i].capture = capture;
+        tokens[i].suffix = strdup(close + 1);
+        tokens[i].capture_type = capture_type;
+        if (!tokens[i].prefix || !tokens[i].suffix) {
+          error = ST_ERR_MEMORY;
+          goto cpl_done;
+        }
+        continue;
+      }
+    }
     bool typed = !words[i].literal && wildcard_spelling(words[i].text);
     if (!words[i].literal && words[i].text[0] == '#' && !typed) {
       error = ST_ERR_INVALID;
-      free_words(words, count);
-      return error;
+      goto cpl_done;
     }
     tokens[i] = (st_token_t){.text = words[i].text,
                              .type = typed ? wildcard_type(words[i].text)
                                            : ST_TYPE_LITERAL};
   }
   error = st_netpattern_encode(tokens, count, out_netpattern);
+cpl_done:
+  for (size_t i = 0; i < count; i++) {
+    free(tokens[i].prefix);
+    free(tokens[i].capture);
+    free(tokens[i].suffix);
+  }
   free_words(words, count);
   return error;
 }
@@ -316,26 +459,23 @@ st_error_t st_netpattern_from_cpl(const char *cpl, char **out_netpattern) {
 static st_error_t read_netstring(const char *encoded, size_t encoded_length,
                                  size_t *offset, const char **payload,
                                  size_t *payload_length) {
-  if (*offset >= encoded_length || !isdigit((unsigned char)encoded[*offset]))
+  if (!encoded || !offset || !payload || !payload_length ||
+      *offset > encoded_length)
     return ST_ERR_FORMAT;
-  size_t length = 0;
-  if (encoded[*offset] == '0' && *offset + 1 < encoded_length &&
-      isdigit((unsigned char)encoded[*offset + 1]))
+  shell_netstring_iter_t iter;
+  shell_netstring_status_t status = shell_netstring_iter_init(
+      &iter, encoded + *offset, encoded_length - *offset);
+  if (status != SHELL_NETSTRING_OK)
     return ST_ERR_FORMAT;
-  do {
-    unsigned digit = (unsigned)(encoded[*offset] - '0');
-    if (length > (SIZE_MAX - digit) / 10)
-      return ST_ERR_LIMIT;
-    length = length * 10 + digit;
-    (*offset)++;
-  } while (*offset < encoded_length &&
-           isdigit((unsigned char)encoded[*offset]));
-  if (*offset >= encoded_length || encoded[(*offset)++] != ':' ||
-      length >= encoded_length - *offset || encoded[*offset + length] != ',')
+  shell_netstring_view_t view;
+  status = shell_netstring_iter_next(&iter, &view);
+  if (status == SHELL_NETSTRING_EOVERFLOW)
+    return ST_ERR_LIMIT;
+  if (status != SHELL_NETSTRING_OK)
     return ST_ERR_FORMAT;
-  *payload = encoded + *offset;
-  *payload_length = length;
-  *offset += length + 1;
+  *payload = (const char *)view.payload;
+  *payload_length = view.payload_length;
+  *offset += view.record_length;
   return ST_OK;
 }
 
@@ -346,7 +486,8 @@ static bool literal_needs_quotes(const char *text, size_t length) {
     return true;
   for (size_t i = 0; i < length; i++) {
     unsigned char c = (unsigned char)text[i];
-    if (isspace(c) || c < 0x20 || c == 0x7f || c == '"' || c == '\\')
+    if (isspace(c) || c < 0x20 || c == 0x7f || c == '"' || c == '\\' ||
+        c == '{' || c == '}')
       return true;
   }
   return false;
@@ -431,30 +572,120 @@ st_error_t st_netpattern_decode(const char *netpattern,
         read_netstring(record, record_length, &inner, &value, &value_length) !=
             ST_OK ||
         inner != record_length || tag_length != 1 ||
-        (tag[0] != 'L' && tag[0] != 'T') || value_length >= ST_MAX_TOKEN_LEN)
+        (tag[0] != 'L' && tag[0] != 'T' && tag[0] != 'C') ||
+        value_length >= ST_MAX_NETPATTERN_LEN)
       goto format;
-    char *text = strndup(value, value_length);
-    if (!text)
-      goto memory;
-    st_token_type_t type = ST_TYPE_LITERAL;
-    if (tag[0] == 'T') {
-      if (!wildcard_spelling(text)) {
-        free(text);
+    st_token_t token = {0};
+    if (tag[0] == 'C') {
+      const char *part_values[3] = {0};
+      size_t part_lengths[3] = {0};
+      char part_tags[3] = {0};
+      size_t nested = 0, part_count = 0, typed_index = SIZE_MAX;
+      while (nested < value_length && part_count < 3) {
+        const char *part_record, *part_tag, *part_value;
+        size_t part_record_length, part_tag_length, part_value_length;
+        size_t part_inner = 0;
+        if (read_netstring(value, value_length, &nested, &part_record,
+                           &part_record_length) != ST_OK ||
+            read_netstring(part_record, part_record_length, &part_inner,
+                           &part_tag, &part_tag_length) != ST_OK ||
+            read_netstring(part_record, part_record_length, &part_inner,
+                           &part_value, &part_value_length) != ST_OK ||
+            part_inner != part_record_length || part_tag_length != 1 ||
+            (part_tag[0] != 'L' && part_tag[0] != 'T') ||
+            part_value_length >= ST_MAX_TOKEN_LEN)
+          goto format;
+        part_tags[part_count] = part_tag[0];
+        part_values[part_count] = part_value;
+        part_lengths[part_count] = part_value_length;
+        if (part_tag[0] == 'T') {
+          if (typed_index != SIZE_MAX)
+            goto format;
+          typed_index = part_count;
+        }
+        part_count++;
+      }
+      bool canonical_parts =
+          (part_count == 2 && ((part_tags[0] == 'L' && part_tags[1] == 'T') ||
+                               (part_tags[0] == 'T' && part_tags[1] == 'L'))) ||
+          (part_count == 3 && part_tags[0] == 'L' && part_tags[1] == 'T' &&
+           part_tags[2] == 'L');
+      if (nested != value_length || !canonical_parts || typed_index == SIZE_MAX)
+        goto format;
+      const char *typed = part_values[typed_index];
+      size_t typed_length = part_lengths[typed_index];
+      char *typed_text = strndup(typed, typed_length);
+      if (!typed_text)
+        goto memory;
+      st_token_type_t capture_type = wildcard_type(typed_text);
+      if (capture_type == ST_TYPE_LITERAL) {
+        free(typed_text);
         goto format;
       }
-      type = wildcard_type(text);
-      if (type == ST_TYPE_LITERAL) {
-        free(text);
+      const char *prefix = typed_index ? part_values[0] : "";
+      size_t prefix_length = typed_index ? part_lengths[0] : 0;
+      const char *suffix =
+          typed_index + 1 < part_count ? part_values[typed_index + 1] : "";
+      size_t suffix_length =
+          typed_index + 1 < part_count ? part_lengths[typed_index + 1] : 0;
+      if (prefix_length == 0 && suffix_length == 0) {
+        free(typed_text);
         goto format;
+      }
+      token.prefix = strndup(prefix, prefix_length);
+      token.capture = typed_text;
+      token.suffix = strndup(suffix, suffix_length);
+      size_t display_length = prefix_length + typed_length + suffix_length + 2;
+      token.text = malloc(display_length + 1);
+      if (!token.prefix || !token.suffix || !token.text) {
+        free(token.prefix);
+        free(token.capture);
+        free(token.suffix);
+        free(token.text);
+        goto memory;
+      }
+      size_t display_used = 0;
+      memcpy(token.text + display_used, prefix, prefix_length);
+      display_used += prefix_length;
+      token.text[display_used++] = '{';
+      memcpy(token.text + display_used, typed, typed_length);
+      display_used += typed_length;
+      token.text[display_used++] = '}';
+      memcpy(token.text + display_used, suffix, suffix_length);
+      display_used += suffix_length;
+      token.text[display_used] = '\0';
+      token.type = ST_TYPE_LITERAL;
+      token.compound = true;
+      token.capture_type = capture_type;
+    } else {
+      if (value_length >= ST_MAX_TOKEN_LEN)
+        goto format;
+      token.text = strndup(value, value_length);
+      if (!token.text)
+        goto memory;
+      token.type = ST_TYPE_LITERAL;
+      if (tag[0] == 'T') {
+        if (!wildcard_spelling(token.text)) {
+          free(token.text);
+          goto format;
+        }
+        token.type = wildcard_type(token.text);
+        if (token.type == ST_TYPE_LITERAL) {
+          free(token.text);
+          goto format;
+        }
       }
     }
     st_token_t *grown = realloc(tokens, (count + 1) * sizeof(*tokens));
     if (!grown) {
-      free(text);
+      free(token.text);
+      free(token.prefix);
+      free(token.capture);
+      free(token.suffix);
       goto memory;
     }
     tokens = grown;
-    tokens[count++] = (st_token_t){.text = text, .type = type};
+    tokens[count++] = token;
   }
   if (count == 0)
     goto format;
@@ -475,18 +706,30 @@ st_error_t st_netpattern_decode(const char *netpattern,
   out_tokens->count = count;
   return ST_OK;
 format:
-  for (size_t i = 0; i < count; i++)
+  for (size_t i = 0; i < count; i++) {
     free(tokens[i].text);
+    free(tokens[i].prefix);
+    free(tokens[i].capture);
+    free(tokens[i].suffix);
+  }
   free(tokens);
   return ST_ERR_FORMAT;
 limit:
-  for (size_t i = 0; i < count; i++)
+  for (size_t i = 0; i < count; i++) {
     free(tokens[i].text);
+    free(tokens[i].prefix);
+    free(tokens[i].capture);
+    free(tokens[i].suffix);
+  }
   free(tokens);
   return ST_ERR_LIMIT;
 memory:
-  for (size_t i = 0; i < count; i++)
+  for (size_t i = 0; i < count; i++) {
     free(tokens[i].text);
+    free(tokens[i].prefix);
+    free(tokens[i].capture);
+    free(tokens[i].suffix);
+  }
   free(tokens);
   return ST_ERR_MEMORY;
 }
@@ -502,6 +745,25 @@ st_error_t st_netpattern_to_cpl(const char *netpattern, char **out_cpl) {
     return decode_error;
   size_t required = decoded.count ? decoded.count - 1 : 0;
   for (size_t i = 0; i < decoded.count; i++) {
+    if (decoded.tokens[i].compound) {
+      size_t prefix_length = strlen(decoded.tokens[i].prefix);
+      size_t capture_length = strlen(decoded.tokens[i].capture);
+      size_t suffix_length = strlen(decoded.tokens[i].suffix);
+      if (literal_needs_quotes(decoded.tokens[i].prefix, prefix_length) ||
+          (suffix_length &&
+           literal_needs_quotes(decoded.tokens[i].suffix, suffix_length))) {
+        st_free_token_array(&decoded);
+        return ST_ERR_INVALID;
+      }
+      size_t addition = prefix_length + capture_length + suffix_length + 2;
+      if (addition > SIZE_MAX - required ||
+          required + addition >= ST_MAX_CPL_LEN) {
+        st_free_token_array(&decoded);
+        return ST_ERR_LIMIT;
+      }
+      required += addition;
+      continue;
+    }
     size_t value_length = strlen(decoded.tokens[i].text);
     size_t addition =
         decoded.tokens[i].type == ST_TYPE_LITERAL
@@ -527,6 +789,20 @@ st_error_t st_netpattern_to_cpl(const char *netpattern, char **out_cpl) {
     size_t value_length = strlen(value);
     if (used)
       cpl[used++] = ' ';
+    if (decoded.tokens[i].compound) {
+      size_t prefix_length = strlen(decoded.tokens[i].prefix);
+      size_t capture_length = strlen(decoded.tokens[i].capture);
+      size_t suffix_length = strlen(decoded.tokens[i].suffix);
+      memcpy(cpl + used, decoded.tokens[i].prefix, prefix_length);
+      used += prefix_length;
+      cpl[used++] = '{';
+      memcpy(cpl + used, decoded.tokens[i].capture, capture_length);
+      used += capture_length;
+      cpl[used++] = '}';
+      memcpy(cpl + used, decoded.tokens[i].suffix, suffix_length);
+      used += suffix_length;
+      continue;
+    }
     if (decoded.tokens[i].type != ST_TYPE_LITERAL) {
       memcpy(cpl + used, value, value_length);
       used += value_length;

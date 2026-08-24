@@ -227,6 +227,17 @@ st_error_t st_netpattern_apply_type_at(const char *netpattern, size_t edit_pos,
     st_free_token_array(&decoded);
     return ST_ERR_INVALID;
   }
+  if (decoded.tokens[edit_pos].compound) {
+    char *old_capture = decoded.tokens[edit_pos].capture;
+    st_token_type_t old_capture_type = decoded.tokens[edit_pos].capture_type;
+    decoded.tokens[edit_pos].capture = (char *)st_type_symbol[new_type];
+    decoded.tokens[edit_pos].capture_type = new_type;
+    error = st_netpattern_encode(decoded.tokens, decoded.count, out_netpattern);
+    decoded.tokens[edit_pos].capture = old_capture;
+    decoded.tokens[edit_pos].capture_type = old_capture_type;
+    st_free_token_array(&decoded);
+    return error;
+  }
   char *old_text = decoded.tokens[edit_pos].text;
   decoded.tokens[edit_pos].text = (char *)st_type_symbol[new_type];
   decoded.tokens[edit_pos].type = new_type;

@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 #include "shell_abstract.h"
 #include "test_allocator.h"
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -167,27 +168,30 @@ static void test_abstraction_allocation_failures(void) {
     shell_abstracted_destroy(result);
   }
 
+  char *netseq = NULL;
+  size_t count = 0;
   shellsplit_test_alloc_reset();
-  char *sequence = shell_build_type_sequence(input);
+  shell_process_status_t status =
+      shell_build_type_netseq(input, NULL, &netseq, &count);
   allocations = shellsplit_test_alloc_count();
-  TEST("type-sequence allocation probe succeeds",
-       sequence != NULL && allocations > 0);
-  free(sequence);
-  bool sequence_failures_are_safe = true;
-  bool observed_failure = false;
+  TEST("type-netsequence allocation probe succeeds",
+       status == SHELL_PROCESS_OK && netseq && count == 1);
+  free(netseq);
+
+  bool atomic = true;
   for (size_t fail_at = 1; fail_at <= allocations; fail_at++) {
+    netseq = (char *)(void *)1;
+    count = SIZE_MAX;
     shellsplit_test_alloc_fail_at(fail_at);
-    sequence = shell_build_type_sequence(input);
-    size_t attempted = shellsplit_test_alloc_count();
+    status = shell_build_type_netseq(input, NULL, &netseq, &count);
     shellsplit_test_alloc_reset();
-    observed_failure |= sequence == NULL;
-    if (attempted < fail_at ||
-        (sequence && strcmp(sequence, "echo EV AP GB CS AR") != 0))
-      sequence_failures_are_safe = false;
-    free(sequence);
+    if (status != SHELL_PROCESS_ENOMEM || netseq != NULL || count != 0) {
+      atomic = false;
+      free(netseq);
+      break;
+    }
   }
-  TEST("type-sequence allocation failures are atomic or recoverable",
-       sequence_failures_are_safe && observed_failure);
+  TEST("type-netsequence allocation failures are atomic", atomic);
 }
 
 static void test_element_metadata(void) {
@@ -438,47 +442,69 @@ static void test_invalid_and_null_inputs(void) {
 
 static void test_type_sequence_matrix(void) {
   printf("\n=== Type Sequence Matrix ===\n");
+  char *netseq = NULL;
+  size_t command_count = 0;
+  bool valid =
+      shell_build_type_netseq("printf 'two words'; cd /tmp", NULL, &netseq,
+                              &command_count) == SHELL_PROCESS_OK &&
+      command_count == 2 && netseq &&
+      strcmp(netseq, "15:6:printf,3:STR,,10:2:cd,2:AP,,") == 0;
+  TEST("nested type sequence uses one record per command", valid);
+  free(netseq);
 
-  static const struct {
-    const char *command;
-    const char *expected;
-  } cases[] = {
-      {"cat /etc/passwd", "cat AP"},
-      {"grep -i root /etc/shadow", "grep OPT STR AP"},
-      {"cat /etc/passwd | grep root", "cat AP | grep STR"},
-      {"ls ; cd /tmp && pwd || echo done", "ls | cd AP | pwd | echo STR"},
-      {"echo $HOME", "echo EV"},
-      {"$COMMAND argument", "EV STR"},
-      {"echo $1 $? *.c $((1+2))", "echo PV SV GB AR"},
-      {"cat ./file.txt ~/file.txt", "cat RP HP"},
-      {"echo hi > out", "echo STR"},
-      {"> out echo hi", "echo STR"},
-      {"cat <<EOF\npayload\nEOF", "cat"},
-      {"diff <(left) >(right)", "diff CS CS"},
-  };
+  netseq = NULL;
+  command_count = 0;
+  valid = shell_build_type_netseq("'my tool' 'two words'", NULL, &netseq,
+                                  &command_count) == SHELL_PROCESS_OK &&
+          command_count == 1 && netseq &&
+          strcmp(netseq, "16:7:my tool,3:STR,,") == 0;
+  TEST("nested type sequence preserves spaced executable names", valid);
+  free(netseq);
 
-  bool valid = shell_build_type_sequence(NULL) == NULL &&
-               shell_build_type_sequence("") == NULL;
-  for (size_t i = 0; valid && i < sizeof(cases) / sizeof(cases[0]); i++) {
-    char *sequence = shell_build_type_sequence(cases[i].command);
-    valid = sequence && strcmp(sequence, cases[i].expected) == 0;
-    if (!valid && sequence)
-      printf("    command '%s': got '%s', expected '%s'\n", cases[i].command,
-             sequence, cases[i].expected);
-    free(sequence);
-  }
-  TEST("canonical sequences preserve clean command semantics", valid);
+  netseq = NULL;
+  command_count = 0;
+  valid = shell_build_type_netseq("foo\"bar\" 'two words'", NULL, &netseq,
+                                  &command_count) == SHELL_PROCESS_OK &&
+          command_count == 1 && netseq &&
+          strcmp(netseq, "15:6:foobar,3:STR,,") == 0;
+  TEST("nested type sequence shares quote-fragment decoding", valid);
+  free(netseq);
 
-  char long_command[700] = "echo";
-  char long_expected[1400] = "echo";
-  for (size_t i = 0; i < 300; i++) {
-    strcat(long_command, " x");
-    strcat(long_expected, " STR");
-  }
-  char *sequence = shell_build_type_sequence(long_command);
-  valid = sequence && strcmp(sequence, long_expected) == 0;
-  TEST("type sequence grows for 300 arguments", valid);
-  free(sequence);
+  netseq = NULL;
+  command_count = 0;
+  valid = shell_build_type_netseq("my\\\ncommand value", NULL, &netseq,
+                                  &command_count) == SHELL_PROCESS_OK &&
+          command_count == 1 && netseq &&
+          strcmp(netseq, "18:9:mycommand,3:STR,,") == 0;
+  TEST("nested type sequence shares escaped-newline decoding", valid);
+  free(netseq);
+
+  netseq = (char *)(void *)1;
+  command_count = SIZE_MAX;
+  valid = shell_build_type_netseq("'' value", NULL, &netseq, &command_count) ==
+              SHELL_PROCESS_EPARSE &&
+          netseq == NULL && command_count == 0;
+  TEST("nested type sequence rejects an empty decoded executable", valid);
+
+  valid = shell_build_type_netseq(NULL, NULL, &netseq, &command_count) ==
+              SHELL_PROCESS_EINPUT &&
+          netseq == NULL && command_count == 0;
+  valid = valid &&
+          shell_build_type_netseq("echo x", NULL, NULL, &command_count) ==
+              SHELL_PROCESS_EINPUT &&
+          command_count == 0;
+  valid = valid &&
+          shell_build_type_netseq("echo x", NULL, &netseq, NULL) ==
+              SHELL_PROCESS_EINPUT &&
+          netseq == NULL;
+  TEST("nested type sequence validates every argument atomically", valid);
+
+  shell_process_limits_t limits = {SIZE_MAX, SIZE_MAX};
+  limits.max_string_bytes = 1;
+  valid = shell_build_type_netseq("echo x", &limits, &netseq, &command_count) ==
+              SHELL_PROCESS_EOUTPUT_LIMIT &&
+          netseq == NULL && command_count == 0;
+  TEST("nested type sequence enforces its outer output limit", valid);
 }
 
 int main(void) {

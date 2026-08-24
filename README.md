@@ -59,9 +59,9 @@ Learn command shapes:
 
 st_learner_t *learner = st_learner_new(2, 0.5);
 if (learner != NULL) {
-    (void)st_feed(learner, "git status --short");
-    (void)st_feed(learner, "git status --short");
-    (void)st_feed(learner, "git log --oneline");
+    (void)st_feed(learner, "3:git,6:status,7:--short,");
+    (void)st_feed(learner, "3:git,6:status,7:--short,");
+    (void)st_feed(learner, "3:git,3:log,9:--oneline,");
 
     size_t count = 0;
     st_suggestion_t *suggestions = st_suggest(learner, &count);
@@ -101,6 +101,27 @@ if (gate != NULL) {
 
 Ownership, destruction, and concurrency contracts are documented in the public
 headers.
+
+## Canonical machine boundaries
+
+Shellclave uses canonical netstrings whenever values cross a machine-facing
+API boundary. A `netargv` is a concatenation of netstrings, one per argument;
+a `netsequence` is an outer concatenation whose records each represent one
+isolated subcommand. This preserves empty arguments, whitespace, punctuation,
+and nested per-command type signatures without quoting heuristics.
+
+Shellsplit remains the shell-language boundary: use
+`shell_extract_netargv_sequence()`, `shell_build_command_netseq()`, or
+`shell_build_type_netseq()` to turn shell source into canonical records.
+Shellgate expansion callbacks consume and return canonical `netargv` values,
+and its anomaly APIs accept canonical `netsequence` values. Human-facing CPL
+conversion remains explicit at the Shellgate and CLI boundaries. See
+[docs/canonical-formats.md](docs/canonical-formats.md) for the wire contracts.
+
+For each `sg_subcmd_result_t`, `netargv` and `netargv_length` are the
+authoritative programmatic result. `command` is a space-joined diagnostic
+display and is deliberately not reparsable; applications must decode the
+netargv records with `shell_netstring_iter_t` when they need argument values.
 
 ## CMake consumption
 

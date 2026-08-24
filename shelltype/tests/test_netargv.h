@@ -1,68 +1,91 @@
 #ifndef SHELLTYPE_TEST_NETARGV_H
 #define SHELLTYPE_TEST_NETARGV_H
 
+#include "shell_netstring.h"
+#include "shell_processor.h"
 #include <ctype.h>
-#include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
-/* Compatibility helpers for older readable test fixtures. Their names make
- * conversion explicit at each call site; canonical-boundary tests call the
- * production APIs directly. */
+/* Readable argv-fixture notation for tests. It splits whitespace outside
+ * quotes but is deliberately not shell source: operator-looking and leading
+ * '#' values remain literal fixture words. Production boundaries receive
+ * canonical netargv directly. */
+static inline bool test_netargv_next_word(const char *fixture, size_t length,
+                                          size_t *offset, size_t *start,
+                                          size_t *word_length) {
+  size_t input = *offset;
+  while (input < length && isspace((unsigned char)fixture[input]))
+    input++;
+  if (input == length) {
+    *offset = input;
+    return false;
+  }
+  *start = input;
+  char quote = 0;
+  while (input < length) {
+    char c = fixture[input];
+    if (quote == 0 && isspace((unsigned char)c))
+      break;
+    if ((c == '\'' || c == '"') && (quote == 0 || quote == c)) {
+      quote = quote == 0 ? c : 0;
+      input++;
+      continue;
+    }
+    if (c == '\\' && quote != '\'' && input + 1 < length) {
+      input += 2;
+      continue;
+    }
+    input++;
+  }
+  *word_length = input - *start;
+  *offset = input;
+  return true;
+}
+
 static inline char *test_netargv(const char *command) {
   if (!command)
     return NULL;
   size_t input_length = strlen(command);
-  size_t capacity = input_length * 3 + 32;
-  char *encoded = malloc(capacity);
-  char *word = malloc(input_length + 1);
-  if (!encoded || !word) {
-    free(encoded);
-    free(word);
-    return NULL;
+  size_t input = 0, total = 0, start = 0, word_length = 0;
+  while (test_netargv_next_word(command, input_length, &input, &start,
+                                &word_length)) {
+    size_t decoded_length = 0, record_length = 0;
+    if (shell_measure_decoded_word(command + start, word_length,
+                                   &decoded_length) != SHELL_PROCESS_OK ||
+        shell_netstring_encoded_length(decoded_length, &record_length) !=
+            SHELL_NETSTRING_OK ||
+        total > SIZE_MAX - record_length)
+      return NULL;
+    total += record_length;
   }
-  size_t input = 0, output = 0;
-  while (input < input_length) {
-    while (input < input_length && isspace((unsigned char)command[input]))
-      input++;
-    if (input == input_length)
-      break;
-    size_t word_length = 0;
-    char quote = 0;
-    while (input < input_length) {
-      char c = command[input];
-      if (!quote && isspace((unsigned char)c))
-        break;
-      if ((c == '\'' || c == '"') && (!quote || quote == c)) {
-        quote = quote ? 0 : c;
-        input++;
-        continue;
-      }
-      if (c == '\\' && quote != '\'' && input + 1 < input_length) {
-        input++;
-        if (command[input] == '\n') {
-          input++;
-          continue;
-        }
-        c = command[input];
-      }
-      word[word_length++] = c;
-      input++;
-    }
-    int prefix =
-        snprintf(encoded + output, capacity - output, "%zu:", word_length);
-    if (prefix < 0 || output + (size_t)prefix + word_length + 2 > capacity) {
+  if (total == SIZE_MAX)
+    return NULL;
+  char *encoded = malloc(total + 1);
+  if (!encoded)
+    return NULL;
+  input = 0;
+  size_t output = 0;
+  while (test_netargv_next_word(command, input_length, &input, &start,
+                                &word_length)) {
+    size_t decoded_length = 0, prefix_length = 0, written = 0;
+    if (shell_measure_decoded_word(command + start, word_length,
+                                   &decoded_length) != SHELL_PROCESS_OK ||
+        shell_netstring_write_prefix(encoded + output, total - output,
+                                     decoded_length,
+                                     &prefix_length) != SHELL_NETSTRING_OK ||
+        shell_write_decoded_word(
+            command + start, word_length, encoded + output + prefix_length,
+            decoded_length, &written) != SHELL_PROCESS_OK ||
+        written != decoded_length) {
       free(encoded);
-      free(word);
       return NULL;
     }
-    output += (size_t)prefix;
-    memcpy(encoded + output, word, word_length);
-    output += word_length;
+    output += prefix_length + written;
     encoded[output++] = ',';
   }
   encoded[output] = '\0';
-  free(word);
   return encoded;
 }
 
@@ -73,46 +96,6 @@ static inline st_error_t test_st_classify(const char *command,
     return command ? ST_ERR_MEMORY : st_classify(NULL, out);
   st_error_t error = st_classify(encoded, out);
   free(encoded);
-  return error;
-}
-
-static inline st_error_t test_st_normalize(const char *command, char ***tokens,
-                                           size_t *count) {
-  if (tokens)
-    *tokens = NULL;
-  if (count)
-    *count = 0;
-  if (!command || !tokens || !count)
-    return ST_ERR_INVALID;
-  char *encoded = test_netargv(command);
-  if (!encoded)
-    return ST_ERR_MEMORY;
-  st_token_array_t typed = {0};
-  st_error_t error = st_classify(encoded, &typed);
-  free(encoded);
-  if (error != ST_OK)
-    return error;
-  char **legacy = typed.count ? calloc(typed.count, sizeof(*legacy)) : NULL;
-  if (typed.count && !legacy) {
-    st_free_token_array(&typed);
-    return ST_ERR_MEMORY;
-  }
-  for (size_t i = 0; i < typed.count; i++) {
-    const char *value = typed.tokens[i].type == ST_TYPE_LITERAL
-                            ? typed.tokens[i].text
-                            : st_type_symbol[typed.tokens[i].type];
-    legacy[i] = strdup(value);
-    if (!legacy[i]) {
-      for (size_t j = 0; j < i; j++)
-        free(legacy[j]);
-      free(legacy);
-      st_free_token_array(&typed);
-      return ST_ERR_MEMORY;
-    }
-  }
-  *tokens = legacy;
-  *count = typed.count;
-  st_free_token_array(&typed);
   return error;
 }
 

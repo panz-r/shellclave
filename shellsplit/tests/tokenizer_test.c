@@ -377,16 +377,10 @@ typedef struct {
   const char *input;
   size_t command_count;
   const char *original_commands[4];
-  const char *clean_commands[4];
+  const char *legacy_renderings[4];
   unsigned flags[4];
   unsigned feature_stages;
 } processor_case_t;
-
-static void free_dfa_inputs(const char **inputs, size_t count) {
-  for (size_t i = 0; i < count; i++)
-    free((void *)inputs[i]);
-  free(inputs);
-}
 
 static void run_processor_cases(const processor_case_t *cases, size_t count) {
   for (size_t i = 0; i < count; i++) {
@@ -394,20 +388,11 @@ static void run_processor_cases(const processor_case_t *cases, size_t count) {
     size_t command_count = 0;
     shell_process_status_t process_status =
         shell_process_command(cases[i].input, NULL, &infos, &command_count);
-    const char **dfa_inputs = NULL;
-    size_t dfa_count = 0;
     bool has_shell_features = false;
-    shell_process_status_t extract_status = shell_extract_dfa_inputs(
-        cases[i].input, NULL, &dfa_inputs, &dfa_count, &has_shell_features);
     bool processed = process_status == SHELL_PROCESS_OK;
-    bool extracted = extract_status == SHELL_PROCESS_OK;
-    bool valid = processed && extracted &&
-                 command_count == cases[i].command_count &&
-                 dfa_count == cases[i].command_count &&
-                 (command_count == 0 || (infos && dfa_inputs)) &&
-                 has_shell_features == (cases[i].feature_stages != 0);
-    for (size_t j = 0; infos && dfa_inputs && j < cases[i].command_count &&
-                       j < command_count && j < dfa_count;
+    bool valid = processed && command_count == cases[i].command_count &&
+                 (command_count == 0 || infos);
+    for (size_t j = 0; infos && j < cases[i].command_count && j < command_count;
          j++) {
       unsigned flags =
           (infos[j].has_pipe_input ? PROCESS_PIPE_INPUT : 0) |
@@ -415,31 +400,30 @@ static void run_processor_cases(const processor_case_t *cases, size_t count) {
           (infos[j].has_redirections ? PROCESS_REDIRECTION : 0) |
           (infos[j].has_error_redirection ? PROCESS_ERROR_REDIRECTION : 0);
       bool expected_feature = (cases[i].feature_stages & (1u << j)) != 0;
+      char *netargv = NULL;
+      bool rendered =
+          shell_render_netargv(&infos[j], NULL, &netargv) == SHELL_PROCESS_OK;
       bool stage_valid =
-          infos[j].original_command && infos[j].clean_command &&
-          dfa_inputs[j] &&
-          shell_get_clean_command(&infos[j]) == infos[j].clean_command &&
+          infos[j].original_command && rendered && netargv &&
           strcmp(infos[j].original_command, cases[i].original_commands[j]) ==
               0 &&
-          strcmp(infos[j].clean_command, cases[i].clean_commands[j]) == 0 &&
-          strcmp(dfa_inputs[j], cases[i].clean_commands[j]) == 0 &&
           flags == cases[i].flags[j] &&
           shell_has_dangerous_features(&infos[j]) == expected_feature;
       if (!stage_valid)
-        printf("    stage %zu: original='%s' clean='%s' flags=%#x "
+        printf("    stage %zu: original='%s' netargv='%s' flags=%#x "
                "feature=%d\n",
                j, infos[j].original_command ? infos[j].original_command : "",
-               infos[j].clean_command ? infos[j].clean_command : "", flags,
+               netargv ? netargv : "", flags,
                shell_has_dangerous_features(&infos[j]));
+      free(netargv);
       valid = stage_valid && valid;
+      has_shell_features |= expected_feature;
     }
     if (!valid)
-      printf("    processor: count=%zu dfa=%zu expected=%zu features=%d\n",
-             command_count, dfa_count, cases[i].command_count,
-             has_shell_features);
+      printf("    processor: count=%zu expected=%zu features=%d\n",
+             command_count, cases[i].command_count, has_shell_features);
     test(cases[i].name, valid);
     shell_free_command_infos(infos, command_count);
-    free_dfa_inputs(dfa_inputs, dfa_count);
   }
 }
 
@@ -547,34 +531,55 @@ static void test_processor_allocation_failures(void) {
   }
   test("Processor allocation failures report ENOMEM and clear outputs", atomic);
 
-  const char **inputs = NULL;
   bool has_features = false;
+  char *sequence = NULL;
   shellsplit_test_alloc_reset();
-  status =
-      shell_extract_dfa_inputs(input, NULL, &inputs, &count, &has_features);
+  status = shell_extract_netargv_sequence(input, NULL, &sequence, &count,
+                                          &has_features);
   allocations = shellsplit_test_alloc_count();
-  test("DFA extraction allocation probe succeeds",
-       status == SHELL_PROCESS_OK && count == 2 && has_features &&
-           allocations > 5);
-  free_dfa_inputs(inputs, count);
+  test("Netargv-sequence allocation probe succeeds",
+       status == SHELL_PROCESS_OK && sequence && count == 2 && has_features);
+  free(sequence);
 
   atomic = true;
   for (size_t fail_at = 1; fail_at <= allocations; fail_at++) {
-    inputs = (const char **)(void *)1;
+    sequence = (char *)(void *)1;
     count = SIZE_MAX;
     has_features = true;
     shellsplit_test_alloc_fail_at(fail_at);
-    status =
-        shell_extract_dfa_inputs(input, NULL, &inputs, &count, &has_features);
+    status = shell_extract_netargv_sequence(input, NULL, &sequence, &count,
+                                            &has_features);
     shellsplit_test_alloc_reset();
-    if (status != SHELL_PROCESS_ENOMEM || inputs != NULL || count != 0 ||
+    if (status != SHELL_PROCESS_ENOMEM || sequence != NULL || count != 0 ||
         has_features) {
       atomic = false;
-      free_dfa_inputs(inputs, count);
+      free(sequence);
       break;
     }
   }
-  test("DFA extraction allocation failures are atomic", atomic);
+  test("Netargv-sequence allocation failures are atomic", atomic);
+
+  shellsplit_test_alloc_reset();
+  status = shell_build_command_netseq(input, NULL, &sequence, &count);
+  allocations = shellsplit_test_alloc_count();
+  test("Command-netsequence allocation probe succeeds",
+       status == SHELL_PROCESS_OK && sequence && count == 2);
+  free(sequence);
+
+  atomic = true;
+  for (size_t fail_at = 1; fail_at <= allocations; fail_at++) {
+    sequence = (char *)(void *)1;
+    count = SIZE_MAX;
+    shellsplit_test_alloc_fail_at(fail_at);
+    status = shell_build_command_netseq(input, NULL, &sequence, &count);
+    shellsplit_test_alloc_reset();
+    if (status != SHELL_PROCESS_ENOMEM || sequence != NULL || count != 0) {
+      atomic = false;
+      free(sequence);
+      break;
+    }
+  }
+  test("Command-netsequence allocation failures are atomic", atomic);
 }
 
 static void test_transform_allocation_failures(void) {
@@ -618,12 +623,9 @@ static void test_output_limit_boundaries(void) {
   size_t process_total = 0;
   for (size_t i = 0; process_status == SHELL_PROCESS_OK && i < count; i++) {
     size_t original = strlen(infos[i].original_command);
-    size_t clean = strlen(infos[i].clean_command);
     if (original > process_max)
       process_max = original;
-    if (clean > process_max)
-      process_max = clean;
-    process_total += original + clean;
+    process_total += original;
   }
   shell_free_command_infos(infos, count);
 
@@ -1589,53 +1591,66 @@ int main(void) {
   // Test: NULL handling
   {
     shell_command_info_t *infos = (shell_command_info_t *)(uintptr_t)1;
-    const char **inputs = (const char **)(uintptr_t)1;
     size_t count = SIZE_MAX;
-    bool has_shell = true;
     shell_process_status_t process_result =
         shell_process_command(NULL, NULL, &infos, &count);
     bool process_valid =
         process_result != SHELL_PROCESS_OK && infos == NULL && count == 0;
-    count = SIZE_MAX;
-    shell_process_status_t extract_result =
-        shell_extract_dfa_inputs(NULL, NULL, &inputs, &count, &has_shell);
-    test("Processor: NULL input clears every writable output",
-         process_valid && extract_result != SHELL_PROCESS_OK &&
-             inputs == NULL && count == 0 && !has_shell);
+    test("Processor: NULL input clears every writable output", process_valid);
 
     infos = (shell_command_info_t *)(uintptr_t)1;
-    inputs = (const char **)(uintptr_t)1;
     count = SIZE_MAX;
-    has_shell = true;
     process_result = shell_process_command("\x01"
                                            "cmd",
                                            NULL, &infos, &count);
     process_valid =
         process_result != SHELL_PROCESS_OK && infos == NULL && count == 0;
-    count = SIZE_MAX;
-    extract_result =
-        shell_extract_dfa_inputs("\x01"
-                                 "cmd",
-                                 NULL, &inputs, &count, &has_shell);
     test("Processor: rejected input clears every writable output",
-         process_valid && extract_result != SHELL_PROCESS_OK &&
-             inputs == NULL && count == 0 && !has_shell);
+         process_valid);
+  }
+
+  {
+    const char *word = "foo\"bar\"\\\n' two words'\\$";
+    const char expected[] = "foobar two words$";
+    char decoded[sizeof(expected)] = {0};
+    size_t measured = 0, written = 0;
+    bool valid = shell_measure_decoded_word(word, strlen(word), &measured) ==
+                     SHELL_PROCESS_OK &&
+                 measured == strlen(expected) &&
+                 shell_write_decoded_word(word, strlen(word), decoded, measured,
+                                          &written) == SHELL_PROCESS_OK &&
+                 written == measured &&
+                 memcmp(decoded, expected, measured) == 0;
+    const size_t expected_length = measured;
+    valid = valid &&
+            shell_write_decoded_word(word, strlen(word), decoded, measured - 1,
+                                     &written) == SHELL_PROCESS_EOUTPUT_LIMIT &&
+            written == 0;
+    valid = valid &&
+            shell_measure_decoded_word(NULL, 0, &measured) ==
+                SHELL_PROCESS_EINPUT &&
+            measured == 0 &&
+            shell_write_decoded_word(word, strlen(word), NULL, 0, &written) ==
+                SHELL_PROCESS_EINPUT &&
+            written == 0;
+    char *owned = NULL;
+    size_t owned_length = 0;
+    valid = valid &&
+            shell_decode_word(word, strlen(word), &owned, &owned_length) ==
+                SHELL_PROCESS_OK &&
+            owned_length == expected_length && strcmp(owned, expected) == 0;
+    free(owned);
+    test("Decoded-word measure/write matches owned decoding", valid);
   }
 
   {
     shell_command_info_t *infos = NULL;
-    const char **inputs = NULL;
     size_t count = 0;
-    bool has_shell = false;
     shell_process_status_t rejected[] = {
         shell_process_command("echo", NULL, NULL, &count),
         shell_process_command("echo", NULL, &infos, NULL),
-        shell_extract_dfa_inputs("echo", NULL, NULL, &count, &has_shell),
-        shell_extract_dfa_inputs("echo", NULL, &inputs, NULL, &has_shell),
-        shell_extract_dfa_inputs("echo", NULL, &inputs, &count, NULL),
     };
-    bool valid = shell_get_clean_command(NULL) == NULL &&
-                 !shell_has_dangerous_features(NULL);
+    bool valid = !shell_has_dangerous_features(NULL);
     for (size_t i = 0; i < sizeof(rejected) / sizeof(rejected[0]); i++)
       valid = valid && rejected[i] != SHELL_PROCESS_OK;
     test("Processor: NULL output and accessor contracts", valid);
@@ -1949,21 +1964,88 @@ int main(void) {
   }
 
   {
-    const char **inputs = NULL;
+    shell_command_info_t *infos = NULL;
+    size_t count = 0;
+    char *netargv = NULL;
+    shell_process_status_t status = shell_process_command(
+        "printf '' foo\"bar\" 'two words' '>'", NULL, &infos, &count);
+    if (status == SHELL_PROCESS_OK && count == 1)
+      status = shell_render_netargv(&infos[0], NULL, &netargv);
+    bool valid = status == SHELL_PROCESS_OK && count == 1 && netargv &&
+                 strcmp(netargv, "6:printf,0:,6:foobar,9:two words,1:>,") == 0;
+    test("Netargv rendering preserves exact argument boundaries", valid);
+    free(netargv);
+    shell_free_command_infos(infos, count);
+  }
+
+  {
+    char *sequence = NULL;
     size_t count = 0;
     bool features = false;
     shell_process_status_t status =
-        shell_extract_netargv_inputs("printf '' foo\"bar\" 'two words' '>'",
-                                     NULL, &inputs, &count, &features);
+        shell_extract_netargv_sequence("printf '' 'two words'; cd '/tmp path'",
+                                       NULL, &sequence, &count, &features);
     bool valid =
-        status == SHELL_PROCESS_OK && count == 1 && !features &&
-        strcmp(inputs[0], "6:printf,0:,6:foobar,9:two words,1:>,") == 0;
-    test("Netargv rendering preserves exact argument boundaries", valid);
-    if (inputs) {
-      for (size_t i = 0; i < count; i++)
-        free((void *)inputs[i]);
-    }
-    free(inputs);
+        status == SHELL_PROCESS_OK && count == 2 && features && sequence &&
+        strcmp(sequence, "24:6:printf,0:,9:two words,,17:2:cd,9:/tmp path,,") ==
+            0;
+    test("Nested netargv sequence preserves subcommand boundaries", valid);
+    free(sequence);
+
+    sequence = (char *)1;
+    count = 99;
+    features = true;
+    valid = shell_extract_netargv_sequence(NULL, NULL, &sequence, &count,
+                                           &features) == SHELL_PROCESS_EINPUT &&
+            sequence == NULL && count == 0 && !features;
+    test("Nested netargv sequence rejects invalid input atomically", valid);
+
+    valid = shell_extract_netargv_sequence("echo x", NULL, NULL, &count,
+                                           &features) == SHELL_PROCESS_EINPUT &&
+            count == 0 && !features;
+    valid = valid &&
+            shell_extract_netargv_sequence("echo x", NULL, &sequence, NULL,
+                                           &features) == SHELL_PROCESS_EINPUT &&
+            sequence == NULL && !features;
+    valid = valid &&
+            shell_extract_netargv_sequence("echo x", NULL, &sequence, &count,
+                                           NULL) == SHELL_PROCESS_EINPUT &&
+            sequence == NULL && count == 0;
+    test("Nested netargv sequence validates every output", valid);
+
+    shell_process_limits_t limits = {SIZE_MAX, SIZE_MAX};
+    limits.max_string_bytes = 1;
+    features = true;
+    valid = shell_extract_netargv_sequence("echo x", &limits, &sequence, &count,
+                                           &features) ==
+                SHELL_PROCESS_EOUTPUT_LIMIT &&
+            sequence == NULL && count == 0 && !features;
+    test("Nested netargv sequence enforces its outer output limit", valid);
+
+    sequence = NULL;
+    count = 0;
+    valid = shell_build_command_netseq("'my tool' one two; printf x", NULL,
+                                       &sequence, &count) == SHELL_PROCESS_OK &&
+            count == 2 && sequence &&
+            strcmp(sequence, "7:my tool,6:printf,") == 0;
+    test("Command netsequence records executables rather than arguments",
+         valid);
+    free(sequence);
+
+    valid = shell_build_command_netseq("echo x", NULL, NULL, &count) ==
+                SHELL_PROCESS_EINPUT &&
+            count == 0;
+    valid = valid &&
+            shell_build_command_netseq("echo x", NULL, &sequence, NULL) ==
+                SHELL_PROCESS_EINPUT &&
+            sequence == NULL;
+    limits = (shell_process_limits_t){SIZE_MAX, SIZE_MAX};
+    limits.max_total_bytes = 1;
+    valid = valid &&
+            shell_build_command_netseq("echo x", &limits, &sequence, &count) ==
+                SHELL_PROCESS_EOUTPUT_LIMIT &&
+            sequence == NULL && count == 0;
+    test("Command netsequence validates outputs and limits", valid);
   }
 
   printf("\n=== SUMMARY ===\n");

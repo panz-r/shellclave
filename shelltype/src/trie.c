@@ -8,6 +8,7 @@
  * the join of all observed types at each position for precise generalisation.
  */
 
+#include "shell_netstring.h"
 #include "shelltype.h"
 
 #include <assert.h>
@@ -512,6 +513,61 @@ static bool append_prefixed(candidate_list_t *output,
   return true;
 }
 
+static bool append_compound_prefixed(candidate_list_t *output,
+                                     const branch_candidate_t *branch,
+                                     const char *prefix,
+                                     st_token_type_t capture_type,
+                                     double confidence) {
+  st_token_t typed = {.text = (char *)prefix,
+                      .type = ST_TYPE_LITERAL,
+                      .compound = true,
+                      .prefix = (char *)prefix,
+                      .capture = (char *)st_type_symbol[capture_type],
+                      .suffix = "",
+                      .capture_type = capture_type};
+  char *encoded_prefix = NULL;
+  if (st_netpattern_encode(&typed, 1, &encoded_prefix) != ST_OK)
+    return false;
+  size_t prefix_length = strlen(encoded_prefix);
+  size_t suffix_length = strlen(branch->suffix.pattern);
+  if (prefix_length >= ST_MAX_NETPATTERN_LEN ||
+      suffix_length >= ST_MAX_NETPATTERN_LEN - prefix_length) {
+    free(encoded_prefix);
+    return true;
+  }
+  char *pattern = malloc(prefix_length + suffix_length + 1);
+  if (!pattern) {
+    free(encoded_prefix);
+    return false;
+  }
+  memcpy(pattern, encoded_prefix, prefix_length);
+  free(encoded_prefix);
+  memcpy(pattern + prefix_length, branch->suffix.pattern, suffix_length + 1);
+  st_candidate_t candidate = {.pattern = pattern,
+                              .count = branch->suffix.count,
+                              .confidence = confidence};
+  if (!candidate_list_append(output, candidate)) {
+    free(pattern);
+    return false;
+  }
+  return true;
+}
+
+static bool option_capture(const char *token, size_t *prefix_length,
+                           st_token_type_t *capture_type) {
+  if (!token || token[0] != '-' || token[1] != '-')
+    return false;
+  const char *equals = strchr(token + 2, '=');
+  if (!equals || equals == token + 2 || equals[1] == '\0')
+    return false;
+  st_token_type_t type = st_classify_token(equals + 1);
+  if (type == ST_TYPE_LITERAL)
+    return false;
+  *prefix_length = (size_t)(equals - token + 1);
+  *capture_type = type;
+  return true;
+}
+
 /* Return complete terminal continuations following node.  Each returned
  * pattern is empty only when a command terminates at node itself. */
 static bool collect_complete_continuations(const st_node_t *node,
@@ -599,7 +655,51 @@ static bool collect_complete_continuations(const st_node_t *node,
     }
 
     bool command_position = node->token[0] == '\0';
-    if (literal_count >= 2 && !command_position && group_total <= UINT32_MAX) {
+    bool compound_group = literal_count >= 2 && typed_count == 0 &&
+                          !command_position && group_total <= UINT32_MAX;
+    size_t compound_prefix_length = 0;
+    st_token_type_t compound_type = ST_TYPE_COUNT;
+    const char *compound_source = NULL;
+    if (compound_group) {
+      for (size_t i = begin; i < end; i++) {
+        const st_node_t *child = branches[i].child;
+        size_t prefix_length = 0;
+        st_token_type_t capture_type = ST_TYPE_LITERAL;
+        if (child->type != ST_TYPE_LITERAL ||
+            !option_capture(child->token, &prefix_length, &capture_type)) {
+          compound_group = false;
+          break;
+        }
+        if (!compound_source) {
+          compound_source = child->token;
+          compound_prefix_length = prefix_length;
+          compound_type = capture_type;
+        } else if (prefix_length != compound_prefix_length ||
+                   memcmp(compound_source, child->token, prefix_length) != 0) {
+          compound_group = false;
+          break;
+        } else {
+          compound_type = st_join(compound_type, capture_type);
+        }
+      }
+      if (compound_type == ST_TYPE_LITERAL || compound_type == ST_TYPE_COUNT)
+        compound_group = false;
+    }
+    if (compound_group) {
+      char prefix[ST_MAX_TOKEN_LEN];
+      memcpy(prefix, compound_source, compound_prefix_length);
+      prefix[compound_prefix_length] = '\0';
+      branch_candidate_t aggregate = {
+          .suffix = {.pattern = branches[begin].suffix.pattern,
+                     .count = (uint32_t)group_total,
+                     .confidence = (double)group_total / (double)node->count},
+          .child = branches[begin].child,
+      };
+      if (!append_compound_prefixed(output, &aggregate, prefix, compound_type,
+                                    aggregate.suffix.confidence))
+        goto failure;
+    } else if (literal_count >= 2 && !command_position &&
+               group_total <= UINT32_MAX) {
       branch_candidate_t aggregate = {
           .suffix = {.pattern = branches[begin].suffix.pattern,
                      .count = (uint32_t)group_total,
@@ -925,14 +1025,14 @@ typedef struct {
 static bool append_netstring_field(char *record, size_t capacity, size_t *used,
                                    const char *value) {
   size_t length = strlen(value);
-  int prefix = snprintf(record + *used, capacity - *used, "%zu:", length);
-  if (prefix < 0 || (size_t)prefix >= capacity - *used ||
-      length + 1 >= capacity - *used - (size_t)prefix)
+  size_t written = 0;
+  if (*used > capacity ||
+      shell_netstring_write(record + *used, capacity - *used, value, length,
+                            &written) != SHELL_NETSTRING_OK)
     return false;
-  *used += (size_t)prefix;
-  memcpy(record + *used, value, length);
-  *used += length;
-  record[(*used)++] = ',';
+  *used += written;
+  if (*used >= capacity)
+    return false;
   record[*used] = '\0';
   return true;
 }
@@ -1001,13 +1101,18 @@ static void dfs_save_v4(st_node_t *node, uint32_t parent_id, size_t depth,
     return;
   }
   char prefix[32];
-  int prefix_length = snprintf(prefix, sizeof(prefix), "%zu:", used);
-  if (prefix_length < 0 || (size_t)prefix_length >= sizeof(prefix) ||
-      fprintf(ctx->fp, "%s%s,\n", prefix, record) < 0) {
+  size_t prefix_length = 0;
+  if (shell_netstring_write_prefix(prefix, sizeof(prefix) - 1, used,
+                                   &prefix_length) != SHELL_NETSTRING_OK) {
+    ctx->error = ST_ERR_LIMIT;
+    return;
+  }
+  prefix[prefix_length] = '\0';
+  if (fprintf(ctx->fp, "%s%s,\n", prefix, record) < 0) {
     ctx->error = ST_ERR_IO;
     return;
   }
-  ctx->crc = st_crc32_update(prefix, (size_t)prefix_length, ctx->crc);
+  ctx->crc = st_crc32_update(prefix, prefix_length, ctx->crc);
   ctx->crc = st_crc32_update(record, used, ctx->crc);
   ctx->crc = st_crc32_update(",\n", 2, ctx->crc);
 
@@ -1044,7 +1149,7 @@ st_error_t st_save(const st_learner_t *learner, const char *path) {
     return ST_ERR_LIMIT;
   }
   if (fprintf(output.stream,
-              "# shelltype-learner v4\n# total-commands: %u\n# nodes: %u\n",
+              "# shelltype-learner v5\n# total-commands: %u\n# nodes: %u\n",
               learner->trie.total_commands, (unsigned)node_total) < 0) {
     st_atomic_output_discard(&output);
     return ST_ERR_IO;
@@ -1069,67 +1174,51 @@ st_error_t st_save(const st_learner_t *learner, const char *path) {
 
 static st_error_t read_outer_record(FILE *fp, char **payload, uint32_t *crc) {
   *payload = NULL;
-  char prefix[32];
-  size_t prefix_length = 0, length = 0;
-  int ch = fgetc(fp);
-  if (ch == EOF)
-    return ferror(fp) ? ST_ERR_IO : ST_ERR_FORMAT;
-  bool leading_zero = ch == '0';
-  do {
-    if (!isdigit((unsigned char)ch) || prefix_length + 1 >= sizeof(prefix))
-      return ST_ERR_FORMAT;
-    prefix[prefix_length++] = (char)ch;
-    unsigned digit = (unsigned)(ch - '0');
-    if (length > (SIZE_MAX - digit) / 10)
-      return ST_ERR_LIMIT;
-    length = length * 10 + digit;
-    ch = fgetc(fp);
-  } while (ch != ':' && ch != EOF);
-  if (ch != ':' || (leading_zero && prefix_length != 1) || length == 0 ||
-      length >= ST_MAX_TOKEN_LEN + 256)
-    return ST_ERR_FORMAT;
-  prefix[prefix_length++] = ':';
-  char *record = malloc(length + 1);
-  if (!record)
+  unsigned char *record = NULL;
+  size_t record_length = 0;
+  shell_netstring_status_t status = shell_netstring_read_stream(
+      fp, ST_MAX_TOKEN_LEN + 288, &record, &record_length);
+  if (status == SHELL_NETSTRING_ENOMEM)
     return ST_ERR_MEMORY;
-  if (fread(record, 1, length, fp) != length) {
+  if (status == SHELL_NETSTRING_EIO)
+    return ST_ERR_IO;
+  if (status != SHELL_NETSTRING_OK)
+    return status == SHELL_NETSTRING_EOVERFLOW ? ST_ERR_LIMIT : ST_ERR_FORMAT;
+  shell_netstring_iter_t iter;
+  shell_netstring_view_t view;
+  if (shell_netstring_iter_init(&iter, record, record_length) !=
+          SHELL_NETSTRING_OK ||
+      shell_netstring_iter_next(&iter, &view) != SHELL_NETSTRING_OK ||
+      view.record_length != record_length || view.payload_length == 0 ||
+      view.payload_length >= ST_MAX_TOKEN_LEN + 256 ||
+      memchr(view.payload, '\0', view.payload_length) || fgetc(fp) != '\n') {
     free(record);
     return ferror(fp) ? ST_ERR_IO : ST_ERR_FORMAT;
   }
-  record[length] = '\0';
-  if (memchr(record, '\0', length) || fgetc(fp) != ',' || fgetc(fp) != '\n') {
-    free(record);
-    return ferror(fp) ? ST_ERR_IO : ST_ERR_FORMAT;
-  }
-  *crc = st_crc32_update(prefix, prefix_length, *crc);
-  *crc = st_crc32_update(record, length, *crc);
+  size_t prefix_length = record_length - view.payload_length - 1;
+  *crc = st_crc32_update(record, prefix_length, *crc);
+  *crc = st_crc32_update(view.payload, view.payload_length, *crc);
   *crc = st_crc32_update(",\n", 2, *crc);
-  *payload = record;
+  memmove(record, view.payload, view.payload_length);
+  record[view.payload_length] = '\0';
+  *payload = (char *)record;
   return ST_OK;
 }
 
 static bool take_netstring_field(char *record, size_t length, size_t *offset,
                                  char **field) {
-  if (*offset >= length || !isdigit((unsigned char)record[*offset]))
+  if (!record || !offset || !field || *offset > length)
     return false;
-  size_t field_length = 0;
-  bool leading_zero = record[*offset] == '0';
-  size_t digits_count = 0;
-  do {
-    unsigned digit = (unsigned)(record[*offset] - '0');
-    if (field_length > (SIZE_MAX - digit) / 10)
-      return false;
-    field_length = field_length * 10 + digit;
-    (*offset)++;
-    digits_count++;
-  } while (*offset < length && isdigit((unsigned char)record[*offset]));
-  if (*offset >= length || record[(*offset)++] != ':' ||
-      (leading_zero && digits_count != 1) || field_length >= length - *offset ||
-      record[*offset + field_length] != ',')
+  shell_netstring_iter_t iter;
+  if (shell_netstring_iter_init(&iter, record + *offset, length - *offset) !=
+      SHELL_NETSTRING_OK)
     return false;
-  *field = record + *offset;
-  *offset += field_length;
-  record[(*offset)++] = '\0';
+  shell_netstring_view_t view;
+  if (shell_netstring_iter_next(&iter, &view) != SHELL_NETSTRING_OK)
+    return false;
+  *field = (char *)view.payload;
+  *offset += view.record_length;
+  record[*offset - 1] = '\0';
   return true;
 }
 
@@ -1170,7 +1259,7 @@ st_error_t st_load(st_learner_t *learner, const char *path) {
   char line[128];
   uint32_t saved_total = 0, node_count = 0;
   st_line_status_t status = st_read_line(fp, line, sizeof(line));
-  if (status != ST_LINE_OK || !line_equals(line, "# shelltype-learner v4"))
+  if (status != ST_LINE_OK || !line_equals(line, "# shelltype-learner v5"))
     goto done;
   status = st_read_line(fp, line, sizeof(line));
   if (status != ST_LINE_OK || strncmp(line, "# total-commands: ", 18) != 0)

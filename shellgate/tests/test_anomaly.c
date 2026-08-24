@@ -3,13 +3,89 @@
 #define _POSIX_C_SOURCE 200809L
 #include "../src/sg_anomaly_internal.h"
 #include "sg_anomaly.h"
+#include "shell_netstring.h"
 #include "test_sg_failures.h"
 #include <errno.h>
 #include <math.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+
+static char *test_encode_netseq(const char **sequence, size_t count) {
+  if (!sequence && count)
+    return NULL;
+  size_t total = 0;
+  for (size_t i = 0; i < count; i++) {
+    if (!sequence[i])
+      return NULL;
+    size_t length = strlen(sequence[i]);
+    size_t record_length = 0;
+    if (shell_netstring_encoded_length(length, &record_length) !=
+            SHELL_NETSTRING_OK ||
+        total > SIZE_MAX - record_length)
+      return NULL;
+    total += record_length;
+  }
+  if (total == SIZE_MAX)
+    return NULL;
+  char *encoded = malloc(total + 1);
+  if (!encoded)
+    return NULL;
+  size_t used = 0;
+  for (size_t i = 0; i < count; i++) {
+    size_t length = strlen(sequence[i]);
+    size_t written = 0;
+    if (shell_netstring_write(encoded + used, total - used, sequence[i], length,
+                              &written) != SHELL_NETSTRING_OK) {
+      free(encoded);
+      return NULL;
+    }
+    used += written;
+  }
+  encoded[used] = '\0';
+  return encoded;
+}
+
+static bool test_has_observed(const sg_anomaly_model_t *model,
+                              const char **sequence, size_t count) {
+  char *encoded = test_encode_netseq(sequence, count);
+  bool observed = false;
+  if (!encoded ||
+      sg_anomaly_has_observed_netseq(model, encoded, strlen(encoded),
+                                     &observed) != SG_ANOMALY_OK)
+    observed = false;
+  free(encoded);
+  return observed;
+}
+
+static double test_anomaly_score_array(const sg_anomaly_model_t *model,
+                                       const char **sequence, size_t count) {
+  char *encoded = test_encode_netseq(sequence, count);
+  double score = INFINITY;
+  if (encoded) {
+    (void)sg_anomaly_score_netseq(model, encoded, strlen(encoded), &score);
+    free(encoded);
+  } else {
+    (void)sg_anomaly_score_netseq(model, NULL, 0, &score);
+  }
+  return score;
+}
+
+static void test_anomaly_update_array(sg_anomaly_model_t *model,
+                                      const char **sequence, size_t count) {
+  char *encoded = test_encode_netseq(sequence, count);
+  if (encoded) {
+    (void)sg_anomaly_update_netseq(model, encoded, strlen(encoded));
+    free(encoded);
+  } else {
+    (void)sg_anomaly_update_netseq(model, NULL, 0);
+  }
+}
+
+#define sg_anomaly_score test_anomaly_score_array
+#define sg_anomaly_update test_anomaly_update_array
 
 static int pass_count;
 static int fail_count;
@@ -127,7 +203,7 @@ TEST(lifecycle_and_null_safety) {
   for (size_t i = 0;
        i < sizeof(invalid_sequences) / sizeof(invalid_sequences[0]); i++) {
     ASSERT(isinf(sg_anomaly_score(model, invalid_sequences[i], 3)));
-    ASSERT(!sg_anomaly_has_observed(model, invalid_sequences[i], 3));
+    ASSERT(!test_has_observed(model, invalid_sequences[i], 3));
     sg_anomaly_update(model, invalid_sequences[i], 3);
     ASSERT_EQ_INT(sg_anomaly_total_uni(model), 5);
   }
@@ -166,8 +242,12 @@ TEST(lifecycle_and_null_safety) {
   ASSERT(isfinite(sg_anomaly_score(model, oversized_late, 4)));
   ASSERT(isfinite(sg_anomaly_score(model, oversized_last, 4)));
   ASSERT_EQ_DBL(sg_anomaly_kn_discount(NULL), 0.0, 0.0);
-  ASSERT(!sg_anomaly_has_observed(NULL, commands, 5));
-  ASSERT(!sg_anomaly_has_observed(model, NULL, 5));
+  bool observed = true;
+  ASSERT_EQ_INT(sg_anomaly_has_observed_netseq(NULL, "", 0, &observed),
+                SG_ANOMALY_ERR_INVALID);
+  ASSERT(!observed);
+  ASSERT_EQ_INT(sg_anomaly_has_observed_netseq(model, NULL, 0, &observed),
+                SG_ANOMALY_ERR_INVALID);
   FILE *stream = tmpfile();
   ASSERT(stream != NULL);
   ASSERT_EQ_INT(sg_anomaly_write_stream(NULL, stream), -1);
@@ -214,9 +294,9 @@ TEST(update_count_matrix) {
     ASSERT_EQ_INT(sg_anomaly_quad_count(model, "a", "b", "c", "d"),
                   length > 3 ? 3 : 0);
     ASSERT((length < 3) == isinf(sg_anomaly_score(model, commands, length)));
-    ASSERT(sg_anomaly_has_observed(model, commands, length));
+    ASSERT(test_has_observed(model, commands, length));
     const char *unseen[] = {"missing"};
-    ASSERT(!sg_anomaly_has_observed(model, unseen, 1));
+    ASSERT(!test_has_observed(model, unseen, 1));
     sg_anomaly_model_free(model);
   }
 
@@ -334,6 +414,7 @@ TEST(save_load_roundtrip) {
   double unseen_score = sg_anomaly_score(source, unseen, 5);
 
   ASSERT_EQ_INT(sg_anomaly_save(source, path), 0);
+  ASSERT_EQ_INT(sg_anomaly_save(source, "/no/such/directory/model"), -1);
   if (access("/dev/full", W_OK) == 0) {
     errno = 0;
     ASSERT_EQ_INT(sg_anomaly_save(source, "/dev/full"), -1);
@@ -369,6 +450,9 @@ TEST(save_load_roundtrip) {
     if (valid[binary_offset++] == '\n')
       newlines++;
   ASSERT(newlines == 2 && binary_offset < valid_size);
+  const unsigned char *first_newline = memchr(valid, '\n', valid_size);
+  ASSERT(first_newline != NULL);
+  size_t header_end = (size_t)(first_newline - valid) + 1;
 
   double preserved_score = sg_anomaly_score(loaded, commands, 5);
   ASSERT(unlink(path) == 0);
@@ -378,9 +462,19 @@ TEST(save_load_roundtrip) {
   ASSERT_EQ_DBL(sg_anomaly_score(loaded, commands, 5), preserved_score,
                 0.000001);
 
-  enum corruption { EMPTY, BAD_MAGIC, TRUNCATED, BAD_TYPE, BAD_NEWLINE };
-  static const enum corruption corruptions[] = {EMPTY, BAD_MAGIC, TRUNCATED,
-                                                BAD_TYPE, BAD_NEWLINE};
+  enum corruption {
+    EMPTY,
+    BAD_MAGIC,
+    MISSING_METADATA,
+    BAD_METADATA,
+    TRUNCATED,
+    BAD_TYPE,
+    BAD_KEY_TERMINATOR,
+    BAD_NEWLINE
+  };
+  static const enum corruption corruptions[] = {
+      EMPTY,     BAD_MAGIC, MISSING_METADATA,   BAD_METADATA,
+      TRUNCATED, BAD_TYPE,  BAD_KEY_TERMINATOR, BAD_NEWLINE};
   for (size_t i = 0; i < sizeof(corruptions) / sizeof(corruptions[0]); i++) {
     unsigned char *data = malloc(valid_size);
     ASSERT(data != NULL);
@@ -393,12 +487,25 @@ TEST(save_load_roundtrip) {
     case BAD_MAGIC:
       data[0] = '!';
       break;
+    case MISSING_METADATA:
+      size = header_end;
+      break;
+    case BAD_METADATA:
+      data[header_end] = '!';
+      break;
     case TRUNCATED:
       size--;
       break;
     case BAD_TYPE:
       data[binary_offset] = 99;
       break;
+    case BAD_KEY_TERMINATOR: {
+      uint32_t key_length = 0;
+      memcpy(&key_length, data + binary_offset + 1, sizeof(key_length));
+      ASSERT(key_length > 0 && binary_offset + 5U + key_length <= size);
+      data[binary_offset + 5U + key_length - 1U] = 'X';
+      break;
+    }
     case BAD_NEWLINE:
       data[size - 1] = 'X';
       break;
@@ -598,6 +705,116 @@ TEST(prune_and_compact_preserve_common_behavior) {
   sg_anomaly_model_free(model);
 }
 
+TEST(canonical_netseq_contract) {
+  sg_anomaly_model_t *model = sg_anomaly_model_new();
+  ASSERT(model != NULL);
+  static const char valid[] = "9:two words,1::,1:,,";
+  ASSERT_EQ_INT(sg_anomaly_update_netseq(model, valid, sizeof(valid) - 1),
+                SG_ANOMALY_OK);
+  bool observed = false;
+  ASSERT_EQ_INT(sg_anomaly_has_observed_netseq(model, valid, sizeof(valid) - 1,
+                                               &observed),
+                SG_ANOMALY_OK);
+  ASSERT(observed);
+  observed = true;
+  ASSERT_EQ_INT(sg_anomaly_has_observed_netseq(model, "", 0, &observed),
+                SG_ANOMALY_OK);
+  ASSERT(!observed);
+  ASSERT_EQ_INT(sg_anomaly_has_observed_netseq(model, "01:a,", 5, &observed),
+                SG_ANOMALY_ERR_FORMAT);
+  ASSERT_EQ_INT(sg_anomaly_vocab_size(model), 3);
+  double score = 0.0;
+  ASSERT_EQ_INT(
+      sg_anomaly_score_netseq(model, valid, sizeof(valid) - 1, &score),
+      SG_ANOMALY_OK);
+  ASSERT(isfinite(score));
+
+  static const char *invalid[] = {"01:x,", "1:x", "2:x,", "0:,",
+                                  "x",     "1x,", "1:x;", "1:,"};
+  for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
+    score = 0.0;
+    ASSERT_EQ_INT(
+        sg_anomaly_score_netseq(model, invalid[i], strlen(invalid[i]), &score),
+        SG_ANOMALY_ERR_FORMAT);
+    ASSERT(isinf(score));
+  }
+  ASSERT_EQ_INT(sg_anomaly_score_netseq(NULL, valid, sizeof(valid) - 1, &score),
+                SG_ANOMALY_ERR_INVALID);
+  ASSERT_EQ_INT(sg_anomaly_score_netseq(model, valid, sizeof(valid) - 1, NULL),
+                SG_ANOMALY_ERR_INVALID);
+  ASSERT_EQ_INT(sg_anomaly_update_netseq(NULL, valid, sizeof(valid) - 1),
+                SG_ANOMALY_ERR_INVALID);
+
+  static const char embedded_nul[] = {'1', ':', 'x', ',', '\0',
+                                      '1', ':', 'y', ','};
+  ASSERT_EQ_INT(sg_anomaly_score_netseq(model, embedded_nul,
+                                        sizeof(embedded_nul), &score),
+                SG_ANOMALY_ERR_FORMAT);
+  ASSERT_EQ_INT(sg_anomaly_score_netseq(model, "", 0, &score), SG_ANOMALY_OK);
+  ASSERT(isinf(score));
+  ASSERT_EQ_INT(sg_anomaly_update_netseq(model, "", 0), SG_ANOMALY_OK);
+
+  static const char overflow[] = "999999999999999999999999999999999999:x,";
+  ASSERT_EQ_INT(sg_anomaly_update_netseq(model, overflow, sizeof(overflow) - 1),
+                SG_ANOMALY_ERR_LIMIT);
+
+  size_t large_length = SG_ANOMALY_MAX_COMMAND_LENGTH + 1U;
+  size_t large_capacity = large_length + 32U;
+  char *large = malloc(large_capacity);
+  ASSERT(large != NULL);
+  int prefix = snprintf(large, large_capacity, "%zu:", large_length);
+  ASSERT(prefix > 0);
+  memset(large + prefix, 'z', large_length);
+  large[prefix + large_length] = ',';
+  size_t encoded_length = (size_t)prefix + large_length + 1U;
+  ASSERT_EQ_INT(sg_anomaly_update_netseq(model, large, encoded_length),
+                SG_ANOMALY_ERR_LIMIT);
+  ASSERT_EQ_INT(sg_anomaly_score_netseq(model, large, encoded_length, &score),
+                SG_ANOMALY_OK);
+  ASSERT(isinf(score));
+  free(large);
+  sg_anomaly_model_free(model);
+}
+
+TEST(canonical_netseq_allocation_failures) {
+  static const char sequence[] = "1:a,1:b,1:c,1:d,1:e,1:f,1:g,1:h,1:i,";
+  sg_anomaly_model_t *probe = sg_anomaly_model_new();
+  ASSERT(probe != NULL);
+  sg_test_anomaly_op_reset();
+  ASSERT_EQ_INT(sg_anomaly_update_netseq(probe, sequence, sizeof(sequence) - 1),
+                SG_ANOMALY_OK);
+  size_t update_allocations = sg_test_anomaly_op_count();
+  sg_test_anomaly_op_reset();
+  ASSERT(update_allocations > 0);
+  sg_anomaly_model_free(probe);
+
+  for (size_t fail_at = 1; fail_at <= update_allocations; fail_at++) {
+    sg_anomaly_model_t *model = sg_anomaly_model_new();
+    ASSERT(model != NULL);
+    sg_test_anomaly_op_fail_at(fail_at);
+    sg_anomaly_status_t status =
+        sg_anomaly_update_netseq(model, sequence, sizeof(sequence) - 1);
+    sg_test_anomaly_op_reset();
+    ASSERT_EQ_INT(status, SG_ANOMALY_ERR_MEMORY);
+    sg_anomaly_model_free(model);
+  }
+
+  probe = sg_anomaly_model_new();
+  ASSERT(probe != NULL);
+  ASSERT_EQ_INT(sg_anomaly_update_netseq(probe, sequence, sizeof(sequence) - 1),
+                SG_ANOMALY_OK);
+  double score = 0.0;
+  sg_test_anomaly_op_reset();
+  ASSERT_EQ_INT(
+      sg_anomaly_score_netseq(probe, sequence, sizeof(sequence) - 1, &score),
+      SG_ANOMALY_OK);
+  size_t score_allocations = sg_test_anomaly_op_count();
+  sg_test_anomaly_op_reset();
+  ASSERT_EQ_INT(score_allocations, 0);
+  ASSERT(isfinite(score));
+  sg_anomaly_model_free(probe);
+}
+
 int main(void) {
   atexit(cleanup_anomaly_temp_file);
   printf("sg_anomaly unit tests\n");
@@ -612,6 +829,8 @@ int main(void) {
   RUN(decay_matrix);
   RUN(decay_removes_large_rare_model);
   RUN(prune_and_compact_preserve_common_behavior);
+  RUN(canonical_netseq_contract);
+  RUN(canonical_netseq_allocation_failures);
   printf("\n%d passed, %d failed\n", pass_count, fail_count);
   return fail_count > 0 ? 1 : 0;
 }

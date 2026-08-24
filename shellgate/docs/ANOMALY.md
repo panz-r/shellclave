@@ -9,9 +9,13 @@ Shellgate uses a **hybrid dual-model** language model to detect anomalous shell 
 Two models run in parallel:
 
 1. **Raw model** — scores command names (e.g., `["ls", "cd", "pwd"]`)
-2. **Type model** — scores abstracted type sequences (e.g., `["ls", "cd OPT AP", "pwd"]`)
+2. **Type model** — scores nested canonical per-command signatures (for
+   example, the three records representing `ls`, `cd AP`, and `pwd`)
 
-The type model generalises arguments: paths become `AP`, options become `OPT`, environment variables become `EV`, etc. This catches structural anomalies even when specific commands differ.
+The type model generalises arguments: paths become `AP`, options become `OPT`,
+environment variables become `EV`, etc. Both models contain exactly one item
+per isolated subcommand; arguments are nested inside the corresponding type
+signature rather than becoming n-gram items themselves.
 
 ### Scoring
 
@@ -108,6 +112,17 @@ r.anomaly_score_raw;   /* raw command name model score */
 r.anomaly_score_type;  /* type sequence model score */
 ```
 
+### Canonical Sequence Scoring
+
+Applications that already hold Shellsplit-derived records can score them
+without rebuilding shell source. `sg_gate_score_anomaly_netseq()` accepts
+matching raw and type netsequences: the raw sequence has one executable-name
+record per command and the type sequence has one nested type-netargv record per
+command. It is read-only: it neither learns nor changes adaptive or Bayesian
+threshold state. Use `shell_build_command_netseq()` and
+`shell_build_type_netseq()` to construct the matching pair from source when
+needed.
+
 ## Type Sequence Caching
 
 An LRU cache avoids recomputing type sequences for repeated commands:
@@ -118,7 +133,7 @@ sg_gate_set_anomaly_cache_size(gate, 0);    /* disable */
 ```
 
 - Default: disabled (cache_size = 0)
-- On cache hit, `shell_build_type_sequence` is skipped
+- On cache hit, `shell_build_type_netseq` is skipped
 - Least-recently-used entries are evicted when the cache is full
 - Maximum allowed size: 8192 entries
 - Cache is not persisted through save/load (only the model is saved)
@@ -147,10 +162,9 @@ Sequences with < 3 commands are not scored for anomaly detection (score = 0, det
 - Use `sg_gate_anomaly_had_error()` to check for OOM conditions
 - Save/load both models atomically with `sg_gate_save_anomaly_model()` /
   `sg_gate_load_anomaly_model()`.
-- Gate persistence uses one checksummed bundle containing the raw and type
-  models. It does not read standalone v3 model files or the former `_type`
-  sidecar layout. The lower-level `sg_anomaly_save()` / `sg_anomaly_load()`
-  APIs continue to use the standalone single-model v3 format.
+- Gate persistence uses the checksummed v2 bundle containing raw and type
+  models. Standalone models use v5. Older files and the former `_type` sidecar
+  layout are rejected because their n-gram units have different semantics.
 
 ## Long-Running Model Maintenance
 

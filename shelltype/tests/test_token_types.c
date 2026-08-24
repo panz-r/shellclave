@@ -5,6 +5,8 @@
  * Tests all 12+1 types, the join table, and the compatibility table.
  */
 
+#include "../src/netpattern.h"
+#include "shell_netstring.h"
 #include "shelltype.h"
 #include "test_allocator.h"
 #include "test_netargv.h"
@@ -16,10 +18,77 @@ static int tests_run = 0;
 static int tests_passed = 0;
 static int tests_failed = 0;
 
-static void st_free_tokens(char **tokens, size_t count) {
+static char *test_wrap_netstring(const char *payload) {
+  size_t length = strlen(payload);
+  size_t record_length = 0;
+  if (shell_netstring_encoded_length(length, &record_length) !=
+      SHELL_NETSTRING_OK)
+    return NULL;
+  char *encoded = malloc(record_length + 1);
+  if (!encoded)
+    return NULL;
+  size_t written = 0;
+  if (shell_netstring_write(encoded, record_length, payload, length,
+                            &written) != SHELL_NETSTRING_OK ||
+      written != record_length) {
+    free(encoded);
+    return NULL;
+  }
+  encoded[written] = '\0';
+  return encoded;
+}
+
+static char *test_pattern_record(char tag, const char *value) {
+  char tag_payload[2] = {tag, '\0'};
+  char *tag_record = test_wrap_netstring(tag_payload);
+  char *value_record = test_wrap_netstring(value);
+  if (!tag_record || !value_record) {
+    free(tag_record);
+    free(value_record);
+    return NULL;
+  }
+  size_t payload_length = strlen(tag_record) + strlen(value_record);
+  char *payload = malloc(payload_length + 1);
+  if (!payload) {
+    free(tag_record);
+    free(value_record);
+    return NULL;
+  }
+  strcpy(payload, tag_record);
+  strcat(payload, value_record);
+  char *record = test_wrap_netstring(payload);
+  free(payload);
+  free(value_record);
+  free(tag_record);
+  return record;
+}
+
+static char *test_compound_pattern(const char *tags, const char *const *values,
+                                   size_t count) {
+  char *parts[4] = {0};
+  size_t compound_length = 0;
+  for (size_t i = 0; i < count; i++) {
+    parts[i] = test_pattern_record(tags[i], values[i]);
+    if (!parts[i])
+      goto fail;
+    compound_length += strlen(parts[i]);
+  }
+  char *compound = malloc(compound_length + 1);
+  if (!compound)
+    goto fail;
+  compound[0] = '\0';
   for (size_t i = 0; i < count; i++)
-    free(tokens[i]);
-  free(tokens);
+    strcat(compound, parts[i]);
+  char *pattern = test_pattern_record('C', compound);
+  free(compound);
+  for (size_t i = 0; i < count; i++)
+    free(parts[i]);
+  return pattern;
+
+fail:
+  for (size_t i = 0; i < count; i++)
+    free(parts[i]);
+  return NULL;
 }
 
 #define TEST(name)                                                             \
@@ -660,21 +729,21 @@ static int test_normalization_matrix(void) {
        {ST_TYPE_LITERAL, ST_TYPE_QUOTED_SPACE},
        2},
       {"export PATH=/usr/bin",
-       "export\tPATH=\t/usr/bin",
-       {ST_TYPE_LITERAL, ST_TYPE_LITERAL, ST_TYPE_ABS_PATH},
-       3},
+       "export\tPATH=/usr/bin",
+       {ST_TYPE_LITERAL, ST_TYPE_LITERAL},
+       2},
       {"tool --output=file.txt",
-       "tool\t--output\tfile.txt",
-       {ST_TYPE_LITERAL, ST_TYPE_LONGOPT, ST_TYPE_FILENAME},
-       3},
+       "tool\t--output=file.txt",
+       {ST_TYPE_LITERAL, ST_TYPE_LITERAL},
+       2},
       {"tool --output=",
-       "tool\t--output\t",
-       {ST_TYPE_LITERAL, ST_TYPE_LONGOPT, ST_TYPE_LITERAL},
-       3},
+       "tool\t--output=",
+       {ST_TYPE_LITERAL, ST_TYPE_LITERAL},
+       2},
       {"export EMPTY=",
-       "export\tEMPTY=\t",
-       {ST_TYPE_LITERAL, ST_TYPE_LITERAL, ST_TYPE_LITERAL},
-       3},
+       "export\tEMPTY=",
+       {ST_TYPE_LITERAL, ST_TYPE_LITERAL},
+       2},
       {"echo sha256", "echo\tsha256", {ST_TYPE_LITERAL, ST_TYPE_HASH_ALGO}, 2},
       {"docker pull ghcr.io/org/app:v1",
        "docker\tpull\tghcr.io/org/app:v1",
@@ -752,19 +821,6 @@ static int test_normalization_matrix(void) {
     }
     ASSERT(*expected_text == '\0');
 
-    char **legacy = NULL;
-    size_t legacy_count = 99;
-    ASSERT(test_st_normalize(cases[i].command, &legacy, &legacy_count) ==
-           ST_OK);
-    ASSERT(legacy_count == cases[i].count);
-    ASSERT(cases[i].count != 0 || legacy == NULL);
-    for (size_t j = 0; j < legacy_count; j++) {
-      const char *expected = cases[i].types[j] == ST_TYPE_LITERAL
-                                 ? typed.tokens[j].text
-                                 : st_type_symbol[cases[i].types[j]];
-      ASSERT(legacy[j] != NULL && strcmp(legacy[j], expected) == 0);
-    }
-    st_free_tokens(legacy, legacy_count);
     st_free_token_array(&typed);
   }
   return 1;
@@ -772,19 +828,9 @@ static int test_normalization_matrix(void) {
 
 static int test_normalization_boundaries(void) {
   st_token_array_t typed = {(st_token_t *)1, 99};
-  char **legacy = (char **)1;
-  size_t count = 99;
   ASSERT(test_st_classify(NULL, &typed) == ST_ERR_INVALID);
   ASSERT(typed.tokens == NULL && typed.count == 0);
   ASSERT(test_st_classify("echo ok", NULL) == ST_ERR_INVALID);
-  ASSERT(test_st_normalize(NULL, &legacy, &count) == ST_ERR_INVALID);
-  ASSERT(legacy == NULL && count == 0);
-  legacy = (char **)1;
-  count = 99;
-  ASSERT(test_st_normalize("echo ok", NULL, &count) == ST_ERR_INVALID);
-  ASSERT(count == 0);
-  ASSERT(test_st_normalize("echo ok", &legacy, NULL) == ST_ERR_INVALID);
-  ASSERT(legacy == NULL);
 
   /* Shelltype never re-tokenizes argv elements, including operator-looking
    * text. */
@@ -796,6 +842,13 @@ static int test_normalization_boundaries(void) {
   ASSERT(typed.count == 1);
   ASSERT(typed.tokens[0].type == ST_TYPE_LITERAL);
   ASSERT(strcmp(typed.tokens[0].text, operators) == 0);
+  st_free_token_array(&typed);
+
+  ASSERT(test_st_classify("#literal | ;", &typed) == ST_OK);
+  ASSERT(typed.count == 3);
+  ASSERT(strcmp(typed.tokens[0].text, "#literal") == 0);
+  ASSERT(strcmp(typed.tokens[1].text, "|") == 0);
+  ASSERT(strcmp(typed.tokens[2].text, ";") == 0);
   st_free_token_array(&typed);
 
   char many[(ST_MAX_CMD_TOKENS + 1) * 2 + 1];
@@ -847,30 +900,6 @@ static int test_normalization_allocation_failures(void) {
   }
   ASSERT(observed);
 
-  char **legacy_probe = NULL;
-  size_t legacy_count = 0;
-  st_test_alloc_reset();
-  ASSERT(test_st_normalize(input, &legacy_probe, &legacy_count) == ST_OK);
-  size_t legacy_allocations = st_test_alloc_count();
-  ASSERT(legacy_probe != NULL && legacy_count > 0 && legacy_allocations > 0);
-  st_free_tokens(legacy_probe, legacy_count);
-  observed = false;
-  for (size_t fail_at = 1; fail_at <= legacy_allocations; fail_at++) {
-    char **tokens = (char **)1;
-    size_t count = 99;
-    st_test_alloc_fail_at(fail_at);
-    st_error_t err = test_st_normalize(input, &tokens, &count);
-    st_test_alloc_reset();
-    if (err == ST_ERR_MEMORY) {
-      observed = true;
-      ASSERT(tokens == NULL && count == 0);
-    } else {
-      ASSERT(err == ST_OK);
-      ASSERT(tokens != NULL && count > 0);
-      st_free_tokens(tokens, count);
-    }
-  }
-  ASSERT(observed);
   return 1;
 }
 
@@ -948,8 +977,9 @@ static int test_netargv_contract(void) {
   char split_overflow[1024] = {0};
   for (size_t i = 0; i < ST_MAX_CMD_TOKENS / 2 + 1; i++)
     strcat(split_overflow, "3:A=1,");
-  ASSERT(st_classify(split_overflow, &typed) == ST_ERR_INVALID);
-  ASSERT(typed.tokens == NULL && typed.count == 0);
+  ASSERT(st_classify(split_overflow, &typed) == ST_OK);
+  ASSERT(typed.count == ST_MAX_CMD_TOKENS / 2 + 1);
+  st_free_token_array(&typed);
   return 1;
 }
 
@@ -968,6 +998,8 @@ static int test_netpattern_cpl_contract(void) {
       {"echo \"\\u00a2\" \"\\u20ac\" \"\\ud83d\\ude00\"", "echo ¢ € 😀"},
       {"echo \"quote: \\\" slash: \\\\\"", "echo \"quote: \\\" slash: \\\\\""},
       {"echo \"#unknown\" \"#CRC16:\"", "echo \"#unknown\" \"#CRC16:\""},
+      {"dd bs={#size.MiB}", "dd bs={#size.MiB}"},
+      {"echo \"{literal}\"", "echo \"{literal}\""},
       {"id #uuid.4", "id #uuid.v4"},
   };
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
@@ -984,6 +1016,97 @@ static int test_netpattern_cpl_contract(void) {
     free(rendered);
     free(netpattern);
   }
+
+  char *compare_a = NULL, *compare_b = NULL, *compare_typed = NULL;
+  char *compare_literal_star = NULL;
+  ASSERT(st_netpattern_from_cpl("a", &compare_a) == ST_OK);
+  ASSERT(st_netpattern_from_cpl("bb", &compare_b) == ST_OK);
+  ASSERT(st_netpattern_from_cpl("*", &compare_typed) == ST_OK);
+  ASSERT(st_netpattern_from_cpl("\"*\"", &compare_literal_star) == ST_OK);
+  ASSERT(st_netpattern_compare(NULL, NULL) == 0);
+  ASSERT(st_netpattern_compare(compare_a, NULL) > 0);
+  ASSERT(st_netpattern_compare(NULL, compare_a) < 0);
+  ASSERT(st_netpattern_compare(compare_a, compare_a) == 0);
+  ASSERT(st_netpattern_compare(compare_a, compare_b) < 0);
+  ASSERT(st_netpattern_compare(compare_b, compare_a) > 0);
+  ASSERT(st_netpattern_compare(compare_literal_star, compare_typed) < 0);
+  ASSERT(st_netpattern_compare("malformed-a", "malformed-b") < 0);
+  free(compare_literal_star);
+  free(compare_typed);
+  free(compare_b);
+  free(compare_a);
+  char *compound = NULL;
+  char *widened = NULL;
+  char *widened_cpl = NULL;
+  ASSERT(st_netpattern_from_cpl("dd bs={#size.MiB}", &compound) == ST_OK);
+  ASSERT(st_netpattern_apply_type_at(compound, 1, ST_TYPE_ANY, &widened) ==
+         ST_OK);
+  ASSERT(st_netpattern_to_cpl(widened, &widened_cpl) == ST_OK);
+  ASSERT(strcmp(widened_cpl, "dd bs={*}") == 0);
+  free(widened_cpl);
+  free(widened);
+  free(compound);
+
+  st_token_t compound_token = {
+      .text = "pre{#path}.log",
+      .type = ST_TYPE_LITERAL,
+      .compound = true,
+      .capture_type = ST_TYPE_PATH,
+      .prefix = "pre",
+      .capture = "#path",
+      .suffix = ".log",
+  };
+  st_token_t invalid_compound_token = compound_token;
+  invalid_compound_token.prefix = NULL;
+  ASSERT(st_netpattern_encode(&invalid_compound_token, 1, &roundtrip) ==
+         ST_ERR_INVALID);
+  invalid_compound_token = compound_token;
+  invalid_compound_token.capture = NULL;
+  ASSERT(st_netpattern_encode(&invalid_compound_token, 1, &roundtrip) ==
+         ST_ERR_INVALID);
+  invalid_compound_token = compound_token;
+  invalid_compound_token.suffix = NULL;
+  ASSERT(st_netpattern_encode(&invalid_compound_token, 1, &roundtrip) ==
+         ST_ERR_INVALID);
+  invalid_compound_token = compound_token;
+  invalid_compound_token.capture_type = ST_TYPE_LITERAL;
+  ASSERT(st_netpattern_encode(&invalid_compound_token, 1, &roundtrip) ==
+         ST_ERR_INVALID);
+  invalid_compound_token = compound_token;
+  invalid_compound_token.capture_type = ST_TYPE_COUNT;
+  ASSERT(st_netpattern_encode(&invalid_compound_token, 1, &roundtrip) ==
+         ST_ERR_INVALID);
+  invalid_compound_token = compound_token;
+  invalid_compound_token.prefix = "";
+  invalid_compound_token.suffix = "";
+  ASSERT(st_netpattern_encode(&invalid_compound_token, 1, &roundtrip) ==
+         ST_ERR_INVALID);
+  invalid_compound_token = compound_token;
+  invalid_compound_token.capture_type = ST_TYPE_NUMBER;
+  ASSERT(st_netpattern_encode(&invalid_compound_token, 1, &roundtrip) ==
+         ST_ERR_FORMAT);
+
+  for (size_t fail_at = 1; fail_at <= 8; fail_at++) {
+    char *failed = (char *)1;
+    st_test_alloc_fail_at(fail_at);
+    st_error_t error = st_netpattern_encode(&compound_token, 1, &failed);
+    st_test_alloc_reset();
+    ASSERT(error == ST_ERR_MEMORY || error == ST_OK);
+    if (error == ST_ERR_MEMORY)
+      ASSERT(failed == NULL);
+    free(failed);
+  }
+
+  st_token_t spaced_affix = compound_token;
+  spaced_affix.prefix = "bad prefix";
+  ASSERT(st_netpattern_encode(&spaced_affix, 1, &roundtrip) == ST_OK);
+  ASSERT(st_netpattern_to_cpl(roundtrip, &widened_cpl) == ST_ERR_INVALID);
+  free(roundtrip);
+  spaced_affix = compound_token;
+  spaced_affix.suffix = "bad suffix";
+  ASSERT(st_netpattern_encode(&spaced_affix, 1, &roundtrip) == ST_OK);
+  ASSERT(st_netpattern_to_cpl(roundtrip, &widened_cpl) == ST_ERR_INVALID);
+  free(roundtrip);
   static const char *const invalid[] = {
       NULL,
       "",
@@ -1002,6 +1125,9 @@ static int test_netpattern_cpl_contract(void) {
       "echo \\\\value",
       "echo bare\\value",
       "echo bare\"value",
+      "dd {#path}",
+      "dd pre{#path}{#n}",
+      "dd pre{#unknown}",
       "echo \"line\nfeed\"",
       "echo bare\tvalue",
   };
@@ -1029,6 +1155,53 @@ static int test_netpattern_cpl_contract(void) {
   ASSERT(st_netpattern_decode("9:01:L,1:x,,", &decoded) == ST_ERR_FORMAT);
   ASSERT(st_netpattern_decode("9:1:L,01:x,,", &decoded) == ST_ERR_FORMAT);
   ASSERT(st_netpattern_decode("9:1:T,1:*, ,", &decoded) == ST_ERR_FORMAT);
+
+  static const struct {
+    const char *tags;
+    const char *values[4];
+  } invalid_compounds[] = {
+      {"L", {"prefix"}},
+      {"LL", {"prefix", "suffix"}},
+      {"TT", {"*", "#n"}},
+      {"LT", {"", "*"}},
+      {"LT", {"prefix", "#unknown"}},
+      {"LTT", {"prefix", "*", "#n"}},
+      {"TLT", {"*", "suffix", "#n"}},
+      {"LTLT", {"prefix", "*", "suffix", "#n"}},
+      {"XT", {"prefix", "*"}},
+  };
+  for (size_t i = 0;
+       i < sizeof(invalid_compounds) / sizeof(invalid_compounds[0]); i++) {
+    char *malformed = test_compound_pattern(invalid_compounds[i].tags,
+                                            invalid_compounds[i].values,
+                                            strlen(invalid_compounds[i].tags));
+    ASSERT(malformed != NULL);
+    decoded.tokens = (st_token_t *)1;
+    decoded.count = 99;
+    ASSERT(st_netpattern_decode(malformed, &decoded) == ST_ERR_FORMAT);
+    ASSERT(decoded.tokens == NULL && decoded.count == 0);
+    free(malformed);
+  }
+
+  static const struct {
+    const char *tags;
+    const char *values[3];
+  } valid_compounds[] = {
+      {"LT", {"prefix", "*"}},
+      {"TL", {"#n", "suffix"}},
+      {"LTL", {"pre", "#path", ".log"}},
+  };
+  for (size_t i = 0; i < sizeof(valid_compounds) / sizeof(valid_compounds[0]);
+       i++) {
+    char *nested = test_compound_pattern(valid_compounds[i].tags,
+                                         valid_compounds[i].values,
+                                         strlen(valid_compounds[i].tags));
+    ASSERT(nested != NULL);
+    ASSERT(st_netpattern_decode(nested, &decoded) == ST_OK);
+    ASSERT(decoded.count == 1 && decoded.tokens[0].compound);
+    st_free_token_array(&decoded);
+    free(nested);
+  }
   ASSERT(st_netpattern_to_cpl(NULL, &roundtrip) == ST_ERR_INVALID);
   ASSERT(st_netpattern_to_cpl("x", &roundtrip) == ST_ERR_FORMAT);
 

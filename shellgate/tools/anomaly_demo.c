@@ -27,12 +27,14 @@
  */
 
 #include <ctype.h>
+#include <math.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "sg_anomaly.h"
+#include "shell_processor.h"
 
 #define MAX_LINE 4096
 
@@ -72,24 +74,6 @@ static char *trim(char *s) {
     end--;
   end[1] = '\0';
   return s;
-}
-
-/* Simple tokenizer: split command into tokens for anomaly update */
-static size_t tokenize(const char *line, const char **tokens,
-                       size_t max_tokens) {
-  size_t count = 0;
-  static char buf[MAX_LINE];
-
-  strncpy(buf, line, sizeof(buf) - 1);
-  buf[sizeof(buf) - 1] = '\0';
-
-  char *saveptr;
-  char *token = strtok_r(buf, " \t\r\n", &saveptr);
-  while (token && count < max_tokens) {
-    tokens[count++] = token;
-    token = strtok_r(NULL, " \t\r\n", &saveptr);
-  }
-  return count;
 }
 
 int main(int argc, char **argv) {
@@ -193,17 +177,29 @@ int main(int argc, char **argv) {
     printf("Enter commands (Ctrl+D to exit):\n");
 
     char line[MAX_LINE];
-    const char *tokens[256];
-
     while (fgets(line, sizeof(line), stdin)) {
       char *cmd = trim(line);
       if (!*cmd)
         continue;
 
-      size_t count = tokenize(cmd, tokens, 256);
+      size_t count = 0;
+      char *netseq = NULL;
+      if (shell_build_command_netseq(cmd, NULL, &netseq, &count) !=
+              SHELL_PROCESS_OK ||
+          !netseq) {
+        fprintf(stderr, "Could not parse command sequence\n");
+        continue;
+      }
 
       /* Score the command sequence */
-      double score = sg_anomaly_score(model, tokens, count);
+      double score = INFINITY;
+      sg_anomaly_status_t score_status =
+          sg_anomaly_score_netseq(model, netseq, strlen(netseq), &score);
+      if (score_status != SG_ANOMALY_OK) {
+        free(netseq);
+        fprintf(stderr, "Could not score command sequence\n");
+        continue;
+      }
 
       /* Adjust for short sequences */
       if (count < 3) {
@@ -216,12 +212,13 @@ int main(int argc, char **argv) {
       /* Update model if in learning mode */
       if (learning && count > 0) {
         if (!detected) {
-          sg_anomaly_update(model, tokens, count);
-          updated = true;
+          updated = sg_anomaly_update_netseq(model, netseq, strlen(netseq)) ==
+                    SG_ANOMALY_OK;
         }
       }
 
       print_result(cmd, score, detected, updated);
+      free(netseq);
     }
   }
 

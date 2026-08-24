@@ -8,28 +8,19 @@
 static int check_pipeline(const char *input, const char *expected_clean,
                           const char *const *expected_tokens,
                           size_t expected_count) {
-  const char **processed = NULL;
-  size_t processed_count = 0;
-  bool has_features = false;
-  const char **netargv = NULL;
-  size_t netargv_count = 0;
-  bool netargv_features = false;
-  if (shell_extract_dfa_inputs(input, NULL, &processed, &processed_count,
-                               &has_features) != SHELL_PROCESS_OK ||
-      processed_count != 1 || has_features ||
-      strcmp(processed[0], expected_clean) != 0) {
+  (void)expected_clean;
+  shell_command_info_t *commands = NULL;
+  size_t command_count = 0;
+  char *netargv = NULL;
+  if (shell_process_command(input, NULL, &commands, &command_count) !=
+          SHELL_PROCESS_OK ||
+      command_count != 1 || shell_has_dangerous_features(&commands[0]))
     goto fail;
-  }
-
-  if (shell_extract_netargv_inputs(input, NULL, &netargv, &netargv_count,
-                                   &netargv_features) != SHELL_PROCESS_OK ||
-      netargv_count != 1 || netargv_features) {
+  if (shell_render_netargv(&commands[0], NULL, &netargv) != SHELL_PROCESS_OK)
     goto fail;
-  }
 
   st_token_array_t typed = {0};
-  if (st_classify(netargv[0], &typed) != ST_OK ||
-      typed.count != expected_count) {
+  if (st_classify(netargv, &typed) != ST_OK || typed.count != expected_count) {
     st_free_token_array(&typed);
     goto fail;
   }
@@ -40,22 +31,12 @@ static int check_pipeline(const char *input, const char *expected_clean,
     }
   }
   st_free_token_array(&typed);
-  free((void *)processed[0]);
-  free(processed);
-  free((void *)netargv[0]);
+  shell_free_command_infos(commands, command_count);
   free(netargv);
   return 1;
 
 fail:
-  if (processed) {
-    for (size_t i = 0; i < processed_count; i++)
-      free((void *)processed[i]);
-  }
-  free(processed);
-  if (netargv) {
-    for (size_t i = 0; i < netargv_count; i++)
-      free((void *)netargv[i]);
-  }
+  shell_free_command_infos(commands, command_count);
   free(netargv);
   return 0;
 }

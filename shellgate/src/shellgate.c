@@ -10,6 +10,7 @@
 #include "sg_io.h"
 #include "shell_abstract.h"
 #include "shell_depgraph.h"
+#include "shell_netstring.h"
 #include "shell_processor.h"
 #include "shell_tokenizer.h"
 #include "shelltype.h"
@@ -117,6 +118,7 @@ typedef struct {
   char *key;   /* command string (owned) */
   char *value; /* type sequence string (owned) */
   size_t key_len;
+  size_t value_count;
 } lru_entry_t;
 
 typedef struct {
@@ -143,8 +145,8 @@ static void type_cache_free(type_cache_t *c) {
 }
 
 static void cdf_free(sg_gate_t *gate);
-static char *type_cache_lookup(type_cache_t *c, const char *key,
-                               size_t key_len) {
+static char *type_cache_lookup(type_cache_t *c, const char *key, size_t key_len,
+                               size_t *value_count) {
   if (!c->entries || c->count == 0)
     return NULL;
   for (size_t i = 0; i < c->count; i++) {
@@ -156,6 +158,7 @@ static char *type_cache_lookup(type_cache_t *c, const char *key,
                 (c->count - i - 1) * sizeof(lru_entry_t));
         c->entries[c->count - 1] = tmp;
       }
+      *value_count = c->entries[c->count - 1].value_count;
       return c->entries[c->count - 1].value;
     }
   }
@@ -166,7 +169,7 @@ static char *type_cache_lookup(type_cache_t *c, const char *key,
  * Takes ownership of value on success; caller must NOT free it.
  * Returns true on success, false on allocation failure. */
 static bool type_cache_insert(type_cache_t *c, const char *key, size_t key_len,
-                              char *value) {
+                              char *value, size_t value_count) {
   if (c->capacity == 0)
     return false;
 
@@ -187,6 +190,7 @@ static bool type_cache_insert(type_cache_t *c, const char *key, size_t key_len,
   c->entries[c->count].key = key_copy;
   c->entries[c->count].key_len = key_len;
   c->entries[c->count].value = value;
+  c->entries[c->count].value_count = value_count;
   c->count++;
   return true;
 }
@@ -204,10 +208,10 @@ struct sg_gate {
   bool suggestions;
   bool strict_mode;
 
-  sg_expand_var_fn expand_var_fn;
-  void *expand_var_ctx;
-  sg_expand_glob_fn expand_glob_fn;
-  void *expand_glob_ctx;
+  sg_expand_netargv_fn expand_var_netargv_fn;
+  void *expand_var_netargv_ctx;
+  sg_expand_netargv_fn expand_glob_netargv_fn;
+  void *expand_glob_netargv_ctx;
 
   bool viol_enabled;
   sg_violation_config_t viol_config;
@@ -340,21 +344,23 @@ sg_error_t sg_gate_set_suggestions(sg_gate_t *gate, bool enabled) {
   return SG_OK;
 }
 
-sg_error_t sg_gate_set_expand_var(sg_gate_t *gate, sg_expand_var_fn fn,
-                                  void *user_ctx) {
+sg_error_t sg_gate_set_expand_var_netargv(sg_gate_t *gate,
+                                          sg_expand_netargv_fn fn,
+                                          void *user_ctx) {
   if (!gate)
     return SG_ERR_INVALID;
-  gate->expand_var_fn = fn;
-  gate->expand_var_ctx = user_ctx;
+  gate->expand_var_netargv_fn = fn;
+  gate->expand_var_netargv_ctx = user_ctx;
   return SG_OK;
 }
 
-sg_error_t sg_gate_set_expand_glob(sg_gate_t *gate, sg_expand_glob_fn fn,
-                                   void *user_ctx) {
+sg_error_t sg_gate_set_expand_glob_netargv(sg_gate_t *gate,
+                                           sg_expand_netargv_fn fn,
+                                           void *user_ctx) {
   if (!gate)
     return SG_ERR_INVALID;
-  gate->expand_glob_fn = fn;
-  gate->expand_glob_ctx = user_ctx;
+  gate->expand_glob_netargv_fn = fn;
+  gate->expand_glob_netargv_ctx = user_ctx;
   return SG_OK;
 }
 
@@ -688,6 +694,79 @@ static bool cdf_ready(const sg_gate_t *gate) {
          gate->cdf_type_count >= min_samples;
 }
 
+static void combine_anomaly_scores(const sg_gate_t *gate, double raw_score,
+                                   double type_score, double *combined) {
+  if (gate->anomaly_combine_mode == SG_ANOMALY_COMBINE_BAYESIAN &&
+      cdf_ready(gate)) {
+    *combined =
+        cdf_log_odds(gate->cdf_raw_hist, gate->cdf_raw_count, raw_score) +
+        cdf_log_odds(gate->cdf_type_hist, gate->cdf_type_count, type_score);
+    return;
+  }
+  *combined = 0.0;
+  if (gate->anomaly_weight_raw > 0.0) {
+    if (!isfinite(raw_score)) {
+      *combined = INFINITY;
+      return;
+    }
+    *combined += raw_score * gate->anomaly_weight_raw;
+  }
+  if (gate->anomaly_weight_type > 0.0) {
+    if (!isfinite(type_score)) {
+      *combined = INFINITY;
+      return;
+    }
+    *combined += type_score * gate->anomaly_weight_type;
+  }
+}
+
+sg_error_t sg_gate_score_anomaly_netseq(const sg_gate_t *gate,
+                                        const char *raw_netseq,
+                                        size_t raw_length,
+                                        const char *type_netseq,
+                                        size_t type_length,
+                                        sg_anomaly_sequence_score_t *out) {
+  if (out)
+    *out =
+        (sg_anomaly_sequence_score_t){INFINITY, INFINITY, INFINITY, false, 0};
+  if (!gate || !raw_netseq || !type_netseq || !out)
+    return SG_ERR_INVALID;
+  if (!gate->anomaly_enabled || !gate->anomaly_model ||
+      !gate->anomaly_model_type)
+    return SG_ERR_INVALID;
+  size_t raw_count = 0, type_count = 0;
+  if (sg_anomaly_netseq_count(raw_netseq, raw_length, false, &raw_count) !=
+          SG_ANOMALY_OK ||
+      sg_anomaly_netseq_count(type_netseq, type_length, false, &type_count) !=
+          SG_ANOMALY_OK ||
+      raw_count != type_count)
+    return SG_ERR_PARSE;
+  sg_anomaly_status_t raw_status = sg_anomaly_score_netseq(
+      gate->anomaly_model, raw_netseq, raw_length, &out->raw_score);
+  sg_anomaly_status_t type_status = sg_anomaly_score_netseq(
+      gate->anomaly_model_type, type_netseq, type_length, &out->type_score);
+  if (raw_status == SG_ANOMALY_ERR_MEMORY ||
+      type_status == SG_ANOMALY_ERR_MEMORY)
+    return SG_ERR_MEMORY;
+  if (raw_status != SG_ANOMALY_OK || type_status != SG_ANOMALY_OK)
+    return SG_ERR_PARSE;
+  out->command_count = raw_count;
+  if (raw_count < 3) {
+    out->combined_score = 0.0;
+    out->raw_score = 0.0;
+    out->type_score = 0.0;
+    return SG_OK;
+  }
+  combine_anomaly_scores(gate, out->raw_score, out->type_score,
+                         &out->combined_score);
+  double threshold = gate->anomaly_threshold;
+  if (gate->anomaly_adaptive && !gate->anomaly_adaptive_armed)
+    threshold = gate->anomaly_fixed_threshold;
+  out->detected =
+      isfinite(out->combined_score) && out->combined_score > threshold;
+  return SG_OK;
+}
+
 sg_error_t sg_gate_set_anomaly_combine_mode(sg_gate_t *gate,
                                             sg_anomaly_combine_mode_t mode) {
   if (!gate)
@@ -714,7 +793,7 @@ sg_error_t sg_gate_set_anomaly_combine_mode(sg_gate_t *gate,
 
 #define SG_BUNDLE_HEADER_SIZE 32U
 static const unsigned char sg_bundle_magic[8] = {'S', 'G', 'A', 'B',
-                                                 'N', 'D', 'L', '1'};
+                                                 'N', 'D', 'L', '2'};
 
 static void store_u64_le(unsigned char *dst, uint64_t value) {
   for (unsigned i = 0; i < 8; i++)
@@ -730,6 +809,10 @@ static uint64_t load_u64_le(const unsigned char *src) {
 
 static sg_error_t errno_to_gate_error(void) {
   return errno == ENOMEM ? SG_ERR_MEMORY : SG_ERR_IO;
+}
+
+static sg_error_t process_status_to_gate_error(shell_process_status_t status) {
+  return status == SHELL_PROCESS_ENOMEM ? SG_ERR_MEMORY : SG_ERR_PARSE;
 }
 
 static int stream_size(FILE *stream, uint64_t *size) {
@@ -1198,13 +1281,22 @@ static bool has_glob_chars(const char *tok, size_t len) {
 #define SG_EXPAND_BUF 4096
 #define SG_GLOB_PATTERN_BUF 256
 
-static bool append_netarg(char **encoded, size_t *length, size_t *capacity,
-                          const char *text, size_t text_length) {
-  int prefix = snprintf(NULL, 0, "%zu:", text_length);
-  if (prefix < 0 || text_length > SIZE_MAX - (size_t)prefix - 2 ||
-      *length > SIZE_MAX - text_length - (size_t)prefix - 2)
+static bool reserve_netarg_payload(char **encoded, size_t *length,
+                                   size_t *capacity, size_t payload_length,
+                                   char **payload, size_t *encoded_length,
+                                   bool *allocation_failed) {
+  if (!payload || !encoded_length)
     return false;
-  size_t needed = *length + (size_t)prefix + text_length + 2;
+  *payload = NULL;
+  *encoded_length = 0;
+  if (allocation_failed)
+    *allocation_failed = false;
+  size_t record_length = 0;
+  if (shell_netstring_encoded_length(payload_length, &record_length) !=
+          SHELL_NETSTRING_OK ||
+      *length > SIZE_MAX - record_length)
+    return false;
+  size_t needed = *length + record_length + 1;
   if (needed > *capacity) {
     size_t grown = *capacity ? *capacity : 64;
     while (grown < needed) {
@@ -1215,23 +1307,114 @@ static bool append_netarg(char **encoded, size_t *length, size_t *capacity,
       grown *= 2;
     }
     char *replacement = realloc(*encoded, grown);
-    if (!replacement)
+    if (!replacement) {
+      if (allocation_failed)
+        *allocation_failed = true;
       return false;
+    }
     *encoded = replacement;
     *capacity = grown;
   }
-  int written = sprintf(*encoded + *length, "%zu:", text_length);
-  *length += (size_t)written;
-  memcpy(*encoded + *length, text, text_length);
-  *length += text_length;
-  (*encoded)[(*length)++] = ',';
+  size_t prefix_length = 0;
+  if (shell_netstring_write_prefix(*encoded + *length, *capacity - *length,
+                                   payload_length,
+                                   &prefix_length) != SHELL_NETSTRING_OK ||
+      prefix_length >= record_length)
+    return false;
+  *payload = *encoded + *length + prefix_length;
+  *encoded_length = record_length;
+  return true;
+}
+
+static bool append_decoded_netarg(char **encoded, size_t *length,
+                                  size_t *capacity, const char *text,
+                                  size_t text_length, bool *allocation_failed) {
+  size_t decoded_length = 0;
+  if (shell_measure_decoded_word(text, text_length, &decoded_length) !=
+      SHELL_PROCESS_OK)
+    return false;
+  char *payload = NULL;
+  size_t record_length = 0;
+  if (!reserve_netarg_payload(encoded, length, capacity, decoded_length,
+                              &payload, &record_length, allocation_failed))
+    return false;
+  size_t written = 0;
+  if (shell_write_decoded_word(text, text_length, payload, decoded_length,
+                               &written) != SHELL_PROCESS_OK ||
+      written != decoded_length)
+    return false;
+  payload[decoded_length] = ',';
+  *length += record_length;
   (*encoded)[*length] = '\0';
+  return true;
+}
+
+static bool append_encoded_netargv(char **encoded, size_t *length,
+                                   size_t *capacity, const char *addition,
+                                   size_t addition_length,
+                                   bool *allocation_failed) {
+  if (allocation_failed)
+    *allocation_failed = false;
+  if (addition_length > SIZE_MAX - *length - 1)
+    return false;
+  size_t needed = *length + addition_length + 1;
+  if (needed > *capacity) {
+    size_t grown = *capacity ? *capacity : 64;
+    while (grown < needed) {
+      if (grown > SIZE_MAX / 2) {
+        grown = needed;
+        break;
+      }
+      grown *= 2;
+    }
+    char *replacement = realloc(*encoded, grown);
+    if (!replacement) {
+      if (allocation_failed)
+        *allocation_failed = true;
+      return false;
+    }
+    *encoded = replacement;
+    *capacity = grown;
+  }
+  memcpy(*encoded + *length, addition, addition_length);
+  *length += addition_length;
+  (*encoded)[*length] = '\0';
+  return true;
+}
+
+static bool render_expansion_netargv(const char *encoded, size_t length,
+                                     char *display, size_t display_size) {
+  shell_netstring_iter_t iter;
+  if (shell_netstring_iter_init(&iter, encoded, length) != SHELL_NETSTRING_OK)
+    return false;
+  size_t used = 0, count = 0;
+  shell_netstring_view_t view;
+  shell_netstring_status_t status;
+  while ((status = shell_netstring_iter_next(&iter, &view)) ==
+         SHELL_NETSTRING_OK) {
+    if (count && used + 1 >= display_size)
+      return false;
+    if (count)
+      display[used++] = ' ';
+    if (view.payload_length >= display_size - used ||
+        memchr(view.payload, '\0', view.payload_length) != NULL)
+      return false;
+    memcpy(display + used, view.payload, view.payload_length);
+    used += view.payload_length;
+    count++;
+  }
+  if (status != SHELL_NETSTRING_DONE)
+    return false;
+  if (used >= display_size)
+    return false;
+  display[used] = '\0';
   return true;
 }
 
 static const char *build_cmd_string(const shell_dep_cmd_t *cmd,
                                     buf_writer_t *bw, const sg_gate_t *gate,
-                                    char **netargv) {
+                                    char **netargv, sg_error_t *build_error) {
+  *build_error = SG_OK;
   /*
    * Reconstructs the command by joining tokens with spaces.
    * Tokens are copied as-is — no additional quoting is applied.
@@ -1258,6 +1441,7 @@ static const char *build_cmd_string(const shell_dep_cmd_t *cmd,
   size_t pos = 0;
 
   char exp_buf[SG_EXPAND_BUF];
+  char expansion_display[SG_EXPAND_BUF];
 
   for (uint32_t i = 0; i < cmd->token_count; i++) {
     if (i > 0 && pos < avail)
@@ -1266,27 +1450,37 @@ static const char *build_cmd_string(const shell_dep_cmd_t *cmd,
     const char *text = cmd->tokens[i];
     size_t text_len = cmd->token_lens[i];
     bool expanded = false;
+    size_t encoded_expansion_length = 0;
 
     /* Try variable expansion */
-    if (gate->expand_var_fn) {
+    if (gate->expand_var_netargv_fn) {
       char var_name[128];
       if (extract_var_name(text, text_len, var_name, sizeof(var_name))) {
-        size_t elen = gate->expand_var_fn(var_name, exp_buf, sizeof(exp_buf),
-                                          gate->expand_var_ctx);
-        if (elen > 0) {
-          if (elen >= sizeof(exp_buf)) {
-            bw->overflow = true;
-            return NULL;
-          }
-          text = exp_buf;
-          text_len = elen;
+        memset(exp_buf, 0, sizeof(exp_buf));
+        size_t elen = 0;
+        sg_expand_status_t status =
+            gate->expand_var_netargv_fn(var_name, exp_buf, sizeof(exp_buf),
+                                        &elen, gate->expand_var_netargv_ctx);
+        if ((status != SG_EXPAND_UNRESOLVED && status != SG_EXPAND_RESOLVED) ||
+            elen >= sizeof(exp_buf) ||
+            (status == SG_EXPAND_RESOLVED &&
+             (exp_buf[elen] != '\0' ||
+              !render_expansion_netargv(exp_buf, elen, expansion_display,
+                                        sizeof(expansion_display))))) {
+          *build_error = SG_ERR_EXPAND;
+          return NULL;
+        }
+        if (status == SG_EXPAND_RESOLVED) {
+          text = expansion_display;
+          text_len = strlen(expansion_display);
+          encoded_expansion_length = elen;
           expanded = true;
         }
       }
     }
 
     /* Try glob expansion (only if variable expansion didn't fire) */
-    if (!expanded && gate->expand_glob_fn) {
+    if (!expanded && gate->expand_glob_netargv_fn) {
       if (has_glob_chars(text, text_len)) {
         if (text_len >= SG_GLOB_PATTERN_BUF) {
           bw->overflow = true;
@@ -1297,49 +1491,51 @@ static const char *build_cmd_string(const shell_dep_cmd_t *cmd,
         memcpy(pattern, text, plen);
         pattern[plen] = '\0';
 
-        size_t elen = gate->expand_glob_fn(pattern, exp_buf, sizeof(exp_buf),
-                                           gate->expand_glob_ctx);
-        if (elen > 0) {
-          if (elen >= sizeof(exp_buf)) {
-            bw->overflow = true;
-            return NULL;
-          }
-          text = exp_buf;
-          text_len = elen;
+        memset(exp_buf, 0, sizeof(exp_buf));
+        size_t elen = 0;
+        sg_expand_status_t status =
+            gate->expand_glob_netargv_fn(pattern, exp_buf, sizeof(exp_buf),
+                                         &elen, gate->expand_glob_netargv_ctx);
+        if ((status != SG_EXPAND_UNRESOLVED && status != SG_EXPAND_RESOLVED) ||
+            elen >= sizeof(exp_buf) ||
+            (status == SG_EXPAND_RESOLVED &&
+             (exp_buf[elen] != '\0' ||
+              !render_expansion_netargv(exp_buf, elen, expansion_display,
+                                        sizeof(expansion_display))))) {
+          *build_error = SG_ERR_EXPAND;
+          return NULL;
+        }
+        if (status == SG_EXPAND_RESOLVED) {
+          text = expansion_display;
+          text_len = strlen(expansion_display);
+          encoded_expansion_length = elen;
           expanded = true;
         }
       }
     }
 
-    char *decoded = NULL;
-    size_t decoded_length = 0;
-    const char *policy_text = text;
-    size_t policy_length = text_len;
-    if (!expanded) {
-      if (shell_decode_word(text, text_len, &decoded, &decoded_length) !=
-          SHELL_PROCESS_OK) {
-        free(*netargv);
-        *netargv = NULL;
+    if (expanded && memchr(text, '\0', text_len) != NULL) {
+      free(*netargv);
+      *netargv = NULL;
+      bw->overflow = true;
+      return NULL;
+    }
+    bool allocation_failed = false;
+    bool appended =
+        !expanded ? append_decoded_netarg(netargv, &net_length, &net_capacity,
+                                          text, text_len, &allocation_failed)
+                  : append_encoded_netargv(netargv, &net_length, &net_capacity,
+                                           exp_buf, encoded_expansion_length,
+                                           &allocation_failed);
+    if (!appended) {
+      free(*netargv);
+      *netargv = NULL;
+      if (allocation_failed)
+        *build_error = SG_ERR_MEMORY;
+      else
         bw->overflow = true;
-        return NULL;
-      }
-      policy_text = decoded;
-      policy_length = decoded_length;
-    } else if (memchr(text, '\0', text_len) != NULL) {
-      free(*netargv);
-      *netargv = NULL;
-      bw->overflow = true;
       return NULL;
     }
-    if (!append_netarg(netargv, &net_length, &net_capacity, policy_text,
-                       policy_length)) {
-      free(decoded);
-      free(*netargv);
-      *netargv = NULL;
-      bw->overflow = true;
-      return NULL;
-    }
-    free(decoded);
 
     if (pos + text_len >= avail) {
       size_t writable = avail > pos + 1 ? avail - pos - 1 : 0;
@@ -1354,6 +1550,13 @@ static const char *build_cmd_string(const shell_dep_cmd_t *cmd,
   }
   bw->base[start + pos] = '\0';
   bw->used = start + pos + 1;
+  if (!*netargv) {
+    *netargv = strdup("");
+    if (!*netargv) {
+      bw->overflow = true;
+      return NULL;
+    }
+  }
   return bw->base + start;
 }
 
@@ -2575,115 +2778,82 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len, char *buf,
 
   /* Extract command sequence from graph (used for anomaly detection and
    * learning) */
-  const char *cmd_seq[SHELL_DEP_MAX_NODES];
   size_t cmd_count = 0;
   for (uint32_t ni = 0; ni < graph.node_count; ni++) {
     const shell_dep_node_t *node = &graph.nodes[ni];
-    if (node->type == SHELL_NODE_CMD && node->cmd.token_count > 0)
-      cmd_seq[cmd_count++] = node->cmd.tokens[0];
+    if (node->type == SHELL_NODE_CMD && node->cmd.token_count > 0) {
+      cmd_count++;
+    }
   }
 
-  /* Build type sequence tokens for hybrid anomaly detection.
-   * Uses shell_build_type_sequence on the full command. An LRU cache
-   * avoids recomputation for repeated commands. The cache stores immutable
-   * copies; strtok_r tokenization operates on a mutable working copy. */
+  /* Build one nested canonical type signature per isolated command. */
   char *type_seq_buf = NULL;
-  const char *type_seq[SHELL_DEP_MAX_NODES];
   size_t type_count = 0;
+  size_t anomaly_count = 0;
 
   if (gate->anomaly_enabled && gate->anomaly_model_type && cmd_count > 0) {
+    shell_process_status_t type_status = SHELL_PROCESS_OK;
     const char *cached =
-        type_cache_lookup(&gate->anomaly_type_cache, cmd, cmd_len);
+        type_cache_lookup(&gate->anomaly_type_cache, cmd, cmd_len, &type_count);
     if (cached) {
       type_seq_buf = strdup(cached);
-      /* Cache storage is only an optimization. If copying a hit fails, retry
-       * the authoritative builder instead of silently dropping the type
-       * anomaly signal. */
       if (!type_seq_buf)
-        type_seq_buf = shell_build_type_sequence(cmd);
+        type_status =
+            shell_build_type_netseq(cmd, NULL, &type_seq_buf, &type_count);
     } else {
-      char *raw = shell_build_type_sequence(cmd);
-      if (raw) {
-        /* Store immutable copy in cache before strtok_r mutates */
+      char *raw = NULL;
+      type_status = shell_build_type_netseq(cmd, NULL, &raw, &type_count);
+      if (type_status == SHELL_PROCESS_OK) {
         if (gate->anomaly_type_cache.capacity > 0) {
           char *for_cache = strdup(raw);
           if (for_cache) {
             if (!type_cache_insert(&gate->anomaly_type_cache, cmd, cmd_len,
-                                   for_cache))
+                                   for_cache, type_count))
               free(for_cache);
           }
         }
         type_seq_buf = raw;
       }
     }
-    if (type_seq_buf) {
-      char *saveptr = NULL;
-      char *tok = strtok_r(type_seq_buf, " ", &saveptr);
-      while (tok && type_count < SHELL_DEP_MAX_NODES) {
-        type_seq[type_count++] = tok;
-        tok = strtok_r(NULL, " ", &saveptr);
-      }
+    if (type_status != SHELL_PROCESS_OK || !type_seq_buf) {
+      free(type_seq_buf);
+      out->verdict = SG_VERDICT_UNDETERMINED;
+      if (type_status == SHELL_PROCESS_OK)
+        return SG_ERR_MEMORY;
+      return process_status_to_gate_error(type_status);
     }
   }
 
   /* Anomaly detection: score the command sequence with hybrid model */
   if (gate->anomaly_enabled && gate->anomaly_model && cmd_count > 0) {
-    double score_raw =
-        sg_anomaly_score(gate->anomaly_model, cmd_seq, cmd_count);
-    /* The type sequence is built by a different parser than cmd_seq, so it can
-     * be shorter than 3 even when cmd_count is not. sg_anomaly_score reports
-     * INFINITY below that length, which would poison the combined score and
-     * silently suppress detection, so treat a too-short type sequence as no
-     * type signal. */
-    double score_type =
-        (gate->anomaly_model_type && type_count >= 3)
-            ? sg_anomaly_score(gate->anomaly_model_type, type_seq, type_count)
-            : 0.0;
-
-    out->anomaly_score_raw = score_raw;
-    out->anomaly_score_type = score_type;
-
-    if (cmd_count < 3) {
-      out->anomaly_score = 0.0;
-      out->anomaly_score_raw = 0.0;
-      out->anomaly_score_type = 0.0;
-      out->anomaly_detected = false;
-    } else {
-      if (gate->anomaly_combine_mode == SG_ANOMALY_COMBINE_BAYESIAN &&
-          cdf_ready(gate)) {
-        /* Bayesian: log-odds from empirical CDF per model */
-        double lr_raw =
-            cdf_log_odds(gate->cdf_raw_hist, gate->cdf_raw_count, score_raw);
-        double lr_type =
-            cdf_log_odds(gate->cdf_type_hist, gate->cdf_type_count, score_type);
-        out->anomaly_score = lr_raw + lr_type;
-      } else {
-        /* Weighted sum in bit-space (default, or fallback) */
-        out->anomaly_score = 0.0;
-        if (gate->anomaly_weight_raw > 0.0) {
-          if (!isfinite(score_raw))
-            out->anomaly_score = INFINITY;
-          else
-            out->anomaly_score += score_raw * gate->anomaly_weight_raw;
-        }
-        if (gate->anomaly_weight_type > 0.0) {
-          if (!isfinite(score_type))
-            out->anomaly_score = INFINITY;
-          else if (isfinite(out->anomaly_score))
-            out->anomaly_score += score_type * gate->anomaly_weight_type;
-        }
-      }
-      /* Choose effective threshold: adaptive if armed, else fixed */
-      double eff_threshold = gate->anomaly_threshold;
-      if (gate->anomaly_adaptive && !gate->anomaly_adaptive_armed)
-        eff_threshold = gate->anomaly_fixed_threshold;
-      /* INFINITY means the model cannot score yet (most notably while empty),
-       * not that the command is known to be anomalous. Treating it as an
-       * anomaly prevents the default skip-on-anomaly mode from ever
-       * bootstrapping on a sequence long enough to score. */
-      out->anomaly_detected =
-          isfinite(out->anomaly_score) && out->anomaly_score > eff_threshold;
+    char *cmd_seq = NULL;
+    shell_process_status_t command_status =
+        shell_build_command_netseq(cmd, NULL, &cmd_seq, &anomaly_count);
+    if (command_status != SHELL_PROCESS_OK || !cmd_seq) {
+      free(type_seq_buf);
+      out->verdict = SG_VERDICT_UNDETERMINED;
+      return command_status == SHELL_PROCESS_OK
+                 ? SG_ERR_MEMORY
+                 : process_status_to_gate_error(command_status);
     }
+    sg_anomaly_sequence_score_t scores = {0};
+    sg_error_t score_status = sg_gate_score_anomaly_netseq(
+        gate, cmd_seq, strlen(cmd_seq), type_seq_buf, strlen(type_seq_buf),
+        &scores);
+    free(cmd_seq);
+    if (score_status == SG_ERR_MEMORY) {
+      free(type_seq_buf);
+      return SG_ERR_MEMORY;
+    }
+    if (score_status != SG_OK || type_count != anomaly_count ||
+        scores.command_count != anomaly_count) {
+      free(type_seq_buf);
+      return SG_ERR_PARSE;
+    }
+    out->anomaly_score = scores.combined_score;
+    out->anomaly_score_raw = scores.raw_score;
+    out->anomaly_score_type = scores.type_score;
+    out->anomaly_detected = scores.detected;
   } else if (gate->anomaly_enabled && gate->anomaly_model) {
     out->anomaly_score = 0.0;
     out->anomaly_detected = false;
@@ -2719,7 +2889,24 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len, char *buf,
     sr->backgrounded = node->cmd.backgrounded;
 
     char *policy_netargv = NULL;
-    sr->command = build_cmd_string(&node->cmd, &bw, gate, &policy_netargv);
+    sg_error_t build_error = SG_OK;
+    sr->command =
+        build_cmd_string(&node->cmd, &bw, gate, &policy_netargv, &build_error);
+    if (build_error != SG_OK) {
+      free(policy_netargv);
+      out->verdict = SG_VERDICT_UNDETERMINED;
+      free(type_seq_buf);
+      return build_error;
+    }
+    if (bw.overflow) {
+      free(policy_netargv);
+      out->truncated = true;
+      out->verdict = SG_VERDICT_UNDETERMINED;
+      free(type_seq_buf);
+      return SG_ERR_TRUNC;
+    }
+    sr->netargv_length = strlen(policy_netargv);
+    sr->netargv = bw_copy(&bw, policy_netargv, sr->netargv_length);
     if (bw.overflow) {
       free(policy_netargv);
       out->truncated = true;
@@ -2951,12 +3138,12 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len, char *buf,
     /* Record normal scores for adaptive threshold (before update, using current
      * model) */
     if (gate->anomaly_adaptive && !out->anomaly_detected &&
-        isfinite(out->anomaly_score) && cmd_count >= 3)
+        isfinite(out->anomaly_score) && anomaly_count >= 3)
       adaptive_record_score(gate, out->anomaly_score);
 
     /* Record per-model CDF for Bayesian combination */
     if (gate->anomaly_combine_mode == SG_ANOMALY_COMBINE_BAYESIAN &&
-        !out->anomaly_detected && cmd_count >= 3) {
+        !out->anomaly_detected && anomaly_count >= 3) {
       cdf_record(gate->cdf_raw_hist, &gate->cdf_raw_count,
                  out->anomaly_score_raw);
       cdf_record(gate->cdf_type_hist, &gate->cdf_type_count,
@@ -2964,10 +3151,39 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len, char *buf,
     }
 
     if (should_update) {
-      sg_anomaly_update(gate->anomaly_model, cmd_seq, cmd_count);
+      char *cmd_seq = NULL;
+      size_t update_count = 0;
+      shell_process_status_t command_status =
+          shell_build_command_netseq(cmd, NULL, &cmd_seq, &update_count);
+      if (command_status != SHELL_PROCESS_OK || !cmd_seq ||
+          update_count != anomaly_count) {
+        bool count_mismatch = command_status == SHELL_PROCESS_OK &&
+                              cmd_seq != NULL && update_count != anomaly_count;
+        free(cmd_seq);
+        free(type_seq_buf);
+        out->verdict = SG_VERDICT_UNDETERMINED;
+        if (count_mismatch)
+          return SG_ERR_PARSE;
+        return command_status == SHELL_PROCESS_OK
+                   ? SG_ERR_MEMORY
+                   : process_status_to_gate_error(command_status);
+      }
+      sg_anomaly_status_t raw_status = sg_anomaly_update_netseq(
+          gate->anomaly_model, cmd_seq, strlen(cmd_seq));
+      free(cmd_seq);
       /* Also update type sequence model */
+      sg_anomaly_status_t type_status = SG_ANOMALY_OK;
       if (gate->anomaly_model_type && type_count > 0)
-        sg_anomaly_update(gate->anomaly_model_type, type_seq, type_count);
+        type_status = sg_anomaly_update_netseq(
+            gate->anomaly_model_type, type_seq_buf, strlen(type_seq_buf));
+      if ((raw_status != SG_ANOMALY_OK && raw_status != SG_ANOMALY_ERR_MEMORY &&
+           raw_status != SG_ANOMALY_ERR_LIMIT) ||
+          (type_status != SG_ANOMALY_OK &&
+           type_status != SG_ANOMALY_ERR_MEMORY &&
+           type_status != SG_ANOMALY_ERR_LIMIT)) {
+        free(type_seq_buf);
+        return SG_ERR_PARSE;
+      }
     }
   }
 

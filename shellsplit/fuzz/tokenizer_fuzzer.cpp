@@ -851,7 +851,7 @@ static bool tokens_refer_to_owned_command(const shell_token_t *tokens,
   return true;
 }
 
-// Test processor and its convenience extraction API against each other.
+// Test processor metadata and canonical sequence rendering together.
 static int test_processor(const char *input) {
   shell_command_info_t *infos = NULL;
   size_t command_count = 0;
@@ -859,16 +859,16 @@ static int test_processor(const char *input) {
   shell_process_status_t status =
       shell_process_command(input, &limits, &infos, &command_count);
   bool success = status == SHELL_PROCESS_OK;
-  const char **dfa_inputs = NULL;
-  size_t dfa_input_count = 0;
+  char *sequence = NULL;
+  size_t sequence_count = 0;
   bool has_shell_features = false;
-  shell_process_status_t extracted_status = shell_extract_dfa_inputs(
-      input, &limits, &dfa_inputs, &dfa_input_count, &has_shell_features);
+  shell_process_status_t extracted_status = shell_extract_netargv_sequence(
+      input, &limits, &sequence, &sequence_count, &has_shell_features);
   bool extracted = extracted_status == SHELL_PROCESS_OK;
 
   if (success != extracted) {
     shell_free_command_infos(infos, command_count);
-    free_dfa_inputs(dfa_inputs, dfa_input_count);
+    free(sequence);
     return 1;
   }
   if (!success) {
@@ -876,19 +876,18 @@ static int test_processor(const char *input) {
         !(status == SHELL_PROCESS_EPARSE &&
           extracted_status == SHELL_PROCESS_EPARSE)) {
       shell_free_command_infos(infos, command_count);
-      free_dfa_inputs(dfa_inputs, dfa_input_count);
+      free(sequence);
       return 1;
     }
     shell_free_command_infos(infos, command_count);
-    free_dfa_inputs(dfa_inputs, dfa_input_count);
+    free(sequence);
     return 0;
   }
 
-  if ((infos == NULL) != (command_count == 0) ||
-      (dfa_inputs == NULL) != (dfa_input_count == 0) ||
-      dfa_input_count != command_count) {
+  if ((infos == NULL) != (command_count == 0) || (sequence == NULL) ||
+      sequence_count != command_count) {
     shell_free_command_infos(infos, command_count);
-    free_dfa_inputs(dfa_inputs, dfa_input_count);
+    free(sequence);
     return 1;
   }
 
@@ -896,8 +895,8 @@ static int test_processor(const char *input) {
   if (infos) {
     for (size_t i = 0; i < command_count; i++) {
       shell_command_info_t *info = &infos[i];
-      if (!info->original_command || !info->clean_command ||
-          shell_get_clean_command(info) != info->clean_command ||
+      char *netargv = NULL;
+      if (!info->original_command ||
           (info->shell_tokens == NULL) != (info->shell_token_count == 0) ||
           (info->command_tokens == NULL) != (info->command_token_count == 0) ||
           !tokens_refer_to_owned_command(info->shell_tokens,
@@ -906,20 +905,19 @@ static int test_processor(const char *input) {
           !tokens_refer_to_owned_command(info->command_tokens,
                                          info->command_token_count,
                                          info->original_command) ||
-          !dfa_inputs[i] || strcmp(dfa_inputs[i], info->clean_command) != 0) {
+          shell_render_netargv(info, &limits, &netargv) != SHELL_PROCESS_OK) {
+        free(netargv);
         shell_free_command_infos(infos, command_count);
-        free_dfa_inputs(dfa_inputs, dfa_input_count);
+        free(sequence);
         return 1;
       }
-      /* clean_command is a canonical processed serialization. Quote-fragment
-       * assembly and escaped arguments mean its byte length intentionally need
-       * not equal the sum of the raw source spans. */
+      free(netargv);
       expected_features |= shell_has_dangerous_features(info);
     }
   }
 
   shell_free_command_infos(infos, command_count);
-  free_dfa_inputs(dfa_inputs, dfa_input_count);
+  free(sequence);
   return expected_features != has_shell_features;
 }
 

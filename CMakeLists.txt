@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(Shellclave VERSION 0.3.0 LANGUAGES C CXX)
+project(Shellclave VERSION 0.5.0 LANGUAGES C CXX)
 
 if(PROJECT_IS_TOP_LEVEL)
   set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -28,6 +28,7 @@ set(SHELLCLAVE_PUBLIC_HEADERS
   shellsplit/include/shell_abstract.h
   shellsplit/include/shell_depgraph.h
   shellsplit/include/shell_interop.h
+  shellsplit/include/shell_netstring.h
   shellsplit/include/shell_processor.h
   shellsplit/include/shell_tokenizer.h
   shellsplit/include/shell_tokenizer_full.h
@@ -65,6 +66,7 @@ set(SHELLSPLIT_SOURCES
   shellsplit/src/shell_abstract.c
   shellsplit/src/shell_depgraph.c
   shellsplit/src/shell_interop.c
+  shellsplit/src/shell_netstring.c
   shellsplit/src/shell_processor.c
   shellsplit/src/shell_tokenizer.c
   shellsplit/src/shell_tokenizer_full.c
@@ -108,7 +110,7 @@ target_include_directories(shelltype PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/shelltype/include>
   $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/shellclave>
   PRIVATE deps/draugr/include)
-target_link_libraries(shelltype PRIVATE m PUBLIC Threads::Threads)
+target_link_libraries(shelltype PRIVATE m PUBLIC Threads::Threads shellsplit)
 set_target_properties(shelltype PROPERTIES EXPORT_NAME shelltype)
 
 if(BUILD_TESTING)
@@ -122,18 +124,19 @@ if(BUILD_TESTING)
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shelltype/src
             ${CMAKE_CURRENT_SOURCE_DIR}/shelltype/tests
             deps/draugr/include)
-  target_link_libraries(shelltype_test PRIVATE m PUBLIC Threads::Threads)
+  target_link_libraries(shelltype_test PRIVATE m PUBLIC Threads::Threads shellsplit_test)
 endif()
 
 set(SHELLGATE_SOURCES shellgate/src/shellgate.c shellgate/src/sg_anomaly.c)
 
-function(shellclave_configure_shellgate_target target shelltype_target)
+function(shellclave_configure_shellgate_target target shelltype_target
+         shellsplit_target)
   add_library(${target} ${SHELLGATE_SOURCES})
   shellclave_project_target(${target})
   target_include_directories(${target} PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/shellgate/include>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/shellclave>)
-  target_link_libraries(${target} PUBLIC shellsplit ${shelltype_target} PRIVATE m)
+  target_link_libraries(${target} PUBLIC ${shellsplit_target} ${shelltype_target} PRIVATE m)
 
   # Reuse dependency targets supplied by a parent. In a standalone build,
   # compile the pinned private implementations into Shellgate so installed
@@ -164,12 +167,12 @@ function(shellclave_configure_shellgate_target target shelltype_target)
   endif()
 endfunction()
 
-shellclave_configure_shellgate_target(shellgate shelltype)
+shellclave_configure_shellgate_target(shellgate shelltype shellsplit)
 add_library(Shellclave::shellgate ALIAS shellgate)
 set_target_properties(shellgate PROPERTIES EXPORT_NAME shellgate)
 
 if(BUILD_TESTING)
-  shellclave_configure_shellgate_target(shellgate_test shelltype_test)
+  shellclave_configure_shellgate_target(shellgate_test shelltype_test shellsplit_test)
   target_sources(shellgate_test PRIVATE shellgate/tests/test_sg_failures.c)
   target_compile_definitions(shellgate_test PRIVATE
     SHELLGATE_TEST_ALLOCATOR SHELLGATE_TEST_ANOMALY_OPS SHELLGATE_TEST_IO)
@@ -192,9 +195,10 @@ if(BUILD_TESTING)
   shellclave_add_test(shellsplit_entropy_test shellsplit/tests/entropy_test.c shellsplit_test)
   shellclave_add_test(shellsplit_depgraph_test shellsplit/tests/test_depgraph.c shellsplit_test)
   shellclave_add_test(shellsplit_interop_test shellsplit/tests/interop_test.c shellsplit_test)
+  shellclave_add_test(shellsplit_netstring_test shellsplit/tests/netstring_test.c shellsplit_test)
   foreach(shellsplit_test_target IN ITEMS shellsplit_tokenizer_test
       shellsplit_fast_parser_test shellsplit_abstract_test shellsplit_entropy_test
-      shellsplit_depgraph_test shellsplit_interop_test)
+      shellsplit_depgraph_test shellsplit_interop_test shellsplit_netstring_test)
     target_include_directories(${shellsplit_test_target} PRIVATE shellsplit/tests)
   endforeach()
   shellclave_add_test(shelltype_token_types_test shelltype/tests/test_token_types.c shelltype_test)

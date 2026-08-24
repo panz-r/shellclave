@@ -28,11 +28,13 @@ typedef enum {
   SG_ANOMALY_OK = 0,
   SG_ANOMALY_ERR_INVALID = -1,
   SG_ANOMALY_ERR_MEMORY = -2,
+  SG_ANOMALY_ERR_FORMAT = -3,
+  SG_ANOMALY_ERR_LIMIT = -4,
 } sg_anomaly_status_t;
 
-/* Maximum command-name length accepted by update, scoring, and lookup APIs.
- * Four maximum-length commands and their terminators fit exactly in the
- * serialized n-gram key limit. */
+/* Maximum decoded sequence-item length accepted while learning. Scoring
+ * accepts longer items and treats them as unknown. Four maximum-length items
+ * and their terminators fit exactly in the serialized n-gram key limit. */
 #define SG_ANOMALY_MAX_COMMAND_LENGTH 1023
 
 /* --- ERROR STATE --- */
@@ -71,13 +73,15 @@ void sg_anomaly_model_free(sg_anomaly_model_t *model);
 /*
  * Score a command sequence.
  *
- * `seq` is an array of `len` non-null, non-empty command names (e.g. tokens[0]
- * from depgraph).
- * The model does NOT copy these strings — it only reads them.
+ * `netseq` is a canonical concatenation of non-empty netstring records. Each
+ * record is one opaque sequence item, such as an executable name or a nested
+ * per-command type signature.
  *
  * Returns the average negative log-probability per command (bits).
  * Higher = more anomalous.
- * Returns INFINITY if len < 3, or if any entry is NULL or empty.
+ * On success, writes INFINITY when the sequence has fewer than three items or
+ * the model is empty. Malformed and non-canonical framing returns
+ * SG_ANOMALY_ERR_FORMAT.
  *
  * Names longer than SG_ANOMALY_MAX_COMMAND_LENGTH are scored, not rejected.
  * They can never have been learned, so they score as unknown commands and
@@ -85,25 +89,28 @@ void sg_anomaly_model_free(sg_anomaly_model_t *model);
  *
  * Does not modify the model.
  */
-double sg_anomaly_score(const sg_anomaly_model_t *model, const char **seq,
-                        size_t len);
+sg_anomaly_status_t sg_anomaly_score_netseq(const sg_anomaly_model_t *model,
+                                            const char *netseq,
+                                            size_t netseq_length,
+                                            double *score);
 
 /* --- UPDATE (LEARNING) --- */
 
 /*
  * Update the model with a command sequence.
  *
- * The model copies each non-null, non-empty command name — the caller's array
- * can be freed after this call without affecting the stored model. An invalid
- * sequence is ignored without changing the model.
+ * The model copies each decoded non-empty record. The caller retains ownership
+ * of `netseq`. Malformed framing is rejected without changing the model.
  *
  * Updates every unigram and consecutive bigram, trigram, and 4-gram in the
  * sequence.
  *
- * Unigrams and bigrams are also updated even when len < 3
+ * Unigrams and bigrams are also updated when the record count is below 3
  * (e.g. a 2-token sequence contributes 1 bigram and 2 unigrams).
  */
-void sg_anomaly_update(sg_anomaly_model_t *model, const char **seq, size_t len);
+sg_anomaly_status_t sg_anomaly_update_netseq(sg_anomaly_model_t *model,
+                                             const char *netseq,
+                                             size_t netseq_length);
 
 /* --- SERIALISATION --- */
 
@@ -163,9 +170,12 @@ size_t sg_anomaly_quad_count(const sg_anomaly_model_t *model, const char *p3,
 /* Get total number of unique n-gram contexts across all levels. */
 size_t sg_anomaly_total_contexts(const sg_anomaly_model_t *model);
 
-/* Check if any command in the sequence has been observed by the model. */
-bool sg_anomaly_has_observed(const sg_anomaly_model_t *model, const char **seq,
-                             size_t len);
+/* Check whether any command in a canonical netsequence has been observed.
+ * Empty sequences are valid and produce false. */
+sg_anomaly_status_t
+sg_anomaly_has_observed_netseq(const sg_anomaly_model_t *model,
+                               const char *netseq, size_t netseq_length,
+                               bool *observed);
 
 /* Clear all counts and reset to a fresh model.
  * Hyperparameters are preserved. The operation is atomic: on failure the
