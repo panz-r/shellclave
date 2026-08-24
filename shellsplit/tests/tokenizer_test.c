@@ -1644,6 +1644,39 @@ int main(void) {
   }
 
   {
+    const char *word = "quoted";
+    char destination[sizeof("quoted")] = {0};
+    char *owned = (char *)(uintptr_t)1;
+    size_t length = SIZE_MAX;
+    size_t written = SIZE_MAX;
+    bool valid =
+        shell_measure_decoded_word(word, strlen(word), NULL) ==
+            SHELL_PROCESS_EINPUT &&
+        shell_write_decoded_word(NULL, 0, destination, sizeof(destination),
+                                 &written) == SHELL_PROCESS_EINPUT &&
+        written == 0 &&
+        shell_write_decoded_word(word, strlen(word), destination,
+                                 sizeof(destination),
+                                 NULL) == SHELL_PROCESS_EINPUT &&
+        shell_decode_word(NULL, 0, &owned, &length) == SHELL_PROCESS_EINPUT &&
+        owned == NULL && length == 0 &&
+        shell_decode_word(word, strlen(word), NULL, &length) ==
+            SHELL_PROCESS_EINPUT &&
+        length == 0 &&
+        shell_decode_word(word, strlen(word), &owned, NULL) ==
+            SHELL_PROCESS_EINPUT &&
+        owned == NULL;
+    shellsplit_test_alloc_reset();
+    shellsplit_test_alloc_fail_at(1);
+    valid = valid &&
+            shell_decode_word(word, strlen(word), &owned, &length) ==
+                SHELL_PROCESS_ENOMEM &&
+            owned == NULL && length == 0;
+    shellsplit_test_alloc_reset();
+    test("Decoded-word helpers reject invalid and exhausted storage", valid);
+  }
+
+  {
     shell_command_info_t *infos = NULL;
     size_t count = 0;
     shell_process_status_t rejected[] = {
@@ -1665,6 +1698,37 @@ int main(void) {
     test("Processor: explicit output limits report rejection",
          status == SHELL_PROCESS_EOUTPUT_LIMIT && infos == NULL && count == 0);
     shell_free_command_infos(infos, count);
+  }
+
+  {
+    shell_command_info_t *infos = NULL;
+    size_t count = 0;
+    char *netargv = (char *)(uintptr_t)1;
+    shell_process_limits_t limits = {1, 1};
+    bool valid =
+        shell_render_netargv(NULL, NULL, &netargv) == SHELL_PROCESS_EINPUT &&
+        netargv == NULL &&
+        shell_process_command("echo x", NULL, &infos, &count) ==
+            SHELL_PROCESS_OK &&
+        count == 1 &&
+        shell_render_netargv(&infos[0], NULL, NULL) == SHELL_PROCESS_EINPUT &&
+        shell_render_netargv(&infos[0], &limits, &netargv) ==
+            SHELL_PROCESS_EOUTPUT_LIMIT &&
+        netargv == NULL;
+    limits.max_string_bytes = SIZE_MAX;
+    valid = valid &&
+            shell_render_netargv(&infos[0], &limits, &netargv) ==
+                SHELL_PROCESS_EOUTPUT_LIMIT &&
+            netargv == NULL;
+    shellsplit_test_alloc_reset();
+    shellsplit_test_alloc_fail_at(1);
+    valid = valid &&
+            shell_render_netargv(&infos[0], NULL, &netargv) ==
+                SHELL_PROCESS_ENOMEM &&
+            netargv == NULL;
+    shellsplit_test_alloc_reset();
+    shell_free_command_infos(infos, count);
+    test("Netargv rendering validates limits and allocation failures", valid);
   }
 
   printf("\n=== PIPELINE/SUBCOMMAND EXTRACTION TESTS ===\n\n");
@@ -2013,6 +2077,17 @@ int main(void) {
             sequence == NULL && count == 0;
     test("Nested netargv sequence validates every output", valid);
 
+    sequence = (char *)(uintptr_t)1;
+    count = SIZE_MAX;
+    features = true;
+    valid = shell_extract_netargv_sequence("\x01"
+                                           "bad",
+                                           NULL, &sequence, &count,
+                                           &features) == SHELL_PROCESS_EPARSE &&
+            sequence == NULL && count == 0 && !features;
+    test("Nested netargv sequence propagates parser failures atomically",
+         valid);
+
     shell_process_limits_t limits = {SIZE_MAX, SIZE_MAX};
     limits.max_string_bytes = 1;
     features = true;
@@ -2021,6 +2096,35 @@ int main(void) {
                 SHELL_PROCESS_EOUTPUT_LIMIT &&
             sequence == NULL && count == 0 && !features;
     test("Nested netargv sequence enforces its outer output limit", valid);
+
+    limits = (shell_process_limits_t){SIZE_MAX, 10};
+    valid = shell_extract_netargv_sequence("echo x", &limits, &sequence, &count,
+                                           &features) ==
+                SHELL_PROCESS_EOUTPUT_LIMIT &&
+            sequence == NULL && count == 0 && !features;
+    test("Nested netargv sequence checks its post-processing size", valid);
+
+    valid = true;
+    bool completed = false;
+    for (size_t fail_at = 1; fail_at < 32; fail_at++) {
+      shellsplit_test_alloc_reset();
+      shellsplit_test_alloc_fail_at(fail_at);
+      sequence = (char *)(uintptr_t)1;
+      count = SIZE_MAX;
+      features = true;
+      status = shell_extract_netargv_sequence("echo x", NULL, &sequence, &count,
+                                              &features);
+      if (status == SHELL_PROCESS_OK) {
+        completed = true;
+        free(sequence);
+        break;
+      }
+      valid = valid && status == SHELL_PROCESS_ENOMEM && sequence == NULL &&
+              count == 0 && !features;
+    }
+    shellsplit_test_alloc_reset();
+    test("Nested netargv sequence is failure-atomic at every allocation",
+         valid && completed);
 
     sequence = NULL;
     count = 0;
@@ -2046,6 +2150,41 @@ int main(void) {
                 SHELL_PROCESS_EOUTPUT_LIMIT &&
             sequence == NULL && count == 0;
     test("Command netsequence validates outputs and limits", valid);
+
+    limits = (shell_process_limits_t){SIZE_MAX, 6};
+    valid = shell_build_command_netseq("echo x", &limits, &sequence, &count) ==
+                SHELL_PROCESS_EOUTPUT_LIMIT &&
+            sequence == NULL && count == 0;
+    test("Command netsequence checks its encoded size", valid);
+
+    sequence = (char *)(uintptr_t)1;
+    count = SIZE_MAX;
+    valid = shell_build_command_netseq("\x01"
+                                       "bad",
+                                       NULL, &sequence,
+                                       &count) == SHELL_PROCESS_EPARSE &&
+            sequence == NULL && count == 0;
+    test("Command netsequence propagates parser failures atomically", valid);
+
+    valid = true;
+    completed = false;
+    for (size_t fail_at = 1; fail_at < 32; fail_at++) {
+      shellsplit_test_alloc_reset();
+      shellsplit_test_alloc_fail_at(fail_at);
+      sequence = (char *)(uintptr_t)1;
+      count = SIZE_MAX;
+      status = shell_build_command_netseq("echo x", NULL, &sequence, &count);
+      if (status == SHELL_PROCESS_OK) {
+        completed = true;
+        free(sequence);
+        break;
+      }
+      valid = valid && status == SHELL_PROCESS_ENOMEM && sequence == NULL &&
+              count == 0;
+    }
+    shellsplit_test_alloc_reset();
+    test("Command netsequence is failure-atomic at every allocation",
+         valid && completed);
   }
 
   printf("\n=== SUMMARY ===\n");

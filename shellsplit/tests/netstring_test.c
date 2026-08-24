@@ -126,6 +126,51 @@ static void test_encoding(void) {
            SHELL_NETSTRING_EOVERFLOW);
 }
 
+static void test_api_contract_failures(void) {
+  static const unsigned char one_record[] = "1:x,";
+  unsigned char record[16] = {0};
+  shell_netstring_iter_t iter;
+  shell_netstring_view_t view;
+  size_t length = SIZE_MAX;
+  size_t prefix = SIZE_MAX;
+
+  TEST("iterator initialization requires valid storage",
+       shell_netstring_iter_init(NULL, one_record, sizeof(one_record) - 1) ==
+               SHELL_NETSTRING_EINPUT &&
+           shell_netstring_iter_init(&iter, NULL, 1) == SHELL_NETSTRING_EINPUT);
+  TEST("iterator next validates arguments and offsets",
+       shell_netstring_iter_next(NULL, &view) == SHELL_NETSTRING_EINPUT &&
+           shell_netstring_iter_init(&iter, one_record,
+                                     sizeof(one_record) - 1) ==
+               SHELL_NETSTRING_OK &&
+           shell_netstring_iter_next(&iter, NULL) == SHELL_NETSTRING_EINPUT &&
+           ((iter.offset = iter.length + 1),
+            shell_netstring_iter_next(&iter, &view) == SHELL_NETSTRING_EINPUT));
+  TEST("iterator rejects a length prefix without a colon",
+       shell_netstring_iter_init(&iter, "1x", 2) == SHELL_NETSTRING_OK &&
+           shell_netstring_iter_next(&iter, &view) == SHELL_NETSTRING_EFORMAT);
+  TEST("encoded length requires an output pointer",
+       shell_netstring_encoded_length(1, NULL) == SHELL_NETSTRING_EINPUT);
+  TEST("prefix writer validates storage and capacity",
+       shell_netstring_write_prefix(NULL, sizeof(record), 1, &prefix) ==
+               SHELL_NETSTRING_EINPUT &&
+           prefix == 0 &&
+           shell_netstring_write_prefix(record, 1, 10, &prefix) ==
+               SHELL_NETSTRING_EOVERFLOW &&
+           prefix == 0);
+  TEST("record writer validates input and overflow",
+       shell_netstring_write(NULL, sizeof(record), "x", 1, &length) ==
+               SHELL_NETSTRING_EINPUT &&
+           length == 0 &&
+           shell_netstring_write(record, sizeof(record), NULL, 1, &length) ==
+               SHELL_NETSTRING_EINPUT &&
+           shell_netstring_write(record, sizeof(record), "x", 1, NULL) ==
+               SHELL_NETSTRING_OK &&
+           shell_netstring_write(record, SIZE_MAX, record, SIZE_MAX, &length) ==
+               SHELL_NETSTRING_EOVERFLOW &&
+           length == 0);
+}
+
 static void test_stream_reader(void) {
   FILE *stream = tmpfile();
   unsigned char *record = NULL;
@@ -203,6 +248,58 @@ static void test_stream_reader_rejects_unallocatable_record(void) {
   fclose(stream);
 }
 
+static void test_stream_reader_format_failures(void) {
+  static const struct {
+    const char *input;
+    shell_netstring_status_t expected;
+  } cases[] = {
+      {"x", SHELL_NETSTRING_EFORMAT},
+      {"01:,", SHELL_NETSTRING_EFORMAT},
+      {"999999999999999999999999999999:", SHELL_NETSTRING_EOVERFLOW},
+      {"3", SHELL_NETSTRING_EFORMAT},
+      {"3:ab", SHELL_NETSTRING_EFORMAT},
+      {"3:abc.", SHELL_NETSTRING_EFORMAT},
+  };
+  unsigned char *record = (unsigned char *)(void *)1;
+  size_t length = SIZE_MAX;
+  TEST("stream reader requires every output and stream",
+       shell_netstring_read_stream(NULL, 0, &record, &length) ==
+               SHELL_NETSTRING_EINPUT &&
+           record == NULL && length == 0 &&
+           shell_netstring_read_stream(stdin, 0, NULL, &length) ==
+               SHELL_NETSTRING_EINPUT &&
+           length == 0 &&
+           shell_netstring_read_stream(stdin, 0, &record, NULL) ==
+               SHELL_NETSTRING_EINPUT &&
+           record == NULL);
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    FILE *stream = tmpfile();
+    TEST("open malformed stream", stream != NULL);
+    if (!stream)
+      continue;
+    fputs(cases[i].input, stream);
+    rewind(stream);
+    record = (unsigned char *)(void *)1;
+    length = SIZE_MAX;
+    TEST("stream reader rejects malformed framing",
+         shell_netstring_read_stream(stream, 0, &record, &length) ==
+                 cases[i].expected &&
+             record == NULL && length == 0);
+    fclose(stream);
+  }
+  FILE *limited = tmpfile();
+  TEST("open limited stream", limited != NULL);
+  if (limited) {
+    fputs("3:cat,", limited);
+    rewind(limited);
+    TEST("stream reader enforces record limit",
+         shell_netstring_read_stream(limited, 5, &record, &length) ==
+                 SHELL_NETSTRING_EOVERFLOW &&
+             record == NULL && length == 0);
+    fclose(limited);
+  }
+}
+
 int main(void) {
   printf("=== Shellsplit Netstring Tests ===\n");
   test_iteration();
@@ -210,9 +307,11 @@ int main(void) {
   test_validation_failures();
   test_count_and_error_position();
   test_encoding();
+  test_api_contract_failures();
   test_stream_reader();
   test_stream_reader_allocation_failures();
   test_stream_reader_rejects_unallocatable_record();
+  test_stream_reader_format_failures();
   printf("\n%d passed, %d failed\n", passed, failed);
   return failed != 0;
 }
