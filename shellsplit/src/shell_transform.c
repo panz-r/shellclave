@@ -2,7 +2,6 @@
 #include "shell_transform.h"
 #include "alloc.h"
 #include "shell_tokenizer_full.h"
-#include <errno.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -11,22 +10,22 @@ static const char *VAR_PLACEHOLDER = "VAR_VALUE";
 static const char *GLOB_PLACEHOLDER = "FILE_PATTERN";
 static const char *SUBSHELL_PLACEHOLDER = "TEMP_FILE";
 
-static bool is_shell_syntax_token(token_type_t type) {
-  return type == TOKEN_PIPE || type == TOKEN_REDIRECT_IN ||
-         type == TOKEN_REDIRECT_OUT || type == TOKEN_REDIRECT_ERR ||
-         type == TOKEN_REDIRECT_APPEND || type == TOKEN_SEMICOLON ||
-         type == TOKEN_AND || type == TOKEN_BACKGROUND || type == TOKEN_OR ||
-         type == TOKEN_GROUP_START || type == TOKEN_GROUP_END ||
-         type == TOKEN_SUBSHELL_START || type == TOKEN_SUBSHELL_END ||
-         type == TOKEN_HEREDOC || type == TOKEN_HERESTRING ||
-         type == TOKEN_PROCESS_SUB;
+static bool is_shell_syntax_token(shell_token_type_t type) {
+  return type == SHELL_TOKEN_PIPE || type == SHELL_TOKEN_REDIRECT_IN ||
+         type == SHELL_TOKEN_REDIRECT_OUT || type == SHELL_TOKEN_REDIRECT_ERR ||
+         type == SHELL_TOKEN_REDIRECT_APPEND || type == SHELL_TOKEN_SEMICOLON ||
+         type == SHELL_TOKEN_AND || type == SHELL_TOKEN_BACKGROUND ||
+         type == SHELL_TOKEN_OR || type == SHELL_TOKEN_GROUP_START ||
+         type == SHELL_TOKEN_GROUP_END || type == SHELL_TOKEN_SUBSHELL_START ||
+         type == SHELL_TOKEN_SUBSHELL_END || type == SHELL_TOKEN_HEREDOC ||
+         type == SHELL_TOKEN_HERESTRING || type == SHELL_TOKEN_PROCESS_SUB;
 }
 
-void shell_free_transformed_command(transformed_command_t *command) {
+void shell_transformed_command_free(shell_transformed_command_t *command) {
   if (!command)
     return;
   free((void *)command->original_command);
-  free((void *)command->transformed_command);
+  free((void *)command->display_text);
   if (command->tokens) {
     for (size_t i = 0; i < command->token_count; i++) {
       free((void *)command->tokens[i].original);
@@ -39,11 +38,11 @@ void shell_free_transformed_command(transformed_command_t *command) {
 }
 
 static shell_transform_status_t
-measure_transformed_command(const transformed_command_t *command,
+measure_transformed_command(const shell_transformed_command_t *command,
                             size_t *total_output) {
   size_t total = 0;
   const char *command_strings[] = {command->original_command,
-                                   command->transformed_command};
+                                   command->display_text};
   for (size_t i = 0; i < 2; i++) {
     size_t length = strlen(command_strings[i]);
     if (length > SIZE_MAX - total)
@@ -64,11 +63,10 @@ measure_transformed_command(const transformed_command_t *command,
   return SHELL_TRANSFORM_OK;
 }
 
-static transformed_token_t create_transformed_token(const char *original,
-                                                    const char *transformed,
-                                                    transform_type_t type,
-                                                    bool is_shell_construct) {
-  transformed_token_t token;
+static shell_transformed_token_t
+create_transformed_token(const char *original, const char *transformed,
+                         shell_transform_type_t type, bool is_shell_construct) {
+  shell_transformed_token_t token;
   token.original = original;
   token.transformed = transformed;
   token.type = type;
@@ -76,7 +74,8 @@ static transformed_token_t create_transformed_token(const char *original,
   return token;
 }
 
-static void free_transformed_tokens(transformed_token_t *tokens, size_t count) {
+static void free_transformed_tokens(shell_transformed_token_t *tokens,
+                                    size_t count) {
   for (size_t i = 0; i < count; i++) {
     free((void *)tokens[i].original);
     if (tokens[i].transformed != tokens[i].original)
@@ -85,7 +84,7 @@ static void free_transformed_tokens(transformed_token_t *tokens, size_t count) {
   free(tokens);
 }
 
-static char *build_transformed_command(transformed_token_t *tokens,
+static char *build_transformed_command(shell_transformed_token_t *tokens,
                                        size_t token_count,
                                        shell_transform_status_t *status) {
   size_t total_length = 0;
@@ -129,21 +128,22 @@ static char *build_transformed_command(transformed_token_t *tokens,
 }
 
 shell_transform_status_t
-shell_transform_command(shell_command_t *cmd,
+shell_transform_command(const shell_command_t *cmd,
                         const shell_transform_limits_t *limits,
-                        transformed_command_t **transformed_cmd) {
+                        shell_transformed_command_t **transformed_cmd) {
   if (!transformed_cmd)
     return SHELL_TRANSFORM_EINPUT;
   *transformed_cmd = NULL;
   if (!cmd)
     return SHELL_TRANSFORM_EINPUT;
 
-  transformed_command_t *tcmd = malloc(sizeof(transformed_command_t));
+  shell_transformed_command_t *tcmd =
+      malloc(sizeof(shell_transformed_command_t));
   if (!tcmd)
     return SHELL_TRANSFORM_ENOMEM;
 
   tcmd->original_command = NULL;
-  tcmd->transformed_command = NULL;
+  tcmd->display_text = NULL;
   tcmd->tokens = NULL;
   tcmd->token_count = 0;
   tcmd->has_transformations = false;
@@ -155,7 +155,7 @@ shell_transform_command(shell_command_t *cmd,
     return SHELL_TRANSFORM_EINPUT;
   }
 
-  shell_token_t *first_token = &cmd->tokens[0];
+  const shell_token_t *first_token = &cmd->tokens[0];
   if (!first_token->start || cmd->end_pos < cmd->start_pos ||
       first_token->position < cmd->start_pos ||
       first_token->position > cmd->end_pos ||
@@ -177,13 +177,13 @@ shell_transform_command(shell_command_t *cmd,
     return SHELL_TRANSFORM_EOUTPUT_LIMIT;
   }
 
-  if (cmd->token_count > SIZE_MAX / sizeof(transformed_token_t)) {
+  if (cmd->token_count > SIZE_MAX / sizeof(shell_transformed_token_t)) {
     free((void *)tcmd->original_command);
     free(tcmd);
     return SHELL_TRANSFORM_EOVERFLOW;
   }
-  transformed_token_t *tokens =
-      malloc(cmd->token_count * sizeof(transformed_token_t));
+  shell_transformed_token_t *tokens =
+      malloc(cmd->token_count * sizeof(shell_transformed_token_t));
   if (!tokens) {
     free((void *)tcmd->original_command);
     free(tcmd);
@@ -191,7 +191,7 @@ shell_transform_command(shell_command_t *cmd,
   }
 
   for (size_t i = 0; i < cmd->token_count; i++) {
-    shell_token_t *tok = &cmd->tokens[i];
+    const shell_token_t *tok = &cmd->tokens[i];
     if (!tok->start || tok->position < cmd->start_pos ||
         tok->position > cmd->end_pos ||
         tok->length > cmd->end_pos - tok->position) {
@@ -200,26 +200,26 @@ shell_transform_command(shell_command_t *cmd,
       free(tcmd);
       return SHELL_TRANSFORM_EINPUT;
     }
-    transform_type_t type = TRANSFORM_NONE;
+    shell_transform_type_t type = SHELL_TRANSFORM_NONE;
     const char *replacement = NULL;
     switch (tok->type) {
-    case TOKEN_VARIABLE:
-    case TOKEN_VARIABLE_QUOTED:
-    case TOKEN_SPECIAL_VAR:
-      type = TRANSFORM_VARIABLE;
+    case SHELL_TOKEN_VARIABLE:
+    case SHELL_TOKEN_VARIABLE_QUOTED:
+    case SHELL_TOKEN_SPECIAL_VAR:
+      type = SHELL_TRANSFORM_VARIABLE;
       replacement = VAR_PLACEHOLDER;
       break;
-    case TOKEN_GLOB:
-      type = TRANSFORM_GLOB;
+    case SHELL_TOKEN_GLOB:
+      type = SHELL_TRANSFORM_GLOB;
       replacement = GLOB_PLACEHOLDER;
       break;
-    case TOKEN_SUBSHELL:
-    case TOKEN_PROCESS_SUB:
-      type = TRANSFORM_SUBSHELL;
+    case SHELL_TOKEN_SUBSHELL:
+    case SHELL_TOKEN_PROCESS_SUB:
+      type = SHELL_TRANSFORM_SUBSHELL;
       replacement = SUBSHELL_PLACEHOLDER;
       break;
-    case TOKEN_ARITHMETIC:
-      type = TRANSFORM_VARIABLE;
+    case SHELL_TOKEN_ARITHMETIC:
+      type = SHELL_TRANSFORM_VARIABLE;
       replacement = VAR_PLACEHOLDER;
       break;
     default:
@@ -249,17 +249,17 @@ shell_transform_command(shell_command_t *cmd,
   tcmd->tokens = tokens;
   tcmd->token_count = cmd->token_count;
   shell_transform_status_t build_status = SHELL_TRANSFORM_OK;
-  tcmd->transformed_command =
+  tcmd->display_text =
       build_transformed_command(tokens, tcmd->token_count, &build_status);
 
-  if (!tcmd->transformed_command) {
+  if (!tcmd->display_text) {
     free_transformed_tokens(tokens, tcmd->token_count);
     free((void *)tcmd->original_command);
     free(tcmd);
     return build_status;
   }
 
-  size_t transformed_length = strlen(tcmd->transformed_command);
+  size_t transformed_length = strlen(tcmd->display_text);
   if (limits && transformed_length > limits->max_string_bytes)
     goto output_limit;
   for (size_t i = 0; i < tcmd->token_count; i++) {
@@ -279,16 +279,18 @@ shell_transform_command(shell_command_t *cmd,
   return SHELL_TRANSFORM_OK;
 
 output_limit:
-  shell_free_transformed_command(tcmd);
+  shell_transformed_command_free(tcmd);
   return SHELL_TRANSFORM_EOUTPUT_LIMIT;
 overflow:
-  shell_free_transformed_command(tcmd);
+  shell_transformed_command_free(tcmd);
   return SHELL_TRANSFORM_EOVERFLOW;
 }
 
-shell_transform_status_t shell_transform_command_line(
-    const char *command_line, const shell_transform_limits_t *limits,
-    transformed_command_t ***transformed_cmds, size_t *transformed_count) {
+shell_transform_status_t
+shell_transform_command_line(const char *command_line, size_t command_length,
+                             const shell_transform_limits_t *limits,
+                             shell_transformed_command_t ***transformed_cmds,
+                             size_t *transformed_count) {
   if (!transformed_cmds || !transformed_count)
     return SHELL_TRANSFORM_EINPUT;
   *transformed_cmds = NULL;
@@ -299,22 +301,33 @@ shell_transform_status_t shell_transform_command_line(
   shell_command_t *cmds = NULL;
   size_t cmd_count = 0;
 
-  errno = 0;
-  if (!shell_tokenize_commands(command_line, &cmds, &cmd_count))
-    return errno == ENOMEM ? SHELL_TRANSFORM_ENOMEM : SHELL_TRANSFORM_EPARSE;
+  switch (shell_tokenize_commands(command_line, command_length, &cmds,
+                                  &cmd_count)) {
+  case SHELL_TOKENIZE_OK:
+    break;
+  case SHELL_TOKENIZE_ENOMEM:
+    return SHELL_TRANSFORM_ENOMEM;
+  case SHELL_TOKENIZE_EOVERFLOW:
+    return SHELL_TRANSFORM_EOVERFLOW;
+  case SHELL_TOKENIZE_EINPUT:
+    return SHELL_TRANSFORM_EINPUT;
+  case SHELL_TOKENIZE_EPARSE:
+  default:
+    return SHELL_TRANSFORM_EPARSE;
+  }
 
   if (cmd_count == 0) {
     return SHELL_TRANSFORM_OK;
   }
 
-  if (cmd_count > SIZE_MAX / sizeof(transformed_command_t *)) {
-    shell_free_commands(cmds, cmd_count);
+  if (cmd_count > SIZE_MAX / sizeof(shell_transformed_command_t *)) {
+    shell_commands_free(cmds, cmd_count);
     return SHELL_TRANSFORM_EOVERFLOW;
   }
-  transformed_command_t **tcmds =
-      malloc(cmd_count * sizeof(transformed_command_t *));
+  shell_transformed_command_t **tcmds =
+      malloc(cmd_count * sizeof(shell_transformed_command_t *));
   if (!tcmds) {
-    shell_free_commands(cmds, cmd_count);
+    shell_commands_free(cmds, cmd_count);
     return SHELL_TRANSFORM_ENOMEM;
   }
 
@@ -339,33 +352,36 @@ shell_transform_status_t shell_transform_command_line(
         success_count++;
         continue;
       }
-      shell_free_transformed_command(tcmds[i]);
+      shell_transformed_command_free(tcmds[i]);
     }
     for (size_t j = 0; j < success_count; j++)
-      shell_free_transformed_command(tcmds[j]);
+      shell_transformed_command_free(tcmds[j]);
     free(tcmds);
-    shell_free_commands(cmds, cmd_count);
+    shell_commands_free(cmds, cmd_count);
     return status;
   }
 
   *transformed_cmds = tcmds;
   *transformed_count = success_count;
-  shell_free_commands(cmds, cmd_count);
+  shell_commands_free(cmds, cmd_count);
   return SHELL_TRANSFORM_OK;
 }
 
-void shell_free_transformed_commands(transformed_command_t **commands,
-                                     size_t count) {
+void shell_transformed_command_list_free(shell_transformed_command_t **commands,
+                                         size_t count) {
   if (!commands)
     return;
   for (size_t i = 0; i < count; i++)
-    shell_free_transformed_command(commands[i]);
+    shell_transformed_command_free(commands[i]);
+  free(commands);
 }
 
-const char *shell_get_dfa_input(transformed_command_t *cmd) {
-  return cmd ? cmd->transformed_command : NULL;
+const char *shell_transformed_command_get_display_text(
+    const shell_transformed_command_t *cmd) {
+  return cmd ? cmd->display_text : NULL;
 }
 
-bool shell_has_transformations(transformed_command_t *cmd) {
+bool shell_transformed_command_has_transformations(
+    const shell_transformed_command_t *cmd) {
   return cmd ? cmd->has_transformations : false;
 }

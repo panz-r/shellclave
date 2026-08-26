@@ -127,7 +127,7 @@ static int test_large_policy_compaction(void) {
              i);
     ASSERT(test_st_policy_add(policy, pattern) == ST_OK);
   }
-  ASSERT(st_policy_count(policy) == (size_t)pattern_count);
+  ASSERT(st_policy_rule_count(policy) == (size_t)pattern_count);
   size_t populated_states = st_policy_state_count(policy);
   size_t populated_memory = st_policy_memory_usage(policy);
   ASSERT(populated_states > (size_t)pattern_count);
@@ -145,10 +145,10 @@ static int test_large_policy_compaction(void) {
              i);
     ASSERT(test_st_policy_remove(policy, pattern) == ST_OK);
   }
-  ASSERT(st_policy_count(policy) == (size_t)pattern_count / 2);
+  ASSERT(st_policy_rule_count(policy) == (size_t)pattern_count / 2);
   size_t stale_states = st_policy_state_count(policy);
   ASSERT(st_policy_compact(policy) == ST_OK);
-  ASSERT(st_policy_count(policy) == (size_t)pattern_count / 2);
+  ASSERT(st_policy_rule_count(policy) == (size_t)pattern_count / 2);
   ASSERT(st_policy_state_count(policy) < stale_states);
   ASSERT(st_policy_memory_usage(policy) < populated_memory);
   ASSERT(verify_alternating_policy(policy, pattern_count));
@@ -167,7 +167,7 @@ static int test_large_policy_compaction(void) {
   ASSERT(st_policy_state_count(policy) == compacted_states);
   ASSERT(verify_alternating_policy(policy, pattern_count));
   st_policy_free(policy);
-  st_policy_ctx_free(context);
+  st_policy_ctx_release(context);
   return 1;
 }
 
@@ -181,7 +181,7 @@ static int test_compaction_allocation_failures_are_atomic(void) {
   ASSERT(st_policy_compact(probe) == ST_OK);
   size_t allocations = st_test_alloc_count();
   st_policy_free(probe);
-  st_policy_ctx_free(probe_context);
+  st_policy_ctx_release(probe_context);
   ASSERT(allocations > 0);
 
   for (size_t fail_at = 1; fail_at <= allocations; fail_at++) {
@@ -193,14 +193,14 @@ static int test_compaction_allocation_failures_are_atomic(void) {
     st_error_t error = st_policy_compact(policy);
     st_test_alloc_reset();
     ASSERT(error == ST_OK || error == ST_ERR_MEMORY);
-    ASSERT(st_policy_count(policy) == 3);
+    ASSERT(st_policy_rule_count(policy) == 3);
     ASSERT(eval_matches(policy, "git status", "git status"));
     ASSERT(eval_matches(policy, "copy /tmp/value", "copy #path"));
     ASSERT(eval_matches(policy, "probe 17", "probe #n"));
     ASSERT(test_st_policy_add(policy, "after failure") == ST_OK);
     ASSERT(eval_matches(policy, "after failure", "after failure"));
     st_policy_free(policy);
-    st_policy_ctx_free(context);
+    st_policy_ctx_release(context);
   }
   return 1;
 }
@@ -506,7 +506,7 @@ static size_t parsed_nfa_matches_typed(const parsed_nfa_t *nfa,
                          .matches = matches,
                          .match_capacity = match_capacity};
   typed_nfa_walk(&ctx, 0, 0);
-  st_free_token_array(&tokens);
+  st_token_array_free(&tokens);
   return ctx.match_count;
 }
 
@@ -593,7 +593,7 @@ static int test_nfa_rendering_contract(void) {
   }
   ASSERT(remove(path) == 0);
   st_policy_free(policy);
-  st_policy_ctx_free(context);
+  st_policy_ctx_release(context);
   return 1;
 }
 
@@ -635,13 +635,13 @@ static int test_nfa_policy_equivalence(void) {
         found = found || pattern_is_cpl(policy_matches[p], nfa_matches[n]);
       ASSERT(found);
     }
-    st_policy_free_matches(policy_matches, policy_count);
+    st_policy_matches_free(policy_matches);
   }
 
   parsed_nfa_free(&nfa);
   ASSERT(remove(path) == 0);
   st_policy_free(policy);
-  st_policy_ctx_free(context);
+  st_policy_ctx_release(context);
   return 1;
 }
 
@@ -695,7 +695,7 @@ static int test_nfa_lattice_transition_matrix(void) {
   parsed_nfa_free(&nfa);
   ASSERT(remove(path) == 0);
   st_policy_free(policy);
-  st_policy_ctx_free(context);
+  st_policy_ctx_release(context);
   return 1;
 }
 
@@ -731,7 +731,7 @@ static int nfa_equivalent_for_commands(st_policy_t *policy, const char *path,
         found = found || pattern_is_cpl(policy_matches[p], nfa_matches[n]);
       equivalent = found;
     }
-    st_policy_free_matches(policy_matches, policy_count);
+    st_policy_matches_free(policy_matches);
   }
   parsed_nfa_free(&nfa);
   return equivalent;
@@ -772,7 +772,7 @@ static int test_nfa_lifecycle_equivalence(void) {
   ASSERT(source && test_st_policy_add(source, "allocate #size.MiB") == ST_OK);
   ASSERT(st_policy_merge(policy, source) == ST_OK);
   st_policy_free(source);
-  st_policy_ctx_free(source_context);
+  st_policy_ctx_release(source_context);
   ASSERT(nfa_equivalent_for_commands(policy, nfa_path, commands,
                                      sizeof(commands) / sizeof(commands[0])));
 
@@ -784,7 +784,7 @@ static int test_nfa_lifecycle_equivalence(void) {
 
   ASSERT(remove(nfa_path) == 0 && remove(policy_path) == 0);
   st_policy_free(policy);
-  st_policy_ctx_free(context);
+  st_policy_ctx_release(context);
   return 1;
 }
 
@@ -848,13 +848,13 @@ static int test_nfa_preserves_parameter_branches(void) {
         found = found || pattern_is_cpl(policy_matches[p], matches[n]);
       ASSERT(found);
     }
-    st_policy_free_matches(policy_matches, policy_count);
+    st_policy_matches_free(policy_matches);
   }
 
   parsed_nfa_free(&nfa);
   ASSERT(remove(path) == 0);
   st_policy_free(policy);
-  st_policy_ctx_free(context);
+  st_policy_ctx_release(context);
   return 1;
 }
 
@@ -901,12 +901,12 @@ static int metadata_matches_expected(st_policy_t *policy, const char *path,
                "counts=%zu/%zu)\n",
                cases[i].command, cases[i].expected[expected], policy_found,
                nfa_found, policy_count, nfa_count);
-        st_policy_free_matches(policy_matches, policy_count);
+        st_policy_matches_free(policy_matches);
         parsed_nfa_free(&nfa);
         return 0;
       }
     }
-    st_policy_free_matches(policy_matches, policy_count);
+    st_policy_matches_free(policy_matches);
   }
   parsed_nfa_free(&nfa);
   return 1;
@@ -1022,8 +1022,8 @@ static int test_nfa_same_prefix_metadata_cross_product(void) {
   ASSERT(remove(nfa_path) == 0 && remove(policy_path) == 0);
   st_policy_free(policy);
   st_policy_free(source);
-  st_policy_ctx_free(context);
-  st_policy_ctx_free(source_context);
+  st_policy_ctx_release(context);
+  st_policy_ctx_release(source_context);
   return 1;
 }
 
@@ -1058,7 +1058,7 @@ static int test_nfa_allocation_failures(void) {
   }
   ASSERT(observed);
   st_policy_free(policy);
-  st_policy_ctx_free(context);
+  st_policy_ctx_release(context);
   return 1;
 }
 
@@ -1122,7 +1122,7 @@ static int test_nfa_atomic_io_and_crash_boundaries(void) {
   }
 
   st_policy_free(policy);
-  st_policy_ctx_free(context);
+  st_policy_ctx_release(context);
   ASSERT(unlink(path) == 0);
   return 1;
 }
@@ -1137,7 +1137,7 @@ static int test_dot_queue_growth(void) {
     snprintf(pattern, sizeof(pattern), "queue-%zu", i);
     ASSERT(test_st_policy_add(policy, pattern) == ST_OK);
   }
-  ASSERT(st_policy_count(policy) == pattern_count);
+  ASSERT(st_policy_rule_count(policy) == pattern_count);
   ASSERT(eval_matches(policy, "queue-0", "queue-0"));
   ASSERT(eval_matches(policy, "queue-2500", "queue-2500"));
   ASSERT(eval_matches(policy, "queue-4999", "queue-4999"));
@@ -1152,7 +1152,7 @@ static int test_dot_queue_growth(void) {
   free(dot);
   ASSERT(remove("/tmp/shelltype-large.dot") == 0);
   st_policy_free(policy);
-  st_policy_ctx_free(context);
+  st_policy_ctx_release(context);
   return 1;
 }
 
@@ -1188,7 +1188,7 @@ static int test_dot_allocation_failures_are_clean(void) {
   }
   ASSERT(observed);
   st_policy_free(policy);
-  st_policy_ctx_free(context);
+  st_policy_ctx_release(context);
   return 1;
 }
 
@@ -1203,7 +1203,7 @@ static st_error_t write_nfa(void *object, const char *path) {
 }
 
 static st_error_t write_learner(void *object, const char *path) {
-  return st_save(object, path);
+  return st_learner_save(object, path);
 }
 
 static int file_mode_is(const char *path, mode_t expected) {
@@ -1215,7 +1215,10 @@ static int file_mode_is(const char *path, mode_t expected) {
 static int test_atomic_writers_preserve_regular_file_modes(void) {
   st_policy_ctx_t *context = st_policy_ctx_new();
   st_policy_t *policy = context ? st_policy_new(context) : NULL;
-  st_learner_t *learner = st_learner_new(1, 0.0);
+  st_learner_t *learner = st_learner_new(
+      &(st_learner_config_t){.min_support = 1,
+                             .min_confidence = 0.0,
+                             .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
   ASSERT(context != NULL && policy != NULL && learner != NULL);
   ASSERT(test_st_policy_add(policy, "copy #p") == ST_OK);
   ASSERT(test_st_feed(learner, "copy /tmp/source") == ST_OK);
@@ -1263,7 +1266,7 @@ static int test_atomic_writers_preserve_regular_file_modes(void) {
   ASSERT(rmdir(directory) == 0);
   st_learner_free(learner);
   st_policy_free(policy);
-  st_policy_ctx_free(context);
+  st_policy_ctx_release(context);
   return 1;
 }
 

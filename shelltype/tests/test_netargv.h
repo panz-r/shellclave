@@ -93,8 +93,8 @@ static inline st_error_t test_st_classify(const char *command,
                                           st_token_array_t *out) {
   char *encoded = test_netargv(command);
   if (!encoded)
-    return command ? ST_ERR_MEMORY : st_classify(NULL, out);
-  st_error_t error = st_classify(encoded, out);
+    return command ? ST_ERR_MEMORY : st_netargv_classify(NULL, out);
+  st_error_t error = st_netargv_classify(encoded, out);
   free(encoded);
   return error;
 }
@@ -103,8 +103,8 @@ static inline st_error_t test_st_feed(st_learner_t *learner,
                                       const char *command) {
   char *encoded = test_netargv(command);
   if (!encoded)
-    return command ? ST_ERR_MEMORY : st_feed(learner, NULL);
-  st_error_t error = st_feed(learner, encoded);
+    return command ? ST_ERR_MEMORY : st_learner_feed_netargv(learner, NULL);
+  st_error_t error = st_learner_feed_netargv(learner, encoded);
   free(encoded);
   return error;
 }
@@ -116,6 +116,16 @@ static inline st_error_t test_st_policy_eval(st_policy_t *policy,
   if (!encoded)
     return command ? ST_ERR_MEMORY : st_policy_eval(policy, NULL, result);
   st_error_t error = st_policy_eval(policy, encoded, result);
+  free(encoded);
+  return error;
+}
+
+static inline st_error_t
+test_st_policy_match(st_policy_t *policy, const char *command, bool *matches) {
+  char *encoded = test_netargv(command);
+  if (!encoded)
+    return command ? ST_ERR_MEMORY : st_policy_match(policy, NULL, matches);
+  st_error_t error = st_policy_match(policy, encoded, matches);
   free(encoded);
   return error;
 }
@@ -139,10 +149,10 @@ static inline st_error_t test_st_policy_add(st_policy_t *policy,
                                             const char *cpl) {
   st_token_array_t decoded = {0};
   if (cpl && st_netpattern_decode(cpl, &decoded) == ST_OK) {
-    st_free_token_array(&decoded);
+    st_token_array_free(&decoded);
     return st_policy_add_netpattern(policy, cpl);
   }
-  st_free_token_array(&decoded);
+  st_token_array_free(&decoded);
   char *pattern = NULL;
   st_error_t error = st_netpattern_from_cpl(cpl, &pattern);
   if (error != ST_OK)
@@ -156,10 +166,10 @@ static inline st_error_t test_st_policy_remove(st_policy_t *policy,
                                                const char *cpl) {
   st_token_array_t decoded = {0};
   if (cpl && st_netpattern_decode(cpl, &decoded) == ST_OK) {
-    st_free_token_array(&decoded);
+    st_token_array_free(&decoded);
     return st_policy_remove_netpattern(policy, cpl);
   }
-  st_free_token_array(&decoded);
+  st_token_array_free(&decoded);
   char *pattern = NULL;
   st_error_t error = st_netpattern_from_cpl(cpl, &pattern);
   if (error != ST_OK)
@@ -199,8 +209,8 @@ static inline st_error_t test_st_validate_pattern(const char *cpl,
   char *pattern = NULL;
   st_error_t error = st_netpattern_from_cpl(cpl, &pattern);
   if (error != ST_OK)
-    return cpl ? error : st_validate_netpattern(NULL, info);
-  error = st_validate_netpattern(pattern, info);
+    return cpl ? error : st_netpattern_validate(NULL, info);
+  error = st_netpattern_validate(pattern, info);
   free(pattern);
   return error;
 }
@@ -210,7 +220,7 @@ static inline st_error_t test_st_blacklist_add(st_learner_t *learner,
   char *pattern = NULL;
   st_error_t error = st_netpattern_from_cpl(cpl, &pattern);
   if (error == ST_OK)
-    error = st_blacklist_add_netpattern(learner, pattern);
+    error = st_learner_blacklist_add_netpattern(learner, pattern);
   free(pattern);
   return error;
 }
@@ -220,7 +230,7 @@ static inline bool test_st_is_blacklisted(const st_learner_t *learner,
   char *pattern = NULL;
   if (st_netpattern_from_cpl(cpl, &pattern) != ST_OK)
     return false;
-  bool found = st_is_netpattern_blacklisted(learner, pattern);
+  bool found = st_learner_is_netpattern_blacklisted(learner, pattern);
   free(pattern);
   return found;
 }

@@ -125,6 +125,16 @@ static int test_contract_boundaries(void) {
   CHECK(sg_atomic_output_commit(&output) == 0);
   CHECK(file_is_complete(relative));
   CHECK(unlink(relative) == 0);
+
+  char non_directory[256];
+  CHECK(make_destination(non_directory));
+  char nested[sizeof(non_directory) + 8];
+  int nested_length =
+      snprintf(nested, sizeof(nested), "%s/child", non_directory);
+  CHECK(nested_length > 0 && (size_t)nested_length < sizeof(nested));
+  CHECK(sg_atomic_output_begin(nested, &output) == SG_ATOMIC_OUTPUT_IO);
+  CHECK(output.stream == NULL && output.temporary_path == NULL);
+  CHECK(unlink(non_directory) == 0);
   return 1;
 }
 

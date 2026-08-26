@@ -105,7 +105,7 @@ static bool shellsplit_test_depgraph_invariants(
 
   if (error == SHELL_DEP_EINPUT || error == SHELL_DEP_EPARSE)
     return graph->node_count == 0 && graph->edge_count == 0;
-  if (!shell_dep_validate(graph).valid)
+  if (!shell_dep_graph_validate(graph).valid)
     return false;
 
   for (uint32_t i = 0; i < graph->edge_count; i++) {

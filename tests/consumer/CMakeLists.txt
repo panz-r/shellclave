@@ -10,13 +10,11 @@ else()
 endif()
 
 add_executable(shellclave_consumer main.c)
-target_link_libraries(shellclave_consumer PRIVATE
-  Shellclave::shellsplit Shellclave::shelltype Shellclave::shellgate)
+target_link_libraries(shellclave_consumer PRIVATE Shellclave::shellgate)
 
 add_executable(shellclave_cpp_consumer main.cpp)
 target_compile_features(shellclave_cpp_consumer PRIVATE cxx_std_11)
-target_link_libraries(shellclave_cpp_consumer PRIVATE
-  Shellclave::shellsplit Shellclave::shelltype Shellclave::shellgate)
+target_link_libraries(shellclave_cpp_consumer PRIVATE Shellclave::shellgate)
 
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
   target_compile_options(shellclave_consumer PRIVATE -Wall -Wextra -Wpedantic)

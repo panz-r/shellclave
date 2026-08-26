@@ -56,6 +56,18 @@ static st_policy_t *new_policy(st_policy_ctx_t *context,
   return policy;
 }
 
+typedef struct {
+  const char *patterns[4];
+  size_t count;
+  size_t stop_after;
+} match_visit_t;
+
+static bool visit_match(const char *pattern, void *user_ctx) {
+  match_visit_t *visit = user_ctx;
+  visit->patterns[visit->count++] = pattern;
+  return visit->count < visit->stop_after;
+}
+
 static int test_verify_all_matrix(void) {
   static const char *patterns[] = {"git commit -m *", "git commit -m fix",
                                    "git status", "typed #n #val",
@@ -80,7 +92,7 @@ static int test_verify_all_matrix(void) {
 
   /* The wildcard subsumes the exact commit rule; the crossing typed rules do
    * not subsume one another. */
-  ASSERT(st_policy_count(policy) == 4);
+  ASSERT(st_policy_rule_count(policy) == 4);
 
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
     const char **matches = NULL;
@@ -99,8 +111,33 @@ static int test_verify_all_matrix(void) {
         found = found || pattern_is_cpl(matches[k], cases[i].expected[j]);
       ASSERT(found);
     }
-    st_policy_free_matches(matches, count);
+    st_policy_matches_free(matches);
   }
+
+  const char **borrowed_matches = NULL;
+  size_t borrowed_count = 0;
+  st_eval_result_t borrowed_eval = {0};
+  ASSERT(test_st_policy_verify_all(policy, "git status", &borrowed_matches,
+                                   &borrowed_count) == ST_OK);
+  ASSERT(test_st_policy_eval(policy, "git status", &borrowed_eval) == ST_OK);
+  ASSERT(borrowed_count == 1 &&
+         borrowed_matches[0] == borrowed_eval.matching_pattern);
+  st_policy_matches_free(borrowed_matches);
+
+  char *netargv = test_netargv("typed 1 2");
+  ASSERT(netargv != NULL);
+  match_visit_t visit = {.stop_after = 4};
+  size_t visited = 0;
+  ASSERT(st_policy_visit_matches(policy, netargv, visit_match, &visit,
+                                 &visited) == ST_OK);
+  ASSERT(visited == 2 && visit.count == 2);
+  ASSERT(pattern_is_cpl(visit.patterns[0], "typed #n #val") ||
+         pattern_is_cpl(visit.patterns[1], "typed #n #val"));
+  visit = (match_visit_t){.stop_after = 1};
+  ASSERT(st_policy_visit_matches(policy, netargv, visit_match, &visit,
+                                 &visited) == ST_OK);
+  ASSERT(visited == 1 && visit.count == 1);
+  free(netargv);
 
   const char **matches = (const char **)1;
   size_t count = 99;
@@ -126,7 +163,126 @@ static int test_verify_all_matrix(void) {
     ASSERT(!invalid[i].give_count || count == 0);
   }
   st_policy_free(policy);
-  st_policy_ctx_free(context);
+  st_policy_ctx_release(context);
+  return 1;
+}
+
+static int test_policy_read_paths_avoid_token_allocations(void) {
+  static const char netargv[] = "4:echo,5:value,";
+  st_policy_ctx_t *context = st_policy_ctx_new();
+  ASSERT(context != NULL);
+  st_policy_t *policy = new_policy(context, (const char *[]){"echo *"}, 1);
+  ASSERT(policy != NULL);
+
+  st_eval_result_t result = {0};
+  ASSERT(st_policy_eval(policy, netargv, &result) == ST_OK && result.matches);
+  match_visit_t visit = {.stop_after = 1};
+  size_t visited = 0;
+  ASSERT(st_policy_visit_matches(policy, netargv, visit_match, &visit,
+                                 &visited) == ST_OK &&
+         visited == 1 && visit.count == 1);
+
+  st_test_alloc_reset();
+  ASSERT(st_policy_eval(policy, netargv, &result) == ST_OK && result.matches);
+  ASSERT(st_test_alloc_count() == 0);
+  visit = (match_visit_t){.stop_after = 1};
+  visited = 0;
+  ASSERT(st_policy_visit_matches(policy, netargv, visit_match, &visit,
+                                 &visited) == ST_OK &&
+         visited == 1 && st_test_alloc_count() == 0);
+  st_test_alloc_reset();
+  st_policy_free(policy);
+  st_policy_ctx_release(context);
+  return 1;
+}
+
+static int test_policy_match_matrix(void) {
+  static const char *patterns[] = {"echo #n", "kill #signal", "grep #regex",
+                                   "assign value=1"};
+  static const struct {
+    const char *command;
+    bool expected;
+  } cases[] = {{"echo 42", true},        {"echo value", false},
+               {"kill 9", true},         {"grep 'a.*'", true},
+               {"assign value=1", true}, {"assign value=2", false}};
+
+  st_policy_ctx_t *context = st_policy_ctx_new();
+  ASSERT(context != NULL);
+  st_policy_t *policy =
+      new_policy(context, patterns, sizeof(patterns) / sizeof(patterns[0]));
+  ASSERT(policy != NULL);
+
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    char *netargv = test_netargv(cases[i].command);
+    ASSERT(netargv != NULL);
+    st_eval_result_t eval = {0};
+    bool matches = !cases[i].expected;
+    ASSERT(st_policy_eval(policy, netargv, &eval) == ST_OK);
+    ASSERT(st_policy_match(policy, netargv, &matches) == ST_OK);
+    ASSERT(eval.matches == cases[i].expected && matches == eval.matches);
+    free(netargv);
+  }
+
+  static char long_netargv[sizeof("4:echo,256:") + ST_MAX_TOKEN_LEN + 1];
+  size_t long_prefix_length = sizeof("4:echo,256:") - 1;
+  memcpy(long_netargv, "4:echo,256:", long_prefix_length);
+  memset(long_netargv + long_prefix_length, 'x', ST_MAX_TOKEN_LEN);
+  long_netargv[long_prefix_length + ST_MAX_TOKEN_LEN] = ',';
+  long_netargv[long_prefix_length + ST_MAX_TOKEN_LEN + 1] = '\0';
+  bool matches = true;
+  ASSERT(st_policy_match(policy, long_netargv, &matches) == ST_OK);
+  ASSERT(!matches);
+
+  matches = true;
+  ASSERT(st_policy_match(policy, "1:x,x", &matches) == ST_ERR_FORMAT);
+  ASSERT(!matches);
+  ASSERT(st_policy_match(NULL, "4:echo,", &matches) == ST_ERR_INVALID);
+  ASSERT(!matches);
+  ASSERT(st_policy_match(policy, "4:echo,", NULL) == ST_ERR_INVALID);
+
+  char *netargv = test_netargv("echo 42");
+  ASSERT(netargv != NULL);
+  ASSERT(st_policy_match(policy, netargv, &matches) == ST_OK && matches);
+  st_test_alloc_reset();
+  ASSERT(st_policy_match(policy, netargv, &matches) == ST_OK && matches);
+  ASSERT(st_test_alloc_count() == 0);
+  st_test_alloc_reset();
+  free(netargv);
+  st_policy_free(policy);
+  st_policy_ctx_release(context);
+  return 1;
+}
+
+static int test_maximum_length_suggestion(void) {
+  char netargv[ST_MAX_CMD_TOKENS * sizeof("1:x,")];
+  char *output = netargv;
+  for (size_t i = 0; i < ST_MAX_CMD_TOKENS; i++) {
+    memcpy(output, "1:x,", sizeof("1:x,") - 1);
+    output += sizeof("1:x,") - 1;
+  }
+  *output = '\0';
+
+  st_policy_ctx_t *context = st_policy_ctx_new();
+  ASSERT(context != NULL);
+  st_policy_t *policy = new_policy(context, (const char *[]){"x"}, 1);
+  ASSERT(policy != NULL);
+
+  st_eval_result_t result = {0};
+  ASSERT(st_policy_eval(policy, netargv, &result) == ST_OK);
+  ASSERT(!result.matches && result.suggestion_count == 1);
+  ASSERT(pattern_is_cpl(result.suggestions[0].based_on, "x"));
+
+  st_token_array_t decoded = {0};
+  ASSERT(st_netpattern_decode(result.suggestions[0].pattern, &decoded) ==
+         ST_OK);
+  ASSERT(decoded.count == ST_MAX_CMD_TOKENS);
+  for (size_t i = 0; i < decoded.count; i++)
+    ASSERT(decoded.tokens[i].type == ST_TYPE_LITERAL &&
+           strcmp(decoded.tokens[i].text, "x") == 0);
+  st_token_array_free(&decoded);
+
+  st_policy_free(policy);
+  st_policy_ctx_release(context);
   return 1;
 }
 
@@ -147,7 +303,7 @@ static int test_verify_and_precedence_matrix(void) {
     ASSERT(matches != NULL);
     ASSERT(pattern_is_cpl(matches[0], "x #n #val"));
     ASSERT(pattern_is_cpl(matches[1], "x #val #n"));
-    st_policy_free_matches(matches, count);
+    st_policy_matches_free(matches);
 
     for (size_t phase = 0; phase < 2; phase++) {
       st_eval_result_t result = {0};
@@ -159,7 +315,7 @@ static int test_verify_and_precedence_matrix(void) {
     }
 
     st_policy_free(policy);
-    st_policy_ctx_free(context);
+    st_policy_ctx_release(context);
   }
   return 1;
 }
@@ -177,7 +333,7 @@ static int test_verify_all_allocation_failures_clear_outputs(void) {
   ASSERT(probe_matches != NULL && probe_count == 2);
   size_t allocations = st_test_alloc_count();
   ASSERT(allocations > 0);
-  st_policy_free_matches(probe_matches, probe_count);
+  st_policy_matches_free(probe_matches);
 
   bool observed = false;
   for (size_t fail_at = 1; fail_at <= allocations; fail_at++) {
@@ -193,12 +349,12 @@ static int test_verify_all_allocation_failures_clear_outputs(void) {
     } else {
       ASSERT(err == ST_OK);
       ASSERT(matches != NULL && count == 2);
-      st_policy_free_matches(matches, count);
+      st_policy_matches_free(matches);
     }
   }
   ASSERT(observed);
   st_policy_free(policy);
-  st_policy_ctx_free(context);
+  st_policy_ctx_release(context);
   return 1;
 }
 
@@ -208,7 +364,7 @@ static int test_semver_informational_coexistence(void) {
                                    "install #semver.minor"};
   st_policy_ctx_t *context = st_policy_ctx_new();
   st_policy_t *policy = new_policy(context, patterns, 4);
-  ASSERT(context && policy && st_policy_count(policy) == 4);
+  ASSERT(context && policy && st_policy_rule_count(policy) == 4);
 
   const char **matches = NULL;
   size_t count = 0;
@@ -221,7 +377,7 @@ static int test_semver_informational_coexistence(void) {
       found = found || pattern_is_cpl(matches[m], patterns[p]);
     ASSERT(found);
   }
-  st_policy_free_matches(matches, count);
+  st_policy_matches_free(matches);
 
   st_eval_result_t result = {0};
   ASSERT(test_st_policy_eval(policy, "install 1.2.3", &result) == ST_OK);
@@ -233,7 +389,7 @@ static int test_semver_informational_coexistence(void) {
          pattern_is_cpl(result.matching_pattern, "install #semver.*"));
 
   st_policy_free(policy);
-  st_policy_ctx_free(context);
+  st_policy_ctx_release(context);
   return 1;
 }
 
@@ -254,13 +410,13 @@ static int test_verify_high_fanout_growth(void) {
       strcpy(expected, pattern);
     pattern_count++;
   }
-  ASSERT(pattern_count == 126 && st_policy_count(policy) == 126);
+  ASSERT(pattern_count == 126 && st_policy_rule_count(policy) == 126);
   const char *command = "x 1 2 3 4 5 6 7 8 9";
   const char **matches = NULL;
   size_t count = 0;
   ASSERT(test_st_policy_verify_all(policy, command, &matches, &count) == ST_OK);
   ASSERT(count == 126);
-  st_policy_free_matches(matches, count);
+  st_policy_matches_free(matches);
   st_eval_result_t result = {0};
   ASSERT(test_st_policy_eval(policy, command, &result) == ST_OK);
   ASSERT(result.matches && pattern_is_cpl(result.matching_pattern, expected));
@@ -277,7 +433,7 @@ static int test_verify_high_fanout_growth(void) {
     if (error == ST_ERR_MEMORY) {
       eval_failure_observed = true;
       ASSERT(!result.matches && result.matching_pattern == NULL &&
-             result.suggestion_count == 0 && result.error == ST_OK);
+             result.suggestion_count == 0 && result.suggestion_error == ST_OK);
     } else {
       ASSERT(error == ST_OK && result.matches && result.matching_pattern &&
              pattern_is_cpl(result.matching_pattern, expected));
@@ -288,7 +444,7 @@ static int test_verify_high_fanout_growth(void) {
   st_test_alloc_reset();
   ASSERT(test_st_policy_verify_all(policy, command, &matches, &count) == ST_OK);
   size_t allocations = st_test_alloc_count();
-  st_policy_free_matches(matches, count);
+  st_policy_matches_free(matches);
   bool observed = false;
   for (size_t fail_at = 1; fail_at <= allocations; fail_at++) {
     matches = (const char **)1;
@@ -302,12 +458,12 @@ static int test_verify_high_fanout_growth(void) {
       ASSERT(matches == NULL && count == 0);
     } else {
       ASSERT(error == ST_OK && count == 126);
-      st_policy_free_matches(matches, count);
+      st_policy_matches_free(matches);
     }
   }
   ASSERT(observed);
   st_policy_free(policy);
-  st_policy_ctx_free(context);
+  st_policy_ctx_release(context);
   return 1;
 }
 
@@ -376,13 +532,16 @@ static int test_suggestion_round_trip_matrix(void) {
     }
   }
   st_policy_free(policy);
-  st_policy_ctx_free(context);
+  st_policy_ctx_release(context);
   return 1;
 }
 
 int main(void) {
   printf("Running verification tests...\n\n");
   TEST(test_verify_all_matrix);
+  TEST(test_policy_read_paths_avoid_token_allocations);
+  TEST(test_policy_match_matrix);
+  TEST(test_maximum_length_suggestion);
   TEST(test_verify_and_precedence_matrix);
   TEST(test_verify_all_allocation_failures_clear_outputs);
   TEST(test_semver_informational_coexistence);

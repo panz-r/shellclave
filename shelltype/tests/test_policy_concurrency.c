@@ -1,5 +1,6 @@
 #define _XOPEN_SOURCE 700
 
+#include "policy_ctx.h"
 #include "shelltype.h"
 #include "test_netargv.h"
 
@@ -97,11 +98,11 @@ static void *policy_reader(void *opaque) {
         match_count != 1 || matches == NULL ||
         !pattern_is_cpl(matches[0], command)) {
       record_failure(args->failures, "policy verification", args->id, i);
-      st_policy_free_matches(matches, match_count);
+      st_policy_matches_free(matches);
       break;
     }
-    st_policy_free_matches(matches, match_count);
-    size_t count = st_policy_count(args->policy);
+    st_policy_matches_free(matches);
+    size_t count = st_policy_rule_count(args->policy);
     if (count < 2) {
       record_failure(args->failures, "policy count", args->id, i);
       break;
@@ -161,14 +162,14 @@ static int test_concurrent_policy_readers(void) {
   if (!ctx || !policy) {
     fprintf(stderr, "failed to create policy context\n");
     st_policy_free(policy);
-    st_policy_ctx_free(ctx);
+    st_policy_ctx_release(ctx);
     return 0;
   }
   if (test_st_policy_add(policy, "git status") != ST_OK ||
       test_st_policy_add(policy, "docker ps") != ST_OK) {
     fprintf(stderr, "failed to add baseline patterns\n");
     st_policy_free(policy);
-    st_policy_ctx_free(ctx);
+    st_policy_ctx_release(ctx);
     return 0;
   }
 
@@ -176,7 +177,7 @@ static int test_concurrent_policy_readers(void) {
   if (pthread_barrier_init(&barrier, NULL, READER_COUNT) != 0) {
     fprintf(stderr, "failed to initialize policy barrier\n");
     st_policy_free(policy);
-    st_policy_ctx_free(ctx);
+    st_policy_ctx_release(ctx);
     return 0;
   }
 
@@ -222,13 +223,13 @@ static int test_concurrent_policy_readers(void) {
             (unsigned long long)stats.eval_count);
     passed = false;
   }
-  if (st_policy_count(policy) != 2) {
+  if (st_policy_rule_count(policy) != 2) {
     fprintf(stderr, "reader changed the baseline pattern count\n");
     passed = false;
   }
 
   st_policy_free(policy);
-  st_policy_ctx_free(ctx);
+  st_policy_ctx_release(ctx);
   return passed;
 }
 
@@ -284,14 +285,14 @@ static int test_concurrent_same_policy_readers_and_writer(void) {
   bool passed = atomic_load(&failures) == 0;
   passed = passed && policy_matches_exact(policy, "git status") &&
            policy_matches_exact(policy, "docker ps") &&
-           st_policy_count(policy) == 2;
+           st_policy_rule_count(policy) == 2;
   st_policy_free(policy);
-  st_policy_ctx_free(ctx);
+  st_policy_ctx_release(ctx);
   return passed;
 
 setup_failed:
   st_policy_free(policy);
-  st_policy_ctx_free(ctx);
+  st_policy_ctx_release(ctx);
   return 0;
 }
 
@@ -334,7 +335,7 @@ static int test_concurrent_context_refcount(void) {
 
   pthread_barrier_t barrier;
   if (pthread_barrier_init(&barrier, NULL, REFCOUNT_THREAD_COUNT + 1) != 0) {
-    st_policy_ctx_free(ctx);
+    st_policy_ctx_release(ctx);
     return 0;
   }
 
@@ -371,12 +372,12 @@ static int test_concurrent_context_refcount(void) {
   st_policy_t *policy = st_policy_new(ctx);
   st_error_t add_result =
       policy ? test_st_policy_add(policy, "echo ok") : ST_ERR_MEMORY;
-  size_t policy_count = policy ? st_policy_count(policy) : 0;
+  size_t policy_count = policy ? st_policy_rule_count(policy) : 0;
   bool policy_usable = policy && add_result == ST_OK && policy_count == 1 &&
                        policy_matches_exact(policy, "echo ok");
   bool passed = atomic_load(&failures) == 0 && policy_usable;
   st_policy_free(policy);
-  st_policy_ctx_free(ctx);
+  st_policy_ctx_release(ctx);
   return passed;
 }
 
@@ -419,7 +420,7 @@ static int test_concurrent_context_interning(void) {
 
   pthread_barrier_t barrier;
   if (pthread_barrier_init(&barrier, NULL, INTERN_THREAD_COUNT) != 0) {
-    st_policy_ctx_free(ctx);
+    st_policy_ctx_release(ctx);
     return 0;
   }
 
@@ -454,7 +455,7 @@ static int test_concurrent_context_interning(void) {
         passed = false;
   }
 
-  st_policy_ctx_free(ctx);
+  st_policy_ctx_release(ctx);
   return passed;
 }
 
@@ -465,7 +466,7 @@ static int test_concurrent_shared_context_writes(void) {
   if (!policies[0] || !policies[1]) {
     st_policy_free(policies[0]);
     st_policy_free(policies[1]);
-    st_policy_ctx_free(ctx);
+    st_policy_ctx_release(ctx);
     return 0;
   }
 
@@ -497,7 +498,7 @@ static int test_concurrent_shared_context_writes(void) {
   bool passed = atomic_load(&failures) == 0;
   static const char *patterns[] = {"left final", "right final"};
   for (size_t i = 0; i < 2; i++) {
-    if (st_policy_count(policies[i]) != 0 ||
+    if (st_policy_rule_count(policies[i]) != 0 ||
         test_st_policy_add(policies[i], patterns[i]) != ST_OK ||
         !policy_matches_exact(policies[i], patterns[i]))
       passed = false;
@@ -505,7 +506,7 @@ static int test_concurrent_shared_context_writes(void) {
 
   st_policy_free(policies[0]);
   st_policy_free(policies[1]);
-  st_policy_ctx_free(ctx);
+  st_policy_ctx_release(ctx);
   return passed;
 }
 

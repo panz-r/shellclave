@@ -10,6 +10,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "shell_depgraph.h"
+#include "shell_depgraph_internal.h"
 #include "shell_tokenizer.h"
 #include <ctype.h>
 #include <limits.h>
@@ -831,10 +832,10 @@ static bool add_doc_envvar(shell_dep_graph_t *g, uint32_t max_nodes,
 
 /* --- MAIN PARSER --- */
 
-shell_dep_error_t shell_parse_depgraph(const char *cmd, size_t cmd_len,
-                                       const char *initial_cwd,
-                                       const shell_dep_limits_t *limits,
-                                       uint32_t depth, shell_dep_graph_t *out) {
+static shell_dep_error_t shell_dep_graph_parse_impl(
+    const char *cmd, size_t cmd_len, const char *initial_cwd,
+    const shell_dep_limits_t *limits, uint32_t depth,
+    const shell_parse_result_t *provided_fast, shell_dep_graph_t *out) {
   if (!cmd || !out || cmd_len == 0) {
     if (out) {
       out->node_count = 0;
@@ -899,7 +900,15 @@ shell_dep_error_t shell_parse_depgraph(const char *cmd, size_t cmd_len,
   out->status = 0;
 
   shell_parse_result_t fast_result;
-  shell_error_t fast_err = shell_parse_fast(cmd, cmd_len, NULL, &fast_result);
+  shell_error_t fast_err;
+  if (provided_fast) {
+    fast_result = *provided_fast;
+    fast_err = (fast_result.status & SHELL_STATUS_ERROR)       ? SHELL_EPARSE
+               : (fast_result.status & SHELL_STATUS_TRUNCATED) ? SHELL_ETRUNC
+                                                               : SHELL_OK;
+  } else {
+    fast_err = shell_parse_fast(cmd, cmd_len, NULL, &fast_result);
+  }
   bool whitespace_only = true;
   for (uint32_t i = 0; i < cmd_len; i++) {
     if (!isspace((unsigned char)cmd[i])) {
@@ -1258,9 +1267,9 @@ shell_dep_error_t shell_parse_depgraph(const char *cmd, size_t cmd_len,
             uint32_t sub_len = target->len - 2;
             shell_dep_graph_t sub_graph;
             memset(&sub_graph, 0, sizeof(sub_graph));
-            shell_dep_error_t sub_err = shell_parse_depgraph(
+            shell_dep_error_t sub_err = shell_dep_graph_parse_impl(
                 sub_content, sub_len, out->cwd_buf.data + cwd_offset, limits,
-                depth + 1, &sub_graph);
+                depth + 1, NULL, &sub_graph);
             if (sub_err == SHELL_DEP_EPARSE || sub_err == SHELL_DEP_EINPUT) {
               out->node_count = 0;
               out->edge_count = 0;
@@ -1374,8 +1383,9 @@ shell_dep_error_t shell_parse_depgraph(const char *cmd, size_t cmd_len,
         if (sub_content && sub_len > 0) {
           shell_dep_graph_t sub_graph;
           memset(&sub_graph, 0, sizeof(sub_graph));
-          shell_dep_error_t sub_err = shell_parse_depgraph(
-              sub_content, sub_len, sub_cwd_str, limits, depth + 1, &sub_graph);
+          shell_dep_error_t sub_err =
+              shell_dep_graph_parse_impl(sub_content, sub_len, sub_cwd_str,
+                                         limits, depth + 1, NULL, &sub_graph);
           if (sub_err == SHELL_DEP_EPARSE || sub_err == SHELL_DEP_EINPUT) {
             out->node_count = 0;
             out->edge_count = 0;
@@ -1578,6 +1588,24 @@ shell_dep_error_t shell_parse_depgraph(const char *cmd, size_t cmd_len,
                                                     : SHELL_DEP_OK;
 }
 
+shell_dep_error_t shell_dep_graph_parse(const char *cmd, size_t cmd_len,
+                                        const char *initial_cwd,
+                                        const shell_dep_limits_t *limits,
+                                        shell_dep_graph_t *out) {
+  return shell_dep_graph_parse_impl(cmd, cmd_len, initial_cwd, limits, 0, NULL,
+                                    out);
+}
+
+shell_dep_error_t shell_dep_graph_parse_with_fast(
+    const char *cmd, size_t cmd_len, const char *initial_cwd,
+    const shell_dep_limits_t *limits, const shell_parse_result_t *fast,
+    shell_dep_graph_t *out) {
+  if (!fast)
+    return shell_dep_graph_parse(cmd, cmd_len, initial_cwd, limits, out);
+  return shell_dep_graph_parse_impl(cmd, cmd_len, initial_cwd, limits, 0, fast,
+                                    out);
+}
+
 /* --- GRAPH UTILITIES --- */
 
 void shell_dep_graph_dump(const shell_dep_graph_t *g, FILE *fp) {
@@ -1631,8 +1659,9 @@ void shell_dep_graph_dump(const shell_dep_graph_t *g, FILE *fp) {
   }
 }
 
-shell_dep_validate_result_t shell_dep_validate(const shell_dep_graph_t *g) {
-  shell_dep_validate_result_t r;
+shell_dep_graph_validation_t
+shell_dep_graph_validate(const shell_dep_graph_t *g) {
+  shell_dep_graph_validation_t r;
   r.valid = true;
   r.error_count = 0;
 

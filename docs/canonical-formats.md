@@ -8,7 +8,9 @@ not characters. Embedded spaces, quotes, commas, colons, and newlines need no
 escaping. `shell_netstring.h` provides a length-aware, byte-oriented iterator
 for applications that need to validate or traverse these records; it can expose
 NUL payload bytes. Shellclave's netargv/netsequence-producing APIs remain
-C-string transports, so their payloads do not support embedded NUL bytes.
+NUL-free transports, so their payloads do not support embedded NUL bytes.
+Shelltype's `st_netargv_view_t` carries an explicit byte length for callers
+that already know it; it preserves that same NUL-free contract.
 
 ## netargv
 
@@ -25,7 +27,12 @@ escape processing, control-flow isolation, and redirection removal. Another
 caller may perform those steps itself. Shelltype decodes these boundaries and
 classifies arguments; it does not tokenize shell source.
 
-Shellgate publishes this value as `sg_subcmd_result_t.netargv` with an explicit
+The `*_view` Shelltype entry points accept `st_netargv_view_t` and use its
+explicit length directly. Existing C-string entry points remain convenience
+wrappers that derive that length with `strlen()`. A NULL data pointer is valid
+only for an empty view; neither form accepts embedded NUL bytes.
+
+Shellgate publishes this value as `sg_subcommand_result_t.netargv` with an explicit
 length. It is the authoritative result for applications. The adjacent
 `command` member is a readable, lossy diagnostic display and is never shell
 source or a replacement for netargv.

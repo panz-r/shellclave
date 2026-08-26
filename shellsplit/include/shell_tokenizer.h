@@ -104,7 +104,7 @@ static const shell_limits_t SHELL_LIMITS_DEFAULT = {
 /**
  * Feature flag set - alternative to bitmask shell_cmd_features_t.
  * Provides named boolean fields for each feature.
- * Use shell_get_feature_flags() to populate this struct.
+ * Use shell_feature_flags_from_bits() to populate this struct.
  */
 typedef struct {
   bool has_vars;
@@ -128,7 +128,8 @@ typedef struct {
  * @param features  Raw features bitmask from shell_range_t.features
  * @param flags     Output struct; NULL is ignored
  */
-void shell_get_feature_flags(uint32_t features, shell_feature_flags_t *flags);
+void shell_feature_flags_from_bits(uint32_t features,
+                                   shell_feature_flags_t *flags);
 
 /**
  * Get human-readable error string for fast parser error code.
@@ -188,7 +189,7 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
  * @param buf_len Buffer size
  * @return        Bytes written (excluding null), or 0 on error
  */
-size_t shell_copy_subcommand(const char *cmd, const shell_range_t *range,
+size_t shell_subcommand_copy(const char *cmd, const shell_range_t *range,
                              char *buf, size_t buf_len);
 
 /**
@@ -199,8 +200,8 @@ size_t shell_copy_subcommand(const char *cmd, const shell_range_t *range,
  * @param out_len Output parameter for length
  * @return        Pointer into original command (not null-terminated)
  */
-const char *shell_get_subcommand(const char *cmd, const shell_range_t *range,
-                                 uint32_t *out_len);
+const char *shell_subcommand_view(const char *cmd, const shell_range_t *range,
+                                  size_t *out_len);
 
 /* Full parser section is in shell_tokenizer_full.h */
 

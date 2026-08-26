@@ -32,6 +32,7 @@
 #include "shell_abstract.h"
 #include "shell_netstring.h"
 #include "shell_processor.h"
+#include "shell_sequence.h"
 #include "shellgate.h"
 
 #define MAX_LINE 4096
@@ -317,7 +318,7 @@ int main(int argc, char **argv) {
   }
 
   sg_gate_t *gate = sg_gate_new();
-  if (!gate || sg_gate_enable_anomaly(gate, 5.0, 0.1, -10.0) != SG_OK) {
+  if (!gate || sg_gate_enable_anomaly(gate, 5.0, NULL) != SG_OK) {
     sg_gate_free(gate);
     fprintf(stderr, "Cannot create anomaly gate\n");
     return 1;
@@ -348,9 +349,9 @@ int main(int argc, char **argv) {
       continue;
     char *raw = NULL, *type = NULL;
     size_t raw_count = 0, type_count = 0;
-    if (shell_build_command_netseq(cmd, NULL, &raw, &raw_count) !=
+    if (shell_build_command_netseq(cmd, strlen(cmd), NULL, &raw, &raw_count) !=
             SHELL_PROCESS_OK ||
-        shell_build_type_netseq(cmd, NULL, &type, &type_count) !=
+        shell_build_type_netseq(cmd, strlen(cmd), NULL, &type, &type_count) !=
             SHELL_PROCESS_OK ||
         raw_count == 0 || raw_count != type_count) {
       free(raw);
@@ -359,7 +360,8 @@ int main(int argc, char **argv) {
     }
     char buf[8192];
     sg_result_t result;
-    if (sg_eval(gate, cmd, strlen(cmd), buf, sizeof(buf), &result) != SG_OK) {
+    if (sg_gate_evaluate(gate, cmd, strlen(cmd), buf, sizeof(buf), &result) !=
+        SG_OK) {
       free(raw);
       free(type);
       continue;

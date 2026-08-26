@@ -12,31 +12,33 @@ static int check_pipeline(const char *input, const char *expected_clean,
   shell_command_info_t *commands = NULL;
   size_t command_count = 0;
   char *netargv = NULL;
-  if (shell_process_command(input, NULL, &commands, &command_count) !=
-          SHELL_PROCESS_OK ||
-      command_count != 1 || shell_has_dangerous_features(&commands[0]))
+  if (shell_process_command(input, strlen(input), NULL, &commands,
+                            &command_count) != SHELL_PROCESS_OK ||
+      command_count != 1 ||
+      shell_command_info_has_dangerous_features(&commands[0]))
     goto fail;
   if (shell_render_netargv(&commands[0], NULL, &netargv) != SHELL_PROCESS_OK)
     goto fail;
 
   st_token_array_t typed = {0};
-  if (st_classify(netargv, &typed) != ST_OK || typed.count != expected_count) {
-    st_free_token_array(&typed);
+  if (st_netargv_classify(netargv, &typed) != ST_OK ||
+      typed.count != expected_count) {
+    st_token_array_free(&typed);
     goto fail;
   }
   for (size_t i = 0; i < expected_count; i++) {
     if (strcmp(typed.tokens[i].text, expected_tokens[i]) != 0) {
-      st_free_token_array(&typed);
+      st_token_array_free(&typed);
       goto fail;
     }
   }
-  st_free_token_array(&typed);
-  shell_free_command_infos(commands, command_count);
+  st_token_array_free(&typed);
+  shell_command_infos_free(commands, command_count);
   free(netargv);
   return 1;
 
 fail:
-  shell_free_command_infos(commands, command_count);
+  shell_command_infos_free(commands, command_count);
   free(netargv);
   return 0;
 }
@@ -47,16 +49,19 @@ static int check_trusted_processed_input(void) {
   static const char *const expected[] = {"printf", "two words",
                                          "literal>operator", "a\\b"};
   st_token_array_t typed = {0};
-  st_learner_t *learner = st_learner_new(1, 0.0);
+  st_learner_t *learner = st_learner_new(
+      &(st_learner_config_t){.min_support = 1,
+                             .min_confidence = 0.0,
+                             .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
   st_policy_ctx_t *ctx = st_policy_ctx_new();
   st_policy_t *policy = ctx ? st_policy_new(ctx) : NULL;
-  if (!learner || st_classify(netargv, &typed) != ST_OK ||
+  if (!learner || st_netargv_classify(netargv, &typed) != ST_OK ||
       typed.count != sizeof(expected) / sizeof(expected[0]))
     goto fail;
   for (size_t i = 0; i < typed.count; i++)
     if (strcmp(typed.tokens[i].text, expected[i]) != 0)
       goto fail;
-  if (st_feed(learner, netargv) != ST_OK)
+  if (st_learner_feed_netargv(learner, netargv) != ST_OK)
     goto fail;
   char *netpattern = NULL;
   if (!policy || st_netpattern_from_cpl("printf * * *", &netpattern) != ST_OK ||
@@ -72,21 +77,21 @@ static int check_trusted_processed_input(void) {
   size_t match_count = 0;
   if (st_policy_verify_all(policy, netargv, &matches, &match_count) != ST_OK ||
       match_count != 1) {
-    st_policy_free_matches(matches, match_count);
+    st_policy_matches_free(matches);
     goto fail;
   }
-  st_policy_free_matches(matches, match_count);
-  st_free_token_array(&typed);
+  st_policy_matches_free(matches);
+  st_token_array_free(&typed);
   st_learner_free(learner);
   st_policy_free(policy);
-  st_policy_ctx_free(ctx);
+  st_policy_ctx_release(ctx);
   return 1;
 
 fail:
-  st_free_token_array(&typed);
+  st_token_array_free(&typed);
   st_learner_free(learner);
   st_policy_free(policy);
-  st_policy_ctx_free(ctx);
+  st_policy_ctx_release(ctx);
   return 0;
 }
 

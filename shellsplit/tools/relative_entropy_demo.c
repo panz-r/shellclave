@@ -12,8 +12,8 @@ int main(void) {
 
   for (int i = 0; i < 4; i++) {
     const char *s = test_strings[i];
-    double ratio_char = relative_entropy_ratio(s, 10, 1);
-    double ratio_2gram = relative_entropy_ratio(s, 10, 2);
+    double ratio_char = shell_rpe_relative_entropy_ratio(s, 10, 1);
+    double ratio_2gram = shell_rpe_relative_entropy_ratio(s, 10, 2);
 
     printf("String: %s\n", s);
     printf("  Character ratio: %.2f\n", ratio_char);

@@ -448,9 +448,9 @@ st_error_t st_netpattern_from_cpl(const char *cpl, char **out_netpattern) {
   error = st_netpattern_encode(tokens, count, out_netpattern);
 cpl_done:
   for (size_t i = 0; i < count; i++) {
-    free(tokens[i].prefix);
-    free(tokens[i].capture);
-    free(tokens[i].suffix);
+    free((void *)tokens[i].prefix);
+    free((void *)tokens[i].capture);
+    free((void *)tokens[i].suffix);
   }
   free_words(words, count);
   return error;
@@ -636,24 +636,25 @@ st_error_t st_netpattern_decode(const char *netpattern,
       token.capture = typed_text;
       token.suffix = strndup(suffix, suffix_length);
       size_t display_length = prefix_length + typed_length + suffix_length + 2;
-      token.text = malloc(display_length + 1);
+      char *display_text = malloc(display_length + 1);
+      token.text = display_text;
       if (!token.prefix || !token.suffix || !token.text) {
-        free(token.prefix);
-        free(token.capture);
-        free(token.suffix);
-        free(token.text);
+        free((void *)token.prefix);
+        free((void *)token.capture);
+        free((void *)token.suffix);
+        free((void *)token.text);
         goto memory;
       }
       size_t display_used = 0;
-      memcpy(token.text + display_used, prefix, prefix_length);
+      memcpy(display_text + display_used, prefix, prefix_length);
       display_used += prefix_length;
-      token.text[display_used++] = '{';
-      memcpy(token.text + display_used, typed, typed_length);
+      display_text[display_used++] = '{';
+      memcpy(display_text + display_used, typed, typed_length);
       display_used += typed_length;
-      token.text[display_used++] = '}';
-      memcpy(token.text + display_used, suffix, suffix_length);
+      display_text[display_used++] = '}';
+      memcpy(display_text + display_used, suffix, suffix_length);
       display_used += suffix_length;
-      token.text[display_used] = '\0';
+      display_text[display_used] = '\0';
       token.type = ST_TYPE_LITERAL;
       token.compound = true;
       token.capture_type = capture_type;
@@ -666,22 +667,22 @@ st_error_t st_netpattern_decode(const char *netpattern,
       token.type = ST_TYPE_LITERAL;
       if (tag[0] == 'T') {
         if (!wildcard_spelling(token.text)) {
-          free(token.text);
+          free((void *)token.text);
           goto format;
         }
         token.type = wildcard_type(token.text);
         if (token.type == ST_TYPE_LITERAL) {
-          free(token.text);
+          free((void *)token.text);
           goto format;
         }
       }
     }
     st_token_t *grown = realloc(tokens, (count + 1) * sizeof(*tokens));
     if (!grown) {
-      free(token.text);
-      free(token.prefix);
-      free(token.capture);
-      free(token.suffix);
+      free((void *)token.text);
+      free((void *)token.prefix);
+      free((void *)token.capture);
+      free((void *)token.suffix);
       goto memory;
     }
     tokens = grown;
@@ -707,28 +708,28 @@ st_error_t st_netpattern_decode(const char *netpattern,
   return ST_OK;
 format:
   for (size_t i = 0; i < count; i++) {
-    free(tokens[i].text);
-    free(tokens[i].prefix);
-    free(tokens[i].capture);
-    free(tokens[i].suffix);
+    free((void *)tokens[i].text);
+    free((void *)tokens[i].prefix);
+    free((void *)tokens[i].capture);
+    free((void *)tokens[i].suffix);
   }
   free(tokens);
   return ST_ERR_FORMAT;
 limit:
   for (size_t i = 0; i < count; i++) {
-    free(tokens[i].text);
-    free(tokens[i].prefix);
-    free(tokens[i].capture);
-    free(tokens[i].suffix);
+    free((void *)tokens[i].text);
+    free((void *)tokens[i].prefix);
+    free((void *)tokens[i].capture);
+    free((void *)tokens[i].suffix);
   }
   free(tokens);
   return ST_ERR_LIMIT;
 memory:
   for (size_t i = 0; i < count; i++) {
-    free(tokens[i].text);
-    free(tokens[i].prefix);
-    free(tokens[i].capture);
-    free(tokens[i].suffix);
+    free((void *)tokens[i].text);
+    free((void *)tokens[i].prefix);
+    free((void *)tokens[i].capture);
+    free((void *)tokens[i].suffix);
   }
   free(tokens);
   return ST_ERR_MEMORY;
@@ -752,13 +753,13 @@ st_error_t st_netpattern_to_cpl(const char *netpattern, char **out_cpl) {
       if (literal_needs_quotes(decoded.tokens[i].prefix, prefix_length) ||
           (suffix_length &&
            literal_needs_quotes(decoded.tokens[i].suffix, suffix_length))) {
-        st_free_token_array(&decoded);
+        st_token_array_free(&decoded);
         return ST_ERR_INVALID;
       }
       size_t addition = prefix_length + capture_length + suffix_length + 2;
       if (addition > SIZE_MAX - required ||
           required + addition >= ST_MAX_CPL_LEN) {
-        st_free_token_array(&decoded);
+        st_token_array_free(&decoded);
         return ST_ERR_LIMIT;
       }
       required += addition;
@@ -773,14 +774,14 @@ st_error_t st_netpattern_to_cpl(const char *netpattern, char **out_cpl) {
             : value_length;
     if (addition > SIZE_MAX - required ||
         required + addition >= ST_MAX_CPL_LEN) {
-      st_free_token_array(&decoded);
+      st_token_array_free(&decoded);
       return ST_ERR_LIMIT;
     }
     required += addition;
   }
   char *cpl = malloc(required + 1);
   if (!cpl) {
-    st_free_token_array(&decoded);
+    st_token_array_free(&decoded);
     return ST_ERR_MEMORY;
   }
   size_t used = 0;
@@ -812,7 +813,7 @@ st_error_t st_netpattern_to_cpl(const char *netpattern, char **out_cpl) {
   }
   cpl[used] = '\0';
   *out_cpl = cpl;
-  st_free_token_array(&decoded);
+  st_token_array_free(&decoded);
   return ST_OK;
 }
 

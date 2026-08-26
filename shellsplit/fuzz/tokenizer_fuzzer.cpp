@@ -17,6 +17,7 @@
 #include "shell_depgraph.h"
 #include "shell_interop.h"
 #include "shell_processor.h"
+#include "shell_sequence.h"
 #include "shell_tokenizer.h"
 #include "shell_tokenizer_full.h"
 #include "shell_transform.h"
@@ -30,7 +31,8 @@ extern "C" {
 static const size_t MAX_INPUT_SIZE = 8192;
 static int g_verbose = 0;
 
-/* CWD strategies for shell_parse_depgraph. NULL tests the early substitution to
+/* CWD strategies for shell_dep_graph_parse. NULL tests the early substitution
+ * to
  * "." inside the parser; the rest cover the realistic path shapes used in
  * existing depgraph tests plus a few edge cases. */
 static const char *kCwdStrategies[] = {
@@ -106,7 +108,7 @@ static int validate_fast_result(const char *input, size_t length,
     }
 
     char buf[256];
-    size_t copied = shell_copy_subcommand(input, r, buf, sizeof(buf));
+    size_t copied = shell_subcommand_copy(input, r, buf, sizeof(buf));
     size_t expected = r->len < sizeof(buf) ? r->len : sizeof(buf) - 1;
     if (copied != expected || buf[copied] != '\0' ||
         memcmp(buf, input + r->start, copied) != 0) {
@@ -115,8 +117,8 @@ static int validate_fast_result(const char *input, size_t length,
       return 1;
     }
 
-    uint32_t out_len = 0;
-    const char *ptr = shell_get_subcommand(input, r, &out_len);
+    size_t out_len = 0;
+    const char *ptr = shell_subcommand_view(input, r, &out_len);
     if (ptr != input + r->start || out_len != r->len) {
       if (g_verbose)
         fprintf(stderr, "\n=== FAST PARSER ERROR: Length mismatch ===\n");
@@ -204,8 +206,10 @@ static int test_fixed_oracles(void) {
       return 1;
     shell_command_t *commands = NULL;
     size_t command_count = 0;
-    bool ok = shell_tokenize_commands(item.input, &commands, &command_count);
-    shell_free_commands(commands, command_count);
+    bool ok =
+        (shell_tokenize_commands(item.input, strlen(item.input), &commands,
+                                 &command_count) == SHELL_TOKENIZE_OK);
+    shell_commands_free(commands, command_count);
     if (!ok || command_count != item.count)
       return 1;
   }
@@ -228,8 +232,8 @@ static int test_fixed_oracles(void) {
   };
   for (const dep_oracle_case &item : dep_cases) {
     shell_dep_graph_t graph = {};
-    if (shell_parse_depgraph(item.input, strlen(item.input), ".", NULL, 0,
-                             &graph) != SHELL_DEP_OK ||
+    if (shell_dep_graph_parse(item.input, strlen(item.input), ".", NULL,
+                              &graph) != SHELL_DEP_OK ||
         !shellsplit_test_depgraph_invariants(item.input, strlen(item.input),
                                              SHELL_DEP_OK, &graph,
                                              &SHELL_DEP_LIMITS_DEFAULT))
@@ -258,8 +262,8 @@ static int test_fixed_oracles(void) {
   };
   for (const composition_oracle &item : composition_cases) {
     shell_dep_graph_t graph = {};
-    if (shell_parse_depgraph(item.input, strlen(item.input), ".", NULL, 0,
-                             &graph) != SHELL_DEP_OK)
+    if (shell_dep_graph_parse(item.input, strlen(item.input), ".", NULL,
+                              &graph) != SHELL_DEP_OK)
       return 1;
     uint32_t command_count = 0;
     bool edge_seen = false;
@@ -284,11 +288,12 @@ static int test_fixed_oracles(void) {
       return 1;
     shell_command_t *commands = NULL;
     size_t command_count = 0;
-    if (shell_tokenize_commands(input, &commands, &command_count)) {
-      shell_free_commands(commands, command_count);
+    if ((shell_tokenize_commands(input, strlen(input), &commands,
+                                 &command_count) == SHELL_TOKENIZE_OK)) {
+      shell_commands_free(commands, command_count);
       return 1;
     }
-    shell_free_commands(commands, command_count);
+    shell_commands_free(commands, command_count);
   }
   static const char *const unsupported_nested_documents[] = {
       "echo $(cat <<EOF\nbody\nEOF)",
@@ -301,7 +306,7 @@ static int test_fixed_oracles(void) {
         !(fast.status & SHELL_STATUS_ERROR))
       return 1;
     shell_dep_graph_t graph = {};
-    if (shell_parse_depgraph(input, strlen(input), ".", NULL, 0, &graph) !=
+    if (shell_dep_graph_parse(input, strlen(input), ".", NULL, &graph) !=
             SHELL_DEP_EPARSE ||
         graph.status != SHELL_DEP_STATUS_ERROR)
       return 1;
@@ -312,7 +317,7 @@ static int test_fixed_oracles(void) {
   };
   for (const char *input : unsupported_nested_structures) {
     shell_dep_graph_t graph = {};
-    if (shell_parse_depgraph(input, strlen(input), ".", NULL, 0, &graph) !=
+    if (shell_dep_graph_parse(input, strlen(input), ".", NULL, &graph) !=
             SHELL_DEP_EPARSE ||
         graph.status != SHELL_DEP_STATUS_ERROR || graph.node_count != 0 ||
         graph.edge_count != 0)
@@ -332,14 +337,15 @@ static int test_fixed_oracles(void) {
   for (const full_feature_case &item : full_cases) {
     shell_command_t *commands = NULL;
     size_t command_count = 0;
-    if (!shell_tokenize_commands(item.input, &commands, &command_count) ||
+    if (!(shell_tokenize_commands(item.input, strlen(item.input), &commands,
+                                  &command_count) == SHELL_TOKENIZE_OK) ||
         command_count == 0 || commands[0].has_loops != item.loops ||
         commands[0].has_conditionals != item.conditionals ||
         commands[0].has_case != item.case_stmt) {
-      shell_free_commands(commands, command_count);
+      shell_commands_free(commands, command_count);
       return 1;
     }
-    shell_free_commands(commands, command_count);
+    shell_commands_free(commands, command_count);
   }
   return 0;
 }
@@ -400,15 +406,16 @@ static int test_plain_differential(const char *input, size_t length) {
     return 1;
   shell_command_t *commands = NULL;
   size_t command_count = 0;
-  bool full_ok = shell_tokenize_commands(input, &commands, &command_count);
-  shell_free_commands(commands, command_count);
+  bool full_ok = (shell_tokenize_commands(input, strlen(input), &commands,
+                                          &command_count) == SHELL_TOKENIZE_OK);
+  shell_commands_free(commands, command_count);
   if (!full_ok || command_count != 1)
     return 1;
   shell_command_info_t *infos = NULL;
   size_t info_count = 0;
   shell_process_status_t processed =
-      shell_process_command(input, NULL, &infos, &info_count);
-  shell_free_command_infos(infos, info_count);
+      shell_process_command(input, strlen(input), NULL, &infos, &info_count);
+  shell_command_infos_free(infos, info_count);
   return processed != SHELL_PROCESS_OK || info_count != 1;
 }
 
@@ -418,8 +425,7 @@ static int validate_depgraph(const char *input, size_t length,
                              const shell_dep_limits_t *limits);
 static int test_full_parser(const char *input, size_t length);
 
-static int test_structured_variants(const char *input, size_t length,
-                                    uint32_t depth) {
+static int test_structured_variants(const char *input, size_t length) {
   if (length == 0 || length > 256)
     return 0;
   std::string base(input, length);
@@ -434,8 +440,8 @@ static int test_structured_variants(const char *input, size_t length,
       return 1;
     shell_dep_graph_t graph = {};
     shell_dep_limits_t limits = SHELL_DEP_LIMITS_DEFAULT;
-    shell_dep_error_t dep_error = shell_parse_depgraph(
-        variant.data(), variant.size(), ".", &limits, depth, &graph);
+    shell_dep_error_t dep_error = shell_dep_graph_parse(
+        variant.data(), variant.size(), ".", &limits, &graph);
     if (validate_depgraph(variant.data(), variant.size(), dep_error, &graph,
                           &limits))
       return 1;
@@ -455,8 +461,7 @@ static int validate_depgraph(const char *input, size_t length,
              : 1;
 }
 
-static int test_depgraph(const char *input, size_t length, const char *cwd,
-                         uint32_t depth) {
+static int test_depgraph(const char *input, size_t length, const char *cwd) {
   static const shell_dep_limits_t limits[] = {
       SHELL_DEP_LIMITS_DEFAULT,
       {0, 0, 0, 2, false},
@@ -473,7 +478,7 @@ static int test_depgraph(const char *input, size_t length, const char *cwd,
   for (size_t i = 0; i < sizeof(limits) / sizeof(limits[0]); i++) {
     shell_dep_graph_t graph = {};
     shell_dep_error_t error =
-        shell_parse_depgraph(input, length, cwd, &limits[i], depth, &graph);
+        shell_dep_graph_parse(input, length, cwd, &limits[i], &graph);
     if (validate_depgraph(input, length, error, &graph, &limits[i]))
       return 1;
   }
@@ -485,13 +490,14 @@ static int test_full_parser(const char *input, size_t length) {
   shell_command_t *commands = NULL;
   size_t command_count = 0;
 
-  bool success = shell_tokenize_commands(input, &commands, &command_count);
+  bool success = (shell_tokenize_commands(input, strlen(input), &commands,
+                                          &command_count) == SHELL_TOKENIZE_OK);
 
   if (!success)
     return commands != NULL || command_count != 0;
 
   if ((commands == NULL) != (command_count == 0)) {
-    shell_free_commands(commands, command_count);
+    shell_commands_free(commands, command_count);
     return 1;
   }
 
@@ -501,23 +507,24 @@ static int test_full_parser(const char *input, size_t length) {
       if (cmd->start_pos > length || cmd->end_pos < cmd->start_pos ||
           cmd->end_pos > length ||
           (cmd->tokens == NULL) != (cmd->token_count == 0)) {
-        shell_free_commands(commands, command_count);
+        shell_commands_free(commands, command_count);
         return 1;
       }
       for (size_t j = 0; j < cmd->token_count; j++) {
         const shell_token_t *tok = &cmd->tokens[j];
-        if (tok->type < TOKEN_COMMAND || tok->type > TOKEN_HERESTRING ||
-            tok->position > length || tok->length > length - tok->position ||
+        if (tok->type < SHELL_TOKEN_COMMAND ||
+            tok->type > SHELL_TOKEN_HERESTRING || tok->position > length ||
+            tok->length > length - tok->position ||
             tok->start != input + tok->position) {
           if (g_verbose)
             fprintf(stderr,
                     "\n=== FULL PARSER ERROR: invalid token range/type ===\n");
-          shell_free_commands(commands, command_count);
+          shell_commands_free(commands, command_count);
           return 1;
         }
       }
     }
-    shell_free_commands(commands, command_count);
+    shell_commands_free(commands, command_count);
   }
 
   return 0;
@@ -525,7 +532,7 @@ static int test_full_parser(const char *input, size_t length) {
 
 static int test_tokenizer_state(const char *input, size_t length) {
   shell_tokenizer_state_t state = {};
-  shell_tokenizer_init(&state, input);
+  shell_tokenizer_init(&state, input, strlen(input));
 
   size_t steps = 0;
   size_t previous_end = 0;
@@ -534,15 +541,17 @@ static int test_tokenizer_state(const char *input, size_t length) {
   while (steps++ <= length + 32) {
     shell_token_t token = {};
     bool produced = shell_tokenizer_next(&state, &token);
-    if (!produced || token.type == TOKEN_END) {
+    if (!produced || token.type == SHELL_TOKEN_END) {
       terminated = true;
       break;
     }
-    if (token.type < TOKEN_COMMAND || token.type > TOKEN_HERESTRING ||
-        token.position > length || token.length > length - token.position ||
+    if (token.type < SHELL_TOKEN_COMMAND ||
+        token.type > SHELL_TOKEN_HERESTRING || token.position > length ||
+        token.length > length - token.position ||
         token.start != input + token.position || token.position < previous_end)
       return 1;
-    if (token.type != TOKEN_GROUP_START && token.type != TOKEN_GROUP_END)
+    if (token.type != SHELL_TOKEN_GROUP_START &&
+        token.type != SHELL_TOKEN_GROUP_END)
       iterated.push_back(token);
     previous_end = token.position + token.length;
   }
@@ -551,20 +560,21 @@ static int test_tokenizer_state(const char *input, size_t length) {
 
   shell_command_t *commands = NULL;
   size_t command_count = 0;
-  bool full_ok = shell_tokenize_commands(input, &commands, &command_count);
+  bool full_ok = (shell_tokenize_commands(input, strlen(input), &commands,
+                                          &command_count) == SHELL_TOKENIZE_OK);
   if (!full_ok) {
-    shell_free_commands(commands, command_count);
+    shell_commands_free(commands, command_count);
     return 0;
   }
   if (command_count == 0) {
-    shell_free_commands(commands, command_count);
+    shell_commands_free(commands, command_count);
     return 0;
   }
   size_t expected = 0;
   for (size_t i = 0; i < command_count; i++)
     expected += commands[i].token_count;
   if (iterated.size() != expected) {
-    shell_free_commands(commands, command_count);
+    shell_commands_free(commands, command_count);
     return 1;
   }
   size_t offset = 0;
@@ -575,118 +585,115 @@ static int test_tokenizer_state(const char *input, size_t length) {
       if (a.type != b.type || a.position != b.position ||
           a.length != b.length || a.is_quoted != b.is_quoted ||
           a.is_escaped != b.is_escaped) {
-        shell_free_commands(commands, command_count);
+        shell_commands_free(commands, command_count);
         return 1;
       }
     }
   }
-  shell_free_commands(commands, command_count);
+  shell_commands_free(commands, command_count);
   return 0;
 }
 
 static int test_interop(const char *input, size_t length) {
-  shell_interop_handle_t *handle = shell_interop_create();
+  shell_interop_handle_t *handle = shell_interop_new();
   if (!handle)
     return 0;
 
-  int count = shell_interop_parse(handle, input, (int)length);
-  if (count < -1 || (count == -1 && length < SHELL_INTEROP_BUFFER_SIZE))
-    goto fail;
-  if (count > 0) {
+  size_t count = 0;
+  shell_error_t status = shell_interop_parse(handle, input, length, &count);
+  if (status == SHELL_OK) {
     if (shell_interop_subcommand_count(handle) != count)
       goto fail;
-    for (int i = -1; i <= count; i++) {
-      int type = shell_interop_subcommand_type(handle, i);
-      int features = shell_interop_subcommand_features(handle, i);
-      int start = shell_interop_subcommand_start(handle, i);
-      int len = shell_interop_subcommand_len(handle, i);
-      char *text = shell_interop_subcommand_str(handle, i);
-      if (i < 0 || i == count) {
-        if (type != 0 || features != 0 || start != 0 || len != 0 ||
-            text != NULL) {
+    for (size_t i = 0; i <= count; i++) {
+      shell_range_t range{};
+      bool has_range = shell_interop_subcommand_range(handle, i, &range);
+      char *text = shell_interop_subcommand_dup(handle, i);
+      if (i == count) {
+        if (has_range || text != NULL)
           goto fail;
-        }
       } else {
-        if (type < 0 || features < 0 || start < 0 || len <= 0 ||
-            (size_t)start > length || (size_t)len > length - (size_t)start ||
-            !text || strlen(text) != (size_t)len) {
+        if (!has_range || range.start > length ||
+            range.len > length - range.start || !text ||
+            strlen(text) != range.len) {
           goto fail;
         }
-        shell_interop_free_str(text);
+        free(text);
       }
     }
   } else if (shell_interop_subcommand_count(handle) != 0 ||
-             shell_interop_subcommand_type(handle, 0) != 0 ||
-             shell_interop_subcommand_features(handle, 0) != 0 ||
-             shell_interop_subcommand_start(handle, 0) != 0 ||
-             shell_interop_subcommand_len(handle, 0) != 0 ||
-             shell_interop_subcommand_str(handle, 0) != NULL) {
+             shell_interop_subcommand_dup(handle, 0) != NULL) {
     goto fail;
   }
 
   {
-    char *features = shell_interop_features_str(UINT16_MAX);
-    char *type = shell_interop_type_str(UINT16_MAX);
-    if (!features || !type) {
-      shell_interop_free_str(features);
-      shell_interop_free_str(type);
+    char features[256];
+    size_t written = 0;
+    if (shell_interop_format_features(UINT16_MAX, features, sizeof(features),
+                                      &written) != SHELL_OK ||
+        written == 0 ||
+        !shell_interop_command_type_name(
+            static_cast<shell_cmd_type_t>(UINT16_MAX)))
       goto fail;
-    }
-    shell_interop_free_str(features);
-    shell_interop_free_str(type);
   }
   /* Reuse the handle after both a successful and an invalid/empty parse. */
-  if (shell_interop_parse(handle, "echo ok", 7) != 1 ||
-      shell_interop_subcommand_count(handle) != 1 ||
-      shell_interop_parse(handle, NULL, 0) != 0 ||
+  if (shell_interop_parse(handle, "echo ok", 7, &count) != SHELL_OK ||
+      count != 1 || shell_interop_subcommand_count(handle) != 1 ||
+      shell_interop_parse(handle, NULL, 0, &count) != SHELL_EINPUT ||
       shell_interop_subcommand_count(handle) != 0 ||
-      shell_interop_subcommand_str(handle, 0) != NULL)
+      shell_interop_subcommand_dup(handle, 0) != NULL)
     goto fail;
-  shell_interop_destroy(handle);
+  shell_interop_free(handle);
   return 0;
 
 fail:
-  shell_interop_destroy(handle);
+  shell_interop_free(handle);
   return 1;
 }
 
 static int test_abstraction(const char *input, size_t length) {
   if (length == 0)
-    return shell_classify_raw_token(NULL, 0) == TOKEN_END ? 0 : 1;
+    return shell_classify_raw_token(NULL, 0) == SHELL_TOKEN_END ? 0 : 1;
 
   (void)shell_classify_raw_token(input, length);
-  abstracted_command_t *command = NULL;
-  bool success = shell_abstract_command(input, &command);
+  shell_abstract_command_t *command = nullptr;
+  if (shell_abstract_command_parse(input, length, &command) !=
+      SHELL_ABSTRACT_OK)
+    command = nullptr;
+  bool success = command != NULL;
   if (!success)
     return command != NULL;
-  if (!command || !shell_get_original(command) ||
-      !shell_get_abstracted(command)) {
-    shell_abstracted_destroy(command);
+  if (!command || !shell_abstract_command_get_source(command) ||
+      !shell_abstract_command_get_display_text(command)) {
+    shell_abstract_command_free(command);
     return 1;
   }
 
   size_t count = 0;
-  abstract_element_t **elements = shell_get_elements(command, &count);
+  shell_abstract_element_t *const *elements =
+      shell_abstract_command_get_mutable_elements(command, &count);
   if (count > 0 && !elements) {
-    shell_abstracted_destroy(command);
+    shell_abstract_command_free(command);
     return 1;
   }
 
-  if (shell_get_element_at(command, count) != NULL ||
-      shell_get_element_by_abstract(command, "__missing__") != NULL ||
-      shell_has_variables(command) != command->has_variables ||
-      shell_has_pos_vars(command) != command->has_pos_vars ||
-      shell_has_special_vars(command) != command->has_special_vars ||
-      shell_has_globs(command) != command->has_globs ||
-      shell_has_paths(command) != command->has_paths ||
-      shell_has_abs_paths(command) != command->has_abs_paths ||
-      shell_has_rel_paths(command) != command->has_rel_paths ||
-      shell_has_home_paths(command) != command->has_home_paths ||
-      shell_has_cmd_subst(command) != command->has_cmd_subst ||
-      shell_has_redirects(command) != command->has_redirects ||
-      shell_has_strings(command) != command->has_strings ||
-      shell_has_arithmetic(command) != command->has_arithmetic) {
-    shell_abstracted_destroy(command);
+  if (shell_abstract_command_get_element(command, count) != NULL ||
+      shell_abstract_command_find_element(command, "__missing__") != NULL ||
+      shell_abstract_command_has_variables(command) != command->has_variables ||
+      shell_abstract_command_has_pos_vars(command) != command->has_pos_vars ||
+      shell_abstract_command_has_special_vars(command) !=
+          command->has_special_vars ||
+      shell_abstract_command_has_globs(command) != command->has_globs ||
+      shell_abstract_command_has_paths(command) != command->has_paths ||
+      shell_abstract_command_has_abs_paths(command) != command->has_abs_paths ||
+      shell_abstract_command_has_rel_paths(command) != command->has_rel_paths ||
+      shell_abstract_command_has_home_paths(command) !=
+          command->has_home_paths ||
+      shell_abstract_command_has_cmd_subst(command) != command->has_cmd_subst ||
+      shell_abstract_command_has_redirects(command) != command->has_redirects ||
+      shell_abstract_command_has_strings(command) != command->has_strings ||
+      shell_abstract_command_has_arithmetic(command) !=
+          command->has_arithmetic) {
+    shell_abstract_command_free(command);
     return 1;
   }
 
@@ -695,33 +702,33 @@ static int test_abstraction(const char *input, size_t length) {
   for (size_t i = 0; i < count; i++) {
     if (!elements[i] || elements[i]->start > length ||
         elements[i]->end < elements[i]->start || elements[i]->end > length) {
-      shell_abstracted_destroy(command);
+      shell_abstract_command_free(command);
       return 1;
     }
     if (elements[i]->abstraction &&
-        shell_get_element_by_abstract(command, elements[i]->abstraction) !=
-            elements[i]) {
-      shell_abstracted_destroy(command);
+        shell_abstract_command_find_element(
+            command, elements[i]->abstraction) != elements[i]) {
+      shell_abstract_command_free(command);
       return 1;
     }
   }
-  runtime_context_t contexts[] = {{env, (char *)"/tmp", false},
-                                  {env, NULL, false},
-                                  {env, (char *)".", true},
-                                  {NULL, (char *)"/tmp", true}};
-  for (runtime_context_t &context : contexts) {
+  shell_runtime_context_t contexts[] = {{env, (char *)"/tmp", false},
+                                        {env, NULL, false},
+                                        {env, (char *)".", true},
+                                        {NULL, (char *)"/tmp", true}};
+  for (shell_runtime_context_t &context : contexts) {
     for (size_t i = 0; i < count; i++) {
-      char *expanded = shell_expand_element(elements[i], &context);
+      char *expanded = shell_abstract_element_expand(elements[i], &context);
       if (expanded)
-        (void)shell_get_path_category(expanded);
+        (void)shell_path_category_from_path(expanded);
       free(expanded);
     }
-    if (!shell_expand_all_elements(command, &context)) {
-      shell_abstracted_destroy(command);
+    if (!shell_abstract_command_expand(command, &context)) {
+      shell_abstract_command_free(command);
       return 1;
     }
   }
-  shell_abstracted_destroy(command);
+  shell_abstract_command_free(command);
   return 0;
 }
 
@@ -741,99 +748,95 @@ static int test_data_helpers(const char *input, size_t length,
   const std::string &value = samples[(selector >> 2) % 3];
   const char *text = value.c_str();
   int permutations = 1 + (value.size() % 3);
-  double first = ngram_entropy(text, 1);
-  if (!isfinite(first) || first != ngram_entropy(text, 1) ||
-      !isfinite(ngram_entropy(text, 2)) ||
-      !isfinite(conditional_entropy(text)) ||
-      !isfinite(permutation_entropy(text, permutations, 1)) ||
-      !isfinite(permutation_conditional_entropy(text, permutations)) ||
-      !isfinite(relative_entropy_ratio(text, permutations, 2)) ||
-      !isfinite(relative_conditional_entropy(text, permutations)))
+  double first = shell_rpe_ngram_entropy(text, 1);
+  if (!isfinite(first) || first != shell_rpe_ngram_entropy(text, 1) ||
+      !isfinite(shell_rpe_ngram_entropy(text, 2)) ||
+      !isfinite(shell_rpe_conditional_entropy(text)) ||
+      !isfinite(shell_rpe_permutation_entropy(text, permutations, 1)) ||
+      !isfinite(
+          shell_rpe_permutation_conditional_entropy(text, permutations)) ||
+      !isfinite(shell_rpe_relative_entropy_ratio(text, permutations, 2)) ||
+      !isfinite(shell_rpe_relative_conditional_entropy(text, permutations)))
     return 1;
-  (void)env_screener_calculate_entropy(text);
-  (void)env_screener_is_secret_pattern(text);
-  (void)env_screener_is_whitelisted(text);
-  (void)env_screener_combined_score(text);
-  (void)env_screener_combined_score_name("FUZZ_KEY", text);
-  (void)looks_like_path(text);
-  (void)looks_like_base64(text);
+  (void)shell_env_screener_calculate_entropy(text);
+  (void)shell_env_screener_is_secret_pattern(text);
+  (void)shell_env_screener_is_whitelisted(text);
+  (void)shell_env_screener_combined_score(text);
+  (void)shell_env_screener_combined_score_name("FUZZ_KEY", text);
+  (void)shell_env_screener_looks_like_path(text);
+  (void)shell_env_screener_looks_like_base64(text);
   double suffix = 0.0;
-  (void)check_secret_prefix(text, &suffix);
-  for (int capacity : {0, 1, 8}) {
-    int indices[8] = {0};
-    int count = 0;
-    env_screener_status_t status =
-        env_screener_scan(indices, capacity, &count, 0.5, 8);
-    if (status != ENV_SCREENER_OK && status != ENV_SCREENER_BUFFER_TOO_SMALL)
+  (void)shell_env_screener_check_secret_prefix(text, &suffix);
+  for (size_t capacity : {size_t{0}, size_t{1}, size_t{8}}) {
+    size_t indices[8] = {0};
+    size_t count = 0;
+    shell_env_screener_status_t status =
+        shell_env_screener_scan(indices, capacity, &count, 0.5, 8);
+    if (status != SHELL_ENV_SCREENER_OK &&
+        status != SHELL_ENV_SCREENER_BUFFER_TOO_SMALL)
       return 1;
-    if (count < 0 || (status == ENV_SCREENER_OK && count > capacity))
+    if (status == SHELL_ENV_SCREENER_OK && count > capacity)
       return 1;
   }
   return 0;
 }
 
 // Test transformer
-static int test_transformer(const char *input) {
-  transformed_command_t **transformed_cmds = NULL;
+static int test_transformer(const char *input, size_t input_length) {
+  shell_transformed_command_t **transformed_cmds = NULL;
   size_t transformed_count = 0;
 
   static const shell_transform_limits_t limits = {1u << 20, 4u << 20};
   shell_transform_status_t status = shell_transform_command_line(
-      input, &limits, &transformed_cmds, &transformed_count);
+      input, input_length, &limits, &transformed_cmds, &transformed_count);
   bool success = status == SHELL_TRANSFORM_OK;
 
   // Clean up on failure
   if (!success) {
-    shell_free_transformed_commands(transformed_cmds, transformed_count);
-    free(transformed_cmds);
+    shell_transformed_command_list_free(transformed_cmds, transformed_count);
     return 0;
   }
 
   if ((transformed_cmds == NULL) != (transformed_count == 0)) {
-    shell_free_transformed_commands(transformed_cmds, transformed_count);
-    free(transformed_cmds);
+    shell_transformed_command_list_free(transformed_cmds, transformed_count);
     return 1;
   }
 
   if (transformed_cmds) {
     for (size_t i = 0; i < transformed_count; i++) {
-      transformed_command_t *tcmd = transformed_cmds[i];
-      if (!tcmd || !tcmd->original_command || !tcmd->transformed_command ||
+      shell_transformed_command_t *tcmd = transformed_cmds[i];
+      if (!tcmd || !tcmd->original_command || !tcmd->display_text ||
           (tcmd->tokens == NULL) != (tcmd->token_count == 0) ||
-          shell_get_dfa_input(tcmd) != tcmd->transformed_command ||
-          shell_has_transformations(tcmd) != tcmd->has_transformations) {
-        shell_free_transformed_commands(transformed_cmds, transformed_count);
-        free(transformed_cmds);
+          shell_transformed_command_get_display_text(tcmd) !=
+              tcmd->display_text ||
+          shell_transformed_command_has_transformations(tcmd) !=
+              tcmd->has_transformations) {
+        shell_transformed_command_list_free(transformed_cmds,
+                                            transformed_count);
         return 1;
       }
 
       for (size_t j = 0; j < tcmd->token_count; j++) {
-        const transformed_token_t *tok = &tcmd->tokens[j];
-        bool transformed = tok->type != TRANSFORM_NONE;
-        if (tok->type < TRANSFORM_NONE || tok->type > TRANSFORM_REDIRECTION ||
-            !tok->original || !tok->transformed ||
+        const shell_transformed_token_t *tok = &tcmd->tokens[j];
+        bool transformed = tok->type != SHELL_TRANSFORM_NONE;
+        if (tok->type < SHELL_TRANSFORM_NONE ||
+            tok->type > SHELL_TRANSFORM_REDIRECTION || !tok->original ||
+            !tok->transformed ||
             (!transformed && tok->transformed != tok->original) ||
             (transformed && tok->transformed == tok->original) ||
             tok->is_shell_construct != transformed) {
           if (g_verbose)
             fprintf(stderr, "\n=== TRANSFORMER ERROR: invalid token ===\n");
-          shell_free_transformed_commands(transformed_cmds, transformed_count);
-          free(transformed_cmds);
+          shell_transformed_command_list_free(transformed_cmds,
+                                              transformed_count);
           return 1;
         }
       }
     }
-    shell_free_transformed_commands(transformed_cmds, transformed_count);
-    free(transformed_cmds);
+    shell_transformed_command_list_free(transformed_cmds, transformed_count);
   }
 
   return 0;
-}
-
-static void free_dfa_inputs(const char **inputs, size_t count) {
-  for (size_t i = 0; i < count; i++)
-    free((void *)inputs[i]);
-  free(inputs);
 }
 
 static bool tokens_refer_to_owned_command(const shell_token_t *tokens,
@@ -852,22 +855,23 @@ static bool tokens_refer_to_owned_command(const shell_token_t *tokens,
 }
 
 // Test processor metadata and canonical sequence rendering together.
-static int test_processor(const char *input) {
+static int test_processor(const char *input, size_t input_length) {
   shell_command_info_t *infos = NULL;
   size_t command_count = 0;
   static const shell_process_limits_t limits = {1u << 20, 4u << 20};
-  shell_process_status_t status =
-      shell_process_command(input, &limits, &infos, &command_count);
+  shell_process_status_t status = shell_process_command(
+      input, input_length, &limits, &infos, &command_count);
   bool success = status == SHELL_PROCESS_OK;
   char *sequence = NULL;
   size_t sequence_count = 0;
   bool has_shell_features = false;
-  shell_process_status_t extracted_status = shell_extract_netargv_sequence(
-      input, &limits, &sequence, &sequence_count, &has_shell_features);
+  shell_process_status_t extracted_status =
+      shell_build_netargv_sequence(input, input_length, &limits, &sequence,
+                                   &sequence_count, &has_shell_features);
   bool extracted = extracted_status == SHELL_PROCESS_OK;
 
   if (success != extracted) {
-    shell_free_command_infos(infos, command_count);
+    shell_command_infos_free(infos, command_count);
     free(sequence);
     return 1;
   }
@@ -875,18 +879,18 @@ static int test_processor(const char *input) {
     if (status != extracted_status &&
         !(status == SHELL_PROCESS_EPARSE &&
           extracted_status == SHELL_PROCESS_EPARSE)) {
-      shell_free_command_infos(infos, command_count);
+      shell_command_infos_free(infos, command_count);
       free(sequence);
       return 1;
     }
-    shell_free_command_infos(infos, command_count);
+    shell_command_infos_free(infos, command_count);
     free(sequence);
     return 0;
   }
 
   if ((infos == NULL) != (command_count == 0) || (sequence == NULL) ||
       sequence_count != command_count) {
-    shell_free_command_infos(infos, command_count);
+    shell_command_infos_free(infos, command_count);
     free(sequence);
     return 1;
   }
@@ -907,55 +911,53 @@ static int test_processor(const char *input) {
                                          info->original_command) ||
           shell_render_netargv(info, &limits, &netargv) != SHELL_PROCESS_OK) {
         free(netargv);
-        shell_free_command_infos(infos, command_count);
+        shell_command_infos_free(infos, command_count);
         free(sequence);
         return 1;
       }
       free(netargv);
-      expected_features |= shell_has_dangerous_features(info);
+      expected_features |= shell_command_info_has_dangerous_features(info);
     }
   }
 
-  shell_free_command_infos(infos, command_count);
+  shell_command_infos_free(infos, command_count);
   free(sequence);
   return expected_features != has_shell_features;
 }
 
-static int test_output_limits(const char *input) {
+static int test_output_limits(const char *input, size_t input_length) {
   static const shell_process_limits_t process_limits = {8, 16};
   static const shell_transform_limits_t transform_limits = {8, 16};
 
   shell_command_info_t *infos = NULL;
   size_t info_count = 0;
-  shell_process_status_t process_status =
-      shell_process_command(input, &process_limits, &infos, &info_count);
+  shell_process_status_t process_status = shell_process_command(
+      input, input_length, &process_limits, &infos, &info_count);
   if (process_status != SHELL_PROCESS_OK &&
       process_status != SHELL_PROCESS_EINPUT &&
       process_status != SHELL_PROCESS_EPARSE &&
       process_status != SHELL_PROCESS_ENOMEM &&
       process_status != SHELL_PROCESS_EOVERFLOW &&
       process_status != SHELL_PROCESS_EOUTPUT_LIMIT) {
-    shell_free_command_infos(infos, info_count);
+    shell_command_infos_free(infos, info_count);
     return 1;
   }
-  shell_free_command_infos(infos, info_count);
+  shell_command_infos_free(infos, info_count);
 
-  transformed_command_t **transformed = NULL;
+  shell_transformed_command_t **transformed = NULL;
   size_t transformed_count = 0;
   shell_transform_status_t transform_status = shell_transform_command_line(
-      input, &transform_limits, &transformed, &transformed_count);
+      input, input_length, &transform_limits, &transformed, &transformed_count);
   if (transform_status != SHELL_TRANSFORM_OK &&
       transform_status != SHELL_TRANSFORM_EINPUT &&
       transform_status != SHELL_TRANSFORM_EPARSE &&
       transform_status != SHELL_TRANSFORM_ENOMEM &&
       transform_status != SHELL_TRANSFORM_EOVERFLOW &&
       transform_status != SHELL_TRANSFORM_EOUTPUT_LIMIT) {
-    shell_free_transformed_commands(transformed, transformed_count);
-    free(transformed);
+    shell_transformed_command_list_free(transformed, transformed_count);
     return 1;
   }
-  shell_free_transformed_commands(transformed, transformed_count);
-  free(transformed);
+  shell_transformed_command_list_free(transformed, transformed_count);
   return 0;
 }
 
@@ -971,12 +973,6 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
    * fuzz input must remain available to the parsers, including short and
    * malformed prefixes. */
   uint8_t cwd_selector = size > 0 ? data[0] : 0;
-  uint8_t depth_byte = size > 1 ? data[1] : 0;
-  /* depth is a recursion cap: shell_parse_depgraph rejects values > 16 with
-   * SHELL_DEP_EPARSE (shell_depgraph.c:670). Map a byte to [0, 31] so the
-   * fuzzer can find the boundary and exercise both sides. */
-  uint32_t depth = depth_byte >> 3;
-
   /* Derive a CWD without consuming payload bytes, so every remaining byte
    * remains available to the parsers. */
   constexpr size_t kMaxCwdBytes = 32;
@@ -1021,20 +1017,19 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     }
   };
   run_check("fast parser", test_fast_parser(cmd.data(), cmd.size()));
-  run_check("dependency graph",
-            test_depgraph(cmd.data(), cmd.size(), cwd, depth));
+  run_check("dependency graph", test_depgraph(cmd.data(), cmd.size(), cwd));
   run_check("full parser", test_full_parser(input, text_length));
   run_check("tokenizer iterator", test_tokenizer_state(input, text_length));
-  run_check("transformer", test_transformer(input));
-  run_check("processor", test_processor(input));
-  run_check("output limits", test_output_limits(input));
+  run_check("transformer", test_transformer(input, text_length));
+  run_check("processor", test_processor(input, text_length));
+  run_check("output limits", test_output_limits(input, text_length));
   run_check("interop", test_interop(cmd.data(), cmd.size()));
   run_check("abstraction", test_abstraction(input, text_length));
   run_check("entropy/environment helpers",
             test_data_helpers(input, text_length, cwd_selector));
   run_check("plain differential", test_plain_differential(input, text_length));
   run_check("structured variants",
-            test_structured_variants(input, text_length, depth));
+            test_structured_variants(input, text_length));
   free(input);
   if (failed)
     abort();

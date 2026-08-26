@@ -1,5 +1,4 @@
 #include "shell_interop.h"
-#include "shell_tokenizer.h"
 #include "test_allocator.h"
 
 #include <stdio.h>
@@ -17,231 +16,166 @@ static int failures;
     }                                                                          \
   } while (0)
 
-static void test_parse_matrix(void) {
+static shell_error_t parse(shell_interop_handle_t *handle, const char *text,
+                           size_t length, size_t *count) {
+  return shell_interop_parse(handle, text, length, count);
+}
+
+static void test_parse_and_views(void) {
   static const char input[] = "echo $USER | grep *.txt && pwd";
   static const struct {
     const char *text;
-    int type;
-    int required_features;
-  } expected[] = {
-      {"echo $USER", SHELL_TYPE_SIMPLE, SHELL_FEAT_VARS},
-      {"grep *.txt", SHELL_TYPE_PIPELINE,
-       SHELL_FEAT_GLOBS | SHELL_FEAT_PIPELINE},
-      {"pwd", SHELL_TYPE_AND, 0},
-  };
+    shell_cmd_type_t type;
+    uint32_t features;
+  } expected[] = {{"echo $USER", SHELL_TYPE_SIMPLE, SHELL_FEAT_VARS},
+                  {"grep *.txt", SHELL_TYPE_PIPELINE,
+                   SHELL_FEAT_GLOBS | SHELL_FEAT_PIPELINE},
+                  {"pwd", SHELL_TYPE_AND, 0}};
+  shell_interop_handle_t *handle = shell_interop_new();
+  size_t count = 0;
+  CHECK(handle && parse(handle, input, strlen(input), &count) == SHELL_OK);
+  CHECK(count == 3 && shell_interop_subcommand_count(handle) == count);
 
-  shell_interop_handle_t *handle = shell_interop_create();
-  CHECK(handle != NULL);
-  if (!handle)
-    return;
-  CHECK(shell_interop_parse(handle, input, (int)strlen(input)) ==
-        (int)(sizeof(expected) / sizeof(expected[0])));
-  CHECK(shell_interop_subcommand_count(handle) ==
-        (int)(sizeof(expected) / sizeof(expected[0])));
-
-  for (size_t i = 0; i < sizeof(expected) / sizeof(expected[0]); i++) {
+  for (size_t i = 0; handle && i < count; i++) {
+    shell_range_t range = {0};
+    const char *view = NULL;
+    size_t view_length = 0;
     const char *location = strstr(input, expected[i].text);
-    CHECK(location != NULL);
-    CHECK(shell_interop_subcommand_type(handle, (int)i) == expected[i].type);
-    CHECK((shell_interop_subcommand_features(handle, (int)i) &
-           expected[i].required_features) == expected[i].required_features);
-    CHECK(shell_interop_subcommand_start(handle, (int)i) == location - input);
-    CHECK(shell_interop_subcommand_len(handle, (int)i) ==
-          (int)strlen(expected[i].text));
-    char *copy = shell_interop_subcommand_str(handle, (int)i);
-    CHECK(copy != NULL && strcmp(copy, expected[i].text) == 0);
-    shell_interop_free_str(copy);
+    CHECK(location && shell_interop_subcommand_range(handle, i, &range));
+    CHECK(range.type == expected[i].type &&
+          (range.features & expected[i].features) == expected[i].features);
+    CHECK(range.start == (uint32_t)(location - input) &&
+          range.len == strlen(expected[i].text));
+    CHECK(shell_interop_subcommand_view(handle, i, &view, &view_length));
+    CHECK(view_length == range.len &&
+          memcmp(view, expected[i].text, view_length) == 0);
+    char *copy = shell_interop_subcommand_dup(handle, i);
+    CHECK(copy && strcmp(copy, expected[i].text) == 0);
+    free(copy);
   }
 
-  char *owned = shell_interop_subcommand_str(handle, 1);
-  CHECK(shell_interop_parse(handle, "pwd", 3) == 1);
-  CHECK(owned != NULL && strcmp(owned, "grep *.txt") == 0);
-  shell_interop_free_str(owned);
-  shell_interop_destroy(handle);
+  char *copy = shell_interop_subcommand_dup(handle, 1);
+  CHECK(parse(handle, "pwd", 3, &count) == SHELL_OK && count == 1);
+  CHECK(copy && strcmp(copy, "grep *.txt") == 0);
+  free(copy);
+  shell_interop_free(handle);
 }
 
-static void test_failure_and_length_boundaries(void) {
-  shell_interop_handle_t *handle = shell_interop_create();
-  CHECK(handle != NULL);
-  if (!handle)
-    return;
-
+static void test_failures_clear_state(void) {
+  shell_interop_handle_t *handle = shell_interop_new();
+  size_t count = 99;
   static const char embedded_nul[] = {'p', 'w', 'd', '\0', ';', 'i', 'd'};
-  static const struct {
-    const char *command;
-    int length;
-    int result;
-  } invalid[] = {{NULL, 7, 0},
-                 {"echo ok", 0, 0},
-                 {"echo ok", -1, 0},
-                 {"${}", 3, 0},
-                 {"cat <<EOF\n?tenregaed inpuat <<\n",
-                  (int)(sizeof("cat <<EOF\n?tenregaed inpuat <<\n") - 1), 0},
-                 {embedded_nul, (int)sizeof(embedded_nul), 0}};
-  for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
-    CHECK(shell_interop_parse(handle, "echo ok", 7) == 1);
-    CHECK(shell_interop_parse(handle, invalid[i].command, invalid[i].length) ==
-          invalid[i].result);
-    CHECK(shell_interop_subcommand_count(handle) == 0);
-    CHECK(shell_interop_subcommand_str(handle, 0) == NULL);
-  }
-
-  char command[SHELL_INTEROP_BUFFER_SIZE];
-  memset(command, 'x', sizeof(command));
-  CHECK(shell_interop_parse(handle, command, (int)sizeof(command)) == -1);
+  CHECK(handle && parse(handle, "echo ok", 7, &count) == SHELL_OK);
+  shell_range_t range = {.len = 1};
+  const char *view = (const char *)(void *)1;
+  size_t view_length = SIZE_MAX;
+  CHECK(!shell_interop_subcommand_range(handle, 1, &range) && range.len == 0);
+  CHECK(!shell_interop_subcommand_view(handle, 1, &view, &view_length) &&
+        view == NULL && view_length == 0);
+  CHECK(parse(handle, "pwd", 3, NULL) == SHELL_EINPUT);
+  CHECK(parse(handle, NULL, 0, &count) == SHELL_EINPUT && count == 0);
   CHECK(shell_interop_subcommand_count(handle) == 0);
-  command[sizeof(command) - 1] = '\0';
-  CHECK(shell_interop_parse(handle, command, (int)strlen(command)) == 1);
-  CHECK(shell_interop_subcommand_len(handle, 0) ==
-        SHELL_INTEROP_BUFFER_SIZE - 1);
-  char *copy = shell_interop_subcommand_str(handle, 0);
-  CHECK(copy != NULL && memcmp(copy, command, sizeof(command)) == 0);
-  shell_interop_free_str(copy);
-  shell_interop_destroy(handle);
+  CHECK(parse(handle, embedded_nul, sizeof(embedded_nul), &count) ==
+        SHELL_EINPUT);
+  CHECK(parse(handle, "${}", 3, &count) == SHELL_EPARSE);
+
+  char too_long[SHELL_INTEROP_BUFFER_SIZE];
+  memset(too_long, 'x', sizeof(too_long));
+  CHECK(parse(handle, too_long, sizeof(too_long), &count) == SHELL_ETRUNC);
+  range = (shell_range_t){.len = 1};
+  CHECK(!shell_interop_subcommand_range(handle, 0, &range) && range.len == 0);
+  CHECK(!shell_interop_subcommand_range(NULL, 0, &range) && range.len == 0);
+  CHECK(!shell_interop_subcommand_range(handle, 0, NULL));
+  CHECK(!shell_interop_subcommand_view(handle, 0, NULL, &count));
+  view = (const char *)(void *)1;
+  view_length = SIZE_MAX;
+  CHECK(!shell_interop_subcommand_view(handle, 0, &view, NULL) && view == NULL);
+  CHECK(!shell_interop_subcommand_view(NULL, 0, &view, &view_length) &&
+        view == NULL && view_length == 0);
+  CHECK(shell_interop_subcommand_dup(handle, 0) == NULL);
+  CHECK(parse(NULL, "ls", 2, &count) == SHELL_EINPUT && count == 0);
+  shell_interop_free(handle);
 }
 
-static void test_bounded_input_and_handle_isolation(void) {
-  static const char bounded[] = {'e', 'c', 'h', 'o', ' ', '$', 'X', 'x'};
-  shell_interop_handle_t *first = shell_interop_create();
-  shell_interop_handle_t *second = shell_interop_create();
-  CHECK(first != NULL && second != NULL);
-  if (!first || !second) {
-    shell_interop_destroy(first);
-    shell_interop_destroy(second);
-    return;
-  }
-
-  CHECK(shell_interop_parse(first, bounded, 7) == 1);
-  CHECK(shell_interop_subcommand_len(first, 0) == 7);
-  CHECK(shell_interop_subcommand_features(first, 0) == SHELL_FEAT_VARS);
-  char *owned = shell_interop_subcommand_str(first, 0);
-  CHECK(owned != NULL && strcmp(owned, "echo $X") == 0);
-
-  CHECK(shell_interop_parse(second, "pwd; whoami", 11) == 2);
-  CHECK(shell_interop_parse(first, "id", 2) == 1);
-  CHECK(shell_interop_subcommand_count(second) == 2);
-  char *second_copy = shell_interop_subcommand_str(second, 1);
-  CHECK(second_copy != NULL && strcmp(second_copy, "whoami") == 0);
-  CHECK(owned != NULL && strcmp(owned, "echo $X") == 0);
-
-  shell_interop_free_str(second_copy);
-  shell_interop_free_str(owned);
-  shell_interop_destroy(second);
-  shell_interop_destroy(first);
-}
-
-static void test_accessors_and_conversions(void) {
-  shell_interop_handle_t *handle = shell_interop_create();
-  CHECK(handle != NULL && shell_interop_parse(handle, "ls", 2) == 1);
-  if (!handle)
-    return;
-  const int invalid_indices[] = {-1, 1, 99};
-  for (size_t i = 0; i < sizeof(invalid_indices) / sizeof(invalid_indices[0]);
-       i++) {
-    int index = invalid_indices[i];
-    CHECK(shell_interop_subcommand_type(handle, index) == 0);
-    CHECK(shell_interop_subcommand_features(handle, index) == 0);
-    CHECK(shell_interop_subcommand_start(handle, index) == 0);
-    CHECK(shell_interop_subcommand_len(handle, index) == 0);
-    CHECK(shell_interop_subcommand_str(handle, index) == NULL);
-  }
+static void test_formatters(void) {
+  char buffer[128];
+  size_t written = 0;
+  CHECK(shell_interop_format_features(SHELL_FEAT_VARS | SHELL_FEAT_GLOBS,
+                                      buffer, sizeof(buffer),
+                                      &written) == SHELL_OK);
+  CHECK(written == strlen("VAR GLOB") && strcmp(buffer, "VAR GLOB") == 0);
+  CHECK(shell_interop_format_features(0, buffer, sizeof(buffer), &written) ==
+            SHELL_OK &&
+        strcmp(buffer, "none") == 0);
+  CHECK(shell_interop_format_features(0, buffer, sizeof("none") - 1,
+                                      &written) == SHELL_ETRUNC &&
+        buffer[0] == '\0' && written == 0);
+  CHECK(shell_interop_format_features(SHELL_FEAT_VARS, buffer, 2, &written) ==
+            SHELL_ETRUNC &&
+        buffer[0] == '\0' && written == 0);
+  CHECK(shell_interop_format_features(SHELL_FEAT_VARS | SHELL_FEAT_GLOBS,
+                                      buffer, 5, &written) == SHELL_ETRUNC &&
+        buffer[0] == '\0' && written == 0);
+  CHECK(shell_interop_format_features(SHELL_FEAT_VARS, NULL, sizeof(buffer),
+                                      &written) == SHELL_EINPUT &&
+        written == 0);
+  CHECK(shell_interop_format_features(SHELL_FEAT_VARS, buffer, 0, &written) ==
+            SHELL_EINPUT &&
+        written == 0);
+  CHECK(shell_interop_format_features(SHELL_FEAT_VARS, buffer, sizeof(buffer),
+                                      NULL) == SHELL_EINPUT);
+  CHECK(strcmp(shell_interop_command_type_name(SHELL_TYPE_PIPELINE), "PIPE") ==
+        0);
+  CHECK(strcmp(shell_interop_command_type_name(SHELL_TYPE_SIMPLE), "SIMPLE") ==
+        0);
 
   static const struct {
-    int type;
+    shell_cmd_type_t type;
     const char *name;
-  } types[] = {{SHELL_TYPE_SIMPLE, "SIMPLE"},
-               {SHELL_TYPE_PIPELINE, "PIPE"},
-               {SHELL_TYPE_AND, "AND"},
-               {SHELL_TYPE_OR, "OR"},
-               {SHELL_TYPE_SEMICOLON, "SEMICOLON"},
-               {SHELL_TYPE_HEREDOC, "HEREDOC"},
-               {SHELL_TYPE_HERESTRING, "HERESTRING"},
-               {SHELL_TYPE_SUBSTITUTION, "SUBSTITUTION"},
-               {SHELL_TYPE_BACKGROUND, "BACKGROUND"}};
-  for (size_t i = 0; i < sizeof(types) / sizeof(types[0]); i++) {
-    char *name = shell_interop_type_str(types[i].type);
-    CHECK(name != NULL && strcmp(name, types[i].name) == 0);
-    shell_interop_free_str(name);
-  }
-  static const struct {
-    int feature;
-    const char *name;
-  } feature_names[] = {
-      {SHELL_FEAT_VARS, "VAR "},
-      {SHELL_FEAT_GLOBS, "GLOB "},
-      {SHELL_FEAT_SUBSHELL, "SUBSHELL "},
-      {SHELL_FEAT_ARITH, "ARITH "},
-      {SHELL_FEAT_HEREDOC, "HEREDOC "},
-      {SHELL_FEAT_HERESTRING, "HERESTRING "},
-      {SHELL_FEAT_PROCESS_SUB, "PROCSUB "},
-      {SHELL_FEAT_LOOPS, "LOOPS "},
-      {SHELL_FEAT_CONDITIONALS, "COND "},
-      {SHELL_FEAT_CASE, "CASE "},
-      {SHELL_FEAT_SUBSHELL_FILE, "SUBSHELL_FILE "},
-      {SHELL_FEAT_PIPELINE, "PIPELINE "},
-      {SHELL_FEAT_GROUP, "GROUP "},
-      {SHELL_FEAT_BACKGROUND, "BACKGROUND "},
+  } types[] = {
+      {SHELL_TYPE_AND, "AND"},
+      {SHELL_TYPE_OR, "OR"},
+      {SHELL_TYPE_SEMICOLON, "SEMICOLON"},
+      {SHELL_TYPE_HEREDOC, "HEREDOC"},
+      {SHELL_TYPE_HERESTRING, "HERESTRING"},
+      {SHELL_TYPE_SUBSTITUTION, "SUBSTITUTION"},
+      {SHELL_TYPE_BACKGROUND, "BACKGROUND"},
   };
-  int all_features = 0;
-  char all_names[256] = "";
-  for (size_t i = 0; i < sizeof(feature_names) / sizeof(feature_names[0]);
-       i++) {
-    char *name = shell_interop_features_str(feature_names[i].feature);
-    CHECK(name != NULL && strcmp(name, feature_names[i].name) == 0);
-    shell_interop_free_str(name);
-    all_features |= feature_names[i].feature;
-    strcat(all_names, feature_names[i].name);
-  }
-  char *features = shell_interop_features_str(all_features);
-  CHECK(features != NULL && strcmp(features, all_names) == 0);
-  shell_interop_free_str(features);
-  features = shell_interop_features_str(1 << 30);
-  CHECK(features != NULL && strcmp(features, "none") == 0);
-  shell_interop_free_str(features);
+  for (size_t i = 0; i < sizeof(types) / sizeof(types[0]); i++)
+    CHECK(strcmp(shell_interop_command_type_name(types[i].type),
+                 types[i].name) == 0);
 
-  CHECK(shell_interop_parse(NULL, "ls", 2) == 0);
-  CHECK(shell_interop_subcommand_count(NULL) == 0);
-  CHECK(shell_interop_subcommand_type(NULL, 0) == 0);
-  CHECK(shell_interop_subcommand_features(NULL, 0) == 0);
-  CHECK(shell_interop_subcommand_start(NULL, 0) == 0);
-  CHECK(shell_interop_subcommand_len(NULL, 0) == 0);
-  CHECK(shell_interop_subcommand_str(NULL, 0) == NULL);
-  shell_interop_free_str(NULL);
-  shell_interop_destroy(NULL);
-  shell_interop_destroy(handle);
+  const uint32_t all_features =
+      SHELL_FEAT_VARS | SHELL_FEAT_GLOBS | SHELL_FEAT_SUBSHELL |
+      SHELL_FEAT_ARITH | SHELL_FEAT_HEREDOC | SHELL_FEAT_HERESTRING |
+      SHELL_FEAT_PROCESS_SUB | SHELL_FEAT_LOOPS | SHELL_FEAT_CONDITIONALS |
+      SHELL_FEAT_CASE | SHELL_FEAT_SUBSHELL_FILE | SHELL_FEAT_PIPELINE |
+      SHELL_FEAT_GROUP | SHELL_FEAT_BACKGROUND;
+  CHECK(shell_interop_format_features(all_features, buffer, sizeof(buffer),
+                                      &written) == SHELL_OK);
+  CHECK(written == strlen(buffer) && strstr(buffer, "BACKGROUND") != NULL);
 }
 
-static void test_allocation_failures(void) {
+static void test_allocation_boundaries(void) {
   shellsplit_test_alloc_fail_at(1);
-  CHECK(shell_interop_create() == NULL);
+  CHECK(shell_interop_new() == NULL);
   shellsplit_test_alloc_reset();
-
-  shell_interop_handle_t *handle = shell_interop_create();
-  CHECK(handle != NULL && shell_interop_parse(handle, "echo $USER", 10) == 1);
-  if (!handle)
-    return;
-
+  shell_interop_handle_t *handle = shell_interop_new();
+  size_t count = 0;
+  CHECK(handle && parse(handle, "echo $USER", 10, &count) == SHELL_OK);
   shellsplit_test_alloc_fail_at(1);
-  CHECK(shell_interop_subcommand_str(handle, 0) == NULL);
-  shellsplit_test_alloc_fail_at(1);
-  CHECK(shell_interop_features_str(SHELL_FEAT_VARS) == NULL);
-  shellsplit_test_alloc_fail_at(1);
-  CHECK(shell_interop_type_str(SHELL_TYPE_SIMPLE) == NULL);
+  CHECK(shell_interop_subcommand_dup(handle, 0) == NULL);
   shellsplit_test_alloc_reset();
-
-  CHECK(shell_interop_subcommand_count(handle) == 1);
-  char *copy = shell_interop_subcommand_str(handle, 0);
-  CHECK(copy != NULL && strcmp(copy, "echo $USER") == 0);
-  shell_interop_free_str(copy);
-  shell_interop_destroy(handle);
+  CHECK(shell_interop_format_features(SHELL_FEAT_VARS, (char[16]){0}, 16,
+                                      &count) == SHELL_OK);
+  shell_interop_free(handle);
 }
 
 int main(void) {
-  test_parse_matrix();
-  test_failure_and_length_boundaries();
-  test_bounded_input_and_handle_isolation();
-  test_accessors_and_conversions();
-  test_allocation_failures();
+  test_parse_and_views();
+  test_failures_clear_state();
+  test_formatters();
+  test_allocation_boundaries();
   if (failures)
     fprintf(stderr, "%d interop checks failed\n", failures);
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;

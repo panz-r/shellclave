@@ -41,6 +41,7 @@
 #include "crc32.h"
 #include "io.h"
 #include "metadata.h"
+#include "normalize_internal.h"
 #include "read_line.h"
 
 /* --- COMPATIBILITY MASK --- */
@@ -270,7 +271,7 @@ static bool pattern_entry_prepare(st_policy_ctx_t *ctx, const char *pattern,
     tok_copy[i].text = strdup(tokens[i].text);
     if (!tok_copy[i].text) {
       for (size_t k = 0; k < i; k++)
-        free(tok_copy[k].text);
+        free((void *)tok_copy[k].text);
       free(tok_copy);
       return false;
     }
@@ -333,6 +334,7 @@ typedef struct {
   uint16_t *indices;
   size_t count;
   size_t capacity;
+  size_t explicit_wildcard_count;
 } len_bucket_t;
 
 static void len_bucket_free(len_bucket_t *b) {
@@ -340,6 +342,7 @@ static void len_bucket_free(len_bucket_t *b) {
   b->indices = NULL;
   b->count = 0;
   b->capacity = 0;
+  b->explicit_wildcard_count = 0;
 }
 
 static bool len_bucket_add(len_bucket_t *b, uint16_t pattern_id) {
@@ -835,10 +838,10 @@ static void free_pattern_tokens(st_token_t *tokens, size_t count) {
   if (!tokens)
     return;
   for (size_t i = 0; i < count; i++) {
-    free(tokens[i].text);
-    free(tokens[i].prefix);
-    free(tokens[i].capture);
-    free(tokens[i].suffix);
+    free((void *)tokens[i].text);
+    free((void *)tokens[i].prefix);
+    free((void *)tokens[i].capture);
+    free((void *)tokens[i].suffix);
   }
   free(tokens);
 }
@@ -865,6 +868,22 @@ static bool is_explicit_wildcard(const char *text, st_token_type_t type) {
   if (strncmp(text, sym, sym_len) == 0 && text[sym_len] == '.')
     return true;
   return false;
+}
+
+static bool pattern_has_explicit_wildcard(const st_token_t *tokens,
+                                          size_t count) {
+  for (size_t i = 0; i < count; i++)
+    if (is_explicit_wildcard(tokens[i].text, tokens[i].type))
+      return true;
+  return false;
+}
+
+static bool pattern_is_plain_literal(const st_token_t *tokens, size_t count) {
+  for (size_t i = 0; i < count; i++)
+    if (tokens[i].compound ||
+        is_explicit_wildcard(tokens[i].text, tokens[i].type))
+      return false;
+  return true;
 }
 
 /**
@@ -939,7 +958,7 @@ static bool pattern_subsumes(const st_token_t *a, size_t a_len,
        * type. For A (wildcard) to subsume B (concrete): A must be as general as
        * B's type. Check: st_is_compatible(B.type, A.type) — B's type must be
        * subtype of A's type. */
-      st_token_type_t concrete_type = st_classify_token(b[i].text);
+      st_token_type_t concrete_type = st_token_classify(b[i].text);
       if (!(runtime_match_mask(concrete_type) & (1ULL << a[i].type)) ||
           !param_matches(b[i].text, concrete_type, a[i].text, a[i].type))
         return false;
@@ -1045,7 +1064,7 @@ static void policy_rebuild_filters(st_policy_t *policy) {
 
 /* --- PATTERN VALIDATION (public API) --- */
 
-st_error_t st_validate_netpattern(const char *pattern,
+st_error_t st_netpattern_validate(const char *pattern,
                                   st_pattern_info_t *info) {
   if (info)
     memset(info, 0, sizeof(*info));
@@ -1198,9 +1217,43 @@ static st_error_t st_policy_add_locked(st_policy_t *policy,
   }
   /* --- Incremental subsumption check --- */
   len_bucket_t *bucket = &policy->len_buckets[token_count];
+  bool has_explicit_wildcard =
+      pattern_has_explicit_wildcard(tokens, token_count);
+  bool is_plain_literal = pattern_is_plain_literal(tokens, token_count);
+
+  /* Find the first absent trie edge before checking subsumption. This also
+   * detects an exact duplicate in the literal-only fast path below. */
+  uint32_t probe = 0;
+  size_t first_missing = token_count;
+  for (size_t i = 0; i < token_count; i++) {
+    policy_state_t *node = &policy->states.states[probe];
+    bool is_wild = is_explicit_wildcard(tokens[i].text, tokens[i].type);
+    child_entry_t *child =
+        is_wild ? find_exact_wildcard_child(node, policy->children_arena.base,
+                                            tokens[i].type, tokens[i].text)
+                : find_literal_child(node, policy->children_arena.base,
+                                     tokens[i].text, tokens[i].compound);
+    if (!child) {
+      first_missing = i;
+      break;
+    }
+    probe = child->target;
+  }
+
+  /* Concrete rules can only subsume, or be subsumed by, an identical concrete
+   * rule. The trie detects that duplicate directly. Compound rules are not
+   * concrete here, and any explicit wildcard in the bucket retains the full
+   * subsumption scan. */
+  bool needs_subsumption_scan =
+      !is_plain_literal || bucket->explicit_wildcard_count != 0;
+  if (!needs_subsumption_scan && first_missing == token_count &&
+      policy->states.states[probe].pattern_id != UINT16_MAX) {
+    free_pattern_tokens(tokens, token_count);
+    return ST_OK;
+  }
 
   /* Step 1: Check if new pattern is subsumed by an existing pattern */
-  for (size_t bi = 0; bi < bucket->count; bi++) {
+  for (size_t bi = 0; needs_subsumption_scan && bi < bucket->count; bi++) {
     uint16_t eid = bucket->indices[bi];
     pattern_entry_t *entry = &policy->patterns.entries[eid];
     if (!entry->active || !entry->tokens)
@@ -1221,7 +1274,7 @@ static st_error_t st_policy_add_locked(st_policy_t *policy,
   size_t to_remove_count = 0;
   size_t to_remove_cap = 0;
 
-  for (size_t bi = 0; bi < bucket->count; bi++) {
+  for (size_t bi = 0; needs_subsumption_scan && bi < bucket->count; bi++) {
     uint16_t eid = bucket->indices[bi];
     pattern_entry_t *entry = &policy->patterns.entries[eid];
     if (!entry->active || !entry->tokens)
@@ -1254,26 +1307,7 @@ static st_error_t st_policy_add_locked(st_policy_t *policy,
   bool reuse_subsumed_slot =
       policy->patterns.count >= ST_MAX_POLICY_PATTERNS && to_remove_count != 0;
 
-  /* Find the first absent trie edge. Every following token needs one state
-   * and one child array. Reserve all fallible structural allocations before
-   * removing subsumed rules or publishing a new edge. */
-  uint32_t probe = 0;
-  size_t first_missing = token_count;
   size_t arena_bytes = 0;
-  for (size_t i = 0; i < token_count; i++) {
-    policy_state_t *node = &policy->states.states[probe];
-    bool is_wild = is_explicit_wildcard(tokens[i].text, tokens[i].type);
-    child_entry_t *child =
-        is_wild ? find_exact_wildcard_child(node, policy->children_arena.base,
-                                            tokens[i].type, tokens[i].text)
-                : find_literal_child(node, policy->children_arena.base,
-                                     tokens[i].text, tokens[i].compound);
-    if (!child) {
-      first_missing = i;
-      break;
-    }
-    probe = child->target;
-  }
   size_t missing = token_count - first_missing;
   if (missing > 0) {
     policy_state_t *parent = &policy->states.states[probe];
@@ -1386,6 +1420,8 @@ static st_error_t st_policy_add_locked(st_policy_t *policy,
     /* Add to length bucket */
     bool added = len_bucket_add(&policy->len_buckets[token_count], pid);
     assert(added);
+    if (has_explicit_wildcard)
+      bucket->explicit_wildcard_count++;
   }
 
   /* Only now remove rules subsumed by the successfully published pattern.
@@ -1568,7 +1604,12 @@ static st_error_t remove_pattern_by_id_locked(st_policy_t *policy,
 
   /* Remove from length bucket */
   if (entry->token_count < policy->num_buckets) {
-    len_bucket_remove(&policy->len_buckets[entry->token_count], pid);
+    len_bucket_t *bucket = &policy->len_buckets[entry->token_count];
+    if (pattern_has_explicit_wildcard(entry->tokens, entry->token_count)) {
+      assert(bucket->explicit_wildcard_count != 0);
+      bucket->explicit_wildcard_count--;
+    }
+    len_bucket_remove(bucket, pid);
   }
 
   /* Deactivate and free tokens */
@@ -1589,7 +1630,7 @@ st_error_t st_policy_add_netpattern(st_policy_t *policy, const char *pattern) {
 }
 
 st_error_t st_policy_batch_add_netpatterns(st_policy_t *policy,
-                                           const char **patterns,
+                                           const char *const *patterns,
                                            size_t count) {
   if (!policy || !patterns || count == 0)
     return ST_ERR_INVALID;
@@ -1713,13 +1754,13 @@ static bool pattern_array_contains_entry(const pattern_entry_t *entries,
   return false;
 }
 
-st_error_t st_policy_diff(const st_policy_t *a, const st_policy_t *b,
-                          st_policy_diff_t *result) {
-  if (!a || !b || !result)
+st_error_t st_policy_visit_diff(const st_policy_t *a, const st_policy_t *b,
+                                st_policy_diff_visitor_t visitor,
+                                void *user_ctx, size_t *visited_count) {
+  if (visited_count)
+    *visited_count = 0;
+  if (!a || !b || !visitor || !visited_count)
     return ST_ERR_INVALID;
-
-  memset(result, 0, sizeof(*result));
-
   if (a == b)
     return ST_OK;
 
@@ -1729,82 +1770,80 @@ st_error_t st_policy_diff(const st_policy_t *a, const st_policy_t *b,
   pthread_rwlock_rdlock((pthread_rwlock_t *)&first->rwlock);
   pthread_rwlock_rdlock((pthread_rwlock_t *)&second->rwlock);
 
-  size_t a_count = a->patterns.count;
-  size_t b_count = b->patterns.count;
   const pattern_entry_t *a_entries = a->patterns.entries;
   const pattern_entry_t *b_entries = b->patterns.entries;
+  size_t a_count = a->patterns.count;
+  size_t b_count = b->patterns.count;
+  size_t visited = 0;
+  bool keep_going = true;
 
-  /* Collect patterns in b that are not in a */
-  size_t added_cap = b_count > 0 ? b_count : 1;
-  char **added = calloc(added_cap, sizeof(char *));
-  if (!added) {
-    pthread_rwlock_unlock((pthread_rwlock_t *)&second->rwlock);
-    pthread_rwlock_unlock((pthread_rwlock_t *)&first->rwlock);
-    return ST_ERR_MEMORY;
-  }
-  size_t added_count = 0;
-  char **removed = NULL;
-  size_t removed_count = 0;
-  for (size_t i = 0; i < b_count; i++) {
-    if (!b_entries[i].active)
+  for (size_t i = 0; keep_going && i < b_count; i++) {
+    if (!b_entries[i].active ||
+        pattern_array_contains_entry(a_entries, a_count, b_entries[i].pattern))
       continue;
-    if (!pattern_array_contains_entry(a_entries, a_count,
-                                      b_entries[i].pattern)) {
-      added[added_count] = strdup(b_entries[i].pattern);
-      if (!added[added_count])
-        goto diff_memory_fail;
-      added_count++;
-    }
+    visited++;
+    keep_going = visitor(ST_POLICY_DIFF_ADDED, b_entries[i].pattern, user_ctx);
   }
-
-  /* Collect patterns in a that are not in b */
-  size_t removed_cap = a_count > 0 ? a_count : 1;
-  removed = calloc(removed_cap, sizeof(char *));
-  if (!removed) {
-    for (size_t i = 0; i < added_count; i++)
-      free(added[i]);
-    free(added);
-    pthread_rwlock_unlock((pthread_rwlock_t *)&second->rwlock);
-    pthread_rwlock_unlock((pthread_rwlock_t *)&first->rwlock);
-    return ST_ERR_MEMORY;
-  }
-  for (size_t i = 0; i < a_count; i++) {
-    if (!a_entries[i].active)
+  for (size_t i = 0; keep_going && i < a_count; i++) {
+    if (!a_entries[i].active ||
+        pattern_array_contains_entry(b_entries, b_count, a_entries[i].pattern))
       continue;
-    if (!pattern_array_contains_entry(b_entries, b_count,
-                                      a_entries[i].pattern)) {
-      removed[removed_count] = strdup(a_entries[i].pattern);
-      if (!removed[removed_count])
-        goto diff_memory_fail;
-      removed_count++;
-    }
+    visited++;
+    keep_going =
+        visitor(ST_POLICY_DIFF_REMOVED, a_entries[i].pattern, user_ctx);
   }
-
-  result->added = added;
-  result->added_count = added_count;
-  result->removed = removed;
-  result->removed_count = removed_count;
 
   pthread_rwlock_unlock((pthread_rwlock_t *)&second->rwlock);
   pthread_rwlock_unlock((pthread_rwlock_t *)&first->rwlock);
+  *visited_count = visited;
   return ST_OK;
-
-diff_memory_fail:
-  for (size_t i = 0; i < added_count; i++)
-    free(added[i]);
-  free(added);
-  if (removed) {
-    for (size_t i = 0; i < removed_count; i++)
-      free(removed[i]);
-    free(removed);
-  }
-  memset(result, 0, sizeof(*result));
-  pthread_rwlock_unlock((pthread_rwlock_t *)&second->rwlock);
-  pthread_rwlock_unlock((pthread_rwlock_t *)&first->rwlock);
-  return ST_ERR_MEMORY;
 }
 
-void st_free_diff_result(st_policy_diff_t *result) {
+typedef struct {
+  st_policy_diff_t *result;
+  bool failed;
+} diff_collect_t;
+
+static bool collect_policy_diff(st_policy_diff_kind_t kind,
+                                const char *netpattern, void *user_ctx) {
+  diff_collect_t *collect = user_ctx;
+  char ***items = kind == ST_POLICY_DIFF_ADDED ? &collect->result->added
+                                               : &collect->result->removed;
+  size_t *count = kind == ST_POLICY_DIFF_ADDED
+                      ? &collect->result->added_count
+                      : &collect->result->removed_count;
+  char **grown = realloc(*items, (*count + 1) * sizeof(**items));
+  if (!grown) {
+    collect->failed = true;
+    return false;
+  }
+  *items = grown;
+  grown[*count] = strdup(netpattern);
+  if (!grown[*count]) {
+    collect->failed = true;
+    return false;
+  }
+  (*count)++;
+  return true;
+}
+
+st_error_t st_policy_diff(const st_policy_t *a, const st_policy_t *b,
+                          st_policy_diff_t *result) {
+  if (!a || !b || !result)
+    return ST_ERR_INVALID;
+  memset(result, 0, sizeof(*result));
+
+  diff_collect_t collect = {.result = result};
+  size_t visited = 0;
+  st_error_t error =
+      st_policy_visit_diff(a, b, collect_policy_diff, &collect, &visited);
+  if (error == ST_OK && !collect.failed)
+    return ST_OK;
+  st_policy_diff_free(result);
+  return error == ST_OK ? ST_ERR_MEMORY : error;
+}
+
+void st_policy_diff_free(st_policy_diff_t *result) {
   if (!result)
     return;
   for (size_t i = 0; i < result->added_count; i++)
@@ -1922,7 +1961,7 @@ st_error_t st_policy_compact(st_policy_t *policy) {
     for (size_t i = 0; i < n_active; i++)
       free(active[i]);
     free(active);
-    st_policy_ctx_free(replacement_ctx);
+    st_policy_ctx_release(replacement_ctx);
     pthread_rwlock_unlock(&policy->rwlock);
     return ST_ERR_MEMORY;
   }
@@ -1938,7 +1977,7 @@ st_error_t st_policy_compact(st_policy_t *policy) {
   free(active);
   if (build_error != ST_OK) {
     st_policy_free(staged);
-    st_policy_ctx_free(replacement_ctx);
+    st_policy_ctx_release(replacement_ctx);
     pthread_rwlock_unlock(&policy->rwlock);
     return build_error;
   }
@@ -1947,7 +1986,7 @@ st_error_t st_policy_compact(st_policy_t *policy) {
       st_policy_ctx_swap_storage(policy->ctx, replacement_ctx);
   if (swap_error != ST_OK) {
     st_policy_free(staged);
-    st_policy_ctx_free(replacement_ctx);
+    st_policy_ctx_release(replacement_ctx);
     pthread_rwlock_unlock(&policy->rwlock);
     return swap_error;
   }
@@ -1983,7 +2022,7 @@ st_error_t st_policy_compact(st_policy_t *policy) {
   atomic_fetch_add(&policy->epoch, 1);
   pthread_rwlock_unlock(&policy->rwlock);
   st_policy_free(staged);
-  st_policy_ctx_free(replacement_ctx);
+  st_policy_ctx_release(replacement_ctx);
   return ST_OK;
 }
 
@@ -2028,7 +2067,7 @@ st_error_t st_policy_clear(st_policy_t *policy) {
   return ST_OK;
 }
 
-size_t st_policy_count(const st_policy_t *policy) {
+size_t st_policy_rule_count(const st_policy_t *policy) {
   if (!policy)
     return 0;
   pthread_rwlock_rdlock((pthread_rwlock_t *)&policy->rwlock);
@@ -2052,26 +2091,27 @@ static const char *token_display_text(const st_token_t *tok) {
 }
 
 /* Build a canonical netpattern from typed suggestion tokens. */
-static bool st_build_pattern(char *buf, size_t buf_size,
-                             const st_token_t *tokens, size_t count) {
+static st_error_t st_build_pattern(char *buf, size_t buf_size,
+                                   const st_token_t *tokens, size_t count) {
   st_token_t display[ST_MAX_CMD_TOKENS];
   if (count == 0 || count > ST_MAX_CMD_TOKENS)
-    return false;
+    return ST_ERR_INVALID;
   for (size_t i = 0; i < count; i++) {
     display[i] = tokens[i];
     display[i].text = (char *)token_display_text(&tokens[i]);
   }
   char *encoded = NULL;
-  if (st_netpattern_encode(display, count, &encoded) != ST_OK)
-    return false;
+  st_error_t err = st_netpattern_encode(display, count, &encoded);
+  if (err != ST_OK)
+    return err;
   size_t length = strlen(encoded);
   if (length + 1 > buf_size) {
     free(encoded);
-    return false;
+    return ST_ERR_LIMIT;
   }
   memcpy(buf, encoded, length + 1);
   free(encoded);
-  return true;
+  return ST_OK;
 }
 
 typedef struct {
@@ -2188,7 +2228,7 @@ static bool compound_child_matches(const child_entry_t *child,
   }
   if (wild_type == ST_TYPE_LITERAL)
     return false;
-  st_token_type_t concrete_type = st_classify_token(capture);
+  st_token_type_t concrete_type = st_token_classify(capture);
   return (runtime_match_mask(concrete_type) & (1ULL << wild_type)) != 0 &&
          param_matches(capture, concrete_type, symbol, wild_type);
 }
@@ -2300,18 +2340,25 @@ static const char *st_find_based_on(const st_policy_t *policy,
   return best ? best->pattern : NULL;
 }
 
-st_error_t st_policy_eval(st_policy_t *policy, const char *netargv,
-                          st_eval_result_t *result) {
+static void release_owned_tokens(st_token_array_t *tokens, bool owned) {
+  if (owned)
+    st_token_array_free(tokens);
+}
+
+static st_error_t policy_eval(st_policy_t *policy, st_netargv_view_t netargv,
+                              st_eval_result_t *result, bool *matches) {
+  if (matches)
+    *matches = false;
   if (result) {
     result->matches = false;
     result->matching_pattern = NULL;
     result->suggestion_count = 0;
-    result->error = ST_OK;
+    result->suggestion_error = ST_OK;
   }
-  if (!policy || !netargv)
+  if (!policy || (!netargv.data && netargv.length != 0))
     return ST_ERR_INVALID;
 
-  pthread_rwlock_rdlock(&policy->rwlock);
+  pthread_rwlock_rdlock((pthread_rwlock_t *)&policy->rwlock);
 
   /* Track statistics (atomic increment for thread safety) */
   atomic_fetch_add(&policy->stats.eval_count, 1);
@@ -2320,20 +2367,28 @@ st_error_t st_policy_eval(st_policy_t *policy, const char *netargv,
     result->matches = false;
     result->matching_pattern = NULL;
     result->suggestion_count = 0;
-    result->error = ST_OK;
+    result->suggestion_error = ST_OK;
   }
 
-  st_token_array_t cmd;
-  cmd.tokens = NULL;
-  cmd.count = 0;
-  st_error_t err = st_classify(netargv, &cmd);
+  st_token_scratch_t scratch;
+  st_token_array_t owned = {0};
+  bool cmd_owned = false;
+  st_error_t err = st_netargv_classify_scratch_view(netargv, &scratch);
+  if (err == ST_ERR_FAILED) {
+    err = st_netargv_classify_view(netargv, &owned);
+    cmd_owned = err == ST_OK;
+  }
   if (err != ST_OK) {
     pthread_rwlock_unlock(&policy->rwlock);
     return err;
   }
+  st_token_array_t cmd = cmd_owned
+                             ? owned
+                             : (st_token_array_t){.tokens = scratch.tokens,
+                                                  .count = scratch.count};
 
   if (cmd.count == 0 || cmd.count > MAX_CMD_TOKENS) {
-    st_free_token_array(&cmd);
+    release_owned_tokens(&cmd, cmd_owned);
     pthread_rwlock_unlock(&policy->rwlock);
     if (result)
       result->matches = false;
@@ -2405,7 +2460,7 @@ st_error_t st_policy_eval(st_policy_t *policy, const char *netargv,
   /* Verify-only fast path: filter rejected → skip trie walk entirely */
   if (filter_rejected && !result) {
     atomic_fetch_add(&policy->stats.filter_reject_count, 1);
-    st_free_token_array(&cmd);
+    release_owned_tokens(&cmd, cmd_owned);
     pthread_rwlock_unlock(&policy->rwlock);
     return ST_OK;
   }
@@ -2422,7 +2477,7 @@ st_error_t st_policy_eval(st_policy_t *policy, const char *netargv,
   const char *best_pattern = NULL;
   err = matching_walk_locked(policy, &cmd, &frontier, &best_pattern);
   if (err != ST_OK) {
-    st_free_token_array(&cmd);
+    release_owned_tokens(&cmd, cmd_owned);
     pthread_rwlock_unlock(&policy->rwlock);
     return err;
   }
@@ -2430,7 +2485,9 @@ st_error_t st_policy_eval(st_policy_t *policy, const char *netargv,
   assert(match_depth <= cmd.count);
   if (best_pattern) {
     match_frontier_free(&frontier);
-    st_free_token_array(&cmd);
+    release_owned_tokens(&cmd, cmd_owned);
+    if (matches)
+      *matches = true;
     if (result) {
       result->matches = true;
       result->matching_pattern = best_pattern;
@@ -2442,7 +2499,7 @@ st_error_t st_policy_eval(st_policy_t *policy, const char *netargv,
   /* Verify-only: no match, no suggestions needed */
   if (!result) {
     match_frontier_free(&frontier);
-    st_free_token_array(&cmd);
+    release_owned_tokens(&cmd, cmd_owned);
     pthread_rwlock_unlock(&policy->rwlock);
     return ST_OK;
   }
@@ -2463,35 +2520,28 @@ st_error_t st_policy_eval(st_policy_t *policy, const char *netargv,
 
   /* Suggestion A: minimal extension (matched prefix as-is + remaining as
    * literals) */
+  st_token_t suggestion_tokens[ST_MAX_CMD_TOKENS] = {0};
   {
-    st_token_t *pat_tokens = calloc(cmd.count, sizeof(st_token_t));
-    if (!pat_tokens) {
-      st_free_token_array(&cmd);
-      pthread_rwlock_unlock(&policy->rwlock);
-      return ST_ERR_MEMORY;
-    }
-
     for (size_t i = 0; i < match_depth; i++) {
-      pat_tokens[i].text = (char *)cmd.tokens[i].text;
-      pat_tokens[i].type = cmd.tokens[i].type;
+      suggestion_tokens[i].text = (char *)cmd.tokens[i].text;
+      suggestion_tokens[i].type = cmd.tokens[i].type;
     }
     for (size_t i = match_depth; i < cmd.count; i++) {
-      pat_tokens[i].text = (char *)cmd.tokens[i].text;
-      pat_tokens[i].type = ST_TYPE_LITERAL;
+      suggestion_tokens[i].text = (char *)cmd.tokens[i].text;
+      suggestion_tokens[i].type = ST_TYPE_LITERAL;
     }
 
-    if (!st_build_pattern(result->suggestions[0].pattern,
-                          sizeof(result->suggestions[0].pattern), pat_tokens,
-                          cmd.count)) {
-      free(pat_tokens);
-      st_free_token_array(&cmd);
-      result->error = ST_ERR_FAILED;
+    st_error_t pattern_err = st_build_pattern(
+        result->suggestions[0].pattern, sizeof(result->suggestions[0].pattern),
+        suggestion_tokens, cmd.count);
+    if (pattern_err != ST_OK) {
+      release_owned_tokens(&cmd, cmd_owned);
+      result->suggestion_error = pattern_err;
       pthread_rwlock_unlock(&policy->rwlock);
       return ST_OK;
     }
     result->suggestions[0].based_on = based_on;
     result->suggestions[0].confidence = confidence;
-    free(pat_tokens);
   }
 
   /* Suggestion B: best generalization */
@@ -2515,39 +2565,37 @@ st_error_t st_policy_eval(st_policy_t *policy, const char *netargv,
 
       if (best_wild != ST_TYPE_ANY) {
         size_t pat_len = match_depth + 1;
-        st_token_t *pat_tokens = calloc(pat_len, sizeof(st_token_t));
-        if (pat_tokens) {
-          for (size_t i = 0; i < match_depth; i++) {
-            pat_tokens[i].text = (char *)cmd.tokens[i].text;
-            pat_tokens[i].type = cmd.tokens[i].type;
-          }
-          pat_tokens[match_depth].text = (char *)st_type_symbol[best_wild];
-          pat_tokens[match_depth].type = best_wild;
-
-          if (!st_build_pattern(result->suggestions[1].pattern,
-                                sizeof(result->suggestions[1].pattern),
-                                pat_tokens, pat_len)) {
-            free(pat_tokens);
-            st_free_token_array(&cmd);
-            result->error = ST_ERR_FAILED;
-            pthread_rwlock_unlock(&policy->rwlock);
-            return ST_OK;
-          }
-          result->suggestions[1].based_on = based_on;
-          result->suggestions[1].confidence = confidence;
-          free(pat_tokens);
-          n_suggestions = 2;
+        memset(suggestion_tokens, 0, sizeof(suggestion_tokens));
+        for (size_t i = 0; i < match_depth; i++) {
+          suggestion_tokens[i].text = (char *)cmd.tokens[i].text;
+          suggestion_tokens[i].type = cmd.tokens[i].type;
         }
+        suggestion_tokens[match_depth].text = (char *)st_type_symbol[best_wild];
+        suggestion_tokens[match_depth].type = best_wild;
+
+        st_error_t pattern_err = st_build_pattern(
+            result->suggestions[1].pattern,
+            sizeof(result->suggestions[1].pattern), suggestion_tokens, pat_len);
+        if (pattern_err != ST_OK) {
+          release_owned_tokens(&cmd, cmd_owned);
+          result->suggestion_error = pattern_err;
+          pthread_rwlock_unlock(&policy->rwlock);
+          return ST_OK;
+        }
+        result->suggestions[1].based_on = based_on;
+        result->suggestions[1].confidence = confidence;
+        n_suggestions = 2;
       }
     }
   }
 
   if (n_suggestions < 2) {
-    if (!st_build_pattern(result->suggestions[1].pattern,
-                          sizeof(result->suggestions[1].pattern), cmd.tokens,
-                          cmd.count)) {
-      st_free_token_array(&cmd);
-      result->error = ST_ERR_FAILED;
+    st_error_t pattern_err = st_build_pattern(
+        result->suggestions[1].pattern, sizeof(result->suggestions[1].pattern),
+        cmd.tokens, cmd.count);
+    if (pattern_err != ST_OK) {
+      release_owned_tokens(&cmd, cmd_owned);
+      result->suggestion_error = pattern_err;
       pthread_rwlock_unlock(&policy->rwlock);
       return ST_OK;
     }
@@ -2561,9 +2609,47 @@ st_error_t st_policy_eval(st_policy_t *policy, const char *netargv,
 
   result->suggestion_count = n_suggestions;
   atomic_fetch_add(&policy->stats.suggestion_count, (uint64_t)n_suggestions);
-  st_free_token_array(&cmd);
-  pthread_rwlock_unlock(&policy->rwlock);
+  release_owned_tokens(&cmd, cmd_owned);
+  pthread_rwlock_unlock((pthread_rwlock_t *)&policy->rwlock);
   return ST_OK;
+}
+
+st_error_t st_policy_eval_view(st_policy_t *policy, st_netargv_view_t netargv,
+                               st_eval_result_t *result) {
+  if (!result)
+    return ST_ERR_INVALID;
+  return policy_eval(policy, netargv, result, NULL);
+}
+
+st_error_t st_policy_eval(st_policy_t *policy, const char *netargv,
+                          st_eval_result_t *result) {
+  if (!netargv)
+    return st_policy_eval_view(
+        policy, (st_netargv_view_t){.data = NULL, .length = 1}, result);
+  return st_policy_eval_view(
+      policy, (st_netargv_view_t){.data = netargv, .length = strlen(netargv)},
+      result);
+}
+
+st_error_t st_policy_match_view(st_policy_t *policy, st_netargv_view_t netargv,
+                                bool *matches) {
+  if (matches)
+    *matches = false;
+  if (!matches)
+    return ST_ERR_INVALID;
+  return policy_eval(policy, netargv, NULL, matches);
+}
+
+st_error_t st_policy_match(st_policy_t *policy, const char *netargv,
+                           bool *matches) {
+  if (!netargv) {
+    if (matches)
+      *matches = false;
+    return ST_ERR_INVALID;
+  }
+  return st_policy_match_view(
+      policy, (st_netargv_view_t){.data = netargv, .length = strlen(netargv)},
+      matches);
 }
 
 /* --- VERIFY ALL --- */
@@ -2573,41 +2659,44 @@ typedef struct {
   uint8_t token_idx;
 } bfs_entry_t;
 
-st_error_t st_policy_verify_all(const st_policy_t *policy, const char *netargv,
-                                const char ***matching_patterns,
-                                size_t *match_count) {
-  if (matching_patterns)
-    *matching_patterns = NULL;
-  if (match_count)
-    *match_count = 0;
-  if (!policy || !netargv || !matching_patterns || !match_count)
+static st_error_t policy_visit_matches(const st_policy_t *policy,
+                                       st_netargv_view_t netargv,
+                                       st_policy_match_visitor_t visitor,
+                                       void *user_ctx, size_t *visited_count) {
+  if (visited_count)
+    *visited_count = 0;
+  if (!policy || (!netargv.data && netargv.length != 0) || !visitor ||
+      !visited_count)
     return ST_ERR_INVALID;
 
-  st_token_array_t cmd;
-  cmd.tokens = NULL;
-  cmd.count = 0;
-  st_error_t err = st_classify(netargv, &cmd);
+  st_token_scratch_t scratch;
+  st_token_array_t owned = {0};
+  bool cmd_owned = false;
+  st_error_t err = st_netargv_classify_scratch_view(netargv, &scratch);
+  if (err == ST_ERR_FAILED) {
+    err = st_netargv_classify_view(netargv, &owned);
+    cmd_owned = err == ST_OK;
+  }
   if (err != ST_OK)
     return err;
+  st_token_array_t cmd = cmd_owned
+                             ? owned
+                             : (st_token_array_t){.tokens = scratch.tokens,
+                                                  .count = scratch.count};
 
   if (cmd.count == 0 || cmd.count > MAX_CMD_TOKENS) {
-    st_free_token_array(&cmd);
+    release_owned_tokens(&cmd, cmd_owned);
     return ST_OK;
   }
 
   pthread_rwlock_rdlock((pthread_rwlock_t *)&policy->rwlock);
 
-  const char **matches = NULL;
-  size_t match_cap = 0;
-  size_t match_n = 0;
+  size_t visited = 0;
   st_error_t result = ST_OK;
 
   size_t queue_cap = 64;
-  bfs_entry_t *queue = malloc(queue_cap * sizeof(*queue));
-  if (!queue) {
-    result = ST_ERR_MEMORY;
-    goto cleanup;
-  }
+  bfs_entry_t stack_queue[64];
+  bfs_entry_t *queue = stack_queue;
   size_t head = 0, tail = 1;
   queue[0].state_idx = 0;
   queue[0].token_idx = 0;
@@ -2620,19 +2709,11 @@ st_error_t st_policy_verify_all(const st_policy_t *policy, const char *netargv,
     if (entry.token_idx == cmd.count) {
       if (state->pattern_id != UINT16_MAX &&
           state->pattern_id < policy->patterns.count) {
-        if (match_n >= match_cap) {
-          size_t new_cap = match_cap == 0 ? 8 : match_cap * 2;
-          const char **new_matches =
-              realloc(matches, new_cap * sizeof(const char *));
-          if (!new_matches) {
-            result = ST_ERR_MEMORY;
-            goto cleanup;
-          }
-          matches = new_matches;
-          match_cap = new_cap;
-        }
-        matches[match_n++] =
+        const char *pattern =
             policy->patterns.entries[state->pattern_id].pattern;
+        visited++;
+        if (!visitor(pattern, user_ctx))
+          break;
       }
       continue;
     }
@@ -2657,11 +2738,15 @@ st_error_t st_policy_verify_all(const st_policy_t *policy, const char *netargv,
               goto cleanup;
             }
             size_t new_cap = queue_cap * 2;
-            bfs_entry_t *grown = realloc(queue, new_cap * sizeof(*queue));
+            bfs_entry_t *grown = queue == stack_queue
+                                     ? malloc(new_cap * sizeof(*queue))
+                                     : realloc(queue, new_cap * sizeof(*queue));
             if (!grown) {
               result = ST_ERR_MEMORY;
               goto cleanup;
             }
+            if (queue == stack_queue)
+              memcpy(grown, stack_queue, tail * sizeof(*queue));
             queue = grown;
             queue_cap = new_cap;
           }
@@ -2687,11 +2772,15 @@ st_error_t st_policy_verify_all(const st_policy_t *policy, const char *netargv,
             goto cleanup;
           }
           size_t new_cap = queue_cap * 2;
-          bfs_entry_t *grown = realloc(queue, new_cap * sizeof(*queue));
+          bfs_entry_t *grown = queue == stack_queue
+                                   ? malloc(new_cap * sizeof(*queue))
+                                   : realloc(queue, new_cap * sizeof(*queue));
           if (!grown) {
             result = ST_ERR_MEMORY;
             goto cleanup;
           }
+          if (queue == stack_queue)
+            memcpy(grown, stack_queue, tail * sizeof(*queue));
           queue = grown;
           queue_cap = new_cap;
         }
@@ -2703,24 +2792,96 @@ st_error_t st_policy_verify_all(const st_policy_t *policy, const char *netargv,
   }
 
 cleanup:
-  free(queue);
+  if (queue != stack_queue)
+    free(queue);
   pthread_rwlock_unlock((pthread_rwlock_t *)&policy->rwlock);
-  st_free_token_array(&cmd);
+  release_owned_tokens(&cmd, cmd_owned);
 
   if (result != ST_OK) {
-    free(matches);
     return result;
   }
-
-  *matching_patterns = matches;
-  *match_count = match_n;
+  *visited_count = visited;
   return ST_OK;
 }
 
-void st_policy_free_matches(const char **matches, size_t count) {
-  (void)count;
-  free((void *)matches);
+st_error_t st_policy_visit_matches_view(const st_policy_t *policy,
+                                        st_netargv_view_t netargv,
+                                        st_policy_match_visitor_t visitor,
+                                        void *user_ctx, size_t *visited_count) {
+  return policy_visit_matches(policy, netargv, visitor, user_ctx,
+                              visited_count);
 }
+
+st_error_t st_policy_visit_matches(const st_policy_t *policy,
+                                   const char *netargv,
+                                   st_policy_match_visitor_t visitor,
+                                   void *user_ctx, size_t *visited_count) {
+  if (!netargv) {
+    if (visited_count)
+      *visited_count = 0;
+    return ST_ERR_INVALID;
+  }
+  return st_policy_visit_matches_view(
+      policy, (st_netargv_view_t){.data = netargv, .length = strlen(netargv)},
+      visitor, user_ctx, visited_count);
+}
+
+typedef struct {
+  const char **items;
+  size_t count;
+  size_t capacity;
+} match_list_t;
+
+static bool collect_policy_match(const char *pattern, void *user_ctx) {
+  match_list_t *list = user_ctx;
+  if (list->count == list->capacity) {
+    size_t capacity = list->capacity ? list->capacity * 2 : 8;
+    const char **items = realloc(list->items, capacity * sizeof(*items));
+    if (!items)
+      return false;
+    list->items = items;
+    list->capacity = capacity;
+  }
+  list->items[list->count++] = pattern;
+  return true;
+}
+
+st_error_t st_policy_verify_all_view(const st_policy_t *policy,
+                                     st_netargv_view_t netargv,
+                                     const char ***matching_patterns,
+                                     size_t *match_count) {
+  if (matching_patterns)
+    *matching_patterns = NULL;
+  if (match_count)
+    *match_count = 0;
+  if (!matching_patterns || !match_count)
+    return ST_ERR_INVALID;
+  match_list_t list = {0};
+  size_t visited = 0;
+  st_error_t error = policy_visit_matches(policy, netargv, collect_policy_match,
+                                          &list, &visited);
+  if (error != ST_OK || visited != list.count) {
+    free(list.items);
+    return error == ST_OK ? ST_ERR_MEMORY : error;
+  }
+  *matching_patterns = list.items;
+  *match_count = list.count;
+  return ST_OK;
+}
+
+st_error_t st_policy_verify_all(const st_policy_t *policy, const char *netargv,
+                                const char ***matching_patterns,
+                                size_t *match_count) {
+  if (!netargv)
+    return st_policy_verify_all_view(
+        policy, (st_netargv_view_t){.data = NULL, .length = 1},
+        matching_patterns, match_count);
+  return st_policy_verify_all_view(
+      policy, (st_netargv_view_t){.data = netargv, .length = strlen(netargv)},
+      matching_patterns, match_count);
+}
+
+void st_policy_matches_free(const char **matches) { free((void *)matches); }
 
 /* --- NFA RENDERING ---
  *
@@ -3321,7 +3482,7 @@ st_error_t st_policy_load(st_policy_t *policy, const char *path,
       char *payload = (char *)record;
       st_token_array_t decoded_pattern = {0};
       st_error_t decode_error = st_netpattern_decode(payload, &decoded_pattern);
-      st_free_token_array(&decoded_pattern);
+      st_token_array_free(&decoded_pattern);
       if (decode_error != ST_OK) {
         free(payload);
         if (decode_error == ST_ERR_MEMORY)
@@ -3519,7 +3680,10 @@ size_t st_policy_state_count(const st_policy_t *policy) {
 /* --- STATISTICS --- */
 
 void st_policy_get_stats(const st_policy_t *policy, st_policy_stats_t *stats) {
-  if (!policy || !stats)
+  if (!stats)
+    return;
+  *stats = (st_policy_stats_t){0};
+  if (!policy)
     return;
 
   pthread_rwlock_rdlock((pthread_rwlock_t *)&policy->rwlock);
@@ -3697,7 +3861,7 @@ st_error_t st_policy_dump_dot(const st_policy_t *policy, const char *path) {
 
 /* --- DRY-RUN MODE --- */
 
-st_error_t st_policy_simulate_add_netpattern(st_policy_t *policy,
+st_error_t st_policy_simulate_add_netpattern(const st_policy_t *policy,
                                              const char *netpattern,
                                              bool *would_match,
                                              const char **conflicting_pattern) {
@@ -3720,7 +3884,7 @@ st_error_t st_policy_simulate_add_netpattern(st_policy_t *policy,
     return ST_ERR_INVALID;
   }
 
-  pthread_rwlock_rdlock(&policy->rwlock);
+  pthread_rwlock_rdlock((pthread_rwlock_t *)&policy->rwlock);
   const pattern_entry_t *best = NULL;
   len_bucket_t *bucket = &policy->len_buckets[token_count];
   for (size_t i = 0; i < bucket->count; i++) {
@@ -3735,7 +3899,7 @@ st_error_t st_policy_simulate_add_netpattern(st_policy_t *policy,
   *would_match = best != NULL;
   if (best && conflicting_pattern)
     *conflicting_pattern = best->pattern;
-  pthread_rwlock_unlock(&policy->rwlock);
+  pthread_rwlock_unlock((pthread_rwlock_t *)&policy->rwlock);
 
   free_pattern_tokens(tokens, token_count);
   return ST_OK;
@@ -3781,9 +3945,9 @@ size_t st_policy_suggest_variants(const st_policy_t *policy,
       lit_tokens[i].text = (char *)tokens[i].text;
       lit_tokens[i].type = ST_TYPE_LITERAL;
     }
-    if (!st_build_pattern(out[0].pattern, sizeof(out[0].pattern), lit_tokens,
-                          token_count) ||
-        st_validate_netpattern(out[0].pattern, NULL) != ST_OK) {
+    if (st_build_pattern(out[0].pattern, sizeof(out[0].pattern), lit_tokens,
+                         token_count) != ST_OK ||
+        st_netpattern_validate(out[0].pattern, NULL) != ST_OK) {
       free(lit_tokens);
       memset(out, 0, 3 * sizeof(*out));
       return 0;
@@ -3815,10 +3979,10 @@ size_t st_policy_suggest_variants(const st_policy_t *policy,
       pat_tokens[i].text = (char *)st_type_symbol[wider];
       pat_tokens[i].type = wider;
 
-      if (!st_build_pattern(out[n_variants].pattern,
-                            sizeof(out[n_variants].pattern), pat_tokens,
-                            token_count) ||
-          st_validate_netpattern(out[n_variants].pattern, NULL) != ST_OK) {
+      if (st_build_pattern(out[n_variants].pattern,
+                           sizeof(out[n_variants].pattern), pat_tokens,
+                           token_count) != ST_OK ||
+          st_netpattern_validate(out[n_variants].pattern, NULL) != ST_OK) {
         free(pat_tokens);
         memset(out, 0, 3 * sizeof(*out));
         return 0;

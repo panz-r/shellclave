@@ -3,6 +3,7 @@
 #include "test_allocator.h"
 
 #include <math.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -48,30 +49,32 @@ static int test_known_entropy_values(void) {
                {"abcd", 2.0, 1.584962500721156, 0.0},
                {"aab", 0.9182958340544896, 1.0, 1.0}};
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
-    ASSERT(near(env_screener_calculate_entropy(cases[i].text), cases[i].shannon,
+    ASSERT(near(shell_env_screener_calculate_entropy(cases[i].text),
+                cases[i].shannon, 1e-12));
+    ASSERT(near(shell_rpe_ngram_entropy(cases[i].text, 1), cases[i].shannon,
                 1e-12));
-    ASSERT(near(ngram_entropy(cases[i].text, 1), cases[i].shannon, 1e-12));
-    ASSERT(near(ngram_entropy(cases[i].text, 2), cases[i].bigram, 1e-12));
-    ASSERT(
-        near(conditional_entropy(cases[i].text), cases[i].conditional, 1e-12));
+    ASSERT(near(shell_rpe_ngram_entropy(cases[i].text, 2), cases[i].bigram,
+                1e-12));
+    ASSERT(near(shell_rpe_conditional_entropy(cases[i].text),
+                cases[i].conditional, 1e-12));
   }
-  ASSERT(env_screener_calculate_entropy(NULL) == 0.0);
-  ASSERT(isnan(ngram_entropy(NULL, 1)));
-  ASSERT(isnan(ngram_entropy("abcd", 0)));
-  ASSERT(isnan(ngram_entropy("abcd", 3)));
-  ASSERT(isnan(conditional_entropy(NULL)));
+  ASSERT(shell_env_screener_calculate_entropy(NULL) == 0.0);
+  ASSERT(isnan(shell_rpe_ngram_entropy(NULL, 1)));
+  ASSERT(isnan(shell_rpe_ngram_entropy("abcd", 0)));
+  ASSERT(isnan(shell_rpe_ngram_entropy("abcd", 3)));
+  ASSERT(isnan(shell_rpe_conditional_entropy(NULL)));
   return 1;
 }
 
 static int test_permutation_boundaries_and_ranges(void) {
-  ASSERT(
-      near(permutation_entropy("abcd", 5, 2), ngram_entropy("abcd", 2), 1e-12));
-  ASSERT(near(relative_entropy_ratio("abcd", 5, 2), 1.0, 1e-12));
-  ASSERT(isnan(permutation_entropy("abcd", 0, 2)));
-  ASSERT(isnan(permutation_entropy("abcd", 5, 3)));
-  ASSERT(isnan(permutation_conditional_entropy("abcd", 0)));
-  ASSERT(isnan(relative_entropy_ratio(NULL, 5, 2)));
-  ASSERT(isnan(relative_conditional_entropy(NULL, 5)));
+  ASSERT(near(shell_rpe_permutation_entropy("abcd", 5, 2),
+              shell_rpe_ngram_entropy("abcd", 2), 1e-12));
+  ASSERT(near(shell_rpe_relative_entropy_ratio("abcd", 5, 2), 1.0, 1e-12));
+  ASSERT(isnan(shell_rpe_permutation_entropy("abcd", 0, 2)));
+  ASSERT(isnan(shell_rpe_permutation_entropy("abcd", 5, 3)));
+  ASSERT(isnan(shell_rpe_permutation_conditional_entropy("abcd", 0)));
+  ASSERT(isnan(shell_rpe_relative_entropy_ratio(NULL, 5, 2)));
+  ASSERT(isnan(shell_rpe_relative_conditional_entropy(NULL, 5)));
 
   char long_input[512];
   static const char alphabet[] =
@@ -80,10 +83,10 @@ static int test_permutation_boundaries_and_ranges(void) {
     long_input[i] = alphabet[(i * 37 + i / 7) % (sizeof(alphabet) - 1)];
   long_input[sizeof(long_input) - 1] = '\0';
 
-  double values[] = {permutation_entropy(long_input, 17, 2),
-                     permutation_conditional_entropy(long_input, 17),
-                     relative_entropy_ratio(long_input, 17, 2),
-                     relative_conditional_entropy(long_input, 17)};
+  double values[] = {shell_rpe_permutation_entropy(long_input, 17, 2),
+                     shell_rpe_permutation_conditional_entropy(long_input, 17),
+                     shell_rpe_relative_entropy_ratio(long_input, 17, 2),
+                     shell_rpe_relative_conditional_entropy(long_input, 17)};
   for (size_t i = 0; i < sizeof(values) / sizeof(values[0]); i++)
     ASSERT(isfinite(values[i]) && values[i] >= 0.0);
   ASSERT(values[0] <= log2(strlen(long_input)));
@@ -95,17 +98,17 @@ static int test_permutation_allocation_failures(void) {
   static const char input[] = "abcdefghijklmnopqrstuvwxyz0123456789";
   for (size_t fail_at = 1; fail_at <= 2; fail_at++) {
     shellsplit_test_alloc_fail_at(fail_at);
-    ASSERT(isnan(permutation_entropy(input, 7, 2)));
+    ASSERT(isnan(shell_rpe_permutation_entropy(input, 7, 2)));
     shellsplit_test_alloc_fail_at(fail_at);
-    ASSERT(isnan(relative_entropy_ratio(input, 7, 2)));
+    ASSERT(isnan(shell_rpe_relative_entropy_ratio(input, 7, 2)));
     shellsplit_test_alloc_fail_at(fail_at);
-    ASSERT(isnan(permutation_conditional_entropy(input, 7)));
+    ASSERT(isnan(shell_rpe_permutation_conditional_entropy(input, 7)));
     shellsplit_test_alloc_fail_at(fail_at);
-    ASSERT(isnan(relative_conditional_entropy(input, 7)));
+    ASSERT(isnan(shell_rpe_relative_conditional_entropy(input, 7)));
   }
   shellsplit_test_alloc_reset();
-  ASSERT(isfinite(permutation_entropy(input, 7, 2)));
-  ASSERT(isfinite(permutation_conditional_entropy(input, 7)));
+  ASSERT(isfinite(shell_rpe_permutation_entropy(input, 7, 2)));
+  ASSERT(isfinite(shell_rpe_permutation_conditional_entropy(input, 7)));
   return 1;
 }
 
@@ -128,17 +131,18 @@ static int test_posterior_regression_matrix(void) {
       {"abc", 0.0},
   };
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
-    double score = env_screener_combined_score_name(NULL, cases[i].value);
+    double score = shell_env_screener_combined_score_name(NULL, cases[i].value);
     double tolerance = fmax(1e-6, cases[i].expected * 0.01);
     ASSERT(near(score, cases[i].expected, tolerance));
     ASSERT(score >= 0.0 && score <= 1.0);
-    ASSERT(score == env_screener_combined_score(cases[i].value));
+    ASSERT(score == shell_env_screener_combined_score(cases[i].value));
   }
-  ASSERT(env_screener_combined_score(NULL) == 0.0);
+  ASSERT(shell_env_screener_combined_score(NULL) == 0.0);
 
   const char *value = "someRandomValue1234567890abcdef";
-  double unnamed = env_screener_combined_score_name(NULL, value);
-  double named = env_screener_combined_score_name("SERVICE_API_KEY", value);
+  double unnamed = shell_env_screener_combined_score_name(NULL, value);
+  double named =
+      shell_env_screener_combined_score_name("SERVICE_API_KEY", value);
   ASSERT(named > unnamed);
   return 1;
 }
@@ -178,9 +182,11 @@ static int test_detector_matrices(void) {
                 {"", 0, 0, 0},
                 {NULL, 0, 0, 0}};
   for (size_t i = 0; i < sizeof(values) / sizeof(values[0]); i++) {
-    ASSERT(looks_like_path(values[i].value) == (bool)values[i].path);
-    ASSERT(looks_like_base64(values[i].value) == (bool)values[i].base64);
-    ASSERT(check_secret_prefix(values[i].value, NULL) ==
+    ASSERT(shell_env_screener_looks_like_path(values[i].value) ==
+           (bool)values[i].path);
+    ASSERT(shell_env_screener_looks_like_base64(values[i].value) ==
+           (bool)values[i].base64);
+    ASSERT(shell_env_screener_check_secret_prefix(values[i].value, NULL) ==
            (bool)values[i].prefix);
   }
 
@@ -193,21 +199,22 @@ static int test_detector_matrices(void) {
                {"MY_PASSWORD", 0, 1},    {"AUTH_TOKEN", 0, 1},
                {"ORDINARY_VALUE", 0, 0}, {NULL, 0, 0}};
   for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
-    ASSERT(env_screener_is_whitelisted(names[i].name) ==
+    ASSERT(shell_env_screener_is_whitelisted(names[i].name) ==
            (bool)names[i].whitelisted);
-    ASSERT(env_screener_is_secret_pattern(names[i].name) ==
+    ASSERT(shell_env_screener_is_secret_pattern(names[i].name) ==
            (bool)names[i].secret);
   }
 
   double suffix_entropy = -1.0;
-  ASSERT(check_secret_prefix("sk-abcdef123456", &suffix_entropy));
-  ASSERT(near(suffix_entropy, env_screener_calculate_entropy("abcdef123456"),
-              1e-12));
-  const char *whitelist = env_screener_get_whitelist_doc();
+  ASSERT(shell_env_screener_check_secret_prefix("sk-abcdef123456",
+                                                &suffix_entropy));
+  ASSERT(near(suffix_entropy,
+              shell_env_screener_calculate_entropy("abcdef123456"), 1e-12));
+  const char *whitelist = shell_env_screener_get_whitelist_doc();
   ASSERT(whitelist && strstr(whitelist, "DISPLAY") &&
          strstr(whitelist, "PATH"));
-  ASSERT(env_screener_get_whitelist_doc() == whitelist);
-  ASSERT(env_screener_recommended_capacity() > 0);
+  ASSERT(shell_env_screener_get_whitelist_doc() == whitelist);
+  ASSERT(shell_env_screener_recommended_capacity() > 0);
   return 1;
 }
 
@@ -230,46 +237,47 @@ static int test_environment_scan_contract(void) {
       long_named_secret,
       NULL,
   };
-  int indices[3] = {-1, -1, -1};
-  int count = -1;
+  size_t indices[3] = {SIZE_MAX, SIZE_MAX, SIZE_MAX};
+  size_t count = SIZE_MAX;
 
   environ = controlled_environ;
-  ASSERT(env_screener_scan(indices, -1, &count, 0.5, 8) == ENV_SCREENER_ERROR);
-  ASSERT(count == 0);
-  count = -1;
-  ASSERT(env_screener_scan(indices, 3, &count, 0.5, -1) == ENV_SCREENER_ERROR);
-  ASSERT(count == 0);
-  ASSERT(env_screener_scan(indices, 1, &count, 0.5, 8) ==
-         ENV_SCREENER_BUFFER_TOO_SMALL);
-  ASSERT(count == 3 && indices[0] == -1 && indices[1] == -1 &&
-         indices[2] == -1);
+  ASSERT(shell_env_screener_scan(indices, 1, &count, 0.5, 8) ==
+         SHELL_ENV_SCREENER_BUFFER_TOO_SMALL);
+  ASSERT(count == 3 && indices[0] == SIZE_MAX && indices[1] == SIZE_MAX &&
+         indices[2] == SIZE_MAX);
 
-  ASSERT(env_screener_scan(indices, 3, &count, 0.5, 8) == ENV_SCREENER_OK);
+  ASSERT(shell_env_screener_scan(indices, 3, &count, 0.5, 8) ==
+         SHELL_ENV_SCREENER_OK);
   ASSERT(count == 3 && indices[0] == 5 && indices[1] == 7 && indices[2] == 8);
 
-  ASSERT(env_screener_scan(indices, 3, &count, 1.0, 8) == ENV_SCREENER_OK);
+  ASSERT(shell_env_screener_scan(indices, 3, &count, 1.0, 8) ==
+         SHELL_ENV_SCREENER_OK);
   ASSERT(count == 0);
-  ASSERT(env_screener_scan(indices, 3, &count, 0.0, 100) == ENV_SCREENER_OK);
+  ASSERT(shell_env_screener_scan(indices, 3, &count, 0.0, 100) ==
+         SHELL_ENV_SCREENER_OK);
   ASSERT(count == 0);
 
   static const double invalid_thresholds[] = {-0.01, 1.01, NAN, INFINITY,
                                               -INFINITY};
   for (size_t i = 0;
        i < sizeof(invalid_thresholds) / sizeof(invalid_thresholds[0]); i++) {
-    count = -1;
-    ASSERT(env_screener_scan(indices, 3, &count, invalid_thresholds[i], 8) ==
-           ENV_SCREENER_ERROR);
+    count = SIZE_MAX;
+    ASSERT(shell_env_screener_scan(indices, 3, &count, invalid_thresholds[i],
+                                   8) == SHELL_ENV_SCREENER_ERROR);
     ASSERT(count == 0);
   }
 
   environ = NULL;
-  count = -1;
-  ASSERT(env_screener_scan(indices, 3, &count, 0.5, 8) == ENV_SCREENER_OK);
+  count = SIZE_MAX;
+  ASSERT(shell_env_screener_scan(indices, 3, &count, 0.5, 8) ==
+         SHELL_ENV_SCREENER_OK);
   ASSERT(count == 0);
 
   environ = saved_environ;
-  ASSERT(env_screener_scan(NULL, 3, &count, 0.5, 8) == ENV_SCREENER_ERROR);
-  ASSERT(env_screener_scan(indices, 3, NULL, 0.5, 8) == ENV_SCREENER_ERROR);
+  ASSERT(shell_env_screener_scan(NULL, 3, &count, 0.5, 8) ==
+         SHELL_ENV_SCREENER_ERROR);
+  ASSERT(shell_env_screener_scan(indices, 3, NULL, 0.5, 8) ==
+         SHELL_ENV_SCREENER_ERROR);
   return 1;
 }
 

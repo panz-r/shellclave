@@ -114,6 +114,34 @@ fail:
 
 /* --- TYPE CLASSIFICATION --- */
 
+typedef struct {
+  const char *text;
+  st_token_type_t type;
+  size_t count;
+} single_visit_expect_t;
+
+static bool check_single_visit(const st_token_view_t *token, void *user_ctx) {
+  single_visit_expect_t *expect = user_ctx;
+  size_t length = strlen(expect->text);
+  if (token->text_length != length ||
+      memcmp(token->text, expect->text, length) || token->type != expect->type)
+    return false;
+  expect->count++;
+  return true;
+}
+
+static int visit_single_classification(const char *text, st_token_type_t type) {
+  char *netargv = test_wrap_netstring(text);
+  if (!netargv)
+    return 0;
+  single_visit_expect_t expect = {.text = text, .type = type};
+  size_t visited = 0;
+  st_error_t error =
+      st_netargv_visit(netargv, check_single_visit, &expect, &visited);
+  free(netargv);
+  return error == ST_OK && visited == 1 && expect.count == 1;
+}
+
 static int test_classification_matrix(void) {
   static const struct {
     const char *token;
@@ -338,11 +366,11 @@ static int test_classification_matrix(void) {
       {"1a:2b:3c:4d:5e:6f:7a:8b:9c:0d:1e:2f:3a:4b:5c:6d", ST_TYPE_FINGERPRINT},
   };
 
-  ASSERT(st_classify_token(NULL) == ST_TYPE_LITERAL);
-  ASSERT(st_classify_token("") == ST_TYPE_LITERAL);
+  ASSERT(st_token_classify(NULL) == ST_TYPE_LITERAL);
+  ASSERT(st_token_classify("") == ST_TYPE_LITERAL);
 
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
-    st_token_type_t actual = st_classify_token(cases[i].token);
+    st_token_type_t actual = st_token_classify(cases[i].token);
     if ((unsigned)actual >= ST_TYPE_COUNT) {
       printf("  case %zu: classify('%s') returned invalid type %u\n", i,
              cases[i].token, (unsigned)actual);
@@ -354,6 +382,8 @@ static int test_classification_matrix(void) {
              st_type_symbol[cases[i].expected]);
       return 0;
     }
+    if (!strchr(cases[i].token, '='))
+      ASSERT(visit_single_classification(cases[i].token, actual));
     ASSERT(st_type_symbol[actual] != NULL);
   }
 
@@ -396,22 +426,26 @@ static int test_classification_matrix(void) {
       {"fe80::1%eth/0", ST_TYPE_IPV6},
   };
   for (size_t i = 0; i < sizeof(rejection_cases) / sizeof(rejection_cases[0]);
-       i++)
-    ASSERT(st_classify_token(rejection_cases[i].token) !=
+       i++) {
+    ASSERT(st_token_classify(rejection_cases[i].token) !=
            rejection_cases[i].forbidden);
+    ASSERT(visit_single_classification(
+        rejection_cases[i].token, st_token_classify(rejection_cases[i].token)));
+  }
   return 1;
 }
 
 static int generated_token_is(const char *token, st_token_type_t expected) {
   st_token_array_t normalized = {0};
-  if (st_classify_token(token) != expected ||
+  if (st_token_classify(token) != expected ||
+      !visit_single_classification(token, expected) ||
       test_st_classify(token, &normalized) != ST_OK || normalized.count != 1 ||
       normalized.tokens[0].type != expected ||
       strcmp(normalized.tokens[0].text, token) != 0) {
-    st_free_token_array(&normalized);
+    st_token_array_free(&normalized);
     return 0;
   }
-  st_free_token_array(&normalized);
+  st_token_array_free(&normalized);
   return 1;
 }
 
@@ -431,7 +465,7 @@ static int test_generated_classification_boundaries(void) {
     ASSERT(generated_token_is(token, ST_TYPE_SIZE));
     ASSERT(snprintf(token, sizeof(token), "%zu..5%s", i + 1, size_suffixes[i]) >
            0);
-    ASSERT(st_classify_token(token) != ST_TYPE_SIZE);
+    ASSERT(st_token_classify(token) != ST_TYPE_SIZE);
   }
   for (size_t i = 0;
        i < sizeof(duration_suffixes) / sizeof(duration_suffixes[0]); i++) {
@@ -440,14 +474,14 @@ static int test_generated_classification_boundaries(void) {
     ASSERT(generated_token_is(token, ST_TYPE_DURATION));
     ASSERT(snprintf(token, sizeof(token), "-%zu..25%s", i + 1,
                     duration_suffixes[i]) > 0);
-    ASSERT(st_classify_token(token) != ST_TYPE_DURATION);
+    ASSERT(st_token_classify(token) != ST_TYPE_DURATION);
   }
 
   for (unsigned octet = 0; octet <= 255; octet += 51) {
     ASSERT(snprintf(token, sizeof(token), "192.0.2.%u", octet) > 0);
     ASSERT(generated_token_is(token, ST_TYPE_IPV4));
   }
-  ASSERT(st_classify_token("192.0.2.256") != ST_TYPE_IPV4);
+  ASSERT(st_token_classify("192.0.2.256") != ST_TYPE_IPV4);
 
   static const char *uuids[] = {
       "550e8400-e29b-41d4-a716-446655440000",
@@ -455,7 +489,7 @@ static int test_generated_classification_boundaries(void) {
   };
   for (size_t i = 0; i < sizeof(uuids) / sizeof(uuids[0]); i++)
     ASSERT(generated_token_is(uuids[i], ST_TYPE_UUID));
-  ASSERT(st_classify_token("550e8400-e29b-41d4-a716-44665544000g") !=
+  ASSERT(st_token_classify("550e8400-e29b-41d4-a716-44665544000g") !=
          ST_TYPE_UUID);
 
   static const size_t sha_lengths[] = {7, 40, 64};
@@ -464,7 +498,7 @@ static int test_generated_classification_boundaries(void) {
     token[sha_lengths[i]] = '\0';
     ASSERT(generated_token_is(token, ST_TYPE_SHA));
     token[sha_lengths[i] - 1] = 'g';
-    ASSERT(st_classify_token(token) != ST_TYPE_SHA);
+    ASSERT(st_token_classify(token) != ST_TYPE_SHA);
   }
 
   static const char *timestamps[] = {"2024-02-29", "00:00:00", "23:59:59",
@@ -476,7 +510,7 @@ static int test_generated_classification_boundaries(void) {
                                          "23:60:00", "2025-01-01T00:00:60Z"};
   for (size_t i = 0; i < sizeof(bad_timestamps) / sizeof(bad_timestamps[0]);
        i++)
-    ASSERT(st_classify_token(bad_timestamps[i]) != ST_TYPE_TIMESTAMP);
+    ASSERT(st_token_classify(bad_timestamps[i]) != ST_TYPE_TIMESTAMP);
   return 1;
 }
 
@@ -658,8 +692,104 @@ static int test_classifier_adversarial_branch_matrix(void) {
       "7777",
   };
   for (size_t i = 0; i < sizeof(tokens) / sizeof(tokens[0]); i++) {
-    st_token_type_t type = st_classify_token(tokens[i]);
+    st_token_type_t type = st_token_classify(tokens[i]);
     ASSERT((unsigned)type < ST_TYPE_COUNT);
+    if (!strchr(tokens[i], '='))
+      ASSERT(visit_single_classification(tokens[i], type));
+  }
+  return 1;
+}
+
+static int test_bounded_recognizer_boundary_matrix(void) {
+  static const struct {
+    const char *token;
+    st_token_type_t expected;
+  } cases[] = {
+      {"::", ST_TYPE_IPV6},
+      {"::1", ST_TYPE_IPV6},
+      {"1:2:3:4:5:6:7:8", ST_TYPE_IPV6},
+      {"1:2:3:4:5:6:7::", ST_TYPE_IPV6},
+      {"1:2:3:4:5:6:7:8:9", ST_TYPE_IMAGE},
+      {"1:2:3:4:5:6:7", ST_TYPE_IMAGE},
+      {"::ffff:192.0.2.1", ST_TYPE_IPV6},
+      {"::ffff:192.0.2.256", ST_TYPE_FILENAME},
+      {"fe80::1%eth0", ST_TYPE_IPV6},
+      {"fe80::1%eth 0", ST_TYPE_QUOTED_SPACE},
+      {"fe80::1%", ST_TYPE_LITERAL},
+      {"1.2.3.4", ST_TYPE_IPV4},
+      {"1.2.3.04", ST_TYPE_IPV4},
+      {"1.2.3.4.", ST_TYPE_FILENAME},
+      {"1.2.3", ST_TYPE_SEMVER},
+      {"00:11:22:33:44:55", ST_TYPE_MAC},
+      {"00-11-22-33-44-55", ST_TYPE_MAC},
+      {"00:11-22:33-44:55", ST_TYPE_IMAGE},
+      {"@scope/name", ST_TYPE_PKG},
+      {"@scope/name@1.0", ST_TYPE_PKG},
+      {"name@1.0", ST_TYPE_PKG},
+      {"name@alpha", ST_TYPE_LITERAL},
+      {"name@1", ST_TYPE_PKG},
+      {"name@^1", ST_TYPE_PKG},
+      {"nginx:latest", ST_TYPE_IMAGE},
+      {"registry/name:tag", ST_TYPE_IMAGE},
+      {"image@sha256:"
+       "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+       ST_TYPE_IMAGE},
+      {"image@sha256:"
+       "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdeg",
+       ST_TYPE_LITERAL},
+      {"2024-02-29", ST_TYPE_TIMESTAMP},
+      {"2023-02-29", ST_TYPE_CRON},
+      {"2024-01-01T00:00:00+0000", ST_TYPE_TIMESTAMP},
+      {"2024-01-01T00:00:00+00:00", ST_TYPE_TIMESTAMP},
+      {"2024-01-01T00:00:00+24:00", ST_TYPE_LITERAL},
+      {"2024-01-01T00:00:00+00:60", ST_TYPE_LITERAL},
+      {"0B", ST_TYPE_SIZE},
+      {"0bytes", ST_TYPE_SIZE},
+      {"0.5KiB", ST_TYPE_SIZE},
+      {"0..5KiB", ST_TYPE_REL_PATH},
+      {"-0.5ms", ST_TYPE_DURATION},
+      {"-.5ms", ST_TYPE_DURATION},
+      {"1.0.0-0", ST_TYPE_SEMVER},
+      {"1.0.0-00", ST_TYPE_LITERAL},
+      {"1.0.0+00", ST_TYPE_SEMVER},
+      {"root:wheel", ST_TYPE_USER_GROUP},
+      {"www-data:users", ST_TYPE_USER_GROUP},
+      {"root:WHEEL", ST_TYPE_IMAGE},
+      {"*.c", ST_TYPE_GLOB},
+      {"[ab]", ST_TYPE_GLOB},
+      {"[ab", ST_TYPE_LITERAL},
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    st_token_type_t actual = st_token_classify(cases[i].token);
+    if (actual != cases[i].expected) {
+      printf("  bounded case %zu: '%s' = %s, expected %s\n", i, cases[i].token,
+             st_type_symbol[actual], st_type_symbol[cases[i].expected]);
+      return 0;
+    }
+    ASSERT(visit_single_classification(cases[i].token, cases[i].expected));
+  }
+  return 1;
+}
+
+static int test_bounded_classifier_stress_matrix(void) {
+  /* Deterministic mixed syntax keeps rare bounded-parser exits covered without
+   * depending on a fuzzer or asserting an arbitrary lattice result. */
+  static const char alphabet[] =
+      "0123456789abcdefABCDEF.-_/:@%+=*?[]{}|\\$abcdefghijklmnopqrstuvwxyz";
+  uint32_t state = UINT32_C(0x5eed1234);
+  char token[80];
+  for (size_t sample = 0; sample < 4096; sample++) {
+    state = state * UINT32_C(1664525) + UINT32_C(1013904223);
+    size_t length = state % (sizeof(token) - 1);
+    for (size_t i = 0; i < length; i++) {
+      state = state * UINT32_C(1664525) + UINT32_C(1013904223);
+      token[i] = alphabet[state % (sizeof(alphabet) - 1)];
+    }
+    token[length] = '\0';
+    st_token_type_t type = st_token_classify(token);
+    ASSERT((unsigned)type < ST_TYPE_COUNT);
+    if (!strchr(token, '='))
+      ASSERT(visit_single_classification(token, type));
   }
   return 1;
 }
@@ -678,7 +808,7 @@ static int test_contextual_adversarial_branch_matrix(void) {
   for (size_t i = 0; i < sizeof(commands) / sizeof(commands[0]); i++) {
     st_token_array_t typed = {0};
     ASSERT(test_st_classify(commands[i], &typed) == ST_OK);
-    st_free_token_array(&typed);
+    st_token_array_free(&typed);
   }
   return 1;
 }
@@ -805,7 +935,7 @@ static int test_normalization_matrix(void) {
     if (typed.count != cases[i].count) {
       printf("  normalization case '%s': got %zu tokens, expected %zu\n",
              cases[i].command, typed.count, cases[i].count);
-      st_free_token_array(&typed);
+      st_token_array_free(&typed);
       return 0;
     }
     const char *expected_text = cases[i].text;
@@ -821,7 +951,7 @@ static int test_normalization_matrix(void) {
     }
     ASSERT(*expected_text == '\0');
 
-    st_free_token_array(&typed);
+    st_token_array_free(&typed);
   }
   return 1;
 }
@@ -842,14 +972,14 @@ static int test_normalization_boundaries(void) {
   ASSERT(typed.count == 1);
   ASSERT(typed.tokens[0].type == ST_TYPE_LITERAL);
   ASSERT(strcmp(typed.tokens[0].text, operators) == 0);
-  st_free_token_array(&typed);
+  st_token_array_free(&typed);
 
   ASSERT(test_st_classify("#literal | ;", &typed) == ST_OK);
   ASSERT(typed.count == 3);
   ASSERT(strcmp(typed.tokens[0].text, "#literal") == 0);
   ASSERT(strcmp(typed.tokens[1].text, "|") == 0);
   ASSERT(strcmp(typed.tokens[2].text, ";") == 0);
-  st_free_token_array(&typed);
+  st_token_array_free(&typed);
 
   char many[(ST_MAX_CMD_TOKENS + 1) * 2 + 1];
   size_t used = 0;
@@ -871,7 +1001,7 @@ static int test_normalization_boundaries(void) {
   ASSERT(test_st_classify(long_command, &typed) == ST_OK);
   ASSERT(typed.count == 2 &&
          strlen(typed.tokens[1].text) == ST_MAX_TOKEN_LEN + 1);
-  st_free_token_array(&typed);
+  st_token_array_free(&typed);
   return 1;
 }
 
@@ -882,7 +1012,7 @@ static int test_normalization_allocation_failures(void) {
   ASSERT(test_st_classify(input, &probe) == ST_OK);
   size_t allocations = st_test_alloc_count();
   ASSERT(allocations > 0);
-  st_free_token_array(&probe);
+  st_token_array_free(&probe);
 
   bool observed = false;
   for (size_t fail_at = 1; fail_at <= allocations; fail_at++) {
@@ -895,7 +1025,7 @@ static int test_normalization_allocation_failures(void) {
       ASSERT(typed.tokens == NULL && typed.count == 0);
     } else {
       ASSERT(err == ST_OK);
-      st_free_token_array(&typed);
+      st_token_array_free(&typed);
     }
   }
   ASSERT(observed);
@@ -945,13 +1075,13 @@ static int test_public_helper_matrix(void) {
 
 static int test_netargv_contract(void) {
   st_token_array_t typed = {(st_token_t *)1, 99};
-  ASSERT(st_classify("6:printf,9:two words,0:,1:>,", &typed) == ST_OK);
+  ASSERT(st_netargv_classify("6:printf,9:two words,0:,1:>,", &typed) == ST_OK);
   ASSERT(typed.count == 4);
   ASSERT(strcmp(typed.tokens[0].text, "printf") == 0);
   ASSERT(strcmp(typed.tokens[1].text, "two words") == 0);
   ASSERT(strcmp(typed.tokens[2].text, "") == 0);
   ASSERT(strcmp(typed.tokens[3].text, ">") == 0);
-  st_free_token_array(&typed);
+  st_token_array_free(&typed);
 
   static const char *const malformed[] = {
       "01:x,", "-1:x,", "+1:x,", "1x,", "1:x", "2:x,", "0:;", "x",
@@ -959,27 +1089,174 @@ static int test_netargv_contract(void) {
   for (size_t i = 0; i < sizeof(malformed) / sizeof(malformed[0]); i++) {
     typed.tokens = (st_token_t *)1;
     typed.count = 99;
-    ASSERT(st_classify(malformed[i], &typed) == ST_ERR_FORMAT);
+    ASSERT(st_netargv_classify(malformed[i], &typed) == ST_ERR_FORMAT);
     ASSERT(typed.tokens == NULL && typed.count == 0);
   }
-  ASSERT(st_classify("", &typed) == ST_OK);
+  ASSERT(st_netargv_classify("", &typed) == ST_OK);
   ASSERT(typed.tokens == NULL && typed.count == 0);
 
-  ASSERT(st_classify("999999999999999999999999999999999999:x,", &typed) ==
-         ST_ERR_LIMIT);
-  ASSERT(st_classify("1:x,x", &typed) == ST_ERR_FORMAT);
+  ASSERT(st_netargv_classify("999999999999999999999999999999999999:x,",
+                             &typed) == ST_ERR_LIMIT);
+  ASSERT(st_netargv_classify("1:x,x", &typed) == ST_ERR_FORMAT);
 
   char too_many[ST_MAX_CMD_TOKENS * 4 + 2] = {0};
   for (size_t i = 0; i <= ST_MAX_CMD_TOKENS; i++)
     strcat(too_many, "0:,");
-  ASSERT(st_classify(too_many, &typed) == ST_ERR_LIMIT);
+  ASSERT(st_netargv_classify(too_many, &typed) == ST_ERR_LIMIT);
 
   char split_overflow[1024] = {0};
   for (size_t i = 0; i < ST_MAX_CMD_TOKENS / 2 + 1; i++)
     strcat(split_overflow, "3:A=1,");
-  ASSERT(st_classify(split_overflow, &typed) == ST_OK);
+  ASSERT(st_netargv_classify(split_overflow, &typed) == ST_OK);
   ASSERT(typed.count == ST_MAX_CMD_TOKENS / 2 + 1);
-  st_free_token_array(&typed);
+  st_token_array_free(&typed);
+  return 1;
+}
+
+static bool count_netargv_view(const st_token_view_t *token, void *user_ctx) {
+  size_t *count = user_ctx;
+  if (!token || !count)
+    return false;
+  (*count)++;
+  return true;
+}
+
+static int test_netargv_view_contract(void) {
+  static const char framed_with_trailer[] = "4:echo,5:hello,not netargv";
+  st_netargv_view_t bounded = {
+      .data = framed_with_trailer,
+      .length = strlen("4:echo,5:hello,"),
+  };
+  st_token_array_t typed = {0};
+  ASSERT(st_netargv_classify_view(bounded, &typed) == ST_OK);
+  ASSERT(typed.count == 2);
+  ASSERT(strcmp(typed.tokens[0].text, "echo") == 0);
+  ASSERT(strcmp(typed.tokens[1].text, "hello") == 0);
+  st_token_array_free(&typed);
+
+  size_t visited = 0;
+  ASSERT(st_netargv_visit_view(bounded, count_netargv_view, &visited,
+                               &visited) == ST_OK);
+  ASSERT(visited == 2);
+
+  static const char embedded_nul[] = {'1', ':', 'x', ',', '\0'};
+  ASSERT(st_netargv_classify_view(
+             (st_netargv_view_t){.data = embedded_nul,
+                                 .length = sizeof(embedded_nul)},
+             &typed) == ST_ERR_FORMAT);
+  ASSERT(typed.tokens == NULL && typed.count == 0);
+  ASSERT(st_netargv_classify_view((st_netargv_view_t){0}, &typed) == ST_OK);
+  ASSERT(typed.tokens == NULL && typed.count == 0);
+  return 1;
+}
+
+typedef struct {
+  const char *expected_text[8];
+  st_token_type_t expected_type[8];
+  size_t count;
+  size_t stop_after;
+} netargv_visit_expect_t;
+
+static bool check_netargv_visit(const st_token_view_t *token, void *user_ctx) {
+  netargv_visit_expect_t *expect = user_ctx;
+  if (!token || expect->count >= 8)
+    return false;
+  size_t index = expect->count++;
+  size_t length = strlen(expect->expected_text[index]);
+  if (token->text_length != length ||
+      memcmp(token->text, expect->expected_text[index], length) != 0 ||
+      token->type != expect->expected_type[index])
+    return false;
+  return expect->stop_after == 0 || expect->count < expect->stop_after;
+}
+
+static int test_netargv_visit_contract(void) {
+  netargv_visit_expect_t expect = {
+      .expected_text = {"grep", "a.*b", "--output", "123", "kill", "9", "A=1"},
+      .expected_type = {ST_TYPE_LITERAL, ST_TYPE_REGEX, ST_TYPE_LONGOPT,
+                        ST_TYPE_NUMBER, ST_TYPE_LITERAL, ST_TYPE_SIGNAL,
+                        ST_TYPE_LITERAL},
+  };
+  size_t visited = SIZE_MAX;
+  ASSERT(st_netargv_visit("4:grep,4:a.*b,8:--output,3:123,4:kill,1:9,3:A=1,",
+                          check_netargv_visit, &expect, &visited) == ST_OK);
+  ASSERT(visited == 7 && expect.count == 7);
+
+  expect.count = 0;
+  expect.stop_after = 2;
+  ASSERT(st_netargv_visit("4:grep,4:a.*b,8:--output,3:123,4:kill,1:9,3:A=1,",
+                          check_netargv_visit, &expect, &visited) == ST_OK);
+  ASSERT(visited == 2 && expect.count == 2);
+
+  netargv_visit_expect_t empty_expect = {.expected_text = {""},
+                                         .expected_type = {ST_TYPE_LITERAL}};
+  ASSERT(st_netargv_visit("0:,", check_netargv_visit, &empty_expect,
+                          &visited) == ST_OK);
+  ASSERT(visited == 1 && empty_expect.count == 1);
+
+  ASSERT(st_netargv_visit("1:x", check_netargv_visit, &expect, &visited) ==
+         ST_ERR_FORMAT);
+  ASSERT(visited == 0);
+  ASSERT(st_netargv_visit(NULL, check_netargv_visit, &expect, &visited) ==
+         ST_ERR_INVALID);
+  ASSERT(st_netargv_visit("1:x,", NULL, &expect, &visited) == ST_ERR_INVALID);
+  return 1;
+}
+
+typedef struct {
+  const char *payload;
+  size_t length;
+  st_token_type_t type;
+  size_t calls;
+} netargv_borrowed_expect_t;
+
+static bool check_netargv_borrowed(const st_token_view_t *token,
+                                   void *user_ctx) {
+  netargv_borrowed_expect_t *expect = user_ctx;
+  ASSERT(token->text == expect->payload);
+  ASSERT(token->text_length == expect->length);
+  ASSERT(token->type == expect->type);
+  expect->calls++;
+  return true;
+}
+
+static int test_netargv_visit_is_borrowed_and_allocation_free(void) {
+  static const char netargv[] = "4:grep,";
+  netargv_borrowed_expect_t short_expect = {
+      .payload = netargv + 2, .length = 4, .type = ST_TYPE_LITERAL};
+  size_t visited = 0;
+  st_test_alloc_reset();
+  ASSERT(st_netargv_visit(netargv, check_netargv_borrowed, &short_expect,
+                          &visited) == ST_OK);
+  ASSERT(visited == 1 && short_expect.calls == 1);
+  ASSERT(st_test_alloc_count() == 0);
+
+  size_t length = ST_MAX_TOKEN_LEN + 32;
+  size_t record_length = 0;
+  ASSERT(shell_netstring_encoded_length(length, &record_length) ==
+         SHELL_NETSTRING_OK);
+  char *long_netargv = malloc(record_length + 1);
+  ASSERT(long_netargv != NULL);
+  char *payload = malloc(length);
+  ASSERT(payload != NULL);
+  memset(payload, 'x', length);
+  size_t written = 0;
+  ASSERT(shell_netstring_write(long_netargv, record_length, payload, length,
+                               &written) == SHELL_NETSTRING_OK);
+  ASSERT(written == record_length);
+  long_netargv[written] = '\0';
+  netargv_borrowed_expect_t long_expect = {
+      .payload = long_netargv + (record_length - length - 1),
+      .length = length,
+      .type = ST_TYPE_LITERAL,
+  };
+  st_test_alloc_reset();
+  ASSERT(st_netargv_visit(long_netargv, check_netargv_borrowed, &long_expect,
+                          &visited) == ST_OK);
+  ASSERT(visited == 1 && long_expect.calls == 1);
+  ASSERT(st_test_alloc_count() == 0);
+  free(payload);
+  free(long_netargv);
   return 1;
 }
 
@@ -1138,7 +1415,7 @@ static int test_netpattern_cpl_contract(void) {
   }
   st_token_array_t decoded = {0};
   ASSERT(st_netpattern_decode("9:1:T,2:#n,,", &decoded) == ST_OK);
-  st_free_token_array(&decoded);
+  st_token_array_free(&decoded);
   ASSERT(st_netpattern_decode("09:1:T,2:#n,,", &decoded) == ST_ERR_FORMAT);
   ASSERT(st_netpattern_decode("14:1:T,7:#uuid.4,,", &decoded) == ST_ERR_FORMAT);
 
@@ -1199,7 +1476,7 @@ static int test_netpattern_cpl_contract(void) {
     ASSERT(nested != NULL);
     ASSERT(st_netpattern_decode(nested, &decoded) == ST_OK);
     ASSERT(decoded.count == 1 && decoded.tokens[0].compound);
-    st_free_token_array(&decoded);
+    st_token_array_free(&decoded);
     free(nested);
   }
   ASSERT(st_netpattern_to_cpl(NULL, &roundtrip) == ST_ERR_INVALID);
@@ -1261,7 +1538,7 @@ static int test_netpattern_cpl_contract(void) {
     ASSERT(error == ST_ERR_MEMORY || error == ST_OK);
     if (error == ST_ERR_MEMORY)
       ASSERT(failed.tokens == NULL && failed.count == 0);
-    st_free_token_array(&failed);
+    st_token_array_free(&failed);
 
     output = (char *)1;
     st_test_alloc_fail_at(fail_at);
@@ -1281,18 +1558,37 @@ static int test_canonical_policy_boundary(void) {
   st_policy_t *policy = st_policy_new(context);
   ASSERT(context != NULL && policy != NULL);
 
-  ASSERT(st_validate_netpattern("git status", NULL) == ST_ERR_FORMAT);
+  ASSERT(st_netpattern_validate("git status", NULL) == ST_ERR_FORMAT);
   ASSERT(st_policy_add_netpattern(policy, "git status") == ST_ERR_FORMAT);
 
   char *netpattern = NULL;
   ASSERT(st_netpattern_from_cpl("git status", &netpattern) == ST_OK);
-  ASSERT(st_validate_netpattern(netpattern, NULL) == ST_OK);
+  ASSERT(st_netpattern_validate(netpattern, NULL) == ST_OK);
   ASSERT(st_policy_add_netpattern(policy, netpattern) == ST_OK);
-  ASSERT(st_policy_count(policy) == 1);
+  ASSERT(st_policy_rule_count(policy) == 1);
 
   free(netpattern);
   st_policy_free(policy);
   st_policy_ctx_release(context);
+  return 1;
+}
+
+static int test_token_variant_api(void) {
+  st_token_t tokens[] = {
+      {.text = "42", .type = ST_TYPE_LITERAL},
+      {.text = "--force", .type = ST_TYPE_OPT},
+  };
+  st_token_array_t pattern = {.tokens = tokens, .count = 2};
+  st_token_variant_t variants[ST_MAX_TOKEN_VARIANTS];
+  size_t count =
+      st_token_variants_at(&pattern, 0, variants, ST_MAX_TOKEN_VARIANTS);
+  ASSERT(count >= 2);
+  ASSERT(variants[0].type == ST_TYPE_LITERAL);
+  ASSERT(variants[1].type == ST_TYPE_NUMBER);
+  ASSERT(variants[0].sample_value == NULL);
+  ASSERT(st_token_variants_at(&pattern, 2, variants, ST_MAX_TOKEN_VARIANTS) ==
+         0);
+  ASSERT(st_token_variants_at(NULL, 0, variants, ST_MAX_TOKEN_VARIANTS) == 0);
   return 1;
 }
 
@@ -1305,6 +1601,8 @@ int main(void) {
   TEST(test_classification_matrix);
   TEST(test_generated_classification_boundaries);
   TEST(test_classifier_adversarial_branch_matrix);
+  TEST(test_bounded_recognizer_boundary_matrix);
+  TEST(test_bounded_classifier_stress_matrix);
   TEST(test_contextual_adversarial_branch_matrix);
 
   printf("\nType lattice:\n");
@@ -1315,9 +1613,13 @@ int main(void) {
   TEST(test_normalization_boundaries);
   TEST(test_normalization_allocation_failures);
   TEST(test_netargv_contract);
+  TEST(test_netargv_view_contract);
+  TEST(test_netargv_visit_contract);
+  TEST(test_netargv_visit_is_borrowed_and_allocation_free);
   TEST(test_netpattern_cpl_contract);
   TEST(test_canonical_policy_boundary);
   TEST(test_public_helper_matrix);
+  TEST(test_token_variant_api);
 
   printf("\n========================================\n");
   printf("Results: %d/%d passed, %d failed\n", tests_passed, tests_run,

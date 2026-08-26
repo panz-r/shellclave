@@ -1405,7 +1405,7 @@ truncated:
 /**
  * Copy subcommand to buffer (null-terminated)
  */
-size_t shell_copy_subcommand(const char *cmd, const shell_range_t *range,
+size_t shell_subcommand_copy(const char *cmd, const shell_range_t *range,
                              char *buf, size_t buf_len) {
   if (!cmd || !range || !buf || buf_len == 0) {
     return 0;
@@ -1429,8 +1429,8 @@ size_t shell_copy_subcommand(const char *cmd, const shell_range_t *range,
 /**
  * Get subcommand pointer (not null-terminated)
  */
-const char *shell_get_subcommand(const char *cmd, const shell_range_t *range,
-                                 uint32_t *out_len) {
+const char *shell_subcommand_view(const char *cmd, const shell_range_t *range,
+                                  size_t *out_len) {
   if (!cmd || !range) {
     if (out_len)
       *out_len = 0;
@@ -1457,7 +1457,8 @@ const char *shell_error_string(shell_error_t err) {
   }
 }
 
-void shell_get_feature_flags(uint32_t features, shell_feature_flags_t *flags) {
+void shell_feature_flags_from_bits(uint32_t features,
+                                   shell_feature_flags_t *flags) {
   if (!flags)
     return;
   flags->has_vars = (features & SHELL_FEAT_VARS) != 0;

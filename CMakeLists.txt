@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(Shellclave VERSION 0.5.0 LANGUAGES C CXX)
+project(Shellclave VERSION 0.6.0 LANGUAGES C CXX)
 
 if(PROJECT_IS_TOP_LEVEL)
   set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -30,6 +30,7 @@ set(SHELLCLAVE_PUBLIC_HEADERS
   shellsplit/include/shell_interop.h
   shellsplit/include/shell_netstring.h
   shellsplit/include/shell_processor.h
+  shellsplit/include/shell_sequence.h
   shellsplit/include/shell_tokenizer.h
   shellsplit/include/shell_tokenizer_full.h
   shellsplit/include/shell_transform.h
@@ -135,7 +136,8 @@ function(shellclave_configure_shellgate_target target shelltype_target
   shellclave_project_target(${target})
   target_include_directories(${target} PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/shellgate/include>
-    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/shellclave>)
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/shellclave>
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shellsplit/src)
   target_link_libraries(${target} PUBLIC ${shellsplit_target} ${shelltype_target} PRIVATE m)
 
   # Reuse dependency targets supplied by a parent. In a standalone build,
@@ -224,7 +226,8 @@ if(BUILD_TESTING)
   foreach(shelltype_test_target IN ITEMS shelltype_token_types_test shelltype_unit_test
       shelltype_policy_test shelltype_policy_concurrency_test shelltype_verify_test
       shelltype_integration_test shelltype_compact_policy_test)
-    target_include_directories(${shelltype_test_target} PRIVATE shelltype/tests)
+    target_include_directories(${shelltype_test_target} PRIVATE
+      shelltype/src shelltype/tests)
   endforeach()
   shellclave_add_test(shellgate_unit_test shellgate/tests/test_shellgate.c shellgate_test)
   shellclave_add_test(shellgate_anomaly_test shellgate/tests/test_anomaly.c shellgate_test)
@@ -278,6 +281,11 @@ if(BUILD_TESTING)
     shellsplit/tests/generator)
   target_link_libraries(shellsplit_ast_generator_test PRIVATE shellsplit)
   add_test(NAME shellsplit_ast_generator_seed_1 COMMAND shellsplit_ast_generator_test -n 10000 -s 1)
+  add_test(NAME shellclave_public_api_names
+    COMMAND ${CMAKE_COMMAND}
+      -DSHELLCLAVE_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/test_public_api_names.cmake)
+  set_tests_properties(shellclave_public_api_names PROPERTIES LABELS api)
 
   if(NOT SHELLCLAVE_ENABLE_SANITIZERS AND NOT SHELLCLAVE_ENABLE_TSAN
       AND NOT SHELLCLAVE_ENABLE_COVERAGE AND NOT SHELLCLAVE_BUILD_FUZZERS)
@@ -324,6 +332,7 @@ if(SHELLCLAVE_BUILD_TOOLS)
   add_executable(shelltype_tool shelltype/tools/shelltype-tool.c)
   shellclave_project_target(shelltype_tool)
   target_link_libraries(shelltype_tool PRIVATE shelltype)
+  target_include_directories(shelltype_tool PRIVATE shelltype/src)
   foreach(tool IN ITEMS anomaly_demo anomaly_calibrate)
     add_executable(${tool} shellgate/tools/${tool}.c)
     shellclave_project_target(${tool})
@@ -382,6 +391,7 @@ if(SHELLCLAVE_BUILD_FUZZERS)
   target_link_libraries(fuzz_shellsplit PRIVATE shellsplit)
   add_executable(fuzz_shelltype shelltype/fuzz/fuzz_shelltype.cpp)
   target_compile_features(fuzz_shelltype PRIVATE cxx_std_11)
+  target_include_directories(fuzz_shelltype PRIVATE shelltype/src)
   target_compile_options(fuzz_shelltype PRIVATE -fsanitize=fuzzer,address,undefined)
   target_link_options(fuzz_shelltype PRIVATE -fsanitize=fuzzer,address,undefined)
   target_link_libraries(fuzz_shelltype PRIVATE shelltype)

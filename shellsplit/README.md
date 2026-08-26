@@ -10,6 +10,12 @@ APIs.
 ShellSplit parses shell commands and extracts individual command stages for
 callers that perform their own policy or pattern evaluation.
 
+## Canonical command transport
+
+Programmatic command flow uses canonical netargv and netseq values from
+`shell_sequence.h`. The transform and abstract modules expose diagnostic
+display text only; it is lossy and must not be reparsed or passed to Shelltype.
+
 ```
 Input: "cat file.txt | grep pattern | sort | uniq"
 
@@ -73,13 +79,13 @@ const char input[] = "cat file | grep pattern";
 shell_command_t* commands;
 size_t command_count;
 
-if (shell_tokenize_commands("cat file | grep pattern", &commands, &command_count)) {
+if ((shell_tokenize_commands("cat file | grep pattern", &commands, &command_count) == SHELL_TOKENIZE_OK)) {
     for (size_t i = 0; i < command_count; i++) {
         printf("Command %zu: %.*s\n", i + 1,
                (int)(commands[i].end_pos - commands[i].start_pos),
                input + commands[i].start_pos);
     }
-    shell_free_commands(commands, command_count);
+    shell_commands_free(commands, command_count);
 }
 ```
 

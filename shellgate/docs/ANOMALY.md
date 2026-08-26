@@ -146,7 +146,7 @@ The model learns from command sequences subject to two flags:
    - When true: model only updates on ALLOW verdicts
    - When false: model updates on every eval call
 
-2. **`anomaly_update_on_non_anomaly`** (default: true)
+2. **`anomaly_skip_on_detected`** (default: true)
    - When true: model skips learning from anomalous commands
    - When false: model learns from all commands
 
@@ -210,7 +210,7 @@ Prune before saving the model for disk efficiency.
 
 1. **Train on normal behavior**: Start with a threshold of 5.0 and adjust based on false positive rate
 2. **Enable adaptive threshold**: Use `sg_gate_set_anomaly_adaptive(gate, true, 1000)` for production workloads to reduce false positives as the model learns
-3. **Periodic model refresh**: Use `sg_anomaly_reset()` to clear old data and relearn
+3. **Periodic model refresh**: Use `sg_anomaly_model_reset()` to clear old data and relearn
 4. **Monitor OOM**: Check `sg_gate_anomaly_had_error()` after heavy usage
 5. **Save checkpoints**: Periodically save model to disk for recovery
 6. **Enable type caching**: Use `sg_gate_set_anomaly_cache_size(gate, 256)` when evaluating repeated commands
@@ -219,7 +219,9 @@ Prune before saving the model for disk efficiency.
 
 ```c
 sg_gate_t *gate = sg_gate_new();
-sg_gate_enable_anomaly(gate, 5.0, 0.1, -10.0);
+sg_anomaly_config_t anomaly_config;
+sg_anomaly_config_default(&anomaly_config);
+sg_gate_enable_anomaly(gate, 5.0, &anomaly_config);
 sg_gate_set_anomaly_adaptive(gate, true, 1000);
 sg_gate_set_anomaly_cache_size(gate, 256);
 
@@ -227,7 +229,7 @@ sg_gate_set_anomaly_cache_size(gate, 256);
 for (int i = 0; i < 100; i++) {
     char buf[8192];
     sg_result_t r;
-    sg_eval(gate, "ls ; cd /tmp ; pwd", 18, buf, sizeof(buf), &r);
+    sg_gate_evaluate(gate, "ls ; cd /tmp ; pwd", 18, buf, sizeof(buf), &r);
     // r.anomaly_detected tells if sequence is anomalous
     // r.anomaly_score_raw / r.anomaly_score_type for debugging
 }

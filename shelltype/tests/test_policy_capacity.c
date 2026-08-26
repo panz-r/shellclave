@@ -6,28 +6,12 @@
 #include <string.h>
 #include <unistd.h>
 
-enum { PREFIX_DEPTH = 128, LEAVES_PER_DEPTH = 512 };
+enum { GROUP_COUNT = 256, LEAVES_PER_GROUP = 256 };
 
-static int make_pattern(char *buffer, size_t capacity, size_t depth,
+static int make_pattern(char *buffer, size_t capacity, size_t group,
                         size_t leaf) {
-  size_t used = 0;
-  if (depth > 1) {
-    int written =
-        depth == 2 ? snprintf(buffer, capacity, "group ")
-                   : snprintf(buffer, capacity, "g%03zu ", leaf % (size_t)512);
-    if (written < 0 || (size_t)written >= capacity)
-      return 0;
-    used = (size_t)written;
-  }
-  for (size_t i = 1; i + 1 < depth; i++) {
-    int written = snprintf(buffer + used, capacity - used, "p%03zu ", i);
-    if (written < 0 || (size_t)written >= capacity - used)
-      return 0;
-    used += (size_t)written;
-  }
-  int written =
-      snprintf(buffer + used, capacity - used, "leaf%03zu_%03zu", depth, leaf);
-  return written >= 0 && (size_t)written < capacity - used;
+  int written = snprintf(buffer, capacity, "group%03zu leaf%03zu", group, leaf);
+  return written >= 0 && (size_t)written < capacity;
 }
 
 static int matches(st_policy_t *policy, const char *command, bool expected) {
@@ -117,78 +101,86 @@ int main(void) {
     return 1;
 
   size_t added = 0;
-  for (size_t depth = 1; depth <= PREFIX_DEPTH; depth++) {
+  for (size_t group = 0; group < GROUP_COUNT; group++) {
     size_t leaves =
-        depth == PREFIX_DEPTH ? LEAVES_PER_DEPTH - 1 : LEAVES_PER_DEPTH;
+        group + 1 == GROUP_COUNT ? LEAVES_PER_GROUP - 1 : LEAVES_PER_GROUP;
     for (size_t leaf = 0; leaf < leaves; leaf++) {
-      if (!make_pattern(pattern, sizeof(pattern), depth, leaf) ||
+      if (!make_pattern(pattern, sizeof(pattern), group, leaf) ||
           test_st_policy_add(policy, pattern) != ST_OK) {
-        fprintf(stderr, "initial add failed depth=%zu leaf=%zu\n", depth, leaf);
+        fprintf(stderr, "initial add failed group=%zu leaf=%zu\n", group, leaf);
         return 1;
       }
       added++;
     }
   }
-  if (added != ST_MAX_POLICY_PATTERNS || st_policy_count(policy) != added) {
+  if (added != ST_MAX_POLICY_PATTERNS ||
+      st_policy_rule_count(policy) != added) {
     fprintf(stderr, "initial count failed: %zu/%zu\n", added,
-            st_policy_count(policy));
+            st_policy_rule_count(policy));
     return 1;
   }
 
-  if (!make_pattern(pattern, sizeof(pattern), PREFIX_DEPTH,
-                    LEAVES_PER_DEPTH - 1) ||
+  if (!make_pattern(pattern, sizeof(pattern), GROUP_COUNT - 1,
+                    LEAVES_PER_GROUP - 1) ||
       test_st_policy_add(policy, pattern) != ST_ERR_LIMIT ||
-      st_policy_count(policy) != ST_MAX_POLICY_PATTERNS)
+      st_policy_rule_count(policy) != ST_MAX_POLICY_PATTERNS)
     return fprintf(stderr, "capacity limit check failed\n"), 1;
 
   char first[ST_MAX_NETPATTERN_LEN], middle[ST_MAX_NETPATTERN_LEN];
   char last[ST_MAX_NETPATTERN_LEN], removed[ST_MAX_NETPATTERN_LEN];
-  if (!make_pattern(first, sizeof(first), 1, 0) ||
-      !make_pattern(middle, sizeof(middle), 64, 255) ||
-      !make_pattern(last, sizeof(last), PREFIX_DEPTH, LEAVES_PER_DEPTH - 2) ||
-      !make_pattern(removed, sizeof(removed), 64, 256) ||
+  if (!make_pattern(first, sizeof(first), 0, 0) ||
+      !make_pattern(middle, sizeof(middle), GROUP_COUNT / 2,
+                    LEAVES_PER_GROUP / 2) ||
+      !make_pattern(last, sizeof(last), GROUP_COUNT - 1,
+                    LEAVES_PER_GROUP - 2) ||
+      !make_pattern(removed, sizeof(removed), GROUP_COUNT / 2,
+                    LEAVES_PER_GROUP / 2 + 1) ||
       !matches(policy, first, true) || !matches(policy, middle, true) ||
       !matches(policy, last, true))
     return fprintf(stderr, "initial match check failed\n"), 1;
 
   if (test_st_policy_remove(policy, removed) != ST_OK ||
-      st_policy_count(policy) != ST_MAX_POLICY_PATTERNS - 1 ||
+      st_policy_rule_count(policy) != ST_MAX_POLICY_PATTERNS - 1 ||
       !matches(policy, removed, false) ||
       test_st_policy_add(policy, pattern) != ST_OK ||
-      st_policy_count(policy) != ST_MAX_POLICY_PATTERNS ||
+      st_policy_rule_count(policy) != ST_MAX_POLICY_PATTERNS ||
       !matches(policy, pattern, true))
     return fprintf(stderr, "remove/readd check failed\n"), 1;
 
-  /* Reuse tombstoned registry slots and trie paths at several depths. */
-  static const size_t depths[] = {1, 64, PREFIX_DEPTH};
-  for (size_t i = 0; i < sizeof(depths) / sizeof(depths[0]); i++) {
+  /* Reuse tombstoned registry slots across existing and new trie branches. */
+  static const struct {
+    size_t group;
+    size_t leaf;
+  } replacements[] = {{1, 100},
+                      {GROUP_COUNT / 2, 100},
+                      {GROUP_COUNT - 1, LEAVES_PER_GROUP - 2}};
+  for (size_t i = 0; i < sizeof(replacements) / sizeof(replacements[0]); i++) {
     char old_pattern[ST_MAX_NETPATTERN_LEN];
     char replacement[ST_MAX_NETPATTERN_LEN];
-    size_t old_leaf = i == 2 ? LEAVES_PER_DEPTH - 2 : 100 + i;
-    if (!make_pattern(old_pattern, sizeof(old_pattern), depths[i], old_leaf) ||
-        !make_pattern(replacement, sizeof(replacement), depths[i],
-                      LEAVES_PER_DEPTH + i) ||
+    if (!make_pattern(old_pattern, sizeof(old_pattern), replacements[i].group,
+                      replacements[i].leaf) ||
+        !make_pattern(replacement, sizeof(replacement), GROUP_COUNT, i) ||
         test_st_policy_remove(policy, old_pattern) != ST_OK ||
-        st_policy_count(policy) != ST_MAX_POLICY_PATTERNS - 1 ||
+        st_policy_rule_count(policy) != ST_MAX_POLICY_PATTERNS - 1 ||
         test_st_policy_add(policy, replacement) != ST_OK ||
-        st_policy_count(policy) != ST_MAX_POLICY_PATTERNS ||
+        st_policy_rule_count(policy) != ST_MAX_POLICY_PATTERNS ||
         !matches(policy, replacement, true)) {
-      fprintf(stderr, "tombstone reuse failed at depth %zu (count=%zu)\n",
-              depths[i], st_policy_count(policy));
+      fprintf(stderr, "tombstone reuse failed at group %zu (count=%zu)\n",
+              replacements[i].group, st_policy_rule_count(policy));
       return 1;
     }
   }
 
   char replacement_last[ST_MAX_NETPATTERN_LEN];
-  if (!make_pattern(replacement_last, sizeof(replacement_last), PREFIX_DEPTH,
-                    LEAVES_PER_DEPTH + 2) ||
+  if (!make_pattern(replacement_last, sizeof(replacement_last), GROUP_COUNT,
+                    2) ||
       !matches(policy, first, true) || !matches(policy, middle, true) ||
       !matches(policy, replacement_last, true))
     return fprintf(stderr, "replacement last check failed\n"), 1;
 
   /* Exercise the complete lifecycle while the 16-bit registry is full. */
   if (st_policy_compact(policy) != ST_OK ||
-      st_policy_count(policy) != ST_MAX_POLICY_PATTERNS ||
+      st_policy_rule_count(policy) != ST_MAX_POLICY_PATTERNS ||
       !matches(policy, first, true) || !matches(policy, middle, true) ||
       !matches(policy, replacement_last, true))
     return fprintf(stderr, "compact check failed\n"), 1;
@@ -212,7 +204,7 @@ int main(void) {
   st_policy_ctx_t *loaded_context = st_policy_ctx_new();
   st_policy_t *loaded = loaded_context ? st_policy_new(loaded_context) : NULL;
   if (!loaded || st_policy_load(loaded, first_save, true) != ST_OK ||
-      st_policy_count(loaded) != ST_MAX_POLICY_PATTERNS ||
+      st_policy_rule_count(loaded) != ST_MAX_POLICY_PATTERNS ||
       !matches(loaded, first, true) || !matches(loaded, middle, true) ||
       !matches(loaded, replacement_last, true) ||
       st_policy_save(loaded, second_save) != ST_OK ||
@@ -233,24 +225,34 @@ int main(void) {
     return 1;
 
   st_policy_free(loaded);
-  st_policy_ctx_free(loaded_context);
+  st_policy_ctx_release(loaded_context);
   if (unlink(first_save) != 0 || unlink(second_save) != 0 ||
       unlink(nfa_path) != 0)
     return 1;
 
   /* Capacity checks must account for the narrower rules removed by a broader
-   * insertion. All 512 two-token rules are replaced by one rule. */
-  st_error_t broad_result = test_st_policy_add(policy, "group *");
+   * insertion. All 256 group000 rules are replaced by one rule. */
+  st_error_t broad_result = test_st_policy_add(policy, "group000 *");
   if (broad_result != ST_OK ||
-      st_policy_count(policy) != ST_MAX_POLICY_PATTERNS - 511 ||
-      !matches(policy, "group any-value", true)) {
+      st_policy_rule_count(policy) != ST_MAX_POLICY_PATTERNS - 255 ||
+      !matches(policy, "group000 any-value", true)) {
     fprintf(stderr, "broad insertion failed: error=%d count=%zu\n",
-            broad_result, st_policy_count(policy));
+            broad_result, st_policy_rule_count(policy));
+    return 1;
+  }
+  if (test_st_policy_add(policy, "group000 still-covered") != ST_OK ||
+      st_policy_rule_count(policy) != ST_MAX_POLICY_PATTERNS - 255 ||
+      test_st_policy_remove(policy, "group000 *") != ST_OK ||
+      st_policy_rule_count(policy) != ST_MAX_POLICY_PATTERNS - 256 ||
+      test_st_policy_add(policy, "group000 restored") != ST_OK ||
+      st_policy_rule_count(policy) != ST_MAX_POLICY_PATTERNS - 255 ||
+      !matches(policy, "group000 restored", true)) {
+    fprintf(stderr, "literal fast-path wildcard check failed\n");
     return 1;
   }
 
   st_policy_free(policy);
-  st_policy_ctx_free(ctx);
+  st_policy_ctx_release(ctx);
   puts("policy capacity: boundary, tombstone reuse, and subsumption passed");
   return 0;
 }

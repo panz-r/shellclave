@@ -3,6 +3,8 @@
 #include "alloc.h"
 #include "shell_netstring.h"
 #include "shell_processor.h"
+#include "shell_processor_internal.h"
+#include "shell_sequence.h"
 #include "shell_tokenizer_full.h"
 #include <ctype.h>
 #include <limits.h>
@@ -14,10 +16,10 @@
 
 /* --- Internal Helpers --- */
 
-static const char *ABSTRACT_TYPE_NAMES[] = {"EV", "PV", "SV", "AP",  "RP", "HP",
-                                            "GB", "CS", "AR", "STR", "RD"};
+static const char *SHELL_ABSTRACT_TYPE_NAMES[] = {
+    "EV", "PV", "SV", "AP", "RP", "HP", "GB", "CS", "AR", "STR", "RD"};
 
-static const char *PATH_CATEGORY_NAMES[] = {
+static const char *SHELL_PATH_CATEGORY_NAMES[] = {
     "ROOT",    "ETC",  "VAR", "USR",   "HOME",     "TMP",
     "PROC",    "SYS",  "DEV", "OPT",   "SRV",      "RUN",
     "SYSROOT", "BOOT", "MNT", "MEDIA", "SNAPSHOT", "OTHER"};
@@ -184,16 +186,17 @@ static bool is_long_option(const char *s, size_t len) {
   return s[0] == '-' && s[1] == '-' && s[2] != '-';
 }
 
-static bool is_redirection_token(token_type_t type) {
-  return type == TOKEN_REDIRECT_IN || type == TOKEN_REDIRECT_OUT ||
-         type == TOKEN_REDIRECT_ERR || type == TOKEN_REDIRECT_APPEND ||
-         type == TOKEN_HEREDOC || type == TOKEN_HERESTRING;
+static bool is_redirection_token(shell_token_type_t type) {
+  return type == SHELL_TOKEN_REDIRECT_IN || type == SHELL_TOKEN_REDIRECT_OUT ||
+         type == SHELL_TOKEN_REDIRECT_ERR ||
+         type == SHELL_TOKEN_REDIRECT_APPEND || type == SHELL_TOKEN_HEREDOC ||
+         type == SHELL_TOKEN_HERESTRING;
 }
 
 static bool redirection_consumes_operand(const shell_token_t *token) {
-  if (token->type == TOKEN_HERESTRING)
+  if (token->type == SHELL_TOKEN_HERESTRING)
     return true;
-  if (token->type == TOKEN_HEREDOC || token->length == 0)
+  if (token->type == SHELL_TOKEN_HEREDOC || token->length == 0)
     return false;
   char last = token->start[token->length - 1];
   return last == '<' || last == '>';
@@ -202,72 +205,72 @@ static bool redirection_consumes_operand(const shell_token_t *token) {
 /**
  * Classify a raw token string
  */
-token_type_t shell_classify_raw_token(const char *text, size_t len) {
+shell_token_type_t shell_classify_raw_token(const char *text, size_t len) {
   if (!text || len == 0)
-    return TOKEN_END;
+    return SHELL_TOKEN_END;
 
   // Handle quoted strings
   if ((text[0] == '"' && text[len - 1] == '"') ||
       (text[0] == '\'' && text[len - 1] == '\'')) {
-    return TOKEN_ARGUMENT; // Will be treated as string in abstraction
+    return SHELL_TOKEN_ARGUMENT; // Will be treated as string in abstraction
   }
 
   // Arithmetic must be checked before command substitution because $((...))
   // also has the outer $(...) shape.
   if (len >= 5 && text[0] == '$' && text[1] == '(' && text[2] == '(' &&
       text[len - 1] == ')' && text[len - 2] == ')') {
-    return TOKEN_ARITHMETIC;
+    return SHELL_TOKEN_ARITHMETIC;
   }
 
   // Command substitution: $(...) or `...`
   if (len >= 4) {
     if (text[0] == '$' && text[1] == '(' && text[len - 1] == ')') {
-      return TOKEN_SUBSHELL;
+      return SHELL_TOKEN_SUBSHELL;
     }
     if (text[0] == '`' && text[len - 1] == '`') {
-      return TOKEN_SUBSHELL;
+      return SHELL_TOKEN_SUBSHELL;
     }
   }
 
   // Variables
   if (text[0] == '$') {
     if (is_positional_variable(text, len)) {
-      return TOKEN_SPECIAL_VAR; // Use special var type for $1, $2
+      return SHELL_TOKEN_SPECIAL_VAR; // Use special var type for $1, $2
     }
     if (is_special_variable(text + 1, len - 1)) {
-      return TOKEN_SPECIAL_VAR;
+      return SHELL_TOKEN_SPECIAL_VAR;
     }
     if (is_env_variable(text, len)) {
-      return TOKEN_VARIABLE;
+      return SHELL_TOKEN_VARIABLE;
     }
-    return TOKEN_ARGUMENT;
+    return SHELL_TOKEN_ARGUMENT;
   }
 
   // Paths (before checking options since - could be a path component)
   if (is_absolute_path(text, len)) {
-    return TOKEN_ARGUMENT; // Will be classified as path in abstraction
+    return SHELL_TOKEN_ARGUMENT; // Will be classified as path in abstraction
   }
   if (is_home_path(text, len)) {
-    return TOKEN_ARGUMENT;
+    return SHELL_TOKEN_ARGUMENT;
   }
   if (is_relative_path(text, len)) {
-    return TOKEN_ARGUMENT;
+    return SHELL_TOKEN_ARGUMENT;
   }
 
   // Glob patterns
   if (is_glob_pattern(text, len)) {
-    return TOKEN_GLOB;
+    return SHELL_TOKEN_GLOB;
   }
 
   // Options
   if (is_long_option(text, len)) {
-    return TOKEN_ARGUMENT;
+    return SHELL_TOKEN_ARGUMENT;
   }
   if (is_short_option(text, len)) {
-    return TOKEN_ARGUMENT;
+    return SHELL_TOKEN_ARGUMENT;
   }
 
-  return TOKEN_ARGUMENT;
+  return SHELL_TOKEN_ARGUMENT;
 }
 
 /* --- ABSTRACTION HELPERS --- */
@@ -275,8 +278,8 @@ token_type_t shell_classify_raw_token(const char *text, size_t len) {
 /**
  * Create abstraction string for a type and index
  */
-static char *make_abstraction(abstract_type_t type, size_t index) {
-  const char *type_str = ABSTRACT_TYPE_NAMES[type];
+static char *make_abstraction(shell_abstract_type_t type, size_t index) {
+  const char *type_str = SHELL_ABSTRACT_TYPE_NAMES[type];
   int needed = snprintf(NULL, 0, "$%s_%zu", type_str, index);
   if (needed < 0)
     return NULL;
@@ -306,12 +309,12 @@ static char *extract_var_name(const char *text, size_t len) {
 /**
  * Determine abstract type from token type and classify path
  */
-static abstract_type_t get_abstract_type(token_type_t tok_type,
-                                         const char *text, size_t len) {
+static shell_abstract_type_t get_abstract_type(shell_token_type_t tok_type,
+                                               const char *text, size_t len) {
   // Handle known types from tokenizer directly
   switch (tok_type) {
-  case TOKEN_VARIABLE:
-  case TOKEN_VARIABLE_QUOTED:
+  case SHELL_TOKEN_VARIABLE:
+  case SHELL_TOKEN_VARIABLE_QUOTED:
     // Check if this is a braced positional variable: ${1}, ${10}, etc.
     if (len >= 4 && text[1] == '{' && text[len - 1] == '}') {
       // Check if the content is digits
@@ -323,57 +326,57 @@ static abstract_type_t get_abstract_type(token_type_t tok_type,
         }
       }
       if (all_digits) {
-        return ABSTRACT_PV;
+        return SHELL_ABSTRACT_PV;
       }
-      return ABSTRACT_EV; // ${VAR} - environment variable
+      return SHELL_ABSTRACT_EV; // ${VAR} - environment variable
     }
     // Check if positional variable: $1, $2, $10, etc.
     if (len >= 2 && isdigit((unsigned char)(text[1]))) {
-      return ABSTRACT_PV;
+      return SHELL_ABSTRACT_PV;
     }
     // Default: environment variable $VAR
-    return ABSTRACT_EV;
+    return SHELL_ABSTRACT_EV;
 
-  case TOKEN_SPECIAL_VAR:
+  case SHELL_TOKEN_SPECIAL_VAR:
     // Check if positional ($1, $2) - tokenizer returns SPECIAL_VAR for these
     if (len >= 2 && isdigit((unsigned char)(text[1]))) {
-      return ABSTRACT_PV;
+      return SHELL_ABSTRACT_PV;
     }
-    return ABSTRACT_SV;
+    return SHELL_ABSTRACT_SV;
 
-  case TOKEN_GLOB:
-    return ABSTRACT_GB;
+  case SHELL_TOKEN_GLOB:
+    return SHELL_ABSTRACT_GB;
 
-  case TOKEN_SUBSHELL:
-  case TOKEN_PROCESS_SUB:
-    return ABSTRACT_CS;
+  case SHELL_TOKEN_SUBSHELL:
+  case SHELL_TOKEN_PROCESS_SUB:
+    return SHELL_ABSTRACT_CS;
 
-  case TOKEN_ARITHMETIC:
-    return ABSTRACT_AR;
+  case SHELL_TOKEN_ARITHMETIC:
+    return SHELL_ABSTRACT_AR;
 
   default:
     break;
   }
 
-  // For TOKEN_COMMAND and TOKEN_ARGUMENT, do path classification
-  if (tok_type == TOKEN_COMMAND || tok_type == TOKEN_ARGUMENT) {
+  // For SHELL_TOKEN_COMMAND and SHELL_TOKEN_ARGUMENT, do path classification
+  if (tok_type == SHELL_TOKEN_COMMAND || tok_type == SHELL_TOKEN_ARGUMENT) {
     // Check for quoted strings first
     if ((text[0] == '"' && text[len - 1] == '"') ||
         (text[0] == '\'' && text[len - 1] == '\'')) {
-      return ABSTRACT_STR;
+      return SHELL_ABSTRACT_STR;
     }
     // Check glob before path (path check catches relative paths with /)
     if (is_glob_pattern(text, len)) {
-      return ABSTRACT_GB;
+      return SHELL_ABSTRACT_GB;
     }
     if (is_absolute_path(text, len)) {
-      return ABSTRACT_AP;
+      return SHELL_ABSTRACT_AP;
     }
     if (is_home_path(text, len)) {
-      return ABSTRACT_HP;
+      return SHELL_ABSTRACT_HP;
     }
     if (is_relative_path(text, len)) {
-      return ABSTRACT_RP;
+      return SHELL_ABSTRACT_RP;
     }
   }
 
@@ -385,15 +388,14 @@ static abstract_type_t get_abstract_type(token_type_t tok_type,
 /**
  * Build the abstracted command string from sorted elements
  */
-static char *build_abstracted_command(const char *original,
-                                      abstract_element_t **elements,
-                                      size_t element_count) {
-  if (!original)
-    return strdup("");
-
-  size_t orig_len = strlen(original);
+static shell_abstract_status_t
+build_abstracted_command(const char *original, size_t original_length,
+                         shell_abstract_element_t **elements,
+                         size_t element_count, char **out) {
+  *out = NULL;
   if (element_count == 0) {
-    return strdup(original);
+    *out = strndup(original, original_length);
+    return *out ? SHELL_ABSTRACT_OK : SHELL_ABSTRACT_ENOMEM;
   }
 
   // Compute required output size, including abstracted segments and untouched
@@ -402,7 +404,7 @@ static char *build_abstracted_command(const char *original,
   for (size_t i = 0; i < element_count; i++) {
     size_t length = strlen(elements[i]->abstraction);
     if (length > SIZE_MAX - output_size)
-      return NULL;
+      return SHELL_ABSTRACT_EOVERFLOW;
     output_size += length;
   }
 
@@ -412,21 +414,21 @@ static char *build_abstracted_command(const char *original,
     if (elements[i]->start > last_end) {
       size_t length = elements[i]->start - last_end;
       if (length > SIZE_MAX - output_size)
-        return NULL;
+        return SHELL_ABSTRACT_EOVERFLOW;
       output_size += length;
     }
     last_end = elements[i]->end;
   }
-  if (last_end < orig_len) {
-    size_t length = orig_len - last_end;
+  if (last_end < original_length) {
+    size_t length = original_length - last_end;
     if (length > SIZE_MAX - output_size)
-      return NULL;
+      return SHELL_ABSTRACT_EOVERFLOW;
     output_size += length;
   }
 
   char *result = malloc(output_size);
   if (!result)
-    return NULL;
+    return SHELL_ABSTRACT_ENOMEM;
 
   // Construct transformed output by merging original text and abstractions.
   size_t dst = 0;
@@ -449,37 +451,38 @@ static char *build_abstracted_command(const char *original,
   }
 
   // Copy remaining
-  if (src < orig_len) {
-    memcpy(result + dst, original + src, orig_len - src);
-    dst += orig_len - src;
+  if (src < original_length) {
+    memcpy(result + dst, original + src, original_length - src);
+    dst += original_length - src;
   }
 
   result[dst] = '\0';
-  return result;
+  *out = result;
+  return SHELL_ABSTRACT_OK;
 }
 
-static void free_abstract_element(abstract_element_t *elem) {
+static void free_abstract_element(shell_abstract_element_t *elem) {
   if (!elem)
     return;
   free(elem->abstraction);
   free((void *)elem->original);
   switch (elem->type) {
-  case ABSTRACT_EV:
-  case ABSTRACT_PV:
-  case ABSTRACT_SV:
+  case SHELL_ABSTRACT_EV:
+  case SHELL_ABSTRACT_PV:
+  case SHELL_ABSTRACT_SV:
     free(elem->data.var.name);
     break;
-  case ABSTRACT_AP:
-  case ABSTRACT_RP:
-  case ABSTRACT_HP:
+  case SHELL_ABSTRACT_AP:
+  case SHELL_ABSTRACT_RP:
+  case SHELL_ABSTRACT_HP:
     free(elem->data.path.path);
     break;
-  case ABSTRACT_GB:
+  case SHELL_ABSTRACT_GB:
     free(elem->data.glob.pattern);
     break;
-  case ABSTRACT_CS:
-  case ABSTRACT_AR:
-  case ABSTRACT_STR:
+  case SHELL_ABSTRACT_CS:
+  case SHELL_ABSTRACT_AR:
+  case SHELL_ABSTRACT_STR:
     free(elem->data.cmd_subst.content);
     break;
   default:
@@ -491,61 +494,73 @@ static void free_abstract_element(abstract_element_t *elem) {
 
 /* --- MAIN ABSTRACTION FUNCTION --- */
 
-bool shell_abstract_command(const char *command,
-                            abstracted_command_t **result) {
-  if (!result)
-    return false;
-  *result = NULL;
-  if (!command)
-    return false;
+static shell_abstract_status_t
+abstract_command_parse_impl(const char *command, size_t command_length,
+                            shell_abstract_command_t **out) {
+  *out = NULL;
 
   // Tokenize the command first
   shell_command_t *cmds = NULL;
   size_t cmd_count = 0;
 
-  if (!shell_tokenize_commands(command, &cmds, &cmd_count)) {
-    return false;
+  switch (shell_tokenize_commands(command, command_length, &cmds, &cmd_count)) {
+  case SHELL_TOKENIZE_OK:
+    break;
+  case SHELL_TOKENIZE_EINPUT:
+    return SHELL_ABSTRACT_EINPUT;
+  case SHELL_TOKENIZE_ENOMEM:
+    return SHELL_ABSTRACT_ENOMEM;
+  case SHELL_TOKENIZE_EOVERFLOW:
+    return SHELL_ABSTRACT_EOVERFLOW;
+  case SHELL_TOKENIZE_EPARSE:
+  default:
+    return SHELL_ABSTRACT_EPARSE;
   }
 
   if (cmd_count == 0 || cmds[0].token_count == 0) {
-    shell_free_commands(cmds, cmd_count);
-    *result = NULL;
-    return false;
+    shell_commands_free(cmds, cmd_count);
+    return SHELL_ABSTRACT_EPARSE;
   }
 
   // Allocate output structure for the transformed command result.
-  abstracted_command_t *abst = calloc(1, sizeof(abstracted_command_t));
+  shell_abstract_command_t *abst = calloc(1, sizeof(shell_abstract_command_t));
   if (!abst) {
-    shell_free_commands(cmds, cmd_count);
-    return false;
+    shell_commands_free(cmds, cmd_count);
+    return SHELL_ABSTRACT_ENOMEM;
   }
 
-  abst->original = strdup(command);
+  abst->original = strndup(command, command_length);
   if (!abst->original) {
-    shell_free_commands(cmds, cmd_count);
+    shell_commands_free(cmds, cmd_count);
     free(abst);
-    return false;
+    return SHELL_ABSTRACT_ENOMEM;
   }
 
   // Count abstractable tokens first
   size_t max_elements = 0;
   for (size_t c = 0; c < cmd_count; c++) {
     if (cmds[c].token_count > SIZE_MAX - max_elements) {
-      shell_free_commands(cmds, cmd_count);
+      shell_commands_free(cmds, cmd_count);
       free((void *)abst->original);
       free(abst);
-      return false;
+      return SHELL_ABSTRACT_EOVERFLOW;
     }
     max_elements += cmds[c].token_count;
   }
-  abstract_element_t **elements =
-      calloc(max_elements, sizeof(abstract_element_t *));
-
-  if (!elements) {
-    shell_free_commands(cmds, cmd_count);
+  if (max_elements > SIZE_MAX / sizeof(shell_abstract_element_t *)) {
+    shell_commands_free(cmds, cmd_count);
     free((void *)abst->original);
     free(abst);
-    return false;
+    return SHELL_ABSTRACT_EOVERFLOW;
+  }
+  shell_abstract_element_t **elements =
+      calloc(max_elements, sizeof(shell_abstract_element_t *));
+
+  if (!elements) {
+    shell_commands_free(cmds, cmd_count);
+    free((void *)abst->original);
+    free(abst);
+    return SHELL_ABSTRACT_ENOMEM;
   }
 
   // Indices for each abstract type
@@ -572,9 +587,9 @@ bool shell_abstract_command(const char *command,
       }
 
       // Get abstract type for this token
-      abstract_type_t ab_type =
+      shell_abstract_type_t ab_type =
           redirect_operand
-              ? ABSTRACT_REDIR
+              ? SHELL_ABSTRACT_REDIR
               : get_abstract_type(tok->type, tok->start, tok->length);
       redirect_operand = false;
 
@@ -584,37 +599,37 @@ bool shell_abstract_command(const char *command,
       // Determine index
       size_t idx = 0;
       switch (ab_type) {
-      case ABSTRACT_EV:
+      case SHELL_ABSTRACT_EV:
         idx = ++idx_ev;
         break;
-      case ABSTRACT_PV:
+      case SHELL_ABSTRACT_PV:
         idx = ++idx_pv;
         break;
-      case ABSTRACT_SV:
+      case SHELL_ABSTRACT_SV:
         idx = ++idx_sv;
         break;
-      case ABSTRACT_AP:
+      case SHELL_ABSTRACT_AP:
         idx = ++idx_ap;
         break;
-      case ABSTRACT_RP:
+      case SHELL_ABSTRACT_RP:
         idx = ++idx_rp;
         break;
-      case ABSTRACT_HP:
+      case SHELL_ABSTRACT_HP:
         idx = ++idx_hp;
         break;
-      case ABSTRACT_GB:
+      case SHELL_ABSTRACT_GB:
         idx = ++idx_gb;
         break;
-      case ABSTRACT_CS:
+      case SHELL_ABSTRACT_CS:
         idx = ++idx_cs;
         break;
-      case ABSTRACT_AR:
+      case SHELL_ABSTRACT_AR:
         idx = ++idx_ar;
         break;
-      case ABSTRACT_STR:
+      case SHELL_ABSTRACT_STR:
         idx = ++idx_str;
         break;
-      case ABSTRACT_REDIR:
+      case SHELL_ABSTRACT_REDIR:
         idx = ++idx_rd;
         break;
       default:
@@ -622,7 +637,8 @@ bool shell_abstract_command(const char *command,
       }
 
       // Create abstract element
-      abstract_element_t *elem = calloc(1, sizeof(abstract_element_t));
+      shell_abstract_element_t *elem =
+          calloc(1, sizeof(shell_abstract_element_t));
       if (!elem) {
         allocation_failed = true;
         break;
@@ -637,9 +653,9 @@ bool shell_abstract_command(const char *command,
 
       // Extract type-specific data
       switch (ab_type) {
-      case ABSTRACT_EV:
-      case ABSTRACT_PV:
-      case ABSTRACT_SV: {
+      case SHELL_ABSTRACT_EV:
+      case SHELL_ABSTRACT_PV:
+      case SHELL_ABSTRACT_SV: {
         const char *variable = tok->start;
         size_t variable_len = tok->length;
         elem->data.var.is_quoted = tok->is_quoted;
@@ -654,22 +670,22 @@ bool shell_abstract_command(const char *command,
         break;
       }
 
-      case ABSTRACT_AP:
-      case ABSTRACT_RP:
-      case ABSTRACT_HP:
+      case SHELL_ABSTRACT_AP:
+      case SHELL_ABSTRACT_RP:
+      case SHELL_ABSTRACT_HP:
         elem->data.path.path = strndup(tok->start, tok->length);
         elem->data.path.is_absolute = (tok->start[0] == '/');
         elem->data.path.ends_with_slash =
             (tok->length > 0 && tok->start[tok->length - 1] == '/');
         break;
 
-      case ABSTRACT_GB:
+      case SHELL_ABSTRACT_GB:
         elem->data.glob.pattern = strndup(tok->start, tok->length);
         elem->data.glob.has_slash =
             (memchr(tok->start, '/', tok->length) != NULL);
         break;
 
-      case ABSTRACT_CS:
+      case SHELL_ABSTRACT_CS:
         // Extract content
         if (tok->length >= 4) {
           if (tok->start[1] == '(') {
@@ -682,8 +698,8 @@ bool shell_abstract_command(const char *command,
         }
         break;
 
-      case ABSTRACT_AR:
-      case ABSTRACT_STR:
+      case SHELL_ABSTRACT_AR:
+      case SHELL_ABSTRACT_STR:
         // Store content if needed
         if (tok->length >= 2) {
           elem->data.cmd_subst.content =
@@ -697,9 +713,9 @@ bool shell_abstract_command(const char *command,
 
       bool detail_ok = true;
       switch (ab_type) {
-      case ABSTRACT_EV:
-      case ABSTRACT_PV:
-      case ABSTRACT_SV: {
+      case SHELL_ABSTRACT_EV:
+      case SHELL_ABSTRACT_PV:
+      case SHELL_ABSTRACT_SV: {
         const char *variable = tok->start;
         size_t variable_len = tok->length;
         if (tok->is_quoted && variable_len >= 2) {
@@ -712,19 +728,19 @@ bool shell_abstract_command(const char *command,
                     elem->data.var.name != NULL;
         break;
       }
-      case ABSTRACT_AP:
-      case ABSTRACT_RP:
-      case ABSTRACT_HP:
+      case SHELL_ABSTRACT_AP:
+      case SHELL_ABSTRACT_RP:
+      case SHELL_ABSTRACT_HP:
         detail_ok = elem->data.path.path != NULL;
         break;
-      case ABSTRACT_GB:
+      case SHELL_ABSTRACT_GB:
         detail_ok = elem->data.glob.pattern != NULL;
         break;
-      case ABSTRACT_CS:
+      case SHELL_ABSTRACT_CS:
         detail_ok = tok->length < 4 || elem->data.cmd_subst.content != NULL;
         break;
-      case ABSTRACT_AR:
-      case ABSTRACT_STR:
+      case SHELL_ABSTRACT_AR:
+      case SHELL_ABSTRACT_STR:
         detail_ok = tok->length < 2 || elem->data.cmd_subst.content != NULL;
         break;
       default:
@@ -736,42 +752,42 @@ bool shell_abstract_command(const char *command,
 
         // Set flags
         switch (ab_type) {
-        case ABSTRACT_EV:
+        case SHELL_ABSTRACT_EV:
           abst->has_variables = true;
           break;
-        case ABSTRACT_PV:
+        case SHELL_ABSTRACT_PV:
           abst->has_pos_vars = true;
           abst->has_variables = true;
           break;
-        case ABSTRACT_SV:
+        case SHELL_ABSTRACT_SV:
           abst->has_special_vars = true;
           abst->has_variables = true;
           break;
-        case ABSTRACT_AP:
+        case SHELL_ABSTRACT_AP:
           abst->has_abs_paths = true;
           abst->has_paths = true;
           break;
-        case ABSTRACT_RP:
+        case SHELL_ABSTRACT_RP:
           abst->has_rel_paths = true;
           abst->has_paths = true;
           break;
-        case ABSTRACT_HP:
+        case SHELL_ABSTRACT_HP:
           abst->has_home_paths = true;
           abst->has_paths = true;
           break;
-        case ABSTRACT_GB:
+        case SHELL_ABSTRACT_GB:
           abst->has_globs = true;
           break;
-        case ABSTRACT_CS:
+        case SHELL_ABSTRACT_CS:
           abst->has_cmd_subst = true;
           break;
-        case ABSTRACT_AR:
+        case SHELL_ABSTRACT_AR:
           abst->has_arithmetic = true;
           break;
-        case ABSTRACT_STR:
+        case SHELL_ABSTRACT_STR:
           abst->has_strings = true;
           break;
-        case ABSTRACT_REDIR:
+        case SHELL_ABSTRACT_REDIR:
           break;
         default:
           break;
@@ -789,9 +805,9 @@ bool shell_abstract_command(const char *command,
   if (allocation_failed) {
     abst->elements = elements;
     abst->element_count = element_count;
-    shell_free_commands(cmds, cmd_count);
-    shell_abstracted_destroy(abst);
-    return false;
+    shell_commands_free(cmds, cmd_count);
+    shell_abstract_command_free(abst);
+    return SHELL_ABSTRACT_ENOMEM;
   }
 
   // Set elements in result
@@ -801,7 +817,7 @@ bool shell_abstract_command(const char *command,
   // Sort elements by start position
   if (element_count > 0) {
     for (size_t i = 1; i < element_count; i++) {
-      abstract_element_t *key = elements[i];
+      shell_abstract_element_t *key = elements[i];
       size_t j = i;
       while (j > 0 && elements[j - 1]->start > key->start) {
         elements[j] = elements[j - 1];
@@ -811,100 +827,128 @@ bool shell_abstract_command(const char *command,
     }
   }
 
-  // Build abstracted command string
-  if (element_count == 0) {
-    abst->abstracted = strdup(command);
-  } else {
-    abst->abstracted =
-        build_abstracted_command(command, elements, element_count);
+  // Build from the owned source and the original span length. The caller's
+  // raw span need not have a NUL terminator.
+  shell_abstract_status_t display_status =
+      build_abstracted_command(abst->original, command_length, elements,
+                               element_count, &abst->display_text);
+  shell_commands_free(cmds, cmd_count);
+
+  if (display_status != SHELL_ABSTRACT_OK) {
+    shell_abstract_command_free(abst);
+    return display_status;
   }
 
-  shell_free_commands(cmds, cmd_count);
+  *out = abst;
+  return SHELL_ABSTRACT_OK;
+}
 
-  if (!abst->abstracted) {
-    shell_abstracted_destroy(abst);
-    return false;
-  }
-
-  *result = abst;
-  return true;
+shell_abstract_status_t
+shell_abstract_command_parse(const char *command, size_t command_length,
+                             shell_abstract_command_t **out) {
+  if (out)
+    *out = NULL;
+  if (!command || !out || memchr(command, '\0', command_length) != NULL)
+    return SHELL_ABSTRACT_EINPUT;
+  return abstract_command_parse_impl(command, command_length, out);
 }
 
 /* --- QUERY FUNCTIONS --- */
 
-const char *shell_get_abstracted(abstracted_command_t *cmd) {
-  return cmd ? cmd->abstracted : NULL;
+const char *
+shell_abstract_command_get_display_text(const shell_abstract_command_t *cmd) {
+  return cmd ? cmd->display_text : NULL;
 }
 
-const char *shell_get_original(abstracted_command_t *cmd) {
+const char *
+shell_abstract_command_get_source(const shell_abstract_command_t *cmd) {
   return cmd ? cmd->original : NULL;
 }
 
-abstract_element_t **shell_get_elements(abstracted_command_t *cmd,
-                                        size_t *count) {
+const shell_abstract_element_t *const *
+shell_abstract_command_get_elements(const shell_abstract_command_t *cmd,
+                                    size_t *count) {
+  if (count)
+    *count = 0;
+  if (!cmd || !count)
+    return NULL;
+  *count = cmd->element_count;
+  return (const shell_abstract_element_t *const *)cmd->elements;
+}
+
+shell_abstract_element_t *const *
+shell_abstract_command_get_mutable_elements(shell_abstract_command_t *cmd,
+                                            size_t *count) {
+  if (count)
+    *count = 0;
   if (!cmd || !count)
     return NULL;
   *count = cmd->element_count;
   return cmd->elements;
 }
 
-abstract_element_t *shell_get_element_at(abstracted_command_t *cmd,
-                                         size_t index) {
+shell_abstract_element_t *
+shell_abstract_command_get_element(shell_abstract_command_t *cmd,
+                                   size_t index) {
   if (!cmd || index >= cmd->element_count)
     return NULL;
   return cmd->elements[index];
 }
 
-bool shell_has_variables(abstracted_command_t *cmd) {
+bool shell_abstract_command_has_variables(const shell_abstract_command_t *cmd) {
   return cmd ? cmd->has_variables : false;
 }
 
-bool shell_has_pos_vars(abstracted_command_t *cmd) {
+bool shell_abstract_command_has_pos_vars(const shell_abstract_command_t *cmd) {
   return cmd ? cmd->has_pos_vars : false;
 }
 
-bool shell_has_special_vars(abstracted_command_t *cmd) {
+bool shell_abstract_command_has_special_vars(
+    const shell_abstract_command_t *cmd) {
   return cmd ? cmd->has_special_vars : false;
 }
 
-bool shell_has_globs(abstracted_command_t *cmd) {
+bool shell_abstract_command_has_globs(const shell_abstract_command_t *cmd) {
   return cmd ? cmd->has_globs : false;
 }
 
-bool shell_has_paths(abstracted_command_t *cmd) {
+bool shell_abstract_command_has_paths(const shell_abstract_command_t *cmd) {
   return cmd ? cmd->has_paths : false;
 }
 
-bool shell_has_abs_paths(abstracted_command_t *cmd) {
+bool shell_abstract_command_has_abs_paths(const shell_abstract_command_t *cmd) {
   return cmd ? cmd->has_abs_paths : false;
 }
 
-bool shell_has_rel_paths(abstracted_command_t *cmd) {
+bool shell_abstract_command_has_rel_paths(const shell_abstract_command_t *cmd) {
   return cmd ? cmd->has_rel_paths : false;
 }
 
-bool shell_has_home_paths(abstracted_command_t *cmd) {
+bool shell_abstract_command_has_home_paths(
+    const shell_abstract_command_t *cmd) {
   return cmd ? cmd->has_home_paths : false;
 }
 
-bool shell_has_cmd_subst(abstracted_command_t *cmd) {
+bool shell_abstract_command_has_cmd_subst(const shell_abstract_command_t *cmd) {
   return cmd ? cmd->has_cmd_subst : false;
 }
 
-bool shell_has_redirects(abstracted_command_t *cmd) {
+bool shell_abstract_command_has_redirects(const shell_abstract_command_t *cmd) {
   return cmd ? cmd->has_redirects : false;
 }
 
-bool shell_has_arithmetic(abstracted_command_t *cmd) {
+bool shell_abstract_command_has_arithmetic(
+    const shell_abstract_command_t *cmd) {
   return cmd ? cmd->has_arithmetic : false;
 }
 
-bool shell_has_strings(abstracted_command_t *cmd) {
+bool shell_abstract_command_has_strings(const shell_abstract_command_t *cmd) {
   return cmd ? cmd->has_strings : false;
 }
 
-abstract_element_t *shell_get_element_by_abstract(abstracted_command_t *cmd,
-                                                  const char *abstraction) {
+shell_abstract_element_t *
+shell_abstract_command_find_element(shell_abstract_command_t *cmd,
+                                    const char *abstraction) {
   if (!cmd || !abstraction)
     return NULL;
 
@@ -920,7 +964,8 @@ abstract_element_t *shell_get_element_by_abstract(abstracted_command_t *cmd,
 
 /* --- RUNTIME EXPANSION --- */
 
-static char *finish_expanded_path(char *path, runtime_context_t *ctx) {
+static char *finish_expanded_path(char *path,
+                                  const shell_runtime_context_t *ctx) {
   if (!path || !ctx->resolve_symlinks)
     return path;
 
@@ -947,14 +992,15 @@ static char *join_path(const char *base, const char *path) {
   return result;
 }
 
-char *shell_expand_element(abstract_element_t *elem, runtime_context_t *ctx) {
+char *shell_abstract_element_expand(shell_abstract_element_t *elem,
+                                    const shell_runtime_context_t *ctx) {
   if (!elem || !ctx)
     return NULL;
 
   switch (elem->type) {
-  case ABSTRACT_EV:
-  case ABSTRACT_PV:
-  case ABSTRACT_SV: {
+  case SHELL_ABSTRACT_EV:
+  case SHELL_ABSTRACT_PV:
+  case SHELL_ABSTRACT_SV: {
     if (!elem->data.var.name)
       return NULL;
 
@@ -971,13 +1017,13 @@ char *shell_expand_element(abstract_element_t *elem, runtime_context_t *ctx) {
     return NULL;
   }
 
-  case ABSTRACT_HP: {
+  case SHELL_ABSTRACT_HP: {
     if (!elem->data.path.path)
       return NULL;
     const char *path = elem->data.path.path;
 
     if (path[0] == '~' && (path[1] == '/' || path[1] == '\0')) {
-      char *home = NULL;
+      const char *home = NULL;
       if (ctx->env) {
         for (size_t i = 0; ctx->env[i]; i++) {
           if (strncmp(ctx->env[i], "HOME=", 5) == 0) {
@@ -997,8 +1043,8 @@ char *shell_expand_element(abstract_element_t *elem, runtime_context_t *ctx) {
     return finish_expanded_path(strdup(path), ctx);
   }
 
-  case ABSTRACT_AP:
-  case ABSTRACT_RP: {
+  case SHELL_ABSTRACT_AP:
+  case SHELL_ABSTRACT_RP: {
     if (!elem->data.path.path)
       return NULL;
 
@@ -1014,8 +1060,8 @@ char *shell_expand_element(abstract_element_t *elem, runtime_context_t *ctx) {
   }
 }
 
-bool shell_expand_all_elements(abstracted_command_t *cmd,
-                               runtime_context_t *ctx) {
+bool shell_abstract_command_expand(shell_abstract_command_t *cmd,
+                                   const shell_runtime_context_t *ctx) {
   if (!cmd || !ctx)
     return false;
 
@@ -1025,7 +1071,8 @@ bool shell_expand_all_elements(abstracted_command_t *cmd,
       cmd->elements[i]->expanded = NULL;
     }
 
-    cmd->elements[i]->expanded = shell_expand_element(cmd->elements[i], ctx);
+    cmd->elements[i]->expanded =
+        shell_abstract_element_expand(cmd->elements[i], ctx);
   }
 
   return true;
@@ -1033,15 +1080,15 @@ bool shell_expand_all_elements(abstracted_command_t *cmd,
 
 /* --- UTILITY FUNCTIONS --- */
 
-path_category_t shell_get_path_category(const char *resolved_path) {
+shell_path_category_t shell_path_category_from_path(const char *resolved_path) {
   if (!resolved_path || resolved_path[0] != '/') {
-    return PATH_OTHER;
+    return SHELL_PATH_OTHER;
   }
 
   // Skip leading /
   const char *p = resolved_path + 1;
   if (*p == '\0')
-    return PATH_ROOT;
+    return SHELL_PATH_ROOT;
 
   // Find first /
   const char *slash = strchr(p, '/');
@@ -1049,71 +1096,71 @@ path_category_t shell_get_path_category(const char *resolved_path) {
 
   // Compare first component
   if (first_comp_len == 3 && strncmp(p, "etc", 3) == 0)
-    return PATH_ETC;
+    return SHELL_PATH_ETC;
   if (first_comp_len == 3 && strncmp(p, "var", 3) == 0)
-    return PATH_VAR;
+    return SHELL_PATH_VAR;
   if (first_comp_len == 3 && strncmp(p, "usr", 3) == 0)
-    return PATH_USR;
+    return SHELL_PATH_USR;
   if (first_comp_len == 4 && strncmp(p, "home", 4) == 0)
-    return PATH_HOME;
+    return SHELL_PATH_HOME;
   if (first_comp_len == 4 && strncmp(p, "root", 4) == 0)
-    return PATH_HOME;
+    return SHELL_PATH_HOME;
   if (first_comp_len == 3 && strncmp(p, "tmp", 3) == 0)
-    return PATH_TMP;
+    return SHELL_PATH_TMP;
   if (first_comp_len == 4 && strncmp(p, "proc", 4) == 0)
-    return PATH_PROC;
+    return SHELL_PATH_PROC;
   if (first_comp_len == 3 && strncmp(p, "sys", 3) == 0)
-    return PATH_SYS;
+    return SHELL_PATH_SYS;
   if (first_comp_len == 3 && strncmp(p, "dev", 3) == 0)
-    return PATH_DEV;
+    return SHELL_PATH_DEV;
   if (first_comp_len == 3 && strncmp(p, "opt", 3) == 0)
-    return PATH_OPT;
+    return SHELL_PATH_OPT;
   if (first_comp_len == 3 && strncmp(p, "srv", 3) == 0)
-    return PATH_SRV;
+    return SHELL_PATH_SRV;
   if (first_comp_len == 3 && strncmp(p, "run", 3) == 0)
-    return PATH_RUN;
+    return SHELL_PATH_RUN;
   if (first_comp_len == 7 && strncmp(p, "sysroot", 7) == 0)
-    return PATH_SYSROOT;
+    return SHELL_PATH_SYSROOT;
   if (first_comp_len == 4 && strncmp(p, "boot", 4) == 0)
-    return PATH_BOOT;
+    return SHELL_PATH_BOOT;
   if (first_comp_len == 3 && strncmp(p, "mnt", 3) == 0)
-    return PATH_MNT;
+    return SHELL_PATH_MNT;
   if (first_comp_len == 5 && strncmp(p, "media", 5) == 0)
-    return PATH_MEDIA;
+    return SHELL_PATH_MEDIA;
   if (first_comp_len == 10 && strncmp(p, ".snapshots", 10) == 0)
-    return PATH_SNAPSHOT;
+    return SHELL_PATH_SNAPSHOT;
 
-  return PATH_OTHER;
+  return SHELL_PATH_OTHER;
 }
 
-const char *shell_abstract_type_name(abstract_type_t type) {
-  if (type >= 0 && type < (int)(sizeof(ABSTRACT_TYPE_NAMES) /
-                                sizeof(ABSTRACT_TYPE_NAMES[0]))) {
-    return ABSTRACT_TYPE_NAMES[type];
+const char *shell_abstract_type_name(shell_abstract_type_t type) {
+  if (type >= 0 && type < (int)(sizeof(SHELL_ABSTRACT_TYPE_NAMES) /
+                                sizeof(SHELL_ABSTRACT_TYPE_NAMES[0]))) {
+    return SHELL_ABSTRACT_TYPE_NAMES[type];
   }
   return "UNKNOWN";
 }
 
-const char *shell_path_category_name(path_category_t cat) {
-  if (cat >= 0 && cat < (int)(sizeof(PATH_CATEGORY_NAMES) /
-                              sizeof(PATH_CATEGORY_NAMES[0]))) {
-    return PATH_CATEGORY_NAMES[cat];
+const char *shell_path_category_name(shell_path_category_t cat) {
+  if (cat >= 0 && cat < (int)(sizeof(SHELL_PATH_CATEGORY_NAMES) /
+                              sizeof(SHELL_PATH_CATEGORY_NAMES[0]))) {
+    return SHELL_PATH_CATEGORY_NAMES[cat];
   }
   return "UNKNOWN";
 }
 
 /* --- CLEANUP --- */
 
-void shell_abstracted_destroy(abstracted_command_t *cmd) {
+void shell_abstract_command_free(shell_abstract_command_t *cmd) {
   if (!cmd)
     return;
 
   free((void *)cmd->original);
-  free(cmd->abstracted);
+  free(cmd->display_text);
 
   if (cmd->elements) {
     for (size_t i = 0; i < cmd->element_count; i++) {
-      abstract_element_t *elem = cmd->elements[i];
+      shell_abstract_element_t *elem = cmd->elements[i];
       free_abstract_element(elem);
     }
     free(cmd->elements);
@@ -1127,37 +1174,37 @@ void shell_abstracted_destroy(abstracted_command_t *cmd) {
 static const char *token_abbreviation(const shell_token_t *token) {
   if (token->length >= 2 && token->start[0] == '-')
     return "OPT";
-  abstract_type_t type =
+  shell_abstract_type_t type =
       get_abstract_type(token->type, token->start, token->length);
   switch (type) {
-  case ABSTRACT_EV:
+  case SHELL_ABSTRACT_EV:
     return "EV";
-  case ABSTRACT_PV:
+  case SHELL_ABSTRACT_PV:
     return "PV";
-  case ABSTRACT_SV:
+  case SHELL_ABSTRACT_SV:
     return "SV";
-  case ABSTRACT_AP:
+  case SHELL_ABSTRACT_AP:
     return "AP";
-  case ABSTRACT_RP:
+  case SHELL_ABSTRACT_RP:
     return "RP";
-  case ABSTRACT_HP:
+  case SHELL_ABSTRACT_HP:
     return "HP";
-  case ABSTRACT_GB:
+  case SHELL_ABSTRACT_GB:
     return "GB";
-  case ABSTRACT_CS:
+  case SHELL_ABSTRACT_CS:
     return "CS";
-  case ABSTRACT_AR:
+  case SHELL_ABSTRACT_AR:
     return "AR";
-  case ABSTRACT_REDIR:
+  case SHELL_ABSTRACT_REDIR:
     return "RD";
-  case ABSTRACT_STR:
+  case SHELL_ABSTRACT_STR:
   default:
     return "STR";
   }
 }
 
 shell_process_status_t
-shell_build_type_netseq(const char *command,
+shell_build_type_netseq(const char *command, size_t command_length,
                         const shell_process_limits_t *limits, char **netseq,
                         size_t *subcommand_count) {
   if (netseq)
@@ -1167,21 +1214,23 @@ shell_build_type_netseq(const char *command,
   if (!command || !netseq || !subcommand_count)
     return SHELL_PROCESS_EINPUT;
 
-  shell_command_info_t *commands = NULL;
+  shell_command_t *commands = NULL;
   size_t count = 0;
-  shell_process_status_t status =
-      shell_process_command(command, limits, &commands, &count);
+  shell_process_status_t status = shell_processed_commands_parse(
+      command, command_length, limits, &commands, &count);
   if (status != SHELL_PROCESS_OK)
     return status;
 
   size_t outer_length = 0;
   for (size_t c = 0; c < count; c++) {
-    if (commands[c].command_token_count == 0) {
+    size_t word_count = shell_processed_command_word_count(&commands[c]);
+    if (word_count == 0) {
       status = SHELL_PROCESS_EPARSE;
       goto fail_type_netseq;
     }
     size_t inner_length = 0;
-    const shell_token_t *executable = &commands[c].command_tokens[0];
+    const shell_token_t *executable =
+        shell_processed_command_word_at(&commands[c], 0);
     size_t decoded_length = 0;
     status = shell_measure_decoded_word(executable->start, executable->length,
                                         &decoded_length);
@@ -1196,9 +1245,9 @@ shell_build_type_netseq(const char *command,
       status = SHELL_PROCESS_EOVERFLOW;
       goto fail_type_netseq;
     }
-    for (size_t i = 1; i < commands[c].command_token_count; i++) {
+    for (size_t i = 1; i < word_count; i++) {
       const char *abbreviation =
-          token_abbreviation(&commands[c].command_tokens[i]);
+          token_abbreviation(shell_processed_command_word_at(&commands[c], i));
       size_t length = strlen(abbreviation);
       size_t framed = 0;
       if (shell_netstring_encoded_length(length, &framed) !=
@@ -1234,14 +1283,16 @@ shell_build_type_netseq(const char *command,
   char *position = outer;
   for (size_t c = 0; c < count; c++) {
     size_t inner_length = 0;
-    const shell_token_t *executable = &commands[c].command_tokens[0];
+    const shell_token_t *executable =
+        shell_processed_command_word_at(&commands[c], 0);
     size_t decoded_length = 0;
     (void)shell_measure_decoded_word(executable->start, executable->length,
                                      &decoded_length);
     (void)shell_netstring_encoded_length(decoded_length, &inner_length);
-    for (size_t i = 1; i < commands[c].command_token_count; i++) {
-      size_t length =
-          strlen(token_abbreviation(&commands[c].command_tokens[i]));
+    size_t word_count = shell_processed_command_word_count(&commands[c]);
+    for (size_t i = 1; i < word_count; i++) {
+      size_t length = strlen(
+          token_abbreviation(shell_processed_command_word_at(&commands[c], i)));
       size_t framed = 0;
       (void)shell_netstring_encoded_length(length, &framed);
       inner_length += framed;
@@ -1258,9 +1309,9 @@ shell_build_type_netseq(const char *command,
                                    position, decoded_length, &written);
     position += written;
     *position++ = ',';
-    for (size_t i = 1; i < commands[c].command_token_count; i++) {
+    for (size_t i = 1; i < word_count; i++) {
       const char *abbreviation =
-          token_abbreviation(&commands[c].command_tokens[i]);
+          token_abbreviation(shell_processed_command_word_at(&commands[c], i));
       size_t length = strlen(abbreviation);
       size_t prefix = 0;
       (void)shell_netstring_write_prefix(position, SIZE_MAX, length, &prefix);
@@ -1272,12 +1323,164 @@ shell_build_type_netseq(const char *command,
     *position++ = ',';
   }
   *position = '\0';
-  shell_free_command_infos(commands, count);
+  shell_commands_free(commands, count);
   *netseq = outer;
   *subcommand_count = count;
   return SHELL_PROCESS_OK;
 
 fail_type_netseq:
-  shell_free_command_infos(commands, count);
+  shell_commands_free(commands, count);
+  return status;
+}
+
+shell_process_status_t
+shell_build_anomaly_netseqs(const char *command_line, size_t command_length,
+                            const shell_process_limits_t *limits,
+                            char **command_netseq, char **type_netseq,
+                            size_t *subcommand_count) {
+  if (command_netseq)
+    *command_netseq = NULL;
+  if (type_netseq)
+    *type_netseq = NULL;
+  if (subcommand_count)
+    *subcommand_count = 0;
+  if (!command_line || !command_netseq || !type_netseq || !subcommand_count)
+    return SHELL_PROCESS_EINPUT;
+
+  shell_command_t *commands = NULL;
+  size_t count = 0;
+  shell_process_status_t status = shell_processed_commands_parse(
+      command_line, command_length, limits, &commands, &count);
+  if (status != SHELL_PROCESS_OK)
+    return status;
+
+  size_t command_total = 0;
+  size_t type_total = 0;
+  for (size_t c = 0; c < count; c++) {
+    size_t word_count = shell_processed_command_word_count(&commands[c]);
+    if (word_count == 0) {
+      status = SHELL_PROCESS_EPARSE;
+      goto fail;
+    }
+    const shell_token_t *executable =
+        shell_processed_command_word_at(&commands[c], 0);
+    size_t executable_length = 0;
+    status = shell_measure_decoded_word(executable->start, executable->length,
+                                        &executable_length);
+    if (status != SHELL_PROCESS_OK || executable_length == 0) {
+      if (status == SHELL_PROCESS_OK)
+        status = SHELL_PROCESS_EPARSE;
+      goto fail;
+    }
+    size_t raw_record_length = 0;
+    if (shell_netstring_encoded_length(executable_length, &raw_record_length) !=
+            SHELL_NETSTRING_OK ||
+        command_total > SIZE_MAX - raw_record_length) {
+      status = SHELL_PROCESS_EOVERFLOW;
+      goto fail;
+    }
+    command_total += raw_record_length;
+
+    size_t type_inner_length = raw_record_length;
+    for (size_t i = 1; i < word_count; i++) {
+      size_t abbreviation_length = strlen(
+          token_abbreviation(shell_processed_command_word_at(&commands[c], i)));
+      size_t record_length = 0;
+      if (shell_netstring_encoded_length(abbreviation_length, &record_length) !=
+              SHELL_NETSTRING_OK ||
+          type_inner_length > SIZE_MAX - record_length) {
+        status = SHELL_PROCESS_EOVERFLOW;
+        goto fail;
+      }
+      type_inner_length += record_length;
+    }
+    size_t type_record_length = 0;
+    if (shell_netstring_encoded_length(
+            type_inner_length, &type_record_length) != SHELL_NETSTRING_OK ||
+        type_total > SIZE_MAX - type_record_length) {
+      status = SHELL_PROCESS_EOVERFLOW;
+      goto fail;
+    }
+    type_total += type_record_length;
+  }
+  if (limits && (command_total > limits->max_string_bytes ||
+                 command_total > limits->max_total_bytes ||
+                 type_total > limits->max_string_bytes ||
+                 type_total > limits->max_total_bytes)) {
+    status = SHELL_PROCESS_EOUTPUT_LIMIT;
+    goto fail;
+  }
+
+  char *raw = malloc(command_total + 1);
+  char *typed = malloc(type_total + 1);
+  if (!raw || !typed) {
+    free(raw);
+    free(typed);
+    status = SHELL_PROCESS_ENOMEM;
+    goto fail;
+  }
+
+  char *raw_position = raw;
+  char *type_position = typed;
+  for (size_t c = 0; c < count; c++) {
+    const shell_token_t *executable =
+        shell_processed_command_word_at(&commands[c], 0);
+    size_t executable_length = 0;
+    (void)shell_measure_decoded_word(executable->start, executable->length,
+                                     &executable_length);
+    size_t type_inner_length = 0;
+    (void)shell_netstring_encoded_length(executable_length, &type_inner_length);
+    size_t word_count = shell_processed_command_word_count(&commands[c]);
+    for (size_t i = 1; i < word_count; i++) {
+      size_t abbreviation_length = strlen(
+          token_abbreviation(shell_processed_command_word_at(&commands[c], i)));
+      size_t record_length = 0;
+      (void)shell_netstring_encoded_length(abbreviation_length, &record_length);
+      type_inner_length += record_length;
+    }
+    size_t prefix_length = 0;
+    (void)shell_netstring_write_prefix(raw_position, SIZE_MAX,
+                                       executable_length, &prefix_length);
+    char *raw_payload = raw_position + prefix_length;
+    size_t written = 0;
+    (void)shell_write_decoded_word(executable->start, executable->length,
+                                   raw_payload, executable_length, &written);
+    raw_position = raw_payload + written;
+    *raw_position++ = ',';
+
+    size_t type_prefix_length = 0;
+    (void)shell_netstring_write_prefix(type_position, SIZE_MAX,
+                                       type_inner_length, &type_prefix_length);
+    type_position += type_prefix_length;
+    (void)shell_netstring_write_prefix(type_position, SIZE_MAX,
+                                       executable_length, &prefix_length);
+    char *type_payload = type_position + prefix_length;
+    (void)shell_write_decoded_word(executable->start, executable->length,
+                                   type_payload, executable_length, &written);
+    type_position = type_payload + written;
+    *type_position++ = ',';
+    for (size_t i = 1; i < word_count; i++) {
+      const char *abbreviation =
+          token_abbreviation(shell_processed_command_word_at(&commands[c], i));
+      size_t abbreviation_length = strlen(abbreviation);
+      (void)shell_netstring_write_prefix(type_position, SIZE_MAX,
+                                         abbreviation_length, &prefix_length);
+      type_position += prefix_length;
+      memcpy(type_position, abbreviation, abbreviation_length);
+      type_position += abbreviation_length;
+      *type_position++ = ',';
+    }
+    *type_position++ = ',';
+  }
+  *raw_position = '\0';
+  *type_position = '\0';
+  shell_commands_free(commands, count);
+  *command_netseq = raw;
+  *type_netseq = typed;
+  *subcommand_count = count;
+  return SHELL_PROCESS_OK;
+
+fail:
+  shell_commands_free(commands, count);
   return status;
 }

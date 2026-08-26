@@ -20,48 +20,48 @@ extern "C" {
  * Abstract token kind used by downstream validation logic.
  */
 typedef enum {
-  ABSTRACT_EV,   // Environment variable: $FOO → $EV_1
-  ABSTRACT_PV,   // Positional: $1 → $PV_1
-  ABSTRACT_SV,   // Special: $? → $SV_1
-  ABSTRACT_AP,   // Absolute path: /etc → $AP_1
-  ABSTRACT_RP,   // Relative path: ./foo → $RP_1
-  ABSTRACT_HP,   // Home path: ~/file → $HP_1
-  ABSTRACT_GB,   // Glob: *.txt → $GB_1
-  ABSTRACT_CS,   // Command subst: $(cmd) → $CS_1
-  ABSTRACT_AR,   // Arithmetic: $((x+1)) → $AR_1
-  ABSTRACT_STR,  // String: "foo" → $STR_1
-  ABSTRACT_REDIR // Redirect target: > file → $RD_1
-} abstract_type_t;
+  SHELL_ABSTRACT_EV,   // Environment variable: $FOO → $EV_1
+  SHELL_ABSTRACT_PV,   // Positional: $1 → $PV_1
+  SHELL_ABSTRACT_SV,   // Special: $? → $SV_1
+  SHELL_ABSTRACT_AP,   // Absolute path: /etc → $AP_1
+  SHELL_ABSTRACT_RP,   // Relative path: ./foo → $RP_1
+  SHELL_ABSTRACT_HP,   // Home path: ~/file → $HP_1
+  SHELL_ABSTRACT_GB,   // Glob: *.txt → $GB_1
+  SHELL_ABSTRACT_CS,   // Command subst: $(cmd) → $CS_1
+  SHELL_ABSTRACT_AR,   // Arithmetic: $((x+1)) → $AR_1
+  SHELL_ABSTRACT_STR,  // String: "foo" → $STR_1
+  SHELL_ABSTRACT_REDIR // Redirect target: > file → $RD_1
+} shell_abstract_type_t;
 
 /**
  * Path category for validation rules
  */
 typedef enum {
-  PATH_ROOT,     // /
-  PATH_ETC,      // /etc/
-  PATH_VAR,      // /var/
-  PATH_USR,      // /usr/
-  PATH_HOME,     // /home/*, /root
-  PATH_TMP,      // /tmp/
-  PATH_PROC,     // /proc/
-  PATH_SYS,      // /sys/
-  PATH_DEV,      // /dev/
-  PATH_OPT,      // /opt/
-  PATH_SRV,      // /srv/
-  PATH_RUN,      // /run/
-  PATH_SYSROOT,  // /sysroot/
-  PATH_BOOT,     // /boot/
-  PATH_MNT,      // /mnt/
-  PATH_MEDIA,    // /media/
-  PATH_SNAPSHOT, // /.snapshots/
-  PATH_OTHER     // anything else
-} path_category_t;
+  SHELL_PATH_ROOT,     // /
+  SHELL_PATH_ETC,      // /etc/
+  SHELL_PATH_VAR,      // /var/
+  SHELL_PATH_USR,      // /usr/
+  SHELL_PATH_HOME,     // /home/*, /root
+  SHELL_PATH_TMP,      // /tmp/
+  SHELL_PATH_PROC,     // /proc/
+  SHELL_PATH_SYS,      // /sys/
+  SHELL_PATH_DEV,      // /dev/
+  SHELL_PATH_OPT,      // /opt/
+  SHELL_PATH_SRV,      // /srv/
+  SHELL_PATH_RUN,      // /run/
+  SHELL_PATH_SYSROOT,  // /sysroot/
+  SHELL_PATH_BOOT,     // /boot/
+  SHELL_PATH_MNT,      // /mnt/
+  SHELL_PATH_MEDIA,    // /media/
+  SHELL_PATH_SNAPSHOT, // /.snapshots/
+  SHELL_PATH_OTHER     // anything else
+} shell_path_category_t;
 
 /**
  * Single abstracted element
  */
 typedef struct {
-  abstract_type_t type;
+  shell_abstract_type_t type;
   const char *original; // Original text from input
   char *abstraction;    // "$AP_1" (owned)
   size_t start;
@@ -93,16 +93,16 @@ typedef struct {
 
   // Runtime-expandable data (set during validation phase)
   char *expanded;
-} abstract_element_t;
+} shell_abstract_element_t;
 
 /**
  * Full abstracted command
  */
 typedef struct {
   const char *original; // Owned copy of the input command
-  char *abstracted;     // "grep $EV_1 $AP_1$GB_1" (owned)
+  char *display_text;   // Lossy diagnostic abstraction (owned)
 
-  abstract_element_t **elements; // Array of pointers (owned)
+  shell_abstract_element_t **elements; // Array of pointers (owned)
   size_t element_count;
 
   // Metadata flags
@@ -118,7 +118,7 @@ typedef struct {
   bool has_redirects;
   bool has_strings;
   bool has_arithmetic;
-} abstracted_command_t;
+} shell_abstract_command_t;
 
 /* --- PHASE 2: ABSTRACTION FUNCTIONS --- */
 
@@ -126,59 +126,83 @@ typedef struct {
  * Classify a raw token string (no tokenization needed)
  * Uses tokenizer types for basic classification
  */
-token_type_t shell_classify_raw_token(const char *text, size_t len);
+shell_token_type_t shell_classify_raw_token(const char *text, size_t len);
 
 /**
- * Create abstracted command from original
+ * Create an abstracted command from original shell text.
  *
- * This is the main entry point - tokenizes, classifies, and abstracts
- * in one flow.
+ * Input is a raw shell span: it need not be NUL-terminated, but cannot contain
+ * NUL bytes. On success, `out` owns a command released with
+ * shell_abstract_command_free(). On failure, `out` is NULL and the status
+ * identifies invalid input, shell syntax, allocation failure, or overflow.
  */
-bool shell_abstract_command(const char *command, abstracted_command_t **result);
+typedef enum {
+  SHELL_ABSTRACT_OK = 0,
+  SHELL_ABSTRACT_EINPUT,
+  SHELL_ABSTRACT_EPARSE,
+  SHELL_ABSTRACT_ENOMEM,
+  SHELL_ABSTRACT_EOVERFLOW,
+} shell_abstract_status_t;
+
+shell_abstract_status_t
+shell_abstract_command_parse(const char *command, size_t command_length,
+                             shell_abstract_command_t **out);
 
 /**
- * Get the abstracted form for downstream processing
+ * Get the lossy diagnostic abstraction. This is not shell source or
+ * canonical netargv; programmatic consumers must use Shellsplit's canonical
+ * sequence builders instead.
  */
-const char *shell_get_abstracted(abstracted_command_t *cmd);
+const char *
+shell_abstract_command_get_display_text(const shell_abstract_command_t *cmd);
 
 /**
  * Get all extracted elements for validation
  */
-abstract_element_t **shell_get_elements(abstracted_command_t *cmd,
-                                        size_t *count);
+const shell_abstract_element_t *const *
+shell_abstract_command_get_elements(const shell_abstract_command_t *cmd,
+                                    size_t *count);
+
+/** Get the mutable elements for explicit expansion or editing. */
+shell_abstract_element_t *const *
+shell_abstract_command_get_mutable_elements(shell_abstract_command_t *cmd,
+                                            size_t *count);
 
 /**
  * Get original command
  */
-const char *shell_get_original(abstracted_command_t *cmd);
+const char *
+shell_abstract_command_get_source(const shell_abstract_command_t *cmd);
 
 /**
  * Check if command has specific feature
  */
-bool shell_has_variables(abstracted_command_t *cmd);
-bool shell_has_pos_vars(abstracted_command_t *cmd);
-bool shell_has_special_vars(abstracted_command_t *cmd);
-bool shell_has_globs(abstracted_command_t *cmd);
-bool shell_has_paths(abstracted_command_t *cmd);
-bool shell_has_abs_paths(abstracted_command_t *cmd);
-bool shell_has_rel_paths(abstracted_command_t *cmd);
-bool shell_has_home_paths(abstracted_command_t *cmd);
-bool shell_has_cmd_subst(abstracted_command_t *cmd);
-bool shell_has_redirects(abstracted_command_t *cmd);
-bool shell_has_arithmetic(abstracted_command_t *cmd);
-bool shell_has_strings(abstracted_command_t *cmd);
+bool shell_abstract_command_has_variables(const shell_abstract_command_t *cmd);
+bool shell_abstract_command_has_pos_vars(const shell_abstract_command_t *cmd);
+bool shell_abstract_command_has_special_vars(
+    const shell_abstract_command_t *cmd);
+bool shell_abstract_command_has_globs(const shell_abstract_command_t *cmd);
+bool shell_abstract_command_has_paths(const shell_abstract_command_t *cmd);
+bool shell_abstract_command_has_abs_paths(const shell_abstract_command_t *cmd);
+bool shell_abstract_command_has_rel_paths(const shell_abstract_command_t *cmd);
+bool shell_abstract_command_has_home_paths(const shell_abstract_command_t *cmd);
+bool shell_abstract_command_has_cmd_subst(const shell_abstract_command_t *cmd);
+bool shell_abstract_command_has_redirects(const shell_abstract_command_t *cmd);
+bool shell_abstract_command_has_arithmetic(const shell_abstract_command_t *cmd);
+bool shell_abstract_command_has_strings(const shell_abstract_command_t *cmd);
 
 /**
  * Get element by abstraction string (e.g., "$AP_1")
  */
-abstract_element_t *shell_get_element_by_abstract(abstracted_command_t *cmd,
-                                                  const char *abstraction);
+shell_abstract_element_t *
+shell_abstract_command_find_element(shell_abstract_command_t *cmd,
+                                    const char *abstraction);
 
 /**
  * Get element by index
  */
-abstract_element_t *shell_get_element_at(abstracted_command_t *cmd,
-                                         size_t index);
+shell_abstract_element_t *
+shell_abstract_command_get_element(shell_abstract_command_t *cmd, size_t index);
 
 /* --- PHASE 3: RUNTIME EXPANSION (OPTIONAL) --- */
 
@@ -186,56 +210,47 @@ abstract_element_t *shell_get_element_at(abstracted_command_t *cmd,
  * Runtime context for expansion
  */
 typedef struct {
-  char **env; // Environment variables (NULL-terminated)
-  char *cwd;  // Current working directory
+  const char *const *env; // Environment variables (NULL-terminated)
+  const char *cwd;        // Current working directory
   bool resolve_symlinks;
-} runtime_context_t;
+} shell_runtime_context_t;
 
 /**
  * Expand a single element using runtime context
  * Returns expanded string (caller must free) or NULL on failure
  */
-char *shell_expand_element(abstract_element_t *elem, runtime_context_t *ctx);
+char *shell_abstract_element_expand(shell_abstract_element_t *elem,
+                                    const shell_runtime_context_t *ctx);
 
 /**
  * Expand all elements in an abstracted command
  */
-bool shell_expand_all_elements(abstracted_command_t *cmd,
-                               runtime_context_t *ctx);
+bool shell_abstract_command_expand(shell_abstract_command_t *cmd,
+                                   const shell_runtime_context_t *ctx);
 
 /* --- UTILITY FUNCTIONS --- */
 
 /**
  * Get path category from resolved path
  */
-path_category_t shell_get_path_category(const char *resolved_path);
+shell_path_category_t shell_path_category_from_path(const char *resolved_path);
 
 /**
  * Get human-readable name for abstract type
  */
-const char *shell_abstract_type_name(abstract_type_t type);
+const char *shell_abstract_type_name(shell_abstract_type_t type);
 
 /**
  * Get human-readable name for path category
  */
-const char *shell_path_category_name(path_category_t cat);
+const char *shell_path_category_name(shell_path_category_t cat);
 
 /* --- CLEANUP --- */
 
 /**
  * Free abstracted command and all elements
  */
-void shell_abstracted_destroy(abstracted_command_t *cmd);
-
-/** Build a canonical anomaly type sequence. Each outer netstring represents
- * one isolated subcommand and contains a nested netargv signature: the first
- * element is the decoded executable name and remaining elements are abstract
- * type symbols. Operators between subcommands are intentionally normalized to
- * sequence order. */
-shell_process_status_t
-shell_build_type_netseq(const char *command,
-                        const shell_process_limits_t *limits, char **netseq,
-                        size_t *subcommand_count);
+void shell_abstract_command_free(shell_abstract_command_t *cmd);
 
 #ifdef __cplusplus
 }

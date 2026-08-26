@@ -47,7 +47,7 @@ typedef struct {
 } shell_process_limits_t;
 
 /**
- * Process shell command with proper separation
+ * Process exactly `command_length` shell-source bytes with proper separation.
  *
  * Separates shell logic from command arguments. On
  * success, returned command metadata owns all text it refers to and remains
@@ -55,15 +55,17 @@ typedef struct {
  * canonical processed-subcommand representation. On failure, writable outputs
  * are set to NULL and zero.
  */
-shell_process_status_t shell_process_command(
-    const char *command_line, const shell_process_limits_t *limits,
-    shell_command_info_t **command_infos, size_t *command_count);
+shell_process_status_t
+shell_process_command(const char *command_line, size_t command_length,
+                      const shell_process_limits_t *limits,
+                      shell_command_info_t **command_infos,
+                      size_t *command_count);
 
 /**
  * Free shell_command_info_t values and associated owned allocations.
  * Safe to call with a NULL pointer.
  */
-void shell_free_command_infos(shell_command_info_t *infos, size_t count);
+void shell_command_infos_free(shell_command_info_t *infos, size_t count);
 
 /** Measure the decoded payload of one already-isolated shell word, assembling
  * quote fragments and escapes. This is not shell tokenization: callers must
@@ -87,8 +89,23 @@ shell_process_status_t shell_decode_word(const char *text, size_t length,
                                          char **decoded,
                                          size_t *decoded_length);
 
+/** Return the bytes required to encode one command's already-processed
+ * arguments as concatenated canonical netstrings, excluding the terminating
+ * NUL. */
+shell_process_status_t shell_measure_netargv(const shell_command_info_t *info,
+                                             size_t *netargv_length);
+
+/** Write one command's canonical netargv into caller storage. `destination`
+ * must provide the measured encoded length plus one byte for the terminating
+ * NUL. `written` excludes that NUL. On failure no partial netargv is exposed.
+ */
+shell_process_status_t shell_write_netargv(const shell_command_info_t *info,
+                                           char *destination,
+                                           size_t destination_size,
+                                           size_t *written);
+
 /** Encode one command's already-processed arguments as concatenated canonical
- * netstrings. The caller owns *netargv. */
+ * netstrings. This allocating convenience wrapper owns *netargv. */
 shell_process_status_t
 shell_render_netargv(const shell_command_info_t *info,
                      const shell_process_limits_t *limits, char **netargv);
@@ -97,24 +114,8 @@ shell_render_netargv(const shell_command_info_t *info,
  * Check if a command uses shell operators, redirections, or execution-bearing
  * substitutions that require shell-aware handling.
  */
-bool shell_has_dangerous_features(shell_command_info_t *info);
-
-/** Parse a command line and return one outer netstring whose payload records
- * are the canonical netargv values for each isolated subcommand. This is the
- * single-buffer machine transport for subcommand collections. The caller owns
- * *netargv_sequence. */
-shell_process_status_t shell_extract_netargv_sequence(
-    const char *command_line, const shell_process_limits_t *limits,
-    char **netargv_sequence, size_t *subcommand_count,
-    bool *has_shell_features);
-
-/** Parse shell source and return one canonical netstring record per isolated
- * decoded executable name. This is the raw command sequence consumed by
- * anomaly models. */
-shell_process_status_t
-shell_build_command_netseq(const char *command_line,
-                           const shell_process_limits_t *limits,
-                           char **command_netseq, size_t *subcommand_count);
+bool shell_command_info_has_dangerous_features(
+    const shell_command_info_t *info);
 
 #ifdef __cplusplus
 }

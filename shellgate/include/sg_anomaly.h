@@ -30,6 +30,7 @@ typedef enum {
   SG_ANOMALY_ERR_MEMORY = -2,
   SG_ANOMALY_ERR_FORMAT = -3,
   SG_ANOMALY_ERR_LIMIT = -4,
+  SG_ANOMALY_ERR_IO = -5,
 } sg_anomaly_status_t;
 
 /* Maximum decoded sequence-item length accepted while learning. Scoring
@@ -53,17 +54,24 @@ void sg_anomaly_model_clear_error(sg_anomaly_model_t *model);
 
 /* --- LIFECYCLE --- */
 
+typedef struct {
+  /* Dirichlet smoothing parameter; must be finite and positive. */
+  double alpha;
+  /* Fallback log-probability; must be finite. */
+  double unknown_log_prior;
+} sg_anomaly_config_t;
+
+/* Initialize a configuration with the default hyperparameters. */
+void sg_anomaly_config_default(sg_anomaly_config_t *config);
+
 /* Create a new model with default hyperparameters.
  * Returns NULL on allocation failure. */
 sg_anomaly_model_t *sg_anomaly_model_new(void);
 
-/* Create a new model with explicit hyperparameters.
- *
- *   alpha      : smoothing parameter (0.01 - 1.0 recommended, try 0.1)
- *   unk_prior  : log-probability of unseen command (try -10.0 = very rare)
- *
- * Returns NULL on allocation failure. */
-sg_anomaly_model_t *sg_anomaly_model_new_ex(double alpha, double unk_prior);
+/* Create a new model with `config`, or defaults when it is NULL. Invalid
+ * explicit configuration and allocation failure both return NULL. */
+sg_anomaly_model_t *
+sg_anomaly_model_new_with_config(const sg_anomaly_config_t *config);
 
 /* Free all memory associated with the model. */
 void sg_anomaly_model_free(sg_anomaly_model_t *model);
@@ -89,10 +97,10 @@ void sg_anomaly_model_free(sg_anomaly_model_t *model);
  *
  * Does not modify the model.
  */
-sg_anomaly_status_t sg_anomaly_score_netseq(const sg_anomaly_model_t *model,
-                                            const char *netseq,
-                                            size_t netseq_length,
-                                            double *score);
+sg_anomaly_status_t
+sg_anomaly_model_score_netseq(const sg_anomaly_model_t *model,
+                              const char *netseq, size_t netseq_length,
+                              double *score);
 
 /* --- UPDATE (LEARNING) --- */
 
@@ -108,79 +116,87 @@ sg_anomaly_status_t sg_anomaly_score_netseq(const sg_anomaly_model_t *model,
  * Unigrams and bigrams are also updated when the record count is below 3
  * (e.g. a 2-token sequence contributes 1 bigram and 2 unigrams).
  */
-sg_anomaly_status_t sg_anomaly_update_netseq(sg_anomaly_model_t *model,
-                                             const char *netseq,
-                                             size_t netseq_length);
+sg_anomaly_status_t sg_anomaly_model_update_netseq(sg_anomaly_model_t *model,
+                                                   const char *netseq,
+                                                   size_t netseq_length);
 
 /* --- SERIALISATION --- */
 
 /*
  * Save the model to a versioned binary file.
  *
- * Returns 0 on success, -1 on error (errno set).
+ * Returns SG_ANOMALY_OK on success. On failure, returns a specific status and
+ * preserves errno for OS-level diagnostics.
  */
-int sg_anomaly_save(const sg_anomaly_model_t *model, const char *path);
+sg_anomaly_status_t sg_anomaly_model_save(const sg_anomaly_model_t *model,
+                                          const char *path);
 
 /*
- * Load a model from a file written by sg_anomaly_save().
+ * Load a model from a file written by sg_anomaly_model_save().
  *
- * Returns 0 on success, -1 on error (errno set).
+ * Returns SG_ANOMALY_OK on success. Malformed persisted data returns
+ * SG_ANOMALY_ERR_FORMAT; the existing model remains unchanged on every
+ * failure. errno remains available for OS-level diagnostics.
  * On error, the existing model is unchanged.
  */
-int sg_anomaly_load(sg_anomaly_model_t *model, const char *path);
+sg_anomaly_status_t sg_anomaly_model_load(sg_anomaly_model_t *model,
+                                          const char *path);
 
 /* --- ACCESSORS --- */
 
 /* Total number of unique commands observed (unigram vocabulary). */
-size_t sg_anomaly_vocab_size(const sg_anomaly_model_t *model);
+size_t sg_anomaly_model_vocab_size(const sg_anomaly_model_t *model);
 
 /* Total number of unigram observations. */
-size_t sg_anomaly_total_uni(const sg_anomaly_model_t *model);
+size_t sg_anomaly_model_total_unigrams(const sg_anomaly_model_t *model);
 
 /* Total number of bigram observations. */
-size_t sg_anomaly_total_bi(const sg_anomaly_model_t *model);
+size_t sg_anomaly_model_total_bigrams(const sg_anomaly_model_t *model);
 
 /* Total number of trigram observations. */
-size_t sg_anomaly_total_tri(const sg_anomaly_model_t *model);
+size_t sg_anomaly_model_total_trigrams(const sg_anomaly_model_t *model);
 
 /* Total number of 4-gram observations. */
-size_t sg_anomaly_total_quad(const sg_anomaly_model_t *model);
+size_t sg_anomaly_model_total_fourgrams(const sg_anomaly_model_t *model);
 
 /* Get unigram count for a command.  Returns 0 if never seen. */
-size_t sg_anomaly_uni_count(const sg_anomaly_model_t *model, const char *cmd);
+size_t sg_anomaly_model_unigram_count(const sg_anomaly_model_t *model,
+                                      const char *cmd);
 
 /* Get count of unseen commands (for UNK probability estimation). */
-size_t sg_anomaly_unk_count(const sg_anomaly_model_t *model);
+size_t sg_anomaly_model_unknown_count(const sg_anomaly_model_t *model);
 
 /* Get the Kneser-Ney absolute discount parameter (default 0.5). */
-double sg_anomaly_kn_discount(const sg_anomaly_model_t *model);
+double sg_anomaly_model_kneser_ney_discount(const sg_anomaly_model_t *model);
 
 /* Get bigram count for (prev, curr). Returns 0 if never seen. */
-size_t sg_anomaly_bi_count(const sg_anomaly_model_t *model, const char *prev,
-                           const char *curr);
+size_t sg_anomaly_model_bigram_count(const sg_anomaly_model_t *model,
+                                     const char *prev, const char *curr);
 
 /* Get trigram count for (p2, p1, curr). Returns 0 if never seen. */
-size_t sg_anomaly_tri_count(const sg_anomaly_model_t *model, const char *p2,
-                            const char *p1, const char *curr);
+size_t sg_anomaly_model_trigram_count(const sg_anomaly_model_t *model,
+                                      const char *p2, const char *p1,
+                                      const char *curr);
 
 /* Get 4-gram count for (p3, p2, p1, curr). Returns 0 if never seen. */
-size_t sg_anomaly_quad_count(const sg_anomaly_model_t *model, const char *p3,
-                             const char *p2, const char *p1, const char *curr);
+size_t sg_anomaly_model_fourgram_count(const sg_anomaly_model_t *model,
+                                       const char *p3, const char *p2,
+                                       const char *p1, const char *curr);
 
 /* Get total number of unique n-gram contexts across all levels. */
-size_t sg_anomaly_total_contexts(const sg_anomaly_model_t *model);
+size_t sg_anomaly_model_total_contexts(const sg_anomaly_model_t *model);
 
 /* Check whether any command in a canonical netsequence has been observed.
  * Empty sequences are valid and produce false. */
 sg_anomaly_status_t
-sg_anomaly_has_observed_netseq(const sg_anomaly_model_t *model,
-                               const char *netseq, size_t netseq_length,
-                               bool *observed);
+sg_anomaly_model_has_observed_netseq(const sg_anomaly_model_t *model,
+                                     const char *netseq, size_t netseq_length,
+                                     bool *observed);
 
 /* Clear all counts and reset to a fresh model.
  * Hyperparameters are preserved. The operation is atomic: on failure the
  * existing counts remain unchanged. */
-sg_anomaly_status_t sg_anomaly_reset(sg_anomaly_model_t *model);
+sg_anomaly_status_t sg_anomaly_model_reset(sg_anomaly_model_t *model);
 
 /* Apply exponential decay to all counts.
  * Scale should be between 0.0 and 1.0 (e.g., 0.99 for 1% decay).
@@ -198,10 +214,10 @@ sg_anomaly_status_t sg_anomaly_model_decay(sg_anomaly_model_t *model,
 sg_anomaly_status_t sg_anomaly_model_prune(sg_anomaly_model_t *model,
                                            size_t min_count, size_t *removed);
 
-/* Rebuild all hash tables to compact their internal storage.
- * Call after decay or prune to recover memory.
- * Returns true if every table was compacted successfully. */
-bool sg_anomaly_model_compact(sg_anomaly_model_t *model);
+/* Rebuild all hash tables to compact their internal storage. Call after decay
+ * or prune to recover memory. A memory failure can leave some tables compacted
+ * but never changes learned counts or scores. */
+sg_anomaly_status_t sg_anomaly_model_compact(sg_anomaly_model_t *model);
 
 #ifdef __cplusplus
 }

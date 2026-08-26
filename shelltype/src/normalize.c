@@ -14,10 +14,10 @@
  * definition and regenerate.
  */
 
+#include "normalize_internal.h"
 #include "shell_netstring.h"
 #include "shelltype.h"
 
-#include <arpa/inet.h>
 #include <ctype.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -925,374 +925,269 @@ const bool st_type_compatible[ST_TYPE_COUNT][ST_TYPE_COUNT] = {
 
 /* --- CLASSIFICATION HELPERS --- */
 
-static bool is_decimal_number(const char *token) {
-  if (!token[0])
-    return false;
-  const char *p = token;
-  if (*p == '-')
-    p++;
-  if (!*p)
-    return false;
-  while (*p) {
-    if (!isdigit((unsigned char)*p))
-      return false;
-    p++;
-  }
-  return true;
+/* The public classifier accepts a C string, but canonical netargv records are
+ * length-delimited. Keep the classification core on explicit spans so visitors
+ * can classify borrowed payloads without manufacturing a NUL terminator. */
+typedef struct {
+  const char *data;
+  size_t length;
+} st_text_span_t;
+
+static bool span_eq(st_text_span_t text, const char *literal) {
+  size_t length = strlen(literal);
+  return text.length == length && memcmp(text.data, literal, length) == 0;
 }
 
-static bool is_hex_number(const char *token) {
-  if (token[0] == '0' && (token[1] == 'x' || token[1] == 'X')) {
-    if (!token[2])
-      return false;
-    for (const char *p = token + 2; *p; p++) {
-      if (!isxdigit((unsigned char)*p))
-        return false;
-    }
-    return true;
-  }
+static bool span_eq_ci(st_text_span_t text, const char *literal) {
+  size_t length = strlen(literal);
+  return text.length == length && strncasecmp(text.data, literal, length) == 0;
+}
+
+static bool span_starts(st_text_span_t text, const char *literal) {
+  size_t length = strlen(literal);
+  return text.length >= length && memcmp(text.data, literal, length) == 0;
+}
+
+static const char *span_find(st_text_span_t text, char needle) {
+  return memchr(text.data, (unsigned char)needle, text.length);
+}
+
+static bool span_has(st_text_span_t text, char needle) {
+  return span_find(text, needle) != NULL;
+}
+
+static bool span_has_pair(st_text_span_t text, char first, char second) {
+  if (text.length < 2)
+    return false;
+  for (size_t i = 1; i < text.length; i++)
+    if (text.data[i - 1] == first && text.data[i] == second)
+      return true;
   return false;
 }
 
-static bool is_hex_hash(const char *token) {
-  size_t len = strlen(token);
-  if (len < 8)
+static bool span_all_ascii(st_text_span_t text, int (*predicate)(int)) {
+  for (size_t i = 0; i < text.length; i++)
+    if (!predicate((unsigned char)text.data[i]))
+      return false;
+  return true;
+}
+
+static bool span_is_decimal_number(st_text_span_t token) {
+  if (token.length == 0)
+    return false;
+  size_t i = token.data[0] == '-' ? 1 : 0;
+  if (i == token.length)
+    return false;
+  for (; i < token.length; i++)
+    if (!isdigit((unsigned char)token.data[i]))
+      return false;
+  return true;
+}
+
+static bool span_is_hex_number(st_text_span_t token) {
+  return token.length > 2 && token.data[0] == '0' &&
+         (token.data[1] == 'x' || token.data[1] == 'X') &&
+         span_all_ascii((st_text_span_t){token.data + 2, token.length - 2},
+                        isxdigit);
+}
+
+static bool span_is_hex_hash(st_text_span_t token) {
+  if (token.length < 8)
     return false;
   bool has_alpha = false;
-  for (size_t i = 0; i < len; i++) {
-    unsigned char c = (unsigned char)token[i];
+  for (size_t i = 0; i < token.length; i++) {
+    unsigned char c = (unsigned char)token.data[i];
     if (!isxdigit(c))
       return false;
-    if (isalpha(c))
-      has_alpha = true;
+    has_alpha |= isalpha(c) != 0;
   }
   return has_alpha;
 }
 
-static bool is_ipv4(const char *token) {
-  const char *p = token;
-  for (int segment = 0; segment < 4; segment++) {
-    if (!isdigit((unsigned char)*p))
+static bool span_is_ipv4(st_text_span_t token) {
+  size_t position = 0;
+  for (size_t segment = 0; segment < 4; segment++) {
+    if (position == token.length ||
+        !isdigit((unsigned char)token.data[position]))
       return false;
     unsigned value = 0;
-    int digits = 0;
-    while (isdigit((unsigned char)*p)) {
-      value = value * 10 + (unsigned)(*p - '0');
+    size_t digits = 0;
+    while (position < token.length &&
+           isdigit((unsigned char)token.data[position])) {
+      value = value * 10u + (unsigned)(token.data[position] - '0');
       if (++digits > 3 || value > 255)
         return false;
-      p++;
+      position++;
     }
-    if (segment < 3) {
-      if (*p != '.')
+    if (segment != 3) {
+      if (position == token.length || token.data[position++] != '.')
         return false;
-      p++;
     }
   }
-  return *p == '\0';
+  return position == token.length;
 }
 
-static bool is_ipv6(const char *token) {
-  /* IPv6: colon-separated hex groups, with optional :: compression
-   * and optional zone index (%iface).
-   * Examples: 2001:db8::1, ::1, fe80::1%eth0, ::ffff:192.168.1.1 */
-  size_t len = strlen(token);
-  if (len < 2)
+static bool span_is_mac(st_text_span_t token) {
+  if (token.length != 17)
     return false;
-
-  /* inet_pton does not accept an RFC 4007 zone identifier, so validate and
-   * remove it before parsing the address proper. */
-  const char *zone = strchr(token, '%');
-  if (zone) {
-    if (zone == token || zone[1] == '\0' || strchr(zone + 1, '%'))
+  char separator = '\0';
+  for (size_t i = 0; i < token.length; i++) {
+    if (i % 3 != 2) {
+      if (!isxdigit((unsigned char)token.data[i]))
+        return false;
+    } else if (separator == '\0') {
+      if (token.data[i] != ':' && token.data[i] != '-')
+        return false;
+      separator = token.data[i];
+    } else if (token.data[i] != separator) {
       return false;
-    for (const char *z = zone + 1; *z; z++) {
-      if (!isalnum((unsigned char)*z) && *z != '_' && *z != '.' && *z != '-')
-        return false;
     }
   }
-
-  size_t address_len = zone ? (size_t)(zone - token) : len;
-  if (address_len == 0 || address_len >= INET6_ADDRSTRLEN)
-    return false;
-  char address[INET6_ADDRSTRLEN];
-  memcpy(address, token, address_len);
-  address[address_len] = '\0';
-  struct in6_addr parsed;
-  return inet_pton(AF_INET6, address, &parsed) == 1;
+  return true;
 }
 
-static bool is_mac(const char *token) {
-  /* MAC address: xx:xx:xx:xx:xx:xx or xx-xx-xx-xx-xx-xx
-   * Exactly 6 hex pairs separated by : or - */
-  size_t len = strlen(token);
-  if (len != 17)
-    return false;
-
-  char sep = 0;
-  for (size_t i = 0; i < len; i++) {
-    size_t mod = i % 3;
-    if (mod == 0 || mod == 1) {
-      if (!isxdigit((unsigned char)token[i]))
-        return false;
-    } else {
-      /* Separator position */
-      if (sep == 0) {
-        if (token[i] != ':' && token[i] != '-')
-          return false;
-        sep = token[i];
-      } else {
-        if (token[i] != sep)
-          return false;
-      }
-    }
-  }
-  return sep != 0;
-}
-
-static bool is_http_method(const char *token) {
-  static const char *methods[] = {
+static bool span_is_http_method(st_text_span_t token) {
+  static const char *const methods[] = {
       "GET",      "POST",     "PUT",       "DELETE", "PATCH",     "HEAD",
       "OPTIONS",  "TRACE",    "CONNECT",   "COPY",   "LOCK",      "MKCOL",
       "MOVE",     "PROPFIND", "PROPPATCH", "UNLOCK", "REPORT",    "MKACTIVITY",
       "CHECKOUT", "MERGE",    "M-SEARCH",  "NOTIFY", "SUBSCRIBE", "UNSUBSCRIBE",
       "PURGE",    NULL};
-  for (const char **m = methods; *m; m++) {
-    if (strcmp(token, *m) == 0)
+  for (const char *const *method = methods; *method; method++)
+    if (span_eq(token, *method))
       return true;
-  }
   return false;
 }
 
-static bool is_cron_like(const char *token) {
-  /* Cron pattern: digits with stars, commas, hyphens, slashes. */
-  if (!token || !*token)
+static bool span_is_cron_like(st_text_span_t token) {
+  if (token.length == 0)
     return false;
   bool has_digit_or_star = false;
-  for (const char *p = token; *p; p++) {
-    if (isdigit((unsigned char)*p) || *p == '*') {
+  for (size_t i = 0; i < token.length; i++) {
+    char c = token.data[i];
+    if (isdigit((unsigned char)c) || c == '*')
       has_digit_or_star = true;
-    } else if (*p != '-' && *p != ',' && *p != '/') {
+    else if (c != '-' && c != ',' && c != '/')
       return false;
-    }
   }
   return has_digit_or_star;
 }
 
-static bool is_duration(const char *token) {
-  /* Duration: optionally signed number (int or float) + time suffix.
-   * Suffixes: ns, us, ms, s, m, h, d, w (case-insensitive)
-   * Examples: 30s, 1.5h, 100ms, 7d, 2w, 500ns */
-  size_t len = strlen(token);
-  if (len < 2)
-    return false;
+static bool span_is_absolute_path(st_text_span_t token) {
+  return token.length > 1 && token.data[0] == '/';
+}
 
-  /* Parse numeric part */
-  size_t i = token[0] == '-' ? 1 : 0;
-  bool has_digit = false;
-  bool has_dot = false;
-  while (i < len && (isdigit((unsigned char)token[i]) || token[i] == '.')) {
-    if (token[i] == '.') {
-      if (has_dot)
-        return false;
-      has_dot = true;
-    } else {
-      has_digit = true;
-    }
-    i++;
-  }
-  if (!has_digit || i == len)
-    return false;
+static bool span_is_relative_path(st_text_span_t token) {
+  return token.length != 0 && token.data[0] != '/' &&
+         (span_has_pair(token, '.', '.') || span_has(token, '/'));
+}
 
-  /* Remaining must be a known suffix */
-  const char *suffix = token + i;
-  size_t slen = len - i;
-  if (slen == 0)
-    return false;
+static bool span_is_filename(st_text_span_t token) {
+  return !span_has(token, '/') && span_has(token, '.') && !span_has(token, '-');
+}
 
-  static const char *suffixes[] = {"ns", "us", "ms", "s", "m",
-                                   "h",  "d",  "w",  NULL};
-  for (const char **s = suffixes; *s; s++) {
-    if (slen == strlen(*s) && strcasecmp(suffix, *s) == 0)
+static bool span_has_whitespace(st_text_span_t token) {
+  for (size_t i = 0; i < token.length; i++)
+    if (isspace((unsigned char)token.data[i]))
       return true;
+  return false;
+}
+
+static bool span_is_short_option(st_text_span_t token) {
+  if (token.length < 2 || token.data[0] != '-' || token.data[1] == '-')
+    return false;
+  return span_all_ascii((st_text_span_t){token.data + 1, token.length - 1},
+                        isalnum);
+}
+
+static bool span_is_long_option(st_text_span_t token) {
+  if (token.length < 3 || token.data[0] != '-' || token.data[1] != '-')
+    return false;
+  for (size_t i = 2; i < token.length; i++) {
+    char c = token.data[i];
+    if (!isalnum((unsigned char)c) && c != '-' && c != '=')
+      return false;
   }
-  return false;
-}
-
-static bool is_absolute_path(const char *token) {
-  return token[0] == '/' && token[1] != '\0';
-}
-
-static bool is_relative_path(const char *token) {
-  /* Contains ".." or "/" but does not start with "/" */
-  if (token[0] == '/')
-    return false;
-  if (strstr(token, "..") != NULL)
-    return true;
-  if (strchr(token, '/') != NULL)
-    return true;
-  return false;
-}
-
-static bool is_filename(const char *token) {
-  /* No "/", has "." (extension), not a number/word/etc.
-   * Reject tokens with hyphens - they're hyphenated identifiers, not filenames.
-   * Examples: "release-1.0" → HYPHENATED, not FILENAME */
-  if (strchr(token, '/') != NULL)
-    return false;
-  if (strchr(token, '.') == NULL)
-    return false;
-  if (strchr(token, '-') != NULL)
-    return false;
   return true;
 }
 
-static bool is_url(const char *token) {
-  /* protocol://... */
-  const char *colon = strchr(token, ':');
+static bool span_is_url(st_text_span_t token) {
+  const char *colon = span_find(token, ':');
   if (!colon)
     return false;
-  if (colon[1] != '/' || colon[2] != '/')
+  size_t scheme_length = (size_t)(colon - token.data);
+  if (scheme_length == 0 || scheme_length + 2 >= token.length ||
+      colon[1] != '/' || colon[2] != '/' ||
+      !isalpha((unsigned char)token.data[0]))
     return false;
-  /* RFC 3986 scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." ). */
-  if (colon == token || !isalpha((unsigned char)token[0]))
-    return false;
-  for (const char *p = token + 1; p < colon; p++) {
-    if (!isalnum((unsigned char)*p) && *p != '+' && *p != '-' && *p != '.')
+  for (size_t i = 1; i < scheme_length; i++) {
+    char c = token.data[i];
+    if (!isalnum((unsigned char)c) && c != '+' && c != '-' && c != '.')
       return false;
   }
   return true;
 }
 
-static bool has_whitespace(const char *token) {
-  for (const char *p = token; *p; p++) {
-    if (isspace((unsigned char)*p))
-      return true;
-  }
-  return false;
-}
-
-static bool is_short_option(const char *token) {
-  /* Short option: -x (single letter after dash, not digit)
-   * Stacked flags allowed: -la, -rf */
-  if (token[0] != '-')
+static bool span_is_uuid(st_text_span_t token) {
+  static const size_t groups[] = {8, 4, 4, 4, 12};
+  if (token.length != 36)
     return false;
-  if (token[1] == '-')
-    return false; /* long options handled separately */
-  if (!token[1])
-    return false; /* just "-" is not an option */
-  /* All chars after dash must be alphanumeric (not digit alone for stack) */
-  for (const char *p = token + 1; *p; p++) {
-    if (!isalnum((unsigned char)*p))
+  size_t position = 0;
+  for (size_t group = 0; group < sizeof(groups) / sizeof(groups[0]); group++) {
+    for (size_t i = 0; i < groups[group]; i++)
+      if (!isxdigit((unsigned char)token.data[position++]))
+        return false;
+    if (group + 1 != sizeof(groups) / sizeof(groups[0]) &&
+        token.data[position++] != '-')
       return false;
   }
   return true;
 }
 
-static bool is_long_option(const char *token) {
-  /* Long option: --word or --word=value */
-  if (token[0] != '-' || token[1] != '-')
+static bool span_is_email(st_text_span_t token) {
+  const char *at = span_find(token, '@');
+  if (!at || at == token.data || at + 1 == token.data + token.length)
     return false;
-  if (!token[2])
-    return false; /* Just "--" is not an option */
-  for (const char *p = token + 2; *p; p++) {
-    if (isalnum((unsigned char)*p) || *p == '-' || *p == '=')
-      continue;
-    return false;
-  }
-  return true;
-}
-
-static bool is_uuid(const char *token) {
-  /* UUID format: 8-4-4-4-12 hex digits (e.g.,
-   * 550e8400-e29b-41d4-a716-446655440000) */
-  size_t len = strlen(token);
-  if (len != 36)
-    return false;
-
-  static const int segments[] = {8, 4, 4, 4, 12};
-  int pos = 0;
-
-  for (int i = 0; i < 5; i++) {
-    for (int j = 0; j < segments[i]; j++) {
-      char c = token[pos++];
-      if (!isxdigit((unsigned char)c))
+  size_t at_index = (size_t)(at - token.data);
+  bool has_dot = false;
+  for (size_t i = 0; i < token.length; i++) {
+    char c = token.data[i];
+    if (i < at_index) {
+      if (!isalnum((unsigned char)c) && c != '.' && c != '_' && c != '-' &&
+          c != '+')
         return false;
-    }
-    if (i < 4) {
-      if (token[pos++] != '-')
+    } else if (i > at_index) {
+      has_dot |= c == '.';
+      if (!isalnum((unsigned char)c) && c != '.' && c != '-')
         return false;
     }
   }
-  return token[pos] == '\0';
+  return has_dot;
 }
 
-static bool is_email(const char *token) {
-  /* Email format: user@domain */
-  const char *at = strchr(token, '@');
-  if (!at)
-    return false;
-  if (at == token)
-    return false;
-  if (at[1] == '\0')
-    return false;
-
-  /* Check user part */
-  for (const char *p = token; p < at; p++) {
-    char c = *p;
-    if (isalnum((unsigned char)c) || c == '.' || c == '_' || c == '-' ||
-        c == '+')
-      continue;
-    return false;
-  }
-
-  /* Check domain part */
-  const char *domain = at + 1;
-  if (strchr(domain, '.') == NULL)
-    return false;
-  for (const char *p = domain; *p; p++) {
-    char c = *p;
-    if (isalnum((unsigned char)c) || c == '.' || c == '-')
-      continue;
-    return false;
-  }
-  return true;
-}
-
-static bool is_hostname(const char *token) {
-  /* Hostname/domain: alphanumeric with hyphens and dots, starts and ends
-   * with alphanumeric. Accepted if:
-   *   - has at least one dot AND at least one hyphen, OR
-   *   - has at least one dot AND the last label is a known TLD.
-   * The TLD list is intentionally small (~15 entries) to avoid matching
-   * filenames like "output.txt" or "main.go" while accepting common
-   * domains like "example.com" or "github.io".
-   * Tokens without dots (e.g., "localhost") are covered by #word or #hyp. */
-  static const char *known_tlds[] = {
+static bool span_is_hostname(st_text_span_t token) {
+  static const char *const known_tlds[] = {
       "com", "org", "net",   "edu",   "gov", "mil", "io",   "co",
       "dev", "app", "cloud", "local", "int", "biz", "info", NULL};
-
-  size_t len = strlen(token);
-  if (len == 0)
+  if (token.length == 0 || token.data[0] == '-' ||
+      token.data[token.length - 1] == '-' ||
+      !isalnum((unsigned char)token.data[0]) ||
+      !isalnum((unsigned char)token.data[token.length - 1]))
     return false;
-  if (token[0] == '-' || token[len - 1] == '-')
-    return false;
-  if (!isalnum((unsigned char)token[0]) ||
-      !isalnum((unsigned char)token[len - 1]))
-    return false;
-
-  bool has_dot = false, has_hyphen_before_dot = false;
-  for (size_t i = 0; i < len; i++) {
-    char c = token[i];
+  bool has_dot = false;
+  bool has_hyphen_before_dot = false;
+  size_t last_dot = 0;
+  for (size_t i = 0; i < token.length; i++) {
+    char c = token.data[i];
     if (c == '-') {
-      /* Check if next char is dot (hyphen immediately followed by dot: a-b.c)
-       */
-      if (i + 1 < len && token[i + 1] == '.')
+      if (i + 1 < token.length && token.data[i + 1] == '.')
         has_hyphen_before_dot = true;
-      if (i > 0 && token[i - 1] == '-')
+      if (i != 0 && token.data[i - 1] == '-')
         return false;
     } else if (c == '.') {
       has_dot = true;
-      if (i > 0 && token[i - 1] == '.')
+      last_dot = i;
+      if (i != 0 && token.data[i - 1] == '.')
         return false;
     } else if (!isalnum((unsigned char)c)) {
       return false;
@@ -1302,489 +1197,432 @@ static bool is_hostname(const char *token) {
     return false;
   if (has_hyphen_before_dot)
     return true;
-
-  /* No hyphen - check if last label is a known TLD */
-  const char *last_dot = strrchr(token, '.');
-  if (!last_dot)
-    return false;
-  const char *tld = last_dot + 1;
-  for (const char **p = known_tlds; *p; p++) {
-    if (strcasecmp(tld, *p) == 0)
+  st_text_span_t tld = {token.data + last_dot + 1, token.length - last_dot - 1};
+  for (const char *const *known = known_tlds; *known; known++)
+    if (span_eq_ci(tld, *known))
       return true;
-  }
   return false;
 }
 
-static bool is_size(const char *token) {
-  /* Size: number followed by suffix (K, M, G, T, Ki, Mi, Gi, Ti, KB, MB, GB,
-   * TB, bytes, b) */
-  size_t len = strlen(token);
-  if (len < 2)
+static bool span_is_duration(st_text_span_t token) {
+  if (token.length < 2)
     return false;
-
-  size_t num_end = 0;
+  size_t i = token.data[0] == '-' ? 1 : 0;
+  bool has_digit = false;
   bool has_dot = false;
-  while (num_end < len &&
-         (isdigit((unsigned char)token[num_end]) || token[num_end] == '.')) {
-    if (token[num_end] == '.') {
-      if (has_dot || num_end + 1 == len ||
-          !isdigit((unsigned char)token[num_end + 1]))
+  while (i < token.length &&
+         (isdigit((unsigned char)token.data[i]) || token.data[i] == '.')) {
+    if (token.data[i] == '.') {
+      if (has_dot)
         return false;
       has_dot = true;
-    }
-    num_end++;
-  }
-  if (num_end == 0)
-    return false;
-
-  bool has_digit = false;
-  for (size_t i = 0; i < num_end; i++) {
-    if (isdigit((unsigned char)token[i])) {
-      has_digit = true;
-      break;
-    }
-  }
-  if (!has_digit)
-    return false;
-
-  if (num_end == len)
-    return false;
-
-  const char *suffix = token + num_end;
-
-  if (strcmp(suffix, "Ki") == 0 || strcmp(suffix, "Mi") == 0 ||
-      strcmp(suffix, "Gi") == 0 || strcmp(suffix, "Ti") == 0) {
-    return true;
-  }
-
-  if (strcmp(suffix, "K") == 0 || strcmp(suffix, "M") == 0 ||
-      strcmp(suffix, "G") == 0 || strcmp(suffix, "T") == 0) {
-    return true;
-  }
-
-  if (strcmp(suffix, "KB") == 0 || strcmp(suffix, "MB") == 0 ||
-      strcmp(suffix, "GB") == 0 || strcmp(suffix, "TB") == 0 ||
-      strcmp(suffix, "bytes") == 0 || strcmp(suffix, "b") == 0) {
-    return true;
-  }
-
-  if (strcmp(suffix, "KiB") == 0 || strcmp(suffix, "MiB") == 0 ||
-      strcmp(suffix, "GiB") == 0 || strcmp(suffix, "TiB") == 0) {
-    return true;
-  }
-
-  if (strcmp(suffix, "B") == 0) {
-    return true;
-  }
-
-  return false;
-}
-
-static bool parse_semver_number(const char **cursor) {
-  const char *start = *cursor;
-  if (!isdigit((unsigned char)*start))
-    return false;
-  while (isdigit((unsigned char)**cursor))
-    (*cursor)++;
-  return *start != '0' || *cursor == start + 1;
-}
-
-static bool parse_semver_identifiers(const char **cursor,
-                                     bool reject_numeric_leading_zero) {
-  for (;;) {
-    const char *start = *cursor;
-    bool numeric = true;
-    while (isalnum((unsigned char)**cursor) || **cursor == '-') {
-      if (!isdigit((unsigned char)**cursor))
-        numeric = false;
-      (*cursor)++;
-    }
-    if (*cursor == start || (reject_numeric_leading_zero && numeric &&
-                             *start == '0' && *cursor != start + 1))
-      return false;
-    if (**cursor != '.')
-      return true;
-    (*cursor)++;
-  }
-}
-
-static bool is_semver(const char *token) {
-  /* Semantic version: major.minor.patch[-prerelease][+build] */
-  size_t len = strlen(token);
-  if (len < 3)
-    return false;
-
-  const char *p = token;
-  if (!parse_semver_number(&p) || *p++ != '.' || !parse_semver_number(&p) ||
-      *p++ != '.' || !parse_semver_number(&p))
-    return false;
-
-  if (*p == '-') {
-    p++;
-    if (!parse_semver_identifiers(&p, true))
-      return false;
-  }
-
-  if (*p == '+') {
-    p++;
-    if (!parse_semver_identifiers(&p, false))
-      return false;
-  }
-
-  return *p == '\0';
-}
-
-static bool is_timestamp(const char *token) {
-  int y = 0, m = 0, d = 0, h = 0, min = 0, s = 0;
-
-#define PARSE_DIGITS(position, count, output)                                  \
-  do {                                                                         \
-    (output) = 0;                                                              \
-    for (size_t digit = 0; digit < (count); digit++) {                         \
-      char c = token[(position) + digit];                                      \
-      if (!isdigit((unsigned char)c))                                          \
-        return false;                                                          \
-      (output) = (output) * 10 + (c - '0');                                    \
-    }                                                                          \
-  } while (0)
-
-  size_t len = strlen(token);
-  if (len < 8)
-    return false;
-
-  bool has_date = len >= 10 && token[4] == '-' && token[7] == '-';
-  if (has_date) {
-    PARSE_DIGITS(0, 4, y);
-    PARSE_DIGITS(5, 2, m);
-    PARSE_DIGITS(8, 2, d);
-    if (y == 0 || m < 1 || m > 12)
-      return false;
-    static const int days_per_month[] = {31, 28, 31, 30, 31, 30,
-                                         31, 31, 30, 31, 30, 31};
-    int max_day = days_per_month[m - 1];
-    bool leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
-    if (m == 2 && leap)
-      max_day++;
-    if (d < 1 || d > max_day)
-      return false;
-  }
-
-  /* Combined datetime: YYYY-MM-DDThh:mm:ss[Z|+HH:MM|+HHMM|-HH:MM] */
-  if (len >= 19 && has_date &&
-      (token[10] == 'T' || token[10] == ' ' || token[10] == 't') &&
-      token[13] == ':' && token[16] == ':') {
-    PARSE_DIGITS(11, 2, h);
-    PARSE_DIGITS(14, 2, min);
-    PARSE_DIGITS(17, 2, s);
-    if (h > 23 || min > 59 || s > 59)
-      return false;
-    const char *zone = token + 19;
-    if (*zone == '\0')
-      return true;
-    if ((zone[0] == 'Z' || zone[0] == 'z') && zone[1] == '\0')
-      return true;
-    if (zone[0] != '+' && zone[0] != '-')
-      return false;
-    int zone_hour = 0, zone_minute = 0;
-    if (strlen(zone) == 6 && zone[3] == ':') {
-      PARSE_DIGITS(20, 2, zone_hour);
-      PARSE_DIGITS(23, 2, zone_minute);
-    } else if (strlen(zone) == 5) {
-      PARSE_DIGITS(20, 2, zone_hour);
-      PARSE_DIGITS(22, 2, zone_minute);
     } else {
-      return false;
+      has_digit = true;
     }
-    return zone_hour <= 23 && zone_minute <= 59;
+    i++;
   }
-
-  /* Simple date: YYYY-MM-DD (must have 4-digit year to avoid hostname overlap)
-   */
-  if (len == 10 && has_date)
-    return true;
-
-  /* Simple time: HH:MM:SS */
-  if (len == 8 && token[2] == ':' && token[5] == ':') {
-    PARSE_DIGITS(0, 2, h);
-    PARSE_DIGITS(3, 2, min);
-    PARSE_DIGITS(6, 2, s);
-    return h <= 23 && min <= 59 && s <= 59;
-  }
-
-#undef PARSE_DIGITS
-  return false;
-}
-
-static bool is_hash_algo(const char *token) {
-  static const char *algos[] = {"md5",       "sha1",     "sha224",  "sha256",
-                                "sha384",    "sha512",   "blake2b", "blake2s",
-                                "ripemd160", "whirlpool"};
-  for (size_t i = 0; i < sizeof(algos) / sizeof(algos[0]); i++) {
-    if (strcmp(token, algos[i]) == 0)
+  if (!has_digit || i == token.length)
+    return false;
+  st_text_span_t suffix = {token.data + i, token.length - i};
+  static const char *const suffixes[] = {"ns", "us", "ms", "s", "m",
+                                         "h",  "d",  "w",  NULL};
+  for (const char *const *item = suffixes; *item; item++)
+    if (span_eq_ci(suffix, *item))
       return true;
-  }
   return false;
 }
 
-static bool is_env_var(const char *token) {
-  if (token[0] != '$')
+static bool span_is_size(st_text_span_t token) {
+  if (token.length < 2)
     return false;
-  if (token[1] == '{') {
-    size_t len = strlen(token);
-    if (len < 4 || token[len - 1] != '}')
-      return false;
-    /* Variable name must start with letter or underscore */
-    if (!isalpha((unsigned char)token[2]) && token[2] != '_')
-      return false;
-    for (size_t i = 3; i < len - 1; i++) {
-      if (!isalnum((unsigned char)token[i]) && token[i] != '_')
+  size_t number_end = 0;
+  bool has_dot = false;
+  bool has_digit = false;
+  while (number_end < token.length &&
+         (isdigit((unsigned char)token.data[number_end]) ||
+          token.data[number_end] == '.')) {
+    if (token.data[number_end] == '.') {
+      if (has_dot || number_end + 1 == token.length ||
+          !isdigit((unsigned char)token.data[number_end + 1]))
         return false;
+      has_dot = true;
+    } else {
+      has_digit = true;
     }
-    return true;
+    number_end++;
   }
-  if (token[1] == '\0')
+  if (!has_digit || number_end == token.length)
     return false;
-  /* Variable name must start with letter or underscore */
-  if (!isalpha((unsigned char)token[1]) && token[1] != '_')
+  st_text_span_t suffix = {token.data + number_end, token.length - number_end};
+  static const char *const suffixes[] = {
+      "Ki", "Mi", "Gi",    "Ti", "K",   "M",   "G",   "T",   "KB", "MB",
+      "GB", "TB", "bytes", "b",  "KiB", "MiB", "GiB", "TiB", "B",  NULL};
+  for (const char *const *item = suffixes; *item; item++)
+    if (span_eq(suffix, *item))
+      return true;
+  return false;
+}
+
+static bool span_parse_semver_number(st_text_span_t token, size_t *position) {
+  size_t start = *position;
+  if (start == token.length || !isdigit((unsigned char)token.data[start]))
     return false;
-  for (const char *p = token + 2; *p; p++) {
-    if (!isalnum((unsigned char)*p) && *p != '_')
+  while (*position < token.length &&
+         isdigit((unsigned char)token.data[*position]))
+    (*position)++;
+  return token.data[start] != '0' || *position == start + 1;
+}
+
+static bool span_parse_semver_identifiers(st_text_span_t token,
+                                          size_t *position,
+                                          bool reject_numeric_leading_zero) {
+  for (;;) {
+    size_t start = *position;
+    bool numeric = true;
+    while (*position < token.length &&
+           (isalnum((unsigned char)token.data[*position]) ||
+            token.data[*position] == '-')) {
+      if (!isdigit((unsigned char)token.data[*position]))
+        numeric = false;
+      (*position)++;
+    }
+    if (*position == start ||
+        (reject_numeric_leading_zero && numeric && token.data[start] == '0' &&
+         *position != start + 1))
       return false;
+    if (*position == token.length || token.data[*position] != '.')
+      return true;
+    (*position)++;
+  }
+}
+
+static bool span_is_semver(st_text_span_t token) {
+  if (token.length < 3)
+    return false;
+  size_t position = 0;
+  if (!span_parse_semver_number(token, &position) || position == token.length ||
+      token.data[position++] != '.' ||
+      !span_parse_semver_number(token, &position) || position == token.length ||
+      token.data[position++] != '.' ||
+      !span_parse_semver_number(token, &position))
+    return false;
+  if (position < token.length && token.data[position] == '-') {
+    position++;
+    if (!span_parse_semver_identifiers(token, &position, true))
+      return false;
+  }
+  if (position < token.length && token.data[position] == '+') {
+    position++;
+    if (!span_parse_semver_identifiers(token, &position, false))
+      return false;
+  }
+  return position == token.length;
+}
+
+static bool span_parse_digits(st_text_span_t token, size_t position,
+                              size_t count, int *value) {
+  if (position > token.length || count > token.length - position)
+    return false;
+  *value = 0;
+  for (size_t i = 0; i < count; i++) {
+    char c = token.data[position + i];
+    if (!isdigit((unsigned char)c))
+      return false;
+    *value = *value * 10 + (c - '0');
   }
   return true;
 }
 
-static bool is_hyphenated(const char *token) {
-  /* Match hyphenated identifiers: a-b where both a and b are 1+ chars
-   * of [A-Za-z0-9_]. First char must be alpha or underscore.
-   * Examples: user-42, alice-smith, not-a-date. */
-  if (!token[0])
+static bool span_is_timestamp(st_text_span_t token) {
+  int year = 0, month = 0, day = 0, hour = 0, minute = 0, second = 0;
+  if (token.length < 8)
     return false;
-  if (!isalpha((unsigned char)token[0]) && token[0] != '_')
-    return false;
+  bool has_date =
+      token.length >= 10 && token.data[4] == '-' && token.data[7] == '-';
+  if (has_date) {
+    if (!span_parse_digits(token, 0, 4, &year) ||
+        !span_parse_digits(token, 5, 2, &month) ||
+        !span_parse_digits(token, 8, 2, &day) || year == 0 || month < 1 ||
+        month > 12)
+      return false;
+    static const int days_per_month[] = {31, 28, 31, 30, 31, 30,
+                                         31, 31, 30, 31, 30, 31};
+    int max_day = days_per_month[month - 1];
+    if (month == 2 && ((year % 4 == 0 && year % 100 != 0) || year % 400 == 0))
+      max_day++;
+    if (day < 1 || day > max_day)
+      return false;
+  }
+  if (token.length >= 19 && has_date &&
+      (token.data[10] == 'T' || token.data[10] == 't' ||
+       token.data[10] == ' ') &&
+      token.data[13] == ':' && token.data[16] == ':') {
+    if (!span_parse_digits(token, 11, 2, &hour) ||
+        !span_parse_digits(token, 14, 2, &minute) ||
+        !span_parse_digits(token, 17, 2, &second) || hour > 23 || minute > 59 ||
+        second > 59)
+      return false;
+    size_t zone_length = token.length - 19;
+    if (zone_length == 0)
+      return true;
+    if (zone_length == 1 && (token.data[19] == 'Z' || token.data[19] == 'z'))
+      return true;
+    if ((token.data[19] != '+' && token.data[19] != '-') ||
+        (zone_length != 5 && zone_length != 6) ||
+        (zone_length == 6 && token.data[22] != ':'))
+      return false;
+    size_t minute_position = zone_length == 6 ? 23 : 22;
+    if (!span_parse_digits(token, 20, 2, &hour) ||
+        !span_parse_digits(token, minute_position, 2, &minute))
+      return false;
+    return hour <= 23 && minute <= 59;
+  }
+  if (token.length == 10 && has_date)
+    return true;
+  if (token.length == 8 && token.data[2] == ':' && token.data[5] == ':') {
+    return span_parse_digits(token, 0, 2, &hour) &&
+           span_parse_digits(token, 3, 2, &minute) &&
+           span_parse_digits(token, 6, 2, &second) && hour <= 23 &&
+           minute <= 59 && second <= 59;
+  }
+  return false;
+}
 
-  bool has_hyphen = false;
-  for (const char *p = token + 1; *p; p++) {
-    if (*p == '-') {
-      has_hyphen = true;
-    } else if (!isalnum((unsigned char)*p) && *p != '_') {
+static bool span_is_ipv6(st_text_span_t token) {
+  size_t end = token.length;
+  const char *zone = span_find(token, '%');
+  if (zone) {
+    end = (size_t)(zone - token.data);
+    if (end == 0 || end + 1 == token.length ||
+        span_find((st_text_span_t){zone + 1, token.length - end - 1}, '%'))
+      return false;
+    for (size_t i = end + 1; i < token.length; i++)
+      if (!isalnum((unsigned char)token.data[i]) && token.data[i] != '_' &&
+          token.data[i] != '.' && token.data[i] != '-')
+        return false;
+  }
+  if (end < 2)
+    return false;
+  size_t i = 0, groups = 0;
+  bool compressed = false;
+  if (token.data[0] == ':') {
+    if (token.data[1] != ':')
+      return false;
+    compressed = true;
+    i = 2;
+  }
+  while (i < end) {
+    size_t start = i, digits = 0;
+    while (i < end && isxdigit((unsigned char)token.data[i])) {
+      i++;
+      digits++;
+    }
+    if (i < end && token.data[i] == '.') {
+      if (!span_is_ipv4((st_text_span_t){token.data + start, end - start}) ||
+          groups > 6)
+        return false;
+      groups += 2;
+      i = end;
+      break;
+    }
+    if (digits == 0 || digits > 4 || groups == 8)
+      return false;
+    groups++;
+    if (i == end)
+      break;
+    if (token.data[i++] != ':')
+      return false;
+    if (i < end && token.data[i] == ':') {
+      if (compressed)
+        return false;
+      compressed = true;
+      i++;
+      if (i == end)
+        break;
+    } else if (i == end) {
       return false;
     }
   }
-  return has_hyphen;
+  return compressed ? groups < 8 : groups == 8;
 }
 
-static bool is_branch(const char *token) {
-  /* Git branch/ref name: must be 1+ chars, no leading dash/slash/dot.
-   * Either:
-   *   (a) known short names: HEAD, main, master, develop, trunk, mainline,
-   * default (b) path-like: alphanumeric, hyphens, underscores with '/' but no
-   * dots Reject: anything with dots (→ rel_path or filename), abs paths,
-   * options. */
-  if (!token[0])
-    return false;
-  if (token[0] == '-' || token[0] == '/' || token[0] == '.')
-    return false;
+static bool span_is_hash_algo(st_text_span_t token) {
+  static const char *const algos[] = {
+      "md5",     "sha1",    "sha224",    "sha256",    "sha384", "sha512",
+      "blake2b", "blake2s", "ripemd160", "whirlpool", NULL};
+  for (const char *const *algo = algos; *algo; algo++)
+    if (span_eq(token, *algo))
+      return true;
+  return false;
+}
 
-  /* Known branch short names */
-  static const char *short_refs[] = {
+static bool span_is_env_var(st_text_span_t token) {
+  if (token.length < 2 || token.data[0] != '$')
+    return false;
+  size_t begin = 1, end = token.length;
+  if (token.data[1] == '{') {
+    if (token.length < 4 || token.data[token.length - 1] != '}')
+      return false;
+    begin++;
+    end--;
+  }
+  if (!isalpha((unsigned char)token.data[begin]) && token.data[begin] != '_')
+    return false;
+  for (size_t i = begin + 1; i < end; i++)
+    if (!isalnum((unsigned char)token.data[i]) && token.data[i] != '_')
+      return false;
+  return true;
+}
+
+static bool span_is_hyphenated(st_text_span_t token) {
+  if (token.length == 0 ||
+      (!isalpha((unsigned char)token.data[0]) && token.data[0] != '_'))
+    return false;
+  bool hyphen = false;
+  for (size_t i = 1; i < token.length; i++) {
+    if (token.data[i] == '-')
+      hyphen = true;
+    else if (!isalnum((unsigned char)token.data[i]) && token.data[i] != '_')
+      return false;
+  }
+  return hyphen;
+}
+
+static bool span_is_branch(st_text_span_t token) {
+  static const char *const refs[] = {
       "HEAD",    "main",     "master",  "develop", "trunk",   "mainline",
       "default", "gh-pages", "source",  "sandbox", "staging", "production",
       "next",    "feature",  "release", "hotfix",  "fix",     "bugfix",
       "wip",     "maint",    NULL};
-  for (const char **r = short_refs; *r; r++) {
-    if (strcmp(token, *r) == 0)
+  if (token.length == 0 || token.data[0] == '-' || token.data[0] == '/' ||
+      token.data[0] == '.')
+    return false;
+  for (const char *const *ref = refs; *ref; ref++)
+    if (span_eq(token, *ref))
       return true;
-  }
-
-  /* Path-like: must contain '/' and NO dots */
-  bool has_slash = false;
-  for (const char *p = token; *p; p++) {
-    char c = *p;
+  bool slash = false;
+  for (size_t i = 0; i < token.length; i++) {
+    char c = token.data[i];
     if (c == '/') {
-      has_slash = true;
-      /* reject "//" or leading/trailing "/" */
-      if (p == token || p[1] == '\0' || p[1] == '/')
+      if (i == 0 || i + 1 == token.length || token.data[i + 1] == '/')
         return false;
-    } else if (c == '.') {
-      /* Dots not allowed in path-like branch names - would be rel_path */
-      return false;
-    } else if (!isalnum((unsigned char)c) && c != '-' && c != '_') {
+      slash = true;
+    } else if (c == '.' ||
+               (!isalnum((unsigned char)c) && c != '-' && c != '_')) {
       return false;
     }
   }
-  if (!has_slash)
-    return false; /* must have '/' unless short ref */
-
-  /* Must end with alnum (not hyphen/underscore) */
-  size_t len = strlen(token);
-  if (!isalnum((unsigned char)token[len - 1]))
-    return false;
-
-  return true;
+  return slash && isalnum((unsigned char)token.data[token.length - 1]);
 }
 
-static bool is_sha(const char *token) {
-  /* SHA/hash digest: 7 or 9-64 lowercase hex chars (a-f only, no A-F).
-   * Seven characters is the supported #sha.short representation; eight
-   * remains a generic hex hash.
-   * This distinguishes SHA from HEXHASH which accepts mixed case. */
-  size_t len = strlen(token);
-  if (len < 7 || len == 8 || len > 64)
+static bool span_is_sha(st_text_span_t token) {
+  if (token.length < 7 || token.length == 8 || token.length > 64)
     return false;
-  for (size_t i = 0; i < len; i++) {
-    unsigned char c = (unsigned char)token[i];
-    /* Must be lowercase hex digit */
-    if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')))
+  for (size_t i = 0; i < token.length; i++)
+    if (!((token.data[i] >= '0' && token.data[i] <= '9') ||
+          (token.data[i] >= 'a' && token.data[i] <= 'f')))
       return false;
-  }
   return true;
 }
 
-static bool is_image(const char *token) {
-  /* Container image ref: must have : (tag) or @ (digest) to be distinguishable
-   * from paths and filenames.
-   * Format: [registry/]name[:tag][@digest]
-   * Examples: nginx:latest, ghcr.io/org/app:v1, myimage@sha256:abc...
-   * Registry names are lowercase; reject uppercase-heavy tokens like SHA1:abc
-   */
-  size_t len = strlen(token);
-  if (len < 2)
+static bool span_is_image(st_text_span_t token) {
+  if (token.length < 2)
     return false;
-
-  /* Find the primary name segment (before any / or :) */
-  const char *name_end = token;
-  while (*name_end && *name_end != '/' && *name_end != ':' && *name_end != '@')
+  size_t name_end = 0;
+  while (name_end < token.length && token.data[name_end] != '/' &&
+         token.data[name_end] != ':' && token.data[name_end] != '@')
     name_end++;
-  /* Reject names like "User" that are a single capitalized word (starts with
-   * uppercase, rest lowercase). These look like user:group. Accept names with
-   * lowercase, digits, slashes, hyphens, underscores, or mixed case. */
-  if (name_end - token >= 1 && token[0] >= 'A' && token[0] <= 'Z') {
-    bool rest_all_lowercase = true;
-    for (const char *p = token + 1; p < name_end; p++) {
-      if (!(*p >= 'a' && *p <= 'z')) {
-        rest_all_lowercase = false;
-        break;
-      }
-    }
-    if (rest_all_lowercase)
+  if (name_end && token.data[0] >= 'A' && token.data[0] <= 'Z') {
+    bool rest_lower = true;
+    for (size_t i = 1; i < name_end; i++)
+      if (token.data[i] < 'a' || token.data[i] > 'z')
+        rest_lower = false;
+    if (rest_lower)
       return false;
   }
-
-  /* Reject tokens that look like IPv6 addresses (contain ::) */
-  if (strstr(token, "::") != NULL)
+  if (span_has_pair(token, ':', ':'))
     return false;
-
-  bool has_colon = false;
-  for (size_t i = 0; i < len; i++) {
-    char c = token[i];
+  bool colon = false;
+  for (size_t i = 0; i < token.length; i++) {
+    char c = token.data[i];
     if (c == ':')
-      has_colon = true;
+      colon = true;
     else if (c == '@') {
-      /* Digest form: sha256: followed by 64 hex chars */
-      if (strncmp(token + i + 1, "sha256:", 7) != 0)
+      st_text_span_t digest = {token.data + i + 1, token.length - i - 1};
+      if (digest.length != 71 || !span_starts(digest, "sha256:"))
         return false;
-      size_t digest_len = len - i - 8;
-      if (digest_len != 64)
-        return false;
-      for (size_t j = i + 8; j < len; j++) {
-        if (!isxdigit((unsigned char)token[j]))
-          return false;
-      }
-      return true;
+      return span_all_ascii((st_text_span_t){digest.data + 7, 64}, isxdigit);
     } else if (!isalnum((unsigned char)c) && c != '.' && c != '-' && c != '_' &&
-               c != '/')
+               c != '/') {
       return false;
+    }
   }
-  /* Must have : or @ (digest). */
-  if (!has_colon)
-    return false;
-  /* Must not start with '-' or '.' */
-  if (token[0] == '-' || token[0] == '.')
-    return false;
-  return true;
+  return colon && token.data[0] != '-' && token.data[0] != '.';
 }
 
-static bool is_pkg(const char *token) {
-  /* Package specifier: must have @ (scoped or versioned) to distinguish
-   * from plain words. Format: @scope/name[@ver] or name@ver
-   * Common package names (without @) are too ambiguous as command args. */
-  if (!token[0])
+static bool span_is_pkg(st_text_span_t token) {
+  if (token.length == 0 || token.data[0] == '-')
     return false;
-  if (token[0] == '-')
-    return false;
-
-  const char *p = token;
-
-  /* Scoped package: @scope/name */
-  if (*p == '@') {
-    p++;
-    if (!*p)
+  size_t i = 0;
+  if (token.data[0] == '@') {
+    for (i = 1; i < token.length && token.data[i] != '/'; i++)
+      if (!isalnum((unsigned char)token.data[i]) && token.data[i] != '-' &&
+          token.data[i] != '_')
+        return false;
+    if (i == 1 || i == token.length || ++i == token.length)
       return false;
-    /* Scope part: alnum, -, _ */
-    while (*p && *p != '/') {
-      if (!isalnum((unsigned char)*p) && *p != '-' && *p != '_')
+    for (; i < token.length && token.data[i] != '@'; i++)
+      if (!isalnum((unsigned char)token.data[i]) && token.data[i] != '.' &&
+          token.data[i] != '-' && token.data[i] != '_')
         return false;
-      p++;
-    }
-    if (*p != '/')
-      return false; /* @scope must have / */
-    p++;
-    if (!*p)
+    if (i == token.length)
+      return true;
+    if (++i == token.length)
       return false;
-    /* Name part after scope/ */
-    while (*p && *p != '@') {
-      if (!isalnum((unsigned char)*p) && *p != '.' && *p != '-' && *p != '_')
+  } else {
+    for (; i < token.length && token.data[i] != '@'; i++)
+      if (!isalnum((unsigned char)token.data[i]) && token.data[i] != '.' &&
+          token.data[i] != '-' && token.data[i] != '_')
         return false;
-      p++;
-    }
-    /* Optional @version */
-    if (*p == '@') {
-      p++;
-      if (!*p)
+    if (i == 0 || i == token.length || ++i == token.length)
+      return false;
+  }
+  bool version_char = token.data[0] == '@';
+  for (; i < token.length; i++) {
+    char c = token.data[i];
+    if (!isalnum((unsigned char)c) && c != '.' && c != '-' && c != '^' &&
+        c != '~' && c != '<' && c != '>' && c != '=')
+      return false;
+    if (isdigit((unsigned char)c) || c == '.' || c == '-')
+      version_char = true;
+  }
+  return version_char;
+}
+
+static bool span_is_fingerprint(st_text_span_t token) {
+  if (span_starts(token, "SHA256:")) {
+    if (token.length != 50)
+      return false;
+    for (size_t i = 7; i < token.length; i++)
+      if (!isalnum((unsigned char)token.data[i]) && token.data[i] != '+' &&
+          token.data[i] != '/' && token.data[i] != '=')
         return false;
-      while (*p) {
-        if (!isalnum((unsigned char)*p) && *p != '.' && *p != '-' &&
-            *p != '^' && *p != '~' && *p != '<' && *p != '>' && *p != '=')
-          return false;
-        p++;
-      }
-    }
     return true;
   }
-
-  /* Versioned package: name@ver (name must have @ somewhere) */
-  /* Find the @ */
-  while (*p && *p != '@') {
-    if (!isalnum((unsigned char)*p) && *p != '.' && *p != '-' && *p != '_')
-      return false;
-    p++;
-  }
-  if (*p != '@')
-    return false; /* no @ → not a package */
-  p++;
-  if (!*p)
+  if (token.length != 47)
     return false;
-  /* Version part must contain at least one digit, dot, or hyphen
-   * (pure alphabetic is not a valid version, e.g. foo@bar is not a package) */
-  bool has_version_char = false;
-  while (*p) {
-    if (!isalnum((unsigned char)*p) && *p != '.' && *p != '-' && *p != '^' &&
-        *p != '~' && *p != '<' && *p != '>' && *p != '=')
+  for (size_t i = 0; i < 16; i++) {
+    size_t pos = i * 3;
+    if (!isxdigit((unsigned char)token.data[pos]) ||
+        !isxdigit((unsigned char)token.data[pos + 1]) ||
+        (i < 15 && token.data[pos + 2] != ':'))
       return false;
-    if (isdigit((unsigned char)*p) || *p == '.' || *p == '-')
-      has_version_char = true;
-    p++;
   }
-  return has_version_char;
+  return true;
 }
 
-static bool is_user(const char *token) {
-  /* Known Unix system accounts (conservative list).
-   * Excludes accounts that are commonly used as service/command names
-   * (e.g., postgres, mysql, nginx, redis, etc.) to avoid misclassifying
-   * service names in command arguments. */
-  static const char *known_users[] = {"root",
+static bool span_is_user(st_text_span_t token) {
+  static const char *const users[] = {"root",
                                       "nobody",
                                       "daemon",
                                       "bin",
@@ -1863,485 +1701,238 @@ static bool is_user(const char *token) {
                                       "oprofile",
                                       "oprofile-agent",
                                       NULL};
-  size_t len = strlen(token);
-  if (len < 1 || len > 32)
+  if (token.length == 0 || token.length > 32 ||
+      (!islower((unsigned char)token.data[0]) && token.data[0] != '_'))
     return false;
-  if (!islower((unsigned char)token[0]) && token[0] != '_')
-    return false;
-  for (size_t i = 1; i < len; i++) {
-    char c = token[i];
-    if (!islower((unsigned char)c) && !isdigit((unsigned char)c) && c != '_' &&
-        c != '-')
+  for (size_t i = 1; i < token.length; i++)
+    if (!islower((unsigned char)token.data[i]) &&
+        !isdigit((unsigned char)token.data[i]) && token.data[i] != '_' &&
+        token.data[i] != '-')
       return false;
-  }
-  /* Must be in the known list */
-  for (const char **u = known_users; *u; u++) {
-    if (strcmp(token, *u) == 0)
+  for (const char *const *user = users; *user; user++)
+    if (span_eq(token, *user))
       return true;
-  }
   return false;
 }
 
-static bool is_fingerprint(const char *token) {
-  /* SSH key fingerprint:
-   * Form 1: SHA256: followed by 43 base64 chars (no padding)
-   * Form 2: 16 pairs of 2-hex-digit groups separated by colons (MD5) */
-  size_t len = strlen(token);
-
-  /* SHA256 form */
-  if (strncmp(token, "SHA256:", 7) == 0) {
-    if (len != 50)
-      return false; /* SHA256: + 43 chars */
-    for (size_t i = 7; i < len; i++) {
-      char c = token[i];
-      if (!isalnum((unsigned char)c) && c != '+' && c != '/' && c != '=')
-        return false;
-    }
-    return true;
-  }
-
-  /* MD5 form: xx:xx:xx:... (16 groups, 15 colons, total 47 chars) */
-  if (len != 47)
-    return false;
-  for (int i = 0; i < 16; i++) {
-    size_t pos = (size_t)i * 3;
-    if (!isxdigit((unsigned char)token[pos]) ||
-        !isxdigit((unsigned char)token[pos + 1]))
-      return false;
-    if (i < 15 && token[pos + 2] != ':')
-      return false;
-  }
-  return true;
-}
-
-/* --- REGEX DETECTION HELPERS (context-aware) --- */
-
-static bool is_regex_context(const char *prev) {
-  static const char *cmds[] = {"sed",   "awk", "perl", "grep", "egrep",
-                               "fgrep", "rg",  "ag",   NULL};
-  for (const char **c = cmds; *c; c++) {
-    if (strcmp(prev, *c) == 0)
+static bool span_is_regex_context(st_text_span_t token) {
+  static const char *const contexts[] = {
+      "sed", "awk", "perl", "grep", "egrep", "fgrep", "rg", "ag", "-e",
+      "-E",  "-P",  "-pe",  "-ne",  "-pie",  "-nle",  "-F", NULL};
+  for (const char *const *context = contexts; *context; context++)
+    if (span_eq(token, *context))
       return true;
-  }
-  /* Flags that introduce a regex argument */
-  if (strcmp(prev, "-e") == 0 || strcmp(prev, "-E") == 0 ||
-      strcmp(prev, "-P") == 0 || strcmp(prev, "-pe") == 0 ||
-      strcmp(prev, "-ne") == 0 || strcmp(prev, "-pie") == 0 ||
-      strcmp(prev, "-nle") == 0 || strcmp(prev, "-F") == 0)
-    return true;
   return false;
 }
 
-static bool has_regex_metachar(const char *token) {
-  /* Must contain at least one regex metacharacter.
-   * Exclude bare '/' - too many false positives with paths. */
-  static const char metachar[] = "[]*+?{}|\\^$()";
-  for (const char *p = token; *p; p++) {
-    if (strchr(metachar, *p))
+static bool span_has_regex_metachar(st_text_span_t token) {
+  static const char metacharacters[] = "[]*+?{}|\\^$()";
+  for (size_t i = 0; i < token.length; i++)
+    if (strchr(metacharacters, token.data[i]))
       return true;
-  }
   return false;
 }
 
-/* --- GLOB, RANGE, SIGNAL, USER_GROUP, PERM_OCTAL DETECTION --- */
-
-static bool is_glob_pattern(const char *token) {
-  /* Must contain at least one of * ? [ and no shell operators.
-   * Reject if it starts with / (absolute path) or looks like an option. */
-  if (token[0] == '-' || token[0] == '/')
+static bool span_is_glob_pattern(st_text_span_t token) {
+  if (token.length == 0 || token.data[0] == '-' || token.data[0] == '/')
     return false;
-  bool has_wild = false;
-  bool in_bracket = false;
-  for (const char *p = token; *p; p++) {
-    if (*p == '*' || *p == '?') {
-      has_wild = true;
-      continue;
-    }
-    if (*p == '[') {
-      has_wild = true;
-      in_bracket = true;
-      continue;
-    }
-    if (*p == ']' && in_bracket) {
-      in_bracket = false;
-      continue;
-    }
-    if (strchr("|&;<>()", *p))
+  bool wild = false, bracket = false;
+  for (size_t i = 0; i < token.length; i++) {
+    char c = token.data[i];
+    if (c == '*' || c == '?')
+      wild = true;
+    else if (c == '[')
+      wild = bracket = true;
+    else if (c == ']' && bracket)
+      bracket = false;
+    else if (strchr("|&;<>()", c))
       return false;
   }
-  return has_wild && !in_bracket;
+  return wild && !bracket;
 }
 
-static bool is_range(const char *token) {
-  /* Numeric range: digits with exactly one hyphen separator.
-   * Reject multiple hyphens (1-2-3) and comma-only (0,30 -> cron). */
-  size_t len = strlen(token);
-  if (len < 2)
+static bool span_is_range(st_text_span_t token) {
+  if (token.length < 2)
     return false;
-  size_t hyphen_count = 0;
-  for (size_t i = 0; i < len; i++) {
-    if (token[i] == '-')
-      hyphen_count++;
-    else if (!isdigit((unsigned char)token[i]))
+  size_t hyphens = 0;
+  for (size_t i = 0; i < token.length; i++) {
+    if (token.data[i] == '-')
+      hyphens++;
+    else if (!isdigit((unsigned char)token.data[i]))
       return false;
   }
-  return hyphen_count == 1;
+  return hyphens == 1;
 }
 
-static bool is_signal(const char *token) {
-  /* Known signal names (with optional SIG prefix) or numeric 1-31 */
-  static const char *signals[] = {
+static bool span_is_signal(st_text_span_t token) {
+  static const char *const signals[] = {
       "HUP",  "INT",    "QUIT", "ILL",   "TRAP", "ABRT", "BUS",  "FPE",
       "KILL", "USR1",   "SEGV", "USR2",  "PIPE", "ALRM", "TERM", "STKFLT",
       "CHLD", "CONT",   "STOP", "TSTP",  "TTIN", "TTOU", "URG",  "XCPU",
       "XFSZ", "VTALRM", "PROF", "WINCH", "POLL", "PWR",  "SYS",  NULL};
-  for (const char **s = signals; *s; s++) {
-    if (strcmp(token, *s) == 0)
+  for (const char *const *signal = signals; *signal; signal++) {
+    if (span_eq(token, *signal))
       return true;
-    char buf[16];
-    snprintf(buf, sizeof(buf), "SIG%s", *s);
-    if (strcmp(token, buf) == 0)
+    size_t length = strlen(*signal);
+    if (token.length == length + 3 && span_starts(token, "SIG") &&
+        memcmp(token.data + 3, *signal, length) == 0)
       return true;
   }
-  /* Numeric signals 1-31: only match if clearly signal-like context.
-   * Standalone numbers like "2" are just numbers, not signals.
-   * Signal numbers are typically after "kill" or "-s" which is handled
-   * by context in st_classify. */
   return false;
 }
 
-static bool is_user_group(const char *token) {
-  /* user:group - one colon, non-empty parts, alnum/_/-.
-   * Requires lowercase in both parts (unix usernames/groups are lowercase).
-   * Reject dots and slashes to filter image refs.
-   * Also require user part to have a hyphen or be longer than typical image
-   * names (e.g., "nginx" -> image, "www-data" -> user). */
-  const char *colon = strchr(token, ':');
-  if (!colon || colon == token || colon[1] == '\0')
+static bool span_is_user_group(st_text_span_t token) {
+  const char *colon = span_find(token, ':');
+  if (!colon || colon == token.data || colon + 1 == token.data + token.length ||
+      span_find(
+          (st_text_span_t){colon + 1,
+                           token.length - (size_t)(colon - token.data) - 1},
+          ':') ||
+      span_has(token, '.') || span_has(token, '/') ||
+      (!islower((unsigned char)token.data[0]) && token.data[0] != '_'))
     return false;
-  if (strchr(colon + 1, ':'))
-    return false;
-  if (strchr(token, '.') || strchr(token, '/'))
-    return false;
-  /* User part must start with lowercase letter or underscore */
-  if (!islower((unsigned char)token[0]) && token[0] != '_')
-    return false;
-  /* User part must have at least one hyphen to distinguish from image names,
-   * or be a known system account pattern (root, nobody, daemon, etc.) */
-  size_t user_len = (size_t)(colon - token);
-  bool has_hyphen = (strchr(token, '-') != NULL);
-  /* Known system accounts and common user names that should be
-   * recognized as user:group (even without hyphen in username) */
-  static const char *known_users[] = {"root",
-                                      "nobody",
-                                      "daemon",
-                                      "bin",
-                                      "sys",
-                                      "adm",
-                                      "tty",
-                                      "disk",
-                                      "lp",
-                                      "mail",
-                                      "news",
-                                      "uucp",
-                                      "man",
-                                      "proxy",
-                                      "www-data",
-                                      "backup",
-                                      "list",
-                                      "irc",
-                                      "gnats",
-                                      "systemd",
-                                      "systemd-network",
-                                      "systemd-resolve",
-                                      "systemd-timesync",
-                                      "_apt",
-                                      "messagebus",
-                                      "systemd-coredump",
-                                      "rpc",
-                                      "rpcuser",
-                                      "nfsnobody",
-                                      "saslauth",
-                                      "ldap",
-                                      "postfix",
-                                      "dovecot",
-                                      "clamav",
-                                      "amavis",
-                                      "spamassassin",
-                                      "tcpdump",
-                                      "avahi",
-                                      "bluetooth",
-                                      "audio",
-                                      "video",
-                                      "games",
-                                      "cdrom",
-                                      "floppy",
-                                      "tape",
-                                      "dialout",
-                                      "fax",
-                                      "voice",
-                                      "cdwriter",
-                                      "scanner",
-                                      "kmem",
-                                      "wheel",
-                                      "users",
-                                      "input",
-                                      "kvm",
-                                      "render",
-                                      "sgx",
-                                      "dip",
-                                      "postgres",
-                                      "mysql",
-                                      "redis",
-                                      "apache",
-                                      "vagrant",
-                                      "guest",
-                                      "ubuntu",
-                                      "deploy",
-                                      "jenkins",
-                                      "builder",
-                                      "runner",
-                                      "alice",
-                                      "bob",
-                                      "charlie",
-                                      "dave",
-                                      "eve",
-                                      "frank",
-                                      NULL};
-  bool is_known_user = false;
-  for (const char **p = known_users; *p; p++) {
-    if (strncmp(token, *p, user_len) == 0 && (*p)[user_len] == '\0') {
-      is_known_user = true;
-      break;
+  size_t user_length = (size_t)(colon - token.data);
+  bool hyphen = span_has(token, '-');
+  if (!hyphen && !span_is_user((st_text_span_t){token.data, user_length})) {
+    static const char *const common_users[] = {
+        "postgres", "mysql",   "redis",   "apache",  "vagrant", "guest",
+        "ubuntu",   "deploy",  "jenkins", "builder", "runner",  "alice",
+        "bob",      "charlie", "dave",    "eve",     "frank",   NULL};
+    bool known = false;
+    st_text_span_t user = {token.data, user_length};
+    for (const char *const *candidate = common_users; *candidate; candidate++)
+      if (span_eq(user, *candidate))
+        known = true;
+    if (!known)
+      return false;
+  }
+  bool user_lower = false, group_lower = false;
+  for (size_t i = 0; i < token.length; i++) {
+    char c = token.data[i];
+    if (i == user_length)
+      continue;
+    if (!isalnum((unsigned char)c) && c != '_' && c != '-')
+      return false;
+    if (islower((unsigned char)c)) {
+      if (i < user_length)
+        user_lower = true;
+      else
+        group_lower = true;
     }
   }
-  if (!has_hyphen && !is_known_user)
+  return user_lower && group_lower;
+}
+
+static bool span_is_perm_octal(st_text_span_t token) {
+  if (token.length != 3 && token.length != 4)
     return false;
-  /* Both parts must have at least one lowercase letter */
-  bool has_lower_user = false, has_lower_group = false;
-  for (const char *p = token; p < colon; p++) {
-    if (!isalnum((unsigned char)*p) && *p != '_' && *p != '-')
+  if (token.length == 3 && token.data[1] < '4')
+    return false;
+  if (token.length == 4 &&
+      ((token.data[0] == '1' || token.data[0] == '2') && token.data[1] < '4'))
+    return false;
+  for (size_t i = 0; i < token.length; i++)
+    if (token.data[i] < '0' || token.data[i] > '7')
       return false;
-    if (islower((unsigned char)*p))
-      has_lower_user = true;
-  }
-  for (const char *p = colon + 1; *p; p++) {
-    if (!isalnum((unsigned char)*p) && *p != '_' && *p != '-')
-      return false;
-    if (islower((unsigned char)*p))
-      has_lower_group = true;
-  }
-  if (!has_lower_user)
-    return false;
-  if (!has_lower_group)
-    return false;
   return true;
 }
 
-static bool is_perm_octal(const char *token) {
-  /* 3 octal digits (755, 644) or 4 digits with first digit 0-3
-   * (setuid/setgid/sticky bits 1000-3777). Reject ambiguous forms
-   * that look like years (4-digit starting with 2-3 where last 3 digits
-   * form a year pattern like 020, 025, etc.). */
-  size_t len = strlen(token);
-  if (len == 3) {
-    /* 3-digit: all must be 0-7 (e.g., 755, 644).
-     * Second digit must be 4-7 to distinguish from timestamps/years.
-     * (0444 has digit[1]=4, passes; 123 has digit[1]=2, fails) */
-    for (size_t i = 0; i < 3; i++) {
-      if (token[i] < '0' || token[i] > '7')
-        return false;
-    }
-    if (token[1] < '4')
-      return false;
-    return true;
-  }
-  if (len != 4)
-    return false;
-  /* 4-digit: special bit (0-7) + permission bits (0-7).
-   * Reject 1xxx where second digit < 4 (1234 looks like year/month)
-   * and 2xxx where second digit < 4 (2014 looks like a year). */
-  if (token[0] == '1' && token[1] < '4')
-    return false;
-  if (token[0] == '2' && token[1] < '4')
-    return false;
-  for (size_t i = 0; i < 4; i++) {
-    if (token[i] < '0' || token[i] > '7')
-      return false;
-  }
-  return true;
+static st_token_type_t st_token_classify_span(st_text_span_t token) {
+  if (token.length == 0)
+    return ST_TYPE_LITERAL;
+  if (span_is_absolute_path(token))
+    return ST_TYPE_ABS_PATH;
+  if (span_is_url(token))
+    return ST_TYPE_URL;
+  if (span_is_ipv4(token))
+    return ST_TYPE_IPV4;
+  if (span_is_ipv6(token))
+    return ST_TYPE_IPV6;
+  if (span_is_mac(token))
+    return ST_TYPE_MAC;
+  if (span_is_hex_number(token))
+    return ST_TYPE_NUMBER;
+  if (span_is_uuid(token))
+    return ST_TYPE_UUID;
+  if (span_is_pkg(token))
+    return ST_TYPE_PKG;
+  if (span_is_email(token))
+    return ST_TYPE_EMAIL;
+  if (span_is_hostname(token))
+    return ST_TYPE_HOSTNAME;
+  if (span_is_size(token))
+    return ST_TYPE_SIZE;
+  if (span_is_semver(token))
+    return ST_TYPE_SEMVER;
+  if (span_is_perm_octal(token))
+    return ST_TYPE_PERM_OCTAL;
+  if (span_is_signal(token))
+    return ST_TYPE_SIGNAL;
+  if (span_is_decimal_number(token))
+    return ST_TYPE_NUMBER;
+  if (span_is_timestamp(token))
+    return ST_TYPE_TIMESTAMP;
+  if (span_is_duration(token))
+    return ST_TYPE_DURATION;
+  if (span_is_hash_algo(token))
+    return ST_TYPE_HASH_ALGO;
+  if (span_is_fingerprint(token))
+    return ST_TYPE_FINGERPRINT;
+  if (span_is_env_var(token))
+    return ST_TYPE_ENV_VAR;
+  if (span_is_user(token))
+    return ST_TYPE_USER;
+  if (span_is_range(token))
+    return ST_TYPE_RANGE;
+  if (span_is_cron_like(token))
+    return ST_TYPE_CRON;
+  if (span_is_hyphenated(token))
+    return ST_TYPE_HYPHENATED;
+  if (span_is_branch(token))
+    return ST_TYPE_BRANCH;
+  if (span_is_http_method(token))
+    return ST_TYPE_METHOD;
+  if (span_is_short_option(token))
+    return ST_TYPE_SHORTOPT;
+  if (span_is_long_option(token))
+    return ST_TYPE_LONGOPT;
+  if (span_is_sha(token))
+    return ST_TYPE_SHA;
+  if (span_is_hex_hash(token))
+    return ST_TYPE_HEXHASH;
+  if (span_is_user_group(token))
+    return ST_TYPE_USER_GROUP;
+  if (span_is_image(token))
+    return ST_TYPE_IMAGE;
+  if (span_is_glob_pattern(token))
+    return ST_TYPE_GLOB;
+  if (span_is_relative_path(token))
+    return ST_TYPE_REL_PATH;
+  if (span_is_filename(token))
+    return ST_TYPE_FILENAME;
+  if (span_has_whitespace(token))
+    return ST_TYPE_QUOTED_SPACE;
+  return ST_TYPE_LITERAL;
 }
 
 /* --- PUBLIC: CLASSIFY --- */
 
-st_token_type_t st_classify_token(const char *token) {
-  if (!token || !token[0])
+st_token_type_t st_token_classify(const char *token) {
+  if (!token)
     return ST_TYPE_LITERAL;
-
-  /* Absolute path */
-  if (is_absolute_path(token))
-    return ST_TYPE_ABS_PATH;
-
-  /* URL */
-  if (is_url(token))
-    return ST_TYPE_URL;
-
-  /* IPv4 */
-  if (is_ipv4(token))
-    return ST_TYPE_IPV4;
-
-  /* IPv6 - after IPv4, before hex number (both use hex digits + colons) */
-  if (is_ipv6(token))
-    return ST_TYPE_IPV6;
-
-  /* MAC address - after IPv6 (both use colon-separated hex) */
-  if (is_mac(token))
-    return ST_TYPE_MAC;
-
-  /* Hex number (0x...) - check before hex hash which requires alpha */
-  if (is_hex_number(token))
-    return ST_TYPE_NUMBER;
-
-  /* UUID */
-  if (is_uuid(token))
-    return ST_TYPE_UUID;
-
-  /* Package specifier (name[@ver], @scope/name[@ver]) - before email so
-   * versioned packages like lodash@4.17.21 go to PKG, not EMAIL */
-  if (is_pkg(token))
-    return ST_TYPE_PKG;
-
-  /* Email */
-  if (is_email(token))
-    return ST_TYPE_EMAIL;
-
-  /* Hostname */
-  if (is_hostname(token))
-    return ST_TYPE_HOSTNAME;
-
-  /* Size */
-  if (is_size(token))
-    return ST_TYPE_SIZE;
-
-  /* Semantic version */
-  if (is_semver(token))
-    return ST_TYPE_SEMVER;
-
-  /* Octal permission (755, 0644) - before decimal number and port */
-  if (is_perm_octal(token))
-    return ST_TYPE_PERM_OCTAL;
-
-  /* Signal name (HUP, SIGTERM) or numeric signal (1-31) - before decimal */
-  if (is_signal(token))
-    return ST_TYPE_SIGNAL;
-
-  /* Decimal number - check before hex hash which requires alpha */
-  if (is_decimal_number(token))
-    return ST_TYPE_NUMBER;
-
-  /* Timestamp (ISO 8601 date/time before option check to avoid misclassifying
-   * dates) */
-  if (is_timestamp(token))
-    return ST_TYPE_TIMESTAMP;
-
-  /* Duration (30s, 1.5h, 100ms) - after size (both are number+suffix) */
-  if (is_duration(token))
-    return ST_TYPE_DURATION;
-
-  /* Hash algorithm names (sha256, md5, etc.) */
-  if (is_hash_algo(token))
-    return ST_TYPE_HASH_ALGO;
-
-  /* SSH key fingerprint (SHA256:xxx or MD5 hex colons) */
-  if (is_fingerprint(token))
-    return ST_TYPE_FINGERPRINT;
-
-  /* Environment variable ($VAR, ${VAR}) */
-  if (is_env_var(token))
-    return ST_TYPE_ENV_VAR;
-
-  /* Unix username (lowercase, hyphens, underscores - before hyphenated check
-   * so known users like www-data go to USER, not HYPHENATED) */
-  if (is_user(token))
-    return ST_TYPE_USER;
-
-  /* Numeric range with hyphen (1-5, 10-20) - before hyphenated.
-   * Cron fields (star/5, 0,30) have stars/slashes/commas; pure numeric
-   * ranges like 1-5 have only digits and one hyphen. */
-  if (is_range(token))
-    return ST_TYPE_RANGE;
-
-  /* Cron schedule field checked after range. */
-  if (is_cron_like(token))
-    return ST_TYPE_CRON;
-  if (is_hyphenated(token))
-    return ST_TYPE_HYPHENATED;
-
-  /* Git branch/ref name (alnum, hyphens, slashes, dots) */
-  if (is_branch(token))
-    return ST_TYPE_BRANCH;
-
-  /* HTTP method (GET, POST, etc.) - after branch so git HEAD stays BRANCH */
-  if (is_http_method(token))
-    return ST_TYPE_METHOD;
-
-  /* Short option (-v, -la) or long option (--help, --verbose) */
-  if (is_short_option(token))
-    return ST_TYPE_SHORTOPT;
-  if (is_long_option(token))
-    return ST_TYPE_LONGOPT;
-
-  /* SHA/hash digest (7 or 9-64 lowercase hex chars) - checked before hex_hash
-   * so short and full digests become SHA, not HEXHASH. */
-  if (is_sha(token))
-    return ST_TYPE_SHA;
-
-  /* Hex hash (8+ hex chars with at least one letter, no 0x prefix) */
-  if (is_hex_hash(token))
-    return ST_TYPE_HEXHASH;
-
-  /* User:group specifier (root:docker) - before image (also has colon) */
-  if (is_user_group(token))
-    return ST_TYPE_USER_GROUP;
-
-  /* Container image reference ([reg/]name[:tag][@digest]) - before
-   * relative_path and filename so docker-style refs with : are classified as
-   * IMAGE. Requires : or @ to avoid misclassifying plain paths. */
-  if (is_image(token))
-    return ST_TYPE_IMAGE;
-
-  /* Glob pattern (*.txt, file?.log, [abc]) - before relative_path */
-  if (is_glob_pattern(token))
-    return ST_TYPE_GLOB;
-
-  /* Relative path (has / or ..) */
-  if (is_relative_path(token))
-    return ST_TYPE_REL_PATH;
-
-  /* Filename (has ., no /) */
-  if (is_filename(token))
-    return ST_TYPE_FILENAME;
-
-  /* Words are LITERAL by default - they could be command names,
-   * subcommands, or fixed arguments. Only classify as #w when
-   * the context indicates a variable position (after long flags,
-   * redirections, etc.) - handled by the caller. */
-
-  /* Quoted string with whitespace */
-  if (has_whitespace(token))
-    return ST_TYPE_QUOTED_SPACE;
-
-  /* Default: literal */
-  return ST_TYPE_LITERAL;
+  return st_token_classify_span((st_text_span_t){token, strlen(token)});
 }
 
 /* --- CANONICAL NETSTRING ARGV DECODING --- */
 
-static st_error_t validate_netargv(const char *netargv, size_t *out_count) {
-  size_t encoded_length = strlen(netargv);
+static st_error_t validate_netargv_view(st_netargv_view_t netargv,
+                                        size_t *out_count) {
+  if ((!netargv.data && netargv.length != 0) ||
+      (netargv.data && memchr(netargv.data, '\0', netargv.length)))
+    return ST_ERR_FORMAT;
   size_t count = 0;
   shell_netstring_iter_t iter;
-  if (shell_netstring_iter_init(&iter, netargv, encoded_length) !=
+  if (shell_netstring_iter_init(&iter, netargv.data, netargv.length) !=
       SHELL_NETSTRING_OK)
     return ST_ERR_FORMAT;
   shell_netstring_view_t view;
@@ -2360,18 +1951,155 @@ static st_error_t validate_netargv(const char *netargv, size_t *out_count) {
   return ST_OK;
 }
 
+static st_token_type_t classify_netargv_span(st_text_span_t token,
+                                             bool after_long_option,
+                                             bool after_signal_option,
+                                             bool after_regex_command) {
+  if (after_long_option)
+    return st_token_classify_span(token);
+  if (after_signal_option && token.length != 0 && token.data[0] != '-' &&
+      span_is_decimal_number(token)) {
+    unsigned long number = 0;
+    for (size_t i = 0; i < token.length && number <= 31; i++)
+      number = number * 10u + (unsigned long)(token.data[i] - '0');
+    if (number >= 1 && number <= 31)
+      return ST_TYPE_SIGNAL;
+  }
+  if (after_regex_command &&
+      (span_has_regex_metachar(token) || span_has(token, '/')))
+    return ST_TYPE_REGEX;
+  return span_has(token, '=') ? ST_TYPE_LITERAL : st_token_classify_span(token);
+}
+
+static void netargv_context_after_span(st_text_span_t token,
+                                       bool *after_long_option,
+                                       bool *after_signal_option,
+                                       bool *after_regex_command) {
+  *after_long_option =
+      token.length >= 2 && token.data[0] == '-' && token.data[1] == '-' &&
+      !span_find((st_text_span_t){token.data + 2, token.length - 2}, '=');
+  *after_signal_option = span_eq(token, "kill") || span_eq(token, "-s");
+  *after_regex_command = span_is_regex_context(token);
+}
+
+st_error_t st_netargv_classify_scratch_view(st_netargv_view_t netargv,
+                                            st_token_scratch_t *scratch) {
+  if (scratch)
+    memset(scratch, 0, sizeof(*scratch));
+  if ((!netargv.data && netargv.length != 0) || !scratch)
+    return ST_ERR_INVALID;
+
+  size_t raw_count = 0;
+  st_error_t error = validate_netargv_view(netargv, &raw_count);
+  if (error != ST_OK)
+    return error;
+  if (raw_count == 0)
+    return ST_OK;
+
+  bool after_long_option = false;
+  bool after_signal_option = false;
+  bool after_regex_command = false;
+  shell_netstring_iter_t iter;
+  if (shell_netstring_iter_init(&iter, netargv.data, netargv.length) !=
+      SHELL_NETSTRING_OK)
+    return ST_ERR_FORMAT;
+  for (size_t i = 0; i < raw_count; i++) {
+    shell_netstring_view_t view;
+    if (shell_netstring_iter_next(&iter, &view) != SHELL_NETSTRING_OK)
+      return ST_ERR_FORMAT;
+    /* Policy evaluation uses this fast scratch path for ordinary shell words.
+     * Preserve support for larger callback-expanded values by letting callers
+     * fall back to the owned classifier. */
+    if (view.payload_length >= ST_MAX_TOKEN_LEN)
+      return ST_ERR_FAILED;
+    char *tok = scratch->text[i];
+    memcpy(tok, view.payload, view.payload_length);
+    tok[view.payload_length] = '\0';
+    scratch->tokens[i].text = tok;
+
+    st_text_span_t token = {(const char *)view.payload, view.payload_length};
+    scratch->tokens[i].type = classify_netargv_span(
+        token, after_long_option, after_signal_option, after_regex_command);
+    scratch->count++;
+    netargv_context_after_span(token, &after_long_option, &after_signal_option,
+                               &after_regex_command);
+  }
+  return ST_OK;
+}
+
+st_error_t st_netargv_visit_view(st_netargv_view_t netargv,
+                                 st_netargv_token_visitor_t visitor,
+                                 void *user_ctx, size_t *visited_count) {
+  if (visited_count)
+    *visited_count = 0;
+  if ((!netargv.data && netargv.length != 0) || !visitor)
+    return ST_ERR_INVALID;
+
+  size_t count = 0;
+  st_error_t error = validate_netargv_view(netargv, &count);
+  if (error != ST_OK)
+    return error;
+
+  bool after_long_option = false;
+  bool after_signal_option = false;
+  bool after_regex_command = false;
+  size_t visited = 0;
+  shell_netstring_iter_t iter;
+  if (shell_netstring_iter_init(&iter, netargv.data, netargv.length) !=
+      SHELL_NETSTRING_OK)
+    return ST_ERR_FORMAT;
+
+  for (size_t i = 0; i < count; i++) {
+    shell_netstring_view_t record;
+    if (shell_netstring_iter_next(&iter, &record) != SHELL_NETSTRING_OK) {
+      error = ST_ERR_FORMAT;
+      break;
+    }
+    st_text_span_t text = {(const char *)record.payload, record.payload_length};
+    st_token_view_t token = {
+        .text = (const char *)record.payload,
+        .text_length = record.payload_length,
+        .type = classify_netargv_span(text, after_long_option,
+                                      after_signal_option, after_regex_command),
+    };
+    visited++;
+    netargv_context_after_span(text, &after_long_option, &after_signal_option,
+                               &after_regex_command);
+    if (!visitor(&token, user_ctx))
+      break;
+  }
+
+  if (visited_count)
+    *visited_count = visited;
+  return error;
+}
+
+st_error_t st_netargv_visit(const char *netargv,
+                            st_netargv_token_visitor_t visitor, void *user_ctx,
+                            size_t *visited_count) {
+  if (!netargv) {
+    if (visited_count)
+      *visited_count = 0;
+    return ST_ERR_INVALID;
+  }
+  return st_netargv_visit_view(
+      (st_netargv_view_t){.data = netargv, .length = strlen(netargv)}, visitor,
+      user_ctx, visited_count);
+}
+
 /* --- PUBLIC API: NETSTRING ARGV CLASSIFICATION --- */
 
-st_error_t st_classify(const char *netargv, st_token_array_t *out) {
+st_error_t st_netargv_classify_view(st_netargv_view_t netargv,
+                                    st_token_array_t *out) {
   if (out) {
     out->tokens = NULL;
     out->count = 0;
   }
-  if (!netargv || !out)
+  if ((!netargv.data && netargv.length != 0) || !out)
     return ST_ERR_INVALID;
 
   size_t raw_count = 0;
-  st_error_t decode_error = validate_netargv(netargv, &raw_count);
+  st_error_t decode_error = validate_netargv_view(netargv, &raw_count);
   if (decode_error != ST_OK)
     return decode_error;
 
@@ -2385,9 +2113,11 @@ st_error_t st_classify(const char *netargv, st_token_array_t *out) {
     return ST_ERR_MEMORY;
   out->count = 0;
 
-  const char *prev = NULL;
+  bool after_long_option = false;
+  bool after_signal_option = false;
+  bool after_regex_command = false;
   shell_netstring_iter_t iter;
-  if (shell_netstring_iter_init(&iter, netargv, strlen(netargv)) !=
+  if (shell_netstring_iter_init(&iter, netargv.data, netargv.length) !=
       SHELL_NETSTRING_OK)
     goto fail;
   for (size_t i = 0; i < raw_count; i++) {
@@ -2401,74 +2131,45 @@ st_error_t st_classify(const char *netargv, st_token_array_t *out) {
       goto fail;
     out->tokens[out->count].text = tok;
 
-    /* Long flag (--something) followed by a separate token → next token is a
-     * value. Short flags (-X, -la) are kept as literals; we don't generalise
-     * their values. */
-    if (prev && prev[0] == '-' && prev[1] == '-' &&
-        strchr(prev + 2, '=') == NULL) {
-      /* This token is a value after a long flag */
-      out->tokens[out->count].type = st_classify_token(tok);
-      out->count++;
-      prev = tok;
-      continue;
-    }
-
-    /* Signal number after kill/-s: classify as SIGNAL instead of NUMBER */
-    if (prev && (strcmp(prev, "kill") == 0 || strcmp(prev, "-s") == 0) &&
-        is_decimal_number(tok) && tok[0] != '-') {
-      long n = strtol(tok, NULL, 10);
-      if (n >= 1 && n <= 31) {
-        out->tokens[out->count].type = ST_TYPE_SIGNAL;
-        out->count++;
-        prev = tok;
-        continue;
-      }
-    }
-
-    /* Regex pattern after regex-using commands (sed, awk, grep, perl, etc.)
-     * Must check before default classification because regex tokens like
-     * s/foo/bar/g would otherwise be misclassified as REL_PATH.
-     * Requires either metacharacters or at least 2 slashes (sed-style). */
-    if (prev && is_regex_context(prev) &&
-        (has_regex_metachar(tok) || strchr(tok, '/') != NULL)) {
-      out->tokens[out->count].type = ST_TYPE_REGEX;
-      out->count++;
-      prev = tok;
-      continue;
-    }
-
-    /* Concrete text and its lattice type are separate. Parameters are closed
-     * policy metadata; normalization must never synthesize a wildcard symbol
-     * by copying characters from a concrete value. */
-    out->tokens[out->count].type = st_classify_token(tok);
-    /* Compound candidates remain one concrete argv literal. Their internal
-     * value may be generalized later without turning it into another trie
-     * position or classifying the whole spelling from an embedded slash. */
-    if (strchr(tok, '=') != NULL)
-      out->tokens[out->count].type = ST_TYPE_LITERAL;
+    st_text_span_t token = {payload, length};
+    out->tokens[out->count].type = classify_netargv_span(
+        token, after_long_option, after_signal_option, after_regex_command);
     out->count++;
-    prev = tok;
+    netargv_context_after_span(token, &after_long_option, &after_signal_option,
+                               &after_regex_command);
   }
 
   return ST_OK;
 
 fail:
   for (size_t i = 0; i < out->count; i++)
-    free(out->tokens[i].text);
+    free((void *)out->tokens[i].text);
   free(out->tokens);
   out->tokens = NULL;
   out->count = 0;
   return ST_ERR_MEMORY;
 }
 
-void st_free_token_array(st_token_array_t *arr) {
+st_error_t st_netargv_classify(const char *netargv, st_token_array_t *out) {
+  if (!netargv) {
+    if (out) {
+      out->tokens = NULL;
+      out->count = 0;
+    }
+    return ST_ERR_INVALID;
+  }
+  return st_netargv_classify_view(
+      (st_netargv_view_t){.data = netargv, .length = strlen(netargv)}, out);
+}
+
+void st_token_array_free(st_token_array_t *arr) {
   if (!arr)
     return;
   for (size_t i = 0; i < arr->count; i++) {
-    free(arr->tokens[i].text);
-    free(arr->tokens[i].prefix);
-    free(arr->tokens[i].capture);
-    free(arr->tokens[i].suffix);
+    free((void *)arr->tokens[i].text);
+    free((void *)arr->tokens[i].prefix);
+    free((void *)arr->tokens[i].capture);
+    free((void *)arr->tokens[i].suffix);
   }
   free(arr->tokens);
   arr->tokens = NULL;

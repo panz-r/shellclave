@@ -48,7 +48,7 @@ void print_whitelist_check(const char *name) {
   print_banner("2. WHITELIST CHECK");
 
   printf("%sVariable name: %s\n", INDENT, name);
-  bool is_whitelisted = env_screener_is_whitelisted(name);
+  bool is_whitelisted = shell_env_screener_is_whitelisted(name);
   printf("%sIs whitelisted: %s\n", INDENT,
          is_whitelisted ? "YES (skip)" : "NO");
 
@@ -81,8 +81,8 @@ void print_entropy_analysis(const char *value, bool has_prefix,
   } else {
     printf("%sHas secret prefix: NO\n", INDENT);
     printf("%sShannon entropy (full value): %.4f bits/char\n", INDENT,
-           env_screener_calculate_entropy(value));
-    shannon = env_screener_calculate_entropy(value);
+           shell_env_screener_calculate_entropy(value));
+    shannon = shell_env_screener_calculate_entropy(value);
   }
 
   printf("%sMaximum possible entropy: 8.0 bits/char\n", INDENT);
@@ -90,8 +90,8 @@ void print_entropy_analysis(const char *value, bool has_prefix,
 
   printf("\n%sRelative Permutation Entropy (5 permutations):\n", INDENT);
 
-  double rel_conditional = relative_conditional_entropy(value, 5);
-  double rel_ratio_2gram = relative_entropy_ratio(value, 5, 2);
+  double rel_conditional = shell_rpe_relative_conditional_entropy(value, 5);
+  double rel_ratio_2gram = shell_rpe_relative_entropy_ratio(value, 5, 2);
 
   printf("%s  - Conditional entropy ratio: %.4f\n", INDENT, rel_conditional);
   if (rel_conditional > 1.0) {
@@ -119,12 +119,13 @@ void print_entropy_analysis(const char *value, bool has_prefix,
 void print_pattern_checks(const char *name, const char *value) {
   print_banner("5. PATTERN CHECKS");
 
-  bool has_name_pattern = env_screener_is_secret_pattern(name);
+  bool has_name_pattern = shell_env_screener_is_secret_pattern(name);
   printf("%sName matches secret pattern (KEY, SECRET, TOKEN, etc.): %s\n",
          INDENT, has_name_pattern ? "YES" : "NO");
 
   double suffix_entropy;
-  bool has_prefix = check_secret_prefix(value, &suffix_entropy);
+  bool has_prefix =
+      shell_env_screener_check_secret_prefix(value, &suffix_entropy);
   printf("%sValue has known secret prefix: %s\n", INDENT,
          has_prefix ? "YES" : "NO");
   if (has_prefix) {
@@ -133,11 +134,11 @@ void print_pattern_checks(const char *name, const char *value) {
            INDENT);
   }
 
-  bool is_path = looks_like_path(value);
+  bool is_path = shell_env_screener_looks_like_path(value);
   printf("%sValue looks like a path: %s\n", INDENT,
          is_path ? "YES (negative indicator)" : "NO");
 
-  bool is_base64 = looks_like_base64(value);
+  bool is_base64 = shell_env_screener_looks_like_base64(value);
   printf("%sValue looks like base64: %s\n", INDENT, is_base64 ? "YES" : "NO");
 }
 
@@ -271,8 +272,8 @@ void print_usage(const char *prog) {
 
 int main(int argc, char **argv) {
   const char *var_eq_value = NULL;
-  double threshold = ENV_SCREENER_POSTERIOR_THRESHOLD;
-  int min_length = ENV_SCREENER_MIN_LENGTH;
+  double threshold = SHELL_ENV_SCREENER_POSTERIOR_THRESHOLD;
+  int min_length = SHELL_ENV_SCREENER_MIN_LENGTH;
 
   int opt;
   while ((opt = getopt(argc, argv, "t:m:h")) != -1) {
@@ -327,7 +328,7 @@ int main(int argc, char **argv) {
 
   print_value_analysis(name, value);
 
-  bool whitelisted = env_screener_is_whitelisted(name);
+  bool whitelisted = shell_env_screener_is_whitelisted(name);
   print_whitelist_check(name);
 
   if (whitelisted) {
@@ -356,28 +357,29 @@ int main(int argc, char **argv) {
   }
 
   double suffix_entropy = 0;
-  bool has_prefix = check_secret_prefix(value, &suffix_entropy);
+  bool has_prefix =
+      shell_env_screener_check_secret_prefix(value, &suffix_entropy);
 
   double shannon;
   if (has_prefix && suffix_entropy > 0) {
     shannon = suffix_entropy;
   } else {
-    shannon = env_screener_calculate_entropy(value);
+    shannon = shell_env_screener_calculate_entropy(value);
   }
 
-  double rel_conditional = relative_conditional_entropy(value, 5);
-  double rel_ratio_2gram = relative_entropy_ratio(value, 5, 2);
+  double rel_conditional = shell_rpe_relative_conditional_entropy(value, 5);
+  double rel_ratio_2gram = shell_rpe_relative_entropy_ratio(value, 5, 2);
 
   print_entropy_analysis(value, has_prefix, suffix_entropy);
 
-  bool has_name_pattern = env_screener_is_secret_pattern(name);
-  bool is_path = looks_like_path(value);
+  bool has_name_pattern = shell_env_screener_is_secret_pattern(name);
+  bool is_path = shell_env_screener_looks_like_path(value);
 
   print_pattern_checks(name, value);
   print_bayesian_scoring(shannon, rel_conditional, rel_ratio_2gram, has_prefix,
                          has_name_pattern, is_path);
 
-  double score = env_screener_combined_score_name(name, value);
+  double score = shell_env_screener_combined_score_name(name, value);
   print_threshold_decision(score, threshold);
   print_summary(name, value, score, false, true, threshold);
 

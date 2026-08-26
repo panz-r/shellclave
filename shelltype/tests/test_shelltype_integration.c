@@ -2,6 +2,7 @@
 
 #include "shelltype.h"
 #include "test_netargv.h"
+#include "trie_internal.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -82,7 +83,7 @@ static int suggestions_replay_exactly(const st_suggestion_t *suggestions,
     if (!policy ||
         test_st_policy_add(policy, suggestions[i].pattern) != ST_OK) {
       st_policy_free(policy);
-      st_policy_ctx_free(context);
+      st_policy_ctx_release(context);
       return 0;
     }
     uint32_t matches = 0;
@@ -90,13 +91,13 @@ static int suggestions_replay_exactly(const st_suggestion_t *suggestions,
       st_eval_result_t result = {0};
       if (test_st_policy_eval(policy, commands[command], &result) != ST_OK) {
         st_policy_free(policy);
-        st_policy_ctx_free(context);
+        st_policy_ctx_release(context);
         return 0;
       }
       matches += result.matches;
     }
     st_policy_free(policy);
-    st_policy_ctx_free(context);
+    st_policy_ctx_release(context);
     if (matches != suggestions[i].count)
       return 0;
   }
@@ -124,16 +125,19 @@ static int test_realistic_workload_matrix(void) {
       {"cat #p | grep *", 4, 1.0},
   };
 
-  st_learner_t *learner = st_learner_new(3, 0.0);
+  st_learner_t *learner = st_learner_new(
+      &(st_learner_config_t){.min_support = 3,
+                             .min_confidence = 0.0,
+                             .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
   ASSERT(learner != NULL);
   ASSERT(feed_all(learner, commands, sizeof(commands) / sizeof(commands[0])));
   size_t count = 0;
-  st_suggestion_t *suggestions = st_suggest(learner, &count);
+  st_suggestion_t *suggestions = st_learner_suggest(learner, &count);
   ASSERT(suggestions_equal(suggestions, count, expected,
                            sizeof(expected) / sizeof(expected[0])));
   ASSERT(suggestions_replay_exactly(suggestions, count, commands,
                                     sizeof(commands) / sizeof(commands[0])));
-  st_free_suggestions(suggestions, count);
+  st_suggestion_list_free(suggestions, count);
   st_learner_free(learner);
   return 1;
 }
@@ -156,7 +160,10 @@ static int test_large_dataset_ranking(void) {
       {"docker run #sopt #hyp bash", 15, 1.0},
       {"systemctl restart #hyp", 10, 1.0},
   };
-  st_learner_t *learner = st_learner_new(5, 0.01);
+  st_learner_t *learner = st_learner_new(
+      &(st_learner_config_t){.min_support = 5,
+                             .min_confidence = 0.01,
+                             .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
   ASSERT(learner != NULL);
   for (size_t family = 0; family < sizeof(families) / sizeof(families[0]);
        family++)
@@ -168,7 +175,7 @@ static int test_large_dataset_ranking(void) {
   ASSERT(learner->trie.total_commands == 100);
 
   size_t count = 0;
-  st_suggestion_t *suggestions = st_suggest(learner, &count);
+  st_suggestion_t *suggestions = st_learner_suggest(learner, &count);
   ASSERT(suggestions_equal(suggestions, count, expected,
                            sizeof(expected) / sizeof(expected[0])));
   const char *commands[100];
@@ -185,7 +192,7 @@ static int test_large_dataset_ranking(void) {
     }
   ASSERT(
       suggestions_replay_exactly(suggestions, count, commands, command_count));
-  st_free_suggestions(suggestions, count);
+  st_suggestion_list_free(suggestions, count);
   st_learner_free(learner);
   return 1;
 }

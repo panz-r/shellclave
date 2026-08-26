@@ -6,7 +6,7 @@
  *
  * Multiple policies share a context to deduplicate token strings across
  * policy sets. Chunks never move, so every interned pointer remains valid
- * until the context is reset or freed.
+ * until the context is reset or released.
  */
 
 #include "policy_ctx.h"
@@ -191,7 +191,7 @@ st_policy_ctx_t *st_policy_ctx_new_with_arena(size_t arena_size) {
   return ctx;
 }
 
-void st_policy_ctx_free(st_policy_ctx_t *ctx) {
+static void policy_ctx_destroy(st_policy_ctx_t *ctx) {
   if (!ctx)
     return;
   context_storage_free(ctx);
@@ -212,7 +212,7 @@ void st_policy_ctx_release(st_policy_ctx_t *ctx) {
   if (!ctx)
     return;
   if (atomic_fetch_sub(&ctx->refcount, 1) == 1) {
-    st_policy_ctx_free(ctx);
+    policy_ctx_destroy(ctx);
   }
 }
 
@@ -342,8 +342,4 @@ const char *st_policy_ctx_intern(st_policy_ctx_t *ctx, const char *str) {
   ctx->str_pool.count++;
   pthread_mutex_unlock(&ctx->lock);
   return copy;
-}
-
-st_error_t st_policy_ctx_compact(st_policy_ctx_t *ctx) {
-  return st_policy_ctx_reset(ctx);
 }

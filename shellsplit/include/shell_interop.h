@@ -1,6 +1,8 @@
 #ifndef SHELL_INTEROP_H
 #define SHELL_INTEROP_H
 
+#include "shell_tokenizer.h"
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -19,11 +21,10 @@ typedef struct shell_interop_handle shell_interop_handle_t;
 /* Create/destroy an interop parsing handle. Creation allocates parser state;
  * destroy releases it once parsing and result access are complete.
  */
-shell_interop_handle_t *shell_interop_create(void);
-void shell_interop_destroy(shell_interop_handle_t *handle);
+shell_interop_handle_t *shell_interop_new(void);
+void shell_interop_free(shell_interop_handle_t *handle);
 
-/* Parse a shell command and return subcommand count (0 on error, -1 if cmd too
- * long)
+/* Parse a shell command into the handle's bounded internal storage.
  *
  * Features are OR'd flags from shell_tokenizer.h:
  *   SHELL_FEAT_VARS       = 0x01  // $VAR, ${VAR}, $1
@@ -56,42 +57,40 @@ void shell_interop_destroy(shell_interop_handle_t *handle);
  *
  * `cmd` points to exactly `cmd_len` bytes and need not be null-terminated.
  * Embedded NUL bytes are rejected because they are not valid shell input.
+ * On success, `subcommand_count` receives the number of parsed subcommands.
+ * Every call clears the previous result before validating input.
  */
-int shell_interop_parse(shell_interop_handle_t *handle, const char *cmd,
-                        int cmd_len);
+shell_error_t shell_interop_parse(shell_interop_handle_t *handle,
+                                  const char *cmd, size_t cmd_len,
+                                  size_t *subcommand_count);
 
 /* Return the number of subcommands from the most recent successful parse. */
-int shell_interop_subcommand_count(shell_interop_handle_t *handle);
+size_t shell_interop_subcommand_count(const shell_interop_handle_t *handle);
 
-/* Return the command-subtype for subcommand index i (SHELL_TYPE_* flags), or 0
- * on invalid input. */
-int shell_interop_subcommand_type(shell_interop_handle_t *handle, int i);
+/* Copy range metadata for one subcommand. The range remains valid until the
+ * next parse on handle or shell_interop_free(handle). */
+bool shell_interop_subcommand_range(const shell_interop_handle_t *handle,
+                                    size_t index, shell_range_t *range);
 
-/* Return the feature bitmask describing shell features in subcommand index i,
- * or 0 on invalid input. */
-int shell_interop_subcommand_features(shell_interop_handle_t *handle, int i);
+/* Return a borrowed, non-NUL-terminated subcommand view. It remains valid
+ * until the next parse on handle or shell_interop_free(handle). */
+bool shell_interop_subcommand_view(const shell_interop_handle_t *handle,
+                                   size_t index, const char **data,
+                                   size_t *length);
 
-/* Return byte offset where subcommand i starts in the original command string.
- */
-int shell_interop_subcommand_start(shell_interop_handle_t *handle, int i);
+/* Return a heap-allocated NUL-terminated copy of one subcommand. The caller
+ * releases a successful result with free(). */
+char *shell_interop_subcommand_dup(const shell_interop_handle_t *handle,
+                                   size_t index);
 
-/* Return the byte length of subcommand i in the original command string. */
-int shell_interop_subcommand_len(shell_interop_handle_t *handle, int i);
+/* Format recognized feature flags into caller-owned storage. `written` gets
+ * the byte count excluding NUL. The output is cleared on failure. */
+shell_error_t shell_interop_format_features(uint32_t features, char *output,
+                                            size_t output_size,
+                                            size_t *written);
 
-/* Return heap-allocated copy of subcommand i text.
-   Caller must free the result with shell_interop_free_str(). */
-char *shell_interop_subcommand_str(shell_interop_handle_t *handle, int i);
-
-/* Free a string returned by shell_interop_*_str functions */
-void shell_interop_free_str(char *s);
-
-/* Get string representation of features (caller must free via
- * shell_interop_free_str) */
-char *shell_interop_features_str(int features);
-
-/* Get string representation of command type (caller must free via
- * shell_interop_free_str) */
-char *shell_interop_type_str(int type);
+/* Return the static display name for a command separator type. */
+const char *shell_interop_command_type_name(shell_cmd_type_t type);
 
 #ifdef __cplusplus
 }

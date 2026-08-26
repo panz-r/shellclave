@@ -63,12 +63,12 @@ static const char *secret_patterns[] = {"KEY",      "SECRET",     "TOKEN",
                                         "PASSWORD", "CREDENTIAL", "API",
                                         "AUTH",     "PRIVATE",    NULL};
 
-double env_screener_calculate_entropy(const char *str) {
+double shell_env_screener_calculate_entropy(const char *str) {
   if (!str || !str[0])
     return 0;
 
-  int freq[256] = {0};
-  int len = 0;
+  size_t freq[256] = {0};
+  size_t len = 0;
 
   while (str[len]) {
     freq[(unsigned char)str[len]]++;
@@ -76,7 +76,7 @@ double env_screener_calculate_entropy(const char *str) {
   }
 
   double entropy = 0;
-  for (int i = 0; i < 256; i++) {
+  for (size_t i = 0; i < 256; i++) {
     if (freq[i] > 0) {
       double p = (double)freq[i] / len;
       entropy -= p * log2(p);
@@ -85,7 +85,7 @@ double env_screener_calculate_entropy(const char *str) {
   return entropy;
 }
 
-bool env_screener_is_secret_pattern(const char *name) {
+bool shell_env_screener_is_secret_pattern(const char *name) {
   if (!name)
     return false;
 
@@ -97,7 +97,7 @@ bool env_screener_is_secret_pattern(const char *name) {
   return false;
 }
 
-bool env_screener_is_whitelisted(const char *name) {
+bool shell_env_screener_is_whitelisted(const char *name) {
   if (!name)
     return false;
 
@@ -116,7 +116,8 @@ bool env_screener_is_whitelisted(const char *name) {
  * prefix)
  * @return       true if known prefix detected
  */
-bool check_secret_prefix(const char *value, double *out_suffix_entropy) {
+bool shell_env_screener_check_secret_prefix(const char *value,
+                                            double *out_suffix_entropy) {
   if (!value || !value[0])
     return false;
 
@@ -129,7 +130,7 @@ bool check_secret_prefix(const char *value, double *out_suffix_entropy) {
       /* Found prefix - calculate entropy of suffix */
       if (out_suffix_entropy) {
         *out_suffix_entropy =
-            env_screener_calculate_entropy(value + prefix_len);
+            shell_env_screener_calculate_entropy(value + prefix_len);
       }
       return true;
     }
@@ -143,7 +144,7 @@ bool check_secret_prefix(const char *value, double *out_suffix_entropy) {
  * @param value  The value to check
  * @return      true if value looks like a path
  */
-bool looks_like_path(const char *value) {
+bool shell_env_screener_looks_like_path(const char *value) {
   if (!value || strlen(value) < 2)
     return false;
 
@@ -169,7 +170,7 @@ bool looks_like_path(const char *value) {
  * @param value  The value to check
  * @return      true if value appears to be base64 encoded
  */
-bool looks_like_base64(const char *value) {
+bool shell_env_screener_looks_like_base64(const char *value) {
   if (!value || strlen(value) < 4)
     return false;
 
@@ -210,7 +211,7 @@ bool looks_like_base64(const char *value) {
   return len >= 16;
 }
 
-int env_screener_recommended_capacity(void) { return 32; }
+size_t shell_env_screener_recommended_capacity(void) { return 32; }
 
 static const char *secret_pattern_in_span(const char *name, size_t name_len) {
   for (int i = 0; secret_patterns[i]; i++) {
@@ -225,10 +226,10 @@ static const char *secret_pattern_in_span(const char *name, size_t name_len) {
   return NULL;
 }
 
-static bool score_environment_entry(const char *entry, int min_length,
+static bool score_environment_entry(const char *entry, size_t min_length,
                                     double *out_score) {
   const char *eq = strchr(entry, '=');
-  if (!eq || eq == entry || !eq[1] || (int)strlen(eq + 1) < min_length)
+  if (!eq || eq == entry || !eq[1] || strlen(eq + 1) < min_length)
     return false;
 
   size_t name_len = (size_t)(eq - entry);
@@ -237,7 +238,7 @@ static bool score_environment_entry(const char *entry, int min_length,
   if (name_len < sizeof(name)) {
     memcpy(name, entry, name_len);
     name[name_len] = '\0';
-    if (env_screener_is_whitelisted(name))
+    if (shell_env_screener_is_whitelisted(name))
       return false;
     score_name = name;
   } else {
@@ -246,32 +247,30 @@ static bool score_environment_entry(const char *entry, int min_length,
     score_name = secret_pattern_in_span(entry, name_len);
   }
 
-  *out_score = env_screener_combined_score_name(score_name, eq + 1);
+  *out_score = shell_env_screener_combined_score_name(score_name, eq + 1);
   return true;
 }
 
-env_screener_status_t env_screener_scan(int *out_indices, int capacity,
-                                        int *out_count,
-                                        double posterior_threshold,
-                                        int min_length) {
+shell_env_screener_status_t
+shell_env_screener_scan(size_t *out_indices, size_t capacity, size_t *out_count,
+                        double posterior_threshold, size_t min_length) {
   extern char **environ;
 
   if (!out_count)
-    return ENV_SCREENER_ERROR;
+    return SHELL_ENV_SCREENER_ERROR;
   *out_count = 0;
-  if (!out_indices || capacity < 0 || min_length < 0 ||
-      !isfinite(posterior_threshold) || posterior_threshold < 0.0 ||
-      posterior_threshold > 1.0)
-    return ENV_SCREENER_ERROR;
+  if (!out_indices || !isfinite(posterior_threshold) ||
+      posterior_threshold < 0.0 || posterior_threshold > 1.0)
+    return SHELL_ENV_SCREENER_ERROR;
 
   if (!environ) {
-    return ENV_SCREENER_OK;
+    return SHELL_ENV_SCREENER_OK;
   }
 
-  int flagged = 0;
+  size_t flagged = 0;
 
   /* First pass: count how many would be flagged */
-  for (int i = 0; environ[i]; i++) {
+  for (size_t i = 0; environ[i]; i++) {
     double score;
     if (score_environment_entry(environ[i], min_length, &score) &&
         score > posterior_threshold)
@@ -281,12 +280,12 @@ env_screener_status_t env_screener_scan(int *out_indices, int capacity,
   /* Check capacity */
   if (flagged > capacity) {
     *out_count = flagged;
-    return ENV_SCREENER_BUFFER_TOO_SMALL;
+    return SHELL_ENV_SCREENER_BUFFER_TOO_SMALL;
   }
 
   /* Second pass: fill output array */
-  int out_idx = 0;
-  for (int i = 0; environ[i] && out_idx < capacity; i++) {
+  size_t out_idx = 0;
+  for (size_t i = 0; environ[i] && out_idx < capacity; i++) {
     double score;
     if (score_environment_entry(environ[i], min_length, &score) &&
         score > posterior_threshold)
@@ -294,7 +293,7 @@ env_screener_status_t env_screener_scan(int *out_indices, int capacity,
   }
 
   *out_count = out_idx;
-  return ENV_SCREENER_OK;
+  return SHELL_ENV_SCREENER_OK;
 }
 
 /**
@@ -405,27 +404,29 @@ static double combine_evidence(double posterior, bool has_prefix,
  * @param value  Variable value
  * @return      Probability 0.0-1.0 (higher = more likely to be a secret)
  */
-double env_screener_combined_score_name(const char *name, const char *value) {
+double shell_env_screener_combined_score_name(const char *name,
+                                              const char *value) {
   if (!value || strlen(value) < 8)
     return 0.0;
 
   /* Get entropy evidence - use suffix entropy if has prefix */
   double suffix_entropy = 0;
-  bool has_prefix = check_secret_prefix(value, &suffix_entropy);
+  bool has_prefix =
+      shell_env_screener_check_secret_prefix(value, &suffix_entropy);
 
   double shannon;
   if (has_prefix && suffix_entropy > 0) {
     shannon = suffix_entropy;
   } else {
-    shannon = env_screener_calculate_entropy(value);
+    shannon = shell_env_screener_calculate_entropy(value);
   }
 
-  double rel_conditional = relative_conditional_entropy(value, 5);
-  double rel_ratio_2gram = relative_entropy_ratio(value, 5, 2);
+  double rel_conditional = shell_rpe_relative_conditional_entropy(value, 5);
+  double rel_ratio_2gram = shell_rpe_relative_entropy_ratio(value, 5, 2);
 
   /* Get other evidence */
-  bool has_name_pattern = (name && env_screener_is_secret_pattern(name));
-  bool is_path = looks_like_path(value);
+  bool has_name_pattern = (name && shell_env_screener_is_secret_pattern(name));
+  bool is_path = shell_env_screener_looks_like_path(value);
 
   /* Calculate entropy-based posterior */
   double lh_entropy =
@@ -440,11 +441,11 @@ double env_screener_combined_score_name(const char *name, const char *value) {
 }
 
 /* Legacy function for backward compatibility */
-double env_screener_combined_score(const char *value) {
-  return env_screener_combined_score_name(NULL, value);
+double shell_env_screener_combined_score(const char *value) {
+  return shell_env_screener_combined_score_name(NULL, value);
 }
 
-const char *env_screener_get_whitelist_doc(void) {
+const char *shell_env_screener_get_whitelist_doc(void) {
   static char doc[2048] = {0};
   if (doc[0])
     return doc;

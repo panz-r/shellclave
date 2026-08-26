@@ -43,6 +43,27 @@
 
 #define SG_ANOMALY_MAX_KEY_LENGTH ((SG_ANOMALY_MAX_COMMAND_LENGTH + 1U) * 4U)
 
+static sg_anomaly_status_t anomaly_status_from_errno(int error) {
+  switch (error) {
+  case EINVAL:
+    return SG_ANOMALY_ERR_INVALID;
+  case ENOMEM:
+    return SG_ANOMALY_ERR_MEMORY;
+  case EPROTO:
+    return SG_ANOMALY_ERR_FORMAT;
+  case EOVERFLOW:
+    return SG_ANOMALY_ERR_LIMIT;
+  default:
+    return SG_ANOMALY_ERR_IO;
+  }
+}
+
+static sg_anomaly_status_t anomaly_failure_status(void) {
+  if (errno == 0)
+    errno = EIO;
+  return anomaly_status_from_errno(errno);
+}
+
 /* --- COUNT TABLE HELPERS --- */
 
 static uint64_t anomaly_hash_fn(const void *key, size_t key_len,
@@ -253,11 +274,14 @@ struct sg_anomaly_model {
   size_t unk_count;   /* count of unseen commands for probability estimation */
 };
 
-sg_anomaly_model_t *sg_anomaly_model_new(void) {
-  return sg_anomaly_model_new_ex(0.1, -10.0);
+void sg_anomaly_config_default(sg_anomaly_config_t *config) {
+  if (!config)
+    return;
+  config->alpha = 0.1;
+  config->unknown_log_prior = -10.0;
 }
 
-sg_anomaly_model_t *sg_anomaly_model_new_ex(double alpha, double unk_prior) {
+static sg_anomaly_model_t *anomaly_model_new(double alpha, double unk_prior) {
   sg_anomaly_model_t *m = calloc(1, sizeof(*m));
   if (!m)
     return NULL;
@@ -286,6 +310,23 @@ sg_anomaly_model_t *sg_anomaly_model_new_ex(double alpha, double unk_prior) {
     return NULL;
   }
   return m;
+}
+
+sg_anomaly_model_t *
+sg_anomaly_model_new_with_config(const sg_anomaly_config_t *config) {
+  sg_anomaly_config_t defaults;
+  if (!config) {
+    sg_anomaly_config_default(&defaults);
+    config = &defaults;
+  }
+  if (!isfinite(config->alpha) || config->alpha <= 0.0 ||
+      !isfinite(config->unknown_log_prior))
+    return NULL;
+  return anomaly_model_new(config->alpha, config->unknown_log_prior);
+}
+
+sg_anomaly_model_t *sg_anomaly_model_new(void) {
+  return sg_anomaly_model_new_with_config(NULL);
 }
 
 void sg_anomaly_model_free(sg_anomaly_model_t *model) {
@@ -505,10 +546,10 @@ sg_anomaly_status_t sg_anomaly_netseq_count(const char *netseq, size_t length,
   return validate_netseq(netseq, length, enforce_item_limit, count);
 }
 
-sg_anomaly_status_t sg_anomaly_score_netseq(const sg_anomaly_model_t *model,
-                                            const char *netseq,
-                                            size_t netseq_length,
-                                            double *score) {
+sg_anomaly_status_t
+sg_anomaly_model_score_netseq(const sg_anomaly_model_t *model,
+                              const char *netseq, size_t netseq_length,
+                              double *score) {
   if (score)
     *score = INFINITY;
   if (!model || !netseq || !score)
@@ -553,9 +594,9 @@ sg_anomaly_status_t sg_anomaly_score_netseq(const sg_anomaly_model_t *model,
   return SG_ANOMALY_OK;
 }
 
-sg_anomaly_status_t sg_anomaly_update_netseq(sg_anomaly_model_t *model,
-                                             const char *netseq,
-                                             size_t netseq_length) {
+sg_anomaly_status_t sg_anomaly_model_update_netseq(sg_anomaly_model_t *model,
+                                                   const char *netseq,
+                                                   size_t netseq_length) {
   if (!model || !netseq)
     return SG_ANOMALY_ERR_INVALID;
   size_t count = 0;
@@ -663,21 +704,29 @@ int sg_anomaly_write_stream(const sg_anomaly_model_t *model, FILE *f) {
   return 0;
 }
 
-int sg_anomaly_save(const sg_anomaly_model_t *model, const char *path) {
+sg_anomaly_status_t sg_anomaly_model_save(const sg_anomaly_model_t *model,
+                                          const char *path) {
   if (!model || !path) {
     errno = EINVAL;
-    return -1;
+    return SG_ANOMALY_ERR_INVALID;
   }
 
   FILE *f = fopen(path, "wb");
   if (!f)
-    return -1;
+    return anomaly_failure_status();
 
+  errno = 0;
   int result = sg_anomaly_write_stream(model, f);
+  int saved_errno = errno;
 
-  if (fclose(f) != 0)
+  if (fclose(f) != 0) {
     result = -1;
-  return result;
+    saved_errno = errno;
+  }
+  if (result == 0)
+    return SG_ANOMALY_OK;
+  errno = saved_errno;
+  return anomaly_failure_status();
 }
 
 static bool serialized_key_valid(const char *key, size_t length,
@@ -704,10 +753,14 @@ static int load_anomaly_stream(sg_anomaly_model_t *model, FILE *f) {
   if (!fgets(line, sizeof(line), f) ||
       (strcmp(line, "# anomaly-model-v5\n") != 0 &&
        strcmp(line, "# anomaly-model-v5\r\n") != 0)) {
+    if (ferror(f))
+      return -1;
     errno = EPROTO;
     return -1;
   }
   if (!fgets(line, sizeof(line), f)) {
+    if (ferror(f))
+      return -1;
     errno = EPROTO;
     return -1;
   }
@@ -750,6 +803,8 @@ static int load_anomaly_stream(sg_anomaly_model_t *model, FILE *f) {
         count > INT64_MAX || count > SIZE_MAX ||
         fread(&newline, 1, 1, f) != 1 || newline != '\n' || type < 1 ||
         type > 4 || !serialized_key_valid(key, key_len, type)) {
+      if (ferror(f))
+        return -1;
       errno = EPROTO;
       return -1;
     }
@@ -807,7 +862,7 @@ int sg_anomaly_read_stream(sg_anomaly_model_t *model, FILE *f) {
     return -1;
   }
   sg_anomaly_model_t *loaded =
-      sg_anomaly_model_new_ex(model->alpha, model->unk_prior);
+      anomaly_model_new(model->alpha, model->unk_prior);
   if (!loaded) {
     errno = ENOMEM;
     return -1;
@@ -825,64 +880,69 @@ int sg_anomaly_read_stream(sg_anomaly_model_t *model, FILE *f) {
   return result;
 }
 
-int sg_anomaly_load(sg_anomaly_model_t *model, const char *path) {
+sg_anomaly_status_t sg_anomaly_model_load(sg_anomaly_model_t *model,
+                                          const char *path) {
   if (!model || !path) {
     errno = EINVAL;
-    return -1;
+    return SG_ANOMALY_ERR_INVALID;
   }
 
   FILE *f = fopen(path, "rb");
   if (!f)
-    return -1;
+    return anomaly_failure_status();
+  errno = 0;
   int result = sg_anomaly_read_stream(model, f);
   int saved_errno = errno;
   if (fclose(f) != 0 && result == 0) {
     result = -1;
     saved_errno = errno;
   }
+  if (result == 0)
+    return SG_ANOMALY_OK;
   errno = saved_errno;
-  return result;
+  return anomaly_failure_status();
 }
 
 /* --- ACCESSORS --- */
 
-size_t sg_anomaly_vocab_size(const sg_anomaly_model_t *model) {
+size_t sg_anomaly_model_vocab_size(const sg_anomaly_model_t *model) {
   return model ? ht_size(model->uni) : 0;
 }
 
-size_t sg_anomaly_total_uni(const sg_anomaly_model_t *model) {
+size_t sg_anomaly_model_total_unigrams(const sg_anomaly_model_t *model) {
   return model ? model->total_uni : 0;
 }
 
-size_t sg_anomaly_total_bi(const sg_anomaly_model_t *model) {
+size_t sg_anomaly_model_total_bigrams(const sg_anomaly_model_t *model) {
   return model ? model->total_bi : 0;
 }
 
-size_t sg_anomaly_total_tri(const sg_anomaly_model_t *model) {
+size_t sg_anomaly_model_total_trigrams(const sg_anomaly_model_t *model) {
   return model ? model->total_tri : 0;
 }
 
-size_t sg_anomaly_total_quad(const sg_anomaly_model_t *model) {
+size_t sg_anomaly_model_total_fourgrams(const sg_anomaly_model_t *model) {
   return model ? model->total_quad : 0;
 }
 
-size_t sg_anomaly_uni_count(const sg_anomaly_model_t *model, const char *cmd) {
+size_t sg_anomaly_model_unigram_count(const sg_anomaly_model_t *model,
+                                      const char *cmd) {
   if (!model || !command_is_valid(cmd))
     return 0;
   size_t cmd_len = strlen(cmd) + 1;
   return count_get(model->uni, cmd, cmd_len);
 }
 
-size_t sg_anomaly_unk_count(const sg_anomaly_model_t *model) {
+size_t sg_anomaly_model_unknown_count(const sg_anomaly_model_t *model) {
   return model ? model->unk_count : 0;
 }
 
-double sg_anomaly_kn_discount(const sg_anomaly_model_t *model) {
+double sg_anomaly_model_kneser_ney_discount(const sg_anomaly_model_t *model) {
   return model ? model->kn_discount : 0.0;
 }
 
-size_t sg_anomaly_bi_count(const sg_anomaly_model_t *model, const char *prev,
-                           const char *curr) {
+size_t sg_anomaly_model_bigram_count(const sg_anomaly_model_t *model,
+                                     const char *prev, const char *curr) {
   if (!model || !command_is_valid(prev) || !command_is_valid(curr))
     return 0;
   char key[SG_ANOMALY_MAX_KEY_LENGTH];
@@ -890,8 +950,9 @@ size_t sg_anomaly_bi_count(const sg_anomaly_model_t *model, const char *prev,
   return key_len > 0 ? count_get(model->bi, key, key_len) : 0;
 }
 
-size_t sg_anomaly_tri_count(const sg_anomaly_model_t *model, const char *p2,
-                            const char *p1, const char *curr) {
+size_t sg_anomaly_model_trigram_count(const sg_anomaly_model_t *model,
+                                      const char *p2, const char *p1,
+                                      const char *curr) {
   if (!model || !command_is_valid(p2) || !command_is_valid(p1) ||
       !command_is_valid(curr))
     return 0;
@@ -900,8 +961,9 @@ size_t sg_anomaly_tri_count(const sg_anomaly_model_t *model, const char *p2,
   return key_len > 0 ? count_get(model->tri, key, key_len) : 0;
 }
 
-size_t sg_anomaly_quad_count(const sg_anomaly_model_t *model, const char *p3,
-                             const char *p2, const char *p1, const char *curr) {
+size_t sg_anomaly_model_fourgram_count(const sg_anomaly_model_t *model,
+                                       const char *p3, const char *p2,
+                                       const char *p1, const char *curr) {
   if (!model || !command_is_valid(p3) || !command_is_valid(p2) ||
       !command_is_valid(p1) || !command_is_valid(curr))
     return 0;
@@ -910,7 +972,7 @@ size_t sg_anomaly_quad_count(const sg_anomaly_model_t *model, const char *p3,
   return key_len > 0 ? count_get(model->quad, key, key_len) : 0;
 }
 
-size_t sg_anomaly_total_contexts(const sg_anomaly_model_t *model) {
+size_t sg_anomaly_model_total_contexts(const sg_anomaly_model_t *model) {
   if (!model)
     return 0;
   return ht_size(model->bi_ctx) + ht_size(model->tri_ctx) +
@@ -918,9 +980,9 @@ size_t sg_anomaly_total_contexts(const sg_anomaly_model_t *model) {
 }
 
 sg_anomaly_status_t
-sg_anomaly_has_observed_netseq(const sg_anomaly_model_t *model,
-                               const char *netseq, size_t netseq_length,
-                               bool *observed) {
+sg_anomaly_model_has_observed_netseq(const sg_anomaly_model_t *model,
+                                     const char *netseq, size_t netseq_length,
+                                     bool *observed) {
   if (observed)
     *observed = false;
   if (!model || !netseq || !observed)
@@ -1053,12 +1115,12 @@ static void anomaly_recalculate_totals(sg_anomaly_model_t *model) {
   }
 }
 
-sg_anomaly_status_t sg_anomaly_reset(sg_anomaly_model_t *model) {
+sg_anomaly_status_t sg_anomaly_model_reset(sg_anomaly_model_t *model) {
   if (!model)
     return SG_ANOMALY_ERR_INVALID;
 
   sg_anomaly_model_t *staged =
-      sg_anomaly_model_new_ex(model->alpha, model->unk_prior);
+      anomaly_model_new(model->alpha, model->unk_prior);
   if (!staged) {
     model->oom = true;
     return SG_ANOMALY_ERR_MEMORY;
@@ -1283,9 +1345,9 @@ sg_anomaly_status_t sg_anomaly_model_prune(sg_anomaly_model_t *model,
   return SG_ANOMALY_OK;
 }
 
-bool sg_anomaly_model_compact(sg_anomaly_model_t *model) {
+sg_anomaly_status_t sg_anomaly_model_compact(sg_anomaly_model_t *model) {
   if (!model)
-    return false;
+    return SG_ANOMALY_ERR_INVALID;
 
   bool success = ht_compact(model->uni);
   success = ht_compact(model->bi) && success;
@@ -1294,5 +1356,5 @@ bool sg_anomaly_model_compact(sg_anomaly_model_t *model) {
   success = ht_compact(model->bi_ctx) && success;
   success = ht_compact(model->tri_ctx) && success;
   success = ht_compact(model->quad_ctx) && success;
-  return success;
+  return success ? SG_ANOMALY_OK : SG_ANOMALY_ERR_MEMORY;
 }

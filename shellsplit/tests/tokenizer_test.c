@@ -1,4 +1,6 @@
+#include "../src/shell_processor_internal.h"
 #include "shell_processor.h"
+#include "shell_sequence.h"
 #include "shell_tokenizer.h"
 #include "shell_tokenizer_full.h"
 #include "shell_transform.h"
@@ -66,12 +68,12 @@ static void test_token_type_names(void) {
       "HEREDOC",
       "HERESTRING",
   };
-  bool valid = sizeof(names) / sizeof(names[0]) == TOKEN_HERESTRING + 1;
+  bool valid = sizeof(names) / sizeof(names[0]) == SHELL_TOKEN_HERESTRING + 1;
   for (size_t i = 0; valid && i < sizeof(names) / sizeof(names[0]); i++)
-    valid = strcmp(shell_token_type_name((token_type_t)i), names[i]) == 0;
-  valid = valid &&
-          strcmp(shell_token_type_name((token_type_t)(TOKEN_HERESTRING + 1)),
-                 "UNKNOWN") == 0;
+    valid = strcmp(shell_token_type_name((shell_token_type_t)i), names[i]) == 0;
+  valid = valid && strcmp(shell_token_type_name(
+                              (shell_token_type_t)(SHELL_TOKEN_HERESTRING + 1)),
+                          "UNKNOWN") == 0;
   test("Token type names cover every enum value", valid);
 }
 
@@ -94,36 +96,39 @@ static void test_error_strings(void) {
 static void test_composition_metadata(void) {
   shell_command_t *commands = NULL;
   size_t count = 0;
-  bool ok =
-      shell_tokenize_commands("echo ok # | ignored\npwd", &commands, &count) &&
-      count == 2 && commands[0].token_count >= 2 &&
-      commands[0].tokens[0].start[0] == 'e' &&
-      commands[0].tokens[1].start[0] == 'o' &&
-      commands[1].tokens[0].start[0] == 'p';
-  shell_free_commands(commands, count);
+  bool ok = (shell_tokenize_commands("echo ok # | ignored\npwd",
+                                     strlen("echo ok # | ignored\npwd"),
+                                     &commands, &count) == SHELL_TOKENIZE_OK) &&
+            count == 2 && commands[0].token_count >= 2 &&
+            commands[0].tokens[0].start[0] == 'e' &&
+            commands[0].tokens[1].start[0] == 'o' &&
+            commands[1].tokens[0].start[0] == 'p';
+  shell_commands_free(commands, count);
   test("Comments hide operators and preserve following command", ok);
 
   commands = NULL;
   count = 0;
-  ok = shell_tokenize_commands("first & second", &commands, &count) &&
+  ok = (shell_tokenize_commands("first & second", strlen("first & second"),
+                                &commands, &count) == SHELL_TOKENIZE_OK) &&
        count == 2 && commands[0].has_background &&
-       commands[1].tokens[0].type == TOKEN_COMMAND;
-  shell_free_commands(commands, count);
+       commands[1].tokens[0].type == SHELL_TOKEN_COMMAND;
+  shell_commands_free(commands, count);
   test("Background separator is represented without losing commands", ok);
 
   commands = NULL;
   count = 0;
-  ok = shell_tokenize_commands("(one; two)", &commands, &count) && count == 2 &&
-       commands[0].has_groups && commands[1].has_groups &&
+  ok = (shell_tokenize_commands("(one; two)", strlen("(one; two)"), &commands,
+                                &count) == SHELL_TOKENIZE_OK) &&
+       count == 2 && commands[0].has_groups && commands[1].has_groups &&
        commands[0].group_depth == 1 && commands[1].group_depth == 1 &&
        commands[0].start_pos == 1 && commands[1].start_pos == 6 &&
        commands[1].end_pos == 9;
-  shell_free_commands(commands, count);
+  shell_commands_free(commands, count);
   test("Parenthesized groups retain command spans and depth", ok);
 }
 
 static bool is_cleared_end_token(const shell_token_t *token) {
-  return token->type == TOKEN_END && token->start == NULL &&
+  return token->type == SHELL_TOKEN_END && token->start == NULL &&
          token->length == 0 && token->position == 0 && !token->is_quoted &&
          !token->is_escaped;
 }
@@ -132,7 +137,7 @@ typedef struct {
   const char *name;
   const char *input;
   size_t token_count;
-  token_type_t types[8];
+  shell_token_type_t types[8];
   const char *texts[8];
   int if_depth;
   int loop_depth;
@@ -142,7 +147,7 @@ typedef struct {
 static void run_iterator_cases(const iterator_case_t *cases, size_t count) {
   for (size_t i = 0; i < count; i++) {
     shell_tokenizer_state_t state;
-    shell_tokenizer_init(&state, cases[i].input);
+    shell_tokenizer_init(&state, cases[i].input, strlen(cases[i].input));
     bool valid = state.input == cases[i].input && state.position == 0 &&
                  state.length == strlen(cases[i].input);
     for (size_t j = 0; j < cases[i].token_count; j++) {
@@ -173,7 +178,7 @@ static void run_iterator_cases(const iterator_case_t *cases, size_t count) {
 static void test_iterator_argument_contracts(void) {
   shell_tokenizer_state_t state;
   memset(&state, 0xA5, sizeof(state));
-  shell_tokenizer_init(&state, NULL);
+  shell_tokenizer_init(&state, NULL, 0);
   shell_token_t token;
   memset(&token, 0xA5, sizeof(token));
   bool null_input =
@@ -185,7 +190,7 @@ static void test_iterator_argument_contracts(void) {
       state.case_depth == 0 && !shell_tokenizer_next(&state, &token) &&
       is_cleared_end_token(&token);
 
-  shell_tokenizer_init(&state, "echo");
+  shell_tokenizer_init(&state, "echo", strlen("echo"));
   size_t initial_position = state.position;
   bool null_output =
       !shell_tokenizer_next(&state, NULL) && state.position == initial_position;
@@ -197,23 +202,43 @@ static void test_iterator_argument_contracts(void) {
   memset(&token, 0xA5, sizeof(token));
   bool zero_state =
       !shell_tokenizer_next(&state, &token) && is_cleared_end_token(&token);
-  shell_tokenizer_init(&state, "cmd\x01suffix");
+  shell_tokenizer_init(&state, "cmd\x01suffix", strlen("cmd\x01suffix"));
   memset(&token, 0xA5, sizeof(token));
   bool invalid_input =
       !shell_tokenizer_next(&state, &token) && is_cleared_end_token(&token);
-  shell_tokenizer_init(NULL, "ignored");
+  shell_tokenizer_init(NULL, "ignored", strlen("ignored"));
 
   shell_command_t *commands = (shell_command_t *)(uintptr_t)1;
   size_t command_count = SIZE_MAX;
   bool aggregate_null_input =
-      !shell_tokenize_commands(NULL, &commands, &command_count) &&
+      shell_tokenize_commands(NULL, 0, &commands, &command_count) ==
+          SHELL_TOKENIZE_EINPUT &&
       commands == NULL && command_count == 0;
   bool missing_outputs =
-      !shell_tokenize_commands("echo", NULL, &command_count) &&
-      !shell_tokenize_commands("echo", &commands, NULL);
+      shell_tokenize_commands("echo", strlen("echo"), NULL, &command_count) ==
+          SHELL_TOKENIZE_EINPUT &&
+      shell_tokenize_commands("echo", strlen("echo"), &commands, NULL) ==
+          SHELL_TOKENIZE_EINPUT;
+  shell_tokenize_status_t parse_status = shell_tokenize_commands(
+      "'unterminated", strlen("'unterminated"), &commands, &command_count);
+  static const char bounded_input[] = {'e', 'c', 'h', 'o'};
+  bool bounded_input_ok =
+      shell_tokenize_commands(bounded_input, sizeof(bounded_input), &commands,
+                              &command_count) == SHELL_TOKENIZE_OK &&
+      command_count == 1;
+  shell_commands_free(commands, command_count);
+  commands = (shell_command_t *)(uintptr_t)1;
+  command_count = SIZE_MAX;
+  static const char nul_input[] = {'e', 'c', 'h', 'o', '\0', ';', 'i', 'd'};
+  bool embedded_nul_rejected =
+      shell_tokenize_commands(nul_input, sizeof(nul_input), &commands,
+                              &command_count) == SHELL_TOKENIZE_EINPUT &&
+      commands == NULL && command_count == 0;
   test("Tokenizer iterator: NULL and exhausted argument contracts",
        null_input && null_output && null_state && zero_state && invalid_input &&
-           aggregate_null_input && missing_outputs);
+           aggregate_null_input && missing_outputs && bounded_input_ok &&
+           embedded_nul_rejected && parse_status == SHELL_TOKENIZE_EPARSE &&
+           commands == NULL && command_count == 0);
 }
 
 typedef struct {
@@ -226,12 +251,13 @@ static void run_tokenizer_cases(const tokenizer_case_t *cases, size_t count) {
   for (size_t i = 0; i < count; i++) {
     shell_command_t *commands = NULL;
     size_t command_count = 0;
-    bool parsed =
-        shell_tokenize_commands(cases[i].input, &commands, &command_count);
+    bool parsed = (shell_tokenize_commands(
+                       cases[i].input, strlen(cases[i].input), &commands,
+                       &command_count) == SHELL_TOKENIZE_OK);
     test(cases[i].name,
          parsed && command_count == cases[i].command_count &&
              tokens_are_consistent(cases[i].input, commands, command_count));
-    shell_free_commands(commands, command_count);
+    shell_commands_free(commands, command_count);
   }
 }
 
@@ -239,14 +265,15 @@ static void check_tokenizer_case(const char *name, const char *input,
                                  size_t expected_count) {
   shell_command_t *commands = NULL;
   size_t command_count = 0;
-  bool parsed = shell_tokenize_commands(input, &commands, &command_count);
+  bool parsed = (shell_tokenize_commands(input, strlen(input), &commands,
+                                         &command_count) == SHELL_TOKENIZE_OK);
   bool valid = parsed && command_count == expected_count &&
                tokens_are_consistent(input, commands, command_count);
   if (!valid)
     printf("    commands: got %zu, expected %zu\n", command_count,
            expected_count);
   test(name, valid);
-  shell_free_commands(commands, command_count);
+  shell_commands_free(commands, command_count);
 }
 
 static void run_rejected_cases(const tokenizer_case_t *cases, size_t count) {
@@ -254,12 +281,13 @@ static void run_rejected_cases(const tokenizer_case_t *cases, size_t count) {
     shell_command_t *sentinel = (shell_command_t *)(uintptr_t)1;
     shell_command_t *commands = sentinel;
     size_t command_count = SIZE_MAX;
-    bool parsed =
-        shell_tokenize_commands(cases[i].input, &commands, &command_count);
+    bool parsed = (shell_tokenize_commands(
+                       cases[i].input, strlen(cases[i].input), &commands,
+                       &command_count) == SHELL_TOKENIZE_OK);
     test(cases[i].name, !parsed && commands == NULL &&
                             command_count == cases[i].command_count);
     if (commands && commands != sentinel && command_count < 1024)
-      shell_free_commands(commands, command_count);
+      shell_commands_free(commands, command_count);
   }
 }
 
@@ -284,8 +312,10 @@ static void run_feature_cases(const feature_case_t *cases, size_t count) {
   for (size_t i = 0; i < count; i++) {
     shell_command_t *commands = NULL;
     size_t command_count = 0;
-    bool parsed = shell_tokenize_commands(cases[i].tokenizer.input, &commands,
-                                          &command_count);
+    bool parsed =
+        (shell_tokenize_commands(cases[i].tokenizer.input,
+                                 strlen(cases[i].tokenizer.input), &commands,
+                                 &command_count) == SHELL_TOKENIZE_OK);
     unsigned features = 0;
     bool feature_api_consistent = true;
     for (size_t j = 0; j < command_count; j++) {
@@ -298,7 +328,7 @@ static void run_feature_cases(const feature_case_t *cases, size_t count) {
           (commands[j].has_conditionals ? EXPECT_CONDITIONAL : 0) |
           (commands[j].has_case ? EXPECT_CASE : 0);
       features |= command_features;
-      if (shell_has_features(&commands[j]) !=
+      if (shell_command_has_shell_features(&commands[j]) !=
           ((command_features & EXPECT_SHELL_FEATURE) != 0))
         feature_api_consistent = false;
     }
@@ -311,7 +341,7 @@ static void run_feature_cases(const feature_case_t *cases, size_t count) {
              command_count, cases[i].tokenizer.command_count, features,
              cases[i].features);
     test(cases[i].tokenizer.name, valid);
-    shell_free_commands(commands, command_count);
+    shell_commands_free(commands, command_count);
   }
 }
 
@@ -327,8 +357,10 @@ static void run_stage_cases(const stage_case_t *cases, size_t count) {
   for (size_t i = 0; i < count; i++) {
     shell_command_t *commands = NULL;
     size_t command_count = 0;
-    bool parsed = shell_tokenize_commands(cases[i].tokenizer.input, &commands,
-                                          &command_count);
+    bool parsed =
+        (shell_tokenize_commands(cases[i].tokenizer.input,
+                                 strlen(cases[i].tokenizer.input), &commands,
+                                 &command_count) == SHELL_TOKENIZE_OK);
     uint64_t variables = 0;
     uint64_t globs = 0;
     uint64_t subshells = 0;
@@ -343,7 +375,7 @@ static void run_stage_cases(const stage_case_t *cases, size_t count) {
       bool has_feature = commands[j].has_variables || commands[j].has_globs ||
                          commands[j].has_subshells ||
                          commands[j].has_arithmetic;
-      if (shell_has_features(&commands[j]) != has_feature)
+      if (shell_command_has_shell_features(&commands[j]) != has_feature)
         feature_api_consistent = false;
     }
     bool valid = parsed && command_count == cases[i].tokenizer.command_count &&
@@ -361,7 +393,7 @@ static void run_stage_cases(const stage_case_t *cases, size_t count) {
              (unsigned long long)globs, (unsigned long long)subshells,
              (unsigned long long)arithmetic);
     test(cases[i].tokenizer.name, valid);
-    shell_free_commands(commands, command_count);
+    shell_commands_free(commands, command_count);
   }
 }
 
@@ -382,12 +414,27 @@ typedef struct {
   unsigned feature_stages;
 } processor_case_t;
 
+static bool tokens_refer_to_owned_command(const shell_token_t *tokens,
+                                          size_t token_count,
+                                          const char *original_command) {
+  if ((!tokens && token_count != 0) || !original_command)
+    return false;
+  size_t length = strlen(original_command);
+  for (size_t i = 0; i < token_count; i++) {
+    if (tokens[i].position > length ||
+        tokens[i].length > length - tokens[i].position ||
+        tokens[i].start != original_command + tokens[i].position)
+      return false;
+  }
+  return true;
+}
+
 static void run_processor_cases(const processor_case_t *cases, size_t count) {
   for (size_t i = 0; i < count; i++) {
     shell_command_info_t *infos = NULL;
     size_t command_count = 0;
-    shell_process_status_t process_status =
-        shell_process_command(cases[i].input, NULL, &infos, &command_count);
+    shell_process_status_t process_status = shell_process_command(
+        cases[i].input, strlen(cases[i].input), NULL, &infos, &command_count);
     bool has_shell_features = false;
     bool processed = process_status == SHELL_PROCESS_OK;
     bool valid = processed && command_count == cases[i].command_count &&
@@ -408,13 +455,20 @@ static void run_processor_cases(const processor_case_t *cases, size_t count) {
           strcmp(infos[j].original_command, cases[i].original_commands[j]) ==
               0 &&
           flags == cases[i].flags[j] &&
-          shell_has_dangerous_features(&infos[j]) == expected_feature;
+          tokens_refer_to_owned_command(infos[j].shell_tokens,
+                                        infos[j].shell_token_count,
+                                        infos[j].original_command) &&
+          tokens_refer_to_owned_command(infos[j].command_tokens,
+                                        infos[j].command_token_count,
+                                        infos[j].original_command) &&
+          shell_command_info_has_dangerous_features(&infos[j]) ==
+              expected_feature;
       if (!stage_valid)
         printf("    stage %zu: original='%s' netargv='%s' flags=%#x "
                "feature=%d\n",
                j, infos[j].original_command ? infos[j].original_command : "",
                netargv ? netargv : "", flags,
-               shell_has_dangerous_features(&infos[j]));
+               shell_command_info_has_dangerous_features(&infos[j]));
       free(netargv);
       valid = stage_valid && valid;
       has_shell_features |= expected_feature;
@@ -423,7 +477,7 @@ static void run_processor_cases(const processor_case_t *cases, size_t count) {
       printf("    processor: count=%zu expected=%zu features=%d\n",
              command_count, cases[i].command_count, has_shell_features);
     test(cases[i].name, valid);
-    shell_free_command_infos(infos, command_count);
+    shell_command_infos_free(infos, command_count);
   }
 }
 
@@ -439,11 +493,11 @@ typedef struct {
 static void run_transform_line_cases(const transform_line_case_t *cases,
                                      size_t count) {
   for (size_t i = 0; i < count; i++) {
-    transformed_command_t **commands = NULL;
+    shell_transformed_command_t **commands = NULL;
     size_t command_count = 0;
-    bool transformed =
-        shell_transform_command_line(cases[i].input, NULL, &commands,
-                                     &command_count) == SHELL_TRANSFORM_OK;
+    bool transformed = shell_transform_command_line(
+                           cases[i].input, strlen(cases[i].input), NULL,
+                           &commands, &command_count) == SHELL_TRANSFORM_OK;
     bool valid = transformed && command_count == cases[i].command_count &&
                  (command_count == 0 || commands != NULL);
     for (size_t j = 0; valid && j < command_count; j++) {
@@ -455,23 +509,23 @@ static void run_transform_line_cases(const transform_line_case_t *cases,
       const char *expected_original = cases[i].original_commands[j];
       if (!expected_original && command_count == 1)
         expected_original = cases[i].input;
-      valid =
-          commands[j] && commands[j]->original_command &&
-          commands[j]->transformed_command && expected_original &&
-          strcmp(commands[j]->original_command, expected_original) == 0 &&
-          strcmp(commands[j]->transformed_command,
-                 cases[i].transformed_commands[j]) == 0 &&
-          commands[j]->has_transformations == expected_transform &&
-          commands[j]->has_shell_syntax == expected_shell &&
-          shell_has_transformations(commands[j]) == expected_transform &&
-          shell_get_dfa_input(commands[j]) == commands[j]->transformed_command;
+      valid = commands[j] && commands[j]->original_command &&
+              commands[j]->display_text && expected_original &&
+              strcmp(commands[j]->original_command, expected_original) == 0 &&
+              strcmp(commands[j]->display_text,
+                     cases[i].transformed_commands[j]) == 0 &&
+              commands[j]->has_transformations == expected_transform &&
+              commands[j]->has_shell_syntax == expected_shell &&
+              shell_transformed_command_has_transformations(commands[j]) ==
+                  expected_transform &&
+              shell_transformed_command_get_display_text(commands[j]) ==
+                  commands[j]->display_text;
     }
     if (!valid)
       printf("    transform line: count=%zu expected=%zu\n", command_count,
              cases[i].command_count);
     test(cases[i].name, valid);
-    shell_free_transformed_commands(commands, command_count);
-    free(commands);
+    shell_transformed_command_list_free(commands, command_count);
   }
 }
 
@@ -481,22 +535,24 @@ static void test_tokenize_allocation_failures(void) {
   shell_command_t *commands = NULL;
   size_t count = 0;
   shellsplit_test_alloc_reset();
-  bool success = shell_tokenize_commands(input, &commands, &count);
+  bool success = (shell_tokenize_commands(input, strlen(input), &commands,
+                                          &count) == SHELL_TOKENIZE_OK);
   size_t allocations = shellsplit_test_alloc_count();
   test("Allocation probe tokenizes multiple grown commands",
        success && count == 3 && allocations >= 5);
-  shell_free_commands(commands, count);
+  shell_commands_free(commands, count);
 
   bool atomic = true;
   for (size_t fail_at = 1; fail_at <= allocations; fail_at++) {
     commands = (shell_command_t *)(void *)1;
     count = SIZE_MAX;
     shellsplit_test_alloc_fail_at(fail_at);
-    success = shell_tokenize_commands(input, &commands, &count);
+    success = (shell_tokenize_commands(input, strlen(input), &commands,
+                                       &count) == SHELL_TOKENIZE_OK);
     shellsplit_test_alloc_reset();
     if (success || commands != NULL || count != 0) {
       atomic = false;
-      shell_free_commands(commands, count);
+      shell_commands_free(commands, count);
       break;
     }
   }
@@ -510,22 +566,22 @@ static void test_processor_allocation_failures(void) {
   size_t count = 0;
   shellsplit_test_alloc_reset();
   shell_process_status_t status =
-      shell_process_command(input, NULL, &infos, &count);
+      shell_process_command(input, strlen(input), NULL, &infos, &count);
   size_t allocations = shellsplit_test_alloc_count();
   test("Processor allocation probe succeeds",
        status == SHELL_PROCESS_OK && count == 2 && allocations > 5);
-  shell_free_command_infos(infos, count);
+  shell_command_infos_free(infos, count);
 
   bool atomic = true;
   for (size_t fail_at = 1; fail_at <= allocations; fail_at++) {
     infos = (shell_command_info_t *)(void *)1;
     count = SIZE_MAX;
     shellsplit_test_alloc_fail_at(fail_at);
-    status = shell_process_command(input, NULL, &infos, &count);
+    status = shell_process_command(input, strlen(input), NULL, &infos, &count);
     shellsplit_test_alloc_reset();
     if (status != SHELL_PROCESS_ENOMEM || infos != NULL || count != 0) {
       atomic = false;
-      shell_free_command_infos(infos, count);
+      shell_command_infos_free(infos, count);
       break;
     }
   }
@@ -534,8 +590,8 @@ static void test_processor_allocation_failures(void) {
   bool has_features = false;
   char *sequence = NULL;
   shellsplit_test_alloc_reset();
-  status = shell_extract_netargv_sequence(input, NULL, &sequence, &count,
-                                          &has_features);
+  status = shell_build_netargv_sequence(input, strlen(input), NULL, &sequence,
+                                        &count, &has_features);
   allocations = shellsplit_test_alloc_count();
   test("Netargv-sequence allocation probe succeeds",
        status == SHELL_PROCESS_OK && sequence && count == 2 && has_features);
@@ -547,8 +603,8 @@ static void test_processor_allocation_failures(void) {
     count = SIZE_MAX;
     has_features = true;
     shellsplit_test_alloc_fail_at(fail_at);
-    status = shell_extract_netargv_sequence(input, NULL, &sequence, &count,
-                                            &has_features);
+    status = shell_build_netargv_sequence(input, strlen(input), NULL, &sequence,
+                                          &count, &has_features);
     shellsplit_test_alloc_reset();
     if (status != SHELL_PROCESS_ENOMEM || sequence != NULL || count != 0 ||
         has_features) {
@@ -560,7 +616,8 @@ static void test_processor_allocation_failures(void) {
   test("Netargv-sequence allocation failures are atomic", atomic);
 
   shellsplit_test_alloc_reset();
-  status = shell_build_command_netseq(input, NULL, &sequence, &count);
+  status =
+      shell_build_command_netseq(input, strlen(input), NULL, &sequence, &count);
   allocations = shellsplit_test_alloc_count();
   test("Command-netsequence allocation probe succeeds",
        status == SHELL_PROCESS_OK && sequence && count == 2);
@@ -571,7 +628,8 @@ static void test_processor_allocation_failures(void) {
     sequence = (char *)(void *)1;
     count = SIZE_MAX;
     shellsplit_test_alloc_fail_at(fail_at);
-    status = shell_build_command_netseq(input, NULL, &sequence, &count);
+    status = shell_build_command_netseq(input, strlen(input), NULL, &sequence,
+                                        &count);
     shellsplit_test_alloc_reset();
     if (status != SHELL_PROCESS_ENOMEM || sequence != NULL || count != 0) {
       atomic = false;
@@ -585,28 +643,27 @@ static void test_processor_allocation_failures(void) {
 static void test_transform_allocation_failures(void) {
   static const char input[] =
       "echo $USER a b c d e f g h i j k l m n o p | grep '*.txt'";
-  transformed_command_t **commands = NULL;
+  shell_transformed_command_t **commands = NULL;
   size_t count = 0;
   shellsplit_test_alloc_reset();
-  shell_transform_status_t status =
-      shell_transform_command_line(input, NULL, &commands, &count);
+  shell_transform_status_t status = shell_transform_command_line(
+      input, strlen(input), NULL, &commands, &count);
   size_t allocations = shellsplit_test_alloc_count();
   test("Transform allocation probe succeeds",
        status == SHELL_TRANSFORM_OK && count == 2 && allocations > 5);
-  shell_free_transformed_commands(commands, count);
-  free(commands);
+  shell_transformed_command_list_free(commands, count);
 
   bool atomic = true;
   for (size_t fail_at = 1; fail_at <= allocations; fail_at++) {
-    commands = (transformed_command_t **)(void *)1;
+    commands = (shell_transformed_command_t **)(void *)1;
     count = SIZE_MAX;
     shellsplit_test_alloc_fail_at(fail_at);
-    status = shell_transform_command_line(input, NULL, &commands, &count);
+    status = shell_transform_command_line(input, strlen(input), NULL, &commands,
+                                          &count);
     shellsplit_test_alloc_reset();
     if (status != SHELL_TRANSFORM_ENOMEM || commands != NULL || count != 0) {
       atomic = false;
-      shell_free_transformed_commands(commands, count);
-      free(commands);
+      shell_transformed_command_list_free(commands, count);
       break;
     }
   }
@@ -618,7 +675,7 @@ static void test_output_limit_boundaries(void) {
   shell_command_info_t *infos = NULL;
   size_t count = 0;
   shell_process_status_t process_status =
-      shell_process_command(input, NULL, &infos, &count);
+      shell_process_command(input, strlen(input), NULL, &infos, &count);
   size_t process_max = 0;
   size_t process_total = 0;
   for (size_t i = 0; process_status == SHELL_PROCESS_OK && i < count; i++) {
@@ -627,22 +684,23 @@ static void test_output_limit_boundaries(void) {
       process_max = original;
     process_total += original;
   }
-  shell_free_command_infos(infos, count);
+  shell_command_infos_free(infos, count);
 
   shell_process_limits_t process_limits = {process_max, process_total};
   infos = NULL;
   count = 0;
-  bool process_valid = process_status == SHELL_PROCESS_OK &&
-                       shell_process_command(input, &process_limits, &infos,
-                                             &count) == SHELL_PROCESS_OK;
-  shell_free_command_infos(infos, count);
+  bool process_valid =
+      process_status == SHELL_PROCESS_OK &&
+      shell_process_command(input, strlen(input), &process_limits, &infos,
+                            &count) == SHELL_PROCESS_OK;
+  shell_command_infos_free(infos, count);
   process_limits.max_string_bytes--;
   infos = (shell_command_info_t *)(uintptr_t)1;
   count = SIZE_MAX;
   process_valid =
       process_valid &&
-      shell_process_command(input, &process_limits, &infos, &count) ==
-          SHELL_PROCESS_EOUTPUT_LIMIT &&
+      shell_process_command(input, strlen(input), &process_limits, &infos,
+                            &count) == SHELL_PROCESS_EOUTPUT_LIMIT &&
       infos == NULL && count == 0;
   process_limits.max_string_bytes = process_max;
   process_limits.max_total_bytes--;
@@ -650,22 +708,22 @@ static void test_output_limit_boundaries(void) {
   count = SIZE_MAX;
   process_valid =
       process_valid &&
-      shell_process_command(input, &process_limits, &infos, &count) ==
-          SHELL_PROCESS_EOUTPUT_LIMIT &&
+      shell_process_command(input, strlen(input), &process_limits, &infos,
+                            &count) == SHELL_PROCESS_EOUTPUT_LIMIT &&
       infos == NULL && count == 0;
   test("Processor output limits accept exact bounds and reject overflow",
        process_valid);
 
-  transformed_command_t **commands = NULL;
+  shell_transformed_command_t **commands = NULL;
   size_t transformed_count = 0;
-  shell_transform_status_t transform_status =
-      shell_transform_command_line(input, NULL, &commands, &transformed_count);
+  shell_transform_status_t transform_status = shell_transform_command_line(
+      input, strlen(input), NULL, &commands, &transformed_count);
   size_t transform_max = 0;
   size_t transform_total = 0;
   for (size_t i = 0;
        transform_status == SHELL_TRANSFORM_OK && i < transformed_count; i++) {
     size_t lengths[2] = {strlen(commands[i]->original_command),
-                         strlen(commands[i]->transformed_command)};
+                         strlen(commands[i]->display_text)};
     for (size_t j = 0; j < 2; j++) {
       if (lengths[j] > transform_max)
         transform_max = lengths[j];
@@ -681,33 +739,31 @@ static void test_output_limit_boundaries(void) {
       transform_total += original + transformed;
     }
   }
-  shell_free_transformed_commands(commands, transformed_count);
-  free(commands);
+  shell_transformed_command_list_free(commands, transformed_count);
 
   shell_transform_limits_t transform_limits = {transform_max, transform_total};
   commands = NULL;
   transformed_count = 0;
-  bool transform_valid =
-      transform_status == SHELL_TRANSFORM_OK &&
-      shell_transform_command_line(input, &transform_limits, &commands,
-                                   &transformed_count) == SHELL_TRANSFORM_OK;
-  shell_free_transformed_commands(commands, transformed_count);
-  free(commands);
+  bool transform_valid = transform_status == SHELL_TRANSFORM_OK &&
+                         shell_transform_command_line(
+                             input, strlen(input), &transform_limits, &commands,
+                             &transformed_count) == SHELL_TRANSFORM_OK;
+  shell_transformed_command_list_free(commands, transformed_count);
   transform_limits.max_string_bytes--;
-  commands = (transformed_command_t **)(uintptr_t)1;
+  commands = (shell_transformed_command_t **)(uintptr_t)1;
   transformed_count = SIZE_MAX;
   transform_valid = transform_valid &&
                     shell_transform_command_line(
-                        input, &transform_limits, &commands,
+                        input, strlen(input), &transform_limits, &commands,
                         &transformed_count) == SHELL_TRANSFORM_EOUTPUT_LIMIT &&
                     commands == NULL && transformed_count == 0;
   transform_limits.max_string_bytes = transform_max;
   transform_limits.max_total_bytes--;
-  commands = (transformed_command_t **)(uintptr_t)1;
+  commands = (shell_transformed_command_t **)(uintptr_t)1;
   transformed_count = SIZE_MAX;
   transform_valid = transform_valid &&
                     shell_transform_command_line(
-                        input, &transform_limits, &commands,
+                        input, strlen(input), &transform_limits, &commands,
                         &transformed_count) == SHELL_TRANSFORM_EOUTPUT_LIMIT &&
                     commands == NULL && transformed_count == 0;
   test("Transform output limits enforce exact call-wide aggregate bounds",
@@ -735,8 +791,8 @@ int main(void) {
       {"Tokenizer iterator: token sequence",
        "echo \"$VAR\" | cat 2>&1",
        5,
-       {TOKEN_COMMAND, TOKEN_VARIABLE_QUOTED, TOKEN_PIPE, TOKEN_COMMAND,
-        TOKEN_REDIRECT_ERR},
+       {SHELL_TOKEN_COMMAND, SHELL_TOKEN_VARIABLE_QUOTED, SHELL_TOKEN_PIPE,
+        SHELL_TOKEN_COMMAND, SHELL_TOKEN_REDIRECT_ERR},
        {"echo", "\"$VAR\"", "|", "cat", "2>&1"},
        0,
        0,
@@ -744,7 +800,7 @@ int main(void) {
       {"Tokenizer iterator: keyword depth transitions",
        "if for case",
        3,
-       {TOKEN_COMMAND, TOKEN_COMMAND, TOKEN_COMMAND},
+       {SHELL_TOKEN_COMMAND, SHELL_TOKEN_COMMAND, SHELL_TOKEN_COMMAND},
        {"if", "for", "case"},
        1,
        1,
@@ -752,7 +808,7 @@ int main(void) {
       {"Tokenizer iterator: process substitutions",
        "diff <(left \"(x)\") >(right)",
        3,
-       {TOKEN_COMMAND, TOKEN_PROCESS_SUB, TOKEN_PROCESS_SUB},
+       {SHELL_TOKEN_COMMAND, SHELL_TOKEN_PROCESS_SUB, SHELL_TOKEN_PROCESS_SUB},
        {"diff", "<(left \"(x)\")", ">(right)"},
        0,
        0,
@@ -760,9 +816,10 @@ int main(void) {
       {"Tokenizer iterator: special parameter family",
        "echo $? $$ $# $! $@ $* $-",
        8,
-       {TOKEN_COMMAND, TOKEN_SPECIAL_VAR, TOKEN_SPECIAL_VAR, TOKEN_SPECIAL_VAR,
-        TOKEN_SPECIAL_VAR, TOKEN_SPECIAL_VAR, TOKEN_SPECIAL_VAR,
-        TOKEN_SPECIAL_VAR},
+       {SHELL_TOKEN_COMMAND, SHELL_TOKEN_SPECIAL_VAR, SHELL_TOKEN_SPECIAL_VAR,
+        SHELL_TOKEN_SPECIAL_VAR, SHELL_TOKEN_SPECIAL_VAR,
+        SHELL_TOKEN_SPECIAL_VAR, SHELL_TOKEN_SPECIAL_VAR,
+        SHELL_TOKEN_SPECIAL_VAR},
        {"echo", "$?", "$$", "$#", "$!", "$@", "$*", "$-"},
        0,
        0,
@@ -770,7 +827,8 @@ int main(void) {
       {"Tokenizer iterator: positional parameter boundary",
        "echo $10 ${10}",
        4,
-       {TOKEN_COMMAND, TOKEN_SPECIAL_VAR, TOKEN_COMMAND, TOKEN_VARIABLE},
+       {SHELL_TOKEN_COMMAND, SHELL_TOKEN_SPECIAL_VAR, SHELL_TOKEN_COMMAND,
+        SHELL_TOKEN_VARIABLE},
        {"echo", "$1", "0", "${10}"},
        0,
        0,
@@ -778,9 +836,10 @@ int main(void) {
       {"Tokenizer iterator: descriptor redirection family",
        "cmd >>&9 >&10 <&0 3>&- 4<&- 12>>log",
        8,
-       {TOKEN_COMMAND, TOKEN_REDIRECT_APPEND, TOKEN_REDIRECT_ERR,
-        TOKEN_REDIRECT_IN, TOKEN_REDIRECT_ERR, TOKEN_REDIRECT_IN,
-        TOKEN_REDIRECT_APPEND, TOKEN_COMMAND},
+       {SHELL_TOKEN_COMMAND, SHELL_TOKEN_REDIRECT_APPEND,
+        SHELL_TOKEN_REDIRECT_ERR, SHELL_TOKEN_REDIRECT_IN,
+        SHELL_TOKEN_REDIRECT_ERR, SHELL_TOKEN_REDIRECT_IN,
+        SHELL_TOKEN_REDIRECT_APPEND, SHELL_TOKEN_COMMAND},
        {"cmd", ">>&9", ">&10", "<&0", "3>&-", "4<&-", "12>>", "log"},
        0,
        0,
@@ -1082,35 +1141,36 @@ int main(void) {
     static const char *transformed[] = {"echo",         "VAR_VALUE",
                                         "FILE_PATTERN", "TEMP_FILE",
                                         "VAR_VALUE",    "TEMP_FILE"};
-    static const transform_type_t types[] = {
-        TRANSFORM_NONE,     TRANSFORM_VARIABLE, TRANSFORM_GLOB,
-        TRANSFORM_SUBSHELL, TRANSFORM_VARIABLE, TRANSFORM_SUBSHELL};
-    transformed_command_t **commands = NULL;
+    static const shell_transform_type_t types[] = {
+        SHELL_TRANSFORM_NONE,     SHELL_TRANSFORM_VARIABLE,
+        SHELL_TRANSFORM_GLOB,     SHELL_TRANSFORM_SUBSHELL,
+        SHELL_TRANSFORM_VARIABLE, SHELL_TRANSFORM_SUBSHELL};
+    shell_transformed_command_t **commands = NULL;
     size_t count = 0;
-    bool valid = shell_transform_command_line(input, NULL, &commands, &count) ==
-                     SHELL_TRANSFORM_OK &&
-                 count == 1 && commands && commands[0] &&
-                 commands[0]->token_count == sizeof(types) / sizeof(types[0]);
+    bool valid =
+        shell_transform_command_line(input, strlen(input), NULL, &commands,
+                                     &count) == SHELL_TRANSFORM_OK &&
+        count == 1 && commands && commands[0] &&
+        commands[0]->token_count == sizeof(types) / sizeof(types[0]);
     memset(input, 'X', strlen(input));
     if (valid &&
         (strcmp(commands[0]->original_command,
                 "echo $NAME *.txt $(id) $((1+2)) <(left)") != 0 ||
-         strcmp(commands[0]->transformed_command,
+         strcmp(commands[0]->display_text,
                 "echo VAR_VALUE FILE_PATTERN TEMP_FILE VAR_VALUE TEMP_FILE") !=
              0 ||
          !commands[0]->has_transformations || !commands[0]->has_shell_syntax))
       valid = false;
     for (size_t i = 0; valid && i < sizeof(types) / sizeof(types[0]); i++) {
-      transformed_token_t *token = &commands[0]->tokens[i];
+      shell_transformed_token_t *token = &commands[0]->tokens[i];
       valid = token->original && token->transformed &&
               strcmp(token->original, originals[i]) == 0 &&
               strcmp(token->transformed, transformed[i]) == 0 &&
               token->type == types[i] &&
-              token->is_shell_construct == (types[i] != TRANSFORM_NONE);
+              token->is_shell_construct == (types[i] != SHELL_TRANSFORM_NONE);
     }
     test("Transform: token metadata owns exact strings", valid);
-    shell_free_transformed_commands(commands, count);
-    free(commands);
+    shell_transformed_command_list_free(commands, count);
   }
 
   static const transform_line_case_t transform_line_cases[] = {
@@ -1219,14 +1279,25 @@ int main(void) {
                                sizeof(transform_line_cases[0]));
 
   {
-    transformed_command_t **sentinel = (transformed_command_t **)(uintptr_t)1;
-    transformed_command_t **commands = sentinel;
-    transformed_command_t *command = (transformed_command_t *)(uintptr_t)1;
+    shell_transformed_command_t **sentinel =
+        (shell_transformed_command_t **)(uintptr_t)1;
+    shell_transformed_command_t **commands = sentinel;
+    shell_transformed_command_t *command =
+        (shell_transformed_command_t *)(uintptr_t)1;
     shell_command_t empty = {0};
     shell_token_t malformed_tokens[] = {
-        {.type = TOKEN_COMMAND, .start = "echo", .length = 4, .position = 0},
-        {.type = TOKEN_ARGUMENT, .start = NULL, .length = 5, .position = 5},
-        {.type = TOKEN_ARGUMENT, .start = "x", .length = 2, .position = 4},
+        {.type = SHELL_TOKEN_COMMAND,
+         .start = "echo",
+         .length = 4,
+         .position = 0},
+        {.type = SHELL_TOKEN_ARGUMENT,
+         .start = NULL,
+         .length = 5,
+         .position = 5},
+        {.type = SHELL_TOKEN_ARGUMENT,
+         .start = "x",
+         .length = 2,
+         .position = 4},
     };
     shell_command_t malformed[] = {
         {.tokens = &malformed_tokens[0],
@@ -1245,7 +1316,7 @@ int main(void) {
     size_t count = SIZE_MAX;
     bool valid = true;
 
-    if (shell_transform_command_line(NULL, NULL, &commands, &count) !=
+    if (shell_transform_command_line(NULL, 0, NULL, &commands, &count) !=
             SHELL_TRANSFORM_EINPUT ||
         commands != NULL || count != 0)
       valid = false;
@@ -1253,21 +1324,36 @@ int main(void) {
     count = SIZE_MAX;
     if (shell_transform_command_line("\x01"
                                      "cmd",
+                                     strlen("\x01"
+                                            "cmd"),
                                      NULL, &commands,
-                                     &count) != SHELL_TRANSFORM_EPARSE ||
+                                     &count) != SHELL_TRANSFORM_EINPUT ||
         commands != NULL || count != 0)
       valid = false;
-    if (shell_transform_command_line("echo", NULL, NULL, &count) !=
-        SHELL_TRANSFORM_EINPUT)
+    if (shell_transform_command_line("echo", strlen("echo"), NULL, NULL,
+                                     &count) != SHELL_TRANSFORM_EINPUT)
       valid = false;
-    if (shell_transform_command_line("echo", NULL, &commands, NULL) !=
-        SHELL_TRANSFORM_EINPUT)
+    if (shell_transform_command_line("echo", strlen("echo"), NULL, &commands,
+                                     NULL) != SHELL_TRANSFORM_EINPUT)
+      valid = false;
+    commands = sentinel;
+    count = SIZE_MAX;
+    if (shell_transform_command_line(" \t", 2, NULL, &commands, &count) !=
+            SHELL_TRANSFORM_OK ||
+        commands != NULL || count != 0)
+      valid = false;
+    commands = sentinel;
+    count = SIZE_MAX;
+    if (shell_transform_command_line("echo '", strlen("echo '"), NULL,
+                                     &commands,
+                                     &count) != SHELL_TRANSFORM_EPARSE ||
+        commands != NULL || count != 0)
       valid = false;
     if (shell_transform_command(NULL, NULL, &command) !=
             SHELL_TRANSFORM_EINPUT ||
         command != NULL)
       valid = false;
-    command = (transformed_command_t *)(uintptr_t)1;
+    command = (shell_transformed_command_t *)(uintptr_t)1;
     if (shell_transform_command(&empty, NULL, &command) !=
             SHELL_TRANSFORM_EINPUT ||
         command != NULL)
@@ -1275,28 +1361,160 @@ int main(void) {
     if (shell_transform_command(&empty, NULL, NULL) != SHELL_TRANSFORM_EINPUT)
       valid = false;
     for (size_t i = 0; i < sizeof(malformed) / sizeof(malformed[0]); i++) {
-      command = (transformed_command_t *)(uintptr_t)1;
+      command = (shell_transformed_command_t *)(uintptr_t)1;
       if (shell_transform_command(&malformed[i], NULL, &command) ==
               SHELL_TRANSFORM_OK ||
           command != NULL)
         valid = false;
     }
-    if (shell_get_dfa_input(NULL) != NULL || shell_has_transformations(NULL))
+    shell_token_t first = {.type = SHELL_TOKEN_COMMAND,
+                           .start = "echo x",
+                           .length = 4,
+                           .position = 0};
+    const shell_command_t first_invalid[] = {
+        {.tokens = &(shell_token_t){.type = SHELL_TOKEN_COMMAND,
+                                    .start = NULL,
+                                    .length = 4,
+                                    .position = 0},
+         .token_count = 1,
+         .start_pos = 0,
+         .end_pos = 4},
+        {.tokens = &(shell_token_t){.type = SHELL_TOKEN_COMMAND,
+                                    .start = "echo",
+                                    .length = 4,
+                                    .position = 0},
+         .token_count = 1,
+         .start_pos = 1,
+         .end_pos = 4},
+        {.tokens = &(shell_token_t){.type = SHELL_TOKEN_COMMAND,
+                                    .start = "echo",
+                                    .length = 4,
+                                    .position = 5},
+         .token_count = 1,
+         .start_pos = 0,
+         .end_pos = 4},
+        {.tokens = &(shell_token_t){.type = SHELL_TOKEN_COMMAND,
+                                    .start = "echo",
+                                    .length = 5,
+                                    .position = 0},
+         .token_count = 1,
+         .start_pos = 0,
+         .end_pos = 4},
+    };
+    for (size_t i = 0; i < sizeof(first_invalid) / sizeof(first_invalid[0]);
+         i++) {
+      command = (shell_transformed_command_t *)(uintptr_t)1;
+      if (shell_transform_command(&first_invalid[i], NULL, &command) !=
+              SHELL_TRANSFORM_EINPUT ||
+          command != NULL)
+        valid = false;
+    }
+    shell_token_t later_tokens[] = {
+        first,
+        {.type = SHELL_TOKEN_ARGUMENT,
+         .start = NULL,
+         .length = 1,
+         .position = 4},
+    };
+    command = (shell_transformed_command_t *)(uintptr_t)1;
+    if (shell_transform_command(&(shell_command_t){.tokens = later_tokens,
+                                                   .token_count = 2,
+                                                   .start_pos = 0,
+                                                   .end_pos = 5},
+                                NULL, &command) != SHELL_TRANSFORM_EINPUT ||
+        command != NULL)
       valid = false;
-    shell_free_transformed_command(NULL);
+    command = (shell_transformed_command_t *)(uintptr_t)1;
+    if (shell_transform_command(&(shell_command_t){.tokens = &first,
+                                                   .token_count = SIZE_MAX,
+                                                   .start_pos = 0,
+                                                   .end_pos = 4},
+                                NULL, &command) != SHELL_TRANSFORM_EOVERFLOW ||
+        command != NULL)
+      valid = false;
+    shell_transform_limits_t transformed_limit = {.max_string_bytes = 5,
+                                                  .max_total_bytes = SIZE_MAX};
+    command = (shell_transformed_command_t *)(uintptr_t)1;
+    if (shell_transform_command(&(shell_command_t){.tokens = &first,
+                                                   .token_count = 1,
+                                                   .start_pos = 0,
+                                                   .end_pos = 4},
+                                &transformed_limit,
+                                &command) != SHELL_TRANSFORM_OK ||
+        command == NULL)
+      valid = false;
+    shell_transformed_command_free(command);
+    transformed_limit.max_string_bytes = 3;
+    command = (shell_transformed_command_t *)(uintptr_t)1;
+    if (shell_transform_command(&(shell_command_t){.tokens = &first,
+                                                   .token_count = 1,
+                                                   .start_pos = 0,
+                                                   .end_pos = 4},
+                                &transformed_limit,
+                                &command) != SHELL_TRANSFORM_EOUTPUT_LIMIT ||
+        command != NULL)
+      valid = false;
+    const shell_token_type_t syntax_types[] = {
+        SHELL_TOKEN_PIPE,
+        SHELL_TOKEN_REDIRECT_IN,
+        SHELL_TOKEN_REDIRECT_OUT,
+        SHELL_TOKEN_REDIRECT_ERR,
+        SHELL_TOKEN_REDIRECT_APPEND,
+        SHELL_TOKEN_SEMICOLON,
+        SHELL_TOKEN_AND,
+        SHELL_TOKEN_BACKGROUND,
+        SHELL_TOKEN_OR,
+        SHELL_TOKEN_GROUP_START,
+        SHELL_TOKEN_GROUP_END,
+        SHELL_TOKEN_SUBSHELL_START,
+        SHELL_TOKEN_SUBSHELL_END,
+        SHELL_TOKEN_HEREDOC,
+        SHELL_TOKEN_HERESTRING,
+        SHELL_TOKEN_PROCESS_SUB,
+    };
+    for (size_t i = 0; i < sizeof(syntax_types) / sizeof(syntax_types[0]);
+         i++) {
+      shell_token_t syntax = {
+          .type = syntax_types[i], .start = "x", .length = 1, .position = 0};
+      command = NULL;
+      if (shell_transform_command(&(shell_command_t){.tokens = &syntax,
+                                                     .token_count = 1,
+                                                     .start_pos = 0,
+                                                     .end_pos = 1},
+                                  NULL, &command) != SHELL_TRANSFORM_OK ||
+          !command || !command->has_shell_syntax)
+        valid = false;
+      shell_transformed_command_free(command);
+    }
+    transformed_limit.max_string_bytes = SIZE_MAX;
+    transformed_limit.max_total_bytes = 1;
+    command = (shell_transformed_command_t *)(uintptr_t)1;
+    if (shell_transform_command(&(shell_command_t){.tokens = &first,
+                                                   .token_count = 1,
+                                                   .start_pos = 0,
+                                                   .end_pos = 4},
+                                &transformed_limit,
+                                &command) != SHELL_TRANSFORM_EOUTPUT_LIMIT ||
+        command != NULL)
+      valid = false;
+    if (shell_transformed_command_get_display_text(NULL) != NULL ||
+        shell_transformed_command_has_transformations(NULL))
+      valid = false;
+    shell_transformed_command_free(NULL);
     test("Transform: failure contracts clear writable outputs", valid);
   }
 
   {
-    transformed_command_t **commands = (transformed_command_t **)(uintptr_t)1;
+    shell_transformed_command_t **commands =
+        (shell_transformed_command_t **)(uintptr_t)1;
     size_t count = SIZE_MAX;
     const shell_transform_limits_t tiny = {3, 3};
-    shell_transform_status_t status =
-        shell_transform_command_line("echo $NAME", &tiny, &commands, &count);
+    shell_transform_status_t status = shell_transform_command_line(
+        "echo $NAME", strlen("echo $NAME"), &tiny, &commands, &count);
     bool valid = status == SHELL_TRANSFORM_EOUTPUT_LIMIT && commands == NULL &&
                  count == 0;
     test("Transform: explicit output limits report rejection", valid);
-    shell_free_transformed_commands(commands, count);
+    shell_transformed_command_list_free(commands, count);
   }
 
   printf("\n=== STRESS/CRASH TEST CASES ===\n\n");
@@ -1404,10 +1622,11 @@ int main(void) {
                         "cmd8 | cmd9 | cmd10 | cmd11 | cmd12";
     shell_command_t *cmds = NULL;
     size_t count = 0;
-    int result = shell_tokenize_commands(input, &cmds, &count);
+    int result = (shell_tokenize_commands(input, strlen(input), &cmds,
+                                          &count) == SHELL_TOKENIZE_OK);
     test("Stress: long command (~4x)",
          result && count == 12 && tokens_are_consistent(input, cmds, count));
-    shell_free_commands(cmds, count);
+    shell_commands_free(cmds, count);
   }
 
   // Test 118: Very long single token
@@ -1417,12 +1636,13 @@ int main(void) {
     input[2047] = '\0';
     shell_command_t *cmds = NULL;
     size_t count = 0;
-    int result = shell_tokenize_commands(input, &cmds, &count);
+    int result = (shell_tokenize_commands(input, strlen(input), &cmds,
+                                          &count) == SHELL_TOKENIZE_OK);
     test("Stress: very long token (2KB)",
          result && count == 1 && cmds[0].token_count == 1 &&
              cmds[0].tokens[0].length == sizeof(input) - 1 &&
              tokens_are_consistent(input, cmds, count));
-    shell_free_commands(cmds, count);
+    shell_commands_free(cmds, count);
   }
 
   // Test 144: Very long command (~8x typical)
@@ -1434,10 +1654,11 @@ int main(void) {
     }
     shell_command_t *cmds = NULL;
     size_t count = 0;
-    int result = shell_tokenize_commands(input, &cmds, &count);
+    int result = (shell_tokenize_commands(input, strlen(input), &cmds,
+                                          &count) == SHELL_TOKENIZE_OK);
     test("Stress: very long command (~8x)",
          result && count == 51 && tokens_are_consistent(input, cmds, count));
-    shell_free_commands(cmds, count);
+    shell_commands_free(cmds, count);
   }
 
   static const processor_case_t processor_cases[] = {
@@ -1570,8 +1791,8 @@ int main(void) {
     char input[] = "cat < in | grep x > out";
     shell_command_info_t *infos = NULL;
     size_t count = 0;
-    bool processed =
-        shell_process_command(input, NULL, &infos, &count) == SHELL_PROCESS_OK;
+    bool processed = shell_process_command(input, strlen(input), NULL, &infos,
+                                           &count) == SHELL_PROCESS_OK;
     memset(input, 'X', sizeof(input) - 1);
     bool valid =
         processed && count == 2 && infos &&
@@ -1585,7 +1806,7 @@ int main(void) {
         strncmp(infos[1].command_tokens[0].start, "grep", 4) == 0 &&
         infos[1].shell_tokens[0].start[0] == '>';
     test("Processor: returned metadata owns its source text", valid);
-    shell_free_command_infos(infos, count);
+    shell_command_infos_free(infos, count);
   }
 
   // Test: NULL handling
@@ -1593,7 +1814,7 @@ int main(void) {
     shell_command_info_t *infos = (shell_command_info_t *)(uintptr_t)1;
     size_t count = SIZE_MAX;
     shell_process_status_t process_result =
-        shell_process_command(NULL, NULL, &infos, &count);
+        shell_process_command(NULL, 0, NULL, &infos, &count);
     bool process_valid =
         process_result != SHELL_PROCESS_OK && infos == NULL && count == 0;
     test("Processor: NULL input clears every writable output", process_valid);
@@ -1602,6 +1823,8 @@ int main(void) {
     count = SIZE_MAX;
     process_result = shell_process_command("\x01"
                                            "cmd",
+                                           strlen("\x01"
+                                                  "cmd"),
                                            NULL, &infos, &count);
     process_valid =
         process_result != SHELL_PROCESS_OK && infos == NULL && count == 0;
@@ -1680,37 +1903,100 @@ int main(void) {
     shell_command_info_t *infos = NULL;
     size_t count = 0;
     shell_process_status_t rejected[] = {
-        shell_process_command("echo", NULL, NULL, &count),
-        shell_process_command("echo", NULL, &infos, NULL),
+        shell_process_command("echo", strlen("echo"), NULL, NULL, &count),
+        shell_process_command("echo", strlen("echo"), NULL, &infos, NULL),
     };
-    bool valid = !shell_has_dangerous_features(NULL);
+    bool valid = !shell_command_info_has_dangerous_features(NULL);
     for (size_t i = 0; i < sizeof(rejected) / sizeof(rejected[0]); i++)
       valid = valid && rejected[i] != SHELL_PROCESS_OK;
     test("Processor: NULL output and accessor contracts", valid);
   }
 
   {
+    static const char word[] = "word";
+    static const char redirect[] = ">";
+    shell_token_t tokens[] = {
+        {.type = SHELL_TOKEN_COMMAND, .start = word, .length = 4},
+        {.type = SHELL_TOKEN_REDIRECT_OUT, .start = redirect, .length = 1},
+        {.type = SHELL_TOKEN_ARGUMENT, .start = word, .length = 4},
+        {.type = SHELL_TOKEN_PIPE, .start = "|", .length = 1},
+        {.type = SHELL_TOKEN_SUBSHELL, .start = "$(x)", .length = 4},
+        {.type = SHELL_TOKEN_PROCESS_SUB, .start = "<(x)", .length = 4},
+    };
+    shell_command_t command = {
+        .tokens = tokens, .token_count = sizeof(tokens) / sizeof(tokens[0])};
+    shell_command_t plain = {.tokens = tokens, .token_count = 1};
+    shell_token_t redirections[] = {
+        {.type = SHELL_TOKEN_COMMAND, .start = word, .length = 4},
+        {.type = SHELL_TOKEN_REDIRECT_IN, .start = "<", .length = 1},
+        {.type = SHELL_TOKEN_ARGUMENT, .start = word, .length = 4},
+        {.type = SHELL_TOKEN_REDIRECT_APPEND, .start = ">>", .length = 2},
+        {.type = SHELL_TOKEN_ARGUMENT, .start = word, .length = 4},
+        {.type = SHELL_TOKEN_HEREDOC, .start = "<<", .length = 2},
+        {.type = SHELL_TOKEN_ARGUMENT, .start = word, .length = 4},
+        {.type = SHELL_TOKEN_HERESTRING, .start = "<<<", .length = 3},
+        {.type = SHELL_TOKEN_ARGUMENT, .start = word, .length = 4},
+        {.type = SHELL_TOKEN_REDIRECT_ERR, .start = "", .length = 0},
+        {.type = SHELL_TOKEN_ARGUMENT, .start = word, .length = 4},
+    };
+    shell_token_t plain_words[] = {
+        {.type = SHELL_TOKEN_COMMAND, .start = word, .length = 4},
+        {.type = SHELL_TOKEN_ARGUMENT, .start = word, .length = 4},
+    };
+    shell_command_t only_words = {.tokens = plain_words, .token_count = 2};
+    shell_command_t nested_word = {.tokens = &tokens[4], .token_count = 2};
+    shell_command_t redirects = {
+        .tokens = redirections,
+        .token_count = sizeof(redirections) / sizeof(redirections[0]),
+    };
+    bool valid =
+        shell_processed_command_word_count(NULL) == 0 &&
+        shell_processed_command_word_count(&command) == 3 &&
+        shell_processed_command_word_at(NULL, 0) == NULL &&
+        shell_processed_command_word_at(&command, 0) == &tokens[0] &&
+        shell_processed_command_word_at(&command, 1) == &tokens[4] &&
+        shell_processed_command_word_at(&command, 2) == &tokens[5] &&
+        shell_processed_command_word_at(&command, 3) == NULL &&
+        shell_processed_command_word_count(&redirects) == 2 &&
+        shell_processed_command_word_at(&redirects, 1) == &redirections[10] &&
+        !shell_processed_command_has_dangerous_features(NULL, false) &&
+        shell_processed_command_has_dangerous_features(&plain, true) &&
+        shell_processed_command_has_dangerous_features(&command, false) &&
+        shell_processed_command_has_dangerous_features(&nested_word, false) &&
+        !shell_processed_command_has_dangerous_features(&only_words, false) &&
+        !shell_processed_command_has_pipe_output(NULL) &&
+        shell_processed_command_has_pipe_output(&command) &&
+        !shell_processed_command_has_pipe_output(&plain);
+    test("Processed-command word accessors respect redirection operands",
+         valid);
+  }
+
+  {
     shell_command_info_t *infos = (shell_command_info_t *)(uintptr_t)1;
     size_t count = SIZE_MAX;
     const shell_process_limits_t tiny = {3, 3};
-    shell_process_status_t status =
-        shell_process_command("echo value", &tiny, &infos, &count);
+    shell_process_status_t status = shell_process_command(
+        "echo value", strlen("echo value"), &tiny, &infos, &count);
     test("Processor: explicit output limits report rejection",
          status == SHELL_PROCESS_EOUTPUT_LIMIT && infos == NULL && count == 0);
-    shell_free_command_infos(infos, count);
+    shell_command_infos_free(infos, count);
   }
 
   {
     shell_command_info_t *infos = NULL;
     size_t count = 0;
+    size_t measured = SIZE_MAX;
     char *netargv = (char *)(uintptr_t)1;
     shell_process_limits_t limits = {1, 1};
     bool valid =
         shell_render_netargv(NULL, NULL, &netargv) == SHELL_PROCESS_EINPUT &&
         netargv == NULL &&
-        shell_process_command("echo x", NULL, &infos, &count) ==
-            SHELL_PROCESS_OK &&
+        shell_process_command("echo x", strlen("echo x"), NULL, &infos,
+                              &count) == SHELL_PROCESS_OK &&
         count == 1 &&
+        shell_measure_netargv(NULL, &measured) == SHELL_PROCESS_EINPUT &&
+        measured == 0 &&
+        shell_measure_netargv(&infos[0], NULL) == SHELL_PROCESS_EINPUT &&
         shell_render_netargv(&infos[0], NULL, NULL) == SHELL_PROCESS_EINPUT &&
         shell_render_netargv(&infos[0], &limits, &netargv) ==
             SHELL_PROCESS_EOUTPUT_LIMIT &&
@@ -1727,8 +2013,38 @@ int main(void) {
                 SHELL_PROCESS_ENOMEM &&
             netargv == NULL;
     shellsplit_test_alloc_reset();
-    shell_free_command_infos(infos, count);
+    shell_command_infos_free(infos, count);
     test("Netargv rendering validates limits and allocation failures", valid);
+  }
+
+  {
+    shell_command_info_t *infos = NULL;
+    size_t count = 0;
+    bool valid = shell_process_command("printf '' 'two words'",
+                                       strlen("printf '' 'two words'"), NULL,
+                                       &infos, &count) == SHELL_PROCESS_OK &&
+                 count == 1;
+    size_t length = 0, written = SIZE_MAX;
+    char exact[32] = {0};
+    char short_buffer[31];
+    memset(short_buffer, 0xA5, sizeof(short_buffer));
+    char *allocated = NULL;
+    valid =
+        valid &&
+        shell_measure_netargv(&infos[0], &length) == SHELL_PROCESS_OK &&
+        length == strlen("6:printf,0:,9:two words,") &&
+        length + 1 <= sizeof(exact) &&
+        shell_write_netargv(&infos[0], exact, length + 1, &written) ==
+            SHELL_PROCESS_OK &&
+        written == length && strcmp(exact, "6:printf,0:,9:two words,") == 0 &&
+        shell_write_netargv(&infos[0], short_buffer, length, &written) ==
+            SHELL_PROCESS_EOUTPUT_LIMIT &&
+        written == 0 && short_buffer[0] == (char)0xA5 &&
+        shell_render_netargv(&infos[0], NULL, &allocated) == SHELL_PROCESS_OK &&
+        strcmp(allocated, exact) == 0;
+    free(allocated);
+    shell_command_infos_free(infos, count);
+    test("Netargv measure/write matches allocating renderer", valid);
   }
 
   printf("\n=== PIPELINE/SUBCOMMAND EXTRACTION TESTS ===\n\n");
@@ -1804,11 +2120,12 @@ int main(void) {
     }
     shell_command_t *cmds = NULL;
     size_t count = 0;
-    int result = shell_tokenize_commands(input, &cmds, &count);
+    int result = (shell_tokenize_commands(input, strlen(input), &cmds,
+                                          &count) == SHELL_TOKENIZE_OK);
     test("Stress: max depth nesting (20 levels)",
          result && count == 1 && cmds[0].has_subshells &&
              tokens_are_consistent(input, cmds, count));
-    shell_free_commands(cmds, count);
+    shell_commands_free(cmds, count);
   }
 
   static const feature_case_t compound_syntax_cases[] = {
@@ -1899,11 +2216,12 @@ int main(void) {
     }
     shell_command_t *cmds = NULL;
     size_t count = 0;
-    int result = shell_tokenize_commands(input, &cmds, &count);
+    int result = (shell_tokenize_commands(input, strlen(input), &cmds,
+                                          &count) == SHELL_TOKENIZE_OK);
     test("Stress: long command (200 args)",
          result && count == 1 && cmds[0].token_count == 201 &&
              tokens_are_consistent(input, cmds, count));
-    shell_free_commands(cmds, count);
+    shell_commands_free(cmds, count);
   }
 
   // Test 191: Very long pipeline with many args
@@ -1917,13 +2235,14 @@ int main(void) {
     }
     shell_command_t *cmds = NULL;
     size_t count = 0;
-    int result = shell_tokenize_commands(input, &cmds, &count);
+    int result = (shell_tokenize_commands(input, strlen(input), &cmds,
+                                          &count) == SHELL_TOKENIZE_OK);
     bool token_counts_match = result && count == 50;
     for (size_t i = 0; token_counts_match && i < count; i++)
       token_counts_match = cmds[i].token_count == (i + 1 < count ? 5 : 4);
     test("Stress: long pipeline (50 stages)",
          token_counts_match && tokens_are_consistent(input, cmds, count));
-    shell_free_commands(cmds, count);
+    shell_commands_free(cmds, count);
   }
 
   // Test 206: Very long variable name
@@ -1933,11 +2252,12 @@ int main(void) {
     input[2006] = '\0';
     shell_command_t *cmds = NULL;
     size_t count = 0;
-    int result = shell_tokenize_commands(input, &cmds, &count);
+    int result = (shell_tokenize_commands(input, strlen(input), &cmds,
+                                          &count) == SHELL_TOKENIZE_OK);
     test("Stress: very long variable name (2000 characters)",
          result && count == 1 && cmds[0].has_variables &&
              tokens_are_consistent(input, cmds, count));
-    shell_free_commands(cmds, count);
+    shell_commands_free(cmds, count);
   }
 
   /* --- PARSER REGRESSION TESTS --- */
@@ -1969,12 +2289,13 @@ int main(void) {
     const char *input = "\"text \"text";
     shell_command_t *cmds = NULL;
     size_t count = 0;
-    int result = shell_tokenize_commands(input, &cmds, &count);
+    int result = (shell_tokenize_commands(input, strlen(input), &cmds,
+                                          &count) == SHELL_TOKENIZE_OK);
     // This is CORRECT behavior - shell parses it as two words
     test("Adjacent quoted and unquoted text is one command",
          result && count == 1 && tokens_are_consistent(input, cmds, count));
     if (cmds)
-      shell_free_commands(cmds, count);
+      shell_commands_free(cmds, count);
   }
 
   // Test 218: Double keyword 'if if' - actually VALID shell syntax!
@@ -1984,11 +2305,12 @@ int main(void) {
     const char *input = "if if cmd";
     shell_command_t *cmds = NULL;
     size_t count = 0;
-    int result = shell_tokenize_commands(input, &cmds, &count);
+    int result = (shell_tokenize_commands(input, strlen(input), &cmds,
+                                          &count) == SHELL_TOKENIZE_OK);
     test("Tokenizer accepts keyword-shaped command fragments",
          result && count == 1 && tokens_are_consistent(input, cmds, count));
     if (cmds)
-      shell_free_commands(cmds, count);
+      shell_commands_free(cmds, count);
   }
 
   // Test 219: Double 'then' keyword - complex case requires full grammar
@@ -1998,12 +2320,13 @@ int main(void) {
     const char *input = "if true; then then cmd; fi";
     shell_command_t *cmds = NULL;
     size_t count = 0;
-    int result = shell_tokenize_commands(input, &cmds, &count);
+    int result = (shell_tokenize_commands(input, strlen(input), &cmds,
+                                          &count) == SHELL_TOKENIZE_OK);
     // This is a complex case - fast tokenizer may not catch nested "then then"
     test("Non-strict tokenizer accepts unsupported compound grammar",
          result == 1);
     if (cmds)
-      shell_free_commands(cmds, count);
+      shell_commands_free(cmds, count);
   }
 
   // Regression: an unmatched glob bracket must not create a token beyond the
@@ -2015,7 +2338,7 @@ int main(void) {
     bool in_bounds = true;
     size_t input_len = strlen(input);
 
-    shell_tokenizer_init(&state, input);
+    shell_tokenizer_init(&state, input, strlen(input));
     while (shell_tokenizer_next(&state, &token)) {
       if (token.position > input_len ||
           token.length > input_len - token.position ||
@@ -2032,23 +2355,25 @@ int main(void) {
     size_t count = 0;
     char *netargv = NULL;
     shell_process_status_t status = shell_process_command(
-        "printf '' foo\"bar\" 'two words' '>'", NULL, &infos, &count);
+        "printf '' foo\"bar\" 'two words' '>'",
+        strlen("printf '' foo\"bar\" 'two words' '>'"), NULL, &infos, &count);
     if (status == SHELL_PROCESS_OK && count == 1)
       status = shell_render_netargv(&infos[0], NULL, &netargv);
     bool valid = status == SHELL_PROCESS_OK && count == 1 && netargv &&
                  strcmp(netargv, "6:printf,0:,6:foobar,9:two words,1:>,") == 0;
     test("Netargv rendering preserves exact argument boundaries", valid);
     free(netargv);
-    shell_free_command_infos(infos, count);
+    shell_command_infos_free(infos, count);
   }
 
   {
     char *sequence = NULL;
     size_t count = 0;
     bool features = false;
-    shell_process_status_t status =
-        shell_extract_netargv_sequence("printf '' 'two words'; cd '/tmp path'",
-                                       NULL, &sequence, &count, &features);
+    shell_process_status_t status = shell_build_netargv_sequence(
+        "printf '' 'two words'; cd '/tmp path'",
+        strlen("printf '' 'two words'; cd '/tmp path'"), NULL, &sequence,
+        &count, &features);
     bool valid =
         status == SHELL_PROCESS_OK && count == 2 && features && sequence &&
         strcmp(sequence, "24:6:printf,0:,9:two words,,17:2:cd,9:/tmp path,,") ==
@@ -2056,34 +2381,175 @@ int main(void) {
     test("Nested netargv sequence preserves subcommand boundaries", valid);
     free(sequence);
 
+    char *command_netseq = NULL;
+    char *type_netseq = NULL;
+    char *expected_command_netseq = NULL;
+    char *expected_type_netseq = NULL;
+    size_t paired_count = 0;
+    valid =
+        shell_build_anomaly_netseqs(
+            "printf '' 'two words'; cd '/tmp path'",
+            strlen("printf '' 'two words'; cd '/tmp path'"), NULL,
+            &command_netseq, &type_netseq, &paired_count) == SHELL_PROCESS_OK &&
+        shell_build_command_netseq(
+            "printf '' 'two words'; cd '/tmp path'",
+            strlen("printf '' 'two words'; cd '/tmp path'"), NULL,
+            &expected_command_netseq, &count) == SHELL_PROCESS_OK &&
+        shell_build_type_netseq("printf '' 'two words'; cd '/tmp path'",
+                                strlen("printf '' 'two words'; cd '/tmp path'"),
+                                NULL, &expected_type_netseq,
+                                &count) == SHELL_PROCESS_OK &&
+        paired_count == 2 && command_netseq && type_netseq &&
+        strcmp(command_netseq, expected_command_netseq) == 0 &&
+        strcmp(type_netseq, expected_type_netseq) == 0;
+    test("Paired anomaly netsequences share canonical command boundaries",
+         valid);
+    free(expected_type_netseq);
+    free(expected_command_netseq);
+    free(type_netseq);
+    free(command_netseq);
+
+    command_netseq = (char *)(uintptr_t)1;
+    type_netseq = (char *)(uintptr_t)1;
+    paired_count = SIZE_MAX;
+    valid = shell_build_anomaly_netseqs(NULL, 0, NULL, &command_netseq,
+                                        &type_netseq, &paired_count) ==
+                SHELL_PROCESS_EINPUT &&
+            command_netseq == NULL && type_netseq == NULL && paired_count == 0;
+    shell_process_limits_t pair_limits = {SIZE_MAX, 8};
+    valid = valid &&
+            shell_build_anomaly_netseqs(
+                "echo x", strlen("echo x"), &pair_limits, &command_netseq,
+                &type_netseq, &paired_count) == SHELL_PROCESS_EOUTPUT_LIMIT &&
+            command_netseq == NULL && type_netseq == NULL && paired_count == 0;
+    test("Paired anomaly netsequences clear every output on failure", valid);
+
+    static const char *const paired_inputs[] = {
+        "'my tool' 'two words' 2>&1; printf '' | sed 's/x/y/'",
+        "printf \\\"quoted\\\"; echo one\\ two >output",
+        "echo x && cd '/tmp path'; :",
+    };
+    valid = true;
+    for (size_t i = 0; i < sizeof(paired_inputs) / sizeof(paired_inputs[0]);
+         i++) {
+      const char *input = paired_inputs[i];
+      command_netseq = NULL;
+      type_netseq = NULL;
+      expected_command_netseq = NULL;
+      expected_type_netseq = NULL;
+      paired_count = 0;
+      size_t command_count = 0;
+      size_t type_count = 0;
+      valid = valid &&
+              shell_build_anomaly_netseqs(input, strlen(input), NULL,
+                                          &command_netseq, &type_netseq,
+                                          &paired_count) == SHELL_PROCESS_OK &&
+              shell_build_command_netseq(input, strlen(input), NULL,
+                                         &expected_command_netseq,
+                                         &command_count) == SHELL_PROCESS_OK &&
+              shell_build_type_netseq(input, strlen(input), NULL,
+                                      &expected_type_netseq,
+                                      &type_count) == SHELL_PROCESS_OK &&
+              paired_count == command_count && paired_count == type_count &&
+              strcmp(command_netseq, expected_command_netseq) == 0 &&
+              strcmp(type_netseq, expected_type_netseq) == 0;
+      free(expected_type_netseq);
+      free(expected_command_netseq);
+      free(type_netseq);
+      free(command_netseq);
+    }
+    test("Paired anomaly netsequences match independent builders", valid);
+
+    command_netseq = (char *)(uintptr_t)1;
+    type_netseq = (char *)(uintptr_t)1;
+    paired_count = SIZE_MAX;
+    valid = shell_build_anomaly_netseqs(
+                "'' x", strlen("'' x"), NULL, &command_netseq, &type_netseq,
+                &paired_count) == SHELL_PROCESS_EPARSE &&
+            command_netseq == NULL && type_netseq == NULL && paired_count == 0;
+    command_netseq = (char *)(uintptr_t)1;
+    type_netseq = (char *)(uintptr_t)1;
+    paired_count = SIZE_MAX;
+    valid =
+        valid &&
+        shell_build_anomaly_netseqs("\x01"
+                                    "bad",
+                                    strlen("\x01"
+                                           "bad"),
+                                    NULL, &command_netseq, &type_netseq,
+                                    &paired_count) == SHELL_PROCESS_EINPUT &&
+        command_netseq == NULL && type_netseq == NULL && paired_count == 0;
+    test("Paired anomaly netsequences reject empty executables atomically",
+         valid);
+
+    valid = true;
+    bool pair_completed = false;
+    for (size_t fail_at = 1; fail_at < 48; fail_at++) {
+      shellsplit_test_alloc_reset();
+      shellsplit_test_alloc_fail_at(fail_at);
+      command_netseq = (char *)(uintptr_t)1;
+      type_netseq = (char *)(uintptr_t)1;
+      paired_count = SIZE_MAX;
+      status = shell_build_anomaly_netseqs(
+          "echo x; printf y", strlen("echo x; printf y"), NULL, &command_netseq,
+          &type_netseq, &paired_count);
+      if (status == SHELL_PROCESS_OK) {
+        pair_completed = true;
+        free(type_netseq);
+        free(command_netseq);
+        break;
+      }
+      valid = valid && status == SHELL_PROCESS_ENOMEM &&
+              command_netseq == NULL && type_netseq == NULL &&
+              paired_count == 0;
+    }
+    shellsplit_test_alloc_reset();
+    test("Paired anomaly netsequences are allocation-failure atomic",
+         valid && pair_completed);
+
+    shell_command_info_t *infos = NULL;
+    size_t info_count = 0;
+    status = shell_process_command(
+        "cmd 2>>errors <>input &>output >|forced\n",
+        strlen("cmd 2>>errors <>input &>output >|forced\n"), NULL, &infos,
+        &info_count);
+    valid = status == SHELL_PROCESS_OK && infos && info_count == 3;
+    shell_command_infos_free(infos, info_count);
+    test("Processor owns compound-redirection token boundaries", valid);
+
     sequence = (char *)1;
     count = 99;
     features = true;
-    valid = shell_extract_netargv_sequence(NULL, NULL, &sequence, &count,
-                                           &features) == SHELL_PROCESS_EINPUT &&
+    valid = shell_build_netargv_sequence(NULL, 0, NULL, &sequence, &count,
+                                         &features) == SHELL_PROCESS_EINPUT &&
             sequence == NULL && count == 0 && !features;
     test("Nested netargv sequence rejects invalid input atomically", valid);
 
-    valid = shell_extract_netargv_sequence("echo x", NULL, NULL, &count,
-                                           &features) == SHELL_PROCESS_EINPUT &&
+    valid = shell_build_netargv_sequence("echo x", strlen("echo x"), NULL, NULL,
+                                         &count,
+                                         &features) == SHELL_PROCESS_EINPUT &&
             count == 0 && !features;
     valid = valid &&
-            shell_extract_netargv_sequence("echo x", NULL, &sequence, NULL,
-                                           &features) == SHELL_PROCESS_EINPUT &&
+            shell_build_netargv_sequence("echo x", strlen("echo x"), NULL,
+                                         &sequence, NULL,
+                                         &features) == SHELL_PROCESS_EINPUT &&
             sequence == NULL && !features;
     valid = valid &&
-            shell_extract_netargv_sequence("echo x", NULL, &sequence, &count,
-                                           NULL) == SHELL_PROCESS_EINPUT &&
+            shell_build_netargv_sequence("echo x", strlen("echo x"), NULL,
+                                         &sequence, &count,
+                                         NULL) == SHELL_PROCESS_EINPUT &&
             sequence == NULL && count == 0;
     test("Nested netargv sequence validates every output", valid);
 
     sequence = (char *)(uintptr_t)1;
     count = SIZE_MAX;
     features = true;
-    valid = shell_extract_netargv_sequence("\x01"
-                                           "bad",
-                                           NULL, &sequence, &count,
-                                           &features) == SHELL_PROCESS_EPARSE &&
+    valid = shell_build_netargv_sequence("\x01"
+                                         "bad",
+                                         strlen("\x01"
+                                                "bad"),
+                                         NULL, &sequence, &count,
+                                         &features) == SHELL_PROCESS_EINPUT &&
             sequence == NULL && count == 0 && !features;
     test("Nested netargv sequence propagates parser failures atomically",
          valid);
@@ -2091,15 +2557,15 @@ int main(void) {
     shell_process_limits_t limits = {SIZE_MAX, SIZE_MAX};
     limits.max_string_bytes = 1;
     features = true;
-    valid = shell_extract_netargv_sequence("echo x", &limits, &sequence, &count,
-                                           &features) ==
+    valid = shell_build_netargv_sequence("echo x", strlen("echo x"), &limits,
+                                         &sequence, &count, &features) ==
                 SHELL_PROCESS_EOUTPUT_LIMIT &&
             sequence == NULL && count == 0 && !features;
     test("Nested netargv sequence enforces its outer output limit", valid);
 
     limits = (shell_process_limits_t){SIZE_MAX, 10};
-    valid = shell_extract_netargv_sequence("echo x", &limits, &sequence, &count,
-                                           &features) ==
+    valid = shell_build_netargv_sequence("echo x", strlen("echo x"), &limits,
+                                         &sequence, &count, &features) ==
                 SHELL_PROCESS_EOUTPUT_LIMIT &&
             sequence == NULL && count == 0 && !features;
     test("Nested netargv sequence checks its post-processing size", valid);
@@ -2112,8 +2578,8 @@ int main(void) {
       sequence = (char *)(uintptr_t)1;
       count = SIZE_MAX;
       features = true;
-      status = shell_extract_netargv_sequence("echo x", NULL, &sequence, &count,
-                                              &features);
+      status = shell_build_netargv_sequence("echo x", strlen("echo x"), NULL,
+                                            &sequence, &count, &features);
       if (status == SHELL_PROCESS_OK) {
         completed = true;
         free(sequence);
@@ -2128,32 +2594,36 @@ int main(void) {
 
     sequence = NULL;
     count = 0;
-    valid = shell_build_command_netseq("'my tool' one two; printf x", NULL,
-                                       &sequence, &count) == SHELL_PROCESS_OK &&
-            count == 2 && sequence &&
-            strcmp(sequence, "7:my tool,6:printf,") == 0;
+    valid =
+        shell_build_command_netseq("'my tool' one two; printf x",
+                                   strlen("'my tool' one two; printf x"), NULL,
+                                   &sequence, &count) == SHELL_PROCESS_OK &&
+        count == 2 && sequence && strcmp(sequence, "7:my tool,6:printf,") == 0;
     test("Command netsequence records executables rather than arguments",
          valid);
     free(sequence);
 
-    valid = shell_build_command_netseq("echo x", NULL, NULL, &count) ==
-                SHELL_PROCESS_EINPUT &&
+    valid = shell_build_command_netseq("echo x", strlen("echo x"), NULL, NULL,
+                                       &count) == SHELL_PROCESS_EINPUT &&
             count == 0;
-    valid = valid &&
-            shell_build_command_netseq("echo x", NULL, &sequence, NULL) ==
-                SHELL_PROCESS_EINPUT &&
-            sequence == NULL;
+    valid =
+        valid &&
+        shell_build_command_netseq("echo x", strlen("echo x"), NULL, &sequence,
+                                   NULL) == SHELL_PROCESS_EINPUT &&
+        sequence == NULL;
     limits = (shell_process_limits_t){SIZE_MAX, SIZE_MAX};
     limits.max_total_bytes = 1;
     valid = valid &&
-            shell_build_command_netseq("echo x", &limits, &sequence, &count) ==
-                SHELL_PROCESS_EOUTPUT_LIMIT &&
+            shell_build_command_netseq("echo x", strlen("echo x"), &limits,
+                                       &sequence,
+                                       &count) == SHELL_PROCESS_EOUTPUT_LIMIT &&
             sequence == NULL && count == 0;
     test("Command netsequence validates outputs and limits", valid);
 
     limits = (shell_process_limits_t){SIZE_MAX, 6};
-    valid = shell_build_command_netseq("echo x", &limits, &sequence, &count) ==
-                SHELL_PROCESS_EOUTPUT_LIMIT &&
+    valid = shell_build_command_netseq("echo x", strlen("echo x"), &limits,
+                                       &sequence,
+                                       &count) == SHELL_PROCESS_EOUTPUT_LIMIT &&
             sequence == NULL && count == 0;
     test("Command netsequence checks its encoded size", valid);
 
@@ -2161,8 +2631,10 @@ int main(void) {
     count = SIZE_MAX;
     valid = shell_build_command_netseq("\x01"
                                        "bad",
+                                       strlen("\x01"
+                                              "bad"),
                                        NULL, &sequence,
-                                       &count) == SHELL_PROCESS_EPARSE &&
+                                       &count) == SHELL_PROCESS_EINPUT &&
             sequence == NULL && count == 0;
     test("Command netsequence propagates parser failures atomically", valid);
 
@@ -2173,7 +2645,8 @@ int main(void) {
       shellsplit_test_alloc_fail_at(fail_at);
       sequence = (char *)(uintptr_t)1;
       count = SIZE_MAX;
-      status = shell_build_command_netseq("echo x", NULL, &sequence, &count);
+      status = shell_build_command_netseq("echo x", strlen("echo x"), NULL,
+                                          &sequence, &count);
       if (status == SHELL_PROCESS_OK) {
         completed = true;
         free(sequence);

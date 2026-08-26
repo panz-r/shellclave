@@ -20,7 +20,7 @@ extern "C" {
  * @param n  N-gram size (1 for char, 2 for 2-gram)
  * @return   Entropy in bits, or NAN for invalid input
  */
-double ngram_entropy(const char *s, int n);
+double shell_rpe_ngram_entropy(const char *s, int n);
 
 /**
  * Calculate median permutation entropy
@@ -30,7 +30,7 @@ double ngram_entropy(const char *s, int n);
  * @return        Median entropy of permutations, or NAN for invalid input or
  *                allocation failure
  */
-double permutation_entropy(const char *s, int n_perms, int n);
+double shell_rpe_permutation_entropy(const char *s, int n_perms, int n);
 
 /**
  * Calculate relative entropy ratio
@@ -40,14 +40,14 @@ double permutation_entropy(const char *s, int n_perms, int n);
  * @return        Ratio: H(original) / H(permuted), or NAN for invalid input or
  *                allocation failure
  */
-double relative_entropy_ratio(const char *s, int n_perms, int n);
+double shell_rpe_relative_entropy_ratio(const char *s, int n_perms, int n);
 
 /**
  * Calculate conditional entropy H(Char_i | Char_{i-1})
  * @param s  Input string
  * @return   Conditional entropy in bits, or NAN for invalid input
  */
-double conditional_entropy(const char *s);
+double shell_rpe_conditional_entropy(const char *s);
 
 /**
  * Calculate median conditional entropy over permutations
@@ -56,7 +56,7 @@ double conditional_entropy(const char *s);
  * @return        Median conditional entropy of permutations, or NAN for
  *                invalid input or allocation failure
  */
-double permutation_conditional_entropy(const char *s, int n_perms);
+double shell_rpe_permutation_conditional_entropy(const char *s, int n_perms);
 
 /**
  * Calculate relative conditional entropy ratio
@@ -65,7 +65,7 @@ double permutation_conditional_entropy(const char *s, int n_perms);
  * @return        Ratio: H_cond(original) / H_cond(permuted), or NAN for
  *                invalid input or allocation failure
  */
-double relative_conditional_entropy(const char *s, int n_perms);
+double shell_rpe_relative_conditional_entropy(const char *s, int n_perms);
 
 #ifdef __cplusplus
 }

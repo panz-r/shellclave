@@ -87,13 +87,13 @@ int main(void) {
     add_cpl(policy, buf);
   }
 
-  if (st_policy_count(policy) != N_PATTERNS) {
+  if (st_policy_rule_count(policy) != N_PATTERNS) {
     fprintf(stderr, "benchmark policy has %zu patterns, expected %d\n",
-            st_policy_count(policy), N_PATTERNS);
+            st_policy_rule_count(policy), N_PATTERNS);
     return EXIT_FAILURE;
   }
 
-  printf("Policy: %zu patterns, %zu states\n", st_policy_count(policy),
+  printf("Policy: %zu patterns, %zu states\n", st_policy_rule_count(policy),
          st_policy_state_count(policy));
 
   /* Warm up (triggers lazy filter rebuild) */
@@ -157,6 +157,6 @@ int main(void) {
   printf("  Filter rebuilds: %lu\n", (unsigned long)stats.filter_rebuild_count);
 
   st_policy_free(policy);
-  st_policy_ctx_free(ctx);
+  st_policy_ctx_release(ctx);
   return 0;
 }

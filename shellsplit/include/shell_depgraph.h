@@ -202,7 +202,7 @@ typedef struct {
 } shell_dep_graph_t;
 
 /**
- * Validation result - checked by shell_dep_validate
+ * Validation result - checked by shell_dep_graph_validate
  */
 #define SHELL_DEP_MAX_VALIDATE_ERRORS 16
 
@@ -213,7 +213,7 @@ typedef struct {
     uint32_t edge_idx;
     char msg[96];
   } errors[SHELL_DEP_MAX_VALIDATE_ERRORS];
-} shell_dep_validate_result_t;
+} shell_dep_graph_validation_t;
 
 /* --- API --- */
 
@@ -224,8 +224,8 @@ typedef struct {
  * the original `cmd` string. The caller must ensure `cmd` remains valid and
  * unmodified for the lifetime of the graph.
  *
- * `depth` limits recursion for subshell parsing. Pass 0 for top-level.
- * Returns SHELL_DEP_EPARSE if depth exceeds 16 (defense-in-depth).
+ * Subshell parsing is internally limited to 16 levels (defense-in-depth).
+ * Returns SHELL_DEP_EPARSE when that limit is exceeded.
  * Returns SHELL_DEP_ETRUNC and sets SHELL_DEP_STATUS_TRUNCATED when a caller
  * limit or fixed parser limit prevents the complete graph from being stored.
  * On input or parse errors, writable output counts are cleared and
@@ -236,10 +236,10 @@ typedef struct {
  * grammar; malformed structures are rejected instead of being represented as
  * a partial graph.
  */
-shell_dep_error_t shell_parse_depgraph(const char *cmd, size_t cmd_len,
-                                       const char *initial_cwd,
-                                       const shell_dep_limits_t *limits,
-                                       uint32_t depth, shell_dep_graph_t *out);
+shell_dep_error_t shell_dep_graph_parse(const char *cmd, size_t cmd_len,
+                                        const char *initial_cwd,
+                                        const shell_dep_limits_t *limits,
+                                        shell_dep_graph_t *out);
 
 const char *shell_dep_edge_type_name(shell_dep_edge_type_t type);
 const char *shell_dep_node_type_name(shell_dep_node_type_t type);
@@ -258,7 +258,8 @@ void shell_dep_graph_dump(const shell_dep_graph_t *g, FILE *fp);
  *    READ requires DOC→CMD, WRITE/APPEND require CMD→DOC,
  *    ENV requires DOC→CMD, ARG requires CMD↔DOC)
  */
-shell_dep_validate_result_t shell_dep_validate(const shell_dep_graph_t *g);
+shell_dep_graph_validation_t
+shell_dep_graph_validate(const shell_dep_graph_t *g);
 
 #ifdef __cplusplus
 }

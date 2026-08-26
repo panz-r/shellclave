@@ -28,46 +28,47 @@ extern "C" {
  */
 typedef enum {
   // Basic types
-  TOKEN_COMMAND,         // Command name or path
-  TOKEN_ARGUMENT,        // Command argument
-  TOKEN_PIPE,            // Pipe operator
-  TOKEN_REDIRECT_IN,     // Input redirection
-  TOKEN_REDIRECT_OUT,    // Output redirection
-  TOKEN_REDIRECT_ERR,    // Error redirection
-  TOKEN_REDIRECT_APPEND, // Append redirection
-  TOKEN_SEMICOLON,       // Command separator
-  TOKEN_AND,             // Logical AND
-  TOKEN_BACKGROUND,      // Background command separator (&)
-  TOKEN_OR,              // Logical OR
-  TOKEN_SUBSHELL_START,  // Subshell start
-  TOKEN_SUBSHELL_END,    // Subshell end
-  TOKEN_GROUP_START,     // Parenthesized command-group start
-  TOKEN_GROUP_END,       // Parenthesized command-group end
-  TOKEN_END,             // End of tokens
+  SHELL_TOKEN_COMMAND,         // Command name or path
+  SHELL_TOKEN_ARGUMENT,        // Command argument
+  SHELL_TOKEN_PIPE,            // Pipe operator
+  SHELL_TOKEN_REDIRECT_IN,     // Input redirection
+  SHELL_TOKEN_REDIRECT_OUT,    // Output redirection
+  SHELL_TOKEN_REDIRECT_ERR,    // Error redirection
+  SHELL_TOKEN_REDIRECT_APPEND, // Append redirection
+  SHELL_TOKEN_SEMICOLON,       // Command separator
+  SHELL_TOKEN_AND,             // Logical AND
+  SHELL_TOKEN_BACKGROUND,      // Background command separator (&)
+  SHELL_TOKEN_OR,              // Logical OR
+  SHELL_TOKEN_SUBSHELL_START,  // Subshell start
+  SHELL_TOKEN_SUBSHELL_END,    // Subshell end
+  SHELL_TOKEN_GROUP_START,     // Parenthesized command-group start
+  SHELL_TOKEN_GROUP_END,       // Parenthesized command-group end
+  SHELL_TOKEN_END,             // End of tokens
 
   // Extended types
-  TOKEN_VARIABLE,        // $VAR, ${VAR}
-  TOKEN_VARIABLE_QUOTED, // Double-quoted shell word containing an expansion
-  TOKEN_SPECIAL_VAR,     // $1, $#, $?, $$, $!, $@, $*, $-
-  TOKEN_GLOB,            // *.txt, file?
-  TOKEN_SUBSHELL,        // $(command), `command`
-  TOKEN_ARITHMETIC,      // $((expr))
-  TOKEN_PROCESS_SUB,     // <(command), >(command)
-  TOKEN_HEREDOC,         // << delimiter
-  TOKEN_HERESTRING       // <<< here-string
-} token_type_t;
+  SHELL_TOKEN_VARIABLE,        // $VAR, ${VAR}
+  SHELL_TOKEN_VARIABLE_QUOTED, // Double-quoted shell word containing an
+                               // expansion
+  SHELL_TOKEN_SPECIAL_VAR,     // $1, $#, $?, $$, $!, $@, $*, $-
+  SHELL_TOKEN_GLOB,            // *.txt, file?
+  SHELL_TOKEN_SUBSHELL,        // $(command), `command`
+  SHELL_TOKEN_ARITHMETIC,      // $((expr))
+  SHELL_TOKEN_PROCESS_SUB,     // <(command), >(command)
+  SHELL_TOKEN_HEREDOC,         // << delimiter
+  SHELL_TOKEN_HERESTRING       // <<< here-string
+} shell_token_type_t;
 
 /**
  * Token structure
  */
 typedef struct {
-  token_type_t type;  // Token type
-  const char *start;  // Pointer to start of token in original string
-  size_t length;      // Length of token
-  size_t position;    // Position in original string
-  bool is_quoted;     // True if token is quoted
-  bool is_escaped;    // True if token contains escapes
-  size_t group_depth; // Parenthesized command-group nesting depth
+  shell_token_type_t type; // Token type
+  const char *start;       // Pointer to start of token in original string
+  size_t length;           // Length of token
+  size_t position;         // Position in original string
+  bool is_quoted;          // True if token is quoted
+  bool is_escaped;         // True if token contains escapes
+  size_t group_depth;      // Parenthesized command-group nesting depth
 } shell_token_t;
 
 /**
@@ -112,40 +113,52 @@ typedef struct {
 } shell_tokenizer_state_t;
 
 /**
- * Initialize tokenizer. A NULL input initializes an empty tokenizer. Passing a
- * NULL state has no effect.
+ * Initialize a tokenizer over exactly `input_length` source bytes. NULL input
+ * is valid only with zero length. Returns false for invalid input or state.
  */
-void shell_tokenizer_init(shell_tokenizer_state_t *state, const char *input);
+bool shell_tokenizer_init(shell_tokenizer_state_t *state, const char *input,
+                          size_t input_length);
 
 /**
  * Get next token. Returns false without advancing state when token is NULL.
  * When token is writable but state is NULL or exhausted, token is cleared and
- * set to TOKEN_END.
+ * set to SHELL_TOKEN_END.
  */
 bool shell_tokenizer_next(shell_tokenizer_state_t *state, shell_token_t *token);
 
+typedef enum {
+  SHELL_TOKENIZE_OK = 0,
+  SHELL_TOKENIZE_EINPUT,
+  SHELL_TOKENIZE_EPARSE,
+  SHELL_TOKENIZE_ENOMEM,
+  SHELL_TOKENIZE_EOVERFLOW,
+} shell_tokenize_status_t;
+
 /**
- * Tokenize an entire command line into commands. The caller frees the result
- * with shell_free_commands(); token text points into input, which must remain
+ * Tokenize exactly `input_length` shell-source bytes into commands. Embedded
+ * NUL is rejected. The caller frees the result
+ * with shell_commands_free(); token text points into input, which must remain
  * valid until the result is freed. On failure, writable outputs are NULL and 0.
  */
-bool shell_tokenize_commands(const char *input, shell_command_t **commands,
-                             size_t *command_count);
+shell_tokenize_status_t shell_tokenize_commands(const char *input,
+                                                size_t input_length,
+                                                shell_command_t **commands,
+                                                size_t *command_count);
 
 /**
  * Free tokenized commands
  */
-void shell_free_commands(shell_command_t *commands, size_t command_count);
+void shell_commands_free(shell_command_t *commands, size_t command_count);
 
 /**
  * Get human-readable token type name
  */
-const char *shell_token_type_name(token_type_t type);
+const char *shell_token_type_name(shell_token_type_t type);
 
 /**
  * Check if command has shell scripting features
  */
-bool shell_has_features(shell_command_t *command);
+bool shell_command_has_shell_features(const shell_command_t *command);
 
 #ifdef __cplusplus
 }

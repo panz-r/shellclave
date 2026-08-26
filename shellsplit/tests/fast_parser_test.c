@@ -127,12 +127,12 @@ static bool result_invariants(const char *input, size_t input_len,
   uint32_t previous_end = 0;
   for (uint32_t i = 0; i < result->count; i++) {
     const shell_range_t *range = &result->cmds[i];
-    uint32_t length = 0;
-    const char *view = shell_get_subcommand(input, range, &length);
+    size_t length = 0;
+    const char *view = shell_subcommand_view(input, range, &length);
     char copy[64];
     size_t expected_copy =
         range->len < sizeof(copy) ? range->len : sizeof(copy) - 1;
-    size_t copied = shell_copy_subcommand(input, range, copy, sizeof(copy));
+    size_t copied = shell_subcommand_copy(input, range, copy, sizeof(copy));
     if (range->len == 0 || range->start > input_len ||
         range->len > input_len - range->start || range->start < previous_end ||
         !valid_command_type(range->type) ||
@@ -475,23 +475,23 @@ void test_layer1_utility_functions(void) {
   const char input[] = "  ls -la";
   char buf[64];
 
-  size_t copied = shell_copy_subcommand(input, &range, buf, sizeof(buf));
+  size_t copied = shell_subcommand_copy(input, &range, buf, sizeof(buf));
   test("copy returns exact subcommand",
        copied == 6 && strcmp(buf, "ls -la") == 0);
 
-  copied = shell_copy_subcommand(input, &range, buf, 3);
+  copied = shell_subcommand_copy(input, &range, buf, 3);
   test("copy truncates and terminates a small buffer",
        copied == 2 && strcmp(buf, "ls") == 0);
 
-  uint32_t len = 0;
-  const char *ptr = shell_get_subcommand(input, &range, &len);
+  size_t len = 0;
+  const char *ptr = shell_subcommand_view(input, &range, &len);
   test("get returns the ranged view", ptr == input + 2 && len == 6);
 
   // Test: NULL inputs
-  copied = shell_copy_subcommand(NULL, NULL, NULL, 0);
+  copied = shell_subcommand_copy(NULL, NULL, NULL, 0);
   test("Copy with NULL returns 0", copied == 0);
 
-  ptr = shell_get_subcommand(NULL, NULL, NULL);
+  ptr = shell_subcommand_view(NULL, NULL, NULL);
   test("Get with NULL returns NULL", ptr == NULL);
 }
 
@@ -585,15 +585,16 @@ void test_dialect_oracle(void) {
         shell_parse_fast(cases[i].input, strlen(cases[i].input), NULL, &fast);
     shell_command_t *commands = NULL;
     size_t command_count = 0;
-    bool full_ok =
-        shell_tokenize_commands(cases[i].input, &commands, &command_count);
+    bool full_ok = (shell_tokenize_commands(
+                        cases[i].input, strlen(cases[i].input), &commands,
+                        &command_count) == SHELL_TOKENIZE_OK);
     shell_command_info_t *infos = NULL;
     size_t info_count = 0;
-    shell_process_status_t process_error =
-        shell_process_command(cases[i].input, NULL, &infos, &info_count);
+    shell_process_status_t process_error = shell_process_command(
+        cases[i].input, strlen(cases[i].input), NULL, &infos, &info_count);
     shell_dep_graph_t graph;
-    shell_dep_error_t graph_error = shell_parse_depgraph(
-        cases[i].input, strlen(cases[i].input), ".", NULL, 0, &graph);
+    shell_dep_error_t graph_error = shell_dep_graph_parse(
+        cases[i].input, strlen(cases[i].input), ".", NULL, &graph);
     uint32_t graph_commands = 0;
     for (uint32_t node = 0; node < graph.node_count; node++)
       if (graph.nodes[node].type == SHELL_NODE_CMD)
@@ -650,8 +651,8 @@ void test_dialect_oracle(void) {
       printf("    oracle details: error=%d fast=%u graph_error=%d graph=%u\n",
              error, fast.count, graph_error, graph_commands);
     test(name, valid);
-    shell_free_command_infos(infos, info_count);
-    shell_free_commands(commands, command_count);
+    shell_command_infos_free(infos, info_count);
+    shell_commands_free(commands, command_count);
   }
 
   static const char *strict_errors[] = {"echo 'x", "echo \"x", "$(("};
@@ -674,9 +675,10 @@ void test_dialect_oracle(void) {
   shell_command_t *commands = NULL;
   size_t command_count = 0;
   test("full tokenizer rejects non-ASCII shell text",
-       !shell_tokenize_commands(non_ascii, &commands, &command_count) &&
+       !(shell_tokenize_commands(non_ascii, strlen(non_ascii), &commands,
+                                 &command_count) == SHELL_TOKENIZE_OK) &&
            commands == NULL && command_count == 0);
-  shell_free_commands(commands, command_count);
+  shell_commands_free(commands, command_count);
 }
 
 void test_layer1_edge_cases(void) {
@@ -1193,7 +1195,7 @@ static void test_feature_flags(void) {
   };
   for (size_t i = 0; i < sizeof(masks) / sizeof(masks[0]); i++) {
     shell_feature_flags_t flags;
-    shell_get_feature_flags(masks[i], &flags);
+    shell_feature_flags_from_bits(masks[i], &flags);
     char name[80];
     snprintf(name, sizeof(name), "feature mask 0x%03x round-trips", masks[i]);
     test(name, feature_flags_mask(&flags) == masks[i]);

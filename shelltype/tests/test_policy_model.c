@@ -189,7 +189,7 @@ static int cross_policy_matches_model(st_policy_t *actual, const bool *active,
   for (size_t i = 0; i < sizeof(cross_patterns) / sizeof(cross_patterns[0]);
        i++)
     expected_policy_count += active[i] ? 1u : 0u;
-  if (st_policy_count(actual) != expected_policy_count)
+  if (st_policy_rule_count(actual) != expected_policy_count)
     return 0;
 
   for (size_t probe = 0; probe < sizeof(cross_probes) / sizeof(cross_probes[0]);
@@ -218,7 +218,7 @@ static int cross_policy_matches_model(st_policy_t *actual, const bool *active,
     if (test_st_policy_verify_all(actual, cross_probes[probe], &matches,
                                   &match_count) != ST_OK ||
         match_count != expected_match_count) {
-      st_policy_free_matches(matches, match_count);
+      st_policy_matches_free(matches);
       return 0;
     }
     for (size_t i = 0; i < sizeof(cross_patterns) / sizeof(cross_patterns[0]);
@@ -229,11 +229,11 @@ static int cross_policy_matches_model(st_policy_t *actual, const bool *active,
       for (size_t j = 0; j < match_count; j++)
         found = found || pattern_is_cpl(matches[j], cross_patterns[i].pattern);
       if (!found) {
-        st_policy_free_matches(matches, match_count);
+        st_policy_matches_free(matches);
         return 0;
       }
     }
-    st_policy_free_matches(matches, match_count);
+    st_policy_matches_free(matches);
   }
   return 1;
 }
@@ -298,7 +298,7 @@ static int run_cross_policy_model(const char *replace_path,
             err = st_policy_load(actual, append_path, false);
         }
         st_policy_free(source);
-        st_policy_ctx_free(source_ctx);
+        st_policy_ctx_release(source_ctx);
         if (err != ST_OK)
           return 0;
         reference_add(active, index);
@@ -309,7 +309,7 @@ static int run_cross_policy_model(const char *replace_path,
         return 0;
     }
     st_policy_free(actual);
-    st_policy_ctx_free(actual_ctx);
+    st_policy_ctx_release(actual_ctx);
   }
   return 1;
 }
@@ -370,9 +370,9 @@ static int policy_matches_model(st_policy_t *actual, const bool *active,
   size_t expected_count = 0;
   for (size_t i = 0; i < sizeof(patterns) / sizeof(patterns[0]); i++)
     expected_count += active[i] ? 1 : 0;
-  if (st_policy_count(actual) != expected_count) {
+  if (st_policy_rule_count(actual) != expected_count) {
     fprintf(stderr, "seed %u step %zu: count differs (%zu != %zu)\n", seed,
-            step, st_policy_count(actual), expected_count);
+            step, st_policy_rule_count(actual), expected_count);
     return 0;
   }
   for (size_t i = 0; i < sizeof(probes) / sizeof(probes[0]); i++) {
@@ -395,10 +395,10 @@ static int policy_matches_model(st_policy_t *actual, const bool *active,
             ST_OK ||
         match_count != (expected ? 1u : 0u) ||
         (expected && !pattern_is_cpl(matches[0], expected))) {
-      st_policy_free_matches(matches, match_count);
+      st_policy_matches_free(matches);
       return 0;
     }
-    st_policy_free_matches(matches, match_count);
+    st_policy_matches_free(matches);
   }
   return 1;
 }
@@ -471,7 +471,7 @@ int main(void) {
         return 1;
     }
     st_policy_free(actual);
-    st_policy_ctx_free(actual_ctx);
+    st_policy_ctx_release(actual_ctx);
   }
   if (!run_cross_policy_model(path, append_path)) {
     unlink(path);

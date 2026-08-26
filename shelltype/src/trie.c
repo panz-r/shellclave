@@ -8,8 +8,10 @@
  * the join of all observed types at each position for precise generalisation.
  */
 
+#include "normalize_internal.h"
 #include "shell_netstring.h"
 #include "shelltype.h"
+#include "trie_internal.h"
 
 #include <assert.h>
 #include <ctype.h>
@@ -309,7 +311,29 @@ static bool learner_tokens_valid(const st_token_t *tokens, size_t count) {
 
 /* --- PUBLIC API – LIFECYCLE --- */
 
-st_learner_t *st_learner_new(uint32_t min_support, double min_confidence) {
+static bool learner_config_valid(const st_learner_config_t *config) {
+  return config && config->min_confidence >= 0.0 &&
+         config->min_confidence <= 1.0;
+}
+
+void st_learner_config_default(st_learner_config_t *config) {
+  if (!config)
+    return;
+  *config = (st_learner_config_t){
+      .min_support = ST_DEFAULT_MIN_SUPPORT,
+      .min_confidence = ST_DEFAULT_MIN_CONFIDENCE,
+      .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS,
+  };
+}
+
+st_learner_t *st_learner_new(const st_learner_config_t *config) {
+  st_learner_config_t defaults;
+  st_learner_config_default(&defaults);
+  if (!config)
+    config = &defaults;
+  st_learner_config_t selected = *config;
+  if (!learner_config_valid(&selected))
+    return NULL;
   st_learner_t *learner = calloc(1, sizeof(st_learner_t));
   if (!learner)
     return NULL;
@@ -321,14 +345,39 @@ st_learner_t *st_learner_new(uint32_t min_support, double min_confidence) {
   }
 
   learner->trie.total_commands = 0;
-  learner->min_support = min_support > 0 ? min_support : ST_DEFAULT_MIN_SUPPORT;
-  learner->min_confidence = min_confidence;
-  learner->max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS;
+  learner->config = selected;
   learner->blacklist = NULL;
   learner->blacklist_count = 0;
   learner->blacklist_capacity = 0;
 
   return learner;
+}
+
+st_error_t st_learner_get_config(const st_learner_t *learner,
+                                 st_learner_config_t *config) {
+  if (!learner || !config)
+    return ST_ERR_INVALID;
+  *config = learner->config;
+  return ST_OK;
+}
+
+st_error_t st_learner_set_config(st_learner_t *learner,
+                                 const st_learner_config_t *config) {
+  if (!learner || !learner_config_valid(config))
+    return ST_ERR_INVALID;
+  learner->config = *config;
+  return ST_OK;
+}
+
+void st_learner_get_stats(const st_learner_t *learner,
+                          st_learner_stats_t *stats) {
+  if (!stats)
+    return;
+  *stats = (st_learner_stats_t){0};
+  if (learner) {
+    stats->command_count = learner->trie.total_commands;
+    stats->blacklist_count = learner->blacklist_count;
+  }
 }
 
 void st_learner_free(st_learner_t *learner) {
@@ -344,28 +393,31 @@ void st_learner_free(st_learner_t *learner) {
 
 /* --- PUBLIC API – FEED --- */
 
-st_error_t st_feed(st_learner_t *learner, const char *netargv) {
-  if (!learner || !netargv || !netargv[0])
+st_error_t st_learner_feed_netargv_view(st_learner_t *learner,
+                                        st_netargv_view_t netargv) {
+  if (!learner || (!netargv.data && netargv.length != 0) || netargv.length == 0)
     return ST_ERR_INVALID;
 
-  st_token_array_t typed;
-  typed.tokens = NULL;
-  typed.count = 0;
-  st_error_t err = st_classify(netargv, &typed);
+  st_token_scratch_t scratch;
+  st_error_t err = st_netargv_classify_scratch_view(netargv, &scratch);
+  if (err == ST_ERR_FAILED)
+    return ST_ERR_INVALID;
   if (err != ST_OK)
     return err;
-  if (!learner_tokens_valid(typed.tokens, typed.count)) {
-    st_free_token_array(&typed);
+  if (!learner_tokens_valid(scratch.tokens, scratch.count))
     return ST_ERR_INVALID;
-  }
-
-  err = learner_insert_atomic(learner, typed.tokens, typed.count);
-  st_free_token_array(&typed);
-  return err;
+  return learner_insert_atomic(learner, scratch.tokens, scratch.count);
 }
 
-st_error_t st_feed_parsed(st_learner_t *learner,
-                          const st_token_array_t *typed) {
+st_error_t st_learner_feed_netargv(st_learner_t *learner, const char *netargv) {
+  if (!netargv)
+    return ST_ERR_INVALID;
+  return st_learner_feed_netargv_view(
+      learner, (st_netargv_view_t){.data = netargv, .length = strlen(netargv)});
+}
+
+st_error_t st_learner_feed_tokens(st_learner_t *learner,
+                                  const st_token_array_t *typed) {
   if (!learner || !typed)
     return ST_ERR_INVALID;
   if (!learner_tokens_valid(typed->tokens, typed->count))
@@ -560,7 +612,7 @@ static bool option_capture(const char *token, size_t *prefix_length,
   const char *equals = strchr(token + 2, '=');
   if (!equals || equals == token + 2 || equals[1] == '\0')
     return false;
-  st_token_type_t type = st_classify_token(equals + 1);
+  st_token_type_t type = st_token_classify(equals + 1);
   if (type == ST_TYPE_LITERAL)
     return false;
   *prefix_length = (size_t)(equals - token + 1);
@@ -792,12 +844,12 @@ static void collect_suggestions(st_learner_t *learner, dfs_ctx_t *ctx) {
                              : ST_ERR_FORMAT;
     bool leading_any = decode_error == ST_OK && decoded.count != 0 &&
                        decoded.tokens[0].type == ST_TYPE_ANY;
-    st_free_token_array(&decoded);
+    st_token_array_free(&decoded);
     if (decode_error != ST_OK || leading_any ||
         candidate.count < ctx->min_support ||
         candidate.confidence < ctx->min_confidence ||
-        st_validate_netpattern(candidate.pattern, NULL) != ST_OK ||
-        st_is_netpattern_blacklisted(ctx->learner, candidate.pattern)) {
+        st_netpattern_validate(candidate.pattern, NULL) != ST_OK ||
+        st_learner_is_netpattern_blacklisted(ctx->learner, candidate.pattern)) {
       free(candidate.pattern);
       complete.items[i].pattern = NULL;
       continue;
@@ -857,7 +909,7 @@ static size_t deduplicate(st_candidate_t *candidates, size_t count) {
   return write;
 }
 
-st_suggestion_t *st_suggest(st_learner_t *learner, size_t *out_count) {
+st_suggestion_t *st_learner_suggest(st_learner_t *learner, size_t *out_count) {
   if (out_count)
     *out_count = 0;
   if (!learner || !out_count)
@@ -867,8 +919,8 @@ st_suggestion_t *st_suggest(st_learner_t *learner, size_t *out_count) {
       .candidates = NULL,
       .count = 0,
       .capacity = 0,
-      .min_support = learner->min_support,
-      .min_confidence = learner->min_confidence,
+      .min_support = learner->config.min_support,
+      .min_confidence = learner->config.min_confidence,
       .learner = learner,
   };
 
@@ -891,8 +943,8 @@ st_suggestion_t *st_suggest(st_learner_t *learner, size_t *out_count) {
   qsort(ctx.candidates, ctx.count, sizeof(st_candidate_t), compare_candidates);
 
   size_t result_count = ctx.count;
-  if (result_count > learner->max_suggestions) {
-    result_count = learner->max_suggestions;
+  if (result_count > learner->config.max_suggestions) {
+    result_count = learner->config.max_suggestions;
   }
   if (result_count == 0) {
     for (size_t i = 0; i < ctx.count; i++)
@@ -924,7 +976,7 @@ st_suggestion_t *st_suggest(st_learner_t *learner, size_t *out_count) {
   return result;
 }
 
-void st_free_suggestions(st_suggestion_t *suggestions, size_t count) {
+void st_suggestion_list_free(st_suggestion_t *suggestions, size_t count) {
   if (!suggestions)
     return;
   for (size_t i = 0; i < count; i++)
@@ -947,16 +999,16 @@ static bool blacklist_ensure(st_learner_t *learner) {
   return true;
 }
 
-st_error_t st_blacklist_add_netpattern(st_learner_t *learner,
-                                       const char *pattern) {
+st_error_t st_learner_blacklist_add_netpattern(st_learner_t *learner,
+                                               const char *pattern) {
   if (!learner || !pattern || pattern[0] == '\0')
     return ST_ERR_INVALID;
   st_token_array_t decoded = {0};
   st_error_t decode_error = st_netpattern_decode(pattern, &decoded);
-  st_free_token_array(&decoded);
+  st_token_array_free(&decoded);
   if (decode_error != ST_OK)
     return decode_error;
-  if (st_is_netpattern_blacklisted(learner, pattern))
+  if (st_learner_is_netpattern_blacklisted(learner, pattern))
     return ST_OK;
   if (!blacklist_ensure(learner))
     return ST_ERR_MEMORY;
@@ -967,8 +1019,8 @@ st_error_t st_blacklist_add_netpattern(st_learner_t *learner,
   return ST_OK;
 }
 
-bool st_is_netpattern_blacklisted(const st_learner_t *learner,
-                                  const char *pattern) {
+bool st_learner_is_netpattern_blacklisted(const st_learner_t *learner,
+                                          const char *pattern) {
   if (!learner || !pattern || pattern[0] == '\0')
     return false;
   for (size_t i = 0; i < learner->blacklist_count; i++) {
@@ -1132,7 +1184,7 @@ static bool node_counts_valid(const st_node_t *node) {
   return child_total <= node->count;
 }
 
-st_error_t st_save(const st_learner_t *learner, const char *path) {
+st_error_t st_learner_save(const st_learner_t *learner, const char *path) {
   if (!learner || !path)
     return ST_ERR_INVALID;
 
@@ -1241,7 +1293,7 @@ static bool parse_crc_footer(const char *line, uint32_t *crc) {
   return true;
 }
 
-st_error_t st_load(st_learner_t *learner, const char *path) {
+st_error_t st_learner_load(st_learner_t *learner, const char *path) {
   if (!learner || !path)
     return ST_ERR_INVALID;
   FILE *fp = fopen(path, "rb");

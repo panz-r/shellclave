@@ -57,20 +57,20 @@ Learn command shapes:
 #include <shelltype.h>
 #include <stdio.h>
 
-st_learner_t *learner = st_learner_new(2, 0.5);
+st_learner_t *learner = st_learner_new(&(st_learner_config_t){.min_support = 2, .min_confidence = 0.5});
 if (learner != NULL) {
-    (void)st_feed(learner, "3:git,6:status,7:--short,");
-    (void)st_feed(learner, "3:git,6:status,7:--short,");
-    (void)st_feed(learner, "3:git,3:log,9:--oneline,");
+    (void)st_learner_feed_netargv(learner, "3:git,6:status,7:--short,");
+    (void)st_learner_feed_netargv(learner, "3:git,6:status,7:--short,");
+    (void)st_learner_feed_netargv(learner, "3:git,3:log,9:--oneline,");
 
     size_t count = 0;
-    st_suggestion_t *suggestions = st_suggest(learner, &count);
+    st_suggestion_t *suggestions = st_learner_suggest(learner, &count);
     for (size_t i = 0; i < count; ++i) {
         printf("%s (count=%u, confidence=%.2f)\n",
                suggestions[i].pattern, suggestions[i].count,
                suggestions[i].confidence);
     }
-    st_free_suggestions(suggestions, count);
+    st_suggestion_list_free(suggestions, count);
     st_learner_free(learner);
 }
 ```
@@ -87,9 +87,9 @@ const char command[] = "git status --short";
 char output[4096];
 sg_result_t result;
 if (gate != NULL) {
-    sg_error_t error = sg_gate_add_rule(gate, "git status #opt");
+    sg_error_t error = sg_gate_add_allow_cpl(gate, "git status #opt");
     if (error == SG_OK) {
-        error = sg_eval(gate, command, strlen(command), output,
+        error = sg_gate_evaluate(gate, command, strlen(command), output,
                         sizeof output, &result);
         if (error == SG_OK) {
             printf("verdict: %d\n", result.verdict);
@@ -111,14 +111,14 @@ isolated subcommand. This preserves empty arguments, whitespace, punctuation,
 and nested per-command type signatures without quoting heuristics.
 
 Shellsplit remains the shell-language boundary: use
-`shell_extract_netargv_sequence()`, `shell_build_command_netseq()`, or
+`shell_build_netargv_sequence()`, `shell_build_command_netseq()`, or
 `shell_build_type_netseq()` to turn shell source into canonical records.
 Shellgate expansion callbacks consume and return canonical `netargv` values,
 and its anomaly APIs accept canonical `netsequence` values. Human-facing CPL
 conversion remains explicit at the Shellgate and CLI boundaries. See
 [docs/canonical-formats.md](docs/canonical-formats.md) for the wire contracts.
 
-For each `sg_subcmd_result_t`, `netargv` and `netargv_length` are the
+For each `sg_subcommand_result_t`, `netargv` and `netargv_length` are the
 authoritative programmatic result. `command` is a space-joined diagnostic
 display and is deliberately not reparsable; applications must decode the
 netargv records with `shell_netstring_iter_t` when they need argument values.

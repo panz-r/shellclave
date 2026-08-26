@@ -7,7 +7,7 @@
 #include "relative_permutation_entropy.h"
 
 // Function to compute Shannon entropy for n-grams
-double ngram_entropy(const char *s, int n) {
+double shell_rpe_ngram_entropy(const char *s, int n) {
   if (!s || (n != 1 && n != 2))
     return NAN;
   int freq[256 * 256] = {0}; // Supports up to 2-grams
@@ -45,7 +45,7 @@ void fixed_permute_string(char *s, int perm_index);
 
 // Conditional entropy H(Char_i | Char_{i-1}) - entropy of char given previous
 // char
-double conditional_entropy(const char *s) {
+double shell_rpe_conditional_entropy(const char *s) {
   if (!s)
     return NAN;
   int bigram_freq[256][256] = {0};
@@ -86,11 +86,11 @@ double conditional_entropy(const char *s) {
 }
 
 // Median conditional entropy over permutations
-double permutation_conditional_entropy(const char *s, int n_perms) {
+double shell_rpe_permutation_conditional_entropy(const char *s, int n_perms) {
   if (!s || n_perms <= 0)
     return NAN;
   if (strlen(s) < 12) {
-    return conditional_entropy(s);
+    return shell_rpe_conditional_entropy(s);
   }
 
   size_t length = strlen(s);
@@ -107,7 +107,7 @@ double permutation_conditional_entropy(const char *s, int n_perms) {
   for (int i = 0; i < n_perms; i++) {
     memcpy(perm, s, length + 1);
     fixed_permute_string(perm, i);
-    entropies[i] = conditional_entropy(perm);
+    entropies[i] = shell_rpe_conditional_entropy(perm);
   }
 
   // Sort to find median
@@ -128,11 +128,11 @@ double permutation_conditional_entropy(const char *s, int n_perms) {
 }
 
 // Relative conditional entropy ratio
-double relative_conditional_entropy(const char *s, int n_perms) {
+double shell_rpe_relative_conditional_entropy(const char *s, int n_perms) {
   if (!s || n_perms <= 0)
     return NAN;
-  double H_original = conditional_entropy(s);
-  double H_permuted = permutation_conditional_entropy(s, n_perms);
+  double H_original = shell_rpe_conditional_entropy(s);
+  double H_permuted = shell_rpe_permutation_conditional_entropy(s, n_perms);
   if (H_permuted == 0.0) {
     return 2.0; /* permutation collapsed entropy: original was structured */
   }
@@ -167,11 +167,11 @@ void fixed_permute_string(char *s, int perm_index) {
 }
 
 // Function to compute median permutation entropy
-double permutation_entropy(const char *s, int n_perms, int n) {
+double shell_rpe_permutation_entropy(const char *s, int n_perms, int n) {
   if (!s || n_perms <= 0 || (n != 1 && n != 2))
     return NAN;
   if (strlen(s) < 12) {
-    return ngram_entropy(s, n);
+    return shell_rpe_ngram_entropy(s, n);
   }
 
   size_t length = strlen(s);
@@ -188,7 +188,7 @@ double permutation_entropy(const char *s, int n_perms, int n) {
   for (int i = 0; i < n_perms; i++) {
     memcpy(perm, s, length + 1);
     fixed_permute_string(perm, i);
-    entropies[i] = ngram_entropy(perm, n);
+    entropies[i] = shell_rpe_ngram_entropy(perm, n);
   }
 
   // Sort entropies to find median
@@ -209,11 +209,11 @@ double permutation_entropy(const char *s, int n_perms, int n) {
 }
 
 // Function to compute relative entropy ratio
-double relative_entropy_ratio(const char *s, int n_perms, int n) {
+double shell_rpe_relative_entropy_ratio(const char *s, int n_perms, int n) {
   if (!s || n_perms <= 0 || (n != 1 && n != 2))
     return NAN;
-  double H_original = ngram_entropy(s, n);
-  double H_permuted = permutation_entropy(s, n_perms, n);
+  double H_original = shell_rpe_ngram_entropy(s, n);
+  double H_permuted = shell_rpe_permutation_entropy(s, n_perms, n);
   if (H_permuted == 0.0) {
     return 2.0; /* permutation collapsed entropy: original was structured */
   }

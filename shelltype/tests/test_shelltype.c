@@ -5,6 +5,7 @@
 #include "test_allocator.h"
 #include "test_io.h"
 #include "test_netargv.h"
+#include "trie_internal.h"
 #include <glob.h>
 #include <math.h>
 #include <stdio.h>
@@ -96,7 +97,10 @@ static int trie_counts_equal(const st_node_t *a, const st_node_t *b) {
 }
 
 static st_learner_t *baseline_learner(void) {
-  st_learner_t *learner = st_learner_new(1, 0.0);
+  st_learner_t *learner = st_learner_new(
+      &(st_learner_config_t){.min_support = 1,
+                             .min_confidence = 0.0,
+                             .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
   if (!learner || test_st_feed(learner, "git status") != ST_OK ||
       test_st_feed(learner, "git log") != ST_OK) {
     st_learner_free(learner);
@@ -158,7 +162,7 @@ static int test_feed_is_atomic(void) {
   probe = baseline_learner();
   ASSERT(probe != NULL);
   st_test_alloc_reset();
-  ASSERT(st_feed_parsed(probe, &parsed) == ST_OK);
+  ASSERT(st_learner_feed_tokens(probe, &parsed) == ST_OK);
   allocations = st_test_alloc_count();
   st_learner_free(probe);
   for (size_t fail_at = 1; fail_at <= allocations; fail_at++) {
@@ -167,7 +171,7 @@ static int test_feed_is_atomic(void) {
     st_learner_t *actual = baseline_learner();
     ASSERT(expected && actual);
     st_test_alloc_fail_at(fail_at);
-    st_error_t error = st_feed_parsed(actual, &parsed);
+    st_error_t error = st_learner_feed_tokens(actual, &parsed);
     st_test_alloc_reset();
     if (error == ST_ERR_MEMORY)
       ASSERT(actual->trie.total_commands == expected->trie.total_commands &&
@@ -177,16 +181,16 @@ static int test_feed_is_atomic(void) {
     st_learner_free(expected);
     st_learner_free(actual);
   }
-  st_free_token_array(&parsed);
+  st_token_array_free(&parsed);
 
   st_learner_t *learner = baseline_learner();
   ASSERT(learner != NULL);
   st_token_t invalid_token = {.text = NULL, .type = ST_TYPE_WORD};
   st_token_array_t invalid = {.tokens = &invalid_token, .count = 1};
-  ASSERT(st_feed_parsed(learner, &invalid) == ST_ERR_INVALID);
+  ASSERT(st_learner_feed_tokens(learner, &invalid) == ST_ERR_INVALID);
   invalid_token.text = "value";
   invalid_token.type = ST_TYPE_COUNT;
-  ASSERT(st_feed_parsed(learner, &invalid) == ST_ERR_INVALID);
+  ASSERT(st_learner_feed_tokens(learner, &invalid) == ST_ERR_INVALID);
   ASSERT(learner->trie.total_commands == 2);
 
   learner->trie.total_commands = UINT32_MAX;
@@ -195,6 +199,36 @@ static int test_feed_is_atomic(void) {
   ASSERT(learner->trie.total_commands == UINT32_MAX &&
          learner->trie.root->count == UINT32_MAX);
   st_learner_free(learner);
+  return 1;
+}
+
+static int test_feed_netargv_avoids_classifier_allocations(void) {
+  static const char netargv[] = "3:git,6:commit,2:-m,12:/tmp/message,";
+  st_token_t tokens[] = {
+      {.text = "git", .type = ST_TYPE_LITERAL},
+      {.text = "commit", .type = ST_TYPE_LITERAL},
+      {.text = "-m", .type = ST_TYPE_SHORTOPT},
+      {.text = "/tmp/message", .type = ST_TYPE_ABS_PATH},
+  };
+  const st_token_array_t typed = {
+      .tokens = tokens,
+      .count = sizeof(tokens) / sizeof(tokens[0]),
+  };
+  st_learner_t *from_netargv = baseline_learner();
+  st_learner_t *from_tokens = baseline_learner();
+  ASSERT(from_netargv && from_tokens);
+
+  st_test_alloc_reset();
+  ASSERT(st_learner_feed_netargv(from_netargv, netargv) == ST_OK);
+  size_t netargv_allocations = st_test_alloc_count();
+  st_test_alloc_reset();
+  ASSERT(st_learner_feed_tokens(from_tokens, &typed) == ST_OK);
+  size_t token_allocations = st_test_alloc_count();
+
+  ASSERT(netargv_allocations == token_allocations);
+  ASSERT(nodes_equal(from_netargv->trie.root, from_tokens->trie.root));
+  st_learner_free(from_netargv);
+  st_learner_free(from_tokens);
   return 1;
 }
 
@@ -208,41 +242,50 @@ static int test_expressive_literal_suggestions(void) {
                {"hash", "#n", "hash \"#n\""},
                {"star", "*", "star \"*\""},
                {"line", "line\nfeed", "line \"line\\nfeed\""}};
-  st_learner_t *learner = st_learner_new(1, 0.0);
+  st_learner_t *learner = st_learner_new(
+      &(st_learner_config_t){.min_support = 1,
+                             .min_confidence = 0.0,
+                             .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
   ASSERT(learner != NULL);
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
     st_token_t tokens[] = {
         {.text = (char *)cases[i].command, .type = ST_TYPE_LITERAL},
         {.text = (char *)cases[i].argument, .type = ST_TYPE_LITERAL}};
     st_token_array_t command = {.tokens = tokens, .count = 2};
-    ASSERT(st_feed_parsed(learner, &command) == ST_OK);
+    ASSERT(st_learner_feed_tokens(learner, &command) == ST_OK);
   }
   size_t count = 0;
-  st_suggestion_t *suggestions = st_suggest(learner, &count);
+  st_suggestion_t *suggestions = st_learner_suggest(learner, &count);
   ASSERT(suggestions != NULL && count == sizeof(cases) / sizeof(cases[0]));
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++)
     ASSERT(find_suggestion(suggestions, count, cases[i].expected_cpl));
-  st_free_suggestions(suggestions, count);
+  st_suggestion_list_free(suggestions, count);
   st_learner_free(learner);
   return 1;
 }
 
 static int test_compound_option_suggestion(void) {
-  st_learner_t *learner = st_learner_new(2, 0.0);
+  st_learner_t *learner = st_learner_new(
+      &(st_learner_config_t){.min_support = 2,
+                             .min_confidence = 0.0,
+                             .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
   ASSERT(learner != NULL);
   ASSERT(test_st_feed(learner, "tool --output=/tmp/one") == ST_OK);
   ASSERT(test_st_feed(learner, "tool --output=/var/two") == ST_OK);
   size_t count = 0;
-  st_suggestion_t *suggestions = st_suggest(learner, &count);
+  st_suggestion_t *suggestions = st_learner_suggest(learner, &count);
   ASSERT(suggestions != NULL);
   ASSERT(find_suggestion(suggestions, count, "tool --output={#p}"));
-  st_free_suggestions(suggestions, count);
+  st_suggestion_list_free(suggestions, count);
   st_learner_free(learner);
   return 1;
 }
 
 static int test_learner_state_transitions(void) {
-  st_learner_t *learner = st_learner_new(1, 0.0);
+  st_learner_t *learner = st_learner_new(
+      &(st_learner_config_t){.min_support = 1,
+                             .min_confidence = 0.0,
+                             .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
   ASSERT(learner && learner->trie.root);
   ASSERT(learner->trie.total_commands == 0);
   ASSERT(learner->trie.root->count == 0);
@@ -264,8 +307,8 @@ static int test_learner_state_transitions(void) {
 
   st_token_array_t parsed = {0};
   ASSERT(test_st_classify("curl /tmp/data", &parsed) == ST_OK);
-  ASSERT(st_feed_parsed(learner, &parsed) == ST_OK);
-  st_free_token_array(&parsed);
+  ASSERT(st_learner_feed_tokens(learner, &parsed) == ST_OK);
+  st_token_array_free(&parsed);
   ASSERT(learner->trie.total_commands == 6);
   ASSERT(learner->trie.root->count == 6);
   ASSERT(find_child(learner->trie.root, "curl") != NULL);
@@ -278,7 +321,7 @@ static int test_learner_state_transitions(void) {
       .tokens = too_many_tokens,
       .count = sizeof(too_many_tokens) / sizeof(too_many_tokens[0]),
   };
-  ASSERT(st_feed_parsed(learner, &oversized) == ST_ERR_INVALID);
+  ASSERT(st_learner_feed_tokens(learner, &oversized) == ST_ERR_INVALID);
   ASSERT(learner->trie.total_commands == 6);
   st_learner_free(learner);
   return 1;
@@ -292,9 +335,9 @@ static int test_learner_input_boundaries(void) {
   ASSERT(test_st_feed(learner, "   ") == ST_ERR_INVALID);
 
   st_token_array_t empty_tokens = {0};
-  ASSERT(st_feed_parsed(learner, &empty_tokens) == ST_ERR_INVALID);
-  ASSERT(st_feed_parsed(NULL, &empty_tokens) == ST_ERR_INVALID);
-  ASSERT(st_feed_parsed(learner, NULL) == ST_ERR_INVALID);
+  ASSERT(st_learner_feed_tokens(learner, &empty_tokens) == ST_ERR_INVALID);
+  ASSERT(st_learner_feed_tokens(NULL, &empty_tokens) == ST_ERR_INVALID);
+  ASSERT(st_learner_feed_tokens(learner, NULL) == ST_ERR_INVALID);
 
   char many[(ST_MAX_CMD_TOKENS + 1) * 2 + 1];
   size_t used = 0;
@@ -306,42 +349,105 @@ static int test_learner_input_boundaries(void) {
   ASSERT(test_st_feed(learner, many) == ST_ERR_LIMIT);
   ASSERT(learner->trie.total_commands == 2);
 
-  st_learner_t *empty = st_learner_new(5, 0.05);
+  st_learner_t *empty = st_learner_new(
+      &(st_learner_config_t){.min_support = 5,
+                             .min_confidence = 0.05,
+                             .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
   ASSERT(empty != NULL);
   size_t count = 17;
-  ASSERT(st_suggest(empty, &count) == NULL && count == 0);
+  ASSERT(st_learner_suggest(empty, &count) == NULL && count == 0);
   count = 17;
-  ASSERT(st_suggest(NULL, &count) == NULL && count == 0);
-  ASSERT(st_suggest(empty, NULL) == NULL);
+  ASSERT(st_learner_suggest(NULL, &count) == NULL && count == 0);
+  ASSERT(st_learner_suggest(empty, NULL) == NULL);
   ASSERT(test_st_blacklist_add(NULL, "pattern") == ST_ERR_INVALID);
   ASSERT(test_st_blacklist_add(learner, NULL) == ST_ERR_INVALID);
   ASSERT(!test_st_is_blacklisted(NULL, "pattern"));
   ASSERT(!test_st_is_blacklisted(learner, NULL));
-  ASSERT(st_save(NULL, "/tmp/unused") == ST_ERR_INVALID);
-  ASSERT(st_save(learner, NULL) == ST_ERR_INVALID);
-  ASSERT(st_load(NULL, "/tmp/unused") == ST_ERR_INVALID);
-  ASSERT(st_load(learner, NULL) == ST_ERR_INVALID);
+  ASSERT(st_learner_save(NULL, "/tmp/unused") == ST_ERR_INVALID);
+  ASSERT(st_learner_save(learner, NULL) == ST_ERR_INVALID);
+  ASSERT(st_learner_load(NULL, "/tmp/unused") == ST_ERR_INVALID);
+  ASSERT(st_learner_load(learner, NULL) == ST_ERR_INVALID);
   st_learner_free(empty);
   st_learner_free(learner);
   return 1;
 }
 
 static int test_learner_configuration_boundaries(void) {
-  st_learner_t *defaults = st_learner_new(0, 0.0);
+  st_learner_config_t config = {0};
+  st_learner_config_default(&config);
+  ASSERT(config.min_support == ST_DEFAULT_MIN_SUPPORT);
+  ASSERT(config.min_confidence == ST_DEFAULT_MIN_CONFIDENCE);
+  ASSERT(config.max_suggestions == ST_DEFAULT_MAX_SUGGESTIONS);
+  st_learner_config_default(NULL);
+
+  st_learner_t *defaults = st_learner_new(NULL);
   ASSERT(defaults != NULL);
-  ASSERT(defaults->min_support == ST_DEFAULT_MIN_SUPPORT);
-  ASSERT(defaults->min_confidence == 0.0);
-  ASSERT(defaults->max_suggestions == ST_DEFAULT_MAX_SUGGESTIONS);
+  ASSERT(st_learner_get_config(defaults, &config) == ST_OK);
+  ASSERT(config.min_support == ST_DEFAULT_MIN_SUPPORT);
+  ASSERT(config.min_confidence == ST_DEFAULT_MIN_CONFIDENCE);
+  ASSERT(config.max_suggestions == ST_DEFAULT_MAX_SUGGESTIONS);
   st_learner_free(defaults);
 
-  st_learner_t *configured = st_learner_new(UINT32_MAX, 1.0);
+  st_learner_t *zeroes = st_learner_new(&(st_learner_config_t){0});
+  ASSERT(zeroes != NULL);
+  ASSERT(st_learner_get_config(zeroes, &config) == ST_OK);
+  ASSERT(config.min_support == 0);
+  ASSERT(config.min_confidence == 0.0);
+  ASSERT(config.max_suggestions == 0);
+  st_learner_free(zeroes);
+
+  st_learner_t *configured = st_learner_new(
+      &(st_learner_config_t){.min_support = UINT32_MAX,
+                             .min_confidence = 1.0,
+                             .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
   ASSERT(configured != NULL);
-  ASSERT(configured->min_support == UINT32_MAX);
-  ASSERT(configured->min_confidence == 1.0);
+  ASSERT(st_learner_get_config(configured, &config) == ST_OK);
+  ASSERT(config.min_support == UINT32_MAX);
+  ASSERT(config.min_confidence == 1.0);
   ASSERT(test_st_feed(configured, "git status") == ST_OK);
   size_t count = 99;
-  ASSERT(st_suggest(configured, &count) == NULL && count == 0);
+  ASSERT(st_learner_suggest(configured, &count) == NULL && count == 0);
   st_learner_free(configured);
+  return 1;
+}
+
+static int test_learner_stats_contract(void) {
+  st_learner_stats_t stats = {.command_count = UINT32_MAX,
+                              .blacklist_count = SIZE_MAX};
+  st_learner_get_stats(NULL, &stats);
+  ASSERT(stats.command_count == 0 && stats.blacklist_count == 0);
+  st_learner_get_stats(NULL, NULL);
+
+  st_learner_t *learner = st_learner_new(NULL);
+  ASSERT(learner != NULL);
+  st_learner_get_stats(learner, &stats);
+  ASSERT(stats.command_count == 0 && stats.blacklist_count == 0);
+  ASSERT(test_st_feed(learner, "echo one") == ST_OK);
+  ASSERT(test_st_feed(learner, "printf two") == ST_OK);
+  ASSERT(test_st_blacklist_add(learner, "echo *") == ST_OK);
+  st_learner_get_stats(learner, &stats);
+  ASSERT(stats.command_count == 2 && stats.blacklist_count == 1);
+  st_learner_get_stats(learner, NULL);
+
+  st_learner_config_t before;
+  st_learner_config_t after;
+  ASSERT(st_learner_get_config(learner, &before) == ST_OK);
+  ASSERT(st_learner_set_config(learner, NULL) == ST_ERR_INVALID);
+  ASSERT(st_learner_set_config(learner,
+                               &(st_learner_config_t){.min_support = 1,
+                                                      .min_confidence = NAN,
+                                                      .max_suggestions = 1}) ==
+         ST_ERR_INVALID);
+  ASSERT(st_learner_get_config(learner, &after) == ST_OK);
+  ASSERT(memcmp(&before, &after, sizeof(before)) == 0);
+  ASSERT(st_learner_set_config(
+             learner, &(st_learner_config_t){.min_support = 3,
+                                             .min_confidence = 0.5,
+                                             .max_suggestions = 2}) == ST_OK);
+  ASSERT(st_learner_get_config(learner, &after) == ST_OK);
+  ASSERT(after.min_support == 3 && after.min_confidence == 0.5 &&
+         after.max_suggestions == 2);
+  st_learner_free(learner);
   return 1;
 }
 
@@ -428,12 +534,15 @@ static int test_suggestion_order_is_input_order_independent(void) {
   st_suggestion_t *baseline = NULL;
   size_t baseline_count = 0;
   for (size_t order = 0; order < sizeof(orders) / sizeof(orders[0]); order++) {
-    st_learner_t *learner = st_learner_new(1, 0.0);
+    st_learner_t *learner = st_learner_new(
+        &(st_learner_config_t){.min_support = 1,
+                               .min_confidence = 0.0,
+                               .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
     ASSERT(learner != NULL);
     for (size_t i = 0; i < sizeof(commands) / sizeof(commands[0]); i++)
       ASSERT(test_st_feed(learner, commands[orders[order][i]]) == ST_OK);
     size_t count = 0;
-    st_suggestion_t *suggestions = st_suggest(learner, &count);
+    st_suggestion_t *suggestions = st_learner_suggest(learner, &count);
     ASSERT(suggestions != NULL && count > 0);
     ASSERT(suggestions_replay_exactly(suggestions, count, commands,
                                       sizeof(commands) / sizeof(commands[0])));
@@ -443,11 +552,11 @@ static int test_suggestion_order_is_input_order_independent(void) {
     } else {
       ASSERT(
           suggestion_lists_equal(baseline, baseline_count, suggestions, count));
-      st_free_suggestions(suggestions, count);
+      st_suggestion_list_free(suggestions, count);
     }
     st_learner_free(learner);
   }
-  st_free_suggestions(baseline, baseline_count);
+  st_suggestion_list_free(baseline, baseline_count);
   return 1;
 }
 
@@ -623,9 +732,15 @@ static int test_independent_two_token_learner_oracle(void) {
       double min_confidence = configuration == 0 ? 0.0 : 0.2;
       size_t limit = configuration == 0 ? 20 : 5;
       const char *blacklist = configuration == 0 ? NULL : "copy *";
-      st_learner_t *learner = st_learner_new(min_support, min_confidence);
+      st_learner_t *learner = st_learner_new(&(st_learner_config_t){
+          .min_support = min_support,
+          .min_confidence = min_confidence,
+          .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
       ASSERT(learner != NULL);
-      learner->max_suggestions = limit;
+      st_learner_config_t learner_config = {0};
+      ASSERT(st_learner_get_config(learner, &learner_config) == ST_OK);
+      learner_config.max_suggestions = limit;
+      ASSERT(st_learner_set_config(learner, &learner_config) == ST_OK);
       if (blacklist)
         ASSERT(test_st_blacklist_add(learner, blacklist) == ST_OK);
 
@@ -636,7 +751,7 @@ static int test_independent_two_token_learner_oracle(void) {
             {.text = (char *)item->argument, .type = item->type},
         };
         st_token_array_t parsed = {.tokens = tokens, .count = 2};
-        ASSERT(st_feed_parsed(learner, &parsed) == ST_OK);
+        ASSERT(st_learner_feed_tokens(learner, &parsed) == ST_OK);
       }
 
       oracle_suggestion_t expected[ORACLE_CAPACITY] = {0};
@@ -645,7 +760,7 @@ static int test_independent_two_token_learner_oracle(void) {
           min_support, min_confidence, limit, blacklist, expected,
           ORACLE_CAPACITY);
       size_t actual_count = 0;
-      st_suggestion_t *actual = st_suggest(learner, &actual_count);
+      st_suggestion_t *actual = st_learner_suggest(learner, &actual_count);
       ASSERT(actual_count == expected_count);
       for (size_t i = 0; i < expected_count; i++) {
         ASSERT(actual != NULL);
@@ -653,7 +768,7 @@ static int test_independent_two_token_learner_oracle(void) {
         ASSERT(actual[i].count == expected[i].count);
         ASSERT(actual[i].confidence == expected[i].confidence);
       }
-      st_free_suggestions(actual, actual_count);
+      st_suggestion_list_free(actual, actual_count);
       st_learner_free(learner);
     }
   }
@@ -694,10 +809,22 @@ static int test_generated_suggestion_history_properties(void) {
       history[i] = corpus[history_random_next(&state) %
                           (sizeof(corpus) / sizeof(corpus[0]))];
 
-    st_learner_t *forward = st_learner_new(1, 0.0);
-    st_learner_t *reverse = st_learner_new(1, 0.0);
-    st_learner_t *permuted = st_learner_new(1, 0.0);
-    st_learner_t *loaded = st_learner_new(1, 0.0);
+    st_learner_t *forward = st_learner_new(
+        &(st_learner_config_t){.min_support = 1,
+                               .min_confidence = 0.0,
+                               .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
+    st_learner_t *reverse = st_learner_new(
+        &(st_learner_config_t){.min_support = 1,
+                               .min_confidence = 0.0,
+                               .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
+    st_learner_t *permuted = st_learner_new(
+        &(st_learner_config_t){.min_support = 1,
+                               .min_confidence = 0.0,
+                               .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
+    st_learner_t *loaded = st_learner_new(
+        &(st_learner_config_t){.min_support = 1,
+                               .min_confidence = 0.0,
+                               .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
     ASSERT(forward && reverse && permuted && loaded);
     for (size_t i = 0; i < HISTORY_COUNT; i++) {
       ASSERT(test_st_feed(forward, history[i]) == ST_OK);
@@ -708,9 +835,12 @@ static int test_generated_suggestion_history_properties(void) {
 
     size_t forward_count = 0, reverse_count = 0, permuted_count = 0,
            loaded_count = 0;
-    st_suggestion_t *forward_items = st_suggest(forward, &forward_count);
-    st_suggestion_t *reverse_items = st_suggest(reverse, &reverse_count);
-    st_suggestion_t *permuted_items = st_suggest(permuted, &permuted_count);
+    st_suggestion_t *forward_items =
+        st_learner_suggest(forward, &forward_count);
+    st_suggestion_t *reverse_items =
+        st_learner_suggest(reverse, &reverse_count);
+    st_suggestion_t *permuted_items =
+        st_learner_suggest(permuted, &permuted_count);
     if (!suggestion_lists_equal(forward_items, forward_count, reverse_items,
                                 reverse_count) ||
         !suggestion_lists_equal(forward_items, forward_count, permuted_items,
@@ -720,16 +850,16 @@ static int test_generated_suggestion_history_properties(void) {
     }
     ASSERT(suggestions_replay_exactly(forward_items, forward_count, history,
                                       HISTORY_COUNT));
-    ASSERT(st_save(forward, path) == ST_OK);
-    ASSERT(st_load(loaded, path) == ST_OK);
-    st_suggestion_t *loaded_items = st_suggest(loaded, &loaded_count);
+    ASSERT(st_learner_save(forward, path) == ST_OK);
+    ASSERT(st_learner_load(loaded, path) == ST_OK);
+    st_suggestion_t *loaded_items = st_learner_suggest(loaded, &loaded_count);
     ASSERT(suggestion_lists_equal(forward_items, forward_count, loaded_items,
                                   loaded_count));
 
-    st_free_suggestions(forward_items, forward_count);
-    st_free_suggestions(reverse_items, reverse_count);
-    st_free_suggestions(permuted_items, permuted_count);
-    st_free_suggestions(loaded_items, loaded_count);
+    st_suggestion_list_free(forward_items, forward_count);
+    st_suggestion_list_free(reverse_items, reverse_count);
+    st_suggestion_list_free(permuted_items, permuted_count);
+    st_suggestion_list_free(loaded_items, loaded_count);
     st_learner_free(forward);
     st_learner_free(reverse);
     st_learner_free(permuted);
@@ -764,7 +894,10 @@ static int test_suggestion_matrix(void) {
   };
 
   for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
-    st_learner_t *learner = st_learner_new(3, 0.0);
+    st_learner_t *learner = st_learner_new(
+        &(st_learner_config_t){.min_support = 3,
+                               .min_confidence = 0.0,
+                               .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
     ASSERT(learner != NULL);
     char command_storage[8][128];
     const char *commands[8];
@@ -776,12 +909,12 @@ static int test_suggestion_matrix(void) {
     }
 
     size_t count = 0;
-    st_suggestion_t *suggestions = st_suggest(learner, &count);
+    st_suggestion_t *suggestions = st_learner_suggest(learner, &count);
     ASSERT(suggestions_equal(suggestions, count, cases[c].expected,
                              cases[c].expected_count));
     ASSERT(suggestions_replay_exactly(suggestions, count, commands,
                                       cases[c].repetitions));
-    st_free_suggestions(suggestions, count);
+    st_suggestion_list_free(suggestions, count);
     st_learner_free(learner);
   }
   return 1;
@@ -793,7 +926,10 @@ static int test_suggestion_thresholds_and_limit(void) {
       {"beta #n", 3, 1.0},
       {"delta #n", 3, 1.0},
   };
-  st_learner_t *learner = st_learner_new(6, 0.0);
+  st_learner_t *learner = st_learner_new(
+      &(st_learner_config_t){.min_support = 6,
+                             .min_confidence = 0.0,
+                             .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
   ASSERT(learner != NULL);
   for (size_t i = 0; i < 5; i++) {
     char command[64];
@@ -801,13 +937,19 @@ static int test_suggestion_thresholds_and_limit(void) {
     ASSERT(test_st_feed(learner, command) == ST_OK);
   }
   size_t count = 99;
-  st_suggestion_t *suggestions = st_suggest(learner, &count);
+  st_suggestion_t *suggestions = st_learner_suggest(learner, &count);
   ASSERT(!suggestions && count == 0);
   st_learner_free(learner);
 
-  learner = st_learner_new(3, 0.0);
+  learner = st_learner_new(
+      &(st_learner_config_t){.min_support = 3,
+                             .min_confidence = 0.0,
+                             .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
   ASSERT(learner != NULL);
-  learner->max_suggestions = 3;
+  st_learner_config_t learner_config = {0};
+  ASSERT(st_learner_get_config(learner, &learner_config) == ST_OK);
+  learner_config.max_suggestions = 3;
+  ASSERT(st_learner_set_config(learner, &learner_config) == ST_OK);
   static const char *families[] = {"alpha", "beta", "delta", "gamma"};
   for (size_t family = 0; family < 4; family++)
     for (size_t i = 1; i <= 3; i++) {
@@ -815,14 +957,15 @@ static int test_suggestion_thresholds_and_limit(void) {
       snprintf(command, sizeof(command), "%s %zu", families[family], i);
       ASSERT(test_st_feed(learner, command) == ST_OK);
     }
-  suggestions = st_suggest(learner, &count);
+  suggestions = st_learner_suggest(learner, &count);
   ASSERT(
       suggestions_equal(suggestions, count, expected_capped,
                         sizeof(expected_capped) / sizeof(expected_capped[0])));
-  st_free_suggestions(suggestions, count);
-  learner->max_suggestions = 0;
+  st_suggestion_list_free(suggestions, count);
+  learner_config.max_suggestions = 0;
+  ASSERT(st_learner_set_config(learner, &learner_config) == ST_OK);
   count = 17;
-  ASSERT(st_suggest(learner, &count) == NULL && count == 0);
+  ASSERT(st_learner_suggest(learner, &count) == NULL && count == 0);
   st_learner_free(learner);
   return 1;
 }
@@ -832,7 +975,10 @@ static int test_confidence_ranking(void) {
       {"git commit #sopt *", 8, 1.0},
       {"git *", 2, 0.2},
   };
-  st_learner_t *learner = st_learner_new(2, 0.0);
+  st_learner_t *learner = st_learner_new(
+      &(st_learner_config_t){.min_support = 2,
+                             .min_confidence = 0.0,
+                             .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
   ASSERT(learner != NULL);
   for (size_t i = 0; i < 8; i++) {
     char command[64];
@@ -843,7 +989,7 @@ static int test_confidence_ranking(void) {
   ASSERT(test_st_feed(learner, "git log") == ST_OK);
 
   size_t count = 0;
-  st_suggestion_t *suggestions = st_suggest(learner, &count);
+  st_suggestion_t *suggestions = st_learner_suggest(learner, &count);
   ASSERT(suggestions_equal(suggestions, count, expected,
                            sizeof(expected) / sizeof(expected[0])));
   static const char *commands[] = {"git commit -m msg0", "git commit -m msg1",
@@ -853,7 +999,7 @@ static int test_confidence_ranking(void) {
                                    "git status",         "git log"};
   ASSERT(suggestions_replay_exactly(suggestions, count, commands,
                                     sizeof(commands) / sizeof(commands[0])));
-  st_free_suggestions(suggestions, count);
+  st_suggestion_list_free(suggestions, count);
   st_learner_free(learner);
   return 1;
 }
@@ -862,16 +1008,19 @@ static int check_complete_rule_case(const char *const *commands,
                                     size_t command_count,
                                     const expected_suggestion_t *expected,
                                     size_t expected_count) {
-  st_learner_t *learner = st_learner_new(1, 0.0);
+  st_learner_t *learner = st_learner_new(
+      &(st_learner_config_t){.min_support = 1,
+                             .min_confidence = 0.0,
+                             .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
   ASSERT(learner != NULL);
   for (size_t i = 0; i < command_count; i++)
     ASSERT(test_st_feed(learner, commands[i]) == ST_OK);
   size_t count = 0;
-  st_suggestion_t *suggestions = st_suggest(learner, &count);
+  st_suggestion_t *suggestions = st_learner_suggest(learner, &count);
   ASSERT(suggestions_equal(suggestions, count, expected, expected_count));
   ASSERT(
       suggestions_replay_exactly(suggestions, count, commands, command_count));
-  st_free_suggestions(suggestions, count);
+  st_suggestion_list_free(suggestions, count);
   st_learner_free(learner);
   return 1;
 }
@@ -933,7 +1082,10 @@ static int test_complete_rule_branch_semantics(void) {
 }
 
 static int test_blacklist_filters_exact_suggestion(void) {
-  st_learner_t *learner = st_learner_new(3, 0.0);
+  st_learner_t *learner = st_learner_new(
+      &(st_learner_config_t){.min_support = 3,
+                             .min_confidence = 0.0,
+                             .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
   ASSERT(learner != NULL);
   for (size_t i = 0; i < 5; i++) {
     char command[64];
@@ -949,16 +1101,19 @@ static int test_blacklist_filters_exact_suggestion(void) {
   ASSERT(!test_st_is_blacklisted(learner, ""));
 
   size_t count = 0;
-  st_suggestion_t *suggestions = st_suggest(learner, &count);
+  st_suggestion_t *suggestions = st_learner_suggest(learner, &count);
   ASSERT(suggestions == NULL && count == 0);
-  st_free_suggestions(suggestions, count);
+  st_suggestion_list_free(suggestions, count);
   st_learner_free(learner);
   return 1;
 }
 
 static int test_blacklist_allocation_failures_are_atomic(void) {
   st_test_alloc_reset();
-  st_learner_t *probe = st_learner_new(1, 0.0);
+  st_learner_t *probe = st_learner_new(
+      &(st_learner_config_t){.min_support = 1,
+                             .min_confidence = 0.0,
+                             .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
   ASSERT(probe != NULL);
   for (size_t i = 0; i < 16; i++) {
     char pattern[32];
@@ -973,7 +1128,10 @@ static int test_blacklist_allocation_failures_are_atomic(void) {
 
   for (size_t fail_at = 1; fail_at <= allocations; fail_at++) {
     st_test_alloc_reset();
-    st_learner_t *learner = st_learner_new(1, 0.0);
+    st_learner_t *learner = st_learner_new(
+        &(st_learner_config_t){.min_support = 1,
+                               .min_confidence = 0.0,
+                               .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
     ASSERT(learner != NULL);
     for (size_t i = 0; i < 16; i++) {
       char pattern[32];
@@ -1003,27 +1161,37 @@ static int test_serialization_roundtrip_and_validation(void) {
   snprintf(learner_temp_path, sizeof(learner_temp_path), "%s", path);
   close(fd);
 
-  st_learner_t *source = st_learner_new(3, 0.0);
-  st_learner_t *loaded = st_learner_new(3, 0.0);
+  st_learner_t *source = st_learner_new(
+      &(st_learner_config_t){.min_support = 3,
+                             .min_confidence = 0.0,
+                             .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
+  st_learner_t *loaded = st_learner_new(
+      &(st_learner_config_t){.min_support = 3,
+                             .min_confidence = 0.0,
+                             .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
   ASSERT(source && loaded);
   ASSERT(test_st_feed(loaded, "obsolete command") == ST_OK);
-  ASSERT(st_load(loaded, "/tmp/shelltype-file-does-not-exist") == ST_ERR_IO);
+  ASSERT(st_learner_load(loaded, "/tmp/shelltype-file-does-not-exist") ==
+         ST_ERR_IO);
   ASSERT(find_child(loaded->trie.root, "obsolete") != NULL);
   for (size_t i = 0; i < 4; i++) {
     char command[128];
     snprintf(command, sizeof(command), "cat /var/log/file%zu | grep ERROR", i);
     ASSERT(test_st_feed(source, command) == ST_OK);
   }
-  st_learner_t *empty_source = st_learner_new(1, 0.0);
-  ASSERT(empty_source != NULL && st_save(empty_source, path) == ST_OK);
+  st_learner_t *empty_source = st_learner_new(
+      &(st_learner_config_t){.min_support = 1,
+                             .min_confidence = 0.0,
+                             .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
+  ASSERT(empty_source != NULL && st_learner_save(empty_source, path) == ST_OK);
   st_learner_free(empty_source);
-  ASSERT(st_load(loaded, path) == ST_OK);
+  ASSERT(st_learner_load(loaded, path) == ST_OK);
   ASSERT(loaded->trie.total_commands == 0);
   ASSERT(find_child(loaded->trie.root, "obsolete") == NULL);
 
   /* A serialization allocation failure must not replace the previous file. */
   st_test_alloc_reset();
-  ASSERT(st_save(source, path) == ST_OK);
+  ASSERT(st_learner_save(source, path) == ST_OK);
   size_t save_allocations = st_test_alloc_count();
   ASSERT(save_allocations > 0);
   bool save_failure_observed = false;
@@ -1032,7 +1200,7 @@ static int test_serialization_roundtrip_and_validation(void) {
     ASSERT(keep != NULL && fputs("keep-existing\n", keep) >= 0 &&
            fclose(keep) == 0);
     st_test_alloc_fail_at(fail_at);
-    st_error_t save_error = st_save(source, path);
+    st_error_t save_error = st_learner_save(source, path);
     st_test_alloc_reset();
     if (save_error == ST_ERR_MEMORY) {
       save_failure_observed = true;
@@ -1047,8 +1215,8 @@ static int test_serialization_roundtrip_and_validation(void) {
     }
   }
   ASSERT(save_failure_observed);
-  ASSERT(st_save(source, path) == ST_OK);
-  ASSERT(st_load(loaded, path) == ST_OK);
+  ASSERT(st_learner_save(source, path) == ST_OK);
+  ASSERT(st_learner_load(loaded, path) == ST_OK);
   ASSERT(loaded->trie.total_commands == source->trie.total_commands);
   ASSERT(find_child(loaded->trie.root, "obsolete") == NULL);
 
@@ -1070,14 +1238,14 @@ static int test_serialization_roundtrip_and_validation(void) {
   ASSERT(checksum_digit != EOF && fseek(damaged, -1, SEEK_CUR) == 0);
   ASSERT(fputc(checksum_digit == '0' ? '1' : '0', damaged) != EOF);
   ASSERT(fclose(damaged) == 0);
-  ASSERT(st_load(loaded, path) == ST_ERR_FORMAT);
+  ASSERT(st_learner_load(loaded, path) == ST_ERR_FORMAT);
   ASSERT(loaded->trie.total_commands == source->trie.total_commands);
   ASSERT(find_child(loaded->trie.root, "git") == NULL);
-  ASSERT(st_save(source, path) == ST_OK);
+  ASSERT(st_learner_save(source, path) == ST_OK);
 
   size_t source_count = 0, loaded_count = 0;
-  st_suggestion_t *source_items = st_suggest(source, &source_count);
-  st_suggestion_t *loaded_items = st_suggest(loaded, &loaded_count);
+  st_suggestion_t *source_items = st_learner_suggest(source, &source_count);
+  st_suggestion_t *loaded_items = st_learner_suggest(loaded, &loaded_count);
   ASSERT(source_items && loaded_items && source_count == 1 &&
          suggestion_lists_equal(source_items, source_count, loaded_items,
                                 loaded_count));
@@ -1132,7 +1300,7 @@ static int test_serialization_roundtrip_and_validation(void) {
     ASSERT(fixture != NULL);
     ASSERT(fputs(malformed[i], fixture) >= 0);
     ASSERT(fclose(fixture) == 0);
-    ASSERT(st_load(loaded, path) == ST_ERR_FORMAT);
+    ASSERT(st_learner_load(loaded, path) == ST_ERR_FORMAT);
     ASSERT(loaded->trie.total_commands == source->trie.total_commands);
     ASSERT(loaded->trie.root->num_children == original_children);
     ASSERT(find_child(loaded->trie.root, "git") == NULL);
@@ -1171,7 +1339,7 @@ static int test_serialization_roundtrip_and_validation(void) {
     FILE *fixture = fopen(path, "wb");
     ASSERT(fixture != NULL && fputs(malformed_framed[i], fixture) >= 0);
     ASSERT(fclose(fixture) == 0);
-    ASSERT(st_load(loaded, path) == ST_ERR_FORMAT);
+    ASSERT(st_learner_load(loaded, path) == ST_ERR_FORMAT);
     ASSERT(loaded->trie.total_commands == source->trie.total_commands);
     ASSERT(loaded->trie.root->num_children == original_children);
   }
@@ -1181,7 +1349,7 @@ static int test_serialization_roundtrip_and_validation(void) {
   for (size_t i = 1; i <= ST_MAX_CMD_TOKENS + 1; i++)
     ASSERT(fprintf(deep, "%zu\t%zu\tL\t0\t1\t-\t0\t78\n", i, i - 1) > 0);
   ASSERT(fclose(deep) == 0);
-  ASSERT(st_load(loaded, path) == ST_ERR_FORMAT);
+  ASSERT(st_learner_load(loaded, path) == ST_ERR_FORMAT);
   ASSERT(loaded->trie.total_commands == source->trie.total_commands);
 
   FILE *wide = fopen(path, "w");
@@ -1191,7 +1359,7 @@ static int test_serialization_roundtrip_and_validation(void) {
   for (size_t i = 0; i < ST_MAX_TOKEN_LEN; i++)
     ASSERT(fputs("61", wide) >= 0);
   ASSERT(fputc('\n', wide) != EOF && fclose(wide) == 0);
-  ASSERT(st_load(loaded, path) == ST_ERR_FORMAT);
+  ASSERT(st_learner_load(loaded, path) == ST_ERR_FORMAT);
   ASSERT(loaded->trie.total_commands == source->trie.total_commands);
 
   /* The provisional line-oriented v4 was never released.  It must not be
@@ -1202,17 +1370,17 @@ static int test_serialization_roundtrip_and_validation(void) {
                "1\t0\tT\t6\t1\t!\t1\t-\r\n",
                crlf) >= 0);
   ASSERT(fclose(crlf) == 0);
-  ASSERT(st_load(loaded, path) == ST_ERR_FORMAT);
+  ASSERT(st_learner_load(loaded, path) == ST_ERR_FORMAT);
   ASSERT(loaded->trie.total_commands == source->trie.total_commands);
   ASSERT(loaded->trie.root->num_children == original_children);
   ASSERT(test_st_feed(loaded, "git status") == ST_OK);
   ASSERT(loaded->trie.total_commands == source->trie.total_commands + 1);
 
   if (access("/dev/full", W_OK) == 0)
-    ASSERT(st_save(source, "/dev/full") == ST_ERR_IO);
+    ASSERT(st_learner_save(source, "/dev/full") == ST_ERR_IO);
 
-  st_free_suggestions(source_items, source_count);
-  st_free_suggestions(loaded_items, loaded_count);
+  st_suggestion_list_free(source_items, source_count);
+  st_suggestion_list_free(loaded_items, loaded_count);
   st_learner_free(source);
   st_learner_free(loaded);
   unlink(path);
@@ -1226,8 +1394,14 @@ static int test_serialization_preserves_prefix_nodes(void) {
   snprintf(learner_temp_path, sizeof(learner_temp_path), "%s", path);
   ASSERT(close(fd) == 0);
 
-  st_learner_t *source = st_learner_new(1, 0.0);
-  st_learner_t *loaded = st_learner_new(1, 0.0);
+  st_learner_t *source = st_learner_new(
+      &(st_learner_config_t){.min_support = 1,
+                             .min_confidence = 0.0,
+                             .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
+  st_learner_t *loaded = st_learner_new(
+      &(st_learner_config_t){.min_support = 1,
+                             .min_confidence = 0.0,
+                             .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
   ASSERT(source != NULL && loaded != NULL);
   ASSERT(test_st_feed(source, "git") == ST_OK);
   ASSERT(test_st_feed(source, "git") == ST_OK);
@@ -1242,19 +1416,19 @@ static int test_serialization_preserves_prefix_nodes(void) {
   st_node_t *commit = find_child(git, "commit");
   ASSERT(commit != NULL && commit->count == 3);
 
-  ASSERT(st_save(source, path) == ST_OK);
-  ASSERT(st_load(loaded, path) == ST_OK);
+  ASSERT(st_learner_save(source, path) == ST_OK);
+  ASSERT(st_learner_load(loaded, path) == ST_OK);
   ASSERT(loaded->trie.total_commands == source->trie.total_commands);
   ASSERT(trie_counts_equal(source->trie.root, loaded->trie.root));
 
   size_t source_count = 0, loaded_count = 0;
-  st_suggestion_t *source_items = st_suggest(source, &source_count);
-  st_suggestion_t *loaded_items = st_suggest(loaded, &loaded_count);
+  st_suggestion_t *source_items = st_learner_suggest(source, &source_count);
+  st_suggestion_t *loaded_items = st_learner_suggest(loaded, &loaded_count);
   ASSERT(source_items != NULL && loaded_items != NULL &&
          suggestion_lists_equal(source_items, source_count, loaded_items,
                                 loaded_count));
-  st_free_suggestions(source_items, source_count);
-  st_free_suggestions(loaded_items, loaded_count);
+  st_suggestion_list_free(source_items, source_count);
+  st_suggestion_list_free(loaded_items, loaded_count);
   st_learner_free(source);
   st_learner_free(loaded);
   ASSERT(unlink(path) == 0);
@@ -1271,7 +1445,7 @@ static int test_learner_save_io_failures_are_atomic(void) {
   ASSERT(learner != NULL);
 
   st_test_io_reset();
-  ASSERT(st_save(learner, path) == ST_OK);
+  ASSERT(st_learner_save(learner, path) == ST_OK);
   size_t operation_count = st_test_io_count();
   ASSERT(operation_count >= 4);
   static const char sentinel[] = "preserve-existing-learner";
@@ -1283,7 +1457,7 @@ static int test_learner_save_io_failures_are_atomic(void) {
            sizeof(sentinel) - 1);
     ASSERT(fclose(fp) == 0);
     st_test_io_fail_at(fail_at);
-    st_error_t error = st_save(learner, path);
+    st_error_t error = st_learner_save(learner, path);
     st_test_io_reset();
     ASSERT(error == ST_ERR_IO);
 
@@ -1295,8 +1469,11 @@ static int test_learner_save_io_failures_are_atomic(void) {
     bool old_file = length == sizeof(sentinel) - 1 &&
                     memcmp(contents, sentinel, length) == 0;
     if (!old_file) {
-      st_learner_t *check = st_learner_new(1, 0.0);
-      ASSERT(check != NULL && st_load(check, path) == ST_OK);
+      st_learner_t *check = st_learner_new(&(st_learner_config_t){
+          .min_support = 1,
+          .min_confidence = 0.0,
+          .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
+      ASSERT(check != NULL && st_learner_load(check, path) == ST_OK);
       ASSERT(check->trie.total_commands == learner->trie.total_commands);
       st_learner_free(check);
     }
@@ -1324,7 +1501,7 @@ static int test_learner_load_rejects_binary_and_overlong_lines(void) {
   ASSERT(fp != NULL);
   ASSERT(fwrite(binary, 1, sizeof(binary) - 1, fp) == sizeof(binary) - 1);
   ASSERT(fclose(fp) == 0);
-  ASSERT(st_load(learner, path) == ST_ERR_FORMAT);
+  ASSERT(st_learner_load(learner, path) == ST_ERR_FORMAT);
   ASSERT(learner->trie.total_commands == 2);
   ASSERT(find_child(learner->trie.root, "git") != NULL);
 
@@ -1334,7 +1511,7 @@ static int test_learner_load_rejects_binary_and_overlong_lines(void) {
   for (size_t i = 0; i < 4096; i++)
     ASSERT(fputc('a', fp) != EOF);
   ASSERT(fputc('\n', fp) != EOF && fclose(fp) == 0);
-  ASSERT(st_load(learner, path) == ST_ERR_FORMAT);
+  ASSERT(st_learner_load(learner, path) == ST_ERR_FORMAT);
   ASSERT(learner->trie.total_commands == 2);
   ASSERT(find_child(learner->trie.root, "git") != NULL);
 
@@ -1346,7 +1523,10 @@ static int test_learner_load_rejects_binary_and_overlong_lines(void) {
 
 static int test_suggestion_allocation_failures_are_clean(void) {
   st_test_alloc_reset();
-  st_learner_t *probe = st_learner_new(1, 0.0);
+  st_learner_t *probe = st_learner_new(
+      &(st_learner_config_t){.min_support = 1,
+                             .min_confidence = 0.0,
+                             .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
   ASSERT(probe != NULL);
   for (size_t i = 0; i < 8; i++) {
     char command[64];
@@ -1355,16 +1535,19 @@ static int test_suggestion_allocation_failures_are_clean(void) {
   }
   st_test_alloc_reset();
   size_t probe_count = 0;
-  st_suggestion_t *probe_suggestions = st_suggest(probe, &probe_count);
+  st_suggestion_t *probe_suggestions = st_learner_suggest(probe, &probe_count);
   size_t allocations = st_test_alloc_count();
   ASSERT(probe_suggestions != NULL && probe_count > 0 && allocations > 0);
-  st_free_suggestions(probe_suggestions, probe_count);
+  st_suggestion_list_free(probe_suggestions, probe_count);
   st_learner_free(probe);
 
   bool observed = false;
   for (size_t fail_at = 1; fail_at <= allocations; fail_at++) {
     st_test_alloc_reset();
-    st_learner_t *learner = st_learner_new(1, 0.0);
+    st_learner_t *learner = st_learner_new(
+        &(st_learner_config_t){.min_support = 1,
+                               .min_confidence = 0.0,
+                               .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
     ASSERT(learner != NULL);
     for (size_t i = 0; i < 8; i++) {
       char command[64];
@@ -1373,14 +1556,14 @@ static int test_suggestion_allocation_failures_are_clean(void) {
     }
     size_t count = 99;
     st_test_alloc_fail_at(fail_at);
-    st_suggestion_t *suggestions = st_suggest(learner, &count);
+    st_suggestion_t *suggestions = st_learner_suggest(learner, &count);
     st_test_alloc_reset();
     if (!suggestions) {
       observed = true;
       ASSERT(count == 0);
     } else {
       ASSERT(count > 0);
-      st_free_suggestions(suggestions, count);
+      st_suggestion_list_free(suggestions, count);
     }
     st_learner_free(learner);
   }
@@ -1396,26 +1579,35 @@ static int test_load_allocation_failures_preserve_learner(void) {
   close(fd);
 
   st_test_alloc_reset();
-  st_learner_t *source = st_learner_new(1, 0.0);
-  st_learner_t *loaded = st_learner_new(1, 0.0);
+  st_learner_t *source = st_learner_new(
+      &(st_learner_config_t){.min_support = 1,
+                             .min_confidence = 0.0,
+                             .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
+  st_learner_t *loaded = st_learner_new(
+      &(st_learner_config_t){.min_support = 1,
+                             .min_confidence = 0.0,
+                             .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
   ASSERT(source != NULL && loaded != NULL);
   ASSERT(test_st_feed(source, "source command") == ST_OK);
-  ASSERT(st_save(source, path) == ST_OK);
+  ASSERT(st_learner_save(source, path) == ST_OK);
   ASSERT(test_st_feed(loaded, "keep command") == ST_OK);
 
   st_test_alloc_reset();
-  ASSERT(st_load(loaded, path) == ST_OK);
+  ASSERT(st_learner_load(loaded, path) == ST_OK);
   size_t allocations = st_test_alloc_count();
   ASSERT(allocations > 0);
   st_learner_free(loaded);
 
   bool observed = false;
   for (size_t fail_at = 1; fail_at <= allocations; fail_at++) {
-    loaded = st_learner_new(1, 0.0);
+    loaded = st_learner_new(
+        &(st_learner_config_t){.min_support = 1,
+                               .min_confidence = 0.0,
+                               .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
     ASSERT(loaded != NULL);
     ASSERT(test_st_feed(loaded, "keep command") == ST_OK);
     st_test_alloc_fail_at(fail_at);
-    st_error_t err = st_load(loaded, path);
+    st_error_t err = st_learner_load(loaded, path);
     st_test_alloc_reset();
     if (err == ST_ERR_MEMORY) {
       observed = true;
@@ -1439,16 +1631,19 @@ static int test_learner_load_read_failures_preserve_state(void) {
   int fd = mkstemp(path);
   ASSERT(fd >= 0 && close(fd) == 0);
   snprintf(learner_temp_path, sizeof(learner_temp_path), "%s", path);
-  st_learner_t *source = st_learner_new(1, 0.0);
+  st_learner_t *source = st_learner_new(
+      &(st_learner_config_t){.min_support = 1,
+                             .min_confidence = 0.0,
+                             .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
   ASSERT(source != NULL);
   ASSERT(test_st_feed(source, "replacement 42") == ST_OK);
   ASSERT(test_st_feed(source, "replacement 43") == ST_OK);
-  ASSERT(st_save(source, path) == ST_OK);
+  ASSERT(st_learner_save(source, path) == ST_OK);
 
   st_learner_t *probe = baseline_learner();
   ASSERT(probe != NULL);
   st_test_io_reset();
-  ASSERT(st_load(probe, path) == ST_OK);
+  ASSERT(st_learner_load(probe, path) == ST_OK);
   size_t read_count = st_test_read_count();
   st_test_io_reset();
   ASSERT(read_count > 0);
@@ -1459,7 +1654,7 @@ static int test_learner_load_read_failures_preserve_state(void) {
     st_learner_t *expected = baseline_learner();
     ASSERT(learner && expected);
     st_test_read_fail_at(fail_at);
-    ASSERT(st_load(learner, path) == ST_ERR_IO);
+    ASSERT(st_learner_load(learner, path) == ST_ERR_IO);
     st_test_io_reset();
     ASSERT(learner->trie.total_commands == expected->trie.total_commands);
     ASSERT(nodes_equal(learner->trie.root, expected->trie.root));
@@ -1472,7 +1667,7 @@ static int test_learner_load_read_failures_preserve_state(void) {
   st_learner_t *expected = baseline_learner();
   ASSERT(close_failed && expected);
   st_test_io_fail_at(1);
-  ASSERT(st_load(close_failed, path) == ST_ERR_IO);
+  ASSERT(st_learner_load(close_failed, path) == ST_ERR_IO);
   st_test_io_reset();
   ASSERT(nodes_equal(close_failed->trie.root, expected->trie.root));
   st_learner_free(expected);
@@ -1513,7 +1708,10 @@ static int test_mixed_type_widening_and_v4_roundtrip(void) {
   st_suggestion_t *baseline = NULL;
   size_t baseline_count = 0;
   for (size_t order = 0; order < sizeof(orders) / sizeof(orders[0]); order++) {
-    st_learner_t *learner = st_learner_new(1, 0.0);
+    st_learner_t *learner = st_learner_new(
+        &(st_learner_config_t){.min_support = 1,
+                               .min_confidence = 0.0,
+                               .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
     ASSERT(learner != NULL);
     for (size_t i = 0; i < 10; i++) {
       size_t index = orders[order][i];
@@ -1522,29 +1720,35 @@ static int test_mixed_type_widening_and_v4_roundtrip(void) {
       ASSERT(test_st_feed(learner, command) == ST_OK);
     }
     size_t count = 0;
-    st_suggestion_t *items = st_suggest(learner, &count);
+    st_suggestion_t *items = st_learner_suggest(learner, &count);
     const st_suggestion_t *dominant = find_suggestion(items, count, "probe #n");
     ASSERT(dominant && dominant->count == 7 && dominant->confidence == 0.7);
     ASSERT(!find_suggestion(items, count, "probe #val"));
     if (order == 0) {
       baseline = items;
       baseline_count = count;
-      ASSERT(st_save(learner, path) == ST_OK);
+      ASSERT(st_learner_save(learner, path) == ST_OK);
     } else {
       ASSERT(suggestion_lists_equal(baseline, baseline_count, items, count));
-      st_free_suggestions(items, count);
+      st_suggestion_list_free(items, count);
     }
     st_learner_free(learner);
   }
 
-  st_learner_t *loaded = st_learner_new(1, 0.0);
-  ASSERT(loaded && st_load(loaded, path) == ST_OK);
+  st_learner_t *loaded = st_learner_new(
+      &(st_learner_config_t){.min_support = 1,
+                             .min_confidence = 0.0,
+                             .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
+  ASSERT(loaded && st_learner_load(loaded, path) == ST_OK);
   size_t loaded_count = 0;
-  st_suggestion_t *loaded_items = st_suggest(loaded, &loaded_count);
+  st_suggestion_t *loaded_items = st_learner_suggest(loaded, &loaded_count);
   ASSERT(suggestion_lists_equal(baseline, baseline_count, loaded_items,
                                 loaded_count));
 
-  st_learner_t *joined = st_learner_new(1, 0.0);
+  st_learner_t *joined = st_learner_new(
+      &(st_learner_config_t){.min_support = 1,
+                             .min_confidence = 0.0,
+                             .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
   ASSERT(joined != NULL);
   for (size_t i = 0; i < 6; i++)
     ASSERT(test_st_feed(joined, number_commands[i]) == ST_OK);
@@ -1552,14 +1756,14 @@ static int test_mixed_type_widening_and_v4_roundtrip(void) {
     ASSERT(test_st_feed(joined, uuid_commands[i]) == ST_OK);
   ASSERT(test_st_feed(joined, "probe 9.9.9") == ST_OK);
   size_t joined_count = 0;
-  st_suggestion_t *joined_items = st_suggest(joined, &joined_count);
+  st_suggestion_t *joined_items = st_learner_suggest(joined, &joined_count);
   const st_suggestion_t *generic =
       find_suggestion(joined_items, joined_count, "probe #val");
   ASSERT(generic && generic->count == 10 && generic->confidence == 1.0);
 
-  st_free_suggestions(baseline, baseline_count);
-  st_free_suggestions(loaded_items, loaded_count);
-  st_free_suggestions(joined_items, joined_count);
+  st_suggestion_list_free(baseline, baseline_count);
+  st_suggestion_list_free(loaded_items, loaded_count);
+  st_suggestion_list_free(joined_items, joined_count);
   st_learner_free(loaded);
   st_learner_free(joined);
   ASSERT(unlink(path) == 0);
@@ -1572,18 +1776,24 @@ static int test_v4_preserves_reserved_literal_spellings(void) {
   int fd = mkstemp(path);
   ASSERT(fd >= 0 && close(fd) == 0);
   snprintf(learner_temp_path, sizeof(learner_temp_path), "%s", path);
-  st_learner_t *source = st_learner_new(1, 0.0);
-  st_learner_t *loaded = st_learner_new(1, 0.0);
+  st_learner_t *source = st_learner_new(
+      &(st_learner_config_t){.min_support = 1,
+                             .min_confidence = 0.0,
+                             .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
+  st_learner_t *loaded = st_learner_new(
+      &(st_learner_config_t){.min_support = 1,
+                             .min_confidence = 0.0,
+                             .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
   ASSERT(source && loaded);
 
   for (int type = ST_TYPE_HEXHASH; type < ST_TYPE_COUNT; type++) {
     st_token_t token = {.text = (char *)st_type_symbol[type],
                         .type = ST_TYPE_LITERAL};
     st_token_array_t parsed = {.tokens = &token, .count = 1};
-    ASSERT(st_feed_parsed(source, &parsed) == ST_OK);
+    ASSERT(st_learner_feed_tokens(source, &parsed) == ST_OK);
   }
-  ASSERT(st_save(source, path) == ST_OK);
-  ASSERT(st_load(loaded, path) == ST_OK);
+  ASSERT(st_learner_save(source, path) == ST_OK);
+  ASSERT(st_learner_load(loaded, path) == ST_OK);
   ASSERT(source->trie.total_commands == loaded->trie.total_commands);
   for (int type = ST_TYPE_HEXHASH; type < ST_TYPE_COUNT; type++) {
     st_node_t *node = find_child(loaded->trie.root, st_type_symbol[type]);
@@ -1591,15 +1801,15 @@ static int test_v4_preserves_reserved_literal_spellings(void) {
   }
   size_t source_count = SIZE_MAX;
   size_t loaded_count = SIZE_MAX;
-  st_suggestion_t *source_items = st_suggest(source, &source_count);
-  st_suggestion_t *loaded_items = st_suggest(loaded, &loaded_count);
+  st_suggestion_t *source_items = st_learner_suggest(source, &source_count);
+  st_suggestion_t *loaded_items = st_learner_suggest(loaded, &loaded_count);
   ASSERT(source_items != NULL && loaded_items != NULL && source_count != 0 &&
          source_count == loaded_count);
   ASSERT(suggestion_lists_equal(source_items, source_count, loaded_items,
                                 loaded_count));
 
-  st_free_suggestions(source_items, source_count);
-  st_free_suggestions(loaded_items, loaded_count);
+  st_suggestion_list_free(source_items, source_count);
+  st_suggestion_list_free(loaded_items, loaded_count);
 
   st_learner_free(source);
   st_learner_free(loaded);
@@ -1614,10 +1824,22 @@ static int test_metadata_aggregation_and_v4_roundtrip(void) {
   ASSERT(fd >= 0 && close(fd) == 0);
   snprintf(learner_temp_path, sizeof(learner_temp_path), "%s", path);
 
-  st_learner_t *uniform = st_learner_new(1, 0.0);
-  st_learner_t *mixed_a = st_learner_new(1, 0.0);
-  st_learner_t *mixed_b = st_learner_new(1, 0.0);
-  st_learner_t *loaded = st_learner_new(1, 0.0);
+  st_learner_t *uniform = st_learner_new(
+      &(st_learner_config_t){.min_support = 1,
+                             .min_confidence = 0.0,
+                             .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
+  st_learner_t *mixed_a = st_learner_new(
+      &(st_learner_config_t){.min_support = 1,
+                             .min_confidence = 0.0,
+                             .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
+  st_learner_t *mixed_b = st_learner_new(
+      &(st_learner_config_t){.min_support = 1,
+                             .min_confidence = 0.0,
+                             .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
+  st_learner_t *loaded = st_learner_new(
+      &(st_learner_config_t){.min_support = 1,
+                             .min_confidence = 0.0,
+                             .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
   ASSERT(uniform && mixed_a && mixed_b && loaded);
   for (size_t i = 0; i < ST_MAX_SAMPLE_VALUES + 8; i++) {
     char mib[64], gib[64];
@@ -1630,9 +1852,9 @@ static int test_metadata_aggregation_and_v4_roundtrip(void) {
   }
 
   size_t uniform_count = 0, mixed_a_count = 0, mixed_b_count = 0;
-  st_suggestion_t *uniform_items = st_suggest(uniform, &uniform_count);
-  st_suggestion_t *mixed_a_items = st_suggest(mixed_a, &mixed_a_count);
-  st_suggestion_t *mixed_b_items = st_suggest(mixed_b, &mixed_b_count);
+  st_suggestion_t *uniform_items = st_learner_suggest(uniform, &uniform_count);
+  st_suggestion_t *mixed_a_items = st_learner_suggest(mixed_a, &mixed_a_count);
+  st_suggestion_t *mixed_b_items = st_learner_suggest(mixed_b, &mixed_b_count);
   ASSERT(uniform_items && mixed_a_items && mixed_b_items);
   ASSERT(find_suggestion(uniform_items, uniform_count, "allocate #size.MiB"));
   ASSERT(find_suggestion(mixed_a_items, mixed_a_count, "allocate #size"));
@@ -1640,10 +1862,10 @@ static int test_metadata_aggregation_and_v4_roundtrip(void) {
   ASSERT(!find_suggestion(mixed_a_items, mixed_a_count, "allocate #size.MiB"));
   ASSERT(!find_suggestion(mixed_b_items, mixed_b_count, "allocate #size.MiB"));
 
-  ASSERT(st_save(uniform, path) == ST_OK);
-  ASSERT(st_load(loaded, path) == ST_OK);
+  ASSERT(st_learner_save(uniform, path) == ST_OK);
+  ASSERT(st_learner_load(loaded, path) == ST_OK);
   size_t loaded_count = 0;
-  st_suggestion_t *loaded_items = st_suggest(loaded, &loaded_count);
+  st_suggestion_t *loaded_items = st_learner_suggest(loaded, &loaded_count);
   ASSERT(loaded_items && suggestion_lists_equal(uniform_items, uniform_count,
                                                 loaded_items, loaded_count));
 
@@ -1674,34 +1896,40 @@ static int test_metadata_aggregation_and_v4_roundtrip(void) {
   };
   for (size_t i = 0; i < sizeof(metadata_cases) / sizeof(metadata_cases[0]);
        i++) {
-    st_learner_t *family = st_learner_new(1, 0.0);
-    st_learner_t *family_loaded = st_learner_new(1, 0.0);
+    st_learner_t *family = st_learner_new(
+        &(st_learner_config_t){.min_support = 1,
+                               .min_confidence = 0.0,
+                               .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
+    st_learner_t *family_loaded = st_learner_new(
+        &(st_learner_config_t){.min_support = 1,
+                               .min_confidence = 0.0,
+                               .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
     ASSERT(family && family_loaded);
     ASSERT(test_st_feed(family, metadata_cases[i].first) == ST_OK);
     ASSERT(test_st_feed(family, metadata_cases[i].second) == ST_OK);
     size_t family_count = 0;
-    st_suggestion_t *family_items = st_suggest(family, &family_count);
+    st_suggestion_t *family_items = st_learner_suggest(family, &family_count);
     ASSERT(find_suggestion(family_items, family_count,
                            metadata_cases[i].specific));
-    ASSERT(st_save(family, path) == ST_OK);
-    ASSERT(st_load(family_loaded, path) == ST_OK);
+    ASSERT(st_learner_save(family, path) == ST_OK);
+    ASSERT(st_learner_load(family_loaded, path) == ST_OK);
     size_t family_loaded_count = 0;
     st_suggestion_t *family_loaded_items =
-        st_suggest(family_loaded, &family_loaded_count);
+        st_learner_suggest(family_loaded, &family_loaded_count);
     ASSERT(suggestion_lists_equal(family_items, family_count,
                                   family_loaded_items, family_loaded_count));
 
     if (metadata_cases[i].different) {
       ASSERT(test_st_feed(family, metadata_cases[i].different) == ST_OK);
-      st_free_suggestions(family_items, family_count);
-      family_items = st_suggest(family, &family_count);
+      st_suggestion_list_free(family_items, family_count);
+      family_items = st_learner_suggest(family, &family_count);
       ASSERT(find_suggestion(family_items, family_count,
                              metadata_cases[i].generic));
       ASSERT(!find_suggestion(family_items, family_count,
                               metadata_cases[i].specific));
     }
-    st_free_suggestions(family_items, family_count);
-    st_free_suggestions(family_loaded_items, family_loaded_count);
+    st_suggestion_list_free(family_items, family_count);
+    st_suggestion_list_free(family_loaded_items, family_loaded_count);
     st_learner_free(family);
     st_learner_free(family_loaded);
   }
@@ -1709,7 +1937,7 @@ static int test_metadata_aggregation_and_v4_roundtrip(void) {
   FILE *legacy = fopen(path, "w");
   ASSERT(legacy && fputs("# ST trie dump\n# total_commands=0\n", legacy) >= 0 &&
          fclose(legacy) == 0);
-  ASSERT(st_load(loaded, path) == ST_ERR_FORMAT);
+  ASSERT(st_learner_load(loaded, path) == ST_ERR_FORMAT);
   ASSERT(loaded->trie.total_commands == uniform->trie.total_commands);
 
   static const char *malformed_v2[] = {
@@ -1726,14 +1954,14 @@ static int test_metadata_aggregation_and_v4_roundtrip(void) {
     FILE *fixture = fopen(path, "w");
     ASSERT(fixture && fputs(malformed_v2[i], fixture) >= 0 &&
            fclose(fixture) == 0);
-    ASSERT(st_load(loaded, path) == ST_ERR_FORMAT);
+    ASSERT(st_learner_load(loaded, path) == ST_ERR_FORMAT);
     ASSERT(loaded->trie.total_commands == uniform->trie.total_commands);
   }
 
-  st_free_suggestions(uniform_items, uniform_count);
-  st_free_suggestions(mixed_a_items, mixed_a_count);
-  st_free_suggestions(mixed_b_items, mixed_b_count);
-  st_free_suggestions(loaded_items, loaded_count);
+  st_suggestion_list_free(uniform_items, uniform_count);
+  st_suggestion_list_free(mixed_a_items, mixed_a_count);
+  st_suggestion_list_free(mixed_b_items, mixed_b_count);
+  st_suggestion_list_free(loaded_items, loaded_count);
   st_learner_free(uniform);
   st_learner_free(mixed_a);
   st_learner_free(mixed_b);
@@ -1748,26 +1976,32 @@ static int test_learner_save_crash_boundaries(void) {
   int fd = mkstemp(path);
   ASSERT(fd >= 0 && close(fd) == 0);
   snprintf(learner_temp_path, sizeof(learner_temp_path), "%s", path);
-  st_learner_t *old_state = st_learner_new(1, 0.0);
-  st_learner_t *new_state = st_learner_new(1, 0.0);
+  st_learner_t *old_state = st_learner_new(
+      &(st_learner_config_t){.min_support = 1,
+                             .min_confidence = 0.0,
+                             .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
+  st_learner_t *new_state = st_learner_new(
+      &(st_learner_config_t){.min_support = 1,
+                             .min_confidence = 0.0,
+                             .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
   ASSERT(old_state && new_state);
   ASSERT(test_st_feed(old_state, "old 1MiB") == ST_OK);
   ASSERT(test_st_feed(new_state, "new 1GiB") == ST_OK);
   ASSERT(test_st_feed(new_state, "new 2GiB") == ST_OK);
 
   st_test_io_reset();
-  ASSERT(st_save(new_state, path) == ST_OK);
+  ASSERT(st_learner_save(new_state, path) == ST_OK);
   size_t operation_count = st_test_io_count();
   ASSERT(operation_count > 0);
   st_test_io_reset();
 
   for (size_t crash_after = 1; crash_after <= operation_count; crash_after++) {
-    ASSERT(st_save(old_state, path) == ST_OK);
+    ASSERT(st_learner_save(old_state, path) == ST_OK);
     pid_t child = fork();
     ASSERT(child >= 0);
     if (child == 0) {
       st_test_io_crash_after(crash_after);
-      (void)st_save(new_state, path);
+      (void)st_learner_save(new_state, path);
       _exit(92);
     }
     int status = 0;
@@ -1775,8 +2009,11 @@ static int test_learner_save_crash_boundaries(void) {
     ASSERT(WIFEXITED(status) && WEXITSTATUS(status) == 91);
     st_test_io_reset();
 
-    st_learner_t *loaded = st_learner_new(1, 0.0);
-    ASSERT(loaded && st_load(loaded, path) == ST_OK);
+    st_learner_t *loaded = st_learner_new(
+        &(st_learner_config_t){.min_support = 1,
+                               .min_confidence = 0.0,
+                               .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
+    ASSERT(loaded && st_learner_load(loaded, path) == ST_OK);
     ASSERT(loaded->trie.total_commands == 1 ||
            loaded->trie.total_commands == 2);
     st_learner_free(loaded);
@@ -1796,6 +2033,7 @@ int main(void) {
   TEST(test_learner_state_transitions);
   TEST(test_learner_input_boundaries);
   TEST(test_learner_configuration_boundaries);
+  TEST(test_learner_stats_contract);
   TEST(test_suggestion_matrix);
   TEST(test_suggestion_order_is_input_order_independent);
   TEST(test_generated_suggestion_history_properties);
@@ -1817,6 +2055,7 @@ int main(void) {
   TEST(test_metadata_aggregation_and_v4_roundtrip);
   TEST(test_learner_save_crash_boundaries);
   TEST(test_feed_is_atomic);
+  TEST(test_feed_netargv_avoids_classifier_allocations);
   TEST(test_expressive_literal_suggestions);
   TEST(test_compound_option_suggestion);
   printf("\nResults: %d/%d passed, %d failed\n", tests_passed, tests_run,

@@ -35,6 +35,7 @@
 
 #include "sg_anomaly.h"
 #include "shell_processor.h"
+#include "shell_sequence.h"
 
 #define MAX_LINE 4096
 
@@ -116,19 +117,21 @@ int main(int argc, char **argv) {
   }
 
   /* Create or load model */
-  sg_anomaly_model_t *model = sg_anomaly_model_new_ex(0.1, -10.0);
+  sg_anomaly_config_t config;
+  sg_anomaly_config_default(&config);
+  sg_anomaly_model_t *model = sg_anomaly_model_new_with_config(&config);
   if (!model) {
     fprintf(stderr, "Failed to create model\n");
     return 1;
   }
 
   if (model_path) {
-    if (sg_anomaly_load(model, model_path) != 0) {
+    if (sg_anomaly_model_load(model, model_path) != SG_ANOMALY_OK) {
       fprintf(stderr, "Warning: Could not load model from %s, starting fresh\n",
               model_path);
     } else {
       printf("Loaded model from %s (vocab=%zu)\n", model_path,
-             sg_anomaly_vocab_size(model));
+             sg_anomaly_model_vocab_size(model));
     }
   }
 
@@ -141,7 +144,8 @@ int main(int argc, char **argv) {
       return 1;
     }
     printf("After decay: vocab=%zu, total_uni=%zu\n",
-           sg_anomaly_vocab_size(model), sg_anomaly_total_uni(model));
+           sg_anomaly_model_vocab_size(model),
+           sg_anomaly_model_total_unigrams(model));
   }
 
   if (do_prune) {
@@ -157,13 +161,17 @@ int main(int argc, char **argv) {
 
   if (do_compact) {
     printf("Compacting model...\n");
-    bool did_compact = sg_anomaly_model_compact(model);
-    printf("Compaction %s\n", did_compact ? "completed" : "not needed");
+    if (sg_anomaly_model_compact(model) != SG_ANOMALY_OK) {
+      fprintf(stderr, "anomaly compaction failed\n");
+      sg_anomaly_model_free(model);
+      return 1;
+    }
+    printf("Compaction completed\n");
   }
 
   /* Save if requested */
   if (save_path && (do_decay || do_prune || do_compact)) {
-    if (sg_anomaly_save(model, save_path) == 0) {
+    if (sg_anomaly_model_save(model, save_path) == SG_ANOMALY_OK) {
       printf("Model saved to %s\n", save_path);
     } else {
       fprintf(stderr, "Failed to save model to %s\n", save_path);
@@ -184,7 +192,7 @@ int main(int argc, char **argv) {
 
       size_t count = 0;
       char *netseq = NULL;
-      if (shell_build_command_netseq(cmd, NULL, &netseq, &count) !=
+      if (shell_build_command_netseq(cmd, strlen(cmd), NULL, &netseq, &count) !=
               SHELL_PROCESS_OK ||
           !netseq) {
         fprintf(stderr, "Could not parse command sequence\n");
@@ -194,7 +202,7 @@ int main(int argc, char **argv) {
       /* Score the command sequence */
       double score = INFINITY;
       sg_anomaly_status_t score_status =
-          sg_anomaly_score_netseq(model, netseq, strlen(netseq), &score);
+          sg_anomaly_model_score_netseq(model, netseq, strlen(netseq), &score);
       if (score_status != SG_ANOMALY_OK) {
         free(netseq);
         fprintf(stderr, "Could not score command sequence\n");
@@ -212,8 +220,8 @@ int main(int argc, char **argv) {
       /* Update model if in learning mode */
       if (learning && count > 0) {
         if (!detected) {
-          updated = sg_anomaly_update_netseq(model, netseq, strlen(netseq)) ==
-                    SG_ANOMALY_OK;
+          updated = sg_anomaly_model_update_netseq(
+                        model, netseq, strlen(netseq)) == SG_ANOMALY_OK;
         }
       }
 
@@ -224,7 +232,7 @@ int main(int argc, char **argv) {
 
   /* Save on exit if requested */
   if (save_path && !do_decay && !do_prune && !do_compact) {
-    if (sg_anomaly_save(model, save_path) == 0) {
+    if (sg_anomaly_model_save(model, save_path) == SG_ANOMALY_OK) {
       printf("Model saved to %s\n", save_path);
     } else {
       fprintf(stderr, "Failed to save model to %s\n", save_path);

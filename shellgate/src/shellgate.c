@@ -10,8 +10,10 @@
 #include "sg_io.h"
 #include "shell_abstract.h"
 #include "shell_depgraph.h"
+#include "shell_depgraph_internal.h"
 #include "shell_netstring.h"
 #include "shell_processor.h"
+#include "shell_sequence.h"
 #include "shell_tokenizer.h"
 #include "shelltype.h"
 #include <ctype.h>
@@ -54,6 +56,14 @@ static void bw_init(buf_writer_t *w, char *buf, size_t buf_size) {
   w->size = buf_size;
   w->used = 0;
   w->overflow = false;
+}
+
+static void bw_mark_overflow(buf_writer_t *w) {
+  w->overflow = true;
+  if (w->size != 0) {
+    w->base[w->size - 1] = '\0';
+    w->used = w->size;
+  }
 }
 
 static const char *bw_copy(buf_writer_t *w, const char *src, size_t src_len) {
@@ -145,8 +155,8 @@ static void type_cache_free(type_cache_t *c) {
 }
 
 static void cdf_free(sg_gate_t *gate);
-static char *type_cache_lookup(type_cache_t *c, const char *key, size_t key_len,
-                               size_t *value_count) {
+static const char *type_cache_lookup(type_cache_t *c, const char *key,
+                                     size_t key_len, size_t *value_count) {
   if (!c->entries || c->count == 0)
     return NULL;
   for (size_t i = 0; i < c->count; i++) {
@@ -223,9 +233,9 @@ struct sg_gate {
   bool anomaly_enabled;
   double anomaly_threshold;
   bool anomaly_update_only_on_allow;
-  bool anomaly_update_on_non_anomaly; /* don't learn from anomalous commands */
-  double anomaly_weight_raw;          /* weight for raw score (default 0.5) */
-  double anomaly_weight_type;         /* weight for type score (default 0.5) */
+  bool anomaly_skip_on_detected; /* don't learn from anomalous commands */
+  double anomaly_weight_raw;     /* weight for raw score (default 0.5) */
+  double anomaly_weight_type;    /* weight for type score (default 0.5) */
   sg_anomaly_combine_mode_t
       anomaly_combine_mode; /* WEIGHTED or BAYESIAN (default WEIGHTED) */
 
@@ -265,7 +275,7 @@ sg_gate_t *sg_gate_new(void) {
 
   g->policy = st_policy_new(g->pctx);
   if (!g->policy) {
-    st_policy_ctx_free(g->pctx);
+    st_policy_ctx_release(g->pctx);
     free(g);
     return NULL;
   }
@@ -273,7 +283,7 @@ sg_gate_t *sg_gate_new(void) {
   g->deny_policy = st_policy_new(g->pctx);
   if (!g->deny_policy) {
     st_policy_free(g->policy);
-    st_policy_ctx_free(g->pctx);
+    st_policy_ctx_release(g->pctx);
     free(g);
     return NULL;
   }
@@ -286,7 +296,7 @@ sg_gate_t *sg_gate_new(void) {
 
   /* Anomaly detection defaults */
   g->anomaly_update_only_on_allow = false;
-  g->anomaly_update_on_non_anomaly = true;
+  g->anomaly_skip_on_detected = true;
   g->anomaly_weight_raw = 0.5;
   g->anomaly_weight_type = 0.5;
 
@@ -308,7 +318,7 @@ void sg_gate_free(sg_gate_t *gate) {
   if (gate->deny_policy)
     st_policy_free(gate->deny_policy);
   if (gate->pctx)
-    st_policy_ctx_free(gate->pctx);
+    st_policy_ctx_release(gate->pctx);
   free(gate);
 }
 
@@ -374,8 +384,9 @@ static bool config_array_valid(const char *const *values, uint32_t count,
   return true;
 }
 
-sg_error_t sg_gate_set_violation_config(sg_gate_t *gate,
-                                        const sg_violation_config_t *config) {
+sg_error_t
+sg_gate_set_violation_config_borrowed(sg_gate_t *gate,
+                                      const sg_violation_config_t *config) {
   if (!gate || !config)
     return SG_ERR_INVALID;
   if (!config_array_valid(config->sensitive_write_paths,
@@ -418,15 +429,16 @@ sg_error_t sg_gate_set_violation_config(sg_gate_t *gate,
 /* --- ANOMALY DETECTION CONFIGURATION --- */
 
 sg_error_t sg_gate_enable_anomaly(sg_gate_t *gate, double threshold,
-                                  double alpha, double unk_prior) {
-  if (!gate || !isfinite(threshold) || !isfinite(alpha) || alpha <= 0.0 ||
-      !isfinite(unk_prior))
+                                  const sg_anomaly_config_t *config) {
+  if (!gate || !isfinite(threshold))
     return SG_ERR_INVALID;
-
-  sg_anomaly_model_t *new_raw = sg_anomaly_model_new_ex(alpha, unk_prior);
+  if (config && (!isfinite(config->alpha) || config->alpha <= 0.0 ||
+                 !isfinite(config->unknown_log_prior)))
+    return SG_ERR_INVALID;
+  sg_anomaly_model_t *new_raw = sg_anomaly_model_new_with_config(config);
   if (!new_raw)
     return SG_ERR_MEMORY;
-  sg_anomaly_model_t *new_type = sg_anomaly_model_new_ex(alpha, unk_prior);
+  sg_anomaly_model_t *new_type = sg_anomaly_model_new_with_config(config);
   if (!new_type) {
     sg_anomaly_model_free(new_raw);
     return SG_ERR_MEMORY;
@@ -456,7 +468,7 @@ sg_error_t sg_gate_enable_anomaly(sg_gate_t *gate, double threshold,
   gate->anomaly_enabled = true;
   gate->anomaly_threshold = threshold;
   gate->anomaly_update_only_on_allow = false;
-  gate->anomaly_update_on_non_anomaly = true;
+  gate->anomaly_skip_on_detected = true;
   gate->anomaly_weight_raw = 0.5;
   gate->anomaly_weight_type = 0.5;
   gate->anomaly_combine_mode = SG_ANOMALY_COMBINE_WEIGHTED;
@@ -498,11 +510,10 @@ sg_error_t sg_gate_set_anomaly_update_mode(sg_gate_t *gate,
   return SG_OK;
 }
 
-sg_error_t sg_gate_set_anomaly_update_on_non_anomaly(sg_gate_t *gate,
-                                                     bool skip_on_anomaly) {
+sg_error_t sg_gate_set_anomaly_skip_on_detected(sg_gate_t *gate, bool skip) {
   if (!gate)
     return SG_ERR_INVALID;
-  gate->anomaly_update_on_non_anomaly = skip_on_anomaly;
+  gate->anomaly_skip_on_detected = skip;
   return SG_OK;
 }
 
@@ -741,9 +752,9 @@ sg_error_t sg_gate_score_anomaly_netseq(const sg_gate_t *gate,
           SG_ANOMALY_OK ||
       raw_count != type_count)
     return SG_ERR_PARSE;
-  sg_anomaly_status_t raw_status = sg_anomaly_score_netseq(
+  sg_anomaly_status_t raw_status = sg_anomaly_model_score_netseq(
       gate->anomaly_model, raw_netseq, raw_length, &out->raw_score);
-  sg_anomaly_status_t type_status = sg_anomaly_score_netseq(
+  sg_anomaly_status_t type_status = sg_anomaly_model_score_netseq(
       gate->anomaly_model_type, type_netseq, type_length, &out->type_score);
   if (raw_status == SG_ANOMALY_ERR_MEMORY ||
       type_status == SG_ANOMALY_ERR_MEMORY)
@@ -1015,25 +1026,22 @@ bool sg_gate_anomaly_had_error(const sg_gate_t *gate) {
 size_t sg_gate_anomaly_vocab_size(const sg_gate_t *gate) {
   if (!gate || !gate->anomaly_model)
     return 0;
-  return sg_anomaly_vocab_size(gate->anomaly_model);
+  return sg_anomaly_model_vocab_size(gate->anomaly_model);
 }
 
 /* --- SUGGESTION TOKEN VARIANTS --- */
 
 /*
  * Given a suggestion pattern string and a token position, return type variants
- * for editing. Chain: literal → most_specific (via st_classify_token) → ...
+ * for editing. Chain: literal → most_specific (via st_token_classify) → ...
  *        ... → suggested_wildcard (from suggestion) → ... → #any
  *
  * Variants walk from more specific to more general.
  * st_type_join gives the widening direction toward ST_TYPE_ANY.
  */
-size_t sg_gate_suggestion_token_variants_at(sg_gate_t *gate,
-                                            const char *pattern,
-                                            size_t edit_pos,
-                                            st_token_variant_t *out_variants,
-                                            size_t max_variants) {
-  (void)gate; /* reserved for future use (learner-based observed types) */
+size_t sg_cpl_token_variants_at(const char *pattern, size_t edit_pos,
+                                st_token_variant_t *out_variants,
+                                size_t max_variants) {
   if (!pattern || !out_variants || max_variants == 0)
     return 0;
   if (pattern[0] == '\0')
@@ -1047,88 +1055,9 @@ size_t sg_gate_suggestion_token_variants_at(sg_gate_t *gate,
     return 0;
   }
   free(netpattern);
-  if (edit_pos >= decoded.count) {
-    st_free_token_array(&decoded);
-    return 0;
-  }
-
-  const char *target_tok = decoded.tokens[edit_pos].text;
-
-  /* Determine the starting type:
-   * - If target token is already a wildcard, use that type
-   * - If literal, classify it via st_classify_token to get most specific type
-   */
-  st_token_type_t start_type = decoded.tokens[edit_pos].type;
-  if (start_type == ST_TYPE_LITERAL) {
-    start_type = st_classify_token(target_tok);
-  }
-
-  /* Build chain: [literal, start_type, ..., suggested_wildcard, ...,
-   * ST_TYPE_ANY] First position is always the literal text */
-  size_t out = 0;
-
-  /* Variant 0: the literal itself */
-  out_variants[out].type = ST_TYPE_LITERAL;
-  out_variants[out].type_symbol = st_type_symbol[ST_TYPE_LITERAL];
-  out_variants[out].sample_value = NULL;
-  out++;
-
-  /* Variant 1: most specific type for this literal (st_classify_token result)
-   */
-  if (out < max_variants && start_type != ST_TYPE_LITERAL) {
-    out_variants[out].type = start_type;
-    out_variants[out].type_symbol = st_type_symbol[start_type];
-    out_variants[out].sample_value = NULL;
-    out++;
-  }
-
-  /* Remaining variants: walk from start_type toward ST_TYPE_ANY via
-   * st_type_join. We use st_is_compatible to find the next wider type. The join
-   * of start_type and any type gives the next wider type in the lattice.
-   *
-   * We collect seen types to avoid duplicates. Start from the most specific
-   * (after literal and classification), then progressively widen. */
-  bool seen[ST_TYPE_COUNT] = {false};
-  if (start_type != ST_TYPE_LITERAL)
-    seen[start_type] = true;
-
-  st_token_type_t current = start_type;
-
-  /* Widen until we reach ST_TYPE_ANY */
-  while (current != ST_TYPE_ANY && out < max_variants) {
-    st_token_type_t next_wide = ST_TYPE_ANY;
-    /* Find the narrowest type that is wider than current (join of current and
-     * each candidate) */
-    for (st_token_type_t t = ST_TYPE_LITERAL + 1; t < ST_TYPE_COUNT; t++) {
-      if (t == current || seen[t])
-        continue;
-      st_token_type_t joined = st_type_join[current][t];
-      if (joined != current && !seen[joined]) {
-        /* joined is wider than current — track the narrowest such option */
-        if (next_wide == ST_TYPE_ANY || st_is_compatible(joined, next_wide)) {
-          next_wide = joined;
-        }
-      }
-    }
-    if (next_wide == ST_TYPE_ANY || next_wide == current)
-      break;
-    seen[next_wide] = true;
-    out_variants[out].type = next_wide;
-    out_variants[out].type_symbol = st_type_symbol[next_wide];
-    out_variants[out].sample_value = NULL;
-    out++;
-    current = next_wide;
-  }
-
-  /* Final variant: ST_TYPE_ANY (only if not already seen) */
-  if (out < max_variants && !seen[ST_TYPE_ANY]) {
-    out_variants[out].type = ST_TYPE_ANY;
-    out_variants[out].type_symbol = st_type_symbol[ST_TYPE_ANY];
-    out_variants[out].sample_value = NULL;
-    out++;
-  }
-
-  st_free_token_array(&decoded);
+  size_t out =
+      st_token_variants_at(&decoded, edit_pos, out_variants, max_variants);
+  st_token_array_free(&decoded);
   return out;
 }
 
@@ -1151,22 +1080,27 @@ static sg_error_t policy_mutation_error(st_error_t error) {
   return SG_ERR_INVALID;
 }
 
-static st_error_t policy_add_cpl(st_policy_t *policy, const char *cpl) {
-  char *netpattern = NULL;
-  st_error_t error = st_netpattern_from_cpl(cpl, &netpattern);
-  if (error == ST_OK)
-    error = st_policy_add_netpattern(policy, netpattern);
-  free(netpattern);
-  return error;
+static sg_error_t gate_add_netpattern(st_policy_t *policy,
+                                      const char *netpattern) {
+  if (!netpattern)
+    return SG_ERR_INVALID;
+  return policy_mutation_error(st_policy_add_netpattern(policy, netpattern));
 }
 
-static st_error_t policy_remove_cpl(st_policy_t *policy, const char *cpl) {
-  char *netpattern = NULL;
-  st_error_t error = st_netpattern_from_cpl(cpl, &netpattern);
-  if (error == ST_OK)
-    error = st_policy_remove_netpattern(policy, netpattern);
-  free(netpattern);
-  return error;
+static sg_error_t gate_remove_netpattern(st_policy_t *policy,
+                                         const char *netpattern) {
+  if (!netpattern)
+    return SG_ERR_INVALID;
+  return policy_mutation_error(st_policy_remove_netpattern(policy, netpattern));
+}
+
+static sg_error_t gate_batch_add_netpatterns(st_policy_t *policy,
+                                             const char *const *netpatterns,
+                                             size_t count) {
+  if (!netpatterns || count == 0)
+    return SG_ERR_INVALID;
+  return policy_mutation_error(
+      st_policy_batch_add_netpatterns(policy, netpatterns, count));
 }
 
 static sg_error_t policy_load_error(st_error_t error) {
@@ -1199,46 +1133,114 @@ sg_error_t sg_gate_save_policy(const sg_gate_t *gate, const char *path) {
   return policy_mutation_error(st_policy_save(gate->policy, path));
 }
 
-sg_error_t sg_gate_add_rule(sg_gate_t *gate, const char *pattern) {
-  if (!gate || !pattern)
+sg_error_t sg_gate_add_allow_netpattern(sg_gate_t *gate,
+                                        const char *netpattern) {
+  if (!gate)
     return SG_ERR_INVALID;
-  return policy_mutation_error(policy_add_cpl(gate->policy, pattern));
+  return gate_add_netpattern(gate->policy, netpattern);
 }
 
-sg_error_t sg_gate_remove_rule(sg_gate_t *gate, const char *pattern) {
-  if (!gate || !pattern)
+sg_error_t sg_gate_remove_allow_netpattern(sg_gate_t *gate,
+                                           const char *netpattern) {
+  if (!gate)
     return SG_ERR_INVALID;
-  return policy_mutation_error(policy_remove_cpl(gate->policy, pattern));
+  return gate_remove_netpattern(gate->policy, netpattern);
 }
 
-uint32_t sg_gate_rule_count(const sg_gate_t *gate) {
+sg_error_t sg_gate_batch_add_allow_netpatterns(sg_gate_t *gate,
+                                               const char *const *netpatterns,
+                                               size_t count) {
+  if (!gate)
+    return SG_ERR_INVALID;
+  return gate_batch_add_netpatterns(gate->policy, netpatterns, count);
+}
+
+sg_error_t sg_gate_add_allow_cpl(sg_gate_t *gate, const char *pattern) {
+  if (!gate || !pattern)
+    return SG_ERR_INVALID;
+  char *netpattern = NULL;
+  st_error_t error = st_netpattern_from_cpl(pattern, &netpattern);
+  sg_error_t result = error == ST_OK
+                          ? sg_gate_add_allow_netpattern(gate, netpattern)
+                          : policy_mutation_error(error);
+  free(netpattern);
+  return result;
+}
+
+sg_error_t sg_gate_remove_allow_cpl(sg_gate_t *gate, const char *pattern) {
+  if (!gate || !pattern)
+    return SG_ERR_INVALID;
+  char *netpattern = NULL;
+  st_error_t error = st_netpattern_from_cpl(pattern, &netpattern);
+  sg_error_t result = error == ST_OK
+                          ? sg_gate_remove_allow_netpattern(gate, netpattern)
+                          : policy_mutation_error(error);
+  free(netpattern);
+  return result;
+}
+
+size_t sg_gate_allow_rule_count(const sg_gate_t *gate) {
   if (!gate)
     return 0;
-  return (uint32_t)st_policy_count(gate->policy);
+  return st_policy_rule_count(gate->policy);
 }
 
-sg_error_t sg_gate_add_deny_rule(sg_gate_t *gate, const char *pattern) {
+sg_error_t sg_gate_add_deny_netpattern(sg_gate_t *gate,
+                                       const char *netpattern) {
+  if (!gate)
+    return SG_ERR_INVALID;
+  return gate_add_netpattern(gate->deny_policy, netpattern);
+}
+
+sg_error_t sg_gate_remove_deny_netpattern(sg_gate_t *gate,
+                                          const char *netpattern) {
+  if (!gate)
+    return SG_ERR_INVALID;
+  return gate_remove_netpattern(gate->deny_policy, netpattern);
+}
+
+sg_error_t sg_gate_batch_add_deny_netpatterns(sg_gate_t *gate,
+                                              const char *const *netpatterns,
+                                              size_t count) {
+  if (!gate)
+    return SG_ERR_INVALID;
+  return gate_batch_add_netpatterns(gate->deny_policy, netpatterns, count);
+}
+
+sg_error_t sg_gate_add_deny_cpl(sg_gate_t *gate, const char *pattern) {
   if (!gate || !pattern)
     return SG_ERR_INVALID;
-  return policy_mutation_error(policy_add_cpl(gate->deny_policy, pattern));
+  char *netpattern = NULL;
+  st_error_t error = st_netpattern_from_cpl(pattern, &netpattern);
+  sg_error_t result = error == ST_OK
+                          ? sg_gate_add_deny_netpattern(gate, netpattern)
+                          : policy_mutation_error(error);
+  free(netpattern);
+  return result;
 }
 
-sg_error_t sg_gate_remove_deny_rule(sg_gate_t *gate, const char *pattern) {
+sg_error_t sg_gate_remove_deny_cpl(sg_gate_t *gate, const char *pattern) {
   if (!gate || !pattern)
     return SG_ERR_INVALID;
-  return policy_mutation_error(policy_remove_cpl(gate->deny_policy, pattern));
+  char *netpattern = NULL;
+  st_error_t error = st_netpattern_from_cpl(pattern, &netpattern);
+  sg_error_t result = error == ST_OK
+                          ? sg_gate_remove_deny_netpattern(gate, netpattern)
+                          : policy_mutation_error(error);
+  free(netpattern);
+  return result;
 }
 
-uint32_t sg_gate_deny_rule_count(const sg_gate_t *gate) {
+size_t sg_gate_deny_rule_count(const sg_gate_t *gate) {
   if (!gate)
     return 0;
-  return (uint32_t)st_policy_count(gate->deny_policy);
+  return st_policy_rule_count(gate->deny_policy);
 }
 
 /* --- INTERNAL: TOKEN EXPANSION HELPERS --- */
 
-static bool extract_var_name(const char *tok, size_t len, char *name_out,
-                             size_t name_max) {
+static bool extract_var_name(const char *tok, size_t len, const char **name,
+                             size_t *name_length) {
   if (len < 2 || tok[0] != '$')
     return false;
 
@@ -1251,7 +1253,7 @@ static bool extract_var_name(const char *tok, size_t len, char *name_out,
   }
 
   size_t nlen = end - start;
-  if (nlen == 0 || nlen >= name_max)
+  if (nlen == 0)
     return false;
 
   for (size_t i = start; i < end; i++) {
@@ -1261,8 +1263,8 @@ static bool extract_var_name(const char *tok, size_t len, char *name_out,
       return false;
   }
 
-  memcpy(name_out, tok + start, nlen);
-  name_out[nlen] = '\0';
+  *name = tok + start;
+  *name_length = nlen;
   return true;
 }
 
@@ -1276,114 +1278,10 @@ static bool has_glob_chars(const char *tok, size_t len) {
 
 /* --- INTERNAL: BUILD COMMAND STRING WITH OPTIONAL EXPANSION --- */
 
-/* Expansion buffer size. Callbacks must return at most this many bytes minus
- * one for the terminating NUL. */
-#define SG_EXPAND_BUF 4096
-#define SG_GLOB_PATTERN_BUF 256
-
-static bool reserve_netarg_payload(char **encoded, size_t *length,
-                                   size_t *capacity, size_t payload_length,
-                                   char **payload, size_t *encoded_length,
-                                   bool *allocation_failed) {
-  if (!payload || !encoded_length)
+static bool measure_expansion_display(const char *encoded, size_t length,
+                                      size_t *display_length) {
+  if (!display_length)
     return false;
-  *payload = NULL;
-  *encoded_length = 0;
-  if (allocation_failed)
-    *allocation_failed = false;
-  size_t record_length = 0;
-  if (shell_netstring_encoded_length(payload_length, &record_length) !=
-          SHELL_NETSTRING_OK ||
-      *length > SIZE_MAX - record_length)
-    return false;
-  size_t needed = *length + record_length + 1;
-  if (needed > *capacity) {
-    size_t grown = *capacity ? *capacity : 64;
-    while (grown < needed) {
-      if (grown > SIZE_MAX / 2) {
-        grown = needed;
-        break;
-      }
-      grown *= 2;
-    }
-    char *replacement = realloc(*encoded, grown);
-    if (!replacement) {
-      if (allocation_failed)
-        *allocation_failed = true;
-      return false;
-    }
-    *encoded = replacement;
-    *capacity = grown;
-  }
-  size_t prefix_length = 0;
-  if (shell_netstring_write_prefix(*encoded + *length, *capacity - *length,
-                                   payload_length,
-                                   &prefix_length) != SHELL_NETSTRING_OK ||
-      prefix_length >= record_length)
-    return false;
-  *payload = *encoded + *length + prefix_length;
-  *encoded_length = record_length;
-  return true;
-}
-
-static bool append_decoded_netarg(char **encoded, size_t *length,
-                                  size_t *capacity, const char *text,
-                                  size_t text_length, bool *allocation_failed) {
-  size_t decoded_length = 0;
-  if (shell_measure_decoded_word(text, text_length, &decoded_length) !=
-      SHELL_PROCESS_OK)
-    return false;
-  char *payload = NULL;
-  size_t record_length = 0;
-  if (!reserve_netarg_payload(encoded, length, capacity, decoded_length,
-                              &payload, &record_length, allocation_failed))
-    return false;
-  size_t written = 0;
-  if (shell_write_decoded_word(text, text_length, payload, decoded_length,
-                               &written) != SHELL_PROCESS_OK ||
-      written != decoded_length)
-    return false;
-  payload[decoded_length] = ',';
-  *length += record_length;
-  (*encoded)[*length] = '\0';
-  return true;
-}
-
-static bool append_encoded_netargv(char **encoded, size_t *length,
-                                   size_t *capacity, const char *addition,
-                                   size_t addition_length,
-                                   bool *allocation_failed) {
-  if (allocation_failed)
-    *allocation_failed = false;
-  if (addition_length > SIZE_MAX - *length - 1)
-    return false;
-  size_t needed = *length + addition_length + 1;
-  if (needed > *capacity) {
-    size_t grown = *capacity ? *capacity : 64;
-    while (grown < needed) {
-      if (grown > SIZE_MAX / 2) {
-        grown = needed;
-        break;
-      }
-      grown *= 2;
-    }
-    char *replacement = realloc(*encoded, grown);
-    if (!replacement) {
-      if (allocation_failed)
-        *allocation_failed = true;
-      return false;
-    }
-    *encoded = replacement;
-    *capacity = grown;
-  }
-  memcpy(*encoded + *length, addition, addition_length);
-  *length += addition_length;
-  (*encoded)[*length] = '\0';
-  return true;
-}
-
-static bool render_expansion_netargv(const char *encoded, size_t length,
-                                     char *display, size_t display_size) {
   shell_netstring_iter_t iter;
   if (shell_netstring_iter_init(&iter, encoded, length) != SHELL_NETSTRING_OK)
     return false;
@@ -1392,172 +1290,210 @@ static bool render_expansion_netargv(const char *encoded, size_t length,
   shell_netstring_status_t status;
   while ((status = shell_netstring_iter_next(&iter, &view)) ==
          SHELL_NETSTRING_OK) {
-    if (count && used + 1 >= display_size)
+    size_t separator = count != 0 ? 1 : 0;
+    if (used > SIZE_MAX - separator ||
+        view.payload_length > SIZE_MAX - used - separator)
       return false;
-    if (count)
-      display[used++] = ' ';
-    if (view.payload_length >= display_size - used ||
-        memchr(view.payload, '\0', view.payload_length) != NULL)
+    if (memchr(view.payload, '\0', view.payload_length) != NULL)
       return false;
-    memcpy(display + used, view.payload, view.payload_length);
-    used += view.payload_length;
+    used += (count != 0) + view.payload_length;
     count++;
   }
   if (status != SHELL_NETSTRING_DONE)
     return false;
-  if (used >= display_size)
-    return false;
-  display[used] = '\0';
+  *display_length = used;
   return true;
+}
+
+static bool write_expansion_display(const char *encoded, size_t length,
+                                    char *display, size_t display_size,
+                                    size_t *written) {
+  if (written)
+    *written = 0;
+  if (!display || !written)
+    return false;
+  size_t measured = 0;
+  if (!measure_expansion_display(encoded, length, &measured) ||
+      measured >= display_size)
+    return false;
+  shell_netstring_iter_t iter;
+  if (shell_netstring_iter_init(&iter, encoded, length) != SHELL_NETSTRING_OK)
+    return false;
+  size_t used = 0, count = 0;
+  shell_netstring_view_t view;
+  while (shell_netstring_iter_next(&iter, &view) == SHELL_NETSTRING_OK) {
+    if (count)
+      display[used++] = ' ';
+    memcpy(display + used, view.payload, view.payload_length);
+    used += view.payload_length;
+    count++;
+  }
+  display[used] = '\0';
+  *written = used;
+  return true;
+}
+
+typedef struct {
+  const char *text;
+  const char *expansion_netargv;
+  size_t text_length;
+  size_t expansion_length;
+  size_t payload_length;
+  size_t display_length;
+  bool expanded;
+} command_word_t;
+
+static bool valid_expansion_netargv(const char *netargv, size_t length) {
+  return (netargv != NULL || length == 0) &&
+         (length == 0 || (memchr(netargv, '\0', length) == NULL &&
+                          shell_netstring_validate(netargv, length, NULL) ==
+                              SHELL_NETSTRING_OK));
 }
 
 static const char *build_cmd_string(const shell_dep_cmd_t *cmd,
                                     buf_writer_t *bw, const sg_gate_t *gate,
-                                    char **netargv, sg_error_t *build_error) {
+                                    const char **netargv,
+                                    size_t *netargv_length,
+                                    sg_error_t *build_error) {
+  command_word_t words[SHELL_DEP_MAX_TOKENS];
+  size_t display_total = 0;
+  size_t net_total = 0;
+
   *build_error = SG_OK;
-  /*
-   * Reconstructs the command by joining tokens with spaces.
-   * Tokens are copied as-is — no additional quoting is applied.
-   * This is intentional: the original shell input already contains
-   * any necessary quoting, and adding quotes around tokens that
-   * contain spaces or special characters would change the meaning
-   * of the reconstructed command.  The goal is a readable display
-   * string, not a round-trippable shell command.
-   *
-   * Policy matching uses netargv below, so an expansion containing spaces is
-   * still exactly one argument.
-   */
-  if (bw->used >= bw->size) {
-    bw->overflow = true;
+  *netargv = NULL;
+  *netargv_length = 0;
+  if (cmd->token_count > SHELL_DEP_MAX_TOKENS) {
+    *build_error = SG_ERR_PARSE;
     return NULL;
   }
 
-  *netargv = NULL;
-  size_t net_length = 0;
-  size_t net_capacity = 0;
-
-  size_t start = bw->used;
-  size_t avail = bw->size - start;
-  size_t pos = 0;
-
-  char exp_buf[SG_EXPAND_BUF];
-  char expansion_display[SG_EXPAND_BUF];
-
   for (uint32_t i = 0; i < cmd->token_count; i++) {
-    if (i > 0 && pos < avail)
-      bw->base[start + pos++] = ' ';
+    command_word_t *word = &words[i];
+    memset(word, 0, sizeof(*word));
+    word->text = cmd->tokens[i];
+    word->text_length = cmd->token_lens[i];
 
-    const char *text = cmd->tokens[i];
-    size_t text_len = cmd->token_lens[i];
-    bool expanded = false;
-    size_t encoded_expansion_length = 0;
-
-    /* Try variable expansion */
     if (gate->expand_var_netargv_fn) {
-      char var_name[128];
-      if (extract_var_name(text, text_len, var_name, sizeof(var_name))) {
-        memset(exp_buf, 0, sizeof(exp_buf));
-        size_t elen = 0;
-        sg_expand_status_t status =
-            gate->expand_var_netargv_fn(var_name, exp_buf, sizeof(exp_buf),
-                                        &elen, gate->expand_var_netargv_ctx);
-        if ((status != SG_EXPAND_UNRESOLVED && status != SG_EXPAND_RESOLVED) ||
-            elen >= sizeof(exp_buf) ||
-            (status == SG_EXPAND_RESOLVED &&
-             (exp_buf[elen] != '\0' ||
-              !render_expansion_netargv(exp_buf, elen, expansion_display,
-                                        sizeof(expansion_display))))) {
+      const char *var_name = NULL;
+      size_t var_name_length = 0;
+      if (extract_var_name(word->text, word->text_length, &var_name,
+                           &var_name_length)) {
+        sg_expand_status_t status = gate->expand_var_netargv_fn(
+            var_name, var_name_length, &word->expansion_netargv,
+            &word->expansion_length, gate->expand_var_netargv_ctx);
+        if (status != SG_EXPAND_UNRESOLVED && status != SG_EXPAND_RESOLVED) {
           *build_error = SG_ERR_EXPAND;
           return NULL;
         }
-        if (status == SG_EXPAND_RESOLVED) {
-          text = expansion_display;
-          text_len = strlen(expansion_display);
-          encoded_expansion_length = elen;
-          expanded = true;
-        }
+        word->expanded = status == SG_EXPAND_RESOLVED;
       }
     }
-
-    /* Try glob expansion (only if variable expansion didn't fire) */
-    if (!expanded && gate->expand_glob_netargv_fn) {
-      if (has_glob_chars(text, text_len)) {
-        if (text_len >= SG_GLOB_PATTERN_BUF) {
-          bw->overflow = true;
-          return NULL;
-        }
-        char pattern[SG_GLOB_PATTERN_BUF];
-        size_t plen = text_len;
-        memcpy(pattern, text, plen);
-        pattern[plen] = '\0';
-
-        memset(exp_buf, 0, sizeof(exp_buf));
-        size_t elen = 0;
-        sg_expand_status_t status =
-            gate->expand_glob_netargv_fn(pattern, exp_buf, sizeof(exp_buf),
-                                         &elen, gate->expand_glob_netargv_ctx);
-        if ((status != SG_EXPAND_UNRESOLVED && status != SG_EXPAND_RESOLVED) ||
-            elen >= sizeof(exp_buf) ||
-            (status == SG_EXPAND_RESOLVED &&
-             (exp_buf[elen] != '\0' ||
-              !render_expansion_netargv(exp_buf, elen, expansion_display,
-                                        sizeof(expansion_display))))) {
-          *build_error = SG_ERR_EXPAND;
-          return NULL;
-        }
-        if (status == SG_EXPAND_RESOLVED) {
-          text = expansion_display;
-          text_len = strlen(expansion_display);
-          encoded_expansion_length = elen;
-          expanded = true;
-        }
+    if (!word->expanded && gate->expand_glob_netargv_fn &&
+        has_glob_chars(word->text, word->text_length)) {
+      sg_expand_status_t status = gate->expand_glob_netargv_fn(
+          word->text, word->text_length, &word->expansion_netargv,
+          &word->expansion_length, gate->expand_glob_netargv_ctx);
+      if (status != SG_EXPAND_UNRESOLVED && status != SG_EXPAND_RESOLVED) {
+        *build_error = SG_ERR_EXPAND;
+        return NULL;
       }
+      word->expanded = status == SG_EXPAND_RESOLVED;
     }
 
-    if (expanded && memchr(text, '\0', text_len) != NULL) {
-      free(*netargv);
-      *netargv = NULL;
-      bw->overflow = true;
+    if (word->expanded) {
+      if (!valid_expansion_netargv(word->expansion_netargv,
+                                   word->expansion_length) ||
+          !measure_expansion_display(
+              word->expansion_netargv ? word->expansion_netargv : "",
+              word->expansion_length, &word->display_length)) {
+        *build_error = SG_ERR_EXPAND;
+        return NULL;
+      }
+    } else if (shell_measure_decoded_word(word->text, word->text_length,
+                                          &word->payload_length) !=
+               SHELL_PROCESS_OK) {
+      bw_mark_overflow(bw);
       return NULL;
-    }
-    bool allocation_failed = false;
-    bool appended =
-        !expanded ? append_decoded_netarg(netargv, &net_length, &net_capacity,
-                                          text, text_len, &allocation_failed)
-                  : append_encoded_netargv(netargv, &net_length, &net_capacity,
-                                           exp_buf, encoded_expansion_length,
-                                           &allocation_failed);
-    if (!appended) {
-      free(*netargv);
-      *netargv = NULL;
-      if (allocation_failed)
-        *build_error = SG_ERR_MEMORY;
-      else
-        bw->overflow = true;
-      return NULL;
+    } else {
+      word->display_length = word->text_length;
     }
 
-    if (pos + text_len >= avail) {
-      size_t writable = avail > pos + 1 ? avail - pos - 1 : 0;
-      if (writable > 0)
-        memcpy(bw->base + start + pos, text, writable);
-      pos = avail > 0 ? avail - 1 : 0;
-      bw->overflow = true;
-      break;
-    }
-    memcpy(bw->base + start + pos, text, text_len);
-    pos += text_len;
-  }
-  bw->base[start + pos] = '\0';
-  bw->used = start + pos + 1;
-  if (!*netargv) {
-    *netargv = strdup("");
-    if (!*netargv) {
-      bw->overflow = true;
+    size_t record_length = word->expanded ? word->expansion_length : 0;
+    if (!word->expanded &&
+        shell_netstring_encoded_length(word->payload_length, &record_length) !=
+            SHELL_NETSTRING_OK) {
+      bw_mark_overflow(bw);
       return NULL;
     }
+    if (display_total > SIZE_MAX - word->display_length - (i != 0) ||
+        net_total > SIZE_MAX - record_length) {
+      bw_mark_overflow(bw);
+      return NULL;
+    }
+    display_total += (i != 0) + word->display_length;
+    net_total += record_length;
   }
-  return bw->base + start;
+
+  if (bw->used > bw->size || display_total == SIZE_MAX ||
+      net_total == SIZE_MAX || display_total + 1 > SIZE_MAX - net_total - 1 ||
+      display_total + 1 + net_total + 1 > bw->size - bw->used) {
+    bw_mark_overflow(bw);
+    return NULL;
+  }
+
+  char *display = bw->base + bw->used;
+  char *encoded = display + display_total + 1;
+  size_t display_used = 0;
+  size_t encoded_used = 0;
+  for (uint32_t i = 0; i < cmd->token_count; i++) {
+    const command_word_t *word = &words[i];
+    if (i)
+      display[display_used++] = ' ';
+    if (word->expanded) {
+      size_t written = 0;
+      if (!write_expansion_display(
+              word->expansion_netargv ? word->expansion_netargv : "",
+              word->expansion_length, display + display_used,
+              word->display_length + 1, &written) ||
+          written != word->display_length) {
+        *build_error = SG_ERR_EXPAND;
+        return NULL;
+      }
+      display_used += written;
+      if (word->expansion_length) {
+        memcpy(encoded + encoded_used, word->expansion_netargv,
+               word->expansion_length);
+        encoded_used += word->expansion_length;
+      }
+      continue;
+    }
+    memcpy(display + display_used, word->text, word->text_length);
+    display_used += word->text_length;
+    size_t prefix_length = 0;
+    if (shell_netstring_write_prefix(
+            encoded + encoded_used, net_total - encoded_used,
+            word->payload_length, &prefix_length) != SHELL_NETSTRING_OK) {
+      bw_mark_overflow(bw);
+      return NULL;
+    }
+    size_t written = 0;
+    if (shell_write_decoded_word(word->text, word->text_length,
+                                 encoded + encoded_used + prefix_length,
+                                 word->payload_length,
+                                 &written) != SHELL_PROCESS_OK ||
+        written != word->payload_length) {
+      bw_mark_overflow(bw);
+      return NULL;
+    }
+    encoded_used += prefix_length + written;
+    encoded[encoded_used++] = ',';
+  }
+  display[display_used] = '\0';
+  encoded[encoded_used] = '\0';
+  bw->used += display_total + 1 + net_total + 1;
+  *netargv = encoded;
+  *netargv_length = net_total;
+  return display;
 }
 
 /* --- INTERNAL: CHECK FEATURES FROM FAST PARSER AGAINST REJECT MASK --- */
@@ -1897,7 +1833,7 @@ static void emit_violation(sg_violation_t *viol, uint32_t *count, uint32_t max,
   v->type = type;
   v->category_flags = sg_violation_categories(type);
   v->severity = severity;
-  v->cmd_node_index = cmd_idx;
+  v->command_node_index = cmd_idx;
   v->description = desc;
   v->detail = detail;
 }
@@ -1942,12 +1878,12 @@ static void
 sg_violation_scan(const shell_dep_graph_t *graph,
                   const sg_violation_config_t *cfg, buf_writer_t *bw,
                   sg_violation_t *violations, uint32_t max_violations,
-                  uint32_t *violation_count, uint32_t *violation_flags,
+                  uint32_t *violation_count, uint32_t *violation_type_flags,
                   uint32_t *violation_dropped, uint32_t *node_viols,
                   uint32_t *cmd_write_count, uint32_t *cmd_read_count,
                   uint32_t *cmd_env_count) {
   *violation_count = 0;
-  *violation_flags = 0;
+  *violation_type_flags = 0;
   *violation_dropped = 0;
 
   for (uint32_t ei = 0; ei < graph->edge_count && !bw->overflow; ei++) {
@@ -1981,7 +1917,7 @@ sg_violation_scan(const shell_dep_graph_t *graph,
                        violation_dropped, SG_VIOL_WRITE_SENSITIVE,
                        SG_SEVERITY_HIGH, e->from, desc, det);
         node_viols[e->from] |= SG_VIOL_WRITE_SENSITIVE;
-        *violation_flags |= SG_VIOL_WRITE_SENSITIVE;
+        *violation_type_flags |= SG_VIOL_WRITE_SENSITIVE;
       }
     }
 
@@ -2007,7 +1943,7 @@ sg_violation_scan(const shell_dep_graph_t *graph,
                          violation_dropped, SG_VIOL_ENV_PRIVILEGED,
                          SG_SEVERITY_CRITICAL, e->to, desc, det);
           node_viols[e->to] |= SG_VIOL_ENV_PRIVILEGED;
-          *violation_flags |= SG_VIOL_ENV_PRIVILEGED;
+          *violation_type_flags |= SG_VIOL_ENV_PRIVILEGED;
         }
       }
     }
@@ -2038,7 +1974,7 @@ sg_violation_scan(const shell_dep_graph_t *graph,
                          violation_dropped, SG_VIOL_SUBST_SENSITIVE,
                          SG_SEVERITY_HIGH, e->to, desc, det);
           node_viols[e->to] |= SG_VIOL_SUBST_SENSITIVE;
-          *violation_flags |= SG_VIOL_SUBST_SENSITIVE;
+          *violation_type_flags |= SG_VIOL_SUBST_SENSITIVE;
           break;
         }
       }
@@ -2071,7 +2007,7 @@ sg_violation_scan(const shell_dep_graph_t *graph,
                        violation_dropped, SG_VIOL_REMOVE_SYSTEM, 95, ni, desc,
                        det);
         node_viols[ni] |= SG_VIOL_REMOVE_SYSTEM;
-        *violation_flags |= SG_VIOL_REMOVE_SYSTEM;
+        *violation_type_flags |= SG_VIOL_REMOVE_SYSTEM;
         break;
       }
     }
@@ -2113,7 +2049,7 @@ sg_violation_scan(const shell_dep_graph_t *graph,
                        violation_dropped, SG_VIOL_WRITE_THEN_READ,
                        SG_SEVERITY_MEDIUM, read_cmd, desc, det);
         node_viols[read_cmd] |= SG_VIOL_WRITE_THEN_READ;
-        *violation_flags |= SG_VIOL_WRITE_THEN_READ;
+        *violation_type_flags |= SG_VIOL_WRITE_THEN_READ;
         break;
       }
     }
@@ -2130,7 +2066,7 @@ sg_violation_scan(const shell_dep_graph_t *graph,
                      violation_dropped, SG_VIOL_REDIRECT_FANOUT,
                      SG_SEVERITY_LOW, ni, desc, NULL);
       node_viols[ni] |= SG_VIOL_REDIRECT_FANOUT;
-      *violation_flags |= SG_VIOL_REDIRECT_FANOUT;
+      *violation_type_flags |= SG_VIOL_REDIRECT_FANOUT;
     }
   }
 
@@ -2162,7 +2098,7 @@ sg_violation_scan(const shell_dep_graph_t *graph,
                    violation_dropped, SG_VIOL_NET_DOWNLOAD_EXEC,
                    SG_SEVERITY_CRITICAL, e->to, desc, det);
     node_viols[e->to] |= SG_VIOL_NET_DOWNLOAD_EXEC;
-    *violation_flags |= SG_VIOL_NET_DOWNLOAD_EXEC;
+    *violation_type_flags |= SG_VIOL_NET_DOWNLOAD_EXEC;
   }
 
   /* --- SG_VIOL_PERM_SYSTEM --- */
@@ -2202,7 +2138,7 @@ sg_violation_scan(const shell_dep_graph_t *graph,
                        violation_dropped, SG_VIOL_PERM_SYSTEM, SG_SEVERITY_HIGH,
                        ni, desc, det);
         node_viols[ni] |= SG_VIOL_PERM_SYSTEM;
-        *violation_flags |= SG_VIOL_PERM_SYSTEM;
+        *violation_type_flags |= SG_VIOL_PERM_SYSTEM;
         break;
       }
     }
@@ -2232,7 +2168,7 @@ sg_violation_scan(const shell_dep_graph_t *graph,
                    violation_dropped, SG_VIOL_SHELL_ESCALATION,
                    SG_SEVERITY_CRITICAL, ni, desc, det);
     node_viols[ni] |= SG_VIOL_SHELL_ESCALATION;
-    *violation_flags |= SG_VIOL_SHELL_ESCALATION;
+    *violation_type_flags |= SG_VIOL_SHELL_ESCALATION;
   }
 
   /* --- SG_VIOL_SUDO_REDIRECT --- */
@@ -2274,7 +2210,7 @@ sg_violation_scan(const shell_dep_graph_t *graph,
                    violation_dropped, SG_VIOL_SUDO_REDIRECT, SG_SEVERITY_HIGH,
                    ni, desc, det);
     node_viols[ni] |= SG_VIOL_SUDO_REDIRECT;
-    *violation_flags |= SG_VIOL_SUDO_REDIRECT;
+    *violation_type_flags |= SG_VIOL_SUDO_REDIRECT;
   }
 
   /* --- SG_VIOL_READ_SECRETS --- */
@@ -2310,7 +2246,7 @@ sg_violation_scan(const shell_dep_graph_t *graph,
                          violation_dropped, SG_VIOL_READ_SECRETS,
                          SG_SEVERITY_MEDIUM, ni, desc, det);
           node_viols[ni] |= SG_VIOL_READ_SECRETS;
-          *violation_flags |= SG_VIOL_READ_SECRETS;
+          *violation_type_flags |= SG_VIOL_READ_SECRETS;
           break;
         }
       }
@@ -2400,7 +2336,7 @@ sg_violation_scan(const shell_dep_graph_t *graph,
                    violation_dropped, SG_VIOL_NET_UPLOAD, SG_SEVERITY_HIGH, ni,
                    desc, det);
     node_viols[ni] |= SG_VIOL_NET_UPLOAD;
-    *violation_flags |= SG_VIOL_NET_UPLOAD;
+    *violation_type_flags |= SG_VIOL_NET_UPLOAD;
   }
 
   /* --- SG_VIOL_NET_LISTENER --- */
@@ -2463,7 +2399,7 @@ sg_violation_scan(const shell_dep_graph_t *graph,
                    violation_dropped, SG_VIOL_NET_LISTENER, SG_SEVERITY_HIGH,
                    ni, desc, det);
     node_viols[ni] |= SG_VIOL_NET_LISTENER;
-    *violation_flags |= SG_VIOL_NET_LISTENER;
+    *violation_type_flags |= SG_VIOL_NET_LISTENER;
   }
 
   /* --- SG_VIOL_SHELL_OBFUSCATION --- */
@@ -2524,7 +2460,7 @@ sg_violation_scan(const shell_dep_graph_t *graph,
                    violation_dropped, SG_VIOL_SHELL_OBFUSCATION,
                    SG_SEVERITY_CRITICAL, e->to, desc, det);
     node_viols[e->to] |= SG_VIOL_SHELL_OBFUSCATION;
-    *violation_flags |= SG_VIOL_SHELL_OBFUSCATION;
+    *violation_type_flags |= SG_VIOL_SHELL_OBFUSCATION;
   }
 
   /* --- SG_VIOL_GIT_DESTRUCTIVE --- */
@@ -2570,7 +2506,7 @@ sg_violation_scan(const shell_dep_graph_t *graph,
                    violation_dropped, SG_VIOL_GIT_DESTRUCTIVE,
                    SG_SEVERITY_MEDIUM, ni, desc, det);
     node_viols[ni] |= SG_VIOL_GIT_DESTRUCTIVE;
-    *violation_flags |= SG_VIOL_GIT_DESTRUCTIVE;
+    *violation_type_flags |= SG_VIOL_GIT_DESTRUCTIVE;
   }
 
   /* --- SG_VIOL_PERSISTENCE --- */
@@ -2597,7 +2533,7 @@ sg_violation_scan(const shell_dep_graph_t *graph,
                        violation_dropped, SG_VIOL_PERSISTENCE,
                        SG_SEVERITY_MEDIUM, ni, desc, det);
         node_viols[ni] |= SG_VIOL_PERSISTENCE;
-        *violation_flags |= SG_VIOL_PERSISTENCE;
+        *violation_type_flags |= SG_VIOL_PERSISTENCE;
       }
       continue;
     }
@@ -2621,7 +2557,7 @@ sg_violation_scan(const shell_dep_graph_t *graph,
                          violation_dropped, SG_VIOL_PERSISTENCE,
                          SG_SEVERITY_HIGH, ni, desc, det);
           node_viols[ni] |= SG_VIOL_PERSISTENCE;
-          *violation_flags |= SG_VIOL_PERSISTENCE;
+          *violation_type_flags |= SG_VIOL_PERSISTENCE;
           break;
         }
       }
@@ -2649,13 +2585,13 @@ static uint32_t sg_violation_categories(uint32_t types) {
 
 /* --- EVALUATION --- */
 
-sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len, char *buf,
-                   size_t buf_size, sg_result_t *out) {
+sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
+                            char *buf, size_t buf_size, sg_result_t *out) {
   if (!gate || !cmd || !buf || !out)
     return SG_ERR_INVALID;
   if (buf_size == 0)
     return SG_ERR_INVALID;
-  if (cmd_len == 0)
+  if (cmd_len == 0 || memchr(cmd, '\0', cmd_len) != NULL)
     return SG_ERR_INVALID;
 
   memset(out, 0, sizeof(*out));
@@ -2684,9 +2620,9 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len, char *buf,
   if (ferr == SHELL_EPARSE && fast.count == 0) {
     out->verdict = SG_VERDICT_REJECT;
     out->deny_reason = bw_copy(&bw, "parse error", 11);
-    out->subcmd_count = 1;
-    out->subcmds[0].verdict = SG_VERDICT_REJECT;
-    out->subcmds[0].reject_reason = out->deny_reason;
+    out->subcommand_count = 1;
+    out->subcommands[0].verdict = SG_VERDICT_REJECT;
+    out->subcommands[0].reject_reason = out->deny_reason;
     if (bw.overflow) {
       out->truncated = true;
       out->verdict = SG_VERDICT_UNDETERMINED;
@@ -2697,9 +2633,9 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len, char *buf,
   if (ferr == SHELL_EPARSE) {
     out->verdict = SG_VERDICT_REJECT;
     out->deny_reason = bw_copy(&bw, "parse error", 11);
-    out->subcmd_count = 1;
-    out->subcmds[0].verdict = SG_VERDICT_REJECT;
-    out->subcmds[0].reject_reason = out->deny_reason;
+    out->subcommand_count = 1;
+    out->subcommands[0].verdict = SG_VERDICT_REJECT;
+    out->subcommands[0].reject_reason = out->deny_reason;
     if (bw.overflow) {
       out->truncated = true;
       out->verdict = SG_VERDICT_UNDETERMINED;
@@ -2714,9 +2650,9 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len, char *buf,
   if (feat) {
     out->verdict = SG_VERDICT_REJECT;
     out->deny_reason = bw_printf(&bw, "%s not allowed", feat);
-    out->subcmd_count = 1;
-    out->subcmds[0].verdict = SG_VERDICT_REJECT;
-    out->subcmds[0].reject_reason = out->deny_reason;
+    out->subcommand_count = 1;
+    out->subcommands[0].verdict = SG_VERDICT_REJECT;
+    out->subcommands[0].reject_reason = out->deny_reason;
     if (bw.overflow) {
       out->truncated = true;
       out->verdict = SG_VERDICT_UNDETERMINED;
@@ -2728,15 +2664,15 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len, char *buf,
   /* Step 3: Build depgraph */
   shell_dep_graph_t graph;
   memset(&graph, 0, sizeof(graph));
-  shell_dep_error_t derr =
-      shell_parse_depgraph(cmd, cmd_len, gate->cwd, NULL, 0, &graph);
+  shell_dep_error_t derr = shell_dep_graph_parse_with_fast(
+      cmd, cmd_len, gate->cwd, NULL, &fast, &graph);
   bool depgraph_truncated = derr == SHELL_DEP_ETRUNC;
   if (derr != SHELL_DEP_OK && !depgraph_truncated) {
     out->verdict = SG_VERDICT_REJECT;
     out->deny_reason = bw_copy(&bw, "depgraph error", 14);
-    out->subcmd_count = 1;
-    out->subcmds[0].verdict = SG_VERDICT_REJECT;
-    out->subcmds[0].reject_reason = out->deny_reason;
+    out->subcommand_count = 1;
+    out->subcommands[0].verdict = SG_VERDICT_REJECT;
+    out->subcommands[0].reject_reason = out->deny_reason;
     if (bw.overflow) {
       out->truncated = true;
       out->verdict = SG_VERDICT_UNDETERMINED;
@@ -2758,13 +2694,11 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len, char *buf,
   if (gate->viol_enabled) {
     sg_violation_scan(&graph, &gate->viol_config, &bw, out->violations,
                       SG_MAX_VIOLATIONS, &out->violation_count,
-                      &out->violation_flags, &out->violation_dropped_count,
+                      &out->violation_type_flags, &out->violation_dropped_count,
                       node_viols, cmd_write_count, cmd_read_count,
                       cmd_env_count);
-    out->violation_type_flags = out->violation_flags;
     out->violation_category_flags =
         sg_violation_categories(out->violation_type_flags);
-    out->violation_flags = out->violation_type_flags;
     out->has_violations = (out->violation_count > 0);
     out->violation_truncated = (out->violation_dropped_count > 0);
     if (bw.overflow) {
@@ -2787,67 +2721,69 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len, char *buf,
   }
 
   /* Build one nested canonical type signature per isolated command. */
-  char *type_seq_buf = NULL;
+  const char *type_seq = NULL;
+  char *owned_type_seq = NULL;
+  char *owned_cmd_seq = NULL;
   size_t type_count = 0;
   size_t anomaly_count = 0;
+  size_t cmd_seq_length = 0;
 
   if (gate->anomaly_enabled && gate->anomaly_model_type && cmd_count > 0) {
-    shell_process_status_t type_status = SHELL_PROCESS_OK;
     const char *cached =
         type_cache_lookup(&gate->anomaly_type_cache, cmd, cmd_len, &type_count);
     if (cached) {
-      type_seq_buf = strdup(cached);
-      if (!type_seq_buf)
-        type_status =
-            shell_build_type_netseq(cmd, NULL, &type_seq_buf, &type_count);
-    } else {
-      char *raw = NULL;
-      type_status = shell_build_type_netseq(cmd, NULL, &raw, &type_count);
-      if (type_status == SHELL_PROCESS_OK) {
-        if (gate->anomaly_type_cache.capacity > 0) {
-          char *for_cache = strdup(raw);
-          if (for_cache) {
-            if (!type_cache_insert(&gate->anomaly_type_cache, cmd, cmd_len,
-                                   for_cache, type_count))
-              free(for_cache);
-          }
-        }
-        type_seq_buf = raw;
-      }
-    }
-    if (type_status != SHELL_PROCESS_OK || !type_seq_buf) {
-      free(type_seq_buf);
-      out->verdict = SG_VERDICT_UNDETERMINED;
-      if (type_status == SHELL_PROCESS_OK)
-        return SG_ERR_MEMORY;
-      return process_status_to_gate_error(type_status);
+      type_seq = cached;
     }
   }
 
   /* Anomaly detection: score the command sequence with hybrid model */
   if (gate->anomaly_enabled && gate->anomaly_model && cmd_count > 0) {
-    char *cmd_seq = NULL;
-    shell_process_status_t command_status =
-        shell_build_command_netseq(cmd, NULL, &cmd_seq, &anomaly_count);
-    if (command_status != SHELL_PROCESS_OK || !cmd_seq) {
-      free(type_seq_buf);
+    shell_process_status_t command_status;
+    if (type_seq) {
+      command_status = shell_build_command_netseq(
+          cmd, cmd_len, NULL, &owned_cmd_seq, &anomaly_count);
+    } else {
+      command_status = shell_build_anomaly_netseqs(
+          cmd, cmd_len, NULL, &owned_cmd_seq, &owned_type_seq, &anomaly_count);
+      type_count = anomaly_count;
+      if (command_status == SHELL_PROCESS_OK) {
+        if (type_cache_insert(&gate->anomaly_type_cache, cmd, cmd_len,
+                              owned_type_seq, type_count)) {
+          type_seq = owned_type_seq;
+          owned_type_seq = NULL;
+        } else {
+          type_seq = owned_type_seq;
+        }
+      }
+    }
+    if (command_status != SHELL_PROCESS_OK || !owned_cmd_seq) {
+      free(owned_cmd_seq);
+      free(owned_type_seq);
       out->verdict = SG_VERDICT_UNDETERMINED;
       return command_status == SHELL_PROCESS_OK
                  ? SG_ERR_MEMORY
                  : process_status_to_gate_error(command_status);
     }
+    if (!type_seq) {
+      free(owned_cmd_seq);
+      free(owned_type_seq);
+      out->verdict = SG_VERDICT_UNDETERMINED;
+      return SG_ERR_MEMORY;
+    }
+    cmd_seq_length = strlen(owned_cmd_seq);
     sg_anomaly_sequence_score_t scores = {0};
-    sg_error_t score_status = sg_gate_score_anomaly_netseq(
-        gate, cmd_seq, strlen(cmd_seq), type_seq_buf, strlen(type_seq_buf),
-        &scores);
-    free(cmd_seq);
+    sg_error_t score_status =
+        sg_gate_score_anomaly_netseq(gate, owned_cmd_seq, cmd_seq_length,
+                                     type_seq, strlen(type_seq), &scores);
     if (score_status == SG_ERR_MEMORY) {
-      free(type_seq_buf);
+      free(owned_cmd_seq);
+      free(owned_type_seq);
       return SG_ERR_MEMORY;
     }
     if (score_status != SG_OK || type_count != anomaly_count ||
         scores.command_count != anomaly_count) {
-      free(type_seq_buf);
+      free(owned_cmd_seq);
+      free(owned_type_seq);
       return SG_ERR_PARSE;
     }
     out->anomaly_score = scores.combined_score;
@@ -2863,7 +2799,7 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len, char *buf,
   /* The depgraph may retain only the same bounded command prefix as the fast
    * parser. Preserve the fast parser's truncation signal so a complete-looking
    * 64-entry result can never be mistaken for evaluation of the whole input. */
-  bool subcmd_truncated = parse_truncated || depgraph_truncated;
+  bool subcommand_truncated = parse_truncated || depgraph_truncated;
   bool stopped_early = false;
   sg_error_t evaluation_error = SG_OK;
   uint32_t node_result_index[SHELL_DEP_MAX_NODES];
@@ -2876,76 +2812,96 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len, char *buf,
     if (node->cmd.token_count == 0)
       continue;
 
-    if (out->subcmd_count >= SG_MAX_SUBCMD_RESULTS) {
-      subcmd_truncated = true;
+    if (out->subcommand_count >= SG_MAX_SUBCOMMAND_RESULTS) {
+      subcommand_truncated = true;
       break;
     }
 
-    sg_subcmd_result_t *sr = &out->subcmds[out->subcmd_count++];
-    node_result_index[ni] = out->subcmd_count - 1;
+    sg_subcommand_result_t *sr = &out->subcommands[out->subcommand_count++];
+    node_result_index[ni] = out->subcommand_count - 1;
     sr->substitution_parent_index = -1;
     sr->group_parent_index = -1;
     sr->group_depth = node->cmd.group_depth;
     sr->backgrounded = node->cmd.backgrounded;
 
-    char *policy_netargv = NULL;
+    const char *policy_netargv = NULL;
     sg_error_t build_error = SG_OK;
-    sr->command =
-        build_cmd_string(&node->cmd, &bw, gate, &policy_netargv, &build_error);
+    sr->display_command =
+        build_cmd_string(&node->cmd, &bw, gate, &policy_netargv,
+                         &sr->netargv_length, &build_error);
     if (build_error != SG_OK) {
-      free(policy_netargv);
       out->verdict = SG_VERDICT_UNDETERMINED;
-      free(type_seq_buf);
+      free(owned_cmd_seq);
+      free(owned_type_seq);
       return build_error;
     }
     if (bw.overflow) {
-      free(policy_netargv);
       out->truncated = true;
       out->verdict = SG_VERDICT_UNDETERMINED;
-      free(type_seq_buf);
+      free(owned_cmd_seq);
+      free(owned_type_seq);
       return SG_ERR_TRUNC;
     }
-    sr->netargv_length = strlen(policy_netargv);
-    sr->netargv = bw_copy(&bw, policy_netargv, sr->netargv_length);
-    if (bw.overflow) {
-      free(policy_netargv);
-      out->truncated = true;
-      out->verdict = SG_VERDICT_UNDETERMINED;
-      free(type_seq_buf);
-      return SG_ERR_TRUNC;
-    }
+    sr->netargv = policy_netargv;
+    st_netargv_view_t policy_netargv_view = {
+        .data = policy_netargv,
+        .length = sr->netargv_length,
+    };
 
     sr->write_count = cmd_write_count[ni];
     sr->read_count = cmd_read_count[ni];
     sr->env_count = cmd_env_count[ni];
     sr->violation_type_flags = node_viols[ni];
     sr->violation_category_flags = sg_violation_categories(node_viols[ni]);
-    sr->violation_flags = sr->violation_type_flags;
 
-    /* Check deny policy first */
-    st_eval_result_t deny_eval;
+    /* Check deny policy first. The match-only path avoids constructing
+     * suggestions when the caller has disabled their display. */
+    st_eval_result_t deny_eval = {0};
+    bool deny_matches = false;
     st_error_t deny_err =
-        st_policy_eval(gate->deny_policy, policy_netargv, &deny_eval);
+        gate->suggestions
+            ? st_policy_eval_view(gate->deny_policy, policy_netargv_view,
+                                  &deny_eval)
+            : st_policy_match_view(gate->deny_policy, policy_netargv_view,
+                                   &deny_matches);
+    if (gate->suggestions) {
+      deny_matches = deny_eval.matches;
+      /* A suggestion can exceed its bounded display buffer without making
+       * policy matching invalid. Allocation failure is different: preserve
+       * the fail-closed contract for work Shellgate requested. */
+      if (deny_err == ST_OK && deny_eval.suggestion_error == ST_ERR_MEMORY)
+        deny_err = deny_eval.suggestion_error;
+    }
     if (deny_err != ST_OK) {
       sr->matches = false;
       sr->verdict = SG_VERDICT_UNDETERMINED;
       sr->reject_reason = bw_copy(&bw, "deny policy evaluation failed", 29);
       evaluation_error =
           deny_err == ST_ERR_MEMORY ? SG_ERR_MEMORY : SG_ERR_PARSE;
-    } else if (deny_eval.matches) {
+    } else if (deny_matches) {
       sr->matches = true;
       sr->verdict = SG_VERDICT_DENY;
       sr->reject_reason = bw_copy(&bw, "deny policy match", 17);
     } else {
-      /* Check allow policy */
-      st_eval_result_t eval;
-      st_error_t eval_err = st_policy_eval(gate->policy, policy_netargv, &eval);
+      /* Check allow policy with the same optional suggestion work. */
+      st_eval_result_t eval = {0};
+      bool allow_matches = false;
+      st_error_t eval_err =
+          gate->suggestions
+              ? st_policy_eval_view(gate->policy, policy_netargv_view, &eval)
+              : st_policy_match_view(gate->policy, policy_netargv_view,
+                                     &allow_matches);
+      if (gate->suggestions) {
+        allow_matches = eval.matches;
+        if (eval_err == ST_OK && eval.suggestion_error == ST_ERR_MEMORY)
+          eval_err = eval.suggestion_error;
+      }
       if (eval_err != ST_OK) {
         sr->matches = false;
         sr->verdict = SG_VERDICT_UNDETERMINED;
         evaluation_error =
             eval_err == ST_ERR_MEMORY ? SG_ERR_MEMORY : SG_ERR_PARSE;
-      } else if (eval.matches) {
+      } else if (allow_matches) {
         sr->matches = true;
         sr->verdict = SG_VERDICT_ALLOW;
       } else {
@@ -2961,8 +2917,8 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len, char *buf,
             else if (bw.overflow) {
               out->truncated = true;
               out->verdict = SG_VERDICT_UNDETERMINED;
-              free(policy_netargv);
-              free(type_seq_buf);
+              free(owned_cmd_seq);
+              free(owned_type_seq);
               return SG_ERR_TRUNC;
             }
           }
@@ -2974,8 +2930,8 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len, char *buf,
             else if (bw.overflow) {
               out->truncated = true;
               out->verdict = SG_VERDICT_UNDETERMINED;
-              free(policy_netargv);
-              free(type_seq_buf);
+              free(owned_cmd_seq);
+              free(owned_type_seq);
               return SG_ERR_TRUNC;
             }
           }
@@ -2993,8 +2949,8 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len, char *buf,
             else if (bw.overflow) {
               out->truncated = true;
               out->verdict = SG_VERDICT_UNDETERMINED;
-              free(policy_netargv);
-              free(type_seq_buf);
+              free(owned_cmd_seq);
+              free(owned_type_seq);
               return SG_ERR_TRUNC;
             }
           }
@@ -3007,20 +2963,19 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len, char *buf,
             else if (bw.overflow) {
               out->truncated = true;
               out->verdict = SG_VERDICT_UNDETERMINED;
-              free(policy_netargv);
-              free(type_seq_buf);
+              free(owned_cmd_seq);
+              free(owned_type_seq);
               return SG_ERR_TRUNC;
             }
           }
         }
       }
     }
-    free(policy_netargv);
-
     if (sr->verdict == SG_VERDICT_REJECT || sr->verdict == SG_VERDICT_DENY) {
       if (out->deny_reason == NULL) {
-        out->deny_reason = sr->reject_reason ? sr->reject_reason : sr->command;
-        out->attention_index = out->subcmd_count - 1;
+        out->deny_reason =
+            sr->reject_reason ? sr->reject_reason : sr->display_command;
+        out->attention_index = out->subcommand_count - 1;
       }
     }
 
@@ -3044,7 +2999,7 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len, char *buf,
     }
   }
 
-  out->short_circuited = stopped_early && out->subcmd_count < cmd_count;
+  out->short_circuited = stopped_early && out->subcommand_count < cmd_count;
 
   /* Substitution edges describe a dependency from the nested command to its
    * containing command.  Resolve result-array indices after all commands have
@@ -3058,29 +3013,31 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len, char *buf,
     uint32_t parent = node_result_index[edge->to];
     if (child == UINT32_MAX || parent == UINT32_MAX)
       continue;
-    out->subcmds[child].substitution_parent_index = (int32_t)parent;
-    out->subcmds[parent].requires_substitution_evaluation = true;
+    out->subcommands[child].substitution_parent_index = (int32_t)parent;
+    out->subcommands[parent].requires_substitution_evaluation = true;
     out->requires_substitution_evaluation = true;
-    if (out->subcmds[parent].verdict == SG_VERDICT_ALLOW &&
-        (out->subcmds[child].verdict == SG_VERDICT_ALLOW ||
-         out->subcmds[child].verdict == SG_VERDICT_ALLOW_CONDITIONAL))
-      out->subcmds[parent].verdict = SG_VERDICT_ALLOW_CONDITIONAL;
+    if (out->subcommands[parent].verdict == SG_VERDICT_ALLOW &&
+        (out->subcommands[child].verdict == SG_VERDICT_ALLOW ||
+         out->subcommands[child].verdict == SG_VERDICT_ALLOW_CONDITIONAL))
+      out->subcommands[parent].verdict = SG_VERDICT_ALLOW_CONDITIONAL;
   }
 
-  out->truncated = bw.overflow || subcmd_truncated;
-  out->subcmd_truncated = subcmd_truncated;
-  if (subcmd_truncated) {
+  out->truncated = bw.overflow || subcommand_truncated;
+  out->subcommand_truncated = subcommand_truncated;
+  if (subcommand_truncated) {
     /* The retained prefix cannot authorize a command composition whose tail
      * was not evaluated. Partial subcommand details remain available. */
     out->verdict = SG_VERDICT_UNDETERMINED;
-    free(type_seq_buf);
+    free(owned_cmd_seq);
+    free(owned_type_seq);
     return SG_ERR_TRUNC;
   }
-  if (out->subcmd_count == 0) {
+  if (out->subcommand_count == 0) {
     /* Truncation that leaves no subcommands means nothing was evaluated at all.
      * Reporting ALLOW/SG_OK would fail open on input the gate never inspected,
      * so surface it as undetermined and propagate the truncation error. */
-    free(type_seq_buf);
+    free(owned_cmd_seq);
+    free(owned_type_seq);
     if (out->truncated) {
       out->verdict = SG_VERDICT_UNDETERMINED;
       return SG_ERR_TRUNC;
@@ -3093,15 +3050,15 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len, char *buf,
   bool any_conditional = false;
   bool any_reject = false;
   bool any_deny = false;
-  for (uint32_t i = 0; i < out->subcmd_count; i++) {
-    if (out->subcmds[i].verdict != SG_VERDICT_ALLOW &&
-        out->subcmds[i].verdict != SG_VERDICT_ALLOW_CONDITIONAL)
+  for (uint32_t i = 0; i < out->subcommand_count; i++) {
+    if (out->subcommands[i].verdict != SG_VERDICT_ALLOW &&
+        out->subcommands[i].verdict != SG_VERDICT_ALLOW_CONDITIONAL)
       all_allow = false;
-    if (out->subcmds[i].verdict == SG_VERDICT_ALLOW_CONDITIONAL)
+    if (out->subcommands[i].verdict == SG_VERDICT_ALLOW_CONDITIONAL)
       any_conditional = true;
-    if (out->subcmds[i].verdict == SG_VERDICT_REJECT)
+    if (out->subcommands[i].verdict == SG_VERDICT_REJECT)
       any_reject = true;
-    if (out->subcmds[i].verdict == SG_VERDICT_DENY)
+    if (out->subcommands[i].verdict == SG_VERDICT_DENY)
       any_deny = true;
   }
 
@@ -3118,7 +3075,8 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len, char *buf,
 
   if (evaluation_error != SG_OK) {
     out->verdict = SG_VERDICT_UNDETERMINED;
-    free(type_seq_buf);
+    free(owned_cmd_seq);
+    free(owned_type_seq);
     return evaluation_error;
   }
 
@@ -3127,12 +3085,10 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len, char *buf,
     bool should_update = false;
     if (!gate->anomaly_update_only_on_allow) {
       /* Always update, but skip if anomalous and flag is set */
-      should_update =
-          !out->anomaly_detected || !gate->anomaly_update_on_non_anomaly;
+      should_update = !out->anomaly_detected || !gate->anomaly_skip_on_detected;
     } else if (out->verdict == SG_VERDICT_ALLOW) {
       /* Only update on ALLOW verdict */
-      should_update =
-          !out->anomaly_detected || !gate->anomaly_update_on_non_anomaly;
+      should_update = !out->anomaly_detected || !gate->anomaly_skip_on_detected;
     }
 
     /* Record normal scores for adaptive threshold (before update, using current
@@ -3151,44 +3107,28 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len, char *buf,
     }
 
     if (should_update) {
-      char *cmd_seq = NULL;
-      size_t update_count = 0;
-      shell_process_status_t command_status =
-          shell_build_command_netseq(cmd, NULL, &cmd_seq, &update_count);
-      if (command_status != SHELL_PROCESS_OK || !cmd_seq ||
-          update_count != anomaly_count) {
-        bool count_mismatch = command_status == SHELL_PROCESS_OK &&
-                              cmd_seq != NULL && update_count != anomaly_count;
-        free(cmd_seq);
-        free(type_seq_buf);
-        out->verdict = SG_VERDICT_UNDETERMINED;
-        if (count_mismatch)
-          return SG_ERR_PARSE;
-        return command_status == SHELL_PROCESS_OK
-                   ? SG_ERR_MEMORY
-                   : process_status_to_gate_error(command_status);
-      }
-      sg_anomaly_status_t raw_status = sg_anomaly_update_netseq(
-          gate->anomaly_model, cmd_seq, strlen(cmd_seq));
-      free(cmd_seq);
+      sg_anomaly_status_t raw_status = sg_anomaly_model_update_netseq(
+          gate->anomaly_model, owned_cmd_seq, cmd_seq_length);
       /* Also update type sequence model */
       sg_anomaly_status_t type_status = SG_ANOMALY_OK;
       if (gate->anomaly_model_type && type_count > 0)
-        type_status = sg_anomaly_update_netseq(
-            gate->anomaly_model_type, type_seq_buf, strlen(type_seq_buf));
+        type_status = sg_anomaly_model_update_netseq(
+            gate->anomaly_model_type, type_seq, strlen(type_seq));
       if ((raw_status != SG_ANOMALY_OK && raw_status != SG_ANOMALY_ERR_MEMORY &&
            raw_status != SG_ANOMALY_ERR_LIMIT) ||
           (type_status != SG_ANOMALY_OK &&
            type_status != SG_ANOMALY_ERR_MEMORY &&
            type_status != SG_ANOMALY_ERR_LIMIT)) {
-        free(type_seq_buf);
+        free(owned_cmd_seq);
+        free(owned_type_seq);
         return SG_ERR_PARSE;
       }
     }
   }
 
-  /* Free type sequence buffer */
-  free(type_seq_buf);
+  /* Free evaluation-owned anomaly sequence buffers. */
+  free(owned_cmd_seq);
+  free(owned_type_seq);
 
   if (bw.overflow) {
     /* A diagnostic write may truncate without aborting the current command
@@ -3204,7 +3144,7 @@ sg_error_t sg_eval(sg_gate_t *gate, const char *cmd, size_t cmd_len, char *buf,
 
 /* --- HELPERS --- */
 
-size_t sg_eval_size_hint(size_t cmd_len) {
+size_t sg_gate_evaluate_size_hint(size_t cmd_len) {
   if (cmd_len > (SIZE_MAX - 512) / 4)
     return SIZE_MAX;
   return cmd_len * 4 + 512;

@@ -74,7 +74,8 @@ shell_netstring_write(void *record, size_t record_capacity, const void *payload,
 /* Read one complete canonical record from a byte stream. DONE means clean EOF.
  * `max_record_length` bounds the encoded record (zero means unbounded). The
  * returned allocation is NUL-terminated for convenience but its explicit
- * length excludes that terminator. */
+ * length excludes that terminator. The caller releases a successful record
+ * with free(). */
 shell_netstring_status_t shell_netstring_read_stream(FILE *stream,
                                                      size_t max_record_length,
                                                      unsigned char **record,

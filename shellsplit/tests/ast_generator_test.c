@@ -123,12 +123,13 @@ static int verify_command(const char *cmd, size_t cmd_len,
 
   shell_command_t *commands = NULL;
   size_t command_count = 0;
-  bool full_ok = shell_tokenize_commands(cmd, &commands, &command_count);
+  bool full_ok = (shell_tokenize_commands(cmd, strlen(cmd), &commands,
+                                          &command_count) == SHELL_TOKENIZE_OK);
 
   shell_command_info_t *infos = NULL;
   size_t info_count = 0;
-  bool proc_ok =
-      shell_process_command(cmd, NULL, &infos, &info_count) == SHELL_PROCESS_OK;
+  bool proc_ok = shell_process_command(cmd, strlen(cmd), NULL, &infos,
+                                       &info_count) == SHELL_PROCESS_OK;
 
   int failed = 0;
   if (expects_parse_success && (!full_ok || !proc_ok)) {
@@ -158,9 +159,9 @@ static int verify_command(const char *cmd, size_t cmd_len,
   }
 
   if (commands)
-    shell_free_commands(commands, command_count);
+    shell_commands_free(commands, command_count);
   if (infos)
-    shell_free_command_infos(infos, info_count);
+    shell_command_infos_free(infos, info_count);
 
   return failed;
 }

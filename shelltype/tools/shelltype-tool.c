@@ -22,6 +22,7 @@
 
 #include "shell_netstring.h"
 #include "shelltype.h"
+#include "trie_internal.h"
 
 /* Read one outer netstring whose payload is a complete canonical netargv. */
 static int read_netargv_record(FILE *stream, char **out) {
@@ -198,7 +199,7 @@ int main(int argc, char *argv[]) {
   /* Classify mode */
   if (classify_cmd) {
     st_token_array_t arr = {NULL, 0};
-    st_error_t err = st_classify(classify_cmd, &arr);
+    st_error_t err = st_netargv_classify(classify_cmd, &arr);
     if (err != ST_OK) {
       fprintf(stderr, "Error: normalisation failed (%d)\n", err);
       return 1;
@@ -208,7 +209,7 @@ int main(int argc, char *argv[]) {
       printf("  [%zu] %-30s type=%-4d (%s)\n", i, arr.tokens[i].text,
              arr.tokens[i].type, sym[0] ? sym : "LITERAL");
     }
-    st_free_token_array(&arr);
+    st_token_array_free(&arr);
     return 0;
   }
 
@@ -218,7 +219,7 @@ int main(int argc, char *argv[]) {
     char *netpattern = NULL;
     st_error_t err = st_netpattern_from_cpl(validate_pat, &netpattern);
     if (err == ST_OK)
-      err = st_validate_netpattern(netpattern, &info);
+      err = st_netpattern_validate(netpattern, &info);
     free(netpattern);
     if (err != ST_OK) {
       fprintf(stderr, "INVALID: %s\n", validate_pat);
@@ -286,7 +287,7 @@ int main(int argc, char *argv[]) {
     }
 
     fprintf(stderr, "Loaded policy with %zu patterns\n",
-            st_policy_count(policy));
+            st_policy_rule_count(policy));
 
     /* Single command verify */
     if (verify_cmd) {
@@ -382,16 +383,19 @@ int main(int argc, char *argv[]) {
   }
 
   /* Create learner */
-  st_learner_t *learner = st_learner_new(min_support, min_confidence);
+  st_learner_config_t learner_config;
+  st_learner_config_default(&learner_config);
+  learner_config.min_support = min_support;
+  learner_config.min_confidence = min_confidence;
+  learner_config.max_suggestions = max_suggestions;
+  st_learner_t *learner = st_learner_new(&learner_config);
   if (!learner) {
     fprintf(stderr, "Error: failed to create learner\n");
     return 1;
   }
-  learner->max_suggestions = max_suggestions;
-
   /* Optionally load state */
   if (load_file) {
-    st_error_t err = st_load(learner, load_file);
+    st_error_t err = st_learner_load(learner, load_file);
     if (err != ST_OK) {
       fprintf(stderr, "Error: failed to load state from '%s' (%d)\n", load_file,
               err);
@@ -414,7 +418,7 @@ int main(int argc, char *argv[]) {
     char *record = NULL;
     int read_status;
     while ((read_status = read_netargv_record(fp, &record)) == 1) {
-      st_error_t err = st_feed(learner, record);
+      st_error_t err = st_learner_feed_netargv(learner, record);
       if (err != ST_OK) {
         error_count++;
         if (error_count <= 3)
@@ -441,7 +445,7 @@ int main(int argc, char *argv[]) {
   /* Generate suggestions */
   if (do_suggest) {
     size_t sug_count = 0;
-    st_suggestion_t *suggestions = st_suggest(learner, &sug_count);
+    st_suggestion_t *suggestions = st_learner_suggest(learner, &sug_count);
 
     FILE *out = stdout;
     if (output_file) {
@@ -473,12 +477,12 @@ int main(int argc, char *argv[]) {
 
     if (out != stdout)
       fclose(out);
-    st_free_suggestions(suggestions, sug_count);
+    st_suggestion_list_free(suggestions, sug_count);
   }
 
   /* Save state */
   if (save_file) {
-    st_error_t err = st_save(learner, save_file);
+    st_error_t err = st_learner_save(learner, save_file);
     if (err != ST_OK) {
       fprintf(stderr, "Error: failed to save state to '%s' (%d)\n", save_file,
               err);
