@@ -14,9 +14,13 @@
  *   ./shellgate/fuzz/run_fuzzing_4h.sh 1 300
  */
 
+#include "brace_fuzz_case.h"
+
 #include <fuzzer/FuzzedDataProvider.h>
 
 extern "C" {
+#include "shell_netstring.h"
+#include "shell_tokenizer.h"
 #include "shellgate.h"
 }
 
@@ -86,6 +90,17 @@ int valid_buffer_string(const char *value, const char *buffer, size_t size) {
   return memchr(value, '\0', size - (size_t)(address - begin)) != NULL;
 }
 
+int valid_buffer_span(const char *value, size_t length, const char *buffer,
+                      size_t size) {
+  if (!value)
+    return length == 0;
+  uintptr_t address = (uintptr_t)value;
+  uintptr_t begin = (uintptr_t)buffer;
+  if (address < begin || address > begin + size)
+    return 0;
+  return length <= size - (size_t)(address - begin);
+}
+
 bool valid_verdict(sg_verdict_t verdict) {
   switch (verdict) {
   case SG_VERDICT_ALLOW:
@@ -119,20 +134,35 @@ void validate_result(const sg_result_t *result, sg_error_t error,
     invariant_failure("result field outside its documented bounds");
   }
 
-  bool linked_substitution = false;
   for (uint32_t i = 0; i < result->subcommand_count; i++) {
-    if (!valid_buffer_string(result->subcommands[i].display_command, buffer,
+    const sg_subcommand_result_t *subcommand = &result->subcommands[i];
+    if (!valid_buffer_string(subcommand->display_command, buffer,
                              buffer_size) ||
-        !valid_buffer_string(result->subcommands[i].reject_reason, buffer,
-                             buffer_size) ||
-        !valid_verdict(result->subcommands[i].verdict) ||
-        result->subcommands[i].violation_type_flags !=
-            result->subcommands[i].violation_type_flags ||
-        result->subcommands[i].substitution_parent_index >=
-            static_cast<int32_t>(result->subcommand_count))
+        !valid_buffer_string(subcommand->reject_reason, buffer, buffer_size) ||
+        !valid_buffer_span(subcommand->netargv, subcommand->netargv_length,
+                           buffer, buffer_size) ||
+        (subcommand->netargv != nullptr &&
+         shell_netstring_validate(subcommand->netargv,
+                                  subcommand->netargv_length,
+                                  nullptr) != SHELL_NETSTRING_OK) ||
+        !valid_verdict(subcommand->verdict) ||
+        subcommand->group_parent_index != -1 ||
+        subcommand->substitution_consumer_index < -1 ||
+        subcommand->substitution_consumer_index >=
+            static_cast<int32_t>(result->subcommand_count) ||
+        subcommand->substitution_consumer_index == static_cast<int32_t>(i))
       invariant_failure("subcommand string outside the output buffer");
-    linked_substitution = linked_substitution ||
-                          result->subcommands[i].substitution_parent_index >= 0;
+    if ((subcommand->group_depth == 0) !=
+            (subcommand->group_kinds == SHELL_GROUP_NONE) ||
+        (subcommand->group_kinds &
+         ~(SHELL_GROUP_BRACE | SHELL_GROUP_SUBSHELL)) != 0)
+      invariant_failure("subcommand group metadata is inconsistent");
+    if (subcommand->requires_substitution_evaluation &&
+        !result->requires_substitution_evaluation)
+      invariant_failure("subcommand dynamic-content flag lacks top-level flag");
+    if (subcommand->has_dynamic_substitution_io &&
+        !result->has_dynamic_substitution_io)
+      invariant_failure("subcommand dynamic-I/O flag lacks top-level flag");
   }
   for (uint32_t i = 0; i < result->suggestion_count; i++)
     if (!valid_buffer_string(result->suggestions[i], buffer, buffer_size))
@@ -147,8 +177,12 @@ void validate_result(const sg_result_t *result, sg_error_t error,
       invariant_failure("violation string outside the output buffer");
 
   if (result->verdict == SG_VERDICT_ALLOW_CONDITIONAL &&
-      (!result->requires_substitution_evaluation || !linked_substitution))
+      !result->requires_substitution_evaluation)
     invariant_failure("conditional allowance lacks a substitution dependency");
+  /* Collector endpoints and GROUP endpoints intentionally have no fabricated
+   * command-to-command mapping. Therefore a conditional result need not have
+   * a directly marked result in a short-circuited prefix or when the graph
+   * relation terminates at a group. */
   if (result->short_circuited && result->subcommand_count == 0)
     invariant_failure("short-circuit result has no evaluated prefix");
 }
@@ -169,7 +203,7 @@ bool results_equal(const sg_result_t &left, const sg_result_t &right) {
       left.violation_type_flags != right.violation_type_flags ||
       left.requires_substitution_evaluation !=
           right.requires_substitution_evaluation ||
-      left.violation_type_flags != right.violation_type_flags ||
+      left.has_dynamic_substitution_io != right.has_dynamic_substitution_io ||
       left.violation_dropped_count != right.violation_dropped_count ||
       left.has_violations != right.has_violations ||
       left.anomaly_detected != right.anomaly_detected ||
@@ -184,13 +218,18 @@ bool results_equal(const sg_result_t &left, const sg_result_t &right) {
     if (a.matches != b.matches || a.verdict != b.verdict ||
         !equal_string(a.display_command, b.display_command) ||
         !equal_string(a.reject_reason, b.reject_reason) ||
+        a.netargv_length != b.netargv_length ||
+        (a.netargv_length != 0 &&
+         memcmp(a.netargv, b.netargv, a.netargv_length) != 0) ||
         a.write_count != b.write_count || a.read_count != b.read_count ||
         a.env_count != b.env_count ||
         a.requires_substitution_evaluation !=
             b.requires_substitution_evaluation ||
-        a.substitution_parent_index != b.substitution_parent_index ||
+        a.has_dynamic_substitution_io != b.has_dynamic_substitution_io ||
+        a.substitution_consumer_index != b.substitution_consumer_index ||
+        a.group_parent_index != b.group_parent_index ||
+        a.group_depth != b.group_depth || a.group_kinds != b.group_kinds ||
         a.violation_category_flags != b.violation_category_flags ||
-        a.violation_type_flags != b.violation_type_flags ||
         a.violation_type_flags != b.violation_type_flags)
       return false;
   }
@@ -215,8 +254,9 @@ bool results_equal(const sg_result_t &left, const sg_result_t &right) {
 
 /* A compact, parser-independent semantic reference set. These cases describe
  * the supported shell dialect rather than duplicating the production parser:
- * each executable substitution must become one command node, point at its
- * containing command, and contribute to conditional allowance exactly once. */
+ * each executable substitution must become one command node and point at its
+ * containing command. Shell-word substitutions contribute to conditional
+ * allowance; process substitutions instead expose dynamic descriptor I/O. */
 void run_semantic_reference_oracles() {
   struct oracle_case {
     const char *input;
@@ -225,11 +265,17 @@ void run_semantic_reference_oracles() {
     uint32_t command_count;
     int32_t parents[4];
     sg_verdict_t verdict;
+    bool requires_shell_word_evaluation;
+    bool has_dynamic_substitution_io;
   };
   static const char *const echo_id_pwd[] = {"echo *", "id", "pwd"};
   static const char *const nested[] = {"echo *", "echo $(printf x $(id))",
                                        "printf x $(id)", "id"};
-  static const char *const process[] = {"cat", "sort", "cat #path"};
+  /* Process substitution supplies a generated pathname argument to `sort`.
+   * Keep that argument in canonical netargv, so the reference policy must
+   * permit one operand rather than treating `sort` as a zero-argument command.
+   */
+  static const char *const process[] = {"cat", "sort", "cat #path", "sort *"};
   static const char *const quoted[] = {"echo *", "id"};
   static const oracle_case cases[] = {
       {"echo $(id)$(pwd)",
@@ -237,25 +283,33 @@ void run_semantic_reference_oracles() {
        3,
        3,
        {-1, 0, 0},
-       SG_VERDICT_ALLOW_CONDITIONAL},
+       SG_VERDICT_ALLOW_CONDITIONAL,
+       true,
+       true},
       {"echo $(printf x $(id))",
        nested,
        4,
        3,
        {-1, 0, 1},
-       SG_VERDICT_ALLOW_CONDITIONAL},
+       SG_VERDICT_ALLOW_CONDITIONAL,
+       true,
+       true},
       {"cat <(sort <(cat /tmp/a))",
        process,
-       3,
+       4,
        3,
        {-1, 0, 1},
-       SG_VERDICT_ALLOW_CONDITIONAL},
+       SG_VERDICT_ALLOW,
+       false,
+       true},
       {"echo \"$(id)\"",
        quoted,
        2,
        2,
        {-1, 0, -1},
-       SG_VERDICT_ALLOW_CONDITIONAL},
+       SG_VERDICT_ALLOW_CONDITIONAL,
+       true,
+       true},
   };
 
   for (const oracle_case &item : cases) {
@@ -275,12 +329,321 @@ void run_semantic_reference_oracles() {
     if (error != SG_OK || result.verdict != item.verdict ||
         result.subcommand_count != item.command_count ||
         result.requires_substitution_evaluation !=
-            (item.verdict == SG_VERDICT_ALLOW_CONDITIONAL))
+            item.requires_shell_word_evaluation ||
+        result.has_dynamic_substitution_io != item.has_dynamic_substitution_io)
       invariant_failure("semantic oracle verdict or command count mismatch");
     for (uint32_t i = 0; i < item.command_count; i++)
-      if (result.subcommands[i].substitution_parent_index != item.parents[i])
+      if (result.subcommands[i].substitution_consumer_index != item.parents[i])
         invariant_failure("semantic oracle parent relationship mismatch");
     sg_gate_free(gate);
+  }
+}
+
+/* Graph paths preserve source spelling, so quote and escape fragments must not
+ * evade literal path rules. Exercise the allocation-free decoded-word scans
+ * through the public violation result rather than duplicating their lexer. */
+void run_decoded_path_oracles() {
+  struct oracle_case {
+    const char *input;
+    uint32_t expected_flag;
+    bool expected;
+  };
+  static const oracle_case cases[] = {
+      {"cat ~/.s\"sh\"/id_rsa", SG_VIOL_READ_SECRETS, true},
+      {"cat ~/.s\\sh/id_rsa", SG_VIOL_READ_SECRETS, true},
+      {"echo payload >> ~/.b\"ashrc\"", SG_VIOL_PERSISTENCE, true},
+      {"echo payload >> ~/.b\\ashrc", SG_VIOL_PERSISTENCE, true},
+      {"cat ~/.s\"sh-backup\"/id_rsa", SG_VIOL_READ_SECRETS, false},
+      {"echo payload >> ~/.b\"ash-profile\"", SG_VIOL_PERSISTENCE, false},
+  };
+
+  sg_gate_t *gate = sg_gate_new();
+  if (!gate || sg_gate_set_reject_mask(gate, 0) != SG_OK ||
+      sg_gate_set_stop_mode(gate, SG_EVAL_ALL) != SG_OK ||
+      sg_gate_add_allow_cpl(gate, "cat *") != SG_OK ||
+      sg_gate_add_allow_cpl(gate, "echo *") != SG_OK)
+    invariant_failure("decoded path oracle gate setup failed");
+  sg_violation_config_t config;
+  sg_violation_config_default(&config);
+  if (sg_gate_set_violation_config_borrowed(gate, &config) != SG_OK)
+    invariant_failure("decoded path oracle configuration failed");
+
+  for (const oracle_case &item : cases) {
+    char buffer[4096];
+    sg_result_t result = {};
+    sg_error_t error =
+        sg_gate_evaluate(gate, item.input, std::strlen(item.input), buffer,
+                         sizeof(buffer), &result);
+    if (error != SG_OK ||
+        (!!(result.violation_type_flags & item.expected_flag) != item.expected))
+      invariant_failure("decoded path oracle violation mismatch");
+    validate_result(&result, error, buffer, sizeof(buffer));
+  }
+  sg_gate_free(gate);
+}
+
+void run_brace_group_oracles() {
+  static const char *const rules[] = {"echo *", "cat", "printf *"};
+  const char *input =
+      "{ { echo one; } | cat; printf two; } > /tmp/nested-brace.out";
+  const char *sibling_input =
+      "{ printf left; } 3>/tmp/left | { cat; } 2>>/tmp/right && "
+      "{ printf tail; }";
+  const char *document_input = "{ printf one; cat; } <<'EOF'\n}\nEOF";
+  const char *crlf_document_input =
+      "{ printf one; cat; } <<'EOF'\r\n}\r\nEOF\r\n";
+  sg_gate_t *gate = sg_gate_new();
+  if (!gate || sg_gate_set_reject_mask(gate, 0) != SG_OK ||
+      sg_gate_set_stop_mode(gate, SG_EVAL_ALL) != SG_OK)
+    invariant_failure("brace oracle gate setup failed");
+  for (size_t i = 0; i < sizeof(rules) / sizeof(rules[0]); i++)
+    if (sg_gate_add_allow_cpl(gate, rules[i]) != SG_OK)
+      invariant_failure("brace oracle rule setup failed");
+  char buffer[4096];
+  sg_result_t result = {};
+  sg_error_t error = sg_gate_evaluate(gate, input, std::strlen(input), buffer,
+                                      sizeof(buffer), &result);
+  if (error != SG_OK || result.verdict != SG_VERDICT_ALLOW ||
+      result.subcommand_count != 3 || result.subcommands[0].group_depth != 2 ||
+      result.subcommands[1].group_depth != 1 ||
+      result.subcommands[2].group_depth != 1 ||
+      std::strcmp(result.subcommands[0].netargv, "4:echo,3:one,") != 0 ||
+      std::strcmp(result.subcommands[1].netargv, "3:cat,") != 0 ||
+      std::strcmp(result.subcommands[2].netargv, "6:printf,3:two,") != 0)
+    invariant_failure("brace oracle result mismatch");
+
+  memset(&result, 0, sizeof(result));
+  error = sg_gate_evaluate(gate, sibling_input, std::strlen(sibling_input),
+                           buffer, sizeof(buffer), &result);
+  if (error != SG_OK || result.verdict != SG_VERDICT_ALLOW ||
+      result.subcommand_count != 3 ||
+      std::strcmp(result.subcommands[0].netargv, "6:printf,4:left,") != 0 ||
+      std::strcmp(result.subcommands[1].netargv, "3:cat,") != 0 ||
+      std::strcmp(result.subcommands[2].netargv, "6:printf,4:tail,") != 0 ||
+      result.subcommands[0].group_depth != 1 ||
+      result.subcommands[1].group_depth != 1 ||
+      result.subcommands[2].group_depth != 1)
+    invariant_failure("brace sibling pipeline oracle result mismatch");
+
+  memset(&result, 0, sizeof(result));
+  error = sg_gate_evaluate(gate, document_input, std::strlen(document_input),
+                           buffer, sizeof(buffer), &result);
+  if (error != SG_OK || result.verdict != SG_VERDICT_ALLOW ||
+      result.subcommand_count != 2 || result.subcommands[0].group_depth != 1 ||
+      result.subcommands[1].group_depth != 1 ||
+      std::strcmp(result.subcommands[0].netargv, "6:printf,3:one,") != 0 ||
+      std::strcmp(result.subcommands[1].netargv, "3:cat,") != 0)
+    invariant_failure("brace document oracle result mismatch");
+
+  memset(&result, 0, sizeof(result));
+  error = sg_gate_evaluate(gate, crlf_document_input,
+                           std::strlen(crlf_document_input), buffer,
+                           sizeof(buffer), &result);
+  if (error != SG_OK || result.verdict != SG_VERDICT_ALLOW ||
+      result.subcommand_count != 2 || result.subcommands[0].group_depth != 1 ||
+      result.subcommands[1].group_depth != 1 ||
+      std::strcmp(result.subcommands[0].netargv, "6:printf,3:one,") != 0 ||
+      std::strcmp(result.subcommands[1].netargv, "3:cat,") != 0)
+    invariant_failure("brace CRLF document oracle result mismatch");
+  sg_gate_free(gate);
+}
+
+void run_generated_brace_case(const uint8_t *data, size_t size) {
+  shell_brace_fuzz_case_t item = shell_brace_fuzz_case(data, size);
+  sg_gate_t *gate = sg_gate_new();
+  if (!gate || sg_gate_set_reject_mask(gate, 0) != SG_OK ||
+      sg_gate_set_stop_mode(gate, SG_EVAL_ALL) != SG_OK)
+    invariant_failure("generated brace gate setup failed");
+  sg_violation_config_t config;
+  sg_violation_config_default(&config);
+  config.sensitive_write_paths[0] = "/tmp/brace-sensitive";
+  config.sensitive_write_path_count = 1;
+  if (sg_gate_set_violation_config_borrowed(gate, &config) != SG_OK)
+    invariant_failure("generated brace violation setup failed");
+
+  char buffer[4096];
+  sg_result_t result = {};
+  sg_error_t error =
+      sg_gate_evaluate(gate, item.command.data(), item.command.size(), buffer,
+                       sizeof(buffer), &result);
+  if (!item.valid || !item.strict_valid) {
+    if (error != SG_ERR_PARSE)
+      invariant_failure("strict generated brace input was accepted");
+    sg_gate_free(gate);
+    return;
+  }
+  if (error != SG_OK || result.subcommand_count != item.command_count ||
+      result.subcommand_count > SHELL_MAX_SUBCOMMANDS)
+    invariant_failure(
+        "generated brace result is outside bounded command limits");
+  validate_result(&result, error, buffer, sizeof(buffer));
+  bool saw_group = false;
+  for (uint32_t i = 0; i < result.subcommand_count; i++)
+    saw_group = saw_group || result.subcommands[i].group_depth != 0;
+  if (!saw_group)
+    invariant_failure("generated brace result lost group metadata");
+  const bool uniform_group_io = !item.has_background_sibling &&
+                                !item.heterogeneous_group_io &&
+                                !item.command_local_documents;
+  if (!item.has_background_sibling && !item.heterogeneous_group_io) {
+    uint32_t group_commands_checked = 0;
+    for (uint32_t i = 0; i < result.subcommand_count; i++) {
+      const sg_subcommand_result_t *command = &result.subcommands[i];
+      if (command->group_depth == 0)
+        continue;
+      uint32_t nested_layers = command->group_depth - 1;
+      uint32_t expected_writes =
+          item.base_write_count +
+          nested_layers * item.nested_write_count_per_layer;
+      if (uniform_group_io &&
+          (command->read_count != item.base_read_count ||
+           command->write_count != expected_writes ||
+           (!!(command->violation_type_flags & SG_VIOL_WRITE_SENSITIVE) !=
+            item.sensitive_write)))
+        invariant_failure("generated brace inherited I/O context mismatch");
+      group_commands_checked++;
+    }
+    if (group_commands_checked != item.group_command_count)
+      invariant_failure("generated brace group membership mismatch");
+  }
+  uint16_t deepest_group = 0;
+  for (uint32_t i = 0; i < result.subcommand_count; i++)
+    if (result.subcommands[i].group_depth > deepest_group)
+      deepest_group = result.subcommands[i].group_depth;
+  uint32_t group_commands_checked = 0;
+  for (uint32_t i = 0; i < result.subcommand_count; i++) {
+    const sg_subcommand_result_t *command = &result.subcommands[i];
+    if (command->group_depth != deepest_group)
+      continue;
+    if (uniform_group_io &&
+        (command->read_count != item.read_count ||
+         command->write_count != item.write_count ||
+         (!!(command->violation_type_flags & SG_VIOL_WRITE_SENSITIVE) !=
+          item.sensitive_write)))
+      invariant_failure("generated brace group I/O context mismatch");
+    group_commands_checked++;
+  }
+  /* A top-level background sibling can share depth one with the generated
+   * group. Its I/O intentionally differs, so leave that ambiguous shape to
+   * the dedicated composition checks; every other generated deepest group is
+   * checked in full. */
+  if (item.heterogeneous_group_io &&
+      group_commands_checked != item.group_command_count)
+    invariant_failure("generated brace group membership mismatch");
+  if (item.has_background_sibling && item.group_count > 2 &&
+      group_commands_checked != item.deepest_command_count)
+    invariant_failure("generated brace group membership mismatch");
+  if ((!!(result.violation_type_flags & SG_VIOL_WRITE_SENSITIVE) !=
+       item.sensitive_write))
+    invariant_failure("generated brace violation propagation mismatch");
+  sg_gate_free(gate);
+}
+
+/* Exercise the public result contract for the graph's dynamic-byte paths.
+ * The command-to-command index is deliberately absent for GROUP and ENDPOINT
+ * relations; group members receive the dynamic flag through inherited
+ * descriptor context rather than a fabricated direct mapping. */
+void run_substitution_case(const shell_substitution_fuzz_case_t &item) {
+  static const char *const rules[] = {
+      "echo *", "sleep *", "printf *",  "printf * *", "./clock",
+      "cat",    "cat *",   "cat #path", "date",       "id",
+      "pwd",    "sort",    "sort *",    "sh",         "sh *"};
+  sg_gate_t *gate = sg_gate_new();
+  if (!gate || sg_gate_set_reject_mask(gate, 0) != SG_OK ||
+      sg_gate_set_stop_mode(gate, SG_EVAL_ALL) != SG_OK)
+    invariant_failure("generated substitution gate setup failed");
+  for (size_t i = 0; i < sizeof(rules) / sizeof(rules[0]); i++)
+    if (sg_gate_add_allow_cpl(gate, rules[i]) != SG_OK)
+      invariant_failure("generated substitution rule setup failed");
+
+  char buffer[4096];
+  sg_result_t result = {};
+  sg_error_t error =
+      sg_gate_evaluate(gate, item.command.data(), item.command.size(), buffer,
+                       sizeof(buffer), &result);
+  if (item.depgraph_truncated) {
+    if (error != SG_ERR_TRUNC || !result.truncated ||
+        result.verdict == SG_VERDICT_ALLOW ||
+        result.verdict == SG_VERDICT_ALLOW_CONDITIONAL)
+      invariant_failure("generated substitution truncation contract mismatch");
+    validate_result(&result, error, buffer, sizeof(buffer));
+    sg_gate_free(gate);
+    return;
+  }
+  uint32_t dynamic_consumers = 0;
+  uint32_t shell_word_consumers = 0;
+  uint32_t command_mappings = 0;
+  bool mappings_valid = true;
+  for (uint32_t i = 0; i < result.subcommand_count; i++) {
+    const sg_subcommand_result_t *subcommand = &result.subcommands[i];
+    dynamic_consumers += subcommand->has_dynamic_substitution_io;
+    shell_word_consumers += subcommand->requires_substitution_evaluation;
+    command_mappings += subcommand->substitution_consumer_index >= 0;
+    if (subcommand->substitution_consumer_index >= 0 &&
+        !result.subcommands[subcommand->substitution_consumer_index]
+             .has_dynamic_substitution_io)
+      mappings_valid = false;
+  }
+  sg_verdict_t expected_verdict = item.requires_substitution_evaluation
+                                      ? SG_VERDICT_ALLOW_CONDITIONAL
+                                      : SG_VERDICT_ALLOW;
+  if (error != SG_OK || result.verdict != expected_verdict ||
+      result.subcommand_count != item.command_count ||
+      result.requires_substitution_evaluation !=
+          item.requires_substitution_evaluation ||
+      result.has_dynamic_substitution_io !=
+          (item.substitution_edge_count != 0) ||
+      dynamic_consumers != item.result_dynamic_consumer_count ||
+      command_mappings != item.command_mapping_count || !mappings_valid) {
+    fprintf(
+        stderr,
+        "generated substitution result mismatch: %s (error=%d "
+        "verdict=%d/%d commands=%u/%u shell-word=%d/%d dynamic=%d/%d "
+        "consumers=%u/%u shell-word-consumers=%u mappings=%u/%u valid=%d)\n",
+        item.command.c_str(), error, result.verdict, expected_verdict,
+        result.subcommand_count, item.command_count,
+        result.requires_substitution_evaluation,
+        item.requires_substitution_evaluation,
+        result.has_dynamic_substitution_io, item.substitution_edge_count != 0,
+        dynamic_consumers, item.result_dynamic_consumer_count,
+        shell_word_consumers, command_mappings, item.command_mapping_count,
+        mappings_valid);
+    invariant_failure("generated substitution result contract mismatch");
+  }
+  validate_result(&result, error, buffer, sizeof(buffer));
+  sg_gate_free(gate);
+}
+
+void run_generated_substitution_case(const uint8_t *data, size_t size) {
+  run_substitution_case(shell_brace_fuzz_substitution_case(data, size));
+}
+
+void run_composed_substitution_case(const uint8_t *data, size_t size) {
+  run_substitution_case(
+      shell_brace_fuzz_composed_substitution_case(data, size));
+}
+
+void run_composed_substitution_matrix() {
+  uint8_t data[7] = {};
+  for (uint8_t form = 0; form < 6; form++) {
+    uint8_t pipeline_count = form == 5 ? 1 : 2;
+    uint8_t literal_count = form == 5 ? 2 : 1;
+    for (uint8_t depth = 0; depth < 3; depth++) {
+      for (uint8_t pipeline = 0; pipeline < pipeline_count; pipeline++) {
+        for (uint8_t literal = 0; literal < literal_count; literal++) {
+          for (uint8_t group_mask = 0; group_mask < (1u << (depth + 1));
+               group_mask++) {
+            data[0] = form;
+            data[1] = depth;
+            data[2] = pipeline;
+            data[3] = literal;
+            for (uint8_t level = 0; level <= depth; level++)
+              data[4 + level] = (group_mask >> level) & 1u;
+            run_composed_substitution_case(data, sizeof(data));
+          }
+        }
+      }
+    }
   }
 }
 
@@ -500,10 +863,39 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
   static bool semantic_oracles_checked = false;
   if (!semantic_oracles_checked) {
     run_semantic_reference_oracles();
+    run_decoded_path_oracles();
+    run_brace_group_oracles();
+    for (uint8_t selector = 0;
+         selector < SHELL_BRACE_FUZZ_SUBSTITUTION_CASE_COUNT; selector++)
+      run_generated_substitution_case(&selector, 1);
+    for (uint8_t selector = 0;
+         selector < SHELL_BRACE_FUZZ_COMPOSED_SUBSTITUTION_CASE_COUNT;
+         selector++)
+      run_composed_substitution_case(&selector, 1);
+    run_composed_substitution_matrix();
+    static const uint8_t background_group_io_case[] = {
+        0, 27, 99, 100, 32, 47, 57, 116,
+    };
+    run_generated_brace_case(background_group_io_case,
+                             sizeof(background_group_io_case));
     semantic_oracles_checked = true;
   }
   if (size == 0)
     return 0;
+
+  /* The fixed oracle pass exhausts every generated case. Select one matrix
+   * for each fuzzed payload so the random-input path remains economical. */
+  switch (size == 0 ? 0 : data[0] % 3) {
+  case 0:
+    run_generated_brace_case(data, size);
+    break;
+  case 1:
+    run_generated_substitution_case(data, size);
+    break;
+  default:
+    run_composed_substitution_case(data, size);
+    break;
+  }
 
   FuzzedDataProvider fdp(data, size);
   if (fdp.ConsumeBool()) {

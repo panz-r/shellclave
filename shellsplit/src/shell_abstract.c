@@ -189,12 +189,15 @@ static bool is_long_option(const char *s, size_t len) {
 static bool is_redirection_token(shell_token_type_t type) {
   return type == SHELL_TOKEN_REDIRECT_IN || type == SHELL_TOKEN_REDIRECT_OUT ||
          type == SHELL_TOKEN_REDIRECT_ERR ||
-         type == SHELL_TOKEN_REDIRECT_APPEND || type == SHELL_TOKEN_HEREDOC ||
+         type == SHELL_TOKEN_REDIRECT_APPEND ||
+         type == SHELL_TOKEN_REDIRECT_READ_WRITE ||
+         type == SHELL_TOKEN_REDIRECT_CLOBBER || type == SHELL_TOKEN_HEREDOC ||
          type == SHELL_TOKEN_HERESTRING;
 }
 
 static bool redirection_consumes_operand(const shell_token_t *token) {
-  if (token->type == SHELL_TOKEN_HERESTRING)
+  if (token->type == SHELL_TOKEN_HERESTRING ||
+      token->type == SHELL_TOKEN_REDIRECT_CLOBBER)
     return true;
   if (token->type == SHELL_TOKEN_HEREDOC || token->length == 0)
     return false;
@@ -1214,16 +1217,24 @@ shell_build_type_netseq(const char *command, size_t command_length,
   if (!command || !netseq || !subcommand_count)
     return SHELL_PROCESS_EINPUT;
 
+  shell_process_status_t status =
+      shell_process_validate_supported_source(command, command_length, NULL);
+  if (status != SHELL_PROCESS_OK)
+    return status;
+
   shell_command_t *commands = NULL;
   size_t count = 0;
-  shell_process_status_t status = shell_processed_commands_parse(
-      command, command_length, limits, &commands, &count);
+  status = shell_processed_commands_parse(command, command_length, limits,
+                                          &commands, &count);
   if (status != SHELL_PROCESS_OK)
     return status;
 
   size_t outer_length = 0;
+  size_t rendered_count = 0;
   for (size_t c = 0; c < count; c++) {
     size_t word_count = shell_processed_command_word_count(&commands[c]);
+    if (shell_processed_command_is_group_structure(commands, count, c))
+      continue;
     if (word_count == 0) {
       status = SHELL_PROCESS_EPARSE;
       goto fail_type_netseq;
@@ -1269,6 +1280,7 @@ shell_build_type_netseq(const char *command, size_t command_length,
       goto fail_type_netseq;
     }
     outer_length += framed;
+    rendered_count++;
   }
   if (limits && (outer_length > limits->max_string_bytes ||
                  outer_length > limits->max_total_bytes)) {
@@ -1282,6 +1294,8 @@ shell_build_type_netseq(const char *command, size_t command_length,
   }
   char *position = outer;
   for (size_t c = 0; c < count; c++) {
+    if (shell_processed_command_is_group_structure(commands, count, c))
+      continue;
     size_t inner_length = 0;
     const shell_token_t *executable =
         shell_processed_command_word_at(&commands[c], 0);
@@ -1325,7 +1339,7 @@ shell_build_type_netseq(const char *command, size_t command_length,
   *position = '\0';
   shell_commands_free(commands, count);
   *netseq = outer;
-  *subcommand_count = count;
+  *subcommand_count = rendered_count;
   return SHELL_PROCESS_OK;
 
 fail_type_netseq:
@@ -1347,17 +1361,25 @@ shell_build_anomaly_netseqs(const char *command_line, size_t command_length,
   if (!command_line || !command_netseq || !type_netseq || !subcommand_count)
     return SHELL_PROCESS_EINPUT;
 
+  shell_process_status_t status = shell_process_validate_supported_source(
+      command_line, command_length, NULL);
+  if (status != SHELL_PROCESS_OK)
+    return status;
+
   shell_command_t *commands = NULL;
   size_t count = 0;
-  shell_process_status_t status = shell_processed_commands_parse(
-      command_line, command_length, limits, &commands, &count);
+  status = shell_processed_commands_parse(command_line, command_length, limits,
+                                          &commands, &count);
   if (status != SHELL_PROCESS_OK)
     return status;
 
   size_t command_total = 0;
   size_t type_total = 0;
+  size_t rendered_count = 0;
   for (size_t c = 0; c < count; c++) {
     size_t word_count = shell_processed_command_word_count(&commands[c]);
+    if (shell_processed_command_is_group_structure(commands, count, c))
+      continue;
     if (word_count == 0) {
       status = SHELL_PROCESS_EPARSE;
       goto fail;
@@ -1402,6 +1424,7 @@ shell_build_anomaly_netseqs(const char *command_line, size_t command_length,
       goto fail;
     }
     type_total += type_record_length;
+    rendered_count++;
   }
   if (limits && (command_total > limits->max_string_bytes ||
                  command_total > limits->max_total_bytes ||
@@ -1423,6 +1446,8 @@ shell_build_anomaly_netseqs(const char *command_line, size_t command_length,
   char *raw_position = raw;
   char *type_position = typed;
   for (size_t c = 0; c < count; c++) {
+    if (shell_processed_command_is_group_structure(commands, count, c))
+      continue;
     const shell_token_t *executable =
         shell_processed_command_word_at(&commands[c], 0);
     size_t executable_length = 0;
@@ -1477,7 +1502,7 @@ shell_build_anomaly_netseqs(const char *command_line, size_t command_length,
   shell_commands_free(commands, count);
   *command_netseq = raw;
   *type_netseq = typed;
-  *subcommand_count = count;
+  *subcommand_count = rendered_count;
   return SHELL_PROCESS_OK;
 
 fail:

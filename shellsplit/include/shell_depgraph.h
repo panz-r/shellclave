@@ -6,8 +6,9 @@
  *
  * Consumes the output of the fast tokenizer (shell_parse_fast).
  * Produces a linearized, topologically-sorted graph of CMD and DOC
- * nodes with directed/undirected edges. Group and background composition
- * remains explicit in command metadata and composition edges.
+ * nodes with directed/undirected edges. Compound groups are first-class
+ * execution endpoints: their redirects and external pipes connect to the
+ * GROUP node, while GROUP edges express containment rather than I/O.
  *
  * Design principles:
  * - Zero-copy: tokens point into original input string
@@ -18,6 +19,7 @@
 #ifndef SHELL_DEPGRAPH_H
 #define SHELL_DEPGRAPH_H
 
+#include <limits.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -34,6 +36,12 @@ extern "C" {
 #define SHELL_DEP_MAX_TOKENS 32
 #define SHELL_DEP_MAX_HEREDOCS 8
 #define SHELL_DEP_CWD_BUF_SIZE 16384 /* 16KB buffer for unique CWD strings */
+/* An edge endpoint has no applicable file descriptor. */
+#define SHELL_DEP_FD_NONE UINT32_MAX
+/* Shell io_number values are bounded by the implementation's signed fd
+ * domain. Keeping this below SHELL_DEP_FD_NONE makes the sentinel unambiguous.
+ */
+#define SHELL_DEP_FD_MAX ((uint32_t)INT_MAX)
 
 /* CWD buffer must accommodate at least one PATH_MAX-sized path */
 #if defined(PATH_MAX) && PATH_MAX > SHELL_DEP_CWD_BUF_SIZE
@@ -58,7 +66,11 @@ typedef enum {
 typedef enum {
   SHELL_NODE_CMD = 0,
   SHELL_NODE_DOC,
-  SHELL_NODE_GROUP, /* Reserved; current groups use CMD metadata and edges. */
+  SHELL_NODE_GROUP, /* Compound-command execution endpoint and container. */
+  /* Non-executable collector for a dynamically produced substitution stream.
+   * Its incoming WRITE edges identify producer descriptors; its outgoing
+   * SUBST edge identifies the shell execution context that consumes it. */
+  SHELL_NODE_ENDPOINT,
 } shell_dep_node_type_t;
 
 typedef enum {
@@ -67,6 +79,23 @@ typedef enum {
   SHELL_DOC_HERESTRING = 2,
   SHELL_DOC_ENVVAR = 3,
 } shell_dep_doc_kind_t;
+
+typedef enum {
+  SHELL_DEP_DOC_FLAG_NONE = 0,
+  /* `value` is a physical `<<-` source span. Use the content helpers to
+   * obtain the tab-stripped logical bytes. */
+  SHELL_DEP_DOC_FLAG_HEREDOC_STRIP_TABS = 1 << 0,
+  /* The file-path operand contains a command substitution, so `path` is
+   * source spelling rather than a resolved filesystem path. This covers both
+   * ordinary redirections and Bash `$(<word)` file-command substitutions. */
+  SHELL_DEP_DOC_FLAG_DYNAMIC_NAME = 1 << 1,
+  /* The heredoc delimiter was quoted and its body is literal. */
+  SHELL_DEP_DOC_FLAG_HEREDOC_LITERAL = 1 << 2,
+  /* An inline input document is evaluated during redirection setup but a later
+   * redirect replaces the target descriptor, so it has no effective READ edge.
+   */
+  SHELL_DEP_DOC_FLAG_TRANSIENT = 1 << 3,
+} shell_dep_doc_flags_t;
 
 typedef enum {
   SHELL_EDGE_READ = 0,
@@ -89,6 +118,20 @@ typedef enum {
   SHELL_DIR_BIDIR = 1,
   SHELL_DIR_UNDIR = 2,
 } shell_dep_edge_dir_t;
+
+typedef enum {
+  SHELL_DEP_EDGE_FLAG_NONE = 0,
+  /* This SUBST edge supplies bytes that the shell incorporates into a word
+   * before invoking its command. A caller can submit that later content to a
+   * separate Shellgate inspection. Other SUBST edges model dynamic descriptor
+   * routing, such as process substitution, and must not be treated as shell
+   * word evaluation. */
+  SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD = 1 << 0,
+  /* This SUBST edge supplies a FILE document's runtime pathname. The value
+   * affects I/O topology but is not itself command-word content for a later
+   * Shellgate inspection. The receiving FILE DOC has DYNAMIC_NAME set. */
+  SHELL_DEP_EDGE_FLAG_SUBST_DYNAMIC_NAME = 1 << 1,
+} shell_dep_edge_flags_t;
 
 /**
  * Limits for depgraph parsing.
@@ -144,27 +187,47 @@ typedef struct {
   uint32_t token_lens[SHELL_DEP_MAX_TOKENS];
   uint32_t token_count;
   uint32_t cwd_offset;  /* Offset into graph->cwd_buf.data */
-  uint16_t group_depth; /* Parenthesized command-group nesting depth */
+  uint16_t group_depth; /* Enclosing command-group nesting depth */
+  uint8_t group_kinds;  /* shell_group_kind_t bitset of enclosing groups */
   bool backgrounded;    /* Command runs asynchronously */
   bool cwd_known;       /* False when branch composition makes CWD ambiguous */
 } shell_dep_cmd_t;
 
 typedef struct {
-  /* Reserved for a future explicit group node; current graphs expose group
-   * spans through each CMD node's group_depth and SHELL_EDGE_GROUP edges. */
-  const char *start; /* Opening parenthesis in the original input */
+  const char *start; /* Opening group delimiter in the original input */
   uint32_t length;   /* Complete group span, including delimiters */
   uint32_t parent;   /* Parent group node, or UINT32_MAX */
+  uint8_t kind;      /* shell_group_kind_t */
 } shell_dep_group_t;
+
+/**
+ * Dynamic substitution-stream collector.
+ *
+ * An ENDPOINT normally has incoming WRITE edges and outgoing SUBST edges.
+ * The parser may also use an internal terminal endpoint for a pipe whose
+ * reader was replaced by a later redirect; that endpoint has only incoming
+ * PIPE edges, preserving the producer's real output relation without
+ * inventing a consumer. Descriptor ownership is carried by those edges,
+ * avoiding a second, ambiguous descriptor field on the endpoint itself.
+ */
+typedef struct {
+  uint8_t reserved;
+} shell_dep_endpoint_t;
 
 /**
  * DOC node - a data artifact
  *
  * Fields are used according to kind:
  *   FILE:      path/path_len
- *   HEREDOC:   name/name_len (delimiter), value/value_len (content)
- *   HERESTRING: value/value_len (content)
+ *   HEREDOC:   name/name_len (delimiter), value/value_len (source content)
+ *   HERESTRING: value/value_len (content; an expandable word can receive
+ *               incoming SUBST edges before its READ edge supplies owner)
  *   ENVVAR:    name/name_len, value/value_len
+ *
+ * All fields borrow source spans. `value` always preserves physical source
+ * bytes; for `<<-`, use shell_dep_doc_content_length() and
+ * shell_dep_doc_write_content() to obtain logical tab-stripped content. CRLF
+ * heredoc framing is recognized, but carriage returns remain content bytes.
  */
 typedef struct {
   shell_dep_doc_kind_t kind;
@@ -174,6 +237,7 @@ typedef struct {
   uint32_t name_len;
   const char *value;
   uint32_t value_len;
+  uint8_t flags; /* shell_dep_doc_flags_t */
 } shell_dep_doc_t;
 
 typedef struct {
@@ -182,6 +246,7 @@ typedef struct {
     shell_dep_cmd_t cmd;
     shell_dep_doc_t doc;
     shell_dep_group_t group;
+    shell_dep_endpoint_t endpoint;
   };
 } shell_dep_node_t;
 
@@ -190,6 +255,14 @@ typedef struct {
   uint32_t to;
   shell_dep_edge_type_t type;
   shell_dep_edge_dir_t dir;
+  uint8_t flags; /* shell_dep_edge_flags_t */
+  /* Descriptor pair for the directed byte relation. Use SHELL_DEP_FD_NONE on
+   * the non-descriptor side: DOC→owner READ is none→fd, owner→DOC WRITE is
+   * fd→none, and PIPE is fd→fd. Shell-word and dynamic-FILE-name SUBST edges
+   * terminate at none; an unflagged process-substitution route can instead
+   * carry the redirected outer descriptor as its target fd. */
+  uint32_t source_fd;
+  uint32_t target_fd;
 } shell_dep_edge_t;
 
 typedef struct {
@@ -231,6 +304,45 @@ typedef struct {
  * On input or parse errors, writable output counts are cleared and
  * SHELL_DEP_STATUS_ERROR is set.
  *
+ * Command, backtick, process, and Bash file-command substitutions are
+ * represented as dynamic I/O: direct SHELL_EDGE_SUBST edges when one
+ * execution endpoint or FILE document supplies the stream, or
+ * WRITE→ENDPOINT→SUBST paths when several producers or descriptor routing
+ * must be retained. Unquoted heredoc bodies receive the same command and
+ * backtick-substitution analysis; quoted delimiters keep their body literal.
+ * SUBST marks runtime-generated topology;
+ * `SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD` identifies the subset where bytes
+ * become shell-word content and callers may submit it to a later Shellgate
+ * pass. `SHELL_DEP_EDGE_FLAG_SUBST_DYNAMIC_NAME` instead supplies a FILE
+ * document pathname and must not request that inspection. Unflagged SUBST
+ * edges are dynamic descriptor routes. Neither kind by itself means that a
+ * receiving program executes those bytes: process
+ * substitution is ordinary I/O, while an interpreter such as `sh` reading that
+ * descriptor as source is application-level semantics. A process substitution
+ * used as an ordinary word is not itself a redirect:
+ * `<(producer)` retains a producer-to-command SUBST relation with no target
+ * descriptor, while `>(consumer)` retains the nested command graph without
+ * claiming that the outer program writes a particular descriptor to it.
+ * In a redirect operand, a matching pair establishes the descriptor route:
+ * `< <(producer)` supplies the redirect fd and `> >(consumer)` receives it.
+ * A cross-direction pair such as `< >(consumer)` or `> <(producer)` still
+ * evaluates and retains the nested graph, but the shell syntax establishes no
+ * byte route between that nested command and the redirect. `<>` is modeled as
+ * read/write: `<> <(producer)` supplies its input side, while `<> >(consumer)`
+ * establishes its known write side through an ENDPOINT to the consumer's
+ * stdin. Its default descriptor is fd 0; neither form fabricates the opposite
+ * descriptor direction.
+ *
+ * READ, WRITE, APPEND, and PIPE edges model the effective descriptor bindings
+ * after redirections, descriptor duplication, and descriptor closes have
+ * been applied in source order. A recursive substitution contributes an
+ * inherited-stream relation only while its relevant descriptor still refers
+ * to the original inherited fd; a close or duplication from another fd does
+ * not fabricate a SUBST edge. A replaced document remains as a DOC syntax
+ * artifact without a stale I/O edge and carries
+ * SHELL_DEP_DOC_FLAG_TRANSIENT; an expandable one retains its setup-time
+ * SUBST flow as well.
+ *
  * Subshell extraction tracks simple single/double quotes and odd/even
  * backslash escapes while finding delimiters. It is not a complete shell
  * grammar; malformed structures are rejected instead of being represented as
@@ -245,6 +357,17 @@ const char *shell_dep_edge_type_name(shell_dep_edge_type_t type);
 const char *shell_dep_node_type_name(shell_dep_node_type_t type);
 const char *shell_dep_doc_kind_name(shell_dep_doc_kind_t kind);
 
+/** Measure the logical value bytes of a document without allocating. For a
+ * `<<-` heredoc this removes all leading tabs from each physical body line. */
+bool shell_dep_doc_content_length(const shell_dep_doc_t *doc,
+                                  size_t *content_length);
+
+/** Write the logical value bytes of a document into caller storage. Measure
+ * first; on failure `written` is zero and no partial content is exposed. A
+ * NULL destination is accepted only for empty logical content. */
+bool shell_dep_doc_write_content(const shell_dep_doc_t *doc, char *destination,
+                                 size_t destination_size, size_t *written);
+
 /**
  * Dump graph to FILE* for debugging.
  */
@@ -253,10 +376,12 @@ void shell_dep_graph_dump(const shell_dep_graph_t *g, FILE *fp);
 /**
  * Validate graph integrity:
  * - All edge from/to within node_count bounds
- * - Edge types consistent with node types
- *   (PIPE/SEQ/AND/OR/SUBST require CMD→CMD,
- *    READ requires DOC→CMD, WRITE/APPEND require CMD→DOC,
- *    ENV requires DOC→CMD, ARG requires CMD↔DOC)
+ * - Node and edge types, containment parentage, directions, and descriptor
+ *   fields consistent with their documented graph roles
+ *   (PIPE/SEQ/AND/OR require CMD/GROUP endpoints; SUBST additionally permits
+ *    ENDPOINT and DOC(FILE) sources and DOC(HEREDOC/HERESTRING) targets; READ
+ * requires DOC→CMD/GROUP, WRITE/APPEND require an execution endpoint→DOC or
+ * ENDPOINT, ENV requires DOC→CMD, ARG requires CMD↔DOC)
  */
 shell_dep_graph_validation_t
 shell_dep_graph_validate(const shell_dep_graph_t *g);

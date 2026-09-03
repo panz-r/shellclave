@@ -101,8 +101,55 @@ static bool seed_zero_is_stable(void) {
   return stable;
 }
 
+static bool control_serialization_is_posix(void) {
+  char buffer[128] = {0};
+  bool valid = true;
+
+  shell_ast_t *conditional = shell_ast_create();
+  if (conditional) {
+    conditional->root = shell_ast_add_if(
+        conditional, shell_ast_add_command(conditional, "test"),
+        shell_ast_add_command(conditional, "echo"));
+    valid =
+        valid && conditional->root != NULL &&
+        shell_ast_serialize(conditional, buffer, sizeof(buffer)) == buffer &&
+        strcmp(buffer, "if test; then echo; fi") == 0;
+  } else {
+    valid = false;
+  }
+  shell_ast_destroy(conditional);
+
+  shell_ast_t *loop = shell_ast_create();
+  if (loop) {
+    loop->root = shell_ast_add_loop(loop, "for", "entry",
+                                    shell_ast_add_glob(loop, "*.c"),
+                                    shell_ast_add_command(loop, "cat"));
+    valid = valid && loop->root != NULL &&
+            shell_ast_serialize(loop, buffer, sizeof(buffer)) == buffer &&
+            strcmp(buffer, "for entry in *.c; do cat; done") == 0;
+  } else {
+    valid = false;
+  }
+  shell_ast_destroy(loop);
+
+  shell_ast_t *selection = shell_ast_create();
+  if (selection) {
+    selection->root = shell_ast_add_case(
+        selection, "$value", "yes", shell_ast_add_command(selection, "echo"));
+    valid = valid && selection->root != NULL &&
+            shell_ast_serialize(selection, buffer, sizeof(buffer)) == buffer &&
+            strcmp(buffer, "case $value in yes) echo ;; esac") == 0;
+  } else {
+    valid = false;
+  }
+  shell_ast_destroy(selection);
+
+  return valid;
+}
+
 static int verify_command(const char *cmd, size_t cmd_len,
-                          bool expects_parse_success) {
+                          bool expects_parse_success,
+                          bool expects_canonical_success) {
   shell_parse_result_t result = {0};
   shell_limits_t limits = SHELL_LIMITS_DEFAULT;
   limits.strict_mode = true;
@@ -126,24 +173,34 @@ static int verify_command(const char *cmd, size_t cmd_len,
   bool full_ok = (shell_tokenize_commands(cmd, strlen(cmd), &commands,
                                           &command_count) == SHELL_TOKENIZE_OK);
 
-  shell_command_info_t *infos = NULL;
-  size_t info_count = 0;
-  bool proc_ok = shell_process_command(cmd, strlen(cmd), NULL, &infos,
-                                       &info_count) == SHELL_PROCESS_OK;
+  shell_processed_commands_t processed = {0};
+  shell_process_status_t process_status =
+      shell_process_commands(cmd, strlen(cmd), NULL, &processed);
+  bool proc_ok = process_status == SHELL_PROCESS_OK;
 
   int failed = 0;
-  if (expects_parse_success && (!full_ok || !proc_ok)) {
-    printf("FAIL: parser disagreement (fast=%d full=%d processor=%d) for: "
-           "%s\n",
-           err == SHELL_OK, full_ok, proc_ok, cmd);
+  if (expects_parse_success &&
+      (!full_ok || proc_ok != expects_canonical_success ||
+       (!expects_canonical_success &&
+        process_status != SHELL_PROCESS_EPARSE))) {
+    printf("FAIL: parser disagreement (fast=%d full=%d processor=%d "
+           "expected-canonical=%d status=%d) for: %s\n",
+           err == SHELL_OK, full_ok, proc_ok, expects_canonical_success,
+           process_status, cmd);
     failed = 1;
-  } else if (expects_parse_success &&
-             (result.count != command_count || command_count != info_count)) {
-    printf("FAIL: parser count disagreement (fast=%u full=%zu processor=%zu) "
-           "for: %s\n",
-           result.count, command_count, info_count, cmd);
+  } else if (expects_parse_success && expects_canonical_success &&
+             ((result.group_count == 0 &&
+               (result.count != command_count ||
+                processed.command_count != command_count)) ||
+              (result.group_count != 0 &&
+               processed.command_count > command_count))) {
+    printf("FAIL: parser count disagreement (fast=%u full=%zu processor=%zu "
+           "groups=%u) for: %s\n",
+           result.count, command_count, processed.command_count,
+           result.group_count, cmd);
     failed = 1;
-  } else if (expects_parse_success) {
+  } else if (expects_parse_success && expects_canonical_success &&
+             result.group_count == 0) {
     for (size_t i = 0; i < command_count; i++) {
       size_t full_length = commands[i].end_pos - commands[i].start_pos;
       if (result.cmds[i].start != commands[i].start_pos ||
@@ -160,9 +217,65 @@ static int verify_command(const char *cmd, size_t cmd_len,
 
   if (commands)
     shell_commands_free(commands, command_count);
-  if (infos)
-    shell_command_infos_free(infos, info_count);
+  shell_processed_commands_free(&processed);
 
+  return failed;
+}
+
+static int verify_brace_templates(void) {
+  enum {
+    BRACE_TEMPLATE_BASIC = 1u << 0,
+    BRACE_TEMPLATE_NEWLINE = 1u << 1,
+    BRACE_TEMPLATE_NESTED = 1u << 2,
+    BRACE_TEMPLATE_COMPOSITION = 1u << 3,
+    BRACE_TEMPLATE_DOCUMENT = 1u << 4,
+    BRACE_TEMPLATE_REDIRECT = 1u << 5,
+    BRACE_TEMPLATE_INVALID = 1u << 6,
+  };
+  static const struct {
+    const char *command;
+    bool valid;
+    uint32_t coverage;
+  } cases[] = {
+      {"{ echo one; }", true, BRACE_TEMPLATE_BASIC},
+      {"{\n echo one\n}", true, BRACE_TEMPLATE_NEWLINE},
+      {"{\r\n  echo one\r\n}", true, BRACE_TEMPLATE_NEWLINE},
+      {"{ { echo one; } | cat; printf two; } > /tmp/nested-brace.out", true,
+       BRACE_TEMPLATE_NESTED | BRACE_TEMPLATE_COMPOSITION |
+           BRACE_TEMPLATE_REDIRECT},
+      {"{ echo one; } && { cat; }", true, BRACE_TEMPLATE_COMPOSITION},
+      {"{ echo one; } & { cat; }", true, BRACE_TEMPLATE_COMPOSITION},
+      {"{ cat; cat; } <<'EOF'\n}\nEOF", true, BRACE_TEMPLATE_DOCUMENT},
+      {"{ cat; cat; } <<< \"two words\"", true, BRACE_TEMPLATE_DOCUMENT},
+      {"{ ./left; ./right; } </tmp/in >/tmp/out 2>>/tmp/err", true,
+       BRACE_TEMPLATE_REDIRECT},
+      {"{ echo one; }2>>/tmp/compact-group.err", true, BRACE_TEMPLATE_REDIRECT},
+      {"{ echo one; } 3>/tmp/trace </tmp/in 2>>/tmp/group.err", true,
+       BRACE_TEMPLATE_REDIRECT},
+      {"{ echo one }", false, BRACE_TEMPLATE_INVALID},
+      {"{\r\n echo one }", false, BRACE_TEMPLATE_INVALID},
+      {"{ echo one;", false, BRACE_TEMPLATE_INVALID},
+      {"{ ( echo one; } )", false, BRACE_TEMPLATE_INVALID},
+  };
+  int failed = 0;
+  uint32_t observed = 0;
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    int case_failed = verify_command(cases[i].command, strlen(cases[i].command),
+                                     cases[i].valid, cases[i].valid);
+    failed += case_failed;
+    if (!case_failed)
+      observed |= cases[i].coverage;
+  }
+  uint32_t expected = BRACE_TEMPLATE_BASIC | BRACE_TEMPLATE_NEWLINE |
+                      BRACE_TEMPLATE_NESTED | BRACE_TEMPLATE_COMPOSITION |
+                      BRACE_TEMPLATE_DOCUMENT | BRACE_TEMPLATE_REDIRECT |
+                      BRACE_TEMPLATE_INVALID;
+  if (observed != expected) {
+    fprintf(stderr, "FAIL: incomplete deterministic brace template coverage\n");
+    failed++;
+  }
+  if (failed)
+    fprintf(stderr, "FAIL: deterministic brace templates failed\n");
   return failed;
 }
 
@@ -198,6 +311,12 @@ int main(int argc, char **argv) {
     fprintf(stderr, "FAIL: seed zero does not reproduce its golden AST\n");
     return 1;
   }
+  if (!control_serialization_is_posix()) {
+    fprintf(stderr, "FAIL: control AST serialization is not POSIX-shaped\n");
+    return 1;
+  }
+  if (verify_brace_templates() != 0)
+    return 1;
 
   if (!seed_provided)
     seed = ((uint64_t)time(NULL) << 32) | (getpid() & 0xFFFFFFFF);
@@ -222,6 +341,7 @@ int main(int argc, char **argv) {
   char replay_buffer[4096];
   size_t passed = 0;
   size_t correctly_rejected = 0;
+  size_t canonically_rejected = 0;
   size_t failed = 0;
   uint32_t generated_types = 0;
 
@@ -278,12 +398,17 @@ int main(int argc, char **argv) {
     }
 
     bool expects_success = shell_ast_expects_parse_success(ast);
+    bool expects_canonical_success = expects_success && !ast->has_case &&
+                                     !ast->has_loops && !ast->has_conditionals;
 
-    int result = verify_command(buffer, cmd_len, expects_success);
+    int result = verify_command(buffer, cmd_len, expects_success,
+                                expects_canonical_success);
 
     if (result == 0) {
-      if (expects_success) {
+      if (expects_canonical_success) {
         passed++;
+      } else if (expects_success) {
+        canonically_rejected++;
       } else {
         correctly_rejected++;
       }
@@ -296,8 +421,10 @@ int main(int argc, char **argv) {
     shell_ast_destroy(replayed_ast);
 
     if ((i + 1) % 100 == 0) {
-      printf("Progress: %zu/%zu (passed: %zu, rejected: %zu, failed: %zu)\n",
-             i + 1, num_tests, passed, correctly_rejected, failed);
+      printf("Progress: %zu/%zu (passed: %zu, rejected: %zu, canonical: %zu, "
+             "failed: %zu)\n",
+             i + 1, num_tests, passed, correctly_rejected, canonically_rejected,
+             failed);
     }
   }
 
@@ -305,11 +432,14 @@ int main(int argc, char **argv) {
   printf("Total: %zu\n", num_tests);
   printf("Passed (valid commands parsed): %zu\n", passed);
   printf("Correctly rejected (invalid detected): %zu\n", correctly_rejected);
+  printf("Canonically rejected (unsupported controls): %zu\n",
+         canonically_rejected);
   printf("Failed: %zu\n", failed);
-  if (passed + correctly_rejected + failed != num_tests) {
-    fprintf(stderr,
-            "FAIL: only %zu of %zu generated cases were accounted for\n",
-            passed + correctly_rejected + failed, num_tests);
+  if (passed + correctly_rejected + canonically_rejected + failed !=
+      num_tests) {
+    fprintf(
+        stderr, "FAIL: only %zu of %zu generated cases were accounted for\n",
+        passed + correctly_rejected + canonically_rejected + failed, num_tests);
     failed++;
   }
   if (passed == 0 || correctly_rejected == 0) {
@@ -326,7 +456,8 @@ int main(int argc, char **argv) {
     failed++;
   }
   printf("Success rate: %.2f%%\n",
-         (double)(passed + correctly_rejected) / num_tests * 100.0);
+         (double)(passed + correctly_rejected + canonically_rejected) /
+             num_tests * 100.0);
 
   shell_ast_generator_destroy(gen);
   shell_ast_generator_destroy(replay);

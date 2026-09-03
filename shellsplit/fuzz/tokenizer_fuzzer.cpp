@@ -1,6 +1,8 @@
 // LibFuzzer harness for shellsplit - fuzzes all parsers
 // Fuzzes: fast parser, full parser, transformer, processor
 
+#include "brace_fuzz_case.h"
+
 #include <ctype.h>
 #include <limits.h>
 #include <math.h>
@@ -16,6 +18,7 @@
 #include "shell_abstract.h"
 #include "shell_depgraph.h"
 #include "shell_interop.h"
+#include "shell_netstring.h"
 #include "shell_processor.h"
 #include "shell_sequence.h"
 #include "shell_tokenizer.h"
@@ -30,6 +33,9 @@ extern "C" {
 
 static const size_t MAX_INPUT_SIZE = 8192;
 static int g_verbose = 0;
+
+static int test_generated_brace_case(const uint8_t *data, size_t size,
+                                     const char *cwd);
 
 /* CWD strategies for shell_dep_graph_parse. NULL tests the early substitution
  * to
@@ -73,7 +79,7 @@ static int validate_fast_result(const char *input, size_t length,
     return 1;
   }
 
-  if (result->count > max_commands) {
+  if (result->count > max_commands || result->group_count > SHELL_MAX_GROUPS) {
     if (g_verbose)
       fprintf(stderr, "\n=== FAST PARSER ERROR: Invalid count %u ===\n",
               result->count);
@@ -123,6 +129,37 @@ static int validate_fast_result(const char *input, size_t length,
       if (g_verbose)
         fprintf(stderr, "\n=== FAST PARSER ERROR: Length mismatch ===\n");
       return 1;
+    }
+  }
+
+  /* Truncation may expose an in-progress descriptor so callers can retain
+   * completed command ranges. Full descriptor invariants apply only to a
+   * successful parse. */
+  if (err != SHELL_OK)
+    return 0;
+  for (uint32_t i = 0; i < result->group_count; i++) {
+    const shell_group_t *group = &result->groups[i];
+    if (group->start >= group->end || group->end > length ||
+        group->first_command > result->count ||
+        group->command_count > result->count - group->first_command ||
+        (group->kind != SHELL_GROUP_BRACE &&
+         group->kind != SHELL_GROUP_SUBSHELL) ||
+        (group->parent != UINT16_MAX && group->parent >= i)) {
+      if (g_verbose)
+        fprintf(stderr, "\n=== FAST PARSER ERROR: Invalid group %u ===\n", i);
+      return 1;
+    }
+    if (group->parent != UINT16_MAX) {
+      const shell_group_t *parent = &result->groups[group->parent];
+      if (group->start < parent->start || group->end > parent->end ||
+          group->first_command < parent->first_command ||
+          group->first_command + group->command_count >
+              parent->first_command + parent->command_count) {
+        if (g_verbose)
+          fprintf(stderr,
+                  "\n=== FAST PARSER ERROR: Group parent mismatch %u ===\n", i);
+        return 1;
+      }
     }
   }
 
@@ -194,6 +231,10 @@ static int test_fixed_oracles(void) {
        SHELL_FEAT_BACKGROUND},
       {"(echo one; echo two)", 2, SHELL_TYPE_SIMPLE, SHELL_TYPE_SEMICOLON,
        SHELL_FEAT_GROUP},
+      {"{ echo one; echo two; }", 2, SHELL_TYPE_SIMPLE, SHELL_TYPE_SEMICOLON,
+       SHELL_FEAT_GROUP},
+      {"{( echo one ) ; echo two; }", 2, SHELL_TYPE_SIMPLE,
+       SHELL_TYPE_SEMICOLON, SHELL_FEAT_GROUP},
   };
   for (const oracle_case &item : cases) {
     shell_parse_result_t fast = {};
@@ -213,6 +254,123 @@ static int test_fixed_oracles(void) {
     if (!ok || command_count != item.count)
       return 1;
   }
+  static const struct {
+    const char *input;
+    size_t command_count;
+  } brace_descriptor_cases[] = {
+      {"{ echo one; echo two; }", 2},
+      {"{ ( echo one; ); { echo two; }; }", 2},
+      {"{ echo \"$(printf '}')\"; # }\n echo two; }", 2},
+      {"{\n echo one\n} | { cat; }", 2},
+      {"{\r\n echo one\r\n} | { cat; }", 2},
+      {"{ { echo one; } | cat; printf two; } > /tmp/nested-brace.out", 3},
+      {"{ cat; cat; } <<< value", 2},
+      {"{ cat; cat; } <<< \"two words\"", 2},
+      {"{ echo one; } & { cat; }", 2},
+  };
+  for (const auto &item : brace_descriptor_cases) {
+    const char *input = item.input;
+    shell_parse_result_t fast = {};
+    shell_processed_commands_t processed = {};
+    shell_error_t fast_status =
+        shell_parse_fast(input, strlen(input), NULL, &fast);
+    shell_process_status_t processed_status =
+        shell_process_commands(input, strlen(input), NULL, &processed);
+    if (fast_status != SHELL_OK || fast.group_count == 0 ||
+        processed_status != SHELL_PROCESS_OK ||
+        processed.command_count != item.command_count ||
+        processed.group_count != fast.group_count ||
+        memcmp(processed.groups, fast.groups,
+               fast.group_count * sizeof(*fast.groups)) != 0) {
+      if (g_verbose)
+        fprintf(stderr,
+                "brace oracle mismatch: %s (fast=%d count=%u groups=%u "
+                "processed=%d count=%zu groups=%zu)\n",
+                input, fast_status, fast.count, fast.group_count,
+                processed_status, processed.command_count,
+                processed.group_count);
+      shell_processed_commands_free(&processed);
+      return 1;
+    }
+    shell_processed_commands_free(&processed);
+  }
+  struct group_document_oracle {
+    const char *input;
+    shell_dep_doc_kind_t kind;
+    uint32_t command_count;
+    uint32_t pipe_count;
+  };
+  static const group_document_oracle group_document_cases[] = {
+      {"{ cat; cat; } <<'EOF'\n}\nEOF", SHELL_DOC_HEREDOC, 2, 0},
+      {"{ cat; cat; } <<EOF\r\n}\r\nEOF\r\n", SHELL_DOC_HEREDOC, 2, 0},
+      {"{ cat; cat; } <<EOF | sort > /tmp/brace.out 2>>/tmp/brace.err\n"
+       "payload\nEOF",
+       SHELL_DOC_HEREDOC, 3, 1},
+      {"{ cat; cat; } <<< \"two words\"", SHELL_DOC_HERESTRING, 2, 0},
+  };
+  for (const group_document_oracle &item : group_document_cases) {
+    shell_dep_graph_t graph = {};
+    if (shell_dep_graph_parse(item.input, strlen(item.input), ".", NULL,
+                              &graph) != SHELL_DEP_OK ||
+        !shellsplit_test_depgraph_invariants(item.input, strlen(item.input),
+                                             SHELL_DEP_OK, &graph,
+                                             &SHELL_DEP_LIMITS_DEFAULT))
+      return 1;
+    uint32_t command_count = 0;
+    uint32_t document_count = 0;
+    uint32_t read_count = 0;
+    uint32_t pipe_count = 0;
+    for (uint32_t i = 0; i < graph.node_count; i++) {
+      command_count += graph.nodes[i].type == SHELL_NODE_CMD;
+      document_count += graph.nodes[i].type == SHELL_NODE_DOC &&
+                        graph.nodes[i].doc.kind == item.kind;
+    }
+    for (uint32_t i = 0; i < graph.edge_count; i++)
+      read_count += graph.edges[i].type == SHELL_EDGE_READ;
+    for (uint32_t i = 0; i < graph.edge_count; i++)
+      pipe_count += graph.edges[i].type == SHELL_EDGE_PIPE;
+    /* Group-owned input is represented as one DOC -> GROUP relation, not a
+     * synthetic fan-out to each member command. */
+    if (command_count != item.command_count || document_count != 1 ||
+        read_count != 1 || pipe_count != item.pipe_count)
+      return 1;
+  }
+  static const char group_herestring_override[] =
+      "{ cat; } 3>&1 <<< stale 0<<< $(printf live)";
+  shell_dep_graph_t group_herestring_graph = {};
+  if (shell_dep_graph_parse(group_herestring_override,
+                            strlen(group_herestring_override), ".", NULL,
+                            &group_herestring_graph) != SHELL_DEP_OK ||
+      !shellsplit_test_depgraph_invariants(
+          group_herestring_override, strlen(group_herestring_override),
+          SHELL_DEP_OK, &group_herestring_graph, &SHELL_DEP_LIMITS_DEFAULT))
+    return 1;
+  uint32_t here_documents = 0;
+  uint32_t transient_here_documents = 0;
+  uint32_t here_reads = 0;
+  uint32_t here_substitutions = 0;
+  for (uint32_t node = 0; node < group_herestring_graph.node_count; node++) {
+    const shell_dep_node_t *current = &group_herestring_graph.nodes[node];
+    if (current->type != SHELL_NODE_DOC ||
+        current->doc.kind != SHELL_DOC_HERESTRING)
+      continue;
+    here_documents++;
+    transient_here_documents +=
+        (current->doc.flags & SHELL_DEP_DOC_FLAG_TRANSIENT) != 0;
+  }
+  for (uint32_t edge = 0; edge < group_herestring_graph.edge_count; edge++) {
+    const shell_dep_edge_t *current = &group_herestring_graph.edges[edge];
+    here_reads += current->type == SHELL_EDGE_READ;
+    here_substitutions +=
+        current->type == SHELL_EDGE_SUBST &&
+        current->to < group_herestring_graph.node_count &&
+        group_herestring_graph.nodes[current->to].type == SHELL_NODE_DOC &&
+        group_herestring_graph.nodes[current->to].doc.kind ==
+            SHELL_DOC_HERESTRING;
+  }
+  if (here_documents != 2 || transient_here_documents != 1 || here_reads != 1 ||
+      here_substitutions != 1)
+    return 1;
   struct dep_oracle_case {
     const char *input;
     uint32_t command_count;
@@ -227,6 +385,7 @@ static int test_fixed_oracles(void) {
       {"echo \\$(id)", 1, 0},
       {"echo \\\\$(id)", 2, 1},
       {"echo \"$(id)$(pwd)\"", 3, 2},
+      {"sh <<< $(printf data)", 2, 1},
       {"cat <(printf \\))", 2, 1},
       {"cat <(printf \\\\)", 2, 1},
   };
@@ -430,23 +589,35 @@ static int test_structured_variants(const char *input, size_t length) {
     return 0;
   std::string base(input, length);
   const std::string variants[] = {base + " | cat", "echo $(" + base + ")",
-                                  "'" + base + "'"};
+                                  "'" + base + "'", "{ " + base + "; }"};
   for (const std::string &variant : variants) {
     shell_parse_result_t fast = {};
     shell_error_t fast_error =
         shell_parse_fast(variant.data(), variant.size(), NULL, &fast);
     if (validate_fast_result(variant.data(), variant.size(), fast_error, &fast,
-                             SHELL_MAX_SUBCOMMANDS))
+                             SHELL_MAX_SUBCOMMANDS)) {
+      if (g_verbose)
+        fprintf(stderr, "structured variant fast failure: %s\n",
+                variant.c_str());
       return 1;
+    }
     shell_dep_graph_t graph = {};
     shell_dep_limits_t limits = SHELL_DEP_LIMITS_DEFAULT;
     shell_dep_error_t dep_error = shell_dep_graph_parse(
         variant.data(), variant.size(), ".", &limits, &graph);
     if (validate_depgraph(variant.data(), variant.size(), dep_error, &graph,
-                          &limits))
+                          &limits)) {
+      if (g_verbose)
+        fprintf(stderr, "structured variant graph failure: %s\n",
+                variant.c_str());
       return 1;
-    if (test_full_parser(variant.c_str(), variant.size()))
+    }
+    if (test_full_parser(variant.c_str(), variant.size())) {
+      if (g_verbose)
+        fprintf(stderr, "structured variant full failure: %s\n",
+                variant.c_str());
       return 1;
+    }
   }
   return 0;
 }
@@ -490,13 +661,23 @@ static int test_full_parser(const char *input, size_t length) {
   shell_command_t *commands = NULL;
   size_t command_count = 0;
 
-  bool success = (shell_tokenize_commands(input, strlen(input), &commands,
-                                          &command_count) == SHELL_TOKENIZE_OK);
+  shell_tokenize_status_t status =
+      shell_tokenize_commands(input, strlen(input), &commands, &command_count);
+  bool success = status == SHELL_TOKENIZE_OK;
 
-  if (!success)
+  if (!success) {
+    if (g_verbose && (commands != NULL || command_count != 0))
+      fprintf(
+          stderr,
+          "full parser retained rejected output: status=%d commands=%p/%zu\n",
+          status, (void *)commands, command_count);
     return commands != NULL || command_count != 0;
+  }
 
   if ((commands == NULL) != (command_count == 0)) {
+    if (g_verbose)
+      fprintf(stderr, "full parser pointer/count mismatch: %p/%zu\n",
+              (void *)commands, command_count);
     shell_commands_free(commands, command_count);
     return 1;
   }
@@ -507,14 +688,19 @@ static int test_full_parser(const char *input, size_t length) {
       if (cmd->start_pos > length || cmd->end_pos < cmd->start_pos ||
           cmd->end_pos > length ||
           (cmd->tokens == NULL) != (cmd->token_count == 0)) {
+        if (g_verbose)
+          fprintf(stderr,
+                  "full parser invalid command range: %zu..%zu tokens=%p/%zu\n",
+                  cmd->start_pos, cmd->end_pos, (void *)cmd->tokens,
+                  cmd->token_count);
         shell_commands_free(commands, command_count);
         return 1;
       }
       for (size_t j = 0; j < cmd->token_count; j++) {
         const shell_token_t *tok = &cmd->tokens[j];
         if (tok->type < SHELL_TOKEN_COMMAND ||
-            tok->type > SHELL_TOKEN_HERESTRING || tok->position > length ||
-            tok->length > length - tok->position ||
+            tok->type > SHELL_TOKEN_REDIRECT_CLOBBER ||
+            tok->position > length || tok->length > length - tok->position ||
             tok->start != input + tok->position) {
           if (g_verbose)
             fprintf(stderr,
@@ -546,7 +732,7 @@ static int test_tokenizer_state(const char *input, size_t length) {
       break;
     }
     if (token.type < SHELL_TOKEN_COMMAND ||
-        token.type > SHELL_TOKEN_HERESTRING || token.position > length ||
+        token.type > SHELL_TOKEN_REDIRECT_CLOBBER || token.position > length ||
         token.length > length - token.position ||
         token.start != input + token.position || token.position < previous_end)
       return 1;
@@ -854,11 +1040,31 @@ static bool tokens_refer_to_owned_command(const shell_token_t *tokens,
   return true;
 }
 
+static bool
+processed_groups_match_fast(const shell_parse_result_t *fast,
+                            const shell_processed_commands_t *result) {
+  if (fast->group_count != result->group_count ||
+      (result->groups == NULL) != (result->group_count == 0))
+    return false;
+  for (uint32_t i = 0; i < fast->group_count; i++) {
+    const shell_group_t *source = &fast->groups[i];
+    const shell_group_t *processed = &result->groups[i];
+    if (source->start != processed->start || source->end != processed->end ||
+        source->parent != processed->parent ||
+        source->kind != processed->kind ||
+        processed->first_command > result->command_count ||
+        processed->command_count >
+            result->command_count - processed->first_command)
+      return false;
+  }
+  return true;
+}
+
 // Test processor metadata and canonical sequence rendering together.
 static int test_processor(const char *input, size_t input_length) {
   shell_command_info_t *infos = NULL;
   size_t command_count = 0;
-  static const shell_process_limits_t limits = {1u << 20, 4u << 20};
+  static const shell_process_limits_t limits = {1u << 20, 4u << 20, 0};
   shell_process_status_t status = shell_process_command(
       input, input_length, &limits, &infos, &command_count);
   bool success = status == SHELL_PROCESS_OK;
@@ -870,7 +1076,92 @@ static int test_processor(const char *input, size_t input_length) {
                                    &sequence_count, &has_shell_features);
   bool extracted = extracted_status == SHELL_PROCESS_OK;
 
+  /* The flat processor preserves an empty lexical result for diagnostics,
+   * whereas a canonical netargv sequence requires source that contains a
+   * command. This is an intentional semantic boundary, not a differential
+   * parser failure. */
+  if (success && command_count == 0 && !extracted &&
+      extracted_status == SHELL_PROCESS_EINPUT && sequence == NULL &&
+      sequence_count == 0 && !has_shell_features) {
+    shell_command_infos_free(infos, command_count);
+    return 0;
+  }
+
+  /* The legacy flat processor preserves lexically useful but semantically
+   * incomplete records for diagnostic callers.  Canonical sequence builders
+   * reject an unrepresentable lexical record, while the structured processor
+   * may either reject the source or retain only the executable simple-command
+   * ranges it can represent.  The latter result is independently canonical;
+   * the APIs need not make the same choice for malformed surrounding syntax. */
+  if (success && !extracted && extracted_status == SHELL_PROCESS_EPARSE) {
+    shell_processed_commands_t processed = {};
+    shell_process_status_t processed_status =
+        shell_process_commands(input, input_length, &limits, &processed);
+    bool structured_canonical =
+        processed_status == SHELL_PROCESS_OK &&
+        (processed.commands != NULL || processed.command_count == 0);
+    for (size_t i = 0; structured_canonical && i < processed.command_count;
+         i++) {
+      char *netargv = NULL;
+      structured_canonical =
+          processed.commands[i].command_token_count != 0 &&
+          shell_render_netargv(&processed.commands[i], &limits, &netargv) ==
+              SHELL_PROCESS_OK &&
+          netargv != NULL;
+      free(netargv);
+    }
+    bool canonical_boundary =
+        (processed_status == SHELL_PROCESS_EPARSE &&
+         processed.commands == NULL && processed.command_count == 0 &&
+         processed.groups == NULL && processed.group_count == 0 &&
+         processed.group_io_ops == NULL && processed.group_io_op_count == 0) ||
+        structured_canonical;
+    if (!canonical_boundary && g_verbose)
+      fprintf(stderr,
+              "processor canonical-boundary mismatch: flat=%d/%zu "
+              "sequence=%d/%zu structured=%d/%zu groups=%zu ops=%zu\n",
+              status, command_count, extracted_status, sequence_count,
+              processed_status, processed.command_count, processed.group_count,
+              processed.group_io_op_count);
+    shell_processed_commands_free(&processed);
+    shell_command_infos_free(infos, command_count);
+    free(sequence);
+    return canonical_boundary ? 0 : 1;
+  }
+
+  /* The flat processor retains arbitrarily many lexical records for
+   * diagnostics, while canonical sequence builders use the fixed-size
+   * semantic model. Confirm a model-capacity rejection through the
+   * structured API instead of requiring the two surfaces to agree. */
+  if (success && !extracted &&
+      extracted_status == SHELL_PROCESS_EOUTPUT_LIMIT) {
+    shell_processed_commands_t processed = {};
+    shell_process_status_t processed_status =
+        shell_process_commands(input, input_length, &limits, &processed);
+    bool canonical_capacity =
+        processed_status == SHELL_PROCESS_EOUTPUT_LIMIT &&
+        processed.commands == NULL && processed.command_count == 0 &&
+        processed.groups == NULL && processed.group_count == 0 &&
+        processed.group_io_ops == NULL && processed.group_io_op_count == 0 &&
+        sequence == NULL && sequence_count == 0 && !has_shell_features;
+    if (!canonical_capacity && g_verbose)
+      fprintf(stderr,
+              "processor canonical-capacity mismatch: flat=%d/%zu "
+              "sequence=%d/%zu structured=%d/%zu groups=%zu ops=%zu\n",
+              status, command_count, extracted_status, sequence_count,
+              processed_status, processed.command_count, processed.group_count,
+              processed.group_io_op_count);
+    shell_processed_commands_free(&processed);
+    shell_command_infos_free(infos, command_count);
+    free(sequence);
+    return canonical_capacity ? 0 : 1;
+  }
+
   if (success != extracted) {
+    if (g_verbose)
+      fprintf(stderr,
+              "processor success mismatch: flat=%d/%zu sequence=%d/%zu\n",
+              status, command_count, extracted_status, sequence_count);
     shell_command_infos_free(infos, command_count);
     free(sequence);
     return 1;
@@ -879,6 +1170,9 @@ static int test_processor(const char *input, size_t input_length) {
     if (status != extracted_status &&
         !(status == SHELL_PROCESS_EPARSE &&
           extracted_status == SHELL_PROCESS_EPARSE)) {
+      if (g_verbose)
+        fprintf(stderr, "processor rejection mismatch: flat=%d sequence=%d\n",
+                status, extracted_status);
       shell_command_infos_free(infos, command_count);
       free(sequence);
       return 1;
@@ -890,6 +1184,10 @@ static int test_processor(const char *input, size_t input_length) {
 
   if ((infos == NULL) != (command_count == 0) || (sequence == NULL) ||
       sequence_count != command_count) {
+    if (g_verbose)
+      fprintf(stderr,
+              "processor output mismatch: infos=%p/%zu sequence=%p/%zu\n",
+              (void *)infos, command_count, (void *)sequence, sequence_count);
     shell_command_infos_free(infos, command_count);
     free(sequence);
     return 1;
@@ -920,13 +1218,62 @@ static int test_processor(const char *input, size_t input_length) {
     }
   }
 
+  /* shell_process_command permits a syntactically valid comment-only input
+   * with no command records; the descriptor-bearing API deliberately treats
+   * that as no command line. Its result contract is exercised for every
+   * material command below. */
+  if (command_count == 0) {
+    shell_command_infos_free(infos, command_count);
+    free(sequence);
+    return expected_features != has_shell_features;
+  }
+
+  shell_parse_result_t fast = {};
+  if (shell_parse_fast(input, input_length, NULL, &fast) == SHELL_OK) {
+    shell_processed_commands_t processed = {};
+    shell_process_status_t processed_status =
+        shell_process_commands(input, input_length, &limits, &processed);
+    bool descriptor_outputs_cleared =
+        processed.commands == NULL && processed.command_count == 0 &&
+        processed.groups == NULL && processed.group_count == 0 &&
+        processed.group_io_ops == NULL && processed.group_io_op_count == 0;
+    /* The flat processor deliberately preserves the full tokenizer's
+     * permissive lexical records for diagnostics. The descriptor-bearing API
+     * must reject and clear a construct whose compound semantics it cannot
+     * model, even when that flat view remains available. */
+    bool semantic_rejection = status == SHELL_PROCESS_OK &&
+                              processed_status == SHELL_PROCESS_EPARSE &&
+                              descriptor_outputs_cleared;
+    /* The flat API preserves lexical structural records, while the descriptor
+     * API exposes only executable simple commands. Group source spans, kind,
+     * and parent stay stable, but command intervals are remapped to the
+     * retained command array and must not be compared byte-for-byte. */
+    if ((processed_status != status && !semantic_rejection) ||
+        (processed_status == SHELL_PROCESS_OK &&
+         ((processed.commands == NULL) != (processed.command_count == 0) ||
+          !processed_groups_match_fast(&fast, &processed)))) {
+      if (g_verbose)
+        fprintf(stderr,
+                "processor descriptor mismatch: input=%.*s process=%d/%zu "
+                "processed=%d/%zu groups=%zu fast-groups=%u\n",
+                (int)input_length, input, status, command_count,
+                processed_status, processed.command_count,
+                processed.group_count, fast.group_count);
+      shell_processed_commands_free(&processed);
+      shell_command_infos_free(infos, command_count);
+      free(sequence);
+      return 1;
+    }
+    shell_processed_commands_free(&processed);
+  }
+
   shell_command_infos_free(infos, command_count);
   free(sequence);
   return expected_features != has_shell_features;
 }
 
 static int test_output_limits(const char *input, size_t input_length) {
-  static const shell_process_limits_t process_limits = {8, 16};
+  static const shell_process_limits_t process_limits = {8, 16, 0};
   static const shell_transform_limits_t transform_limits = {8, 16};
 
   shell_command_info_t *infos = NULL;
@@ -961,10 +1308,668 @@ static int test_output_limits(const char *input, size_t input_length) {
   return 0;
 }
 
+static uint16_t processed_group_depth(const shell_processed_commands_t *result,
+                                      uint16_t group_index) {
+  uint16_t depth = 0;
+  while (group_index != UINT16_MAX && group_index < result->group_count) {
+    depth++;
+    group_index = result->groups[group_index].parent;
+  }
+  return depth;
+}
+
+static uint16_t graph_group_depth(const shell_dep_graph_t *graph,
+                                  uint32_t group_index) {
+  uint16_t depth = 0;
+  while (group_index != UINT32_MAX && group_index < graph->node_count) {
+    depth++;
+    group_index = graph->nodes[group_index].group.parent;
+  }
+  return depth;
+}
+
+static bool valid_generated_outer_netsequence(const char *sequence,
+                                              uint32_t expected_count) {
+  size_t count = 0;
+  return sequence != NULL &&
+         shell_netstring_validate(sequence, strlen(sequence), &count) ==
+             SHELL_NETSTRING_OK &&
+         count == expected_count;
+}
+
+static bool valid_generated_netargv_sequence(const char *sequence,
+                                             uint32_t expected_count) {
+  if (!valid_generated_outer_netsequence(sequence, expected_count))
+    return false;
+  shell_netstring_iter_t iterator = {};
+  if (shell_netstring_iter_init(&iterator, sequence, strlen(sequence)) !=
+      SHELL_NETSTRING_OK)
+    return false;
+  for (;;) {
+    shell_netstring_view_t record = {};
+    shell_netstring_status_t status =
+        shell_netstring_iter_next(&iterator, &record);
+    if (status == SHELL_NETSTRING_DONE)
+      return true;
+    size_t argument_count = 0;
+    if (status != SHELL_NETSTRING_OK ||
+        shell_netstring_validate(record.payload, record.payload_length,
+                                 &argument_count) != SHELL_NETSTRING_OK ||
+        argument_count == 0)
+      return false;
+  }
+}
+
+static bool
+generated_artifact_relation_present(const shell_dep_graph_t *graph,
+                                    const shell_brace_fuzz_io_t &expected) {
+  bool read = expected.kind == SHELL_GROUP_IO_READ_FILE ||
+              expected.kind == SHELL_GROUP_IO_HEREDOC ||
+              expected.kind == SHELL_GROUP_IO_HERESTRING;
+  shell_dep_edge_type_t type = expected.kind == SHELL_GROUP_IO_APPEND_FILE
+                                   ? SHELL_EDGE_APPEND
+                                   : SHELL_EDGE_WRITE;
+  for (uint32_t i = 0; i < graph->edge_count; i++) {
+    const shell_dep_edge_t *edge = &graph->edges[i];
+    uint32_t group = read ? edge->to : edge->from;
+    if ((read ? edge->target_fd : edge->source_fd) != expected.fd ||
+        edge->type != (read ? SHELL_EDGE_READ : type) ||
+        group >= graph->node_count ||
+        graph->nodes[group].type != SHELL_NODE_GROUP ||
+        graph_group_depth(graph, group) != expected.group_depth)
+      continue;
+    return true;
+  }
+  return false;
+}
+
+static int test_generated_brace_case(const uint8_t *data, size_t size,
+                                     const char *cwd) {
+  shell_brace_fuzz_case_t item = shell_brace_fuzz_case(data, size);
+  shell_parse_result_t fast = {};
+  shell_error_t fast_error =
+      shell_parse_fast(item.command.data(), item.command.size(), NULL, &fast);
+  shell_limits_t strict_limits = {SHELL_MAX_SUBCOMMANDS, true};
+  shell_parse_result_t strict_fast = {};
+  shell_error_t strict_error = shell_parse_fast(
+      item.command.data(), item.command.size(), &strict_limits, &strict_fast);
+  shell_command_t *commands = NULL;
+  size_t command_count = 0;
+  shell_tokenize_status_t full_error = shell_tokenize_commands(
+      item.command.data(), item.command.size(), &commands, &command_count);
+  shell_processed_commands_t processed = {};
+  shell_process_status_t process_error = shell_process_commands(
+      item.command.data(), item.command.size(), NULL, &processed);
+  shell_dep_graph_t graph = {};
+  shell_dep_error_t dep_error = shell_dep_graph_parse(
+      item.command.data(), item.command.size(), cwd, NULL, &graph);
+
+  if (!item.valid) {
+    bool failed = fast_error != SHELL_EPARSE ||
+                  (!item.tokenizer_tolerates_malformed &&
+                   full_error == SHELL_TOKENIZE_OK) ||
+                  process_error == SHELL_PROCESS_OK ||
+                  dep_error != SHELL_DEP_EPARSE;
+    if (failed && g_verbose)
+      fprintf(stderr,
+              "generated invalid brace case failed: %s (fast=%d full=%d "
+              "process=%d dep=%d)\n",
+              item.command.c_str(), fast_error, full_error, process_error,
+              dep_error);
+    shell_commands_free(commands, command_count);
+    shell_processed_commands_free(&processed);
+    return failed;
+  }
+  /* Unterminated heredocs are intentionally retained by the permissive
+   * tokenizer so callers can report useful source locations, but strict
+   * parsing rejects them. Exercise the tolerant surfaces above without
+   * imposing an invented semantic graph contract on incomplete source. */
+  if (!item.strict_valid) {
+    shell_commands_free(commands, command_count);
+    shell_processed_commands_free(&processed);
+    return fast_error != SHELL_OK || strict_error != SHELL_EPARSE;
+  }
+
+  uint32_t graph_commands = 0;
+  uint32_t graph_documents = 0;
+  uint32_t graph_reads = 0;
+  uint32_t graph_pipes = 0;
+  uint32_t graph_writes = 0;
+  uint32_t processed_dups = 0;
+  uint32_t processed_closes = 0;
+  size_t generated_redirect_index = 0;
+  uint32_t outer_group = UINT32_MAX;
+  for (uint32_t i = 0; i < graph.node_count; i++) {
+    graph_commands += graph.nodes[i].type == SHELL_NODE_CMD;
+    graph_documents += graph.nodes[i].type == SHELL_NODE_DOC &&
+                       (graph.nodes[i].doc.kind == SHELL_DOC_HEREDOC ||
+                        graph.nodes[i].doc.kind == SHELL_DOC_HERESTRING);
+    if (graph.nodes[i].type == SHELL_NODE_GROUP &&
+        graph.nodes[i].group.parent == UINT32_MAX &&
+        (outer_group == UINT32_MAX ||
+         graph.nodes[i].group.start < graph.nodes[outer_group].group.start))
+      outer_group = i;
+  }
+  bool group_endpoints_valid = outer_group != UINT32_MAX;
+  bool operations_valid = true;
+  for (size_t i = 0; i < processed.group_io_op_count; i++) {
+    const shell_group_io_op_t *op = &processed.group_io_ops[i];
+    bool relation = op->kind == SHELL_GROUP_IO_PIPE_INPUT ||
+                    op->kind == SHELL_GROUP_IO_PIPE_OUTPUT ||
+                    op->kind == SHELL_GROUP_IO_BACKGROUND;
+    bool shared_pipeline_operator =
+        i > 0 &&
+        processed.group_io_ops[i - 1].kind == SHELL_GROUP_IO_PIPE_OUTPUT &&
+        op->kind == SHELL_GROUP_IO_PIPE_INPUT &&
+        processed.group_io_ops[i - 1].source_start == op->source_start &&
+        processed.group_io_ops[i - 1].source_end == op->source_end;
+    if (op->group_index >= processed.group_count ||
+        op->source_start >= op->source_end ||
+        (!relation && op->operand_start >= op->operand_end) ||
+        (i > 0 && processed.group_io_ops[i - 1].source_end > op->source_start &&
+         !shared_pipeline_operator))
+      operations_valid = false;
+    processed_dups += op->kind == SHELL_GROUP_IO_DUP_FD;
+    processed_closes += op->kind == SHELL_GROUP_IO_CLOSE_FD;
+    if (op->kind == SHELL_GROUP_IO_DUP_FD && op->target_fd == UINT32_MAX)
+      operations_valid = false;
+    if (op->kind == SHELL_GROUP_IO_CLOSE_FD && op->target_fd != UINT32_MAX)
+      operations_valid = false;
+    if (!relation) {
+      if (generated_redirect_index >= item.redirect_ops.size()) {
+        operations_valid = false;
+        continue;
+      }
+      const shell_brace_fuzz_io_t &expected =
+          item.redirect_ops[generated_redirect_index++];
+      size_t source_length = op->source_end - op->source_start;
+      if (op->kind != expected.kind || op->fd != expected.fd ||
+          op->target_fd != expected.target_fd ||
+          processed_group_depth(&processed, op->group_index) !=
+              expected.group_depth ||
+          op->source_start != expected.source_offset ||
+          source_length != expected.spelling.size() ||
+          memcmp(item.command.data() + op->source_start,
+                 expected.spelling.data(), source_length) != 0)
+        operations_valid = false;
+    }
+  }
+  if (generated_redirect_index != item.redirect_ops.size())
+    operations_valid = false;
+  for (const shell_brace_fuzz_io_t &expected : item.redirect_ops)
+    if (expected.artifact_relation &&
+        !generated_artifact_relation_present(&graph, expected))
+      operations_valid = false;
+  for (uint32_t i = 0; i < graph.edge_count; i++) {
+    const shell_dep_edge_t *edge = &graph.edges[i];
+    graph_reads += graph.edges[i].type == SHELL_EDGE_READ;
+    graph_pipes += edge->type == SHELL_EDGE_PIPE;
+    graph_writes +=
+        edge->type == SHELL_EDGE_WRITE || edge->type == SHELL_EDGE_APPEND;
+    if (edge->type == SHELL_EDGE_READ &&
+        graph.nodes[edge->to].type != SHELL_NODE_GROUP &&
+        (!item.command_local_documents ||
+         graph.nodes[edge->to].type != SHELL_NODE_CMD))
+      group_endpoints_valid = false;
+    if ((edge->type == SHELL_EDGE_WRITE || edge->type == SHELL_EDGE_APPEND) &&
+        graph.nodes[edge->from].type != SHELL_NODE_GROUP)
+      group_endpoints_valid = false;
+    /* A redirected group input leaves its upstream writer connected to a
+     * terminal ENDPOINT.  That is intentionally not a group endpoint: it
+     * records the real pipe write after fd 0 has been replaced. */
+    if (edge->type == SHELL_EDGE_PIPE && edge->from != outer_group &&
+        edge->to != outer_group &&
+        graph.nodes[edge->to].type != SHELL_NODE_ENDPOINT)
+      group_endpoints_valid = false;
+  }
+
+  shell_dep_graph_validation_t graph_validation =
+      shell_dep_graph_validate(&graph);
+  char *netargv_sequence = NULL;
+  char *command_netseq = NULL;
+  char *type_netseq = NULL;
+  char *paired_command_netseq = NULL;
+  char *paired_type_netseq = NULL;
+  size_t netargv_count = 0;
+  size_t command_netseq_count = 0;
+  size_t type_netseq_count = 0;
+  size_t paired_count = 0;
+  bool has_shell_features = false;
+  shell_process_status_t netargv_status = shell_build_netargv_sequence(
+      item.command.data(), item.command.size(), NULL, &netargv_sequence,
+      &netargv_count, &has_shell_features);
+  shell_process_status_t command_netseq_status =
+      shell_build_command_netseq(item.command.data(), item.command.size(), NULL,
+                                 &command_netseq, &command_netseq_count);
+  shell_process_status_t type_netseq_status =
+      shell_build_type_netseq(item.command.data(), item.command.size(), NULL,
+                              &type_netseq, &type_netseq_count);
+  shell_process_status_t paired_netseq_status = shell_build_anomaly_netseqs(
+      item.command.data(), item.command.size(), NULL, &paired_command_netseq,
+      &paired_type_netseq, &paired_count);
+  bool sequences_valid =
+      netargv_status == SHELL_PROCESS_OK && netargv_count != 0 &&
+      valid_generated_netargv_sequence(netargv_sequence, netargv_count) &&
+      command_netseq_status == SHELL_PROCESS_OK &&
+      command_netseq_count == netargv_count &&
+      valid_generated_outer_netsequence(command_netseq, command_netseq_count) &&
+      type_netseq_status == SHELL_PROCESS_OK &&
+      type_netseq_count == netargv_count &&
+      valid_generated_outer_netsequence(type_netseq, type_netseq_count) &&
+      paired_netseq_status == SHELL_PROCESS_OK &&
+      paired_count == netargv_count &&
+      strcmp(command_netseq, paired_command_netseq) == 0 &&
+      strcmp(type_netseq, paired_type_netseq) == 0;
+  if (!sequences_valid && g_verbose)
+    fprintf(stderr,
+            "generated sequence mismatch: netargv=%d/%zu command=%d/%zu "
+            "type=%d/%zu paired=%d/%zu features=%d\n",
+            netargv_status, netargv_count, command_netseq_status,
+            command_netseq_count, type_netseq_status, type_netseq_count,
+            paired_netseq_status, paired_count, has_shell_features);
+  free(paired_type_netseq);
+  free(paired_command_netseq);
+  free(type_netseq);
+  free(command_netseq);
+  free(netargv_sequence);
+  bool group_limits_valid = true;
+  bool failed =
+      fast_error != SHELL_OK ||
+      (item.strict_valid ? strict_error != SHELL_OK
+                         : strict_error != SHELL_EPARSE) ||
+      fast.group_count != item.group_count || full_error != SHELL_TOKENIZE_OK ||
+      process_error != SHELL_PROCESS_OK || command_count == 0 ||
+      command_count > SHELL_MAX_SUBCOMMANDS ||
+      processed.command_count != item.command_count ||
+      processed.group_io_op_count != item.group_io_count ||
+      processed_dups != item.dup_count ||
+      processed_closes != item.close_count || dep_error != SHELL_DEP_OK ||
+      graph_commands != item.command_count ||
+      graph_documents != item.document_count ||
+      graph_reads != item.read_count || graph_pipes != item.pipe_count ||
+      graph_writes != item.write_count || !group_endpoints_valid ||
+      !operations_valid || !sequences_valid ||
+      graph.nodes[outer_group].group.kind !=
+          (item.outer_subshell ? SHELL_GROUP_SUBSHELL : SHELL_GROUP_BRACE) ||
+      !graph_validation.valid;
+
+  /* Zero means unlimited in the public limits contract, so only operations
+   * above one have a representable immediately-smaller rejecting limit. */
+  if (!failed && item.strict_valid && item.group_io_count > 1) {
+    shell_process_limits_t exact_limits = {SIZE_MAX, SIZE_MAX,
+                                           item.group_io_count};
+    shell_processed_commands_t limited = {};
+    shell_process_status_t limited_status = shell_process_commands(
+        item.command.data(), item.command.size(), &exact_limits, &limited);
+    if (limited_status != SHELL_PROCESS_OK ||
+        limited.group_io_op_count != item.group_io_count)
+      group_limits_valid = false;
+    shell_processed_commands_free(&limited);
+
+    exact_limits.max_group_io_ops = item.group_io_count - 1;
+    limited.commands = (shell_command_info_t *)(uintptr_t)1;
+    limited.command_count = SIZE_MAX;
+    limited.groups = (shell_group_t *)(uintptr_t)1;
+    limited.group_count = SIZE_MAX;
+    limited.group_io_ops = (shell_group_io_op_t *)(uintptr_t)1;
+    limited.group_io_op_count = SIZE_MAX;
+    limited_status = shell_process_commands(
+        item.command.data(), item.command.size(), &exact_limits, &limited);
+    bool rejected_limit_cleared =
+        limited.commands == NULL && limited.command_count == 0 &&
+        limited.groups == NULL && limited.group_count == 0 &&
+        limited.group_io_ops == NULL && limited.group_io_op_count == 0;
+    if (limited_status != SHELL_PROCESS_EOUTPUT_LIMIT ||
+        !rejected_limit_cleared)
+      group_limits_valid = false;
+    if (!group_limits_valid)
+      failed = true;
+  }
+  if (failed && g_verbose) {
+    uint8_t outer_kind = outer_group < graph.node_count
+                             ? graph.nodes[outer_group].group.kind
+                             : 0;
+    fprintf(stderr,
+            "generated brace case failed: %s (fast=%d strict=%d groups=%u "
+            "full=%d commands=%zu process=%d processed=%zu/%zu dep=%d "
+            "graph=%u/%u/%u/%u/%u expected=%u/%u/%u/%u/%u/%u "
+            "endpoints=%d operations=%d sequences=%d limits=%d kind=%u "
+            "validation=%d)\n",
+            item.command.c_str(), fast_error, strict_error, fast.group_count,
+            full_error, command_count, process_error, processed.command_count,
+            processed.group_io_op_count, dep_error, graph_commands,
+            graph_documents, graph_reads, graph_pipes, graph_writes,
+            item.command_count, item.group_io_count, item.document_count,
+            item.read_count, item.pipe_count, item.write_count,
+            group_endpoints_valid, operations_valid, sequences_valid,
+            group_limits_valid, outer_kind, graph_validation.valid);
+  }
+  shell_commands_free(commands, command_count);
+  shell_processed_commands_free(&processed);
+  return failed;
+}
+
+/* The ordinary brace generator checks command ownership and group I/O. These
+ * cases instead assert the dynamic-byte topology produced by substitutions:
+ * direct streams stay direct, while ambiguous fan-in is made explicit with an
+ * ENDPOINT collector. */
+static int test_substitution_case(const shell_substitution_fuzz_case_t &item,
+                                  const char *cwd) {
+  shell_parse_result_t fast = {};
+  shell_command_t *commands = NULL;
+  size_t command_count = 0;
+  shell_processed_commands_t processed = {};
+  shell_dep_graph_t graph = {};
+  char *netargv_sequence = NULL;
+  size_t netargv_count = 0;
+  bool has_shell_features = false;
+
+  shell_error_t fast_error =
+      shell_parse_fast(item.command.data(), item.command.size(), NULL, &fast);
+  shell_tokenize_status_t full_error = shell_tokenize_commands(
+      item.command.data(), item.command.size(), &commands, &command_count);
+  shell_process_status_t process_error = shell_process_commands(
+      item.command.data(), item.command.size(), NULL, &processed);
+  shell_dep_error_t graph_error = shell_dep_graph_parse(
+      item.command.data(), item.command.size(), cwd, NULL, &graph);
+  shell_process_status_t netargv_error = shell_build_netargv_sequence(
+      item.command.data(), item.command.size(), NULL, &netargv_sequence,
+      &netargv_count, &has_shell_features);
+
+  uint32_t graph_commands = 0;
+  uint32_t graph_groups = 0;
+  uint32_t graph_endpoints = 0;
+  uint32_t substitution_edges = 0;
+  uint32_t shell_word_substitution_edges = 0;
+  uint32_t dynamic_name_substitution_edges = 0;
+  uint32_t file_substitution_edges = 0;
+  uint32_t collector_writes = 0;
+  uint32_t heredoc_count = 0;
+  uint32_t literal_heredoc_count = 0;
+  uint32_t transient_heredoc_count = 0;
+  uint32_t heredoc_substitution_count = 0;
+  uint32_t herestring_count = 0;
+  uint32_t herestring_substitution_count = 0;
+  bool direct_file_consumers[SHELL_DEP_MAX_NODES] = {false};
+  bool topology_valid = true;
+  for (uint32_t i = 0; i < graph.node_count; i++) {
+    const shell_dep_node_t *node = &graph.nodes[i];
+    graph_commands += node->type == SHELL_NODE_CMD;
+    graph_groups += node->type == SHELL_NODE_GROUP;
+    graph_endpoints += node->type == SHELL_NODE_ENDPOINT;
+    if (node->type == SHELL_NODE_DOC && node->doc.kind == SHELL_DOC_HEREDOC) {
+      heredoc_count++;
+      literal_heredoc_count +=
+          (node->doc.flags & SHELL_DEP_DOC_FLAG_HEREDOC_LITERAL) != 0;
+      transient_heredoc_count +=
+          (node->doc.flags & SHELL_DEP_DOC_FLAG_TRANSIENT) != 0;
+    }
+    if (node->type == SHELL_NODE_DOC && node->doc.kind == SHELL_DOC_HERESTRING)
+      herestring_count++;
+  }
+  for (uint32_t i = 0; i < graph.edge_count; i++) {
+    const shell_dep_edge_t *edge = &graph.edges[i];
+    if (edge->from >= graph.node_count || edge->to >= graph.node_count) {
+      topology_valid = false;
+      continue;
+    }
+    if (edge->type == SHELL_EDGE_SUBST) {
+      substitution_edges++;
+      if ((edge->flags & ~(SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD |
+                           SHELL_DEP_EDGE_FLAG_SUBST_DYNAMIC_NAME)) != 0 ||
+          ((edge->flags & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0 &&
+           (edge->flags & SHELL_DEP_EDGE_FLAG_SUBST_DYNAMIC_NAME) != 0))
+        topology_valid = false;
+      shell_word_substitution_edges +=
+          (edge->flags & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0;
+      dynamic_name_substitution_edges +=
+          (edge->flags & SHELL_DEP_EDGE_FLAG_SUBST_DYNAMIC_NAME) != 0;
+      if (graph.nodes[edge->from].type == SHELL_NODE_ENDPOINT) {
+        if (edge->source_fd != SHELL_DEP_FD_NONE)
+          topology_valid = false;
+      } else if (graph.nodes[edge->from].type == SHELL_NODE_DOC) {
+        if (graph.nodes[edge->from].doc.kind != SHELL_DOC_FILE ||
+            edge->source_fd != SHELL_DEP_FD_NONE ||
+            edge->target_fd != SHELL_DEP_FD_NONE)
+          topology_valid = false;
+        else {
+          file_substitution_edges++;
+          direct_file_consumers[edge->to] = true;
+        }
+      } else {
+        if (edge->source_fd != 1)
+          topology_valid = false;
+      }
+      if (graph.nodes[edge->to].type != SHELL_NODE_CMD &&
+          graph.nodes[edge->to].type != SHELL_NODE_GROUP &&
+          graph.nodes[edge->to].type != SHELL_NODE_DOC)
+        topology_valid = false;
+      if (graph.nodes[edge->to].type == SHELL_NODE_DOC &&
+          graph.nodes[edge->to].doc.kind == SHELL_DOC_HEREDOC)
+        heredoc_substitution_count++;
+      if (graph.nodes[edge->to].type == SHELL_NODE_DOC &&
+          graph.nodes[edge->to].doc.kind == SHELL_DOC_HERESTRING)
+        herestring_substitution_count++;
+      if (edge->flags & SHELL_DEP_EDGE_FLAG_SUBST_DYNAMIC_NAME) {
+        if (graph.nodes[edge->to].type != SHELL_NODE_DOC ||
+            graph.nodes[edge->to].doc.kind != SHELL_DOC_FILE ||
+            (graph.nodes[edge->to].doc.flags &
+             SHELL_DEP_DOC_FLAG_DYNAMIC_NAME) == 0)
+          topology_valid = false;
+      }
+    }
+    if (edge->type == SHELL_EDGE_WRITE &&
+        graph.nodes[edge->to].type == SHELL_NODE_ENDPOINT) {
+      collector_writes++;
+      if (edge->source_fd != item.outer_fd && edge->source_fd != 1)
+        topology_valid = false;
+    }
+  }
+  for (uint32_t i = 0; i < graph.edge_count; i++)
+    if (graph.edges[i].type == SHELL_EDGE_READ &&
+        graph.edges[i].to < graph.node_count &&
+        direct_file_consumers[graph.edges[i].to])
+      topology_valid = false;
+
+  if (item.output_process && item.collector_write_count != 0) {
+    bool output_collector_valid = false;
+    for (uint32_t i = 0; i < graph.node_count; i++) {
+      if (graph.nodes[i].type != SHELL_NODE_ENDPOINT)
+        continue;
+      bool outer_write = false;
+      bool nested_consumer = false;
+      for (uint32_t edge_index = 0; edge_index < graph.edge_count;
+           edge_index++) {
+        const shell_dep_edge_t *edge = &graph.edges[edge_index];
+        outer_write =
+            outer_write || (edge->type == SHELL_EDGE_WRITE && edge->to == i &&
+                            edge->source_fd == item.outer_fd &&
+                            (graph.nodes[edge->from].type == SHELL_NODE_CMD ||
+                             graph.nodes[edge->from].type == SHELL_NODE_GROUP));
+        nested_consumer = nested_consumer ||
+                          (edge->type == SHELL_EDGE_SUBST && edge->from == i &&
+                           (graph.nodes[edge->to].type == SHELL_NODE_CMD ||
+                            graph.nodes[edge->to].type == SHELL_NODE_GROUP) &&
+                           edge->target_fd == 0);
+      }
+      output_collector_valid =
+          output_collector_valid || (outer_write && nested_consumer);
+    }
+    topology_valid = topology_valid && output_collector_valid;
+  }
+
+  if (item.group_substitution_owner) {
+    bool group_owned_flow = false;
+    bool group_owned_descriptor = false;
+    bool expected_group_pipe = item.group_pipe_target_fd == UINT32_MAX;
+    for (uint32_t edge_index = 0; edge_index < graph.edge_count; edge_index++) {
+      const shell_dep_edge_t *edge = &graph.edges[edge_index];
+      if (item.output_process && item.collector_write_count != 0) {
+        group_owned_flow = group_owned_flow ||
+                           (edge->type == SHELL_EDGE_WRITE &&
+                            graph.nodes[edge->from].type == SHELL_NODE_GROUP &&
+                            graph.nodes[edge->to].type == SHELL_NODE_ENDPOINT &&
+                            edge->source_fd == item.outer_fd);
+      } else {
+        group_owned_flow = group_owned_flow ||
+                           (edge->type == SHELL_EDGE_SUBST &&
+                            graph.nodes[edge->to].type == SHELL_NODE_GROUP &&
+                            edge->target_fd != SHELL_DEP_FD_NONE);
+      }
+      expected_group_pipe = expected_group_pipe ||
+                            (edge->type == SHELL_EDGE_PIPE &&
+                             graph.nodes[edge->to].type == SHELL_NODE_GROUP &&
+                             edge->target_fd == item.group_pipe_target_fd);
+    }
+    shell_group_io_kind_t expected_kind = item.output_process
+                                              ? SHELL_GROUP_IO_PROCESS_SUB_OUT
+                                              : SHELL_GROUP_IO_PROCESS_SUB_IN;
+    uint32_t expected_fd = item.output_process ? item.outer_fd : 0;
+    for (size_t op_index = 0; op_index < processed.group_io_op_count;
+         op_index++) {
+      const shell_group_io_op_t *op = &processed.group_io_ops[op_index];
+      group_owned_descriptor =
+          group_owned_descriptor ||
+          (op->kind == expected_kind && op->fd == expected_fd &&
+           op->group_index < processed.group_count);
+    }
+    topology_valid = topology_valid && group_owned_flow &&
+                     group_owned_descriptor && expected_group_pipe;
+  }
+
+  shell_dep_graph_validation_t validation = shell_dep_graph_validate(&graph);
+  if (item.depgraph_truncated) {
+    bool failed = graph_error != SHELL_DEP_ETRUNC ||
+                  !(graph.status & SHELL_DEP_STATUS_TRUNCATED) ||
+                  !validation.valid;
+    if (failed && g_verbose)
+      fprintf(stderr,
+              "generated substitution truncation case failed: %s "
+              "(graph=%d status=%u validation=%d)\n",
+              item.command.c_str(), graph_error, graph.status,
+              validation.valid);
+    free(netargv_sequence);
+    shell_commands_free(commands, command_count);
+    shell_processed_commands_free(&processed);
+    return failed;
+  }
+  bool failed =
+      fast_error != SHELL_OK || full_error != SHELL_TOKENIZE_OK ||
+      process_error != SHELL_PROCESS_OK || graph_error != SHELL_DEP_OK ||
+      netargv_error != SHELL_PROCESS_OK || !has_shell_features ||
+      graph_commands != item.command_count ||
+      graph_groups != item.group_count ||
+      graph_endpoints != item.endpoint_count ||
+      substitution_edges != item.substitution_edge_count ||
+      (item.dynamic_name_substitution_count != UINT32_MAX &&
+       dynamic_name_substitution_edges !=
+           item.dynamic_name_substitution_count) ||
+      file_substitution_edges != item.file_substitution_count ||
+      collector_writes != item.collector_write_count ||
+      heredoc_count != item.heredoc_count ||
+      literal_heredoc_count != item.literal_heredoc_count ||
+      transient_heredoc_count != item.transient_heredoc_count ||
+      heredoc_substitution_count != item.heredoc_substitution_count ||
+      herestring_count != item.herestring_count ||
+      herestring_substitution_count != item.herestring_substitution_count ||
+      !topology_valid || !validation.valid;
+  if (item.surface_command_count != 0 &&
+      (command_count != item.surface_command_count ||
+       processed.command_count != item.surface_command_count ||
+       netargv_count != item.surface_command_count))
+    failed = true;
+  if (item.requires_substitution_evaluation !=
+      (shell_word_substitution_edges != 0))
+    failed = true;
+  if (failed && g_verbose)
+    fprintf(
+        stderr,
+        "generated substitution case failed: %s (fast=%d full=%d "
+        "process=%d graph=%d netargv=%d surface=%zu/%zu/%zu/%u "
+        "nodes=%u/%u groups=%u/%u "
+        "endpoints=%u/%u substitutions=%u/%u shell-words=%u "
+        "dynamic-names=%u/%u "
+        "file-substitutions=%u/%u "
+        "writes=%u/%u heredocs=%u/%u literal=%u/%u transient=%u/%u "
+        "heredoc-substitutions=%u/%u herestrings=%u/%u "
+        "herestring-substitutions=%u/%u topology=%d validation=%d)\n",
+        item.command.c_str(), fast_error, full_error, process_error,
+        graph_error, netargv_error, command_count, processed.command_count,
+        netargv_count, item.surface_command_count, graph_commands,
+        item.command_count, graph_groups, item.group_count, graph_endpoints,
+        item.endpoint_count, substitution_edges, item.substitution_edge_count,
+        shell_word_substitution_edges, dynamic_name_substitution_edges,
+        item.dynamic_name_substitution_count, file_substitution_edges,
+        item.file_substitution_count, collector_writes,
+        item.collector_write_count, heredoc_count, item.heredoc_count,
+        literal_heredoc_count, item.literal_heredoc_count,
+        transient_heredoc_count, item.transient_heredoc_count,
+        heredoc_substitution_count, item.heredoc_substitution_count,
+        herestring_count, item.herestring_count, herestring_substitution_count,
+        item.herestring_substitution_count, topology_valid, validation.valid);
+  free(netargv_sequence);
+  shell_commands_free(commands, command_count);
+  shell_processed_commands_free(&processed);
+  return failed;
+}
+
+static int test_generated_substitution_case(const uint8_t *data, size_t size,
+                                            const char *cwd) {
+  return test_substitution_case(shell_brace_fuzz_substitution_case(data, size),
+                                cwd);
+}
+
+static int test_composed_substitution_case(const uint8_t *data, size_t size,
+                                           const char *cwd) {
+  return test_substitution_case(
+      shell_brace_fuzz_composed_substitution_case(data, size), cwd);
+}
+
+static int test_composed_substitution_matrix(const char *cwd) {
+  uint8_t data[7] = {0};
+  for (uint8_t form = 0; form < 6; form++) {
+    uint8_t pipeline_count = form == 5 ? 1 : 2;
+    uint8_t literal_count = form == 5 ? 2 : 1;
+    for (uint8_t depth = 0; depth < 3; depth++) {
+      for (uint8_t pipeline = 0; pipeline < pipeline_count; pipeline++) {
+        for (uint8_t literal = 0; literal < literal_count; literal++) {
+          for (uint8_t group_mask = 0; group_mask < (1u << (depth + 1));
+               group_mask++) {
+            data[0] = form;
+            data[1] = depth;
+            data[2] = pipeline;
+            data[3] = literal;
+            for (uint8_t level = 0; level <= depth; level++)
+              data[4 + level] = (group_mask >> level) & 1u;
+            if (test_composed_substitution_case(data, sizeof(data), cwd))
+              return 1;
+          }
+        }
+      }
+    }
+  }
+  return 0;
+}
+
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
   static bool fixed_oracles_checked = false;
   if (!fixed_oracles_checked) {
     if (test_fixed_oracles())
+      abort();
+    for (uint8_t selector = 0;
+         selector < SHELL_BRACE_FUZZ_SUBSTITUTION_CASE_COUNT; selector++)
+      if (test_generated_substitution_case(&selector, 1, "/tmp"))
+        abort();
+    for (uint8_t selector = 0;
+         selector < SHELL_BRACE_FUZZ_COMPOSED_SUBSTITUTION_CASE_COUNT;
+         selector++)
+      if (test_composed_substitution_case(&selector, 1, "/tmp"))
+        abort();
+    static const uint8_t local_document_selectors[] = {58, 59, 60};
+    for (uint8_t selector : local_document_selectors)
+      if (test_generated_brace_case(&selector, 1, "/tmp"))
+        abort();
+    if (test_composed_substitution_matrix("/tmp"))
       abort();
     fixed_oracles_checked = true;
   }
@@ -1030,6 +2035,23 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
   run_check("plain differential", test_plain_differential(input, text_length));
   run_check("structured variants",
             test_structured_variants(input, text_length));
+  /* Startup exhaustively checks each generated matrix. On fuzzed payloads,
+   * choose one without consuming input bytes, so structural coverage does not
+   * multiply the cost of every arbitrary-parser iteration. */
+  switch (size == 0 ? 0 : data[0] % 3) {
+  case 0:
+    run_check("generated brace case",
+              test_generated_brace_case(data, size, cwd));
+    break;
+  case 1:
+    run_check("generated substitution case",
+              test_generated_substitution_case(data, size, cwd));
+    break;
+  default:
+    run_check("composed substitution case",
+              test_composed_substitution_case(data, size, cwd));
+    break;
+  }
   free(input);
   if (failed)
     abort();

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(Shellclave VERSION 0.6.0 LANGUAGES C CXX)
+project(Shellclave VERSION 0.7.0 LANGUAGES C CXX)
 
 if(PROJECT_IS_TOP_LEVEL)
   set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -8,6 +8,8 @@ endif()
 include(CTest)
 include(CMakePackageConfigHelpers)
 include(GNUInstallDirs)
+include(cmake/CommandFixtureValidation.cmake)
+include(cmake/SmokeSeedManifests.cmake)
 
 option(SHELLCLAVE_BUILD_TOOLS "Build command-line tools" ${PROJECT_IS_TOP_LEVEL})
 option(SHELLCLAVE_BUILD_BENCHMARKS "Build micro-benchmarks" OFF)
@@ -82,6 +84,7 @@ target_link_libraries(shellsplit PRIVATE m)
 set_target_properties(shellsplit PROPERTIES EXPORT_NAME shellsplit)
 
 if(BUILD_TESTING)
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
   add_library(shellsplit_test ${SHELLSPLIT_SOURCES}
     shellsplit/tests/test_allocator.c)
   shellclave_project_target(shellsplit_test)
@@ -193,14 +196,25 @@ if(BUILD_TESTING)
   file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests/headers")
   shellclave_add_test(shellsplit_tokenizer_test shellsplit/tests/tokenizer_test.c shellsplit_test)
   shellclave_add_test(shellsplit_fast_parser_test shellsplit/tests/fast_parser_test.c shellsplit_test)
+  # Exercise the same public parser contract against the shipping library. The
+  # allocation-failure variant above links the instrumented test library;
+  # keeping this production variant prevents that build from being the only
+  # implementation exercised by the parser regression suite.
+  shellclave_add_test(shellsplit_fast_parser_production_test shellsplit/tests/fast_parser_test.c shellsplit)
   shellclave_add_test(shellsplit_abstract_test shellsplit/tests/abstract_test.c shellsplit_test)
+  shellclave_add_test(shellsplit_production_semantics_test
+    shellsplit/tests/production_semantics_test.c shellsplit)
   shellclave_add_test(shellsplit_entropy_test shellsplit/tests/entropy_test.c shellsplit_test)
   shellclave_add_test(shellsplit_depgraph_test shellsplit/tests/test_depgraph.c shellsplit_test)
+  # The dependency graph has no allocator-test dependency, so run its full
+  # public contract against both the fault-injection and shipping builds.
+  shellclave_add_test(shellsplit_depgraph_production_test shellsplit/tests/test_depgraph.c shellsplit)
   shellclave_add_test(shellsplit_interop_test shellsplit/tests/interop_test.c shellsplit_test)
   shellclave_add_test(shellsplit_netstring_test shellsplit/tests/netstring_test.c shellsplit_test)
   foreach(shellsplit_test_target IN ITEMS shellsplit_tokenizer_test
       shellsplit_fast_parser_test shellsplit_abstract_test shellsplit_entropy_test
-      shellsplit_depgraph_test shellsplit_interop_test shellsplit_netstring_test)
+      shellsplit_depgraph_test shellsplit_interop_test shellsplit_netstring_test
+      shellsplit_fast_parser_production_test shellsplit_depgraph_production_test)
     target_include_directories(${shellsplit_test_target} PRIVATE shellsplit/tests)
   endforeach()
   shellclave_add_test(shelltype_token_types_test shelltype/tests/test_token_types.c shelltype_test)
@@ -232,6 +246,72 @@ if(BUILD_TESTING)
   shellclave_add_test(shellgate_unit_test shellgate/tests/test_shellgate.c shellgate_test)
   shellclave_add_test(shellgate_anomaly_test shellgate/tests/test_anomaly.c shellgate_test)
   shellclave_add_test(shellgate_io_test shellgate/tests/test_sg_io.c shellgate_test)
+  set(shellclave_command_fixture_json
+    "${CMAKE_CURRENT_SOURCE_DIR}/shellsplit/tests/data/coding-agent-commands.json")
+  set(shellclave_command_fixture_header
+    "${CMAKE_CURRENT_BINARY_DIR}/tests/shellgate_corpus_fixtures.h")
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${shellclave_command_fixture_json}")
+  file(READ "${shellclave_command_fixture_json}" shellclave_command_fixture_data)
+  string(JSON shellclave_command_fixture_format ERROR_VARIABLE shellclave_fixture_error
+    GET "${shellclave_command_fixture_data}" format)
+  if(NOT shellclave_fixture_error STREQUAL "NOTFOUND" OR
+      NOT shellclave_command_fixture_format STREQUAL "shellclave-command-fixtures-v1")
+    message(FATAL_ERROR "Unsupported command fixture format")
+  endif()
+  string(JSON shellclave_command_fixture_count ERROR_VARIABLE shellclave_fixture_error
+    LENGTH "${shellclave_command_fixture_data}" commands)
+  if(NOT shellclave_fixture_error STREQUAL "NOTFOUND")
+    message(FATAL_ERROR "Invalid command fixture JSON: ${shellclave_fixture_error}")
+  endif()
+  if(shellclave_command_fixture_count EQUAL 0)
+    message(FATAL_ERROR "Command fixture JSON must not be empty")
+  endif()
+  file(WRITE "${shellclave_command_fixture_header}"
+    "/* Generated from shellsplit/tests/data/coding-agent-commands.json. */\n"
+    "#ifndef SHELLGATE_CORPUS_FIXTURES_H\n"
+    "#define SHELLGATE_CORPUS_FIXTURES_H\n"
+    "static const char *const shellgate_corpus_commands[] = {\n")
+  math(EXPR shellclave_command_fixture_last "${shellclave_command_fixture_count} - 1")
+  foreach(shellclave_command_fixture_index RANGE 0 ${shellclave_command_fixture_last})
+    shellclave_read_command_fixture(shellclave_command_fixture
+      "${shellclave_command_fixture_data}" ${shellclave_command_fixture_index})
+    shellclave_validate_command_fixture("${shellclave_command_fixture}"
+      "${shellclave_command_fixture_index}")
+    shellclave_escape_command_fixture(shellclave_command_fixture_c
+      "${shellclave_command_fixture}")
+    file(APPEND "${shellclave_command_fixture_header}"
+      "  \"${shellclave_command_fixture_c}\",\n")
+  endforeach()
+  file(APPEND "${shellclave_command_fixture_header}"
+    "};\n"
+    "#define SHELLGATE_CORPUS_COMMAND_COUNT ${shellclave_command_fixture_count}u\n"
+    "#endif\n")
+  shellclave_add_test(shellgate_corpus_test shellgate/tests/test_corpus.c shellgate_test)
+  target_include_directories(shellgate_corpus_test PRIVATE
+    "${CMAKE_CURRENT_BINARY_DIR}/tests")
+  add_test(NAME shellclave_command_fixture_validation
+    COMMAND "${CMAKE_COMMAND}" -P
+      "${CMAKE_CURRENT_SOURCE_DIR}/cmake/TestCommandFixtureValidation.cmake")
+  set_tests_properties(shellclave_command_fixture_validation
+    PROPERTIES WILL_FAIL TRUE LABELS "fixtures")
+  add_test(NAME shellclave_command_fixture_type
+    COMMAND "${CMAKE_COMMAND}" -P
+      "${CMAKE_CURRENT_SOURCE_DIR}/cmake/TestCommandFixtureType.cmake")
+  set_tests_properties(shellclave_command_fixture_type
+    PROPERTIES WILL_FAIL TRUE LABELS "fixtures")
+  add_test(NAME shellclave_command_fixture_escaping
+    COMMAND "${CMAKE_COMMAND}" -P
+      "${CMAKE_CURRENT_SOURCE_DIR}/cmake/TestCommandFixtureEscaping.cmake")
+  set_tests_properties(shellclave_command_fixture_escaping
+    PROPERTIES LABELS "fixtures")
+  add_test(NAME shellsplit_sanitize_command_fixtures
+    COMMAND "${Python3_EXECUTABLE}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/shellsplit/tests/test_sanitize_command_fixtures.py"
+      "${CMAKE_CURRENT_SOURCE_DIR}/shellsplit/tools/sanitize_command_fixtures.py"
+      "${shellclave_command_fixture_json}")
+  set_tests_properties(shellsplit_sanitize_command_fixtures
+    PROPERTIES LABELS "fixtures;shellsplit")
   target_compile_definitions(shellgate_io_test PRIVATE
     SHELLGATE_TEST_ALLOCATOR SHELLGATE_TEST_IO)
   target_include_directories(shellgate_io_test PRIVATE
@@ -355,32 +435,66 @@ if(SHELLCLAVE_BUILD_FUZZERS)
   endif()
   add_executable(fuzz_shellgate shellgate/fuzz/fuzz_shellgate.cpp)
   target_compile_definitions(fuzz_shellgate PRIVATE HAS_LIBFUZZER)
-  target_compile_features(fuzz_shellgate PRIVATE cxx_std_11)
+  target_compile_features(fuzz_shellgate PRIVATE cxx_std_17)
+  target_include_directories(fuzz_shellgate PRIVATE shellsplit/fuzz)
   target_compile_options(fuzz_shellgate PRIVATE -fsanitize=fuzzer,address,undefined)
   target_link_options(fuzz_shellgate PRIVATE -fsanitize=fuzzer,address,undefined)
   target_link_libraries(fuzz_shellgate PRIVATE shellgate)
 
-  foreach(fuzzer_name IN ITEMS shellgate shellsplit shelltype)
+  function(shellclave_stage_smoke_seeds fuzzer_name)
+    string(TOUPPER "${fuzzer_name}" fuzzer_upper)
+    set(manifest "${SHELLCLAVE_${fuzzer_upper}_SMOKE_SEEDS}")
     set(smoke_seed_dir
       "${CMAKE_CURRENT_SOURCE_DIR}/${fuzzer_name}/fuzz/smoke-seeds")
-    file(GLOB smoke_seed_files CONFIGURE_DEPENDS
-      "${smoke_seed_dir}/*")
+    if(NOT manifest)
+      message(FATAL_ERROR "${fuzzer_name} smoke seed manifest is empty")
+    endif()
+    set(smoke_seed_files)
+    foreach(smoke_seed_name IN LISTS manifest)
+      if(smoke_seed_name MATCHES "[/\\]" OR
+         smoke_seed_name MATCHES "^\\.\\.")
+        message(FATAL_ERROR
+          "${fuzzer_name} smoke seed manifest contains an unsafe filename: ${smoke_seed_name}")
+      endif()
+      set(smoke_seed "${smoke_seed_dir}/${smoke_seed_name}")
+      if(NOT EXISTS "${smoke_seed}" OR IS_DIRECTORY "${smoke_seed}")
+        message(FATAL_ERROR
+          "${fuzzer_name} smoke seed manifest entry is not a regular file: ${smoke_seed}")
+      endif()
+      list(APPEND smoke_seed_files "${smoke_seed}")
+    endforeach()
     list(LENGTH smoke_seed_files smoke_seed_count)
-    if(smoke_seed_count GREATER 61)
+    if(smoke_seed_count GREATER 64)
       message(FATAL_ERROR
-        "${fuzzer_name} smoke seed set exceeds the 61-file limit")
+        "${fuzzer_name} smoke seed set exceeds the 64-file limit")
     endif()
     set(smoke_seed_bytes 0)
     foreach(smoke_seed IN LISTS smoke_seed_files)
-      if(NOT IS_DIRECTORY "${smoke_seed}")
-        file(SIZE "${smoke_seed}" smoke_seed_size)
-        math(EXPR smoke_seed_bytes "${smoke_seed_bytes}+${smoke_seed_size}")
-      endif()
+      file(SIZE "${smoke_seed}" smoke_seed_size)
+      math(EXPR smoke_seed_bytes "${smoke_seed_bytes}+${smoke_seed_size}")
     endforeach()
     if(smoke_seed_bytes GREATER 1048576)
       message(FATAL_ERROR
         "${fuzzer_name} smoke seed set exceeds the 1 MiB size limit")
     endif()
+    set(smoke_seed_stage_dir
+      "${CMAKE_CURRENT_BINARY_DIR}/fuzz-smoke-seeds/${fuzzer_name}")
+    set(smoke_stage_commands)
+    foreach(smoke_seed IN LISTS smoke_seed_files)
+      list(APPEND smoke_stage_commands
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${smoke_seed}"
+          "${smoke_seed_stage_dir}")
+    endforeach()
+    add_custom_target(stage-${fuzzer_name}-smoke-seeds
+      COMMAND ${CMAKE_COMMAND} -E rm -rf "${smoke_seed_stage_dir}"
+      COMMAND ${CMAKE_COMMAND} -E make_directory "${smoke_seed_stage_dir}"
+      ${smoke_stage_commands})
+    set("SHELLCLAVE_${fuzzer_upper}_SMOKE_STAGE_DIR" "${smoke_seed_stage_dir}"
+        PARENT_SCOPE)
+  endfunction()
+
+  foreach(fuzzer_name IN ITEMS shellgate shellsplit shelltype)
+    shellclave_stage_smoke_seeds("${fuzzer_name}")
   endforeach()
 
   add_executable(fuzz_shellsplit shellsplit/fuzz/tokenizer_fuzzer.cpp)
@@ -408,32 +522,32 @@ if(SHELLCLAVE_BUILD_FUZZERS)
   add_custom_target(fuzz-shellsplit-smoke
     COMMAND /bin/bash ${CMAKE_CURRENT_SOURCE_DIR}/scripts/run_fuzz_smoke.sh
       $<TARGET_FILE:fuzz_shellsplit>
-      ${CMAKE_CURRENT_SOURCE_DIR}/shellsplit/fuzz/smoke-seeds
+      ${SHELLCLAVE_SHELLSPLIT_SMOKE_STAGE_DIR}
       ${CMAKE_CURRENT_BINARY_DIR}/fuzz-smoke-corpus/shellsplit
       ${SHELLCLAVE_FUZZ_RUNS}
       ${SHELLCLAVE_FUZZ_MAX_LEN}
       ${CMAKE_CURRENT_BINARY_DIR}/fuzz-artifacts/smoke/shellsplit_
-    DEPENDS fuzz_shellsplit
+    DEPENDS fuzz_shellsplit stage-shellsplit-smoke-seeds
     COMMENT "Running the unified Shellsplit fuzzer")
   add_custom_target(fuzz-shellgate-smoke
     COMMAND /bin/bash ${CMAKE_CURRENT_SOURCE_DIR}/scripts/run_fuzz_smoke.sh
       $<TARGET_FILE:fuzz_shellgate>
-      ${CMAKE_CURRENT_SOURCE_DIR}/shellgate/fuzz/smoke-seeds
+      ${SHELLCLAVE_SHELLGATE_SMOKE_STAGE_DIR}
       ${CMAKE_CURRENT_BINARY_DIR}/fuzz-smoke-corpus/shellgate
       ${SHELLCLAVE_FUZZ_RUNS}
       ${SHELLCLAVE_FUZZ_MAX_LEN}
       ${CMAKE_CURRENT_BINARY_DIR}/fuzz-artifacts/smoke/shellgate_
-    DEPENDS fuzz_shellgate
+    DEPENDS fuzz_shellgate stage-shellgate-smoke-seeds
     COMMENT "Running the Shellgate fuzzer")
   add_custom_target(fuzz-shelltype-smoke
     COMMAND /bin/bash ${CMAKE_CURRENT_SOURCE_DIR}/scripts/run_fuzz_smoke.sh
       $<TARGET_FILE:fuzz_shelltype>
-      ${CMAKE_CURRENT_SOURCE_DIR}/shelltype/fuzz/smoke-seeds
+      ${SHELLCLAVE_SHELLTYPE_SMOKE_STAGE_DIR}
       ${CMAKE_CURRENT_BINARY_DIR}/fuzz-smoke-corpus/shelltype
       ${SHELLCLAVE_FUZZ_RUNS}
       ${SHELLCLAVE_FUZZ_MAX_LEN}
       ${CMAKE_CURRENT_BINARY_DIR}/fuzz-artifacts/smoke/shelltype_
-    DEPENDS fuzz_shelltype
+    DEPENDS fuzz_shelltype stage-shelltype-smoke-seeds
     COMMENT "Running the Shelltype fuzzer")
   add_custom_target(fuzz-smoke
     DEPENDS fuzz-shellsplit-smoke fuzz-shellgate-smoke fuzz-shelltype-smoke
@@ -515,7 +629,7 @@ configure_package_config_file(cmake/ShellclaveConfig.cmake.in
   ${CMAKE_CURRENT_BINARY_DIR}/ShellclaveConfig.cmake
   INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/Shellclave)
 write_basic_package_version_file(${CMAKE_CURRENT_BINARY_DIR}/ShellclaveConfigVersion.cmake
-  VERSION ${PROJECT_VERSION} COMPATIBILITY SameMajorVersion)
+  VERSION ${PROJECT_VERSION} COMPATIBILITY SameMinorVersion)
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/ShellclaveConfig.cmake
   ${CMAKE_CURRENT_BINARY_DIR}/ShellclaveConfigVersion.cmake
   DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/Shellclave)

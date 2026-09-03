@@ -4,6 +4,8 @@
 #include <stdbool.h>
 #include <stddef.h>
 
+#include "shell_tokenizer.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -41,8 +43,8 @@ typedef enum {
   SHELL_TOKEN_OR,              // Logical OR
   SHELL_TOKEN_SUBSHELL_START,  // Subshell start
   SHELL_TOKEN_SUBSHELL_END,    // Subshell end
-  SHELL_TOKEN_GROUP_START,     // Parenthesized command-group start
-  SHELL_TOKEN_GROUP_END,       // Parenthesized command-group end
+  SHELL_TOKEN_GROUP_START,     // Command-group start
+  SHELL_TOKEN_GROUP_END,       // Command-group end
   SHELL_TOKEN_END,             // End of tokens
 
   // Extended types
@@ -55,7 +57,11 @@ typedef enum {
   SHELL_TOKEN_ARITHMETIC,      // $((expr))
   SHELL_TOKEN_PROCESS_SUB,     // <(command), >(command)
   SHELL_TOKEN_HEREDOC,         // << delimiter
-  SHELL_TOKEN_HERESTRING       // <<< here-string
+  SHELL_TOKEN_HERESTRING,      // <<< here-string
+
+  /* Kept at the end so existing token values remain stable. */
+  SHELL_TOKEN_REDIRECT_READ_WRITE, // <> input/output redirection
+  SHELL_TOKEN_REDIRECT_CLOBBER     // >| forced output redirection
 } shell_token_type_t;
 
 /**
@@ -68,7 +74,8 @@ typedef struct {
   size_t position;         // Position in original string
   bool is_quoted;          // True if token is quoted
   bool is_escaped;         // True if token contains escapes
-  size_t group_depth;      // Parenthesized command-group nesting depth
+  size_t group_depth;      // Enclosing command-group nesting depth
+  uint8_t group_kinds;     // shell_group_kind_t bitset of enclosing groups
 } shell_token_t;
 
 /**
@@ -79,7 +86,8 @@ typedef struct {
   size_t token_count;    // Number of tokens
   size_t start_pos;      // Start position in original string
   size_t end_pos;        // End position in original string
-  size_t group_depth;    // Parenthesized command-group nesting depth
+  size_t group_depth;    // Enclosing command-group nesting depth
+  uint8_t group_kinds;   // shell_group_kind_t bitset of enclosing groups
   bool has_variables;    // Contains variables ($VAR, ${VAR}, etc.)
   bool has_globs;        // Contains glob patterns (*, ?, [abc])
   bool has_subshells;    // Contains subshells ($(cmd), `cmd`)
@@ -87,24 +95,40 @@ typedef struct {
   bool has_loops;        // Contains loops (while, for, until)
   bool has_conditionals; // Contains conditionals (if/then/elif/else/fi)
   bool has_case;         // Contains case statements
-  bool has_groups;       // Contains parenthesized command groups
-  bool has_background;   // Contains background execution
+  bool has_groups;       // Contains command groups
+  bool ends_group;     // Last command content closes a group (redirections may
+                       // follow)
+  bool has_background; // Contains background execution
 } shell_command_t;
+
+/* Fixed-capacity heredoc declaration retained until the declaration line has
+ * ended and the corresponding data body can be skipped. */
+typedef struct {
+  size_t delimiter_position;
+  size_t delimiter_length;
+  bool strip_tabs;
+} shell_pending_heredoc_t;
 
 /**
  * Tokenizer state
  */
 typedef struct {
-  const char *input;  // Input string
-  size_t position;    // Current position
-  size_t length;      // Total length
-  bool in_quotes;     // Currently in quotes
-  bool in_subshell;   // Currently in subshell
-  char quote_char;    // Current quote character
-  int paren_depth;    // Parentheses depth
-  int brace_depth;    // Brace depth for ${VAR}
-  bool in_arithmetic; // Currently in arithmetic expansion
-  int arith_depth;    // Arithmetic expansion nesting depth ($((...))
+  const char *input;     // Input string
+  size_t position;       // Current position
+  size_t length;         // Total length
+  bool in_quotes;        // Currently in quotes
+  bool in_subshell;      // Currently in subshell
+  char quote_char;       // Current quote character
+  int paren_depth;       // Parentheses depth
+  int brace_depth;       // Brace depth for ${VAR}
+  int brace_group_depth; // POSIX brace-group nesting depth
+  uint8_t group_kinds;   // shell_group_kind_t bitset of enclosing groups
+  bool in_arithmetic;    // Currently in arithmetic expansion
+  int arith_depth;       // Arithmetic expansion nesting depth ($((...))
+
+  shell_pending_heredoc_t pending_heredocs[SHELL_MAX_SUBCOMMANDS];
+  size_t pending_heredoc_count;
+  bool heredoc_error;
 
   // Track keywords for feature detection
   int if_depth;   // Track if/then/fi nesting
@@ -120,9 +144,12 @@ bool shell_tokenizer_init(shell_tokenizer_state_t *state, const char *input,
                           size_t input_length);
 
 /**
- * Get next token. Returns false without advancing state when token is NULL.
- * When token is writable but state is NULL or exhausted, token is cleared and
- * set to SHELL_TOKEN_END.
+ * Get the next lexical token. A heredoc declaration is one
+ * SHELL_TOKEN_HEREDOC token spanning `<<` and its delimiter; its body and
+ * terminator are opaque data and are skipped after the declaration line.
+ * Returns false without advancing state when token is NULL. When token is
+ * writable but state is NULL or exhausted, token is cleared and set to
+ * SHELL_TOKEN_END.
  */
 bool shell_tokenizer_next(shell_tokenizer_state_t *state, shell_token_t *token);
 

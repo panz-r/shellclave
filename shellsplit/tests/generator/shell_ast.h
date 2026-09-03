@@ -10,6 +10,7 @@ typedef enum {
   AST_PIPELINE,
   AST_SEQUENCE,
   AST_SUBSHELL,
+  AST_BRACE_GROUP,
   AST_REDIRECT,
   AST_VARIABLE,
   AST_ARITHMETIC,
@@ -23,11 +24,22 @@ typedef enum {
   AST_BACKTICK,
 } ast_node_type_t;
 
+/* Test-only brace-group spellings.  The valid form is rendered as
+ * "{ list; }"; the other forms exercise delimiter validation. */
+typedef enum {
+  AST_BRACE_COMPLETE,
+  AST_BRACE_MISSING_SEPARATOR,
+  AST_BRACE_UNCLOSED,
+  AST_BRACE_CROSSED_SUBSHELL,
+} ast_brace_form_t;
+
 typedef struct ast_node {
   ast_node_type_t type;
-  struct ast_node *next;   // For chaining (pipeline, sequence)
-  struct ast_node *child;  // For subshell contents, redirects
-  char *value;             // Command name, variable name, etc.
+  struct ast_node *next;  // For chaining (pipeline, sequence)
+  struct ast_node *child; // For subshell contents, redirects
+  char *value;            // Command name, variable name, etc.
+  /* Loop iteration name or case pattern for control-compound test nodes. */
+  char *control_word;
   char *redirect_target;   // File for redirect
   int redirect_fd;         // File descriptor for redirect (-1 for none)
   bool is_input_redirect;  // true for <, false for >
@@ -38,6 +50,7 @@ typedef struct ast_node {
                            // true means double quote, false means single quote
   bool has_redirect;       // has redirect attached
   bool is_closing;         // for if/fi, case/esac, etc.
+  ast_brace_form_t brace_form;
 } ast_node_t;
 
 typedef struct {
@@ -83,6 +96,9 @@ ast_node_t *shell_ast_add_sequence(shell_ast_t *ast, ast_node_t *cmd1,
 
 // Subshell: ( cmd )
 ast_node_t *shell_ast_add_subshell(shell_ast_t *ast, ast_node_t *content);
+
+// POSIX brace group: { cmd; }
+ast_node_t *shell_ast_add_brace_group(shell_ast_t *ast, ast_node_t *content);
 
 // Redirect: cmd > file or cmd < file or cmd 2>&1
 ast_node_t *shell_ast_add_redirect(shell_ast_t *ast, ast_node_t *cmd,

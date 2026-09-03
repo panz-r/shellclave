@@ -189,6 +189,10 @@ static void test_abstraction_matrix(void) {
        "cat < $RD_1 >$RD_2 2>> $RD_3 2>&1", 3, FLAG_REDIRECTS},
       {"here-string target", "cat <<< \"$VALUE\"", "cat <<< $RD_1", 1,
        FLAG_REDIRECTS},
+      {"clobber redirect target", "echo x >| /tmp/clobber", "echo x >| $RD_1",
+       1, FLAG_REDIRECTS},
+      {"numbered clobber redirect target", "echo x 2>| /tmp/clobber",
+       "echo x 2>| $RD_1", 1, FLAG_REDIRECTS},
       {"heredoc is redirection", "cat <<EOF\npayload\nEOF",
        "cat <<EOF\npayload\nEOF", 0, FLAG_REDIRECTS},
   };
@@ -573,7 +577,7 @@ static void test_type_sequence_matrix(void) {
           netseq == NULL;
   TEST("nested type sequence validates every argument atomically", valid);
 
-  shell_process_limits_t limits = {SIZE_MAX, SIZE_MAX};
+  shell_process_limits_t limits = {SIZE_MAX, SIZE_MAX, 0};
   limits.max_string_bytes = 1;
   valid =
       shell_build_type_netseq("echo x", strlen("echo x"), &limits, &netseq,

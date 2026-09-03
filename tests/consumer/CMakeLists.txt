@@ -6,7 +6,9 @@ if(SHELLCLAVE_EMBEDDED_SOURCE)
   set(SHELLCLAVE_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
   add_subdirectory("${SHELLCLAVE_EMBEDDED_SOURCE}" shellclave)
 else()
-  find_package(Shellclave 0.1 CONFIG REQUIRED)
+  set(SHELLCLAVE_REQUIRED_VERSION "0.7.0" CACHE STRING
+      "Required Shellclave package version")
+  find_package(Shellclave ${SHELLCLAVE_REQUIRED_VERSION} CONFIG REQUIRED)
 endif()
 
 add_executable(shellclave_consumer main.c)

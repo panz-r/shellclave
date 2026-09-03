@@ -139,14 +139,33 @@ typedef struct {
   size_t netargv_length;
   const char *reject_reason;
 
+  /* Direct I/O plus I/O owned by an enclosing compound group. These are
+   * effective evaluation context counts, not claims of direct command edges. */
   uint32_t write_count;
   uint32_t read_count;
   uint32_t env_count;
+  /* True when a SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD route delivers
+   * runtime-generated word content directly to this command or to an
+   * enclosing compound group that it may inherit. A dynamic FILE-name route
+   * alone selects I/O topology and does not set this field. */
   bool requires_substitution_evaluation;
-  int32_t substitution_parent_index;
-  int32_t group_parent_index; /* Reserved for a future explicit group node. */
-  uint16_t group_depth;       /* Parenthesized group nesting depth. */
-  bool backgrounded;          /* Command runs in the background via '&'. */
+  /* True when any represented SUBST route reaches this command or an
+   * enclosing compound group. This includes dynamic FILE-name and ordinary
+   * process-substitution I/O; it describes topology, not code execution or
+   * risk. */
+  bool has_dynamic_substitution_io;
+  /* Replaces `substitution_parent_index`, removed in 0.7.0: result index of
+   * the unique simple-command consumer of this direct producer. A HEREDOC DOC
+   * indirection resolves to its READ owner; group, endpoint, and ambiguous
+   * routes remain -1. */
+  int32_t substitution_consumer_index;
+  /* Legacy field retained for source compatibility. Always -1: group nodes
+   * are graph-only and result entries describe simple commands. Use
+   * group_depth and group_kinds for command membership. */
+  int32_t group_parent_index;
+  uint16_t group_depth; /* Enclosing command-group nesting depth. */
+  uint8_t group_kinds;  /* shell_group_kind_t bitset of enclosing groups. */
+  bool backgrounded;    /* Command runs in the background via '&'. */
   uint32_t violation_category_flags;
   uint32_t violation_type_flags;
 } sg_subcommand_result_t;
@@ -156,6 +175,9 @@ typedef struct {
   uint32_t type;
   uint32_t category_flags;
   uint32_t severity;
+  /* Index of the dependency-graph execution endpoint responsible for this
+   * violation. It is a CMD node in the usual case and may be a GROUP node
+   * when the relevant stream is owned by a compound command. */
   uint32_t command_node_index;
   const char *description;
   const char *detail;
@@ -195,7 +217,15 @@ typedef struct {
   uint32_t violation_count;
   uint32_t violation_category_flags;
   uint32_t violation_type_flags;
+  /* True when a SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD route supplies
+   * runtime-generated word content, including one whose producer or consumer
+   * was not retained in the bounded result prefix. */
   bool requires_substitution_evaluation;
+  /* True when any represented dynamic substitution I/O path exists, including
+   * dynamic FILE-name or process-substitution descriptor routes whose endpoint
+   * was not retained in the bounded result prefix. This is not a risk
+   * classification. */
+  bool has_dynamic_substitution_io;
   uint32_t violation_dropped_count;
   bool has_violations;
 

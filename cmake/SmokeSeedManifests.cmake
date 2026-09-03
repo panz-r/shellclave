@@ -1,0 +1,84 @@
+# Curated, bounded inputs for the repository smoke fuzzers.  Keep these lists
+# explicit: libFuzzer writes hash-named discoveries beside a supplied corpus,
+# and those disposable files must never become implicit smoke-test inputs.
+
+set(SHELLCLAVE_SHELLGATE_SMOKE_SEEDS
+  basic_commands.txt
+  composition.txt
+  malformed.txt
+  paths.txt
+  policy_features.txt
+  quoted_bytes.txt
+  redirections.txt
+  substitution.txt)
+
+set(SHELLCLAVE_SHELLSPLIT_SMOKE_SEEDS
+  arithmetic.txt
+  arithmetic_loop.txt
+  assignment_and_export.txt
+  associative_array_stream.txt
+  background_operator.txt
+  backtick_substitution_quotes.txt
+  bare_separator.txt
+  basic_commands.txt
+  case_arithmetic_process_loop.txt
+  case_select.txt
+  comments_and_newlines.txt
+  composition.txt
+  compound_expansions.txt
+  compound_subshell.txt
+  conditional_expression.txt
+  control_features.txt
+  control_flow.txt
+  dense_arithmetic_status.txt
+  dense_array_arithmetic_loop.txt
+  dense_feature_path.txt
+  dense_function_pipeline_loop.txt
+  dense_functions_arrays.txt
+  dense_loop_pipeline_filter.txt
+  empty_commands.txt
+  escaped_quoting.txt
+  file_substitution.txt
+  function_definition.txt
+  glob_forms.txt
+  here_string.txt
+  heredoc.txt
+  leading_boolean.txt
+  line_continuation.txt
+  live_parameter_redirection.txt
+  long_pipeline.txt
+  loop_redirection.txt
+  malformed.txt
+  malformed_quotes.txt
+  mixed_composition.txt
+  nested_arithmetic_substitution.txt
+  nested_command_quotes.txt
+  nested_dataflow.txt
+  nested_quotes_escapes.txt
+  nested_substitution_quotes.txt
+  newline_sequence.txt
+  operator_adjacency.txt
+  parameter_expansion.txt
+  parameter_operators.txt
+  process_substitution_first.txt
+  process_substitution_multiple.txt
+  quoted_heredoc.txt
+  quoted_operators.txt
+  quoting_and_paths.txt
+  redirection_variants.txt
+  redirections.txt
+  select_loop.txt
+  special_variables.txt
+  substitution.txt
+  tab_heredoc.txt
+  trailing_separator.txt
+  unclosed_arithmetic.txt
+  unclosed_backtick.txt)
+
+set(SHELLCLAVE_SHELLTYPE_SMOKE_SEEDS
+  learner-and-normalize
+  learner-v4
+  policy-lifecycle
+  policy-parameters
+  serialized-policy
+  stateful-two-policy)

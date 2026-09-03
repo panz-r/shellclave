@@ -39,7 +39,7 @@ void shell_interop_free(shell_interop_handle_t *handle);
  *   SHELL_FEAT_CASE          = 0x200 // case/esac
  *   SHELL_FEAT_SUBSHELL_FILE = 0x400 // $(<file)
  *   SHELL_FEAT_PIPELINE       = 0x800 // literal | pipeline construct
- *   SHELL_FEAT_GROUP          = 0x1000 // parenthesized command group
+ *   SHELL_FEAT_GROUP          = 0x1000 // brace or parenthesized command group
  *
  * Command types (upper bits of type) describe the operator or structural
  * marker associated with one subcommand. The outer separator takes precedence

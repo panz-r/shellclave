@@ -17,6 +17,7 @@ extern "C" {
 /* --- CONSTANTS AND LIMITS --- */
 
 #define SHELL_MAX_SUBCOMMANDS 64 // Default max subcommands
+#define SHELL_MAX_GROUPS SHELL_MAX_SUBCOMMANDS
 
 /* --- TYPE DEFINITIONS --- */
 
@@ -55,6 +56,14 @@ typedef enum {
   SHELL_TYPE_BACKGROUND = 1 << 15,   // Preceded by a background '&'
 } shell_cmd_type_t;
 
+/* Kinds of enclosing command groups. Values are a bitset so mixed nesting is
+ * represented without losing an outer subshell boundary. */
+typedef enum {
+  SHELL_GROUP_NONE = 0,
+  SHELL_GROUP_BRACE = 1 << 0,
+  SHELL_GROUP_SUBSHELL = 1 << 1,
+} shell_group_kind_t;
+
 /**
  * Subcommand features - what's inside the subcommand
  */
@@ -72,7 +81,7 @@ typedef enum {
   SHELL_FEAT_CASE = 1 << 9,                  // case/esac statements
   SHELL_FEAT_SUBSHELL_FILE = 1 << 10,        // $(<file) - read from file
   SHELL_FEAT_PIPELINE = 1 << 11,             // literal | pipeline construct
-  SHELL_FEAT_GROUP = UINT32_C(1) << 12,      // Parenthesized command group
+  SHELL_FEAT_GROUP = UINT32_C(1) << 12,      // Command group
   SHELL_FEAT_BACKGROUND = UINT32_C(1) << 13, // Background execution
 } shell_cmd_features_t;
 
@@ -85,9 +94,10 @@ typedef struct {
 } shell_limits_t;
 
 /**
- * Strict mode rejects unterminated quotes, substitutions, parentheses, and
- * invalid parameter expansions. A single trailing semicolon is accepted as
- * a command-list terminator; trailing pipes and logical operators are not.
+ * Strict mode rejects unterminated quotes, substitutions, parentheses,
+ * top-level heredocs, and invalid parameter expansions. A single trailing
+ * semicolon is accepted as a command-list terminator; trailing pipes and
+ * logical operators are not.
  */
 
 /**
@@ -146,16 +156,35 @@ typedef struct {
   uint32_t len;         // Length
   uint16_t type;        // shell_cmd_type_t
   uint32_t features;    // shell_cmd_features_t
-  uint16_t group_depth; // Parenthesized command-group nesting depth
+  uint16_t group_depth; // Enclosing command-group nesting depth
+  uint8_t group_kinds;  // shell_group_kind_t bitset of enclosing groups
 } shell_range_t;
 
+/** A complete compound-command half-open span [start, end), including the
+ * delimiters. The command interval indexes the command collection returned
+ * beside this descriptor: shell_parse_result_t.cmds for a fast parse and
+ * shell_processed_commands_t.commands for a processed parse. Processed
+ * results remap the interval after structural ranges are omitted. parent is
+ * UINT16_MAX for a top-level group. */
+typedef struct {
+  uint32_t start;
+  uint32_t end;
+  uint16_t first_command;
+  uint16_t command_count;
+  uint16_t parent;
+  uint8_t kind; // Exactly one shell_group_kind_t value
+} shell_group_t;
+
 /**
- * Parse result - caller allocates this
- * Size: 64 * 12 + 8 = 776 bytes (for 64 max subcommands)
+ * Parse result - caller allocates this. Its fixed command and group capacities
+ * are SHELL_MAX_SUBCOMMANDS and SHELL_MAX_GROUPS; do not depend on a concrete
+ * byte size, which is ABI and compiler-layout dependent.
  */
 typedef struct {
   shell_range_t cmds[SHELL_MAX_SUBCOMMANDS]; // Subcommand ranges
+  shell_group_t groups[SHELL_MAX_GROUPS];    // Complete compound-group spans
   uint32_t count;                            // Number of subcommands found
+  uint32_t group_count;                      // Number of complete groups found
   uint32_t status;                           // shell_status_t flags
 } shell_parse_result_t;
 
@@ -173,8 +202,11 @@ typedef struct {
  * @param result    Caller-allocated result buffer
  * @return          SHELL_OK on success, error code otherwise
  *
- * On success, result contains ranges into cmd. On truncation, completed ranges
- * remain available and result->status includes SHELL_STATUS_TRUNCATED.
+ * On success, result contains ranges into cmd. Complete heredoc bodies are
+ * data, not executable ranges; their declaration remains a single
+ * SHELL_TYPE_HEREDOC range. Comment-only source spans yield no range. On
+ * truncation, completed ranges remain available and result->status includes
+ * SHELL_STATUS_TRUNCATED.
  */
 shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
                                const shell_limits_t *limits,

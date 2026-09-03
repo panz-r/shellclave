@@ -1,7 +1,8 @@
 set(staging "${SHELLCLAVE_BINARY_DIR}/consumer-install-staging")
 set(prefix "${SHELLCLAVE_BINARY_DIR}/consumer install relocated")
 set(build "${SHELLCLAVE_BINARY_DIR}/consumer installed build")
-file(REMOVE_RECURSE "${staging}" "${prefix}" "${build}")
+set(incompatible_build "${SHELLCLAVE_BINARY_DIR}/consumer incompatible build")
+file(REMOVE_RECURSE "${staging}" "${prefix}" "${build}" "${incompatible_build}")
 execute_process(COMMAND "${CMAKE_COMMAND}" --install "${SHELLCLAVE_BINARY_DIR}" --prefix "${staging}"
   RESULT_VARIABLE result)
 if(result)
@@ -53,6 +54,16 @@ execute_process(COMMAND "${CMAKE_COMMAND}" -S "${SHELLCLAVE_SOURCE_DIR}/tests/co
   "-DCMAKE_BUILD_TYPE=${SHELLCLAVE_BUILD_TYPE}" RESULT_VARIABLE result)
 if(result)
   message(FATAL_ERROR "Installed consumer configuration failed: ${result}")
+endif()
+execute_process(COMMAND "${CMAKE_COMMAND}" -S "${SHELLCLAVE_SOURCE_DIR}/tests/consumer" -B "${incompatible_build}"
+  -G "${SHELLCLAVE_GENERATOR}" "-DCMAKE_PREFIX_PATH=${prefix}"
+  "-DCMAKE_C_COMPILER=${SHELLCLAVE_C_COMPILER}"
+  "-DCMAKE_CXX_COMPILER=${SHELLCLAVE_CXX_COMPILER}"
+  "-DCMAKE_BUILD_TYPE=${SHELLCLAVE_BUILD_TYPE}"
+  "-DSHELLCLAVE_REQUIRED_VERSION=0.6.0" RESULT_VARIABLE incompatible_result)
+if(NOT incompatible_result)
+  message(FATAL_ERROR
+    "Installed 0.7 package unexpectedly satisfies an incompatible 0.6 request")
 endif()
 set(build_command "${CMAKE_COMMAND}" --build "${build}")
 if(SHELLCLAVE_BUILD_TYPE)

@@ -13,10 +13,13 @@ static const char *SUBSHELL_PLACEHOLDER = "TEMP_FILE";
 static bool is_shell_syntax_token(shell_token_type_t type) {
   return type == SHELL_TOKEN_PIPE || type == SHELL_TOKEN_REDIRECT_IN ||
          type == SHELL_TOKEN_REDIRECT_OUT || type == SHELL_TOKEN_REDIRECT_ERR ||
-         type == SHELL_TOKEN_REDIRECT_APPEND || type == SHELL_TOKEN_SEMICOLON ||
-         type == SHELL_TOKEN_AND || type == SHELL_TOKEN_BACKGROUND ||
-         type == SHELL_TOKEN_OR || type == SHELL_TOKEN_GROUP_START ||
-         type == SHELL_TOKEN_GROUP_END || type == SHELL_TOKEN_SUBSHELL_START ||
+         type == SHELL_TOKEN_REDIRECT_APPEND ||
+         type == SHELL_TOKEN_REDIRECT_READ_WRITE ||
+         type == SHELL_TOKEN_REDIRECT_CLOBBER ||
+         type == SHELL_TOKEN_SEMICOLON || type == SHELL_TOKEN_AND ||
+         type == SHELL_TOKEN_BACKGROUND || type == SHELL_TOKEN_OR ||
+         type == SHELL_TOKEN_GROUP_START || type == SHELL_TOKEN_GROUP_END ||
+         type == SHELL_TOKEN_SUBSHELL_START ||
          type == SHELL_TOKEN_SUBSHELL_END || type == SHELL_TOKEN_HEREDOC ||
          type == SHELL_TOKEN_HERESTRING || type == SHELL_TOKEN_PROCESS_SUB;
 }

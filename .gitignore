@@ -28,6 +28,7 @@ Testing/
 coverage.info
 coverage/
 htmlcov/
+__pycache__/
 core
 core.*
 

@@ -26,6 +26,7 @@ static void free_ast_node(ast_node_t *node) {
   free_ast_node(node->child);
   free_ast_node(node->next);
   free(node->value);
+  free(node->control_word);
   free(node->redirect_target);
   free(node);
 }
@@ -87,6 +88,18 @@ ast_node_t *shell_ast_add_subshell(shell_ast_t *ast, ast_node_t *content) {
     node->child = content;
     ast->node_count++;
     ast->has_subshell = true;
+  }
+  return node;
+}
+
+ast_node_t *shell_ast_add_brace_group(shell_ast_t *ast, ast_node_t *content) {
+  if (!ast)
+    return NULL;
+
+  ast_node_t *node = ast_node_create(AST_BRACE_GROUP);
+  if (node) {
+    node->child = content;
+    ast->node_count++;
   }
   return node;
 }
@@ -232,7 +245,17 @@ static size_t serialize_node(const ast_node_t *node, char *buffer,
     }
     /* Recursively serialize child nodes (args, vars, globs attached as
      * children) */
-    if (node->child) {
+    if (node->child && node->child->type == AST_SUBSHELL) {
+      /* A subshell attached to a simple command is command substitution, not
+       * an adjacent subshell control operator.  Serialize it with its `$`
+       * introducer and a separating space so the generated source is POSIX
+       * shell syntax. */
+      pos = append_str(buffer, buffer_size, pos, " $( ");
+      if (node->child->child)
+        pos = serialize_node(node->child->child, buffer, buffer_size, pos);
+      if (node->child->is_valid)
+        pos = append_str(buffer, buffer_size, pos, " )");
+    } else if (node->child) {
       pos = serialize_node(node->child, buffer, buffer_size, pos);
     }
     /* Handle redirects attached via child */
@@ -276,6 +299,22 @@ static size_t serialize_node(const ast_node_t *node, char *buffer,
     if (node->is_valid) {
       pos = append_str(buffer, buffer_size, pos, " )");
     }
+    break;
+
+  case AST_BRACE_GROUP:
+    pos = append_str(buffer, buffer_size, pos,
+                     node->brace_form == AST_BRACE_CROSSED_SUBSHELL ? "{ ( "
+                                                                    : "{ ");
+    if (node->child)
+      pos = serialize_node(node->child, buffer, buffer_size, pos);
+    if (node->brace_form == AST_BRACE_COMPLETE && node->is_valid)
+      pos = append_str(buffer, buffer_size, pos, "; } ");
+    else if (node->brace_form == AST_BRACE_MISSING_SEPARATOR)
+      pos = append_str(buffer, buffer_size, pos, " } ");
+    else if (node->brace_form == AST_BRACE_CROSSED_SUBSHELL)
+      pos = append_str(buffer, buffer_size, pos, "; } ");
+    else
+      pos = append_str(buffer, buffer_size, pos, "; ");
     break;
 
   case AST_REDIRECT:
@@ -360,6 +399,9 @@ static size_t serialize_node(const ast_node_t *node, char *buffer,
     if (node->value)
       pos = append_str(buffer, buffer_size, pos, node->value);
     pos = append_str(buffer, buffer_size, pos, " in ");
+    pos = append_str(buffer, buffer_size, pos,
+                     node->control_word ? node->control_word : "*");
+    pos = append_str(buffer, buffer_size, pos, ") ");
     if (node->child) {
       pos = serialize_node(node->child, buffer, buffer_size, pos);
     }
@@ -374,12 +416,12 @@ static size_t serialize_node(const ast_node_t *node, char *buffer,
     if (node->child) {
       pos = serialize_node(node->child, buffer, buffer_size, pos);
     }
-    pos = append_str(buffer, buffer_size, pos, " then ");
+    pos = append_str(buffer, buffer_size, pos, "; then ");
     if (node->next) {
       pos = serialize_node(node->next, buffer, buffer_size, pos);
     }
     if (node->is_valid) {
-      pos = append_str(buffer, buffer_size, pos, " fi");
+      pos = append_str(buffer, buffer_size, pos, "; fi");
     }
     break;
 
@@ -387,15 +429,20 @@ static size_t serialize_node(const ast_node_t *node, char *buffer,
     if (node->value)
       pos = append_str(buffer, buffer_size, pos, node->value);
     pos = append_str(buffer, buffer_size, pos, " ");
+    if (node->value && strcmp(node->value, "for") == 0) {
+      pos = append_str(buffer, buffer_size, pos,
+                       node->control_word ? node->control_word : "i");
+      pos = append_str(buffer, buffer_size, pos, " in ");
+    }
     if (node->next) {
       pos = serialize_node(node->next, buffer, buffer_size, pos);
     }
-    pos = append_str(buffer, buffer_size, pos, " do ");
+    pos = append_str(buffer, buffer_size, pos, "; do ");
     if (node->child) {
       pos = serialize_node(node->child, buffer, buffer_size, pos);
     }
     if (node->is_valid) {
-      pos = append_str(buffer, buffer_size, pos, " done");
+      pos = append_str(buffer, buffer_size, pos, "; done");
     }
     break;
 
@@ -505,11 +552,11 @@ ast_node_t *shell_ast_add_loop(shell_ast_t *ast, const char *type,
                                ast_node_t *body) {
   if (!ast)
     return NULL;
-  (void)var; // Reserved for future use
 
   ast_node_t *node = ast_node_create(AST_LOOP);
   if (node) {
     node->value = strdup(type ? type : "while");
+    node->control_word = strdup(var ? var : "i");
     node->child = body;
     node->next = list;
     ast->node_count++;
@@ -522,11 +569,11 @@ ast_node_t *shell_ast_add_case(shell_ast_t *ast, const char *var,
                                const char *pattern, ast_node_t *body) {
   if (!ast)
     return NULL;
-  (void)pattern; // Reserved for future use
 
   ast_node_t *node = ast_node_create(AST_CASE);
   if (node) {
     node->value = strdup(var ? var : "$VAR");
+    node->control_word = strdup(pattern ? pattern : "*");
     node->child = body; // pattern list
     ast->node_count++;
     ast->has_case = true;
@@ -735,15 +782,9 @@ bool shell_ast_is_valid(const shell_ast_t *ast) {
 bool shell_ast_expects_parse_success(const shell_ast_t *ast) {
   if (!ast)
     return false;
-  // Valid if: has valid structure AND no unclosed syntax
-  // Exception: Heredocs - bash is lenient and accepts unclosed heredocs with
-  // warning So we don't fail on has_valid_structure if the only issue is
-  // heredoc
-  if (ast->has_heredoc && !ast->has_valid_structure) {
-    // Only fail if there are OTHER issues besides heredoc
-    return !ast->has_unclosed_quote && !ast->has_unclosed_paren &&
-           !ast->has_unclosed_brace;
-  }
+  /* Strict parsing requires every heredoc declaration to have its terminator.
+   * The permissive lexical API still accepts an unfinished document, but this
+   * generator verifies the strict structural contract. */
   return ast->has_valid_structure && !ast->has_unclosed_quote &&
          !ast->has_unclosed_paren && !ast->has_unclosed_brace;
 }

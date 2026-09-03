@@ -823,7 +823,11 @@ static sg_error_t errno_to_gate_error(void) {
 }
 
 static sg_error_t process_status_to_gate_error(shell_process_status_t status) {
-  return status == SHELL_PROCESS_ENOMEM ? SG_ERR_MEMORY : SG_ERR_PARSE;
+  if (status == SHELL_PROCESS_ENOMEM)
+    return SG_ERR_MEMORY;
+  if (status == SHELL_PROCESS_EOUTPUT_LIMIT)
+    return SG_ERR_TRUNC;
+  return SG_ERR_PARSE;
 }
 
 static int stream_size(FILE *stream, uint64_t *size) {
@@ -1409,8 +1413,8 @@ static const char *build_cmd_string(const shell_dep_cmd_t *cmd,
         *build_error = SG_ERR_EXPAND;
         return NULL;
       }
-    } else if (shell_measure_decoded_word(word->text, word->text_length,
-                                          &word->payload_length) !=
+    } else if (shell_measure_processed_word(word->text, word->text_length,
+                                            &word->payload_length) !=
                SHELL_PROCESS_OK) {
       bw_mark_overflow(bw);
       return NULL;
@@ -1477,10 +1481,10 @@ static const char *build_cmd_string(const shell_dep_cmd_t *cmd,
       return NULL;
     }
     size_t written = 0;
-    if (shell_write_decoded_word(word->text, word->text_length,
-                                 encoded + encoded_used + prefix_length,
-                                 word->payload_length,
-                                 &written) != SHELL_PROCESS_OK ||
+    if (shell_write_processed_word(word->text, word->text_length,
+                                   encoded + encoded_used + prefix_length,
+                                   word->payload_length,
+                                   &written) != SHELL_PROCESS_OK ||
         written != word->payload_length) {
       bw_mark_overflow(bw);
       return NULL;
@@ -1516,7 +1520,7 @@ static const char *check_features(const shell_parse_result_t *fast,
       {SHELL_FEAT_GLOBS, "glob expansion"},
       {SHELL_FEAT_SUBSHELL_FILE, "file command substitution"},
       {SHELL_FEAT_PIPELINE, "pipeline"},
-      {SHELL_FEAT_GROUP, "parenthesized command group"},
+      {SHELL_FEAT_GROUP, "command group"},
       {SHELL_FEAT_BACKGROUND, "background execution"},
   };
 
@@ -1685,22 +1689,85 @@ static bool sg_name_found(const char *needle, uint32_t needle_len,
   return false;
 }
 
-/* Prefix-match linear search on sorted path array.
- * For small arrays (max 32 entries), linear search is faster than binary search
- * due to better cache locality. The array is kept sorted (shorter paths first).
- * Returns true and sets *out_idx if a matching prefix is found. */
-static bool sg_path_found(const char *path, uint32_t path_len,
-                          const char *const *sorted_paths, uint32_t count,
-                          uint32_t *out_idx) {
+/* Graph document paths retain their original source spelling for diagnostics.
+ * Traverse an isolated shell word without materializing its decoded form so
+ * every literal path rule applies the same quote and backslash semantics. A
+ * false callback result stops traversal after a decisive match or mismatch. */
+typedef bool (*sg_decoded_word_visitor_t)(char byte, size_t decoded_pos,
+                                          void *context);
+
+static void sg_visit_decoded_word(const char *word, uint32_t word_len,
+                                  sg_decoded_word_visitor_t visitor,
+                                  void *context) {
+  char quote = '\0';
+  size_t decoded_pos = 0;
+  for (uint32_t pos = 0; pos < word_len; pos++) {
+    char byte = word[pos];
+    bool emit = true;
+    if (quote == '\0' && (byte == '\'' || byte == '"')) {
+      quote = byte;
+      emit = false;
+    } else if (quote != '\0' && byte == quote) {
+      quote = '\0';
+      emit = false;
+    } else if (byte == '\\' && quote != '\'' && pos + 1 < word_len) {
+      char next = word[pos + 1];
+      if (quote == '\0' || next == '$' || next == '`' || next == '"' ||
+          next == '\\' || next == '\n') {
+        pos++;
+        byte = next;
+        emit = next != '\n';
+      }
+    }
+    if (!emit)
+      continue;
+    if (!visitor(byte, decoded_pos, context))
+      return;
+    decoded_pos++;
+  }
+}
+
+typedef struct {
+  const char *prefix;
+  size_t prefix_len;
+  size_t decoded_len;
+  char first_after_prefix;
+  bool matches;
+} sg_decoded_prefix_match_t;
+
+static bool sg_decoded_prefix_visit(char byte, size_t decoded_pos,
+                                    void *context) {
+  sg_decoded_prefix_match_t *match = context;
+  if (decoded_pos < match->prefix_len && byte != match->prefix[decoded_pos]) {
+    match->matches = false;
+    return false;
+  }
+  if (decoded_pos == match->prefix_len)
+    match->first_after_prefix = byte;
+  match->decoded_len = decoded_pos + 1;
+  return true;
+}
+
+static bool sg_decoded_path_found(const char *word, uint32_t word_len,
+                                  const char *const *sorted_paths,
+                                  uint32_t count, uint32_t *out_idx) {
   for (uint32_t i = 0; i < count; i++) {
     const char *prefix = sorted_paths[i];
-    size_t plen = strlen(prefix);
-    if (plen == 0)
+    size_t prefix_len = strlen(prefix);
+    if (prefix_len == 0)
       continue;
-    bool exact = path_len == plen;
+
+    sg_decoded_prefix_match_t match = {
+        .prefix = prefix,
+        .prefix_len = prefix_len,
+        .matches = true,
+    };
+    sg_visit_decoded_word(word, word_len, sg_decoded_prefix_visit, &match);
+    bool exact = match.decoded_len == prefix_len;
     bool child =
-        path_len > plen && (prefix[plen - 1] == '/' || path[plen] == '/');
-    if ((exact || child) && memcmp(path, prefix, plen) == 0) {
+        match.decoded_len > prefix_len &&
+        (prefix[prefix_len - 1] == '/' || match.first_after_prefix == '/');
+    if (match.matches && (exact || child)) {
       *out_idx = i;
       return true;
     }
@@ -1708,16 +1775,52 @@ static bool sg_path_found(const char *path, uint32_t path_len,
   return false;
 }
 
-static bool path_contains(const char *path, uint32_t path_len,
-                          const char *needle) {
-  size_t nlen = strlen(needle);
-  if (path_len < nlen)
-    return false;
-  for (uint32_t i = 0; i <= path_len - nlen; i++) {
-    if (memcmp(path + i, needle, nlen) == 0)
-      return true;
+typedef struct {
+  const char *needle;
+  size_t needle_len;
+  size_t matched_len;
+  bool found;
+} sg_decoded_contains_match_t;
+
+/* Return the longest proper prefix of needle[0, matched_len) that is also a
+ * suffix. Configuration values are small path fragments, so recomputing this
+ * fallback avoids allocating a KMP table for every graph document. */
+static size_t sg_decoded_match_fallback(const char *needle,
+                                        size_t matched_len) {
+  for (size_t candidate = matched_len - 1; candidate > 0; candidate--) {
+    if (memcmp(needle, needle + matched_len - candidate, candidate) == 0)
+      return candidate;
   }
-  return false;
+  return 0;
+}
+
+static bool sg_decoded_contains_visit(char byte, size_t decoded_pos,
+                                      void *context) {
+  (void)decoded_pos;
+  sg_decoded_contains_match_t *match = context;
+  while (match->matched_len > 0 && byte != match->needle[match->matched_len])
+    match->matched_len =
+        sg_decoded_match_fallback(match->needle, match->matched_len);
+  if (byte == match->needle[match->matched_len])
+    match->matched_len++;
+  if (match->matched_len == match->needle_len) {
+    match->found = true;
+    return false;
+  }
+  return true;
+}
+
+static bool sg_decoded_path_contains(const char *word, uint32_t word_len,
+                                     const char *needle) {
+  size_t needle_len = strlen(needle);
+  if (needle_len == 0)
+    return false;
+  sg_decoded_contains_match_t match = {
+      .needle = needle,
+      .needle_len = needle_len,
+  };
+  sg_visit_decoded_word(word, word_len, sg_decoded_contains_visit, &match);
+  return match.found;
 }
 
 static bool tok_equals(const char *tok, uint32_t tok_len, const char *str) {
@@ -1872,6 +1975,145 @@ static bool has_control_flow_path(const shell_dep_graph_t *g, uint32_t from,
   return false;
 }
 
+/* Group-owned I/O is real context for every contained command, but it remains
+ * attached to the GROUP node in the dependency graph. Derive that context at
+ * evaluation time instead of inventing command-to-document edges. */
+static void sg_group_context(const shell_dep_graph_t *graph,
+                             uint32_t command_index, const uint32_t *node_viols,
+                             const uint32_t *node_write_count,
+                             const uint32_t *node_read_count,
+                             uint32_t *violations, uint32_t *write_count,
+                             uint32_t *read_count) {
+  bool visited[SHELL_DEP_MAX_NODES] = {false};
+  uint32_t stack[SHELL_DEP_MAX_NODES];
+  size_t stack_count = 0;
+  stack[stack_count++] = command_index;
+  while (stack_count > 0) {
+    uint32_t child = stack[--stack_count];
+    for (uint32_t i = 0; i < graph->edge_count; i++) {
+      const shell_dep_edge_t *edge = &graph->edges[i];
+      if (edge->type != SHELL_EDGE_GROUP || edge->to != child ||
+          graph->nodes[edge->from].type != SHELL_NODE_GROUP ||
+          visited[edge->from])
+        continue;
+      visited[edge->from] = true;
+      *violations |= node_viols[edge->from];
+      *write_count += node_write_count[edge->from];
+      *read_count += node_read_count[edge->from];
+      if (stack_count < SHELL_DEP_MAX_NODES)
+        stack[stack_count++] = edge->from;
+    }
+  }
+}
+
+/* SUBST may start at a CMD/GROUP directly or at an ENDPOINT collector. Follow
+ * only data-flow predecessors that feed that dynamic stream so the sensitive
+ * substitution signal survives pipelines, nested substitutions, grouping, and
+ * multi-producer collection without inventing command-to-command edges. */
+static bool sg_substitution_source_sensitive(const shell_dep_graph_t *graph,
+                                             uint32_t source,
+                                             const sg_violation_config_t *cfg,
+                                             uint32_t *document_index) {
+  bool visited[SHELL_DEP_MAX_NODES] = {false};
+  uint32_t stack[SHELL_DEP_MAX_NODES];
+  size_t stack_count = 0;
+  if (source >= graph->node_count)
+    return false;
+  stack[stack_count++] = source;
+  while (stack_count > 0) {
+    uint32_t current = stack[--stack_count];
+    if (visited[current])
+      continue;
+    visited[current] = true;
+    const shell_dep_node_t *current_node = &graph->nodes[current];
+    if (current_node->type == SHELL_NODE_DOC &&
+        current_node->doc.kind == SHELL_DOC_FILE) {
+      uint32_t ignored;
+      if (sg_decoded_path_found(current_node->doc.path,
+                                current_node->doc.path_len,
+                                cfg->sensitive_read_paths,
+                                cfg->sensitive_read_path_count, &ignored)) {
+        *document_index = current;
+        return true;
+      }
+    }
+    for (uint32_t ei = 0; ei < graph->edge_count; ei++) {
+      const shell_dep_edge_t *edge = &graph->edges[ei];
+      uint32_t candidate = UINT32_MAX;
+      if (edge->type == SHELL_EDGE_READ && edge->to == current)
+        candidate = edge->from;
+      else if (edge->type == SHELL_EDGE_ARG && edge->from == current)
+        candidate = edge->to;
+      else if ((edge->type == SHELL_EDGE_PIPE ||
+                edge->type == SHELL_EDGE_SUBST) &&
+               edge->to == current)
+        candidate = edge->from;
+      else if (current_node->type == SHELL_NODE_ENDPOINT &&
+               edge->type == SHELL_EDGE_WRITE && edge->to == current)
+        candidate = edge->from;
+      else if (current_node->type == SHELL_NODE_GROUP &&
+               edge->type == SHELL_EDGE_GROUP && edge->from == current)
+        candidate = edge->to;
+      if (candidate == UINT32_MAX)
+        continue;
+      if (candidate < graph->node_count && !visited[candidate] &&
+          stack_count < SHELL_DEP_MAX_NODES)
+        stack[stack_count++] = candidate;
+    }
+  }
+  return false;
+}
+
+/* A SUBST edge terminates at the execution endpoint in the ordinary case.
+ * Expandable heredocs and here-strings are document indirections: dynamic
+ * bytes first enter the DOC, then its READ edge supplies the command or group
+ * that owns the descriptor. A dynamic FILE name similarly reaches the owner
+ * through its FILE I/O edge, but remains topology only rather than a
+ * shell-word inspection dependency. */
+static uint32_t
+sg_substitution_consumers(const shell_dep_graph_t *graph, uint32_t target,
+                          uint32_t edge_flags,
+                          uint32_t consumers[SHELL_DEP_MAX_NODES]) {
+  if (target >= graph->node_count)
+    return 0;
+  const shell_dep_node_t *node = &graph->nodes[target];
+  if (node->type == SHELL_NODE_CMD || node->type == SHELL_NODE_GROUP) {
+    consumers[0] = target;
+    return 1;
+  }
+  if (node->type != SHELL_NODE_DOC)
+    return 0;
+
+  uint32_t count = 0;
+  for (uint32_t edge_index = 0; edge_index < graph->edge_count; edge_index++) {
+    const shell_dep_edge_t *edge = &graph->edges[edge_index];
+    uint32_t consumer = UINT32_MAX;
+    if ((node->doc.kind == SHELL_DOC_HEREDOC ||
+         node->doc.kind == SHELL_DOC_HERESTRING) &&
+        edge->type == SHELL_EDGE_READ && edge->from == target)
+      consumer = edge->to;
+    else if (node->doc.kind == SHELL_DOC_FILE &&
+             (node->doc.flags & SHELL_DEP_DOC_FLAG_DYNAMIC_NAME) != 0 &&
+             (edge_flags & SHELL_DEP_EDGE_FLAG_SUBST_DYNAMIC_NAME) != 0 &&
+             ((edge->type == SHELL_EDGE_READ && edge->from == target) ||
+              ((edge->type == SHELL_EDGE_WRITE ||
+                edge->type == SHELL_EDGE_APPEND) &&
+               edge->to == target)))
+      consumer = edge->type == SHELL_EDGE_READ ? edge->to : edge->from;
+    if (consumer >= graph->node_count)
+      continue;
+    shell_dep_node_type_t type = graph->nodes[consumer].type;
+    if (type != SHELL_NODE_CMD && type != SHELL_NODE_GROUP)
+      continue;
+    bool duplicate = false;
+    for (uint32_t previous = 0; previous < count; previous++)
+      duplicate = duplicate || consumers[previous] == consumer;
+    if (!duplicate && count < SHELL_DEP_MAX_NODES)
+      consumers[count++] = consumer;
+  }
+  return count;
+}
+
 /* --- VIOLATION SCANNING ENGINE --- */
 
 static void
@@ -1892,11 +2134,12 @@ sg_violation_scan(const shell_dep_graph_t *graph,
     const shell_dep_node_t *to_node = &graph->nodes[e->to];
 
     /* --- Per-node edge counters --- */
-    if (from_node->type == SHELL_NODE_CMD) {
+    if (from_node->type == SHELL_NODE_CMD ||
+        from_node->type == SHELL_NODE_GROUP) {
       if (e->type == SHELL_EDGE_WRITE || e->type == SHELL_EDGE_APPEND)
         cmd_write_count[e->from]++;
     }
-    if (to_node->type == SHELL_NODE_CMD) {
+    if (to_node->type == SHELL_NODE_CMD || to_node->type == SHELL_NODE_GROUP) {
       if (e->type == SHELL_EDGE_READ)
         cmd_read_count[e->to]++;
       if (e->type == SHELL_EDGE_ENV)
@@ -1908,9 +2151,9 @@ sg_violation_scan(const shell_dep_graph_t *graph,
         to_node->type == SHELL_NODE_DOC &&
         to_node->doc.kind == SHELL_DOC_FILE) {
       uint32_t idx;
-      if (sg_path_found(to_node->doc.path, to_node->doc.path_len,
-                        cfg->sensitive_write_paths,
-                        cfg->sensitive_write_path_count, &idx)) {
+      if (sg_decoded_path_found(to_node->doc.path, to_node->doc.path_len,
+                                cfg->sensitive_write_paths,
+                                cfg->sensitive_write_path_count, &idx)) {
         const char *desc = bw_printf(bw, "writes to sensitive path");
         const char *det = bw_copy(bw, to_node->doc.path, to_node->doc.path_len);
         emit_violation(violations, violation_count, max_violations,
@@ -1950,32 +2193,23 @@ sg_violation_scan(const shell_dep_graph_t *graph,
 
     /* --- SG_VIOL_SUBST_SENSITIVE --- */
     if (e->type == SHELL_EDGE_SUBST) {
-      uint32_t sub_cmd = e->from;
-      for (uint32_t ej = 0; ej < graph->edge_count && !bw->overflow; ej++) {
-        const shell_dep_edge_t *re = &graph->edges[ej];
-        uint32_t doc_idx;
-        if (re->type == SHELL_EDGE_READ && re->to == sub_cmd) {
-          doc_idx = re->from;
-        } else if (re->type == SHELL_EDGE_ARG && re->from == sub_cmd) {
-          doc_idx = re->to;
-        } else {
-          continue;
-        }
+      uint32_t doc_idx;
+      if (sg_substitution_source_sensitive(graph, e->from, cfg, &doc_idx)) {
         const shell_dep_node_t *doc = &graph->nodes[doc_idx];
-        if (doc->type != SHELL_NODE_DOC || doc->doc.kind != SHELL_DOC_FILE)
-          continue;
-        uint32_t idx;
-        if (sg_path_found(doc->doc.path, doc->doc.path_len,
-                          cfg->sensitive_read_paths,
-                          cfg->sensitive_read_path_count, &idx)) {
+        *violation_type_flags |= SG_VIOL_SUBST_SENSITIVE;
+        uint32_t consumers[SHELL_DEP_MAX_NODES];
+        uint32_t consumer_count =
+            sg_substitution_consumers(graph, e->to, e->flags, consumers);
+        for (uint32_t consumer_index = 0;
+             consumer_index < consumer_count && !bw->overflow;
+             consumer_index++) {
           const char *desc = bw_printf(bw, "subshell reads sensitive file");
           const char *det = bw_copy(bw, doc->doc.path, doc->doc.path_len);
           emit_violation(violations, violation_count, max_violations,
                          violation_dropped, SG_VIOL_SUBST_SENSITIVE,
-                         SG_SEVERITY_HIGH, e->to, desc, det);
-          node_viols[e->to] |= SG_VIOL_SUBST_SENSITIVE;
-          *violation_type_flags |= SG_VIOL_SUBST_SENSITIVE;
-          break;
+                         SG_SEVERITY_HIGH, consumers[consumer_index], desc,
+                         det);
+          node_viols[consumers[consumer_index]] |= SG_VIOL_SUBST_SENSITIVE;
         }
       }
     }
@@ -1999,8 +2233,9 @@ sg_violation_scan(const shell_dep_graph_t *graph,
       if (doc->type != SHELL_NODE_DOC || doc->doc.kind != SHELL_DOC_FILE)
         continue;
       uint32_t idx;
-      if (sg_path_found(doc->doc.path, doc->doc.path_len, cfg->sensitive_dirs,
-                        cfg->sensitive_dir_count, &idx)) {
+      if (sg_decoded_path_found(doc->doc.path, doc->doc.path_len,
+                                cfg->sensitive_dirs, cfg->sensitive_dir_count,
+                                &idx)) {
         const char *desc = bw_printf(bw, "removal of system directory");
         const char *det = bw_copy(bw, doc->doc.path, doc->doc.path_len);
         emit_violation(violations, violation_count, max_violations,
@@ -2057,7 +2292,8 @@ sg_violation_scan(const shell_dep_graph_t *graph,
 
   /* --- SG_VIOL_REDIRECT_FANOUT --- */
   for (uint32_t ni = 0; ni < graph->node_count && !bw->overflow; ni++) {
-    if (graph->nodes[ni].type != SHELL_NODE_CMD)
+    if (graph->nodes[ni].type != SHELL_NODE_CMD &&
+        graph->nodes[ni].type != SHELL_NODE_GROUP)
       continue;
     if (cmd_write_count[ni] > cfg->redirect_fanout_threshold) {
       const char *desc = bw_printf(
@@ -2129,8 +2365,9 @@ sg_violation_scan(const shell_dep_graph_t *graph,
       const shell_dep_node_t *doc = &graph->nodes[e->to];
       if (doc->type != SHELL_NODE_DOC || doc->doc.kind != SHELL_DOC_FILE)
         continue;
-      if (sg_path_found(doc->doc.path, doc->doc.path_len, cfg->sensitive_dirs,
-                        cfg->sensitive_dir_count, &idx)) {
+      if (sg_decoded_path_found(doc->doc.path, doc->doc.path_len,
+                                cfg->sensitive_dirs, cfg->sensitive_dir_count,
+                                &idx)) {
         const char *desc =
             bw_printf(bw, "recursive permission change on system dir");
         const char *det = bw_copy(bw, doc->doc.path, doc->doc.path_len);
@@ -2238,8 +2475,8 @@ sg_violation_scan(const shell_dep_graph_t *graph,
       if (doc->type != SHELL_NODE_DOC || doc->doc.kind != SHELL_DOC_FILE)
         continue;
       for (uint32_t p = 0; p < cfg->sensitive_secret_path_count; p++) {
-        if (path_contains(doc->doc.path, doc->doc.path_len,
-                          cfg->sensitive_secret_paths[p])) {
+        if (sg_decoded_path_contains(doc->doc.path, doc->doc.path_len,
+                                     cfg->sensitive_secret_paths[p])) {
           const char *desc = bw_printf(bw, "reading secret file");
           const char *det = bw_copy(bw, doc->doc.path, doc->doc.path_len);
           emit_violation(violations, violation_count, max_violations,
@@ -2548,8 +2785,8 @@ sg_violation_scan(const shell_dep_graph_t *graph,
       if (doc->type != SHELL_NODE_DOC || doc->doc.kind != SHELL_DOC_FILE)
         continue;
       for (uint32_t p = 0; p < cfg->shell_profile_path_count; p++) {
-        if (path_contains(doc->doc.path, doc->doc.path_len,
-                          cfg->shell_profile_paths[p])) {
+        if (sg_decoded_path_contains(doc->doc.path, doc->doc.path_len,
+                                     cfg->shell_profile_paths[p])) {
           const char *desc =
               bw_printf(bw, "writing to shell profile/ssh config");
           const char *det = bw_copy(bw, doc->doc.path, doc->doc.path_len);
@@ -2584,6 +2821,67 @@ static uint32_t sg_violation_categories(uint32_t types) {
 }
 
 /* --- EVALUATION --- */
+
+/* A group-level dynamic stream is inherited by every simple command it
+ * contains unless the caller later resolves more detailed program semantics.
+ * Keep the public result safe without inventing a direct producer-to-command
+ * edge: a GROUP remains the authoritative graph consumer. */
+static void sg_mark_group_substitution_consumers(
+    const shell_dep_graph_t *graph, const uint32_t *node_result_index,
+    uint32_t group_node, bool shell_word, sg_result_t *out) {
+  if (group_node >= graph->node_count ||
+      graph->nodes[group_node].type != SHELL_NODE_GROUP)
+    return;
+
+  /* A substitution graph can have source text inside this group's span while
+   * remaining an independent graph fragment. Only GROUP edges express the
+   * structural descendants that inherit a group descriptor. */
+  bool visited[SHELL_DEP_MAX_NODES] = {false};
+  uint32_t pending[SHELL_DEP_MAX_NODES];
+  uint32_t pending_count = 0;
+  visited[group_node] = true;
+  pending[pending_count++] = group_node;
+  while (pending_count > 0) {
+    uint32_t current = pending[--pending_count];
+    for (uint32_t edge_index = 0; edge_index < graph->edge_count;
+         edge_index++) {
+      const shell_dep_edge_t *edge = &graph->edges[edge_index];
+      if (edge->type != SHELL_EDGE_GROUP || edge->from != current ||
+          edge->to >= graph->node_count)
+        continue;
+      uint32_t node = edge->to;
+      if (graph->nodes[node].type == SHELL_NODE_GROUP && !visited[node]) {
+        visited[node] = true;
+        pending[pending_count++] = node;
+      }
+      if (graph->nodes[node].type != SHELL_NODE_CMD ||
+          node_result_index[node] == UINT32_MAX)
+        continue;
+      sg_subcommand_result_t *result =
+          &out->subcommands[node_result_index[node]];
+      result->has_dynamic_substitution_io = true;
+      if (shell_word) {
+        result->requires_substitution_evaluation = true;
+      }
+      if (shell_word && result->verdict == SG_VERDICT_ALLOW)
+        result->verdict = SG_VERDICT_ALLOW_CONDITIONAL;
+    }
+  }
+}
+
+/* Rejections before per-command evaluation still expose one synthetic result.
+ * Preserve the documented sentinel metadata instead of leaving zeroed indices
+ * that could be mistaken for a relationship to result zero. */
+static void sg_init_rejected_subcommand(sg_result_t *out,
+                                        const char *reject_reason) {
+  out->subcommand_count = 1;
+  out->subcommands[0] = (sg_subcommand_result_t){
+      .verdict = SG_VERDICT_REJECT,
+      .reject_reason = reject_reason,
+      .substitution_consumer_index = -1,
+      .group_parent_index = -1,
+  };
+}
 
 sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
                             char *buf, size_t buf_size, sg_result_t *out) {
@@ -2620,9 +2918,7 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
   if (ferr == SHELL_EPARSE && fast.count == 0) {
     out->verdict = SG_VERDICT_REJECT;
     out->deny_reason = bw_copy(&bw, "parse error", 11);
-    out->subcommand_count = 1;
-    out->subcommands[0].verdict = SG_VERDICT_REJECT;
-    out->subcommands[0].reject_reason = out->deny_reason;
+    sg_init_rejected_subcommand(out, out->deny_reason);
     if (bw.overflow) {
       out->truncated = true;
       out->verdict = SG_VERDICT_UNDETERMINED;
@@ -2633,9 +2929,7 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
   if (ferr == SHELL_EPARSE) {
     out->verdict = SG_VERDICT_REJECT;
     out->deny_reason = bw_copy(&bw, "parse error", 11);
-    out->subcommand_count = 1;
-    out->subcommands[0].verdict = SG_VERDICT_REJECT;
-    out->subcommands[0].reject_reason = out->deny_reason;
+    sg_init_rejected_subcommand(out, out->deny_reason);
     if (bw.overflow) {
       out->truncated = true;
       out->verdict = SG_VERDICT_UNDETERMINED;
@@ -2650,9 +2944,7 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
   if (feat) {
     out->verdict = SG_VERDICT_REJECT;
     out->deny_reason = bw_printf(&bw, "%s not allowed", feat);
-    out->subcommand_count = 1;
-    out->subcommands[0].verdict = SG_VERDICT_REJECT;
-    out->subcommands[0].reject_reason = out->deny_reason;
+    sg_init_rejected_subcommand(out, out->deny_reason);
     if (bw.overflow) {
       out->truncated = true;
       out->verdict = SG_VERDICT_UNDETERMINED;
@@ -2670,9 +2962,7 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
   if (derr != SHELL_DEP_OK && !depgraph_truncated) {
     out->verdict = SG_VERDICT_REJECT;
     out->deny_reason = bw_copy(&bw, "depgraph error", 14);
-    out->subcommand_count = 1;
-    out->subcommands[0].verdict = SG_VERDICT_REJECT;
-    out->subcommands[0].reject_reason = out->deny_reason;
+    sg_init_rejected_subcommand(out, out->deny_reason);
     if (bw.overflow) {
       out->truncated = true;
       out->verdict = SG_VERDICT_UNDETERMINED;
@@ -2680,6 +2970,16 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
     }
     return SG_ERR_PARSE;
   }
+
+  /* This is graph-level information, not a property of whichever command
+   * results fit in the caller's display buffer. Preserve it before any later
+   * diagnostic rendering can return SG_ERR_TRUNC. */
+  for (uint32_t ei = 0; ei < graph.edge_count; ei++)
+    if (graph.edges[ei].type == SHELL_EDGE_SUBST) {
+      out->has_dynamic_substitution_io = true;
+      if (graph.edges[ei].flags & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD)
+        out->requires_substitution_evaluation = true;
+    }
 
   /* Step 3.5: Violation scan on the depgraph */
   uint32_t node_viols[SHELL_DEP_MAX_NODES];
@@ -2760,6 +3060,8 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
       free(owned_cmd_seq);
       free(owned_type_seq);
       out->verdict = SG_VERDICT_UNDETERMINED;
+      if (command_status == SHELL_PROCESS_EOUTPUT_LIMIT)
+        out->truncated = true;
       return command_status == SHELL_PROCESS_OK
                  ? SG_ERR_MEMORY
                  : process_status_to_gate_error(command_status);
@@ -2819,9 +3121,10 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
 
     sg_subcommand_result_t *sr = &out->subcommands[out->subcommand_count++];
     node_result_index[ni] = out->subcommand_count - 1;
-    sr->substitution_parent_index = -1;
+    sr->substitution_consumer_index = -1;
     sr->group_parent_index = -1;
     sr->group_depth = node->cmd.group_depth;
+    sr->group_kinds = node->cmd.group_kinds;
     sr->backgrounded = node->cmd.backgrounded;
 
     const char *policy_netargv = NULL;
@@ -2852,7 +3155,11 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
     sr->read_count = cmd_read_count[ni];
     sr->env_count = cmd_env_count[ni];
     sr->violation_type_flags = node_viols[ni];
-    sr->violation_category_flags = sg_violation_categories(node_viols[ni]);
+    sg_group_context(&graph, ni, node_viols, cmd_write_count, cmd_read_count,
+                     &sr->violation_type_flags, &sr->write_count,
+                     &sr->read_count);
+    sr->violation_category_flags =
+        sg_violation_categories(sr->violation_type_flags);
 
     /* Check deny policy first. The match-only path avoids constructing
      * suggestions when the caller has disabled their display. */
@@ -3001,25 +3308,53 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
 
   out->short_circuited = stopped_early && out->subcommand_count < cmd_count;
 
-  /* Substitution edges describe a dependency from the nested command to its
-   * containing command.  Resolve result-array indices after all commands have
-   * been visited because nested nodes precede their parent in the graph. */
+  /* SUBST edges carry dynamic topology into an execution endpoint, directly
+   * or through an expandable heredoc document. Resolve that endpoint after
+   * all command nodes have been visited. A group-owned stream is marked on
+   * every contained simple command because any of them can consume its
+   * inherited descriptor. Only a flagged shell-word edge requests another
+   * Shellgate inspection or changes an ALLOW verdict to conditional. */
   for (uint32_t ei = 0; ei < graph.edge_count; ei++) {
     const shell_dep_edge_t *edge = &graph.edges[ei];
     if (edge->type != SHELL_EDGE_SUBST || edge->from >= graph.node_count ||
         edge->to >= graph.node_count)
       continue;
-    uint32_t child = node_result_index[edge->from];
-    uint32_t parent = node_result_index[edge->to];
-    if (child == UINT32_MAX || parent == UINT32_MAX)
+    bool shell_word = (edge->flags & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0;
+    out->has_dynamic_substitution_io = true;
+    if (shell_word)
+      out->requires_substitution_evaluation = true;
+    uint32_t consumer_nodes[SHELL_DEP_MAX_NODES];
+    uint32_t consumer_count = sg_substitution_consumers(
+        &graph, edge->to, edge->flags, consumer_nodes);
+    uint32_t consumer = UINT32_MAX;
+    for (uint32_t consumer_index = 0; consumer_index < consumer_count;
+         consumer_index++) {
+      uint32_t consumer_node = consumer_nodes[consumer_index];
+      if (graph.nodes[consumer_node].type == SHELL_NODE_GROUP) {
+        sg_mark_group_substitution_consumers(&graph, node_result_index,
+                                             consumer_node, shell_word, out);
+        continue;
+      }
+      uint32_t result_index = node_result_index[consumer_node];
+      if (result_index == UINT32_MAX)
+        continue;
+      out->subcommands[result_index].has_dynamic_substitution_io = true;
+      if (shell_word)
+        out->subcommands[result_index].requires_substitution_evaluation = true;
+      if (shell_word &&
+          out->subcommands[result_index].verdict == SG_VERDICT_ALLOW)
+        out->subcommands[result_index].verdict = SG_VERDICT_ALLOW_CONDITIONAL;
+      if (consumer_count == 1)
+        consumer = result_index;
+    }
+    if (consumer == UINT32_MAX ||
+        (edge->flags & SHELL_DEP_EDGE_FLAG_SUBST_DYNAMIC_NAME) != 0)
       continue;
-    out->subcommands[child].substitution_parent_index = (int32_t)parent;
-    out->subcommands[parent].requires_substitution_evaluation = true;
-    out->requires_substitution_evaluation = true;
-    if (out->subcommands[parent].verdict == SG_VERDICT_ALLOW &&
-        (out->subcommands[child].verdict == SG_VERDICT_ALLOW ||
-         out->subcommands[child].verdict == SG_VERDICT_ALLOW_CONDITIONAL))
-      out->subcommands[parent].verdict = SG_VERDICT_ALLOW_CONDITIONAL;
+
+    uint32_t producer = node_result_index[edge->from];
+    if (producer != UINT32_MAX)
+      out->subcommands[producer].substitution_consumer_index =
+          (int32_t)consumer;
   }
 
   out->truncated = bw.overflow || subcommand_truncated;

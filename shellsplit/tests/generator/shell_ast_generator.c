@@ -201,7 +201,12 @@ static ast_node_t *gen_if(shell_ast_generator_t *gen, shell_ast_t *ast) {
 static ast_node_t *gen_loop(shell_ast_generator_t *gen, shell_ast_t *ast) {
   const char *loop_type = LOOP_TYPES[random_range(gen, 3)];
   ast_node_t *body = gen_command_with_redirects(gen, ast);
-  ast_node_t *list = gen_command_with_redirects(gen, ast);
+  /* `for name in words` takes shell words, not a command list. Keep its
+   * generated list free of redirects while while/until retain a command
+   * condition. */
+  ast_node_t *list = strcmp(loop_type, "for") == 0
+                         ? gen_glob(gen, ast)
+                         : gen_command_with_redirects(gen, ast);
   return shell_ast_add_loop(ast, loop_type, "i", list, body);
 }
 
@@ -219,6 +224,29 @@ static ast_node_t *gen_subshell(shell_ast_generator_t *gen, shell_ast_t *ast) {
   return shell_ast_add_subshell(ast, inner);
 }
 
+static ast_node_t *gen_sequence(shell_ast_generator_t *gen, shell_ast_t *ast);
+
+// POSIX brace group: { cmd; }.  Keep the required separator in the serializer
+// rather than overloading the variable-expansion is_braced flag.
+static ast_node_t *gen_brace_group_depth(shell_ast_generator_t *gen,
+                                         shell_ast_t *ast, unsigned depth) {
+  ast_node_t *inner = NULL;
+  if (depth < 3 && random_range(gen, 4) == 0)
+    inner = gen_brace_group_depth(gen, ast, depth + 1);
+  else if (random_range(gen, 3) == 0)
+    inner = gen_sequence(gen, ast);
+  else if (random_range(gen, 2) == 0)
+    inner = gen_subshell(gen, ast);
+  else
+    inner = gen_command_with_redirects(gen, ast);
+  return shell_ast_add_brace_group(ast, inner);
+}
+
+static ast_node_t *gen_brace_group(shell_ast_generator_t *gen,
+                                   shell_ast_t *ast) {
+  return gen_brace_group_depth(gen, ast, 0);
+}
+
 // Generate process substitution: <(cmd) or >(cmd)
 static ast_node_t *gen_process_sub(shell_ast_generator_t *gen,
                                    shell_ast_t *ast) {
@@ -229,8 +257,12 @@ static ast_node_t *gen_process_sub(shell_ast_generator_t *gen,
 
 // Generate pipeline: cmd1 | cmd2
 static ast_node_t *gen_pipeline(shell_ast_generator_t *gen, shell_ast_t *ast) {
-  ast_node_t *cmd1 = gen_command_with_redirects(gen, ast);
-  ast_node_t *cmd2 = gen_command_with_redirects(gen, ast);
+  ast_node_t *cmd1 = random_range(gen, 5) == 0
+                         ? gen_brace_group(gen, ast)
+                         : gen_command_with_redirects(gen, ast);
+  ast_node_t *cmd2 = random_range(gen, 5) == 0
+                         ? gen_brace_group(gen, ast)
+                         : gen_command_with_redirects(gen, ast);
   return shell_ast_add_pipeline(ast, cmd1, cmd2);
 }
 
@@ -280,6 +312,34 @@ static void gen_subshell_in_pipeline(shell_ast_generator_t *gen,
   ast->root = shell_ast_add_pipeline(ast, cmd1, cmd2);
   ast->has_valid_structure = true;
   ast->has_subshell = true;
+}
+
+static void gen_brace_group_in_pipeline(shell_ast_generator_t *gen,
+                                        shell_ast_t *ast) {
+  ast_node_t *source = gen_command_with_redirects(gen, ast);
+  ast_node_t *group = gen_brace_group(gen, ast);
+  ast_node_t *pipeline = shell_ast_add_pipeline(ast, source, group);
+  if (pipeline && random_range(gen, 2) == 0)
+    pipeline = shell_ast_add_redirect(ast, pipeline, gen_random_file(gen), -1,
+                                      false, false, false);
+  ast->root = pipeline;
+  ast->has_valid_structure = pipeline != NULL;
+}
+
+/* Exercise group aggregate control edges without making the recursive AST
+ * generator unbounded.  Nested groups remain produced by gen_brace_group(). */
+static void gen_brace_group_control(shell_ast_generator_t *gen,
+                                    shell_ast_t *ast) {
+  static const char *const separators[] = {"&&", "||", "&"};
+  ast_node_t *left = gen_brace_group(gen, ast);
+  ast_node_t *right = random_range(gen, 2) == 0
+                          ? gen_brace_group(gen, ast)
+                          : gen_command_with_redirects(gen, ast);
+  ast->root = shell_ast_add_sequence(
+      ast, left, right,
+      separators[random_range(gen,
+                              sizeof(separators) / sizeof(separators[0]))]);
+  ast->has_valid_structure = ast->root != NULL;
 }
 
 // cmd && $VAR || other - compound with variables
@@ -391,6 +451,41 @@ static void gen_unclosed_subshell(shell_ast_generator_t *gen,
   }
 }
 
+static void gen_unclosed_brace_group(shell_ast_generator_t *gen,
+                                     shell_ast_t *ast) {
+  ast_node_t *node = shell_ast_add_brace_group(ast, gen_command(gen, ast));
+  if (node) {
+    node->is_valid = false;
+    node->brace_form = AST_BRACE_UNCLOSED;
+    ast->root = node;
+    ast->has_unclosed_brace = true;
+    ast->has_valid_structure = false;
+  }
+}
+
+static void gen_brace_missing_separator(shell_ast_generator_t *gen,
+                                        shell_ast_t *ast) {
+  ast_node_t *node = shell_ast_add_brace_group(ast, gen_command(gen, ast));
+  if (node) {
+    node->is_valid = false;
+    node->brace_form = AST_BRACE_MISSING_SEPARATOR;
+    ast->root = node;
+    ast->has_valid_structure = false;
+  }
+}
+
+static void gen_brace_crossed_subshell(shell_ast_generator_t *gen,
+                                       shell_ast_t *ast) {
+  ast_node_t *node = shell_ast_add_brace_group(ast, gen_command(gen, ast));
+  if (node) {
+    node->is_valid = false;
+    node->brace_form = AST_BRACE_CROSSED_SUBSHELL;
+    ast->root = node;
+    ast->has_unclosed_paren = true;
+    ast->has_valid_structure = false;
+  }
+}
+
 // Invalid redirect target: cmd > (no file)
 static void gen_missing_redirect_target(shell_ast_generator_t *gen,
                                         shell_ast_t *ast) {
@@ -494,11 +589,14 @@ static void gen_valid_shell(shell_ast_generator_t *gen, shell_ast_t *ast) {
   } else if (type < 60) {
     // Sequence (; or && or ||)
     ast->root = gen_sequence(gen, ast);
-  } else if (type < 68) {
+  } else if (type < 66) {
     // Subshell
     ast->root = gen_subshell(gen, ast);
     ast->has_subshell = true;
-  } else if (type < 75) {
+  } else if (type < 73) {
+    // POSIX brace group
+    ast->root = gen_brace_group(gen, ast);
+  } else if (type < 80) {
     // Arithmetic
     ast->root = gen_arithmetic(gen, ast);
     if (ast->root && !ast->root->is_valid) {
@@ -507,11 +605,11 @@ static void gen_valid_shell(shell_ast_generator_t *gen, shell_ast_t *ast) {
       return;
     }
     ast->has_arithmetic = true;
-  } else if (type < 80) {
+  } else if (type < 84) {
     // Process substitution
     ast->root = gen_process_sub(gen, ast);
     ast->has_process_sub = true;
-  } else if (type < 84) {
+  } else if (type < 87) {
     ast_node_t *cmd = gen_command(gen, ast);
     ast_node_t *quote = gen_quote(gen, ast);
     quote->is_valid = true;
@@ -521,27 +619,32 @@ static void gen_valid_shell(shell_ast_generator_t *gen, shell_ast_t *ast) {
     // Clear flags that might have been set by unclosed quote
     ast->has_unclosed_quote = false;
     ast->has_valid_structure = true;
-  } else if (type < 87) {
+  } else if (type < 90) {
     // Loop (for/while/until)
     ast->root = gen_loop(gen, ast);
     ast->has_loops = true;
-  } else if (type < 90) {
+  } else if (type < 92) {
     // If statement
     ast->root = gen_if(gen, ast);
     ast->has_conditionals = true;
-  } else if (type < 92) {
+  } else if (type < 94) {
     // Case statement
     ast->root = gen_case(gen, ast);
     ast->has_case = true;
-  } else if (type < 94) {
+  } else if (type < 96) {
     // Complex: variable + glob + redirect
     gen_complex_var_glob_redirect(gen, ast);
-  } else if (type < 96) {
+  } else if (type < 98) {
     // Complex: subshell in pipeline
     gen_subshell_in_pipeline(gen, ast);
-  } else if (type < 98) {
-    // Complex: compound with variables
-    gen_compound_with_vars(gen, ast);
+  } else if (type < 99) {
+    // Complex: brace groups at pipeline and aggregate-control boundaries.
+    if (random_range(gen, 3) == 0)
+      gen_brace_group_in_pipeline(gen, ast);
+    else if (random_range(gen, 2) == 0)
+      gen_brace_group_control(gen, ast);
+    else
+      gen_compound_with_vars(gen, ast);
   } else {
     // Complex: glob in loop
     gen_glob_in_loop(gen, ast);
@@ -560,7 +663,8 @@ static void gen_invalid_shell(shell_ast_generator_t *gen, shell_ast_t *ast) {
       gen_invalid_arithmetic,      gen_unclosed_subshell,
       gen_missing_redirect_target, gen_multiple_unclosed,
       gen_incomplete_case,         gen_incomplete_if,
-      gen_incomplete_loop,
+      gen_incomplete_loop,         gen_unclosed_brace_group,
+      gen_brace_missing_separator, gen_brace_crossed_subshell,
   };
   size_t choice =
       (size_t)random_range(gen, 9 + sizeof(generators) / sizeof(generators[0]));
