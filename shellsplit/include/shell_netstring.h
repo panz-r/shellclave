@@ -1,6 +1,7 @@
 #ifndef SHELL_NETSTRING_H
 #define SHELL_NETSTRING_H
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdio.h>
 
@@ -16,6 +17,24 @@ typedef struct {
   const unsigned char *payload;
   size_t payload_length;
 } shell_netstring_view_t;
+
+/* Owned binary storage for a canonical netstring or netstring sequence.
+ * `data` is not a C string: payloads may contain NUL bytes and callers must
+ * always use `length`. Initialize to {0}, and release with
+ * shell_netstring_buffer_free(). Producer APIs require an empty buffer: call
+ * shell_netstring_buffer_free() before reusing a successful result as an
+ * output argument. Producers reject non-empty or inconsistent buffers without
+ * modifying them. */
+typedef struct {
+  unsigned char *data;
+  size_t length;
+} shell_netstring_buffer_t;
+
+/* Release an owned canonical buffer and reset it. NULL is a no-op. */
+void shell_netstring_buffer_free(shell_netstring_buffer_t *buffer);
+
+/* Return true only for a valid empty owned-output buffer. */
+bool shell_netstring_buffer_is_empty(const shell_netstring_buffer_t *buffer);
 
 /* Stateful, allocation-free iterator over concatenated canonical netstrings.
  * The input is byte-oriented: payloads may contain NUL bytes. */

@@ -50,7 +50,7 @@ static void check_eval_is_verified(st_policy_t *policy, const char *command) {
   st_eval_result_t result = {};
   if (st_policy_eval(policy, command, &result) != ST_OK)
     return;
-  const char **matches = nullptr;
+  st_netpattern_view_t *matches = nullptr;
   size_t count = 0;
   if (st_policy_verify_all(policy, command, &matches, &count) != ST_OK)
     return;
@@ -58,7 +58,9 @@ static void check_eval_is_verified(st_policy_t *policy, const char *command) {
     bool found = false;
     for (size_t i = 0; i < count; i++)
       found = found || (result.matching_pattern &&
-                        std::strcmp(result.matching_pattern, matches[i]) == 0);
+                        result.matching_pattern_length == matches[i].length &&
+                        std::memcmp(result.matching_pattern, matches[i].data,
+                                    matches[i].length) == 0);
     require(found);
   } else {
     require(count == 0);
@@ -66,14 +68,17 @@ static void check_eval_is_verified(st_policy_t *policy, const char *command) {
   st_policy_matches_free(matches);
 }
 
-static bool string_set_equal(char *const *left, size_t left_count,
-                             char *const *right, size_t right_count) {
+static bool netpattern_set_equal(const st_netpattern_t *left, size_t left_count,
+                                 const st_netpattern_t *right,
+                                 size_t right_count) {
   if (left_count != right_count)
     return false;
   for (size_t i = 0; i < left_count; i++) {
     bool found = false;
     for (size_t j = 0; j < right_count; j++)
-      found = found || std::strcmp(left[i], right[j]) == 0;
+      found = found ||
+              (left[i].length == right[j].length &&
+               std::memcmp(left[i].data, right[j].data, left[i].length) == 0);
     if (!found)
       return false;
   }
@@ -239,7 +244,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         break;
       }
       case 5: {
-        const char **matches = nullptr;
+        st_netpattern_view_t *matches = nullptr;
         size_t count = 0;
         (void)st_policy_verify_all(policy, netargv.c_str(), &matches, &count);
         st_policy_matches_free(matches);
@@ -298,10 +303,10 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         st_policy_diff_t reverse = {};
         if (st_policy_diff(policy, policy_b, &forward) == ST_OK &&
             st_policy_diff(policy_b, policy, &reverse) == ST_OK) {
-          require(string_set_equal(forward.added, forward.added_count,
-                                   reverse.removed, reverse.removed_count));
-          require(string_set_equal(forward.removed, forward.removed_count,
-                                   reverse.added, reverse.added_count));
+          require(netpattern_set_equal(forward.added, forward.added_count,
+                                       reverse.removed, reverse.removed_count));
+          require(netpattern_set_equal(forward.removed, forward.removed_count,
+                                       reverse.added, reverse.added_count));
         }
         st_policy_diff_free(&forward);
         st_policy_diff_free(&reverse);

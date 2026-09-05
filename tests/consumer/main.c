@@ -15,18 +15,19 @@ static bool count_token(const st_token_view_t *token, void *user_ctx) {
   return true;
 }
 
-static bool count_policy_match(const char *netpattern, void *user_ctx) {
+static bool count_policy_match(st_netpattern_view_t netpattern,
+                               void *user_ctx) {
   size_t *count = user_ctx;
-  if (!netpattern || !count)
+  if (!netpattern.data || !count)
     return false;
   (*count)++;
   return true;
 }
 
 static bool count_policy_diff(st_policy_diff_kind_t kind,
-                              const char *netpattern, void *user_ctx) {
+                              st_netpattern_view_t netpattern, void *user_ctx) {
   size_t *count = user_ctx;
-  if (kind != ST_POLICY_DIFF_ADDED || !netpattern || !count)
+  if (kind != ST_POLICY_DIFF_ADDED || !netpattern.data || !count)
     return false;
   (*count)++;
   return true;
@@ -37,7 +38,7 @@ static bool check_policy_view_apis(st_netargv_view_t netargv) {
   st_policy_t *policy = ctx ? st_policy_new(ctx) : NULL;
   st_policy_t *empty = ctx ? st_policy_new(ctx) : NULL;
   char *netpattern = NULL;
-  const char **all_matches = NULL;
+  st_netpattern_view_t *all_matches = NULL;
   size_t all_count = 0;
   size_t visited_count = 0;
   size_t diff_count = 0;
@@ -51,7 +52,8 @@ static bool check_policy_view_apis(st_netargv_view_t netargv) {
       st_policy_match_view(policy, netargv, &matches) == ST_OK && matches &&
       st_policy_verify_all_view(policy, netargv, &all_matches, &all_count) ==
           ST_OK &&
-      all_count == 1 && strcmp(all_matches[0], netpattern) == 0 &&
+      all_count == 1 && all_matches[0].length == strlen(netpattern) &&
+      memcmp(all_matches[0].data, netpattern, all_matches[0].length) == 0 &&
       st_policy_visit_matches_view(policy, netargv, count_policy_match,
                                    &visited_count, &visited_count) == ST_OK &&
       visited_count == 1 &&

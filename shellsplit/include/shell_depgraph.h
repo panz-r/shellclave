@@ -38,6 +38,10 @@ extern "C" {
 #define SHELL_DEP_CWD_BUF_SIZE 16384 /* 16KB buffer for unique CWD strings */
 /* An edge endpoint has no applicable file descriptor. */
 #define SHELL_DEP_FD_NONE UINT32_MAX
+/* A Bash `{name}OPword` redirect uses a shell-managed descriptor whose numeric
+ * value is only known at execution time. The graph preserves its setup edge
+ * but must not mislabel it as stdout or stderr I/O. */
+#define SHELL_DEP_FD_NAMED (UINT32_MAX - 1u)
 /* Shell io_number values are bounded by the implementation's signed fd
  * domain. Keeping this below SHELL_DEP_FD_NONE makes the sentinel unambiguous.
  */
@@ -111,6 +115,11 @@ typedef enum {
   SHELL_EDGE_CWD = 10,
   SHELL_EDGE_BACKGROUND = 11,
   SHELL_EDGE_GROUP = 12,
+  /* A named-FD redirect opens a descriptor but does not itself route command
+   * bytes to the file. This setup edge preserves the file-to-descriptor
+   * orientation (`<`), descriptor-to-file orientation (`>`/`>>`), or both
+   * (`<>`) without falsely claiming stdout/stderr I/O. */
+  SHELL_EDGE_FD_OPEN = 13,
 } shell_dep_edge_type_t;
 
 typedef enum {
@@ -190,7 +199,10 @@ typedef struct {
   uint16_t group_depth; /* Enclosing command-group nesting depth */
   uint8_t group_kinds;  /* shell_group_kind_t bitset of enclosing groups */
   bool backgrounded;    /* Command runs asynchronously */
-  bool cwd_known;       /* False when branch composition makes CWD ambiguous */
+  /* This command is a member of a POSIX `! pipeline`; the pipeline's final
+   * status is inverted after all members have run. */
+  bool pipeline_negated;
+  bool cwd_known; /* False when branch composition makes CWD ambiguous */
 } shell_dep_cmd_t;
 
 typedef struct {
@@ -198,6 +210,8 @@ typedef struct {
   uint32_t length;   /* Complete group span, including delimiters */
   uint32_t parent;   /* Parent group node, or UINT32_MAX */
   uint8_t kind;      /* shell_group_kind_t */
+  /* This compound command is a member of a POSIX `! pipeline`. */
+  bool pipeline_negated;
 } shell_dep_group_t;
 
 /**
@@ -219,13 +233,18 @@ typedef struct {
  *
  * Fields are used according to kind:
  *   FILE:      path/path_len
- *   HEREDOC:   name/name_len (delimiter), value/value_len (source content)
+ *   HEREDOC:   name/name_len (borrowed delimiter display span),
+ *              value/value_len (source content)
  *   HERESTRING: value/value_len (content; an expandable word can receive
  *               incoming SUBST edges before its READ edge supplies owner)
  *   ENVVAR:    name/name_len, value/value_len
  *
- * All fields borrow source spans. `value` always preserves physical source
- * bytes; for `<<-`, use shell_dep_doc_content_length() and
+ * All fields borrow source spans. Heredoc delimiter matching applies shell
+ * quote removal, but `name` is not a decoded value: one enclosing homogeneous
+ * `'...'` or `"..."` pair is elided for display, while mixed-quote,
+ * backslash, and ANSI-C spellings retain their source span.
+ * `value` always preserves physical source bytes; for `<<-`, use
+ * shell_dep_doc_content_length() and
  * shell_dep_doc_write_content() to obtain logical tab-stripped content. CRLF
  * heredoc framing is recognized, but carriage returns remain content bytes.
  */

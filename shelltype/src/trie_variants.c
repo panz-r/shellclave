@@ -5,6 +5,7 @@
  * options (more specific to more general).
  */
 
+#include "normalize_internal.h"
 #include "shelltype.h"
 #include "trie_internal.h"
 
@@ -18,6 +19,13 @@
 _Static_assert(ST_TYPE_COUNT <= 64,
                "token variant collection requires a 64-bit type mask");
 
+static size_t token_text_length(const st_token_t *token) {
+  if (!token || !token->text)
+    return 0;
+  return (token->text_length || token->text[0] == '\0') ? token->text_length
+                                                        : strlen(token->text);
+}
+
 size_t st_token_variants_at(const st_token_array_t *pattern, size_t edit_pos,
                             st_token_variant_t *out_variants,
                             size_t max_variants) {
@@ -30,8 +38,9 @@ size_t st_token_variants_at(const st_token_array_t *pattern, size_t edit_pos,
   if (start_type < ST_TYPE_LITERAL || start_type >= ST_TYPE_COUNT ||
       !token->text)
     return 0;
-  if (start_type == ST_TYPE_LITERAL)
-    start_type = st_token_classify(token->text);
+  if (start_type == ST_TYPE_LITERAL &&
+      memchr(token->text, '\0', token_text_length(token)) == NULL)
+    start_type = st_token_classify_bytes(token->text, token_text_length(token));
 
   size_t out = 0;
   out_variants[out++] = (st_token_variant_t){
@@ -100,13 +109,15 @@ static void collect_variants_at(const st_node_t *node,
   }
 
   const char *current_token = pattern_tokens[depth].text;
+  size_t current_token_length = token_text_length(&pattern_tokens[depth]);
   st_token_type_t current_type = pattern_tokens[depth].type;
 
   if (current_type == ST_TYPE_LITERAL) {
     for (size_t i = 0; i < node->num_children; i++) {
       const st_node_t *child = node->children[i];
       if (child->type == ST_TYPE_LITERAL &&
-          strcmp(child->token, current_token) == 0) {
+          child->token_length == current_token_length &&
+          memcmp(child->token, current_token, current_token_length) == 0) {
         collect_variants_at(child, pattern_tokens, pattern_count, target_pos,
                             depth + 1, observed_types);
         return;
@@ -155,10 +166,10 @@ static st_token_type_t most_specific_remaining(uint64_t remaining) {
 }
 
 static bool pattern_tokens_are_representable(const st_token_array_t *pattern) {
-  char *encoded = NULL;
+  st_netpattern_t encoded = {0};
   st_error_t error =
-      st_netpattern_encode(pattern->tokens, pattern->count, &encoded);
-  free(encoded);
+      st_netpattern_encode_owned(pattern->tokens, pattern->count, &encoded);
+  st_netpattern_free(&encoded);
   return error == ST_OK;
 }
 
@@ -270,16 +281,16 @@ size_t st_learner_suggest_token_variants(const st_learner_t *learner,
 
 /* Apply a type change to a pattern at a given position. Caller must free
  * result. */
-st_error_t st_netpattern_apply_type_at(const char *netpattern, size_t edit_pos,
-                                       st_token_type_t new_type,
-                                       char **out_netpattern) {
-  if (out_netpattern)
-    *out_netpattern = NULL;
-  if (!netpattern || !out_netpattern || new_type <= ST_TYPE_LITERAL ||
-      new_type >= ST_TYPE_COUNT)
+st_error_t st_netpattern_apply_type_at_owned(st_netpattern_view_t netpattern,
+                                             size_t edit_pos,
+                                             st_token_type_t new_type,
+                                             st_netpattern_t *out_netpattern) {
+  if (!netpattern.data || netpattern.length == 0 || !out_netpattern ||
+      out_netpattern->data || out_netpattern->length != 0 ||
+      new_type <= ST_TYPE_LITERAL || new_type >= ST_TYPE_COUNT)
     return ST_ERR_INVALID;
   st_token_array_t decoded = {0};
-  st_error_t error = st_netpattern_decode(netpattern, &decoded);
+  st_error_t error = st_netpattern_decode_view(netpattern, &decoded);
   if (error != ST_OK)
     return error;
   if (edit_pos >= decoded.count) {
@@ -288,20 +299,49 @@ st_error_t st_netpattern_apply_type_at(const char *netpattern, size_t edit_pos,
   }
   if (decoded.tokens[edit_pos].compound) {
     const char *old_capture = decoded.tokens[edit_pos].capture;
+    size_t old_capture_length = decoded.tokens[edit_pos].capture_length;
     st_token_type_t old_capture_type = decoded.tokens[edit_pos].capture_type;
     decoded.tokens[edit_pos].capture = (char *)st_type_symbol[new_type];
     decoded.tokens[edit_pos].capture_type = new_type;
-    error = st_netpattern_encode(decoded.tokens, decoded.count, out_netpattern);
+    decoded.tokens[edit_pos].capture_length = strlen(st_type_symbol[new_type]);
+    error = st_netpattern_encode_owned(decoded.tokens, decoded.count,
+                                       out_netpattern);
     decoded.tokens[edit_pos].capture = old_capture;
     decoded.tokens[edit_pos].capture_type = old_capture_type;
+    decoded.tokens[edit_pos].capture_length = old_capture_length;
     st_token_array_free(&decoded);
     return error;
   }
   const char *old_text = decoded.tokens[edit_pos].text;
+  size_t old_text_length = decoded.tokens[edit_pos].text_length;
   decoded.tokens[edit_pos].text = (char *)st_type_symbol[new_type];
+  decoded.tokens[edit_pos].text_length = strlen(st_type_symbol[new_type]);
   decoded.tokens[edit_pos].type = new_type;
-  error = st_netpattern_encode(decoded.tokens, decoded.count, out_netpattern);
+  error =
+      st_netpattern_encode_owned(decoded.tokens, decoded.count, out_netpattern);
   decoded.tokens[edit_pos].text = old_text;
+  decoded.tokens[edit_pos].text_length = old_text_length;
   st_token_array_free(&decoded);
   return error;
+}
+
+st_error_t st_netpattern_apply_type_at(const char *netpattern, size_t edit_pos,
+                                       st_token_type_t new_type,
+                                       char **out_netpattern) {
+  if (out_netpattern)
+    *out_netpattern = NULL;
+  if (!netpattern || !out_netpattern)
+    return ST_ERR_INVALID;
+  st_netpattern_t owned = {0};
+  st_error_t error = st_netpattern_apply_type_at_owned(
+      (st_netpattern_view_t){.data = netpattern, .length = strlen(netpattern)},
+      edit_pos, new_type, &owned);
+  if (error != ST_OK)
+    return error;
+  if (memchr(owned.data, '\0', owned.length)) {
+    st_netpattern_free(&owned);
+    return ST_ERR_LIMIT;
+  }
+  *out_netpattern = owned.data;
+  return ST_OK;
 }

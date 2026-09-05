@@ -24,8 +24,13 @@
 #include "shelltype.h"
 #include "trie_internal.h"
 
-/* Read one outer netstring whose payload is a complete canonical netargv. */
-static int read_netargv_record(FILE *stream, char **out) {
+/* Read one outer netstring whose payload is a complete canonical netargv.
+ * The payload is binary data: an argv element may contain NUL. */
+static int read_netargv_record(FILE *stream, shell_netstring_buffer_t *out) {
+  if (out)
+    *out = (shell_netstring_buffer_t){0};
+  if (!stream || !out)
+    return -1;
   unsigned char *record = NULL;
   size_t record_length = 0;
   shell_netstring_status_t status =
@@ -39,14 +44,13 @@ static int read_netargv_record(FILE *stream, char **out) {
   if (shell_netstring_iter_init(&iter, record, record_length) !=
           SHELL_NETSTRING_OK ||
       shell_netstring_iter_next(&iter, &view) != SHELL_NETSTRING_OK ||
-      view.record_length != record_length ||
-      memchr(view.payload, '\0', view.payload_length) != NULL) {
+      view.record_length != record_length) {
     free(record);
     return -1;
   }
   memmove(record, view.payload, view.payload_length);
-  record[view.payload_length] = '\0';
-  *out = (char *)record;
+  out->data = record;
+  out->length = view.payload_length;
   return 1;
 }
 
@@ -55,15 +59,48 @@ static void free_policy(st_policy_t *policy, st_policy_ctx_t *context) {
   st_policy_ctx_release(context);
 }
 
-static int print_match(const char *prefix, const char *netpattern) {
+static int print_match(const char *prefix, st_netpattern_view_t netpattern) {
   char *cpl = NULL;
-  if (!netpattern || st_netpattern_to_cpl(netpattern, &cpl) != ST_OK) {
+  if (!netpattern.data ||
+      st_netpattern_to_cpl_view(netpattern, &cpl) != ST_OK) {
     free(cpl);
     return -1;
   }
   int result = printf("%s%s)\n", prefix, cpl);
   free(cpl);
   return result < 0 ? -1 : 0;
+}
+
+/* Validation details can contain arbitrary literal bytes. Keep diagnostics
+ * terminal-safe and lossless instead of treating token_texts as C strings. */
+static int print_escaped_bytes(const char *text, size_t length) {
+  static const char hex[] = "0123456789abcdef";
+  if (fputc('"', stdout) == EOF)
+    return -1;
+  for (size_t i = 0; i < length; i++) {
+    unsigned char byte = (unsigned char)text[i];
+    if (byte == '"' || byte == '\\') {
+      if (fputc('\\', stdout) == EOF || fputc(byte, stdout) == EOF)
+        return -1;
+    } else if (byte == '\b' || byte == '\f' || byte == '\n' || byte == '\r' ||
+               byte == '\t') {
+      char escape = byte == '\b'   ? 'b'
+                    : byte == '\f' ? 'f'
+                    : byte == '\n' ? 'n'
+                    : byte == '\r' ? 'r'
+                                   : 't';
+      if (fputc('\\', stdout) == EOF || fputc(escape, stdout) == EOF)
+        return -1;
+    } else if (byte < 0x20 || byte >= 0x7f) {
+      if (fputc('\\', stdout) == EOF || fputc('x', stdout) == EOF ||
+          fputc(hex[byte >> 4], stdout) == EOF ||
+          fputc(hex[byte & 0x0f], stdout) == EOF)
+        return -1;
+    } else if (fputc(byte, stdout) == EOF) {
+      return -1;
+    }
+  }
+  return fputc('"', stdout) == EOF ? -1 : 0;
 }
 
 static void print_usage(const char *prog) {
@@ -216,11 +253,14 @@ int main(int argc, char *argv[]) {
   /* Validate pattern mode */
   if (validate_pat) {
     st_pattern_info_t info;
-    char *netpattern = NULL;
-    st_error_t err = st_netpattern_from_cpl(validate_pat, &netpattern);
+    st_netpattern_t netpattern = {0};
+    st_error_t err = st_netpattern_from_cpl_owned(validate_pat, &netpattern);
     if (err == ST_OK)
-      err = st_netpattern_validate(netpattern, &info);
-    free(netpattern);
+      err = st_netpattern_validate_view(
+          (st_netpattern_view_t){.data = netpattern.data,
+                                 .length = netpattern.length},
+          &info);
+    st_netpattern_free(&netpattern);
     if (err != ST_OK) {
       fprintf(stderr, "INVALID: %s\n", validate_pat);
       return 1;
@@ -228,8 +268,14 @@ int main(int argc, char *argv[]) {
     printf("VALID: %s (%zu tokens)\n", validate_pat, info.token_count);
     for (size_t i = 0; i < info.token_count; i++) {
       const char *sym = st_type_symbol[info.token_types[i]];
-      printf("  [%zu] %-30s type=%-4d (%s)\n", i, info.token_texts[i],
-             info.token_types[i], sym[0] ? sym : "LITERAL");
+      if (printf("  [%zu] ", i) < 0 ||
+          print_escaped_bytes(info.token_texts[i], info.token_lengths[i]) !=
+              0 ||
+          printf(" type=%-4d (%s)\n", info.token_types[i],
+                 sym[0] ? sym : "LITERAL") < 0) {
+        fprintf(stderr, "Error: failed to write validation output\n");
+        return 1;
+      }
     }
     return 0;
   }
@@ -299,7 +345,10 @@ int main(int argc, char *argv[]) {
         return 1;
       }
       if (r.matches) {
-        if (print_match("ALLOW (matched: ", r.matching_pattern) != 0) {
+        if (print_match("ALLOW (matched: ",
+                        (st_netpattern_view_t){
+                            .data = r.matching_pattern,
+                            .length = r.matching_pattern_length}) != 0) {
           fprintf(stderr, "Error: failed to render matching netpattern\n");
           free_policy(policy, context);
           return 1;
@@ -323,15 +372,19 @@ int main(int argc, char *argv[]) {
       int record_count = 0;
       int allow_count = 0;
       int deny_count = 0;
-      char *record = NULL;
+      shell_netstring_buffer_t record = {0};
       int read_status;
       while ((read_status = read_netargv_record(fp, &record)) == 1) {
         st_eval_result_t r = {0};
-        err = st_policy_eval(policy, record, &r);
+        err = st_policy_eval_view(
+            policy,
+            (st_netargv_view_t){.data = (const char *)record.data,
+                                .length = record.length},
+            &r);
         if (err != ST_OK) {
           fprintf(stderr, "Error: invalid netargv record %d (%d)\n",
                   record_count + 1, err);
-          free(record);
+          shell_netstring_buffer_free(&record);
           fclose(fp);
           free_policy(policy, context);
           return 1;
@@ -339,9 +392,12 @@ int main(int argc, char *argv[]) {
           char prefix[64];
           snprintf(prefix, sizeof(prefix),
                    "ALLOW: record %-6d (matched: ", record_count + 1);
-          if (print_match(prefix, r.matching_pattern) != 0) {
+          if (print_match(prefix,
+                          (st_netpattern_view_t){
+                              .data = r.matching_pattern,
+                              .length = r.matching_pattern_length}) != 0) {
             fprintf(stderr, "Error: failed to render matching netpattern\n");
-            free(record);
+            shell_netstring_buffer_free(&record);
             fclose(fp);
             free_policy(policy, context);
             return 1;
@@ -351,11 +407,10 @@ int main(int argc, char *argv[]) {
           printf("DENY:  record %d\n", record_count + 1);
           deny_count++;
         }
-        free(record);
-        record = NULL;
+        shell_netstring_buffer_free(&record);
         record_count++;
       }
-      free(record);
+      shell_netstring_buffer_free(&record);
       fclose(fp);
       if (read_status < 0) {
         fprintf(stderr, "Error: malformed framed input '%s'\n", verify_file);
@@ -415,21 +470,22 @@ int main(int argc, char *argv[]) {
 
     int record_count = 0;
     int error_count = 0;
-    char *record = NULL;
+    shell_netstring_buffer_t record = {0};
     int read_status;
     while ((read_status = read_netargv_record(fp, &record)) == 1) {
-      st_error_t err = st_learner_feed_netargv(learner, record);
+      st_error_t err = st_learner_feed_netargv_view(
+          learner, (st_netargv_view_t){.data = (const char *)record.data,
+                                       .length = record.length});
       if (err != ST_OK) {
         error_count++;
         if (error_count <= 3)
           fprintf(stderr, "Warning: failed to feed record %d (%d)\n",
                   record_count + 1, err);
       }
-      free(record);
-      record = NULL;
+      shell_netstring_buffer_free(&record);
       record_count++;
     }
-    free(record);
+    shell_netstring_buffer_free(&record);
     fclose(fp);
     if (read_status < 0) {
       fprintf(stderr, "Error: malformed framed input '%s'\n", input_file);
@@ -466,7 +522,10 @@ int main(int argc, char *argv[]) {
               sug_count, min_support, min_confidence);
       for (size_t i = 0; i < sug_count; i++) {
         char *cpl = NULL;
-        if (st_netpattern_to_cpl(suggestions[i].pattern, &cpl) != ST_OK)
+        if (st_netpattern_to_cpl_view(
+                (st_netpattern_view_t){.data = suggestions[i].pattern,
+                                       .length = suggestions[i].pattern_length},
+                &cpl) != ST_OK)
           cpl = strdup("<invalid netpattern>");
         fprintf(out, "%3zu. %-50s (count=%u, confidence=%.2f)\n", i + 1,
                 cpl ? cpl : "<allocation failure>", suggestions[i].count,

@@ -597,6 +597,52 @@ static int test_nfa_rendering_contract(void) {
   return 1;
 }
 
+static int test_nfa_binary_literal_rendering(void) {
+  const char *path = "test_binary_policy.nfa";
+  st_policy_ctx_t *context = st_policy_ctx_new();
+  st_policy_t *policy = context ? st_policy_new(context) : NULL;
+  st_netpattern_t pattern = {0};
+  st_netpattern_t empty_literal = {0};
+  ASSERT(context != NULL && policy != NULL);
+  ASSERT(st_netpattern_from_cpl_owned("echo \"a\\x00b\"", &pattern) == ST_OK);
+  ASSERT(st_policy_add_netpattern_view(
+             policy, (st_netpattern_view_t){.data = pattern.data,
+                                            .length = pattern.length}) ==
+         ST_OK);
+  ASSERT(st_netpattern_from_cpl_owned("empty \"\"", &empty_literal) == ST_OK);
+  ASSERT(st_policy_add_netpattern_view(
+             policy, (st_netpattern_view_t){.data = empty_literal.data,
+                                            .length = empty_literal.length}) ==
+         ST_OK);
+
+  st_nfa_render_opts_t options = {.category_mask = 1,
+                                  .pattern_id_base = 1,
+                                  .include_tags = true,
+                                  .identifier = "binary-policy"};
+  ASSERT(st_policy_render_nfa(policy, path, &options) == ST_OK);
+  char *rendered = read_file(path);
+  ASSERT(rendered != NULL);
+  ASSERT(strstr(rendered, "    Symbol 0 ->") != NULL);
+  ASSERT(strstr(rendered, "    Symbol 257 ->") != NULL);
+  ASSERT(strstr(rendered, "  Tags: echo \"a\\x00b\"\n") != NULL);
+  free(rendered);
+
+  options.include_tags = false;
+  ASSERT(st_policy_render_nfa(policy, path, &options) == ST_OK);
+  rendered = read_file(path);
+  ASSERT(rendered != NULL);
+  ASSERT(strstr(rendered, "    Symbol 0 ->") != NULL);
+  ASSERT(strstr(rendered, "    Symbol 257 ->") != NULL);
+  ASSERT(strstr(rendered, "  Tags: ") == NULL);
+  free(rendered);
+  ASSERT(remove(path) == 0);
+  st_netpattern_free(&pattern);
+  st_netpattern_free(&empty_literal);
+  st_policy_free(policy);
+  st_policy_ctx_release(context);
+  return 1;
+}
+
 static int test_nfa_policy_equivalence(void) {
   static const char *patterns[] = {
       "number #n",     "path #path",    "option #opt",  "anything *",
@@ -635,7 +681,7 @@ static int test_nfa_policy_equivalence(void) {
         found = found || pattern_is_cpl(policy_matches[p], nfa_matches[n]);
       ASSERT(found);
     }
-    st_policy_matches_free(policy_matches);
+    test_st_policy_matches_free(policy_matches);
   }
 
   parsed_nfa_free(&nfa);
@@ -731,7 +777,7 @@ static int nfa_equivalent_for_commands(st_policy_t *policy, const char *path,
         found = found || pattern_is_cpl(policy_matches[p], nfa_matches[n]);
       equivalent = found;
     }
-    st_policy_matches_free(policy_matches);
+    test_st_policy_matches_free(policy_matches);
   }
   parsed_nfa_free(&nfa);
   return equivalent;
@@ -848,7 +894,7 @@ static int test_nfa_preserves_parameter_branches(void) {
         found = found || pattern_is_cpl(policy_matches[p], matches[n]);
       ASSERT(found);
     }
-    st_policy_matches_free(policy_matches);
+    test_st_policy_matches_free(policy_matches);
   }
 
   parsed_nfa_free(&nfa);
@@ -901,12 +947,12 @@ static int metadata_matches_expected(st_policy_t *policy, const char *path,
                "counts=%zu/%zu)\n",
                cases[i].command, cases[i].expected[expected], policy_found,
                nfa_found, policy_count, nfa_count);
-        st_policy_matches_free(policy_matches);
+        test_st_policy_matches_free(policy_matches);
         parsed_nfa_free(&nfa);
         return 0;
       }
     }
-    st_policy_matches_free(policy_matches);
+    test_st_policy_matches_free(policy_matches);
   }
   parsed_nfa_free(&nfa);
   return 1;
@@ -1275,6 +1321,7 @@ int main(void) {
   TEST(test_large_policy_compaction);
   TEST(test_compaction_allocation_failures_are_atomic);
   TEST(test_nfa_rendering_contract);
+  TEST(test_nfa_binary_literal_rendering);
   TEST(test_nfa_policy_equivalence);
   TEST(test_nfa_lattice_transition_matrix);
   TEST(test_nfa_lifecycle_equivalence);

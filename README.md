@@ -110,9 +110,12 @@ a `netsequence` is an outer concatenation whose records each represent one
 isolated subcommand. This preserves empty arguments, whitespace, punctuation,
 and nested per-command type signatures without quoting heuristics.
 
-Shellsplit remains the shell-language boundary: use
-`shell_build_netargv_sequence()`, `shell_build_command_netseq()`, or
-`shell_build_type_netseq()` to turn shell source into canonical records.
+Shellsplit remains the shell-language boundary: use the binary-safe
+`shell_build_netargv_sequence_buffer()`,
+`shell_build_command_netseq_buffer()`, or
+`shell_build_type_netseq_buffer()` to turn shell source into canonical records
+when arguments may contain NUL. The similarly named C-string builders remain
+available for NUL-free compatibility inputs.
 Shellgate expansion callbacks consume and return canonical `netargv` values,
 and its anomaly APIs accept canonical `netsequence` values. Human-facing CPL
 conversion remains explicit at the Shellgate and CLI boundaries. See

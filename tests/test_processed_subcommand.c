@@ -73,7 +73,7 @@ static int check_trusted_processed_input(void) {
   st_eval_result_t result = {0};
   if (st_policy_eval(policy, netargv, &result) != ST_OK || !result.matches)
     goto fail;
-  const char **matches = NULL;
+  st_netpattern_view_t *matches = NULL;
   size_t match_count = 0;
   if (st_policy_verify_all(policy, netargv, &matches, &match_count) != ST_OK ||
       match_count != 1) {

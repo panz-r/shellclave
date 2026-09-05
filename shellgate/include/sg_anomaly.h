@@ -23,6 +23,13 @@ extern "C" {
 /* Opaque anomaly model.  All memory is owned and freed on destroy. */
 typedef struct sg_anomaly_model sg_anomaly_model_t;
 
+/* Borrowed opaque command bytes. A valid item has non-NULL data, non-zero
+ * length, and may include embedded NUL bytes. */
+typedef struct {
+  const char *data;
+  size_t length;
+} sg_anomaly_item_view_t;
+
 /* Results returned by maintenance operations. */
 typedef enum {
   SG_ANOMALY_OK = 0,
@@ -35,7 +42,7 @@ typedef enum {
 
 /* Maximum decoded sequence-item length accepted while learning. Scoring
  * accepts longer items and treats them as unknown. Four maximum-length items
- * and their terminators fit exactly in the serialized n-gram key limit. */
+ * fit exactly in the internal concatenated-netstring key limit. */
 #define SG_ANOMALY_MAX_COMMAND_LENGTH 1023
 
 /* --- ERROR STATE --- */
@@ -82,8 +89,9 @@ void sg_anomaly_model_free(sg_anomaly_model_t *model);
  * Score a command sequence.
  *
  * `netseq` is a canonical concatenation of non-empty netstring records. Each
- * record is one opaque sequence item, such as an executable name or a nested
- * per-command type signature.
+ * record is one opaque byte sequence, such as an executable name or a nested
+ * per-command type signature. Payloads may contain NUL bytes; callers must
+ * always provide the explicit sequence length.
  *
  * Returns the average negative log-probability per command (bits).
  * Higher = more anomalous.
@@ -107,8 +115,9 @@ sg_anomaly_model_score_netseq(const sg_anomaly_model_t *model,
 /*
  * Update the model with a command sequence.
  *
- * The model copies each decoded non-empty record. The caller retains ownership
- * of `netseq`. Malformed framing is rejected without changing the model.
+ * The model copies each decoded non-empty byte record. The caller retains
+ * ownership of `netseq`. Payloads may contain NUL bytes. Malformed framing is
+ * rejected without changing the model.
  *
  * Updates every unigram and consecutive bigram, trigram, and 4-gram in the
  * sequence.
@@ -159,7 +168,12 @@ size_t sg_anomaly_model_total_trigrams(const sg_anomaly_model_t *model);
 /* Total number of 4-gram observations. */
 size_t sg_anomaly_model_total_fourgrams(const sg_anomaly_model_t *model);
 
-/* Get unigram count for a command.  Returns 0 if never seen. */
+/* Get unigram count for opaque command bytes. Returns 0 if never seen or the
+ * view is invalid. */
+size_t sg_anomaly_model_unigram_count_view(const sg_anomaly_model_t *model,
+                                           sg_anomaly_item_view_t cmd);
+
+/* NUL-free compatibility convenience wrapper for unigram_count_view(). */
 size_t sg_anomaly_model_unigram_count(const sg_anomaly_model_t *model,
                                       const char *cmd);
 
@@ -169,16 +183,37 @@ size_t sg_anomaly_model_unknown_count(const sg_anomaly_model_t *model);
 /* Get the Kneser-Ney absolute discount parameter (default 0.5). */
 double sg_anomaly_model_kneser_ney_discount(const sg_anomaly_model_t *model);
 
-/* Get bigram count for (prev, curr). Returns 0 if never seen. */
+/* Get bigram count for opaque command bytes. Returns 0 if never seen or any
+ * view is invalid. */
+size_t sg_anomaly_model_bigram_count_view(const sg_anomaly_model_t *model,
+                                          sg_anomaly_item_view_t prev,
+                                          sg_anomaly_item_view_t curr);
+
+/* NUL-free compatibility convenience wrapper for bigram_count_view(). */
 size_t sg_anomaly_model_bigram_count(const sg_anomaly_model_t *model,
                                      const char *prev, const char *curr);
 
-/* Get trigram count for (p2, p1, curr). Returns 0 if never seen. */
+/* Get trigram count for opaque command bytes. Returns 0 if never seen or any
+ * view is invalid. */
+size_t sg_anomaly_model_trigram_count_view(const sg_anomaly_model_t *model,
+                                           sg_anomaly_item_view_t p2,
+                                           sg_anomaly_item_view_t p1,
+                                           sg_anomaly_item_view_t curr);
+
+/* NUL-free compatibility convenience wrapper for trigram_count_view(). */
 size_t sg_anomaly_model_trigram_count(const sg_anomaly_model_t *model,
                                       const char *p2, const char *p1,
                                       const char *curr);
 
-/* Get 4-gram count for (p3, p2, p1, curr). Returns 0 if never seen. */
+/* Get 4-gram count for opaque command bytes. Returns 0 if never seen or any
+ * view is invalid. */
+size_t sg_anomaly_model_fourgram_count_view(const sg_anomaly_model_t *model,
+                                            sg_anomaly_item_view_t p3,
+                                            sg_anomaly_item_view_t p2,
+                                            sg_anomaly_item_view_t p1,
+                                            sg_anomaly_item_view_t curr);
+
+/* NUL-free compatibility convenience wrapper for fourgram_count_view(). */
 size_t sg_anomaly_model_fourgram_count(const sg_anomaly_model_t *model,
                                        const char *p3, const char *p2,
                                        const char *p1, const char *curr);

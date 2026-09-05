@@ -34,6 +34,7 @@
 #include <string.h>
 
 #include "sg_anomaly.h"
+#include "shell_netstring.h"
 #include "shell_processor.h"
 #include "shell_sequence.h"
 
@@ -191,20 +192,20 @@ int main(int argc, char **argv) {
         continue;
 
       size_t count = 0;
-      char *netseq = NULL;
-      if (shell_build_command_netseq(cmd, strlen(cmd), NULL, &netseq, &count) !=
-              SHELL_PROCESS_OK ||
-          !netseq) {
+      shell_netstring_buffer_t netseq = {0};
+      if (shell_build_command_netseq_buffer(cmd, strlen(cmd), NULL, &netseq,
+                                            &count) != SHELL_PROCESS_OK ||
+          !netseq.data) {
         fprintf(stderr, "Could not parse command sequence\n");
         continue;
       }
 
       /* Score the command sequence */
       double score = INFINITY;
-      sg_anomaly_status_t score_status =
-          sg_anomaly_model_score_netseq(model, netseq, strlen(netseq), &score);
+      sg_anomaly_status_t score_status = sg_anomaly_model_score_netseq(
+          model, (const char *)netseq.data, netseq.length, &score);
       if (score_status != SG_ANOMALY_OK) {
-        free(netseq);
+        shell_netstring_buffer_free(&netseq);
         fprintf(stderr, "Could not score command sequence\n");
         continue;
       }
@@ -220,13 +221,14 @@ int main(int argc, char **argv) {
       /* Update model if in learning mode */
       if (learning && count > 0) {
         if (!detected) {
-          updated = sg_anomaly_model_update_netseq(
-                        model, netseq, strlen(netseq)) == SG_ANOMALY_OK;
+          updated =
+              sg_anomaly_model_update_netseq(model, (const char *)netseq.data,
+                                             netseq.length) == SG_ANOMALY_OK;
         }
       }
 
       print_result(cmd, score, detected, updated);
-      free(netseq);
+      shell_netstring_buffer_free(&netseq);
     }
   }
 

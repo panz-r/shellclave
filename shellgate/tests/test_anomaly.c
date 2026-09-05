@@ -609,13 +609,25 @@ TEST(save_load_roundtrip) {
 
   fixture = fopen(path, "wb");
   ASSERT(fixture != NULL);
+  /* Version 5 used NUL-delimited model keys and is deliberately not
+   * compatible with binary-safe version 6. Loading remains atomic. */
   ASSERT(fprintf(fixture, "# anomaly-model-v5\n") > 0);
+  ASSERT(fprintf(fixture, "# 0.1 -10 0.5 0 0 0 0 0 0\n") > 0);
+  ASSERT(fclose(fixture) == 0);
+  errno = 0;
+  ASSERT_EQ_INT(sg_anomaly_model_load(loaded, path), SG_ANOMALY_ERR_FORMAT);
+  ASSERT_EQ_INT(errno, EPROTO);
+  ASSERT_EQ_DBL(sg_anomaly_score(loaded, commands, 5), known_score, 0.000001);
+
+  fixture = fopen(path, "wb");
+  ASSERT(fixture != NULL);
+  ASSERT(fprintf(fixture, "# anomaly-model-v6\n") > 0);
   ASSERT(fprintf(fixture, "# 0.1 -10 0.5 0 0 0 0 0 0\n") > 0);
   for (unsigned char key = 'a'; key <= 'c'; key++) {
     const uint8_t type = 1;
-    const uint32_t key_length = 2;
+    const uint32_t key_length = 4;
     const uint64_t count = INT64_MAX;
-    const unsigned char record_key[] = {key, '\0'};
+    const unsigned char record_key[] = {'1', ':', key, ','};
     ASSERT(fwrite(&type, 1, 1, fixture) == 1);
     ASSERT(fwrite(&key_length, sizeof(key_length), 1, fixture) == 1);
     ASSERT(fwrite(record_key, 1, sizeof(record_key), fixture) ==
@@ -848,6 +860,35 @@ TEST(canonical_netseq_contract) {
       SG_ANOMALY_OK);
   ASSERT(isfinite(score));
 
+  /* Netseq payloads are opaque bytes, including NUL. Canonical nested keys
+   * must keep a NUL-bearing command distinct from a different record split. */
+  static const char binary_known[] = {
+      '3', ':', 'a', '\0', 'b', ',', '1', ':', 'c', ',', '1', ':', 'd', ',',
+  };
+  static const char binary_split[] = {
+      '1', ':', 'a', ',', '3', ':', 'b', '\0', 'c', ',', '1', ':', 'd', ',',
+  };
+  ASSERT_EQ_INT(
+      sg_anomaly_model_update_netseq(model, binary_known, sizeof(binary_known)),
+      SG_ANOMALY_OK);
+  ASSERT_EQ_INT(sg_anomaly_model_has_observed_netseq(
+                    model, binary_known, sizeof(binary_known), &observed),
+                SG_ANOMALY_OK);
+  ASSERT(observed);
+  double binary_known_score = INFINITY;
+  double binary_split_score = INFINITY;
+  ASSERT_EQ_INT(sg_anomaly_model_score_netseq(model, binary_known,
+                                              sizeof(binary_known),
+                                              &binary_known_score),
+                SG_ANOMALY_OK);
+  ASSERT_EQ_INT(sg_anomaly_model_score_netseq(model, binary_split,
+                                              sizeof(binary_split),
+                                              &binary_split_score),
+                SG_ANOMALY_OK);
+  ASSERT(isfinite(binary_known_score));
+  ASSERT(isfinite(binary_split_score));
+  ASSERT(binary_known_score < binary_split_score);
+
   static const char *invalid[] = {"01:x,", "1:x", "2:x,", "0:,",
                                   "x",     "1x,", "1:x;", "1:,"};
   for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
@@ -866,10 +907,10 @@ TEST(canonical_netseq_contract) {
   ASSERT_EQ_INT(sg_anomaly_model_update_netseq(NULL, valid, sizeof(valid) - 1),
                 SG_ANOMALY_ERR_INVALID);
 
-  static const char embedded_nul[] = {'1', ':', 'x', ',', '\0',
-                                      '1', ':', 'y', ','};
-  ASSERT_EQ_INT(sg_anomaly_model_score_netseq(model, embedded_nul,
-                                              sizeof(embedded_nul), &score),
+  static const char framing_nul[] = {'1', ':', 'x', ',', '\0',
+                                     '1', ':', 'y', ','};
+  ASSERT_EQ_INT(sg_anomaly_model_score_netseq(model, framing_nul,
+                                              sizeof(framing_nul), &score),
                 SG_ANOMALY_ERR_FORMAT);
   ASSERT_EQ_INT(sg_anomaly_model_score_netseq(model, "", 0, &score),
                 SG_ANOMALY_OK);
@@ -931,6 +972,64 @@ TEST(canonical_netseq_contract) {
   sg_anomaly_model_free(model);
 }
 
+TEST(binary_netseq_persistence) {
+  static const char sequence[] = {
+      '3', ':', 'a', '\0', 'b', ',', '1', ':', 'c',
+      ',', '1', ':', 'd',  ',', '1', ':', 'e', ',',
+  };
+  const sg_anomaly_item_view_t binary = {.data = "a\0b", .length = 3};
+  const sg_anomaly_item_view_t c = {.data = "c", .length = 1};
+  const sg_anomaly_item_view_t d = {.data = "d", .length = 1};
+  const sg_anomaly_item_view_t e = {.data = "e", .length = 1};
+  char path[] = "/tmp/shellclave-anomaly-binary-XXXXXX";
+  int fd = mkstemp(path);
+  ASSERT(fd >= 0);
+  close(fd);
+  sg_anomaly_model_t *source = sg_anomaly_model_new();
+  sg_anomaly_model_t *loaded = sg_anomaly_model_new();
+  ASSERT(source != NULL && loaded != NULL);
+  ASSERT_EQ_INT(
+      sg_anomaly_model_update_netseq(source, sequence, sizeof(sequence)),
+      SG_ANOMALY_OK);
+  ASSERT_EQ_INT(sg_anomaly_model_unigram_count_view(source, binary), 1);
+  ASSERT_EQ_INT(sg_anomaly_model_bigram_count_view(source, binary, c), 1);
+  ASSERT_EQ_INT(sg_anomaly_model_trigram_count_view(source, binary, c, d), 1);
+  ASSERT_EQ_INT(sg_anomaly_model_fourgram_count_view(source, binary, c, d, e),
+                1);
+  ASSERT_EQ_INT(sg_anomaly_model_unigram_count(source, "a"), 0);
+  ASSERT_EQ_INT(
+      sg_anomaly_model_unigram_count_view(
+          source, (sg_anomaly_item_view_t){.data = binary.data, .length = 0}),
+      0);
+  ASSERT_EQ_INT(sg_anomaly_model_bigram_count_view(source, binary,
+                                                   (sg_anomaly_item_view_t){0}),
+                0);
+  double source_score = INFINITY;
+  ASSERT_EQ_INT(sg_anomaly_model_score_netseq(source, sequence,
+                                              sizeof(sequence), &source_score),
+                SG_ANOMALY_OK);
+  ASSERT_EQ_INT(sg_anomaly_model_save(source, path), SG_ANOMALY_OK);
+  ASSERT_EQ_INT(sg_anomaly_model_load(loaded, path), SG_ANOMALY_OK);
+  bool observed = false;
+  ASSERT_EQ_INT(sg_anomaly_model_has_observed_netseq(
+                    loaded, sequence, sizeof(sequence), &observed),
+                SG_ANOMALY_OK);
+  ASSERT(observed);
+  double loaded_score = INFINITY;
+  ASSERT_EQ_INT(sg_anomaly_model_score_netseq(loaded, sequence,
+                                              sizeof(sequence), &loaded_score),
+                SG_ANOMALY_OK);
+  ASSERT_EQ_DBL(loaded_score, source_score, 0.000001);
+  ASSERT_EQ_INT(sg_anomaly_model_unigram_count_view(loaded, binary), 1);
+  ASSERT_EQ_INT(sg_anomaly_model_bigram_count_view(loaded, binary, c), 1);
+  ASSERT_EQ_INT(sg_anomaly_model_trigram_count_view(loaded, binary, c, d), 1);
+  ASSERT_EQ_INT(sg_anomaly_model_fourgram_count_view(loaded, binary, c, d, e),
+                1);
+  sg_anomaly_model_free(source);
+  sg_anomaly_model_free(loaded);
+  ASSERT(unlink(path) == 0);
+}
+
 TEST(canonical_netseq_allocation_failures) {
   static const char sequence[] = "1:a,1:b,1:c,1:d,1:e,1:f,1:g,1:h,1:i,";
   sg_anomaly_model_t *probe = sg_anomaly_model_new();
@@ -988,6 +1087,7 @@ int main(void) {
   RUN(decay_removes_large_rare_model);
   RUN(prune_and_compact_preserve_common_behavior);
   RUN(canonical_netseq_contract);
+  RUN(binary_netseq_persistence);
   RUN(canonical_netseq_allocation_failures);
   printf("\n%d passed, %d failed\n", pass_count, fail_count);
   return fail_count > 0 ? 1 : 0;

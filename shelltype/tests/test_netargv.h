@@ -134,15 +134,51 @@ static inline st_error_t
 test_st_policy_verify_all(const st_policy_t *policy, const char *command,
                           const char ***matching_patterns,
                           size_t *match_count) {
+  if (matching_patterns)
+    *matching_patterns = NULL;
+  if (match_count)
+    *match_count = 0;
   char *encoded = test_netargv(command);
-  if (!encoded)
-    return command ? ST_ERR_MEMORY
-                   : st_policy_verify_all(policy, NULL, matching_patterns,
-                                          match_count);
-  st_error_t error =
-      st_policy_verify_all(policy, encoded, matching_patterns, match_count);
+  if (!encoded && command)
+    return ST_ERR_MEMORY;
+  st_netpattern_view_t *views = NULL;
+  size_t count = 0;
+  if (!matching_patterns || !match_count) {
+    st_error_t error =
+        st_policy_verify_all(policy, encoded, matching_patterns ? &views : NULL,
+                             match_count ? &count : NULL);
+    free(encoded);
+    st_policy_matches_free(views);
+    return error;
+  }
+  st_error_t error = st_policy_verify_all(policy, encoded, &views, &count);
   free(encoded);
+  if (error != ST_OK)
+    return error;
+  const char **patterns = count ? calloc(count, sizeof(*patterns)) : NULL;
+  if (!patterns && count != 0) {
+    st_policy_matches_free(views);
+    return ST_ERR_MEMORY;
+  }
+  for (size_t i = 0; i < count; i++) {
+    if (memchr(views[i].data, '\0', views[i].length)) {
+      free(patterns);
+      st_policy_matches_free(views);
+      return ST_ERR_LIMIT;
+    }
+    patterns[i] = views[i].data;
+  }
+  st_policy_matches_free(views);
+  *matching_patterns = patterns;
+  *match_count = count;
   return error;
+}
+
+/* The test adapter returns an independently allocated legacy pointer array,
+ * unlike st_policy_verify_all(), whose typed view array uses the public
+ * release function. */
+static inline void test_st_policy_matches_free(const char **matches) {
+  free((void *)matches);
 }
 
 static inline st_error_t test_st_policy_add(st_policy_t *policy,
@@ -220,7 +256,9 @@ static inline st_error_t test_st_blacklist_add(st_learner_t *learner,
   char *pattern = NULL;
   st_error_t error = st_netpattern_from_cpl(cpl, &pattern);
   if (error == ST_OK)
-    error = st_learner_blacklist_add_netpattern(learner, pattern);
+    error = st_learner_blacklist_add_netpattern(
+        learner,
+        (st_netpattern_view_t){.data = pattern, .length = strlen(pattern)});
   free(pattern);
   return error;
 }
@@ -230,7 +268,9 @@ static inline bool test_st_is_blacklisted(const st_learner_t *learner,
   char *pattern = NULL;
   if (st_netpattern_from_cpl(cpl, &pattern) != ST_OK)
     return false;
-  bool found = st_learner_is_netpattern_blacklisted(learner, pattern);
+  bool found = st_learner_is_netpattern_blacklisted(
+      learner,
+      (st_netpattern_view_t){.data = pattern, .length = strlen(pattern)});
   free(pattern);
   return found;
 }

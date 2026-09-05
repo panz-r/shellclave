@@ -1,6 +1,7 @@
 /* Core unit tests for the command policy learner. */
 
 #define _POSIX_C_SOURCE 200809L
+#include "crc32.h"
 #include "shelltype.h"
 #include "test_allocator.h"
 #include "test_io.h"
@@ -75,11 +76,8 @@ static int nodes_equal(const st_node_t *a, const st_node_t *b) {
       a->metadata_observations != b->metadata_observations ||
       a->common_metadata != b->common_metadata ||
       a->metadata_mixed != b->metadata_mixed ||
-      a->num_samples != b->num_samples || a->num_children != b->num_children)
+      a->num_children != b->num_children)
     return 0;
-  for (size_t i = 0; i < a->num_samples; i++)
-    if (strcmp(a->sample_values[i], b->sample_values[i]) != 0)
-      return 0;
   for (size_t i = 0; i < a->num_children; i++)
     if (!nodes_equal(a->children[i], b->children[i]))
       return 0;
@@ -1387,6 +1385,68 @@ static int test_serialization_roundtrip_and_validation(void) {
   return 1;
 }
 
+static int test_learner_numeric_fields_reject_hidden_bytes(void) {
+  char path[] = "/tmp/shelltype-numeric-fields-XXXXXX";
+  int fd = mkstemp(path);
+  ASSERT(fd >= 0 && close(fd) == 0);
+  snprintf(learner_temp_path, sizeof(learner_temp_path), "%s", path);
+  st_learner_t *expected = baseline_learner();
+  st_learner_t *actual = baseline_learner();
+  ASSERT(expected && actual);
+  const size_t numeric_fields[] = {0, 1, 3, 4, 6};
+  const char *fields[] = {"1", "0", "L", "0", "1", "-", "0", "echo"};
+  const char *tails[] = {"\0junk", "x", "42949672960"};
+  const size_t tail_lengths[] = {5, 1, 11};
+  /* Each corrupt fixture has valid framing and CRC so numeric validation,
+   * rather than checksum rejection, must preserve the existing learner. */
+  for (size_t field_index = 0; field_index <= 5; field_index++) {
+    const bool valid_control = field_index == 5;
+    for (size_t corruption = 0; corruption < (valid_control ? 1u : 3u);
+         corruption++) {
+      char payload[256], record[300];
+      size_t used = 0, written = 0;
+      for (size_t i = 0; i < 8; i++) {
+        char altered[32];
+        const char *value = fields[i];
+        size_t length = strlen(value);
+        if (!valid_control && i == numeric_fields[field_index]) {
+          memcpy(altered, value, length);
+          memcpy(altered + length, tails[corruption], tail_lengths[corruption]);
+          length += tail_lengths[corruption];
+          value = altered;
+        }
+        ASSERT(shell_netstring_write(payload + used, sizeof(payload) - used,
+                                     value, length,
+                                     &written) == SHELL_NETSTRING_OK);
+        used += written;
+      }
+      ASSERT(shell_netstring_write(record, sizeof(record) - 1, payload, used,
+                                   &written) == SHELL_NETSTRING_OK);
+      record[written++] = '\n';
+      uint32_t crc = st_crc32_update(record, written, 0);
+      FILE *fp = fopen(path, "wb");
+      ASSERT(fp != NULL);
+      ASSERT(fputs("# shelltype-learner v5\n# total-commands: 1\n# nodes: 1\n",
+                   fp) >= 0);
+      ASSERT(fwrite(record, 1, written, fp) == written);
+      ASSERT(fprintf(fp, "# CRC32: %08x\n", crc) > 0 && fclose(fp) == 0);
+      if (valid_control) {
+        ASSERT(st_learner_load(actual, path) == ST_OK);
+        ASSERT(actual->trie.total_commands == 1);
+      } else {
+        ASSERT(st_learner_load(actual, path) == ST_ERR_FORMAT);
+        ASSERT(actual->trie.total_commands == expected->trie.total_commands &&
+               nodes_equal(actual->trie.root, expected->trie.root));
+      }
+    }
+  }
+  st_learner_free(actual);
+  st_learner_free(expected);
+  ASSERT(unlink(path) == 0);
+  learner_temp_path[0] = '\0';
+  return 1;
+}
+
 static int test_serialization_preserves_prefix_nodes(void) {
   char path[] = "/tmp/shelltype-learner-prefix-XXXXXX";
   int fd = mkstemp(path);
@@ -1518,6 +1578,125 @@ static int test_learner_load_rejects_binary_and_overlong_lines(void) {
   st_learner_free(learner);
   ASSERT(unlink(path) == 0);
   learner_temp_path[0] = '\0';
+  return 1;
+}
+
+static int test_learner_binary_literal_roundtrip(void) {
+  static const char binary_netargv[] = {'4', ':', 'e', 'c',  'h', 'o',
+                                        ',', '2', ':', '\0', 'x', ','};
+  st_netargv_view_t netargv = {.data = binary_netargv,
+                               .length = sizeof(binary_netargv)};
+  st_netpattern_t expected = {0};
+  ASSERT(st_netpattern_from_cpl_owned("echo \"\\x00x\"", &expected) == ST_OK);
+
+  st_learner_t *learner = st_learner_new(
+      &(st_learner_config_t){.min_support = 1,
+                             .min_confidence = 0.0,
+                             .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
+  ASSERT(learner != NULL);
+  ASSERT(st_learner_feed_netargv_view(learner, netargv) == ST_OK);
+  size_t count = 0;
+  st_suggestion_t *suggestions = st_learner_suggest(learner, &count);
+  ASSERT(suggestions != NULL && count == 1 &&
+         suggestions[0].pattern_length == expected.length &&
+         memcmp(suggestions[0].pattern, expected.data, expected.length) == 0 &&
+         st_netpattern_validate_view(
+             (st_netpattern_view_t){.data = suggestions[0].pattern,
+                                    .length = suggestions[0].pattern_length},
+             NULL) == ST_OK);
+  st_suggestion_list_free(suggestions, count);
+
+  char path[] = "/tmp/shelltype-learner-binary-XXXXXX";
+  int fd = mkstemp(path);
+  ASSERT(fd >= 0 && close(fd) == 0);
+  ASSERT(st_learner_save(learner, path) == ST_OK);
+  st_learner_t *loaded = st_learner_new(
+      &(st_learner_config_t){.min_support = 1,
+                             .min_confidence = 0.0,
+                             .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
+  ASSERT(loaded != NULL && st_learner_load(loaded, path) == ST_OK);
+  suggestions = st_learner_suggest(loaded, &count);
+  ASSERT(suggestions != NULL && count == 1 &&
+         suggestions[0].pattern_length == expected.length &&
+         memcmp(suggestions[0].pattern, expected.data, expected.length) == 0);
+  st_suggestion_list_free(suggestions, count);
+
+  ASSERT(st_learner_blacklist_add_netpattern(
+             loaded, (st_netpattern_view_t){.data = expected.data,
+                                            .length = expected.length}) ==
+         ST_OK);
+  ASSERT(st_learner_is_netpattern_blacklisted(
+      loaded, (st_netpattern_view_t){.data = expected.data,
+                                     .length = expected.length}));
+  ASSERT(st_learner_suggest(loaded, &count) == NULL && count == 0);
+  st_learner_free(loaded);
+  st_learner_free(learner);
+  st_netpattern_free(&expected);
+  ASSERT(unlink(path) == 0);
+  return 1;
+}
+
+static int test_typed_token_metadata_is_span_safe(void) {
+  static const char unterminated_size[] = {'1', 'M', 'i', 'B'};
+  static const char binary_size[] = {'1', 'M', 'i', 'B', '\0', 'x'};
+  st_token_t text_tokens[] = {
+      {.text = "allocate", .type = ST_TYPE_LITERAL},
+      {.text = unterminated_size,
+       .text_length = sizeof(unterminated_size),
+       .type = ST_TYPE_SIZE},
+  };
+  st_token_array_t text_typed = {.tokens = text_tokens, .count = 2};
+  st_token_t binary_tokens[] = {
+      {.text = "allocate", .type = ST_TYPE_LITERAL},
+      {.text = binary_size,
+       .text_length = sizeof(binary_size),
+       .type = ST_TYPE_SIZE},
+  };
+  st_token_array_t binary_typed = {.tokens = binary_tokens, .count = 2};
+  st_learner_t *text_learner = st_learner_new(
+      &(st_learner_config_t){.min_support = 1,
+                             .min_confidence = 0.0,
+                             .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
+  st_learner_t *binary_learner = st_learner_new(
+      &(st_learner_config_t){.min_support = 1,
+                             .min_confidence = 0.0,
+                             .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
+  ASSERT(text_learner != NULL && binary_learner != NULL &&
+         st_learner_feed_tokens(text_learner, &text_typed) == ST_OK &&
+         st_learner_feed_tokens(text_learner, &text_typed) == ST_OK &&
+         st_learner_feed_tokens(binary_learner, &binary_typed) == ST_OK &&
+         st_learner_feed_tokens(binary_learner, &binary_typed) == ST_OK);
+
+  size_t count = 0;
+  st_suggestion_t *suggestions = st_learner_suggest(text_learner, &count);
+  ASSERT(suggestions != NULL &&
+         find_suggestion(suggestions, count, "allocate #size.MiB"));
+  st_suggestion_list_free(suggestions, count);
+
+  suggestions = st_learner_suggest(binary_learner, &count);
+  ASSERT(suggestions != NULL &&
+         find_suggestion(suggestions, count, "allocate #size") &&
+         !find_suggestion(suggestions, count, "allocate #size.MiB"));
+  st_suggestion_list_free(suggestions, count);
+  st_learner_free(text_learner);
+  st_learner_free(binary_learner);
+  for (size_t binary_first = 0; binary_first < 2; binary_first++) {
+    st_learner_t *mixed = st_learner_new(
+        &(st_learner_config_t){.min_support = 1,
+                               .min_confidence = 0.0,
+                               .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
+    ASSERT(mixed != NULL);
+    ASSERT(st_learner_feed_tokens(mixed, binary_first ? &binary_typed
+                                                      : &text_typed) == ST_OK);
+    ASSERT(st_learner_feed_tokens(
+               mixed, binary_first ? &text_typed : &binary_typed) == ST_OK);
+    suggestions = st_learner_suggest(mixed, &count);
+    ASSERT(suggestions != NULL &&
+           find_suggestion(suggestions, count, "allocate #size") &&
+           !find_suggestion(suggestions, count, "allocate #size.MiB"));
+    st_suggestion_list_free(suggestions, count);
+    st_learner_free(mixed);
+  }
   return 1;
 }
 
@@ -1841,12 +2020,13 @@ static int test_metadata_aggregation_and_v4_roundtrip(void) {
                              .min_confidence = 0.0,
                              .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
   ASSERT(uniform && mixed_a && mixed_b && loaded);
-  for (size_t i = 0; i < ST_MAX_SAMPLE_VALUES + 8; i++) {
+  const size_t observation_count = 40;
+  for (size_t i = 0; i < observation_count; i++) {
     char mib[64], gib[64];
     snprintf(mib, sizeof(mib), "allocate %zuMiB", i + 1);
     snprintf(gib, sizeof(gib), "allocate %zuGiB", i + 1);
     ASSERT(test_st_feed(uniform, mib) == ST_OK);
-    ASSERT(test_st_feed(mixed_a, i == ST_MAX_SAMPLE_VALUES + 7 ? gib : mib) ==
+    ASSERT(test_st_feed(mixed_a, i == observation_count - 1 ? gib : mib) ==
            ST_OK);
     ASSERT(test_st_feed(mixed_b, i == 0 ? gib : mib) == ST_OK);
   }
@@ -2045,8 +2225,11 @@ int main(void) {
   TEST(test_blacklist_allocation_failures_are_atomic);
   TEST(test_serialization_roundtrip_and_validation);
   TEST(test_serialization_preserves_prefix_nodes);
+  TEST(test_learner_numeric_fields_reject_hidden_bytes);
   TEST(test_learner_save_io_failures_are_atomic);
   TEST(test_learner_load_rejects_binary_and_overlong_lines);
+  TEST(test_learner_binary_literal_roundtrip);
+  TEST(test_typed_token_metadata_is_span_safe);
   TEST(test_suggestion_allocation_failures_are_clean);
   TEST(test_load_allocation_failures_preserve_learner);
   TEST(test_learner_load_read_failures_preserve_state);

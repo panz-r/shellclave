@@ -8,11 +8,10 @@ typedef struct st_trie st_trie_t;
 
 struct st_node {
   char *token;
+  size_t token_length;
   st_token_type_t type;
   uint32_t count;
   uint64_t observed_types;
-  char **sample_values;
-  size_t num_samples;
   uint32_t metadata_observations;
   uint16_t common_metadata;
   bool metadata_mixed;
@@ -29,7 +28,7 @@ struct st_trie {
 struct st_learner {
   st_trie_t trie;
   st_learner_config_t config;
-  char **blacklist;
+  st_netpattern_t *blacklist;
   size_t blacklist_count;
   size_t blacklist_capacity;
 };

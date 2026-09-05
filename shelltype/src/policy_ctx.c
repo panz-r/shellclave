@@ -31,6 +31,7 @@
 typedef struct {
   const char **slots;
   uint64_t *hashes;
+  size_t *lengths;
   size_t count;
   size_t capacity;
 } str_pool_t;
@@ -54,6 +55,12 @@ static bool str_pool_init(str_pool_t *p) {
     free(p->slots);
     return false;
   }
+  p->lengths = calloc(p->capacity, sizeof(size_t));
+  if (!p->lengths) {
+    free(p->hashes);
+    free(p->slots);
+    return false;
+  }
   p->count = 0;
   for (size_t i = 0; i < p->capacity; i++)
     p->hashes[i] = HASH_EMPTY;
@@ -63,8 +70,10 @@ static bool str_pool_init(str_pool_t *p) {
 static void str_pool_free(str_pool_t *p) {
   free(p->slots);
   free(p->hashes);
+  free(p->lengths);
   p->slots = NULL;
   p->hashes = NULL;
+  p->lengths = NULL;
   p->count = 0;
   p->capacity = 0;
 }
@@ -101,6 +110,12 @@ static bool str_pool_grow(str_pool_t *p) {
     free(new_slots);
     return false;
   }
+  size_t *new_lengths = calloc(new_cap, sizeof(size_t));
+  if (!new_lengths) {
+    free(new_hashes);
+    free(new_slots);
+    return false;
+  }
   for (size_t i = 0; i < new_cap; i++)
     new_hashes[i] = HASH_EMPTY;
   for (size_t i = 0; i < p->capacity; i++) {
@@ -111,12 +126,15 @@ static bool str_pool_grow(str_pool_t *p) {
       }
       new_slots[pos] = p->slots[i];
       new_hashes[pos] = p->hashes[i];
+      new_lengths[pos] = p->lengths[i];
     }
   }
   free(p->slots);
   free(p->hashes);
+  free(p->lengths);
   p->slots = new_slots;
   p->hashes = new_hashes;
+  p->lengths = new_lengths;
   p->capacity = new_cap;
   return true;
 }
@@ -296,10 +314,10 @@ static uint64_t str_pool_hash(const char *str, size_t len) {
   return h;
 }
 
-const char *st_policy_ctx_intern(st_policy_ctx_t *ctx, const char *str) {
-  if (!ctx || !str)
+const char *st_policy_ctx_intern_view(st_policy_ctx_t *ctx, const char *str,
+                                      size_t len) {
+  if (!ctx || (!str && len != 0))
     return NULL;
-  size_t len = strlen(str);
   if (len == 0)
     return "";
 
@@ -310,7 +328,8 @@ const char *st_policy_ctx_intern(st_policy_ctx_t *ctx, const char *str) {
   while (ctx->str_pool.hashes[pos] != HASH_EMPTY) {
     if (ctx->str_pool.hashes[pos] == h) {
       const char *existing = ctx->str_pool.slots[pos];
-      if (strcmp(existing, str) == 0) {
+      if (ctx->str_pool.lengths[pos] == len &&
+          memcmp(existing, str, len) == 0) {
         pthread_mutex_unlock(&ctx->lock);
         return existing;
       }
@@ -339,7 +358,12 @@ const char *st_policy_ctx_intern(st_policy_ctx_t *ctx, const char *str) {
 
   ctx->str_pool.slots[pos] = copy;
   ctx->str_pool.hashes[pos] = h;
+  ctx->str_pool.lengths[pos] = len;
   ctx->str_pool.count++;
   pthread_mutex_unlock(&ctx->lock);
   return copy;
+}
+
+const char *st_policy_ctx_intern(st_policy_ctx_t *ctx, const char *str) {
+  return str ? st_policy_ctx_intern_view(ctx, str, strlen(str)) : NULL;
 }

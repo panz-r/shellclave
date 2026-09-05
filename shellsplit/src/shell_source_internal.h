@@ -47,6 +47,35 @@ shell_source_parse_io_number(const char *input, size_t start, size_t end,
   return SHELL_SOURCE_IO_NUMBER_VALID;
 }
 
+/* Bash's {name}>word descriptor allocator. The braces and the redirect must
+ * be adjacent; whitespace or an invalid shell identifier leaves the text an
+ * ordinary shell word/group delimiter. */
+static inline bool shell_source_parse_named_fd(const char *input, size_t start,
+                                               size_t end, size_t *after,
+                                               size_t *name_start,
+                                               size_t *name_length) {
+  if (after)
+    *after = start;
+  if (name_start)
+    *name_start = 0;
+  if (name_length)
+    *name_length = 0;
+  if (!input || !after || !name_start || !name_length || start + 3 > end ||
+      input[start] != '{' ||
+      !(isalpha((unsigned char)input[start + 1]) || input[start + 1] == '_'))
+    return false;
+  size_t position = start + 2;
+  while (position < end &&
+         (isalnum((unsigned char)input[position]) || input[position] == '_'))
+    position++;
+  if (position >= end || input[position] != '}')
+    return false;
+  *name_start = start + 1;
+  *name_length = position - *name_start;
+  *after = position + 1;
+  return true;
+}
+
 /* The lexical source scanner must accept every pending heredoc that the fast
  * tokenizer can represent. Dependency-graph document limits remain separate
  * and are enforced only when a graph is built. */
@@ -110,6 +139,223 @@ static inline size_t shell_source_skip_quoted_text(const char *input,
   return position;
 }
 
+/* Bash ANSI-C quotes are a single shell-word fragment. */
+static inline size_t shell_source_skip_ansi_c_quote(const char *input,
+                                                    size_t length,
+                                                    size_t position) {
+  if (!input || position + 1 >= length || input[position] != '$' ||
+      input[position + 1] != '\'')
+    return position;
+  position += 2;
+  while (position < length) {
+    if (input[position] == '\\' && position + 1 < length) {
+      position += 2;
+    } else if (input[position++] == '\'') {
+      break;
+    }
+  }
+  return position;
+}
+
+/* Return the byte after one complete ANSI-C quote. Keeping completion checking
+ * beside the lexical skipper prevents structural scanners from accidentally
+ * treating an escaped apostrophe in $'...' as the end of a plain single quote.
+ */
+static inline bool shell_source_skip_complete_ansi_c_quote(const char *input,
+                                                           size_t length,
+                                                           size_t position,
+                                                           size_t *after) {
+  if (!after)
+    return false;
+  size_t quoted = shell_source_skip_ansi_c_quote(input, length, position);
+  if (quoted <= position + 2 || quoted > length || input[quoted - 1] != '\'')
+    return false;
+  *after = quoted;
+  return true;
+}
+
+/* Decode one complete Bash ANSI-C quote through a byte visitor. This is shared
+ * by canonical argv rendering and heredoc delimiter matching so both paths
+ * retain identical escape semantics. A false visitor result aborts decoding;
+ * callers that need to distinguish output failure from malformed source keep
+ * that detail in their visitor context. */
+typedef bool (*shell_source_byte_visitor_t)(unsigned char byte, void *context);
+
+static inline int shell_source_ansi_hex_value(char value) {
+  if (value >= '0' && value <= '9')
+    return value - '0';
+  if (value >= 'a' && value <= 'f')
+    return value - 'a' + 10;
+  if (value >= 'A' && value <= 'F')
+    return value - 'A' + 10;
+  return -1;
+}
+
+static inline bool shell_source_ansi_emit(shell_source_byte_visitor_t visitor,
+                                          void *context, unsigned char byte) {
+  return !visitor || visitor(byte, context);
+}
+
+static inline bool
+shell_source_ansi_emit_codepoint(shell_source_byte_visitor_t visitor,
+                                 void *context, uint32_t value) {
+  /* Bash retains its historical UTF-8 byte forms for ANSI-C code points.
+   * Values above INT32_MAX expand to no bytes. */
+  if (value > INT32_MAX)
+    return true;
+  if (value <= 0x7f)
+    return shell_source_ansi_emit(visitor, context, (unsigned char)value);
+  unsigned char encoded[6];
+  size_t count = value <= 0x7ff       ? 2
+                 : value <= 0xffff    ? 3
+                 : value <= 0x1fffff  ? 4
+                 : value <= 0x3ffffff ? 5
+                                      : 6;
+  for (size_t i = count; i-- > 1;) {
+    encoded[i] = (unsigned char)(0x80 | (value & 0x3f));
+    value >>= 6;
+  }
+  encoded[0] = (unsigned char)((count == 2   ? 0xc0
+                                : count == 3 ? 0xe0
+                                : count == 4 ? 0xf0
+                                : count == 5 ? 0xf8
+                                             : 0xfc) |
+                               value);
+  for (size_t i = 0; i < count; i++)
+    if (!shell_source_ansi_emit(visitor, context, encoded[i]))
+      return false;
+  return true;
+}
+
+/* `position` starts at '$' and is advanced past the closing quote. */
+static inline bool shell_source_decode_ansi_c_quote(
+    const char *text, size_t length, size_t *position,
+    shell_source_byte_visitor_t visitor, void *context) {
+  if (!text || !position || *position + 1 >= length || text[*position] != '$' ||
+      text[*position + 1] != '\'')
+    return false;
+  *position += 2;
+  while (*position < length) {
+    unsigned char value = (unsigned char)text[(*position)++];
+    if (value == '\'')
+      return true;
+    if (value != '\\') {
+      if (!shell_source_ansi_emit(visitor, context, value))
+        return false;
+      continue;
+    }
+    if (*position == length)
+      return false;
+    char escape = text[(*position)++];
+    unsigned char decoded = 0;
+    switch (escape) {
+    case 'a':
+      decoded = '\a';
+      break;
+    case 'b':
+      decoded = '\b';
+      break;
+    case 'e':
+    case 'E':
+      decoded = 0x1b;
+      break;
+    case 'f':
+      decoded = '\f';
+      break;
+    case 'n':
+      decoded = '\n';
+      break;
+    case 'r':
+      decoded = '\r';
+      break;
+    case 't':
+      decoded = '\t';
+      break;
+    case 'v':
+      decoded = '\v';
+      break;
+    case '\\':
+    case '\'':
+    case '"':
+    case '?':
+      decoded = (unsigned char)escape;
+      break;
+    case 'c':
+      if (*position == length || text[*position] == '\'') {
+        if (!shell_source_ansi_emit(visitor, context, (unsigned char)'\\'))
+          return false;
+        decoded = 'c';
+      } else {
+        decoded = (unsigned char)text[(*position)++];
+        decoded = decoded == '?' ? 0x7f : (unsigned char)(decoded & 0x1f);
+      }
+      break;
+    case 'x': {
+      int digit = *position < length
+                      ? shell_source_ansi_hex_value(text[*position])
+                      : -1;
+      if (digit < 0) {
+        if (!shell_source_ansi_emit(visitor, context, (unsigned char)'\\'))
+          return false;
+        decoded = 'x';
+        break;
+      }
+      unsigned value = 0;
+      for (size_t digits = 0; digits < 2 && digit >= 0; digits++) {
+        value = (value << 4) | (unsigned)digit;
+        (*position)++;
+        digit = *position < length
+                    ? shell_source_ansi_hex_value(text[*position])
+                    : -1;
+      }
+      decoded = (unsigned char)value;
+      break;
+    }
+    case 'u':
+    case 'U': {
+      size_t digits = escape == 'u' ? 4 : 8;
+      uint32_t codepoint = 0;
+      size_t consumed = 0;
+      while (consumed < digits && *position + consumed < length) {
+        int digit = shell_source_ansi_hex_value(text[*position + consumed]);
+        if (digit < 0)
+          break;
+        codepoint = (codepoint << 4) | (uint32_t)digit;
+        consumed++;
+      }
+      if (consumed == 0) {
+        if (!shell_source_ansi_emit(visitor, context, (unsigned char)'\\'))
+          return false;
+        decoded = (unsigned char)escape;
+      } else {
+        *position += consumed;
+        if (!shell_source_ansi_emit_codepoint(visitor, context, codepoint))
+          return false;
+        continue;
+      }
+      break;
+    }
+    default:
+      if (escape >= '0' && escape <= '7') {
+        unsigned value = (unsigned)(escape - '0');
+        for (size_t i = 0; i < 2 && *position < length &&
+                           text[*position] >= '0' && text[*position] <= '7';
+             i++)
+          value = (value << 3) | (unsigned)(text[(*position)++] - '0');
+        decoded = (unsigned char)value;
+      } else {
+        if (!shell_source_ansi_emit(visitor, context, (unsigned char)'\\'))
+          return false;
+        decoded = (unsigned char)escape;
+      }
+      break;
+    }
+    if (!shell_source_ansi_emit(visitor, context, decoded))
+      return false;
+  }
+  return false;
+}
+
 typedef struct {
   const char *word;
   size_t word_length;
@@ -161,6 +407,14 @@ shell_source_parse_heredoc_delimiter(const char *input, size_t length,
       cursor += 2;
       continue;
     }
+    if (c == '$' && cursor + 1 < length && input[cursor + 1] == '\'') {
+      size_t after = 0;
+      if (!shell_source_skip_complete_ansi_c_quote(input, length, cursor,
+                                                   &after))
+        return false;
+      cursor = after;
+      continue;
+    }
     if (c == '\'' || c == '"') {
       quote = c;
       cursor++;
@@ -181,17 +435,60 @@ shell_source_parse_heredoc_delimiter(const char *input, size_t length,
   return true;
 }
 
+typedef struct {
+  const char *input;
+  size_t text;
+  size_t end;
+  bool mismatch;
+  bool terminated;
+} shell_source_heredoc_match_t;
+
+static inline bool shell_source_match_heredoc_byte(unsigned char byte,
+                                                   void *context) {
+  shell_source_heredoc_match_t *match = context;
+  /* Bash stores a heredoc delimiter as a C string: the first ANSI-C NUL
+   * terminates its spelling and any remaining quote bytes are irrelevant. */
+  if (match->terminated || match->mismatch)
+    return true;
+  if (byte == '\0') {
+    match->terminated = true;
+    return true;
+  }
+  if (match->text == match->end || match->input[match->text] != (char)byte) {
+    match->mismatch = true;
+    return true;
+  }
+  match->text++;
+  return true;
+}
+
 static inline bool shell_source_line_is_heredoc_delimiter(
     const char *input, size_t length, size_t line,
     const shell_source_pending_heredoc_t *pending) {
+  if (!input || !pending || !pending->word)
+    return false;
   size_t text = line;
   if (pending->strip_tabs)
     while (text < length && input[text] == '\t')
       text++;
-  size_t end = shell_source_line_content_end(input, length, text);
+  shell_source_heredoc_match_t match = {
+      .input = input,
+      .text = text,
+      .end = shell_source_line_content_end(input, length, text),
+  };
   char quote = '\0';
   for (size_t word = 0; word < pending->word_length;) {
     char c = pending->word[word++];
+    if (quote == '\0' && c == '$' && word < pending->word_length &&
+        pending->word[word] == '\'') {
+      size_t position = word - 1;
+      if (!shell_source_decode_ansi_c_quote(
+              pending->word, pending->word_length, &position,
+              shell_source_match_heredoc_byte, &match))
+        return false;
+      word = position;
+      continue;
+    }
     if (quote != '\0') {
       if (c == quote) {
         quote = '\0';
@@ -210,10 +507,10 @@ static inline bool shell_source_line_is_heredoc_delimiter(
         return false;
       c = pending->word[word++];
     }
-    if (text == end || input[text++] != c)
+    if (!shell_source_match_heredoc_byte((unsigned char)c, &match))
       return false;
   }
-  return quote == '\0' && text == end;
+  return quote == '\0' && !match.mismatch && match.text == match.end;
 }
 
 /* A quoted delimiter disables expansion of its document body. The parser
@@ -298,6 +595,14 @@ static inline bool shell_source_skip_heredoc_sequence(const char *input,
       cursor += 2;
       continue;
     }
+    if (c == '$' && cursor + 1 < line_end && input[cursor + 1] == '\'') {
+      size_t quoted = shell_source_skip_ansi_c_quote(input, line_end, cursor);
+      if (quoted <= cursor + 2 || quoted > line_end ||
+          input[quoted - 1] != '\'')
+        return false;
+      cursor = quoted;
+      continue;
+    }
     if (c == '\'' || c == '"' || c == '`') {
       size_t quoted = shell_source_skip_quoted_text(input, line_end, cursor, c);
       if (quoted > line_end)
@@ -369,6 +674,13 @@ static inline bool shell_source_skip_arithmetic_expansion(const char *input,
     char c = input[position];
     if (c == '\\' && position + 1 < length) {
       position++;
+    } else if (c == '$' && position + 1 < length &&
+               input[position + 1] == '\'') {
+      size_t quoted = 0;
+      if (!shell_source_skip_complete_ansi_c_quote(input, length, position,
+                                                   &quoted))
+        return false;
+      position = quoted - 1;
     } else if (c == '\'' || c == '"' || c == '`') {
       position = shell_source_skip_quoted_text(input, length, position, c) - 1;
     } else if (c == '$' && position + 2 < length &&
@@ -419,6 +731,13 @@ static inline bool shell_source_find_balanced_parentheses(const char *input,
     char c = input[position];
     if (c == '\\' && position + 1 < length) {
       position++;
+    } else if (c == '$' && position + 1 < length &&
+               input[position + 1] == '\'') {
+      size_t quoted = 0;
+      if (!shell_source_skip_complete_ansi_c_quote(input, length, position,
+                                                   &quoted))
+        return false;
+      position = quoted - 1;
     } else if (c == '\'' || c == '"') {
       position = shell_source_skip_quoted_text(input, length, position, c) - 1;
     } else if (c == '`') {
@@ -474,6 +793,111 @@ static inline size_t shell_source_skip_balanced_parentheses(const char *input,
   return after;
 }
 
+/* Skip an array subscript beginning at an opening `[`. Array expressions are
+ * not evaluated by Shellsplit, but their structural delimiters must still be
+ * recognized accurately so quoted or substituted `]` bytes cannot terminate
+ * the surrounding parameter or assignment early. */
+static inline bool shell_source_skip_array_subscript(const char *input,
+                                                     size_t length,
+                                                     size_t position,
+                                                     size_t *after) {
+  if (!input || !after || position >= length || input[position] != '[')
+    return false;
+
+  size_t depth = 1;
+  for (position++; position < length; position++) {
+    char c = input[position];
+    if (c == '\\' && position + 1 < length) {
+      position++;
+    } else if (c == '$' && position + 1 < length &&
+               input[position + 1] == '\'') {
+      size_t quoted = 0;
+      if (!shell_source_skip_complete_ansi_c_quote(input, length, position,
+                                                   &quoted))
+        return false;
+      position = quoted - 1;
+    } else if (c == '\'' || c == '"' || c == '`') {
+      size_t quoted = shell_source_skip_quoted_text(input, length, position, c);
+      if (quoted <= position + 1 || quoted > length || input[quoted - 1] != c)
+        return false;
+      position = quoted - 1;
+    } else if (c == '$' && position + 2 < length &&
+               input[position + 1] == '(' && input[position + 2] == '(') {
+      size_t arithmetic_after = 0;
+      if (!shell_source_skip_arithmetic_expansion(input, length, position,
+                                                  &arithmetic_after))
+        return false;
+      position = arithmetic_after - 1;
+    } else if (c == '$' && position + 1 < length &&
+               input[position + 1] == '(') {
+      size_t substitution_after = 0;
+      if (!shell_source_find_balanced_parentheses(input, length, position + 1,
+                                                  &substitution_after))
+        return false;
+      position = substitution_after - 1;
+    } else if (c == '[') {
+      depth++;
+    } else if (c == ']') {
+      depth--;
+      if (depth == 0) {
+        *after = position + 1;
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+/* Identify the array-only form of a braced parameter expansion.  A bracket
+ * elsewhere in `${parameter-word}` is normally a pattern, not an array
+ * subscript, so callers must not use a raw `[` search for this distinction. */
+static inline bool
+shell_source_find_parameter_array_subscript(const char *input, size_t length,
+                                            size_t position, size_t *after,
+                                            size_t *subscript_start) {
+  if (!input || !after || !subscript_start || position + 2 >= length ||
+      input[position] != '$' || input[position + 1] != '{')
+    return false;
+
+  *subscript_start = 0;
+  size_t cursor = position + 2;
+  if (cursor < length && (input[cursor] == '#' || input[cursor] == '!'))
+    cursor++;
+  if (cursor >= length ||
+      !(isalpha((unsigned char)input[cursor]) || input[cursor] == '_'))
+    return false;
+  while (cursor < length &&
+         (isalnum((unsigned char)input[cursor]) || input[cursor] == '_'))
+    cursor++;
+  if (cursor >= length || input[cursor] != '[')
+    return false;
+
+  *subscript_start = cursor;
+  return shell_source_skip_array_subscript(input, length, cursor, after);
+}
+
+/* A compound array assignment remains array grammar wherever it appears:
+ * unlike `a[0]=word`, Bash cannot reinterpret `a=(one two)` as one ordinary
+ * command argument after a command word. */
+static inline bool shell_source_array_assignment_is_compound(const char *input,
+                                                             size_t length) {
+  if (!input || length < 4 ||
+      !(isalpha((unsigned char)input[0]) || input[0] == '_'))
+    return false;
+  size_t position = 1;
+  while (position < length &&
+         (isalnum((unsigned char)input[position]) || input[position] == '_'))
+    position++;
+  if (position < length && input[position] == '[') {
+    if (!shell_source_skip_array_subscript(input, length, position, &position))
+      return false;
+  }
+  if (position < length && input[position] == '+')
+    position++;
+  return position + 1 < length && input[position] == '=' &&
+         input[position + 1] == '(';
+}
+
 /* Skip one complete shell word while retaining its raw source span. Unlike a
  * redirect operand, this reports an incomplete substitution or quote so
  * callers that need complete syntax can reject it rather than flattening the
@@ -485,6 +909,14 @@ static inline bool shell_source_skip_shell_word(const char *input,
     return false;
   while (position < length) {
     char c = input[position];
+    if (c == '$' && position + 1 < length && input[position + 1] == '\'') {
+      size_t quoted = shell_source_skip_ansi_c_quote(input, length, position);
+      if (quoted <= position + 2 || quoted > length ||
+          input[quoted - 1] != '\'')
+        return false;
+      position = quoted;
+      continue;
+    }
     if (c == '\\') {
       if (position + 1 >= length)
         return false;
@@ -534,6 +966,13 @@ static inline size_t shell_source_skip_redirect_word(const char *input,
                                                      size_t end) {
   while (position < end) {
     char c = input[position];
+    if (c == '$' && position + 1 < end && input[position + 1] == '\'') {
+      size_t quoted = shell_source_skip_ansi_c_quote(input, end, position);
+      if (quoted <= position + 2 || quoted > end || input[quoted - 1] != '\'')
+        return end;
+      position = quoted;
+      continue;
+    }
     if (c == '\\' && position + 1 < end) {
       position += 2;
       continue;
@@ -580,11 +1019,23 @@ static inline size_t shell_source_skip_redirect(const char *input,
     return position;
   size_t cursor = position;
   uint32_t descriptor = 0;
-  if (shell_source_parse_io_number(input, position, end, &cursor,
-                                   &descriptor) ==
-      SHELL_SOURCE_IO_NUMBER_OVERFLOW)
+  size_t name_start = 0, name_length = 0;
+  bool named_fd = shell_source_parse_named_fd(input, position, end, &cursor,
+                                              &name_start, &name_length);
+  if (!named_fd && shell_source_parse_io_number(input, position, end, &cursor,
+                                                &descriptor) ==
+                       SHELL_SOURCE_IO_NUMBER_OVERFLOW)
+    return position;
+  /* Bash requires `{name}` immediately before its redirect operator. Numeric
+   * io_number syntax permits no whitespace either, but only named FDs need
+   * this explicit check because their closing brace is otherwise a word. */
+  if (named_fd && cursor < end && isspace((unsigned char)input[cursor]))
     return position;
   while (cursor < end && isspace((unsigned char)input[cursor]))
+    cursor++;
+  bool combined_output =
+      cursor + 1 < end && input[cursor] == '&' && input[cursor + 1] == '>';
+  if (combined_output)
     cursor++;
   if (cursor == end || (input[cursor] != '<' && input[cursor] != '>'))
     return position;
@@ -639,6 +1090,10 @@ static inline size_t shell_source_skip_redirect(const char *input,
   } else {
     cursor = shell_source_skip_redirect_word(input, cursor, end);
   }
+  (void)combined_output;
+  (void)named_fd;
+  (void)name_start;
+  (void)name_length;
   return operand == cursor ? position : cursor;
 }
 

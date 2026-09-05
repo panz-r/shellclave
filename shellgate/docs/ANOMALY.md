@@ -119,9 +119,10 @@ without rebuilding shell source. `sg_gate_score_anomaly_netseq()` accepts
 matching raw and type netsequences: the raw sequence has one executable-name
 record per command and the type sequence has one nested type-netargv record per
 command. It is read-only: it neither learns nor changes adaptive or Bayesian
-threshold state. Use `shell_build_command_netseq()` and
-`shell_build_type_netseq()` to construct the matching pair from source when
-needed.
+threshold state. Use `shell_build_command_netseq_buffer()` and
+`shell_build_type_netseq_buffer()` to construct the matching pair from source
+when payloads may contain NUL; their legacy C-string counterparts are suitable
+only for NUL-free records.
 
 ## Type Sequence Caching
 
@@ -163,8 +164,9 @@ Sequences with < 3 commands are not scored for anomaly detection (score = 0, det
 - Save/load both models atomically with `sg_gate_save_anomaly_model()` /
   `sg_gate_load_anomaly_model()`.
 - Gate persistence uses the checksummed v2 bundle containing raw and type
-  models. Standalone models use v5. Older files and the former `_type` sidecar
-  layout are rejected because their n-gram units have different semantics.
+  models. Standalone models use v6. Version 5 and older files, plus the former
+  `_type` sidecar layout, are rejected because their NUL-delimited n-gram keys
+  cannot represent the current opaque byte-item semantics.
 
 ## Long-Running Model Maintenance
 

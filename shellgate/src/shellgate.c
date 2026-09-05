@@ -87,9 +87,10 @@ static const char *bw_copy(buf_writer_t *w, const char *src, size_t src_len) {
   return result;
 }
 
-static const char *bw_copy_policy_cpl(buf_writer_t *w, const char *netpattern) {
+static const char *bw_copy_policy_cpl(buf_writer_t *w,
+                                      st_netpattern_view_t netpattern) {
   char *cpl = NULL;
-  if (st_netpattern_to_cpl(netpattern, &cpl) != ST_OK)
+  if (st_netpattern_to_cpl_view(netpattern, &cpl) != ST_OK)
     return NULL;
   const char *copy = bw_copy(w, cpl, strlen(cpl));
   free(cpl);
@@ -128,6 +129,7 @@ typedef struct {
   char *key;   /* command string (owned) */
   char *value; /* type sequence string (owned) */
   size_t key_len;
+  size_t value_len;
   size_t value_count;
 } lru_entry_t;
 
@@ -156,7 +158,8 @@ static void type_cache_free(type_cache_t *c) {
 
 static void cdf_free(sg_gate_t *gate);
 static const char *type_cache_lookup(type_cache_t *c, const char *key,
-                                     size_t key_len, size_t *value_count) {
+                                     size_t key_len, size_t *value_count,
+                                     size_t *value_len) {
   if (!c->entries || c->count == 0)
     return NULL;
   for (size_t i = 0; i < c->count; i++) {
@@ -169,6 +172,7 @@ static const char *type_cache_lookup(type_cache_t *c, const char *key,
         c->entries[c->count - 1] = tmp;
       }
       *value_count = c->entries[c->count - 1].value_count;
+      *value_len = c->entries[c->count - 1].value_len;
       return c->entries[c->count - 1].value;
     }
   }
@@ -179,7 +183,8 @@ static const char *type_cache_lookup(type_cache_t *c, const char *key,
  * Takes ownership of value on success; caller must NOT free it.
  * Returns true on success, false on allocation failure. */
 static bool type_cache_insert(type_cache_t *c, const char *key, size_t key_len,
-                              char *value, size_t value_count) {
+                              char *value, size_t value_count,
+                              size_t value_len) {
   if (c->capacity == 0)
     return false;
 
@@ -201,6 +206,7 @@ static bool type_cache_insert(type_cache_t *c, const char *key, size_t key_len,
   c->entries[c->count].key_len = key_len;
   c->entries[c->count].value = value;
   c->entries[c->count].value_count = value_count;
+  c->entries[c->count].value_len = value_len;
   c->count++;
   return true;
 }
@@ -1051,14 +1057,17 @@ size_t sg_cpl_token_variants_at(const char *pattern, size_t edit_pos,
   if (pattern[0] == '\0')
     return 0;
 
-  char *netpattern = NULL;
+  st_netpattern_t netpattern = {0};
   st_token_array_t decoded = {0};
-  if (st_netpattern_from_cpl(pattern, &netpattern) != ST_OK ||
-      st_netpattern_decode(netpattern, &decoded) != ST_OK) {
-    free(netpattern);
+  if (st_netpattern_from_cpl_owned(pattern, &netpattern) != ST_OK ||
+      st_netpattern_decode_view(
+          (st_netpattern_view_t){.data = netpattern.data,
+                                 .length = netpattern.length},
+          &decoded) != ST_OK) {
+    st_netpattern_free(&netpattern);
     return 0;
   }
-  free(netpattern);
+  st_netpattern_free(&netpattern);
   size_t out =
       st_token_variants_at(&decoded, edit_pos, out_variants, max_variants);
   st_token_array_free(&decoded);
@@ -1096,6 +1105,22 @@ static sg_error_t gate_remove_netpattern(st_policy_t *policy,
   if (!netpattern)
     return SG_ERR_INVALID;
   return policy_mutation_error(st_policy_remove_netpattern(policy, netpattern));
+}
+
+static sg_error_t gate_add_netpattern_view(st_policy_t *policy,
+                                           st_netpattern_view_t netpattern) {
+  if (!netpattern.data || netpattern.length == 0)
+    return SG_ERR_INVALID;
+  return policy_mutation_error(
+      st_policy_add_netpattern_view(policy, netpattern));
+}
+
+static sg_error_t gate_remove_netpattern_view(st_policy_t *policy,
+                                              st_netpattern_view_t netpattern) {
+  if (!netpattern.data || netpattern.length == 0)
+    return SG_ERR_INVALID;
+  return policy_mutation_error(
+      st_policy_remove_netpattern_view(policy, netpattern));
 }
 
 static sg_error_t gate_batch_add_netpatterns(st_policy_t *policy,
@@ -1162,24 +1187,30 @@ sg_error_t sg_gate_batch_add_allow_netpatterns(sg_gate_t *gate,
 sg_error_t sg_gate_add_allow_cpl(sg_gate_t *gate, const char *pattern) {
   if (!gate || !pattern)
     return SG_ERR_INVALID;
-  char *netpattern = NULL;
-  st_error_t error = st_netpattern_from_cpl(pattern, &netpattern);
-  sg_error_t result = error == ST_OK
-                          ? sg_gate_add_allow_netpattern(gate, netpattern)
-                          : policy_mutation_error(error);
-  free(netpattern);
+  st_netpattern_t netpattern = {0};
+  st_error_t error = st_netpattern_from_cpl_owned(pattern, &netpattern);
+  sg_error_t result =
+      error == ST_OK ? gate_add_netpattern_view(
+                           gate->policy,
+                           (st_netpattern_view_t){.data = netpattern.data,
+                                                  .length = netpattern.length})
+                     : policy_mutation_error(error);
+  st_netpattern_free(&netpattern);
   return result;
 }
 
 sg_error_t sg_gate_remove_allow_cpl(sg_gate_t *gate, const char *pattern) {
   if (!gate || !pattern)
     return SG_ERR_INVALID;
-  char *netpattern = NULL;
-  st_error_t error = st_netpattern_from_cpl(pattern, &netpattern);
-  sg_error_t result = error == ST_OK
-                          ? sg_gate_remove_allow_netpattern(gate, netpattern)
-                          : policy_mutation_error(error);
-  free(netpattern);
+  st_netpattern_t netpattern = {0};
+  st_error_t error = st_netpattern_from_cpl_owned(pattern, &netpattern);
+  sg_error_t result =
+      error == ST_OK ? gate_remove_netpattern_view(
+                           gate->policy,
+                           (st_netpattern_view_t){.data = netpattern.data,
+                                                  .length = netpattern.length})
+                     : policy_mutation_error(error);
+  st_netpattern_free(&netpattern);
   return result;
 }
 
@@ -1214,24 +1245,30 @@ sg_error_t sg_gate_batch_add_deny_netpatterns(sg_gate_t *gate,
 sg_error_t sg_gate_add_deny_cpl(sg_gate_t *gate, const char *pattern) {
   if (!gate || !pattern)
     return SG_ERR_INVALID;
-  char *netpattern = NULL;
-  st_error_t error = st_netpattern_from_cpl(pattern, &netpattern);
-  sg_error_t result = error == ST_OK
-                          ? sg_gate_add_deny_netpattern(gate, netpattern)
-                          : policy_mutation_error(error);
-  free(netpattern);
+  st_netpattern_t netpattern = {0};
+  st_error_t error = st_netpattern_from_cpl_owned(pattern, &netpattern);
+  sg_error_t result =
+      error == ST_OK ? gate_add_netpattern_view(
+                           gate->deny_policy,
+                           (st_netpattern_view_t){.data = netpattern.data,
+                                                  .length = netpattern.length})
+                     : policy_mutation_error(error);
+  st_netpattern_free(&netpattern);
   return result;
 }
 
 sg_error_t sg_gate_remove_deny_cpl(sg_gate_t *gate, const char *pattern) {
   if (!gate || !pattern)
     return SG_ERR_INVALID;
-  char *netpattern = NULL;
-  st_error_t error = st_netpattern_from_cpl(pattern, &netpattern);
-  sg_error_t result = error == ST_OK
-                          ? sg_gate_remove_deny_netpattern(gate, netpattern)
-                          : policy_mutation_error(error);
-  free(netpattern);
+  st_netpattern_t netpattern = {0};
+  st_error_t error = st_netpattern_from_cpl_owned(pattern, &netpattern);
+  sg_error_t result =
+      error == ST_OK ? gate_remove_netpattern_view(
+                           gate->deny_policy,
+                           (st_netpattern_view_t){.data = netpattern.data,
+                                                  .length = netpattern.length})
+                     : policy_mutation_error(error);
+  st_netpattern_free(&netpattern);
   return result;
 }
 
@@ -1295,12 +1332,18 @@ static bool measure_expansion_display(const char *encoded, size_t length,
   while ((status = shell_netstring_iter_next(&iter, &view)) ==
          SHELL_NETSTRING_OK) {
     size_t separator = count != 0 ? 1 : 0;
+    size_t payload_display = 0;
+    for (size_t i = 0; i < view.payload_length; i++) {
+      unsigned char byte = view.payload[i];
+      size_t width = (byte >= 0x20 && byte <= 0x7e && byte != '\\') ? 1 : 4;
+      if (payload_display > SIZE_MAX - width)
+        return false;
+      payload_display += width;
+    }
     if (used > SIZE_MAX - separator ||
-        view.payload_length > SIZE_MAX - used - separator)
+        payload_display > SIZE_MAX - used - separator)
       return false;
-    if (memchr(view.payload, '\0', view.payload_length) != NULL)
-      return false;
-    used += (count != 0) + view.payload_length;
+    used += separator + payload_display;
     count++;
   }
   if (status != SHELL_NETSTRING_DONE)
@@ -1328,8 +1371,18 @@ static bool write_expansion_display(const char *encoded, size_t length,
   while (shell_netstring_iter_next(&iter, &view) == SHELL_NETSTRING_OK) {
     if (count)
       display[used++] = ' ';
-    memcpy(display + used, view.payload, view.payload_length);
-    used += view.payload_length;
+    for (size_t i = 0; i < view.payload_length; i++) {
+      unsigned char byte = view.payload[i];
+      if (byte >= 0x20 && byte <= 0x7e && byte != '\\') {
+        display[used++] = (char)byte;
+      } else {
+        static const char hex[] = "0123456789abcdef";
+        display[used++] = '\\';
+        display[used++] = 'x';
+        display[used++] = hex[byte >> 4];
+        display[used++] = hex[byte & 0x0f];
+      }
+    }
     count++;
   }
   display[used] = '\0';
@@ -1349,9 +1402,8 @@ typedef struct {
 
 static bool valid_expansion_netargv(const char *netargv, size_t length) {
   return (netargv != NULL || length == 0) &&
-         (length == 0 || (memchr(netargv, '\0', length) == NULL &&
-                          shell_netstring_validate(netargv, length, NULL) ==
-                              SHELL_NETSTRING_OK));
+         (length == 0 || shell_netstring_validate(netargv, length, NULL) ==
+                             SHELL_NETSTRING_OK);
 }
 
 static const char *build_cmd_string(const shell_dep_cmd_t *cmd,
@@ -1690,41 +1742,13 @@ static bool sg_name_found(const char *needle, uint32_t needle_len,
 }
 
 /* Graph document paths retain their original source spelling for diagnostics.
- * Traverse an isolated shell word without materializing its decoded form so
- * every literal path rule applies the same quote and backslash semantics. A
- * false callback result stops traversal after a decisive match or mismatch. */
-typedef bool (*sg_decoded_word_visitor_t)(char byte, size_t decoded_pos,
-                                          void *context);
-
+ * Shellsplit traverses an isolated source word without materializing it, so
+ * path rules share canonical argv's quote, escape, and ANSI-C semantics. */
 static void sg_visit_decoded_word(const char *word, uint32_t word_len,
-                                  sg_decoded_word_visitor_t visitor,
+                                  shell_decoded_word_visitor_t visitor,
                                   void *context) {
-  char quote = '\0';
-  size_t decoded_pos = 0;
-  for (uint32_t pos = 0; pos < word_len; pos++) {
-    char byte = word[pos];
-    bool emit = true;
-    if (quote == '\0' && (byte == '\'' || byte == '"')) {
-      quote = byte;
-      emit = false;
-    } else if (quote != '\0' && byte == quote) {
-      quote = '\0';
-      emit = false;
-    } else if (byte == '\\' && quote != '\'' && pos + 1 < word_len) {
-      char next = word[pos + 1];
-      if (quote == '\0' || next == '$' || next == '`' || next == '"' ||
-          next == '\\' || next == '\n') {
-        pos++;
-        byte = next;
-        emit = next != '\n';
-      }
-    }
-    if (!emit)
-      continue;
-    if (!visitor(byte, decoded_pos, context))
-      return;
-    decoded_pos++;
-  }
+  size_t ignored = 0;
+  (void)shell_visit_decoded_word(word, word_len, visitor, context, &ignored);
 }
 
 typedef struct {
@@ -1735,10 +1759,11 @@ typedef struct {
   bool matches;
 } sg_decoded_prefix_match_t;
 
-static bool sg_decoded_prefix_visit(char byte, size_t decoded_pos,
+static bool sg_decoded_prefix_visit(unsigned char byte, size_t decoded_pos,
                                     void *context) {
   sg_decoded_prefix_match_t *match = context;
-  if (decoded_pos < match->prefix_len && byte != match->prefix[decoded_pos]) {
+  if (decoded_pos < match->prefix_len &&
+      byte != (unsigned char)match->prefix[decoded_pos]) {
     match->matches = false;
     return false;
   }
@@ -1794,14 +1819,15 @@ static size_t sg_decoded_match_fallback(const char *needle,
   return 0;
 }
 
-static bool sg_decoded_contains_visit(char byte, size_t decoded_pos,
+static bool sg_decoded_contains_visit(unsigned char byte, size_t decoded_pos,
                                       void *context) {
   (void)decoded_pos;
   sg_decoded_contains_match_t *match = context;
-  while (match->matched_len > 0 && byte != match->needle[match->matched_len])
+  while (match->matched_len > 0 &&
+         byte != (unsigned char)match->needle[match->matched_len])
     match->matched_len =
         sg_decoded_match_fallback(match->needle, match->matched_len);
-  if (byte == match->needle[match->matched_len])
+  if (byte == (unsigned char)match->needle[match->matched_len])
     match->matched_len++;
   if (match->matched_len == match->needle_len) {
     match->found = true;
@@ -3027,10 +3053,11 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
   size_t type_count = 0;
   size_t anomaly_count = 0;
   size_t cmd_seq_length = 0;
+  size_t type_seq_length = 0;
 
   if (gate->anomaly_enabled && gate->anomaly_model_type && cmd_count > 0) {
-    const char *cached =
-        type_cache_lookup(&gate->anomaly_type_cache, cmd, cmd_len, &type_count);
+    const char *cached = type_cache_lookup(
+        &gate->anomaly_type_cache, cmd, cmd_len, &type_count, &type_seq_length);
     if (cached) {
       type_seq = cached;
     }
@@ -3038,26 +3065,33 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
 
   /* Anomaly detection: score the command sequence with hybrid model */
   if (gate->anomaly_enabled && gate->anomaly_model && cmd_count > 0) {
+    shell_netstring_buffer_t raw = {0};
+    shell_netstring_buffer_t typed = {0};
     shell_process_status_t command_status;
     if (type_seq) {
-      command_status = shell_build_command_netseq(
-          cmd, cmd_len, NULL, &owned_cmd_seq, &anomaly_count);
+      command_status = shell_build_command_netseq_buffer(cmd, cmd_len, NULL,
+                                                         &raw, &anomaly_count);
     } else {
-      command_status = shell_build_anomaly_netseqs(
-          cmd, cmd_len, NULL, &owned_cmd_seq, &owned_type_seq, &anomaly_count);
+      command_status = shell_build_anomaly_netseqs_buffer(
+          cmd, cmd_len, NULL, &raw, &typed, &anomaly_count);
       type_count = anomaly_count;
       if (command_status == SHELL_PROCESS_OK) {
+        type_seq = (const char *)typed.data;
+        type_seq_length = typed.length;
         if (type_cache_insert(&gate->anomaly_type_cache, cmd, cmd_len,
-                              owned_type_seq, type_count)) {
-          type_seq = owned_type_seq;
-          owned_type_seq = NULL;
+                              (char *)typed.data, type_count,
+                              type_seq_length)) {
+          typed = (shell_netstring_buffer_t){0};
         } else {
+          owned_type_seq = (char *)typed.data;
+          typed = (shell_netstring_buffer_t){0};
           type_seq = owned_type_seq;
         }
       }
     }
-    if (command_status != SHELL_PROCESS_OK || !owned_cmd_seq) {
-      free(owned_cmd_seq);
+    if (command_status != SHELL_PROCESS_OK || !raw.data) {
+      shell_netstring_buffer_free(&raw);
+      shell_netstring_buffer_free(&typed);
       free(owned_type_seq);
       out->verdict = SG_VERDICT_UNDETERMINED;
       if (command_status == SHELL_PROCESS_EOUTPUT_LIMIT)
@@ -3066,17 +3100,19 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
                  ? SG_ERR_MEMORY
                  : process_status_to_gate_error(command_status);
     }
+    owned_cmd_seq = (char *)raw.data;
+    cmd_seq_length = raw.length;
+    raw = (shell_netstring_buffer_t){0};
     if (!type_seq) {
       free(owned_cmd_seq);
       free(owned_type_seq);
       out->verdict = SG_VERDICT_UNDETERMINED;
       return SG_ERR_MEMORY;
     }
-    cmd_seq_length = strlen(owned_cmd_seq);
     sg_anomaly_sequence_score_t scores = {0};
     sg_error_t score_status =
         sg_gate_score_anomaly_netseq(gate, owned_cmd_seq, cmd_seq_length,
-                                     type_seq, strlen(type_seq), &scores);
+                                     type_seq, type_seq_length, &scores);
     if (score_status == SG_ERR_MEMORY) {
       free(owned_cmd_seq);
       free(owned_type_seq);
@@ -3217,8 +3253,10 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
 
         if (gate->suggestions) {
           if (eval.suggestion_count > 0 && out->suggestion_count == 0) {
-            out->suggestions[0] =
-                bw_copy_policy_cpl(&bw, eval.suggestions[0].pattern);
+            out->suggestions[0] = bw_copy_policy_cpl(
+                &bw, (st_netpattern_view_t){
+                         .data = eval.suggestions[0].pattern,
+                         .length = eval.suggestions[0].pattern_length});
             if (out->suggestions[0])
               out->suggestion_count++;
             else if (bw.overflow) {
@@ -3230,8 +3268,10 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
             }
           }
           if (eval.suggestion_count > 1 && out->suggestion_count == 1) {
-            out->suggestions[1] =
-                bw_copy_policy_cpl(&bw, eval.suggestions[1].pattern);
+            out->suggestions[1] = bw_copy_policy_cpl(
+                &bw, (st_netpattern_view_t){
+                         .data = eval.suggestions[1].pattern,
+                         .length = eval.suggestions[1].pattern_length});
             if (out->suggestions[1])
               out->suggestion_count++;
             else if (bw.overflow) {
@@ -3249,8 +3289,10 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
         /* Generate deny suggestions from deny policy */
         if (deny_err == ST_OK && out->deny_suggestion_count == 0) {
           if (deny_eval.suggestion_count > 0) {
-            out->deny_suggestions[0] =
-                bw_copy_policy_cpl(&bw, deny_eval.suggestions[0].pattern);
+            out->deny_suggestions[0] = bw_copy_policy_cpl(
+                &bw, (st_netpattern_view_t){
+                         .data = deny_eval.suggestions[0].pattern,
+                         .length = deny_eval.suggestions[0].pattern_length});
             if (out->deny_suggestions[0])
               out->deny_suggestion_count++;
             else if (bw.overflow) {
@@ -3263,8 +3305,10 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
           }
           if (deny_eval.suggestion_count > 1 &&
               out->deny_suggestion_count == 1) {
-            out->deny_suggestions[1] =
-                bw_copy_policy_cpl(&bw, deny_eval.suggestions[1].pattern);
+            out->deny_suggestions[1] = bw_copy_policy_cpl(
+                &bw, (st_netpattern_view_t){
+                         .data = deny_eval.suggestions[1].pattern,
+                         .length = deny_eval.suggestions[1].pattern_length});
             if (out->deny_suggestions[1])
               out->deny_suggestion_count++;
             else if (bw.overflow) {
@@ -3447,8 +3491,8 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
       /* Also update type sequence model */
       sg_anomaly_status_t type_status = SG_ANOMALY_OK;
       if (gate->anomaly_model_type && type_count > 0)
-        type_status = sg_anomaly_model_update_netseq(
-            gate->anomaly_model_type, type_seq, strlen(type_seq));
+        type_status = sg_anomaly_model_update_netseq(gate->anomaly_model_type,
+                                                     type_seq, type_seq_length);
       if ((raw_status != SG_ANOMALY_OK && raw_status != SG_ANOMALY_ERR_MEMORY &&
            raw_status != SG_ANOMALY_ERR_LIMIT) ||
           (type_status != SG_ANOMALY_OK &&

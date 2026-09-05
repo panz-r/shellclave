@@ -72,6 +72,15 @@ static int pattern_is_cpl(const char *actual, const char *expected_cpl) {
   return equal;
 }
 
+static int compare_netpattern_views(st_netpattern_view_t left,
+                                    st_netpattern_view_t right) {
+  size_t shared = left.length < right.length ? left.length : right.length;
+  int compared = shared ? memcmp(left.data, right.data, shared) : 0;
+  if (compared != 0)
+    return compared;
+  return left.length > right.length ? 1 : left.length < right.length ? -1 : 0;
+}
+
 static st_token_type_t test_pattern_token_type(const char *token) {
   if (!token)
     return ST_TYPE_LITERAL;
@@ -1650,6 +1659,26 @@ static int test_dot_export(void) {
   ASSERT(test_st_policy_add(policy, "git status") == ST_OK);
   ASSERT(test_st_policy_add(policy, "git commit -m *") == ST_OK);
   ASSERT(test_st_policy_add(policy, "echo \"a\\\"b\"") == ST_OK);
+  st_token_t binary_tokens[] = {
+      {.text = "echo", .type = ST_TYPE_LITERAL},
+      {.text = "",
+       .type = ST_TYPE_LITERAL,
+       .compound = true,
+       .prefix = "a",
+       .prefix_length = 1,
+       .capture = "#n",
+       .capture_length = 2,
+       .suffix = "\0z",
+       .suffix_length = 2,
+       .capture_type = ST_TYPE_NUMBER},
+  };
+  st_netpattern_t binary_pattern = {0};
+  ASSERT(st_netpattern_encode_owned(binary_tokens, 2, &binary_pattern) ==
+         ST_OK);
+  ASSERT(st_policy_add_netpattern_view(
+             policy, (st_netpattern_view_t){.data = binary_pattern.data,
+                                            .length = binary_pattern.length}) ==
+         ST_OK);
   ASSERT(st_policy_dump_dot(NULL, path) == ST_ERR_INVALID);
   ASSERT(st_policy_dump_dot(policy, NULL) == ST_ERR_INVALID);
   ASSERT(st_policy_dump_dot(policy, path) == ST_OK);
@@ -1666,8 +1695,10 @@ static int test_dot_export(void) {
   ASSERT(strstr(output, "status") != NULL);
   ASSERT(strstr(output, "commit") != NULL);
   ASSERT(strstr(output, "a\\\"b") != NULL);
+  ASSERT(strstr(output, "a{#n}\\x00z") != NULL);
   ASSERT(unlink(path) == 0);
 
+  st_netpattern_free(&binary_pattern);
   st_policy_free(policy);
   st_policy_ctx_release(ctx);
   return 1;
@@ -2312,18 +2343,19 @@ static int test_merge_allocation_failures_preserve_destination(void) {
 
 /* --- POLICY DIFF (st_policy_diff) --- */
 
-static int string_set_is(char *const *actual, size_t actual_count,
+static int string_set_is(const st_netpattern_t *actual, size_t actual_count,
                          const char *const *expected, size_t expected_count) {
   if (actual_count != expected_count)
     return 0;
   for (size_t i = 0; i < actual_count; i++)
     for (size_t j = i + 1; j < actual_count; j++)
-      if (strcmp(actual[i], actual[j]) == 0)
+      if (actual[i].length == actual[j].length &&
+          memcmp(actual[i].data, actual[j].data, actual[i].length) == 0)
         return 0;
   for (size_t i = 0; i < expected_count; i++) {
     int found = 0;
     for (size_t j = 0; j < actual_count; j++)
-      if (pattern_is_cpl(actual[j], expected[i])) {
+      if (pattern_is_cpl(actual[j].data, expected[i])) {
         found = 1;
         break;
       }
@@ -2333,9 +2365,9 @@ static int string_set_is(char *const *actual, size_t actual_count,
   return 1;
 }
 
-static bool count_policy_match(const char *pattern, void *user_ctx) {
+static bool count_policy_match(st_netpattern_view_t pattern, void *user_ctx) {
   size_t *count = user_ctx;
-  return pattern && count && (++*count, true);
+  return pattern.data && count && (++*count, true);
 }
 
 static int test_netargv_view_policy_apis(void) {
@@ -2351,13 +2383,13 @@ static int test_netargv_view_policy_apis(void) {
   };
   st_eval_result_t eval = {0};
   bool matches = false;
-  const char **all = NULL;
+  st_netpattern_view_t *all = NULL;
   size_t all_count = 0;
   size_t visited = 0;
   ASSERT(st_policy_eval_view(policy, view, &eval) == ST_OK && eval.matches);
   ASSERT(st_policy_match_view(policy, view, &matches) == ST_OK && matches);
   ASSERT(st_policy_verify_all_view(policy, view, &all, &all_count) == ST_OK);
-  ASSERT(all_count == 1 && pattern_is_cpl(all[0], "echo hello"));
+  ASSERT(all_count == 1 && pattern_is_cpl(all[0].data, "echo hello"));
   st_policy_matches_free(all);
   ASSERT(st_policy_visit_matches_view(policy, view, count_policy_match,
                                       &visited, &visited) == ST_OK);
@@ -2369,10 +2401,404 @@ static int test_netargv_view_policy_apis(void) {
   st_test_alloc_reset();
   ASSERT(visit_error == ST_OK && visited == 1);
 
+  st_netpattern_t binary_pattern = {0};
+  ASSERT(st_netpattern_from_cpl_owned("echo \"\\x00x\"", &binary_pattern) ==
+         ST_OK);
+  ASSERT(st_policy_add_netpattern_view(
+             policy, (st_netpattern_view_t){.data = binary_pattern.data,
+                                            .length = binary_pattern.length}) ==
+         ST_OK);
+  static const char binary_netargv[] = {'4', ':', 'e', 'c',  'h', 'o',
+                                        ',', '2', ':', '\0', 'x', ','};
+  view = (st_netargv_view_t){.data = binary_netargv,
+                             .length = sizeof(binary_netargv)};
+  ASSERT(st_policy_match_view(policy, view, &matches) == ST_OK && matches);
+  ASSERT(st_policy_eval_view(policy, view, &eval) == ST_OK && eval.matches &&
+         eval.matching_pattern != NULL &&
+         eval.matching_pattern_length == binary_pattern.length);
+  all = NULL;
+  all_count = 0;
+  ASSERT(st_policy_verify_all_view(policy, view, &all, &all_count) == ST_OK &&
+         all_count == 1 && all[0].length == binary_pattern.length &&
+         memcmp(all[0].data, binary_pattern.data, binary_pattern.length) == 0);
+  st_policy_matches_free(all);
+  st_policy_t *before_binary = st_policy_new(ctx);
+  ASSERT(before_binary != NULL &&
+         test_st_policy_add(before_binary, "echo hello") == ST_OK);
+  st_policy_diff_t binary_diff = {0};
+  ASSERT(st_policy_diff(before_binary, policy, &binary_diff) == ST_OK &&
+         binary_diff.added_count == 1 && binary_diff.removed_count == 0 &&
+         binary_diff.added[0].length == binary_pattern.length &&
+         memcmp(binary_diff.added[0].data, binary_pattern.data,
+                binary_pattern.length) == 0);
+  st_policy_diff_free(&binary_diff);
+  st_policy_free(before_binary);
+  char binary_path[] = "/tmp/shelltype-policy-binary-XXXXXX";
+  int binary_fd = mkstemp(binary_path);
+  ASSERT(binary_fd >= 0);
+  ASSERT(close(binary_fd) == 0);
+  ASSERT(st_policy_save(policy, binary_path) == ST_OK);
+  st_policy_ctx_t *loaded_ctx = st_policy_ctx_new();
+  st_policy_t *loaded = loaded_ctx ? st_policy_new(loaded_ctx) : NULL;
+  ASSERT(loaded != NULL && st_policy_load(loaded, binary_path, true) == ST_OK);
+  ASSERT(st_policy_match_view(loaded, view, &matches) == ST_OK && matches);
+  ASSERT(st_policy_compact(loaded) == ST_OK);
+  ASSERT(st_policy_match_view(loaded, view, &matches) == ST_OK && matches);
+  st_policy_free(loaded);
+  st_policy_ctx_release(loaded_ctx);
+  ASSERT(unlink(binary_path) == 0);
+  ASSERT(st_policy_remove_netpattern_view(
+             policy, (st_netpattern_view_t){.data = binary_pattern.data,
+                                            .length = binary_pattern.length}) ==
+         ST_OK);
+  ASSERT(st_policy_match_view(policy, view, &matches) == ST_OK && !matches);
+  st_netpattern_free(&binary_pattern);
+
   st_learner_t *learner = st_learner_new(NULL);
   ASSERT(learner != NULL);
   ASSERT(st_learner_feed_netargv_view(learner, view) == ST_OK);
   st_learner_free(learner);
+  st_policy_free(policy);
+  st_policy_ctx_release(ctx);
+  return 1;
+}
+
+static int test_suggestion_byte_output_contract(void) {
+  st_policy_ctx_t *ctx = st_policy_ctx_new();
+  st_policy_t *policy = ctx ? st_policy_new(ctx) : NULL;
+  ASSERT(policy != NULL && test_st_policy_add(policy, "echo stable") == ST_OK);
+
+  /* A poisoned result must become a wholly initialized result, including the
+   * legacy terminator after its explicit canonical suggestion length. */
+  st_eval_result_t legacy_eval;
+  memset(&legacy_eval, 0xa5, sizeof(legacy_eval));
+  ASSERT(test_st_policy_eval(policy, "echo changed", &legacy_eval) == ST_OK &&
+         !legacy_eval.matches && legacy_eval.suggestion_count != 0 &&
+         legacy_eval.suggestions[0].pattern_length != 0 &&
+         legacy_eval.suggestions[0]
+                 .pattern[legacy_eval.suggestions[0].pattern_length] == '\0');
+  st_token_array_t decoded = {0};
+  ASSERT(st_netpattern_decode(legacy_eval.suggestions[0].pattern, &decoded) ==
+             ST_OK &&
+         decoded.count == 2 && strcmp(decoded.tokens[0].text, "echo") == 0 &&
+         strcmp(decoded.tokens[1].text, "changed") == 0);
+  st_token_array_free(&decoded);
+
+  st_policy_t *binary_policy = st_policy_new(ctx);
+  ASSERT(binary_policy != NULL);
+  static const char known[] = {'\0', 'k', 'n', 'o', 'w', 'n'};
+  st_token_t known_tokens[] = {
+      {.text = "echo", .type = ST_TYPE_LITERAL},
+      {.text = known, .text_length = sizeof(known), .type = ST_TYPE_LITERAL},
+  };
+  st_netpattern_t known_pattern = {0};
+  ASSERT(st_netpattern_encode_owned(known_tokens, 2, &known_pattern) == ST_OK &&
+         st_policy_add_netpattern_view(
+             binary_policy,
+             (st_netpattern_view_t){.data = known_pattern.data,
+                                    .length = known_pattern.length}) == ST_OK);
+
+  static const char binary_netargv[] = {'4', ':', 'e', 'c',  'h', 'o',
+                                        ',', '6', ':', '\0', 'o', 't',
+                                        'h', 'e', 'r', ','};
+  st_eval_result_t binary_eval;
+  memset(&binary_eval, 0xa5, sizeof(binary_eval));
+  ASSERT(
+      st_policy_eval_view(binary_policy,
+                          (st_netargv_view_t){.data = binary_netargv,
+                                              .length = sizeof(binary_netargv)},
+                          &binary_eval) == ST_OK &&
+      !binary_eval.matches && binary_eval.suggestion_count != 0 &&
+      binary_eval.suggestions[0].based_on != NULL &&
+      binary_eval.suggestions[0].based_on_length == known_pattern.length &&
+      memcmp(binary_eval.suggestions[0].based_on, known_pattern.data,
+             known_pattern.length) == 0 &&
+      binary_eval.suggestions[0]
+              .pattern[binary_eval.suggestions[0].pattern_length] == '\0');
+  char *rendered = NULL;
+  ASSERT(st_netpattern_to_cpl_view(
+             (st_netpattern_view_t){
+                 .data = binary_eval.suggestions[0].pattern,
+                 .length = binary_eval.suggestions[0].pattern_length},
+             &rendered) == ST_OK &&
+         strcmp(rendered, "echo \"\\x00other\"") == 0);
+  free(rendered);
+
+  static const char direct_bytes[] = {'v', 'i', 'e', 'w'};
+  st_token_t direct_tokens[] = {
+      {.text = direct_bytes,
+       .text_length = sizeof(direct_bytes),
+       .type = ST_TYPE_LITERAL},
+  };
+  st_expand_suggestion_t variants[3];
+  memset(variants, 0xa5, sizeof(variants));
+  ASSERT(
+      st_policy_suggest_variants(binary_policy, direct_tokens, 1, variants) ==
+          1 &&
+      variants[0].pattern_length != 0 &&
+      variants[0].pattern[variants[0].pattern_length] == '\0' &&
+      st_netpattern_decode_view(
+          (st_netpattern_view_t){.data = variants[0].pattern,
+                                 .length = variants[0].pattern_length},
+          &decoded) == ST_OK &&
+      decoded.count == 1 &&
+      decoded.tokens[0].text_length == sizeof(direct_bytes) &&
+      memcmp(decoded.tokens[0].text, direct_bytes, sizeof(direct_bytes)) == 0);
+  st_token_array_free(&decoded);
+
+  st_netpattern_free(&known_pattern);
+  st_policy_free(binary_policy);
+  st_policy_free(policy);
+  st_policy_ctx_release(ctx);
+  return 1;
+}
+
+/* Compound policy entries are keyed by their canonical component boundaries,
+ * not only their flattened display text. All matching and removal paths must
+ * retain arbitrary bytes in the literal affixes. */
+static int test_compound_policy_binary_identity(void) {
+  st_policy_ctx_t *ctx = st_policy_ctx_new();
+  st_policy_t *policy = ctx ? st_policy_new(ctx) : NULL;
+  ASSERT(policy != NULL);
+
+  static const char binary_prefix[] = {'a', '\0', '{'};
+  static const char binary_suffix[] = {'}', '\0', 'z'};
+  st_token_t binary_tokens[] = {
+      {.text = "cmd", .type = ST_TYPE_LITERAL},
+      {.text = "",
+       .type = ST_TYPE_LITERAL,
+       .compound = true,
+       .prefix = binary_prefix,
+       .prefix_length = sizeof(binary_prefix),
+       .capture = "#n",
+       .capture_length = 2,
+       .suffix = binary_suffix,
+       .suffix_length = sizeof(binary_suffix),
+       .capture_type = ST_TYPE_NUMBER},
+  };
+  st_netpattern_t binary_pattern = {0};
+  ASSERT(st_netpattern_encode_owned(binary_tokens, 2, &binary_pattern) ==
+         ST_OK);
+  ASSERT(st_policy_add_netpattern_view(
+             policy, (st_netpattern_view_t){.data = binary_pattern.data,
+                                            .length = binary_pattern.length}) ==
+         ST_OK);
+
+  static const char binary_command[] = {
+      '3',  ':', 'c', 'm', 'd', ',',  '8', ':', 'a',
+      '\0', '{', '4', '2', '}', '\0', 'z', ',',
+  };
+  static const char binary_mismatch[] = {
+      '3',  ':', 'c', 'm', 'd', ',',  '8', ':', 'a',
+      '\0', '{', 'x', '2', '}', '\0', 'z', ',',
+  };
+  bool matches = false;
+  ASSERT(st_policy_match_view(
+             policy,
+             (st_netargv_view_t){.data = binary_command,
+                                 .length = sizeof(binary_command)},
+             &matches) == ST_OK &&
+         matches);
+  ASSERT(st_policy_match_view(
+             policy,
+             (st_netargv_view_t){.data = binary_mismatch,
+                                 .length = sizeof(binary_mismatch)},
+             &matches) == ST_OK &&
+         !matches);
+
+  st_netpattern_view_t *all = NULL;
+  size_t all_count = 0;
+  ASSERT(st_policy_verify_all_view(
+             policy,
+             (st_netargv_view_t){.data = binary_command,
+                                 .length = sizeof(binary_command)},
+             &all, &all_count) == ST_OK &&
+         all_count == 1 && all[0].length == binary_pattern.length &&
+         memcmp(all[0].data, binary_pattern.data, binary_pattern.length) == 0);
+  st_policy_matches_free(all);
+  size_t visited = 0;
+  ASSERT(st_policy_visit_matches_view(
+             policy,
+             (st_netargv_view_t){.data = binary_command,
+                                 .length = sizeof(binary_command)},
+             count_policy_match, &visited, &visited) == ST_OK &&
+         visited == 1);
+
+  st_token_t collision_a[] = {
+      {.text = "cmd", .type = ST_TYPE_LITERAL},
+      {.text = "a{#n}{#n}x",
+       .type = ST_TYPE_LITERAL,
+       .compound = true,
+       .prefix = "a",
+       .prefix_length = 1,
+       .capture = "#n",
+       .capture_length = 2,
+       .suffix = "{#n}x",
+       .suffix_length = 5,
+       .capture_type = ST_TYPE_NUMBER},
+  };
+  st_token_t collision_b[] = {
+      {.text = "cmd", .type = ST_TYPE_LITERAL},
+      {.text = "a{#n}{#n}x",
+       .type = ST_TYPE_LITERAL,
+       .compound = true,
+       .prefix = "a{#n}",
+       .prefix_length = 5,
+       .capture = "#n",
+       .capture_length = 2,
+       .suffix = "x",
+       .suffix_length = 1,
+       .capture_type = ST_TYPE_NUMBER},
+  };
+  st_netpattern_t pattern_a = {0};
+  st_netpattern_t pattern_b = {0};
+  ASSERT(st_netpattern_encode_owned(collision_a, 2, &pattern_a) == ST_OK);
+  ASSERT(st_netpattern_encode_owned(collision_b, 2, &pattern_b) == ST_OK);
+  st_token_array_t decoded_collision = {0};
+  ASSERT(st_netpattern_decode_view(
+             (st_netpattern_view_t){.data = pattern_b.data,
+                                    .length = pattern_b.length},
+             &decoded_collision) == ST_OK);
+  st_token_array_free(&decoded_collision);
+  ASSERT(st_policy_add_netpattern_view(
+             policy, (st_netpattern_view_t){.data = pattern_a.data,
+                                            .length = pattern_a.length}) ==
+         ST_OK);
+  ASSERT(st_policy_add_netpattern_view(
+             policy, (st_netpattern_view_t){.data = pattern_b.data,
+                                            .length = pattern_b.length}) ==
+         ST_OK);
+  ASSERT(st_policy_rule_count(policy) == 3);
+
+  char *command_a = test_netargv("cmd a42{#n}x");
+  char *command_b = test_netargv("cmd 'a{#n}42x'");
+  ASSERT(command_a != NULL && command_b != NULL);
+  st_eval_result_t eval = {0};
+  ASSERT(st_policy_eval_view(policy,
+                             (st_netargv_view_t){.data = command_a,
+                                                 .length = strlen(command_a)},
+                             &eval) == ST_OK &&
+         eval.matches && eval.matching_pattern_length == pattern_a.length &&
+         memcmp(eval.matching_pattern, pattern_a.data, pattern_a.length) == 0);
+  ASSERT(st_policy_eval_view(policy,
+                             (st_netargv_view_t){.data = command_b,
+                                                 .length = strlen(command_b)},
+                             &eval) == ST_OK &&
+         eval.matches && eval.matching_pattern_length == pattern_b.length &&
+         memcmp(eval.matching_pattern, pattern_b.data, pattern_b.length) == 0);
+
+  st_token_t overlap_a[] = {
+      {.text = "cmd", .type = ST_TYPE_LITERAL},
+      {.text = "a{*}{*}x",
+       .type = ST_TYPE_LITERAL,
+       .compound = true,
+       .prefix = "a",
+       .prefix_length = 1,
+       .capture = "*",
+       .capture_length = 1,
+       .suffix = "{*}x",
+       .suffix_length = 4,
+       .capture_type = ST_TYPE_ANY},
+  };
+  st_token_t overlap_b[] = {
+      {.text = "cmd", .type = ST_TYPE_LITERAL},
+      {.text = "a{*}{*}x",
+       .type = ST_TYPE_LITERAL,
+       .compound = true,
+       .prefix = "a{*}",
+       .prefix_length = 4,
+       .capture = "*",
+       .capture_length = 1,
+       .suffix = "x",
+       .suffix_length = 1,
+       .capture_type = ST_TYPE_ANY},
+  };
+  st_netpattern_t overlap_pattern_a = {0};
+  st_netpattern_t overlap_pattern_b = {0};
+  ASSERT(st_netpattern_encode_owned(overlap_a, 2, &overlap_pattern_a) == ST_OK);
+  ASSERT(st_netpattern_encode_owned(overlap_b, 2, &overlap_pattern_b) == ST_OK);
+  ASSERT(st_policy_add_netpattern_view(
+             policy, (st_netpattern_view_t){
+                         .data = overlap_pattern_a.data,
+                         .length = overlap_pattern_a.length}) == ST_OK);
+  ASSERT(st_policy_add_netpattern_view(
+             policy, (st_netpattern_view_t){
+                         .data = overlap_pattern_b.data,
+                         .length = overlap_pattern_b.length}) == ST_OK);
+  char *overlap_command = test_netargv("cmd 'a{*}{*}x'");
+  ASSERT(overlap_command != NULL);
+  all = NULL;
+  all_count = 0;
+  ASSERT(st_policy_verify_all_view(
+             policy,
+             (st_netargv_view_t){.data = overlap_command,
+                                 .length = strlen(overlap_command)},
+             &all, &all_count) == ST_OK &&
+         all_count == 2);
+  st_policy_matches_free(all);
+  visited = 0;
+  ASSERT(st_policy_visit_matches_view(
+             policy,
+             (st_netargv_view_t){.data = overlap_command,
+                                 .length = strlen(overlap_command)},
+             count_policy_match, &visited, &visited) == ST_OK &&
+         visited == 2);
+  const st_netpattern_t *preferred =
+      compare_netpattern_views(
+          (st_netpattern_view_t){.data = overlap_pattern_a.data,
+                                 .length = overlap_pattern_a.length},
+          (st_netpattern_view_t){.data = overlap_pattern_b.data,
+                                 .length = overlap_pattern_b.length}) < 0
+          ? &overlap_pattern_a
+          : &overlap_pattern_b;
+  ASSERT(st_policy_eval_view(
+             policy,
+             (st_netargv_view_t){.data = overlap_command,
+                                 .length = strlen(overlap_command)},
+             &eval) == ST_OK &&
+         eval.matches && eval.matching_pattern_length == preferred->length &&
+         memcmp(eval.matching_pattern, preferred->data, preferred->length) ==
+             0);
+  ASSERT(st_policy_remove_netpattern_view(
+             policy, (st_netpattern_view_t){
+                         .data = overlap_pattern_a.data,
+                         .length = overlap_pattern_a.length}) == ST_OK);
+  ASSERT(st_policy_match_view(
+             policy,
+             (st_netargv_view_t){.data = overlap_command,
+                                 .length = strlen(overlap_command)},
+             &matches) == ST_OK &&
+         matches);
+  ASSERT(st_policy_remove_netpattern_view(
+             policy, (st_netpattern_view_t){
+                         .data = overlap_pattern_b.data,
+                         .length = overlap_pattern_b.length}) == ST_OK);
+  ASSERT(st_policy_rule_count(policy) == 3);
+  free(overlap_command);
+  st_netpattern_free(&overlap_pattern_b);
+  st_netpattern_free(&overlap_pattern_a);
+
+  ASSERT(st_policy_remove_netpattern_view(
+             policy, (st_netpattern_view_t){.data = pattern_a.data,
+                                            .length = pattern_a.length}) ==
+         ST_OK);
+  ASSERT(st_policy_rule_count(policy) == 2);
+  ASSERT(st_policy_match_view(policy,
+                              (st_netargv_view_t){.data = command_a,
+                                                  .length = strlen(command_a)},
+                              &matches) == ST_OK &&
+         !matches);
+  ASSERT(st_policy_match_view(policy,
+                              (st_netargv_view_t){.data = command_b,
+                                                  .length = strlen(command_b)},
+                              &matches) == ST_OK &&
+         matches);
+
+  free(command_a);
+  free(command_b);
+  st_netpattern_free(&pattern_b);
+  st_netpattern_free(&pattern_a);
+  st_netpattern_free(&binary_pattern);
   st_policy_free(policy);
   st_policy_ctx_release(ctx);
   return 1;
@@ -2385,25 +2811,25 @@ typedef struct {
   size_t stop_after;
 } diff_visit_expect_t;
 
-static bool check_policy_diff(st_policy_diff_kind_t kind, const char *pattern,
-                              void *user_ctx) {
+static bool check_policy_diff(st_policy_diff_kind_t kind,
+                              st_netpattern_view_t pattern, void *user_ctx) {
   diff_visit_expect_t *expect = user_ctx;
   if (!expect ||
       expect->count == sizeof(expect->kinds) / sizeof(expect->kinds[0]))
     return false;
   size_t index = expect->count++;
-  if (kind != expect->kinds[index] ||
-      !pattern_is_cpl(pattern, expect->patterns[index]))
+  if (kind != expect->kinds[index] || !pattern.data ||
+      !pattern_is_cpl(pattern.data, expect->patterns[index]))
     return false;
   return expect->stop_after == 0 || expect->count < expect->stop_after;
 }
 
 static bool count_policy_diff_without_allocation(st_policy_diff_kind_t kind,
-                                                 const char *pattern,
+                                                 st_netpattern_view_t pattern,
                                                  void *user_ctx) {
   (void)kind;
   size_t *count = user_ctx;
-  if (!pattern || !count)
+  if (!pattern.data || !count)
     return false;
   (*count)++;
   return true;
@@ -2500,7 +2926,7 @@ static int test_diff_matrix_and_symmetry(void) {
     ASSERT(add_patterns(left, cases[i].left, cases[i].left_count));
     ASSERT(add_patterns(right, cases[i].right, cases[i].right_count));
 
-    st_policy_diff_t forward;
+    st_policy_diff_t forward = {0};
     ASSERT(st_policy_diff(left, right, &forward) == ST_OK);
     ASSERT(string_set_is(forward.added, forward.added_count, cases[i].added,
                          cases[i].added_count));
@@ -2508,7 +2934,7 @@ static int test_diff_matrix_and_symmetry(void) {
                          cases[i].removed, cases[i].removed_count));
     st_policy_diff_free(&forward);
 
-    st_policy_diff_t reverse;
+    st_policy_diff_t reverse = {0};
     ASSERT(st_policy_diff(right, left, &reverse) == ST_OK);
     ASSERT(string_set_is(reverse.added, reverse.added_count, cases[i].removed,
                          cases[i].removed_count));
@@ -2516,11 +2942,26 @@ static int test_diff_matrix_and_symmetry(void) {
                          cases[i].added_count));
     st_policy_diff_free(&reverse);
 
-    if (i == 0) {
-      st_policy_diff_t identity;
+    if (i == 1) {
+      st_policy_diff_t identity = {0};
       ASSERT(st_policy_diff(left, left, &identity) == ST_OK);
       ASSERT(identity.added_count == 0 && identity.removed_count == 0);
       st_policy_diff_free(&identity);
+
+      st_policy_diff_t reused = {0};
+      ASSERT(st_policy_diff(left, right, &reused) == ST_OK);
+      st_netpattern_t *reused_added = reused.added;
+      size_t reused_added_count = reused.added_count;
+      st_netpattern_t *reused_removed = reused.removed;
+      size_t reused_removed_count = reused.removed_count;
+      ASSERT(st_policy_diff(right, left, &reused) == ST_ERR_INVALID);
+      ASSERT(reused.added == reused_added &&
+             reused.added_count == reused_added_count &&
+             reused.removed == reused_removed &&
+             reused.removed_count == reused_removed_count);
+      st_policy_diff_free(&reused);
+      ASSERT(st_policy_diff(right, left, &reused) == ST_OK);
+      st_policy_diff_free(&reused);
     }
     st_policy_free(left);
     st_policy_free(right);
@@ -2548,6 +2989,17 @@ static int test_diff_allocation_failures_clear_result(void) {
   size_t diff_allocations = st_test_alloc_count();
   ASSERT(diff_allocations > 0);
   st_policy_diff_free(&probe_result);
+
+  st_policy_diff_t reuse_after_free = {0};
+  ASSERT(st_policy_diff(probe_left, probe_right, &reuse_after_free) == ST_OK);
+  st_policy_diff_free(&reuse_after_free);
+  st_test_alloc_fail_at(1);
+  ASSERT(st_policy_diff(probe_left, probe_right, &reuse_after_free) ==
+         ST_ERR_MEMORY);
+  st_test_alloc_reset();
+  ASSERT(reuse_after_free.added == NULL && reuse_after_free.added_count == 0 &&
+         reuse_after_free.removed == NULL &&
+         reuse_after_free.removed_count == 0);
   st_policy_free(probe_left);
   st_policy_free(probe_right);
   st_policy_ctx_release(probe_left_context);
@@ -2565,7 +3017,7 @@ static int test_diff_allocation_failures_clear_result(void) {
     ASSERT(add_patterns(left, left_patterns, 3));
     ASSERT(add_patterns(right, right_patterns, 3));
 
-    st_policy_diff_t result = {(char **)1, 7, (char **)1, 9};
+    st_policy_diff_t result = {0};
     st_test_alloc_fail_at(fail_at);
     st_error_t err = st_policy_diff(left, right, &result);
     st_test_alloc_reset();
@@ -2845,7 +3297,8 @@ static int variants_match(st_learner_t *learner, const char **tokens,
   for (size_t i = 0; i < count; i++) {
     if (variants[i].type != expected[i] || !variants[i].type_symbol ||
         strcmp(variants[i].type_symbol, st_type_symbol[expected[i]]) != 0 ||
-        variants[i].sample_value != NULL) {
+        variants[i].sample_value != NULL ||
+        variants[i].sample_value_length != 0) {
       printf("    variant %zu: got %d (%s), expected %d (%s)\n", i,
              variants[i].type,
              variants[i].type_symbol ? variants[i].type_symbol : "NULL",
@@ -2865,7 +3318,8 @@ static int variant_lists_equal(const st_token_variant_t *left,
   for (size_t i = 0; i < left_count; i++)
     if (left[i].type != right[i].type ||
         strcmp(left[i].type_symbol, right[i].type_symbol) != 0 ||
-        left[i].sample_value != right[i].sample_value)
+        left[i].sample_value != right[i].sample_value ||
+        left[i].sample_value_length != right[i].sample_value_length)
       return 0;
   return 1;
 }
@@ -2934,7 +3388,9 @@ static int test_token_variant_matrix(void) {
                                           1, variants) == 0);
   for (size_t i = 0; i < ST_MAX_TOKEN_VARIANTS; i++)
     ASSERT(variants[i].type == ST_TYPE_LITERAL &&
-           variants[i].type_symbol == NULL && variants[i].sample_value == NULL);
+           variants[i].type_symbol == NULL &&
+           variants[i].sample_value == NULL &&
+           variants[i].sample_value_length == 0);
 
   st_learner_t *learner = st_learner_new(
       &(st_learner_config_t){.min_support = 1,
@@ -3143,6 +3599,7 @@ int main(void) {
   TEST(test_suggestion_contracts);
   TEST(test_branching_suggestions_are_lifecycle_independent);
   TEST(test_suggestion_render_allocation_failures);
+  TEST(test_suggestion_byte_output_contract);
 
   printf("\nContext and validation:\n");
   TEST(test_context_and_compaction_transitions);
@@ -3176,6 +3633,7 @@ int main(void) {
 
   printf("\nPolicy diff (st_policy_diff):\n");
   TEST(test_netargv_view_policy_apis);
+  TEST(test_compound_policy_binary_identity);
   TEST(test_policy_diff_visit_contract);
   TEST(test_diff_matrix_and_symmetry);
   TEST(test_diff_allocation_failures_clear_result);

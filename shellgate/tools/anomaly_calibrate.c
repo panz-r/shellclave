@@ -63,7 +63,9 @@ typedef struct {
 
 typedef struct {
   char *raw_netseq;
+  size_t raw_netseq_length;
   char *type_netseq;
+  size_t type_netseq_length;
   size_t count;
 } corpus_record_t;
 
@@ -129,36 +131,43 @@ static bool rare_spans(const char *command, netseq_span_t *raw,
   return true;
 }
 
-static char *render_selection(const netseq_span_t *spans, size_t count,
-                              const size_t *order, const char *rare_command,
-                              bool type_sequence) {
+static bool render_selection(const netseq_span_t *spans, size_t count,
+                             const size_t *order, const char *rare_command,
+                             bool type_sequence,
+                             shell_netstring_buffer_t *out) {
+  if (!out)
+    return false;
+  *out = (shell_netstring_buffer_t){0};
   char raw_buf[64], type_buf[80];
   netseq_span_t rare_raw, rare_type;
   if (rare_command &&
       !rare_spans(rare_command, &rare_raw, &rare_type, raw_buf, type_buf))
-    return NULL;
+    return false;
   size_t total = 0;
   for (size_t i = 0; i < count; i++) {
     netseq_span_t span = order[i] == SIZE_MAX
                              ? (type_sequence ? rare_type : rare_raw)
                              : spans[order[i]];
     if (span.record_length > SIZE_MAX - total)
-      return NULL;
+      return false;
     total += span.record_length;
   }
-  char *out = malloc(total + 1);
-  if (!out)
-    return NULL;
+  if (total == SIZE_MAX)
+    return false;
+  out->data = malloc(total + 1);
+  if (!out->data)
+    return false;
   size_t used = 0;
   for (size_t i = 0; i < count; i++) {
     netseq_span_t span = order[i] == SIZE_MAX
                              ? (type_sequence ? rare_type : rare_raw)
                              : spans[order[i]];
-    memcpy(out + used, span.record, span.record_length);
+    memcpy(out->data + used, span.record, span.record_length);
     used += span.record_length;
   }
-  out[used] = '\0';
-  return out;
+  out->data[used] = '\0';
+  out->length = used;
+  return true;
 }
 
 static unsigned int rand_uint(unsigned int *state) {
@@ -347,26 +356,28 @@ int main(int argc, char **argv) {
     char *cmd = trim(line);
     if (!*cmd)
       continue;
-    char *raw = NULL, *type = NULL;
+    shell_netstring_buffer_t raw = {0}, type = {0};
     size_t raw_count = 0, type_count = 0;
-    if (shell_build_command_netseq(cmd, strlen(cmd), NULL, &raw, &raw_count) !=
-            SHELL_PROCESS_OK ||
-        shell_build_type_netseq(cmd, strlen(cmd), NULL, &type, &type_count) !=
-            SHELL_PROCESS_OK ||
+    if (shell_build_command_netseq_buffer(cmd, strlen(cmd), NULL, &raw,
+                                          &raw_count) != SHELL_PROCESS_OK ||
+        shell_build_type_netseq_buffer(cmd, strlen(cmd), NULL, &type,
+                                       &type_count) != SHELL_PROCESS_OK ||
         raw_count == 0 || raw_count != type_count) {
-      free(raw);
-      free(type);
+      shell_netstring_buffer_free(&raw);
+      shell_netstring_buffer_free(&type);
       continue;
     }
     char buf[8192];
     sg_result_t result;
     if (sg_gate_evaluate(gate, cmd, strlen(cmd), buf, sizeof(buf), &result) !=
         SG_OK) {
-      free(raw);
-      free(type);
+      shell_netstring_buffer_free(&raw);
+      shell_netstring_buffer_free(&type);
       continue;
     }
-    normal[normal_count++] = (corpus_record_t){raw, type, raw_count};
+    normal[normal_count++] =
+        (corpus_record_t){(char *)raw.data, raw.length, (char *)type.data,
+                          type.length, raw_count};
   }
   fclose(fp);
 
@@ -397,8 +408,8 @@ int main(int argc, char **argv) {
   for (size_t i = 0; i < normal_count; i++) {
     sg_anomaly_sequence_score_t score = {0};
     if (sg_gate_score_anomaly_netseq(
-            gate, normal[i].raw_netseq, strlen(normal[i].raw_netseq),
-            normal[i].type_netseq, strlen(normal[i].type_netseq),
+            gate, normal[i].raw_netseq, normal[i].raw_netseq_length,
+            normal[i].type_netseq, normal[i].type_netseq_length,
             &score) != SG_OK) {
       fprintf(stderr, "Cannot score canonical corpus record\n");
       free(normal_scores);
@@ -425,11 +436,10 @@ int main(int argc, char **argv) {
       continue;
     netseq_span_t raw_spans[MAX_TOKENS], type_spans[MAX_TOKENS];
     size_t raw_count = 0, type_count = 0;
-    if (!collect_netseq_views(normal[i].raw_netseq,
-                              strlen(normal[i].raw_netseq), raw_spans,
-                              MAX_TOKENS, &raw_count) ||
+    if (!collect_netseq_views(normal[i].raw_netseq, normal[i].raw_netseq_length,
+                              raw_spans, MAX_TOKENS, &raw_count) ||
         !collect_netseq_views(normal[i].type_netseq,
-                              strlen(normal[i].type_netseq), type_spans,
+                              normal[i].type_netseq_length, type_spans,
                               MAX_TOKENS, &type_count) ||
         raw_count != normal[i].count || type_count != raw_count)
       continue;
@@ -455,21 +465,22 @@ int main(int argc, char **argv) {
       }
       if (!ok)
         continue;
-      char *raw =
-          render_selection(raw_spans, selected_count, order, rare, false);
-      char *type =
-          render_selection(type_spans, selected_count, order, rare, true);
-      if (!raw || !type) {
-        free(raw);
-        free(type);
+      shell_netstring_buffer_t raw = {0}, type = {0};
+      if (!render_selection(raw_spans, selected_count, order, rare, false,
+                            &raw) ||
+          !render_selection(type_spans, selected_count, order, rare, true,
+                            &type)) {
+        shell_netstring_buffer_free(&raw);
+        shell_netstring_buffer_free(&type);
         continue;
       }
       sg_anomaly_sequence_score_t score = {0};
-      if (sg_gate_score_anomaly_netseq(gate, raw, strlen(raw), type,
-                                       strlen(type), &score) == SG_OK)
+      if (sg_gate_score_anomaly_netseq(gate, (const char *)raw.data, raw.length,
+                                       (const char *)type.data, type.length,
+                                       &score) == SG_OK)
         synth_scores[synth_count++] = score.combined_score;
-      free(raw);
-      free(type);
+      shell_netstring_buffer_free(&raw);
+      shell_netstring_buffer_free(&type);
     }
   }
 

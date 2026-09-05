@@ -56,6 +56,13 @@ typedef enum {
   SHELL_TYPE_BACKGROUND = 1 << 15,   // Preceded by a background '&'
 } shell_cmd_type_t;
 
+/* Orthogonal syntactic modifiers. Unlike shell_cmd_type_t these describe the
+ * complete command/pipeline rather than the separator before one range. */
+typedef enum {
+  SHELL_CMD_MOD_NONE = 0,
+  SHELL_CMD_MOD_PIPE_NEGATED = 1 << 0, /* POSIX `! pipeline` */
+} shell_cmd_modifier_t;
+
 /* Kinds of enclosing command groups. Values are a bitset so mixed nesting is
  * represented without losing an outer subshell boundary. */
 typedef enum {
@@ -83,6 +90,11 @@ typedef enum {
   SHELL_FEAT_PIPELINE = 1 << 11,             // literal | pipeline construct
   SHELL_FEAT_GROUP = UINT32_C(1) << 12,      // Command group
   SHELL_FEAT_BACKGROUND = UINT32_C(1) << 13, // Background execution
+  SHELL_FEAT_EXTGLOB = UINT32_C(1) << 14,    // Bash extglob pattern
+  SHELL_FEAT_ANSI_C_QUOTE = UINT32_C(1) << 15, // Bash $'...' quote
+  SHELL_FEAT_ARRAY = UINT32_C(1) << 16,    // Bash array assignment/reference
+  SHELL_FEAT_NAMED_FD = UINT32_C(1) << 17, // Bash {name} redirect
+  SHELL_FEAT_COMBINED_REDIRECT = UINT32_C(1) << 18, // Bash &>/&>>
 } shell_cmd_features_t;
 
 /**
@@ -131,6 +143,11 @@ typedef struct {
   bool has_pipeline;
   bool has_group;
   bool has_background;
+  bool has_extglob;
+  bool has_ansi_c_quote;
+  bool has_array;
+  bool has_named_fd;
+  bool has_combined_redirect;
 } shell_feature_flags_t;
 
 /**
@@ -155,6 +172,7 @@ typedef struct {
   uint32_t start;       // Index in command string
   uint32_t len;         // Length
   uint16_t type;        // shell_cmd_type_t
+  uint16_t modifiers;   // shell_cmd_modifier_t
   uint32_t features;    // shell_cmd_features_t
   uint16_t group_depth; // Enclosing command-group nesting depth
   uint8_t group_kinds;  // shell_group_kind_t bitset of enclosing groups
@@ -172,7 +190,8 @@ typedef struct {
   uint16_t first_command;
   uint16_t command_count;
   uint16_t parent;
-  uint8_t kind; // Exactly one shell_group_kind_t value
+  uint8_t kind;       // Exactly one shell_group_kind_t value
+  uint16_t modifiers; // shell_cmd_modifier_t on this compound pipeline member
 } shell_group_t;
 
 /**

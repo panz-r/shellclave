@@ -36,10 +36,18 @@ static bool trie_type_supports_param(st_token_type_t t) {
   return st_type_supports_metadata(t);
 }
 
-static const st_metadata_entry_t *sample_metadata(st_token_type_t type,
-                                                  const char *text) {
-  if (!text)
+static const st_metadata_entry_t *
+sample_metadata(st_token_type_t type, const char *text, size_t text_length) {
+  /* Parameter metadata is textual. Never classify bytes after an embedded
+   * NUL as if the payload ended at that point, and never let C-string helpers
+   * read past a valid explicit-length span. */
+  if (!text || text_length >= ST_MAX_TOKEN_LEN ||
+      memchr(text, '\0', text_length) != NULL)
     return NULL;
+  char terminated[ST_MAX_TOKEN_LEN];
+  memcpy(terminated, text, text_length);
+  terminated[text_length] = '\0';
+  text = terminated;
   if (type == ST_TYPE_SIZE)
     return st_metadata_lookup(type, st_size_suffix(text));
   if (type == ST_TYPE_DURATION) {
@@ -82,16 +90,20 @@ static const st_metadata_entry_t *sample_metadata(st_token_type_t type,
 
 /* --- NODE HELPERS --- */
 
-static st_node_t *node_new(const char *token, st_token_type_t type) {
+static st_node_t *node_new(const char *token, size_t token_length,
+                           st_token_type_t type) {
   st_node_t *node = calloc(1, sizeof(st_node_t));
   if (!node)
     return NULL;
 
-  node->token = strdup(token);
+  node->token = malloc(token_length + 1);
   if (!node->token) {
     free(node);
     return NULL;
   }
+  memcpy(node->token, token, token_length);
+  node->token[token_length] = '\0';
+  node->token_length = token_length;
 
   node->type = type;
   node->count = 0;
@@ -99,8 +111,6 @@ static st_node_t *node_new(const char *token, st_token_type_t type) {
   node->children = NULL;
   node->num_children = 0;
   node->children_capacity = 0;
-  node->sample_values = NULL;
-  node->num_samples = 0;
   node->metadata_observations = 0;
   node->common_metadata = ST_META_NONE;
   node->metadata_mixed = false;
@@ -115,10 +125,6 @@ static void node_free(st_node_t *node) {
     node_free(node->children[i]);
   }
   free(node->children);
-  for (size_t i = 0; i < node->num_samples; i++) {
-    free(node->sample_values[i]);
-  }
-  free(node->sample_values);
   free(node->token);
   free(node);
 }
@@ -141,11 +147,12 @@ static bool node_ensure_capacity(st_node_t *node, size_t needed) {
 
 /* Find child by token text (for literals) or by type (for wildcards) */
 static st_node_t *node_find_child(st_node_t *node, const char *token,
-                                  st_token_type_t type) {
+                                  size_t token_length, st_token_type_t type) {
   for (size_t i = 0; i < node->num_children; i++) {
     st_node_t *child = node->children[i];
     if (child->type == ST_TYPE_LITERAL && type == ST_TYPE_LITERAL) {
-      if (strcmp(child->token, token) == 0)
+      if (child->token_length == token_length &&
+          memcmp(child->token, token, token_length) == 0)
         return child;
     } else if (child->type == type) {
       return child;
@@ -162,7 +169,11 @@ static st_error_t trie_insert_with_count(st_node_t *root, st_token_t *tokens,
     return ST_ERR_LIMIT;
   st_node_t *current = root;
   for (size_t i = 0; i < count; i++) {
-    st_node_t *child = node_find_child(current, tokens[i].text, tokens[i].type);
+    size_t token_length = tokens[i].text_length;
+    if (token_length == 0 && tokens[i].text[0] != '\0')
+      token_length = strlen(tokens[i].text);
+    st_node_t *child =
+        node_find_child(current, tokens[i].text, token_length, tokens[i].type);
     if (!child)
       break;
     if (increment > UINT32_MAX - child->count)
@@ -175,21 +186,26 @@ static st_error_t trie_insert_with_count(st_node_t *root, st_token_t *tokens,
   uint32_t old_metadata_observations[ST_MAX_CMD_TOKENS] = {0};
   uint16_t old_common_metadata[ST_MAX_CMD_TOKENS] = {0};
   bool old_metadata_mixed[ST_MAX_CMD_TOKENS] = {false};
-  bool sample_added[ST_MAX_CMD_TOKENS] = {false};
   size_t path_count = 1;
   size_t created_index = SIZE_MAX;
   current = root;
   current->count += increment;
 
   for (size_t i = 0; i < count; i++) {
-    st_node_t *child = node_find_child(current, tokens[i].text, tokens[i].type);
+    size_t token_length = tokens[i].text_length;
+    if (token_length == 0 && tokens[i].text[0] != '\0')
+      token_length = strlen(tokens[i].text);
+    st_node_t *child =
+        node_find_child(current, tokens[i].text, token_length, tokens[i].type);
     if (!child) {
       if (!node_ensure_capacity(current, current->num_children + 1))
         goto memory_failure;
       const char *tok_str = (tokens[i].type == ST_TYPE_LITERAL)
                                 ? tokens[i].text
                                 : st_type_symbol[tokens[i].type];
-      child = node_new(tok_str, tokens[i].type);
+      size_t stored_length =
+          tokens[i].type == ST_TYPE_LITERAL ? token_length : strlen(tok_str);
+      child = node_new(tok_str, stored_length, tokens[i].type);
       if (!child)
         goto memory_failure;
       current->children[current->num_children++] = child;
@@ -207,7 +223,7 @@ static st_error_t trie_insert_with_count(st_node_t *root, st_token_t *tokens,
     if (tokens[i].type != ST_TYPE_LITERAL) {
       child->observed_types |= (1ULL << tokens[i].type);
       const st_metadata_entry_t *observed =
-          sample_metadata(tokens[i].type, tokens[i].text);
+          sample_metadata(tokens[i].type, tokens[i].text, token_length);
       if (increment > UINT32_MAX - child->metadata_observations)
         goto limit_failure;
       if (child->metadata_observations == 0 && observed) {
@@ -217,19 +233,6 @@ static st_error_t trie_insert_with_count(st_node_t *root, st_token_t *tokens,
         child->metadata_mixed = true;
       }
       child->metadata_observations += increment;
-      /* Store original value as sample (for parametrized suggestions) */
-      if (child->num_samples < ST_MAX_SAMPLE_VALUES) {
-        char **new_vals = realloc(child->sample_values,
-                                  (child->num_samples + 1) * sizeof(char *));
-        if (!new_vals)
-          goto memory_failure;
-        child->sample_values = new_vals;
-        child->sample_values[child->num_samples] = strdup(tokens[i].text);
-        if (!child->sample_values[child->num_samples])
-          goto memory_failure;
-        child->num_samples++;
-        sample_added[i] = true;
-      }
     }
     current = child;
   }
@@ -247,10 +250,6 @@ limit_failure:
       node->metadata_observations = old_metadata_observations[i];
       node->common_metadata = old_common_metadata[i];
       node->metadata_mixed = old_metadata_mixed[i];
-      if (sample_added[i]) {
-        free(node->sample_values[node->num_samples - 1]);
-        node->num_samples--;
-      }
     }
   }
   if (created_index != SIZE_MAX) {
@@ -271,10 +270,6 @@ memory_failure:
     node->metadata_observations = old_metadata_observations[i];
     node->common_metadata = old_common_metadata[i];
     node->metadata_mixed = old_metadata_mixed[i];
-    if (sample_added[i]) {
-      free(node->sample_values[node->num_samples - 1]);
-      node->num_samples--;
-    }
   }
   if (created_index != SIZE_MAX) {
     st_node_t *parent = path[created_index];
@@ -303,7 +298,9 @@ static bool learner_tokens_valid(const st_token_t *tokens, size_t count) {
   for (size_t i = 0; i < count; i++) {
     if (!tokens[i].text || tokens[i].type < ST_TYPE_LITERAL ||
         tokens[i].type >= ST_TYPE_COUNT ||
-        strlen(tokens[i].text) >= ST_MAX_TOKEN_LEN)
+        (tokens[i].text_length != 0
+             ? tokens[i].text_length
+             : strlen(tokens[i].text)) >= ST_MAX_TOKEN_LEN)
       return false;
   }
   return true;
@@ -338,7 +335,7 @@ st_learner_t *st_learner_new(const st_learner_config_t *config) {
   if (!learner)
     return NULL;
 
-  learner->trie.root = node_new("", ST_TYPE_LITERAL);
+  learner->trie.root = node_new("", 0, ST_TYPE_LITERAL);
   if (!learner->trie.root) {
     free(learner);
     return NULL;
@@ -384,9 +381,8 @@ void st_learner_free(st_learner_t *learner) {
   if (!learner)
     return;
   node_free(learner->trie.root);
-  for (size_t i = 0; i < learner->blacklist_count; i++) {
-    free(learner->blacklist[i]);
-  }
+  for (size_t i = 0; i < learner->blacklist_count; i++)
+    st_netpattern_free(&learner->blacklist[i]);
   free(learner->blacklist);
   free(learner);
 }
@@ -400,8 +396,19 @@ st_error_t st_learner_feed_netargv_view(st_learner_t *learner,
 
   st_token_scratch_t scratch;
   st_error_t err = st_netargv_classify_scratch_view(netargv, &scratch);
-  if (err == ST_ERR_FAILED)
-    return ST_ERR_INVALID;
+  if (err == ST_ERR_FAILED) {
+    st_token_array_t owned = {0};
+    err = st_netargv_classify_view(netargv, &owned);
+    if (err != ST_OK)
+      return err;
+    if (!learner_tokens_valid(owned.tokens, owned.count)) {
+      st_token_array_free(&owned);
+      return ST_ERR_INVALID;
+    }
+    err = learner_insert_atomic(learner, owned.tokens, owned.count);
+    st_token_array_free(&owned);
+    return err;
+  }
   if (err != ST_OK)
     return err;
   if (!learner_tokens_valid(scratch.tokens, scratch.count))
@@ -428,7 +435,7 @@ st_error_t st_learner_feed_tokens(st_learner_t *learner,
 /* --- PUBLIC API – SUGGESTIONS --- */
 
 typedef struct {
-  char *pattern;
+  st_netpattern_t pattern;
   uint32_t count;
   double confidence;
 } st_candidate_t;
@@ -490,7 +497,7 @@ typedef struct {
 
 static void candidate_list_free(candidate_list_t *list) {
   for (size_t i = 0; i < list->count; i++)
-    free(list->items[i].pattern);
+    st_netpattern_free(&list->items[i].pattern);
   free(list->items);
   memset(list, 0, sizeof(*list));
 }
@@ -523,43 +530,55 @@ static uint32_t node_terminal_count(const st_node_t *node) {
 static int compare_branch_candidates(const void *left, const void *right) {
   const branch_candidate_t *a = left;
   const branch_candidate_t *b = right;
-  int suffix = st_netpattern_compare(a->suffix.pattern, b->suffix.pattern);
+  int suffix = st_netpattern_compare_view(
+      (st_netpattern_view_t){.data = a->suffix.pattern.data,
+                             .length = a->suffix.pattern.length},
+      (st_netpattern_view_t){.data = b->suffix.pattern.data,
+                             .length = b->suffix.pattern.length});
   if (suffix != 0)
     return suffix;
   if (a->child->type != b->child->type)
     return a->child->type < b->child->type ? -1 : 1;
-  return strcmp(a->child->token, b->child->token);
+  size_t shared = a->child->token_length < b->child->token_length
+                      ? a->child->token_length
+                      : b->child->token_length;
+  int token = shared ? memcmp(a->child->token, b->child->token, shared) : 0;
+  return token                                             ? token
+         : a->child->token_length > b->child->token_length ? 1
+         : a->child->token_length < b->child->token_length ? -1
+                                                           : 0;
 }
 
 static bool append_prefixed(candidate_list_t *output,
                             const branch_candidate_t *branch, const char *token,
-                            st_token_type_t type, double confidence) {
-  st_token_t typed = {.text = (char *)token, .type = type};
-  char *prefix = NULL;
-  if (st_netpattern_encode(&typed, 1, &prefix) != ST_OK)
+                            size_t token_length, st_token_type_t type,
+                            double confidence) {
+  st_token_t typed = {.text = token, .text_length = token_length, .type = type};
+  st_netpattern_t prefix = {0};
+  if (st_netpattern_encode_owned(&typed, 1, &prefix) != ST_OK)
     return false;
-  size_t token_length = strlen(prefix);
-  size_t suffix_length = strlen(branch->suffix.pattern);
-  if (token_length >= ST_MAX_NETPATTERN_LEN ||
-      suffix_length >= ST_MAX_NETPATTERN_LEN - token_length) {
-    free(prefix);
+  if (prefix.length >= ST_MAX_NETPATTERN_LEN ||
+      branch->suffix.pattern.length >= ST_MAX_NETPATTERN_LEN - prefix.length) {
+    st_netpattern_free(&prefix);
     return true;
   }
-  size_t length = token_length + suffix_length;
+  size_t length = prefix.length + branch->suffix.pattern.length;
   char *pattern = malloc(length + 1);
   if (!pattern) {
-    free(prefix);
+    st_netpattern_free(&prefix);
     return false;
   }
-  memcpy(pattern, prefix, token_length);
-  free(prefix);
-  size_t used = token_length;
-  memcpy(pattern + used, branch->suffix.pattern, suffix_length + 1);
-  st_candidate_t candidate = {.pattern = pattern,
+  size_t encoded_length = prefix.length;
+  memcpy(pattern, prefix.data, encoded_length);
+  st_netpattern_free(&prefix);
+  memcpy(pattern + encoded_length, branch->suffix.pattern.data,
+         branch->suffix.pattern.length);
+  pattern[length] = '\0';
+  st_candidate_t candidate = {.pattern = {.data = pattern, .length = length},
                               .count = branch->suffix.count,
                               .confidence = confidence};
   if (!candidate_list_append(output, candidate)) {
-    free(pattern);
+    st_netpattern_free(&candidate.pattern);
     return false;
   }
   return true;
@@ -567,50 +586,57 @@ static bool append_prefixed(candidate_list_t *output,
 
 static bool append_compound_prefixed(candidate_list_t *output,
                                      const branch_candidate_t *branch,
-                                     const char *prefix,
+                                     const char *prefix, size_t prefix_length,
                                      st_token_type_t capture_type,
                                      double confidence) {
   st_token_t typed = {.text = (char *)prefix,
                       .type = ST_TYPE_LITERAL,
                       .compound = true,
                       .prefix = (char *)prefix,
+                      .prefix_length = prefix_length,
                       .capture = (char *)st_type_symbol[capture_type],
                       .suffix = "",
                       .capture_type = capture_type};
-  char *encoded_prefix = NULL;
-  if (st_netpattern_encode(&typed, 1, &encoded_prefix) != ST_OK)
+  st_netpattern_t encoded_prefix = {0};
+  if (st_netpattern_encode_owned(&typed, 1, &encoded_prefix) != ST_OK)
     return false;
-  size_t prefix_length = strlen(encoded_prefix);
-  size_t suffix_length = strlen(branch->suffix.pattern);
-  if (prefix_length >= ST_MAX_NETPATTERN_LEN ||
-      suffix_length >= ST_MAX_NETPATTERN_LEN - prefix_length) {
-    free(encoded_prefix);
+  if (encoded_prefix.length >= ST_MAX_NETPATTERN_LEN ||
+      branch->suffix.pattern.length >=
+          ST_MAX_NETPATTERN_LEN - encoded_prefix.length) {
+    st_netpattern_free(&encoded_prefix);
     return true;
   }
-  char *pattern = malloc(prefix_length + suffix_length + 1);
+  size_t length = encoded_prefix.length + branch->suffix.pattern.length;
+  char *pattern = malloc(length + 1);
   if (!pattern) {
-    free(encoded_prefix);
+    st_netpattern_free(&encoded_prefix);
     return false;
   }
-  memcpy(pattern, encoded_prefix, prefix_length);
-  free(encoded_prefix);
-  memcpy(pattern + prefix_length, branch->suffix.pattern, suffix_length + 1);
-  st_candidate_t candidate = {.pattern = pattern,
+  size_t encoded_length = encoded_prefix.length;
+  memcpy(pattern, encoded_prefix.data, encoded_length);
+  st_netpattern_free(&encoded_prefix);
+  memcpy(pattern + encoded_length, branch->suffix.pattern.data,
+         branch->suffix.pattern.length);
+  pattern[length] = '\0';
+  st_candidate_t candidate = {.pattern = {.data = pattern, .length = length},
                               .count = branch->suffix.count,
                               .confidence = confidence};
   if (!candidate_list_append(output, candidate)) {
-    free(pattern);
+    st_netpattern_free(&candidate.pattern);
     return false;
   }
   return true;
 }
 
-static bool option_capture(const char *token, size_t *prefix_length,
+static bool option_capture(const char *token, size_t token_length,
+                           size_t *prefix_length,
                            st_token_type_t *capture_type) {
-  if (!token || token[0] != '-' || token[1] != '-')
+  if (!token || token_length < 4 || token[0] != '-' || token[1] != '-' ||
+      memchr(token, '\0', token_length) != NULL)
     return false;
-  const char *equals = strchr(token + 2, '=');
-  if (!equals || equals == token + 2 || equals[1] == '\0')
+  const char *equals = memchr(token + 2, '=', token_length - 2);
+  if (!equals || equals == token + 2 ||
+      (size_t)(equals - token + 1) == token_length)
     return false;
   st_token_type_t type = st_token_classify(equals + 1);
   if (type == ST_TYPE_LITERAL)
@@ -626,10 +652,14 @@ static bool collect_complete_continuations(const st_node_t *node,
                                            candidate_list_t *output) {
   uint32_t terminal = node_terminal_count(node);
   if (terminal != 0) {
-    char *empty = strdup("");
-    if (!empty || !candidate_list_append(
-                      output, (st_candidate_t){empty, terminal, 1.0})) {
-      free(empty);
+    char *empty = malloc(1);
+    if (empty)
+      empty[0] = '\0';
+    st_candidate_t candidate = {.pattern = {.data = empty, .length = 0},
+                                .count = terminal,
+                                .confidence = 1.0};
+    if (!empty || !candidate_list_append(output, candidate)) {
+      st_netpattern_free(&candidate.pattern);
       return false;
     }
   }
@@ -679,8 +709,13 @@ static bool collect_complete_continuations(const st_node_t *node,
   for (size_t begin = 0; begin < branch_count;) {
     size_t end = begin + 1;
     while (end < branch_count &&
-           st_netpattern_compare(branches[begin].suffix.pattern,
-                                 branches[end].suffix.pattern) == 0)
+           st_netpattern_compare_view(
+               (st_netpattern_view_t){
+                   .data = branches[begin].suffix.pattern.data,
+                   .length = branches[begin].suffix.pattern.length},
+               (st_netpattern_view_t){
+                   .data = branches[end].suffix.pattern.data,
+                   .length = branches[end].suffix.pattern.length}) == 0)
       end++;
 
     size_t literal_count = 0;
@@ -718,7 +753,8 @@ static bool collect_complete_continuations(const st_node_t *node,
         size_t prefix_length = 0;
         st_token_type_t capture_type = ST_TYPE_LITERAL;
         if (child->type != ST_TYPE_LITERAL ||
-            !option_capture(child->token, &prefix_length, &capture_type)) {
+            !option_capture(child->token, child->token_length, &prefix_length,
+                            &capture_type)) {
           compound_group = false;
           break;
         }
@@ -747,7 +783,8 @@ static bool collect_complete_continuations(const st_node_t *node,
                      .confidence = (double)group_total / (double)node->count},
           .child = branches[begin].child,
       };
-      if (!append_compound_prefixed(output, &aggregate, prefix, compound_type,
+      if (!append_compound_prefixed(output, &aggregate, prefix,
+                                    compound_prefix_length, compound_type,
                                     aggregate.suffix.confidence))
         goto failure;
     } else if (literal_count >= 2 && !command_position &&
@@ -758,7 +795,7 @@ static bool collect_complete_continuations(const st_node_t *node,
                      .confidence = (double)group_total / (double)node->count},
           .child = branches[begin].child,
       };
-      if (!append_prefixed(output, &aggregate, "*", ST_TYPE_ANY,
+      if (!append_prefixed(output, &aggregate, "*", 1, ST_TYPE_ANY,
                            aggregate.suffix.confidence))
         goto failure;
     } else {
@@ -767,11 +804,11 @@ static bool collect_complete_continuations(const st_node_t *node,
         if (child->type != ST_TYPE_LITERAL)
           continue;
         double confidence =
-            branches[i].suffix.pattern[0] == '\0'
+            branches[i].suffix.pattern.length == 0
                 ? (double)branches[i].suffix.count / (double)node->count
                 : branches[i].suffix.confidence;
         if (!append_prefixed(output, &branches[i], child->token,
-                             ST_TYPE_LITERAL, confidence))
+                             child->token_length, ST_TYPE_LITERAL, confidence))
           goto failure;
       }
     }
@@ -784,11 +821,11 @@ static bool collect_complete_continuations(const st_node_t *node,
       char token[32];
       node_suggestion_token(dominant->child, dominant->child->type, token);
       double confidence =
-          dominant->suffix.pattern[0] == '\0'
+          dominant->suffix.pattern.length == 0
               ? (double)dominant->suffix.count / (double)node->count
               : dominant->suffix.confidence;
-      if (!append_prefixed(output, dominant, token, dominant->child->type,
-                           confidence))
+      if (!append_prefixed(output, dominant, token, strlen(token),
+                           dominant->child->type, confidence))
         goto failure;
     } else if (typed_count >= 2 && dominant && typed_total <= UINT32_MAX) {
       st_token_type_t selected;
@@ -810,7 +847,7 @@ static bool collect_complete_continuations(const st_node_t *node,
                      .confidence = (double)support / (double)node->count},
           .child = dominant->child,
       };
-      if (!append_prefixed(output, &aggregate, token, selected,
+      if (!append_prefixed(output, &aggregate, token, strlen(token), selected,
                            aggregate.suffix.confidence))
         goto failure;
     }
@@ -818,13 +855,13 @@ static bool collect_complete_continuations(const st_node_t *node,
   }
 
   for (size_t i = 0; i < branch_count; i++)
-    free(branches[i].suffix.pattern);
+    st_netpattern_free(&branches[i].suffix.pattern);
   free(branches);
   return true;
 
 failure:
   for (size_t i = 0; i < branch_count; i++)
-    free(branches[i].suffix.pattern);
+    st_netpattern_free(&branches[i].suffix.pattern);
   free(branches);
   candidate_list_free(output);
   return false;
@@ -839,33 +876,35 @@ static void collect_suggestions(st_learner_t *learner, dfs_ctx_t *ctx) {
   for (size_t i = 0; i < complete.count; i++) {
     st_candidate_t candidate = complete.items[i];
     st_token_array_t decoded = {0};
-    st_error_t decode_error =
-        candidate.pattern[0] ? st_netpattern_decode(candidate.pattern, &decoded)
-                             : ST_ERR_FORMAT;
+    st_netpattern_view_t pattern = {.data = candidate.pattern.data,
+                                    .length = candidate.pattern.length};
+    st_error_t decode_error = candidate.pattern.length
+                                  ? st_netpattern_decode_view(pattern, &decoded)
+                                  : ST_ERR_FORMAT;
     bool leading_any = decode_error == ST_OK && decoded.count != 0 &&
                        decoded.tokens[0].type == ST_TYPE_ANY;
     st_token_array_free(&decoded);
     if (decode_error != ST_OK || leading_any ||
         candidate.count < ctx->min_support ||
         candidate.confidence < ctx->min_confidence ||
-        st_netpattern_validate(candidate.pattern, NULL) != ST_OK ||
-        st_learner_is_netpattern_blacklisted(ctx->learner, candidate.pattern)) {
-      free(candidate.pattern);
-      complete.items[i].pattern = NULL;
+        st_netpattern_validate_view(pattern, NULL) != ST_OK ||
+        st_learner_is_netpattern_blacklisted(ctx->learner, pattern)) {
+      st_netpattern_free(&candidate.pattern);
+      complete.items[i].pattern = (st_netpattern_t){0};
       continue;
     }
     if (!dfs_ctx_ensure(ctx)) {
-      free(candidate.pattern);
-      complete.items[i].pattern = NULL;
+      st_netpattern_free(&candidate.pattern);
+      complete.items[i].pattern = (st_netpattern_t){0};
       ctx->failed = true;
       break;
     }
     ctx->candidates[ctx->count++] = candidate;
-    complete.items[i].pattern = NULL;
+    complete.items[i].pattern = (st_netpattern_t){0};
   }
   if (ctx->failed)
     for (size_t i = 0; i < complete.count; i++)
-      free(complete.items[i].pattern);
+      st_netpattern_free(&complete.items[i].pattern);
   free(complete.items);
 }
 
@@ -880,13 +919,21 @@ static int compare_candidates(const void *a, const void *b) {
     return -1;
   if (ca->count < cb->count)
     return 1;
-  return st_netpattern_compare(ca->pattern, cb->pattern);
+  return st_netpattern_compare_view(
+      (st_netpattern_view_t){.data = ca->pattern.data,
+                             .length = ca->pattern.length},
+      (st_netpattern_view_t){.data = cb->pattern.data,
+                             .length = cb->pattern.length});
 }
 
 static int compare_candidate_patterns(const void *a, const void *b) {
   const st_candidate_t *ca = (const st_candidate_t *)a;
   const st_candidate_t *cb = (const st_candidate_t *)b;
-  int pattern_order = st_netpattern_compare(ca->pattern, cb->pattern);
+  int pattern_order = st_netpattern_compare_view(
+      (st_netpattern_view_t){.data = ca->pattern.data,
+                             .length = ca->pattern.length},
+      (st_netpattern_view_t){.data = cb->pattern.data,
+                             .length = cb->pattern.length});
   return pattern_order != 0 ? pattern_order : compare_candidates(a, b);
 }
 
@@ -895,15 +942,19 @@ static size_t deduplicate(st_candidate_t *candidates, size_t count) {
     return count;
   size_t write = 1;
   for (size_t read = 1; read < count; read++) {
-    if (st_netpattern_compare(candidates[read].pattern,
-                              candidates[write - 1].pattern) != 0) {
+    if (st_netpattern_compare_view(
+            (st_netpattern_view_t){.data = candidates[read].pattern.data,
+                                   .length = candidates[read].pattern.length},
+            (st_netpattern_view_t){
+                .data = candidates[write - 1].pattern.data,
+                .length = candidates[write - 1].pattern.length}) != 0) {
       if (write != read) {
-        free(candidates[write].pattern);
+        st_netpattern_free(&candidates[write].pattern);
         candidates[write] = candidates[read];
       }
       write++;
     } else {
-      free(candidates[read].pattern);
+      st_netpattern_free(&candidates[read].pattern);
     }
   }
   return write;
@@ -914,7 +965,6 @@ st_suggestion_t *st_learner_suggest(st_learner_t *learner, size_t *out_count) {
     *out_count = 0;
   if (!learner || !out_count)
     return NULL;
-
   dfs_ctx_t ctx = {
       .candidates = NULL,
       .count = 0,
@@ -928,12 +978,13 @@ st_suggestion_t *st_learner_suggest(st_learner_t *learner, size_t *out_count) {
 
   if (ctx.failed) {
     for (size_t i = 0; i < ctx.count; i++)
-      free(ctx.candidates[i].pattern);
+      st_netpattern_free(&ctx.candidates[i].pattern);
     free(ctx.candidates);
     return NULL;
   }
 
   if (ctx.count == 0) {
+    free(ctx.candidates);
     return NULL;
   }
 
@@ -948,7 +999,7 @@ st_suggestion_t *st_learner_suggest(st_learner_t *learner, size_t *out_count) {
   }
   if (result_count == 0) {
     for (size_t i = 0; i < ctx.count; i++)
-      free(ctx.candidates[i].pattern);
+      st_netpattern_free(&ctx.candidates[i].pattern);
     free(ctx.candidates);
     return NULL;
   }
@@ -956,19 +1007,20 @@ st_suggestion_t *st_learner_suggest(st_learner_t *learner, size_t *out_count) {
   st_suggestion_t *result = calloc(result_count, sizeof(st_suggestion_t));
   if (!result) {
     for (size_t i = 0; i < ctx.count; i++)
-      free(ctx.candidates[i].pattern);
+      st_netpattern_free(&ctx.candidates[i].pattern);
     free(ctx.candidates);
     return NULL;
   }
 
   for (size_t i = 0; i < result_count; i++) {
-    result[i].pattern = ctx.candidates[i].pattern;
+    result[i].pattern = ctx.candidates[i].pattern.data;
+    result[i].pattern_length = ctx.candidates[i].pattern.length;
     result[i].count = ctx.candidates[i].count;
     result[i].confidence = ctx.candidates[i].confidence;
   }
 
   for (size_t i = result_count; i < ctx.count; i++) {
-    free(ctx.candidates[i].pattern);
+    st_netpattern_free(&ctx.candidates[i].pattern);
   }
   free(ctx.candidates);
 
@@ -991,7 +1043,8 @@ static bool blacklist_ensure(st_learner_t *learner) {
     return true;
   size_t new_cap =
       learner->blacklist_capacity == 0 ? 16 : learner->blacklist_capacity * 2;
-  char **new_arr = realloc(learner->blacklist, new_cap * sizeof(char *));
+  st_netpattern_t *new_arr =
+      realloc(learner->blacklist, new_cap * sizeof(*new_arr));
   if (!new_arr)
     return false;
   learner->blacklist = new_arr;
@@ -1000,11 +1053,11 @@ static bool blacklist_ensure(st_learner_t *learner) {
 }
 
 st_error_t st_learner_blacklist_add_netpattern(st_learner_t *learner,
-                                               const char *pattern) {
-  if (!learner || !pattern || pattern[0] == '\0')
+                                               st_netpattern_view_t pattern) {
+  if (!learner || !pattern.data || pattern.length == 0)
     return ST_ERR_INVALID;
   st_token_array_t decoded = {0};
-  st_error_t decode_error = st_netpattern_decode(pattern, &decoded);
+  st_error_t decode_error = st_netpattern_decode_view(pattern, &decoded);
   st_token_array_free(&decoded);
   if (decode_error != ST_OK)
     return decode_error;
@@ -1012,19 +1065,23 @@ st_error_t st_learner_blacklist_add_netpattern(st_learner_t *learner,
     return ST_OK;
   if (!blacklist_ensure(learner))
     return ST_ERR_MEMORY;
-  char *copy = strdup(pattern);
+  char *copy = malloc(pattern.length + 1);
   if (!copy)
     return ST_ERR_MEMORY;
-  learner->blacklist[learner->blacklist_count++] = copy;
+  memcpy(copy, pattern.data, pattern.length);
+  copy[pattern.length] = '\0';
+  learner->blacklist[learner->blacklist_count++] =
+      (st_netpattern_t){.data = copy, .length = pattern.length};
   return ST_OK;
 }
 
 bool st_learner_is_netpattern_blacklisted(const st_learner_t *learner,
-                                          const char *pattern) {
-  if (!learner || !pattern || pattern[0] == '\0')
+                                          st_netpattern_view_t pattern) {
+  if (!learner || !pattern.data || pattern.length == 0)
     return false;
   for (size_t i = 0; i < learner->blacklist_count; i++) {
-    if (strcmp(learner->blacklist[i], pattern) == 0)
+    if (learner->blacklist[i].length == pattern.length &&
+        memcmp(learner->blacklist[i].data, pattern.data, pattern.length) == 0)
       return true;
   }
   return false;
@@ -1062,11 +1119,6 @@ static bool line_equals(const char *line, const char *expected) {
          line_ends_here(line + length);
 }
 
-static bool parse_u32_exact(const char *text, uint32_t *value) {
-  char *end = NULL;
-  return parse_u32_field(text, &end, value) && *end == '\0';
-}
-
 typedef struct {
   FILE *fp;
   st_error_t error;
@@ -1075,17 +1127,13 @@ typedef struct {
 } learner_save_ctx_t;
 
 static bool append_netstring_field(char *record, size_t capacity, size_t *used,
-                                   const char *value) {
-  size_t length = strlen(value);
+                                   const char *value, size_t length) {
   size_t written = 0;
   if (*used > capacity ||
       shell_netstring_write(record + *used, capacity - *used, value, length,
                             &written) != SHELL_NETSTRING_OK)
     return false;
   *used += written;
-  if (*used >= capacity)
-    return false;
-  record[*used] = '\0';
   return true;
 }
 
@@ -1140,15 +1188,23 @@ static void dfs_save_v4(st_node_t *node, uint32_t parent_id, size_t depth,
            node->metadata_observations);
   char record[ST_MAX_TOKEN_LEN + 256] = {0};
   size_t used = 0;
-  if (!append_netstring_field(record, sizeof(record), &used, id_text) ||
-      !append_netstring_field(record, sizeof(record), &used, parent_text) ||
-      !append_netstring_field(record, sizeof(record), &used, kind_text) ||
-      !append_netstring_field(record, sizeof(record), &used, type_text) ||
-      !append_netstring_field(record, sizeof(record), &used, count_text) ||
-      !append_netstring_field(record, sizeof(record), &used, metadata) ||
-      !append_netstring_field(record, sizeof(record), &used,
-                              observations_text) ||
-      !append_netstring_field(record, sizeof(record), &used, token)) {
+  size_t token_length = node->type == ST_TYPE_LITERAL ? node->token_length : 0;
+  if (!append_netstring_field(record, sizeof(record), &used, id_text,
+                              strlen(id_text)) ||
+      !append_netstring_field(record, sizeof(record), &used, parent_text,
+                              strlen(parent_text)) ||
+      !append_netstring_field(record, sizeof(record), &used, kind_text,
+                              strlen(kind_text)) ||
+      !append_netstring_field(record, sizeof(record), &used, type_text,
+                              strlen(type_text)) ||
+      !append_netstring_field(record, sizeof(record), &used, count_text,
+                              strlen(count_text)) ||
+      !append_netstring_field(record, sizeof(record), &used, metadata,
+                              strlen(metadata)) ||
+      !append_netstring_field(record, sizeof(record), &used, observations_text,
+                              strlen(observations_text)) ||
+      !append_netstring_field(record, sizeof(record), &used, token,
+                              token_length)) {
     ctx->error = ST_ERR_LIMIT;
     return;
   }
@@ -1159,8 +1215,9 @@ static void dfs_save_v4(st_node_t *node, uint32_t parent_id, size_t depth,
     ctx->error = ST_ERR_LIMIT;
     return;
   }
-  prefix[prefix_length] = '\0';
-  if (fprintf(ctx->fp, "%s%s,\n", prefix, record) < 0) {
+  if (fwrite(prefix, 1, prefix_length, ctx->fp) != prefix_length ||
+      fwrite(record, 1, used, ctx->fp) != used ||
+      fwrite(",\n", 1, 2, ctx->fp) != 2) {
     ctx->error = ST_ERR_IO;
     return;
   }
@@ -1187,7 +1244,6 @@ static bool node_counts_valid(const st_node_t *node) {
 st_error_t st_learner_save(const st_learner_t *learner, const char *path) {
   if (!learner || !path)
     return ST_ERR_INVALID;
-
   st_atomic_output_t output;
   st_atomic_output_result_t begin = st_atomic_output_begin(path, &output);
   if (begin != ST_ATOMIC_OUTPUT_OK)
@@ -1224,8 +1280,10 @@ st_error_t st_learner_save(const st_learner_t *learner, const char *path) {
   return ctx.error;
 }
 
-static st_error_t read_outer_record(FILE *fp, char **payload, uint32_t *crc) {
+static st_error_t read_outer_record(FILE *fp, unsigned char **payload,
+                                    size_t *payload_length, uint32_t *crc) {
   *payload = NULL;
+  *payload_length = 0;
   unsigned char *record = NULL;
   size_t record_length = 0;
   shell_netstring_status_t status = shell_netstring_read_stream(
@@ -1242,8 +1300,7 @@ static st_error_t read_outer_record(FILE *fp, char **payload, uint32_t *crc) {
           SHELL_NETSTRING_OK ||
       shell_netstring_iter_next(&iter, &view) != SHELL_NETSTRING_OK ||
       view.record_length != record_length || view.payload_length == 0 ||
-      view.payload_length >= ST_MAX_TOKEN_LEN + 256 ||
-      memchr(view.payload, '\0', view.payload_length) || fgetc(fp) != '\n') {
+      view.payload_length >= ST_MAX_TOKEN_LEN + 256 || fgetc(fp) != '\n') {
     free(record);
     return ferror(fp) ? ST_ERR_IO : ST_ERR_FORMAT;
   }
@@ -1253,12 +1310,14 @@ static st_error_t read_outer_record(FILE *fp, char **payload, uint32_t *crc) {
   *crc = st_crc32_update(",\n", 2, *crc);
   memmove(record, view.payload, view.payload_length);
   record[view.payload_length] = '\0';
-  *payload = (char *)record;
+  *payload = record;
+  *payload_length = view.payload_length;
   return ST_OK;
 }
 
-static bool take_netstring_field(char *record, size_t length, size_t *offset,
-                                 char **field) {
+static bool take_netstring_field(const char *record, size_t length,
+                                 size_t *offset,
+                                 shell_netstring_view_t *field) {
   if (!record || !offset || !field || *offset > length)
     return false;
   shell_netstring_iter_t iter;
@@ -1268,9 +1327,31 @@ static bool take_netstring_field(char *record, size_t length, size_t *offset,
   shell_netstring_view_t view;
   if (shell_netstring_iter_next(&iter, &view) != SHELL_NETSTRING_OK)
     return false;
-  *field = (char *)view.payload;
+  *field = view;
   *offset += view.record_length;
-  record[*offset - 1] = '\0';
+  return true;
+}
+
+static bool field_equals(shell_netstring_view_t field, const char *text) {
+  size_t length = strlen(text);
+  return field.payload_length == length &&
+         memcmp(field.payload, text, length) == 0;
+}
+
+static bool parse_u32_view(shell_netstring_view_t field, uint32_t *value) {
+  if (!value || field.payload_length == 0 || field.payload_length >= 16)
+    return false;
+  uint32_t parsed = 0;
+  for (size_t i = 0; i < field.payload_length; i++) {
+    unsigned char c = field.payload[i];
+    if (c < '0' || c > '9')
+      return false;
+    unsigned digit = c - '0';
+    if (parsed > (UINT32_MAX - digit) / 10)
+      return false;
+    parsed = parsed * 10 + digit;
+  }
+  *value = parsed;
   return true;
 }
 
@@ -1300,7 +1381,7 @@ st_error_t st_learner_load(st_learner_t *learner, const char *path) {
   if (!fp)
     return ST_ERR_IO;
   st_error_t error = ST_ERR_FORMAT;
-  st_node_t *new_root = node_new("", ST_TYPE_LITERAL);
+  st_node_t *new_root = node_new("", 0, ST_TYPE_LITERAL);
   st_node_t **nodes = NULL;
   uint16_t *depths = NULL;
   if (!new_root) {
@@ -1334,55 +1415,67 @@ st_error_t st_learner_load(st_learner_t *learner, const char *path) {
   nodes[0] = new_root;
   uint32_t computed_crc = 0;
   for (uint32_t expected_id = 1; expected_id <= node_count; expected_id++) {
-    char *record = NULL;
-    error = read_outer_record(fp, &record, &computed_crc);
+    unsigned char *record = NULL;
+    size_t record_length = 0;
+    error = read_outer_record(fp, &record, &record_length, &computed_crc);
     if (error != ST_OK)
       goto done;
-    char *fields[8];
-    size_t record_length = strlen(record), offset = 0;
+    shell_netstring_view_t fields[8];
+    size_t offset = 0;
     bool valid = true;
     for (size_t field = 0; field < 8; field++)
-      valid = valid && take_netstring_field(record, record_length, &offset,
-                                            &fields[field]);
+      valid = valid && take_netstring_field((const char *)record, record_length,
+                                            &offset, &fields[field]);
     if (!valid || offset != record_length) {
       free(record);
       error = ST_ERR_FORMAT;
       goto done;
     }
     uint32_t id, parent_id, type_value, count, observations;
-    if (!parse_u32_exact(fields[0], &id) || id != expected_id ||
-        !parse_u32_exact(fields[1], &parent_id) || parent_id >= id ||
-        strlen(fields[2]) != 1 ||
-        (fields[2][0] != 'L' && fields[2][0] != 'T') ||
-        !parse_u32_exact(fields[3], &type_value) ||
-        type_value >= ST_TYPE_COUNT || !parse_u32_exact(fields[4], &count) ||
-        count == 0 || !parse_u32_exact(fields[6], &observations) ||
+    if (!parse_u32_view(fields[0], &id) || id != expected_id ||
+        !parse_u32_view(fields[1], &parent_id) || parent_id >= id ||
+        fields[2].payload_length != 1 ||
+        (fields[2].payload[0] != 'L' && fields[2].payload[0] != 'T') ||
+        !parse_u32_view(fields[3], &type_value) ||
+        type_value >= ST_TYPE_COUNT || !parse_u32_view(fields[4], &count) ||
+        count == 0 || !parse_u32_view(fields[6], &observations) ||
         !nodes[parent_id] || depths[parent_id] >= ST_MAX_CMD_TOKENS) {
       free(record);
       error = ST_ERR_FORMAT;
       goto done;
     }
     st_token_type_t type = (st_token_type_t)type_value;
-    bool literal = fields[2][0] == 'L';
+    bool literal = fields[2].payload[0] == 'L';
     if (literal != (type == ST_TYPE_LITERAL) ||
-        (literal ? strlen(fields[7]) >= ST_MAX_TOKEN_LEN
-                 : fields[7][0] != '\0')) {
+        (literal ? fields[7].payload_length >= ST_MAX_TOKEN_LEN
+                 : fields[7].payload_length != 0)) {
       free(record);
       error = ST_ERR_FORMAT;
       goto done;
     }
-    const char *token = literal ? fields[7] : st_type_symbol[type];
-    if (node_find_child(nodes[parent_id], token, type)) {
+    const char *token =
+        literal ? (const char *)fields[7].payload : st_type_symbol[type];
+    size_t token_length = literal ? fields[7].payload_length : strlen(token);
+    if (node_find_child(nodes[parent_id], token, token_length, type)) {
       free(record);
       error = ST_ERR_FORMAT;
       goto done;
     }
-    bool mixed = strcmp(fields[5], "!") == 0;
+    bool mixed = field_equals(fields[5], "!");
     const st_metadata_entry_t *common = NULL;
-    if (strcmp(fields[5], "-") != 0 && !mixed)
-      common = st_metadata_lookup(type, fields[5]);
-    if ((strcmp(fields[5], "-") != 0 && !mixed &&
-         (!common || strcmp(common->name, fields[5]) != 0)) ||
+    if (!field_equals(fields[5], "-") && !mixed) {
+      char metadata[ST_MAX_TOKEN_LEN];
+      if (fields[5].payload_length >= sizeof(metadata)) {
+        free(record);
+        error = ST_ERR_FORMAT;
+        goto done;
+      }
+      memcpy(metadata, fields[5].payload, fields[5].payload_length);
+      metadata[fields[5].payload_length] = '\0';
+      common = st_metadata_lookup(type, metadata);
+    }
+    if ((!field_equals(fields[5], "-") && !mixed &&
+         (!common || !field_equals(fields[5], common->name))) ||
         (literal && (observations != 0 || mixed || common)) ||
         (!literal && (observations != count || (mixed == (common != NULL)))) ||
         (common && (common->type != type || type == ST_TYPE_SEMVER))) {
@@ -1390,7 +1483,7 @@ st_error_t st_learner_load(st_learner_t *learner, const char *path) {
       error = ST_ERR_FORMAT;
       goto done;
     }
-    st_node_t *child = node_new(token, type);
+    st_node_t *child = node_new(token, token_length, type);
     if (!child) {
       free(record);
       error = ST_ERR_MEMORY;

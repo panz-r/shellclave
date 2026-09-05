@@ -27,6 +27,14 @@ static size_t skip_parameter_expansion(const char *input, size_t length,
     char c = input[position];
     if (c == '\\' && position + 1 < length) {
       position++;
+    } else if (c == '$' && position + 1 < length &&
+               input[position + 1] == '\'') {
+      size_t quoted = 0;
+      if (shell_source_skip_complete_ansi_c_quote(input, length, position,
+                                                  &quoted)) {
+        position = quoted - 1;
+        continue;
+      }
     } else if (c == '\'' || c == '"') {
       position = shell_source_skip_quoted_text(input, length, position, c) - 1;
     } else if (c == '{') {
@@ -36,6 +44,107 @@ static size_t skip_parameter_expansion(const char *input, size_t length,
     }
   }
   return position;
+}
+
+/* Bash arithmetic accepts indexed and associative array references.  They do
+ * not become ordinary scalar words merely because the outer lexer represents
+ * the whole expression as one ARITHMETIC token, so inspect the expression
+ * before canonical callers accept it. */
+bool shell_tokenizer_arithmetic_has_array_semantics(const char *input,
+                                                    size_t length) {
+  if (!input)
+    return false;
+
+  for (size_t position = 0; position < length; position++) {
+    char c = input[position];
+    if (c == '\\' && position + 1 < length) {
+      position++;
+      continue;
+    }
+    if (c == '$' && position + 1 < length && input[position + 1] == '\'') {
+      size_t after = 0;
+      if (!shell_source_skip_complete_ansi_c_quote(input, length, position,
+                                                   &after))
+        return false;
+      position = after - 1;
+      continue;
+    }
+    if (c == '\'') {
+      size_t after = shell_source_skip_quoted_text(input, length, position, c);
+      if (after <= position + 1 || after > length || input[after - 1] != c)
+        return false;
+      position = after - 1;
+      continue;
+    }
+    if (c == '"') {
+      size_t after = shell_source_skip_quoted_text(input, length, position, c);
+      if (after <= position + 1 || after > length || input[after - 1] != c)
+        return false;
+      if (shell_tokenizer_arithmetic_has_array_semantics(input + position + 1,
+                                                         after - position - 2))
+        return true;
+      position = after - 1;
+      continue;
+    }
+    if (c == '`') {
+      size_t after = shell_source_skip_quoted_text(input, length, position, c);
+      if (after <= position + 1 || after > length || input[after - 1] != c)
+        return false;
+      if (shell_tokenizer_has_unsupported_semantics(input + position + 1,
+                                                    after - position - 2))
+        return true;
+      position = after - 1;
+      continue;
+    }
+    if (c == '$' && position + 1 < length && input[position + 1] == '{') {
+      size_t after = 0, subscript_start = 0;
+      if (shell_source_find_parameter_array_subscript(input, length, position,
+                                                      &after, &subscript_start))
+        return true;
+      after = skip_parameter_expansion(input, length, position);
+      if (after > position + 3 && after <= length && input[after - 1] == '}' &&
+          shell_tokenizer_has_unsupported_semantics(input + position + 2,
+                                                    after - position - 3))
+        return true;
+      position = after - 1;
+      continue;
+    }
+    if (c == '$' && position + 1 < length && input[position + 1] == '(') {
+      size_t after = 0;
+      if (position + 2 < length && input[position + 2] == '(') {
+        if (!shell_source_skip_arithmetic_expansion(input, length, position,
+                                                    &after))
+          return false;
+        if (after > position + 5 &&
+            shell_tokenizer_arithmetic_has_array_semantics(
+                input + position + 3, after - position - 5))
+          return true;
+      } else {
+        if (!shell_source_find_balanced_parentheses(input, length, position + 1,
+                                                    &after))
+          return false;
+        if (shell_tokenizer_has_unsupported_semantics(input + position + 2,
+                                                      after - position - 3))
+          return true;
+      }
+      position = after - 1;
+      continue;
+    }
+    if (!(isalpha((unsigned char)c) || c == '_'))
+      continue;
+    size_t after_name = position + 1;
+    while (after_name < length && (isalnum((unsigned char)input[after_name]) ||
+                                   input[after_name] == '_'))
+      after_name++;
+    if (after_name < length && input[after_name] == '[') {
+      size_t after_subscript = 0;
+      if (shell_source_skip_array_subscript(input, length, after_name,
+                                            &after_subscript))
+        return true;
+    }
+    position = after_name - 1;
+  }
+  return false;
 }
 
 static size_t compound_list_segment_start(const char *input, size_t end) {
@@ -54,6 +163,14 @@ static size_t compound_list_segment_start(const char *input, size_t end) {
     if (c == '\\' && position + 1 < end) {
       position++;
       continue;
+    }
+    if (c == '$' && position + 1 < end && input[position + 1] == '\'') {
+      size_t quoted = 0;
+      if (shell_source_skip_complete_ansi_c_quote(input, end, position,
+                                                  &quoted)) {
+        position = quoted - 1;
+        continue;
+      }
     }
     /* A process-substitution operand belongs to the preceding redirect. Its
      * parentheses are not compound-list separators while locating a later
@@ -129,6 +246,13 @@ static bool brace_groups_valid(const char *input, size_t length) {
         return false;
       i = after - 1;
       continue;
+    }
+    if (c == '$' && i + 1 < length && input[i + 1] == '\'') {
+      size_t quoted = 0;
+      if (shell_source_skip_complete_ansi_c_quote(input, length, i, &quoted)) {
+        i = quoted - 1;
+        continue;
+      }
     }
     if (c == '\'' || c == '"') {
       i = shell_source_skip_quoted_text(input, length, i, c) - 1;
@@ -297,6 +421,52 @@ static bool is_shell_operator(char c) {
          c == ')' || c == '{' || c == '}' || c == '$' || c == '`' || c == '[';
 }
 
+static bool token_at_word_boundary(const shell_tokenizer_state_t *state) {
+  if (!state || state->position == 0)
+    return true;
+  char previous = state->input[state->position - 1];
+  return isspace((unsigned char)previous) || previous == ';' ||
+         previous == '|' || previous == '&' || previous == '(' ||
+         previous == '{' || previous == '}';
+}
+
+static bool parse_array_assignment_end(const char *input, size_t length,
+                                       size_t start, size_t *end) {
+  if (!input || !end || start >= length ||
+      !(isalpha((unsigned char)input[start]) || input[start] == '_'))
+    return false;
+  size_t position = start + 1;
+  bool indexed = false;
+  while (position < length &&
+         (isalnum((unsigned char)input[position]) || input[position] == '_'))
+    position++;
+  if (position < length && input[position] == '[') {
+    indexed = true;
+    size_t close = 0;
+    if (!shell_source_skip_array_subscript(input, length, position, &close))
+      return false;
+    position = close;
+  }
+  if (position < length && input[position] == '+')
+    position++;
+  if (position >= length || input[position] != '=')
+    return false;
+  if (position + 1 >= length || input[position + 1] != '(') {
+    /* a[0]=value and map[key]+=value are still array syntax even though the
+     * RHS is not a compound assignment. The semantic layer rejects them. */
+    if (!indexed)
+      return false;
+    *end = position + 1;
+    return true;
+  }
+  size_t after = 0;
+  if (!shell_source_find_balanced_parentheses(input, length, position + 1,
+                                              &after))
+    return false;
+  *end = after;
+  return true;
+}
+
 static bool is_brace_group_delimiter(const shell_tokenizer_state_t *state,
                                      bool opening) {
   size_t p = state->position;
@@ -430,32 +600,48 @@ static bool parse_variable(shell_tokenizer_state_t *state,
         return true;
       }
 
+      /* Parameter-expansion operands may contain complete quoted and
+       * substituted shell-word fragments. Keep their internal delimiters
+       * opaque while looking for this expansion's closing brace. */
+      if (c == '$' && state->position + 1 < state->length &&
+          state->input[state->position + 1] == '\'') {
+        size_t after = 0;
+        if (!shell_source_skip_complete_ansi_c_quote(
+                state->input, state->length, state->position, &after))
+          return false;
+        state->position = after;
+        continue;
+      }
+      if (c == '\'' || c == '"' || c == '`') {
+        size_t after = shell_source_skip_quoted_text(
+            state->input, state->length, state->position, c);
+        if (after <= state->position + 1 || after > state->length ||
+            state->input[after - 1] != c)
+          return false;
+        state->position = after;
+        continue;
+      }
+      if (c == '$' && state->position + 1 < state->length &&
+          state->input[state->position + 1] == '(') {
+        size_t after = 0;
+        if (!shell_source_find_balanced_parentheses(
+                state->input, state->length, state->position + 1, &after))
+          return false;
+        state->position = after;
+        continue;
+      }
+      if (c == '\\' && state->position + 1 < state->length) {
+        state->position += 2;
+        continue;
+      }
+
       // Subscript may contain: simple index, $VAR, $((expr)), etc.
       if (c == '[') {
-        int bracket_depth = 1;
-        state->position++;
-
-        while (state->position < state->length && bracket_depth > 0) {
-          char bc = state->input[state->position];
-
-          // Handle nested brackets
-          if (bc == '[') {
-            bracket_depth++;
-            state->position++;
-            continue;
-          }
-          if (bc == ']') {
-            bracket_depth--;
-            if (bracket_depth > 0) {
-              state->position++;
-              continue;
-            }
-            state->position++;
-            break;
-          }
-
-          state->position++;
-        }
+        size_t after = 0;
+        if (!shell_source_skip_array_subscript(state->input, state->length,
+                                               state->position, &after))
+          return false;
+        state->position = after;
         continue;
       }
 
@@ -840,40 +1026,18 @@ bool shell_tokenizer_next(shell_tokenizer_state_t *state,
       size_t start = state->position;
       int saved_arith_depth = state->arith_depth;
       bool saved_in_arithmetic = state->in_arithmetic;
-      state->position += 3;
       state->arith_depth = saved_arith_depth + 1;
       state->in_arithmetic = true;
-
-      // The arithmetic opener contributes two parentheses. A local balance
-      // handles both ordinary and nested parentheses without corrupting the
-      // tokenizer's surrounding arithmetic state.
-      int depth = 2;
-      bool found_matching_paren = false;
-      while (state->position < state->length && depth > 0) {
-        char c = state->input[state->position];
-        if (c == '(')
-          depth++;
-        else if (c == ')') {
-          depth--;
-          if (depth == 0)
-            found_matching_paren = true;
-        }
-        state->position++;
-      }
-
-      // Only accept if we actually found matching )) - not just reached end of
-      // input
-      if (found_matching_paren) {
-        // depth == 0 means we found matching ))
-        // position > start + 3 ensures we consumed at least "$((" and one )
-        // beyond the opening pair. This prevents accepting unclosed $((x+1)
-        // which has one )
+      size_t after = 0;
+      if (shell_source_skip_arithmetic_expansion(state->input, state->length,
+                                                 start, &after)) {
         token->type = SHELL_TOKEN_ARITHMETIC;
         token->start = state->input + start;
-        token->length = state->position - start;
+        token->length = after - start;
         token->position = start;
         token->is_quoted = false;
         token->is_escaped = false;
+        state->position = after;
         state->arith_depth = saved_arith_depth;
         state->in_arithmetic = saved_in_arithmetic;
         return shell_token_return_current_group_context(state, token);
@@ -906,6 +1070,108 @@ bool shell_tokenizer_next(shell_tokenizer_state_t *state,
     current_char = state->input[state->position];
   }
 
+  if (!state->in_quotes && current_char == '!' &&
+      token_at_word_boundary(state) &&
+      (state->position + 1 == state->length ||
+       isspace((unsigned char)state->input[state->position + 1]))) {
+    token->type = SHELL_TOKEN_PIPE_NEGATE;
+    token->start = state->input + state->position;
+    token->length = 1;
+    token->position = state->position;
+    token->is_quoted = false;
+    token->is_escaped = false;
+    state->position++;
+    return shell_token_return_current_group_context(state, token);
+  }
+
+  if (!state->in_quotes && current_char == '$' &&
+      state->position + 1 < state->length &&
+      state->input[state->position + 1] == '\'') {
+    size_t after = shell_source_skip_ansi_c_quote(state->input, state->length,
+                                                  state->position);
+    if (after > state->position + 2 && after <= state->length &&
+        state->input[after - 1] == '\'') {
+      token->type = SHELL_TOKEN_ANSI_C_QUOTED;
+      token->start = state->input + state->position;
+      token->length = after - state->position;
+      token->position = state->position;
+      token->is_quoted = true;
+      token->is_escaped = true;
+      state->position = after;
+      return shell_token_return_current_group_context(state, token);
+    }
+  }
+
+  if (!state->in_quotes &&
+      (current_char == '?' || current_char == '*' || current_char == '+' ||
+       current_char == '@' || current_char == '!') &&
+      state->position + 1 < state->length &&
+      state->input[state->position + 1] == '(') {
+    size_t after = 0;
+    if (shell_source_find_balanced_parentheses(state->input, state->length,
+                                               state->position + 1, &after)) {
+      token->type = SHELL_TOKEN_EXTGLOB;
+      token->start = state->input + state->position;
+      token->length = after - state->position;
+      token->position = state->position;
+      token->is_quoted = false;
+      token->is_escaped = false;
+      state->position = after;
+      return shell_token_return_current_group_context(state, token);
+    }
+  }
+
+  if (!state->in_quotes) {
+    size_t after = 0;
+    if (parse_array_assignment_end(state->input, state->length, state->position,
+                                   &after)) {
+      token->type = SHELL_TOKEN_ARRAY_ASSIGNMENT;
+      token->start = state->input + state->position;
+      token->length = after - state->position;
+      token->position = state->position;
+      token->is_quoted = false;
+      token->is_escaped = memchr(token->start, '\\', token->length) != NULL;
+      state->position = after;
+      return shell_token_return_current_group_context(state, token);
+    }
+  }
+
+  if (!state->in_quotes && current_char == '{') {
+    size_t redirect = 0, name_start = 0, name_length = 0;
+    if (shell_source_parse_named_fd(state->input, state->position,
+                                    state->length, &redirect, &name_start,
+                                    &name_length) &&
+        redirect < state->length &&
+        (state->input[redirect] == '<' || state->input[redirect] == '>')) {
+      char direction = state->input[redirect++];
+      token->type =
+          direction == '<' ? SHELL_TOKEN_REDIRECT_IN : SHELL_TOKEN_REDIRECT_OUT;
+      if (direction == '>' && redirect < state->length &&
+          state->input[redirect] == '>') {
+        token->type = SHELL_TOKEN_REDIRECT_APPEND;
+        redirect++;
+      } else if (direction == '<' && redirect < state->length &&
+                 state->input[redirect] == '>') {
+        token->type = SHELL_TOKEN_REDIRECT_READ_WRITE;
+        redirect++;
+      }
+      if (redirect < state->length && state->input[redirect] == '&') {
+        token->type = SHELL_TOKEN_REDIRECT_ERR;
+        redirect =
+            scan_descriptor_target(state->input, redirect + 1, state->length);
+      }
+      token->start = state->input + state->position;
+      token->length = redirect - state->position;
+      token->position = state->position;
+      token->is_quoted = false;
+      token->is_escaped = false;
+      (void)name_start;
+      (void)name_length;
+      state->position = redirect;
+      return shell_token_return_current_group_context(state, token);
+    }
+  }
+
   // Check for shell operators
   if (!state->in_quotes && (current_char == '{' || current_char == '}') &&
       !is_brace_group_delimiter(state, current_char == '{')) {
@@ -931,6 +1197,20 @@ bool shell_tokenizer_next(shell_tokenizer_state_t *state,
         token->is_quoted = false;
         token->is_escaped = false;
         state->position += 2;
+        return shell_token_return_current_group_context(state, token);
+      } else if (current_char == '&' && next_char == '>') {
+        token->type = SHELL_TOKEN_REDIRECT_BOTH;
+        token->start = state->input + state->position;
+        token->position = state->position;
+        token->is_quoted = false;
+        token->is_escaped = false;
+        state->position += 2;
+        if (state->position < state->length &&
+            state->input[state->position] == '>') {
+          token->type = SHELL_TOKEN_REDIRECT_BOTH_APPEND;
+          state->position++;
+        }
+        token->length = state->position - token->position;
         return shell_token_return_current_group_context(state, token);
       } else if (current_char == '>' && next_char == '>') {
         token->type = SHELL_TOKEN_REDIRECT_APPEND;
@@ -985,6 +1265,7 @@ bool shell_tokenizer_next(shell_tokenizer_state_t *state,
 
     size_t token_group_depth = shell_tokenizer_group_depth(state);
     uint8_t token_group_kinds = state->group_kinds;
+    size_t operator_length = 1;
     switch (current_char) {
     case '|':
       token->type = SHELL_TOKEN_PIPE;
@@ -1037,7 +1318,22 @@ bool shell_tokenizer_next(shell_tokenizer_state_t *state,
       token->type = SHELL_TOKEN_BACKGROUND;
       break;
     case ';':
-      token->type = SHELL_TOKEN_SEMICOLON;
+      if (state->position + 2 < state->length &&
+          state->input[state->position + 1] == ';' &&
+          state->input[state->position + 2] == '&') {
+        token->type = SHELL_TOKEN_CASE_TEST_NEXT;
+        operator_length = 3;
+      } else if (state->position + 1 < state->length &&
+                 state->input[state->position + 1] == '&') {
+        token->type = SHELL_TOKEN_CASE_FALLTHROUGH;
+        operator_length = 2;
+      } else if (state->position + 1 < state->length &&
+                 state->input[state->position + 1] == ';') {
+        token->type = SHELL_TOKEN_CASE_TERMINATE;
+        operator_length = 2;
+      } else {
+        token->type = SHELL_TOKEN_SEMICOLON;
+      }
       break;
     case '(':
       token->type = SHELL_TOKEN_GROUP_START;
@@ -1122,11 +1418,11 @@ bool shell_tokenizer_next(shell_tokenizer_state_t *state,
     }
 
     token->start = state->input + state->position;
-    token->length = 1;
+    token->length = operator_length;
     token->position = state->position;
     token->is_quoted = false;
     token->is_escaped = false;
-    state->position++;
+    state->position += token->length;
     shell_token_set_group_context(token, token_group_depth, token_group_kinds);
     return true;
   }
@@ -1254,6 +1550,8 @@ static bool full_token_is_redirection(const shell_token_t *token) {
          token->type == SHELL_TOKEN_REDIRECT_APPEND ||
          token->type == SHELL_TOKEN_REDIRECT_READ_WRITE ||
          token->type == SHELL_TOKEN_REDIRECT_CLOBBER ||
+         token->type == SHELL_TOKEN_REDIRECT_BOTH ||
+         token->type == SHELL_TOKEN_REDIRECT_BOTH_APPEND ||
          token->type == SHELL_TOKEN_HEREDOC ||
          token->type == SHELL_TOKEN_HERESTRING;
 }
@@ -1263,7 +1561,9 @@ static bool full_redirection_consumes_next(const shell_token_t *token) {
    * Keep this semantic exception explicit rather than treating the final
    * spelling byte as the complete redirect grammar. */
   if (token->type == SHELL_TOKEN_HERESTRING ||
-      token->type == SHELL_TOKEN_REDIRECT_CLOBBER)
+      token->type == SHELL_TOKEN_REDIRECT_CLOBBER ||
+      token->type == SHELL_TOKEN_REDIRECT_BOTH ||
+      token->type == SHELL_TOKEN_REDIRECT_BOTH_APPEND)
     return true;
   if (token->length == 0)
     return false;
@@ -1273,7 +1573,10 @@ static bool full_redirection_consumes_next(const shell_token_t *token) {
 
 static bool control_token_is_word(const shell_token_t *token) {
   return token->type == SHELL_TOKEN_COMMAND ||
-         token->type == SHELL_TOKEN_ARGUMENT;
+         token->type == SHELL_TOKEN_ARGUMENT ||
+         token->type == SHELL_TOKEN_ANSI_C_QUOTED ||
+         token->type == SHELL_TOKEN_EXTGLOB ||
+         token->type == SHELL_TOKEN_ARRAY_ASSIGNMENT;
 }
 
 static bool control_token_is_assignment_prefix(const shell_token_t *token) {
@@ -1362,6 +1665,217 @@ shell_control_syntax_t shell_tokenizer_control_syntax(const char *input,
   return control_syntax_scan(input, input_length, 0);
 }
 
+static bool token_is_plain_word(const shell_token_t *token, const char *word) {
+  return token &&
+         (token->type == SHELL_TOKEN_COMMAND ||
+          token->type == SHELL_TOKEN_ARGUMENT) &&
+         !token->is_quoted && !token->is_escaped &&
+         token->length == strlen(word) &&
+         memcmp(token->start, word, token->length) == 0;
+}
+
+/* Inspect every active expansion in one lexical word.  The full tokenizer may
+ * classify a mixed or quoted word as ARGUMENT/GLOB even when it contains an
+ * arithmetic expression, parameter array reference, or nested command.  The
+ * semantic boundary must therefore follow shell quoting rules rather than the
+ * outer token spelling. */
+static bool word_has_unsupported_semantics(const char *input, size_t length) {
+  if (!input)
+    return true;
+  bool in_single = false;
+  bool in_double = false;
+  for (size_t position = 0; position < length; position++) {
+    char c = input[position];
+    if (c == '\\' && !in_single && position + 1 < length) {
+      position++;
+      continue;
+    }
+    if (c == '\'' && !in_double) {
+      in_single = !in_single;
+      continue;
+    }
+    if (c == '"' && !in_single) {
+      in_double = !in_double;
+      continue;
+    }
+    if (in_single)
+      continue;
+    if (c == '$' && position + 1 < length && input[position + 1] == '\'' &&
+        !in_double) {
+      size_t after = 0;
+      if (!shell_source_skip_complete_ansi_c_quote(input, length, position,
+                                                   &after))
+        return false;
+      position = after - 1;
+      continue;
+    }
+    if (c == '`') {
+      size_t after = shell_source_skip_quoted_text(input, length, position, c);
+      if (after <= position + 1 || after > length || input[after - 1] != c)
+        return false;
+      if (shell_tokenizer_has_unsupported_semantics(input + position + 1,
+                                                    after - position - 2))
+        return true;
+      position = after - 1;
+      continue;
+    }
+    if (c == '$' && position + 1 < length && input[position + 1] == '{') {
+      size_t after = 0, subscript_start = 0;
+      if (shell_source_find_parameter_array_subscript(input, length, position,
+                                                      &after, &subscript_start))
+        return true;
+      after = skip_parameter_expansion(input, length, position);
+      if (after <= position + 3 || after > length || input[after - 1] != '}')
+        return false;
+      if (word_has_unsupported_semantics(input + position + 2,
+                                         after - position - 3))
+        return true;
+      position = after - 1;
+      continue;
+    }
+    if (c == '$' && position + 1 < length && input[position + 1] == '(') {
+      size_t after = 0;
+      if (position + 2 < length && input[position + 2] == '(') {
+        if (!shell_source_skip_arithmetic_expansion(input, length, position,
+                                                    &after))
+          return false;
+        if (after <= position + 5 ||
+            shell_tokenizer_arithmetic_has_array_semantics(
+                input + position + 3, after - position - 5))
+          return true;
+      } else {
+        if (!shell_source_find_balanced_parentheses(input, length, position + 1,
+                                                    &after))
+          return false;
+        if (after <= position + 3 ||
+            shell_tokenizer_has_unsupported_semantics(input + position + 2,
+                                                      after - position - 3))
+          return true;
+      }
+      position = after - 1;
+      continue;
+    }
+    if (!in_double && (c == '<' || c == '>') && position + 1 < length &&
+        input[position + 1] == '(') {
+      size_t after = 0;
+      if (!shell_source_find_balanced_parentheses(input, length, position + 1,
+                                                  &after))
+        return false;
+      if (after <= position + 3 ||
+          shell_tokenizer_has_unsupported_semantics(input + position + 2,
+                                                    after - position - 3))
+        return true;
+      position = after - 1;
+    }
+  }
+  return false;
+}
+
+bool shell_tokenizer_has_unsupported_semantics(const char *input,
+                                               size_t input_length) {
+  if (!input)
+    return true;
+  shell_tokenizer_state_t state;
+  /* This helper classifies valid shell source.  Let each public adapter keep
+   * its established EINPUT result for raw control bytes or other invalid
+   * source rather than relabelling them as unsupported semantics. */
+  if (!shell_tokenizer_init(&state, input, input_length))
+    return false;
+  if (shell_tokenizer_has_unsupported_control(input, input_length))
+    return true;
+  bool declaration = false;
+  bool declaration_wrapper = false;
+  bool command_start = true;
+  bool redirect_operand = false;
+  shell_token_t token;
+  while (shell_tokenizer_next(&state, &token)) {
+    /* Shellsplit deliberately does not execute or model case clauses.  The
+     * clause terminators are meaningful only there, and Bash rejects them in
+     * an ordinary command list.  Never reinterpret one as a plain separator.
+     */
+    if (token.type == SHELL_TOKEN_CASE_TERMINATE ||
+        token.type == SHELL_TOKEN_CASE_FALLTHROUGH ||
+        token.type == SHELL_TOKEN_CASE_TEST_NEXT)
+      return true;
+    if (token.type == SHELL_TOKEN_REDIRECT_ERR && token.length >= 4 &&
+        token.start[0] == '{')
+      return true;
+    if (word_has_unsupported_semantics(token.start, token.length))
+      return true;
+    if (token.type == SHELL_TOKEN_PIPE || token.type == SHELL_TOKEN_SEMICOLON ||
+        token.type == SHELL_TOKEN_AND || token.type == SHELL_TOKEN_OR ||
+        token.type == SHELL_TOKEN_BACKGROUND) {
+      command_start = true;
+      declaration = false;
+      declaration_wrapper = false;
+      redirect_operand = false;
+      continue;
+    }
+    if (full_token_is_redirection(&token)) {
+      redirect_operand = full_redirection_consumes_next(&token);
+      continue;
+    }
+    if (redirect_operand) {
+      redirect_operand = false;
+      continue;
+    }
+
+    /* A lexer can recognize the spelling NAME[index]=value without knowing
+     * whether it occupies an assignment-prefix position.  Outside that
+     * position Bash passes it as an ordinary argument (for example,
+     * `echo a[0]=b`), so reject it only when it has array-assignment
+     * semantics.  Declaration builtins also give their operands that meaning.
+     */
+    if (token.type == SHELL_TOKEN_ARRAY_ASSIGNMENT &&
+        (command_start || declaration ||
+         shell_source_array_assignment_is_compound(token.start, token.length)))
+      return true;
+
+    if (command_start) {
+      /* Scalar assignment prefixes do not consume the command-word position.
+       * Keep looking so `VAR=x declare -a values` cannot evade the semantic
+       * rejection. */
+      if (control_token_is_assignment_prefix(&token))
+        continue;
+      declaration_wrapper = token_is_plain_word(&token, "command") ||
+                            token_is_plain_word(&token, "builtin");
+      declaration = token_is_plain_word(&token, "declare") ||
+                    token_is_plain_word(&token, "typeset") ||
+                    token_is_plain_word(&token, "local") ||
+                    token_is_plain_word(&token, "readonly");
+      command_start = false;
+      continue;
+    }
+    if (declaration_wrapper) {
+      /* `command` and `builtin` can carry options before the command they
+       * invoke.  Their operands retain the invoked command's semantics, so
+       * do not let `command -p declare -a names` bypass the array-declaration
+       * rejection.  Treat every unquoted dash word as a wrapper option; this
+       * is deliberately conservative and only affects the unsupported
+       * semantic classification. */
+      if (token.type == SHELL_TOKEN_COMMAND ||
+          token.type == SHELL_TOKEN_ARGUMENT) {
+        if (token.length > 0 && token.start[0] == '-')
+          continue;
+      }
+      declaration_wrapper = false;
+      declaration = token_is_plain_word(&token, "declare") ||
+                    token_is_plain_word(&token, "typeset") ||
+                    token_is_plain_word(&token, "local") ||
+                    token_is_plain_word(&token, "readonly");
+      continue;
+    }
+    if (declaration &&
+        (token.type == SHELL_TOKEN_COMMAND ||
+         token.type == SHELL_TOKEN_ARGUMENT) &&
+        token.length >= 2 && (token.start[0] == '-' || token.start[0] == '+') &&
+        (memchr(token.start + 1, 'a', token.length - 1) != NULL ||
+         memchr(token.start + 1, 'A', token.length - 1) != NULL))
+      return true;
+  }
+  return false;
+}
+
 static shell_control_syntax_t
 control_syntax_scan(const char *input, size_t input_length, uint32_t depth) {
   if (depth > 16)
@@ -1386,6 +1900,9 @@ control_syntax_scan(const char *input, size_t input_length, uint32_t depth) {
         return nested;
     }
     if (token.type == SHELL_TOKEN_PIPE || token.type == SHELL_TOKEN_SEMICOLON ||
+        token.type == SHELL_TOKEN_CASE_TERMINATE ||
+        token.type == SHELL_TOKEN_CASE_FALLTHROUGH ||
+        token.type == SHELL_TOKEN_CASE_TEST_NEXT ||
         token.type == SHELL_TOKEN_AND || token.type == SHELL_TOKEN_OR ||
         token.type == SHELL_TOKEN_BACKGROUND) {
       command_start = true;
@@ -1479,9 +1996,16 @@ control_syntax_scan(const char *input, size_t input_length, uint32_t depth) {
       push_frame = true;
     } else if (control_token_is(&token, "while") ||
                control_token_is(&token, "until") ||
-               control_token_is(&token, "for")) {
+               control_token_is(&token, "for") ||
+               control_token_is(&token, "select")) {
       frame = CONTROL_FRAME_LOOP;
       push_frame = true;
+    } else if (control_token_is(&token, "coproc")) {
+      /* Bash coprocesses introduce a concurrently executing command and a
+       * pair of implicit descriptors.  The semantic command model does not
+       * represent either yet, so reject them explicitly rather than treating
+       * `coproc` as an ordinary executable name. */
+      return SHELL_CONTROL_SYNTAX_COMPLETE;
     } else if (control_token_is(&token, "case")) {
       frame = CONTROL_FRAME_CASE;
       push_frame = true;
@@ -1643,11 +2167,17 @@ shell_tokenize_status_t shell_tokenize_commands(const char *input,
 
   size_t count = 0;
   bool expect_command = true;
+  bool pipeline_start = true;
 
   shell_tokenizer_state_t temp_state = state;
   shell_token_t token;
 
   while (shell_tokenizer_next(&temp_state, &token)) {
+    if (token.type == SHELL_TOKEN_PIPE_NEGATE) {
+      if (!pipeline_start && expect_command)
+        return SHELL_TOKENIZE_EPARSE;
+      continue;
+    }
     /* A closing group completes the compound command even when the preceding
      * list ended in a separator. Its following redirects bind to that group;
      * they must not be counted as a new redirect-only command. */
@@ -1662,31 +2192,38 @@ shell_tokenize_status_t shell_tokenize_commands(const char *input,
       expect_command = true;
       continue;
     }
-    if (expect_command &&
-        (token.type == SHELL_TOKEN_COMMAND ||
-         token.type == SHELL_TOKEN_ARGUMENT ||
-         token.type == SHELL_TOKEN_SUBSHELL ||
-         token.type == SHELL_TOKEN_VARIABLE ||
-         token.type == SHELL_TOKEN_VARIABLE_QUOTED ||
-         token.type == SHELL_TOKEN_SPECIAL_VAR ||
-         token.type == SHELL_TOKEN_ARITHMETIC ||
-         token.type == SHELL_TOKEN_GLOB || token.type == SHELL_TOKEN_HEREDOC ||
-         token.type == SHELL_TOKEN_HERESTRING ||
-         token.type == SHELL_TOKEN_REDIRECT_IN ||
-         token.type == SHELL_TOKEN_REDIRECT_OUT ||
-         token.type == SHELL_TOKEN_REDIRECT_ERR ||
-         token.type == SHELL_TOKEN_REDIRECT_APPEND ||
-         token.type == SHELL_TOKEN_REDIRECT_READ_WRITE ||
-         token.type == SHELL_TOKEN_REDIRECT_CLOBBER ||
-         token.type == SHELL_TOKEN_PROCESS_SUB)) {
+    if (expect_command && (token.type == SHELL_TOKEN_COMMAND ||
+                           token.type == SHELL_TOKEN_ARGUMENT ||
+                           token.type == SHELL_TOKEN_SUBSHELL ||
+                           token.type == SHELL_TOKEN_VARIABLE ||
+                           token.type == SHELL_TOKEN_VARIABLE_QUOTED ||
+                           token.type == SHELL_TOKEN_SPECIAL_VAR ||
+                           token.type == SHELL_TOKEN_ARITHMETIC ||
+                           token.type == SHELL_TOKEN_GLOB ||
+                           token.type == SHELL_TOKEN_ANSI_C_QUOTED ||
+                           token.type == SHELL_TOKEN_EXTGLOB ||
+                           token.type == SHELL_TOKEN_ARRAY_ASSIGNMENT ||
+                           token.type == SHELL_TOKEN_HEREDOC ||
+                           token.type == SHELL_TOKEN_HERESTRING ||
+                           token.type == SHELL_TOKEN_REDIRECT_IN ||
+                           token.type == SHELL_TOKEN_REDIRECT_OUT ||
+                           token.type == SHELL_TOKEN_REDIRECT_ERR ||
+                           token.type == SHELL_TOKEN_REDIRECT_APPEND ||
+                           token.type == SHELL_TOKEN_REDIRECT_READ_WRITE ||
+                           token.type == SHELL_TOKEN_REDIRECT_CLOBBER ||
+                           token.type == SHELL_TOKEN_REDIRECT_BOTH ||
+                           token.type == SHELL_TOKEN_REDIRECT_BOTH_APPEND ||
+                           token.type == SHELL_TOKEN_PROCESS_SUB)) {
       count++;
       expect_command = false;
+      pipeline_start = false;
     }
 
     if (token.type == SHELL_TOKEN_PIPE || token.type == SHELL_TOKEN_SEMICOLON ||
         token.type == SHELL_TOKEN_AND || token.type == SHELL_TOKEN_BACKGROUND ||
         token.type == SHELL_TOKEN_OR) {
       expect_command = true;
+      pipeline_start = token.type != SHELL_TOKEN_PIPE;
     }
   }
 
@@ -1760,8 +2297,10 @@ shell_tokenize_status_t shell_tokenize_commands(const char *input,
   current_cmd->has_groups = false;
   current_cmd->ends_group = false;
   current_cmd->has_background = false;
+  current_cmd->pipeline_negated = false;
 
   expect_command = true;
+  pipeline_start = true;
   bool saw_loop = false;
   bool saw_conditional = false;
   bool saw_case = false;
@@ -1808,6 +2347,7 @@ shell_tokenize_status_t shell_tokenize_commands(const char *input,
         current_cmd->has_groups = false;
         current_cmd->ends_group = false;
         current_cmd->has_background = false;
+        current_cmd->pipeline_negated = false;
         expect_command = true;
       }
       current_cmd->has_groups = true;
@@ -1825,14 +2365,42 @@ shell_tokenize_status_t shell_tokenize_commands(const char *input,
     }
     bool redirect_operand = full_tokens_need_redirect_operand(
         current_cmd->tokens, current_cmd->token_count);
+    if (token.type == SHELL_TOKEN_PIPE_NEGATE && !pipeline_start) {
+      /* `!` is ordinary word data after a command. It cannot begin a later
+       * pipeline stage either; reject that form rather than dropping it. */
+      if (current_cmd->token_count > 0 &&
+          current_cmd->tokens[current_cmd->token_count - 1].type ==
+              SHELL_TOKEN_PIPE) {
+        shell_commands_free(*commands, count);
+        *commands = NULL;
+        *command_count = 0;
+        return SHELL_TOKENIZE_EPARSE;
+      }
+      token.type = SHELL_TOKEN_ARGUMENT;
+    }
+    if (token.type == SHELL_TOKEN_PIPE_NEGATE) {
+      /* This is a modifier of the following POSIX pipeline, never an argv
+       * word. It is retained as syntax in shell_tokens below. */
+      current_cmd->pipeline_negated = true;
+    }
     if (expect_command && (token.type == SHELL_TOKEN_COMMAND ||
                            token.type == SHELL_TOKEN_ARGUMENT ||
                            token.type == SHELL_TOKEN_SUBSHELL ||
                            token.type == SHELL_TOKEN_VARIABLE ||
                            token.type == SHELL_TOKEN_VARIABLE_QUOTED ||
                            token.type == SHELL_TOKEN_SPECIAL_VAR ||
-                           token.type == SHELL_TOKEN_GLOB)) {
-      if (current_cmd->token_count > 0 && !redirect_operand) {
+                           token.type == SHELL_TOKEN_GLOB ||
+                           token.type == SHELL_TOKEN_ANSI_C_QUOTED ||
+                           token.type == SHELL_TOKEN_EXTGLOB ||
+                           token.type == SHELL_TOKEN_ARRAY_ASSIGNMENT)) {
+      /* The leading `!` is retained as the pipeline's syntax token, but it
+       * does not occupy a simple-command slot. The first following word must
+       * join that same record rather than create a phantom `!` command. */
+      bool has_only_pipeline_negation =
+          current_cmd->token_count == 1 &&
+          current_cmd->tokens[0].type == SHELL_TOKEN_PIPE_NEGATE;
+      if (current_cmd->token_count > 0 && !redirect_operand &&
+          !has_only_pipeline_negation) {
         bool can_split = current_command + 1 < count;
         if (!can_split && current_cmd->ends_group) {
           if (full_commands_append_slot(commands, &count)) {
@@ -1872,11 +2440,13 @@ shell_tokenize_status_t shell_tokenize_commands(const char *input,
           current_cmd->has_groups = false;
           current_cmd->ends_group = false;
           current_cmd->has_background = false;
+          current_cmd->pipeline_negated = false;
         }
       } else if (current_cmd->has_groups && !redirect_operand) {
         current_cmd->start_pos = token.position;
       }
       expect_command = false;
+      pipeline_start = false;
     }
 
     if (current_cmd->token_count >= token_capacity) {
@@ -1909,6 +2479,9 @@ shell_tokenize_status_t shell_tokenize_commands(const char *input,
         token.type == SHELL_TOKEN_VARIABLE_QUOTED ||
         token.type == SHELL_TOKEN_SPECIAL_VAR ||
         token.type == SHELL_TOKEN_GLOB ||
+        token.type == SHELL_TOKEN_ANSI_C_QUOTED ||
+        token.type == SHELL_TOKEN_EXTGLOB ||
+        token.type == SHELL_TOKEN_ARRAY_ASSIGNMENT ||
         token.type == SHELL_TOKEN_ARITHMETIC ||
         token.type == SHELL_TOKEN_PROCESS_SUB)
       if (!redirect_operand)
@@ -1921,6 +2494,9 @@ shell_tokenize_status_t shell_tokenize_commands(const char *input,
       current_cmd->has_variables = true;
       break;
     case SHELL_TOKEN_GLOB:
+      current_cmd->has_globs = true;
+      break;
+    case SHELL_TOKEN_EXTGLOB:
       current_cmd->has_globs = true;
       break;
     case SHELL_TOKEN_SUBSHELL:
@@ -1950,6 +2526,7 @@ shell_tokenize_status_t shell_tokenize_commands(const char *input,
         token.type == SHELL_TOKEN_AND || token.type == SHELL_TOKEN_BACKGROUND ||
         token.type == SHELL_TOKEN_OR) {
       expect_command = true;
+      pipeline_start = token.type != SHELL_TOKEN_PIPE;
       current_cmd->end_pos = token.position + token.length;
     }
   }
@@ -2038,6 +2615,12 @@ const char *shell_token_type_name(shell_token_type_t type) {
     return "REDIRECT_READ_WRITE";
   case SHELL_TOKEN_REDIRECT_CLOBBER:
     return "REDIRECT_CLOBBER";
+  case SHELL_TOKEN_PIPE_NEGATE:
+    return "PIPE_NEGATE";
+  case SHELL_TOKEN_REDIRECT_BOTH:
+    return "REDIRECT_BOTH";
+  case SHELL_TOKEN_REDIRECT_BOTH_APPEND:
+    return "REDIRECT_BOTH_APPEND";
   case SHELL_TOKEN_SEMICOLON:
     return "SEMICOLON";
   case SHELL_TOKEN_AND:
@@ -2062,6 +2645,12 @@ const char *shell_token_type_name(shell_token_type_t type) {
     return "SPECIAL_VAR";
   case SHELL_TOKEN_GLOB:
     return "GLOB";
+  case SHELL_TOKEN_ANSI_C_QUOTED:
+    return "ANSI_C_QUOTED";
+  case SHELL_TOKEN_EXTGLOB:
+    return "EXTGLOB";
+  case SHELL_TOKEN_ARRAY_ASSIGNMENT:
+    return "ARRAY_ASSIGNMENT";
   case SHELL_TOKEN_SUBSHELL:
     return "SUBSHELL";
   case SHELL_TOKEN_ARITHMETIC:
@@ -2072,6 +2661,12 @@ const char *shell_token_type_name(shell_token_type_t type) {
     return "HEREDOC";
   case SHELL_TOKEN_HERESTRING:
     return "HERESTRING";
+  case SHELL_TOKEN_CASE_TERMINATE:
+    return "CASE_TERMINATE";
+  case SHELL_TOKEN_CASE_FALLTHROUGH:
+    return "CASE_FALLTHROUGH";
+  case SHELL_TOKEN_CASE_TEST_NEXT:
+    return "CASE_TEST_NEXT";
   case SHELL_TOKEN_END:
     return "END";
   default:

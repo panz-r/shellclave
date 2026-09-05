@@ -14,4 +14,9 @@ typedef struct {
 st_error_t st_netargv_classify_scratch_view(st_netargv_view_t netargv,
                                             st_token_scratch_t *scratch);
 
+/* Classify one explicit byte span with the same rules used for canonical
+ * netargv payloads.  This is internal because public C-string classification
+ * remains available through st_token_classify(). */
+st_token_type_t st_token_classify_bytes(const char *text, size_t length);
+
 #endif

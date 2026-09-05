@@ -14,6 +14,21 @@
 static int test_count = 0;
 static int pass_count = 0;
 
+typedef struct {
+  unsigned char *bytes;
+  size_t capacity;
+  size_t stop_after;
+} decoded_word_capture_t;
+
+static bool capture_decoded_word_byte(unsigned char byte, size_t offset,
+                                      void *context) {
+  decoded_word_capture_t *capture = context;
+  if (offset >= capture->capacity)
+    return false;
+  capture->bytes[offset] = byte;
+  return capture->stop_after == 0 || offset + 1 < capture->stop_after;
+}
+
 void test(const char *name, int result) {
   test_count++;
   if (result) {
@@ -52,6 +67,7 @@ static bool processed_group_descriptors_match_source(
     if (source->start != processed->start || source->end != processed->end ||
         source->parent != processed->parent ||
         source->kind != processed->kind ||
+        source->modifiers != processed->modifiers ||
         processed->first_command > result->command_count ||
         processed->command_count >
             result->command_count - processed->first_command)
@@ -89,16 +105,554 @@ static void test_token_type_names(void) {
       "HERESTRING",
       "REDIRECT_READ_WRITE",
       "REDIRECT_CLOBBER",
+      "PIPE_NEGATE",
+      "REDIRECT_BOTH",
+      "REDIRECT_BOTH_APPEND",
+      "ANSI_C_QUOTED",
+      "EXTGLOB",
+      "ARRAY_ASSIGNMENT",
+      "CASE_TERMINATE",
+      "CASE_FALLTHROUGH",
+      "CASE_TEST_NEXT",
   };
   bool valid =
-      sizeof(names) / sizeof(names[0]) == SHELL_TOKEN_REDIRECT_CLOBBER + 1;
+      sizeof(names) / sizeof(names[0]) == SHELL_TOKEN_CASE_TEST_NEXT + 1;
   for (size_t i = 0; valid && i < sizeof(names) / sizeof(names[0]); i++)
     valid = strcmp(shell_token_type_name((shell_token_type_t)i), names[i]) == 0;
-  valid = valid &&
-          strcmp(shell_token_type_name(
-                     (shell_token_type_t)(SHELL_TOKEN_REDIRECT_CLOBBER + 1)),
-                 "UNKNOWN") == 0;
+  valid =
+      valid && strcmp(shell_token_type_name(
+                          (shell_token_type_t)(SHELL_TOKEN_CASE_TEST_NEXT + 1)),
+                      "UNKNOWN") == 0;
   test("Token type names cover every enum value", valid);
+}
+
+static void test_modern_bash_syntax_contract(void) {
+  const char *source = "! printf $'a\\0b' @(left|right) items=(one two) &>out";
+  shell_tokenizer_state_t state;
+  shell_token_t token;
+  shell_token_type_t expected[] = {
+      SHELL_TOKEN_PIPE_NEGATE,      SHELL_TOKEN_COMMAND,
+      SHELL_TOKEN_ANSI_C_QUOTED,    SHELL_TOKEN_EXTGLOB,
+      SHELL_TOKEN_ARRAY_ASSIGNMENT, SHELL_TOKEN_REDIRECT_BOTH,
+      SHELL_TOKEN_COMMAND,
+  };
+  bool valid = shell_tokenizer_init(&state, source, strlen(source));
+  for (size_t i = 0; valid && i < sizeof(expected) / sizeof(expected[0]); i++)
+    valid = shell_tokenizer_next(&state, &token) && token.type == expected[i];
+  valid = valid && !shell_tokenizer_next(&state, &token);
+  test("Modern Bash syntax has dedicated lexical tokens", valid);
+
+  shell_parse_result_t parsed = {0};
+  valid = shell_parse_fast(source, strlen(source), NULL, &parsed) == SHELL_OK &&
+          parsed.count == 1 &&
+          (parsed.cmds[0].modifiers & SHELL_CMD_MOD_PIPE_NEGATED) != 0 &&
+          (parsed.cmds[0].features & SHELL_FEAT_ANSI_C_QUOTE) != 0 &&
+          (parsed.cmds[0].features & SHELL_FEAT_EXTGLOB) != 0 &&
+          (parsed.cmds[0].features & SHELL_FEAT_ARRAY) != 0 &&
+          (parsed.cmds[0].features & SHELL_FEAT_COMBINED_REDIRECT) != 0;
+  test("Fast parser preserves modern Bash feature metadata", valid);
+
+  shell_command_info_t *infos = NULL;
+  size_t count = 0;
+  shell_netstring_buffer_t netargv = {0};
+  valid = shell_process_command("printf $'a\\0b'", strlen("printf $'a\\0b'"),
+                                NULL, &infos, &count) == SHELL_PROCESS_OK &&
+          count == 1 &&
+          shell_render_netargv_buffer(&infos[0], NULL, &netargv) ==
+              SHELL_PROCESS_OK;
+  shell_netstring_iter_t iter;
+  shell_netstring_view_t first, second;
+  valid = valid &&
+          shell_netstring_iter_init(&iter, netargv.data, netargv.length) ==
+              SHELL_NETSTRING_OK &&
+          shell_netstring_iter_next(&iter, &first) == SHELL_NETSTRING_OK &&
+          shell_netstring_iter_next(&iter, &second) == SHELL_NETSTRING_OK &&
+          second.payload_length == 3 && second.payload[0] == 'a' &&
+          second.payload[1] == '\0' && second.payload[2] == 'b' &&
+          shell_netstring_iter_next(&iter, &second) == SHELL_NETSTRING_DONE;
+  shell_netstring_buffer_free(&netargv);
+  shell_command_infos_free(infos, count);
+  test("ANSI-C NUL escape survives canonical netargv", valid);
+
+  char ansi_bytes[3] = {0};
+  size_t ansi_length = 0;
+  size_t ansi_written = 0;
+  valid = shell_measure_decoded_word("$'\\x4142'", strlen("$'\\x4142'"),
+                                     &ansi_length) == SHELL_PROCESS_OK &&
+          ansi_length == sizeof(ansi_bytes) &&
+          shell_write_decoded_word("$'\\x4142'", strlen("$'\\x4142'"),
+                                   ansi_bytes, sizeof(ansi_bytes),
+                                   &ansi_written) == SHELL_PROCESS_OK &&
+          ansi_written == sizeof(ansi_bytes) &&
+          memcmp(ansi_bytes, "A42", sizeof(ansi_bytes)) == 0;
+  test("ANSI-C hex escapes consume at most two digits", valid);
+
+  char ansi_escapes[5] = {0};
+  ansi_length = 0;
+  ansi_written = 0;
+  valid = shell_measure_decoded_word("$'\\q\\x\\u12'", strlen("$'\\q\\x\\u12'"),
+                                     &ansi_length) == SHELL_PROCESS_OK &&
+          ansi_length == sizeof(ansi_escapes) &&
+          shell_write_decoded_word("$'\\q\\x\\u12'", strlen("$'\\q\\x\\u12'"),
+                                   ansi_escapes, sizeof(ansi_escapes),
+                                   &ansi_written) == SHELL_PROCESS_OK &&
+          ansi_written == sizeof(ansi_escapes) &&
+          memcmp(ansi_escapes, "\\q\\x\x12", sizeof(ansi_escapes)) == 0;
+  test("ANSI-C preserves unknown escapes and accepts short Unicode", valid);
+
+  char ansi_incomplete[2] = {0};
+  ansi_written = 0;
+  valid = shell_write_decoded_word("$'\\c'", strlen("$'\\c'"), ansi_incomplete,
+                                   sizeof(ansi_incomplete),
+                                   &ansi_written) == SHELL_PROCESS_OK &&
+          ansi_written == sizeof(ansi_incomplete) &&
+          memcmp(ansi_incomplete, "\\c", sizeof(ansi_incomplete)) == 0;
+  test("ANSI-C preserves an incomplete control escape", valid);
+
+  unsigned char ansi_del = 0;
+  ansi_length = 0;
+  ansi_written = 0;
+  valid = shell_measure_decoded_word("$'\\c?'", strlen("$'\\c?'"),
+                                     &ansi_length) == SHELL_PROCESS_OK &&
+          ansi_length == 1 &&
+          shell_write_decoded_word("$'\\c?'", strlen("$'\\c?'"),
+                                   (char *)&ansi_del, sizeof(ansi_del),
+                                   &ansi_written) == SHELL_PROCESS_OK &&
+          ansi_written == 1 && ansi_del == 0x7f;
+  test("ANSI-C control-question escape emits DEL", valid);
+
+  static const char extended_ansi_source[] = "$'\\uD800\\U00110000'";
+  static const unsigned char extended_ansi_expected[] = {
+      0xed, 0xa0, 0x80, 0xf4, 0x90, 0x80, 0x80,
+  };
+  unsigned char extended_ansi[sizeof(extended_ansi_expected)] = {0};
+  ansi_length = 0;
+  ansi_written = 0;
+  valid = shell_measure_decoded_word(extended_ansi_source,
+                                     sizeof(extended_ansi_source) - 1,
+                                     &ansi_length) == SHELL_PROCESS_OK &&
+          ansi_length == sizeof(extended_ansi_expected) &&
+          shell_write_decoded_word(extended_ansi_source,
+                                   sizeof(extended_ansi_source) - 1,
+                                   (char *)extended_ansi, sizeof(extended_ansi),
+                                   &ansi_written) == SHELL_PROCESS_OK &&
+          ansi_written == sizeof(extended_ansi_expected) &&
+          memcmp(extended_ansi, extended_ansi_expected,
+                 sizeof(extended_ansi_expected)) == 0;
+  test("ANSI-C retains Bash extended Unicode byte forms", valid);
+
+  char *legacy = NULL;
+  shell_netstring_buffer_t argv_sequence = {0};
+  shell_netstring_buffer_t command_sequence = {0};
+  shell_netstring_buffer_t type_sequence = {0};
+  shell_netstring_buffer_t anomaly_commands = {0};
+  shell_netstring_buffer_t anomaly_types = {0};
+  size_t sequence_count = 0;
+  bool features = false;
+  const char *binary_source = "$'a\\0b' arg";
+  valid =
+      shell_build_netargv_sequence_buffer(binary_source, strlen(binary_source),
+                                          NULL, &argv_sequence, &sequence_count,
+                                          &features) == SHELL_PROCESS_OK &&
+      sequence_count == 1 &&
+      shell_build_command_netseq_buffer(binary_source, strlen(binary_source),
+                                        NULL, &command_sequence,
+                                        &sequence_count) == SHELL_PROCESS_OK &&
+      sequence_count == 1 &&
+      shell_build_type_netseq_buffer(binary_source, strlen(binary_source), NULL,
+                                     &type_sequence,
+                                     &sequence_count) == SHELL_PROCESS_OK &&
+      sequence_count == 1 &&
+      shell_build_anomaly_netseqs_buffer(
+          binary_source, strlen(binary_source), NULL, &anomaly_commands,
+          &anomaly_types, &sequence_count) == SHELL_PROCESS_OK &&
+      sequence_count == 1 &&
+      shell_build_netargv_sequence(binary_source, strlen(binary_source), NULL,
+                                   &legacy, &sequence_count,
+                                   &features) == SHELL_PROCESS_EOUTPUT_LIMIT &&
+      legacy == NULL &&
+      shell_build_command_netseq(binary_source, strlen(binary_source), NULL,
+                                 &legacy, &sequence_count) ==
+          SHELL_PROCESS_EOUTPUT_LIMIT &&
+      legacy == NULL &&
+      shell_build_type_netseq(binary_source, strlen(binary_source), NULL,
+                              &legacy,
+                              &sequence_count) == SHELL_PROCESS_EOUTPUT_LIMIT &&
+      legacy == NULL;
+  shell_netstring_buffer_free(&argv_sequence);
+  shell_netstring_buffer_free(&command_sequence);
+  shell_netstring_buffer_free(&type_sequence);
+  shell_netstring_buffer_free(&anomaly_commands);
+  shell_netstring_buffer_free(&anomaly_types);
+  test("Canonical sequence buffers retain binary payloads", valid);
+
+  char *aliased_netseq = NULL;
+  shell_netstring_buffer_t aliased_buffer = {0};
+  valid = shell_build_anomaly_netseqs(
+              "echo value", strlen("echo value"), NULL, &aliased_netseq,
+              &aliased_netseq, &sequence_count) == SHELL_PROCESS_EINPUT &&
+          aliased_netseq == NULL &&
+          shell_build_anomaly_netseqs_buffer(
+              "echo value", strlen("echo value"), NULL, &aliased_buffer,
+              &aliased_buffer, &sequence_count) == SHELL_PROCESS_EINPUT &&
+          aliased_buffer.data == NULL && aliased_buffer.length == 0;
+  test("Aligned anomaly sequence outputs reject aliasing", valid);
+
+  infos = NULL;
+  count = 0;
+  valid = shell_process_command("! false | cat", strlen("! false | cat"), NULL,
+                                &infos, &count) == SHELL_PROCESS_OK &&
+          count == 2 && infos[0].pipeline_negated &&
+          infos[1].pipeline_negated && infos[0].has_pipe_output &&
+          infos[1].has_pipe_input;
+  shell_command_infos_free(infos, count);
+  shell_processed_commands_t incomplete_negation = {0};
+  valid = valid &&
+          shell_process_commands("!", strlen("!"), NULL,
+                                 &incomplete_negation) == SHELL_PROCESS_EPARSE;
+  shell_processed_commands_free(&incomplete_negation);
+  infos = NULL;
+  count = 0;
+  valid = valid &&
+          shell_process_command("echo !", strlen("echo !"), NULL, &infos,
+                                &count) == SHELL_PROCESS_OK &&
+          count == 1 && !infos[0].pipeline_negated &&
+          infos[0].command_token_count == 2 &&
+          infos[0].command_tokens[1].length == 1 &&
+          infos[0].command_tokens[1].start[0] == '!';
+  shell_command_infos_free(infos, count);
+  const struct {
+    const char *source;
+    shell_process_status_t expected;
+  } syntax_cases[] = {
+      {"cmd | ! other", SHELL_PROCESS_EPARSE},
+      {"items=(one two)", SHELL_PROCESS_EPARSE},
+      {"items[0]=one", SHELL_PROCESS_EPARSE},
+      {"map[key]+=one", SHELL_PROCESS_EPARSE},
+      {"printf '%s' \"${items[0]}\"", SHELL_PROCESS_EPARSE},
+      {"declare -a items", SHELL_PROCESS_EPARSE},
+      {"FOO=bar declare -a items", SHELL_PROCESS_EPARSE},
+      {"command typeset -A items", SHELL_PROCESS_EPARSE},
+      {"command -p -- declare -a items", SHELL_PROCESS_EPARSE},
+      {"builtin -- typeset -A items", SHELL_PROCESS_EPARSE},
+      {"echo item[0]=one", SHELL_PROCESS_OK},
+      {"echo one ;& echo two", SHELL_PROCESS_EPARSE},
+      {"echo one ;;& echo two", SHELL_PROCESS_EPARSE},
+      {"echo $(echo one ;& echo two)", SHELL_PROCESS_EPARSE},
+      {"cmd {fd}>&1", SHELL_PROCESS_EPARSE},
+      {"cmd {fd}>out", SHELL_PROCESS_OK},
+  };
+  for (size_t i = 0; i < sizeof(syntax_cases) / sizeof(syntax_cases[0]); i++) {
+    shell_processed_commands_t processed = {0};
+    shell_process_status_t status = shell_process_commands(
+        syntax_cases[i].source, strlen(syntax_cases[i].source), NULL,
+        &processed);
+    if (status != syntax_cases[i].expected) {
+      fprintf(stderr, "Unexpected status %d for modern syntax: %s\n",
+              (int)status, syntax_cases[i].source);
+      valid = false;
+    }
+    shell_processed_commands_free(&processed);
+  }
+  test("Pipeline negation and arrays preserve semantic boundaries", valid);
+
+  shell_processed_commands_t deferred = {0};
+  valid = shell_process_commands("select x in a; do :; done",
+                                 strlen("select x in a; do :; done"), NULL,
+                                 &deferred) == SHELL_PROCESS_EPARSE &&
+          shell_process_commands("coproc worker { echo ok; }",
+                                 strlen("coproc worker { echo ok; }"), NULL,
+                                 &deferred) == SHELL_PROCESS_EPARSE;
+  shell_processed_commands_free(&deferred);
+  test("Deferred control-flow constructs reject semantically", valid);
+}
+
+static void test_canonical_buffer_output_contract(void) {
+  const char *source = "printf value";
+  shell_command_info_t *infos = NULL;
+  size_t info_count = 0;
+  shell_netstring_buffer_t rendered = {0};
+  shell_netstring_buffer_t argv_sequence = {0};
+  shell_netstring_buffer_t command_sequence = {0};
+  shell_netstring_buffer_t type_sequence = {0};
+  shell_netstring_buffer_t anomaly_commands = {0};
+  shell_netstring_buffer_t anomaly_types = {0};
+  size_t count = 0;
+  bool features = false;
+
+  bool valid = shell_process_command(source, strlen(source), NULL, &infos,
+                                     &info_count) == SHELL_PROCESS_OK &&
+               info_count == 1 &&
+               shell_render_netargv_buffer(&infos[0], NULL, &rendered) ==
+                   SHELL_PROCESS_OK &&
+               rendered.data != NULL && rendered.length != 0;
+  shell_netstring_buffer_free(&rendered);
+  valid = valid &&
+          shell_render_netargv_buffer(&infos[0], NULL, &rendered) ==
+              SHELL_PROCESS_OK &&
+          rendered.data != NULL && rendered.length != 0;
+  unsigned char *rendered_data = rendered.data;
+  size_t rendered_length = rendered.length;
+  valid = valid &&
+          shell_render_netargv_buffer(&infos[0], NULL, &rendered) ==
+              SHELL_PROCESS_EINPUT &&
+          rendered.data == rendered_data && rendered.length == rendered_length;
+  shell_netstring_buffer_free(&rendered);
+  valid = valid &&
+          shell_render_netargv_buffer(NULL, NULL, &rendered) ==
+              SHELL_PROCESS_EINPUT &&
+          rendered.data == NULL && rendered.length == 0;
+  shell_netstring_buffer_t inconsistent = {.length = 1};
+  valid = valid && !shell_netstring_buffer_is_empty(&inconsistent) &&
+          shell_render_netargv_buffer(&infos[0], NULL, &inconsistent) ==
+              SHELL_PROCESS_EINPUT &&
+          inconsistent.data == NULL && inconsistent.length == 1;
+  shell_command_infos_free(infos, info_count);
+
+  valid = valid &&
+          shell_build_netargv_sequence_buffer(source, strlen(source), NULL,
+                                              &argv_sequence, &count,
+                                              &features) == SHELL_PROCESS_OK &&
+          argv_sequence.data != NULL && argv_sequence.length != 0;
+  unsigned char *argv_data = argv_sequence.data;
+  size_t argv_length = argv_sequence.length;
+  valid =
+      valid &&
+      shell_build_netargv_sequence_buffer(source, strlen(source), NULL,
+                                          &argv_sequence, &count,
+                                          &features) == SHELL_PROCESS_EINPUT &&
+      argv_sequence.data == argv_data && argv_sequence.length == argv_length;
+  shell_netstring_buffer_free(&argv_sequence);
+  valid = valid &&
+          shell_build_netargv_sequence_buffer(source, strlen(source), NULL,
+                                              &argv_sequence, &count,
+                                              &features) == SHELL_PROCESS_OK &&
+          argv_sequence.data != NULL && argv_sequence.length != 0;
+  shell_netstring_buffer_free(&argv_sequence);
+  count = SIZE_MAX;
+  features = true;
+  valid = valid &&
+          shell_build_netargv_sequence_buffer(
+              "while true; do :; done", strlen("while true; do :; done"), NULL,
+              &argv_sequence, &count, &features) == SHELL_PROCESS_EPARSE &&
+          argv_sequence.data == NULL && argv_sequence.length == 0 &&
+          count == 0 && !features;
+
+  valid = valid &&
+          shell_build_command_netseq_buffer(source, strlen(source), NULL,
+                                            &command_sequence,
+                                            &count) == SHELL_PROCESS_OK &&
+          command_sequence.data != NULL && command_sequence.length != 0;
+  unsigned char *command_data = command_sequence.data;
+  size_t command_length = command_sequence.length;
+  valid = valid &&
+          shell_build_command_netseq_buffer(source, strlen(source), NULL,
+                                            &command_sequence,
+                                            &count) == SHELL_PROCESS_EINPUT &&
+          command_sequence.data == command_data &&
+          command_sequence.length == command_length;
+  shell_netstring_buffer_free(&command_sequence);
+  valid = valid &&
+          shell_build_command_netseq_buffer(source, strlen(source), NULL,
+                                            &command_sequence,
+                                            &count) == SHELL_PROCESS_OK &&
+          command_sequence.data != NULL && command_sequence.length != 0;
+  shell_netstring_buffer_free(&command_sequence);
+  count = SIZE_MAX;
+  valid = valid &&
+          shell_build_command_netseq_buffer(
+              "while true; do :; done", strlen("while true; do :; done"), NULL,
+              &command_sequence, &count) == SHELL_PROCESS_EPARSE &&
+          command_sequence.data == NULL && command_sequence.length == 0 &&
+          count == 0;
+
+  valid = valid &&
+          shell_build_type_netseq_buffer(source, strlen(source), NULL,
+                                         &type_sequence,
+                                         &count) == SHELL_PROCESS_OK &&
+          type_sequence.data != NULL && type_sequence.length != 0;
+  unsigned char *type_data = type_sequence.data;
+  size_t type_length = type_sequence.length;
+  valid = valid &&
+          shell_build_type_netseq_buffer(source, strlen(source), NULL,
+                                         &type_sequence,
+                                         &count) == SHELL_PROCESS_EINPUT &&
+          type_sequence.data == type_data &&
+          type_sequence.length == type_length;
+  shell_netstring_buffer_free(&type_sequence);
+  valid = valid &&
+          shell_build_type_netseq_buffer(source, strlen(source), NULL,
+                                         &type_sequence,
+                                         &count) == SHELL_PROCESS_OK &&
+          type_sequence.data != NULL && type_sequence.length != 0;
+  shell_netstring_buffer_free(&type_sequence);
+  count = SIZE_MAX;
+  valid = valid &&
+          shell_build_type_netseq_buffer(
+              "while true; do :; done", strlen("while true; do :; done"), NULL,
+              &type_sequence, &count) == SHELL_PROCESS_EPARSE &&
+          type_sequence.data == NULL && type_sequence.length == 0 && count == 0;
+
+  valid = valid &&
+          shell_build_anomaly_netseqs_buffer(source, strlen(source), NULL,
+                                             &anomaly_commands, &anomaly_types,
+                                             &count) == SHELL_PROCESS_OK &&
+          anomaly_commands.data != NULL && anomaly_commands.length != 0 &&
+          anomaly_types.data != NULL && anomaly_types.length != 0;
+  unsigned char *anomaly_command_data = anomaly_commands.data;
+  size_t anomaly_command_length = anomaly_commands.length;
+  unsigned char *anomaly_type_data = anomaly_types.data;
+  size_t anomaly_type_length = anomaly_types.length;
+  valid = valid &&
+          shell_build_anomaly_netseqs_buffer(source, strlen(source), NULL,
+                                             &anomaly_commands, &anomaly_types,
+                                             &count) == SHELL_PROCESS_EINPUT &&
+          anomaly_commands.data == anomaly_command_data &&
+          anomaly_commands.length == anomaly_command_length &&
+          anomaly_types.data == anomaly_type_data &&
+          anomaly_types.length == anomaly_type_length;
+  shell_netstring_buffer_free(&anomaly_commands);
+  shell_netstring_buffer_free(&anomaly_types);
+  valid = valid &&
+          shell_build_anomaly_netseqs_buffer(source, strlen(source), NULL,
+                                             &anomaly_commands, &anomaly_types,
+                                             &count) == SHELL_PROCESS_OK &&
+          anomaly_commands.data != NULL && anomaly_commands.length != 0 &&
+          anomaly_types.data != NULL && anomaly_types.length != 0;
+  shell_netstring_buffer_free(&anomaly_commands);
+  shell_netstring_buffer_free(&anomaly_types);
+  count = SIZE_MAX;
+  valid =
+      valid &&
+      shell_build_anomaly_netseqs_buffer(
+          "while true; do :; done", strlen("while true; do :; done"), NULL,
+          &anomaly_commands, &anomaly_types, &count) == SHELL_PROCESS_EPARSE &&
+      anomaly_commands.data == NULL && anomaly_commands.length == 0 &&
+      anomaly_types.data == NULL && anomaly_types.length == 0 && count == 0;
+
+  test("Canonical buffer outputs require release before reuse", valid);
+}
+
+static void test_array_semantic_boundaries(void) {
+  static const char *const supported[] = {
+      "echo ${x:-[abc]}",    "echo ${x#[abc]}",
+      "echo ${x%[abc]}",     "echo ${x//[abc]/q}",
+      "echo ${x:-foo[bar]}", "echo \\${items[0]}",
+      "echo '${items[0]}'",  "echo $(( ${x:-[abc]} + 1 ))",
+  };
+  static const char *const rejected[] = {
+      "echo ${items[0]}",
+      "echo \"${#items[0]}\"",
+      "echo pre\"${items[0]}\"post",
+      "echo >\"${items[0]}\"",
+      "echo ${!items[$(printf key)]}",
+      "echo $((items[0]))",
+      "echo \"$((items[0]))\"",
+      "echo >\"$((items[0]))\"",
+      "echo pre$((items[0]))post",
+      "echo $(( \"items[0]\" ))",
+      "echo $(( ${x:-${items[0]}} ))",
+      "echo $((items[$(printf 0)] + 1))",
+      "echo $(printf $((items[0])))",
+      "echo \"$(for x in y; do :; done)\"",
+      "printf items=(one two)",
+  };
+  bool valid = true;
+  for (size_t i = 0; i < sizeof(supported) / sizeof(supported[0]); i++) {
+    shell_processed_commands_t processed = {0};
+    shell_dep_graph_t graph = {0};
+    valid = valid &&
+            shell_process_commands(supported[i], strlen(supported[i]), NULL,
+                                   &processed) == SHELL_PROCESS_OK &&
+            processed.command_count == 1 &&
+            shell_dep_graph_parse(supported[i], strlen(supported[i]), ".", NULL,
+                                  &graph) == SHELL_DEP_OK &&
+            shell_dep_graph_validate(&graph).valid;
+    shell_processed_commands_free(&processed);
+  }
+  for (size_t i = 0; i < sizeof(rejected) / sizeof(rejected[0]); i++) {
+    shell_processed_commands_t processed = {0};
+    shell_dep_graph_t graph = {0};
+    valid = valid &&
+            shell_process_commands(rejected[i], strlen(rejected[i]), NULL,
+                                   &processed) == SHELL_PROCESS_EPARSE &&
+            processed.command_count == 0 &&
+            shell_dep_graph_parse(rejected[i], strlen(rejected[i]), ".", NULL,
+                                  &graph) == SHELL_DEP_EPARSE &&
+            graph.node_count == 0 && graph.edge_count == 0 &&
+            graph.status == SHELL_DEP_STATUS_ERROR;
+    shell_processed_commands_free(&processed);
+  }
+  test("Array semantic boundary accepts patterns and rejects real arrays",
+       valid);
+}
+
+static void test_ansi_c_structural_scanner_contract(void) {
+  static const char *const cases[] = {
+      "echo $(printf $'foo\\'bar)')",
+      "cat <(printf $'foo\\'bar)')",
+      "echo $(( $(printf $'foo\\'bar)') + 1 ))",
+      "echo ${value:-$(printf $'foo\\'bar)')}",
+      "{ echo $(printf $'foo\\'bar)'); }",
+  };
+  bool valid = true;
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    shell_processed_commands_t processed = {0};
+    shell_dep_graph_t graph = {0};
+    size_t length = strlen(cases[i]);
+    shell_process_status_t process_status =
+        shell_process_commands(cases[i], length, NULL, &processed);
+    shell_dep_error_t graph_status =
+        shell_dep_graph_parse(cases[i], length, ".", NULL, &graph);
+    bool case_valid = process_status == SHELL_PROCESS_OK &&
+                      graph_status == SHELL_DEP_OK &&
+                      shell_dep_graph_validate(&graph).valid;
+    valid = valid && case_valid;
+    shell_processed_commands_free(&processed);
+  }
+  test("ANSI-C quotes remain opaque to structural scanners", valid);
+
+  const char *arithmetic = "echo $(( $(printf $'foo\\'bar)') + 1 ))";
+  shell_tokenizer_state_t state;
+  shell_token_t token;
+  valid = shell_tokenizer_init(&state, arithmetic, strlen(arithmetic)) &&
+          shell_tokenizer_next(&state, &token) &&
+          token.type == SHELL_TOKEN_COMMAND &&
+          shell_tokenizer_next(&state, &token) &&
+          token.type == SHELL_TOKEN_ARITHMETIC && token.position == 5 &&
+          token.length == strlen(arithmetic) - token.position &&
+          !shell_tokenizer_next(&state, &token);
+  test("ANSI-C quote cannot truncate arithmetic token span", valid);
+
+  static const char *const array_subscripts[] = {
+      "echo ${array[$'close] bracket']}",
+      "echo ${array['close] bracket']}",
+      "echo ${array[\"close] bracket\"]}",
+      "echo ${array[$(printf \"]\")]}",
+  };
+  valid = true;
+  for (size_t i = 0; i < sizeof(array_subscripts) / sizeof(array_subscripts[0]);
+       i++) {
+    const char *input = array_subscripts[i];
+    shell_processed_commands_t processed = {0};
+    shell_dep_graph_t graph = {0};
+    valid = valid && shell_tokenizer_init(&state, input, strlen(input)) &&
+            shell_tokenizer_next(&state, &token) &&
+            token.type == SHELL_TOKEN_COMMAND &&
+            shell_tokenizer_next(&state, &token) &&
+            token.type == SHELL_TOKEN_VARIABLE &&
+            token.position == strlen("echo ") &&
+            token.length == strlen(input) - token.position &&
+            !shell_tokenizer_next(&state, &token) &&
+            shell_process_commands(input, strlen(input), NULL, &processed) ==
+                SHELL_PROCESS_EPARSE &&
+            processed.commands == NULL && processed.command_count == 0 &&
+            shell_dep_graph_parse(input, strlen(input), ".", NULL, &graph) ==
+                SHELL_DEP_EPARSE &&
+            graph.node_count == 0 && graph.edge_count == 0;
+    shell_processed_commands_free(&processed);
+  }
+  test("Quoted array subscripts tokenize once and reject consistently", valid);
 }
 
 static void test_error_strings(void) {
@@ -1017,7 +1571,7 @@ static void test_tolerant_unfinished_group_omits_empty_command(void) {
   shell_tokenize_status_t status =
       shell_tokenize_commands(input, strlen(input), &commands, &command_count);
   bool valid =
-      status == SHELL_TOKENIZE_OK && commands != NULL && command_count == 2;
+      status == SHELL_TOKENIZE_OK && commands != NULL && command_count == 1;
   for (size_t i = 0; valid && i < command_count; i++)
     valid = commands[i].tokens != NULL && commands[i].token_count != 0 &&
             commands[i].start_pos < commands[i].end_pos;
@@ -2874,6 +3428,10 @@ int main(void) {
   test_canonical_sequence_model_capacity_contract();
   test_group_structure_redirect_marker_contract();
   test_token_type_names();
+  test_modern_bash_syntax_contract();
+  test_canonical_buffer_output_contract();
+  test_array_semantic_boundaries();
+  test_ansi_c_structural_scanner_contract();
   test_error_strings();
   test_composition_metadata();
   static const iterator_case_t iterator_cases[] = {
@@ -3799,6 +4357,20 @@ int main(void) {
        {"cmd"},
        {PROCESS_REDIRECTION | PROCESS_ERROR_REDIRECTION},
        0x1},
+      {"Processor: combined redirect marks stderr",
+       "cmd &> output.txt",
+       1,
+       {"cmd &> output.txt"},
+       {"cmd"},
+       {PROCESS_REDIRECTION | PROCESS_ERROR_REDIRECTION},
+       0x1},
+      {"Processor: combined append redirect marks stderr",
+       "cmd &>> output.txt",
+       1,
+       {"cmd &>> output.txt"},
+       {"cmd"},
+       {PROCESS_REDIRECTION | PROCESS_ERROR_REDIRECTION},
+       0x1},
       {"Processor: sequencing operators",
        "a && b || c ; d",
        4,
@@ -3980,6 +4552,43 @@ int main(void) {
             owned_length == expected_length && strcmp(owned, expected) == 0;
     free(owned);
     test("Decoded-word measure/write matches owned decoding", valid);
+  }
+
+  {
+    static const char word[] = "$'\\x2fhome\\0'$(id)";
+    static const unsigned char expected[] = {'/', 'h', 'o', 'm', 'e', '\0',
+                                             '$', '(', 'i', 'd', ')'};
+    unsigned char visited[sizeof(expected)] = {0};
+    unsigned char written_bytes[sizeof(expected)] = {0};
+    decoded_word_capture_t capture = {
+        .bytes = visited,
+        .capacity = sizeof(visited),
+    };
+    size_t visited_length = 0;
+    size_t measured = 0;
+    size_t written = 0;
+    bool valid =
+        shell_visit_decoded_word(word, sizeof(word) - 1,
+                                 capture_decoded_word_byte, &capture,
+                                 &visited_length) == SHELL_PROCESS_OK &&
+        shell_measure_decoded_word(word, sizeof(word) - 1, &measured) ==
+            SHELL_PROCESS_OK &&
+        shell_write_decoded_word(word, sizeof(word) - 1, (char *)written_bytes,
+                                 sizeof(written_bytes),
+                                 &written) == SHELL_PROCESS_OK &&
+        visited_length == sizeof(expected) && measured == sizeof(expected) &&
+        written == sizeof(expected) &&
+        memcmp(visited, expected, sizeof(expected)) == 0 &&
+        memcmp(written_bytes, expected, sizeof(expected)) == 0;
+    capture.stop_after = 3;
+    memset(visited, 0, sizeof(visited));
+    visited_length = 0;
+    valid = valid &&
+            shell_visit_decoded_word(word, sizeof(word) - 1,
+                                     capture_decoded_word_byte, &capture,
+                                     &visited_length) == SHELL_PROCESS_OK &&
+            visited_length == 3 && memcmp(visited, expected, 3) == 0;
+    test("Decoded-word visitor shares binary-safe syntax decoding", valid);
   }
 
   {
@@ -4259,7 +4868,7 @@ int main(void) {
       {{"Edge: while loop", "while read line; do echo $line; done < file.txt",
         3},
        EXPECT_VARIABLE | EXPECT_LOOP},
-      {{"Edge: case statement", "case $var in a) echo a;; esac", 2},
+      {{"Edge: case statement", "case $var in a) echo a;; esac", 1},
        EXPECT_VARIABLE | EXPECT_CASE},
       {{"Edge: conditional", "if [ -f file.txt ]; then echo exists; fi", 3},
        EXPECT_CONDITIONAL},

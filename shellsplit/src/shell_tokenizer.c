@@ -1,5 +1,6 @@
 #include "shell_tokenizer.h"
 #include "shell_source_internal.h"
+#include "shell_tokenizer_full.h"
 #include "shell_tokenizer_full_internal.h"
 #include <ctype.h>
 #include <string.h>
@@ -111,6 +112,15 @@ static bool collect_heredoc_body_spans(const char *cmd, uint32_t length,
       position += 2;
       continue;
     }
+    if (c == '$' && position + 1 < length && cmd[position + 1] == '\'') {
+      size_t after = 0;
+      if (!shell_source_skip_complete_ansi_c_quote(cmd, length, position,
+                                                   &after) ||
+          after > UINT32_MAX)
+        return false;
+      position = (uint32_t)after;
+      continue;
+    }
     if (c == '\'' || c == '"') {
       quote = c;
       position++;
@@ -191,6 +201,181 @@ static bool strict_heredocs_complete(const char *cmd, uint32_t length) {
                                     &span_count);
 }
 
+static bool shell_identifier_start(char c) {
+  return isalpha((unsigned char)c) || c == '_';
+}
+
+static bool shell_identifier_continue(char c) {
+  return isalnum((unsigned char)c) || c == '_';
+}
+
+/* Recognize assignment syntax that establishes an array without treating the
+ * index as a glob or the compound value as a command group. */
+static bool skip_array_assignment(const char *input, uint32_t length,
+                                  uint32_t position, size_t *after,
+                                  size_t *subscript_start,
+                                  size_t *subscript_after, size_t *value_start,
+                                  size_t *value_after) {
+  if (!input || !after || !subscript_start || !subscript_after ||
+      !value_start || !value_after || position >= length ||
+      !shell_identifier_start(input[position]))
+    return false;
+
+  *subscript_start = 0;
+  *subscript_after = 0;
+  *value_start = 0;
+  *value_after = 0;
+
+  size_t cursor = position + 1;
+  while (cursor < length && shell_identifier_continue(input[cursor]))
+    cursor++;
+  bool indexed = false;
+  if (cursor < length && input[cursor] == '[') {
+    *subscript_start = cursor;
+    if (!shell_source_skip_array_subscript(input, length, cursor, &cursor))
+      return false;
+    *subscript_after = cursor;
+    indexed = true;
+  }
+  if (cursor < length && input[cursor] == '+')
+    cursor++;
+  if (cursor >= length || input[cursor] != '=')
+    return false;
+  if (!indexed && (cursor + 1 >= length || input[cursor + 1] != '('))
+    return false;
+
+  cursor++;
+  if (cursor < length && input[cursor] == '(') {
+    size_t group_start = cursor;
+    if (!shell_source_find_balanced_parentheses(input, length, cursor, &cursor))
+      return false;
+    *value_start = group_start + 1;
+    *value_after = cursor - 1;
+  }
+  *after = cursor;
+  return true;
+}
+
+/* The fast scanner is lexical, but an array-shaped assignment is an array
+ * assignment only before a command word. Keep this tiny no-allocation view of
+ * the full token stream so `echo a[0]=b` remains an ordinary glob-capable
+ * argument while `a[0]=b command` is tagged as Bash array syntax. */
+typedef struct {
+  shell_tokenizer_state_t state;
+  shell_token_t token;
+  bool ready;
+  bool command_start;
+  bool redirect_operand;
+  bool token_array_assignment;
+} fast_array_context_t;
+
+static bool fast_token_is_redirection(const shell_token_t *token) {
+  return token->type == SHELL_TOKEN_REDIRECT_IN ||
+         token->type == SHELL_TOKEN_REDIRECT_OUT ||
+         token->type == SHELL_TOKEN_REDIRECT_ERR ||
+         token->type == SHELL_TOKEN_REDIRECT_APPEND ||
+         token->type == SHELL_TOKEN_REDIRECT_READ_WRITE ||
+         token->type == SHELL_TOKEN_REDIRECT_CLOBBER ||
+         token->type == SHELL_TOKEN_REDIRECT_BOTH ||
+         token->type == SHELL_TOKEN_REDIRECT_BOTH_APPEND ||
+         token->type == SHELL_TOKEN_HEREDOC ||
+         token->type == SHELL_TOKEN_HERESTRING;
+}
+
+static bool fast_redirection_consumes_next(const shell_token_t *token) {
+  if (token->type == SHELL_TOKEN_HERESTRING ||
+      token->type == SHELL_TOKEN_REDIRECT_CLOBBER ||
+      token->type == SHELL_TOKEN_REDIRECT_BOTH ||
+      token->type == SHELL_TOKEN_REDIRECT_BOTH_APPEND)
+    return true;
+  return token->length > 0 && (token->start[token->length - 1] == '<' ||
+                               token->start[token->length - 1] == '>');
+}
+
+static bool fast_token_is_scalar_assignment(const shell_token_t *token) {
+  if (!token || token->is_quoted || token->is_escaped || token->length < 3 ||
+      (token->type != SHELL_TOKEN_COMMAND &&
+       token->type != SHELL_TOKEN_ARGUMENT) ||
+      !shell_identifier_start(token->start[0]))
+    return false;
+  size_t position = 1;
+  while (position < token->length &&
+         shell_identifier_continue(token->start[position]))
+    position++;
+  return position < token->length && token->start[position] == '=';
+}
+
+static bool fast_array_context_init(fast_array_context_t *context,
+                                    const char *input, uint32_t length) {
+  if (!context || !shell_tokenizer_init(&context->state, input, length))
+    return false;
+  context->ready = false;
+  context->command_start = true;
+  context->redirect_operand = false;
+  context->token_array_assignment = false;
+  return true;
+}
+
+static bool fast_array_context_next(fast_array_context_t *context) {
+  if (!shell_tokenizer_next(&context->state, &context->token))
+    return false;
+  context->ready = true;
+  context->token_array_assignment =
+      context->token.type == SHELL_TOKEN_ARRAY_ASSIGNMENT &&
+      (context->command_start ||
+       shell_source_array_assignment_is_compound(context->token.start,
+                                                 context->token.length));
+
+  if (context->token.type == SHELL_TOKEN_PIPE_NEGATE)
+    return true;
+  if (context->token.type == SHELL_TOKEN_PIPE ||
+      context->token.type == SHELL_TOKEN_SEMICOLON ||
+      context->token.type == SHELL_TOKEN_AND ||
+      context->token.type == SHELL_TOKEN_OR ||
+      context->token.type == SHELL_TOKEN_BACKGROUND) {
+    context->command_start = true;
+    context->redirect_operand = false;
+    return true;
+  }
+  if (context->token.type == SHELL_TOKEN_GROUP_START ||
+      context->token.type == SHELL_TOKEN_SUBSHELL_START) {
+    context->command_start = true;
+    context->redirect_operand = false;
+    return true;
+  }
+  if (context->token.type == SHELL_TOKEN_GROUP_END ||
+      context->token.type == SHELL_TOKEN_SUBSHELL_END) {
+    context->command_start = false;
+    context->redirect_operand = false;
+    return true;
+  }
+  if (fast_token_is_redirection(&context->token)) {
+    context->redirect_operand = fast_redirection_consumes_next(&context->token);
+    return true;
+  }
+  if (context->redirect_operand) {
+    context->redirect_operand = false;
+    return true;
+  }
+  if (context->command_start &&
+      (context->token.type == SHELL_TOKEN_ARRAY_ASSIGNMENT ||
+       fast_token_is_scalar_assignment(&context->token)))
+    return true;
+  context->command_start = false;
+  return true;
+}
+
+static bool fast_array_assignment_at(fast_array_context_t *context,
+                                     uint32_t position) {
+  if (!context)
+    return false;
+  while ((!context->ready || context->token.position < position) &&
+         fast_array_context_next(context))
+    ;
+  return context->ready && context->token.position == position &&
+         context->token_array_assignment;
+}
+
 /**
  * Detect features in a subcommand range
  */
@@ -201,6 +386,8 @@ static void detect_features(const char *cmd, uint32_t start, uint32_t len,
   bool in_single_quotes = false;
   bool in_double_quotes = false;
   int arith_depth = 0;
+  fast_array_context_t array_context;
+  bool have_array_context = fast_array_context_init(&array_context, p, len);
 
   while (i < len) {
     char c = p[i];
@@ -235,6 +422,13 @@ static void detect_features(const char *cmd, uint32_t start, uint32_t len,
         p[i + 2] == '(') {
       arith_depth++;
       *features |= SHELL_FEAT_ARITH;
+      size_t arithmetic_after = 0;
+      if (shell_source_skip_arithmetic_expansion(p, len, i,
+                                                 &arithmetic_after) &&
+          arithmetic_after > i + 5 &&
+          shell_tokenizer_arithmetic_has_array_semantics(
+              p + i + 3, arithmetic_after - i - 5))
+        *features |= SHELL_FEAT_ARRAY;
       // Check if first variable after $((
       if (i + 3 < len) {
         char next = p[i + 3];
@@ -248,6 +442,21 @@ static void detect_features(const char *cmd, uint32_t start, uint32_t len,
     }
     if (arith_depth > 0) {
       // Inside $((...)) - detect variables and subshells
+      if (c == '$' && i + 1 < len && p[i + 1] == '\'') {
+        size_t after = shell_source_skip_ansi_c_quote(p, len, i);
+        if (after > i + 2 && after <= len && p[after - 1] == '\'') {
+          *features |= SHELL_FEAT_ANSI_C_QUOTE;
+          i = (uint32_t)after;
+          continue;
+        }
+      }
+      if (c == '\'' || c == '"' || c == '`') {
+        size_t after = shell_source_skip_quoted_text(p, len, i, c);
+        if (after > i + 1 && after <= len && p[after - 1] == c) {
+          i = (uint32_t)after;
+          continue;
+        }
+      }
       if (c == ')') {
         arith_depth--;
         i++;
@@ -257,8 +466,21 @@ static void detect_features(const char *cmd, uint32_t start, uint32_t len,
       if (c == '$' && i + 1 < len) {
         char next = p[i + 1];
         if (next == '(') {
-          // $(...) subshell inside arithmetic
-          *features |= SHELL_FEAT_SUBSHELL;
+          size_t after = 0;
+          if (i + 2 < len && p[i + 2] == '(') {
+            if (shell_source_skip_arithmetic_expansion(p, len, i, &after)) {
+              detect_features(p, i + 3, (uint32_t)(after - i - 5), features);
+              i = (uint32_t)after;
+              continue;
+            }
+          } else if (shell_source_find_balanced_parentheses(p, len, i + 1,
+                                                            &after)) {
+            // $(...) command substitution inside arithmetic.
+            *features |= SHELL_FEAT_SUBSHELL;
+            detect_features(p, i + 2, (uint32_t)(after - i - 3), features);
+            i = (uint32_t)after;
+            continue;
+          }
         } else if (next == '{') {
           *features |= SHELL_FEAT_VARS;
         } else if (isdigit((unsigned char)next) || next == '#' || next == '?' ||
@@ -273,15 +495,61 @@ static void detect_features(const char *cmd, uint32_t start, uint32_t len,
       continue;
     }
 
-    // Detect shell features in each character after expansion handling.
-    if ((c == '<' || c == '>') && i + 1 < len && p[i + 1] == '(') {
+    // Grammar-only syntax is literal inside double quotes. Parameter, command,
+    // and arithmetic expansions below intentionally remain visible there.
+    if (!in_double_quotes && shell_identifier_start(c)) {
+      size_t after = 0, subscript_start = 0, subscript_after = 0;
+      size_t value_start = 0, value_after = 0;
+      if (skip_array_assignment(p, len, i, &after, &subscript_start,
+                                &subscript_after, &value_start, &value_after) &&
+          have_array_context && fast_array_assignment_at(&array_context, i)) {
+        *features |= SHELL_FEAT_ARRAY;
+        if (subscript_after > subscript_start + 1)
+          detect_features(p, (uint32_t)subscript_start + 1,
+                          (uint32_t)(subscript_after - subscript_start - 2),
+                          features);
+        if (value_after > value_start)
+          detect_features(p, (uint32_t)value_start,
+                          (uint32_t)(value_after - value_start), features);
+        i = (uint32_t)after;
+        continue;
+      }
+    }
+    if (!in_double_quotes && c == '&' && i + 1 < len && p[i + 1] == '>') {
+      *features |= SHELL_FEAT_COMBINED_REDIRECT;
+      i += (i + 2 < len && p[i + 2] == '>') ? 3 : 2;
+      continue;
+    }
+    if (!in_double_quotes && c == '$' && i + 1 < len && p[i + 1] == '\'') {
+      *features |= SHELL_FEAT_ANSI_C_QUOTE;
+      size_t after = shell_source_skip_ansi_c_quote(p, len, i);
+      if (after > i + 2 && after <= len && p[after - 1] == '\'') {
+        i = (uint32_t)after;
+        continue;
+      }
+    }
+    if (!in_double_quotes &&
+        (c == '?' || c == '*' || c == '+' || c == '@' || c == '!') &&
+        i + 1 < len && p[i + 1] == '(')
+      *features |= SHELL_FEAT_EXTGLOB;
+    if (!in_double_quotes && c == '{') {
+      size_t end = 0;
+      while (i + end + 1 < len &&
+             (isalnum((unsigned char)p[i + end + 1]) || p[i + end + 1] == '_'))
+        end++;
+      if (end != 0 && i + end + 1 < len && p[i + end + 1] == '}' &&
+          i + end + 2 < len && (p[i + end + 2] == '<' || p[i + end + 2] == '>'))
+        *features |= SHELL_FEAT_NAMED_FD;
+    }
+    if (!in_double_quotes && (c == '<' || c == '>') && i + 1 < len &&
+        p[i + 1] == '(') {
       *features |= SHELL_FEAT_PROCESS_SUB;
       i++;
       continue;
     }
     bool arithmetic_paren =
         i > 1 && p[i - 1] == '(' && (p[i - 2] == '$' || p[i - 2] == '(');
-    if (c == '(' && !arithmetic_paren &&
+    if (!in_double_quotes && c == '(' && !arithmetic_paren &&
         !(i > 0 && (p[i - 1] == '$' || p[i - 1] == '<' || p[i - 1] == '>')))
       *features |= SHELL_FEAT_GROUP;
     switch (c) {
@@ -300,6 +568,17 @@ static void detect_features(const char *cmd, uint32_t start, uint32_t len,
           *features |= SHELL_FEAT_SUBSHELL;
         } else if (next == '{') {
           *features |= SHELL_FEAT_VARS;
+          size_t after = 0, subscript_start = 0;
+          if (shell_source_find_parameter_array_subscript(p, len, i, &after,
+                                                          &subscript_start)) {
+            *features |= SHELL_FEAT_ARRAY;
+            if (after > subscript_start + 1)
+              detect_features(p, (uint32_t)subscript_start + 1,
+                              (uint32_t)(after - subscript_start - 2),
+                              features);
+            i = (uint32_t)after;
+            continue;
+          }
         } else if (isdigit((unsigned char)next) || next == '#' || next == '?' ||
                    next == '$' || next == '!' || next == '@' || next == '*' ||
                    next == '-') {
@@ -393,7 +672,8 @@ static void detect_control_features(const char *cmd, uint32_t start,
       const char *word = p + word_start;
       if ((word_len == 5 && memcmp(word, "while", 5) == 0) ||
           (word_len == 5 && memcmp(word, "until", 5) == 0) ||
-          (word_len == 3 && memcmp(word, "for", 3) == 0))
+          (word_len == 3 && memcmp(word, "for", 3) == 0) ||
+          (word_len == 6 && memcmp(word, "select", 6) == 0))
         *features |= SHELL_FEAT_LOOPS;
       if ((word_len == 2 && memcmp(word, "if", 2) == 0) ||
           (word_len == 4 && memcmp(word, "then", 4) == 0) ||
@@ -446,6 +726,98 @@ static void normalize_result_metadata(shell_parse_result_t *result) {
     if (result->cmds[i].type == SHELL_TYPE_BACKGROUND && i > 0)
       result->cmds[i - 1].features |= SHELL_FEAT_BACKGROUND;
   }
+}
+
+/* A reserved `!` before a compound group belongs to the surrounding pipeline,
+ * not to the group's first inner command. */
+static bool range_is_pipeline_negator_prefix(const char *cmd, uint32_t start,
+                                             uint32_t end) {
+  while (start < end && isspace((unsigned char)cmd[start]))
+    start++;
+  if (start == end || cmd[start++] != '!')
+    return false;
+  while (start < end && isspace((unsigned char)cmd[start]))
+    start++;
+  return start == end;
+}
+
+/* `!` is a reserved pipeline modifier, not an executable command word. The
+ * range tokenizer keeps it inside the first range so it never becomes a
+ * generic separator; remove that prefix here and attach one explicit modifier
+ * to every range in the syntactic pipeline. */
+static bool normalize_pipeline_negation(const char *cmd,
+                                        shell_parse_result_t *result) {
+  for (uint32_t i = 0; i < result->count; i++) {
+    shell_range_t *first = &result->cmds[i];
+    uint32_t offset = 0;
+    while (offset < first->len &&
+           isspace((unsigned char)cmd[first->start + offset]))
+      offset++;
+    if (offset >= first->len || cmd[first->start + offset] != '!')
+      continue;
+    /* A pipeline negator begins a pipeline, not a later stage. `cmd | ! x`
+     * is invalid shell syntax; after &&/||/;/& the new range begins a new
+     * pipeline and is valid. */
+    if (i != 0 && first->type == SHELL_TYPE_PIPELINE)
+      return false;
+    uint32_t after = offset + 1;
+    /* `!` at a command boundary is a reserved pipeline modifier, including
+     * the incomplete end-of-input form. It is never an ordinary executable
+     * name there. `!literal` remains a literal word. */
+    if (after == first->len)
+      return false;
+    if (!isspace((unsigned char)cmd[first->start + after]))
+      continue;
+    while (after < first->len &&
+           isspace((unsigned char)cmd[first->start + after]))
+      after++;
+    if (after == first->len)
+      return false;
+    do {
+      first->start += after;
+      first->len -= after;
+      offset = 0;
+      while (offset < first->len &&
+             isspace((unsigned char)cmd[first->start + offset]))
+        offset++;
+      if (offset >= first->len || cmd[first->start + offset] != '!')
+        break;
+      after = offset + 1;
+      if (after == first->len ||
+          !isspace((unsigned char)cmd[first->start + after]))
+        break;
+      while (after < first->len &&
+             isspace((unsigned char)cmd[first->start + after]))
+        after++;
+      if (after == first->len)
+        return false;
+    } while (true);
+    first->modifiers |= SHELL_CMD_MOD_PIPE_NEGATED;
+    for (uint32_t member = i + 1; member < result->count; member++) {
+      if (result->cmds[member].type != SHELL_TYPE_PIPELINE)
+        break;
+      result->cmds[member].modifiers |= SHELL_CMD_MOD_PIPE_NEGATED;
+    }
+  }
+
+  /* A group opener removes its delimiter and prefix from the inner command
+   * range, so `! { list; } | cmd` has no range beginning with `!`. Retain the
+   * modifier on the GROUP descriptor and apply it to later pipe stages. */
+  for (uint32_t group_index = 0; group_index < result->group_count;
+       group_index++) {
+    const shell_group_t *group = &result->groups[group_index];
+    if ((group->modifiers & SHELL_CMD_MOD_PIPE_NEGATED) == 0)
+      continue;
+    for (uint32_t member = 0; member < result->count; member++) {
+      shell_range_t *range = &result->cmds[member];
+      if (range->start < group->end)
+        continue;
+      if (range->type != SHELL_TYPE_PIPELINE)
+        break;
+      range->modifiers |= SHELL_CMD_MOD_PIPE_NEGATED;
+    }
+  }
+  return true;
 }
 
 static bool input_bytes_are_supported(const char *cmd, size_t cmd_len) {
@@ -578,7 +950,7 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
     }                                                                          \
   } while (0)
 
-#define OPEN_GROUP(kind_val, start_val)                                        \
+#define OPEN_GROUP(kind_val, start_val, modifiers_val)                         \
   do {                                                                         \
     if (result->group_count >= SHELL_MAX_GROUPS ||                             \
         group_descriptor_depth >= SHELL_MAX_GROUPS) {                          \
@@ -595,6 +967,7 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
                          ? group_descriptor_stack[group_descriptor_depth - 1]  \
                          : UINT16_MAX;                                         \
     _group->kind = (kind_val);                                                 \
+    _group->modifiers = (modifiers_val);                                       \
     group_descriptor_stack[group_descriptor_depth++] =                         \
         (uint16_t)result->group_count++;                                       \
   } while (0)
@@ -651,6 +1024,24 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
       continue;
     }
     char c = cmd[pos];
+    /* ANSI-C quoting is one shell-word fragment, even when its body contains
+     * escaped quotes or delimiter-looking bytes. Consume it before generic
+     * quote and delimiter handling so it remains opaque to this structural
+     * parser. */
+    if (!in_quotes && c == '$' && pos + 1 < cmd_len && cmd[pos + 1] == '\'') {
+      size_t after = 0;
+      if (!shell_source_skip_complete_ansi_c_quote(cmd, cmd_len, pos, &after) ||
+          after > UINT32_MAX) {
+        if (limits->strict_mode) {
+          result->status = SHELL_STATUS_ERROR;
+          result->count = subcmd_idx;
+          return SHELL_EPARSE;
+        }
+      } else {
+        pos = (uint32_t)after;
+        continue;
+      }
+    }
     /* Command substitutions are one shell-word component at this layer. The
      * shared scanner owns their matching parentheses and deferred heredoc
      * bodies, so syntax in the nested command cannot split the outer range.
@@ -728,7 +1119,9 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
         last_closed_group_end != UINT32_MAX &&
         source_range_is_whitespace(cmd, last_closed_group_end, pos);
     bool command_boundary =
-        only_whitespace_before_delimiter && !directly_after_closed_group;
+        (only_whitespace_before_delimiter ||
+         range_is_pipeline_negator_prefix(cmd, subcmd_start, pos)) &&
+        !directly_after_closed_group;
 
     bool redirect_prefix =
         redirect_list_precedes_group(cmd, subcmd_start, pos) ||
@@ -750,7 +1143,10 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
         return SHELL_EPARSE;
       }
       brace_group_stack[brace_group_stack_depth++] = SHELL_GROUP_BRACE;
-      OPEN_GROUP(SHELL_GROUP_BRACE, pos);
+      OPEN_GROUP(SHELL_GROUP_BRACE, pos,
+                 range_is_pipeline_negator_prefix(cmd, subcmd_start, pos)
+                     ? SHELL_CMD_MOD_PIPE_NEGATED
+                     : 0);
       brace_group_depth++;
       group_depth++;
       group_kinds |= SHELL_GROUP_BRACE;
@@ -927,6 +1323,26 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
     // Only track when NOT inside arithmetic expansion
     if (arith_depth == 0) {
       if (c == '(' && !function_paren) {
+        /* Extglob alternatives and array values are words, not command
+         * groups. Their interior may contain spaces, pipes, or parentheses,
+         * all of which are opaque to the command-list parser. */
+        if (pos > 0 && (cmd[pos - 1] == '=' || cmd[pos - 1] == '?' ||
+                        cmd[pos - 1] == '*' || cmd[pos - 1] == '+' ||
+                        cmd[pos - 1] == '@' || cmd[pos - 1] == '!')) {
+          size_t after = 0;
+          if (!shell_source_find_balanced_parentheses(cmd, cmd_len, pos,
+                                                      &after) ||
+              after > UINT32_MAX) {
+            if (limits->strict_mode) {
+              result->status = SHELL_STATUS_ERROR;
+              result->count = subcmd_idx;
+              return SHELL_EPARSE;
+            }
+          } else {
+            pos = (uint32_t)after;
+            continue;
+          }
+        }
         /* A parenthesized group is a command, not a word expansion. `$(` and
          * `<(`/`>(` were consumed above by their dedicated scanners. */
         if (limits->strict_mode && !inside_parameter_expansion &&
@@ -948,7 +1364,10 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
             }
             brace_group_stack[brace_group_stack_depth++] = SHELL_GROUP_SUBSHELL;
           }
-          OPEN_GROUP(SHELL_GROUP_SUBSHELL, pos);
+          OPEN_GROUP(SHELL_GROUP_SUBSHELL, pos,
+                     range_is_pipeline_negator_prefix(cmd, subcmd_start, pos)
+                         ? SHELL_CMD_MOD_PIPE_NEGATED
+                         : 0);
           group_depth++, group_paren_depth++;
           group_kinds |= SHELL_GROUP_SUBSHELL;
           /* A group delimiter is syntax, not part of its first command. */
@@ -963,7 +1382,8 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
             result->count = subcmd_idx;
             return SHELL_EPARSE;
           }
-          if (group_prefix == pos)
+          if (group_prefix == pos ||
+              range_is_pipeline_negator_prefix(cmd, subcmd_start, pos))
             subcmd_start = pos + 1;
         }
       } else if (function_paren) {
@@ -1029,13 +1449,24 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
       }
     }
 
-    /* Bash's &>/&>> redirections are outside this parser's documented
-     * redirection dialect. Do not treat them as ordinary argument text: that
-     * would produce a successful range with no corresponding file edge. */
+    /* Bash combines stdout and stderr with &>word / &>>word. It is one
+     * redirect, not a background separator followed by an ordinary word. */
     if (!in_quotes && c == '&' && pos + 1 < cmd_len && cmd[pos + 1] == '>') {
-      result->status = SHELL_STATUS_ERROR;
-      result->count = 0;
-      return SHELL_EPARSE;
+      uint32_t operator_end = pos + 2;
+      if (operator_end < cmd_len && cmd[operator_end] == '>')
+        operator_end++;
+      uint32_t operand = operator_end;
+      while (operand < cmd_len && isspace((unsigned char)cmd[operand]))
+        operand++;
+      size_t after = operand;
+      if (!shell_source_skip_shell_word(cmd, cmd_len, operand, &after) ||
+          after == operand || after > UINT32_MAX) {
+        result->status = SHELL_STATUS_ERROR;
+        result->count = subcmd_idx;
+        return SHELL_EPARSE;
+      }
+      pos = (uint32_t)after;
+      continue;
     }
 
     /* Command and backtick substitutions compose multiple processes. Keep
@@ -1591,6 +2022,14 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
           i++;
         continue;
       }
+      if (!in_single && !in_double && !in_backtick && c == '$' &&
+          i + 1 < cmd_len && cmd[i + 1] == '\'') {
+        size_t after = 0;
+        if (shell_source_skip_complete_ansi_c_quote(cmd, cmd_len, i, &after)) {
+          i = after - 1;
+          continue;
+        }
+      }
       if (c == '\\' && !in_single && i + 1 < cmd_len) {
         i++;
         continue;
@@ -1771,12 +2210,20 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
   }
 
   result->count = subcmd_idx;
+  if (!normalize_pipeline_negation(cmd, result)) {
+    result->status = SHELL_STATUS_ERROR;
+    return SHELL_EPARSE;
+  }
   normalize_result_metadata(result);
   result->status = SHELL_STATUS_OK;
   return SHELL_OK;
 
 truncated:
   result->count = subcmd_idx;
+  if (!normalize_pipeline_negation(cmd, result)) {
+    result->status = SHELL_STATUS_ERROR;
+    return SHELL_EPARSE;
+  }
   normalize_result_metadata(result);
   result->status = SHELL_STATUS_TRUNCATED;
   return SHELL_ETRUNC;
@@ -1855,4 +2302,9 @@ void shell_feature_flags_from_bits(uint32_t features,
   flags->has_pipeline = (features & SHELL_FEAT_PIPELINE) != 0;
   flags->has_group = (features & SHELL_FEAT_GROUP) != 0;
   flags->has_background = (features & SHELL_FEAT_BACKGROUND) != 0;
+  flags->has_extglob = (features & SHELL_FEAT_EXTGLOB) != 0;
+  flags->has_ansi_c_quote = (features & SHELL_FEAT_ANSI_C_QUOTE) != 0;
+  flags->has_array = (features & SHELL_FEAT_ARRAY) != 0;
+  flags->has_named_fd = (features & SHELL_FEAT_NAMED_FD) != 0;
+  flags->has_combined_redirect = (features & SHELL_FEAT_COMBINED_REDIRECT) != 0;
 }

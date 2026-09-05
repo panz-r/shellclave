@@ -218,7 +218,7 @@ static int cross_policy_matches_model(st_policy_t *actual, const bool *active,
     if (test_st_policy_verify_all(actual, cross_probes[probe], &matches,
                                   &match_count) != ST_OK ||
         match_count != expected_match_count) {
-      st_policy_matches_free(matches);
+      test_st_policy_matches_free(matches);
       return 0;
     }
     for (size_t i = 0; i < sizeof(cross_patterns) / sizeof(cross_patterns[0]);
@@ -229,11 +229,11 @@ static int cross_policy_matches_model(st_policy_t *actual, const bool *active,
       for (size_t j = 0; j < match_count; j++)
         found = found || pattern_is_cpl(matches[j], cross_patterns[i].pattern);
       if (!found) {
-        st_policy_matches_free(matches);
+        test_st_policy_matches_free(matches);
         return 0;
       }
     }
-    st_policy_matches_free(matches);
+    test_st_policy_matches_free(matches);
   }
   return 1;
 }
@@ -395,10 +395,10 @@ static int policy_matches_model(st_policy_t *actual, const bool *active,
             ST_OK ||
         match_count != (expected ? 1u : 0u) ||
         (expected && !pattern_is_cpl(matches[0], expected))) {
-      st_policy_matches_free(matches);
+      test_st_policy_matches_free(matches);
       return 0;
     }
-    st_policy_matches_free(matches);
+    test_st_policy_matches_free(matches);
   }
   return 1;
 }

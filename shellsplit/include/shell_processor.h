@@ -1,6 +1,7 @@
 #ifndef SHELL_PROCESSOR_H
 #define SHELL_PROCESSOR_H
 
+#include "shell_netstring.h"
 #include "shell_tokenizer_full.h"
 #include <stdbool.h>
 #include <stddef.h>
@@ -25,8 +26,9 @@ typedef struct {
   size_t command_token_count;    // Number of command arguments
   bool has_pipe_input;           // Has pipe input (|)
   bool has_pipe_output;          // Has pipe output (|)
+  bool pipeline_negated;         // Belongs to a POSIX ! pipeline
   bool has_redirections;         // Has any redirections
-  bool has_error_redirection;    // Has error redirection (2>)
+  bool has_error_redirection;    // Has stderr redirection (2>, &>, or &>>)
 } shell_command_info_t;
 
 /* One source-order I/O or execution-list operation attached to a complete
@@ -165,6 +167,25 @@ void shell_processed_commands_free(shell_processed_commands_t *result);
  */
 void shell_command_infos_free(shell_command_info_t *infos, size_t count);
 
+/* Receives one decoded byte from an already-isolated shell word. Returning
+ * false stops traversal successfully after the current byte. The callback
+ * observes syntactic decoding only: it does not evaluate parameter expansion,
+ * command substitution, globbing, or other runtime shell semantics. */
+typedef bool (*shell_decoded_word_visitor_t)(unsigned char byte,
+                                             size_t decoded_offset,
+                                             void *context);
+
+/** Visit the decoded payload of one already-isolated shell word, assembling
+ * quote fragments, eligible escapes, and Bash ANSI-C quotes. This is not shell
+ * tokenization: callers must isolate the word before calling it. `visitor` may
+ * be NULL to measure only. `decoded_length` is required and receives the
+ * number of bytes delivered; when the visitor stops traversal it is the
+ * delivered prefix length. */
+shell_process_status_t
+shell_visit_decoded_word(const char *text, size_t length,
+                         shell_decoded_word_visitor_t visitor, void *context,
+                         size_t *decoded_length);
+
 /** Measure the decoded payload of one already-isolated shell word, assembling
  * quote fragments and escapes. This is not shell tokenization: callers must
  * isolate the word before calling it. */
@@ -194,9 +215,11 @@ shell_process_status_t
 shell_write_processed_word(const char *text, size_t length, char *destination,
                            size_t destination_size, size_t *written);
 
-/** Decode one already-isolated shell word into an owned C string, assembling
- * quote fragments and escapes. Prefer the measure/write pair when the decoded
- * bytes will be written directly into another representation. */
+/** Decode one already-isolated shell word into an owned, NUL-terminated byte
+ * buffer, assembling quote fragments and escapes. The decoded payload may
+ * itself contain NUL bytes, so consumers must use `decoded_length` rather
+ * than C-string operations to inspect it. Prefer the measure/write pair when
+ * the decoded bytes will be written directly into another representation. */
 shell_process_status_t shell_decode_word(const char *text, size_t length,
                                          char **decoded,
                                          size_t *decoded_length);
@@ -217,10 +240,24 @@ shell_process_status_t shell_write_netargv(const shell_command_info_t *info,
                                            size_t *written);
 
 /** Encode one command's already-processed arguments as concatenated canonical
- * netstrings. This allocating convenience wrapper owns *netargv. */
+ * netstrings. This legacy C-string convenience wrapper owns *netargv. It is
+ * suitable only when the encoded payload contains no NUL byte; use
+ * shell_render_netargv_buffer() for canonical programmatic transport. */
 shell_process_status_t
 shell_render_netargv(const shell_command_info_t *info,
                      const shell_process_limits_t *limits, char **netargv);
+
+/** Encode one command's already-processed arguments as concatenated canonical
+ * netstrings in owned byte storage. Payloads, including those decoded from
+ * Bash ANSI-C quotes, may contain NUL. `buffer` must be empty (initialized to
+ * {0} or released with shell_netstring_buffer_free()) and is empty on failure.
+ * A populated or inconsistent buffer is rejected without modification. Release
+ * a successful result with shell_netstring_buffer_free() before reusing it as
+ * an output argument. */
+shell_process_status_t
+shell_render_netargv_buffer(const shell_command_info_t *info,
+                            const shell_process_limits_t *limits,
+                            shell_netstring_buffer_t *buffer);
 
 /**
  * Check if a command uses shell operators, redirections, or execution-bearing

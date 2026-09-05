@@ -69,7 +69,7 @@ static void test_type(const char *name, const shell_parse_result_t *result,
 
 static void test_has_feature(const char *name,
                              const shell_parse_result_t *result, uint32_t idx,
-                             uint16_t feature) {
+                             uint32_t feature) {
   test_count++;
   if (idx < result->count &&
       (result->cmds[idx].features & feature) == feature) {
@@ -87,8 +87,8 @@ typedef struct {
   uint32_t type_index;
   uint16_t expected_type;
   uint32_t feature_index;
-  uint16_t required_features;
-  uint16_t forbidden_features;
+  uint32_t required_features;
+  uint32_t forbidden_features;
 } parse_case_t;
 
 #define NO_CHECK UINT32_MAX
@@ -118,7 +118,9 @@ static bool result_invariants(const char *input, size_t input_len,
       SHELL_FEAT_ARITH | SHELL_FEAT_HEREDOC | SHELL_FEAT_HERESTRING |
       SHELL_FEAT_PROCESS_SUB | SHELL_FEAT_LOOPS | SHELL_FEAT_CONDITIONALS |
       SHELL_FEAT_CASE | SHELL_FEAT_SUBSHELL_FILE | SHELL_FEAT_PIPELINE |
-      SHELL_FEAT_GROUP | SHELL_FEAT_BACKGROUND;
+      SHELL_FEAT_GROUP | SHELL_FEAT_BACKGROUND | SHELL_FEAT_EXTGLOB |
+      SHELL_FEAT_ANSI_C_QUOTE | SHELL_FEAT_ARRAY | SHELL_FEAT_NAMED_FD |
+      SHELL_FEAT_COMBINED_REDIRECT;
   if (!input || !result || result->count > SHELL_MAX_SUBCOMMANDS ||
       result->group_count > SHELL_MAX_GROUPS)
     return false;
@@ -155,6 +157,7 @@ static bool result_invariants(const char *input, size_t input_len,
         group->command_count > result->count - group->first_command ||
         (group->kind != SHELL_GROUP_BRACE &&
          group->kind != SHELL_GROUP_SUBSHELL) ||
+        (group->modifiers & ~SHELL_CMD_MOD_PIPE_NEGATED) != 0 ||
         (group->parent != UINT16_MAX && group->parent >= i))
       return false;
     if (group->parent != UINT16_MAX) {
@@ -433,6 +436,18 @@ static void test_feature_matrix(void) {
        SHELL_FEAT_ARITH, 0},
       {"double-quoted variable", "echo \"$VAR\"", 1, NO_CHECK, 0, 0,
        SHELL_FEAT_VARS, 0},
+      {"double-quoted command substitution", "echo \"$(id)\"", 1, 0,
+       SHELL_TYPE_SUBSTITUTION, 0, SHELL_FEAT_SUBSHELL, 0},
+      {"double-quoted combined redirect", "echo \"&>out\"", 1, NO_CHECK, 0, 0,
+       0, SHELL_FEAT_COMBINED_REDIRECT},
+      {"double-quoted extglob", "echo \"@(left|right)\"", 1, NO_CHECK, 0, 0, 0,
+       SHELL_FEAT_EXTGLOB | SHELL_FEAT_GROUP},
+      {"double-quoted array syntax", "echo \"items=(one)\"", 1, NO_CHECK, 0, 0,
+       0, SHELL_FEAT_ARRAY | SHELL_FEAT_GROUP},
+      {"double-quoted named descriptor", "echo \"{fd}>out\"", 1, NO_CHECK, 0, 0,
+       0, SHELL_FEAT_NAMED_FD},
+      {"double-quoted process substitution", "echo \"<(producer)\"", 1,
+       NO_CHECK, 0, 0, 0, SHELL_FEAT_PROCESS_SUB | SHELL_FEAT_GROUP},
       {"single quote inside double substitution", "echo \"'$(id)\"", 1, 0,
        SHELL_TYPE_SUBSTITUTION, 0, SHELL_FEAT_SUBSHELL, 0},
       {"adjacent substitutions", "echo $(id)$(pwd)", 1, 0,
@@ -446,6 +461,33 @@ static void test_feature_matrix(void) {
       {"arithmetic expansion variants",
        "echo $(( $(id) + ${value} + $1 + $number ))", 1, NO_CHECK, 0, 0,
        SHELL_FEAT_ARITH | SHELL_FEAT_SUBSHELL | SHELL_FEAT_VARS, 0},
+      {"ANSI-C quote inside arithmetic substitution",
+       "echo $(( $(printf $'x)') + 1 ))", 1, NO_CHECK, 0, 0,
+       SHELL_FEAT_ARITH | SHELL_FEAT_SUBSHELL | SHELL_FEAT_ANSI_C_QUOTE, 0},
+      {"indexed array assignment", "items[0]=one", 1, NO_CHECK, 0, 0,
+       SHELL_FEAT_ARRAY, SHELL_FEAT_GLOBS},
+      {"associative array assignment with ANSI-C index", "items[$'key]']=one",
+       1, NO_CHECK, 0, 0, SHELL_FEAT_ARRAY | SHELL_FEAT_ANSI_C_QUOTE,
+       SHELL_FEAT_GLOBS},
+      {"parameter array reference", "echo ${items[$'key]']}", 1, NO_CHECK, 0, 0,
+       SHELL_FEAT_VARS | SHELL_FEAT_ARRAY | SHELL_FEAT_ANSI_C_QUOTE,
+       SHELL_FEAT_GLOBS},
+      {"parameter default bracket pattern is not an array",
+       "echo ${value:-[x]}", 1, NO_CHECK, 0, 0, SHELL_FEAT_VARS,
+       SHELL_FEAT_ARRAY},
+      {"ordinary array-shaped argument is not an array assignment",
+       "echo item[0]=one", 1, NO_CHECK, 0, 0, SHELL_FEAT_GLOBS,
+       SHELL_FEAT_ARRAY},
+      {"array assignment after scalar prefix", "MODE=x items[0]=one command", 1,
+       NO_CHECK, 0, 0, SHELL_FEAT_ARRAY, SHELL_FEAT_GLOBS},
+      {"arithmetic array reference", "echo $((items[0] + 1))", 1, NO_CHECK, 0,
+       0, SHELL_FEAT_ARITH | SHELL_FEAT_ARRAY, SHELL_FEAT_GLOBS},
+      {"quoted arithmetic array reference", "echo \"$((items[0]))\"", 1,
+       NO_CHECK, 0, 0, SHELL_FEAT_ARITH | SHELL_FEAT_ARRAY, SHELL_FEAT_GLOBS},
+      {"mixed parameter array reference", "echo pre\"${items[0]}\"post", 1,
+       NO_CHECK, 0, 0, SHELL_FEAT_VARS | SHELL_FEAT_ARRAY, SHELL_FEAT_GLOBS},
+      {"quoted literal array syntax", "echo '${items[0]}'", 1, NO_CHECK, 0, 0,
+       0, SHELL_FEAT_ARRAY},
       {"odd escaped substitution", "echo \\$(id)", 1, NO_CHECK, 0, 0, 0,
        SHELL_FEAT_SUBSHELL},
       {"even escaped substitution", "echo \\\\$(id)", 1, NO_CHECK, 0, 0,
@@ -1254,6 +1296,16 @@ static void test_strict_heredoc_completion(void) {
           shell_parse_fast(complete, sizeof(complete) - 1, &limits, &result) ==
               SHELL_OK &&
           result.status == SHELL_STATUS_OK;
+  static const char ansi_complete[] = "cat <<$'EO\\x46' <<-$'B'\r\n"
+                                      "one\r\n"
+                                      "EOF\r\n"
+                                      "\ttwo\r\n"
+                                      "\tB\r\n";
+  memset(&result, 0, sizeof(result));
+  valid = valid &&
+          shell_parse_fast(ansi_complete, sizeof(ansi_complete) - 1, &limits,
+                           &result) == SHELL_OK &&
+          result.status == SHELL_STATUS_OK;
   test("Strict mode validates quoted, tab-stripped heredoc terminators", valid);
 }
 
@@ -1439,6 +1491,26 @@ static void test_source_scanner_contract(void) {
            shell_source_line_is_heredoc_delimiter("\n", 1, 0, &empty_pending) &&
            !shell_source_line_is_heredoc_delimiter("\\\n", 2, 0,
                                                    &dangling_pending));
+  static const char ansi_delimiter[] = "$'EO\\x46'";
+  static const char ansi_nul_delimiter[] = "$'E\\0F'";
+  shell_source_pending_heredoc_t ansi_pending = {0};
+  shell_source_pending_heredoc_t ansi_nul_pending = {0};
+  position = 0;
+  bool ansi_parsed = shell_source_parse_heredoc_delimiter(
+      ansi_delimiter, sizeof(ansi_delimiter) - 1, &position, &ansi_pending);
+  position = 0;
+  bool ansi_nul_parsed = shell_source_parse_heredoc_delimiter(
+      ansi_nul_delimiter, sizeof(ansi_nul_delimiter) - 1, &position,
+      &ansi_nul_pending);
+  test("source scanner decodes ANSI-C heredoc delimiters",
+       ansi_parsed && shell_source_heredoc_delimiter_is_quoted(&ansi_pending) &&
+           shell_source_line_is_heredoc_delimiter("EOF\n", 4, 0,
+                                                  &ansi_pending) &&
+           ansi_nul_parsed &&
+           shell_source_line_is_heredoc_delimiter("E\n", 2, 0,
+                                                  &ansi_nul_pending) &&
+           !shell_source_line_is_heredoc_delimiter("EF\n", 3, 0,
+                                                   &ansi_nul_pending));
   position = 0;
   test(
       "source scanner rejects malformed heredoc delimiters",
@@ -1680,16 +1752,17 @@ static void test_arithmetic_shift_heredoc_boundary(void) {
 }
 
 static void test_dialect_boundary_matrix(void) {
-  printf("\n--- Unsupported Redirect Boundary ---\n");
+  printf("\n--- Combined Redirect Boundary ---\n");
   static const char *cases[] = {"cmd &>file", "cmd &>>file"};
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
     shell_parse_result_t result = {0};
     shell_error_t error =
         shell_parse_fast(cases[i], strlen(cases[i]), NULL, &result);
     char name[96];
-    snprintf(name, sizeof(name), "reject unsupported redirect: %s", cases[i]);
-    test(name, error == SHELL_EPARSE && result.status == SHELL_STATUS_ERROR &&
-                   result.count == 0);
+    snprintf(name, sizeof(name), "accept combined redirect: %s", cases[i]);
+    test(name, error == SHELL_OK && result.status == SHELL_STATUS_OK &&
+                   result.count == 1 &&
+                   (result.cmds[0].features & SHELL_FEAT_COMBINED_REDIRECT));
   }
 }
 

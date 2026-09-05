@@ -16,6 +16,16 @@ typedef enum {
 shell_control_syntax_t shell_tokenizer_control_syntax(const char *input,
                                                       size_t input_length);
 
+/* Syntax that remains lexically visible but is outside Shellclave's
+ * one-command semantic model. */
+bool shell_tokenizer_has_unsupported_semantics(const char *input,
+                                               size_t input_length);
+
+/* Inspect the contents of one already-delimited arithmetic expansion for
+ * array semantics, including nested executable substitutions. */
+bool shell_tokenizer_arithmetic_has_array_semantics(const char *input,
+                                                    size_t input_length);
+
 static inline bool
 shell_tokenizer_has_unsupported_control(const char *input,
                                         size_t input_length) {

@@ -6,6 +6,7 @@
 #include "shell_processor_internal.h"
 #include "shell_sequence.h"
 #include "shell_tokenizer_full.h"
+#include "shell_tokenizer_full_internal.h"
 #include <ctype.h>
 #include <limits.h>
 #include <stdint.h>
@@ -191,13 +192,17 @@ static bool is_redirection_token(shell_token_type_t type) {
          type == SHELL_TOKEN_REDIRECT_ERR ||
          type == SHELL_TOKEN_REDIRECT_APPEND ||
          type == SHELL_TOKEN_REDIRECT_READ_WRITE ||
-         type == SHELL_TOKEN_REDIRECT_CLOBBER || type == SHELL_TOKEN_HEREDOC ||
-         type == SHELL_TOKEN_HERESTRING;
+         type == SHELL_TOKEN_REDIRECT_CLOBBER ||
+         type == SHELL_TOKEN_REDIRECT_BOTH ||
+         type == SHELL_TOKEN_REDIRECT_BOTH_APPEND ||
+         type == SHELL_TOKEN_HEREDOC || type == SHELL_TOKEN_HERESTRING;
 }
 
 static bool redirection_consumes_operand(const shell_token_t *token) {
   if (token->type == SHELL_TOKEN_HERESTRING ||
-      token->type == SHELL_TOKEN_REDIRECT_CLOBBER)
+      token->type == SHELL_TOKEN_REDIRECT_CLOBBER ||
+      token->type == SHELL_TOKEN_REDIRECT_BOTH ||
+      token->type == SHELL_TOKEN_REDIRECT_BOTH_APPEND)
     return true;
   if (token->type == SHELL_TOKEN_HEREDOC || token->length == 0)
     return false;
@@ -853,6 +858,8 @@ shell_abstract_command_parse(const char *command, size_t command_length,
     *out = NULL;
   if (!command || !out || memchr(command, '\0', command_length) != NULL)
     return SHELL_ABSTRACT_EINPUT;
+  if (shell_tokenizer_has_unsupported_semantics(command, command_length))
+    return SHELL_ABSTRACT_EPARSE;
   return abstract_command_parse_impl(command, command_length, out);
 }
 
@@ -1206,12 +1213,15 @@ static const char *token_abbreviation(const shell_token_t *token) {
   }
 }
 
-shell_process_status_t
-shell_build_type_netseq(const char *command, size_t command_length,
-                        const shell_process_limits_t *limits, char **netseq,
-                        size_t *subcommand_count) {
+static shell_process_status_t
+shell_build_type_netseq_impl(const char *command, size_t command_length,
+                             const shell_process_limits_t *limits,
+                             char **netseq, size_t *netseq_length,
+                             size_t *subcommand_count) {
   if (netseq)
     *netseq = NULL;
+  if (netseq_length)
+    *netseq_length = 0;
   if (subcommand_count)
     *subcommand_count = 0;
   if (!command || !netseq || !subcommand_count)
@@ -1339,6 +1349,8 @@ shell_build_type_netseq(const char *command, size_t command_length,
   *position = '\0';
   shell_commands_free(commands, count);
   *netseq = outer;
+  if (netseq_length)
+    *netseq_length = outer_length;
   *subcommand_count = rendered_count;
   return SHELL_PROCESS_OK;
 
@@ -1348,14 +1360,54 @@ fail_type_netseq:
 }
 
 shell_process_status_t
-shell_build_anomaly_netseqs(const char *command_line, size_t command_length,
-                            const shell_process_limits_t *limits,
-                            char **command_netseq, char **type_netseq,
-                            size_t *subcommand_count) {
+shell_build_type_netseq(const char *command, size_t command_length,
+                        const shell_process_limits_t *limits, char **netseq,
+                        size_t *subcommand_count) {
+  size_t length = 0;
+  shell_process_status_t status = shell_build_type_netseq_impl(
+      command, command_length, limits, netseq, &length, subcommand_count);
+  if (status != SHELL_PROCESS_OK)
+    return status;
+  if (memchr(*netseq, '\0', length)) {
+    free(*netseq);
+    *netseq = NULL;
+    *subcommand_count = 0;
+    return SHELL_PROCESS_EOUTPUT_LIMIT;
+  }
+  return SHELL_PROCESS_OK;
+}
+
+shell_process_status_t
+shell_build_type_netseq_buffer(const char *command, size_t command_length,
+                               const shell_process_limits_t *limits,
+                               shell_netstring_buffer_t *sequence,
+                               size_t *subcommand_count) {
+  if (!shell_netstring_buffer_is_empty(sequence) || !subcommand_count)
+    return SHELL_PROCESS_EINPUT;
+  char *encoded = NULL;
+  size_t length = 0;
+  shell_process_status_t status = shell_build_type_netseq_impl(
+      command, command_length, limits, &encoded, &length, subcommand_count);
+  if (status != SHELL_PROCESS_OK)
+    return status;
+  sequence->data = (unsigned char *)encoded;
+  sequence->length = length;
+  return SHELL_PROCESS_OK;
+}
+
+static shell_process_status_t shell_build_anomaly_netseqs_impl(
+    const char *command_line, size_t command_length,
+    const shell_process_limits_t *limits, char **command_netseq,
+    size_t *command_length_out, char **type_netseq, size_t *type_length_out,
+    size_t *subcommand_count) {
   if (command_netseq)
     *command_netseq = NULL;
+  if (command_length_out)
+    *command_length_out = 0;
   if (type_netseq)
     *type_netseq = NULL;
+  if (type_length_out)
+    *type_length_out = 0;
   if (subcommand_count)
     *subcommand_count = 0;
   if (!command_line || !command_netseq || !type_netseq || !subcommand_count)
@@ -1502,10 +1554,63 @@ shell_build_anomaly_netseqs(const char *command_line, size_t command_length,
   shell_commands_free(commands, count);
   *command_netseq = raw;
   *type_netseq = typed;
+  if (command_length_out)
+    *command_length_out = command_total;
+  if (type_length_out)
+    *type_length_out = type_total;
   *subcommand_count = rendered_count;
   return SHELL_PROCESS_OK;
 
 fail:
   shell_commands_free(commands, count);
   return status;
+}
+
+shell_process_status_t
+shell_build_anomaly_netseqs(const char *command_line, size_t command_length,
+                            const shell_process_limits_t *limits,
+                            char **command_netseq, char **type_netseq,
+                            size_t *subcommand_count) {
+  if (!command_netseq || !type_netseq || command_netseq == type_netseq)
+    return SHELL_PROCESS_EINPUT;
+  size_t command_length_out = 0;
+  size_t type_length_out = 0;
+  shell_process_status_t status = shell_build_anomaly_netseqs_impl(
+      command_line, command_length, limits, command_netseq, &command_length_out,
+      type_netseq, &type_length_out, subcommand_count);
+  if (status != SHELL_PROCESS_OK)
+    return status;
+  if (memchr(*command_netseq, '\0', command_length_out) ||
+      memchr(*type_netseq, '\0', type_length_out)) {
+    free(*command_netseq);
+    free(*type_netseq);
+    *command_netseq = NULL;
+    *type_netseq = NULL;
+    *subcommand_count = 0;
+    return SHELL_PROCESS_EOUTPUT_LIMIT;
+  }
+  return SHELL_PROCESS_OK;
+}
+
+shell_process_status_t shell_build_anomaly_netseqs_buffer(
+    const char *command_line, size_t command_length,
+    const shell_process_limits_t *limits, shell_netstring_buffer_t *command,
+    shell_netstring_buffer_t *type, size_t *subcommand_count) {
+  if (!shell_netstring_buffer_is_empty(command) ||
+      !shell_netstring_buffer_is_empty(type) || command == type)
+    return SHELL_PROCESS_EINPUT;
+  char *raw = NULL;
+  char *typed = NULL;
+  size_t raw_length = 0;
+  size_t typed_length = 0;
+  shell_process_status_t status = shell_build_anomaly_netseqs_impl(
+      command_line, command_length, limits, &raw, &raw_length, &typed,
+      &typed_length, subcommand_count);
+  if (status != SHELL_PROCESS_OK)
+    return status;
+  command->data = (unsigned char *)raw;
+  command->length = raw_length;
+  type->data = (unsigned char *)typed;
+  type->length = typed_length;
+  return SHELL_PROCESS_OK;
 }

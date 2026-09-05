@@ -60,8 +60,18 @@ typedef enum {
   SHELL_TOKEN_HERESTRING,      // <<< here-string
 
   /* Kept at the end so existing token values remain stable. */
-  SHELL_TOKEN_REDIRECT_READ_WRITE, // <> input/output redirection
-  SHELL_TOKEN_REDIRECT_CLOBBER     // >| forced output redirection
+  SHELL_TOKEN_REDIRECT_READ_WRITE,  // <> input/output redirection
+  SHELL_TOKEN_REDIRECT_CLOBBER,     // >| forced output redirection
+  SHELL_TOKEN_PIPE_NEGATE,          // POSIX ! pipeline modifier
+  SHELL_TOKEN_REDIRECT_BOTH,        // Bash &> word
+  SHELL_TOKEN_REDIRECT_BOTH_APPEND, // Bash &>> word
+  SHELL_TOKEN_ANSI_C_QUOTED,        // Bash $'...'
+  SHELL_TOKEN_EXTGLOB,          // Bash ?(...), *(...), +(...), @(...), !(...)
+  SHELL_TOKEN_ARRAY_ASSIGNMENT, // Bash indexed/associative assignment
+  SHELL_TOKEN_CASE_TERMINATE,   // ;;
+  SHELL_TOKEN_CASE_FALLTHROUGH, // ;&
+  SHELL_TOKEN_CASE_TEST_NEXT,   // ;;&
+  SHELL_TOKEN_TYPE_COUNT
 } shell_token_type_t;
 
 /**
@@ -99,6 +109,7 @@ typedef struct {
   bool ends_group;     // Last command content closes a group (redirections may
                        // follow)
   bool has_background; // Contains background execution
+  bool pipeline_negated; // This command belongs to a `! pipeline`
 } shell_command_t;
 
 /* Fixed-capacity heredoc declaration retained until the declaration line has

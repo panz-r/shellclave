@@ -52,26 +52,36 @@ ctest --test-dir build --output-on-failure
 | Comments | `# comment` through the end of a line | ✅ |
 | Background execution | `cmd & next` | ✅ |
 | Parenthesized groups | `(cmd1; cmd2)` with nesting metadata | ✅ |
-| Control Features | loops, conditionals, and `case` | ✅ |
+| Pipeline negation | `! pipeline` | ✅ |
+| POSIX brace groups | `{ list; }`, including group redirections | ✅ |
+| Bash extensions | `&>`, `&>>`, `$'...'`, extglob, named-FD open redirects | ✅ |
+| Control Features | loops, conditionals, and `case` | detected, rejected as unsupported |
 
 The fast parser is zero-copy and bounded rather than a complete POSIX shell
 grammar. It reports parse errors and output truncation through return codes;
 callers must handle those results explicitly.
 
-Feature bits for control keywords are lexical indicators. The dependency graph
-represents simple commands, sequencing, pipelines, parenthesized groups,
-background execution, and executable substitutions. Heredoc bodies remain
-data. CWD metadata is propagated only through sequential lists; pipeline,
+Control keyword feature bits are lexical indicators only. Canonical sequence
+and dependency-graph APIs reject loops, conditionals, and `case` statements as
+unsupported rather than flattening bodies into unconditional execution. The
+dependency graph represents simple commands, sequencing, pipelines (including
+their `!` negation modifier), parenthesized and brace groups, background execution, executable
+substitutions, and Bash combined redirects plus named-FD open forms
+(`{fd}<file`, `{fd}>file`, `{fd}>>file`, and `{fd}<>file`). Named-FD
+duplication and close forms, such as `{fd}>&1` and `{fd}>&-`, remain explicitly
+unsupported. Heredoc bodies remain data. CWD metadata is propagated only through sequential lists; pipeline,
 background, group, and substitution execution do not mutate the surrounding
-CWD, and conditional joins are marked unknown when their paths can differ.
-Bash-specific combined redirects such as `&>` are rejected by the bounded
-dialect.
+CWD.
+
+Extglob is recognized as Bash syntax, but a fresh Bash executor must enable
+`extglob` before parsing the command (for example, `bash -O extglob`).
 
 ## Usage
 
 ```c
 #include "shell_tokenizer_full.h"
 #include <stdio.h>
+#include <string.h>
 
 const char input[] = "cat file | grep pattern";
 
@@ -79,7 +89,8 @@ const char input[] = "cat file | grep pattern";
 shell_command_t* commands;
 size_t command_count;
 
-if ((shell_tokenize_commands("cat file | grep pattern", &commands, &command_count) == SHELL_TOKENIZE_OK)) {
+if (shell_tokenize_commands(input, strlen(input), &commands, &command_count) ==
+    SHELL_TOKENIZE_OK) {
     for (size_t i = 0; i < command_count; i++) {
         printf("Command %zu: %.*s\n", i + 1,
                (int)(commands[i].end_pos - commands[i].start_pos),

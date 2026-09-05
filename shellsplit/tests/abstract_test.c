@@ -70,6 +70,17 @@ static void test_bounded_span_and_statuses(void) {
   TEST("abstraction reports input and parse failures precisely", valid);
 }
 
+static void test_ansi_c_arithmetic_span(void) {
+  const char *source = "echo $(( $(printf $'foo\\'bar)') + 1 ))";
+  shell_abstract_command_t *result = parse_command(source);
+  bool valid = result &&
+               strcmp(shell_abstract_command_get_source(result), source) == 0 &&
+               strcmp(shell_abstract_command_get_display_text(result),
+                      "echo $AR_1") == 0;
+  shell_abstract_command_free(result);
+  TEST("ANSI-C quote preserves the complete arithmetic abstraction", valid);
+}
+
 enum {
   FLAG_VARIABLES = 1u << 0,
   FLAG_POS_VARS = 1u << 1,
@@ -591,6 +602,7 @@ int main(void) {
 
   test_abstraction_matrix();
   test_bounded_span_and_statuses();
+  test_ansi_c_arithmetic_span();
   test_abstraction_allocation_failures();
   test_element_metadata();
   test_classification_matrix();

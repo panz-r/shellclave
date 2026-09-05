@@ -95,7 +95,9 @@ static int validate_fast_result(const char *input, size_t length,
       SHELL_FEAT_ARITH | SHELL_FEAT_HEREDOC | SHELL_FEAT_HERESTRING |
       SHELL_FEAT_PROCESS_SUB | SHELL_FEAT_LOOPS | SHELL_FEAT_CONDITIONALS |
       SHELL_FEAT_CASE | SHELL_FEAT_SUBSHELL_FILE | SHELL_FEAT_PIPELINE |
-      SHELL_FEAT_GROUP | SHELL_FEAT_BACKGROUND;
+      SHELL_FEAT_GROUP | SHELL_FEAT_BACKGROUND | SHELL_FEAT_EXTGLOB |
+      SHELL_FEAT_ANSI_C_QUOTE | SHELL_FEAT_ARRAY | SHELL_FEAT_NAMED_FD |
+      SHELL_FEAT_COMBINED_REDIRECT;
   for (uint32_t i = 0; i < result->count; i++) {
     const shell_range_t *r = &result->cmds[i];
     bool known_type =
@@ -106,7 +108,8 @@ static int validate_fast_result(const char *input, size_t length,
         r->type == SHELL_TYPE_SUBSTITUTION || r->type == SHELL_TYPE_BACKGROUND;
     if (r->len == 0 || r->start > length || r->len > length - r->start ||
         !known_type || (r->type & (uint16_t)~valid_types) != 0 ||
-        (r->features & ~valid_features) != 0) {
+        (r->features & ~valid_features) != 0 ||
+        (r->modifiers & ~SHELL_CMD_MOD_PIPE_NEGATED) != 0) {
       if (g_verbose)
         fprintf(stderr,
                 "\n=== FAST PARSER ERROR: Invalid range at idx %u ===\n", i);
@@ -144,6 +147,7 @@ static int validate_fast_result(const char *input, size_t length,
         group->command_count > result->count - group->first_command ||
         (group->kind != SHELL_GROUP_BRACE &&
          group->kind != SHELL_GROUP_SUBSHELL) ||
+        (group->modifiers & ~SHELL_CMD_MOD_PIPE_NEGATED) != 0 ||
         (group->parent != UINT16_MAX && group->parent >= i)) {
       if (g_verbose)
         fprintf(stderr, "\n=== FAST PARSER ERROR: Invalid group %u ===\n", i);
@@ -254,6 +258,43 @@ static int test_fixed_oracles(void) {
     if (!ok || command_count != item.count)
       return 1;
   }
+
+  /* Keep newly supported spelling families in the always-run oracle set. The
+   * literal forms also become comparison material for libFuzzer's dictionary
+   * discovery, so mutations reach their boundary handling quickly. */
+  shell_parse_result_t modern = {};
+  if (shell_parse_fast("! false | cat", strlen("! false | cat"), NULL,
+                       &modern) != SHELL_OK ||
+      modern.count != 2 ||
+      (modern.cmds[0].modifiers & SHELL_CMD_MOD_PIPE_NEGATED) == 0 ||
+      (modern.cmds[1].modifiers & SHELL_CMD_MOD_PIPE_NEGATED) == 0)
+    return 1;
+  if (shell_parse_fast("printf $'a\\0b' @(one|two) xs=(one two) &>out",
+                       strlen("printf $'a\\0b' @(one|two) xs=(one two) &>out"),
+                       NULL, &modern) != SHELL_OK ||
+      modern.count != 1 ||
+      (modern.cmds[0].features &
+       (SHELL_FEAT_ANSI_C_QUOTE | SHELL_FEAT_EXTGLOB | SHELL_FEAT_ARRAY |
+        SHELL_FEAT_COMBINED_REDIRECT)) !=
+          (SHELL_FEAT_ANSI_C_QUOTE | SHELL_FEAT_EXTGLOB | SHELL_FEAT_ARRAY |
+           SHELL_FEAT_COMBINED_REDIRECT))
+    return 1;
+  shell_dep_graph_t modern_graph = {};
+  if (shell_dep_graph_parse("cmd {trace}> trace.log &>> combined.log",
+                            strlen("cmd {trace}> trace.log &>> combined.log"),
+                            NULL, NULL, &modern_graph) != SHELL_DEP_OK ||
+      !shell_dep_graph_validate(&modern_graph).valid)
+    return 1;
+  shell_processed_commands_t unsupported = {};
+  if (shell_process_commands("select x in one; do :; done",
+                             strlen("select x in one; do :; done"), NULL,
+                             &unsupported) != SHELL_PROCESS_EPARSE ||
+      shell_process_commands("coproc worker { :; }",
+                             strlen("coproc worker { :; }"), NULL,
+                             &unsupported) != SHELL_PROCESS_EPARSE)
+    return 1;
+  shell_processed_commands_free(&unsupported);
+
   static const struct {
     const char *input;
     size_t command_count;
@@ -699,8 +740,8 @@ static int test_full_parser(const char *input, size_t length) {
       for (size_t j = 0; j < cmd->token_count; j++) {
         const shell_token_t *tok = &cmd->tokens[j];
         if (tok->type < SHELL_TOKEN_COMMAND ||
-            tok->type > SHELL_TOKEN_REDIRECT_CLOBBER ||
-            tok->position > length || tok->length > length - tok->position ||
+            tok->type >= SHELL_TOKEN_TYPE_COUNT || tok->position > length ||
+            tok->length > length - tok->position ||
             tok->start != input + tok->position) {
           if (g_verbose)
             fprintf(stderr,
@@ -732,7 +773,7 @@ static int test_tokenizer_state(const char *input, size_t length) {
       break;
     }
     if (token.type < SHELL_TOKEN_COMMAND ||
-        token.type > SHELL_TOKEN_REDIRECT_CLOBBER || token.position > length ||
+        token.type >= SHELL_TOKEN_TYPE_COUNT || token.position > length ||
         token.length > length - token.position ||
         token.start != input + token.position || token.position < previous_end)
       return 1;

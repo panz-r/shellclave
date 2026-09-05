@@ -15,6 +15,18 @@ static size_t decimal_digits(size_t value) {
   return digits;
 }
 
+void shell_netstring_buffer_free(shell_netstring_buffer_t *buffer) {
+  if (!buffer)
+    return;
+  free(buffer->data);
+  buffer->data = NULL;
+  buffer->length = 0;
+}
+
+bool shell_netstring_buffer_is_empty(const shell_netstring_buffer_t *buffer) {
+  return buffer && buffer->data == NULL && buffer->length == 0;
+}
+
 shell_netstring_status_t shell_netstring_iter_init(shell_netstring_iter_t *iter,
                                                    const void *data,
                                                    size_t length) {

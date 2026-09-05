@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(Shellclave VERSION 0.7.0 LANGUAGES C CXX)
+project(Shellclave VERSION 0.8.0 LANGUAGES C CXX)
 
 if(PROJECT_IS_TOP_LEVEL)
   set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -413,6 +413,14 @@ if(SHELLCLAVE_BUILD_TOOLS)
   shellclave_project_target(shelltype_tool)
   target_link_libraries(shelltype_tool PRIVATE shelltype)
   target_include_directories(shelltype_tool PRIVATE shelltype/src)
+  if(BUILD_TESTING)
+    add_executable(shelltype_tool_binary_input_test
+      shelltype/tests/test_tool_binary_input.c)
+    shellclave_project_target(shelltype_tool_binary_input_test)
+    add_dependencies(shelltype_tool_binary_input_test shelltype_tool)
+    add_test(NAME shelltype_tool_binary_input
+      COMMAND shelltype_tool_binary_input_test $<TARGET_FILE:shelltype_tool>)
+  endif()
   foreach(tool IN ITEMS anomaly_demo anomaly_calibrate)
     add_executable(${tool} shellgate/tools/${tool}.c)
     shellclave_project_target(${tool})

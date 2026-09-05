@@ -7,10 +7,11 @@ is `0`, and non-zero lengths have no leading zero. Payload lengths count bytes,
 not characters. Embedded spaces, quotes, commas, colons, and newlines need no
 escaping. `shell_netstring.h` provides a length-aware, byte-oriented iterator
 for applications that need to validate or traverse these records; it can expose
-NUL payload bytes. Shellclave's netargv/netsequence-producing APIs remain
-NUL-free transports, so their payloads do not support embedded NUL bytes.
-Shelltype's `st_netargv_view_t` carries an explicit byte length for callers
-that already know it; it preserves that same NUL-free contract.
+NUL payload bytes. Canonical netargv, netsequences, and netpatterns support
+embedded NUL in their payloads. Keep the enclosing byte length throughout
+processing; NUL termination is only a convenience for NUL-free compatibility
+inputs. Raw shell source still rejects literal NUL bytes; syntactic decoding
+of ANSI-C quotes can produce binary canonical payloads.
 
 ## netargv
 
@@ -30,7 +31,13 @@ classifies arguments; it does not tokenize shell source.
 The `*_view` Shelltype entry points accept `st_netargv_view_t` and use its
 explicit length directly. Existing C-string entry points remain convenience
 wrappers that derive that length with `strlen()`. A NULL data pointer is valid
-only for an empty view; neither form accepts embedded NUL bytes.
+only for an empty view. The view forms support embedded NUL; the C-string
+wrappers are limited to NUL-free encodings.
+
+Use Shellsplit's `shell_render_netargv_buffer()` or
+`shell_build_netargv_sequence_buffer()` to preserve binary payloads in an
+owned `shell_netstring_buffer_t`. Release it with
+`shell_netstring_buffer_free()` before reuse.
 
 Shellgate publishes this value as `sg_subcommand_result_t.netargv` with an explicit
 length. It is the authoritative result for applications. The adjacent
@@ -47,23 +54,33 @@ subcommand, with a nested netargv signature containing the executable followed
 by abstract type symbols. A multi-argument command therefore remains one
 anomaly item; command lists and pipelines produce multiple items.
 
+Use `shell_build_command_netseq_buffer()`, `shell_build_type_netseq_buffer()`,
+or `shell_build_anomaly_netseqs_buffer()` for binary sequence output. Pass
+their explicit lengths to the anomaly APIs; legacy C-string builders support
+only NUL-free output.
+
 ## netpattern and CPL
 
 A netpattern is a canonical sequence of outer netstrings. Each outer payload is
 itself two netstrings: a one-byte tag (`L` for a literal, `T` for a type, or
 `C` for a compound argument) and its value. A compound value is a nested
 sequence of two or three `L`/`T` records with exactly one typed capture and a
-literal prefix and/or suffix. Nesting preserves spaces and all other supported
-non-NUL bytes without ambiguity.
+literal prefix and/or suffix. Literal payloads and compound affixes preserve
+arbitrary bytes, including NUL; typed capture markers remain textual.
 
 CPL is the human-readable policy notation. Bare words are literals, recognized
 `#` symbols are types, and `*` is the any-token type. Double quotes force a
-literal and support `\"`, `\\`, `\n`, `\r`, `\t`, and `\uXXXX`. Renderers quote
+literal and support `\"`, `\\`, `\n`, `\r`, `\t`, `\uXXXX`, and `\xHH` for
+an arbitrary byte (including `\x00`). Renderers quote
 empty literals, literal `*`, every literal beginning with `#`, and text needing
 escaping. Braced types describe a typed substring in one argv element:
 `--output={#path}` is distinct from the two arguments `--output #path`. Use
-`st_netpattern_from_cpl()` at a user-input boundary; policy APIs
-accept only canonical netpatterns.
+`st_netpattern_from_cpl_owned()` at a user-input boundary and
+`st_netpattern_to_cpl_view()` for display. The owned `st_netpattern_t` and
+borrowed `st_netpattern_view_t` preserve the enclosing length; release owned
+patterns with `st_netpattern_free()`. Legacy C-string converters support only
+NUL-free netpatterns. Policy APIs accept only canonical netpatterns; use their
+view forms for binary patterns.
 
 ## Framed files
 

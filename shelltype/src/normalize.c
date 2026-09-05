@@ -1915,20 +1915,25 @@ static st_token_type_t st_token_classify_span(st_text_span_t token) {
   return ST_TYPE_LITERAL;
 }
 
+st_token_type_t st_token_classify_bytes(const char *text, size_t length) {
+  if (!text && length != 0)
+    return ST_TYPE_LITERAL;
+  return st_token_classify_span((st_text_span_t){text, length});
+}
+
 /* --- PUBLIC: CLASSIFY --- */
 
 st_token_type_t st_token_classify(const char *token) {
   if (!token)
     return ST_TYPE_LITERAL;
-  return st_token_classify_span((st_text_span_t){token, strlen(token)});
+  return st_token_classify_bytes(token, strlen(token));
 }
 
 /* --- CANONICAL NETSTRING ARGV DECODING --- */
 
 static st_error_t validate_netargv_view(st_netargv_view_t netargv,
                                         size_t *out_count) {
-  if ((!netargv.data && netargv.length != 0) ||
-      (netargv.data && memchr(netargv.data, '\0', netargv.length)))
+  if (!netargv.data && netargv.length != 0)
     return ST_ERR_FORMAT;
   size_t count = 0;
   shell_netstring_iter_t iter;
@@ -2007,6 +2012,12 @@ st_error_t st_netargv_classify_scratch_view(st_netargv_view_t netargv,
     shell_netstring_view_t view;
     if (shell_netstring_iter_next(&iter, &view) != SHELL_NETSTRING_OK)
       return ST_ERR_FORMAT;
+    /* The scratch representation is deliberately C-string based. Ask callers
+     * to use the owned byte-length representation for binary argv values. */
+    if (memchr(view.payload, '\0', view.payload_length)) {
+      memset(scratch, 0, sizeof(*scratch));
+      return ST_ERR_FAILED;
+    }
     /* Policy evaluation uses this fast scratch path for ordinary shell words.
      * Preserve support for larger callback-expanded values by letting callers
      * fall back to the owned classifier. */
@@ -2016,6 +2027,7 @@ st_error_t st_netargv_classify_scratch_view(st_netargv_view_t netargv,
     memcpy(tok, view.payload, view.payload_length);
     tok[view.payload_length] = '\0';
     scratch->tokens[i].text = tok;
+    scratch->tokens[i].text_length = view.payload_length;
 
     st_text_span_t token = {(const char *)view.payload, view.payload_length};
     scratch->tokens[i].type = classify_netargv_span(
@@ -2126,10 +2138,13 @@ st_error_t st_netargv_classify_view(st_netargv_view_t netargv,
       goto fail;
     const char *payload = (const char *)view.payload;
     size_t length = view.payload_length;
-    char *tok = strndup(payload, length);
+    char *tok = malloc(length + 1);
     if (!tok)
       goto fail;
+    memcpy(tok, payload, length);
+    tok[length] = '\0';
     out->tokens[out->count].text = tok;
+    out->tokens[out->count].text_length = length;
 
     st_text_span_t token = {payload, length};
     out->tokens[out->count].type = classify_netargv_span(
@@ -2147,7 +2162,7 @@ fail:
   free(out->tokens);
   out->tokens = NULL;
   out->count = 0;
-  return ST_ERR_MEMORY;
+  return decode_error == ST_OK ? ST_ERR_MEMORY : decode_error;
 }
 
 st_error_t st_netargv_classify(const char *netargv, st_token_array_t *out) {

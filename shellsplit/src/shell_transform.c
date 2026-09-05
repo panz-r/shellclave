@@ -2,6 +2,7 @@
 #include "shell_transform.h"
 #include "alloc.h"
 #include "shell_tokenizer_full.h"
+#include "shell_tokenizer_full_internal.h"
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -11,11 +12,14 @@ static const char *GLOB_PLACEHOLDER = "FILE_PATTERN";
 static const char *SUBSHELL_PLACEHOLDER = "TEMP_FILE";
 
 static bool is_shell_syntax_token(shell_token_type_t type) {
-  return type == SHELL_TOKEN_PIPE || type == SHELL_TOKEN_REDIRECT_IN ||
-         type == SHELL_TOKEN_REDIRECT_OUT || type == SHELL_TOKEN_REDIRECT_ERR ||
+  return type == SHELL_TOKEN_PIPE || type == SHELL_TOKEN_PIPE_NEGATE ||
+         type == SHELL_TOKEN_REDIRECT_IN || type == SHELL_TOKEN_REDIRECT_OUT ||
+         type == SHELL_TOKEN_REDIRECT_ERR ||
          type == SHELL_TOKEN_REDIRECT_APPEND ||
          type == SHELL_TOKEN_REDIRECT_READ_WRITE ||
          type == SHELL_TOKEN_REDIRECT_CLOBBER ||
+         type == SHELL_TOKEN_REDIRECT_BOTH ||
+         type == SHELL_TOKEN_REDIRECT_BOTH_APPEND ||
          type == SHELL_TOKEN_SEMICOLON || type == SHELL_TOKEN_AND ||
          type == SHELL_TOKEN_BACKGROUND || type == SHELL_TOKEN_OR ||
          type == SHELL_TOKEN_GROUP_START || type == SHELL_TOKEN_GROUP_END ||
@@ -300,6 +304,8 @@ shell_transform_command_line(const char *command_line, size_t command_length,
   *transformed_count = 0;
   if (!command_line)
     return SHELL_TRANSFORM_EINPUT;
+  if (shell_tokenizer_has_unsupported_semantics(command_line, command_length))
+    return SHELL_TRANSFORM_EPARSE;
 
   shell_command_t *cmds = NULL;
   size_t cmd_count = 0;

@@ -98,10 +98,10 @@ static void *policy_reader(void *opaque) {
         match_count != 1 || matches == NULL ||
         !pattern_is_cpl(matches[0], command)) {
       record_failure(args->failures, "policy verification", args->id, i);
-      st_policy_matches_free(matches);
+      test_st_policy_matches_free(matches);
       break;
     }
-    st_policy_matches_free(matches);
+    test_st_policy_matches_free(matches);
     size_t count = st_policy_rule_count(args->policy);
     if (count < 2) {
       record_failure(args->failures, "policy count", args->id, i);

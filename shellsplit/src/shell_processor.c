@@ -14,12 +14,15 @@
 
 static bool is_shell_operator_token(const shell_token_t *token) {
   return token->type == SHELL_TOKEN_PIPE ||
+         token->type == SHELL_TOKEN_PIPE_NEGATE ||
          token->type == SHELL_TOKEN_REDIRECT_IN ||
          token->type == SHELL_TOKEN_REDIRECT_OUT ||
          token->type == SHELL_TOKEN_REDIRECT_ERR ||
          token->type == SHELL_TOKEN_REDIRECT_APPEND ||
          token->type == SHELL_TOKEN_REDIRECT_READ_WRITE ||
          token->type == SHELL_TOKEN_REDIRECT_CLOBBER ||
+         token->type == SHELL_TOKEN_REDIRECT_BOTH ||
+         token->type == SHELL_TOKEN_REDIRECT_BOTH_APPEND ||
          token->type == SHELL_TOKEN_SEMICOLON ||
          token->type == SHELL_TOKEN_AND ||
          token->type == SHELL_TOKEN_BACKGROUND ||
@@ -39,6 +42,8 @@ static bool is_redirection_token(const shell_token_t *token) {
          token->type == SHELL_TOKEN_REDIRECT_APPEND ||
          token->type == SHELL_TOKEN_REDIRECT_READ_WRITE ||
          token->type == SHELL_TOKEN_REDIRECT_CLOBBER ||
+         token->type == SHELL_TOKEN_REDIRECT_BOTH ||
+         token->type == SHELL_TOKEN_REDIRECT_BOTH_APPEND ||
          token->type == SHELL_TOKEN_HEREDOC ||
          token->type == SHELL_TOKEN_HERESTRING;
 }
@@ -48,7 +53,9 @@ static bool redirection_consumes_next_token(const shell_token_t *token) {
    * Keep this semantic exception explicit rather than treating the final
    * spelling byte as the complete redirect grammar. */
   if (token->type == SHELL_TOKEN_HERESTRING ||
-      token->type == SHELL_TOKEN_REDIRECT_CLOBBER)
+      token->type == SHELL_TOKEN_REDIRECT_CLOBBER ||
+      token->type == SHELL_TOKEN_REDIRECT_BOTH ||
+      token->type == SHELL_TOKEN_REDIRECT_BOTH_APPEND)
     return true;
   if (token->length == 0)
     return false;
@@ -140,7 +147,7 @@ shell_process_validate_supported_source(const char *command_line,
    * command limit and otherwise hide a later `while`, `select`, or similar
    * construct from canonical callers. */
   if (command_length <= UINT32_MAX &&
-      shell_tokenizer_has_unsupported_control(command_line, command_length))
+      shell_tokenizer_has_unsupported_semantics(command_line, command_length))
     return SHELL_PROCESS_EPARSE;
 
   shell_parse_result_t local = {0};
@@ -182,7 +189,7 @@ shell_processed_commands_parse(const char *command_line, size_t command_length,
   default:
     return SHELL_PROCESS_EPARSE;
   }
-  if (shell_tokenizer_has_unsupported_control(command_line, command_length)) {
+  if (shell_tokenizer_has_unsupported_semantics(command_line, command_length)) {
     shell_commands_free(*commands, *count);
     *commands = NULL;
     *count = 0;
@@ -325,17 +332,70 @@ bool shell_processed_command_has_pipe_output(const shell_command_t *command) {
   return false;
 }
 
-shell_process_status_t shell_measure_decoded_word(const char *text,
-                                                  size_t length,
-                                                  size_t *decoded_length) {
-  if (decoded_length)
-    *decoded_length = 0;
-  if (!text || !decoded_length)
-    return SHELL_PROCESS_EINPUT;
-  size_t out = 0;
+typedef struct {
+  char *destination;
+  size_t destination_size;
+  size_t output_length;
+  shell_decoded_word_visitor_t visitor;
+  void *visitor_context;
+  bool stopped;
+  shell_process_status_t error;
+} decoded_word_sink_t;
+
+static shell_process_status_t decoded_word_emit(decoded_word_sink_t *sink,
+                                                unsigned char value) {
+  if (sink->stopped)
+    return SHELL_PROCESS_OK;
+  if (sink->output_length == SIZE_MAX)
+    return SHELL_PROCESS_EOVERFLOW;
+  if (sink->destination) {
+    if (sink->output_length >= sink->destination_size)
+      return SHELL_PROCESS_EOUTPUT_LIMIT;
+    sink->destination[sink->output_length] = (char)value;
+  }
+  size_t offset = sink->output_length++;
+  if (sink->visitor && !sink->visitor(value, offset, sink->visitor_context))
+    sink->stopped = true;
+  return SHELL_PROCESS_OK;
+}
+
+static bool ansi_decode_emit(unsigned char byte, void *context) {
+  decoded_word_sink_t *sink = context;
+  sink->error = decoded_word_emit(sink, byte);
+  return sink->error == SHELL_PROCESS_OK;
+}
+
+/* Decode one complete Bash $'...' fragment through the source-level decoder.
+ * Canonical argv keeps decoded NUL bytes; heredoc matching uses the same
+ * decoder with its distinct C-string delimiter rule. */
+static shell_process_status_t ansi_decode_quote(const char *text, size_t length,
+                                                size_t *position,
+                                                decoded_word_sink_t *sink) {
+  if (!sink)
+    return SHELL_PROCESS_EPARSE;
+  sink->error = SHELL_PROCESS_OK;
+  if (shell_source_decode_ansi_c_quote(text, length, position, ansi_decode_emit,
+                                       sink))
+    return SHELL_PROCESS_OK;
+  return sink->error == SHELL_PROCESS_OK ? SHELL_PROCESS_EPARSE : sink->error;
+}
+
+static shell_process_status_t decode_shell_word(const char *text, size_t length,
+                                                decoded_word_sink_t *sink) {
   char quote = 0;
   for (size_t i = 0; i < length; i++) {
     char c = text[i];
+    if (quote == 0 && c == '$' && i + 1 < length && text[i + 1] == '\'') {
+      size_t position = i;
+      shell_process_status_t status =
+          ansi_decode_quote(text, length, &position, sink);
+      if (sink->stopped)
+        return SHELL_PROCESS_OK;
+      if (status != SHELL_PROCESS_OK)
+        return status;
+      i = position - 1;
+      continue;
+    }
     if (quote == 0 && (c == '\'' || c == '"')) {
       quote = c;
       continue;
@@ -349,49 +409,46 @@ shell_process_status_t shell_measure_decoded_word(const char *text,
       if (quote == 0 || next == '$' || next == '`' || next == '"' ||
           next == '\\' || next == '\n') {
         if (next != '\n') {
-          if (out == SIZE_MAX)
-            return SHELL_PROCESS_EOVERFLOW;
-          out++;
+          shell_process_status_t status = decoded_word_emit(sink, next);
+          if (status != SHELL_PROCESS_OK)
+            return status;
+          if (sink->stopped)
+            return SHELL_PROCESS_OK;
         }
         i++;
         continue;
       }
     }
-    if (out == SIZE_MAX)
-      return SHELL_PROCESS_EOVERFLOW;
-    out++;
+    shell_process_status_t status = decoded_word_emit(sink, (unsigned char)c);
+    if (status != SHELL_PROCESS_OK)
+      return status;
+    if (sink->stopped)
+      return SHELL_PROCESS_OK;
   }
-  *decoded_length = out;
   return SHELL_PROCESS_OK;
 }
 
-static char *decode_shell_word_unchecked(const char *text, size_t length,
-                                         char *decoded) {
-  char *out = decoded;
-  char quote = 0;
-  for (size_t i = 0; i < length; i++) {
-    char c = text[i];
-    if (quote == 0 && (c == '\'' || c == '"')) {
-      quote = c;
-      continue;
-    }
-    if (quote != 0 && c == quote) {
-      quote = 0;
-      continue;
-    }
-    if (c == '\\' && quote != '\'' && i + 1 < length) {
-      char next = text[i + 1];
-      if (quote == 0 || next == '$' || next == '`' || next == '"' ||
-          next == '\\' || next == '\n') {
-        if (next != '\n')
-          *out++ = next;
-        i++;
-        continue;
-      }
-    }
-    *out++ = c;
-  }
-  return out;
+shell_process_status_t
+shell_visit_decoded_word(const char *text, size_t length,
+                         shell_decoded_word_visitor_t visitor, void *context,
+                         size_t *decoded_length) {
+  if (decoded_length)
+    *decoded_length = 0;
+  if (!text || !decoded_length)
+    return SHELL_PROCESS_EINPUT;
+  decoded_word_sink_t sink = {
+      .visitor = visitor,
+      .visitor_context = context,
+  };
+  shell_process_status_t status = decode_shell_word(text, length, &sink);
+  *decoded_length = sink.output_length;
+  return status;
+}
+
+shell_process_status_t shell_measure_decoded_word(const char *text,
+                                                  size_t length,
+                                                  size_t *decoded_length) {
+  return shell_visit_decoded_word(text, length, NULL, NULL, decoded_length);
 }
 
 shell_process_status_t shell_write_decoded_word(const char *text, size_t length,
@@ -409,8 +466,14 @@ shell_process_status_t shell_write_decoded_word(const char *text, size_t length,
     return status;
   if (destination_size < decoded_length)
     return SHELL_PROCESS_EOUTPUT_LIMIT;
-  char *end = decode_shell_word_unchecked(text, length, destination);
-  *written = (size_t)(end - destination);
+  decoded_word_sink_t sink = {
+      .destination = destination,
+      .destination_size = destination_size,
+  };
+  status = decode_shell_word(text, length, &sink);
+  if (status != SHELL_PROCESS_OK)
+    return status;
+  *written = sink.output_length;
   return SHELL_PROCESS_OK;
 }
 
@@ -426,6 +489,19 @@ render_processed_word(const char *text, size_t length, char *destination,
   char quote = '\0';
   for (size_t i = 0; i < length;) {
     char c = text[i];
+    if (quote == '\0' && c == '$' && i + 1 < length && text[i + 1] == '\'') {
+      decoded_word_sink_t sink = {
+          .destination = destination,
+          .destination_size = destination_size,
+          .output_length = out,
+      };
+      shell_process_status_t status =
+          ansi_decode_quote(text, length, &i, &sink);
+      if (status != SHELL_PROCESS_OK)
+        return status;
+      out = sink.output_length;
+      continue;
+    }
     if (quote == '\0' && (c == '\'' || c == '"')) {
       quote = c;
       i++;
@@ -613,6 +689,7 @@ static bool process_single_command_internal(shell_command_t *basic_cmd,
   bool have_command_word = false;
   size_t command_word_end = 0;
   bool has_pipe_output = false;
+  bool pipeline_negated = basic_cmd->pipeline_negated;
   bool has_redirections = false;
   bool has_error_redirection = false;
 
@@ -629,6 +706,9 @@ static bool process_single_command_internal(shell_command_t *basic_cmd,
       case SHELL_TOKEN_PIPE:
         has_pipe_output = true;
         break;
+      case SHELL_TOKEN_PIPE_NEGATE:
+        pipeline_negated = true;
+        break;
       case SHELL_TOKEN_REDIRECT_IN:
       case SHELL_TOKEN_REDIRECT_OUT:
       case SHELL_TOKEN_REDIRECT_APPEND:
@@ -639,6 +719,8 @@ static bool process_single_command_internal(shell_command_t *basic_cmd,
         has_redirections = true;
         break;
       case SHELL_TOKEN_REDIRECT_ERR:
+      case SHELL_TOKEN_REDIRECT_BOTH:
+      case SHELL_TOKEN_REDIRECT_BOTH_APPEND:
         has_redirections = true;
         has_error_redirection = true;
         break;
@@ -739,6 +821,7 @@ static bool process_single_command_internal(shell_command_t *basic_cmd,
   info->command_tokens = command_tokens;
   info->command_token_count = command_count;
   info->has_pipe_output = has_pipe_output;
+  info->pipeline_negated = pipeline_negated;
   info->has_redirections = has_redirections;
   info->has_error_redirection = has_error_redirection;
   return true;
@@ -821,8 +904,15 @@ shell_process_command(const char *command_line, size_t command_length,
       shell_commands_free(basic_commands, basic_count);
       return SHELL_PROCESS_ENOMEM;
     }
-    if (info_count > 0 && infos[info_count - 1].has_pipe_output)
+    if (info_count > 0 && infos[info_count - 1].has_pipe_output) {
       infos[info_count].has_pipe_input = true;
+      /* `!` modifies the complete pipeline. The full lexer observes it at
+       * the first stage, while this flat result exposes one record per stage,
+       * so propagate the modifier along adjacent pipe links. */
+      infos[info_count].pipeline_negated =
+          infos[info_count].pipeline_negated ||
+          infos[info_count - 1].pipeline_negated;
+    }
     info_count++;
   }
 
@@ -1557,6 +1647,32 @@ shell_render_netargv(const shell_command_info_t *info,
     *netargv = NULL;
   if (!info || !netargv)
     return SHELL_PROCESS_EINPUT;
+  shell_netstring_buffer_t encoded = {0};
+  shell_process_status_t status =
+      shell_render_netargv_buffer(info, limits, &encoded);
+  if (status != SHELL_PROCESS_OK)
+    return status;
+  if (memchr(encoded.data, '\0', encoded.length)) {
+    shell_netstring_buffer_free(&encoded);
+    return SHELL_PROCESS_EOUTPUT_LIMIT;
+  }
+  char *legacy = realloc(encoded.data, encoded.length + 1);
+  if (!legacy) {
+    shell_netstring_buffer_free(&encoded);
+    return SHELL_PROCESS_ENOMEM;
+  }
+  legacy[encoded.length] = '\0';
+  *netargv = legacy;
+  return SHELL_PROCESS_OK;
+}
+
+shell_process_status_t
+shell_render_netargv_buffer(const shell_command_info_t *info,
+                            const shell_process_limits_t *limits,
+                            shell_netstring_buffer_t *buffer) {
+  if (!info || !shell_netstring_buffer_is_empty(buffer))
+    return SHELL_PROCESS_EINPUT;
+
   size_t total = 0;
   shell_process_status_t status = shell_measure_netargv(info, &total);
   if (status != SHELL_PROCESS_OK)
@@ -1566,17 +1682,19 @@ shell_render_netargv(const shell_command_info_t *info,
     return SHELL_PROCESS_EOUTPUT_LIMIT;
   if (total == SIZE_MAX)
     return SHELL_PROCESS_EOVERFLOW;
-  char *encoded = malloc(total + 1);
-  if (!encoded)
-    return SHELL_PROCESS_ENOMEM;
 
-  size_t written = 0;
-  status = shell_write_netargv(info, encoded, total + 1, &written);
-  if (status != SHELL_PROCESS_OK) {
-    free(encoded);
-    return status;
+  /* Keep a valid zero-length base pointer: write_netargv_unchecked() verifies
+   * its final position even for an argv with no records. */
+  unsigned char *data = malloc(total == 0 ? 1 : total);
+  if (!data)
+    return SHELL_PROCESS_ENOMEM;
+  char *position = write_netargv_unchecked(info, (char *)data);
+  if (position != (char *)data + total) {
+    free(data);
+    return SHELL_PROCESS_EPARSE;
   }
-  *netargv = encoded;
+  buffer->data = data;
+  buffer->length = total;
   return SHELL_PROCESS_OK;
 }
 
@@ -1600,13 +1718,15 @@ bool shell_command_info_has_dangerous_features(
   return false;
 }
 
-shell_process_status_t
-shell_build_netargv_sequence(const char *command_line, size_t command_length,
-                             const shell_process_limits_t *limits,
-                             char **netargv_sequence, size_t *subcommand_count,
-                             bool *has_shell_features) {
+static shell_process_status_t shell_build_netargv_sequence_impl(
+    const char *command_line, size_t command_length,
+    const shell_process_limits_t *limits, char **netargv_sequence,
+    size_t *netargv_length, size_t *subcommand_count,
+    bool *has_shell_features) {
   if (netargv_sequence)
     *netargv_sequence = NULL;
+  if (netargv_length)
+    *netargv_length = 0;
   if (subcommand_count)
     *subcommand_count = 0;
   if (has_shell_features)
@@ -1683,6 +1803,8 @@ shell_build_netargv_sequence(const char *command_line, size_t command_length,
   *position = '\0';
   shell_commands_free(commands, count);
   *netargv_sequence = encoded;
+  if (netargv_length)
+    *netargv_length = total;
   *subcommand_count = rendered_count;
   return SHELL_PROCESS_OK;
 
@@ -1693,11 +1815,53 @@ fail_sequence:
 }
 
 shell_process_status_t
-shell_build_command_netseq(const char *command_line, size_t command_length,
-                           const shell_process_limits_t *limits,
-                           char **command_netseq, size_t *subcommand_count) {
+shell_build_netargv_sequence(const char *command_line, size_t command_length,
+                             const shell_process_limits_t *limits,
+                             char **netargv_sequence, size_t *subcommand_count,
+                             bool *has_shell_features) {
+  size_t length = 0;
+  shell_process_status_t status = shell_build_netargv_sequence_impl(
+      command_line, command_length, limits, netargv_sequence, &length,
+      subcommand_count, has_shell_features);
+  if (status != SHELL_PROCESS_OK)
+    return status;
+  if (memchr(*netargv_sequence, '\0', length)) {
+    free(*netargv_sequence);
+    *netargv_sequence = NULL;
+    *subcommand_count = 0;
+    *has_shell_features = false;
+    return SHELL_PROCESS_EOUTPUT_LIMIT;
+  }
+  return SHELL_PROCESS_OK;
+}
+
+shell_process_status_t shell_build_netargv_sequence_buffer(
+    const char *command_line, size_t command_length,
+    const shell_process_limits_t *limits, shell_netstring_buffer_t *sequence,
+    size_t *subcommand_count, bool *has_shell_features) {
+  if (!shell_netstring_buffer_is_empty(sequence) || !subcommand_count ||
+      !has_shell_features)
+    return SHELL_PROCESS_EINPUT;
+  char *encoded = NULL;
+  size_t length = 0;
+  shell_process_status_t status = shell_build_netargv_sequence_impl(
+      command_line, command_length, limits, &encoded, &length, subcommand_count,
+      has_shell_features);
+  if (status != SHELL_PROCESS_OK)
+    return status;
+  sequence->data = (unsigned char *)encoded;
+  sequence->length = length;
+  return SHELL_PROCESS_OK;
+}
+
+static shell_process_status_t shell_build_command_netseq_impl(
+    const char *command_line, size_t command_length,
+    const shell_process_limits_t *limits, char **command_netseq,
+    size_t *command_length_out, size_t *subcommand_count) {
   if (command_netseq)
     *command_netseq = NULL;
+  if (command_length_out)
+    *command_length_out = 0;
   if (subcommand_count)
     *subcommand_count = 0;
   if (!command_line || !command_netseq || !subcommand_count)
@@ -1763,17 +1927,65 @@ shell_build_command_netseq(const char *command_line, size_t command_length,
     (void)shell_netstring_write_prefix(position, SIZE_MAX, length,
                                        &prefix_length);
     position += prefix_length;
-    position =
-        decode_shell_word_unchecked(token->start, token->length, position);
+    decoded_word_sink_t sink = {
+        .destination = position,
+        .destination_size = length,
+    };
+    status = decode_shell_word(token->start, token->length, &sink);
+    if (status != SHELL_PROCESS_OK || sink.output_length != length) {
+      free(encoded);
+      status = status == SHELL_PROCESS_OK ? SHELL_PROCESS_EPARSE : status;
+      goto fail_commands;
+    }
+    position += sink.output_length;
     *position++ = ',';
   }
   *position = '\0';
   shell_commands_free(commands, count);
   *command_netseq = encoded;
+  if (command_length_out)
+    *command_length_out = total;
   *subcommand_count = rendered_count;
   return SHELL_PROCESS_OK;
 
 fail_commands:
   shell_commands_free(commands, count);
   return status;
+}
+
+shell_process_status_t
+shell_build_command_netseq(const char *command_line, size_t command_length,
+                           const shell_process_limits_t *limits,
+                           char **command_netseq, size_t *subcommand_count) {
+  size_t length = 0;
+  shell_process_status_t status = shell_build_command_netseq_impl(
+      command_line, command_length, limits, command_netseq, &length,
+      subcommand_count);
+  if (status != SHELL_PROCESS_OK)
+    return status;
+  if (memchr(*command_netseq, '\0', length)) {
+    free(*command_netseq);
+    *command_netseq = NULL;
+    *subcommand_count = 0;
+    return SHELL_PROCESS_EOUTPUT_LIMIT;
+  }
+  return SHELL_PROCESS_OK;
+}
+
+shell_process_status_t shell_build_command_netseq_buffer(
+    const char *command_line, size_t command_length,
+    const shell_process_limits_t *limits, shell_netstring_buffer_t *sequence,
+    size_t *subcommand_count) {
+  if (!shell_netstring_buffer_is_empty(sequence) || !subcommand_count)
+    return SHELL_PROCESS_EINPUT;
+  char *encoded = NULL;
+  size_t length = 0;
+  shell_process_status_t status =
+      shell_build_command_netseq_impl(command_line, command_length, limits,
+                                      &encoded, &length, subcommand_count);
+  if (status != SHELL_PROCESS_OK)
+    return status;
+  sequence->data = (unsigned char *)encoded;
+  sequence->length = length;
+  return SHELL_PROCESS_OK;
 }
