@@ -76,12 +76,16 @@ static bool shellsplit_test_edge_types_match(const shell_dep_graph_t *graph,
             graph->nodes[edge->to].group.parent == edge->from);
   case SHELL_EDGE_FD_OPEN:
     return (((from == SHELL_NODE_CMD || from == SHELL_NODE_GROUP) &&
-             to == SHELL_NODE_DOC && edge->source_fd == SHELL_DEP_FD_NAMED &&
+             to == SHELL_NODE_DOC && edge->source_fd != SHELL_DEP_FD_NONE &&
              edge->target_fd == SHELL_DEP_FD_NONE) ||
             (from == SHELL_NODE_DOC &&
              (to == SHELL_NODE_CMD || to == SHELL_NODE_GROUP) &&
              edge->source_fd == SHELL_DEP_FD_NONE &&
-             edge->target_fd == SHELL_DEP_FD_NAMED)) &&
+             edge->target_fd != SHELL_DEP_FD_NONE)) &&
+           (((edge->flags & SHELL_DEP_EDGE_FLAG_FD_OPEN_APPEND) == 0) ||
+            ((from == SHELL_NODE_CMD || from == SHELL_NODE_GROUP) &&
+             to == SHELL_NODE_DOC && edge->source_fd != SHELL_DEP_FD_NONE &&
+             edge->target_fd == SHELL_DEP_FD_NONE)) &&
            edge->dir == SHELL_DIR_FORWARD;
   }
   return false;
@@ -158,11 +162,15 @@ static bool shellsplit_test_depgraph_invariants(
     if (edge->from >= graph->node_count || edge->to >= graph->node_count ||
         edge->type > SHELL_EDGE_FD_OPEN || edge->dir > SHELL_DIR_UNDIR ||
         (edge->flags & ~(SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD |
-                         SHELL_DEP_EDGE_FLAG_SUBST_DYNAMIC_NAME)) != 0 ||
+                         SHELL_DEP_EDGE_FLAG_SUBST_DYNAMIC_NAME |
+                         SHELL_DEP_EDGE_FLAG_FD_OPEN_APPEND)) != 0 ||
         ((edge->flags & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0 &&
          (edge->flags & SHELL_DEP_EDGE_FLAG_SUBST_DYNAMIC_NAME) != 0) ||
-        (edge->type != SHELL_EDGE_SUBST &&
-         edge->flags != SHELL_DEP_EDGE_FLAG_NONE) ||
+        ((edge->flags & (SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD |
+                         SHELL_DEP_EDGE_FLAG_SUBST_DYNAMIC_NAME)) != 0 &&
+         edge->type != SHELL_EDGE_SUBST) ||
+        ((edge->flags & SHELL_DEP_EDGE_FLAG_FD_OPEN_APPEND) != 0 &&
+         edge->type != SHELL_EDGE_FD_OPEN) ||
         !shellsplit_test_edge_types_match(graph, edge))
       return false;
   }

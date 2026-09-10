@@ -22,15 +22,18 @@ static shell_error_t parse(shell_interop_handle_t *handle, const char *text,
 }
 
 static void test_parse_and_views(void) {
-  static const char input[] = "echo $USER | grep *.txt && pwd";
+  static const char input[] = "echo $USER |& grep *.txt && pwd";
   static const struct {
     const char *text;
     shell_cmd_type_t type;
     uint32_t features;
-  } expected[] = {{"echo $USER", SHELL_TYPE_SIMPLE, SHELL_FEAT_VARS},
-                  {"grep *.txt", SHELL_TYPE_PIPELINE,
-                   SHELL_FEAT_GLOBS | SHELL_FEAT_PIPELINE},
-                  {"pwd", SHELL_TYPE_AND, 0}};
+    shell_pipe_mode_t pipe_input_mode;
+  } expected[] = {
+      {"echo $USER", SHELL_TYPE_SIMPLE, SHELL_FEAT_VARS, SHELL_PIPE_MODE_NONE},
+      {"grep *.txt", SHELL_TYPE_PIPELINE,
+       SHELL_FEAT_GLOBS | SHELL_FEAT_PIPELINE,
+       SHELL_PIPE_MODE_STDOUT_AND_STDERR},
+      {"pwd", SHELL_TYPE_AND, 0, SHELL_PIPE_MODE_NONE}};
   shell_interop_handle_t *handle = shell_interop_new();
   size_t count = 0;
   CHECK(handle && parse(handle, input, strlen(input), &count) == SHELL_OK);
@@ -43,7 +46,8 @@ static void test_parse_and_views(void) {
     const char *location = strstr(input, expected[i].text);
     CHECK(location && shell_interop_subcommand_range(handle, i, &range));
     CHECK(range.type == expected[i].type &&
-          (range.features & expected[i].features) == expected[i].features);
+          (range.features & expected[i].features) == expected[i].features &&
+          range.pipe_input_mode == expected[i].pipe_input_mode);
     CHECK(range.start == (uint32_t)(location - input) &&
           range.len == strlen(expected[i].text));
     CHECK(shell_interop_subcommand_view(handle, i, &view, &view_length));
@@ -64,8 +68,10 @@ static void test_parse_and_views(void) {
 static void test_failures_clear_state(void) {
   shell_interop_handle_t *handle = shell_interop_new();
   size_t count = 99;
+  size_t empty_count = SIZE_MAX;
   static const char embedded_nul[] = {'p', 'w', 'd', '\0', ';', 'i', 'd'};
   CHECK(handle && parse(handle, "echo ok", 7, &count) == SHELL_OK);
+  CHECK(parse(handle, "", 0, &empty_count) == SHELL_EINPUT && empty_count == 0);
   shell_range_t range = {.len = 1};
   const char *view = (const char *)(void *)1;
   size_t view_length = SIZE_MAX;

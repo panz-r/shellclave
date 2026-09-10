@@ -95,9 +95,11 @@ typedef enum {
   SHELL_DEP_DOC_FLAG_DYNAMIC_NAME = 1 << 1,
   /* The heredoc delimiter was quoted and its body is literal. */
   SHELL_DEP_DOC_FLAG_HEREDOC_LITERAL = 1 << 2,
-  /* An inline input document is evaluated during redirection setup but a later
-   * redirect replaces the target descriptor, so it has no effective READ edge.
-   */
+  /* A document is evaluated during redirection setup but every ordinary
+   * descriptor route to it is later replaced or closed. A transient FILE
+   * document retains its FD_OPEN setup edge without claiming byte flow.
+   * Transient heredoc and here-string documents have no FD_OPEN edge. A live
+   * named-descriptor FD_OPEN edge is not transient. */
   SHELL_DEP_DOC_FLAG_TRANSIENT = 1 << 3,
 } shell_dep_doc_flags_t;
 
@@ -115,10 +117,10 @@ typedef enum {
   SHELL_EDGE_CWD = 10,
   SHELL_EDGE_BACKGROUND = 11,
   SHELL_EDGE_GROUP = 12,
-  /* A named-FD redirect opens a descriptor but does not itself route command
-   * bytes to the file. This setup edge preserves the file-to-descriptor
-   * orientation (`<`), descriptor-to-file orientation (`>`/`>>`), or both
-   * (`<>`) without falsely claiming stdout/stderr I/O. */
+  /* A setup-time redirection binds a descriptor without claiming command-byte
+   * flow. It represents named descriptors and ordinary numeric descriptors
+   * whose route is later replaced or closed. Direction preserves file-to-FD
+   * (`<`), FD-to-file (`>`/`>>`), or both (`<>`) setup. */
   SHELL_EDGE_FD_OPEN = 13,
 } shell_dep_edge_type_t;
 
@@ -140,6 +142,9 @@ typedef enum {
    * affects I/O topology but is not itself command-word content for a later
    * Shellgate inspection. The receiving FILE DOC has DYNAMIC_NAME set. */
   SHELL_DEP_EDGE_FLAG_SUBST_DYNAMIC_NAME = 1 << 1,
+  /* A setup-only FD_OPEN output binding used Bash/POSIX append mode (`>>` or
+   * `&>>`). An unflagged output FD_OPEN is ordinary truncating output. */
+  SHELL_DEP_EDGE_FLAG_FD_OPEN_APPEND = 1 << 2,
 } shell_dep_edge_flags_t;
 
 /**
@@ -199,8 +204,9 @@ typedef struct {
   uint16_t group_depth; /* Enclosing command-group nesting depth */
   uint8_t group_kinds;  /* shell_group_kind_t bitset of enclosing groups */
   bool backgrounded;    /* Command runs asynchronously */
-  /* This command is a member of a POSIX `! pipeline`; the pipeline's final
-   * status is inverted after all members have run. */
+  /* Every leading `!` belongs to this pipeline. The boolean is the effective
+   * odd-count status inversion after all members have run. */
+  uint32_t pipeline_negation_count;
   bool pipeline_negated;
   bool cwd_known; /* False when branch composition makes CWD ambiguous */
 } shell_dep_cmd_t;
@@ -210,7 +216,8 @@ typedef struct {
   uint32_t length;   /* Complete group span, including delimiters */
   uint32_t parent;   /* Parent group node, or UINT32_MAX */
   uint8_t kind;      /* shell_group_kind_t */
-  /* This compound command is a member of a POSIX `! pipeline`. */
+  uint32_t pipeline_negation_count;
+  /* Effective odd-count inversion for this compound pipeline member. */
   bool pipeline_negated;
 } shell_dep_group_t;
 
@@ -323,6 +330,11 @@ typedef struct {
  * On input or parse errors, writable output counts are cleared and
  * SHELL_DEP_STATUS_ERROR is set.
  *
+ * The graph models simple-command lists, pipelines, and brace/subshell groups.
+ * Control compounds (including function declarations, `select`, and `coproc`),
+ * shell-semantic array forms, and unmodeled Bash `[[ … ]]`, `(( … ))`, `time`,
+ * `$"…"`, and `;&` / `;;&` forms return SHELL_DEP_EPARSE.
+ *
  * Command, backtick, process, and Bash file-command substitutions are
  * represented as dynamic I/O: direct SHELL_EDGE_SUBST edges when one
  * execution endpoint or FILE document supplies the stream, or
@@ -344,6 +356,11 @@ typedef struct {
  * claiming that the outer program writes a particular descriptor to it.
  * In a redirect operand, a matching pair establishes the descriptor route:
  * `< <(producer)` supplies the redirect fd and `> >(consumer)` receives it.
+ * This direct route requires the whole operand to be one process substitution.
+ * Composite operands such as `prefix<(producer)` retain a dynamic FILE document
+ * and the nested commands, without inventing a stream route or treating their
+ * stdout as pathname bytes. Command substitutions within that filename still
+ * supply pathname bytes through SUBST_DYNAMIC_NAME edges.
  * A cross-direction pair such as `< >(consumer)` or `> <(producer)` still
  * evaluates and retains the nested graph, but the shell syntax establishes no
  * byte route between that nested command and the redirect. `<>` is modeled as
@@ -358,9 +375,11 @@ typedef struct {
  * inherited-stream relation only while its relevant descriptor still refers
  * to the original inherited fd; a close or duplication from another fd does
  * not fabricate a SUBST edge. A replaced document remains as a DOC syntax
- * artifact without a stale I/O edge and carries
- * SHELL_DEP_DOC_FLAG_TRANSIENT; an expandable one retains its setup-time
- * SUBST flow as well.
+ * artifact without a stale byte-flow edge. A replaced FILE document retains
+ * its FD_OPEN setup-time descriptor binding and carries
+ * SHELL_DEP_DOC_FLAG_TRANSIENT when no effective route remains. Replaced
+ * heredoc and here-string documents have no FD_OPEN edge. An expandable
+ * document retains its setup-time SUBST flow as well.
  *
  * Subshell extraction tracks simple single/double quotes and odd/even
  * backslash escapes while finding delimiters. It is not a complete shell

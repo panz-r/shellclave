@@ -14,7 +14,7 @@ extern "C" {
  * Shell Command Tokenizer
  *
  * Tokenizes shell command lines into individual commands, handling:
- * - Pipes (|)
+ * - Pipelines (| and Bash |&)
  * - Redirections (>, <, >>, 2>, etc.)
  * - Command separators (&&, ||, ;)
  * - Comments, background separators (&), and parenthesized groups
@@ -32,7 +32,7 @@ typedef enum {
   // Basic types
   SHELL_TOKEN_COMMAND,         // Command name or path
   SHELL_TOKEN_ARGUMENT,        // Command argument
-  SHELL_TOKEN_PIPE,            // Pipe operator
+  SHELL_TOKEN_PIPE,            // stdout pipe operator
   SHELL_TOKEN_REDIRECT_IN,     // Input redirection
   SHELL_TOKEN_REDIRECT_OUT,    // Output redirection
   SHELL_TOKEN_REDIRECT_ERR,    // Error redirection
@@ -71,6 +71,7 @@ typedef enum {
   SHELL_TOKEN_CASE_TERMINATE,   // ;;
   SHELL_TOKEN_CASE_FALLTHROUGH, // ;&
   SHELL_TOKEN_CASE_TEST_NEXT,   // ;;&
+  SHELL_TOKEN_PIPE_BOTH,        // Bash |&
   SHELL_TOKEN_TYPE_COUNT
 } shell_token_type_t;
 
@@ -109,7 +110,12 @@ typedef struct {
   bool ends_group;     // Last command content closes a group (redirections may
                        // follow)
   bool has_background; // Contains background execution
-  bool pipeline_negated; // This command belongs to a `! pipeline`
+  /* Every leading `!` belongs to the pipeline. `pipeline_negated` is true
+   * when the count is odd, so it describes the effective exit-status
+   * inversion rather than merely the presence of syntax. */
+  uint32_t pipeline_negation_count;
+  bool pipeline_negated;
+  shell_pipe_mode_t pipe_output_mode; // Pipe operator following this command
 } shell_command_t;
 
 /* Fixed-capacity heredoc declaration retained until the declaration line has
@@ -176,7 +182,9 @@ typedef enum {
  * Tokenize exactly `input_length` shell-source bytes into commands. Embedded
  * NUL is rejected. The caller frees the result
  * with shell_commands_free(); token text points into input, which must remain
- * valid until the result is freed. On failure, writable outputs are NULL and 0.
+ * valid until the result is freed. Impossible top-level list-operator chains
+ * (for example, a trailing pipe or a pipe followed by another operator) are
+ * rejected. On failure, writable outputs are NULL and 0.
  */
 shell_tokenize_status_t shell_tokenize_commands(const char *input,
                                                 size_t input_length,

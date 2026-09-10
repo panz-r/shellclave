@@ -23,27 +23,33 @@ static bool source_range_is_whitespace(const char *cmd, uint32_t start,
   return true;
 }
 
+/* A pending list connector may be followed by blank space, comments, and
+ * escaped physical line endings before its stage begins. Keep this narrower
+ * than general word scanning: any other byte starts a real stage. */
+static bool source_range_is_list_continuation_trivia(const char *cmd,
+                                                     uint32_t start,
+                                                     uint32_t end) {
+  return shell_source_is_list_trivia(cmd, start, end);
+}
+
 /* An io_number is contiguous with its redirect and starts at a shell-word
  * boundary. Values above INT_MAX remain ordinary argument text. */
 static uint32_t source_io_number_start_before(const char *cmd, uint32_t marker,
                                               uint32_t length) {
-  uint32_t start = marker;
-  while (start > 0 && isdigit((unsigned char)cmd[start - 1]))
-    start--;
-  if (start == marker)
-    return marker;
-  if (start > 0 && !isspace((unsigned char)cmd[start - 1]) &&
-      !is_separator(cmd[start - 1]) && cmd[start - 1] != '(' &&
-      cmd[start - 1] != ')' && cmd[start - 1] != '{' && cmd[start - 1] != '}')
-    return marker;
-  size_t after = 0;
-  uint32_t descriptor = 0;
-  return shell_source_parse_io_number(cmd, start, marker, &after,
-                                      &descriptor) ==
-                     SHELL_SOURCE_IO_NUMBER_VALID &&
-                 after == marker && marker <= length
-             ? start
-             : marker;
+  return (uint32_t)shell_source_io_number_start_before(cmd, length, marker);
+}
+
+/* A named descriptor is a redirect prefix in exactly the same way as an
+ * io_number.  Keep the prefix out of the preceding command range: `{fd}` in
+ * `cmd {fd}<<<word` is syntax, not argv.  The source helper remains the
+ * authority for the spelling; this small reverse scan only finds its start. */
+static uint32_t source_redirect_prefix_start_before(const char *cmd,
+                                                    uint32_t marker,
+                                                    uint32_t length) {
+  uint32_t numeric = source_io_number_start_before(cmd, marker, length);
+  if (numeric != marker)
+    return numeric;
+  return (uint32_t)shell_source_named_fd_start_before(cmd, length, marker);
 }
 
 /* `{` and `}` are reserved words only when they form a complete word. Keep
@@ -329,6 +335,7 @@ static bool fast_array_context_next(fast_array_context_t *context) {
   if (context->token.type == SHELL_TOKEN_PIPE_NEGATE)
     return true;
   if (context->token.type == SHELL_TOKEN_PIPE ||
+      context->token.type == SHELL_TOKEN_PIPE_BOTH ||
       context->token.type == SHELL_TOKEN_SEMICOLON ||
       context->token.type == SHELL_TOKEN_AND ||
       context->token.type == SHELL_TOKEN_OR ||
@@ -719,6 +726,8 @@ static void normalize_result_metadata(shell_parse_result_t *result) {
     if (result->cmds[i].group_depth > 0)
       result->cmds[i].features |= SHELL_FEAT_GROUP;
     if (result->cmds[i].type == SHELL_TYPE_PIPELINE) {
+      if (result->cmds[i].pipe_input_mode == SHELL_PIPE_MODE_NONE)
+        result->cmds[i].pipe_input_mode = SHELL_PIPE_MODE_STDOUT;
       result->cmds[i].features |= SHELL_FEAT_PIPELINE;
       if (i > 0)
         result->cmds[i - 1].features |= SHELL_FEAT_PIPELINE;
@@ -728,17 +737,62 @@ static void normalize_result_metadata(shell_parse_result_t *result) {
   }
 }
 
+/* Scan the leading negators for one pipeline stage. A bare `!` must be
+ * followed on the same logical line by the next modifier or stage: unlike a
+ * binary list connector, an unescaped newline or comment cannot bridge it.
+ * Return zero for non-negated ranges and malformed/incomplete prefixes. */
+static uint32_t range_pipeline_negation_prefix(const char *cmd, uint32_t start,
+                                               uint32_t end,
+                                               uint32_t *stage_start) {
+  if (stage_start)
+    *stage_start = start;
+  while (start < end && isspace((unsigned char)cmd[start]))
+    start++;
+  uint32_t count = 0;
+  for (;;) {
+    if (start == end || cmd[start] != '!')
+      break;
+    uint32_t after = start + 1;
+    if (after == end || !isspace((unsigned char)cmd[after]))
+      break;
+    after = (uint32_t)shell_source_skip_pipeline_negator_gap(cmd, end, after);
+    if (after < end &&
+        (cmd[after] == '\n' || cmd[after] == '\r' ||
+         (cmd[after] == '#' && shell_source_comment_starts(cmd, end, after))))
+      return 0;
+    if (count == UINT32_MAX)
+      return 0;
+    count++;
+    /* A group opener is outside this bounded prefix while the range parser is
+     * deciding whether `{` or `(` starts a compound pipeline stage. Preserve
+     * the completed modifier sequence for that caller; normalization below
+     * rejects the same empty stage when it is an actual complete range. */
+    if (after == end) {
+      if (stage_start)
+        *stage_start = after;
+      return count;
+    }
+    /* A following `!` is another modifier only when it too is delimited.
+     * `! !literal` therefore executes the command named `!literal` under one
+     * negation, as Bash does. */
+    if (cmd[after] != '!' || after + 1 == end ||
+        !isspace((unsigned char)cmd[after + 1])) {
+      if (stage_start)
+        *stage_start = after;
+      return count;
+    }
+    start = after;
+  }
+  return 0;
+}
+
 /* A reserved `!` before a compound group belongs to the surrounding pipeline,
  * not to the group's first inner command. */
 static bool range_is_pipeline_negator_prefix(const char *cmd, uint32_t start,
                                              uint32_t end) {
-  while (start < end && isspace((unsigned char)cmd[start]))
-    start++;
-  if (start == end || cmd[start++] != '!')
-    return false;
-  while (start < end && isspace((unsigned char)cmd[start]))
-    start++;
-  return start == end;
+  uint32_t stage = start;
+  return range_pipeline_negation_prefix(cmd, start, end, &stage) != 0 &&
+         stage == end;
 }
 
 /* `!` is a reserved pipeline modifier, not an executable command word. The
@@ -747,6 +801,25 @@ static bool range_is_pipeline_negator_prefix(const char *cmd, uint32_t start,
  * to every range in the syntactic pipeline. */
 static bool normalize_pipeline_negation(const char *cmd,
                                         shell_parse_result_t *result) {
+  /* Redirect-only stages have no word range from which to strip `!`.  The
+   * marker records the modifier directly; propagate it through its pipeline
+   * just as a word-bearing first stage would. */
+  for (uint32_t i = 0; i < result->count; i++) {
+    shell_range_t *first = &result->cmds[i];
+    if ((first->modifiers & SHELL_CMD_MOD_PIPE_NEGATED) == 0)
+      continue;
+    if (first->pipeline_negation_count == 0)
+      return false;
+    if (i != 0 && first->type == SHELL_TYPE_PIPELINE)
+      continue;
+    for (uint32_t member = i + 1; member < result->count; member++) {
+      if (result->cmds[member].type != SHELL_TYPE_PIPELINE)
+        break;
+      result->cmds[member].modifiers |= SHELL_CMD_MOD_PIPE_NEGATED;
+      result->cmds[member].pipeline_negation_count =
+          first->pipeline_negation_count;
+    }
+  }
   for (uint32_t i = 0; i < result->count; i++) {
     shell_range_t *first = &result->cmds[i];
     uint32_t offset = 0;
@@ -760,43 +833,29 @@ static bool normalize_pipeline_negation(const char *cmd,
      * pipeline and is valid. */
     if (i != 0 && first->type == SHELL_TYPE_PIPELINE)
       return false;
-    uint32_t after = offset + 1;
-    /* `!` at a command boundary is a reserved pipeline modifier, including
-     * the incomplete end-of-input form. It is never an ordinary executable
-     * name there. `!literal` remains a literal word. */
-    if (after == first->len)
-      return false;
-    if (!isspace((unsigned char)cmd[first->start + after]))
-      continue;
-    while (after < first->len &&
-           isspace((unsigned char)cmd[first->start + after]))
-      after++;
-    if (after == first->len)
-      return false;
-    do {
-      first->start += after;
-      first->len -= after;
-      offset = 0;
-      while (offset < first->len &&
-             isspace((unsigned char)cmd[first->start + offset]))
-        offset++;
-      if (offset >= first->len || cmd[first->start + offset] != '!')
-        break;
-      after = offset + 1;
-      if (after == first->len ||
-          !isspace((unsigned char)cmd[first->start + after]))
-        break;
-      while (after < first->len &&
-             isspace((unsigned char)cmd[first->start + after]))
-        after++;
-      if (after == first->len)
+    uint32_t range_end = first->start + first->len;
+    uint32_t stage_start = first->start + offset;
+    uint32_t negation_count = range_pipeline_negation_prefix(
+        cmd, first->start + offset, range_end, &stage_start);
+    if (negation_count == 0) {
+      /* `!literal` is an ordinary command word, while a delimited but
+       * incomplete negator is malformed source. */
+      if (first->start + offset + 1 == range_end ||
+          isspace((unsigned char)cmd[first->start + offset + 1]))
         return false;
-    } while (true);
+      continue;
+    }
+    if (stage_start == range_end)
+      return false;
+    first->len = range_end - stage_start;
+    first->start = stage_start;
     first->modifiers |= SHELL_CMD_MOD_PIPE_NEGATED;
+    first->pipeline_negation_count = negation_count;
     for (uint32_t member = i + 1; member < result->count; member++) {
       if (result->cmds[member].type != SHELL_TYPE_PIPELINE)
         break;
       result->cmds[member].modifiers |= SHELL_CMD_MOD_PIPE_NEGATED;
+      result->cmds[member].pipeline_negation_count = negation_count;
     }
   }
 
@@ -805,9 +864,11 @@ static bool normalize_pipeline_negation(const char *cmd,
    * modifier on the GROUP descriptor and apply it to later pipe stages. */
   for (uint32_t group_index = 0; group_index < result->group_count;
        group_index++) {
-    const shell_group_t *group = &result->groups[group_index];
+    shell_group_t *group = &result->groups[group_index];
     if ((group->modifiers & SHELL_CMD_MOD_PIPE_NEGATED) == 0)
       continue;
+    if (group->pipeline_negation_count == 0)
+      group->pipeline_negation_count = 1;
     for (uint32_t member = 0; member < result->count; member++) {
       shell_range_t *range = &result->cmds[member];
       if (range->start < group->end)
@@ -815,6 +876,7 @@ static bool normalize_pipeline_negation(const char *cmd,
       if (range->type != SHELL_TYPE_PIPELINE)
         break;
       range->modifiers |= SHELL_CMD_MOD_PIPE_NEGATED;
+      range->pipeline_negation_count = group->pipeline_negation_count;
     }
   }
   return true;
@@ -903,6 +965,10 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
     result->status = SHELL_STATUS_ERROR;
     return SHELL_EPARSE;
   }
+  if (!shell_tokenizer_list_syntax_valid(cmd, cmd_len)) {
+    result->status = SHELL_STATUS_ERROR;
+    return SHELL_EPARSE;
+  }
 
   /* The fast parser preserves lexical ranges for control compounds so the
    * higher-level semantic boundary can report them as unsupported syntax.
@@ -937,6 +1003,7 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
       result->cmds[subcmd_idx].start = _s;                                     \
       result->cmds[subcmd_idx].len = _e - _s;                                  \
       result->cmds[subcmd_idx].type = (type_val);                              \
+      result->cmds[subcmd_idx].pipe_input_mode = current_pipe_input_mode;      \
       result->cmds[subcmd_idx].features = 0;                                   \
       result->cmds[subcmd_idx].group_depth = group_depth;                      \
       result->cmds[subcmd_idx].group_kinds = group_kinds;                      \
@@ -950,7 +1017,7 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
     }                                                                          \
   } while (0)
 
-#define OPEN_GROUP(kind_val, start_val, modifiers_val)                         \
+#define OPEN_GROUP(kind_val, start_val, modifiers_val, negation_count_val)     \
   do {                                                                         \
     if (result->group_count >= SHELL_MAX_GROUPS ||                             \
         group_descriptor_depth >= SHELL_MAX_GROUPS) {                          \
@@ -968,6 +1035,7 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
                          : UINT16_MAX;                                         \
     _group->kind = (kind_val);                                                 \
     _group->modifiers = (modifiers_val);                                       \
+    _group->pipeline_negation_count = (negation_count_val);                    \
     group_descriptor_stack[group_descriptor_depth++] =                         \
         (uint16_t)result->group_count++;                                       \
   } while (0)
@@ -991,6 +1059,7 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
   uint32_t subcmd_start = 0;
   uint32_t subcmd_idx = 0;
   uint16_t current_type = SHELL_TYPE_SIMPLE;
+  uint8_t current_pipe_input_mode = SHELL_PIPE_MODE_NONE;
   uint16_t group_depth = 0;
   uint8_t group_kinds = SHELL_GROUP_NONE;
   uint16_t brace_group_depth = 0;
@@ -1042,6 +1111,24 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
         continue;
       }
     }
+    /* A balanced parameter expansion is one shell-word fragment. Its default,
+     * pattern, or replacement word may contain bytes that are operators at
+     * the enclosing command-list level. */
+    if (!in_quotes && c == '$' && pos + 1 < cmd_len && cmd[pos + 1] == '{') {
+      size_t after = 0;
+      if (!shell_source_skip_parameter_expansion(cmd, cmd_len, pos, &after) ||
+          after > UINT32_MAX) {
+        /* A braced parameter expansion is syntactically complete or it is
+         * invalid source; permissive range recovery must not turn `${}` or an
+         * unterminated expansion into an unrelated ordinary brace word. */
+        result->status = SHELL_STATUS_ERROR;
+        result->count = subcmd_idx;
+        return SHELL_EPARSE;
+      } else {
+        pos = (uint32_t)after;
+        continue;
+      }
+    }
     /* Command substitutions are one shell-word component at this layer. The
      * shared scanner owns their matching parentheses and deferred heredoc
      * bodies, so syntax in the nested command cannot split the outer range.
@@ -1075,6 +1162,14 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
       }
       pos = (uint32_t)after;
       continue;
+    }
+    if (!in_quotes && arith_depth == 0 && substitution_paren_depth == 0) {
+      size_t after = 0;
+      if (shell_source_skip_extglob(cmd, cmd_len, pos, &after) &&
+          after <= UINT32_MAX) {
+        pos = (uint32_t)after;
+        continue;
+      }
     }
     bool function_paren = c == '(' && pos + 1 < cmd_len &&
                           cmd[pos + 1] == ')' && pos > subcmd_start &&
@@ -1143,10 +1238,12 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
         return SHELL_EPARSE;
       }
       brace_group_stack[brace_group_stack_depth++] = SHELL_GROUP_BRACE;
+      uint32_t group_stage = subcmd_start;
+      uint32_t group_negation_count =
+          range_pipeline_negation_prefix(cmd, subcmd_start, pos, &group_stage);
       OPEN_GROUP(SHELL_GROUP_BRACE, pos,
-                 range_is_pipeline_negator_prefix(cmd, subcmd_start, pos)
-                     ? SHELL_CMD_MOD_PIPE_NEGATED
-                     : 0);
+                 group_negation_count ? SHELL_CMD_MOD_PIPE_NEGATED : 0,
+                 group_negation_count);
       brace_group_depth++;
       group_depth++;
       group_kinds |= SHELL_GROUP_BRACE;
@@ -1209,6 +1306,29 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
         comment_start = pos;
       while (pos < cmd_len && cmd[pos] != '\n' && cmd[pos] != '\r')
         pos++;
+      continue;
+    }
+
+    /* An unquoted escaped physical line ending is removed before list
+     * grammar is evaluated. In particular, it cannot become the missing
+     * right-hand stage of a pipeline or AND/OR list. */
+    if (!in_quotes && c == '\\' && pos + 1 < cmd_len &&
+        (cmd[pos + 1] == '\n' || cmd[pos + 1] == '\r')) {
+      uint32_t after = pos + 2;
+      if (after < cmd_len && cmd[pos + 1] == '\r' && cmd[after] == '\n')
+        after++;
+      /* A group closer, a pending list operator, or a redirect list may have
+       * left `subcmd_start` at source trivia. Do not emit a phantom command
+       * for a continuation that shell removes before parsing the next token. */
+      if (source_range_is_list_continuation_trivia(cmd, subcmd_start, after)) {
+        subcmd_start = after;
+        comment_start = UINT32_MAX;
+      } else if (range_is_pipeline_negator_prefix(cmd, subcmd_start, after)) {
+        /* Keep a pending `!` with its following stage. Normalization strips
+         * the modifier after the complete range has been emitted. */
+        comment_start = UINT32_MAX;
+      }
+      pos = after;
       continue;
     }
 
@@ -1364,10 +1484,12 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
             }
             brace_group_stack[brace_group_stack_depth++] = SHELL_GROUP_SUBSHELL;
           }
+          uint32_t group_stage = subcmd_start;
+          uint32_t group_negation_count = range_pipeline_negation_prefix(
+              cmd, subcmd_start, pos, &group_stage);
           OPEN_GROUP(SHELL_GROUP_SUBSHELL, pos,
-                     range_is_pipeline_negator_prefix(cmd, subcmd_start, pos)
-                         ? SHELL_CMD_MOD_PIPE_NEGATED
-                         : 0);
+                     group_negation_count ? SHELL_CMD_MOD_PIPE_NEGATED : 0,
+                     group_negation_count);
           group_depth++, group_paren_depth++;
           group_kinds |= SHELL_GROUP_SUBSHELL;
           /* A group delimiter is syntax, not part of its first command. */
@@ -1489,16 +1611,29 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
     // inside arithmetic
     if (arith_depth == 0 && c == '<' && pos + 2 < cmd_len &&
         cmd[pos + 1] == '<' && cmd[pos + 2] == '<') {
-      uint32_t io_number_start =
-          source_io_number_start_before(cmd, pos, cmd_len);
-      bool trailing_group_redirect = last_closed_group_end != UINT32_MAX;
-      for (uint32_t probe = last_closed_group_end;
-           trailing_group_redirect && probe < pos; probe++)
-        trailing_group_redirect = isspace((unsigned char)cmd[probe]);
+      uint32_t redirect_prefix_start =
+          source_redirect_prefix_start_before(cmd, pos, cmd_len);
+      uint32_t negation_stage = subcmd_start;
+      uint32_t negation_count = range_pipeline_negation_prefix(
+          cmd, subcmd_start, pos, &negation_stage);
+      bool negated_document_stage =
+          negation_count != 0 && negation_stage == pos;
+      bool trailing_group_redirect =
+          last_closed_group_end != UINT32_MAX &&
+          shell_source_skip_inline_continuations(cmd, pos,
+                                                 last_closed_group_end) == pos;
+      if (!trailing_group_redirect && last_closed_group_end != UINT32_MAX &&
+          redirect_prefix_start > last_closed_group_end)
+        trailing_group_redirect =
+            shell_source_skip_inline_continuations(cmd, redirect_prefix_start,
+                                                   last_closed_group_end) ==
+            redirect_prefix_start;
       // End current subcommand if it has content (trim whitespace)
-      if (subcmd_idx < max_cmds && subcmd_start < pos) {
+      if (!negated_document_stage && subcmd_idx < max_cmds &&
+          subcmd_start < pos) {
         uint32_t s = subcmd_start;
-        uint32_t e = io_number_start >= subcmd_start ? io_number_start : pos;
+        uint32_t e =
+            redirect_prefix_start >= subcmd_start ? redirect_prefix_start : pos;
         while (s < e && isspace((unsigned char)cmd[s]))
           s++;
         while (e > s && isspace((unsigned char)cmd[e - 1]))
@@ -1507,6 +1642,7 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
           result->cmds[subcmd_idx].start = s;
           result->cmds[subcmd_idx].len = e - s;
           result->cmds[subcmd_idx].type = current_type;
+          result->cmds[subcmd_idx].pipe_input_mode = current_pipe_input_mode;
           result->cmds[subcmd_idx].features = 0;
           result->cmds[subcmd_idx].group_depth = group_depth;
           result->cmds[subcmd_idx].group_kinds = group_kinds;
@@ -1527,9 +1663,7 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
       uint32_t herestring_start = pos;
       pos += 3; // Skip <<<
 
-      // Skip whitespace
-      while (pos < cmd_len && isspace((unsigned char)cmd[pos]))
-        pos++;
+      pos = (uint32_t)shell_source_skip_inline_continuations(cmd, cmd_len, pos);
 
       // Find the complete shell word, including any quoted whitespace.
       uint32_t string_start = pos;
@@ -1551,14 +1685,20 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
         result->cmds[subcmd_idx].start = herestring_start;
         result->cmds[subcmd_idx].len = (pos - herestring_start);
         result->cmds[subcmd_idx].type = SHELL_TYPE_HERESTRING;
+        result->cmds[subcmd_idx].pipe_input_mode = current_pipe_input_mode;
         result->cmds[subcmd_idx].features = SHELL_FEAT_HERESTRING;
         result->cmds[subcmd_idx].group_depth = group_depth;
         result->cmds[subcmd_idx].group_kinds = group_kinds;
+        result->cmds[subcmd_idx].modifiers =
+            negated_document_stage ? SHELL_CMD_MOD_PIPE_NEGATED : 0;
+        result->cmds[subcmd_idx].pipeline_negation_count =
+            negated_document_stage ? negation_count : 0;
         subcmd_idx++;
 
         // Start next subcommand
         subcmd_start = pos;
         current_type = SHELL_TYPE_SIMPLE;
+        current_pipe_input_mode = SHELL_PIPE_MODE_NONE;
 
         // Skip whitespace to next token
         while (pos < cmd_len && isspace((unsigned char)cmd[pos]))
@@ -1571,30 +1711,42 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
     // arithmetic
     if (arith_depth == 0 && c == '<' && pos + 1 < cmd_len &&
         cmd[pos + 1] == '<') {
-      uint32_t io_number_start =
-          source_io_number_start_before(cmd, pos, cmd_len);
+      uint32_t redirect_prefix_start =
+          source_redirect_prefix_start_before(cmd, pos, cmd_len);
+      uint32_t negation_stage = subcmd_start;
+      uint32_t negation_count = range_pipeline_negation_prefix(
+          cmd, subcmd_start, pos, &negation_stage);
+      bool negated_document_stage =
+          negation_count != 0 && negation_stage == pos;
       /* A trailing group redirection may carry an io_number immediately
        * before `<<`.  It is still a redirect on the completed group, not a
        * synthetic command containing that number. */
-      bool trailing_group_redirect = last_closed_group_end != UINT32_MAX;
-      uint32_t trailing_probe = last_closed_group_end;
-      while (trailing_group_redirect && trailing_probe < pos &&
-             isspace((unsigned char)cmd[trailing_probe]))
-        trailing_probe++;
-      if (trailing_group_redirect && trailing_probe < pos) {
+      bool trailing_group_redirect =
+          last_closed_group_end != UINT32_MAX &&
+          shell_source_skip_inline_continuations(cmd, pos,
+                                                 last_closed_group_end) == pos;
+      if (!trailing_group_redirect) {
         size_t descriptor_after = 0;
         uint32_t descriptor = 0;
-        trailing_group_redirect =
-            shell_source_parse_io_number(cmd, trailing_probe, pos,
+        bool numeric_prefix =
+            shell_source_parse_io_number(cmd, redirect_prefix_start, pos,
                                          &descriptor_after, &descriptor) ==
                 SHELL_SOURCE_IO_NUMBER_VALID &&
             descriptor_after == pos;
+        trailing_group_redirect =
+            last_closed_group_end != UINT32_MAX &&
+            redirect_prefix_start > last_closed_group_end &&
+            shell_source_skip_inline_continuations(cmd, redirect_prefix_start,
+                                                   last_closed_group_end) ==
+                redirect_prefix_start &&
+            (numeric_prefix || redirect_prefix_start != pos);
       }
       // End current subcommand if it has content (trim whitespace)
-      if (!trailing_group_redirect && subcmd_idx < max_cmds &&
-          subcmd_start < pos) {
+      if (!trailing_group_redirect && !negated_document_stage &&
+          subcmd_idx < max_cmds && subcmd_start < pos) {
         uint32_t s = subcmd_start;
-        uint32_t e = io_number_start >= subcmd_start ? io_number_start : pos;
+        uint32_t e =
+            redirect_prefix_start >= subcmd_start ? redirect_prefix_start : pos;
         while (s < e && isspace((unsigned char)cmd[s]))
           s++;
         while (e > s && isspace((unsigned char)cmd[e - 1]))
@@ -1603,6 +1755,7 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
           result->cmds[subcmd_idx].start = s;
           result->cmds[subcmd_idx].len = e - s;
           result->cmds[subcmd_idx].type = current_type;
+          result->cmds[subcmd_idx].pipe_input_mode = current_pipe_input_mode;
           result->cmds[subcmd_idx].features = 0;
           result->cmds[subcmd_idx].group_depth = group_depth;
           result->cmds[subcmd_idx].group_kinds = group_kinds;
@@ -1625,7 +1778,7 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
       // so the marker range ends after the complete raw delimiter word.
       uint32_t heredoc_start = pos;
       if (!trailing_group_redirect)
-        heredoc_prefix_start = heredoc_start;
+        heredoc_prefix_start = redirect_prefix_start;
       size_t delimiter_position = (size_t)pos + 2;
       shell_source_pending_heredoc_t pending;
       bool delimiter_valid = shell_source_parse_heredoc_delimiter(
@@ -1655,14 +1808,20 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
         result->cmds[subcmd_idx].start = heredoc_start;
         result->cmds[subcmd_idx].len = (pos - heredoc_start); // << + delimiter
         result->cmds[subcmd_idx].type = SHELL_TYPE_HEREDOC;
+        result->cmds[subcmd_idx].pipe_input_mode = current_pipe_input_mode;
         result->cmds[subcmd_idx].features = SHELL_FEAT_HEREDOC;
         result->cmds[subcmd_idx].group_depth = group_depth;
         result->cmds[subcmd_idx].group_kinds = group_kinds;
+        result->cmds[subcmd_idx].modifiers =
+            negated_document_stage ? SHELL_CMD_MOD_PIPE_NEGATED : 0;
+        result->cmds[subcmd_idx].pipeline_negation_count =
+            negated_document_stage ? negation_count : 0;
         subcmd_idx++;
 
         // Start next subcommand after delimiter
         subcmd_start = pos;
         current_type = SHELL_TYPE_SIMPLE;
+        current_pipe_input_mode = SHELL_PIPE_MODE_NONE;
 
         // Skip whitespace to next token
         while (pos < cmd_len && isspace((unsigned char)cmd[pos]))
@@ -1712,6 +1871,7 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
         pos++;
         subcmd_start = pos;
         current_type = SHELL_TYPE_BACKGROUND;
+        current_pipe_input_mode = SHELL_PIPE_MODE_NONE;
         comment_start = UINT32_MAX;
         last_closed_group_end = UINT32_MAX;
         continue;
@@ -1736,6 +1896,7 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
             result->cmds[subcmd_idx].start = s;
             result->cmds[subcmd_idx].len = e - s;
             result->cmds[subcmd_idx].type = current_type;
+            result->cmds[subcmd_idx].pipe_input_mode = current_pipe_input_mode;
             result->cmds[subcmd_idx].features = 0;
             result->cmds[subcmd_idx].group_depth = group_depth;
             result->cmds[subcmd_idx].group_kinds = group_kinds;
@@ -1749,6 +1910,7 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
         pos += 2;
         subcmd_start = pos;
         current_type = SHELL_TYPE_AND;
+        current_pipe_input_mode = SHELL_PIPE_MODE_NONE;
         last_closed_group_end = UINT32_MAX;
         continue;
       }
@@ -1772,6 +1934,7 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
             result->cmds[subcmd_idx].start = s;
             result->cmds[subcmd_idx].len = e - s;
             result->cmds[subcmd_idx].type = current_type;
+            result->cmds[subcmd_idx].pipe_input_mode = current_pipe_input_mode;
             result->cmds[subcmd_idx].features = 0;
             result->cmds[subcmd_idx].group_depth = group_depth;
             result->cmds[subcmd_idx].group_kinds = group_kinds;
@@ -1785,6 +1948,7 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
         pos += 2;
         subcmd_start = pos;
         current_type = SHELL_TYPE_OR;
+        current_pipe_input_mode = SHELL_PIPE_MODE_NONE;
         last_closed_group_end = UINT32_MAX;
         continue;
       }
@@ -1808,6 +1972,7 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
             result->cmds[subcmd_idx].start = s;
             result->cmds[subcmd_idx].len = e - s;
             result->cmds[subcmd_idx].type = current_type;
+            result->cmds[subcmd_idx].pipe_input_mode = current_pipe_input_mode;
             result->cmds[subcmd_idx].features = 0;
             result->cmds[subcmd_idx].group_depth = group_depth;
             result->cmds[subcmd_idx].group_kinds = group_kinds;
@@ -1820,9 +1985,13 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
         // Start new subcommand with PIPELINE type
         if (subcmd_idx > 0)
           result->cmds[subcmd_idx - 1].features |= SHELL_FEAT_PIPELINE;
-        pos++;
+        bool pipe_stderr = pos + 1 < cmd_len && cmd[pos + 1] == '&';
+        pos += pipe_stderr ? 2 : 1;
         subcmd_start = pos;
         current_type = SHELL_TYPE_PIPELINE;
+        current_pipe_input_mode = pipe_stderr
+                                      ? SHELL_PIPE_MODE_STDOUT_AND_STDERR
+                                      : SHELL_PIPE_MODE_STDOUT;
         last_closed_group_end = UINT32_MAX;
         continue;
       }
@@ -1830,6 +1999,17 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
       // Handle ; and newlines as command separators
       if (c == ';' || c == '\n' || c == '\r') {
         // End current subcommand (trim whitespace)
+        bool pending_list_continuation =
+            (current_type == SHELL_TYPE_PIPELINE ||
+             current_type == SHELL_TYPE_AND || current_type == SHELL_TYPE_OR) &&
+            source_range_is_list_continuation_trivia(cmd, subcmd_start,
+                                                     pos + 1);
+        /* Unlike a binary list connector, a leading `!` cannot cross a raw
+         * comment or physical line ending. Recognize only a same-logical-line
+         * modifier prefix so strict validation rejects an incomplete pipeline
+         * rather than treating the reserved word as an executable command. */
+        bool pending_pipeline_negation =
+            range_is_pipeline_negator_prefix(cmd, subcmd_start, pos + 1);
         if (subcmd_start < pos) {
           if (subcmd_idx >= max_cmds) {
             result->status = SHELL_STATUS_TRUNCATED;
@@ -1842,10 +2022,16 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
             s++;
           while (e > s && isspace((unsigned char)cmd[e - 1]))
             e--;
-          if (s < e) {
+          /* POSIX linebreaks after a pending pipeline or AND/OR connector
+           * continue the next stage. The full tokenizer already recognizes
+           * this grammar; retain the fast parser's connector metadata rather
+           * than silently turning it into a semicolon relation. */
+          if (s < e && !pending_list_continuation &&
+              !pending_pipeline_negation) {
             result->cmds[subcmd_idx].start = s;
             result->cmds[subcmd_idx].len = e - s;
             result->cmds[subcmd_idx].type = current_type;
+            result->cmds[subcmd_idx].pipe_input_mode = current_pipe_input_mode;
             result->cmds[subcmd_idx].features = 0;
             result->cmds[subcmd_idx].group_depth = group_depth;
             result->cmds[subcmd_idx].group_kinds = group_kinds;
@@ -1855,10 +2041,23 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
           }
         }
 
+        if (pending_list_continuation) {
+          pos++;
+          subcmd_start = pos;
+          comment_start = UINT32_MAX;
+          continue;
+        }
+        if (pending_pipeline_negation) {
+          pos++;
+          comment_start = UINT32_MAX;
+          continue;
+        }
+
         // Start new subcommand with SEMICOLON type
         pos++;
         subcmd_start = pos;
         current_type = SHELL_TYPE_SEMICOLON;
+        current_pipe_input_mode = SHELL_PIPE_MODE_NONE;
         comment_start = UINT32_MAX;
         last_closed_group_end = UINT32_MAX;
         continue;
@@ -1919,9 +2118,8 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
               SHELL_SOURCE_IO_NUMBER_VALID)
             pos = (uint32_t)target_after;
         }
-        // Skip whitespace
-        while (pos < cmd_len && isspace((unsigned char)cmd[pos]))
-          pos++;
+        pos =
+            (uint32_t)shell_source_skip_inline_continuations(cmd, cmd_len, pos);
         // Validate: redirect must be followed by a valid target
         // Check for end of input or invalid next character
         if (pos >= cmd_len) {
@@ -1949,10 +2147,13 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
           result->count = subcmd_idx;
           return SHELL_EPARSE;
         }
-        // Redirect target can't be an operator, except process substitution.
+        // Redirect target can't be an operator or an unquoted comment,
+        // except process substitution.  Inline continuations have already
+        // been removed; an ordinary physical line break remains an error.
         if (!process_sub_target &&
             (next_ch == '<' || next_ch == '>' || next_ch == '|' ||
-             next_ch == ';' || next_ch == '&' || next_ch == '\n')) {
+             next_ch == ';' || next_ch == '&' || next_ch == '#' ||
+             next_ch == '\n' || next_ch == '\r')) {
           result->status = SHELL_STATUS_ERROR;
           result->count = subcmd_idx;
           return SHELL_EPARSE;
@@ -1999,6 +2200,7 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
       result->cmds[subcmd_idx].start = start_pos;
       result->cmds[subcmd_idx].len = end_pos - start_pos;
       result->cmds[subcmd_idx].type = current_type;
+      result->cmds[subcmd_idx].pipe_input_mode = current_pipe_input_mode;
       result->cmds[subcmd_idx].features = 0;
       result->cmds[subcmd_idx].group_depth = group_depth;
       result->cmds[subcmd_idx].group_kinds = group_kinds;
@@ -2078,8 +2280,10 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
     return SHELL_EPARSE;
   }
 
-  // Reject input that is only redirects/separators with no actual command
-  // content.
+  /* A comment-only source is valid but has no executable range. Redirects
+   * without an operand and incomplete list operators have already returned
+   * from the structural scan above, so no second raw-byte operator pass is
+   * needed here. */
   if (subcmd_idx == 0) {
     if (source_is_comment_only(cmd, cmd_len)) {
       result->count = 0;
@@ -2087,50 +2291,9 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
       result->status = SHELL_STATUS_OK;
       return SHELL_OK;
     }
-    bool has_valid_content = false;
-    for (size_t i = 0; i < cmd_len; i++) {
-      char ch = cmd[i];
-      if (isspace((unsigned char)ch))
-        continue;
-
-      // Skip redirect operators
-      if (ch == '<' || ch == '>') {
-        // Check for multi-char redirects: <<, >>, <<<, &>, &>>
-        if (i + 1 < cmd_len && (cmd[i + 1] == '<' || cmd[i + 1] == '>')) {
-          i++; // skip second char
-          // Check for <<< or &>>/&<<
-          if (i + 1 < cmd_len && (cmd[i + 1] == '<' || cmd[i + 1] == '>')) {
-            i++;
-          }
-          continue;
-        }
-        // Check for &> or &<
-        if (ch == '&' && i + 1 < cmd_len) {
-          i++;
-          continue;
-        }
-        continue;
-      }
-
-      // Skip separators
-      if (ch == ';' || ch == '|' || ch == '&') {
-        // Skip && or ||
-        if (i + 1 < cmd_len && cmd[i + 1] == ch) {
-          i++;
-        }
-        continue;
-      }
-
-      // Found actual content - this is valid
-      has_valid_content = true;
-      break;
-    }
-
-    if (!has_valid_content) {
-      result->status = SHELL_STATUS_ERROR;
-      result->count = 0;
-      return SHELL_EPARSE;
-    }
+    result->status = SHELL_STATUS_ERROR;
+    result->count = 0;
+    return SHELL_EPARSE;
   }
 
   // Ensure each parsed subcommand has real content beyond redirect/separator
@@ -2165,31 +2328,9 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
     return SHELL_EPARSE;
   }
 
-  // A trailing semicolon terminates the command list and is valid shell
-  // syntax. Other trailing operators still require a following command.
-  if (subcmd_idx > 0) {
-    // Get the last subcommand
-    uint32_t last_start = result->cmds[subcmd_idx - 1].start;
-    uint32_t last_len = result->cmds[subcmd_idx - 1].len;
-
-    if (last_len > 0) {
-      // Check if the last subcommand ends with |, ;, or &
-      char last_char = cmd[last_start + last_len - 1];
-      if (last_char == '|' || last_char == ';' || last_char == '&') {
-        // Check it's not && or ||
-        if (!(last_len >= 2 && cmd[last_start + last_len - 2] == last_char)) {
-          // Trailing separator without valid continuation
-          result->status = SHELL_STATUS_ERROR;
-          result->count = subcmd_idx;
-          return SHELL_EPARSE;
-        }
-      }
-    }
-  }
-
-  // Also check for the case where we have a trailing separator but no
-  // subcommand after it. This happens with "cmd |" where the | sets
-  // subcmd_start past the end.
+  /* A literal final '|', ';', or '&' may be quoted or escaped. The scanner's
+   * pending list state, rather than a raw source-byte check, is authoritative
+   * for an actual trailing operator. */
   if (subcmd_start >= cmd_len && subcmd_idx > 0) {
     // The last thing we saw was a separator - check what type
     // If current_type is PIPELINE/SEMICOLON/AND/OR, we have a trailing

@@ -5,6 +5,7 @@
 #include "shell_tokenizer_full.h"
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -20,22 +21,32 @@ extern "C" {
 typedef struct {
   const char *original_command; // Owned full command-stage text
   // Token text points into original_command, and positions are relative to it.
-  shell_token_t *shell_tokens;   // Shell operators and redirections
-  size_t shell_token_count;      // Number of shell tokens
-  shell_token_t *command_tokens; // Command arguments only
-  size_t command_token_count;    // Number of command arguments
-  bool has_pipe_input;           // Has pipe input (|)
-  bool has_pipe_output;          // Has pipe output (|)
-  bool pipeline_negated;         // Belongs to a POSIX ! pipeline
-  bool has_redirections;         // Has any redirections
-  bool has_error_redirection;    // Has stderr redirection (2>, &>, or &>>)
+  shell_token_t *shell_tokens;        // Shell operators and redirections
+  size_t shell_token_count;           // Number of shell tokens
+  shell_token_t *command_tokens;      // Command arguments only
+  size_t command_token_count;         // Number of command arguments
+  bool has_pipe_input;                // Has pipe input (| or |&)
+  bool has_pipe_output;               // Has pipe output (| or |&)
+  shell_pipe_mode_t pipe_output_mode; // stdout or stdout+stderr pipe output
+  uint32_t pipeline_negation_count;   // Every leading `!` pipeline modifier
+  bool pipeline_negated;              // Effective odd-count status inversion
+  bool has_redirections;              // Has any redirections
+  bool has_error_redirection;         // Has stderr redirection (2>, &>, or &>>)
 } shell_command_info_t;
+
+/* `shell_group_io_op_t` has no concrete descriptor when it describes a list
+ * relation. A Bash `{name}OPword` redirect instead allocates a descriptor at
+ * execution time, so its identity is dynamic but must remain distinct from
+ * that no-descriptor state. The source span retains the identifier spelling. */
+#define SHELL_PROCESS_FD_NONE UINT32_MAX
+#define SHELL_PROCESS_FD_NAMED (UINT32_MAX - 1u)
 
 /* One source-order I/O or execution-list operation attached to a complete
  * compound group rather than any one of its enclosed simple commands.
  * Descriptor duplication and close semantics are order-sensitive: consumers
  * that model descriptor routing must apply consecutive operations in this
- * order. */
+ * order. When the same `|` or `|&` spelling contributes a relation to both
+ * adjacent groups, its output relation precedes its input relation. */
 typedef enum {
   SHELL_GROUP_IO_READ_FILE,
   SHELL_GROUP_IO_WRITE_FILE,
@@ -62,21 +73,29 @@ typedef enum {
    * evaluates the nested process but establishes no modeled byte route between
    * the group descriptor and that process. */
   SHELL_GROUP_IO_PROCESS_SUB_UNROUTED,
+  /* Bash `|&` joins stderr to stdout after local group redirections.  Keep
+   * this additive public value last so existing enum values remain stable. */
+  SHELL_GROUP_IO_PIPE_OUTPUT_STDERR,
 } shell_group_io_kind_t;
 
 /** Source-relative metadata for one group-owned I/O operation. `source_*`
  * covers the complete operator and operand; `operand_*` isolates the operand
- * and excludes deferred heredoc body data. `fd` is always the effective file
- * descriptor. `target_fd` is meaningful only for SHELL_GROUP_IO_DUP_FD and
- * is UINT32_MAX for every other operation. Explicit descriptor values are
- * limited to INT_MAX, leaving UINT32_MAX as an unambiguous no-descriptor
- * sentinel. Process-substitution kinds retain
+ * and excludes deferred heredoc body data. `fd` is the effective numeric file
+ * descriptor, SHELL_PROCESS_FD_NAMED for a dynamic Bash `{name}` descriptor,
+ * or SHELL_PROCESS_FD_NONE for a non-descriptor list relation. `target_fd` is
+ * meaningful only for SHELL_GROUP_IO_DUP_FD and is SHELL_PROCESS_FD_NONE for
+ * every other operation. Explicit descriptor values are limited to INT_MAX.
+ * A combined `&>` or `&>>` redirect has two same-span operations, ordered fd
+ * 1 then fd 2. Process-substitution kinds retain
  * the complete `<(command)` or `>(command)` operand, rather than representing
  * it as a file. The caller retains the source input while inspecting these
- * spans. PROCESS_SUB_UNROUTED retains valid process-substitution syntax that
- * has no direct byte relation in the graph. The read/write process-substitution
- * kinds identify the operand's known stream direction without representing it
- * as a filesystem path. */
+ * spans. Concatenated operands such as `<(command)suffix` use FILE kinds;
+ * only a whole-operand process substitution uses a PROCESS_SUB kind. The
+ * caller must not infer a direct stream route from a substitution substring in
+ * a FILE operand. PROCESS_SUB_UNROUTED retains valid process-substitution
+ * syntax that has no direct byte relation in the graph. The read/write
+ * process-substitution kinds identify the operand's known stream direction
+ * without representing it as a filesystem path. */
 typedef struct {
   uint16_t group_index;
   uint32_t source_start;
@@ -89,13 +108,20 @@ typedef struct {
 } shell_group_io_op_t;
 
 /** Owned canonical command result with the structural group descriptors from
- * the same source command. `commands` has one entry per retained
+ * the same source command. `commands` has one entry per retained executable
  * simple-command range; each group's first_command and command_count index
- * this array, not the source fast-parser ranges.
- * group-attached I/O and external pipeline state are represented by ordered
+ * this array, not the source fast-parser ranges. An argv-less redirect-only
+ * operation, such as `>output`, has no `shell_command_info_t` entry. Inspect
+ * the dependency graph, or paired anomaly netsequences (an empty raw record
+ * paired with a typed record containing empty argv[0]), when a caller needs
+ * every structural source stage. `commands` is NULL exactly when
+ * `command_count` is zero and is therefore never an
+ * authorization-complete view of the source on its own. Group-attached I/O
+ * and external pipeline state are represented by ordered
  * `group_io_ops`, never attributed to the final enclosed command. Several
- * operations may share a group index and preserve source order; group indexes
- * refer to `groups`, whose source spans remain authoritative. */
+ * operations may share a group index and preserve source order; paired
+ * pipeline relations with the same source span are output then input. Group
+ * indexes refer to `groups`, whose source spans remain authoritative. */
 typedef struct {
   shell_command_info_t *commands;
   size_t command_count;
@@ -130,15 +156,24 @@ typedef struct {
  * Separates shell logic from command arguments. On
  * success, returned command metadata owns all text it refers to and remains
  * valid independently of command_line. Use shell_render_netargv() for the
- * canonical processed-subcommand representation. This flat record API retains
- * the full tokenizer's tolerant lexical handling for incomplete source, while
- * shell_process_commands() requires a complete form it can model. Recognized
- * POSIX control compounds (loops,
- * conditionals, and case statements) are not modeled and return
- * SHELL_PROCESS_EPARSE. Supported compound groups contain simple-command
- * lists, pipelines, and nested brace/subshell groups; callers must not infer
- * support for POSIX control compounds from group support. On failure, writable
- * outputs are set to NULL and zero.
+ * canonical processed-subcommand representation. This legacy flat API retains
+ * every lexical simple-command record, including a valid argv-less
+ * redirect-only operation with command_token_count == 0. Its empty rendering
+ * is diagnostic metadata, not an executable netargv or policy input. The
+ * structured API omits those records, while paired anomaly netsequences retain
+ * their explicit empty-stage sentinel for callers that need every stage.
+ *
+ * It retains the full tokenizer's tolerant lexical handling for incomplete
+ * parenthesized source, but rejects impossible list-operator chains just like
+ * the structured APIs. shell_process_commands() requires a complete form it can
+ * model. Recognized control compounds (loops, conditionals, `case`, `select`,
+ * `coproc`, and function declarations), shell-semantic array assignments,
+ * references, and declarations, and unmodeled Bash forms (`[[ … ]]`,
+ * `(( … ))`, leading `time` pipelines, locale quotes `$"…"`, and case
+ * fall-through `;&` / `;;&`) return SHELL_PROCESS_EPARSE. Supported compound
+ * groups contain simple-command lists, pipelines, and nested brace/subshell
+ * groups; callers must not infer support for control compounds from group
+ * support. On failure, writable outputs are set to NULL and zero.
  */
 shell_process_status_t
 shell_process_command(const char *command_line, size_t command_length,
@@ -150,9 +185,10 @@ shell_process_command(const char *command_line, size_t command_length,
  * brace/subshell group descriptors from the same source. The fixed semantic
  * model accepts at most SHELL_MAX_SUBCOMMANDS ranges and returns
  * SHELL_PROCESS_EOUTPUT_LIMIT beyond that capacity. Group contents may be
- * simple-command lists, pipelines, and nested groups. Control compounds
- * return SHELL_PROCESS_EPARSE. The result owns all returned storage and is
- * cleared on failure. */
+ * simple-command lists, pipelines, and nested groups. Redirect-only simple
+ * operations are omitted from `result->commands` as documented on
+ * shell_processed_commands_t. Control compounds return SHELL_PROCESS_EPARSE.
+ * The result owns all returned storage and is cleared on failure. */
 shell_process_status_t
 shell_process_commands(const char *command_line, size_t command_length,
                        const shell_process_limits_t *limits,

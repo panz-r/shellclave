@@ -46,7 +46,7 @@ typedef enum {
  */
 typedef enum {
   SHELL_TYPE_SIMPLE = 0,             // Single command, no separator
-  SHELL_TYPE_PIPELINE = 1 << 8,      // Preceded by literal |
+  SHELL_TYPE_PIPELINE = 1 << 8,      // Preceded by literal | or |&
   SHELL_TYPE_AND = 1 << 9,           // Preceded by &&
   SHELL_TYPE_OR = 1 << 10,           // Preceded by ||
   SHELL_TYPE_SEMICOLON = 1 << 11,    // Preceded by ;
@@ -55,6 +55,15 @@ typedef enum {
   SHELL_TYPE_SUBSTITUTION = 1 << 14, // Command/process substitution operator
   SHELL_TYPE_BACKGROUND = 1 << 15,   // Preceded by a background '&'
 } shell_cmd_type_t;
+
+/* The byte streams connected by a pipeline operator. A range not preceded by
+ * a pipeline uses NONE; a range following `|` or `|&` records that connector's
+ * mode, including a document-only heredoc or here-string range. */
+typedef enum {
+  SHELL_PIPE_MODE_NONE = 0,
+  SHELL_PIPE_MODE_STDOUT,
+  SHELL_PIPE_MODE_STDOUT_AND_STDERR,
+} shell_pipe_mode_t;
 
 /* Orthogonal syntactic modifiers. Unlike shell_cmd_type_t these describe the
  * complete command/pipeline rather than the separator before one range. */
@@ -76,21 +85,21 @@ typedef enum {
  */
 typedef enum {
   SHELL_FEAT_NONE = 0,
-  SHELL_FEAT_VARS = 1 << 0,                  // $VAR, ${VAR}, $1, etc.
-  SHELL_FEAT_GLOBS = 1 << 1,                 // *, ?, [abc]
-  SHELL_FEAT_SUBSHELL = 1 << 2,              // $(...), `...`
-  SHELL_FEAT_ARITH = 1 << 3,                 // $((...))
-  SHELL_FEAT_HEREDOC = 1 << 4,               // << delimiter (in subcommand)
-  SHELL_FEAT_HERESTRING = 1 << 5,            // <<< here-string (in subcommand)
-  SHELL_FEAT_PROCESS_SUB = 1 << 6,           // <(cmd), >(cmd)
-  SHELL_FEAT_LOOPS = 1 << 7,                 // while, for, until loops
-  SHELL_FEAT_CONDITIONALS = 1 << 8,          // if/then/elif/else/fi
-  SHELL_FEAT_CASE = 1 << 9,                  // case/esac statements
-  SHELL_FEAT_SUBSHELL_FILE = 1 << 10,        // $(<file) - read from file
-  SHELL_FEAT_PIPELINE = 1 << 11,             // literal | pipeline construct
-  SHELL_FEAT_GROUP = UINT32_C(1) << 12,      // Command group
-  SHELL_FEAT_BACKGROUND = UINT32_C(1) << 13, // Background execution
-  SHELL_FEAT_EXTGLOB = UINT32_C(1) << 14,    // Bash extglob pattern
+  SHELL_FEAT_VARS = 1 << 0,             // $VAR, ${VAR}, $1, etc.
+  SHELL_FEAT_GLOBS = 1 << 1,            // *, ?, [abc]
+  SHELL_FEAT_SUBSHELL = 1 << 2,         // $(...), `...`
+  SHELL_FEAT_ARITH = 1 << 3,            // $((...))
+  SHELL_FEAT_HEREDOC = 1 << 4,          // << delimiter (in subcommand)
+  SHELL_FEAT_HERESTRING = 1 << 5,       // <<< here-string (in subcommand)
+  SHELL_FEAT_PROCESS_SUB = 1 << 6,      // <(cmd), >(cmd)
+  SHELL_FEAT_LOOPS = 1 << 7,            // while, for, until loops
+  SHELL_FEAT_CONDITIONALS = 1 << 8,     // if/then/elif/else/fi
+  SHELL_FEAT_CASE = 1 << 9,             // case/esac statements
+  SHELL_FEAT_SUBSHELL_FILE = 1 << 10,   // $(<file) - read from file
+  SHELL_FEAT_PIPELINE = 1 << 11,        // literal | or |& pipeline construct
+  SHELL_FEAT_GROUP = UINT32_C(1) << 12, // Command group
+  SHELL_FEAT_BACKGROUND = UINT32_C(1) << 13,   // Background execution
+  SHELL_FEAT_EXTGLOB = UINT32_C(1) << 14,      // Bash extglob pattern
   SHELL_FEAT_ANSI_C_QUOTE = UINT32_C(1) << 15, // Bash $'...' quote
   SHELL_FEAT_ARRAY = UINT32_C(1) << 16,    // Bash array assignment/reference
   SHELL_FEAT_NAMED_FD = UINT32_C(1) << 17, // Bash {name} redirect
@@ -169,13 +178,18 @@ const char *shell_error_string(shell_error_t err);
  * Zero-copy subcommand - just indices into original command
  */
 typedef struct {
-  uint32_t start;       // Index in command string
-  uint32_t len;         // Length
-  uint16_t type;        // shell_cmd_type_t
-  uint16_t modifiers;   // shell_cmd_modifier_t
-  uint32_t features;    // shell_cmd_features_t
-  uint16_t group_depth; // Enclosing command-group nesting depth
-  uint8_t group_kinds;  // shell_group_kind_t bitset of enclosing groups
+  uint32_t start;     // Index in command string
+  uint32_t len;       // Length
+  uint16_t type;      // shell_cmd_type_t
+  uint16_t modifiers; // shell_cmd_modifier_t
+  /* Number of leading `!` pipeline modifiers. `modifiers` retains the
+   * compatible nonzero indication; callers derive the effective inversion
+   * from this count's parity. */
+  uint32_t pipeline_negation_count;
+  uint8_t pipe_input_mode; // shell_pipe_mode_t for a preceding pipeline
+  uint32_t features;       // shell_cmd_features_t
+  uint16_t group_depth;    // Enclosing command-group nesting depth
+  uint8_t group_kinds;     // shell_group_kind_t bitset of enclosing groups
 } shell_range_t;
 
 /** A complete compound-command half-open span [start, end), including the
@@ -192,6 +206,7 @@ typedef struct {
   uint16_t parent;
   uint8_t kind;       // Exactly one shell_group_kind_t value
   uint16_t modifiers; // shell_cmd_modifier_t on this compound pipeline member
+  uint32_t pipeline_negation_count;
 } shell_group_t;
 
 /**

@@ -13,7 +13,7 @@
  *   D = absolute discount (default 0.5)
  *
  * Serialisation uses a binary format with length-prefixed keys:
- *   Header (text):  # anomaly-model-v6\n
+ *   Header (text):  # anomaly-model-v7\n
  *                   # alpha unk_prior D total_uni total_bi total_tri total_quad
  * vocab_size unk_count\n Entry (binary): uint8_t type; uint32_t key_len;
  * uint8_t key[key_len]; uint64_t count; uint8_t nl; type values: 1='U', 2='B',
@@ -43,7 +43,7 @@
 
 /* A key is a concatenation of up to four canonical netstrings. A maximum
  * payload needs four decimal digits, a colon, and a trailing comma. */
-#define SG_ANOMALY_MAX_KEY_LENGTH (4U * (SG_ANOMALY_MAX_COMMAND_LENGTH + 6U))
+#define SG_ANOMALY_MAX_KEY_LENGTH (4U * (SG_ANOMALY_MAX_STAGE_LENGTH + 6U))
 
 static sg_anomaly_status_t anomaly_status_from_errno(int error) {
   switch (error) {
@@ -121,7 +121,7 @@ static size_t build_key(char *buf, size_t buf_size,
   if (!buf || !items || item_count == 0)
     return 0;
   for (size_t i = 0; i < item_count; i++) {
-    if (!items[i].data || items[i].length == 0 || used >= buf_size)
+    if (!items[i].data || used >= buf_size)
       return 0;
     size_t record_length = 0;
     if (shell_netstring_encoded_length(items[i].length, &record_length) !=
@@ -397,7 +397,7 @@ static double kn_logprob(const sg_anomaly_model_t *m, const anomaly_bytes_t *p3,
 /* --- SCORING --- */
 
 static bool command_is_scorable(anomaly_bytes_t command) {
-  return command.data && command.length != 0;
+  return command.data != NULL;
 }
 
 /* The length cap bounds the memory a single key can consume, so it constrains
@@ -407,7 +407,7 @@ static bool command_is_scorable(anomaly_bytes_t command) {
  * instead would return INFINITY and suppress detection entirely. */
 static bool command_is_valid(anomaly_bytes_t command) {
   return command_is_scorable(command) &&
-         command.length <= SG_ANOMALY_MAX_COMMAND_LENGTH;
+         command.length <= SG_ANOMALY_MAX_STAGE_LENGTH;
 }
 
 static sg_anomaly_status_t netstring_status(shell_netstring_status_t status) {
@@ -431,10 +431,7 @@ static sg_anomaly_status_t validate_netseq(const char *netseq, size_t length,
   shell_netstring_view_t view;
   while ((net_status = shell_netstring_iter_next(&iter, &view)) ==
          SHELL_NETSTRING_OK) {
-    if (view.payload_length == 0)
-      return SG_ANOMALY_ERR_FORMAT;
-    if (enforce_item_limit &&
-        view.payload_length > SG_ANOMALY_MAX_COMMAND_LENGTH)
+    if (enforce_item_limit && view.payload_length > SG_ANOMALY_MAX_STAGE_LENGTH)
       return SG_ANOMALY_ERR_LIMIT;
     (*count)++;
   }
@@ -592,7 +589,7 @@ int sg_anomaly_write_stream(const sg_anomaly_model_t *model, FILE *f) {
     errno = EINVAL;
     return -1;
   }
-  if (fprintf(f, "# anomaly-model-v6\n") < 0 ||
+  if (fprintf(f, "# anomaly-model-v7\n") < 0 ||
       fprintf(f, "# %.17g %.17g %.17g %zu %zu %zu %zu %zu %zu\n", model->alpha,
               model->unk_prior, model->kn_discount, model->total_uni,
               model->total_bi, model->total_tri, model->total_quad,
@@ -631,15 +628,15 @@ sg_anomaly_status_t sg_anomaly_model_save(const sg_anomaly_model_t *model,
 }
 
 static bool serialized_key_valid(const char *key, size_t length,
-                                 size_t components) {
+                                 size_t components, bool allow_empty_items) {
   shell_netstring_iter_t iter;
   if (shell_netstring_iter_init(&iter, key, length) != SHELL_NETSTRING_OK)
     return false;
   shell_netstring_view_t view;
   for (size_t i = 0; i < components; i++) {
     if (shell_netstring_iter_next(&iter, &view) != SHELL_NETSTRING_OK ||
-        view.payload_length == 0 ||
-        view.payload_length > SG_ANOMALY_MAX_COMMAND_LENGTH)
+        (!allow_empty_items && view.payload_length == 0) ||
+        view.payload_length > SG_ANOMALY_MAX_STAGE_LENGTH)
       return false;
   }
   return shell_netstring_iter_next(&iter, &view) == SHELL_NETSTRING_DONE;
@@ -652,11 +649,17 @@ static bool serialized_line_end(const char *text) {
 
 static int load_anomaly_stream(sg_anomaly_model_t *model, FILE *f) {
   char line[256];
-  if (!fgets(line, sizeof(line), f) ||
-      (strcmp(line, "# anomaly-model-v6\n") != 0 &&
-       strcmp(line, "# anomaly-model-v6\r\n") != 0)) {
+  if (!fgets(line, sizeof(line), f)) {
     if (ferror(f))
       return -1;
+    errno = EPROTO;
+    return -1;
+  }
+  bool allow_empty_items = strcmp(line, "# anomaly-model-v7\n") == 0 ||
+                           strcmp(line, "# anomaly-model-v7\r\n") == 0;
+  bool legacy_v6 = strcmp(line, "# anomaly-model-v6\n") == 0 ||
+                   strcmp(line, "# anomaly-model-v6\r\n") == 0;
+  if (!allow_empty_items && !legacy_v6) {
     errno = EPROTO;
     return -1;
   }
@@ -704,7 +707,8 @@ static int load_anomaly_stream(sg_anomaly_model_t *model, FILE *f) {
         fread(&count, sizeof(count), 1, f) != 1 || count == 0 ||
         count > INT64_MAX || count > SIZE_MAX ||
         fread(&newline, 1, 1, f) != 1 || newline != '\n' || type < 1 ||
-        type > 4 || !serialized_key_valid(key, key_len, type)) {
+        type > 4 ||
+        !serialized_key_valid(key, key_len, type, allow_empty_items)) {
       if (ferror(f))
         return -1;
       errno = EPROTO;

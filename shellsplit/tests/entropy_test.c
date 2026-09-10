@@ -59,6 +59,7 @@ static int test_known_entropy_values(void) {
                 cases[i].conditional, 1e-12));
   }
   ASSERT(shell_env_screener_calculate_entropy(NULL) == 0.0);
+  ASSERT(shell_rpe_ngram_entropy("", 2) == 0.0);
   ASSERT(isnan(shell_rpe_ngram_entropy(NULL, 1)));
   ASSERT(isnan(shell_rpe_ngram_entropy("abcd", 0)));
   ASSERT(isnan(shell_rpe_ngram_entropy("abcd", 3)));
@@ -174,6 +175,7 @@ static int test_detector_matrices(void) {
                 {"YWJjZA==", 0, 1, 0},
                 {"AAA=", 0, 1, 0},
                 {"AA==", 0, 1, 0},
+                {"==", 0, 0, 0},
                 {"A=AA", 0, 0, 0},
                 {"AAA", 0, 0, 0},
                 {"QUJDRA", 0, 0, 0},
@@ -270,6 +272,17 @@ static int test_environment_scan_contract(void) {
   environ = NULL;
   count = SIZE_MAX;
   ASSERT(shell_env_screener_scan(indices, 3, &count, 0.5, 8) ==
+         SHELL_ENV_SCREENER_OK);
+  ASSERT(count == 0);
+
+  /* Long names bypass the fixed whitelist buffer. A non-secret long name
+   * must still be scored safely when no bounded secret pattern is present. */
+  char long_named_plain[320];
+  memset(long_named_plain, 'X', 256);
+  memcpy(long_named_plain + 256, "=ordinary-value", sizeof("=ordinary-value"));
+  char *plain_environ[] = {long_named_plain, NULL};
+  environ = plain_environ;
+  ASSERT(shell_env_screener_scan(indices, 3, &count, 1.0, 8) ==
          SHELL_ENV_SCREENER_OK);
   ASSERT(count == 0);
 

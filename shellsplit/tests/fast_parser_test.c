@@ -1,8 +1,11 @@
 #include "../src/shell_source_internal.h"
+#include "../src/shell_tokenizer_full_internal.h"
+#include "shell_abstract.h"
 #include "shell_depgraph.h"
 #include "shell_processor.h"
 #include "shell_tokenizer.h"
 #include "shell_tokenizer_full.h"
+#include "shell_transform.h"
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1118,7 +1121,7 @@ void test_layer3_boundary_edge(void) {
   printf("\n--- Layer 3: Boundary and Edge ---\n");
 
   shell_parse_result_t result;
-  shell_limits_t limits;
+  shell_limits_t limits = {.strict_mode = true};
 
   // Exactly at subcommand limit
   limits.max_subcommands = 5;
@@ -1656,6 +1659,151 @@ static void test_source_scanner_contract(void) {
            rejects_dangling_escape && rejects_unclosed_quote &&
            rejects_unclosed_substitution && rejects_unclosed_arithmetic);
 
+  static const struct {
+    const char *expansion;
+    size_t trailing_word_bytes;
+  } parameter_expansions[] = {
+      {"${value:-left|&right}", 0},
+      {"${value:-left>file}", 0},
+      {"${value:-${fallback:-one}}", 0},
+      {"${value#prefix${suffix}}", 0},
+      {"${value##prefix${suffix}}", 0},
+      {"${value%prefix${suffix}}", 0},
+      {"${value%%prefix${suffix}}", 0},
+      {"${value/pattern/${replacement}}", 0},
+      {"${value:-{left,right}}", 1},
+      {"${value:-${fallback:-{}}", 0},
+      {"${value:-{}", 0},
+      {"${value#{}", 0},
+      {"${value/{}", 0},
+      {"${array[${index}]}", 0},
+      {"${#value}", 0},
+      {"${##prefix}", 0},
+      {"${!prefix*}", 0},
+      {"${!prefix@}", 0},
+      {"${10}", 0},
+      {"${?}", 0},
+      {"${#?}", 0},
+      {"${value:-$'a|b'}", 0},
+      {"${value:-$((1 | 2))}", 0},
+      {"${value:-$(printf '|')}", 0},
+      {"${value:-<(printf '|')}", 0},
+  };
+  bool parameter_contract = true;
+  for (size_t i = 0;
+       parameter_contract &&
+       i < sizeof(parameter_expansions) / sizeof(parameter_expansions[0]);
+       i++) {
+    const char *expansion = parameter_expansions[i].expansion;
+    size_t parameter_after = 0;
+    parameter_contract =
+        shell_source_skip_parameter_expansion(expansion, strlen(expansion), 0,
+                                              &parameter_after) &&
+        parameter_after ==
+            strlen(expansion) - parameter_expansions[i].trailing_word_bytes;
+  }
+  test(
+      "source scanner keeps nested parameter words opaque",
+      parameter_contract &&
+          !shell_source_skip_parameter_expansion("${}", 3, 0, &after) &&
+          !shell_source_skip_parameter_expansion("${VAR${SUFFIX}}", 15, 0,
+                                                 &after) &&
+          !shell_source_skip_parameter_expansion("${${suffix}}", 12, 0,
+                                                 &after) &&
+          !shell_source_skip_parameter_expansion("${VAR$SUFFIX}", 13, 0,
+                                                 &after) &&
+          !shell_source_skip_parameter_expansion("${VAR.suffix}", 13, 0,
+                                                 &after) &&
+          !shell_source_skip_parameter_expansion("${?suffix}", 10, 0, &after) &&
+          !shell_source_skip_parameter_expansion("${10suffix}", 11, 0,
+                                                 &after) &&
+          !shell_source_skip_parameter_expansion("${array[broken}", 15, 0,
+                                                 &after) &&
+          !shell_source_skip_parameter_expansion("${value:-$'unterminated}", 24,
+                                                 0, &after) &&
+          !shell_source_skip_parameter_expansion("${value:-$(broken}", 18, 0,
+                                                 &after));
+
+  static const char *const bracket_patterns[] = {
+      "[[:alpha:]]", "[[.x.]]", "[[=x=]]",   "[]a]",
+      "[!ab]",       "[a\\|b]", "[[:\\|:]]",
+  };
+  bool bracket_contract = true;
+  for (size_t i = 0; bracket_contract &&
+                     i < sizeof(bracket_patterns) / sizeof(bracket_patterns[0]);
+       i++) {
+    const char *pattern = bracket_patterns[i];
+    size_t bracket_after = 0;
+    bracket_contract = shell_source_skip_glob_bracket(pattern, strlen(pattern),
+                                                      0, &bracket_after) &&
+                       bracket_after == strlen(pattern);
+  }
+  test("source scanner recognizes non-structural glob bracket candidates",
+       bracket_contract &&
+           !shell_source_skip_glob_bracket(NULL, 0, 0, &after) &&
+           !shell_source_skip_glob_bracket("[a b]", 5, 0, &after) &&
+           !shell_source_skip_glob_bracket("[[:alpha:]", 10, 0, &after) &&
+           !shell_source_skip_glob_bracket("[[:alpha", 8, 0, &after) &&
+           !shell_source_skip_glob_bracket("[a|b]", 5, 0, &after) &&
+           !shell_source_skip_glob_bracket("[[:|:]]", 7, 0, &after) &&
+           !shell_source_skip_glob_bracket("[a&&b]", 6, 0, &after) &&
+           !shell_source_skip_glob_bracket("[", 1, 0, &after));
+
+  test("source scanner keeps extglob alternatives inside one word",
+       shell_source_skip_extglob("@(left|right)", 13, 0, &after) &&
+           after == 13 &&
+           shell_source_skip_extglob("prefix@(left|right)suffix", 25, 6,
+                                     &after) &&
+           after == 19 && !shell_source_skip_extglob(NULL, 0, 0, &after) &&
+           !shell_source_skip_extglob("@(", 2, 0, &after) &&
+           !shell_source_skip_extglob("@(left|right", 12, 0, &after));
+
+  static const char *const opaque_word_fragments[] = {
+      "prefix${value:-left|&right}suffix next",
+      "prefix@(left|right)suffix next",
+      "prefix\\{left\\|right\\}suffix next",
+      "prefix'[left|right]'suffix next",
+  };
+  bool opaque_word_contract = true;
+  for (size_t i = 0;
+       opaque_word_contract &&
+       i < sizeof(opaque_word_fragments) / sizeof(opaque_word_fragments[0]);
+       i++) {
+    const char *word = opaque_word_fragments[i];
+    size_t word_end = strcspn(word, " ");
+    size_t word_after = 0;
+    opaque_word_contract =
+        shell_source_skip_shell_word(word, strlen(word), 0, &word_after) &&
+        word_after == word_end &&
+        shell_source_skip_redirect_word(word, 0, strlen(word)) == word_end;
+  }
+  test("source scanner preserves real shell-word fragments in word scanners",
+       opaque_word_contract);
+
+  static const char *const structural_word_fragments[] = {
+      "prefix{left|right}suffix next",
+      "prefix[left|right]suffix next",
+  };
+  bool structural_word_contract = true;
+  for (size_t i = 0;
+       structural_word_contract && i < sizeof(structural_word_fragments) /
+                                           sizeof(structural_word_fragments[0]);
+       i++) {
+    const char *word = structural_word_fragments[i];
+    size_t operator_at = strcspn(word, "|&;<>");
+    size_t word_after = 0;
+    structural_word_contract =
+        shell_source_skip_shell_word(word, strlen(word), 0, &word_after) &&
+        word_after == operator_at &&
+        shell_source_skip_redirect_word(word, 0, strlen(word)) == operator_at;
+  }
+  test("source scanner leaves brace and bracket operators structural",
+       structural_word_contract);
+
+  test("source scanner rejects incomplete parameter words consistently",
+       !shell_source_skip_shell_word("${", 2, 0, &after) &&
+           shell_source_skip_redirect_word("${", 0, 2) == 2);
+
   static const char escaped_arithmetic_word[] = "$((1\\+2))";
   size_t escaped_arithmetic_after = 0;
   bool skips_escaped_arithmetic = shell_source_skip_shell_word(
@@ -2081,6 +2229,786 @@ static void test_group_context_on_redirect_and_operator_ranges(void) {
        valid);
 }
 
+/* A physical linebreak after a list connector belongs to the pending stage,
+ * rather than becoming an intervening semicolon. Exercise comments, CRLF, and
+ * escaped line endings because each reaches the same source-span boundary by
+ * a different scanner path. */
+static void test_list_connector_continuation_metadata(void) {
+  static const struct {
+    const char *name;
+    const char *input;
+    uint16_t type;
+    shell_pipe_mode_t pipe_mode;
+  } cases[] = {
+      {"newline pipeline", "left |\nright", SHELL_TYPE_PIPELINE,
+       SHELL_PIPE_MODE_STDOUT},
+      {"CRLF pipe-both", "left |&\r\nright", SHELL_TYPE_PIPELINE,
+       SHELL_PIPE_MODE_STDOUT_AND_STDERR},
+      {"commented pipeline", "left | # note\nright", SHELL_TYPE_PIPELINE,
+       SHELL_PIPE_MODE_STDOUT},
+      {"commented pipe-both", "left |& # note\r\nright", SHELL_TYPE_PIPELINE,
+       SHELL_PIPE_MODE_STDOUT_AND_STDERR},
+      {"blank commented pipeline", "left |\n\n # note\n right",
+       SHELL_TYPE_PIPELINE, SHELL_PIPE_MODE_STDOUT},
+      {"escaped newline pipeline", "left | \\\nright", SHELL_TYPE_PIPELINE,
+       SHELL_PIPE_MODE_STDOUT},
+      {"escaped CRLF pipe-both", "left |& \\\r\nright", SHELL_TYPE_PIPELINE,
+       SHELL_PIPE_MODE_STDOUT_AND_STDERR},
+      {"newline AND", "left &&\nright", SHELL_TYPE_AND, SHELL_PIPE_MODE_NONE},
+      {"commented OR", "left || # note\nright", SHELL_TYPE_OR,
+       SHELL_PIPE_MODE_NONE},
+      {"ordinary newline remains sequential", "left\nright",
+       SHELL_TYPE_SEMICOLON, SHELL_PIPE_MODE_NONE},
+  };
+  static const char *const malformed[] = {
+      "left | # note",
+      "left |& \\\n",
+      "left && # note",
+      "left ||\r\n",
+  };
+  shell_limits_t strict = {
+      .max_subcommands = SHELL_MAX_SUBCOMMANDS,
+      .strict_mode = true,
+  };
+  bool valid = true;
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    shell_parse_result_t parsed = {0};
+    valid = valid &&
+            shell_parse_fast(cases[i].input, strlen(cases[i].input), &strict,
+                             &parsed) == SHELL_OK &&
+            parsed.count == 2 && parsed.cmds[1].type == cases[i].type &&
+            parsed.cmds[1].pipe_input_mode == cases[i].pipe_mode;
+  }
+  for (size_t i = 0; i < sizeof(malformed) / sizeof(malformed[0]); i++) {
+    shell_parse_result_t parsed = {0};
+    valid = valid &&
+            shell_parse_fast(malformed[i], strlen(malformed[i]), &strict,
+                             &parsed) == SHELL_EPARSE &&
+            parsed.status == SHELL_STATUS_ERROR;
+  }
+  test("Fast parser preserves continued list connector metadata", valid);
+}
+
+/* Only shell syntax that actually quotes its contents may hide a list
+ * operator. Exercise those boundaries, and the complementary ordinary brace
+ * and bracket cases, through every public parsing surface. */
+static void test_word_fragment_operator_boundaries(void) {
+  static const char *const opaque_word_cases[] = {
+      "echo ${value:-left|&right}",          "echo ${value:-left>file}",
+      "echo ${value:-left\\|right}",         "echo ${value:-'left|right'}",
+      "echo ${value:-$'left|right'}",        "echo ${value:-$((1 | 2))}",
+      "echo ${value:-{left|right}}",         "echo prefix@(left|right)suffix",
+      "echo prefix\\{left\\|right\\}suffix", "echo prefix'[left|right]'suffix",
+  };
+  static const char *const escaped_cases[] = {
+      "echo \\|",
+      "echo \\&",
+      "echo \\;",
+      "echo \\|\\&",
+  };
+  shell_limits_t strict = {
+      .max_subcommands = SHELL_MAX_SUBCOMMANDS,
+      .strict_mode = true,
+  };
+  bool valid = true;
+  for (size_t set = 0; set < 2; set++) {
+    const char *const *cases = set == 0 ? opaque_word_cases : escaped_cases;
+    size_t count =
+        set == 0 ? sizeof(opaque_word_cases) / sizeof(opaque_word_cases[0])
+                 : sizeof(escaped_cases) / sizeof(escaped_cases[0]);
+    for (size_t i = 0; valid && i < count; i++) {
+      const char *input = cases[i];
+      shell_parse_result_t fast = {0};
+      shell_command_t *commands = NULL;
+      size_t command_count = 0;
+      shell_processed_commands_t processed = {0};
+      shell_dep_graph_t graph = {0};
+      valid =
+          shell_source_skip_shell_word(input, strlen(input), 5, &(size_t){0}) &&
+          shell_parse_fast(input, strlen(input), &strict, &fast) == SHELL_OK &&
+          fast.count == 1 && fast.cmds[0].type == SHELL_TYPE_SIMPLE &&
+          fast.cmds[0].pipe_input_mode == SHELL_PIPE_MODE_NONE &&
+          shell_tokenize_commands(input, strlen(input), &commands,
+                                  &command_count) == SHELL_TOKENIZE_OK &&
+          command_count == 1 &&
+          shell_process_commands(input, strlen(input), NULL, &processed) ==
+              SHELL_PROCESS_OK &&
+          processed.command_count == 1 &&
+          !processed.commands[0].has_pipe_input &&
+          !processed.commands[0].has_pipe_output &&
+          shell_dep_graph_parse(input, strlen(input), ".", NULL, &graph) ==
+              SHELL_DEP_OK &&
+          graph.edge_count == 0;
+      shell_commands_free(commands, command_count);
+      shell_processed_commands_free(&processed);
+    }
+  }
+  test("Quoted and expansion word fragments keep operators out of list parsing",
+       valid);
+
+  static const char *const structural_word_cases[] = {
+      "echo prefix{left|right}suffix",
+      "echo [left|right]",
+      "echo [[:alpha:]|]",
+      "echo []|]",
+      "echo [!left|right]",
+  };
+  bool structural = true;
+  for (size_t i = 0; structural && i < sizeof(structural_word_cases) /
+                                           sizeof(structural_word_cases[0]);
+       i++) {
+    const char *input = structural_word_cases[i];
+    shell_parse_result_t fast = {0};
+    shell_command_t *commands = NULL;
+    size_t command_count = 0;
+    shell_processed_commands_t processed = {0};
+    shell_dep_graph_t graph = {0};
+    uint32_t pipe_count = 0;
+    structural =
+        shell_parse_fast(input, strlen(input), &strict, &fast) == SHELL_OK &&
+        fast.count == 2 && fast.cmds[1].type == SHELL_TYPE_PIPELINE &&
+        fast.cmds[1].pipe_input_mode == SHELL_PIPE_MODE_STDOUT &&
+        shell_tokenize_commands(input, strlen(input), &commands,
+                                &command_count) == SHELL_TOKENIZE_OK &&
+        command_count == 2 &&
+        shell_process_commands(input, strlen(input), NULL, &processed) ==
+            SHELL_PROCESS_OK &&
+        processed.command_count == 2 && processed.commands[0].has_pipe_output &&
+        processed.commands[1].has_pipe_input &&
+        shell_dep_graph_parse(input, strlen(input), ".", NULL, &graph) ==
+            SHELL_DEP_OK &&
+        shell_dep_graph_validate(&graph).valid;
+    for (uint32_t edge = 0; structural && edge < graph.edge_count; edge++)
+      pipe_count += graph.edges[edge].type == SHELL_EDGE_PIPE;
+    structural = structural && pipe_count == 1;
+    shell_commands_free(commands, command_count);
+    shell_processed_commands_free(&processed);
+  }
+  test("Brace and bracket text leave list operators structural", structural);
+
+  static const struct {
+    const char *input;
+    uint32_t commands;
+    uint32_t pipes;
+  } redirect_fragment_cases[] = {
+      {"printf x >out@(left|right)", 1, 0},
+      /* An explicit stdout redirect wins over the syntactic pipeline's data
+       * route, so the graph correctly has no PIPE relation. */
+      {"printf x >out{left|right}", 2, 0},
+      {"printf x >out[left|right]", 2, 0},
+  };
+  bool redirect_fragments = true;
+  for (size_t i = 0;
+       redirect_fragments &&
+       i < sizeof(redirect_fragment_cases) / sizeof(redirect_fragment_cases[0]);
+       i++) {
+    const char *input = redirect_fragment_cases[i].input;
+    shell_parse_result_t fast = {0};
+    shell_command_t *commands = NULL;
+    size_t command_count = 0;
+    shell_processed_commands_t processed = {0};
+    shell_dep_graph_t graph = {0};
+    uint32_t pipe_count = 0;
+    redirect_fragments =
+        shell_parse_fast(input, strlen(input), &strict, &fast) == SHELL_OK &&
+        fast.count == redirect_fragment_cases[i].commands &&
+        shell_tokenize_commands(input, strlen(input), &commands,
+                                &command_count) == SHELL_TOKENIZE_OK &&
+        command_count == redirect_fragment_cases[i].commands &&
+        shell_process_commands(input, strlen(input), NULL, &processed) ==
+            SHELL_PROCESS_OK &&
+        processed.command_count == redirect_fragment_cases[i].commands &&
+        shell_dep_graph_parse(input, strlen(input), ".", NULL, &graph) ==
+            SHELL_DEP_OK &&
+        shell_dep_graph_validate(&graph).valid;
+    for (uint32_t edge = 0; redirect_fragments && edge < graph.edge_count;
+         edge++)
+      pipe_count += graph.edges[edge].type == SHELL_EDGE_PIPE;
+    redirect_fragments =
+        redirect_fragments && pipe_count == redirect_fragment_cases[i].pipes;
+    shell_commands_free(commands, command_count);
+    shell_processed_commands_free(&processed);
+  }
+  test("Redirect operands preserve only true shell-word syntax",
+       redirect_fragments);
+
+  const shell_process_limits_t short_string = {
+      .max_string_bytes = 1,
+      .max_total_bytes = SIZE_MAX,
+  };
+  const shell_process_limits_t short_total = {
+      .max_string_bytes = SIZE_MAX,
+      .max_total_bytes = 1,
+  };
+  shell_processed_commands_t limited = {0};
+  bool limits_are_atomic =
+      shell_process_commands("echo value", strlen("echo value"), &short_string,
+                             &limited) == SHELL_PROCESS_EOUTPUT_LIMIT &&
+      limited.commands == NULL && limited.command_count == 0 &&
+      shell_process_commands("echo one; echo two", strlen("echo one; echo two"),
+                             &short_total,
+                             &limited) == SHELL_PROCESS_EOUTPUT_LIMIT &&
+      limited.commands == NULL && limited.command_count == 0;
+  test("Processed command limits clear partial output", limits_are_atomic);
+
+  static const char *const malformed_word_cases[] = {
+      "echo ${}",
+      "echo ${VAR${SUFFIX}}",
+      "echo ${${suffix}}",
+      "echo ${value:-$'unterminated}",
+      "echo ${value:-$(broken}",
+  };
+  bool rejects_malformed = true;
+  for (size_t i = 0;
+       rejects_malformed &&
+       i < sizeof(malformed_word_cases) / sizeof(malformed_word_cases[0]);
+       i++) {
+    shell_parse_result_t parsed = {0};
+    shell_command_t *commands = (shell_command_t *)(uintptr_t)1;
+    size_t command_count = SIZE_MAX;
+    rejects_malformed =
+        shell_parse_fast(malformed_word_cases[i],
+                         strlen(malformed_word_cases[i]), &strict,
+                         &parsed) == SHELL_EPARSE &&
+        parsed.status == SHELL_STATUS_ERROR &&
+        shell_tokenize_commands(malformed_word_cases[i],
+                                strlen(malformed_word_cases[i]), &commands,
+                                &command_count) == SHELL_TOKENIZE_EPARSE &&
+        commands == NULL && command_count == 0;
+  }
+  test("Word fragments reject incomplete structural subsyntax",
+       rejects_malformed);
+}
+
+/* `!` is a counted pipeline modifier. It may cross horizontal whitespace and
+ * escaped physical continuations, but never a raw newline or comment. */
+static void test_pipeline_negation_trivia_metadata(void) {
+  static const struct {
+    const char *input;
+    uint32_t count;
+    uint32_t negation_count;
+    shell_pipe_mode_t pipe_mode;
+  } cases[] = {
+      {"! \\\nprintf x", 1, 1, SHELL_PIPE_MODE_NONE},
+      {"! ! printf x |& cat", 2, 2, SHELL_PIPE_MODE_STDOUT_AND_STDERR},
+      {"! ! ! \\\r\nprintf x | cat", 2, 3, SHELL_PIPE_MODE_STDOUT},
+  };
+  shell_limits_t strict = {
+      .max_subcommands = SHELL_MAX_SUBCOMMANDS,
+      .strict_mode = true,
+  };
+  bool valid = true;
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    shell_parse_result_t parsed = {0};
+    valid = valid &&
+            shell_parse_fast(cases[i].input, strlen(cases[i].input), &strict,
+                             &parsed) == SHELL_OK &&
+            parsed.count == cases[i].count;
+    for (uint32_t range = 0; valid && range < parsed.count; range++)
+      valid =
+          (parsed.cmds[range].modifiers & SHELL_CMD_MOD_PIPE_NEGATED) != 0 &&
+          parsed.cmds[range].pipeline_negation_count == cases[i].negation_count;
+    if (valid && parsed.count > 1)
+      valid = parsed.cmds[1].type == SHELL_TYPE_PIPELINE &&
+              parsed.cmds[1].pipe_input_mode == cases[i].pipe_mode;
+  }
+
+  static const char negated_group[] = "! ! { printf x; } | cat";
+  shell_parse_result_t grouped = {0};
+  valid = valid &&
+          shell_parse_fast(negated_group, sizeof(negated_group) - 1, &strict,
+                           &grouped) == SHELL_OK &&
+          grouped.count == 2 && grouped.group_count == 1 &&
+          (grouped.groups[0].modifiers & SHELL_CMD_MOD_PIPE_NEGATED) != 0 &&
+          grouped.groups[0].pipeline_negation_count == 2 &&
+          (grouped.cmds[1].modifiers & SHELL_CMD_MOD_PIPE_NEGATED) != 0 &&
+          grouped.cmds[1].pipeline_negation_count == 2;
+
+  static const char *const incomplete[] = {
+      "!", "! # note\n", "! \\\n", "!\nprintf x", "! !",
+  };
+  for (size_t i = 0; i < sizeof(incomplete) / sizeof(incomplete[0]); i++) {
+    shell_parse_result_t parsed = {0};
+    valid = valid &&
+            shell_parse_fast(incomplete[i], strlen(incomplete[i]), &strict,
+                             &parsed) == SHELL_EPARSE &&
+            parsed.status == SHELL_STATUS_ERROR;
+  }
+  test("Fast parser preserves counted pipeline negation boundaries", valid);
+}
+
+/* Document redirects may carry Bash's named descriptor allocator. They are
+ * redirect syntax, never an argv fragment, and a bare document redirect can
+ * be the pipeline stage modified by one or more leading `!` reserved words. */
+static void test_named_document_and_negation_metadata(void) {
+  static const struct {
+    const char *input;
+    uint16_t document_type;
+    uint32_t negation_count;
+  } cases[] = {
+      {"printf x {fd}<<<body", SHELL_TYPE_HERESTRING, 0},
+      {"printf x {fd}<<EOF\nbody\nEOF\n", SHELL_TYPE_HEREDOC, 0},
+      {"! <<<body", SHELL_TYPE_HERESTRING, 1},
+      {"! ! <<EOF\nbody\nEOF\n", SHELL_TYPE_HEREDOC, 2},
+      {"! <<<body | cat", SHELL_TYPE_HERESTRING, 1},
+      {"{ cat; } {fd}<<<body", SHELL_TYPE_HERESTRING, 0},
+      {"{ cat; } {fd}<<EOF\nbody\nEOF\n", SHELL_TYPE_HEREDOC, 0},
+  };
+  const shell_limits_t strict = {
+      .max_subcommands = SHELL_MAX_SUBCOMMANDS,
+      .strict_mode = true,
+  };
+  bool valid = true;
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    shell_parse_result_t parsed = {0};
+    valid = valid && shell_parse_fast(cases[i].input, strlen(cases[i].input),
+                                      &strict, &parsed) == SHELL_OK;
+    uint32_t document = UINT32_MAX;
+    for (uint32_t range = 0; range < parsed.count; range++)
+      if (parsed.cmds[range].type & cases[i].document_type)
+        document = range;
+    if (i == 5) {
+      /* A trailing group here-string is recorded in group I/O metadata rather
+       * than as a synthetic command range. */
+      valid = valid && parsed.count == 1 && document == UINT32_MAX;
+    } else {
+      valid =
+          valid && document != UINT32_MAX &&
+          parsed.cmds[document].pipeline_negation_count ==
+              cases[i].negation_count &&
+          (!!(parsed.cmds[document].modifiers & SHELL_CMD_MOD_PIPE_NEGATED) ==
+           (cases[i].negation_count != 0));
+    }
+    if (i < 2)
+      valid = valid && parsed.count == 2 &&
+              parsed.cmds[0].len == strlen("printf x");
+    if (i == 4)
+      valid = valid && parsed.count == 2 &&
+              parsed.cmds[1].type == SHELL_TYPE_PIPELINE &&
+              parsed.cmds[1].pipeline_negation_count == 1;
+    if (i == 6)
+      valid = valid && parsed.count == 2;
+  }
+  test("Fast parser classifies named document redirects and negated document "
+       "stages",
+       valid);
+}
+
+/* The strict fast parser is the shared admission check for every canonical
+ * surface. Keep uncommon malformed operator forms here rather than relying on
+ * a later tokenizer to reject a partially structured list. */
+static void test_strict_operator_boundary_matrix(void) {
+  static const char *const malformed[] = {
+      "echo @(unterminated",
+      "echo value=(unterminated",
+      "echo &>",
+      "echo &>>",
+      "echo > (group)",
+      "echo < (group)",
+      "echo >|",
+      "echo > >out",
+      "echo < <in",
+      "echo |&",
+      "echo | ! next",
+      "echo && && next",
+      "echo || || next",
+      "echo ; ;",
+      "echo & &",
+      "echo $'unterminated",
+      "echo $(unterminated",
+      "echo <(unterminated",
+      "echo >(unterminated",
+      "echo ${unterminated",
+      "echo $((unterminated",
+      "echo )",
+      "echo; }",
+      "echo | )",
+      "echo { literal; }",
+      "echo (cat)",
+      "echo ((1))",
+  };
+  shell_limits_t strict = {
+      .max_subcommands = SHELL_MAX_SUBCOMMANDS,
+      .strict_mode = true,
+  };
+  bool valid = true;
+  for (size_t i = 0; i < sizeof(malformed) / sizeof(malformed[0]); i++) {
+    shell_parse_result_t result = {0};
+    shell_error_t status =
+        shell_parse_fast(malformed[i], strlen(malformed[i]), &strict, &result);
+    valid = (status == SHELL_EPARSE && result.status == SHELL_STATUS_ERROR) &&
+            valid;
+  }
+
+  char nested[8 * (SHELL_MAX_SUBCOMMANDS + 1) + sizeof(" echo ")] = {0};
+  size_t used = 0;
+  for (size_t i = 0; i < SHELL_MAX_SUBCOMMANDS + 1; i++)
+    used += (size_t)snprintf(nested + used, sizeof(nested) - used, "{ (");
+  used += (size_t)snprintf(nested + used, sizeof(nested) - used, " echo ");
+  for (size_t i = 0; i < SHELL_MAX_SUBCOMMANDS + 1; i++)
+    used += (size_t)snprintf(nested + used, sizeof(nested) - used, ") ; }");
+  shell_parse_result_t result = {0};
+  shell_error_t nested_status =
+      shell_parse_fast(nested, used, &strict, &result);
+  valid = valid && used < sizeof(nested) && nested_status == SHELL_EPARSE &&
+          result.status == SHELL_STATUS_ERROR;
+  test("Strict parser rejects malformed and over-nested operators", valid);
+}
+
+/* These semantic classifiers sit below the public processor adapters. Exercise
+ * their quote, expansion, and unsupported-control boundaries directly so the
+ * adapters cannot accidentally narrow the lexical contract. */
+static void test_semantic_classifier_boundaries(void) {
+  static const struct {
+    const char *input;
+    bool unsupported;
+  } source_cases[] = {
+      {"", false},
+      {"printf '%s' while", false},
+      {"while true; do :; done", true},
+      {"echo items[0]", false},
+      {"echo ${items[0]}", true},
+      {"echo $(while true; do :; done)", true},
+      {"echo <(while true; do :; done)", true},
+      {"echo `while true; do :; done`", true},
+      {"echo ${value:-$(while true; do :; done)}", true},
+      {"echo $((items[0]))", true},
+      {"echo \\$(while true; do :; done)", false},
+      {"echo \"$(printf x)\"", false},
+      {"echo $'while'", false},
+      {"echo $'$\"localized\"'", false},
+      {"echo \\$\"localized\"", false},
+      {"echo x # $\"localized\"", false},
+      {"cat <<'EOF'\n$\"localized\"\nEOF", false},
+      {"echo $\"localized\"", true},
+      {"echo prefix$\"localized\"suffix", true},
+      {"echo ${value:-$\"fallback\"}", true},
+      {"echo \"${value:-$\"localized\"}\"", true},
+      {"echo \"${outer:-${inner:-$\"localized\"}}\"", true},
+      {"echo \"${value:-\\$\"literal\"}\"", false},
+      {"echo \"${value:-'$\"literal\"'}\"", false},
+      {"declare arr[0]", true},
+      {"declare 'arr[0]'", true},
+      {"declare arr\\[0\\]", true},
+      {"declare arr$'[0]'", true},
+      {"declare ar\"r\"[0]", true},
+      {"declare arr[$((0))]", true},
+      {"declare arr[${index}]", true},
+      {"declare arr[`printf 0`]", true},
+      {"declare ar\\\nr[0]", true},
+      {"de$'clare' -a values", true},
+      {"command -$'p' de$'clare' -a values", true},
+      {"declare -$'a' values", true},
+      {"echo de$'clare' -a values", false},
+      {"$tool -a values", false},
+      {"typeset map[key]", true},
+      {"command -- declare \"arr[$(printf 0)]\"", true},
+      {"declare scalar='[literal]'", false},
+      {"[[ -f /tmp/x ]]", true},
+      {"VALUE=x [[ $VALUE == x ]]", true},
+      {"{ [[ -n value ]]; }", true},
+      {"echo $( [[ -f /tmp/x ]] )", true},
+      {"(( count += 1 ))", true},
+      {"! (( 1 ))", true},
+      {"{ (( 1 )); }", true},
+      {"time echo x", true},
+      {"VALUE=x time -p echo x", true},
+      {"! time false", true},
+      {"command time echo x", false},
+      {"\"time\" echo x", false},
+      {"echo $'unterminated", false},
+  };
+  static const struct {
+    const char *input;
+    bool array_semantics;
+  } arithmetic_cases[] = {
+      {"1 + value", false},
+      {"\\items[0]", true},
+      {"items[0] + 1", true},
+      {"'items[0]'", false},
+      {"\"items[0]\"", true},
+      {"$'literal' items[0]", true},
+      {"${items[0]}", true},
+      {"${value:-$(while true; do :; done)}", true},
+      {"`while true; do :; done`", true},
+      {"$(while true; do :; done)", true},
+      {"$((items[0]))", true},
+      {"$'unterminated", false},
+  };
+  bool valid = !shell_tokenizer_arithmetic_has_array_semantics(NULL, 0) &&
+               shell_tokenizer_has_unsupported_semantics(NULL, 0);
+  shell_tokenizer_state_t escaped_glob_state;
+  shell_token_t escaped_glob = {0};
+  valid =
+      valid &&
+      shell_tokenizer_init(&escaped_glob_state, "[a\\]]", strlen("[a\\]]")) &&
+      shell_tokenizer_next(&escaped_glob_state, &escaped_glob) &&
+      escaped_glob.type == SHELL_TOKEN_GLOB;
+  for (size_t i = 0; i < sizeof(source_cases) / sizeof(source_cases[0]); i++) {
+    bool got = shell_tokenizer_has_unsupported_semantics(
+        source_cases[i].input, strlen(source_cases[i].input));
+    valid = got == source_cases[i].unsupported && valid;
+  }
+  for (size_t i = 0; i < sizeof(arithmetic_cases) / sizeof(arithmetic_cases[0]);
+       i++) {
+    bool got = shell_tokenizer_arithmetic_has_array_semantics(
+        arithmetic_cases[i].input, strlen(arithmetic_cases[i].input));
+    valid = got == arithmetic_cases[i].array_semantics && valid;
+  }
+  char too_many_commands[2 * (SHELL_MAX_SUBCOMMANDS + 1)] = {0};
+  for (size_t i = 0; i < SHELL_MAX_SUBCOMMANDS + 1; i++) {
+    too_many_commands[2 * i] = 'x';
+    if (i + 1 < SHELL_MAX_SUBCOMMANDS + 1)
+      too_many_commands[2 * i + 1] = ';';
+  }
+  shell_processed_commands_t too_many = {
+      .commands = (shell_command_info_t *)(uintptr_t)1,
+      .command_count = SIZE_MAX,
+  };
+  valid = valid && shell_process_commands(
+                       too_many_commands, strlen(too_many_commands), NULL,
+                       &too_many) == SHELL_PROCESS_EOUTPUT_LIMIT;
+  valid = valid && too_many.commands == NULL && too_many.command_count == 0;
+  test("Semantic classifiers retain quote and expansion boundaries", valid);
+}
+
+/* Exercise transformation after tokenization has established source spans.
+ * In particular, a short variable spelling expands to a longer display token,
+ * so both string and aggregate output limits need independent coverage. */
+static void test_transform_contract_boundaries(void) {
+  shell_transformed_command_t *transformed =
+      (shell_transformed_command_t *)(uintptr_t)1;
+  shell_command_t empty = {0};
+  shell_token_t invalid = {
+      .type = SHELL_TOKEN_COMMAND, .start = NULL, .length = 1, .position = 0};
+  shell_command_t malformed = {
+      .tokens = &invalid, .token_count = 1, .start_pos = 0, .end_pos = 1};
+  shell_token_t variable = {
+      .type = SHELL_TOKEN_VARIABLE, .start = "$X", .length = 2, .position = 0};
+  shell_command_t command = {
+      .tokens = &variable, .token_count = 1, .start_pos = 0, .end_pos = 2};
+  const shell_transform_limits_t display_limit = {
+      .max_string_bytes = 2,
+      .max_total_bytes = SIZE_MAX,
+  };
+  const shell_transform_limits_t total_limit = {
+      .max_string_bytes = SIZE_MAX,
+      .max_total_bytes = 20,
+  };
+  bool valid =
+      shell_transform_command(NULL, NULL, &transformed) ==
+          SHELL_TRANSFORM_EINPUT &&
+      transformed == NULL &&
+      shell_transform_command(&empty, NULL, &transformed) ==
+          SHELL_TRANSFORM_EINPUT &&
+      transformed == NULL &&
+      shell_transform_command(&malformed, NULL, &transformed) ==
+          SHELL_TRANSFORM_EINPUT &&
+      transformed == NULL &&
+      shell_transform_command(&command, &display_limit, &transformed) ==
+          SHELL_TRANSFORM_EOUTPUT_LIMIT &&
+      transformed == NULL &&
+      shell_transform_command(&command, &total_limit, &transformed) ==
+          SHELL_TRANSFORM_EOUTPUT_LIMIT &&
+      transformed == NULL;
+  shell_transformed_command_t **commands =
+      (shell_transformed_command_t **)(uintptr_t)1;
+  size_t count = SIZE_MAX;
+  valid = valid &&
+          shell_transform_command_line(NULL, 0, NULL, &commands, &count) ==
+              SHELL_TRANSFORM_EINPUT &&
+          commands == NULL && count == 0 &&
+          shell_transform_command_line("echo $X", strlen("echo $X"), NULL, NULL,
+                                       &count) == SHELL_TRANSFORM_EINPUT;
+  test("Transform contracts retain expansion and output boundaries", valid);
+}
+
+static bool stop_after_first_decoded_byte(unsigned char byte,
+                                          size_t decoded_offset,
+                                          void *context) {
+  (void)byte;
+  (void)decoded_offset;
+  size_t *seen = context;
+  (*seen)++;
+  return false;
+}
+
+/* The word helpers are deliberately byte-oriented: callers supply exact
+ * capacity, including when substitutions preserve their source spelling.
+ * Check short destinations and early visitors without allocating a temporary
+ * decoded string. */
+static void test_word_writer_contract_boundaries(void) {
+  char destination[16] = {0};
+  size_t written = SIZE_MAX;
+  size_t seen = 0;
+  shell_command_info_t *infos = NULL;
+  size_t info_count = 0;
+  bool valid =
+      shell_visit_decoded_word("word", 4, stop_after_first_decoded_byte, &seen,
+                               &written) == SHELL_PROCESS_OK &&
+      seen == 1 && written == 1 &&
+      shell_write_decoded_word("word", 4, destination, 3, &written) ==
+          SHELL_PROCESS_EOUTPUT_LIMIT &&
+      written == 0 &&
+      shell_measure_processed_word(NULL, 0, &written) == SHELL_PROCESS_EINPUT &&
+      written == 0 &&
+      shell_write_processed_word(NULL, 0, destination, sizeof(destination),
+                                 &written) == SHELL_PROCESS_EINPUT &&
+      written == 0 &&
+      shell_write_processed_word("$(printf x)", strlen("$(printf x)"),
+                                 destination, 1,
+                                 &written) == SHELL_PROCESS_EOUTPUT_LIMIT &&
+      written == 0 &&
+      shell_write_processed_word("x", 1, destination, 0, &written) ==
+          SHELL_PROCESS_EOUTPUT_LIMIT &&
+      written == 0 &&
+      shell_process_command("echo x", strlen("echo x"), NULL, &infos,
+                            &info_count) == SHELL_PROCESS_OK &&
+      info_count == 1;
+  shell_netstring_buffer_t occupied = {
+      .data = (unsigned char *)destination,
+      .length = 1,
+  };
+  const shell_process_limits_t tiny = {
+      .max_string_bytes = 1,
+      .max_total_bytes = 1,
+  };
+  valid = valid &&
+          shell_render_netargv_buffer(&infos[0], NULL, &occupied) ==
+              SHELL_PROCESS_EINPUT &&
+          shell_render_netargv_buffer(&infos[0], &tiny, &occupied) ==
+              SHELL_PROCESS_EINPUT;
+  shell_command_infos_free(infos, info_count);
+  infos = (shell_command_info_t *)(uintptr_t)1;
+  info_count = SIZE_MAX;
+  valid = valid &&
+          shell_process_command("echo x", strlen("echo x"), &tiny, &infos,
+                                &info_count) == SHELL_PROCESS_EOUTPUT_LIMIT &&
+          infos == NULL && info_count == 0;
+  test("Word writers preserve byte-capacity and visitor contracts", valid);
+}
+
+/* Abstraction is a diagnostic adapter, but it still consumes the same lexical
+ * spans as canonical processing. Exercise it from both library variants so
+ * path, expansion, redirect, and accessor contracts cannot drift. */
+static void test_abstract_adapter_contract(void) {
+  shell_abstract_command_t *abstracted =
+      (shell_abstract_command_t *)(uintptr_t)1;
+  const char source[] =
+      "printf $HOME /etc/passwd ./relative ~/home *.c $(id) $((1 + 2)) >out";
+  shell_abstract_status_t null_status =
+      shell_abstract_command_parse(NULL, 0, &abstracted);
+  bool null_cleared = abstracted == NULL;
+  shell_abstract_status_t malformed_status =
+      shell_abstract_command_parse("echo '", strlen("echo '"), &abstracted);
+  bool malformed_cleared = abstracted == NULL;
+  shell_abstract_status_t parse_status =
+      shell_abstract_command_parse(source, sizeof(source) - 1, &abstracted);
+  bool valid = null_status == SHELL_ABSTRACT_EINPUT && null_cleared &&
+               malformed_status == SHELL_ABSTRACT_EPARSE && malformed_cleared &&
+               parse_status == SHELL_ABSTRACT_OK && abstracted != NULL &&
+               shell_abstract_command_get_source(abstracted) != NULL &&
+               shell_abstract_command_get_display_text(abstracted) != NULL &&
+               shell_abstract_command_has_variables(abstracted) &&
+               shell_abstract_command_has_paths(abstracted) &&
+               shell_abstract_command_has_abs_paths(abstracted) &&
+               shell_abstract_command_has_rel_paths(abstracted) &&
+               shell_abstract_command_has_home_paths(abstracted) &&
+               shell_abstract_command_has_globs(abstracted) &&
+               shell_abstract_command_has_cmd_subst(abstracted) &&
+               shell_abstract_command_has_arithmetic(abstracted) &&
+               shell_abstract_command_has_redirects(abstracted);
+  size_t element_count = 0;
+  const shell_abstract_element_t *const *elements =
+      shell_abstract_command_get_elements(abstracted, &element_count);
+  valid =
+      valid && elements != NULL && element_count > 0 &&
+      shell_abstract_command_get_element(abstracted, element_count) == NULL &&
+      shell_abstract_command_find_element(abstracted, "$missing") == NULL &&
+      shell_classify_raw_token("/tmp/file", strlen("/tmp/file")) ==
+          SHELL_TOKEN_ARGUMENT &&
+      shell_path_category_from_path("/tmp/file") == SHELL_PATH_TMP &&
+      strcmp(shell_abstract_type_name((shell_abstract_type_t)99), "UNKNOWN") ==
+          0 &&
+      strcmp(shell_path_category_name((shell_path_category_t)99), "UNKNOWN") ==
+          0;
+  /* Raw classification accepts a token span rather than a command line. Keep
+   * malformed and boundary spellings distinct from the richer parsed input
+   * above. */
+  valid = valid && shell_classify_raw_token(NULL, 0) == SHELL_TOKEN_END &&
+          shell_classify_raw_token("$", 1) == SHELL_TOKEN_ARGUMENT &&
+          shell_classify_raw_token("${x}", 4) == SHELL_TOKEN_VARIABLE &&
+          shell_classify_raw_token("${12}", 5) == SHELL_TOKEN_SPECIAL_VAR &&
+          shell_classify_raw_token("$?", 2) == SHELL_TOKEN_SPECIAL_VAR &&
+          shell_classify_raw_token("$(x)", 4) == SHELL_TOKEN_SUBSHELL &&
+          shell_classify_raw_token("$((1))", 6) == SHELL_TOKEN_ARITHMETIC &&
+          shell_classify_raw_token("~other", 6) == SHELL_TOKEN_ARGUMENT &&
+          shell_classify_raw_token("relative/path", strlen("relative/path")) ==
+              SHELL_TOKEN_ARGUMENT &&
+          shell_classify_raw_token("--option", strlen("--option")) ==
+              SHELL_TOKEN_ARGUMENT;
+  const char *const environment[] = {"HOME=/home/example", "HOMEVAR=value",
+                                     NULL};
+  shell_runtime_context_t runtime = {
+      .env = environment,
+      .cwd = "/work/base",
+      .resolve_symlinks = false,
+  };
+  valid = valid && shell_abstract_command_expand(abstracted, &runtime);
+  shell_abstract_command_free(abstracted);
+  test("Abstract adapter preserves lexical and accessor contracts", valid);
+}
+
+/* A redirect or list operator alone is not an executable fast-parser range.
+ * Exercise every compact spelling here so the no-command rejection stays
+ * separate from valid redirection operands such as `cat <input`. */
+static void test_operator_only_rejection(void) {
+  static const char *const cases[] = {
+      "<", ">", "<<", ">>", "<<<", ";", "&&", "||", "|", "|&", "&", "&>", "&>>",
+  };
+  bool rejected = true;
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    shell_parse_result_t result = {0};
+    rejected = rejected &&
+               shell_parse_fast(cases[i], strlen(cases[i]), NULL, &result) ==
+                   SHELL_EPARSE &&
+               result.count == 0;
+  }
+  test("Fast parser rejects operator-only input", rejected);
+}
+
+/* These inputs reach the fast structural scanner after lexical validation but
+ * cannot form a strict canonical command. Keep their rejection contracts
+ * explicit: they prevent incomplete expansions or malformed group placement
+ * from being recovered as ordinary words. */
+static void test_strict_structural_rejection(void) {
+  static const char *const cases[] = {
+      "${broken",
+      "\\$(broken",
+      ">output { :; }",
+      "{ echo",
+  };
+  const shell_limits_t strict = {
+      .max_subcommands = SHELL_MAX_SUBCOMMANDS,
+      .strict_mode = true,
+  };
+  bool rejected = true;
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    shell_parse_result_t result = {0};
+    shell_error_t status =
+        shell_parse_fast(cases[i], strlen(cases[i]), &strict, &result);
+    bool case_rejected =
+        status == SHELL_EPARSE && result.status == SHELL_STATUS_ERROR;
+    if (!case_rejected)
+      fprintf(stderr,
+              "strict structural case accepted: %s (status=%d, "
+              "parser-status=%d)\n",
+              cases[i], status, result.status);
+    rejected = rejected && case_rejected;
+  }
+  test("Strict fast parser rejects malformed structural forms", rejected);
+}
+
 /* --- MAIN --- */
 
 int main(void) {
@@ -2123,6 +3051,17 @@ int main(void) {
   test_source_io_number_contract();
   test_quoted_heredoc_delimiter_fast_ranges();
   test_group_context_on_redirect_and_operator_ranges();
+  test_list_connector_continuation_metadata();
+  test_word_fragment_operator_boundaries();
+  test_pipeline_negation_trivia_metadata();
+  test_named_document_and_negation_metadata();
+  test_strict_operator_boundary_matrix();
+  test_semantic_classifier_boundaries();
+  test_transform_contract_boundaries();
+  test_word_writer_contract_boundaries();
+  test_abstract_adapter_contract();
+  test_operator_only_rejection();
+  test_strict_structural_rejection();
 
   test_fast_parser_limitations();
 

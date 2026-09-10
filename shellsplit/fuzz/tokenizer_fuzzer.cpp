@@ -36,6 +36,7 @@ static int g_verbose = 0;
 
 static int test_generated_brace_case(const uint8_t *data, size_t size,
                                      const char *cwd);
+static int test_tokenizer_state(const char *input, size_t length);
 
 /* CWD strategies for shell_dep_graph_parse. NULL tests the early substitution
  * to
@@ -109,7 +110,8 @@ static int validate_fast_result(const char *input, size_t length,
     if (r->len == 0 || r->start > length || r->len > length - r->start ||
         !known_type || (r->type & (uint16_t)~valid_types) != 0 ||
         (r->features & ~valid_features) != 0 ||
-        (r->modifiers & ~SHELL_CMD_MOD_PIPE_NEGATED) != 0) {
+        (r->modifiers & ~SHELL_CMD_MOD_PIPE_NEGATED) != 0 ||
+        r->pipe_input_mode > SHELL_PIPE_MODE_STDOUT_AND_STDERR) {
       if (g_verbose)
         fprintf(stderr,
                 "\n=== FAST PARSER ERROR: Invalid range at idx %u ===\n", i);
@@ -193,6 +195,25 @@ static int test_fast_parser(const char *input, size_t length) {
  * checks make the fuzzer fail on semantic regressions, not only malformed
  * output structures. */
 static int test_fixed_oracles(void) {
+  /* The iterator intentionally exposes a standalone escaped physical line
+   * ending while the structured tokenizer omits it from command records.
+   * Keep this exact smoke finding deterministic so their comparison remains
+   * semantic rather than byte-for-byte lexical. */
+  static const char iterator_continuation[] = "echo first \\\nsecond | cat\n";
+  if (test_tokenizer_state(iterator_continuation,
+                           sizeof(iterator_continuation) - 1))
+    return 1;
+  static const char iterator_heredoc_boundary[] = "cat& <<EOF\nvalue\nEOF\n";
+  if (test_tokenizer_state(iterator_heredoc_boundary,
+                           sizeof(iterator_heredoc_boundary) - 1))
+    return 1;
+  /* A heredoc that remains attached to a command retains its following
+   * newline. This complements the input-only heredoc case above. */
+  static const char iterator_attached_heredoc[] = "cat <<EOF\nvalue\nEOF\n";
+  if (test_tokenizer_state(iterator_attached_heredoc,
+                           sizeof(iterator_attached_heredoc) - 1))
+    return 1;
+
   struct oracle_case {
     const char *input;
     uint32_t count;
@@ -259,6 +280,75 @@ static int test_fixed_oracles(void) {
       return 1;
   }
 
+  /* Metadata must distinguish executable substitutions from literal spelling
+   * lookalikes, even when the full tokenizer retains one compound word. Keep
+   * these in-code so every fuzzing session exercises the contract without
+   * growing the checked-in smoke corpus. */
+  struct word_metadata_oracle {
+    const char *input;
+    bool has_cmd_subst;
+    bool has_globs;
+    bool has_strings;
+    bool has_transformations;
+    bool has_shell_syntax;
+    const char *display;
+    shell_transform_type_t argument_type;
+  };
+  static const word_metadata_oracle word_metadata_cases[] = {
+      {"echo \"$(id)\"", true, false, true, false, true, "echo \"$(id)\"",
+       SHELL_TRANSFORM_NONE},
+      {"echo \"<(id)\"", false, false, true, false, false, "echo \"<(id)\"",
+       SHELL_TRANSFORM_NONE},
+      {"echo $'$(id)'", false, false, true, false, false, "echo $'$(id)'",
+       SHELL_TRANSFORM_NONE},
+      {"echo $'it\\'s $(id)'", false, false, true, false, false,
+       "echo $'it\\'s $(id)'", SHELL_TRANSFORM_NONE},
+      {"echo @(left|right)", false, true, false, true, true,
+       "echo FILE_PATTERN", SHELL_TRANSFORM_GLOB},
+      {"echo $'a\\n'", false, false, true, false, false, "echo $'a\\n'",
+       SHELL_TRANSFORM_NONE},
+  };
+  for (const word_metadata_oracle &item : word_metadata_cases) {
+    shell_abstract_command_t *abstract = NULL;
+    shell_transformed_command_t **transformed = NULL;
+    size_t transformed_count = 0;
+    shell_command_info_t *processed = NULL;
+    size_t processed_count = 0;
+    char *sequence = NULL;
+    size_t sequence_count = 0;
+    bool sequence_features = !item.has_cmd_subst;
+    bool metadata_ok =
+        shell_abstract_command_parse(item.input, strlen(item.input),
+                                     &abstract) == SHELL_ABSTRACT_OK &&
+        abstract && abstract->has_cmd_subst == item.has_cmd_subst &&
+        abstract->has_globs == item.has_globs &&
+        abstract->has_strings == item.has_strings &&
+        shell_transform_command_line(item.input, strlen(item.input), NULL,
+                                     &transformed, &transformed_count) ==
+            SHELL_TRANSFORM_OK &&
+        transformed_count == 1 && transformed && transformed[0] &&
+        transformed[0]->token_count == 2 &&
+        transformed[0]->has_transformations == item.has_transformations &&
+        transformed[0]->has_shell_syntax == item.has_shell_syntax &&
+        strcmp(transformed[0]->display_text, item.display) == 0 &&
+        transformed[0]->tokens[1].type == item.argument_type &&
+        shell_process_command(item.input, strlen(item.input), NULL, &processed,
+                              &processed_count) == SHELL_PROCESS_OK &&
+        processed_count == 1 && processed != nullptr &&
+        shell_command_info_has_dangerous_features(processed) ==
+            item.has_cmd_subst &&
+        shell_build_netargv_sequence(item.input, strlen(item.input), NULL,
+                                     &sequence, &sequence_count,
+                                     &sequence_features) == SHELL_PROCESS_OK &&
+        sequence_count == 1 && sequence_features == item.has_cmd_subst;
+    free(sequence);
+    shell_command_infos_free(processed, processed_count);
+    shell_transformed_command_list_free(transformed, transformed_count);
+    shell_abstract_command_free(abstract);
+    if (!metadata_ok)
+      return 1;
+  }
+
   /* Keep newly supported spelling families in the always-run oracle set. The
    * literal forms also become comparison material for libFuzzer's dictionary
    * discovery, so mutations reach their boundary handling quickly. */
@@ -269,6 +359,604 @@ static int test_fixed_oracles(void) {
       (modern.cmds[0].modifiers & SHELL_CMD_MOD_PIPE_NEGATED) == 0 ||
       (modern.cmds[1].modifiers & SHELL_CMD_MOD_PIPE_NEGATED) == 0)
     return 1;
+  shell_command_t *pipe_both_commands = NULL;
+  size_t pipe_both_count = 0;
+  shell_command_info_t *pipe_both_infos = NULL;
+  size_t pipe_both_info_count = 0;
+  shell_dep_graph_t pipe_both_graph = {};
+  bool pipe_both_ok =
+      shell_parse_fast("printf x |& cat", strlen("printf x |& cat"), NULL,
+                       &modern) == SHELL_OK &&
+      modern.count == 2 &&
+      modern.cmds[1].pipe_input_mode == SHELL_PIPE_MODE_STDOUT_AND_STDERR &&
+      shell_tokenize_commands("printf x |& cat", strlen("printf x |& cat"),
+                              &pipe_both_commands,
+                              &pipe_both_count) == SHELL_TOKENIZE_OK &&
+      pipe_both_count == 2 &&
+      pipe_both_commands[0].pipe_output_mode ==
+          SHELL_PIPE_MODE_STDOUT_AND_STDERR &&
+      shell_process_command("printf x |& cat", strlen("printf x |& cat"), NULL,
+                            &pipe_both_infos,
+                            &pipe_both_info_count) == SHELL_PROCESS_OK &&
+      pipe_both_info_count == 2 &&
+      pipe_both_infos[0].pipe_output_mode ==
+          SHELL_PIPE_MODE_STDOUT_AND_STDERR &&
+      shell_dep_graph_parse("printf x |& cat", strlen("printf x |& cat"), NULL,
+                            NULL, &pipe_both_graph) == SHELL_DEP_OK;
+  uint32_t pipe_both_edges = 0;
+  for (uint32_t i = 0; i < pipe_both_graph.edge_count; i++)
+    pipe_both_edges += pipe_both_graph.edges[i].type == SHELL_EDGE_PIPE;
+  bool pipe_both_valid = pipe_both_ok && pipe_both_edges == 2 &&
+                         shell_dep_graph_validate(&pipe_both_graph).valid;
+  shell_command_infos_free(pipe_both_infos, pipe_both_info_count);
+  shell_commands_free(pipe_both_commands, pipe_both_count);
+  if (!pipe_both_valid)
+    return 1;
+
+  /* Only syntax that actually quotes a word fragment hides outer list or
+   * redirection operators. Keep every parser layer aligned on that boundary. */
+  static const char *const opaque_word_cases[] = {
+      "echo ${value:-left|&right}",
+      "echo ${value:-left>file}",
+      "echo prefix@(left|right)suffix",
+      "echo prefix\\{left\\|right\\}suffix",
+      "echo '[left|right]'",
+      "echo \\|",
+      "echo \\&",
+      "echo \\;",
+      "echo \\|\\&",
+  };
+  for (const char *input : opaque_word_cases) {
+    shell_parse_result_t parsed = {};
+    shell_command_t *commands = NULL;
+    size_t command_count = 0;
+    shell_processed_commands_t processed = {};
+    shell_dep_graph_t graph = {};
+    bool opaque_word_ok =
+        shell_parse_fast(input, strlen(input), NULL, &parsed) == SHELL_OK &&
+        parsed.count == 1 && parsed.cmds[0].type == SHELL_TYPE_SIMPLE &&
+        parsed.cmds[0].pipe_input_mode == SHELL_PIPE_MODE_NONE &&
+        shell_tokenize_commands(input, strlen(input), &commands,
+                                &command_count) == SHELL_TOKENIZE_OK &&
+        command_count == 1 &&
+        shell_process_commands(input, strlen(input), NULL, &processed) ==
+            SHELL_PROCESS_OK &&
+        processed.command_count == 1 && !processed.commands[0].has_pipe_input &&
+        !processed.commands[0].has_pipe_output &&
+        shell_dep_graph_parse(input, strlen(input), ".", NULL, &graph) ==
+            SHELL_DEP_OK &&
+        graph.edge_count == 0 && shell_dep_graph_validate(&graph).valid;
+    shell_commands_free(commands, command_count);
+    shell_processed_commands_free(&processed);
+    if (!opaque_word_ok)
+      return 1;
+  }
+
+  /* A raw opening brace is literal in a parameter word. Keep both the
+   * accepted operand forms and the outer-pipeline boundary in the always-run
+   * oracle set without adding checked-in smoke seeds. */
+  static const struct {
+    const char *input;
+    uint32_t command_count;
+    uint32_t pipe_count;
+  } parameter_literal_brace_cases[] = {
+      {"echo ${value:-{}", 1, 0},
+      {"echo ${value#{}", 1, 0},
+      {"echo ${value/{}", 1, 0},
+      {"echo ${value:-${fallback:-{}}", 1, 0},
+      {"echo ${value:-{left}| cat", 2, 1},
+  };
+  for (const auto &item : parameter_literal_brace_cases) {
+    shell_parse_result_t parsed = {};
+    shell_command_t *commands = NULL;
+    size_t command_count = 0;
+    shell_processed_commands_t processed = {};
+    shell_transformed_command_t **transformed = NULL;
+    size_t transformed_count = 0;
+    shell_abstract_command_t *abstract = NULL;
+    shell_dep_graph_t graph = {};
+    bool parameter_brace_ok =
+        shell_parse_fast(item.input, strlen(item.input), NULL, &parsed) ==
+            SHELL_OK &&
+        parsed.count == item.command_count &&
+        shell_tokenize_commands(item.input, strlen(item.input), &commands,
+                                &command_count) == SHELL_TOKENIZE_OK &&
+        command_count == item.command_count &&
+        shell_process_commands(item.input, strlen(item.input), NULL,
+                               &processed) == SHELL_PROCESS_OK &&
+        processed.command_count == item.command_count &&
+        shell_transform_command_line(item.input, strlen(item.input), NULL,
+                                     &transformed, &transformed_count) ==
+            SHELL_TRANSFORM_OK &&
+        transformed_count == item.command_count &&
+        shell_abstract_command_parse(item.input, strlen(item.input),
+                                     &abstract) == SHELL_ABSTRACT_OK &&
+        abstract != NULL &&
+        shell_dep_graph_parse(item.input, strlen(item.input), ".", NULL,
+                              &graph) == SHELL_DEP_OK &&
+        shell_dep_graph_validate(&graph).valid;
+    uint32_t pipe_count = 0;
+    for (uint32_t edge = 0; parameter_brace_ok && edge < graph.edge_count;
+         edge++)
+      pipe_count += graph.edges[edge].type == SHELL_EDGE_PIPE;
+    shell_commands_free(commands, command_count);
+    shell_processed_commands_free(&processed);
+    shell_transformed_command_list_free(transformed, transformed_count);
+    shell_abstract_command_free(abstract);
+    if (!parameter_brace_ok || pipe_count != item.pipe_count)
+      return 1;
+  }
+
+  static const char *const structural_word_cases[] = {
+      "echo prefix{left|right}suffix",
+      "echo [left|right]",
+      "echo [[:alpha:]|]",
+  };
+  for (const char *input : structural_word_cases) {
+    shell_parse_result_t parsed = {};
+    shell_command_t *commands = NULL;
+    size_t command_count = 0;
+    shell_processed_commands_t processed = {};
+    shell_dep_graph_t graph = {};
+    uint32_t pipe_count = 0;
+    bool structural_word_ok =
+        shell_parse_fast(input, strlen(input), NULL, &parsed) == SHELL_OK &&
+        parsed.count == 2 && parsed.cmds[1].type == SHELL_TYPE_PIPELINE &&
+        parsed.cmds[1].pipe_input_mode == SHELL_PIPE_MODE_STDOUT &&
+        shell_tokenize_commands(input, strlen(input), &commands,
+                                &command_count) == SHELL_TOKENIZE_OK &&
+        command_count == 2 &&
+        shell_process_commands(input, strlen(input), NULL, &processed) ==
+            SHELL_PROCESS_OK &&
+        processed.command_count == 2 && processed.commands[0].has_pipe_output &&
+        processed.commands[1].has_pipe_input &&
+        shell_dep_graph_parse(input, strlen(input), ".", NULL, &graph) ==
+            SHELL_DEP_OK &&
+        shell_dep_graph_validate(&graph).valid;
+    for (uint32_t edge = 0; structural_word_ok && edge < graph.edge_count;
+         edge++)
+      pipe_count += graph.edges[edge].type == SHELL_EDGE_PIPE;
+    shell_commands_free(commands, command_count);
+    shell_processed_commands_free(&processed);
+    if (!structural_word_ok || pipe_count != 1)
+      return 1;
+  }
+
+  static const struct {
+    const char *input;
+    uint32_t command_count;
+    uint32_t pipe_count;
+  } redirect_fragment_cases[] = {
+      {"printf x >out@(left|right)", 1, 0},
+      {"printf x >out{left|right}", 2, 0},
+      {"printf x >out[left|right]", 2, 0},
+  };
+  for (const auto &item : redirect_fragment_cases) {
+    shell_parse_result_t parsed = {};
+    shell_command_t *commands = NULL;
+    size_t command_count = 0;
+    shell_processed_commands_t processed = {};
+    shell_dep_graph_t graph = {};
+    uint32_t pipe_count = 0;
+    bool redirect_fragment_ok =
+        shell_parse_fast(item.input, strlen(item.input), NULL, &parsed) ==
+            SHELL_OK &&
+        parsed.count == item.command_count &&
+        shell_tokenize_commands(item.input, strlen(item.input), &commands,
+                                &command_count) == SHELL_TOKENIZE_OK &&
+        command_count == item.command_count &&
+        shell_process_commands(item.input, strlen(item.input), NULL,
+                               &processed) == SHELL_PROCESS_OK &&
+        processed.command_count == item.command_count &&
+        shell_dep_graph_parse(item.input, strlen(item.input), ".", NULL,
+                              &graph) == SHELL_DEP_OK &&
+        shell_dep_graph_validate(&graph).valid;
+    for (uint32_t edge = 0; redirect_fragment_ok && edge < graph.edge_count;
+         edge++)
+      pipe_count += graph.edges[edge].type == SHELL_EDGE_PIPE;
+    shell_commands_free(commands, command_count);
+    shell_processed_commands_free(&processed);
+    if (!redirect_fragment_ok || pipe_count != item.pipe_count)
+      return 1;
+  }
+
+  /* A document-only right pipeline member still owns its document input, but
+   * the preceding command retains the real pipe route to an endpoint. */
+  static const struct {
+    const char *input;
+    uint16_t marker_type;
+    shell_pipe_mode_t mode;
+    uint32_t pipe_count;
+  } document_pipeline_cases[] = {
+      {"printf x | <<EOF\nbody\nEOF\n", SHELL_TYPE_HEREDOC,
+       SHELL_PIPE_MODE_STDOUT, 1},
+      {"printf x | <<<body", SHELL_TYPE_HERESTRING, SHELL_PIPE_MODE_STDOUT, 1},
+      {"printf x |& <<EOF\nbody\nEOF\n", SHELL_TYPE_HEREDOC,
+       SHELL_PIPE_MODE_STDOUT_AND_STDERR, 2},
+      {"printf x |& <<<body", SHELL_TYPE_HERESTRING,
+       SHELL_PIPE_MODE_STDOUT_AND_STDERR, 2},
+  };
+  for (const auto &item : document_pipeline_cases) {
+    shell_parse_result_t parsed = {};
+    shell_processed_commands_t processed = {};
+    shell_dep_graph_t graph = {};
+    bool document_pipeline_ok =
+        shell_parse_fast(item.input, strlen(item.input), NULL, &parsed) ==
+            SHELL_OK &&
+        parsed.count == 2 && parsed.cmds[1].type == item.marker_type &&
+        parsed.cmds[1].pipe_input_mode == item.mode &&
+        shell_process_commands(item.input, strlen(item.input), NULL,
+                               &processed) == SHELL_PROCESS_OK &&
+        processed.command_count == 1 && processed.commands[0].has_pipe_output &&
+        processed.commands[0].pipe_output_mode == item.mode &&
+        shell_dep_graph_parse(item.input, strlen(item.input), ".", NULL,
+                              &graph) == SHELL_DEP_OK &&
+        shell_dep_graph_validate(&graph).valid;
+    uint32_t pipe_count = 0;
+    for (uint32_t edge = 0; edge < graph.edge_count; edge++)
+      pipe_count += graph.edges[edge].type == SHELL_EDGE_PIPE;
+    shell_processed_commands_free(&processed);
+    if (!document_pipeline_ok || pipe_count != item.pipe_count)
+      return 1;
+  }
+
+  /* Named descriptors prefix document redirects; neither the descriptor nor
+   * the document marker may become argv.  Keep these fixed cross-layer
+   * oracles outside the checked-in smoke corpus. */
+  static const char *const named_document_cases[] = {
+      "printf x {fd}<<<body",     "printf x {fd}<<EOF\nbody\nEOF\n",
+      "{ cat; } {fd}<<<body",     "{ cat; } {fd}<<EOF\nbody\nEOF\n",
+      "printf x {f\\\nd}<<<body", "{ cat; } {f\\\r\nd}\\\n<<EOF\nbody\nEOF\n",
+  };
+  for (const char *input : named_document_cases) {
+    shell_parse_result_t parsed = {};
+    shell_processed_commands_t processed = {};
+    shell_dep_graph_t graph = {};
+    bool named_document_ok =
+        shell_parse_fast(input, strlen(input), NULL, &parsed) == SHELL_OK &&
+        shell_process_commands(input, strlen(input), NULL, &processed) ==
+            SHELL_PROCESS_OK &&
+        processed.command_count == 1 &&
+        shell_dep_graph_parse(input, strlen(input), "/tmp", NULL, &graph) ==
+            SHELL_DEP_OK &&
+        shell_dep_graph_validate(&graph).valid;
+    uint32_t command_nodes = 0;
+    bool named_document_edge = false;
+    for (uint32_t node = 0; node < graph.node_count; node++)
+      command_nodes += graph.nodes[node].type == SHELL_NODE_CMD;
+    for (uint32_t edge = 0; edge < graph.edge_count; edge++)
+      named_document_edge = named_document_edge ||
+                            (graph.edges[edge].type == SHELL_EDGE_FD_OPEN &&
+                             graph.edges[edge].source_fd == SHELL_DEP_FD_NONE &&
+                             graph.edges[edge].target_fd == SHELL_DEP_FD_NAMED);
+    shell_processed_commands_free(&processed);
+    if (!named_document_ok || command_nodes != 1 || !named_document_edge) {
+      return 1;
+    }
+  }
+
+  static const char *const literal_named_fd_cases[] = {
+      "cat $'x'{fd}>out",
+      "cat ''{fd}>out",
+      "cat ${x}{fd}<<<body",
+      "cat $(id){fd}>out",
+  };
+  for (const char *input : literal_named_fd_cases) {
+    shell_processed_commands_t processed = {};
+    shell_dep_graph_t graph = {};
+    bool ok = shell_process_commands(input, strlen(input), NULL, &processed) ==
+                  SHELL_PROCESS_OK &&
+              processed.command_count == 1 &&
+              processed.commands[0].command_token_count == 2 &&
+              shell_dep_graph_parse(input, strlen(input), "/tmp", NULL,
+                                    &graph) == SHELL_DEP_OK &&
+              shell_dep_graph_validate(&graph).valid;
+    for (uint32_t edge = 0; edge < graph.edge_count; edge++)
+      if (graph.edges[edge].type == SHELL_EDGE_FD_OPEN &&
+          (graph.edges[edge].source_fd == SHELL_DEP_FD_NAMED ||
+           graph.edges[edge].target_fd == SHELL_DEP_FD_NAMED))
+        ok = false;
+    shell_processed_commands_free(&processed);
+    if (!ok)
+      return 1;
+  }
+
+  static const char compound_words[] =
+      "$'c'3>out;cat \"x\"${y}z;my\\\r\ncommand value";
+  char *raw = nullptr;
+  char *typed = nullptr;
+  size_t compound_count = 0;
+  bool compound_ok =
+      shell_build_anomaly_netseqs(compound_words, sizeof(compound_words) - 1,
+                                  NULL, &raw, &typed,
+                                  &compound_count) == SHELL_PROCESS_OK &&
+      compound_count == 3 && raw && typed &&
+      strcmp(raw, "2:c3,3:cat,9:mycommand,") == 0 &&
+      strcmp(typed, "5:2:c3,,12:3:cat,3:STR,,18:9:mycommand,3:STR,,") == 0;
+  free(typed);
+  free(raw);
+  if (!compound_ok)
+    return 1;
+
+  static const char *const negated_document_cases[] = {
+      "! <<<body",
+      "! ! <<<body",
+      "! <<EOF\nbody\nEOF\n",
+      "! ! <<EOF\nbody\nEOF\n",
+  };
+  for (const char *input : negated_document_cases) {
+    shell_parse_result_t parsed = {};
+    shell_dep_graph_t graph = {};
+    if (shell_parse_fast(input, strlen(input), NULL, &parsed) != SHELL_OK ||
+        parsed.count != 1 || parsed.cmds[0].pipeline_negation_count == 0 ||
+        shell_dep_graph_parse(input, strlen(input), "/tmp", NULL, &graph) !=
+            SHELL_DEP_OK ||
+        graph.node_count == 0 || graph.nodes[0].type != SHELL_NODE_CMD ||
+        graph.nodes[0].cmd.token_count != 0 ||
+        graph.nodes[0].cmd.pipeline_negation_count !=
+            parsed.cmds[0].pipeline_negation_count ||
+        !shell_dep_graph_validate(&graph).valid) {
+      return 1;
+    }
+  }
+
+  /* Line continuations after a list connector are structural syntax, not a
+   * semicolon separator. Keep a compact semantic oracle here so random input
+   * mutation cannot regress the agreement between fast ranges, processing,
+   * and dependency routing. */
+  struct continued_list_oracle {
+    const char *input;
+    uint16_t type;
+    shell_pipe_mode_t pipe_mode;
+    shell_dep_edge_type_t relation;
+    uint32_t relation_count;
+  };
+  static const continued_list_oracle continued_lists[] = {
+      {"printf x | # note\ncat", SHELL_TYPE_PIPELINE, SHELL_PIPE_MODE_STDOUT,
+       SHELL_EDGE_PIPE, 1},
+      {"printf x |& \\\r\ncat", SHELL_TYPE_PIPELINE,
+       SHELL_PIPE_MODE_STDOUT_AND_STDERR, SHELL_EDGE_PIPE, 2},
+      {"printf x &&\ncat", SHELL_TYPE_AND, SHELL_PIPE_MODE_NONE, SHELL_EDGE_AND,
+       1},
+      {"printf x || # note\ncat", SHELL_TYPE_OR, SHELL_PIPE_MODE_NONE,
+       SHELL_EDGE_OR, 1},
+  };
+  for (const continued_list_oracle &item : continued_lists) {
+    shell_parse_result_t continued_fast = {};
+    shell_processed_commands_t continued_processed = {};
+    shell_dep_graph_t continued_graph = {};
+    bool continued_ok =
+        shell_parse_fast(item.input, strlen(item.input), NULL,
+                         &continued_fast) == SHELL_OK &&
+        continued_fast.count == 2 && continued_fast.cmds[1].type == item.type &&
+        continued_fast.cmds[1].pipe_input_mode == item.pipe_mode &&
+        shell_process_commands(item.input, strlen(item.input), NULL,
+                               &continued_processed) == SHELL_PROCESS_OK &&
+        continued_processed.command_count == 2 &&
+        shell_dep_graph_parse(item.input, strlen(item.input), ".", NULL,
+                              &continued_graph) == SHELL_DEP_OK;
+    if (item.type == SHELL_TYPE_PIPELINE)
+      continued_ok =
+          continued_ok && continued_processed.commands[0].has_pipe_output &&
+          continued_processed.commands[0].pipe_output_mode == item.pipe_mode &&
+          continued_processed.commands[1].has_pipe_input;
+    uint32_t relations = 0;
+    for (uint32_t edge = 0; edge < continued_graph.edge_count; edge++)
+      relations += continued_graph.edges[edge].type == item.relation;
+    continued_ok = continued_ok && relations == item.relation_count &&
+                   shell_dep_graph_validate(&continued_graph).valid;
+    shell_processed_commands_free(&continued_processed);
+    if (!continued_ok)
+      return 1;
+  }
+
+  static const char continued_group[] = "{ printf x; } \\\n|& { cat; }";
+  shell_processed_commands_t continued_group_processed = {};
+  shell_dep_graph_t continued_group_graph = {};
+  bool continued_group_ok =
+      shell_process_commands(continued_group, sizeof(continued_group) - 1, NULL,
+                             &continued_group_processed) == SHELL_PROCESS_OK &&
+      continued_group_processed.command_count == 2 &&
+      continued_group_processed.group_count == 2 &&
+      continued_group_processed.group_io_op_count == 2 &&
+      continued_group_processed.group_io_ops[0].kind ==
+          SHELL_GROUP_IO_PIPE_OUTPUT_STDERR &&
+      continued_group_processed.group_io_ops[1].kind ==
+          SHELL_GROUP_IO_PIPE_INPUT &&
+      continued_group_processed.group_io_ops[0].source_start ==
+          continued_group_processed.group_io_ops[1].source_start &&
+      continued_group_processed.group_io_ops[0].source_end ==
+          continued_group_processed.group_io_ops[1].source_end &&
+      shell_dep_graph_parse(continued_group, sizeof(continued_group) - 1, ".",
+                            NULL, &continued_group_graph) == SHELL_DEP_OK;
+  uint32_t continued_group_pipe_count = 0;
+  for (uint32_t i = 0; i < continued_group_graph.edge_count; i++)
+    continued_group_pipe_count +=
+        continued_group_graph.edges[i].type == SHELL_EDGE_PIPE;
+  continued_group_ok = continued_group_ok && continued_group_pipe_count == 2 &&
+                       shell_dep_graph_validate(&continued_group_graph).valid;
+  shell_processed_commands_free(&continued_group_processed);
+  if (!continued_group_ok)
+    return 1;
+
+  shell_processed_commands_t negated_pipeline = {};
+  bool negation_ok =
+      shell_process_commands("! false |& cat | sort",
+                             strlen("! false |& cat | sort"), NULL,
+                             &negated_pipeline) == SHELL_PROCESS_OK &&
+      negated_pipeline.command_count == 3 &&
+      negated_pipeline.commands[0].pipeline_negated &&
+      negated_pipeline.commands[1].pipeline_negated &&
+      negated_pipeline.commands[2].pipeline_negated &&
+      negated_pipeline.commands[0].pipe_output_mode ==
+          SHELL_PIPE_MODE_STDOUT_AND_STDERR &&
+      negated_pipeline.commands[1].pipe_output_mode == SHELL_PIPE_MODE_STDOUT &&
+      !negated_pipeline.commands[2].has_pipe_output &&
+      negated_pipeline.commands[2].pipe_output_mode == SHELL_PIPE_MODE_NONE;
+  shell_processed_commands_free(&negated_pipeline);
+  if (!negation_ok)
+    return 1;
+
+  /* Every leading `!` is a modifier, so the count and parity must survive the
+   * fast/full processor boundary without leaking a synthetic `!` argv word. */
+  shell_processed_commands_t repeated_negation = {};
+  bool repeated_negation_ok =
+      shell_process_commands("! ! false |& cat | sort",
+                             strlen("! ! false |& cat | sort"), NULL,
+                             &repeated_negation) == SHELL_PROCESS_OK &&
+      repeated_negation.command_count == 3;
+  for (size_t i = 0;
+       repeated_negation_ok && i < repeated_negation.command_count; i++)
+    repeated_negation_ok =
+        repeated_negation.commands[i].pipeline_negation_count == 2 &&
+        !repeated_negation.commands[i].pipeline_negated;
+  repeated_negation_ok =
+      repeated_negation_ok &&
+      repeated_negation.commands[0].command_token_count == 1 &&
+      repeated_negation.commands[0].command_tokens[0].length == 5 &&
+      memcmp(repeated_negation.commands[0].command_tokens[0].start, "false",
+             5) == 0;
+  shell_processed_commands_free(&repeated_negation);
+  if (!repeated_negation_ok)
+    return 1;
+
+  static const struct {
+    const char *input;
+    size_t command_count;
+  } valid_list_cases[] = {
+      {"! ! true", 1},
+      {"! ! ! true", 1},
+      {"a && ! b", 2},
+      {"a & ! b", 2},
+  };
+  for (const auto &item : valid_list_cases) {
+    shell_parse_result_t parsed = {};
+    shell_command_t *commands = NULL;
+    size_t command_count = 0;
+    shell_processed_commands_t processed = {};
+    shell_dep_graph_t graph = {};
+    bool valid =
+        shell_parse_fast(item.input, strlen(item.input), NULL, &parsed) ==
+            SHELL_OK &&
+        parsed.count == item.command_count &&
+        shell_tokenize_commands(item.input, strlen(item.input), &commands,
+                                &command_count) == SHELL_TOKENIZE_OK &&
+        command_count == item.command_count &&
+        shell_process_commands(item.input, strlen(item.input), NULL,
+                               &processed) == SHELL_PROCESS_OK &&
+        processed.command_count == item.command_count &&
+        shell_dep_graph_parse(item.input, strlen(item.input), NULL, NULL,
+                              &graph) == SHELL_DEP_OK &&
+        shell_dep_graph_validate(&graph).valid;
+    shell_commands_free(commands, command_count);
+    shell_processed_commands_free(&processed);
+    if (!valid)
+      return 1;
+  }
+
+  struct parameter_word_oracle {
+    const char *input;
+    bool has_substitution;
+  };
+  static const parameter_word_oracle parameter_word_cases[] = {
+      {"printf ${VALUE#prefix${SUFFIX:-$(producer)}}", true},
+      {"printf ${VALUE##prefix${SUFFIX}}", false},
+      {"printf ${VALUE%tail${SUFFIX}}", false},
+      {"printf ${VALUE%%tail${SUFFIX}}", false},
+      {"printf ${VALUE/pattern/${REPLACEMENT}}", false},
+      {"printf ${VALUE:-{left,right}}", false},
+  };
+  for (const parameter_word_oracle &item : parameter_word_cases) {
+    size_t length = strlen(item.input);
+    shell_parse_result_t parsed = {};
+    shell_command_t *commands = NULL;
+    size_t command_count = 0;
+    shell_processed_commands_t processed = {};
+    char *netargv = NULL;
+    size_t netargv_count = 0;
+    bool features = false;
+    shell_transformed_command_t **transformed = NULL;
+    size_t transformed_count = 0;
+    shell_abstract_command_t *abstract = NULL;
+    shell_dep_graph_t graph = {};
+    bool valid =
+        shell_parse_fast(item.input, length, NULL, &parsed) == SHELL_OK &&
+        parsed.count == 1 &&
+        shell_tokenize_commands(item.input, length, &commands,
+                                &command_count) == SHELL_TOKENIZE_OK &&
+        command_count == 1 &&
+        shell_process_commands(item.input, length, NULL, &processed) ==
+            SHELL_PROCESS_OK &&
+        processed.command_count == 1 &&
+        shell_build_netargv_sequence(item.input, length, NULL, &netargv,
+                                     &netargv_count,
+                                     &features) == SHELL_PROCESS_OK &&
+        netargv != NULL && netargv_count == 1 &&
+        shell_transform_command_line(item.input, length, NULL, &transformed,
+                                     &transformed_count) ==
+            SHELL_TRANSFORM_OK &&
+        transformed != NULL && transformed_count == 1 &&
+        shell_abstract_command_parse(item.input, length, &abstract) ==
+            SHELL_ABSTRACT_OK &&
+        abstract != NULL && abstract->has_cmd_subst == item.has_substitution &&
+        shell_dep_graph_parse(item.input, length, ".", NULL, &graph) ==
+            SHELL_DEP_OK &&
+        shell_dep_graph_validate(&graph).valid;
+    shell_commands_free(commands, command_count);
+    shell_processed_commands_free(&processed);
+    free(netargv);
+    shell_transformed_command_list_free(transformed, transformed_count);
+    shell_abstract_command_free(abstract);
+    if (!valid)
+      return 1;
+  }
+
+  static const char *const invalid_list_cases[] = {
+      "a |",
+      "a &&",
+      "a ||",
+      "a || || b",
+      "a && && b",
+      "a & & b",
+      "a | ! b",
+      "! !",
+      "! \nprintf x |& cat",
+      "! # note\nprintf x |& cat",
+      "{ printf x; } 2&>combined",
+      "{ printf x; } 3&>>combined",
+      "{ printf x; } {fd}&>combined",
+      "printf ${VALUE${SUFFIX}}",
+      "printf ${VALUE$SUFFIX}",
+      "printf ${VALUE.suffix}",
+      "printf ${?suffix}",
+      "printf ${10suffix}",
+  };
+  for (const char *input : invalid_list_cases) {
+    shell_parse_result_t parsed = {};
+    shell_command_t *commands = (shell_command_t *)(uintptr_t)1;
+    size_t command_count = SIZE_MAX;
+    shell_processed_commands_t processed = {
+        (shell_command_info_t *)(uintptr_t)1, SIZE_MAX,
+        (shell_group_t *)(uintptr_t)1,        SIZE_MAX,
+        (shell_group_io_op_t *)(uintptr_t)1,  SIZE_MAX,
+    };
+    shell_dep_graph_t graph = {};
+    bool invalid =
+        shell_parse_fast(input, strlen(input), NULL, &parsed) == SHELL_EPARSE &&
+        shell_tokenize_commands(input, strlen(input), &commands,
+                                &command_count) == SHELL_TOKENIZE_EPARSE &&
+        commands == NULL && command_count == 0 &&
+        shell_process_commands(input, strlen(input), NULL, &processed) ==
+            SHELL_PROCESS_EPARSE &&
+        processed.commands == NULL && processed.command_count == 0 &&
+        processed.groups == NULL && processed.group_count == 0 &&
+        processed.group_io_ops == NULL && processed.group_io_op_count == 0 &&
+        shell_dep_graph_parse(input, strlen(input), NULL, NULL, &graph) ==
+            SHELL_DEP_EPARSE;
+    if (!invalid)
+      return 1;
+  }
+
   if (shell_parse_fast("printf $'a\\0b' @(one|two) xs=(one two) &>out",
                        strlen("printf $'a\\0b' @(one|two) xs=(one two) &>out"),
                        NULL, &modern) != SHELL_OK ||
@@ -294,6 +982,110 @@ static int test_fixed_oracles(void) {
                              &unsupported) != SHELL_PROCESS_EPARSE)
     return 1;
   shell_processed_commands_free(&unsupported);
+
+  static const char *const redirect_boundaries[] = {
+      "cat >out;echo hi",
+      "cat >out|echo hi",
+      "cat >out|&echo hi",
+      "cat >out&&echo hi",
+      "cat >out||echo hi",
+      "cat >out&echo hi",
+      "{ cat; } >out;echo hi",
+      "> <(cat)while echo ok",
+      "> prefix<(cat)while echo ok",
+  };
+  for (const char *input : redirect_boundaries) {
+    char *sequence = NULL;
+    size_t command_count = 0;
+    bool features = false;
+    if (shell_build_netargv_sequence(input, strlen(input), NULL, &sequence,
+                                     &command_count,
+                                     &features) != SHELL_PROCESS_OK ||
+        command_count != (strstr(input, "echo hi") ? 2u : 1u)) {
+      free(sequence);
+      return 1;
+    }
+    free(sequence);
+  }
+  static const char *const redirect_followed_by_unsupported[] = {
+      "> <(cat)foo declare -a values",
+      "> <(cat)foo time echo ok",
+      "> <(cat)foo [[ x ]]",
+      "> <(cat)foo while true; do :; done",
+  };
+  for (const char *input : redirect_followed_by_unsupported) {
+    shell_processed_commands_t result = {};
+    if (shell_process_commands(input, strlen(input), NULL, &result) !=
+            SHELL_PROCESS_EPARSE ||
+        result.commands != NULL || result.command_count != 0)
+      return 1;
+  }
+
+  /* These Bash forms remain lexically visible for diagnostics, but the
+   * canonical argv, transform, abstraction, and graph APIs must refuse a
+   * semantic model they cannot faithfully provide. Keep this independent of
+   * checked-in smoke seeds so the fail-closed boundary runs in every session.
+   */
+  static const char *const unmodeled_semantic_cases[] = {
+      "[[ -f /tmp/x ]]",
+      "(( count += 1 ))",
+      "time -p echo x",
+      "printf '%s' $\"localized\"",
+      "echo \"${value:-$\"localized\"}\"",
+      "declare arr[0]",
+      "declare 'arr[0]'",
+      "declare arr\\[0\\]",
+      "declare arr$'[0]'",
+      "\"declare\" -a values",
+      "d\\eclare -a values",
+      "de$'clare' -a values",
+      "command \"declare\" -a values",
+      "command -$'p' de$'clare' -a values",
+      "declare \"-a\" values",
+      "declare -$'a' values",
+      "declare \"arr[0]=value\"",
+      "readonly \"map[key]+=value\"",
+      "typeset map[key]",
+      "command -- declare \"arr[$(printf 0)]\"",
+      "echo $( [[ -f /tmp/x ]] )",
+      "{ (( 1 )); }",
+      "cat <<EOF\n$(while true; do :; done)\nEOF\n",
+      "cat <<EOF\n`select item in one; do :; done`\nEOF\n",
+      "cat <<EOF\n${items[0]}\nEOF\n",
+      "cat <<EOF\n$((items[0]))\nEOF\n",
+  };
+  for (const char *input : unmodeled_semantic_cases) {
+    shell_command_t *lexical = NULL;
+    size_t lexical_count = 0;
+    shell_processed_commands_t canonical = {};
+    shell_transformed_command_t **transformed = NULL;
+    size_t transformed_count = 0;
+    shell_abstract_command_t *abstract = NULL;
+    shell_dep_graph_t graph = {};
+    bool rejected =
+        shell_tokenize_commands(input, strlen(input), &lexical,
+                                &lexical_count) == SHELL_TOKENIZE_OK &&
+        lexical != NULL && lexical_count > 0 &&
+        shell_process_commands(input, strlen(input), NULL, &canonical) ==
+            SHELL_PROCESS_EPARSE &&
+        canonical.commands == NULL && canonical.command_count == 0 &&
+        shell_transform_command_line(input, strlen(input), NULL, &transformed,
+                                     &transformed_count) ==
+            SHELL_TRANSFORM_EPARSE &&
+        transformed == NULL && transformed_count == 0 &&
+        shell_abstract_command_parse(input, strlen(input), &abstract) ==
+            SHELL_ABSTRACT_EPARSE &&
+        abstract == NULL &&
+        shell_dep_graph_parse(input, strlen(input), NULL, NULL, &graph) ==
+            SHELL_DEP_EPARSE &&
+        graph.node_count == 0 && graph.edge_count == 0;
+    shell_commands_free(lexical, lexical_count);
+    shell_processed_commands_free(&canonical);
+    shell_transformed_command_list_free(transformed, transformed_count);
+    shell_abstract_command_free(abstract);
+    if (!rejected)
+      return 1;
+  }
 
   static const struct {
     const char *input;
@@ -421,6 +1213,10 @@ static int test_fixed_oracles(void) {
       {"echo $(id)", 2, 1},
       {"echo $(id)$(pwd)", 3, 2},
       {"echo prefix$(id)suffix$(pwd)", 3, 2},
+      {"cat < prefix<(id)", 2, 0},
+      {"{ cat; } > >(id)suffix", 2, 0},
+      {"cat < <(id)<(pwd)", 3, 0},
+      {"echo $(<prefix<(id))", 2, 1},
       {"echo $(id)`pwd`", 3, 2},
       {"echo $(( $(id) + 1 ))", 2, 1},
       {"echo \\$(id)", 1, 0},
@@ -546,6 +1342,185 @@ static int test_fixed_oracles(void) {
       return 1;
     }
     shell_commands_free(commands, command_count);
+  }
+
+  /* Redirect operands are attached grammar, so only horizontal whitespace and
+   * escaped physical line endings may separate them from their operator. Keep
+   * the complete API family in this fixed oracle: accepting one of these
+   * malformed inputs in only a downstream representation would fabricate a
+   * different command stream for policy and graph consumers. */
+  static const char *const invalid_redirect_operands[] = {
+      "echo >\nout",
+      "echo > # comment",
+      "echo <\nin",
+      "echo 2>\nerr",
+      "echo &>\nout",
+      "echo <<<\nword",
+      "echo <<\nEOF\nbody\nEOF\n",
+      "echo >#comment",
+      "echo 2>#comment",
+      "echo <#comment",
+      "echo >|#comment",
+      "echo <>#comment",
+      "echo &>#comment",
+      "echo &>>#comment",
+      "echo <<<#comment",
+      "echo <<#comment",
+      "echo <<-#comment",
+      "echo << #comment",
+      "echo <<- #comment",
+  };
+  for (const char *input : invalid_redirect_operands) {
+    size_t length = strlen(input);
+    shell_parse_result_t fast = {};
+    shell_command_t *commands = NULL;
+    size_t command_count = 0;
+    shell_command_info_t *infos = NULL;
+    size_t info_count = 0;
+    shell_processed_commands_t processed = {};
+    char *netargv = NULL;
+    size_t netargv_count = 0;
+    bool has_shell_features = false;
+    char *command_netseq = NULL;
+    size_t command_netseq_count = 0;
+    char *type_netseq = NULL;
+    size_t type_netseq_count = 0;
+    char *anomaly_commands = NULL;
+    char *anomaly_types = NULL;
+    size_t anomaly_count = 0;
+    shell_dep_graph_t graph = {};
+    bool rejected =
+        shell_parse_fast(input, length, NULL, &fast) == SHELL_EPARSE &&
+        shell_tokenize_commands(input, length, &commands, &command_count) ==
+            SHELL_TOKENIZE_EPARSE &&
+        commands == NULL && command_count == 0 &&
+        shell_process_command(input, length, NULL, &infos, &info_count) ==
+            SHELL_PROCESS_EPARSE &&
+        infos == NULL && info_count == 0 &&
+        shell_process_commands(input, length, NULL, &processed) ==
+            SHELL_PROCESS_EPARSE &&
+        processed.commands == NULL && processed.command_count == 0 &&
+        shell_build_netargv_sequence(input, length, NULL, &netargv,
+                                     &netargv_count, &has_shell_features) ==
+            SHELL_PROCESS_EPARSE &&
+        netargv == NULL && netargv_count == 0 &&
+        shell_build_command_netseq(input, length, NULL, &command_netseq,
+                                   &command_netseq_count) ==
+            SHELL_PROCESS_EPARSE &&
+        command_netseq == NULL && command_netseq_count == 0 &&
+        shell_build_type_netseq(input, length, NULL, &type_netseq,
+                                &type_netseq_count) == SHELL_PROCESS_EPARSE &&
+        type_netseq == NULL && type_netseq_count == 0 &&
+        shell_build_anomaly_netseqs(input, length, NULL, &anomaly_commands,
+                                    &anomaly_types,
+                                    &anomaly_count) == SHELL_PROCESS_EPARSE &&
+        anomaly_commands == NULL && anomaly_types == NULL &&
+        anomaly_count == 0 &&
+        shell_dep_graph_parse(input, length, ".", NULL, &graph) ==
+            SHELL_DEP_EPARSE &&
+        graph.status == SHELL_DEP_STATUS_ERROR;
+    shell_commands_free(commands, command_count);
+    shell_command_infos_free(infos, info_count);
+    shell_processed_commands_free(&processed);
+    free(netargv);
+    free(command_netseq);
+    free(type_netseq);
+    free(anomaly_commands);
+    free(anomaly_types);
+    if (!rejected)
+      return 1;
+  }
+
+  static const char *const accepted_redirect_operands[] = {
+      "echo > \\\nout",
+      "echo 2> \\\r\nerr",
+      "echo >\"#name\"",
+      "echo >\\#name",
+      "echo <<<\"#value\"",
+      "echo <<<\\#value",
+      "echo <<'#marker'\nbody\n#marker\n",
+      "echo <<\\#marker\nbody\n#marker\n",
+      "echo <<-'#marker'\n\tbody\n\t#marker\n",
+      "{ echo; } \\\n>out",
+      "{ echo; } \\\n<<<payload",
+      "{ echo; } \\\n<<EOF\npayload\nEOF\n",
+  };
+  for (const char *input : accepted_redirect_operands) {
+    size_t length = strlen(input);
+    shell_parse_result_t fast = {};
+    shell_command_t *commands = NULL;
+    size_t command_count = 0;
+    shell_processed_commands_t processed = {};
+    char *netargv = NULL;
+    size_t netargv_count = 0;
+    bool has_shell_features = false;
+    shell_dep_graph_t graph = {};
+    bool accepted =
+        shell_parse_fast(input, length, NULL, &fast) == SHELL_OK &&
+        shell_tokenize_commands(input, length, &commands, &command_count) ==
+            SHELL_TOKENIZE_OK &&
+        shell_process_commands(input, length, NULL, &processed) ==
+            SHELL_PROCESS_OK &&
+        shell_build_netargv_sequence(input, length, NULL, &netargv,
+                                     &netargv_count,
+                                     &has_shell_features) == SHELL_PROCESS_OK &&
+        shell_dep_graph_parse(input, length, ".", NULL, &graph) ==
+            SHELL_DEP_OK &&
+        shell_dep_graph_validate(&graph).valid;
+    shell_commands_free(commands, command_count);
+    shell_processed_commands_free(&processed);
+    free(netargv);
+    if (!accepted)
+      return 1;
+  }
+
+  struct redirect_owner_oracle {
+    const char *input;
+    shell_dep_doc_kind_t document_kind;
+    bool continued;
+  };
+  static const redirect_owner_oracle redirect_owners[] = {
+      {"{ echo; }\n<<<payload", SHELL_DOC_HERESTRING, false},
+      {"{ echo; } \\\n<<<payload", SHELL_DOC_HERESTRING, true},
+      {"{ echo; }\n<<EOF\npayload\nEOF\n", SHELL_DOC_HEREDOC, false},
+      {"{ echo; } \\\n<<EOF\npayload\nEOF\n", SHELL_DOC_HEREDOC, true},
+  };
+  for (const redirect_owner_oracle &item : redirect_owners) {
+    shell_dep_graph_t graph = {};
+    if (shell_dep_graph_parse(item.input, strlen(item.input), ".", NULL,
+                              &graph) != SHELL_DEP_OK ||
+        !shell_dep_graph_validate(&graph).valid)
+      return 1;
+    uint32_t group = UINT32_MAX;
+    uint32_t document = UINT32_MAX;
+    uint32_t empty_command = UINT32_MAX;
+    uint32_t command_count = 0;
+    for (uint32_t node = 0; node < graph.node_count; node++) {
+      if (graph.nodes[node].type == SHELL_NODE_GROUP &&
+          graph.nodes[node].group.parent == UINT32_MAX)
+        group = node;
+      if (graph.nodes[node].type == SHELL_NODE_DOC &&
+          graph.nodes[node].doc.kind == item.document_kind)
+        document = node;
+      if (graph.nodes[node].type == SHELL_NODE_CMD) {
+        command_count++;
+        if (graph.nodes[node].cmd.token_count == 0)
+          empty_command = node;
+      }
+    }
+    uint32_t reader = UINT32_MAX;
+    for (uint32_t edge = 0; edge < graph.edge_count; edge++) {
+      if (graph.edges[edge].type == SHELL_EDGE_READ &&
+          graph.edges[edge].from == document) {
+        reader = graph.edges[edge].to;
+        break;
+      }
+    }
+    if (group == UINT32_MAX || document == UINT32_MAX || reader == UINT32_MAX ||
+        (item.continued ? command_count != 1 || reader != group
+                        : command_count != 2 || empty_command == UINT32_MAX ||
+                              reader != empty_command))
+      return 1;
   }
   return 0;
 }
@@ -757,13 +1732,74 @@ static int test_full_parser(const char *input, size_t length) {
   return 0;
 }
 
+/* The public iterator preserves every lexical separator. The full command
+ * model deliberately elides physical newlines while a list is waiting for its
+ * next stage, so compare it to the iterator's semantic-token subsequence. */
+static bool tokenizer_token_is_newline(const shell_token_t &token) {
+  return token.type == SHELL_TOKEN_SEMICOLON && token.length != 0 &&
+         (token.start[0] == '\n' || token.start[0] == '\r');
+}
+
+static bool tokenizer_token_starts_command(const shell_token_t &token) {
+  switch (token.type) {
+  case SHELL_TOKEN_COMMAND:
+  case SHELL_TOKEN_ARGUMENT:
+  case SHELL_TOKEN_SUBSHELL:
+  case SHELL_TOKEN_VARIABLE:
+  case SHELL_TOKEN_VARIABLE_QUOTED:
+  case SHELL_TOKEN_SPECIAL_VAR:
+  case SHELL_TOKEN_ARITHMETIC:
+  case SHELL_TOKEN_GLOB:
+  case SHELL_TOKEN_ANSI_C_QUOTED:
+  case SHELL_TOKEN_EXTGLOB:
+  case SHELL_TOKEN_ARRAY_ASSIGNMENT:
+  case SHELL_TOKEN_HEREDOC:
+  case SHELL_TOKEN_HERESTRING:
+  case SHELL_TOKEN_REDIRECT_IN:
+  case SHELL_TOKEN_REDIRECT_OUT:
+  case SHELL_TOKEN_REDIRECT_ERR:
+  case SHELL_TOKEN_REDIRECT_APPEND:
+  case SHELL_TOKEN_REDIRECT_READ_WRITE:
+  case SHELL_TOKEN_REDIRECT_CLOBBER:
+  case SHELL_TOKEN_REDIRECT_BOTH:
+  case SHELL_TOKEN_REDIRECT_BOTH_APPEND:
+  case SHELL_TOKEN_PROCESS_SUB:
+    return true;
+  default:
+    return false;
+  }
+}
+
+static bool tokenizer_token_is_list_operator(const shell_token_t &token) {
+  return token.type == SHELL_TOKEN_PIPE ||
+         token.type == SHELL_TOKEN_PIPE_BOTH ||
+         token.type == SHELL_TOKEN_SEMICOLON || token.type == SHELL_TOKEN_AND ||
+         token.type == SHELL_TOKEN_OR || token.type == SHELL_TOKEN_BACKGROUND;
+}
+
+/* The iterator exposes a standalone escaped physical line ending so list
+ * validation can discard it before classifying the token that follows. The
+ * structured tokenizer intentionally omits this grammar-only token from its
+ * command records, so the iterator/reference comparison must do likewise. */
+static bool tokenizer_token_is_line_continuation(const shell_token_t &token) {
+  if (token.type != SHELL_TOKEN_ARGUMENT || !token.is_escaped ||
+      token.length < 2 || token.start[0] != '\\')
+    return false;
+  if (token.start[1] == '\n')
+    return token.length == 2;
+  return token.start[1] == '\r' &&
+         (token.length == 2 || (token.length == 3 && token.start[2] == '\n'));
+}
+
 static int test_tokenizer_state(const char *input, size_t length) {
   shell_tokenizer_state_t state = {};
-  shell_tokenizer_init(&state, input, strlen(input));
+  shell_tokenizer_init(&state, input, length);
 
   size_t steps = 0;
   size_t previous_end = 0;
   std::vector<shell_token_t> iterated;
+  bool expect_command = true;
+  bool follows_empty_heredoc = false;
   bool terminated = false;
   while (steps++ <= length + 32) {
     shell_token_t token = {};
@@ -777,9 +1813,33 @@ static int test_tokenizer_state(const char *input, size_t length) {
         token.length > length - token.position ||
         token.start != input + token.position || token.position < previous_end)
       return 1;
-    if (token.type != SHELL_TOKEN_GROUP_START &&
-        token.type != SHELL_TOKEN_GROUP_END)
-      iterated.push_back(token);
+    if (tokenizer_token_is_line_continuation(token)) {
+      previous_end = token.position + token.length;
+      continue;
+    }
+    /* An input-only heredoc after a list separator has no command record to
+     * own its document-closing separator. The iterator still exposes that
+     * newline while the structured tokenizer intentionally drops the empty
+     * trailing record. A heredoc attached to an ordinary command retains its
+     * newline and must continue through the normal comparison below. */
+    if (follows_empty_heredoc && tokenizer_token_is_newline(token)) {
+      follows_empty_heredoc = false;
+      previous_end = token.position + token.length;
+      continue;
+    }
+    bool begins_empty_heredoc =
+        token.type == SHELL_TOKEN_HEREDOC && expect_command;
+    if (token.type == SHELL_TOKEN_GROUP_START) {
+      expect_command = true;
+    } else if (token.type != SHELL_TOKEN_GROUP_END) {
+      if (!(expect_command && tokenizer_token_is_newline(token)))
+        iterated.push_back(token);
+      if (tokenizer_token_starts_command(token))
+        expect_command = false;
+      if (tokenizer_token_is_list_operator(token))
+        expect_command = true;
+    }
+    follows_empty_heredoc = begins_empty_heredoc;
     previous_end = token.position + token.length;
   }
   if (!terminated)
@@ -787,7 +1847,7 @@ static int test_tokenizer_state(const char *input, size_t length) {
 
   shell_command_t *commands = NULL;
   size_t command_count = 0;
-  bool full_ok = (shell_tokenize_commands(input, strlen(input), &commands,
+  bool full_ok = (shell_tokenize_commands(input, length, &commands,
                                           &command_count) == SHELL_TOKENIZE_OK);
   if (!full_ok) {
     shell_commands_free(commands, command_count);
@@ -1051,7 +2111,7 @@ static int test_transformer(const char *input, size_t input_length) {
             !tok->transformed ||
             (!transformed && tok->transformed != tok->original) ||
             (transformed && tok->transformed == tok->original) ||
-            tok->is_shell_construct != transformed) {
+            (transformed && !tok->is_shell_construct)) {
           if (g_verbose)
             fprintf(stderr, "\n=== TRANSFORMER ERROR: invalid token ===\n");
           shell_transformed_command_list_free(transformed_cmds,
@@ -1466,9 +2526,15 @@ static int test_generated_brace_case(const uint8_t *data, size_t size,
    * parsing rejects them. Exercise the tolerant surfaces above without
    * imposing an invented semantic graph contract on incomplete source. */
   if (!item.strict_valid) {
+    bool failed = fast_error != SHELL_OK || strict_error != SHELL_EPARSE;
+    if (failed && g_verbose)
+      fprintf(stderr,
+              "generated strict-only brace case failed: %s (fast=%d "
+              "strict=%d)\n",
+              item.command.c_str(), fast_error, strict_error);
     shell_commands_free(commands, command_count);
     shell_processed_commands_free(&processed);
-    return fast_error != SHELL_OK || strict_error != SHELL_EPARSE;
+    return failed;
   }
 
   uint32_t graph_commands = 0;
@@ -1497,10 +2563,13 @@ static int test_generated_brace_case(const uint8_t *data, size_t size,
     const shell_group_io_op_t *op = &processed.group_io_ops[i];
     bool relation = op->kind == SHELL_GROUP_IO_PIPE_INPUT ||
                     op->kind == SHELL_GROUP_IO_PIPE_OUTPUT ||
+                    op->kind == SHELL_GROUP_IO_PIPE_OUTPUT_STDERR ||
                     op->kind == SHELL_GROUP_IO_BACKGROUND;
     bool shared_pipeline_operator =
         i > 0 &&
-        processed.group_io_ops[i - 1].kind == SHELL_GROUP_IO_PIPE_OUTPUT &&
+        (processed.group_io_ops[i - 1].kind == SHELL_GROUP_IO_PIPE_OUTPUT ||
+         processed.group_io_ops[i - 1].kind ==
+             SHELL_GROUP_IO_PIPE_OUTPUT_STDERR) &&
         op->kind == SHELL_GROUP_IO_PIPE_INPUT &&
         processed.group_io_ops[i - 1].source_start == op->source_start &&
         processed.group_io_ops[i - 1].source_end == op->source_end;
@@ -1592,13 +2661,17 @@ static int test_generated_brace_case(const uint8_t *data, size_t size,
       netargv_status == SHELL_PROCESS_OK && netargv_count != 0 &&
       valid_generated_netargv_sequence(netargv_sequence, netargv_count) &&
       command_netseq_status == SHELL_PROCESS_OK &&
-      command_netseq_count == netargv_count &&
+      /* Netargv models only immediate list members. Canonical anomaly
+       * sequences additionally retain executable substitutions, so their
+       * stage count may be larger while raw, typed, and paired forms must
+       * still agree exactly. */
+      command_netseq_count >= netargv_count &&
       valid_generated_outer_netsequence(command_netseq, command_netseq_count) &&
       type_netseq_status == SHELL_PROCESS_OK &&
-      type_netseq_count == netargv_count &&
+      type_netseq_count == command_netseq_count &&
       valid_generated_outer_netsequence(type_netseq, type_netseq_count) &&
       paired_netseq_status == SHELL_PROCESS_OK &&
-      paired_count == netargv_count &&
+      paired_count == command_netseq_count &&
       strcmp(command_netseq, paired_command_netseq) == 0 &&
       strcmp(type_netseq, paired_type_netseq) == 0;
   if (!sequences_valid && g_verbose)
@@ -1954,6 +3027,118 @@ static int test_substitution_case(const shell_substitution_fuzz_case_t &item,
   return failed;
 }
 
+static int test_composite_redirect_operand(unsigned selector, const char *cwd) {
+  /* Exercise literal concatenation without growing the checked-in corpus. */
+  std::string operand = (selector & 1) ? "<(printf x)" : ">(cat)";
+  operand = (selector & 2) ? "prefix" + operand : operand + "suffix";
+  std::string command = (selector & 4) ? "{ cat; } " : "cat ";
+  command += (selector & 8) ? "< " : "> ";
+  command += operand;
+  shell_dep_graph_t graph = {};
+  if (shell_dep_graph_parse(command.data(), command.size(), cwd, NULL,
+                            &graph) != SHELL_DEP_OK ||
+      !shell_dep_graph_validate(&graph).valid)
+    return 1;
+  unsigned commands = 0;
+  for (uint32_t n = 0; n < graph.node_count; n++)
+    commands += graph.nodes[n].type == SHELL_NODE_CMD;
+  for (uint32_t e = 0; e < graph.edge_count; e++)
+    if (graph.edges[e].type == SHELL_EDGE_SUBST)
+      return 1;
+  if (commands != 2 || test_processor(command.data(), command.size()))
+    return 1;
+  return 0;
+}
+
+static int test_generated_redirect_boundary(unsigned selector) {
+  static const char *const separators[] = {";", "\n", "&&", "||",
+                                           "&", "|",  "|&"};
+  unsigned mode = selector % 6;
+  std::string number = std::to_string(selector / 6);
+  std::string input;
+  if (mode == 0)
+    input = std::string("{ cat; } >out") + separators[(selector / 3) % 7] +
+            " >other";
+  else if (mode == 1)
+    input = "cat " + number + " <<<body";
+  else if (mode == 2)
+    input = "cat " + number + "<<'EOF'\nwhile true; do :; done\nEOF\n";
+  else if (mode == 3)
+    input = "{ cat; } " + number + "\\\n2<<EOF\nbody\nEOF\n>out";
+  else if (mode == 4)
+    input = "cat " + number + "\\\r\n2<<<body";
+  else
+    input = "cat $'x'" + number + ">out";
+  bool empty_stage = mode == 0 || mode == 3;
+  char *raw = NULL, *typed = NULL;
+  size_t count = 0;
+  bool valid =
+      shell_build_anomaly_netseqs(input.data(), input.size(), NULL, &raw,
+                                  &typed, &count) == SHELL_PROCESS_OK;
+  valid = valid && count == (empty_stage ? 2u : 1u) &&
+          strcmp(raw, empty_stage ? "3:cat,0:," : "3:cat,") == 0;
+  free(raw);
+  free(typed);
+  shell_netstring_buffer_t sequence = {};
+  bool features = false;
+  shell_process_status_t status = shell_build_netargv_sequence_buffer(
+      input.data(), input.size(), NULL, &sequence, &count, &features);
+  if (empty_stage) {
+    valid = valid && status == SHELL_PROCESS_EPARSE && sequence.data == NULL &&
+            count == 0 && !features;
+  } else {
+    shell_netstring_iter_t outer, inner;
+    shell_netstring_view_t record, word;
+    valid = valid && status == SHELL_PROCESS_OK && count == 1 &&
+            shell_netstring_iter_init(&outer, sequence.data, sequence.length) ==
+                SHELL_NETSTRING_OK &&
+            shell_netstring_iter_next(&outer, &record) == SHELL_NETSTRING_OK &&
+            shell_netstring_iter_init(&inner, record.payload,
+                                      record.payload_length) ==
+                SHELL_NETSTRING_OK &&
+            shell_netstring_iter_next(&inner, &word) == SHELL_NETSTRING_OK &&
+            word.payload_length == 3 && memcmp(word.payload, "cat", 3) == 0;
+    if (mode == 1 || mode == 5) {
+      std::string expected = mode == 5 ? "x" + number : number;
+      valid = valid &&
+              shell_netstring_iter_next(&inner, &word) == SHELL_NETSTRING_OK &&
+              word.payload_length == expected.size() &&
+              memcmp(word.payload, expected.data(), expected.size()) == 0;
+    }
+    valid = valid &&
+            shell_netstring_iter_next(&inner, &word) == SHELL_NETSTRING_DONE;
+  }
+  shell_netstring_buffer_free(&sequence);
+  shell_dep_graph_t graph = {};
+  valid = valid &&
+          shell_dep_graph_parse(input.data(), input.size(), "/tmp", NULL,
+                                &graph) == SHELL_DEP_OK &&
+          shell_dep_graph_validate(&graph).valid;
+  unsigned commands = 0, empty_commands = 0, document_routes = 0;
+  for (uint32_t n = 0; valid && n < graph.node_count; n++) {
+    if (graph.nodes[n].type == SHELL_NODE_CMD) {
+      commands++;
+      empty_commands += graph.nodes[n].cmd.token_count == 0;
+    }
+  }
+  valid = valid && commands == (empty_stage ? 2u : 1u) &&
+          empty_commands == (empty_stage ? 1u : 0u);
+  if (mode == 3 || mode == 4) {
+    for (uint32_t e = 0; valid && e < graph.edge_count; e++) {
+      if (graph.edges[e].type == SHELL_EDGE_READ) {
+        valid = graph.edges[e].target_fd == (selector / 6) * 10 + 2;
+        document_routes++;
+      }
+    }
+    valid = valid && document_routes == 1;
+  }
+  int failed = valid ? test_processor(input.data(), input.size()) : 1;
+  if (failed)
+    fprintf(stderr, "redirect boundary selector %u (canonical=%d): %s\n",
+            selector, valid, input.c_str());
+  return failed;
+}
+
 static int test_generated_substitution_case(const uint8_t *data, size_t size,
                                             const char *cwd) {
   return test_substitution_case(shell_brace_fuzz_substitution_case(data, size),
@@ -1997,6 +3182,12 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
   if (!fixed_oracles_checked) {
     if (test_fixed_oracles())
       abort();
+    for (unsigned selector = 0; selector < 48; selector++)
+      if (test_generated_redirect_boundary(selector))
+        abort();
+    for (unsigned selector = 0; selector < 16; selector++)
+      if (test_composite_redirect_operand(selector, "/tmp"))
+        abort();
     for (uint8_t selector = 0;
          selector < SHELL_BRACE_FUZZ_SUBSTITUTION_CASE_COUNT; selector++)
       if (test_generated_substitution_case(&selector, 1, "/tmp"))
@@ -2010,6 +3201,14 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     for (uint8_t selector : local_document_selectors)
       if (test_generated_brace_case(&selector, 1, "/tmp"))
         abort();
+    /* The invalid/strict-only family encodes its form selector in byte four;
+     * exercise every member at startup so a parser-boundary change cannot
+     * leave a stale expectation to be found only by random mutation. */
+    for (uint8_t selector = 0; selector < 12; selector++) {
+      const uint8_t invalid_case[] = {7, 0, 0, 0, selector};
+      if (test_generated_brace_case(invalid_case, sizeof(invalid_case), "/tmp"))
+        abort();
+    }
     if (test_composed_substitution_matrix("/tmp"))
       abort();
     fixed_oracles_checked = true;
@@ -2079,7 +3278,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
   /* Startup exhaustively checks each generated matrix. On fuzzed payloads,
    * choose one without consuming input bytes, so structural coverage does not
    * multiply the cost of every arbitrary-parser iteration. */
-  switch (size == 0 ? 0 : data[0] % 3) {
+  switch (size == 0 ? 0 : data[0] % 4) {
   case 0:
     run_check("generated brace case",
               test_generated_brace_case(data, size, cwd));
@@ -2088,9 +3287,13 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     run_check("generated substitution case",
               test_generated_substitution_case(data, size, cwd));
     break;
-  default:
+  case 2:
     run_check("composed substitution case",
               test_composed_substitution_case(data, size, cwd));
+    break;
+  default:
+    run_check("generated redirect boundary",
+              test_generated_redirect_boundary(data[0]));
     break;
   }
   free(input);

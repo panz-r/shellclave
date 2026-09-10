@@ -767,7 +767,7 @@ sg_error_t sg_gate_score_anomaly_netseq(const sg_gate_t *gate,
     return SG_ERR_MEMORY;
   if (raw_status != SG_ANOMALY_OK || type_status != SG_ANOMALY_OK)
     return SG_ERR_PARSE;
-  out->command_count = raw_count;
+  out->stage_count = raw_count;
   if (raw_count < 3) {
     out->combined_score = 0.0;
     out->raw_score = 0.0;
@@ -3036,17 +3036,27 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
     }
   }
 
-  /* Extract command sequence from graph (used for anomaly detection and
-   * learning) */
+  /* Policy evaluation is graph-based. Anomaly sequences are built separately:
+   * they include nested executable substitutions in deterministic analysis
+   * order, whereas graph CMD nodes preserve dependency topology. */
   size_t cmd_count = 0;
+  bool has_unpolicyable_io_only_command = false;
   for (uint32_t ni = 0; ni < graph.node_count; ni++) {
     const shell_dep_node_t *node = &graph.nodes[ni];
-    if (node->type == SHELL_NODE_CMD && node->cmd.token_count > 0) {
+    if (node->type != SHELL_NODE_CMD)
+      continue;
+    if (node->cmd.token_count > 0) {
       cmd_count++;
+    } else {
+      /* A redirect-only simple command is valid shell syntax and remains in
+       * the graph so its I/O effects are visible. It has no argv, though, so
+       * the canonical argv policy model cannot authorize it. Shellsplit's
+       * anomaly sequence carries an explicit empty argv[0] stage for it. */
+      has_unpolicyable_io_only_command = true;
     }
   }
 
-  /* Build one nested canonical type signature per isolated command. */
+  /* Build one nested canonical type signature per execution stage. */
   const char *type_seq = NULL;
   char *owned_type_seq = NULL;
   char *owned_cmd_seq = NULL;
@@ -3055,7 +3065,7 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
   size_t cmd_seq_length = 0;
   size_t type_seq_length = 0;
 
-  if (gate->anomaly_enabled && gate->anomaly_model_type && cmd_count > 0) {
+  if (gate->anomaly_enabled && gate->anomaly_model_type) {
     const char *cached = type_cache_lookup(
         &gate->anomaly_type_cache, cmd, cmd_len, &type_count, &type_seq_length);
     if (cached) {
@@ -3063,8 +3073,11 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
     }
   }
 
-  /* Anomaly detection: score the command sequence with hybrid model */
-  if (gate->anomaly_enabled && gate->anomaly_model && cmd_count > 0) {
+  /* Anomaly detection: score the complete execution-stage sequence with the
+   * hybrid model. Build first, rather than inferring a count from the graph:
+   * command and process substitutions are execution stages but are not
+   * top-level graph list members. */
+  if (gate->anomaly_enabled && gate->anomaly_model) {
     shell_netstring_buffer_t raw = {0};
     shell_netstring_buffer_t typed = {0};
     shell_process_status_t command_status;
@@ -3109,28 +3122,30 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
       out->verdict = SG_VERDICT_UNDETERMINED;
       return SG_ERR_MEMORY;
     }
-    sg_anomaly_sequence_score_t scores = {0};
-    sg_error_t score_status =
-        sg_gate_score_anomaly_netseq(gate, owned_cmd_seq, cmd_seq_length,
-                                     type_seq, type_seq_length, &scores);
-    if (score_status == SG_ERR_MEMORY) {
-      free(owned_cmd_seq);
-      free(owned_type_seq);
-      return SG_ERR_MEMORY;
+    if (anomaly_count != 0) {
+      sg_anomaly_sequence_score_t scores = {0};
+      sg_error_t score_status =
+          sg_gate_score_anomaly_netseq(gate, owned_cmd_seq, cmd_seq_length,
+                                       type_seq, type_seq_length, &scores);
+      if (score_status == SG_ERR_MEMORY) {
+        free(owned_cmd_seq);
+        free(owned_type_seq);
+        return SG_ERR_MEMORY;
+      }
+      if (score_status != SG_OK || type_count != anomaly_count ||
+          scores.stage_count != anomaly_count) {
+        free(owned_cmd_seq);
+        free(owned_type_seq);
+        return SG_ERR_PARSE;
+      }
+      out->anomaly_score = scores.combined_score;
+      out->anomaly_score_raw = scores.raw_score;
+      out->anomaly_score_type = scores.type_score;
+      out->anomaly_detected = scores.detected;
+    } else {
+      out->anomaly_score = 0.0;
+      out->anomaly_detected = false;
     }
-    if (score_status != SG_OK || type_count != anomaly_count ||
-        scores.command_count != anomaly_count) {
-      free(owned_cmd_seq);
-      free(owned_type_seq);
-      return SG_ERR_PARSE;
-    }
-    out->anomaly_score = scores.combined_score;
-    out->anomaly_score_raw = scores.raw_score;
-    out->anomaly_score_type = scores.type_score;
-    out->anomaly_detected = scores.detected;
-  } else if (gate->anomaly_enabled && gate->anomaly_model) {
-    out->anomaly_score = 0.0;
-    out->anomaly_detected = false;
   }
 
   /* Step 4: Walk CMD nodes, evaluate each against policy */
@@ -3411,7 +3426,17 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
     free(owned_type_seq);
     return SG_ERR_TRUNC;
   }
-  if (out->subcommand_count == 0) {
+  /* Policy evaluation failures remain errors even when another part of the
+   * composition is an argv-less redirect-only operation.  Undetermined is a
+   * useful verdict for the latter, but it must not hide an allocation or
+   * canonical-policy failure encountered while evaluating a real command. */
+  if (evaluation_error != SG_OK) {
+    out->verdict = SG_VERDICT_UNDETERMINED;
+    free(owned_cmd_seq);
+    free(owned_type_seq);
+    return evaluation_error;
+  }
+  if (out->subcommand_count == 0 && !has_unpolicyable_io_only_command) {
     /* Truncation that leaves no subcommands means nothing was evaluated at all.
      * Reporting ALLOW/SG_OK would fail open on input the gate never inspected,
      * so surface it as undetermined and propagate the truncation error. */
@@ -3445,22 +3470,23 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
     out->verdict = SG_VERDICT_REJECT;
   else if (any_deny)
     out->verdict = SG_VERDICT_DENY;
-  else if (all_allow)
+  else if (has_unpolicyable_io_only_command) {
+    /* An argv-less redirect is not policy-evaluable, but it must not mask a
+     * definite DENY or REJECT from another simple command in the same list. */
+    out->verdict = SG_VERDICT_UNDETERMINED;
+    if (!out->deny_reason)
+      out->deny_reason = bw_copy(
+          &bw, "redirect-only shell operation is not argv-policy-evaluable",
+          58);
+  } else if (all_allow)
     out->verdict = (out->requires_substitution_evaluation || any_conditional)
                        ? SG_VERDICT_ALLOW_CONDITIONAL
                        : SG_VERDICT_ALLOW;
   else
     out->verdict = SG_VERDICT_UNDETERMINED;
 
-  if (evaluation_error != SG_OK) {
-    out->verdict = SG_VERDICT_UNDETERMINED;
-    free(owned_cmd_seq);
-    free(owned_type_seq);
-    return evaluation_error;
-  }
-
   /* Deferred anomaly model update — after verdict is known */
-  if (gate->anomaly_enabled && gate->anomaly_model && cmd_count > 0) {
+  if (gate->anomaly_enabled && gate->anomaly_model && anomaly_count > 0) {
     bool should_update = false;
     if (!gate->anomaly_update_only_on_allow) {
       /* Always update, but skip if anomalous and flag is set */

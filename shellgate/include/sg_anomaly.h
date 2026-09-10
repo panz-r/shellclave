@@ -1,10 +1,10 @@
 /*
  * sg_anomaly.h - Statistical Anomaly Detection for shellgate
  *
- * Uses a 4-gram language model with backoff to score command sequences.
- * The model owns all its memory (strings are strdup'd).
+ * Uses a 4-gram language model with backoff to score anomaly-stage sequences.
+ * The model owns copied, length-delimited byte keys; keys may contain NUL.
  *
- * Scores are average negative log-probability in bits per command; higher
+ * Scores are average negative log-probability in bits per stage; higher
  * scores represent less probable sequences.
  */
 
@@ -23,8 +23,9 @@ extern "C" {
 /* Opaque anomaly model.  All memory is owned and freed on destroy. */
 typedef struct sg_anomaly_model sg_anomaly_model_t;
 
-/* Borrowed opaque command bytes. A valid item has non-NULL data, non-zero
- * length, and may include embedded NUL bytes. */
+/* Borrowed opaque anomaly-stage bytes. A valid item has non-NULL data and may
+ * include embedded NUL bytes. A zero-length item is reserved for Shellsplit's
+ * argv-less redirect-only-stage sentinel; it is not an executable name. */
 typedef struct {
   const char *data;
   size_t length;
@@ -40,10 +41,14 @@ typedef enum {
   SG_ANOMALY_ERR_IO = -5,
 } sg_anomaly_status_t;
 
-/* Maximum decoded sequence-item length accepted while learning. Scoring
+/* Maximum decoded anomaly-stage-item length accepted while learning. Scoring
  * accepts longer items and treats them as unknown. Four maximum-length items
  * fit exactly in the internal concatenated-netstring key limit. */
-#define SG_ANOMALY_MAX_COMMAND_LENGTH 1023
+#define SG_ANOMALY_MAX_STAGE_LENGTH 1023
+
+/* Compatibility spelling retained for source users from before anomaly items
+ * were correctly named stages. New code should use _STAGE_LENGTH. */
+#define SG_ANOMALY_MAX_COMMAND_LENGTH SG_ANOMALY_MAX_STAGE_LENGTH
 
 /* --- ERROR STATE --- */
 
@@ -86,22 +91,23 @@ void sg_anomaly_model_free(sg_anomaly_model_t *model);
 /* --- SCORING --- */
 
 /*
- * Score a command sequence.
+ * Score an anomaly-stage sequence.
  *
- * `netseq` is a canonical concatenation of non-empty netstring records. Each
- * record is one opaque byte sequence, such as an executable name or a nested
- * per-command type signature. Payloads may contain NUL bytes; callers must
- * always provide the explicit sequence length.
+ * `netseq` is a canonical concatenation of netstring records. Each record is
+ * one opaque byte sequence, such as an executable name or a nested per-stage
+ * type signature. A zero-length record is reserved for Shellsplit's
+ * argv-less redirect-only-stage sentinel. Payloads may contain NUL bytes;
+ * callers must always provide the explicit sequence length.
  *
- * Returns the average negative log-probability per command (bits).
+ * Returns the average negative log-probability per anomaly stage (bits).
  * Higher = more anomalous.
  * On success, writes INFINITY when the sequence has fewer than three items or
  * the model is empty. Malformed and non-canonical framing returns
  * SG_ANOMALY_ERR_FORMAT.
  *
- * Names longer than SG_ANOMALY_MAX_COMMAND_LENGTH are scored, not rejected.
- * They can never have been learned, so they score as unknown commands and
- * read as highly anomalous.
+ * Items longer than SG_ANOMALY_MAX_STAGE_LENGTH are scored, not rejected.
+ * They can never have been learned, so they score as unknown stages and read
+ * as highly anomalous.
  *
  * Does not modify the model.
  */
@@ -113,10 +119,11 @@ sg_anomaly_model_score_netseq(const sg_anomaly_model_t *model,
 /* --- UPDATE (LEARNING) --- */
 
 /*
- * Update the model with a command sequence.
+ * Update the model with an anomaly-stage sequence.
  *
- * The model copies each decoded non-empty byte record. The caller retains
- * ownership of `netseq`. Payloads may contain NUL bytes. Malformed framing is
+ * The model copies each decoded byte record. The caller retains ownership of
+ * `netseq`. A zero-length record is the argv-less redirect-only-stage
+ * sentinel; payloads may otherwise contain NUL bytes. Malformed framing is
  * rejected without changing the model.
  *
  * Updates every unigram and consecutive bigram, trigram, and 4-gram in the
@@ -153,7 +160,7 @@ sg_anomaly_status_t sg_anomaly_model_load(sg_anomaly_model_t *model,
 
 /* --- ACCESSORS --- */
 
-/* Total number of unique commands observed (unigram vocabulary). */
+/* Total number of unique anomaly stages observed (unigram vocabulary). */
 size_t sg_anomaly_model_vocab_size(const sg_anomaly_model_t *model);
 
 /* Total number of unigram observations. */
@@ -168,8 +175,8 @@ size_t sg_anomaly_model_total_trigrams(const sg_anomaly_model_t *model);
 /* Total number of 4-gram observations. */
 size_t sg_anomaly_model_total_fourgrams(const sg_anomaly_model_t *model);
 
-/* Get unigram count for opaque command bytes. Returns 0 if never seen or the
- * view is invalid. */
+/* Get unigram count for opaque anomaly-stage bytes. Returns 0 if never seen
+ * or the view is invalid. */
 size_t sg_anomaly_model_unigram_count_view(const sg_anomaly_model_t *model,
                                            sg_anomaly_item_view_t cmd);
 
@@ -177,14 +184,14 @@ size_t sg_anomaly_model_unigram_count_view(const sg_anomaly_model_t *model,
 size_t sg_anomaly_model_unigram_count(const sg_anomaly_model_t *model,
                                       const char *cmd);
 
-/* Get count of unseen commands (for UNK probability estimation). */
+/* Get count of unseen anomaly stages (for UNK probability estimation). */
 size_t sg_anomaly_model_unknown_count(const sg_anomaly_model_t *model);
 
 /* Get the Kneser-Ney absolute discount parameter (default 0.5). */
 double sg_anomaly_model_kneser_ney_discount(const sg_anomaly_model_t *model);
 
-/* Get bigram count for opaque command bytes. Returns 0 if never seen or any
- * view is invalid. */
+/* Get bigram count for opaque anomaly-stage bytes. Returns 0 if never seen or
+ * any view is invalid. */
 size_t sg_anomaly_model_bigram_count_view(const sg_anomaly_model_t *model,
                                           sg_anomaly_item_view_t prev,
                                           sg_anomaly_item_view_t curr);
@@ -193,8 +200,8 @@ size_t sg_anomaly_model_bigram_count_view(const sg_anomaly_model_t *model,
 size_t sg_anomaly_model_bigram_count(const sg_anomaly_model_t *model,
                                      const char *prev, const char *curr);
 
-/* Get trigram count for opaque command bytes. Returns 0 if never seen or any
- * view is invalid. */
+/* Get trigram count for opaque anomaly-stage bytes. Returns 0 if never seen
+ * or any view is invalid. */
 size_t sg_anomaly_model_trigram_count_view(const sg_anomaly_model_t *model,
                                            sg_anomaly_item_view_t p2,
                                            sg_anomaly_item_view_t p1,
@@ -205,8 +212,8 @@ size_t sg_anomaly_model_trigram_count(const sg_anomaly_model_t *model,
                                       const char *p2, const char *p1,
                                       const char *curr);
 
-/* Get 4-gram count for opaque command bytes. Returns 0 if never seen or any
- * view is invalid. */
+/* Get 4-gram count for opaque anomaly-stage bytes. Returns 0 if never seen
+ * or any view is invalid. */
 size_t sg_anomaly_model_fourgram_count_view(const sg_anomaly_model_t *model,
                                             sg_anomaly_item_view_t p3,
                                             sg_anomaly_item_view_t p2,
@@ -221,8 +228,8 @@ size_t sg_anomaly_model_fourgram_count(const sg_anomaly_model_t *model,
 /* Get total number of unique n-gram contexts across all levels. */
 size_t sg_anomaly_model_total_contexts(const sg_anomaly_model_t *model);
 
-/* Check whether any command in a canonical netsequence has been observed.
- * Empty sequences are valid and produce false. */
+/* Check whether any anomaly stage in a canonical netsequence has been
+ * observed. Empty sequences are valid and produce false. */
 sg_anomaly_status_t
 sg_anomaly_model_has_observed_netseq(const sg_anomaly_model_t *model,
                                      const char *netseq, size_t netseq_length,

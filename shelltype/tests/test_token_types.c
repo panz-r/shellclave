@@ -6,6 +6,7 @@
  */
 
 #include "../src/netpattern.h"
+#include "../src/normalize_internal.h"
 #include "shell_netstring.h"
 #include "shelltype.h"
 #include "test_allocator.h"
@@ -1033,6 +1034,79 @@ static int test_normalization_allocation_failures(void) {
   return 1;
 }
 
+static int test_canonical_invalid_boundaries(void) {
+  ASSERT(st_token_classify_bytes(NULL, 1) == ST_TYPE_LITERAL);
+  ASSERT(st_token_classify_bytes(NULL, 0) == ST_TYPE_LITERAL);
+  st_token_array_free(NULL);
+  ASSERT(st_netpattern_from_cpl("echo", NULL) == ST_ERR_INVALID);
+  ASSERT(st_netpattern_to_cpl("", NULL) == ST_ERR_INVALID);
+  ASSERT(st_netargv_classify(NULL, NULL) == ST_ERR_INVALID);
+  ASSERT(st_netargv_classify_view((st_netargv_view_t){NULL, 1}, NULL) ==
+         ST_ERR_INVALID);
+  ASSERT(st_netargv_classify_view((st_netargv_view_t){"", 0}, NULL) ==
+         ST_ERR_INVALID);
+  ASSERT(st_netargv_visit(NULL, NULL, NULL, NULL) == ST_ERR_INVALID);
+  ASSERT(st_netargv_visit_view((st_netargv_view_t){NULL, 1}, NULL, NULL,
+                               NULL) == ST_ERR_INVALID);
+  ASSERT(st_netargv_classify_scratch_view((st_netargv_view_t){"", 0}, NULL) ==
+         ST_ERR_INVALID);
+  st_token_scratch_t scratch;
+  ASSERT(st_netargv_classify_scratch_view((st_netargv_view_t){NULL, 1},
+                                          &scratch) == ST_ERR_INVALID);
+  ASSERT(scratch.count == 0);
+  ASSERT(st_netargv_classify_scratch_view((st_netargv_view_t){"bad", 3},
+                                          &scratch) == ST_ERR_FORMAT);
+  ASSERT(scratch.count == 0);
+  return 1;
+}
+
+/* Explicit-length pattern views are the binary-safe public boundary. Exercise
+ * their invalid-output and malformed-input paths directly so the C-string
+ * wrappers do not become the only tested route to canonical validation. */
+static int test_netpattern_view_boundary_contract(void) {
+  char *valid = test_pattern_record('L', "value");
+  ASSERT(valid != NULL);
+
+  st_token_array_t decoded = {(st_token_t *)(uintptr_t)1, SIZE_MAX};
+  ASSERT(st_netpattern_decode_view(
+             (st_netpattern_view_t){.data = NULL, .length = 1}, &decoded) ==
+         ST_ERR_INVALID);
+  ASSERT(decoded.tokens == NULL && decoded.count == 0);
+  decoded.tokens = (st_token_t *)(uintptr_t)1;
+  decoded.count = SIZE_MAX;
+  ASSERT(
+      st_netpattern_decode_view((st_netpattern_view_t){.data = "", .length = 0},
+                                &decoded) == ST_ERR_FORMAT);
+  ASSERT(decoded.tokens == NULL && decoded.count == 0);
+  ASSERT(st_netpattern_decode_view(
+             (st_netpattern_view_t){.data = valid, .length = strlen(valid)},
+             NULL) == ST_ERR_INVALID);
+
+  char *cpl = (char *)(uintptr_t)1;
+  ASSERT(st_netpattern_to_cpl_view(
+             (st_netpattern_view_t){.data = NULL, .length = 1}, &cpl) ==
+         ST_ERR_INVALID);
+  ASSERT(cpl == NULL);
+  cpl = (char *)(uintptr_t)1;
+  ASSERT(
+      st_netpattern_to_cpl_view((st_netpattern_view_t){.data = "", .length = 0},
+                                &cpl) == ST_ERR_FORMAT);
+  ASSERT(cpl == NULL);
+  ASSERT(st_netpattern_to_cpl_view(
+             (st_netpattern_view_t){.data = valid, .length = strlen(valid)},
+             NULL) == ST_ERR_INVALID);
+
+  st_netpattern_t occupied = {.data = valid, .length = strlen(valid)};
+  st_token_t literal = {.text = "value", .type = ST_TYPE_LITERAL};
+  ASSERT(st_netpattern_encode_owned(&literal, 1, &occupied) == ST_ERR_INVALID);
+  ASSERT(occupied.data == valid && occupied.length == strlen(valid));
+  ASSERT(st_netpattern_from_cpl_owned("value", &occupied) == ST_ERR_INVALID);
+  ASSERT(occupied.data == valid && occupied.length == strlen(valid));
+  st_netpattern_free(&occupied);
+  ASSERT(occupied.data == NULL && occupied.length == 0);
+  return 1;
+}
+
 static int test_public_helper_matrix(void) {
   static const struct {
     st_error_t error;
@@ -1306,6 +1380,7 @@ static int test_netpattern_cpl_contract(void) {
       {"echo \"line\\nfeed\" \"\\u20ac\"", "echo \"line\\nfeed\" €"},
       {"echo \"\\b\\f\\r\\t\\u007f\"", "echo \"\\b\\f\\r\\t\\x7f\""},
       {"echo \"\\u00a2\" \"\\u20ac\" \"\\ud83d\\ude00\"", "echo ¢ € 😀"},
+      {"echo \"\\u00A2\" \"\\u20AC\"", "echo ¢ €"},
       {"echo \"quote: \\\" slash: \\\\\"", "echo \"quote: \\\" slash: \\\\\""},
       {"echo \"#unknown\" \"#CRC16:\"", "echo \"#unknown\" \"#CRC16:\""},
       {"dd bs={#size.MiB}", "dd bs={#size.MiB}"},
@@ -1327,10 +1402,13 @@ static int test_netpattern_cpl_contract(void) {
     free(netpattern);
   }
 
-  char *compare_a = NULL, *compare_b = NULL, *compare_typed = NULL;
+  char *compare_a = NULL, *compare_aa = NULL, *compare_b = NULL;
+  char *compare_pair = NULL, *compare_typed = NULL;
   char *compare_literal_star = NULL;
   ASSERT(st_netpattern_from_cpl("a", &compare_a) == ST_OK);
+  ASSERT(st_netpattern_from_cpl("aa", &compare_aa) == ST_OK);
   ASSERT(st_netpattern_from_cpl("bb", &compare_b) == ST_OK);
+  ASSERT(st_netpattern_from_cpl("a a", &compare_pair) == ST_OK);
   ASSERT(st_netpattern_from_cpl("*", &compare_typed) == ST_OK);
   ASSERT(st_netpattern_from_cpl("\"*\"", &compare_literal_star) == ST_OK);
   ASSERT(st_netpattern_compare(NULL, NULL) == 0);
@@ -1339,11 +1417,35 @@ static int test_netpattern_cpl_contract(void) {
   ASSERT(st_netpattern_compare(compare_a, compare_a) == 0);
   ASSERT(st_netpattern_compare(compare_a, compare_b) < 0);
   ASSERT(st_netpattern_compare(compare_b, compare_a) > 0);
+  ASSERT(st_netpattern_compare(compare_a, compare_aa) < 0);
+  ASSERT(st_netpattern_compare(compare_aa, compare_a) > 0);
+  ASSERT(st_netpattern_compare(compare_a, compare_pair) < 0);
+  ASSERT(st_netpattern_compare(compare_pair, compare_a) > 0);
   ASSERT(st_netpattern_compare(compare_literal_star, compare_typed) < 0);
+  ASSERT(st_netpattern_compare(compare_typed, compare_literal_star) > 0);
   ASSERT(st_netpattern_compare("malformed-a", "malformed-b") < 0);
+  /* A valid outer netstring can still contain a malformed netpattern record.
+   * Comparison falls back to its bytewise order without treating it as a
+   * canonical typed token. */
+  ASSERT(st_netpattern_compare("3:bad,", "3:bae,") < 0);
+  static const char malformed_short[] = "3:bad,";
+  static const char malformed_long[] = "3:bad,4:more,";
+  ASSERT(st_netpattern_compare_view(
+             (st_netpattern_view_t){.data = malformed_short, .length = 0},
+             (st_netpattern_view_t){.data = malformed_short,
+                                    .length = sizeof(malformed_short) - 1}) <
+         0);
+  ASSERT(st_netpattern_compare_view(
+             (st_netpattern_view_t){.data = malformed_short,
+                                    .length = sizeof(malformed_short) - 1},
+             (st_netpattern_view_t){.data = malformed_short, .length = 0}) > 0);
+  ASSERT(st_netpattern_compare(malformed_short, malformed_long) < 0);
+  ASSERT(st_netpattern_compare(malformed_long, malformed_short) > 0);
   free(compare_literal_star);
   free(compare_typed);
+  free(compare_pair);
   free(compare_b);
+  free(compare_aa);
   free(compare_a);
   char *compound = NULL;
   char *widened = NULL;
@@ -1434,10 +1536,15 @@ static int test_netpattern_cpl_contract(void) {
       "echo \"\\ud800\\u0000\"",
       "echo \"\\u0x00\"",
       "echo \"\\u123\"",
+      "echo \"\\x\"",
+      "echo \"\\xG0\"",
+      "echo \"\\q\"",
       "echo \"x\"tail",
       "echo \\\\value",
       "echo bare\\value",
       "echo bare\"value",
+      "echo }",
+      "echo {unterminated",
       "dd {#path}",
       "dd pre{#path}{#n}",
       "dd pre{#unknown}",
@@ -1901,6 +2008,8 @@ int main(void) {
   TEST(test_owned_netpattern_output_contract);
   TEST(test_canonical_policy_boundary);
   TEST(test_public_helper_matrix);
+  TEST(test_canonical_invalid_boundaries);
+  TEST(test_netpattern_view_boundary_contract);
   TEST(test_token_variant_api);
 
   printf("\n========================================\n");

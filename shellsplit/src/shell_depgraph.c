@@ -272,15 +272,10 @@ static uint32_t scan_redirect_token(const char *cmd, uint32_t pos,
    * misread as an executable command. */
   if (pos + 1 < end && cmd[pos] == '&' && cmd[pos + 1] == '>')
     return pos + ((pos + 2 < end && cmd[pos + 2] == '>') ? 3u : 2u);
-  size_t named_after = 0;
-  size_t name_start = 0;
-  size_t name_length = 0;
-  if (shell_source_parse_named_fd(cmd, pos, end, &named_after, &name_start,
-                                  &name_length) &&
-      named_after < end &&
-      (cmd[named_after] == '<' || cmd[named_after] == '>')) {
-    uint32_t cursor = (uint32_t)named_after + 1;
-    char operator_char = cmd[named_after];
+  size_t named_operator = 0;
+  if (shell_source_parse_named_fd_redirect(cmd, pos, end, &named_operator)) {
+    uint32_t cursor = (uint32_t)named_operator + 1;
+    char operator_char = cmd[named_operator];
     if (cursor < end && cmd[cursor] == operator_char)
       cursor++;
     else if (cursor < end && ((operator_char == '<' && cmd[cursor] == '>') ||
@@ -333,11 +328,26 @@ static bool scan_word_token(const char *cmd, uint32_t end, uint32_t *position) {
   uint32_t pos = *position;
   while (pos < end) {
     char c = cmd[pos];
+    if (c == '$' && pos + 1 < end && cmd[pos + 1] == '{') {
+      size_t after = 0;
+      if (!shell_source_skip_parameter_expansion(cmd, end, pos, &after))
+        return false;
+      pos = (uint32_t)after;
+      continue;
+    }
+    size_t extglob_after = 0;
+    if (shell_source_skip_extglob(cmd, end, pos, &extglob_after)) {
+      pos = (uint32_t)extglob_after;
+      continue;
+    }
     if (c == '\\' && pos + 1 < end) {
       /* The escaped byte is literal, so an escaped `$(` must not require a
        * matching close parenthesis. Parentheses are ordinary word bytes here.
        */
+      bool cr = cmd[pos + 1] == '\r';
       pos += 2;
+      if (cr && pos < end && cmd[pos] == '\n')
+        pos++;
       continue;
     }
     if (c == '$' && pos + 1 < end && cmd[pos + 1] == '\'') {
@@ -502,12 +512,7 @@ static dep_redirect_t classify_redirect(const dep_token_t *tok) {
     return DEP_REDIRECT_BOTH_APPEND;
   size_t after = 0;
   uint32_t descriptor = 0;
-  size_t name_start = 0;
-  size_t name_length = 0;
-  if (shell_source_parse_named_fd(tok->start, 0, tok->len, &after, &name_start,
-                                  &name_length)) {
-    if (after >= tok->len)
-      return DEP_REDIRECT_NONE;
+  if (shell_source_parse_named_fd_redirect(tok->start, 0, tok->len, &after)) {
     uint32_t operator_len = tok->len - (uint32_t)after;
     if (operator_len == 1 && tok->start[after] == '<')
       return DEP_REDIRECT_IN;
@@ -557,21 +562,15 @@ static dep_redirect_t classify_redirect(const dep_token_t *tok) {
 }
 
 static bool dep_token_is_named_fd_redirect(const dep_token_t *tok) {
-  size_t after = 0, name_start = 0, name_length = 0;
-  return tok &&
-         shell_source_parse_named_fd(tok->start, 0, tok->len, &after,
-                                     &name_start, &name_length) &&
-         after < tok->len &&
-         (tok->start[after] == '<' || tok->start[after] == '>');
+  size_t operator_position = 0;
+  return tok && shell_source_parse_named_fd_redirect(tok->start, 0, tok->len,
+                                                     &operator_position);
 }
 
 static uint32_t redirect_fd(const dep_token_t *tok, dep_redirect_t redirect) {
   size_t after = 0;
   uint32_t descriptor = 0;
-  size_t name_start = 0;
-  size_t name_length = 0;
-  if (shell_source_parse_named_fd(tok->start, 0, tok->len, &after, &name_start,
-                                  &name_length))
+  if (shell_source_parse_named_fd_redirect(tok->start, 0, tok->len, &after))
     return SHELL_DEP_FD_NAMED;
   if (shell_source_parse_io_number(tok->start, 0, tok->len, &after,
                                    &descriptor) == SHELL_SOURCE_IO_NUMBER_VALID)
@@ -583,9 +582,8 @@ static uint32_t redirect_fd(const dep_token_t *tok, dep_redirect_t redirect) {
 
 static bool
 dep_redirect_target_is_process_substitution(const dep_token_t *target) {
-  return target->len >= 3 &&
-         (target->start[0] == '<' || target->start[0] == '>') &&
-         target->start[1] == '(' && target->start[target->len - 1] == ')';
+  return target &&
+         shell_source_word_is_process_substitution(target->start, target->len);
 }
 
 /* A process-substitution path creates a stream when the redirect opens its
@@ -945,8 +943,16 @@ static bool range_is_in_group(const shell_parse_result_t *result,
 /* A group is a pipeline member in its own right. Detect a directly preceding
  * reserved `!` instead of inheriting a nested command's modifier: in
  * `{ ! false | cat; echo; }`, only the inner pipeline is negated. */
+static uint32_t group_pipeline_negation_count(const shell_group_t *group) {
+  if (!group)
+    return 0;
+  if (group->pipeline_negation_count != 0)
+    return group->pipeline_negation_count;
+  return (group->modifiers & SHELL_CMD_MOD_PIPE_NEGATED) != 0 ? 1 : 0;
+}
+
 static bool group_is_pipeline_negated(const shell_group_t *group) {
-  return group && (group->modifiers & SHELL_CMD_MOD_PIPE_NEGATED) != 0;
+  return (group_pipeline_negation_count(group) & UINT32_C(1)) != 0;
 }
 
 static int32_t find_innermost_group(const shell_parse_result_t *result,
@@ -1023,19 +1029,15 @@ static void dep_prepare_group_execution(const char *command,
     const shell_group_t *group = &result->groups[i];
     groups[i].isolated = group->kind == SHELL_GROUP_SUBSHELL;
 
-    size_t position = group->end;
-    while (position < command_length &&
-           isspace((unsigned char)command[position]))
-      position++;
+    size_t position = shell_source_skip_inline_continuations(
+        command, command_length, group->end);
     for (;;) {
       size_t after =
           shell_source_skip_redirect(command, position, command_length);
       if (after == position)
         break;
-      position = after;
-      while (position < command_length &&
-             isspace((unsigned char)command[position]))
-        position++;
+      position = shell_source_skip_inline_continuations(command, command_length,
+                                                        after);
     }
     if (position >= command_length)
       continue;
@@ -1112,19 +1114,86 @@ static int32_t find_preceding_group(const shell_parse_result_t *result,
     const shell_group_t *group = &result->groups[i];
     if (group->end > position || group->end < latest_end)
       continue;
-    bool adjacent = true;
-    for (uint32_t p = group->end; p < position; p++) {
-      if (!isspace((unsigned char)command[p])) {
-        adjacent = false;
-        break;
-      }
-    }
-    if (adjacent) {
+    if (shell_source_skip_inline_continuations(command, position, group->end) ==
+        position) {
       found = (int32_t)i;
       latest_end = group->end;
     }
   }
   return found;
+}
+
+/* True when the source between a completed simple-command range and a later
+ * redirect-only fast range contains only that command's continuing redirect
+ * list.  A physical newline or comment cannot be skipped here: both begin a
+ * new shell command, while horizontal space and escaped line endings remain
+ * part of the same command. */
+static bool command_redirect_tail(const char *command, uint32_t start,
+                                  uint32_t end) {
+  size_t position = start;
+  while (position < end) {
+    position = shell_source_skip_inline_continuations(command, end, position);
+    if (position == end)
+      return true;
+    size_t after = shell_source_skip_redirect(command, position, end);
+    if (after == position)
+      return false;
+    position = after;
+  }
+  return true;
+}
+
+/* Fast-parser ranges may start at the redirect operator, leaving an adjacent
+ * io_number (for example the `3` in `cmd 3<<<word`) at the end of the prior
+ * simple-command range.  That decimal prefix is redirect syntax only when it
+ * touches the following operator.  Treat it as part of the continued
+ * redirect list without allowing a newline, comment, or ordinary word to
+ * bridge two independent commands. */
+static bool command_redirect_tail_to_range(const char *command, uint32_t start,
+                                           const shell_range_t *range) {
+  if (!command || !range)
+    return false;
+  /* Fast ranges may end at the backslash byte while the following range
+   * starts after its escaped line ending. Normalize that split before either
+   * tail scanner examines an adjacent io_number. */
+  if (start > 0 && start < range->start && command[start - 1] == '\\') {
+    if (command[start] == '\n') {
+      start++;
+    } else if (command[start] == '\r') {
+      start++;
+      if (start < range->start && command[start] == '\n')
+        start++;
+    }
+  }
+  if (command_redirect_tail(command, start, range->start))
+    return true;
+  if (range->len == 0 ||
+      (command[range->start] != '<' && command[range->start] != '>'))
+    return false;
+
+  size_t position =
+      shell_source_skip_inline_continuations(command, range->start, start);
+  while (position < range->start) {
+    size_t after = shell_source_skip_redirect(command, position, range->start);
+    if (after != position) {
+      position =
+          shell_source_skip_inline_continuations(command, range->start, after);
+      continue;
+    }
+    size_t descriptor_after = position;
+    uint32_t descriptor = 0;
+    if (shell_source_parse_io_number(command, position, range->start,
+                                     &descriptor_after, &descriptor) ==
+            SHELL_SOURCE_IO_NUMBER_VALID &&
+        descriptor_after == range->start)
+      return true;
+    size_t named_after = 0;
+    return shell_source_parse_named_fd(command, position, range->start,
+                                       &named_after) &&
+           shell_source_skip_escaped_line_endings(command, range->start,
+                                                  named_after) == range->start;
+  }
+  return true;
 }
 
 /* A group redirect list may contain several operations before a heredoc
@@ -1140,26 +1209,31 @@ static int32_t find_trailing_redirect_group(const shell_parse_result_t *result,
     const shell_group_t *group = &result->groups[i];
     if (group->end > position || group->end < latest_end)
       continue;
-    dep_token_list_t tokens = {0};
-    if (scan_tokens(command, group->end, position - group->end, &tokens) ||
-        tokens.count == 0)
-      continue;
-    bool redirects_only = true;
-    for (uint32_t token = 0; token < tokens.count;) {
-      dep_redirect_t redirect = classify_redirect(&tokens.tokens[token++]);
-      if (redirect == DEP_REDIRECT_NONE) {
-        redirects_only = false;
+    size_t cursor = group->end;
+    bool redirects_only = false;
+    while (cursor < position) {
+      cursor =
+          shell_source_skip_inline_continuations(command, position, cursor);
+      if (cursor == position)
         break;
-      }
-      if (redirect != DEP_REDIRECT_DUP) {
-        if (token >= tokens.count) {
+      size_t after = shell_source_skip_redirect(command, cursor, position);
+      if (after == cursor) {
+        size_t named_after = 0;
+        if (!shell_source_parse_named_fd(command, cursor, position,
+                                         &named_after) ||
+            shell_source_skip_escaped_line_endings(command, position,
+                                                   named_after) != position) {
           redirects_only = false;
           break;
         }
-        token++;
+        redirects_only = true;
+        cursor = named_after;
+        continue;
       }
+      redirects_only = true;
+      cursor = after;
     }
-    if (redirects_only) {
+    if (redirects_only && cursor == position) {
       found = (int32_t)i;
       latest_end = group->end;
     }
@@ -1175,14 +1249,8 @@ static int32_t find_following_group(const shell_parse_result_t *result,
     const shell_group_t *group = &result->groups[i];
     if (group->start < position || group->start >= earliest_start)
       continue;
-    bool adjacent = true;
-    for (uint32_t p = position; p < group->start; p++) {
-      if (!isspace((unsigned char)command[p])) {
-        adjacent = false;
-        break;
-      }
-    }
-    if (adjacent) {
+    if (shell_source_skip_inline_continuations(command, group->start,
+                                               position) == group->start) {
       found = (int32_t)i;
       earliest_start = group->start;
     }
@@ -1216,31 +1284,15 @@ typedef struct {
  * io_number. */
 static uint32_t inline_document_io_number_start(const char *cmd,
                                                 uint32_t marker_start) {
-  uint32_t digit_start = marker_start;
-  while (digit_start > 0 && isdigit((unsigned char)cmd[digit_start - 1]))
-    digit_start--;
-  if (digit_start == marker_start)
-    return marker_start;
-  if (digit_start > 0) {
-    unsigned char preceding = (unsigned char)cmd[digit_start - 1];
-    if (!isspace(preceding) && preceding != ';' && preceding != '|' &&
-        preceding != '&' && preceding != '(' && preceding != ')' &&
-        preceding != '{' && preceding != '}' && preceding != '<' &&
-        preceding != '>')
-      return marker_start;
-  }
-  size_t after = 0;
-  uint32_t descriptor = 0;
-  return shell_source_parse_io_number(cmd, digit_start, marker_start, &after,
-                                      &descriptor) ==
-                     SHELL_SOURCE_IO_NUMBER_VALID &&
-                 after == marker_start
-             ? digit_start
-             : marker_start;
+  return (uint32_t)shell_source_io_number_start_before(cmd, marker_start,
+                                                       marker_start);
 }
 
 static uint32_t inline_document_target_fd(const char *cmd,
                                           uint32_t marker_start) {
+  if (shell_source_named_fd_start_before(cmd, marker_start, marker_start) !=
+      marker_start)
+    return SHELL_DEP_FD_NAMED;
   uint32_t digit_start = inline_document_io_number_start(cmd, marker_start);
   if (digit_start == marker_start)
     return 0;
@@ -1488,10 +1540,14 @@ static bool add_doc_file_named_fd_open(shell_dep_graph_t *g, uint32_t max_nodes,
                                        uint32_t path_len, uint32_t cmd_idx,
                                        dep_redirect_t redir, uint32_t *status,
                                        uint32_t *document_index) {
-  if (redir != DEP_REDIRECT_READ_WRITE)
-    return add_doc_file(g, max_nodes, max_edges, path, path_len, cmd_idx,
-                        SHELL_EDGE_FD_OPEN, SHELL_DIR_FORWARD, redir,
-                        SHELL_DEP_FD_NAMED, status, document_index);
+  if (redir != DEP_REDIRECT_READ_WRITE) {
+    bool added = add_doc_file(g, max_nodes, max_edges, path, path_len, cmd_idx,
+                              SHELL_EDGE_FD_OPEN, SHELL_DIR_FORWARD, redir,
+                              SHELL_DEP_FD_NAMED, status, document_index);
+    if (added && redir == DEP_REDIRECT_APPEND)
+      g->edges[g->edge_count - 1].flags = SHELL_DEP_EDGE_FLAG_FD_OPEN_APPEND;
+    return added;
+  }
 
   if (document_index)
     *document_index = UINT32_MAX;
@@ -1587,8 +1643,10 @@ static bool add_document_read(shell_dep_graph_t *g, uint32_t max_nodes,
   document->doc.path_len = 0;
 
   shell_dep_edge_t *edge = &g->edges[g->edge_count++];
-  dep_init_edge(edge, document_idx, owner_idx, SHELL_EDGE_READ,
-                SHELL_DIR_FORWARD, SHELL_DEP_FD_NONE, target_fd);
+  shell_dep_edge_type_t edge_type =
+      target_fd == SHELL_DEP_FD_NAMED ? SHELL_EDGE_FD_OPEN : SHELL_EDGE_READ;
+  dep_init_edge(edge, document_idx, owner_idx, edge_type, SHELL_DIR_FORWARD,
+                SHELL_DEP_FD_NONE, target_fd);
   return true;
 }
 
@@ -1652,6 +1710,8 @@ typedef struct {
 
 enum {
   DEP_ENDPOINT_TERMINAL_PIPE = 1,
+  /* Internal raw-pipe marker, consumed before the public graph is returned. */
+  DEP_EDGE_FLAG_PIPE_STDERR = 1 << 7,
 };
 
 typedef enum {
@@ -2161,6 +2221,24 @@ static void dep_resolve_effective_routes(shell_dep_graph_t *graph,
           graph->status |= SHELL_DEP_STATUS_TRUNCATED;
       }
     }
+    /* Bash `|&` is shorthand for a normal stdout pipe followed by `2>&1`.
+     * Apply it after every explicit redirect owned by this command or group;
+     * seeding fd 2 as a second pipe before redirect processing is wrong for
+     * forms such as `cmd 2>err |& next`. */
+    for (uint32_t pipe = 0; pipe < pipe_count; pipe++) {
+      if (pipes[pipe].from != owner ||
+          (pipes[pipe].flags & DEP_EDGE_FLAG_PIPE_STDERR) == 0)
+        continue;
+      dep_fd_route_t copied_read =
+          dep_route_get(state->fd, state->fd_count, 1, DEP_FD_ACCESS_READ);
+      dep_fd_route_t copied_write =
+          dep_route_get(state->fd, state->fd_count, 1, DEP_FD_ACCESS_WRITE);
+      if (!dep_route_assign(state->fd, &state->fd_count, 2, DEP_FD_ACCESS_READ,
+                            copied_read) ||
+          !dep_route_assign(state->fd, &state->fd_count, 2, DEP_FD_ACCESS_WRITE,
+                            copied_write))
+        graph->status |= SHELL_DEP_STATUS_TRUNCATED;
+    }
     streams->stdin_inherited[owner] =
         dep_route_inherits(state, 0, DEP_FD_ACCESS_READ);
     streams->stdout_inherited[owner] =
@@ -2183,6 +2261,50 @@ static void dep_resolve_effective_routes(shell_dep_graph_t *graph,
     graph->edges[kept++] = original_edges[edge];
   }
   graph->edge_count = kept;
+
+  /* Redirections are evaluated in source order even if a later redirect,
+   * close, or Bash `|&` descriptor copy replaces their final byte route. Keep
+   * that setup relation as FD_OPEN for FILE documents instead of retaining a
+   * stale READ/WRITE edge. The original direct edge and the final route have a
+   * one-to-one identity, so this does not grow the bounded graph. */
+  for (uint32_t edge = 0; edge < original_edge_count; edge++) {
+    uint32_t owner = UINT32_MAX;
+    if (!dep_is_direct_io_edge(graph, &original_edges[edge], &owner) ||
+        owner >= graph->node_count || !resolved_owner[owner])
+      continue;
+    const shell_dep_edge_t *original = &original_edges[edge];
+    uint32_t document =
+        original->type == SHELL_EDGE_READ ? original->from : original->to;
+    if (document >= graph->node_count ||
+        graph->nodes[document].type != SHELL_NODE_DOC ||
+        graph->nodes[document].doc.kind != SHELL_DOC_FILE)
+      continue;
+
+    const dep_owner_routes_t *state = &routes[owner];
+    bool effective = false;
+    for (uint32_t fd = 0; fd < state->fd_count; fd++) {
+      dep_fd_route_t route = original->type == SHELL_EDGE_READ
+                                 ? state->fd[fd].read_route
+                                 : state->fd[fd].write_route;
+      effective =
+          effective || (route.kind == DEP_ROUTE_DOC && route.value == edge);
+    }
+    if (effective)
+      continue;
+
+    uint8_t flags = original->type == SHELL_EDGE_APPEND
+                        ? SHELL_DEP_EDGE_FLAG_FD_OPEN_APPEND
+                        : SHELL_DEP_EDGE_FLAG_NONE;
+    if (original->type == SHELL_EDGE_READ) {
+      dep_add_resolved_edge(graph, max_edges, document, owner,
+                            SHELL_EDGE_FD_OPEN, SHELL_DEP_FD_NONE,
+                            original->target_fd, flags);
+    } else {
+      dep_add_resolved_edge(graph, max_edges, owner, document,
+                            SHELL_EDGE_FD_OPEN, original->source_fd,
+                            SHELL_DEP_FD_NONE, flags);
+    }
+  }
 
   for (uint32_t owner = 0; owner < graph->node_count; owner++) {
     if (!resolved_owner[owner])
@@ -2244,7 +2366,7 @@ static void dep_resolve_effective_routes(shell_dep_graph_t *graph,
         }
         dep_add_resolved_edge(graph, max_edges, original->from, terminal,
                               SHELL_EDGE_PIPE, source->fd[out].fd, 0,
-                              original->flags);
+                              SHELL_DEP_EDGE_FLAG_NONE);
         continue;
       }
       for (uint32_t in = 0; in < target->fd_count; in++) {
@@ -2253,7 +2375,7 @@ static void dep_resolve_effective_routes(shell_dep_graph_t *graph,
           continue;
         dep_add_resolved_edge(graph, max_edges, original->from, original->to,
                               SHELL_EDGE_PIPE, source->fd[out].fd,
-                              target->fd[in].fd, original->flags);
+                              target->fd[in].fd, SHELL_DEP_EDGE_FLAG_NONE);
       }
     }
   }
@@ -2261,20 +2383,37 @@ static void dep_resolve_effective_routes(shell_dep_graph_t *graph,
   dep_prune_unfed_endpoints(graph, streams);
 }
 
-static void dep_mark_transient_inline_documents(shell_dep_graph_t *graph) {
+static void dep_mark_transient_documents(shell_dep_graph_t *graph) {
   for (uint32_t node = 0; node < graph->node_count; node++) {
     shell_dep_node_t *document = &graph->nodes[node];
-    if (document->type != SHELL_NODE_DOC ||
-        (document->doc.kind != SHELL_DOC_HEREDOC &&
-         document->doc.kind != SHELL_DOC_HERESTRING))
+    if (document->type != SHELL_NODE_DOC)
       continue;
-    bool consumed = false;
-    for (uint32_t edge = 0; edge < graph->edge_count; edge++) {
-      consumed = consumed || (graph->edges[edge].type == SHELL_EDGE_READ &&
-                              graph->edges[edge].from == node);
+    bool effective = false;
+    bool live_named_setup = false;
+    bool numeric_setup = false;
+    for (uint32_t edge_index = 0; edge_index < graph->edge_count;
+         edge_index++) {
+      const shell_dep_edge_t *edge = &graph->edges[edge_index];
+      effective =
+          effective || ((edge->type == SHELL_EDGE_READ && edge->from == node) ||
+                        ((edge->type == SHELL_EDGE_WRITE ||
+                          edge->type == SHELL_EDGE_APPEND) &&
+                         edge->to == node));
+      if (edge->type != SHELL_EDGE_FD_OPEN ||
+          (edge->from != node && edge->to != node))
+        continue;
+      uint32_t fd = edge->from == node ? edge->target_fd : edge->source_fd;
+      live_named_setup = live_named_setup || fd == SHELL_DEP_FD_NAMED;
+      numeric_setup = numeric_setup || fd != SHELL_DEP_FD_NAMED;
     }
-    if (!consumed)
+    if (document->doc.kind == SHELL_DOC_FILE) {
+      if (!effective && numeric_setup)
+        document->doc.flags |= SHELL_DEP_DOC_FLAG_TRANSIENT;
+    } else if ((document->doc.kind == SHELL_DOC_HEREDOC ||
+                document->doc.kind == SHELL_DOC_HERESTRING) &&
+               !effective && !live_named_setup) {
       document->doc.flags |= SHELL_DEP_DOC_FLAG_TRANSIENT;
+    }
   }
 }
 
@@ -2789,6 +2928,28 @@ static bool dep_find_heredoc_substitution(const char *text, uint32_t length,
         continue;
       }
     }
+    /* Arithmetic expansion is active in an unquoted heredoc, but it is not a
+     * command-substitution stream. Keep `$((1 + 2))` from creating a phantom
+     * SUBST edge while still exposing any executable substitution nested in
+     * its expression. */
+    if (text[pos] == '$' && pos + 2 < length && text[pos + 1] == '(' &&
+        text[pos + 2] == '(') {
+      size_t after = 0;
+      if (!shell_source_skip_arithmetic_expansion(text, length, pos, &after)) {
+        *span = 0;
+        return true;
+      }
+      dep_token_t arithmetic = {text + pos + 3, (uint32_t)(after - pos - 5)};
+      dep_token_t nested;
+      uint32_t nested_span = 0;
+      if (find_subshell_at_or_after(&arithmetic, 0, &nested, &nested_span)) {
+        *subshell = nested;
+        *span = nested_span;
+        return true;
+      }
+      pos = (uint32_t)after - 1;
+      continue;
+    }
     if ((text[pos] != '$' || pos + 1 >= length || text[pos + 1] != '(') &&
         text[pos] != '`')
       continue;
@@ -2900,12 +3061,18 @@ static shell_dep_error_t dep_connect_word_substitutions_kind(
         if (error == SHELL_DEP_ETRUNC)
           out->status |= SHELL_DEP_STATUS_TRUNCATED;
         if (error == SHELL_DEP_OK && subgraph.node_count > 0) {
+          /* Process substitution contributes a generated descriptor pathname,
+           * not its stream bytes, to a composite filename. Retain its commands
+           * without claiming that stdout supplies the FILE document's name. */
+          bool disconnected =
+              subshell.start[0] == '>' ||
+              (subshell.start[0] == '<' && kind == DEP_SUBST_DYNAMIC_NAME);
           bool connected =
-              subshell.start[0] != '>' ||
+              !disconnected ||
               dep_append_disconnected_substitution(
                   out, max_nodes, max_edges, effective_cwd_buf_size,
                   out_streams, &subgraph, &subgraph_streams);
-          if (subshell.start[0] != '>')
+          if (!disconnected)
             connected = dep_connect_substitution(
                 out, max_nodes, max_edges, effective_cwd_buf_size, out_streams,
                 &subgraph, &subgraph_streams, consumer_node,
@@ -2957,8 +3124,8 @@ static uint32_t scan_group_herestrings(const char *cmd, uint32_t cmd_len,
   uint32_t position = group->end;
   uint32_t count = 0;
   while (position < end) {
-    while (position < end && isspace((unsigned char)cmd[position]))
-      position++;
+    position =
+        (uint32_t)shell_source_skip_inline_continuations(cmd, end, position);
     if (position == end)
       break;
 
@@ -2970,11 +3137,16 @@ static uint32_t scan_group_herestrings(const char *cmd, uint32_t cmd_len,
       break;
     uint32_t operator_pos = (uint32_t)operator_after;
     bool explicit_fd = io_number == SHELL_SOURCE_IO_NUMBER_VALID;
+    if (!explicit_fd && shell_source_parse_named_fd_redirect(cmd, position, end,
+                                                             &operator_after)) {
+      operator_pos = (uint32_t)operator_after;
+      fd = SHELL_DEP_FD_NAMED;
+      explicit_fd = true;
+    }
     if (operator_pos + 3 <= end && cmd[operator_pos] == '<' &&
         cmd[operator_pos + 1] == '<' && cmd[operator_pos + 2] == '<') {
-      uint32_t operand = operator_pos + 3;
-      while (operand < end && isspace((unsigned char)cmd[operand]))
-        operand++;
+      uint32_t operand = (uint32_t)shell_source_skip_inline_continuations(
+          cmd, end, operator_pos + 3);
       size_t after = operand;
       if (!shell_source_skip_shell_word(cmd, end, operand, &after) ||
           after == operand || after > UINT32_MAX || count == capacity) {
@@ -3016,9 +3188,9 @@ range_starts_in_group_trailing_redirect_list(const shell_parse_result_t *result,
   return false;
 }
 
-/* The fast parser separates an io_number directly adjacent to a here-string
- * (for example `3<<<data`) into a synthetic SIMPLE range. The descriptor is
- * part of the redirection, never an executable command. */
+/* Older caller-supplied fast results may separate a descriptor immediately
+ * adjacent to a here-string into a synthetic SIMPLE range. Numeric and named
+ * descriptors are redirect syntax, never executable argv. */
 static bool range_is_herestring_fd_prefix(const char *cmd,
                                           const shell_range_t *range,
                                           const shell_range_t *next) {
@@ -3026,10 +3198,16 @@ static bool range_is_herestring_fd_prefix(const char *cmd,
       !(next->type & SHELL_TYPE_HERESTRING) || range->len == 0 ||
       range->start + range->len != next->start)
     return false;
+  bool numeric = true;
   for (uint32_t pos = 0; pos < range->len; pos++)
     if (!isdigit((unsigned char)cmd[range->start + pos]))
-      return false;
-  return true;
+      numeric = false;
+  if (numeric)
+    return true;
+  size_t after = 0;
+  return shell_source_parse_named_fd(cmd, range->start, next->start, &after) &&
+         shell_source_skip_escaped_line_endings(cmd, next->start, after) ==
+             next->start;
 }
 
 /* --- MAIN PARSER --- */
@@ -3049,6 +3227,45 @@ static bool dep_fast_command_type_valid(uint16_t type) {
   default:
     return false;
   }
+}
+
+/* A pipeline range starts after its source delimiter and any legal list
+ * continuation trivia. Supplied fast metadata is an internal optimisation
+ * boundary, not an authority over source spelling: validate the mode against
+ * that delimiter before graph routing consumes it. */
+static bool dep_pipeline_mode_from_source(const char *cmd, uint32_t length,
+                                          uint32_t start,
+                                          shell_pipe_mode_t *mode) {
+  if (!cmd || !mode)
+    return false;
+  start = (uint32_t)shell_source_skip_list_trivia_backward(cmd, length, start);
+  if (start == 0)
+    return false;
+
+  if (cmd[start - 1] == '&') {
+    if (start < 2 || cmd[start - 2] != '|' ||
+        (start > 2 && cmd[start - 3] == '|'))
+      return false;
+    *mode = SHELL_PIPE_MODE_STDOUT_AND_STDERR;
+    return true;
+  }
+  if (cmd[start - 1] != '|' || (start > 1 && cmd[start - 2] == '|'))
+    return false;
+  *mode = SHELL_PIPE_MODE_STDOUT;
+  return true;
+}
+
+static uint32_t dep_pipeline_range_anchor(const shell_parse_result_t *fast,
+                                          const bool *group_live,
+                                          uint32_t range_index) {
+  uint32_t anchor = fast->cmds[range_index].start;
+  for (uint32_t i = 0; i < fast->group_count; i++) {
+    const shell_group_t *group = &fast->groups[i];
+    if (group_live[i] && group->command_count != 0 &&
+        group->first_command == range_index && group->start < anchor)
+      anchor = group->start;
+  }
+  return anchor;
 }
 
 static bool dep_fast_group_is_ancestor(const shell_parse_result_t *fast,
@@ -3071,7 +3288,7 @@ static bool dep_fast_group_is_ancestor(const shell_parse_result_t *fast,
  * established partial-graph contract for that one recoverable condition by
  * disabling the descriptor and marking the result truncated. All other
  * structural contradictions are unsafe to interpret and fail closed. */
-static bool dep_prepare_fast_result(shell_parse_result_t *fast,
+static bool dep_prepare_fast_result(shell_parse_result_t *fast, const char *cmd,
                                     uint32_t command_length) {
   const uint32_t valid_status = SHELL_STATUS_TRUNCATED | SHELL_STATUS_ERROR;
   const uint32_t valid_features =
@@ -3091,15 +3308,28 @@ static bool dep_prepare_fast_result(shell_parse_result_t *fast,
 
   uint32_t previous_end = 0;
   for (uint32_t i = 0; i < fast->count; i++) {
-    const shell_range_t *range = &fast->cmds[i];
+    shell_range_t *range = &fast->cmds[i];
     if (range->len == 0 || range->start > command_length ||
         range->len > command_length - range->start ||
         range->start < previous_end ||
         !dep_fast_command_type_valid(range->type) ||
         (range->features & ~valid_features) != 0 ||
         (range->modifiers & ~SHELL_CMD_MOD_PIPE_NEGATED) != 0 ||
+        (range->pipeline_negation_count != 0 &&
+         (range->modifiers & SHELL_CMD_MOD_PIPE_NEGATED) == 0) ||
+        range->pipe_input_mode > SHELL_PIPE_MODE_STDOUT_AND_STDERR ||
         (range->group_kinds & ~(SHELL_GROUP_BRACE | SHELL_GROUP_SUBSHELL)) != 0)
       return false;
+    bool accepts_pipe_input = range->type == SHELL_TYPE_PIPELINE ||
+                              (range->type & SHELL_TYPE_HEREDOC) != 0 ||
+                              (range->type & SHELL_TYPE_HERESTRING) != 0;
+    if (!accepts_pipe_input) {
+      if (range->pipe_input_mode != SHELL_PIPE_MODE_NONE)
+        return false;
+    }
+    if (range->pipeline_negation_count == 0 &&
+        (range->modifiers & SHELL_CMD_MOD_PIPE_NEGATED) != 0)
+      range->pipeline_negation_count = 1;
     previous_end = range->start + range->len;
   }
 
@@ -3116,8 +3346,13 @@ static bool dep_prepare_fast_result(shell_parse_result_t *fast,
         (group->kind != SHELL_GROUP_BRACE &&
          group->kind != SHELL_GROUP_SUBSHELL) ||
         (group->modifiers & ~SHELL_CMD_MOD_PIPE_NEGATED) != 0 ||
+        (group->pipeline_negation_count != 0 &&
+         (group->modifiers & SHELL_CMD_MOD_PIPE_NEGATED) == 0) ||
         (group->parent != UINT16_MAX && group->parent >= i))
       return false;
+    if (group->pipeline_negation_count == 0 &&
+        (group->modifiers & SHELL_CMD_MOD_PIPE_NEGATED) != 0)
+      group->pipeline_negation_count = 1;
     group_live[i] = true;
   }
 
@@ -3168,7 +3403,78 @@ static bool dep_prepare_fast_result(shell_parse_result_t *fast,
         return false;
     }
   }
+
+  for (uint32_t i = 0; i < fast->count; i++) {
+    shell_range_t *range = &fast->cmds[i];
+    if (range->type != SHELL_TYPE_PIPELINE &&
+        range->pipe_input_mode == SHELL_PIPE_MODE_NONE)
+      continue;
+    shell_pipe_mode_t source_mode;
+    uint32_t anchor = dep_pipeline_range_anchor(fast, group_live, i);
+    if (i == 0 || !dep_pipeline_mode_from_source(cmd, command_length, anchor,
+                                                 &source_mode))
+      return false;
+    /* Normal pipelines historically left this zero-initialised in some
+     * manually supplied results. Preserve that compatibility, but never
+     * infer the distinct `|&` behaviour. */
+    if (range->pipe_input_mode == SHELL_PIPE_MODE_NONE &&
+        source_mode == SHELL_PIPE_MODE_STDOUT)
+      range->pipe_input_mode = SHELL_PIPE_MODE_STDOUT;
+    if (range->pipe_input_mode != source_mode)
+      return false;
+  }
   return true;
+}
+
+/* Redirect-only simple commands are real shell execution operations even
+ * though they have no argv. Retain a zero-token CMD node so file and dynamic
+ * descriptor edges have an honest owner rather than being assigned to the
+ * preceding command. */
+static uint32_t dep_add_empty_command(shell_dep_graph_t *out,
+                                      uint32_t max_nodes, uint32_t *node_range,
+                                      uint32_t range_index,
+                                      const shell_range_t *range,
+                                      uint32_t cwd_offset, bool cwd_known,
+                                      bool backgrounded) {
+  if (out->node_count >= max_nodes) {
+    out->status |= SHELL_DEP_STATUS_TRUNCATED;
+    return UINT32_MAX;
+  }
+  uint32_t node_index = out->node_count++;
+  shell_dep_node_t *node = &out->nodes[node_index];
+  memset(node, 0, sizeof(*node));
+  node_range[node_index] = range_index;
+  node->type = SHELL_NODE_CMD;
+  node->cmd.cwd_offset = cwd_offset;
+  node->cmd.group_depth = range->group_depth;
+  node->cmd.group_kinds = range->group_kinds;
+  node->cmd.backgrounded = backgrounded;
+  node->cmd.pipeline_negation_count = range->pipeline_negation_count;
+  node->cmd.pipeline_negated =
+      (node->cmd.pipeline_negation_count & UINT32_C(1)) != 0;
+  node->cmd.cwd_known = cwd_known && range->type != SHELL_TYPE_AND &&
+                        range->type != SHELL_TYPE_OR;
+  return node_index;
+}
+
+/* Inline documents are structural stages.  Their range type records the
+ * document itself, so recover a preceding list connector from source instead
+ * of silently treating every non-pipeline document as a sequence. */
+static shell_dep_edge_type_t
+dep_document_predecessor_type(const char *cmd, uint32_t command_length,
+                              const shell_range_t *range) {
+  if (range->pipe_input_mode != SHELL_PIPE_MODE_NONE)
+    return SHELL_EDGE_PIPE;
+  uint32_t start = (uint32_t)shell_source_skip_list_trivia_backward(
+      cmd, command_length, range->start);
+  if (start >= 2 && cmd[start - 2] == '&' && cmd[start - 1] == '&')
+    return SHELL_EDGE_AND;
+  if (start >= 2 && cmd[start - 2] == '|' && cmd[start - 1] == '|')
+    return SHELL_EDGE_OR;
+  if (start >= 1 && cmd[start - 1] == '&' &&
+      (start < 2 || cmd[start - 2] != '&'))
+    return SHELL_EDGE_BACKGROUND;
+  return SHELL_EDGE_SEQ;
 }
 
 static shell_dep_error_t shell_dep_graph_parse_impl(
@@ -3264,7 +3570,7 @@ static shell_dep_error_t shell_dep_graph_parse_impl(
     fast_err =
         shell_parse_fast(cmd, cmd_len, &strict_fast_limits, &fast_result);
   }
-  if (!dep_prepare_fast_result(&fast_result, (uint32_t)cmd_len)) {
+  if (!dep_prepare_fast_result(&fast_result, cmd, (uint32_t)cmd_len)) {
     out->node_count = 0;
     out->edge_count = 0;
     out->status = SHELL_DEP_STATUS_ERROR;
@@ -3352,6 +3658,7 @@ static shell_dep_error_t shell_dep_graph_parse_impl(
     node->group.start = cmd + group->start;
     node->group.length = group->end - group->start;
     node->group.kind = group->kind;
+    node->group.pipeline_negation_count = group_pipeline_negation_count(group);
     node->group.pipeline_negated = group_is_pipeline_negated(group);
     node->group.parent =
         group->parent == UINT16_MAX || group_node[group->parent] == UINT32_MAX
@@ -3360,6 +3667,10 @@ static shell_dep_error_t shell_dep_graph_parse_impl(
     if (node->group.parent != UINT32_MAX) {
       if (out->edge_count >= max_edges) {
         out->status |= SHELL_DEP_STATUS_TRUNCATED;
+        /* A retained parent index promises a containment edge. If the edge
+         * limit prevents recording it, detach this partial node rather than
+         * exposing a graph which fails its own structural validation. */
+        node->group.parent = UINT32_MAX;
       } else {
         dep_init_edge(&out->edges[out->edge_count++], node->group.parent,
                       node_index, SHELL_EDGE_GROUP, SHELL_DIR_FORWARD,
@@ -3380,10 +3691,9 @@ static shell_dep_error_t shell_dep_graph_parse_impl(
             heredocs[h].group_idx = find_preceding_group(
                 &fast_result, cmd, fast_result.cmds[si].start);
             if (heredocs[h].group_idx < 0) {
-              uint32_t redirect_start = fast_result.cmds[si].start;
-              while (redirect_start > 0 &&
-                     isdigit((unsigned char)cmd[redirect_start - 1]))
-                redirect_start--;
+              uint32_t redirect_start =
+                  (uint32_t)shell_source_io_number_start_before(
+                      cmd, cmd_len, fast_result.cmds[si].start);
               if (redirect_start != fast_result.cmds[si].start)
                 heredocs[h].group_idx =
                     find_preceding_group(&fast_result, cmd, redirect_start);
@@ -3406,6 +3716,86 @@ static shell_dep_error_t shell_dep_graph_parse_impl(
                   break;
                 }
               }
+            }
+
+            /* A heredoc marker emitted as its own fast range normally
+             * continues the preceding simple command. If a real list boundary
+             * intervenes, retain an argv-less command node for that separate
+             * redirection operation instead of attaching its document to the
+             * prior command or compound group. */
+            if (heredocs[h].group_idx < 0) {
+              const shell_range_t *marker = &fast_result.cmds[si];
+              uint32_t marker_owner = UINT32_MAX;
+              if (last_cmd_idx >= 0) {
+                uint32_t previous = (uint32_t)last_cmd_idx;
+                uint32_t previous_range = node_range[previous];
+                if (previous_range != UINT32_MAX) {
+                  const shell_range_t *previous_source =
+                      &fast_result.cmds[previous_range];
+                  uint32_t previous_end =
+                      previous_source->start + previous_source->len;
+                  if (previous_end <= marker->start &&
+                      command_redirect_tail_to_range(cmd, previous_end, marker))
+                    marker_owner = previous;
+                }
+              }
+              if (marker_owner == UINT32_MAX) {
+                int32_t isolated =
+                    dep_range_isolated_group(&fast_result, group_exec, si);
+                uint32_t marker_cwd_offset = cwd_offset;
+                bool marker_cwd_known = cwd_known;
+                shell_dep_edge_type_t marker_predecessor =
+                    dep_document_predecessor_type(cmd, (uint32_t)cmd_len,
+                                                  marker);
+                if (marker_predecessor == SHELL_EDGE_AND ||
+                    marker_predecessor == SHELL_EDGE_OR)
+                  marker_cwd_known = false;
+                if (isolated >= 0) {
+                  dep_initialize_group_cwd(&fast_result, group_exec,
+                                           (uint32_t)isolated, cwd_offset,
+                                           cwd_known);
+                  marker_cwd_offset = group_exec[isolated].cwd_offset;
+                  marker_cwd_known = group_exec[isolated].cwd_known;
+                }
+                marker_owner = dep_add_empty_command(
+                    out, max_nodes, node_range, si, marker, marker_cwd_offset,
+                    marker_cwd_known,
+                    dep_range_is_backgrounded(&fast_result, group_exec, si));
+                if (marker_owner != UINT32_MAX) {
+                  if (last_cmd_idx >= 0) {
+                    if (out->edge_count < max_edges) {
+                      uint32_t control_from = (uint32_t)last_cmd_idx;
+                      if (marker->pipe_input_mode != SHELL_PIPE_MODE_NONE) {
+                        int32_t source_group = find_finished_group(
+                            &fast_result, node_range[control_from],
+                            marker->start);
+                        if (source_group >= 0 &&
+                            group_node[source_group] != UINT32_MAX)
+                          control_from = group_node[source_group];
+                      }
+                      shell_dep_edge_t *edge = &out->edges[out->edge_count++];
+                      dep_init_edge(edge, control_from, marker_owner,
+                                    marker_predecessor, SHELL_DIR_FORWARD,
+                                    SHELL_DEP_FD_NONE, SHELL_DEP_FD_NONE);
+                      if (edge->type == SHELL_EDGE_PIPE) {
+                        edge->source_fd = 1;
+                        edge->target_fd = 0;
+                        if (marker->pipe_input_mode ==
+                            SHELL_PIPE_MODE_STDOUT_AND_STDERR)
+                          edge->flags = DEP_EDGE_FLAG_PIPE_STDERR;
+                      }
+                    } else {
+                      out->status |= SHELL_DEP_STATUS_TRUNCATED;
+                    }
+                  }
+                  last_cmd_idx = (int32_t)marker_owner;
+                  if (marker_predecessor == SHELL_EDGE_AND ||
+                      marker_predecessor == SHELL_EDGE_OR)
+                    cwd_known = false;
+                }
+              }
+              heredocs[h].cmd_node_idx =
+                  marker_owner == UINT32_MAX ? -1 : (int32_t)marker_owner;
             }
           }
         }
@@ -3440,16 +3830,66 @@ static shell_dep_error_t shell_dep_graph_parse_impl(
     if (range->type & SHELL_TYPE_HERESTRING) {
       const char *marker = cmd + rstart;
       uint32_t mlen = rlen;
-      uint32_t pos = 3;
-      while (pos < mlen && isspace((unsigned char)marker[pos]))
-        pos++;
+      uint32_t pos =
+          (uint32_t)shell_source_skip_inline_continuations(marker, mlen, 3);
 
       const char *word = marker + pos;
       uint32_t word_len = mlen - pos;
 
+      uint32_t owner = UINT32_MAX;
+      if (last_cmd_idx >= 0) {
+        uint32_t previous = (uint32_t)last_cmd_idx;
+        uint32_t previous_range = node_range[previous];
+        if (previous_range != UINT32_MAX) {
+          const shell_range_t *previous_source =
+              &fast_result.cmds[previous_range];
+          uint32_t previous_end = previous_source->start + previous_source->len;
+          if (previous_end <= rstart &&
+              command_redirect_tail_to_range(cmd, previous_end, range))
+            owner = previous;
+        }
+      }
+      if (owner == UINT32_MAX) {
+        shell_dep_edge_type_t predecessor =
+            dep_document_predecessor_type(cmd, (uint32_t)cmd_len, range);
+        bool document_cwd_known = *range_cwd_known;
+        if (predecessor == SHELL_EDGE_AND || predecessor == SHELL_EDGE_OR)
+          document_cwd_known = false;
+        owner = dep_add_empty_command(out, max_nodes, node_range, si, range,
+                                      *range_cwd_offset, document_cwd_known,
+                                      range_backgrounded);
+        if (owner == UINT32_MAX)
+          continue;
+        if (last_cmd_idx >= 0) {
+          if (out->edge_count < max_edges) {
+            uint32_t control_from = (uint32_t)last_cmd_idx;
+            if (range->pipe_input_mode != SHELL_PIPE_MODE_NONE) {
+              int32_t source_group = find_finished_group(
+                  &fast_result, node_range[control_from], range->start);
+              if (source_group >= 0 && group_node[source_group] != UINT32_MAX)
+                control_from = group_node[source_group];
+            }
+            shell_dep_edge_t *edge = &out->edges[out->edge_count++];
+            dep_init_edge(edge, control_from, owner, predecessor,
+                          SHELL_DIR_FORWARD, SHELL_DEP_FD_NONE,
+                          SHELL_DEP_FD_NONE);
+            if (edge->type == SHELL_EDGE_PIPE) {
+              edge->source_fd = 1;
+              edge->target_fd = 0;
+              if (range->pipe_input_mode == SHELL_PIPE_MODE_STDOUT_AND_STDERR)
+                edge->flags = DEP_EDGE_FLAG_PIPE_STDERR;
+            }
+          } else {
+            out->status |= SHELL_DEP_STATUS_TRUNCATED;
+          }
+        }
+        last_cmd_idx = (int32_t)owner;
+        if (predecessor == SHELL_EDGE_AND || predecessor == SHELL_EDGE_OR)
+          *range_cwd_known = false;
+      }
+
       uint32_t document = UINT32_MAX;
-      if (last_cmd_idx >= 0 &&
-          add_document_read(out, max_nodes, max_edges, (uint32_t)last_cmd_idx,
+      if (add_document_read(out, max_nodes, max_edges, owner,
                             SHELL_DOC_HERESTRING, NULL, 0, word, word_len,
                             inline_document_target_fd(cmd, rstart),
                             SHELL_DEP_DOC_FLAG_NONE, &out->status, &document)) {
@@ -3469,8 +3909,18 @@ static shell_dep_error_t shell_dep_graph_parse_impl(
       continue;
     }
 
+    /* The fast parser may end this range at the backslash of an escaped
+     * physical line ending, with the following redirect range beginning after
+     * LF/CRLF. That backslash is grammar, not a trailing argv word. */
+    uint32_t token_length = rlen;
+    uint32_t range_end = rstart + rlen;
+    if (token_length != 0 && range_end < cmd_len &&
+        cmd[range_end - 1] == '\\' &&
+        (cmd[range_end] == '\n' || cmd[range_end] == '\r'))
+      token_length--;
+
     dep_token_list_t tokens;
-    if (scan_tokens(cmd, rstart, rlen, &tokens))
+    if (scan_tokens(cmd, rstart, token_length, &tokens))
       out->status |= SHELL_DEP_STATUS_TRUNCATED;
     if (tokens.malformed) {
       out->node_count = 0;
@@ -3511,8 +3961,9 @@ static shell_dep_error_t shell_dep_graph_parse_impl(
         node->cmd.group_depth = range->group_depth;
         node->cmd.group_kinds = range->group_kinds;
         node->cmd.backgrounded = range_backgrounded;
+        node->cmd.pipeline_negation_count = range->pipeline_negation_count;
         node->cmd.pipeline_negated =
-            (range->modifiers & SHELL_CMD_MOD_PIPE_NEGATED) != 0;
+            (node->cmd.pipeline_negation_count & UINT32_C(1)) != 0;
         node->cmd.cwd_known = *range_cwd_known;
         node->cmd.token_count = 0;
         if (tokens.count > max_tokens)
@@ -3624,8 +4075,29 @@ static shell_dep_error_t shell_dep_graph_parse_impl(
       }
     }
 
+    int32_t trailing_group = -1;
+    if (is_redirect_only && tokens.count > 0) {
+      trailing_group = find_preceding_group(&fast_result, cmd, rstart);
+      if (trailing_group < 0)
+        trailing_group =
+            find_trailing_redirect_group(&fast_result, cmd, rstart);
+    }
+    bool follows_inline_command = false;
+    uint32_t prior_command = UINT32_MAX;
     if (is_redirect_only && tokens.count > 0 && last_cmd_idx >= 0) {
-      uint32_t prev_cmd = (uint32_t)last_cmd_idx;
+      prior_command = (uint32_t)last_cmd_idx;
+      uint32_t prior_range = node_range[prior_command];
+      if (prior_range != UINT32_MAX) {
+        const shell_range_t *previous = &fast_result.cmds[prior_range];
+        uint32_t previous_end = previous->start + previous->len;
+        follows_inline_command =
+            previous_end <= rstart &&
+            command_redirect_tail_to_range(cmd, previous_end, range);
+      }
+    }
+
+    if ((trailing_group >= 0 && group_node[trailing_group] != UINT32_MAX) ||
+        follows_inline_command) {
       uint32_t t = 0;
       while (t < tokens.count) {
         dep_redirect_t redir = classify_redirect(&tokens.tokens[t]);
@@ -3634,14 +4106,12 @@ static shell_dep_error_t shell_dep_graph_parse_impl(
           continue;
         if (t < tokens.count && redir != DEP_REDIRECT_NONE) {
           const dep_token_t *target = &tokens.tokens[t];
-          uint32_t owner = prev_cmd;
-          /* A redirect immediately following a completed group belongs to
-           * that group execution endpoint. Do not project it onto members. */
-          int32_t group = find_preceding_group(&fast_result, cmd, rstart);
-          if (group < 0)
-            group = find_trailing_redirect_group(&fast_result, cmd, rstart);
-          if (group >= 0 && group_node[group] != UINT32_MAX)
-            owner = group_node[group];
+          /* A syntactically continuous redirect list after a completed group
+           * belongs to the group execution endpoint. A redirect-only range
+           * after any list boundary instead becomes its own zero-token CMD
+           * node below; it must never be projected onto the prior command. */
+          uint32_t owner =
+              trailing_group >= 0 ? group_node[trailing_group] : prior_command;
 
           bool handled_process = false;
           shell_dep_error_t process_error =
@@ -3724,8 +4194,9 @@ static shell_dep_error_t shell_dep_graph_parse_impl(
     node->cmd.group_depth = range->group_depth;
     node->cmd.group_kinds = range->group_kinds;
     node->cmd.backgrounded = range_backgrounded;
+    node->cmd.pipeline_negation_count = range->pipeline_negation_count;
     node->cmd.pipeline_negated =
-        (range->modifiers & SHELL_CMD_MOD_PIPE_NEGATED) != 0;
+        (node->cmd.pipeline_negation_count & UINT32_C(1)) != 0;
     node->cmd.cwd_known = *range_cwd_known && range->type != SHELL_TYPE_AND &&
                           range->type != SHELL_TYPE_OR;
     node->cmd.token_count = 0;
@@ -4058,6 +4529,8 @@ static shell_dep_error_t shell_dep_graph_parse_impl(
       if (edge->type == SHELL_EDGE_PIPE) {
         edge->source_fd = 1;
         edge->target_fd = 0;
+        if (range->pipe_input_mode == SHELL_PIPE_MODE_STDOUT_AND_STDERR)
+          edge->flags = DEP_EDGE_FLAG_PIPE_STDERR;
       }
 
     } else if (last_cmd_idx >= 0)
@@ -4164,7 +4637,7 @@ static shell_dep_error_t shell_dep_graph_parse_impl(
   dep_resolve_effective_routes(out, cmd, (uint32_t)cmd_len, &fast_result,
                                node_range, group_node, max_nodes, max_edges,
                                streams);
-  dep_mark_transient_inline_documents(out);
+  dep_mark_transient_documents(out);
   return (out->status & SHELL_DEP_STATUS_TRUNCATED) ? SHELL_DEP_ETRUNC
                                                     : SHELL_DEP_OK;
 }
@@ -4197,11 +4670,14 @@ void shell_dep_graph_dump(const shell_dep_graph_t *g, FILE *fp) {
   for (uint32_t i = 0; i < g->node_count; i++) {
     const shell_dep_node_t *n = &g->nodes[i];
     if (n->type == SHELL_NODE_CMD) {
-      fprintf(fp, "  [%u] CMD cwd=\"%s\"%s tokens=[", i,
+      fprintf(fp, "  [%u] CMD cwd=\"%s\"", i,
               n->cmd.cwd_offset < g->cwd_buf.len
                   ? g->cwd_buf.data + n->cmd.cwd_offset
-                  : "?",
-              n->cmd.pipeline_negated ? " negated" : "");
+                  : "?");
+      if (n->cmd.pipeline_negation_count != 0)
+        fprintf(fp, " negation-count=%u%s", n->cmd.pipeline_negation_count,
+                n->cmd.pipeline_negated ? " negated" : "");
+      fprintf(fp, " tokens=[");
       for (uint32_t j = 0; j < n->cmd.token_count; j++) {
         if (j > 0)
           fprintf(fp, ", ");
@@ -4209,9 +4685,12 @@ void shell_dep_graph_dump(const shell_dep_graph_t *g, FILE *fp) {
       }
       fprintf(fp, "]\n");
     } else if (n->type == SHELL_NODE_GROUP) {
-      fprintf(fp, "  [%u] GROUP span=\"%.*s\" parent=%u%s\n", i,
-              n->group.length, n->group.start ? n->group.start : "",
-              n->group.parent, n->group.pipeline_negated ? " negated" : "");
+      fprintf(fp, "  [%u] GROUP span=\"%.*s\" parent=%u", i, n->group.length,
+              n->group.start ? n->group.start : "", n->group.parent);
+      if (n->group.pipeline_negation_count != 0)
+        fprintf(fp, " negation-count=%u%s", n->group.pipeline_negation_count,
+                n->group.pipeline_negated ? " negated" : "");
+      fprintf(fp, "\n");
     } else if (n->type == SHELL_NODE_ENDPOINT) {
       fprintf(fp, "  [%u] ENDPOINT%s\n", i,
               n->endpoint.reserved == DEP_ENDPOINT_TERMINAL_PIPE
@@ -4334,7 +4813,8 @@ shell_dep_graph_validate(const shell_dep_graph_t *g) {
           shape_valid = doc->path != NULL && doc->path_len > 0 &&
                         doc->name == NULL && doc->name_len == 0 &&
                         doc->value == NULL && doc->value_len == 0 &&
-                        (doc->flags & ~(SHELL_DEP_DOC_FLAG_DYNAMIC_NAME)) == 0;
+                        (doc->flags & ~(SHELL_DEP_DOC_FLAG_DYNAMIC_NAME |
+                                        SHELL_DEP_DOC_FLAG_TRANSIENT)) == 0;
           break;
         case SHELL_DOC_HEREDOC:
           shape_valid = doc->path == NULL && doc->path_len == 0 &&
@@ -4483,10 +4963,15 @@ shell_dep_graph_validate(const shell_dep_graph_t *g) {
     }
 
     if ((e->flags & ~(SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD |
-                      SHELL_DEP_EDGE_FLAG_SUBST_DYNAMIC_NAME)) != 0 ||
+                      SHELL_DEP_EDGE_FLAG_SUBST_DYNAMIC_NAME |
+                      SHELL_DEP_EDGE_FLAG_FD_OPEN_APPEND)) != 0 ||
         ((e->flags & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0 &&
          (e->flags & SHELL_DEP_EDGE_FLAG_SUBST_DYNAMIC_NAME) != 0) ||
-        (e->type != SHELL_EDGE_SUBST && e->flags != SHELL_DEP_EDGE_FLAG_NONE)) {
+        ((e->flags & (SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD |
+                      SHELL_DEP_EDGE_FLAG_SUBST_DYNAMIC_NAME)) != 0 &&
+         e->type != SHELL_EDGE_SUBST) ||
+        ((e->flags & SHELL_DEP_EDGE_FLAG_FD_OPEN_APPEND) != 0 &&
+         e->type != SHELL_EDGE_FD_OPEN)) {
       r.valid = false;
       r.errors[r.error_count].edge_idx = i;
       snprintf(r.errors[r.error_count].msg, 96, "invalid flags %#x for %s edge",
@@ -4585,12 +5070,16 @@ shell_dep_graph_validate(const shell_dep_graph_t *g) {
       break;
     case SHELL_EDGE_FD_OPEN:
       ok = (((ft == SHELL_NODE_CMD || ft == SHELL_NODE_GROUP) &&
-             tt == SHELL_NODE_DOC && e->source_fd == SHELL_DEP_FD_NAMED &&
+             tt == SHELL_NODE_DOC && e->source_fd != SHELL_DEP_FD_NONE &&
              e->target_fd == SHELL_DEP_FD_NONE) ||
             (ft == SHELL_NODE_DOC &&
              (tt == SHELL_NODE_CMD || tt == SHELL_NODE_GROUP) &&
              e->source_fd == SHELL_DEP_FD_NONE &&
-             e->target_fd == SHELL_DEP_FD_NAMED)) &&
+             e->target_fd != SHELL_DEP_FD_NONE)) &&
+           (((e->flags & SHELL_DEP_EDGE_FLAG_FD_OPEN_APPEND) == 0) ||
+            ((ft == SHELL_NODE_CMD || ft == SHELL_NODE_GROUP) &&
+             tt == SHELL_NODE_DOC && e->source_fd != SHELL_DEP_FD_NONE &&
+             e->target_fd == SHELL_DEP_FD_NONE)) &&
            e->dir == SHELL_DIR_FORWARD;
       break;
     case SHELL_EDGE_ENV:

@@ -33,7 +33,7 @@ typedef struct {
   const char
       *transformed; // Owned/aliased NUL-terminated transformed token text
   shell_transform_type_t type; // Type of transformation
-  bool is_shell_construct;     // True if this was shell syntax
+  bool is_shell_construct;     // True if this token has shell semantics
 } shell_transformed_token_t;
 
 /**
@@ -44,8 +44,10 @@ typedef struct {
   const char *display_text;     // Lossy diagnostic text after token transforms
   shell_transformed_token_t *tokens; // Transformed tokens
   size_t token_count;                // Number of tokens
-  bool has_transformations;          // Has any transformations
-  bool has_shell_syntax;             // Has shell syntax
+  bool has_transformations;          // Has any display normalizations
+  /* Has semantic shell syntax, including executable substitutions embedded
+   * in a word. This need not imply that diagnostic display text changed. */
+  bool has_shell_syntax;
 } shell_transformed_command_t;
 
 typedef enum {
@@ -78,6 +80,12 @@ shell_transform_command(const shell_command_t *cmd,
 
 /**
  * Transform exactly `command_length` shell-source bytes.
+ *
+ * Shellsplit only transforms modeled simple-command lists, pipelines, and
+ * brace/subshell groups. Control compounds (including function declarations,
+ * `select`, and `coproc`), shell-semantic array forms, and unmodeled Bash
+ * `[[ … ]]`, `(( … ))`, `time`, `$"…"`, and `;&` / `;;&` forms return
+ * SHELL_TRANSFORM_EPARSE.
  *
  * On failure, writable outputs are reset to NULL and zero.
  */

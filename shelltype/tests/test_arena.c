@@ -86,6 +86,25 @@ int main(void) {
     ASSERT(invalid.used == rejected[i].used);
   }
 
+  /* Exercise the two overflow-adjacent growth branches without asking the
+   * allocator for a real near-SIZE_MAX block. The deterministic hook rejects
+   * the realloc after the arena has selected its exact required capacity. */
+  arena_t exact_growth = {0};
+  ASSERT(arena_init(&exact_growth, 1));
+  st_test_alloc_fail_at(1);
+  ASSERT(arena_alloc(&exact_growth, SIZE_MAX - 1023) == NULL);
+  st_test_alloc_reset();
+  ASSERT(exact_growth.size == 1 && exact_growth.used == 0);
+  arena_free(&exact_growth);
+
+  arena_t reserve_exact = {
+      .base = &sentinel, .size = SIZE_MAX / 2 + 1, .used = 0};
+  st_test_alloc_fail_at(1);
+  ASSERT(!arena_reserve(&reserve_exact, SIZE_MAX / 2 + 2));
+  st_test_alloc_reset();
+  ASSERT(reserve_exact.base == &sentinel &&
+         reserve_exact.size == SIZE_MAX / 2 + 1 && reserve_exact.used == 0);
+
   arena_free(&arena);
   ASSERT(arena.base == NULL);
   ASSERT(arena.size == 0);

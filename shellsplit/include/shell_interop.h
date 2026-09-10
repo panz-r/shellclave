@@ -38,7 +38,7 @@ void shell_interop_free(shell_interop_handle_t *handle);
  *   SHELL_FEAT_CONDITIONALS  = 0x100 // if/then/else/fi
  *   SHELL_FEAT_CASE          = 0x200 // case/esac
  *   SHELL_FEAT_SUBSHELL_FILE = 0x400 // $(<file)
- *   SHELL_FEAT_PIPELINE       = 0x800 // literal | pipeline construct
+ *   SHELL_FEAT_PIPELINE       = 0x800 // literal | or |& pipeline construct
  *   SHELL_FEAT_GROUP          = 0x1000 // brace or parenthesized command group
  *
  * Command types (upper bits of type) describe the operator or structural
@@ -46,7 +46,7 @@ void shell_interop_free(shell_interop_handle_t *handle);
  * when a subcommand also contains a nested substitution; inspect features for
  * the nested syntax:
  *   SHELL_TYPE_SIMPLE     = 0x0000 // First or standalone command
- *   SHELL_TYPE_PIPELINE   = 0x0100 // Preceded by literal |
+ *   SHELL_TYPE_PIPELINE   = 0x0100 // Preceded by literal | or |&
  *   SHELL_TYPE_AND        = 0x0200 // Preceded by &&
  *   SHELL_TYPE_OR         = 0x0400 // Preceded by ||
  *   SHELL_TYPE_SEMICOLON  = 0x0800 // Preceded by ;
@@ -58,7 +58,9 @@ void shell_interop_free(shell_interop_handle_t *handle);
  * `cmd` points to exactly `cmd_len` bytes and need not be null-terminated.
  * Embedded NUL bytes are rejected because they are not valid shell input.
  * On success, `subcommand_count` receives the number of parsed subcommands.
- * Every call clears the previous result before validating input.
+ * Every call clears the previous result before validating input. A pipeline
+ * range's `pipe_input_mode` distinguishes normal stdout-only `|` from Bash
+ * `|&`, which sends both stdout and stderr to the next stage.
  */
 shell_error_t shell_interop_parse(shell_interop_handle_t *handle,
                                   const char *cmd, size_t cmd_len,

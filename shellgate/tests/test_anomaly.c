@@ -208,10 +208,7 @@ TEST(lifecycle_and_null_safety) {
   ASSERT_EQ_INT(empty_removed, 0);
   ASSERT_EQ_INT(sg_anomaly_model_reset(NULL), SG_ANOMALY_ERR_INVALID);
 
-  const char *invalid_sequences[][3] = {
-      {"a", NULL, "c"},
-      {"a", "", "c"},
-  };
+  const char *invalid_sequences[][3] = {{"a", NULL, "c"}};
   sg_anomaly_update(model, commands, 5);
   for (size_t i = 0;
        i < sizeof(invalid_sequences) / sizeof(invalid_sequences[0]); i++) {
@@ -220,6 +217,12 @@ TEST(lifecycle_and_null_safety) {
     sg_anomaly_update(model, invalid_sequences[i], 3);
     ASSERT_EQ_INT(sg_anomaly_model_total_unigrams(model), 5);
   }
+  const char *empty_stage[] = {"a", "", "c"};
+  ASSERT(isfinite(sg_anomaly_score(model, empty_stage, 3)));
+  ASSERT_EQ_INT(sg_anomaly_model_unigram_count(model, ""), 0);
+  sg_anomaly_update(model, empty_stage, 3);
+  ASSERT_EQ_INT(sg_anomaly_model_total_unigrams(model), 8);
+  ASSERT_EQ_INT(sg_anomaly_model_unigram_count(model, ""), 1);
   sg_anomaly_update(NULL, commands, 5);
   ASSERT_EQ_INT(sg_anomaly_model_decay(NULL, 0.5), SG_ANOMALY_ERR_INVALID);
   sg_anomaly_model_clear_error(NULL);
@@ -322,6 +325,11 @@ TEST(config_contract) {
 }
 
 TEST(update_count_matrix) {
+  /* Stage is the public term. Keep the former command-length spelling as a
+   * source-compatible alias so downstream callers can migrate independently. */
+  ASSERT_EQ_INT(SG_ANOMALY_MAX_STAGE_LENGTH, 1023);
+  ASSERT_EQ_INT(SG_ANOMALY_MAX_COMMAND_LENGTH, SG_ANOMALY_MAX_STAGE_LENGTH);
+
   for (size_t length = 1; length <= 5; length++) {
     sg_anomaly_model_t *model = sg_anomaly_model_new();
     ASSERT(model != NULL);
@@ -350,12 +358,12 @@ TEST(update_count_matrix) {
     sg_anomaly_model_free(model);
   }
 
-  char storage[4][SG_ANOMALY_MAX_COMMAND_LENGTH + 1];
+  char storage[4][SG_ANOMALY_MAX_STAGE_LENGTH + 1];
   const char *boundary[4];
   for (size_t i = 0; i < 4; i++) {
-    memset(storage[i], 'a', SG_ANOMALY_MAX_COMMAND_LENGTH);
-    storage[i][SG_ANOMALY_MAX_COMMAND_LENGTH - 1] = (char)('a' + i);
-    storage[i][SG_ANOMALY_MAX_COMMAND_LENGTH] = '\0';
+    memset(storage[i], 'a', SG_ANOMALY_MAX_STAGE_LENGTH);
+    storage[i][SG_ANOMALY_MAX_STAGE_LENGTH - 1] = (char)('a' + i);
+    storage[i][SG_ANOMALY_MAX_STAGE_LENGTH] = '\0';
     boundary[i] = storage[i];
   }
   sg_anomaly_model_t *model = sg_anomaly_model_new();
@@ -370,7 +378,7 @@ TEST(update_count_matrix) {
                 1);
   ASSERT(isfinite(sg_anomaly_score(model, boundary, 4)));
 
-  char too_long[SG_ANOMALY_MAX_COMMAND_LENGTH + 2];
+  char too_long[SG_ANOMALY_MAX_STAGE_LENGTH + 2];
   memset(too_long, 'x', sizeof(too_long) - 1);
   too_long[sizeof(too_long) - 1] = '\0';
   const char *invalid[] = {boundary[0], boundary[1], too_long};
@@ -889,8 +897,8 @@ TEST(canonical_netseq_contract) {
   ASSERT(isfinite(binary_split_score));
   ASSERT(binary_known_score < binary_split_score);
 
-  static const char *invalid[] = {"01:x,", "1:x", "2:x,", "0:,",
-                                  "x",     "1x,", "1:x;", "1:,"};
+  static const char *invalid[] = {"01:x,", "1:x",  "2:x,", "x",
+                                  "1x,",   "1:x;", "1:,"};
   for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
     score = 0.0;
     ASSERT_EQ_INT(sg_anomaly_model_score_netseq(model, invalid[i],
@@ -898,6 +906,9 @@ TEST(canonical_netseq_contract) {
                   SG_ANOMALY_ERR_FORMAT);
     ASSERT(isinf(score));
   }
+  ASSERT_EQ_INT(sg_anomaly_model_score_netseq(model, "0:,", 3, &score),
+                SG_ANOMALY_OK);
+  ASSERT(isinf(score));
   ASSERT_EQ_INT(
       sg_anomaly_model_score_netseq(NULL, valid, sizeof(valid) - 1, &score),
       SG_ANOMALY_ERR_INVALID);
@@ -922,7 +933,7 @@ TEST(canonical_netseq_contract) {
       sg_anomaly_model_update_netseq(model, overflow, sizeof(overflow) - 1),
       SG_ANOMALY_ERR_LIMIT);
 
-  size_t large_length = SG_ANOMALY_MAX_COMMAND_LENGTH + 1U;
+  size_t large_length = SG_ANOMALY_MAX_STAGE_LENGTH + 1U;
   size_t large_capacity = large_length + 32U;
   char *large = malloc(large_capacity);
   ASSERT(large != NULL);
@@ -1030,6 +1041,70 @@ TEST(binary_netseq_persistence) {
   ASSERT(unlink(path) == 0);
 }
 
+TEST(empty_stage_persistence_and_legacy_loading) {
+  static const char sentinel_sequence[] = "4:echo,0:,4:sort,";
+  static const char ordinary_sequence[] = "4:echo,4:sort,4:done,";
+  sg_anomaly_model_t *source = sg_anomaly_model_new();
+  sg_anomaly_model_t *loaded = sg_anomaly_model_new();
+  ASSERT(source && loaded);
+  ASSERT_EQ_INT(sg_anomaly_model_update_netseq(source, sentinel_sequence,
+                                               sizeof(sentinel_sequence) - 1),
+                SG_ANOMALY_OK);
+  ASSERT_EQ_INT(sg_anomaly_model_unigram_count(source, ""), 1);
+
+  FILE *stream = tmpfile();
+  ASSERT(stream != NULL);
+  ASSERT_EQ_INT(sg_anomaly_write_stream(source, stream), 0);
+  ASSERT(fseek(stream, 0, SEEK_SET) == 0);
+  char header[32] = {0};
+  ASSERT(fgets(header, sizeof(header), stream) != NULL);
+  ASSERT(strcmp(header, "# anomaly-model-v7\n") == 0);
+  ASSERT(fseek(stream, 0, SEEK_SET) == 0);
+  ASSERT_EQ_INT(sg_anomaly_read_stream(loaded, stream), 0);
+  ASSERT_EQ_INT(sg_anomaly_model_unigram_count(loaded, ""), 1);
+  ASSERT_EQ_INT(sg_anomaly_model_total_unigrams(loaded), 3);
+  ASSERT(fclose(stream) == 0);
+
+  stream = tmpfile();
+  ASSERT(stream != NULL);
+  ASSERT_EQ_INT(sg_anomaly_model_update_netseq(loaded, ordinary_sequence,
+                                               sizeof(ordinary_sequence) - 1),
+                SG_ANOMALY_OK);
+  ASSERT_EQ_INT(sg_anomaly_write_stream(loaded, stream), 0);
+  /* v6 uses canonical binary netstring keys but predates the empty
+   * redirect-only-stage item, so relabeling this v7 sentinel model must fail
+   * atomically. */
+  ASSERT(fseek(stream, strlen("# anomaly-model-v"), SEEK_SET) == 0);
+  ASSERT(fputc('6', stream) == '6' && fflush(stream) == 0);
+  ASSERT(fseek(stream, 0, SEEK_SET) == 0);
+  size_t preserved_unigrams = sg_anomaly_model_total_unigrams(source);
+  errno = 0;
+  ASSERT_EQ_INT(sg_anomaly_read_stream(source, stream), -1);
+  ASSERT_EQ_INT(errno, EPROTO);
+  ASSERT_EQ_INT(sg_anomaly_model_total_unigrams(source), preserved_unigrams);
+  ASSERT(fclose(stream) == 0);
+
+  sg_anomaly_model_t *legacy_source = sg_anomaly_model_new();
+  ASSERT(legacy_source != NULL);
+  ASSERT_EQ_INT(sg_anomaly_model_update_netseq(legacy_source, ordinary_sequence,
+                                               sizeof(ordinary_sequence) - 1),
+                SG_ANOMALY_OK);
+  stream = tmpfile();
+  ASSERT(stream != NULL);
+  ASSERT_EQ_INT(sg_anomaly_write_stream(legacy_source, stream), 0);
+  ASSERT(fseek(stream, strlen("# anomaly-model-v"), SEEK_SET) == 0);
+  ASSERT(fputc('6', stream) == '6' && fflush(stream) == 0);
+  ASSERT(fseek(stream, 0, SEEK_SET) == 0);
+  /* A non-empty legacy v6 model remains supported. */
+  ASSERT_EQ_INT(sg_anomaly_read_stream(loaded, stream), 0);
+  ASSERT_EQ_INT(sg_anomaly_model_unigram_count(loaded, ""), 0);
+  ASSERT_EQ_INT(sg_anomaly_model_total_unigrams(loaded), 3);
+  ASSERT(fclose(stream) == 0);
+  sg_anomaly_model_free(legacy_source);
+  sg_anomaly_model_free(loaded);
+  sg_anomaly_model_free(source);
+}
+
 TEST(canonical_netseq_allocation_failures) {
   static const char sequence[] = "1:a,1:b,1:c,1:d,1:e,1:f,1:g,1:h,1:i,";
   sg_anomaly_model_t *probe = sg_anomaly_model_new();
@@ -1088,6 +1163,7 @@ int main(void) {
   RUN(prune_and_compact_preserve_common_behavior);
   RUN(canonical_netseq_contract);
   RUN(binary_netseq_persistence);
+  RUN(empty_stage_persistence_and_legacy_loading);
   RUN(canonical_netseq_allocation_failures);
   printf("\n%d passed, %d failed\n", pass_count, fail_count);
   return fail_count > 0 ? 1 : 0;

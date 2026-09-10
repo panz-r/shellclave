@@ -88,6 +88,7 @@ static void test_validation_failures(void) {
 }
 
 static void test_count_and_error_position(void) {
+  shell_netstring_buffer_free(NULL);
   static const char input[] = "1:a,2:bc,";
   static const char broken[] = "1:a,01:b,";
   size_t count = 0;
@@ -258,6 +259,7 @@ static void test_stream_reader_format_failures(void) {
       {"999999999999999999999999999999:", SHELL_NETSTRING_EOVERFLOW},
       {"3", SHELL_NETSTRING_EFORMAT},
       {"3:ab", SHELL_NETSTRING_EFORMAT},
+      {"3:abc", SHELL_NETSTRING_EFORMAT},
       {"3:abc.", SHELL_NETSTRING_EFORMAT},
   };
   unsigned char *record = (unsigned char *)(void *)1;

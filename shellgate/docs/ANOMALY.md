@@ -1,6 +1,6 @@
 # Statistical Anomaly Detection for Shellgate
 
-Shellgate uses a **hybrid dual-model** language model to detect anomalous shell command sequences. Two independent n-gram models score each command and their results are combined with configurable weights.
+Shellgate uses a **hybrid dual-model** language model to detect anomalous shell execution-stage sequences. Two independent n-gram models score each stage and their results are combined with configurable weights.
 
 ## How It Works
 
@@ -8,18 +8,34 @@ Shellgate uses a **hybrid dual-model** language model to detect anomalous shell 
 
 Two models run in parallel:
 
-1. **Raw model** — scores command names (e.g., `["ls", "cd", "pwd"]`)
-2. **Type model** — scores nested canonical per-command signatures (for
+1. **Raw model** — scores stage executable names (e.g., `["ls", "cd", "pwd"]`)
+2. **Type model** — scores nested canonical per-stage signatures (for
    example, the three records representing `ls`, `cd AP`, and `pwd`)
 
 The type model generalises arguments: paths become `AP`, options become `OPT`,
 environment variables become `EV`, etc. Both models contain exactly one item
-per isolated subcommand; arguments are nested inside the corresponding type
+per execution stage; arguments are nested inside the corresponding type
 signature rather than becoming n-gram items themselves.
+
+### Execution-Stage Boundaries
+
+The stage sequence includes every supported simple command reached while the
+shell evaluates one submitted source command: ordinary list members plus
+command substitutions, backticks, process substitutions, unquoted heredoc
+expansion bodies, and command substitutions within arithmetic expansions.
+Nested stages precede the enclosing command and sibling stages retain source
+order. This deterministic analysis order makes the raw and type sequences
+align; it does not claim that pipeline members or asynchronous shell work run
+in that order.
+
+This sequence is distinct from Shellgate's `subcommand_count`, which reports
+the policy-evaluable dependency-graph commands retained in the result. An
+argv-less redirect-only operation is an anomaly stage using the empty sentinel,
+but is not a policy-evaluable command.
 
 ### Scoring
 
-Each model uses a **4-gram language model** with Kneser-Ney smoothing and backoff to trigram/bigram/unigram. Scores are in bits per command (higher = more anomalous).
+Each model uses a **4-gram language model** with Kneser-Ney smoothing and backoff to trigram/bigram/unigram. Scores are in bits per stage (higher = more anomalous).
 
 The combined score is a weighted sum in bit-space:
 
@@ -42,11 +58,11 @@ P_KN(w | ctx) = max(0, c(w,ctx) - D) / c(ctx)
 - Continuation counts from lower-order models prevent overfitting on rare n-grams
 - Backoff chain: 4-gram → trigram → bigram → unigram → UNK
 
-Sequences of ≥ 4 commands use 4-gram context; shorter sequences use trigram scoring. Sequences with < 3 commands are not scored (score = 0, detected = false) but still contribute to learning.
+Sequences of ≥ 4 stages use 4-gram context; shorter sequences use trigram scoring. Sequences with < 3 stages are not scored (score = 0, detected = false) but still contribute to learning.
 
 ### Backoff Example
 
-For sequence `[ls, cd, pwd, gcc]` (4 commands → 4-gram scoring):
+For sequence `[ls, cd, pwd, gcc]` (4 stages → 4-gram scoring):
 
 - 4-gram `ls → cd → pwd → gcc`: if seen, use KN discounting
 - If unseen, back off to trigram `cd → pwd → gcc`
@@ -73,7 +89,7 @@ sg_gate_set_anomaly_adaptive(gate, true, 1000);  /* window of 1000 scores */
 sg_gate_set_anomaly_k_factor(gate, 3.0);         /* mean + 3*stddev */
 ```
 
-- The window records scores from non-anomalous commands only
+- The window records scores from non-anomalous stages only
 - Threshold is computed as `mean + k * stddev` once the window is full
 - Until the window fills, the fixed threshold (from `sg_gate_enable_anomaly`) is used
 - Larger window = more stable threshold; smaller window = more responsive
@@ -99,7 +115,7 @@ Weights must be non-negative and sum to approximately 1.0.
 ### Hyperparameters
 
 - **alpha** (0.1): Fallback smoothing parameter (used when KN data is sparse).
-- **unk_prior** (-10.0): Fallback log-probability for unseen commands in bits.
+- **unk_prior** (-10.0): Fallback log-probability for unseen stages in bits.
 - **kn_discount** (0.5): Kneser-Ney absolute discount parameter.
 
 ### Per-Model Scores
@@ -108,7 +124,7 @@ Weights must be non-negative and sum to approximately 1.0.
 
 ```c
 r.anomaly_score;       /* combined weighted score */
-r.anomaly_score_raw;   /* raw command name model score */
+r.anomaly_score_raw;   /* raw stage-name model score */
 r.anomaly_score_type;  /* type sequence model score */
 ```
 
@@ -117,8 +133,10 @@ r.anomaly_score_type;  /* type sequence model score */
 Applications that already hold Shellsplit-derived records can score them
 without rebuilding shell source. `sg_gate_score_anomaly_netseq()` accepts
 matching raw and type netsequences: the raw sequence has one executable-name
-record per command and the type sequence has one nested type-netargv record per
-command. It is read-only: it neither learns nor changes adaptive or Bayesian
+record per execution stage and the type sequence has one nested type-netargv
+record per stage. Redirect-only stages use the canonical empty executable
+sentinel (`0:,`) rather than inventing a command name. The API is read-only: it
+neither learns nor changes adaptive or Bayesian
 threshold state. Use `shell_build_command_netseq_buffer()` and
 `shell_build_type_netseq_buffer()` to construct the matching pair from source
 when payloads may contain NUL; their legacy C-string counterparts are suitable
@@ -126,7 +144,7 @@ only for NUL-free records.
 
 ## Type Sequence Caching
 
-An LRU cache avoids recomputing type sequences for repeated commands:
+An LRU cache avoids recomputing type sequences for repeated command sources:
 
 ```c
 sg_gate_set_anomaly_cache_size(gate, 256);  /* enable with 256 entries */
@@ -141,21 +159,21 @@ sg_gate_set_anomaly_cache_size(gate, 0);    /* disable */
 
 ## Update Behavior
 
-The model learns from command sequences subject to two flags:
+The model learns from execution-stage sequences subject to two flags:
 
 1. **`anomaly_update_only_on_allow`** (default: false)
    - When true: model only updates on ALLOW verdicts
    - When false: model updates on every eval call
 
 2. **`anomaly_skip_on_detected`** (default: true)
-   - When true: model skips learning from anomalous commands
-   - When false: model learns from all commands
+   - When true: model skips learning from anomalous stages
+   - When false: model learns from all stages
 
 Both models (raw and type) are always updated together.
 
 ### Short Sequences
 
-Sequences with < 3 commands are not scored for anomaly detection (score = 0, detected = false). However, they still contribute to unigram and bigram learning.
+Sequences with < 3 stages are not scored for anomaly detection (score = 0, detected = false). However, they still contribute to unigram and bigram learning.
 
 ## Memory Management
 
@@ -164,9 +182,12 @@ Sequences with < 3 commands are not scored for anomaly detection (score = 0, det
 - Save/load both models atomically with `sg_gate_save_anomaly_model()` /
   `sg_gate_load_anomaly_model()`.
 - Gate persistence uses the checksummed v2 bundle containing raw and type
-  models. Standalone models use v6. Version 5 and older files, plus the former
-  `_type` sidecar layout, are rejected because their NUL-delimited n-gram keys
-  cannot represent the current opaque byte-item semantics.
+  models. Standalone writers use v7. Legacy v6 models remain loadable when
+  every n-gram item is non-empty; a v6 file containing the v7 empty
+  redirect-only-stage sentinel is rejected atomically. Version 5 and older
+  files, plus the former `_type` sidecar layout, are rejected because their
+  NUL-delimited n-gram keys cannot represent the current opaque byte-item
+  semantics.
 
 ## Long-Running Model Maintenance
 
@@ -215,7 +236,7 @@ Prune before saving the model for disk efficiency.
 3. **Periodic model refresh**: Use `sg_anomaly_model_reset()` to clear old data and relearn
 4. **Monitor OOM**: Check `sg_gate_anomaly_had_error()` after heavy usage
 5. **Save checkpoints**: Periodically save model to disk for recovery
-6. **Enable type caching**: Use `sg_gate_set_anomaly_cache_size(gate, 256)` when evaluating repeated commands
+6. **Enable type caching**: Use `sg_gate_set_anomaly_cache_size(gate, 256)` when evaluating repeated command sources
 
 ## Example Usage
 
@@ -227,7 +248,7 @@ sg_gate_enable_anomaly(gate, 5.0, &anomaly_config);
 sg_gate_set_anomaly_adaptive(gate, true, 1000);
 sg_gate_set_anomaly_cache_size(gate, 256);
 
-// Train on normal commands
+// Train on normal stage sequences
 for (int i = 0; i < 100; i++) {
     char buf[8192];
     sg_result_t r;

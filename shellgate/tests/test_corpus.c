@@ -2,8 +2,8 @@
  * Fixture commands are data only: this test never executes them. */
 
 #include "shell_netstring.h"
+#include "shellclave_command_corpus_fixtures.h"
 #include "shellgate.h"
-#include "shellgate_corpus_fixtures.h"
 #include "shelltype.h"
 #include <float.h>
 #include <inttypes.h>
@@ -120,8 +120,7 @@ static sg_error_t evaluate(sg_gate_t *gate, const char *command,
 }
 
 static bool netargv_is_valid(const sg_subcommand_result_t *subcommand) {
-  if (!subcommand->netargv ||
-      strlen(subcommand->netargv) != subcommand->netargv_length)
+  if (!subcommand || !subcommand->netargv)
     return false;
   size_t records = 0;
   if (shell_netstring_validate(subcommand->netargv, subcommand->netargv_length,
@@ -129,16 +128,19 @@ static bool netargv_is_valid(const sg_subcommand_result_t *subcommand) {
       records == 0)
     return false;
   st_token_array_t tokens = {0};
-  st_error_t error = st_netargv_classify(subcommand->netargv, &tokens);
+  st_error_t error = st_netargv_classify_view(
+      (st_netargv_view_t){.data = subcommand->netargv,
+                          .length = subcommand->netargv_length},
+      &tokens);
   bool valid = error == ST_OK && tokens.count == records;
   st_token_array_free(&tokens);
   return valid;
 }
 
 static const char *find_fixture(const char *fragment) {
-  for (size_t i = 0; i < SHELLGATE_CORPUS_COMMAND_COUNT; i++)
-    if (strstr(shellgate_corpus_commands[i], fragment))
-      return shellgate_corpus_commands[i];
+  for (size_t i = 0; i < SHELLCLAVE_COMMAND_CORPUS_COUNT; i++)
+    if (strstr(shellclave_command_corpus_commands[i], fragment))
+      return shellclave_command_corpus_commands[i];
   return NULL;
 }
 
@@ -164,10 +166,10 @@ static uint64_t fingerprint_result(uint64_t hash, const sg_result_t *result) {
 }
 
 TEST(fixture_contract) {
-  CHECK(SHELLGATE_CORPUS_COMMAND_COUNT == corpus_baseline.commands);
-  for (size_t i = 0; i < SHELLGATE_CORPUS_COMMAND_COUNT; i++) {
+  CHECK(SHELLCLAVE_COMMAND_CORPUS_COUNT == corpus_baseline.commands);
+  for (size_t i = 0; i < SHELLCLAVE_COMMAND_CORPUS_COUNT; i++) {
     const unsigned char *cursor =
-        (const unsigned char *)shellgate_corpus_commands[i];
+        (const unsigned char *)shellclave_command_corpus_commands[i];
     CHECK(*cursor != '\0');
     for (; *cursor != '\0'; cursor++)
       CHECK(*cursor < 0x80u);
@@ -186,9 +188,10 @@ TEST(policy_and_canonical_results) {
   size_t dynamic_substitution_io = 0;
   uint64_t fingerprint = UINT64_C(1469598103934665603);
   bool saw_suggestion = false;
-  for (size_t i = 0; i < SHELLGATE_CORPUS_COMMAND_COUNT; i++) {
+  for (size_t i = 0; i < SHELLCLAVE_COMMAND_CORPUS_COUNT; i++) {
     sg_result_t result = {0};
-    CHECK(evaluate(gate, shellgate_corpus_commands[i], &result) == SG_OK);
+    CHECK(evaluate(gate, shellclave_command_corpus_commands[i], &result) ==
+          SG_OK);
     CHECK(!result.truncated);
     CHECK(!result.short_circuited);
     CHECK(result.subcommand_count > 0);
@@ -252,9 +255,9 @@ TEST(policy_and_canonical_results) {
 }
 
 static bool train_corpus_model(sg_gate_t *gate) {
-  for (size_t i = 0; i < SHELLGATE_CORPUS_COMMAND_COUNT; i++) {
+  for (size_t i = 0; i < SHELLCLAVE_COMMAND_CORPUS_COUNT; i++) {
     sg_result_t result = {0};
-    if (evaluate(gate, shellgate_corpus_commands[i], &result) != SG_OK)
+    if (evaluate(gate, shellclave_command_corpus_commands[i], &result) != SG_OK)
       return false;
   }
   return sg_gate_anomaly_vocab_size(gate) > 0;

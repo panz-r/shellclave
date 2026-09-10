@@ -14,6 +14,7 @@
 
 static bool is_shell_operator_token(const shell_token_t *token) {
   return token->type == SHELL_TOKEN_PIPE ||
+         token->type == SHELL_TOKEN_PIPE_BOTH ||
          token->type == SHELL_TOKEN_PIPE_NEGATE ||
          token->type == SHELL_TOKEN_REDIRECT_IN ||
          token->type == SHELL_TOKEN_REDIRECT_OUT ||
@@ -48,6 +49,19 @@ static bool is_redirection_token(const shell_token_t *token) {
          token->type == SHELL_TOKEN_HERESTRING;
 }
 
+shell_process_status_t
+shell_process_cstring_allocation_size(size_t content_length,
+                                      size_t *allocation_size) {
+  if (allocation_size)
+    *allocation_size = 0;
+  if (!allocation_size)
+    return SHELL_PROCESS_EINPUT;
+  if (content_length == SIZE_MAX)
+    return SHELL_PROCESS_EOVERFLOW;
+  *allocation_size = content_length + 1;
+  return SHELL_PROCESS_OK;
+}
+
 static bool redirection_consumes_next_token(const shell_token_t *token) {
   /* `>|` has no trailing '<' or '>' byte, but it still requires a pathname.
    * Keep this semantic exception explicit rather than treating the final
@@ -61,45 +75,6 @@ static bool redirection_consumes_next_token(const shell_token_t *token) {
     return false;
   char last = token->start[token->length - 1];
   return last == '<' || last == '>';
-}
-
-/* Lexical token classes deliberately retain standalone substitution forms,
- * but a complete shell word may join one to literal prefix/suffix bytes. Scan
- * the borrowed word when deciding whether downstream handling is required so
- * `prefix$(cmd)suffix` cannot lose its execution marker. Process
- * substitutions are literal inside double quotes; command substitutions and
- * backticks remain active there. */
-static bool word_has_executable_substitution(const shell_token_t *token) {
-  if (!token)
-    return false;
-  bool in_single_quote = false;
-  bool in_double_quote = false;
-  for (size_t i = 0; i < token->length; i++) {
-    char c = token->start[i];
-    if (c == '\\' && !in_single_quote && i + 1 < token->length) {
-      i++;
-      continue;
-    }
-    if (c == '\'' && !in_double_quote) {
-      in_single_quote = !in_single_quote;
-      continue;
-    }
-    if (c == '"' && !in_single_quote) {
-      in_double_quote = !in_double_quote;
-      continue;
-    }
-    if (in_single_quote)
-      continue;
-    if (c == '`')
-      return true;
-    if (c == '$' && i + 1 < token->length && token->start[i + 1] == '(' &&
-        !(i + 2 < token->length && token->start[i + 2] == '('))
-      return true;
-    if (!in_double_quote && (c == '<' || c == '>') && i + 1 < token->length &&
-        token->start[i + 1] == '(')
-      return true;
-  }
-  return false;
 }
 
 static bool
@@ -230,77 +205,442 @@ overflow:
   return SHELL_PROCESS_EOVERFLOW;
 }
 
-size_t shell_processed_command_word_count(const shell_command_t *command) {
-  if (!command)
-    return 0;
-  size_t count = 0;
-  bool consume_redirection_operand = false;
-  size_t redirection_operand_end = 0;
-  for (size_t i = 0; i < command->token_count; i++) {
-    const shell_token_t *token = &command->tokens[i];
+void shell_processed_word_iterator_init(
+    shell_processed_word_iterator_t *iterator, const shell_command_t *command) {
+  if (!iterator)
+    return;
+  *iterator = (shell_processed_word_iterator_t){.command = command};
+}
+
+bool shell_processed_word_iterator_next(
+    shell_processed_word_iterator_t *iterator, shell_token_t *word) {
+  if (!iterator || !word || !iterator->command)
+    return false;
+  const shell_command_t *command = iterator->command;
+  while (iterator->token_index < command->token_count) {
+    const shell_token_t *token = &command->tokens[iterator->token_index++];
     if (is_shell_operator_token(token)) {
-      consume_redirection_operand =
+      iterator->consume_redirection_operand =
           is_redirection_token(token) && redirection_consumes_next_token(token);
-      redirection_operand_end = 0;
-    } else if (consume_redirection_operand) {
-      if (redirection_operand_end == 0 ||
-          token->position == redirection_operand_end) {
-        redirection_operand_end = token->position + token->length;
+      iterator->redirection_operand_end = 0;
+      continue;
+    }
+    if (iterator->consume_redirection_operand) {
+      if (iterator->redirection_operand_end == 0 ||
+          shell_tokenizer_token_continues_word(
+              token, iterator->redirection_operand_end)) {
+        if (token->position > SIZE_MAX - token->length) {
+          /* The iterator cannot report malformed internal token spans. Treat
+           * this operand as complete without wrapping its logical endpoint. */
+          iterator->redirection_operand_end = SIZE_MAX;
+          continue;
+        }
+        iterator->redirection_operand_end = token->position + token->length;
         continue;
       }
-      consume_redirection_operand = false;
-      count++;
-    } else {
-      count++;
+      iterator->consume_redirection_operand = false;
     }
+
+    shell_token_t merged = *token;
+    while (iterator->token_index < command->token_count) {
+      const shell_token_t *next = &command->tokens[iterator->token_index];
+      if (is_shell_operator_token(next) ||
+          merged.position > SIZE_MAX - merged.length ||
+          next->position > SIZE_MAX - next->length ||
+          !shell_tokenizer_token_continues_word(next, merged.position +
+                                                          merged.length))
+        break;
+      merged.length = next->position + next->length - merged.position;
+      merged.is_quoted = merged.is_quoted || next->is_quoted;
+      merged.is_escaped = merged.is_escaped || next->is_escaped;
+      iterator->token_index++;
+    }
+    *word = merged;
+    return true;
   }
+  return false;
+}
+
+size_t shell_processed_command_word_count(const shell_command_t *command) {
+  shell_processed_word_iterator_t iterator;
+  shell_processed_word_iterator_init(&iterator, command);
+  shell_token_t word;
+  size_t count = 0;
+  while (shell_processed_word_iterator_next(&iterator, &word))
+    count++;
   return count;
 }
 
-const shell_token_t *
-shell_processed_command_word_at(const shell_command_t *command,
-                                size_t word_index) {
-  if (!command)
-    return NULL;
-  size_t found = 0;
-  bool consume_redirection_operand = false;
-  size_t redirection_operand_end = 0;
-  for (size_t i = 0; i < command->token_count; i++) {
-    const shell_token_t *token = &command->tokens[i];
-    if (is_shell_operator_token(token)) {
-      consume_redirection_operand =
-          is_redirection_token(token) && redirection_consumes_next_token(token);
-      redirection_operand_end = 0;
-    } else if (consume_redirection_operand) {
-      if (redirection_operand_end == 0 ||
-          token->position == redirection_operand_end) {
-        redirection_operand_end = token->position + token->length;
-        continue;
-      }
-      consume_redirection_operand = false;
-      if (found++ == word_index)
-        return token;
-    } else if (found++ == word_index) {
-      return token;
-    }
-  }
-  return NULL;
-}
-
 bool shell_processed_command_is_group_structure(const shell_command_t *commands,
-                                                size_t count, size_t index) {
+                                                size_t count, size_t index,
+                                                const char *source,
+                                                size_t source_length) {
   if (!commands || index >= count)
     return false;
 
   /* The full tokenizer may reserve an empty trailing slot at a compound-group
    * boundary. It has no source tokens and is structural, unlike a written
-   * redirect-only command, which remains an invalid executable record. */
+   * redirect-only command, which remains an argv-less execution stage for
+   * anomaly-sequence builders. */
   if (commands[index].token_count == 0)
     return true;
+
+  if (!source || index == 0)
+    return false;
+  const shell_command_t *previous_record = &commands[index - 1];
+  if (previous_record->token_count != 0) {
+    const shell_token_t *last_token =
+        &previous_record->tokens[previous_record->token_count - 1];
+    if (last_token->position > source_length ||
+        last_token->length > source_length - last_token->position)
+      return false;
+    size_t start = last_token->position + last_token->length;
+    size_t end = commands[index].tokens[0].position;
+    if (start > source_length || end > source_length)
+      return false;
+    if (end > start &&
+        shell_source_skip_inline_continuations(source, end, start) != end)
+      return false;
+  }
+
+  /* A separator terminates the preceding group's redirect list. Its next
+   * argv-less command is executable structure, not an attached operand. */
+  if (index > 0 && commands[index - 1].token_count != 0) {
+    const shell_command_t *previous = &commands[index - 1];
+    shell_token_type_t last = previous->tokens[previous->token_count - 1].type;
+    if (last == SHELL_TOKEN_SEMICOLON || last == SHELL_TOKEN_PIPE ||
+        last == SHELL_TOKEN_PIPE_BOTH || last == SHELL_TOKEN_AND ||
+        last == SHELL_TOKEN_OR || last == SHELL_TOKEN_BACKGROUND)
+      return false;
+  }
 
   return index > 0 &&
          shell_processed_command_word_count(&commands[index]) == 0 &&
          command_ends_with_group_redirection(&commands[index - 1]);
+}
+
+/* --- EXECUTION-STAGE COLLECTION ---------------------------------------- */
+
+/* Anomaly sequences model every supported simple command that the shell will
+ * execute while evaluating one source command.  The flat tokenizer exposes
+ * only the immediate list, so recursively walk executable substitutions and
+ * append the enclosing command last.  That produces a stable analysis order
+ * (children before parent, siblings in source order) without claiming a
+ * runtime schedule for pipeline members. */
+typedef struct {
+  shell_anomaly_stages_t *stages;
+  const shell_process_limits_t *limits;
+  uint32_t depth;
+  shell_process_status_t status;
+} shell_anomaly_stage_collect_t;
+
+static shell_process_status_t
+anomaly_collect_source(const char *source, size_t source_length,
+                       shell_anomaly_stage_collect_t *collect);
+
+void shell_anomaly_stages_free(shell_anomaly_stages_t *stages) {
+  if (!stages)
+    return;
+  shell_commands_free(stages->commands, stages->count);
+  *stages = (shell_anomaly_stages_t){0};
+}
+
+static bool anomaly_append_stage(shell_anomaly_stage_collect_t *collect,
+                                 shell_command_t *command) {
+  if (!collect || !collect->stages || !command)
+    return false;
+  if (collect->stages->count >= SHELL_MAX_SUBCOMMANDS) {
+    collect->status = SHELL_PROCESS_EOUTPUT_LIMIT;
+    return false;
+  }
+  if (collect->stages->count == SIZE_MAX / sizeof(*collect->stages->commands)) {
+    collect->status = SHELL_PROCESS_EOVERFLOW;
+    return false;
+  }
+  shell_command_t *grown = realloc(
+      collect->stages->commands, (collect->stages->count + 1) * sizeof(*grown));
+  if (!grown) {
+    collect->status = SHELL_PROCESS_ENOMEM;
+    return false;
+  }
+  collect->stages->commands = grown;
+  grown[collect->stages->count++] = *command;
+  *command = (shell_command_t){0};
+  return true;
+}
+
+static bool anomaly_substitution_content(const char *source,
+                                         size_t source_length, size_t start,
+                                         size_t after,
+                                         shell_source_substitution_kind_t kind,
+                                         const char **content,
+                                         size_t *content_length) {
+  if (!source || !content || !content_length || start >= after ||
+      after > source_length)
+    return false;
+  size_t prefix = kind == SHELL_SOURCE_SUBST_BACKTICK ? 1 : 2;
+  size_t suffix = kind == SHELL_SOURCE_SUBST_BACKTICK ? 1 : 1;
+  if (after - start < prefix + suffix)
+    return false;
+  *content = source + start + prefix;
+  *content_length = after - start - prefix - suffix;
+  return true;
+}
+
+static bool
+anomaly_collect_substitutions(const char *source, size_t source_length,
+                              bool allow_process_substitution,
+                              shell_anomaly_stage_collect_t *collect) {
+  if (!source || !collect)
+    return false;
+  shell_source_substitution_scan_t scan = {0};
+  size_t start = 0;
+  size_t after = 0;
+  shell_source_substitution_kind_t kind;
+  while (shell_source_next_executable_substitution(source, source_length, &scan,
+                                                   &start, &after, &kind)) {
+    if (!allow_process_substitution &&
+        (kind == SHELL_SOURCE_SUBST_PROCESS_INPUT ||
+         kind == SHELL_SOURCE_SUBST_PROCESS_OUTPUT))
+      continue;
+    const char *content = NULL;
+    size_t content_length = 0;
+    if (!anomaly_substitution_content(source, source_length, start, after, kind,
+                                      &content, &content_length)) {
+      collect->status = SHELL_PROCESS_EPARSE;
+      return false;
+    }
+    if (collect->depth >= SHELL_MAX_SUBCOMMANDS) {
+      collect->status = SHELL_PROCESS_EOUTPUT_LIMIT;
+      return false;
+    }
+    collect->depth++;
+    shell_process_status_t status =
+        anomaly_collect_source(content, content_length, collect);
+    collect->depth--;
+    if (status != SHELL_PROCESS_OK) {
+      collect->status = status;
+      return false;
+    }
+  }
+  return true;
+}
+
+/* Unlike an ordinary shell word, quote bytes in an unquoted heredoc body are
+ * data. Only its expansion grammar can execute nested source. */
+static bool
+anomaly_collect_heredoc_substitutions(const char *source, size_t source_length,
+                                      shell_anomaly_stage_collect_t *collect) {
+  if (!source || !collect)
+    return false;
+  for (size_t position = 0; position < source_length; position++) {
+    char c = source[position];
+    if (c == '\\' && position + 1 < source_length) {
+      char next = source[position + 1];
+      if (next == '$' || next == '`' || next == '\\' || next == '\n' ||
+          next == '\r') {
+        position++;
+        continue;
+      }
+    }
+    size_t after = 0;
+    const char *content = NULL;
+    size_t content_length = 0;
+    if (c == '`') {
+      after =
+          shell_source_skip_quoted_text(source, source_length, position, '`');
+      if (after <= position + 1 || after > source_length ||
+          source[after - 1] != '`') {
+        collect->status = SHELL_PROCESS_EPARSE;
+        return false;
+      }
+      content = source + position + 1;
+      content_length = after - position - 2;
+    } else if (c == '$' && position + 1 < source_length &&
+               source[position + 1] == '{') {
+      if (!shell_source_skip_parameter_expansion(source, source_length,
+                                                 position, &after) ||
+          after <= position + 3 || after > source_length ||
+          source[after - 1] != '}') {
+        collect->status = SHELL_PROCESS_EPARSE;
+        return false;
+      }
+      if (!anomaly_collect_heredoc_substitutions(source + position + 2,
+                                                 after - position - 3, collect))
+        return false;
+      position = after - 1;
+      continue;
+    } else if (c == '$' && position + 1 < source_length &&
+               source[position + 1] == '(') {
+      if (position + 2 < source_length && source[position + 2] == '(') {
+        if (!shell_source_skip_arithmetic_expansion(source, source_length,
+                                                    position, &after) ||
+            after <= position + 5 || after > source_length) {
+          collect->status = SHELL_PROCESS_EPARSE;
+          return false;
+        }
+        if (!anomaly_collect_substitutions(
+                source + position + 3, after - position - 5, false, collect))
+          return false;
+        position = after - 1;
+        continue;
+      }
+      if (!shell_source_find_balanced_parentheses(source, source_length,
+                                                  position + 1, &after) ||
+          !anomaly_substitution_content(source, source_length, position, after,
+                                        SHELL_SOURCE_SUBST_COMMAND, &content,
+                                        &content_length)) {
+        collect->status = SHELL_PROCESS_EPARSE;
+        return false;
+      }
+    } else {
+      continue;
+    }
+    if (collect->depth >= SHELL_MAX_SUBCOMMANDS) {
+      collect->status = SHELL_PROCESS_EOUTPUT_LIMIT;
+      return false;
+    }
+    collect->depth++;
+    shell_process_status_t status =
+        anomaly_collect_source(content, content_length, collect);
+    collect->depth--;
+    if (status != SHELL_PROCESS_OK) {
+      collect->status = status;
+      return false;
+    }
+    position = after - 1;
+  }
+  return true;
+}
+
+static bool anomaly_collect_heredoc_body(const char *input, size_t body_start,
+                                         size_t body_length,
+                                         bool delimiter_quoted, void *context) {
+  shell_anomaly_stage_collect_t *collect = context;
+  if (!collect || !input)
+    return false;
+  if (delimiter_quoted)
+    return true;
+  return anomaly_collect_heredoc_substitutions(input + body_start, body_length,
+                                               collect);
+}
+
+static bool anomaly_heredoc_operator_position(const shell_token_t *token,
+                                              size_t *operator_position) {
+  if (!token || !operator_position || token->type != SHELL_TOKEN_HEREDOC)
+    return false;
+  for (size_t i = 0; i + 1 < token->length; i++) {
+    if (token->start[i] == '<' && token->start[i + 1] == '<') {
+      *operator_position = token->position + i;
+      return true;
+    }
+  }
+  return false;
+}
+
+static bool
+anomaly_collect_command_substitutions(const char *source, size_t source_length,
+                                      const shell_command_t *command,
+                                      shell_anomaly_stage_collect_t *collect) {
+  if (!source || !command || !collect)
+    return false;
+  size_t heredoc_after = 0;
+  for (size_t i = 0; i < command->token_count; i++) {
+    const shell_token_t *token = &command->tokens[i];
+    if (token->position > source_length ||
+        token->length > source_length - token->position) {
+      collect->status = SHELL_PROCESS_EPARSE;
+      return false;
+    }
+    if (token->type == SHELL_TOKEN_HEREDOC) {
+      if (token->position < heredoc_after)
+        continue;
+      size_t operator_position = 0;
+      size_t after = 0;
+      bool complete = false;
+      if (!anomaly_heredoc_operator_position(token, &operator_position) ||
+          !shell_source_visit_heredoc_sequence(
+              source, source_length, operator_position,
+              anomaly_collect_heredoc_body, collect, &after, &complete) ||
+          !complete) {
+        collect->status = SHELL_PROCESS_EPARSE;
+        return false;
+      }
+      heredoc_after = after;
+      continue;
+    }
+    if (token->type == SHELL_TOKEN_ARITHMETIC && token->length >= 5 &&
+        token->start[0] == '$' && token->start[1] == '(' &&
+        token->start[2] == '(' && token->start[token->length - 2] == ')' &&
+        token->start[token->length - 1] == ')') {
+      if (!anomaly_collect_substitutions(token->start + 3, token->length - 5,
+                                         false, collect))
+        return false;
+      continue;
+    }
+    if (!anomaly_collect_substitutions(token->start, token->length, true,
+                                       collect))
+      return false;
+  }
+  return true;
+}
+
+static shell_process_status_t
+anomaly_collect_source(const char *source, size_t source_length,
+                       shell_anomaly_stage_collect_t *collect) {
+  if (!source || !collect || !collect->stages)
+    return SHELL_PROCESS_EINPUT;
+  shell_command_t *commands = NULL;
+  size_t count = 0;
+  shell_process_status_t status = shell_processed_commands_parse(
+      source, source_length, collect->limits, &commands, &count);
+  if (status != SHELL_PROCESS_OK)
+    return status;
+  for (size_t i = 0; i < count; i++) {
+    if (!anomaly_collect_command_substitutions(source, source_length,
+                                               &commands[i], collect)) {
+      status = collect->status == SHELL_PROCESS_OK ? SHELL_PROCESS_EPARSE
+                                                   : collect->status;
+      goto done;
+    }
+    if (shell_processed_command_is_group_structure(commands, count, i, source,
+                                                   source_length))
+      continue;
+    if (!anomaly_append_stage(collect, &commands[i])) {
+      status = collect->status == SHELL_PROCESS_OK ? SHELL_PROCESS_EPARSE
+                                                   : collect->status;
+      goto done;
+    }
+  }
+  status = SHELL_PROCESS_OK;
+
+done:
+  shell_commands_free(commands, count);
+  return status;
+}
+
+shell_process_status_t
+shell_anomaly_stages_parse(const char *command_line, size_t command_length,
+                           const shell_process_limits_t *limits,
+                           shell_anomaly_stages_t *stages) {
+  if (!stages)
+    return SHELL_PROCESS_EINPUT;
+  *stages = (shell_anomaly_stages_t){0};
+  shell_process_status_t status = shell_process_validate_supported_source(
+      command_line, command_length, NULL);
+  if (status != SHELL_PROCESS_OK)
+    return status;
+  shell_anomaly_stage_collect_t collect = {
+      .stages = stages,
+      .limits = limits,
+      .status = SHELL_PROCESS_OK,
+  };
+  status = anomaly_collect_source(command_line, command_length, &collect);
+  if (status != SHELL_PROCESS_OK) {
+    shell_anomaly_stages_free(stages);
+    return status;
+  }
+  return SHELL_PROCESS_OK;
 }
 
 bool shell_processed_command_has_dangerous_features(
@@ -313,10 +653,11 @@ bool shell_processed_command_has_dangerous_features(
     if (is_shell_operator_token(&command->tokens[i]))
       return true;
   }
-  size_t word_count = shell_processed_command_word_count(command);
-  for (size_t i = 0; i < word_count; i++) {
-    if (word_has_executable_substitution(
-            shell_processed_command_word_at(command, i)))
+  shell_processed_word_iterator_t iterator;
+  shell_processed_word_iterator_init(&iterator, command);
+  shell_token_t word;
+  while (shell_processed_word_iterator_next(&iterator, &word)) {
+    if (shell_source_word_has_executable_substitution(word.start, word.length))
       return true;
   }
   return false;
@@ -326,7 +667,8 @@ bool shell_processed_command_has_pipe_output(const shell_command_t *command) {
   if (!command)
     return false;
   for (size_t i = 0; i < command->token_count; i++) {
-    if (command->tokens[i].type == SHELL_TOKEN_PIPE)
+    if (command->tokens[i].type == SHELL_TOKEN_PIPE ||
+        command->tokens[i].type == SHELL_TOKEN_PIPE_BOTH)
       return true;
   }
   return false;
@@ -407,8 +749,8 @@ static shell_process_status_t decode_shell_word(const char *text, size_t length,
     if (c == '\\' && quote != '\'' && i + 1 < length) {
       char next = text[i + 1];
       if (quote == 0 || next == '$' || next == '`' || next == '"' ||
-          next == '\\' || next == '\n') {
-        if (next != '\n') {
+          next == '\\' || next == '\n' || next == '\r') {
+        if (next != '\n' && next != '\r') {
           shell_process_status_t status = decoded_word_emit(sink, next);
           if (status != SHELL_PROCESS_OK)
             return status;
@@ -416,6 +758,8 @@ static shell_process_status_t decode_shell_word(const char *text, size_t length,
             return SHELL_PROCESS_OK;
         }
         i++;
+        if (next == '\r' && i + 1 < length && text[i + 1] == '\n')
+          i++;
         continue;
       }
     }
@@ -548,8 +892,8 @@ render_processed_word(const char *text, size_t length, char *destination,
     if (c == '\\' && quote != '\'' && i + 1 < length) {
       char next = text[i + 1];
       if (quote == '\0' || next == '$' || next == '`' || next == '"' ||
-          next == '\\' || next == '\n') {
-        if (next != '\n') {
+          next == '\\' || next == '\n' || next == '\r') {
+        if (next != '\n' && next != '\r') {
           if (out == SIZE_MAX)
             return SHELL_PROCESS_EOVERFLOW;
           if (destination) {
@@ -560,6 +904,8 @@ render_processed_word(const char *text, size_t length, char *destination,
           out++;
         }
         i += 2;
+        if (next == '\r' && i < length && text[i] == '\n')
+          i++;
         continue;
       }
     }
@@ -688,8 +1034,8 @@ static bool process_single_command_internal(shell_command_t *basic_cmd,
   size_t redirection_operand_end = 0;
   bool have_command_word = false;
   size_t command_word_end = 0;
-  bool has_pipe_output = false;
-  bool pipeline_negated = basic_cmd->pipeline_negated;
+  shell_pipe_mode_t pipe_output_mode = SHELL_PIPE_MODE_NONE;
+  uint32_t pipeline_negation_count = basic_cmd->pipeline_negation_count;
   bool has_redirections = false;
   bool has_error_redirection = false;
 
@@ -704,10 +1050,12 @@ static bool process_single_command_internal(shell_command_t *basic_cmd,
 
       switch (token->type) {
       case SHELL_TOKEN_PIPE:
-        has_pipe_output = true;
+        pipe_output_mode = SHELL_PIPE_MODE_STDOUT;
+        break;
+      case SHELL_TOKEN_PIPE_BOTH:
+        pipe_output_mode = SHELL_PIPE_MODE_STDOUT_AND_STDERR;
         break;
       case SHELL_TOKEN_PIPE_NEGATE:
-        pipeline_negated = true;
         break;
       case SHELL_TOKEN_REDIRECT_IN:
       case SHELL_TOKEN_REDIRECT_OUT:
@@ -731,18 +1079,20 @@ static bool process_single_command_internal(shell_command_t *basic_cmd,
           is_redirection_token(token) && redirection_consumes_next_token(token);
       redirection_operand_end = 0;
     } else if (consume_redirection_operand) {
-      if (redirection_operand_end == 0 ||
-          token->position == redirection_operand_end) {
+      if (redirection_operand_end == 0 || shell_tokenizer_token_continues_word(
+                                              token, redirection_operand_end)) {
         redirection_operand_end = token->position + token->length;
         continue;
       }
       consume_redirection_operand = false;
-      if (!have_command_word || token->position != command_word_end)
+      if (!have_command_word ||
+          !shell_tokenizer_token_continues_word(token, command_word_end))
         command_count++;
       have_command_word = true;
       command_word_end = token->position + token->length;
     } else {
-      if (!have_command_word || token->position != command_word_end)
+      if (!have_command_word ||
+          !shell_tokenizer_token_continues_word(token, command_word_end))
         command_count++;
       have_command_word = true;
       command_word_end = token->position + token->length;
@@ -784,8 +1134,8 @@ static bool process_single_command_internal(shell_command_t *basic_cmd,
           is_redirection_token(token) && redirection_consumes_next_token(token);
       redirection_operand_end = 0;
     } else if (consume_redirection_operand) {
-      if (redirection_operand_end == 0 ||
-          token->position == redirection_operand_end) {
+      if (redirection_operand_end == 0 || shell_tokenizer_token_continues_word(
+                                              token, redirection_operand_end)) {
         redirection_operand_end = token->position + token->length;
         continue;
       }
@@ -793,8 +1143,9 @@ static bool process_single_command_internal(shell_command_t *basic_cmd,
       if (command_index > 0) {
         shell_token_t *previous = &command_tokens[command_index - 1];
         size_t previous_end = previous->position + previous->length;
-        if (previous_end == token->position) {
-          previous->length += token->length;
+        if (shell_tokenizer_token_continues_word(token, previous_end)) {
+          previous->length =
+              token->position + token->length - previous->position;
           previous->is_quoted = previous->is_quoted || token->is_quoted;
           previous->is_escaped = previous->is_escaped || token->is_escaped;
           continue;
@@ -805,8 +1156,9 @@ static bool process_single_command_internal(shell_command_t *basic_cmd,
       if (command_index > 0) {
         shell_token_t *previous = &command_tokens[command_index - 1];
         size_t previous_end = previous->position + previous->length;
-        if (previous_end == token->position) {
-          previous->length += token->length;
+        if (shell_tokenizer_token_continues_word(token, previous_end)) {
+          previous->length =
+              token->position + token->length - previous->position;
           previous->is_quoted = previous->is_quoted || token->is_quoted;
           previous->is_escaped = previous->is_escaped || token->is_escaped;
           continue;
@@ -820,8 +1172,10 @@ static bool process_single_command_internal(shell_command_t *basic_cmd,
   info->shell_token_count = shell_count;
   info->command_tokens = command_tokens;
   info->command_token_count = command_count;
-  info->has_pipe_output = has_pipe_output;
-  info->pipeline_negated = pipeline_negated;
+  info->pipe_output_mode = pipe_output_mode;
+  info->has_pipe_output = pipe_output_mode != SHELL_PIPE_MODE_NONE;
+  info->pipeline_negation_count = pipeline_negation_count;
+  info->pipeline_negated = (pipeline_negation_count & UINT32_C(1)) != 0;
   info->has_redirections = has_redirections;
   info->has_error_redirection = has_error_redirection;
   return true;
@@ -895,8 +1249,8 @@ shell_process_command(const char *command_line, size_t command_length,
   for (size_t i = 0; i < basic_count; i++) {
     /* The operand of a redirect attached to a completed group is parser
      * structure, not an independently executable command. */
-    if (shell_processed_command_is_group_structure(basic_commands, basic_count,
-                                                   i))
+    if (shell_processed_command_is_group_structure(
+            basic_commands, basic_count, i, command_line, command_length))
       continue;
     if (!process_single_command(&basic_commands[i], command_line,
                                 &infos[info_count])) {
@@ -906,12 +1260,12 @@ shell_process_command(const char *command_line, size_t command_length,
     }
     if (info_count > 0 && infos[info_count - 1].has_pipe_output) {
       infos[info_count].has_pipe_input = true;
-      /* `!` modifies the complete pipeline. The full lexer observes it at
-       * the first stage, while this flat result exposes one record per stage,
-       * so propagate the modifier along adjacent pipe links. */
+      /* `!` modifies the complete pipeline. Propagate the exact count, not
+       * merely a boolean, so an even number does not look inverted. */
+      infos[info_count].pipeline_negation_count =
+          infos[info_count - 1].pipeline_negation_count;
       infos[info_count].pipeline_negated =
-          infos[info_count].pipeline_negated ||
-          infos[info_count - 1].pipeline_negated;
+          (infos[info_count].pipeline_negation_count & UINT32_C(1)) != 0;
     }
     info_count++;
   }
@@ -1002,18 +1356,15 @@ static bool range_is_executable(const char *input, uint32_t length,
   bool redirect_only = position < range->start + range->len &&
                        (input[position] == '<' || input[position] == '>');
   if (redirect_only) {
+    uint32_t group_redirect_start =
+        (uint32_t)shell_source_named_fd_start_before(input, length,
+                                                     range->start);
     for (uint32_t i = 0; i < parsed->group_count; i++) {
       const shell_group_t *group = &parsed->groups[i];
-      if (group->end > range->start)
+      if (group->end > group_redirect_start)
         continue;
-      bool adjacent = true;
-      for (uint32_t p = group->end; p < range->start; p++) {
-        if (!isspace((unsigned char)input[p])) {
-          adjacent = false;
-          break;
-        }
-      }
-      if (adjacent)
+      if (shell_source_skip_inline_continuations(
+              input, group_redirect_start, group->end) == group_redirect_start)
         return false;
     }
   }
@@ -1042,14 +1393,6 @@ static bool command_is_group_boundary(const shell_parse_result_t *parsed,
   return false;
 }
 
-static uint32_t skip_inline_space(const char *input, uint32_t position,
-                                  uint32_t length) {
-  while (position < length &&
-         (input[position] == ' ' || input[position] == '\t'))
-    position++;
-  return position;
-}
-
 static shell_process_status_t
 append_group_io_op(shell_processed_commands_t *result,
                    const shell_group_io_op_t *op, size_t max_group_io_ops) {
@@ -1070,33 +1413,20 @@ append_group_io_op(shell_processed_commands_t *result,
 static bool parse_group_fd(const char *input, uint32_t start, uint32_t end,
                            uint32_t *fd, uint32_t *after) {
   size_t position = 0;
+  if (shell_source_parse_named_fd_redirect(input, start, end, &position)) {
+    *fd = SHELL_PROCESS_FD_NAMED;
+    *after = (uint32_t)position;
+    return true;
+  }
   uint32_t descriptor = 0;
   shell_source_io_number_t io_number =
       shell_source_parse_io_number(input, start, end, &position, &descriptor);
   if (io_number == SHELL_SOURCE_IO_NUMBER_OVERFLOW)
     return false;
-  *fd = io_number == SHELL_SOURCE_IO_NUMBER_VALID ? descriptor : UINT32_MAX;
+  *fd = io_number == SHELL_SOURCE_IO_NUMBER_VALID ? descriptor
+                                                  : SHELL_PROCESS_FD_NONE;
   *after = (uint32_t)position;
   return true;
-}
-
-static bool range_has_validated_token(const shell_parse_result_t *parsed,
-                                      uint32_t range_index,
-                                      const shell_command_t *commands,
-                                      size_t command_count) {
-  const shell_range_t *range = &parsed->cmds[range_index];
-  uint64_t range_start = range->start;
-  uint64_t range_end = range_start + range->len;
-  for (size_t i = 0; i < command_count; i++) {
-    for (size_t j = 0; j < commands[i].token_count; j++) {
-      const shell_token_t *token = &commands[i].tokens[j];
-      uint64_t token_start = token->position;
-      uint64_t token_end = token_start + token->length;
-      if (range_start < token_end && token_start < range_end)
-        return true;
-    }
-  }
-  return false;
 }
 
 /* Scan a redirect list without accepting executable words. Adjacent
@@ -1106,13 +1436,34 @@ static shell_process_status_t
 scan_group_redirects(const char *input, uint32_t start, uint32_t end,
                      uint16_t group_index, shell_processed_commands_t *result,
                      size_t max_group_io_ops, bool *found) {
-  uint32_t position = skip_inline_space(input, start, end);
+  uint32_t position =
+      (uint32_t)shell_source_skip_inline_continuations(input, end, start);
   *found = false;
   while (position < end) {
     uint32_t source_start = position;
-    uint32_t fd = UINT32_MAX;
+    size_t redirect_end = shell_source_skip_redirect(input, source_start, end);
+    if (redirect_end == source_start)
+      return *found ? SHELL_PROCESS_OK : SHELL_PROCESS_EPARSE;
+    /* Once the shared scanner has recognized a redirect, a later semantic
+     * rejection must not be mistaken by scan_group_io() for ordinary text
+     * following the group. */
+    *found = true;
+
+    uint32_t fd = SHELL_PROCESS_FD_NONE;
     if (!parse_group_fd(input, position, end, &fd, &position))
       return SHELL_PROCESS_EPARSE;
+    bool combined = position + 1 < end && input[position] == '&' &&
+                    input[position + 1] == '>';
+    if (combined) {
+      /* Bash supplies no descriptor-prefixed form of `&>` or `&>>`: a
+       * preceding numeric or named token is an ordinary shell word.  The
+       * shared scanner rejects such a group tail before this point; retain
+       * this check so a future scanner change cannot emit a false fd-2 route.
+       */
+      if (fd != SHELL_PROCESS_FD_NONE)
+        return SHELL_PROCESS_EPARSE;
+      position++;
+    }
     if (position >= end || (input[position] != '<' && input[position] != '>'))
       return *found ? SHELL_PROCESS_OK : SHELL_PROCESS_EPARSE;
     char direction = input[position++];
@@ -1135,20 +1486,12 @@ scan_group_redirects(const char *input, uint32_t start, uint32_t end,
       position++;
     if (heredoc && !herestring && position < end && input[position] == '-')
       position++;
-    uint32_t operand_start = skip_inline_space(input, position, end);
-    uint32_t operand_end = operand_start;
-    if (!heredoc && operand_start < end && input[operand_start] == '&') {
-      operand_end++;
-      if (operand_end < end && input[operand_end] == '-')
-        operand_end++;
-      else
-        while (operand_end < end && isdigit((unsigned char)input[operand_end]))
-          operand_end++;
-    } else {
-      operand_end =
-          (uint32_t)shell_source_skip_redirect_word(input, operand_start, end);
-    }
-    if (operand_start == operand_end)
+    uint32_t operand_start =
+        (uint32_t)shell_source_skip_inline_continuations(input, end, position);
+    uint32_t operand_end = (uint32_t)redirect_end;
+    if (operand_start >= operand_end || operand_end > end)
+      return SHELL_PROCESS_EPARSE;
+    if (!heredoc && fd == SHELL_PROCESS_FD_NAMED && input[operand_start] == '&')
       return SHELL_PROCESS_EPARSE;
 
     shell_group_io_op_t op = {
@@ -1157,8 +1500,8 @@ scan_group_redirects(const char *input, uint32_t start, uint32_t end,
         .source_end = operand_end,
         .operand_start = operand_start,
         .operand_end = operand_end,
-        .fd = fd == UINT32_MAX ? (direction == '<' ? 0 : 1) : fd,
-        .target_fd = UINT32_MAX,
+        .fd = fd == SHELL_PROCESS_FD_NONE ? (direction == '<' ? 0 : 1) : fd,
+        .target_fd = SHELL_PROCESS_FD_NONE,
         .kind = read_write
                     ? SHELL_GROUP_IO_READ_WRITE_FILE
                     : (direction == '<' ? SHELL_GROUP_IO_READ_FILE
@@ -1167,9 +1510,10 @@ scan_group_redirects(const char *input, uint32_t start, uint32_t end,
     };
     if (heredoc)
       op.kind = herestring ? SHELL_GROUP_IO_HERESTRING : SHELL_GROUP_IO_HEREDOC;
-    if (!heredoc && operand_end - operand_start >= 2 &&
-        (input[operand_start] == '<' || input[operand_start] == '>') &&
-        input[operand_start + 1] == '(') {
+    if (!heredoc && shell_source_word_is_process_substitution(
+                        input + operand_start, operand_end - operand_start)) {
+      if (fd == SHELL_PROCESS_FD_NAMED)
+        return SHELL_PROCESS_EPARSE;
       bool operand_input = input[operand_start] == '<';
       if (read_write)
         op.kind = operand_input ? SHELL_GROUP_IO_PROCESS_SUB_RW_IN
@@ -1186,10 +1530,11 @@ scan_group_redirects(const char *input, uint32_t start, uint32_t end,
         op.kind = SHELL_GROUP_IO_CLOSE_FD;
       else {
         uint32_t target_after = 0;
-        uint32_t target_fd = UINT32_MAX;
+        uint32_t target_fd = SHELL_PROCESS_FD_NONE;
         if (!parse_group_fd(input, operand_start + 1, operand_end, &target_fd,
                             &target_after) ||
-            target_fd == UINT32_MAX || target_after != operand_end)
+            target_fd == SHELL_PROCESS_FD_NONE ||
+            target_fd == SHELL_PROCESS_FD_NAMED || target_after != operand_end)
           return SHELL_PROCESS_EPARSE;
         op.kind = SHELL_GROUP_IO_DUP_FD;
         op.target_fd = target_fd;
@@ -1199,8 +1544,14 @@ scan_group_redirects(const char *input, uint32_t start, uint32_t end,
         append_group_io_op(result, &op, max_group_io_ops);
     if (status != SHELL_PROCESS_OK)
       return status;
-    *found = true;
-    position = skip_inline_space(input, operand_end, end);
+    if (combined) {
+      op.fd = 2;
+      status = append_group_io_op(result, &op, max_group_io_ops);
+      if (status != SHELL_PROCESS_OK)
+        return status;
+    }
+    position = (uint32_t)shell_source_skip_inline_continuations(input, end,
+                                                                operand_end);
   }
   return SHELL_PROCESS_OK;
 }
@@ -1212,6 +1563,32 @@ static int compare_group_io_ops(const void *left, const void *right) {
     return a->source_start < b->source_start ? -1 : 1;
   if (a->source_end != b->source_end)
     return a->source_end < b->source_end ? -1 : 1;
+  /* A shared pipeline spelling belongs to both neighbouring groups. Its
+   * source has no byte-level ordering between the output and input records,
+   * but consumers must be able to apply the relation deterministically. */
+  unsigned a_relation_order = (a->kind == SHELL_GROUP_IO_PIPE_OUTPUT ||
+                               a->kind == SHELL_GROUP_IO_PIPE_OUTPUT_STDERR)
+                                  ? 0
+                              : a->kind == SHELL_GROUP_IO_PIPE_INPUT ? 1
+                                                                     : 2;
+  unsigned b_relation_order = (b->kind == SHELL_GROUP_IO_PIPE_OUTPUT ||
+                               b->kind == SHELL_GROUP_IO_PIPE_OUTPUT_STDERR)
+                                  ? 0
+                              : b->kind == SHELL_GROUP_IO_PIPE_INPUT ? 1
+                                                                     : 2;
+  if (a_relation_order != b_relation_order)
+    return a_relation_order < b_relation_order ? -1 : 1;
+  /* Combined redirects intentionally share one spelling. Preserve Bash's
+   * stdout-then-stderr descriptor order rather than depending on qsort's
+   * unspecified order for equal elements. */
+  if (a->fd != b->fd)
+    return a->fd < b->fd ? -1 : 1;
+  if (a->target_fd != b->target_fd)
+    return a->target_fd < b->target_fd ? -1 : 1;
+  if (a->kind != b->kind)
+    return a->kind < b->kind ? -1 : 1;
+  if (a->group_index != b->group_index)
+    return a->group_index < b->group_index ? -1 : 1;
   return 0;
 }
 
@@ -1225,8 +1602,8 @@ append_group_relation(shell_processed_commands_t *result, uint16_t group_index,
       .source_end = source_end,
       .operand_start = source_end,
       .operand_end = source_end,
-      .fd = UINT32_MAX,
-      .target_fd = UINT32_MAX,
+      .fd = SHELL_PROCESS_FD_NONE,
+      .target_fd = SHELL_PROCESS_FD_NONE,
       .kind = kind,
   };
   return append_group_io_op(result, &op, max_group_io_ops);
@@ -1237,38 +1614,50 @@ static shell_process_status_t scan_group_io(const char *input, uint32_t length,
                                             uint16_t group_index,
                                             shell_processed_commands_t *result,
                                             size_t max_group_io_ops) {
-  uint32_t before = group->start;
-  while (before > 0 && isspace((unsigned char)input[before - 1]))
-    before--;
-  if (before > 0 && input[before - 1] == '|' &&
-      (before < 2 || input[before - 2] != '|')) {
+  uint32_t before = (uint32_t)shell_source_skip_list_trivia_backward(
+      input, length, group->start);
+  uint32_t pipe_start = before;
+  if (before >= 2 && input[before - 2] == '|' && input[before - 1] == '&') {
+    pipe_start = before - 2;
+  } else if (before > 0 && input[before - 1] == '|' &&
+             (before < 2 || input[before - 2] != '|')) {
+    pipe_start = before - 1;
+  }
+  if (pipe_start != before) {
     shell_process_status_t status =
         append_group_relation(result, group_index, SHELL_GROUP_IO_PIPE_INPUT,
-                              before - 1, before, max_group_io_ops);
+                              pipe_start, before, max_group_io_ops);
     if (status != SHELL_PROCESS_OK)
       return status;
   }
 
-  uint32_t after = skip_inline_space(input, group->end, length);
+  uint32_t after = (uint32_t)shell_source_skip_inline_continuations(
+      input, length, group->end);
   bool found = false;
   shell_process_status_t status = scan_group_redirects(
       input, after, length, group_index, result, max_group_io_ops, &found);
   if (status != SHELL_PROCESS_OK && (found || status != SHELL_PROCESS_EPARSE))
     return status;
   if (status != SHELL_PROCESS_OK)
-    after = skip_inline_space(input, group->end, length);
+    after = (uint32_t)shell_source_skip_inline_continuations(input, length,
+                                                             group->end);
   else if (found) {
     size_t last = result->group_io_op_count - 1;
     after = result->group_io_ops[last].source_end;
-    after = skip_inline_space(input, after, length);
+    after =
+        (uint32_t)shell_source_skip_inline_continuations(input, length, after);
   }
   if (after < length && input[after] == '|' &&
       (after + 1 == length || input[after + 1] != '|')) {
-    status =
-        append_group_relation(result, group_index, SHELL_GROUP_IO_PIPE_OUTPUT,
-                              after, after + 1, max_group_io_ops);
+    bool pipe_stderr = after + 1 < length && input[after + 1] == '&';
+    status = append_group_relation(
+        result, group_index,
+        pipe_stderr ? SHELL_GROUP_IO_PIPE_OUTPUT_STDERR
+                    : SHELL_GROUP_IO_PIPE_OUTPUT,
+        after, after + (pipe_stderr ? 2u : 1u), max_group_io_ops);
     if (status != SHELL_PROCESS_OK)
       return status;
+    after += pipe_stderr ? 2 : 1;
   }
   if (after < length && input[after] == '&' &&
       (after + 1 == length || input[after + 1] != '&'))
@@ -1306,16 +1695,62 @@ static shell_process_status_t validate_group_io_limit(const char *command_line,
   return SHELL_PROCESS_OK;
 }
 
+/* Fast ranges stop immediately before a following list connector. If that
+ * boundary follows a redirect operand through `\\` + a physical line ending,
+ * retain the continuation bytes while reparsing the range: the full tokenizer
+ * must see the LF/CRLF to avoid treating the dangling backslash as a command
+ * word. Horizontal space alone remains outside the range. */
+static size_t
+range_length_with_trailing_continuation(const char *command_line,
+                                        size_t command_length,
+                                        const shell_range_t *range) {
+  size_t range_end = (size_t)range->start + range->len;
+  if (range_end > command_length)
+    return 0;
+  /* The fast parser conventionally includes the backslash in its range but
+   * leaves the physical line-ending token for the connector scanner. */
+  if (range_end < command_length && range_end > range->start &&
+      command_line[range_end - 1] == '\\' &&
+      (command_line[range_end] == '\n' || command_line[range_end] == '\r')) {
+    size_t after = shell_source_skip_inline_continuations(
+        command_line, command_length, range_end - 1);
+    return after - range->start;
+  }
+  if (range_end < command_length && range_end >= (size_t)range->start + 2 &&
+      command_line[range_end - 2] == '\\' &&
+      command_line[range_end - 1] == '\r' && command_line[range_end] == '\n') {
+    size_t after = shell_source_skip_inline_continuations(
+        command_line, command_length, range_end - 2);
+    return after - range->start;
+  }
+  size_t position = range_end;
+  while (position < command_length &&
+         (command_line[position] == ' ' || command_line[position] == '\t'))
+    position++;
+  if (position >= command_length || command_line[position] != '\\' ||
+      position + 1 >= command_length ||
+      (command_line[position + 1] != '\n' &&
+       command_line[position + 1] != '\r'))
+    return range->len;
+  size_t after = shell_source_skip_inline_continuations(
+      command_line, command_length, range_end);
+  return after - range->start;
+}
+
 static shell_process_status_t
-process_fast_range(const char *command_line, const shell_parse_result_t *parsed,
-                   uint32_t range_index, shell_command_info_t *info,
-                   bool *produced) {
+process_fast_range(const char *command_line, size_t command_length,
+                   const shell_parse_result_t *parsed, uint32_t range_index,
+                   shell_command_info_t *info, bool *produced) {
   *produced = false;
   const shell_range_t *range = &parsed->cmds[range_index];
+  size_t range_length = range_length_with_trailing_continuation(
+      command_line, command_length, range);
+  if (range_length == 0)
+    return SHELL_PROCESS_EPARSE;
   shell_command_info_t *one = NULL;
   size_t count = 0;
   shell_process_status_t status = shell_process_command(
-      command_line + range->start, range->len, NULL, &one, &count);
+      command_line + range->start, range_length, NULL, &one, &count);
   if (status != SHELL_PROCESS_OK)
     return status;
   if (count != 1) {
@@ -1328,12 +1763,52 @@ process_fast_range(const char *command_line, const shell_parse_result_t *parsed,
   }
   *info = one[0];
   free(one);
+  /* The strict fast parser removes leading `!` modifiers from ordinary ranges
+   * and carries their exact count in range metadata. Preserve compatibility
+   * with old caller-supplied fast results that have only the modifier bit. */
+  info->pipeline_negation_count = range->pipeline_negation_count;
+  if (info->pipeline_negation_count == 0 &&
+      (range->modifiers & SHELL_CMD_MOD_PIPE_NEGATED) != 0)
+    info->pipeline_negation_count = 1;
+  info->pipeline_negated = (info->pipeline_negation_count & UINT32_C(1)) != 0;
   info->has_pipe_input = range->type == SHELL_TYPE_PIPELINE &&
                          !command_is_group_boundary(parsed, range_index, true);
+  /* SHELL_FEAT_PIPELINE identifies every member of a pipeline, including its
+   * final stage. Output exists only when the following range is connected by
+   * a pipeline operator; using the feature here falsely gave terminal stages
+   * a stdout pipe output. */
   info->has_pipe_output =
-      (range->features & SHELL_FEAT_PIPELINE) != 0 &&
+      range_index + 1 < parsed->count &&
+      parsed->cmds[range_index + 1].pipe_input_mode != SHELL_PIPE_MODE_NONE &&
       !command_is_group_boundary(parsed, range_index, false);
+  if (info->has_pipe_output) {
+    info->pipe_output_mode =
+        (shell_pipe_mode_t)parsed->cmds[range_index + 1].pipe_input_mode;
+  }
   *produced = true;
+  return SHELL_PROCESS_OK;
+}
+
+/* The structured result intentionally omits argv-less redirect-only stages.
+ * Retain command storage only once a real argv record has been produced, so a
+ * successful redirect-only source has the same compact empty-array ownership
+ * contract as every other zero-count result. */
+static shell_process_status_t
+append_processed_command(shell_processed_commands_t *result, size_t *capacity,
+                         size_t maximum, shell_command_info_t *info) {
+  if (result->command_count == *capacity) {
+    size_t next_capacity = *capacity == 0 ? 1 : *capacity;
+    if (next_capacity < maximum)
+      next_capacity = next_capacity > maximum / 2 ? maximum : next_capacity * 2;
+    shell_command_info_t *commands =
+        realloc(result->commands, next_capacity * sizeof(*result->commands));
+    if (!commands)
+      return SHELL_PROCESS_ENOMEM;
+    result->commands = commands;
+    *capacity = next_capacity;
+  }
+  result->commands[result->command_count++] = *info;
+  *info = (shell_command_info_t){0};
   return SHELL_PROCESS_OK;
 }
 
@@ -1344,59 +1819,56 @@ shell_process_commands(const char *command_line, size_t command_length,
   if (!result)
     return SHELL_PROCESS_EINPUT;
   memset(result, 0, sizeof(*result));
-  /* Keep the full tokenizer as the lexical syntax authority for this
-   * higher-level API. The strict fast pass supplies the complete semantic
-   * simple-command ranges needed for group ownership and I/O. */
+  /* The validator combines full lexical list grammar with the strict fast
+   * semantic ranges needed for group ownership and I/O. */
   shell_parse_result_t parsed = {0};
   shell_process_status_t validation = shell_process_validate_supported_source(
       command_line, command_length, &parsed);
   if (validation != SHELL_PROCESS_OK)
     return validation;
-  shell_command_t *validated = NULL;
-  size_t validated_count = 0;
-  validation = shell_processed_commands_parse(
-      command_line, command_length, limits, &validated, &validated_count);
-  if (validation != SHELL_PROCESS_OK)
-    return validation;
-
-  if (parsed.count > 0) {
-    result->commands = calloc(parsed.count, sizeof(*result->commands));
-    if (!result->commands) {
-      shell_commands_free(validated, validated_count);
-      return SHELL_PROCESS_ENOMEM;
-    }
-  }
+  /* This structured result describes executable simple-command records. A
+   * syntactically valid comment-only source has no such record and therefore
+   * is not a successful structured-processing result. Keep this distinct
+   * from shell_process_validate_supported_source(), whose narrower contract
+   * is grammar validation rather than result production. */
+  if (parsed.count == 0)
+    return SHELL_PROCESS_EPARSE;
   /* A processed result drops structural ranges (heredoc markers, here
    * strings, and document bodies).  Preserve the original fast-range index
    * only while constructing the owned command list, then remap groups below
    * so their intervals are always safe to index into result->commands. */
   uint16_t command_index[SHELL_MAX_SUBCOMMANDS];
+  size_t command_capacity = 0;
   for (uint32_t i = 0; i < parsed.count; i++)
     command_index[i] = UINT16_MAX;
   for (uint32_t i = 0; i < parsed.count; i++) {
     if (!range_is_executable(command_line, (uint32_t)command_length, &parsed,
-                             i) ||
-        !range_has_validated_token(&parsed, i, validated, validated_count))
+                             i))
       continue;
     bool produced = false;
-    shell_process_status_t status =
-        process_fast_range(command_line, &parsed, i,
-                           &result->commands[result->command_count], &produced);
+    shell_command_info_t info = {0};
+    shell_process_status_t status = process_fast_range(
+        command_line, command_length, &parsed, i, &info, &produced);
     if (status != SHELL_PROCESS_OK) {
+      clear_command_info(&info);
       shell_processed_commands_free(result);
-      shell_commands_free(validated, validated_count);
       return status;
     }
     if (produced) {
       command_index[i] = (uint16_t)result->command_count;
-      result->command_count++;
+      status = append_processed_command(result, &command_capacity, parsed.count,
+                                        &info);
+      if (status != SHELL_PROCESS_OK) {
+        clear_command_info(&info);
+        shell_processed_commands_free(result);
+        return status;
+      }
     }
   }
   if (parsed.group_count > 0) {
     result->groups = malloc(parsed.group_count * sizeof(*result->groups));
     if (!result->groups) {
       shell_processed_commands_free(result);
-      shell_commands_free(validated, validated_count);
       return SHELL_PROCESS_ENOMEM;
     }
     result->group_count = parsed.group_count;
@@ -1425,7 +1897,6 @@ shell_process_commands(const char *command_line, size_t command_length,
           limits ? limits->max_group_io_ops : 0);
       if (status != SHELL_PROCESS_OK) {
         shell_processed_commands_free(result);
-        shell_commands_free(validated, validated_count);
         return status;
       }
     }
@@ -1439,22 +1910,18 @@ shell_process_commands(const char *command_line, size_t command_length,
     size_t length = strlen(result->commands[i].original_command);
     if (limits && length > limits->max_string_bytes) {
       shell_processed_commands_free(result);
-      shell_commands_free(validated, validated_count);
       return SHELL_PROCESS_EOUTPUT_LIMIT;
     }
     if (length > SIZE_MAX - total_output) {
       shell_processed_commands_free(result);
-      shell_commands_free(validated, validated_count);
       return SHELL_PROCESS_EOVERFLOW;
     }
     total_output += length;
   }
   if (limits && total_output > limits->max_total_bytes) {
     shell_processed_commands_free(result);
-    shell_commands_free(validated, validated_count);
     return SHELL_PROCESS_EOUTPUT_LIMIT;
   }
-  shell_commands_free(validated, validated_count);
   return SHELL_PROCESS_OK;
 }
 
@@ -1520,65 +1987,6 @@ static char *write_netargv_unchecked(const shell_command_info_t *info,
   return position;
 }
 
-/* The full iterator exposes lexical expansion fragments for callers that
- * need them. Canonical argv instead has one record per source shell word, so
- * merge adjacent non-operator fragments into a small borrowed synthetic
- * token while rendering the direct netargv-sequence APIs. */
-static bool basic_command_word_at(const shell_command_t *command, size_t wanted,
-                                  shell_token_t *word) {
-  if (!command || !word)
-    return false;
-  bool consume_redirection_operand = false;
-  size_t redirection_operand_end = 0;
-  size_t found = 0;
-  for (size_t i = 0; i < command->token_count; i++) {
-    const shell_token_t *token = &command->tokens[i];
-    if (is_shell_operator_token(token)) {
-      consume_redirection_operand =
-          is_redirection_token(token) && redirection_consumes_next_token(token);
-      redirection_operand_end = 0;
-      continue;
-    }
-    if (consume_redirection_operand) {
-      if (redirection_operand_end == 0 ||
-          token->position == redirection_operand_end) {
-        redirection_operand_end = token->position + token->length;
-        continue;
-      }
-      consume_redirection_operand = false;
-    }
-
-    shell_token_t merged = *token;
-    size_t j = i + 1;
-    while (j < command->token_count) {
-      const shell_token_t *next = &command->tokens[j];
-      if (is_shell_operator_token(next))
-        break;
-      if (merged.position > SIZE_MAX - merged.length ||
-          merged.position + merged.length != next->position)
-        break;
-      merged.length += next->length;
-      merged.is_quoted = merged.is_quoted || next->is_quoted;
-      merged.is_escaped = merged.is_escaped || next->is_escaped;
-      j++;
-    }
-    if (found++ == wanted) {
-      *word = merged;
-      return true;
-    }
-    i = j - 1;
-  }
-  return false;
-}
-
-static size_t basic_command_word_count(const shell_command_t *command) {
-  size_t count = 0;
-  shell_token_t word;
-  while (basic_command_word_at(command, count, &word))
-    count++;
-  return count;
-}
-
 shell_process_status_t shell_write_netargv(const shell_command_info_t *info,
                                            char *destination,
                                            size_t destination_size,
@@ -1602,11 +2010,10 @@ shell_process_status_t shell_write_netargv(const shell_command_info_t *info,
 static shell_process_status_t
 measure_basic_netargv(const shell_command_t *command, size_t *total) {
   *total = 0;
-  size_t count = basic_command_word_count(command);
-  for (size_t i = 0; i < count; i++) {
-    shell_token_t word;
-    if (!basic_command_word_at(command, i, &word))
-      return SHELL_PROCESS_EPARSE;
+  shell_processed_word_iterator_t iterator;
+  shell_processed_word_iterator_init(&iterator, command);
+  shell_token_t word;
+  while (shell_processed_word_iterator_next(&iterator, &word)) {
     size_t length = 0;
     shell_process_status_t status = rendered_word_length(&word, &length);
     if (status != SHELL_PROCESS_OK)
@@ -1623,11 +2030,10 @@ measure_basic_netargv(const shell_command_t *command, size_t *total) {
 
 static char *write_basic_netargv(const shell_command_t *command,
                                  char *position) {
-  size_t count = basic_command_word_count(command);
-  for (size_t i = 0; i < count; i++) {
-    shell_token_t word;
-    if (!basic_command_word_at(command, i, &word))
-      return NULL;
+  shell_processed_word_iterator_t iterator;
+  shell_processed_word_iterator_init(&iterator, command);
+  shell_token_t word;
+  while (shell_processed_word_iterator_next(&iterator, &word)) {
     size_t length = 0;
     (void)rendered_word_length(&word, &length);
     size_t prefix_length = 0;
@@ -1712,7 +2118,9 @@ bool shell_command_info_has_dangerous_features(
   /* Substitutions remain explicit netargv values. They can execute shell code,
    * so callers must handle them explicitly. */
   for (size_t i = 0; i < info->command_token_count; i++) {
-    if (word_has_executable_substitution(&info->command_tokens[i]))
+    const shell_token_t *word = &info->command_tokens[i];
+    if (shell_source_word_has_executable_substitution(word->start,
+                                                      word->length))
       return true;
   }
   return false;
@@ -1753,7 +2161,8 @@ static shell_process_status_t shell_build_netargv_sequence_impl(
     /* A redirect following a compound group belongs to that group. The full
      * tokenizer retains its operand as a structural stage so redirection
      * metadata is not lost; canonical argv must not render it as a command. */
-    if (shell_processed_command_is_group_structure(commands, count, i))
+    if (shell_processed_command_is_group_structure(
+            commands, count, i, command_line, command_length))
       continue;
     if (shell_processed_command_word_count(&commands[i]) == 0) {
       status = SHELL_PROCESS_EPARSE;
@@ -1782,14 +2191,19 @@ static shell_process_status_t shell_build_netargv_sequence_impl(
     status = SHELL_PROCESS_EOUTPUT_LIMIT;
     goto fail_sequence;
   }
-  char *encoded = malloc(total + 1);
+  size_t allocation_size = 0;
+  status = shell_process_cstring_allocation_size(total, &allocation_size);
+  if (status != SHELL_PROCESS_OK)
+    goto fail_sequence;
+  char *encoded = malloc(allocation_size);
   if (!encoded) {
     status = SHELL_PROCESS_ENOMEM;
     goto fail_sequence;
   }
   char *position = encoded;
   for (size_t i = 0; i < count; i++) {
-    if (shell_processed_command_is_group_structure(commands, count, i))
+    if (shell_processed_command_is_group_structure(
+            commands, count, i, command_line, command_length))
       continue;
     size_t length = 0;
     (void)measure_basic_netargv(&commands[i], &length);
@@ -1866,29 +2280,38 @@ static shell_process_status_t shell_build_command_netseq_impl(
     *subcommand_count = 0;
   if (!command_line || !command_netseq || !subcommand_count)
     return SHELL_PROCESS_EINPUT;
-  shell_process_status_t status = shell_process_validate_supported_source(
-      command_line, command_length, NULL);
-  if (status != SHELL_PROCESS_OK)
-    return status;
-  shell_command_t *commands = NULL;
-  size_t count = 0;
-  status = shell_processed_commands_parse(command_line, command_length, limits,
-                                          &commands, &count);
+  shell_anomaly_stages_t stages = {0};
+  shell_process_status_t status =
+      shell_anomaly_stages_parse(command_line, command_length, limits, &stages);
   if (status != SHELL_PROCESS_OK)
     return status;
   size_t total = 0;
   size_t rendered_count = 0;
-  for (size_t i = 0; i < count; i++) {
-    if (shell_processed_command_is_group_structure(commands, count, i))
+  for (size_t i = 0; i < stages.count; i++) {
+    if (shell_processed_command_word_count(&stages.commands[i]) == 0) {
+      /* An argv-less redirect-only simple command is a real execution stage.
+       * The anomaly sequence represents its missing argv[0] as a canonical
+       * empty record. This sequence is not a policy netargv transport. */
+      size_t record_length = 0;
+      if (shell_netstring_encoded_length(0, &record_length) !=
+              SHELL_NETSTRING_OK ||
+          total > SIZE_MAX - record_length) {
+        status = SHELL_PROCESS_EOVERFLOW;
+        goto fail_commands;
+      }
+      total += record_length;
+      rendered_count++;
       continue;
-    if (shell_processed_command_word_count(&commands[i]) == 0) {
+    }
+    shell_processed_word_iterator_t iterator;
+    shell_processed_word_iterator_init(&iterator, &stages.commands[i]);
+    shell_token_t token;
+    if (!shell_processed_word_iterator_next(&iterator, &token)) {
       status = SHELL_PROCESS_EPARSE;
       goto fail_commands;
     }
-    const shell_token_t *token =
-        shell_processed_command_word_at(&commands[i], 0);
     size_t length = 0;
-    status = shell_measure_decoded_word(token->start, token->length, &length);
+    status = shell_measure_decoded_word(token.start, token.length, &length);
     if (status != SHELL_PROCESS_OK)
       goto fail_commands;
     if (length == 0) {
@@ -1910,19 +2333,34 @@ static shell_process_status_t shell_build_command_netseq_impl(
     status = SHELL_PROCESS_EOUTPUT_LIMIT;
     goto fail_commands;
   }
-  char *encoded = malloc(total + 1);
+  size_t allocation_size = 0;
+  status = shell_process_cstring_allocation_size(total, &allocation_size);
+  if (status != SHELL_PROCESS_OK)
+    goto fail_commands;
+  char *encoded = malloc(allocation_size);
   if (!encoded) {
     status = SHELL_PROCESS_ENOMEM;
     goto fail_commands;
   }
   char *position = encoded;
-  for (size_t i = 0; i < count; i++) {
-    if (shell_processed_command_is_group_structure(commands, count, i))
+  for (size_t i = 0; i < stages.count; i++) {
+    if (shell_processed_command_word_count(&stages.commands[i]) == 0) {
+      size_t prefix_length = 0;
+      (void)shell_netstring_write_prefix(position, SIZE_MAX, 0, &prefix_length);
+      position += prefix_length;
+      *position++ = ',';
       continue;
-    const shell_token_t *token =
-        shell_processed_command_word_at(&commands[i], 0);
+    }
+    shell_processed_word_iterator_t iterator;
+    shell_processed_word_iterator_init(&iterator, &stages.commands[i]);
+    shell_token_t token;
+    if (!shell_processed_word_iterator_next(&iterator, &token)) {
+      free(encoded);
+      status = SHELL_PROCESS_EPARSE;
+      goto fail_commands;
+    }
     size_t length = 0;
-    (void)shell_measure_decoded_word(token->start, token->length, &length);
+    (void)shell_measure_decoded_word(token.start, token.length, &length);
     size_t prefix_length = 0;
     (void)shell_netstring_write_prefix(position, SIZE_MAX, length,
                                        &prefix_length);
@@ -1931,7 +2369,7 @@ static shell_process_status_t shell_build_command_netseq_impl(
         .destination = position,
         .destination_size = length,
     };
-    status = decode_shell_word(token->start, token->length, &sink);
+    status = decode_shell_word(token.start, token.length, &sink);
     if (status != SHELL_PROCESS_OK || sink.output_length != length) {
       free(encoded);
       status = status == SHELL_PROCESS_OK ? SHELL_PROCESS_EPARSE : status;
@@ -1941,7 +2379,7 @@ static shell_process_status_t shell_build_command_netseq_impl(
     *position++ = ',';
   }
   *position = '\0';
-  shell_commands_free(commands, count);
+  shell_anomaly_stages_free(&stages);
   *command_netseq = encoded;
   if (command_length_out)
     *command_length_out = total;
@@ -1949,7 +2387,7 @@ static shell_process_status_t shell_build_command_netseq_impl(
   return SHELL_PROCESS_OK;
 
 fail_commands:
-  shell_commands_free(commands, count);
+  shell_anomaly_stages_free(&stages);
   return status;
 }
 

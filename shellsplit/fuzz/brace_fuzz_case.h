@@ -165,12 +165,13 @@ static inline shell_brace_fuzz_case_t shell_brace_fuzz_case(const uint8_t *data,
     return item;
   }
   if (form % 16 == 13) {
-    shell_brace_fuzz_case_t item =
-        shell_brace_fuzz_make_case("{ " + std::string(first) + " one; } | { " +
-                                       second + "; } && { printf done; }",
-                                   true, true, 3, 3, 2, 0, 0);
+    bool pipe_stderr = (shell_brace_fuzz_byte(data, size, 4) & 1) != 0;
+    shell_brace_fuzz_case_t item = shell_brace_fuzz_make_case(
+        "{ " + std::string(first) + " one; } " + (pipe_stderr ? "|&" : "|") +
+            " { " + second + "; } && { printf done; }",
+        true, true, 3, 3, 2, 0, 0);
     item.group_command_count = 3;
-    item.pipe_count = 1;
+    item.pipe_count = pipe_stderr ? 2 : 1;
     item.deepest_command_count = 3;
     return item;
   }
@@ -261,24 +262,24 @@ static inline shell_brace_fuzz_case_t shell_brace_fuzz_case(const uint8_t *data,
       return shell_brace_fuzz_make_case("{ " + std::string(first) +
                                             "; } 3>> (cat)",
                                         false, false, 0, 0, 0, 0, 0);
-    /* These are lexically recoverable source strings, but not supported
-     * complete commands. Keep them in the strict-only family so fuzzing
-     * asserts the same semantic boundary used by canonical APIs and
-     * Shellgate without changing the intentionally tolerant lexer contract. */
+    /* These cannot form a simple command around a compound delimiter. They
+     * are impossible list grammar, not merely unsupported semantics, so every
+     * public parser rejects them before processing. */
     case 7:
-      return shell_brace_fuzz_make_case(std::string(first) + "; }", true, false,
-                                        0, 0, 0, 0, 0);
+      return shell_brace_fuzz_make_case(std::string(first) + "; }", false,
+                                        false, 0, 0, 0, 0, 0);
     case 8:
-      return shell_brace_fuzz_make_case(std::string(first) + " | )", true,
+      return shell_brace_fuzz_make_case(std::string(first) + " | )", false,
                                         false, 0, 0, 0, 0, 0);
     case 9:
       return shell_brace_fuzz_make_case(std::string(first) + " { literal; }",
-                                        true, false, 0, 0, 0, 0, 0);
+                                        false, false, 0, 0, 0, 0, 0);
     case 10:
-      return shell_brace_fuzz_make_case(
-          std::string(first) + " (" + second + ")", true, false, 0, 0, 0, 0, 0);
+      return shell_brace_fuzz_make_case(std::string(first) + " (" + second +
+                                            ")",
+                                        false, false, 0, 0, 0, 0, 0);
     default:
-      return shell_brace_fuzz_make_case(std::string(first) + " ((1))", true,
+      return shell_brace_fuzz_make_case(std::string(first) + " ((1))", false,
                                         false, 0, 0, 0, 0, 0);
     }
   }

@@ -63,7 +63,7 @@ execute_process(COMMAND "${CMAKE_COMMAND}" -S "${SHELLCLAVE_SOURCE_DIR}/tests/co
   "-DSHELLCLAVE_REQUIRED_VERSION=0.6.0" RESULT_VARIABLE incompatible_result)
 if(NOT incompatible_result)
   message(FATAL_ERROR
-    "Installed 0.7 package unexpectedly satisfies an incompatible 0.6 request")
+    "Installed package unexpectedly satisfies an incompatible 0.6 request")
 endif()
 set(build_command "${CMAKE_COMMAND}" --build "${build}")
 if(SHELLCLAVE_BUILD_TYPE)

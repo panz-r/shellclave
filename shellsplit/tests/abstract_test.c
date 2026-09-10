@@ -81,6 +81,226 @@ static void test_ansi_c_arithmetic_span(void) {
   TEST("ANSI-C quote preserves the complete arithmetic abstraction", valid);
 }
 
+static void test_compound_variable_quote_boundaries(void) {
+  static const struct {
+    const char *source;
+    const char *display;
+    size_t element_count;
+    bool has_ansi_c_string;
+  } cases[] = {
+      {"printf prefix'$literal'${NAME}", "printf prefix'$literal'$EV_1", 1,
+       false},
+      {"printf prefix$'don\\'t $literal'${NAME}", "printf prefix$STR_1$EV_1", 2,
+       true},
+  };
+  bool valid = true;
+  for (size_t i = 0; valid && i < sizeof(cases) / sizeof(cases[0]); i++) {
+    shell_abstract_command_t *result = parse_command(cases[i].source);
+    size_t count = 0;
+    const shell_abstract_element_t *const *elements =
+        result ? shell_abstract_command_get_elements(result, &count) : NULL;
+    valid = result &&
+            strcmp(shell_abstract_command_get_display_text(result),
+                   cases[i].display) == 0 &&
+            count == cases[i].element_count && elements != NULL &&
+            elements[count - 1] != NULL &&
+            elements[count - 1]->type == SHELL_ABSTRACT_EV &&
+            strcmp(elements[count - 1]->original, "${NAME}") == 0 &&
+            elements[count - 1]->data.var.name != NULL &&
+            strcmp(elements[count - 1]->data.var.name, "NAME") == 0 &&
+            result->has_strings == cases[i].has_ansi_c_string &&
+            (!cases[i].has_ansi_c_string ||
+             (elements[0] && elements[0]->type == SHELL_ABSTRACT_STR &&
+              strcmp(elements[0]->original, "$'don\\'t $literal'") == 0));
+    shell_abstract_command_free(result);
+  }
+  TEST("compound variables preserve quoted and ANSI-C literal boundaries",
+       valid);
+}
+
+static void test_compound_substitution_boundaries(void) {
+  shell_abstract_command_t *result = parse_command("printf \"x$VAR$(id)\"");
+  size_t count = 0;
+  const shell_abstract_element_t *const *elements =
+      result ? shell_abstract_command_get_elements(result, &count) : NULL;
+  bool valid = result && elements && count == 2 && result->has_cmd_subst &&
+               strcmp(shell_abstract_command_get_display_text(result),
+                      "printf \"x$EV_1$CS_1\"") == 0 &&
+               elements[0]->type == SHELL_ABSTRACT_EV &&
+               strcmp(elements[0]->original, "$VAR") == 0 &&
+               elements[1]->type == SHELL_ABSTRACT_CS &&
+               strcmp(elements[1]->original, "$(id)") == 0 &&
+               elements[1]->data.cmd_subst.content &&
+               strcmp(elements[1]->data.cmd_subst.content, "id") == 0;
+  shell_abstract_command_free(result);
+
+  result = parse_command("printf prefix${VAR:-$(id)}");
+  count = 0;
+  elements =
+      result ? shell_abstract_command_get_elements(result, &count) : NULL;
+  valid = valid && result && elements && count == 1 && result->has_cmd_subst &&
+          elements[0]->type == SHELL_ABSTRACT_EV &&
+          strcmp(elements[0]->original, "${VAR:-$(id)}") == 0 &&
+          strcmp(shell_abstract_command_get_display_text(result),
+                 "printf prefix$EV_1") == 0;
+  shell_abstract_command_free(result);
+
+  result = parse_command("printf x$VAR`id` <(producer)");
+  count = 0;
+  elements =
+      result ? shell_abstract_command_get_elements(result, &count) : NULL;
+  valid = valid && result && elements && count == 3 && result->has_cmd_subst &&
+          elements[0]->type == SHELL_ABSTRACT_EV &&
+          elements[1]->type == SHELL_ABSTRACT_CS &&
+          strcmp(elements[1]->original, "`id`") == 0 &&
+          elements[2]->type == SHELL_ABSTRACT_CS &&
+          strcmp(elements[2]->original, "<(producer)") == 0;
+  shell_abstract_command_free(result);
+
+  static const char *const literal_cases[] = {
+      "printf \"x$VAR<(producer)\"",
+      "printf x$VAR\\$(id)",
+      "printf x$VAR$'$(id)'",
+      "printf x$VAR'$(id)'",
+  };
+  for (size_t i = 0;
+       valid && i < sizeof(literal_cases) / sizeof(literal_cases[0]); i++) {
+    result = parse_command(literal_cases[i]);
+    valid = result && !result->has_cmd_subst;
+    shell_abstract_command_free(result);
+  }
+  TEST("compound abstractions retain active substitution boundaries", valid);
+}
+
+static void test_parameter_expansion_metadata(void) {
+  static const struct {
+    const char *source;
+    shell_abstract_type_t type;
+    const char *name;
+  } cases[] = {
+      {"printf ${VALUE:-fallback}", SHELL_ABSTRACT_EV, "VALUE"},
+      {"printf ${VALUE#prefix}", SHELL_ABSTRACT_EV, "VALUE"},
+      {"printf ${VALUE%%suffix}", SHELL_ABSTRACT_EV, "VALUE"},
+      {"printf ${#VALUE}", SHELL_ABSTRACT_EV, "VALUE"},
+      {"printf ${10}", SHELL_ABSTRACT_PV, "10"},
+      {"printf ${?}", SHELL_ABSTRACT_SV, "?"},
+      {"printf ${#}", SHELL_ABSTRACT_SV, "#"},
+      {"printf ${!}", SHELL_ABSTRACT_SV, "!"},
+      {"printf ${#?}", SHELL_ABSTRACT_SV, "?"},
+      {"printf ${!name}", SHELL_ABSTRACT_EV, "name"},
+      {"printf ${!1}", SHELL_ABSTRACT_PV, "1"},
+      {"printf ${!prefix*}", SHELL_ABSTRACT_EV, NULL},
+      {"printf ${!prefix@}", SHELL_ABSTRACT_EV, NULL},
+  };
+  bool valid = true;
+  for (size_t i = 0; valid && i < sizeof(cases) / sizeof(cases[0]); i++) {
+    shell_abstract_command_t *result = parse_command(cases[i].source);
+    size_t count = 0;
+    const shell_abstract_element_t *const *elements =
+        result ? shell_abstract_command_get_elements(result, &count) : NULL;
+    valid = result && count == 1 && elements && elements[0] &&
+            elements[0]->type == cases[i].type &&
+            elements[0]->data.var.is_braced &&
+            ((cases[i].name == NULL && elements[0]->data.var.name == NULL) ||
+             (cases[i].name != NULL && elements[0]->data.var.name != NULL &&
+              strcmp(elements[0]->data.var.name, cases[i].name) == 0));
+    shell_abstract_command_free(result);
+  }
+  TEST("parameter expansion metadata names only static parameters", valid);
+}
+
+static void test_nested_parameter_substitution_metadata(void) {
+  static const struct {
+    const char *source;
+    bool has_substitution;
+  } cases[] = {
+      {"printf ${VALUE:-$(id)}", true},
+      {"printf ${VALUE:-`id`}", true},
+      {"printf ${VALUE:-<(id)}", true},
+      {"printf ${VALUE:->(id)}", true},
+      {"printf ${VALUE:-${FALLBACK:-$(id)}}", true},
+      {"printf ${VALUE#prefix${SUFFIX:-$(id)}}", true},
+      {"printf ${VALUE:-\"$(id)\"}", true},
+      {"printf ${VALUE:-'$(id)'}", false},
+      {"printf ${VALUE:-$'`id`'}", false},
+      {"printf ${VALUE:-\\$(id)}", false},
+  };
+  bool valid = true;
+  for (size_t i = 0; valid && i < sizeof(cases) / sizeof(cases[0]); i++) {
+    shell_abstract_command_t *result = parse_command(cases[i].source);
+    size_t count = 0;
+    const shell_abstract_element_t *const *elements =
+        result ? shell_abstract_command_get_elements(result, &count) : NULL;
+    valid = result && count == 1 && elements && elements[0] &&
+            elements[0]->type == SHELL_ABSTRACT_EV &&
+            strcmp(elements[0]->original,
+                   cases[i].source + strlen("printf ")) == 0 &&
+            shell_abstract_command_has_cmd_subst(result) ==
+                cases[i].has_substitution;
+    shell_abstract_command_free(result);
+  }
+  TEST("nested parameter substitutions remain visible in metadata", valid);
+}
+
+static void test_invalid_parameter_selectors(void) {
+  static const char *const cases[] = {
+      "printf ${VALUE${SUFFIX}}", "printf ${VALUE$SUFFIX}",
+      "printf ${VALUE.suffix}",   "printf ${?suffix}",
+      "printf ${10suffix}",
+  };
+  bool valid = true;
+  for (size_t i = 0; valid && i < sizeof(cases) / sizeof(cases[0]); i++) {
+    shell_abstract_command_t *result = (shell_abstract_command_t *)(void *)1;
+    valid = shell_abstract_command_parse(cases[i], strlen(cases[i]), &result) ==
+                SHELL_ABSTRACT_EPARSE &&
+            result == NULL;
+  }
+  TEST("invalid parameter selectors cannot produce abstractions", valid);
+}
+
+static void test_quote_aware_substitution_metadata(void) {
+  static const struct {
+    const char *source;
+    bool has_substitution;
+  } cases[] = {
+      {"printf \"$(id)\"", true},         {"printf \"`id`\"", true},
+      {"printf prefix$(id)suffix", true}, {"printf x >\"$(id)\"", true},
+      {"printf '<(id)'", false},          {"printf $'$(id)'", false},
+      {"printf \\$(id)", false},          {"printf \"<(id)\"", false},
+      {"printf \">(id)\"", false},        {"printf ${VALUE:-\"<(id)\"}", false},
+      {"printf ${VALUE:-<(id)}", true},   {"printf ${VALUE:->(id)}", true},
+  };
+  bool valid = true;
+  for (size_t i = 0; valid && i < sizeof(cases) / sizeof(cases[0]); i++) {
+    shell_abstract_command_t *result = parse_command(cases[i].source);
+    valid = result && shell_abstract_command_has_cmd_subst(result) ==
+                          cases[i].has_substitution;
+    shell_abstract_command_free(result);
+  }
+  TEST("substitution metadata honors quote execution semantics", valid);
+}
+
+static void test_modern_word_abstractions(void) {
+  shell_abstract_command_t *result =
+      parse_command("printf $'a\\n' @(left|right)");
+  size_t count = 0;
+  const shell_abstract_element_t *const *elements =
+      result ? shell_abstract_command_get_elements(result, &count) : NULL;
+  bool valid = result && elements && count == 2 &&
+               strcmp(shell_abstract_command_get_display_text(result),
+                      "printf $STR_1 $GB_1") == 0 &&
+               result->has_strings && result->has_globs && elements[0] &&
+               elements[1] && elements[0]->type == SHELL_ABSTRACT_STR &&
+               strcmp(elements[0]->original, "$'a\\n'") == 0 &&
+               elements[0]->data.cmd_subst.content &&
+               strcmp(elements[0]->data.cmd_subst.content, "a\\n") == 0 &&
+               elements[1]->type == SHELL_ABSTRACT_GB &&
+               elements[1]->data.glob.pattern &&
+               strcmp(elements[1]->data.glob.pattern, "@(left|right)") == 0;
+  shell_abstract_command_free(result);
+  TEST("ANSI-C strings and extglobs retain abstract metadata", valid);
+}
+
 enum {
   FLAG_VARIABLES = 1u << 0,
   FLAG_POS_VARS = 1u << 1,
@@ -178,7 +398,7 @@ static void test_abstraction_matrix(void) {
       {"quoted string", "echo \"hello world\"", "echo $STR_1", 1, FLAG_STRINGS},
       {"quoted variable", "echo \"$USER\"", "echo $EV_1", 1, FLAG_VARIABLES},
       {"embedded quoted variable", "echo \"prefix ${NAME} suffix\"",
-       "echo $EV_1", 1, FLAG_VARIABLES},
+       "echo \"prefix $EV_1 suffix\"", 1, FLAG_VARIABLES},
       {"multiple variables", "grep $USER $HOME/file $PATH",
        "grep $EV_1 $EV_2$AP_1 $EV_3", 4,
        FLAG_VARIABLES | FLAG_PATHS | FLAG_ABS_PATHS},
@@ -192,6 +412,14 @@ static void test_abstraction_matrix(void) {
        "tail -f /var/log/$APP.log | grep -i error | head -n 100",
        "tail -f $AP_1$EV_1.log | grep -i error | head -n 100", 2,
        FLAG_VARIABLES | FLAG_PATHS | FLAG_ABS_PATHS},
+      {"trailing path fragments in one variable word", "printf /a/$X/b/$Y/c",
+       "printf $AP_1$EV_1$AP_2$EV_2$AP_3", 5,
+       FLAG_VARIABLES | FLAG_PATHS | FLAG_ABS_PATHS},
+      {"compound word abstraction families",
+       "printf ./$REL/tail ~/$HOME/tail arg-$1 status-$?",
+       "printf $RP_1$EV_1$AP_1 $HP_1$EV_2$AP_2 arg-$PV_1 status-$SV_1", 8,
+       FLAG_VARIABLES | FLAG_PATHS | FLAG_ABS_PATHS | FLAG_REL_PATHS |
+           FLAG_HOME_PATHS | FLAG_POS_VARS | FLAG_SPECIAL_VARS},
       {"later sequence stages are abstracted",
        "echo ok && cat /etc/$FILE || diff <(left) >(right)",
        "echo ok && cat $AP_1$EV_1 || diff $CS_1 $CS_2", 4,
@@ -229,7 +457,8 @@ static void test_abstraction_matrix(void) {
 
 static void test_abstraction_allocation_failures(void) {
   static const char input[] =
-      "echo $USER /etc/passwd *.txt $(date) $((x+1)) >output";
+      "echo /var/log/$APP.log ./$REL ~/$HOME arg-$1 status-$? *.txt $(date) "
+      "$((x+1)) /a/$X/b ${VALUE:-$(date)} ${!prefix*} ${?} >output";
   shellsplit_test_alloc_reset();
   shell_abstract_command_t *probe = parse_command(input);
   TEST("allocation probe succeeds", probe != NULL);
@@ -254,8 +483,11 @@ static void test_abstraction_allocation_failures(void) {
   shell_process_status_t status =
       shell_build_type_netseq(input, strlen(input), NULL, &netseq, &count);
   allocations = shellsplit_test_alloc_count();
+  /* The two nested `$(date)` expansions are execution stages in addition to
+   * the enclosing command. Keep this allocation probe on the full canonical
+   * stage sequence rather than the older top-level-only count. */
   TEST("type-netsequence allocation probe succeeds",
-       status == SHELL_PROCESS_OK && netseq && count == 1);
+       status == SHELL_PROCESS_OK && netseq && count == 3);
   free(netseq);
 
   bool atomic = true;
@@ -346,18 +578,49 @@ static void test_classification_matrix(void) {
   static const struct {
     const char *text;
     shell_token_type_t expected;
-  } cases[] = {
-      {"$HOME", SHELL_TOKEN_VARIABLE},    {"${HOME}", SHELL_TOKEN_VARIABLE},
-      {"$1", SHELL_TOKEN_SPECIAL_VAR},    {"$10", SHELL_TOKEN_SPECIAL_VAR},
-      {"${10}", SHELL_TOKEN_SPECIAL_VAR}, {"$?", SHELL_TOKEN_SPECIAL_VAR},
-      {"$$", SHELL_TOKEN_SPECIAL_VAR},    {"$#", SHELL_TOKEN_SPECIAL_VAR},
-      {"$!", SHELL_TOKEN_SPECIAL_VAR},    {"$@", SHELL_TOKEN_SPECIAL_VAR},
-      {"$*", SHELL_TOKEN_SPECIAL_VAR},    {"$-", SHELL_TOKEN_SPECIAL_VAR},
-      {"$!x", SHELL_TOKEN_ARGUMENT},      {"$@x", SHELL_TOKEN_ARGUMENT},
-      {"$*x", SHELL_TOKEN_ARGUMENT},      {"$(date)", SHELL_TOKEN_SUBSHELL},
-      {"`date`", SHELL_TOKEN_SUBSHELL},   {"$((1+2))", SHELL_TOKEN_ARITHMETIC},
-      {"*.txt", SHELL_TOKEN_GLOB},        {"/etc/passwd", SHELL_TOKEN_ARGUMENT},
-      {"\"text\"", SHELL_TOKEN_ARGUMENT}, {"plain", SHELL_TOKEN_ARGUMENT}};
+  } cases[] = {{"", SHELL_TOKEN_END},
+               {"$HOME", SHELL_TOKEN_VARIABLE},
+               {"${HOME}", SHELL_TOKEN_VARIABLE},
+               {"$1", SHELL_TOKEN_SPECIAL_VAR},
+               {"$10", SHELL_TOKEN_SPECIAL_VAR},
+               {"${10}", SHELL_TOKEN_SPECIAL_VAR},
+               {"$?", SHELL_TOKEN_SPECIAL_VAR},
+               {"$$", SHELL_TOKEN_SPECIAL_VAR},
+               {"$#", SHELL_TOKEN_SPECIAL_VAR},
+               {"$!", SHELL_TOKEN_SPECIAL_VAR},
+               {"$@", SHELL_TOKEN_SPECIAL_VAR},
+               {"$*", SHELL_TOKEN_SPECIAL_VAR},
+               {"$-", SHELL_TOKEN_SPECIAL_VAR},
+               {"$!x", SHELL_TOKEN_ARGUMENT},
+               {"$@x", SHELL_TOKEN_ARGUMENT},
+               {"$*x", SHELL_TOKEN_ARGUMENT},
+               {"$", SHELL_TOKEN_ARGUMENT},
+               {"${", SHELL_TOKEN_ARGUMENT},
+               {"${%word}", SHELL_TOKEN_ARGUMENT},
+               {"${!}", SHELL_TOKEN_SPECIAL_VAR},
+               {"${#?}", SHELL_TOKEN_SPECIAL_VAR},
+               {"${!1}", SHELL_TOKEN_SPECIAL_VAR},
+               {"$(date)", SHELL_TOKEN_SUBSHELL},
+               {"`date`", SHELL_TOKEN_SUBSHELL},
+               {"$((1+2))", SHELL_TOKEN_ARITHMETIC},
+               {"*.txt", SHELL_TOKEN_GLOB},
+               {"/tmp/*.txt", SHELL_TOKEN_ARGUMENT},
+               {"dir/*.txt", SHELL_TOKEN_ARGUMENT},
+               {"/etc/passwd", SHELL_TOKEN_ARGUMENT},
+               {"./local", SHELL_TOKEN_ARGUMENT},
+               {"../parent", SHELL_TOKEN_ARGUMENT},
+               {".", SHELL_TOKEN_ARGUMENT},
+               {"..", SHELL_TOKEN_ARGUMENT},
+               {"dir/file", SHELL_TOKEN_ARGUMENT},
+               {"~", SHELL_TOKEN_ARGUMENT},
+               {"~user", SHELL_TOKEN_ARGUMENT},
+               {"~9", SHELL_TOKEN_ARGUMENT},
+               {"-x", SHELL_TOKEN_ARGUMENT},
+               {"-1", SHELL_TOKEN_ARGUMENT},
+               {"--long", SHELL_TOKEN_ARGUMENT},
+               {"---", SHELL_TOKEN_ARGUMENT},
+               {"\"text\"", SHELL_TOKEN_ARGUMENT},
+               {"plain", SHELL_TOKEN_ARGUMENT}};
 
   bool valid = shell_classify_raw_token(NULL, 0) == SHELL_TOKEN_END;
   for (size_t i = 0; valid && i < sizeof(cases) / sizeof(cases[0]); i++)
@@ -447,7 +710,7 @@ static void test_runtime_expansion(void) {
                {"cat /etc/passwd", "$AP_1", "/etc/passwd", NULL},
                {"cat ./file", "$RP_1", "/tmp/./file", "/tmp/"},
                {"echo $MISSING", "$EV_1", NULL, NULL},
-               {"echo \"prefix $USER\"", "$EV_1", NULL, NULL},
+               {"echo \"prefix $USER\"", "$EV_1", "testuser", NULL},
                {"echo \"literal\"", "$STR_1", NULL, NULL}};
 
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
@@ -603,6 +866,13 @@ int main(void) {
   test_abstraction_matrix();
   test_bounded_span_and_statuses();
   test_ansi_c_arithmetic_span();
+  test_compound_variable_quote_boundaries();
+  test_compound_substitution_boundaries();
+  test_parameter_expansion_metadata();
+  test_nested_parameter_substitution_metadata();
+  test_invalid_parameter_selectors();
+  test_quote_aware_substitution_metadata();
+  test_modern_word_abstractions();
   test_abstraction_allocation_failures();
   test_element_metadata();
   test_classification_matrix();

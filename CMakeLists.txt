@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(Shellclave VERSION 0.8.0 LANGUAGES C CXX)
+project(Shellclave VERSION 0.9.0 LANGUAGES C CXX)
 
 if(PROJECT_IS_TOP_LEVEL)
   set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -249,7 +249,7 @@ if(BUILD_TESTING)
   set(shellclave_command_fixture_json
     "${CMAKE_CURRENT_SOURCE_DIR}/shellsplit/tests/data/coding-agent-commands.json")
   set(shellclave_command_fixture_header
-    "${CMAKE_CURRENT_BINARY_DIR}/tests/shellgate_corpus_fixtures.h")
+    "${CMAKE_CURRENT_BINARY_DIR}/tests/shellclave_command_corpus_fixtures.h")
   set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
     "${shellclave_command_fixture_json}")
   file(READ "${shellclave_command_fixture_json}" shellclave_command_fixture_data)
@@ -269,9 +269,9 @@ if(BUILD_TESTING)
   endif()
   file(WRITE "${shellclave_command_fixture_header}"
     "/* Generated from shellsplit/tests/data/coding-agent-commands.json. */\n"
-    "#ifndef SHELLGATE_CORPUS_FIXTURES_H\n"
-    "#define SHELLGATE_CORPUS_FIXTURES_H\n"
-    "static const char *const shellgate_corpus_commands[] = {\n")
+    "#ifndef SHELLCLAVE_COMMAND_CORPUS_FIXTURES_H\n"
+    "#define SHELLCLAVE_COMMAND_CORPUS_FIXTURES_H\n"
+    "static const char *const shellclave_command_corpus_commands[] = {\n")
   math(EXPR shellclave_command_fixture_last "${shellclave_command_fixture_count} - 1")
   foreach(shellclave_command_fixture_index RANGE 0 ${shellclave_command_fixture_last})
     shellclave_read_command_fixture(shellclave_command_fixture
@@ -285,8 +285,20 @@ if(BUILD_TESTING)
   endforeach()
   file(APPEND "${shellclave_command_fixture_header}"
     "};\n"
-    "#define SHELLGATE_CORPUS_COMMAND_COUNT ${shellclave_command_fixture_count}u\n"
+    "#define SHELLCLAVE_COMMAND_CORPUS_COUNT ${shellclave_command_fixture_count}u\n"
     "#endif\n")
+  # The same sanitized fixture is useful below Shellgate as well: it keeps
+  # the public Shellsplit parsing, canonicalization, and graph surfaces in
+  # agreement over realistic command shapes without ever executing them.
+  shellclave_add_test(shellsplit_corpus_test shellsplit/tests/corpus_test.c shellsplit_test)
+  shellclave_add_test(shellsplit_corpus_production_test
+    shellsplit/tests/corpus_test.c shellsplit)
+  target_include_directories(shellsplit_corpus_test PRIVATE
+    shellsplit/tests "${CMAKE_CURRENT_BINARY_DIR}/tests")
+  target_include_directories(shellsplit_corpus_production_test PRIVATE
+    shellsplit/tests "${CMAKE_CURRENT_BINARY_DIR}/tests")
+  set_tests_properties(shellsplit_corpus_test shellsplit_corpus_production_test
+    PROPERTIES LABELS shellsplit)
   shellclave_add_test(shellgate_corpus_test shellgate/tests/test_corpus.c shellgate_test)
   target_include_directories(shellgate_corpus_test PRIVATE
     "${CMAKE_CURRENT_BINARY_DIR}/tests")

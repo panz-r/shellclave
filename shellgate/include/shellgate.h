@@ -231,19 +231,24 @@ typedef struct {
 
   /* Anomaly detection */
   /*
-   * anomaly_score: bits per command (higher = more anomalous).
-   *                 0.0 for sequences < 3 commands.
+   * anomaly_score: bits per anomaly stage (higher = more anomalous).
+   *                 Stages include supported nested command, backtick,
+   *                 process, heredoc-body, and arithmetic substitutions in
+   *                 Shellsplit's deterministic child-before-parent analysis
+   *                 order. This is distinct from subcommand_count, which
+   *                 describes policy-evaluable graph commands. A redirect-only
+   *                 simple command is one anomaly stage even though it has no
+   *                 policy-evaluable argv. 0.0 for sequences with fewer than
+   *                 three stages.
    *                 INFINITY if model cannot score (e.g., empty model).
    *
    * anomaly_detected: true if anomaly_score is finite and above threshold.
-   *                    Always false for sequences with < 3 commands.
+   *                    Always false for sequences with < 3 stages.
    *
-   * anomaly_score_raw:  score from the raw command name model (bits/cmd).
-   * anomaly_score_type: score from the type sequence model (bits/cmd).
+   * anomaly_score_raw:  score from the raw command-name model (bits/stage).
+   * anomaly_score_type: score from the type-sequence model (bits/stage).
    *                      0.0 if the type model is disabled, or if either the
-   *                      command sequence or the type sequence has < 3 entries.
-   *                      The two sequences come from different parsers, so
-   *                      either can be the shorter one.
+   *                      raw or type sequence has < 3 aligned entries.
    */
   bool anomaly_detected;
   double anomaly_score;
@@ -325,10 +330,14 @@ void sg_violation_config_default(sg_violation_config_t *cfg);
 /* --- EXPANSION CALLBACKS --- */
 
 /* Canonical expansion callbacks receive a borrowed query span and return a
- * borrowed canonical netargv span. A resolved empty expansion may use NULL
- * with length zero. The returned bytes must remain valid until the enclosing
- * sg_gate_evaluate() call returns. They are never reparsed as shell source.
- * Failed or malformed results make sg_gate_evaluate() return SG_ERR_EXPAND.
+ * borrowed canonical netargv span. Neither span need be NUL-terminated; the
+ * resolved netargv may contain embedded NUL bytes and is interpreted only by
+ * its explicit length. On SG_EXPAND_RESOLVED, the callback must provide a
+ * canonical netargv (or NULL with length zero for an empty expansion). The
+ * returned bytes must remain valid until the enclosing sg_gate_evaluate() call
+ * returns. They are never reparsed as shell source. Output values are ignored
+ * for other statuses. Failed or malformed results make sg_gate_evaluate()
+ * return SG_ERR_EXPAND.
  */
 typedef enum {
   SG_EXPAND_UNRESOLVED = 0,
@@ -373,12 +382,12 @@ sg_error_t sg_gate_set_anomaly_update_mode(sg_gate_t *gate,
                                            bool update_only_on_allow);
 
 /*
- * Set whether to skip learning from anomalous commands.
+ * Set whether to skip learning from anomalous stages.
  * If `skip` is true, the model is NOT updated when
  * `anomaly_detected` is true (score exceeds threshold), even if
  * the verdict is ALLOW.  This prevents poisoning the model with
- * suspicious commands.
- * Default: true (skip anomalous commands).
+ * suspicious stages.
+ * Default: true (skip anomalous stages).
  */
 sg_error_t sg_gate_set_anomaly_skip_on_detected(sg_gate_t *gate, bool skip);
 
@@ -401,7 +410,7 @@ sg_error_t sg_gate_set_anomaly_weights(sg_gate_t *gate, double weight_raw,
  *
  * SG_ANOMALY_COMBINE_WEIGHTED (default):
  *   combined = w_raw * score_raw + w_type * score_type
- *   Scores in bits/command; threshold is compared directly.
+ *   Scores in bits/stage; threshold is compared directly.
  *
  * SG_ANOMALY_COMBINE_BAYESIAN:
  *   Each model's score is converted to a log-odds ratio using an empirical
@@ -421,7 +430,7 @@ typedef struct {
   double raw_score;
   double type_score;
   bool detected;
-  size_t command_count;
+  size_t stage_count;
 } sg_anomaly_sequence_score_t;
 
 /* Set the score combination method.  Default: WEIGHTED.
@@ -432,7 +441,7 @@ sg_error_t sg_gate_set_anomaly_combine_mode(sg_gate_t *gate,
 /* Score matching outer netstring sequences using the gate's configured raw
  * and type models. This does not update either model, adaptive thresholds,
  * Bayesian histograms, or caches. Both sequences must be canonical and have
- * the same number of command records. */
+ * the same number of execution-stage records. */
 sg_error_t sg_gate_score_anomaly_netseq(const sg_gate_t *gate,
                                         const char *raw_netseq,
                                         size_t raw_length,
@@ -444,7 +453,7 @@ sg_error_t sg_gate_score_anomaly_netseq(const sg_gate_t *gate,
  * Enable or disable adaptive threshold mode.
  *
  * When adaptive=true:
- *   - A rolling window of `window_size` scores from non-anomalous commands
+ *   - A rolling window of `window_size` scores from non-anomalous stages
  *     is maintained.
  *   - The threshold is computed as mean + k * stddev of the window.
  *   - Until the window is full, the fixed threshold (from
@@ -473,8 +482,8 @@ sg_error_t sg_gate_set_anomaly_k_factor(sg_gate_t *gate, double k);
  * Set the type sequence cache size (default 0 = disabled).
  *
  * When cache_size > 0, an LRU cache stores type sequences for recently
- * evaluated commands, avoiding recomputation by the paired anomaly builder
- * on repeated commands. The cache evicts the least-recently-used entry
+ * evaluated command sources, avoiding recomputation by the paired anomaly
+ * builder on repeated sources. The cache evicts the least-recently-used entry
  * when full.
  *
  * Call before or after sg_gate_enable_anomaly. Setting cache_size=0
@@ -506,7 +515,7 @@ sg_error_t sg_gate_load_anomaly_model(sg_gate_t *gate, const char *path);
 bool sg_gate_anomaly_had_error(const sg_gate_t *gate);
 
 /*
- * Returns the number of unique commands in the anomaly model.
+ * Returns the number of unique anomaly stages in the anomaly model.
  */
 size_t sg_gate_anomaly_vocab_size(const sg_gate_t *gate);
 
@@ -597,6 +606,11 @@ size_t sg_gate_deny_rule_count(const sg_gate_t *gate);
  * A result with `SG_VERDICT_ALLOW_CONDITIONAL` contains a substitution
  * dependency. This API does not assume Bash or any specific executor; the
  * caller decides whether its execution mode can honor that dependency.
+ *
+ * A syntactically valid redirect-only command, such as `>output`, has no argv
+ * and therefore cannot be evaluated by the argv policy model. It returns
+ * `SG_OK` with `SG_VERDICT_UNDETERMINED` and a diagnostic `deny_reason`; it
+ * never inherits authorization from an adjacent command.
  *
  * Returns SG_OK on success, SG_ERR_PARSE for malformed input, SG_ERR_TRUNC if
  * the output buffer or bounded

@@ -277,7 +277,73 @@ void run_semantic_reference_oracles() {
    */
   static const char *const process[] = {"cat", "sort", "cat #path", "sort *"};
   static const char *const quoted[] = {"echo *", "id"};
+  static const char *const composite[] = {"echo", "echo *", "id"};
+  static const char *const redirect_rules[] = {"cat", "cat 0"};
   static const oracle_case cases[] = {
+      {"{ cat; } 1\\\n2<<EOF\nbody\nEOF\n>out",
+       redirect_rules,
+       2,
+       1,
+       {-1},
+       SG_VERDICT_UNDETERMINED,
+       false,
+       false},
+      {"cat 1\\\r\n2<<<body",
+       redirect_rules,
+       2,
+       1,
+       {-1},
+       SG_VERDICT_ALLOW,
+       false,
+       false},
+      {"cat $'x'3>out",
+       redirect_rules,
+       2,
+       1,
+       {-1},
+       SG_VERDICT_UNDETERMINED,
+       false,
+       false},
+      {"{ cat; } >out; >a; >b",
+       redirect_rules,
+       2,
+       1,
+       {-1},
+       SG_VERDICT_UNDETERMINED,
+       false,
+       false},
+      {"cat 0 <<<body",
+       redirect_rules,
+       2,
+       1,
+       {-1},
+       SG_VERDICT_ALLOW,
+       false,
+       false},
+      {"cat 0<<EOF\nwhile true; do :; done\nEOF\n",
+       redirect_rules,
+       2,
+       1,
+       {-1},
+       SG_VERDICT_ALLOW,
+       false,
+       false},
+      {"echo < prefix<(id)",
+       composite,
+       3,
+       2,
+       {-1, -1},
+       SG_VERDICT_ALLOW,
+       false,
+       false},
+      {"echo $(<prefix<(id))",
+       composite,
+       3,
+       2,
+       {-1, -1},
+       SG_VERDICT_ALLOW_CONDITIONAL,
+       true,
+       true},
       {"echo $(id)$(pwd)",
        echo_id_pwd,
        3,
@@ -330,13 +396,191 @@ void run_semantic_reference_oracles() {
         result.subcommand_count != item.command_count ||
         result.requires_substitution_evaluation !=
             item.requires_shell_word_evaluation ||
-        result.has_dynamic_substitution_io != item.has_dynamic_substitution_io)
+        result.has_dynamic_substitution_io !=
+            item.has_dynamic_substitution_io) {
+      fprintf(stderr, "semantic oracle input: %s\n", item.input);
       invariant_failure("semantic oracle verdict or command count mismatch");
+    }
     for (uint32_t i = 0; i < item.command_count; i++)
       if (result.subcommands[i].substitution_consumer_index != item.parents[i])
         invariant_failure("semantic oracle parent relationship mismatch");
     sg_gate_free(gate);
   }
+
+  sg_gate_t *compound_gate = sg_gate_new();
+  if (!compound_gate || sg_gate_set_reject_mask(compound_gate, 0) != SG_OK ||
+      sg_gate_add_allow_cpl(compound_gate, "c3") != SG_OK ||
+      sg_gate_add_allow_cpl(compound_gate, "cat *") != SG_OK ||
+      sg_gate_add_allow_cpl(compound_gate, "mycommand *") != SG_OK)
+    invariant_failure("compound-word oracle gate setup failed");
+  static const char compound_input[] =
+      "$'c'3>out;cat \"x\"${y}z;my\\\r\ncommand value";
+  char compound_buffer[4096];
+  sg_result_t compound_result = {};
+  if (sg_gate_evaluate(compound_gate, compound_input,
+                       sizeof(compound_input) - 1, compound_buffer,
+                       sizeof(compound_buffer), &compound_result) != SG_OK ||
+      compound_result.subcommand_count != 3 ||
+      !compound_result.subcommands[0].netargv ||
+      !compound_result.subcommands[1].netargv ||
+      !compound_result.subcommands[2].netargv ||
+      strcmp(compound_result.subcommands[0].netargv, "2:c3,") != 0 ||
+      strcmp(compound_result.subcommands[1].netargv, "3:cat,6:x${y}z,") != 0 ||
+      strcmp(compound_result.subcommands[2].netargv, "9:mycommand,5:value,") !=
+          0)
+    invariant_failure("compound-word policy netargv oracle mismatch");
+  sg_gate_free(compound_gate);
+
+  /* Shellgate must receive one policy subject only when shell syntax actually
+   * quotes the metacharacter. Keep feature rejection disabled: this oracle
+   * tests structure, while an empty policy deliberately remains undecided. */
+  static const char *const opaque_word_cases[] = {
+      "echo ${value:-left|&right}",
+      "echo ${value:-left>file}",
+      "echo prefix@(left|right)suffix",
+      "echo prefix\\{left\\|right\\}suffix",
+      "echo '[left|right]'",
+      "echo \\|",
+      "echo \\&",
+      "echo \\;",
+      "echo \\|\\&",
+  };
+  sg_gate_t *opaque_word_gate = sg_gate_new();
+  if (!opaque_word_gate ||
+      sg_gate_set_reject_mask(opaque_word_gate, 0) != SG_OK)
+    invariant_failure("opaque-word oracle gate setup failed");
+  for (const char *input : opaque_word_cases) {
+    char buffer[4096] = {};
+    sg_result_t result = {};
+    if (sg_gate_evaluate(opaque_word_gate, input, std::strlen(input), buffer,
+                         sizeof(buffer), &result) != SG_OK ||
+        result.verdict != SG_VERDICT_UNDETERMINED ||
+        result.subcommand_count != 1 || !result.subcommands[0].netargv ||
+        result.truncated)
+      invariant_failure("opaque-word semantic oracle mismatch");
+  }
+  sg_gate_free(opaque_word_gate);
+
+  static const char *const structural_word_cases[] = {
+      "echo prefix{left|right}suffix",
+      "echo [left|right]",
+      "echo [[:alpha:]|]",
+  };
+  sg_gate_t *structural_word_gate = sg_gate_new();
+  if (!structural_word_gate ||
+      sg_gate_set_reject_mask(structural_word_gate, 0) != SG_OK)
+    invariant_failure("structural-word oracle gate setup failed");
+  for (const char *input : structural_word_cases) {
+    char buffer[4096] = {};
+    sg_result_t result = {};
+    if (sg_gate_evaluate(structural_word_gate, input, std::strlen(input),
+                         buffer, sizeof(buffer), &result) != SG_OK ||
+        result.verdict != SG_VERDICT_UNDETERMINED ||
+        result.subcommand_count != 2 || !result.subcommands[0].netargv ||
+        !result.subcommands[1].netargv || result.truncated)
+      invariant_failure("structural-word semantic oracle mismatch");
+  }
+  sg_gate_free(structural_word_gate);
+
+  /* Lexical recognition must never become a policy subject when Shellsplit
+   * cannot construct the command's execution semantics. These fixed cases
+   * intentionally live in the harness rather than the smoke corpus. */
+  static const char *const unmodeled_semantic_cases[] = {
+      "[[ -f /tmp/x ]]",
+      "(( count += 1 ))",
+      "time -p echo x",
+      "printf '%s' $\"localized\"",
+      "echo $( [[ -f /tmp/x ]] )",
+      "{ (( 1 )); }",
+      "cat <<EOF\n$(while true; do :; done)\nEOF\n",
+      "cat <<EOF\n`select item in one; do :; done`\nEOF\n",
+      "cat <<EOF\n${items[0]}\nEOF\n",
+      "cat <<EOF\n$((items[0]))\nEOF\n",
+      "cmd {fd}< <(producer)",
+      "cmd {fd}< prefix<(producer)",
+      "cmd {fd}> >(consumer)",
+      "cmd {fd}> prefix>(consumer)",
+      "cmd {fd}<> <(producer)",
+  };
+  sg_gate_t *unmodeled_gate = sg_gate_new();
+  if (!unmodeled_gate || sg_gate_set_reject_mask(unmodeled_gate, 0) != SG_OK)
+    invariant_failure("unmodeled semantic oracle gate setup failed");
+  for (const char *input : unmodeled_semantic_cases) {
+    char buffer[4096] = {};
+    sg_result_t result = {};
+    if (sg_gate_evaluate(unmodeled_gate, input, std::strlen(input), buffer,
+                         sizeof(buffer), &result) != SG_ERR_PARSE ||
+        result.verdict != SG_VERDICT_REJECT || result.subcommand_count != 1 ||
+        result.truncated)
+      invariant_failure("unmodeled semantic rejection mismatch");
+  }
+  sg_gate_free(unmodeled_gate);
+
+  /* A syntactically valid redirect-only list element has no argv policy
+   * subject. It must remain explicitly undetermined, while preserving normal
+   * policy results for preceding executable commands and learning the full
+   * structural sequence through Shellsplit's empty-stage sentinel. */
+  sg_gate_t *redirect_gate = sg_gate_new();
+  if (!redirect_gate || sg_gate_set_reject_mask(redirect_gate, 0) != SG_OK ||
+      sg_gate_set_stop_mode(redirect_gate, SG_EVAL_ALL) != SG_OK ||
+      sg_gate_enable_anomaly(redirect_gate, 100.0, nullptr) != SG_OK ||
+      sg_gate_set_anomaly_skip_on_detected(redirect_gate, false) != SG_OK ||
+      sg_gate_add_allow_cpl(redirect_gate, "echo ok") != SG_OK)
+    invariant_failure("redirect-only oracle gate setup failed");
+  size_t redirect_vocabulary = sg_gate_anomaly_vocab_size(redirect_gate);
+  static const char *const redirect_reason =
+      "redirect-only shell operation is not argv-policy-evaluable";
+  struct redirect_oracle_case {
+    const char *input;
+    uint32_t command_count;
+  };
+  static const redirect_oracle_case redirect_cases[] = {
+      {">/tmp/fuzz-redirect-only", 0},
+      {"echo ok; >/tmp/fuzz-redirect-only", 1},
+      {"echo ok | >/tmp/fuzz-redirect-only", 1},
+  };
+  for (size_t i = 0; i < std::size(redirect_cases); i++) {
+    const redirect_oracle_case &item = redirect_cases[i];
+    char buffer[4096] = {};
+    sg_result_t result = {};
+    size_t vocabulary_before = sg_gate_anomaly_vocab_size(redirect_gate);
+    if (sg_gate_evaluate(redirect_gate, item.input, std::strlen(item.input),
+                         buffer, sizeof(buffer), &result) != SG_OK ||
+        result.verdict != SG_VERDICT_UNDETERMINED ||
+        result.subcommand_count != item.command_count || !result.deny_reason ||
+        std::strcmp(result.deny_reason, redirect_reason) != 0 ||
+        sg_gate_anomaly_vocab_size(redirect_gate) < vocabulary_before ||
+        (i < 2 &&
+         sg_gate_anomaly_vocab_size(redirect_gate) <= vocabulary_before) ||
+        (item.command_count != 0 &&
+         (!result.subcommands[0].matches ||
+          result.subcommands[0].verdict != SG_VERDICT_ALLOW)))
+      invariant_failure("redirect-only policy oracle mismatch");
+    redirect_vocabulary = sg_gate_anomaly_vocab_size(redirect_gate);
+  }
+  if (redirect_vocabulary == 0)
+    invariant_failure("redirect-only anomaly sentinel was not learned");
+  sg_gate_free(redirect_gate);
+
+  sg_gate_t *strong_redirect_gate = sg_gate_new();
+  if (!strong_redirect_gate ||
+      sg_gate_set_stop_mode(strong_redirect_gate, SG_EVAL_ALL) != SG_OK ||
+      sg_gate_set_reject_mask(strong_redirect_gate, 0) != SG_OK ||
+      sg_gate_add_deny_cpl(strong_redirect_gate, "blocked") != SG_OK)
+    invariant_failure("strong redirect-only oracle gate setup failed");
+  char strong_buffer[4096] = {};
+  sg_result_t strong_result = {};
+  if (sg_gate_evaluate(
+          strong_redirect_gate, "blocked; >/tmp/fuzz-redirect-only",
+          std::strlen("blocked; >/tmp/fuzz-redirect-only"), strong_buffer,
+          sizeof(strong_buffer), &strong_result) != SG_OK ||
+      strong_result.verdict != SG_VERDICT_DENY ||
+      strong_result.subcommand_count != 1 ||
+      strong_result.subcommands[0].verdict != SG_VERDICT_DENY ||
+      !strong_result.deny_reason ||
+      std::strcmp(strong_result.deny_reason, redirect_reason) == 0)
+    invariant_failure("redirect-only verdict priority mismatch");
+  sg_gate_free(strong_redirect_gate);
 }
 
 /* Graph paths preserve source spelling, so quote and escape fragments must not
@@ -392,6 +636,8 @@ void run_brace_group_oracles() {
   const char *document_input = "{ printf one; cat; } <<'EOF'\n}\nEOF";
   const char *crlf_document_input =
       "{ printf one; cat; } <<'EOF'\r\n}\r\nEOF\r\n";
+  const char *named_document_input = "printf x {fd}<<<body";
+  const char *named_group_document_input = "{ cat; } {fd}<<EOF\nbody\nEOF\n";
   sg_gate_t *gate = sg_gate_new();
   if (!gate || sg_gate_set_reject_mask(gate, 0) != SG_OK ||
       sg_gate_set_stop_mode(gate, SG_EVAL_ALL) != SG_OK)
@@ -445,6 +691,24 @@ void run_brace_group_oracles() {
       std::strcmp(result.subcommands[0].netargv, "6:printf,3:one,") != 0 ||
       std::strcmp(result.subcommands[1].netargv, "3:cat,") != 0)
     invariant_failure("brace CRLF document oracle result mismatch");
+
+  memset(&result, 0, sizeof(result));
+  error = sg_gate_evaluate(gate, named_document_input,
+                           std::strlen(named_document_input), buffer,
+                           sizeof(buffer), &result);
+  if (error != SG_OK || result.verdict != SG_VERDICT_ALLOW ||
+      result.subcommand_count != 1 ||
+      std::strcmp(result.subcommands[0].netargv, "6:printf,1:x,") != 0)
+    invariant_failure("named document oracle result mismatch");
+
+  memset(&result, 0, sizeof(result));
+  error = sg_gate_evaluate(gate, named_group_document_input,
+                           std::strlen(named_group_document_input), buffer,
+                           sizeof(buffer), &result);
+  if (error != SG_OK || result.verdict != SG_VERDICT_ALLOW ||
+      result.subcommand_count != 1 ||
+      std::strcmp(result.subcommands[0].netargv, "3:cat,") != 0)
+    invariant_failure("named group document oracle result mismatch");
   sg_gate_free(gate);
 }
 
@@ -878,6 +1142,12 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     };
     run_generated_brace_case(background_group_io_case,
                              sizeof(background_group_io_case));
+    /* Keep the shared generated invalid/strict-only matrix deterministic.
+     * Byte four selects these forms when byte zero is seven. */
+    for (uint8_t selector = 0; selector < 12; selector++) {
+      const uint8_t invalid_case[] = {7, 0, 0, 0, selector};
+      run_generated_brace_case(invalid_case, sizeof(invalid_case));
+    }
     semantic_oracles_checked = true;
   }
   if (size == 0)

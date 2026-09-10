@@ -70,7 +70,10 @@ typedef struct {
   // Classification details (owned copies)
   union {
     struct {
-      char *name;     // For variables: "PATH", "1", etc.
+      /* Static parameter name, such as "PATH", "1", or "?". This is NULL
+       * when the expansion selects a dynamic set of names (for example
+       * `${!prefix*}`); `original` always retains the complete spelling. */
+      char *name;
       bool is_braced; // ${VAR} vs $VAR
       bool is_quoted;
     } var;
@@ -110,6 +113,9 @@ typedef struct {
   bool has_pos_vars;
   bool has_special_vars;
   bool has_globs;
+  /* Includes direct and parameter-expansion-nested command/process
+   * substitutions. A nested substitution remains inside its enclosing
+   * element so diagnostic display elements never overlap. */
   bool has_cmd_subst;
   bool has_abs_paths;
   bool has_rel_paths;
@@ -144,6 +150,11 @@ typedef enum {
   SHELL_ABSTRACT_EOVERFLOW,
 } shell_abstract_status_t;
 
+/* Shellsplit abstracts modeled simple-command lists, pipelines, and
+ * brace/subshell groups. Control compounds (including function declarations,
+ * `select`, and `coproc`), shell-semantic array forms, and unmodeled Bash
+ * `[[ … ]]`, `(( … ))`, `time`, `$"…"`, and `;&` / `;;&` forms return
+ * SHELL_ABSTRACT_EPARSE. */
 shell_abstract_status_t
 shell_abstract_command_parse(const char *command, size_t command_length,
                              shell_abstract_command_t **out);
@@ -186,6 +197,8 @@ bool shell_abstract_command_has_paths(const shell_abstract_command_t *cmd);
 bool shell_abstract_command_has_abs_paths(const shell_abstract_command_t *cmd);
 bool shell_abstract_command_has_rel_paths(const shell_abstract_command_t *cmd);
 bool shell_abstract_command_has_home_paths(const shell_abstract_command_t *cmd);
+/* True for executable direct and parameter-expansion-nested command/process
+ * substitutions, including command substitutions inside double quotes. */
 bool shell_abstract_command_has_cmd_subst(const shell_abstract_command_t *cmd);
 bool shell_abstract_command_has_redirects(const shell_abstract_command_t *cmd);
 bool shell_abstract_command_has_arithmetic(const shell_abstract_command_t *cmd);
