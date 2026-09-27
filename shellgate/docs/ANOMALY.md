@@ -21,8 +21,10 @@ signature rather than becoming n-gram items themselves.
 
 The stage sequence includes every supported simple command reached while the
 shell evaluates one submitted source command: ordinary list members plus
-command substitutions, backticks, process substitutions, unquoted heredoc
-expansion bodies, and command substitutions within arithmetic expansions.
+command substitutions, backticks, process substitutions, and unquoted heredoc
+expansion bodies. Dynamic arithmetic expansions are rejected before anomaly
+sequence construction because their evaluated text can become current-shell
+program source.
 Nested stages precede the enclosing command and sibling stages retain source
 order. This deterministic analysis order makes the raw and type sequences
 align; it does not claim that pipeline members or asynchronous shell work run
@@ -169,7 +171,28 @@ The model learns from execution-stage sequences subject to two flags:
    - When true: model skips learning from anomalous stages
    - When false: model learns from all stages
 
-Both models (raw and type) are always updated together.
+Raw and type models learn as one transaction: preparation validates both
+canonical sequences before either model changes, and a table or resource
+failure rolls back both models. Failed learning is non-fatal when the evaluator
+can still return a result, but it does not update adaptive or Bayesian-CDF
+calibration history.
+
+`SG_OK` means that evaluation completed; it does not by itself mean that a
+sample was learned. Inspect `sg_result_t.anomaly_update` when that distinction
+matters. It reports an applied update, policy/detection skip, or a non-fatal
+limit or memory rejection. This lets trusted offline trainers fail closed when
+a corpus record did not enter the model while production callers retain the
+best-effort evaluation contract. A memory-rejected transactional update leaves
+both models unchanged, and later evaluations may learn normally. The separate
+`sg_gate_anomaly_had_error()` flag remains a sticky diagnostic of that past
+failure, not a signal that learning has stopped.
+
+`anomaly_calibrate` treats its input corpus as trusted: it disables
+anomaly-detected update skipping, requires every accepted source record to
+report an applied update, and fails rather than emitting a partial calibration.
+Its default perturbation seed remains time-based; pass `-r <seed>` to make a
+run reproducible. `-p all` cycles through each viable perturbation kind rather
+than repeatedly selecting swaps.
 
 ### Short Sequences
 
@@ -241,6 +264,10 @@ Prune before saving the model for disk efficiency.
 ## Example Usage
 
 ```c
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+
 sg_gate_t *gate = sg_gate_new();
 sg_anomaly_config_t anomaly_config;
 sg_anomaly_config_default(&anomaly_config);
@@ -248,13 +275,18 @@ sg_gate_enable_anomaly(gate, 5.0, &anomaly_config);
 sg_gate_set_anomaly_adaptive(gate, true, 1000);
 sg_gate_set_anomaly_cache_size(gate, 256);
 
-// Train on normal stage sequences
-for (int i = 0; i < 100; i++) {
-    char buf[8192];
-    sg_result_t r;
-    sg_gate_evaluate(gate, "ls ; cd /tmp ; pwd", 18, buf, sizeof(buf), &r);
-    // r.anomaly_detected tells if sequence is anomalous
-    // r.anomaly_score_raw / r.anomaly_score_type for debugging
+// Train on normal stage sequences. Reuse the one evaluation workspace.
+const char command[] = "ls ; cd /tmp ; pwd";
+size_t buffer_size = sg_gate_evaluate_size_hint(strlen(command));
+char *buf = buffer_size == SIZE_MAX ? NULL : malloc(buffer_size);
+if (buf != NULL) {
+    for (int i = 0; i < 100; i++) {
+        sg_result_t r;
+        sg_gate_evaluate(gate, command, strlen(command), buf, buffer_size, &r);
+        // r.anomaly_detected tells if sequence is anomalous
+        // r.anomaly_score_raw / r.anomaly_score_type for debugging
+    }
+    free(buf);
 }
 
 // Save model

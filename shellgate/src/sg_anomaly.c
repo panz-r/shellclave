@@ -37,8 +37,12 @@
 #ifdef SHELLGATE_TEST_ANOMALY_OPS
 #include "test_sg_failures.h"
 #define SG_ANOMALY_OP_FAILED() sg_test_anomaly_op_should_fail()
+#define SG_ANOMALY_SCORE_FAILURE() sg_test_anomaly_score_take_failure()
+#define SG_ANOMALY_UPDATE_FAILURE() sg_test_anomaly_update_take_failure()
 #else
 #define SG_ANOMALY_OP_FAILED() false
+#define SG_ANOMALY_SCORE_FAILURE() SG_ANOMALY_OK
+#define SG_ANOMALY_UPDATE_FAILURE() SG_ANOMALY_OK
 #endif
 
 /* A key is a concatenation of up to four canonical netstrings. A maximum
@@ -168,7 +172,7 @@ struct sg_anomaly_model {
   double unk_prior;   /* fallback log-prob for unseen commands */
   double kn_discount; /* Kneser-Ney absolute discount (default 0.5) */
   size_t vocab_size;  /* number of unique unigrams */
-  bool oom;           /* true if any allocation failed */
+  bool oom;           /* sticky record of an allocation failure, not poison */
   size_t unk_count;   /* count of unseen commands for probability estimation */
 };
 
@@ -460,6 +464,9 @@ sg_anomaly_model_score_netseq(const sg_anomaly_model_t *model,
       validate_netseq(netseq, netseq_length, false, &count);
   if (status != SG_ANOMALY_OK)
     return status;
+  status = SG_ANOMALY_SCORE_FAILURE();
+  if (status != SG_ANOMALY_OK)
+    return status;
   if (count < 3 || model->total_uni == 0)
     return SG_ANOMALY_OK;
   anomaly_bytes_t window[4];
@@ -490,9 +497,125 @@ sg_anomaly_model_score_netseq(const sg_anomaly_model_t *model,
   return SG_ANOMALY_OK;
 }
 
-sg_anomaly_status_t sg_anomaly_model_update_netseq(sg_anomaly_model_t *model,
-                                                   const char *netseq,
-                                                   size_t netseq_length) {
+typedef enum {
+  ANOMALY_TABLE_UNI,
+  ANOMALY_TABLE_BI,
+  ANOMALY_TABLE_TRI,
+  ANOMALY_TABLE_QUAD,
+  ANOMALY_TABLE_BI_CTX,
+  ANOMALY_TABLE_TRI_CTX,
+  ANOMALY_TABLE_QUAD_CTX,
+} anomaly_table_kind_t;
+
+typedef struct {
+  anomaly_table_kind_t table;
+  uint8_t order;
+  size_t end;
+  bool inserted;
+  bool applied;
+} anomaly_update_action_t;
+
+typedef struct {
+  sg_anomaly_model_t *model;
+  anomaly_bytes_t *items;
+  size_t item_count;
+  size_t item_filled;
+  anomaly_update_action_t *actions;
+  size_t action_count;
+  size_t action_capacity;
+  size_t applied_count;
+  size_t unknown_added;
+} anomaly_update_txn_t;
+
+static ht_table_t *anomaly_table_for_kind(sg_anomaly_model_t *model,
+                                          anomaly_table_kind_t table) {
+  if (!model)
+    return NULL;
+  switch (table) {
+  case ANOMALY_TABLE_UNI:
+    return model->uni;
+  case ANOMALY_TABLE_BI:
+    return model->bi;
+  case ANOMALY_TABLE_TRI:
+    return model->tri;
+  case ANOMALY_TABLE_QUAD:
+    return model->quad;
+  case ANOMALY_TABLE_BI_CTX:
+    return model->bi_ctx;
+  case ANOMALY_TABLE_TRI_CTX:
+    return model->tri_ctx;
+  case ANOMALY_TABLE_QUAD_CTX:
+    return model->quad_ctx;
+  }
+  return NULL;
+}
+
+static size_t *anomaly_total_for_kind(sg_anomaly_model_t *model,
+                                      anomaly_table_kind_t table) {
+  if (!model)
+    return NULL;
+  switch (table) {
+  case ANOMALY_TABLE_UNI:
+    return &model->total_uni;
+  case ANOMALY_TABLE_BI:
+    return &model->total_bi;
+  case ANOMALY_TABLE_TRI:
+    return &model->total_tri;
+  case ANOMALY_TABLE_QUAD:
+    return &model->total_quad;
+  case ANOMALY_TABLE_BI_CTX:
+  case ANOMALY_TABLE_TRI_CTX:
+  case ANOMALY_TABLE_QUAD_CTX:
+    return NULL;
+  }
+  return NULL;
+}
+
+static void anomaly_update_txn_free(anomaly_update_txn_t *txn) {
+  if (!txn)
+    return;
+  free(txn->items);
+  free(txn->actions);
+  *txn = (anomaly_update_txn_t){0};
+}
+
+static bool anomaly_update_txn_add(anomaly_update_txn_t *txn,
+                                   anomaly_table_kind_t table, uint8_t order,
+                                   size_t end) {
+  if (!txn || order == 0 || order > 4 || end + 1 < order ||
+      txn->action_count == txn->action_capacity)
+    return false;
+  txn->actions[txn->action_count++] = (anomaly_update_action_t){
+      .table = table,
+      .order = order,
+      .end = end,
+  };
+  return true;
+}
+
+static bool anomaly_update_txn_key(const anomaly_update_txn_t *txn,
+                                   const anomaly_update_action_t *action,
+                                   char key[SG_ANOMALY_MAX_KEY_LENGTH],
+                                   size_t *key_length) {
+  if (!txn || !action || !key || !key_length ||
+      action->end >= txn->item_count || action->order == 0 ||
+      action->end + 1 < action->order)
+    return false;
+  *key_length =
+      build_key(key, SG_ANOMALY_MAX_KEY_LENGTH,
+                &txn->items[action->end + 1 - action->order], action->order);
+  return *key_length != 0;
+}
+
+/* Build every mutation before touching a table. The journal stores source
+ * views, not duplicated keys, so transaction memory is linear in record count
+ * rather than in the maximum n-gram key size. */
+static sg_anomaly_status_t
+anomaly_update_txn_prepare(sg_anomaly_model_t *model, const char *netseq,
+                           size_t netseq_length, anomaly_update_txn_t *txn) {
+  if (!txn)
+    return SG_ANOMALY_ERR_INVALID;
+  *txn = (anomaly_update_txn_t){.model = model};
   if (!model || !netseq)
     return SG_ANOMALY_ERR_INVALID;
   size_t count = 0;
@@ -500,60 +623,221 @@ sg_anomaly_status_t sg_anomaly_model_update_netseq(sg_anomaly_model_t *model,
       validate_netseq(netseq, netseq_length, true, &count);
   if (status != SG_ANOMALY_OK)
     return status;
-  anomaly_bytes_t window[4];
-  shell_netstring_iter_t iter;
-  if (shell_netstring_iter_init(&iter, netseq, netseq_length) !=
-      SHELL_NETSTRING_OK)
-    return SG_ANOMALY_ERR_FORMAT;
-  shell_netstring_view_t view;
-  size_t seen = 0, ctx_total = 0;
-  while (shell_netstring_iter_next(&iter, &view) == SHELL_NETSTRING_OK) {
-    size_t slot = seen % 4;
-    window[slot] = (anomaly_bytes_t){.data = (const char *)view.payload,
-                                     .length = view.payload_length};
-    const anomaly_bytes_t *curr = &window[slot];
-    char key[SG_ANOMALY_MAX_KEY_LENGTH], ctx[SG_ANOMALY_MAX_KEY_LENGTH];
-    size_t key_len = build_key(key, sizeof(key), curr, 1);
-    if (key_len == 0)
-      return SG_ANOMALY_ERR_LIMIT;
-    if (count_get(model->uni, key, key_len) == 0)
-      model->unk_count++;
-    if (!count_inc(model->uni, key, key_len, 1, &model->total_uni))
-      model->oom = true;
-    seen++;
-    if (seen >= 2) {
-      const anomaly_bytes_t pair[] = {window[(seen - 2) % 4], *curr};
-      key_len = build_key(key, sizeof(key), pair, 2);
-      size_t ctx_len = build_key(ctx, sizeof(ctx), pair, 1);
-      if (key_len == 0 || ctx_len == 0 ||
-          !count_inc(model->bi, key, key_len, 1, &model->total_bi) ||
-          !count_inc(model->bi_ctx, ctx, ctx_len, 1, &ctx_total))
-        model->oom = true;
-    }
-    if (seen >= 3) {
-      const anomaly_bytes_t triple[] = {window[(seen - 3) % 4],
-                                        window[(seen - 2) % 4], *curr};
-      key_len = build_key(key, sizeof(key), triple, 3);
-      size_t ctx_len = build_key(ctx, sizeof(ctx), triple, 2);
-      if (key_len == 0 || ctx_len == 0 ||
-          !count_inc(model->tri, key, key_len, 1, &model->total_tri) ||
-          !count_inc(model->tri_ctx, ctx, ctx_len, 1, &ctx_total))
-        model->oom = true;
-    }
-    if (seen >= 4) {
-      const anomaly_bytes_t quad[] = {window[(seen - 4) % 4],
-                                      window[(seen - 3) % 4],
-                                      window[(seen - 2) % 4], *curr};
-      key_len = build_key(key, sizeof(key), quad, 4);
-      size_t ctx_len = build_key(ctx, sizeof(ctx), quad, 3);
-      if (key_len == 0 || ctx_len == 0 ||
-          !count_inc(model->quad, key, key_len, 1, &model->total_quad) ||
-          !count_inc(model->quad_ctx, ctx, ctx_len, 1, &ctx_total))
-        model->oom = true;
+  if (count > SIZE_MAX / 7 || count > SIZE_MAX / sizeof(*txn->items) ||
+      count * 7 > SIZE_MAX / sizeof(*txn->actions))
+    return SG_ANOMALY_ERR_LIMIT;
+
+  if (count != 0) {
+    /* The model's backing hash tables are independently allocatable. Keep the
+     * per-update journal outside Shellgate's cache-allocation fault seam so a
+     * cache optimization failure cannot masquerade as a failed learn. */
+    txn->items = realloc(NULL, count * sizeof(*txn->items));
+    txn->actions = realloc(NULL, count * 7 * sizeof(*txn->actions));
+    if (!txn->items || !txn->actions) {
+      anomaly_update_txn_free(txn);
+      return SG_ANOMALY_ERR_MEMORY;
     }
   }
-  model->vocab_size = ht_size(model->uni);
-  return model->oom ? SG_ANOMALY_ERR_MEMORY : SG_ANOMALY_OK;
+  txn->item_count = count;
+  txn->action_capacity = count * 7;
+
+  shell_netstring_iter_t iter;
+  if (shell_netstring_iter_init(&iter, netseq, netseq_length) !=
+      SHELL_NETSTRING_OK) {
+    anomaly_update_txn_free(txn);
+    return SG_ANOMALY_ERR_FORMAT;
+  }
+  shell_netstring_view_t view;
+  while (shell_netstring_iter_next(&iter, &view) == SHELL_NETSTRING_OK) {
+    if (txn->item_filled == txn->item_count) {
+      anomaly_update_txn_free(txn);
+      return SG_ANOMALY_ERR_FORMAT;
+    }
+    size_t index = txn->item_filled++;
+    txn->items[index] = (anomaly_bytes_t){.data = (const char *)view.payload,
+                                          .length = view.payload_length};
+    if (!anomaly_update_txn_add(txn, ANOMALY_TABLE_UNI, 1, index) ||
+        (index >= 1 &&
+         (!anomaly_update_txn_add(txn, ANOMALY_TABLE_BI, 2, index) ||
+          !anomaly_update_txn_add(txn, ANOMALY_TABLE_BI_CTX, 1, index - 1))) ||
+        (index >= 2 &&
+         (!anomaly_update_txn_add(txn, ANOMALY_TABLE_TRI, 3, index) ||
+          !anomaly_update_txn_add(txn, ANOMALY_TABLE_TRI_CTX, 2, index - 1))) ||
+        (index >= 3 &&
+         (!anomaly_update_txn_add(txn, ANOMALY_TABLE_QUAD, 4, index) ||
+          !anomaly_update_txn_add(txn, ANOMALY_TABLE_QUAD_CTX, 3,
+                                  index - 1)))) {
+      anomaly_update_txn_free(txn);
+      return SG_ANOMALY_ERR_LIMIT;
+    }
+  }
+  if (txn->item_filled != count) {
+    anomaly_update_txn_free(txn);
+    return SG_ANOMALY_ERR_FORMAT;
+  }
+  for (size_t i = 0; i < txn->action_count; i++) {
+    char key[SG_ANOMALY_MAX_KEY_LENGTH];
+    size_t key_length = 0;
+    if (!anomaly_update_txn_key(txn, &txn->actions[i], key, &key_length)) {
+      anomaly_update_txn_free(txn);
+      return SG_ANOMALY_ERR_LIMIT;
+    }
+  }
+  return SG_ANOMALY_OK;
+}
+
+static void anomaly_update_txn_rollback(anomaly_update_txn_t *txn) {
+  if (!txn || !txn->model)
+    return;
+  while (txn->applied_count != 0) {
+    anomaly_update_action_t *action = &txn->actions[--txn->applied_count];
+    if (!action->applied)
+      continue;
+    char key[SG_ANOMALY_MAX_KEY_LENGTH];
+    size_t key_length = 0;
+    ht_table_t *table = anomaly_table_for_kind(txn->model, action->table);
+    size_t *total = anomaly_total_for_kind(txn->model, action->table);
+    if (!table || !anomaly_update_txn_key(txn, action, key, &key_length))
+      continue;
+    if (action->inserted) {
+      (void)ht_remove(table, key, key_length);
+    } else {
+      bool ok = false;
+      (void)ht_inc_with_hash(table, anomaly_hash_fn(key, key_length, NULL), key,
+                             key_length, -1, &ok);
+    }
+    if (total && *total != 0)
+      (*total)--;
+    action->applied = false;
+  }
+  if (txn->unknown_added <= txn->model->unk_count)
+    txn->model->unk_count -= txn->unknown_added;
+  txn->unknown_added = 0;
+}
+
+static sg_anomaly_status_t anomaly_update_txn_apply(anomaly_update_txn_t *txn) {
+  if (!txn || !txn->model)
+    return SG_ANOMALY_ERR_INVALID;
+  /* `oom` records an earlier failure for diagnostics. Prepared updates are
+   * failure-atomic, so a successfully rolled-back model remains usable. */
+  sg_anomaly_status_t injected = SG_ANOMALY_UPDATE_FAILURE();
+  if (injected != SG_ANOMALY_OK)
+    return injected;
+  for (size_t i = 0; i < txn->action_count; i++) {
+    anomaly_update_action_t *action = &txn->actions[i];
+    char key[SG_ANOMALY_MAX_KEY_LENGTH];
+    size_t key_length = 0;
+    ht_table_t *table = anomaly_table_for_kind(txn->model, action->table);
+    size_t *total = anomaly_total_for_kind(txn->model, action->table);
+    if (!table || !anomaly_update_txn_key(txn, action, key, &key_length))
+      return SG_ANOMALY_ERR_LIMIT;
+    size_t previous_count = count_get(table, key, key_length);
+    if (previous_count >= INT64_MAX || (total && *total == SIZE_MAX) ||
+        (action->table == ANOMALY_TABLE_UNI && previous_count == 0 &&
+         txn->model->unk_count == SIZE_MAX))
+      return SG_ANOMALY_ERR_LIMIT;
+    action->inserted = previous_count == 0;
+    if (SG_ANOMALY_OP_FAILED())
+      return SG_ANOMALY_ERR_MEMORY;
+    bool ok = false;
+    (void)ht_inc_with_hash(table, anomaly_hash_fn(key, key_length, NULL), key,
+                           key_length, 1, &ok);
+    if (!ok)
+      return SG_ANOMALY_ERR_MEMORY;
+    if (total)
+      (*total)++;
+    if (action->table == ANOMALY_TABLE_UNI && action->inserted) {
+      txn->model->unk_count++;
+      txn->unknown_added++;
+    }
+    action->applied = true;
+    txn->applied_count++;
+  }
+  return SG_ANOMALY_OK;
+}
+
+static void anomaly_update_txn_commit(anomaly_update_txn_t *txn) {
+  if (!txn || !txn->model)
+    return;
+  txn->model->vocab_size = ht_size(txn->model->uni);
+  anomaly_update_txn_free(txn);
+}
+
+sg_anomaly_status_t sg_anomaly_model_update_netseq(sg_anomaly_model_t *model,
+                                                   const char *netseq,
+                                                   size_t netseq_length) {
+  anomaly_update_txn_t txn;
+  sg_anomaly_status_t status =
+      anomaly_update_txn_prepare(model, netseq, netseq_length, &txn);
+  if (status != SG_ANOMALY_OK) {
+    if (model && status == SG_ANOMALY_ERR_MEMORY)
+      model->oom = true;
+    return status;
+  }
+  status = anomaly_update_txn_apply(&txn);
+  if (status != SG_ANOMALY_OK) {
+    anomaly_update_txn_rollback(&txn);
+    anomaly_update_txn_free(&txn);
+    if (status == SG_ANOMALY_ERR_MEMORY)
+      model->oom = true;
+    return status;
+  }
+  anomaly_update_txn_commit(&txn);
+  return SG_ANOMALY_OK;
+}
+
+sg_anomaly_status_t sg_anomaly_models_update_netseq_pair(
+    sg_anomaly_model_t *raw, const char *raw_netseq, size_t raw_length,
+    sg_anomaly_model_t *type, const char *type_netseq, size_t type_length) {
+  if (raw == type && raw != NULL)
+    return SG_ANOMALY_ERR_INVALID;
+  anomaly_update_txn_t raw_txn;
+  anomaly_update_txn_t type_txn;
+  sg_anomaly_status_t status =
+      anomaly_update_txn_prepare(raw, raw_netseq, raw_length, &raw_txn);
+  if (status != SG_ANOMALY_OK) {
+    if (raw && status == SG_ANOMALY_ERR_MEMORY)
+      raw->oom = true;
+    return status;
+  }
+  bool have_type = type != NULL;
+  if (have_type) {
+    status =
+        anomaly_update_txn_prepare(type, type_netseq, type_length, &type_txn);
+    if (status != SG_ANOMALY_OK) {
+      anomaly_update_txn_free(&raw_txn);
+      if (status == SG_ANOMALY_ERR_MEMORY)
+        type->oom = true;
+      return status;
+    }
+  } else {
+    type_txn = (anomaly_update_txn_t){0};
+  }
+  if (have_type && raw_txn.item_count != type_txn.item_count) {
+    anomaly_update_txn_free(&type_txn);
+    anomaly_update_txn_free(&raw_txn);
+    return SG_ANOMALY_ERR_FORMAT;
+  }
+  status = anomaly_update_txn_apply(&raw_txn);
+  bool type_attempted = status == SG_ANOMALY_OK && have_type;
+  if (type_attempted)
+    status = anomaly_update_txn_apply(&type_txn);
+  if (status != SG_ANOMALY_OK) {
+    anomaly_update_txn_rollback(&type_txn);
+    anomaly_update_txn_rollback(&raw_txn);
+    anomaly_update_txn_free(&type_txn);
+    anomaly_update_txn_free(&raw_txn);
+    if (status == SG_ANOMALY_ERR_MEMORY) {
+      if (type_attempted)
+        type->oom = true;
+      else
+        raw->oom = true;
+    }
+    return status;
+  }
+  anomaly_update_txn_commit(&type_txn);
+  anomaly_update_txn_commit(&raw_txn);
+  return SG_ANOMALY_OK;
 }
 
 /* --- SERIALISATION --- */

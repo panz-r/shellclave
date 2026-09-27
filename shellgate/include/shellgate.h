@@ -55,8 +55,10 @@ SG_STATIC_ASSERT((SG_REJECT_MASK_DEFAULT & (1u << 9)) != 0,
                  "CASE bit mismatch");
 #undef SG_STATIC_ASSERT
 
-/* Suggested output-buffer capacity. */
-#define SG_BUF_MIN 8192
+/* Baseline capacity for diagnostic-only buffers. A successful evaluation also
+ * needs the bounded depgraph workspace in the same caller buffer; use
+ * sg_gate_evaluate_size_hint() to size ordinary evaluation buffers. */
+#define SG_DIAGNOSTIC_BUF_MIN 8192
 
 /* --- VIOLATION FLAGS --- */
 
@@ -139,8 +141,10 @@ typedef struct {
   size_t netargv_length;
   const char *reject_reason;
 
-  /* Direct I/O plus I/O owned by an enclosing compound group. These are
-   * effective evaluation context counts, not claims of direct command edges. */
+  /* Direct I/O plus I/O owned by an enclosing compound group. write_count also
+   * includes output-file setup that the shell performs before a later redirect
+   * replaces that descriptor. These are effective evaluation context counts,
+   * not claims of direct command byte-flow edges. */
   uint32_t write_count;
   uint32_t read_count;
   uint32_t env_count;
@@ -149,10 +153,13 @@ typedef struct {
    * enclosing compound group that it may inherit. A dynamic FILE-name route
    * alone selects I/O topology and does not set this field. */
   bool requires_substitution_evaluation;
-  /* True when any represented SUBST route reaches this command or an
-   * enclosing compound group. This includes dynamic FILE-name and ordinary
-   * process-substitution I/O; it describes topology, not code execution or
-   * risk. */
+  /* True when any represented dynamic substitution route reaches this command
+   * or an enclosing compound group. This includes dynamic FILE names, ordinary
+   * process-substitution I/O, and named-FD input setup such as
+   * `exec {fd}< <(producer)`. Named-FD output setup is source-only and marks
+   * its downstream substitution consumer instead. Setup is topology only: it
+   * does not by itself set requires_substitution_evaluation or claim code
+   * execution or risk. */
   bool has_dynamic_substitution_io;
   /* Replaces `substitution_parent_index`, removed in 0.7.0: result index of
    * the unique simple-command consumer of this direct producer. A HEREDOC DOC
@@ -182,6 +189,21 @@ typedef struct {
   const char *description;
   const char *detail;
 } sg_violation_t;
+
+/* Outcome of the deferred anomaly-model update for one completed evaluation.
+ * SG_OK describes evaluation and policy handling; inspect this field when a
+ * caller needs to know whether the evaluated sample actually entered the
+ * anomaly model. Resource failures intentionally remain non-fatal to normal
+ * gate evaluation, but are observable here. */
+typedef enum {
+  SG_ANOMALY_UPDATE_NOT_ATTEMPTED = 0,
+  SG_ANOMALY_UPDATE_APPLIED,
+  SG_ANOMALY_UPDATE_SKIPPED_DETECTED,
+  SG_ANOMALY_UPDATE_SKIPPED_VERDICT,
+  SG_ANOMALY_UPDATE_REJECTED_LIMIT,
+  SG_ANOMALY_UPDATE_FAILED_MEMORY,
+  SG_ANOMALY_UPDATE_FAILED_FORMAT,
+} sg_anomaly_update_t;
 
 /* Top-level evaluation result: metadata + pointer array into buffer.
  *
@@ -222,8 +244,8 @@ typedef struct {
    * was not retained in the bounded result prefix. */
   bool requires_substitution_evaluation;
   /* True when any represented dynamic substitution I/O path exists, including
-   * dynamic FILE-name or process-substitution descriptor routes whose endpoint
-   * was not retained in the bounded result prefix. This is not a risk
+   * dynamic FILE names and process-substitution descriptor setup/routes whose
+   * endpoint was not retained in the bounded result prefix. This is not a risk
    * classification. */
   bool has_dynamic_substitution_io;
   uint32_t violation_dropped_count;
@@ -233,9 +255,10 @@ typedef struct {
   /*
    * anomaly_score: bits per anomaly stage (higher = more anomalous).
    *                 Stages include supported nested command, backtick,
-   *                 process, heredoc-body, and arithmetic substitutions in
-   *                 Shellsplit's deterministic child-before-parent analysis
-   *                 order. This is distinct from subcommand_count, which
+   *                 process, and heredoc-body substitutions in Shellsplit's
+   *                 deterministic child-before-parent analysis order. Dynamic
+   *                 arithmetic is rejected before anomaly stage collection.
+   *                 This is distinct from subcommand_count, which
    *                 describes policy-evaluable graph commands. A redirect-only
    *                 simple command is one anomaly stage even though it has no
    *                 policy-evaluable argv. 0.0 for sequences with fewer than
@@ -254,6 +277,9 @@ typedef struct {
   double anomaly_score;
   double anomaly_score_raw;
   double anomaly_score_type;
+  /* See sg_anomaly_update_t. Defaults to NOT_ATTEMPTED when anomaly learning
+   * is disabled, no canonical stages exist, or evaluation did not complete. */
+  sg_anomaly_update_t anomaly_update;
 } sg_result_t;
 
 typedef struct sg_gate sg_gate_t;
@@ -510,7 +536,9 @@ sg_error_t sg_gate_save_anomaly_model(const sg_gate_t *gate, const char *path);
 sg_error_t sg_gate_load_anomaly_model(sg_gate_t *gate, const char *path);
 
 /*
- * Returns true if the anomaly model has had an allocation failure.
+ * Returns true if an anomaly model has had an allocation failure. This is a
+ * sticky diagnostic; a failed, rolled-back update does not disable future
+ * learning. Inspect sg_result_t.anomaly_update for the current evaluation.
  */
 bool sg_gate_anomaly_had_error(const sg_gate_t *gate);
 
@@ -598,10 +626,18 @@ size_t sg_gate_deny_rule_count(const sg_gate_t *gate);
  * `cmd` / `cmd_len` : raw command bytes to evaluate. They need not be
  *   null-terminated, but embedded NUL bytes are rejected.
  *
- * `buf` / `buf_size` : caller-owned output buffer.  All string data
- *   (command texts, reject reasons, suggestions) is packed into this
- *   buffer.  Result pointers reference into it.  `buf` must remain
- *   valid while reading `sg_result_t` string fields.
+ * `buf` / `buf_size` : caller-owned evaluation buffer. Evaluations that reach
+ *   dependency-graph construction reserve a private aligned tail as bounded
+ *   workspace, and their result strings (command texts, reject reasons, and
+ *   suggestions) are packed into the remaining prefix. Parse errors,
+ *   unsupported-feature rejections, and workspace-unavailable diagnostics
+ *   occur before that reservation and may use the complete buffer. No result
+ *   pointer refers to the private tail when it is reserved. `buf` must remain
+ *   valid while reading `sg_result_t` string fields. Use
+ *   sg_gate_evaluate_size_hint() for ordinary successful evaluations. `cmd`,
+ *   `buf`, and `out` must occupy non-overlapping storage: command bytes are
+ *   borrowed during rendering, `buf` is writable result/workspace storage,
+ *   and `out` is writable metadata.
  *
  * A result with `SG_VERDICT_ALLOW_CONDITIONAL` contains a substitution
  * dependency. This API does not assume Bash or any specific executor; the
@@ -612,14 +648,30 @@ size_t sg_gate_deny_rule_count(const sg_gate_t *gate);
  * `SG_OK` with `SG_VERDICT_UNDETERMINED` and a diagnostic `deny_reason`; it
  * never inherits authorization from an adjacent command.
  *
- * Returns SG_OK on success, SG_ERR_PARSE for malformed input, SG_ERR_TRUNC if
- * the output buffer or bounded
- *   subcommand result array was too small (partial results are still valid),
- *   or SG_ERR_INVALID for bad args.  Inspect `truncated`,
+ * Returns SG_OK on success, SG_ERR_PARSE for malformed input, SG_ERR_EXPAND
+ * when an expansion callback fails or returns malformed canonical data,
+ * SG_ERR_MEMORY if the evaluation buffer cannot also hold the bounded
+ * depgraph workspace, SG_ERR_TRUNC if the output buffer or bounded
+ * subcommand result array was too small (partial results are still valid), or
+ * SG_ERR_INVALID for bad args, including overlapping input/output storage.
+ * The error code reports the primary failure: `truncated` independently
+ * reports incomplete result or diagnostic rendering, so it can also be true
+ * with SG_ERR_MEMORY when even the workspace-unavailable diagnostic cannot
+ * fit. SG_ERR_TRUNC always sets `truncated`. Inspect `truncated`,
  * `subcommand_truncated`, and `violation_truncated` to identify the truncated
  * result category. Any truncated result leaves the verdict
  * SG_VERDICT_UNDETERMINED rather than authorizing incomplete output or an
- * evaluated prefix.
+ * evaluated prefix. It also leaves anomaly-model learning and adaptive/CDF
+ * calibration unchanged, so a caller may grow its buffer and retry the same
+ * evaluation without counting that source record twice.
+ *
+ * After argument validation initializes `out`, any fatal operational failure
+ * also leaves its verdict SG_VERDICT_UNDETERMINED; this includes workspace,
+ * expansion, canonical-sequence, and anomaly-model failures. A malformed or
+ * unsupported source command intentionally remains SG_VERDICT_REJECT. Some
+ * internal canonical failures share SG_ERR_PARSE with source parse failures,
+ * so callers must use the result verdict rather than treating that status
+ * alone as an authorization decision.
  *
  * Early-stop modes preserve their prefix verdict. When parsed subcommands
  * remain unevaluated, `short_circuited` is true; callers authorizing the whole
@@ -629,9 +681,10 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
                             char *buf, size_t buf_size, sg_result_t *out);
 
 /*
- * Estimate minimum output buffer size needed for a command of `cmd_len` bytes.
- * Returns an estimate for command text and fixed result metadata; expansion
- * callbacks and violation details can require additional buffer space.
+ * Return a recommended initial evaluation-buffer size for a command of
+ * `cmd_len` bytes. The estimate includes both command/result storage and the
+ * aligned bounded depgraph workspace. Expansion callbacks and violation
+ * details can require additional result-prefix space.
  */
 size_t sg_gate_evaluate_size_hint(size_t cmd_len);
 

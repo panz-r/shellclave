@@ -52,16 +52,21 @@ static bool abstract_parse_parameter_name(const char *text, size_t length,
   if (!text || !out || !after || position >= length)
     return false;
 
+  position = shell_source_skip_escaped_line_endings(text, length, position);
+  if (position >= length)
+    return false;
   unsigned char first = (unsigned char)text[position];
   out->name_start = position;
   if (isdigit(first)) {
     do {
       position++;
+      position = shell_source_skip_escaped_line_endings(text, length, position);
     } while (position < length && isdigit((unsigned char)text[position]));
     out->type = SHELL_ABSTRACT_PV;
   } else if (isalpha(first) || first == '_') {
     do {
       position++;
+      position = shell_source_skip_escaped_line_endings(text, length, position);
     } while (position < length &&
              (isalnum((unsigned char)text[position]) || text[position] == '_'));
     out->type = SHELL_ABSTRACT_EV;
@@ -83,9 +88,12 @@ static bool abstract_parse_variable(const char *text, size_t length,
     return false;
   memset(out, 0, sizeof(*out));
 
-  if (text[1] != '{') {
+  size_t brace = shell_source_logical_following(text, length, 0);
+  if (brace >= length)
+    return false;
+  if (text[brace] != '{') {
     size_t after = 0;
-    return abstract_parse_parameter_name(text, length, 1, out, &after) &&
+    return abstract_parse_parameter_name(text, length, brace, out, &after) &&
            after == length;
   }
 
@@ -93,14 +101,18 @@ static bool abstract_parse_variable(const char *text, size_t length,
     return false;
   out->is_braced = true;
   const size_t body_end = length - 1;
-  size_t position = 2;
+  size_t position = shell_source_logical_following(text, length, brace);
+  if (position >= body_end)
+    return false;
 
   /* `${#}` is the special parameter, while `${#name}` is the length of the
    * named parameter. */
   if (text[position] == '#') {
-    if (++position == body_end) {
+    size_t special_position = position;
+    position = shell_source_logical_following(text, body_end, position);
+    if (position == body_end) {
       out->type = SHELL_ABSTRACT_SV;
-      out->name_start = 2;
+      out->name_start = special_position;
       out->name_length = 1;
       out->has_static_name = true;
       return true;
@@ -113,9 +125,11 @@ static bool abstract_parse_variable(const char *text, size_t length,
    * otherwise still has a concrete source parameter (for example `${!name}`)
    * that is useful metadata, while `original` preserves the indirection. */
   if (text[position] == '!') {
-    if (++position == body_end) {
+    size_t special_position = position;
+    position = shell_source_logical_following(text, body_end, position);
+    if (position == body_end) {
       out->type = SHELL_ABSTRACT_SV;
-      out->name_start = 2;
+      out->name_start = special_position;
       out->name_length = 1;
       out->has_static_name = true;
       return true;
@@ -181,9 +195,38 @@ static char *abstract_variable_name_copy(const char *text, size_t length,
     return NULL;
   if (has_static_name)
     *has_static_name = info.has_static_name;
-  return info.has_static_name ? strndup(text + variable_start + info.name_start,
-                                        info.name_length)
-                              : NULL;
+  if (!info.has_static_name)
+    return NULL;
+  const char *name = text + variable_start + info.name_start;
+  size_t raw_length = info.name_length;
+  size_t logical_length = 0;
+  for (size_t position = 0; position < raw_length;) {
+    size_t next =
+        shell_source_skip_escaped_line_endings(name, raw_length, position);
+    if (next != position) {
+      position = next;
+      continue;
+    }
+    logical_length++;
+    position++;
+  }
+  if (logical_length == raw_length)
+    return strndup(name, raw_length);
+  char *copy = malloc(logical_length + 1);
+  if (!copy)
+    return NULL;
+  size_t written = 0;
+  for (size_t position = 0; position < raw_length;) {
+    size_t next =
+        shell_source_skip_escaped_line_endings(name, raw_length, position);
+    if (next != position) {
+      position = next;
+      continue;
+    }
+    copy[written++] = name[position++];
+  }
+  copy[written] = '\0';
+  return copy;
 }
 
 /**
@@ -1153,9 +1196,15 @@ abstract_command_parse_impl(const char *command, size_t command_length,
       case SHELL_ABSTRACT_CS:
         // Extract content
         if (tok->length >= 4) {
-          if (tok->start[1] == '(') {
+          size_t open = 0;
+          if ((tok->start[0] == '$' &&
+               shell_source_dollar_parentheses_open(tok->start, tok->length, 0,
+                                                    &open)) ||
+              ((tok->start[0] == '<' || tok->start[0] == '>') &&
+               shell_source_process_substitution_open(tok->start, tok->length,
+                                                      0, &open))) {
             elem->data.cmd_subst.content =
-                strndup(tok->start + 2, tok->length - 3);
+                strndup(tok->start + open + 1, tok->length - open - 2);
           } else {
             elem->data.cmd_subst.content =
                 strndup(tok->start + 1, tok->length - 2);

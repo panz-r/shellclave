@@ -11,13 +11,15 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define ARRAY_COUNT(values) (sizeof(values) / sizeof((values)[0]))
-#define EVAL_BUFFER_SIZE 65536u
 
 static int passed;
 static int failed;
+static char *evaluation_buffer;
+static size_t evaluation_buffer_capacity;
 
 /* This is a deliberately exact corpus baseline, not a policy claim. Update
  * it only alongside an intentional fixture or evaluator behavior change. */
@@ -111,12 +113,30 @@ fail:
   return NULL;
 }
 
+static bool ensure_evaluation_buffer(size_t command_length) {
+  size_t hint = sg_gate_evaluate_size_hint(command_length);
+  if (hint == SIZE_MAX)
+    return false;
+  if (hint <= evaluation_buffer_capacity)
+    return true;
+  char *resized = realloc(evaluation_buffer, hint);
+  if (!resized)
+    return false;
+  evaluation_buffer = resized;
+  evaluation_buffer_capacity = hint;
+  return true;
+}
+
+/* Allocate before evaluation so an unexpected diagnostic-capacity regression
+ * is reported as a test failure, never retried after a stateful model update.
+ */
 static sg_error_t evaluate(sg_gate_t *gate, const char *command,
                            sg_result_t *result) {
-  static char buffer[EVAL_BUFFER_SIZE];
-  memset(buffer, 0, sizeof(buffer));
-  return sg_gate_evaluate(gate, command, strlen(command), buffer,
-                          sizeof(buffer), result);
+  if (!command || !ensure_evaluation_buffer(strlen(command)))
+    return SG_ERR_MEMORY;
+  memset(evaluation_buffer, 0, evaluation_buffer_capacity);
+  return sg_gate_evaluate(gate, command, strlen(command), evaluation_buffer,
+                          evaluation_buffer_capacity, result);
 }
 
 static bool netargv_is_valid(const sg_subcommand_result_t *subcommand) {
@@ -339,6 +359,7 @@ int main(void) {
   RUN(policy_and_canonical_results);
   RUN(anomaly_cache_equivalence);
   RUN(corpus_violation_configuration);
+  free(evaluation_buffer);
   printf("\n%d passed, %d failed\n", passed, failed);
   return failed != 0;
 }

@@ -40,6 +40,12 @@ void shell_interop_free(shell_interop_handle_t *handle);
  *   SHELL_FEAT_SUBSHELL_FILE = 0x400 // $(<file)
  *   SHELL_FEAT_PIPELINE       = 0x800 // literal | or |& pipeline construct
  *   SHELL_FEAT_GROUP          = 0x1000 // brace or parenthesized command group
+ *   SHELL_FEAT_BACKGROUND     = 0x2000 // background command or group
+ *   SHELL_FEAT_EXTGLOB        = 0x4000 // Bash extended glob
+ *   SHELL_FEAT_ANSI_C_QUOTE   = 0x8000 // Bash $'...' literal
+ *   SHELL_FEAT_ARRAY           = 0x10000 // Bash array syntax
+ *   SHELL_FEAT_NAMED_FD        = 0x20000 // Bash {name} redirection
+ *   SHELL_FEAT_COMBINED_REDIRECT = 0x40000 // Bash &> or &>> redirect
  *
  * Command types (upper bits of type) describe the operator or structural
  * marker associated with one subcommand. The outer separator takes precedence

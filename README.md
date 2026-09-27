@@ -79,21 +79,26 @@ Evaluate a gate rule:
 
 ```c
 #include <shellgate.h>
+#include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 
 sg_gate_t *gate = sg_gate_new();
 const char command[] = "git status --short";
-char output[4096];
 sg_result_t result;
 if (gate != NULL) {
     sg_error_t error = sg_gate_add_allow_cpl(gate, "git status #opt");
     if (error == SG_OK) {
-        error = sg_gate_evaluate(gate, command, strlen(command), output,
-                        sizeof output, &result);
+        size_t output_size = sg_gate_evaluate_size_hint(strlen(command));
+        char *output = output_size == SIZE_MAX ? NULL : malloc(output_size);
+        error = output == NULL ? SG_ERR_MEMORY :
+            sg_gate_evaluate(gate, command, strlen(command), output,
+                             output_size, &result);
         if (error == SG_OK) {
             printf("verdict: %d\n", result.verdict);
         }
+        free(output);
     }
     sg_gate_free(gate);
 }

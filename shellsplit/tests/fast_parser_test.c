@@ -1,8 +1,10 @@
 #include "../src/shell_source_internal.h"
 #include "../src/shell_tokenizer_full_internal.h"
+#include "depgraph_test_workspace.h"
 #include "shell_abstract.h"
 #include "shell_depgraph.h"
 #include "shell_processor.h"
+#include "shell_sequence.h"
 #include "shell_tokenizer.h"
 #include "shell_tokenizer_full.h"
 #include "shell_transform.h"
@@ -1496,8 +1498,10 @@ static void test_source_scanner_contract(void) {
                                                    &dangling_pending));
   static const char ansi_delimiter[] = "$'EO\\x46'";
   static const char ansi_nul_delimiter[] = "$'E\\0F'";
+  static const char ansi_nul_suffix[] = "$'E\\0F'X$'Y\\0Z'W";
   shell_source_pending_heredoc_t ansi_pending = {0};
   shell_source_pending_heredoc_t ansi_nul_pending = {0};
+  shell_source_pending_heredoc_t ansi_suffix_pending = {0};
   position = 0;
   bool ansi_parsed = shell_source_parse_heredoc_delimiter(
       ansi_delimiter, sizeof(ansi_delimiter) - 1, &position, &ansi_pending);
@@ -1505,6 +1509,10 @@ static void test_source_scanner_contract(void) {
   bool ansi_nul_parsed = shell_source_parse_heredoc_delimiter(
       ansi_nul_delimiter, sizeof(ansi_nul_delimiter) - 1, &position,
       &ansi_nul_pending);
+  position = 0;
+  bool ansi_suffix_parsed = shell_source_parse_heredoc_delimiter(
+      ansi_nul_suffix, sizeof(ansi_nul_suffix) - 1, &position,
+      &ansi_suffix_pending);
   test("source scanner decodes ANSI-C heredoc delimiters",
        ansi_parsed && shell_source_heredoc_delimiter_is_quoted(&ansi_pending) &&
            shell_source_line_is_heredoc_delimiter("EOF\n", 4, 0,
@@ -1514,6 +1522,35 @@ static void test_source_scanner_contract(void) {
                                                   &ansi_nul_pending) &&
            !shell_source_line_is_heredoc_delimiter("EF\n", 3, 0,
                                                    &ansi_nul_pending));
+  test("ANSI-C NUL truncates only its heredoc quote segment",
+       ansi_suffix_parsed &&
+           shell_source_line_is_heredoc_delimiter("EXYW\n", 5, 0,
+                                                  &ansi_suffix_pending) &&
+           !shell_source_line_is_heredoc_delimiter("E\n", 2, 0,
+                                                   &ansi_suffix_pending));
+  bool decoded_nul = false;
+  position = 0;
+  test("ANSI-C NUL probe distinguishes malformed and inactive quotes",
+       !shell_source_ansi_c_quote_has_nul("$'a\\0b'", 7, &position, NULL) &&
+           shell_source_ansi_c_quote_has_nul("$'a\\0b'", 7, &position,
+                                             &decoded_nul) &&
+           decoded_nul && position == 7 &&
+           !shell_source_heredoc_word_has_ansi_c_nul(NULL, 0) &&
+           !shell_source_heredoc_word_has_ansi_c_nul("\\$'a\\0b'", 8) &&
+           !shell_source_heredoc_word_has_ansi_c_nul("\"$'a\\0b'\"", 9) &&
+           !shell_source_heredoc_word_has_ansi_c_nul("'$'a\\0b''", 9) &&
+           !shell_source_heredoc_word_has_ansi_c_nul("$'unterminated", 14) &&
+           shell_source_heredoc_word_has_ansi_c_nul("\\\r\n$'a\\0b'", 10));
+  static const char suffix_source[] =
+      "cat <<$'E\\0F'X\npayload\nE\nEX\nprintf done\n";
+  shell_parse_result_t suffix_result = {0};
+  test(
+      "Fast parser keeps heredoc body until concatenated delimiter",
+      shell_parse_fast(suffix_source, sizeof(suffix_source) - 1, NULL,
+                       &suffix_result) == SHELL_OK &&
+          suffix_result.count == 3 &&
+          suffix_result.cmds[2].start ==
+              (uint32_t)(strstr(suffix_source, "printf done") - suffix_source));
   position = 0;
   test(
       "source scanner rejects malformed heredoc delimiters",
@@ -1612,6 +1649,24 @@ static void test_source_scanner_contract(void) {
               "$(( 'x' + 2))", strlen("$(( 'x' + 2))"), 0, &after) &&
           !shell_source_skip_arithmetic_expansion("$((1 + 2)", 10, 0, &after) &&
           !shell_source_skip_arithmetic_expansion("(1 + 2)", 7, 0, &after));
+  static const char ansi_arithmetic[] = "$(( $'()' + 1 ))";
+  static const char malformed_ansi_arithmetic[] = "$(( $'unterminated ))";
+  test("source scanner balances ANSI-C quotes in arithmetic expansions",
+       shell_source_skip_arithmetic_expansion(
+           ansi_arithmetic, sizeof(ansi_arithmetic) - 1, 0, &after) &&
+           after == sizeof(ansi_arithmetic) - 1 &&
+           !shell_source_skip_arithmetic_expansion(
+               malformed_ansi_arithmetic, sizeof(malformed_ansi_arithmetic) - 1,
+               0, &after));
+  static const char continued_assignment[] = "N\\\r\nAME=value";
+  shell_source_decoded_assignment_t assignment = {0};
+  test("source scanner preserves assignment positions after CRLF continuation",
+       shell_source_scan_decoded_assignment(continued_assignment,
+                                            sizeof(continued_assignment) - 1,
+                                            NULL, NULL, &assignment) &&
+           assignment.name_length == 4 && assignment.source_delimiter &&
+           assignment.equals == 7 && assignment.name_end == 7 &&
+           !assignment.append);
   test(
       "source scanner rejects malformed nested and direct scanner inputs",
       !shell_source_find_balanced_parentheses(NULL, 0, 0, &after) &&
@@ -1896,6 +1951,25 @@ static void test_arithmetic_shift_heredoc_boundary(void) {
           shell_parse_fast(incomplete_heredoc, sizeof(incomplete_heredoc) - 1,
                            &limits, &result) == SHELL_EPARSE &&
           result.status == SHELL_STATUS_ERROR;
+
+  static const char hexadecimal_arithmetic[] = "echo $((0x10 + 2))";
+  memset(&result, 0, sizeof(result));
+  valid = valid &&
+          shell_parse_fast(hexadecimal_arithmetic,
+                           sizeof(hexadecimal_arithmetic) - 1, &limits,
+                           &result) == SHELL_OK &&
+          result.status == SHELL_STATUS_OK && result.count == 1 &&
+          (result.cmds[0].features & SHELL_FEAT_ARITH) != 0 &&
+          (result.cmds[0].features & SHELL_FEAT_VARS) == 0;
+  static const char base_arithmetic[] =
+      "echo $((2#1010 + 8#17 + 16#ff + 36#Z + 37#A + 64#_@))";
+  memset(&result, 0, sizeof(result));
+  valid = valid &&
+          shell_parse_fast(base_arithmetic, sizeof(base_arithmetic) - 1,
+                           &limits, &result) == SHELL_OK &&
+          result.status == SHELL_STATUS_OK && result.count == 1 &&
+          (result.cmds[0].features & SHELL_FEAT_ARITH) != 0 &&
+          (result.cmds[0].features & SHELL_FEAT_VARS) == 0;
   test("Arithmetic shifts remain opaque to heredoc scanning", valid);
 }
 
@@ -2153,6 +2227,40 @@ static void test_source_io_number_contract(void) {
               sizeof(spaced_process_input) - 1;
   test("Shared io_number parser preserves fd bounds and redirect syntax",
        valid);
+}
+
+/* Raw ranges retain terminal physical continuations, but a redirect still owns
+ * the following shell word after lexical continuation removal. Exercise the
+ * shared operand predicate and fast-range construction together. */
+static void test_terminal_redirect_continuation_fast_ranges(void) {
+  static const struct {
+    const char *operator_text;
+    const char *command;
+  } cases[] = {
+      {">\\\n", "printf value >\\\n/tmp/out"},
+      {"<\\\r", "cat <\\\r/tmp/in"},
+      {">>\\\r\n", "printf value >>\\\r\n/tmp/log"},
+      {">|\\\n", "printf value >|\\\n/tmp/force"},
+      {"&>\\\r", "printf value &>\\\r/tmp/both"},
+      {"&>>\\\n", "printf value &>>\\\n/tmp/both-append"},
+      {"<>\\\r", "cat <>\\\r/tmp/read-write"},
+      {"{fd}>\\\n", "exec {fd}>\\\n/tmp/trace"},
+  };
+  shell_limits_t strict = {
+      .max_subcommands = SHELL_MAX_SUBCOMMANDS,
+      .strict_mode = true,
+  };
+  bool valid = true;
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    shell_parse_result_t parsed = {0};
+    valid = valid &&
+            shell_source_redirection_consumes_word(
+                cases[i].operator_text, strlen(cases[i].operator_text)) &&
+            shell_parse_fast(cases[i].command, strlen(cases[i].command),
+                             &strict, &parsed) == SHELL_OK &&
+            parsed.status == SHELL_STATUS_OK && parsed.count == 1;
+  }
+  test("Fast parser preserves terminal redirect continuations", valid);
 }
 
 static void test_quoted_heredoc_delimiter_fast_ranges(void) {
@@ -2696,6 +2804,7 @@ static void test_semantic_classifier_boundaries(void) {
       {"declare arr[${index}]", true},
       {"declare arr[`printf 0`]", true},
       {"declare ar\\\nr[0]", true},
+      {"f\\\nd=shadow declare -a values", true},
       {"de$'clare' -a values", true},
       {"command -$'p' de$'clare' -a values", true},
       {"declare -$'a' values", true},
@@ -3009,7 +3118,227 @@ static void test_strict_structural_rejection(void) {
   test("Strict fast parser rejects malformed structural forms", rejected);
 }
 
+/* These are distinct malformed source boundaries, not merely different
+ * spellings of a trailing operator.  Exercise them through both the shipping
+ * and allocator-instrumented fast-parser targets: redirects must have a word
+ * operand, group prefixes cannot masquerade as command arguments, and a
+ * redirect-only syntax is kept distinct from an executable command range. */
+static void test_strict_redirect_and_group_rejection(void) {
+  static const char *const cases[] = {
+      "command >",
+      "command > (consumer)",
+      "command > | next",
+      "command << (delimiter)",
+      ">output { command; }",
+      ">output (printf x)",
+      "2>>output (printf x)",
+      "{ command }",
+      "command |",
+      "command &&",
+  };
+  const shell_limits_t strict = {
+      .max_subcommands = SHELL_MAX_SUBCOMMANDS,
+      .strict_mode = true,
+  };
+  bool rejected = true;
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    shell_parse_result_t result = {0};
+    shell_error_t status =
+        shell_parse_fast(cases[i], strlen(cases[i]), &strict, &result);
+    bool case_rejected =
+        status == SHELL_EPARSE && result.status == SHELL_STATUS_ERROR;
+    if (!case_rejected)
+      fprintf(stderr,
+              "strict redirect/group case accepted: %s (status=%d, "
+              "parser-status=%d)\n",
+              cases[i], status, result.status);
+    rejected = rejected && case_rejected;
+  }
+  test("Strict fast parser rejects malformed redirect and group boundaries",
+       rejected);
+
+  shell_parse_result_t redirect_only = {0};
+  test("Fast parser retains redirect-only structural syntax",
+       shell_parse_fast(">output", strlen(">output"), &strict,
+                        &redirect_only) == SHELL_OK &&
+           redirect_only.count == 1 &&
+           redirect_only.cmds[0].type == SHELL_TYPE_SIMPLE);
+}
+
+/* Anomaly stage extraction recursively visits executable substitutions.  Its
+ * bound is independent of the top-level fast-parser range bound, so confirm
+ * one outer command with too many inner execution stages fails closed without
+ * exposing a partial canonical sequence. */
+static void test_anomaly_stage_recursion_limit(void) {
+  char nested[4 * SHELL_MAX_SUBCOMMANDS + sizeof("outer $()")] = "outer $(";
+  size_t position = strlen(nested);
+  for (uint32_t i = 0; i < SHELL_MAX_SUBCOMMANDS; i++) {
+    nested[position++] = 'x';
+    if (i + 1 < SHELL_MAX_SUBCOMMANDS)
+      nested[position++] = ';';
+  }
+  nested[position++] = ')';
+  nested[position] = '\0';
+  char *command_netseq = (char *)(uintptr_t)1;
+  size_t count = SIZE_MAX;
+  bool rejected =
+      shell_build_command_netseq(nested, position, NULL, &command_netseq,
+                                 &count) == SHELL_PROCESS_EOUTPUT_LIMIT &&
+      command_netseq == NULL && count == 0;
+  free(command_netseq);
+  test("Anomaly stage extraction bounds recursive substitutions", rejected);
+}
+
 /* --- MAIN --- */
+
+static void test_backtick_command_boundaries(void) {
+  static const struct {
+    const char *source;
+    uint32_t count;
+    uint16_t next_type;
+  } cases[] = {
+      {"echo `printf x; printf y`; next", 2, SHELL_TYPE_SEMICOLON},
+      {"echo `printf x | cat` && next", 2, SHELL_TYPE_AND},
+      {"echo `printf \\`quoted\\` | cat`; next", 2, SHELL_TYPE_SEMICOLON},
+      {"echo `printf x || printf y` # && comment\nnext", 2,
+       SHELL_TYPE_SEMICOLON},
+  };
+  shell_limits_t strict = {
+      .max_subcommands = SHELL_MAX_SUBCOMMANDS,
+      .strict_mode = true,
+  };
+  bool valid = true;
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    shell_parse_result_t result = {0};
+    shell_error_t status = shell_parse_fast(
+        cases[i].source, strlen(cases[i].source), &strict, &result);
+    valid = valid && status == SHELL_OK && result.count == cases[i].count &&
+            result.cmds[0].type == SHELL_TYPE_SUBSTITUTION &&
+            result.cmds[1].type == cases[i].next_type;
+  }
+  shell_parse_result_t result = {0};
+  const char *incomplete = "echo `printf \\`";
+  valid = valid && shell_parse_fast(incomplete, strlen(incomplete), &strict,
+                                    &result) == SHELL_EPARSE;
+  test("Backtick substitution operators stay inside their outer command",
+       valid);
+}
+
+static void test_nested_double_quote_boundaries(void) {
+  static const char *const valid_sources[] = {
+      "echo \"${value:-\"x;y\"}\"",
+      "echo \"$(printf \"x;y\")\"",
+      "echo \"`printf \"x;y\"`\"",
+      "echo \"${value:-\"x;y\"}\"; next",
+  };
+  shell_limits_t strict = {.max_subcommands = SHELL_MAX_SUBCOMMANDS,
+                           .strict_mode = true};
+  bool valid = true;
+  for (size_t i = 0; i < sizeof(valid_sources) / sizeof(valid_sources[0]);
+       i++) {
+    shell_parse_result_t result = {0};
+    const char *source = valid_sources[i];
+    valid = valid &&
+            shell_parse_fast(source, strlen(source), &strict, &result) ==
+                SHELL_OK &&
+            result.count == (i == 3 ? 2u : 1u);
+  }
+  test("Nested quote scopes preserve outer command boundaries", valid);
+
+  const char *quoted_operator = "echo \"${value:-\"x&y\"}\"";
+  shell_parse_result_t feature_result = {0};
+  bool feature_ok = shell_parse_fast(quoted_operator, strlen(quoted_operator),
+                                     &strict, &feature_result) == SHELL_OK &&
+                    feature_result.count == 1 &&
+                    !(feature_result.cmds[0].features & SHELL_FEAT_BACKGROUND);
+  test("Nested quoted ampersand is not a background feature", feature_ok);
+
+  static const char *const parameter_punctuation[] = {
+      "echo ${value:-x&y}",
+      "echo \"${value:-x&y}\"",
+      "echo \"${value:-\"x&y\"}\"",
+  };
+  bool parameter_features_ok = true;
+  for (size_t i = 0;
+       i < sizeof(parameter_punctuation) / sizeof(parameter_punctuation[0]);
+       i++) {
+    shell_parse_result_t parsed = {0};
+    parameter_features_ok &=
+        shell_parse_fast(parameter_punctuation[i],
+                         strlen(parameter_punctuation[i]), &strict,
+                         &parsed) == SHELL_OK &&
+        parsed.count == 1 && (parsed.cmds[0].features & SHELL_FEAT_VARS) != 0 &&
+        (parsed.cmds[0].features & SHELL_FEAT_BACKGROUND) == 0;
+  }
+  test("Parameter-word ampersands do not mark outer background execution",
+       parameter_features_ok);
+
+  const char *nested_background = "echo ${value:-$(sleep 1 & wait)}";
+  shell_parse_result_t nested_features = {0};
+  test("Executable commands inside parameter words retain background metadata",
+       shell_parse_fast(nested_background, strlen(nested_background), &strict,
+                        &nested_features) == SHELL_OK &&
+           nested_features.count == 1 &&
+           (nested_features.cmds[0].features & SHELL_FEAT_SUBSHELL) != 0 &&
+           (nested_features.cmds[0].features & SHELL_FEAT_BACKGROUND) != 0);
+
+  static const struct {
+    const char *source;
+    uint32_t required;
+    uint32_t forbidden;
+  } operand_features[] = {
+      {"echo ${value:-`printf hi`}", SHELL_FEAT_VARS | SHELL_FEAT_SUBSHELL,
+       SHELL_FEAT_BACKGROUND},
+      {"echo ${value:-<(printf hi)}", SHELL_FEAT_VARS | SHELL_FEAT_PROCESS_SUB,
+       SHELL_FEAT_BACKGROUND},
+      {"echo \"${value:-\"<(printf hi)\"}\"", SHELL_FEAT_VARS,
+       SHELL_FEAT_PROCESS_SUB | SHELL_FEAT_BACKGROUND},
+      {"echo ${value:-$(printf one)$(printf two)}",
+       SHELL_FEAT_VARS | SHELL_FEAT_SUBSHELL, SHELL_FEAT_BACKGROUND},
+  };
+  bool operand_features_ok = true;
+  for (size_t i = 0; i < sizeof(operand_features) / sizeof(operand_features[0]);
+       i++) {
+    shell_parse_result_t parsed = {0};
+    operand_features_ok &=
+        shell_parse_fast(operand_features[i].source,
+                         strlen(operand_features[i].source), &strict,
+                         &parsed) == SHELL_OK &&
+        parsed.count == 1 &&
+        (parsed.cmds[0].features & operand_features[i].required) ==
+            operand_features[i].required &&
+        (parsed.cmds[0].features & operand_features[i].forbidden) == 0;
+  }
+  test("Parameter operands retain executable features without leaking syntax",
+       operand_features_ok);
+
+  static const char *const incomplete_nested[] = {
+      "echo \"${value:-\"x;y\"\"",
+      "echo \"$(printf \"x;y\"\"",
+      "echo \"`printf x\"",
+  };
+  bool invalid = true;
+  for (size_t i = 0;
+       i < sizeof(incomplete_nested) / sizeof(incomplete_nested[0]); i++) {
+    shell_parse_result_t rejected = {0};
+    invalid = invalid && shell_parse_fast(incomplete_nested[i],
+                                          strlen(incomplete_nested[i]), &strict,
+                                          &rejected) == SHELL_EPARSE;
+  }
+  test("Incomplete expansions cannot borrow the outer quote delimiter",
+       invalid);
+
+  const char *incomplete = "echo $'foo\\'";
+  shell_parse_result_t result = {0};
+  test("Escaped final ANSI-C apostrophe is not a closing delimiter",
+       shell_parse_fast(incomplete, strlen(incomplete), &strict, &result) ==
+           SHELL_EPARSE);
+  const char *complete = "echo $'foo\\\\'";
+  test("Paired ANSI-C backslashes permit a closing apostrophe",
+       shell_parse_fast(complete, strlen(complete), &strict, &result) ==
+               SHELL_OK &&
+           result.count == 1);
+}
 
 int main(void) {
   printf("=== FAST PARSER API TESTS ===\n");
@@ -3049,6 +3378,7 @@ int main(void) {
   test_group_descriptor_limits();
   test_io_number_bounds();
   test_source_io_number_contract();
+  test_terminal_redirect_continuation_fast_ranges();
   test_quoted_heredoc_delimiter_fast_ranges();
   test_group_context_on_redirect_and_operator_ranges();
   test_list_connector_continuation_metadata();
@@ -3057,11 +3387,15 @@ int main(void) {
   test_named_document_and_negation_metadata();
   test_strict_operator_boundary_matrix();
   test_semantic_classifier_boundaries();
+  test_backtick_command_boundaries();
+  test_nested_double_quote_boundaries();
   test_transform_contract_boundaries();
   test_word_writer_contract_boundaries();
   test_abstract_adapter_contract();
   test_operator_only_rejection();
   test_strict_structural_rejection();
+  test_strict_redirect_and_group_rejection();
+  test_anomaly_stage_recursion_limit();
 
   test_fast_parser_limitations();
 

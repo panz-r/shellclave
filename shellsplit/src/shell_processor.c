@@ -7,6 +7,7 @@
 #include "shell_tokenizer_full.h"
 #include "shell_tokenizer_full_internal.h"
 #include <ctype.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -62,19 +63,424 @@ shell_process_cstring_allocation_size(size_t content_length,
   return SHELL_PROCESS_OK;
 }
 
-static bool redirection_consumes_next_token(const shell_token_t *token) {
-  /* `>|` has no trailing '<' or '>' byte, but it still requires a pathname.
-   * Keep this semantic exception explicit rather than treating the final
-   * spelling byte as the complete redirect grammar. */
-  if (token->type == SHELL_TOKEN_HERESTRING ||
-      token->type == SHELL_TOKEN_REDIRECT_CLOBBER ||
-      token->type == SHELL_TOKEN_REDIRECT_BOTH ||
-      token->type == SHELL_TOKEN_REDIRECT_BOTH_APPEND)
-    return true;
-  if (token->length == 0)
+typedef struct {
+  uint32_t value;
+  size_t length;
+  bool all_digits;
+  bool exact_dash;
+  bool overflow;
+  bool has_nul;
+} static_fd_target_t;
+
+static bool static_fd_target_byte(unsigned char byte, size_t offset,
+                                  void *context) {
+  static_fd_target_t *target = context;
+  if (!target)
     return false;
-  char last = token->start[token->length - 1];
-  return last == '<' || last == '>';
+  if (byte == '\0') {
+    target->has_nul = true;
+    return false;
+  }
+
+  target->length++;
+  if (offset != 0 || byte != '-')
+    target->exact_dash = false;
+  if (byte < '0' || byte > '9') {
+    target->all_digits = false;
+    return true;
+  }
+  if (target->all_digits && !target->overflow) {
+    uint32_t digit = (uint32_t)(byte - '0');
+    if (target->value > ((uint32_t)INT_MAX - digit) / 10u)
+      target->overflow = true;
+    else
+      target->value = target->value * 10u + digit;
+  }
+  return true;
+}
+
+shell_process_fd_target_t
+shell_process_classify_static_fd_target(const char *text, size_t length,
+                                        uint32_t *fd) {
+  if (fd)
+    *fd = SHELL_PROCESS_FD_NONE;
+  if (!text || length == 0 || !fd)
+    return SHELL_PROCESS_FD_TARGET_INVALID;
+
+  /* Bash decides `>&word` after quote decoding.  Stream the complete word:
+   * zero-padded descriptor spellings need not have a bounded source length,
+   * while an all-digit spelling that exceeds INT_MAX is a bad descriptor, not
+   * Bash's legacy combined-output pathname form. */
+  static_fd_target_t target = {
+      .all_digits = true,
+      .exact_dash = true,
+  };
+  size_t decoded_length = 0;
+  if (shell_visit_decoded_word(text, length, static_fd_target_byte, &target,
+                               &decoded_length) != SHELL_PROCESS_OK ||
+      target.has_nul || target.length == 0 || target.length != decoded_length)
+    return SHELL_PROCESS_FD_TARGET_INVALID;
+  if (target.exact_dash)
+    return SHELL_PROCESS_FD_TARGET_CLOSE;
+  if (!target.all_digits)
+    return SHELL_PROCESS_FD_TARGET_PATH;
+  if (target.overflow)
+    return SHELL_PROCESS_FD_TARGET_INVALID;
+  *fd = target.value;
+  return SHELL_PROCESS_FD_TARGET_FD;
+}
+
+typedef struct {
+  bool path_forcing;
+  bool invalid;
+} legacy_output_literal_scan_t;
+
+static void legacy_output_note_literal(legacy_output_literal_scan_t *scan,
+                                       unsigned char byte) {
+  if (!scan)
+    return;
+  if (byte == '\0') {
+    scan->invalid = true;
+    return;
+  }
+  if (byte != '-' && (byte < '0' || byte > '9'))
+    scan->path_forcing = true;
+}
+
+static bool legacy_output_note_ansi_literal(unsigned char byte, void *context) {
+  legacy_output_note_literal(context, byte);
+  return true;
+}
+
+static bool legacy_output_skip_backtick(const char *text, size_t length,
+                                        size_t *position) {
+  if (!text || !position || *position >= length || text[*position] != '`')
+    return false;
+  size_t after = shell_source_skip_quoted_text(text, length, *position, '`');
+  if (after <= *position + 1 || after > length || text[after - 1] != '`')
+    return false;
+  *position = after;
+  return true;
+}
+
+/* Bash resolves `>&word` after expansion and quote removal.  A literal byte
+ * other than a digit or `-` anywhere in that word survives every later
+ * expansion, so the result cannot be an FD number or close marker.  Scan
+ * source fragments rather than the first raw byte: empty quotes, escaped line
+ * continuations, and quoted or escaped literals may precede the proof. */
+static bool legacy_output_has_path_forcing_literal(const char *text,
+                                                   size_t length) {
+  if (!text || length == 0)
+    return false;
+
+  legacy_output_literal_scan_t scan = {0};
+  bool in_single_quote = false;
+  bool in_double_quote = false;
+  bool logical_word_start = true;
+  for (size_t position = 0; position < length;) {
+    char current = text[position];
+    if (in_single_quote) {
+      if (current == '\'') {
+        in_single_quote = false;
+        position++;
+      } else {
+        legacy_output_note_literal(&scan, (unsigned char)current);
+        position++;
+      }
+      continue;
+    }
+
+    if (in_double_quote) {
+      if (current == '"') {
+        in_double_quote = false;
+        position++;
+        continue;
+      }
+      if (current == '\\') {
+        if (position + 1 >= length)
+          return false;
+        char next = text[position + 1];
+        if (next == '$' || next == '`' || next == '"' || next == '\\' ||
+            next == '\n' || next == '\r') {
+          if (next != '\n' && next != '\r')
+            legacy_output_note_literal(&scan, (unsigned char)next);
+          position += 2;
+          if (next == '\r' && position < length && text[position] == '\n')
+            position++;
+          continue;
+        }
+        /* A backslash before an ordinary double-quoted byte is literal. */
+        legacy_output_note_literal(&scan, (unsigned char)'\\');
+        position++;
+        continue;
+      }
+      if (current == '`') {
+        if (!legacy_output_skip_backtick(text, length, &position))
+          return false;
+        continue;
+      }
+      if (current == '$') {
+        size_t after = 0;
+        if (shell_source_dollar_arithmetic_open(text, length, position, NULL)) {
+          if (!shell_source_skip_arithmetic_expansion(text, length, position,
+                                                      &after))
+            return false;
+          position = after;
+          logical_word_start = false;
+          continue;
+        }
+        size_t open = 0;
+        if (shell_source_dollar_parentheses_open(text, length, position,
+                                                 &open)) {
+          if (!shell_source_find_balanced_parentheses(text, length, open,
+                                                      &after))
+            return false;
+          position = after;
+          logical_word_start = false;
+          continue;
+        }
+        if (shell_source_skip_variable_expansion(text, length, position,
+                                                 &after)) {
+          position = after;
+          logical_word_start = false;
+          continue;
+        }
+        /* `$'...'` is not ANSI-C quoting inside double quotes. */
+        legacy_output_note_literal(&scan, (unsigned char)'$');
+        position++;
+        logical_word_start = false;
+        continue;
+      }
+      legacy_output_note_literal(&scan, (unsigned char)current);
+      position++;
+      logical_word_start = false;
+      continue;
+    }
+
+    if (current == '\\') {
+      size_t continued =
+          shell_source_skip_escaped_line_endings(text, length, position);
+      if (continued != position) {
+        position = continued;
+        continue;
+      }
+      if (position + 1 >= length)
+        return false;
+      legacy_output_note_literal(&scan, (unsigned char)text[position + 1]);
+      position += 2;
+      logical_word_start = false;
+      continue;
+    }
+    if (current == '\'') {
+      in_single_quote = true;
+      position++;
+      logical_word_start = false;
+      continue;
+    }
+    if (current == '"') {
+      in_double_quote = true;
+      position++;
+      logical_word_start = false;
+      continue;
+    }
+    if (current == '$' &&
+        shell_source_logical_next_is(text, length, position, '\'', NULL)) {
+      if (!shell_source_decode_ansi_c_quote(
+              text, length, &position, legacy_output_note_ansi_literal, &scan))
+        return false;
+      logical_word_start = false;
+      continue;
+    }
+    if (current == '`') {
+      if (!legacy_output_skip_backtick(text, length, &position))
+        return false;
+      logical_word_start = false;
+      continue;
+    }
+    if (current == '$') {
+      size_t after = 0;
+      if (shell_source_dollar_arithmetic_open(text, length, position, NULL)) {
+        if (!shell_source_skip_arithmetic_expansion(text, length, position,
+                                                    &after))
+          return false;
+        position = after;
+        logical_word_start = false;
+        continue;
+      }
+      size_t open = 0;
+      if (shell_source_dollar_parentheses_open(text, length, position, &open)) {
+        if (!shell_source_find_balanced_parentheses(text, length, open, &after))
+          return false;
+        position = after;
+        logical_word_start = false;
+        continue;
+      }
+      if (shell_source_skip_variable_expansion(text, length, position,
+                                               &after)) {
+        position = after;
+        logical_word_start = false;
+        continue;
+      }
+      legacy_output_note_literal(&scan, (unsigned char)'$');
+      position++;
+      logical_word_start = false;
+      continue;
+    }
+    size_t open = 0;
+    if ((current == '<' || current == '>') &&
+        shell_source_process_substitution_open(text, length, position, &open)) {
+      size_t after = 0;
+      if (!shell_source_find_balanced_parentheses(text, length, open, &after))
+        return false;
+      position = after;
+      logical_word_start = false;
+      continue;
+    }
+    if (current == '~' && logical_word_start) {
+      /* Tilde and its optional user name form one expansion prefix. A slash
+       * after it is still a stable pathname byte and will be observed below. */
+      position++;
+      while (position < length && text[position] != '/')
+        position++;
+      logical_word_start = false;
+      continue;
+    }
+    size_t extglob_after = 0;
+    if (shell_source_skip_extglob(text, length, position, &extglob_after)) {
+      position = extglob_after;
+      logical_word_start = false;
+      continue;
+    }
+    if (current == '*' || current == '?') {
+      position++;
+      logical_word_start = false;
+      continue;
+    }
+    if (current == '[') {
+      size_t after = 0;
+      if (shell_source_skip_glob_bracket(text, length, position, &after)) {
+        position = after;
+        logical_word_start = false;
+        continue;
+      }
+    }
+    if (current == '{') {
+      size_t after = 0;
+      bool expands = false;
+      bool has_dynamic_syntax = false;
+      if (shell_source_brace_expansion_pair(text, length, position, &after,
+                                            &expands, &has_dynamic_syntax) &&
+          (expands || has_dynamic_syntax)) {
+        position = after;
+        logical_word_start = false;
+        continue;
+      }
+    }
+    legacy_output_note_literal(&scan, (unsigned char)current);
+    position++;
+    logical_word_start = false;
+  }
+  return !scan.invalid && !in_single_quote && !in_double_quote &&
+         scan.path_forcing;
+}
+
+shell_process_legacy_redirect_target_t
+shell_process_classify_legacy_output_target(const char *text, size_t length) {
+  if (!text || length == 0)
+    return SHELL_PROCESS_LEGACY_REDIRECT_UNSUPPORTED;
+  /* Process substitution itself has pathname semantics.  The direction only
+   * determines whether that pathname is usable as an I/O stream, not whether
+   * the legacy `>&word` spelling denotes combined output. */
+  if (shell_source_word_is_process_substitution(text, length))
+    return SHELL_PROCESS_LEGACY_REDIRECT_PATH;
+
+  size_t name_start = 0;
+  size_t name_end = 0;
+  if (shell_source_parse_named_fd_parameter(text, 0, length, &name_start,
+                                            &name_end))
+    return SHELL_PROCESS_LEGACY_REDIRECT_DUPLICATION;
+
+  if (!shell_source_redirect_word_has_dynamic_path_syntax(text, length)) {
+    uint32_t ignored = SHELL_PROCESS_FD_NONE;
+    switch (shell_process_classify_static_fd_target(text, length, &ignored)) {
+    case SHELL_PROCESS_FD_TARGET_PATH:
+      return SHELL_PROCESS_LEGACY_REDIRECT_PATH;
+    case SHELL_PROCESS_FD_TARGET_FD:
+    case SHELL_PROCESS_FD_TARGET_CLOSE:
+      return SHELL_PROCESS_LEGACY_REDIRECT_DUPLICATION;
+    case SHELL_PROCESS_FD_TARGET_INVALID:
+    default:
+      /* An empty, NUL-bearing, or out-of-range target cannot be either a
+       * concrete pathname or a descriptor operation. Do not let a later
+       * consumer reinterpret an execution-time redirect failure as a valid
+       * combined-output route. */
+      return SHELL_PROCESS_LEGACY_REDIRECT_UNSUPPORTED;
+    }
+  }
+
+  /* A literal non-descriptor fragment makes every expanded result a pathname,
+   * regardless of whether the remaining dynamic syntax is a parameter,
+   * arithmetic expression, substitution, glob, or brace expansion. */
+  if (legacy_output_has_path_forcing_literal(text, length))
+    return SHELL_PROCESS_LEGACY_REDIRECT_PATH;
+  return SHELL_PROCESS_LEGACY_REDIRECT_UNSUPPORTED;
+}
+
+static bool token_is_legacy_output_redirect(const shell_token_t *token) {
+  if (!token || token->type != SHELL_TOKEN_REDIRECT_ERR)
+    return false;
+  size_t after = 0;
+  uint32_t descriptor = 0;
+  shell_source_io_number_t number = shell_source_parse_io_number(
+      token->start, 0, token->length, &after, &descriptor);
+  if (number == SHELL_SOURCE_IO_NUMBER_OVERFLOW || after + 2 != token->length ||
+      token->start[after] != '>' || token->start[after + 1] != '&')
+    return false;
+  return number == SHELL_SOURCE_IO_NUMBER_NONE ||
+         (number == SHELL_SOURCE_IO_NUMBER_VALID && descriptor == 1);
+}
+
+/* The full tokenizer preserves `>&word` as descriptor syntax. Decide its
+ * legacy pathname interpretation before any canonical API can treat an
+ * ambiguous command substitution as an ordinary redirect operand. */
+static bool validate_legacy_output_redirects(const shell_command_t *commands,
+                                             size_t count) {
+  if (!commands)
+    return count == 0;
+  for (size_t i = 0; i < count; i++) {
+    const shell_command_t *command = &commands[i];
+    for (size_t token_index = 0; token_index < command->token_count;
+         token_index++) {
+      if (!token_is_legacy_output_redirect(&command->tokens[token_index]))
+        continue;
+      size_t operand_index = token_index + 1;
+      if (operand_index == command->token_count ||
+          is_shell_operator_token(&command->tokens[operand_index]))
+        return false;
+      const shell_token_t *first = &command->tokens[operand_index];
+      if (first->position > SIZE_MAX - first->length)
+        return false;
+      size_t operand_end = first->position + first->length;
+      while (++operand_index < command->token_count) {
+        const shell_token_t *next = &command->tokens[operand_index];
+        if (is_shell_operator_token(next) ||
+            next->position > SIZE_MAX - next->length ||
+            !shell_tokenizer_token_continues_word(next, operand_end))
+          break;
+        operand_end = next->position + next->length;
+      }
+      if (shell_process_classify_legacy_output_target(
+              first->start, operand_end - first->position) ==
+          SHELL_PROCESS_LEGACY_REDIRECT_UNSUPPORTED)
+        return false;
+    }
+  }
+  return true;
+}
+
+static bool redirection_consumes_next_token(const shell_token_t *token) {
+  return token &&
+         shell_source_redirection_consumes_word(token->start, token->length);
 }
 
 static bool
@@ -165,6 +571,12 @@ shell_processed_commands_parse(const char *command_line, size_t command_length,
     return SHELL_PROCESS_EPARSE;
   }
   if (shell_tokenizer_has_unsupported_semantics(command_line, command_length)) {
+    shell_commands_free(*commands, *count);
+    *commands = NULL;
+    *count = 0;
+    return SHELL_PROCESS_EPARSE;
+  }
+  if (!validate_legacy_output_redirects(*commands, *count)) {
     shell_commands_free(*commands, *count);
     *commands = NULL;
     *count = 0;
@@ -378,7 +790,20 @@ static bool anomaly_substitution_content(const char *source,
   if (!source || !content || !content_length || start >= after ||
       after > source_length)
     return false;
-  size_t prefix = kind == SHELL_SOURCE_SUBST_BACKTICK ? 1 : 2;
+  size_t prefix = 1;
+  if (kind != SHELL_SOURCE_SUBST_BACKTICK) {
+    size_t open = 0;
+    bool valid = (kind == SHELL_SOURCE_SUBST_COMMAND &&
+                  shell_source_dollar_parentheses_open(source, source_length,
+                                                       start, &open)) ||
+                 ((kind == SHELL_SOURCE_SUBST_PROCESS_INPUT ||
+                   kind == SHELL_SOURCE_SUBST_PROCESS_OUTPUT) &&
+                  shell_source_process_substitution_open(source, source_length,
+                                                         start, &open));
+    if (!valid)
+      return false;
+    prefix = open - start + 1;
+  }
   size_t suffix = kind == SHELL_SOURCE_SUBST_BACKTICK ? 1 : 1;
   if (after - start < prefix + suffix)
     return false;
@@ -447,46 +872,53 @@ anomaly_collect_heredoc_substitutions(const char *source, size_t source_length,
     const char *content = NULL;
     size_t content_length = 0;
     if (c == '`') {
-      after =
-          shell_source_skip_quoted_text(source, source_length, position, '`');
-      if (after <= position + 1 || after > source_length ||
-          source[after - 1] != '`') {
+      if (!shell_source_skip_complete_backtick(source, source_length, position,
+                                               &after)) {
         collect->status = SHELL_PROCESS_EPARSE;
         return false;
       }
       content = source + position + 1;
       content_length = after - position - 2;
-    } else if (c == '$' && position + 1 < source_length &&
-               source[position + 1] == '{') {
-      if (!shell_source_skip_parameter_expansion(source, source_length,
-                                                 position, &after) ||
-          after <= position + 3 || after > source_length ||
-          source[after - 1] != '}') {
-        collect->status = SHELL_PROCESS_EPARSE;
-        return false;
-      }
-      if (!anomaly_collect_heredoc_substitutions(source + position + 2,
-                                                 after - position - 3, collect))
-        return false;
-      position = after - 1;
-      continue;
-    } else if (c == '$' && position + 1 < source_length &&
-               source[position + 1] == '(') {
-      if (position + 2 < source_length && source[position + 2] == '(') {
-        if (!shell_source_skip_arithmetic_expansion(source, source_length,
-                                                    position, &after) ||
-            after <= position + 5 || after > source_length) {
+    } else if (c == '$') {
+      size_t parameter_open = 0;
+      if (shell_source_logical_next_is(source, source_length, position, '{',
+                                       &parameter_open)) {
+        if (!shell_source_skip_parameter_expansion(source, source_length,
+                                                   position, &after) ||
+            after <= parameter_open + 1 || after > source_length ||
+            source[after - 1] != '}') {
           collect->status = SHELL_PROCESS_EPARSE;
           return false;
         }
-        if (!anomaly_collect_substitutions(
-                source + position + 3, after - position - 5, false, collect))
+        if (!anomaly_collect_heredoc_substitutions(source + parameter_open + 1,
+                                                   after - parameter_open - 2,
+                                                   collect))
           return false;
         position = after - 1;
         continue;
       }
-      if (!shell_source_find_balanced_parentheses(source, source_length,
-                                                  position + 1, &after) ||
+      size_t open = 0;
+      if (!shell_source_dollar_parentheses_open(source, source_length, position,
+                                                &open))
+        continue;
+      if (shell_source_dollar_arithmetic_open(source, source_length, position,
+                                              NULL)) {
+        size_t content_start = 0;
+        size_t content_length = 0;
+        if (!shell_source_arithmetic_content(source, source_length, position,
+                                             &content_start, &content_length,
+                                             &after)) {
+          collect->status = SHELL_PROCESS_EPARSE;
+          return false;
+        }
+        if (!anomaly_collect_substitutions(source + content_start,
+                                           content_length, false, collect))
+          return false;
+        position = after - 1;
+        continue;
+      }
+      if (!shell_source_find_balanced_parentheses(source, source_length, open,
+                                                  &after) ||
           !anomaly_substitution_content(source, source_length, position, after,
                                         SHELL_SOURCE_SUBST_COMMAND, &content,
                                         &content_length)) {
@@ -529,8 +961,13 @@ static bool anomaly_heredoc_operator_position(const shell_token_t *token,
                                               size_t *operator_position) {
   if (!token || !operator_position || token->type != SHELL_TOKEN_HEREDOC)
     return false;
-  for (size_t i = 0; i + 1 < token->length; i++) {
-    if (token->start[i] == '<' && token->start[i + 1] == '<') {
+  for (size_t i = 0; i < token->length; i++) {
+    size_t after = 0;
+    if (token->start[i] == '<' &&
+        shell_source_match_logical_punctuation(token->start, token->length, i,
+                                               "<<", &after) &&
+        !shell_source_match_logical_punctuation(token->start, token->length, i,
+                                                "<<<", NULL)) {
       *operator_position = token->position + i;
       return true;
     }
@@ -569,12 +1006,16 @@ anomaly_collect_command_substitutions(const char *source, size_t source_length,
       heredoc_after = after;
       continue;
     }
-    if (token->type == SHELL_TOKEN_ARITHMETIC && token->length >= 5 &&
-        token->start[0] == '$' && token->start[1] == '(' &&
-        token->start[2] == '(' && token->start[token->length - 2] == ')' &&
-        token->start[token->length - 1] == ')') {
-      if (!anomaly_collect_substitutions(token->start + 3, token->length - 5,
-                                         false, collect))
+    if (token->type == SHELL_TOKEN_ARITHMETIC) {
+      size_t content_start = 0;
+      size_t content_length = 0;
+      size_t after = 0;
+      if (!shell_source_arithmetic_content(token->start, token->length, 0,
+                                           &content_start, &content_length,
+                                           &after) ||
+          after != token->length ||
+          !anomaly_collect_substitutions(token->start + content_start,
+                                         content_length, false, collect))
         return false;
       continue;
     }
@@ -727,7 +1168,8 @@ static shell_process_status_t decode_shell_word(const char *text, size_t length,
   char quote = 0;
   for (size_t i = 0; i < length; i++) {
     char c = text[i];
-    if (quote == 0 && c == '$' && i + 1 < length && text[i + 1] == '\'') {
+    if (quote == 0 && c == '$' &&
+        shell_source_logical_next_is(text, length, i, '\'', NULL)) {
       size_t position = i;
       shell_process_status_t status =
           ansi_decode_quote(text, length, &position, sink);
@@ -789,6 +1231,18 @@ shell_visit_decoded_word(const char *text, size_t length,
   return status;
 }
 
+bool shell_visit_static_word(const char *text, size_t length,
+                             shell_decoded_word_visitor_t visitor,
+                             void *context, size_t *decoded_length) {
+  if (decoded_length)
+    *decoded_length = 0;
+  if (!text || !decoded_length ||
+      shell_source_word_has_dynamic_syntax(text, length))
+    return false;
+  return shell_visit_decoded_word(text, length, visitor, context,
+                                  decoded_length) == SHELL_PROCESS_OK;
+}
+
 shell_process_status_t shell_measure_decoded_word(const char *text,
                                                   size_t length,
                                                   size_t *decoded_length) {
@@ -833,7 +1287,8 @@ render_processed_word(const char *text, size_t length, char *destination,
   char quote = '\0';
   for (size_t i = 0; i < length;) {
     char c = text[i];
-    if (quote == '\0' && c == '$' && i + 1 < length && text[i + 1] == '\'') {
+    if (quote == '\0' && c == '$' &&
+        shell_source_logical_next_is(text, length, i, '\'', NULL)) {
       decoded_word_sink_t sink = {
           .destination = destination,
           .destination_size = destination_size,
@@ -859,18 +1314,24 @@ render_processed_word(const char *text, size_t length, char *destination,
 
     size_t dynamic_after = i;
     bool dynamic = false;
-    if (quote != '\'' && c == '$' && i + 1 < length && text[i + 1] == '(') {
-      if (i + 2 < length && text[i + 2] == '(') {
+    if (quote != '\'' && c == '$' &&
+        shell_source_dollar_parentheses_open(text, length, i, NULL)) {
+      if (shell_source_dollar_arithmetic_open(text, length, i, NULL)) {
         dynamic = shell_source_skip_arithmetic_expansion(text, length, i,
                                                          &dynamic_after);
       } else {
-        dynamic = shell_source_find_balanced_parentheses(text, length, i + 1,
-                                                         &dynamic_after);
+        size_t open = 0;
+        dynamic =
+            shell_source_dollar_parentheses_open(text, length, i, &open) &&
+            shell_source_find_balanced_parentheses(text, length, open,
+                                                   &dynamic_after);
       }
-    } else if (quote == '\0' && (c == '<' || c == '>') && i + 1 < length &&
-               text[i + 1] == '(') {
-      dynamic = shell_source_find_balanced_parentheses(text, length, i + 1,
-                                                       &dynamic_after);
+    } else if (quote == '\0' && (c == '<' || c == '>')) {
+      size_t open = 0;
+      dynamic =
+          shell_source_process_substitution_open(text, length, i, &open) &&
+          shell_source_find_balanced_parentheses(text, length, open,
+                                                 &dynamic_after);
     } else if (quote != '\'' && c == '`') {
       dynamic_after = shell_source_skip_quoted_text(text, length, i, '`');
       dynamic = dynamic_after > i + 1 && dynamic_after <= length &&
@@ -1084,10 +1545,12 @@ static bool process_single_command_internal(shell_command_t *basic_cmd,
         redirection_operand_end = token->position + token->length;
         continue;
       }
+      /* A redirection operator separates its operand from every earlier
+       * command word.  Once its operand ends, the next word necessarily
+       * starts a new command token; only the ordinary path below may merge
+       * adjacent word fragments. */
       consume_redirection_operand = false;
-      if (!have_command_word ||
-          !shell_tokenizer_token_continues_word(token, command_word_end))
-        command_count++;
+      command_count++;
       have_command_word = true;
       command_word_end = token->position + token->length;
     } else {
@@ -1140,17 +1603,6 @@ static bool process_single_command_internal(shell_command_t *basic_cmd,
         continue;
       }
       consume_redirection_operand = false;
-      if (command_index > 0) {
-        shell_token_t *previous = &command_tokens[command_index - 1];
-        size_t previous_end = previous->position + previous->length;
-        if (shell_tokenizer_token_continues_word(token, previous_end)) {
-          previous->length =
-              token->position + token->length - previous->position;
-          previous->is_quoted = previous->is_quoted || token->is_quoted;
-          previous->is_escaped = previous->is_escaped || token->is_escaped;
-          continue;
-        }
-      }
       command_tokens[command_index++] = *token;
     } else {
       if (command_index > 0) {
@@ -1209,11 +1661,36 @@ static bool own_token_text(shell_command_t *basic_cmd,
                        info->original_command, command_length);
 }
 
-shell_process_status_t
-shell_process_command(const char *command_line, size_t command_length,
-                      const shell_process_limits_t *limits,
-                      shell_command_info_t **command_infos,
-                      size_t *command_count) {
+/* Byte limits describe the flat records returned to the caller.  Structural
+ * group syntax is intentionally absent from this array, so it must not affect
+ * the accounting here. */
+static shell_process_status_t
+validate_flat_command_limits(const shell_process_limits_t *limits,
+                             const shell_command_info_t *infos,
+                             size_t info_count) {
+  size_t total_output = 0;
+  for (size_t i = 0; i < info_count; i++) {
+    size_t length = strlen(infos[i].original_command);
+    if (limits && length > limits->max_string_bytes)
+      return SHELL_PROCESS_EOUTPUT_LIMIT;
+    if (length > SIZE_MAX - total_output)
+      return SHELL_PROCESS_EOVERFLOW;
+    total_output += length;
+  }
+  if (limits && total_output > limits->max_total_bytes)
+    return SHELL_PROCESS_EOUTPUT_LIMIT;
+  return SHELL_PROCESS_OK;
+}
+
+/* Preserve the legacy full-tokenizer behavior for callers that deliberately
+ * inspect incomplete parenthesized input. Complete compound sources use the
+ * strict processor below so a group-owned redirect never leaks into a flat
+ * executable record. */
+static shell_process_status_t
+shell_process_command_lexical(const char *command_line, size_t command_length,
+                              const shell_process_limits_t *limits,
+                              shell_command_info_t **command_infos,
+                              size_t *command_count) {
   if (!command_infos || !command_count)
     return SHELL_PROCESS_EINPUT;
   *command_infos = NULL;
@@ -1224,8 +1701,20 @@ shell_process_command(const char *command_line, size_t command_length,
   shell_command_t *basic_commands;
   size_t basic_count;
 
+  shell_process_limits_t parse_limits = {0};
+  const shell_process_limits_t *structural_limits = NULL;
+  if (limits) {
+    /* Structural parsing must still enforce the group-I/O cap, but byte limits
+     * describe returned records.  A trailing compound redirect is structure,
+     * not flat output. */
+    parse_limits = *limits;
+    parse_limits.max_string_bytes = SIZE_MAX;
+    parse_limits.max_total_bytes = SIZE_MAX;
+    structural_limits = &parse_limits;
+  }
   shell_process_status_t parsed = shell_processed_commands_parse(
-      command_line, command_length, limits, &basic_commands, &basic_count);
+      command_line, command_length, structural_limits, &basic_commands,
+      &basic_count);
   if (parsed != SHELL_PROCESS_OK)
     return parsed;
 
@@ -1270,27 +1759,12 @@ shell_process_command(const char *command_line, size_t command_length,
     info_count++;
   }
 
-  if (limits) {
-    size_t total_output = 0;
-    for (size_t i = 0; i < info_count; i++) {
-      size_t original_length = strlen(infos[i].original_command);
-      if (original_length > limits->max_string_bytes) {
-        shell_command_infos_free(infos, info_count);
-        shell_commands_free(basic_commands, basic_count);
-        return SHELL_PROCESS_EOUTPUT_LIMIT;
-      }
-      if (original_length > SIZE_MAX - total_output) {
-        shell_command_infos_free(infos, info_count);
-        shell_commands_free(basic_commands, basic_count);
-        return SHELL_PROCESS_EOVERFLOW;
-      }
-      total_output += original_length;
-    }
-    if (total_output > limits->max_total_bytes) {
-      shell_command_infos_free(infos, info_count);
-      shell_commands_free(basic_commands, basic_count);
-      return SHELL_PROCESS_EOUTPUT_LIMIT;
-    }
+  shell_process_status_t status =
+      validate_flat_command_limits(limits, infos, info_count);
+  if (status != SHELL_PROCESS_OK) {
+    shell_command_infos_free(infos, info_count);
+    shell_commands_free(basic_commands, basic_count);
+    return status;
   }
 
   shell_commands_free(basic_commands, basic_count);
@@ -1326,16 +1800,16 @@ static bool fast_range_is_heredoc_body(const char *input, uint32_t length,
     uint32_t marker_start = parsed->cmds[marker_index].start;
     if (marker_start < prior_body_after)
       continue;
-    uint32_t header_end =
-        (uint32_t)shell_source_line_end(input, length, marker_start);
-    if (header_end == length)
+    uint32_t marker_end = marker_start + parsed->cmds[marker_index].len;
+    if (marker_end >= length)
       return false;
     size_t after = length;
     bool complete = false;
     if (!shell_source_skip_heredoc_sequence(input, length, marker_start, &after,
                                             &complete))
       return false;
-    uint32_t body_start = header_end + 1;
+    uint32_t body_start =
+        (uint32_t)shell_source_next_line(input, length, marker_end);
     if (!complete)
       return range_start >= body_start;
     if (range_start >= body_start && range_start < after)
@@ -1411,11 +1885,25 @@ append_group_io_op(shell_processed_commands_t *result,
 }
 
 static bool parse_group_fd(const char *input, uint32_t start, uint32_t end,
-                           uint32_t *fd, uint32_t *after) {
+                           uint32_t *fd, uint32_t *after, uint32_t *name_start,
+                           uint32_t *name_end) {
+  if (name_start)
+    *name_start = 0;
+  if (name_end)
+    *name_end = 0;
   size_t position = 0;
   if (shell_source_parse_named_fd_redirect(input, start, end, &position)) {
+    size_t name_position = 0;
+    if (!shell_source_parse_named_fd(input, start, position, &name_position) ||
+        name_position < start + 3 || name_position > position ||
+        input[name_position - 1] != '}')
+      return false;
     *fd = SHELL_PROCESS_FD_NAMED;
     *after = (uint32_t)position;
+    if (name_start)
+      *name_start = start;
+    if (name_end)
+      *name_end = (uint32_t)name_position;
     return true;
   }
   uint32_t descriptor = 0;
@@ -1426,6 +1914,25 @@ static bool parse_group_fd(const char *input, uint32_t start, uint32_t end,
   *fd = io_number == SHELL_SOURCE_IO_NUMBER_VALID ? descriptor
                                                   : SHELL_PROCESS_FD_NONE;
   *after = (uint32_t)position;
+  return true;
+}
+
+/* A descriptor value stored by Bash's `{name}` allocator is referenced by an
+ * ordinary parameter expansion in a duplication redirect.  Keep this helper
+ * deliberately narrow: only a complete `$name` or `${name}` word, optionally
+ * wrapped in one pair of double quotes, has a statically meaningful identity.
+ * General parameter evaluation belongs to a later value-analysis layer. */
+static bool parse_group_fd_parameter(const char *input, uint32_t start,
+                                     uint32_t end, uint32_t *name_start,
+                                     uint32_t *name_end) {
+  size_t parsed_start = 0;
+  size_t parsed_end = 0;
+  if (!shell_source_parse_named_fd_parameter(input, start, end, &parsed_start,
+                                             &parsed_end) ||
+      parsed_start > UINT32_MAX || parsed_end > UINT32_MAX)
+    return false;
+  *name_start = (uint32_t)parsed_start;
+  *name_end = (uint32_t)parsed_end;
   return true;
 }
 
@@ -1450,40 +1957,61 @@ scan_group_redirects(const char *input, uint32_t start, uint32_t end,
     *found = true;
 
     uint32_t fd = SHELL_PROCESS_FD_NONE;
-    if (!parse_group_fd(input, position, end, &fd, &position))
-      return SHELL_PROCESS_EPARSE;
-    bool combined = position + 1 < end && input[position] == '&' &&
-                    input[position + 1] == '>';
+    uint32_t fd_name_start = 0;
+    uint32_t fd_name_end = 0;
+    size_t combined_after = source_start;
+    bool combined_append = shell_source_match_logical_punctuation(
+        input, end, source_start, "&>>", &combined_after);
+    bool combined =
+        combined_append || shell_source_match_logical_punctuation(
+                               input, end, source_start, "&>", &combined_after);
     if (combined) {
       /* Bash supplies no descriptor-prefixed form of `&>` or `&>>`: a
        * preceding numeric or named token is an ordinary shell word.  The
        * shared scanner rejects such a group tail before this point; retain
        * this check so a future scanner change cannot emit a false fd-2 route.
        */
-      if (fd != SHELL_PROCESS_FD_NONE)
-        return SHELL_PROCESS_EPARSE;
-      position++;
+      position = (uint32_t)combined_after;
+    } else if (!parse_group_fd(input, position, end, &fd, &position,
+                               &fd_name_start, &fd_name_end)) {
+      return SHELL_PROCESS_EPARSE;
     }
-    if (position >= end || (input[position] != '<' && input[position] != '>'))
+    position =
+        (uint32_t)shell_source_skip_escaped_line_endings(input, end, position);
+    if (!combined &&
+        (position >= end || (input[position] != '<' && input[position] != '>')))
       return *found ? SHELL_PROCESS_OK : SHELL_PROCESS_EPARSE;
-    char direction = input[position++];
-    bool append = direction == '>' && position < end && input[position] == '>';
-    if (append)
+    char direction = combined ? '>' : input[position++];
+    position =
+        (uint32_t)shell_source_skip_escaped_line_endings(input, end, position);
+    bool append = combined_append || (!combined && direction == '>' &&
+                                      position < end && input[position] == '>');
+    if (!combined && append)
       position++;
+    position =
+        (uint32_t)shell_source_skip_escaped_line_endings(input, end, position);
     bool clobber =
         direction == '>' && !append && position < end && input[position] == '|';
     if (clobber)
       position++;
+    position =
+        (uint32_t)shell_source_skip_escaped_line_endings(input, end, position);
     bool read_write =
         direction == '<' && position < end && input[position] == '>';
     if (read_write)
       position++;
+    position =
+        (uint32_t)shell_source_skip_escaped_line_endings(input, end, position);
     bool heredoc = direction == '<' && position < end && input[position] == '<';
     if (heredoc)
       position++;
+    position =
+        (uint32_t)shell_source_skip_escaped_line_endings(input, end, position);
     bool herestring = heredoc && position < end && input[position] == '<';
     if (herestring)
       position++;
+    position =
+        (uint32_t)shell_source_skip_escaped_line_endings(input, end, position);
     if (heredoc && !herestring && position < end && input[position] == '-')
       position++;
     uint32_t operand_start =
@@ -1491,7 +2019,22 @@ scan_group_redirects(const char *input, uint32_t start, uint32_t end,
     uint32_t operand_end = (uint32_t)redirect_end;
     if (operand_start >= operand_end || operand_end > end)
       return SHELL_PROCESS_EPARSE;
-    if (!heredoc && fd == SHELL_PROCESS_FD_NAMED && input[operand_start] == '&')
+    uint32_t legacy_operand_start =
+        (uint32_t)shell_source_skip_inline_continuations(input, end,
+                                                         operand_start + 1);
+    bool legacy_combined =
+        !combined && direction == '>' && !append && !read_write &&
+        (fd == SHELL_PROCESS_FD_NONE || fd == 1) &&
+        operand_start < operand_end && input[operand_start] == '&' &&
+        legacy_operand_start < operand_end &&
+        shell_process_classify_legacy_output_target(
+            input + legacy_operand_start, operand_end - legacy_operand_start) ==
+            SHELL_PROCESS_LEGACY_REDIRECT_PATH;
+    if (legacy_combined) {
+      operand_start = legacy_operand_start;
+      combined = true;
+    }
+    if (!heredoc && (append || read_write) && input[operand_start] == '&')
       return SHELL_PROCESS_EPARSE;
 
     shell_group_io_op_t op = {
@@ -1502,6 +2045,10 @@ scan_group_redirects(const char *input, uint32_t start, uint32_t end,
         .operand_end = operand_end,
         .fd = fd == SHELL_PROCESS_FD_NONE ? (direction == '<' ? 0 : 1) : fd,
         .target_fd = SHELL_PROCESS_FD_NONE,
+        .fd_name_start = fd_name_start,
+        .fd_name_end = fd_name_end,
+        .target_name_start = 0,
+        .target_name_end = 0,
         .kind = read_write
                     ? SHELL_GROUP_IO_READ_WRITE_FILE
                     : (direction == '<' ? SHELL_GROUP_IO_READ_FILE
@@ -1512,8 +2059,6 @@ scan_group_redirects(const char *input, uint32_t start, uint32_t end,
       op.kind = herestring ? SHELL_GROUP_IO_HERESTRING : SHELL_GROUP_IO_HEREDOC;
     if (!heredoc && shell_source_word_is_process_substitution(
                         input + operand_start, operand_end - operand_start)) {
-      if (fd == SHELL_PROCESS_FD_NAMED)
-        return SHELL_PROCESS_EPARSE;
       bool operand_input = input[operand_start] == '<';
       if (read_write)
         op.kind = operand_input ? SHELL_GROUP_IO_PROCESS_SUB_RW_IN
@@ -1524,21 +2069,50 @@ scan_group_redirects(const char *input, uint32_t start, uint32_t end,
       else
         op.kind = SHELL_GROUP_IO_PROCESS_SUB_UNROUTED;
     }
-    if (!heredoc && operand_end - operand_start >= 2 &&
-        input[operand_start] == '&') {
-      if (input[operand_start + 1] == '-' && operand_end == operand_start + 2)
-        op.kind = SHELL_GROUP_IO_CLOSE_FD;
-      else {
+    if (!legacy_combined && !heredoc && !append && !read_write &&
+        operand_end - operand_start >= 2 && input[operand_start] == '&') {
+      /* The duplication operand is one shell word after `&`. Horizontal
+       * whitespace and escaped physical line endings are lexical trivia here,
+       * just as they are after every other redirect operator. Keep
+       * operand_start unchanged so callers retain the complete source span. */
+      uint32_t target_start = (uint32_t)shell_source_skip_inline_continuations(
+          input, operand_end, (size_t)operand_start + 1);
+      if (target_start >= operand_end)
+        return SHELL_PROCESS_EPARSE;
+      bool close_target =
+          input[target_start] == '-' && target_start + 1 == operand_end;
+      if (!close_target) {
         uint32_t target_after = 0;
         uint32_t target_fd = SHELL_PROCESS_FD_NONE;
-        if (!parse_group_fd(input, operand_start + 1, operand_end, &target_fd,
-                            &target_after) ||
-            target_fd == SHELL_PROCESS_FD_NONE ||
-            target_fd == SHELL_PROCESS_FD_NAMED || target_after != operand_end)
+        if (!parse_group_fd(input, target_start, operand_end, &target_fd,
+                            &target_after, NULL, NULL) ||
+            target_fd == SHELL_PROCESS_FD_NAMED ||
+            target_after != operand_end) {
+          uint32_t target_name_start = 0;
+          uint32_t target_name_end = 0;
+          if (parse_group_fd_parameter(input, target_start, operand_end,
+                                       &target_name_start, &target_name_end)) {
+            op.target_name_start = target_name_start;
+            op.target_name_end = target_name_end;
+          } else {
+            shell_process_fd_target_t target =
+                shell_process_classify_static_fd_target(
+                    input + target_start, operand_end - target_start,
+                    &target_fd);
+            if (target == SHELL_PROCESS_FD_TARGET_CLOSE)
+              close_target = true;
+            else if (target == SHELL_PROCESS_FD_TARGET_FD)
+              op.target_fd = target_fd;
+            else
+              return SHELL_PROCESS_EPARSE;
+          }
+        } else if (target_fd == SHELL_PROCESS_FD_NONE) {
           return SHELL_PROCESS_EPARSE;
-        op.kind = SHELL_GROUP_IO_DUP_FD;
-        op.target_fd = target_fd;
+        } else {
+          op.target_fd = target_fd;
+        }
       }
+      op.kind = close_target ? SHELL_GROUP_IO_CLOSE_FD : SHELL_GROUP_IO_DUP_FD;
     }
     shell_process_status_t status =
         append_group_io_op(result, &op, max_group_io_ops);
@@ -1617,11 +2191,23 @@ static shell_process_status_t scan_group_io(const char *input, uint32_t length,
   uint32_t before = (uint32_t)shell_source_skip_list_trivia_backward(
       input, length, group->start);
   uint32_t pipe_start = before;
-  if (before >= 2 && input[before - 2] == '|' && input[before - 1] == '&') {
-    pipe_start = before - 2;
-  } else if (before > 0 && input[before - 1] == '|' &&
-             (before < 2 || input[before - 2] != '|')) {
-    pipe_start = before - 1;
+  uint32_t logical_before =
+      (uint32_t)shell_source_skip_escaped_line_endings_backward(input, length,
+                                                                before);
+  if (logical_before > 0 && input[logical_before - 1] == '&') {
+    uint32_t ampersand = logical_before - 1;
+    uint32_t before_ampersand =
+        (uint32_t)shell_source_skip_escaped_line_endings_backward(input, length,
+                                                                  ampersand);
+    if (before_ampersand > 0 && input[before_ampersand - 1] == '|')
+      pipe_start = before_ampersand - 1;
+  } else if (logical_before > 0 && input[logical_before - 1] == '|') {
+    uint32_t pipe = logical_before - 1;
+    uint32_t before_pipe =
+        (uint32_t)shell_source_skip_escaped_line_endings_backward(input, length,
+                                                                  pipe);
+    if (before_pipe == 0 || input[before_pipe - 1] != '|')
+      pipe_start = pipe;
   }
   if (pipe_start != before) {
     shell_process_status_t status =
@@ -1647,20 +2233,26 @@ static shell_process_status_t scan_group_io(const char *input, uint32_t length,
     after =
         (uint32_t)shell_source_skip_inline_continuations(input, length, after);
   }
-  if (after < length && input[after] == '|' &&
-      (after + 1 == length || input[after + 1] != '|')) {
-    bool pipe_stderr = after + 1 < length && input[after + 1] == '&';
-    status = append_group_relation(
-        result, group_index,
-        pipe_stderr ? SHELL_GROUP_IO_PIPE_OUTPUT_STDERR
-                    : SHELL_GROUP_IO_PIPE_OUTPUT,
-        after, after + (pipe_stderr ? 2u : 1u), max_group_io_ops);
+  size_t pipe_after = after;
+  bool pipe_stderr = shell_source_match_logical_punctuation(
+      input, length, after, "|&", &pipe_after);
+  bool logical_or =
+      shell_source_match_logical_punctuation(input, length, after, "||", NULL);
+  if (after < length && input[after] == '|' && !logical_or) {
+    if (!pipe_stderr)
+      pipe_after = after + 1;
+    status =
+        append_group_relation(result, group_index,
+                              pipe_stderr ? SHELL_GROUP_IO_PIPE_OUTPUT_STDERR
+                                          : SHELL_GROUP_IO_PIPE_OUTPUT,
+                              after, (uint32_t)pipe_after, max_group_io_ops);
     if (status != SHELL_PROCESS_OK)
       return status;
-    after += pipe_stderr ? 2 : 1;
+    after = (uint32_t)pipe_after;
   }
-  if (after < length && input[after] == '&' &&
-      (after + 1 == length || input[after + 1] != '&'))
+  bool logical_and =
+      shell_source_match_logical_punctuation(input, length, after, "&&", NULL);
+  if (after < length && input[after] == '&' && !logical_and)
     return append_group_relation(result, group_index, SHELL_GROUP_IO_BACKGROUND,
                                  after, after + 1, max_group_io_ops);
   return SHELL_PROCESS_OK;
@@ -1740,7 +2332,8 @@ range_length_with_trailing_continuation(const char *command_line,
 static shell_process_status_t
 process_fast_range(const char *command_line, size_t command_length,
                    const shell_parse_result_t *parsed, uint32_t range_index,
-                   shell_command_info_t *info, bool *produced) {
+                   bool retain_empty, shell_command_info_t *info,
+                   bool *produced) {
   *produced = false;
   const shell_range_t *range = &parsed->cmds[range_index];
   size_t range_length = range_length_with_trailing_continuation(
@@ -1749,7 +2342,7 @@ process_fast_range(const char *command_line, size_t command_length,
     return SHELL_PROCESS_EPARSE;
   shell_command_info_t *one = NULL;
   size_t count = 0;
-  shell_process_status_t status = shell_process_command(
+  shell_process_status_t status = shell_process_command_lexical(
       command_line + range->start, range_length, NULL, &one, &count);
   if (status != SHELL_PROCESS_OK)
     return status;
@@ -1757,7 +2350,7 @@ process_fast_range(const char *command_line, size_t command_length,
     shell_command_infos_free(one, count);
     return SHELL_PROCESS_EPARSE;
   }
-  if (one[0].command_token_count == 0) {
+  if (one[0].command_token_count == 0 && !retain_empty) {
     shell_command_infos_free(one, count);
     return SHELL_PROCESS_OK;
   }
@@ -1848,7 +2441,7 @@ shell_process_commands(const char *command_line, size_t command_length,
     bool produced = false;
     shell_command_info_t info = {0};
     shell_process_status_t status = process_fast_range(
-        command_line, command_length, &parsed, i, &info, &produced);
+        command_line, command_length, &parsed, i, false, &info, &produced);
     if (status != SHELL_PROCESS_OK) {
       clear_command_info(&info);
       shell_processed_commands_free(result);
@@ -1923,6 +2516,155 @@ shell_process_commands(const char *command_line, size_t command_length,
     return SHELL_PROCESS_EOUTPUT_LIMIT;
   }
   return SHELL_PROCESS_OK;
+}
+
+/* The flat result has no group-I/O side channel. Preserve its long-standing
+ * redirection feature flags on the final enclosed command without putting a
+ * group-owned redirect operand back into that command's source or argv. */
+static void
+flat_apply_group_redirect_flags(shell_processed_commands_t *processed) {
+  if (!processed)
+    return;
+  for (size_t i = 0; i < processed->group_io_op_count; i++) {
+    const shell_group_io_op_t *op = &processed->group_io_ops[i];
+    if (op->group_index >= processed->group_count ||
+        op->kind == SHELL_GROUP_IO_PIPE_INPUT ||
+        op->kind == SHELL_GROUP_IO_PIPE_OUTPUT ||
+        op->kind == SHELL_GROUP_IO_PIPE_OUTPUT_STDERR ||
+        op->kind == SHELL_GROUP_IO_BACKGROUND)
+      continue;
+    const shell_group_t *group = &processed->groups[op->group_index];
+    if (group->command_count == 0 ||
+        group->first_command >= processed->command_count ||
+        group->command_count > processed->command_count - group->first_command)
+      continue;
+    shell_command_info_t *info =
+        &processed->commands[group->first_command + group->command_count - 1];
+    info->has_redirections = true;
+    info->has_error_redirection = info->has_error_redirection || op->fd == 2;
+  }
+}
+
+/* Complete-group processing supplies correctly trimmed executable records.
+ * Revisit only validated executable fast ranges to retain independent
+ * redirect-only stages for the legacy flat result. Re-tokenizing the complete
+ * source is incorrect here: the tolerant lexer deliberately lets an empty
+ * record beside a group inherit structural `}` and group-owned redirect text.
+ * Every nonempty range must correspond to exactly one structured record,
+ * otherwise returning either representation would silently lose semantics. */
+static shell_process_status_t flat_build_group_records(
+    const char *command_line, size_t command_length,
+    const shell_parse_result_t *parsed, shell_processed_commands_t *processed,
+    shell_command_info_t **command_infos, size_t *command_count) {
+  if (!command_line || !parsed || !processed || !command_infos ||
+      !command_count)
+    return SHELL_PROCESS_EINPUT;
+  *command_infos = NULL;
+  *command_count = 0;
+  if (parsed->count > SHELL_MAX_SUBCOMMANDS)
+    return SHELL_PROCESS_EOVERFLOW;
+  if (parsed->count == 0)
+    return processed->command_count == 0 ? SHELL_PROCESS_OK
+                                         : SHELL_PROCESS_EPARSE;
+
+  shell_command_info_t *flat = calloc(parsed->count, sizeof(*flat));
+  if (!flat)
+    return SHELL_PROCESS_ENOMEM;
+
+  size_t strict_index = 0;
+  size_t flat_count = 0;
+  shell_process_status_t status = SHELL_PROCESS_OK;
+  for (uint32_t i = 0; i < parsed->count; i++) {
+    if (!range_is_executable(command_line, (uint32_t)command_length, parsed, i))
+      continue;
+
+    shell_command_info_t range_info = {0};
+    bool produced = false;
+    status = process_fast_range(command_line, command_length, parsed, i, true,
+                                &range_info, &produced);
+    if (status != SHELL_PROCESS_OK)
+      goto fail;
+    if (!produced) {
+      status = SHELL_PROCESS_EPARSE;
+      goto fail;
+    }
+    if (range_info.command_token_count == 0) {
+      flat[flat_count++] = range_info;
+      continue;
+    }
+
+    clear_command_info(&range_info);
+    if (strict_index >= processed->command_count) {
+      status = SHELL_PROCESS_EPARSE;
+      goto fail;
+    }
+    flat[flat_count++] = processed->commands[strict_index];
+    processed->commands[strict_index++] = (shell_command_info_t){0};
+  }
+  if (strict_index != processed->command_count) {
+    status = SHELL_PROCESS_EPARSE;
+    goto fail;
+  }
+
+  free(processed->commands);
+  processed->commands = NULL;
+  processed->command_count = 0;
+  *command_infos = flat;
+  *command_count = flat_count;
+  return SHELL_PROCESS_OK;
+
+fail:
+  shell_command_infos_free(flat, flat_count);
+  return status;
+}
+
+shell_process_status_t
+shell_process_command(const char *command_line, size_t command_length,
+                      const shell_process_limits_t *limits,
+                      shell_command_info_t **command_infos,
+                      size_t *command_count) {
+  if (!command_infos || !command_count)
+    return SHELL_PROCESS_EINPUT;
+  *command_infos = NULL;
+  *command_count = 0;
+  if (!command_line)
+    return SHELL_PROCESS_EINPUT;
+
+  /* A complete group is a single shell execution endpoint, while the old
+   * lexical tokenizer retains its trailing redirect words in the final body
+   * record. Reuse the strict processor for that one shape: it reports only
+   * executable records and applies byte limits after structural group I/O is
+   * removed. Inputs outside the complete supported subset retain the legacy
+   * lexical contract below, notably tolerant incomplete parenthesized input.
+   */
+  shell_parse_result_t parsed = {0};
+  if (shell_process_validate_supported_source(command_line, command_length,
+                                              &parsed) == SHELL_PROCESS_OK &&
+      parsed.group_count != 0) {
+    shell_processed_commands_t processed = {0};
+    shell_process_status_t status = shell_process_commands(
+        command_line, command_length, limits, &processed);
+    if (status != SHELL_PROCESS_OK)
+      return status;
+    flat_apply_group_redirect_flags(&processed);
+    status = flat_build_group_records(command_line, command_length, &parsed,
+                                      &processed, command_infos, command_count);
+    if (status == SHELL_PROCESS_OK)
+      status =
+          validate_flat_command_limits(limits, *command_infos, *command_count);
+    if (status != SHELL_PROCESS_OK) {
+      shell_command_infos_free(*command_infos, *command_count);
+      *command_infos = NULL;
+      *command_count = 0;
+      shell_processed_commands_free(&processed);
+      return status;
+    }
+    shell_processed_commands_free(&processed);
+    return SHELL_PROCESS_OK;
+  }
+
+  return shell_process_command_lexical(command_line, command_length, limits,
+                                       command_infos, command_count);
 }
 
 void shell_command_infos_free(shell_command_info_t *infos, size_t count) {

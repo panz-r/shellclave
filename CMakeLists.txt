@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(Shellclave VERSION 0.9.0 LANGUAGES C CXX)
+project(Shellclave VERSION 0.10.0 LANGUAGES C CXX)
 
 if(PROJECT_IS_TOP_LEVEL)
   set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -194,6 +194,23 @@ endfunction()
 if(BUILD_TESTING)
   file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests")
   file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests/headers")
+  find_program(SHELLCLAVE_BASH_EXECUTABLE NAMES bash)
+  if(SHELLCLAVE_BASH_EXECUTABLE)
+    add_test(NAME shellsplit_bash_ansi_nul_semantics
+      COMMAND ${CMAKE_COMMAND}
+        -DSHELLCLAVE_BASH=${SHELLCLAVE_BASH_EXECUTABLE}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/test_bash_ansi_nul_semantics.cmake)
+    set_tests_properties(shellsplit_bash_ansi_nul_semantics PROPERTIES
+      LABELS shellsplit)
+    add_test(NAME shellsplit_bash_named_fd_semantics
+      COMMAND ${CMAKE_COMMAND}
+        -DSHELLCLAVE_BASH=${SHELLCLAVE_BASH_EXECUTABLE}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/test_bash_named_fd_semantics.cmake)
+    set_tests_properties(shellsplit_bash_named_fd_semantics PROPERTIES
+      LABELS shellsplit
+      ENVIRONMENT
+        "BASH_ENV=${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/bash_env_enable_lastpipe.sh;BASHOPTS=lastpipe;SHELLOPTS=braceexpand:hashall:interactive-comments:monitor;POSIXLY_CORRECT=1")
+  endif()
   shellclave_add_test(shellsplit_tokenizer_test shellsplit/tests/tokenizer_test.c shellsplit_test)
   shellclave_add_test(shellsplit_fast_parser_test shellsplit/tests/fast_parser_test.c shellsplit_test)
   # Exercise the same public parser contract against the shipping library. The
@@ -438,6 +455,16 @@ if(SHELLCLAVE_BUILD_TOOLS)
     shellclave_project_target(${tool})
     target_link_libraries(${tool} PRIVATE shellgate)
   endforeach()
+  if(BUILD_TESTING)
+    add_test(NAME shellgate_anomaly_calibrate_workspace
+      COMMAND ${CMAKE_COMMAND}
+        -DSHELLCLAVE_ANOMALY_CALIBRATE=$<TARGET_FILE:anomaly_calibrate>
+        -DSHELLCLAVE_ANOMALY_CORPUS=${CMAKE_CURRENT_SOURCE_DIR}/shellgate/tests/data/anomaly_calibrate_normal.txt
+        -DSHELLCLAVE_ANOMALY_TEMP=${CMAKE_CURRENT_BINARY_DIR}/anomaly-calibrate-test
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/test_anomaly_calibrate.cmake)
+    set_tests_properties(shellgate_anomaly_calibrate_workspace PROPERTIES
+      LABELS shellgate)
+  endif()
 endif()
 
 if(SHELLCLAVE_BUILD_BENCHMARKS)

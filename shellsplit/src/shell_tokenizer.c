@@ -115,10 +115,13 @@ static bool collect_heredoc_body_spans(const char *cmd, uint32_t length,
       continue;
     }
     if (c == '\\' && position + 1 < length) {
-      position += 2;
+      size_t continued =
+          shell_source_skip_escaped_line_endings(cmd, length, position);
+      position = (uint32_t)(continued != position ? continued : position + 2);
       continue;
     }
-    if (c == '$' && position + 1 < length && cmd[position + 1] == '\'') {
+    if (c == '$' &&
+        shell_source_logical_next_is(cmd, length, position, '\'', NULL)) {
       size_t after = 0;
       if (!shell_source_skip_complete_ansi_c_quote(cmd, length, position,
                                                    &after) ||
@@ -132,8 +135,8 @@ static bool collect_heredoc_body_spans(const char *cmd, uint32_t length,
       position++;
       continue;
     }
-    if (c == '$' && position + 2 < length && cmd[position + 1] == '(' &&
-        cmd[position + 2] == '(') {
+    if (c == '$' &&
+        shell_source_dollar_arithmetic_open(cmd, length, position, NULL)) {
       size_t after = 0;
       if (!shell_source_skip_arithmetic_expansion(cmd, length, position,
                                                   &after) ||
@@ -147,15 +150,17 @@ static bool collect_heredoc_body_spans(const char *cmd, uint32_t length,
         position++;
       continue;
     }
-    if (c == '<' && position + 2 < length && cmd[position + 1] == '<' &&
-        cmd[position + 2] == '<') {
-      position += 3;
+    size_t operator_after = 0;
+    if (c == '<' && shell_source_match_logical_punctuation(
+                        cmd, length, position, "<<<", &operator_after)) {
+      position = (uint32_t)operator_after;
       continue;
     }
-    if (c == '<' && position + 1 < length && cmd[position + 1] == '<') {
+    if (c == '<' && shell_source_match_logical_punctuation(
+                        cmd, length, position, "<<", &operator_after)) {
       if (pending_count == SHELL_MAX_SUBCOMMANDS)
         return false;
-      size_t delimiter = position + 2;
+      size_t delimiter = operator_after;
       if (!shell_source_parse_heredoc_delimiter(cmd, length, &delimiter,
                                                 &pending[pending_count]) ||
           delimiter > UINT32_MAX)
@@ -164,28 +169,27 @@ static bool collect_heredoc_body_spans(const char *cmd, uint32_t length,
       pending_count++;
       continue;
     }
-    if (c != '\n' || pending_count == 0) {
+    if ((c != '\n' && c != '\r') || pending_count == 0) {
       position++;
       continue;
     }
-    position++;
+    position = (uint32_t)shell_source_next_line(cmd, length, position);
     uint32_t body_start = position;
     for (uint32_t h = 0; h < pending_count; h++) {
       bool found = false;
       while (position <= length) {
         uint32_t line_start = position;
-        while (position < length && cmd[position] != '\n')
-          position++;
         if (shell_source_line_is_heredoc_delimiter(cmd, length, line_start,
                                                    &pending[h])) {
-          if (position < length)
-            position++;
+          position = (uint32_t)shell_source_next_line(cmd, length, line_start);
           found = true;
           break;
         }
         if (position == length)
           break;
-        position++;
+        position = (uint32_t)shell_source_next_line(cmd, length, line_start);
+        if (position <= line_start)
+          break;
       }
       if (!found)
         return false;
@@ -289,13 +293,8 @@ static bool fast_token_is_redirection(const shell_token_t *token) {
 }
 
 static bool fast_redirection_consumes_next(const shell_token_t *token) {
-  if (token->type == SHELL_TOKEN_HERESTRING ||
-      token->type == SHELL_TOKEN_REDIRECT_CLOBBER ||
-      token->type == SHELL_TOKEN_REDIRECT_BOTH ||
-      token->type == SHELL_TOKEN_REDIRECT_BOTH_APPEND)
-    return true;
-  return token->length > 0 && (token->start[token->length - 1] == '<' ||
-                               token->start[token->length - 1] == '>');
+  return token &&
+         shell_source_redirection_consumes_word(token->start, token->length);
 }
 
 static bool fast_token_is_scalar_assignment(const shell_token_t *token) {
@@ -383,16 +382,156 @@ static bool fast_array_assignment_at(fast_array_context_t *context,
          context->token_array_assignment;
 }
 
+static void detect_features(const char *cmd, uint32_t start, uint32_t len,
+                            uint32_t *features);
+
+/* Parameter operands have their own lexical scope. Scan expansion features
+ * there, but do not promote their punctuation to the containing command's
+ * list/pipeline/redirect flags. Executable substitutions are then inspected
+ * in their own command scope. */
+static void detect_parameter_features(const char *input, size_t position,
+                                      size_t after, bool outer_double_quote,
+                                      uint32_t *features) {
+  uint32_t inner = 0;
+  size_t brace = shell_source_logical_following(input, after, position);
+  if (brace + 1 < after - 1)
+    detect_features(input, (uint32_t)brace + 1, (uint32_t)(after - brace - 2),
+                    &inner);
+  const uint32_t syntax = SHELL_FEAT_BACKGROUND | SHELL_FEAT_GLOBS |
+                          SHELL_FEAT_PIPELINE | SHELL_FEAT_GROUP |
+                          SHELL_FEAT_HEREDOC | SHELL_FEAT_HERESTRING |
+                          SHELL_FEAT_NAMED_FD | SHELL_FEAT_COMBINED_REDIRECT |
+                          SHELL_FEAT_SUBSHELL | SHELL_FEAT_PROCESS_SUB;
+  *features |= SHELL_FEAT_VARS | (inner & ~syntax);
+
+  shell_source_substitution_scan_t scan = {0};
+  scan.in_double_quote = outer_double_quote;
+  size_t start = 0, end = 0;
+  shell_source_substitution_kind_t kind;
+  while (shell_source_next_executable_substitution(
+      input + position, after - position, &scan, &start, &end, &kind)) {
+    size_t body_start = start + 1;
+    if (kind == SHELL_SOURCE_SUBST_COMMAND) {
+      *features |= SHELL_FEAT_SUBSHELL;
+      body_start = shell_source_logical_following(input + position,
+                                                  after - position, start) +
+                   1;
+    } else if (kind == SHELL_SOURCE_SUBST_BACKTICK) {
+      *features |= SHELL_FEAT_SUBSHELL;
+    } else {
+      *features |= SHELL_FEAT_PROCESS_SUB;
+      body_start = shell_source_logical_following(input + position,
+                                                  after - position, start) +
+                   1;
+    }
+    if (end > body_start + 1)
+      detect_features(input + position, (uint32_t)body_start,
+                      (uint32_t)(end - body_start - 1), features);
+  }
+}
+
+/* Arithmetic content has its own grammar: `items[0]` is an array reference,
+ * not a pathname glob. Scan only expansion features here and recurse into
+ * command substitutions, rather than feeding the expression through the
+ * ordinary shell-word feature walker. */
+static void detect_arithmetic_features(const char *cmd, size_t start,
+                                       size_t end, uint32_t *features) {
+  if (!cmd || !features || start > end)
+    return;
+  for (size_t position = start; position < end;) {
+    char c = cmd[position];
+    if (c == '\\' && position + 1 < end) {
+      size_t continued =
+          shell_source_skip_escaped_line_endings(cmd, end, position);
+      position = continued != position ? continued : position + 2;
+      continue;
+    }
+    if (c == '$' &&
+        shell_source_logical_next_is(cmd, end, position, '\'', NULL)) {
+      size_t after = 0;
+      if (!shell_source_skip_complete_ansi_c_quote(cmd, end, position, &after))
+        return;
+      *features |= SHELL_FEAT_ANSI_C_QUOTE;
+      position = after;
+      continue;
+    }
+    if (c == '\'' || c == '"') {
+      size_t after = 0;
+      if (!shell_source_skip_complete_quoted_text(cmd, end, position, c,
+                                                  &after))
+        return;
+      position = after;
+      continue;
+    }
+    if (c == '`') {
+      size_t after = 0;
+      if (!shell_source_skip_complete_backtick(cmd, end, position, &after))
+        return;
+      *features |= SHELL_FEAT_SUBSHELL;
+      if (after > position + 1)
+        detect_features(cmd, (uint32_t)position + 1,
+                        (uint32_t)(after - position - 2), features);
+      position = after;
+      continue;
+    }
+    if (isdigit((unsigned char)c)) {
+      size_t after = 0;
+      if (shell_source_skip_arithmetic_number(cmd, end, position, &after)) {
+        position = after;
+        continue;
+      }
+    }
+    if (c == '$') {
+      size_t command_open = 0;
+      if (shell_source_dollar_arithmetic_open(cmd, end, position, NULL)) {
+        size_t content_start = 0, content_length = 0, after = 0;
+        if (!shell_source_arithmetic_content(cmd, end, position, &content_start,
+                                             &content_length, &after))
+          return;
+        *features |= SHELL_FEAT_ARITH;
+        detect_arithmetic_features(cmd, content_start,
+                                   content_start + content_length, features);
+        position = after;
+        continue;
+      }
+      if (shell_source_dollar_parentheses_open(cmd, end, position,
+                                               &command_open)) {
+        size_t after = 0;
+        if (!shell_source_find_balanced_parentheses(cmd, end, command_open,
+                                                    &after))
+          return;
+        *features |= SHELL_FEAT_SUBSHELL;
+        if (after > command_open + 1)
+          detect_features(cmd, (uint32_t)command_open + 1,
+                          (uint32_t)(after - command_open - 2), features);
+        position = after;
+        continue;
+      }
+      size_t next = shell_source_logical_following(cmd, end, position);
+      if (next < end &&
+          (isalpha((unsigned char)cmd[next]) || cmd[next] == '_' ||
+           isdigit((unsigned char)cmd[next]) || strchr("#?$!@*-{", cmd[next])))
+        *features |= SHELL_FEAT_VARS;
+    }
+    if (isalpha((unsigned char)c) || c == '_')
+      *features |= SHELL_FEAT_VARS;
+    position++;
+  }
+}
+
 /**
  * Detect features in a subcommand range
  */
 static void detect_features(const char *cmd, uint32_t start, uint32_t len,
                             uint32_t *features) {
+  static _Thread_local unsigned nesting;
+  if (nesting >= SHELL_MAX_SUBCOMMANDS)
+    return;
+  nesting++;
   const char *p = cmd + start;
   uint32_t i = 0;
   bool in_single_quotes = false;
   bool in_double_quotes = false;
-  int arith_depth = 0;
   fast_array_context_t array_context;
   bool have_array_context = fast_array_context_init(&array_context, p, len);
 
@@ -418,90 +557,94 @@ static void detect_features(const char *cmd, uint32_t start, uint32_t len,
       continue;
     }
 
-    // Skip escapes
+    // Skip escapes. Escaped physical line endings are lexically removed, so
+    // consume a complete LF or CRLF continuation rather than exposing its
+    // trailing LF as source syntax on the next iteration.
     if (c == '\\' && i + 1 < len) {
-      i += 2;
+      size_t continued = shell_source_skip_escaped_line_endings(p, len, i);
+      i = (uint32_t)(continued != i ? continued : i + 2);
       continue;
     }
 
-    // Track arithmetic depth and detect variables inside
-    if (c == '$' && i + 1 < len && p[i + 1] == '(' && i + 2 < len &&
-        p[i + 2] == '(') {
-      arith_depth++;
-      *features |= SHELL_FEAT_ARITH;
-      size_t arithmetic_after = 0;
-      if (shell_source_skip_arithmetic_expansion(p, len, i,
-                                                 &arithmetic_after) &&
-          arithmetic_after > i + 5 &&
-          shell_tokenizer_arithmetic_has_array_semantics(
-              p + i + 3, arithmetic_after - i - 5))
-        *features |= SHELL_FEAT_ARRAY;
-      // Check if first variable after $((
-      if (i + 3 < len) {
-        char next = p[i + 3];
-        if (isalpha((unsigned char)next) || next == '_') {
-          *features |= SHELL_FEAT_VARS;
-        }
-      }
-      // Don't skip ahead - let next iteration process the content
-      i++;
-      continue;
-    }
-    if (arith_depth > 0) {
-      // Inside $((...)) - detect variables and subshells
-      if (c == '$' && i + 1 < len && p[i + 1] == '\'') {
-        size_t after = shell_source_skip_ansi_c_quote(p, len, i);
-        if (after > i + 2 && after <= len && p[after - 1] == '\'') {
-          *features |= SHELL_FEAT_ANSI_C_QUOTE;
-          i = (uint32_t)after;
-          continue;
-        }
-      }
-      if (c == '\'' || c == '"' || c == '`') {
-        size_t after = shell_source_skip_quoted_text(p, len, i, c);
-        if (after > i + 1 && after <= len && p[after - 1] == c) {
-          i = (uint32_t)after;
-          continue;
-        }
-      }
-      if (c == ')') {
-        arith_depth--;
-        i++;
+    if (c == '$' && shell_source_logical_next_is(p, len, i, '{', NULL)) {
+      size_t after = 0;
+      if (shell_source_skip_parameter_expansion(p, len, i, &after)) {
+        detect_parameter_features(p, i, after, in_double_quotes, features);
+        size_t subscript_start = 0, subscript_after = 0;
+        if (shell_source_find_parameter_array_subscript(
+                p, len, i, &subscript_after, &subscript_start))
+          *features |= SHELL_FEAT_ARRAY;
+        i = (uint32_t)after;
         continue;
       }
-      // Check for $VAR and $(...) patterns inside arithmetic
-      if (c == '$' && i + 1 < len) {
-        char next = p[i + 1];
-        if (next == '(') {
-          size_t after = 0;
-          if (i + 2 < len && p[i + 2] == '(') {
-            if (shell_source_skip_arithmetic_expansion(p, len, i, &after)) {
-              detect_features(p, i + 3, (uint32_t)(after - i - 5), features);
-              i = (uint32_t)after;
-              continue;
-            }
-          } else if (shell_source_find_balanced_parentheses(p, len, i + 1,
-                                                            &after)) {
-            // $(...) command substitution inside arithmetic.
-            *features |= SHELL_FEAT_SUBSHELL;
-            detect_features(p, i + 2, (uint32_t)(after - i - 3), features);
-            i = (uint32_t)after;
+    }
+
+    // Arithmetic expansions are opaque source units. Recurse into their
+    // physical content range so a continuation inside either opener cannot
+    // turn the following `(` into an ordinary command group.
+    if (c == '$' && shell_source_dollar_arithmetic_open(p, len, i, NULL)) {
+      *features |= SHELL_FEAT_ARITH;
+      size_t content_start = 0, content_length = 0, arithmetic_after = 0;
+      if (shell_source_arithmetic_content(p, len, i, &content_start,
+                                          &content_length, &arithmetic_after)) {
+        bool has_array = shell_tokenizer_arithmetic_has_array_semantics(
+            p + content_start, content_length);
+        if (has_array)
+          *features |= SHELL_FEAT_ARRAY;
+        size_t first = content_start;
+        size_t content_end = content_start + content_length;
+        while (first < content_end) {
+          size_t continued =
+              shell_source_skip_escaped_line_endings(p, content_end, first);
+          if (continued != first) {
+            first = continued;
             continue;
           }
-        } else if (next == '{') {
-          *features |= SHELL_FEAT_VARS;
-        } else if (isdigit((unsigned char)next) || next == '#' || next == '?' ||
-                   next == '$' || next == '!' || next == '@' || next == '*' ||
-                   next == '-') {
-          *features |= SHELL_FEAT_VARS;
-        } else if (isalpha((unsigned char)next) || next == '_') {
-          *features |= SHELL_FEAT_VARS;
+          if (!isspace((unsigned char)p[first]))
+            break;
+          first++;
         }
+        if (!has_array && first < content_end &&
+            (isalpha((unsigned char)p[first]) || p[first] == '_'))
+          *features |= SHELL_FEAT_VARS;
+        if (content_length != 0)
+          detect_arithmetic_features(p, content_start,
+                                     content_start + content_length, features);
+        i = (uint32_t)arithmetic_after;
+        continue;
       }
+      /* Leave malformed arithmetic to the structural parser. */
       i++;
       continue;
     }
-
+    if (in_double_quotes && (c == '$' || c == '`')) {
+      bool recognized = false;
+      size_t after = 0;
+      if (shell_source_skip_double_quote_expansion(p, len, i, &recognized,
+                                                   &after) &&
+          recognized) {
+        size_t content_start = i + 1;
+        if (c == '`') {
+          *features |= SHELL_FEAT_SUBSHELL;
+        } else if (shell_source_logical_next_is(p, len, i, '{', NULL)) {
+          *features |= SHELL_FEAT_VARS;
+          /* Revisit the parameter as its own unquoted syntactic scope. This
+           * preserves array-subscript detection as well as nested features,
+           * without letting its quotes alter the enclosing quote state. */
+          detect_features(p, i, (uint32_t)(after - i), features);
+          i = (uint32_t)after;
+          continue;
+        } else {
+          *features |= SHELL_FEAT_SUBSHELL;
+          content_start = shell_source_logical_following(p, len, i) + 1;
+        }
+        if (after > content_start + 1)
+          detect_features(p, (uint32_t)content_start,
+                          (uint32_t)(after - content_start - 1), features);
+        i = (uint32_t)after;
+        continue;
+      }
+    }
     // Grammar-only syntax is literal inside double quotes. Parameter, command,
     // and arithmetic expansions below intentionally remain visible there.
     if (!in_double_quotes && shell_identifier_start(c)) {
@@ -522,36 +665,53 @@ static void detect_features(const char *cmd, uint32_t start, uint32_t len,
         continue;
       }
     }
-    if (!in_double_quotes && c == '&' && i + 1 < len && p[i + 1] == '>') {
+    size_t combined_redirect = 0;
+    if (!in_double_quotes && c == '&' &&
+        shell_source_logical_next_is(p, len, i, '>', &combined_redirect)) {
       *features |= SHELL_FEAT_COMBINED_REDIRECT;
-      i += (i + 2 < len && p[i + 2] == '>') ? 3 : 2;
+      size_t after = combined_redirect + 1;
+      size_t append = 0;
+      if (shell_source_logical_next_is(p, len, combined_redirect, '>', &append))
+        after = append + 1;
+      i = (uint32_t)after;
       continue;
     }
-    if (!in_double_quotes && c == '$' && i + 1 < len && p[i + 1] == '\'') {
+    if (!in_double_quotes && c == '$' &&
+        shell_source_logical_next_is(p, len, i, '\'', NULL)) {
       *features |= SHELL_FEAT_ANSI_C_QUOTE;
-      size_t after = shell_source_skip_ansi_c_quote(p, len, i);
-      if (after > i + 2 && after <= len && p[after - 1] == '\'') {
+      size_t after = 0;
+      if (shell_source_skip_complete_ansi_c_quote(p, len, i, &after)) {
         i = (uint32_t)after;
         continue;
       }
     }
     if (!in_double_quotes &&
-        (c == '?' || c == '*' || c == '+' || c == '@' || c == '!') &&
-        i + 1 < len && p[i + 1] == '(')
-      *features |= SHELL_FEAT_EXTGLOB;
+        (c == '?' || c == '*' || c == '+' || c == '@' || c == '!')) {
+      size_t extglob_after = 0;
+      if (shell_source_skip_extglob(p, len, i, &extglob_after)) {
+        *features |= SHELL_FEAT_EXTGLOB;
+        i = (uint32_t)extglob_after;
+        continue;
+      }
+    }
     if (!in_double_quotes && c == '{') {
-      size_t end = 0;
-      while (i + end + 1 < len &&
-             (isalnum((unsigned char)p[i + end + 1]) || p[i + end + 1] == '_'))
-        end++;
-      if (end != 0 && i + end + 1 < len && p[i + end + 1] == '}' &&
-          i + end + 2 < len && (p[i + end + 2] == '<' || p[i + end + 2] == '>'))
+      size_t operator_position = 0;
+      if (shell_source_parse_named_fd_redirect(p, i, len, &operator_position))
         *features |= SHELL_FEAT_NAMED_FD;
     }
-    if (!in_double_quotes && (c == '<' || c == '>') && i + 1 < len &&
-        p[i + 1] == '(') {
+    size_t process_open = 0;
+    if (!in_double_quotes && (c == '<' || c == '>') &&
+        shell_source_process_substitution_open(p, len, i, &process_open)) {
       *features |= SHELL_FEAT_PROCESS_SUB;
-      i++;
+      size_t after = 0;
+      if (shell_source_find_balanced_parentheses(p, len, process_open,
+                                                 &after)) {
+        if (after > process_open + 1)
+          detect_features(p, (uint32_t)process_open + 1,
+                          (uint32_t)(after - process_open - 2), features);
+        i = (uint32_t)after;
+        continue;
+      }
       continue;
     }
     bool arithmetic_paren =
@@ -562,36 +722,48 @@ static void detect_features(const char *cmd, uint32_t start, uint32_t len,
     switch (c) {
     case '$':
       // Variables expand in double quotes
-      if (i + 1 < len) {
-        char next = p[i + 1];
-        if (next == '(') {
-          if (i + 2 < len && p[i + 2] == '(') {
-            // This is handled in arith_depth section above
-            i += 3;
-            continue;
+      {
+        size_t next_position = shell_source_logical_following(p, len, i);
+        if (next_position < len) {
+          char next = p[next_position];
+          if (next == '(') {
+            if (shell_source_dollar_arithmetic_open(p, len, i, NULL)) {
+              // This is handled by the arithmetic-expansion branch above.
+              continue;
+            }
+            *features |= SHELL_FEAT_SUBSHELL;
+            size_t after = 0;
+            if (shell_source_find_balanced_parentheses(p, len, next_position,
+                                                       &after)) {
+              if (after > next_position + 1)
+                detect_features(p, (uint32_t)next_position + 1,
+                                (uint32_t)(after - next_position - 2),
+                                features);
+              i = (uint32_t)after;
+              continue;
+            }
+          } else if (next == '`') {
+            *features |= SHELL_FEAT_SUBSHELL;
+          } else if (next == '{') {
+            *features |= SHELL_FEAT_VARS;
+            size_t after = 0, subscript_start = 0;
+            if (shell_source_find_parameter_array_subscript(p, len, i, &after,
+                                                            &subscript_start)) {
+              *features |= SHELL_FEAT_ARRAY;
+              if (after > subscript_start + 1)
+                detect_features(p, (uint32_t)subscript_start + 1,
+                                (uint32_t)(after - subscript_start - 2),
+                                features);
+              i = (uint32_t)after;
+              continue;
+            }
+          } else if (isdigit((unsigned char)next) || next == '#' ||
+                     next == '?' || next == '$' || next == '!' || next == '@' ||
+                     next == '*' || next == '-') {
+            *features |= SHELL_FEAT_VARS;
+          } else if (isalpha((unsigned char)next) || next == '_') {
+            *features |= SHELL_FEAT_VARS;
           }
-          *features |= SHELL_FEAT_SUBSHELL;
-        } else if (next == '`') {
-          *features |= SHELL_FEAT_SUBSHELL;
-        } else if (next == '{') {
-          *features |= SHELL_FEAT_VARS;
-          size_t after = 0, subscript_start = 0;
-          if (shell_source_find_parameter_array_subscript(p, len, i, &after,
-                                                          &subscript_start)) {
-            *features |= SHELL_FEAT_ARRAY;
-            if (after > subscript_start + 1)
-              detect_features(p, (uint32_t)subscript_start + 1,
-                              (uint32_t)(after - subscript_start - 2),
-                              features);
-            i = (uint32_t)after;
-            continue;
-          }
-        } else if (isdigit((unsigned char)next) || next == '#' || next == '?' ||
-                   next == '$' || next == '!' || next == '@' || next == '*' ||
-                   next == '-') {
-          *features |= SHELL_FEAT_VARS;
-        } else if (isalpha((unsigned char)next) || next == '_') {
-          *features |= SHELL_FEAT_VARS;
         }
       }
       break;
@@ -599,7 +771,7 @@ static void detect_features(const char *cmd, uint32_t start, uint32_t len,
       *features |= SHELL_FEAT_SUBSHELL;
       break;
     case '&':
-      if (!(i + 1 < len && p[i + 1] == '&') &&
+      if (!in_double_quotes && !(i + 1 < len && p[i + 1] == '&') &&
           !(i > 0 && (p[i - 1] == '<' || p[i - 1] == '>')))
         *features |= SHELL_FEAT_BACKGROUND;
       break;
@@ -622,6 +794,32 @@ static void detect_features(const char *cmd, uint32_t start, uint32_t len,
 
     i++;
   }
+  nesting--;
+}
+
+/* Match an unquoted reserved spelling after lexical line-continuation removal.
+ * Ordinary backslash escapes and quotes deliberately fail: `wh\\ile` is a
+ * command word, while `whi\\\nle` is the reserved `while` word. */
+static bool detect_logical_unquoted_word_is(const char *text, size_t start,
+                                            size_t end, const char *word) {
+  if (!text || !word || start > end)
+    return false;
+  size_t matched = 0;
+  size_t word_length = strlen(word);
+  for (size_t position = start; position < end;) {
+    size_t continued =
+        shell_source_skip_escaped_line_endings(text, end, position);
+    if (continued != position) {
+      position = continued;
+      continue;
+    }
+    char c = text[position++];
+    if (c == '\\' || c == '\'' || c == '"' || c == '`' ||
+        matched == word_length || c != word[matched])
+      return false;
+    matched++;
+  }
+  return matched == word_length;
 }
 
 /* Detect control-flow and file-substitution features in one subcommand.
@@ -664,7 +862,8 @@ static void detect_control_features(const char *cmd, uint32_t start,
     if (c == '\\' && i + 1 < len) {
       if (word_start == UINT32_MAX)
         word_start = i;
-      i++;
+      size_t continued = shell_source_skip_escaped_line_endings(p, len, i);
+      i = (uint32_t)(continued != i ? continued - 1 : i + 1);
       continue;
     }
 
@@ -675,28 +874,30 @@ static void detect_control_features(const char *cmd, uint32_t start,
     }
 
     if (word_start != UINT32_MAX) {
-      size_t word_len = i - word_start;
-      const char *word = p + word_start;
-      if ((word_len == 5 && memcmp(word, "while", 5) == 0) ||
-          (word_len == 5 && memcmp(word, "until", 5) == 0) ||
-          (word_len == 3 && memcmp(word, "for", 3) == 0) ||
-          (word_len == 6 && memcmp(word, "select", 6) == 0))
+      if (detect_logical_unquoted_word_is(p, word_start, i, "while") ||
+          detect_logical_unquoted_word_is(p, word_start, i, "until") ||
+          detect_logical_unquoted_word_is(p, word_start, i, "for") ||
+          detect_logical_unquoted_word_is(p, word_start, i, "select"))
         *features |= SHELL_FEAT_LOOPS;
-      if ((word_len == 2 && memcmp(word, "if", 2) == 0) ||
-          (word_len == 4 && memcmp(word, "then", 4) == 0) ||
-          (word_len == 4 && memcmp(word, "elif", 4) == 0) ||
-          (word_len == 4 && memcmp(word, "else", 4) == 0) ||
-          (word_len == 2 && memcmp(word, "fi", 2) == 0))
+      if (detect_logical_unquoted_word_is(p, word_start, i, "if") ||
+          detect_logical_unquoted_word_is(p, word_start, i, "then") ||
+          detect_logical_unquoted_word_is(p, word_start, i, "elif") ||
+          detect_logical_unquoted_word_is(p, word_start, i, "else") ||
+          detect_logical_unquoted_word_is(p, word_start, i, "fi"))
         *features |= SHELL_FEAT_CONDITIONALS;
-      if ((word_len == 4 && memcmp(word, "case", 4) == 0) ||
-          (word_len == 2 && memcmp(word, "in", 2) == 0) ||
-          (word_len == 4 && memcmp(word, "esac", 4) == 0))
+      if (detect_logical_unquoted_word_is(p, word_start, i, "case") ||
+          detect_logical_unquoted_word_is(p, word_start, i, "in") ||
+          detect_logical_unquoted_word_is(p, word_start, i, "esac"))
         *features |= SHELL_FEAT_CASE;
       word_start = UINT32_MAX;
     }
 
-    if (c == '$' && i + 1 < len && p[i + 1] == '(') {
-      uint32_t j = i + 2;
+    size_t command_open = 0;
+    if (c == '$' &&
+        shell_source_dollar_parentheses_open(p, len, i, &command_open) &&
+        !shell_source_dollar_arithmetic_open(p, len, i, NULL)) {
+      uint32_t j = (uint32_t)shell_source_skip_escaped_line_endings(
+          p, len, command_open + 1);
       while (j < len && isspace((unsigned char)p[j]))
         j++;
       if (j < len && p[j] == '<')
@@ -1093,11 +1294,31 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
       continue;
     }
     char c = cmd[pos];
+    /* A nested expansion owns its quotes even inside an outer double-quoted
+     * word. Consume its whole span before the outer quote state sees any
+     * delimiter or command-list operator from its body. */
+    if (in_quotes && quote_char == '"' && (c == '$' || c == '`')) {
+      size_t after = 0;
+      bool recognized = false;
+      bool complete = shell_source_skip_double_quote_expansion(
+          cmd, cmd_len, pos, &recognized, &after);
+      if (recognized) {
+        if ((!complete && (c != '`' || limits->strict_mode)) ||
+            (complete && after > UINT32_MAX)) {
+          result->status = SHELL_STATUS_ERROR;
+          result->count = subcmd_idx;
+          return SHELL_EPARSE;
+        }
+        pos = complete ? (uint32_t)after : cmd_len;
+        continue;
+      }
+    }
     /* ANSI-C quoting is one shell-word fragment, even when its body contains
      * escaped quotes or delimiter-looking bytes. Consume it before generic
      * quote and delimiter handling so it remains opaque to this structural
      * parser. */
-    if (!in_quotes && c == '$' && pos + 1 < cmd_len && cmd[pos + 1] == '\'') {
+    if (!in_quotes && c == '$' &&
+        shell_source_logical_next_is(cmd, cmd_len, pos, '\'', NULL)) {
       size_t after = 0;
       if (!shell_source_skip_complete_ansi_c_quote(cmd, cmd_len, pos, &after) ||
           after > UINT32_MAX) {
@@ -1114,17 +1335,20 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
     /* A balanced parameter expansion is one shell-word fragment. Its default,
      * pattern, or replacement word may contain bytes that are operators at
      * the enclosing command-list level. */
-    if (!in_quotes && c == '$' && pos + 1 < cmd_len && cmd[pos + 1] == '{') {
-      size_t after = 0;
-      if (!shell_source_skip_parameter_expansion(cmd, cmd_len, pos, &after) ||
-          after > UINT32_MAX) {
-        /* A braced parameter expansion is syntactically complete or it is
-         * invalid source; permissive range recovery must not turn `${}` or an
-         * unterminated expansion into an unrelated ordinary brace word. */
-        result->status = SHELL_STATUS_ERROR;
-        result->count = subcmd_idx;
-        return SHELL_EPARSE;
-      } else {
+    if (!in_quotes && c == '$') {
+      size_t next =
+          shell_source_skip_escaped_line_endings(cmd, cmd_len, pos + 1);
+      if (next < cmd_len && cmd[next] == '{') {
+        size_t after = 0;
+        if (!shell_source_skip_parameter_expansion(cmd, cmd_len, pos, &after) ||
+            after > UINT32_MAX) {
+          /* A braced parameter expansion is syntactically complete or it is
+           * invalid source; permissive range recovery must not turn `${}` or an
+           * unterminated expansion into an unrelated ordinary brace word. */
+          result->status = SHELL_STATUS_ERROR;
+          result->count = subcmd_idx;
+          return SHELL_EPARSE;
+        }
         pos = (uint32_t)after;
         continue;
       }
@@ -1133,16 +1357,46 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
      * shared scanner owns their matching parentheses and deferred heredoc
      * bodies, so syntax in the nested command cannot split the outer range.
      * Arithmetic expansion remains on its dedicated depth-tracking path. */
-    if (!in_quotes && c == '$' && pos + 1 < cmd_len && cmd[pos + 1] == '(' &&
-        !(pos + 2 < cmd_len && cmd[pos + 2] == '(')) {
+    size_t substitution_open = 0;
+    if (!in_quotes && c == '$' &&
+        shell_source_dollar_parentheses_open(cmd, cmd_len, pos,
+                                             &substitution_open) &&
+        !shell_source_dollar_arithmetic_open(cmd, cmd_len, pos, NULL)) {
       size_t after = 0;
-      if (!shell_source_find_balanced_parentheses(cmd, cmd_len, pos + 1,
-                                                  &after) ||
+      if (!shell_source_find_balanced_parentheses(cmd, cmd_len,
+                                                  substitution_open, &after) ||
           after > UINT32_MAX) {
         result->status = SHELL_STATUS_ERROR;
         result->count = subcmd_idx;
         return SHELL_EPARSE;
       }
+      pos = (uint32_t)after;
+      continue;
+    }
+    /* Process substitutions have the same balanced command-list body as
+     * `$()`, but their leading redirection byte can be separated from `(` by
+     * an escaped physical line ending. Consume the whole source fragment here
+     * rather than relying on the immediately preceding physical byte when the
+     * opening parenthesis is reached. */
+    if (!in_quotes && (c == '<' || c == '>') &&
+        shell_source_process_substitution_open(cmd, cmd_len, pos,
+                                               &substitution_open)) {
+      size_t after = 0;
+      if (!shell_source_find_balanced_parentheses(cmd, cmd_len,
+                                                  substitution_open, &after) ||
+          after > UINT32_MAX) {
+        result->status = SHELL_STATUS_ERROR;
+        result->count = subcmd_idx;
+        return SHELL_EPARSE;
+      }
+      /* Retain the fast parser's historical eager attribution: once a list
+       * connector has closed a preceding range, its following process
+       * substitution is recorded on that emitted range. The final range is
+       * still classified as a substitution below when it starts a command. */
+      if (subcmd_idx > 0 && subcmd_idx < max_cmds)
+        result->cmds[subcmd_idx - 1].features |= SHELL_FEAT_PROCESS_SUB;
+      if (current_type == SHELL_TYPE_SIMPLE)
+        current_type = SHELL_TYPE_SUBSTITUTION;
       pos = (uint32_t)after;
       continue;
     }
@@ -1403,15 +1657,24 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
 
     // Track arithmetic expansion $(( ... )) and (( ... ))
     // Note: $(( opens TWO parens - handle specially to avoid double counting
-    if (c == '$' && pos + 2 < cmd_len && cmd[pos + 1] == '(' &&
-        cmd[pos + 2] == '(') {
-      // This is $((...)) - arithmetic expansion, opens TWO parentheses
-      arith_depth += 2; // Track that we're inside arithmetic
-      pos += 3;         // Skip $(( entirely (3 chars)
+    if (c == '$' &&
+        shell_source_dollar_arithmetic_open(cmd, cmd_len, pos, NULL)) {
+      size_t after = 0;
+      if (!shell_source_skip_arithmetic_expansion(cmd, cmd_len, pos, &after) ||
+          after > UINT32_MAX) {
+        result->status = SHELL_STATUS_ERROR;
+        result->count = subcmd_idx;
+        return SHELL_EPARSE;
+      }
+      pos = (uint32_t)after;
       continue;
     }
-    // Also handle plain (( )) - arithmetic in bash
-    if (c == '(' && pos + 1 < cmd_len && cmd[pos + 1] == '(') {
+    // Also handle plain (( )) - arithmetic in bash. Physical continuations
+    // are removed before syntax recognition, so use the same logical
+    // punctuation matcher as the full lexer.
+    size_t arithmetic_command_after = 0;
+    if (c == '(' && shell_source_match_logical_punctuation(
+                        cmd, cmd_len, pos, "((", &arithmetic_command_after)) {
       /* `(( ... ))` is a shell arithmetic command only at a command
        * boundary. In argument position it is invalid shell syntax, not a
        * simple command containing literal parentheses. */
@@ -1423,7 +1686,7 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
       }
       // This is ((...)) - arithmetic
       arith_depth += 2;
-      pos += 2; // Skip ((
+      pos = (uint32_t)arithmetic_command_after; // Skip logical ((
       continue;
     }
     /* Arithmetic parentheses can nest ordinary grouping parentheses as well
@@ -1544,40 +1807,24 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
     if (closes_function_paren)
       function_paren_close = UINT32_MAX;
 
-    // Handle bare $ - must be followed by valid characters
-    // $$ (PID), $? (exit status), $# (arg count), $! (last bg pid),
-    // $*/$@ (positional params) at end ARE valid
-    // Skip $ handling inside quotes - $ is literal in single quotes
-    if (c == '$' && !in_quotes) {
-      if (pos + 1 >= cmd_len) {
-        // $ at end - check if this is the second $ of $$
-        if (pos > 0 && cmd[pos - 1] == '$') {
-          // This is $$ - valid!
-        } else {
-          // Bare $ at end - malformed
-          brace_depth++;
-        }
-      } else {
-        char next = cmd[pos + 1];
-        // $ must be followed by: alphanumeric, _, {, (, `, digit, or special
-        // var chars (*, @, #, ?, !, $)
-        if (!isalpha((unsigned char)next) && next != '_' && next != '{' &&
-            next != '(' && next != '`' && !isdigit((unsigned char)next) &&
-            next != '*' && next != '@' && next != '#' && next != '?' &&
-            next != '!' && next != '$') {
-          // Malformed $ - increment brace_depth so it will fail the final check
-          brace_depth++;
-        }
-      }
-    }
+    /* A dollar not starting one of the complete expansion forms handled
+     * above is a literal shell-word byte. In particular, Bash accepts `$`,
+     * `$:`, and `path$` as pathnames. Do not overload brace_depth as a
+     * pseudo-error channel here: `${...}`, `$'...'`, and `$(...)` already
+     * have structural validation at their respective scanners. */
 
     /* Bash combines stdout and stderr with &>word / &>>word. It is one
      * redirect, not a background separator followed by an ordinary word. */
-    if (!in_quotes && c == '&' && pos + 1 < cmd_len && cmd[pos + 1] == '>') {
-      uint32_t operator_end = pos + 2;
-      if (operator_end < cmd_len && cmd[operator_end] == '>')
-        operator_end++;
-      uint32_t operand = operator_end;
+    size_t combined_redirect = 0;
+    if (!in_quotes && c == '&' &&
+        shell_source_logical_next_is(cmd, cmd_len, pos, '>',
+                                     &combined_redirect)) {
+      size_t operator_end = combined_redirect + 1;
+      size_t append = 0;
+      if (shell_source_logical_next_is(cmd, cmd_len, combined_redirect, '>',
+                                       &append))
+        operator_end = append + 1;
+      uint32_t operand = (uint32_t)operator_end;
       while (operand < cmd_len && isspace((unsigned char)cmd[operand]))
         operand++;
       size_t after = operand;
@@ -1595,10 +1842,29 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
      * their concrete syntax in the feature mask and classify a standalone
      * subcommand with the substitution operator type. */
     if (current_type == SHELL_TYPE_SIMPLE &&
-        ((c == '$' && pos + 1 < cmd_len && cmd[pos + 1] == '(' &&
-          !(pos + 2 < cmd_len && cmd[pos + 2] == '(')) ||
+        ((c == '$' &&
+          shell_source_dollar_parentheses_open(cmd, cmd_len, pos, NULL) &&
+          !shell_source_dollar_arithmetic_open(cmd, cmd_len, pos, NULL)) ||
          (c == '`' && !(in_quotes && quote_char == '\'')))) {
       current_type = SHELL_TYPE_SUBSTITUTION;
+    }
+
+    /* A legacy substitution is one shell-word fragment. Operators inside it
+     * belong to its nested command, never to this command list. */
+    if (!in_quotes && c == '`') {
+      size_t after = 0;
+      if (!shell_source_skip_complete_backtick(cmd, cmd_len, pos, &after) ||
+          after > UINT32_MAX) {
+        if (limits->strict_mode) {
+          result->status = SHELL_STATUS_ERROR;
+          result->count = subcmd_idx;
+          return SHELL_EPARSE;
+        }
+        pos = cmd_len;
+      } else {
+        pos = (uint32_t)after;
+      }
+      continue;
     }
 
     // Handle escapes outside quotes
@@ -1609,8 +1875,10 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
 
     // Check for HERESTRING <<< (here-string) - must check before << and NOT
     // inside arithmetic
-    if (arith_depth == 0 && c == '<' && pos + 2 < cmd_len &&
-        cmd[pos + 1] == '<' && cmd[pos + 2] == '<') {
+    size_t here_string_after = 0;
+    if (arith_depth == 0 && c == '<' &&
+        shell_source_match_logical_punctuation(cmd, cmd_len, pos, "<<<",
+                                               &here_string_after)) {
       uint32_t redirect_prefix_start =
           source_redirect_prefix_start_before(cmd, pos, cmd_len);
       uint32_t negation_stage = subcmd_start;
@@ -1661,7 +1929,7 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
 
       // Record herestring subcommand: include <<< and the string
       uint32_t herestring_start = pos;
-      pos += 3; // Skip <<<
+      pos = (uint32_t)here_string_after;
 
       pos = (uint32_t)shell_source_skip_inline_continuations(cmd, cmd_len, pos);
 
@@ -1709,8 +1977,10 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
 
     // Check for HEREDOC << (heredoc) - only if not <<< and NOT inside
     // arithmetic
-    if (arith_depth == 0 && c == '<' && pos + 1 < cmd_len &&
-        cmd[pos + 1] == '<') {
+    size_t heredoc_operator_after = 0;
+    if (arith_depth == 0 && c == '<' &&
+        shell_source_match_logical_punctuation(cmd, cmd_len, pos, "<<",
+                                               &heredoc_operator_after)) {
       uint32_t redirect_prefix_start =
           source_redirect_prefix_start_before(cmd, pos, cmd_len);
       uint32_t negation_stage = subcmd_start;
@@ -1779,13 +2049,13 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
       uint32_t heredoc_start = pos;
       if (!trailing_group_redirect)
         heredoc_prefix_start = redirect_prefix_start;
-      size_t delimiter_position = (size_t)pos + 2;
+      size_t delimiter_position = heredoc_operator_after;
       shell_source_pending_heredoc_t pending;
       bool delimiter_valid = shell_source_parse_heredoc_delimiter(
           cmd, cmd_len, &delimiter_position, &pending);
 
       if (!delimiter_valid) {
-        size_t delimiter_start = (size_t)heredoc_start + 2;
+        size_t delimiter_start = heredoc_operator_after;
         if (delimiter_start < cmd_len && cmd[delimiter_start] == '-')
           delimiter_start++;
         while (delimiter_start < cmd_len &&
@@ -1863,7 +2133,14 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
     if (arith_depth == 0 && substitution_paren_depth == 0 && is_separator(c)) {
       /* A lone '&' backgrounds the preceding command and starts a new
        * execution unit. It is distinct from logical AND (&&). */
-      if (c == '&' && !(pos + 1 < cmd_len && cmd[pos + 1] == '&')) {
+      size_t operator_after = pos;
+      bool logical_and =
+          c == '&' && shell_source_match_logical_punctuation(
+                          cmd, cmd_len, pos, "&&", &operator_after);
+      bool logical_or =
+          c == '|' && shell_source_match_logical_punctuation(
+                          cmd, cmd_len, pos, "||", &operator_after);
+      if (c == '&' && !logical_and) {
         if (subcmd_start < pos)
           RECORD_SUBCMD(subcmd_start, pos, current_type);
         if (subcmd_idx > 0)
@@ -1878,7 +2155,7 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
       }
 
       // Handle &&
-      if (c == '&' && pos + 1 < cmd_len && cmd[pos + 1] == '&') {
+      if (logical_and) {
         // End current subcommand (trim whitespace)
         if (subcmd_start < pos) {
           if (subcmd_idx >= max_cmds) {
@@ -1907,7 +2184,7 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
         }
 
         // Start new subcommand with AND type
-        pos += 2;
+        pos = (uint32_t)operator_after;
         subcmd_start = pos;
         current_type = SHELL_TYPE_AND;
         current_pipe_input_mode = SHELL_PIPE_MODE_NONE;
@@ -1916,7 +2193,7 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
       }
 
       // Handle ||
-      if (c == '|' && pos + 1 < cmd_len && cmd[pos + 1] == '|') {
+      if (logical_or) {
         // End current subcommand (trim whitespace)
         if (subcmd_start < pos) {
           if (subcmd_idx >= max_cmds) {
@@ -1945,7 +2222,7 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
         }
 
         // Start new subcommand with OR type
-        pos += 2;
+        pos = (uint32_t)operator_after;
         subcmd_start = pos;
         current_type = SHELL_TYPE_OR;
         current_pipe_input_mode = SHELL_PIPE_MODE_NONE;
@@ -1985,8 +2262,13 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
         // Start new subcommand with PIPELINE type
         if (subcmd_idx > 0)
           result->cmds[subcmd_idx - 1].features |= SHELL_FEAT_PIPELINE;
-        bool pipe_stderr = pos + 1 < cmd_len && cmd[pos + 1] == '&';
-        pos += pipe_stderr ? 2 : 1;
+        size_t pipe_after = pos + 1;
+        bool pipe_stderr = shell_source_match_logical_punctuation(
+            cmd, cmd_len, pos, "|&", &pipe_after);
+        /* A failed multi-byte match deliberately leaves `pipe_after` at the
+         * first byte.  Ordinary `|` must still consume itself; otherwise the
+         * fast parser revisits the same source offset forever. */
+        pos = (uint32_t)(pipe_stderr ? pipe_after : (size_t)pos + 1);
         subcmd_start = pos;
         current_type = SHELL_TYPE_PIPELINE;
         current_pipe_input_mode = pipe_stderr
@@ -2067,10 +2349,12 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
       // But NOT if inside arithmetic - there they're operators, not redirects
       if ((c == '<' || c == '>') && arith_depth == 0) {
         // Check for process substitution: >(cmd) or <(cmd)
-        if (pos + 1 < cmd_len && cmd[pos + 1] == '(') {
+        size_t process_open = 0;
+        if (shell_source_process_substitution_open(cmd, cmd_len, pos,
+                                                   &process_open)) {
           size_t after = 0;
-          if (!shell_source_find_balanced_parentheses(cmd, cmd_len, pos + 1,
-                                                      &after) ||
+          if (!shell_source_find_balanced_parentheses(cmd, cmd_len,
+                                                      process_open, &after) ||
               after > UINT32_MAX) {
             result->status = SHELL_STATUS_ERROR;
             result->count = subcmd_idx;
@@ -2091,22 +2375,25 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
         bool is_double_redirect = false;
         bool is_extended_redirect = false;
         bool is_fd_redirect = false; // >& or <& (file descriptor redirect)
-        if (pos + 1 < cmd_len) {
-          if (cmd[pos + 1] == c) {
+        size_t redirect_after = (size_t)pos + 1;
+        size_t redirect_next =
+            shell_source_logical_following(cmd, cmd_len, pos);
+        if (redirect_next < cmd_len) {
+          if (cmd[redirect_next] == c) {
             // >>, <<
             is_double_redirect = true;
-            pos++; // skip second char
-          } else if ((c == '>' && cmd[pos + 1] == '|') ||
-                     (c == '<' && cmd[pos + 1] == '>')) {
+            redirect_after = redirect_next + 1;
+          } else if ((c == '>' && cmd[redirect_next] == '|') ||
+                     (c == '<' && cmd[redirect_next] == '>')) {
             is_extended_redirect = true;
-            pos++; // skip the second operator byte
-          } else if (cmd[pos + 1] == '&') {
+            redirect_after = redirect_next + 1;
+          } else if (cmd[redirect_next] == '&') {
             // >& or <& (fd redirect)
             is_fd_redirect = true;
-            pos++; // skip the &
+            redirect_after = redirect_next + 1;
           }
         }
-        pos++;
+        pos = (uint32_t)redirect_after;
         // Skip file descriptor number if present (but not after >>, and not for
         // fd redirects) For 2>file, skip the 2. For 2>&1, don't skip the 1
         // (it's the target).
@@ -2135,8 +2422,9 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
         /* A process substitution may be the target of an ordinary redirect:
          * `2> >(consumer)` and `0< <(producer)`. Leave its opener for the
          * normal process-substitution scanner on the next iteration. */
-        bool process_sub_target = (next_ch == '<' || next_ch == '>') &&
-                                  pos + 1 < cmd_len && cmd[pos + 1] == '(';
+        bool process_sub_target =
+            (next_ch == '<' || next_ch == '>') &&
+            shell_source_process_substitution_open(cmd, cmd_len, pos, NULL);
         /* Process substitution is one shell word. The opener must be
          * contiguous with `<` or `>`: `> (command)` is a syntax error, not a
          * redirect to a parenthesized command group. The same spelling is not

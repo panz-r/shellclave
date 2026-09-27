@@ -41,8 +41,10 @@ typedef enum {
 } shell_status_t;
 
 /**
- * Subcommand type - the operator associated with this subcommand
- * (shifted to upper bits to avoid conflict with features)
+ * Subcommand type - the operator or structural marker associated with this
+ * subcommand. These are a mutually exclusive token-type field; callers that
+ * need auxiliary properties must use the separate shell_cmd_features_t field
+ * rather than OR-ing feature bits into a type value.
  */
 typedef enum {
   SHELL_TYPE_SIMPLE = 0,             // Single command, no separator

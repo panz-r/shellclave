@@ -70,15 +70,14 @@ static void test_bounded_span_and_statuses(void) {
   TEST("abstraction reports input and parse failures precisely", valid);
 }
 
-static void test_ansi_c_arithmetic_span(void) {
+static void test_dynamic_arithmetic_is_rejected(void) {
   const char *source = "echo $(( $(printf $'foo\\'bar)') + 1 ))";
-  shell_abstract_command_t *result = parse_command(source);
-  bool valid = result &&
-               strcmp(shell_abstract_command_get_source(result), source) == 0 &&
-               strcmp(shell_abstract_command_get_display_text(result),
-                      "echo $AR_1") == 0;
+  shell_abstract_command_t *result = (shell_abstract_command_t *)(void *)1;
+  bool valid = shell_abstract_command_parse(source, strlen(source), &result) ==
+                   SHELL_ABSTRACT_EPARSE &&
+               result == NULL;
   shell_abstract_command_free(result);
-  TEST("ANSI-C quote preserves the complete arithmetic abstraction", valid);
+  TEST("Dynamic arithmetic is rejected before abstraction", valid);
 }
 
 static void test_compound_variable_quote_boundaries(void) {
@@ -116,6 +115,20 @@ static void test_compound_variable_quote_boundaries(void) {
   }
   TEST("compound variables preserve quoted and ANSI-C literal boundaries",
        valid);
+
+  shell_abstract_command_t *continued = parse_command("printf ${NA\\\nME}");
+  size_t count = 0;
+  const shell_abstract_element_t *const *elements =
+      continued ? shell_abstract_command_get_elements(continued, &count) : NULL;
+  valid = continued && elements && count == 1 && elements[0] &&
+          elements[0]->type == SHELL_ABSTRACT_EV &&
+          strcmp(shell_abstract_command_get_display_text(continued),
+                 "printf $EV_1") == 0 &&
+          strcmp(elements[0]->original, "${NA\\\nME}") == 0 &&
+          elements[0]->data.var.name &&
+          strcmp(elements[0]->data.var.name, "NAME") == 0;
+  shell_abstract_command_free(continued);
+  TEST("continued static variable names retain canonical metadata", valid);
 }
 
 static void test_compound_substitution_boundaries(void) {
@@ -186,6 +199,9 @@ static void test_parameter_expansion_metadata(void) {
       {"printf ${?}", SHELL_ABSTRACT_SV, "?"},
       {"printf ${#}", SHELL_ABSTRACT_SV, "#"},
       {"printf ${!}", SHELL_ABSTRACT_SV, "!"},
+      {"printf $\\\n{#}", SHELL_ABSTRACT_SV, "#"},
+      {"printf $\\\r\n{!}", SHELL_ABSTRACT_SV, "!"},
+      {"printf \"$\\\n{#}\"", SHELL_ABSTRACT_SV, "#"},
       {"printf ${#?}", SHELL_ABSTRACT_SV, "?"},
       {"printf ${!name}", SHELL_ABSTRACT_EV, "name"},
       {"printf ${!1}", SHELL_ABSTRACT_PV, "1"},
@@ -393,7 +409,7 @@ static void test_abstraction_matrix(void) {
       {"command substitution", "cat $(cat file.txt)", "cat $CS_1", 1,
        FLAG_CMD_SUBST},
       {"backtick substitution", "echo `date`", "echo $CS_1", 1, FLAG_CMD_SUBST},
-      {"arithmetic expansion", "echo $((x+1))", "echo $AR_1", 1,
+      {"arithmetic expansion", "echo $((1+2))", "echo $AR_1", 1,
        FLAG_ARITHMETIC},
       {"quoted string", "echo \"hello world\"", "echo $STR_1", 1, FLAG_STRINGS},
       {"quoted variable", "echo \"$USER\"", "echo $EV_1", 1, FLAG_VARIABLES},
@@ -458,7 +474,7 @@ static void test_abstraction_matrix(void) {
 static void test_abstraction_allocation_failures(void) {
   static const char input[] =
       "echo /var/log/$APP.log ./$REL ~/$HOME arg-$1 status-$? *.txt $(date) "
-      "$((x+1)) /a/$X/b ${VALUE:-$(date)} ${!prefix*} ${?} >output";
+      "$((1+2)) /a/$X/b ${VALUE:-$(date)} ${!prefix*} ${?} >output";
   shellsplit_test_alloc_reset();
   shell_abstract_command_t *probe = parse_command(input);
   TEST("allocation probe succeeds", probe != NULL);
@@ -858,6 +874,17 @@ static void test_type_sequence_matrix(void) {
                               &command_count) == SHELL_PROCESS_EOUTPUT_LIMIT &&
       netseq == NULL && command_count == 0;
   TEST("nested type sequence enforces its outer output limit", valid);
+
+  /* Input fits the bound, but its framed type sequence does not. This must
+   * fail at the output measurement boundary, not in source parsing. */
+  limits.max_string_bytes = 10;
+  netseq = (char *)(void *)1;
+  command_count = SIZE_MAX;
+  valid =
+      shell_build_type_netseq("echo x", strlen("echo x"), &limits, &netseq,
+                              &command_count) == SHELL_PROCESS_EOUTPUT_LIMIT &&
+      netseq == NULL && command_count == 0;
+  TEST("nested type sequence checks framed output after parsing", valid);
 }
 
 int main(void) {
@@ -865,7 +892,7 @@ int main(void) {
 
   test_abstraction_matrix();
   test_bounded_span_and_statuses();
-  test_ansi_c_arithmetic_span();
+  test_dynamic_arithmetic_is_rejected();
   test_compound_variable_quote_boundaries();
   test_compound_substitution_boundaries();
   test_parameter_expansion_metadata();

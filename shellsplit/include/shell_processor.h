@@ -37,7 +37,8 @@ typedef struct {
 /* `shell_group_io_op_t` has no concrete descriptor when it describes a list
  * relation. A Bash `{name}OPword` redirect instead allocates a descriptor at
  * execution time, so its identity is dynamic but must remain distinct from
- * that no-descriptor state. The source span retains the identifier spelling. */
+ * that no-descriptor state. `fd_name_*` retains the allocation spelling, so
+ * callers must not use this sentinel as a unique descriptor identity. */
 #define SHELL_PROCESS_FD_NONE UINT32_MAX
 #define SHELL_PROCESS_FD_NAMED (UINT32_MAX - 1u)
 
@@ -82,9 +83,12 @@ typedef enum {
  * covers the complete operator and operand; `operand_*` isolates the operand
  * and excludes deferred heredoc body data. `fd` is the effective numeric file
  * descriptor, SHELL_PROCESS_FD_NAMED for a dynamic Bash `{name}` descriptor,
- * or SHELL_PROCESS_FD_NONE for a non-descriptor list relation. `target_fd` is
- * meaningful only for SHELL_GROUP_IO_DUP_FD and is SHELL_PROCESS_FD_NONE for
- * every other operation. Explicit descriptor values are limited to INT_MAX.
+ * or SHELL_PROCESS_FD_NONE for a non-descriptor list relation. For a named
+ * descriptor, `fd_name_start..fd_name_end` covers its `{name}` source
+ * spelling. `target_fd` is meaningful only for SHELL_GROUP_IO_DUP_FD. A
+ * symbolic duplication target such as `>&"$fd"` has target_fd NONE and
+ * `target_name_start..target_name_end` covering the bare variable name.
+ * Explicit descriptor values are limited to INT_MAX.
  * A combined `&>` or `&>>` redirect has two same-span operations, ordered fd
  * 1 then fd 2. Process-substitution kinds retain
  * the complete `<(command)` or `>(command)` operand, rather than representing
@@ -104,6 +108,10 @@ typedef struct {
   uint32_t operand_end;
   uint32_t fd;
   uint32_t target_fd;
+  uint32_t fd_name_start;
+  uint32_t fd_name_end;
+  uint32_t target_name_start;
+  uint32_t target_name_end;
   shell_group_io_kind_t kind;
 } shell_group_io_op_t;
 
@@ -163,17 +171,24 @@ typedef struct {
  * structured API omits those records, while paired anomaly netsequences retain
  * their explicit empty-stage sentinel for callers that need every stage.
  *
- * It retains the full tokenizer's tolerant lexical handling for incomplete
- * parenthesized source, but rejects impossible list-operator chains just like
- * the structured APIs. shell_process_commands() requires a complete form it can
- * model. Recognized control compounds (loops, conditionals, `case`, `select`,
- * `coproc`, and function declarations), shell-semantic array assignments,
- * references, and declarations, and unmodeled Bash forms (`[[ … ]]`,
+ * For a complete supported compound group, it uses the structured group model
+ * to omit group-owned redirect operands from returned text while retaining
+ * their redirection flags; independent redirect-only stages remain explicit.
+ * It otherwise retains the full tokenizer's tolerant lexical handling for
+ * incomplete parenthesized source, but rejects impossible list-operator chains
+ * just like the structured APIs. shell_process_commands() requires a complete
+ * form it can model. Recognized control compounds (loops, conditionals, `case`,
+ * `select`, `coproc`, and function declarations), shell-semantic array
+ * assignments, references, declarations, and element targets (including
+ * `printf -v name[0]` and `read -a name`), and unmodeled current-shell forms
+ * (`mapfile`/`readarray`, `wait -p`, `pushd`/`popd`, and dynamic or mutating
+ * arithmetic expansions) return SHELL_PROCESS_EPARSE. Other unmodeled Bash
+ * forms (`[[ … ]]`,
  * `(( … ))`, leading `time` pipelines, locale quotes `$"…"`, and case
- * fall-through `;&` / `;;&`) return SHELL_PROCESS_EPARSE. Supported compound
- * groups contain simple-command lists, pipelines, and nested brace/subshell
- * groups; callers must not infer support for control compounds from group
- * support. On failure, writable outputs are set to NULL and zero.
+ * fall-through `;&` / `;;&`) also return SHELL_PROCESS_EPARSE. Supported
+ * compound groups contain simple-command lists, pipelines, and nested
+ * brace/subshell groups; callers must not infer support for control compounds
+ * from group support. On failure, writable outputs are set to NULL and zero.
  */
 shell_process_status_t
 shell_process_command(const char *command_line, size_t command_length,
@@ -221,6 +236,15 @@ shell_process_status_t
 shell_visit_decoded_word(const char *text, size_t length,
                          shell_decoded_word_visitor_t visitor, void *context,
                          size_t *decoded_length);
+
+/** Visit a complete word only when its value is statically determined.
+ * Quote removal, escapes, and ANSI-C quotes are decoded; parameter, command,
+ * arithmetic, glob, brace, process, and tilde expansion make the word
+ * non-static. Returns false for a dynamic, malformed, or invalid word. The
+ * visitor and decoded_length have the same semantics as above. */
+bool shell_visit_static_word(const char *text, size_t length,
+                             shell_decoded_word_visitor_t visitor,
+                             void *context, size_t *decoded_length);
 
 /** Measure the decoded payload of one already-isolated shell word, assembling
  * quote fragments and escapes. This is not shell tokenization: callers must
@@ -285,8 +309,10 @@ shell_render_netargv(const shell_command_info_t *info,
 
 /** Encode one command's already-processed arguments as concatenated canonical
  * netstrings in owned byte storage. Payloads, including those decoded from
- * Bash ANSI-C quotes, may contain NUL. `buffer` must be empty (initialized to
- * {0} or released with shell_netstring_buffer_free()) and is empty on failure.
+ * standalone decoded-word helpers, may contain NUL. Complete-command
+ * processing rejects NUL-producing ANSI-C source by default. `buffer` must
+ * be empty (initialized to {0} or released with shell_netstring_buffer_free())
+ * and is empty on failure.
  * A populated or inconsistent buffer is rejected without modification. Release
  * a successful result with shell_netstring_buffer_free() before reusing it as
  * an output argument. */

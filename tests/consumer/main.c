@@ -1,11 +1,20 @@
 #include <env_screener.h>
+#include <shell_depgraph.h>
 #include <shell_sequence.h>
 #include <shell_tokenizer.h>
 #include <shellgate.h>
 #include <shelltype.h>
 
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifdef SG_BUF_MIN
+#error "SG_BUF_MIN must not be exposed by the current public API"
+#endif
+#ifndef SG_DIAGNOSTIC_BUF_MIN
+#error "SG_DIAGNOSTIC_BUF_MIN must remain available for diagnostic buffers"
+#endif
 
 static bool count_token(const st_token_view_t *token, void *user_ctx) {
   size_t *count = user_ctx;
@@ -66,6 +75,32 @@ static bool check_policy_view_apis(st_netargv_view_t netargv) {
   st_policy_free(empty);
   st_policy_free(policy);
   st_policy_ctx_release(ctx);
+  return ok;
+}
+
+/* Exercise the installed caller-owned dependency-graph workspace contract,
+ * including its declared alignment, without relying on test-only adapters. */
+static bool check_depgraph_workspace_api(void) {
+  size_t workspace_size = 0;
+  size_t alignment = shell_dep_workspace_alignment();
+  if (alignment == 0 || (alignment & (alignment - 1)) != 0 ||
+      !shell_dep_workspace_size(NULL, &workspace_size) || workspace_size == 0 ||
+      workspace_size > SIZE_MAX - (alignment - 1))
+    return false;
+
+  unsigned char *raw = malloc(workspace_size + alignment - 1);
+  if (!raw)
+    return false;
+  uintptr_t address = (uintptr_t)(void *)raw;
+  size_t padding = (size_t)((alignment - address % alignment) % alignment);
+  shell_dep_limits_t limits = SHELL_DEP_LIMITS_DEFAULT;
+  limits.workspace = raw + padding;
+  limits.workspace_size = workspace_size;
+  shell_dep_graph_t graph = {0};
+  bool ok = shell_dep_graph_parse("echo hello", strlen("echo hello"), ".",
+                                  &limits, &graph) == SHELL_DEP_OK &&
+            shell_dep_graph_validate(&graph).valid;
+  free(raw);
   return ok;
 }
 
@@ -144,16 +179,22 @@ int main(void) {
   st_suggestion_list_free(suggestions, suggestion_count);
   st_learner_free(learner);
 
+  if (!check_depgraph_workspace_api())
+    return 7;
+
   sg_gate_t *gate = sg_gate_new();
   if (!gate || sg_gate_add_allow_cpl(gate, "echo hello") != SG_OK) {
     sg_gate_free(gate);
     return 7;
   }
-  char buffer[SG_BUF_MIN];
+  size_t buffer_size = sg_gate_evaluate_size_hint(strlen("echo hello"));
+  char *buffer = buffer_size == SIZE_MAX ? NULL : malloc(buffer_size);
   sg_result_t result;
   sg_error_t gate_error =
-      sg_gate_evaluate(gate, "echo hello", strlen("echo hello"), buffer,
-                       sizeof(buffer), &result);
+      buffer ? sg_gate_evaluate(gate, "echo hello", strlen("echo hello"),
+                                buffer, buffer_size, &result)
+             : SG_ERR_MEMORY;
+  free(buffer);
   sg_gate_free(gate);
   return gate_error == SG_OK && result.verdict == SG_VERDICT_ALLOW ? 0 : 8;
 }

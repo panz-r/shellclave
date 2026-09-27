@@ -19,6 +19,7 @@
 #include <fuzzer/FuzzedDataProvider.h>
 
 extern "C" {
+#include "shell_depgraph.h"
 #include "shell_netstring.h"
 #include "shell_tokenizer.h"
 #include "shellgate.h"
@@ -37,6 +38,55 @@ extern "C" {
 namespace {
 
 constexpr int kPoolSize = 8;
+
+/* Shellgate's public evaluation buffer owns the bounded depgraph workspace as
+ * well as result strings. Fuzz inputs vary only the result-prefix budget; the
+ * same caller-owned allocation always retains enough aligned route storage. */
+size_t eval_buffer_size(size_t command_length, size_t minimum_prefix = 0) {
+  size_t hint = sg_gate_evaluate_size_hint(command_length);
+  if (hint == SIZE_MAX)
+    return 0;
+  size_t workspace = 0;
+  size_t alignment = shell_dep_workspace_alignment();
+  if (!shell_dep_workspace_size(nullptr, &workspace) || alignment == 0 ||
+      minimum_prefix > SIZE_MAX - workspace ||
+      minimum_prefix + workspace > SIZE_MAX - (alignment - 1))
+    return 0;
+  size_t minimum = minimum_prefix + workspace + alignment - 1;
+  return hint > minimum ? hint : minimum;
+}
+
+/* The hot fuzzer path evaluates, replays, and sometimes enlarges the same
+ * command. Reuse its caller-owned workspaces instead of feeding multi-megabyte
+ * allocations into ASan's quarantine on every input. */
+struct reusable_eval_buffer {
+  std::vector<char> storage;
+
+  bool reset_for(size_t command_length, size_t minimum_prefix = 0) {
+    size_t size = eval_buffer_size(command_length, minimum_prefix);
+    if (size == 0)
+      return false;
+    reset(size);
+    return true;
+  }
+
+  char *reset(size_t size) {
+    storage.resize(size);
+    /* sg_gate_evaluate overwrites every published byte. Clearing a bounded
+     * multi-megabyte depgraph workspace here would turn every fuzz input into
+     * an unnecessary memory sweep. */
+    return storage.data();
+  }
+
+  char *data() { return storage.data(); }
+  size_t size() const { return storage.size(); }
+};
+
+struct eval_buffer_set {
+  reusable_eval_buffer result;
+  reusable_eval_buffer replay;
+  reusable_eval_buffer large;
+};
 
 /* Curated deny patterns. Variability comes from the pool: each entry gets a
  * different subset of these, so the rule-evaluation path is exercised with
@@ -74,10 +124,19 @@ constexpr int kSeedCmdsN = sizeof(kSeedCmds) / sizeof(kSeedCmds[0]);
 
 sg_gate_t *g_anomaly_pool[kPoolSize];
 sg_gate_t *g_policy_pool[kPoolSize];
+eval_buffer_set g_eval_buffers;
 
 void invariant_failure(const char *message) {
   fprintf(stderr, "shellgate fuzz invariant failed: %s\n", message);
   abort();
+}
+
+reusable_eval_buffer &eval_buffer_for(reusable_eval_buffer &buffer,
+                                      size_t command_length,
+                                      size_t minimum_prefix = 0) {
+  if (!buffer.reset_for(command_length, minimum_prefix))
+    invariant_failure("evaluation buffer size overflow");
+  return buffer;
 }
 
 int valid_buffer_string(const char *value, const char *buffer, size_t size) {
@@ -85,9 +144,12 @@ int valid_buffer_string(const char *value, const char *buffer, size_t size) {
     return 1;
   uintptr_t address = (uintptr_t)value;
   uintptr_t begin = (uintptr_t)buffer;
-  if (address < begin || address >= begin + size)
+  if (address < begin)
     return 0;
-  return memchr(value, '\0', size - (size_t)(address - begin)) != NULL;
+  uintptr_t offset = address - begin;
+  if (offset >= size)
+    return 0;
+  return memchr(value, '\0', size - (size_t)offset) != NULL;
 }
 
 int valid_buffer_span(const char *value, size_t length, const char *buffer,
@@ -96,9 +158,33 @@ int valid_buffer_span(const char *value, size_t length, const char *buffer,
     return length == 0;
   uintptr_t address = (uintptr_t)value;
   uintptr_t begin = (uintptr_t)buffer;
-  if (address < begin || address > begin + size)
+  if (address < begin)
     return 0;
-  return length <= size - (size_t)(address - begin);
+  uintptr_t offset = address - begin;
+  if (offset > size)
+    return 0;
+  return length <= size - (size_t)offset;
+}
+
+/* Mirror Shellgate's documented aligned workspace placement. Graph-backed
+ * results must not expose pointers into this private tail; early parse and
+ * feature rejections intentionally retain the complete caller buffer. */
+size_t eval_result_prefix_size(const char *buffer, size_t buffer_size) {
+  size_t workspace_size = 0;
+  size_t alignment = shell_dep_workspace_alignment();
+  if (!buffer || buffer_size == 0 ||
+      !shell_dep_workspace_size(nullptr, &workspace_size) || alignment == 0 ||
+      workspace_size > buffer_size)
+    return 0;
+  uintptr_t begin = (uintptr_t)buffer;
+  if (buffer_size > UINTPTR_MAX - begin)
+    return 0;
+  uintptr_t start = begin + buffer_size - workspace_size;
+  uintptr_t padding = start % alignment;
+  if (padding > start || start - padding < begin)
+    return 0;
+  start -= padding;
+  return start == begin ? 0 : (size_t)(start - begin);
 }
 
 bool valid_verdict(sg_verdict_t verdict) {
@@ -125,7 +211,8 @@ void validate_result(const sg_result_t *result, sg_error_t error,
       result->subcommand_count > SG_MAX_SUBCOMMAND_RESULTS ||
       result->violation_count > SG_MAX_VIOLATIONS ||
       result->suggestion_count > 2 || result->deny_suggestion_count > 2 ||
-      (error == SG_ERR_TRUNC) != result->truncated ||
+      (error == SG_ERR_TRUNC && !result->truncated) ||
+      (result->truncated && result->verdict != SG_VERDICT_UNDETERMINED) ||
       (error == SG_ERR_TRUNC &&
        (result->verdict == SG_VERDICT_ALLOW ||
         result->verdict == SG_VERDICT_ALLOW_CONDITIONAL)) ||
@@ -185,6 +272,22 @@ void validate_result(const sg_result_t *result, sg_error_t error,
    * relation terminates at a group. */
   if (result->short_circuited && result->subcommand_count == 0)
     invariant_failure("short-circuit result has no evaluated prefix");
+}
+
+void validate_known_graph_result_prefix(const sg_result_t *result,
+                                        sg_error_t error, const char *buffer,
+                                        size_t buffer_size) {
+  size_t prefix_size = eval_result_prefix_size(buffer, buffer_size);
+  if (prefix_size == 0)
+    invariant_failure("graph result had no public output prefix");
+  validate_result(result, error, buffer, prefix_size);
+}
+
+void validate_graph_result_prefix(const sg_result_t *result, sg_error_t error,
+                                  const char *buffer, size_t buffer_size) {
+  if (error != SG_OK || result->verdict == SG_VERDICT_REJECT)
+    return;
+  validate_known_graph_result_prefix(result, error, buffer, buffer_size);
 }
 
 bool results_equal(const sg_result_t &left, const sg_result_t &right) {
@@ -250,6 +353,26 @@ bool results_equal(const sg_result_t &left, const sg_result_t &right) {
       return false;
   }
   return true;
+}
+
+/* A buffer can be too small both for the mandatory depgraph workspace and for
+ * its explanatory diagnostic. SG_ERR_MEMORY remains the primary failure;
+ * truncation describes the independently incomplete diagnostic result. Keep
+ * this mixed-status contract in the deterministic oracle path because normal
+ * fuzz buffers always reserve the workspace tail. */
+void run_evaluation_buffer_contract_oracle() {
+  sg_gate_t *gate = sg_gate_new();
+  if (!gate)
+    invariant_failure("buffer contract gate setup failed");
+  char tiny_buffer[1];
+  sg_result_t result = {};
+  sg_error_t error = sg_gate_evaluate(gate, "ls", 2, tiny_buffer,
+                                      sizeof(tiny_buffer), &result);
+  if (error != SG_ERR_MEMORY || !result.truncated ||
+      result.verdict != SG_VERDICT_UNDETERMINED)
+    invariant_failure("workspace and diagnostic failure contract mismatch");
+  validate_result(&result, error, tiny_buffer, sizeof(tiny_buffer));
+  sg_gate_free(gate);
 }
 
 /* A compact, parser-independent semantic reference set. These cases describe
@@ -387,11 +510,12 @@ void run_semantic_reference_oracles() {
       if (sg_gate_add_allow_cpl(gate, item.rules[i]) != SG_OK)
         invariant_failure("semantic oracle rule setup failed");
 
-    char buffer[4096];
+    reusable_eval_buffer &buffer =
+        eval_buffer_for(g_eval_buffers.result, std::strlen(item.input));
     sg_result_t result = {};
     sg_error_t error =
-        sg_gate_evaluate(gate, item.input, std::strlen(item.input), buffer,
-                         sizeof(buffer), &result);
+        sg_gate_evaluate(gate, item.input, std::strlen(item.input),
+                         buffer.data(), buffer.size(), &result);
     if (error != SG_OK || result.verdict != item.verdict ||
         result.subcommand_count != item.command_count ||
         result.requires_substitution_evaluation !=
@@ -415,11 +539,12 @@ void run_semantic_reference_oracles() {
     invariant_failure("compound-word oracle gate setup failed");
   static const char compound_input[] =
       "$'c'3>out;cat \"x\"${y}z;my\\\r\ncommand value";
-  char compound_buffer[4096];
+  reusable_eval_buffer &compound_buffer =
+      eval_buffer_for(g_eval_buffers.result, sizeof(compound_input) - 1);
   sg_result_t compound_result = {};
   if (sg_gate_evaluate(compound_gate, compound_input,
-                       sizeof(compound_input) - 1, compound_buffer,
-                       sizeof(compound_buffer), &compound_result) != SG_OK ||
+                       sizeof(compound_input) - 1, compound_buffer.data(),
+                       compound_buffer.size(), &compound_result) != SG_OK ||
       compound_result.subcommand_count != 3 ||
       !compound_result.subcommands[0].netargv ||
       !compound_result.subcommands[1].netargv ||
@@ -430,6 +555,142 @@ void run_semantic_reference_oracles() {
           0)
     invariant_failure("compound-word policy netargv oracle mismatch");
   sg_gate_free(compound_gate);
+
+  /* Assignment prefixes do not replace a current-shell descriptor-variable
+   * binding. Keep this fixed oracle independent of the checked-in fuzz seeds:
+   * a regression must not turn a valid redirect into a graph parse error. */
+  sg_gate_t *named_fd_prefix_gate = sg_gate_new();
+  if (!named_fd_prefix_gate ||
+      sg_gate_set_reject_mask(named_fd_prefix_gate, 0) != SG_OK ||
+      sg_gate_add_allow_cpl(named_fd_prefix_gate, "exec") != SG_OK ||
+      sg_gate_add_allow_cpl(named_fd_prefix_gate, "producer") != SG_OK ||
+      sg_gate_add_allow_cpl(named_fd_prefix_gate, "printf *") != SG_OK)
+    invariant_failure("named-fd prefix oracle gate setup failed");
+  static const char named_fd_prefix_input[] =
+      "exec {fd}>/tmp/fuzz-prefix; fd=shadow printf bytes >&$fd; "
+      "printf later >&$fd";
+  reusable_eval_buffer &named_fd_buffer =
+      eval_buffer_for(g_eval_buffers.result, sizeof(named_fd_prefix_input) - 1);
+  sg_result_t named_fd_result = {};
+  if (sg_gate_evaluate(named_fd_prefix_gate, named_fd_prefix_input,
+                       sizeof(named_fd_prefix_input) - 1,
+                       named_fd_buffer.data(), named_fd_buffer.size(),
+                       &named_fd_result) != SG_OK ||
+      named_fd_result.verdict != SG_VERDICT_ALLOW ||
+      named_fd_result.subcommand_count != 3)
+    invariant_failure("named-fd prefix oracle mismatch");
+  static const char named_fd_append_prefix_input[] =
+      "exec {fd}>/tmp/fuzz-append-prefix; fd+=shadow printf bytes >&$fd; "
+      "printf later >&$fd";
+  eval_buffer_for(named_fd_buffer, sizeof(named_fd_append_prefix_input) - 1);
+  if (sg_gate_evaluate(named_fd_prefix_gate, named_fd_append_prefix_input,
+                       sizeof(named_fd_append_prefix_input) - 1,
+                       named_fd_buffer.data(), named_fd_buffer.size(),
+                       &named_fd_result) != SG_OK ||
+      named_fd_result.verdict != SG_VERDICT_ALLOW ||
+      named_fd_result.subcommand_count != 3)
+    invariant_failure("named-fd append-prefix oracle mismatch");
+
+  /* A persistent close is valid setup, but it must remove the named route
+   * before a later exact redirect can reach policy evaluation. */
+  static const char named_fd_close_input[] =
+      "exec {fd}>/tmp/fuzz-close; exec {fd}>&-";
+  eval_buffer_for(named_fd_buffer, sizeof(named_fd_close_input) - 1);
+  if (sg_gate_evaluate(named_fd_prefix_gate, named_fd_close_input,
+                       sizeof(named_fd_close_input) - 1, named_fd_buffer.data(),
+                       named_fd_buffer.size(), &named_fd_result) != SG_OK ||
+      named_fd_result.verdict != SG_VERDICT_ALLOW ||
+      named_fd_result.subcommand_count != 2)
+    invariant_failure("named-fd close oracle mismatch");
+  static const char named_fd_closed_use_input[] =
+      "exec {fd}>/tmp/fuzz-close; exec {fd}>&-; printf bytes >&$fd";
+  eval_buffer_for(named_fd_buffer, sizeof(named_fd_closed_use_input) - 1);
+  if (sg_gate_evaluate(named_fd_prefix_gate, named_fd_closed_use_input,
+                       sizeof(named_fd_closed_use_input) - 1,
+                       named_fd_buffer.data(), named_fd_buffer.size(),
+                       &named_fd_result) != SG_ERR_PARSE ||
+      named_fd_result.verdict != SG_VERDICT_REJECT)
+    invariant_failure("named-fd closed-use oracle mismatch");
+
+  static const char named_fd_assignment_input[] =
+      "exec {fd}>/tmp/fuzz-assignment; f\\\nd=shadow; printf bytes >&$fd";
+  eval_buffer_for(named_fd_buffer, sizeof(named_fd_assignment_input) - 1);
+  if (sg_gate_evaluate(named_fd_prefix_gate, named_fd_assignment_input,
+                       sizeof(named_fd_assignment_input) - 1,
+                       named_fd_buffer.data(), named_fd_buffer.size(),
+                       &named_fd_result) != SG_ERR_PARSE ||
+      named_fd_result.verdict != SG_VERDICT_REJECT)
+    invariant_failure("named-fd assignment oracle mismatch");
+  static const char named_fd_append_assignment_input[] =
+      "exec {fd}>/tmp/fuzz-append-assignment; f\\\n"
+      "d+=shadow; printf bytes >&$fd";
+  eval_buffer_for(named_fd_buffer,
+                  sizeof(named_fd_append_assignment_input) - 1);
+  if (sg_gate_evaluate(named_fd_prefix_gate, named_fd_append_assignment_input,
+                       sizeof(named_fd_append_assignment_input) - 1,
+                       named_fd_buffer.data(), named_fd_buffer.size(),
+                       &named_fd_result) != SG_ERR_PARSE ||
+      named_fd_result.verdict != SG_VERDICT_REJECT)
+    invariant_failure("named-fd append-assignment oracle mismatch");
+
+  /* A readonly descriptor variable makes a later `{fd}>...` allocation fail
+   * while retaining its old value in Bash. Shellgate must reject the entire
+   * source at the shared semantic boundary instead of evaluating a graph with
+   * a fictitious route to the replacement file. */
+  static const char *const named_fd_readonly_inputs[] = {
+      "exec {fd}>/tmp/fuzz-readonly-first; readonly fd; "
+      "exec {fd}>/tmp/fuzz-readonly-second; printf bytes >&$fd",
+      "exec {fd}>/tmp/fuzz-readonly-first; declare -r fd; "
+      "exec {fd}>/tmp/fuzz-readonly-second; printf bytes >&$fd",
+      "exec {fd}>/tmp/fuzz-readonly-first; typeset -r fd; "
+      "exec {fd}>/tmp/fuzz-readonly-second; printf bytes >&$fd",
+  };
+  for (const char *input : named_fd_readonly_inputs) {
+    eval_buffer_for(named_fd_buffer, std::strlen(input));
+    if (sg_gate_evaluate(named_fd_prefix_gate, input, std::strlen(input),
+                         named_fd_buffer.data(), named_fd_buffer.size(),
+                         &named_fd_result) != SG_ERR_PARSE ||
+        named_fd_result.verdict != SG_VERDICT_REJECT)
+      invariant_failure("named-fd readonly oracle mismatch");
+  }
+
+  /* Dynamic words after `set -o` and `printf -v` are not ordinary argv: they
+   * can respectively change POSIX mode or write POSIXLY_CORRECT in the current
+   * shell. The lexer exposes parameter expansions as fragments, so keep this
+   * fixed oracle at the public Shellgate boundary. */
+  static const char *const dynamic_current_shell_inputs[] = {
+      "set -o \"$option\"; printf bytes",
+      "target='POSIXLY_CORRECT=1'; declare \"$target\"; printf bytes",
+      "target='POSIXLY_CORRECT=1'; typeset \"$target\"; printf bytes",
+      "target='POSIXLY_CORRECT=1'; export \"$target\"; printf bytes",
+      "printf -v \"$target\" enabled; printf bytes",
+      "printf -v\"$target\" enabled; printf bytes",
+      "printf -v${target} enabled; printf bytes",
+  };
+  for (const char *input : dynamic_current_shell_inputs) {
+    eval_buffer_for(named_fd_buffer, std::strlen(input));
+    if (sg_gate_evaluate(named_fd_prefix_gate, input, std::strlen(input),
+                         named_fd_buffer.data(), named_fd_buffer.size(),
+                         &named_fd_result) != SG_ERR_PARSE ||
+        named_fd_result.verdict != SG_VERDICT_REJECT)
+      invariant_failure("dynamic current-shell oracle mismatch");
+  }
+
+  static const char named_fd_input_process_substitution[] =
+      "exec {source}< <(producer); printf bytes";
+  eval_buffer_for(named_fd_buffer,
+                  sizeof(named_fd_input_process_substitution) - 1);
+  if (sg_gate_evaluate(named_fd_prefix_gate,
+                       named_fd_input_process_substitution,
+                       sizeof(named_fd_input_process_substitution) - 1,
+                       named_fd_buffer.data(), named_fd_buffer.size(),
+                       &named_fd_result) != SG_OK ||
+      named_fd_result.verdict != SG_VERDICT_ALLOW ||
+      named_fd_result.subcommand_count != 3 ||
+      !named_fd_result.has_dynamic_substitution_io ||
+      named_fd_result.requires_substitution_evaluation)
+    invariant_failure("named-fd process-substitution topology oracle mismatch");
+  sg_gate_free(named_fd_prefix_gate);
 
   /* Shellgate must receive one policy subject only when shell syntax actually
    * quotes the metacharacter. Keep feature rejection disabled: this oracle
@@ -450,10 +711,11 @@ void run_semantic_reference_oracles() {
       sg_gate_set_reject_mask(opaque_word_gate, 0) != SG_OK)
     invariant_failure("opaque-word oracle gate setup failed");
   for (const char *input : opaque_word_cases) {
-    char buffer[4096] = {};
+    reusable_eval_buffer &buffer =
+        eval_buffer_for(g_eval_buffers.result, std::strlen(input));
     sg_result_t result = {};
-    if (sg_gate_evaluate(opaque_word_gate, input, std::strlen(input), buffer,
-                         sizeof(buffer), &result) != SG_OK ||
+    if (sg_gate_evaluate(opaque_word_gate, input, std::strlen(input),
+                         buffer.data(), buffer.size(), &result) != SG_OK ||
         result.verdict != SG_VERDICT_UNDETERMINED ||
         result.subcommand_count != 1 || !result.subcommands[0].netargv ||
         result.truncated)
@@ -471,10 +733,11 @@ void run_semantic_reference_oracles() {
       sg_gate_set_reject_mask(structural_word_gate, 0) != SG_OK)
     invariant_failure("structural-word oracle gate setup failed");
   for (const char *input : structural_word_cases) {
-    char buffer[4096] = {};
+    reusable_eval_buffer &buffer =
+        eval_buffer_for(g_eval_buffers.result, std::strlen(input));
     sg_result_t result = {};
     if (sg_gate_evaluate(structural_word_gate, input, std::strlen(input),
-                         buffer, sizeof(buffer), &result) != SG_OK ||
+                         buffer.data(), buffer.size(), &result) != SG_OK ||
         result.verdict != SG_VERDICT_UNDETERMINED ||
         result.subcommand_count != 2 || !result.subcommands[0].netargv ||
         !result.subcommands[1].netargv || result.truncated)
@@ -496,25 +759,128 @@ void run_semantic_reference_oracles() {
       "cat <<EOF\n`select item in one; do :; done`\nEOF\n",
       "cat <<EOF\n${items[0]}\nEOF\n",
       "cat <<EOF\n$((items[0]))\nEOF\n",
-      "cmd {fd}< <(producer)",
-      "cmd {fd}< prefix<(producer)",
-      "cmd {fd}> >(consumer)",
-      "cmd {fd}> prefix>(consumer)",
-      "cmd {fd}<> <(producer)",
   };
   sg_gate_t *unmodeled_gate = sg_gate_new();
   if (!unmodeled_gate || sg_gate_set_reject_mask(unmodeled_gate, 0) != SG_OK)
     invariant_failure("unmodeled semantic oracle gate setup failed");
   for (const char *input : unmodeled_semantic_cases) {
-    char buffer[4096] = {};
+    reusable_eval_buffer &buffer =
+        eval_buffer_for(g_eval_buffers.result, std::strlen(input));
     sg_result_t result = {};
-    if (sg_gate_evaluate(unmodeled_gate, input, std::strlen(input), buffer,
-                         sizeof(buffer), &result) != SG_ERR_PARSE ||
+    if (sg_gate_evaluate(unmodeled_gate, input, std::strlen(input),
+                         buffer.data(), buffer.size(),
+                         &result) != SG_ERR_PARSE ||
         result.verdict != SG_VERDICT_REJECT || result.subcommand_count != 1 ||
         result.truncated)
       invariant_failure("unmodeled semantic rejection mismatch");
   }
   sg_gate_free(unmodeled_gate);
+
+  static const char *const named_fd_cases[] = {
+      "cmd {fd}< <(producer)",
+      "cmd {fd}< prefix<(producer)",
+      "cmd {fd}> >(consumer)",
+      "cmd {fd}> prefix>(consumer)",
+      "cmd {fd}<> <(producer)",
+      "printf x {fd}>out >&$fd",
+      "printf x {fd}>out; printf x >&$fd",
+      "exec {fd}>out; ( printf x >&$fd )",
+      "( printf x >&$fd ) {fd}>out",
+      "exec {fd}<&0; printf x \"$(cat <&$fd)\"",
+      "exec {source}<in; exec {copy}<&$source; printf x \"$(cat <&$copy)\"",
+      "exec {out}>out; exec {copy}<&$out; printf x >&$copy",
+      "exec {in}<in; exec {copy}>&$in; cat <&$copy",
+      "exec {out}>out; exec {out}>&$out; printf x >&$out",
+      "printf {fd}<in > >(cat <&$fd)",
+      "printf x >&combined",
+      "printf x 1>&combined",
+      "printf x >&$",
+      "printf x >&[",
+      "printf x >&file[part",
+      "printf x >&literal{path}",
+      "printf x >&literal$destination",
+      "printf x >&literal${destination}",
+      "printf x >&literal$((1 + 2))",
+      "printf x >&\"\"literal$(printf target)",
+      "printf x >&file{one,two}",
+      "printf x >&*.log",
+      "printf x >& >(consumer)",
+      "exec 3>out; printf x >&3",
+      "exec 3<in; printf x \"$(cat <&3)\"",
+      "exec 3> >(consumer); printf x >&3",
+  };
+  sg_gate_t *named_fd_gate = sg_gate_new();
+  if (!named_fd_gate || sg_gate_set_reject_mask(named_fd_gate, 0) != SG_OK)
+    invariant_failure("named-fd semantic oracle gate setup failed");
+  for (const char *input : named_fd_cases) {
+    reusable_eval_buffer &buffer =
+        eval_buffer_for(g_eval_buffers.result, std::strlen(input));
+    sg_result_t result = {};
+    if (sg_gate_evaluate(named_fd_gate, input, std::strlen(input),
+                         buffer.data(), buffer.size(), &result) != SG_OK ||
+        result.verdict != SG_VERDICT_UNDETERMINED ||
+        result.subcommand_count < 1 || !result.subcommands[0].netargv ||
+        result.truncated)
+      invariant_failure("named-fd semantic oracle mismatch");
+  }
+  sg_gate_free(named_fd_gate);
+
+  static const char *const named_fd_snapshot_rejections[] = {
+      "printf x {fd}<in \"$(cat <&$fd)\"",
+      "exec {fd}<in; exec {fd}<&-; printf x \"$(cat <&$fd)\"",
+      "exec {fd}>&-",
+      "exec {fd}<&-",
+      "printf x 2>&combined",
+      "printf x {fd}>&combined",
+      "printf x >&$destination",
+      "printf x >&~",
+      "printf x >&*",
+      "printf x >&@(file)",
+      "printf x >&[[:digit:]]",
+      "printf x >&[[=a=]]",
+      "printf x >&[[.a.]]",
+      "printf x >&\\\n~",
+      "printf > >(cat <&$fd) {fd}<in",
+      "shopt -u varredir_close; : {fd}<in; printf x \"$(cat <&$fd)\"",
+      "x+=value shopt -s varredir_close; : {fd}<in; "
+      "printf x \"$(cat <&$fd)\"",
+      "x+\\\n=value shopt -u varredir_close; : {fd}<in; "
+      "printf x \"$(cat <&$fd)\"",
+      "shopt -s lastpipe; printf source | : {fd}<in; "
+      "printf x \"$(cat <&$fd)\"",
+      "eval 'shopt -s lastpipe'; printf source | : {fd}<in; "
+      "printf x \"$(cat <&$fd)\"",
+      ". /tmp/shell-state; printf source | : {fd}<in; "
+      "printf x \"$(cat <&$fd)\"",
+      "command source /tmp/shell-state; printf source | : {fd}<in; "
+      "printf x \"$(cat <&$fd)\"",
+      "trap 'shopt -s lastpipe' DEBUG; printf source | : {fd}<in; "
+      "printf x \"$(cat <&$fd)\"",
+      "alias change_scope='shopt -s lastpipe'; "
+      "printf source | : {fd}<in; printf x \"$(cat <&$fd)\"",
+      "shopt -s expand_aliases; printf source | : {fd}<in; "
+      "printf x \"$(cat <&$fd)\"",
+      "history -s 'shopt -s lastpipe'; fc -s -1; "
+      "printf source | : {fd}<in; printf x \"$(cat <&$fd)\"",
+      "enable -f /tmp/shell-state change_scope; "
+      "printf source | : {fd}<in; printf x \"$(cat <&$fd)\"",
+      "( : ) {fd}>out; printf x >&$fd",
+  };
+  named_fd_gate = sg_gate_new();
+  if (!named_fd_gate || sg_gate_set_reject_mask(named_fd_gate, 0) != SG_OK)
+    invariant_failure("named-fd snapshot rejection gate setup failed");
+  for (const char *input : named_fd_snapshot_rejections) {
+    reusable_eval_buffer &buffer =
+        eval_buffer_for(g_eval_buffers.result, std::strlen(input));
+    sg_result_t result = {};
+    if (sg_gate_evaluate(named_fd_gate, input, std::strlen(input),
+                         buffer.data(), buffer.size(),
+                         &result) != SG_ERR_PARSE ||
+        result.verdict != SG_VERDICT_REJECT || result.subcommand_count != 1 ||
+        result.truncated)
+      invariant_failure("named-fd snapshot rejection mismatch");
+  }
+  sg_gate_free(named_fd_gate);
 
   /* A syntactically valid redirect-only list element has no argv policy
    * subject. It must remain explicitly undetermined, while preserving normal
@@ -541,11 +907,12 @@ void run_semantic_reference_oracles() {
   };
   for (size_t i = 0; i < std::size(redirect_cases); i++) {
     const redirect_oracle_case &item = redirect_cases[i];
-    char buffer[4096] = {};
+    reusable_eval_buffer &buffer =
+        eval_buffer_for(g_eval_buffers.result, std::strlen(item.input));
     sg_result_t result = {};
     size_t vocabulary_before = sg_gate_anomaly_vocab_size(redirect_gate);
     if (sg_gate_evaluate(redirect_gate, item.input, std::strlen(item.input),
-                         buffer, sizeof(buffer), &result) != SG_OK ||
+                         buffer.data(), buffer.size(), &result) != SG_OK ||
         result.verdict != SG_VERDICT_UNDETERMINED ||
         result.subcommand_count != item.command_count || !result.deny_reason ||
         std::strcmp(result.deny_reason, redirect_reason) != 0 ||
@@ -568,12 +935,14 @@ void run_semantic_reference_oracles() {
       sg_gate_set_reject_mask(strong_redirect_gate, 0) != SG_OK ||
       sg_gate_add_deny_cpl(strong_redirect_gate, "blocked") != SG_OK)
     invariant_failure("strong redirect-only oracle gate setup failed");
-  char strong_buffer[4096] = {};
+  reusable_eval_buffer &strong_buffer = eval_buffer_for(
+      g_eval_buffers.result, std::strlen("blocked; >/tmp/fuzz-redirect-only"));
   sg_result_t strong_result = {};
-  if (sg_gate_evaluate(
-          strong_redirect_gate, "blocked; >/tmp/fuzz-redirect-only",
-          std::strlen("blocked; >/tmp/fuzz-redirect-only"), strong_buffer,
-          sizeof(strong_buffer), &strong_result) != SG_OK ||
+  if (sg_gate_evaluate(strong_redirect_gate,
+                       "blocked; >/tmp/fuzz-redirect-only",
+                       std::strlen("blocked; >/tmp/fuzz-redirect-only"),
+                       strong_buffer.data(), strong_buffer.size(),
+                       &strong_result) != SG_OK ||
       strong_result.verdict != SG_VERDICT_DENY ||
       strong_result.subcommand_count != 1 ||
       strong_result.subcommands[0].verdict != SG_VERDICT_DENY ||
@@ -597,6 +966,8 @@ void run_decoded_path_oracles() {
       {"cat ~/.s\\sh/id_rsa", SG_VIOL_READ_SECRETS, true},
       {"echo payload >> ~/.b\"ashrc\"", SG_VIOL_PERSISTENCE, true},
       {"echo payload >> ~/.b\\ashrc", SG_VIOL_PERSISTENCE, true},
+      {"printf x >/etc/replaced >/tmp/out", SG_VIOL_WRITE_SENSITIVE, true},
+      {"echo payload >> ~/.bashrc >/tmp/out", SG_VIOL_PERSISTENCE, true},
       {"cat ~/.s\"sh-backup\"/id_rsa", SG_VIOL_READ_SECRETS, false},
       {"echo payload >> ~/.b\"ash-profile\"", SG_VIOL_PERSISTENCE, false},
   };
@@ -605,7 +976,8 @@ void run_decoded_path_oracles() {
   if (!gate || sg_gate_set_reject_mask(gate, 0) != SG_OK ||
       sg_gate_set_stop_mode(gate, SG_EVAL_ALL) != SG_OK ||
       sg_gate_add_allow_cpl(gate, "cat *") != SG_OK ||
-      sg_gate_add_allow_cpl(gate, "echo *") != SG_OK)
+      sg_gate_add_allow_cpl(gate, "echo *") != SG_OK ||
+      sg_gate_add_allow_cpl(gate, "printf *") != SG_OK)
     invariant_failure("decoded path oracle gate setup failed");
   sg_violation_config_t config;
   sg_violation_config_default(&config);
@@ -613,15 +985,37 @@ void run_decoded_path_oracles() {
     invariant_failure("decoded path oracle configuration failed");
 
   for (const oracle_case &item : cases) {
-    char buffer[4096];
+    reusable_eval_buffer &buffer =
+        eval_buffer_for(g_eval_buffers.result, std::strlen(item.input));
     sg_result_t result = {};
     sg_error_t error =
-        sg_gate_evaluate(gate, item.input, std::strlen(item.input), buffer,
-                         sizeof(buffer), &result);
+        sg_gate_evaluate(gate, item.input, std::strlen(item.input),
+                         buffer.data(), buffer.size(), &result);
     if (error != SG_OK ||
         (!!(result.violation_type_flags & item.expected_flag) != item.expected))
       invariant_failure("decoded path oracle violation mismatch");
-    validate_result(&result, error, buffer, sizeof(buffer));
+    validate_result(&result, error, buffer.data(), buffer.size());
+  }
+
+  static const char dynamic_setup[] =
+      "{ printf x; } >\"$(cat /etc/shadow)\" >/tmp/out";
+  reusable_eval_buffer &dynamic_buffer =
+      eval_buffer_for(g_eval_buffers.result, sizeof(dynamic_setup) - 1);
+  sg_result_t dynamic_result = {};
+  sg_error_t dynamic_error = sg_gate_evaluate(
+      gate, dynamic_setup, sizeof(dynamic_setup) - 1, dynamic_buffer.data(),
+      dynamic_buffer.size(), &dynamic_result);
+  bool dynamic_owner = false;
+  for (uint32_t i = 0; i < dynamic_result.subcommand_count; i++)
+    dynamic_owner |=
+        dynamic_result.subcommands[i].has_dynamic_substitution_io &&
+        (dynamic_result.subcommands[i].violation_type_flags &
+         SG_VIOL_SUBST_SENSITIVE) != 0;
+  if (dynamic_error != SG_OK || !dynamic_result.has_dynamic_substitution_io ||
+      dynamic_result.requires_substitution_evaluation ||
+      !(dynamic_result.violation_type_flags & SG_VIOL_SUBST_SENSITIVE) ||
+      !dynamic_owner) {
+    invariant_failure("FD_OPEN dynamic-path oracle mismatch");
   }
   sg_gate_free(gate);
 }
@@ -645,10 +1039,16 @@ void run_brace_group_oracles() {
   for (size_t i = 0; i < sizeof(rules) / sizeof(rules[0]); i++)
     if (sg_gate_add_allow_cpl(gate, rules[i]) != SG_OK)
       invariant_failure("brace oracle rule setup failed");
-  char buffer[4096];
+  size_t maximum_input_length =
+      std::max({std::strlen(input), std::strlen(sibling_input),
+                std::strlen(document_input), std::strlen(crlf_document_input),
+                std::strlen(named_document_input),
+                std::strlen(named_group_document_input)});
+  reusable_eval_buffer &buffer =
+      eval_buffer_for(g_eval_buffers.result, maximum_input_length);
   sg_result_t result = {};
-  sg_error_t error = sg_gate_evaluate(gate, input, std::strlen(input), buffer,
-                                      sizeof(buffer), &result);
+  sg_error_t error = sg_gate_evaluate(gate, input, std::strlen(input),
+                                      buffer.data(), buffer.size(), &result);
   if (error != SG_OK || result.verdict != SG_VERDICT_ALLOW ||
       result.subcommand_count != 3 || result.subcommands[0].group_depth != 2 ||
       result.subcommands[1].group_depth != 1 ||
@@ -660,7 +1060,7 @@ void run_brace_group_oracles() {
 
   memset(&result, 0, sizeof(result));
   error = sg_gate_evaluate(gate, sibling_input, std::strlen(sibling_input),
-                           buffer, sizeof(buffer), &result);
+                           buffer.data(), buffer.size(), &result);
   if (error != SG_OK || result.verdict != SG_VERDICT_ALLOW ||
       result.subcommand_count != 3 ||
       std::strcmp(result.subcommands[0].netargv, "6:printf,4:left,") != 0 ||
@@ -673,7 +1073,7 @@ void run_brace_group_oracles() {
 
   memset(&result, 0, sizeof(result));
   error = sg_gate_evaluate(gate, document_input, std::strlen(document_input),
-                           buffer, sizeof(buffer), &result);
+                           buffer.data(), buffer.size(), &result);
   if (error != SG_OK || result.verdict != SG_VERDICT_ALLOW ||
       result.subcommand_count != 2 || result.subcommands[0].group_depth != 1 ||
       result.subcommands[1].group_depth != 1 ||
@@ -683,8 +1083,8 @@ void run_brace_group_oracles() {
 
   memset(&result, 0, sizeof(result));
   error = sg_gate_evaluate(gate, crlf_document_input,
-                           std::strlen(crlf_document_input), buffer,
-                           sizeof(buffer), &result);
+                           std::strlen(crlf_document_input), buffer.data(),
+                           buffer.size(), &result);
   if (error != SG_OK || result.verdict != SG_VERDICT_ALLOW ||
       result.subcommand_count != 2 || result.subcommands[0].group_depth != 1 ||
       result.subcommands[1].group_depth != 1 ||
@@ -694,8 +1094,8 @@ void run_brace_group_oracles() {
 
   memset(&result, 0, sizeof(result));
   error = sg_gate_evaluate(gate, named_document_input,
-                           std::strlen(named_document_input), buffer,
-                           sizeof(buffer), &result);
+                           std::strlen(named_document_input), buffer.data(),
+                           buffer.size(), &result);
   if (error != SG_OK || result.verdict != SG_VERDICT_ALLOW ||
       result.subcommand_count != 1 ||
       std::strcmp(result.subcommands[0].netargv, "6:printf,1:x,") != 0)
@@ -703,8 +1103,8 @@ void run_brace_group_oracles() {
 
   memset(&result, 0, sizeof(result));
   error = sg_gate_evaluate(gate, named_group_document_input,
-                           std::strlen(named_group_document_input), buffer,
-                           sizeof(buffer), &result);
+                           std::strlen(named_group_document_input),
+                           buffer.data(), buffer.size(), &result);
   if (error != SG_OK || result.verdict != SG_VERDICT_ALLOW ||
       result.subcommand_count != 1 ||
       std::strcmp(result.subcommands[0].netargv, "3:cat,") != 0)
@@ -725,11 +1125,12 @@ void run_generated_brace_case(const uint8_t *data, size_t size) {
   if (sg_gate_set_violation_config_borrowed(gate, &config) != SG_OK)
     invariant_failure("generated brace violation setup failed");
 
-  char buffer[4096];
+  reusable_eval_buffer &buffer =
+      eval_buffer_for(g_eval_buffers.result, item.command.size());
   sg_result_t result = {};
   sg_error_t error =
-      sg_gate_evaluate(gate, item.command.data(), item.command.size(), buffer,
-                       sizeof(buffer), &result);
+      sg_gate_evaluate(gate, item.command.data(), item.command.size(),
+                       buffer.data(), buffer.size(), &result);
   if (!item.valid || !item.strict_valid) {
     if (error != SG_ERR_PARSE)
       invariant_failure("strict generated brace input was accepted");
@@ -740,7 +1141,7 @@ void run_generated_brace_case(const uint8_t *data, size_t size) {
       result.subcommand_count > SHELL_MAX_SUBCOMMANDS)
     invariant_failure(
         "generated brace result is outside bounded command limits");
-  validate_result(&result, error, buffer, sizeof(buffer));
+  validate_result(&result, error, buffer.data(), buffer.size());
   bool saw_group = false;
   for (uint32_t i = 0; i < result.subcommand_count; i++)
     saw_group = saw_group || result.subcommands[i].group_depth != 0;
@@ -820,17 +1221,32 @@ void run_substitution_case(const shell_substitution_fuzz_case_t &item) {
     if (sg_gate_add_allow_cpl(gate, rules[i]) != SG_OK)
       invariant_failure("generated substitution rule setup failed");
 
-  char buffer[4096];
+  reusable_eval_buffer &buffer =
+      eval_buffer_for(g_eval_buffers.result, item.command.size());
   sg_result_t result = {};
   sg_error_t error =
-      sg_gate_evaluate(gate, item.command.data(), item.command.size(), buffer,
-                       sizeof(buffer), &result);
+      sg_gate_evaluate(gate, item.command.data(), item.command.size(),
+                       buffer.data(), buffer.size(), &result);
+  if (item.source_rejected) {
+    if (error != SG_ERR_PARSE || result.verdict != SG_VERDICT_REJECT)
+      invariant_failure("generated unsafe ANSI source was not rejected");
+    validate_result(&result, error, buffer.data(), buffer.size());
+    sg_gate_free(gate);
+    return;
+  }
+  if (item.depgraph_rejected) {
+    if (error != SG_ERR_PARSE || result.verdict != SG_VERDICT_REJECT)
+      invariant_failure("generated substitution rejection contract mismatch");
+    validate_result(&result, error, buffer.data(), buffer.size());
+    sg_gate_free(gate);
+    return;
+  }
   if (item.depgraph_truncated) {
     if (error != SG_ERR_TRUNC || !result.truncated ||
         result.verdict == SG_VERDICT_ALLOW ||
         result.verdict == SG_VERDICT_ALLOW_CONDITIONAL)
       invariant_failure("generated substitution truncation contract mismatch");
-    validate_result(&result, error, buffer, sizeof(buffer));
+    validate_result(&result, error, buffer.data(), buffer.size());
     sg_gate_free(gate);
     return;
   }
@@ -874,7 +1290,7 @@ void run_substitution_case(const shell_substitution_fuzz_case_t &item) {
         mappings_valid);
     invariant_failure("generated substitution result contract mismatch");
   }
-  validate_result(&result, error, buffer, sizeof(buffer));
+  validate_result(&result, error, buffer.data(), buffer.size());
   sg_gate_free(gate);
 }
 
@@ -1014,14 +1430,20 @@ void run_stateful(FuzzedDataProvider &fdp) {
       for (char &c : command)
         if (c == 0)
           c = ' ';
-      char left_buffer[4096], right_buffer[4096];
+      reusable_eval_buffer &left_buffer =
+          eval_buffer_for(g_eval_buffers.result, command.size());
+      reusable_eval_buffer &right_buffer =
+          eval_buffer_for(g_eval_buffers.replay, command.size());
       sg_result_t left_result = {}, right_result = {};
-      a = sg_gate_evaluate(left, command.c_str(), command.size(), left_buffer,
-                           sizeof(left_buffer), &left_result);
-      b = sg_gate_evaluate(right, command.c_str(), command.size(), right_buffer,
-                           sizeof(right_buffer), &right_result);
-      validate_result(&left_result, a, left_buffer, sizeof(left_buffer));
-      validate_result(&right_result, b, right_buffer, sizeof(right_buffer));
+      a = sg_gate_evaluate(left, command.c_str(), command.size(),
+                           left_buffer.data(), left_buffer.size(),
+                           &left_result);
+      b = sg_gate_evaluate(right, command.c_str(), command.size(),
+                           right_buffer.data(), right_buffer.size(),
+                           &right_result);
+      validate_result(&left_result, a, left_buffer.data(), left_buffer.size());
+      validate_result(&right_result, b, right_buffer.data(),
+                      right_buffer.size());
       if (a != b || !results_equal(left_result, right_result))
         invariant_failure("mirrored stateful evaluation diverged");
       break;
@@ -1042,11 +1464,12 @@ sg_gate_t *create_pool_gate(int idx) {
   if (sg_gate_enable_anomaly(g, 5.0, NULL) != SG_OK)
     invariant_failure("sg_gate_enable_anomaly failed");
 
-  char train_buf[8192];
+  reusable_eval_buffer &train_buf = eval_buffer_for(g_eval_buffers.result, 128);
   sg_result_t training_result;
   for (int i = 0; i < kSeedCmdsN; i++) {
-    if (sg_gate_evaluate(g, kSeedCmds[i], strlen(kSeedCmds[i]), train_buf,
-                         sizeof(train_buf), &training_result) != SG_OK)
+    if (sg_gate_evaluate(g, kSeedCmds[i], strlen(kSeedCmds[i]),
+                         train_buf.data(), train_buf.size(),
+                         &training_result) != SG_OK)
       invariant_failure("anomaly model training failed");
   }
   if (sg_gate_set_anomaly_update_mode(g, true) != SG_OK)
@@ -1126,6 +1549,7 @@ extern "C" int LLVMFuzzerInitialize(int *argc, char ***argv) {
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
   static bool semantic_oracles_checked = false;
   if (!semantic_oracles_checked) {
+    run_evaluation_buffer_contract_oracle();
     run_semantic_reference_oracles();
     run_decoded_path_oracles();
     run_brace_group_oracles();
@@ -1178,7 +1602,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
   if (fdp.remaining_bytes() < 2)
     return 0;
   uint16_t raw = fdp.ConsumeIntegral<uint16_t>();
-  size_t buf_size = 16 + (size_t)((uint32_t)raw * 16368u / 65535u);
+  size_t result_prefix = 16 + (size_t)((uint32_t)raw * 16368u / 65535u);
 
   std::string cmd = fdp.ConsumeRemainingBytesAsString();
   if (cmd.empty())
@@ -1191,15 +1615,18 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
       c = ' ';
   }
 
-  std::vector<char> result_buf(buf_size);
-  std::vector<char> replay_buf(buf_size);
+  size_t buf_size = eval_buffer_size(cmd.size(), result_prefix);
+  if (buf_size == 0)
+    return 0;
+  char *result_buf = g_eval_buffers.result.reset(buf_size);
+  char *replay_buf = g_eval_buffers.replay.reset(buf_size);
 
   sg_gate_t *g =
       anomaly_mode ? g_anomaly_pool[pool_idx] : g_policy_pool[pool_idx];
   sg_result_t result, replay;
 
-  sg_error_t err = sg_gate_evaluate(g, cmd.data(), cmd.size(),
-                                    result_buf.data(), buf_size, &result);
+  sg_error_t err = sg_gate_evaluate(g, cmd.data(), cmd.size(), result_buf,
+                                    buf_size, &result);
   /* Arbitrary bytes routinely form malformed shell syntax. Parse errors are
    * expected outcomes of the public evaluator, not harness failures. */
   if (err != SG_OK && err != SG_ERR_PARSE && err != SG_ERR_TRUNC &&
@@ -1212,27 +1639,32 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
       !isfinite(result.anomaly_score_type))
     invariant_failure("non-finite anomaly score with a trained model");
 
-  validate_result(&result, err, result_buf.data(), buf_size);
+  validate_result(&result, err, result_buf, buf_size);
+  validate_graph_result_prefix(&result, err, result_buf, buf_size);
 
-  sg_error_t replay_err = sg_gate_evaluate(
-      g, cmd.data(), cmd.size(), replay_buf.data(), buf_size, &replay);
+  sg_error_t replay_err = sg_gate_evaluate(g, cmd.data(), cmd.size(),
+                                           replay_buf, buf_size, &replay);
   if (replay_err != err || !results_equal(result, replay))
     invariant_failure("frozen-model replay was not deterministic");
-  validate_result(&replay, replay_err, replay_buf.data(), buf_size);
+  validate_result(&replay, replay_err, replay_buf, buf_size);
+  validate_graph_result_prefix(&replay, replay_err, replay_buf, buf_size);
 
-  if (err == SG_OK) {
-    size_t hint = sg_gate_evaluate_size_hint(cmd.size());
-    size_t large_size = hint == SIZE_MAX ? 65536 : hint + SG_BUF_MIN;
-    if (large_size > 65536)
-      large_size = 65536;
+  if (err == SG_OK || err == SG_ERR_TRUNC) {
+    size_t large_size = eval_buffer_size(cmd.size(), SG_DIAGNOSTIC_BUF_MIN);
+    if (large_size == 0)
+      return 0;
     if (large_size < buf_size)
       large_size = buf_size;
-    std::vector<char> large_buf(large_size);
+    char *large_buf = g_eval_buffers.large.reset(large_size);
     sg_result_t large = {};
-    sg_error_t large_err = sg_gate_evaluate(
-        g, cmd.data(), cmd.size(), large_buf.data(), large_buf.size(), &large);
-    validate_result(&large, large_err, large_buf.data(), large_buf.size());
-    if (large_err != SG_OK || !results_equal(result, large)) {
+    sg_error_t large_err = sg_gate_evaluate(g, cmd.data(), cmd.size(),
+                                            large_buf, large_size, &large);
+    validate_result(&large, large_err, large_buf, large_size);
+    validate_graph_result_prefix(&large, large_err, large_buf, large_size);
+    if (err == SG_ERR_TRUNC && large_err == SG_OK &&
+        large.verdict != SG_VERDICT_REJECT)
+      validate_known_graph_result_prefix(&result, err, result_buf, buf_size);
+    if (err == SG_OK && (large_err != SG_OK || !results_equal(result, large))) {
       std::fprintf(
           stderr,
           "buffer mismatch: small=%zu large=%zu errors=%d/%d "

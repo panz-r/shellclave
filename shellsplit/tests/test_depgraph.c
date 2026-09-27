@@ -1,5 +1,6 @@
 #include "../src/shell_depgraph_internal.h"
 #include "depgraph_invariants.h"
+#include "depgraph_test_workspace.h"
 #include "shell_depgraph.h"
 #include "shell_processor.h"
 #include "shell_tokenizer.h"
@@ -7,6 +8,27 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* The shared test adapter intentionally supplies workspace. Keep raw entry
+ * points available for the public ownership/error contract itself. */
+#undef shell_dep_graph_parse
+#undef shell_dep_graph_parse_with_fast
+static shell_dep_error_t raw_dep_graph_parse(const char *cmd, size_t cmd_len,
+                                             const char *initial_cwd,
+                                             const shell_dep_limits_t *limits,
+                                             shell_dep_graph_t *out) {
+  return shell_dep_graph_parse(cmd, cmd_len, initial_cwd, limits, out);
+}
+static shell_dep_error_t raw_dep_graph_parse_with_fast(
+    const char *cmd, size_t cmd_len, const char *initial_cwd,
+    const shell_dep_limits_t *limits, const shell_parse_result_t *fast,
+    shell_dep_graph_t *out) {
+  return shell_dep_graph_parse_with_fast(cmd, cmd_len, initial_cwd, limits,
+                                         fast, out);
+}
+#define shell_dep_graph_parse shellsplit_test_dep_graph_parse
+#define shell_dep_graph_parse_with_fast                                        \
+  shellsplit_test_dep_graph_parse_with_fast
 
 static int pass_count = 0;
 static int fail_count = 0;
@@ -98,7 +120,8 @@ static bool has_edge_fds(const shell_dep_graph_t *g, shell_dep_edge_type_t type,
 static bool has_only_public_edge_flags(const shell_dep_graph_t *g) {
   const uint8_t public_flags = SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD |
                                SHELL_DEP_EDGE_FLAG_SUBST_DYNAMIC_NAME |
-                               SHELL_DEP_EDGE_FLAG_FD_OPEN_APPEND;
+                               SHELL_DEP_EDGE_FLAG_FD_OPEN_APPEND |
+                               SHELL_DEP_EDGE_FLAG_FD_OPEN_DUP;
   for (uint32_t i = 0; i < g->edge_count; i++)
     if ((g->edges[i].flags & ~public_flags) != 0)
       return false;
@@ -126,6 +149,27 @@ static int find_nth_cmd(const shell_dep_graph_t *g, uint32_t ordinal) {
     if (g->nodes[i].type != SHELL_NODE_CMD)
       continue;
     if (ordinal-- == 0)
+      return (int)i;
+  }
+  return -1;
+}
+
+static int find_cmd_tokens(const shell_dep_graph_t *g, const char *first,
+                           const char *second) {
+  if (!first)
+    return -1;
+  size_t first_len = strlen(first);
+  size_t second_len = second ? strlen(second) : 0;
+  for (uint32_t i = 0; i < g->node_count; i++) {
+    const shell_dep_node_t *node = &g->nodes[i];
+    if (node->type != SHELL_NODE_CMD || node->cmd.token_count == 0 ||
+        node->cmd.token_lens[0] != first_len ||
+        memcmp(node->cmd.tokens[0], first, first_len) != 0)
+      continue;
+    if (!second)
+      return (int)i;
+    if (node->cmd.token_count > 1 && node->cmd.token_lens[1] == second_len &&
+        memcmp(node->cmd.tokens[1], second, second_len) == 0)
       return (int)i;
   }
   return -1;
@@ -257,6 +301,31 @@ TEST(supplied_fast_parser_contract) {
   ASSERT(supplied.edge_count == regular.edge_count);
   ASSERT(supplied.status == regular.status);
   ASSERT(shell_dep_graph_validate(&supplied).valid);
+
+  /* `fast` is borrowed at entry. Deliberately overlap its trailing count with
+   * the graph's first output field: the parser must snapshot metadata before
+   * it initializes output storage. */
+  typedef union {
+    max_align_t alignment;
+    unsigned char bytes[offsetof(shell_parse_result_t, count) +
+                        sizeof(shell_dep_graph_t)];
+  } fast_graph_overlap_t;
+  fast_graph_overlap_t overlap = {0};
+  shell_parse_result_t *overlapping_fast =
+      (shell_parse_result_t *)(void *)overlap.bytes;
+  shell_dep_graph_t *overlapping_graph =
+      (shell_dep_graph_t *)(void *)(overlap.bytes +
+                                    offsetof(shell_parse_result_t, count));
+  ASSERT((uintptr_t)overlapping_graph % _Alignof(shell_dep_graph_t) == 0);
+  ASSERT(shell_parse_fast(command, strlen(command), NULL, overlapping_fast) ==
+         SHELL_OK);
+  ASSERT(shell_dep_graph_parse_with_fast(command, strlen(command), ".", NULL,
+                                         overlapping_fast,
+                                         overlapping_graph) == SHELL_DEP_OK);
+  ASSERT(overlapping_graph->node_count == regular.node_count &&
+         overlapping_graph->edge_count == regular.edge_count &&
+         overlapping_graph->status == regular.status &&
+         shell_dep_graph_validate(overlapping_graph).valid);
 
   shell_limits_t short_limits = {.max_subcommands = 1, .strict_mode = false};
   ASSERT(shell_parse_fast(command, strlen(command), &short_limits, &fast) ==
@@ -626,6 +695,8 @@ TEST(redirect_matrix) {
       {"cmd {both}<> state.log", SHELL_EDGE_FD_OPEN, 1, 2, 1, "state.log"},
       {"cmd &> combined.log", SHELL_EDGE_WRITE, 1, 2, 1, "combined.log"},
       {"cmd &>> combined.log", SHELL_EDGE_APPEND, 1, 2, 1, "combined.log"},
+      {"cmd >& combined.log", SHELL_EDGE_WRITE, 1, 2, 1, "combined.log"},
+      {"cmd 1>& combined.log", SHELL_EDGE_WRITE, 1, 2, 1, "combined.log"},
   };
 
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
@@ -662,7 +733,9 @@ TEST(redirect_matrix) {
         ASSERT(g.nodes[g.edges[j].to].type == SHELL_NODE_DOC);
       }
     }
-    if (strstr(cases[i].command, "&>") != NULL) {
+    if (strstr(cases[i].command, "&>") != NULL ||
+        strstr(cases[i].command, " >&") != NULL ||
+        strstr(cases[i].command, " 1>&") != NULL) {
       bool stdout_seen = false;
       bool stderr_seen = false;
       for (uint32_t j = 0; j < g.edge_count; j++) {
@@ -686,10 +759,300 @@ TEST(redirect_matrix) {
     ASSERT(validation.valid);
     ASSERT(validation.error_count == 0);
   }
-  shell_dep_graph_t rejected;
-  ASSERT(parse("cmd {fd}>&1", &rejected) == SHELL_DEP_EPARSE);
-  ASSERT(parse("cmd {fd}<&0", &rejected) == SHELL_DEP_EPARSE);
-  ASSERT(parse("cmd {fd}>&-", &rejected) == SHELL_DEP_EPARSE);
+  shell_dep_graph_t named;
+  ASSERT(parse("cmd {fd}>&1", &named) == SHELL_DEP_OK);
+  ASSERT(count_edge_type(&named, SHELL_EDGE_FD_OPEN) == 1 &&
+         named.edges[0].source_fd == 1 &&
+         named.edges[0].target_fd == SHELL_DEP_FD_NAMED &&
+         (named.edges[0].flags & SHELL_DEP_EDGE_FLAG_FD_OPEN_DUP) != 0 &&
+         named.edges[0].target_fd_name_len == 2 &&
+         memcmp(named.edges[0].target_fd_name, "fd", 2) == 0 &&
+         shell_dep_graph_validate(&named).valid);
+  ASSERT(parse("cmd {fd}<&0", &named) == SHELL_DEP_OK);
+  ASSERT(count_edge_type(&named, SHELL_EDGE_FD_OPEN) == 1 &&
+         named.edges[0].source_fd == 0 &&
+         named.edges[0].target_fd == SHELL_DEP_FD_NAMED &&
+         shell_dep_graph_validate(&named).valid);
+  /* Bash rejects a close before `{fd}` has allocated a descriptor. */
+  ASSERT(parse("cmd {fd}>&-", &named) == SHELL_DEP_EPARSE);
+  ASSERT(named.node_count == 0 && named.edge_count == 0 &&
+         named.status == SHELL_DEP_STATUS_ERROR);
+  pass_count++;
+}
+
+TEST(legacy_combined_output_redirects) {
+  static const char *const accepted[] = {
+      "cmd >&combined",
+      "cmd >&$",
+      "cmd >&$:",
+      "cmd >&[",
+      "cmd >&[]",
+      "cmd >&file[part",
+      "cmd >&{literal$}",
+      "cmd 1>&combined",
+      "cmd >&123file",
+      "cmd >&\"quoted combined\"",
+      "cmd >&\"-\"file",
+      "cmd >&\\-file",
+      "cmd >&$'-'file",
+      "cmd >&foo{bar}",
+      "cmd >&literal$destination",
+      "cmd >&literal${destination}",
+      "cmd >&literal$((1 + 2))",
+      "cmd >&literal*.log",
+      "cmd >&literal@(one|two)",
+      "cmd >&foo{one,two}",
+      "cmd >&foo{1..2}",
+      "cmd >&*.log",
+      "{ cmd; } >&combined",
+  };
+  for (uint32_t i = 0; i < sizeof(accepted) / sizeof(accepted[0]); i++) {
+    shell_dep_graph_t graph = {0};
+    ASSERT(parse(accepted[i], &graph) == SHELL_DEP_OK);
+    int document = find_doc(&graph, SHELL_DOC_FILE);
+    ASSERT(document >= 0);
+    bool stdout_seen = false;
+    bool stderr_seen = false;
+    for (uint32_t edge = 0; edge < graph.edge_count; edge++) {
+      const shell_dep_edge_t *item = &graph.edges[edge];
+      if ((item->type == SHELL_EDGE_WRITE || item->type == SHELL_EDGE_APPEND) &&
+          item->to == (uint32_t)document) {
+        stdout_seen = stdout_seen || item->source_fd == 1;
+        stderr_seen = stderr_seen || item->source_fd == 2;
+      }
+    }
+    ASSERT(stdout_seen && stderr_seen &&
+           shell_dep_graph_validate(&graph).valid);
+  }
+
+  shell_dep_graph_t graph = {0};
+  static const char *const descriptor_targets[] = {
+      "cmd >&7",
+      "cmd >&0000000000000000000000000000000000000001",
+      "cmd >&$'0000000000000000000000000000000000000001'",
+      "cmd >&-",
+      "cmd >&\"7\"",
+      "cmd >&$'7'",
+      "cmd >&\"-\"",
+  };
+  for (uint32_t i = 0;
+       i < sizeof(descriptor_targets) / sizeof(descriptor_targets[0]); i++) {
+    ASSERT(parse(descriptor_targets[i], &graph) == SHELL_DEP_OK);
+    ASSERT(count_doc_kind(&graph, SHELL_DOC_FILE) == 0 &&
+           shell_dep_graph_validate(&graph).valid);
+  }
+
+  ASSERT(parse("cmd >&-file", &graph) == SHELL_DEP_OK);
+  int close_command = find_first_cmd(&graph);
+  ASSERT(close_command >= 0 &&
+         graph.nodes[close_command].cmd.token_count == 2 &&
+         graph.nodes[close_command].cmd.token_lens[0] == 3 &&
+         memcmp(graph.nodes[close_command].cmd.tokens[0], "cmd", 3) == 0 &&
+         graph.nodes[close_command].cmd.token_lens[1] == 4 &&
+         memcmp(graph.nodes[close_command].cmd.tokens[1], "file", 4) == 0 &&
+         count_doc_kind(&graph, SHELL_DOC_FILE) == 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_FD_CLOSE, (uint32_t)close_command,
+                      (uint32_t)close_command, 1, SHELL_DEP_FD_NONE) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  static const char long_path[] = "abcdefghijklmnopqrstuvwxyzabcdefghi";
+  char long_legacy[sizeof("cmd >&") + sizeof(long_path)] = "cmd >&";
+  strcat(long_legacy, long_path);
+  ASSERT(parse(long_legacy, &graph) == SHELL_DEP_OK);
+  ASSERT(find_file_doc(&graph, long_path) >= 0 &&
+         shell_dep_graph_validate(&graph).valid);
+
+  ASSERT(parse("cmd >&foo{bar}", &graph) == SHELL_DEP_OK);
+  ASSERT(find_file_doc(&graph, "foo{bar}") >= 0 &&
+         shell_dep_graph_validate(&graph).valid);
+
+  /* A bare dollar and unmatched bracket are literal pathname bytes. They must
+   * not be promoted into dynamic filename nodes or descriptor duplication. */
+  static const char *const literal_targets[] = {
+      "$", "$:", "[", "[]", "file[part", "{literal$}",
+  };
+  for (uint32_t i = 0; i < sizeof(literal_targets) / sizeof(literal_targets[0]);
+       i++) {
+    char command_text[64];
+    int written = snprintf(command_text, sizeof(command_text), "cmd >&%s",
+                           literal_targets[i]);
+    ASSERT(written > 0 && (size_t)written < sizeof(command_text));
+    ASSERT(parse(command_text, &graph) == SHELL_DEP_OK);
+    int literal_document = find_file_doc(&graph, literal_targets[i]);
+    int literal_command = find_first_cmd(&graph);
+    ASSERT(literal_document >= 0 && literal_command >= 0 &&
+           (graph.nodes[literal_document].doc.flags &
+            SHELL_DEP_DOC_FLAG_DYNAMIC_NAME) == 0 &&
+           has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)literal_command,
+                        (uint32_t)literal_document, 1, SHELL_DEP_FD_NONE) &&
+           has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)literal_command,
+                        (uint32_t)literal_document, 2, SHELL_DEP_FD_NONE) &&
+           shell_dep_graph_validate(&graph).valid);
+  }
+
+  /* An unmatched bracket is a literal pathname byte even when the remaining
+   * word has runtime expansion. A complete bracket glob, by contrast, could
+   * become a descriptor number and is rejected below. */
+  static const char *const dynamic_literal_targets[] = {
+      "[$fd",
+      "[]$fd",
+      "file[[:digit:]]",
+  };
+  for (uint32_t i = 0;
+       i < sizeof(dynamic_literal_targets) / sizeof(dynamic_literal_targets[0]);
+       i++) {
+    char command_text[64];
+    int written = snprintf(command_text, sizeof(command_text), "cmd >&%s",
+                           dynamic_literal_targets[i]);
+    ASSERT(written > 0 && (size_t)written < sizeof(command_text));
+    ASSERT(parse(command_text, &graph) == SHELL_DEP_OK);
+    int dynamic_document = find_file_doc(&graph, dynamic_literal_targets[i]);
+    int dynamic_command = find_first_cmd(&graph);
+    ASSERT(dynamic_document >= 0 && dynamic_command >= 0 &&
+           (graph.nodes[dynamic_document].doc.flags &
+            SHELL_DEP_DOC_FLAG_DYNAMIC_NAME) != 0 &&
+           has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)dynamic_command,
+                        (uint32_t)dynamic_document, 1, SHELL_DEP_FD_NONE) &&
+           has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)dynamic_command,
+                        (uint32_t)dynamic_document, 2, SHELL_DEP_FD_NONE) &&
+           shell_dep_graph_validate(&graph).valid);
+  }
+
+  ASSERT(parse("cmd >& >(consumer)", &graph) == SHELL_DEP_OK);
+  int endpoint = find_endpoint(&graph);
+  int command = find_first_cmd(&graph);
+  ASSERT(endpoint >= 0 && command >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)command,
+                      (uint32_t)endpoint, 1, SHELL_DEP_FD_NONE) &&
+         has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)command,
+                      (uint32_t)endpoint, 2, SHELL_DEP_FD_NONE) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  /* Both process-substitution directions yield a pathname.  Writing through
+   * the pathname produced by `<(...)` is cross-directional, so retain the
+   * producer but do not invent a byte-flow route to it. */
+  static const char *const cross_direction_process_substitutions[] = {
+      "cmd >& <(producer)",
+      "cmd >&<(producer)",
+      "{ cmd; } >& <(producer)",
+  };
+  for (uint32_t i = 0; i < sizeof(cross_direction_process_substitutions) /
+                               sizeof(cross_direction_process_substitutions[0]);
+       i++) {
+    ASSERT(parse(cross_direction_process_substitutions[i], &graph) ==
+           SHELL_DEP_OK);
+    bool byte_route = false;
+    for (uint32_t edge = 0; edge < graph.edge_count; edge++)
+      byte_route = byte_route || graph.edges[edge].type == SHELL_EDGE_WRITE ||
+                   graph.edges[edge].type == SHELL_EDGE_APPEND ||
+                   graph.edges[edge].type == SHELL_EDGE_PIPE ||
+                   graph.edges[edge].type == SHELL_EDGE_SUBST;
+    ASSERT(count_type(&graph, SHELL_NODE_CMD) == 2 &&
+           count_doc_kind(&graph, SHELL_DOC_FILE) == 0 && !byte_route &&
+           shell_dep_graph_validate(&graph).valid);
+  }
+
+  static const char *const rejected[] = {
+      "cmd 2>&combined",
+      "cmd {fd}>&combined",
+      "cmd >&$destination",
+      "cmd >&~",
+      "cmd >&*",
+      "cmd >&[[:digit:]]",
+      "cmd >&[[=a=]]",
+      "cmd >&[[.a.]]",
+      "cmd >&?(one|two)",
+      "cmd >&*(one|two)",
+      "cmd >&+(one|two)",
+      "cmd >&@(one|two)",
+      "cmd >&!(one|two)",
+      "cmd >&\\\n~",
+      "cmd >&''",
+      "cmd >&$'a\\0b'",
+      "cmd >&2147483648",
+      "cmd >&00000000000000000000000000000000002147483648",
+      "cmd >&$'2147483648'",
+      /* A command substitution may produce a descriptor number, `-`, or a
+       * pathname. Do not claim the legacy combined-output topology for it. */
+      "cmd >&$(printf 2)",
+      "cmd >&`printf 2`",
+      "cmd >&",
+  };
+  for (uint32_t i = 0; i < sizeof(rejected) / sizeof(rejected[0]); i++) {
+    ASSERT(parse(rejected[i], &graph) == SHELL_DEP_EPARSE);
+    ASSERT(graph.node_count == 0 && graph.edge_count == 0 &&
+           graph.status == SHELL_DEP_STATUS_ERROR);
+  }
+  pass_count++;
+}
+
+/* A literal non-descriptor fragment proves that an expanded `>&word` remains
+ * a pathname. Dynamic FILE nodes retain that fact for all expansion forms;
+ * command substitutions additionally retain their producer. */
+TEST(literal_brace_dynamic_redirect_paths) {
+  static const struct {
+    const char *command;
+    const char *path;
+    bool combined_output;
+    bool has_producer;
+    bool owner_is_group;
+  } cases[] = {
+      {"printf value >{$(printf /tmp/brace-output)}",
+       "{$(printf /tmp/brace-output)}", false, true, false},
+      {"printf value >&path-$(printf /tmp/brace-combined)",
+       "path-$(printf /tmp/brace-combined)", true, true, false},
+      {"printf value >&literal$destination", "literal$destination", true, false,
+       false},
+      {"printf value >&literal$((1 + 2))", "literal$((1 + 2))", true, false,
+       false},
+      {"{ printf value; } >&\"\"literal$(printf /tmp/quoted-combined)",
+       "\"\"literal$(printf /tmp/quoted-combined)", true, true, true},
+  };
+
+  for (uint32_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    shell_dep_graph_t graph = {0};
+    ASSERT(parse(cases[i].command, &graph) == SHELL_DEP_OK);
+    int redirect_owner = find_nth_cmd(&graph, 0);
+    if (cases[i].owner_is_group) {
+      redirect_owner = -1;
+      for (uint32_t node = 0; node < graph.node_count; node++)
+        if (graph.nodes[node].type == SHELL_NODE_GROUP) {
+          redirect_owner = (int)node;
+          break;
+        }
+    }
+    int pathname_producer =
+        cases[i].has_producer
+            ? (cases[i].owner_is_group
+                   ? find_cmd_tokens(&graph, "printf", "/tmp/quoted-combined")
+                   : find_nth_cmd(&graph, 1))
+            : -1;
+    int document = find_file_doc(&graph, cases[i].path);
+    ASSERT(redirect_owner >= 0 &&
+           (!cases[i].has_producer || pathname_producer >= 0) && document >= 0);
+    ASSERT((graph.nodes[document].doc.flags &
+            SHELL_DEP_DOC_FLAG_DYNAMIC_NAME) != 0);
+
+    bool dynamic_name_flow = false;
+    for (uint32_t edge = 0; edge < graph.edge_count; edge++) {
+      const shell_dep_edge_t *current = &graph.edges[edge];
+      dynamic_name_flow =
+          dynamic_name_flow ||
+          (current->type == SHELL_EDGE_SUBST &&
+           current->from == (uint32_t)pathname_producer &&
+           current->to == (uint32_t)document && current->source_fd == 1 &&
+           current->target_fd == SHELL_DEP_FD_NONE &&
+           (current->flags & SHELL_DEP_EDGE_FLAG_SUBST_DYNAMIC_NAME) != 0 &&
+           (current->flags & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) == 0);
+    }
+    ASSERT(!cases[i].has_producer || dynamic_name_flow);
+    ASSERT(has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)redirect_owner,
+                        (uint32_t)document, 1, SHELL_DEP_FD_NONE));
+    ASSERT(!cases[i].combined_output ||
+           has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)redirect_owner,
+                        (uint32_t)document, 2, SHELL_DEP_FD_NONE));
+    ASSERT(shell_dep_graph_validate(&graph).valid);
+  }
   pass_count++;
 }
 
@@ -749,6 +1112,2282 @@ TEST(named_fd_redirect_topology) {
   pass_count++;
 }
 
+TEST(named_fd_symbolic_duplication_routes) {
+  shell_dep_graph_t graph = {0};
+  ASSERT(parse("printf bytes {out}> /tmp/out >&\"$out\"", &graph) ==
+         SHELL_DEP_OK);
+  int command = find_first_cmd(&graph);
+  int document = find_doc(&graph, SHELL_DOC_FILE);
+  bool setup = false;
+  bool routed = false;
+  for (uint32_t edge = 0; edge < graph.edge_count; edge++) {
+    const shell_dep_edge_t *item = &graph.edges[edge];
+    setup = setup || (item->type == SHELL_EDGE_FD_OPEN &&
+                      item->from == (uint32_t)command &&
+                      item->to == (uint32_t)document &&
+                      item->source_fd == SHELL_DEP_FD_NAMED &&
+                      item->source_fd_name_len == 3 &&
+                      memcmp(item->source_fd_name, "out", 3) == 0);
+    routed = routed || (item->type == SHELL_EDGE_WRITE &&
+                        item->from == (uint32_t)command &&
+                        item->to == (uint32_t)document && item->source_fd == 1);
+  }
+  ASSERT(command >= 0 && document >= 0 && setup && routed &&
+         shell_dep_graph_validate(&graph).valid);
+
+  ASSERT(parse("printf bytes {one}> /tmp/out {two}>&\"$one\" >&${two}",
+               &graph) == SHELL_DEP_OK);
+  command = find_first_cmd(&graph);
+  document = find_doc(&graph, SHELL_DOC_FILE);
+  bool named_dup = false;
+  routed = false;
+  for (uint32_t edge = 0; edge < graph.edge_count; edge++) {
+    const shell_dep_edge_t *item = &graph.edges[edge];
+    named_dup =
+        named_dup ||
+        (item->type == SHELL_EDGE_FD_OPEN &&
+         (item->flags & SHELL_DEP_EDGE_FLAG_FD_OPEN_DUP) != 0 &&
+         item->source_fd == SHELL_DEP_FD_NAMED &&
+         item->target_fd == SHELL_DEP_FD_NAMED &&
+         item->source_fd_name_len == 3 && item->target_fd_name_len == 3 &&
+         memcmp(item->source_fd_name, "one", 3) == 0 &&
+         memcmp(item->target_fd_name, "two", 3) == 0);
+    routed = routed || (item->type == SHELL_EDGE_WRITE &&
+                        item->from == (uint32_t)command &&
+                        item->to == (uint32_t)document && item->source_fd == 1);
+  }
+  ASSERT(command >= 0 && document >= 0 && named_dup && routed &&
+         shell_dep_graph_validate(&graph).valid);
+
+  /* Bash permits descriptor setup from the otherwise unavailable direction of
+   * a named descriptor. It becomes meaningful only if a later command uses
+   * that direction, so the graph records setup without inventing byte flow. */
+  ASSERT(parse("exec {out}> /tmp/out; exec {copy}<&$out; printf bytes >&$copy",
+               &graph) == SHELL_DEP_OK);
+  command = find_nth_cmd(&graph, 2);
+  document = find_file_doc(&graph, "/tmp/out");
+  ASSERT(command >= 0 && document >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)command,
+                      (uint32_t)document, 1, SHELL_DEP_FD_NONE) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  ASSERT(parse("exec {in}< /tmp/in; exec {copy}>&$in; cat <&$copy", &graph) ==
+         SHELL_DEP_OK);
+  command = find_nth_cmd(&graph, 2);
+  document = find_file_doc(&graph, "/tmp/in");
+  ASSERT(command >= 0 && document >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_READ, (uint32_t)document,
+                      (uint32_t)command, SHELL_DEP_FD_NONE, 0) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  /* A named self-dup resolves the old descriptor before the redirect assigns
+   * its fresh descriptor value. The later write must still reach /tmp/out. */
+  ASSERT(parse("exec {out}> /tmp/out; exec {out}>&$out; printf bytes >&$out",
+               &graph) == SHELL_DEP_OK);
+  command = find_nth_cmd(&graph, 2);
+  document = find_file_doc(&graph, "/tmp/out");
+  routed = false;
+  for (uint32_t edge = 0; edge < graph.edge_count; edge++)
+    routed = routed || (graph.edges[edge].type == SHELL_EDGE_WRITE &&
+                        graph.edges[edge].from == (uint32_t)command &&
+                        graph.edges[edge].to == (uint32_t)document &&
+                        graph.edges[edge].source_fd == 1);
+  ASSERT(command >= 0 && document >= 0 && routed &&
+         shell_dep_graph_validate(&graph).valid);
+
+  /* The suffix is a stable non-descriptor literal, so this is combined output
+   * to a dynamic pathname rather than a named-FD duplication. */
+  ASSERT(parse("printf bytes {out}> /tmp/out >&\"$out\"suffix", &graph) ==
+         SHELL_DEP_OK);
+  command = find_first_cmd(&graph);
+  document = find_file_doc(&graph, "\"$out\"suffix");
+  ASSERT(command >= 0 && document >= 0 &&
+         (graph.nodes[document].doc.flags & SHELL_DEP_DOC_FLAG_DYNAMIC_NAME) !=
+             0 &&
+         has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)command,
+                      (uint32_t)document, 1, SHELL_DEP_FD_NONE) &&
+         has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)command,
+                      (uint32_t)document, 2, SHELL_DEP_FD_NONE) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  static const char *const rejected[] = {
+      "printf bytes >&\"$missing\"",
+      "printf bytes {out}> /tmp/out >&${out:-1}",
+      "exec {out}> /tmp/out; exec {copy}<&$out; cat <&$copy",
+      "exec {in}< /tmp/in; exec {copy}>&$in; printf bytes >&$copy",
+  };
+  for (uint32_t i = 0; i < sizeof(rejected) / sizeof(rejected[0]); i++) {
+    ASSERT(parse(rejected[i], &graph) == SHELL_DEP_EPARSE);
+    ASSERT(graph.status == SHELL_DEP_STATUS_ERROR && graph.node_count == 0 &&
+           graph.edge_count == 0);
+  }
+  pass_count++;
+}
+
+/* A named process-substitution descriptor remains a valid Bash descriptor
+ * even if the nested command redirected away the stream it inherited from the
+ * process-substitution pipe. Retain that pipe as setup-only endpoint state;
+ * the later exact descriptor use is the first actual byte-flow relation. */
+TEST(named_fd_unconnected_process_substitution_routes) {
+  shell_dep_graph_t graph = {0};
+  ASSERT(parse("exec {source}< <(printf payload >/tmp/named-source); "
+               "cat <&\"$source\"",
+               &graph) == SHELL_DEP_OK);
+  int setup_owner = find_cmd_tokens(&graph, "exec", NULL);
+  int payload = find_cmd_tokens(&graph, "printf", "payload");
+  int consumer = find_cmd_tokens(&graph, "cat", NULL);
+  int endpoint = find_endpoint(&graph);
+  bool setup = false;
+  bool flow = false;
+  for (uint32_t edge = 0; edge < graph.edge_count; edge++) {
+    const shell_dep_edge_t *item = &graph.edges[edge];
+    setup = setup || (item->type == SHELL_EDGE_FD_OPEN &&
+                      item->from == (uint32_t)endpoint &&
+                      item->to == (uint32_t)setup_owner &&
+                      item->source_fd == SHELL_DEP_FD_NONE &&
+                      item->target_fd == SHELL_DEP_FD_NAMED &&
+                      item->target_fd_name_len == 6 &&
+                      memcmp(item->target_fd_name, "source", 6) == 0);
+    flow =
+        flow ||
+        (item->type == SHELL_EDGE_SUBST && item->from == (uint32_t)endpoint &&
+         item->to == (uint32_t)consumer &&
+         item->source_fd == SHELL_DEP_FD_NONE && item->target_fd == 0);
+  }
+  ASSERT(setup_owner >= 0 && payload >= 0 && consumer >= 0 && endpoint >= 0 &&
+         graph.nodes[endpoint].endpoint.reserved != 0 && setup && flow &&
+         shell_dep_graph_validate(&graph).valid);
+
+  ASSERT(parse("exec {sink}> >(cat </tmp/named-sink); "
+               "printf payload >&\"$sink\"",
+               &graph) == SHELL_DEP_OK);
+  setup_owner = find_cmd_tokens(&graph, "exec", NULL);
+  int nested_consumer = find_cmd_tokens(&graph, "cat", NULL);
+  int writer = find_cmd_tokens(&graph, "printf", "payload");
+  endpoint = find_endpoint(&graph);
+  setup = false;
+  flow = false;
+  uint32_t setup_edge = UINT32_MAX;
+  for (uint32_t edge = 0; edge < graph.edge_count; edge++) {
+    const shell_dep_edge_t *item = &graph.edges[edge];
+    bool is_setup = item->type == SHELL_EDGE_FD_OPEN &&
+                    item->from == (uint32_t)setup_owner &&
+                    item->to == (uint32_t)endpoint &&
+                    item->source_fd == SHELL_DEP_FD_NAMED &&
+                    item->source_fd_name_len == 4 &&
+                    memcmp(item->source_fd_name, "sink", 4) == 0 &&
+                    item->target_fd == SHELL_DEP_FD_NONE;
+    setup = setup || is_setup;
+    if (is_setup)
+      setup_edge = edge;
+    flow = flow ||
+           (item->type == SHELL_EDGE_WRITE && item->from == (uint32_t)writer &&
+            item->to == (uint32_t)endpoint && item->source_fd == 1 &&
+            item->target_fd == SHELL_DEP_FD_NONE);
+  }
+  ASSERT(setup_owner >= 0 && nested_consumer >= 0 && writer >= 0 &&
+         endpoint >= 0 && graph.nodes[endpoint].endpoint.reserved != 0 &&
+         setup && flow && shell_dep_graph_validate(&graph).valid);
+
+  shell_dep_graph_t malformed = graph;
+  ASSERT(setup_edge != UINT32_MAX);
+  malformed.edges[setup_edge].type = SHELL_EDGE_WRITE;
+  ASSERT(!shell_dep_graph_validate(&malformed).valid);
+
+  shell_dep_limits_t limits = SHELL_DEP_LIMITS_DEFAULT;
+  limits.max_nodes = 2;
+  shell_dep_graph_t limited = {0};
+  const char *limited_input =
+      "exec {source}< <(printf payload >/tmp/named-source)";
+  ASSERT(shell_dep_graph_parse(limited_input, strlen(limited_input), ".",
+                               &limits, &limited) == SHELL_DEP_ETRUNC);
+  ASSERT((limited.status & SHELL_DEP_STATUS_TRUNCATED) != 0 &&
+         limited.node_count <= limits.max_nodes &&
+         shell_dep_graph_validate(&limited).valid);
+  pass_count++;
+}
+
+/* Named descriptor spans retain their source spelling, but binding identity
+ * must use the same escaped-physical-line-ending rules as syntax parsing.
+ * Exercise every accepted spelling against a differently wrapped reference so
+ * a local descriptor comparator cannot silently diverge from the parser. */
+TEST(named_fd_continuation_identity) {
+  static const struct {
+    const char *command;
+    const char *path;
+  } cases[] = {
+      {"exec {f\\\rd}>/tmp/bare-cr-declaration; printf bytes >&$fd",
+       "/tmp/bare-cr-declaration"},
+      {"exec {fd}>/tmp/bare-cr-reference; printf bytes >&$f\\\rd",
+       "/tmp/bare-cr-reference"},
+      {"exec {f\\\r\nd}>/tmp/crlf-declaration; printf bytes >&$fd",
+       "/tmp/crlf-declaration"},
+      {"exec {fd}>/tmp/crlf-reference; printf bytes >&\"${f\\\r\nd}\"",
+       "/tmp/crlf-reference"},
+      {"exec {fd}>/tmp/dollar-lf-reference; printf bytes >&$\\\n{fd}",
+       "/tmp/dollar-lf-reference"},
+      {"exec {fd}>/tmp/dollar-crlf-reference; printf bytes >&$\\\r\n{fd}",
+       "/tmp/dollar-crlf-reference"},
+      {"exec {fd}>/tmp/dollar-cr-reference; printf bytes >&$\\\r{fd}",
+       "/tmp/dollar-cr-reference"},
+      {"exec {fd}>/tmp/dollar-quoted-reference; printf bytes >&\"$\\\n{fd}\"",
+       "/tmp/dollar-quoted-reference"},
+  };
+
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    shell_dep_graph_t graph = {0};
+    ASSERT(parse(cases[i].command, &graph) == SHELL_DEP_OK);
+    int document = find_file_doc(&graph, cases[i].path);
+    int command = find_nth_cmd(&graph, 1);
+    ASSERT(document >= 0 && command >= 0 &&
+           has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)command,
+                        (uint32_t)document, 1, SHELL_DEP_FD_NONE) &&
+           !has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)command,
+                         (uint32_t)document, 2, SHELL_DEP_FD_NONE) &&
+           count_doc_kind(&graph, SHELL_DOC_FILE) == 1 &&
+           shell_dep_graph_validate(&graph).valid);
+  }
+  pass_count++;
+}
+
+TEST(named_fd_exec_scope_and_lifecycle) {
+  shell_dep_graph_t graph = {0};
+  const char *persistent = "exec {out}> /tmp/out; printf bytes >&\"$out\"";
+  ASSERT(parse(persistent, &graph) == SHELL_DEP_OK);
+  int document = find_doc(&graph, SHELL_DOC_FILE);
+  int printf_command = find_nth_cmd(&graph, 1);
+  bool routed = false;
+  for (uint32_t edge = 0; edge < graph.edge_count; edge++)
+    routed = routed || (graph.edges[edge].type == SHELL_EDGE_WRITE &&
+                        graph.edges[edge].from == (uint32_t)printf_command &&
+                        graph.edges[edge].to == (uint32_t)document &&
+                        graph.edges[edge].source_fd == 1);
+  ASSERT(document >= 0 && printf_command >= 0 && routed &&
+         shell_dep_graph_validate(&graph).valid);
+
+  /* Assignment prefixes are private to the command they decorate. Redirect
+   * expansion must keep using the current-shell descriptor value, and the
+   * prefix must not erase that value for the later command either. */
+  ASSERT(parse("exec {out}> /tmp/prefix-out; out=shadow printf first >&$out; "
+               "printf second >&$out",
+               &graph) == SHELL_DEP_OK);
+  document = find_file_doc(&graph, "/tmp/prefix-out");
+  int prefixed_printf = find_nth_cmd(&graph, 1);
+  int later_printf = find_nth_cmd(&graph, 2);
+  ASSERT(document >= 0 && prefixed_printf >= 0 && later_printf >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)prefixed_printf,
+                      (uint32_t)document, 1, SHELL_DEP_FD_NONE) &&
+         has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)later_printf,
+                      (uint32_t)document, 1, SHELL_DEP_FD_NONE) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  ASSERT(parse("exec {out}> /tmp/prefix-append-out; "
+               "out+=shadow printf first >&$out; printf second >&$out",
+               &graph) == SHELL_DEP_OK);
+  document = find_file_doc(&graph, "/tmp/prefix-append-out");
+  prefixed_printf = find_nth_cmd(&graph, 1);
+  later_printf = find_nth_cmd(&graph, 2);
+  ASSERT(document >= 0 && prefixed_printf >= 0 && later_printf >= 0 &&
+         find_nth_cmd(&graph, 3) < 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)prefixed_printf,
+                      (uint32_t)document, 1, SHELL_DEP_FD_NONE) &&
+         has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)later_printf,
+                      (uint32_t)document, 1, SHELL_DEP_FD_NONE) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  /* Command-word substitutions use that same pre-command descriptor state;
+   * resolver snapshots must not treat their outer assignment prefix as a
+   * persistent mutation. */
+  ASSERT(parse("exec {input}< /tmp/prefix-in; input=shadow printf '%s' "
+               "\"$(cat <&$input)\"",
+               &graph) == SHELL_DEP_OK);
+  document = find_file_doc(&graph, "/tmp/prefix-in");
+  int prefixed_nested_cat = find_nth_cmd(&graph, 2);
+  ASSERT(document >= 0 && prefixed_nested_cat >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_READ, (uint32_t)document,
+                      (uint32_t)prefixed_nested_cat, SHELL_DEP_FD_NONE, 0) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  ASSERT(parse("{ exec {out}> /tmp/out; printf bytes >&$out; }", &graph) ==
+         SHELL_DEP_OK);
+  document = find_doc(&graph, SHELL_DOC_FILE);
+  bool brace_routed = false;
+  for (uint32_t edge = 0; edge < graph.edge_count; edge++)
+    brace_routed =
+        brace_routed || (graph.edges[edge].type == SHELL_EDGE_WRITE &&
+                         graph.edges[edge].to == (uint32_t)document &&
+                         graph.edges[edge].source_fd == 1);
+  ASSERT(document >= 0 && brace_routed &&
+         shell_dep_graph_validate(&graph).valid);
+
+  /* Every execution scope inherits descriptors that existed before it. A
+   * brace group shares its parent state; subshell, pipeline, and background
+   * scopes each receive a private snapshot. */
+  static const char *const inherited[] = {
+      "exec {out}> /tmp/out; { printf bytes >&$out; }",
+      "exec {out}> /tmp/out; ( printf bytes >&$out )",
+      "exec {out}> /tmp/out; printf source | cat >&$out",
+      "exec {out}> /tmp/out; printf bytes >&$out &",
+      "exec {f\\\nd}> /tmp/out; printf bytes >&$f\\\nd",
+      "exec {out}> /tmp/out; true && printf bytes >&$out",
+  };
+  for (uint32_t i = 0; i < sizeof(inherited) / sizeof(inherited[0]); i++) {
+    ASSERT(parse(inherited[i], &graph) == SHELL_DEP_OK);
+    document = find_file_doc(&graph, "/tmp/out");
+    bool child_write = false;
+    for (uint32_t edge = 0; edge < graph.edge_count; edge++)
+      child_write =
+          child_write || (graph.edges[edge].type == SHELL_EDGE_WRITE &&
+                          graph.edges[edge].to == (uint32_t)document &&
+                          graph.edges[edge].source_fd == 1);
+    ASSERT(document >= 0 && child_write &&
+           shell_dep_graph_validate(&graph).valid);
+  }
+
+  ASSERT(parse("( exec {out}> /tmp/out; printf bytes >&$out )", &graph) ==
+             SHELL_DEP_OK &&
+         shell_dep_graph_validate(&graph).valid);
+
+  /* Recursively parsed shell and process substitutions retain direct edges to
+   * the parent resource; they neither reject a visible binding nor clone its
+   * FILE/ENDPOINT node. */
+  ASSERT(parse("exec {input}< /tmp/in; printf '%s' \"$(cat <&$input)\"",
+               &graph) == SHELL_DEP_OK);
+  document = find_file_doc(&graph, "/tmp/in");
+  int nested_cat_command = find_nth_cmd(&graph, 2);
+  ASSERT(document >= 0 && nested_cat_command >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_READ, (uint32_t)document,
+                      (uint32_t)nested_cat_command, SHELL_DEP_FD_NONE, 0) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  ASSERT(parse("exec {input}< /tmp/in; printf '%s' \"$(printf '%s' \"$(cat "
+               "<&$input)\")\"",
+               &graph) == SHELL_DEP_OK);
+  document = find_file_doc(&graph, "/tmp/in");
+  bool nested_import_read = false;
+  for (uint32_t edge = 0; edge < graph.edge_count; edge++)
+    nested_import_read =
+        nested_import_read || (graph.edges[edge].type == SHELL_EDGE_READ &&
+                               graph.edges[edge].from == (uint32_t)document &&
+                               graph.edges[edge].target_fd == 0);
+  ASSERT(document >= 0 && nested_import_read &&
+         shell_dep_graph_validate(&graph).valid);
+
+  /* `<>` retains both directions when the descriptor crosses a recursive
+   * shell boundary; a one-way named allocation must not inherit its absent
+   * direction from an earlier value of the shell variable. */
+  ASSERT(parse("exec {state}<> /tmp/state; printf '%s' \"$(cat <&$state; "
+               "printf bytes >&$state)\"",
+               &graph) == SHELL_DEP_OK);
+  document = find_file_doc(&graph, "/tmp/state");
+  int state_cat = find_nth_cmd(&graph, 2);
+  int state_printf = find_nth_cmd(&graph, 3);
+  ASSERT(document >= 0 && state_cat >= 0 && state_printf >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_READ, (uint32_t)document,
+                      (uint32_t)state_cat, SHELL_DEP_FD_NONE, 0) &&
+         has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)state_printf,
+                      (uint32_t)document, 1, SHELL_DEP_FD_NONE) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  ASSERT(parse("exec {sink}> >(cat); printf '%s' \"$(printf bytes >&$sink)\"",
+               &graph) == SHELL_DEP_OK);
+  int nested_sink = find_endpoint(&graph);
+  int nested_printf = find_nth_cmd(&graph, 3);
+  ASSERT(nested_sink >= 0 && nested_printf >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)nested_printf,
+                      (uint32_t)nested_sink, 1, SHELL_DEP_FD_NONE) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  ASSERT(parse("exec {sink}> >(cat)", &graph) == SHELL_DEP_OK);
+  int exec_command = find_nth_cmd(&graph, 0);
+  int sink = find_endpoint(&graph);
+  bool sink_setup = false;
+  bool false_exec_write = false;
+  for (uint32_t edge = 0; edge < graph.edge_count; edge++) {
+    const shell_dep_edge_t *item = &graph.edges[edge];
+    sink_setup = sink_setup || (item->type == SHELL_EDGE_FD_OPEN &&
+                                item->from == (uint32_t)exec_command &&
+                                item->to == (uint32_t)sink &&
+                                item->source_fd == SHELL_DEP_FD_NAMED &&
+                                item->source_fd_name_len == 4 &&
+                                memcmp(item->source_fd_name, "sink", 4) == 0);
+    false_exec_write =
+        false_exec_write ||
+        (item->type == SHELL_EDGE_WRITE &&
+         item->from == (uint32_t)exec_command && item->to == (uint32_t)sink);
+  }
+  ASSERT(exec_command >= 0 && sink >= 0 && sink_setup && !false_exec_write &&
+         shell_dep_graph_validate(&graph).valid);
+
+  ASSERT(parse("exec {sink}> >(cat); printf bytes >&\"$sink\"", &graph) ==
+         SHELL_DEP_OK);
+  sink = find_endpoint(&graph);
+  printf_command = find_nth_cmd(&graph, 2);
+  bool sink_write = false;
+  for (uint32_t edge = 0; edge < graph.edge_count; edge++)
+    sink_write =
+        sink_write || (graph.edges[edge].type == SHELL_EDGE_WRITE &&
+                       graph.edges[edge].from == (uint32_t)printf_command &&
+                       graph.edges[edge].to == (uint32_t)sink &&
+                       graph.edges[edge].source_fd == 1);
+  ASSERT(sink >= 0 && printf_command >= 0 && sink_write &&
+         shell_dep_graph_validate(&graph).valid);
+
+  ASSERT(parse("exec {source}< <(printf bytes); cat <&\"${source}\"", &graph) ==
+         SHELL_DEP_OK);
+  int producer = find_nth_cmd(&graph, 1);
+  int cat_command = find_nth_cmd(&graph, 2);
+  bool source_setup = false;
+  bool source_read = false;
+  for (uint32_t edge = 0; edge < graph.edge_count; edge++) {
+    const shell_dep_edge_t *item = &graph.edges[edge];
+    source_setup =
+        source_setup ||
+        (item->type == SHELL_EDGE_FD_OPEN && item->from == (uint32_t)producer &&
+         item->target_fd == SHELL_DEP_FD_NAMED &&
+         item->target_fd_name_len == 6 &&
+         memcmp(item->target_fd_name, "source", 6) == 0);
+    source_read =
+        source_read ||
+        (item->type == SHELL_EDGE_SUBST && item->from == (uint32_t)producer &&
+         item->to == (uint32_t)cat_command && item->target_fd == 0);
+  }
+  ASSERT(producer >= 0 && cat_command >= 0 && source_setup && source_read &&
+         shell_dep_graph_validate(&graph).valid);
+
+  /* With Bash's default `varredir_close` behavior, a named descriptor opened
+   * by an ordinary simple command remains available to later commands. A
+   * redirect-only command is deliberately different and remains rejected. */
+  ASSERT(parse(": {out}> /tmp/out; printf bytes >&$out", &graph) ==
+         SHELL_DEP_OK);
+  document = find_file_doc(&graph, "/tmp/out");
+  printf_command = find_nth_cmd(&graph, 1);
+  ASSERT(document >= 0 && printf_command >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)printf_command,
+                      (uint32_t)document, 1, SHELL_DEP_FD_NONE) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  /* A trailing group redirect has the same current-shell lifetime. */
+  ASSERT(parse("{ :; } {out}> /tmp/out; printf bytes >&$out", &graph) ==
+         SHELL_DEP_OK);
+  document = find_file_doc(&graph, "/tmp/out");
+  printf_command = find_nth_cmd(&graph, 1);
+  ASSERT(document >= 0 && printf_command >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)printf_command,
+                      (uint32_t)document, 1, SHELL_DEP_FD_NONE) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  /* A bare `>&$name` after a completed group is a group redirect tail, not an
+   * argv word or a separate redirect-only command. The group and later
+   * command therefore share the previously persisted binding. */
+  ASSERT(parse("exec {out}>/tmp/out; { :; } >&$out; printf bytes >&$out",
+               &graph) == SHELL_DEP_OK);
+  document = find_file_doc(&graph, "/tmp/out");
+  int group = find_group(&graph, SHELL_GROUP_BRACE, UINT32_MAX);
+  printf_command = find_nth_cmd(&graph, 2);
+  ASSERT(document >= 0 && group >= 0 && printf_command >= 0 &&
+         count_type(&graph, SHELL_NODE_CMD) == 3 &&
+         has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)group,
+                      (uint32_t)document, 1, SHELL_DEP_FD_NONE) &&
+         has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)printf_command,
+                      (uint32_t)document, 1, SHELL_DEP_FD_NONE) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  /* A non-`exec` close is local under the default option, whereas an `exec`
+   * close persists and makes the known later descriptor use invalid. */
+  ASSERT(parse("exec {out}> /tmp/out; : {out}>&-; printf bytes >&$out",
+               &graph) == SHELL_DEP_OK);
+  document = find_file_doc(&graph, "/tmp/out");
+  printf_command = find_nth_cmd(&graph, 2);
+  ASSERT(document >= 0 && printf_command >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)printf_command,
+                      (uint32_t)document, 1, SHELL_DEP_FD_NONE) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  /* A successful AND continuation necessarily observes setup performed by
+   * its left side. Keep that state branch-local: the subsequent byte-flow
+   * edge belongs to the consumer, while the setup remains visible on exec. */
+  ASSERT(parse("exec {out}> /tmp/and-named && printf bytes >&$out", &graph) ==
+         SHELL_DEP_OK);
+  document = find_file_doc(&graph, "/tmp/and-named");
+  exec_command = find_nth_cmd(&graph, 0);
+  printf_command = find_nth_cmd(&graph, 1);
+  ASSERT(document >= 0 && exec_command >= 0 && printf_command >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_FD_OPEN, (uint32_t)exec_command,
+                      (uint32_t)document, SHELL_DEP_FD_NAMED,
+                      SHELL_DEP_FD_NONE) &&
+         has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)printf_command,
+                      (uint32_t)document, 1, SHELL_DEP_FD_NONE) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  /* `exec` is not special to the successful direct-AND visibility rule:
+   * an ordinary current-shell command that allocates a named descriptor also
+   * makes it available to its immediate right-hand continuation. */
+  ASSERT(parse(": {out}> /tmp/and-ordinary && printf bytes >&$out", &graph) ==
+         SHELL_DEP_OK);
+  document = find_file_doc(&graph, "/tmp/and-ordinary");
+  int setup_command = find_nth_cmd(&graph, 0);
+  printf_command = find_nth_cmd(&graph, 1);
+  ASSERT(document >= 0 && setup_command >= 0 && printf_command >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_FD_OPEN, (uint32_t)setup_command,
+                      (uint32_t)document, SHELL_DEP_FD_NAMED,
+                      SHELL_DEP_FD_NONE) &&
+         has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)printf_command,
+                      (uint32_t)document, 1, SHELL_DEP_FD_NONE) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  ASSERT(parse("exec 3>/tmp/and-numeric && printf bytes >&3", &graph) ==
+         SHELL_DEP_OK);
+  document = find_file_doc(&graph, "/tmp/and-numeric");
+  exec_command = find_nth_cmd(&graph, 0);
+  printf_command = find_nth_cmd(&graph, 1);
+  ASSERT(document >= 0 && exec_command >= 0 && printf_command >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_FD_OPEN, (uint32_t)exec_command,
+                      (uint32_t)document, 3, SHELL_DEP_FD_NONE) &&
+         has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)printf_command,
+                      (uint32_t)document, 1, SHELL_DEP_FD_NONE) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  ASSERT(parse("true && exec {out}> /tmp/and-chain && printf bytes >&$out",
+               &graph) == SHELL_DEP_OK);
+  document = find_file_doc(&graph, "/tmp/and-chain");
+  printf_command = find_nth_cmd(&graph, 2);
+  ASSERT(document >= 0 && printf_command >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)printf_command,
+                      (uint32_t)document, 1, SHELL_DEP_FD_NONE) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  static const char *const rejected[] = {
+      "{out}> /tmp/out; printf bytes >&$out",
+      "FOO=bar {out}> /tmp/out; printf bytes >&$out",
+      "true && exec {out}> /tmp/out; printf bytes >&$out",
+      "true || exec {out}> /tmp/out && printf bytes >&$out",
+      "exec {out}> /tmp/out || : && printf bytes >&$out",
+      "exec {out}> /tmp/out && :; printf bytes >&$out",
+      "( exec {out}> /tmp/out; printf bytes >&$out ); printf bytes >&$out",
+      "exec {out}> /tmp/out; exec {out}>&-; printf bytes >&$out",
+      "exec {out}> /tmp/out; out=1; printf bytes >&$out",
+      "exec {out}> /tmp/out; out+=shadow; printf bytes >&$out",
+      "exec {o}> /tmp/one-char; o=shadow; printf bytes >&$o",
+      "exec {out}> /tmp/out; o\\\nut=shadow; printf bytes >&$out",
+      "exec {out}> /tmp/out; o\\\r\nut=shadow; printf bytes >&$out",
+      "exec {out}> /tmp/out; o\\\nut+=shadow; printf bytes >&$out",
+      "exec {out}> /tmp/out; o\\\r\nut+=shadow; printf bytes >&$out",
+      "exec {out}> /tmp/out; unset out; printf bytes >&$out",
+      "exec {out}> /tmp/out; un'set' out; printf bytes >&$out",
+      "exec {out}> /tmp/out; un'set' 'out'; printf bytes >&$out",
+      "exec {out}> /tmp/out; command unset out; printf bytes >&$out",
+      "exec {out}> /tmp/out; builtin unset out; printf bytes >&$out",
+      "exec {out}> /tmp/out; read out </dev/null; printf bytes >&$out",
+      "exec {out}> /tmp/out; r'ead' out </dev/null; printf bytes >&$out",
+      "exec {out}> /tmp/out; printf -v out 1; printf bytes >&$out",
+      "exec {out}> /tmp/out; p'rintf' -v out 1; printf bytes >&$out",
+      "exec {out}> /tmp/out; command printf -v out 1; printf bytes >&$out",
+      "exec {out}> /tmp/out; export out=1; printf bytes >&$out",
+      "exec {out}> /tmp/out; export out+=1; printf bytes >&$out",
+      "exec {out}> /tmp/out; ex'port' out=1; printf bytes >&$out",
+      "exec {out}> /tmp/out; declare out=1; printf bytes >&$out",
+      "exec {out}> /tmp/out; declare out+=1; printf bytes >&$out",
+      "exec {out}> /tmp/out; de'clare' out=1; printf bytes >&$out",
+      "exec {out}> /tmp/out; declare 'out'=1; printf bytes >&$out",
+      "exec {out}> /tmp/out; declare 'out'+=1; printf bytes >&$out",
+      "exec {out}> /tmp/out; @(unset) out; printf bytes >&$out",
+      "exec {out}> /tmp/out; eval 'out=1'; printf bytes >&$out",
+      "exec {out}> /tmp/out; printf '%s' \"$(cat <&$out)\"",
+      "exec {out}< /tmp/in; printf bytes >&$out",
+      "exec {out}< /tmp/in; exec {out}> /tmp/out; "
+      "printf '%s' \"$(cat <&$out)\"",
+      "exec {out}> /tmp/out; exec {out}>&-; "
+      "printf '%s' \"$(cat <&$out)\"",
+      "shopt -s varredir_close; : {out}> /tmp/out; printf bytes >&$out",
+      "x+=value shopt -s varredir_close; : {out}> /tmp/out; "
+      "printf bytes >&$out",
+      "x+\\\n=value shopt -u varredir_close; : {out}> /tmp/out; "
+      "printf bytes >&$out",
+      "sh'opt' '-s' varredir_close; : {out}> /tmp/out; printf bytes >&$out",
+      "command shopt -u varredir_close; : {out}> /tmp/out; "
+      "printf bytes >&$out",
+      "shopt -s lastpipe; printf source | : {out}> /tmp/out; "
+      "printf bytes >&$out",
+      "command shopt -u lastpipe; printf source | : {out}> /tmp/out; "
+      "printf bytes >&$out",
+      "eval 'shopt -s lastpipe'; printf source | : {out}> /tmp/out; "
+      "printf bytes >&$out",
+      ". /tmp/shell-state; printf source | : {out}> /tmp/out; "
+      "printf bytes >&$out",
+      "command source /tmp/shell-state; printf source | : {out}> /tmp/out; "
+      "printf bytes >&$out",
+      "trap 'shopt -s lastpipe' DEBUG; printf source | : {out}> /tmp/out; "
+      "printf bytes >&$out",
+      "alias change_scope='shopt -s lastpipe'; "
+      "printf source | : {out}> /tmp/out; printf bytes >&$out",
+      "shopt -s expand_aliases; printf source | : {out}> /tmp/out; "
+      "printf bytes >&$out",
+      "history -s 'shopt -s lastpipe'; fc -s -1; "
+      "printf source | : {out}> /tmp/out; printf bytes >&$out",
+      "enable -f /tmp/shell-state change_scope; "
+      "printf source | : {out}> /tmp/out; printf bytes >&$out",
+  };
+  for (uint32_t i = 0; i < sizeof(rejected) / sizeof(rejected[0]); i++) {
+    ASSERT(parse(rejected[i], &graph) == SHELL_DEP_EPARSE);
+    ASSERT(graph.status == SHELL_DEP_STATUS_ERROR && graph.node_count == 0 &&
+           graph.edge_count == 0);
+  }
+  pass_count++;
+}
+
+/* A group redirect list is installed before that group's body runs. A brace
+ * group shares its parent shell, while a subshell or a brace group isolated by
+ * a pipeline/background relation keeps the named descriptor private. */
+TEST(named_fd_group_execution_scopes) {
+  shell_dep_graph_t graph = {0};
+
+  ASSERT(parse("{ printf bytes >&$out; } {out}> /tmp/brace-out; "
+               "printf later >&$out",
+               &graph) == SHELL_DEP_OK);
+  int document = find_file_doc(&graph, "/tmp/brace-out");
+  int first_printf = find_first_cmd(&graph);
+  int later_printf = find_nth_cmd(&graph, 1);
+  ASSERT(document >= 0 && first_printf >= 0 && later_printf >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)first_printf,
+                      (uint32_t)document, 1, SHELL_DEP_FD_NONE) &&
+         has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)later_printf,
+                      (uint32_t)document, 1, SHELL_DEP_FD_NONE) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  /* The redirect is visible inside the isolated group, but does not survive
+   * in the caller's descriptor-variable state. */
+  ASSERT(parse("( printf bytes >&$out ) {out}> /tmp/subshell-out", &graph) ==
+         SHELL_DEP_OK);
+  document = find_file_doc(&graph, "/tmp/subshell-out");
+  first_printf = find_first_cmd(&graph);
+  ASSERT(document >= 0 && first_printf >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)first_printf,
+                      (uint32_t)document, 1, SHELL_DEP_FD_NONE) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  static const char *const nonexporting_groups[] = {
+      "( : ) {out}> /tmp/subshell-out; printf bytes >&$out",
+      "{ :; } {out}> /tmp/pipe-out | cat; printf bytes >&$out",
+      "{ :; } {out}> /tmp/background-out & printf bytes >&$out",
+  };
+  for (uint32_t i = 0;
+       i < sizeof(nonexporting_groups) / sizeof(nonexporting_groups[0]); i++) {
+    ASSERT(parse(nonexporting_groups[i], &graph) == SHELL_DEP_EPARSE);
+    ASSERT(graph.status == SHELL_DEP_STATUS_ERROR && graph.node_count == 0 &&
+           graph.edge_count == 0);
+  }
+
+  /* A compound group's ordinary redirect list is restored before its direct
+   * `&&` successor runs.  The success edge carries control, not the group's
+   * temporary stdin document. */
+  ASSERT(parse("{ cat; } <<< group-input && cat", &graph) == SHELL_DEP_OK);
+  int group = -1;
+  for (uint32_t node = 0; node < graph.node_count; node++)
+    if (graph.nodes[node].type == SHELL_NODE_GROUP) {
+      group = (int)node;
+      break;
+    }
+  int tail = find_nth_cmd(&graph, 1);
+  int here = -1;
+  uint32_t reads = 0;
+  bool group_read = false;
+  bool tail_read = false;
+  for (uint32_t edge = 0; edge < graph.edge_count; edge++) {
+    const shell_dep_edge_t *item = &graph.edges[edge];
+    if (item->type != SHELL_EDGE_READ)
+      continue;
+    reads++;
+    here = (int)item->from;
+    group_read = group_read || item->to == (uint32_t)group;
+    tail_read = tail_read || item->to == (uint32_t)tail;
+  }
+  ASSERT(group >= 0 && tail >= 0 && here >= 0 && reads == 1 && group_read &&
+         !tail_read && graph.nodes[here].type == SHELL_NODE_DOC &&
+         graph.nodes[here].doc.kind == SHELL_DOC_HERESTRING &&
+         shell_dep_graph_validate(&graph).valid);
+
+  /* Bash retains a `{name}` allocation from a non-isolated brace group, so
+   * the proven success successor may resolve the symbolic descriptor even
+   * though the group's ordinary redirect routes were discarded. */
+  ASSERT(parse("{ printf inner >&$out; } {out}> /tmp/and-group-out && "
+               "printf outer >&$out",
+               &graph) == SHELL_DEP_OK);
+  document = find_file_doc(&graph, "/tmp/and-group-out");
+  first_printf = find_first_cmd(&graph);
+  later_printf = find_nth_cmd(&graph, 1);
+  ASSERT(document >= 0 && first_printf >= 0 && later_printf >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)first_printf,
+                      (uint32_t)document, 1, SHELL_DEP_FD_NONE) &&
+         has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)later_printf,
+                      (uint32_t)document, 1, SHELL_DEP_FD_NONE) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  /* All group-tail operations are installed before body substitutions. The
+   * later dup must copy the opened stdin route, so nested command evaluation
+   * reads the same file from fd 3. */
+  ASSERT(parse("{ printf '%s' \"$(cat <&3)\"; } </tmp/group-mixed-in 3<&0",
+               &graph) == SHELL_DEP_OK);
+  group = find_group(&graph, SHELL_GROUP_BRACE, UINT32_MAX);
+  document = find_file_doc(&graph, "/tmp/group-mixed-in");
+  int nested_cat = find_cmd_tokens(&graph, "cat", NULL);
+  ASSERT(group >= 0 && document >= 0 && nested_cat >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_READ, (uint32_t)document,
+                      (uint32_t)nested_cat, SHELL_DEP_FD_NONE, 0) &&
+         has_edge_fds(&graph, SHELL_EDGE_READ, (uint32_t)document,
+                      (uint32_t)group, SHELL_DEP_FD_NONE, 3) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  /* The same source-order replay includes here-string and here-document
+   * documents, not just file opens. */
+  ASSERT(parse("{ printf '%s' \"$(cat <&3)\"; } <<< group-here 3<&0", &graph) ==
+         SHELL_DEP_OK);
+  document = find_doc(&graph, SHELL_DOC_HERESTRING);
+  nested_cat = find_cmd_tokens(&graph, "cat", NULL);
+  ASSERT(document >= 0 && nested_cat >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_READ, (uint32_t)document,
+                      (uint32_t)nested_cat, SHELL_DEP_FD_NONE, 0) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  ASSERT(parse("{ printf '%s' \"$(cat <&3)\"; } <<EOF 3<&0\n"
+               "group-doc\nEOF\n",
+               &graph) == SHELL_DEP_OK);
+  document = find_doc(&graph, SHELL_DOC_HEREDOC);
+  nested_cat = find_cmd_tokens(&graph, "cat", NULL);
+  ASSERT(document >= 0 && nested_cat >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_READ, (uint32_t)document,
+                      (uint32_t)nested_cat, SHELL_DEP_FD_NONE, 0) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  /* A process-substitution input followed by a dup is replayed before body
+   * expansion too; no placeholder FILE path stands in for the pipe. */
+  ASSERT(parse("{ printf '%s' \"$(cat <&3)\"; } < <(printf payload) 3<&0",
+               &graph) == SHELL_DEP_OK);
+  int process_producer = find_cmd_tokens(&graph, "printf", "payload");
+  nested_cat = find_cmd_tokens(&graph, "cat", NULL);
+  group = find_group(&graph, SHELL_GROUP_BRACE, UINT32_MAX);
+  ASSERT(process_producer >= 0 && nested_cat >= 0 && group >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_SUBST, (uint32_t)process_producer,
+                      (uint32_t)group, 1, 0) &&
+         has_edge_fds(&graph, SHELL_EDGE_SUBST, (uint32_t)process_producer,
+                      (uint32_t)nested_cat, 1, 0) &&
+         has_edge_fds(&graph, SHELL_EDGE_SUBST, (uint32_t)process_producer,
+                      (uint32_t)group, 1, 3) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  /* The group's descriptor table is installed before its body starts, so a
+   * nested command substitution inherits its named input descriptor too. */
+  ASSERT(parse("{ printf '%s' \"$(cat <&$in)\"; } {in}</tmp/and-group-in && :",
+               &graph) == SHELL_DEP_OK);
+  document = find_file_doc(&graph, "/tmp/and-group-in");
+  nested_cat = find_nth_cmd(&graph, 1);
+  ASSERT(document >= 0 && nested_cat >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_READ, (uint32_t)document,
+                      (uint32_t)nested_cat, SHELL_DEP_FD_NONE, 0) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  /* The same installation rule applies to ordinary descriptors. The
+   * pre-body redirect must reach a nested shell even though its source text is
+   * a trailing group list. */
+  ASSERT(parse("{ printf '%s' \"$(cat <&0)\"; } </tmp/group-substitution-in",
+               &graph) == SHELL_DEP_OK);
+  document = find_file_doc(&graph, "/tmp/group-substitution-in");
+  nested_cat = find_cmd_tokens(&graph, "cat", NULL);
+  ASSERT(document >= 0 && nested_cat >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_READ, (uint32_t)document,
+                      (uint32_t)nested_cat, SHELL_DEP_FD_NONE, 0) &&
+         shell_dep_graph_validate(&graph).valid);
+  pass_count++;
+}
+
+TEST(named_fd_group_body_replay) {
+  shell_dep_graph_t graph = {0};
+  ASSERT(parse("{ exec {fd}</tmp/inner; echo \"$(cat <&$fd)\"; }", &graph) ==
+         SHELL_DEP_OK);
+  int inner = find_file_doc(&graph, "/tmp/inner");
+  int cat = find_cmd_tokens(&graph, "cat", NULL);
+  ASSERT(inner >= 0 && cat >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_READ, (uint32_t)inner, (uint32_t)cat,
+                      SHELL_DEP_FD_NONE, 0) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  ASSERT(parse("exec {fd}</tmp/outer; { exec {fd}</tmp/inner; "
+               "echo \"$(cat <&$fd)\"; }",
+               &graph) == SHELL_DEP_OK);
+  inner = find_file_doc(&graph, "/tmp/inner");
+  int outer = find_file_doc(&graph, "/tmp/outer");
+  cat = find_cmd_tokens(&graph, "cat", NULL);
+  ASSERT(inner >= 0 && outer >= 0 && cat >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_READ, (uint32_t)inner, (uint32_t)cat,
+                      SHELL_DEP_FD_NONE, 0) &&
+         !has_edge_fds(&graph, SHELL_EDGE_READ, (uint32_t)outer, (uint32_t)cat,
+                       SHELL_DEP_FD_NONE, 0) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  ASSERT(parse("exec {fd}</tmp/outer; { exec {fd}</tmp/inner; cat <&$fd; }",
+               &graph) == SHELL_DEP_OK);
+  inner = find_file_doc(&graph, "/tmp/inner");
+  outer = find_file_doc(&graph, "/tmp/outer");
+  cat = find_cmd_tokens(&graph, "cat", NULL);
+  ASSERT(inner >= 0 && outer >= 0 && cat >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_READ, (uint32_t)inner, (uint32_t)cat,
+                      SHELL_DEP_FD_NONE, 0) &&
+         !has_edge_fds(&graph, SHELL_EDGE_READ, (uint32_t)outer, (uint32_t)cat,
+                       SHELL_DEP_FD_NONE, 0));
+
+  static const char *const group_cases[] = {
+      ("exec {fd}</tmp/outer; { exec {fd}</tmp/inner; cat <&$fd; } "
+       "{tail}>/tmp/tail"),
+      "exec {fd}</tmp/outer; { { exec {fd}</tmp/inner; cat <&$fd; }; }",
+      "exec {fd}</tmp/outer; { exec {fd}</tmp/inner && cat <&$fd; }",
+  };
+  for (uint32_t i = 0; i < sizeof(group_cases) / sizeof(group_cases[0]); i++) {
+    ASSERT(parse(group_cases[i], &graph) == SHELL_DEP_OK);
+    inner = find_file_doc(&graph, "/tmp/inner");
+    outer = find_file_doc(&graph, "/tmp/outer");
+    cat = find_cmd_tokens(&graph, "cat", NULL);
+    ASSERT(inner >= 0 && outer >= 0 && cat >= 0 &&
+           has_edge_fds(&graph, SHELL_EDGE_READ, (uint32_t)inner, (uint32_t)cat,
+                        SHELL_DEP_FD_NONE, 0) &&
+           !has_edge_fds(&graph, SHELL_EDGE_READ, (uint32_t)outer,
+                         (uint32_t)cat, SHELL_DEP_FD_NONE, 0) &&
+           shell_dep_graph_validate(&graph).valid);
+  }
+
+  ASSERT(parse("{ exec {fd}</tmp/inner; cat <&$fd; } {fd}</tmp/outer",
+               &graph) == SHELL_DEP_OK);
+  inner = find_file_doc(&graph, "/tmp/inner");
+  outer = find_file_doc(&graph, "/tmp/outer");
+  cat = find_cmd_tokens(&graph, "cat", NULL);
+  ASSERT(inner >= 0 && outer >= 0 && cat >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_READ, (uint32_t)inner, (uint32_t)cat,
+                      SHELL_DEP_FD_NONE, 0) &&
+         !has_edge_fds(&graph, SHELL_EDGE_READ, (uint32_t)outer, (uint32_t)cat,
+                       SHELL_DEP_FD_NONE, 0));
+
+  /* A subshell sees the rebind but must not publish it back to its parent. */
+  ASSERT(parse("exec {fd}</tmp/outer; ( exec {fd}</tmp/inner; cat <&$fd ); "
+               "cat <&$fd",
+               &graph) == SHELL_DEP_OK);
+  inner = find_file_doc(&graph, "/tmp/inner");
+  outer = find_file_doc(&graph, "/tmp/outer");
+  int local_cat = find_nth_cmd(&graph, 2);
+  int parent_cat = find_nth_cmd(&graph, 3);
+  ASSERT(inner >= 0 && outer >= 0 && local_cat >= 0 && parent_cat >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_READ, (uint32_t)inner,
+                      (uint32_t)local_cat, SHELL_DEP_FD_NONE, 0) &&
+         has_edge_fds(&graph, SHELL_EDGE_READ, (uint32_t)outer,
+                      (uint32_t)parent_cat, SHELL_DEP_FD_NONE, 0) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  static const char *const invalidated[] = {
+      "exec {fd}</tmp/outer; unset fd; echo \"$(cat <&$fd)\"",
+      "exec {fd}</tmp/outer; fd=shadow; echo \"$(cat <&$fd)\"",
+      "exec {fd}</tmp/outer; { unset fd; echo \"$(cat <&$fd)\"; }",
+      "exec {fd}</tmp/outer; { fd=shadow; echo \"$(cat <&$fd)\"; }",
+  };
+  for (uint32_t i = 0; i < sizeof(invalidated) / sizeof(invalidated[0]); i++)
+    ASSERT(parse(invalidated[i], &graph) == SHELL_DEP_EPARSE);
+  pass_count++;
+}
+
+TEST(conditional_group_descriptor_replay) {
+  shell_dep_graph_t graph = {0};
+  static const char *const commented_connectors[] = {
+      "{ exec {fd}</tmp/snapshot-input; } >/dev/null # && not a connector\n"
+      "printf \"$(cat <&$fd)\"",
+      "{ exec {fd}</tmp/snapshot-input; } >/dev/null # || not a connector\n"
+      "printf \"$(cat <&$fd)\"",
+      "{ exec {fd}</tmp/snapshot-input; } >\"/tmp/out # && literal\"; "
+      "printf \"$(cat <&$fd)\"",
+  };
+  for (uint32_t i = 0;
+       i < sizeof(commented_connectors) / sizeof(commented_connectors[0]);
+       i++) {
+    ASSERT(parse(commented_connectors[i], &graph) == SHELL_DEP_OK);
+    int input = find_file_doc(&graph, "/tmp/snapshot-input");
+    int nested = find_cmd_tokens(&graph, "cat", NULL);
+    ASSERT(input >= 0 && nested >= 0 &&
+           has_edge_fds(&graph, SHELL_EDGE_READ, (uint32_t)input,
+                        (uint32_t)nested, SHELL_DEP_FD_NONE, 0) &&
+           shell_dep_graph_validate(&graph).valid);
+  }
+  ASSERT(parse("false && { :; exec {fd}</tmp/skipped; }; "
+               "echo \"$(cat <&$fd)\"",
+               &graph) == SHELL_DEP_EPARSE);
+  ASSERT(parse("true || { :; exec {fd}</tmp/skipped; }; "
+               "echo \"$(cat <&$fd)\"",
+               &graph) == SHELL_DEP_EPARSE);
+  ASSERT(parse("{ :; exec {fd}</tmp/skipped; } && :; "
+               "echo \"$(cat <&$fd)\"",
+               &graph) == SHELL_DEP_EPARSE);
+
+  ASSERT(parse("true && { exec {fd}</tmp/inside; "
+               "echo \"$(cat <&$fd)\"; }",
+               &graph) == SHELL_DEP_OK);
+  int inside = find_file_doc(&graph, "/tmp/inside");
+  int cat = find_cmd_tokens(&graph, "cat", NULL);
+  ASSERT(inside >= 0 && cat >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_READ, (uint32_t)inside, (uint32_t)cat,
+                      SHELL_DEP_FD_NONE, 0) &&
+         shell_dep_graph_validate(&graph).valid);
+  ASSERT(parse("false || { exec {fd}</tmp/inside; "
+               "echo \"$(cat <&$fd)\"; }",
+               &graph) == SHELL_DEP_OK);
+  inside = find_file_doc(&graph, "/tmp/inside");
+  cat = find_cmd_tokens(&graph, "cat", NULL);
+  ASSERT(inside >= 0 && cat >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_READ, (uint32_t)inside, (uint32_t)cat,
+                      SHELL_DEP_FD_NONE, 0));
+
+  ASSERT(parse("{ exec 3<&0; } </tmp/group-input; cat <&3", &graph) ==
+         SHELL_DEP_OK);
+  inside = find_file_doc(&graph, "/tmp/group-input");
+  cat = find_cmd_tokens(&graph, "cat", NULL);
+  ASSERT(inside >= 0 && cat >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_READ, (uint32_t)inside, (uint32_t)cat,
+                      SHELL_DEP_FD_NONE, 0) &&
+         shell_dep_graph_validate(&graph).valid);
+  ASSERT(parse("{ cat <&3; } 3</tmp/group-input", &graph) == SHELL_DEP_OK);
+  inside = find_file_doc(&graph, "/tmp/group-input");
+  cat = find_cmd_tokens(&graph, "cat", NULL);
+  ASSERT(inside >= 0 && cat >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_READ, (uint32_t)inside, (uint32_t)cat,
+                      SHELL_DEP_FD_NONE, 0) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  ASSERT(parse("exec 3</tmp/outer; true && { exec 3</tmp/inner; "
+               "{ cat <&3; }; }",
+               &graph) == SHELL_DEP_OK);
+  inside = find_file_doc(&graph, "/tmp/inner");
+  int outer = find_file_doc(&graph, "/tmp/outer");
+  cat = find_cmd_tokens(&graph, "cat", NULL);
+  ASSERT(inside >= 0 && outer >= 0 && cat >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_READ, (uint32_t)inside, (uint32_t)cat,
+                      SHELL_DEP_FD_NONE, 0) &&
+         !has_edge_fds(&graph, SHELL_EDGE_READ, (uint32_t)outer, (uint32_t)cat,
+                       SHELL_DEP_FD_NONE, 0) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  ASSERT(parse("exec {fd}</tmp/outer; true && { unset fd; "
+               "{ cat <&$fd; }; }",
+               &graph) == SHELL_DEP_EPARSE);
+  pass_count++;
+}
+
+TEST(named_fd_builtin_mutation_follows_own_redirects) {
+  shell_dep_graph_t graph = {0};
+  static const char *const output_cases[] = {
+      "exec {fd}>/tmp/before-mutation; unset fd >&$fd",
+      "exec {fd}>/tmp/before-mutation; printf -v fd shadow >&$fd",
+      "exec {fd}>/tmp/before-mutation; command unset fd >&$fd",
+      "exec {fd}>/tmp/before-mutation; { unset fd >&$fd; }",
+  };
+  for (uint32_t i = 0; i < sizeof(output_cases) / sizeof(output_cases[0]);
+       i++) {
+    ASSERT(parse(output_cases[i], &graph) == SHELL_DEP_OK);
+    int document = find_file_doc(&graph, "/tmp/before-mutation");
+    int mutator = find_cmd_tokens(&graph,
+                                  i == 1   ? "printf"
+                                  : i == 2 ? "command"
+                                           : "unset",
+                                  NULL);
+    ASSERT(document >= 0 && mutator >= 0 &&
+           has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)mutator,
+                        (uint32_t)document, 1, SHELL_DEP_FD_NONE) &&
+           shell_dep_graph_validate(&graph).valid);
+  }
+
+  ASSERT(parse("exec {fd}</tmp/before-read; read fd <&$fd", &graph) ==
+         SHELL_DEP_OK);
+  int document = find_file_doc(&graph, "/tmp/before-read");
+  int reader = find_cmd_tokens(&graph, "read", NULL);
+  ASSERT(document >= 0 && reader >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_READ, (uint32_t)document,
+                      (uint32_t)reader, SHELL_DEP_FD_NONE, 0) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  ASSERT(parse("exec {fd}</tmp/before-read; printf -v fd shadow "
+               "> >(cat <&$fd)",
+               &graph) == SHELL_DEP_OK);
+  document = find_file_doc(&graph, "/tmp/before-read");
+  reader = find_cmd_tokens(&graph, "cat", NULL);
+  ASSERT(document >= 0 && reader >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_READ, (uint32_t)document,
+                      (uint32_t)reader, SHELL_DEP_FD_NONE, 0) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  ASSERT(parse("exec {fd}</tmp/before-read; printf -v fd shadow "
+               "\"$(cat <&$fd)\"",
+               &graph) == SHELL_DEP_OK);
+  document = find_file_doc(&graph, "/tmp/before-read");
+  reader = find_cmd_tokens(&graph, "cat", NULL);
+  ASSERT(document >= 0 && reader >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_READ, (uint32_t)document,
+                      (uint32_t)reader, SHELL_DEP_FD_NONE, 0) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  static const char *const invalid_after[] = {
+      "exec {fd}>/tmp/before-mutation; unset fd >&$fd; printf x >&$fd",
+      "exec {fd}>/tmp/before-mutation; unset fd >&$fd && printf x >&$fd",
+      "exec {fd}</tmp/before-read; read fd <&$fd; cat <&$fd",
+      "exec {fd}>/tmp/before-mutation; fd=shadow >&$fd",
+      "printf -v fd shadow {fd}>/tmp/before-mutation; printf x >&$fd",
+      "printf -v fd shadow {fd}>/tmp/before-mutation && printf x >&$fd",
+      "unset fd {fd}>/tmp/before-mutation; printf x >&$fd",
+  };
+  for (uint32_t i = 0; i < sizeof(invalid_after) / sizeof(invalid_after[0]);
+       i++)
+    ASSERT(parse(invalid_after[i], &graph) == SHELL_DEP_EPARSE &&
+           graph.node_count == 0 && graph.edge_count == 0);
+  pass_count++;
+}
+
+/* Redirect filenames and symbolic duplication operands belong to the shell,
+ * not to the builtin's variable-argument list. */
+TEST(named_fd_builtin_redirect_operands) {
+  static const char *const surviving[] = {
+      "exec {fd}>/tmp/route; unset unrelated >&$fd; printf x >&$fd",
+      "exec {fd}>/tmp/route; unset unrelated >fd; printf x >&$fd",
+      "exec {fd}>/tmp/route; command unset unrelated >other; printf x >&$fd",
+      "exec {fd}>/tmp/route; export OTHER=1 >fd=shadow; printf x >&$fd",
+      "exec {fd}>/tmp/route; declare OTHER=1 >fd=shadow; printf x >&$fd",
+      "exec {fd}>/tmp/route; typeset OTHER=1 >fd=shadow; printf x >&$fd",
+      "exec {fd}>/tmp/route; >fd=shadow export OTHER=1; printf x >&$fd",
+      "exec {fd}>/tmp/route; printf '%s' x >&$fd; printf x >&$fd",
+  };
+  shell_dep_graph_t graph = {0};
+  for (size_t i = 0; i < sizeof(surviving) / sizeof(surviving[0]); i++) {
+    shell_dep_error_t parsed = parse(surviving[i], &graph);
+    if (parsed != SHELL_DEP_OK)
+      fprintf(stderr, "builtin redirect case %zu failed: %s (%d)\n", i,
+              surviving[i], parsed);
+    ASSERT(parsed == SHELL_DEP_OK);
+    int document = find_file_doc(&graph, "/tmp/route");
+    int writer = find_nth_cmd(&graph, count_type(&graph, SHELL_NODE_CMD) - 1);
+    ASSERT(document >= 0 && writer >= 0 &&
+           has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)writer,
+                        (uint32_t)document, 1, SHELL_DEP_FD_NONE) &&
+           shell_dep_graph_validate(&graph).valid);
+  }
+  ASSERT(parse("exec {fd}>/tmp/route; unset fd >other; printf x >&$fd",
+               &graph) == SHELL_DEP_EPARSE);
+  ASSERT(parse("exec {fd}>/tmp/route; export fd=shadow >other; "
+               "printf x >&$fd",
+               &graph) == SHELL_DEP_EPARSE);
+  pass_count++;
+}
+
+TEST(backtick_command_boundaries) {
+  shell_dep_graph_t graph = {0};
+  static const char *const commands[] = {
+      "echo `printf x; printf y`; next",
+      "echo `printf x | cat` && next",
+      "echo `printf \\`quoted\\` | cat`; next",
+  };
+  for (uint32_t i = 0; i < sizeof(commands) / sizeof(commands[0]); i++) {
+    ASSERT(parse(commands[i], &graph) == SHELL_DEP_OK);
+    ASSERT(find_cmd_tokens(&graph, "echo", NULL) >= 0 &&
+           find_cmd_tokens(&graph, "next", NULL) >= 0 &&
+           shell_dep_graph_validate(&graph).valid);
+  }
+  pass_count++;
+}
+
+/* Nested shell evaluations receive the descriptor environment that the shell
+ * would have at that exact expansion point.  In particular, ordinary command
+ * words expand before their command's redirect list, while a redirect operand
+ * and an expandable heredoc see only preceding entries in that list. */
+TEST(named_fd_recursive_snapshot_timing) {
+  shell_dep_graph_t graph = {0};
+
+  static const char *const rejected[] = {
+      "printf '%s' {fd}</tmp/in \"$(cat <&$fd)\"",
+      "printf '%s' \"$(cat <&$fd)\" {fd}</tmp/in",
+      "exec {fd}</tmp/in; exec {fd}<&-; printf '%s' \"$(cat <&$fd)\"",
+      "false && exec {fd}</tmp/in; printf '%s' \"$(cat <&$fd)\"",
+      "true || exec {fd}</tmp/in && printf '%s' \"$(cat <&$fd)\"",
+      "printf > >(cat <&$fd) {fd}</tmp/in",
+      "cat <<EOF {fd}</tmp/in\n$(cat <&$fd)\nEOF\n",
+  };
+  for (uint32_t i = 0; i < sizeof(rejected) / sizeof(rejected[0]); i++) {
+    ASSERT(parse(rejected[i], &graph) == SHELL_DEP_EPARSE);
+    ASSERT(graph.status == SHELL_DEP_STATUS_ERROR && graph.node_count == 0 &&
+           graph.edge_count == 0);
+  }
+
+  /* A preceding ordinary command persists its named allocation under the
+   * default `varredir_close` setting. Its later command substitution receives
+   * the exact descriptor state, rather than rediscovering raw source text. */
+  ASSERT(parse("printf '%s' {fd}</tmp/in; printf '%s' \"$(cat <&$fd)\"",
+               &graph) == SHELL_DEP_OK);
+  int document = find_file_doc(&graph, "/tmp/in");
+  int nested_cat = find_nth_cmd(&graph, 2);
+  ASSERT(document >= 0 && nested_cat >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_READ, (uint32_t)document,
+                      (uint32_t)nested_cat, SHELL_DEP_FD_NONE, 0) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  /* Recursive parsing asks for a snapshot before the enclosing graph has
+   * emitted every control edge. A right-hand substitution still receives the
+   * proven AND-success descriptor state, while an OR bypass above is rejected
+   * by the matrix before this case. */
+  ASSERT(parse("exec {fd}</tmp/and-in && printf '%s' \"$(cat <&$fd)\"",
+               &graph) == SHELL_DEP_OK);
+  document = find_file_doc(&graph, "/tmp/and-in");
+  nested_cat = find_nth_cmd(&graph, 2);
+  ASSERT(document >= 0 && nested_cat >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_READ, (uint32_t)document,
+                      (uint32_t)nested_cat, SHELL_DEP_FD_NONE, 0) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  /* Duplicating an inherited numeric descriptor is a valid named binding,
+   * even though it has no document endpoint to materialize in this graph. */
+  static const char *const inherited_numeric[] = {
+      "exec {fd}<&0; printf '%s' \"$(cat <&$fd)\"",
+      "exec {fd}>&1; printf '%s' \"$(printf bytes >&$fd)\"",
+  };
+  for (uint32_t i = 0;
+       i < sizeof(inherited_numeric) / sizeof(inherited_numeric[0]); i++) {
+    ASSERT(parse(inherited_numeric[i], &graph) == SHELL_DEP_OK);
+    ASSERT(shell_dep_graph_validate(&graph).valid);
+  }
+
+  ASSERT(parse("exec {source}</tmp/in; exec {copy}<&$source; printf '%s' "
+               "\"$(cat <&$copy)\"",
+               &graph) == SHELL_DEP_OK);
+  document = find_file_doc(&graph, "/tmp/in");
+  nested_cat = find_nth_cmd(&graph, 3);
+  ASSERT(document >= 0 && nested_cat >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_READ, (uint32_t)document,
+                      (uint32_t)nested_cat, SHELL_DEP_FD_NONE, 0) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  ASSERT(parse("exec {source}>/tmp/out; exec {copy}<&$source; printf '%s' "
+               "\"$(printf bytes >&$copy)\"",
+               &graph) == SHELL_DEP_OK);
+  document = find_file_doc(&graph, "/tmp/out");
+  int nested_printf = find_nth_cmd(&graph, 3);
+  ASSERT(document >= 0 && nested_printf >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)nested_printf,
+                      (uint32_t)document, 1, SHELL_DEP_FD_NONE) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  ASSERT(parse("printf {fd}</tmp/in > >(cat <&$fd)", &graph) == SHELL_DEP_OK);
+  document = find_file_doc(&graph, "/tmp/in");
+  ASSERT(document >= 0 && shell_dep_graph_validate(&graph).valid);
+
+  ASSERT(parse("cat {fd}</tmp/in <<EOF\n$(cat <&$fd)\nEOF\n", &graph) ==
+         SHELL_DEP_OK);
+  document = find_file_doc(&graph, "/tmp/in");
+  ASSERT(document >= 0 && shell_dep_graph_validate(&graph).valid);
+  pass_count++;
+}
+
+TEST(group_entry_redirect_expansion_timing) {
+  shell_dep_graph_t graph = {0};
+  shell_dep_limits_t limits = SHELL_DEP_LIMITS_DEFAULT;
+  limits.cd_as_cmd = true;
+  const char *cwd_command = "cd /tmp; { :; } > >(pwd); pwd";
+  ASSERT(shell_dep_graph_parse(cwd_command, strlen(cwd_command), "/workspace",
+                               &limits, &graph) == SHELL_DEP_OK);
+  int nested_pwd = find_cmd_tokens(&graph, "pwd", NULL);
+  int body = find_cmd_tokens(&graph, ":", NULL);
+  ASSERT(nested_pwd >= 0 && body >= 0 && nested_pwd < body &&
+         graph.nodes[nested_pwd].cmd.cwd_known);
+  ASSERT_STR_EQ(get_cwd_str(&graph, graph.nodes[nested_pwd].cmd.cwd_offset),
+                "/tmp");
+  ASSERT(shell_dep_graph_validate(&graph).valid);
+
+  static const char *const other_group_operands[] = {
+      "cd /tmp; { :; } >$(pwd)",
+      "cd /tmp; { :; } <<<$(pwd)",
+      "cd /tmp; { :; } <<EOF\n$(pwd)\nEOF\n",
+      "( cd /tmp; { :; } > >(pwd) ); pwd",
+  };
+  for (uint32_t i = 0;
+       i < sizeof(other_group_operands) / sizeof(other_group_operands[0]);
+       i++) {
+    ASSERT(parse_cwd(other_group_operands[i], "/workspace", &graph) ==
+           SHELL_DEP_OK);
+    nested_pwd = find_cmd_tokens(&graph, "pwd", NULL);
+    ASSERT(nested_pwd >= 0 && graph.nodes[nested_pwd].cmd.cwd_known);
+    ASSERT_STR_EQ(get_cwd_str(&graph, graph.nodes[nested_pwd].cmd.cwd_offset),
+                  "/tmp");
+    ASSERT(shell_dep_graph_validate(&graph).valid);
+  }
+
+  const char *isolated = "cd /tmp; ( { :; } > >(pwd) ); pwd";
+  ASSERT(shell_dep_graph_parse(isolated, strlen(isolated), "/workspace",
+                               &limits, &graph) == SHELL_DEP_OK);
+  nested_pwd = find_cmd_tokens(&graph, "pwd", NULL);
+  ASSERT(nested_pwd >= 0 && graph.nodes[nested_pwd].cmd.cwd_known);
+  ASSERT_STR_EQ(get_cwd_str(&graph, graph.nodes[nested_pwd].cmd.cwd_offset),
+                "/tmp");
+  ASSERT(shell_dep_graph_validate(&graph).valid);
+
+  const char *uncertain = "cd \"$path\"; { :; } > >(pwd)";
+  ASSERT(shell_dep_graph_parse(uncertain, strlen(uncertain), "/workspace",
+                               &limits, &graph) == SHELL_DEP_OK);
+  nested_pwd = find_cmd_tokens(&graph, "pwd", NULL);
+  ASSERT(nested_pwd >= 0 && !graph.nodes[nested_pwd].cmd.cwd_known &&
+         shell_dep_graph_validate(&graph).valid);
+
+  ASSERT(parse_cwd("cd \"$path\"; echo \"$(pwd)\"", "/workspace", &graph) ==
+         SHELL_DEP_OK);
+  nested_pwd = find_cmd_tokens(&graph, "pwd", NULL);
+  ASSERT(nested_pwd >= 0 && !graph.nodes[nested_pwd].cmd.cwd_known &&
+         shell_dep_graph_validate(&graph).valid);
+
+  ASSERT(parse("exec 3</tmp/group-entry-in; { :; } <<<$(cat <&3)", &graph) ==
+         SHELL_DEP_OK);
+  int file = find_file_doc(&graph, "/tmp/group-entry-in");
+  int cat = find_cmd_tokens(&graph, "cat", NULL);
+  ASSERT(file >= 0 && cat >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_READ, (uint32_t)file, (uint32_t)cat,
+                      SHELL_DEP_FD_NONE, 0) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  ASSERT(parse("exec {in}</tmp/group-entry-in && ! { :; } <<<$(cat <&$in)",
+               &graph) == SHELL_DEP_OK);
+  file = find_file_doc(&graph, "/tmp/group-entry-in");
+  cat = find_cmd_tokens(&graph, "cat", NULL);
+  ASSERT(file >= 0 && cat >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_READ, (uint32_t)file, (uint32_t)cat,
+                      SHELL_DEP_FD_NONE, 0) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  ASSERT(parse("exec {in}</tmp/group-entry-in; { :; } <<<$(cat <&$in)",
+               &graph) == SHELL_DEP_OK);
+  file = find_file_doc(&graph, "/tmp/group-entry-in");
+  cat = find_cmd_tokens(&graph, "cat", NULL);
+  ASSERT(file >= 0 && cat >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_READ, (uint32_t)file, (uint32_t)cat,
+                      SHELL_DEP_FD_NONE, 0) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  ASSERT(parse("exec {in}</tmp/group-entry-in && { :; } <<<$(cat <&$in)",
+               &graph) == SHELL_DEP_OK);
+  file = find_file_doc(&graph, "/tmp/group-entry-in");
+  cat = find_cmd_tokens(&graph, "cat", NULL);
+  ASSERT(file >= 0 && cat >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_READ, (uint32_t)file, (uint32_t)cat,
+                      SHELL_DEP_FD_NONE, 0) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  /* The inner group is prebuilt but has not run when the outer redirect
+   * operand expands. Its named descriptor must not leak backwards in time. */
+  ASSERT(parse("{ { :; } {in}</tmp/later; } <<<$(cat <&$in)", &graph) ==
+         SHELL_DEP_EPARSE);
+  ASSERT(graph.status == SHELL_DEP_STATUS_ERROR && graph.node_count == 0 &&
+         graph.edge_count == 0);
+
+  ASSERT(parse("{ :; } {in}</tmp/earlier <<<$(cat <&$in)", &graph) ==
+         SHELL_DEP_OK);
+  ASSERT(shell_dep_graph_validate(&graph).valid);
+  ASSERT(parse("{ :; } <<<$(cat <&$in) {in}</tmp/later", &graph) ==
+         SHELL_DEP_EPARSE);
+  ASSERT(graph.status == SHELL_DEP_STATUS_ERROR && graph.node_count == 0 &&
+         graph.edge_count == 0);
+
+  /* Prebuilt compound documents still honor graph bounds before any body or
+   * operand expansion is allowed to publish a partial topology. */
+  static const char *const bounded[] = {
+      "{ :; } >/tmp/group-bound",
+      "{ :; } <<<$(pwd)",
+      "{ :; } <<EOF\n$(pwd)\nEOF\n",
+  };
+  shell_dep_limits_t bounded_limits = SHELL_DEP_LIMITS_DEFAULT;
+  bounded_limits.max_nodes = 1;
+  for (uint32_t i = 0; i < sizeof(bounded) / sizeof(bounded[0]); i++) {
+    ASSERT(shell_dep_graph_parse(bounded[i], strlen(bounded[i]), ".",
+                                 &bounded_limits, &graph) == SHELL_DEP_ETRUNC);
+    ASSERT((graph.status & SHELL_DEP_STATUS_TRUNCATED) != 0);
+  }
+
+  static const char *const quoted_substitutions[] = {
+      "{ :; } <<<$(printf $'a)b')",
+      "{ :; } > >(printf $'a)b')",
+      "{ :; } >$(printf $'a)b')",
+  };
+  for (uint32_t i = 0;
+       i < sizeof(quoted_substitutions) / sizeof(quoted_substitutions[0]);
+       i++) {
+    ASSERT(parse(quoted_substitutions[i], &graph) == SHELL_DEP_OK);
+    ASSERT(find_cmd_tokens(&graph, "printf", NULL) >= 0 &&
+           shell_dep_graph_validate(&graph).valid);
+  }
+  pass_count++;
+}
+
+/* A persistent `exec` redirect updates the current shell's numeric descriptor
+ * table. It is setup, not byte flow: only a later command that duplicates the
+ * descriptor onto stdin/stdout has a concrete edge to the resource. */
+TEST(numeric_exec_descriptor_lifecycle) {
+  shell_dep_graph_t graph = {0};
+
+  ASSERT(parse("exec >/tmp/stdout; printf bytes", &graph) == SHELL_DEP_OK);
+  int document = find_file_doc(&graph, "/tmp/stdout");
+  int exec_command = find_nth_cmd(&graph, 0);
+  int printf_command = find_nth_cmd(&graph, 1);
+  ASSERT(document >= 0 && exec_command >= 0 && printf_command >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_FD_OPEN, (uint32_t)exec_command,
+                      (uint32_t)document, 1, SHELL_DEP_FD_NONE) &&
+         has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)printf_command,
+                      (uint32_t)document, 1, SHELL_DEP_FD_NONE) &&
+         !has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)exec_command,
+                       (uint32_t)document, 1, SHELL_DEP_FD_NONE) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  ASSERT(parse("MODE=quiet exec 3>/tmp/prefixed; printf bytes >&3", &graph) ==
+         SHELL_DEP_OK);
+  document = find_file_doc(&graph, "/tmp/prefixed");
+  exec_command = find_nth_cmd(&graph, 0);
+  printf_command = find_nth_cmd(&graph, 1);
+  ASSERT(document >= 0 && exec_command >= 0 && printf_command >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_FD_OPEN, (uint32_t)exec_command,
+                      (uint32_t)document, 3, SHELL_DEP_FD_NONE) &&
+         has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)printf_command,
+                      (uint32_t)document, 1, SHELL_DEP_FD_NONE) &&
+         !has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)exec_command,
+                       (uint32_t)document, 3, SHELL_DEP_FD_NONE) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  ASSERT(parse("exec -cl 3>/tmp/options; printf bytes >&3", &graph) ==
+         SHELL_DEP_OK);
+  document = find_file_doc(&graph, "/tmp/options");
+  exec_command = find_nth_cmd(&graph, 0);
+  printf_command = find_nth_cmd(&graph, 1);
+  ASSERT(document >= 0 && exec_command >= 0 && printf_command >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_FD_OPEN, (uint32_t)exec_command,
+                      (uint32_t)document, 3, SHELL_DEP_FD_NONE) &&
+         has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)printf_command,
+                      (uint32_t)document, 1, SHELL_DEP_FD_NONE) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  ASSERT(parse("exec -a label 3>/tmp/option-name; printf bytes >&3", &graph) ==
+         SHELL_DEP_OK);
+  document = find_file_doc(&graph, "/tmp/option-name");
+  exec_command = find_nth_cmd(&graph, 0);
+  printf_command = find_nth_cmd(&graph, 1);
+  ASSERT(document >= 0 && exec_command >= 0 && printf_command >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_FD_OPEN, (uint32_t)exec_command,
+                      (uint32_t)document, 3, SHELL_DEP_FD_NONE) &&
+         has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)printf_command,
+                      (uint32_t)document, 1, SHELL_DEP_FD_NONE) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  ASSERT(parse("exec -- 3>/tmp/end-options; printf bytes >&3", &graph) ==
+         SHELL_DEP_OK);
+  document = find_file_doc(&graph, "/tmp/end-options");
+  exec_command = find_nth_cmd(&graph, 0);
+  printf_command = find_nth_cmd(&graph, 1);
+  ASSERT(document >= 0 && exec_command >= 0 && printf_command >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_FD_OPEN, (uint32_t)exec_command,
+                      (uint32_t)document, 3, SHELL_DEP_FD_NONE) &&
+         has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)printf_command,
+                      (uint32_t)document, 1, SHELL_DEP_FD_NONE) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  ASSERT(parse("exec -alabel 3>/tmp/argv0; printf bytes >&3", &graph) ==
+         SHELL_DEP_OK);
+  document = find_file_doc(&graph, "/tmp/argv0");
+  exec_command = find_nth_cmd(&graph, 0);
+  printf_command = find_nth_cmd(&graph, 1);
+  ASSERT(document >= 0 && exec_command >= 0 && printf_command >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_FD_OPEN, (uint32_t)exec_command,
+                      (uint32_t)document, 3, SHELL_DEP_FD_NONE) &&
+         has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)printf_command,
+                      (uint32_t)document, 1, SHELL_DEP_FD_NONE) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  ASSERT(parse("exec </tmp/stdin; cat", &graph) == SHELL_DEP_OK);
+  document = find_file_doc(&graph, "/tmp/stdin");
+  exec_command = find_nth_cmd(&graph, 0);
+  int cat_command = find_nth_cmd(&graph, 1);
+  ASSERT(document >= 0 && exec_command >= 0 && cat_command >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_FD_OPEN, (uint32_t)document,
+                      (uint32_t)exec_command, SHELL_DEP_FD_NONE, 0) &&
+         has_edge_fds(&graph, SHELL_EDGE_READ, (uint32_t)document,
+                      (uint32_t)cat_command, SHELL_DEP_FD_NONE, 0) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  ASSERT(parse("exec 3>>/tmp/append; printf bytes >&3", &graph) ==
+         SHELL_DEP_OK);
+  document = find_file_doc(&graph, "/tmp/append");
+  exec_command = find_nth_cmd(&graph, 0);
+  printf_command = find_nth_cmd(&graph, 1);
+  ASSERT(document >= 0 && exec_command >= 0 && printf_command >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_FD_OPEN, (uint32_t)exec_command,
+                      (uint32_t)document, 3, SHELL_DEP_FD_NONE) &&
+         has_edge_fds(&graph, SHELL_EDGE_APPEND, (uint32_t)printf_command,
+                      (uint32_t)document, 1, SHELL_DEP_FD_NONE) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  ASSERT(parse("exec 3>/tmp/out; printf bytes >&3", &graph) == SHELL_DEP_OK);
+  document = find_file_doc(&graph, "/tmp/out");
+  exec_command = find_nth_cmd(&graph, 0);
+  printf_command = find_nth_cmd(&graph, 1);
+  ASSERT(document >= 0 && exec_command >= 0 && printf_command >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_FD_OPEN, (uint32_t)exec_command,
+                      (uint32_t)document, 3, SHELL_DEP_FD_NONE) &&
+         has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)printf_command,
+                      (uint32_t)document, 1, SHELL_DEP_FD_NONE) &&
+         !has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)printf_command,
+                       (uint32_t)document, 3, SHELL_DEP_FD_NONE) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  /* Shell roles use quote removal, not raw source spelling. These forms all
+   * invoke a current-shell `exec` and must materialize the later route only
+   * when stdout is duplicated onto the persistent descriptor. */
+  ASSERT(parse("e'x'ec 3>/tmp/quoted-exec; printf bytes >&3", &graph) ==
+         SHELL_DEP_OK);
+  document = find_file_doc(&graph, "/tmp/quoted-exec");
+  exec_command = find_nth_cmd(&graph, 0);
+  printf_command = find_nth_cmd(&graph, 1);
+  ASSERT(document >= 0 && exec_command >= 0 && printf_command >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_FD_OPEN, (uint32_t)exec_command,
+                      (uint32_t)document, 3, SHELL_DEP_FD_NONE) &&
+         has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)printf_command,
+                      (uint32_t)document, 1, SHELL_DEP_FD_NONE) &&
+         !has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)exec_command,
+                       (uint32_t)document, 3, SHELL_DEP_FD_NONE) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  ASSERT(parse("e\\xec '-c''l' 3>/tmp/escaped-exec; printf bytes >&3",
+               &graph) == SHELL_DEP_OK);
+  document = find_file_doc(&graph, "/tmp/escaped-exec");
+  exec_command = find_nth_cmd(&graph, 0);
+  printf_command = find_nth_cmd(&graph, 1);
+  ASSERT(document >= 0 && exec_command >= 0 && printf_command >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_FD_OPEN, (uint32_t)exec_command,
+                      (uint32_t)document, 3, SHELL_DEP_FD_NONE) &&
+         has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)printf_command,
+                      (uint32_t)document, 1, SHELL_DEP_FD_NONE) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  /* An auxiliary descriptor does not imply that an unrelated command writes
+   * to it. The graph records the persistent setup but no speculative flow. */
+  ASSERT(parse("exec 3>/tmp/out; printf bytes", &graph) == SHELL_DEP_OK);
+  document = find_file_doc(&graph, "/tmp/out");
+  printf_command = find_nth_cmd(&graph, 1);
+  ASSERT(document >= 0 && count_edge_type(&graph, SHELL_EDGE_FD_OPEN) == 1 &&
+         printf_command >= 0 &&
+         !has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)printf_command,
+                       (uint32_t)document, 3, SHELL_DEP_FD_NONE) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  ASSERT(parse("exec 3>/tmp/out; exec 4>&3; printf bytes >&4", &graph) ==
+         SHELL_DEP_OK);
+  document = find_file_doc(&graph, "/tmp/out");
+  int duplicate_exec = find_nth_cmd(&graph, 1);
+  printf_command = find_nth_cmd(&graph, 2);
+  ASSERT(document >= 0 && duplicate_exec >= 0 && printf_command >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_FD_OPEN, (uint32_t)duplicate_exec,
+                      (uint32_t)duplicate_exec, 3, 4) &&
+         has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)printf_command,
+                      (uint32_t)document, 1, SHELL_DEP_FD_NONE) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  /* The target word can remain quoted or be a distinct lexical token. It is
+   * still a static descriptor target, never an argv or pathname operand. */
+  ASSERT(parse("exec 3>/tmp/quoted-dup; exec 4>&\"3\"; printf bytes >&4",
+               &graph) == SHELL_DEP_OK);
+  document = find_file_doc(&graph, "/tmp/quoted-dup");
+  duplicate_exec = find_nth_cmd(&graph, 1);
+  printf_command = find_nth_cmd(&graph, 2);
+  ASSERT(document >= 0 && duplicate_exec >= 0 && printf_command >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_FD_OPEN, (uint32_t)duplicate_exec,
+                      (uint32_t)duplicate_exec, 3, 4) &&
+         has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)printf_command,
+                      (uint32_t)document, 1, SHELL_DEP_FD_NONE) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  ASSERT(parse("exec 3>/tmp/bare-dup; exec 4>& 3; printf bytes >&4", &graph) ==
+         SHELL_DEP_OK);
+  document = find_file_doc(&graph, "/tmp/bare-dup");
+  duplicate_exec = find_nth_cmd(&graph, 1);
+  printf_command = find_nth_cmd(&graph, 2);
+  ASSERT(document >= 0 && duplicate_exec >= 0 && printf_command >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_FD_OPEN, (uint32_t)duplicate_exec,
+                      (uint32_t)duplicate_exec, 3, 4) &&
+         has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)printf_command,
+                      (uint32_t)document, 1, SHELL_DEP_FD_NONE) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  /* `command` preserves execution for its `-p` form. A following `exec`
+   * without a command operand therefore has the same current-shell descriptor
+   * lifetime as direct exec, including numeric open and duplication state. */
+  ASSERT(parse("command -p -- exec 3>/tmp/command-open; command exec 4>&3; "
+               "printf bytes >&4",
+               &graph) == SHELL_DEP_OK);
+  document = find_file_doc(&graph, "/tmp/command-open");
+  exec_command = find_nth_cmd(&graph, 0);
+  duplicate_exec = find_nth_cmd(&graph, 1);
+  printf_command = find_nth_cmd(&graph, 2);
+  ASSERT(document >= 0 && exec_command >= 0 && duplicate_exec >= 0 &&
+         printf_command >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_FD_OPEN, (uint32_t)exec_command,
+                      (uint32_t)document, 3, SHELL_DEP_FD_NONE) &&
+         has_edge_fds(&graph, SHELL_EDGE_FD_OPEN, (uint32_t)duplicate_exec,
+                      (uint32_t)duplicate_exec, 3, 4) &&
+         has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)printf_command,
+                      (uint32_t)document, 1, SHELL_DEP_FD_NONE) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  ASSERT(parse("com'mand' '-p' '--' e'x'ec 3>/tmp/quoted-command; "
+               "com'mand' e'x'ec 4>&3; printf bytes >&4",
+               &graph) == SHELL_DEP_OK);
+  document = find_file_doc(&graph, "/tmp/quoted-command");
+  exec_command = find_nth_cmd(&graph, 0);
+  duplicate_exec = find_nth_cmd(&graph, 1);
+  printf_command = find_nth_cmd(&graph, 2);
+  ASSERT(document >= 0 && exec_command >= 0 && duplicate_exec >= 0 &&
+         printf_command >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_FD_OPEN, (uint32_t)exec_command,
+                      (uint32_t)document, 3, SHELL_DEP_FD_NONE) &&
+         has_edge_fds(&graph, SHELL_EDGE_FD_OPEN, (uint32_t)duplicate_exec,
+                      (uint32_t)duplicate_exec, 3, 4) &&
+         has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)printf_command,
+                      (uint32_t)document, 1, SHELL_DEP_FD_NONE) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  /* A qualified exec close must replace an earlier named binding. The later
+   * exact parameter reference is consequently not a usable route. */
+  ASSERT(parse("command exec {fd}>/tmp/command-close; command exec {fd}>&-; "
+               "printf bytes >&$fd",
+               &graph) == SHELL_DEP_EPARSE);
+  ASSERT(graph.status == SHELL_DEP_STATUS_ERROR && graph.node_count == 0 &&
+         graph.edge_count == 0);
+
+  /* Inspection forms do not execute their argument and must not accidentally
+   * promote the redirect into persistent descriptor state. */
+  ASSERT(parse("command -v exec 3>/tmp/command-inspect; printf bytes >&3",
+               &graph) == SHELL_DEP_OK);
+  document = find_file_doc(&graph, "/tmp/command-inspect");
+  exec_command = find_nth_cmd(&graph, 0);
+  printf_command = find_nth_cmd(&graph, 1);
+  ASSERT(document >= 0 && exec_command >= 0 && printf_command >= 0 &&
+         !has_edge_fds(&graph, SHELL_EDGE_FD_OPEN, (uint32_t)exec_command,
+                       (uint32_t)document, 3, SHELL_DEP_FD_NONE) &&
+         !has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)printf_command,
+                       (uint32_t)document, 1, SHELL_DEP_FD_NONE) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  ASSERT(parse("builtin e'x'ec 3>/tmp/builtin-inspect; printf bytes >&3",
+               &graph) == SHELL_DEP_OK);
+  document = find_file_doc(&graph, "/tmp/builtin-inspect");
+  exec_command = find_nth_cmd(&graph, 0);
+  printf_command = find_nth_cmd(&graph, 1);
+  ASSERT(document >= 0 && exec_command >= 0 && printf_command >= 0 &&
+         !has_edge_fds(&graph, SHELL_EDGE_FD_OPEN, (uint32_t)exec_command,
+                       (uint32_t)document, 3, SHELL_DEP_FD_NONE) &&
+         !has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)printf_command,
+                       (uint32_t)document, 1, SHELL_DEP_FD_NONE) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  ASSERT(parse("com'mand' '-V' e'x'ec 3>/tmp/quoted-inspect; "
+               "printf bytes >&3",
+               &graph) == SHELL_DEP_OK);
+  document = find_file_doc(&graph, "/tmp/quoted-inspect");
+  exec_command = find_nth_cmd(&graph, 0);
+  printf_command = find_nth_cmd(&graph, 1);
+  ASSERT(document >= 0 && exec_command >= 0 && printf_command >= 0 &&
+         !has_edge_fds(&graph, SHELL_EDGE_FD_OPEN, (uint32_t)exec_command,
+                       (uint32_t)document, 3, SHELL_DEP_FD_NONE) &&
+         !has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)printf_command,
+                       (uint32_t)document, 1, SHELL_DEP_FD_NONE) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  ASSERT(parse("exec 3>/tmp/out; exec 3>&-; printf bytes", &graph) ==
+         SHELL_DEP_OK);
+  document = find_file_doc(&graph, "/tmp/out");
+  exec_command = find_nth_cmd(&graph, 1);
+  printf_command = find_nth_cmd(&graph, 2);
+  ASSERT(document >= 0 && exec_command >= 0 && printf_command >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_FD_CLOSE, (uint32_t)exec_command,
+                      (uint32_t)exec_command, 3, SHELL_DEP_FD_NONE) &&
+         !has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)printf_command,
+                       (uint32_t)document, 3, SHELL_DEP_FD_NONE) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  ASSERT(parse("exec 3>/tmp/quoted-close; exec 3>&\"-\"; printf bytes >&3",
+               &graph) == SHELL_DEP_EPARSE);
+  ASSERT(graph.status == SHELL_DEP_STATUS_ERROR && graph.node_count == 0 &&
+         graph.edge_count == 0);
+
+  ASSERT(parse("exec 3>/tmp/bare-close; exec 3>& -; printf bytes >&3",
+               &graph) == SHELL_DEP_EPARSE);
+  ASSERT(graph.status == SHELL_DEP_STATUS_ERROR && graph.node_count == 0 &&
+         graph.edge_count == 0);
+
+  ASSERT(parse("exec 3>/tmp/out; exec 3>&-; printf bytes >&3", &graph) ==
+         SHELL_DEP_EPARSE);
+  ASSERT(graph.status == SHELL_DEP_STATUS_ERROR && graph.node_count == 0 &&
+         graph.edge_count == 0);
+
+  /* Nested command substitutions inherit persistent numeric descriptors, but
+   * their captured stdout remains independent of the parent descriptor. */
+  ASSERT(parse("exec 3>/tmp/out; printf '%s' \"$(printf bytes >&3)\"",
+               &graph) == SHELL_DEP_OK);
+  document = find_file_doc(&graph, "/tmp/out");
+  int nested_printf = find_nth_cmd(&graph, 2);
+  ASSERT(document >= 0 && nested_printf >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)nested_printf,
+                      (uint32_t)document, 1, SHELL_DEP_FD_NONE) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  /* A nested `exec 4>&3` is descriptor setup, not a write by the `exec`
+   * builtin. Its later nested command is the one that materializes the
+   * imported route. */
+  ASSERT(parse("exec 3>/tmp/out; printf '%s' \"$(exec 4>&3; "
+               "printf bytes >&4)\"",
+               &graph) == SHELL_DEP_OK);
+  document = find_file_doc(&graph, "/tmp/out");
+  int nested_exec = find_nth_cmd(&graph, 2);
+  nested_printf = find_nth_cmd(&graph, 3);
+  ASSERT(document >= 0 && nested_exec >= 0 && nested_printf >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_FD_OPEN, (uint32_t)nested_exec,
+                      (uint32_t)nested_exec, 3, 4) &&
+         !has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)nested_exec,
+                       (uint32_t)document, 4, SHELL_DEP_FD_NONE) &&
+         has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)nested_printf,
+                      (uint32_t)document, 1, SHELL_DEP_FD_NONE) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  ASSERT(parse("exec 3</tmp/in; printf '%s' \"$(cat <&3)\"", &graph) ==
+         SHELL_DEP_OK);
+  document = find_file_doc(&graph, "/tmp/in");
+  int nested_cat = find_nth_cmd(&graph, 2);
+  ASSERT(document >= 0 && nested_cat >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_READ, (uint32_t)document,
+                      (uint32_t)nested_cat, SHELL_DEP_FD_NONE, 0) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  /* Process substitutions receive the same persistent auxiliary descriptor
+   * state, while their stdin remains the substitution stream. */
+  ASSERT(parse("exec 3>/tmp/out; printf payload > >(cat >&3)", &graph) ==
+         SHELL_DEP_OK);
+  document = find_file_doc(&graph, "/tmp/out");
+  int nested_consumer = find_nth_cmd(&graph, 2);
+  ASSERT(document >= 0 && nested_consumer >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)nested_consumer,
+                      (uint32_t)document, 1, SHELL_DEP_FD_NONE) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  ASSERT(parse("exec 3> >(cat); printf bytes >&3", &graph) == SHELL_DEP_OK);
+  int endpoint = find_endpoint(&graph);
+  exec_command = find_nth_cmd(&graph, 0);
+  printf_command = find_nth_cmd(&graph, 2);
+  ASSERT(endpoint >= 0 && exec_command >= 0 && printf_command >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_FD_OPEN, (uint32_t)exec_command,
+                      (uint32_t)endpoint, 3, SHELL_DEP_FD_NONE) &&
+         has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)printf_command,
+                      (uint32_t)endpoint, 1, SHELL_DEP_FD_NONE) &&
+         !has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)printf_command,
+                       (uint32_t)endpoint, 3, SHELL_DEP_FD_NONE) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  ASSERT(parse("exec 3< <(printf bytes); cat <&3", &graph) == SHELL_DEP_OK);
+  exec_command = find_nth_cmd(&graph, 0);
+  int producer = find_nth_cmd(&graph, 1);
+  cat_command = find_nth_cmd(&graph, 2);
+  ASSERT(exec_command >= 0 && producer >= 0 && cat_command >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_FD_OPEN, (uint32_t)producer,
+                      (uint32_t)exec_command, 1, 3) &&
+         has_edge_fds(&graph, SHELL_EDGE_SUBST, (uint32_t)producer,
+                      (uint32_t)cat_command, 1, 0) &&
+         shell_dep_graph_validate(&graph).valid);
+  pass_count++;
+}
+
+/* Descriptor state follows the effective static builtin after quote removal.
+ * Wrapper redirects are temporary, while a dynamic wrapper target can execute
+ * an arbitrary assignment builtin and must therefore invalidate every named
+ * route before a later symbolic descriptor use. */
+TEST(static_builtin_descriptor_route_regressions) {
+  shell_dep_graph_t graph = {0};
+
+  /* `unset -f` and `unset -n` do not remove ordinary descriptor variables.
+   * `-v` does, and conflicting function/variable options fail before changing
+   * either namespace. */
+  ASSERT(parse("exec {out}> /tmp/function; unset -f out; printf bytes >&$out",
+               &graph) == SHELL_DEP_OK);
+  int document = find_file_doc(&graph, "/tmp/function");
+  int printf_command = find_nth_cmd(&graph, 2);
+  ASSERT(document >= 0 && printf_command >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)printf_command,
+                      (uint32_t)document, 1, SHELL_DEP_FD_NONE) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  ASSERT(parse("exec {out}> /tmp/nameref; unset '-n' out; printf bytes >&$out",
+               &graph) == SHELL_DEP_OK);
+  document = find_file_doc(&graph, "/tmp/nameref");
+  printf_command = find_nth_cmd(&graph, 2);
+  ASSERT(document >= 0 && printf_command >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)printf_command,
+                      (uint32_t)document, 1, SHELL_DEP_FD_NONE) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  ASSERT(parse("exec {out}> /tmp/variable; unset -v out; printf bytes >&$out",
+               &graph) == SHELL_DEP_EPARSE);
+  ASSERT(graph.status == SHELL_DEP_STATUS_ERROR && graph.node_count == 0 &&
+         graph.edge_count == 0);
+
+  ASSERT(parse("exec {out}> /tmp/conflict; unset -fv out; printf bytes >&$out",
+               &graph) == SHELL_DEP_OK);
+  document = find_file_doc(&graph, "/tmp/conflict");
+  printf_command = find_nth_cmd(&graph, 2);
+  ASSERT(document >= 0 && printf_command >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)printf_command,
+                      (uint32_t)document, 1, SHELL_DEP_FD_NONE) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  ASSERT(parse("exec {out}> /tmp/out; command >/tmp/log unset out; "
+               "printf bytes >&$out",
+               &graph) == SHELL_DEP_EPARSE);
+  ASSERT(graph.status == SHELL_DEP_STATUS_ERROR && graph.node_count == 0 &&
+         graph.edge_count == 0);
+
+  ASSERT(parse("exec {out}> /tmp/out; command -- unset out; "
+               "printf bytes >&$out",
+               &graph) == SHELL_DEP_EPARSE);
+  ASSERT(graph.status == SHELL_DEP_STATUS_ERROR && graph.node_count == 0 &&
+         graph.edge_count == 0);
+
+  ASSERT(parse("exec {out}> /tmp/out; builtin -- unset out; "
+               "printf bytes >&$out",
+               &graph) == SHELL_DEP_EPARSE);
+  ASSERT(graph.status == SHELL_DEP_STATUS_ERROR && graph.node_count == 0 &&
+         graph.edge_count == 0);
+
+  /* Wrapper chains retain the final builtin's current-shell effect. A chain
+   * that reaches unset, printf -v, or export must not leave a stale named-FD
+   * route for a later descriptor expansion. */
+  ASSERT(parse("exec {out}> /tmp/out; command builtin unset out; "
+               "printf bytes >&$out",
+               &graph) == SHELL_DEP_EPARSE);
+  ASSERT(graph.status == SHELL_DEP_STATUS_ERROR && graph.node_count == 0 &&
+         graph.edge_count == 0);
+
+  ASSERT(parse("exec {out}> /tmp/out; builtin command printf -v out value; "
+               "printf bytes >&$out",
+               &graph) == SHELL_DEP_EPARSE);
+  ASSERT(graph.status == SHELL_DEP_STATUS_ERROR && graph.node_count == 0 &&
+         graph.edge_count == 0);
+
+  ASSERT(parse("exec {out}> /tmp/out; command command export out=value; "
+               "printf bytes >&$out",
+               &graph) == SHELL_DEP_EPARSE);
+  ASSERT(graph.status == SHELL_DEP_STATUS_ERROR && graph.node_count == 0 &&
+         graph.edge_count == 0);
+
+  ASSERT(parse("exec {out}> /tmp/out; command \"$target\"; "
+               "printf bytes >&$out",
+               &graph) == SHELL_DEP_EPARSE);
+  ASSERT(graph.status == SHELL_DEP_STATUS_ERROR && graph.node_count == 0 &&
+         graph.edge_count == 0);
+
+  /* `declare -p` only inspects state. It must not discard the named descriptor
+   * route, unlike a declaration assignment. */
+  ASSERT(parse("exec {out}> /tmp/declared; declare -p; printf bytes >&$out",
+               &graph) == SHELL_DEP_OK);
+  document = find_file_doc(&graph, "/tmp/declared");
+  printf_command = find_nth_cmd(&graph, 2);
+  ASSERT(document >= 0 && printf_command >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)printf_command,
+                      (uint32_t)document, 1, SHELL_DEP_FD_NONE) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  /* An invalid static printf assignment target fails before mutating its
+   * variable, so it does not invalidate an unrelated descriptor binding. */
+  ASSERT(parse("exec {out}> /tmp/out; printf -v 3 ignored; "
+               "printf bytes >&$out",
+               &graph) == SHELL_DEP_OK);
+  document = find_file_doc(&graph, "/tmp/out");
+  printf_command = find_nth_cmd(&graph, 2);
+  ASSERT(document >= 0 && printf_command >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)printf_command,
+                      (uint32_t)document, 1, SHELL_DEP_FD_NONE) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  ASSERT(parse("com'mand' '-pp' e'x'ec 3>/tmp/repeated-p; "
+               "printf bytes >&3",
+               &graph) == SHELL_DEP_OK);
+  document = find_file_doc(&graph, "/tmp/repeated-p");
+  printf_command = find_nth_cmd(&graph, 1);
+  ASSERT(document >= 0 && printf_command >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)printf_command,
+                      (uint32_t)document, 1, SHELL_DEP_FD_NONE) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  /* A chain of `command` wrappers preserves `exec`'s current-shell
+   * descriptor lifetime. Introducing `builtin` does not: Bash scopes the
+   * redirect to that wrapper invocation, so the later writer has no route. */
+  ASSERT(parse("command command exec 3>/tmp/nested-command; printf bytes >&3",
+               &graph) == SHELL_DEP_OK);
+  document = find_file_doc(&graph, "/tmp/nested-command");
+  printf_command = find_nth_cmd(&graph, 1);
+  ASSERT(document >= 0 && printf_command >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)printf_command,
+                      (uint32_t)document, 1, SHELL_DEP_FD_NONE) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  ASSERT(parse("command builtin exec 3>/tmp/nested-builtin; "
+               "printf bytes >&3",
+               &graph) == SHELL_DEP_OK);
+  document = find_file_doc(&graph, "/tmp/nested-builtin");
+  printf_command = find_nth_cmd(&graph, 1);
+  ASSERT(document >= 0 && printf_command >= 0 &&
+         !has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)printf_command,
+                       (uint32_t)document, 1, SHELL_DEP_FD_NONE) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  ASSERT(parse("builtin command exec 3>/tmp/builtin-command; "
+               "printf bytes >&3",
+               &graph) == SHELL_DEP_OK);
+  document = find_file_doc(&graph, "/tmp/builtin-command");
+  printf_command = find_nth_cmd(&graph, 1);
+  ASSERT(document >= 0 && printf_command >= 0 &&
+         !has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)printf_command,
+                       (uint32_t)document, 1, SHELL_DEP_FD_NONE) &&
+         shell_dep_graph_validate(&graph).valid);
+  pass_count++;
+}
+
+/* Descriptor variables are shell identifiers after quote removal. A static
+ * mutation of `{left}` must not erase an independent `{right}` binding merely
+ * because its operand was quoted or physically continued in source. */
+TEST(quoted_named_fd_mutation_targets) {
+  static const char *const mutations[] = {
+      "unset 'left'",        "unset -v \"left\"",      "printf -v le'ft' value",
+      "export 'left'=value", "declare le\"ft\"=value", "typeset $'left'=value",
+  };
+  shell_dep_graph_t graph = {0};
+  for (size_t i = 0; i < sizeof(mutations) / sizeof(mutations[0]); i++) {
+    char command[256];
+    int written = snprintf(command, sizeof(command),
+                           "exec {left}>/tmp/left; exec {right}>/tmp/right; "
+                           "%s; printf bytes >&$right",
+                           mutations[i]);
+    ASSERT(written > 0 && (size_t)written < sizeof(command));
+    shell_dep_error_t parsed = parse(command, &graph);
+    if (parsed != SHELL_DEP_OK)
+      fprintf(stderr, "quoted mutation %s returned %d\n", mutations[i], parsed);
+    ASSERT(parsed == SHELL_DEP_OK);
+    int document = find_file_doc(&graph, "/tmp/right");
+    int printf_command = find_nth_cmd(&graph, 3);
+    ASSERT(document >= 0 && printf_command >= 0 &&
+           has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)printf_command,
+                        (uint32_t)document, 1, SHELL_DEP_FD_NONE) &&
+           shell_dep_graph_validate(&graph).valid);
+  }
+
+  /* A plain declaration reads metadata without changing the descriptor
+   * variable, even when its name contains quotes. */
+  ASSERT(parse("exec {left}>/tmp/left; declare 'left'; "
+               "printf bytes >&$left",
+               &graph) == SHELL_DEP_OK);
+  int document = find_file_doc(&graph, "/tmp/left");
+  int printf_command = find_nth_cmd(&graph, 2);
+  ASSERT(document >= 0 && printf_command >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)printf_command,
+                      (uint32_t)document, 1, SHELL_DEP_FD_NONE) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  /* The stored route and the static target both allow physical continuation.
+   * Removing `right` must leave the independently named left route alive. */
+  ASSERT(parse("exec {left}>/tmp/left; exec {ri\\\nght}>/tmp/right; "
+               "unset ri\\\nght; printf bytes >&$left",
+               &graph) == SHELL_DEP_OK);
+  document = find_file_doc(&graph, "/tmp/left");
+  printf_command = find_nth_cmd(&graph, 3);
+  ASSERT(document >= 0 && printf_command >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)printf_command,
+                      (uint32_t)document, 1, SHELL_DEP_FD_NONE) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  /* Runtime, malformed, and invalid assignment targets remain conservative:
+   * they could alter any descriptor variable, so no later symbolic route is
+   * trusted. */
+  static const char *const uncertain_mutations[] = {
+      "unset \"$target\"",
+      "printf -v \"$target\" value",
+      "export \"$target\"=value",
+      "declare 1left=value",
+  };
+  for (size_t i = 0;
+       i < sizeof(uncertain_mutations) / sizeof(uncertain_mutations[0]); i++) {
+    char command[256];
+    int written = snprintf(command, sizeof(command),
+                           "exec {left}>/tmp/left; exec {right}>/tmp/right; "
+                           "%s; printf bytes >&$right",
+                           uncertain_mutations[i]);
+    ASSERT(written > 0 && (size_t)written < sizeof(command));
+    ASSERT(parse(command, &graph) == SHELL_DEP_EPARSE);
+    ASSERT(graph.status == SHELL_DEP_STATUS_ERROR && graph.node_count == 0 &&
+           graph.edge_count == 0);
+  }
+  pass_count++;
+}
+
+TEST(decoded_assignment_targets_and_env_docs) {
+  shell_dep_graph_t graph = {0};
+  static const char *const spellings[] = {
+      "export \"NAME=$(printf data)\"",
+      "export NA\"ME\"=value",
+      "export $'NA\\x4dE'=value",
+      "export N\\AME=value",
+      "export 'NAME=value'",
+      "export \"NAME+=value\"",
+  };
+  for (size_t i = 0; i < sizeof(spellings) / sizeof(spellings[0]); i++) {
+    ASSERT(parse(spellings[i], &graph) == SHELL_DEP_OK);
+    const shell_dep_doc_t *env = NULL;
+    for (uint32_t node = 0; node < graph.node_count; node++)
+      if (graph.nodes[node].type == SHELL_NODE_DOC &&
+          graph.nodes[node].doc.kind == SHELL_DOC_ENVVAR)
+        env = &graph.nodes[node].doc;
+    ASSERT(env != NULL && count_doc_kind(&graph, SHELL_DOC_ENVVAR) == 1);
+    ASSERT(((env->flags & SHELL_DEP_DOC_FLAG_ENVVAR_APPEND) != 0) == (i == 5));
+    size_t length = 0;
+    size_t written = SIZE_MAX;
+    char name[8] = {0};
+    ASSERT(shell_dep_doc_env_name_length(env, &length) && length == 4 &&
+           shell_dep_doc_write_env_name(env, name, sizeof(name), &written) &&
+           written == 4 && memcmp(name, "NAME", 4) == 0 &&
+           shell_dep_doc_env_name_equals(env, "NAME", 4) &&
+           !shell_dep_doc_env_name_equals(env, "OTHER", 5));
+    written = SIZE_MAX;
+    ASSERT(!shell_dep_doc_write_env_name(env, name, 3, &written) &&
+           written == 0 && memcmp(name, "NAME", 4) == 0);
+    ASSERT(shell_dep_graph_validate(&graph).valid);
+    if (i == 0) {
+      int command = find_cmd_tokens(&graph, "export", NULL);
+      int producer = find_cmd_tokens(&graph, "printf", NULL);
+      ASSERT(command >= 0 && producer >= 0 &&
+             has_edge(&graph, SHELL_EDGE_SUBST, (uint32_t)producer,
+                      (uint32_t)command));
+    }
+  }
+  shell_dep_doc_t non_env = {.kind = SHELL_DOC_FILE};
+  size_t rejected_length = SIZE_MAX;
+  size_t rejected_written = SIZE_MAX;
+  char rejected_name[10] = "untouched";
+  ASSERT(!shell_dep_doc_env_name_length(&non_env, &rejected_length) &&
+         rejected_length == 0 &&
+         !shell_dep_doc_write_env_name(&non_env, rejected_name,
+                                       sizeof(rejected_name),
+                                       &rejected_written) &&
+         rejected_written == 0 &&
+         memcmp(rejected_name, "untouched", sizeof(rejected_name)) == 0 &&
+         !shell_dep_doc_env_name_equals(&non_env, "NAME", 4));
+  ASSERT(parse("NAME+=value command", &graph) == SHELL_DEP_OK);
+  bool leading_append = false;
+  for (uint32_t node = 0; node < graph.node_count; node++)
+    if (graph.nodes[node].type == SHELL_NODE_DOC &&
+        graph.nodes[node].doc.kind == SHELL_DOC_ENVVAR)
+      leading_append =
+          (graph.nodes[node].doc.flags & SHELL_DEP_DOC_FLAG_ENVVAR_APPEND) != 0;
+  ASSERT(leading_append && shell_dep_graph_validate(&graph).valid);
+
+  ASSERT(parse("exec {fd}>/tmp/route; export OTHER=$(printf data); "
+               "printf x >&$fd",
+               &graph) == SHELL_DEP_OK);
+  int document = find_file_doc(&graph, "/tmp/route");
+  int writer = find_nth_cmd(&graph, count_type(&graph, SHELL_NODE_CMD) - 1);
+  ASSERT(document >= 0 && writer >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)writer,
+                      (uint32_t)document, 1, SHELL_DEP_FD_NONE));
+  ASSERT(parse("exec {fd}>/tmp/route; export \"OTHER=$(printf data)\"; "
+               "printf x >&$fd",
+               &graph) == SHELL_DEP_OK);
+  document = find_file_doc(&graph, "/tmp/route");
+  writer = find_nth_cmd(&graph, count_type(&graph, SHELL_NODE_CMD) - 1);
+  ASSERT(document >= 0 && writer >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)writer,
+                      (uint32_t)document, 1, SHELL_DEP_FD_NONE));
+  ASSERT(parse("exec {fd}>/tmp/route; declare OTHER=\"$(printf data)\"; "
+               "printf x >&$fd",
+               &graph) == SHELL_DEP_OK);
+  int declaration = find_cmd_tokens(&graph, "declare", NULL);
+  int producer = find_cmd_tokens(&graph, "printf", NULL);
+  ASSERT(declaration >= 0 && producer >= 0 &&
+         has_edge(&graph, SHELL_EDGE_SUBST, (uint32_t)producer,
+                  (uint32_t)declaration));
+  ASSERT(parse("exec {fd}>/tmp/route; export fd=$(printf data); "
+               "printf x >&$fd",
+               &graph) == SHELL_DEP_EPARSE);
+  ASSERT(parse("exec {fd}>/tmp/route; export \"fd=$(printf data)\"; "
+               "printf x >&$fd",
+               &graph) == SHELL_DEP_EPARSE);
+  ASSERT(parse("exec {left}>/tmp/left; exec {right}>/tmp/right; "
+               "export \"left=$(printf data)\"; printf x >&$right",
+               &graph) == SHELL_DEP_OK);
+  document = find_file_doc(&graph, "/tmp/right");
+  writer = find_nth_cmd(&graph, count_type(&graph, SHELL_NODE_CMD) - 1);
+  ASSERT(document >= 0 && writer >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)writer,
+                      (uint32_t)document, 1, SHELL_DEP_FD_NONE) &&
+         shell_dep_graph_validate(&graph).valid);
+  pass_count++;
+}
+
+/* Bash parses `printf` options only before its format operand. Keep literal
+ * `-v` data from discarding a route, while attached `-vname` assignments must
+ * retire exactly that route after quote removal. */
+TEST(printf_v_named_fd_option_contract) {
+  shell_dep_graph_t graph = {0};
+  ASSERT(parse("exec {out}>/tmp/out; printf '%s' -v out; printf bytes >&$out",
+               &graph) == SHELL_DEP_OK);
+  int document = find_file_doc(&graph, "/tmp/out");
+  int writer = find_nth_cmd(&graph, 2);
+  ASSERT(document >= 0 && writer >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)writer,
+                      (uint32_t)document, 1, SHELL_DEP_FD_NONE) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  ASSERT(parse("exec {out}>/tmp/out; printf -- -v out; printf bytes >&$out",
+               &graph) == SHELL_DEP_OK);
+  document = find_file_doc(&graph, "/tmp/out");
+  writer = find_nth_cmd(&graph, 2);
+  ASSERT(document >= 0 && writer >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)writer,
+                      (uint32_t)document, 1, SHELL_DEP_FD_NONE) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  /* Static invalid destinations make Bash printf fail before assigning a
+   * variable. They are not dynamic writers, so an existing route remains
+   * available to the next command. */
+  ASSERT(parse("exec {out}>/tmp/out; printf -v9 value; "
+               "printf bytes >&$out",
+               &graph) == SHELL_DEP_OK);
+  document = find_file_doc(&graph, "/tmp/out");
+  writer = find_nth_cmd(&graph, 2);
+  ASSERT(document >= 0 && writer >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)writer,
+                      (uint32_t)document, 1, SHELL_DEP_FD_NONE) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  ASSERT(parse("exec {out}>/tmp/out; printf -v 9 value; "
+               "printf bytes >&$out",
+               &graph) == SHELL_DEP_OK);
+  document = find_file_doc(&graph, "/tmp/out");
+  writer = find_nth_cmd(&graph, 2);
+  ASSERT(document >= 0 && writer >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)writer,
+                      (uint32_t)document, 1, SHELL_DEP_FD_NONE) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  ASSERT(parse("exec {left}>/tmp/left; exec {right}>/tmp/right; "
+               "printf -v'left' value; printf bytes >&$right",
+               &graph) == SHELL_DEP_OK);
+  document = find_file_doc(&graph, "/tmp/right");
+  writer = find_nth_cmd(&graph, 3);
+  ASSERT(document >= 0 && writer >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)writer,
+                      (uint32_t)document, 1, SHELL_DEP_FD_NONE) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  ASSERT(parse("exec {out}>/tmp/out; printf -vout value; "
+               "printf bytes >&$out",
+               &graph) == SHELL_DEP_EPARSE);
+  ASSERT(graph.status == SHELL_DEP_STATUS_ERROR && graph.node_count == 0 &&
+         graph.edge_count == 0);
+  ASSERT(parse("exec {out}>/tmp/out; printf \"$format\"; "
+               "printf bytes >&$out",
+               &graph) == SHELL_DEP_EPARSE);
+  ASSERT(graph.status == SHELL_DEP_STATUS_ERROR && graph.node_count == 0 &&
+         graph.edge_count == 0);
+
+  /* Bash treats `name[0]` as an array target, including the scalar element
+   * zero. It must not be mistaken for printf's harmless invalid-target path:
+   * accepting it would preserve the old {out} route after the variable value
+   * changed. */
+  static const char *const array_targets[] = {
+      "printf -v out[0] value",
+      "printf -vout[0] value",
+      "printf -v 'out[0]' value",
+      "printf -v $'out[0]' value",
+  };
+  for (size_t i = 0; i < sizeof(array_targets) / sizeof(array_targets[0]);
+       i++) {
+    char command[256];
+    int written = snprintf(command, sizeof(command),
+                           "exec {out}>/tmp/out; %s; printf bytes >&$out",
+                           array_targets[i]);
+    ASSERT(written > 0 && (size_t)written < sizeof(command));
+    ASSERT(parse(command, &graph) == SHELL_DEP_EPARSE);
+    ASSERT(graph.status == SHELL_DEP_STATUS_ERROR && graph.node_count == 0 &&
+           graph.edge_count == 0);
+  }
+  pass_count++;
+}
+
+/* Keep the persistent named-FD resolver exercised across the forms that share
+ * one logical descriptor while changing quoting, direction, scope, and
+ * declaration semantics. These are parser-only fixtures: every accepted row
+ * must yield an internally consistent effective-I/O graph. */
+TEST(named_fd_route_cross_product_matrix) {
+  static const struct {
+    const char *command;
+    shell_dep_error_t expected;
+  } cases[] = {
+      {"exec {out}>/tmp/out; printf x >&${out}", SHELL_DEP_OK},
+      {"exec {out}>/tmp/out; printf x >&\"$out\"", SHELL_DEP_OK},
+      {"exec {out}>>/tmp/out; printf x >&$out", SHELL_DEP_OK},
+      {"exec {in}</tmp/in; exec {copy}<&$in; cat <&$copy", SHELL_DEP_OK},
+      {"exec {both}<>/tmp/rw; cat <&$both; printf x >&$both", SHELL_DEP_OK},
+      {"exec {out}>/tmp/out; exec {copy}>&$out; printf x >&$copy",
+       SHELL_DEP_OK},
+      {"exec {out}>/tmp/out; { printf x; } >&$out; printf y >&$out",
+       SHELL_DEP_OK},
+      {"exec {out}>/tmp/out; ( printf x >&$out ); printf y >&$out",
+       SHELL_DEP_OK},
+      {"exec {out}>/tmp/out; { printf x; } | cat; printf y >&$out",
+       SHELL_DEP_OK},
+      {"exec {out}>/tmp/out; printf x >&$out | cat; printf y >&$out",
+       SHELL_DEP_OK},
+      {"exec {out}>/tmp/out; printf \"$(printf nested >&$out)\"", SHELL_DEP_OK},
+      {"exec {in}</tmp/in; printf \"$(cat <&$in)\"", SHELL_DEP_OK},
+      {"exec {sink}> >(cat); printf \"$(printf nested >&$sink)\"",
+       SHELL_DEP_OK},
+      {"{ printf root; } > >(printf one; printf two)", SHELL_DEP_OK},
+      {"{ printf root; } < <(printf one; printf two)", SHELL_DEP_OK},
+      {"exec {out}>/tmp/out; unset -f 'out'; printf x >&$out", SHELL_DEP_OK},
+      {"exec {out}>/tmp/out; unset -n 'out'; printf x >&$out", SHELL_DEP_OK},
+      {"exec {out}>/tmp/out; command -p unset -f out; printf x >&$out",
+       SHELL_DEP_OK},
+      {"exec {out}>/tmp/out; builtin unset -f out; printf x >&$out",
+       SHELL_DEP_OK},
+      {"exec {out}>/tmp/out; command -V unset; printf x >&$out", SHELL_DEP_OK},
+      {"exec {out}>/tmp/out; command -v unset; printf x >&$out", SHELL_DEP_OK},
+      {"exec {out}>/tmp/out; command -p -- unset -f out; printf x >&$out",
+       SHELL_DEP_OK},
+      {"exec {out}>/tmp/out; command >/tmp/log -- unset -f out; "
+       "printf x >&$out",
+       SHELL_DEP_OK},
+      {"exec {out}>/tmp/out; builtin -p unset; printf x >&$out", SHELL_DEP_OK},
+      {"exec {out}>/tmp/out; declare 'out'; printf x >&$out", SHELL_DEP_OK},
+      {"exec {out}>/tmp/out; readonly -p; printf x >&$out", SHELL_DEP_OK},
+      {"exec {out}>/tmp/out; exec {copy}>&$out; unset copy; "
+       "printf x >&$out",
+       SHELL_DEP_OK},
+      {"exec {out}>/tmp/out; exec {copy}>&$out; unset out; "
+       "printf x >&$copy",
+       SHELL_DEP_OK},
+      {"exec {in}</tmp/in; exec {copy}<&$in; unset in; cat <&$copy",
+       SHELL_DEP_OK},
+      {"exec {out}>/tmp/out; exec {out}>&$out; printf x >&$out", SHELL_DEP_OK},
+      {"exec {out}>/tmp/out; { exec {copy}>&$out; printf x >&$copy; }; "
+       "printf y >&$copy",
+       SHELL_DEP_OK},
+      {"exec {out}>/tmp/out; ( exec {copy}>&$out; printf x >&$copy ); "
+       "printf y >&$out",
+       SHELL_DEP_OK},
+      {"exec {out}>/tmp/out; printf \"$(exec {copy}>&$out; "
+       "printf x >&$copy)\"",
+       SHELL_DEP_OK},
+      {"exec {out}>/tmp/out; exec {sink}> >(cat); printf x >&$sink",
+       SHELL_DEP_OK},
+      {"exec {out}>/tmp/out; printf '%s' -v out; printf x >&$out",
+       SHELL_DEP_OK},
+      {"exec {out}>/tmp/out; printf -- -v out; printf x >&$out", SHELL_DEP_OK},
+      {"exec {left}>/tmp/left; exec {right}>/tmp/right; printf -vleft value; "
+       "printf x >&$right",
+       SHELL_DEP_OK},
+      {"exec {out}>/tmp/out; unset -- 'out'; printf x >&$out",
+       SHELL_DEP_EPARSE},
+      {"exec {out}>/tmp/out; printf -v out value; printf x >&$out",
+       SHELL_DEP_EPARSE},
+      {"exec {out}>/tmp/out; printf -vout value; printf x >&$out",
+       SHELL_DEP_EPARSE},
+      {"exec {out}>/tmp/out; printf -v'o'ut value; printf x >&$out",
+       SHELL_DEP_EPARSE},
+      {"exec {out}>/tmp/out; printf > /tmp/log -v out value; printf x >&$out",
+       SHELL_DEP_EPARSE},
+      {"exec {out}>/tmp/out; printf \"$format\"; printf x >&$out",
+       SHELL_DEP_EPARSE},
+      {"exec {out}>/tmp/out; declare -n ref=out; ref=1; printf x >&$out",
+       SHELL_DEP_EPARSE},
+      {"exec {out}>/tmp/first; readonly out; exec {out}>/tmp/second; "
+       "printf x >&$out",
+       SHELL_DEP_EPARSE},
+      {"exec {out}>/tmp/first; declare -r out; exec {out}>/tmp/second; "
+       "printf x >&$out",
+       SHELL_DEP_EPARSE},
+      {"exec {out}>/tmp/first; typeset -r out; exec {out}>/tmp/second; "
+       "printf x >&$out",
+       SHELL_DEP_EPARSE},
+      {"exec {out}>/tmp/first; command -p readonly out; "
+       "exec {out}>/tmp/second; printf x >&$out",
+       SHELL_DEP_EPARSE},
+      {"exec {out}>/tmp/out; set -o posix; out=1 export marker=1; "
+       "printf x >&$out",
+       SHELL_DEP_EPARSE},
+      {"exec {out}>/tmp/out; export out=value; printf x >&$out",
+       SHELL_DEP_EPARSE},
+      {"exec {out}>/tmp/out; command -p unset out; printf x >&$out",
+       SHELL_DEP_EPARSE},
+      {"exec {out}>/tmp/out; builtin unset out; printf x >&$out",
+       SHELL_DEP_EPARSE},
+      {"exec {out}>/tmp/out; command -p printf -v out value; printf x >&$out",
+       SHELL_DEP_EPARSE},
+      {"exec {out}>/tmp/out; builtin export out=value; printf x >&$out",
+       SHELL_DEP_EPARSE},
+      {"exec {out}>/tmp/out; command unset \"$target\"; printf x >&$out",
+       SHELL_DEP_EPARSE},
+      {"exec {out}>/tmp/out; command -- unset out; printf x >&$out",
+       SHELL_DEP_EPARSE},
+      {"exec {out}>/tmp/out; builtin -- unset out; printf x >&$out",
+       SHELL_DEP_EPARSE},
+      {"exec {out}>/tmp/out; { exec {copy}>&$out; printf x >&$copy; } | cat; "
+       "printf y >&$copy",
+       SHELL_DEP_EPARSE},
+      {"exec {out}>/tmp/out; ( exec {copy}>&$out; printf x >&$copy ); "
+       "printf y >&$copy",
+       SHELL_DEP_EPARSE},
+      {"exec {out}>/tmp/out; exec {missing}>&-; printf x >&$out",
+       SHELL_DEP_EPARSE},
+      {"exec {out}>/tmp/out; exec {out}>&-; printf x >&$out", SHELL_DEP_EPARSE},
+  };
+  shell_dep_graph_t graph = {0};
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    shell_dep_error_t parsed = parse(cases[i].command, &graph);
+    if (parsed != cases[i].expected)
+      fprintf(stderr, "named FD matrix row %zu returned %d, expected %d: %s\n",
+              i, parsed, cases[i].expected, cases[i].command);
+    ASSERT(parsed == cases[i].expected);
+    if (cases[i].expected == SHELL_DEP_OK) {
+      shell_dep_graph_validation_t validation =
+          shell_dep_graph_validate(&graph);
+      if (!validation.valid)
+        fprintf(stderr, "named FD matrix invalid row %zu: %s (%s)\n", i,
+                cases[i].command, validation.errors[0].msg);
+      ASSERT(validation.valid);
+      if (strcmp(cases[i].command, "exec {out}>>/tmp/out; printf x >&$out") ==
+          0) {
+        bool append_setup = false;
+        bool materialized_append = false;
+        for (uint32_t edge = 0; edge < graph.edge_count; edge++) {
+          const shell_dep_edge_t *current = &graph.edges[edge];
+          append_setup =
+              append_setup ||
+              (current->type == SHELL_EDGE_FD_OPEN &&
+               (current->flags & SHELL_DEP_EDGE_FLAG_FD_OPEN_APPEND) != 0);
+          materialized_append = materialized_append ||
+                                (current->type == SHELL_EDGE_APPEND &&
+                                 current->flags == SHELL_DEP_EDGE_FLAG_NONE);
+        }
+        ASSERT(append_setup && materialized_append);
+      }
+    } else
+      ASSERT(graph.status == SHELL_DEP_STATUS_ERROR && graph.node_count == 0 &&
+             graph.edge_count == 0);
+  }
+  pass_count++;
+}
+
 /* A named descriptor is dynamically addressed, so it has no numeric READ
  * route in the graph. Its inline document is nevertheless live: FD_OPEN is
  * the descriptor setup relation and must not be labelled as a document later
@@ -787,6 +3426,73 @@ TEST(named_fd_inline_documents_remain_live) {
                         SHELL_DEP_FD_NAMED));
     ASSERT(shell_dep_graph_validate(&graph).valid);
   }
+  pass_count++;
+}
+
+/* A named FD_OPEN records observable setup, but it is only a live setup while
+ * the final current-shell descriptor table still reaches its document. A
+ * persistent `exec` close or rebind must retire the old document without
+ * confusing a separate alias or a command-local close for that transition. */
+TEST(named_fd_retired_setup_documents) {
+  shell_dep_graph_t graph = {0};
+  ASSERT(parse("exec {fd}>out; exec {fd}>&-", &graph) == SHELL_DEP_OK);
+  int out = find_file_doc(&graph, "out");
+  int close = find_nth_cmd(&graph, 1);
+  bool named_close = false;
+  for (uint32_t edge = 0; edge < graph.edge_count; edge++) {
+    const shell_dep_edge_t *current = &graph.edges[edge];
+    named_close =
+        named_close ||
+        (current->type == SHELL_EDGE_FD_CLOSE &&
+         current->from == (uint32_t)close && current->to == (uint32_t)close &&
+         current->source_fd == SHELL_DEP_FD_NAMED &&
+         current->target_fd == SHELL_DEP_FD_NONE &&
+         current->source_fd_name_len == 2 &&
+         memcmp(current->source_fd_name, "fd", 2) == 0);
+  }
+  ASSERT(out >= 0 && close >= 0 && named_close &&
+         (graph.nodes[out].doc.flags & SHELL_DEP_DOC_FLAG_TRANSIENT) != 0 &&
+         shell_dep_graph_validate(&graph).valid);
+
+  /* An alias is still a live reference to the original setup after the source
+   * binding is persistently closed. */
+  ASSERT(parse("exec {fd}>out; exec {copy}>&$fd; exec {fd}>&-", &graph) ==
+         SHELL_DEP_OK);
+  out = find_file_doc(&graph, "out");
+  ASSERT(out >= 0 &&
+         (graph.nodes[out].doc.flags & SHELL_DEP_DOC_FLAG_TRANSIENT) == 0 &&
+         shell_dep_graph_validate(&graph).valid);
+
+  ASSERT(parse("exec {fd}>old; exec {fd}>&-; exec {fd}>new", &graph) ==
+         SHELL_DEP_OK);
+  int old = find_file_doc(&graph, "old");
+  int replacement = find_file_doc(&graph, "new");
+  ASSERT(old >= 0 && replacement >= 0 &&
+         (graph.nodes[old].doc.flags & SHELL_DEP_DOC_FLAG_TRANSIENT) != 0 &&
+         (graph.nodes[replacement].doc.flags & SHELL_DEP_DOC_FLAG_TRANSIENT) ==
+             0 &&
+         shell_dep_graph_validate(&graph).valid);
+
+  /* A close attached to an ordinary command is local under Bash's default
+   * varredir_close behavior; it cannot retire the outer binding. */
+  ASSERT(parse("exec {fd}>local; : {fd}>&-", &graph) == SHELL_DEP_OK);
+  int local = find_file_doc(&graph, "local");
+  ASSERT(local >= 0 &&
+         (graph.nodes[local].doc.flags & SHELL_DEP_DOC_FLAG_TRANSIENT) == 0 &&
+         shell_dep_graph_validate(&graph).valid);
+
+  ASSERT(parse("exec {fd}<>state; exec {fd}>&-", &graph) == SHELL_DEP_OK);
+  int state = find_file_doc(&graph, "state");
+  ASSERT(state >= 0 &&
+         (graph.nodes[state].doc.flags & SHELL_DEP_DOC_FLAG_TRANSIENT) != 0 &&
+         shell_dep_graph_validate(&graph).valid);
+
+  ASSERT(parse("exec {fd}<<<payload; exec {fd}>&-", &graph) == SHELL_DEP_OK);
+  int here_string = find_doc(&graph, SHELL_DOC_HERESTRING);
+  ASSERT(here_string >= 0 &&
+         (graph.nodes[here_string].doc.flags & SHELL_DEP_DOC_FLAG_TRANSIENT) !=
+             0 &&
+         shell_dep_graph_validate(&graph).valid);
   pass_count++;
 }
 
@@ -1004,7 +3710,12 @@ TEST(cwd_matrix) {
       {"cd .. && pwd", "/home/user/docs", "/home/user"},
       {"cd ./foo && ls", "/home/user", "/home/user/foo"},
       {"cd ../../foo && ls", "/home/user", "/foo"},
+      {"cd /../../foo; pwd", "/home/user", "/foo"},
       {"cd /tmp//nested/../final && ls", "/home/user", "/tmp/final"},
+      {"cd ..; pwd", ".", ".."},
+      {"cd ../../foo; pwd", ".", "../../foo"},
+      {"cd ./a/../..; pwd", ".", ".."},
+      {"cd ./a/..; pwd", ".", "."},
       {"ls", ".", "."},
   };
 
@@ -1031,19 +3742,30 @@ TEST(cwd_decoded_operand_matrix) {
     const char *expected_cwd;
   } static_cases[] = {
       {"cd \"/tmp\"; pwd", "/home/user", "/tmp"},
+      {"c'd' '/tmp'; pwd", "/home/user", "/tmp"},
       {"cd /tmp\\ dir; pwd", "/home/user", "/tmp dir"},
+      {"cd /tmp$; pwd", "/home/user", "/tmp$"},
+      {"cd /tmp[part; pwd", "/home/user", "/tmp[part"},
+      {"cd /tmp{part}; pwd", "/home/user", "/tmp{part}"},
       {"cd $'\\x2ftmp'; pwd", "/home/user", "/tmp"},
       {"cd ~; pwd", "/home/user", "$HOME"},
       {"cd ~/project; pwd", "/home/user", "$HOME/project"},
       {"cd ~/project; cd ./child; pwd", "/home/user", "$HOME/project/child"},
-      {"cd -P /tmp; pwd", "/home/user", "/tmp"},
+      {"cd -e /tmp; pwd", "/home/user", "/tmp"},
+      {"cd -PL /tmp; pwd", "/home/user", "/tmp"},
       {"cd /tmp > log; pwd", "/home/user", "/tmp"},
+      {"cd /tmp >&log; pwd", "/home/user", "/tmp"},
+      {"command cd /tmp; pwd", "/home/user", "/tmp"},
+      {"command -p cd /tmp; pwd", "/home/user", "/tmp"},
+      {"builtin cd /tmp; pwd", "/home/user", "/tmp"},
+      {"command builtin cd /tmp; pwd", "/home/user", "/tmp"},
+      {"CDPREFIX=1 command cd /tmp; pwd", "/home/user", "/tmp"},
   };
   for (size_t i = 0; i < sizeof(static_cases) / sizeof(static_cases[0]); i++) {
     shell_dep_graph_t graph;
     ASSERT(parse_cwd(static_cases[i].command, static_cases[i].initial_cwd,
                      &graph) == SHELL_DEP_OK);
-    int pwd = find_first_cmd(&graph);
+    int pwd = find_nth_cmd(&graph, count_type(&graph, SHELL_NODE_CMD) - 1);
     ASSERT(pwd >= 0);
     ASSERT(graph.nodes[pwd].cmd.cwd_known);
     ASSERT_STR_EQ(get_cwd_str(&graph, graph.nodes[pwd].cmd.cwd_offset),
@@ -1058,11 +3780,18 @@ TEST(cwd_decoded_operand_matrix) {
       "cd $(pwd); pwd",
       "cd `pwd`; pwd",
       "cd *.d; pwd",
+      "cd /tmp[ab]; pwd",
+      "cd /tmp{left,right}; pwd",
+      "cd /tmp@(left|right); pwd",
       "cd ~other; pwd",
-      "cd $'\\0tmp'; pwd",
       "cd <(pwd); pwd",
       "cd -; pwd",
       "cd -P -; pwd",
+      "cd -P /tmp; pwd",
+      "cd -LP /tmp; pwd",
+      "cd -Pe /tmp; pwd",
+      "cd -@ /tmp; pwd",
+      "cd \"$option\" /tmp; pwd",
       "cd project; pwd",
       "cd project/subdir; pwd",
       "cd relative\\ dir; pwd",
@@ -1078,7 +3807,7 @@ TEST(cwd_decoded_operand_matrix) {
        i++) {
     shell_dep_graph_t graph;
     ASSERT(parse_cwd(dynamic_cases[i], "/home/user", &graph) == SHELL_DEP_OK);
-    int pwd = find_first_cmd(&graph);
+    int pwd = find_nth_cmd(&graph, count_type(&graph, SHELL_NODE_CMD) - 1);
     ASSERT(pwd >= 0);
     ASSERT(!graph.nodes[pwd].cmd.cwd_known);
     ASSERT_STR_EQ(get_cwd_str(&graph, graph.nodes[pwd].cmd.cwd_offset),
@@ -1088,6 +3817,8 @@ TEST(cwd_decoded_operand_matrix) {
 
   static const char *const failed_cd_cases[] = {
       "cd /tmp extra; pwd",
+      "cd /tmp -P; pwd",
+      "cd /tmp --; pwd",
       "cd -x; pwd",
   };
   for (size_t i = 0; i < sizeof(failed_cd_cases) / sizeof(failed_cd_cases[0]);
@@ -1125,6 +3856,132 @@ TEST(cwd_decoded_operand_matrix) {
   ASSERT_STRN_EQ(graph.nodes[document].doc.path,
                  graph.nodes[document].doc.path_len, "$'\\x2ftmp'");
   ASSERT(shell_dep_graph_validate(&graph).valid);
+  pass_count++;
+}
+
+/* cd's redirect setup and nested commands execute before its CWD transition.
+ * Plain cd still needs no execution node with default limits. */
+TEST(cd_graph_visible_effects) {
+  shell_dep_graph_t graph = {0};
+  ASSERT(parse_cwd("cd /tmp", "/home/user", &graph) == SHELL_DEP_OK);
+  ASSERT(count_type(&graph, SHELL_NODE_CMD) == 0);
+
+  ASSERT(parse_cwd("printf before; cd /tmp >/tmp/redirect; pwd", "/home/user",
+                   &graph) == SHELL_DEP_OK);
+  int before = find_cmd_tokens(&graph, "printf", NULL);
+  int cd = find_cmd_tokens(&graph, "cd", NULL);
+  int pwd = find_cmd_tokens(&graph, "pwd", NULL);
+  int redirect = find_file_doc(&graph, "/tmp/redirect");
+  ASSERT(before >= 0 && cd >= 0 && pwd >= 0 && redirect >= 0);
+  ASSERT(has_edge(&graph, SHELL_EDGE_SEQ, (uint32_t)before, (uint32_t)cd) &&
+         has_edge(&graph, SHELL_EDGE_SEQ, (uint32_t)cd, (uint32_t)pwd) &&
+         has_edge(&graph, SHELL_EDGE_WRITE, (uint32_t)cd, (uint32_t)redirect) &&
+         !has_edge(&graph, SHELL_EDGE_ARG, (uint32_t)cd, (uint32_t)redirect));
+  ASSERT_STR_EQ(get_cwd_str(&graph, graph.nodes[cd].cmd.cwd_offset),
+                "/home/user");
+  ASSERT_STR_EQ(get_cwd_str(&graph, graph.nodes[pwd].cmd.cwd_offset), "/tmp");
+  ASSERT(shell_dep_graph_validate(&graph).valid);
+
+  ASSERT(parse_cwd("printf before; cd /tmp \\\n>out; pwd", "/home/user",
+                   &graph) == SHELL_DEP_OK);
+  cd = find_cmd_tokens(&graph, "cd", NULL);
+  pwd = find_cmd_tokens(&graph, "pwd", NULL);
+  redirect = find_file_doc(&graph, "out");
+  ASSERT(cd >= 0 && pwd >= 0 && redirect >= 0 &&
+         has_edge(&graph, SHELL_EDGE_WRITE, (uint32_t)cd, (uint32_t)redirect) &&
+         !has_edge(&graph, SHELL_EDGE_ARG, (uint32_t)cd, (uint32_t)redirect));
+  ASSERT_STR_EQ(get_cwd_str(&graph, graph.nodes[cd].cmd.cwd_offset),
+                "/home/user");
+  ASSERT_STR_EQ(get_cwd_str(&graph, graph.nodes[pwd].cmd.cwd_offset), "/tmp");
+  ASSERT(shell_dep_graph_validate(&graph).valid);
+
+  ASSERT(parse_cwd("cd \"$(printf /tmp)\"; pwd", "/home/user", &graph) ==
+         SHELL_DEP_OK);
+  cd = find_cmd_tokens(&graph, "cd", NULL);
+  int producer = find_cmd_tokens(&graph, "printf", NULL);
+  pwd = find_cmd_tokens(&graph, "pwd", NULL);
+  ASSERT(cd >= 0 && producer >= 0 && pwd >= 0 &&
+         has_edge(&graph, SHELL_EDGE_SUBST, (uint32_t)producer, (uint32_t)cd) &&
+         !graph.nodes[pwd].cmd.cwd_known &&
+         shell_dep_graph_validate(&graph).valid);
+
+  ASSERT(parse_cwd("cd /tmp > >(cat); pwd", "/home/user", &graph) ==
+         SHELL_DEP_OK);
+  cd = find_cmd_tokens(&graph, "cd", NULL);
+  int consumer = find_cmd_tokens(&graph, "cat", NULL);
+  ASSERT(cd >= 0 && consumer >= 0 &&
+         count_edge_type(&graph, SHELL_EDGE_SUBST) != 0 &&
+         shell_dep_graph_validate(&graph).valid);
+
+  ASSERT(parse_cwd("cd /tmp {fd}>out; printf x >&$fd", "/home/user", &graph) ==
+         SHELL_DEP_OK);
+  cd = find_cmd_tokens(&graph, "cd", NULL);
+  int writer = find_cmd_tokens(&graph, "printf", NULL);
+  redirect = find_file_doc(&graph, "out");
+  ASSERT(cd >= 0 && writer >= 0 && redirect >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)writer,
+                      (uint32_t)redirect, 1, SHELL_DEP_FD_NONE) &&
+         shell_dep_graph_validate(&graph).valid);
+  ASSERT_STR_EQ(get_cwd_str(&graph, graph.nodes[cd].cmd.cwd_offset),
+                "/home/user");
+  ASSERT_STR_EQ(get_cwd_str(&graph, graph.nodes[writer].cmd.cwd_offset),
+                "/tmp");
+
+  shell_dep_limits_t limits = SHELL_DEP_LIMITS_DEFAULT;
+  limits.cd_as_cmd = true;
+  ASSERT(shell_dep_graph_parse("cd /tmp >/tmp/redirect",
+                               strlen("cd /tmp >/tmp/redirect"), "/home/user",
+                               &limits, &graph) == SHELL_DEP_OK);
+  cd = find_cmd_tokens(&graph, "cd", NULL);
+  redirect = find_file_doc(&graph, "/tmp/redirect");
+  ASSERT(cd >= 0 && redirect >= 0 &&
+         has_edge(&graph, SHELL_EDGE_WRITE, (uint32_t)cd, (uint32_t)redirect) &&
+         !has_edge(&graph, SHELL_EDGE_ARG, (uint32_t)cd, (uint32_t)redirect) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  ASSERT(shell_dep_graph_parse("printf before; cd /tmp; pwd",
+                               strlen("printf before; cd /tmp; pwd"),
+                               "/home/user", &limits, &graph) == SHELL_DEP_OK);
+  before = find_cmd_tokens(&graph, "printf", NULL);
+  cd = find_cmd_tokens(&graph, "cd", NULL);
+  pwd = find_cmd_tokens(&graph, "pwd", NULL);
+  ASSERT(before >= 0 && cd >= 0 && pwd >= 0 &&
+         has_edge(&graph, SHELL_EDGE_SEQ, (uint32_t)before, (uint32_t)cd) &&
+         has_edge(&graph, SHELL_EDGE_SEQ, (uint32_t)cd, (uint32_t)pwd) &&
+         shell_dep_graph_validate(&graph).valid);
+  pass_count++;
+}
+
+TEST(wrapper_cwd_semantics) {
+  static const char *const dynamic_command_cases[] = {
+      "command \"$target\"; pwd",
+      "builtin \"$target\"; pwd",
+  };
+  for (size_t i = 0;
+       i < sizeof(dynamic_command_cases) / sizeof(dynamic_command_cases[0]);
+       i++) {
+    shell_dep_graph_t graph = {0};
+    ASSERT(parse_cwd(dynamic_command_cases[i], "/home/user", &graph) ==
+           SHELL_DEP_OK);
+    int pwd = find_nth_cmd(&graph, 1);
+    ASSERT(pwd >= 0 && !graph.nodes[pwd].cmd.cwd_known);
+    ASSERT_STR_EQ(get_cwd_str(&graph, graph.nodes[pwd].cmd.cwd_offset),
+                  "/home/user");
+    ASSERT(shell_dep_graph_validate(&graph).valid);
+  }
+
+  static const char *const unsupported[] = {
+      "pushd /tmp; pwd",
+      "popd; pwd",
+      "command pushd /tmp; pwd",
+      "builtin popd; pwd",
+  };
+  for (size_t i = 0; i < sizeof(unsupported) / sizeof(unsupported[0]); i++) {
+    shell_dep_graph_t graph = {0};
+    ASSERT(parse_cwd(unsupported[i], "/home/user", &graph) == SHELL_DEP_EPARSE);
+    ASSERT(graph.node_count == 0 && graph.edge_count == 0 &&
+           graph.status == SHELL_DEP_STATUS_ERROR);
+  }
   pass_count++;
 }
 
@@ -1510,6 +4367,223 @@ TEST(sibling_brace_group_pipeline_endpoints) {
   pass_count++;
 }
 
+TEST(static_file_identity_and_effective_group_pipe_routes) {
+  shell_dep_graph_t graph = {0};
+  ASSERT(parse("cd /tmp/first; printf x >\"out\"; cat ./out; "
+               "cd /tmp/second; cat ./out",
+               &graph) == SHELL_DEP_OK);
+  char identities[3][128] = {{0}};
+  size_t lengths[3] = {0};
+  bool absolute = false;
+  uint32_t count = 0;
+  for (uint32_t node = 0; node < graph.node_count; node++) {
+    if (graph.nodes[node].type != SHELL_NODE_DOC ||
+        graph.nodes[node].doc.kind != SHELL_DOC_FILE || count == 3)
+      continue;
+    ASSERT(shell_dep_doc_file_identity_write(
+        &graph, &graph.nodes[node].doc, identities[count],
+        sizeof(identities[count]), &lengths[count], &absolute));
+    ASSERT(absolute);
+    count++;
+  }
+  ASSERT(count == 3 && strcmp(identities[0], "/tmp/first/out") == 0 &&
+         strcmp(identities[1], identities[0]) == 0 &&
+         strcmp(identities[2], "/tmp/second/out") == 0);
+
+  ASSERT(parse("printf x >out; cd /; cat ./out", &graph) == SHELL_DEP_OK);
+  bool origin_absolute[2] = {false, false};
+  uint32_t origin_count = 0;
+  for (uint32_t node = 0; node < graph.node_count; node++) {
+    if (graph.nodes[node].type != SHELL_NODE_DOC ||
+        graph.nodes[node].doc.kind != SHELL_DOC_FILE || origin_count == 2)
+      continue;
+    ASSERT(shell_dep_doc_file_identity_write(
+        &graph, &graph.nodes[node].doc, identities[origin_count],
+        sizeof(identities[origin_count]), &lengths[origin_count],
+        &origin_absolute[origin_count]));
+    origin_count++;
+  }
+  ASSERT(origin_count == 2 && !origin_absolute[0] && origin_absolute[1] &&
+         strcmp(identities[0], "out") == 0 &&
+         strcmp(identities[1], "/out") == 0);
+
+  ASSERT(parse("printf x >../out; cat ./out", &graph) == SHELL_DEP_OK);
+  int parent_file = find_file_doc(&graph, "../out");
+  int local_file = find_file_doc(&graph, "./out");
+  ASSERT(parent_file >= 0 && local_file >= 0);
+  ASSERT(shell_dep_doc_file_identity_write(
+             &graph, &graph.nodes[parent_file].doc, identities[0],
+             sizeof(identities[0]), &lengths[0], &absolute) &&
+         !absolute && strcmp(identities[0], "../out") == 0);
+  ASSERT(shell_dep_doc_file_identity_write(&graph, &graph.nodes[local_file].doc,
+                                           identities[1], sizeof(identities[1]),
+                                           &lengths[1], &absolute) &&
+         !absolute && strcmp(identities[1], "out") == 0);
+
+  ASSERT(parse("printf x >/var/run/../tmp/out; cat /var/tmp/out", &graph) ==
+         SHELL_DEP_OK);
+  parent_file = find_file_doc(&graph, "/var/run/../tmp/out");
+  local_file = find_file_doc(&graph, "/var/tmp/out");
+  ASSERT(parent_file >= 0 && local_file >= 0);
+  ASSERT(shell_dep_doc_file_identity_write(
+             &graph, &graph.nodes[parent_file].doc, identities[0],
+             sizeof(identities[0]), &lengths[0], &absolute) &&
+         absolute && strcmp(identities[0], "/var/run/../tmp/out") == 0);
+  ASSERT(shell_dep_doc_file_identity_write(&graph, &graph.nodes[local_file].doc,
+                                           identities[1], sizeof(identities[1]),
+                                           &lengths[1], &absolute) &&
+         absolute && strcmp(identities[1], "/var/tmp/out") == 0);
+
+  ASSERT(parse("printf x >link/../out; cat ./out", &graph) == SHELL_DEP_OK);
+  parent_file = find_file_doc(&graph, "link/../out");
+  local_file = find_file_doc(&graph, "./out");
+  ASSERT(parent_file >= 0 && local_file >= 0);
+  ASSERT(shell_dep_doc_file_identity_write(
+             &graph, &graph.nodes[parent_file].doc, identities[0],
+             sizeof(identities[0]), &lengths[0], &absolute) &&
+         !absolute && strcmp(identities[0], "link/../out") == 0);
+  ASSERT(shell_dep_doc_file_identity_write(&graph, &graph.nodes[local_file].doc,
+                                           identities[1], sizeof(identities[1]),
+                                           &lengths[1], &absolute) &&
+         !absolute && strcmp(identities[1], "out") == 0);
+
+  ASSERT(parse("cd /tmp/first; printf x >\"out\"; cat ./out; "
+               "cd /tmp/second; cat ./out",
+               &graph) == SHELL_DEP_OK);
+  char too_small[4] = {'x', 'x', 'x', 'x'};
+  size_t written = SIZE_MAX;
+  int file = find_file_doc(&graph, "\"out\"");
+  ASSERT(file >= 0 &&
+         !shell_dep_doc_file_identity_write(&graph, &graph.nodes[file].doc,
+                                            too_small, sizeof(too_small),
+                                            &written, &absolute) &&
+         written == 0 && too_small[0] == 'x');
+
+  shell_dep_doc_t uncertain = graph.nodes[file].doc;
+  uncertain.cwd_known = false;
+  written = SIZE_MAX;
+  ASSERT(!shell_dep_doc_file_identity_write(&graph, &uncertain, identities[0],
+                                            sizeof(identities[0]), &written,
+                                            &absolute) &&
+         written == 0);
+  uncertain.path = "/tmp/absolute";
+  uncertain.path_len = (uint32_t)strlen(uncertain.path);
+  ASSERT(shell_dep_doc_file_identity_write(&graph, &uncertain, identities[0],
+                                           sizeof(identities[0]), &written,
+                                           &absolute) &&
+         absolute && strcmp(identities[0], "/tmp/absolute") == 0);
+  uncertain.path = "$runtime";
+  uncertain.path_len = (uint32_t)strlen(uncertain.path);
+  ASSERT(!shell_dep_doc_file_identity_write(&graph, &uncertain, identities[0],
+                                            sizeof(identities[0]), &written,
+                                            &absolute) &&
+         written == 0);
+  uncertain.path = "$'\\x00x'";
+  uncertain.path_len = (uint32_t)strlen(uncertain.path);
+  ASSERT(!shell_dep_doc_file_identity_write(&graph, &uncertain, identities[0],
+                                            sizeof(identities[0]), &written,
+                                            &absolute) &&
+         written == 0);
+  ASSERT(!shell_dep_doc_file_identity_write(NULL, &uncertain, identities[0],
+                                            sizeof(identities[0]), &written,
+                                            &absolute) &&
+         written == 0 && !absolute);
+  shell_dep_graph_t malformed_cwd = {0};
+  memcpy(malformed_cwd.cwd_buf.data, "invalid", 7);
+  malformed_cwd.cwd_buf.len = 7;
+  uncertain.path = "relative";
+  uncertain.path_len = (uint32_t)strlen(uncertain.path);
+  uncertain.cwd_known = true;
+  uncertain.cwd_offset = 0;
+  ASSERT(!shell_dep_doc_file_identity_write(
+             &malformed_cwd, &uncertain, identities[0], sizeof(identities[0]),
+             &written, &absolute) &&
+         written == 0 && !absolute);
+
+  ASSERT(parse("cd /tmp/group; { printf x; } >out", &graph) == SHELL_DEP_OK);
+  file = find_file_doc(&graph, "out");
+  ASSERT(file >= 0 &&
+         shell_dep_doc_file_identity_write(&graph, &graph.nodes[file].doc,
+                                           identities[0], sizeof(identities[0]),
+                                           &written, &absolute) &&
+         absolute && strcmp(identities[0], "/tmp/group/out") == 0);
+
+  ASSERT(parse("echo $(cd /tmp/nested; cat ./file)", &graph) == SHELL_DEP_OK);
+  file = find_file_doc(&graph, "./file");
+  ASSERT(file >= 0 &&
+         shell_dep_doc_file_identity_write(&graph, &graph.nodes[file].doc,
+                                           identities[0], sizeof(identities[0]),
+                                           &written, &absolute) &&
+         absolute && strcmp(identities[0], "/tmp/nested/file") == 0);
+
+  ASSERT(parse("{ curl URL; } | { sh; }", &graph) == SHELL_DEP_OK);
+  int curl = find_nth_cmd(&graph, 0);
+  int sh = find_nth_cmd(&graph, 1);
+  ASSERT(curl >= 0 && sh >= 0);
+  uint32_t source_group = UINT32_MAX, target_group = UINT32_MAX;
+  for (uint32_t edge = 0; edge < graph.edge_count; edge++)
+    if (graph.edges[edge].type == SHELL_EDGE_PIPE) {
+      source_group = graph.edges[edge].from;
+      target_group = graph.edges[edge].to;
+    }
+  ASSERT(source_group != UINT32_MAX && target_group != UINT32_MAX &&
+         graph.nodes[curl].cmd.pipe_stdout_target == target_group &&
+         graph.nodes[sh].cmd.pipe_stdin_source == source_group &&
+         shell_dep_graph_validate(&graph).valid);
+
+  ASSERT(parse("{ curl URL >/tmp/out; } | { sh </dev/null; }", &graph) ==
+         SHELL_DEP_OK);
+  curl = find_nth_cmd(&graph, 0);
+  sh = find_nth_cmd(&graph, 1);
+  ASSERT(curl >= 0 && sh >= 0 &&
+         graph.nodes[curl].cmd.pipe_stdout_target == UINT32_MAX &&
+         graph.nodes[sh].cmd.pipe_stdin_source == UINT32_MAX &&
+         shell_dep_graph_validate(&graph).valid);
+  pass_count++;
+}
+
+TEST(effective_static_command_identity) {
+  static const struct {
+    const char *command;
+    bool known;
+    uint32_t token;
+    shell_dep_command_wrapper_t wrapper;
+  } cases[] = {
+      {"curl URL", true, 0, SHELL_DEP_COMMAND_DIRECT},
+      {"command -p curl URL", true, 2, SHELL_DEP_COMMAND_SEARCH},
+      {"NAME=x command curl URL", true, 1, SHELL_DEP_COMMAND_SEARCH},
+      {"com'mand' -p c'url' URL", true, 2, SHELL_DEP_COMMAND_SEARCH},
+      {"builtin command curl URL", true, 2, SHELL_DEP_COMMAND_SEARCH},
+      {"command builtin curl URL", true, 2, SHELL_DEP_COMMAND_BUILTIN},
+      {"builtin curl URL", true, 1, SHELL_DEP_COMMAND_BUILTIN},
+      {"exec curl URL", true, 1, SHELL_DEP_COMMAND_EXEC},
+      {"exec -c curl URL", true, 2, SHELL_DEP_COMMAND_EXEC},
+      {"exec -a alias curl URL", true, 3, SHELL_DEP_COMMAND_EXEC},
+      {"exec -aalias curl URL", true, 2, SHELL_DEP_COMMAND_EXEC},
+      {"exec -- curl URL", true, 2, SHELL_DEP_COMMAND_EXEC},
+      {"command exec curl URL", true, 2, SHELL_DEP_COMMAND_EXEC},
+      {"builtin exec curl URL", true, 2, SHELL_DEP_COMMAND_EXEC},
+      {"exec 3>out", true, 0, SHELL_DEP_COMMAND_DIRECT},
+      {"exec \"$runtime\" URL", false, 0, SHELL_DEP_COMMAND_DIRECT},
+      {"exec -x curl URL", false, 0, SHELL_DEP_COMMAND_DIRECT},
+      {"command -v curl", false, 0, SHELL_DEP_COMMAND_DIRECT},
+      {"command \"$runtime\" URL", false, 0, SHELL_DEP_COMMAND_DIRECT},
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    shell_dep_graph_t graph = {0};
+    ASSERT(parse(cases[i].command, &graph) == SHELL_DEP_OK);
+    int command = find_first_cmd(&graph);
+    ASSERT(command >= 0);
+    const shell_dep_cmd_t *result = &graph.nodes[command].cmd;
+    ASSERT(result->effective_command_known == cases[i].known);
+    if (cases[i].known)
+      ASSERT(result->effective_command_token == cases[i].token &&
+             result->effective_command_wrapper == cases[i].wrapper);
+    ASSERT(shell_dep_graph_validate(&graph).valid);
+  }
+  pass_count++;
+}
+
 TEST(nested_brace_group_pipeline_scope) {
   const char *command =
       "./source | { ( read first; printf first; ); printf last; } | ./sink";
@@ -1748,7 +4822,6 @@ TEST(canonical_heredoc_delimiter_contract) {
       {"{ cat; } << EOF\nbody\nEOF\n", 1, 0, "EOF"},
       {"{ cat; } <<\"E\\qF\"\nbody\nE\\qF\n", 1, 1, "E\\qF"},
       {"{ cat; } <<$'EO\\x46'\nbody\nEOF\n", 1, 1, "$'EO\\x46'"},
-      {"{ cat; } <<$'E\\0F'\nbody\nE\n", 1, 1, "$'E\\0F'"},
       {"{ cat; } <<''\n\n", 1, 1, ""},
       {"{ cat; } << EOF <<-\"F\"\r\none\r\nEOF\r\n\ttwo\r\n\tF\r\n", 2, 1,
        "EOF"},
@@ -1948,6 +5021,18 @@ TEST(brace_group_cwd_scope) {
   ASSERT_STR_EQ(get_cwd_str(&g, g.nodes[find_nth_cmd(&g, 3)].cmd.cwd_offset),
                 "/home/user");
 
+  /* A physical continuation inside `||` must not turn the brace group into a
+   * pipeline subshell. The group remains in the current shell, so its `cd`
+   * reaches the right-hand side of the logical list. */
+  memset(&g, 0, sizeof(g));
+  const char *continued_or = "{ cd /tmp; } |\\\n| pwd";
+  ASSERT(shell_dep_graph_parse(continued_or, strlen(continued_or), "/home/user",
+                               &limits, &g) == SHELL_DEP_OK);
+  ASSERT(count_type(&g, SHELL_NODE_CMD) == 2);
+  ASSERT_STR_EQ(get_cwd_str(&g, g.nodes[find_nth_cmd(&g, 1)].cmd.cwd_offset),
+                "/tmp");
+  ASSERT(shell_dep_graph_validate(&g).valid);
+
   /* Background execution is also aggregate: every enclosed simple command
    * is marked backgrounded and its local CWD cannot affect the foreground. */
   memset(&g, 0, sizeof(g));
@@ -2135,6 +5220,41 @@ TEST(environment_matrix) {
   pass_count++;
 }
 
+TEST(export_graph_visible_effects) {
+  static const char *const redirected[] = {
+      "export VALUE=one >/tmp/export-output",
+      ">/tmp/export-output export VALUE=one",
+      "command export VALUE=one >/tmp/export-output",
+  };
+  shell_dep_graph_t graph = {0};
+  for (size_t i = 0; i < sizeof(redirected) / sizeof(redirected[0]); i++) {
+    ASSERT(parse(redirected[i], &graph) == SHELL_DEP_OK);
+    int command = find_nth_cmd(&graph, 0);
+    int output = find_file_doc(&graph, "/tmp/export-output");
+    ASSERT(command >= 0 && output >= 0 &&
+           count_doc_kind(&graph, SHELL_DOC_ENVVAR) == 1 &&
+           has_edge(&graph, SHELL_EDGE_WRITE, (uint32_t)command,
+                    (uint32_t)output) &&
+           !has_edge(&graph, SHELL_EDGE_ARG, (uint32_t)command,
+                     (uint32_t)output) &&
+           shell_dep_graph_validate(&graph).valid);
+  }
+
+  ASSERT(parse("export VALUE=$(printf data) >/tmp/export-output", &graph) ==
+         SHELL_DEP_OK);
+  int command = find_cmd_tokens(&graph, "export", NULL);
+  int producer = find_cmd_tokens(&graph, "printf", NULL);
+  int output = find_file_doc(&graph, "/tmp/export-output");
+  ASSERT(
+      command >= 0 && producer >= 0 && output >= 0 &&
+      count_doc_kind(&graph, SHELL_DOC_ENVVAR) == 1 &&
+      has_edge(&graph, SHELL_EDGE_SUBST, (uint32_t)producer,
+               (uint32_t)command) &&
+      has_edge(&graph, SHELL_EDGE_WRITE, (uint32_t)command, (uint32_t)output) &&
+      shell_dep_graph_validate(&graph).valid);
+  pass_count++;
+}
+
 /* --- FILE ARGUMENTS --- */
 
 TEST(file_argument_matrix) {
@@ -2194,6 +5314,9 @@ TEST(subshell_matrix) {
       {"echo $(date) $(whoami)", 3, 2, 0},
       {"cat <(whoami)", 2, 1, 0},
       {"echo $(<file)", 1, 1, 1},
+      {"echo $\\\n(whoami)", 2, 1, 0},
+      {"cat <\\\r\n(whoami)", 2, 1, 0},
+      {"printf bytes > \\\n>(cat)", 2, 1, 0},
   };
 
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
@@ -2208,7 +5331,8 @@ TEST(subshell_matrix) {
         continue;
       ASSERT(g.nodes[g.edges[j].from].type == SHELL_NODE_CMD ||
              (g.nodes[g.edges[j].from].type == SHELL_NODE_DOC &&
-              g.nodes[g.edges[j].from].doc.kind == SHELL_DOC_FILE));
+              g.nodes[g.edges[j].from].doc.kind == SHELL_DOC_FILE) ||
+             g.nodes[g.edges[j].from].type == SHELL_NODE_ENDPOINT);
       ASSERT(g.nodes[g.edges[j].to].type == SHELL_NODE_CMD);
       if (g.nodes[g.edges[j].from].type == SHELL_NODE_DOC)
         ASSERT(g.edges[j].source_fd == SHELL_DEP_FD_NONE &&
@@ -2266,11 +5390,11 @@ TEST(nested_composition_matrix) {
        3,
        0,
        0},
-      {"substitution inside arithmetic",
-       "echo $(( $(id) + 1 ))",
-       {"echo", "id"},
-       {-1, 0},
-       2,
+      {"nested static arithmetic",
+       "echo $((1 + $((2))))",
+       {"echo"},
+       {-1},
+       1,
        0,
        0},
       {"escaped closing parenthesis",
@@ -3066,6 +6190,50 @@ TEST(document_content_api_error_contract) {
   pass_count++;
 }
 
+TEST(document_writer_overlap_contract) {
+  char heredoc_source[] = "\tX\n\tY";
+  const char heredoc_original[] = "\tX\n\tY";
+  shell_dep_doc_t heredoc = {
+      .kind = SHELL_DOC_HEREDOC,
+      .value = heredoc_source,
+      .value_len = sizeof(heredoc_source) - 1,
+      .flags = SHELL_DEP_DOC_FLAG_HEREDOC_STRIP_TABS,
+  };
+  size_t length = SIZE_MAX;
+  size_t written = SIZE_MAX;
+  ASSERT(shell_dep_doc_content_length(&heredoc, &length) && length == 3);
+  ASSERT(!shell_dep_doc_write_content(&heredoc, heredoc_source + 2, length,
+                                      &written) &&
+         written == 0 &&
+         memcmp(heredoc_source, heredoc_original, sizeof(heredoc_original)) ==
+             0);
+  char content[3];
+  ASSERT(shell_dep_doc_write_content(&heredoc, content, sizeof(content),
+                                     &written) &&
+         written == sizeof(content) && memcmp(content, "X\nY", 3) == 0);
+
+  char assignment_source[] = "a\\\nb=1";
+  const char assignment_original[] = "a\\\nb=1";
+  shell_dep_doc_t env = {
+      .kind = SHELL_DOC_ENVVAR,
+      .name = assignment_source,
+      .name_len = 4,
+      .value = assignment_source + 5,
+      .value_len = 1,
+  };
+  ASSERT(shell_dep_doc_env_name_length(&env, &length) && length == 2);
+  written = SIZE_MAX;
+  ASSERT(!shell_dep_doc_write_env_name(&env, assignment_source + 1, length,
+                                       &written) &&
+         written == 0 &&
+         memcmp(assignment_source, assignment_original,
+                sizeof(assignment_original)) == 0);
+  char name[2];
+  ASSERT(shell_dep_doc_write_env_name(&env, name, sizeof(name), &written) &&
+         written == sizeof(name) && memcmp(name, "ab", 2) == 0);
+  pass_count++;
+}
+
 TEST(expandable_heredoc_substitution_matrix) {
   shell_dep_graph_t graph;
 
@@ -3380,7 +6548,6 @@ TEST(group_heredoc_descriptor_substitution_routing) {
     uint32_t expected_dynamic_consumers;
   } cases[] = {
       {"{ cat <&4; } 3<<EOF 4<&3 3>&-\n$(id)\nEOF", true, 1},
-      {"{ cat <&4; } 3<<EOF 3>&- 4<&3\n$(id)\nEOF", false, 0},
   };
 
   for (size_t ci = 0; ci < sizeof(cases) / sizeof(cases[0]); ci++) {
@@ -3414,6 +6581,11 @@ TEST(group_heredoc_descriptor_substitution_routing) {
            transient == !cases[ci].consumed &&
            shell_dep_graph_validate(&graph).valid);
   }
+  /* The group tail closes fd 3 before trying to copy it to fd 4. Bash fails
+   * setup with EBADF; a full inherited table must not invent a live route. */
+  shell_dep_graph_t invalid;
+  ASSERT(parse("{ cat <&4; } 3<<EOF 3>&- 4<&3\n$(id)\nEOF", &invalid) ==
+         SHELL_DEP_EPARSE);
   pass_count++;
 }
 
@@ -3506,6 +6678,19 @@ TEST(brace_group_substitution_boundary_matrix) {
   /* Near-miss brace syntax must fail rather than flattening the substitution
    * into a partial command list. */
   ASSERT(parse("{ echo $(id) }", &graph) == SHELL_DEP_EPARSE);
+
+  /* Parameter operands are a separate quote scope. A quoted process-like
+   * spelling is literal, while unquoted process and command substitutions
+   * still contribute executable producers. */
+  ASSERT(parse("echo \"${value:-\"<(printf hi)\"}\"", &graph) == SHELL_DEP_OK);
+  ASSERT(count_type(&graph, SHELL_NODE_CMD) == 1 &&
+         count_edge_type(&graph, SHELL_EDGE_SUBST) == 0);
+  ASSERT(parse("echo ${value:-<(printf hi)}", &graph) == SHELL_DEP_OK);
+  ASSERT(count_type(&graph, SHELL_NODE_CMD) == 2 &&
+         count_edge_type(&graph, SHELL_EDGE_SUBST) == 1);
+  ASSERT(parse("echo ${value:-$(printf hi)}", &graph) == SHELL_DEP_OK);
+  ASSERT(count_type(&graph, SHELL_NODE_CMD) == 2 &&
+         count_edge_type(&graph, SHELL_EDGE_SUBST) == 1);
   pass_count++;
 }
 
@@ -3516,8 +6701,8 @@ TEST(brace_group_process_substitution_routing) {
    * rather than being projected onto the first member command. */
   ASSERT(parse("{ cat; } < <(printf config)", &graph) == SHELL_DEP_OK);
   int group = find_group(&graph, SHELL_GROUP_BRACE, UINT32_MAX);
-  int consumer = find_nth_cmd(&graph, 0);
-  int producer = find_nth_cmd(&graph, 1);
+  int consumer = find_cmd_tokens(&graph, "cat", NULL);
+  int producer = find_cmd_tokens(&graph, "printf", "config");
   ASSERT(group >= 0 && consumer >= 0 && producer >= 0);
   ASSERT(count_doc_kind(&graph, SHELL_DOC_FILE) == 0 &&
          has_edge_fds(&graph, SHELL_EDGE_SUBST, (uint32_t)producer,
@@ -3532,7 +6717,7 @@ TEST(brace_group_process_substitution_routing) {
   ASSERT(parse("{ printf value; } > >(cat)", &graph) == SHELL_DEP_OK);
   group = find_group(&graph, SHELL_GROUP_BRACE, UINT32_MAX);
   int endpoint = find_endpoint(&graph);
-  consumer = find_nth_cmd(&graph, 1);
+  consumer = find_cmd_tokens(&graph, "cat", NULL);
   ASSERT(group >= 0 && endpoint >= 0 && consumer >= 0);
   ASSERT(count_doc_kind(&graph, SHELL_DOC_FILE) == 0 &&
          has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)group,
@@ -3546,7 +6731,7 @@ TEST(brace_group_process_substitution_routing) {
   ASSERT(parse("{ printf value >&3; } 3> >(cat)", &graph) == SHELL_DEP_OK);
   group = find_group(&graph, SHELL_GROUP_BRACE, UINT32_MAX);
   endpoint = find_endpoint(&graph);
-  consumer = find_nth_cmd(&graph, 1);
+  consumer = find_cmd_tokens(&graph, "cat", NULL);
   ASSERT(group >= 0 && endpoint >= 0 && consumer >= 0);
   ASSERT(count_doc_kind(&graph, SHELL_DOC_FILE) == 0 &&
          has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)group,
@@ -3572,9 +6757,9 @@ TEST(brace_group_process_substitution_routing) {
    * before that replacement still retains the pipe on fd 3. */
   ASSERT(parse("printf source | { cat; } 3<&0 < <(printf config)", &graph) ==
          SHELL_DEP_OK);
-  int source = find_nth_cmd(&graph, 0);
+  int source = find_cmd_tokens(&graph, "printf", "source");
   group = find_group(&graph, SHELL_GROUP_BRACE, UINT32_MAX);
-  producer = find_nth_cmd(&graph, 2);
+  producer = find_cmd_tokens(&graph, "printf", "config");
   ASSERT(source >= 0 && group >= 0 && producer >= 0);
   ASSERT(has_edge_fds(&graph, SHELL_EDGE_PIPE, (uint32_t)source,
                       (uint32_t)group, 1, 3) &&
@@ -3589,10 +6774,10 @@ TEST(brace_group_process_substitution_routing) {
    * must not invent an outer WRITE through a collector that bypasses fd 0. */
   ASSERT(parse("printf outer > >({ cat; } < <(printf inner))", &graph) ==
          SHELL_DEP_OK);
-  int writer = find_nth_cmd(&graph, 0);
+  int writer = find_cmd_tokens(&graph, "printf", "outer");
   group = find_group(&graph, SHELL_GROUP_BRACE, UINT32_MAX);
-  consumer = find_nth_cmd(&graph, 1);
-  producer = find_nth_cmd(&graph, 2);
+  consumer = find_cmd_tokens(&graph, "cat", NULL);
+  producer = find_cmd_tokens(&graph, "printf", "inner");
   ASSERT(
       writer >= 0 && group >= 0 && consumer >= 0 && producer >= 0 &&
       count_type(&graph, SHELL_NODE_ENDPOINT) == 0 &&
@@ -3625,8 +6810,8 @@ TEST(brace_group_process_substitution_routing) {
          SHELL_DEP_OK);
   group = find_group(&graph, SHELL_GROUP_BRACE, UINT32_MAX);
   endpoint = find_endpoint(&graph);
-  consumer = find_nth_cmd(&graph, 1);
-  producer = find_nth_cmd(&graph, 2);
+  consumer = find_cmd_tokens(&graph, "printf", "'%s'");
+  producer = find_cmd_tokens(&graph, "id", NULL);
   ASSERT(group >= 0 && endpoint >= 0 && consumer >= 0 && producer >= 0);
   /* The output-process descriptor belongs to the enclosing printf. The nested
    * `id` is a separate command-substitution producer, not another fd-0 sink
@@ -3833,6 +7018,7 @@ TEST(process_substitution_stream_topology) {
   int writer = find_nth_cmd(&graph, 0);
   consumer = find_nth_cmd(&graph, 1);
   int endpoint = find_endpoint(&graph);
+  int group = -1;
   ASSERT(writer >= 0 && consumer >= 0 && endpoint >= 0 &&
          count_doc_kind(&graph, SHELL_DOC_FILE) == 0 &&
          count_edge_type(&graph, SHELL_EDGE_SUBST) == 1 &&
@@ -3872,12 +7058,89 @@ TEST(process_substitution_stream_topology) {
   ASSERT(stdout_to_endpoint && stderr_to_endpoint);
   ASSERT(shell_dep_graph_validate(&graph).valid);
 
+  /* A combined process-output redirect still creates independent fd routes.
+   * Later redirects replace only the descriptor they name; retaining the
+   * initial stdout collector edge here would falsely duplicate `log` into
+   * the nested shell. */
+  ASSERT(parse("cat log &> >(sh) >out", &graph) == SHELL_DEP_OK);
+  writer = find_nth_cmd(&graph, 0);
+  endpoint = find_endpoint(&graph);
+  int out_file = find_file_doc(&graph, "out");
+  ASSERT(writer >= 0 && endpoint >= 0 && out_file >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)writer,
+                      (uint32_t)out_file, 1, SHELL_DEP_FD_NONE) &&
+         has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)writer,
+                      (uint32_t)endpoint, 2, SHELL_DEP_FD_NONE) &&
+         !has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)writer,
+                       (uint32_t)endpoint, 1, SHELL_DEP_FD_NONE) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  ASSERT(parse("cat log &>> >(sh) 2>>err", &graph) == SHELL_DEP_OK);
+  writer = find_nth_cmd(&graph, 0);
+  endpoint = find_endpoint(&graph);
+  int err_file = find_file_doc(&graph, "err");
+  ASSERT(writer >= 0 && endpoint >= 0 && err_file >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)writer,
+                      (uint32_t)endpoint, 1, SHELL_DEP_FD_NONE) &&
+         has_edge_fds(&graph, SHELL_EDGE_APPEND, (uint32_t)writer,
+                      (uint32_t)err_file, 2, SHELL_DEP_FD_NONE) &&
+         !has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)writer,
+                       (uint32_t)endpoint, 2, SHELL_DEP_FD_NONE) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  ASSERT(parse("cat log >& >(sh) 2>&-", &graph) == SHELL_DEP_OK);
+  writer = find_nth_cmd(&graph, 0);
+  endpoint = find_endpoint(&graph);
+  ASSERT(writer >= 0 && endpoint >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)writer,
+                      (uint32_t)endpoint, 1, SHELL_DEP_FD_NONE) &&
+         !has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)writer,
+                       (uint32_t)endpoint, 2, SHELL_DEP_FD_NONE) &&
+         has_edge_fds(&graph, SHELL_EDGE_FD_CLOSE, (uint32_t)writer,
+                      (uint32_t)writer, 2, SHELL_DEP_FD_NONE) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  ASSERT(parse("cat log &> >(sh) >out 2>&1", &graph) == SHELL_DEP_OK);
+  writer = find_nth_cmd(&graph, 0);
+  out_file = find_file_doc(&graph, "out");
+  bool stale_collector_route = false;
+  for (uint32_t i = 0; i < graph.edge_count; i++) {
+    const shell_dep_edge_t *edge = &graph.edges[i];
+    stale_collector_route =
+        stale_collector_route ||
+        (edge->type == SHELL_EDGE_WRITE && edge->from == (uint32_t)writer &&
+         graph.nodes[edge->to].type == SHELL_NODE_ENDPOINT &&
+         (edge->source_fd == 1 || edge->source_fd == 2));
+  }
+  ASSERT(writer >= 0 && out_file >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)writer,
+                      (uint32_t)out_file, 1, SHELL_DEP_FD_NONE) &&
+         has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)writer,
+                      (uint32_t)out_file, 2, SHELL_DEP_FD_NONE) &&
+         !stale_collector_route && shell_dep_graph_validate(&graph).valid);
+
+  ASSERT(parse("{ cat log; } &> >(sh) >out", &graph) == SHELL_DEP_OK);
+  group = find_group(&graph, SHELL_GROUP_BRACE, UINT32_MAX);
+  endpoint = find_endpoint(&graph);
+  out_file = find_file_doc(&graph, "out");
+  ASSERT(group >= 0 && endpoint >= 0 && out_file >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)group,
+                      (uint32_t)out_file, 1, SHELL_DEP_FD_NONE) &&
+         has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)group,
+                      (uint32_t)endpoint, 2, SHELL_DEP_FD_NONE) &&
+         !has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)group,
+                       (uint32_t)endpoint, 1, SHELL_DEP_FD_NONE) &&
+         shell_dep_graph_validate(&graph).valid);
+
   /* Combined output process substitutions need both descriptor edges. A
    * one-edge-short graph must report truncation rather than retaining only
    * stdout and appearing complete. */
+  shell_dep_graph_t combined_complete = {0};
+  ASSERT(shell_dep_graph_parse("cat log &> >(sh)", strlen("cat log &> >(sh)"),
+                               ".", NULL, &combined_complete) == SHELL_DEP_OK);
   shell_dep_limits_t combined_limits = SHELL_DEP_LIMITS_DEFAULT;
-  ASSERT(graph.edge_count > 0);
-  combined_limits.max_edges = graph.edge_count - 1;
+  ASSERT(combined_complete.edge_count > 0);
+  combined_limits.max_edges = combined_complete.edge_count - 1;
   shell_dep_graph_t combined_limited = {0};
   ASSERT(shell_dep_graph_parse("cat log &> >(sh)", strlen("cat log &> >(sh)"),
                                ".", &combined_limits,
@@ -3887,9 +7150,9 @@ TEST(process_substitution_stream_topology) {
   ASSERT(shell_dep_graph_validate(&combined_limited).valid);
 
   ASSERT(parse("{ printf payload; } 3>> >(cat)", &graph) == SHELL_DEP_OK);
-  int group = find_group(&graph, SHELL_GROUP_BRACE, UINT32_MAX);
+  group = find_group(&graph, SHELL_GROUP_BRACE, UINT32_MAX);
   endpoint = find_endpoint(&graph);
-  consumer = find_nth_cmd(&graph, 1);
+  consumer = find_cmd_tokens(&graph, "cat", NULL);
   ASSERT(group >= 0 && endpoint >= 0 && consumer >= 0 &&
          count_doc_kind(&graph, SHELL_DOC_FILE) == 0 &&
          count_edge_type(&graph, SHELL_EDGE_APPEND) == 0 &&
@@ -4063,6 +7326,67 @@ TEST(process_substitution_stream_topology) {
   pass_count++;
 }
 
+/* Recursive descriptor imports retain child-node indices until the parent
+ * graph is assembled. Pruning an overridden process-output collector must
+ * remap those indices before a later child redirect materializes its route. */
+TEST(recursive_fd_import_survives_endpoint_pruning) {
+  static const struct {
+    const char *command;
+    const char *path;
+    const char *final_command;
+    const char *final_argument;
+    shell_dep_edge_type_t edge_type;
+    uint32_t source_fd;
+    uint32_t target_fd;
+  } cases[] = {
+      {"exec {fd}>/tmp/import-out; printf \"$(printf x > >(sink) "
+       ">/tmp/replaced; printf y >&$fd)\"",
+       "/tmp/import-out", "printf", "y", SHELL_EDGE_WRITE, 1,
+       SHELL_DEP_FD_NONE},
+      {"exec 3>/tmp/import-out; printf \"$(printf x > >(sink) "
+       ">/tmp/replaced; printf y >&3)\"",
+       "/tmp/import-out", "printf", "y", SHELL_EDGE_WRITE, 1,
+       SHELL_DEP_FD_NONE},
+      {"exec {fd}</tmp/import-in; printf \"$(printf x > >(sink) "
+       ">/tmp/replaced; cat <&$fd)\"",
+       "/tmp/import-in", "cat", NULL, SHELL_EDGE_READ, SHELL_DEP_FD_NONE, 0},
+      {"exec 3</tmp/import-in; printf \"$(printf x > >(sink) "
+       ">/tmp/replaced; cat <&3)\"",
+       "/tmp/import-in", "cat", NULL, SHELL_EDGE_READ, SHELL_DEP_FD_NONE, 0},
+  };
+
+  for (uint32_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    shell_dep_graph_t graph = {0};
+    ASSERT(parse(cases[i].command, &graph) == SHELL_DEP_OK);
+    int document = find_file_doc(&graph, cases[i].path);
+    int final = find_cmd_tokens(&graph, cases[i].final_command,
+                                cases[i].final_argument);
+    int sink = find_cmd_tokens(&graph, "sink", NULL);
+    bool stale_collector_substitution = false;
+    for (uint32_t edge = 0; edge < graph.edge_count; edge++) {
+      const shell_dep_edge_t *current = &graph.edges[edge];
+      stale_collector_substitution =
+          stale_collector_substitution ||
+          (current->type == SHELL_EDGE_SUBST && current->to == (uint32_t)sink);
+    }
+    ASSERT(document >= 0);
+    ASSERT(final >= 0);
+    ASSERT(sink >= 0);
+    ASSERT(graph.status == SHELL_DEP_STATUS_OK);
+    ASSERT(!stale_collector_substitution);
+    if (cases[i].edge_type == SHELL_EDGE_READ)
+      ASSERT(has_edge_fds(&graph, cases[i].edge_type, (uint32_t)document,
+                          (uint32_t) final, cases[i].source_fd,
+                          cases[i].target_fd));
+    else
+      ASSERT(has_edge_fds(&graph, cases[i].edge_type, (uint32_t) final,
+                          (uint32_t)document, cases[i].source_fd,
+                          cases[i].target_fd));
+    ASSERT(shell_dep_graph_validate(&graph).valid);
+  }
+  pass_count++;
+}
+
 TEST(substitution_descriptor_provenance) {
   static const struct {
     const char *command;
@@ -4105,6 +7429,51 @@ TEST(substitution_descriptor_provenance) {
 
 TEST(substitution_scanner_and_flag_contract) {
   shell_dep_graph_t graph = {0};
+
+  static const struct {
+    const char *source;
+    bool executes;
+  } parameter_cases[] = {
+      {"echo \"${x:-'$(printf hi)'}\"", true},
+      {"echo \"${x:-$'$(printf hi)'}\"", true},
+      {"echo \"${x:-'`printf hi`'}\"", true},
+      {"echo \"${x:-'${y:-$(printf hi)}'}\"", true},
+      {"echo ${x:-'$(printf hi)'}", false},
+      {"echo ${x:-$'$(printf hi)'}", false},
+      {"echo \"${x:-'\\$(printf hi)'}\"", false},
+      {"echo \"${x:-'<(printf hi)'}\"", false},
+      {"echo \"${x/a/'$(printf hi)'}\"", false},
+      {"echo \"${x#'$(printf hi)'}\"", false},
+      {"echo \"${x:-$'\\\\$(printf hi)'}\"", false},
+      {"echo \"${x:-$'\\\\\\$(printf hi)'}\"", true},
+      {"echo \"${x^$(printf hi)}\"", true},
+      {"echo \"${x:-$'\\x24'}\"", false},
+      {"echo \"${x:-$'\\x3c'}\"", false},
+  };
+  for (size_t i = 0; i < sizeof(parameter_cases) / sizeof(parameter_cases[0]);
+       i++) {
+    ASSERT(parse(parameter_cases[i].source, &graph) == SHELL_DEP_OK);
+    ASSERT(count_type(&graph, SHELL_NODE_CMD) ==
+           (parameter_cases[i].executes ? 2u : 1u));
+    ASSERT(count_edge_type(&graph, SHELL_EDGE_SUBST) ==
+           (parameter_cases[i].executes ? 1u : 0u));
+    ASSERT(shell_dep_graph_validate(&graph).valid);
+  }
+
+  static const char *const unsafe_ansi[] = {
+      "echo \"${x:-$'$(printf\\x20X)'}\"", "echo \"${x:-$'$(pr\\x69ntf X)'}\"",
+      "echo \"${x:-$'\\\\'$(printf X)}\"", "echo \"${x:-$'\\\"$(printf X)'}\"",
+      "echo \"${x:-$'\"$(printf X)'}\"",
+  };
+  for (size_t i = 0; i < sizeof(unsafe_ansi) / sizeof(unsafe_ansi[0]); i++) {
+    ASSERT(parse(unsafe_ansi[i], &graph) == SHELL_DEP_EPARSE);
+    ASSERT(graph.node_count == 0 && graph.edge_count == 0);
+  }
+
+  ASSERT(parse("echo \"${x/a/<(printf hi)}\"", &graph) == SHELL_DEP_OK);
+  ASSERT(count_type(&graph, SHELL_NODE_CMD) == 2 &&
+         count_edge_type(&graph, SHELL_EDGE_SUBST) == 1 &&
+         shell_dep_graph_validate(&graph).valid);
 
   ASSERT(parse("echo $(printf value)", &graph) == SHELL_DEP_OK);
   bool saw_shell_word = false;
@@ -4249,7 +7618,7 @@ TEST(herestring_substitution_topology) {
    * actual I/O owner is the GROUP endpoint rather than a member command. */
   ASSERT(parse("{ cat; } <<< $(printf value)", &graph) == SHELL_DEP_OK);
   int group = find_group(&graph, SHELL_GROUP_BRACE, UINT32_MAX);
-  producer = find_nth_cmd(&graph, 1);
+  producer = find_cmd_tokens(&graph, "printf", "value");
   document = find_doc(&graph, SHELL_DOC_HERESTRING);
   ASSERT(group >= 0 && producer >= 0 && document >= 0 &&
          has_edge_fds(&graph, SHELL_EDGE_READ, (uint32_t)document,
@@ -4271,8 +7640,8 @@ TEST(herestring_substitution_topology) {
   ASSERT(parse("{ sh; } > >(cat) <<< \"$(printf payload)\"", &graph) ==
          SHELL_DEP_OK);
   group = find_group(&graph, SHELL_GROUP_BRACE, UINT32_MAX);
-  int process_consumer = find_nth_cmd(&graph, 1);
-  producer = find_nth_cmd(&graph, 2);
+  int process_consumer = find_cmd_tokens(&graph, "cat", NULL);
+  producer = find_cmd_tokens(&graph, "printf", "payload");
   document = find_doc(&graph, SHELL_DOC_HERESTRING);
   shell_word_document = false;
   for (uint32_t edge_index = 0; edge_index < graph.edge_count; edge_index++) {
@@ -4320,7 +7689,7 @@ TEST(herestring_substitution_topology) {
   ASSERT(parse("{ cat; } 3>&1 <<< stale 0<<< $(printf live)", &graph) ==
          SHELL_DEP_OK);
   group = find_group(&graph, SHELL_GROUP_BRACE, UINT32_MAX);
-  producer = find_nth_cmd(&graph, 1);
+  producer = find_cmd_tokens(&graph, "printf", "live");
   int stale_document = -1;
   int effective_document = -1;
   for (uint32_t node = 0; node < graph.node_count; node++) {
@@ -4649,7 +8018,7 @@ TEST(substitution_operand_matrix) {
 
   ASSERT(parse("{ cat; } >\"$(id)\"", &graph) == SHELL_DEP_OK);
   int group = find_group(&graph, SHELL_GROUP_BRACE, UINT32_MAX);
-  producer = find_nth_cmd(&graph, 1);
+  producer = find_cmd_tokens(&graph, "id", NULL);
   document = -1;
   for (uint32_t node = 0; node < graph.node_count; node++)
     if (graph.nodes[node].type == SHELL_NODE_DOC &&
@@ -4993,6 +8362,208 @@ TEST(empty_input) {
   pass_count++;
 }
 
+TEST(resolver_workspace_contract) {
+  size_t required = 0;
+  size_t alignment = shell_dep_workspace_alignment();
+  ASSERT(alignment != 0 && (alignment & (alignment - 1)) == 0);
+  ASSERT(shell_dep_workspace_size(NULL, &required));
+  ASSERT(required != 0 && required <= sizeof(shellsplit_test_dep_workspace));
+  shell_dep_limits_t small_limits = SHELL_DEP_LIMITS_DEFAULT;
+  small_limits.max_nodes = 1;
+  small_limits.max_edges = 1;
+  small_limits.max_tokens_per_cmd = 1;
+  size_t small_required = 0;
+  ASSERT(shell_dep_workspace_size(&small_limits, &small_required));
+  shell_dep_limits_t maximum_limits = SHELL_DEP_LIMITS_DEFAULT;
+  size_t maximum_required = 0;
+  ASSERT(shell_dep_workspace_size(&maximum_limits, &maximum_required));
+  ASSERT(small_required == required && maximum_required == required);
+
+  shell_dep_graph_t graph;
+  memset(&graph, 0xA5, sizeof(graph));
+  ASSERT(raw_dep_graph_parse("printf x", strlen("printf x"), ".", NULL,
+                             &graph) == SHELL_DEP_EWORKSPACE);
+  ASSERT(graph.node_count == 0 && graph.edge_count == 0 &&
+         graph.cwd_buf.len == 0 && graph.status == SHELL_DEP_STATUS_ERROR);
+
+  ASSERT(raw_dep_graph_parse("echo $(id)", strlen("echo $(id)"), ".", NULL,
+                             &graph) == SHELL_DEP_EWORKSPACE);
+  ASSERT(graph.node_count == 0 && graph.edge_count == 0 &&
+         graph.cwd_buf.len == 0 && graph.status == SHELL_DEP_STATUS_ERROR);
+
+  static const char group_substitution[] = "{ echo $(id); } > /tmp/group.out";
+  ASSERT(raw_dep_graph_parse(group_substitution, strlen(group_substitution),
+                             ".", NULL, &graph) == SHELL_DEP_EWORKSPACE);
+  ASSERT(graph.node_count == 0 && graph.edge_count == 0 &&
+         graph.cwd_buf.len == 0 && graph.status == SHELL_DEP_STATUS_ERROR);
+
+  ASSERT(raw_dep_graph_parse("echo \"", strlen("echo \""), ".", NULL, &graph) ==
+         SHELL_DEP_EPARSE);
+  ASSERT(graph.node_count == 0 && graph.edge_count == 0 &&
+         graph.cwd_buf.len == 0 && graph.status == SHELL_DEP_STATUS_ERROR);
+
+  ASSERT(raw_dep_graph_parse(" \t\n", strlen(" \t\n"), ".", NULL, &graph) ==
+         SHELL_DEP_OK);
+  ASSERT(graph.node_count == 0 && graph.edge_count == 0 &&
+         graph.cwd_buf.len == 0 && graph.status == SHELL_DEP_STATUS_OK);
+
+  shell_dep_limits_t limits = SHELL_DEP_LIMITS_DEFAULT;
+  limits.workspace = shellsplit_test_dep_workspace;
+  limits.workspace_size = required - 1;
+  memset(&graph, 0xA5, sizeof(graph));
+  ASSERT(raw_dep_graph_parse("printf x", strlen("printf x"), ".", &limits,
+                             &graph) == SHELL_DEP_EWORKSPACE);
+  ASSERT(graph.node_count == 0 && graph.edge_count == 0 &&
+         graph.cwd_buf.len == 0 && graph.status == SHELL_DEP_STATUS_ERROR);
+
+  limits.workspace = shellsplit_test_dep_workspace + 1;
+  limits.workspace_size = sizeof(shellsplit_test_dep_workspace) - 1;
+  memset(&graph, 0xA5, sizeof(graph));
+  ASSERT(raw_dep_graph_parse("printf x", strlen("printf x"), ".", &limits,
+                             &graph) == SHELL_DEP_EWORKSPACE);
+  ASSERT(graph.node_count == 0 && graph.edge_count == 0 &&
+         graph.cwd_buf.len == 0 && graph.status == SHELL_DEP_STATUS_ERROR);
+
+  limits.workspace = shellsplit_test_dep_workspace;
+  limits.workspace_size = sizeof(shellsplit_test_dep_workspace);
+  ASSERT(raw_dep_graph_parse("printf x", strlen("printf x"), ".", &limits,
+                             &graph) == SHELL_DEP_OK);
+  ASSERT(shell_dep_graph_validate(&graph).valid);
+
+  shell_parse_result_t fast;
+  ASSERT(shell_parse_fast("printf x", strlen("printf x"), NULL, &fast) ==
+         SHELL_OK);
+  limits.workspace = NULL;
+  limits.workspace_size = 0;
+  ASSERT(raw_dep_graph_parse_with_fast("printf x", strlen("printf x"), ".",
+                                       &limits, &fast,
+                                       &graph) == SHELL_DEP_EWORKSPACE);
+  ASSERT(graph.node_count == 0 && graph.edge_count == 0 &&
+         graph.cwd_buf.len == 0 && graph.status == SHELL_DEP_STATUS_ERROR);
+  pass_count++;
+}
+
+TEST(resolver_workspace_alias_contract) {
+  const char command[] = "printf x";
+  size_t required = 0;
+  ASSERT(shell_dep_workspace_size(NULL, &required) && required != 0);
+
+  shell_dep_limits_t limits = SHELL_DEP_LIMITS_DEFAULT;
+  shell_dep_graph_t graph;
+  unsigned char graph_snapshot[sizeof(graph)];
+
+  /* A workspace may be large in the public contract, but overlap is rejected
+   * before it is touched. Keep both the command and graph sentinels intact. */
+  char command_storage[sizeof(command)];
+  memcpy(command_storage, command, sizeof(command));
+  memset(&graph, 0xA5, sizeof(graph));
+  memcpy(graph_snapshot, &graph, sizeof(graph));
+  limits.workspace = command_storage;
+  limits.workspace_size = required;
+  ASSERT(raw_dep_graph_parse(command_storage, sizeof(command) - 1, ".", &limits,
+                             &graph) == SHELL_DEP_EINPUT);
+  ASSERT(memcmp(command_storage, command, sizeof(command)) == 0 &&
+         memcmp(&graph, graph_snapshot, sizeof(graph)) == 0);
+
+  memset(&graph, 0xA5, sizeof(graph));
+  memcpy(graph_snapshot, &graph, sizeof(graph));
+  limits.workspace = command_storage + 1;
+  limits.workspace_size = required;
+  ASSERT(raw_dep_graph_parse(command_storage, sizeof(command) - 1, ".", &limits,
+                             &graph) == SHELL_DEP_EINPUT);
+  ASSERT(memcmp(command_storage, command, sizeof(command)) == 0 &&
+         memcmp(&graph, graph_snapshot, sizeof(graph)) == 0);
+
+  /* Graph output and resolver scratch also have incompatible write
+   * lifetimes, even when the graph object's alignment happens to suffice. */
+  memset(&graph, 0xA5, sizeof(graph));
+  memcpy(graph_snapshot, &graph, sizeof(graph));
+  limits.workspace = &graph;
+  limits.workspace_size = required;
+  ASSERT(raw_dep_graph_parse(command, sizeof(command) - 1, ".", &limits,
+                             &graph) == SHELL_DEP_EINPUT);
+  ASSERT(memcmp(&graph, graph_snapshot, sizeof(graph)) == 0);
+
+  /* The output graph itself cannot alias borrowed command storage. */
+  memset(&graph, 0xA5, sizeof(graph));
+  memcpy(&graph, command, sizeof(command) - 1);
+  memcpy(graph_snapshot, &graph, sizeof(graph));
+  ASSERT(raw_dep_graph_parse((const char *)&graph, sizeof(command) - 1, ".",
+                             NULL, &graph) == SHELL_DEP_EINPUT);
+  ASSERT(memcmp(&graph, graph_snapshot, sizeof(graph)) == 0);
+
+  /* The initial CWD is a borrowed input too. Reject an output alias before
+   * clearing the CWD buffer that contains it. */
+  memset(&graph, 0xA5, sizeof(graph));
+  strcpy(graph.cwd_buf.data, "/saved-cwd");
+  graph.cwd_buf.len = strlen(graph.cwd_buf.data) + 1;
+  memcpy(graph_snapshot, &graph, sizeof(graph));
+  limits.workspace = shellsplit_test_dep_workspace;
+  limits.workspace_size = sizeof(shellsplit_test_dep_workspace);
+  ASSERT(raw_dep_graph_parse(command, sizeof(command) - 1, graph.cwd_buf.data,
+                             &limits, &graph) == SHELL_DEP_EINPUT);
+  ASSERT(memcmp(&graph, graph_snapshot, sizeof(graph)) == 0);
+
+  /* Resolver scratch is writable for the duration of parsing, so it cannot
+   * also own the borrowed initial CWD string. */
+  const char workspace_cwd[] = "/workspace-cwd";
+  memcpy(shellsplit_test_dep_workspace, workspace_cwd, sizeof(workspace_cwd));
+  memset(&graph, 0xA5, sizeof(graph));
+  memcpy(graph_snapshot, &graph, sizeof(graph));
+  ASSERT(raw_dep_graph_parse(command, sizeof(command) - 1,
+                             (const char *)shellsplit_test_dep_workspace,
+                             &limits, &graph) == SHELL_DEP_EINPUT);
+  ASSERT(memcmp(shellsplit_test_dep_workspace, workspace_cwd,
+                sizeof(workspace_cwd)) == 0 &&
+         memcmp(&graph, graph_snapshot, sizeof(graph)) == 0);
+
+  ASSERT(raw_dep_graph_parse(command, sizeof(command) - 1, "/valid-cwd",
+                             &limits, &graph) == SHELL_DEP_OK);
+  ASSERT(strcmp(graph.cwd_buf.data, "/valid-cwd") == 0 &&
+         shell_dep_graph_validate(&graph).valid);
+
+  /* Limits are borrowed at entry, but may live in either writable region.
+   * A nested parse must retain its own copy after scratch has been reused. */
+  const char nested[] = "echo $(printf nested); echo after";
+  ASSERT(shell_dep_workspace_alignment() <= _Alignof(max_align_t));
+  size_t allocation_size = required > sizeof(shell_dep_limits_t)
+                               ? required
+                               : sizeof(shell_dep_limits_t);
+  shell_dep_limits_t *workspace_limits = malloc(allocation_size);
+  ASSERT(workspace_limits != NULL);
+  *workspace_limits = SHELL_DEP_LIMITS_DEFAULT;
+  workspace_limits->workspace = workspace_limits;
+  workspace_limits->workspace_size = required;
+  ASSERT(raw_dep_graph_parse(nested, sizeof(nested) - 1, ".", workspace_limits,
+                             &graph) == SHELL_DEP_OK);
+  ASSERT(shell_dep_graph_validate(&graph).valid);
+
+  union {
+    shell_dep_limits_t limits;
+    shell_dep_graph_t graph;
+  } graph_alias;
+  graph_alias.limits = SHELL_DEP_LIMITS_DEFAULT;
+  graph_alias.limits.workspace = shellsplit_test_dep_workspace;
+  graph_alias.limits.workspace_size = sizeof(shellsplit_test_dep_workspace);
+  ASSERT(raw_dep_graph_parse(nested, sizeof(nested) - 1, ".",
+                             &graph_alias.limits,
+                             &graph_alias.graph) == SHELL_DEP_OK);
+  ASSERT(shell_dep_graph_validate(&graph_alias.graph).valid);
+
+  shell_parse_result_t nested_fast = {0};
+  ASSERT(shell_parse_fast(nested, sizeof(nested) - 1, NULL, &nested_fast) ==
+         SHELL_OK);
+  *workspace_limits = SHELL_DEP_LIMITS_DEFAULT;
+  workspace_limits->workspace = workspace_limits;
+  workspace_limits->workspace_size = required;
+  ASSERT(raw_dep_graph_parse_with_fast(nested, sizeof(nested) - 1, ".",
+                                       workspace_limits, &nested_fast,
+                                       &graph) == SHELL_DEP_OK);
+  ASSERT(shell_dep_graph_validate(&graph).valid);
+  free(workspace_limits);
+  pass_count++;
+}
+
 TEST(adversarial_limits) {
   shell_dep_graph_t g;
   shell_dep_limits_t limits = SHELL_DEP_LIMITS_DEFAULT;
@@ -5042,6 +8613,9 @@ TEST(dialect_boundary_matrix) {
       "if test -f file; then echo yes; else echo no; fi",
       "while read line; do echo $line; done",
       "until test -f file; do sleep 1; done",
+      "(\\\n( count += 1 ))",
+      "[\\\r[ -n value ]]",
+      "[[\\\r\n -n value ]]",
   };
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
     shell_dep_graph_t graph;
@@ -5103,25 +8677,35 @@ TEST(limit_matrix) {
     uint32_t edge_count;
     uint32_t command_tokens;
   } cases[] = {
-      {"cmd1 ; cmd2", {1, 8, 8, 0, false}, SHELL_DEP_ETRUNC, 1, 0, 1},
-      {"echo hi > out.txt", {8, 0, 8, 0, false}, SHELL_DEP_ETRUNC, 1, 0, 2},
-      {"echo hello", {8, 8, 1, 0, false}, SHELL_DEP_ETRUNC, 1, 0, 1},
-      {"cd /tmp && ls", {8, 8, 8, 4, false}, SHELL_DEP_ETRUNC, 1, 0, 1},
+      {"cmd1 ; cmd2", {1, 8, 8, 0, false, NULL, 0}, SHELL_DEP_ETRUNC, 1, 0, 1},
+      {"echo hi > out.txt",
+       {8, 0, 8, 0, false, NULL, 0},
+       SHELL_DEP_ETRUNC,
+       1,
+       0,
+       2},
+      {"echo hello", {8, 8, 1, 0, false, NULL, 0}, SHELL_DEP_ETRUNC, 1, 0, 1},
+      {"cd /tmp && ls",
+       {8, 8, 8, 4, false, NULL, 0},
+       SHELL_DEP_ETRUNC,
+       1,
+       0,
+       1},
       {"echo $(cat /etc/hosts)",
-       {2, 8, 8, 0, false},
+       {2, 8, 8, 0, false, NULL, 0},
        SHELL_DEP_ETRUNC,
        1,
        0,
        2},
       {"c 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 "
        "24 25 26 27 28 29 30 31 32 33",
-       {64, 64, SHELL_DEP_MAX_TOKENS, 0, false},
+       {64, 64, SHELL_DEP_MAX_TOKENS, 0, false, NULL, 0},
        SHELL_DEP_ETRUNC,
        1,
        0,
        SHELL_DEP_MAX_TOKENS},
       {"echo hello",
-       {UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX, false},
+       {UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX, false, NULL, 0},
        SHELL_DEP_OK,
        1,
        0,
@@ -5182,8 +8766,13 @@ TEST(nested_limit_cross_product) {
   };
 
   for (size_t i = 0; i < sizeof(bounds) / sizeof(bounds[0]); i++) {
-    shell_dep_limits_t limits = {bounds[i].nodes, bounds[i].edges,
-                                 bounds[i].tokens, bounds[i].cwd, false};
+    shell_dep_limits_t limits = {bounds[i].nodes,
+                                 bounds[i].edges,
+                                 bounds[i].tokens,
+                                 bounds[i].cwd,
+                                 false,
+                                 NULL,
+                                 0};
     shell_dep_graph_t graph;
     shell_dep_error_t error =
         shell_dep_graph_parse(command, strlen(command), ".", &limits, &graph);
@@ -5391,6 +8980,95 @@ TEST(validation_rejects_malformed_endpoint_metadata) {
   pass_count++;
 }
 
+/* Named descriptor identity is carried beside the public sentinel. Validate
+ * both sides of that contract explicitly, including the close edge emitted
+ * when an allocated descriptor is released. These guards prevent a malformed
+ * caller-owned graph from silently conflating unrelated named descriptors. */
+TEST(validation_rejects_malformed_named_fd_metadata) {
+  shell_dep_graph_t graph = {0};
+  ASSERT(parse("exec {out}>/tmp/out; printf bytes >&$out", &graph) ==
+         SHELL_DEP_OK);
+  uint32_t named_edge = UINT32_MAX;
+  bool source_name = false;
+  for (uint32_t edge = 0; edge < graph.edge_count; edge++) {
+    if (graph.edges[edge].source_fd == SHELL_DEP_FD_NAMED) {
+      named_edge = edge;
+      source_name = true;
+      break;
+    }
+    if (graph.edges[edge].target_fd == SHELL_DEP_FD_NAMED) {
+      named_edge = edge;
+      break;
+    }
+  }
+  ASSERT(named_edge != UINT32_MAX);
+  if (source_name) {
+    graph.edges[named_edge].source_fd_name = NULL;
+    graph.edges[named_edge].source_fd_name_len = 0;
+  } else {
+    graph.edges[named_edge].target_fd_name = NULL;
+    graph.edges[named_edge].target_fd_name_len = 0;
+  }
+  shell_dep_graph_validation_t validation = shell_dep_graph_validate(&graph);
+  ASSERT(!validation.valid && validation.error_count == 1);
+  ASSERT(strstr(validation.errors[0].msg, "named descriptor") != NULL);
+
+  ASSERT(parse("exec {out}>/tmp/out; exec {out}>&-", &graph) == SHELL_DEP_OK);
+  uint32_t close_edge = UINT32_MAX;
+  for (uint32_t edge = 0; edge < graph.edge_count; edge++)
+    if (graph.edges[edge].type == SHELL_EDGE_FD_CLOSE) {
+      close_edge = edge;
+      break;
+    }
+  ASSERT(close_edge != UINT32_MAX);
+  graph.edges[close_edge].target_fd = 0;
+  validation = shell_dep_graph_validate(&graph);
+  ASSERT(!validation.valid && validation.error_count == 1);
+  ASSERT(strstr(validation.errors[0].msg, "type mismatch") != NULL);
+  pass_count++;
+}
+
+TEST(validation_rejects_ambiguous_fd_open_forms) {
+  /* Every ordinary setup topology must reject the duplication marker. The
+   * marker changes how Shellgate interprets the relation, so accepting it on
+   * a document or process-substitution edge would be contradictory. */
+  static const char *const ordinary_setups[] = {
+      "exec 3>/tmp/fd-open-output",
+      "exec 3</tmp/fd-open-input",
+      "exec 3> >(cat)",
+      "exec 3< <(printf bytes)",
+  };
+  for (uint32_t i = 0; i < sizeof(ordinary_setups) / sizeof(ordinary_setups[0]);
+       i++) {
+    shell_dep_graph_t graph = {0};
+    ASSERT(parse(ordinary_setups[i], &graph) == SHELL_DEP_OK);
+    uint32_t setup = UINT32_MAX;
+    for (uint32_t edge = 0; edge < graph.edge_count; edge++)
+      if (graph.edges[edge].type == SHELL_EDGE_FD_OPEN &&
+          (graph.edges[edge].flags & SHELL_DEP_EDGE_FLAG_FD_OPEN_DUP) == 0) {
+        setup = edge;
+        break;
+      }
+    ASSERT(setup != UINT32_MAX);
+    graph.edges[setup].flags |= SHELL_DEP_EDGE_FLAG_FD_OPEN_DUP;
+    ASSERT(!shell_dep_graph_validate(&graph).valid);
+  }
+
+  shell_dep_graph_t graph = {0};
+  ASSERT(parse("exec 3>/tmp/fd-open-dup; exec 4>&3", &graph) == SHELL_DEP_OK);
+  uint32_t duplicate = UINT32_MAX;
+  for (uint32_t edge = 0; edge < graph.edge_count; edge++)
+    if (graph.edges[edge].type == SHELL_EDGE_FD_OPEN &&
+        (graph.edges[edge].flags & SHELL_DEP_EDGE_FLAG_FD_OPEN_DUP) != 0) {
+      duplicate = edge;
+      break;
+    }
+  ASSERT(duplicate != UINT32_MAX);
+  graph.edges[duplicate].flags = SHELL_DEP_EDGE_FLAG_NONE;
+  ASSERT(!shell_dep_graph_validate(&graph).valid);
+  pass_count++;
+}
+
 TEST(validation_rejects_corrupt_counts_documents_and_endpoint_shapes) {
   shell_dep_graph_t graph = {0};
   shell_dep_graph_validation_t validation;
@@ -5566,10 +9244,20 @@ TEST(graph_dump_contract) {
   shell_dep_graph_dump(&g, output);
   ASSERT(parse("! ! false | cat", &g) == SHELL_DEP_OK);
   shell_dep_graph_dump(&g, output);
+  ASSERT(parse("exec {sink}> >(cat); printf bytes >&\"$sink\"", &g) ==
+         SHELL_DEP_OK);
+  shell_dep_graph_dump(&g, output);
+  ASSERT(parse("exec {source}< <(printf bytes >/tmp/dump-source); "
+               "cat <&\"$source\"",
+               &g) == SHELL_DEP_OK);
+  shell_dep_graph_dump(&g, output);
+  ASSERT(parse("exec {f\\\nd}> out; printf bytes >&$f\\\nd", &g) ==
+         SHELL_DEP_OK);
+  shell_dep_graph_dump(&g, output);
 
   ASSERT(fflush(output) == 0);
   ASSERT(fseek(output, 0, SEEK_SET) == 0);
-  char text[4096];
+  char text[16384];
   size_t length = fread(text, 1, sizeof(text) - 1, output);
   ASSERT(!ferror(output));
   text[length] = '\0';
@@ -5584,8 +9272,14 @@ TEST(graph_dump_contract) {
   ASSERT(strstr(text, "SUBST[1:4294967295]") != NULL);
   ASSERT(strstr(text, "flags=0x1") != NULL);
   ASSERT(strstr(text, "GROUP span=\"{ printf x; }\"") != NULL);
+  ASSERT(strstr(text, "source-name=\"sink\"") != NULL);
+  ASSERT(strstr(text, "source-name=\"f"
+                      "\\\\"
+                      "\\"
+                      "nd\"") != NULL);
   ASSERT(strstr(text, "GROUP[") != NULL);
   ASSERT(strstr(text, "ENDPOINT") != NULL);
+  ASSERT(strstr(text, "unconnected-process-substitution") != NULL);
   ASSERT(strstr(text, "negation-count=2") != NULL);
   ASSERT(strstr(text, " negated") != NULL);
   ASSERT(fclose(output) == 0);
@@ -5593,15 +9287,16 @@ TEST(graph_dump_contract) {
 }
 
 TEST(name_helpers) {
-  static const char *edge_names[] = {"READ",  "WRITE",  "APPEND", "PIPE",
-                                     "ARG",   "ENV",    "SUBST",  "SEQ",
-                                     "AND",   "OR",     "CWD",    "BACKGROUND",
-                                     "GROUP", "FD_OPEN"},
+  static const char *edge_names[] = {"READ",  "WRITE",   "APPEND",
+                                     "PIPE",  "ARG",     "ENV",
+                                     "SUBST", "SEQ",     "AND",
+                                     "OR",    "CWD",     "BACKGROUND",
+                                     "GROUP", "FD_OPEN", "FD_CLOSE"},
                     *node_names[] = {"CMD", "DOC", "GROUP", "ENDPOINT"},
                     *doc_names[] = {"FILE", "HEREDOC", "HERESTRING", "ENVVAR"},
-                    *error_names[] = {"OK", "Invalid input",
-                                      "Truncated (limits exceeded)",
-                                      "Parse error"};
+                    *error_names[] = {
+                        "OK", "Invalid input", "Truncated (limits exceeded)",
+                        "Parse error", "Resolver workspace unavailable"};
   for (size_t i = 0; i < sizeof(edge_names) / sizeof(edge_names[0]); i++)
     ASSERT_STR_EQ(shell_dep_edge_type_name((shell_dep_edge_type_t)i),
                   edge_names[i]);
@@ -6032,7 +9727,7 @@ TEST(routing_feature_cross_product_matrix) {
       "cmd $(printf one)$(printf two)",
       "cmd $(<input) $(<\"$(printf dynamic)\")",
       "cmd `printf one` \"$(printf two)\"",
-      "cmd $((1 + $(printf 2)))",
+      "cmd $((1 + $((2))))",
       "cat <<EOF <<-'END'\nfirst\nEOF\n\tsecond\n\tEND\n",
       "cat <<<\"$(printf body)\"",
       "{ cmd; } <in >out 2>&1",
@@ -6078,6 +9773,31 @@ TEST(dynamic_routing_parse_error_matrix) {
     ASSERT(parse(malformed[i], &graph) == SHELL_DEP_EPARSE);
     ASSERT(graph.node_count == 0 && graph.edge_count == 0);
     ASSERT((graph.status & SHELL_DEP_STATUS_ERROR) != 0);
+  }
+  pass_count++;
+}
+
+/* A nested command can be lexically complete while still using a control
+ * compound that Shellclave intentionally does not model.  Every dynamic-input
+ * surface must reject that unsupported nested program atomically; accepting
+ * the outer command with a missing SUBST edge would hide shell data flow. */
+TEST(nested_unsupported_syntax_fails_atomically) {
+  static const char *const cases[] = {
+      "cmd \"$(while true; do :; done)\"",
+      "VALUE=$(while true; do :; done) cmd",
+      "cmd > \"$(while true; do :; done)\"",
+      "cmd < <(while true; do :; done)",
+      "cmd > >(while true; do :; done)",
+      "cmd <<<\"$(while true; do :; done)\"",
+      "{ cmd; } <<<\"$(while true; do :; done)\"",
+      "{ cmd; } > >(while true; do :; done)",
+      "cat <<EOF\n$(while true; do :; done)\nEOF\n",
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    shell_dep_graph_t graph = {0};
+    ASSERT(parse(cases[i], &graph) == SHELL_DEP_EPARSE);
+    ASSERT(graph.status == SHELL_DEP_STATUS_ERROR && graph.node_count == 0 &&
+           graph.edge_count == 0 && graph.cwd_buf.len == 0);
   }
   pass_count++;
 }
@@ -6248,9 +9968,9 @@ TEST(resource_limit_cross_product_matrix) {
   pass_count++;
 }
 
-/* Multiple documents after a group share the group's execution owner, while a
- * named descriptor cannot be used with a duplicate redirect. Keep both paths
- * explicit: silently accepting either would misrepresent actual I/O. */
+/* Multiple documents after a group share the group's execution owner. Named
+ * descriptor setup is represented explicitly, including duplicate and close
+ * transitions, without inventing a byte route. */
 TEST(group_document_and_named_fd_error_boundaries) {
   static const char grouped_documents[] =
       "{ cat; } <<FIRST <<SECOND\nfirst body\nFIRST\nsecond body\nSECOND\n";
@@ -6259,20 +9979,18 @@ TEST(group_document_and_named_fd_error_boundaries) {
       shell_dep_graph_parse(grouped_documents, sizeof(grouped_documents) - 1,
                             ".", NULL, &graph) == SHELL_DEP_OK &&
       shell_dep_graph_validate(&graph).valid;
-  shell_dep_graph_t rejected = {0};
+  shell_dep_graph_t named = {0};
   valid = valid &&
           shell_dep_graph_parse("cmd {fd}>&1", strlen("cmd {fd}>&1"), ".", NULL,
-                                &rejected) == SHELL_DEP_EPARSE &&
-          rejected.node_count == 0 && rejected.edge_count == 0 &&
-          rejected.cwd_buf.len == 0 &&
-          (rejected.status & SHELL_DEP_STATUS_ERROR) != 0;
+                                &named) == SHELL_DEP_OK &&
+          count_edge_type(&named, SHELL_EDGE_FD_OPEN) == 1 &&
+          shell_dep_graph_validate(&named).valid;
   shell_dep_graph_t closed_fd = {0};
   valid = valid &&
           shell_dep_graph_parse("printf x {fd}>&-", strlen("printf x {fd}>&-"),
                                 ".", NULL, &closed_fd) == SHELL_DEP_EPARSE &&
           closed_fd.node_count == 0 && closed_fd.edge_count == 0 &&
-          closed_fd.cwd_buf.len == 0 &&
-          (closed_fd.status & SHELL_DEP_STATUS_ERROR) != 0;
+          closed_fd.status == SHELL_DEP_STATUS_ERROR;
   ASSERT(valid);
   pass_count++;
 }
@@ -6309,7 +10027,7 @@ TEST(document_and_cwd_boundary_contract) {
       shell_dep_graph_parse("pwd", 3, "a/..", NULL, &normalized);
   valid = valid && normalized_status == SHELL_DEP_OK &&
           normalized.node_count == 1 && normalized.cwd_buf.len == 2 &&
-          strcmp(normalized.cwd_buf.data, "/") == 0 &&
+          strcmp(normalized.cwd_buf.data, ".") == 0 &&
           shell_dep_graph_validate(&normalized).valid;
 
   shell_dep_graph_t empty_initial_cwd = {0};
@@ -6407,7 +10125,198 @@ TEST(document_and_cwd_boundary_contract) {
   pass_count++;
 }
 
+/* A line continuation inside a process-substitution opener must not promote
+ * the operand to a static pathname. Compare the complete graph shape with the
+ * uninterrupted Bash spelling, including the CWD-unknown result after `cd`. */
+TEST(continued_process_substitution_topology) {
+  static const struct {
+    const char *reference;
+    const char *continued;
+    bool checks_cwd;
+  } cases[] = {
+      {"cd <(printf input); pwd", "cd <\\\n(printf input); pwd", true},
+      {"printf bytes > >(cat)", "printf bytes > >\\\n(cat)", false},
+      {"printf bytes >prefix<(printf path)",
+       "printf bytes >prefix<\\\n(printf path)", false},
+  };
+
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    shell_dep_graph_t reference = {0};
+    shell_dep_graph_t continued = {0};
+    ASSERT(parse(cases[i].reference, &reference) == SHELL_DEP_OK);
+    ASSERT(parse(cases[i].continued, &continued) == SHELL_DEP_OK);
+    ASSERT(shell_dep_graph_validate(&reference).valid &&
+           shell_dep_graph_validate(&continued).valid);
+    ASSERT(reference.node_count == continued.node_count &&
+           reference.edge_count == continued.edge_count);
+    for (uint32_t type = SHELL_EDGE_READ; type <= SHELL_EDGE_FD_CLOSE; type++)
+      ASSERT(count_edge_type(&reference, (shell_dep_edge_type_t)type) ==
+             count_edge_type(&continued, (shell_dep_edge_type_t)type));
+    if (cases[i].checks_cwd) {
+      int reference_pwd =
+          find_nth_cmd(&reference, count_type(&reference, SHELL_NODE_CMD) - 1);
+      int continued_pwd =
+          find_nth_cmd(&continued, count_type(&continued, SHELL_NODE_CMD) - 1);
+      ASSERT(reference_pwd >= 0 && continued_pwd >= 0 &&
+             !reference.nodes[reference_pwd].cmd.cwd_known &&
+             !continued.nodes[continued_pwd].cmd.cwd_known);
+    }
+  }
+  pass_count++;
+}
+
+/* A redirect token retains a terminal physical continuation in its raw source
+ * span. The continuation is removed before the following word is assigned to
+ * the operator, so it must not turn the operator or its operand into argv. */
+TEST(continued_terminal_redirect_topology) {
+  static const struct {
+    const char *command;
+    const char *path;
+    shell_dep_edge_type_t edge_type;
+    uint32_t fd;
+    bool file_is_source;
+  } file_cases[] = {
+      {"printf payload >\\\n/tmp/write", "/tmp/write", SHELL_EDGE_WRITE, 1,
+       false},
+      {"cat <\\\r/tmp/read", "/tmp/read", SHELL_EDGE_READ, 0, true},
+      {"printf payload >>\\\r\n/tmp/append", "/tmp/append", SHELL_EDGE_APPEND,
+       1, false},
+      {"printf payload >|\\\n/tmp/clobber", "/tmp/clobber", SHELL_EDGE_WRITE, 1,
+       false},
+      {"printf payload &>\\\r/tmp/both", "/tmp/both", SHELL_EDGE_WRITE, 1,
+       false},
+      {"printf payload &>>\\\n/tmp/both-append", "/tmp/both-append",
+       SHELL_EDGE_APPEND, 1, false},
+  };
+
+  for (size_t i = 0; i < sizeof(file_cases) / sizeof(file_cases[0]); i++) {
+    shell_dep_graph_t graph = {0};
+    ASSERT(parse(file_cases[i].command, &graph) == SHELL_DEP_OK);
+    int command = find_first_cmd(&graph);
+    int file = find_file_doc(&graph, file_cases[i].path);
+    uint32_t from =
+        file_cases[i].file_is_source ? (uint32_t)file : (uint32_t)command;
+    uint32_t to =
+        file_cases[i].file_is_source ? (uint32_t)command : (uint32_t)file;
+    uint32_t source_fd =
+        file_cases[i].file_is_source ? SHELL_DEP_FD_NONE : file_cases[i].fd;
+    uint32_t target_fd =
+        file_cases[i].file_is_source ? file_cases[i].fd : SHELL_DEP_FD_NONE;
+    ASSERT(command >= 0 && file >= 0 &&
+           has_edge_fds(&graph, file_cases[i].edge_type, from, to, source_fd,
+                        target_fd) &&
+           shell_dep_graph_validate(&graph).valid);
+  }
+
+  shell_dep_graph_t graph = {0};
+  ASSERT(parse("cat <>\\\n/tmp/read-write", &graph) == SHELL_DEP_OK);
+  int read_write_command = find_first_cmd(&graph);
+  int read_write_file = find_file_doc(&graph, "/tmp/read-write");
+  ASSERT(read_write_command >= 0 && read_write_file >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_READ, (uint32_t)read_write_file,
+                      (uint32_t)read_write_command, SHELL_DEP_FD_NONE, 0) &&
+         has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)read_write_command,
+                      (uint32_t)read_write_file, 0, SHELL_DEP_FD_NONE) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  ASSERT(parse("exec {fd}>\\\n/tmp/trace; printf payload >&$fd", &graph) ==
+         SHELL_DEP_OK);
+  int writer = find_cmd_tokens(&graph, "printf", "payload");
+  int trace = find_file_doc(&graph, "/tmp/trace");
+  ASSERT(writer >= 0 && trace >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)writer,
+                      (uint32_t)trace, 1, SHELL_DEP_FD_NONE) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  ASSERT(parse("{ echo one; } >\\\r\n/tmp/group", &graph) == SHELL_DEP_OK);
+  int group = find_group(&graph, SHELL_GROUP_BRACE, UINT32_MAX);
+  int group_file = find_file_doc(&graph, "/tmp/group");
+  ASSERT(group >= 0 && group_file >= 0 &&
+         count_type(&graph, SHELL_NODE_CMD) == 1 &&
+         has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)group,
+                      (uint32_t)group_file, 1, SHELL_DEP_FD_NONE) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  ASSERT(parse("cat log >\\\n >(sh)", &graph) == SHELL_DEP_OK);
+  int output_writer = find_nth_cmd(&graph, 0);
+  int output_consumer = find_nth_cmd(&graph, 1);
+  int endpoint = find_endpoint(&graph);
+  ASSERT(output_writer >= 0 && output_consumer >= 0 && endpoint >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)output_writer,
+                      (uint32_t)endpoint, 1, SHELL_DEP_FD_NONE) &&
+         has_edge_fds(&graph, SHELL_EDGE_SUBST, (uint32_t)endpoint,
+                      (uint32_t)output_consumer, SHELL_DEP_FD_NONE, 0) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  static const char continued_heredoc[] = "cat <<\\\nEOF\nbody\nEOF\n";
+  ASSERT(parse(continued_heredoc, &graph) == SHELL_DEP_OK);
+  int heredoc_consumer = find_first_cmd(&graph);
+  int heredoc = find_doc(&graph, SHELL_DOC_HEREDOC);
+  ASSERT(heredoc_consumer >= 0 && heredoc >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_READ, (uint32_t)heredoc,
+                      (uint32_t)heredoc_consumer, SHELL_DEP_FD_NONE, 0) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  /* A closing parenthesis in a continued-heredoc body is data. It cannot
+   * close the surrounding command or process substitution. */
+  static const char continued_command_substitution[] =
+      "echo \"$(cat <\\\n<EOF\n)\nEOF\n)\"";
+  ASSERT(parse(continued_command_substitution, &graph) == SHELL_DEP_OK);
+  int substitution_producer = find_cmd_tokens(&graph, "cat", NULL);
+  int substitution_consumer = find_cmd_tokens(&graph, "echo", NULL);
+  heredoc = find_doc(&graph, SHELL_DOC_HEREDOC);
+  ASSERT(count_type(&graph, SHELL_NODE_CMD) == 2 &&
+         substitution_producer >= 0 && substitution_consumer >= 0 &&
+         heredoc >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_READ, (uint32_t)heredoc,
+                      (uint32_t)substitution_producer, SHELL_DEP_FD_NONE, 0) &&
+         has_edge_fds(&graph, SHELL_EDGE_SUBST, (uint32_t)substitution_producer,
+                      (uint32_t)substitution_consumer, 1, SHELL_DEP_FD_NONE) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  static const char continued_process_substitution[] =
+      "cat < <(cat <\\\n<EOF\n)\nEOF\n)";
+  ASSERT(parse(continued_process_substitution, &graph) == SHELL_DEP_OK);
+  substitution_producer = find_nth_cmd(&graph, 1);
+  substitution_consumer = find_nth_cmd(&graph, 0);
+  heredoc = find_doc(&graph, SHELL_DOC_HEREDOC);
+  ASSERT(count_type(&graph, SHELL_NODE_CMD) == 2 &&
+         substitution_producer >= 0 && substitution_consumer >= 0 &&
+         heredoc >= 0 &&
+         has_edge_fds(&graph, SHELL_EDGE_READ, (uint32_t)heredoc,
+                      (uint32_t)substitution_producer, SHELL_DEP_FD_NONE, 0) &&
+         has_edge_fds(&graph, SHELL_EDGE_SUBST, (uint32_t)substitution_producer,
+                      (uint32_t)substitution_consumer, 1, 0) &&
+         shell_dep_graph_validate(&graph).valid);
+
+  static const char shifted_locale_quote[] =
+      ": $((1 << 2))\nprintf %s $\"localized\"";
+  ASSERT(parse(shifted_locale_quote, &graph) == SHELL_DEP_EPARSE);
+  ASSERT(graph.status == SHELL_DEP_STATUS_ERROR && graph.node_count == 0 &&
+         graph.edge_count == 0);
+  pass_count++;
+}
+
 /* --- MAIN --- */
+
+TEST(ansi_nul_source_boundary) {
+  static const char *const rejected[] = {
+      "e$'val\\0x' 'printf bypass'",
+      "export $'POSIXLY_CORRECT\\0X'=1",
+      "printf $'a\\x00b'",
+      "printf $(printf $'a\\u0000b')",
+      "cat <<$'E\\0F'X\nbody\nEX\n",
+      "cat <<A <<$'E\\0F'X\nfirst\nA\nsecond\nEX\n",
+  };
+  for (size_t i = 0; i < sizeof(rejected) / sizeof(rejected[0]); i++) {
+    shell_dep_graph_t graph = {0};
+    ASSERT(parse(rejected[i], &graph) == SHELL_DEP_EPARSE);
+    ASSERT(graph.node_count == 0 && graph.edge_count == 0);
+  }
+  shell_dep_graph_t literal = {0};
+  ASSERT(parse("cat <<EOF\n$'a\\0b'\nEOF\n", &literal) == SHELL_DEP_OK);
+  ASSERT(shell_dep_graph_validate(&literal).valid);
+}
 
 int main(int argc, char **argv) {
   if (argc > 1 && strcmp(argv[1], "-v") == 0)
@@ -6429,17 +10338,43 @@ int main(int argc, char **argv) {
   RUN(structural_routing_regression_matrix);
   RUN(routing_feature_cross_product_matrix);
   RUN(dynamic_routing_parse_error_matrix);
+  RUN(nested_unsupported_syntax_fails_atomically);
 
   printf("\nRedirects:\n");
   RUN(redirect_matrix);
+  RUN(legacy_combined_output_redirects);
+  RUN(literal_brace_dynamic_redirect_paths);
   RUN(named_fd_redirect_topology);
+  RUN(named_fd_symbolic_duplication_routes);
+  RUN(named_fd_unconnected_process_substitution_routes);
+  RUN(named_fd_continuation_identity);
+  RUN(named_fd_exec_scope_and_lifecycle);
+  RUN(named_fd_group_execution_scopes);
+  RUN(named_fd_group_body_replay);
+  RUN(conditional_group_descriptor_replay);
+  RUN(named_fd_builtin_mutation_follows_own_redirects);
+  RUN(named_fd_builtin_redirect_operands);
+  RUN(backtick_command_boundaries);
+  RUN(named_fd_recursive_snapshot_timing);
+  RUN(group_entry_redirect_expansion_timing);
+  RUN(numeric_exec_descriptor_lifecycle);
+  RUN(static_builtin_descriptor_route_regressions);
+  RUN(quoted_named_fd_mutation_targets);
+  RUN(decoded_assignment_targets_and_env_docs);
+  RUN(printf_v_named_fd_option_contract);
+  RUN(named_fd_route_cross_product_matrix);
   RUN(named_fd_inline_documents_remain_live);
+  RUN(named_fd_retired_setup_documents);
   RUN(named_fd_requires_complete_word_boundary);
   RUN(redirect_only_command_boundary_ownership);
 
   printf("\nCWD Tracking:\n");
   RUN(cwd_matrix);
   RUN(cwd_decoded_operand_matrix);
+  RUN(cd_graph_visible_effects);
+  RUN(wrapper_cwd_semantics);
+  RUN(continued_process_substitution_topology);
+  RUN(continued_terminal_redirect_topology);
   RUN(composition_metadata_matrix);
   RUN(posix_brace_group_pipeline);
   RUN(pipeline_negation_metadata);
@@ -6447,6 +10382,8 @@ int main(int argc, char **argv) {
   RUN(compound_group_input_redirect_overrides_pipe);
   RUN(effective_descriptor_routing);
   RUN(sibling_brace_group_pipeline_endpoints);
+  RUN(static_file_identity_and_effective_group_pipe_routes);
+  RUN(effective_static_command_identity);
   RUN(nested_brace_group_pipeline_scope);
   RUN(internal_brace_group_pipeline_stays_internal);
   RUN(brace_group_redirect_list_scope);
@@ -6468,6 +10405,7 @@ int main(int argc, char **argv) {
 
   printf("\nEnvironment Variables:\n");
   RUN(environment_matrix);
+  RUN(export_graph_visible_effects);
 
   printf("\nFile Arguments:\n");
   RUN(file_argument_matrix);
@@ -6485,12 +10423,14 @@ int main(int argc, char **argv) {
   RUN(named_document_and_structural_stage_routing);
   RUN(heredoc_content_writer_contract);
   RUN(document_content_api_error_contract);
+  RUN(document_writer_overlap_contract);
   RUN(expandable_heredoc_substitution_matrix);
   RUN(heredoc_substitution_cross_product_matrix);
   RUN(group_heredoc_descriptor_substitution_routing);
   RUN(brace_group_substitution_boundary_matrix);
   RUN(brace_group_process_substitution_routing);
   RUN(process_substitution_stream_topology);
+  RUN(recursive_fd_import_survives_endpoint_pruning);
   RUN(composite_process_substitution_redirects);
   RUN(composite_redirect_group_metadata);
   RUN(substitution_descriptor_provenance);
@@ -6515,8 +10455,11 @@ int main(int argc, char **argv) {
   RUN(null_input);
   RUN(null_output);
   RUN(empty_input);
+  RUN(resolver_workspace_contract);
+  RUN(resolver_workspace_alias_contract);
   RUN(adversarial_limits);
   RUN(parse_error);
+  RUN(ansi_nul_source_boundary);
   RUN(dialect_boundary_matrix);
   RUN(nested_parse_error_matrix);
   RUN(limit_matrix);
@@ -6525,6 +10468,8 @@ int main(int argc, char **argv) {
   printf("\nGraph Integrity:\n");
   RUN(validation_matrix);
   RUN(validation_rejects_malformed_endpoint_metadata);
+  RUN(validation_rejects_malformed_named_fd_metadata);
+  RUN(validation_rejects_ambiguous_fd_open_forms);
   RUN(validation_rejects_corrupt_counts_documents_and_endpoint_shapes);
   RUN(validation_rejects_malformed_group_metadata);
   RUN(validation_defensive_diagnostics_matrix);

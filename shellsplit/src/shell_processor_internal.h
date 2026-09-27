@@ -28,8 +28,9 @@ void shell_anomaly_stages_free(shell_anomaly_stages_t *stages);
 
 /* Validate that complete source is representable by Shellsplit's semantic
  * command model. `parsed` is optional; when supplied it receives the strict
- * fast-parser result used for validation. The lexical-only flat API remains
- * intentionally tolerant and does not call this helper. */
+ * fast-parser result used for validation. The flat API uses this model for
+ * complete compound groups, then retains its intentionally tolerant lexical
+ * fallback for incomplete parenthesized input. */
 shell_process_status_t
 shell_process_validate_supported_source(const char *command_line,
                                         size_t command_length,
@@ -41,6 +42,37 @@ shell_process_validate_supported_source(const char *command_line,
 shell_process_status_t
 shell_process_cstring_allocation_size(size_t content_length,
                                       size_t *allocation_size);
+
+/* Classify a fully static duplication operand after shell quote decoding.
+ * This private helper is shared by the processed-command and dependency-graph
+ * layers so `>&\"7\"`, `>&$'7'`, and `>&\"-\"` retain Bash descriptor
+ * semantics instead of being confused with legacy combined-output paths. */
+typedef enum {
+  SHELL_PROCESS_FD_TARGET_PATH,
+  SHELL_PROCESS_FD_TARGET_FD,
+  SHELL_PROCESS_FD_TARGET_CLOSE,
+  SHELL_PROCESS_FD_TARGET_INVALID,
+} shell_process_fd_target_t;
+
+shell_process_fd_target_t
+shell_process_classify_static_fd_target(const char *text, size_t length,
+                                        uint32_t *fd);
+
+/* Bash overloads `>&word`: an ordinary pathname redirects both stdout and
+ * stderr, while a descriptor or `-` duplicates/closes stdout only. Keep this
+ * conservative classifier shared by group metadata and the depgraph. Direct
+ * process substitutions are pathnames in either direction. A decoded literal
+ * byte other than a digit or `-` proves that every expansion result is a
+ * pathname; otherwise unresolved words which could evaluate to either form
+ * are unsupported. */
+typedef enum {
+  SHELL_PROCESS_LEGACY_REDIRECT_PATH,
+  SHELL_PROCESS_LEGACY_REDIRECT_DUPLICATION,
+  SHELL_PROCESS_LEGACY_REDIRECT_UNSUPPORTED,
+} shell_process_legacy_redirect_target_t;
+
+shell_process_legacy_redirect_target_t
+shell_process_classify_legacy_output_target(const char *text, size_t length);
 
 /* Borrowed tokenizer records: token pointers and positions must refer to the
  * same source buffer, including gaps occupied by escaped line continuations.

@@ -582,6 +582,9 @@ struct shell_substitution_fuzz_case_t {
   uint32_t result_dynamic_consumer_count;
   uint32_t command_mapping_count;
   bool requires_substitution_evaluation;
+  /* A literal-looking parameter operand can have no shell execution stage.
+   * The feature bit is then an independent expectation, not a precondition. */
+  bool expected_shell_features = true;
   /* UINT32_MAX leaves the general stream forms unconstrained. Dynamic file
    * names set an exact count so an unflagged command-to-command edge cannot
    * accidentally satisfy their topology contract. */
@@ -602,6 +605,10 @@ struct shell_substitution_fuzz_case_t {
    * truncated graph remains structurally valid, but it is not a successful
    * parse or Shellgate evaluation. */
   bool depgraph_truncated;
+  bool depgraph_rejected;
+  /* Unsafe decoded source fails at semantic parsing, unlike graph-only
+   * rejection of an otherwise valid lexical command. */
+  bool source_rejected = false;
   /* Boundary redirects belong to GROUP rather than a member command. These
    * optional expectations let the Shellsplit fuzzer verify that ownership and
    * any surviving descriptor-specific pipe route exactly. */
@@ -635,7 +642,8 @@ struct shell_substitution_fuzz_case_t {
         heredoc_count(0), literal_heredoc_count(0), transient_heredoc_count(0),
         heredoc_substitution_count(0), herestring_count(0),
         herestring_substitution_count(0), depgraph_truncated(false),
-        group_substitution_owner(false), group_pipe_target_fd(UINT32_MAX) {}
+        depgraph_rejected(false), group_substitution_owner(false),
+        group_pipe_target_fd(UINT32_MAX) {}
 
   shell_substitution_fuzz_case_t(
       const char *command_value, uint32_t command_count_value,
@@ -667,12 +675,12 @@ struct shell_substitution_fuzz_case_t {
         transient_heredoc_count(transient_heredoc_count_value),
         heredoc_substitution_count(heredoc_substitution_count_value),
         herestring_count(0), herestring_substitution_count(0),
-        depgraph_truncated(false), group_substitution_owner(false),
-        group_pipe_target_fd(UINT32_MAX) {}
+        depgraph_truncated(false), depgraph_rejected(false),
+        group_substitution_owner(false), group_pipe_target_fd(UINT32_MAX) {}
 };
 
 enum {
-  SHELL_BRACE_FUZZ_SUBSTITUTION_CASE_COUNT = 69,
+  SHELL_BRACE_FUZZ_SUBSTITUTION_CASE_COUNT = 77,
   SHELL_BRACE_FUZZ_COMPOSED_SUBSTITUTION_CASE_COUNT = 48,
 };
 
@@ -1085,24 +1093,28 @@ shell_brace_fuzz_substitution_case(const uint8_t *data, size_t size) {
             0,
             1};
   case 27:
-    /* Closing fd 3 before duplicating it leaves this document transient, but
-     * its expansion remains a root-level dynamic-content requirement. */
-    return {"{ cat <&4; } 3<<EOF 3>&- 4<&3\n$(id)\nEOF",
-            2,
-            1,
-            0,
-            1,
-            0,
-            0,
-            0,
-            0,
-            true,
-            false,
-            1,
-            1,
-            0,
-            1,
-            1};
+    /* Duplicating fd 3 after closing it is an invalid descriptor route. */
+    {
+      shell_substitution_fuzz_case_t item = {
+          "{ cat <&4; } 3<<EOF 3>&- 4<&3\n$(id)\nEOF",
+          2,
+          1,
+          0,
+          1,
+          0,
+          0,
+          0,
+          0,
+          true,
+          false,
+          1,
+          1,
+          0,
+          1,
+          1};
+      item.depgraph_rejected = true;
+      return item;
+    }
   case 28:
     return {"cat <<A <<B <<C <<D <<E <<F <<G <<H\n"
             "one\nA\ntwo\nB\nthree\nC\nfour\nD\nfive\nE\nsix\nF\n"
@@ -1195,13 +1207,15 @@ shell_brace_fuzz_substitution_case(const uint8_t *data, size_t size) {
     return item;
   }
   case 35: {
+    /* The member's >&3 and the group's fd-3 output each contribute a WRITE
+     * into the same process-substitution endpoint. */
     shell_substitution_fuzz_case_t item = {"{ printf value >&3; } 3> >(cat)",
                                            2,
                                            1,
                                            1,
                                            1,
                                            0,
-                                           1,
+                                           2,
                                            1,
                                            0,
                                            false,
@@ -1561,6 +1575,83 @@ shell_brace_fuzz_substitution_case(const uint8_t *data, size_t size) {
     shell_substitution_fuzz_case_t item = {
         "{ cat; } >\"$(id)\"", 2, 1, 0, 1, 0, 0, 1, 0, false, false, 1};
     item.dynamic_name_substitution_count = 1;
+    return item;
+  }
+  case 69:
+  case 70: {
+    /* In an outer double-quoted parameter word, apostrophes still protect
+     * the closing brace but do not hide executable command substitutions. */
+    shell_substitution_fuzz_case_t item = {
+        shell_brace_fuzz_byte(data, size, 0) %
+                    SHELL_BRACE_FUZZ_SUBSTITUTION_CASE_COUNT ==
+                69
+            ? "echo \"${x:-'$(printf hi)'}\""
+            : "echo \"${x:-$'$(printf hi)'}\"",
+        2,
+        0,
+        0,
+        1,
+        0,
+        0,
+        1,
+        1,
+        true,
+        false,
+        1};
+    item.surface_command_count = 1;
+    return item;
+  }
+  case 71:
+  case 72: {
+    shell_substitution_fuzz_case_t item = {
+        shell_brace_fuzz_byte(data, size, 0) %
+                    SHELL_BRACE_FUZZ_SUBSTITUTION_CASE_COUNT ==
+                71
+            ? "echo \"${x/a/'$(printf hi)'}\""
+            : "echo \"${x:-$'\\\\$(printf hi)'}\"",
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        false,
+        false,
+        1};
+    item.surface_command_count = 1;
+    item.expected_shell_features = false;
+    return item;
+  }
+  case 73:
+  case 74:
+  case 75: {
+    const uint8_t selector = shell_brace_fuzz_byte(data, size, 0) %
+                             SHELL_BRACE_FUZZ_SUBSTITUTION_CASE_COUNT;
+    shell_substitution_fuzz_case_t item = {
+        selector == 73   ? "echo \"${x:-$'$(printf\\x20X)'}\""
+        : selector == 74 ? "echo \"${x:-$'\\\\'$(printf X)}\""
+                         : "echo \"${x:-$'\\\"$(printf X)'}\"",
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        false,
+        false,
+        1};
+    item.source_rejected = true;
+    return item;
+  }
+  case 76: {
+    shell_substitution_fuzz_case_t item = {
+        "echo \"${x:-$'\\x3c'}\"", 1, 0, 0, 0, 0, 0, 0, 0, false, false, 1};
+    item.surface_command_count = 1;
+    item.expected_shell_features = false;
     return item;
   }
   default: {

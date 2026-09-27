@@ -140,7 +140,12 @@ shell_error_t shell_interop_format_features(uint32_t features, char *output,
                {SHELL_FEAT_SUBSHELL_FILE, "SUBSHELL_FILE"},
                {SHELL_FEAT_PIPELINE, "PIPELINE"},
                {SHELL_FEAT_GROUP, "GROUP"},
-               {SHELL_FEAT_BACKGROUND, "BACKGROUND"}};
+               {SHELL_FEAT_BACKGROUND, "BACKGROUND"},
+               {SHELL_FEAT_EXTGLOB, "EXTGLOB"},
+               {SHELL_FEAT_ANSI_C_QUOTE, "ANSI_C_QUOTE"},
+               {SHELL_FEAT_ARRAY, "ARRAY"},
+               {SHELL_FEAT_NAMED_FD, "NAMED_FD"},
+               {SHELL_FEAT_COMBINED_REDIRECT, "COMBINED_REDIRECT"}};
   if (written)
     *written = 0;
   if (!output || output_size == 0 || !written)

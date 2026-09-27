@@ -14,4 +14,13 @@ sg_anomaly_status_t sg_anomaly_netseq_count(const char *netseq, size_t length,
                                             bool enforce_item_limit,
                                             size_t *count);
 
+/* Learn matching raw and type sequences as one transaction. Their outer stage
+ * counts must agree. If either model cannot accept the sample, neither retains
+ * any of its learned counts. `raw`
+ * and `type` must be distinct when both are non-NULL; a NULL type model
+ * selects the single-model form used by compatibility callers. */
+sg_anomaly_status_t sg_anomaly_models_update_netseq_pair(
+    sg_anomaly_model_t *raw, const char *raw_netseq, size_t raw_length,
+    sg_anomaly_model_t *type, const char *type_netseq, size_t type_length);
+
 #endif

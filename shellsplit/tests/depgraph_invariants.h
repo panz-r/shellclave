@@ -75,17 +75,15 @@ static bool shellsplit_test_edge_types_match(const shell_dep_graph_t *graph,
            (to != SHELL_NODE_GROUP ||
             graph->nodes[edge->to].group.parent == edge->from);
   case SHELL_EDGE_FD_OPEN:
-    return (((from == SHELL_NODE_CMD || from == SHELL_NODE_GROUP) &&
-             to == SHELL_NODE_DOC && edge->source_fd != SHELL_DEP_FD_NONE &&
-             edge->target_fd == SHELL_DEP_FD_NONE) ||
-            (from == SHELL_NODE_DOC &&
-             (to == SHELL_NODE_CMD || to == SHELL_NODE_GROUP) &&
-             edge->source_fd == SHELL_DEP_FD_NONE &&
-             edge->target_fd != SHELL_DEP_FD_NONE)) &&
-           (((edge->flags & SHELL_DEP_EDGE_FLAG_FD_OPEN_APPEND) == 0) ||
-            ((from == SHELL_NODE_CMD || from == SHELL_NODE_GROUP) &&
-             to == SHELL_NODE_DOC && edge->source_fd != SHELL_DEP_FD_NONE &&
-             edge->target_fd == SHELL_DEP_FD_NONE)) &&
+    /* shell_dep_graph_validate() runs before this helper.  Keep FD_OPEN's
+     * deliberately detailed setup grammar in that single production oracle
+     * instead of maintaining a second, fuzz-only copy that can drift. */
+    return true;
+  case SHELL_EDGE_FD_CLOSE:
+    return (from == SHELL_NODE_CMD || from == SHELL_NODE_GROUP) && from == to &&
+           edge->from == edge->to && edge->source_fd != SHELL_DEP_FD_NONE &&
+           edge->target_fd == SHELL_DEP_FD_NONE &&
+           edge->flags == SHELL_DEP_EDGE_FLAG_NONE &&
            edge->dir == SHELL_DIR_FORWARD;
   }
   return false;
@@ -139,12 +137,14 @@ static bool shellsplit_test_depgraph_invariants(
     max_cwd = SHELL_DEP_CWD_BUF_SIZE;
 
   if (error != SHELL_DEP_OK && error != SHELL_DEP_EINPUT &&
-      error != SHELL_DEP_ETRUNC && error != SHELL_DEP_EPARSE)
+      error != SHELL_DEP_ETRUNC && error != SHELL_DEP_EPARSE &&
+      error != SHELL_DEP_EWORKSPACE)
     return false;
   if ((error == SHELL_DEP_OK && graph->status != SHELL_DEP_STATUS_OK) ||
       (error == SHELL_DEP_ETRUNC &&
        !(graph->status & SHELL_DEP_STATUS_TRUNCATED)) ||
-      ((error == SHELL_DEP_EINPUT || error == SHELL_DEP_EPARSE) &&
+      ((error == SHELL_DEP_EINPUT || error == SHELL_DEP_EPARSE ||
+        error == SHELL_DEP_EWORKSPACE) &&
        graph->status != SHELL_DEP_STATUS_ERROR) ||
       graph->node_count > max_nodes || graph->edge_count > max_edges ||
       graph->cwd_buf.len > max_cwd ||
@@ -152,7 +152,8 @@ static bool shellsplit_test_depgraph_invariants(
        graph->cwd_buf.data[graph->cwd_buf.len - 1] != '\0'))
     return false;
 
-  if (error == SHELL_DEP_EINPUT || error == SHELL_DEP_EPARSE)
+  if (error == SHELL_DEP_EINPUT || error == SHELL_DEP_EPARSE ||
+      error == SHELL_DEP_EWORKSPACE)
     return graph->node_count == 0 && graph->edge_count == 0;
   if (!shell_dep_graph_validate(graph).valid)
     return false;
@@ -160,10 +161,11 @@ static bool shellsplit_test_depgraph_invariants(
   for (uint32_t i = 0; i < graph->edge_count; i++) {
     const shell_dep_edge_t *edge = &graph->edges[i];
     if (edge->from >= graph->node_count || edge->to >= graph->node_count ||
-        edge->type > SHELL_EDGE_FD_OPEN || edge->dir > SHELL_DIR_UNDIR ||
+        edge->type > SHELL_EDGE_FD_CLOSE || edge->dir > SHELL_DIR_UNDIR ||
         (edge->flags & ~(SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD |
                          SHELL_DEP_EDGE_FLAG_SUBST_DYNAMIC_NAME |
-                         SHELL_DEP_EDGE_FLAG_FD_OPEN_APPEND)) != 0 ||
+                         SHELL_DEP_EDGE_FLAG_FD_OPEN_APPEND |
+                         SHELL_DEP_EDGE_FLAG_FD_OPEN_DUP)) != 0 ||
         ((edge->flags & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0 &&
          (edge->flags & SHELL_DEP_EDGE_FLAG_SUBST_DYNAMIC_NAME) != 0) ||
         ((edge->flags & (SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD |
@@ -171,6 +173,12 @@ static bool shellsplit_test_depgraph_invariants(
          edge->type != SHELL_EDGE_SUBST) ||
         ((edge->flags & SHELL_DEP_EDGE_FLAG_FD_OPEN_APPEND) != 0 &&
          edge->type != SHELL_EDGE_FD_OPEN) ||
+        ((edge->flags & SHELL_DEP_EDGE_FLAG_FD_OPEN_DUP) != 0 &&
+         edge->type != SHELL_EDGE_FD_OPEN) ||
+        !shellsplit_test_span_in_input(input, length, edge->source_fd_name,
+                                       edge->source_fd_name_len) ||
+        !shellsplit_test_span_in_input(input, length, edge->target_fd_name,
+                                       edge->target_fd_name_len) ||
         !shellsplit_test_edge_types_match(graph, edge))
       return false;
   }

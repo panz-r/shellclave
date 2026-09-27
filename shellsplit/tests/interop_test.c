@@ -104,7 +104,7 @@ static void test_failures_clear_state(void) {
 }
 
 static void test_formatters(void) {
-  char buffer[128];
+  char buffer[256];
   size_t written = 0;
   CHECK(shell_interop_format_features(SHELL_FEAT_VARS | SHELL_FEAT_GLOBS,
                                       buffer, sizeof(buffer),
@@ -156,10 +156,35 @@ static void test_formatters(void) {
       SHELL_FEAT_ARITH | SHELL_FEAT_HEREDOC | SHELL_FEAT_HERESTRING |
       SHELL_FEAT_PROCESS_SUB | SHELL_FEAT_LOOPS | SHELL_FEAT_CONDITIONALS |
       SHELL_FEAT_CASE | SHELL_FEAT_SUBSHELL_FILE | SHELL_FEAT_PIPELINE |
-      SHELL_FEAT_GROUP | SHELL_FEAT_BACKGROUND;
+      SHELL_FEAT_GROUP | SHELL_FEAT_BACKGROUND | SHELL_FEAT_EXTGLOB |
+      SHELL_FEAT_ANSI_C_QUOTE | SHELL_FEAT_ARRAY | SHELL_FEAT_NAMED_FD |
+      SHELL_FEAT_COMBINED_REDIRECT;
   CHECK(shell_interop_format_features(all_features, buffer, sizeof(buffer),
                                       &written) == SHELL_OK);
-  CHECK(written == strlen(buffer) && strstr(buffer, "BACKGROUND") != NULL);
+  CHECK(written == strlen(buffer) &&
+        strcmp(buffer,
+               "VAR GLOB SUBSHELL ARITH HEREDOC HERESTRING PROCSUB LOOPS "
+               "COND CASE SUBSHELL_FILE PIPELINE GROUP BACKGROUND EXTGLOB "
+               "ANSI_C_QUOTE ARRAY NAMED_FD COMBINED_REDIRECT") == 0);
+
+  static const struct {
+    uint32_t feature;
+    const char *name;
+  } individual_features[] = {
+      {SHELL_FEAT_BACKGROUND, "BACKGROUND"},
+      {SHELL_FEAT_EXTGLOB, "EXTGLOB"},
+      {SHELL_FEAT_ANSI_C_QUOTE, "ANSI_C_QUOTE"},
+      {SHELL_FEAT_ARRAY, "ARRAY"},
+      {SHELL_FEAT_NAMED_FD, "NAMED_FD"},
+      {SHELL_FEAT_COMBINED_REDIRECT, "COMBINED_REDIRECT"},
+  };
+  for (size_t i = 0;
+       i < sizeof(individual_features) / sizeof(individual_features[0]); i++) {
+    CHECK(shell_interop_format_features(individual_features[i].feature, buffer,
+                                        sizeof(buffer), &written) == SHELL_OK);
+    CHECK(written == strlen(individual_features[i].name) &&
+          strcmp(buffer, individual_features[i].name) == 0);
+  }
 }
 
 static void test_allocation_boundaries(void) {

@@ -1,4 +1,5 @@
 #define _POSIX_C_SOURCE 200809L
+#include <ctype.h>
 #include <errno.h>
 #include <inttypes.h>
 #include <limits.h>
@@ -87,6 +88,22 @@ static bool validate_metadata(const shell_ast_t *ast, uint32_t *types) {
     return false;
   *types |= node_types;
   return true;
+}
+
+/* The canonical boundary accepts only static numeric arithmetic. Bash resolves
+ * identifiers recursively, so even a syntactically harmless `x - y` can read
+ * values which become arithmetic program text at execution time. Keep this
+ * generator oracle independent from the semantic gate under test. */
+static bool ast_has_dynamic_arithmetic(const ast_node_t *node) {
+  if (!node)
+    return false;
+  if (node->type == AST_ARITHMETIC && node->value) {
+    for (const unsigned char *p = (const unsigned char *)node->value; *p; p++)
+      if (!isdigit(*p) && !isspace(*p) && !strchr("()+-*/%<>&|^!~?:,=", *p))
+        return true;
+  }
+  return ast_has_dynamic_arithmetic(node->child) ||
+         ast_has_dynamic_arithmetic(node->next);
 }
 
 static bool seed_zero_is_stable(void) {
@@ -398,8 +415,9 @@ int main(int argc, char **argv) {
     }
 
     bool expects_success = shell_ast_expects_parse_success(ast);
-    bool expects_canonical_success = expects_success && !ast->has_case &&
-                                     !ast->has_loops && !ast->has_conditionals;
+    bool expects_canonical_success =
+        expects_success && !ast->has_case && !ast->has_loops &&
+        !ast->has_conditionals && !ast_has_dynamic_arithmetic(ast->root);
 
     int result = verify_command(buffer, cmd_len, expects_success,
                                 expects_canonical_success);

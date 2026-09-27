@@ -53,9 +53,10 @@ typedef enum {
 /* --- ERROR STATE --- */
 
 /*
- * Returns true if the model encountered an allocation failure
- * (e.g., strdup returned NULL) during an update operation.
- * Call sg_anomaly_model_clear_error() to reset.
+ * Returns true if the model encountered an allocation failure. This is a
+ * sticky diagnostic, not an unusable-model state: failure-atomic updates may
+ * be retried without clearing it. Call sg_anomaly_model_clear_error() after
+ * observing the diagnostic to reset it.
  */
 bool sg_anomaly_model_had_error(const sg_anomaly_model_t *model);
 

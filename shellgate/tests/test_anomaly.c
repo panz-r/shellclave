@@ -1146,6 +1146,102 @@ TEST(canonical_netseq_allocation_failures) {
   sg_anomaly_model_free(probe);
 }
 
+TEST(paired_netseq_updates_are_failure_atomic) {
+  static const char raw_baseline[] = "4:base,";
+  static const char type_baseline[] = "4:WORD,";
+  static const char raw_update[] = "5:alpha,4:beta,5:gamma,";
+  static const char type_update[] = "3:CMD,3:CMD,3:CMD,";
+
+  sg_anomaly_model_t *raw_probe = sg_anomaly_model_new();
+  sg_anomaly_model_t *type_probe = sg_anomaly_model_new();
+  ASSERT(raw_probe != NULL && type_probe != NULL);
+  sg_test_anomaly_op_reset();
+  ASSERT_EQ_INT(sg_anomaly_models_update_netseq_pair(
+                    raw_probe, raw_update, sizeof(raw_update) - 1, type_probe,
+                    type_update, sizeof(type_update) - 1),
+                SG_ANOMALY_OK);
+  size_t operation_count = sg_test_anomaly_op_count();
+  sg_test_anomaly_op_reset();
+  ASSERT(operation_count > 1);
+  sg_anomaly_model_free(type_probe);
+  sg_anomaly_model_free(raw_probe);
+
+  /* An operation may fail in either half of the paired transaction. Each
+   * iteration starts with retained learning, then verifies that every count
+   * and the scoring result survive rollback unchanged. */
+  for (size_t fail_at = 1; fail_at <= operation_count; fail_at++) {
+    sg_anomaly_model_t *raw = sg_anomaly_model_new();
+    sg_anomaly_model_t *type = sg_anomaly_model_new();
+    ASSERT(raw != NULL && type != NULL);
+    ASSERT_EQ_INT(sg_anomaly_models_update_netseq_pair(
+                      raw, raw_baseline, sizeof(raw_baseline) - 1, type,
+                      type_baseline, sizeof(type_baseline) - 1),
+                  SG_ANOMALY_OK);
+    anomaly_snapshot_t raw_before = snapshot_model(raw);
+    anomaly_snapshot_t type_before = snapshot_model(type);
+
+    sg_test_anomaly_op_fail_at(fail_at);
+    ASSERT_EQ_INT(sg_anomaly_models_update_netseq_pair(
+                      raw, raw_update, sizeof(raw_update) - 1, type,
+                      type_update, sizeof(type_update) - 1),
+                  SG_ANOMALY_ERR_MEMORY);
+    sg_test_anomaly_op_reset();
+    ASSERT(snapshot_equal(raw_before, snapshot_model(raw)));
+    ASSERT(snapshot_equal(type_before, snapshot_model(type)));
+    /* The error diagnostic remains sticky, but a rolled-back model is not
+     * poisoned: the next paired update succeeds without clearing it. */
+    ASSERT(sg_anomaly_model_had_error(raw) || sg_anomaly_model_had_error(type));
+    ASSERT_EQ_INT(sg_anomaly_models_update_netseq_pair(
+                      raw, raw_update, sizeof(raw_update) - 1, type,
+                      type_update, sizeof(type_update) - 1),
+                  SG_ANOMALY_OK);
+    ASSERT_EQ_INT(sg_anomaly_model_total_unigrams(raw), 4);
+    ASSERT_EQ_INT(sg_anomaly_model_total_unigrams(type), 4);
+    sg_anomaly_model_clear_error(raw);
+    sg_anomaly_model_clear_error(type);
+    ASSERT(!sg_anomaly_model_had_error(raw) &&
+           !sg_anomaly_model_had_error(type));
+    sg_anomaly_model_free(type);
+    sg_anomaly_model_free(raw);
+  }
+
+  /* Validation is completed for both sequences before either table changes. */
+  sg_anomaly_model_t *raw = sg_anomaly_model_new();
+  sg_anomaly_model_t *type = sg_anomaly_model_new();
+  ASSERT(raw != NULL && type != NULL);
+  ASSERT_EQ_INT(sg_anomaly_models_update_netseq_pair(
+                    raw, raw_baseline, sizeof(raw_baseline) - 1, type,
+                    type_baseline, sizeof(type_baseline) - 1),
+                SG_ANOMALY_OK);
+  anomaly_snapshot_t raw_before = snapshot_model(raw);
+  anomaly_snapshot_t type_before = snapshot_model(type);
+  ASSERT_EQ_INT(sg_anomaly_models_update_netseq_pair(
+                    raw, raw_update, sizeof(raw_update) - 1, type, "01:x,",
+                    sizeof("01:x,") - 1),
+                SG_ANOMALY_ERR_FORMAT);
+  ASSERT(snapshot_equal(raw_before, snapshot_model(raw)));
+  ASSERT(snapshot_equal(type_before, snapshot_model(type)));
+  ASSERT_EQ_INT(sg_anomaly_models_update_netseq_pair(
+                    raw, raw_update, sizeof(raw_update) - 1, type,
+                    type_baseline, sizeof(type_baseline) - 1),
+                SG_ANOMALY_ERR_FORMAT);
+  ASSERT(snapshot_equal(raw_before, snapshot_model(raw)));
+  ASSERT(snapshot_equal(type_before, snapshot_model(type)));
+  ASSERT_EQ_INT(sg_anomaly_models_update_netseq_pair(
+                    raw, raw_baseline, sizeof(raw_baseline) - 1, type,
+                    type_update, sizeof(type_update) - 1),
+                SG_ANOMALY_ERR_FORMAT);
+  ASSERT(snapshot_equal(raw_before, snapshot_model(raw)));
+  ASSERT(snapshot_equal(type_before, snapshot_model(type)));
+  ASSERT_EQ_INT(sg_anomaly_models_update_netseq_pair(
+                    raw, raw_update, sizeof(raw_update) - 1, raw, type_update,
+                    sizeof(type_update) - 1),
+                SG_ANOMALY_ERR_INVALID);
+  ASSERT(snapshot_equal(raw_before, snapshot_model(raw)));
+  sg_anomaly_model_free(type);
+  sg_anomaly_model_free(raw);
+}
+
 int main(void) {
   atexit(cleanup_anomaly_temp_file);
   printf("sg_anomaly unit tests\n");
@@ -1165,6 +1261,7 @@ int main(void) {
   RUN(binary_netseq_persistence);
   RUN(empty_stage_persistence_and_legacy_loading);
   RUN(canonical_netseq_allocation_failures);
+  RUN(paired_netseq_updates_are_failure_atomic);
   printf("\n%d passed, %d failed\n", pass_count, fail_count);
   return fail_count > 0 ? 1 : 0;
 }

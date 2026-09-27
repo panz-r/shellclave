@@ -43,17 +43,19 @@ shell_process_status_t shell_build_netargv_sequence_buffer(
 
 /* Build one canonical netstring record per supported simple-command execution
  * stage. This includes stages reached through command substitutions,
- * backticks, process substitutions, unquoted heredoc expansion bodies, and
- * arithmetic command substitutions. Nested stages precede their enclosing
+ * backticks, process substitutions, and unquoted heredoc expansion bodies.
+ * Dynamic or mutating arithmetic is rejected before stage collection. Nested
+ * stages precede their enclosing
  * command; sibling stages retain source order. This is deterministic analysis
  * order, not a claim about runtime scheduling. An argv-less redirect-only
  * stage is represented by one empty record: its empty payload is the
  * anomaly-only sentinel argv[0]. This is not a netargv transport and must
  * never be used to authorize execution. All executable stages retain their
  * decoded executable-name records.
- * Control compounds, function declarations, array semantics, and unmodeled
- * Bash `[[ … ]]`, `(( … ))`, `time`, `$"…"`, and `;&` / `;;&` forms are
- * rejected with SHELL_PROCESS_EPARSE. The caller owns
+ * Control compounds, function declarations, array semantics, dynamic or
+ * mutating arithmetic, and unmodeled Bash `[[ … ]]`, `(( … ))`, `time`,
+ * `$"…"`, and `;&` / `;;&` forms are rejected with SHELL_PROCESS_EPARSE. The
+ * caller owns
  * *command_netseq and releases it
  * with free(). This legacy C-string form rejects a canonical payload
  * containing NUL; use shell_build_command_netseq_buffer() for lossless
@@ -123,8 +125,9 @@ shell_build_anomaly_netseqs(const char *command_line, size_t command_length,
                             size_t *subcommand_count);
 
 /* Byte-buffer form of shell_build_anomaly_netseqs(). Both outer netsequences
- * are canonical binary data: an ANSI-C quoted executable may contain a NUL,
- * so callers must use the returned lengths rather than strlen(). `command` and
+ * are canonical binary data and callers must use returned lengths rather than
+ * strlen(). Complete-command processing rejects NUL-producing ANSI-C source
+ * by default; this representation remains binary-capable. `command` and
  * `type` must point to distinct, empty buffers (initialized to {0} or released
  * with shell_netstring_buffer_free()). Both are empty on failure. A populated
  * or inconsistent output is rejected without modification. Release each
