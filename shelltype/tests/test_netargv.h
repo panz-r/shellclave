@@ -93,7 +93,7 @@ static inline st_error_t test_st_classify(const char *command,
                                           st_token_array_t *out) {
   char *encoded = test_netargv(command);
   if (!encoded)
-    return command ? ST_ERR_MEMORY : st_netargv_classify(NULL, out);
+    return ST_ERR_MEMORY;
   st_error_t error = st_netargv_classify(encoded, out);
   free(encoded);
   return error;
@@ -103,7 +103,7 @@ static inline st_error_t test_st_feed(st_learner_t *learner,
                                       const char *command) {
   char *encoded = test_netargv(command);
   if (!encoded)
-    return command ? ST_ERR_MEMORY : st_learner_feed_netargv(learner, NULL);
+    return ST_ERR_MEMORY;
   st_error_t error = st_learner_feed_netargv(learner, encoded);
   free(encoded);
   return error;
@@ -114,7 +114,7 @@ static inline st_error_t test_st_policy_eval(st_policy_t *policy,
                                              st_eval_result_t *result) {
   char *encoded = test_netargv(command);
   if (!encoded)
-    return command ? ST_ERR_MEMORY : st_policy_eval(policy, NULL, result);
+    return ST_ERR_MEMORY;
   st_error_t error = st_policy_eval(policy, encoded, result);
   free(encoded);
   return error;
@@ -124,7 +124,7 @@ static inline st_error_t
 test_st_policy_match(st_policy_t *policy, const char *command, bool *matches) {
   char *encoded = test_netargv(command);
   if (!encoded)
-    return command ? ST_ERR_MEMORY : st_policy_match(policy, NULL, matches);
+    return ST_ERR_MEMORY;
   st_error_t error = st_policy_match(policy, encoded, matches);
   free(encoded);
   return error;
@@ -143,14 +143,6 @@ test_st_policy_verify_all(const st_policy_t *policy, const char *command,
     return ST_ERR_MEMORY;
   st_netpattern_view_t *views = NULL;
   size_t count = 0;
-  if (!matching_patterns || !match_count) {
-    st_error_t error =
-        st_policy_verify_all(policy, encoded, matching_patterns ? &views : NULL,
-                             match_count ? &count : NULL);
-    free(encoded);
-    st_policy_matches_free(views);
-    return error;
-  }
   st_error_t error = st_policy_verify_all(policy, encoded, &views, &count);
   free(encoded);
   if (error != ST_OK)
@@ -192,7 +184,7 @@ static inline st_error_t test_st_policy_add(st_policy_t *policy,
   char *pattern = NULL;
   st_error_t error = st_netpattern_from_cpl(cpl, &pattern);
   if (error != ST_OK)
-    return cpl ? error : st_policy_add_netpattern(policy, NULL);
+    return error;
   error = st_policy_add_netpattern(policy, pattern);
   free(pattern);
   return error;
@@ -209,7 +201,7 @@ static inline st_error_t test_st_policy_remove(st_policy_t *policy,
   char *pattern = NULL;
   st_error_t error = st_netpattern_from_cpl(cpl, &pattern);
   if (error != ST_OK)
-    return cpl ? error : st_policy_remove_netpattern(policy, NULL);
+    return error;
   error = st_policy_remove_netpattern(policy, pattern);
   free(pattern);
   return error;
@@ -239,14 +231,12 @@ test_st_policy_batch_add(st_policy_t *policy, const char **cpl, size_t count) {
 }
 
 static inline st_error_t test_st_validate_pattern(const char *cpl,
-                                                  st_pattern_info_t *info) {
-  if (info)
-    memset(info, 0, sizeof(*info));
+                                                  st_token_array_t *tokens) {
   char *pattern = NULL;
   st_error_t error = st_netpattern_from_cpl(cpl, &pattern);
   if (error != ST_OK)
-    return cpl ? error : st_netpattern_validate(NULL, info);
-  error = st_netpattern_validate(pattern, info);
+    return error;
+  error = st_netpattern_validate(pattern, tokens);
   free(pattern);
   return error;
 }

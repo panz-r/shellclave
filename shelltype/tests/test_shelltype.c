@@ -1,12 +1,15 @@
 /* Core unit tests for the command policy learner. */
 
 #define _POSIX_C_SOURCE 200809L
+#include "../../tests/atomic_file_fixture.h"
 #include "crc32.h"
 #include "shelltype.h"
 #include "test_allocator.h"
 #include "test_io.h"
 #include "test_netargv.h"
 #include "trie_internal.h"
+#include <errno.h>
+#include <fcntl.h>
 #include <glob.h>
 #include <math.h>
 #include <stdio.h>
@@ -33,11 +36,24 @@ static int pattern_is_cpl(const char *actual, const char *cpl) {
   return equal;
 }
 static char learner_temp_path[256];
+static char learner_template_path[264];
+static char learner_save_directory[256];
 
 static void cleanup_learner_temp_file(void) {
+  if (learner_template_path[0] != '\0') {
+    (void)unlink(learner_template_path);
+    learner_template_path[0] = '\0';
+  }
   if (learner_temp_path[0] != '\0') {
     (void)unlink(learner_temp_path);
     learner_temp_path[0] = '\0';
+  }
+  if (learner_save_directory[0]) {
+    char path[272];
+    snprintf(path, sizeof(path), "%s/learner", learner_save_directory);
+    (void)test_atomic_temp_files(path, true);
+    (void)rmdir(learner_save_directory);
+    learner_save_directory[0] = '\0';
   }
 }
 
@@ -108,24 +124,11 @@ static st_learner_t *baseline_learner(void) {
 }
 
 static int no_learner_save_temps(const char *path) {
-  char pattern[512];
-  glob_t matches = {0};
-  if (snprintf(pattern, sizeof(pattern), "%s.*", path) < 0)
-    return 0;
-  int result = glob(pattern, 0, NULL, &matches);
-  globfree(&matches);
-  return result == GLOB_NOMATCH;
+  return test_atomic_temp_files(path, false);
 }
 
 static void remove_learner_save_temps(const char *path) {
-  char pattern[512];
-  glob_t matches = {0};
-  if (snprintf(pattern, sizeof(pattern), "%s.*", path) < 0)
-    return;
-  if (glob(pattern, 0, NULL, &matches) == 0)
-    for (size_t i = 0; i < matches.gl_pathc; i++)
-      (void)unlink(matches.gl_pathv[i]);
-  globfree(&matches);
+  (void)test_atomic_temp_files(path, true);
 }
 
 static int test_feed_is_atomic(void) {
@@ -230,6 +233,83 @@ static int test_feed_netargv_avoids_classifier_allocations(void) {
   return 1;
 }
 
+static int test_borrowed_binary_feed_is_atomic(void) {
+  static const char frame[] = "4:echo,3:a\0b,";
+  char *exact = malloc(sizeof(frame) - 1);
+  ASSERT(exact != NULL);
+  memcpy(exact, frame, sizeof(frame) - 1);
+  st_netargv_view_t view = {exact, sizeof(frame) - 1};
+  st_test_alloc_reset();
+  st_learner_t *probe = baseline_learner();
+  ASSERT(probe != NULL);
+  st_test_alloc_reset();
+  ASSERT(st_learner_feed_netargv_view(probe, view) == ST_OK);
+  size_t allocations = st_test_alloc_count();
+  st_learner_free(probe);
+  ASSERT(allocations > 0);
+  for (size_t fail_at = 1; fail_at <= allocations; fail_at++) {
+    st_test_alloc_reset();
+    st_learner_t *expected = baseline_learner();
+    st_learner_t *actual = baseline_learner();
+    ASSERT(expected && actual);
+    st_test_alloc_fail_at(fail_at);
+    st_error_t error = st_learner_feed_netargv_view(actual, view);
+    st_test_alloc_reset();
+    ASSERT(error == ST_ERR_MEMORY);
+    ASSERT(actual->trie.total_commands == expected->trie.total_commands &&
+           nodes_equal(actual->trie.root, expected->trie.root));
+    st_learner_free(expected);
+    st_learner_free(actual);
+  }
+  free(exact);
+  return 1;
+}
+
+static int test_timestamp_metadata_feed_is_atomic(void) {
+  static const char initial[] = "4:tool,20:2026-10-05T12:34:56Z,3:old,";
+  static const char *const incoming[] = {
+      "4:tool,20:2026-10-05t12:34:56Z,2:42,",
+      "4:tool,10:2026-10-05,2:42,",
+      "4:tool,8:12:34:56,2:42,",
+  };
+  for (size_t i = 0; i < sizeof(incoming) / sizeof(incoming[0]); i++) {
+    size_t length = strlen(incoming[i]);
+    char *exact = malloc(length);
+    ASSERT(exact != NULL);
+    memcpy(exact, incoming[i], length);
+    st_netargv_view_t view = {exact, length};
+    st_test_alloc_reset();
+    st_learner_t *probe = baseline_learner();
+    ASSERT(probe != NULL && st_learner_feed_netargv(probe, initial) == ST_OK);
+    st_test_alloc_reset();
+    ASSERT(st_learner_feed_netargv_view(probe, view) == ST_OK);
+    size_t allocations = st_test_alloc_count();
+    st_learner_free(probe);
+    ASSERT(allocations > 0);
+    for (size_t fail_at = 1; fail_at <= allocations; fail_at++) {
+      st_test_alloc_reset();
+      st_learner_t *expected = baseline_learner();
+      st_learner_t *actual = baseline_learner();
+      ASSERT(expected != NULL && actual != NULL);
+      ASSERT(st_learner_feed_netargv(expected, initial) == ST_OK &&
+             st_learner_feed_netargv(actual, initial) == ST_OK);
+      st_test_alloc_fail_at(fail_at);
+      st_error_t error = st_learner_feed_netargv_view(actual, view);
+      st_test_alloc_reset();
+      /* Insertion changes the existing timestamp bucket before allocating
+       * its new continuation. Both common and mixed evidence must roll back
+       * when any later allocation fails. */
+      ASSERT(error == ST_ERR_MEMORY);
+      ASSERT(actual->trie.total_commands == expected->trie.total_commands &&
+             nodes_equal(actual->trie.root, expected->trie.root));
+      st_learner_free(expected);
+      st_learner_free(actual);
+    }
+    free(exact);
+  }
+  return 1;
+}
+
 static int test_expressive_literal_suggestions(void) {
   static const struct {
     const char *command;
@@ -328,14 +408,11 @@ static int test_learner_state_transitions(void) {
 static int test_learner_input_boundaries(void) {
   st_learner_t *learner = baseline_learner();
   ASSERT(learner != NULL);
-  ASSERT(test_st_feed(learner, NULL) == ST_ERR_INVALID);
   ASSERT(test_st_feed(learner, "") == ST_ERR_INVALID);
   ASSERT(test_st_feed(learner, "   ") == ST_ERR_INVALID);
 
   st_token_array_t empty_tokens = {0};
   ASSERT(st_learner_feed_tokens(learner, &empty_tokens) == ST_ERR_INVALID);
-  ASSERT(st_learner_feed_tokens(NULL, &empty_tokens) == ST_ERR_INVALID);
-  ASSERT(st_learner_feed_tokens(learner, NULL) == ST_ERR_INVALID);
 
   char many[(ST_MAX_CMD_TOKENS + 1) * 2 + 1];
   size_t used = 0;
@@ -355,16 +432,7 @@ static int test_learner_input_boundaries(void) {
   size_t count = 17;
   ASSERT(st_learner_suggest(empty, &count) == NULL && count == 0);
   count = 17;
-  ASSERT(st_learner_suggest(NULL, &count) == NULL && count == 0);
-  ASSERT(st_learner_suggest(empty, NULL) == NULL);
-  ASSERT(test_st_blacklist_add(NULL, "pattern") == ST_ERR_INVALID);
-  ASSERT(test_st_blacklist_add(learner, NULL) == ST_ERR_INVALID);
-  ASSERT(!test_st_is_blacklisted(NULL, "pattern"));
-  ASSERT(!test_st_is_blacklisted(learner, NULL));
-  ASSERT(st_learner_save(NULL, "/tmp/unused") == ST_ERR_INVALID);
-  ASSERT(st_learner_save(learner, NULL) == ST_ERR_INVALID);
-  ASSERT(st_learner_load(NULL, "/tmp/unused") == ST_ERR_INVALID);
-  ASSERT(st_learner_load(learner, NULL) == ST_ERR_INVALID);
+
   st_learner_free(empty);
   st_learner_free(learner);
   return 1;
@@ -412,9 +480,6 @@ static int test_learner_configuration_boundaries(void) {
 static int test_learner_stats_contract(void) {
   st_learner_stats_t stats = {.command_count = UINT32_MAX,
                               .blacklist_count = SIZE_MAX};
-  st_learner_get_stats(NULL, &stats);
-  ASSERT(stats.command_count == 0 && stats.blacklist_count == 0);
-  st_learner_get_stats(NULL, NULL);
 
   st_learner_t *learner = st_learner_new(NULL);
   ASSERT(learner != NULL);
@@ -425,12 +490,11 @@ static int test_learner_stats_contract(void) {
   ASSERT(test_st_blacklist_add(learner, "echo *") == ST_OK);
   st_learner_get_stats(learner, &stats);
   ASSERT(stats.command_count == 2 && stats.blacklist_count == 1);
-  st_learner_get_stats(learner, NULL);
 
   st_learner_config_t before;
   st_learner_config_t after;
   ASSERT(st_learner_get_config(learner, &before) == ST_OK);
-  ASSERT(st_learner_set_config(learner, NULL) == ST_ERR_INVALID);
+
   ASSERT(st_learner_set_config(learner,
                                &(st_learner_config_t){.min_support = 1,
                                                       .min_confidence = NAN,
@@ -489,7 +553,9 @@ static int suggestion_lists_equal(const st_suggestion_t *left,
   if (left_count != right_count || (left_count != 0 && (!left || !right)))
     return 0;
   for (size_t i = 0; i < left_count; i++)
-    if (strcmp(left[i].pattern, right[i].pattern) != 0 ||
+    if (left[i].pattern_length != right[i].pattern_length ||
+        memcmp(left[i].pattern, right[i].pattern, left[i].pattern_length) !=
+            0 ||
         left[i].count != right[i].count ||
         left[i].confidence != right[i].confidence)
       return 0;
@@ -1497,8 +1563,12 @@ static int test_serialization_preserves_prefix_nodes(void) {
 }
 
 static int test_learner_save_io_failures_are_atomic(void) {
-  char path[] = "/tmp/shelltype-learner-io-XXXXXX";
-  int fd = mkstemp(path);
+  char directory[] = "/tmp/shelltype-learner-io-XXXXXX";
+  ASSERT(mkdtemp(directory) != NULL);
+  strcpy(learner_save_directory, directory);
+  char path[256];
+  snprintf(path, sizeof(path), "%s/learner", directory);
+  int fd = open(path, O_CREAT | O_EXCL | O_WRONLY, 0600);
   ASSERT(fd >= 0 && close(fd) == 0);
   snprintf(learner_temp_path, sizeof(learner_temp_path), "%s", path);
   st_learner_t *learner = baseline_learner();
@@ -1509,6 +1579,8 @@ static int test_learner_save_io_failures_are_atomic(void) {
   size_t operation_count = st_test_io_count();
   ASSERT(operation_count >= 4);
   static const char sentinel[] = "preserve-existing-learner";
+  char template_path[sizeof(path) + 8];
+  ASSERT(test_atomic_template_path(path, template_path, sizeof(template_path)));
 
   for (size_t fail_at = 1; fail_at <= operation_count; fail_at++) {
     FILE *fp = fopen(path, "wb");
@@ -1516,18 +1588,38 @@ static int test_learner_save_io_failures_are_atomic(void) {
     ASSERT(fwrite(sentinel, 1, sizeof(sentinel) - 1, fp) ==
            sizeof(sentinel) - 1);
     ASSERT(fclose(fp) == 0);
+    fp = fopen(template_path, "wb");
+    ASSERT(fp != NULL);
+    strcpy(learner_template_path, template_path);
+    ASSERT(fwrite("keep", 1, 4, fp) == 4 && fclose(fp) == 0);
+    int next_fd = open(path, O_RDONLY);
+    ASSERT(next_fd >= 0 && close(next_fd) == 0);
     st_test_io_fail_at(fail_at);
     st_error_t error = st_learner_save(learner, path);
     st_test_io_reset();
     ASSERT(error == ST_ERR_IO);
+    errno = 0;
+    ASSERT(fcntl(next_fd, F_GETFD) == -1 && errno == EBADF);
 
     char contents[128] = {0};
+    fp = fopen(template_path, "rb");
+    ASSERT(fp != NULL);
+    size_t template_length = fread(contents, 1, sizeof(contents), fp);
+    ASSERT(!ferror(fp) && fclose(fp) == 0);
+    ASSERT(template_length == 4 && memcmp(contents, "keep", 4) == 0);
+    ASSERT(unlink(template_path) == 0);
+    learner_template_path[0] = '\0';
     fp = fopen(path, "rb");
     ASSERT(fp != NULL);
     size_t length = fread(contents, 1, sizeof(contents), fp);
     ASSERT(!ferror(fp) && fclose(fp) == 0);
     bool old_file = length == sizeof(sentinel) - 1 &&
                     memcmp(contents, sentinel, length) == 0;
+    /* Begin's I/O steps open the parent, inspect the entry, create the
+     * temporary file and fdopen it. None may
+     * replace the destination on failure, even with a valid new save. */
+    if (fail_at <= 4)
+      ASSERT(old_file);
     if (!old_file) {
       st_learner_t *check = st_learner_new(&(st_learner_config_t){
           .min_support = 1,
@@ -1544,7 +1636,90 @@ static int test_learner_save_io_failures_are_atomic(void) {
   st_learner_free(learner);
   ASSERT(unlink(path) == 0);
   learner_temp_path[0] = '\0';
+  ASSERT(rmdir(directory) == 0);
+  learner_save_directory[0] = '\0';
   return 1;
+}
+
+static SHELL_NONNULL(2, 3, 4) st_error_t
+    save_destination_candidate(unsigned kind, const st_learner_t *learner,
+                               const st_policy_t *policy, const char *path) {
+  if (kind == 0)
+    return st_learner_save(learner, path);
+  if (kind == 1)
+    return st_policy_save(policy, path);
+  return st_policy_render_nfa(policy, path, NULL);
+}
+
+static int test_save_destination_candidate_is_not_published(void) {
+  char directory[] = "/tmp/shelltype-destination-candidate-XXXXXX";
+  if (!mkdtemp(directory))
+    return 0;
+  char path[256];
+  snprintf(path, sizeof(path), "%s/.scl-aaaaaa", directory);
+  st_learner_t *learner = baseline_learner();
+  st_policy_ctx_t *context = st_policy_ctx_new();
+  st_policy_t *policy = context ? st_policy_new(context) : NULL;
+  bool ok = learner && policy;
+  if (ok)
+    ok = test_st_policy_add(policy, "git status") == ST_OK;
+  for (unsigned kind = 0; ok && kind < 3; kind++) {
+    unsigned char random[SHELL_FILE_TEMP_RANDOM_BYTES] = {0};
+    st_test_io_reset();
+    st_test_io_temp_random_set(random);
+    ok = save_destination_candidate(kind, learner, policy, path) == ST_ERR_IO &&
+         test_atomic_directory_only_entry(directory, NULL);
+    memset(random + 6, 1, 6);
+    st_test_io_reset();
+    st_test_io_temp_random_set(random);
+    if (ok)
+      ok = save_destination_candidate(kind, learner, policy, path) == ST_OK;
+    size_t operations = st_test_io_count();
+    st_test_io_reset();
+    unsigned char expected[8192];
+    size_t expected_length = 0;
+    FILE *stream = ok ? fopen(path, "rb") : NULL;
+    if (stream) {
+      expected_length = fread(expected, 1, sizeof(expected), stream);
+      ok = expected_length > 0 && expected_length < sizeof(expected) &&
+           !ferror(stream);
+      ok = fclose(stream) == 0 && ok;
+    } else {
+      ok = false;
+    }
+    if (ok)
+      ok = test_atomic_directory_only_entry(directory, ".scl-aaaaaa") &&
+           unlink(path) == 0 && operations > 0;
+    for (size_t fail_at = 1; ok && fail_at <= operations; fail_at++) {
+      st_test_io_fail_at(fail_at);
+      st_test_io_temp_random_set(random);
+      st_error_t result =
+          save_destination_candidate(kind, learner, policy, path);
+      st_test_io_reset();
+      bool published = access(path, F_OK) == 0;
+      ok = result == ST_ERR_IO &&
+           test_atomic_directory_only_entry(directory,
+                                            published ? ".scl-aaaaaa" : NULL);
+      if (published) {
+        unsigned char bytes[sizeof(expected)];
+        stream = fopen(path, "rb");
+        if (stream) {
+          size_t length = fread(bytes, 1, sizeof(bytes), stream);
+          ok = ok && !ferror(stream) && length == expected_length &&
+               memcmp(bytes, expected, length) == 0;
+          ok = fclose(stream) == 0 && ok;
+        } else {
+          ok = false;
+        }
+        ok = unlink(path) == 0 && ok;
+      }
+    }
+  }
+  st_test_io_reset();
+  st_policy_free(policy);
+  st_policy_ctx_release(context);
+  st_learner_free(learner);
+  return test_atomic_cleanup_directory(directory) && ok;
 }
 
 static int test_learner_load_rejects_binary_and_overlong_lines(void) {
@@ -1636,6 +1811,148 @@ static int test_learner_binary_literal_roundtrip(void) {
   return 1;
 }
 
+static int test_generalization_after_empty_and_binary_arguments(void) {
+  static const char empty[] = "4:tool,0:,";
+  static const char binary[] = "4:tool,2:\0x,";
+  static const char nested_empty[] = "4:tool,0:,0:,";
+  static const char nested_binary[] = "4:tool,0:,2:\0x,";
+  static const struct {
+    st_netargv_view_t prefix;
+    const char *wildcard;
+    const char *compound;
+  } cases[] = {
+      {{empty, sizeof(empty) - 1}, "tool \"\" *", "tool \"\" --limit={#n}"},
+      {{binary, sizeof(binary) - 1},
+       "tool \"\\x00x\" *",
+       "tool \"\\x00x\" --limit={#n}"},
+      {{nested_empty, sizeof(nested_empty) - 1},
+       "tool \"\" \"\" *",
+       "tool \"\" \"\" --limit={#n}"},
+      {{nested_binary, sizeof(nested_binary) - 1},
+       "tool \"\" \"\\x00x\" *",
+       "tool \"\" \"\\x00x\" --limit={#n}"},
+  };
+  static const char *const alternatives[][2] = {{"alpha", "beta"},
+                                                {"--limit=42", "--limit=43"}};
+  static const st_learner_config_t configs[] = {
+      {.min_support = 1, .min_confidence = 0.0, .max_suggestions = 20},
+      {.min_support = 6, .min_confidence = 0.8, .max_suggestions = 20},
+  };
+  char path[] = "/tmp/shelltype-empty-prefix-XXXXXX";
+  int fd = mkstemp(path);
+  ASSERT(fd >= 0 && close(fd) == 0);
+  snprintf(learner_temp_path, sizeof(learner_temp_path), "%s", path);
+
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    for (size_t kind = 0; kind < 2; kind++) {
+      st_netpattern_t expected = {0};
+      ASSERT(st_netpattern_from_cpl_owned(kind ? cases[i].compound
+                                               : cases[i].wildcard,
+                                          &expected) == ST_OK);
+      char records[2][128];
+      st_netargv_view_t history[2];
+      for (size_t j = 0; j < 2; j++) {
+        size_t written = 0;
+        memcpy(records[j], cases[i].prefix.data, cases[i].prefix.length);
+        ASSERT(shell_netstring_write(
+                   records[j] + cases[i].prefix.length,
+                   sizeof(records[j]) - cases[i].prefix.length,
+                   alternatives[kind][j], strlen(alternatives[kind][j]),
+                   &written) == SHELL_NETSTRING_OK);
+        history[j] =
+            (st_netargv_view_t){records[j], cases[i].prefix.length + written};
+      }
+      st_suggestion_t *baseline = NULL;
+      size_t baseline_count = 0;
+      for (size_t config = 0; config < 2; config++) {
+        for (size_t reverse = 0; reverse < 2; reverse++) {
+          st_learner_t *learner = st_learner_new(&configs[config]);
+          ASSERT(learner != NULL);
+          for (size_t j = 0; j < 6; j++)
+            ASSERT(st_learner_feed_netargv_view(
+                       learner, history[(j % 2) ^ reverse]) == ST_OK);
+          size_t count = 0;
+          st_suggestion_t *items = st_learner_suggest(learner, &count);
+          ASSERT(items != NULL && count == 1 &&
+                 items[0].pattern_length == expected.length &&
+                 memcmp(items[0].pattern, expected.data, expected.length) ==
+                     0 &&
+                 items[0].count == 6 && items[0].confidence == 1.0);
+          if (!baseline) {
+            baseline = items;
+            baseline_count = count;
+          } else {
+            ASSERT(
+                suggestion_lists_equal(baseline, baseline_count, items, count));
+            st_suggestion_list_free(items, count);
+          }
+
+          st_policy_ctx_t *context = st_policy_ctx_new();
+          st_policy_t *policy = context ? st_policy_new(context) : NULL;
+          ASSERT(policy != NULL &&
+                 st_policy_add_netpattern_view(
+                     policy, (st_netpattern_view_t){expected.data,
+                                                    expected.length}) == ST_OK);
+          uint32_t replay = 0;
+          for (size_t j = 0; j < 2; j++) {
+            bool matched = false;
+            ASSERT(st_policy_match_view(policy, history[j], &matched) == ST_OK);
+            replay += matched ? 3 : 0;
+          }
+          ASSERT(replay == baseline[0].count);
+          st_policy_free(policy);
+          st_policy_ctx_release(context);
+
+          ASSERT(st_learner_save(learner, path) == ST_OK);
+          st_learner_t *loaded = st_learner_new(&configs[config]);
+          ASSERT(loaded != NULL && st_learner_load(loaded, path) == ST_OK);
+          items = st_learner_suggest(loaded, &count);
+          ASSERT(
+              suggestion_lists_equal(baseline, baseline_count, items, count));
+          st_suggestion_list_free(items, count);
+          st_learner_free(loaded);
+          st_learner_free(learner);
+        }
+      }
+      st_suggestion_list_free(baseline, baseline_count);
+      st_netpattern_free(&expected);
+    }
+  }
+  ASSERT(unlink(path) == 0);
+  learner_temp_path[0] = '\0';
+  return 1;
+}
+
+static int test_command_heads_are_not_generalized(void) {
+  static const char empty[] = "0:,5:alpha,";
+  static const char binary[] = "2:\0x,5:alpha,";
+  static const st_netargv_view_t history[] = {
+      {empty, sizeof(empty) - 1},
+      {binary, sizeof(binary) - 1},
+      {"4:tool,5:alpha,", sizeof("4:tool,5:alpha,") - 1}};
+  st_learner_t *learner = st_learner_new(&(st_learner_config_t){
+      .min_support = 1, .min_confidence = 0.0, .max_suggestions = 20});
+  ASSERT(learner != NULL);
+  for (size_t i = 0; i < 3; i++)
+    ASSERT(st_learner_feed_netargv_view(learner, history[i]) == ST_OK);
+  size_t count = 0;
+  st_suggestion_t *items = st_learner_suggest(learner, &count);
+  ASSERT(items != NULL && count == 3);
+  for (size_t i = 0; i < count; i++) {
+    st_token_array_t tokens = {0};
+    ASSERT(
+        st_netpattern_decode_view(
+            (st_netpattern_view_t){items[i].pattern, items[i].pattern_length},
+            &tokens) == ST_OK &&
+        tokens.count == 2 && tokens.tokens[0].type == ST_TYPE_LITERAL &&
+        items[i].count == 1);
+    st_token_array_free(&tokens);
+  }
+  st_suggestion_list_free(items, count);
+  st_learner_free(learner);
+  return 1;
+}
+
 static int test_typed_token_metadata_is_span_safe(void) {
   static const char unterminated_size[] = {'1', 'M', 'i', 'B'};
   static const char binary_size[] = {'1', 'M', 'i', 'B', '\0', 'x'};
@@ -1700,39 +2017,57 @@ static int test_typed_token_metadata_is_span_safe(void) {
   return 1;
 }
 
-static int test_suggestion_allocation_failures_are_clean(void) {
+static int feed_suggestion_allocation_fixture(st_learner_t *learner,
+                                              bool overlapping) {
+  if (overlapping) {
+    static const char *const records[] = {"4:tool,2:42,5:alpha,4:1MiB,",
+                                          "4:tool,2:42,4:beta,4:2MiB,",
+                                          "4:tool,2:42,5:gamma,4:1GiB,",
+                                          "4:tool,2:42,5:delta,4:2GiB,",
+                                          "4:tool,8:a1b2c3d4,4:zeta,4:1MiB,",
+                                          "4:tool,8:a1b2c3d4,4:zeta,4:2GiB,",
+                                          "5:ztool,2:42,",
+                                          "6:zztool,2:42,"};
+    for (size_t i = 0; i < sizeof(records) / sizeof(records[0]); i++)
+      ASSERT(st_learner_feed_netargv(learner, records[i]) == ST_OK);
+  }
+  /* The second fixture also exceeds the initial candidate/result capacity.
+   * Its output cap exercises cleanup of accounted but unpublished rules. */
+  for (size_t i = 0; i < (overlapping ? 70 : 8); i++) {
+    char command[64];
+    if (overlapping)
+      snprintf(command, sizeof(command), "command%zu /tmp/file", i);
+    else
+      snprintf(command, sizeof(command), "copy /tmp/file%zu", i);
+    ASSERT(test_st_feed(learner, command) == ST_OK);
+  }
+  return 1;
+}
+
+static int check_suggestion_allocation_failures(bool overlapping) {
   st_test_alloc_reset();
   st_learner_t *probe = st_learner_new(
       &(st_learner_config_t){.min_support = 1,
                              .min_confidence = 0.0,
                              .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
   ASSERT(probe != NULL);
-  for (size_t i = 0; i < 8; i++) {
-    char command[64];
-    snprintf(command, sizeof(command), "copy /tmp/file%zu", i);
-    ASSERT(test_st_feed(probe, command) == ST_OK);
-  }
+  ASSERT(feed_suggestion_allocation_fixture(probe, overlapping));
   st_test_alloc_reset();
   size_t probe_count = 0;
   st_suggestion_t *probe_suggestions = st_learner_suggest(probe, &probe_count);
   size_t allocations = st_test_alloc_count();
   ASSERT(probe_suggestions != NULL && probe_count > 0 && allocations > 0);
-  st_suggestion_list_free(probe_suggestions, probe_count);
-  st_learner_free(probe);
+
+  st_learner_t *learner = st_learner_new(
+      &(st_learner_config_t){.min_support = 1,
+                             .min_confidence = 0.0,
+                             .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
+  ASSERT(learner != NULL);
+  ASSERT(feed_suggestion_allocation_fixture(learner, overlapping));
 
   bool observed = false;
   for (size_t fail_at = 1; fail_at <= allocations; fail_at++) {
     st_test_alloc_reset();
-    st_learner_t *learner = st_learner_new(
-        &(st_learner_config_t){.min_support = 1,
-                               .min_confidence = 0.0,
-                               .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
-    ASSERT(learner != NULL);
-    for (size_t i = 0; i < 8; i++) {
-      char command[64];
-      snprintf(command, sizeof(command), "copy /tmp/file%zu", i);
-      ASSERT(test_st_feed(learner, command) == ST_OK);
-    }
     size_t count = 99;
     st_test_alloc_fail_at(fail_at);
     st_suggestion_t *suggestions = st_learner_suggest(learner, &count);
@@ -1744,9 +2079,79 @@ static int test_suggestion_allocation_failures_are_clean(void) {
       ASSERT(count > 0);
       st_suggestion_list_free(suggestions, count);
     }
-    st_learner_free(learner);
+    ASSERT(nodes_equal(probe->trie.root, learner->trie.root) &&
+           probe->trie.total_commands == learner->trie.total_commands);
+    /* An allocation failure must not consume observations or poison the next
+     * accounting pass. The same learner recovers the identical ordered rules.
+     */
+    suggestions = st_learner_suggest(learner, &count);
+    ASSERT(suggestions != NULL && count == probe_count);
+    for (size_t i = 0; i < count; i++)
+      ASSERT(suggestions[i].pattern_length ==
+                 probe_suggestions[i].pattern_length &&
+             memcmp(suggestions[i].pattern, probe_suggestions[i].pattern,
+                    suggestions[i].pattern_length) == 0 &&
+             suggestions[i].count == probe_suggestions[i].count &&
+             suggestions[i].confidence == probe_suggestions[i].confidence);
+    st_suggestion_list_free(suggestions, count);
   }
   ASSERT(observed);
+  st_suggestion_list_free(probe_suggestions, probe_count);
+  st_learner_free(probe);
+  st_learner_free(learner);
+  return 1;
+}
+
+static int test_suggestion_allocation_failures_are_clean(void) {
+  ASSERT(check_suggestion_allocation_failures(false));
+  ASSERT(check_suggestion_allocation_failures(true));
+  return 1;
+}
+
+static int test_compound_support_uses_indexed_prefixes(void) {
+  enum { FAMILIES = 256 };
+  st_learner_t *learner = st_learner_new(&(st_learner_config_t){
+      .min_support = 1, .min_confidence = 0.0, .max_suggestions = FAMILIES});
+  ASSERT(learner != NULL);
+  char command[128];
+  for (size_t i = 0; i < FAMILIES; i++)
+    for (size_t value = 42; value < 44; value++) {
+      snprintf(command, sizeof(command), "tool --field%zu=%zu marker%zu", i,
+               value, i);
+      ASSERT(test_st_feed(learner, command) == ST_OK);
+    }
+  size_t count = 0;
+  st_suggestion_t *suggestions = st_learner_suggest(learner, &count);
+  ASSERT(suggestions != NULL && count == FAMILIES);
+  /* Operation count, not a timing heuristic: each literal observation visits
+   * its indexed compound, rather than testing all 256 alternative prefixes. */
+  ASSERT(st_test_learner_support_work() <= FAMILIES * 64);
+  st_policy_ctx_t *context = st_policy_ctx_new();
+  ASSERT(context != NULL);
+  for (size_t i = 0; i < count; i++) {
+    ASSERT(suggestions[i].count == 2 &&
+           suggestions[i].confidence == 1.0 / FAMILIES);
+    st_policy_t *policy = st_policy_new(context);
+    ASSERT(policy != NULL &&
+           st_policy_add_netpattern_view(
+               policy, (st_netpattern_view_t){suggestions[i].pattern,
+                                              suggestions[i].pattern_length}) ==
+               ST_OK);
+    uint32_t replay = 0;
+    for (size_t family = 0; family < FAMILIES; family++)
+      for (size_t value = 42; value < 44; value++) {
+        snprintf(command, sizeof(command), "tool --field%zu=%zu marker%zu",
+                 family, value, family);
+        st_eval_result_t result = {0};
+        ASSERT(test_st_policy_eval(policy, command, &result) == ST_OK);
+        replay += result.matches;
+      }
+    ASSERT(replay == suggestions[i].count);
+    st_policy_free(policy);
+  }
+  st_policy_ctx_release(context);
+  st_suggestion_list_free(suggestions, count);
+  st_learner_free(learner);
   return 1;
 }
 
@@ -1802,6 +2207,8 @@ static int test_load_allocation_failures_preserve_learner(void) {
   }
   ASSERT(observed);
   st_learner_free(source);
+  ASSERT(unlink(path) == 0);
+  learner_temp_path[0] = '\0';
   return 1;
 }
 
@@ -2152,8 +2559,12 @@ static int test_metadata_aggregation_and_v4_roundtrip(void) {
 }
 
 static int test_learner_save_crash_boundaries(void) {
-  char path[] = "/tmp/shelltype-crash-save-XXXXXX";
-  int fd = mkstemp(path);
+  char directory[] = "/tmp/shelltype-crash-save-XXXXXX";
+  ASSERT(mkdtemp(directory) != NULL);
+  strcpy(learner_save_directory, directory);
+  char path[256];
+  snprintf(path, sizeof(path), "%s/learner", directory);
+  int fd = open(path, O_CREAT | O_EXCL | O_WRONLY, 0600);
   ASSERT(fd >= 0 && close(fd) == 0);
   snprintf(learner_temp_path, sizeof(learner_temp_path), "%s", path);
   st_learner_t *old_state = st_learner_new(
@@ -2204,6 +2615,8 @@ static int test_learner_save_crash_boundaries(void) {
   st_learner_free(new_state);
   ASSERT(unlink(path) == 0);
   learner_temp_path[0] = '\0';
+  ASSERT(rmdir(directory) == 0);
+  learner_save_directory[0] = '\0';
   return 1;
 }
 
@@ -2227,10 +2640,14 @@ int main(void) {
   TEST(test_serialization_preserves_prefix_nodes);
   TEST(test_learner_numeric_fields_reject_hidden_bytes);
   TEST(test_learner_save_io_failures_are_atomic);
+  TEST(test_save_destination_candidate_is_not_published);
   TEST(test_learner_load_rejects_binary_and_overlong_lines);
   TEST(test_learner_binary_literal_roundtrip);
+  TEST(test_generalization_after_empty_and_binary_arguments);
+  TEST(test_command_heads_are_not_generalized);
   TEST(test_typed_token_metadata_is_span_safe);
   TEST(test_suggestion_allocation_failures_are_clean);
+  TEST(test_compound_support_uses_indexed_prefixes);
   TEST(test_load_allocation_failures_preserve_learner);
   TEST(test_learner_load_read_failures_preserve_state);
   TEST(test_mixed_type_widening_and_v4_roundtrip);
@@ -2239,6 +2656,8 @@ int main(void) {
   TEST(test_learner_save_crash_boundaries);
   TEST(test_feed_is_atomic);
   TEST(test_feed_netargv_avoids_classifier_allocations);
+  TEST(test_borrowed_binary_feed_is_atomic);
+  TEST(test_timestamp_metadata_feed_is_atomic);
   TEST(test_expressive_literal_suggestions);
   TEST(test_compound_option_suggestion);
   printf("\nResults: %d/%d passed, %d failed\n", tests_passed, tests_run,

@@ -4,12 +4,46 @@
 #include "shell_depgraph.h"
 #include "shell_tokenizer.h"
 
-/* Like shell_dep_graph_parse(), this requires caller-owned resolver workspace
- * in limits for a graph that reaches effective-route resolution. `fast` is a
- * borrowed input snapshotted on entry and is never retained. */
+/* Internal zero-copy consumer of an existing fast parse, not an independent
+ * parse of cmd. With non-NULL `fast`, the caller must supply the unmodified
+ * result of shell_parse_fast(cmd, cmd_len, ...) for exactly these source bytes
+ * and length. Use strict_mode=true for semantic graph construction. A result
+ * from another source, edited metadata, or changed source bytes is INVALID
+ * API USE: this function does not reparse to detect or reconcile a mismatch.
+ * Parser-produced errors and truncated results retain their error/partial
+ * graph handling; they are not permission to fabricate descriptors.
+ *
+ * `cmd` is supplied separately only because the fixed-size parse result stores
+ * zero-copy offsets, not a source pointer. The source must remain alive and
+ * unchanged for the lifetime of the graph, which borrows token spans from it.
+ * Graph construction copies `fast` into local mutable working metadata so it
+ * can derive execution ranges without modifying the caller's result; the copy
+ * is not an alias-safety mechanism. `fast`, when present, and `out` must be
+ * distinct. NULL `fast` delegates to shell_dep_graph_parse(). Like that API,
+ * this requires caller-owned resolver workspace in limits when effective
+ * routes are resolved. */
 shell_dep_error_t shell_dep_graph_parse_with_fast(
     const char *cmd, size_t cmd_len, const char *initial_cwd,
     const shell_dep_limits_t *limits, const shell_parse_result_t *fast,
-    shell_dep_graph_t *out);
+    shell_dep_graph_t *out) SHELL_NONNULL(1, 6);
+
+/* Identity rendering from an already decoded static FILE word. The caller
+ * supplies its complete, nonempty, NUL-free payload and an unchanged document
+ * from graph. This consumes the payload, not the source spelling: no word
+ * classification or decoding is repeated. Storage is readable for length
+ * bytes; destination may overlap it. Unknown CWD and insufficient output
+ * capacity return false, clear outputs, and leave destination unchanged. */
+bool shell_dep_doc_file_identity_from_decoded(
+    const shell_dep_graph_t *graph, const shell_dep_doc_t *doc,
+    const char *decoded, size_t length, char *destination, size_t capacity,
+    size_t *written, bool *absolute) SHELL_NONNULL(1, 2, 3, 5, 7, 8);
+
+/* Normalize one decoded, nonempty, NUL-free lexical path in place. path has
+ * length + 1 writable bytes and length <= UINT32_MAX. Removes single-dot and
+ * redundant separator components, preserving parent components and symlinks.
+ * Returns the length excluding its appended NUL. The input is prechecked;
+ * this helper does not decode, classify or validate caller storage. */
+size_t shell_dep_file_path_normalize(char *path, size_t length)
+    SHELL_NONNULL(1);
 
 #endif

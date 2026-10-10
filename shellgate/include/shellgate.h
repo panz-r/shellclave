@@ -9,12 +9,15 @@
 #ifndef SHELLGATE_H
 #define SHELLGATE_H
 
+#include "shell_contract.h"
+
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
 /* shelltype provides suggestion and token-variant result types. */
 #include "sg_anomaly.h"
+#include "shell_tokenizer.h"
 #include "shelltype.h"
 
 #ifdef __cplusplus
@@ -173,6 +176,13 @@ typedef struct {
   uint16_t group_depth; /* Enclosing command-group nesting depth. */
   uint8_t group_kinds;  /* shell_group_kind_t bitset of enclosing groups. */
   bool backgrounded;    /* Command runs in the background via '&'. */
+  /* Effective Bash `time` mode for this application-facing command result.
+   * Shellgate flattens the nearest timed enclosing GROUP onto its contained
+   * commands when no nearer local pipeline timing applies. This differs from
+   * the dependency graph, which retains compound timing on the GROUP node.
+   * The reserved prefix is not part of canonical netargv or policy matching.
+   */
+  shell_pipeline_time_mode_t pipeline_time_mode;
   uint32_t violation_category_flags;
   uint32_t violation_type_flags;
 } sg_subcommand_result_t;
@@ -261,7 +271,9 @@ typedef struct {
    *                 This is distinct from subcommand_count, which
    *                 describes policy-evaluable graph commands. A redirect-only
    *                 simple command is one anomaly stage even though it has no
-   *                 policy-evaluable argv. 0.0 for sequences with fewer than
+   *                 policy-evaluable argv; a structural empty Bash `time`
+   *                 pipeline is also one anomaly stage, without implying I/O.
+   *                 0.0 for sequences with fewer than
    *                 three stages.
    *                 INFINITY if model cannot score (e.g., empty model).
    *
@@ -294,6 +306,16 @@ typedef struct sg_gate sg_gate_t;
  *
  * Path and name arrays are scanned linearly (arrays are small, <=32 elements).
  * Order does not matter for correctness.
+ * Absolute path-prefix entries match a static FILE document's lexical
+ * identity, including its recorded execution CWD. Relative prefix entries
+ * match its decoded source spelling. Secret/profile path lists are substring
+ * fragments and can also match the known identity's CWD components. When a
+ * static identity cannot be formed, only the decoded-spelling heuristic is
+ * available: no CWD is invented for dynamic paths or unknown relative CWDs.
+ * Identity normalization removes redundant separators and single-dot
+ * components, but does not collapse parent components or resolve symlinks.
+ * Configure prefixes in this same lexical form. These signals do not prove
+ * filesystem identity or determine the policy verdict.
  *
  * Violation fields in sg_result_t (violations[], violation_count,
  * violation_category_flags, violation_type_flags, violation_dropped_count,
@@ -351,7 +373,7 @@ typedef struct {
   uint32_t shell_profile_path_count;
 } sg_violation_config_t;
 
-void sg_violation_config_default(sg_violation_config_t *cfg);
+void sg_violation_config_default(sg_violation_config_t *cfg) SHELL_NONNULL(1);
 
 /* --- EXPANSION CALLBACKS --- */
 
@@ -360,10 +382,21 @@ void sg_violation_config_default(sg_violation_config_t *cfg);
  * resolved netargv may contain embedded NUL bytes and is interpreted only by
  * its explicit length. On SG_EXPAND_RESOLVED, the callback must provide a
  * canonical netargv (or NULL with length zero for an empty expansion). The
- * returned bytes must remain valid until the enclosing sg_gate_evaluate() call
- * returns. They are never reparsed as shell source. Output values are ignored
+ * returned bytes must remain valid and unchanged until the enclosing
+ * sg_gate_evaluate() call returns, including across later callback invocations.
+ * They are never reparsed as shell source. Output values are ignored
  * for other statuses. Failed or malformed results make sg_gate_evaluate()
  * return SG_ERR_EXPAND.
+ *
+ * Variable queries are names from whole unquoted scalar words: $NAME,
+ * ${NAME}, $1, or ${12}. Positional names consist only of digits; unbraced
+ * positional parameters consume one digit, so $12 and $1abc are compound
+ * words and do not invoke this callback. Quoted/compound words, special
+ * parameters, parameter operators, and names requiring continuation removal
+ * remain unresolved by this name-only interface.
+ * Glob queries retain the original source spelling of a word containing
+ * active unquoted glob/extglob syntax. Quoted or escaped wildcard bytes and
+ * expansion interiors do not by themselves cause a glob callback invocation.
  */
 typedef enum {
   SG_EXPAND_UNRESOLVED = 0,
@@ -373,7 +406,8 @@ typedef enum {
 
 typedef sg_expand_status_t (*sg_expand_netargv_fn)(
     const char *name_or_pattern, size_t name_or_pattern_length,
-    const char **netargv, size_t *netargv_length, void *user_ctx);
+    const char **netargv, size_t *netargv_length, void *user_ctx)
+    SHELL_NONNULL(1, 3, 4);
 
 /* --- LIFECYCLE --- */
 
@@ -387,14 +421,19 @@ void sg_gate_free(sg_gate_t *gate);
  *
  * Creates paired empty anomaly models using `config`. A NULL config selects
  * sg_anomaly_config_default(). Scores are stored in sg_result_t by
- * sg_gate_evaluate. Returns SG_ERR_INVALID for an invalid threshold or
+ * sg_gate_evaluate. Successful replacement clears calibration observations;
+ * the configured adaptive window and k-factor are retained. The fixed
+ * threshold is used during adaptive warm-up, in the current score units
+ * (bits/stage for weighted scoring, log-odds for ready Bayesian scoring).
+ * Returns SG_ERR_INVALID for an invalid threshold or
  * explicit config, and SG_ERR_MEMORY on allocation failure.
  */
 sg_error_t sg_gate_enable_anomaly(sg_gate_t *gate, double threshold,
-                                  const sg_anomaly_config_t *config);
+                                  const sg_anomaly_config_t *config)
+    SHELL_NONNULL(1);
 
 /* Disable anomaly detection.  Frees the model. */
-void sg_gate_disable_anomaly(sg_gate_t *gate);
+void sg_gate_disable_anomaly(sg_gate_t *gate) SHELL_NONNULL(1);
 
 /*
  * Set update mode for anomaly learning.
@@ -405,7 +444,8 @@ void sg_gate_disable_anomaly(sg_gate_t *gate);
  * regardless of verdict, as long as anomaly_detected is false).
  */
 sg_error_t sg_gate_set_anomaly_update_mode(sg_gate_t *gate,
-                                           bool update_only_on_allow);
+                                           bool update_only_on_allow)
+    SHELL_NONNULL(1);
 
 /*
  * Set whether to skip learning from anomalous stages.
@@ -415,12 +455,13 @@ sg_error_t sg_gate_set_anomaly_update_mode(sg_gate_t *gate,
  * suspicious stages.
  * Default: true (skip anomalous stages).
  */
-sg_error_t sg_gate_set_anomaly_skip_on_detected(sg_gate_t *gate, bool skip);
+sg_error_t sg_gate_set_anomaly_skip_on_detected(sg_gate_t *gate, bool skip)
+    SHELL_NONNULL(1);
 
 /*
  * Set weights for hybrid anomaly scoring.
  *
- * The combined score is:
+ * In weighted mode, including Bayesian warm-up, the combined score is:
  *   combined = weight_raw * score_raw + weight_type * score_type
  *
  * Weights must be finite, non-negative, and sum to 1.0.
@@ -428,9 +469,13 @@ sg_error_t sg_gate_set_anomaly_skip_on_detected(sg_gate_t *gate, bool skip);
  *
  * To disable the type model, set weight_type=0.0 and weight_raw=1.0.
  * To use only the type model, set weight_raw=0.0 and weight_type=1.0.
+ * Ready Bayesian scoring always combines both component log-odds and does
+ * not use these weights. Changing weights resets adaptive observations only
+ * when weighted scoring is currently effective; identical weights are a
+ * no-op. Component distributions and model learning are preserved.
  */
 sg_error_t sg_gate_set_anomaly_weights(sg_gate_t *gate, double weight_raw,
-                                       double weight_type);
+                                       double weight_type) SHELL_NONNULL(1);
 
 /* Combination mode for raw and type anomaly scores.
  *
@@ -443,7 +488,10 @@ sg_error_t sg_gate_set_anomaly_weights(sg_gate_t *gate, double weight_raw,
  *   CDF built from observed normal scores, then combined by summation in
  *   log-odds space. Higher combined values are more anomalous. Falls back to
  *   WEIGHTED until enough normal scores have been observed
- *   (anomaly_window_size samples, or 128 if adaptive is off).
+ *   (the current adaptive window size, or 128 if adaptive is off).
+ *   Readiness follows current settings, independent of setter order. The
+ *   transition to ready Bayesian scoring clears the weighted adaptive window;
+ *   log-odds calibration starts on the next successfully evaluated sample.
  */
 typedef enum {
   SG_ANOMALY_COMBINE_WEIGHTED = 0,
@@ -459,21 +507,24 @@ typedef struct {
   size_t stage_count;
 } sg_anomaly_sequence_score_t;
 
-/* Set the score combination method.  Default: WEIGHTED.
- * Returns SG_ERR_INVALID if gate is NULL. */
+/* Set the score combination method. Default: WEIGHTED. Switching between
+ * effective weighted and ready Bayesian scoring clears adaptive observations
+ * and restarts fixed-threshold warm-up. Existing component distributions are
+ * retained. Selecting the same effective regime does not reset calibration.
+ * Allocation failure preserves the previous mode and all observations.
+ * The gate pointer is required. */
 sg_error_t sg_gate_set_anomaly_combine_mode(sg_gate_t *gate,
-                                            sg_anomaly_combine_mode_t mode);
+                                            sg_anomaly_combine_mode_t mode)
+    SHELL_NONNULL(1);
 
 /* Score matching outer netstring sequences using the gate's configured raw
  * and type models. This does not update either model, adaptive thresholds,
  * Bayesian histograms, or caches. Both sequences must be canonical and have
  * the same number of execution-stage records. */
-sg_error_t sg_gate_score_anomaly_netseq(const sg_gate_t *gate,
-                                        const char *raw_netseq,
-                                        size_t raw_length,
-                                        const char *type_netseq,
-                                        size_t type_length,
-                                        sg_anomaly_sequence_score_t *out);
+sg_error_t sg_gate_score_anomaly_netseq(
+    const sg_gate_t *gate, const char *raw_netseq, size_t raw_length,
+    const char *type_netseq, size_t type_length,
+    sg_anomaly_sequence_score_t *out) SHELL_NONNULL(1, 2, 4, 6);
 
 /*
  * Enable or disable adaptive threshold mode.
@@ -484,25 +535,32 @@ sg_error_t sg_gate_score_anomaly_netseq(const sg_gate_t *gate,
  *   - The threshold is computed as mean + k * stddev of the window.
  *   - Until the window is full, the fixed threshold (from
  * sg_gate_enable_anomaly) is used as fallback.
+ *   - Every successful enable/resize starts a fresh window. Bayesian
+ *     component distributions are retained, and their readiness immediately
+ *     uses the new window size.
  *
  * When adaptive=false:
  *   - Reverts to the fixed threshold.
  *   - Frees the window buffer.
+ *   - Bayesian warm-up requires 128 normal observations, regardless of the
+ *     previous adaptive window size.
  *
- * Returns SG_ERR_INVALID if gate is NULL, or if adaptive=true and
- * window_size==0. Returns SG_ERR_MEMORY if buffer allocation fails.
+ * Returns SG_ERR_INVALID if adaptive=true and
+ * window_size==0. Returns SG_ERR_MEMORY if buffer allocation fails, preserving
+ * the previous window, readiness and observations.
  */
 sg_error_t sg_gate_set_anomaly_adaptive(sg_gate_t *gate, bool adaptive,
-                                        size_t window_size);
+                                        size_t window_size) SHELL_NONNULL(1);
 
 /*
  * Set the k multiplier for the adaptive threshold (default 3.0).
  * Threshold = mean + k * stddev.
  *
  * Only meaningful when adaptive threshold is enabled.
- * Returns SG_ERR_INVALID if gate is NULL, k is not finite, or k < 0.
+ * Returns SG_ERR_INVALID if k is not finite or k < 0.
  */
-sg_error_t sg_gate_set_anomaly_k_factor(sg_gate_t *gate, double k);
+sg_error_t sg_gate_set_anomaly_k_factor(sg_gate_t *gate, double k)
+    SHELL_NONNULL(1);
 
 /*
  * Set the type sequence cache size (default 0 = disabled).
@@ -515,37 +573,60 @@ sg_error_t sg_gate_set_anomaly_k_factor(sg_gate_t *gate, double k);
  * Call before or after sg_gate_enable_anomaly. Setting cache_size=0
  * frees the cache.
  *
- * Returns SG_ERR_INVALID if gate is NULL or cache_size > 8192.
+ * Returns SG_ERR_INVALID if cache_size > 8192.
  * Returns SG_ERR_MEMORY if allocation fails.
  */
-sg_error_t sg_gate_set_anomaly_cache_size(sg_gate_t *gate, size_t cache_size);
+sg_error_t sg_gate_set_anomaly_cache_size(sg_gate_t *gate, size_t cache_size)
+    SHELL_NONNULL(1);
 
 /*
  * Atomically save the raw and type anomaly models as one versioned bundle.
  * The v2 bundle is intentionally not compatible with standalone sg_anomaly
  * files or the former `{path}_type` sidecar convention.
+ * Existing regular files retain their mode; symlinks are replaced rather than
+ * followed, and other file types are rejected. Failures before replacement
+ * preserve the destination. A parent-directory synchronization failure can
+ * report an error after the complete bundle is installed.
+ * Filesystem-valid basenames need no extra room for a temporary suffix.
+ * The complete save pathname, including NUL, must fit PATH_MAX; longer
+ * spellings return SG_ERR_IO with errno ENAMETOOLONG before creating a file.
+ * Permission and special mode bits are applied after serialization, subject
+ * to OS permission rules; ownership is not copied. Temporary files remain
+ * private until then.
+ * Concurrent saves to the same path require external synchronization.
  */
-sg_error_t sg_gate_save_anomaly_model(const sg_gate_t *gate, const char *path);
+sg_error_t sg_gate_save_anomaly_model(const sg_gate_t *gate, const char *path)
+    SHELL_NONNULL(1, 2);
 
 /*
  * Transactionally load both anomaly models from a gate bundle. Existing
- * models are preserved on every failure. Returns SG_ERR_PARSE for malformed
+ * models, calibration, and type-sequence cache are preserved on every failure.
+ * The payload is read once into staging streams; its framing and checksum are
+ * verified before either model is parsed or published. The checksum covers
+ * exactly the staged bytes, not a separate read of a potentially changing file.
+ * In-place changes may be rejected or leave an already-staged valid snapshot;
+ * loading does not synchronize concurrent writers.
+ * Successful loading clears adaptive observations, Bayesian component
+ * distributions, and type-sequence cache entries; reusable storage and all
+ * configured options are retained. Fixed-threshold warm-up
+ * resumes for the loaded models. Returns SG_ERR_PARSE for malformed
  * or incompatible bundles, SG_ERR_MEMORY for allocation failure, and
  * SG_ERR_IO for filesystem failure.
  */
-sg_error_t sg_gate_load_anomaly_model(sg_gate_t *gate, const char *path);
+sg_error_t sg_gate_load_anomaly_model(sg_gate_t *gate, const char *path)
+    SHELL_NONNULL(1, 2);
 
 /*
  * Returns true if an anomaly model has had an allocation failure. This is a
  * sticky diagnostic; a failed, rolled-back update does not disable future
  * learning. Inspect sg_result_t.anomaly_update for the current evaluation.
  */
-bool sg_gate_anomaly_had_error(const sg_gate_t *gate);
+bool sg_gate_anomaly_had_error(const sg_gate_t *gate) SHELL_NONNULL(1);
 
 /*
  * Returns the number of unique anomaly stages in the anomaly model.
  */
-size_t sg_gate_anomaly_vocab_size(const sg_gate_t *gate);
+size_t sg_gate_anomaly_vocab_size(const sg_gate_t *gate) SHELL_NONNULL(1);
 
 /* --- CONFIGURATION --- */
 
@@ -563,60 +644,76 @@ size_t sg_gate_anomaly_vocab_size(const sg_gate_t *gate);
  * when `cwd` does not fit the gate's fixed storage.
  */
 
-sg_error_t sg_gate_set_cwd(sg_gate_t *gate, const char *cwd);
-sg_error_t sg_gate_set_reject_mask(sg_gate_t *gate, uint32_t mask);
-sg_error_t sg_gate_set_stop_mode(sg_gate_t *gate, sg_stop_mode_t mode);
-sg_error_t sg_gate_set_suggestions(sg_gate_t *gate, bool enabled);
+sg_error_t sg_gate_set_cwd(sg_gate_t *gate, const char *cwd)
+    SHELL_NONNULL(1, 2);
+sg_error_t sg_gate_set_reject_mask(sg_gate_t *gate, uint32_t mask)
+    SHELL_NONNULL(1);
+sg_error_t sg_gate_set_stop_mode(sg_gate_t *gate, sg_stop_mode_t mode)
+    SHELL_NONNULL(1);
+sg_error_t sg_gate_set_suggestions(sg_gate_t *gate, bool enabled)
+    SHELL_NONNULL(1);
 
 sg_error_t sg_gate_set_expand_var_netargv(sg_gate_t *gate,
                                           sg_expand_netargv_fn fn,
-                                          void *user_ctx);
+                                          void *user_ctx) SHELL_NONNULL(1);
 sg_error_t sg_gate_set_expand_glob_netargv(sg_gate_t *gate,
                                            sg_expand_netargv_fn fn,
-                                           void *user_ctx);
+                                           void *user_ctx) SHELL_NONNULL(1);
 
 /*
  * Stores a shallow copy of `config`. All strings referenced by its arrays
  * must remain valid and unchanged until the gate is destroyed or another
  * violation configuration is installed.
+ * Validates array counts and entries, and precomputes fragment matchers.
+ * SG_ERR_INVALID (invalid arrays) and SG_ERR_MEMORY (matcher allocation or
+ * size overflow) leave the installed configuration unchanged. Empty path
+ * entries match nothing. Evaluation does not allocate matcher tables.
  */
-sg_error_t
-sg_gate_set_violation_config_borrowed(sg_gate_t *gate,
-                                      const sg_violation_config_t *config);
+sg_error_t sg_gate_set_violation_config_borrowed(
+    sg_gate_t *gate, const sg_violation_config_t *config) SHELL_NONNULL(1, 2);
 
 /* --- POLICY MANAGEMENT --- */
 
 /* Loads and atomically appends rules to the existing allow policy. Malformed
  * policy data returns SG_ERR_PARSE; allocation and I/O failures preserve the
  * current policy and return SG_ERR_MEMORY and SG_ERR_IO respectively. */
-sg_error_t sg_gate_load_policy(sg_gate_t *gate, const char *path);
+sg_error_t sg_gate_load_policy(sg_gate_t *gate, const char *path)
+    SHELL_NONNULL(1, 2);
 /* Policy persistence reports allocation and I/O failures distinctly. */
-sg_error_t sg_gate_save_policy(const sg_gate_t *gate, const char *path);
+sg_error_t sg_gate_save_policy(const sg_gate_t *gate, const char *path)
+    SHELL_NONNULL(1, 2);
 /* Canonical netpattern mutation for programmatic callers. Invalid patterns and
  * policy capacity limits return SG_ERR_INVALID; allocation failures return
  * SG_ERR_MEMORY without changing the policy. Batch additions are atomic. */
-sg_error_t sg_gate_add_allow_netpattern(sg_gate_t *gate,
-                                        const char *netpattern);
+sg_error_t sg_gate_add_allow_netpattern(sg_gate_t *gate, const char *netpattern)
+    SHELL_NONNULL(1, 2);
 sg_error_t sg_gate_remove_allow_netpattern(sg_gate_t *gate,
-                                           const char *netpattern);
+                                           const char *netpattern)
+    SHELL_NONNULL(1, 2);
 sg_error_t sg_gate_batch_add_allow_netpatterns(sg_gate_t *gate,
                                                const char *const *netpatterns,
-                                               size_t count);
-sg_error_t sg_gate_add_deny_netpattern(sg_gate_t *gate, const char *netpattern);
+                                               size_t count) SHELL_NONNULL(1);
+sg_error_t sg_gate_add_deny_netpattern(sg_gate_t *gate, const char *netpattern)
+    SHELL_NONNULL(1, 2);
 sg_error_t sg_gate_remove_deny_netpattern(sg_gate_t *gate,
-                                          const char *netpattern);
+                                          const char *netpattern)
+    SHELL_NONNULL(1, 2);
 sg_error_t sg_gate_batch_add_deny_netpatterns(sg_gate_t *gate,
                                               const char *const *netpatterns,
-                                              size_t count);
+                                              size_t count) SHELL_NONNULL(1);
 
 /* Human-facing CPL adapters. They convert CPL explicitly before using the
  * corresponding canonical netpattern mutation operation. */
-sg_error_t sg_gate_add_allow_cpl(sg_gate_t *gate, const char *pattern);
-sg_error_t sg_gate_remove_allow_cpl(sg_gate_t *gate, const char *pattern);
-size_t sg_gate_allow_rule_count(const sg_gate_t *gate);
-sg_error_t sg_gate_add_deny_cpl(sg_gate_t *gate, const char *pattern);
-sg_error_t sg_gate_remove_deny_cpl(sg_gate_t *gate, const char *pattern);
-size_t sg_gate_deny_rule_count(const sg_gate_t *gate);
+sg_error_t sg_gate_add_allow_cpl(sg_gate_t *gate, const char *pattern)
+    SHELL_NONNULL(1, 2);
+sg_error_t sg_gate_remove_allow_cpl(sg_gate_t *gate, const char *pattern)
+    SHELL_NONNULL(1, 2);
+size_t sg_gate_allow_rule_count(const sg_gate_t *gate) SHELL_NONNULL(1);
+sg_error_t sg_gate_add_deny_cpl(sg_gate_t *gate, const char *pattern)
+    SHELL_NONNULL(1, 2);
+sg_error_t sg_gate_remove_deny_cpl(sg_gate_t *gate, const char *pattern)
+    SHELL_NONNULL(1, 2);
+size_t sg_gate_deny_rule_count(const sg_gate_t *gate) SHELL_NONNULL(1);
 
 /* --- EVALUATION --- */
 
@@ -637,11 +734,20 @@ size_t sg_gate_deny_rule_count(const sg_gate_t *gate);
  *   sg_gate_evaluate_size_hint() for ordinary successful evaluations. `cmd`,
  *   `buf`, and `out` must occupy non-overlapping storage: command bytes are
  *   borrowed during rendering, `buf` is writable result/workspace storage,
- *   and `out` is writable metadata.
+ *   and `out` is writable metadata. This non-overlap requirement is a caller
+ *   precondition and is not checked at runtime.
  *
+ * Evaluation models the documented Bash subset and clean noninteractive
+ * startup state in shell_depgraph.h and the Shellsplit README; it is not an
+ * executor-neutral shell interpretation. Execution must honor that contract,
+ * including privileged Bash startup with POSIXLY_CORRECT absent,
+ * BASH_COMPAT/BASH_XTRACEFD cleared, all three variables then made readonly,
+ * and no imported/shadowing functions, startup aliases or traps.
+ * The library does not execute commands or choose the application's executor.
  * A result with `SG_VERDICT_ALLOW_CONDITIONAL` contains a substitution
- * dependency. This API does not assume Bash or any specific executor; the
- * caller decides whether its execution mode can honor that dependency.
+ * dependency: the caller must satisfy its dynamic-content inspection and
+ * evaluation obligations before execution under that same model. Conditional
+ * allowance is not unconditional authorization of the substituted content.
  *
  * A syntactically valid redirect-only command, such as `>output`, has no argv
  * and therefore cannot be evaluated by the argv policy model. It returns
@@ -653,7 +759,7 @@ size_t sg_gate_deny_rule_count(const sg_gate_t *gate);
  * SG_ERR_MEMORY if the evaluation buffer cannot also hold the bounded
  * depgraph workspace, SG_ERR_TRUNC if the output buffer or bounded
  * subcommand result array was too small (partial results are still valid), or
- * SG_ERR_INVALID for bad args, including overlapping input/output storage.
+ * SG_ERR_INVALID for invalid source or buffer sizes.
  * The error code reports the primary failure: `truncated` independently
  * reports incomplete result or diagnostic rendering, so it can also be true
  * with SG_ERR_MEMORY when even the workspace-unavailable diagnostic cannot
@@ -678,12 +784,14 @@ size_t sg_gate_deny_rule_count(const sg_gate_t *gate);
  * input must require it to be false.
  */
 sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
-                            char *buf, size_t buf_size, sg_result_t *out);
+                            char *buf, size_t buf_size, sg_result_t *out)
+    SHELL_NONNULL(1, 2, 4, 6);
 
 /*
  * Return a recommended initial evaluation-buffer size for a command of
  * `cmd_len` bytes. The estimate includes both command/result storage and the
- * aligned bounded depgraph workspace. Expansion callbacks and violation
+ * aligned bounded depgraph workspace, reused for source-sized path decoding
+ * and identity comparison scratch. Expansion callbacks and violation
  * details can require additional result-prefix space.
  */
 size_t sg_gate_evaluate_size_hint(size_t cmd_len);
@@ -702,12 +810,13 @@ size_t sg_gate_evaluate_size_hint(size_t cmd_len);
  */
 size_t sg_cpl_token_variants_at(const char *pattern, size_t edit_pos,
                                 st_token_variant_t *out_variants,
-                                size_t max_variants);
+                                size_t max_variants) SHELL_NONNULL(1, 3);
 
 /* --- RESULT HELPERS --- */
 
 const char *sg_verdict_name(sg_verdict_t v);
-uint32_t sg_result_violation_dropped(const sg_result_t *result);
+uint32_t sg_result_violation_dropped(const sg_result_t *result)
+    SHELL_NONNULL(1);
 
 #ifdef __cplusplus
 }

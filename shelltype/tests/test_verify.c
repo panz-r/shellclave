@@ -152,25 +152,6 @@ static int test_verify_all_matrix(void) {
   size_t count = 99;
   ASSERT(test_st_policy_verify_all(policy, "", &matches, &count) == ST_OK);
   ASSERT(matches == NULL && count == 0);
-  const struct {
-    const st_policy_t *policy;
-    const char *command;
-    bool give_matches;
-    bool give_count;
-  } invalid[] = {{NULL, "git status", true, true},
-                 {policy, NULL, true, true},
-                 {policy, "git status", false, true},
-                 {policy, "git status", true, false}};
-  for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
-    matches = (const char **)1;
-    count = 99;
-    ASSERT(test_st_policy_verify_all(invalid[i].policy, invalid[i].command,
-                                     invalid[i].give_matches ? &matches : NULL,
-                                     invalid[i].give_count ? &count : NULL) ==
-           ST_ERR_INVALID);
-    ASSERT(!invalid[i].give_matches || matches == NULL);
-    ASSERT(!invalid[i].give_count || count == 0);
-  }
   st_policy_free(policy);
   st_policy_ctx_release(context);
   return 1;
@@ -245,9 +226,8 @@ static int test_policy_match_matrix(void) {
   matches = true;
   ASSERT(st_policy_match(policy, "1:x,x", &matches) == ST_ERR_FORMAT);
   ASSERT(!matches);
-  ASSERT(st_policy_match(NULL, "4:echo,", &matches) == ST_ERR_INVALID);
+
   ASSERT(!matches);
-  ASSERT(st_policy_match(policy, "4:echo,", NULL) == ST_ERR_INVALID);
 
   char *netargv = test_netargv("echo 42");
   ASSERT(netargv != NULL);

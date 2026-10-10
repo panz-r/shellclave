@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "test_io.h"
+#include "../../shellsplit/src/shell_file_internal.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -15,6 +16,7 @@ static _Thread_local size_t crash_after;
 static _Thread_local size_t operation_count;
 static _Thread_local size_t read_fail_at;
 static _Thread_local size_t read_count;
+static _Thread_local const unsigned char *temp_random;
 
 static int should_fail(void) {
   operation_count++;
@@ -42,6 +44,11 @@ void st_test_io_reset(void) {
   operation_count = 0;
   read_fail_at = 0;
   read_count = 0;
+  temp_random = NULL;
+}
+
+void st_test_io_temp_random_set(const unsigned char *random) {
+  temp_random = random;
 }
 
 size_t st_test_io_count(void) { return operation_count; }
@@ -88,19 +95,25 @@ int st_test_fclose(FILE *stream) {
   return result;
 }
 
-int st_test_rename(const char *old_path, const char *new_path) {
+int st_test_renameat(int old_directory, const char *old_name, int new_directory,
+                     const char *new_name) {
   if (should_fail())
     return -1;
-  int result = rename(old_path, new_path);
+  int result = renameat(old_directory, old_name, new_directory, new_name);
   if (result == 0)
     maybe_crash();
   return result;
 }
 
-int st_test_mkstemp(char *template_path) {
+int st_test_create_temp_at(int directory, const char *destination_name,
+                           char *name) {
   if (should_fail())
     return -1;
-  int result = mkstemp(template_path);
+  int result =
+      temp_random
+          ? shell_file_create_temp_from_bytes(directory, destination_name,
+                                              temp_random, name)
+          : shell_file_create_temp_at(directory, destination_name, name);
   if (result >= 0)
     maybe_crash();
   return result;
@@ -142,21 +155,22 @@ int st_test_close(int fd) {
   return result;
 }
 
-int st_test_unlink(const char *path) {
+int st_test_unlinkat(int directory, const char *name, int flags) {
   if (should_fail())
     return -1;
-  int result = unlink(path);
+  int result = unlinkat(directory, name, flags);
   if (result == 0)
     maybe_crash();
   return result;
 }
 
-int st_test_lstat(const char *path, struct stat *status) {
+int st_test_fstatat(int directory, const char *name, struct stat *status,
+                    int flags) {
   if (should_fail()) {
     errno = EIO;
     return -1;
   }
-  int result = lstat(path, status);
+  int result = fstatat(directory, name, status, flags);
   if (result == 0 || errno == ENOENT)
     maybe_crash();
   return result;

@@ -58,12 +58,12 @@ static int test_known_entropy_values(void) {
     ASSERT(near(shell_rpe_conditional_entropy(cases[i].text),
                 cases[i].conditional, 1e-12));
   }
-  ASSERT(shell_env_screener_calculate_entropy(NULL) == 0.0);
+
   ASSERT(shell_rpe_ngram_entropy("", 2) == 0.0);
-  ASSERT(isnan(shell_rpe_ngram_entropy(NULL, 1)));
+
   ASSERT(isnan(shell_rpe_ngram_entropy("abcd", 0)));
   ASSERT(isnan(shell_rpe_ngram_entropy("abcd", 3)));
-  ASSERT(isnan(shell_rpe_conditional_entropy(NULL)));
+
   return 1;
 }
 
@@ -74,8 +74,6 @@ static int test_permutation_boundaries_and_ranges(void) {
   ASSERT(isnan(shell_rpe_permutation_entropy("abcd", 0, 2)));
   ASSERT(isnan(shell_rpe_permutation_entropy("abcd", 5, 3)));
   ASSERT(isnan(shell_rpe_permutation_conditional_entropy("abcd", 0)));
-  ASSERT(isnan(shell_rpe_relative_entropy_ratio(NULL, 5, 2)));
-  ASSERT(isnan(shell_rpe_relative_conditional_entropy(NULL, 5)));
 
   char long_input[512];
   static const char alphabet[] =
@@ -138,7 +136,6 @@ static int test_posterior_regression_matrix(void) {
     ASSERT(score >= 0.0 && score <= 1.0);
     ASSERT(score == shell_env_screener_combined_score(cases[i].value));
   }
-  ASSERT(shell_env_screener_combined_score(NULL) == 0.0);
 
   const char *value = "someRandomValue1234567890abcdef";
   double unnamed = shell_env_screener_combined_score_name(NULL, value);
@@ -182,7 +179,7 @@ static int test_detector_matrices(void) {
                 {"====", 0, 0, 0},
                 {"hello world!", 0, 0, 0},
                 {"", 0, 0, 0},
-                {NULL, 0, 0, 0}};
+                {"", 0, 0, 0}};
   for (size_t i = 0; i < sizeof(values) / sizeof(values[0]); i++) {
     ASSERT(shell_env_screener_looks_like_path(values[i].value) ==
            (bool)values[i].path);
@@ -199,7 +196,7 @@ static int test_detector_matrices(void) {
   } names[] = {{"DISPLAY", 1, 0},        {"TMUX", 1, 0},
                {"PATH", 1, 0},           {"SERVICE_API_KEY", 0, 1},
                {"MY_PASSWORD", 0, 1},    {"AUTH_TOKEN", 0, 1},
-               {"ORDINARY_VALUE", 0, 0}, {NULL, 0, 0}};
+               {"ORDINARY_VALUE", 0, 0}, {"", 0, 0}};
   for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
     ASSERT(shell_env_screener_is_whitelisted(names[i].name) ==
            (bool)names[i].whitelisted);
@@ -289,8 +286,7 @@ static int test_environment_scan_contract(void) {
   environ = saved_environ;
   ASSERT(shell_env_screener_scan(NULL, 3, &count, 0.5, 8) ==
          SHELL_ENV_SCREENER_ERROR);
-  ASSERT(shell_env_screener_scan(indices, 3, NULL, 0.5, 8) ==
-         SHELL_ENV_SCREENER_ERROR);
+
   return 1;
 }
 

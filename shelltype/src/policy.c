@@ -42,6 +42,7 @@
 #include "io.h"
 #include "metadata.h"
 #include "normalize_internal.h"
+#include "pattern_internal.h"
 #include "read_line.h"
 
 /* --- COMPATIBILITY MASK --- */
@@ -72,28 +73,10 @@ typedef struct {
 } child_entry_t;
 
 static size_t token_text_length(const st_token_t *token) {
-  if (!token || !token->text)
+  if (!token->text)
     return 0;
   return token->text_length || token->text[0] == '\0' ? token->text_length
                                                       : strlen(token->text);
-}
-
-/* Literal netpattern records preserve the caller's spelling.  For ordinary
- * text we still need its runtime classifier type when comparing a literal to
- * a wildcard; embedded NUL has no C-string classifier representation and is
- * intentionally kept literal. */
-static st_token_type_t token_runtime_type(const st_token_t *token) {
-  size_t length = token_text_length(token);
-  if (!token || token->type != ST_TYPE_LITERAL ||
-      memchr(token->text, '\0', length) != NULL)
-    return token ? token->type : ST_TYPE_LITERAL;
-  if (length >= ST_MAX_TOKEN_LEN)
-    return ST_TYPE_LITERAL;
-  char terminated[ST_MAX_TOKEN_LEN];
-  if (length)
-    memcpy(terminated, token->text, length);
-  terminated[length] = '\0';
-  return st_token_classify(terminated);
 }
 
 static bool bytes_equal(const char *left, size_t left_length, const char *right,
@@ -506,7 +489,7 @@ struct st_policy {
  * lists policy wildcard types accepted by a classified command token.
  */
 
-static const uint64_t st_runtime_match_mask[ST_TYPE_COUNT] = {
+const uint64_t st_runtime_match_mask[ST_TYPE_COUNT] = {
     /* LITERAL */ (1ULL << ST_TYPE_LITERAL) | (1ULL << ST_TYPE_ANY),
     /* HEXHASH */ (1ULL << ST_TYPE_HEXHASH) | (1ULL << ST_TYPE_NUMBER) |
         (1ULL << ST_TYPE_VALUE) | (1ULL << ST_TYPE_ANY),
@@ -654,11 +637,6 @@ static child_entry_t *find_literal_child(const policy_state_t *node,
 
 /* --- CLOSED WILDCARD METADATA MATCHING --- */
 
-/* Check if a base type supports parametrization. */
-static bool type_supports_param(st_token_type_t t) {
-  return st_type_supports_metadata(t);
-}
-
 /* Extract the parameter from a parametrized wildcard symbol.
  * E.g., "#path.cfg" → ".cfg", "#size.MiB" → ".MiB", "#path" → NULL. */
 static const char *wildcard_param(const char *wild_text,
@@ -671,8 +649,6 @@ static const char *wildcard_param(const char *wild_text,
 /* Extract the file extension from a path (including dot).
  * "/etc/app.cfg" → ".cfg", "app" → NULL. */
 const char *st_path_extension(const char *text) {
-  if (!text)
-    return NULL;
   const char *dot = strrchr(text, '.');
   const char *slash = strrchr(text, '/');
   const char *basename = slash ? slash + 1 : text;
@@ -689,8 +665,6 @@ const char *st_path_extension(const char *text) {
  * "10MiB" → "MiB", "2G" → "G", "42" → NULL.
  * Returns pointer into the token after the last digit/dot. */
 const char *st_size_suffix(const char *text) {
-  if (!text)
-    return NULL;
   const char *p = text;
   /* skip optional negative sign */
   if (*p == '-')
@@ -705,85 +679,41 @@ const char *st_size_suffix(const char *text) {
 
 /* --- PARAMETRIZED MATCHING --- */
 
-static bool closed_metadata_matches(const char *cmd_text,
-                                    st_token_type_t cmd_type,
-                                    const char *wild_text,
-                                    st_token_type_t wild_type) {
-  const st_metadata_entry_t *metadata =
-      st_wildcard_metadata(wild_text, wild_type);
+static SHELL_NONNULL(1) bool closed_metadata_matches(
+    const char *cmd_text, size_t cmd_length, st_token_type_t cmd_type,
+    st_token_type_t wild_type, const st_metadata_entry_t *metadata) {
   if (!metadata)
     return true;
+  if (!st_metadata_requires_value(metadata))
+    return cmd_type == wild_type;
 
-  if (wild_type == ST_TYPE_SIZE) {
-    const char *suffix =
-        cmd_type == ST_TYPE_SIZE ? st_size_suffix(cmd_text) : NULL;
-    const st_metadata_entry_t *observed =
-        st_metadata_lookup(ST_TYPE_SIZE, suffix);
-    return observed && observed->id == metadata->id;
-  }
-  if (wild_type == ST_TYPE_UUID) {
-    if (cmd_type != ST_TYPE_UUID || !cmd_text || strlen(cmd_text) != 36)
-      return false;
-    return (metadata->id == ST_META_UUID_V4 && cmd_text[14] == '4') ||
-           (metadata->id == ST_META_UUID_V5 && cmd_text[14] == '5');
-  }
-  if (wild_type == ST_TYPE_SEMVER)
-    return cmd_type == ST_TYPE_SEMVER;
-  if (wild_type == ST_TYPE_TIMESTAMP) {
-    if (cmd_type != ST_TYPE_TIMESTAMP || !cmd_text)
-      return false;
-    size_t len = strlen(cmd_text);
-    if (metadata->id == ST_META_TIMESTAMP_DATE)
-      return len == 10 && cmd_text[4] == '-' && cmd_text[7] == '-';
-    if (metadata->id == ST_META_TIMESTAMP_TIME)
-      return len == 8 && cmd_text[2] == ':' && cmd_text[5] == ':';
-    return metadata->id == ST_META_TIMESTAMP_DATETIME && len >= 19 &&
-           (cmd_text[10] == 'T' || cmd_text[10] == ' ');
-  }
-  if (wild_type == ST_TYPE_SHA) {
-    if ((cmd_type != ST_TYPE_SHA && cmd_type != ST_TYPE_HEXHASH) || !cmd_text)
-      return false;
-    size_t len = strlen(cmd_text);
-    for (size_t i = 0; i < len; i++)
-      if (!isxdigit((unsigned char)cmd_text[i]))
-        return false;
-    return (metadata->id == ST_META_SHA_SHORT && len == 7) ||
-           (metadata->id == ST_META_SHA_40 && len == 40) ||
-           (metadata->id == ST_META_SHA_64 && len == 64);
-  }
-  if (wild_type == ST_TYPE_FINGERPRINT) {
-    if (cmd_type != ST_TYPE_FINGERPRINT || !cmd_text)
-      return false;
-    if (metadata->id == ST_META_FINGERPRINT_SHA256)
-      return strncmp(cmd_text, "SHA256:", 7) == 0;
-    return metadata->id == ST_META_FINGERPRINT_MD5 && strlen(cmd_text) == 47 &&
-           cmd_text[2] == ':' && cmd_text[5] == ':';
-  }
-  if (wild_type == ST_TYPE_DURATION) {
-    if (cmd_type != ST_TYPE_DURATION || !cmd_text)
-      return false;
-    const char *suffix = cmd_text;
-    if (*suffix == '-')
-      suffix++;
-    while (*suffix && (isdigit((unsigned char)*suffix) || *suffix == '.'))
-      suffix++;
-    const st_metadata_entry_t *observed =
-        st_metadata_lookup(ST_TYPE_DURATION, suffix);
-    return observed && observed->id == metadata->id;
-  }
-  if (wild_type == ST_TYPE_RANGE)
-    return cmd_type == ST_TYPE_RANGE;
-  if (wild_type == ST_TYPE_PERM_OCTAL)
-    return cmd_type == ST_TYPE_PERM_OCTAL;
-  return false;
+  return cmd_type == wild_type &&
+         st_metadata_value_id(cmd_type, cmd_text, cmd_length) == metadata->id;
 }
 
 /* Check if a command token matches a (possibly parametrized) wildcard child.
  * Returns true for non-parametrized wildcards (text == NULL or no parameter).
  */
-static bool param_matches(const char *cmd_text, st_token_type_t cmd_type,
-                          const char *wild_text, st_token_type_t wild_type) {
-  return closed_metadata_matches(cmd_text, cmd_type, wild_text, wild_type);
+static bool param_matches(const char *cmd_text, size_t cmd_length,
+                          st_token_type_t cmd_type, const char *wild_text,
+                          st_token_type_t wild_type) {
+  return closed_metadata_matches(cmd_text, cmd_length, cmd_type, wild_type,
+                                 st_wildcard_metadata(wild_text, wild_type));
+}
+
+bool st_pattern_wildcard_matches(const char *text, size_t text_length,
+                                 st_token_type_t type, const char *wildcard,
+                                 size_t wildcard_length,
+                                 st_token_type_t wildcard_type) {
+  if (!st_runtime_type_matches(type, wildcard_type))
+    return false;
+  const st_metadata_entry_t *metadata =
+      st_wildcard_metadata_span(wildcard, wildcard_length, wildcard_type);
+  /* Classification already consumed the complete span. Metadata tests below
+   * use explicit lengths, never a shortened C-string capture or a second
+   * classification/validation pass. */
+  return closed_metadata_matches(text, text_length, type, wildcard_type,
+                                 metadata);
 }
 
 /* Find an exact wildcard child for pattern insertion or removal.
@@ -1072,14 +1002,19 @@ static bool pattern_subsumes(const st_token_t *a, size_t a_len,
        * so A does NOT subsume B) */
       return false;
     } else {
-      /* a is wildcard, b is concrete: a can subsume b if a's type covers b's
-       * type. For A (wildcard) to subsume B (concrete): A must be as general as
-       * B's type. Check: st_is_compatible(B.type, A.type) — B's type must be
-       * subtype of A's type. */
-      st_token_type_t concrete_type = token_runtime_type(&b[i]);
-      if (!(runtime_match_mask(concrete_type) & (1ULL << a[i].type)) ||
-          !param_matches(b[i].text, concrete_type, a[i].text, a[i].type))
-        return false;
+      /* Runtime classification depends on the preceding argv value. A must
+       * match every possible classification of this literal under B's prefix,
+       * including unknown contexts after a generalized predecessor. */
+      uint64_t concrete_types = st_pattern_literal_types(b, i);
+      for (st_token_type_t type = ST_TYPE_LITERAL; type < ST_TYPE_COUNT;
+           type++) {
+        if (!(concrete_types & (UINT64_C(1) << type)))
+          continue;
+        if (!(runtime_match_mask(type) & (UINT64_C(1) << a[i].type)) ||
+            !param_matches(b[i].text, token_text_length(&b[i]), type, a[i].text,
+                           a[i].type))
+          return false;
+      }
     }
   }
   return true;
@@ -1183,54 +1118,33 @@ static void policy_rebuild_filters(st_policy_t *policy) {
 /* --- PATTERN VALIDATION (public API) --- */
 
 st_error_t st_netpattern_validate_view(st_netpattern_view_t pattern,
-                                       st_pattern_info_t *info) {
-  if (info)
-    memset(info, 0, sizeof(*info));
+                                       st_token_array_t *out_tokens) {
   st_token_array_t decoded = {0};
   st_error_t decode_error = st_netpattern_decode_view(pattern, &decoded);
   if (decode_error != ST_OK)
     return decode_error;
-  size_t token_count = decoded.count;
-  st_token_t *tokens = decoded.tokens;
-  if (token_count != 0 &&
-      (tokens[0].type == ST_TYPE_ANY || tokens[0].compound)) {
-    free_pattern_tokens(tokens, token_count);
+  if (!st_pattern_token_type_allowed(decoded.tokens, 0,
+                                     decoded.tokens[0].type)) {
+    st_token_array_free(&decoded);
     return ST_ERR_INVALID;
   }
-
-  if (info) {
-    info->token_count = token_count;
-    for (size_t i = 0; i < token_count; i++) {
-      size_t length = token_text_length(&tokens[i]);
-      if (length >= ST_MAX_TOKEN_LEN) {
-        free_pattern_tokens(tokens, token_count);
-        return ST_ERR_LIMIT;
-      }
-      memcpy(info->token_texts[i], tokens[i].text, length);
-      info->token_texts[i][length] = '\0';
-      info->token_lengths[i] = length;
-      info->token_types[i] = tokens[i].type;
-    }
-  }
-
-  free_pattern_tokens(tokens, token_count);
+  if (out_tokens)
+    *out_tokens = decoded;
+  else
+    st_token_array_free(&decoded);
   return ST_OK;
 }
 
 st_error_t st_netpattern_validate(const char *pattern,
-                                  st_pattern_info_t *info) {
-  if (!pattern)
-    return ST_ERR_INVALID;
+                                  st_token_array_t *out_tokens) {
   return st_netpattern_validate_view(
-      (st_netpattern_view_t){.data = pattern, .length = strlen(pattern)}, info);
+      (st_netpattern_view_t){.data = pattern, .length = strlen(pattern)},
+      out_tokens);
 }
 
 /* --- LIFECYCLE --- */
 
 st_policy_t *st_policy_new(st_policy_ctx_t *ctx) {
-  if (!ctx)
-    return NULL;
-
   st_policy_t *policy = calloc(1, sizeof(st_policy_t));
   if (!policy)
     return NULL;
@@ -1323,9 +1237,10 @@ static st_error_t remove_pattern_by_id_locked(st_policy_t *policy,
  *   2. If the new pattern subsumes existing patterns, they are removed.
  * Only compares patterns of the same token length.
  */
-static st_error_t st_policy_add_locked_view(st_policy_t *policy,
-                                            st_netpattern_view_t pattern) {
-  if (!policy || !pattern.data || pattern.length == 0)
+static SHELL_NONNULL(1) st_error_t
+    st_policy_add_locked_view(st_policy_t *policy,
+                              st_netpattern_view_t pattern) {
+  if (!pattern.data || pattern.length == 0)
     return ST_ERR_INVALID;
 
   st_token_array_t decoded = {0};
@@ -1334,16 +1249,7 @@ static st_error_t st_policy_add_locked_view(st_policy_t *policy,
     return decode_error;
   size_t token_count = decoded.count;
   st_token_t *tokens = decoded.tokens;
-  if (token_count != 0 &&
-      (tokens[0].type == ST_TYPE_ANY || tokens[0].compound)) {
-    free_pattern_tokens(tokens, token_count);
-    return ST_ERR_INVALID;
-  }
-  if (token_count == 0) {
-    free_pattern_tokens(tokens, token_count);
-    return ST_ERR_INVALID;
-  }
-  if (token_count > ST_MAX_CMD_TOKENS) {
+  if (!st_pattern_token_type_allowed(tokens, 0, tokens[0].type)) {
     free_pattern_tokens(tokens, token_count);
     return ST_ERR_INVALID;
   }
@@ -1752,7 +1658,7 @@ static st_error_t remove_pattern_by_id_locked(st_policy_t *policy,
 
 /* Public: add pattern (acquires write lock) */
 st_error_t st_policy_add_netpattern(st_policy_t *policy, const char *pattern) {
-  if (!policy || !pattern || !pattern[0])
+  if (!pattern[0])
     return ST_ERR_INVALID;
   return st_policy_add_netpattern_view(
       policy,
@@ -1761,7 +1667,7 @@ st_error_t st_policy_add_netpattern(st_policy_t *policy, const char *pattern) {
 
 st_error_t st_policy_add_netpattern_view(st_policy_t *policy,
                                          st_netpattern_view_t pattern) {
-  if (!policy || !pattern.data || pattern.length == 0)
+  if ((!pattern.data) || (pattern.length == 0))
     return ST_ERR_INVALID;
   pthread_rwlock_wrlock(&policy->rwlock);
   st_error_t err = st_policy_add_locked_view(policy, pattern);
@@ -1849,7 +1755,7 @@ static st_error_t policy_batch_add_views(st_policy_t *policy,
 
 st_error_t st_policy_batch_add_netpattern_views(
     st_policy_t *policy, const st_netpattern_view_t *patterns, size_t count) {
-  if (!policy || !patterns || count == 0)
+  if ((!patterns) || (count == 0))
     return ST_ERR_INVALID;
   for (size_t i = 0; i < count; i++)
     if (!patterns[i].data || patterns[i].length == 0)
@@ -1860,7 +1766,7 @@ st_error_t st_policy_batch_add_netpattern_views(
 st_error_t st_policy_batch_add_netpatterns(st_policy_t *policy,
                                            const char *const *patterns,
                                            size_t count) {
-  if (!policy || !patterns || count == 0)
+  if ((!patterns) || (count == 0))
     return ST_ERR_INVALID;
   st_netpattern_view_t *views = calloc(count, sizeof(*views));
   if (!views)
@@ -1879,8 +1785,6 @@ st_error_t st_policy_batch_add_netpatterns(st_policy_t *policy,
 }
 
 st_error_t st_policy_merge(st_policy_t *dst, const st_policy_t *src) {
-  if (!dst || !src)
-    return ST_ERR_INVALID;
   if (dst == src)
     return ST_OK;
 
@@ -1946,10 +1850,8 @@ static bool pattern_array_contains_entry(const pattern_entry_t *entries,
 st_error_t st_policy_visit_diff(const st_policy_t *a, const st_policy_t *b,
                                 st_policy_diff_visitor_t visitor,
                                 void *user_ctx, size_t *visited_count) {
-  if (visited_count)
-    *visited_count = 0;
-  if (!a || !b || !visitor || !visited_count)
-    return ST_ERR_INVALID;
+  *visited_count = 0;
+
   if (a == b)
     return ST_OK;
 
@@ -2035,10 +1937,6 @@ static bool collect_policy_diff(st_policy_diff_kind_t kind,
 
 st_error_t st_policy_diff(const st_policy_t *a, const st_policy_t *b,
                           st_policy_diff_t *result) {
-  if (!a || !b || !result || result->added || result->added_count != 0 ||
-      result->removed || result->removed_count != 0)
-    return ST_ERR_INVALID;
-
   diff_collect_t collect = {.result = result};
   size_t visited = 0;
   st_error_t error =
@@ -2070,7 +1968,7 @@ void st_policy_diff_free(st_policy_diff_t *result) {
  * otherwise shadow a more-specific parameter branch added later. */
 st_error_t st_policy_remove_netpattern(st_policy_t *policy,
                                        const char *pattern) {
-  if (!policy || !pattern || !pattern[0])
+  if (!pattern[0])
     return ST_ERR_INVALID;
   return st_policy_remove_netpattern_view(
       policy,
@@ -2079,7 +1977,7 @@ st_error_t st_policy_remove_netpattern(st_policy_t *policy,
 
 st_error_t st_policy_remove_netpattern_view(st_policy_t *policy,
                                             st_netpattern_view_t pattern) {
-  if (!policy || !pattern.data || pattern.length == 0)
+  if ((!pattern.data) || (pattern.length == 0))
     return ST_ERR_INVALID;
 
   pthread_rwlock_wrlock(&policy->rwlock);
@@ -2132,9 +2030,6 @@ st_error_t st_policy_remove_netpattern_view(st_policy_t *policy,
  * returned.
  */
 st_error_t st_policy_compact(st_policy_t *policy) {
-  if (!policy)
-    return ST_ERR_INVALID;
-
   if (policy->pattern_count == 0)
     return ST_OK;
 
@@ -2248,9 +2143,6 @@ st_error_t st_policy_compact(st_policy_t *policy) {
 }
 
 st_error_t st_policy_clear(st_policy_t *policy) {
-  if (!policy)
-    return ST_ERR_INVALID;
-
   pthread_rwlock_wrlock(&policy->rwlock);
 
   /* Clear filters */
@@ -2289,8 +2181,6 @@ st_error_t st_policy_clear(st_policy_t *policy) {
 }
 
 size_t st_policy_rule_count(const st_policy_t *policy) {
-  if (!policy)
-    return 0;
   pthread_rwlock_rdlock((pthread_rwlock_t *)&policy->rwlock);
   size_t count = policy->pattern_count;
   pthread_rwlock_unlock((pthread_rwlock_t *)&policy->rwlock);
@@ -2299,40 +2189,17 @@ size_t st_policy_rule_count(const st_policy_t *policy) {
 
 /* --- VERIFICATION + SUGGESTIONS (unified) --- */
 
-/* Select display bytes for a token: preserve the original spelling for a
- * parameterized wildcard (for example, "#path.cfg"), otherwise use the type
- * symbol for a plain wildcard. The input text can be an unterminated view. */
-static void token_display_view(const st_token_t *token, const char **text,
-                               size_t *length) {
-  size_t token_length = token_text_length(token);
-  if (token->type == ST_TYPE_LITERAL ||
-      (token->text && memchr(token->text, '.', token_length) &&
-       type_supports_param(token->type))) {
-    *text = token->text;
-    *length = token_length;
-    return;
-  }
-  *text = st_type_symbol[token->type];
-  *length = strlen(*text);
-}
-
-/* Build a canonical netpattern from typed suggestion tokens. */
-static st_error_t st_build_pattern(char *buf, size_t buf_size,
-                                   size_t *out_length, const st_token_t *tokens,
-                                   size_t count) {
-  if (out_length)
-    *out_length = 0;
-  st_token_t display[ST_MAX_CMD_TOKENS];
-  if (count == 0 || count > ST_MAX_CMD_TOKENS)
-    return ST_ERR_INVALID;
-  for (size_t i = 0; i < count; i++) {
-    if (!tokens[i].text)
-      return ST_ERR_LIMIT;
-    display[i] = tokens[i];
-    token_display_view(&tokens[i], &display[i].text, &display[i].text_length);
-  }
+/* Write already-rendered policy tokens into a bounded canonical suggestion.
+ * Pattern tokens retain their metadata and compound components; concrete
+ * classified command values are rendered separately below. The caller supplies
+ * 1..ST_MAX_CMD_TOKENS tokens and required writable output storage. Encoding
+ * validates policy-token spellings and handles allocation/size failures. */
+static SHELL_NONNULL(1, 3, 4) st_error_t
+    st_build_pattern(char *buf, size_t buf_size, size_t *out_length,
+                     const st_token_t *tokens, size_t count) {
+  *out_length = 0;
   st_netpattern_t encoded = {0};
-  st_error_t err = st_netpattern_encode_owned(display, count, &encoded);
+  st_error_t err = st_netpattern_encode_owned(tokens, count, &encoded);
   if (err != ST_OK)
     return err;
   if (encoded.length >= buf_size) {
@@ -2341,10 +2208,65 @@ static st_error_t st_build_pattern(char *buf, size_t buf_size,
   }
   memcpy(buf, encoded.data, encoded.length);
   buf[encoded.length] = '\0';
-  if (out_length)
-    *out_length = encoded.length;
+  *out_length = encoded.length;
   st_netpattern_free(&encoded);
   return ST_OK;
+}
+
+/* Classified command payloads are data, never parameterized policy symbols.
+ * Non-literal tokens contribute only their classifier type; literal spans
+ * retain their exact length-delimited bytes, including embedded NUL. The caller
+ * supplies 1..ST_MAX_CMD_TOKENS valid classified tokens. */
+static SHELL_NONNULL(1, 3, 4) st_error_t
+    st_build_command_pattern(char *buf, size_t buf_size, size_t *out_length,
+                             const st_token_t *tokens, size_t count) {
+  st_token_t display[ST_MAX_CMD_TOKENS];
+  for (size_t i = 0; i < count; i++) {
+    display[i] = tokens[i];
+    if (tokens[i].type != ST_TYPE_LITERAL) {
+      display[i].text = st_type_symbol[tokens[i].type];
+      display[i].text_length = strlen(display[i].text);
+    }
+  }
+  return st_build_pattern(buf, buf_size, out_length, display, count);
+}
+
+/* Append one independently encoded candidate to a result with room remaining.
+ * Representation failures leave completed candidates available. Allocation
+ * failure clears the batch and stops generation; callers can then fail closed.
+ * tokens are valid classified command tokens, not policy spellings. */
+static SHELL_NONNULL(1, 2) bool offer_command_suggestion(
+    st_eval_result_t *result, const st_token_t *tokens, size_t count,
+    const char *based_on, size_t based_on_length, double confidence) {
+  st_expand_suggestion_t *candidate =
+      &result->suggestions[result->suggestion_count];
+  st_error_t error =
+      st_build_command_pattern(candidate->pattern, sizeof(candidate->pattern),
+                               &candidate->pattern_length, tokens, count);
+  if (error != ST_OK) {
+    memset(candidate, 0, sizeof(*candidate));
+    if (error == ST_ERR_MEMORY) {
+      memset(result->suggestions, 0, sizeof(result->suggestions));
+      result->suggestion_count = 0;
+      result->suggestion_error = error;
+      return false;
+    }
+    if (result->suggestion_error == ST_OK)
+      result->suggestion_error = error;
+    return true;
+  }
+  if (result->suggestion_count != 0 &&
+      bytes_equal(result->suggestions[0].pattern,
+                  result->suggestions[0].pattern_length, candidate->pattern,
+                  candidate->pattern_length)) {
+    memset(candidate, 0, sizeof(*candidate));
+    return true;
+  }
+  candidate->based_on = based_on;
+  candidate->based_on_length = based_on_length;
+  candidate->confidence = confidence;
+  result->suggestion_count++;
+  return true;
 }
 
 typedef struct {
@@ -2425,49 +2347,34 @@ static bool match_queue_append(match_entry_t **queue, match_entry_t *stack,
   return true;
 }
 
+/* child is an insertion-validated trie entry; compound offsets, capture type,
+ * and symbol length come from the canonical pattern decoder. text is a
+ * classified netargv payload, not a NUL-terminated capture or bounded pattern
+ * literal. Match its borrowed span without imposing pattern-storage limits. */
+static bool compound_child_matches(const child_entry_t *child, const char *text,
+                                   size_t text_length) SHELL_NONNULL(1, 2);
 static bool compound_child_matches(const child_entry_t *child, const char *text,
                                    size_t text_length) {
-  if (!child->compound || !child->text || !text)
+  if (!child->compound)
     return false;
   size_t prefix_length = child->compound_prefix_length;
   size_t symbol_length = child->compound_capture_length;
-  if (symbol_length >= ST_MAX_TOKEN_LEN || prefix_length > child->text_length ||
-      symbol_length > child->text_length - prefix_length ||
-      child->text_length - prefix_length - symbol_length < 2)
-    return false;
   size_t open = prefix_length;
   size_t close = open + 1 + symbol_length;
-  if (child->text[open] != '{' || child->text[close] != '}')
-    return false;
   size_t suffix_offset = close + 1;
   size_t suffix_length = child->text_length - suffix_offset;
-  if (text_length < prefix_length + suffix_length ||
-      memcmp(text, child->text, prefix_length) != 0 ||
-      memcmp(text + text_length - suffix_length, child->text + suffix_offset,
-             suffix_length) != 0)
+  const char *capture;
+  size_t capture_length;
+  if (!st_pattern_capture_span(text, text_length, child->text, prefix_length,
+                               child->text + suffix_offset, suffix_length,
+                               &capture, &capture_length))
     return false;
-  size_t capture_length = text_length - prefix_length - suffix_length;
-  if (capture_length >= ST_MAX_TOKEN_LEN)
-    return false;
-  char capture[ST_MAX_TOKEN_LEN];
-  memcpy(capture, text + prefix_length, capture_length);
-  capture[capture_length] = '\0';
-  char symbol[ST_MAX_TOKEN_LEN];
-  memcpy(symbol, child->text + open + 1, symbol_length);
-  symbol[symbol_length] = '\0';
   st_token_type_t wild_type = (st_token_type_t)child->compound_capture_type;
-  if (wild_type <= ST_TYPE_LITERAL || wild_type >= ST_TYPE_COUNT)
-    return false;
   st_token_type_t concrete_type =
       st_token_classify_bytes(capture, capture_length);
-  /* Parameter metadata is defined over textual values. An embedded NUL must
-   * never be interpreted as a shortened textual prefix. Generic wildcard
-   * types remain length-classified above. */
-  if (memchr(capture, '\0', capture_length) != NULL &&
-      st_wildcard_metadata(symbol, wild_type) != NULL)
-    return false;
-  return (runtime_match_mask(concrete_type) & (1ULL << wild_type)) != 0 &&
-         param_matches(capture, concrete_type, symbol, wild_type);
+  return st_pattern_wildcard_matches(capture, capture_length, concrete_type,
+                                     child->text + open + 1, symbol_length,
+                                     wild_type);
 }
 
 static st_error_t matching_walk_locked(const st_policy_t *policy,
@@ -2524,7 +2431,8 @@ static st_error_t matching_walk_locked(const st_policy_t *policy,
     for (uint16_t i = 0; i < state->wildcard_count; i++) {
       child_entry_t *child = &wild[i];
       if (!(runtime_match_mask(type) & (1ULL << child->type)) ||
-          !param_matches(text, type, child->text, (st_token_type_t)child->type))
+          !param_matches(text, text_length, type, child->text,
+                         (st_token_type_t)child->type))
         continue;
       if (!match_queue_append(
               &queue, stack_queue, &tail, &queue_cap,
@@ -2591,18 +2499,13 @@ static size_t policy_pattern_length(const st_policy_t *policy,
   return 0;
 }
 
-static void release_owned_tokens(st_token_array_t *tokens, bool owned) {
-  if (owned)
-    st_token_array_free(tokens);
-}
-
 static st_error_t policy_eval(st_policy_t *policy, st_netargv_view_t netargv,
                               st_eval_result_t *result, bool *matches) {
   if (matches)
     *matches = false;
   if (result)
     *result = (st_eval_result_t){0};
-  if (!policy || (!netargv.data && netargv.length != 0))
+  if ((!netargv.data) && (netargv.length != 0))
     return ST_ERR_INVALID;
 
   pthread_rwlock_rdlock((pthread_rwlock_t *)&policy->rwlock);
@@ -2611,24 +2514,14 @@ static st_error_t policy_eval(st_policy_t *policy, st_netargv_view_t netargv,
   atomic_fetch_add(&policy->stats.eval_count, 1);
 
   st_token_scratch_t scratch;
-  st_token_array_t owned = {0};
-  bool cmd_owned = false;
   st_error_t err = st_netargv_classify_scratch_view(netargv, &scratch);
-  if (err == ST_ERR_FAILED) {
-    err = st_netargv_classify_view(netargv, &owned);
-    cmd_owned = err == ST_OK;
-  }
   if (err != ST_OK) {
     pthread_rwlock_unlock(&policy->rwlock);
     return err;
   }
-  st_token_array_t cmd = cmd_owned
-                             ? owned
-                             : (st_token_array_t){.tokens = scratch.tokens,
-                                                  .count = scratch.count};
+  st_token_array_t cmd = {.tokens = scratch.tokens, .count = scratch.count};
 
   if (cmd.count == 0 || cmd.count > MAX_CMD_TOKENS) {
-    release_owned_tokens(&cmd, cmd_owned);
     pthread_rwlock_unlock(&policy->rwlock);
     if (result)
       result->matches = false;
@@ -2700,7 +2593,6 @@ static st_error_t policy_eval(st_policy_t *policy, st_netargv_view_t netargv,
   /* Verify-only fast path: filter rejected → skip trie walk entirely */
   if (filter_rejected && !result) {
     atomic_fetch_add(&policy->stats.filter_reject_count, 1);
-    release_owned_tokens(&cmd, cmd_owned);
     pthread_rwlock_unlock(&policy->rwlock);
     return ST_OK;
   }
@@ -2717,7 +2609,6 @@ static st_error_t policy_eval(st_policy_t *policy, st_netargv_view_t netargv,
   const char *best_pattern = NULL;
   err = matching_walk_locked(policy, &cmd, &frontier, &best_pattern);
   if (err != ST_OK) {
-    release_owned_tokens(&cmd, cmd_owned);
     pthread_rwlock_unlock(&policy->rwlock);
     return err;
   }
@@ -2725,7 +2616,6 @@ static st_error_t policy_eval(st_policy_t *policy, st_netargv_view_t netargv,
   assert(match_depth <= cmd.count);
   if (best_pattern) {
     match_frontier_free(&frontier);
-    release_owned_tokens(&cmd, cmd_owned);
     if (matches)
       *matches = true;
     if (result) {
@@ -2741,7 +2631,6 @@ static st_error_t policy_eval(st_policy_t *policy, st_netargv_view_t netargv,
   /* Verify-only: no match, no suggestions needed */
   if (!result) {
     match_frontier_free(&frontier);
-    release_owned_tokens(&cmd, cmd_owned);
     pthread_rwlock_unlock(&policy->rwlock);
     return ST_OK;
   }
@@ -2776,23 +2665,12 @@ static st_error_t policy_eval(st_policy_t *policy, st_netargv_view_t netargv,
       suggestion_tokens[i].type = ST_TYPE_LITERAL;
     }
 
-    st_error_t pattern_err = st_build_pattern(
-        result->suggestions[0].pattern, sizeof(result->suggestions[0].pattern),
-        &result->suggestions[0].pattern_length, suggestion_tokens, cmd.count);
-    if (pattern_err != ST_OK) {
-      release_owned_tokens(&cmd, cmd_owned);
-      result->suggestion_error = pattern_err;
-      pthread_rwlock_unlock(&policy->rwlock);
-      return ST_OK;
-    }
-    result->suggestions[0].based_on = based_on;
-    result->suggestions[0].based_on_length = based_on_length;
-    result->suggestions[0].confidence = confidence;
+    if (!offer_command_suggestion(result, suggestion_tokens, cmd.count,
+                                  based_on, based_on_length, confidence))
+      goto suggestions_done;
   }
 
   /* Suggestion B: best generalization */
-  size_t n_suggestions = 1;
-
   if (match_depth < cmd.count) {
     st_token_type_t div_type = cmd.tokens[match_depth].type;
     uint64_t wm = divergence_wildcard_mask;
@@ -2810,76 +2688,37 @@ static st_error_t policy_eval(st_policy_t *policy, st_netargv_view_t netargv,
       }
 
       if (best_wild != ST_TYPE_ANY) {
-        size_t pat_len = match_depth + 1;
-        memset(suggestion_tokens, 0, sizeof(suggestion_tokens));
-        for (size_t i = 0; i < match_depth; i++) {
-          suggestion_tokens[i].text = (char *)cmd.tokens[i].text;
-          suggestion_tokens[i].text_length = token_text_length(&cmd.tokens[i]);
-          suggestion_tokens[i].type = cmd.tokens[i].type;
-        }
+        /* Retain the complete candidate, including literal trailing argv. */
         suggestion_tokens[match_depth].text = (char *)st_type_symbol[best_wild];
         suggestion_tokens[match_depth].text_length =
             strlen(st_type_symbol[best_wild]);
         suggestion_tokens[match_depth].type = best_wild;
 
-        st_error_t pattern_err = st_build_pattern(
-            result->suggestions[1].pattern,
-            sizeof(result->suggestions[1].pattern),
-            &result->suggestions[1].pattern_length, suggestion_tokens, pat_len);
-        if (pattern_err != ST_OK) {
-          release_owned_tokens(&cmd, cmd_owned);
-          result->suggestion_error = pattern_err;
-          pthread_rwlock_unlock(&policy->rwlock);
-          return ST_OK;
-        }
-        result->suggestions[1].based_on = based_on;
-        result->suggestions[1].based_on_length = based_on_length;
-        result->suggestions[1].confidence = confidence;
-        n_suggestions = 2;
+        if (!offer_command_suggestion(result, suggestion_tokens, cmd.count,
+                                      based_on, based_on_length, confidence))
+          goto suggestions_done;
       }
     }
   }
 
-  if (n_suggestions < 2) {
-    st_error_t pattern_err = st_build_pattern(
-        result->suggestions[1].pattern, sizeof(result->suggestions[1].pattern),
-        &result->suggestions[1].pattern_length, cmd.tokens, cmd.count);
-    if (pattern_err != ST_OK) {
-      release_owned_tokens(&cmd, cmd_owned);
-      result->suggestion_error = pattern_err;
-      pthread_rwlock_unlock(&policy->rwlock);
-      return ST_OK;
-    }
-    if (!bytes_equal(result->suggestions[0].pattern,
-                     result->suggestions[0].pattern_length,
-                     result->suggestions[1].pattern,
-                     result->suggestions[1].pattern_length)) {
-      result->suggestions[1].based_on = NULL;
-      result->suggestions[1].based_on_length = 0;
-      result->suggestions[1].confidence = confidence;
-      n_suggestions = 2;
-    }
-  }
+  if (result->suggestion_count < 2)
+    offer_command_suggestion(result, cmd.tokens, cmd.count, NULL, 0,
+                             confidence);
 
-  result->suggestion_count = n_suggestions;
-  atomic_fetch_add(&policy->stats.suggestion_count, (uint64_t)n_suggestions);
-  release_owned_tokens(&cmd, cmd_owned);
+suggestions_done:
+  atomic_fetch_add(&policy->stats.suggestion_count,
+                   (uint64_t)result->suggestion_count);
   pthread_rwlock_unlock((pthread_rwlock_t *)&policy->rwlock);
   return ST_OK;
 }
 
 st_error_t st_policy_eval_view(st_policy_t *policy, st_netargv_view_t netargv,
                                st_eval_result_t *result) {
-  if (!result)
-    return ST_ERR_INVALID;
   return policy_eval(policy, netargv, result, NULL);
 }
 
 st_error_t st_policy_eval(st_policy_t *policy, const char *netargv,
                           st_eval_result_t *result) {
-  if (!netargv)
-    return st_policy_eval_view(
-        policy, (st_netargv_view_t){.data = NULL, .length = 1}, result);
   return st_policy_eval_view(
       policy, (st_netargv_view_t){.data = netargv, .length = strlen(netargv)},
       result);
@@ -2887,20 +2726,13 @@ st_error_t st_policy_eval(st_policy_t *policy, const char *netargv,
 
 st_error_t st_policy_match_view(st_policy_t *policy, st_netargv_view_t netargv,
                                 bool *matches) {
-  if (matches)
-    *matches = false;
-  if (!matches)
-    return ST_ERR_INVALID;
+  *matches = false;
+
   return policy_eval(policy, netargv, NULL, matches);
 }
 
 st_error_t st_policy_match(st_policy_t *policy, const char *netargv,
                            bool *matches) {
-  if (!netargv) {
-    if (matches)
-      *matches = false;
-    return ST_ERR_INVALID;
-  }
   return st_policy_match_view(
       policy, (st_netargv_view_t){.data = netargv, .length = strlen(netargv)},
       matches);
@@ -2917,29 +2749,17 @@ static st_error_t policy_visit_matches(const st_policy_t *policy,
                                        st_netargv_view_t netargv,
                                        st_policy_match_visitor_t visitor,
                                        void *user_ctx, size_t *visited_count) {
-  if (visited_count)
-    *visited_count = 0;
-  if (!policy || (!netargv.data && netargv.length != 0) || !visitor ||
-      !visited_count)
+  *visited_count = 0;
+  if ((!netargv.data) && (netargv.length != 0))
     return ST_ERR_INVALID;
 
   st_token_scratch_t scratch;
-  st_token_array_t owned = {0};
-  bool cmd_owned = false;
   st_error_t err = st_netargv_classify_scratch_view(netargv, &scratch);
-  if (err == ST_ERR_FAILED) {
-    err = st_netargv_classify_view(netargv, &owned);
-    cmd_owned = err == ST_OK;
-  }
   if (err != ST_OK)
     return err;
-  st_token_array_t cmd = cmd_owned
-                             ? owned
-                             : (st_token_array_t){.tokens = scratch.tokens,
-                                                  .count = scratch.count};
+  st_token_array_t cmd = {.tokens = scratch.tokens, .count = scratch.count};
 
   if (cmd.count == 0 || cmd.count > MAX_CMD_TOKENS) {
-    release_owned_tokens(&cmd, cmd_owned);
     return ST_OK;
   }
 
@@ -3026,7 +2846,8 @@ static st_error_t policy_visit_matches(const st_policy_t *policy,
     for (uint16_t wi = 0; wi < state->wildcard_count; wi++) {
       child_entry_t *c = &wild[wi];
       if ((runtime_match_mask(ctype) & (1ULL << c->type)) &&
-          param_matches(ctext, ctype, c->text, (st_token_type_t)c->type)) {
+          param_matches(ctext, ctext_length, ctype, c->text,
+                        (st_token_type_t)c->type)) {
         if (tail == queue_cap) {
           if (queue_cap > SIZE_MAX / 2 ||
               queue_cap * 2 > SIZE_MAX / sizeof(*queue)) {
@@ -3057,7 +2878,6 @@ cleanup:
   if (queue != stack_queue)
     free(queue);
   pthread_rwlock_unlock((pthread_rwlock_t *)&policy->rwlock);
-  release_owned_tokens(&cmd, cmd_owned);
 
   if (result != ST_OK) {
     return result;
@@ -3078,11 +2898,6 @@ st_error_t st_policy_visit_matches(const st_policy_t *policy,
                                    const char *netargv,
                                    st_policy_match_visitor_t visitor,
                                    void *user_ctx, size_t *visited_count) {
-  if (!netargv) {
-    if (visited_count)
-      *visited_count = 0;
-    return ST_ERR_INVALID;
-  }
   return st_policy_visit_matches_view(
       policy, (st_netargv_view_t){.data = netargv, .length = strlen(netargv)},
       visitor, user_ctx, visited_count);
@@ -3113,12 +2928,9 @@ st_error_t st_policy_verify_all_view(const st_policy_t *policy,
                                      st_netargv_view_t netargv,
                                      st_netpattern_view_t **matching_patterns,
                                      size_t *match_count) {
-  if (matching_patterns)
-    *matching_patterns = NULL;
-  if (match_count)
-    *match_count = 0;
-  if (!matching_patterns || !match_count)
-    return ST_ERR_INVALID;
+  *matching_patterns = NULL;
+  *match_count = 0;
+
   match_list_t list = {0};
   size_t visited = 0;
   st_error_t error = policy_visit_matches(policy, netargv, collect_policy_match,
@@ -3135,10 +2947,6 @@ st_error_t st_policy_verify_all_view(const st_policy_t *policy,
 st_error_t st_policy_verify_all(const st_policy_t *policy, const char *netargv,
                                 st_netpattern_view_t **matching_patterns,
                                 size_t *match_count) {
-  if (!netargv)
-    return st_policy_verify_all_view(
-        policy, (st_netargv_view_t){.data = NULL, .length = 1},
-        matching_patterns, match_count);
   return st_policy_verify_all_view(
       policy, (st_netargv_view_t){.data = netargv, .length = strlen(netargv)},
       matching_patterns, match_count);
@@ -3453,9 +3261,6 @@ static bool nfa_write(nfa_ctx_t *c, FILE *fp) {
 
 st_error_t st_policy_render_nfa(const st_policy_t *policy, const char *path,
                                 const st_nfa_render_opts_t *opts) {
-  if (!policy || !path)
-    return ST_ERR_INVALID;
-
   const char *identifier = opts ? opts->identifier : NULL;
   if (identifier)
     for (const unsigned char *p = (const unsigned char *)identifier; *p; p++)
@@ -3538,8 +3343,9 @@ st_error_t st_policy_render_nfa(const st_policy_t *policy, const char *path,
  *   # CRC32: <hex>
  *
  * The CRC covers every complete framed record including its trailing newline.
- * The length frame makes embedded whitespace and newlines unambiguous. Version
- * 1 line-oriented CPL files remain loadable and are canonicalized on import.
+ * The length frame makes embedded whitespace and newlines unambiguous. Only
+ * version 3 is accepted; CPL conversion belongs to human-facing boundaries,
+ * not persisted policy loading.
  */
 
 #define ST_SERIALIZATION_VERSION 3
@@ -3593,9 +3399,6 @@ static void dfs_save(st_policy_t *policy, uint32_t idx,
 }
 
 st_error_t st_policy_save(const st_policy_t *policy, const char *path) {
-  if (!policy || !path)
-    return ST_ERR_INVALID;
-
   st_atomic_output_t output;
   st_atomic_output_result_t begin = st_atomic_output_begin(path, &output);
   if (begin != ST_ATOMIC_OUTPUT_OK)
@@ -3642,19 +3445,15 @@ st_error_t st_policy_save(const st_policy_t *policy, const char *path) {
 }
 
 /*
- * NOTE: By default, st_policy_load appends to an existing policy.
- * If clear_first is true, the policy is reset before loading.
- *
- * If clear_first is false and an error occurs (CRC mismatch, parse error,
- * memory failure), the policy counts are rolled back to their pre-load state.
- * Any arena memory allocated during the failed load is orphaned but will be
- * reclaimed on st_policy_ctx_reset or when the policy/context is freed.
+ * Read and validate the complete v3 file, including CRC and close, before
+ * staging a replacement policy. clear_first selects replacement versus merge
+ * with the existing policy; it does not clear live state before validation.
+ * Publish only after staging succeeds. Both modes preserve the live policy on
+ * every failure. Interned strings acquired by failed staging remain owned by
+ * the shared context until reset or destruction.
  */
 st_error_t st_policy_load(st_policy_t *policy, const char *path,
                           bool clear_first) {
-  if (!policy || !path)
-    return ST_ERR_INVALID;
-
   /* --- PASS 1: Read file, verify CRC, collect pattern lines ---
    * Do NOT modify the policy yet.
    */
@@ -3928,8 +3727,6 @@ static size_t policy_working_set_unlocked(const st_policy_t *policy) {
 }
 
 size_t st_policy_memory_usage(const st_policy_t *policy) {
-  if (!policy)
-    return 0;
   pthread_rwlock_rdlock((pthread_rwlock_t *)&policy->rwlock);
   size_t result = policy_memory_usage_unlocked(policy);
   pthread_rwlock_unlock((pthread_rwlock_t *)&policy->rwlock);
@@ -3937,8 +3734,6 @@ size_t st_policy_memory_usage(const st_policy_t *policy) {
 }
 
 size_t st_policy_working_set(const st_policy_t *policy) {
-  if (!policy)
-    return 0;
   pthread_rwlock_rdlock((pthread_rwlock_t *)&policy->rwlock);
   size_t result = policy_working_set_unlocked(policy);
   pthread_rwlock_unlock((pthread_rwlock_t *)&policy->rwlock);
@@ -3946,8 +3741,6 @@ size_t st_policy_working_set(const st_policy_t *policy) {
 }
 
 size_t st_policy_state_count(const st_policy_t *policy) {
-  if (!policy)
-    return 0;
   pthread_rwlock_rdlock((pthread_rwlock_t *)&policy->rwlock);
   size_t result = policy->states.count;
   pthread_rwlock_unlock((pthread_rwlock_t *)&policy->rwlock);
@@ -4009,9 +3802,6 @@ static bool dot_write_label(FILE *fp, const char *label, size_t length) {
 }
 
 st_error_t st_policy_dump_dot(const st_policy_t *policy, const char *path) {
-  if (!policy || !path)
-    return ST_ERR_INVALID;
-
   pthread_rwlock_rdlock((pthread_rwlock_t *)&policy->rwlock);
   FILE *fp = fopen(path, "w");
   if (!fp) {
@@ -4146,11 +3936,10 @@ st_error_t st_policy_dump_dot(const st_policy_t *policy, const char *path) {
 st_error_t st_policy_simulate_add_netpattern_view(
     const st_policy_t *policy, st_netpattern_view_t netpattern,
     bool *would_match, st_netpattern_view_t *conflicting_pattern) {
-  if (would_match)
-    *would_match = false;
+  *would_match = false;
   if (conflicting_pattern)
     *conflicting_pattern = (st_netpattern_view_t){0};
-  if (!policy || !netpattern.data || !would_match)
+  if (!netpattern.data)
     return ST_ERR_INVALID;
 
   st_token_array_t decoded = {0};
@@ -4159,8 +3948,7 @@ st_error_t st_policy_simulate_add_netpattern_view(
     return decode_error;
   st_token_t *tokens = decoded.tokens;
   size_t token_count = decoded.count;
-  if (token_count == 0 || token_count > ST_MAX_CMD_TOKENS ||
-      tokens[0].type == ST_TYPE_ANY) {
+  if (!st_pattern_token_type_allowed(tokens, 0, tokens[0].type)) {
     free_pattern_tokens(tokens, token_count);
     return ST_ERR_INVALID;
   }
@@ -4193,8 +3981,7 @@ st_error_t st_policy_simulate_add_netpattern(const st_policy_t *policy,
                                              const char **conflicting_pattern) {
   if (conflicting_pattern)
     *conflicting_pattern = NULL;
-  if (!netpattern)
-    return ST_ERR_INVALID;
+
   st_netpattern_view_t conflict = {0};
   st_error_t error = st_policy_simulate_add_netpattern_view(
       policy,
@@ -4229,16 +4016,13 @@ static bool is_safe_immediate_cover(st_token_type_t type,
 size_t st_policy_suggest_variants(const st_policy_t *policy,
                                   const st_token_t *tokens, size_t token_count,
                                   st_expand_suggestion_t out[3]) {
-  if (out)
-    memset(out, 0, 3 * sizeof(*out));
-  if (!policy || !tokens || !out || token_count == 0 ||
-      token_count > ST_MAX_CMD_TOKENS)
+  memset(out, 0, 3 * sizeof(*out));
+  if ((token_count == 0) || (token_count > ST_MAX_CMD_TOKENS))
     return 0;
-  for (size_t i = 0; i < token_count; i++) {
-    if (!tokens[i].text || tokens[i].type < ST_TYPE_LITERAL ||
-        tokens[i].type >= ST_TYPE_COUNT)
-      return 0;
-  }
+  /* This operation produces lattice variants without reading policy state. */
+  if (!st_pattern_token_type_allowed(tokens, 0, tokens[0].type))
+    return 0;
+  (void)policy;
 
   /* Variant 0: exact match as literal */
   {
@@ -4252,11 +4036,7 @@ size_t st_policy_suggest_variants(const st_policy_t *policy,
     }
     if (st_build_pattern(out[0].pattern, sizeof(out[0].pattern),
                          &out[0].pattern_length, lit_tokens,
-                         token_count) != ST_OK ||
-        st_netpattern_validate_view(
-            (st_netpattern_view_t){.data = out[0].pattern,
-                                   .length = out[0].pattern_length},
-            NULL) != ST_OK) {
+                         token_count) != ST_OK) {
       free(lit_tokens);
       memset(out, 0, 3 * sizeof(*out));
       return 0;
@@ -4270,13 +4050,14 @@ size_t st_policy_suggest_variants(const st_policy_t *policy,
   /* Variants 1..N: widen one non-literal token at a time */
   size_t n_variants = 1;
   for (size_t i = 0; i < token_count && n_variants < 3; i++) {
-    if (tokens[i].type == ST_TYPE_LITERAL)
+    st_token_type_t type = st_token_edit_type(&tokens[i]);
+    if (type == ST_TYPE_LITERAL)
       continue;
 
     for (int candidate = ST_TYPE_LITERAL + 1;
          candidate < ST_TYPE_COUNT && n_variants < 3; candidate++) {
       st_token_type_t wider = (st_token_type_t)candidate;
-      if (!is_safe_immediate_cover(tokens[i].type, wider))
+      if (!is_safe_immediate_cover(type, wider))
         continue;
 
       st_token_t *pat_tokens = calloc(token_count, sizeof(st_token_t));
@@ -4286,18 +4067,20 @@ size_t st_policy_suggest_variants(const st_policy_t *policy,
       }
       for (size_t j = 0; j < token_count; j++)
         pat_tokens[j] = tokens[j];
-      pat_tokens[i].text = (char *)st_type_symbol[wider];
-      pat_tokens[i].text_length = strlen(st_type_symbol[wider]);
-      pat_tokens[i].type = wider;
+      if (tokens[i].compound) {
+        pat_tokens[i].capture = st_type_symbol[wider];
+        pat_tokens[i].capture_length = strlen(st_type_symbol[wider]);
+        pat_tokens[i].capture_type = wider;
+      } else {
+        pat_tokens[i].text = st_type_symbol[wider];
+        pat_tokens[i].text_length = strlen(st_type_symbol[wider]);
+        pat_tokens[i].type = wider;
+      }
 
       if (st_build_pattern(out[n_variants].pattern,
                            sizeof(out[n_variants].pattern),
                            &out[n_variants].pattern_length, pat_tokens,
-                           token_count) != ST_OK ||
-          st_netpattern_validate_view(
-              (st_netpattern_view_t){.data = out[n_variants].pattern,
-                                     .length = out[n_variants].pattern_length},
-              NULL) != ST_OK) {
+                           token_count) != ST_OK) {
         free(pat_tokens);
         memset(out, 0, 3 * sizeof(*out));
         return 0;

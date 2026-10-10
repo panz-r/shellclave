@@ -40,7 +40,48 @@ static bool check_depgraph_workspace_api() {
   bool ok = shell_dep_graph_parse("echo hello", std::strlen("echo hello"), ".",
                                   &limits, &graph) == SHELL_DEP_OK &&
             shell_dep_graph_validate(&graph).valid;
+  if (ok) {
+    constexpr char timed[] = "time -p echo hello | cat";
+    ok = shell_dep_graph_parse(timed, sizeof(timed) - 1, ".", &limits,
+                               &graph) == SHELL_DEP_OK &&
+         shell_dep_graph_validate(&graph).valid;
+    std::uint32_t timers = 0;
+    std::uint32_t timed_commands = 0;
+    for (std::uint32_t i = 0; ok && i < graph.node_count; ++i) {
+      if (graph.nodes[i].type == SHELL_NODE_TIME) {
+        ++timers;
+        ok = graph.nodes[i].time.mode == SHELL_PIPE_TIME_POSIX &&
+             graph.nodes[i].time.report_route == SHELL_TIME_REPORT_EXTERNAL &&
+             graph.nodes[i].time.report_target_fd == 2 &&
+             graph.nodes[i].time.report_route_flags ==
+                 SHELL_TIME_REPORT_ROUTE_EXTERNAL &&
+             graph.nodes[i].time.report_external_fd_count == 1 &&
+             graph.nodes[i].time.report_external_fds[0] == 2;
+      } else if (graph.nodes[i].type == SHELL_NODE_CMD) {
+        ok = graph.nodes[i].cmd.pipeline_time_mode == SHELL_PIPE_TIME_POSIX &&
+             graph.nodes[i].cmd.pipeline_time_id != 0;
+        ++timed_commands;
+      }
+    }
+    ok = ok && timers == 1 && timed_commands == 2;
+  }
   std::free(raw);
+  return ok;
+}
+
+static bool check_validation_details_api() {
+  st_netpattern_t pattern{};
+  st_token_array_t details{};
+  bool ok =
+      st_netpattern_from_cpl_owned("tool pre{#n}post", &pattern) == ST_OK &&
+      st_netpattern_validate_view({pattern.data, pattern.length}, &details) ==
+          ST_OK &&
+      details.count == 2 && details.tokens[1].compound &&
+      details.tokens[1].capture_type == ST_TYPE_NUMBER &&
+      details.tokens[1].prefix_length == 3 &&
+      details.tokens[1].suffix_length == 4;
+  st_token_array_free(&details);
+  st_netpattern_free(&pattern);
   return ok;
 }
 
@@ -66,6 +107,8 @@ int main() {
 
   if (!check_depgraph_workspace_api())
     return 4;
+  if (!check_validation_details_api())
+    return 7;
 
   sg_gate_t *gate = sg_gate_new();
   if (!gate)

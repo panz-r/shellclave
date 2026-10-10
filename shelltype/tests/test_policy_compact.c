@@ -1,12 +1,13 @@
 /* Integration tests for large policy compaction and NFA rendering. */
 
+#include "../../tests/atomic_file_fixture.h"
 #include "metadata.h"
 #include "shelltype.h"
 #include "test_allocator.h"
 #include "test_io.h"
 #include "test_netargv.h"
 #include <ctype.h>
-#include <glob.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,6 +18,14 @@
 static int tests_run;
 static int tests_passed;
 static int tests_failed;
+static char nfa_save_directory[256];
+
+static void cleanup_nfa_save_directory(void) {
+  if (nfa_save_directory[0]) {
+    (void)test_atomic_cleanup_directory(nfa_save_directory);
+    nfa_save_directory[0] = '\0';
+  }
+}
 
 static int pattern_is_cpl(const char *actual, const char *cpl) {
   if (!actual || !cpl)
@@ -64,24 +73,11 @@ static st_policy_t *new_policy(st_policy_ctx_t *context,
 }
 
 static int no_atomic_temps(const char *path) {
-  char pattern[512];
-  glob_t matches = {0};
-  if (snprintf(pattern, sizeof(pattern), "%s.*", path) < 0)
-    return 0;
-  int result = glob(pattern, 0, NULL, &matches);
-  globfree(&matches);
-  return result == GLOB_NOMATCH;
+  return test_atomic_temp_files(path, false);
 }
 
 static void remove_atomic_temps(const char *path) {
-  char pattern[512];
-  glob_t matches = {0};
-  if (snprintf(pattern, sizeof(pattern), "%s.*", path) < 0)
-    return;
-  if (glob(pattern, 0, NULL, &matches) == 0)
-    for (size_t i = 0; i < matches.gl_pathc; i++)
-      (void)unlink(matches.gl_pathv[i]);
-  globfree(&matches);
+  (void)test_atomic_temp_files(path, true);
 }
 
 static int eval_matches(st_policy_t *policy, const char *command,
@@ -571,8 +567,7 @@ static int test_nfa_rendering_contract(void) {
     bool include_tags;
   } cases[] = {{&options, "compact-policy-test", 0x05, 7, true},
                {NULL, "rbox policy", 0x01, 1, false}};
-  ASSERT(st_policy_render_nfa(NULL, path, &options) == ST_ERR_INVALID);
-  ASSERT(st_policy_render_nfa(policy, NULL, &options) == ST_ERR_INVALID);
+
   st_nfa_render_opts_t hostile = options;
   hostile.identifier = "injected\nStates: 0";
   ASSERT(st_policy_render_nfa(policy, path, &hostile) == ST_ERR_INVALID);
@@ -1121,8 +1116,12 @@ static int rendered_identifier_is(const char *path, const char *identifier) {
 }
 
 static int test_nfa_atomic_io_and_crash_boundaries(void) {
-  char path[] = "/tmp/shelltype-nfa-atomic-XXXXXX";
-  int fd = mkstemp(path);
+  char directory[] = "/tmp/shelltype-nfa-atomic-XXXXXX";
+  ASSERT(mkdtemp(directory) != NULL);
+  strcpy(nfa_save_directory, directory);
+  char path[256];
+  snprintf(path, sizeof(path), "%s/nfa", directory);
+  int fd = open(path, O_CREAT | O_EXCL | O_WRONLY, 0600);
   ASSERT(fd >= 0 && close(fd) == 0);
   st_policy_ctx_t *context = st_policy_ctx_new();
   st_policy_t *policy = st_policy_new(context);
@@ -1165,11 +1164,14 @@ static int test_nfa_atomic_io_and_crash_boundaries(void) {
     ASSERT(rendered_identifier_is(path, "old-nfa") ||
            rendered_identifier_is(path, "new-nfa"));
     remove_atomic_temps(path);
+    ASSERT(no_atomic_temps(path));
   }
 
   st_policy_free(policy);
   st_policy_ctx_release(context);
   ASSERT(unlink(path) == 0);
+  ASSERT(rmdir(directory) == 0);
+  nfa_save_directory[0] = '\0';
   return 1;
 }
 
@@ -1317,6 +1319,7 @@ static int test_atomic_writers_preserve_regular_file_modes(void) {
 }
 
 int main(void) {
+  atexit(cleanup_nfa_save_directory);
   printf("Running compact policy tests...\n\n");
   TEST(test_large_policy_compaction);
   TEST(test_compaction_allocation_failures_are_atomic);

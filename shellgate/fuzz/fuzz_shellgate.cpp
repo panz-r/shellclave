@@ -14,6 +14,7 @@
  *   ./shellgate/fuzz/run_fuzzing_4h.sh 1 300
  */
 
+#include "../../shellsplit/tests/word_expansion_cases.h"
 #include "brace_fuzz_case.h"
 
 #include <fuzzer/FuzzedDataProvider.h>
@@ -239,6 +240,8 @@ void validate_result(const sg_result_t *result, sg_error_t error,
             static_cast<int32_t>(result->subcommand_count) ||
         subcommand->substitution_consumer_index == static_cast<int32_t>(i))
       invariant_failure("subcommand string outside the output buffer");
+    if (subcommand->pipeline_time_mode > SHELL_PIPE_TIME_POSIX)
+      invariant_failure("subcommand pipeline time mode is invalid");
     if ((subcommand->group_depth == 0) !=
             (subcommand->group_kinds == SHELL_GROUP_NONE) ||
         (subcommand->group_kinds &
@@ -332,6 +335,7 @@ bool results_equal(const sg_result_t &left, const sg_result_t &right) {
         a.substitution_consumer_index != b.substitution_consumer_index ||
         a.group_parent_index != b.group_parent_index ||
         a.group_depth != b.group_depth || a.group_kinds != b.group_kinds ||
+        a.pipeline_time_mode != b.pipeline_time_mode ||
         a.violation_category_flags != b.violation_category_flags ||
         a.violation_type_flags != b.violation_type_flags)
       return false;
@@ -353,6 +357,58 @@ bool results_equal(const sg_result_t &left, const sg_result_t &right) {
       return false;
   }
   return true;
+}
+
+/* Callback eligibility is a source-word contract, not a raw punctuation scan.
+ */
+struct expansion_query_oracle {
+  const char *expected;
+  size_t calls;
+};
+
+sg_expand_status_t oracle_expand_word(const char *query, size_t length,
+                                      const char **netargv,
+                                      size_t *netargv_length, void *userdata) {
+  auto *state = static_cast<expansion_query_oracle *>(userdata);
+  state->calls++;
+  if (!state->expected || strlen(state->expected) != length ||
+      memcmp(state->expected, query, length) != 0)
+    invariant_failure("unexpected source-word expansion query");
+  *netargv = "3:hit,";
+  *netargv_length = sizeof("3:hit,") - 1;
+  return SG_EXPAND_RESOLVED;
+}
+
+void run_expansion_query_oracles() {
+  sg_gate_t *gate = sg_gate_new();
+  expansion_query_oracle state = {};
+  if (!gate ||
+      sg_gate_set_expand_glob_netargv(gate, oracle_expand_word, &state) !=
+          SG_OK ||
+      sg_gate_set_expand_var_netargv(gate, oracle_expand_word, &state) !=
+          SG_OK ||
+      sg_gate_set_suggestions(gate, false) != SG_OK)
+    invariant_failure("expansion oracle setup failed");
+  reusable_eval_buffer buffer;
+  auto check = [&](const char *word, const char *expected,
+                   bool unsupported = false) {
+    std::string source = std::string("echo ") + word;
+    state = {expected, 0};
+    if (!buffer.reset_for(source.size()))
+      invariant_failure("expansion oracle buffer allocation failed");
+    sg_result_t result = {};
+    sg_error_t error = sg_gate_evaluate(gate, source.data(), source.size(),
+                                        buffer.data(), buffer.size(), &result);
+    if (error != (unsupported ? SG_ERR_PARSE : SG_OK) ||
+        (unsupported && result.verdict != SG_VERDICT_REJECT) ||
+        state.calls != static_cast<size_t>(expected != nullptr))
+      invariant_failure("source-word expansion callback contract mismatch");
+  };
+  for (const auto &fixture : shellsplit_test_glob_words)
+    check(fixture.word, fixture.glob ? fixture.word : nullptr);
+  for (const auto &fixture : shellsplit_test_parameter_words)
+    check(fixture.word, fixture.name, fixture.unsupported);
+  sg_gate_free(gate);
 }
 
 /* A buffer can be too small both for the mandatory depgraph workspace and for
@@ -381,6 +437,309 @@ void run_evaluation_buffer_contract_oracle() {
  * containing command. Shell-word substitutions contribute to conditional
  * allowance; process substitutions instead expose dynamic descriptor I/O. */
 void run_semantic_reference_oracles() {
+  sg_gate_t *option_gate = sg_gate_new();
+  if (!option_gate || sg_gate_set_reject_mask(option_gate, 0) != SG_OK ||
+      sg_gate_set_stop_mode(option_gate, SG_EVAL_ALL) != SG_OK)
+    invariant_failure("builtin option oracle gate setup failed");
+  sg_violation_config_t expansion_config = {};
+  expansion_config.redirect_fanout_threshold = UINT32_MAX;
+  expansion_config.sensitive_write_path_count = 1;
+  expansion_config.sensitive_write_paths[0] = "out";
+  if (sg_gate_set_violation_config_borrowed(option_gate, &expansion_config) !=
+      SG_OK)
+    invariant_failure("expansion control violation configuration failed");
+  for (const auto &fixture : shellsplit_test_expansion_time_routes) {
+    size_t length = std::strlen(fixture.source);
+    auto &buffer = eval_buffer_for(g_eval_buffers.result, length);
+    sg_result_t result = {};
+    sg_error_t error = sg_gate_evaluate(option_gate, fixture.source, length,
+                                        buffer.data(), buffer.size(), &result);
+    validate_result(&result, error, buffer.data(), buffer.size());
+    bool named_write = false;
+    for (uint32_t c = 0; c < result.subcommand_count; c++) {
+      const auto &command = result.subcommands[c];
+      named_write |=
+          std::strcmp(command.netargv, "6:printf,7:payload,") == 0 &&
+          (command.violation_type_flags & SG_VIOL_WRITE_SENSITIVE) != 0;
+    }
+    if (error != SG_OK || result.truncated ||
+        result.requires_substitution_evaluation ||
+        result.has_dynamic_substitution_io ||
+        named_write != fixture.named_write)
+      invariant_failure("expansion control timing contract mismatch");
+  }
+  for (bool redirect : {false, true}) {
+    expansion_config.sensitive_write_paths[0] =
+        redirect ? "redirect-out" : "argv-out";
+    if (sg_gate_set_cwd(option_gate, "/workspace") != SG_OK ||
+        sg_gate_set_violation_config_borrowed(option_gate, &expansion_config) !=
+            SG_OK)
+      invariant_failure("expansion setup violation configuration failed");
+    for (const auto &fixture : shellsplit_test_expansion_setup) {
+      size_t length = std::strlen(fixture.source);
+      auto &buffer = eval_buffer_for(g_eval_buffers.result, length);
+      sg_result_t result = {};
+      sg_error_t error =
+          sg_gate_evaluate(option_gate, fixture.source, length, buffer.data(),
+                           buffer.size(), &result);
+      validate_result(&result, error, buffer.data(), buffer.size());
+      bool inspection = fixture.active && fixture.shell_word;
+      bool writer = !redirect && fixture.active && fixture.writer;
+      if (error != SG_OK || result.truncated ||
+          result.requires_substitution_evaluation != inspection ||
+          (inspection && !result.has_dynamic_substitution_io) ||
+          (!fixture.active && result.has_dynamic_substitution_io) ||
+          ((result.violation_type_flags & SG_VIOL_WRITE_SENSITIVE) != 0) !=
+              writer) {
+        std::fprintf(stderr, "expansion setup oracle: %s\n", fixture.source);
+        invariant_failure("expansion phase eligibility contract mismatch");
+      }
+    }
+  }
+  for (const auto &fixture : shellsplit_test_builtin_options) {
+    size_t length = std::strlen(fixture.source);
+    reusable_eval_buffer &buffer =
+        eval_buffer_for(g_eval_buffers.result, length);
+    sg_result_t result = {};
+    sg_error_t error = sg_gate_evaluate(option_gate, fixture.source, length,
+                                        buffer.data(), buffer.size(), &result);
+    if (fixture.supported
+            ? error != SG_OK || result.verdict == SG_VERDICT_REJECT
+            : error != SG_ERR_PARSE || result.verdict != SG_VERDICT_REJECT)
+      invariant_failure("builtin option grammar contract mismatch");
+    validate_result(&result, error, buffer.data(), buffer.size());
+  }
+  for (const auto &fixture : shellsplit_test_builtin_routes) {
+    size_t length = std::strlen(fixture.source);
+    reusable_eval_buffer &buffer =
+        eval_buffer_for(g_eval_buffers.result, length);
+    sg_result_t result = {};
+    sg_error_t error = sg_gate_evaluate(option_gate, fixture.source, length,
+                                        buffer.data(), buffer.size(), &result);
+    if (fixture.resolved
+            ? error != SG_OK || result.verdict == SG_VERDICT_REJECT
+            : error != SG_ERR_PARSE || result.verdict != SG_VERDICT_REJECT)
+      invariant_failure("builtin operand routing contract mismatch");
+    validate_result(&result, error, buffer.data(), buffer.size());
+  }
+  sg_violation_config_t outcome_config;
+  sg_violation_config_default(&outcome_config);
+  outcome_config.sensitive_write_paths[0] = "out";
+  outcome_config.sensitive_write_path_count = 1;
+  if (sg_gate_set_cwd(option_gate, "/workspace") != SG_OK ||
+      sg_gate_set_violation_config_borrowed(option_gate, &outcome_config) !=
+          SG_OK)
+    invariant_failure("scope outcome violation configuration failed");
+  for (const auto &fixture : shellsplit_test_ifs_routes) {
+    size_t length = std::strlen(fixture.source);
+    auto &buffer = eval_buffer_for(g_eval_buffers.result, length);
+    sg_result_t result = {};
+    sg_error_t error = sg_gate_evaluate(option_gate, fixture.source, length,
+                                        buffer.data(), buffer.size(), &result);
+    validate_result(&result, error, buffer.data(), buffer.size());
+    if (!fixture.supported) {
+      if (error != SG_ERR_PARSE || result.verdict != SG_VERDICT_REJECT)
+        invariant_failure("IFS unsupported route contract mismatch");
+      continue;
+    }
+    if (error != SG_OK || result.truncated)
+      invariant_failure("IFS route evaluation failed");
+    bool found = false;
+    for (uint32_t c = 0; c < result.subcommand_count; c++) {
+      const auto &command = result.subcommands[c];
+      if (std::strcmp(command.netargv, "6:printf,7:payload,"))
+        continue;
+      found = true;
+      bool writes =
+          (command.violation_type_flags & SG_VIOL_WRITE_SENSITIVE) != 0;
+      if (writes != fixture.writes)
+        invariant_failure("IFS sensitive-write route mismatch");
+    }
+    if (!found)
+      invariant_failure("IFS route lost its printf command");
+  }
+  for (const auto &fixture : shellsplit_test_setup_time_outcomes) {
+    size_t length = std::strlen(fixture.source);
+    auto &buffer = eval_buffer_for(g_eval_buffers.result, length);
+    sg_result_t result = {};
+    sg_error_t error = sg_gate_evaluate(option_gate, fixture.source, length,
+                                        buffer.data(), buffer.size(), &result);
+    if (error != SG_OK || result.truncated ||
+        result.verdict == SG_VERDICT_REJECT)
+      invariant_failure("setup outcome timing contract mismatch");
+    validate_result(&result, error, buffer.data(), buffer.size());
+  }
+  for (const char *path : {"base", "one", "two"}) {
+    for (const auto &fixture : shellsplit_test_named_cleanup) {
+      outcome_config.sensitive_write_paths[0] = path;
+      if (sg_gate_set_violation_config_borrowed(option_gate, &outcome_config) !=
+          SG_OK)
+        invariant_failure("named cleanup violation configuration failed");
+      size_t length = std::strlen(fixture.source);
+      auto &buffer = eval_buffer_for(g_eval_buffers.result, length);
+      sg_result_t result = {};
+      sg_error_t error =
+          sg_gate_evaluate(option_gate, fixture.source, length, buffer.data(),
+                           buffer.size(), &result);
+      if (error != SG_OK || result.truncated)
+        invariant_failure("named cleanup evaluation failed");
+      validate_result(&result, error, buffer.data(), buffer.size());
+      char netargv[80];
+      if (fixture.read)
+        std::snprintf(netargv, sizeof(netargv), "3:cat,");
+      else if (fixture.timer)
+        std::snprintf(netargv, sizeof(netargv), "4:exec,");
+      else
+        std::snprintf(netargv, sizeof(netargv), "6:printf,%zu:%s,",
+                      std::strlen(fixture.argument), fixture.argument);
+      bool found = false;
+      for (uint32_t c = 0; c < result.subcommand_count; c++) {
+        const auto &command = result.subcommands[c];
+        if (std::strcmp(command.netargv, netargv) ||
+            (fixture.timer && !command.pipeline_time_mode))
+          continue;
+        found = true;
+        bool sensitive =
+            (command.violation_type_flags & SG_VIOL_WRITE_SENSITIVE) != 0;
+        bool expected = std::strcmp(path, fixture.file) == 0 ||
+                        (fixture.alternative_file &&
+                         std::strcmp(path, fixture.alternative_file) == 0);
+        if (fixture.read ? command.read_count !=
+                               1u + (fixture.alternative_file != nullptr)
+                         : !fixture.timer && sensitive != expected)
+          invariant_failure("named cleanup consumer route mismatch");
+      }
+      if (!found)
+        invariant_failure("named cleanup consumer missing");
+    }
+  }
+  for (const char *source : shellsplit_test_invalidated_reallocation) {
+    size_t length = std::strlen(source);
+    auto &buffer = eval_buffer_for(g_eval_buffers.result, length);
+    sg_result_t result = {};
+    sg_error_t error = sg_gate_evaluate(option_gate, source, length,
+                                        buffer.data(), buffer.size(), &result);
+    if (error != SG_ERR_PARSE || result.verdict != SG_VERDICT_REJECT)
+      invariant_failure("invalidated reallocation proof was revived");
+    validate_result(&result, error, buffer.data(), buffer.size());
+  }
+  for (bool base : {false, true}) {
+    outcome_config.sensitive_write_paths[0] = base ? "base" : "out";
+    if (sg_gate_set_violation_config_borrowed(option_gate, &outcome_config) !=
+        SG_OK)
+      invariant_failure("descriptor outcome configuration failed");
+    for (const auto &fixture : shellsplit_test_descriptor_outcomes) {
+      size_t length = std::strlen(fixture.source);
+      auto &buffer = eval_buffer_for(g_eval_buffers.result, length);
+      sg_result_t result = {};
+      sg_error_t error =
+          sg_gate_evaluate(option_gate, fixture.source, length, buffer.data(),
+                           buffer.size(), &result);
+      if (error != SG_OK || result.truncated ||
+          result.verdict == SG_VERDICT_REJECT)
+        invariant_failure("descriptor outcome evaluation mismatch");
+      validate_result(&result, error, buffer.data(), buffer.size());
+      bool found = false;
+      for (uint32_t c = 0; c < result.subcommand_count; c++) {
+        const auto &item = result.subcommands[c];
+        if (std::strcmp(item.netargv, "6:printf,7:payload,"))
+          continue;
+        found = true;
+        bool writes =
+            (item.violation_type_flags & SG_VIOL_WRITE_SENSITIVE) != 0;
+        if (writes != (base ? fixture.base : fixture.out))
+          invariant_failure("descriptor outcome writer effect mismatch");
+      }
+      if (!found)
+        invariant_failure("descriptor outcome writer missing");
+    }
+  }
+  outcome_config.sensitive_write_paths[0] = "out";
+  if (sg_gate_set_violation_config_borrowed(option_gate, &outcome_config) !=
+      SG_OK)
+    invariant_failure("scope outcome configuration failed");
+  for (const auto &fixture : shellsplit_test_scope_outcomes) {
+    size_t length = std::strlen(fixture.source);
+    reusable_eval_buffer &buffer =
+        eval_buffer_for(g_eval_buffers.result, length);
+    sg_result_t result = {};
+    sg_error_t error = sg_gate_evaluate(option_gate, fixture.source, length,
+                                        buffer.data(), buffer.size(), &result);
+    if (error != SG_OK || result.verdict == SG_VERDICT_REJECT)
+      invariant_failure("scope outcome routing contract mismatch");
+    validate_result(&result, error, buffer.data(), buffer.size());
+    bool found = false;
+    for (uint32_t command = 0; command < result.subcommand_count; command++) {
+      const sg_subcommand_result_t &item = result.subcommands[command];
+      if (std::strcmp(item.netargv, "6:printf,7:payload,") != 0)
+        continue;
+      found = true;
+      bool writes = (item.violation_type_flags & SG_VIOL_WRITE_SENSITIVE) != 0;
+      if (writes != fixture.writes_to_out)
+        invariant_failure("scope outcome writer effect mismatch");
+    }
+    if (!found)
+      invariant_failure("scope outcome writer syntax missing");
+  }
+  for (const auto &fixture : shellsplit_test_assignment_snapshots) {
+    size_t length = std::strlen(fixture.source);
+    reusable_eval_buffer &buffer =
+        eval_buffer_for(g_eval_buffers.result, length);
+    sg_result_t result = {};
+    sg_error_t error = sg_gate_evaluate(option_gate, fixture.source, length,
+                                        buffer.data(), buffer.size(), &result);
+    if (fixture.resolved
+            ? error != SG_OK || result.verdict == SG_VERDICT_REJECT
+            : error != SG_ERR_PARSE || result.verdict != SG_VERDICT_REJECT)
+      invariant_failure("assignment value snapshot contract mismatch");
+    validate_result(&result, error, buffer.data(), buffer.size());
+  }
+  outcome_config.sensitive_write_paths[0] = "/workspace/out";
+  if (sg_gate_set_violation_config_borrowed(option_gate, &outcome_config) !=
+      SG_OK)
+    invariant_failure("CWD outcome violation configuration failed");
+  for (const auto &fixture : shellsplit_test_cwd_reachability) {
+    if (std::strcmp(fixture.file, "out") ||
+        !std::strstr(fixture.source, "printf payload"))
+      continue;
+    size_t length = std::strlen(fixture.source);
+    reusable_eval_buffer &buffer =
+        eval_buffer_for(g_eval_buffers.result, length);
+    sg_result_t result = {};
+    sg_error_t error = sg_gate_evaluate(option_gate, fixture.source, length,
+                                        buffer.data(), buffer.size(), &result);
+    if (error != SG_OK)
+      invariant_failure("CWD outcome evaluation failed");
+    validate_result(&result, error, buffer.data(), buffer.size());
+    bool expected =
+        fixture.identity && !std::strcmp(fixture.identity, "/workspace/out");
+    bool found = false;
+    for (uint32_t c = 0; c < result.subcommand_count; c++) {
+      const auto &item = result.subcommands[c];
+      if (std::strcmp(item.netargv, "6:printf,7:payload,"))
+        continue;
+      found = true;
+      if (((item.violation_type_flags & SG_VIOL_WRITE_SENSITIVE) != 0) !=
+          expected)
+        invariant_failure("CWD outcome writer identity mismatch");
+    }
+    if (!found)
+      invariant_failure("CWD outcome writer missing");
+  }
+  for (const auto &fixture : shellsplit_test_skipped_dup_operands) {
+    size_t length = std::strlen(fixture.source);
+    reusable_eval_buffer &buffer =
+        eval_buffer_for(g_eval_buffers.result, length);
+    sg_result_t result = {};
+    sg_error_t error = sg_gate_evaluate(option_gate, fixture.source, length,
+                                        buffer.data(), buffer.size(), &result);
+    if (error != SG_OK || result.subcommand_count != fixture.commands)
+      invariant_failure("skipped duplication syntax missing");
+    validate_result(&result, error, buffer.data(), buffer.size());
+    if (result.violation_type_flags & SG_VIOL_WRITE_SENSITIVE)
+      invariant_failure("skipped duplication has an output effect");
+  }
+  sg_gate_free(option_gate);
   struct oracle_case {
     const char *input;
     const char *const *rules;
@@ -402,7 +761,145 @@ void run_semantic_reference_oracles() {
   static const char *const quoted[] = {"echo *", "id"};
   static const char *const composite[] = {"echo", "echo *", "id"};
   static const char *const redirect_rules[] = {"cat", "cat 0"};
+  static const char *const timed_executables[] = {"true", "cat", "echo *",
+                                                  "time", "time *"};
   static const oracle_case cases[] = {
+      {"time <<<body cat",
+       timed_executables,
+       5,
+       1,
+       {-1},
+       SG_VERDICT_ALLOW,
+       false,
+       false},
+      {"true | time <<<body",
+       timed_executables,
+       5,
+       2,
+       {-1, -1},
+       SG_VERDICT_ALLOW,
+       false,
+       false},
+      {"time true | time -p <<EOF\nbody\nEOF\n",
+       timed_executables,
+       5,
+       2,
+       {-1, -1},
+       SG_VERDICT_ALLOW,
+       false,
+       false},
+      {"true |& 3<<<body cat",
+       timed_executables,
+       5,
+       2,
+       {-1, -1},
+       SG_VERDICT_ALLOW,
+       false,
+       false},
+      {"time true | time",
+       timed_executables,
+       5,
+       2,
+       {-1, -1},
+       SG_VERDICT_ALLOW,
+       false,
+       false},
+      {"time true | time -p",
+       timed_executables,
+       5,
+       2,
+       {-1, -1},
+       SG_VERDICT_ALLOW,
+       false,
+       false},
+      {"time true | time --",
+       timed_executables,
+       5,
+       2,
+       {-1, -1},
+       SG_VERDICT_ALLOW,
+       false,
+       false},
+      {"time true | time !",
+       timed_executables,
+       5,
+       2,
+       {-1, -1},
+       SG_VERDICT_ALLOW,
+       false,
+       false},
+      {"time -p true | time",
+       timed_executables,
+       5,
+       2,
+       {-1, -1},
+       SG_VERDICT_ALLOW,
+       false,
+       false},
+      {"time true |& time",
+       timed_executables,
+       5,
+       2,
+       {-1, -1},
+       SG_VERDICT_ALLOW,
+       false,
+       false},
+      {"time true | time | cat",
+       timed_executables,
+       5,
+       3,
+       {-1, -1, -1},
+       SG_VERDICT_ALLOW,
+       false,
+       false},
+      {"time true | \"time\"",
+       timed_executables,
+       5,
+       2,
+       {-1, -1},
+       SG_VERDICT_ALLOW,
+       false,
+       false},
+      {"time true | { time -p; }",
+       timed_executables,
+       5,
+       1,
+       {-1},
+       SG_VERDICT_ALLOW,
+       false,
+       false},
+      {"echo \"$(time true | time)\"",
+       timed_executables,
+       5,
+       3,
+       {-1, -1, 0},
+       SG_VERDICT_ALLOW_CONDITIONAL,
+       true,
+       true},
+      {"cat && time",
+       redirect_rules,
+       2,
+       1,
+       {-1},
+       SG_VERDICT_ALLOW,
+       false,
+       false},
+      {"cat || time",
+       redirect_rules,
+       2,
+       1,
+       {-1},
+       SG_VERDICT_ALLOW,
+       false,
+       false},
+      {"cat && time; time",
+       redirect_rules,
+       2,
+       1,
+       {-1},
+       SG_VERDICT_ALLOW,
+       false,
+       false},
       {"{ cat; } 1\\\n2<<EOF\nbody\nEOF\n>out",
        redirect_rules,
        2,
@@ -721,6 +1218,35 @@ void run_semantic_reference_oracles() {
         result.truncated)
       invariant_failure("opaque-word semantic oracle mismatch");
   }
+  for (const auto &fixture : shellsplit_test_quoted_arithmetic) {
+    size_t length = std::strlen(fixture.source);
+    reusable_eval_buffer &buffer =
+        eval_buffer_for(g_eval_buffers.result, length);
+    sg_result_t result = {};
+    sg_error_t status =
+        sg_gate_evaluate(opaque_word_gate, fixture.source, length,
+                         buffer.data(), buffer.size(), &result);
+    if (fixture.supported
+            ? status != SG_OK || result.verdict != SG_VERDICT_UNDETERMINED ||
+                  result.subcommand_count != 1
+            : status != SG_ERR_PARSE || result.verdict != SG_VERDICT_REJECT)
+      invariant_failure("quoted arithmetic semantic oracle mismatch");
+  }
+  for (const auto &fixture : shellsplit_test_scoped_expansions) {
+    size_t length = std::strlen(fixture.source);
+    reusable_eval_buffer &buffer =
+        eval_buffer_for(g_eval_buffers.result, length);
+    sg_result_t result = {};
+    sg_error_t status =
+        sg_gate_evaluate(opaque_word_gate, fixture.source, length,
+                         buffer.data(), buffer.size(), &result);
+    if (fixture.supported
+            ? status != SG_OK || result.verdict != SG_VERDICT_UNDETERMINED ||
+                  result.subcommand_count + fixture.file_stages !=
+                      fixture.stages
+            : status != SG_ERR_PARSE || result.verdict != SG_VERDICT_REJECT)
+      invariant_failure("heredoc expansion semantic oracle mismatch");
+  }
   sg_gate_free(opaque_word_gate);
 
   static const char *const structural_word_cases[] = {
@@ -745,13 +1271,98 @@ void run_semantic_reference_oracles() {
   }
   sg_gate_free(structural_word_gate);
 
+  sg_gate_t *timed_gate = sg_gate_new();
+  if (!timed_gate || sg_gate_set_reject_mask(timed_gate, 0) != SG_OK ||
+      sg_gate_set_stop_mode(timed_gate, SG_EVAL_ALL) != SG_OK ||
+      sg_gate_add_allow_cpl(timed_gate, "echo *") != SG_OK ||
+      sg_gate_add_allow_cpl(timed_gate, "true") != SG_OK ||
+      sg_gate_add_allow_cpl(timed_gate, "false") != SG_OK ||
+      sg_gate_add_allow_cpl(timed_gate, "exit") != SG_OK ||
+      sg_gate_add_allow_cpl(timed_gate, "exec") != SG_OK ||
+      sg_gate_add_allow_cpl(timed_gate, "printf *") != SG_OK ||
+      sg_gate_add_allow_cpl(timed_gate, "printf * *") != SG_OK ||
+      sg_gate_add_allow_cpl(timed_gate, "cat *") != SG_OK ||
+      sg_gate_add_allow_cpl(timed_gate, "cat") != SG_OK)
+    invariant_failure("timed-pipeline oracle gate setup failed");
+  static const char timed_input[] = "time -p>/tmp/timing echo x";
+  reusable_eval_buffer &timed_buffer =
+      eval_buffer_for(g_eval_buffers.result, sizeof(timed_input) - 1);
+  sg_result_t timed_result = {};
+  if (sg_gate_evaluate(timed_gate, timed_input, sizeof(timed_input) - 1,
+                       timed_buffer.data(), timed_buffer.size(),
+                       &timed_result) != SG_OK ||
+      timed_result.verdict != SG_VERDICT_ALLOW ||
+      timed_result.subcommand_count != 1 ||
+      timed_result.subcommands[0].pipeline_time_mode != SHELL_PIPE_TIME_POSIX ||
+      timed_result.subcommands[0].netargv_length != strlen("4:echo,1:x,") ||
+      memcmp(timed_result.subcommands[0].netargv, "4:echo,1:x,",
+             strlen("4:echo,1:x,")) != 0)
+    invariant_failure("timed-pipeline semantic oracle mismatch");
+  static const struct {
+    const char *input;
+    uint32_t count;
+    bool inspection;
+    bool dynamic;
+  } timing_stream_cases[] = {
+      {"time ({ echo x; })", 1, false, false},
+      {"time ({(echo x)})", 1, false, false},
+      {"(false; exit <<< <(printf '%s' \"$(true)\")) && printf x >/tmp/skipped",
+       5, true, true},
+      {"(true; exit <<< <(printf '%s' \"$(false)\")) || printf x >/tmp/skipped",
+       5, true, true},
+      {"echo \"$(time; true)\"", 2, true, true},
+      {"echo \"`time; true`\"", 2, true, true},
+      {"echo \"$(exec 2>&1; time; true)\"", 3, true, true},
+      {"cat <(time; printf x)", 2, false, true},
+      {"printf x > >(time; cat)", 2, false, true},
+      {"echo \"$(time &)\"", 1, false, false},
+      {"echo \"$(time { time; })\"", 1, false, false},
+      {"echo \"$(time (time; true))\"", 2, true, true},
+      {"echo \"$(time (time &))\"", 1, false, false},
+      {"printf x | { exec 2>err; time true; }", 3, false, false},
+      {"printf x | { exec {fd}>out; printf value >&$fd; }", 3, false, false},
+  };
+  for (const auto &item : timing_stream_cases) {
+    reusable_eval_buffer &buffer =
+        eval_buffer_for(g_eval_buffers.result, std::strlen(item.input));
+    sg_result_t result = {};
+    if (sg_gate_evaluate(timed_gate, item.input, std::strlen(item.input),
+                         buffer.data(), buffer.size(), &result) != SG_OK ||
+        result.verdict != (item.inspection ? SG_VERDICT_ALLOW_CONDITIONAL
+                                           : SG_VERDICT_ALLOW) ||
+        result.subcommand_count != item.count || result.truncated ||
+        result.requires_substitution_evaluation != item.inspection ||
+        result.has_dynamic_substitution_io != item.dynamic)
+      invariant_failure("timing-stream semantic oracle mismatch");
+    if (std::strstr(item.input, "/tmp/skipped") &&
+        result.subcommands[result.subcommand_count - 1].write_count != 0)
+      invariant_failure("process-child status escaped into skipped writer");
+  }
+  for (const char *input :
+       {"echo \"$(time)\"", "echo \"$(time;)\"", "echo \"$(exec 2>&1; time;)\"",
+        "cat <(time;)", "printf x > >(time;)", "echo \"$( (time;) )\"",
+        "echo \"$(time (time;))\"", "echo \"$( (time;); : )\"",
+        "cat <( (time;) )", "printf x > >( (time;) )"}) {
+    reusable_eval_buffer &buffer =
+        eval_buffer_for(g_eval_buffers.result, std::strlen(input));
+    sg_result_t result = {};
+    if (sg_gate_evaluate(timed_gate, input, std::strlen(input), buffer.data(),
+                         buffer.size(), &result) != SG_ERR_PARSE ||
+        result.verdict != SG_VERDICT_REJECT)
+      invariant_failure("parenthesized empty-time rejection oracle mismatch");
+  }
+  sg_gate_free(timed_gate);
+
   /* Lexical recognition must never become a policy subject when Shellsplit
    * cannot construct the command's execution semantics. These fixed cases
    * intentionally live in the harness rather than the smoke corpus. */
   static const char *const unmodeled_semantic_cases[] = {
       "[[ -f /tmp/x ]]",
       "(( count += 1 ))",
-      "time -p echo x",
+      "time eval echo hidden",
+      "time coproc echo hidden",
+      "time [[ -f /tmp/x ]]",
+      "echo \"$(time eval echo hidden)\"",
       "printf '%s' $\"localized\"",
       "echo $( [[ -f /tmp/x ]] )",
       "{ (( 1 )); }",
@@ -782,6 +1393,10 @@ void run_semantic_reference_oracles() {
       "cmd {fd}> >(consumer)",
       "cmd {fd}> prefix>(consumer)",
       "cmd {fd}<> <(producer)",
+      "exec {fd}< >(true </dev/null); cat <&$fd",
+      "exec {fd}> <(printf ignored >/dev/null); printf value >&$fd",
+      "exec {fd}<> <(printf input); printf value >&$fd",
+      "exec {fd}<> >(true </dev/null); cat <&$fd",
       "printf x {fd}>out >&$fd",
       "printf x {fd}>out; printf x >&$fd",
       "exec {fd}>out; ( printf x >&$fd )",
@@ -904,6 +1519,9 @@ void run_semantic_reference_oracles() {
       {">/tmp/fuzz-redirect-only", 0},
       {"echo ok; >/tmp/fuzz-redirect-only", 1},
       {"echo ok | >/tmp/fuzz-redirect-only", 1},
+      {"{ time; } >/tmp/fuzz-redirect-only", 0},
+      {"{ { time; }; } </dev/null", 0},
+      {"(time;) &>/tmp/fuzz-redirect-only", 0},
   };
   for (size_t i = 0; i < std::size(redirect_cases); i++) {
     const redirect_oracle_case &item = redirect_cases[i];
@@ -1210,9 +1828,9 @@ void run_generated_brace_case(const uint8_t *data, size_t size) {
  * descriptor context rather than a fabricated direct mapping. */
 void run_substitution_case(const shell_substitution_fuzz_case_t &item) {
   static const char *const rules[] = {
-      "echo *", "sleep *", "printf *",  "printf * *", "./clock",
-      "cat",    "cat *",   "cat #path", "date",       "id",
-      "pwd",    "sort",    "sort *",    "sh",         "sh *"};
+      "echo *", "sleep *",   "printf *", "printf * *", "./clock", "cat",
+      "cat *",  "cat #path", "date",     "id",         "pwd",     "sort",
+      "sort *", "sh",        "sh *",     "exec",       "probe",   "true"};
   sg_gate_t *gate = sg_gate_new();
   if (!gate || sg_gate_set_reject_mask(gate, 0) != SG_OK ||
       sg_gate_set_stop_mode(gate, SG_EVAL_ALL) != SG_OK)
@@ -1318,7 +1936,8 @@ void run_composed_substitution_matrix() {
             data[2] = pipeline;
             data[3] = literal;
             for (uint8_t level = 0; level <= depth; level++)
-              data[4 + level] = (group_mask >> level) & 1u;
+              data[4 + level] =
+                  ((group_mask >> level) & 1u) | ((form & 1u) ? 2u : 0u);
             run_composed_substitution_case(data, sizeof(data));
           }
         }
@@ -1549,6 +2168,7 @@ extern "C" int LLVMFuzzerInitialize(int *argc, char ***argv) {
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
   static bool semantic_oracles_checked = false;
   if (!semantic_oracles_checked) {
+    run_expansion_query_oracles();
     run_evaluation_buffer_contract_oracle();
     run_semantic_reference_oracles();
     run_decoded_path_oracles();

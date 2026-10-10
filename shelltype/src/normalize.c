@@ -640,14 +640,15 @@ const st_token_type_t st_type_join[ST_TYPE_COUNT][ST_TYPE_COUNT] = {
 
 /* --- COMPATIBILITY TABLE ---
  *
- * st_type_compatible[cmd_type][policy_type] = true iff cmd_type ≤ policy_type.
- * A command token of cmd_type matches a policy node of policy_type.
+ * st_type_compatible[a][b] = true iff a ≤ b in the generalization lattice.
+ * This is not runtime policy acceptance: classification, argv context and
+ * parameter predicates determine which concrete tokens a policy accepts.
  *
  * Derived from the same lattice via transitive closure.
  */
 
 const bool st_type_compatible[ST_TYPE_COUNT][ST_TYPE_COUNT] = {
-    /* ST_TYPE_LITERAL matches: LITERAL, HEXHASH, NUMBER, IPV4, IPV6, IPADDR,
+    /* ST_TYPE_LITERAL supertypes: LITERAL, HEXHASH, NUMBER, IPV4, IPV6, IPADDR,
        WORD, QUOTED, QUOTED_SPACE, FILENAME, REL_PATH, ABS_PATH, PATH, URL,
        VALUE, SHORTOPT, LONGOPT, OPT, UUID, EMAIL, HOSTNAME, PORT, SIZE, SEMVER,
        TIMESTAMP, HASH_ALGO, ENV_VAR, HYPHENATED, BRANCH, SHA, IMAGE, PKG, USER,
@@ -657,13 +658,13 @@ const bool st_type_compatible[ST_TYPE_COUNT][ST_TYPE_COUNT] = {
      true, true, true, true, true, true, true, true, true, true, true, true,
      true, true, true, true, true, true, true, true, true, true, true, true,
      true, true, true, true, true, true, true, true, true},
-    /* ST_TYPE_HEXHASH matches: HEXHASH, VALUE, ANY */
+    /* ST_TYPE_HEXHASH supertypes: HEXHASH, VALUE, ANY */
     {false, true,  false, false, false, false, false, false, false,
      false, false, false, false, false, true,  false, false, false,
      false, false, false, false, false, false, false, false, false,
      false, false, false, false, false, false, false, false, false,
      false, false, false, false, false, false, false, false, true},
-    /* ST_TYPE_NUMBER matches: NUMBER, VALUE, ANY */
+    /* ST_TYPE_NUMBER supertypes: NUMBER, VALUE, ANY */
     {false, false, true,  false, false, false, false, false, false,
      false, false, false, false, false, true,  false, false, false,
      false, false, false, false, false, false, false, false, false,
@@ -681,241 +682,241 @@ const bool st_type_compatible[ST_TYPE_COUNT][ST_TYPE_COUNT] = {
      false, false, false, false, false, false, false, false, false,
      false, false, false, false, false, false, false, false, false,
      false, false, false, false, false, false, false, false, true},
-    /* ST_TYPE_IPADDR matches: IPADDR, VALUE, ANY */
+    /* ST_TYPE_IPADDR supertypes: IPADDR, VALUE, ANY */
     {false, false, false, false, false, true,  false, false, false,
      false, false, false, false, false, true,  false, false, false,
      false, false, false, false, false, false, false, false, false,
      false, false, false, false, false, false, false, false, false,
      false, false, false, false, false, false, false, false, true},
-    /* ST_TYPE_WORD matches: WORD, VALUE, ANY */
+    /* ST_TYPE_WORD supertypes: WORD, VALUE, ANY */
     {false, false, false, false, false, false, true,  false, false,
      false, false, false, false, false, true,  false, false, false,
      false, false, false, false, false, false, false, false, false,
      false, false, false, false, false, false, false, false, false,
      false, false, false, false, false, false, false, false, true},
-    /* ST_TYPE_QUOTED matches: QUOTED, QUOTED_SPACE, VALUE, ANY */
+    /* ST_TYPE_QUOTED supertypes: QUOTED, QUOTED_SPACE, VALUE, ANY */
     {false, false, false, false, false, false, false, true,  true,
      false, false, false, false, false, true,  false, false, false,
      false, false, false, false, false, false, false, false, false,
      false, false, false, false, false, false, false, false, false,
      false, false, false, false, false, false, false, false, true},
-    /* ST_TYPE_QUOTED_SPACE matches: QUOTED_SPACE, VALUE, ANY */
+    /* ST_TYPE_QUOTED_SPACE supertypes: QUOTED_SPACE, VALUE, ANY */
     {false, false, false, false, false, false, false, false, true,
      false, false, false, false, false, true,  false, false, false,
      false, false, false, false, false, false, false, false, false,
      false, false, false, false, false, false, false, false, false,
      false, false, false, false, false, false, false, false, true},
-    /* ST_TYPE_FILENAME matches: FILENAME, REL_PATH, PATH, ANY */
+    /* ST_TYPE_FILENAME supertypes: FILENAME, REL_PATH, PATH, ANY */
     {false, false, false, false, false, false, false, false, false,
      true,  true,  false, true,  false, false, false, false, false,
      false, false, false, false, false, false, false, false, false,
      false, false, false, false, false, false, false, false, false,
      false, false, false, false, false, false, false, false, true},
-    /* ST_TYPE_REL_PATH matches: REL_PATH, PATH, ANY */
+    /* ST_TYPE_REL_PATH supertypes: REL_PATH, PATH, ANY */
     {false, false, false, false, false, false, false, false, false,
      false, true,  false, true,  false, false, false, false, false,
      false, false, false, false, false, false, false, false, false,
      false, false, false, false, false, false, false, false, false,
      false, false, false, false, false, false, false, false, true},
-    /* ST_TYPE_ABS_PATH matches: ABS_PATH, PATH, ANY */
+    /* ST_TYPE_ABS_PATH supertypes: ABS_PATH, PATH, ANY */
     {false, false, false, false, false, false, false, false, false,
      false, false, true,  true,  false, false, false, false, false,
      false, false, false, false, false, false, false, false, false,
      false, false, false, false, false, false, false, false, false,
      false, false, false, false, false, false, false, false, true},
-    /* ST_TYPE_PATH matches: PATH, ANY */
+    /* ST_TYPE_PATH supertypes: PATH, ANY */
     {false, false, false, false, false, false, false, false, false,
      false, false, false, true,  false, false, false, false, false,
      false, false, false, false, false, false, false, false, false,
      false, false, false, false, false, false, false, false, false,
      false, false, false, false, false, false, false, false, true},
-    /* ST_TYPE_URL matches: URL, ANY */
+    /* ST_TYPE_URL supertypes: URL, ANY */
     {false, false, false, false, false, false, false, false, false,
      false, false, false, false, true,  false, false, false, false,
      false, false, false, false, false, false, false, false, false,
      false, false, false, false, false, false, false, false, false,
      false, false, false, false, false, false, false, false, true},
-    /* ST_TYPE_VALUE matches: VALUE, ANY */
+    /* ST_TYPE_VALUE supertypes: VALUE, ANY */
     {false, false, false, false, false, false, false, false, false,
      false, false, false, false, false, true,  false, false, false,
      false, false, false, false, false, false, false, false, false,
      false, false, false, false, false, false, false, false, false,
      false, false, false, false, false, false, false, false, true},
-    /* ST_TYPE_SHORTOPT matches: VALUE, SHORTOPT, OPT, ANY */
+    /* ST_TYPE_SHORTOPT supertypes: VALUE, SHORTOPT, OPT, ANY */
     {false, false, false, false, false, false, false, false, false,
      false, false, false, false, false, true,  true,  false, true,
      false, false, false, false, false, false, false, false, false,
      false, false, false, false, false, false, false, false, false,
      false, false, false, false, false, false, false, false, true},
-    /* ST_TYPE_LONGOPT matches: VALUE, LONGOPT, OPT, ANY */
+    /* ST_TYPE_LONGOPT supertypes: VALUE, LONGOPT, OPT, ANY */
     {false, false, false, false, false, false, false, false, false,
      false, false, false, false, false, true,  false, true,  true,
      false, false, false, false, false, false, false, false, false,
      false, false, false, false, false, false, false, false, false,
      false, false, false, false, false, false, false, false, true},
-    /* ST_TYPE_OPT matches: VALUE, OPT, ANY */
+    /* ST_TYPE_OPT supertypes: VALUE, OPT, ANY */
     {false, false, false, false, false, false, false, false, false,
      false, false, false, false, false, true,  false, false, true,
      false, false, false, false, false, false, false, false, false,
      false, false, false, false, false, false, false, false, false,
      false, false, false, false, false, false, false, false, true},
-    /* ST_TYPE_UUID matches: VALUE, UUID, ANY */
+    /* ST_TYPE_UUID supertypes: VALUE, UUID, ANY */
     {false, false, false, false, false, false, false, false, false,
      false, false, false, false, false, true,  false, false, false,
      true,  false, false, false, false, false, false, false, false,
      false, false, false, false, false, false, false, false, false,
      false, false, false, false, false, false, false, false, true},
-    /* ST_TYPE_EMAIL matches: VALUE, EMAIL, ANY */
+    /* ST_TYPE_EMAIL supertypes: VALUE, EMAIL, ANY */
     {false, false, false, false, false, false, false, false, false,
      false, false, false, false, false, true,  false, false, false,
      false, true,  false, false, false, false, false, false, false,
      false, false, false, false, false, false, false, false, false,
      false, false, false, false, false, false, false, false, true},
-    /* ST_TYPE_HOSTNAME matches: VALUE, HOSTNAME, ANY */
+    /* ST_TYPE_HOSTNAME supertypes: VALUE, HOSTNAME, ANY */
     {false, false, false, false, false, false, false, false, false,
      false, false, false, false, false, true,  false, false, false,
      false, false, true,  false, false, false, false, false, false,
      false, false, false, false, false, false, false, false, false,
      false, false, false, false, false, false, false, false, true},
-    /* ST_TYPE_PORT matches: NUMBER, VALUE, PORT, ANY */
+    /* ST_TYPE_PORT supertypes: NUMBER, VALUE, PORT, ANY */
     {false, false, true,  false, false, false, false, false, false,
      false, false, false, false, false, true,  false, false, false,
      false, false, false, true,  false, false, false, false, false,
      false, false, false, false, false, false, false, false, false,
      false, false, false, false, false, false, false, false, true},
-    /* ST_TYPE_SIZE matches: VALUE, SIZE, ANY */
+    /* ST_TYPE_SIZE supertypes: VALUE, SIZE, ANY */
     {false, false, false, false, false, false, false, false, false,
      false, false, false, false, false, true,  false, false, false,
      false, false, false, false, true,  false, false, false, false,
      false, false, false, false, false, false, false, false, false,
      false, false, false, false, false, false, false, false, true},
-    /* ST_TYPE_SEMVER matches: VALUE, SEMVER, ANY */
+    /* ST_TYPE_SEMVER supertypes: VALUE, SEMVER, ANY */
     {false, false, false, false, false, false, false, false, false,
      false, false, false, false, false, true,  false, false, false,
      false, false, false, false, false, true,  false, false, false,
      false, false, false, false, false, false, false, false, false,
      false, false, false, false, false, false, false, false, true},
-    /* ST_TYPE_TIMESTAMP matches: VALUE, TIMESTAMP, ANY */
+    /* ST_TYPE_TIMESTAMP supertypes: VALUE, TIMESTAMP, ANY */
     {false, false, false, false, false, false, false, false, false,
      false, false, false, false, false, true,  false, false, false,
      false, false, false, false, false, false, true,  false, false,
      false, false, false, false, false, false, false, false, false,
      false, false, false, false, false, false, false, false, true},
-    /* ST_TYPE_HASH_ALGO matches: WORD, VALUE, HASH_ALGO, ANY */
+    /* ST_TYPE_HASH_ALGO supertypes: WORD, VALUE, HASH_ALGO, ANY */
     {false, false, false, false, false, false, true,  false, false,
      false, false, false, false, false, true,  false, false, false,
      false, false, false, false, false, false, false, true,  false,
      false, false, false, false, false, false, false, false, false,
      false, false, false, false, false, false, false, false, true},
-    /* ST_TYPE_ENV_VAR matches: VALUE, ENV_VAR, ANY */
+    /* ST_TYPE_ENV_VAR supertypes: VALUE, ENV_VAR, ANY */
     {false, false, false, false, false, false, false, false, false,
      false, false, false, false, false, true,  false, false, false,
      false, false, false, false, false, false, false, false, true,
      false, false, false, false, false, false, false, false, false,
      false, false, false, false, false, false, false, false, true},
-    /* ST_TYPE_HYPHENATED matches: WORD, VALUE, HYPHENATED, ANY */
+    /* ST_TYPE_HYPHENATED supertypes: WORD, VALUE, HYPHENATED, ANY */
     {false, false, false, false, false, false, true,  false, false,
      false, false, false, false, false, true,  false, false, false,
      false, false, false, false, false, false, false, false, false,
      true,  false, false, false, false, false, false, false, false,
      false, false, false, false, false, false, false, false, true},
-    /* ST_TYPE_BRANCH matches: VALUE, BRANCH, ANY */
+    /* ST_TYPE_BRANCH supertypes: VALUE, BRANCH, ANY */
     {false, false, false, false, false, false, false, false, false,
      false, false, false, false, false, true,  false, false, false,
      false, false, false, false, false, false, false, false, false,
      false, true,  false, false, false, false, false, false, false,
      false, false, false, false, false, false, false, false, true},
-    /* ST_TYPE_SHA matches: HEXHASH, VALUE, SHA, ANY */
+    /* ST_TYPE_SHA supertypes: HEXHASH, VALUE, SHA, ANY */
     {false, true,  false, false, false, false, false, false, false,
      false, false, false, false, false, true,  false, false, false,
      false, false, false, false, false, false, false, false, false,
      false, false, true,  false, false, false, false, false, false,
      false, false, false, false, false, false, false, false, true},
-    /* ST_TYPE_IMAGE matches: VALUE, IMAGE, ANY */
+    /* ST_TYPE_IMAGE supertypes: VALUE, IMAGE, ANY */
     {false, false, false, false, false, false, false, false, false,
      false, false, false, false, false, true,  false, false, false,
      false, false, false, false, false, false, false, false, false,
      false, false, false, true,  false, false, false, false, false,
      false, false, false, false, false, false, false, false, true},
-    /* ST_TYPE_PKG matches: VALUE, PKG, ANY */
+    /* ST_TYPE_PKG supertypes: VALUE, PKG, ANY */
     {false, false, false, false, false, false, false, false, false,
      false, false, false, false, false, true,  false, false, false,
      false, false, false, false, false, false, false, false, false,
      false, false, false, false, true,  false, false, false, false,
      false, false, false, false, false, false, false, false, true},
-    /* ST_TYPE_USER matches: VALUE, USER, ANY */
+    /* ST_TYPE_USER supertypes: VALUE, USER, ANY */
     {false, false, false, false, false, false, false, false, false,
      false, false, false, false, false, true,  false, false, false,
      false, false, false, false, false, false, false, false, false,
      false, false, false, false, false, true,  false, false, false,
      false, false, false, false, false, false, false, false, true},
-    /* ST_TYPE_FINGERPRINT matches: VALUE, FINGERPRINT, ANY */
+    /* ST_TYPE_FINGERPRINT supertypes: VALUE, FINGERPRINT, ANY */
     {false, false, false, false, false, false, false, false, false,
      false, false, false, false, false, true,  false, false, false,
      false, false, false, false, false, false, false, false, false,
      false, false, false, false, false, false, true,  false, false,
      false, false, false, false, false, false, false, false, true},
-    /* ST_TYPE_MAC matches: VALUE, MAC, ANY */
+    /* ST_TYPE_MAC supertypes: VALUE, MAC, ANY */
     {false, false, false, false, false, false, false, false, false,
      false, false, false, false, false, true,  false, false, false,
      false, false, false, false, false, false, false, false, false,
      false, false, false, false, false, false, false, true,  false,
      false, false, false, false, false, false, false, false, true},
-    /* ST_TYPE_METHOD matches: WORD, VALUE, METHOD, ANY */
+    /* ST_TYPE_METHOD supertypes: WORD, VALUE, METHOD, ANY */
     {false, false, false, false, false, false, true,  false, false,
      false, false, false, false, false, true,  false, false, false,
      false, false, false, false, false, false, false, false, false,
      false, false, false, false, false, false, false, false, true,
      false, false, false, false, false, false, false, false, true},
-    /* ST_TYPE_CRON matches: VALUE, CRON, ANY */
+    /* ST_TYPE_CRON supertypes: VALUE, CRON, ANY */
     {false, false, false, false, false, false, false, false, false,
      false, false, false, false, false, true,  false, false, false,
      false, false, false, false, false, false, false, false, false,
      false, false, false, false, false, false, false, false, false,
      true,  false, false, false, false, false, false, false, true},
-    /* ST_TYPE_DURATION matches: VALUE, DURATION, ANY */
+    /* ST_TYPE_DURATION supertypes: VALUE, DURATION, ANY */
     {false, false, false, false, false, false, false, false, false,
      false, false, false, false, false, true,  false, false, false,
      false, false, false, false, false, false, false, false, false,
      false, false, false, false, false, false, false, false, false,
      false, true,  false, false, false, false, false, false, true},
-    /* ST_TYPE_REGEX matches: VALUE, REGEX, ANY */
+    /* ST_TYPE_REGEX supertypes: VALUE, REGEX, ANY */
     {false, false, false, false, false, false, false, false, false,
      false, false, false, false, false, true,  false, false, false,
      false, false, false, false, false, false, false, false, false,
      false, false, false, false, false, false, false, false, false,
      false, false, true,  false, false, false, false, false, true},
-    /* ST_TYPE_GLOB matches: VALUE, GLOB, ANY */
+    /* ST_TYPE_GLOB supertypes: VALUE, GLOB, ANY */
     {false, false, false, false, false, false, false, false, false,
      false, false, false, false, false, true,  false, false, false,
      false, false, false, false, false, false, false, false, false,
      false, false, false, false, false, false, false, false, false,
      false, false, false, true,  false, false, false, false, true},
-    /* ST_TYPE_RANGE matches: VALUE, RANGE, ANY */
+    /* ST_TYPE_RANGE supertypes: VALUE, RANGE, ANY */
     {false, false, false, false, false, false, false, false, false,
      false, false, false, false, false, true,  false, false, false,
      false, false, false, false, false, false, false, false, false,
      false, false, false, false, false, false, false, false, false,
      false, false, false, false, true,  false, false, false, true},
-    /* ST_TYPE_SIGNAL matches: VALUE, SIGNAL, ANY */
+    /* ST_TYPE_SIGNAL supertypes: VALUE, SIGNAL, ANY */
     {false, false, false, false, false, false, false, false, false,
      false, false, false, false, false, true,  false, false, false,
      false, false, false, false, false, false, false, false, false,
      false, false, false, false, false, false, false, false, false,
      false, false, false, false, false, true,  false, false, true},
-    /* ST_TYPE_USER_GROUP matches: VALUE, USER_GROUP, ANY */
+    /* ST_TYPE_USER_GROUP supertypes: VALUE, USER_GROUP, ANY */
     {false, false, false, false, false, false, false, false, false,
      false, false, false, false, false, true,  false, false, false,
      false, false, false, false, false, false, false, false, false,
      false, false, false, false, false, false, false, false, false,
      false, false, false, false, false, false, true,  false, true},
-    /* ST_TYPE_PERM_OCTAL matches: NUMBER, VALUE, PERM_OCTAL, ANY */
+    /* ST_TYPE_PERM_OCTAL supertypes: NUMBER, VALUE, PERM_OCTAL, ANY */
     {false, false, true,  false, false, false, false, false, false,
      false, false, false, false, false, true,  false, false, false,
      false, false, false, false, false, false, false, false, false,
      false, false, false, false, false, false, false, false, false,
      false, false, false, false, false, false, false, true,  true},
-    /* ST_TYPE_ANY matches: ANY */
+    /* ST_TYPE_ANY supertypes: ANY */
     {false, false, false, false, false, false, false, false, false,
      false, false, false, false, false, false, false, false, false,
      false, false, false, false, false, false, false, false, false,
@@ -1728,12 +1729,13 @@ static bool span_is_regex_context(st_text_span_t token) {
 static bool span_has_regex_metachar(st_text_span_t token) {
   static const char metacharacters[] = "[]*+?{}|\\^$()";
   for (size_t i = 0; i < token.length; i++)
-    if (strchr(metacharacters, token.data[i]))
+    if (memchr(metacharacters, token.data[i], sizeof(metacharacters) - 1))
       return true;
   return false;
 }
 
 static bool span_is_glob_pattern(st_text_span_t token) {
+  static const char operators[] = "|&;<>()";
   if (token.length == 0 || token.data[0] == '-' || token.data[0] == '/')
     return false;
   bool wild = false, bracket = false;
@@ -1745,7 +1747,7 @@ static bool span_is_glob_pattern(st_text_span_t token) {
       wild = bracket = true;
     else if (c == ']' && bracket)
       bracket = false;
-    else if (strchr("|&;<>()", c))
+    else if (memchr(operators, c, sizeof(operators) - 1))
       return false;
   }
   return wild && !bracket;
@@ -1916,16 +1918,12 @@ static st_token_type_t st_token_classify_span(st_text_span_t token) {
 }
 
 st_token_type_t st_token_classify_bytes(const char *text, size_t length) {
-  if (!text && length != 0)
-    return ST_TYPE_LITERAL;
   return st_token_classify_span((st_text_span_t){text, length});
 }
 
 /* --- PUBLIC: CLASSIFY --- */
 
 st_token_type_t st_token_classify(const char *token) {
-  if (!token)
-    return ST_TYPE_LITERAL;
   return st_token_classify_bytes(token, strlen(token));
 }
 
@@ -1956,13 +1954,14 @@ static st_error_t validate_netargv_view(st_netargv_view_t netargv,
   return ST_OK;
 }
 
-static st_token_type_t classify_netargv_span(st_text_span_t token,
-                                             bool after_long_option,
-                                             bool after_signal_option,
-                                             bool after_regex_command) {
-  if (after_long_option)
+st_token_type_t st_token_classify_context(const char *text, size_t length,
+                                          st_arg_context_t context) {
+  st_text_span_t token = {text, length};
+  if (length == 0)
+    return ST_TYPE_LITERAL;
+  if (context == ST_ARG_CONTEXT_LONG_OPTION)
     return st_token_classify_span(token);
-  if (after_signal_option && token.length != 0 && token.data[0] != '-' &&
+  if (context == ST_ARG_CONTEXT_SIGNAL && token.data[0] != '-' &&
       span_is_decimal_number(token)) {
     unsigned long number = 0;
     for (size_t i = 0; i < token.length && number <= 31; i++)
@@ -1970,72 +1969,76 @@ static st_token_type_t classify_netargv_span(st_text_span_t token,
     if (number >= 1 && number <= 31)
       return ST_TYPE_SIGNAL;
   }
-  if (after_regex_command &&
+  if (context == ST_ARG_CONTEXT_REGEX &&
       (span_has_regex_metachar(token) || span_has(token, '/')))
     return ST_TYPE_REGEX;
   return span_has(token, '=') ? ST_TYPE_LITERAL : st_token_classify_span(token);
 }
 
-static void netargv_context_after_span(st_text_span_t token,
-                                       bool *after_long_option,
-                                       bool *after_signal_option,
-                                       bool *after_regex_command) {
-  *after_long_option =
-      token.length >= 2 && token.data[0] == '-' && token.data[1] == '-' &&
-      !span_find((st_text_span_t){token.data + 2, token.length - 2}, '=');
-  *after_signal_option = span_eq(token, "kill") || span_eq(token, "-s");
-  *after_regex_command = span_is_regex_context(token);
+st_arg_context_t st_arg_context_after(const char *text, size_t length) {
+  st_text_span_t token = {text, length};
+  if (token.length >= 2 && token.data[0] == '-' && token.data[1] == '-' &&
+      !span_find((st_text_span_t){token.data + 2, token.length - 2}, '='))
+    return ST_ARG_CONTEXT_LONG_OPTION;
+  if (span_eq(token, "kill") || span_eq(token, "-s"))
+    return ST_ARG_CONTEXT_SIGNAL;
+  if (span_is_regex_context(token))
+    return ST_ARG_CONTEXT_REGEX;
+  return ST_ARG_CONTEXT_NONE;
+}
+
+static SHELL_NONNULL(1) size_t pattern_token_length(const st_token_t *token) {
+  return token->text_length || token->text[0] == '\0' ? token->text_length
+                                                      : strlen(token->text);
+}
+
+uint64_t st_pattern_literal_types(const st_token_t *tokens, size_t pos) {
+  const st_token_t *literal = &tokens[pos];
+  size_t length = pattern_token_length(literal);
+  if (pos == 0 ||
+      (!tokens[pos - 1].compound && tokens[pos - 1].type == ST_TYPE_LITERAL)) {
+    st_arg_context_t context =
+        pos == 0 ? ST_ARG_CONTEXT_NONE
+                 : st_arg_context_after(tokens[pos - 1].text,
+                                        pattern_token_length(&tokens[pos - 1]));
+    return UINT64_C(1) << st_token_classify_context(literal->text, length,
+                                                    context);
+  }
+  uint64_t types = 0;
+  for (st_arg_context_t context = ST_ARG_CONTEXT_NONE;
+       context < ST_ARG_CONTEXT_COUNT; context++)
+    types |= UINT64_C(1) << st_token_classify_context(literal->text, length,
+                                                      context);
+  return types;
 }
 
 st_error_t st_netargv_classify_scratch_view(st_netargv_view_t netargv,
                                             st_token_scratch_t *scratch) {
-  if (scratch)
-    memset(scratch, 0, sizeof(*scratch));
-  if ((!netargv.data && netargv.length != 0) || !scratch)
-    return ST_ERR_INVALID;
-
-  size_t raw_count = 0;
-  st_error_t error = validate_netargv_view(netargv, &raw_count);
-  if (error != ST_OK)
-    return error;
-  if (raw_count == 0)
-    return ST_OK;
-
-  bool after_long_option = false;
-  bool after_signal_option = false;
-  bool after_regex_command = false;
+  scratch->count = 0;
+  st_arg_context_t context = ST_ARG_CONTEXT_NONE;
   shell_netstring_iter_t iter;
   if (shell_netstring_iter_init(&iter, netargv.data, netargv.length) !=
       SHELL_NETSTRING_OK)
-    return ST_ERR_FORMAT;
-  for (size_t i = 0; i < raw_count; i++) {
-    shell_netstring_view_t view;
-    if (shell_netstring_iter_next(&iter, &view) != SHELL_NETSTRING_OK)
-      return ST_ERR_FORMAT;
-    /* The scratch representation is deliberately C-string based. Ask callers
-     * to use the owned byte-length representation for binary argv values. */
-    if (memchr(view.payload, '\0', view.payload_length)) {
-      memset(scratch, 0, sizeof(*scratch));
-      return ST_ERR_FAILED;
-    }
-    /* Policy evaluation uses this fast scratch path for ordinary shell words.
-     * Preserve support for larger callback-expanded values by letting callers
-     * fall back to the owned classifier. */
-    if (view.payload_length >= ST_MAX_TOKEN_LEN)
-      return ST_ERR_FAILED;
-    char *tok = scratch->text[i];
-    memcpy(tok, view.payload, view.payload_length);
-    tok[view.payload_length] = '\0';
-    scratch->tokens[i].text = tok;
-    scratch->tokens[i].text_length = view.payload_length;
-
+    return ST_ERR_INVALID;
+  size_t count = 0;
+  shell_netstring_view_t view;
+  shell_netstring_status_t status;
+  while ((status = shell_netstring_iter_next(&iter, &view)) ==
+         SHELL_NETSTRING_OK) {
+    if (count == ST_MAX_CMD_TOKENS)
+      return ST_ERR_LIMIT;
     st_text_span_t token = {(const char *)view.payload, view.payload_length};
-    scratch->tokens[i].type = classify_netargv_span(
-        token, after_long_option, after_signal_option, after_regex_command);
-    scratch->count++;
-    netargv_context_after_span(token, &after_long_option, &after_signal_option,
-                               &after_regex_command);
+    scratch->tokens[count++] = (st_token_t){
+        .text = view.payload_length ? (char *)view.payload : "",
+        .text_length = view.payload_length,
+        .type = st_token_classify_context(token.data, token.length, context)};
+    context = st_arg_context_after(token.data, token.length);
   }
+  if (status == SHELL_NETSTRING_EOVERFLOW)
+    return ST_ERR_LIMIT;
+  if (status != SHELL_NETSTRING_DONE)
+    return ST_ERR_FORMAT;
+  scratch->count = count;
   return ST_OK;
 }
 
@@ -2044,7 +2047,7 @@ st_error_t st_netargv_visit_view(st_netargv_view_t netargv,
                                  void *user_ctx, size_t *visited_count) {
   if (visited_count)
     *visited_count = 0;
-  if ((!netargv.data && netargv.length != 0) || !visitor)
+  if ((!netargv.data) && (netargv.length != 0))
     return ST_ERR_INVALID;
 
   size_t count = 0;
@@ -2052,9 +2055,7 @@ st_error_t st_netargv_visit_view(st_netargv_view_t netargv,
   if (error != ST_OK)
     return error;
 
-  bool after_long_option = false;
-  bool after_signal_option = false;
-  bool after_regex_command = false;
+  st_arg_context_t context = ST_ARG_CONTEXT_NONE;
   size_t visited = 0;
   shell_netstring_iter_t iter;
   if (shell_netstring_iter_init(&iter, netargv.data, netargv.length) !=
@@ -2071,12 +2072,10 @@ st_error_t st_netargv_visit_view(st_netargv_view_t netargv,
     st_token_view_t token = {
         .text = (const char *)record.payload,
         .text_length = record.payload_length,
-        .type = classify_netargv_span(text, after_long_option,
-                                      after_signal_option, after_regex_command),
+        .type = st_token_classify_context(text.data, text.length, context),
     };
     visited++;
-    netargv_context_after_span(text, &after_long_option, &after_signal_option,
-                               &after_regex_command);
+    context = st_arg_context_after(text.data, text.length);
     if (!visitor(&token, user_ctx))
       break;
   }
@@ -2089,11 +2088,6 @@ st_error_t st_netargv_visit_view(st_netargv_view_t netargv,
 st_error_t st_netargv_visit(const char *netargv,
                             st_netargv_token_visitor_t visitor, void *user_ctx,
                             size_t *visited_count) {
-  if (!netargv) {
-    if (visited_count)
-      *visited_count = 0;
-    return ST_ERR_INVALID;
-  }
   return st_netargv_visit_view(
       (st_netargv_view_t){.data = netargv, .length = strlen(netargv)}, visitor,
       user_ctx, visited_count);
@@ -2103,11 +2097,10 @@ st_error_t st_netargv_visit(const char *netargv,
 
 st_error_t st_netargv_classify_view(st_netargv_view_t netargv,
                                     st_token_array_t *out) {
-  if (out) {
-    out->tokens = NULL;
-    out->count = 0;
-  }
-  if ((!netargv.data && netargv.length != 0) || !out)
+  out->tokens = NULL;
+  out->count = 0;
+
+  if ((!netargv.data) && (netargv.length != 0))
     return ST_ERR_INVALID;
 
   size_t raw_count = 0;
@@ -2125,9 +2118,7 @@ st_error_t st_netargv_classify_view(st_netargv_view_t netargv,
     return ST_ERR_MEMORY;
   out->count = 0;
 
-  bool after_long_option = false;
-  bool after_signal_option = false;
-  bool after_regex_command = false;
+  st_arg_context_t context = ST_ARG_CONTEXT_NONE;
   shell_netstring_iter_t iter;
   if (shell_netstring_iter_init(&iter, netargv.data, netargv.length) !=
       SHELL_NETSTRING_OK)
@@ -2147,11 +2138,10 @@ st_error_t st_netargv_classify_view(st_netargv_view_t netargv,
     out->tokens[out->count].text_length = length;
 
     st_text_span_t token = {payload, length};
-    out->tokens[out->count].type = classify_netargv_span(
-        token, after_long_option, after_signal_option, after_regex_command);
+    out->tokens[out->count].type =
+        st_token_classify_context(token.data, token.length, context);
     out->count++;
-    netargv_context_after_span(token, &after_long_option, &after_signal_option,
-                               &after_regex_command);
+    context = st_arg_context_after(token.data, token.length);
   }
 
   return ST_OK;
@@ -2166,13 +2156,6 @@ fail:
 }
 
 st_error_t st_netargv_classify(const char *netargv, st_token_array_t *out) {
-  if (!netargv) {
-    if (out) {
-      out->tokens = NULL;
-      out->count = 0;
-    }
-    return ST_ERR_INVALID;
-  }
   return st_netargv_classify_view(
       (st_netargv_view_t){.data = netargv, .length = strlen(netargv)}, out);
 }

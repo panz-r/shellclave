@@ -65,9 +65,39 @@ static void test_bounded_span_and_statuses(void) {
           shell_abstract_command_parse("echo '", strlen("echo '"), &result) ==
               SHELL_ABSTRACT_EPARSE &&
           result == NULL;
-  valid = valid && shell_abstract_command_parse("echo", strlen("echo"), NULL) ==
-                       SHELL_ABSTRACT_EINPUT;
   TEST("abstraction reports input and parse failures precisely", valid);
+
+  static const char *const malformed_complete_commands[] = {
+      "time{ true; }",
+      "( git",
+      "time { true;",
+      "echo one |",
+  };
+  valid = true;
+  for (size_t i = 0; i < sizeof(malformed_complete_commands) /
+                             sizeof(malformed_complete_commands[0]);
+       i++) {
+    result = (shell_abstract_command_t *)(void *)1;
+    valid = valid &&
+            shell_abstract_command_parse(malformed_complete_commands[i],
+                                         strlen(malformed_complete_commands[i]),
+                                         &result) == SHELL_ABSTRACT_EPARSE &&
+            result == NULL;
+  }
+  TEST("abstraction rejects malformed complete command syntax", valid);
+
+  char excessive_commands[(SHELL_MAX_SUBCOMMANDS + 1u) * 2u + 1u];
+  size_t excessive_length = 0;
+  for (size_t i = 0; i <= SHELL_MAX_SUBCOMMANDS; i++) {
+    excessive_commands[excessive_length++] = ':';
+    excessive_commands[excessive_length++] = ';';
+  }
+  excessive_commands[excessive_length] = '\0';
+  result = (shell_abstract_command_t *)(void *)1;
+  valid = shell_abstract_command_parse(excessive_commands, excessive_length,
+                                       &result) == SHELL_ABSTRACT_EOVERFLOW &&
+          result == NULL;
+  TEST("abstraction maps semantic command capacity to overflow", valid);
 }
 
 static void test_dynamic_arithmetic_is_rejected(void) {
@@ -78,6 +108,68 @@ static void test_dynamic_arithmetic_is_rejected(void) {
                result == NULL;
   shell_abstract_command_free(result);
   TEST("Dynamic arithmetic is rejected before abstraction", valid);
+}
+
+static void test_timed_complete_command_abstraction(void) {
+  printf("\n=== Timed Complete Command Abstraction ===\n");
+
+  static const struct {
+    const char *source;
+    const char *display;
+    size_t element_count;
+    shell_abstract_type_t first_type;
+    const char *first_original;
+    size_t first_start;
+    const char *second_original;
+    size_t second_start;
+  } cases[] = {
+      {"time -p -- printf %s /workspace/${NAME}",
+       "time -p -- printf %s $AP_1$EV_1", 2, SHELL_ABSTRACT_AP, "/workspace/",
+       21, "${NAME}", 32},
+      {"time { printf %s ./file; }", "time { printf %s $RP_1; }", 1,
+       SHELL_ABSTRACT_RP, "./file", 17, NULL, 0},
+      {"time ({ printf %s ./file; })", "time ({ printf %s $RP_1; })", 1,
+       SHELL_ABSTRACT_RP, "./file", 18, NULL, 0},
+      {"time ({(printf %s ./file)})", "time ({(printf %s $RP_1)})", 1,
+       SHELL_ABSTRACT_RP, "./file", 18, NULL, 0},
+      {"time { time -p printf %s ~/file; }",
+       "time { time -p printf %s $HP_1; }", 1, SHELL_ABSTRACT_HP, "~/file", 25,
+       NULL, 0},
+  };
+
+  bool valid = true;
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    shell_abstract_command_t *result = NULL;
+    shell_abstract_status_t status = shell_abstract_command_parse(
+        cases[i].source, strlen(cases[i].source), &result);
+    size_t count = 0;
+    const shell_abstract_element_t *const *elements =
+        shell_abstract_command_get_elements(result, &count);
+    bool item = status == SHELL_ABSTRACT_OK && result != NULL &&
+                strcmp(shell_abstract_command_get_source(result),
+                       cases[i].source) == 0 &&
+                strcmp(shell_abstract_command_get_display_text(result),
+                       cases[i].display) == 0 &&
+                elements != NULL && count == cases[i].element_count &&
+                elements[0] != NULL &&
+                elements[0]->type == cases[i].first_type &&
+                strcmp(elements[0]->original, cases[i].first_original) == 0 &&
+                elements[0]->start == cases[i].first_start &&
+                elements[0]->end ==
+                    cases[i].first_start + strlen(cases[i].first_original) &&
+                result->has_paths;
+    if (cases[i].second_original) {
+      item = item && elements[1] != NULL &&
+             strcmp(elements[1]->original, cases[i].second_original) == 0 &&
+             elements[1]->start == cases[i].second_start &&
+             elements[1]->end ==
+                 cases[i].second_start + strlen(cases[i].second_original) &&
+             result->has_variables;
+    }
+    valid = valid && item;
+    shell_abstract_command_free(result);
+  }
+  TEST("Timed complete commands retain syntax and abstraction offsets", valid);
 }
 
 static void test_compound_variable_quote_boundaries(void) {
@@ -115,6 +207,33 @@ static void test_compound_variable_quote_boundaries(void) {
   }
   TEST("compound variables preserve quoted and ANSI-C literal boundaries",
        valid);
+
+  static const char *const string_words[] = {
+      "prefix$'literal'",
+      "prefix$'don\\'t $literal'",
+      "prefix$\\\n'literal'",
+  };
+  valid = true;
+  for (size_t i = 0;
+       valid && i < sizeof(string_words) / sizeof(string_words[0]); i++) {
+    char source[128];
+    int length = snprintf(source, sizeof(source), "printf %s", string_words[i]);
+    shell_abstract_command_t *result = parse_command(source);
+    size_t count = 0;
+    const shell_abstract_element_t *const *elements =
+        result ? shell_abstract_command_get_elements(result, &count) : NULL;
+    valid = length > 0 && (size_t)length < sizeof(source) && result &&
+            strcmp(shell_abstract_command_get_display_text(result),
+                   "printf prefix$STR_1") == 0 &&
+            result->has_strings && !result->has_variables && count == 1 &&
+            elements && elements[0] &&
+            elements[0]->type == SHELL_ABSTRACT_STR &&
+            strcmp(elements[0]->original, string_words[i] + 6) == 0 &&
+            strcmp(elements[0]->data.cmd_subst.content,
+                   i == 1 ? "don\\'t $literal" : "literal") == 0;
+    shell_abstract_command_free(result);
+  }
+  TEST("composite ANSI-C strings retain source and payload metadata", valid);
 
   shell_abstract_command_t *continued = parse_command("printf ${NA\\\nME}");
   size_t count = 0;
@@ -183,6 +302,58 @@ static void test_compound_substitution_boundaries(void) {
     shell_abstract_command_free(result);
   }
   TEST("compound abstractions retain active substitution boundaries", valid);
+
+  static const struct {
+    const char *source;
+    const char *substitution;
+    const char *content;
+  } scoped[] = {
+      {"echo \"$OUTER$(printf '$INNER')$AFTER\"", "$(printf '$INNER')",
+       "printf '$INNER'"},
+      {"echo \"$OUTER$(printf '\"$INNER')$AFTER\"", "$(printf '\"$INNER')",
+       "printf '\"$INNER'"},
+      {"echo \"$OUTER$(printf \"$INNER\")$AFTER\"", "$(printf \"$INNER\")",
+       "printf \"$INNER\""},
+      {"echo \"$OUTER`printf '$INNER'`$AFTER\"", "`printf '$INNER'`",
+       "printf '$INNER'"},
+  };
+  valid = true;
+  for (size_t i = 0; i < sizeof(scoped) / sizeof(scoped[0]); i++) {
+    result = parse_command(scoped[i].source);
+    count = 0;
+    elements =
+        result ? shell_abstract_command_get_elements(result, &count) : NULL;
+    bool matches =
+        result && elements && count == 3 && result->has_variables &&
+        result->has_cmd_subst &&
+        strcmp(result->display_text, "echo \"$EV_1$CS_1$EV_2\"") == 0;
+    static const char *const variables[] = {"$OUTER", "$AFTER"};
+    for (size_t j = 0; matches && j < 2; j++) {
+      const shell_abstract_element_t *element = elements[2 * j];
+      const char *expected = strstr(scoped[i].source, variables[j]);
+      matches = element->type == SHELL_ABSTRACT_EV &&
+                strcmp(element->original, variables[j]) == 0 &&
+                strcmp(element->data.var.name, variables[j] + 1) == 0 &&
+                element->data.var.is_quoted &&
+                element->start == (size_t)(expected - scoped[i].source) &&
+                element->end - element->start == strlen(variables[j]);
+    }
+    if (matches) {
+      const shell_abstract_element_t *element = elements[1];
+      matches =
+          element->type == SHELL_ABSTRACT_CS &&
+          strcmp(element->original, scoped[i].substitution) == 0 &&
+          strcmp(element->data.cmd_subst.content, scoped[i].content) == 0 &&
+          element->start ==
+              (size_t)(strstr(scoped[i].source, scoped[i].substitution) -
+                       scoped[i].source) &&
+          element->end - element->start == strlen(scoped[i].substitution);
+    }
+    valid = valid && matches;
+    shell_abstract_command_free(result);
+  }
+  TEST("child substitution quoting cannot alter outer variable metadata",
+       valid);
 }
 
 static void test_parameter_expansion_metadata(void) {
@@ -203,8 +374,6 @@ static void test_parameter_expansion_metadata(void) {
       {"printf $\\\r\n{!}", SHELL_ABSTRACT_SV, "!"},
       {"printf \"$\\\n{#}\"", SHELL_ABSTRACT_SV, "#"},
       {"printf ${#?}", SHELL_ABSTRACT_SV, "?"},
-      {"printf ${!name}", SHELL_ABSTRACT_EV, "name"},
-      {"printf ${!1}", SHELL_ABSTRACT_PV, "1"},
       {"printf ${!prefix*}", SHELL_ABSTRACT_EV, NULL},
       {"printf ${!prefix@}", SHELL_ABSTRACT_EV, NULL},
   };
@@ -223,6 +392,15 @@ static void test_parameter_expansion_metadata(void) {
     shell_abstract_command_free(result);
   }
   TEST("parameter expansion metadata names only static parameters", valid);
+  static const char *const indirect[] = {"printf ${!name}", "printf ${!1}"};
+  for (size_t i = 0; i < sizeof(indirect) / sizeof(indirect[0]); i++) {
+    shell_abstract_command_t *result = NULL;
+    valid &= shell_abstract_command_parse(indirect[i], strlen(indirect[i]),
+                                          &result) == SHELL_ABSTRACT_EPARSE &&
+             result == NULL;
+    shell_abstract_command_free(result);
+  }
+  TEST("indirect expansions reject unmodeled value re-evaluation", valid);
 }
 
 static void test_nested_parameter_substitution_metadata(void) {
@@ -406,6 +584,15 @@ static void test_abstraction_matrix(void) {
       {"special parameter family", "echo $? $$ $# $! $@ $* $-",
        "echo $SV_1 $SV_2 $SV_3 $SV_4 $SV_5 $SV_6 $SV_7", 7,
        FLAG_VARIABLES | FLAG_SPECIAL_VARS},
+      {"quoted special parameter family", "printf '%s\\n' \"$- $@ $* $!\"\n",
+       "printf $STR_1 \"$SV_1 $SV_2 $SV_3 $SV_4\"\n", 5,
+       FLAG_VARIABLES | FLAG_SPECIAL_VARS | FLAG_STRINGS},
+      {"timed quoted compound variables", "time printf \"$HOME $1 $?\"",
+       "time printf \"$EV_1 $PV_1 $SV_1\"", 3,
+       FLAG_VARIABLES | FLAG_POS_VARS | FLAG_SPECIAL_VARS},
+      {"quoted compound path fragments", "time printf \"/a/$USER/b/$HOME/c\"",
+       "time printf \"$AP_1$EV_1$AP_2$EV_2$AP_3\"", 5,
+       FLAG_VARIABLES | FLAG_PATHS | FLAG_ABS_PATHS},
       {"command substitution", "cat $(cat file.txt)", "cat $CS_1", 1,
        FLAG_CMD_SUBST},
       {"backtick substitution", "echo `date`", "echo $CS_1", 1, FLAG_CMD_SUBST},
@@ -474,7 +661,10 @@ static void test_abstraction_matrix(void) {
 static void test_abstraction_allocation_failures(void) {
   static const char input[] =
       "echo /var/log/$APP.log ./$REL ~/$HOME arg-$1 status-$? *.txt $(date) "
-      "$((1+2)) /a/$X/b ${VALUE:-$(date)} ${!prefix*} ${?} >output";
+      "$((1+2)) /a/$X/b ${VALUE:-$(date)} ${!prefix*} ${?} "
+      "\"$OUTER$(printf '\"$INNER')$AFTER\" "
+      "\"$OUTER`printf '$INNER'`$AFTER\" "
+      "\"$(printf '$INNER')\" >output";
   shellsplit_test_alloc_reset();
   shell_abstract_command_t *probe = parse_command(input);
   TEST("allocation probe succeeds", probe != NULL);
@@ -493,17 +683,68 @@ static void test_abstraction_allocation_failures(void) {
     shell_abstract_command_free(result);
   }
 
+  /* Complete-command validation now accepts timing prefixes and compound
+   * timing scopes. Exercise the same failure-atomic allocation boundary on
+   * that path rather than only on an ordinary simple command. */
+  static const char *const timed_inputs[] = {
+      "time { printf %s /tmp/${VALUE}; time -p printf %s ~/nested; }",
+      "time ({ printf %s /tmp/${VALUE}; })",
+      "time ({(printf %s ~/nested)})",
+      "time printf %s ./prefix$VALUE$(time printf child)/suffix",
+      "time printf %s $VALUE`printf child`/suffix",
+      "time { printf %s $VALUE<(printf child)>suffix; } >report",
+      "time printf '%s\\n' \"$- $@ $* $!\"",
+      "time { printf \"$HOME$(printf child) $1 $?\"; }",
+      "time printf prefix$'don\\'t $literal'${NAME}",
+      "time printf prefix$'literal'",
+      "time printf $\\\n'abc'",
+      "time printf pre$\\\n'abc'$VALUE",
+      "time printf \"pre$\\\n(id)$VALUE\"",
+      "time printf \"$VALUE$((1 + 2))\"",
+      "time printf pre$((1))$((2))$VALUE",
+      "time printf $\\\n(\\\r\n(1 + 2)\\\n)$VALUE",
+      "time printf x${VALUE:-$((1 + 2))}*",
+      "time printf >x$VALUE$((1))",
+  };
+  bool timed_atomic = true;
+  for (size_t i = 0;
+       timed_atomic && i < sizeof(timed_inputs) / sizeof(timed_inputs[0]);
+       i++) {
+    shellsplit_test_alloc_reset();
+    probe = parse_command(timed_inputs[i]);
+    allocations = shellsplit_test_alloc_count();
+    timed_atomic = probe != NULL && allocations > 4;
+    shell_abstract_command_free(probe);
+    for (size_t fail_at = 1; timed_atomic && fail_at <= allocations;
+         fail_at++) {
+      shellsplit_test_alloc_fail_at(fail_at);
+      shell_abstract_command_t *result = NULL;
+      shell_abstract_status_t timed_status = shell_abstract_command_parse(
+          timed_inputs[i], strlen(timed_inputs[i]), &result);
+      shellsplit_test_alloc_reset();
+      timed_atomic = timed_status == SHELL_ABSTRACT_ENOMEM && result == NULL;
+      if (!timed_atomic)
+        fprintf(stderr,
+                "timed abstraction failure: source=%s fail_at=%zu "
+                "status=%d\n",
+                timed_inputs[i], fail_at, timed_status);
+      shell_abstract_command_free(result);
+    }
+  }
+  shellsplit_test_alloc_reset();
+  TEST("Timed command abstraction allocation failures are atomic",
+       timed_atomic);
+
   char *netseq = NULL;
   size_t count = 0;
   shellsplit_test_alloc_reset();
   shell_process_status_t status =
       shell_build_type_netseq(input, strlen(input), NULL, &netseq, &count);
   allocations = shellsplit_test_alloc_count();
-  /* The two nested `$(date)` expansions are execution stages in addition to
-   * the enclosing command. Keep this allocation probe on the full canonical
-   * stage sequence rather than the older top-level-only count. */
+  /* Two date substitutions and three scoped printf substitutions precede the
+   * enclosing echo. Keep the allocation probe on all six execution stages. */
   TEST("type-netsequence allocation probe succeeds",
-       status == SHELL_PROCESS_OK && netseq && count == 3);
+       status == SHELL_PROCESS_OK && netseq && count == 6);
   free(netseq);
 
   bool atomic = true;
@@ -588,6 +829,102 @@ static void test_element_metadata(void) {
   }
 }
 
+static void test_fragment_payload_metadata(void) {
+  static const struct {
+    const char *name;
+    const char *input;
+    shell_abstract_type_t type;
+    const char *original;
+    const char *content;
+  } cases[] = {
+      {"empty backtick payload", "echo ``", SHELL_ABSTRACT_CS, "``", ""},
+      {"one-character backtick payload", "echo `x`", SHELL_ABSTRACT_CS, "`x`",
+       "x"},
+      {"empty dollar substitution payload", "echo $()", SHELL_ABSTRACT_CS,
+       "$()", ""},
+      {"one-character dollar substitution payload", "echo $(x)",
+       SHELL_ABSTRACT_CS, "$(x)", "x"},
+      {"empty process input payload", "echo <()", SHELL_ABSTRACT_CS, "<()", ""},
+      {"empty process output payload", "echo >()", SHELL_ABSTRACT_CS, ">()",
+       ""},
+      {"one-character process payload", "echo <(x)", SHELL_ABSTRACT_CS, "<(x)",
+       "x"},
+      {"adjacent short substitution payload", "echo pre`x`suffix",
+       SHELL_ABSTRACT_CS, "`x`", "x"},
+      {"variable-adjacent short substitution payload", "echo $VALUE`x`",
+       SHELL_ABSTRACT_CS, "`x`", "x"},
+      {"quoted composite short substitution payload", "echo \"$VALUE`x`\"",
+       SHELL_ABSTRACT_CS, "`x`", "x"},
+      {"quoted composite empty substitution payload", "echo \"$VALUE$()\"",
+       SHELL_ABSTRACT_CS, "$()", ""},
+      {"timed short substitution payload", "time -p echo `x`",
+       SHELL_ABSTRACT_CS, "`x`", "x"},
+      {"timed group empty substitution payload", "time { echo $(); }",
+       SHELL_ABSTRACT_CS, "$()", ""},
+      {"substitution payload preserves continuations", "echo $(x\\\ny)",
+       SHELL_ABSTRACT_CS, "$(x\\\ny)", "x\\\ny"},
+      {"continued opener empty payload", "echo $\\\n()", SHELL_ABSTRACT_CS,
+       "$\\\n()", ""},
+      {"empty single-quoted payload", "echo ''", SHELL_ABSTRACT_STR, "''", ""},
+      {"empty double-quoted payload", "echo \"\"", SHELL_ABSTRACT_STR, "\"\"",
+       ""},
+      {"empty ANSI-C payload", "echo $''", SHELL_ABSTRACT_STR, "$''", ""},
+      {"composite empty ANSI-C payload", "echo pre$''$VALUE",
+       SHELL_ABSTRACT_STR, "$''", ""},
+      {"single-quoted payload preserves continuations", "echo '\\\n'",
+       SHELL_ABSTRACT_STR, "'\\\n'", "\\\n"},
+      {"double-quoted payload preserves continuations", "echo \"\\\n\"",
+       SHELL_ABSTRACT_STR, "\"\\\n\"", "\\\n"},
+      {"empty arithmetic payload", "echo $(())", SHELL_ABSTRACT_AR, "$(())",
+       ""},
+      {"composite empty arithmetic payload", "echo pre$(())$VALUE",
+       SHELL_ABSTRACT_AR, "$(())", ""},
+      {"arithmetic payload", "echo $((1))", SHELL_ABSTRACT_AR, "$((1))", "1"},
+      {"composite arithmetic payload", "echo pre$((1))$VALUE",
+       SHELL_ABSTRACT_AR, "$((1))", "1"},
+  };
+
+  bool atomic = true;
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    shellsplit_test_alloc_reset();
+    shell_abstract_command_t *result = parse_command(cases[i].input);
+    size_t allocations = shellsplit_test_alloc_count();
+    const char *key = cases[i].type == SHELL_ABSTRACT_CS   ? "$CS_1"
+                      : cases[i].type == SHELL_ABSTRACT_AR ? "$AR_1"
+                                                           : "$STR_1";
+    shell_abstract_element_t *element =
+        result ? shell_abstract_command_find_element(result, key) : NULL;
+    size_t start =
+        (size_t)(strstr(cases[i].input, cases[i].original) - cases[i].input);
+    bool valid =
+        result && element && element->type == cases[i].type &&
+        element->data.cmd_subst.content &&
+        strcmp(element->data.cmd_subst.content, cases[i].content) == 0 &&
+        strcmp(element->original, cases[i].original) == 0 &&
+        element->start == start &&
+        element->end == start + strlen(cases[i].original) &&
+        validate_elements(cases[i].input, result);
+    TEST(cases[i].name, valid);
+    atomic = atomic && result != NULL;
+    shell_abstract_command_free(result);
+
+    for (size_t fail_at = 1; atomic && fail_at <= allocations; fail_at++) {
+      shellsplit_test_alloc_fail_at(fail_at);
+      result = NULL;
+      shell_abstract_status_t status = shell_abstract_command_parse(
+          cases[i].input, strlen(cases[i].input), &result);
+      shellsplit_test_alloc_reset();
+      atomic = status == SHELL_ABSTRACT_ENOMEM && result == NULL;
+      if (!atomic)
+        fprintf(stderr, "fragment payload allocation failure: %s at %zu\n",
+                cases[i].name, fail_at);
+      shell_abstract_command_free(result);
+    }
+  }
+  shellsplit_test_alloc_reset();
+  TEST("fragment payload allocation failures leave no partial result", atomic);
+}
+
 static void test_classification_matrix(void) {
   printf("\n=== Raw Token Classification Matrix ===\n");
 
@@ -616,10 +953,23 @@ static void test_classification_matrix(void) {
                {"${!}", SHELL_TOKEN_SPECIAL_VAR},
                {"${#?}", SHELL_TOKEN_SPECIAL_VAR},
                {"${!1}", SHELL_TOKEN_SPECIAL_VAR},
+               {"$()", SHELL_TOKEN_SUBSHELL},
+               {"$(x)", SHELL_TOKEN_SUBSHELL},
                {"$(date)", SHELL_TOKEN_SUBSHELL},
+               {"``", SHELL_TOKEN_SUBSHELL},
+               {"`x`", SHELL_TOKEN_SUBSHELL},
                {"`date`", SHELL_TOKEN_SUBSHELL},
+               {"`", SHELL_TOKEN_ARGUMENT},
+               {"$(", SHELL_TOKEN_ARGUMENT},
                {"$((1+2))", SHELL_TOKEN_ARITHMETIC},
                {"*.txt", SHELL_TOKEN_GLOB},
+               {"--foo*", SHELL_TOKEN_GLOB},
+               {"-x?", SHELL_TOKEN_GLOB},
+               {"--[ab]", SHELL_TOKEN_GLOB},
+               {"-@(left|right)", SHELL_TOKEN_GLOB},
+               {"--foo\\*", SHELL_TOKEN_ARGUMENT},
+               {"\"-x?\"", SHELL_TOKEN_ARGUMENT},
+               {"--dir/*.txt", SHELL_TOKEN_ARGUMENT},
                {"/tmp/*.txt", SHELL_TOKEN_ARGUMENT},
                {"dir/*.txt", SHELL_TOKEN_ARGUMENT},
                {"/etc/passwd", SHELL_TOKEN_ARGUMENT},
@@ -638,7 +988,7 @@ static void test_classification_matrix(void) {
                {"\"text\"", SHELL_TOKEN_ARGUMENT},
                {"plain", SHELL_TOKEN_ARGUMENT}};
 
-  bool valid = shell_classify_raw_token(NULL, 0) == SHELL_TOKEN_END;
+  bool valid = shell_classify_raw_token("", 0) == SHELL_TOKEN_END;
   for (size_t i = 0; valid && i < sizeof(cases) / sizeof(cases[0]); i++)
     valid = shell_classify_raw_token(cases[i].text, strlen(cases[i].text)) ==
             cases[i].expected;
@@ -675,7 +1025,7 @@ static void test_path_and_name_matrices(void) {
                {"/unknown", SHELL_PATH_OTHER},
                {"relative", SHELL_PATH_OTHER},
                {"", SHELL_PATH_OTHER},
-               {NULL, SHELL_PATH_OTHER}};
+               {"", SHELL_PATH_OTHER}};
   static const char *abstract_names[] = {"EV", "PV", "SV", "AP",  "RP", "HP",
                                          "GB", "CS", "AR", "STR", "RD"};
   static const char *path_names[] = {
@@ -784,23 +1134,8 @@ static void test_invalid_and_null_inputs(void) {
 
   shell_abstract_command_t *result = parse_command("");
   bool valid = result == NULL;
-  result = parse_command(NULL);
-  valid = valid && result == NULL;
   TEST("abstraction rejects invalid inputs", valid);
 
-  size_t count = 7;
-  valid =
-      shell_abstract_command_get_display_text(NULL) == NULL &&
-      shell_abstract_command_get_source(NULL) == NULL &&
-      shell_abstract_command_get_elements(NULL, &count) == NULL && count == 0 &&
-      shell_abstract_command_get_elements(NULL, NULL) == NULL &&
-      shell_abstract_command_get_mutable_elements(NULL, &count) == NULL &&
-      count == 0 && shell_abstract_command_get_element(NULL, 0) == NULL &&
-      shell_abstract_command_find_element(NULL, "$EV_1") == NULL &&
-      shell_abstract_element_expand(NULL, NULL) == NULL &&
-      !shell_abstract_command_expand(NULL, NULL) &&
-      !shell_abstract_command_has_redirects(NULL) && feature_mask(NULL) == 0;
-  TEST("query and expansion APIs are null-safe", valid);
   shell_abstract_command_free(NULL);
 }
 
@@ -854,17 +1189,9 @@ static void test_type_sequence_matrix(void) {
           netseq == NULL && command_count == 0;
   TEST("nested type sequence rejects an empty decoded executable", valid);
 
-  valid = shell_build_type_netseq(NULL, 0, NULL, &netseq, &command_count) ==
+  valid = shell_build_type_netseq("", 0, NULL, &netseq, &command_count) ==
               SHELL_PROCESS_EINPUT &&
           netseq == NULL && command_count == 0;
-  valid = valid &&
-          shell_build_type_netseq("echo x", strlen("echo x"), NULL, NULL,
-                                  &command_count) == SHELL_PROCESS_EINPUT &&
-          command_count == 0;
-  valid = valid &&
-          shell_build_type_netseq("echo x", strlen("echo x"), NULL, &netseq,
-                                  NULL) == SHELL_PROCESS_EINPUT &&
-          netseq == NULL;
   TEST("nested type sequence validates every argument atomically", valid);
 
   shell_process_limits_t limits = {SIZE_MAX, SIZE_MAX, 0};
@@ -893,6 +1220,7 @@ int main(void) {
   test_abstraction_matrix();
   test_bounded_span_and_statuses();
   test_dynamic_arithmetic_is_rejected();
+  test_timed_complete_command_abstraction();
   test_compound_variable_quote_boundaries();
   test_compound_substitution_boundaries();
   test_parameter_expansion_metadata();
@@ -902,6 +1230,7 @@ int main(void) {
   test_modern_word_abstractions();
   test_abstraction_allocation_failures();
   test_element_metadata();
+  test_fragment_payload_metadata();
   test_classification_matrix();
   test_path_and_name_matrices();
   test_runtime_expansion();

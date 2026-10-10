@@ -4,17 +4,32 @@
 #include "shell_processor.h"
 
 /* Private borrowed-token view used by single-buffer netsequence producers.
- * The commands and token text remain owned by the full tokenizer. */
+ * The caller frees command/token arrays with shell_commands_free(); token
+ * text borrows the immutable source. Every returned record is nonempty, with
+ * all tokens inside its declared source span; compound tails do not create
+ * separate structural records. Source and
+ * output destinations are required; limits may be NULL for defaults. Only
+ * max_group_io_ops applies here, to immediate-list group metadata. Borrowed
+ * source spans are not returned strings: byte limits are enforced by the
+ * producer that renders these records into owned output. */
 shell_process_status_t
 shell_processed_commands_parse(const char *command_line, size_t command_length,
                                const shell_process_limits_t *limits,
-                               shell_command_t **commands, size_t *count);
+                               shell_command_t **commands, size_t *count)
+    SHELL_NONNULL(1, 4, 5);
 
-/* Ordered owned view of every supported simple-command stage that executes
- * while evaluating one source command. Nested command and process
- * substitutions precede their enclosing command; siblings retain source
- * order. This deterministic analysis order is intentionally not a runtime
- * scheduling claim for pipeline members. */
+/* Ordered owned anomaly-analysis view of every supported executable simple
+ * command plus each argv-less structural stage that still needs an explicit
+ * anomaly boundary. The latter includes redirect-only commands and empty
+ * Bash `time` pipelines; public netsequence builders represent it with their
+ * anomaly-only empty argv[0] sentinel, never as a policy subject. Nested
+ * command and process substitutions precede their enclosing command; siblings
+ * retain source order. This deterministic analysis order is intentionally not
+ * a runtime scheduling claim for pipeline members. The entry boundary checks
+ * the complete root's byte domain, syntax and supported semantics once;
+ * collection constructs borrowed nested body records without revalidating
+ * their descendants. Resource limits and allocation failures remain checked
+ * during construction. Source storage stays immutable until return. */
 typedef struct {
   shell_command_t *commands;
   size_t count;
@@ -23,7 +38,7 @@ typedef struct {
 shell_process_status_t
 shell_anomaly_stages_parse(const char *command_line, size_t command_length,
                            const shell_process_limits_t *limits,
-                           shell_anomaly_stages_t *stages);
+                           shell_anomaly_stages_t *stages) SHELL_NONNULL(1, 4);
 void shell_anomaly_stages_free(shell_anomaly_stages_t *stages);
 
 /* Validate that complete source is representable by Shellsplit's semantic
@@ -31,17 +46,16 @@ void shell_anomaly_stages_free(shell_anomaly_stages_t *stages);
  * fast-parser result used for validation. The flat API uses this model for
  * complete compound groups, then retains its intentionally tolerant lexical
  * fallback for incomplete parenthesized input. */
-shell_process_status_t
-shell_process_validate_supported_source(const char *command_line,
-                                        size_t command_length,
-                                        shell_parse_result_t *parsed);
+shell_process_status_t shell_process_validate_supported_source(
+    const char *command_line, size_t command_length,
+    shell_parse_result_t *parsed) SHELL_NONNULL(1);
 
 /* Return the storage needed for a NUL-terminated legacy adapter result.
  * Canonical buffers themselves are length-delimited, but their C-string
  * wrappers must reject SIZE_MAX rather than letting a trailing `+ 1` wrap. */
 shell_process_status_t
 shell_process_cstring_allocation_size(size_t content_length,
-                                      size_t *allocation_size);
+                                      size_t *allocation_size) SHELL_NONNULL(2);
 
 /* Classify a fully static duplication operand after shell quote decoding.
  * This private helper is shared by the processed-command and dependency-graph
@@ -56,7 +70,7 @@ typedef enum {
 
 shell_process_fd_target_t
 shell_process_classify_static_fd_target(const char *text, size_t length,
-                                        uint32_t *fd);
+                                        uint32_t *fd) SHELL_NONNULL(1, 3);
 
 /* Bash overloads `>&word`: an ordinary pathname redirects both stdout and
  * stderr, while a descriptor or `-` duplicates/closes stdout only. Keep this
@@ -72,13 +86,18 @@ typedef enum {
 } shell_process_legacy_redirect_target_t;
 
 shell_process_legacy_redirect_target_t
-shell_process_classify_legacy_output_target(const char *text, size_t length);
+shell_process_classify_legacy_output_target(const char *text, size_t length)
+    SHELL_NONNULL(1);
 
 /* Borrowed tokenizer records: token pointers and positions must refer to the
  * same source buffer, including gaps occupied by escaped line continuations.
- * Each returned token is a synthetic span for one complete source word. Its
- * type comes from the first lexical fragment and its quoted/escaped flags are
- * the union of every fragment in the word. */
+ * Tokens have complete readable spans within that buffer in source order;
+ * position + length fits size_t. The parser establishes those preconditions,
+ * and iteration does not revalidate them or accept fabricated token metadata.
+ * Each returned token is a synthetic span for one complete source word.
+ * A NULL command initializes an exhausted iterator. Iterator and word output
+ * pointers are required. The token type comes from the first lexical fragment
+ * and its quoted/escaped flags are the union of every fragment in the word. */
 typedef struct {
   const shell_command_t *command;
   size_t token_index;
@@ -87,18 +106,13 @@ typedef struct {
 } shell_processed_word_iterator_t;
 
 void shell_processed_word_iterator_init(
-    shell_processed_word_iterator_t *iterator, const shell_command_t *command);
+    shell_processed_word_iterator_t *iterator, const shell_command_t *command)
+    SHELL_NONNULL(1);
 bool shell_processed_word_iterator_next(
-    shell_processed_word_iterator_t *iterator, shell_token_t *word);
+    shell_processed_word_iterator_t *iterator, shell_token_t *word)
+    SHELL_NONNULL(1, 2);
 size_t shell_processed_command_word_count(const shell_command_t *command);
 bool shell_processed_command_has_dangerous_features(
     const shell_command_t *command, bool has_pipe_input);
 bool shell_processed_command_has_pipe_output(const shell_command_t *command);
-/* Source positions refer to this complete input. A physical list boundary
- * hidden by heredoc tokenization still terminates a group's redirect list. */
-bool shell_processed_command_is_group_structure(const shell_command_t *commands,
-                                                size_t count, size_t index,
-                                                const char *source,
-                                                size_t source_length);
-
 #endif

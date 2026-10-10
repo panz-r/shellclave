@@ -239,6 +239,13 @@ static ast_node_t *gen_brace_group_depth(shell_ast_generator_t *gen,
     inner = gen_subshell(gen, ast);
   else
     inner = gen_command_with_redirects(gen, ast);
+  if (inner &&
+      (inner->type == AST_BRACE_GROUP || inner->type == AST_SUBSHELL) &&
+      random_range(gen, 3) == 0) {
+    static const char *const prefixes[] = {"time", "time -p", "! time --",
+                                           "time !"};
+    inner = shell_ast_add_time(ast, inner, prefixes[random_range(gen, 4)]);
+  }
   return shell_ast_add_brace_group(ast, inner);
 }
 
@@ -263,7 +270,14 @@ static ast_node_t *gen_pipeline(shell_ast_generator_t *gen, shell_ast_t *ast) {
   ast_node_t *cmd2 = random_range(gen, 5) == 0
                          ? gen_brace_group(gen, ast)
                          : gen_command_with_redirects(gen, ast);
-  return shell_ast_add_pipeline(ast, cmd1, cmd2);
+  ast_node_t *pipeline = shell_ast_add_pipeline(ast, cmd1, cmd2);
+  if (pipeline && random_range(gen, 3) == 0) {
+    static const char *const prefixes[] = {"time", "time -p", "! time --",
+                                           "time !"};
+    pipeline =
+        shell_ast_add_time(ast, pipeline, prefixes[random_range(gen, 4)]);
+  }
+  return pipeline;
 }
 
 // Generate sequence: cmd1 ; cmd2 or cmd1 && cmd2 or cmd1 || cmd2

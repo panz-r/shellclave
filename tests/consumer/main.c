@@ -52,10 +52,14 @@ static bool check_policy_view_apis(st_netargv_view_t netargv) {
   size_t visited_count = 0;
   size_t diff_count = 0;
   st_eval_result_t eval = {0};
+  st_token_array_t validated = {0};
   bool matches = false;
   bool ok =
       ctx && policy && empty &&
       st_netpattern_from_cpl("echo hello", &netpattern) == ST_OK &&
+      st_netpattern_validate(netpattern, &validated) == ST_OK &&
+      validated.count == 2 && validated.tokens[1].text_length == 5 &&
+      memcmp(validated.tokens[1].text, "hello", 5) == 0 &&
       st_policy_add_netpattern(policy, netpattern) == ST_OK &&
       st_policy_eval_view(policy, netargv, &eval) == ST_OK && eval.matches &&
       st_policy_match_view(policy, netargv, &matches) == ST_OK && matches &&
@@ -71,6 +75,7 @@ static bool check_policy_view_apis(st_netargv_view_t netargv) {
       diff_count == 1;
 
   st_policy_matches_free(all_matches);
+  st_token_array_free(&validated);
   free(netpattern);
   st_policy_free(empty);
   st_policy_free(policy);
@@ -100,6 +105,31 @@ static bool check_depgraph_workspace_api(void) {
   bool ok = shell_dep_graph_parse("echo hello", strlen("echo hello"), ".",
                                   &limits, &graph) == SHELL_DEP_OK &&
             shell_dep_graph_validate(&graph).valid;
+  if (ok) {
+    static const char timed[] = "time -p echo hello | cat";
+    ok = shell_dep_graph_parse(timed, sizeof(timed) - 1, ".", &limits,
+                               &graph) == SHELL_DEP_OK &&
+         shell_dep_graph_validate(&graph).valid;
+    uint32_t timers = 0;
+    uint32_t timed_commands = 0;
+    for (uint32_t i = 0; ok && i < graph.node_count; i++) {
+      if (graph.nodes[i].type == SHELL_NODE_TIME) {
+        timers++;
+        ok = graph.nodes[i].time.mode == SHELL_PIPE_TIME_POSIX &&
+             graph.nodes[i].time.report_route == SHELL_TIME_REPORT_EXTERNAL &&
+             graph.nodes[i].time.report_target_fd == 2 &&
+             graph.nodes[i].time.report_route_flags ==
+                 SHELL_TIME_REPORT_ROUTE_EXTERNAL &&
+             graph.nodes[i].time.report_external_fd_count == 1 &&
+             graph.nodes[i].time.report_external_fds[0] == 2;
+      } else if (graph.nodes[i].type == SHELL_NODE_CMD) {
+        ok = graph.nodes[i].cmd.pipeline_time_mode == SHELL_PIPE_TIME_POSIX &&
+             graph.nodes[i].cmd.pipeline_time_id != 0;
+        timed_commands++;
+      }
+    }
+    ok = ok && timers == 1 && timed_commands == 2;
+  }
   free(raw);
   return ok;
 }

@@ -85,6 +85,16 @@ patterns with `st_netpattern_free()`. Legacy C-string converters support only
 NUL-free netpatterns. Policy APIs accept only canonical netpatterns; use their
 view forms for binary patterns.
 
+`st_netpattern_validate_view()` validates the canonical encoding and policy
+command-position grammar. Its optional details output is an owned
+`st_token_array_t`, initialized empty before the call and released with
+`st_token_array_free()`. It retains exact byte lengths and compound component
+metadata, using the decoding allocations directly. Omitting details does not
+change validity; failures leave the output empty. Each literal or compound
+component has its own decoded-byte limit, so a valid compound's complete
+display spelling can exceed an ordinary literal's limit. This is pattern
+validation, not shell-source tokenization.
+
 ## Framed files
 
 Streams of netargv values use one outer netstring per record. Learner v5 and

@@ -13,6 +13,12 @@ command policy.
 - **shellgate** combines both libraries into an allow/deny gate with advisory
   lexical violation checks and optional statistical anomaly scoring.
 
+Gate evaluation uses the [documented Bash execution model](shellsplit/README.md),
+not executor-neutral shell semantics. Applications must establish its clean
+noninteractive startup state before executing accepted source and inspect
+and evaluate dynamic content as required by conditional substitution results.
+Shellclave itself does not execute commands.
+
 ## Requirements and build
 
 The root CMake project requires CMake 3.20+, C11 and C++11 compilers,
@@ -182,6 +188,17 @@ The fixed smoke seed corpora are tracked. Generated fuzzing corpora and
 coverage reports stay in build directories and are ignored. Crash artifacts
 are deliberately neither ignored nor tracked: a new crash appears in
 `git status` for inspection and triage.
+
+Coverage builds select one implementation variant with
+`SHELLCLAVE_COVERAGE_VARIANT=tests` (the default) or `production`.
+Use separate, fresh build directories for the two profiles. Test executables
+and inline-helper tests remain instrumented, but only the selected library
+variant emits counters. Allocation/I/O fault seams change compiler block
+identities; merging their counters with production produces duplicated,
+incompatible branch graphs. CI retains the existing coverage gates for the
+test profile and publishes a separate production report from production-linked
+parser, policy, persistence, and end-to-end corpus contracts. Both profiles
+use gcovr 8.6; production reports are not substituted for the gated test report.
 
 ## Dependencies
 

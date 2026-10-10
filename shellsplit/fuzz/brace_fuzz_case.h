@@ -680,7 +680,7 @@ struct shell_substitution_fuzz_case_t {
 };
 
 enum {
-  SHELL_BRACE_FUZZ_SUBSTITUTION_CASE_COUNT = 77,
+  SHELL_BRACE_FUZZ_SUBSTITUTION_CASE_COUNT = 83,
   SHELL_BRACE_FUZZ_COMPOSED_SUBSTITUTION_CASE_COUNT = 48,
 };
 
@@ -919,23 +919,26 @@ shell_brace_fuzz_substitution_case(const uint8_t *data, size_t size) {
             0,
             0,
             3};
-  case 17:
-    return {"cat <<A <<-B\n$(id)\nA\n\t$(pwd)\n\tB\n",
-            3,
-            0,
-            0,
-            2,
-            0,
-            0,
-            1,
-            1,
-            true,
-            false,
-            1,
-            2,
-            0,
-            1,
-            2};
+  case 17: {
+    /* The second heredoc's producer inherits the first heredoc as stdin.
+     * Both documents have a live consumer and both producers map directly. */
+    shell_substitution_fuzz_case_t item = {
+        "cat <<A <<-B\n$(id)\nA\n\t$(pwd)\n\tB\n",
+        3,
+        0,
+        0,
+        2,
+        0,
+        0,
+        2,
+        2,
+        true,
+        false,
+        1};
+    item.heredoc_count = 2;
+    item.heredoc_substitution_count = 2;
+    return item;
+  }
   case 18:
     return {"cat <<EOF\n$(printf one; printf two)\nEOF",
             3,
@@ -1062,7 +1065,7 @@ shell_brace_fuzz_substitution_case(const uint8_t *data, size_t size) {
         "cat <<EOF\n$( { printf payload; } | ./clock < <(printf config) )\nEOF",
         4,
         1,
-        1,
+        0,
         2,
         0,
         0,
@@ -1093,28 +1096,23 @@ shell_brace_fuzz_substitution_case(const uint8_t *data, size_t size) {
             0,
             1};
   case 27:
-    /* Duplicating fd 3 after closing it is an invalid descriptor route. */
-    {
-      shell_substitution_fuzz_case_t item = {
-          "{ cat <&4; } 3<<EOF 3>&- 4<&3\n$(id)\nEOF",
-          2,
-          1,
-          0,
-          1,
-          0,
-          0,
-          0,
-          0,
-          true,
-          false,
-          1,
-          1,
-          0,
-          1,
-          1};
-      item.depgraph_rejected = true;
-      return item;
-    }
+    /* The heredoc body is expanded before fd 4's known setup failure. */
+    return {"{ cat <&4; } 3<<EOF 3>&- 4<&3\n$(id)\nEOF",
+            2,
+            1,
+            0,
+            1,
+            0,
+            0,
+            0,
+            0,
+            true,
+            false,
+            1,
+            1,
+            0,
+            1,
+            1};
   case 28:
     return {"cat <<A <<B <<C <<D <<E <<F <<G <<H\n"
             "one\nA\ntwo\nB\nthree\nC\nfour\nD\nfive\nE\nsix\nF\n"
@@ -1132,7 +1130,7 @@ shell_brace_fuzz_substitution_case(const uint8_t *data, size_t size) {
             1,
             8,
             0,
-            7,
+            6,
             1};
   case 29:
     return {"{ echo $(id); } | cat", 3, 1, 0, 1, 0, 0, 1, 1, true, false, 1};
@@ -1327,10 +1325,10 @@ shell_brace_fuzz_substitution_case(const uint8_t *data, size_t size) {
         3,
         1,
         1,
-        2,
+        3,
         0,
         1,
-        1,
+        2,
         1,
         true,
         true,
@@ -1368,17 +1366,17 @@ shell_brace_fuzz_substitution_case(const uint8_t *data, size_t size) {
     return item;
   }
   case 50: {
-    /* The target group already has fd 0 from its own process input. The outer
-     * output process substitution must not create a collector bypass. */
+    /* The nested producer inherits the outer process input before its output
+     * replaces group fd 0. Retain that route, not a bypass to the group. */
     shell_substitution_fuzz_case_t item = {
         "printf outer > >({ cat; } < <(printf inner))",
         3,
         1,
+        1,
+        2,
         0,
         1,
-        0,
-        0,
-        1,
+        2,
         0,
         false,
         true,
@@ -1402,18 +1400,18 @@ shell_brace_fuzz_substitution_case(const uint8_t *data, size_t size) {
             false,
             1};
   case 52: {
-    /* Only GROUP-edge descendants inherit the outer process input. The inner
-     * producer remains a direct substitution source for `cat`, not a second
-     * group-owned dynamic consumer. */
+    /* The inner producer is not a GROUP descendant, but its inherited stdin
+     * still comes from the already installed outer process input. The outer
+     * producer's group and direct consumers make its mapping ambiguous. */
     shell_substitution_fuzz_case_t item = {
         "{ cat < <(printf inner); } < <(printf outer)",
         3,
         1,
         0,
+        3,
+        0,
+        0,
         2,
-        0,
-        0,
-        1,
         1,
         false,
         false,
@@ -1422,19 +1420,18 @@ shell_brace_fuzz_substitution_case(const uint8_t *data, size_t size) {
     return item;
   }
   case 53:
-    /* The directions disagree, so the process still runs but no bytes have a
-     * shell-defined route from it to cat's redirected descriptor. */
-    return {"cat < >(sh)", 2, 0, 0, 0, 0, 0, 0, 0, false, false, 1};
+    /* A shared pipe with two readers, not a child-to-cat transfer. */
+    return {"cat < >(sh)", 2, 0, 1, 2, 0, 0, 2, 0, false, false, 0};
   case 54:
-    return {"cat > <(printf input)", 2, 0, 0, 0, 0, 0, 0, 0, false, false, 1};
+    return {"cat > <(printf input)", 2, 0, 1, 0, 0, 2, 0, 0, false, false, 1};
   case 55:
     /* Adjacent `><(` is the compact cross-direction spelling, not a
      * read/write redirect and not a producer-to-cat byte route. */
-    return {"cat><(printf input)", 2, 0, 0, 0, 0, 0, 0, 0, false, false, 1};
+    return {"cat><(printf input)", 2, 0, 1, 0, 0, 2, 0, 0, false, false, 1};
   case 56:
-    return {"cat <> <(printf input)", 2, 0, 0, 1, 0, 0, 1, 1, false, false, 1};
+    return {"cat <> <(printf input)", 2, 0, 1, 1, 0, 2, 1, 0, false, false, 0};
   case 57:
-    return {"cat <> >(sh)", 2, 0, 1, 1, 0, 1, 1, 0, false, true, 0};
+    return {"cat <> >(sh)", 2, 0, 1, 2, 0, 1, 2, 0, false, true, 0};
   case 58: {
     /* The `)` in the deferred body belongs to the heredoc, not the process
      * substitution. The resulting stream is dynamic descriptor I/O only. */
@@ -1654,6 +1651,88 @@ shell_brace_fuzz_substitution_case(const uint8_t *data, size_t size) {
     item.expected_shell_features = false;
     return item;
   }
+  case 77:
+    /* External stdout copied before entry is not the new capture. */
+    return {"exec 3>&1; echo \"$(printf value >&3)\"",
+            3,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            false,
+            false,
+            1};
+  case 78:
+    return {"echo \"$(exec 3>&1; printf value >&3)\"",
+            3,
+            0,
+            0,
+            1,
+            0,
+            0,
+            1,
+            1,
+            true,
+            false,
+            1};
+  case 79:
+    /* Prove the initial file setup before checking the conditional restore:
+     * probe writes only to the file, while printf retains both alternatives. */
+    return {"echo \"$(exec 3>&1 >out && probe && exec >&3; printf value)\"",
+            5,
+            0,
+            0,
+            1,
+            0,
+            0,
+            1,
+            1,
+            true,
+            false,
+            1};
+  case 80:
+    /* Nested stdout capture does not remove process stdin membership. */
+    return {"printf source > >(printf '%s' \"$(cat)\")",
+            3,
+            0,
+            1,
+            3,
+            0,
+            1,
+            2,
+            1,
+            true,
+            true,
+            1};
+  case 81:
+    return {"printf source | echo \"$(cat)\"",
+            3,
+            0,
+            0,
+            1,
+            0,
+            0,
+            1,
+            1,
+            true,
+            false,
+            1};
+  case 82:
+    return {"{ echo \"$(time true)\"; } |& cat",
+            3,
+            1,
+            0,
+            1,
+            0,
+            0,
+            1,
+            1,
+            true,
+            false,
+            1};
   default: {
     shell_substitution_fuzz_case_t item = {
         "cat <<A <<B <<C <<D <<E <<F <<G <<H <<I\n"
@@ -1770,7 +1849,13 @@ shell_brace_fuzz_composed_substitution_case(const uint8_t *data, size_t size) {
     command = body;
     for (uint8_t level = 0; level < depth; level++) {
       bool subshell = (shell_brace_fuzz_byte(data, size, 4 + level) & 1) != 0;
-      command = subshell ? "( " + command + " )" : "{ " + command + "; }";
+      bool compact = (shell_brace_fuzz_byte(data, size, 4 + level) & 2) != 0;
+      /* Adjacent subshell openers form Bash's arithmetic command token `((`,
+       * not two nested groups. Preserve that required lexical separator. */
+      compact = compact && command.front() != '(';
+      command = subshell
+                    ? (compact ? "(" + command + ")" : "( " + command + " )")
+                    : "{ " + command + "; }";
     }
     if (append_pipeline) {
       command += " | sort";

@@ -1,6 +1,8 @@
 #ifndef SHELL_TRANSFORM_H
 #define SHELL_TRANSFORM_H
 
+#include "shell_contract.h"
+
 #include "shell_tokenizer_full.h"
 #include <stdbool.h>
 
@@ -9,20 +11,23 @@ extern "C" {
 #endif
 
 /**
- * Converts tokenized shell constructs into transformed strings for downstream
- * use.
+ * Produces diagnostic strings from tokenized shell constructs. Placeholders
+ * describe expansions; they are not executable or semantically equivalent shell
+ * source. Use canonical sequence builders for programmatic command transport.
  */
 
 /**
  * Transformation types
  */
 typedef enum {
-  SHELL_TRANSFORM_NONE,       // No transformation needed
-  SHELL_TRANSFORM_VARIABLE,   // Variable → placeholder
-  SHELL_TRANSFORM_GLOB,       // Glob → explicit pattern
-  SHELL_TRANSFORM_SUBSHELL,   // Subshell → temp file operation
-  SHELL_TRANSFORM_PIPE,       // Pipe → temp file chain
-  SHELL_TRANSFORM_REDIRECTION // Redirection → explicit file
+  SHELL_TRANSFORM_NONE,     // Diagnostic spelling is retained
+  SHELL_TRANSFORM_VARIABLE, // Variable/arithmetic diagnostic placeholder
+  SHELL_TRANSFORM_GLOB,     // Glob diagnostic placeholder
+  SHELL_TRANSFORM_SUBSHELL, // Command/process-substitution placeholder
+  /* Reserved legacy values. Operators are marked with is_shell_construct but
+   * are not rewritten and therefore never receive these transform types. */
+  SHELL_TRANSFORM_PIPE,
+  SHELL_TRANSFORM_REDIRECTION
 } shell_transform_type_t;
 
 /**
@@ -40,13 +45,14 @@ typedef struct {
  * Transformed command
  */
 typedef struct {
-  const char *original_command; // Original command
-  const char *display_text;     // Lossy diagnostic text after token transforms
+  const char *original_command;      // Owned original command text
+  const char *display_text;          // Owned lossy diagnostic text
   shell_transformed_token_t *tokens; // Transformed tokens
   size_t token_count;                // Number of tokens
-  bool has_transformations;          // Has any display normalizations
-  /* Has semantic shell syntax, including executable substitutions embedded
-   * in a word. This need not imply that diagnostic display text changed. */
+  bool has_transformations;          // Has token-level placeholder replacements
+  /* Has semantic shell syntax, including enclosing groups, pipeline prefixes,
+   * and executable substitutions embedded in a word. This need not imply that
+   * diagnostic display text changed. */
   bool has_shell_syntax;
 } shell_transformed_command_t;
 
@@ -68,23 +74,36 @@ typedef struct {
 } shell_transform_limits_t;
 
 /**
- * Transform shell command to semantic equivalent
+ * Transform one nonempty tokenized command into diagnostic text.
  *
- * Converts shell constructs to what they semantically represent
- * On failure, *transformed_cmd is set to NULL when the output pointer is valid.
+ * Caller preconditions: cmd has token_count > 0 and valid tokens, as returned
+ * by shell_tokenize_commands() or an equivalent producer. All token spans refer
+ * to the same contiguous, immutable, NUL-free source; their positions, lengths,
+ * types, and command start_pos/end_pos describe that source consistently. The
+ * command span includes any structural prefix before the first token. Keep the
+ * command, token array, and source alive and unchanged throughout this call.
+ * These relationships are not revalidated here. This diagnostic operation does
+ * not validate complete shell syntax; use shell_transform_command_line() when
+ * that validation is required.
+ *
+ * transformed_cmd is distinct writable pointer storage owning no live result.
+ * The returned command owns its strings and does not borrow the input source.
+ * NULL limits means unbounded output; otherwise limits must remain unchanged.
+ * On failure, *transformed_cmd is set to NULL.
  */
-shell_transform_status_t
-shell_transform_command(const shell_command_t *cmd,
-                        const shell_transform_limits_t *limits,
-                        shell_transformed_command_t **transformed_cmd);
+shell_transform_status_t shell_transform_command(
+    const shell_command_t *cmd, const shell_transform_limits_t *limits,
+    shell_transformed_command_t **transformed_cmd) SHELL_NONNULL(1, 3);
 
 /**
  * Transform exactly `command_length` shell-source bytes.
+ * Complete syntax is required, including expansion and heredoc termination;
+ * unlike lexical diagnostic iteration, unfinished source is not transformed.
  *
  * Shellsplit only transforms modeled simple-command lists, pipelines, and
  * brace/subshell groups. Control compounds (including function declarations,
  * `select`, and `coproc`), shell-semantic array forms, and unmodeled Bash
- * `[[ … ]]`, `(( … ))`, `time`, `$"…"`, and `;&` / `;;&` forms return
+ * `[[ … ]]`, `(( … ))`, `$"…"`, and `;&` / `;;&` forms return
  * SHELL_TRANSFORM_EPARSE.
  *
  * On failure, writable outputs are reset to NULL and zero.
@@ -93,7 +112,7 @@ shell_transform_status_t
 shell_transform_command_line(const char *command_line, size_t command_length,
                              const shell_transform_limits_t *limits,
                              shell_transformed_command_t ***transformed_cmds,
-                             size_t *transformed_count);
+                             size_t *transformed_count) SHELL_NONNULL(1, 4, 5);
 
 /**
  * Free one transformed command.
@@ -111,14 +130,15 @@ void shell_transformed_command_list_free(shell_transformed_command_t **commands,
  * canonical sequence builders instead.
  */
 const char *shell_transformed_command_get_display_text(
-    const shell_transformed_command_t *cmd);
+    const shell_transformed_command_t *cmd) SHELL_NONNULL(1);
 
 /**
- * Return true when the transformed command has any shell-derived
- * normalizations.
+ * Return true when at least one token received a diagnostic placeholder
+ * replacement. Joining tokens or removing physical line continuations alone
+ * does not set this flag; it is not a source/display equality test.
  */
 bool shell_transformed_command_has_transformations(
-    const shell_transformed_command_t *cmd);
+    const shell_transformed_command_t *cmd) SHELL_NONNULL(1);
 
 #ifdef __cplusplus
 }

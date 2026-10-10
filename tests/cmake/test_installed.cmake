@@ -17,6 +17,7 @@ set(expected_headers
   relative_permutation_entropy.h
   sg_anomaly.h
   shell_abstract.h
+  shell_contract.h
   shell_depgraph.h
   shell_interop.h
   shell_netstring.h

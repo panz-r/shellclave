@@ -529,10 +529,10 @@ TEST(public_failure_and_limit_contracts) {
   shell_transformed_command_t **transformed =
       (shell_transformed_command_t **)(uintptr_t)1;
   size_t transformed_count = SIZE_MAX;
-  bool valid = shell_transform_command_line(NULL, 0, NULL, &transformed,
-                                            &transformed_count) ==
-                   SHELL_TRANSFORM_EINPUT &&
-               transformed == NULL && transformed_count == 0;
+  bool valid =
+      shell_transform_command_line("", 0, NULL, &transformed,
+                                   &transformed_count) == SHELL_TRANSFORM_OK &&
+      transformed == NULL && transformed_count == 0;
 
   transformed = (shell_transformed_command_t **)(uintptr_t)1;
   transformed_count = SIZE_MAX;
@@ -597,9 +597,7 @@ TEST(source_and_word_boundary_contracts) {
       .commands = (shell_command_info_t *)(uintptr_t)1,
       .command_count = SIZE_MAX,
   };
-  CHECK(shell_process_commands(NULL, 0, NULL, &processed) ==
-        SHELL_PROCESS_EINPUT);
-  CHECK(processed.commands == NULL && processed.command_count == 0);
+
   processed.commands = (shell_command_info_t *)(uintptr_t)1;
   processed.command_count = SIZE_MAX;
   CHECK(shell_process_commands(unsupported_byte, sizeof(unsupported_byte), NULL,
@@ -650,10 +648,7 @@ TEST(source_and_word_boundary_contracts) {
             crlf_continuation, sizeof(crlf_continuation) - 1, decoded,
             sizeof(decoded), &written) == SHELL_PROCESS_OK);
   CHECK(written == measured && memcmp(decoded, expected_word, written) == 0);
-  CHECK(shell_visit_decoded_word(NULL, 0, NULL, NULL, &measured) ==
-        SHELL_PROCESS_EINPUT);
-  CHECK(shell_write_decoded_word("x", 1, NULL, 0, &written) ==
-        SHELL_PROCESS_EINPUT);
+
   return true;
 }
 
@@ -1673,11 +1668,12 @@ TEST(redirect_boundaries_preserve_lexical_tolerance) {
 
 TEST(composite_redirect_word_boundaries) {
   static const char *const supported[] = {
-      "> <(cat)while echo ok",       "> <(cat)if echo ok",
-      "> <(cat)for echo ok",         "> <(cat)time echo ok",
-      "> <(cat)declare echo ok",     "> <(cat)\"while\" echo ok",
-      "> prefix<(cat)while echo ok", "> prefix<(cat)\\\nwhile echo ok",
-      "{ cat; } > <(cat)while",      "{ cat; } > prefix<(cat)while",
+      "> <(cat)while echo ok",        "> <(cat)if echo ok",
+      "> <(cat)for echo ok",          "> <(cat)time echo ok",
+      "> <(cat)declare echo ok",      "> <(cat)\"while\" echo ok",
+      "> prefix<(cat)while echo ok",  "> prefix<(cat)\\\nwhile echo ok",
+      "> <(cat)foo time echo ok",     "{ cat; } > <(cat)while",
+      "{ cat; } > prefix<(cat)while",
   };
   for (size_t i = 0; i < ARRAY_COUNT(supported); i++) {
     shell_processed_commands_t processed = {0};
@@ -1689,7 +1685,6 @@ TEST(composite_redirect_word_boundaries) {
 
   static const char *const unsupported[] = {
       "> <(cat)foo declare -a values",
-      "> <(cat)foo time echo ok",
       "> <(cat)foo [[ x ]]",
       "> <(cat)foo while true; do :; done",
       "{ cat; } > <(cat)foo while true; do :; done",

@@ -5,12 +5,12 @@
  * options (more specific to more general).
  */
 
+#include "metadata.h"
 #include "normalize_internal.h"
+#include "pattern_internal.h"
 #include "shelltype.h"
 #include "trie_internal.h"
 
-#include <ctype.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -19,9 +19,7 @@
 _Static_assert(ST_TYPE_COUNT <= 64,
                "token variant collection requires a 64-bit type mask");
 
-static size_t token_text_length(const st_token_t *token) {
-  if (!token || !token->text)
-    return 0;
+static SHELL_NONNULL(1) size_t token_text_length(const st_token_t *token) {
   return (token->text_length || token->text[0] == '\0') ? token->text_length
                                                         : strlen(token->text);
 }
@@ -29,25 +27,40 @@ static size_t token_text_length(const st_token_t *token) {
 size_t st_token_variants_at(const st_token_array_t *pattern, size_t edit_pos,
                             st_token_variant_t *out_variants,
                             size_t max_variants) {
-  if (!pattern || !pattern->tokens || !out_variants || max_variants == 0 ||
-      edit_pos >= pattern->count)
+  if ((max_variants == 0) || (edit_pos >= pattern->count))
+    return 0;
+  if (!st_pattern_token_type_allowed(pattern->tokens, 0,
+                                     pattern->tokens[0].type))
     return 0;
 
   const st_token_t *token = &pattern->tokens[edit_pos];
-  st_token_type_t start_type = token->type;
-  if (start_type < ST_TYPE_LITERAL || start_type >= ST_TYPE_COUNT ||
-      !token->text)
+  st_token_type_t start_type = st_token_edit_type(token);
+  if (!st_pattern_token_type_allowed(token, edit_pos, start_type))
     return 0;
-  if (start_type == ST_TYPE_LITERAL &&
-      memchr(token->text, '\0', token_text_length(token)) == NULL)
-    start_type = st_token_classify_bytes(token->text, token_text_length(token));
+  if (!token->compound && start_type == ST_TYPE_LITERAL) {
+    uint64_t types = st_pattern_literal_types(pattern->tokens, edit_pos);
+    /* LITERAL is the lattice's bottom, not a runtime subtype of every type.
+     * An unclassified value has no narrower wildcard than ANY. */
+    if (types & (UINT64_C(1) << ST_TYPE_LITERAL)) {
+      start_type = types == (UINT64_C(1) << ST_TYPE_LITERAL) ? ST_TYPE_LITERAL
+                                                             : ST_TYPE_ANY;
+    } else {
+      for (st_token_type_t type = ST_TYPE_LITERAL + 1; type < ST_TYPE_COUNT;
+           type++)
+        if (types & (UINT64_C(1) << type))
+          start_type = st_type_join[start_type][type];
+    }
+  }
 
   size_t out = 0;
-  out_variants[out++] = (st_token_variant_t){
-      .type = ST_TYPE_LITERAL,
-      .type_symbol = st_type_symbol[ST_TYPE_LITERAL],
-  };
-  if (out < max_variants && start_type != ST_TYPE_LITERAL)
+  if (!token->compound)
+    out_variants[out++] = (st_token_variant_t){
+        .type = ST_TYPE_LITERAL,
+        .type_symbol = st_type_symbol[ST_TYPE_LITERAL],
+    };
+  bool allow_any = st_pattern_token_type_allowed(token, edit_pos, ST_TYPE_ANY);
+  if (out < max_variants && start_type != ST_TYPE_LITERAL &&
+      (start_type != ST_TYPE_ANY || allow_any))
     out_variants[out++] = (st_token_variant_t){
         .type = start_type,
         .type_symbol = st_type_symbol[start_type],
@@ -57,7 +70,8 @@ size_t st_token_variants_at(const st_token_array_t *pattern, size_t edit_pos,
   if (start_type != ST_TYPE_LITERAL)
     seen[start_type] = true;
   st_token_type_t current = start_type;
-  while (current != ST_TYPE_ANY && out < max_variants) {
+  while (current != ST_TYPE_LITERAL && current != ST_TYPE_ANY &&
+         out < max_variants) {
     st_token_type_t next_wide = ST_TYPE_ANY;
     for (st_token_type_t type = ST_TYPE_LITERAL + 1; type < ST_TYPE_COUNT;
          type++) {
@@ -77,7 +91,7 @@ size_t st_token_variants_at(const st_token_array_t *pattern, size_t edit_pos,
     };
     current = next_wide;
   }
-  if (out < max_variants && !seen[ST_TYPE_ANY])
+  if (allow_any && out < max_variants && !seen[ST_TYPE_ANY])
     out_variants[out++] = (st_token_variant_t){
         .type = ST_TYPE_ANY,
         .type_symbol = st_type_symbol[ST_TYPE_ANY],
@@ -85,55 +99,88 @@ size_t st_token_variants_at(const st_token_array_t *pattern, size_t edit_pos,
   return out;
 }
 
-/* Collect observed types at target position in trie. */
-static void collect_variants_at(const st_node_t *node,
-                                const st_token_t *pattern_tokens,
-                                size_t pattern_count, size_t target_pos,
-                                size_t depth, uint64_t *observed_types) {
-  if (!node || depth >= pattern_count)
-    return;
+typedef struct {
+  uint64_t literal_types;
+  const st_metadata_entry_t *metadata;
+} variant_prefix_t;
 
-  /* The prefix selects one trie node. At the edited position, every child is
-   * an observed alternative; choosing the child matching the current token
-   * would hide precisely the sibling variants this API is meant to expose. */
+/* Prefix analysis is done once per query, not repeated for every trie branch.
+ * Compound affixes need concrete bytes; type-only buckets cannot prove them.
+ * A literal projects onto exactly its possible argv-context classifier buckets
+ * as well as its exact literal branch. Parameters which discriminate values
+ * require retained common metadata proving the entire bucket satisfies them;
+ * type-wide parameters need only the runtime type acceptance below. */
+static SHELL_NONNULL(1, 2, 3) bool variant_prefix_matches(
+    const st_node_t *child, const st_token_t *token,
+    const variant_prefix_t *prefix) {
+  if (token->compound) {
+    if (child->type != ST_TYPE_LITERAL)
+      return false;
+    const char *capture;
+    size_t length;
+    if (!st_pattern_capture_span(child->token, child->token_length,
+                                 token->prefix, token->prefix_length,
+                                 token->suffix, token->suffix_length, &capture,
+                                 &length))
+      return false;
+    return st_pattern_wildcard_matches(
+        capture, length, st_token_classify_bytes(capture, length),
+        token->capture, token->capture_length, token->capture_type);
+  }
+  if (token->type == ST_TYPE_LITERAL) {
+    if (child->type != ST_TYPE_LITERAL)
+      return (prefix->literal_types & (UINT64_C(1) << child->type)) != 0;
+    size_t length = token_text_length(token);
+    return child->token_length == length &&
+           memcmp(child->token, token->text, length) == 0;
+  }
+  if (!st_runtime_type_matches(child->type, token->type))
+    return false;
+  return !prefix->metadata || !st_metadata_requires_value(prefix->metadata) ||
+         (child->metadata_observations != 0 && !child->metadata_mixed &&
+          child->common_metadata == prefix->metadata->id);
+}
+
+/* Collect observed types at the target position in the selected trie branches.
+ * Every visited node is reached once; no encoding, allocation or sample copy.
+ */
+static SHELL_NONNULL(1, 2, 3, 6) void collect_variants_at(
+    const st_node_t *node, const st_token_t *pattern_tokens,
+    const variant_prefix_t *prefixes, size_t target_pos, size_t depth,
+    uint64_t *observed_types) {
+  /* Prefixes select applicable trie branches. At the edited position, every
+   * child is an observed alternative; choosing the child matching the current
+   * token would hide the sibling variants this API is meant to expose. */
   if (depth == target_pos) {
     for (size_t i = 0; i < node->num_children; i++) {
-      uint64_t observed = node->children[i]->observed_types;
-      for (int t = 1; t < ST_TYPE_COUNT; t++) {
-        if (!(observed & (1ULL << t)) || t == ST_TYPE_ANY)
-          continue;
-        *observed_types |= 1ULL << t;
-      }
-    }
-    return;
-  }
-
-  const char *current_token = pattern_tokens[depth].text;
-  size_t current_token_length = token_text_length(&pattern_tokens[depth]);
-  st_token_type_t current_type = pattern_tokens[depth].type;
-
-  if (current_type == ST_TYPE_LITERAL) {
-    for (size_t i = 0; i < node->num_children; i++) {
       const st_node_t *child = node->children[i];
-      if (child->type == ST_TYPE_LITERAL &&
-          child->token_length == current_token_length &&
-          memcmp(child->token, current_token, current_token_length) == 0) {
-        collect_variants_at(child, pattern_tokens, pattern_count, target_pos,
-                            depth + 1, observed_types);
-        return;
+      const st_token_t *token = &pattern_tokens[depth];
+      if (token->compound) {
+        /* At the edited position, the old capture type is not a filter: the
+         * caller is asking for observed alternatives. Whole-word type bits
+         * are not capture observations, so ignore type-only children. */
+        if (child->type != ST_TYPE_LITERAL)
+          continue;
+        const char *capture;
+        size_t length;
+        if (st_pattern_capture_span(child->token, child->token_length,
+                                    token->prefix, token->prefix_length,
+                                    token->suffix, token->suffix_length,
+                                    &capture, &length))
+          *observed_types |= UINT64_C(1)
+                             << st_token_classify_bytes(capture, length);
+      } else {
+        *observed_types |=
+            child->observed_types & ~(UINT64_C(1) << ST_TYPE_ANY);
       }
     }
     return;
   }
 
-  /* A generalized prefix may cover several typed trie branches. Traverse all
-   * lattice-compatible children so downstream variants are independent of
-   * insertion order. */
   for (size_t i = 0; i < node->num_children; i++) {
     const st_node_t *child = node->children[i];
-    if (child->type != ST_TYPE_LITERAL &&
-        st_is_compatible(child->type, current_type))
-      collect_variants_at(child, pattern_tokens, pattern_count, target_pos,
+    if (variant_prefix_matches(child, &pattern_tokens[depth], &prefixes[depth]))
+      collect_variants_at(child, pattern_tokens, prefixes, target_pos,
                           depth + 1, observed_types);
   }
 }
@@ -165,37 +212,43 @@ static st_token_type_t most_specific_remaining(uint64_t remaining) {
   return ST_TYPE_COUNT;
 }
 
-static bool pattern_tokens_are_representable(const st_token_array_t *pattern) {
-  st_netpattern_t encoded = {0};
-  st_error_t error =
-      st_netpattern_encode_owned(pattern->tokens, pattern->count, &encoded);
-  st_netpattern_free(&encoded);
-  return error == ST_OK;
-}
-
 /* Suggest type variants for editing a pattern token. */
 size_t st_learner_suggest_token_variants(const st_learner_t *learner,
                                          const st_token_array_t *pattern,
                                          size_t edit_pos,
                                          st_token_variant_t *out_variants) {
-  if (out_variants)
-    memset(out_variants, 0, ST_MAX_TOKEN_VARIANTS * sizeof(*out_variants));
-  if (!learner || !pattern || !pattern->tokens || !out_variants ||
-      pattern->count == 0 || pattern->count > ST_MAX_CMD_TOKENS ||
-      edit_pos >= pattern->count)
+  memset(out_variants, 0, ST_MAX_TOKEN_VARIANTS * sizeof(*out_variants));
+  if (edit_pos >= pattern->count)
     return 0;
-  if (!pattern_tokens_are_representable(pattern))
+  if (!st_pattern_token_type_allowed(pattern->tokens, 0,
+                                     pattern->tokens[0].type))
     return 0;
-
+  st_token_type_t current_type = st_token_edit_type(&pattern->tokens[edit_pos]);
+  if (!st_pattern_token_type_allowed(&pattern->tokens[edit_pos], edit_pos,
+                                     current_type))
+    return 0;
   uint64_t observed_types = 0;
 
+  variant_prefix_t prefixes[ST_MAX_CMD_TOKENS];
+  for (size_t pos = 0; pos < edit_pos; pos++) {
+    const st_token_t *token = &pattern->tokens[pos];
+    prefixes[pos] = (variant_prefix_t){0};
+    if (!token->compound) {
+      if (token->type == ST_TYPE_LITERAL)
+        prefixes[pos].literal_types =
+            st_pattern_literal_types(pattern->tokens, pos);
+      else
+        prefixes[pos].metadata = st_wildcard_metadata_span(
+            token->text, token_text_length(token), token->type);
+    }
+  }
+
   /* Walk trie to collect observed types */
-  collect_variants_at(learner->trie.root, pattern->tokens, pattern->count,
-                      edit_pos, 0, &observed_types);
+  collect_variants_at(learner->trie.root, pattern->tokens, prefixes, edit_pos,
+                      0, &observed_types);
 
   /* If no observed types, use current type */
   if (observed_types == 0) {
-    st_token_type_t current_type = pattern->tokens[edit_pos].type;
     if (current_type != ST_TYPE_LITERAL && current_type != ST_TYPE_ANY) {
       observed_types |= 1ULL << current_type;
     } else {
@@ -207,7 +260,6 @@ size_t st_learner_suggest_token_variants(const st_learner_t *learner,
 
   /* Build variant list */
   size_t out_count = 0;
-  st_token_type_t current_type = pattern->tokens[edit_pos].type;
 
   /* Add current type first */
   if (current_type != ST_TYPE_ANY && current_type < ST_TYPE_COUNT &&
@@ -269,7 +321,9 @@ size_t st_learner_suggest_token_variants(const st_learner_t *learner,
   /* Reserve the final slot for exactly one wildcard, the most general type.
    * A leading wildcard is not valid policy grammar, so never suggest it for
    * the command position. */
-  if (edit_pos != 0 && out_count < ST_MAX_TOKEN_VARIANTS) {
+  if (st_pattern_token_type_allowed(&pattern->tokens[edit_pos], edit_pos,
+                                    ST_TYPE_ANY) &&
+      out_count < ST_MAX_TOKEN_VARIANTS) {
     out_variants[out_count].type = ST_TYPE_ANY;
     out_variants[out_count].type_symbol = "*";
     out_variants[out_count].sample_value = NULL;
@@ -285,15 +339,22 @@ st_error_t st_netpattern_apply_type_at_owned(st_netpattern_view_t netpattern,
                                              size_t edit_pos,
                                              st_token_type_t new_type,
                                              st_netpattern_t *out_netpattern) {
-  if (!netpattern.data || netpattern.length == 0 || !out_netpattern ||
-      out_netpattern->data || out_netpattern->length != 0 ||
-      new_type <= ST_TYPE_LITERAL || new_type >= ST_TYPE_COUNT)
+  if ((!netpattern.data) || (netpattern.length == 0) ||
+      (new_type <= ST_TYPE_LITERAL) || (new_type >= ST_TYPE_COUNT))
     return ST_ERR_INVALID;
   st_token_array_t decoded = {0};
   st_error_t error = st_netpattern_decode_view(netpattern, &decoded);
   if (error != ST_OK)
     return error;
   if (edit_pos >= decoded.count) {
+    st_token_array_free(&decoded);
+    return ST_ERR_INVALID;
+  }
+  /* Validate the resulting head, not just the edited position. An argument
+   * edit cannot repair a compound/ANY head; replacing a whole-token ANY head
+   * with a supported type can. Reuse decoded grammar without re-encoding it. */
+  st_token_type_t head_type = edit_pos == 0 ? new_type : decoded.tokens[0].type;
+  if (!st_pattern_token_type_allowed(&decoded.tokens[0], 0, head_type)) {
     st_token_array_free(&decoded);
     return ST_ERR_INVALID;
   }
@@ -328,10 +389,8 @@ st_error_t st_netpattern_apply_type_at_owned(st_netpattern_view_t netpattern,
 st_error_t st_netpattern_apply_type_at(const char *netpattern, size_t edit_pos,
                                        st_token_type_t new_type,
                                        char **out_netpattern) {
-  if (out_netpattern)
-    *out_netpattern = NULL;
-  if (!netpattern || !out_netpattern)
-    return ST_ERR_INVALID;
+  *out_netpattern = NULL;
+
   st_netpattern_t owned = {0};
   st_error_t error = st_netpattern_apply_type_at_owned(
       (st_netpattern_view_t){.data = netpattern, .length = strlen(netpattern)},

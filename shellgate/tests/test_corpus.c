@@ -33,7 +33,7 @@ static const struct {
   size_t dynamic_substitution_io;
   uint64_t outcome_fingerprint;
 } corpus_baseline = {246u, 120u, 21u, 105u,
-                     141u, 2u,   17u, UINT64_C(0xfc034c8d13cbde41)};
+                     168u, 2u,   17u, UINT64_C(0xb9a0e1447cf39576)};
 
 #define CHECK(condition)                                                       \
   do {                                                                         \
@@ -263,6 +263,17 @@ TEST(policy_and_canonical_results) {
   CHECK(allow && deny && unknown && process_substitution);
   CHECK(evaluate(gate, allow, &result) == SG_OK &&
         result.verdict == SG_VERDICT_ALLOW);
+  /* Conditional cd must retain its own status endpoint rather than lend the
+   * following command an unrelated predecessor's status. This adds stages,
+   * not changed policy verdicts or changed bytes in the remaining argv. */
+  CHECK(result.subcommand_count == 2);
+  shell_netstring_iter_t cd_iter;
+  shell_netstring_view_t cd_word;
+  CHECK(shell_netstring_iter_init(&cd_iter, result.subcommands[0].netargv,
+                                  result.subcommands[0].netargv_length) ==
+        SHELL_NETSTRING_OK);
+  CHECK(shell_netstring_iter_next(&cd_iter, &cd_word) == SHELL_NETSTRING_OK);
+  CHECK(cd_word.payload_length == 2 && memcmp(cd_word.payload, "cd", 2) == 0);
   CHECK(evaluate(gate, deny, &result) == SG_OK &&
         result.verdict == SG_VERDICT_DENY);
   CHECK(evaluate(gate, unknown, &result) == SG_OK &&

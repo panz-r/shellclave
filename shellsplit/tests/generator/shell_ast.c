@@ -64,6 +64,19 @@ ast_node_t *shell_ast_add_pipeline(shell_ast_t *ast, ast_node_t *cmd1,
   return node;
 }
 
+ast_node_t *shell_ast_add_time(shell_ast_t *ast, ast_node_t *pipeline,
+                               const char *prefix) {
+  if (!ast || !pipeline || !prefix)
+    return NULL;
+  ast_node_t *node = ast_node_create(AST_TIME);
+  if (node) {
+    node->child = pipeline;
+    node->value = strdup(prefix);
+    ast->node_count++;
+  }
+  return node;
+}
+
 ast_node_t *shell_ast_add_sequence(shell_ast_t *ast, ast_node_t *cmd1,
                                    ast_node_t *cmd2, const char *separator) {
   if (!ast || !cmd1 || !cmd2)
@@ -273,6 +286,14 @@ static size_t serialize_node(const ast_node_t *node, char *buffer,
     if (node->next) {
       pos = serialize_node(node->next, buffer, buffer_size, pos);
     }
+    break;
+
+  case AST_TIME:
+    pos = append_str(buffer, buffer_size, pos,
+                     node->value ? node->value : "time");
+    pos = append_str(buffer, buffer_size, pos, " ");
+    if (node->child)
+      pos = serialize_node(node->child, buffer, buffer_size, pos);
     break;
 
   case AST_SEQUENCE:

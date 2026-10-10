@@ -78,8 +78,7 @@ static void test_failures_clear_state(void) {
   CHECK(!shell_interop_subcommand_range(handle, 1, &range) && range.len == 0);
   CHECK(!shell_interop_subcommand_view(handle, 1, &view, &view_length) &&
         view == NULL && view_length == 0);
-  CHECK(parse(handle, "pwd", 3, NULL) == SHELL_EINPUT);
-  CHECK(parse(handle, NULL, 0, &count) == SHELL_EINPUT && count == 0);
+  CHECK(parse(handle, "", 0, &count) == SHELL_EINPUT && count == 0);
   CHECK(shell_interop_subcommand_count(handle) == 0);
   CHECK(parse(handle, embedded_nul, sizeof(embedded_nul), &count) ==
         SHELL_EINPUT);
@@ -90,16 +89,11 @@ static void test_failures_clear_state(void) {
   CHECK(parse(handle, too_long, sizeof(too_long), &count) == SHELL_ETRUNC);
   range = (shell_range_t){.len = 1};
   CHECK(!shell_interop_subcommand_range(handle, 0, &range) && range.len == 0);
-  CHECK(!shell_interop_subcommand_range(NULL, 0, &range) && range.len == 0);
-  CHECK(!shell_interop_subcommand_range(handle, 0, NULL));
-  CHECK(!shell_interop_subcommand_view(handle, 0, NULL, &count));
+
   view = (const char *)(void *)1;
   view_length = SIZE_MAX;
-  CHECK(!shell_interop_subcommand_view(handle, 0, &view, NULL) && view == NULL);
-  CHECK(!shell_interop_subcommand_view(NULL, 0, &view, &view_length) &&
-        view == NULL && view_length == 0);
+
   CHECK(shell_interop_subcommand_dup(handle, 0) == NULL);
-  CHECK(parse(NULL, "ls", 2, &count) == SHELL_EINPUT && count == 0);
   shell_interop_free(handle);
 }
 
@@ -122,14 +116,11 @@ static void test_formatters(void) {
   CHECK(shell_interop_format_features(SHELL_FEAT_VARS | SHELL_FEAT_GLOBS,
                                       buffer, 5, &written) == SHELL_ETRUNC &&
         buffer[0] == '\0' && written == 0);
-  CHECK(shell_interop_format_features(SHELL_FEAT_VARS, NULL, sizeof(buffer),
-                                      &written) == SHELL_EINPUT &&
-        written == 0);
+
   CHECK(shell_interop_format_features(SHELL_FEAT_VARS, buffer, 0, &written) ==
             SHELL_EINPUT &&
         written == 0);
-  CHECK(shell_interop_format_features(SHELL_FEAT_VARS, buffer, sizeof(buffer),
-                                      NULL) == SHELL_EINPUT);
+
   CHECK(strcmp(shell_interop_command_type_name(SHELL_TYPE_PIPELINE), "PIPE") ==
         0);
   CHECK(strcmp(shell_interop_command_type_name(SHELL_TYPE_SIMPLE), "SIMPLE") ==

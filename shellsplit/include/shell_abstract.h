@@ -1,6 +1,8 @@
 #ifndef SHELL_ABSTRACT_H
 #define SHELL_ABSTRACT_H
 
+#include "shell_contract.h"
+
 #include "shell_processor.h"
 #include "shell_tokenizer_full.h"
 #include <stdbool.h>
@@ -90,7 +92,10 @@ typedef struct {
     } glob;
 
     struct {
-      char *content; // Command substitution content
+      /* Owned, non-NULL string for CS, AR and STR elements, including an
+       * empty string for an empty payload. Excludes the source delimiters;
+       * physical continuations within the payload are preserved. */
+      char *content;
     } cmd_subst;
   } data;
 
@@ -108,7 +113,11 @@ typedef struct {
   shell_abstract_element_t **elements; // Array of pointers (owned)
   size_t element_count;
 
-  // Metadata flags
+  /* Semantic feature flags include active expansions inside enclosing glob,
+   * string, parameter and arithmetic elements; display spans never overlap.
+   * Executable substitution bodies are separate inspections, not traversed
+   * for variable/arithmetic flags here. Redirect targets retain their own
+   * classification and are not counted as argument variables/arithmetic. */
   bool has_variables;
   bool has_pos_vars;
   bool has_special_vars;
@@ -131,14 +140,20 @@ typedef struct {
 /**
  * Classify a raw token string (no tokenization needed)
  * Uses tokenizer types for basic classification
+ * Path-shaped words return ARGUMENT for downstream path abstraction. Otherwise
+ * active glob syntax takes precedence over option spelling; quoted and escaped
+ * glob punctuation is literal.
  */
-shell_token_type_t shell_classify_raw_token(const char *text, size_t len);
+shell_token_type_t shell_classify_raw_token(const char *text, size_t len)
+    SHELL_NONNULL(1);
 
 /**
- * Create an abstracted command from original shell text.
+ * Create an abstracted command from one complete supported shell command.
  *
  * Input is a raw shell span: it need not be NUL-terminated, but cannot contain
- * NUL bytes. On success, `out` owns a command released with
+ * NUL bytes. Incomplete or malformed compound syntax is rejected rather than
+ * abstracted through the tokenizer's tolerant diagnostic mode. On success,
+ * `out` owns a command released with
  * shell_abstract_command_free(). On failure, `out` is NULL and the status
  * identifies invalid input, shell syntax, allocation failure, or overflow.
  */
@@ -153,11 +168,12 @@ typedef enum {
 /* Shellsplit abstracts modeled simple-command lists, pipelines, and
  * brace/subshell groups. Control compounds (including function declarations,
  * `select`, and `coproc`), shell-semantic array forms, and unmodeled Bash
- * `[[ … ]]`, `(( … ))`, `time`, `$"…"`, and `;&` / `;;&` forms return
+ * `[[ … ]]`, `(( … ))`, `$"…"`, and `;&` / `;;&` forms return
  * SHELL_ABSTRACT_EPARSE. */
 shell_abstract_status_t
 shell_abstract_command_parse(const char *command, size_t command_length,
-                             shell_abstract_command_t **out);
+                             shell_abstract_command_t **out)
+    SHELL_NONNULL(1, 3);
 
 /**
  * Get the lossy diagnostic abstraction. This is not shell source or
@@ -165,57 +181,70 @@ shell_abstract_command_parse(const char *command, size_t command_length,
  * sequence builders instead.
  */
 const char *
-shell_abstract_command_get_display_text(const shell_abstract_command_t *cmd);
+shell_abstract_command_get_display_text(const shell_abstract_command_t *cmd)
+    SHELL_NONNULL(1);
 
 /**
  * Get all extracted elements for validation
  */
 const shell_abstract_element_t *const *
 shell_abstract_command_get_elements(const shell_abstract_command_t *cmd,
-                                    size_t *count);
+                                    size_t *count) SHELL_NONNULL(1, 2);
 
 /** Get the mutable elements for explicit expansion or editing. */
 shell_abstract_element_t *const *
 shell_abstract_command_get_mutable_elements(shell_abstract_command_t *cmd,
-                                            size_t *count);
+                                            size_t *count) SHELL_NONNULL(1, 2);
 
 /**
  * Get original command
  */
 const char *
-shell_abstract_command_get_source(const shell_abstract_command_t *cmd);
+shell_abstract_command_get_source(const shell_abstract_command_t *cmd)
+    SHELL_NONNULL(1);
 
 /**
  * Check if command has specific feature
  */
-bool shell_abstract_command_has_variables(const shell_abstract_command_t *cmd);
-bool shell_abstract_command_has_pos_vars(const shell_abstract_command_t *cmd);
+bool shell_abstract_command_has_variables(const shell_abstract_command_t *cmd)
+    SHELL_NONNULL(1);
+bool shell_abstract_command_has_pos_vars(const shell_abstract_command_t *cmd)
+    SHELL_NONNULL(1);
 bool shell_abstract_command_has_special_vars(
-    const shell_abstract_command_t *cmd);
-bool shell_abstract_command_has_globs(const shell_abstract_command_t *cmd);
-bool shell_abstract_command_has_paths(const shell_abstract_command_t *cmd);
-bool shell_abstract_command_has_abs_paths(const shell_abstract_command_t *cmd);
-bool shell_abstract_command_has_rel_paths(const shell_abstract_command_t *cmd);
-bool shell_abstract_command_has_home_paths(const shell_abstract_command_t *cmd);
+    const shell_abstract_command_t *cmd) SHELL_NONNULL(1);
+bool shell_abstract_command_has_globs(const shell_abstract_command_t *cmd)
+    SHELL_NONNULL(1);
+bool shell_abstract_command_has_paths(const shell_abstract_command_t *cmd)
+    SHELL_NONNULL(1);
+bool shell_abstract_command_has_abs_paths(const shell_abstract_command_t *cmd)
+    SHELL_NONNULL(1);
+bool shell_abstract_command_has_rel_paths(const shell_abstract_command_t *cmd)
+    SHELL_NONNULL(1);
+bool shell_abstract_command_has_home_paths(const shell_abstract_command_t *cmd)
+    SHELL_NONNULL(1);
 /* True for executable direct and parameter-expansion-nested command/process
  * substitutions, including command substitutions inside double quotes. */
-bool shell_abstract_command_has_cmd_subst(const shell_abstract_command_t *cmd);
-bool shell_abstract_command_has_redirects(const shell_abstract_command_t *cmd);
-bool shell_abstract_command_has_arithmetic(const shell_abstract_command_t *cmd);
-bool shell_abstract_command_has_strings(const shell_abstract_command_t *cmd);
+bool shell_abstract_command_has_cmd_subst(const shell_abstract_command_t *cmd)
+    SHELL_NONNULL(1);
+bool shell_abstract_command_has_redirects(const shell_abstract_command_t *cmd)
+    SHELL_NONNULL(1);
+bool shell_abstract_command_has_arithmetic(const shell_abstract_command_t *cmd)
+    SHELL_NONNULL(1);
+bool shell_abstract_command_has_strings(const shell_abstract_command_t *cmd)
+    SHELL_NONNULL(1);
 
 /**
  * Get element by abstraction string (e.g., "$AP_1")
  */
-shell_abstract_element_t *
-shell_abstract_command_find_element(shell_abstract_command_t *cmd,
-                                    const char *abstraction);
+shell_abstract_element_t *shell_abstract_command_find_element(
+    shell_abstract_command_t *cmd, const char *abstraction) SHELL_NONNULL(1, 2);
 
 /**
  * Get element by index
  */
 shell_abstract_element_t *
-shell_abstract_command_get_element(shell_abstract_command_t *cmd, size_t index);
+shell_abstract_command_get_element(shell_abstract_command_t *cmd, size_t index)
+    SHELL_NONNULL(1);
 
 /* --- PHASE 3: RUNTIME EXPANSION (OPTIONAL) --- */
 
@@ -233,20 +262,23 @@ typedef struct {
  * Returns expanded string (caller must free) or NULL on failure
  */
 char *shell_abstract_element_expand(shell_abstract_element_t *elem,
-                                    const shell_runtime_context_t *ctx);
+                                    const shell_runtime_context_t *ctx)
+    SHELL_NONNULL(1, 2);
 
 /**
  * Expand all elements in an abstracted command
  */
 bool shell_abstract_command_expand(shell_abstract_command_t *cmd,
-                                   const shell_runtime_context_t *ctx);
+                                   const shell_runtime_context_t *ctx)
+    SHELL_NONNULL(1, 2);
 
 /* --- UTILITY FUNCTIONS --- */
 
 /**
  * Get path category from resolved path
  */
-shell_path_category_t shell_path_category_from_path(const char *resolved_path);
+shell_path_category_t shell_path_category_from_path(const char *resolved_path)
+    SHELL_NONNULL(1);
 
 /**
  * Get human-readable name for abstract type

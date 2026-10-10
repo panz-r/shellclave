@@ -1,6 +1,8 @@
 #ifndef SHELL_ENV_SCREENER_H
 #define SHELL_ENV_SCREENER_H
 
+#include "shell_contract.h"
+
 #include <stdbool.h>
 #include <stddef.h>
 
@@ -40,21 +42,21 @@ typedef enum {
  * @param str   Input string
  * @return     Entropy in bits (0-8 per character)
  */
-double shell_env_screener_calculate_entropy(const char *str);
+double shell_env_screener_calculate_entropy(const char *str) SHELL_NONNULL(1);
 
 /**
  * Check if variable name matches known secret patterns
  * @param name  Variable name
  * @return      true when name matches a built-in secret pattern
  */
-bool shell_env_screener_is_secret_pattern(const char *name);
+bool shell_env_screener_is_secret_pattern(const char *name) SHELL_NONNULL(1);
 
 /**
  * Check if variable name is in whitelist (known safe)
  * @param name  Variable name
  * @return      true when name is in the built-in whitelist
  */
-bool shell_env_screener_is_whitelisted(const char *name);
+bool shell_env_screener_is_whitelisted(const char *name) SHELL_NONNULL(1);
 
 /**
  * Screen all environment variables
@@ -75,7 +77,8 @@ bool shell_env_screener_is_whitelisted(const char *name);
  */
 shell_env_screener_status_t
 shell_env_screener_scan(size_t *out_indices, size_t capacity, size_t *out_count,
-                        double posterior_threshold, size_t min_length);
+                        double posterior_threshold, size_t min_length)
+    SHELL_NONNULL(3);
 
 /**
  * Get recommended initial capacity
@@ -95,7 +98,7 @@ const char *shell_env_screener_get_whitelist_doc(void);
  * @param value  The value to score
  * @return      Combined heuristic score
  */
-double shell_env_screener_combined_score(const char *value);
+double shell_env_screener_combined_score(const char *value) SHELL_NONNULL(1);
 
 /**
  * Calculate combined secret score for a name-value pair
@@ -105,21 +108,22 @@ double shell_env_screener_combined_score(const char *value);
  * @return      Combined score in [0, 1]
  */
 double shell_env_screener_combined_score_name(const char *name,
-                                              const char *value);
+                                              const char *value)
+    SHELL_NONNULL(2);
 
 /**
  * Check whether value resembles a file path.
  * @param value  The value to check
  * @return      true if value looks like a path
  */
-bool shell_env_screener_looks_like_path(const char *value);
+bool shell_env_screener_looks_like_path(const char *value) SHELL_NONNULL(1);
 
 /**
  * Check whether value resembles Base64 text.
  * @param value  The value to check
  * @return      true if value appears to be base64 encoded
  */
-bool shell_env_screener_looks_like_base64(const char *value);
+bool shell_env_screener_looks_like_base64(const char *value) SHELL_NONNULL(1);
 
 /**
  * Check if value has a known secret prefix
@@ -129,7 +133,8 @@ bool shell_env_screener_looks_like_base64(const char *value);
  * @return                 true if known prefix detected
  */
 bool shell_env_screener_check_secret_prefix(const char *value,
-                                            double *out_suffix_entropy);
+                                            double *out_suffix_entropy)
+    SHELL_NONNULL(1);
 
 #ifdef __cplusplus
 }

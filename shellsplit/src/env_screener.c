@@ -64,7 +64,7 @@ static const char *secret_patterns[] = {"KEY",      "SECRET",     "TOKEN",
                                         "AUTH",     "PRIVATE",    NULL};
 
 double shell_env_screener_calculate_entropy(const char *str) {
-  if (!str || !str[0])
+  if (!str[0])
     return 0;
 
   size_t freq[256] = {0};
@@ -86,9 +86,6 @@ double shell_env_screener_calculate_entropy(const char *str) {
 }
 
 bool shell_env_screener_is_secret_pattern(const char *name) {
-  if (!name)
-    return false;
-
   for (int i = 0; secret_patterns[i]; i++) {
     if (strstr(name, secret_patterns[i])) {
       return true;
@@ -98,9 +95,6 @@ bool shell_env_screener_is_secret_pattern(const char *name) {
 }
 
 bool shell_env_screener_is_whitelisted(const char *name) {
-  if (!name)
-    return false;
-
   for (int i = 0; whitelisted_vars[i]; i++) {
     if (strcmp(name, whitelisted_vars[i]) == 0) {
       return true;
@@ -118,7 +112,7 @@ bool shell_env_screener_is_whitelisted(const char *name) {
  */
 bool shell_env_screener_check_secret_prefix(const char *value,
                                             double *out_suffix_entropy) {
-  if (!value || !value[0])
+  if (!value[0])
     return false;
 
   size_t value_len = strlen(value);
@@ -145,7 +139,7 @@ bool shell_env_screener_check_secret_prefix(const char *value,
  * @return      true if value looks like a path
  */
 bool shell_env_screener_looks_like_path(const char *value) {
-  if (!value || strlen(value) < 2)
+  if (strlen(value) < 2)
     return false;
 
   /* Starts with / or ~ (absolute or home-relative path) */
@@ -171,7 +165,7 @@ bool shell_env_screener_looks_like_path(const char *value) {
  * @return      true if value appears to be base64 encoded
  */
 bool shell_env_screener_looks_like_base64(const char *value) {
-  if (!value || strlen(value) < 4)
+  if (strlen(value) < 4)
     return false;
 
   size_t len = strlen(value);
@@ -256,8 +250,6 @@ shell_env_screener_scan(size_t *out_indices, size_t capacity, size_t *out_count,
                         double posterior_threshold, size_t min_length) {
   extern char **environ;
 
-  if (!out_count)
-    return SHELL_ENV_SCREENER_ERROR;
   *out_count = 0;
   if (!out_indices || !isfinite(posterior_threshold) ||
       posterior_threshold < 0.0 || posterior_threshold > 1.0)
@@ -406,7 +398,7 @@ static double combine_evidence(double posterior, bool has_prefix,
  */
 double shell_env_screener_combined_score_name(const char *name,
                                               const char *value) {
-  if (!value || strlen(value) < 8)
+  if (strlen(value) < 8)
     return 0.0;
 
   /* Get entropy evidence - use suffix entropy if has prefix */

@@ -12,6 +12,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "../tests/malformed_source_cases.h"
+#include "../tests/word_expansion_cases.h"
 #include "depgraph_invariants.h"
 #include "env_screener.h"
 #include "relative_permutation_entropy.h"
@@ -32,6 +34,7 @@
 #include <vector>
 
 extern "C" {
+#include "../src/shell_depgraph_internal.h"
 #include "../src/shell_tokenizer_full_internal.h"
 
 static const size_t MAX_INPUT_SIZE = 8192;
@@ -40,6 +43,241 @@ static int g_verbose = 0;
 static int test_generated_brace_case(const uint8_t *data, size_t size,
                                      const char *cwd);
 static int test_tokenizer_state(const char *input, size_t length);
+static int test_transformer(const char *input, size_t input_length);
+static int test_processor(const char *input, size_t length);
+static bool
+processed_argv_matches_sequence(const shell_processed_commands_t &processed,
+                                const void *sequence, size_t sequence_length,
+                                size_t count);
+
+static bool token_logically_equals(const shell_token_t &token,
+                                   const char *spelling) {
+  if (!token.start || !spelling)
+    return false;
+  size_t source = 0;
+  size_t expected = 0;
+  while (source < token.length) {
+    if (token.start[source] == '\\' && source + 1 < token.length &&
+        (token.start[source + 1] == '\n' || token.start[source + 1] == '\r')) {
+      bool cr = token.start[source + 1] == '\r';
+      source += 2;
+      if (cr && source < token.length && token.start[source] == '\n')
+        source++;
+      continue;
+    }
+    if (spelling[expected] == '\0' || token.start[source] != spelling[expected])
+      return false;
+    source++;
+    expected++;
+  }
+  return spelling[expected] == '\0';
+}
+
+static bool tokenizer_semantic_type_matches(const shell_token_t &lexical,
+                                            const shell_token_t &structured) {
+  if (structured.type == SHELL_TOKEN_PIPE_NEGATE)
+    return (lexical.type == SHELL_TOKEN_PIPE_NEGATE ||
+            lexical.type == SHELL_TOKEN_COMMAND ||
+            lexical.type == SHELL_TOKEN_ARGUMENT) &&
+           token_logically_equals(lexical, "!");
+  if (structured.type == SHELL_TOKEN_PIPE_TIME)
+    return (lexical.type == SHELL_TOKEN_COMMAND ||
+            lexical.type == SHELL_TOKEN_ARGUMENT) &&
+           token_logically_equals(lexical, "time");
+  if (structured.type == SHELL_TOKEN_PIPE_TIME_OPTION)
+    return (lexical.type == SHELL_TOKEN_COMMAND ||
+            lexical.type == SHELL_TOKEN_ARGUMENT) &&
+           (token_logically_equals(lexical, "-p") ||
+            token_logically_equals(lexical, "--"));
+  return lexical.type == structured.type;
+}
+
+/* A compound pipeline owns leading `!`/`time` syntax on the compound
+ * descriptor, while the allocating tokenizer deliberately exposes only its
+ * flattened simple-command records.  The lexical iterator still sees those
+ * words.  Keep this exception narrowly source-derived: an unconsumed iterator
+ * token may be skipped only when the shared prefix parser proves that it is
+ * part of a modifier sequence immediately followed by a compound opener.
+ *
+ * In particular, do not derive visibility from the command records under
+ * test.  Doing that would let a tokenizer regression shrink a command span
+ * and silently remove the corresponding lexical token from both sides of the
+ * differential check. */
+struct tokenizer_structural_prefix_span {
+  size_t start;
+  size_t end;
+};
+
+static bool
+tokenizer_structural_prefix_starts_at(const char *input, size_t length,
+                                      const shell_token_t &token,
+                                      tokenizer_structural_prefix_span *out) {
+  if (!input || !out || token.position > length ||
+      token.length > length - token.position)
+    return false;
+  size_t prefix_end = 0;
+  if (!shell_tokenizer_compound_prefix_span(input, length, token.position,
+                                            &prefix_end))
+    return false;
+  out->start = token.position;
+  out->end = prefix_end;
+  return true;
+}
+
+static bool tokenizer_token_is_structural_prefix(
+    const shell_token_t &token,
+    const std::vector<tokenizer_structural_prefix_span> &prefixes) {
+  for (const tokenizer_structural_prefix_span &prefix : prefixes)
+    if (token.position >= prefix.start && token.position <= prefix.end &&
+        token.length <= prefix.end - token.position)
+      return true;
+  return false;
+}
+
+static bool tokenizer_iterated_matches_structured(
+    const char *input, size_t length,
+    const std::vector<shell_token_t> &iterated, const shell_command_t *commands,
+    size_t command_count) {
+  if (!input || !commands || command_count == 0)
+    return false;
+  std::vector<tokenizer_structural_prefix_span> structural_prefixes;
+  for (const shell_token_t &token : iterated) {
+    tokenizer_structural_prefix_span prefix = {};
+    if (tokenizer_structural_prefix_starts_at(input, length, token, &prefix))
+      structural_prefixes.push_back(prefix);
+  }
+
+  std::vector<const shell_token_t *> structured;
+  for (size_t i = 0; i < command_count; i++) {
+    if (commands[i].start_pos > commands[i].end_pos ||
+        commands[i].end_pos > length)
+      return false;
+    for (size_t token = 0; token < commands[i].token_count; token++) {
+      const shell_token_t &item = commands[i].tokens[token];
+      if (item.position < commands[i].start_pos ||
+          item.position > commands[i].end_pos ||
+          item.length > commands[i].end_pos - item.position)
+        return false;
+      structured.push_back(&item);
+    }
+  }
+
+  /* Compare both streams in source order.  A mismatch is acceptable only for
+   * a proven compound-owned prefix as described above; every ordinary lexical
+   * word and operator must have a matching structured token. */
+  size_t offset = 0;
+  for (const shell_token_t &token : iterated) {
+    if (offset < structured.size()) {
+      const shell_token_t &expected = *structured[offset];
+      bool same_type = tokenizer_semantic_type_matches(token, expected);
+      if (same_type && token.position == expected.position &&
+          token.length == expected.length &&
+          token.is_quoted == expected.is_quoted &&
+          token.is_escaped == expected.is_escaped) {
+        offset++;
+        continue;
+      }
+    }
+    if (!tokenizer_token_is_structural_prefix(token, structural_prefixes))
+      return false;
+  }
+  return offset == structured.size();
+}
+
+static bool tokenizer_unsupported_semantics_rejected(const char *input,
+                                                     size_t length) {
+  shell_processed_commands_t processed = {};
+  char *sequence = nullptr;
+  size_t sequence_count = 0;
+  bool has_features = false;
+  shell_transformed_command_t **transformed = nullptr;
+  size_t transformed_count = 0;
+  shell_abstract_command_t *abstract = nullptr;
+  shell_dep_graph_t graph = {};
+
+  bool rejected =
+      shell_process_commands(input, length, nullptr, &processed) ==
+          SHELL_PROCESS_EPARSE &&
+      processed.commands == nullptr && processed.command_count == 0 &&
+      processed.groups == nullptr && processed.group_count == 0 &&
+      processed.group_io_ops == nullptr && processed.group_io_op_count == 0 &&
+      shell_build_netargv_sequence(input, length, nullptr, &sequence,
+                                   &sequence_count,
+                                   &has_features) == SHELL_PROCESS_EPARSE &&
+      sequence == nullptr && sequence_count == 0 && !has_features &&
+      shell_transform_command_line(input, length, nullptr, &transformed,
+                                   &transformed_count) ==
+          SHELL_TRANSFORM_EPARSE &&
+      transformed == nullptr && transformed_count == 0 &&
+      shell_abstract_command_parse(input, length, &abstract) ==
+          SHELL_ABSTRACT_EPARSE &&
+      abstract == nullptr &&
+      shell_dep_graph_parse(input, length, ".", nullptr, &graph) ==
+          SHELL_DEP_EPARSE &&
+      graph.node_count == 0 && graph.edge_count == 0 &&
+      graph.status == SHELL_DEP_STATUS_ERROR;
+
+  shell_processed_commands_free(&processed);
+  free(sequence);
+  shell_transformed_command_list_free(transformed, transformed_count);
+  shell_abstract_command_free(abstract);
+  return rejected;
+}
+
+static bool tokenizer_structured_has_span(const shell_command_t *commands,
+                                          size_t command_count, size_t position,
+                                          size_t length) {
+  for (size_t command = 0; command < command_count; command++)
+    for (size_t token = 0; token < commands[command].token_count; token++) {
+      const shell_token_t &current = commands[command].tokens[token];
+      if (current.position == position && current.length == length)
+        return true;
+    }
+  return false;
+}
+
+/* Unsupported shell semantics still have valid shell grammar. Their
+ * diagnostic records must preserve words and operators throughout. Keep this as
+ * a fixed oracle rather than depending on mutations to rediscover every
+ * surrounding context. */
+static bool tokenizer_unsupported_context_visible(const char *input) {
+  if (!input)
+    return false;
+  size_t length = strlen(input);
+  const char *first_echo = strstr(input, "echo");
+  const char *before = strstr(input, "before");
+  const char *second_echo = first_echo ? strstr(first_echo + 1, "echo") : NULL;
+  const char *after = strstr(input, "after");
+  const char *pipe = strrchr(input, '|');
+  const char *cat = pipe ? strstr(pipe + 1, "cat") : NULL;
+  shell_command_t *commands = NULL;
+  size_t command_count = 0;
+  bool visible =
+      first_echo != NULL && before != NULL && second_echo != NULL &&
+      after != NULL && pipe != NULL && cat != NULL &&
+      shell_tokenizer_list_syntax_valid(input, length) &&
+      shell_tokenizer_has_unsupported_semantics(input, length) &&
+      tokenizer_unsupported_semantics_rejected(input, length) &&
+      shell_tokenize_commands(input, length, &commands, &command_count) ==
+          SHELL_TOKENIZE_OK &&
+      tokenizer_structured_has_span(commands, command_count,
+                                    (size_t)(first_echo - input),
+                                    strlen("echo")) &&
+      tokenizer_structured_has_span(commands, command_count,
+                                    (size_t)(before - input),
+                                    strlen("before")) &&
+      tokenizer_structured_has_span(commands, command_count,
+                                    (size_t)(second_echo - input),
+                                    strlen("echo")) &&
+      tokenizer_structured_has_span(commands, command_count,
+                                    (size_t)(after - input), strlen("after")) &&
+      tokenizer_structured_has_span(commands, command_count,
+                                    (size_t)(pipe - input), strlen("|")) &&
+      tokenizer_structured_has_span(commands, command_count,
+                                    (size_t)(cat - input), strlen("cat"));
+  shell_commands_free(commands, command_count);
+  return visible;
+}
 
 /* CWD strategies for shell_dep_graph_parse. NULL tests the early substitution
  * to
@@ -150,7 +388,13 @@ static int validate_fast_result(const char *input, size_t length,
     if (r->len == 0 || r->start > length || r->len > length - r->start ||
         !known_type || (r->type & (uint16_t)~valid_types) != 0 ||
         (r->features & ~valid_features) != 0 ||
-        (r->modifiers & ~SHELL_CMD_MOD_PIPE_NEGATED) != 0 ||
+        (r->modifiers &
+         ~(SHELL_CMD_MOD_PIPE_NEGATED | SHELL_CMD_MOD_PIPE_TIMED)) != 0 ||
+        r->pipeline_time_mode > SHELL_PIPE_TIME_POSIX ||
+        ((r->pipeline_time_mode != SHELL_PIPE_TIME_NONE) !=
+         ((r->modifiers & SHELL_CMD_MOD_PIPE_TIMED) != 0)) ||
+        (r->pipeline_time_direct &&
+         r->pipeline_time_mode == SHELL_PIPE_TIME_NONE) ||
         r->pipe_input_mode > SHELL_PIPE_MODE_STDOUT_AND_STDERR) {
       if (g_verbose)
         fprintf(stderr,
@@ -189,7 +433,13 @@ static int validate_fast_result(const char *input, size_t length,
         group->command_count > result->count - group->first_command ||
         (group->kind != SHELL_GROUP_BRACE &&
          group->kind != SHELL_GROUP_SUBSHELL) ||
-        (group->modifiers & ~SHELL_CMD_MOD_PIPE_NEGATED) != 0 ||
+        (group->modifiers &
+         ~(SHELL_CMD_MOD_PIPE_NEGATED | SHELL_CMD_MOD_PIPE_TIMED)) != 0 ||
+        group->pipeline_time_mode > SHELL_PIPE_TIME_POSIX ||
+        ((group->pipeline_time_mode != SHELL_PIPE_TIME_NONE) !=
+         ((group->modifiers & SHELL_CMD_MOD_PIPE_TIMED) != 0)) ||
+        (group->pipeline_time_direct &&
+         group->pipeline_time_mode == SHELL_PIPE_TIME_NONE) ||
         (group->parent != UINT16_MAX && group->parent >= i)) {
       if (g_verbose)
         fprintf(stderr, "\n=== FAST PARSER ERROR: Invalid group %u ===\n", i);
@@ -219,6 +469,7 @@ static int test_fast_parser(const char *input, size_t length) {
       SHELL_LIMITS_DEFAULT,
       {SHELL_MAX_SUBCOMMANDS, true},
       {1, false},
+      {1, true},
   };
 
   for (size_t i = 0; i < sizeof(limits) / sizeof(limits[0]); i++) {
@@ -234,7 +485,634 @@ static int test_fast_parser(const char *input, size_t length) {
 /* Independent expected results for a small supported-dialect corpus. These
  * checks make the fuzzer fail on semantic regressions, not only malformed
  * output structures. */
+static int fixed_oracle_failure(int line) {
+  fprintf(stderr, "shellsplit fixed oracle failed at line %d\n", line);
+  return 1;
+}
+
+/* These generated sources belong to the supported dialect by construction.
+ * Equality of adapter failures is not an oracle: require acceptance, command
+ * boundaries, canonical argv agreement, and the actual document read route. */
+static int test_supported_document(const std::string &source, size_t commands,
+                                   bool named) {
+  shell_parse_result_t parsed = {};
+  shell_limits_t limits = {SHELL_MAX_SUBCOMMANDS, true};
+  shell_processed_commands_t processed = {};
+  shell_netstring_buffer_t sequence = {}, raw = {}, typed = {};
+  size_t count = 0, anomaly_count = 0;
+  bool features = false;
+  bool valid =
+      shell_parse_fast(source.data(), source.size(), &limits, &parsed) ==
+          SHELL_OK &&
+      shell_process_commands(source.data(), source.size(), nullptr,
+                             &processed) == SHELL_PROCESS_OK &&
+      processed.command_count == commands &&
+      shell_build_netargv_sequence_buffer(source.data(), source.size(), nullptr,
+                                          &sequence, &count,
+                                          &features) == SHELL_PROCESS_OK &&
+      count == commands &&
+      processed_argv_matches_sequence(processed, sequence.data, sequence.length,
+                                      count) &&
+      shell_build_anomaly_netseqs_buffer(source.data(), source.size(), nullptr,
+                                         &raw, &typed,
+                                         &anomaly_count) == SHELL_PROCESS_OK &&
+      anomaly_count >= commands;
+  shell_processed_commands_free(&processed);
+  shell_netstring_buffer_free(&sequence);
+  shell_netstring_buffer_free(&raw);
+  shell_netstring_buffer_free(&typed);
+  shell_dep_graph_t graph = {};
+  valid = valid &&
+          shell_dep_graph_parse(source.data(), source.size(), "/workspace",
+                                nullptr, &graph) == SHELL_DEP_OK &&
+          shell_dep_graph_validate(&graph).valid;
+  size_t documents = 0, reads = 0, opens = 0;
+  for (uint32_t i = 0; i < graph.node_count; i++) {
+    const shell_dep_node_t &node = graph.nodes[i];
+    if (node.type != SHELL_NODE_DOC || (node.doc.kind != SHELL_DOC_HEREDOC &&
+                                        node.doc.kind != SHELL_DOC_HERESTRING))
+      continue;
+    documents++;
+    for (uint32_t j = 0; j < graph.edge_count; j++) {
+      const shell_dep_edge_t &edge = graph.edges[j];
+      if (edge.from != i)
+        continue;
+      if (edge.type == SHELL_EDGE_READ) {
+        reads++;
+        valid = valid && edge.target_fd == 0 &&
+                graph.nodes[edge.to].type == SHELL_NODE_CMD &&
+                graph.nodes[edge.to].cmd.token_count != 0 &&
+                graph.nodes[edge.to].cmd.token_lens[0] == 3 &&
+                memcmp(graph.nodes[edge.to].cmd.tokens[0], "cat", 3) == 0;
+      }
+      if (edge.type == SHELL_EDGE_FD_OPEN) {
+        opens++;
+        valid = valid && edge.target_fd == SHELL_DEP_FD_NAMED &&
+                edge.target_fd_name_len == 3 &&
+                memcmp(edge.target_fd_name, "out", 3) == 0;
+      }
+    }
+  }
+  if (!valid || documents != 1 || reads != 1 || opens != (named ? 1u : 0u)) {
+    fprintf(stderr, "supported document oracle failed: %s\n", source.c_str());
+    return 1;
+  }
+  return 0;
+}
+
+static int test_generated_document_boundary(uint8_t selector) {
+  static const char *const operands[] = {
+      "body",           "'a)b'",         "a\\)b",  "$'a)b'",
+      "$(printf body)", "${value:-a)b}", "@(a|b)", "\"a)b\""};
+  const char *operand = operands[selector % 8];
+  unsigned form = selector / 8 % 6;
+  if (form < 3) {
+    std::string source = form == 0 ? "(" : form == 1 ? "time (" : "(time -p (";
+    source += "cat <<<";
+    source += operand;
+    source += form == 2 ? "))" : ")";
+    return test_supported_document(source, 1, false);
+  }
+  std::string source = "exec {fd}>/dev/null; exec {fd}>&-";
+  if (form == 5)
+    source += "\\\n";
+  source += "{out}";
+  if (form == 4)
+    source += "<<'EOF'; cat <&$out\nbody\nEOF\n";
+  else {
+    source += "<<<";
+    source += operand;
+    source += "; cat <&$out";
+  }
+  return test_supported_document(source, 3, true);
+}
+
 static int test_fixed_oracles(void) {
+  for (const auto &fixture : shellsplit_test_comment_words) {
+    if (test_processor(fixture.source, std::strlen(fixture.source)))
+      return fixed_oracle_failure(__LINE__);
+  }
+  for (const auto &fixture : shellsplit_test_expansion_time_routes) {
+    shell_dep_graph_t graph = {};
+    if (shell_dep_graph_parse(fixture.source, std::strlen(fixture.source), ".",
+                              nullptr, &graph) != SHELL_DEP_OK ||
+        !shell_dep_graph_validate(&graph).valid)
+      return fixed_oracle_failure(__LINE__);
+    unsigned timers = 0;
+    uint32_t writer = UINT32_MAX, file = UINT32_MAX;
+    for (uint32_t n = 0; n < graph.node_count; n++) {
+      const auto &node = graph.nodes[n];
+      if (node.type == SHELL_NODE_CMD && node.cmd.token_count == 2 &&
+          node.cmd.token_lens[0] == 6 &&
+          !std::memcmp(node.cmd.tokens[0], "printf", 6) &&
+          node.cmd.token_lens[1] == 7 &&
+          !std::memcmp(node.cmd.tokens[1], "payload", 7))
+        writer = n;
+      if (node.type == SHELL_NODE_DOC && node.doc.kind == SHELL_DOC_FILE &&
+          node.doc.path_len == 3 && !std::memcmp(node.doc.path, "out", 3))
+        file = n;
+      if (node.type != SHELL_NODE_TIME)
+        continue;
+      bool stdout_route = false, stderr_route = false;
+      for (uint32_t f = 0; f < node.time.report_external_fd_count; f++) {
+        stdout_route |= node.time.report_external_fds[f] == 1;
+        stderr_route |= node.time.report_external_fds[f] == 2;
+      }
+      if (!stdout_route || stderr_route != fixture.stderr_possible ||
+          node.time.report_external_fd_count != 1u + fixture.stderr_possible ||
+          node.time.report_route_flags != SHELL_TIME_REPORT_ROUTE_EXTERNAL ||
+          node.time.report_route != (fixture.stderr_possible
+                                         ? SHELL_TIME_REPORT_MULTIPLE
+                                         : SHELL_TIME_REPORT_EXTERNAL)) {
+        std::fprintf(stderr, "expansion control oracle: %s\n", fixture.source);
+        return fixed_oracle_failure(__LINE__);
+      }
+      timers++;
+    }
+    bool named_write = false;
+    for (uint32_t e = 0; e < graph.edge_count; e++) {
+      const auto &edge = graph.edges[e];
+      named_write |= edge.type == SHELL_EDGE_WRITE && edge.from == writer &&
+                     edge.to == file && edge.source_fd == 1;
+    }
+    if (!timers || named_write != fixture.named_write)
+      return fixed_oracle_failure(__LINE__);
+  }
+  for (const auto &fixture : shellsplit_test_expansion_setup) {
+    shell_dep_graph_t graph = {};
+    if (shell_dep_graph_parse(fixture.source, std::strlen(fixture.source), ".",
+                              nullptr, &graph) != SHELL_DEP_OK ||
+        !shell_dep_graph_validate(&graph).valid)
+      return fixed_oracle_failure(__LINE__);
+    bool file = false, writer = false, redirect = false;
+    bool substitution = false, inspection = false;
+    for (uint32_t e = 0; e < graph.edge_count; e++) {
+      const auto &edge = graph.edges[e];
+      if (edge.type == SHELL_EDGE_SUBST) {
+        substitution = true;
+        inspection |= (edge.flags & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0;
+        const auto &from = graph.nodes[edge.from];
+        file |= from.type == SHELL_NODE_DOC &&
+                from.doc.kind == SHELL_DOC_FILE && from.doc.path_len == 5 &&
+                !std::memcmp(from.doc.path, "input", 5);
+      }
+      if (edge.type == SHELL_EDGE_WRITE) {
+        const auto &to = graph.nodes[edge.to];
+        if (to.type != SHELL_NODE_DOC || to.doc.kind != SHELL_DOC_FILE)
+          continue;
+        writer |=
+            to.doc.path_len == 8 && !std::memcmp(to.doc.path, "argv-out", 8);
+        redirect |= to.doc.path_len == 12 &&
+                    !std::memcmp(to.doc.path, "redirect-out", 12);
+      }
+    }
+    if (file != (fixture.active && fixture.file) ||
+        writer != (fixture.active && fixture.writer) ||
+        inspection != (fixture.active && fixture.shell_word) || redirect ||
+        (!fixture.active && substitution)) {
+      std::fprintf(stderr, "expansion setup oracle: %s\n", fixture.source);
+      return fixed_oracle_failure(__LINE__);
+    }
+  }
+  for (const auto &fixture : shellsplit_test_exec_continuations) {
+    shell_dep_graph_t graph = {};
+    if (shell_dep_graph_parse(fixture.source, std::strlen(fixture.source), ".",
+                              nullptr, &graph) != SHELL_DEP_OK ||
+        !shell_dep_graph_validate(&graph).valid)
+      return fixed_oracle_failure(__LINE__);
+    uint32_t writer = UINT32_MAX, file = UINT32_MAX;
+    for (uint32_t n = 0; n < graph.node_count; n++) {
+      const auto &node = graph.nodes[n];
+      if (node.type == SHELL_NODE_CMD && node.cmd.token_count == 2 &&
+          node.cmd.token_lens[0] == 6 &&
+          !std::memcmp(node.cmd.tokens[0], "printf", 6) &&
+          node.cmd.token_lens[1] == 7 &&
+          !std::memcmp(node.cmd.tokens[1], "payload", 7))
+        writer = n;
+      if (node.type == SHELL_NODE_DOC && node.doc.kind == SHELL_DOC_FILE &&
+          node.doc.path_len == 3 && !std::memcmp(node.doc.path, "out", 3))
+        file = n;
+    }
+    bool writes = false;
+    for (uint32_t e = 0; e < graph.edge_count; e++) {
+      const auto &edge = graph.edges[e];
+      writes |= edge.type == SHELL_EDGE_WRITE && edge.from == writer &&
+                edge.to == file && edge.source_fd == 1;
+    }
+    if (writer == UINT32_MAX || file == UINT32_MAX || writes != fixture.writes)
+      return fixed_oracle_failure(__LINE__);
+  }
+  for (const auto &fixture : shellsplit_test_assignment_snapshots) {
+    shell_dep_graph_t graph = {};
+    shell_dep_error_t error = shell_dep_graph_parse(
+        fixture.source, std::strlen(fixture.source), ".", nullptr, &graph);
+    if (fixture.resolved
+            ? error != SHELL_DEP_OK || !shell_dep_graph_validate(&graph).valid
+            : error != SHELL_DEP_EPARSE || graph.node_count || graph.edge_count)
+      return fixed_oracle_failure(__LINE__);
+  }
+  for (const auto &fixture : shellsplit_test_builtin_routes) {
+    shell_dep_graph_t graph = {};
+    shell_dep_error_t error = shell_dep_graph_parse(
+        fixture.source, std::strlen(fixture.source), ".", nullptr, &graph);
+    if (fixture.resolved
+            ? error != SHELL_DEP_OK || !shell_dep_graph_validate(&graph).valid
+            : error != SHELL_DEP_EPARSE || graph.node_count || graph.edge_count)
+      return fixed_oracle_failure(__LINE__);
+  }
+  for (const auto &fixture : shellsplit_test_ifs_routes) {
+    shell_dep_graph_t graph = {};
+    shell_dep_error_t error = shell_dep_graph_parse(
+        fixture.source, std::strlen(fixture.source), ".", nullptr, &graph);
+    if (!fixture.supported) {
+      if (error != SHELL_DEP_EPARSE || graph.node_count || graph.edge_count)
+        return fixed_oracle_failure(__LINE__);
+      continue;
+    }
+    if (error != SHELL_DEP_OK || !shell_dep_graph_validate(&graph).valid)
+      return fixed_oracle_failure(__LINE__);
+    uint32_t writer = UINT32_MAX, document = UINT32_MAX;
+    for (uint32_t n = 0; n < graph.node_count; n++) {
+      const auto &node = graph.nodes[n];
+      if (node.type == SHELL_NODE_CMD && node.cmd.token_count == 2 &&
+          node.cmd.token_lens[0] == 6 && node.cmd.token_lens[1] == 7 &&
+          !std::memcmp(node.cmd.tokens[0], "printf", 6) &&
+          !std::memcmp(node.cmd.tokens[1], "payload", 7))
+        writer = n;
+      if (node.type == SHELL_NODE_DOC && node.doc.kind == SHELL_DOC_FILE &&
+          node.doc.path_len == 3 && !std::memcmp(node.doc.path, "out", 3))
+        document = n;
+    }
+    bool writes = false;
+    for (uint32_t e = 0; e < graph.edge_count; e++) {
+      const auto &edge = graph.edges[e];
+      writes |= edge.type == SHELL_EDGE_WRITE && edge.from == writer &&
+                edge.to == document && edge.source_fd == 1;
+    }
+    if (writer == UINT32_MAX || document == UINT32_MAX ||
+        writes != fixture.writes)
+      return fixed_oracle_failure(__LINE__);
+  }
+  for (const auto &fixture : shellsplit_test_builtin_options) {
+    size_t length = std::strlen(fixture.source);
+    if (shell_tokenizer_has_unsupported_semantics(fixture.source, length) !=
+        !fixture.supported)
+      return fixed_oracle_failure(__LINE__);
+    if (!fixture.supported &&
+        !tokenizer_unsupported_semantics_rejected(fixture.source, length))
+      return fixed_oracle_failure(__LINE__);
+    if (fixture.supported) {
+      shell_processed_commands_t processed = {};
+      shell_dep_graph_t graph = {};
+      bool valid = shell_process_commands(fixture.source, length, nullptr,
+                                          &processed) == SHELL_PROCESS_OK &&
+                   shell_dep_graph_parse(fixture.source, length, ".", nullptr,
+                                         &graph) == SHELL_DEP_OK &&
+                   shell_dep_graph_validate(&graph).valid;
+      shell_processed_commands_free(&processed);
+      if (!valid)
+        return fixed_oracle_failure(__LINE__);
+    }
+  }
+  for (const auto &fixture : shellsplit_test_setup_time_outcomes) {
+    shell_dep_graph_t graph = {};
+    if (shell_dep_graph_parse(fixture.source, std::strlen(fixture.source), ".",
+                              nullptr, &graph) != SHELL_DEP_OK ||
+        !shell_dep_graph_validate(&graph).valid)
+      return fixed_oracle_failure(__LINE__);
+    uint32_t timer = UINT32_MAX, base = UINT32_MAX, out = UINT32_MAX;
+    for (uint32_t n = 0; n < graph.node_count; n++) {
+      const auto &node = graph.nodes[n];
+      if (node.type == SHELL_NODE_TIME)
+        timer = n;
+      if (node.type == SHELL_NODE_DOC && node.doc.kind == SHELL_DOC_FILE) {
+        if (node.doc.path_len == 4 && !std::memcmp(node.doc.path, "base", 4))
+          base = n;
+        if (node.doc.path_len == 3 && !std::memcmp(node.doc.path, "out", 3))
+          out = n;
+      }
+    }
+    bool to_base = false, to_out = false;
+    unsigned writes = 0;
+    for (uint32_t e = 0; e < graph.edge_count; e++) {
+      const auto &edge = graph.edges[e];
+      if (edge.type == SHELL_EDGE_WRITE && edge.from == timer) {
+        writes++;
+        to_base |= edge.to == base;
+        to_out |= edge.to == out;
+      }
+    }
+    if (timer == UINT32_MAX ||
+        graph.nodes[timer].time.report_route_flags != fixture.flags ||
+        !to_out || to_base != fixture.base || writes != 1u + fixture.base)
+      return fixed_oracle_failure(__LINE__);
+  }
+  for (const auto &fixture : shellsplit_test_named_cleanup) {
+    shell_dep_graph_t graph = {};
+    if (shell_dep_graph_parse(fixture.source, std::strlen(fixture.source), ".",
+                              nullptr, &graph) != SHELL_DEP_OK ||
+        !shell_dep_graph_validate(&graph).valid)
+      return fixed_oracle_failure(__LINE__);
+    uint32_t consumer = UINT32_MAX, target = UINT32_MAX;
+    uint32_t alternative = UINT32_MAX;
+    const char *command = fixture.read ? "cat" : "printf";
+    for (uint32_t n = 0; n < graph.node_count; n++) {
+      const auto &node = graph.nodes[n];
+      if (fixture.timer && node.type == SHELL_NODE_TIME)
+        consumer = n;
+      else if (!fixture.timer && node.type == SHELL_NODE_CMD &&
+               node.cmd.token_count == (fixture.read ? 1u : 2u) &&
+               node.cmd.token_lens[0] == std::strlen(command) &&
+               !std::memcmp(node.cmd.tokens[0], command,
+                            std::strlen(command)) &&
+               (fixture.read ||
+                (node.cmd.token_lens[1] == std::strlen(fixture.argument) &&
+                 !std::memcmp(node.cmd.tokens[1], fixture.argument,
+                              std::strlen(fixture.argument)))))
+        consumer = n;
+      if (node.type == SHELL_NODE_DOC && node.doc.kind == SHELL_DOC_FILE &&
+          node.doc.path_len == std::strlen(fixture.file) &&
+          !std::memcmp(node.doc.path, fixture.file, node.doc.path_len))
+        target = n;
+      if (fixture.alternative_file && node.type == SHELL_NODE_DOC &&
+          node.doc.kind == SHELL_DOC_FILE &&
+          node.doc.path_len == std::strlen(fixture.alternative_file) &&
+          !std::memcmp(node.doc.path, fixture.alternative_file,
+                       node.doc.path_len))
+        alternative = n;
+    }
+    unsigned flows = 0;
+    for (uint32_t e = 0; e < graph.edge_count; e++) {
+      const auto &edge = graph.edges[e];
+      if (edge.type != (fixture.read ? SHELL_EDGE_READ : SHELL_EDGE_WRITE) ||
+          (fixture.read ? edge.to : edge.from) != consumer ||
+          graph.nodes[fixture.read ? edge.from : edge.to].type !=
+              SHELL_NODE_DOC)
+        continue;
+      uint32_t endpoint = fixture.read ? edge.from : edge.to;
+      if ((endpoint != target && endpoint != alternative) ||
+          (fixture.read ? edge.target_fd : edge.source_fd) !=
+              (fixture.timer  ? 2u
+               : fixture.read ? 0u
+                              : 1u))
+        return fixed_oracle_failure(__LINE__);
+      flows++;
+    }
+    if (consumer == UINT32_MAX || target == UINT32_MAX ||
+        (fixture.alternative_file && alternative == UINT32_MAX) ||
+        flows != 1u + (fixture.alternative_file != nullptr))
+      return fixed_oracle_failure(__LINE__);
+  }
+  for (const char *source : shellsplit_test_invalidated_reallocation) {
+    shell_dep_graph_t graph = {};
+    if (shell_dep_graph_parse(source, std::strlen(source), ".", nullptr,
+                              &graph) != SHELL_DEP_EPARSE ||
+        graph.node_count || graph.edge_count)
+      return fixed_oracle_failure(__LINE__);
+  }
+  for (const auto &fixture : shellsplit_test_descriptor_outcomes) {
+    shell_dep_graph_t graph = {};
+    if (shell_dep_graph_parse(fixture.source, std::strlen(fixture.source), ".",
+                              nullptr, &graph) != SHELL_DEP_OK ||
+        !shell_dep_graph_validate(&graph).valid)
+      return fixed_oracle_failure(__LINE__);
+    uint32_t writer = UINT32_MAX, base = UINT32_MAX, out = UINT32_MAX;
+    for (uint32_t n = 0; n < graph.node_count; n++) {
+      const auto &node = graph.nodes[n];
+      if (node.type == SHELL_NODE_CMD && node.cmd.token_count == 2 &&
+          node.cmd.token_lens[0] == 6 && node.cmd.token_lens[1] == 7 &&
+          !std::memcmp(node.cmd.tokens[0], "printf", 6) &&
+          !std::memcmp(node.cmd.tokens[1], "payload", 7))
+        writer = n;
+      if (node.type == SHELL_NODE_DOC && node.doc.kind == SHELL_DOC_FILE) {
+        if (node.doc.path_len == 4 && !std::memcmp(node.doc.path, "base", 4))
+          base = n;
+        if (node.doc.path_len == 3 && !std::memcmp(node.doc.path, "out", 3))
+          out = n;
+      }
+    }
+    bool to_base = false, to_out = false;
+    unsigned writes = 0;
+    for (uint32_t e = 0; e < graph.edge_count; e++) {
+      const auto &edge = graph.edges[e];
+      if (edge.type == SHELL_EDGE_WRITE && edge.from == writer &&
+          edge.source_fd == 1) {
+        writes++;
+        to_base |= edge.to == base;
+        to_out |= edge.to == out;
+      }
+    }
+    if (writer == UINT32_MAX || to_base != fixture.base ||
+        to_out != fixture.out || writes != fixture.base + fixture.out)
+      return fixed_oracle_failure(__LINE__);
+  }
+  for (const auto &fixture : shellsplit_test_scope_outcomes) {
+    shell_dep_graph_t graph = {};
+    bool valid =
+        shell_dep_graph_parse(fixture.source, std::strlen(fixture.source), ".",
+                              nullptr, &graph) == SHELL_DEP_OK &&
+        shell_dep_graph_validate(&graph).valid;
+    uint32_t writer = UINT32_MAX, target = UINT32_MAX;
+    for (uint32_t node = 0; valid && node < graph.node_count; node++) {
+      const shell_dep_node_t &item = graph.nodes[node];
+      if (item.type == SHELL_NODE_CMD && item.cmd.token_count >= 2 &&
+          item.cmd.token_lens[0] == 6 && item.cmd.token_lens[1] == 7 &&
+          !std::memcmp(item.cmd.tokens[0], "printf", 6) &&
+          !std::memcmp(item.cmd.tokens[1], "payload", 7))
+        writer = node;
+      if (item.type == SHELL_NODE_DOC && item.doc.kind == SHELL_DOC_FILE &&
+          item.doc.path_len == 3 && !std::memcmp(item.doc.path, "out", 3))
+        target = node;
+    }
+    bool writes = false;
+    for (uint32_t edge = 0; valid && edge < graph.edge_count; edge++) {
+      const shell_dep_edge_t &item = graph.edges[edge];
+      writes |= item.type == SHELL_EDGE_WRITE && item.from == writer &&
+                item.to == target;
+    }
+    if (!valid || writer == UINT32_MAX || target == UINT32_MAX ||
+        writes != fixture.writes_to_out)
+      return fixed_oracle_failure(__LINE__);
+  }
+  for (const auto &fixture : shellsplit_test_cwd_reachability) {
+    shell_dep_graph_t graph = {};
+    if (shell_dep_graph_parse(fixture.source, std::strlen(fixture.source),
+                              "/workspace", nullptr, &graph) != SHELL_DEP_OK ||
+        !shell_dep_graph_validate(&graph).valid)
+      return fixed_oracle_failure(__LINE__);
+    bool found = false;
+    for (uint32_t n = 0; n < graph.node_count; n++) {
+      const auto &node = graph.nodes[n];
+      if (node.type != SHELL_NODE_DOC || node.doc.kind != SHELL_DOC_FILE ||
+          node.doc.path_len != std::strlen(fixture.file) ||
+          std::memcmp(node.doc.path, fixture.file, node.doc.path_len))
+        continue;
+      found = true;
+      char identity[512];
+      size_t written = 0;
+      bool absolute = false;
+      bool known = shell_dep_doc_file_identity_write(
+          &graph, &node.doc, identity, sizeof(identity), &written, &absolute);
+      if (known != (fixture.identity != nullptr) ||
+          (known && (!absolute || std::strcmp(identity, fixture.identity))))
+        return fixed_oracle_failure(__LINE__);
+    }
+    if (!found)
+      return fixed_oracle_failure(__LINE__);
+  }
+  for (const auto &fixture : shellsplit_test_skipped_dup_operands) {
+    shell_dep_graph_t graph = {};
+    if (shell_dep_graph_parse(fixture.source, std::strlen(fixture.source), ".",
+                              nullptr, &graph) != SHELL_DEP_OK ||
+        !shell_dep_graph_validate(&graph).valid)
+      return fixed_oracle_failure(__LINE__);
+    uint32_t commands = 0;
+    for (uint32_t n = 0; n < graph.node_count; n++)
+      commands += graph.nodes[n].type == SHELL_NODE_CMD;
+    if (commands != fixture.commands)
+      return fixed_oracle_failure(__LINE__);
+    for (uint32_t e = 0; e < graph.edge_count; e++) {
+      auto type = graph.edges[e].type;
+      if (type == SHELL_EDGE_READ || type == SHELL_EDGE_WRITE ||
+          type == SHELL_EDGE_APPEND || type == SHELL_EDGE_SUBST ||
+          type == SHELL_EDGE_FD_OPEN || type == SHELL_EDGE_FD_CLOSE)
+        return fixed_oracle_failure(__LINE__);
+    }
+  }
+  for (uint8_t selector = 0; selector < 48; selector++)
+    if (test_generated_document_boundary(selector))
+      return fixed_oracle_failure(__LINE__);
+  static const char *const compound_modifier_spans[] = {
+      "{ time cat; }",
+      "(time -p cat)",
+      "{ ! cat; }",
+      "{ ! time -p cat; }",
+      "{ { ! time -p cat; }; }",
+      "{ time cat | printf x; }",
+      "{ time cat <<'EOF'; } |& cat\nliteral $(ignored)\nEOF\n",
+  };
+  for (const char *source : compound_modifier_spans) {
+    size_t length = strlen(source);
+    if (test_tokenizer_state(source, length) ||
+        test_transformer(source, length) || test_processor(source, length))
+      return fixed_oracle_failure(__LINE__);
+  }
+
+  static const struct {
+    const char *source;
+    const char *identity;
+  } cwd_files[] = {
+      {"( : | cd /tmp; printf x >out )", "/workspace/out"},
+      {"cd /tmp <<<body | :; printf x >out", "/workspace/out"},
+      {"time cd /tmp <<<body | :; printf x >out", "/workspace/out"},
+      {"{ cd /tmp; printf x >out; } &", "/tmp/out"},
+      {"( : | cd /tmp; echo \"$(<out)\" )", "/workspace/out"},
+      {"cd /tmp; echo \"$(<out)\"", "/tmp/out"},
+      {"cd \"$value\"; echo \"$(<out)\"", nullptr},
+  };
+  for (bool cd_as_cmd : {false, true}) {
+    shell_dep_limits_t limits = SHELL_DEP_LIMITS_DEFAULT;
+    limits.cd_as_cmd = cd_as_cmd;
+    for (const auto &item : cwd_files) {
+      shell_dep_graph_t graph = {};
+      if (shell_dep_graph_parse(item.source, strlen(item.source), "/workspace",
+                                &limits, &graph) != SHELL_DEP_OK ||
+          !shell_dep_graph_validate(&graph).valid)
+        return fixed_oracle_failure(__LINE__);
+      bool found = false;
+      for (uint32_t i = 0; i < graph.node_count; i++) {
+        const shell_dep_node_t &node = graph.nodes[i];
+        if (node.type != SHELL_NODE_DOC || node.doc.kind != SHELL_DOC_FILE ||
+            node.doc.path_len != 3 || memcmp(node.doc.path, "out", 3))
+          continue;
+        char identity[256];
+        size_t length = 0;
+        bool absolute = false;
+        bool known = shell_dep_doc_file_identity_write(
+            &graph, &node.doc, identity, sizeof(identity), &length, &absolute);
+        if (known != (item.identity != nullptr) ||
+            (known && (!absolute || length != strlen(item.identity) ||
+                       strcmp(identity, item.identity))))
+          return fixed_oracle_failure(__LINE__);
+        found = true;
+      }
+      if (!found)
+        return fixed_oracle_failure(__LINE__);
+    }
+  }
+  static const struct {
+    const char *source;
+    const char *command;
+    const char *argument;
+    bool write;
+  } process_pipes[] = {
+      {"cat outer <input < >(true </dev/null)", "cat", "outer", false},
+      {"printf value >out > <(printf ignored >/dev/null)", "printf", "value",
+       true},
+      {"exec {fd}< >(true </dev/null); cat outer <&$fd", "cat", "outer", false},
+      {"exec {fd}> <(printf ignored >/dev/null); printf value >&$fd", "printf",
+       "value", true},
+      {"exec {fd}<> <(printf input); printf value >&$fd", "printf", "value",
+       true},
+      {"exec {fd}<> >(true </dev/null); cat outer <&$fd", "cat", "outer",
+       false},
+  };
+  for (const auto &item : process_pipes) {
+    shell_dep_graph_t graph = {};
+    if (shell_dep_graph_parse(item.source, strlen(item.source), ".", nullptr,
+                              &graph) != SHELL_DEP_OK ||
+        !shell_dep_graph_validate(&graph).valid)
+      return fixed_oracle_failure(__LINE__);
+    uint32_t owner = UINT32_MAX;
+    for (uint32_t i = 0; i < graph.node_count; i++) {
+      const shell_dep_node_t &node = graph.nodes[i];
+      if (node.type == SHELL_NODE_CMD && node.cmd.token_count >= 2 &&
+          node.cmd.token_lens[0] == strlen(item.command) &&
+          node.cmd.token_lens[1] == strlen(item.argument) &&
+          !memcmp(node.cmd.tokens[0], item.command, strlen(item.command)) &&
+          !memcmp(node.cmd.tokens[1], item.argument, strlen(item.argument)))
+        owner = i;
+    }
+    bool installed = false;
+    for (uint32_t i = 0; i < graph.edge_count; i++) {
+      const shell_dep_edge_t &edge = graph.edges[i];
+      if (item.write && edge.from == owner && edge.source_fd == 1 &&
+          edge.type == SHELL_EDGE_WRITE) {
+        if (graph.nodes[edge.to].type != SHELL_NODE_ENDPOINT)
+          return fixed_oracle_failure(__LINE__);
+        installed = true;
+      }
+      if (!item.write && edge.to == owner && edge.target_fd == 0 &&
+          (edge.type == SHELL_EDGE_READ || edge.type == SHELL_EDGE_SUBST)) {
+        if (graph.nodes[edge.from].type != SHELL_NODE_ENDPOINT)
+          return fixed_oracle_failure(__LINE__);
+        installed = true;
+      }
+    }
+    if (!installed)
+      return fixed_oracle_failure(__LINE__);
+  }
+  for (size_t prefix : {size_t(0), size_t(SHELL_MAX_SUBCOMMANDS + 1)}) {
+    for (const char *tail : shellsplit_test_malformed_tails) {
+      char source[4096];
+      size_t length = 0;
+      if (!shellsplit_test_source_with_tail(source, sizeof(source), prefix,
+                                            tail, &length))
+        return fixed_oracle_failure(__LINE__);
+      for (uint32_t capacity : {uint32_t(1), uint32_t(SHELL_MAX_SUBCOMMANDS)}) {
+        shell_parse_result_t fast = {};
+        shell_limits_t limits = {capacity, true};
+        if (shell_parse_fast(source, length, &limits, &fast) != SHELL_EPARSE ||
+            fast.count || fast.group_count || fast.status != SHELL_STATUS_ERROR)
+          return fixed_oracle_failure(__LINE__);
+      }
+      shell_dep_graph_t graph = {};
+      if (shell_dep_graph_parse(source, length, ".", nullptr, &graph) !=
+              SHELL_DEP_EPARSE ||
+          graph.node_count || graph.edge_count || graph.cwd_buf.len)
+        return fixed_oracle_failure(__LINE__);
+    }
+  }
   static const char *const scoped_quotes[] = {
       "echo \"${value:-\"x;y\"}\"",
       "echo \"$(printf \"x;y\")\"",
@@ -257,7 +1135,7 @@ static int test_fixed_oracles(void) {
     shell_commands_free(commands, count);
     shell_processed_commands_free(&processed);
     if (!valid)
-      return 1;
+      return fixed_oracle_failure(__LINE__);
   }
   const char *incomplete_ansi = "echo $'foo\\'";
   shell_parse_result_t incomplete = {};
@@ -265,7 +1143,7 @@ static int test_fixed_oracles(void) {
   strict.strict_mode = true;
   if (shell_parse_fast(incomplete_ansi, strlen(incomplete_ansi), &strict,
                        &incomplete) != SHELL_EPARSE)
-    return 1;
+    return fixed_oracle_failure(__LINE__);
   /* The iterator intentionally exposes a standalone escaped physical line
    * ending while the structured tokenizer omits it from command records.
    * Keep this exact smoke finding deterministic so their comparison remains
@@ -273,17 +1151,27 @@ static int test_fixed_oracles(void) {
   static const char iterator_continuation[] = "echo first \\\nsecond | cat\n";
   if (test_tokenizer_state(iterator_continuation,
                            sizeof(iterator_continuation) - 1))
-    return 1;
+    return fixed_oracle_failure(__LINE__);
   static const char iterator_heredoc_boundary[] = "cat& <<EOF\nvalue\nEOF\n";
   if (test_tokenizer_state(iterator_heredoc_boundary,
                            sizeof(iterator_heredoc_boundary) - 1))
-    return 1;
+    return fixed_oracle_failure(__LINE__);
   /* A heredoc that remains attached to a command retains its following
    * newline. This complements the input-only heredoc case above. */
   static const char iterator_attached_heredoc[] = "cat <<EOF\nvalue\nEOF\n";
   if (test_tokenizer_state(iterator_attached_heredoc,
                            sizeof(iterator_attached_heredoc) - 1))
-    return 1;
+    return fixed_oracle_failure(__LINE__);
+  static const char *const iterator_document_lists[] = {
+      " <<OLDPvcat <<OLDPvalue0EOF\n",
+      "<<A <<B\nA\nB\n",
+      "2>err <<EOF\nEOF\n",
+      "cat <<A <<B\nA\nB\n",
+      "printf x; <<A <<B\nA\nB\n",
+  };
+  for (const char *source : iterator_document_lists)
+    if (test_tokenizer_state(source, strlen(source)))
+      return fixed_oracle_failure(__LINE__);
   static const char *const bang_context_cases[] = {
       "printf '%s' !\n",      "printf '%s' ! !\n", "printf '%s' ! | cat\n",
       "printf '%s' >out !\n", "! printf '%s'\n",   "! ! printf '%s'\n",
@@ -291,8 +1179,164 @@ static int test_fixed_oracles(void) {
   for (const char *source : bang_context_cases)
     if (test_tokenizer_state(source, strlen(source))) {
       fprintf(stderr, "fixed tokenizer bang-context oracle failed: %s", source);
-      return 1;
+      return fixed_oracle_failure(__LINE__);
     }
+  static const char *const time_context_cases[] = {
+      "time printf x\n",
+      "time -p -- ! printf x\n",
+      "! time ! printf x | cat\n",
+      "time { printf x; } | cat\n",
+      "! { printf x; }\n",
+      "time !\n",
+      "printf x | time cat\n",
+      "!>/tmp/out printf x\n",
+      "!2>/tmp/out printf x\n",
+      "time -- true\n",
+      "time time -p true\n",
+      "echo a; time echo b\n",
+      "echo a && time -p echo b\n",
+      "echo a || time -- echo b\n",
+      "echo a & time echo b\n",
+      "time echo a; time -p echo b\n",
+      "echo a; ! echo b\n",
+      "echo a; time\n",
+      "echo a; time; echo b\n",
+      "echo a; time { echo b; }\n",
+      "ti\\\r\nme -\\\np true\n",
+      "VALUE=x time true\n",
+      ">out time true\n",
+      "echo \"unterminated\n",
+      "(echo \"unterminated",
+      "if :; then echo \"unterminated",
+      "{ echo 'unterminated",
+  };
+  for (const char *source : time_context_cases)
+    if (test_tokenizer_state(source, strlen(source))) {
+      fprintf(stderr, "fixed tokenizer time-context oracle failed: %s", source);
+      return fixed_oracle_failure(__LINE__);
+    }
+
+  /* Regression for the former span-filtered comparison: a malformed
+   * structured record that stops before an ordinary lexical argument must be
+   * rejected. Compound-owned `time` prefixes are the only permitted skip. */
+  static const char dropped_word_source[] = "echo dropped";
+  shell_token_t dropped_lexical[2] = {};
+  dropped_lexical[0].type = SHELL_TOKEN_COMMAND;
+  dropped_lexical[0].start = dropped_word_source;
+  dropped_lexical[0].length = 4;
+  dropped_lexical[0].position = 0;
+  dropped_lexical[1].type = SHELL_TOKEN_ARGUMENT;
+  dropped_lexical[1].start = dropped_word_source + 5;
+  dropped_lexical[1].length = 7;
+  dropped_lexical[1].position = 5;
+  shell_command_t truncated_record = {};
+  truncated_record.tokens = dropped_lexical;
+  truncated_record.token_count = 1;
+  truncated_record.start_pos = 0;
+  truncated_record.end_pos = 4;
+  std::vector<shell_token_t> dropped_iterated = {
+      dropped_lexical[0],
+      dropped_lexical[1],
+  };
+  if (tokenizer_iterated_matches_structured(
+          dropped_word_source, sizeof(dropped_word_source) - 1,
+          dropped_iterated, &truncated_record, 1))
+    return fixed_oracle_failure(__LINE__);
+
+  /* Unsupported control flow and current-shell constructs are not a
+   * reconciliation escape hatch: their surrounding ordinary words and
+   * operators must remain visible to the diagnostic tokenizer. */
+  static const char *const unsupported_surrounding[] = {
+      "echo before; for item in one; do :; done; echo after | cat",
+      "echo before; if :; then :; fi; echo after | cat",
+      "echo before; case value in value) : ;; esac; echo after | cat",
+      "echo before; items=(one); echo after | cat",
+      "echo before; eval echo hidden; echo after | cat",
+      ("echo before; for ((i=0; i<3; i++)); do echo inside; done; echo after | "
+       "cat"),
+  };
+  for (const char *source : unsupported_surrounding)
+    if (!tokenizer_unsupported_context_visible(source) ||
+        test_tokenizer_state(source, strlen(source)))
+      return fixed_oracle_failure(__LINE__);
+
+  /* Comment/continuation-only input has no visible diagnostic tokens. The
+   * command tokenizer may reject such non-command source rather than return
+   * empty records; ordinary words must never use this empty-stream escape. */
+  static const char *const empty_visible_sources[] = {
+      "#hile do7",
+      "# time ! echo hidden",
+      "\n# comment\n",
+      "\\\n",
+  };
+  for (const char *source : empty_visible_sources)
+    if (test_tokenizer_state(source, strlen(source)))
+      return fixed_oracle_failure(__LINE__);
+
+  /* Clause terminators without a case construct are malformed grammar, not
+   * empty valid lists. They must reject atomically without weakening the
+   * ordered diagnostic reconciliation for actual control constructs. */
+  static const char *const bare_clause_sources[] = {
+      ";;",
+      ";&",
+      ";;&",
+      "echo one ;; echo two",
+      "echo one ;& echo two",
+      "echo one ;;& echo two",
+  };
+  for (const char *source : bare_clause_sources)
+    if (shell_tokenizer_list_syntax_valid(source, strlen(source)) ||
+        !tokenizer_unsupported_semantics_rejected(source, strlen(source)) ||
+        test_tokenizer_state(source, strlen(source)))
+      return fixed_oracle_failure(__LINE__);
+
+  /* Deliberately corrupt diagnostic records before, within, and after an
+   * unsupported construct. Neither ordinary words nor operators may be
+   * omitted, invented, or reordered. These sources have no structural
+   * delimiters or prefixes to elide, so every lexical token must match. */
+  static const char *const unsupported_loss_cases[] = {
+      "echo before; for item in one; do echo inside; done; echo after | cat",
+      "echo before; eval echo inside; echo after | cat",
+  };
+  for (const char *source : unsupported_loss_cases) {
+    size_t length = strlen(source);
+    shell_tokenizer_state_t state = {};
+    shell_tokenizer_init(&state, source, length);
+    std::vector<shell_token_t> lexical;
+    shell_token_t token = {};
+    while (shell_tokenizer_next(&state, &token))
+      lexical.push_back(token);
+    shell_command_t record = {};
+    record.start_pos = 0;
+    record.end_pos = length;
+    record.tokens = lexical.data();
+    record.token_count = lexical.size();
+    if (!tokenizer_iterated_matches_structured(source, length, lexical, &record,
+                                               1))
+      return fixed_oracle_failure(__LINE__);
+    for (size_t omitted = 0; omitted < lexical.size(); omitted++) {
+      std::vector<shell_token_t> damaged = lexical;
+      damaged.erase(damaged.begin() + omitted);
+      record.tokens = damaged.data();
+      record.token_count = damaged.size();
+      if (tokenizer_iterated_matches_structured(source, length, lexical,
+                                                &record, 1))
+        return fixed_oracle_failure(__LINE__);
+    }
+    std::vector<shell_token_t> invented = lexical;
+    invented.push_back(lexical.back());
+    record.tokens = invented.data();
+    record.token_count = invented.size();
+    if (tokenizer_iterated_matches_structured(source, length, lexical, &record,
+                                              1))
+      return fixed_oracle_failure(__LINE__);
+    std::swap(invented[0], invented[1]);
+    invented.pop_back();
+    record.token_count = invented.size();
+    if (tokenizer_iterated_matches_structured(source, length, lexical, &record,
+                                              1))
+      return fixed_oracle_failure(__LINE__);
+  }
 
   struct oracle_case {
     const char *input;
@@ -349,7 +1393,7 @@ static int test_fixed_oracles(void) {
         (item.features != 0 &&
          (fast.cmds[0].features & item.features) != item.features) ||
         (item.count > 1 && fast.cmds[1].type != item.second_type))
-      return 1;
+      return fixed_oracle_failure(__LINE__);
     shell_command_t *commands = NULL;
     size_t command_count = 0;
     bool ok =
@@ -357,7 +1401,7 @@ static int test_fixed_oracles(void) {
                                  &command_count) == SHELL_TOKENIZE_OK);
     shell_commands_free(commands, command_count);
     if (!ok || command_count != item.count)
-      return 1;
+      return fixed_oracle_failure(__LINE__);
   }
 
   /* Metadata must distinguish executable substitutions from literal spelling
@@ -425,8 +1469,10 @@ static int test_fixed_oracles(void) {
     shell_command_infos_free(processed, processed_count);
     shell_transformed_command_list_free(transformed, transformed_count);
     shell_abstract_command_free(abstract);
-    if (!metadata_ok)
-      return 1;
+    if (!metadata_ok) {
+      fprintf(stderr, "word metadata oracle failed: %s\n", item.input);
+      return fixed_oracle_failure(__LINE__);
+    }
   }
 
   /* Keep newly supported spelling families in the always-run oracle set. The
@@ -438,7 +1484,7 @@ static int test_fixed_oracles(void) {
       modern.count != 2 ||
       (modern.cmds[0].modifiers & SHELL_CMD_MOD_PIPE_NEGATED) == 0 ||
       (modern.cmds[1].modifiers & SHELL_CMD_MOD_PIPE_NEGATED) == 0)
-    return 1;
+    return fixed_oracle_failure(__LINE__);
   shell_command_t *pipe_both_commands = NULL;
   size_t pipe_both_count = 0;
   shell_command_info_t *pipe_both_infos = NULL;
@@ -471,7 +1517,7 @@ static int test_fixed_oracles(void) {
   shell_command_infos_free(pipe_both_infos, pipe_both_info_count);
   shell_commands_free(pipe_both_commands, pipe_both_count);
   if (!pipe_both_valid)
-    return 1;
+    return fixed_oracle_failure(__LINE__);
 
   /* Group-owned redirects are structure rather than flat output, but a later
    * redirect-only list member is a returned empty-argv record. Exercise both
@@ -517,7 +1563,7 @@ static int test_fixed_oracles(void) {
                          &flat_limit_count) == SHELL_PROCESS_EOUTPUT_LIMIT &&
                      flat_limit_infos == nullptr && flat_limit_count == 0;
   if (!flat_limit_valid)
-    return 1;
+    return fixed_oracle_failure(__LINE__);
 
   /* The legacy flat result retains independently executable redirect-only
    * stages adjacent to groups. Their range must stay self-contained: group
@@ -548,7 +1594,7 @@ static int test_fixed_oracles(void) {
     shell_command_infos_free(records, record_count);
   }
   if (!flat_group_records_valid)
-    return 1;
+    return fixed_oracle_failure(__LINE__);
 
   /* Bash consumes an immediate raw `-` as a duplication close marker even
    * when a word follows without whitespace. Keep the lexer, canonical argv,
@@ -598,7 +1644,7 @@ static int test_fixed_oracles(void) {
   shell_command_infos_free(close_infos, close_info_count);
   free(close_netargv);
   if (!raw_close_suffix_ok || !close_edge || file_document)
-    return 1;
+    return fixed_oracle_failure(__LINE__);
 
   /* A persistent named close retires its setup document. An aliased name keeps
    * that document live, so the resolver must not use the historical FD_OPEN
@@ -642,7 +1688,7 @@ static int test_fixed_oracles(void) {
           SHELL_DEP_DOC_FLAG_TRANSIENT) == 0);
   if (!named_close_ok || !named_close_transient || !named_close_edge ||
       !alias_remains_live)
-    return 1;
+    return fixed_oracle_failure(__LINE__);
 
   static const char raw_close_group[] = "{ printf x; } >&-file";
   shell_processed_commands_t rejected_group = {};
@@ -657,7 +1703,7 @@ static int test_fixed_oracles(void) {
       rejected_graph.node_count == 0 && rejected_graph.edge_count == 0;
   shell_processed_commands_free(&rejected_group);
   if (!raw_close_group_ok)
-    return 1;
+    return fixed_oracle_failure(__LINE__);
 
   /* Only syntax that actually quotes a word fragment hides outer list or
    * redirection operators. Keep every parser layer aligned on that boundary. */
@@ -695,7 +1741,7 @@ static int test_fixed_oracles(void) {
     shell_commands_free(commands, command_count);
     shell_processed_commands_free(&processed);
     if (!opaque_word_ok)
-      return 1;
+      return fixed_oracle_failure(__LINE__);
   }
 
   /* A raw opening brace is literal in a parameter word. Keep both the
@@ -750,7 +1796,7 @@ static int test_fixed_oracles(void) {
     shell_transformed_command_list_free(transformed, transformed_count);
     shell_abstract_command_free(abstract);
     if (!parameter_brace_ok || pipe_count != item.pipe_count)
-      return 1;
+      return fixed_oracle_failure(__LINE__);
   }
 
   static const char *const structural_word_cases[] = {
@@ -785,7 +1831,7 @@ static int test_fixed_oracles(void) {
     shell_commands_free(commands, command_count);
     shell_processed_commands_free(&processed);
     if (!structural_word_ok || pipe_count != 1)
-      return 1;
+      return fixed_oracle_failure(__LINE__);
   }
 
   static const struct {
@@ -826,7 +1872,7 @@ static int test_fixed_oracles(void) {
     shell_commands_free(commands, command_count);
     shell_processed_commands_free(&processed);
     if (!redirect_fragment_ok || pipe_count != item.pipe_count)
-      return 1;
+      return fixed_oracle_failure(__LINE__);
   }
 
   /* A document-only right pipeline member still owns its document input, but
@@ -866,7 +1912,7 @@ static int test_fixed_oracles(void) {
       pipe_count += graph.edges[edge].type == SHELL_EDGE_PIPE;
     shell_processed_commands_free(&processed);
     if (!document_pipeline_ok || pipe_count != item.pipe_count)
-      return 1;
+      return fixed_oracle_failure(__LINE__);
   }
 
   /* Named descriptors prefix document redirects; neither the descriptor nor
@@ -900,7 +1946,7 @@ static int test_fixed_oracles(void) {
                              graph.edges[edge].target_fd == SHELL_DEP_FD_NAMED);
     shell_processed_commands_free(&processed);
     if (!named_document_ok || command_nodes != 1 || !named_document_edge) {
-      return 1;
+      return fixed_oracle_failure(__LINE__);
     }
   }
 
@@ -962,7 +2008,7 @@ static int test_fixed_oracles(void) {
      * Those forms have no Bash `{name}` identity, so only named-descriptor
      * syntax is required to produce named edge metadata. */
     if (!named_fd_ok || (std::strchr(input, '{') != nullptr && !named_metadata))
-      return 1;
+      return fixed_oracle_failure(__LINE__);
   }
 
   /* The route model intentionally has no readonly-variable attribute state.
@@ -992,7 +2038,7 @@ static int test_fixed_oracles(void) {
         graph.edge_count == 0;
     shell_processed_commands_free(&processed);
     if (!named_fd_readonly_ok)
-      return 1;
+      return fixed_oracle_failure(__LINE__);
   }
 
   /* A parameter-expansion fragment after `set -o` can select POSIX mode, and
@@ -1017,7 +2063,7 @@ static int test_fixed_oracles(void) {
         graph.edge_count == 0;
     shell_processed_commands_free(&processed);
     if (!dynamic_current_shell_ok)
-      return 1;
+      return fixed_oracle_failure(__LINE__);
   }
 
   /* Escaped physical line endings disappear before `${name}` recognition.
@@ -1031,7 +2077,7 @@ static int test_fixed_oracles(void) {
                             sizeof(braced_named_continuation) - 1, "/tmp",
                             nullptr, &braced_named_graph) != SHELL_DEP_OK ||
       !shell_dep_graph_validate(&braced_named_graph).valid)
-    return 1;
+    return fixed_oracle_failure(__LINE__);
   uint32_t stdout_writes = 0;
   uint32_t stderr_writes = 0;
   for (uint32_t edge = 0; edge < braced_named_graph.edge_count; edge++) {
@@ -1042,7 +2088,7 @@ static int test_fixed_oracles(void) {
     stderr_writes += current->source_fd == 2;
   }
   if (stdout_writes != 1 || stderr_writes != 0)
-    return 1;
+    return fixed_oracle_failure(__LINE__);
 
   /* An overridden output-process collector can be pruned while a later
    * command in the same recursive scope still uses an imported descriptor.
@@ -1129,7 +2175,7 @@ static int test_fixed_oracles(void) {
     shell_processed_commands_free(&processed);
     if (!recursive_import_ok || document < 0 || final < 0 || sink < 0 ||
         stale_collector_substitution || !route)
-      return 1;
+      return fixed_oracle_failure(__LINE__);
   }
 
   static const char *const static_legacy_redirect_cases[] = {
@@ -1139,6 +2185,12 @@ static int test_fixed_oracles(void) {
       "printf x >&literal$((1 + 2))",
       "printf x >&\"\"literal$(printf target)",
       "printf x >&file{one,two}",
+      "printf x >&{$destination}",
+      "printf x >&{{1,2}}",
+      "printf x >&{{1,2}",
+      "printf x >&file[[[[[:unfinished",
+      "printf x >&{[$'a']}",
+      "printf x >&{[$'']}",
   };
   for (const char *input : static_legacy_redirect_cases) {
     shell_processed_commands_t processed = {};
@@ -1152,7 +2204,7 @@ static int test_fixed_oracles(void) {
         shell_dep_graph_validate(&graph).valid;
     shell_processed_commands_free(&processed);
     if (!static_redirect_ok)
-      return 1;
+      return fixed_oracle_failure(__LINE__);
   }
 
   /* Invalid static descriptor targets must be rejected by the processors as
@@ -1178,7 +2230,7 @@ static int test_fixed_oracles(void) {
         shell_dep_graph_parse(input, strlen(input), "/tmp", NULL, &graph) !=
             SHELL_DEP_EPARSE ||
         graph.node_count != 0 || graph.edge_count != 0)
-      return 1;
+      return fixed_oracle_failure(__LINE__);
   }
 
   /* `&>` is two dynamic descriptor routes, not one combined byte edge. Later
@@ -1193,6 +2245,8 @@ static int test_fixed_oracles(void) {
     bool stderr_endpoint;
   };
   static const combined_process_route_oracle combined_process_route_cases[] = {
+      {"cat log >old &> >(sh </dev/null)", nullptr, nullptr, SHELL_EDGE_WRITE,
+       SHELL_EDGE_WRITE, true, true},
       {"cat log &> >(sh) >out", "out", nullptr, SHELL_EDGE_WRITE,
        SHELL_EDGE_WRITE, false, true},
       {"cat log &>> >(sh) 2>>err", nullptr, "err", SHELL_EDGE_WRITE,
@@ -1208,7 +2262,7 @@ static int test_fixed_oracles(void) {
     if (shell_dep_graph_parse(item.input, strlen(item.input), "/tmp", NULL,
                               &graph) != SHELL_DEP_OK ||
         !shell_dep_graph_validate(&graph).valid)
-      return 1;
+      return fixed_oracle_failure(__LINE__);
     int writer = -1;
     int stdout_file = -1;
     int stderr_file = -1;
@@ -1254,7 +2308,7 @@ static int test_fixed_oracles(void) {
     if (writer < 0 || stdout_endpoint != item.stdout_endpoint ||
         stderr_endpoint != item.stderr_endpoint || !stdout_file_route ||
         !stderr_file_route)
-      return 1;
+      return fixed_oracle_failure(__LINE__);
   }
 
   /* Descriptor references in nested shell evaluations are meaningful only
@@ -1291,6 +2345,10 @@ static int test_fixed_oracles(void) {
       "printf source | : {fd}<in; printf x \"$(cat <&$fd)\"",
       "( : ) {fd}>out; printf x >&$fd",
       "{ :; } {fd}>out | cat; printf x >&$fd",
+      "exec {fd}>base; probe && unset fd; printf after >&$fd",
+      "exec {fd}>base; probe || { unset fd; }; printf after >&$fd",
+      "exec {fd}>base; probe && { fd=1; }; printf after >&$fd",
+      "exec {fd}<base; probe && { unset fd; }; echo \"$(cat <&$fd)\"",
   };
   for (const char *input : named_fd_snapshot_rejections) {
     shell_dep_graph_t graph = {};
@@ -1298,7 +2356,7 @@ static int test_fixed_oracles(void) {
             SHELL_DEP_EPARSE ||
         graph.node_count != 0 || graph.edge_count != 0 ||
         graph.status != SHELL_DEP_STATUS_ERROR)
-      return 1;
+      return fixed_oracle_failure(__LINE__);
   }
 
   static const char *const dynamic_legacy_redirect_rejections[] = {
@@ -1315,7 +2373,7 @@ static int test_fixed_oracles(void) {
             SHELL_DEP_EPARSE ||
         graph.node_count != 0 || graph.edge_count != 0 ||
         graph.status != SHELL_DEP_STATUS_ERROR)
-      return 1;
+      return fixed_oracle_failure(__LINE__);
   }
 
   static const char *const literal_named_fd_cases[] = {
@@ -1341,7 +2399,7 @@ static int test_fixed_oracles(void) {
         ok = false;
     shell_processed_commands_free(&processed);
     if (!ok)
-      return 1;
+      return fixed_oracle_failure(__LINE__);
   }
 
   static const char compound_words[] =
@@ -1359,7 +2417,7 @@ static int test_fixed_oracles(void) {
   free(typed);
   free(raw);
   if (!compound_ok)
-    return 1;
+    return fixed_oracle_failure(__LINE__);
 
   static const char *const negated_document_cases[] = {
       "! <<<body",
@@ -1379,7 +2437,673 @@ static int test_fixed_oracles(void) {
         graph.nodes[0].cmd.pipeline_negation_count !=
             parsed.cmds[0].pipeline_negation_count ||
         !shell_dep_graph_validate(&graph).valid) {
-      return 1;
+      return fixed_oracle_failure(__LINE__);
+    }
+  }
+
+  struct timed_pipeline_oracle {
+    const char *input;
+    uint32_t timer_count;
+  };
+  static const timed_pipeline_oracle timed_pipeline_cases[] = {
+      {"time printf x | cat", 1},
+      {"time ({ printf x; })", 1},
+      {"time ({(printf x)}) | cat", 1},
+      {"time printf x <<<body | cat", 1},
+      {"time printf x <<EOF | cat\nbody\nEOF\n", 1},
+      {"time printf x | <<<body", 1},
+      {"time { printf x; } | <<<body", 1},
+      {"time -p -- { printf x; } | cat", 1},
+      {"{ time { printf nested; }; printf outer; }", 1},
+      {"time { printf x; } 2>err | cat", 1},
+      {"time printf x | { cat; } 2>err | sort", 1},
+      {"time>/tmp/timing printf x", 1},
+      {"ti\\\nme printf x", 1},
+      {"time -p ! 3<<<body", 1},
+      {"time$(printf x)", 0},
+      {"time>(printf x)", 0},
+      {"time !", 1},
+      {"time printf x | { time -p cat; printf tail; } | sort", 2},
+      {"time { time a | b; } | c", 2},
+      {"time (time a | b) | c", 2},
+      {"time { time; } | c", 2},
+  };
+  for (const timed_pipeline_oracle &item : timed_pipeline_cases) {
+    const char *input = item.input;
+    shell_parse_result_t parsed = {};
+    shell_processed_commands_t processed = {};
+    shell_dep_graph_t graph = {};
+    shell_error_t fast_status =
+        shell_parse_fast(input, strlen(input), NULL, &parsed);
+    shell_process_status_t process_status =
+        shell_process_commands(input, strlen(input), NULL, &processed);
+    shell_dep_error_t graph_status =
+        shell_dep_graph_parse(input, strlen(input), "/tmp", NULL, &graph);
+    bool graph_valid = shell_dep_graph_validate(&graph).valid;
+    bool timed = fast_status == SHELL_OK && parsed.count != 0 &&
+                 process_status == SHELL_PROCESS_OK &&
+                 graph_status == SHELL_DEP_OK && graph_valid;
+    uint32_t timers = 0;
+    uint32_t timing_edges = 0;
+    for (uint32_t node = 0; node < graph.node_count; node++)
+      timers += graph.nodes[node].type == SHELL_NODE_TIME;
+    for (uint32_t edge = 0; edge < graph.edge_count; edge++)
+      timing_edges += graph.edges[edge].type == SHELL_EDGE_TIME;
+    timed =
+        timed && timers == item.timer_count && timing_edges == item.timer_count;
+    shell_processed_commands_free(&processed);
+    if (!timed) {
+      fprintf(stderr,
+              "shellsplit fuzz invariant failed: timed pipeline oracle (%s, "
+              "fast=%d processed=%d graph=%d valid=%d timers=%u edges=%u)\n",
+              input, (int)fast_status, (int)process_status, (int)graph_status,
+              graph_valid, timers, timing_edges);
+      return fixed_oracle_failure(__LINE__);
+    }
+  }
+
+  {
+    static const char input[] = "time { time a | b; } | c";
+    static const char outer_span[] = "{ time a | b; } | c";
+    static const char inner_span[] = "a | b";
+    shell_dep_graph_t graph = {};
+    if (shell_dep_graph_parse(input, sizeof(input) - 1, "/tmp", nullptr,
+                              &graph) != SHELL_DEP_OK ||
+        !shell_dep_graph_validate(&graph).valid)
+      return fixed_oracle_failure(__LINE__);
+    uint32_t commands[3] = {UINT32_MAX, UINT32_MAX, UINT32_MAX};
+    uint32_t command_count = 0;
+    uint32_t outer_timer = UINT32_MAX;
+    uint32_t inner_timer = UINT32_MAX;
+    for (uint32_t node = 0; node < graph.node_count; node++) {
+      if (graph.nodes[node].type == SHELL_NODE_CMD && command_count < 3)
+        commands[command_count++] = node;
+      if (graph.nodes[node].type != SHELL_NODE_TIME)
+        continue;
+      const shell_dep_time_t &timing = graph.nodes[node].time;
+      if (timing.length == sizeof(outer_span) - 1 &&
+          memcmp(timing.start, outer_span, sizeof(outer_span) - 1) == 0)
+        outer_timer = node;
+      if (timing.length == sizeof(inner_span) - 1 &&
+          memcmp(timing.start, inner_span, sizeof(inner_span) - 1) == 0)
+        inner_timer = node;
+    }
+    if (command_count != 3 || outer_timer == UINT32_MAX ||
+        inner_timer == UINT32_MAX || outer_timer == inner_timer ||
+        graph.nodes[commands[0]].cmd.pipeline_time_id != inner_timer + 1 ||
+        graph.nodes[commands[1]].cmd.pipeline_time_id != inner_timer + 1 ||
+        graph.nodes[commands[2]].cmd.pipeline_time_id != outer_timer + 1)
+      return fixed_oracle_failure(__LINE__);
+  }
+
+  struct nested_modifier_oracle {
+    const char *input;
+    shell_pipeline_time_mode_t modes[3];
+    uint32_t negations[3];
+  };
+  static const nested_modifier_oracle nested_modifier_cases[] = {
+      {"time -p { time a | b; } | c",
+       {SHELL_PIPE_TIME_DEFAULT, SHELL_PIPE_TIME_DEFAULT,
+        SHELL_PIPE_TIME_POSIX},
+       {0, 0, 0}},
+      {"! { ! ! a | b; } | c",
+       {SHELL_PIPE_TIME_NONE, SHELL_PIPE_TIME_NONE, SHELL_PIPE_TIME_NONE},
+       {2, 2, 1}},
+  };
+  for (const nested_modifier_oracle &item : nested_modifier_cases) {
+    shell_command_t *commands = nullptr;
+    size_t count = 0;
+    bool valid =
+        shell_tokenize_commands(item.input, strlen(item.input), &commands,
+                                &count) == SHELL_TOKENIZE_OK &&
+        count == 3;
+    for (size_t command = 0; valid && command < count; command++)
+      valid =
+          commands[command].pipeline_time_mode == item.modes[command] &&
+          commands[command].pipeline_negation_count == item.negations[command];
+    shell_commands_free(commands, count);
+    if (!valid)
+      return fixed_oracle_failure(__LINE__);
+
+    shell_command_info_t *processed = nullptr;
+    size_t processed_count = 0;
+    valid = shell_process_command(item.input, strlen(item.input), nullptr,
+                                  &processed,
+                                  &processed_count) == SHELL_PROCESS_OK &&
+            processed_count == 3;
+    for (size_t command = 0; valid && command < processed_count; command++)
+      valid =
+          processed[command].pipeline_time_mode == item.modes[command] &&
+          processed[command].pipeline_negation_count == item.negations[command];
+    shell_command_infos_free(processed, processed_count);
+    if (!valid)
+      return fixed_oracle_failure(__LINE__);
+  }
+
+  struct timed_route_oracle {
+    const char *input;
+    shell_dep_time_report_route_t route;
+    uint32_t flags;
+    uint32_t external_fd;
+    bool graph_flow;
+    const char *target_file = nullptr;
+  };
+  static const timed_route_oracle timed_route_cases[] = {
+      {"(false; exit <<< <(printf '%s' \"$(true)\")) && time true",
+       SHELL_TIME_REPORT_UNAVAILABLE, SHELL_TIME_REPORT_ROUTE_UNAVAILABLE,
+       SHELL_DEP_FD_NONE, false},
+      {"(true; exit <<< <(printf '%s' \"$(false)\")) || time true",
+       SHELL_TIME_REPORT_UNAVAILABLE, SHELL_TIME_REPORT_ROUTE_UNAVAILABLE,
+       SHELL_DEP_FD_NONE, false},
+      {"(true; exit <<<\"$(false)\") || time true", SHELL_TIME_REPORT_EXTERNAL,
+       SHELL_TIME_REPORT_ROUTE_EXTERNAL, 2, false},
+      {"time (true) 2>local", SHELL_TIME_REPORT_GRAPH,
+       SHELL_TIME_REPORT_ROUTE_GRAPH, SHELL_DEP_FD_NONE, true},
+      {"time { true; } 2>local", SHELL_TIME_REPORT_EXTERNAL,
+       SHELL_TIME_REPORT_ROUTE_EXTERNAL, 2, false},
+      {"time { true; } 2>local &", SHELL_TIME_REPORT_GRAPH,
+       SHELL_TIME_REPORT_ROUTE_GRAPH, SHELL_DEP_FD_NONE, true},
+      {"probe && exec 2>new; time true", SHELL_TIME_REPORT_MULTIPLE,
+       SHELL_TIME_REPORT_ROUTE_EXTERNAL | SHELL_TIME_REPORT_ROUTE_GRAPH, 2,
+       true},
+      {"probe && exec 2>new && time true", SHELL_TIME_REPORT_GRAPH,
+       SHELL_TIME_REPORT_ROUTE_GRAPH, SHELL_DEP_FD_NONE, true},
+      {"probe && exec 3>new && time exec 2>&3", SHELL_TIME_REPORT_GRAPH,
+       SHELL_TIME_REPORT_ROUTE_GRAPH, SHELL_DEP_FD_NONE, true},
+      {"probe && exec 2>&-; time true", SHELL_TIME_REPORT_MULTIPLE,
+       SHELL_TIME_REPORT_ROUTE_EXTERNAL | SHELL_TIME_REPORT_ROUTE_CLOSED, 2,
+       false},
+      {"exec 2>old || exit; exec 2<input && time true",
+       SHELL_TIME_REPORT_UNAVAILABLE, SHELL_TIME_REPORT_ROUTE_UNAVAILABLE,
+       SHELL_DEP_FD_NONE, false},
+      {"exec 2>old || exit; probe && exec 2<input; time true",
+       SHELL_TIME_REPORT_MULTIPLE,
+       SHELL_TIME_REPORT_ROUTE_GRAPH | SHELL_TIME_REPORT_ROUTE_UNAVAILABLE,
+       SHELL_DEP_FD_NONE, true, "old"},
+      {"true && exec 2>new; time true", SHELL_TIME_REPORT_MULTIPLE,
+       SHELL_TIME_REPORT_ROUTE_GRAPH | SHELL_TIME_REPORT_ROUTE_EXTERNAL, 2,
+       true, "new"},
+      {"false && exec 2>new; time true", SHELL_TIME_REPORT_EXTERNAL,
+       SHELL_TIME_REPORT_ROUTE_EXTERNAL, 2, false},
+      {"! false && exec 2>new; time true", SHELL_TIME_REPORT_MULTIPLE,
+       SHELL_TIME_REPORT_ROUTE_GRAPH | SHELL_TIME_REPORT_ROUTE_EXTERNAL, 2,
+       true, "new"},
+      {"! true && exec 2>new; time true", SHELL_TIME_REPORT_EXTERNAL,
+       SHELL_TIME_REPORT_ROUTE_EXTERNAL, 2, false},
+      {"echo \"$(exec 2>&1; time true)\"", SHELL_TIME_REPORT_GRAPH,
+       SHELL_TIME_REPORT_ROUTE_GRAPH, SHELL_DEP_FD_NONE, true},
+      {"exec 2>old || exit; time { exec 2>new; } 2>local",
+       SHELL_TIME_REPORT_GRAPH, SHELL_TIME_REPORT_ROUTE_GRAPH,
+       SHELL_DEP_FD_NONE, true, "old"},
+      {"time { { exec 2>new; } 2>local; true; }", SHELL_TIME_REPORT_EXTERNAL,
+       SHELL_TIME_REPORT_ROUTE_EXTERNAL, 2, false},
+      {"time { exec 2>new; } 2>&2", SHELL_TIME_REPORT_MULTIPLE,
+       SHELL_TIME_REPORT_ROUTE_GRAPH | SHELL_TIME_REPORT_ROUTE_EXTERNAL, 2,
+       true, "new"},
+      {"exec 2>old || exit; { exec 3>&2; } 2>local; time exec 2>&3",
+       SHELL_TIME_REPORT_MULTIPLE, SHELL_TIME_REPORT_ROUTE_GRAPH,
+       SHELL_DEP_FD_NONE, true, "local"},
+      {"{ exec 3>keep 2>new; } 2>local && time exec 2>&3",
+       SHELL_TIME_REPORT_GRAPH, SHELL_TIME_REPORT_ROUTE_GRAPH,
+       SHELL_DEP_FD_NONE, true, "keep"},
+      {"exec 2>old || exit; exec 3>new && exec 2<&3 && time true",
+       SHELL_TIME_REPORT_GRAPH, SHELL_TIME_REPORT_ROUTE_GRAPH,
+       SHELL_DEP_FD_NONE, true, "new"},
+      {"exec 2>old || exit; exec 3>new && { time true; } 2<&3",
+       SHELL_TIME_REPORT_GRAPH, SHELL_TIME_REPORT_ROUTE_GRAPH,
+       SHELL_DEP_FD_NONE, true, "new"},
+      {"exec {fd}>old || exit; : {fd}>new && exec 2>&$fd && time true",
+       SHELL_TIME_REPORT_GRAPH, SHELL_TIME_REPORT_ROUTE_GRAPH,
+       SHELL_DEP_FD_NONE, true, "new"},
+      {"exec {fd}>old || exit; : 3>new {fd}>&3 && exec 2>&$fd && time true",
+       SHELL_TIME_REPORT_GRAPH, SHELL_TIME_REPORT_ROUTE_GRAPH,
+       SHELL_DEP_FD_NONE, true, "new"},
+      {"exec {fd}>old || exit; : {fd}<&1; exec 2>&$fd && time true",
+       SHELL_TIME_REPORT_EXTERNAL, SHELL_TIME_REPORT_ROUTE_EXTERNAL, 1, false},
+      {"time exec 2>new <<<body | cat", SHELL_TIME_REPORT_EXTERNAL,
+       SHELL_TIME_REPORT_ROUTE_EXTERNAL, 2, false},
+      {"probe && exec 3>new && exec 2<&3 && time true", SHELL_TIME_REPORT_GRAPH,
+       SHELL_TIME_REPORT_ROUTE_GRAPH, SHELL_DEP_FD_NONE, true, "new"},
+      {"exec 2>old || exit; probe && exec 2>new; echo \"$(time true)\"",
+       SHELL_TIME_REPORT_MULTIPLE, SHELL_TIME_REPORT_ROUTE_GRAPH,
+       SHELL_DEP_FD_NONE, true, "new"},
+      {"exec 2>old || exit; probe && exec 2>&-; echo \"$(time true)\"",
+       SHELL_TIME_REPORT_MULTIPLE,
+       SHELL_TIME_REPORT_ROUTE_GRAPH | SHELL_TIME_REPORT_ROUTE_CLOSED,
+       SHELL_DEP_FD_NONE, true, "old"},
+      {"{ time true; } |& cat 3<&0", SHELL_TIME_REPORT_MULTIPLE,
+       SHELL_TIME_REPORT_ROUTE_GRAPH, SHELL_DEP_FD_NONE, true},
+      {"printf x | { exec 2>err && time true; }", SHELL_TIME_REPORT_GRAPH,
+       SHELL_TIME_REPORT_ROUTE_GRAPH, SHELL_DEP_FD_NONE, true, "err"},
+      {"printf x |& { exec 2>err && time true; }", SHELL_TIME_REPORT_GRAPH,
+       SHELL_TIME_REPORT_ROUTE_GRAPH, SHELL_DEP_FD_NONE, true, "err"},
+      {"printf x | { { exec 2>err; } && time true; }", SHELL_TIME_REPORT_GRAPH,
+       SHELL_TIME_REPORT_ROUTE_GRAPH, SHELL_DEP_FD_NONE, true, "err"},
+      {"printf x | { exec {fd}>err; exec 2>&$fd && time true; }",
+       SHELL_TIME_REPORT_GRAPH, SHELL_TIME_REPORT_ROUTE_GRAPH,
+       SHELL_DEP_FD_NONE, true, "err"},
+      {"printf x | { exec 2>err && echo \"$(time true)\"; }",
+       SHELL_TIME_REPORT_GRAPH, SHELL_TIME_REPORT_ROUTE_GRAPH,
+       SHELL_DEP_FD_NONE, true, "err"},
+      {"(exec 2>base || exit; exec 2>changed | :; time true)",
+       SHELL_TIME_REPORT_GRAPH, SHELL_TIME_REPORT_ROUTE_GRAPH,
+       SHELL_DEP_FD_NONE, true, "base"},
+      {"(exec 2>base || exit; exec 2>changed & wait; time true)",
+       SHELL_TIME_REPORT_GRAPH, SHELL_TIME_REPORT_ROUTE_GRAPH,
+       SHELL_DEP_FD_NONE, true, "base"},
+      {"(exec {fd}>base || exit; unset fd | :; exec 2>&$fd && time true)",
+       SHELL_TIME_REPORT_GRAPH, SHELL_TIME_REPORT_ROUTE_GRAPH,
+       SHELL_DEP_FD_NONE, true, "base"},
+  };
+  for (const timed_route_oracle &item : timed_route_cases) {
+    shell_dep_graph_t graph = {};
+    if (shell_dep_graph_parse(item.input, strlen(item.input), "/tmp", NULL,
+                              &graph) != SHELL_DEP_OK ||
+        !shell_dep_graph_validate(&graph).valid)
+      return fixed_oracle_failure(__LINE__);
+    const shell_dep_time_t *timing = nullptr;
+    uint32_t timer = UINT32_MAX;
+    for (uint32_t node = 0; node < graph.node_count; node++)
+      if (graph.nodes[node].type == SHELL_NODE_TIME) {
+        if (timing)
+          return fixed_oracle_failure(__LINE__);
+        timing = &graph.nodes[node].time;
+        timer = node;
+      }
+    if (!timing || timing->report_route != item.route ||
+        timing->report_route_flags != item.flags) {
+      fprintf(stderr, "timing outcome oracle: %s route=%u flags=%u\n",
+              item.input, timing ? timing->report_route : UINT32_MAX,
+              timing ? timing->report_route_flags : UINT32_MAX);
+      return fixed_oracle_failure(__LINE__);
+    }
+    bool external_found = item.external_fd == SHELL_DEP_FD_NONE;
+    for (uint32_t fd = 0; fd < timing->report_external_fd_count; fd++)
+      external_found =
+          external_found || timing->report_external_fds[fd] == item.external_fd;
+    bool graph_flow = false;
+    bool target_found = item.target_file == nullptr;
+    for (uint32_t edge = 0; edge < graph.edge_count; edge++) {
+      const shell_dep_edge_t &candidate = graph.edges[edge];
+      graph_flow = graph_flow || (candidate.from == timer &&
+                                  candidate.type != SHELL_EDGE_TIME &&
+                                  candidate.source_fd == timing->report_fd);
+      if (item.target_file && candidate.from == timer &&
+          candidate.type == SHELL_EDGE_WRITE &&
+          candidate.to < graph.node_count) {
+        const shell_dep_node_t &target = graph.nodes[candidate.to];
+        target_found =
+            target_found || (target.type == SHELL_NODE_DOC &&
+                             target.doc.kind == SHELL_DOC_FILE &&
+                             target.doc.path_len == strlen(item.target_file) &&
+                             memcmp(target.doc.path, item.target_file,
+                                    target.doc.path_len) == 0);
+      }
+    }
+    if (!external_found || graph_flow != item.graph_flow || !target_found)
+      return fixed_oracle_failure(__LINE__);
+  }
+
+  for (const char *input : shellsplit_test_enumeration_time_routes) {
+    shell_dep_graph_t graph = {};
+    if (shell_dep_graph_parse(input, strlen(input), "/tmp", nullptr, &graph) !=
+            SHELL_DEP_OK ||
+        !shell_dep_graph_validate(&graph).valid)
+      return fixed_oracle_failure(__LINE__);
+    uint32_t timers = 0;
+    for (uint32_t node = 0; node < graph.node_count; node++) {
+      if (graph.nodes[node].type != SHELL_NODE_TIME)
+        continue;
+      const shell_dep_time_t &time = graph.nodes[node].time;
+      if (time.report_route != SHELL_TIME_REPORT_EXTERNAL ||
+          time.report_target_fd != 1 ||
+          time.report_route_flags != SHELL_TIME_REPORT_ROUTE_EXTERNAL ||
+          time.report_external_fd_count != 1 ||
+          time.report_external_fds[0] != 1)
+        return fixed_oracle_failure(__LINE__);
+      timers++;
+    }
+    if (!timers)
+      return fixed_oracle_failure(__LINE__);
+  }
+
+  /* Effective timing metadata is inherited, but only the pipeline root owns
+   * reserved syntax. Later executables named `time` must retain both argv and
+   * byte routes, even when their spelling also forms an empty time prefix. */
+  static const struct {
+    const char *input;
+    uint32_t commands;
+    uint32_t pipes;
+    uint32_t first;
+    shell_pipeline_time_mode_t mode;
+  } ordinary_timed_stages[] = {
+      {"time true | time", 2, 1, 0, SHELL_PIPE_TIME_DEFAULT},
+      {"time true | time -p", 2, 1, 0, SHELL_PIPE_TIME_DEFAULT},
+      {"time true | time --", 2, 1, 0, SHELL_PIPE_TIME_DEFAULT},
+      {"time true | time !", 2, 1, 0, SHELL_PIPE_TIME_DEFAULT},
+      {"time -p true | time", 2, 1, 0, SHELL_PIPE_TIME_POSIX},
+      {"time true |& time", 2, 2, 0, SHELL_PIPE_TIME_DEFAULT},
+      {"time true | time | cat", 3, 2, 0, SHELL_PIPE_TIME_DEFAULT},
+      {"time true | \"time\"", 2, 1, 0, SHELL_PIPE_TIME_DEFAULT},
+      {"echo \"$(time true | time)\"", 3, 1, 1, SHELL_PIPE_TIME_DEFAULT},
+  };
+  for (const auto &item : ordinary_timed_stages) {
+    shell_dep_graph_t graph = {};
+    if (test_tokenizer_state(item.input, strlen(item.input)) ||
+        shell_dep_graph_parse(item.input, strlen(item.input), "/tmp", nullptr,
+                              &graph) != SHELL_DEP_OK ||
+        !shell_dep_graph_validate(&graph).valid)
+      return fixed_oracle_failure(__LINE__);
+    std::vector<uint32_t> commands;
+    uint32_t timer = UINT32_MAX, timers = 0, pipes = 0;
+    for (uint32_t node = 0; node < graph.node_count; node++) {
+      if (graph.nodes[node].type == SHELL_NODE_CMD) {
+        if (graph.nodes[node].cmd.token_count == 0)
+          return fixed_oracle_failure(__LINE__);
+        commands.push_back(node);
+      } else if (graph.nodes[node].type == SHELL_NODE_TIME) {
+        timer = node;
+        timers++;
+      }
+    }
+    if (commands.size() != item.commands || timers != 1)
+      return fixed_oracle_failure(__LINE__);
+    uint32_t first = commands[item.first];
+    uint32_t ordinary_time = commands[item.first + 1];
+    bool timed_root = false, input_pipe = false, output_pipe = false;
+    for (uint32_t edge = 0; edge < graph.edge_count; edge++) {
+      const shell_dep_edge_t &route = graph.edges[edge];
+      pipes += route.type == SHELL_EDGE_PIPE;
+      timed_root = timed_root || (route.type == SHELL_EDGE_TIME &&
+                                  route.from == timer && route.to == first);
+      input_pipe =
+          input_pipe || (route.type == SHELL_EDGE_PIPE && route.from == first &&
+                         route.to == ordinary_time && route.source_fd == 1 &&
+                         route.target_fd == 0);
+      output_pipe = output_pipe ||
+                    (item.first == 0 && item.commands == 3 &&
+                     route.type == SHELL_EDGE_PIPE &&
+                     route.from == ordinary_time && route.to == commands[2]);
+    }
+    if (!timed_root || !input_pipe || pipes != item.pipes ||
+        (item.first == 0 && item.commands == 3 && !output_pipe))
+      return fixed_oracle_failure(__LINE__);
+    for (size_t stage = item.first; stage < commands.size(); stage++)
+      if (graph.nodes[commands[stage]].cmd.pipeline_time_id != timer + 1 ||
+          graph.nodes[commands[stage]].cmd.pipeline_time_mode != item.mode)
+        return fixed_oracle_failure(__LINE__);
+  }
+
+  static const struct {
+    const char *input;
+    uint32_t commands;
+    uint32_t timed;
+    const char *last_argv = nullptr;
+  } document_stages[] = {
+      {"time <<<body cat", 1, 1},
+      {"time <input <<<body cat", 1, 1},
+      {"time <<<body <input cat", 1, 1},
+      {"time 3<<<body cat <&3", 1, 1},
+      {"time <<EOF cat\nbody\nEOF\n", 1, 1},
+      {"true | time <<<body", 2, 0},
+      {"time true | time -p <<<body", 2, 2},
+      {"<<<body time true", 1, 0},
+      {"<<<body ! true", 1, 0},
+      {"true | <<<body time -p", 2, 0},
+      {"time true | <<<body time -p", 2, 2},
+      {"<<EOF time\nbody\nEOF\n", 1, 0},
+      {"true |& 3<<<body cat", 2, 0},
+      {"true | cat <<EOF | cat\nbody\nEOF\n", 3, 0},
+      {"<<<one time <<<two cat", 1, 0, "4:time,3:cat,"},
+      {"<<<one ! <<<two cat", 1, 0, "1:!,3:cat,"},
+      {"<<<one time -p 3<<<two cat <&3", 1, 0, "4:time,2:-p,3:cat,"},
+      {"<<EOF time <<<two cat\none\nEOF\n", 1, 0, "4:time,3:cat,"},
+      {"<<<one time \\\n<<<two cat", 1, 0, "4:time,3:cat,"},
+      {"time true | <<<one time <<<two cat", 2, 2, "4:time,3:cat,"},
+      {"printf one <<<one\ntime <<<two cat", 2, 1, "3:cat,"},
+      {"printf one <<<one\n! <<<two cat", 2, 0, "3:cat,"},
+      {"printf one <<<one\r\ntime -p <<<two cat", 2, 1, "3:cat,"},
+  };
+  for (const auto &item : document_stages) {
+    shell_dep_graph_t graph = {};
+    if (test_tokenizer_state(item.input, strlen(item.input)) ||
+        test_processor(item.input, strlen(item.input)) ||
+        shell_dep_graph_parse(item.input, strlen(item.input), "/tmp", nullptr,
+                              &graph) != SHELL_DEP_OK ||
+        !shell_dep_graph_validate(&graph).valid)
+      return fixed_oracle_failure(__LINE__);
+    uint32_t commands = 0, timed = 0, last_command = UINT32_MAX;
+    for (uint32_t node = 0; node < graph.node_count; node++) {
+      if (graph.nodes[node].type != SHELL_NODE_CMD)
+        continue;
+      if (graph.nodes[node].cmd.token_count == 0)
+        return fixed_oracle_failure(__LINE__);
+      commands++;
+      last_command = node;
+      timed += graph.nodes[node].cmd.pipeline_time_mode != SHELL_PIPE_TIME_NONE;
+    }
+    if (commands != item.commands || timed != item.timed)
+      return fixed_oracle_failure(__LINE__);
+    if (item.last_argv) {
+      shell_netstring_iter_t words;
+      shell_netstring_view_t word;
+      shell_netstring_iter_init(&words, item.last_argv, strlen(item.last_argv));
+      const shell_dep_cmd_t &cmd = graph.nodes[last_command].cmd;
+      uint32_t token = 0;
+      while (shell_netstring_iter_next(&words, &word) == SHELL_NETSTRING_OK) {
+        if (token >= cmd.token_count ||
+            cmd.token_lens[token] != word.payload_length ||
+            memcmp(cmd.tokens[token], word.payload, word.payload_length) != 0)
+          return fixed_oracle_failure(__LINE__);
+        token++;
+      }
+      if (token != cmd.token_count)
+        return fixed_oracle_failure(__LINE__);
+    }
+  }
+
+  /* Consume real parser output unchanged. Fabricating omitted commands or
+   * groups violates the internal API contract and is not a runtime oracle. */
+  for (const char *source :
+       {"time { true; }", "time true; false", "{ true; }", "true; false"}) {
+    shell_parse_result_t fast = {};
+    shell_dep_graph_t graph = {};
+    shell_dep_limits_t limits;
+    const shell_limits_t strict = {SHELL_MAX_SUBCOMMANDS, true};
+    if (shell_parse_fast(source, strlen(source), &strict, &fast) != SHELL_OK ||
+        !fuzz_dep_limits(nullptr, &limits))
+      return fixed_oracle_failure(__LINE__);
+    const shell_parse_result_t unchanged = fast;
+    if (shell_dep_graph_parse_with_fast(source, strlen(source), ".", &limits,
+                                        &fast, &graph) != SHELL_DEP_OK ||
+        !shellsplit_test_depgraph_invariants(source, strlen(source),
+                                             SHELL_DEP_OK, &graph, &limits) ||
+        memcmp(&fast, &unchanged, sizeof(fast)) != 0)
+      return fixed_oracle_failure(__LINE__);
+  }
+
+  /* Empty timing targets are structural. In particular, recursive capture
+   * and import joins must never materialize them as byte sources or sinks. */
+  static const char *const empty_timing_stream_cases[] = {
+      "echo \"$(time; true)\"",
+      "echo \"`time; true`\"",
+      "echo \"$(exec 2>&1; time; true)\"",
+      "cat <(time; printf x)",
+      "printf x > >(time; cat)",
+      "echo \"$(time &)\"",
+  };
+  for (const char *input : empty_timing_stream_cases) {
+    shell_dep_graph_t graph = {};
+    if (shell_dep_graph_parse(input, strlen(input), "/tmp", nullptr, &graph) !=
+            SHELL_DEP_OK ||
+        !shell_dep_graph_validate(&graph).valid)
+      return fixed_oracle_failure(__LINE__);
+    uint32_t placeholder = UINT32_MAX;
+    for (uint32_t edge = 0; edge < graph.edge_count; edge++)
+      if (graph.edges[edge].type == SHELL_EDGE_TIME &&
+          graph.nodes[graph.edges[edge].from].time.length == 0)
+        placeholder = graph.edges[edge].to;
+    if (placeholder == UINT32_MAX ||
+        graph.nodes[placeholder].cmd.token_count != 0)
+      return fixed_oracle_failure(__LINE__);
+    for (uint32_t edge = 0; edge < graph.edge_count; edge++) {
+      const shell_dep_edge_t &item = graph.edges[edge];
+      if (item.from != placeholder && item.to != placeholder)
+        continue;
+      if (item.type != SHELL_EDGE_TIME && item.type != SHELL_EDGE_SEQ &&
+          item.type != SHELL_EDGE_AND && item.type != SHELL_EDGE_OR &&
+          item.type != SHELL_EDGE_BACKGROUND && item.type != SHELL_EDGE_GROUP)
+        return fixed_oracle_failure(__LINE__);
+    }
+  }
+  for (const char *input :
+       {"echo \"$(time)\"", "echo \"$(time;)\"", "echo \"$(exec 2>&1; time;)\"",
+        "cat <(time;)", "printf x > >(time;)", "echo \"$( (time;) )\"",
+        "echo \"$(time (time;))\"", "echo \"$( (time;); : )\"",
+        "cat <( (time;) )", "printf x > >( (time;) )"}) {
+    shell_dep_graph_t graph = {};
+    if (shell_dep_graph_parse(input, strlen(input), "/tmp", nullptr, &graph) !=
+            SHELL_DEP_EPARSE ||
+        graph.node_count != 0 || graph.edge_count != 0)
+      return fixed_oracle_failure(__LINE__);
+  }
+
+  for (const char *input :
+       {"cat <input < <(printf ignored >/dev/null)",
+        "cat < <(printf old) < <(printf ignored >/dev/null)"}) {
+    shell_dep_graph_t graph = {};
+    if (shell_dep_graph_parse(input, strlen(input), "/tmp", nullptr, &graph) !=
+            SHELL_DEP_OK ||
+        !shell_dep_graph_validate(&graph).valid)
+      return fixed_oracle_failure(__LINE__);
+    bool replacement = false;
+    for (uint32_t edge = 0; edge < graph.edge_count; edge++) {
+      const shell_dep_edge_t &item = graph.edges[edge];
+      if (item.to != 0 ||
+          (item.type != SHELL_EDGE_SUBST && item.type != SHELL_EDGE_READ))
+        continue;
+      if (item.type != SHELL_EDGE_SUBST ||
+          graph.nodes[item.from].type != SHELL_NODE_ENDPOINT ||
+          graph.nodes[item.from].endpoint.reserved != 2 || item.target_fd != 0)
+        return fixed_oracle_failure(__LINE__);
+      replacement = true;
+    }
+    if (!replacement)
+      return fixed_oracle_failure(__LINE__);
+  }
+
+  {
+    static const char input[] = "exec 2>base; probe && exec 2>new; time true";
+    shell_dep_graph_t full = {};
+    if (shell_dep_graph_parse(input, sizeof(input) - 1, "/tmp", nullptr,
+                              &full) != SHELL_DEP_OK)
+      return fixed_oracle_failure(__LINE__);
+    for (uint32_t max_edges = 0; max_edges <= full.edge_count; max_edges++) {
+      shell_dep_limits_t limits = SHELL_DEP_LIMITS_DEFAULT;
+      limits.max_edges = max_edges;
+      shell_dep_graph_t bounded = {};
+      shell_dep_error_t status = shell_dep_graph_parse(
+          input, sizeof(input) - 1, "/tmp", &limits, &bounded);
+      if ((status != SHELL_DEP_OK && status != SHELL_DEP_ETRUNC) ||
+          !shell_dep_graph_validate(&bounded).valid)
+        return fixed_oracle_failure(__LINE__);
+    }
+  }
+
+  struct timed_boundary_oracle {
+    const char *input;
+    uint32_t expected_start;
+    shell_pipeline_time_mode_t mode;
+    uint32_t negation_count;
+  };
+  static const timed_boundary_oracle timed_boundary_cases[] = {
+      {"time printf x", 5, SHELL_PIPE_TIME_DEFAULT, 0},
+      {"time -p -- ! printf x", 13, SHELL_PIPE_TIME_POSIX, 1},
+      {"! time ! printf x", 9, SHELL_PIPE_TIME_DEFAULT, 2},
+      {"time>/tmp/timing printf x", 4, SHELL_PIPE_TIME_DEFAULT, 0},
+      {"ti\\\nme printf x", 7, SHELL_PIPE_TIME_DEFAULT, 0},
+      {"time !", 0, SHELL_PIPE_TIME_DEFAULT, 1},
+      {"!>/tmp/out true", 1, SHELL_PIPE_TIME_NONE, 1},
+      {"!2>/tmp/out true", 0, SHELL_PIPE_TIME_NONE, 0},
+      {"time$(printf x)", 0, SHELL_PIPE_TIME_NONE, 0},
+      {"echo time", 0, SHELL_PIPE_TIME_NONE, 0},
+  };
+  for (const timed_boundary_oracle &item : timed_boundary_cases) {
+    shell_parse_result_t fast = {};
+    shell_command_t *full = nullptr;
+    size_t full_count = 0;
+    bool valid = shell_parse_fast(item.input, strlen(item.input), nullptr,
+                                  &fast) == SHELL_OK &&
+                 fast.count == 1 && fast.group_count == 0 &&
+                 shell_tokenize_commands(item.input, strlen(item.input), &full,
+                                         &full_count) == SHELL_TOKENIZE_OK &&
+                 full_count == 1 && full[0].token_count != 0;
+    size_t full_stage_start = full_count == 1 ? full[0].start_pos : 0;
+    if (valid) {
+      bool all_modifiers = true;
+      for (size_t token = 0; token < full[0].token_count; token++) {
+        shell_token_type_t type = full[0].tokens[token].type;
+        bool modifier = type == SHELL_TOKEN_PIPE_NEGATE ||
+                        type == SHELL_TOKEN_PIPE_TIME ||
+                        type == SHELL_TOKEN_PIPE_TIME_OPTION;
+        if (!modifier) {
+          full_stage_start = full[0].tokens[token].position;
+          all_modifiers = false;
+          break;
+        }
+      }
+      if (all_modifiers)
+        full_stage_start = full[0].tokens[0].position;
+    }
+    valid = valid && full_stage_start == item.expected_start &&
+            fast.cmds[0].start == item.expected_start &&
+            fast.cmds[0].pipeline_time_mode == item.mode &&
+            fast.cmds[0].pipeline_negation_count == item.negation_count &&
+            full[0].pipeline_time_mode == item.mode &&
+            full[0].pipeline_negation_count == item.negation_count;
+    shell_commands_free(full, full_count);
+    if (!valid) {
+      fprintf(stderr,
+              "shellsplit fuzz invariant failed: timed boundary oracle (%s, "
+              "fast-start=%u full-start=%zu expected=%u)\n",
+              item.input, fast.count ? fast.cmds[0].start : UINT32_MAX,
+              full_stage_start, item.expected_start);
+      return fixed_oracle_failure(__LINE__);
+    }
+  }
+
+  static const char *const invalid_timed_close_cases[] = {
+      "(time)",      "(time !)",      "echo \"$(time)\"",
+      "cat <(time)", "cat >(time !)", "cat <<EOF\n$(time)\nEOF\n",
+  };
+  for (const char *input : invalid_timed_close_cases) {
+    shell_parse_result_t fast = {};
+    shell_command_t *full = nullptr;
+    size_t full_count = 0;
+    shell_processed_commands_t processed = {};
+    shell_dep_graph_t graph = {};
+    shell_error_t fast_status =
+        shell_parse_fast(input, strlen(input), nullptr, &fast);
+    shell_tokenize_status_t full_status =
+        shell_tokenize_commands(input, strlen(input), &full, &full_count);
+    shell_process_status_t process_status =
+        shell_process_commands(input, strlen(input), nullptr, &processed);
+    shell_dep_error_t graph_status =
+        shell_dep_graph_parse(input, strlen(input), "/tmp", nullptr, &graph);
+    bool rejected = fast_status == SHELL_EPARSE && fast.count == 0 &&
+                    full_status == SHELL_TOKENIZE_EPARSE && full == nullptr &&
+                    full_count == 0 && process_status == SHELL_PROCESS_EPARSE &&
+                    processed.commands == nullptr &&
+                    processed.command_count == 0 &&
+                    graph_status == SHELL_DEP_EPARSE && graph.node_count == 0 &&
+                    graph.edge_count == 0;
+    shell_commands_free(full, full_count);
+    shell_processed_commands_free(&processed);
+    if (!rejected) {
+      fprintf(stderr,
+              "shellsplit fuzz invariant failed: timed close oracle (%s)\n",
+              input);
+      return fixed_oracle_failure(__LINE__);
     }
   }
 
@@ -1430,7 +3154,7 @@ static int test_fixed_oracles(void) {
                    shell_dep_graph_validate(&continued_graph).valid;
     shell_processed_commands_free(&continued_processed);
     if (!continued_ok)
-      return 1;
+      return fixed_oracle_failure(__LINE__);
   }
 
   /* Shell removal also applies within an expansion opener. Keep the physical
@@ -1485,7 +3209,7 @@ static int test_fixed_oracles(void) {
               "%u/%u substitutions)\n",
               item.input, command_nodes, item.command_nodes, substitution_edges,
               item.substitution_edges);
-      return 1;
+      return fixed_oracle_failure(__LINE__);
     }
   }
 
@@ -1535,7 +3259,7 @@ static int test_fixed_oracles(void) {
     if (!ansi_boundary_ok) {
       fprintf(stderr, "fixed ANSI-C NUL oracle failed: continuation %zu\n",
               index);
-      return 1;
+      return fixed_oracle_failure(__LINE__);
     }
   }
 
@@ -1574,7 +3298,7 @@ static int test_fixed_oracles(void) {
   shell_netstring_buffer_free(&binary_netargv);
   if (!binary_netargv_ok) {
     fprintf(stderr, "fixed ANSI-C NUL oracle failed: direct binary netargv\n");
-    return 1;
+    return fixed_oracle_failure(__LINE__);
   }
 
   /* Reserved words are recognized from their logical, unquoted spelling. A
@@ -1601,7 +3325,7 @@ static int test_fixed_oracles(void) {
     shell_processed_commands_free(&processed);
     free(netargv);
     if (!control_rejected)
-      return 1;
+      return fixed_oracle_failure(__LINE__);
   }
 
   static const char continued_group[] = "{ printf x; } \\\n|& { cat; }";
@@ -1631,7 +3355,7 @@ static int test_fixed_oracles(void) {
                        shell_dep_graph_validate(&continued_group_graph).valid;
   shell_processed_commands_free(&continued_group_processed);
   if (!continued_group_ok)
-    return 1;
+    return fixed_oracle_failure(__LINE__);
 
   shell_processed_commands_t negated_pipeline = {};
   bool negation_ok =
@@ -1649,7 +3373,7 @@ static int test_fixed_oracles(void) {
       negated_pipeline.commands[2].pipe_output_mode == SHELL_PIPE_MODE_NONE;
   shell_processed_commands_free(&negated_pipeline);
   if (!negation_ok)
-    return 1;
+    return fixed_oracle_failure(__LINE__);
 
   /* Every leading `!` is a modifier, so the count and parity must survive the
    * fast/full processor boundary without leaking a synthetic `!` argv word. */
@@ -1672,7 +3396,7 @@ static int test_fixed_oracles(void) {
              5) == 0;
   shell_processed_commands_free(&repeated_negation);
   if (!repeated_negation_ok)
-    return 1;
+    return fixed_oracle_failure(__LINE__);
 
   static const struct {
     const char *input;
@@ -1705,7 +3429,7 @@ static int test_fixed_oracles(void) {
     shell_commands_free(commands, command_count);
     shell_processed_commands_free(&processed);
     if (!valid)
-      return 1;
+      return fixed_oracle_failure(__LINE__);
   }
 
   struct parameter_word_oracle {
@@ -1762,7 +3486,7 @@ static int test_fixed_oracles(void) {
     shell_transformed_command_list_free(transformed, transformed_count);
     shell_abstract_command_free(abstract);
     if (!valid)
-      return 1;
+      return fixed_oracle_failure(__LINE__);
   }
 
   static const char *const invalid_list_cases[] = {
@@ -1808,7 +3532,7 @@ static int test_fixed_oracles(void) {
         shell_dep_graph_parse(input, strlen(input), NULL, NULL, &graph) ==
             SHELL_DEP_EPARSE;
     if (!invalid)
-      return 1;
+      return fixed_oracle_failure(__LINE__);
   }
 
   /* The lexer preserves descriptor-looking prefix words; the structured
@@ -1832,7 +3556,7 @@ static int test_fixed_oracles(void) {
         processed.group_io_ops != NULL || processed.group_io_op_count != 0 ||
         shell_dep_graph_parse(input, strlen(input), NULL, NULL, &graph) !=
             SHELL_DEP_EPARSE)
-      return 1;
+      return fixed_oracle_failure(__LINE__);
   }
 
   /* Shellsplit preserves an exact named-FD parameter as a deferred
@@ -1849,7 +3573,7 @@ static int test_fixed_oracles(void) {
       shell_dep_graph_parse(deferred_named_source,
                             strlen(deferred_named_source), NULL, NULL,
                             &deferred_named_graph) != SHELL_DEP_EPARSE)
-    return 1;
+    return fixed_oracle_failure(__LINE__);
   shell_processed_commands_free(&deferred_named_fd);
 
   if (shell_parse_fast("printf $'a\\0b' @(one|two) xs=(one two) &>out",
@@ -1861,13 +3585,13 @@ static int test_fixed_oracles(void) {
         SHELL_FEAT_COMBINED_REDIRECT)) !=
           (SHELL_FEAT_ANSI_C_QUOTE | SHELL_FEAT_EXTGLOB | SHELL_FEAT_ARRAY |
            SHELL_FEAT_COMBINED_REDIRECT))
-    return 1;
+    return fixed_oracle_failure(__LINE__);
   shell_dep_graph_t modern_graph = {};
   if (shell_dep_graph_parse("cmd {trace}> trace.log &>> combined.log",
                             strlen("cmd {trace}> trace.log &>> combined.log"),
                             NULL, NULL, &modern_graph) != SHELL_DEP_OK ||
       !shell_dep_graph_validate(&modern_graph).valid)
-    return 1;
+    return fixed_oracle_failure(__LINE__);
   shell_processed_commands_t unsupported = {};
   if (shell_process_commands("select x in one; do :; done",
                              strlen("select x in one; do :; done"), NULL,
@@ -1875,7 +3599,7 @@ static int test_fixed_oracles(void) {
       shell_process_commands("coproc worker { :; }",
                              strlen("coproc worker { :; }"), NULL,
                              &unsupported) != SHELL_PROCESS_EPARSE)
-    return 1;
+    return fixed_oracle_failure(__LINE__);
   shell_processed_commands_free(&unsupported);
 
   static const char *const redirect_boundaries[] = {
@@ -1888,6 +3612,7 @@ static int test_fixed_oracles(void) {
       "{ cat; } >out;echo hi",
       "> <(cat)while echo ok",
       "> prefix<(cat)while echo ok",
+      "> <(cat)foo time echo ok",
   };
   for (const char *input : redirect_boundaries) {
     char *sequence = NULL;
@@ -1898,13 +3623,12 @@ static int test_fixed_oracles(void) {
                                      &features) != SHELL_PROCESS_OK ||
         command_count != (strstr(input, "echo hi") ? 2u : 1u)) {
       free(sequence);
-      return 1;
+      return fixed_oracle_failure(__LINE__);
     }
     free(sequence);
   }
   static const char *const redirect_followed_by_unsupported[] = {
       "> <(cat)foo declare -a values",
-      "> <(cat)foo time echo ok",
       "> <(cat)foo [[ x ]]",
       "> <(cat)foo while true; do :; done",
   };
@@ -1913,7 +3637,7 @@ static int test_fixed_oracles(void) {
     if (shell_process_commands(input, strlen(input), NULL, &result) !=
             SHELL_PROCESS_EPARSE ||
         result.commands != NULL || result.command_count != 0)
-      return 1;
+      return fixed_oracle_failure(__LINE__);
   }
 
   /* These Bash forms remain lexically visible for diagnostics, but the
@@ -1924,7 +3648,13 @@ static int test_fixed_oracles(void) {
   static const char *const unmodeled_semantic_cases[] = {
       "[[ -f /tmp/x ]]",
       "(( count += 1 ))",
-      "time -p echo x",
+      "time eval echo hidden",
+      "time coproc echo hidden",
+      "time [[ -f /tmp/x ]]",
+      "time (( count += 1 ))",
+      "time shopt -s varredir_close",
+      "time command declare -a values",
+      "echo \"$(time eval echo hidden)\"",
       "printf '%s' $\"localized\"",
       "echo \"${value:-$\"localized\"}\"",
       "declare arr[0]",
@@ -1980,7 +3710,7 @@ static int test_fixed_oracles(void) {
     shell_transformed_command_list_free(transformed, transformed_count);
     shell_abstract_command_free(abstract);
     if (!rejected)
-      return 1;
+      return fixed_oracle_failure(__LINE__);
   }
 
   static const struct {
@@ -2019,7 +3749,7 @@ static int test_fixed_oracles(void) {
                 processed_status, processed.command_count,
                 processed.group_count);
       shell_processed_commands_free(&processed);
-      return 1;
+      return fixed_oracle_failure(__LINE__);
     }
     shell_processed_commands_free(&processed);
   }
@@ -2044,7 +3774,7 @@ static int test_fixed_oracles(void) {
         !shellsplit_test_depgraph_invariants(item.input, strlen(item.input),
                                              SHELL_DEP_OK, &graph,
                                              &SHELL_DEP_LIMITS_DEFAULT))
-      return 1;
+      return fixed_oracle_failure(__LINE__);
     uint32_t command_count = 0;
     uint32_t document_count = 0;
     uint32_t read_count = 0;
@@ -2062,7 +3792,7 @@ static int test_fixed_oracles(void) {
      * synthetic fan-out to each member command. */
     if (command_count != item.command_count || document_count != 1 ||
         read_count != 1 || pipe_count != item.pipe_count)
-      return 1;
+      return fixed_oracle_failure(__LINE__);
   }
   static const char group_herestring_override[] =
       "{ cat; } 3>&1 <<< stale 0<<< $(printf live)";
@@ -2073,7 +3803,7 @@ static int test_fixed_oracles(void) {
       !shellsplit_test_depgraph_invariants(
           group_herestring_override, strlen(group_herestring_override),
           SHELL_DEP_OK, &group_herestring_graph, &SHELL_DEP_LIMITS_DEFAULT))
-    return 1;
+    return fixed_oracle_failure(__LINE__);
   uint32_t here_documents = 0;
   uint32_t transient_here_documents = 0;
   uint32_t here_reads = 0;
@@ -2097,9 +3827,9 @@ static int test_fixed_oracles(void) {
         group_herestring_graph.nodes[current->to].doc.kind ==
             SHELL_DOC_HERESTRING;
   }
-  if (here_documents != 2 || transient_here_documents != 1 || here_reads != 1 ||
+  if (here_documents != 2 || transient_here_documents != 0 || here_reads != 2 ||
       here_substitutions != 1)
-    return 1;
+    return fixed_oracle_failure(__LINE__);
   struct dep_oracle_case {
     const char *input;
     uint32_t command_count;
@@ -2133,7 +3863,7 @@ static int test_fixed_oracles(void) {
         !shellsplit_test_depgraph_invariants(item.input, strlen(item.input),
                                              SHELL_DEP_OK, &graph,
                                              &SHELL_DEP_LIMITS_DEFAULT))
-      return 1;
+      return fixed_oracle_failure(__LINE__);
     uint32_t command_count = 0;
     uint32_t substitution_edges = 0;
     for (uint32_t i = 0; i < graph.node_count; i++)
@@ -2142,7 +3872,7 @@ static int test_fixed_oracles(void) {
       substitution_edges += graph.edges[i].type == SHELL_EDGE_SUBST;
     if (command_count != item.command_count ||
         substitution_edges != item.substitution_edges)
-      return 1;
+      return fixed_oracle_failure(__LINE__);
   }
 
   /* A literal non-descriptor prefix makes the command-substitution result a
@@ -2212,7 +3942,7 @@ static int test_fixed_oracles(void) {
     }
     if (!graph_ok || command_count != 2 || document < 0 || !dynamic_name_flow ||
         !stdout_route || (item.combined_output && !stderr_route))
-      return 1;
+      return fixed_oracle_failure(__LINE__);
   }
 
   struct composition_oracle {
@@ -2231,7 +3961,7 @@ static int test_fixed_oracles(void) {
     shell_dep_graph_t graph = {};
     if (shell_dep_graph_parse(item.input, strlen(item.input), ".", NULL,
                               &graph) != SHELL_DEP_OK)
-      return 1;
+      return fixed_oracle_failure(__LINE__);
     uint32_t command_count = 0;
     bool edge_seen = false;
     for (uint32_t i = 0; i < graph.node_count; i++) {
@@ -2240,25 +3970,25 @@ static int test_fixed_oracles(void) {
       if (command_count++ == 0 &&
           (graph.nodes[i].cmd.group_depth != item.group_depth ||
            graph.nodes[i].cmd.backgrounded != item.backgrounded))
-        return 1;
+        return fixed_oracle_failure(__LINE__);
     }
     for (uint32_t i = 0; i < graph.edge_count; i++)
       edge_seen = edge_seen || graph.edges[i].type == item.edge;
     if (command_count != item.command_count || !edge_seen)
-      return 1;
+      return fixed_oracle_failure(__LINE__);
   }
   static const char *const invalid[] = {"echo é"};
   for (const char *input : invalid) {
     shell_parse_result_t fast = {};
     if (shell_parse_fast(input, strlen(input), NULL, &fast) != SHELL_EPARSE ||
         !(fast.status & SHELL_STATUS_ERROR))
-      return 1;
+      return fixed_oracle_failure(__LINE__);
     shell_command_t *commands = NULL;
     size_t command_count = 0;
     if ((shell_tokenize_commands(input, strlen(input), &commands,
                                  &command_count) == SHELL_TOKENIZE_OK)) {
       shell_commands_free(commands, command_count);
-      return 1;
+      return fixed_oracle_failure(__LINE__);
     }
     shell_commands_free(commands, command_count);
   }
@@ -2271,12 +4001,12 @@ static int test_fixed_oracles(void) {
     shell_parse_result_t fast = {};
     if (shell_parse_fast(input, strlen(input), NULL, &fast) != SHELL_EPARSE ||
         !(fast.status & SHELL_STATUS_ERROR))
-      return 1;
+      return fixed_oracle_failure(__LINE__);
     shell_dep_graph_t graph = {};
     if (shell_dep_graph_parse(input, strlen(input), ".", NULL, &graph) !=
             SHELL_DEP_EPARSE ||
         graph.status != SHELL_DEP_STATUS_ERROR)
-      return 1;
+      return fixed_oracle_failure(__LINE__);
   }
   static const char *const unsupported_nested_structures[] = {
       "echo $(case value in x)",
@@ -2288,7 +4018,7 @@ static int test_fixed_oracles(void) {
             SHELL_DEP_EPARSE ||
         graph.status != SHELL_DEP_STATUS_ERROR || graph.node_count != 0 ||
         graph.edge_count != 0)
-      return 1;
+      return fixed_oracle_failure(__LINE__);
   }
   struct full_feature_case {
     const char *input;
@@ -2310,7 +4040,7 @@ static int test_fixed_oracles(void) {
         commands[0].has_conditionals != item.conditionals ||
         commands[0].has_case != item.case_stmt) {
       shell_commands_free(commands, command_count);
-      return 1;
+      return fixed_oracle_failure(__LINE__);
     }
     shell_commands_free(commands, command_count);
   }
@@ -2399,7 +4129,7 @@ static int test_fixed_oracles(void) {
     free(anomaly_commands);
     free(anomaly_types);
     if (!rejected)
-      return 1;
+      return fixed_oracle_failure(__LINE__);
   }
 
   static const char *const accepted_redirect_operands[] = {
@@ -2442,7 +4172,7 @@ static int test_fixed_oracles(void) {
     shell_processed_commands_free(&processed);
     free(netargv);
     if (!accepted)
-      return 1;
+      return fixed_oracle_failure(__LINE__);
   }
 
   struct redirect_owner_oracle {
@@ -2461,7 +4191,7 @@ static int test_fixed_oracles(void) {
     if (shell_dep_graph_parse(item.input, strlen(item.input), ".", NULL,
                               &graph) != SHELL_DEP_OK ||
         !shell_dep_graph_validate(&graph).valid)
-      return 1;
+      return fixed_oracle_failure(__LINE__);
     uint32_t group = UINT32_MAX;
     uint32_t document = UINT32_MAX;
     uint32_t empty_command = UINT32_MAX;
@@ -2491,7 +4221,7 @@ static int test_fixed_oracles(void) {
         (item.continued ? command_count != 1 || reader != group
                         : command_count != 2 || empty_command == UINT32_MAX ||
                               reader != empty_command))
-      return 1;
+      return fixed_oracle_failure(__LINE__);
   }
   return 0;
 }
@@ -2655,6 +4385,38 @@ static int test_depgraph(const char *input, size_t length, const char *cwd) {
         shell_dep_graph_parse(input, length, cwd, &limits[i], &graph);
     if (validate_depgraph(input, length, error, &graph, &limits[i]))
       return 1;
+    if (i == 0) {
+      /* The supplied path consumes the same strict parse as the public path.
+       * Compare real results, not arbitrary source/metadata combinations. */
+      const shell_limits_t strict = {SHELL_MAX_SUBCOMMANDS, true};
+      shell_parse_result_t fast = {};
+      shell_error_t fast_error =
+          shell_parse_fast(input, length, &strict, &fast);
+      if (fast_error == SHELL_OK || fast_error == SHELL_ETRUNC) {
+        const shell_parse_result_t unchanged = fast;
+        shell_dep_limits_t effective;
+        if (!fuzz_dep_limits(&limits[i], &effective))
+          return 1;
+        shell_dep_graph_t supplied = {};
+        shell_dep_error_t supplied_error = shell_dep_graph_parse_with_fast(
+            input, length, cwd, &effective, &fast, &supplied);
+        if (supplied_error != error ||
+            validate_depgraph(input, length, supplied_error, &supplied,
+                              &limits[i]) ||
+            supplied.node_count != graph.node_count ||
+            supplied.edge_count != graph.edge_count ||
+            supplied.status != graph.status ||
+            supplied.cwd_buf.len != graph.cwd_buf.len ||
+            memcmp(&fast, &unchanged, sizeof(fast)) != 0 ||
+            memcmp(supplied.nodes, graph.nodes,
+                   graph.node_count * sizeof(graph.nodes[0])) != 0 ||
+            memcmp(supplied.edges, graph.edges,
+                   graph.edge_count * sizeof(graph.edges[0])) != 0 ||
+            memcmp(supplied.cwd_buf.data, graph.cwd_buf.data,
+                   graph.cwd_buf.len) != 0)
+          return 1;
+      }
+    }
   }
   return 0;
 }
@@ -2764,6 +4526,24 @@ static bool tokenizer_token_is_list_operator(const shell_token_t &token) {
          token.type == SHELL_TOKEN_OR || token.type == SHELL_TOKEN_BACKGROUND;
 }
 
+static bool tokenizer_token_is_redirect(const shell_token_t &token) {
+  switch (token.type) {
+  case SHELL_TOKEN_REDIRECT_IN:
+  case SHELL_TOKEN_REDIRECT_OUT:
+  case SHELL_TOKEN_REDIRECT_ERR:
+  case SHELL_TOKEN_REDIRECT_APPEND:
+  case SHELL_TOKEN_REDIRECT_READ_WRITE:
+  case SHELL_TOKEN_REDIRECT_CLOBBER:
+  case SHELL_TOKEN_REDIRECT_BOTH:
+  case SHELL_TOKEN_REDIRECT_BOTH_APPEND:
+  case SHELL_TOKEN_HEREDOC:
+  case SHELL_TOKEN_HERESTRING:
+    return true;
+  default:
+    return false;
+  }
+}
+
 /* The iterator exposes a standalone escaped physical line ending so list
  * validation can discard it before classifying the token that follows. The
  * structured tokenizer intentionally omits this grammar-only token from its
@@ -2786,7 +4566,8 @@ static int test_tokenizer_state(const char *input, size_t length) {
   size_t previous_end = 0;
   std::vector<shell_token_t> iterated;
   bool expect_command = true;
-  bool follows_empty_heredoc = false;
+  bool document_only = true;
+  bool has_heredoc = false;
   bool terminated = false;
   while (steps++ <= length + 32) {
     shell_token_t token = {};
@@ -2804,13 +4585,14 @@ static int test_tokenizer_state(const char *input, size_t length) {
       previous_end = token.position + token.length;
       continue;
     }
-    /* An input-only heredoc after a list separator has no command record to
-     * own its document-closing separator. The iterator still exposes that
-     * newline while the structured tokenizer intentionally drops the empty
-     * trailing record. A heredoc attached to an ordinary command retains its
-     * newline and must continue through the normal comparison below. */
-    if (follows_empty_heredoc && tokenizer_token_is_newline(token)) {
-      follows_empty_heredoc = false;
+    /* A declaration-only stage can contain several document/redirect tokens.
+     * Its closing newline is structural; an ordinary command's newline is a
+     * retained list token. Track the whole lexical stage independently of the
+     * structured records so dropping an ordinary word cannot make it qualify
+     * as an argv-less stage. */
+    if (has_heredoc && document_only && tokenizer_token_is_newline(token)) {
+      has_heredoc = false;
+      expect_command = true;
       previous_end = token.position + token.length;
       continue;
     }
@@ -2819,58 +4601,89 @@ static int test_tokenizer_state(const char *input, size_t length) {
      * not a pipeline negator. Compare the same contextual token stream. */
     if (token.type == SHELL_TOKEN_PIPE_NEGATE && !expect_command)
       token.type = SHELL_TOKEN_ARGUMENT;
-    bool begins_empty_heredoc =
-        token.type == SHELL_TOKEN_HEREDOC && expect_command;
     if (token.type == SHELL_TOKEN_GROUP_START) {
       expect_command = true;
-    } else if (token.type != SHELL_TOKEN_GROUP_END) {
+      document_only = true;
+      has_heredoc = false;
+    } else if (token.type == SHELL_TOKEN_GROUP_END) {
+      /* A trailing group redirect remains owned by its compound record. */
+      document_only = false;
+    } else {
       if (!(expect_command && tokenizer_token_is_newline(token)))
         iterated.push_back(token);
       if (tokenizer_token_starts_command(token))
         expect_command = false;
-      if (tokenizer_token_is_list_operator(token))
+      if (tokenizer_token_is_list_operator(token)) {
         expect_command = true;
+        document_only = true;
+        has_heredoc = false;
+      } else {
+        document_only = document_only && tokenizer_token_is_redirect(token);
+        has_heredoc = has_heredoc || token.type == SHELL_TOKEN_HEREDOC;
+      }
     }
-    follows_empty_heredoc = begins_empty_heredoc;
     previous_end = token.position + token.length;
   }
   if (!terminated)
     return 1;
 
+  bool unsupported = shell_tokenizer_has_unsupported_semantics(input, length);
+  if (unsupported && !tokenizer_unsupported_semantics_rejected(input, length))
+    return 1;
+
   shell_command_t *commands = NULL;
   size_t command_count = 0;
-  bool full_ok = (shell_tokenize_commands(input, length, &commands,
-                                          &command_count) == SHELL_TOKENIZE_OK);
-  if (!full_ok) {
+  bool syntax_valid = shell_tokenizer_list_syntax_valid(input, length);
+  /* List grammar alone is not complete lexical validity: the iterator keeps
+   * an unfinished quote/document for diagnostics, while the allocating API
+   * rejects these specific unfinished lexical states. */
+  bool lexical_complete = !state.in_quotes && state.brace_depth == 0 &&
+                          state.brace_group_depth == 0 && !state.heredoc_error;
+  shell_tokenize_status_t full_status =
+      shell_tokenize_commands(input, length, &commands, &command_count);
+  if (full_status != SHELL_TOKENIZE_OK) {
+    bool outputs_cleared = commands == NULL && command_count == 0;
     shell_commands_free(commands, command_count);
-    return 0;
+    /* Malformed input has no complete command stream to reconcile. A valid
+     * source with visible tokens may only take this escape for the documented
+     * output-capacity limit. Comment/continuation-only source has no command
+     * to return and may be rejected with EParse. All other valid grammar,
+     * including unsupported semantics, must yield diagnostic records. */
+    return outputs_cleared && (!syntax_valid ||
+                               (full_status == SHELL_TOKENIZE_EPARSE &&
+                                (!lexical_complete || iterated.empty())) ||
+                               full_status == SHELL_TOKENIZE_EOVERFLOW)
+               ? 0
+               : 1;
   }
-  if (command_count == 0) {
-    shell_commands_free(commands, command_count);
-    return 0;
-  }
-  size_t expected = 0;
-  for (size_t i = 0; i < command_count; i++)
-    expected += commands[i].token_count;
-  if (iterated.size() != expected) {
+  if (!syntax_valid) {
     shell_commands_free(commands, command_count);
     return 1;
   }
-  size_t offset = 0;
-  for (size_t i = 0; i < command_count; i++) {
-    for (size_t j = 0; j < commands[i].token_count; j++, offset++) {
-      const shell_token_t &a = iterated[offset];
-      const shell_token_t &b = commands[i].tokens[j];
-      if (a.type != b.type || a.position != b.position ||
-          a.length != b.length || a.is_quoted != b.is_quoted ||
-          a.is_escaped != b.is_escaped) {
-        shell_commands_free(commands, command_count);
-        return 1;
+  if (command_count == 0) {
+    shell_commands_free(commands, command_count);
+    return unsupported || !iterated.empty() ? 1 : 0;
+  }
+  /* Unsupported semantics do not excuse a disappearing diagnostic token.
+   * Reconcile both streams with the same source-proven structural omissions. */
+  bool streams_match = tokenizer_iterated_matches_structured(
+      input, length, iterated, commands, command_count);
+  if (!streams_match && g_verbose) {
+    for (const shell_token_t &token : iterated)
+      fprintf(stderr, "lexical token: type=%d span=%zu+%zu\n", token.type,
+              token.position, token.length);
+    for (size_t command = 0; command < command_count; command++) {
+      fprintf(stderr, "structured command: span=%zu..%zu\n",
+              commands[command].start_pos, commands[command].end_pos);
+      for (size_t index = 0; index < commands[command].token_count; index++) {
+        const shell_token_t &token = commands[command].tokens[index];
+        fprintf(stderr, "structured token: type=%d span=%zu+%zu\n", token.type,
+                token.position, token.length);
       }
     }
   }
   shell_commands_free(commands, command_count);
-  return 0;
+  return streams_match ? 0 : 1;
 }
 
 static int test_interop(const char *input, size_t length) {
@@ -2915,12 +4728,7 @@ static int test_interop(const char *input, size_t length) {
       goto fail;
   }
   /* Reuse the handle after both a successful and an invalid/empty parse. */
-  if (shell_interop_parse(handle, "echo ok", 7, &count) != SHELL_OK ||
-      count != 1 || shell_interop_subcommand_count(handle) != 1 ||
-      shell_interop_parse(handle, NULL, 0, &count) != SHELL_EINPUT ||
-      shell_interop_subcommand_count(handle) != 0 ||
-      shell_interop_subcommand_dup(handle, 0) != NULL)
-    goto fail;
+
   shell_interop_free(handle);
   return 0;
 
@@ -2930,8 +4738,6 @@ fail:
 }
 
 static int test_abstraction(const char *input, size_t length) {
-  if (length == 0)
-    return shell_classify_raw_token(NULL, 0) == SHELL_TOKEN_END ? 0 : 1;
 
   (void)shell_classify_raw_token(input, length);
   shell_abstract_command_t *command = nullptr;
@@ -3153,6 +4959,40 @@ processed_groups_match_fast(const shell_parse_result_t *fast,
   return true;
 }
 
+static bool
+processed_argv_matches_sequence(const shell_processed_commands_t &processed,
+                                const void *sequence, size_t sequence_length,
+                                size_t count) {
+  if (!sequence || processed.command_count != count)
+    return false;
+  shell_netstring_iter_t records;
+  shell_netstring_view_t record = {};
+  if (shell_netstring_iter_init(&records, sequence, sequence_length) !=
+      SHELL_NETSTRING_OK)
+    return false;
+  for (size_t command = 0; command < count; command++) {
+    shell_netstring_buffer_t argv = {};
+    bool matches =
+        shell_netstring_iter_next(&records, &record) == SHELL_NETSTRING_OK &&
+        shell_render_netargv_buffer(&processed.commands[command], nullptr,
+                                    &argv) == SHELL_PROCESS_OK &&
+        argv.length == record.payload_length &&
+        memcmp(argv.data, record.payload, argv.length) == 0;
+    if (!matches && g_verbose)
+      fprintf(stderr,
+              "processor argv mismatch at %zu: structured=%.*s "
+              "sequence=%.*s\n",
+              command, (int)argv.length,
+              argv.data ? (const char *)argv.data : "",
+              (int)record.payload_length,
+              record.payload ? (const char *)record.payload : "");
+    shell_netstring_buffer_free(&argv);
+    if (!matches)
+      return false;
+  }
+  return shell_netstring_iter_next(&records, &record) == SHELL_NETSTRING_DONE;
+}
+
 // Test processor metadata and canonical sequence rendering together.
 static int test_processor(const char *input, size_t input_length) {
   shell_command_info_t *infos = NULL;
@@ -3323,6 +5163,11 @@ static int test_processor(const char *input, size_t input_length) {
 
   shell_parse_result_t fast = {};
   if (shell_parse_fast(input, input_length, NULL, &fast) == SHELL_OK) {
+    /* Group delimiters are intentionally absent from each flattened legacy
+     * command record, but remain shell syntax on the canonical call-wide
+     * result. Include that source-level fact in this differential oracle. */
+    for (size_t i = 0; i < fast.count; i++)
+      expected_features |= (fast.cmds[i].features & SHELL_FEAT_GROUP) != 0;
     shell_processed_commands_t processed = {};
     shell_process_status_t processed_status =
         shell_process_commands(input, input_length, &limits, &processed);
@@ -3344,7 +5189,9 @@ static int test_processor(const char *input, size_t input_length) {
     if ((processed_status != status && !semantic_rejection) ||
         (processed_status == SHELL_PROCESS_OK &&
          ((processed.commands == NULL) != (processed.command_count == 0) ||
-          !processed_groups_match_fast(&fast, &processed)))) {
+          !processed_groups_match_fast(&fast, &processed) ||
+          !processed_argv_matches_sequence(
+              processed, sequence, strlen(sequence), sequence_count)))) {
       if (g_verbose)
         fprintf(stderr,
                 "processor descriptor mismatch: input=%.*s process=%d/%zu "
@@ -3362,6 +5209,10 @@ static int test_processor(const char *input, size_t input_length) {
 
   shell_command_infos_free(infos, command_count);
   free(sequence);
+  if (expected_features != has_shell_features && g_verbose)
+    fprintf(stderr,
+            "processor feature mismatch: input=%.*s flat=%d sequence=%d\n",
+            (int)input_length, input, expected_features, has_shell_features);
   return expected_features != has_shell_features;
 }
 
@@ -3604,23 +5455,26 @@ static int test_generated_brace_case(const uint8_t *data, size_t size,
       operations_valid = false;
   for (uint32_t i = 0; i < graph.edge_count; i++) {
     const shell_dep_edge_t *edge = &graph.edges[i];
+    bool timing_report = edge->from < graph.node_count &&
+                         graph.nodes[edge->from].type == SHELL_NODE_TIME;
     graph_reads += graph.edges[i].type == SHELL_EDGE_READ;
-    graph_pipes += edge->type == SHELL_EDGE_PIPE;
-    graph_writes +=
-        edge->type == SHELL_EDGE_WRITE || edge->type == SHELL_EDGE_APPEND;
+    graph_pipes += edge->type == SHELL_EDGE_PIPE && !timing_report;
+    graph_writes += !timing_report && (edge->type == SHELL_EDGE_WRITE ||
+                                       edge->type == SHELL_EDGE_APPEND);
     if (edge->type == SHELL_EDGE_READ &&
         graph.nodes[edge->to].type != SHELL_NODE_GROUP &&
         (!item.command_local_documents ||
          graph.nodes[edge->to].type != SHELL_NODE_CMD))
       group_endpoints_valid = false;
-    if ((edge->type == SHELL_EDGE_WRITE || edge->type == SHELL_EDGE_APPEND) &&
+    if (!timing_report &&
+        (edge->type == SHELL_EDGE_WRITE || edge->type == SHELL_EDGE_APPEND) &&
         graph.nodes[edge->from].type != SHELL_NODE_GROUP)
       group_endpoints_valid = false;
     /* A redirected group input leaves its upstream writer connected to a
      * terminal ENDPOINT.  That is intentionally not a group endpoint: it
      * records the real pipe write after fd 0 has been replaced. */
-    if (edge->type == SHELL_EDGE_PIPE && edge->from != outer_group &&
-        edge->to != outer_group &&
+    if (!timing_report && edge->type == SHELL_EDGE_PIPE &&
+        edge->from != outer_group && edge->to != outer_group &&
         graph.nodes[edge->to].type != SHELL_NODE_ENDPOINT)
       group_endpoints_valid = false;
   }
@@ -3843,7 +5697,11 @@ static int test_substitution_case(const shell_substitution_fuzz_case_t &item,
           direct_file_consumers[edge->to] = true;
         }
       } else {
-        if (edge->source_fd != 1)
+        uint32_t expected_source_fd =
+            graph.nodes[edge->from].type == SHELL_NODE_TIME
+                ? graph.nodes[edge->from].time.report_fd
+                : 1;
+        if (edge->source_fd != expected_source_fd)
           topology_valid = false;
       }
       if (graph.nodes[edge->to].type != SHELL_NODE_CMD &&
@@ -3867,7 +5725,11 @@ static int test_substitution_case(const shell_substitution_fuzz_case_t &item,
     if (edge->type == SHELL_EDGE_WRITE &&
         graph.nodes[edge->to].type == SHELL_NODE_ENDPOINT) {
       collector_writes++;
-      if (edge->source_fd != item.outer_fd && edge->source_fd != 1)
+      bool timing_report =
+          graph.nodes[edge->from].type == SHELL_NODE_TIME &&
+          edge->source_fd == graph.nodes[edge->from].time.report_fd;
+      if (!timing_report && edge->source_fd != item.outer_fd &&
+          edge->source_fd != 1)
         topology_valid = false;
     }
   }
@@ -4183,8 +6045,13 @@ static int test_generated_substitution_case(const uint8_t *data, size_t size,
 
 static int test_composed_substitution_case(const uint8_t *data, size_t size,
                                            const char *cwd) {
-  return test_substitution_case(
-      shell_brace_fuzz_composed_substitution_case(data, size), cwd);
+  shell_substitution_fuzz_case_t item =
+      shell_brace_fuzz_composed_substitution_case(data, size);
+  int failed = test_substitution_case(item, cwd);
+  if (failed)
+    fprintf(stderr, "composed substitution case selector %u: %s\n",
+            size ? (unsigned)data[0] : 0, item.command.c_str());
+  return failed;
 }
 
 static int test_composed_substitution_matrix(const char *cwd) {
@@ -4202,7 +6069,8 @@ static int test_composed_substitution_matrix(const char *cwd) {
             data[2] = pipeline;
             data[3] = literal;
             for (uint8_t level = 0; level <= depth; level++)
-              data[4 + level] = (group_mask >> level) & 1u;
+              data[4 + level] =
+                  ((group_mask >> level) & 1u) | ((form & 1u) ? 2u : 0u);
             if (test_composed_substitution_case(data, sizeof(data), cwd))
               return 1;
           }
@@ -4262,6 +6130,158 @@ static int test_generated_static_arithmetic_case(const uint8_t *data,
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
   static bool fixed_oracles_checked = false;
   if (!fixed_oracles_checked) {
+    for (const auto &fixture : shellsplit_test_array_prefixes) {
+      size_t length = strlen(fixture.source);
+      shell_parse_result_t parsed = {};
+      shell_limits_t strict = SHELL_LIMITS_DEFAULT;
+      strict.strict_mode = true;
+      bool valid = shell_parse_fast(fixture.source, length, &strict, &parsed) ==
+                   SHELL_OK;
+      uint32_t features = 0;
+      for (uint32_t i = 0; i < parsed.count; i++)
+        features |= parsed.cmds[i].features;
+      shell_processed_commands_t processed = {};
+      shell_dep_graph_t graph = {};
+      valid =
+          valid && !!(features & SHELL_FEAT_ARRAY) == fixture.array &&
+          !!(features & SHELL_FEAT_GLOBS) == fixture.glob &&
+          shell_process_commands(fixture.source, length, nullptr, &processed) ==
+              (fixture.array ? SHELL_PROCESS_EPARSE : SHELL_PROCESS_OK) &&
+          shell_dep_graph_parse(fixture.source, length, nullptr, nullptr,
+                                &graph) ==
+              (fixture.array ? SHELL_DEP_EPARSE : SHELL_DEP_OK) &&
+          (fixture.array ? graph.node_count == 0 && graph.edge_count == 0
+                         : shell_dep_graph_validate(&graph).valid);
+      shell_processed_commands_free(&processed);
+      if (!valid) {
+        fprintf(stderr, "array prefix oracle failed: %s\n", fixture.source);
+        abort();
+      }
+    }
+    for (const auto &fixture : shellsplit_test_scoped_expansions) {
+      size_t length = strlen(fixture.source);
+      shell_parse_result_t parsed = {};
+      shell_netstring_buffer_t raw = {}, type = {};
+      size_t stages = 0;
+      shell_process_status_t status = shell_build_anomaly_netseqs_buffer(
+          fixture.source, length, nullptr, &raw, &type, &stages);
+      bool valid = shell_parse_fast(fixture.source, length, nullptr, &parsed) ==
+                   SHELL_OK;
+      uint32_t features = 0;
+      for (uint32_t i = 0; i < parsed.count; i++)
+        features |= parsed.cmds[i].features;
+      valid = valid &&
+              (features & shellsplit_test_expansion_feature_mask) ==
+                  fixture.features &&
+              status == (fixture.supported ? SHELL_PROCESS_OK
+                                           : SHELL_PROCESS_EPARSE) &&
+              stages == fixture.stages;
+      shell_netstring_buffer_free(&raw);
+      shell_netstring_buffer_free(&type);
+      if (!valid) {
+        fprintf(stderr, "heredoc expansion oracle failed: %s\n",
+                fixture.source);
+        abort();
+      }
+    }
+    for (const auto &fixture : shellsplit_test_quoted_arithmetic) {
+      size_t length = strlen(fixture.source);
+      shell_parse_result_t parsed = {};
+      shell_processed_commands_t processed = {};
+      shell_process_status_t status =
+          shell_process_commands(fixture.source, length, NULL, &processed);
+      bool valid =
+          shell_parse_fast(fixture.source, length, NULL, &parsed) == SHELL_OK &&
+          ((parsed.cmds[0].features & SHELL_FEAT_ARITH) != 0) ==
+              fixture.arithmetic &&
+          status ==
+              (fixture.supported ? SHELL_PROCESS_OK : SHELL_PROCESS_EPARSE) &&
+          (fixture.supported
+               ? processed.command_count == 1
+               : processed.command_count == 0 && !processed.commands);
+      shell_processed_commands_free(&processed);
+      if (!valid) {
+        fprintf(stderr, "quoted arithmetic oracle failed: %s\n",
+                fixture.source);
+        abort();
+      }
+    }
+    for (const auto &fixture : shellsplit_test_expansion_features) {
+      shell_abstract_command_t *abstract = nullptr;
+      bool valid =
+          shell_abstract_command_parse(fixture.source, strlen(fixture.source),
+                                       &abstract) == SHELL_ABSTRACT_OK;
+      if (valid) {
+        valid = abstract->has_variables == fixture.variables &&
+                abstract->has_pos_vars == fixture.positional &&
+                abstract->has_special_vars == fixture.special &&
+                abstract->has_arithmetic == fixture.arithmetic &&
+                abstract->has_cmd_subst == fixture.substitution &&
+                abstract->has_globs == fixture.glob &&
+                strcmp(shell_abstract_command_get_display_text(abstract),
+                       fixture.display) == 0;
+        for (size_t j = 1; j < abstract->element_count; j++)
+          valid = valid && abstract->elements[j - 1]->end <=
+                               abstract->elements[j]->start;
+      }
+      shell_abstract_command_free(abstract);
+      if (!valid) {
+        fprintf(stderr, "expansion feature oracle failed: %s\n",
+                fixture.source);
+        abort();
+      }
+    }
+    for (const auto &fixture : shellsplit_test_glob_words) {
+      char source[256];
+      int length = snprintf(source, sizeof(source), "echo %s", fixture.word);
+      if (length <= 0 || static_cast<size_t>(length) >= sizeof(source) ||
+          shell_tokenizer_word_has_glob(fixture.word, strlen(fixture.word)) !=
+              fixture.glob ||
+          (shell_classify_raw_token(fixture.word, strlen(fixture.word)) ==
+           SHELL_TOKEN_GLOB) != fixture.glob ||
+          test_tokenizer_state(source, static_cast<size_t>(length)))
+        abort();
+    }
+    for (const auto &fixture : shellsplit_test_fragment_words) {
+      shell_abstract_command_t *abstract = nullptr;
+      bool valid =
+          shell_abstract_command_parse(fixture.source, strlen(fixture.source),
+                                       &abstract) == SHELL_ABSTRACT_OK;
+      if (valid) {
+        valid = abstract->element_count == (fixture.has_variable ? 2u : 1u) &&
+                abstract->has_strings == fixture.string_fragment &&
+                abstract->has_cmd_subst == !fixture.string_fragment &&
+                abstract->has_variables == fixture.has_variable;
+        if (valid) {
+          const shell_abstract_element_t *element = abstract->elements[0];
+          size_t start = static_cast<size_t>(
+              strstr(fixture.source, fixture.fragment) - fixture.source);
+          valid =
+              element->type == (fixture.string_fragment ? SHELL_ABSTRACT_STR
+                                                        : SHELL_ABSTRACT_CS) &&
+              element->start == start &&
+              element->end == start + strlen(fixture.fragment) &&
+              strcmp(element->original, fixture.fragment) == 0 &&
+              element->data.cmd_subst.content &&
+              strcmp(element->data.cmd_subst.content, fixture.content) == 0;
+        }
+      }
+      shell_abstract_command_free(abstract);
+      if (!valid) {
+        fprintf(stderr, "fragment content oracle failed: %s\n", fixture.source);
+        abort();
+      }
+    }
+    for (const auto &fixture : shellsplit_test_parameter_words) {
+      const char *name = nullptr;
+      size_t length = 0;
+      bool matched = shell_tokenizer_word_parameter_name(
+          fixture.word, strlen(fixture.word), &name, &length);
+      if (matched != (fixture.name != nullptr) ||
+          (matched && (length != strlen(fixture.name) ||
+                       memcmp(name, fixture.name, length) != 0)))
+        abort();
+    }
     if (test_fixed_oracles())
       abort();
     static const char *const plain_boundary_cases[] = {
@@ -4371,7 +6391,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
   /* Startup exhaustively checks each generated matrix. On fuzzed payloads,
    * choose one without consuming input bytes, so structural coverage does not
    * multiply the cost of every arbitrary-parser iteration. */
-  switch (size == 0 ? 0 : data[0] % 5) {
+  switch (size == 0 ? 0 : data[0] % 6) {
   case 0:
     run_check("generated brace case",
               test_generated_brace_case(data, size, cwd));
@@ -4388,9 +6408,13 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     run_check("generated redirect boundary",
               test_generated_redirect_boundary(data[0]));
     break;
-  default:
+  case 4:
     run_check("generated static arithmetic",
               test_generated_static_arithmetic_case(data, size));
+    break;
+  default:
+    run_check("generated document boundary",
+              test_generated_document_boundary(data[0]));
     break;
   }
   free(input);

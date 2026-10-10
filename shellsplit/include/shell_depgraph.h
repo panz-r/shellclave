@@ -19,11 +19,15 @@
 #ifndef SHELL_DEPGRAPH_H
 #define SHELL_DEPGRAPH_H
 
+#include "shell_contract.h"
+
 #include <limits.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+
+#include "shell_tokenizer.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -80,6 +84,8 @@ typedef enum {
    * Its incoming WRITE edges identify producer descriptors; its outgoing
    * SUBST edge identifies the shell execution context that consumes it. */
   SHELL_NODE_ENDPOINT,
+  /* Shell-owned Bash `time` operation for one pipeline. */
+  SHELL_NODE_TIME,
 } shell_dep_node_type_t;
 
 typedef enum {
@@ -139,6 +145,9 @@ typedef enum {
    * and persistent numeric `exec` descriptors. The edge records that
    * source-order setup transition without inventing a byte route. */
   SHELL_EDGE_FD_CLOSE = 14,
+  /* TIME node to the command/group endpoint that roots the measured
+   * pipeline. This is structural, not a byte-flow edge. */
+  SHELL_EDGE_TIME = 15,
 } shell_dep_edge_type_t;
 
 typedef enum {
@@ -180,12 +189,13 @@ typedef enum {
  * This includes temporary state for reconstructing inherited descriptor
  * routes at compound-group expansion points. Obtain the required maximum
  * size and alignment with shell_dep_workspace_size() and
- * shell_dep_workspace_alignment(). Command and initial-CWD inputs may overlap
- * each other because both are read-only, but neither may overlap the writable
- * workspace or shell_dep_graph_t output. A NULL, misaligned, or undersized
- * workspace causes
- * SHELL_DEP_EWORKSPACE rather than a hidden allocation; invalid overlap is
- * rejected with SHELL_DEP_EINPUT.
+ * shell_dep_workspace_alignment(). The limits object, command and initial-CWD
+ * inputs, writable workspace, and shell_dep_graph_t output must have storage
+ * and lifetimes appropriate to their roles; no writable span may overlap a
+ * borrowed input or another writable object. A NULL, misaligned, or undersized
+ * workspace causes (for nonempty executable source, including a collapsible cd)
+ * SHELL_DEP_EWORKSPACE rather than a hidden allocation. Storage aliasing is
+ * invalid API use and is not checked at runtime.
  */
 typedef struct {
   uint32_t max_nodes;
@@ -195,8 +205,9 @@ typedef struct {
   /* cd_as_cmd: when true, a statically recognized current-shell `cd` (direct
    *            or through `command`/`builtin`) produces a CMD node with a CWD
    *            edge. When false (default), a plain `cd` only changes tracked
-   *            CWD; redirects or executable substitutions still require a
-   *            CMD endpoint so their effects remain visible. */
+   *            CWD; redirects, executable substitutions, local pipeline/
+   *            background execution, and conditional status dependencies still
+   *            require a CMD endpoint so their effects remain visible. */
   bool cd_as_cmd;
   void *workspace;
   size_t workspace_size;
@@ -227,10 +238,11 @@ size_t shell_dep_workspace_alignment(void);
  * `limits` may be NULL; the current fixed-capacity implementation returns the
  * same maximum size for every valid limits configuration. The size is
  * independent of command text, so callers can reuse one buffer across
- * evaluations. Returns false only for invalid output arguments.
+ * evaluations. `workspace_size` is required and receives the size; the current
+ * fixed-capacity sizing operation always succeeds.
  */
 bool shell_dep_workspace_size(const shell_dep_limits_t *limits,
-                              size_t *workspace_size);
+                              size_t *workspace_size) SHELL_NONNULL(2);
 
 /**
  * Fixed-size buffer for unique CWD strings.
@@ -276,7 +288,15 @@ typedef struct {
    * odd-count status inversion after all members have run. */
   uint32_t pipeline_negation_count;
   bool pipeline_negated;
-  bool cwd_known;    /* False when branch composition makes CWD ambiguous */
+  /* Bash `time` mode for this command's local syntactic pipeline, or
+   * SHELL_PIPE_TIME_NONE. Timing applied to an enclosing compound is retained
+   * on that GROUP node instead. */
+  shell_pipeline_time_mode_t pipeline_time_mode;
+  /* Stable ownership of the effective timing operation. Zero means none;
+   * otherwise this is the owning TIME node index plus one. The biased form
+   * keeps zero-initialized public graph values valid. */
+  uint32_t pipeline_time_id;
+  bool cwd_known; /* Known across paths that reach this command's expansion */
   bool cwd_absolute; /* False when CWD is rooted at a relative initial path */
   /* Effective fd-0 and fd-1 pipeline endpoint pairs after redirects and
    * descriptor copies. Both fields in a pair are UINT32_MAX when that stream
@@ -298,6 +318,16 @@ typedef struct {
   uint32_t pipeline_negation_count;
   /* Effective odd-count inversion for this compound pipeline member. */
   bool pipeline_negated;
+  /* Effective timing mode for this compound's local syntactic pipeline. A
+   * later compound member inherits the mode without becoming a direct timing
+   * target; only an incoming TIME edge identifies the CMD/GROUP carrying the
+   * reserved prefix. Enclosed CMD nodes keep their own local timing metadata.
+   */
+  shell_pipeline_time_mode_t pipeline_time_mode;
+  /* Effective TIME owner, encoded as its node index plus one; zero means no
+   * timing operation. Unlike the incoming TIME edge, this also associates
+   * later syntactic pipeline members whose byte route may be redirected. */
+  uint32_t pipeline_time_id;
 } shell_dep_group_t;
 
 /**
@@ -306,15 +336,86 @@ typedef struct {
  * An ENDPOINT normally has incoming WRITE edges and outgoing SUBST edges.
  * The parser may also use internal endpoint forms: a terminal pipe whose
  * reader was replaced by a later redirect has only incoming PIPE edges, and
- * an unconnected named-FD process substitution retains one FD_OPEN setup edge
- * until a later symbolic descriptor use materializes byte flow. Descriptor
- * ownership is carried by those edges, avoiding a second, ambiguous
+ * a process-substitution pipe can retain only readers or only writers.
+ * Numeric reads use SUBST and writes use WRITE, including both for `<>`;
+ * persistent/named descriptors retain FD_OPEN setup until a later use adds
+ * byte flow. No edge invents a producer/consumer in the disconnected child.
+ * Descriptor ownership is carried by those edges, avoiding a second, ambiguous
  * descriptor field on the endpoint itself. `reserved` is internal parser
  * state; callers must treat it as opaque.
  */
 typedef struct {
   uint8_t reserved;
 } shell_dep_endpoint_t;
+
+/** Effective destination class for Bash's shell-owned timing report. */
+typedef enum {
+  /* The report leaves the parsed graph through report_target_fd. */
+  SHELL_TIME_REPORT_EXTERNAL = 0,
+  /* One outgoing WRITE, APPEND, PIPE, or SUBST edge identifies the
+   * destination. */
+  SHELL_TIME_REPORT_GRAPH,
+  /* The effective report descriptor is closed. */
+  SHELL_TIME_REPORT_CLOSED,
+  /* The descriptor exists, but has no write-capable route (for example,
+   * after `exec 2<input`), or the timing operation is provably unreachable
+   * and produces no report. This is distinct from an explicit close. */
+  SHELL_TIME_REPORT_UNAVAILABLE,
+  /* The route could not be retained. Valid only on a truncated graph. */
+  SHELL_TIME_REPORT_UNKNOWN,
+  /* Two or more destinations or descriptor aliases are retained, including
+   * runtime-dependent alternatives. Inspect
+   * report_route_flags, report_external_fds, and every outgoing WRITE,
+   * APPEND, PIPE, or SUBST report edge. */
+  SHELL_TIME_REPORT_MULTIPLE,
+} shell_dep_time_report_route_t;
+
+typedef enum {
+  SHELL_TIME_REPORT_ROUTE_NONE = 0,
+  SHELL_TIME_REPORT_ROUTE_EXTERNAL = 1 << 0,
+  SHELL_TIME_REPORT_ROUTE_GRAPH = 1 << 1,
+  SHELL_TIME_REPORT_ROUTE_CLOSED = 1 << 2,
+  SHELL_TIME_REPORT_ROUTE_UNAVAILABLE = 1 << 3,
+  SHELL_TIME_REPORT_ROUTE_UNKNOWN = 1 << 4,
+} shell_dep_time_report_route_flags_t;
+
+/* Conditional descriptor lists can leave a timing report routed through more
+ * than one inherited descriptor. This bounded public list is exact unless the
+ * graph is marked truncated. */
+#define SHELL_DEP_TIME_MAX_EXTERNAL_FDS 16
+
+/** Bash `time` pipeline metadata. The source span covers the measured
+ * pipeline (without requiring callers to reconstruct the reserved prefix).
+ * Exactly one TIME edge targets the directly measured CMD or GROUP, whose
+ * pipeline_time_mode equals mode. Every retained member of that syntactic
+ * pipeline identifies this node through pipeline_time_id even when descriptor
+ * redirection means there is no corresponding command-to-command PIPE edge.
+ * A directly timed compound is owned by its GROUP node; flattened inner CMD
+ * nodes retain only their own local timing and never inherit that direct TIME
+ * edge.
+ * Construction assigns that relation from the parser's pipeline ranges;
+ * callers can validate its retained graph topology, but cannot reconstruct
+ * source pipeline membership from routed edges alone.
+ * The timing report is produced by the shell on report_fd. Its effective
+ * destination is explicit. A deterministic destination retains the compact
+ * report_route/report_target_fd summary. MULTIPLE uses report_route_flags,
+ * every outgoing WRITE/APPEND/PIPE/SUBST edge, and report_external_fds to
+ * retain all statically possible destinations. CLOSED contributes a flag but
+ * no edge.
+ * CLOSED means an explicit close; UNAVAILABLE means the effective descriptor
+ * lacks a write-capable route. UNKNOWN remains reserved for capacity
+ * truncation. */
+typedef struct {
+  const char *start;
+  uint32_t length;
+  shell_pipeline_time_mode_t mode;
+  uint32_t report_fd;
+  uint32_t report_target_fd;
+  shell_dep_time_report_route_t report_route;
+  uint32_t report_route_flags;
+  uint32_t report_external_fd_count;
+  uint32_t report_external_fds[SHELL_DEP_TIME_MAX_EXTERNAL_FDS];
+} shell_dep_time_t;
 
 /**
  * DOC node - a data artifact
@@ -368,6 +469,7 @@ typedef struct {
     shell_dep_doc_t doc;
     shell_dep_group_t group;
     shell_dep_endpoint_t endpoint;
+    shell_dep_time_t time;
   };
 } shell_dep_node_t;
 
@@ -431,16 +533,90 @@ typedef struct {
  * Returns SHELL_DEP_EPARSE when that limit is exceeded.
  * Returns SHELL_DEP_ETRUNC and sets SHELL_DEP_STATUS_TRUNCATED when a caller
  * limit or fixed parser limit prevents the complete graph from being stored.
+ * A capacity stop may retain a consistent partial graph. If construction or
+ * descriptor resolution cannot complete safely, counts and CWD storage length
+ * are cleared instead; the status remains TRUNCATED, never ERROR.
  * On input or parse errors, writable output counts are cleared and
  * SHELL_DEP_STATUS_ERROR is set.
  *
  * The graph models simple-command lists, pipelines, and brace/subshell groups.
- * Control compounds (including function declarations, `select`, and `coproc`),
- * shell-semantic array forms (including array element targets), and unmodeled
- * current-shell forms (`mapfile`/`readarray`, `wait -p`, and mutating
- * arithmetic expansions) return SHELL_DEP_EPARSE, as do unmodeled Bash `[[ …
+ * Bash's reserved `time` prefix produces one TIME node and structural TIME
+ * edge to the measured pipeline root. `report_fd` identifies the shell-owned
+ * timing report descriptor; a distinct WRITE, APPEND, PIPE, or substitution
+ * edge records a concrete report route. Path-dependent routes use
+ * SHELL_TIME_REPORT_MULTIPLE without discarding alternatives. The TIME edge
+ * itself does not claim byte flow.
+ * Proven unreachable stages retain syntax and structural relationships, but
+ * have no effective assignment, descriptor setup, byte-flow, or substitution
+ * effects. Runtime-unknown branches retain possible effects; this is not
+ * runtime execution or general builtin evaluation. Unreachable timing nodes
+ * retain their TIME topology with an unavailable report route. Malformed and
+ * unsupported syntax is rejected even in unreachable stages.
+ * Runtime-dependent redirect setup adds possible failure to a proved command
+ * or compound outcome, never success before negation. A statically known
+ * descriptor failure preserves argument and assignment-value expansions,
+ * which precede a simple command's redirects even when their words appear
+ * later in the source. It also preserves earlier redirect operand expansions
+ * and setup, but suppresses later redirect operands and the command or
+ * compound body. A
+ * compound's setup failure bypasses its negation and retains its entry
+ * directory rather than a directory reached by its body; a simple command's
+ * returning setup failure is negated normally.
+ * Unquoted named-FD duplication operands follow the current shell's IFS.
+ * A proved all-decimal separator set produces a known setup failure. Partial
+ * or unresolved decimal splitting returns SHELL_DEP_EPARSE rather than
+ * guessing a numeric descriptor. Double-quoted `$name` / `${name}` operands
+ * bypass splitting and retain their ordinary binding contract. IFS changes
+ * follow the same outcome and scope lifetime as descriptor bindings.
+ * Failed setup restores numeric redirects and closes to their entry state,
+ * including those on descriptor-only exec. Completed named allocations can
+ * survive a later setup failure. Descriptor existence is tracked separately
+ * from read/write capability: duplicating a live read-only FD succeeds even
+ * though subsequent writes, including timing reports, are unavailable.
+ * CWD tracking follows execution outcomes, including commands collapsed
+ * by cd_as_cmd=false: unreachable transitions leave it unchanged. A conditional
+ * brace body tracks its own executing-path directory; its continuation keeps
+ * a known CWD only when paths reaching that continuation agree. Terminated
+ * paths do not contribute; input-unit abort paths retain their directory when
+ * recovery reaches a later complete input unit. A supported static absolute
+ * `cd` can restore a known directory after an ambiguous or dynamic transition.
+ * No filesystem success is inferred beyond the existing lexical cd model.
+ * Subshells, background stages, pipelines and substitutions never export CWD
+ * changes. Skipped descriptor-duplication operands retain nested substitution
+ * syntax without inventing a FILE resource or an effective
+ * descriptor/substitution edge. Active runtime-expanded duplication targets
+ * remain unsupported. Control compounds (including function declarations,
+ * `select`, and `coproc`), shell-semantic array forms (including array element
+ * targets), and unmodeled current-shell forms (`mapfile`/`readarray`, `wait
+ * -p`, Readline-enabled `read -e`/`-E`, and mutating arithmetic expansions)
+ * return SHELL_DEP_EPARSE, as do
+ * active parameter-assignment operators (=/:=), prompt transformations
+ * (`${value@P}`), and actual indirect dereferences (`${!ref}`). These can
+ * mutate bindings or evaluate value data as shell syntax without a modeled
+ * runtime source. Ordinary expansion and prefix-name enumeration do not
+ * perform that re-evaluation and remain supported. The same rejection applies
+ * to `test`/`[` -v array-variable lookups and unresolved lookup operands or
+ * expression roles. Quoting such a target does not disable its subscript
+ * evaluation. Static scalar queries and non-evaluating string/file predicates
+ * remain supported; expression argument cardinality must be known.
+ * `getopts` likewise rejects integer/protected or runtime-expanded destinations
+ * and unknown operand cardinality before its target. Quoted runtime optstrings
+ * must leave every possible target position safe (including an expanded --).
+ * Ordinary scalar destinations and static invalid-target error paths remain
+ * supported. These checks belong to the shared source-semantics boundary, not
+ * descriptor-route validation.
+ * Unmodeled Bash `[[ …
  * ]]`,
- * `(( … ))`, `time`, `$"…"`, and `;&` / `;;&` forms.
+ * `(( … ))`, `$"…"`, and `;&` / `;;&` forms are also rejected. Non-ASCII ANSI-C
+ * Unicode escapes are also rejected because their bytes depend on an unmodeled
+ * execution locale. ASCII Unicode escapes and byte escapes remain supported.
+ * Active legacy backtick bodies requiring Bash's escape-layer removal return
+ * SHELL_DEP_EPARSE: raw borrowed spans cannot model their decoded nested
+ * source. This covers escapes before $, backticks, backslashes, and newlines,
+ * plus double quotes under enclosing double quoting. Ordinary backticks and
+ * escapes whose slash survives into the nested shell remain supported; quoted
+ * literal backticks are data. Use $(...) for nested substitutions without this
+ * layer.
  *
  * Command, backtick, process, and Bash file-command substitutions are
  * represented as dynamic I/O: direct SHELL_EDGE_SUBST edges when one
@@ -473,12 +649,12 @@ typedef struct {
  * stdout as pathname bytes. Command substitutions within that filename still
  * supply pathname bytes through SUBST_DYNAMIC_NAME edges.
  * A cross-direction pair such as `< >(consumer)` or `> <(producer)` still
- * evaluates and retains the nested graph, but the shell syntax establishes no
- * byte route between that nested command and the redirect. `<>` is modeled as
- * read/write: `<> <(producer)` supplies its input side, while `<> >(consumer)`
- * establishes its known write side through an ENDPOINT to the consumer's
- * stdin. Its default descriptor is fd 0; neither form fabricates the opposite
- * descriptor direction.
+ * installs a pipe descriptor and retains the nested graph. It establishes no
+ * byte transfer between those peers: they share a resource with two readers
+ * or two writers. `<>` installs both read and write capabilities on the same
+ * ENDPOINT, independently of which side the nested command exposes. Its
+ * default descriptor is fd 0. Every installation replaces the previous
+ * descriptor, including cross-direction pairs and disconnected child streams.
  *
  * READ, WRITE, APPEND, and PIPE edges model the effective descriptor bindings
  * after redirections, descriptor duplication, and descriptor closes have
@@ -504,26 +680,42 @@ typedef struct {
  * retain an open named binding in the current shell; redirect-only and
  * assignment-only commands do not. Subshell groups and groups executing as a
  * pipeline member or background job retain bindings only in their private
- * execution scope. Leading assignments on a command are temporary: they do
- * not replace a visible descriptor-variable binding while that command's
- * redirects or nested substitutions expand. Assignment-only scalar names
- * follow shell lexical spelling, so `f\\\nd=value` and `fd+=value` still
- * identify `fd`. A non-`exec` close is
- * local, whereas `exec` persists a close. Commands that mutate `shopt`
- * `varredir_close`, `lastpipe`, or `expand_aliases`, POSIX mode, or statically
- * recognized current-shell metaprogramming builtins (`eval`, `.`, `source`,
- * `trap`, `alias`, `unalias`, `fc`, and `enable`), are rejected as unsupported,
- * so this lifetime and pipeline-scope invariant is never silently changed.
- * The executor must start Bash in the documented clean noninteractive state.
- * Start it with `POSIXLY_CORRECT` absent (not merely empty), then make that
- * variable readonly before evaluating submitted source. `bash -p -c ...` is
- * the supported basis: privileged mode ignores `BASH_ENV`, `BASHOPTS`, and
+ * execution scope. A local pipeline/background command never publishes its
+ * mutations into an enclosing private group. A conditional unset or
+ * reassignment invalidates the binding proof for later unconditional uses; an
+ * explicit reallocation establishes a new binding. Leading assignments on a
+ * command are temporary: they do not replace a visible descriptor-variable
+ * binding while that command's redirects or nested substitutions expand.
+ * Opening a named file/document route first consumes Bash's lowest free
+ * descriptor for the resource, then allocates the retained named descriptor
+ * at or above fd 10. Consequently, a temporarily closed fd 10 is reused by
+ * the named descriptor only when some lower descriptor can hold the resource;
+ * runtime-dependent inherited low-descriptor occupancy is retained as route
+ * alternatives. Named duplication needs no temporary resource descriptor.
+ * Assignment-only scalar names follow shell lexical spelling, so `f\\\nd=value`
+ * and `fd+=value` still identify `fd`. A non-`exec` close is local, whereas
+ * `exec` persists a close. Commands that mutate shell option state through
+ * `set` or `shopt`, or statically recognized
+ * current-shell metaprogramming builtins (`eval`, `.`, `source`, `trap`,
+ * `alias`, `unalias`, `fc`, `let`, `enable`, `compgen`, `complete`, `compopt`,
+ * and `bind`), are rejected as unsupported,
+ * so this lifetime and pipeline-scope invariant is never silently changed. The
+ * executor must start Bash in the documented clean noninteractive state. Start
+ * it with `POSIXLY_CORRECT` absent (not merely empty), clear `BASH_COMPAT` and
+ * `BASH_XTRACEFD`, then make all three variables readonly before evaluating
+ * submitted source. `bash -p -c ...` is the
+ * supported basis: privileged mode ignores `BASH_ENV`, `BASHOPTS`, and
  * `SHELLOPTS`, and declines imported shell functions that could shadow a
  * modelled builtin such as `exec`. An equivalent launcher must establish the
  * same option and command-lookup state before source validation, including no
  * startup aliases or traps, no disabled or shadowed modelled builtins, and a
- * readonly unset `POSIXLY_CORRECT`. A runtime-expanded command word is
+ * frozen `POSIXLY_CORRECT`, `BASH_COMPAT`, and `BASH_XTRACEFD`. A
+ * runtime-expanded command word is
  * intentionally not promoted to one of these builtin roles.
+ * Completion and Readline can expand input data as shell source or execute
+ * registered callbacks even in a fresh noninteractive shell with terminal
+ * input. Ordinary `read` remains supported; e/E bytes used as option operands
+ * or variable names are not Readline selectors.
  *
  * Shell builtin roles use a static quote-removed spelling: `e'x'ec` and
  * `com'mand' -p e'x'ec` have the same descriptor semantics as their plain
@@ -543,11 +735,20 @@ typedef struct {
  * command word sees the descriptor state before that simple command's redirect
  * list. An expansion in a redirect operand, process substitution, or
  * here-string operand, or expandable heredoc instead sees only the preceding
- * redirects in that list. Builtins that may rewrite descriptor variables
- * do so after their own redirects have expanded and taken effect; their
- * mutations invalidate affected bindings for later commands, or every named
- * binding when the target is dynamic. An assignment-only command can instead
- * change a descriptor variable before expanding its redirect operand.
+ * redirects in that list. Known setup failure suppresses later redirect
+ * expansion effects, including parameter/arithmetic failures without a nested
+ * command substitution; it does not suppress earlier argv/RHS expansions.
+ * Conditional read/write route alternatives retain
+ * their original resources across these recursive snapshots. Byte-flow uses
+ * are emitted only from the final effective descriptor state, not from
+ * aliases subsequently replaced or closed; earlier input redirects can still
+ * feed a substitution evaluated in a later operand. Recursive joins reserve
+ * those imported edges before copying child topology, and return truncation
+ * when the bounded capacity is exhausted. Builtins that may rewrite descriptor
+ * variables do so after their own redirects have expanded and taken effect;
+ * their mutations invalidate affected bindings for later commands, or every
+ * named binding when the target is dynamic. An assignment-only command can
+ * instead change a descriptor variable before expanding its redirect operand.
  *
  * Subshell extraction tracks simple single/double quotes and odd/even
  * backslash escapes while finding delimiters. It is not a complete shell
@@ -556,16 +757,17 @@ typedef struct {
  * `limits` must provide the caller-owned workspace described by
  * shell_dep_limits_t; otherwise this returns SHELL_DEP_EWORKSPACE with `out`
  * cleared. `initial_cwd` is a borrowed NUL-terminated path; NULL selects
- * `"."`. `cmd` and `initial_cwd` may overlap because both are read-only, but
- * neither may overlap `out` or the workspace. Invalid overlap is rejected
- * with SHELL_DEP_EINPUT before any writable span is changed.
+ * `"."`. Borrowed inputs and limits must remain alive and unchanged throughout
+ * the call. They must not overlap `out` or the workspace, and those two
+ * writable objects must not overlap each other. Violating these storage
+ * preconditions is invalid API use and is not checked at runtime.
  * Parsing errors that are detected before route resolution do not require
  * workspace.
  */
-shell_dep_error_t shell_dep_graph_parse(const char *cmd, size_t cmd_len,
-                                        const char *initial_cwd,
-                                        const shell_dep_limits_t *limits,
-                                        shell_dep_graph_t *out);
+shell_dep_error_t
+shell_dep_graph_parse(const char *cmd, size_t cmd_len, const char *initial_cwd,
+                      const shell_dep_limits_t *limits, shell_dep_graph_t *out)
+    SHELL_NONNULL(1, 5);
 
 const char *shell_dep_edge_type_name(shell_dep_edge_type_t type);
 const char *shell_dep_node_type_name(shell_dep_node_type_t type);
@@ -574,28 +776,30 @@ const char *shell_dep_doc_kind_name(shell_dep_doc_kind_t kind);
 /** Measure the logical value bytes of a document without allocating. For a
  * `<<-` heredoc this removes all leading tabs from each physical body line. */
 bool shell_dep_doc_content_length(const shell_dep_doc_t *doc,
-                                  size_t *content_length);
+                                  size_t *content_length) SHELL_NONNULL(1, 2);
 
 /** Write the logical value bytes of a document into caller storage. Measure
  * first; on failure `written` is zero and no partial content is exposed. A
- * NULL destination is accepted only for empty logical content. The complete
- * destination buffer must not overlap the document's borrowed value span;
- * overlap is rejected before either span is modified. */
+ * NULL destination is accepted only for empty logical content. The destination
+ * must not overlap the document's borrowed value span; this caller precondition
+ * is not checked at runtime. */
 bool shell_dep_doc_write_content(const shell_dep_doc_t *doc, char *destination,
-                                 size_t destination_size, size_t *written);
+                                 size_t destination_size, size_t *written)
+    SHELL_NONNULL(1, 4);
 
 /** Measure or write an ENVVAR document's quote-removed identifier. The write
  * API is failure-atomic and does not add a NUL terminator. Other document
- * kinds and malformed assignment spans are rejected. The complete destination
- * buffer must not overlap the borrowed assignment word, including its value;
- * overlap is rejected before either span is modified. */
+ * kinds and malformed assignment spans are rejected. The destination must not
+ * overlap the borrowed assignment word, including its value; this caller
+ * precondition is not checked at runtime. */
 bool shell_dep_doc_env_name_length(const shell_dep_doc_t *doc,
-                                   size_t *name_length);
+                                   size_t *name_length) SHELL_NONNULL(1, 2);
 bool shell_dep_doc_write_env_name(const shell_dep_doc_t *doc, char *destination,
-                                  size_t destination_size, size_t *written);
+                                  size_t destination_size, size_t *written)
+    SHELL_NONNULL(1, 2, 4);
 /** Compare an ENVVAR document's logical identifier without materializing it. */
 bool shell_dep_doc_env_name_equals(const shell_dep_doc_t *doc, const char *name,
-                                   size_t name_length);
+                                   size_t name_length) SHELL_NONNULL(1, 2);
 
 /** Write a static FILE document's lexical path identity into caller storage.
  * The result combines the document's recorded execution CWD with its decoded
@@ -606,20 +810,29 @@ bool shell_dep_doc_env_name_equals(const shell_dep_doc_t *doc, const char *name,
  * paths with an unknown CWD return false. `absolute` distinguishes an actual
  * absolute identity from one rooted at a relative initial CWD; compare it
  * along with the output bytes. `written` excludes the trailing NUL. On
- * failure outputs are cleared and the destination is unchanged. */
+ * failure outputs are cleared and the destination is unchanged.
+ * The caller supplies consistent graph/document metadata: when cwd_known is
+ * true, cwd_offset references an installed, complete NUL-terminated entry in
+ * the graph's CWD pool. Metadata and source spans remain immutable during
+ * the call; destination and outputs must not overlap their storage. This
+ * function tests path availability and output capacity, not graph integrity.
+ * Use shell_dep_graph_validate() if validating an externally supplied graph. */
 bool shell_dep_doc_file_identity_write(const shell_dep_graph_t *graph,
                                        const shell_dep_doc_t *doc,
                                        char *destination,
                                        size_t destination_size, size_t *written,
-                                       bool *absolute);
+                                       bool *absolute)
+    SHELL_NONNULL(1, 2, 3, 5, 6);
 
 /**
  * Dump graph to FILE* for debugging.
  */
-void shell_dep_graph_dump(const shell_dep_graph_t *g, FILE *fp);
+void shell_dep_graph_dump(const shell_dep_graph_t *g, FILE *fp)
+    SHELL_NONNULL(1, 2);
 
 /**
  * Validate graph integrity:
+ * - Node, edge, command-token, and CWD-pool counts fit their fixed storage
  * - All edge from/to within node_count bounds
  * - Node and edge types, containment parentage, directions, and descriptor
  *   fields consistent with their documented graph roles
@@ -630,13 +843,31 @@ void shell_dep_graph_dump(const shell_dep_graph_t *g, FILE *fp);
  * forward setup binding: execution→DOC for output, DOC→execution for input,
  * execution→ENDPOINT for process-substitution output, or
  * execution/ENDPOINT→execution for descriptor routing. An internal retained
- * process-substitution endpoint may have only its named FD_OPEN setup until a
- * later descriptor use adds byte flow. It also permits a
+ * process-substitution endpoint may have only FD_OPEN setup, or one-sided
+ * numeric SUBST/WRITE uses, without a connected child stream. It also permits a
  * same-owner execution descriptor duplication. FD_CLOSE is a same-owner
- * CMD/GROUP setup transition with a source descriptor and no target)
+ * CMD/GROUP setup transition with a source descriptor and no target; TIME is
+ * a descriptor-free structural edge from one TIME node to the directly timed
+ * CMD/GROUP endpoint. A TIME node may additionally originate WRITE/APPEND to a
+ * DOC/ENDPOINT, PIPE to a CMD/GROUP/ENDPOINT, or SUBST to a substitution
+ * consumer for its shell-owned report.
+ * Effective timing owners must identify that TIME node; only a graph marked
+ * truncated may retain timed metadata without its owner or report route.
+ * CMD/GROUP pipeline_negated must equal the parity of pipeline_negation_count,
+ * including in a truncated graph. SEQ, AND, OR, PIPE, BACKGROUND, and GROUP
+ * edges together form an acyclic control/containment topology.
+ * This is the validation boundary for malformed numeric graph metadata; the
+ * graph itself must address valid shell_dep_graph_t storage. It does not prove
+ * that retained source pointers address readable spans: source-storage sizes
+ * and lifetimes remain caller preconditions for graph consumers.
+ * This public validator checks graph topology. Exact membership of every
+ * later pipeline stage is source grammar, not recoverable from PIPE edges
+ * after descriptor routing. Construction derives that membership from the
+ * parser-produced ranges; an unchanged parse and its matching immutable
+ * source are caller preconditions, not independently revalidated input.
  */
 shell_dep_graph_validation_t
-shell_dep_graph_validate(const shell_dep_graph_t *g);
+shell_dep_graph_validate(const shell_dep_graph_t *g) SHELL_NONNULL(1);
 
 #ifdef __cplusplus
 }

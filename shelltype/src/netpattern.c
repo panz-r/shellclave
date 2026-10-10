@@ -12,6 +12,23 @@
 #include "alloc.h"
 #include "netpattern.h"
 
+#ifdef SHELLTYPE_TEST_ALLOCATOR
+static _Thread_local size_t cpl_parse_work;
+size_t st_test_cpl_parse_work(void) { return cpl_parse_work; }
+
+/* Include actual length-scan work, not just parser iterations: a suffix
+ * strlen inside an escape/word loop must fail the linear-work regression. */
+static SHELL_NONNULL(1) size_t cpl_test_strlen(const char *text) {
+  size_t length = strlen(text);
+  cpl_parse_work += length + 1;
+  return length;
+}
+#define strlen cpl_test_strlen
+#define CPL_PARSE_WORK(bytes) (cpl_parse_work += (bytes))
+#else
+#define CPL_PARSE_WORK(bytes) ((void)0)
+#endif
+
 typedef struct {
   char *text;
   size_t length;
@@ -30,8 +47,29 @@ static void free_words(cpl_word_t *words, size_t count) {
   free(words);
 }
 
-static bool append_utf8(char *out, size_t *used, uint32_t value) {
+/* Scratch holds three independently bounded components, two structural braces
+ * and a terminator. component_start <= *used and the active component has at
+ * most ST_MAX_TOKEN_LEN - 1 decoded bytes. These helpers enforce that component
+ * limit on untrusted CPL; parse_cpl alone advances structural boundaries. */
+static SHELL_NONNULL(1, 2) bool append_cpl_byte(char *out, size_t *used,
+                                                size_t component_start,
+                                                unsigned char value) {
+  if (*used - component_start == ST_MAX_TOKEN_LEN - 1)
+    return false;
+  out[(*used)++] = (char)value;
+  return true;
+}
+
+static SHELL_NONNULL(1, 2) bool append_utf8(char *out, size_t *used,
+                                            size_t component_start,
+                                            uint32_t value) {
   if (value == 0 || value > 0x10ffff || (value >= 0xd800 && value <= 0xdfff))
+    return false;
+  size_t width = value <= 0x7f     ? 1
+                 : value <= 0x7ff  ? 2
+                 : value <= 0xffff ? 3
+                                   : 4;
+  if (width > ST_MAX_TOKEN_LEN - 1 - (*used - component_start))
     return false;
   if (value <= 0x7f) {
     out[(*used)++] = (char)value;
@@ -51,9 +89,11 @@ static bool append_utf8(char *out, size_t *used, uint32_t value) {
   return true;
 }
 
-static bool hex4(const char *text, uint32_t *value) {
+/* text supplies four readable bytes; parse_cpl checks the source boundary. */
+static SHELL_NONNULL(1, 2) bool hex4(const char *text, uint32_t *value) {
   uint32_t result = 0;
   for (size_t i = 0; i < 4; i++) {
+    CPL_PARSE_WORK(1);
     unsigned char c = (unsigned char)text[i];
     unsigned digit;
     if (c >= '0' && c <= '9')
@@ -96,18 +136,30 @@ static size_t component_length(const char *text, size_t explicit_length) {
   return explicit_length || text[0] == '\0' ? explicit_length : strlen(text);
 }
 
-static st_error_t parse_cpl(const char *cpl, cpl_word_t **out_words,
-                            size_t *out_count) {
+/* cpl is a complete NUL-terminated string. This boundary validates CPL syntax
+ * and resource limits; its outputs are unpublished until parsing succeeds.
+ * Decode each word into bounded scratch, retaining only its exact spelling.
+ * Geometric metadata growth keeps cumulative allocation/copy work linear. */
+static SHELL_NONNULL(1, 2, 3) st_error_t
+    parse_cpl(const char *cpl, cpl_word_t **out_words, size_t *out_count) {
+#ifdef SHELLTYPE_TEST_ALLOCATOR
+  cpl_parse_work = 0;
+#endif
   *out_words = NULL;
   *out_count = 0;
-  if (!cpl || !cpl[0] || strlen(cpl) >= ST_MAX_CPL_LEN)
+  size_t length = strlen(cpl);
+  if (length == 0 || length >= ST_MAX_CPL_LEN)
     return ST_ERR_INVALID;
-  size_t offset = 0, count = 0;
+  size_t offset = 0, count = 0, capacity = 0;
   cpl_word_t *words = NULL;
-  while (cpl[offset]) {
-    while (cpl[offset] == ' ')
+  char word[3 * (ST_MAX_TOKEN_LEN - 1) + 3];
+  while (offset < length) {
+    CPL_PARSE_WORK(1);
+    while (offset < length && cpl[offset] == ' ') {
+      CPL_PARSE_WORK(1);
       offset++;
-    if (!cpl[offset])
+    }
+    if (offset == length)
       break;
     if (count == ST_MAX_CMD_TOKENS)
       goto invalid;
@@ -117,125 +169,134 @@ static st_error_t parse_cpl(const char *cpl, cpl_word_t **out_words,
     bool open_capture = false;
     size_t capture_offset = 0;
     size_t capture_length = 0;
-    size_t capacity = strlen(cpl + offset) * 3 + 1;
-    char *word = malloc(capacity);
-    if (!word)
-      goto memory;
     size_t used = 0;
-    while (cpl[offset] && cpl[offset] != ' ') {
+    size_t component_start = 0;
+    while (offset < length && cpl[offset] != ' ') {
+      CPL_PARSE_WORK(1);
       if (cpl[offset] != '"') {
         unsigned char c = (unsigned char)cpl[offset++];
         if (c < 0x20 || c == 0x7f || c == '\\')
-          goto word_invalid;
+          goto invalid;
         saw_unquoted = true;
         if (c == '{') {
           if (compound || open_capture)
-            goto word_invalid;
+            goto invalid;
           open_capture = true;
-          capture_offset = used + 1;
+          word[used++] = '{';
+          capture_offset = component_start = used;
+          continue;
         } else if (c == '}') {
           if (!open_capture)
-            goto word_invalid;
+            goto invalid;
           open_capture = false;
           compound = true;
           capture_length = used - capture_offset;
+          word[used++] = '}';
+          component_start = used;
+          continue;
         }
-        word[used++] = (char)c;
+        if (!append_cpl_byte(word, &used, component_start, c))
+          goto invalid;
         continue;
       }
 
       saw_quoted = true;
       offset++;
       bool closed = false;
-      while (cpl[offset]) {
+      while (offset < length) {
+        CPL_PARSE_WORK(1);
         unsigned char c = (unsigned char)cpl[offset++];
         if (c == '"') {
           closed = true;
           break;
         }
         if (c < 0x20)
-          goto word_invalid;
+          goto invalid;
         if (c != '\\') {
-          word[used++] = (char)c;
+          if (!append_cpl_byte(word, &used, component_start, c))
+            goto invalid;
           continue;
         }
+        if (offset == length)
+          goto invalid;
         char escape = cpl[offset++];
-        if (!escape)
-          goto word_invalid;
         switch (escape) {
         case '"':
-          word[used++] = '"';
+          c = '"';
           break;
         case '\\':
-          word[used++] = '\\';
+          c = '\\';
           break;
         case 'b':
-          word[used++] = '\b';
+          c = '\b';
           break;
         case 'f':
-          word[used++] = '\f';
+          c = '\f';
           break;
         case 'n':
-          word[used++] = '\n';
+          c = '\n';
           break;
         case 'r':
-          word[used++] = '\r';
+          c = '\r';
           break;
         case 't':
-          word[used++] = '\t';
+          c = '\t';
           break;
         case 'x': {
-          if (!cpl[offset] || !cpl[offset + 1])
-            goto word_invalid;
+          if (length - offset < 2)
+            goto invalid;
           int high = hex_digit((unsigned char)cpl[offset]);
           int low = hex_digit((unsigned char)cpl[offset + 1]);
           if (high < 0 || low < 0)
-            goto word_invalid;
+            goto invalid;
           offset += 2;
-          word[used++] = (char)((high << 4) | low);
+          c = (unsigned char)((high << 4) | low);
           break;
         }
         case 'u': {
           uint32_t value;
-          if (strlen(cpl + offset) < 4 || !hex4(cpl + offset, &value))
-            goto word_invalid;
+          if (length - offset < 4 || !hex4(cpl + offset, &value))
+            goto invalid;
           offset += 4;
           if (value >= 0xd800 && value <= 0xdbff) {
             uint32_t low;
-            if (cpl[offset] != '\\' || cpl[offset + 1] != 'u' ||
-                strlen(cpl + offset + 2) < 4 || !hex4(cpl + offset + 2, &low) ||
+            if (length - offset < 6 || cpl[offset] != '\\' ||
+                cpl[offset + 1] != 'u' || !hex4(cpl + offset + 2, &low) ||
                 low < 0xdc00 || low > 0xdfff)
-              goto word_invalid;
+              goto invalid;
             offset += 6;
             value = 0x10000 + ((value - 0xd800) << 10) + (low - 0xdc00);
           }
-          if (!append_utf8(word, &used, value))
-            goto word_invalid;
-          break;
+          if (!append_utf8(word, &used, component_start, value))
+            goto invalid;
+          continue;
         }
         default:
-          goto word_invalid;
+          goto invalid;
         }
+        if (!append_cpl_byte(word, &used, component_start, c))
+          goto invalid;
       }
       if (!closed)
-        goto word_invalid;
+        goto invalid;
     }
     if ((used == 0 && !saw_quoted) || open_capture ||
         (saw_quoted && saw_unquoted && !compound))
-      goto word_invalid;
-    if (used >= ST_MAX_TOKEN_LEN) {
-    word_invalid:
-      free(word);
       goto invalid;
-    }
     word[used] = '\0';
-    cpl_word_t *grown = realloc(words, (count + 1) * sizeof(*words));
-    if (!grown) {
-      free(word);
-      goto memory;
+    if (count == capacity) {
+      /* The 128-word limit bounds these power-of-two capacities. */
+      size_t next_capacity = capacity ? capacity * 2 : 4;
+      cpl_word_t *grown = realloc(words, next_capacity * sizeof(*words));
+      if (!grown)
+        goto memory;
+      words = grown;
+      capacity = next_capacity;
     }
-    words = grown;
-    words[count++] = (cpl_word_t){.text = word,
+    char *owned_word = bytes_dup(word, used);
+    if (!owned_word)
+      goto memory;
+    words[count++] = (cpl_word_t){.text = owned_word,
                                   .length = used,
                                   .literal = !saw_unquoted,
                                   .compound = compound,
@@ -352,11 +413,10 @@ static st_error_t encode_tagged_record(char tag, const char *value,
 static st_error_t netpattern_encode_impl(const st_token_t *tokens, size_t count,
                                          char **out_netpattern,
                                          size_t *out_length) {
-  if (out_netpattern)
-    *out_netpattern = NULL;
+  *out_netpattern = NULL;
   if (out_length)
     *out_length = 0;
-  if (!tokens || count == 0 || count > ST_MAX_CMD_TOKENS || !out_netpattern)
+  if (!tokens || count == 0 || count > ST_MAX_CMD_TOKENS)
     return ST_ERR_INVALID;
 
   char *records[ST_MAX_CMD_TOKENS] = {0};
@@ -508,24 +568,16 @@ void st_netpattern_free(st_netpattern_t *pattern) {
   *pattern = (st_netpattern_t){0};
 }
 
-static bool st_netpattern_is_empty(const st_netpattern_t *pattern) {
-  return pattern && pattern->data == NULL && pattern->length == 0;
-}
-
 st_error_t st_netpattern_encode_owned(const st_token_t *tokens, size_t count,
                                       st_netpattern_t *out_netpattern) {
-  if (!st_netpattern_is_empty(out_netpattern))
-    return ST_ERR_INVALID;
   return netpattern_encode_impl(tokens, count, &out_netpattern->data,
                                 &out_netpattern->length);
 }
 
 st_error_t st_netpattern_encode(const st_token_t *tokens, size_t count,
                                 char **out_netpattern) {
-  if (out_netpattern)
-    *out_netpattern = NULL;
-  if (!out_netpattern)
-    return ST_ERR_INVALID;
+  *out_netpattern = NULL;
+
   st_netpattern_t encoded = {0};
   st_error_t error = st_netpattern_encode_owned(tokens, count, &encoded);
   if (error != ST_OK)
@@ -540,8 +592,6 @@ st_error_t st_netpattern_encode(const st_token_t *tokens, size_t count,
 
 st_error_t st_netpattern_from_cpl_owned(const char *cpl,
                                         st_netpattern_t *out_netpattern) {
-  if (!st_netpattern_is_empty(out_netpattern))
-    return ST_ERR_INVALID;
   cpl_word_t *words = NULL;
   size_t count = 0;
   st_error_t error = parse_cpl(cpl, &words, &count);
@@ -608,10 +658,8 @@ cpl_done:
 }
 
 st_error_t st_netpattern_from_cpl(const char *cpl, char **out_netpattern) {
-  if (out_netpattern)
-    *out_netpattern = NULL;
-  if (!out_netpattern)
-    return ST_ERR_INVALID;
+  *out_netpattern = NULL;
+
   st_netpattern_t encoded = {0};
   st_error_t error = st_netpattern_from_cpl_owned(cpl, &encoded);
   if (error != ST_OK)
@@ -712,17 +760,17 @@ static void append_cpl_literal(char *output, size_t *used, const char *text,
 
 st_error_t st_netpattern_decode_view(st_netpattern_view_t netpattern,
                                      st_token_array_t *out_tokens) {
-  if (out_tokens) {
-    out_tokens->tokens = NULL;
-    out_tokens->count = 0;
-  }
-  if ((!netpattern.data && netpattern.length != 0) || !out_tokens)
+
+  out_tokens->tokens = NULL;
+  out_tokens->count = 0;
+
+  if (((!netpattern.data) && (netpattern.length != 0)))
     return ST_ERR_INVALID;
   const char *encoded = netpattern.data;
   size_t encoded_length = netpattern.length;
   if (encoded_length == 0 || encoded_length >= ST_MAX_NETPATTERN_LEN)
     return ST_ERR_FORMAT;
-  size_t outer = 0, count = 0;
+  size_t outer = 0, count = 0, capacity = 0;
   st_token_t *tokens = NULL;
   while (outer < encoded_length) {
     if (count == ST_MAX_CMD_TOKENS)
@@ -849,15 +897,22 @@ st_error_t st_netpattern_decode_view(st_netpattern_view_t netpattern,
         }
       }
     }
-    st_token_t *grown = realloc(tokens, (count + 1) * sizeof(*tokens));
-    if (!grown) {
-      free((void *)token.text);
-      free((void *)token.prefix);
-      free((void *)token.capture);
-      free((void *)token.suffix);
-      goto memory;
+    if (count == capacity) {
+      /* The token-count limit bounds these power-of-two capacities. Grow
+       * geometrically so cumulative allocation and token-copy work is linear.
+       */
+      size_t next_capacity = capacity ? capacity * 2 : 4;
+      st_token_t *grown = realloc(tokens, next_capacity * sizeof(*tokens));
+      if (!grown) {
+        free((void *)token.text);
+        free((void *)token.prefix);
+        free((void *)token.capture);
+        free((void *)token.suffix);
+        goto memory;
+      }
+      tokens = grown;
+      capacity = next_capacity;
     }
-    tokens = grown;
     tokens[count++] = token;
   }
   if (count == 0)
@@ -912,8 +967,7 @@ memory:
 
 st_error_t st_netpattern_decode(const char *netpattern,
                                 st_token_array_t *out_tokens) {
-  if (!netpattern)
-    return ST_ERR_INVALID;
+
   return st_netpattern_decode_view(
       (st_netpattern_view_t){.data = netpattern, .length = strlen(netpattern)},
       out_tokens);
@@ -921,9 +975,8 @@ st_error_t st_netpattern_decode(const char *netpattern,
 
 st_error_t st_netpattern_to_cpl_view(st_netpattern_view_t netpattern,
                                      char **out_cpl) {
-  if (out_cpl)
-    *out_cpl = NULL;
-  if ((!netpattern.data && netpattern.length != 0) || !out_cpl)
+  *out_cpl = NULL;
+  if (((!netpattern.data) && (netpattern.length != 0)))
     return ST_ERR_INVALID;
   st_token_array_t decoded = {0};
   st_error_t decode_error = st_netpattern_decode_view(netpattern, &decoded);
@@ -1022,8 +1075,7 @@ st_error_t st_netpattern_to_cpl_view(st_netpattern_view_t netpattern,
 }
 
 st_error_t st_netpattern_to_cpl(const char *netpattern, char **out_cpl) {
-  if (!netpattern)
-    return ST_ERR_INVALID;
+
   return st_netpattern_to_cpl_view(
       (st_netpattern_view_t){.data = netpattern, .length = strlen(netpattern)},
       out_cpl);

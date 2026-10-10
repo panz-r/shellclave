@@ -14,8 +14,10 @@ static const char *SUBSHELL_PLACEHOLDER = "TEMP_FILE";
 
 static bool is_shell_syntax_token(shell_token_type_t type) {
   return type == SHELL_TOKEN_PIPE || type == SHELL_TOKEN_PIPE_BOTH ||
-         type == SHELL_TOKEN_PIPE_NEGATE || type == SHELL_TOKEN_REDIRECT_IN ||
-         type == SHELL_TOKEN_REDIRECT_OUT || type == SHELL_TOKEN_REDIRECT_ERR ||
+         type == SHELL_TOKEN_PIPE_NEGATE || type == SHELL_TOKEN_PIPE_TIME ||
+         type == SHELL_TOKEN_PIPE_TIME_OPTION ||
+         type == SHELL_TOKEN_REDIRECT_IN || type == SHELL_TOKEN_REDIRECT_OUT ||
+         type == SHELL_TOKEN_REDIRECT_ERR ||
          type == SHELL_TOKEN_REDIRECT_APPEND ||
          type == SHELL_TOKEN_REDIRECT_READ_WRITE ||
          type == SHELL_TOKEN_REDIRECT_CLOBBER ||
@@ -32,11 +34,10 @@ static bool is_shell_syntax_token(shell_token_type_t type) {
 /* A variable may be adjacent to literal bytes within one shell word. Preserve
  * those bytes in the diagnostic display: `--limit=${count}` is one argv item,
  * not two items and not merely a bare generic variable. */
-static shell_transform_status_t
-transform_replace_word_variables(const shell_token_t *token, char **out,
-                                 bool *replaced) {
-  if (!token || !token->start || !out || !replaced)
-    return SHELL_TRANSFORM_EINPUT;
+/* token is a live source span; both outputs are distinct writable storage. */
+static SHELL_NONNULL(1, 2, 3) shell_transform_status_t
+    transform_replace_word_variables(const shell_token_t *token, char **out,
+                                     bool *replaced) {
   *out = NULL;
   *replaced = false;
 
@@ -92,9 +93,8 @@ transform_replace_word_variables(const shell_token_t *token, char **out,
  * `"$name"`. Keep its compact display placeholder in that case. Once the
  * shell word also contains literal bytes, it must follow the word-fragment
  * path so the display preserves its one-word structure. */
-static bool token_is_bare_variable_expansion(const shell_token_t *token) {
-  if (!token || !token->start)
-    return false;
+static SHELL_NONNULL(1) bool token_is_bare_variable_expansion(
+    const shell_token_t *token) {
   shell_source_variable_scan_t scan = {0};
   size_t variable_start = 0;
   size_t variable_after = 0;
@@ -129,9 +129,9 @@ void shell_transformed_command_free(shell_transformed_command_t *command) {
   free(command);
 }
 
-static shell_transform_status_t
-measure_transformed_command(const shell_transformed_command_t *command,
-                            size_t *total_output) {
+static SHELL_NONNULL(1, 2) shell_transform_status_t
+    measure_transformed_command(const shell_transformed_command_t *command,
+                                size_t *total_output) {
   size_t total = 0;
   const char *command_strings[] = {command->original_command,
                                    command->display_text};
@@ -155,9 +155,10 @@ measure_transformed_command(const shell_transformed_command_t *command,
   return SHELL_TRANSFORM_OK;
 }
 
-static shell_transformed_token_t
-create_transformed_token(const char *original, const char *transformed,
-                         shell_transform_type_t type, bool is_shell_construct) {
+static SHELL_NONNULL(1, 2) shell_transformed_token_t
+    create_transformed_token(const char *original, const char *transformed,
+                             shell_transform_type_t type,
+                             bool is_shell_construct) {
   shell_transformed_token_t token;
   token.original = original;
   token.transformed = transformed;
@@ -176,10 +177,10 @@ static void free_transformed_tokens(shell_transformed_token_t *tokens,
   free(tokens);
 }
 
-static bool transform_tokens_share_word(const shell_token_t *left,
-                                        const shell_token_t *right) {
-  return left && right && left->position <= SIZE_MAX - left->length &&
-         !is_shell_syntax_token(left->type) &&
+/* Adjacent tokens come from the same command's valid source spans. */
+static SHELL_NONNULL(1, 2) bool transform_tokens_share_word(
+    const shell_token_t *left, const shell_token_t *right) {
+  return !is_shell_syntax_token(left->type) &&
          !is_shell_syntax_token(right->type) &&
          shell_tokenizer_token_continues_word(right,
                                               left->position + left->length);
@@ -187,8 +188,8 @@ static bool transform_tokens_share_word(const shell_token_t *left,
 
 /* Remove source-only escaped physical line endings from diagnostic fragments
  * without changing literal newlines inside ordinary single quotes. */
-static size_t transform_fragment_display_write(const char *text,
-                                               char *destination) {
+static SHELL_NONNULL(1) size_t
+    transform_fragment_display_write(const char *text, char *destination) {
   size_t length = strlen(text);
   char quote = '\0';
   size_t written = 0;
@@ -220,12 +221,11 @@ static size_t transform_fragment_display_write(const char *text,
   return written;
 }
 
-static char *build_transformed_command(const shell_command_t *command,
-                                       shell_transformed_token_t *tokens,
-                                       size_t token_count,
-                                       shell_transform_status_t *status) {
-  if (!command || !tokens || !status)
-    return NULL;
+/* tokens has one transformed entry per source token; status is writable.
+ * A NULL destination in transform_fragment_display_write() measures output. */
+static SHELL_NONNULL(1, 2, 4) char *build_transformed_command(
+    const shell_command_t *command, shell_transformed_token_t *tokens,
+    size_t token_count, shell_transform_status_t *status) {
   size_t total_length = 0;
   for (size_t i = 0; i < token_count; i++) {
     size_t part_length =
@@ -274,11 +274,13 @@ shell_transform_status_t
 shell_transform_command(const shell_command_t *cmd,
                         const shell_transform_limits_t *limits,
                         shell_transformed_command_t **transformed_cmd) {
-  if (!transformed_cmd)
-    return SHELL_TRANSFORM_EINPUT;
   *transformed_cmd = NULL;
-  if (!cmd)
-    return SHELL_TRANSFORM_EINPUT;
+
+  size_t orig_length = cmd->end_pos - cmd->start_pos;
+  if (limits && orig_length > limits->max_string_bytes)
+    return SHELL_TRANSFORM_EOUTPUT_LIMIT;
+  if (cmd->token_count > SIZE_MAX / sizeof(shell_transformed_token_t))
+    return SHELL_TRANSFORM_EOVERFLOW;
 
   shell_transformed_command_t *tcmd =
       malloc(sizeof(shell_transformed_command_t));
@@ -290,40 +292,17 @@ shell_transform_command(const shell_command_t *cmd,
   tcmd->tokens = NULL;
   tcmd->token_count = 0;
   tcmd->has_transformations = false;
-  tcmd->has_shell_syntax = false;
-
-  // Validate tokenized input exists before constructing transformed output.
-  if (cmd->token_count == 0 || cmd->tokens == NULL) {
-    free(tcmd);
-    return SHELL_TRANSFORM_EINPUT;
-  }
+  tcmd->has_shell_syntax = cmd->has_groups || cmd->group_depth != 0 ||
+                           cmd->pipeline_negation_count != 0 ||
+                           cmd->pipeline_time_mode != SHELL_PIPE_TIME_NONE;
 
   const shell_token_t *first_token = &cmd->tokens[0];
-  if (!first_token->start || cmd->end_pos < cmd->start_pos ||
-      first_token->position < cmd->start_pos ||
-      first_token->position > cmd->end_pos ||
-      first_token->length > cmd->end_pos - first_token->position) {
-    free(tcmd);
-    return SHELL_TRANSFORM_EINPUT;
-  }
   size_t prefix_length = first_token->position - cmd->start_pos;
-  size_t orig_length = cmd->end_pos - cmd->start_pos;
   const char *orig_start = first_token->start - prefix_length;
   tcmd->original_command = strndup(orig_start, orig_length);
   if (!tcmd->original_command) {
     free(tcmd);
     return SHELL_TRANSFORM_ENOMEM;
-  }
-  if (limits && orig_length > limits->max_string_bytes) {
-    free((void *)tcmd->original_command);
-    free(tcmd);
-    return SHELL_TRANSFORM_EOUTPUT_LIMIT;
-  }
-
-  if (cmd->token_count > SIZE_MAX / sizeof(shell_transformed_token_t)) {
-    free((void *)tcmd->original_command);
-    free(tcmd);
-    return SHELL_TRANSFORM_EOVERFLOW;
   }
   shell_transformed_token_t *tokens =
       malloc(cmd->token_count * sizeof(shell_transformed_token_t));
@@ -335,14 +314,6 @@ shell_transform_command(const shell_command_t *cmd,
 
   for (size_t i = 0; i < cmd->token_count; i++) {
     const shell_token_t *tok = &cmd->tokens[i];
-    if (!tok->start || tok->position < cmd->start_pos ||
-        tok->position > cmd->end_pos ||
-        tok->length > cmd->end_pos - tok->position) {
-      free_transformed_tokens(tokens, i);
-      free((void *)tcmd->original_command);
-      free(tcmd);
-      return SHELL_TRANSFORM_EINPUT;
-    }
     shell_transform_type_t type = SHELL_TRANSFORM_NONE;
     const char *replacement = NULL;
     char *word_variable_replacement = NULL;
@@ -467,20 +438,14 @@ shell_transform_command_line(const char *command_line, size_t command_length,
                              const shell_transform_limits_t *limits,
                              shell_transformed_command_t ***transformed_cmds,
                              size_t *transformed_count) {
-  if (!transformed_cmds || !transformed_count)
-    return SHELL_TRANSFORM_EINPUT;
   *transformed_cmds = NULL;
   *transformed_count = 0;
-  if (!command_line)
-    return SHELL_TRANSFORM_EINPUT;
-  if (shell_tokenizer_has_unsupported_semantics(command_line, command_length))
-    return SHELL_TRANSFORM_EPARSE;
 
   shell_command_t *cmds = NULL;
   size_t cmd_count = 0;
 
-  switch (shell_tokenize_commands(command_line, command_length, &cmds,
-                                  &cmd_count)) {
+  switch (shell_tokenize_supported_commands(command_line, command_length, true,
+                                            true, &cmds, &cmd_count)) {
   case SHELL_TOKENIZE_OK:
     break;
   case SHELL_TOKENIZE_ENOMEM:
@@ -556,10 +521,10 @@ void shell_transformed_command_list_free(shell_transformed_command_t **commands,
 
 const char *shell_transformed_command_get_display_text(
     const shell_transformed_command_t *cmd) {
-  return cmd ? cmd->display_text : NULL;
+  return cmd->display_text;
 }
 
 bool shell_transformed_command_has_transformations(
     const shell_transformed_command_t *cmd) {
-  return cmd ? cmd->has_transformations : false;
+  return cmd->has_transformations;
 }

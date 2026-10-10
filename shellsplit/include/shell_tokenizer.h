@@ -1,6 +1,8 @@
 #ifndef SHELL_TOKENIZER_H
 #define SHELL_TOKENIZER_H
 
+#include "shell_contract.h"
+
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -67,11 +69,19 @@ typedef enum {
   SHELL_PIPE_MODE_STDOUT_AND_STDERR,
 } shell_pipe_mode_t;
 
+/* Effective formatting selected by Bash's reserved `time` pipeline prefix. */
+typedef enum {
+  SHELL_PIPE_TIME_NONE = 0,
+  SHELL_PIPE_TIME_DEFAULT,
+  SHELL_PIPE_TIME_POSIX,
+} shell_pipeline_time_mode_t;
+
 /* Orthogonal syntactic modifiers. Unlike shell_cmd_type_t these describe the
  * complete command/pipeline rather than the separator before one range. */
 typedef enum {
   SHELL_CMD_MOD_NONE = 0,
   SHELL_CMD_MOD_PIPE_NEGATED = 1 << 0, /* POSIX `! pipeline` */
+  SHELL_CMD_MOD_PIPE_TIMED = 1 << 1,   /* Bash `time pipeline` */
 } shell_cmd_modifier_t;
 
 /* Kinds of enclosing command groups. Values are a bitset so mixed nesting is
@@ -188,6 +198,9 @@ typedef struct {
    * compatible nonzero indication; callers derive the effective inversion
    * from this count's parity. */
   uint32_t pipeline_negation_count;
+  uint8_t pipeline_time_mode; // shell_pipeline_time_mode_t
+  /* True only on the pipeline root that carried reserved `time` syntax. */
+  bool pipeline_time_direct;
   uint8_t pipe_input_mode; // shell_pipe_mode_t for a preceding pipeline
   uint32_t features;       // shell_cmd_features_t
   uint16_t group_depth;    // Enclosing command-group nesting depth
@@ -198,7 +211,10 @@ typedef struct {
  * delimiters. The command interval indexes the command collection returned
  * beside this descriptor: shell_parse_result_t.cmds for a fast parse and
  * shell_processed_commands_t.commands for a processed parse. Processed
- * results remap the interval after structural ranges are omitted. parent is
+ * results remap the interval after structural ranges are omitted. An empty
+ * interval starts at the number of collection entries preceding that group's
+ * source interval, including the one-past-end position for a trailing group.
+ * parent is
  * UINT16_MAX for a top-level group. */
 typedef struct {
   uint32_t start;
@@ -209,12 +225,20 @@ typedef struct {
   uint8_t kind;       // Exactly one shell_group_kind_t value
   uint16_t modifiers; // shell_cmd_modifier_t on this compound pipeline member
   uint32_t pipeline_negation_count;
+  uint8_t pipeline_time_mode; // shell_pipeline_time_mode_t
+  /* True when this group itself follows a reserved `time` prefix. False for
+   * timing inherited because the group is a later member of that pipeline. */
+  bool pipeline_time_direct;
 } shell_group_t;
 
 /**
  * Parse result - caller allocates this. Its fixed command and group capacities
  * are SHELL_MAX_SUBCOMMANDS and SHELL_MAX_GROUPS; do not depend on a concrete
- * byte size, which is ABI and compiler-layout dependent.
+ * byte size, which is ABI and compiler-layout dependent. All offsets and
+ * semantic metadata belong to the exact input span passed to shell_parse_fast.
+ * A consumer supplied both this result and source bytes must receive that
+ * unchanged span and length. Pairing it with another source or editing its
+ * metadata is invalid API use, not an alternate command representation.
  */
 typedef struct {
   shell_range_t cmds[SHELL_MAX_SUBCOMMANDS]; // Subcommand ranges
@@ -243,10 +267,15 @@ typedef struct {
  * SHELL_TYPE_HEREDOC range. Comment-only source spans yield no range. On
  * truncation, completed ranges remain available and result->status includes
  * SHELL_STATUS_TRUNCATED.
+ * In strict_mode, complete-source syntax validation precedes range/group
+ * capacity checks: a malformed suffix is SHELL_EPARSE, not SHELL_ETRUNC.
+ * Non-strict parsing retains diagnostic tolerance for unfinished source; its
+ * ranges are not a guarantee that the source can be modeled semantically.
  */
 shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
                                const shell_limits_t *limits,
-                               shell_parse_result_t *result);
+                               shell_parse_result_t *result)
+    SHELL_NONNULL(1, 4);
 
 /**
  * Copy subcommand to buffer (null-terminated)
@@ -258,7 +287,7 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
  * @return        Bytes written (excluding null), or 0 on error
  */
 size_t shell_subcommand_copy(const char *cmd, const shell_range_t *range,
-                             char *buf, size_t buf_len);
+                             char *buf, size_t buf_len) SHELL_NONNULL(1, 2, 3);
 
 /**
  * Get subcommand pointer (not null-terminated)
@@ -269,7 +298,7 @@ size_t shell_subcommand_copy(const char *cmd, const shell_range_t *range,
  * @return        Pointer into original command (not null-terminated)
  */
 const char *shell_subcommand_view(const char *cmd, const shell_range_t *range,
-                                  size_t *out_len);
+                                  size_t *out_len) SHELL_NONNULL(1, 2);
 
 /* Full parser section is in shell_tokenizer_full.h */
 

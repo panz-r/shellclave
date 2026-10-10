@@ -3,6 +3,7 @@
 
 #include "shelltype.h"
 
+#include <ctype.h>
 #include <stddef.h>
 #include <string.h>
 #include <strings.h>
@@ -108,20 +109,94 @@ static const st_metadata_entry_t st_metadata_entries[] = {
     {ST_META_PERM_BITS, ST_TYPE_PERM_OCTAL, "bits", NULL},
 };
 
-static inline const st_metadata_entry_t *
-st_metadata_lookup(st_token_type_t type, const char *name) {
-  if (!name || *name == '\0')
-    return NULL;
+/* metadata is a valid entry in the closed vocabulary. Semver component,
+ * range-step and permission-bit parameters currently accept the complete
+ * classified type. Other parameters discriminate concrete values and require
+ * value evidence, not just a classifier bucket, in learner prefix queries. */
+static inline SHELL_NONNULL(1) bool st_metadata_requires_value(
+    const st_metadata_entry_t *metadata) {
+  return metadata->type != ST_TYPE_SEMVER && metadata->type != ST_TYPE_RANGE &&
+         metadata->type != ST_TYPE_PERM_OCTAL;
+}
+
+/* Required name references exactly length readable bytes; no terminator is
+ * needed. This vocabulary lookup accepts unknown spellings and returns NULL.
+ * type is a valid enum, supplied by the caller. */
+static inline SHELL_NONNULL(2) const
+    st_metadata_entry_t *st_metadata_lookup_span(st_token_type_t type,
+                                                 const char *name,
+                                                 size_t length) {
   for (size_t i = 0;
        i < sizeof(st_metadata_entries) / sizeof(st_metadata_entries[0]); i++) {
     const st_metadata_entry_t *entry = &st_metadata_entries[i];
     if (entry->type != type)
       continue;
-    if (strcasecmp(name, entry->name) == 0 ||
-        (entry->alias && strcasecmp(name, entry->alias) == 0))
+    if ((strlen(entry->name) == length &&
+         strncasecmp(name, entry->name, length) == 0) ||
+        (entry->alias && strlen(entry->alias) == length &&
+         strncasecmp(name, entry->alias, length) == 0))
       return entry;
   }
   return NULL;
+}
+
+/* NULL means no metadata spelling. Non-NULL name is a terminated string. */
+static inline const st_metadata_entry_t *
+st_metadata_lookup(st_token_type_t type, const char *name) {
+  return name ? st_metadata_lookup_span(type, name, strlen(name)) : NULL;
+}
+
+/* Derive closed metadata from an already-classified concrete value. The caller
+ * supplies a valid type and the correct classification for NUL-free values;
+ * text references length readable bytes, even when length is zero. No syntax
+ * parsing, classification or token-size validation is repeated here.
+ *
+ * This is the shared definition used by runtime parameter matching and learner
+ * evidence. Metadata is textual: a caller-classified binary token has no value
+ * refinement. Semver component parameters are type-wide and provide no single
+ * common value ID; range/permission IDs retain their persistence spelling. */
+static inline SHELL_NONNULL(2) st_metadata_id_t
+    st_metadata_value_id(st_token_type_t type, const char *text,
+                         size_t length) {
+  if (memchr(text, '\0', length) != NULL)
+    return ST_META_NONE;
+  switch (type) {
+  case ST_TYPE_SIZE:
+  case ST_TYPE_DURATION: {
+    size_t suffix = 0;
+    if (length && text[0] == '-')
+      suffix++;
+    while (suffix < length &&
+           (isdigit((unsigned char)text[suffix]) || text[suffix] == '.'))
+      suffix++;
+    const st_metadata_entry_t *metadata =
+        st_metadata_lookup_span(type, text + suffix, length - suffix);
+    return metadata ? metadata->id : ST_META_NONE;
+  }
+  case ST_TYPE_UUID:
+    return text[14] == '4'   ? ST_META_UUID_V4
+           : text[14] == '5' ? ST_META_UUID_V5
+                             : ST_META_NONE;
+  case ST_TYPE_TIMESTAMP:
+    /* Classification already established the date/time grammar, including
+     * uppercase/lowercase T/Z, space separators and supported zone forms. */
+    return length == 10  ? ST_META_TIMESTAMP_DATE
+           : length == 8 ? ST_META_TIMESTAMP_TIME
+                         : ST_META_TIMESTAMP_DATETIME;
+  case ST_TYPE_SHA:
+    return length == 7    ? ST_META_SHA_SHORT
+           : length == 40 ? ST_META_SHA_40
+           : length == 64 ? ST_META_SHA_64
+                          : ST_META_NONE;
+  case ST_TYPE_FINGERPRINT:
+    return length == 50 ? ST_META_FINGERPRINT_SHA256 : ST_META_FINGERPRINT_MD5;
+  case ST_TYPE_RANGE:
+    return ST_META_RANGE_STEP;
+  case ST_TYPE_PERM_OCTAL:
+    return ST_META_PERM_BITS;
+  default:
+    return ST_META_NONE;
+  }
 }
 
 static inline bool st_type_supports_metadata(st_token_type_t type) {
@@ -142,6 +217,21 @@ st_wildcard_metadata(const char *wild_text, st_token_type_t wild_type) {
       wild_text[symbol_len] != '.')
     return NULL;
   return st_metadata_lookup(wild_type, wild_text + symbol_len + 1);
+}
+
+/* The spelling is a valid canonical wildcard with explicit readable length,
+ * matching wild_type. Unlike the C-string adapter, it needs no terminator and
+ * does not repeat spelling validation. NULL means no parameter metadata. */
+static inline SHELL_NONNULL(1) const
+    st_metadata_entry_t *st_wildcard_metadata_span(const char *wild_text,
+                                                   size_t length,
+                                                   st_token_type_t wild_type) {
+  size_t symbol_length = strlen(st_type_symbol[wild_type]);
+  if (length == symbol_length)
+    return NULL;
+  const char *name = wild_text + symbol_length + 1;
+  size_t name_length = length - symbol_length - 1;
+  return st_metadata_lookup_span(wild_type, name, name_length);
 }
 
 #endif

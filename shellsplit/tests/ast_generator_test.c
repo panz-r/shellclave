@@ -40,7 +40,7 @@ static size_t inspect_nodes(const ast_node_t *node, uint32_t *types,
                             bool *valid) {
   if (!node)
     return 0;
-  if ((unsigned)node->type > AST_BACKTICK) {
+  if ((unsigned)node->type > AST_TIME) {
     *valid = false;
     return 0;
   }
@@ -61,6 +61,24 @@ static uint32_t metadata_mask(const shell_ast_t *ast) {
          (uint32_t)ast->has_binary << 13 |
          (uint32_t)ast->has_control_char << 14 |
          (uint32_t)ast->has_high_bytes << 15;
+}
+
+static bool token_is_pipeline_prefix(shell_token_type_t type) {
+  return type == SHELL_TOKEN_PIPE_NEGATE || type == SHELL_TOKEN_PIPE_TIME ||
+         type == SHELL_TOKEN_PIPE_TIME_OPTION;
+}
+
+/* The allocating tokenizer retains structural prefix tokens, while the fast
+ * range begins at the first actual stage token. Derive that exact boundary
+ * independently from the full token stream; an all-modifier empty timed
+ * pipeline deliberately retains the first prefix byte as its nonempty range. */
+static size_t expected_fast_stage_start(const shell_command_t *command) {
+  if (!command || command->token_count == 0)
+    return command ? command->start_pos : 0;
+  for (size_t token = 0; token < command->token_count; token++)
+    if (!token_is_pipeline_prefix(command->tokens[token].type))
+      return command->tokens[token].position;
+  return command->tokens[0].position;
 }
 
 static bool validate_metadata(const shell_ast_t *ast, uint32_t *types) {
@@ -220,11 +238,16 @@ static int verify_command(const char *cmd, size_t cmd_len,
              result.group_count == 0) {
     for (size_t i = 0; i < command_count; i++) {
       size_t full_length = commands[i].end_pos - commands[i].start_pos;
-      if (result.cmds[i].start != commands[i].start_pos ||
-          result.cmds[i].len > full_length) {
+      size_t expected_start = expected_fast_stage_start(&commands[i]);
+      size_t start_offset = result.cmds[i].start >= commands[i].start_pos
+                                ? result.cmds[i].start - commands[i].start_pos
+                                : SIZE_MAX;
+      if (result.cmds[i].start != expected_start ||
+          start_offset > full_length ||
+          result.cmds[i].len > full_length - start_offset) {
         printf("FAIL: incompatible parser range at command %zu "
-               "(fast=%u+%u full=%zu+%zu) for: %s\n",
-               i, result.cmds[i].start, result.cmds[i].len,
+               "(fast=%u+%u expected-start=%zu full=%zu+%zu) for: %s\n",
+               i, result.cmds[i].start, result.cmds[i].len, expected_start,
                commands[i].start_pos, full_length, cmd);
         failed = 1;
         break;
@@ -465,7 +488,7 @@ int main(int argc, char **argv) {
             "FAIL: generated corpus did not exercise both acceptance paths\n");
     failed++;
   }
-  uint32_t all_node_types = (UINT32_C(1) << (AST_BACKTICK + 1)) - 1;
+  uint32_t all_node_types = (UINT32_C(1) << (AST_TIME + 1)) - 1;
   if (num_tests >= 1000 && generated_types != all_node_types) {
     fprintf(stderr,
             "FAIL: generated node coverage 0x%" PRIx32 ", expected 0x%" PRIx32

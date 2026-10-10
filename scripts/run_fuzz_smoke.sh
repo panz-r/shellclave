@@ -19,7 +19,10 @@ WORK_DIR=$(mktemp -d "${WORK_ROOT}.XXXXXX")
 cleanup() { rm -rf "$WORK_DIR"; }
 trap cleanup EXIT INT TERM
 
-ASAN_OPTIONS="${ASAN_OPTIONS:+${ASAN_OPTIONS}:}detect_leaks=0" \
+# Bound ASan's retained fake-stack storage for dense fixed-oracle matrices.
+# Use-after-return detection remains enabled, and the full sanitizer suite
+# uses its ordinary settings independently of this smoke-only memory budget.
+ASAN_OPTIONS="${ASAN_OPTIONS:+${ASAN_OPTIONS}:}detect_leaks=0:min_uar_stack_size_log=16:max_uar_stack_size_log=16" \
 LSAN_OPTIONS="${LSAN_OPTIONS:+${LSAN_OPTIONS}:}detect_leaks=0" \
   "$FUZZER" -runs="$RUNS" -max_len="$MAX_LEN" -timeout=10 -rss_limit_mb=1024 \
   -artifact_prefix="$ARTIFACT_PREFIX" "$WORK_DIR" "$SEEDS"

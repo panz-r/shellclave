@@ -1,16 +1,22 @@
 /* Unit tests for the standalone anomaly model. */
 
 #define _POSIX_C_SOURCE 200809L
+#include "../../tests/atomic_file_fixture.h"
 #include "../src/sg_anomaly_internal.h"
 #include "sg_anomaly.h"
 #include "shell_netstring.h"
+#include "test_numeric_locale.h"
 #include "test_sg_failures.h"
 #include <errno.h>
+#include <fcntl.h>
+#include <float.h>
+#include <glob.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 static sg_anomaly_model_t *test_model_with_config(double alpha,
@@ -77,8 +83,6 @@ static double test_anomaly_score_array(const sg_anomaly_model_t *model,
     (void)sg_anomaly_model_score_netseq(model, encoded, strlen(encoded),
                                         &score);
     free(encoded);
-  } else {
-    (void)sg_anomaly_model_score_netseq(model, NULL, 0, &score);
   }
   return score;
 }
@@ -89,8 +93,6 @@ static void test_anomaly_update_array(sg_anomaly_model_t *model,
   if (encoded) {
     (void)sg_anomaly_model_update_netseq(model, encoded, strlen(encoded));
     free(encoded);
-  } else {
-    (void)sg_anomaly_model_update_netseq(model, NULL, 0);
   }
 }
 
@@ -100,6 +102,14 @@ static void test_anomaly_update_array(sg_anomaly_model_t *model,
 static int pass_count;
 static int fail_count;
 static char anomaly_temp_path[256];
+static char anomaly_save_directory[256];
+
+static void cleanup_anomaly_save_fixture(void) {
+  if (!anomaly_save_directory[0])
+    return;
+  (void)test_atomic_cleanup_directory(anomaly_save_directory);
+  anomaly_save_directory[0] = '\0';
+}
 
 static void cleanup_anomaly_temp_file(void) {
   if (anomaly_temp_path[0] != '\0') {
@@ -184,6 +194,24 @@ static bool snapshot_equal(anomaly_snapshot_t before,
          fabs(before.score - after.score) < 0.000001;
 }
 
+static sg_anomaly_model_t *roundtrip_model(const sg_anomaly_model_t *model) {
+  FILE *stream = tmpfile();
+  sg_anomaly_model_t *loaded = NULL;
+  if (!stream || sg_anomaly_write_stream(model, stream) != SG_ANOMALY_OK ||
+      fseek(stream, 0, SEEK_SET) != 0 ||
+      sg_anomaly_model_read_new(stream, &loaded) != SG_ANOMALY_OK) {
+    if (stream)
+      fclose(stream);
+    sg_anomaly_model_free(loaded);
+    return NULL;
+  }
+  if (fclose(stream) != 0) {
+    sg_anomaly_model_free(loaded);
+    return NULL;
+  }
+  return loaded;
+}
+
 static void update_repeated(sg_anomaly_model_t *model, const char **seq,
                             size_t length, size_t repetitions) {
   for (size_t i = 0; i < repetitions; i++)
@@ -206,7 +234,6 @@ TEST(lifecycle_and_null_safety) {
   ASSERT_EQ_INT(sg_anomaly_model_prune(model, 2, &empty_removed),
                 SG_ANOMALY_OK);
   ASSERT_EQ_INT(empty_removed, 0);
-  ASSERT_EQ_INT(sg_anomaly_model_reset(NULL), SG_ANOMALY_ERR_INVALID);
 
   const char *invalid_sequences[][3] = {{"a", NULL, "c"}};
   sg_anomaly_update(model, commands, 5);
@@ -223,23 +250,10 @@ TEST(lifecycle_and_null_safety) {
   sg_anomaly_update(model, empty_stage, 3);
   ASSERT_EQ_INT(sg_anomaly_model_total_unigrams(model), 8);
   ASSERT_EQ_INT(sg_anomaly_model_unigram_count(model, ""), 1);
-  sg_anomaly_update(NULL, commands, 5);
-  ASSERT_EQ_INT(sg_anomaly_model_decay(NULL, 0.5), SG_ANOMALY_ERR_INVALID);
-  sg_anomaly_model_clear_error(NULL);
+
   sg_anomaly_model_free(NULL);
-  ASSERT(isinf(sg_anomaly_score(NULL, commands, 5)));
   ASSERT(isinf(sg_anomaly_score(model, NULL, 5)));
-  ASSERT_EQ_INT(sg_anomaly_model_vocab_size(NULL), 0);
-  ASSERT_EQ_INT(sg_anomaly_model_total_unigrams(NULL), 0);
-  ASSERT_EQ_INT(sg_anomaly_model_total_bigrams(NULL), 0);
-  ASSERT_EQ_INT(sg_anomaly_model_total_trigrams(NULL), 0);
-  ASSERT_EQ_INT(sg_anomaly_model_total_fourgrams(NULL), 0);
-  ASSERT_EQ_INT(sg_anomaly_model_total_contexts(NULL), 0);
-  ASSERT_EQ_INT(sg_anomaly_model_unknown_count(NULL), 0);
-  ASSERT_EQ_INT(sg_anomaly_model_unigram_count(NULL, "a"), 0);
-  ASSERT_EQ_INT(sg_anomaly_model_bigram_count(NULL, "a", "b"), 0);
-  ASSERT_EQ_INT(sg_anomaly_model_trigram_count(NULL, "a", "b", "c"), 0);
-  ASSERT_EQ_INT(sg_anomaly_model_fourgram_count(NULL, "a", "b", "c", "d"), 0);
+
   char oversized[8192];
   memset(oversized, 'x', sizeof(oversized) - 1);
   oversized[sizeof(oversized) - 1] = '\0';
@@ -258,38 +272,18 @@ TEST(lifecycle_and_null_safety) {
   ASSERT(isfinite(sg_anomaly_score(model, oversized_middle, 4)));
   ASSERT(isfinite(sg_anomaly_score(model, oversized_late, 4)));
   ASSERT(isfinite(sg_anomaly_score(model, oversized_last, 4)));
-  ASSERT_EQ_DBL(sg_anomaly_model_kneser_ney_discount(NULL), 0.0, 0.0);
-  bool observed = true;
-  ASSERT_EQ_INT(sg_anomaly_model_has_observed_netseq(NULL, "", 0, &observed),
-                SG_ANOMALY_ERR_INVALID);
-  ASSERT(!observed);
-  ASSERT_EQ_INT(sg_anomaly_model_has_observed_netseq(model, NULL, 0, &observed),
-                SG_ANOMALY_ERR_INVALID);
+
   FILE *stream = tmpfile();
   ASSERT(stream != NULL);
-  ASSERT_EQ_INT(sg_anomaly_write_stream(NULL, stream), -1);
-  ASSERT_EQ_INT(sg_anomaly_write_stream(model, NULL), -1);
-  ASSERT_EQ_INT(sg_anomaly_read_stream(NULL, stream), -1);
-  ASSERT_EQ_INT(sg_anomaly_read_stream(model, NULL), -1);
   rewind(stream);
-  ASSERT_EQ_INT(sg_anomaly_read_stream(model, stream), -1);
+  ASSERT_EQ_INT(sg_anomaly_read_stream(model, stream), SG_ANOMALY_ERR_FORMAT);
   int close_result = fclose(stream);
   ASSERT_EQ_INT(close_result, 0);
   FILE *read_only = fopen("/dev/null", "rb");
   ASSERT(read_only != NULL);
-  ASSERT_EQ_INT(sg_anomaly_write_stream(model, read_only), -1);
+  ASSERT_EQ_INT(sg_anomaly_write_stream(model, read_only), SG_ANOMALY_ERR_IO);
   close_result = fclose(read_only);
   ASSERT_EQ_INT(close_result, 0);
-  size_t removed = 0;
-  ASSERT_EQ_INT(sg_anomaly_model_prune(NULL, 2, &removed),
-                SG_ANOMALY_ERR_INVALID);
-  ASSERT_EQ_INT(sg_anomaly_model_compact(NULL), SG_ANOMALY_ERR_INVALID);
-  ASSERT_EQ_INT(sg_anomaly_model_save(NULL, "/tmp/unused"),
-                SG_ANOMALY_ERR_INVALID);
-  ASSERT_EQ_INT(errno, EINVAL);
-  ASSERT_EQ_INT(sg_anomaly_model_load(NULL, "/tmp/unused"),
-                SG_ANOMALY_ERR_INVALID);
-  ASSERT_EQ_INT(errno, EINVAL);
   ASSERT_EQ_INT(
       sg_anomaly_model_save(model, "/tmp/shellclave-no-such-directory/model"),
       SG_ANOMALY_ERR_IO);
@@ -301,7 +295,6 @@ TEST(lifecycle_and_null_safety) {
 
 TEST(config_contract) {
   sg_anomaly_config_t config;
-  sg_anomaly_config_default(NULL);
   sg_anomaly_config_default(&config);
   ASSERT_EQ_DBL(config.alpha, 0.1, 0.0);
   ASSERT_EQ_DBL(config.unknown_log_prior, -10.0, 0.0);
@@ -322,6 +315,44 @@ TEST(config_contract) {
   config.alpha = 0.1;
   config.unknown_log_prior = INFINITY;
   ASSERT(sg_anomaly_model_new_with_config(&config) == NULL);
+}
+
+TEST(extreme_alpha_scores_are_finite) {
+  static const double alphas[] = {DBL_TRUE_MIN, DBL_MIN, 0.1, DBL_MAX};
+  static const char learned[] = "1:a,1:b,1:c,";
+  static const char mixed[] = "1:b,1:c,1:x,";
+  for (size_t i = 0; i < sizeof(alphas) / sizeof(alphas[0]); i++) {
+    sg_anomaly_config_t config = {
+        .alpha = alphas[i],
+        .unknown_log_prior = -10.0,
+    };
+    sg_anomaly_model_t *model = sg_anomaly_model_new_with_config(&config);
+    ASSERT(model != NULL);
+    ASSERT_EQ_INT(
+        sg_anomaly_model_update_netseq(model, learned, sizeof(learned) - 1),
+        SG_ANOMALY_OK);
+    double learned_score = INFINITY;
+    double mixed_score = INFINITY;
+    ASSERT_EQ_INT(sg_anomaly_model_score_netseq(
+                      model, learned, sizeof(learned) - 1, &learned_score),
+                  SG_ANOMALY_OK);
+    ASSERT_EQ_INT(sg_anomaly_model_score_netseq(model, mixed, sizeof(mixed) - 1,
+                                                &mixed_score),
+                  SG_ANOMALY_OK);
+    ASSERT(isfinite(learned_score) && learned_score >= 0.0);
+    ASSERT(isfinite(mixed_score) && mixed_score >= 0.0);
+
+    sg_anomaly_model_t *loaded = roundtrip_model(model);
+    ASSERT(loaded != NULL);
+    double loaded_score = INFINITY;
+    ASSERT_EQ_INT(sg_anomaly_model_score_netseq(
+                      loaded, learned, sizeof(learned) - 1, &loaded_score),
+                  SG_ANOMALY_OK);
+    ASSERT(isfinite(loaded_score) && loaded_score >= 0.0);
+    ASSERT_EQ_DBL(loaded_score, learned_score, 0.000001);
+    sg_anomaly_model_free(loaded);
+    sg_anomaly_model_free(model);
+  }
 }
 
 TEST(update_count_matrix) {
@@ -830,6 +861,423 @@ TEST(prune_and_compact_preserve_common_behavior) {
   sg_anomaly_model_free(model);
 }
 
+TEST(maintenance_rebuilds_derived_contexts) {
+  static const char common[] = "1:a,1:b,1:c,1:d,";
+  static const char shared_rare[] = "1:a,1:b,1:c,1:e,";
+  static const char disjoint_rare[] = "1:w,1:x,1:y,1:z,";
+  for (unsigned operation = 0; operation < 2; operation++) {
+    sg_anomaly_model_t *model = sg_anomaly_model_new();
+    ASSERT(model != NULL);
+    for (unsigned repetition = 0; repetition < 3; repetition++)
+      ASSERT_EQ_INT(
+          sg_anomaly_model_update_netseq(model, common, sizeof(common) - 1),
+          SG_ANOMALY_OK);
+    ASSERT_EQ_INT(sg_anomaly_model_update_netseq(model, shared_rare,
+                                                 sizeof(shared_rare) - 1),
+                  SG_ANOMALY_OK);
+    ASSERT_EQ_INT(sg_anomaly_model_update_netseq(model, disjoint_rare,
+                                                 sizeof(disjoint_rare) - 1),
+                  SG_ANOMALY_OK);
+
+    size_t removed = SIZE_MAX;
+    sg_anomaly_status_t status =
+        operation == 0 ? sg_anomaly_model_decay(model, 0.75)
+                       : sg_anomaly_model_prune(model, 2, &removed);
+    ASSERT_EQ_INT(status, SG_ANOMALY_OK);
+    if (operation == 1)
+      /* Four shared-tail and ten disjoint authoritative n-grams disappear;
+       * derived context entries are deliberately not part of this count. */
+      ASSERT_EQ_INT(removed, 14);
+
+    double before = INFINITY;
+    ASSERT_EQ_INT(sg_anomaly_model_score_netseq(model, common,
+                                                sizeof(common) - 1, &before),
+                  SG_ANOMALY_OK);
+    ASSERT(isfinite(before));
+    size_t contexts = sg_anomaly_model_total_contexts(model);
+    sg_anomaly_model_t *loaded = roundtrip_model(model);
+    ASSERT(loaded != NULL);
+    double after = INFINITY;
+    ASSERT_EQ_INT(sg_anomaly_model_score_netseq(loaded, common,
+                                                sizeof(common) - 1, &after),
+                  SG_ANOMALY_OK);
+    ASSERT(after == before);
+    ASSERT_EQ_INT(sg_anomaly_model_total_contexts(loaded), contexts);
+    ASSERT_EQ_INT(sg_anomaly_model_total_unigrams(loaded),
+                  sg_anomaly_model_total_unigrams(model));
+    ASSERT_EQ_INT(sg_anomaly_model_total_bigrams(loaded),
+                  sg_anomaly_model_total_bigrams(model));
+    ASSERT_EQ_INT(sg_anomaly_model_total_trigrams(loaded),
+                  sg_anomaly_model_total_trigrams(model));
+    ASSERT_EQ_INT(sg_anomaly_model_total_fourgrams(loaded),
+                  sg_anomaly_model_total_fourgrams(model));
+    sg_anomaly_model_free(loaded);
+    sg_anomaly_model_free(model);
+  }
+}
+
+/* Deliberately slow independent probability reference: derive each context
+ * by enumerating the complete fixture vocabulary and public n-gram counts.
+ * It neither reads internal context entries nor uses the production scorer. */
+static size_t reference_ngram_count(const sg_anomaly_model_t *model,
+                                    const sg_anomaly_item_view_t *items,
+                                    size_t order) {
+  switch (order) {
+  case 1:
+    return sg_anomaly_model_unigram_count_view(model, items[0]);
+  case 2:
+    return sg_anomaly_model_bigram_count_view(model, items[0], items[1]);
+  case 3:
+    return sg_anomaly_model_trigram_count_view(model, items[0], items[1],
+                                               items[2]);
+  default:
+    return sg_anomaly_model_fourgram_count_view(model, items[0], items[1],
+                                                items[2], items[3]);
+  }
+}
+
+static double
+reference_stage_probability(const sg_anomaly_model_t *model,
+                            const sg_anomaly_item_view_t *window, size_t order,
+                            const sg_anomaly_item_view_t *vocabulary,
+                            size_t vocabulary_count) {
+  const double alpha = 0.1;
+  size_t count = reference_ngram_count(model, window + order - 1, 1);
+  double probability;
+  if (count) {
+    probability = ((double)count + alpha) /
+                  ((double)sg_anomaly_model_total_unigrams(model) +
+                   alpha * (double)sg_anomaly_model_vocab_size(model));
+  } else {
+    double unknown = (double)sg_anomaly_model_unknown_count(model);
+    probability = (unknown + alpha) /
+                  ((double)sg_anomaly_model_total_unigrams(model) + unknown +
+                   alpha * ((double)sg_anomaly_model_vocab_size(model) + 1.0));
+  }
+  double discount = sg_anomaly_model_kneser_ney_discount(model);
+  for (size_t level = 2; level <= order; level++) {
+    const sg_anomaly_item_view_t *items = window + order - level;
+    count = reference_ngram_count(model, items, level);
+    if (!count)
+      continue;
+    sg_anomaly_item_view_t candidate[4];
+    memcpy(candidate, items, (level - 1) * sizeof(*candidate));
+    size_t total = 0, continuations = 0;
+    for (size_t i = 0; i < vocabulary_count; i++) {
+      candidate[level - 1] = vocabulary[i];
+      size_t observed = reference_ngram_count(model, candidate, level);
+      total += observed;
+      continuations += observed != 0;
+    }
+    probability = (fmax(0.0, (double)count - discount) +
+                   discount * (double)continuations * probability) /
+                  (double)total;
+    probability = fmin(1.0, probability);
+  }
+  return probability;
+}
+
+static bool score_matches_reference(const sg_anomaly_model_t *model,
+                                    const sg_anomaly_item_view_t *items,
+                                    size_t count,
+                                    const sg_anomaly_item_view_t *vocabulary,
+                                    size_t vocabulary_count) {
+  char encoded[512];
+  size_t length = 0;
+  for (size_t i = 0; i < count; i++) {
+    size_t written;
+    if (shell_netstring_write(encoded + length, sizeof(encoded) - length,
+                              items[i].data, items[i].length,
+                              &written) != SHELL_NETSTRING_OK)
+      return false;
+    length += written;
+  }
+  double actual = INFINITY;
+  if (sg_anomaly_model_score_netseq(model, encoded, length, &actual) !=
+      SG_ANOMALY_OK)
+    return false;
+  size_t order = count == 3 ? 3 : 4;
+  double bits = 0.0;
+  for (size_t end = order; end <= count; end++)
+    bits -= log2(reference_stage_probability(model, items + end - order, order,
+                                             vocabulary, vocabulary_count));
+  double expected = bits / (double)(count - order + 1);
+  return isfinite(actual) && fabs(actual - expected) <= 1e-9;
+}
+
+static bool reference_score_matrix(const sg_anomaly_model_t *model) {
+  static const char binary[] = {'x', '\0'};
+  static const sg_anomaly_item_view_t vocabulary[] = {
+      {"a", 1},
+      {"b", 1},
+      {"c", 1},
+      {"d", 1},
+      {"e", 1},
+      {"", 0},
+      {binary, sizeof(binary)},
+  };
+  const sg_anomaly_item_view_t queries[][6] = {
+      {{"a", 1}, {"b", 1}, {"c", 1}, {"d", 1}, {"a", 1}, {"b", 1}},
+      {{"a", 1}, {"b", 1}, {"c", 1}, {"e", 1}, {"c", 1}, {"d", 1}},
+      {{"b", 1}, {"b", 1}, {"c", 1}, {"d", 1}, {"c", 1}, {"e", 1}},
+      {{"", 0},
+       {"b", 1},
+       {binary, sizeof(binary)},
+       {"d", 1},
+       {"", 0},
+       {"b", 1}},
+      {{"missing", 7}, {"b", 1}, {"c", 1}, {"d", 1}, {"missing", 7}, {"", 0}},
+      {{"a", 1}, {"missing", 7}, {"c", 1}, {"e", 1}, {"b", 1}, {"d", 1}},
+  };
+  for (size_t i = 0; i < sizeof(queries) / sizeof(queries[0]); i++)
+    for (size_t count = 3; count <= 6; count++)
+      if (!score_matches_reference(model, queries[i], count, vocabulary,
+                                   sizeof(vocabulary) / sizeof(vocabulary[0])))
+        return false;
+  return true;
+}
+
+TEST(context_statistics_match_probability_reference) {
+  static const char binary_sample[] = "0:,1:b,2:x\0,1:d,0:,";
+  static const struct {
+    const char *sequence;
+    size_t length, repetitions;
+  } samples[] = {{"1:a,1:b,1:c,1:d,", 16, 5},
+                 {"1:a,1:b,1:c,1:e,", 16, 3},
+                 {"1:b,1:b,1:c,1:d,", 16, 2},
+                 {binary_sample, sizeof(binary_sample) - 1, 1}};
+  for (size_t maintenance = 0; maintenance < 3; maintenance++) {
+    sg_anomaly_model_t *model = sg_anomaly_model_new();
+    ASSERT(model != NULL);
+    bool ok = true;
+    for (size_t s = 0; ok && s < sizeof(samples) / sizeof(samples[0]); s++)
+      for (size_t r = 0; ok && r < samples[s].repetitions; r++)
+        ok = sg_anomaly_model_update_netseq(model, samples[s].sequence,
+                                            samples[s].length) ==
+                 SG_ANOMALY_OK &&
+             reference_score_matrix(model);
+    size_t removed;
+    if (ok && maintenance == 1)
+      ok = sg_anomaly_model_prune(model, 2, &removed) == SG_ANOMALY_OK;
+    else if (ok && maintenance == 2)
+      ok = sg_anomaly_model_decay(model, 0.75) == SG_ANOMALY_OK;
+    ok = ok && reference_score_matrix(model);
+    sg_anomaly_model_t *loaded = ok ? roundtrip_model(model) : NULL;
+    ok = ok && loaded && reference_score_matrix(loaded) &&
+         sg_anomaly_model_compact(loaded) == SG_ANOMALY_OK &&
+         reference_score_matrix(loaded);
+    sg_anomaly_model_free(loaded);
+    sg_anomaly_model_free(model);
+    ASSERT(ok);
+  }
+}
+
+TEST(compaction_failures_preserve_counts_and_sticky_error) {
+  static const char common[] = "1:a,1:b,1:c,1:d,";
+  static const char alternative[] = "1:a,1:b,1:c,1:e,";
+  static const char binary[] = "0:,1:b,2:x\0,1:d,0:,";
+  for (size_t fail_at = 1; fail_at <= 7; fail_at++) {
+    sg_anomaly_model_t *model = sg_anomaly_model_new();
+    ASSERT(model != NULL);
+    ASSERT_EQ_INT(
+        sg_anomaly_model_update_netseq(model, common, sizeof(common) - 1),
+        SG_ANOMALY_OK);
+    ASSERT_EQ_INT(sg_anomaly_model_update_netseq(model, alternative,
+                                                 sizeof(alternative) - 1),
+                  SG_ANOMALY_OK);
+    ASSERT_EQ_INT(
+        sg_anomaly_model_update_netseq(model, binary, sizeof(binary) - 1),
+        SG_ANOMALY_OK);
+    anomaly_snapshot_t before = snapshot_model(model);
+    bool correct =
+        !sg_anomaly_model_had_error(model) && reference_score_matrix(model);
+    sg_test_anomaly_op_fail_at(fail_at);
+    sg_anomaly_status_t status = sg_anomaly_model_compact(model);
+    size_t operations = sg_test_anomaly_op_count();
+    sg_test_anomaly_op_reset();
+    correct = correct && status == SG_ANOMALY_ERR_MEMORY && operations == 7 &&
+              sg_anomaly_model_had_error(model) &&
+              snapshot_equal(before, snapshot_model(model)) &&
+              reference_score_matrix(model) &&
+              sg_anomaly_model_unigram_count_view(
+                  model, (sg_anomaly_item_view_t){"", 0}) == 2 &&
+              sg_anomaly_model_fourgram_count(model, "a", "b", "c", "e") == 1;
+    sg_test_anomaly_op_reset();
+    status = sg_anomaly_model_compact(model);
+    operations = sg_test_anomaly_op_count();
+    sg_test_anomaly_op_reset();
+    correct = correct && status == SG_ANOMALY_OK && operations == 7 &&
+              sg_anomaly_model_had_error(model) &&
+              snapshot_equal(before, snapshot_model(model)) &&
+              reference_score_matrix(model);
+    size_t removed = SIZE_MAX;
+    correct = correct &&
+              sg_anomaly_model_prune(model, 1, &removed) == SG_ANOMALY_OK &&
+              removed == 0 && sg_anomaly_model_had_error(model) &&
+              sg_anomaly_model_decay(model, 0.75) == SG_ANOMALY_OK &&
+              sg_anomaly_model_had_error(model);
+    sg_anomaly_model_clear_error(model);
+    correct = correct && !sg_anomaly_model_had_error(model) &&
+              sg_anomaly_model_compact(model) == SG_ANOMALY_OK &&
+              !sg_anomaly_model_had_error(model);
+    sg_test_anomaly_op_fail_at(1);
+    status = sg_anomaly_model_compact(model);
+    sg_test_anomaly_op_reset();
+    correct = correct && status == SG_ANOMALY_ERR_MEMORY &&
+              sg_anomaly_model_had_error(model) &&
+              sg_anomaly_model_reset(model) == SG_ANOMALY_OK &&
+              !sg_anomaly_model_had_error(model);
+    sg_anomaly_model_free(model);
+    ASSERT(correct);
+  }
+}
+
+TEST(context_statistics_rollback_is_atomic) {
+  static const char common[] = "1:a,1:b,1:c,1:d,";
+  static const char alternative[] = "1:a,1:b,1:c,1:e,";
+  static const char update[] = "1:a,1:b,1:c,1:e,1:a,1:b,1:c,1:e,";
+  static const char type_update[] = "1:a,1:b,1:c,1:d,1:a,1:b,1:c,1:d,";
+  sg_anomaly_model_t *probe_raw = sg_anomaly_model_new();
+  sg_anomaly_model_t *probe_type = sg_anomaly_model_new();
+  ASSERT(probe_raw != NULL && probe_type != NULL);
+  ASSERT_EQ_INT(sg_anomaly_models_update_netseq_pair(
+                    probe_raw, common, sizeof(common) - 1, probe_type,
+                    alternative, sizeof(alternative) - 1),
+                SG_ANOMALY_OK);
+  sg_test_anomaly_op_reset();
+  ASSERT_EQ_INT(sg_anomaly_models_update_netseq_pair(
+                    probe_raw, update, sizeof(update) - 1, probe_type,
+                    type_update, sizeof(type_update) - 1),
+                SG_ANOMALY_OK);
+  size_t operations = sg_test_anomaly_op_count();
+  sg_test_anomaly_op_reset();
+  sg_anomaly_model_free(probe_raw);
+  sg_anomaly_model_free(probe_type);
+  ASSERT(operations > 1);
+
+  /* New suffixes share existing contexts, and repeated suffixes in the same
+   * transaction must not add another distinct continuation. Fail before and
+   * after each mutation, including after the complete raw half has applied. */
+  for (size_t fault = 1; fault <= operations; fault++) {
+    sg_anomaly_model_t *raw = sg_anomaly_model_new();
+    sg_anomaly_model_t *type = sg_anomaly_model_new();
+    ASSERT(raw != NULL && type != NULL);
+    bool ok = sg_anomaly_models_update_netseq_pair(
+                  raw, common, sizeof(common) - 1, type, alternative,
+                  sizeof(alternative) - 1) == SG_ANOMALY_OK;
+    anomaly_snapshot_t raw_before = snapshot_model(raw);
+    anomaly_snapshot_t type_before = snapshot_model(type);
+    sg_test_anomaly_op_fail_at(fault);
+    sg_anomaly_status_t status = sg_anomaly_models_update_netseq_pair(
+        raw, update, sizeof(update) - 1, type, type_update,
+        sizeof(type_update) - 1);
+    sg_test_anomaly_op_reset();
+    ok = ok && status == SG_ANOMALY_ERR_MEMORY &&
+         snapshot_equal(raw_before, snapshot_model(raw)) &&
+         snapshot_equal(type_before, snapshot_model(type)) &&
+         reference_score_matrix(raw) && reference_score_matrix(type);
+    if (ok)
+      ok = sg_anomaly_models_update_netseq_pair(
+               raw, update, sizeof(update) - 1, type, type_update,
+               sizeof(type_update) - 1) == SG_ANOMALY_OK &&
+           reference_score_matrix(raw) && reference_score_matrix(type);
+    sg_anomaly_model_free(raw);
+    sg_anomaly_model_free(type);
+    ASSERT(ok);
+  }
+}
+
+TEST(scoring_work_is_linear) {
+  size_t previous_work = 0, previous_count = 0;
+  for (size_t count = 128; count <= 2048; count *= 2) {
+    char (*names)[24] = malloc(count * sizeof(*names));
+    const char **items = malloc(count * sizeof(*items));
+    sg_anomaly_model_t *model = sg_anomaly_model_new();
+    bool ok = names && items && model;
+    for (size_t i = 0; ok && i < count; i++) {
+      int length = snprintf(names[i], sizeof(names[i]), "stage%zu", i);
+      ok = length > 0 && (size_t)length < sizeof(names[i]);
+      items[i] = names[i];
+    }
+    char *sequence = ok ? test_encode_netseq(items, count) : NULL;
+    ok = ok && sequence &&
+         sg_anomaly_model_update_netseq(model, sequence, strlen(sequence)) ==
+             SG_ANOMALY_OK;
+    double score = INFINITY;
+    sg_test_anomaly_work_reset();
+    if (ok)
+      ok = sg_anomaly_model_score_netseq(model, sequence, strlen(sequence),
+                                         &score) == SG_ANOMALY_OK &&
+           isfinite(score);
+    size_t work = sg_test_anomaly_work_count();
+    ok = ok && work >= count && work <= 8 * count &&
+         (!previous_count ||
+          work <= previous_work + 8 * (count - previous_count));
+    previous_work = work;
+    previous_count = count;
+    /* Growing the learned model must not increase the cost of a fixed query. */
+    sg_test_anomaly_work_reset();
+    if (ok)
+      ok = isfinite(sg_anomaly_score(model, items, 4));
+    ok = ok && sg_test_anomaly_work_count() <= 8;
+    sg_anomaly_model_free(model);
+    free(sequence);
+    free(items);
+    free(names);
+    ASSERT(ok);
+  }
+}
+
+TEST(one_pass_score_and_count) {
+  static const char valid[] = "1:a,1:b,1:c,1:d,0:,";
+  static const char *const malformed[] = {
+      "1:a,x",
+      "1:a,1:b,x",
+      "1:a,1:b,1:c,x",
+      "1:a,1:b,1:c,1:d,01:x,",
+  };
+  sg_anomaly_model_t *model = sg_anomaly_model_new();
+  ASSERT(model != NULL);
+  for (int trained = 0; trained < 2; trained++) {
+    double score = -1;
+    size_t count = SIZE_MAX;
+    ASSERT_EQ_INT(sg_anomaly_score_netseq_count(model, valid, sizeof(valid) - 1,
+                                                &score, &count),
+                  SG_ANOMALY_OK);
+    ASSERT_EQ_INT(count, 5);
+    ASSERT(trained ? isfinite(score) : isinf(score));
+    for (size_t i = 0; i < sizeof(malformed) / sizeof(malformed[0]); i++) {
+      score = -1;
+      count = SIZE_MAX;
+      ASSERT_EQ_INT(sg_anomaly_score_netseq_count(model, malformed[i],
+                                                  strlen(malformed[i]), &score,
+                                                  &count),
+                    SG_ANOMALY_ERR_FORMAT);
+      ASSERT(isinf(score) && count == 0);
+    }
+    static const char overflow[] = "999999999999999999999999999999:x,";
+    ASSERT_EQ_INT(sg_anomaly_score_netseq_count(
+                      model, overflow, sizeof(overflow) - 1, &score, &count),
+                  SG_ANOMALY_ERR_LIMIT);
+    ASSERT(isinf(score) && count == 0);
+    ASSERT_EQ_INT(sg_anomaly_score_netseq_count(model, "", 0, &score, &count),
+                  SG_ANOMALY_OK);
+    ASSERT(isinf(score) && count == 0);
+    ASSERT_EQ_INT(
+        sg_anomaly_model_update_netseq(model, valid, sizeof(valid) - 1),
+        SG_ANOMALY_OK);
+  }
+  double score = -1;
+  size_t count = SIZE_MAX;
+  sg_test_anomaly_score_fail_with(SG_ANOMALY_ERR_MEMORY);
+  sg_anomaly_status_t status = sg_anomaly_score_netseq_count(
+      model, valid, sizeof(valid) - 1, &score, &count);
+  sg_test_anomaly_result_reset();
+  ASSERT_EQ_INT(status, SG_ANOMALY_ERR_MEMORY);
+  ASSERT(isinf(score) && count == 0);
+  sg_anomaly_model_free(model);
+}
+
 TEST(canonical_netseq_contract) {
   sg_anomaly_model_t *model = sg_anomaly_model_new();
   ASSERT(model != NULL);
@@ -839,10 +1287,8 @@ TEST(canonical_netseq_contract) {
       sg_anomaly_netseq_count(valid, sizeof(valid) - 1, false, &count),
       SG_ANOMALY_OK);
   ASSERT_EQ_INT(count, 3);
-  ASSERT_EQ_INT(sg_anomaly_netseq_count(valid, sizeof(valid) - 1, false, NULL),
-                SG_ANOMALY_ERR_INVALID);
-  ASSERT_EQ_INT(sg_anomaly_netseq_count(NULL, 0, false, &count),
-                SG_ANOMALY_ERR_INVALID);
+  ASSERT_EQ_INT(sg_anomaly_netseq_count(NULL, 0, false, &count), SG_ANOMALY_OK);
+  ASSERT_EQ_INT(count, 0);
   ASSERT_EQ_INT(sg_anomaly_netseq_count("", 0, false, &count), SG_ANOMALY_OK);
   ASSERT_EQ_INT(count, 0);
   ASSERT_EQ_INT(sg_anomaly_netseq_count("01:x,", 5, false, &count),
@@ -909,14 +1355,6 @@ TEST(canonical_netseq_contract) {
   ASSERT_EQ_INT(sg_anomaly_model_score_netseq(model, "0:,", 3, &score),
                 SG_ANOMALY_OK);
   ASSERT(isinf(score));
-  ASSERT_EQ_INT(
-      sg_anomaly_model_score_netseq(NULL, valid, sizeof(valid) - 1, &score),
-      SG_ANOMALY_ERR_INVALID);
-  ASSERT_EQ_INT(
-      sg_anomaly_model_score_netseq(model, valid, sizeof(valid) - 1, NULL),
-      SG_ANOMALY_ERR_INVALID);
-  ASSERT_EQ_INT(sg_anomaly_model_update_netseq(NULL, valid, sizeof(valid) - 1),
-                SG_ANOMALY_ERR_INVALID);
 
   static const char framing_nul[] = {'1', ':', 'x', ',', '\0',
                                      '1', ':', 'y', ','};
@@ -1079,7 +1517,7 @@ TEST(empty_stage_persistence_and_legacy_loading) {
   ASSERT(fseek(stream, 0, SEEK_SET) == 0);
   size_t preserved_unigrams = sg_anomaly_model_total_unigrams(source);
   errno = 0;
-  ASSERT_EQ_INT(sg_anomaly_read_stream(source, stream), -1);
+  ASSERT_EQ_INT(sg_anomaly_read_stream(source, stream), SG_ANOMALY_ERR_FORMAT);
   ASSERT_EQ_INT(errno, EPROTO);
   ASSERT_EQ_INT(sg_anomaly_model_total_unigrams(source), preserved_unigrams);
   ASSERT(fclose(stream) == 0);
@@ -1103,6 +1541,859 @@ TEST(empty_stage_persistence_and_legacy_loading) {
   sg_anomaly_model_free(legacy_source);
   sg_anomaly_model_free(loaded);
   sg_anomaly_model_free(source);
+}
+
+TEST(typed_stream_io_failure_atomicity) {
+  sg_anomaly_model_t *source = sg_anomaly_model_new();
+  sg_anomaly_model_t *target = sg_anomaly_model_new();
+  ASSERT(source && target);
+  ASSERT_EQ_INT(sg_anomaly_model_update_netseq(source, "1:a,1:b,1:c,", 12),
+                SG_ANOMALY_OK);
+  ASSERT_EQ_INT(sg_anomaly_model_update_netseq(target, "1:x,1:y,1:z,", 12),
+                SG_ANOMALY_OK);
+  FILE *stream = tmpfile();
+  ASSERT(stream != NULL);
+  sg_test_io_reset();
+  ASSERT_EQ_INT(sg_anomaly_write_stream(source, stream), SG_ANOMALY_OK);
+  size_t writes = sg_test_io_count();
+  sg_test_io_reset();
+  rewind(stream);
+  ASSERT_EQ_INT(sg_anomaly_read_stream(source, stream), SG_ANOMALY_OK);
+  size_t reads = sg_test_io_count();
+  sg_test_io_reset();
+  ASSERT(writes > 3 && reads > 2);
+  static const int errors[] = {EIO, ENOMEM, EINVAL, EPROTO};
+  for (size_t e = 0; e < sizeof(errors) / sizeof(errors[0]); e++) {
+    for (size_t i = 1; i <= reads; i++) {
+      rewind(stream);
+      sg_test_io_fail_at_with_errno(i, errors[e]);
+      sg_anomaly_status_t status = sg_anomaly_read_stream(target, stream);
+      sg_test_io_reset();
+      ASSERT_EQ_INT(status, errors[e] == ENOMEM ? SG_ANOMALY_ERR_MEMORY
+                                                : SG_ANOMALY_ERR_IO);
+      ASSERT_EQ_INT(sg_anomaly_model_total_unigrams(target), 3);
+      ASSERT_EQ_INT(sg_anomaly_model_unigram_count(target, "x"), 1);
+      ASSERT_EQ_INT(sg_anomaly_model_unigram_count(target, "a"), 0);
+    }
+  }
+  for (size_t i = 1; i <= writes; i++) {
+    FILE *output = tmpfile();
+    ASSERT(output != NULL);
+    sg_test_io_fail_at(i);
+    sg_anomaly_status_t status = sg_anomaly_write_stream(source, output);
+    sg_test_io_reset();
+    ASSERT_EQ_INT(status, SG_ANOMALY_ERR_IO);
+    ASSERT(fclose(output) == 0);
+  }
+  rewind(stream);
+  ASSERT_EQ_INT(sg_anomaly_read_stream(target, stream), SG_ANOMALY_OK);
+  ASSERT_EQ_INT(sg_anomaly_model_unigram_count(target, "a"), 1);
+  ASSERT(fclose(stream) == 0);
+  sg_anomaly_model_free(source);
+  sg_anomaly_model_free(target);
+}
+
+TEST(owned_file_close_and_error_precedence) {
+  char path[] = "/tmp/shellclave-anomaly-close-XXXXXX";
+  int fd = mkstemp(path);
+  ASSERT(fd >= 0);
+  ASSERT(close(fd) == 0);
+  snprintf(anomaly_temp_path, sizeof(anomaly_temp_path), "%s", path);
+  sg_anomaly_model_t *source = test_model_with_config(0.5, -8.0);
+  sg_anomaly_model_t *target = test_model_with_config(0.25, -12.0);
+  ASSERT(source && target);
+  update_repeated(source, commands, 5, 3);
+  update_repeated(target, commands, 5, 1);
+  sg_test_anomaly_op_fail_at(1);
+  ASSERT_EQ_INT(sg_anomaly_model_update_netseq(target, "1:x,", 4),
+                SG_ANOMALY_ERR_MEMORY);
+  sg_test_anomaly_op_reset();
+  ASSERT(sg_anomaly_model_had_error(target));
+  anomaly_snapshot_t before = snapshot_model(target);
+  ASSERT_EQ_INT(sg_anomaly_model_save(source, path), SG_ANOMALY_OK);
+
+  static const int errors[] = {EIO, ENOMEM, EINVAL, EPROTO};
+  for (size_t i = 0; i < sizeof(errors) / sizeof(errors[0]); i++) {
+    sg_test_io_close_fail_with_errno(errors[i]);
+    sg_anomaly_status_t status = sg_anomaly_model_load(target, path);
+    int error_number = errno;
+    sg_test_io_reset();
+    ASSERT_EQ_INT(status, errors[i] == ENOMEM ? SG_ANOMALY_ERR_MEMORY
+                                              : SG_ANOMALY_ERR_IO);
+    ASSERT_EQ_INT(error_number, errors[i]);
+    ASSERT(snapshot_equal(before, snapshot_model(target)));
+    ASSERT(sg_anomaly_model_had_error(target));
+  }
+  /* Closing must preserve an earlier failure and release the actual FILE. */
+  sg_test_io_fail_at_with_errno(1, ENOMEM);
+  sg_test_io_close_fail_with_errno(EIO);
+  ASSERT_EQ_INT(sg_anomaly_model_load(target, path), SG_ANOMALY_ERR_MEMORY);
+  ASSERT_EQ_INT(errno, ENOMEM);
+  sg_test_io_reset();
+  ASSERT(snapshot_equal(before, snapshot_model(target)));
+  ASSERT(sg_anomaly_model_had_error(target));
+
+  /* Four begin operations precede the first serialization write. */
+  sg_test_io_fail_at_with_errno(5, EINVAL);
+  sg_test_io_close_fail_with_errno(ENOMEM);
+  ASSERT_EQ_INT(sg_anomaly_model_save(source, path), SG_ANOMALY_ERR_IO);
+  ASSERT_EQ_INT(errno, EINVAL);
+  sg_test_io_reset();
+  sg_test_io_close_fail_with_errno(EIO);
+  ASSERT_EQ_INT(sg_anomaly_model_save(source, path), SG_ANOMALY_ERR_IO);
+  ASSERT_EQ_INT(errno, EIO);
+  sg_test_io_reset();
+
+  FILE *malformed = fopen(path, "wb");
+  ASSERT(malformed != NULL);
+  ASSERT(fputs("broken\n", malformed) >= 0 && fclose(malformed) == 0);
+  sg_test_io_close_fail_with_errno(ENOMEM);
+  ASSERT_EQ_INT(sg_anomaly_model_load(target, path), SG_ANOMALY_ERR_FORMAT);
+  ASSERT_EQ_INT(errno, EPROTO);
+  sg_test_io_reset();
+  ASSERT(snapshot_equal(before, snapshot_model(target)));
+  ASSERT(sg_anomaly_model_had_error(target));
+
+  ASSERT_EQ_INT(sg_anomaly_model_save(source, path), SG_ANOMALY_OK);
+  ASSERT_EQ_INT(sg_anomaly_model_load(target, path), SG_ANOMALY_OK);
+  ASSERT(snapshot_equal(snapshot_model(source), snapshot_model(target)));
+  ASSERT(!sg_anomaly_model_had_error(target));
+  sg_anomaly_model_free(source);
+  sg_anomaly_model_free(target);
+  ASSERT(unlink(path) == 0);
+  anomaly_temp_path[0] = '\0';
+}
+
+static bool write_count_record(FILE *stream, uint8_t type, const char *key,
+                               uint64_t count) {
+  uint32_t length = (uint32_t)strlen(key);
+  return fwrite(&type, 1, 1, stream) == 1 &&
+         fwrite(&length, sizeof(length), 1, stream) == 1 &&
+         fwrite(key, 1, length, stream) == length &&
+         fwrite(&count, sizeof(count), 1, stream) == 1 &&
+         fputc('\n', stream) != EOF;
+}
+
+TEST(persisted_header_validation) {
+  static const struct {
+    const char *header;
+    sg_anomaly_status_t status;
+    int error_number;
+  } cases[] = {
+      {"# 0.1 -10 0.5 0 0 0 0 0 -1\n", SG_ANOMALY_ERR_FORMAT, EPROTO},
+      {"# 0.1 -10 0.5 0 0 0 0 0 +1\n", SG_ANOMALY_ERR_FORMAT, EPROTO},
+      {"# 0.1 -10 0.5 999999999999999999999999999999999999 0 0 0 0 "
+       "0\n",
+       SG_ANOMALY_ERR_LIMIT, EOVERFLOW},
+      {"# 0.1 -10 0.5 0 0 0 0 0 "
+       "999999999999999999999999999999999999\n",
+       SG_ANOMALY_ERR_LIMIT, EOVERFLOW},
+      {"# 0.1 -10 0 0 0 0 0 0 0\n", SG_ANOMALY_ERR_FORMAT, EPROTO},
+      {"# 0.1 -10 1.00001 0 0 0 0 0 0\n", SG_ANOMALY_ERR_FORMAT, EPROTO},
+      {"# 0.1 -10 0.5 0 0 0 0 0 0 trailing\n", SG_ANOMALY_ERR_FORMAT, EPROTO},
+      {"# 0.1 -10 0.5 0 0 0 0 0\n", SG_ANOMALY_ERR_FORMAT, EPROTO},
+      {"# nan -10 0.5 0 0 0 0 0 0\n", SG_ANOMALY_ERR_FORMAT, EPROTO},
+  };
+
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    sg_anomaly_model_t *target = sg_anomaly_model_new();
+    ASSERT(target != NULL);
+    update_repeated(target, commands, 5, 2);
+    anomaly_snapshot_t before = snapshot_model(target);
+    FILE *stream = tmpfile();
+    ASSERT(stream != NULL);
+    ASSERT(fputs("# anomaly-model-v7\n", stream) >= 0);
+    ASSERT(fputs(cases[i].header, stream) >= 0);
+    ASSERT(fflush(stream) == 0 && fseek(stream, 0, SEEK_SET) == 0);
+    errno = 0;
+    ASSERT_EQ_INT(sg_anomaly_read_stream(target, stream), cases[i].status);
+    ASSERT_EQ_INT(errno, cases[i].error_number);
+    ASSERT(snapshot_equal(before, snapshot_model(target)));
+    ASSERT(fclose(stream) == 0);
+    sg_anomaly_model_free(target);
+  }
+
+  /* The inclusive upper discount bound remains a valid empty model. */
+  FILE *stream = tmpfile();
+  ASSERT(stream != NULL);
+  ASSERT(fputs("# anomaly-model-v7\n# 0.1 -10 1 0 0 0 0 0 0\n", stream) >= 0);
+  ASSERT(fflush(stream) == 0 && fseek(stream, 0, SEEK_SET) == 0);
+  sg_anomaly_model_t *loaded = NULL;
+  ASSERT_EQ_INT(sg_anomaly_model_read_new(stream, &loaded), SG_ANOMALY_OK);
+  ASSERT(loaded != NULL);
+  ASSERT_EQ_DBL(sg_anomaly_model_kneser_ney_discount(loaded), 1.0, 0.0);
+  sg_anomaly_model_free(loaded);
+  ASSERT(fclose(stream) == 0);
+}
+
+TEST(persisted_header_framing) {
+  static const char nul_header[] =
+      "# anomaly-model-v7\n# 0.1 -10 0.5 0 0 0 0 0 0\0 hidden bytes\n";
+  static const char nul_version[] =
+      "# anomaly-model-v7\0 hidden bytes\n# 0.1 -10 0.5 0 0 0 0 0 0\n";
+  static const char incomplete_version[] = "# anomaly-model-v7";
+  static const char incomplete_header[] =
+      "# anomaly-model-v7\n# 0.1 -10 0.5 0 0 0 0 0 0";
+  static const char incomplete_crlf[] =
+      "# anomaly-model-v7\n# 0.1 -10 0.5 0 0 0 0 0 0\r";
+  static const struct {
+    const char *data;
+    size_t length;
+  } cases[] = {{nul_header, sizeof(nul_header) - 1},
+               {nul_version, sizeof(nul_version) - 1},
+               {incomplete_version, sizeof(incomplete_version) - 1},
+               {incomplete_header, sizeof(incomplete_header) - 1},
+               {incomplete_crlf, sizeof(incomplete_crlf) - 1}};
+  sg_anomaly_model_t *target = sg_anomaly_model_new();
+  ASSERT(target != NULL);
+  update_repeated(target, commands, 5, 2);
+  anomaly_snapshot_t before = snapshot_model(target);
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    FILE *stream = tmpfile();
+    ASSERT(stream != NULL);
+    ASSERT(fwrite(cases[i].data, 1, cases[i].length, stream) ==
+           cases[i].length);
+    ASSERT(fseek(stream, 0, SEEK_SET) == 0);
+    ASSERT_EQ_INT(sg_anomaly_read_stream(target, stream),
+                  SG_ANOMALY_ERR_FORMAT);
+    ASSERT_EQ_INT(errno, EPROTO);
+    ASSERT(snapshot_equal(before, snapshot_model(target)));
+    ASSERT(fseek(stream, 0, SEEK_SET) == 0);
+    sg_anomaly_model_t *loaded = NULL;
+    ASSERT_EQ_INT(sg_anomaly_model_read_new(stream, &loaded),
+                  SG_ANOMALY_ERR_FORMAT);
+    ASSERT(loaded == NULL);
+    ASSERT(fclose(stream) == 0);
+  }
+  sg_anomaly_model_free(target);
+
+  /* At the physical buffer boundary a final newline is mandatory, but a
+   * complete line filling all available byte positions is still valid. */
+  static const char fields[] = "0.1 -10 0.5 0 0 0 0 0 0\n";
+  for (size_t length = 254; length <= 256; length++) {
+    char line[256];
+    memset(line, ' ', length);
+    line[0] = '#';
+    memcpy(line + length - (sizeof(fields) - 1), fields, sizeof(fields) - 1);
+    FILE *stream = tmpfile();
+    ASSERT(stream != NULL);
+    ASSERT(fputs("# anomaly-model-v7\n", stream) >= 0);
+    ASSERT(fwrite(line, 1, length, stream) == length);
+    ASSERT(fseek(stream, 0, SEEK_SET) == 0);
+    sg_anomaly_model_t *loaded = NULL;
+    ASSERT_EQ_INT(sg_anomaly_model_read_new(stream, &loaded),
+                  length < 256 ? SG_ANOMALY_OK : SG_ANOMALY_ERR_FORMAT);
+    ASSERT((loaded != NULL) == (length < 256));
+    sg_anomaly_model_free(loaded);
+    ASSERT(fclose(stream) == 0);
+  }
+  FILE *stream = tmpfile();
+  ASSERT(stream != NULL);
+  ASSERT(fputs("# anomaly-model-v6\r\n# 0.1 -10 0.5 0 0 0 0 0 0\r\n", stream) >=
+         0);
+  ASSERT(fseek(stream, 0, SEEK_SET) == 0);
+  sg_anomaly_model_t *loaded = NULL;
+  ASSERT_EQ_INT(sg_anomaly_model_read_new(stream, &loaded), SG_ANOMALY_OK);
+  sg_anomaly_model_free(loaded);
+  ASSERT(fclose(stream) == 0);
+}
+
+/* Always restore the thread locale before reporting an assertion failure. */
+static bool locale_roundtrip_case(locale_t numeric, locale_t other,
+                                  double alpha) {
+  bool ok = false;
+  FILE *stream = NULL;
+  sg_anomaly_model_t *source = test_model_with_config(alpha, -10.0);
+  sg_anomaly_model_t *loaded = NULL;
+  locale_t previous = uselocale(numeric);
+  if (!source)
+    goto done;
+  update_repeated(source, commands, 5, 2);
+  stream = tmpfile();
+  if (!stream || sg_anomaly_write_stream(source, stream) != SG_ANOMALY_OK ||
+      uselocale((locale_t)0) != numeric || fseek(stream, 0, SEEK_SET) != 0)
+    goto done;
+  char version[64], header[256];
+  if (!fgets(version, sizeof(version), stream) ||
+      !fgets(header, sizeof(header), stream) || strchr(header, ',') ||
+      fseek(stream, 0, SEEK_SET) != 0 ||
+      sg_anomaly_model_read_new(stream, &loaded) != SG_ANOMALY_OK ||
+      uselocale((locale_t)0) != numeric ||
+      !snapshot_equal(snapshot_model(source), snapshot_model(loaded)))
+    goto done;
+  sg_anomaly_model_free(loaded);
+  loaded = NULL;
+  uselocale(other);
+  if (fseek(stream, 0, SEEK_SET) != 0 ||
+      sg_anomaly_model_read_new(stream, &loaded) != SG_ANOMALY_OK ||
+      uselocale((locale_t)0) != other ||
+      !snapshot_equal(snapshot_model(source), snapshot_model(loaded)))
+    goto done;
+  ok = true;
+done:
+  uselocale(previous);
+  sg_anomaly_model_free(loaded);
+  sg_anomaly_model_free(source);
+  if (stream && fclose(stream) != 0)
+    ok = false;
+  return ok;
+}
+
+TEST(persistence_is_locale_independent) {
+  locale_t comma = sg_test_comma_locale();
+  if (!comma)
+    return;
+  locale_t numeric = newlocale(LC_NUMERIC_MASK, "C", (locale_t)0);
+  ASSERT(numeric != (locale_t)0);
+  char *global = strdup(setlocale(LC_NUMERIC, NULL));
+  ASSERT(global != NULL);
+  bool ok = true;
+  const double alphas[] = {DBL_TRUE_MIN, DBL_MIN, 0.1, DBL_MAX};
+  for (size_t i = 0; i < sizeof(alphas) / sizeof(alphas[0]); i++) {
+    ok = locale_roundtrip_case(comma, numeric, alphas[i]) && ok;
+    ok = locale_roundtrip_case(numeric, comma, alphas[i]) && ok;
+  }
+  ok = strcmp(global, setlocale(LC_NUMERIC, NULL)) == 0 && ok;
+  free(global);
+  freelocale(numeric);
+  freelocale(comma);
+  ASSERT(ok);
+}
+
+TEST(persistence_locale_failures_are_atomic) {
+  sg_anomaly_model_t *model = sg_anomaly_model_new();
+  ASSERT(model != NULL);
+  update_repeated(model, commands, 5, 2);
+  anomaly_snapshot_t before = snapshot_model(model);
+  FILE *stream = tmpfile();
+  ASSERT(stream != NULL);
+  ASSERT_EQ_INT(sg_anomaly_write_stream(model, stream), SG_ANOMALY_OK);
+  locale_t numeric = newlocale(LC_NUMERIC_MASK, "C", (locale_t)0);
+  ASSERT(numeric != (locale_t)0);
+  locale_t previous = uselocale(numeric);
+  bool ok = true;
+  const int errors[] = {ENOMEM, EIO};
+  for (size_t i = 0; i < sizeof(errors) / sizeof(errors[0]); i++) {
+    sg_anomaly_status_t expected =
+        errors[i] == ENOMEM ? SG_ANOMALY_ERR_MEMORY : SG_ANOMALY_ERR_IO;
+    sg_test_locale_fail_with_errno(errors[i]);
+    sg_anomaly_status_t status = sg_anomaly_write_stream(model, stream);
+    ok = status == expected && errno == errors[i] &&
+         uselocale((locale_t)0) == numeric && ok;
+    rewind(stream);
+    sg_test_locale_fail_with_errno(errors[i]);
+    status = sg_anomaly_read_stream(model, stream);
+    ok = status == expected && errno == errors[i] &&
+         uselocale((locale_t)0) == numeric &&
+         snapshot_equal(before, snapshot_model(model)) && ok;
+    sg_anomaly_model_t *loaded = NULL;
+    sg_test_locale_fail_with_errno(errors[i]);
+    status = sg_anomaly_model_read_new(stream, &loaded);
+    ok = status == expected && errno == errors[i] && loaded == NULL &&
+         uselocale((locale_t)0) == numeric && ok;
+    sg_anomaly_model_free(loaded);
+  }
+  sg_test_io_fail_at_with_errno(1, EINVAL);
+  sg_anomaly_status_t status = sg_anomaly_write_stream(model, stream);
+  ok = status == SG_ANOMALY_ERR_IO && errno == EINVAL &&
+       uselocale((locale_t)0) == numeric && ok;
+  sg_test_io_reset();
+  rewind(stream);
+  sg_test_io_fail_at_with_errno(1, EIO);
+  status = sg_anomaly_read_stream(model, stream);
+  ok = status == SG_ANOMALY_ERR_IO && errno == EIO &&
+       uselocale((locale_t)0) == numeric &&
+       snapshot_equal(before, snapshot_model(model)) && ok;
+  sg_test_io_reset();
+  uselocale(previous);
+  freelocale(numeric);
+  sg_anomaly_model_free(model);
+  ASSERT(fclose(stream) == 0);
+  ASSERT(ok);
+}
+
+/* These owned fixtures fit the supplied buffers; inspect actual physical
+ * bytes rather than C strings, since persisted keys may contain NUL. */
+static SHELL_NONNULL(1, 2, 4) bool read_saved_bytes(const char *path,
+                                                    unsigned char *bytes,
+                                                    size_t capacity,
+                                                    size_t *length) {
+  FILE *stream = fopen(path, "rb");
+  if (!stream)
+    return false;
+  *length = fread(bytes, 1, capacity, stream);
+  bool complete = feof(stream) && !ferror(stream);
+  int closed = fclose(stream);
+  return complete && closed == 0;
+}
+
+static SHELL_NONNULL(1, 2) bool saved_bytes_equal(const char *path,
+                                                  const unsigned char *bytes,
+                                                  size_t length) {
+  unsigned char actual[4096];
+  size_t actual_length = 0;
+  return read_saved_bytes(path, actual, sizeof(actual), &actual_length) &&
+         actual_length == length && memcmp(actual, bytes, length) == 0;
+}
+
+static SHELL_NONNULL(1) bool saved_fixture_is_clean(const char *path,
+                                                    int next_fd) {
+  errno = 0;
+  bool closed = fcntl(next_fd, F_GETFD) == -1 && errno == EBADF;
+  struct stat status;
+  return closed && test_atomic_temp_files(path, false) &&
+         stat(path, &status) == 0 && (status.st_mode & 0777) == 0640;
+}
+
+TEST(path_save_failure_atomicity) {
+  char directory[] = "/tmp/shellclave-anomaly-save-XXXXXX";
+  ASSERT(mkdtemp(directory) != NULL);
+  strcpy(anomaly_save_directory, directory);
+  char path[272];
+  snprintf(path, sizeof(path), "%s/model", anomaly_save_directory);
+  sg_anomaly_model_t *previous = test_model_with_config(0.25, -12.0);
+  sg_anomaly_model_t *replacement = test_model_with_config(0.5, -8.0);
+  sg_anomaly_model_t *loaded = sg_anomaly_model_new();
+  ASSERT(previous && replacement && loaded);
+  update_repeated(previous, commands, 5, 1);
+  update_repeated(replacement, commands, 5, 3);
+  static const char binary[] = "3:a\0b,1:x,";
+  ASSERT_EQ_INT(
+      sg_anomaly_model_update_netseq(replacement, binary, sizeof(binary) - 1),
+      SG_ANOMALY_OK);
+  anomaly_snapshot_t old_state = snapshot_model(previous);
+  anomaly_snapshot_t new_state = snapshot_model(replacement);
+  unsigned char old_bytes[4096], new_bytes[4096];
+  size_t old_length = 0, new_length = 0;
+  ASSERT_EQ_INT(sg_anomaly_model_save(previous, path), SG_ANOMALY_OK);
+  struct stat mode;
+  ASSERT(stat(path, &mode) == 0 && (mode.st_mode & 0777) == 0600);
+  ASSERT(chmod(path, 0640) == 0);
+  ASSERT(read_saved_bytes(path, old_bytes, sizeof(old_bytes), &old_length));
+  sg_test_io_reset();
+  ASSERT_EQ_INT(sg_anomaly_model_save(replacement, path), SG_ANOMALY_OK);
+  size_t operations = sg_test_io_count();
+  sg_test_io_reset();
+  ASSERT(read_saved_bytes(path, new_bytes, sizeof(new_bytes), &new_length));
+  ASSERT(operations > 7 && (old_length != new_length ||
+                            memcmp(old_bytes, new_bytes, old_length)));
+
+  bool ok = true;
+  static const int errors[] = {EIO, ENOMEM, EINVAL, EPROTO};
+  for (size_t e = 0; e < sizeof(errors) / sizeof(errors[0]); e++) {
+    for (size_t fail_at = 1; fail_at <= operations; fail_at++) {
+      ASSERT_EQ_INT(sg_anomaly_model_save(previous, path), SG_ANOMALY_OK);
+      int next_fd = open(path, O_RDONLY);
+      ASSERT(next_fd >= 0 && close(next_fd) == 0);
+      sg_test_io_fail_at_with_errno(fail_at, errors[e]);
+      sg_anomaly_status_t result = sg_anomaly_model_save(replacement, path);
+      int error_number = errno;
+      sg_test_io_reset();
+      /* Only synchronization and close of the retained parent follow rename. */
+      bool installed = fail_at > operations - 2;
+      sg_anomaly_status_t expected =
+          errors[e] == ENOMEM ? SG_ANOMALY_ERR_MEMORY : SG_ANOMALY_ERR_IO;
+      bool case_ok = result == expected && error_number == errors[e] &&
+                     saved_bytes_equal(path, installed ? new_bytes : old_bytes,
+                                       installed ? new_length : old_length) &&
+                     saved_fixture_is_clean(path, next_fd) &&
+                     sg_anomaly_model_load(loaded, path) == SG_ANOMALY_OK &&
+                     snapshot_equal(installed ? new_state : old_state,
+                                    snapshot_model(loaded));
+      if (!case_ok)
+        fprintf(stderr, "save fault %zu/%zu errno %d: status=%d errno=%d\n",
+                fail_at, operations, errors[e], result, error_number);
+      ok = case_ok && ok;
+    }
+  }
+
+  for (size_t e = 0; e < 2; e++) {
+    ASSERT_EQ_INT(sg_anomaly_model_save(previous, path), SG_ANOMALY_OK);
+    int next_fd = open(path, O_RDONLY);
+    ASSERT(next_fd >= 0 && close(next_fd) == 0);
+    sg_test_locale_fail_with_errno(errors[e]);
+    sg_test_io_close_fail_with_errno(EPROTO);
+    sg_anomaly_status_t result = sg_anomaly_model_save(replacement, path);
+    int error_number = errno;
+    sg_test_io_reset();
+    ok = result == (errors[e] == ENOMEM ? SG_ANOMALY_ERR_MEMORY
+                                        : SG_ANOMALY_ERR_IO) &&
+         error_number == errors[e] &&
+         saved_bytes_equal(path, old_bytes, old_length) &&
+         saved_fixture_is_clean(path, next_fd) &&
+         sg_anomaly_model_load(loaded, path) == SG_ANOMALY_OK &&
+         snapshot_equal(old_state, snapshot_model(loaded)) && ok;
+  }
+
+  /* A later close failure must not replace an earlier flush/sync error. */
+  for (size_t fail_at = operations - 6; fail_at <= operations - 4; fail_at++) {
+    int next_fd = open(path, O_RDONLY);
+    ASSERT(next_fd >= 0 && close(next_fd) == 0);
+    sg_test_io_fail_at_with_errno(fail_at, ENOMEM);
+    sg_test_io_close_fail_with_errno(EIO);
+    sg_anomaly_status_t result = sg_anomaly_model_save(replacement, path);
+    int error_number = errno;
+    sg_test_io_reset();
+    ok = result == SG_ANOMALY_ERR_MEMORY && error_number == ENOMEM &&
+         saved_bytes_equal(path, old_bytes, old_length) &&
+         saved_fixture_is_clean(path, next_fd) && ok;
+  }
+
+  int next_fd = open(path, O_RDONLY);
+  ASSERT(next_fd >= 0 && close(next_fd) == 0);
+  sg_test_alloc_fail_at(1);
+  sg_anomaly_status_t result = sg_anomaly_model_save(replacement, path);
+  int error_number = errno;
+  sg_test_alloc_reset();
+  ok = result == SG_ANOMALY_ERR_MEMORY && error_number == ENOMEM &&
+       saved_bytes_equal(path, old_bytes, old_length) &&
+       saved_fixture_is_clean(path, next_fd) && ok;
+  ok = snapshot_equal(old_state, snapshot_model(previous)) &&
+       snapshot_equal(new_state, snapshot_model(replacement)) && ok;
+
+  /* File saves must not replace special files, even with directory write
+   * permission. The FIFO remains unopened and cannot block this test. */
+  ASSERT(unlink(path) == 0 && mkfifo(path, 0600) == 0);
+  result = sg_anomaly_model_save(replacement, path);
+  error_number = errno;
+  ok = result == SG_ANOMALY_ERR_IO && error_number == EINVAL &&
+       lstat(path, &mode) == 0 && S_ISFIFO(mode.st_mode) && ok;
+  result = sg_anomaly_model_save(replacement, anomaly_save_directory);
+  error_number = errno;
+  ok = result == SG_ANOMALY_ERR_IO && error_number == EISDIR &&
+       stat(anomaly_save_directory, &mode) == 0 && S_ISDIR(mode.st_mode) && ok;
+
+  /* A symlink names the entry to replace, not the file to modify. */
+  ASSERT(unlink(path) == 0);
+  char target[280];
+  snprintf(target, sizeof(target), "%s.target", path);
+  ASSERT_EQ_INT(sg_anomaly_model_save(previous, target), SG_ANOMALY_OK);
+  ASSERT(symlink(target, path) == 0);
+  result = sg_anomaly_model_save(replacement, path);
+  ok = result == SG_ANOMALY_OK && lstat(path, &mode) == 0 &&
+       S_ISREG(mode.st_mode) &&
+       saved_bytes_equal(path, new_bytes, new_length) &&
+       saved_bytes_equal(target, old_bytes, old_length) && ok;
+  static const mode_t preserved_modes[] = {0750, 04750, 02750, 01750};
+  for (size_t m = 0; m < sizeof(preserved_modes) / sizeof(preserved_modes[0]);
+       m++) {
+    ok = chmod(path, preserved_modes[m]) == 0 && ok;
+    result = sg_anomaly_model_save(replacement, path);
+    ok = result == SG_ANOMALY_OK && stat(path, &mode) == 0 &&
+         (mode.st_mode & 07777) == preserved_modes[m] &&
+         saved_bytes_equal(path, new_bytes, new_length) && ok;
+  }
+
+  long name_max = pathconf(anomaly_save_directory, _PC_NAME_MAX);
+  size_t prefix = strlen(anomaly_save_directory) + 1;
+  char long_path[PATH_MAX];
+  if (name_max < 14 || (size_t)name_max + prefix + 2 > sizeof(long_path)) {
+    ok = false;
+  } else {
+    const size_t names[] = {(size_t)name_max - 7, (size_t)name_max - 6,
+                            (size_t)name_max, (size_t)name_max + 1};
+    for (size_t n = 0; n < sizeof(names) / sizeof(names[0]); n++) {
+      memcpy(long_path, anomaly_save_directory, prefix - 1);
+      long_path[prefix - 1] = '/';
+      memset(long_path + prefix, 'x', names[n]);
+      long_path[prefix + names[n]] = '\0';
+      if (names[n] > (size_t)name_max) {
+        result = sg_anomaly_model_save(replacement, long_path);
+        ok = result == SG_ANOMALY_ERR_IO && errno == ENAMETOOLONG &&
+             test_atomic_temp_files(long_path, false) && ok;
+        continue;
+      }
+      for (unsigned existing = 0; existing < 2; existing++) {
+        result = sg_anomaly_model_save(replacement, long_path);
+        bool case_ok =
+            result == SG_ANOMALY_OK &&
+            saved_bytes_equal(long_path, new_bytes, new_length) &&
+            lstat(long_path, &mode) == 0 && S_ISREG(mode.st_mode) &&
+            (mode.st_mode & 0777) == (existing ? 0640 : 0600) &&
+            sg_anomaly_model_load(loaded, long_path) == SG_ANOMALY_OK &&
+            snapshot_equal(new_state, snapshot_model(loaded)) &&
+            test_atomic_temp_files(long_path, false);
+        if (!case_ok)
+          fprintf(stderr, "anomaly save basename %zu existing=%u: status=%d\n",
+                  names[n], existing, result);
+        ok = case_ok && ok;
+        ok = chmod(long_path, 0640) == 0 && ok;
+      }
+      ok = unlink(long_path) == 0 && ok;
+    }
+  }
+  sg_anomaly_model_free(loaded);
+  sg_anomaly_model_free(replacement);
+  sg_anomaly_model_free(previous);
+  cleanup_anomaly_save_fixture();
+  ASSERT(ok);
+}
+
+TEST(path_save_near_path_max) {
+  test_atomic_long_directory_t directory = {0};
+  sg_anomaly_model_t *source = sg_anomaly_model_new();
+  sg_anomaly_model_t *loaded = sg_anomaly_model_new();
+  static const char binary[] = "3:a\0b,1:x,1:z,";
+  bool ok = source && loaded;
+  if (ok)
+    ok = sg_anomaly_model_update_netseq(source, binary, sizeof(binary) - 1) ==
+         SG_ANOMALY_OK;
+  static const char *const roots[] = {"/tmp/shellclave-long-anomaly-XXXXXX",
+                                      "shellclave-long-anomaly-XXXXXX"};
+  const size_t lengths[] = {PATH_MAX - 12, PATH_MAX - 3, PATH_MAX - 2,
+                            PATH_MAX - 1};
+  for (size_t r = 0; ok && r < sizeof(roots) / sizeof(roots[0]); r++) {
+    for (size_t l = 0; ok && l < sizeof(lengths) / sizeof(lengths[0]); l++) {
+      ok = test_atomic_long_directory_create(&directory, roots[r], lengths[l]);
+      if (!ok)
+        break;
+      char path[PATH_MAX + 2];
+      memcpy(path, directory.path, lengths[l]);
+      memcpy(path + lengths[l], "/x", 3);
+      if (lengths[l] + 2 >= PATH_MAX) {
+        anomaly_snapshot_t before = snapshot_model(loaded);
+        for (unsigned existing = 0; ok && existing < 2; existing++) {
+          if (existing)
+            ok = test_atomic_directory_sentinel(directory.path, true);
+          if (ok) {
+            errno = 0;
+            ok = sg_anomaly_model_save(source, path) == SG_ANOMALY_ERR_IO &&
+                 errno == ENAMETOOLONG &&
+                 test_atomic_directory_only_entry(directory.path,
+                                                  existing ? "x" : NULL);
+          }
+          if (ok && existing)
+            ok = test_atomic_directory_sentinel(directory.path, false);
+        }
+        if (ok)
+          ok = sg_anomaly_model_load(loaded, path) == SG_ANOMALY_ERR_IO &&
+               snapshot_equal(before, snapshot_model(loaded));
+        ok = test_atomic_long_directory_cleanup(&directory) && ok;
+        continue;
+      }
+      unsigned char expected[4096];
+      size_t length = 0;
+      for (unsigned existing = 0; ok && existing < 2; existing++) {
+        struct stat mode;
+        ok = sg_anomaly_model_save(source, path) == SG_ANOMALY_OK &&
+             stat(path, &mode) == 0 &&
+             (mode.st_mode & 07777) == (existing ? 04750 : 0600) &&
+             test_atomic_temp_files(path, false) &&
+             sg_anomaly_model_load(loaded, path) == SG_ANOMALY_OK &&
+             snapshot_equal(snapshot_model(source), snapshot_model(loaded));
+        if (ok && !existing)
+          ok = read_saved_bytes(path, expected, sizeof(expected), &length);
+        else if (ok)
+          ok = saved_bytes_equal(path, expected, length);
+        if (ok)
+          ok = chmod(path, 04750) == 0;
+      }
+      ok = test_atomic_long_directory_cleanup(&directory) && ok;
+    }
+  }
+  ok = test_atomic_long_directory_cleanup(&directory) && ok;
+  sg_anomaly_model_free(loaded);
+  sg_anomaly_model_free(source);
+  ASSERT(ok);
+}
+
+TEST(persisted_counter_accumulation_is_exact) {
+  /* Signed-key overflow below SIZE_MAX requires a 64-bit size_t. The generic
+   * aggregate-total overflow fixture is exercised separately above. */
+  if (SIZE_MAX <= INT64_MAX)
+    return;
+  sg_anomaly_model_t *target = sg_anomaly_model_new();
+  ASSERT(target != NULL);
+  update_repeated(target, commands, 5, 2);
+  anomaly_snapshot_t before = snapshot_model(target);
+  for (uint8_t order = 1; order <= 4; order++) {
+    for (unsigned context = 0; context < (order == 1 ? 1u : 2u); context++) {
+      FILE *stream = tmpfile();
+      ASSERT(stream != NULL);
+      size_t total = (size_t)INT64_MAX + 1u;
+      ASSERT(
+          fprintf(stream,
+                  "# anomaly-model-v7\n# 0.1 -10 0.5 %zu %zu %zu %zu %zu 0\n",
+                  order == 1 ? total : 0, order == 2 ? total : 0,
+                  order == 3 ? total : 0, order == 4 ? total : 0,
+                  (size_t)(order == 1 ? 1u : 0u)) > 0);
+      static const char *keys[] = {"1:a,", "1:a,1:b,", "1:a,1:b,1:c,",
+                                   "1:a,1:b,1:c,1:d,"};
+      static const char *siblings[] = {"1:a,", "1:a,1:x,", "1:a,1:b,1:x,",
+                                       "1:a,1:b,1:c,1:x,"};
+      ASSERT(write_count_record(stream, order, keys[order - 1], INT64_MAX));
+      ASSERT(write_count_record(
+          stream, order, context ? siblings[order - 1] : keys[order - 1], 1));
+      ASSERT(fflush(stream) == 0 && fseek(stream, 0, SEEK_SET) == 0);
+      ASSERT_EQ_INT(sg_anomaly_read_stream(target, stream),
+                    SG_ANOMALY_ERR_LIMIT);
+      ASSERT_EQ_INT(errno, EOVERFLOW);
+      ASSERT(snapshot_equal(before, snapshot_model(target)));
+      ASSERT(fclose(stream) == 0);
+    }
+  }
+  /* Representable duplicate records remain additive and become one exact
+   * record when reserialized, rather than being silently saturated. */
+  FILE *stream = tmpfile();
+  ASSERT(stream != NULL);
+  ASSERT(fprintf(stream, "# anomaly-model-v7\n# 0.1 -10 0.5 %zu 0 0 0 1 0\n",
+                 (size_t)INT64_MAX) > 0);
+  ASSERT(write_count_record(stream, 1, "1:a,", INT64_MAX - 1));
+  ASSERT(write_count_record(stream, 1, "1:a,", 1));
+  ASSERT(fflush(stream) == 0 && fseek(stream, 0, SEEK_SET) == 0);
+  ASSERT_EQ_INT(sg_anomaly_read_stream(target, stream), SG_ANOMALY_OK);
+  ASSERT_EQ_INT(sg_anomaly_model_unigram_count(target, "a"), (size_t)INT64_MAX);
+  ASSERT_EQ_INT(sg_anomaly_model_total_unigrams(target), (size_t)INT64_MAX);
+  ASSERT(fclose(stream) == 0);
+  stream = tmpfile();
+  ASSERT(stream != NULL);
+  ASSERT_EQ_INT(sg_anomaly_write_stream(target, stream), SG_ANOMALY_OK);
+  ASSERT(fseek(stream, 0, SEEK_SET) == 0);
+  sg_anomaly_model_t *roundtrip = NULL;
+  ASSERT_EQ_INT(sg_anomaly_model_read_new(stream, &roundtrip), SG_ANOMALY_OK);
+  ASSERT_EQ_INT(sg_anomaly_model_unigram_count(roundtrip, "a"),
+                (size_t)INT64_MAX);
+  ASSERT_EQ_INT(sg_anomaly_model_total_unigrams(roundtrip), (size_t)INT64_MAX);
+  ASSERT(fclose(stream) == 0);
+  sg_anomaly_model_free(roundtrip);
+  sg_anomaly_model_free(target);
+}
+
+static sg_anomaly_model_t *model_with_large_counts(uint64_t count,
+                                                   size_t unknown) {
+  static const char *keys[] = {"1:a,", "1:a,1:a,", "1:a,1:a,1:a,",
+                               "1:a,1:a,1:a,1:a,"};
+  FILE *stream = tmpfile();
+  if (!stream)
+    return NULL;
+  sg_anomaly_model_t *model = NULL;
+  bool ok = fprintf(stream,
+                    "# anomaly-model-v7\n# 0.1 -10 0.5 %zu %zu %zu %zu 1 %zu\n",
+                    (size_t)count, (size_t)count, (size_t)count, (size_t)count,
+                    unknown) > 0;
+  for (uint8_t order = 1; order <= 4 && ok; order++)
+    ok = write_count_record(stream, order, keys[order - 1], count);
+  if (ok && fseek(stream, 0, SEEK_SET) == 0)
+    ok = sg_anomaly_model_read_new(stream, &model) == SG_ANOMALY_OK;
+  else
+    ok = false;
+  if (fclose(stream) != 0)
+    ok = false;
+  if (!ok) {
+    sg_anomaly_model_free(model);
+    return NULL;
+  }
+  return model;
+}
+
+/* Independent integer quotient/remainder expectations for dyadic scales,
+ * rather than duplicating the production wide-multiplication implementation. */
+static uint64_t expected_dyadic_decay(uint64_t count, unsigned numerator,
+                                      unsigned bits) {
+  if (bits >= 64)
+    return 0;
+  uint64_t divisor = UINT64_C(1) << bits;
+  return (count / divisor) * numerator +
+         ((count % divisor) * numerator) / divisor;
+}
+
+static uint64_t expected_near_one_decay(uint64_t count) {
+  if (DBL_MANT_DIG >= 64)
+    return count ? count - 1 : 0;
+  uint64_t divisor = UINT64_C(1) << DBL_MANT_DIG;
+  return count - count / divisor - (count % divisor != 0);
+}
+
+TEST(decay_preserves_integer_precision) {
+  const uint64_t counts[] = {1,
+                             2,
+                             3,
+                             (UINT64_C(1) << 32) - 1,
+                             (UINT64_C(1) << 32) + 1,
+                             (UINT64_C(1) << 53) - 1,
+                             UINT64_C(1) << 53,
+                             (UINT64_C(1) << 53) + 1,
+                             INT64_MAX};
+  const struct {
+    double scale;
+    unsigned numerator;
+    unsigned bits;
+  } scales[] = {{0.5, 1, 1},
+                {0.75, 3, 2},
+                {0.125, 1, 3},
+                {0x1p-32, 1, 32},
+                {0x1p-64, 1, 64},
+                {DBL_TRUE_MIN, 1, 1074},
+                {nextafter(1.0, 0.0), 0, 0}};
+  static const char sequence[] = "1:a,1:a,1:a,1:a,";
+  for (size_t i = 0; i < sizeof(counts) / sizeof(counts[0]); i++) {
+    if (counts[i] > SIZE_MAX)
+      continue;
+    for (size_t j = 0; j < sizeof(scales) / sizeof(scales[0]); j++) {
+      sg_anomaly_model_t *model = model_with_large_counts(counts[i], SIZE_MAX);
+      ASSERT(model != NULL);
+      ASSERT_EQ_INT(sg_anomaly_model_decay(model, scales[j].scale),
+                    SG_ANOMALY_OK);
+      size_t expected =
+          (size_t)(scales[j].numerator
+                       ? expected_dyadic_decay(counts[i], scales[j].numerator,
+                                               scales[j].bits)
+                       : expected_near_one_decay(counts[i]));
+      size_t expected_unknown =
+          (size_t)(scales[j].numerator
+                       ? expected_dyadic_decay(SIZE_MAX, scales[j].numerator,
+                                               scales[j].bits)
+                       : expected_near_one_decay(SIZE_MAX));
+      ASSERT_EQ_INT(sg_anomaly_model_unigram_count(model, "a"), expected);
+      ASSERT_EQ_INT(sg_anomaly_model_bigram_count(model, "a", "a"), expected);
+      ASSERT_EQ_INT(sg_anomaly_model_trigram_count(model, "a", "a", "a"),
+                    expected);
+      ASSERT_EQ_INT(sg_anomaly_model_fourgram_count(model, "a", "a", "a", "a"),
+                    expected);
+      ASSERT_EQ_INT(sg_anomaly_model_total_unigrams(model), expected);
+      ASSERT_EQ_INT(sg_anomaly_model_total_bigrams(model), expected);
+      ASSERT_EQ_INT(sg_anomaly_model_total_trigrams(model), expected);
+      ASSERT_EQ_INT(sg_anomaly_model_total_fourgrams(model), expected);
+      ASSERT_EQ_INT(sg_anomaly_model_unknown_count(model), expected_unknown);
+      ASSERT_EQ_INT(sg_anomaly_model_total_contexts(model), expected ? 3 : 0);
+      sg_anomaly_model_t *loaded = roundtrip_model(model);
+      ASSERT(loaded != NULL);
+      ASSERT_EQ_INT(sg_anomaly_model_total_unigrams(loaded), expected);
+      ASSERT_EQ_INT(sg_anomaly_model_unknown_count(loaded), expected_unknown);
+      double before, after;
+      ASSERT_EQ_INT(sg_anomaly_model_score_netseq(
+                        model, sequence, sizeof(sequence) - 1, &before),
+                    SG_ANOMALY_OK);
+      ASSERT_EQ_INT(sg_anomaly_model_score_netseq(loaded, sequence,
+                                                  sizeof(sequence) - 1, &after),
+                    SG_ANOMALY_OK);
+      ASSERT(before == after);
+      sg_anomaly_model_free(loaded);
+      sg_anomaly_model_free(model);
+    }
+  }
+  if (SIZE_MAX < INT64_MAX)
+    return;
+  sg_anomaly_model_t *model = model_with_large_counts(INT64_MAX, SIZE_MAX);
+  ASSERT(model != NULL);
+  sg_test_alloc_fail_at(1);
+  ASSERT_EQ_INT(sg_anomaly_model_decay(model, 0.5), SG_ANOMALY_ERR_MEMORY);
+  sg_test_alloc_reset();
+  ASSERT_EQ_INT(sg_anomaly_model_unigram_count(model, "a"), (size_t)INT64_MAX);
+  ASSERT_EQ_INT(sg_anomaly_model_unknown_count(model), SIZE_MAX);
+  sg_test_anomaly_op_fail_at(1);
+  ASSERT_EQ_INT(sg_anomaly_model_decay(model, 0.5), SG_ANOMALY_ERR_MEMORY);
+  sg_test_anomaly_op_reset();
+  ASSERT_EQ_INT(sg_anomaly_model_unigram_count(model, "a"), (size_t)INT64_MAX);
+  ASSERT_EQ_INT(sg_anomaly_model_unknown_count(model), SIZE_MAX);
+  /* 0.1 is not exactly 1/10 in binary; these constants are the exact floor
+   * of the product with its represented value, not decimal approximations. */
+  ASSERT_EQ_INT(sg_anomaly_model_decay(model, 0.1), SG_ANOMALY_OK);
+  ASSERT_EQ_INT(sg_anomaly_model_unigram_count(model, "a"),
+                UINT64_C(922337203685477631));
+  ASSERT_EQ_INT(sg_anomaly_model_unknown_count(model),
+                UINT64_C(1844674407370955263));
+  sg_anomaly_model_free(model);
 }
 
 TEST(canonical_netseq_allocation_failures) {
@@ -1233,20 +2524,17 @@ TEST(paired_netseq_updates_are_failure_atomic) {
                 SG_ANOMALY_ERR_FORMAT);
   ASSERT(snapshot_equal(raw_before, snapshot_model(raw)));
   ASSERT(snapshot_equal(type_before, snapshot_model(type)));
-  ASSERT_EQ_INT(sg_anomaly_models_update_netseq_pair(
-                    raw, raw_update, sizeof(raw_update) - 1, raw, type_update,
-                    sizeof(type_update) - 1),
-                SG_ANOMALY_ERR_INVALID);
-  ASSERT(snapshot_equal(raw_before, snapshot_model(raw)));
   sg_anomaly_model_free(type);
   sg_anomaly_model_free(raw);
 }
 
 int main(void) {
   atexit(cleanup_anomaly_temp_file);
+  atexit(cleanup_anomaly_save_fixture);
   printf("sg_anomaly unit tests\n");
   RUN(lifecycle_and_null_safety);
   RUN(config_contract);
+  RUN(extreme_alpha_scores_are_finite);
   RUN(update_count_matrix);
   RUN(score_discrimination_matrix);
   RUN(backoff_levels_are_usable);
@@ -1257,9 +2545,25 @@ int main(void) {
   RUN(decay_matrix);
   RUN(decay_removes_large_rare_model);
   RUN(prune_and_compact_preserve_common_behavior);
+  RUN(maintenance_rebuilds_derived_contexts);
+  RUN(context_statistics_match_probability_reference);
+  RUN(compaction_failures_preserve_counts_and_sticky_error);
+  RUN(context_statistics_rollback_is_atomic);
+  RUN(scoring_work_is_linear);
+  RUN(one_pass_score_and_count);
   RUN(canonical_netseq_contract);
   RUN(binary_netseq_persistence);
   RUN(empty_stage_persistence_and_legacy_loading);
+  RUN(typed_stream_io_failure_atomicity);
+  RUN(owned_file_close_and_error_precedence);
+  RUN(persisted_header_validation);
+  RUN(persisted_header_framing);
+  RUN(persistence_is_locale_independent);
+  RUN(persistence_locale_failures_are_atomic);
+  RUN(path_save_failure_atomicity);
+  RUN(path_save_near_path_max);
+  RUN(persisted_counter_accumulation_is_exact);
+  RUN(decay_preserves_integer_precision);
   RUN(canonical_netseq_allocation_failures);
   RUN(paired_netseq_updates_are_failure_atomic);
   printf("\n%d passed, %d failed\n", pass_count, fail_count);

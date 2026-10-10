@@ -1,6 +1,8 @@
 #ifndef SHELL_TOKENIZER_FULL_H
 #define SHELL_TOKENIZER_FULL_H
 
+#include "shell_contract.h"
+
 #include <stdbool.h>
 #include <stddef.h>
 
@@ -72,6 +74,8 @@ typedef enum {
   SHELL_TOKEN_CASE_FALLTHROUGH, // ;&
   SHELL_TOKEN_CASE_TEST_NEXT,   // ;;&
   SHELL_TOKEN_PIPE_BOTH,        // Bash |&
+  SHELL_TOKEN_PIPE_TIME,        // Bash reserved `time` pipeline modifier
+  SHELL_TOKEN_PIPE_TIME_OPTION, // `time`'s consumed -p or -- option
   SHELL_TOKEN_TYPE_COUNT
 } shell_token_type_t;
 
@@ -95,8 +99,11 @@ typedef struct {
 typedef struct {
   shell_token_t *tokens; // Array of tokens
   size_t token_count;    // Number of tokens
-  size_t start_pos;      // Start position in original string
-  size_t end_pos;        // End position in original string
+  /* Half-open source span for this flattened command. Every token is fully
+   * contained in [start_pos, end_pos); compound-level pipeline prefixes are
+   * represented by metadata rather than attached to an inner command. */
+  size_t start_pos;
+  size_t end_pos;
   size_t group_depth;    // Enclosing command-group nesting depth
   uint8_t group_kinds;   // shell_group_kind_t bitset of enclosing groups
   bool has_variables;    // Contains variables ($VAR, ${VAR}, etc.)
@@ -115,6 +122,10 @@ typedef struct {
    * inversion rather than merely the presence of syntax. */
   uint32_t pipeline_negation_count;
   bool pipeline_negated;
+  /* Effective lexical timing context. Commands enclosed by a directly timed
+   * compound inherit its mode here; structured processor and graph APIs keep
+   * the directly timed compound itself as the authoritative owner. */
+  shell_pipeline_time_mode_t pipeline_time_mode;
   shell_pipe_mode_t pipe_output_mode; // Pipe operator following this command
 } shell_command_t;
 
@@ -151,24 +162,34 @@ typedef struct {
   int if_depth;   // Track if/then/fi nesting
   int loop_depth; // Track while/for/until nesting
   int case_depth; // Track case/esac nesting
+  /* Forward lexical grammar context, maintained by next(). Braces in an
+   * ordinary command word or redirect operand are not reserved delimiters.
+   * These fields are iterator state, not metadata for caller validation. */
+  /* Previous word-fragment end, including redirect operands. Operators reset
+   * it, letting adjacent descriptor syntax reuse forward lexical context. */
+  size_t lexical_operand_end;
+  uint8_t lexical_prefix;
+  bool lexical_command_position;
+  bool lexical_redirect_operand;
 } shell_tokenizer_state_t;
 
 /**
  * Initialize a tokenizer over exactly `input_length` source bytes. NULL input
- * is valid only with zero length. Returns false for invalid input or state.
+ * is valid only with zero length. The state pointer is required; returns false
+ * for invalid input.
  */
 bool shell_tokenizer_init(shell_tokenizer_state_t *state, const char *input,
-                          size_t input_length);
+                          size_t input_length) SHELL_NONNULL(1);
 
 /**
  * Get the next lexical token. A heredoc declaration is one
  * SHELL_TOKEN_HEREDOC token spanning `<<` and its delimiter; its body and
  * terminator are opaque data and are skipped after the declaration line.
- * Returns false without advancing state when token is NULL. When token is
- * writable but state is NULL or exhausted, token is cleared and set to
- * SHELL_TOKEN_END.
+ * State must be initialized by shell_tokenizer_init(); both pointers are
+ * required. At exhaustion, token is cleared and set to SHELL_TOKEN_END.
  */
-bool shell_tokenizer_next(shell_tokenizer_state_t *state, shell_token_t *token);
+bool shell_tokenizer_next(shell_tokenizer_state_t *state, shell_token_t *token)
+    SHELL_NONNULL(1, 2);
 
 typedef enum {
   SHELL_TOKENIZE_OK = 0,
@@ -184,12 +205,17 @@ typedef enum {
  * with shell_commands_free(); token text points into input, which must remain
  * valid until the result is freed. Impossible top-level list-operator chains
  * (for example, a trailing pipe or a pipe followed by another operator) are
- * rejected. On failure, writable outputs are NULL and 0.
+ * rejected. Every returned command has at least one token, all contained in
+ * its [start_pos, end_pos) source span. Compound-tail redirections stay in the
+ * final body record; delimiters and empty structural slots do not become
+ * separate records. A separately written redirect-only command still has
+ * tokens and its own record, even though it has no argv words.
+ * On failure, writable outputs are NULL and 0.
  */
-shell_tokenize_status_t shell_tokenize_commands(const char *input,
-                                                size_t input_length,
-                                                shell_command_t **commands,
-                                                size_t *command_count);
+shell_tokenize_status_t
+shell_tokenize_commands(const char *input, size_t input_length,
+                        shell_command_t **commands, size_t *command_count)
+    SHELL_NONNULL(1, 3, 4);
 
 /**
  * Free tokenized commands
@@ -204,7 +230,8 @@ const char *shell_token_type_name(shell_token_type_t type);
 /**
  * Check if command has shell scripting features
  */
-bool shell_command_has_shell_features(const shell_command_t *command);
+bool shell_command_has_shell_features(const shell_command_t *command)
+    SHELL_NONNULL(1);
 
 #ifdef __cplusplus
 }

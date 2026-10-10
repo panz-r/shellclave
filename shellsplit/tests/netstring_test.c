@@ -127,49 +127,13 @@ static void test_encoding(void) {
            SHELL_NETSTRING_EOVERFLOW);
 }
 
-static void test_api_contract_failures(void) {
-  static const unsigned char one_record[] = "1:x,";
-  unsigned char record[16] = {0};
+static void test_malformed_record(void) {
   shell_netstring_iter_t iter;
   shell_netstring_view_t view;
-  size_t length = SIZE_MAX;
-  size_t prefix = SIZE_MAX;
 
-  TEST("iterator initialization requires valid storage",
-       shell_netstring_iter_init(NULL, one_record, sizeof(one_record) - 1) ==
-               SHELL_NETSTRING_EINPUT &&
-           shell_netstring_iter_init(&iter, NULL, 1) == SHELL_NETSTRING_EINPUT);
-  TEST("iterator next validates arguments and offsets",
-       shell_netstring_iter_next(NULL, &view) == SHELL_NETSTRING_EINPUT &&
-           shell_netstring_iter_init(&iter, one_record,
-                                     sizeof(one_record) - 1) ==
-               SHELL_NETSTRING_OK &&
-           shell_netstring_iter_next(&iter, NULL) == SHELL_NETSTRING_EINPUT &&
-           ((iter.offset = iter.length + 1),
-            shell_netstring_iter_next(&iter, &view) == SHELL_NETSTRING_EINPUT));
   TEST("iterator rejects a length prefix without a colon",
        shell_netstring_iter_init(&iter, "1x", 2) == SHELL_NETSTRING_OK &&
            shell_netstring_iter_next(&iter, &view) == SHELL_NETSTRING_EFORMAT);
-  TEST("encoded length requires an output pointer",
-       shell_netstring_encoded_length(1, NULL) == SHELL_NETSTRING_EINPUT);
-  TEST("prefix writer validates storage and capacity",
-       shell_netstring_write_prefix(NULL, sizeof(record), 1, &prefix) ==
-               SHELL_NETSTRING_EINPUT &&
-           prefix == 0 &&
-           shell_netstring_write_prefix(record, 1, 10, &prefix) ==
-               SHELL_NETSTRING_EOVERFLOW &&
-           prefix == 0);
-  TEST("record writer validates input and overflow",
-       shell_netstring_write(NULL, sizeof(record), "x", 1, &length) ==
-               SHELL_NETSTRING_EINPUT &&
-           length == 0 &&
-           shell_netstring_write(record, sizeof(record), NULL, 1, &length) ==
-               SHELL_NETSTRING_EINPUT &&
-           shell_netstring_write(record, sizeof(record), "x", 1, NULL) ==
-               SHELL_NETSTRING_OK &&
-           shell_netstring_write(record, SIZE_MAX, record, SIZE_MAX, &length) ==
-               SHELL_NETSTRING_EOVERFLOW &&
-           length == 0);
 }
 
 static void test_stream_reader(void) {
@@ -264,16 +228,7 @@ static void test_stream_reader_format_failures(void) {
   };
   unsigned char *record = (unsigned char *)(void *)1;
   size_t length = SIZE_MAX;
-  TEST("stream reader requires every output and stream",
-       shell_netstring_read_stream(NULL, 0, &record, &length) ==
-               SHELL_NETSTRING_EINPUT &&
-           record == NULL && length == 0 &&
-           shell_netstring_read_stream(stdin, 0, NULL, &length) ==
-               SHELL_NETSTRING_EINPUT &&
-           length == 0 &&
-           shell_netstring_read_stream(stdin, 0, &record, NULL) ==
-               SHELL_NETSTRING_EINPUT &&
-           record == NULL);
+
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
     FILE *stream = tmpfile();
     TEST("open malformed stream", stream != NULL);
@@ -309,7 +264,7 @@ int main(void) {
   test_validation_failures();
   test_count_and_error_position();
   test_encoding();
-  test_api_contract_failures();
+  test_malformed_record();
   test_stream_reader();
   test_stream_reader_allocation_failures();
   test_stream_reader_rejects_unallocatable_record();

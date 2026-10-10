@@ -45,11 +45,13 @@ static bool abstract_special_parameter(char c) {
   return strchr("?#$-!@*", c) != NULL;
 }
 
-static bool abstract_parse_parameter_name(const char *text, size_t length,
-                                          size_t position,
-                                          shell_abstract_variable_info_t *out,
-                                          size_t *after) {
-  if (!text || !out || !after || position >= length)
+/* These metadata recognizers reject non-variable or malformed spellings.
+ * text is a valid byte span and output storage is required; successful name
+ * offsets refer to that span. Storage validity is not checked here. */
+static SHELL_NONNULL(1, 4, 5) bool abstract_parse_parameter_name(
+    const char *text, size_t length, size_t position,
+    shell_abstract_variable_info_t *out, size_t *after) {
+  if (position >= length)
     return false;
 
   position = shell_source_skip_escaped_line_endings(text, length, position);
@@ -82,9 +84,9 @@ static bool abstract_parse_parameter_name(const char *text, size_t length,
   return true;
 }
 
-static bool abstract_parse_variable(const char *text, size_t length,
-                                    shell_abstract_variable_info_t *out) {
-  if (!text || !out || length < 2 || text[0] != '$')
+static SHELL_NONNULL(1, 3) bool abstract_parse_variable(
+    const char *text, size_t length, shell_abstract_variable_info_t *out) {
+  if (length < 2 || text[0] != '$')
     return false;
   memset(out, 0, sizeof(*out));
 
@@ -153,12 +155,9 @@ static bool abstract_parse_variable(const char *text, size_t length,
  * Keep their established whole-token abstraction while extracting metadata
  * from the expansion itself. Compound unquoted words reach this helper with
  * the variable span already isolated. */
-static bool
-abstract_variable_info_from_token(const char *text, size_t length,
-                                  shell_abstract_variable_info_t *out,
-                                  size_t *variable_start) {
-  if (!text || !out || !variable_start)
-    return false;
+static SHELL_NONNULL(1, 3, 4) bool abstract_variable_info_from_token(
+    const char *text, size_t length, shell_abstract_variable_info_t *out,
+    size_t *variable_start) {
   *variable_start = 0;
   if (abstract_parse_variable(text, length, out))
     return true;
@@ -179,14 +178,15 @@ abstract_variable_info_from_token(const char *text, size_t length,
   return true;
 }
 
-static bool abstract_variable_info(const char *text, size_t length,
-                                   shell_abstract_variable_info_t *out) {
+static SHELL_NONNULL(1, 3) bool abstract_variable_info(
+    const char *text, size_t length, shell_abstract_variable_info_t *out) {
   size_t variable_start = 0;
   return abstract_variable_info_from_token(text, length, out, &variable_start);
 }
 
-static char *abstract_variable_name_copy(const char *text, size_t length,
-                                         bool *has_static_name) {
+/* NULL has_static_name omits the optional static-name discriminator. */
+static SHELL_NONNULL(1) char *abstract_variable_name_copy(
+    const char *text, size_t length, bool *has_static_name) {
   if (has_static_name)
     *has_static_name = false;
   shell_abstract_variable_info_t info = {0};
@@ -233,36 +233,7 @@ static char *abstract_variable_name_copy(const char *text, size_t length,
  * Check if string contains glob characters
  */
 static bool is_glob_pattern(const char *s, size_t len) {
-  if (len == 0)
-    return false;
-
-  // Must contain at least one glob char
-  bool has_glob = false;
-  for (size_t i = 0; i < len; i++) {
-    if (s[i] == '*' || s[i] == '?' ||
-        (s[i] == '[' && i + 1 < len && s[len - 1] != '[')) {
-      has_glob = true;
-      break;
-    }
-  }
-
-  if (!has_glob)
-    return false;
-
-  // Check for path-like patterns
-  if (s[0] == '/' || s[0] == '.' || s[0] == '~') {
-    return true;
-  }
-
-  // Contains path separator with glob somewhere
-  for (size_t i = 0; i < len; i++) {
-    if (s[i] == '/' && i > 0 && i < len - 1) {
-      return true;
-    }
-  }
-
-  // Bare glob pattern (like *.txt)
-  return has_glob;
+  return shell_source_word_has_glob(s, len);
 }
 
 /**
@@ -359,12 +330,16 @@ static bool redirection_consumes_operand(const shell_token_t *token) {
  * Classify a raw token string
  */
 shell_token_type_t shell_classify_raw_token(const char *text, size_t len) {
-  if (!text || len == 0)
+  if (len == 0)
     return SHELL_TOKEN_END;
 
+  /* A word can start/end with quoted fragments and still contain active
+   * pattern syntax between them. Classify the whole word, not its endpoints. */
+  bool has_glob = is_glob_pattern(text, len);
+
   // Handle quoted strings
-  if ((text[0] == '"' && text[len - 1] == '"') ||
-      (text[0] == '\'' && text[len - 1] == '\'')) {
+  if (!has_glob && ((text[0] == '"' && text[len - 1] == '"') ||
+                    (text[0] == '\'' && text[len - 1] == '\''))) {
     return SHELL_TOKEN_ARGUMENT; // Will be treated as string in abstraction
   }
 
@@ -375,18 +350,13 @@ shell_token_type_t shell_classify_raw_token(const char *text, size_t len) {
     return SHELL_TOKEN_ARITHMETIC;
   }
 
-  // Command substitution: $(...) or `...`
-  if (len >= 4) {
-    if (text[0] == '$' && text[1] == '(' && text[len - 1] == ')') {
-      return SHELL_TOKEN_SUBSHELL;
-    }
-    if (text[0] == '`' && text[len - 1] == '`') {
-      return SHELL_TOKEN_SUBSHELL;
-    }
-  }
+  // Command substitutions can have an empty payload.
+  if ((len >= 3 && text[0] == '$' && text[1] == '(' && text[len - 1] == ')') ||
+      (len >= 2 && text[0] == '`' && text[len - 1] == '`'))
+    return SHELL_TOKEN_SUBSHELL;
 
   // Variables
-  if (text[0] == '$') {
+  if (text[0] == '$' && !has_glob) {
     shell_abstract_variable_info_t variable = {0};
     if (abstract_parse_variable(text, len, &variable))
       return variable.type == SHELL_ABSTRACT_EV ? SHELL_TOKEN_VARIABLE
@@ -405,10 +375,8 @@ shell_token_type_t shell_classify_raw_token(const char *text, size_t len) {
     return SHELL_TOKEN_ARGUMENT;
   }
 
-  // Glob patterns
-  if (is_glob_pattern(text, len)) {
+  if (has_glob)
     return SHELL_TOKEN_GLOB;
-  }
 
   // Options
   if (is_long_option(text, len)) {
@@ -634,135 +602,144 @@ static bool compound_abstract_type_is_path(shell_abstract_type_t type) {
          type == SHELL_ABSTRACT_HP;
 }
 
-/* A fully quoted lone variable retains the established whole-token display
- * abstraction (`"$HOME"` becomes `$EV_1`). Quoted words with literal text or
- * more than one expansion need the compound path so each element spans exactly
- * the parameter it describes. */
-static bool
-token_needs_compound_variable_abstraction(const shell_token_t *tok) {
-  if (!tok || !tok->start || !shell_tokenizer_token_has_variable(tok))
-    return false;
-  if (tok->type == SHELL_TOKEN_COMMAND || tok->type == SHELL_TOKEN_ARGUMENT)
-    return true;
-  if (tok->type != SHELL_TOKEN_VARIABLE_QUOTED || tok->length < 2 ||
-      tok->start[0] != '"' || tok->start[tok->length - 1] != '"')
-    return false;
-
-  shell_source_variable_scan_t scan = {0};
-  size_t start = 0;
-  size_t after = 0;
-  if (!shell_source_next_variable_expansion(tok->start, tok->length, &scan,
-                                            &start, &after))
-    return false;
-  if (start != 1 || after != tok->length - 1)
-    return true;
-  return shell_source_next_variable_expansion(tok->start, tok->length, &scan,
-                                              &start, &after);
-}
-
 typedef enum {
   COMPOUND_ABSTRACT_VARIABLE = 0,
   COMPOUND_ABSTRACT_SUBSTITUTION,
+  COMPOUND_ABSTRACT_STRING,
+  COMPOUND_ABSTRACT_ARITHMETIC,
 } compound_abstract_span_type_t;
 
 typedef struct {
   compound_abstract_span_type_t type;
   size_t start;
   size_t after;
-  shell_source_substitution_kind_t substitution_kind;
 } compound_abstract_span_t;
 
 /* Variables and substitutions may be nested in either direction. Emit only
  * top-level, non-overlapping spans: `${value:-$(id)}` remains one variable
- * element, while `x$VALUE$(id)` exposes both independently. */
+ * element, while `x$VALUE$(id)` exposes both independently. ANSI-C quotes in
+ * ordinary composite words retain independent string elements; arithmetic
+ * expressions retain one element even when they contain nested expansions. */
 typedef struct {
   const shell_token_t *token;
-  shell_source_variable_scan_t variables;
-  shell_source_substitution_scan_t substitutions;
-  bool have_variable;
-  bool have_substitution;
-  size_t variable_start;
-  size_t variable_after;
-  size_t substitution_start;
-  size_t substitution_after;
-  shell_source_substitution_kind_t substitution_kind;
+  size_t position;
+  char quote;
 } compound_abstract_span_iterator_t;
 
-static void compound_abstract_span_iterator_init(
+/* Required token with a valid immutable source span, retained for iteration. */
+static SHELL_NONNULL(1, 2) void compound_abstract_span_iterator_init(
     compound_abstract_span_iterator_t *iterator, const shell_token_t *token) {
-  if (!iterator)
-    return;
   *iterator = (compound_abstract_span_iterator_t){.token = token};
 }
 
-static bool compound_abstract_span_iterator_next(
+/* Iterator was initialized above; out is required writable storage. */
+static SHELL_NONNULL(1, 2) bool compound_abstract_span_iterator_next(
     compound_abstract_span_iterator_t *iterator,
     compound_abstract_span_t *out) {
-  if (!iterator || !iterator->token || !iterator->token->start || !out)
-    return false;
 
-  for (;;) {
-    if (!iterator->have_variable) {
-      iterator->have_variable = shell_source_next_variable_expansion(
-          iterator->token->start, iterator->token->length, &iterator->variables,
-          &iterator->variable_start, &iterator->variable_after);
+  const char *input = iterator->token->start;
+  size_t length = iterator->token->length;
+  while (iterator->position < length) {
+    SHELL_SOURCE_WORD_SCAN(1);
+    size_t position = iterator->position;
+    char byte = input[position];
+    if (iterator->quote == '\'') {
+      if (byte == '\'')
+        iterator->quote = 0;
+      iterator->position++;
+      continue;
     }
-    if (!iterator->have_substitution) {
-      iterator->have_substitution = shell_source_next_executable_substitution(
-          iterator->token->start, iterator->token->length,
-          &iterator->substitutions, &iterator->substitution_start,
-          &iterator->substitution_after, &iterator->substitution_kind);
+    if (byte == '\\') {
+      size_t after =
+          shell_source_skip_escaped_line_endings(input, length, position);
+      if (after != position)
+        iterator->position = after;
+      else if (position + 1 < length &&
+               (!iterator->quote || strchr("$`\"\\", input[position + 1])))
+        iterator->position += 2;
+      else
+        iterator->position++;
+      continue;
     }
-    if (!iterator->have_variable && !iterator->have_substitution)
-      return false;
-
-    if (iterator->have_variable && iterator->have_substitution) {
-      if (iterator->substitution_start >= iterator->variable_start &&
-          iterator->substitution_after <= iterator->variable_after) {
-        iterator->have_substitution = false;
+    if ((!iterator->quote && byte == '\'') || byte == '"') {
+      iterator->quote = iterator->quote ? 0 : byte;
+      iterator->position++;
+      continue;
+    }
+    size_t after = 0;
+    compound_abstract_span_type_t type = COMPOUND_ABSTRACT_VARIABLE;
+    if (!iterator->quote && shell_source_skip_complete_ansi_c_quote(
+                                input, length, position, &after)) {
+      type = COMPOUND_ABSTRACT_STRING;
+    } else if (byte == '$' && shell_source_skip_variable_expansion(
+                                  input, length, position, &after)) {
+      /* Its nested syntax belongs to this parameter element. */
+    } else {
+      size_t open = 0;
+      bool recognized = false;
+      if (!shell_source_skip_double_quote_expansion(input, length, position,
+                                                    &recognized, &after))
+        return false;
+      if (recognized) {
+        if (byte == '$' && shell_source_dollar_arithmetic_open(
+                               input, length, position, &open)) {
+          type = COMPOUND_ABSTRACT_ARITHMETIC;
+        } else
+          type = COMPOUND_ABSTRACT_SUBSTITUTION;
+      } else if (!iterator->quote && (byte == '<' || byte == '>') &&
+                 shell_source_process_substitution_open(input, length, position,
+                                                        &open)) {
+        if (!shell_source_find_balanced_parentheses(input, length, open,
+                                                    &after))
+          return false;
+        type = COMPOUND_ABSTRACT_SUBSTITUTION;
+      } else {
+        iterator->position++;
         continue;
       }
-      if (iterator->variable_start >= iterator->substitution_start &&
-          iterator->variable_after <= iterator->substitution_after) {
-        iterator->have_variable = false;
-        continue;
-      }
     }
-
-    if (iterator->have_variable &&
-        (!iterator->have_substitution ||
-         iterator->variable_start < iterator->substitution_start)) {
-      *out = (compound_abstract_span_t){
-          .type = COMPOUND_ABSTRACT_VARIABLE,
-          .start = iterator->variable_start,
-          .after = iterator->variable_after,
-      };
-      iterator->have_variable = false;
-      return true;
-    }
-
-    *out = (compound_abstract_span_t){
-        .type = COMPOUND_ABSTRACT_SUBSTITUTION,
-        .start = iterator->substitution_start,
-        .after = iterator->substitution_after,
-        .substitution_kind = iterator->substitution_kind,
-    };
-    iterator->have_substitution = false;
+    *out = (compound_abstract_span_t){type, position, after};
+    iterator->position = after;
     return true;
   }
+  return false;
 }
 
-static bool compound_abstract_append(shell_abstract_command_t *command,
-                                     shell_abstract_element_t **elements,
-                                     size_t capacity, size_t *count,
-                                     shell_abstract_type_t type,
-                                     const char *text, size_t length,
-                                     size_t position, bool is_quoted,
-                                     size_t indices[SHELL_ABSTRACT_HP + 1]) {
-  /* Only variable and path subspans reach this private helper. */
-  if (*count == capacity || type > SHELL_ABSTRACT_HP)
+/* The tokenizer supplies a live token with an immutable source span. A fully
+ * quoted lone variable keeps its whole-token display abstraction; composite
+ * words expose independent parameters, substitutions, arithmetic expressions,
+ * and ANSI-C strings. */
+static SHELL_NONNULL(1) bool token_needs_compound_abstraction(
+    const shell_token_t *tok) {
+  if (tok->type == SHELL_TOKEN_COMMAND || tok->type == SHELL_TOKEN_ARGUMENT) {
+    compound_abstract_span_iterator_t iterator;
+    compound_abstract_span_t span;
+    compound_abstract_span_iterator_init(&iterator, tok);
+    while (compound_abstract_span_iterator_next(&iterator, &span))
+      if (span.type != COMPOUND_ABSTRACT_SUBSTITUTION)
+        return true;
     return false;
+  }
+  if (tok->type != SHELL_TOKEN_VARIABLE_QUOTED || tok->length < 2 ||
+      tok->start[0] != '"' || tok->start[tok->length - 1] != '"')
+    return false;
+  shell_source_variable_scan_t scan = {0};
+  size_t start = 0, after = 0;
+  if (!shell_source_next_variable_expansion(tok->start, tok->length, &scan,
+                                            &start, &after))
+    return false;
+  return start != 1 || after != tok->length - 1 ||
+         shell_source_next_variable_expansion(tok->start, tok->length, &scan,
+                                              &start, &after);
+}
 
+/* The count pass reserves a free element slot. type is a variable or path
+ * kind in [SHELL_ABSTRACT_EV, SHELL_ABSTRACT_HP], with a matching source span.
+ */
+static SHELL_NONNULL(1, 2, 3, 5, 9) bool compound_abstract_append(
+    shell_abstract_command_t *command, shell_abstract_element_t **elements,
+    size_t *count, shell_abstract_type_t type, const char *text, size_t length,
+    size_t position, bool is_quoted, size_t indices[SHELL_ABSTRACT_HP + 1]) {
   size_t index = ++indices[type];
   shell_abstract_element_t *element = calloc(1, sizeof(*element));
   if (!element)
@@ -808,64 +785,136 @@ static bool compound_abstract_append(shell_abstract_command_t *command,
   return true;
 }
 
-static bool compound_abstract_append_substitution(
+/* text is one validated, balanced command/process/arithmetic substitution,
+ * backtick, or quoted string span. Only the opener is inspected; the caller
+ * owns the matching close. Content remains raw source, excluding delimiters
+ * and any physical continuations between the opener's logical punctuation. */
+static SHELL_NONNULL(1) size_t
+    abstract_fragment_content_start(const char *text, size_t length) {
+  if (text[0] == '`' || text[0] == '\'' || text[0] == '"')
+    return 1;
+  size_t open = shell_source_logical_following(text, length, 0);
+  if (text[0] == '$' && text[open] == '(') {
+    size_t next = shell_source_logical_following(text, length, open);
+    if (next < length && text[next] == '(')
+      open = next;
+  }
+  SHELL_SOURCE_WORD_SCAN(open);
+  return open + 1;
+}
+
+/* A validated arithmetic fragment has two logical closing parentheses. Only
+ * the physical continuation interval between them is visited here. */
+static SHELL_NONNULL(1) size_t
+    abstract_fragment_content_end(const char *text, size_t length,
+                                  shell_abstract_type_t type) {
+  if (type != SHELL_ABSTRACT_AR)
+    return length - 1;
+  size_t close =
+      shell_source_skip_inline_continuations_backward(text, length - 1);
+  SHELL_SOURCE_WORD_SCAN(length - close);
+  return close - 1;
+}
+
+/* The balanced fragment's type is CS, AR or STR. Its payload may be empty;
+ * successful extraction always returns an owned string. */
+static SHELL_NONNULL(1) char *abstract_fragment_content_copy(
+    const char *text, size_t length, shell_abstract_type_t type) {
+  size_t start = abstract_fragment_content_start(text, length);
+  size_t end = abstract_fragment_content_end(text, length, type);
+  return strndup(text + start, end - start);
+}
+
+/* A balanced substitution, arithmetic or ANSI-C string span from the iterator,
+ * with room in elements for one entry. type is CS, AR or STR. */
+static SHELL_NONNULL(1, 2, 3, 4, 8) bool compound_abstract_append_fragment(
     shell_abstract_command_t *command, shell_abstract_element_t **elements,
-    size_t capacity, size_t *count, shell_source_substitution_kind_t kind,
-    const char *text, size_t length, size_t position, size_t *index) {
-  if (!command || !elements || !count || !text || !index ||
-      *count == capacity || length < 2)
-    return false;
-
-  size_t content_start = kind == SHELL_SOURCE_SUBST_BACKTICK ? 1 : 2;
-  if (length < content_start + 1)
-    return false;
-  size_t content_length = length - content_start - 1;
-
+    size_t *count, const char *text, size_t length, size_t position,
+    shell_abstract_type_t type, size_t *index) {
   shell_abstract_element_t *element = calloc(1, sizeof(*element));
   if (!element)
     return false;
-  element->type = SHELL_ABSTRACT_CS;
+  element->type = type;
   element->original = strndup(text, length);
-  element->abstraction = make_abstraction(SHELL_ABSTRACT_CS, ++*index);
+  element->abstraction = make_abstraction(element->type, ++*index);
   element->start = position;
   element->end = position + length;
   element->data.cmd_subst.content =
-      strndup(text + content_start, content_length);
+      abstract_fragment_content_copy(text, length, type);
   if (!element->original || !element->abstraction ||
       !element->data.cmd_subst.content) {
     free_abstract_element(element);
     return false;
   }
   elements[(*count)++] = element;
-  command->has_cmd_subst = true;
+  if (type == SHELL_ABSTRACT_STR)
+    command->has_strings = true;
+  else if (type == SHELL_ABSTRACT_CS)
+    command->has_cmd_subst = true;
+  else
+    command->has_arithmetic = true;
   return true;
+}
+
+/* Tokenization has validated this immutable word. Collect semantic features
+ * independently of the non-overlapping display element which owns its source;
+ * nested executable command bodies remain separate shell inspections. */
+static SHELL_NONNULL(1, 2) void abstract_word_features(
+    shell_abstract_command_t *command, const shell_token_t *token,
+    bool redirect_operand) {
+  shell_source_substitution_scan_t scan = {0};
+  size_t start, after;
+  shell_source_substitution_kind_t kind;
+  while (shell_source_next_executable_substitution(
+             token->start, token->length, &scan, &start, &after, &kind) ==
+         SHELL_SOURCE_SCAN_FOUND)
+    command->has_cmd_subst = true;
+  if (!redirect_operand) {
+    command->has_variables |= scan.has_variables;
+    command->has_pos_vars |= scan.has_positional;
+    command->has_special_vars |= scan.has_special;
+    command->has_arithmetic |= scan.has_arithmetic;
+  }
+}
+
+/* Literal regions of a whole double-quoted word exclude its outer quote
+ * delimiters. Keep this contraction shared by sizing and emission so quotes
+ * stay in diagnostic source rather than in path metadata. The iterator
+ * supplies 0 <= start <= end <= token->length, including empty regions. */
+static SHELL_NONNULL(1, 2, 3) void compound_abstract_literal_bounds(
+    const shell_token_t *token, size_t *start, size_t *end) {
+  if (token->type != SHELL_TOKEN_VARIABLE_QUOTED)
+    return;
+  if (*start < *end && *start == 0)
+    (*start)++;
+  if (*start < *end && *end == token->length)
+    (*end)--;
 }
 
 /* Literal spans between or around variable expansions remain part of the same
  * shell word. Only path-shaped spans are independently abstracted. Keep this
  * helper shared by the allocation and emission passes so a final path suffix
- * cannot be displayed without a matching abstraction element. */
-static bool compound_abstract_append_literal(
+ * cannot be displayed without a matching abstraction element. The iterator
+ * supplies start <= end <= token->length; the count pass reserves any entry. */
+static SHELL_NONNULL(1, 2, 3, 4, 7) bool compound_abstract_append_literal(
     shell_abstract_command_t *command, shell_abstract_element_t **elements,
-    size_t capacity, size_t *count, const shell_token_t *token, size_t start,
-    size_t end, size_t indices[SHELL_ABSTRACT_HP + 1]) {
-  if (!token || start > end || end > token->length)
-    return false;
+    size_t *count, const shell_token_t *token, size_t start, size_t end,
+    size_t indices[SHELL_ABSTRACT_HP + 1]) {
+  compound_abstract_literal_bounds(token, &start, &end);
   if (start == end)
     return true;
   shell_abstract_type_t type = get_abstract_type(
       SHELL_TOKEN_ARGUMENT, token->start + start, end - start);
   return !compound_abstract_type_is_path(type) ||
          compound_abstract_append(
-             command, elements, capacity, count, type, token->start + start,
-             end - start, token->position + start, token->is_quoted, indices);
+             command, elements, count, type, token->start + start, end - start,
+             token->position + start, token->is_quoted, indices);
 }
 
-static bool compound_abstract_count_literal(const shell_token_t *token,
-                                            size_t start, size_t end,
-                                            size_t *count) {
-  if (!token || !count || start > end || end > token->length)
-    return false;
+/* start <= end <= token->length, as supplied by the span iterator. */
+static SHELL_NONNULL(1, 4) bool compound_abstract_count_literal(
+    const shell_token_t *token, size_t start, size_t end, size_t *count) {
+  compound_abstract_literal_bounds(token, &start, &end);
   if (start == end)
     return true;
   shell_abstract_type_t type = get_abstract_type(
@@ -878,14 +927,12 @@ static bool compound_abstract_count_literal(const shell_token_t *token,
   return true;
 }
 
-/* Count exactly the elements emitted for a variable-bearing shell word.  The
+/* Count exactly the elements emitted for a composite shell word. The
  * allocation pass must follow the same fragment rules as emission: a single
  * word such as `/a/$X/b/$Y/c` produces three path fragments and two variables,
  * not merely one token plus two expansions. */
-static bool compound_abstract_element_count(const shell_token_t *token,
-                                            size_t *count) {
-  if (!token || !token->start || !count)
-    return false;
+static SHELL_NONNULL(1, 2) bool compound_abstract_element_count(
+    const shell_token_t *token, size_t *count) {
 
   size_t total = 0;
   size_t literal_start = 0;
@@ -917,11 +964,13 @@ abstract_command_parse_impl(const char *command, size_t command_length,
                             shell_abstract_command_t **out) {
   *out = NULL;
 
-  // Tokenize the command first
+  /* The public adapter validated this immutable source list. Construct its
+   * borrowed lexical view without repeating recursive grammar validation. */
   shell_command_t *cmds = NULL;
   size_t cmd_count = 0;
 
-  switch (shell_tokenize_commands(command, command_length, &cmds, &cmd_count)) {
+  switch (shell_tokenize_prevalidated_commands(command, command_length, true,
+                                               &cmds, &cmd_count)) {
   case SHELL_TOKENIZE_OK:
     break;
   case SHELL_TOKENIZE_EINPUT:
@@ -966,9 +1015,9 @@ abstract_command_parse_impl(const char *command, size_t command_length,
     max_elements += cmds[c].token_count;
     for (size_t i = 0; i < cmds[c].token_count; i++) {
       const shell_token_t *token = &cmds[c].tokens[i];
-      if ((token->type != SHELL_TOKEN_COMMAND &&
-           token->type != SHELL_TOKEN_ARGUMENT) ||
-          !token->start || !shell_tokenizer_token_has_variable(token))
+      /* Use the emission predicate, including multi-expansion quoted words.
+       * Filtering only COMMAND/ARGUMENT undercounts VARIABLE_QUOTED tokens. */
+      if (!token_needs_compound_abstraction(token))
         continue;
       size_t compound_elements = 0;
       if (!compound_abstract_element_count(token, &compound_elements) ||
@@ -1018,6 +1067,7 @@ abstract_command_parse_impl(const char *command, size_t command_length,
     bool redirect_operand = false;
     for (size_t i = 0; i < cmd->token_count; i++) {
       shell_token_t *tok = &cmd->tokens[i];
+      shell_token_t redirect_word;
 
       if (is_redirection_token(tok->type)) {
         abst->has_redirects = true;
@@ -1025,10 +1075,27 @@ abstract_command_parse_impl(const char *command, size_t command_length,
         continue;
       }
 
+      if (redirect_operand) {
+        /* The diagnostic lexer can expose arithmetic/substitution fragments
+         * separately. A redirect consumes their complete shell word, not just
+         * its first fragment. Find that boundary once and consume the fragments
+         * in order; this is semantic ownership, not parse-result verification.
+         */
+        size_t after = 0;
+        (void)shell_source_skip_shell_word(command, command_length,
+                                           tok->position, &after);
+        redirect_word = *tok;
+        redirect_word.length = after - tok->position;
+        tok = &redirect_word;
+        while (i + 1 < cmd->token_count && cmd->tokens[i + 1].position < after)
+          i++;
+      }
+
       /* A simple word may combine a literal path prefix with one or more
        * parameters. Extract those spans independently without turning the
        * containing argv word into separate shell tokens. */
-      if (!redirect_operand && token_needs_compound_variable_abstraction(tok)) {
+      if (!redirect_operand && token_needs_compound_abstraction(tok)) {
+        abstract_word_features(abst, tok, false);
         compound_indices[SHELL_ABSTRACT_EV] = idx_ev;
         compound_indices[SHELL_ABSTRACT_PV] = idx_pv;
         compound_indices[SHELL_ABSTRACT_SV] = idx_sv;
@@ -1041,9 +1108,9 @@ abstract_command_parse_impl(const char *command, size_t command_length,
         compound_abstract_span_iterator_init(&iterator, tok);
         compound_abstract_span_t span;
         while (compound_abstract_span_iterator_next(&iterator, &span)) {
-          if (!compound_abstract_append_literal(
-                  abst, elements, max_elements, &element_count, tok,
-                  literal_start, span.start, compound_indices)) {
+          if (!compound_abstract_append_literal(abst, elements, &element_count,
+                                                tok, literal_start, span.start,
+                                                compound_indices)) {
             allocation_failed = true;
             break;
           }
@@ -1053,18 +1120,26 @@ abstract_command_parse_impl(const char *command, size_t command_length,
             if (!abstract_variable_info(tok->start + span.start,
                                         span.after - span.start, &variable) ||
                 !compound_abstract_append(
-                    abst, elements, max_elements, &element_count, variable.type,
+                    abst, elements, &element_count, variable.type,
                     tok->start + span.start, span.after - span.start,
                     tok->position + span.start, tok->is_quoted,
                     compound_indices)) {
               allocation_failed = true;
               break;
             }
-          } else if (!compound_abstract_append_substitution(
-                         abst, elements, max_elements, &element_count,
-                         span.substitution_kind, tok->start + span.start,
-                         span.after - span.start, tok->position + span.start,
-                         &idx_cs)) {
+          } else if (!compound_abstract_append_fragment(
+                         abst, elements, &element_count,
+                         tok->start + span.start, span.after - span.start,
+                         tok->position + span.start,
+                         span.type == COMPOUND_ABSTRACT_STRING
+                             ? SHELL_ABSTRACT_STR
+                         : span.type == COMPOUND_ABSTRACT_ARITHMETIC
+                             ? SHELL_ABSTRACT_AR
+                             : SHELL_ABSTRACT_CS,
+                         span.type == COMPOUND_ABSTRACT_STRING ? &idx_str
+                         : span.type == COMPOUND_ABSTRACT_ARITHMETIC
+                             ? &idx_ar
+                             : &idx_cs)) {
             allocation_failed = true;
             break;
           }
@@ -1072,9 +1147,9 @@ abstract_command_parse_impl(const char *command, size_t command_length,
           literal_start = span.after;
         }
         if (compound && !allocation_failed &&
-            !compound_abstract_append_literal(
-                abst, elements, max_elements, &element_count, tok,
-                literal_start, tok->length, compound_indices))
+            !compound_abstract_append_literal(abst, elements, &element_count,
+                                              tok, literal_start, tok->length,
+                                              compound_indices))
           allocation_failed = true;
         if (allocation_failed)
           break;
@@ -1085,9 +1160,6 @@ abstract_command_parse_impl(const char *command, size_t command_length,
           idx_ap = compound_indices[SHELL_ABSTRACT_AP];
           idx_rp = compound_indices[SHELL_ABSTRACT_RP];
           idx_hp = compound_indices[SHELL_ABSTRACT_HP];
-          if (shell_source_word_has_executable_substitution(tok->start,
-                                                            tok->length))
-            abst->has_cmd_subst = true;
           redirect_operand = false;
           continue;
         }
@@ -1098,6 +1170,8 @@ abstract_command_parse_impl(const char *command, size_t command_length,
           redirect_operand
               ? SHELL_ABSTRACT_REDIR
               : get_abstract_type(tok->type, tok->start, tok->length);
+      if (ab_type >= 0)
+        abstract_word_features(abst, tok, redirect_operand);
       redirect_operand = false;
 
       if (ab_type < 0)
@@ -1194,43 +1268,10 @@ abstract_command_parse_impl(const char *command, size_t command_length,
         break;
 
       case SHELL_ABSTRACT_CS:
-        // Extract content
-        if (tok->length >= 4) {
-          size_t open = 0;
-          if ((tok->start[0] == '$' &&
-               shell_source_dollar_parentheses_open(tok->start, tok->length, 0,
-                                                    &open)) ||
-              ((tok->start[0] == '<' || tok->start[0] == '>') &&
-               shell_source_process_substitution_open(tok->start, tok->length,
-                                                      0, &open))) {
-            elem->data.cmd_subst.content =
-                strndup(tok->start + open + 1, tok->length - open - 2);
-          } else {
-            elem->data.cmd_subst.content =
-                strndup(tok->start + 1, tok->length - 2);
-          }
-        }
-        break;
-
       case SHELL_ABSTRACT_AR:
-        // Store content if needed
-        if (tok->length >= 2) {
-          elem->data.cmd_subst.content =
-              strndup(tok->start + 1, tok->length - 2);
-        }
-        break;
-
       case SHELL_ABSTRACT_STR:
-        /* ANSI-C quotes have a `$'` opener; retain their raw payload rather
-         * than decoding it so the abstraction stays a source diagnostic. */
-        if (tok->type == SHELL_TOKEN_ANSI_C_QUOTED) {
-          if (tok->length >= 3)
-            elem->data.cmd_subst.content =
-                strndup(tok->start + 2, tok->length - 3);
-        } else if (tok->length >= 2) {
-          elem->data.cmd_subst.content =
-              strndup(tok->start + 1, tok->length - 2);
-        }
+        elem->data.cmd_subst.content =
+            abstract_fragment_content_copy(tok->start, tok->length, ab_type);
         break;
 
       default:
@@ -1261,16 +1302,9 @@ abstract_command_parse_impl(const char *command, size_t command_length,
         detail_ok = elem->data.glob.pattern != NULL;
         break;
       case SHELL_ABSTRACT_CS:
-        detail_ok = tok->length < 4 || elem->data.cmd_subst.content != NULL;
-        break;
       case SHELL_ABSTRACT_AR:
-        detail_ok = tok->length < 2 || elem->data.cmd_subst.content != NULL;
-        break;
       case SHELL_ABSTRACT_STR:
-        detail_ok =
-            (tok->type == SHELL_TOKEN_ANSI_C_QUOTED ? tok->length < 3
-                                                    : tok->length < 2) ||
-            elem->data.cmd_subst.content != NULL;
+        detail_ok = elem->data.cmd_subst.content != NULL;
         break;
       default:
         break;
@@ -1278,10 +1312,6 @@ abstract_command_parse_impl(const char *command, size_t command_length,
 
       if (elem->original && elem->abstraction && detail_ok) {
         elements[element_count++] = elem;
-
-        if (shell_source_word_has_executable_substitution(tok->start,
-                                                          tok->length))
-          abst->has_cmd_subst = true;
 
         // Set flags
         switch (ab_type) {
@@ -1376,37 +1406,48 @@ abstract_command_parse_impl(const char *command, size_t command_length,
   return SHELL_ABSTRACT_OK;
 }
 
+static shell_abstract_status_t
+abstract_command_parse(const char *command, size_t command_length,
+                       shell_abstract_command_t **out) {
+  *out = NULL;
+  shell_process_status_t validation =
+      shell_process_validate_supported_source(command, command_length, NULL);
+  if (validation == SHELL_PROCESS_EINPUT)
+    return SHELL_ABSTRACT_EINPUT;
+  if (validation == SHELL_PROCESS_EOUTPUT_LIMIT)
+    return SHELL_ABSTRACT_EOVERFLOW;
+  if (validation != SHELL_PROCESS_OK)
+    return SHELL_ABSTRACT_EPARSE;
+  return abstract_command_parse_impl(command, command_length, out);
+}
+
 shell_abstract_status_t
 shell_abstract_command_parse(const char *command, size_t command_length,
                              shell_abstract_command_t **out) {
-  if (out)
-    *out = NULL;
-  if (!command || !out || memchr(command, '\0', command_length) != NULL)
-    return SHELL_ABSTRACT_EINPUT;
-  if (shell_tokenizer_has_unsupported_semantics(command, command_length))
-    return SHELL_ABSTRACT_EPARSE;
-  return abstract_command_parse_impl(command, command_length, out);
+  shell_source_operation_begin(command, command_length);
+  shell_abstract_status_t status =
+      abstract_command_parse(command, command_length, out);
+  shell_source_operation_end();
+  return status;
 }
 
 /* --- QUERY FUNCTIONS --- */
 
 const char *
 shell_abstract_command_get_display_text(const shell_abstract_command_t *cmd) {
-  return cmd ? cmd->display_text : NULL;
+  return cmd->display_text;
 }
 
 const char *
 shell_abstract_command_get_source(const shell_abstract_command_t *cmd) {
-  return cmd ? cmd->original : NULL;
+  return cmd->original;
 }
 
 const shell_abstract_element_t *const *
 shell_abstract_command_get_elements(const shell_abstract_command_t *cmd,
                                     size_t *count) {
-  if (count)
-    *count = 0;
-  if (!cmd || !count)
-    return NULL;
+  *count = 0;
+
   *count = cmd->element_count;
   return (const shell_abstract_element_t *const *)cmd->elements;
 }
@@ -1414,10 +1455,8 @@ shell_abstract_command_get_elements(const shell_abstract_command_t *cmd,
 shell_abstract_element_t *const *
 shell_abstract_command_get_mutable_elements(shell_abstract_command_t *cmd,
                                             size_t *count) {
-  if (count)
-    *count = 0;
-  if (!cmd || !count)
-    return NULL;
+  *count = 0;
+
   *count = cmd->element_count;
   return cmd->elements;
 }
@@ -1425,68 +1464,65 @@ shell_abstract_command_get_mutable_elements(shell_abstract_command_t *cmd,
 shell_abstract_element_t *
 shell_abstract_command_get_element(shell_abstract_command_t *cmd,
                                    size_t index) {
-  if (!cmd || index >= cmd->element_count)
+  if (index >= cmd->element_count)
     return NULL;
   return cmd->elements[index];
 }
 
 bool shell_abstract_command_has_variables(const shell_abstract_command_t *cmd) {
-  return cmd ? cmd->has_variables : false;
+  return cmd->has_variables;
 }
 
 bool shell_abstract_command_has_pos_vars(const shell_abstract_command_t *cmd) {
-  return cmd ? cmd->has_pos_vars : false;
+  return cmd->has_pos_vars;
 }
 
 bool shell_abstract_command_has_special_vars(
     const shell_abstract_command_t *cmd) {
-  return cmd ? cmd->has_special_vars : false;
+  return cmd->has_special_vars;
 }
 
 bool shell_abstract_command_has_globs(const shell_abstract_command_t *cmd) {
-  return cmd ? cmd->has_globs : false;
+  return cmd->has_globs;
 }
 
 bool shell_abstract_command_has_paths(const shell_abstract_command_t *cmd) {
-  return cmd ? cmd->has_paths : false;
+  return cmd->has_paths;
 }
 
 bool shell_abstract_command_has_abs_paths(const shell_abstract_command_t *cmd) {
-  return cmd ? cmd->has_abs_paths : false;
+  return cmd->has_abs_paths;
 }
 
 bool shell_abstract_command_has_rel_paths(const shell_abstract_command_t *cmd) {
-  return cmd ? cmd->has_rel_paths : false;
+  return cmd->has_rel_paths;
 }
 
 bool shell_abstract_command_has_home_paths(
     const shell_abstract_command_t *cmd) {
-  return cmd ? cmd->has_home_paths : false;
+  return cmd->has_home_paths;
 }
 
 bool shell_abstract_command_has_cmd_subst(const shell_abstract_command_t *cmd) {
-  return cmd ? cmd->has_cmd_subst : false;
+  return cmd->has_cmd_subst;
 }
 
 bool shell_abstract_command_has_redirects(const shell_abstract_command_t *cmd) {
-  return cmd ? cmd->has_redirects : false;
+  return cmd->has_redirects;
 }
 
 bool shell_abstract_command_has_arithmetic(
     const shell_abstract_command_t *cmd) {
-  return cmd ? cmd->has_arithmetic : false;
+  return cmd->has_arithmetic;
 }
 
 bool shell_abstract_command_has_strings(const shell_abstract_command_t *cmd) {
-  return cmd ? cmd->has_strings : false;
+  return cmd->has_strings;
 }
 
 shell_abstract_element_t *
 shell_abstract_command_find_element(shell_abstract_command_t *cmd,
                                     const char *abstraction) {
-  if (!cmd || !abstraction)
-    return NULL;
-
   for (size_t i = 0; i < cmd->element_count; i++) {
     if (cmd->elements[i]->abstraction &&
         strcmp(cmd->elements[i]->abstraction, abstraction) == 0) {
@@ -1529,9 +1565,6 @@ static char *join_path(const char *base, const char *path) {
 
 char *shell_abstract_element_expand(shell_abstract_element_t *elem,
                                     const shell_runtime_context_t *ctx) {
-  if (!elem || !ctx)
-    return NULL;
-
   switch (elem->type) {
   case SHELL_ABSTRACT_EV:
   case SHELL_ABSTRACT_PV:
@@ -1597,9 +1630,6 @@ char *shell_abstract_element_expand(shell_abstract_element_t *elem,
 
 bool shell_abstract_command_expand(shell_abstract_command_t *cmd,
                                    const shell_runtime_context_t *ctx) {
-  if (!cmd || !ctx)
-    return false;
-
   for (size_t i = 0; i < cmd->element_count; i++) {
     if (cmd->elements[i]->expanded) {
       free(cmd->elements[i]->expanded);
@@ -1616,7 +1646,7 @@ bool shell_abstract_command_expand(shell_abstract_command_t *cmd,
 /* --- UTILITY FUNCTIONS --- */
 
 shell_path_category_t shell_path_category_from_path(const char *resolved_path) {
-  if (!resolved_path || resolved_path[0] != '/') {
+  if (resolved_path[0] != '/') {
     return SHELL_PATH_OTHER;
   }
 
@@ -1743,14 +1773,10 @@ shell_build_type_netseq_impl(const char *command, size_t command_length,
                              const shell_process_limits_t *limits,
                              char **netseq, size_t *netseq_length,
                              size_t *subcommand_count) {
-  if (netseq)
-    *netseq = NULL;
+  *netseq = NULL;
   if (netseq_length)
     *netseq_length = 0;
-  if (subcommand_count)
-    *subcommand_count = 0;
-  if (!command || !netseq || !subcommand_count)
-    return SHELL_PROCESS_EINPUT;
+  *subcommand_count = 0;
 
   shell_anomaly_stages_t stages = {0};
   shell_process_status_t status =
@@ -1927,8 +1953,6 @@ shell_build_type_netseq_buffer(const char *command, size_t command_length,
                                const shell_process_limits_t *limits,
                                shell_netstring_buffer_t *sequence,
                                size_t *subcommand_count) {
-  if (!shell_netstring_buffer_is_empty(sequence) || !subcommand_count)
-    return SHELL_PROCESS_EINPUT;
   char *encoded = NULL;
   size_t length = 0;
   shell_process_status_t status = shell_build_type_netseq_impl(
@@ -1945,18 +1969,13 @@ static shell_process_status_t shell_build_anomaly_netseqs_impl(
     const shell_process_limits_t *limits, char **command_netseq,
     size_t *command_length_out, char **type_netseq, size_t *type_length_out,
     size_t *subcommand_count) {
-  if (command_netseq)
-    *command_netseq = NULL;
+  *command_netseq = NULL;
   if (command_length_out)
     *command_length_out = 0;
-  if (type_netseq)
-    *type_netseq = NULL;
+  *type_netseq = NULL;
   if (type_length_out)
     *type_length_out = 0;
-  if (subcommand_count)
-    *subcommand_count = 0;
-  if (!command_line || !command_netseq || !type_netseq || !subcommand_count)
-    return SHELL_PROCESS_EINPUT;
+  *subcommand_count = 0;
 
   shell_anomaly_stages_t stages = {0};
   shell_process_status_t status =
@@ -2150,8 +2169,6 @@ shell_build_anomaly_netseqs(const char *command_line, size_t command_length,
                             const shell_process_limits_t *limits,
                             char **command_netseq, char **type_netseq,
                             size_t *subcommand_count) {
-  if (!command_netseq || !type_netseq || command_netseq == type_netseq)
-    return SHELL_PROCESS_EINPUT;
   size_t command_length_out = 0;
   size_t type_length_out = 0;
   shell_process_status_t status = shell_build_anomaly_netseqs_impl(
@@ -2175,9 +2192,6 @@ shell_process_status_t shell_build_anomaly_netseqs_buffer(
     const char *command_line, size_t command_length,
     const shell_process_limits_t *limits, shell_netstring_buffer_t *command,
     shell_netstring_buffer_t *type, size_t *subcommand_count) {
-  if (!shell_netstring_buffer_is_empty(command) ||
-      !shell_netstring_buffer_is_empty(type) || command == type)
-    return SHELL_PROCESS_EINPUT;
   char *raw = NULL;
   char *typed = NULL;
   size_t raw_length = 0;

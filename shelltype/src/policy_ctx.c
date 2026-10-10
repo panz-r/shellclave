@@ -218,8 +218,6 @@ static void policy_ctx_destroy(st_policy_ctx_t *ctx) {
 }
 
 void st_policy_ctx_retain(st_policy_ctx_t *ctx) {
-  if (!ctx)
-    return;
   /* Serialize new users with reset's reference-count check and storage swap. */
   pthread_mutex_lock(&ctx->lock);
   atomic_fetch_add(&ctx->refcount, 1);
@@ -263,15 +261,11 @@ static st_error_t context_reset_with_refcount(st_policy_ctx_t *ctx,
 }
 
 st_error_t st_policy_ctx_reset(st_policy_ctx_t *ctx) {
-  if (!ctx)
-    return ST_ERR_INVALID;
   return context_reset_with_refcount(ctx, 1);
 }
 
 st_error_t st_policy_ctx_swap_storage(st_policy_ctx_t *destination,
                                       st_policy_ctx_t *replacement) {
-  if (!destination || !replacement || destination == replacement)
-    return ST_ERR_INVALID;
   pthread_mutex_lock(&destination->lock);
   pthread_mutex_lock(&replacement->lock);
   if (atomic_load(&destination->refcount) != 2 ||
@@ -295,8 +289,6 @@ st_error_t st_policy_ctx_swap_storage(st_policy_ctx_t *destination,
 }
 
 bool st_policy_ctx_is_exclusive(const st_policy_ctx_t *ctx) {
-  if (!ctx)
-    return false;
   /* Context is exclusive if exactly one policy is using it (refcount == 2).
    * refcount = 1: no policies (just ctx)
    * refcount = 2: one policy (safe to compact)
@@ -316,8 +308,6 @@ static uint64_t str_pool_hash(const char *str, size_t len) {
 
 const char *st_policy_ctx_intern_view(st_policy_ctx_t *ctx, const char *str,
                                       size_t len) {
-  if (!ctx || (!str && len != 0))
-    return NULL;
   if (len == 0)
     return "";
 
@@ -365,5 +355,5 @@ const char *st_policy_ctx_intern_view(st_policy_ctx_t *ctx, const char *str,
 }
 
 const char *st_policy_ctx_intern(st_policy_ctx_t *ctx, const char *str) {
-  return str ? st_policy_ctx_intern_view(ctx, str, strlen(str)) : NULL;
+  return st_policy_ctx_intern_view(ctx, str, strlen(str));
 }

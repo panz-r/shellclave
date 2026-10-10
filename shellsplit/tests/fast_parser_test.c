@@ -1,3 +1,4 @@
+#include "../src/shell_pipeline_internal.h"
 #include "../src/shell_source_internal.h"
 #include "../src/shell_tokenizer_full_internal.h"
 #include "depgraph_test_workspace.h"
@@ -8,6 +9,7 @@
 #include "shell_tokenizer.h"
 #include "shell_tokenizer_full.h"
 #include "shell_transform.h"
+#include "word_expansion_cases.h"
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -85,6 +87,87 @@ static void test_has_feature(const char *name,
   }
 }
 
+static void test_array_assignment_prefix_features(void) {
+  bool valid = true;
+  shell_limits_t strict = SHELL_LIMITS_DEFAULT;
+  strict.strict_mode = true;
+  for (size_t c = 0; c < sizeof(shellsplit_test_array_prefixes) /
+                             sizeof(shellsplit_test_array_prefixes[0]);
+       c++) {
+    const char *source = shellsplit_test_array_prefixes[c].source;
+    shell_parse_result_t parsed;
+    bool item =
+        shell_parse_fast(source, strlen(source), &strict, &parsed) == SHELL_OK;
+    uint32_t features = 0;
+    for (uint32_t i = 0; i < parsed.count; i++)
+      features |= parsed.cmds[i].features;
+    item = item &&
+           !!(features & SHELL_FEAT_ARRAY) ==
+               shellsplit_test_array_prefixes[c].array &&
+           !!(features & SHELL_FEAT_GLOBS) ==
+               shellsplit_test_array_prefixes[c].glob;
+    if (!item)
+      fprintf(stderr, "array prefix mismatch: %s features=%x\n", source,
+              features);
+    valid = item && valid;
+  }
+  test("Array assignment position follows complete timing and scalar prefixes",
+       valid);
+  valid = true;
+
+  /* Repeated words, fragments within one value, and a long scalar name all
+   * require linear forward work. Counting real source visits catches suffix
+   * probes that a nominal per-input charge would miss. */
+  for (unsigned family = 0; family < 3; family++) {
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+    size_t previous_work = 0;
+#endif
+    for (size_t units = 64; units <= 2048; units *= 2) {
+      static const char prefix[] = "time ";
+      static const char suffix[] = " a[0]=b";
+      char source[16384];
+      size_t used = sizeof(prefix) - 1;
+      memcpy(source, prefix, used);
+      if (family == 1) {
+        memcpy(source + used, "A=", 2);
+        used += 2;
+      }
+      for (size_t i = 0; i < units; i++) {
+        const char *part = family == 0 ? "A=\"\" " : family == 1 ? "'x'" : "A";
+        size_t length = strlen(part);
+        memcpy(source + used, part, length);
+        used += length;
+      }
+      if (family == 2) {
+        memcpy(source + used, "=''", 3);
+        used += 3;
+      }
+      memcpy(source + used, suffix, sizeof(suffix));
+      used += sizeof(suffix) - 1;
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+      shellsplit_test_source_scan_reset();
+#endif
+      shell_parse_result_t parsed;
+      bool item =
+          shell_parse_fast(source, used, &strict, &parsed) == SHELL_OK &&
+          parsed.count == 1 && (parsed.cmds[0].features & SHELL_FEAT_ARRAY) &&
+          !(parsed.cmds[0].features & SHELL_FEAT_GLOBS);
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+      size_t work = shellsplit_test_source_scan_work();
+      item = item && work <= 128 * used + 1024 &&
+             (previous_work == 0 || work <= 2 * previous_work + 2048);
+      previous_work = work;
+#endif
+      if (!item)
+        fprintf(stderr,
+                "assignment prefix scaling mismatch: family=%u size=%zu\n",
+                family, units);
+      valid = item && valid;
+    }
+  }
+  test("Assignment-prefix classification has linear source work", valid);
+}
+
 typedef struct {
   const char *name;
   const char *input;
@@ -146,6 +229,13 @@ static bool result_invariants(const char *input, size_t input_len,
         range->len > input_len - range->start || range->start < previous_end ||
         !valid_command_type(range->type) ||
         (range->features & ~all_features) != 0 ||
+        (range->modifiers &
+         ~(SHELL_CMD_MOD_PIPE_NEGATED | SHELL_CMD_MOD_PIPE_TIMED)) != 0 ||
+        range->pipeline_time_mode > SHELL_PIPE_TIME_POSIX ||
+        ((range->pipeline_time_mode != SHELL_PIPE_TIME_NONE) !=
+         ((range->modifiers & SHELL_CMD_MOD_PIPE_TIMED) != 0)) ||
+        (range->pipeline_time_direct &&
+         range->pipeline_time_mode == SHELL_PIPE_TIME_NONE) ||
         view != input + range->start || length != range->len ||
         copied != expected_copy || memcmp(copy, view, expected_copy) != 0 ||
         copy[copied] != '\0' || isspace((unsigned char)input[range->start]) ||
@@ -162,7 +252,13 @@ static bool result_invariants(const char *input, size_t input_len,
         group->command_count > result->count - group->first_command ||
         (group->kind != SHELL_GROUP_BRACE &&
          group->kind != SHELL_GROUP_SUBSHELL) ||
-        (group->modifiers & ~SHELL_CMD_MOD_PIPE_NEGATED) != 0 ||
+        (group->modifiers &
+         ~(SHELL_CMD_MOD_PIPE_NEGATED | SHELL_CMD_MOD_PIPE_TIMED)) != 0 ||
+        group->pipeline_time_mode > SHELL_PIPE_TIME_POSIX ||
+        ((group->pipeline_time_mode != SHELL_PIPE_TIME_NONE) !=
+         ((group->modifiers & SHELL_CMD_MOD_PIPE_TIMED) != 0)) ||
+        (group->pipeline_time_direct &&
+         group->pipeline_time_mode == SHELL_PIPE_TIME_NONE) ||
         (group->parent != UINT16_MAX && group->parent >= i))
       return false;
     if (group->parent != UINT16_MAX) {
@@ -212,10 +308,6 @@ void test_layer1_basic_inputs(void) {
   test("Empty input returns SHELL_EINPUT with no ranges",
        err == SHELL_EINPUT && result.count == 0 &&
            result.status == SHELL_STATUS_ERROR);
-
-  // Test: NULL input
-  err = shell_parse_fast(NULL, 0, NULL, &result);
-  test("NULL input returns SHELL_EINPUT", err == SHELL_EINPUT);
 
   err = shell_parse_fast("   \t\n  ", strlen("   \t\n  "), NULL, &result);
   test("Whitespace-only input has no command",
@@ -518,11 +610,25 @@ static void test_feature_matrix(void) {
       {"here-string escaped space", "cmd <<< two\\ words", 2, 1,
        SHELL_TYPE_HERESTRING, 1, SHELL_FEAT_HERESTRING, 0},
       {"here-string command substitution", "cmd <<< $(printf one)", 2, 1,
-       SHELL_TYPE_HERESTRING, 1, SHELL_FEAT_HERESTRING, 0},
+       SHELL_TYPE_HERESTRING, 1, SHELL_FEAT_HERESTRING | SHELL_FEAT_SUBSHELL,
+       0},
       {"here-string file command substitution", "cmd <<< $(</tmp/input)", 2, 1,
-       SHELL_TYPE_HERESTRING, 1, SHELL_FEAT_HERESTRING, 0},
+       SHELL_TYPE_HERESTRING, 1,
+       SHELL_FEAT_HERESTRING | SHELL_FEAT_SUBSHELL | SHELL_FEAT_SUBSHELL_FILE,
+       0},
       {"here-string backtick substitution", "cmd <<< `printf one`", 2, 1,
-       SHELL_TYPE_HERESTRING, 1, SHELL_FEAT_HERESTRING, 0},
+       SHELL_TYPE_HERESTRING, 1, SHELL_FEAT_HERESTRING | SHELL_FEAT_SUBSHELL,
+       0},
+      {"here-string scalar expansion", "cmd <<< \"$value\"", 2, 1,
+       SHELL_TYPE_HERESTRING, 1, SHELL_FEAT_HERESTRING | SHELL_FEAT_VARS, 0},
+      {"here-string process substitution", "cmd <<< <(printf one)", 2, 1,
+       SHELL_TYPE_HERESTRING, 1, SHELL_FEAT_HERESTRING | SHELL_FEAT_PROCESS_SUB,
+       SHELL_FEAT_SUBSHELL},
+      {"here-string literal punctuation", "cmd <<< if*", 2, 1,
+       SHELL_TYPE_HERESTRING, 1, SHELL_FEAT_HERESTRING,
+       SHELL_FEAT_GLOBS | SHELL_FEAT_CONDITIONALS},
+      {"here-string literal substitution", "cmd <<< '$(false)'", 2, 1,
+       SHELL_TYPE_HERESTRING, 1, SHELL_FEAT_HERESTRING, SHELL_FEAT_SUBSHELL},
       {"single-quoted variable", "echo '$VAR'", 1, NO_CHECK, 0, 0, 0,
        SHELL_FEAT_VARS},
       {"double-quoted glob", "echo \"*.txt\"", 1, NO_CHECK, 0, 0, 0,
@@ -633,6 +739,32 @@ static void test_feature_matrix(void) {
            metadata.groups[1].first_command == 0 &&
            metadata.groups[1].command_count == 1);
 
+  static const char *const compact_groups[] = {
+      "({ echo ok; })", "({(echo ok)})", "time ({ echo ok; })",
+      "time ({(echo ok)})", "({ echo a; echo b; }) | cat"};
+  for (size_t i = 0; i < sizeof(compact_groups) / sizeof(compact_groups[0]);
+       i++) {
+    shell_limits_t limits = {SHELL_MAX_SUBCOMMANDS, true};
+    shell_error_t error = shell_parse_fast(
+        compact_groups[i], strlen(compact_groups[i]), &limits, &metadata);
+    test("Compact nested delimiters retain lexical group membership",
+         error == SHELL_OK &&
+             result_invariants(compact_groups[i], strlen(compact_groups[i]),
+                               error, &metadata) &&
+             metadata.group_count == (i == 1 || i == 3 ? 3 : 2) &&
+             metadata.groups[0].kind == SHELL_GROUP_SUBSHELL &&
+             metadata.groups[1].kind == SHELL_GROUP_BRACE &&
+             metadata.groups[1].parent == 0 &&
+             metadata.cmds[0].group_depth == (i == 1 || i == 3 ? 3 : 2));
+  }
+
+  extract("exit <<< <(printf '%s' \"$(true)\")", &metadata);
+  test("Lexical document features still include child-shell substitutions",
+       metadata.count == 2 &&
+           (metadata.cmds[1].features &
+            (SHELL_FEAT_PROCESS_SUB | SHELL_FEAT_SUBSHELL)) ==
+               (SHELL_FEAT_PROCESS_SUB | SHELL_FEAT_SUBSHELL));
+
   extract("{ cat; cat; } <<< value", &metadata);
   test("Group here-strings do not create synthetic fast-parser stages",
        metadata.count == 2 && metadata.group_count == 1 &&
@@ -660,12 +792,13 @@ void test_layer1_utility_functions(void) {
   const char *ptr = shell_subcommand_view(input, &range, &len);
   test("get returns the ranged view", ptr == input + 2 && len == 6);
 
-  // Test: NULL inputs
-  copied = shell_subcommand_copy(NULL, NULL, NULL, 0);
-  test("Copy with NULL returns 0", copied == 0);
+  const shell_range_t empty = {.start = 0, .len = 0};
+  buf[0] = 'x';
+  copied = shell_subcommand_copy(input, &empty, buf, sizeof(buf));
+  test("Copy preserves an empty subcommand", copied == 0 && buf[0] == '\0');
 
-  ptr = shell_subcommand_view(NULL, NULL, NULL);
-  test("Get with NULL returns NULL", ptr == NULL);
+  ptr = shell_subcommand_view(input, &empty, NULL);
+  test("Ranged view may omit its length output", ptr == input);
 }
 
 void test_layer1_error_handling(void) {
@@ -707,9 +840,7 @@ void test_layer1_error_handling(void) {
                  truncation_cases[i].features);
   }
 
-  // Test: NULL result
-  shell_error_t err = shell_parse_fast("cmd", 3, NULL, NULL);
-  test("NULL result returns SHELL_EINPUT", err == SHELL_EINPUT);
+  shell_error_t err;
 
 #if SIZE_MAX > UINT32_MAX
   memset(&result, 0xa5, sizeof(result));
@@ -1440,14 +1571,10 @@ static void test_source_scanner_contract(void) {
            shell_source_next_line(lines, sizeof(lines) - 1, 9) ==
                sizeof(lines) - 1);
 
-  static const char comment[] = "x # comment";
-  test("source scanner recognizes only shell-word comment boundaries",
-       shell_source_comment_starts("#comment", 8, 0) &&
-           shell_source_comment_starts(comment, sizeof(comment) - 1, 2) &&
-           shell_source_comment_starts("x;#comment", 10, 2) &&
-           shell_source_comment_starts("x|#comment", 10, 2) &&
-           !shell_source_comment_starts("word#literal", 12, 4) &&
-           !shell_source_comment_starts(NULL, 0, 0));
+  test("source scanner uses logical shell-word comment boundaries",
+       shell_source_comment_starts('#', true) &&
+           !shell_source_comment_starts('#', false) &&
+           !shell_source_comment_starts('x', true));
 
   static const char quoted[] = "\"one \\\"two\\\"\"";
   test("source scanner skips quoted text and quoted escapes",
@@ -1529,18 +1656,28 @@ static void test_source_scanner_contract(void) {
            !shell_source_line_is_heredoc_delimiter("E\n", 2, 0,
                                                    &ansi_suffix_pending));
   bool decoded_nul = false;
+  bool locale_dependent = false;
   position = 0;
   test("ANSI-C NUL probe distinguishes malformed and inactive quotes",
-       !shell_source_ansi_c_quote_has_nul("$'a\\0b'", 7, &position, NULL) &&
-           shell_source_ansi_c_quote_has_nul("$'a\\0b'", 7, &position,
-                                             &decoded_nul) &&
-           decoded_nul && position == 7 &&
-           !shell_source_heredoc_word_has_ansi_c_nul(NULL, 0) &&
-           !shell_source_heredoc_word_has_ansi_c_nul("\\$'a\\0b'", 8) &&
-           !shell_source_heredoc_word_has_ansi_c_nul("\"$'a\\0b'\"", 9) &&
-           !shell_source_heredoc_word_has_ansi_c_nul("'$'a\\0b''", 9) &&
-           !shell_source_heredoc_word_has_ansi_c_nul("$'unterminated", 14) &&
-           shell_source_heredoc_word_has_ansi_c_nul("\\\r\n$'a\\0b'", 10));
+       shell_source_ansi_c_quote_facts("$'a\\0b'", 7, &position, &decoded_nul,
+                                       &locale_dependent) &&
+           decoded_nul && !locale_dependent && position == 7 &&
+           !shell_source_heredoc_word_has_unsupported_ansi_c(NULL, 0) &&
+           !shell_source_heredoc_word_has_unsupported_ansi_c("\\$'a\\0b'", 8) &&
+           !shell_source_heredoc_word_has_unsupported_ansi_c("\"$'a\\0b'\"",
+                                                             9) &&
+           !shell_source_heredoc_word_has_unsupported_ansi_c("'$'a\\0b''", 9) &&
+           !shell_source_heredoc_word_has_unsupported_ansi_c("$'unterminated",
+                                                             14) &&
+           shell_source_heredoc_word_has_unsupported_ansi_c("\\\r\n$'a\\0b'",
+                                                            10));
+  position = 0;
+  test("ANSI-C Unicode facts do not conflate byte escapes with code points",
+       shell_source_ansi_c_quote_facts("$'\\u00e9'", 9, &position, &decoded_nul,
+                                       &locale_dependent) &&
+           !decoded_nul && locale_dependent && position == 9 &&
+           shell_source_heredoc_word_has_unsupported_ansi_c("$'\\u00e9'", 9) &&
+           !shell_source_heredoc_word_has_unsupported_ansi_c("$'\\xE9'", 7));
   static const char suffix_source[] =
       "cat <<$'E\\0F'X\npayload\nE\nEX\nprintf done\n";
   shell_parse_result_t suffix_result = {0};
@@ -1586,7 +1723,10 @@ static void test_source_scanner_contract(void) {
       "cat <<EOF $(printf value)\nbody\nEOF\n",
       "cat <<EOF <<<word\nbody\nEOF\n",
   };
-  bool opaque_headers = !shell_source_heredoc_delimiter_is_quoted(NULL);
+  const shell_source_pending_heredoc_t plain_pending = {.word = "EOF",
+                                                        .word_length = 3};
+  bool opaque_headers =
+      !shell_source_heredoc_delimiter_is_quoted(&plain_pending);
   for (size_t i = 0; opaque_headers && i < sizeof(opaque_header_cases) /
                                                sizeof(opaque_header_cases[0]);
        i++) {
@@ -1796,6 +1936,7 @@ static void test_source_scanner_contract(void) {
   test("source scanner recognizes non-structural glob bracket candidates",
        bracket_contract &&
            !shell_source_skip_glob_bracket(NULL, 0, 0, &after) &&
+           !shell_source_skip_extglob(NULL, 0, 0, &after) &&
            !shell_source_skip_glob_bracket("[a b]", 5, 0, &after) &&
            !shell_source_skip_glob_bracket("[[:alpha:]", 10, 0, &after) &&
            !shell_source_skip_glob_bracket("[[:alpha", 8, 0, &after) &&
@@ -1867,10 +2008,16 @@ static void test_source_scanner_contract(void) {
   bool rejects_unclosed_process_redirect =
       shell_source_skip_redirect(">(broken", 0, sizeof(">(broken") - 1) == 0;
   bool rejects_invalid_redirect_list =
-      !shell_source_redirect_list_before_group(NULL, 0, 0);
+      !shell_source_redirect_list_before_group("not-a-redirect", 0, 14);
+  shell_source_pending_heredoc_t missing_document;
+  size_t delimiter_after = 0;
+  bool parsed_delimiter = shell_source_parse_heredoc_delimiter(
+      "EOF", 3, &delimiter_after, &missing_document);
   bool rejects_missing_pending_document =
-      !shell_source_skip_pending_heredoc_bodies(NULL, 0, 0, NULL, 0,
-                                                &word_after);
+      parsed_delimiter &&
+      !shell_source_skip_pending_heredoc_bodies(
+          "body\n", 5, 0, &missing_document, 1, &word_after) &&
+      word_after == 5;
   test("source scanner rejects invalid redirect and document boundaries",
        skips_escaped_arithmetic &&
            escaped_arithmetic_after == sizeof(escaped_arithmetic_word) - 1 &&
@@ -2087,6 +2234,9 @@ static uint32_t feature_flags_mask(const shell_feature_flags_t *flags) {
 
 static void test_feature_flags(void) {
   printf("\n--- Feature Flags API ---\n");
+
+  /* NULL is an explicit no-op convenience contract. */
+  shell_feature_flags_from_bits(UINT32_MAX, NULL);
 
   uint32_t masks[] = {
       SHELL_FEAT_NONE,
@@ -2645,6 +2795,308 @@ static void test_pipeline_negation_trivia_metadata(void) {
   test("Fast parser preserves counted pipeline negation boundaries", valid);
 }
 
+static void test_pipeline_time_metadata(void) {
+  static const struct {
+    const char *source;
+    uint32_t count;
+    shell_pipeline_time_mode_t mode;
+    uint32_t negations;
+  } reserved[] = {
+      {"time echo x", 1, SHELL_PIPE_TIME_DEFAULT, 0},
+      {"time -p echo x | cat", 2, SHELL_PIPE_TIME_POSIX, 0},
+      {"time -- echo x", 1, SHELL_PIPE_TIME_POSIX, 0},
+      {"time time echo x", 1, SHELL_PIPE_TIME_DEFAULT, 0},
+      {"time -p time echo x", 1, SHELL_PIPE_TIME_POSIX, 0},
+      {"time time -p true", 1, SHELL_PIPE_TIME_POSIX, 0},
+      {"! time ! echo x | cat", 2, SHELL_PIPE_TIME_DEFAULT, 2},
+      {"time>/tmp/timing echo x", 1, SHELL_PIPE_TIME_DEFAULT, 0},
+      {"time</dev/null cat", 1, SHELL_PIPE_TIME_DEFAULT, 0},
+      {"time -p>/tmp/timing true", 1, SHELL_PIPE_TIME_POSIX, 0},
+      {"time -->/tmp/timing true", 1, SHELL_PIPE_TIME_POSIX, 0},
+      {"ti\\\nme true", 1, SHELL_PIPE_TIME_DEFAULT, 0},
+      {"\\\ntime true", 1, SHELL_PIPE_TIME_DEFAULT, 0},
+      {"time\\\n>/tmp/timing true", 1, SHELL_PIPE_TIME_DEFAULT, 0},
+      {"time", 1, SHELL_PIPE_TIME_DEFAULT, 0},
+      {"time !", 1, SHELL_PIPE_TIME_DEFAULT, 1},
+      {"! time", 1, SHELL_PIPE_TIME_DEFAULT, 1},
+  };
+  bool valid = true;
+  for (size_t i = 0; i < sizeof(reserved) / sizeof(reserved[0]); i++) {
+    shell_parse_result_t parsed = {0};
+    shell_error_t status = shell_parse_fast(
+        reserved[i].source, strlen(reserved[i].source), NULL, &parsed);
+    bool item = status == SHELL_OK && parsed.count == reserved[i].count;
+    for (uint32_t command = 0; item && command < parsed.count; command++) {
+      item =
+          (parsed.cmds[command].modifiers & SHELL_CMD_MOD_PIPE_TIMED) != 0 &&
+          parsed.cmds[command].pipeline_time_mode == reserved[i].mode &&
+          parsed.cmds[command].pipeline_negation_count == reserved[i].negations;
+    }
+    if (!item)
+      fprintf(stderr,
+              "time metadata mismatch: %s status=%d count=%u modifiers=%u "
+              "mode=%u negations=%u\n",
+              reserved[i].source, (int)status, parsed.count,
+              parsed.count ? parsed.cmds[0].modifiers : 0,
+              parsed.count ? parsed.cmds[0].pipeline_time_mode : 0,
+              parsed.count ? parsed.cmds[0].pipeline_negation_count : 0);
+    valid = valid && item;
+  }
+  test("Fast parser retains Bash time pipeline metadata", valid);
+
+  static const struct {
+    const char *source;
+    uint8_t kind;
+  } timed_groups[] = {
+      {"time { printf x; } | cat", SHELL_GROUP_BRACE},
+      {"time -p (printf x; cat) | sort", SHELL_GROUP_SUBSHELL},
+  };
+  valid = true;
+  for (size_t i = 0; i < sizeof(timed_groups) / sizeof(timed_groups[0]); i++) {
+    shell_parse_result_t parsed = {0};
+    bool item =
+        shell_parse_fast(timed_groups[i].source, strlen(timed_groups[i].source),
+                         NULL, &parsed) == SHELL_OK &&
+        parsed.group_count == 1 && parsed.count >= 2 &&
+        parsed.groups[0].kind == timed_groups[i].kind &&
+        (parsed.groups[0].modifiers & SHELL_CMD_MOD_PIPE_TIMED) != 0 &&
+        parsed.groups[0].pipeline_time_direct &&
+        parsed.groups[0].pipeline_time_mode ==
+            (i == 0 ? SHELL_PIPE_TIME_DEFAULT : SHELL_PIPE_TIME_POSIX) &&
+        parsed.cmds[parsed.count - 1].type == SHELL_TYPE_PIPELINE &&
+        parsed.cmds[parsed.count - 1].pipeline_time_mode ==
+            parsed.groups[0].pipeline_time_mode;
+    if (!item) {
+      fprintf(stderr,
+              "timed group mismatch: %s count=%u groups=%u group_mod=%u "
+              "group_mode=%u last_type=%u last_mod=%u last_mode=%u\n",
+              timed_groups[i].source, parsed.count, parsed.group_count,
+              parsed.group_count ? parsed.groups[0].modifiers : 0,
+              parsed.group_count ? parsed.groups[0].pipeline_time_mode : 0,
+              parsed.count ? parsed.cmds[parsed.count - 1].type : 0,
+              parsed.count ? parsed.cmds[parsed.count - 1].modifiers : 0,
+              parsed.count ? parsed.cmds[parsed.count - 1].pipeline_time_mode
+                           : 0);
+    }
+    valid = valid && item;
+  }
+  test("Fast parser attaches time to compound pipeline roots", valid);
+
+  const char *compound_member =
+      "time printf x | { time -p cat; printf tail; } | sort";
+  shell_parse_result_t compound = {0};
+  valid = shell_parse_fast(compound_member, strlen(compound_member), NULL,
+                           &compound) == SHELL_OK &&
+          compound.count == 4 && compound.group_count == 1 &&
+          compound.cmds[0].pipeline_time_mode == SHELL_PIPE_TIME_DEFAULT &&
+          compound.cmds[0].pipeline_time_direct &&
+          compound.groups[0].pipeline_time_mode == SHELL_PIPE_TIME_DEFAULT &&
+          !compound.groups[0].pipeline_time_direct &&
+          compound.cmds[1].pipeline_time_mode == SHELL_PIPE_TIME_POSIX &&
+          compound.cmds[1].pipeline_time_direct &&
+          compound.cmds[2].pipeline_time_mode == SHELL_PIPE_TIME_NONE &&
+          compound.cmds[3].pipeline_time_mode == SHELL_PIPE_TIME_DEFAULT &&
+          !compound.cmds[3].pipeline_time_direct;
+  test("Compound pipeline members separate outer and nested timing", valid);
+
+  static const struct {
+    const char *source;
+    uint16_t modifier;
+  } nested_groups[] = {
+      {"{ time { echo nested; }; echo outer; }", SHELL_CMD_MOD_PIPE_TIMED},
+      {"{ ! { echo nested; }; echo outer; }", SHELL_CMD_MOD_PIPE_NEGATED},
+      {"time { time -p { echo nested; }; echo outer; }",
+       SHELL_CMD_MOD_PIPE_TIMED},
+      {"! { ! { echo nested; }; echo outer; }", SHELL_CMD_MOD_PIPE_NEGATED},
+  };
+  valid = true;
+  for (size_t i = 0; i < sizeof(nested_groups) / sizeof(nested_groups[0]);
+       i++) {
+    shell_parse_result_t parsed = {0};
+    bool item = shell_parse_fast(nested_groups[i].source,
+                                 strlen(nested_groups[i].source), NULL,
+                                 &parsed) == SHELL_OK &&
+                parsed.group_count == 2 && parsed.count == 2;
+    uint32_t direct = 0;
+    for (uint32_t group = 0; item && group < parsed.group_count; group++)
+      direct +=
+          (parsed.groups[group].modifiers & nested_groups[i].modifier) != 0;
+    item = item && direct >= 1;
+    if (!item)
+      fprintf(stderr,
+              "nested pipeline modifier mismatch: %s count=%u "
+              "groups=%u direct=%u\n",
+              nested_groups[i].source, parsed.count, parsed.group_count,
+              direct);
+    valid = valid && item;
+  }
+  test("Nested brace groups retain reserved pipeline modifiers", valid);
+
+  static const struct {
+    const char *source;
+    uint32_t negations;
+    shell_pipeline_time_mode_t mode;
+  } redirected_groups[] = {
+      {"time { echo x; } 2>err | cat", 0, SHELL_PIPE_TIME_DEFAULT},
+      {"time -p (echo x) {fd}>out |& cat", 0, SHELL_PIPE_TIME_POSIX},
+      {"time { echo x; } &>all | cat", 0, SHELL_PIPE_TIME_DEFAULT},
+      {"time { cat; } <<<body | cat", 0, SHELL_PIPE_TIME_DEFAULT},
+      {"time { cat; } <<EOF | cat\nbody\nEOF\n", 0, SHELL_PIPE_TIME_DEFAULT},
+      {"! { echo x; } >out | cat", 1, SHELL_PIPE_TIME_NONE},
+      {"! ! (echo x) <in |& cat", 2, SHELL_PIPE_TIME_NONE},
+      {"time echo x | { cat; } 2>err | sort", 0, SHELL_PIPE_TIME_DEFAULT},
+  };
+  valid = true;
+  for (size_t i = 0;
+       i < sizeof(redirected_groups) / sizeof(redirected_groups[0]); i++) {
+    shell_parse_result_t parsed = {0};
+    bool item = shell_parse_fast(redirected_groups[i].source,
+                                 strlen(redirected_groups[i].source), NULL,
+                                 &parsed) == SHELL_OK &&
+                parsed.count >= 2;
+    const shell_range_t *last = item ? &parsed.cmds[parsed.count - 1] : NULL;
+    item = item && last->type == SHELL_TYPE_PIPELINE &&
+           last->pipeline_negation_count == redirected_groups[i].negations &&
+           last->pipeline_time_mode == redirected_groups[i].mode;
+    if (!item)
+      fprintf(stderr,
+              "redirected group modifier mismatch: %s count=%u "
+              "last-type=%u negations=%u mode=%u\n",
+              redirected_groups[i].source, parsed.count, last ? last->type : 0,
+              last ? last->pipeline_negation_count : 0,
+              last ? last->pipeline_time_mode : 0);
+    valid = valid && item;
+  }
+  test("Group redirect tails preserve outer pipeline modifiers", valid);
+
+  static const char *const ordinary[] = {
+      "VALUE=x time echo x",
+      ">out time echo x",
+      "command time echo x",
+      "\\time echo x",
+      "'time' echo x",
+      "echo | time cat",
+      "<<<body time echo x",
+      "echo | <<<body time",
+      "<<<one 3<<<two time",
+      "<<<one time <<<two cat",
+      "<<<one time -p 3<<<two cat <&3",
+      "<<<one time \\\n<<<two cat",
+      "<<EOF time <<<two cat\none\nEOF\n",
+      "<<<one time <<EOF cat\ntwo\nEOF\n",
+      "true | time <<<one <<<two cat",
+      "{fd}<<<body time",
+      "<<EOF time\nbody\nEOF\n",
+      "time$(echo x)",
+      "time`echo x`",
+      "time$((1))",
+      "time$'x'",
+      "time>(true)",
+      "time<(true)",
+      "time{fd}>out",
+  };
+  valid = true;
+  for (size_t i = 0; i < sizeof(ordinary) / sizeof(ordinary[0]); i++) {
+    shell_parse_result_t parsed = {0};
+    valid = valid && shell_parse_fast(ordinary[i], strlen(ordinary[i]), NULL,
+                                      &parsed) == SHELL_OK;
+    for (uint32_t command = 0; valid && command < parsed.count; command++)
+      valid =
+          (parsed.cmds[command].modifiers & SHELL_CMD_MOD_PIPE_TIMED) == 0 &&
+          parsed.cmds[command].pipeline_time_mode == SHELL_PIPE_TIME_NONE;
+  }
+  test("Time remains an ordinary word outside reserved pipeline position",
+       valid);
+
+  shell_parse_result_t document_negator = {0};
+  valid = shell_parse_fast("<<<body ! true", strlen("<<<body ! true"), NULL,
+                           &document_negator) == SHELL_OK &&
+          document_negator.count == 2;
+  for (uint32_t command = 0; valid && command < document_negator.count;
+       command++)
+    valid = document_negator.cmds[command].pipeline_negation_count == 0 &&
+            (document_negator.cmds[command].modifiers &
+             SHELL_CMD_MOD_PIPE_NEGATED) == 0;
+  test("Negator after a leading document remains an ordinary word", valid);
+
+  static const char *const continued_negator[] = {
+      "<<<one ! <<<two cat", "<<<one ! 3<<<two cat",
+      "<<EOF ! <<<two cat\none\nEOF\n"};
+  valid = true;
+  for (size_t i = 0;
+       i < sizeof(continued_negator) / sizeof(continued_negator[0]); i++) {
+    shell_parse_result_t parsed = {0};
+    valid = valid &&
+            shell_parse_fast(continued_negator[i], strlen(continued_negator[i]),
+                             NULL, &parsed) == SHELL_OK;
+    for (uint32_t range = 0; valid && range < parsed.count; range++)
+      valid = parsed.cmds[range].pipeline_negation_count == 0;
+  }
+  test("Document fragments do not restart reserved negator recognition", valid);
+
+  static const struct {
+    const char *source;
+    shell_pipeline_time_mode_t mode;
+    uint32_t negations;
+  } document_lines[] = {
+      {"printf one <<<one\ntime <<<two cat", SHELL_PIPE_TIME_DEFAULT, 0},
+      {"printf one <<<one\r\ntime -p <<<two cat", SHELL_PIPE_TIME_POSIX, 0},
+      {"printf one <<<one\n! <<<two cat", SHELL_PIPE_TIME_NONE, 1},
+      {"printf one <<<one\n#comment\n! time <<<two cat",
+       SHELL_PIPE_TIME_DEFAULT, 1},
+  };
+  valid = true;
+  for (size_t i = 0; i < sizeof(document_lines) / sizeof(document_lines[0]);
+       i++) {
+    shell_parse_result_t parsed = {0};
+    bool item = shell_parse_fast(document_lines[i].source,
+                                 strlen(document_lines[i].source), NULL,
+                                 &parsed) == SHELL_OK &&
+                parsed.count == 4;
+    if (item)
+      item = parsed.cmds[2].type == SHELL_TYPE_HERESTRING &&
+             parsed.cmds[2].pipeline_time_mode == document_lines[i].mode &&
+             parsed.cmds[2].pipeline_negation_count ==
+                 document_lines[i].negations &&
+             parsed.cmds[0].pipeline_time_mode == SHELL_PIPE_TIME_NONE;
+    valid = valid && item;
+  }
+  test("Real document line endings restore pipeline-prefix context", valid);
+
+  static const char *const option_fragments[] = {
+      "time -p$(echo x)", "time -p`echo x`",  "time -p$'x'",
+      "time -p>(true)",   "time --$(echo x)",
+  };
+  valid = true;
+  for (size_t i = 0; i < sizeof(option_fragments) / sizeof(option_fragments[0]);
+       i++) {
+    shell_parse_result_t parsed = {0};
+    valid = valid &&
+            shell_parse_fast(option_fragments[i], strlen(option_fragments[i]),
+                             NULL, &parsed) == SHELL_OK &&
+            parsed.count != 0 &&
+            parsed.cmds[0].pipeline_time_mode == SHELL_PIPE_TIME_DEFAULT;
+  }
+  test("Time options require complete logical words", valid);
+
+  static const char *const invalid_post_pipe_compounds[] = {
+      "echo | time { cat; }",
+      "echo | time (cat)",
+      "echo | ! { cat; }",
+      "echo | ! (cat)",
+  };
+  valid = true;
+  for (size_t i = 0; i < sizeof(invalid_post_pipe_compounds) /
+                             sizeof(invalid_post_pipe_compounds[0]);
+       i++) {
+    shell_parse_result_t parsed = {0};
+    valid = valid && shell_parse_fast(invalid_post_pipe_compounds[i],
+                                      strlen(invalid_post_pipe_compounds[i]),
+                                      NULL, &parsed) == SHELL_EPARSE;
+  }
+  test("Post-pipe modifiers cannot introduce compound stages", valid);
+}
+
 /* Document redirects may carry Bash's named descriptor allocator. They are
  * redirect syntax, never an argv fragment, and a bare document redirect can
  * be the pipeline stage modified by one or more leading `!` reserved words. */
@@ -2653,14 +3105,20 @@ static void test_named_document_and_negation_metadata(void) {
     const char *input;
     uint16_t document_type;
     uint32_t negation_count;
+    shell_pipeline_time_mode_t time_mode;
   } cases[] = {
-      {"printf x {fd}<<<body", SHELL_TYPE_HERESTRING, 0},
-      {"printf x {fd}<<EOF\nbody\nEOF\n", SHELL_TYPE_HEREDOC, 0},
-      {"! <<<body", SHELL_TYPE_HERESTRING, 1},
-      {"! ! <<EOF\nbody\nEOF\n", SHELL_TYPE_HEREDOC, 2},
-      {"! <<<body | cat", SHELL_TYPE_HERESTRING, 1},
-      {"{ cat; } {fd}<<<body", SHELL_TYPE_HERESTRING, 0},
-      {"{ cat; } {fd}<<EOF\nbody\nEOF\n", SHELL_TYPE_HEREDOC, 0},
+      {"printf x {fd}<<<body", SHELL_TYPE_HERESTRING, 0, SHELL_PIPE_TIME_NONE},
+      {"printf x {fd}<<EOF\nbody\nEOF\n", SHELL_TYPE_HEREDOC, 0,
+       SHELL_PIPE_TIME_NONE},
+      {"! <<<body", SHELL_TYPE_HERESTRING, 1, SHELL_PIPE_TIME_NONE},
+      {"! ! <<EOF\nbody\nEOF\n", SHELL_TYPE_HEREDOC, 2, SHELL_PIPE_TIME_NONE},
+      {"! <<<body | cat", SHELL_TYPE_HERESTRING, 1, SHELL_PIPE_TIME_NONE},
+      {"{ cat; } {fd}<<<body", SHELL_TYPE_HERESTRING, 0, SHELL_PIPE_TIME_NONE},
+      {"{ cat; } {fd}<<EOF\nbody\nEOF\n", SHELL_TYPE_HEREDOC, 0,
+       SHELL_PIPE_TIME_NONE},
+      {"time <<<body", SHELL_TYPE_HERESTRING, 0, SHELL_PIPE_TIME_DEFAULT},
+      {"time -p ! 3<<EOF\nbody\nEOF\n", SHELL_TYPE_HEREDOC, 1,
+       SHELL_PIPE_TIME_POSIX},
   };
   const shell_limits_t strict = {
       .max_subcommands = SHELL_MAX_SUBCOMMANDS,
@@ -2685,7 +3143,10 @@ static void test_named_document_and_negation_metadata(void) {
           parsed.cmds[document].pipeline_negation_count ==
               cases[i].negation_count &&
           (!!(parsed.cmds[document].modifiers & SHELL_CMD_MOD_PIPE_NEGATED) ==
-           (cases[i].negation_count != 0));
+           (cases[i].negation_count != 0)) &&
+          parsed.cmds[document].pipeline_time_mode == cases[i].time_mode &&
+          (!!(parsed.cmds[document].modifiers & SHELL_CMD_MOD_PIPE_TIMED) ==
+           (cases[i].time_mode != SHELL_PIPE_TIME_NONE));
     }
     if (i < 2)
       valid = valid && parsed.count == 2 &&
@@ -2697,9 +3158,43 @@ static void test_named_document_and_negation_metadata(void) {
     if (i == 6)
       valid = valid && parsed.count == 2;
   }
-  test("Fast parser classifies named document redirects and negated document "
-       "stages",
+  test("Fast parser classifies named and modified document redirect stages",
        valid);
+}
+
+static void test_document_pipeline_modifiers(void) {
+  static const char *const cases[] = {
+      "time -p ! cat <<<body | cat",
+      "time -p ! cat <<EOF | cat\nbody\nEOF\n",
+      "time -p ! cat <<<body argument | cat",
+      "time -p ! cat <<<one 3<<<two |& cat",
+      "time -p ! cat | <<<body",
+      "time -p ! cat | <<EOF\nbody\nEOF\n",
+      "time -p ! { cat; } | <<<body",
+      "time -p ! <<<body | cat",
+  };
+  bool valid = true;
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    shell_parse_result_t parsed = {0};
+    bool item =
+        shell_parse_fast(cases[i], strlen(cases[i]), NULL, &parsed) == SHELL_OK;
+    uint32_t stages = 0;
+    for (uint32_t range = 0; item && range < parsed.count; range++) {
+      const shell_range_t *member = &parsed.cmds[range];
+      if (member->pipe_input_mode == SHELL_PIPE_MODE_NONE)
+        continue;
+      stages++;
+      item = member->pipeline_time_mode == SHELL_PIPE_TIME_POSIX &&
+             member->pipeline_negation_count == 1 &&
+             (member->features & SHELL_FEAT_PIPELINE) != 0;
+    }
+    item = item && stages == 1 && parsed.count != 0 &&
+           (parsed.cmds[0].features & SHELL_FEAT_PIPELINE) != 0;
+    if (!item)
+      fprintf(stderr, "Document pipeline metadata: %s\n", cases[i]);
+    valid = valid && item;
+  }
+  test("Document fragments preserve timed and negated pipeline stages", valid);
 }
 
 /* The strict fast parser is the shared admission check for every canonical
@@ -2820,9 +3315,16 @@ static void test_semantic_classifier_boundaries(void) {
       {"(( count += 1 ))", true},
       {"! (( 1 ))", true},
       {"{ (( 1 )); }", true},
-      {"time echo x", true},
-      {"VALUE=x time -p echo x", true},
-      {"! time false", true},
+      {"time echo x", false},
+      {"time eval echo hidden", true},
+      {"time coproc echo hidden", true},
+      {"time [[ -f /tmp/x ]]", true},
+      {"time (( count += 1 ))", true},
+      {"time shopt -s varredir_close", true},
+      {"time command declare -a values", true},
+      {"echo \"$(time eval echo hidden)\"", true},
+      {"VALUE=x time -p echo x", false},
+      {"! time false", false},
       {"command time echo x", false},
       {"\"time\" echo x", false},
       {"echo $'unterminated", false},
@@ -2856,6 +3358,10 @@ static void test_semantic_classifier_boundaries(void) {
   for (size_t i = 0; i < sizeof(source_cases) / sizeof(source_cases[0]); i++) {
     bool got = shell_tokenizer_has_unsupported_semantics(
         source_cases[i].input, strlen(source_cases[i].input));
+    if (got != source_cases[i].unsupported)
+      fprintf(stderr,
+              "semantic classification mismatch: %s got=%d expected=%d\n",
+              source_cases[i].input, got, source_cases[i].unsupported);
     valid = got == source_cases[i].unsupported && valid;
   }
   for (size_t i = 0; i < sizeof(arithmetic_cases) / sizeof(arithmetic_cases[0]);
@@ -2878,6 +3384,26 @@ static void test_semantic_classifier_boundaries(void) {
                        too_many_commands, strlen(too_many_commands), NULL,
                        &too_many) == SHELL_PROCESS_EOUTPUT_LIMIT;
   valid = valid && too_many.commands == NULL && too_many.command_count == 0;
+
+  char unsupported_after_capacity[2 * (SHELL_MAX_SUBCOMMANDS + 1) +
+                                  sizeof("time eval echo hidden")] = {0};
+  size_t capacity_used = 0;
+  for (size_t i = 0; i < SHELL_MAX_SUBCOMMANDS + 1; i++)
+    capacity_used += (size_t)snprintf(
+        unsupported_after_capacity + capacity_used,
+        sizeof(unsupported_after_capacity) - capacity_used, "x;");
+  capacity_used +=
+      (size_t)snprintf(unsupported_after_capacity + capacity_used,
+                       sizeof(unsupported_after_capacity) - capacity_used,
+                       "time eval echo hidden");
+  too_many = (shell_processed_commands_t){
+      .commands = (shell_command_info_t *)(uintptr_t)1,
+      .command_count = SIZE_MAX,
+  };
+  valid = valid && capacity_used < sizeof(unsupported_after_capacity) &&
+          shell_process_commands(unsupported_after_capacity, capacity_used,
+                                 NULL, &too_many) == SHELL_PROCESS_EPARSE &&
+          too_many.commands == NULL && too_many.command_count == 0;
   test("Semantic classifiers retain quote and expansion boundaries", valid);
 }
 
@@ -2887,15 +3413,8 @@ static void test_semantic_classifier_boundaries(void) {
 static void test_transform_contract_boundaries(void) {
   shell_transformed_command_t *transformed =
       (shell_transformed_command_t *)(uintptr_t)1;
-  shell_command_t empty = {0};
-  shell_token_t invalid = {
-      .type = SHELL_TOKEN_COMMAND, .start = NULL, .length = 1, .position = 0};
-  shell_command_t malformed = {
-      .tokens = &invalid, .token_count = 1, .start_pos = 0, .end_pos = 1};
-  shell_token_t variable = {
-      .type = SHELL_TOKEN_VARIABLE, .start = "$X", .length = 2, .position = 0};
-  shell_command_t command = {
-      .tokens = &variable, .token_count = 1, .start_pos = 0, .end_pos = 2};
+  shell_command_t *tokenized = NULL;
+  size_t tokenized_count = 0;
   const shell_transform_limits_t display_limit = {
       .max_string_bytes = 2,
       .max_total_bytes = SIZE_MAX,
@@ -2905,30 +3424,23 @@ static void test_transform_contract_boundaries(void) {
       .max_total_bytes = 20,
   };
   bool valid =
-      shell_transform_command(NULL, NULL, &transformed) ==
-          SHELL_TRANSFORM_EINPUT &&
-      transformed == NULL &&
-      shell_transform_command(&empty, NULL, &transformed) ==
-          SHELL_TRANSFORM_EINPUT &&
-      transformed == NULL &&
-      shell_transform_command(&malformed, NULL, &transformed) ==
-          SHELL_TRANSFORM_EINPUT &&
-      transformed == NULL &&
-      shell_transform_command(&command, &display_limit, &transformed) ==
+      shell_tokenize_commands("$X", 2, &tokenized, &tokenized_count) ==
+          SHELL_TOKENIZE_OK &&
+      tokenized_count == 1 &&
+      shell_transform_command(&tokenized[0], &display_limit, &transformed) ==
           SHELL_TRANSFORM_EOUTPUT_LIMIT &&
       transformed == NULL &&
-      shell_transform_command(&command, &total_limit, &transformed) ==
+      shell_transform_command(&tokenized[0], &total_limit, &transformed) ==
           SHELL_TRANSFORM_EOUTPUT_LIMIT &&
       transformed == NULL;
+  shell_commands_free(tokenized, tokenized_count);
   shell_transformed_command_t **commands =
       (shell_transformed_command_t **)(uintptr_t)1;
   size_t count = SIZE_MAX;
   valid = valid &&
-          shell_transform_command_line(NULL, 0, NULL, &commands, &count) ==
-              SHELL_TRANSFORM_EINPUT &&
-          commands == NULL && count == 0 &&
-          shell_transform_command_line("echo $X", strlen("echo $X"), NULL, NULL,
-                                       &count) == SHELL_TRANSFORM_EINPUT;
+          shell_transform_command_line("", 0, NULL, &commands, &count) ==
+              SHELL_TRANSFORM_OK &&
+          commands == NULL && count == 0;
   test("Transform contracts retain expansion and output boundaries", valid);
 }
 
@@ -2959,11 +3471,6 @@ static void test_word_writer_contract_boundaries(void) {
       shell_write_decoded_word("word", 4, destination, 3, &written) ==
           SHELL_PROCESS_EOUTPUT_LIMIT &&
       written == 0 &&
-      shell_measure_processed_word(NULL, 0, &written) == SHELL_PROCESS_EINPUT &&
-      written == 0 &&
-      shell_write_processed_word(NULL, 0, destination, sizeof(destination),
-                                 &written) == SHELL_PROCESS_EINPUT &&
-      written == 0 &&
       shell_write_processed_word("$(printf x)", strlen("$(printf x)"),
                                  destination, 1,
                                  &written) == SHELL_PROCESS_EOUTPUT_LIMIT &&
@@ -2982,11 +3489,7 @@ static void test_word_writer_contract_boundaries(void) {
       .max_string_bytes = 1,
       .max_total_bytes = 1,
   };
-  valid = valid &&
-          shell_render_netargv_buffer(&infos[0], NULL, &occupied) ==
-              SHELL_PROCESS_EINPUT &&
-          shell_render_netargv_buffer(&infos[0], &tiny, &occupied) ==
-              SHELL_PROCESS_EINPUT;
+  valid = valid && !shell_netstring_buffer_is_empty(&occupied);
   shell_command_infos_free(infos, info_count);
   infos = (shell_command_info_t *)(uintptr_t)1;
   info_count = SIZE_MAX;
@@ -3006,7 +3509,7 @@ static void test_abstract_adapter_contract(void) {
   const char source[] =
       "printf $HOME /etc/passwd ./relative ~/home *.c $(id) $((1 + 2)) >out";
   shell_abstract_status_t null_status =
-      shell_abstract_command_parse(NULL, 0, &abstracted);
+      shell_abstract_command_parse("", 0, &abstracted);
   bool null_cleared = abstracted == NULL;
   shell_abstract_status_t malformed_status =
       shell_abstract_command_parse("echo '", strlen("echo '"), &abstracted);
@@ -3044,7 +3547,7 @@ static void test_abstract_adapter_contract(void) {
   /* Raw classification accepts a token span rather than a command line. Keep
    * malformed and boundary spellings distinct from the richer parsed input
    * above. */
-  valid = valid && shell_classify_raw_token(NULL, 0) == SHELL_TOKEN_END &&
+  valid = valid && shell_classify_raw_token("", 0) == SHELL_TOKEN_END &&
           shell_classify_raw_token("$", 1) == SHELL_TOKEN_ARGUMENT &&
           shell_classify_raw_token("${x}", 4) == SHELL_TOKEN_VARIABLE &&
           shell_classify_raw_token("${12}", 5) == SHELL_TOKEN_SPECIAL_VAR &&
@@ -3340,6 +3843,117 @@ static void test_nested_double_quote_boundaries(void) {
            result.count == 1);
 }
 
+static void test_prefix_scan_scaling(void) {
+  static const struct {
+    const char *prefix;
+    const char *suffix;
+    size_t document_anchor;
+  } cases[] = {
+      {"printf x | ", "<<<word cat", SIZE_MAX},
+      {"! printf x | ", "<<<word cat", SIZE_MAX},
+      {"time printf x | ", "<<<word cat", SIZE_MAX},
+      {"! time printf x |& ", "<<<word cat", SIZE_MAX},
+      {"true; # ignored time !\n ! ", "<<<word cat", 24},
+      {"true && time ! ", "<<<word cat", 8},
+      {"true; time ", "{fd}<<<word cat", 6},
+      {"printf x | { time ! ", "<<<word cat; }", 13},
+      {"time ", "{ printf x; }", SIZE_MAX},
+      {"! time ", "(printf x)", SIZE_MAX},
+  };
+  bool valid = true;
+  for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+    for (size_t padding = 256; padding <= 8192; padding *= 2) {
+      size_t prefix = strlen(cases[c].prefix);
+      size_t suffix = strlen(cases[c].suffix);
+      size_t length = prefix + padding + suffix;
+      char *source = malloc(length + 1);
+      if (!source) {
+        valid = false;
+        break;
+      }
+      memcpy(source, cases[c].prefix, prefix);
+      memset(source + prefix, ' ', padding);
+      memcpy(source + prefix + padding, cases[c].suffix, suffix + 1);
+      shell_parse_result_t parsed;
+      shell_limits_t strict = SHELL_LIMITS_DEFAULT;
+      strict.strict_mode = true;
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+      shellsplit_test_source_scan_reset();
+#endif
+      bool item =
+          shell_parse_fast(source, length, &strict, &parsed) == SHELL_OK;
+      shell_execution_map_t execution;
+      if (item) {
+        shell_execution_map_build(source, length, &parsed, &execution);
+        if (cases[c].document_anchor != SIZE_MAX) {
+          bool found = false;
+          for (uint32_t i = 0; i < parsed.count; i++)
+            if (shell_execution_document(&parsed.cmds[i])) {
+              found = true;
+              item = item && execution.anchor[i] == cases[c].document_anchor;
+              break;
+            }
+          item = item && found;
+        }
+      }
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+      item = item && shellsplit_test_source_scan_work() <= 32 * length;
+#endif
+      if (!item)
+        fprintf(stderr, "prefix scaling mismatch: case=%zu padding=%zu\n", c,
+                padding);
+      valid = valid && item;
+      free(source);
+    }
+  }
+  test("Pipeline and document prefix scans have a linear work budget", valid);
+
+  /* Nested compounds make both the group count and flattened range count grow.
+   * Index construction must visit those tables in one sweep; a per-range group
+   * search or per-group range scan would make this family quadratic. */
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+  size_t previous_work = 0;
+#endif
+  for (size_t depth = 4; depth <= 32; depth *= 2) {
+    char source[4096];
+    size_t used = 0;
+    for (size_t group = 0; group < depth; group++) {
+      static const char prefix[] = "{ printf x; ";
+      memcpy(source + used, prefix, sizeof(prefix) - 1);
+      used += sizeof(prefix) - 1;
+    }
+    source[used++] = ':';
+    for (size_t group = 0; group < depth; group++) {
+      static const char suffix[] = "; }";
+      memcpy(source + used, suffix, sizeof(suffix) - 1);
+      used += sizeof(suffix) - 1;
+    }
+    source[used] = '\0';
+
+    shell_parse_result_t parsed = {0};
+    shell_limits_t strict = SHELL_LIMITS_DEFAULT;
+    strict.strict_mode = true;
+    bool item = shell_parse_fast(source, used, &strict, &parsed) == SHELL_OK &&
+                parsed.group_count == depth && parsed.count == depth + 1;
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+    shellsplit_test_source_scan_reset();
+#endif
+    shell_execution_map_t execution;
+    if (item)
+      shell_execution_map_build(source, used, &parsed, &execution);
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+    size_t work = shellsplit_test_source_scan_work();
+    item = item && work <= 64 * (parsed.count + parsed.group_count) + 256 &&
+           (previous_work == 0 || work <= 3 * previous_work + 128);
+    previous_work = work;
+#endif
+    if (!item)
+      fprintf(stderr, "pipeline index scaling mismatch: depth=%zu\n", depth);
+    valid = valid && item;
+  }
+  test("Pipeline indexing scales with groups and ranges", valid);
+}
+
 int main(void) {
   printf("=== FAST PARSER API TESTS ===\n");
   printf("Testing shell_parse_fast() and related functions\n\n");
@@ -3351,6 +3965,7 @@ int main(void) {
   test_layer1_whitespace_trimming();
   test_layer1_heredoc();
   test_feature_matrix();
+  test_array_assignment_prefix_features();
   test_layer1_utility_functions();
   test_layer1_error_handling();
   test_dialect_oracle();
@@ -3384,7 +3999,10 @@ int main(void) {
   test_list_connector_continuation_metadata();
   test_word_fragment_operator_boundaries();
   test_pipeline_negation_trivia_metadata();
+  test_pipeline_time_metadata();
+  test_prefix_scan_scaling();
   test_named_document_and_negation_metadata();
+  test_document_pipeline_modifiers();
   test_strict_operator_boundary_matrix();
   test_semantic_classifier_boundaries();
   test_backtick_command_boundaries();

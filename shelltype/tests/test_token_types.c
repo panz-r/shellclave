@@ -367,7 +367,6 @@ static int test_classification_matrix(void) {
       {"1a:2b:3c:4d:5e:6f:7a:8b:9c:0d:1e:2f:3a:4b:5c:6d", ST_TYPE_FINGERPRINT},
   };
 
-  ASSERT(st_token_classify(NULL) == ST_TYPE_LITERAL);
   ASSERT(st_token_classify("") == ST_TYPE_LITERAL);
 
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
@@ -958,10 +957,7 @@ static int test_normalization_matrix(void) {
 }
 
 static int test_normalization_boundaries(void) {
-  st_token_array_t typed = {(st_token_t *)1, 99};
-  ASSERT(test_st_classify(NULL, &typed) == ST_ERR_INVALID);
-  ASSERT(typed.tokens == NULL && typed.count == 0);
-  ASSERT(test_st_classify("echo ok", NULL) == ST_ERR_INVALID);
+  st_token_array_t typed = {0};
 
   /* Shelltype never re-tokenizes argv elements, including operator-looking
    * text. */
@@ -1034,22 +1030,62 @@ static int test_normalization_allocation_failures(void) {
   return 1;
 }
 
+static int test_borrowed_policy_classifier(void) {
+  static const char input[] = "4:kill,2:-s,1:9,0:,3:a\0b,";
+  st_token_scratch_t scratch;
+  st_test_alloc_reset();
+  st_test_alloc_fail_at(1);
+  st_error_t error = st_netargv_classify_scratch_view(
+      (st_netargv_view_t){input, sizeof(input) - 1}, &scratch);
+  size_t allocations = st_test_alloc_count();
+  st_test_alloc_reset();
+  ASSERT(error == ST_OK && allocations == 0 && scratch.count == 5);
+  ASSERT(scratch.tokens[0].text == input + 2);
+  ASSERT(scratch.tokens[2].type == ST_TYPE_SIGNAL);
+  ASSERT(scratch.tokens[3].text_length == 0 &&
+         scratch.tokens[3].text[0] == '\0');
+  ASSERT(scratch.tokens[4].text_length == 3 &&
+         memcmp(scratch.tokens[4].text, "a\0b", 3) == 0);
+
+  char long_payload[ST_MAX_TOKEN_LEN * 2];
+  memset(long_payload, 'x', sizeof(long_payload));
+  char encoded[sizeof(long_payload) + 32];
+  size_t length = 0;
+  ASSERT(shell_netstring_write(encoded, sizeof(encoded), long_payload,
+                               sizeof(long_payload),
+                               &length) == SHELL_NETSTRING_OK);
+  ASSERT(st_netargv_classify_scratch_view((st_netargv_view_t){encoded, length},
+                                          &scratch) == ST_OK);
+  ASSERT(scratch.count == 1 &&
+         scratch.tokens[0].text_length == sizeof(long_payload) &&
+         scratch.tokens[0].type == ST_TYPE_LITERAL &&
+         memcmp(scratch.tokens[0].text, long_payload, sizeof(long_payload)) ==
+             0);
+  /* Malformed tails cannot publish a partially classified prefix. */
+  encoded[length] = 'x';
+  ASSERT(
+      st_netargv_classify_scratch_view((st_netargv_view_t){encoded, length + 1},
+                                       &scratch) == ST_ERR_FORMAT);
+  ASSERT(scratch.count == 0);
+
+  char records[(ST_MAX_CMD_TOKENS + 1) * 4];
+  for (size_t i = 0; i < ST_MAX_CMD_TOKENS + 1; i++)
+    memcpy(records + i * 4, "1:x,", 4);
+  ASSERT(st_netargv_classify_scratch_view(
+             (st_netargv_view_t){records, ST_MAX_CMD_TOKENS * 4}, &scratch) ==
+         ST_OK);
+  ASSERT(scratch.count == ST_MAX_CMD_TOKENS);
+  ASSERT(st_netargv_classify_scratch_view(
+             (st_netargv_view_t){records, sizeof(records)}, &scratch) ==
+         ST_ERR_LIMIT);
+  ASSERT(scratch.count == 0);
+  return 1;
+}
+
 static int test_canonical_invalid_boundaries(void) {
-  ASSERT(st_token_classify_bytes(NULL, 1) == ST_TYPE_LITERAL);
   ASSERT(st_token_classify_bytes(NULL, 0) == ST_TYPE_LITERAL);
   st_token_array_free(NULL);
-  ASSERT(st_netpattern_from_cpl("echo", NULL) == ST_ERR_INVALID);
-  ASSERT(st_netpattern_to_cpl("", NULL) == ST_ERR_INVALID);
-  ASSERT(st_netargv_classify(NULL, NULL) == ST_ERR_INVALID);
-  ASSERT(st_netargv_classify_view((st_netargv_view_t){NULL, 1}, NULL) ==
-         ST_ERR_INVALID);
-  ASSERT(st_netargv_classify_view((st_netargv_view_t){"", 0}, NULL) ==
-         ST_ERR_INVALID);
-  ASSERT(st_netargv_visit(NULL, NULL, NULL, NULL) == ST_ERR_INVALID);
-  ASSERT(st_netargv_visit_view((st_netargv_view_t){NULL, 1}, NULL, NULL,
-                               NULL) == ST_ERR_INVALID);
-  ASSERT(st_netargv_classify_scratch_view((st_netargv_view_t){"", 0}, NULL) ==
-         ST_ERR_INVALID);
+
   st_token_scratch_t scratch;
   ASSERT(st_netargv_classify_scratch_view((st_netargv_view_t){NULL, 1},
                                           &scratch) == ST_ERR_INVALID);
@@ -1078,9 +1114,6 @@ static int test_netpattern_view_boundary_contract(void) {
       st_netpattern_decode_view((st_netpattern_view_t){.data = "", .length = 0},
                                 &decoded) == ST_ERR_FORMAT);
   ASSERT(decoded.tokens == NULL && decoded.count == 0);
-  ASSERT(st_netpattern_decode_view(
-             (st_netpattern_view_t){.data = valid, .length = strlen(valid)},
-             NULL) == ST_ERR_INVALID);
 
   char *cpl = (char *)(uintptr_t)1;
   ASSERT(st_netpattern_to_cpl_view(
@@ -1092,16 +1125,8 @@ static int test_netpattern_view_boundary_contract(void) {
       st_netpattern_to_cpl_view((st_netpattern_view_t){.data = "", .length = 0},
                                 &cpl) == ST_ERR_FORMAT);
   ASSERT(cpl == NULL);
-  ASSERT(st_netpattern_to_cpl_view(
-             (st_netpattern_view_t){.data = valid, .length = strlen(valid)},
-             NULL) == ST_ERR_INVALID);
 
   st_netpattern_t occupied = {.data = valid, .length = strlen(valid)};
-  st_token_t literal = {.text = "value", .type = ST_TYPE_LITERAL};
-  ASSERT(st_netpattern_encode_owned(&literal, 1, &occupied) == ST_ERR_INVALID);
-  ASSERT(occupied.data == valid && occupied.length == strlen(valid));
-  ASSERT(st_netpattern_from_cpl_owned("value", &occupied) == ST_ERR_INVALID);
-  ASSERT(occupied.data == valid && occupied.length == strlen(valid));
   st_netpattern_free(&occupied);
   ASSERT(occupied.data == NULL && occupied.length == 0);
   return 1;
@@ -1129,9 +1154,9 @@ static int test_public_helper_matrix(void) {
                     {".profile", NULL},       {"dir/.profile", NULL},
                     {"dir/name.", NULL},      {"dir/name.tar.gz", ".gz"},
                     {"dir/name", NULL},       {"app", NULL},
-                    {"app.", NULL},           {NULL, NULL}},
+                    {"app.", NULL},           {"", NULL}},
     suffixes[] = {{"10MiB", "MiB"}, {"-2.5G", "G"}, {"42", NULL}, {".5G", "G"},
-                  {"-", NULL},      {"10", NULL},   {NULL, NULL}};
+                  {"-", NULL},      {"10", NULL},   {"", NULL}};
   for (size_t i = 0; i < sizeof(extensions) / sizeof(extensions[0]); i++) {
     const char *actual = st_path_extension(extensions[i].input);
     ASSERT((!actual && !extensions[i].expected) ||
@@ -1271,9 +1296,7 @@ static int test_netargv_visit_contract(void) {
   ASSERT(st_netargv_visit("1:x", check_netargv_visit, &expect, &visited) ==
          ST_ERR_FORMAT);
   ASSERT(visited == 0);
-  ASSERT(st_netargv_visit(NULL, check_netargv_visit, &expect, &visited) ==
-         ST_ERR_INVALID);
-  ASSERT(st_netargv_visit("1:x,", NULL, &expect, &visited) == ST_ERR_INVALID);
+
   return 1;
 }
 
@@ -1364,6 +1387,380 @@ static int test_netargv_visit_accepts_binary_payloads(void) {
   st_learner_get_stats(learner, &stats);
   ASSERT(stats.command_count == 1);
   st_learner_free(learner);
+  return 1;
+}
+
+static int test_cpl_parse_work_is_linear(void) {
+  static const size_t escapes[] = {16, 32, 64, 128, 255};
+  static const char prefix[] = "\"cmd\" \"";
+  char cpl[ST_MAX_CPL_LEN];
+  for (size_t i = 0; i < sizeof(escapes) / sizeof(escapes[0]); i++) {
+    size_t used = sizeof(prefix) - 1;
+    memcpy(cpl, prefix, used);
+    for (size_t j = 0; j < escapes[i]; j++) {
+      memcpy(cpl + used, "\\u0061", 6);
+      used += 6;
+    }
+    cpl[used++] = '"';
+    cpl[used] = '\0';
+    st_netpattern_t pattern = {0};
+    st_error_t error = st_netpattern_from_cpl_owned(cpl, &pattern);
+    size_t work = st_test_cpl_parse_work();
+    st_token_array_t decoded = {0};
+    bool correct = error == ST_OK &&
+                   st_netpattern_decode_view(
+                       (st_netpattern_view_t){pattern.data, pattern.length},
+                       &decoded) == ST_OK &&
+                   decoded.count == 2 &&
+                   decoded.tokens[1].text_length == escapes[i];
+    if (correct)
+      for (size_t j = 0; j < escapes[i]; j++)
+        correct = correct && decoded.tokens[1].text[j] == 'a';
+    st_token_array_free(&decoded);
+    st_netpattern_free(&pattern);
+    ASSERT(correct);
+    ASSERT(work <= used * 3 + 64);
+  }
+
+  /* Neither short words nor an escape-heavy trailing word may trigger suffix
+   * allocation or one-entry vector growth. Count requested bytes before the
+   * decoder, so its independently allocated output is not part of this bound.
+   */
+  static const size_t words[] = {8, 16, 32, 64, ST_MAX_CMD_TOKENS};
+  for (size_t tail = 0; tail < 2; tail++) {
+    for (size_t i = 0; i < sizeof(words) / sizeof(words[0]); i++) {
+      size_t used = 0;
+      for (size_t j = 0; j < words[i]; j++) {
+        if (j)
+          cpl[used++] = ' ';
+        cpl[used++] = '"';
+        size_t repeats = tail && j == words[i] - 1 ? ST_MAX_TOKEN_LEN - 1 : 1;
+        for (size_t k = 0; k < repeats; k++) {
+          if (tail && j == words[i] - 1) {
+            memcpy(cpl + used, "\\u0061", 6);
+            used += 6;
+          } else {
+            cpl[used++] = 'a';
+          }
+        }
+        cpl[used++] = '"';
+      }
+      cpl[used] = '\0';
+      st_netpattern_t pattern = {0};
+      st_test_alloc_reset();
+      st_error_t error = st_netpattern_from_cpl_owned(cpl, &pattern);
+      size_t work = st_test_cpl_parse_work();
+      size_t requested = st_test_alloc_bytes();
+      size_t allocations = st_test_alloc_count();
+      st_test_alloc_reset();
+      st_token_array_t decoded = {0};
+      bool correct = error == ST_OK &&
+                     st_netpattern_decode_view(
+                         (st_netpattern_view_t){pattern.data, pattern.length},
+                         &decoded) == ST_OK &&
+                     decoded.count == words[i];
+      if (correct) {
+        for (size_t j = 0; j < words[i]; j++) {
+          size_t expected =
+              tail && j == words[i] - 1 ? ST_MAX_TOKEN_LEN - 1 : 1;
+          correct = correct && decoded.tokens[j].text_length == expected;
+          if (correct)
+            for (size_t k = 0; k < expected; k++)
+              correct = correct && decoded.tokens[j].text[k] == 'a';
+        }
+      }
+      st_token_array_free(&decoded);
+      st_netpattern_free(&pattern);
+      ASSERT(correct);
+      ASSERT(work <= used * 3 + 64);
+      ASSERT(requested <= 192 * words[i] + 8 * used + 2048);
+      ASSERT(allocations <= 2 * words[i] + 8);
+    }
+  }
+  return 1;
+}
+
+static int test_cpl_decoded_token_limits(void) {
+  static const struct {
+    const char *spelling;
+    const char *decoded;
+    size_t width;
+    bool quoted;
+  } cases[] = {
+      {"z", "z", 1, false},
+      {"z", "z", 1, true},
+      {"\\n", "\n", 1, true},
+      {"\\x00", "\0", 1, true},
+      {"\\u007f", "\x7f", 1, true},
+      {"\\u00a2", "\xc2\xa2", 2, true},
+      {"\\u20ac", "\xe2\x82\xac", 3, true},
+      {"\\ud83d\\ude00", "\xf0\x9f\x98\x80", 4, true},
+  };
+  char cpl[ST_MAX_CPL_LEN];
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    /* Exactly full, then every partial fit of a multibyte code point, plus
+     * an already-full buffer. All failures must leave no published output. */
+    for (size_t extra = 0; extra <= cases[i].width; extra++) {
+      size_t padding = ST_MAX_TOKEN_LEN - 1 - cases[i].width + extra;
+      size_t used = 4;
+      memcpy(cpl, "cmd ", used);
+      if (cases[i].quoted)
+        cpl[used++] = '"';
+      memset(cpl + used, 'a', padding);
+      used += padding;
+      size_t spelling_length = strlen(cases[i].spelling);
+      memcpy(cpl + used, cases[i].spelling, spelling_length);
+      used += spelling_length;
+      if (cases[i].quoted)
+        cpl[used++] = '"';
+      cpl[used] = '\0';
+      st_netpattern_t pattern = {0};
+      st_error_t error = st_netpattern_from_cpl_owned(cpl, &pattern);
+      st_token_array_t decoded = {0};
+      bool correct;
+      if (extra == 0) {
+        correct = error == ST_OK &&
+                  st_netpattern_decode_view(
+                      (st_netpattern_view_t){pattern.data, pattern.length},
+                      &decoded) == ST_OK &&
+                  decoded.count == 2 &&
+                  decoded.tokens[1].text_length == ST_MAX_TOKEN_LEN - 1 &&
+                  memcmp(decoded.tokens[1].text + padding, cases[i].decoded,
+                         cases[i].width) == 0;
+        if (correct)
+          for (size_t j = 0; j < padding; j++)
+            correct = correct && decoded.tokens[1].text[j] == 'a';
+      } else {
+        correct = error == ST_ERR_INVALID && pattern.data == NULL &&
+                  pattern.length == 0;
+      }
+      st_token_array_free(&decoded);
+      st_netpattern_free(&pattern);
+      ASSERT(correct);
+    }
+  }
+
+  /* Prefix and suffix have independent decoded-byte limits. Marker bytes
+   * are structural, not part of either literal component's capacity. */
+  for (size_t suffix = 0; suffix < 2; suffix++) {
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+      for (size_t extra = 0; extra <= cases[i].width; extra++) {
+        size_t padding = ST_MAX_TOKEN_LEN - 1 - cases[i].width + extra;
+        size_t used = 4;
+        memcpy(cpl, "cmd ", used);
+        if (suffix) {
+          memset(cpl + used, 'a', ST_MAX_TOKEN_LEN - 1);
+          used += ST_MAX_TOKEN_LEN - 1;
+          memcpy(cpl + used, "{#n}", 4);
+          used += 4;
+        }
+        if (cases[i].quoted)
+          cpl[used++] = '"';
+        memset(cpl + used, 'a', padding);
+        used += padding;
+        size_t spelling_length = strlen(cases[i].spelling);
+        memcpy(cpl + used, cases[i].spelling, spelling_length);
+        used += spelling_length;
+        if (cases[i].quoted)
+          cpl[used++] = '"';
+        if (!suffix) {
+          memcpy(cpl + used, "{#n}", 4);
+          used += 4;
+          memset(cpl + used, 'a', ST_MAX_TOKEN_LEN - 1);
+          used += ST_MAX_TOKEN_LEN - 1;
+        }
+        cpl[used] = '\0';
+        st_netpattern_t pattern = {0};
+        st_error_t error = st_netpattern_from_cpl_owned(cpl, &pattern);
+        st_token_array_t decoded = {0};
+        bool correct;
+        if (extra == 0) {
+          correct = error == ST_OK &&
+                    st_netpattern_decode_view(
+                        (st_netpattern_view_t){pattern.data, pattern.length},
+                        &decoded) == ST_OK &&
+                    decoded.count == 2 && decoded.tokens[1].compound &&
+                    decoded.tokens[1].prefix_length == ST_MAX_TOKEN_LEN - 1 &&
+                    decoded.tokens[1].suffix_length == ST_MAX_TOKEN_LEN - 1 &&
+                    decoded.tokens[1].capture_type == ST_TYPE_NUMBER;
+          if (correct) {
+            const char *fragment =
+                suffix ? decoded.tokens[1].suffix : decoded.tokens[1].prefix;
+            correct = memcmp(fragment + padding, cases[i].decoded,
+                             cases[i].width) == 0;
+          }
+        } else {
+          correct = error == ST_ERR_INVALID && pattern.data == NULL &&
+                    pattern.length == 0;
+        }
+        st_token_array_free(&decoded);
+        st_netpattern_free(&pattern);
+        ASSERT(correct);
+      }
+    }
+  }
+  /* Capture text is bounded too, even before its vocabulary is validated. */
+  memcpy(cpl, "cmd a{", 6);
+  memset(cpl + 6, 'x', ST_MAX_TOKEN_LEN);
+  strcpy(cpl + 6 + ST_MAX_TOKEN_LEN, "}z");
+  st_netpattern_t pattern = {0};
+  ASSERT(st_netpattern_from_cpl_owned(cpl, &pattern) == ST_ERR_INVALID);
+  ASSERT(pattern.data == NULL && pattern.length == 0);
+  return 1;
+}
+
+static int test_netpattern_decode_allocation_contract(void) {
+  static const size_t counts[] = {4, 8, 16, 32, 64, ST_MAX_CMD_TOKENS};
+  static const char binary[] = {'a', '\0', 'b', '}'};
+  char prefix[ST_MAX_TOKEN_LEN - 1], suffix[ST_MAX_TOKEN_LEN - 1];
+  memset(prefix, 'p', sizeof(prefix));
+  memset(suffix, 's', sizeof(suffix));
+  prefix[0] = '\0';
+  suffix[sizeof(suffix) - 1] = '\0';
+  st_token_t tokens[ST_MAX_CMD_TOKENS];
+  for (size_t mixed = 0; mixed < 2; mixed++) {
+    for (size_t i = 0; i < sizeof(counts) / sizeof(counts[0]); i++) {
+      for (size_t j = 0; j < counts[i]; j++)
+        tokens[j] = (st_token_t){.text = mixed ? binary : "a",
+                                 .text_length = mixed ? sizeof(binary) : 1,
+                                 .type = ST_TYPE_LITERAL};
+      if (mixed) {
+        tokens[0] = (st_token_t){.text = "tool", .type = ST_TYPE_LITERAL};
+        tokens[1] = (st_token_t){.text = "#n", .type = ST_TYPE_NUMBER};
+        tokens[counts[i] - 1] = (st_token_t){.text = "compound",
+                                             .type = ST_TYPE_LITERAL,
+                                             .compound = true,
+                                             .prefix = prefix,
+                                             .prefix_length = sizeof(prefix),
+                                             .capture = "#n",
+                                             .capture_length = 2,
+                                             .capture_type = ST_TYPE_NUMBER,
+                                             .suffix = suffix,
+                                             .suffix_length = sizeof(suffix)};
+      }
+      st_netpattern_t pattern = {0};
+      ASSERT(st_netpattern_encode_owned(tokens, counts[i], &pattern) == ST_OK);
+      st_netpattern_view_t view = {pattern.data, pattern.length};
+      st_token_array_t decoded = {0};
+      st_test_alloc_reset();
+      st_error_t error = st_netpattern_decode_view(view, &decoded);
+      size_t allocations = st_test_alloc_count();
+      size_t requested = st_test_alloc_bytes();
+      st_test_alloc_reset();
+      bool correct = error == ST_OK && decoded.count == counts[i];
+      if (correct) {
+        for (size_t j = 0; j < counts[i]; j++) {
+          const st_token_t *token = &decoded.tokens[j];
+          if (tokens[j].compound) {
+            correct = correct && token->compound &&
+                      token->prefix_length == sizeof(prefix) &&
+                      token->suffix_length == sizeof(suffix) &&
+                      token->capture_type == ST_TYPE_NUMBER &&
+                      memcmp(token->prefix, prefix, sizeof(prefix)) == 0 &&
+                      memcmp(token->suffix, suffix, sizeof(suffix)) == 0;
+          } else {
+            size_t length = tokens[j].text_length ? tokens[j].text_length
+                                                  : strlen(tokens[j].text);
+            correct = correct && token->type == tokens[j].type &&
+                      token->text_length == length &&
+                      memcmp(token->text, tokens[j].text, length) == 0;
+          }
+        }
+      }
+      st_token_array_free(&decoded);
+      /* Validation must reuse decoding's allocations, including for large
+       * binary compounds; requesting details introduces no extra copies. */
+      for (unsigned details = 0; details < 2; details++) {
+        st_test_alloc_reset();
+        error = st_netpattern_validate_view(view, details ? &decoded : NULL);
+        size_t validation_allocations = st_test_alloc_count();
+        size_t validation_bytes = st_test_alloc_bytes();
+        st_test_alloc_reset();
+        correct = correct && error == ST_OK &&
+                  validation_allocations == allocations &&
+                  validation_bytes == requested &&
+                  decoded.count == (details ? counts[i] : 0);
+        st_token_array_free(&decoded);
+      }
+      bool linear = requested <= 4 * sizeof(st_token_t) * counts[i] +
+                                     8 * pattern.length + 2048 &&
+                    allocations <= 2 * counts[i] + 16;
+      bool atomic = true;
+      for (size_t fail_at = 1; fail_at <= allocations; fail_at++) {
+        st_test_alloc_fail_at(fail_at);
+        error = st_netpattern_decode_view(view, &decoded);
+        st_test_alloc_reset();
+        atomic = atomic && error == ST_ERR_MEMORY && decoded.tokens == NULL &&
+                 decoded.count == 0;
+        st_token_array_free(&decoded);
+        for (unsigned details = 0; details < 2; details++) {
+          st_test_alloc_fail_at(fail_at);
+          error = st_netpattern_validate_view(view, details ? &decoded : NULL);
+          st_test_alloc_reset();
+          atomic = atomic && error == ST_ERR_MEMORY && decoded.tokens == NULL &&
+                   decoded.count == 0;
+          st_token_array_free(&decoded);
+        }
+        if (!mixed) {
+          st_test_alloc_fail_at(fail_at);
+          error = st_netpattern_validate(pattern.data, &decoded);
+          st_test_alloc_reset();
+          atomic = atomic && error == ST_ERR_MEMORY && decoded.tokens == NULL &&
+                   decoded.count == 0;
+          st_token_array_free(&decoded);
+        }
+      }
+      st_netpattern_free(&pattern);
+      ASSERT(correct);
+      ASSERT(atomic);
+      ASSERT(linear);
+    }
+  }
+  return 1;
+}
+
+static int test_cpl_allocation_failures(void) {
+  static const char prefix[] =
+      "\"cmd\" \"\" \"a\" \"b\" \"c\" \"d\" \"\\x00\" "
+      "\"\\u0061\\u20ac\\ud83d\\ude00\" \"pre\"{#n}\"post\"";
+  static const size_t counts[] = {9, 10, ST_MAX_CMD_TOKENS};
+  char cpl[ST_MAX_CPL_LEN];
+  for (size_t i = 0; i < sizeof(counts) / sizeof(counts[0]); i++) {
+    memcpy(cpl, prefix, sizeof(prefix));
+    size_t used = sizeof(prefix) - 1;
+    if (counts[i] > 9) {
+      memcpy(cpl + used, " \"", 2);
+      used += 2;
+      memset(cpl + used, 'a', ST_MAX_TOKEN_LEN - 1);
+      used += ST_MAX_TOKEN_LEN - 1;
+      memcpy(cpl + used, "\"{#n}\"", 6);
+      used += 6;
+      memset(cpl + used, 'z', ST_MAX_TOKEN_LEN - 2);
+      used += ST_MAX_TOKEN_LEN - 2;
+      memcpy(cpl + used, "\\x00\"", 5);
+      used += 5;
+    }
+    for (size_t j = 10; j < counts[i]; j++) {
+      memcpy(cpl + used, " \"a\"", 4);
+      used += 4;
+    }
+    cpl[used] = '\0';
+    st_netpattern_t pattern = {0};
+    st_test_alloc_reset();
+    st_error_t error = st_netpattern_from_cpl_owned(cpl, &pattern);
+    size_t allocations = st_test_alloc_count();
+    st_test_alloc_reset();
+    st_netpattern_free(&pattern);
+    ASSERT(error == ST_OK && allocations > 0);
+    for (size_t fail_at = 1; fail_at <= allocations; fail_at++) {
+      st_test_alloc_fail_at(fail_at);
+      error = st_netpattern_from_cpl_owned(cpl, &pattern);
+      st_test_alloc_reset();
+      bool empty = pattern.data == NULL && pattern.length == 0;
+      st_netpattern_free(&pattern);
+      ASSERT(error == ST_ERR_MEMORY && empty);
+    }
+  }
   return 1;
 }
 
@@ -1524,7 +1921,6 @@ static int test_netpattern_cpl_contract(void) {
   free(widened_cpl);
   free(roundtrip);
   static const char *const invalid[] = {
-      NULL,
       "",
       "   ",
       "echo \"unterminated",
@@ -1562,7 +1958,6 @@ static int test_netpattern_cpl_contract(void) {
   ASSERT(st_netpattern_decode("09:1:T,2:#n,,", &decoded) == ST_ERR_FORMAT);
   ASSERT(st_netpattern_decode("14:1:T,7:#uuid.4,,", &decoded) == ST_ERR_FORMAT);
 
-  ASSERT(st_netpattern_decode(NULL, &decoded) == ST_ERR_INVALID);
   ASSERT(st_netpattern_decode("9:1:X,2:#n,,", &decoded) == ST_ERR_FORMAT);
   ASSERT(st_netpattern_decode("9:1:T,2:no,,", &decoded) == ST_ERR_FORMAT);
   ASSERT(st_netpattern_decode("8:1:L,1:x,", &decoded) == ST_ERR_FORMAT);
@@ -1622,7 +2017,7 @@ static int test_netpattern_cpl_contract(void) {
     st_token_array_free(&decoded);
     free(nested);
   }
-  ASSERT(st_netpattern_to_cpl(NULL, &roundtrip) == ST_ERR_INVALID);
+
   ASSERT(st_netpattern_to_cpl("x", &roundtrip) == ST_ERR_FORMAT);
 
   /* Canonical views carry arbitrary literal bytes. The compatibility char*
@@ -1822,6 +2217,62 @@ static int test_canonical_policy_boundary(void) {
   return 1;
 }
 
+static int test_netpattern_validation_failures(void) {
+  static const struct {
+    const char *data;
+    size_t length;
+    st_error_t error;
+  } cases[] = {
+      {NULL, 0, ST_ERR_FORMAT},
+      {"", 0, ST_ERR_FORMAT},
+      {"git status", 10, ST_ERR_FORMAT},
+      {"07:1:L,0:,,", 11, ST_ERR_FORMAT},
+      {"7:1:L,0:,", 9, ST_ERR_FORMAT},
+      {"7:1:X,0:,,", 10, ST_ERR_FORMAT},
+      {"9:1:T,2:#x,,", sizeof("9:1:T,2:#x,,") - 1, ST_ERR_FORMAT},
+      {"13:1:T,6:#n.bad,,", sizeof("13:1:T,6:#n.bad,,") - 1, ST_ERR_FORMAT},
+  };
+  st_token_array_t tokens = {0};
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    st_netpattern_view_t view = {cases[i].data, cases[i].length};
+    ASSERT(st_netpattern_validate_view(view, NULL) == cases[i].error);
+    ASSERT(st_netpattern_validate_view(view, &tokens) == cases[i].error);
+    ASSERT(tokens.tokens == NULL && tokens.count == 0);
+  }
+  char too_many[16 * (ST_MAX_CMD_TOKENS + 1)] = {0};
+  for (size_t i = 0; i <= ST_MAX_CMD_TOKENS; i++)
+    strcat(too_many, "7:1:L,0:,,");
+  ASSERT(st_netpattern_validate(too_many, NULL) == ST_ERR_LIMIT);
+  ASSERT(st_netpattern_validate(too_many, &tokens) == ST_ERR_LIMIT);
+  ASSERT(tokens.tokens == NULL && tokens.count == 0);
+
+  /* Framing may decode completely before policy-head grammar fails. Every
+   * decoding allocation failure still releases its partial owned output. */
+  static const char *const unsupported[] = {"* arg", "pre{#n}post arg"};
+  for (size_t i = 0; i < sizeof(unsupported) / sizeof(unsupported[0]); i++) {
+    st_netpattern_t pattern = {0};
+    ASSERT(st_netpattern_from_cpl_owned(unsupported[i], &pattern) == ST_OK);
+    st_netpattern_view_t view = {pattern.data, pattern.length};
+    st_test_alloc_reset();
+    st_error_t error = st_netpattern_validate_view(view, &tokens);
+    size_t allocations = st_test_alloc_count();
+    st_test_alloc_reset();
+    bool correct = error == ST_ERR_INVALID && allocations > 0 &&
+                   tokens.tokens == NULL && tokens.count == 0;
+    for (size_t fail_at = 1; fail_at <= allocations; fail_at++) {
+      st_test_alloc_fail_at(fail_at);
+      error = st_netpattern_validate_view(view, &tokens);
+      st_test_alloc_reset();
+      correct = correct && error == ST_ERR_MEMORY && tokens.tokens == NULL &&
+                tokens.count == 0;
+      st_token_array_free(&tokens);
+    }
+    st_netpattern_free(&pattern);
+    ASSERT(correct);
+  }
+  return 1;
+}
+
 static int test_owned_netpattern_output_contract(void) {
   st_token_t tokens[] = {
       {.text = "printf", .type = ST_TYPE_LITERAL},
@@ -1829,55 +2280,29 @@ static int test_owned_netpattern_output_contract(void) {
   };
   st_netpattern_t pattern = {0};
 
-  ASSERT(st_netpattern_encode_owned(tokens, 2, &pattern) == ST_OK);
-  ASSERT(pattern.data != NULL && pattern.length != 0);
-  char *pattern_data = pattern.data;
-  size_t pattern_length = pattern.length;
-  ASSERT(st_netpattern_encode_owned(tokens, 2, &pattern) == ST_ERR_INVALID);
-  ASSERT(pattern.data == pattern_data && pattern.length == pattern_length);
-  st_netpattern_free(&pattern);
-  ASSERT(pattern.data == NULL && pattern.length == 0);
-  ASSERT(st_netpattern_encode_owned(tokens, 2, &pattern) == ST_OK);
-  ASSERT(pattern.data != NULL && pattern.length != 0);
-  st_netpattern_free(&pattern);
+  for (size_t i = 0; i < 2; i++) {
+    ASSERT(st_netpattern_encode_owned(tokens, 2, &pattern) == ST_OK);
+    ASSERT(pattern.data != NULL && pattern.length != 0);
+    st_netpattern_free(&pattern);
+    ASSERT(pattern.data == NULL && pattern.length == 0);
+    ASSERT(st_netpattern_from_cpl_owned("printf value", &pattern) == ST_OK);
+    ASSERT(pattern.data != NULL && pattern.length != 0);
+    st_netpattern_free(&pattern);
+    ASSERT(pattern.data == NULL && pattern.length == 0);
+  }
   ASSERT(st_netpattern_encode_owned(NULL, 1, &pattern) == ST_ERR_INVALID);
-  ASSERT(pattern.data == NULL && pattern.length == 0);
-
-  ASSERT(st_netpattern_from_cpl_owned("printf value", &pattern) == ST_OK);
-  ASSERT(pattern.data != NULL && pattern.length != 0);
-  pattern_data = pattern.data;
-  pattern_length = pattern.length;
-  ASSERT(st_netpattern_from_cpl_owned("printf value", &pattern) ==
-         ST_ERR_INVALID);
-  ASSERT(pattern.data == pattern_data && pattern.length == pattern_length);
-  st_netpattern_free(&pattern);
-  ASSERT(st_netpattern_from_cpl_owned("printf value", &pattern) == ST_OK);
-  ASSERT(pattern.data != NULL && pattern.length != 0);
-  st_netpattern_free(&pattern);
-  ASSERT(st_netpattern_from_cpl_owned(NULL, &pattern) == ST_ERR_INVALID);
   ASSERT(pattern.data == NULL && pattern.length == 0);
 
   st_netpattern_t source = {0};
   ASSERT(st_netpattern_encode_owned(tokens, 2, &source) == ST_OK);
-  ASSERT(
-      st_netpattern_apply_type_at_owned(
-          (st_netpattern_view_t){.data = source.data, .length = source.length},
-          1, ST_TYPE_WORD, &pattern) == ST_OK);
-  ASSERT(pattern.data != NULL && pattern.length != 0);
-  pattern_data = pattern.data;
-  pattern_length = pattern.length;
-  ASSERT(
-      st_netpattern_apply_type_at_owned(
-          (st_netpattern_view_t){.data = source.data, .length = source.length},
-          1, ST_TYPE_WORD, &pattern) == ST_ERR_INVALID);
-  ASSERT(pattern.data == pattern_data && pattern.length == pattern_length);
-  st_netpattern_free(&pattern);
-  ASSERT(
-      st_netpattern_apply_type_at_owned(
-          (st_netpattern_view_t){.data = source.data, .length = source.length},
-          1, ST_TYPE_WORD, &pattern) == ST_OK);
-  ASSERT(pattern.data != NULL && pattern.length != 0);
-  st_netpattern_free(&pattern);
+  for (size_t i = 0; i < 2; i++) {
+    ASSERT(st_netpattern_apply_type_at_owned(
+               (st_netpattern_view_t){.data = source.data,
+                                      .length = source.length},
+               1, ST_TYPE_WORD, &pattern) == ST_OK);
+    ASSERT(pattern.data != NULL && pattern.length != 0);
+    st_netpattern_free(&pattern);
+  }
   ASSERT(st_netpattern_apply_type_at_owned((st_netpattern_view_t){0}, 1,
                                            ST_TYPE_WORD,
                                            &pattern) == ST_ERR_INVALID);
@@ -1951,7 +2376,7 @@ static int test_owned_netpattern_output_contract(void) {
 static int test_token_variant_api(void) {
   st_token_t tokens[] = {
       {.text = "42", .type = ST_TYPE_LITERAL},
-      {.text = "--force", .type = ST_TYPE_OPT},
+      {.text = "#opt", .type = ST_TYPE_OPT},
   };
   st_token_array_t pattern = {.tokens = tokens, .count = 2};
   st_token_variant_t variants[ST_MAX_TOKEN_VARIANTS];
@@ -1975,7 +2400,7 @@ static int test_token_variant_api(void) {
   ASSERT(count >= 2 && variants[1].type == ST_TYPE_NUMBER);
   ASSERT(st_token_variants_at(&pattern, 2, variants, ST_MAX_TOKEN_VARIANTS) ==
          0);
-  ASSERT(st_token_variants_at(NULL, 0, variants, ST_MAX_TOKEN_VARIANTS) == 0);
+
   return 1;
 }
 
@@ -2005,9 +2430,15 @@ int main(void) {
   TEST(test_netargv_visit_is_borrowed_and_allocation_free);
   TEST(test_netargv_visit_accepts_binary_payloads);
   TEST(test_netpattern_cpl_contract);
+  TEST(test_cpl_parse_work_is_linear);
+  TEST(test_cpl_decoded_token_limits);
+  TEST(test_cpl_allocation_failures);
+  TEST(test_netpattern_decode_allocation_contract);
+  TEST(test_netpattern_validation_failures);
   TEST(test_owned_netpattern_output_contract);
   TEST(test_canonical_policy_boundary);
   TEST(test_public_helper_matrix);
+  TEST(test_borrowed_policy_classifier);
   TEST(test_canonical_invalid_boundaries);
   TEST(test_netpattern_view_boundary_contract);
   TEST(test_token_variant_api);

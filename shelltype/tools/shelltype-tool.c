@@ -72,7 +72,7 @@ static int print_match(const char *prefix, st_netpattern_view_t netpattern) {
 }
 
 /* Validation details can contain arbitrary literal bytes. Keep diagnostics
- * terminal-safe and lossless instead of treating token_texts as C strings. */
+ * terminal-safe and lossless instead of treating token text as C strings. */
 static int print_escaped_bytes(const char *text, size_t length) {
   static const char hex[] = "0123456789abcdef";
   if (fputc('"', stdout) == EOF)
@@ -252,31 +252,33 @@ int main(int argc, char *argv[]) {
 
   /* Validate pattern mode */
   if (validate_pat) {
-    st_pattern_info_t info;
+    st_token_array_t tokens = {0};
     st_netpattern_t netpattern = {0};
     st_error_t err = st_netpattern_from_cpl_owned(validate_pat, &netpattern);
     if (err == ST_OK)
       err = st_netpattern_validate_view(
           (st_netpattern_view_t){.data = netpattern.data,
                                  .length = netpattern.length},
-          &info);
+          &tokens);
     st_netpattern_free(&netpattern);
     if (err != ST_OK) {
       fprintf(stderr, "INVALID: %s\n", validate_pat);
       return 1;
     }
-    printf("VALID: %s (%zu tokens)\n", validate_pat, info.token_count);
-    for (size_t i = 0; i < info.token_count; i++) {
-      const char *sym = st_type_symbol[info.token_types[i]];
+    printf("VALID: %s (%zu tokens)\n", validate_pat, tokens.count);
+    for (size_t i = 0; i < tokens.count; i++) {
+      const st_token_t *token = &tokens.tokens[i];
+      const char *sym = st_type_symbol[token->type];
       if (printf("  [%zu] ", i) < 0 ||
-          print_escaped_bytes(info.token_texts[i], info.token_lengths[i]) !=
-              0 ||
-          printf(" type=%-4d (%s)\n", info.token_types[i],
-                 sym[0] ? sym : "LITERAL") < 0) {
+          print_escaped_bytes(token->text, token->text_length) != 0 ||
+          printf(" type=%-4d (%s)\n", token->type, sym[0] ? sym : "LITERAL") <
+              0) {
         fprintf(stderr, "Error: failed to write validation output\n");
+        st_token_array_free(&tokens);
         return 1;
       }
     }
+    st_token_array_free(&tokens);
     return 0;
   }
 

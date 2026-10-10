@@ -1,6 +1,8 @@
 #ifndef SHELL_PROCESSOR_H
 #define SHELL_PROCESSOR_H
 
+#include "shell_contract.h"
+
 #include "shell_netstring.h"
 #include "shell_tokenizer_full.h"
 #include <stdbool.h>
@@ -19,7 +21,10 @@ extern "C" {
  * Parsed shell command metadata, including original text and tokenized details.
  */
 typedef struct {
-  const char *original_command; // Owned full command-stage text
+  /* Owned text for this flattened simple-command stage. Structural pipeline
+   * prefixes and enclosing group delimiters may be absent; this is diagnostic
+   * source, not a command string that callers can safely reparse. */
+  const char *original_command;
   // Token text points into original_command, and positions are relative to it.
   shell_token_t *shell_tokens;        // Shell operators and redirections
   size_t shell_token_count;           // Number of shell tokens
@@ -30,8 +35,14 @@ typedef struct {
   shell_pipe_mode_t pipe_output_mode; // stdout or stdout+stderr pipe output
   uint32_t pipeline_negation_count;   // Every leading `!` pipeline modifier
   bool pipeline_negated;              // Effective odd-count status inversion
-  bool has_redirections;              // Has any redirections
-  bool has_error_redirection;         // Has stderr redirection (2>, &>, or &>>)
+  /* Bash's reserved `time` prefix is structural and never enters
+   * command_tokens. The selected reporting mode is copied to every simple
+   * member of the local syntactic pipeline. A modifier on a compound group
+   * remains group metadata rather than being attributed to every enclosed
+   * command. */
+  shell_pipeline_time_mode_t pipeline_time_mode;
+  bool has_redirections;      // Has any redirections
+  bool has_error_redirection; // Has stderr redirection (2>, &>, or &>>)
 } shell_command_info_t;
 
 /* `shell_group_io_op_t` has no concrete descriptor when it describes a list
@@ -118,7 +129,10 @@ typedef struct {
 /** Owned canonical command result with the structural group descriptors from
  * the same source command. `commands` has one entry per retained executable
  * simple-command range; each group's first_command and command_count index
- * this array, not the source fast-parser ranges. An argv-less redirect-only
+ * this array, not the source fast-parser ranges. For an empty group,
+ * first_command is the number of retained commands preceding its source
+ * interval (possibly command_count at the end of the collection).
+ * An argv-less redirect-only
  * operation, such as `>output`, has no `shell_command_info_t` entry. Inspect
  * the dependency graph, or paired anomaly netsequences (an empty raw record
  * paired with a typed record containing empty argv[0]), when a caller needs
@@ -151,7 +165,13 @@ typedef enum {
 /* Limits apply to each returned string, aggregate output, and compound-group
  * operation metadata of one call. A NULL limits pointer means unbounded
  * output. Sizes exclude the terminating NUL. `max_group_io_ops == 0` leaves
- * group-operation metadata unbounded, preserving existing initializers. */
+ * group-operation metadata unbounded, preserving existing initializers.
+ * Byte limits measure returned text or canonical encoded output, not borrowed
+ * source spans or intermediate tokens. Each anomaly netsequence independently
+ * observes the byte limits; its group-operation budget covers all collected
+ * execution bodies together, including nested substitutions and expanded
+ * heredoc bodies. APIs returning only the immediate list's command/group
+ * records charge only that list's group-operation metadata. */
 typedef struct {
   size_t max_string_bytes;
   size_t max_total_bytes;
@@ -184,7 +204,7 @@ typedef struct {
  * (`mapfile`/`readarray`, `wait -p`, `pushd`/`popd`, and dynamic or mutating
  * arithmetic expansions) return SHELL_PROCESS_EPARSE. Other unmodeled Bash
  * forms (`[[ … ]]`,
- * `(( … ))`, leading `time` pipelines, locale quotes `$"…"`, and case
+ * `(( … ))`, locale quotes `$"…"`, and case
  * fall-through `;&` / `;;&`) also return SHELL_PROCESS_EPARSE. Supported
  * compound groups contain simple-command lists, pipelines, and nested
  * brace/subshell groups; callers must not infer support for control compounds
@@ -194,7 +214,7 @@ shell_process_status_t
 shell_process_command(const char *command_line, size_t command_length,
                       const shell_process_limits_t *limits,
                       shell_command_info_t **command_infos,
-                      size_t *command_count);
+                      size_t *command_count) SHELL_NONNULL(1, 4, 5);
 
 /** Process supported canonical command records and return the complete
  * brace/subshell group descriptors from the same source. The fixed semantic
@@ -207,7 +227,7 @@ shell_process_command(const char *command_line, size_t command_length,
 shell_process_status_t
 shell_process_commands(const char *command_line, size_t command_length,
                        const shell_process_limits_t *limits,
-                       shell_processed_commands_t *result);
+                       shell_processed_commands_t *result) SHELL_NONNULL(1, 4);
 
 /** Release a result returned by shell_process_commands(). Safe with NULL. */
 void shell_processed_commands_free(shell_processed_commands_t *result);
@@ -231,11 +251,14 @@ typedef bool (*shell_decoded_word_visitor_t)(unsigned char byte,
  * tokenization: callers must isolate the word before calling it. `visitor` may
  * be NULL to measure only. `decoded_length` is required and receives the
  * number of bytes delivered; when the visitor stops traversal it is the
- * delivered prefix length. */
+ * delivered prefix length. Non-ASCII ANSI-C Unicode escapes (`\u` / `\U`)
+ * return SHELL_PROCESS_EPARSE: their bytes depend on the execution locale,
+ * which is not part of the supported shell contract. ASCII Unicode and byte
+ * escapes remain supported; literal non-ASCII bytes are not restricted. */
 shell_process_status_t
 shell_visit_decoded_word(const char *text, size_t length,
                          shell_decoded_word_visitor_t visitor, void *context,
-                         size_t *decoded_length);
+                         size_t *decoded_length) SHELL_NONNULL(1, 5);
 
 /** Visit a complete word only when its value is statically determined.
  * Quote removal, escapes, and ANSI-C quotes are decoded; parameter, command,
@@ -244,22 +267,24 @@ shell_visit_decoded_word(const char *text, size_t length,
  * visitor and decoded_length have the same semantics as above. */
 bool shell_visit_static_word(const char *text, size_t length,
                              shell_decoded_word_visitor_t visitor,
-                             void *context, size_t *decoded_length);
+                             void *context, size_t *decoded_length)
+    SHELL_NONNULL(1, 5);
 
 /** Measure the decoded payload of one already-isolated shell word, assembling
  * quote fragments and escapes. This is not shell tokenization: callers must
  * isolate the word before calling it. */
 shell_process_status_t shell_measure_decoded_word(const char *text,
                                                   size_t length,
-                                                  size_t *decoded_length);
+                                                  size_t *decoded_length)
+    SHELL_NONNULL(1, 3);
 
 /** Write the decoded payload of one already-isolated shell word into caller
  * storage. The destination is a byte buffer, not a C string; it must provide
  * at least the length returned by shell_measure_decoded_word(). */
-shell_process_status_t shell_write_decoded_word(const char *text, size_t length,
-                                                char *destination,
-                                                size_t destination_size,
-                                                size_t *written);
+shell_process_status_t
+shell_write_decoded_word(const char *text, size_t length, char *destination,
+                         size_t destination_size, size_t *written)
+    SHELL_NONNULL(1, 3, 5);
 
 /** Measure one isolated shell word for canonical argv. Ordinary shell quotes
  * and escapes are removed, while executable substitution and arithmetic
@@ -267,13 +292,15 @@ shell_process_status_t shell_write_decoded_word(const char *text, size_t length,
  * syntactically unambiguous. */
 shell_process_status_t shell_measure_processed_word(const char *text,
                                                     size_t length,
-                                                    size_t *processed_length);
+                                                    size_t *processed_length)
+    SHELL_NONNULL(1, 3);
 
 /** Write one word measured by shell_measure_processed_word(). The destination
  * is a byte buffer, not a C string. */
 shell_process_status_t
 shell_write_processed_word(const char *text, size_t length, char *destination,
-                           size_t destination_size, size_t *written);
+                           size_t destination_size, size_t *written)
+    SHELL_NONNULL(1, 3, 5);
 
 /** Decode one already-isolated shell word into an owned, NUL-terminated byte
  * buffer, assembling quote fragments and escapes. The decoded payload may
@@ -281,23 +308,24 @@ shell_write_processed_word(const char *text, size_t length, char *destination,
  * than C-string operations to inspect it. Prefer the measure/write pair when
  * the decoded bytes will be written directly into another representation. */
 shell_process_status_t shell_decode_word(const char *text, size_t length,
-                                         char **decoded,
-                                         size_t *decoded_length);
+                                         char **decoded, size_t *decoded_length)
+    SHELL_NONNULL(1, 3, 4);
 
 /** Return the bytes required to encode one command's already-processed
  * arguments as concatenated canonical netstrings, excluding the terminating
  * NUL. */
 shell_process_status_t shell_measure_netargv(const shell_command_info_t *info,
-                                             size_t *netargv_length);
+                                             size_t *netargv_length)
+    SHELL_NONNULL(1, 2);
 
 /** Write one command's canonical netargv into caller storage. `destination`
  * must provide the measured encoded length plus one byte for the terminating
  * NUL. `written` excludes that NUL. On failure no partial netargv is exposed.
  */
-shell_process_status_t shell_write_netargv(const shell_command_info_t *info,
-                                           char *destination,
-                                           size_t destination_size,
-                                           size_t *written);
+shell_process_status_t
+shell_write_netargv(const shell_command_info_t *info, char *destination,
+                    size_t destination_size, size_t *written)
+    SHELL_NONNULL(1, 2, 4);
 
 /** Encode one command's already-processed arguments as concatenated canonical
  * netstrings. This legacy C-string convenience wrapper owns *netargv. It is
@@ -305,7 +333,8 @@ shell_process_status_t shell_write_netargv(const shell_command_info_t *info,
  * shell_render_netargv_buffer() for canonical programmatic transport. */
 shell_process_status_t
 shell_render_netargv(const shell_command_info_t *info,
-                     const shell_process_limits_t *limits, char **netargv);
+                     const shell_process_limits_t *limits, char **netargv)
+    SHELL_NONNULL(1, 3);
 
 /** Encode one command's already-processed arguments as concatenated canonical
  * netstrings in owned byte storage. Payloads, including those decoded from
@@ -313,20 +342,21 @@ shell_render_netargv(const shell_command_info_t *info,
  * processing rejects NUL-producing ANSI-C source by default. `buffer` must
  * be empty (initialized to {0} or released with shell_netstring_buffer_free())
  * and is empty on failure.
- * A populated or inconsistent buffer is rejected without modification. Release
+ * Empty initialized output storage is a caller precondition. Release
  * a successful result with shell_netstring_buffer_free() before reusing it as
  * an output argument. */
-shell_process_status_t
-shell_render_netargv_buffer(const shell_command_info_t *info,
-                            const shell_process_limits_t *limits,
-                            shell_netstring_buffer_t *buffer);
+shell_process_status_t shell_render_netargv_buffer(
+    const shell_command_info_t *info, const shell_process_limits_t *limits,
+    shell_netstring_buffer_t *buffer) SHELL_NONNULL(1, 3);
 
 /**
- * Check if a command uses shell operators, redirections, or execution-bearing
- * substitutions that require shell-aware handling.
+ * Check if a command uses shell operators, pipeline timing/negation,
+ * redirections, or execution-bearing substitutions that require shell-aware
+ * handling. Structural modifiers count even when their lexical prefix tokens
+ * have been removed from the processed command.
  */
-bool shell_command_info_has_dangerous_features(
-    const shell_command_info_t *info);
+bool shell_command_info_has_dangerous_features(const shell_command_info_t *info)
+    SHELL_NONNULL(1);
 
 #ifdef __cplusplus
 }

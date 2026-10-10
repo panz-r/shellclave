@@ -22,6 +22,7 @@ typedef enum {
   AST_GLOB,
   AST_QUOTE,
   AST_BACKTICK,
+  AST_TIME,
 } ast_node_type_t;
 
 /* Test-only brace-group spellings.  The valid form is rendered as
@@ -89,6 +90,10 @@ ast_node_t *shell_ast_add_command_with_args(shell_ast_t *ast,
 // Pipeline: cmd1 | cmd2
 ast_node_t *shell_ast_add_pipeline(shell_ast_t *ast, ast_node_t *cmd1,
                                    ast_node_t *cmd2);
+
+/* Bash reserved `time` prefix around one command or pipeline. */
+ast_node_t *shell_ast_add_time(shell_ast_t *ast, ast_node_t *pipeline,
+                               const char *prefix);
 
 // Sequence: cmd1 ; cmd2 or cmd1 && cmd2 or cmd1 || cmd2
 ast_node_t *shell_ast_add_sequence(shell_ast_t *ast, ast_node_t *cmd1,

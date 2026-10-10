@@ -1,6 +1,8 @@
 #ifndef SHELL_INTEROP_H
 #define SHELL_INTEROP_H
 
+#include "shell_contract.h"
+
 #include "shell_tokenizer.h"
 #include <stdbool.h>
 #include <stddef.h>
@@ -70,32 +72,35 @@ void shell_interop_free(shell_interop_handle_t *handle);
  */
 shell_error_t shell_interop_parse(shell_interop_handle_t *handle,
                                   const char *cmd, size_t cmd_len,
-                                  size_t *subcommand_count);
+                                  size_t *subcommand_count)
+    SHELL_NONNULL(1, 2, 4);
 
 /* Return the number of subcommands from the most recent successful parse. */
-size_t shell_interop_subcommand_count(const shell_interop_handle_t *handle);
+size_t shell_interop_subcommand_count(const shell_interop_handle_t *handle)
+    SHELL_NONNULL(1);
 
 /* Copy range metadata for one subcommand. The range remains valid until the
  * next parse on handle or shell_interop_free(handle). */
 bool shell_interop_subcommand_range(const shell_interop_handle_t *handle,
-                                    size_t index, shell_range_t *range);
+                                    size_t index, shell_range_t *range)
+    SHELL_NONNULL(1, 3);
 
 /* Return a borrowed, non-NUL-terminated subcommand view. It remains valid
  * until the next parse on handle or shell_interop_free(handle). */
 bool shell_interop_subcommand_view(const shell_interop_handle_t *handle,
                                    size_t index, const char **data,
-                                   size_t *length);
+                                   size_t *length) SHELL_NONNULL(1, 3, 4);
 
 /* Return a heap-allocated NUL-terminated copy of one subcommand. The caller
  * releases a successful result with free(). */
 char *shell_interop_subcommand_dup(const shell_interop_handle_t *handle,
-                                   size_t index);
+                                   size_t index) SHELL_NONNULL(1);
 
 /* Format recognized feature flags into caller-owned storage. `written` gets
  * the byte count excluding NUL. The output is cleared on failure. */
 shell_error_t shell_interop_format_features(uint32_t features, char *output,
-                                            size_t output_size,
-                                            size_t *written);
+                                            size_t output_size, size_t *written)
+    SHELL_NONNULL(2, 4);
 
 /* Return the static display name for a command separator type. */
 const char *shell_interop_command_type_name(shell_cmd_type_t type);

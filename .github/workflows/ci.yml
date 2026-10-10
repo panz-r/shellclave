@@ -39,7 +39,11 @@ jobs:
       - name: Build
         run: cmake --build build --parallel 2
       - name: Test, install, and consume
-        run: ctest --test-dir build --output-on-failure
+        run: |
+          # Avoid glibc's leaked LOCPATH scratch buffer in newlocale(). This
+          # installs data on the ephemeral runner, not global locale settings.
+          sudo localedef -i en_DK -f UTF-8 en_DK.UTF-8
+          ctest --test-dir build --output-on-failure
 
   sanitizers:
     runs-on: ubuntu-latest
@@ -52,7 +56,9 @@ jobs:
           -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
           -DSHELLCLAVE_ENABLE_SANITIZERS=ON
       - run: cmake --build build --parallel 2
-      - run: ctest --test-dir build --output-on-failure
+      - run: |
+          sudo localedef -i en_DK -f UTF-8 en_DK.UTF-8
+          ctest --test-dir build --output-on-failure
 
   thread-sanitizer:
     runs-on: ubuntu-latest
@@ -125,8 +131,11 @@ jobs:
       - run: >-
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
           -DSHELLCLAVE_ENABLE_COVERAGE=ON
+          -DSHELLCLAVE_COVERAGE_VARIANT=tests
       - run: cmake --build build --parallel 2
-      - run: ctest --test-dir build --output-on-failure
+      - run: |
+          sudo localedef -i en_DK -f UTF-8 en_DK.UTF-8
+          ctest --test-dir build --output-on-failure
       - name: Produce Shellsplit coverage reports
         run: >-
           gcovr --root . --filter shellsplit/src --print-summary
@@ -171,3 +180,42 @@ jobs:
           path: |
             shellgate-coverage.txt
             shellgate-coverage.xml
+
+  production-coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - run: python3 -m pip install gcovr==8.6
+      # Report shipping CFGs separately. Fault-injection and production block
+      # identities are different and must never share a coverage denominator.
+      - run: >-
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+          -DSHELLCLAVE_ENABLE_COVERAGE=ON
+          -DSHELLCLAVE_COVERAGE_VARIANT=production
+      - run: >-
+          cmake --build build --parallel 2 --target
+          shellsplit_fast_parser_production_test
+          shellsplit_depgraph_production_test
+          shellsplit_production_semantics_test
+          shellsplit_corpus_production_test
+          shelltype_public_contract_production
+          shellgate_corpus_production_test
+      - run: ctest --test-dir build -R production --output-on-failure
+      - name: Report production implementation coverage
+        run: |
+          for component in shellsplit shelltype shellgate; do
+            gcovr --root . --filter "$component/src" --print-summary \
+              --merge-mode-functions=merge-use-line-min \
+              --gcov-ignore-parse-errors=negative_hits.warn_once_per_file \
+              --gcov-ignore-parse-errors=suspicious_hits.warn_once_per_file \
+              --txt="production-$component-coverage.txt" --xml-pretty \
+              --xml="production-$component-coverage.xml"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: production-coverage
+          path: |
+            production-*-coverage.txt
+            production-*-coverage.xml

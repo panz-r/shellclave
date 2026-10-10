@@ -15,6 +15,7 @@
 #include "shell_processor.h"
 #include "shell_sequence.h"
 #include "shell_tokenizer.h"
+#include "shell_tokenizer_full_internal.h"
 #include "shelltype.h"
 #include <ctype.h>
 #include <math.h>
@@ -26,6 +27,25 @@
 #define XXH_STATIC_LINKING_ONLY
 #include "sg_alloc.h"
 #include <xxhash.h>
+
+#ifdef SHELLGATE_TEST_ALLOCATOR
+#include "test_sg_failures.h"
+#define SG_PATH_WORK() sg_test_path_work_charge()
+#define SG_PATH_DECODED() sg_test_path_decoded_charge()
+#define SG_PATH_IDENTITY(bytes) sg_test_path_identity_charge(bytes)
+#else
+#define SG_PATH_WORK() ((void)0)
+#define SG_PATH_DECODED() ((void)0)
+#define SG_PATH_IDENTITY(bytes) ((void)0)
+#endif
+
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+#include "test_source_scans.h"
+#define SG_EDGE_WORK()                                                         \
+  shellsplit_test_metadata_charge(SHELLSPLIT_TEST_WORK_GATE_EDGES)
+#else
+#define SG_EDGE_WORK() ((void)0)
+#endif
 
 #define CDF_NUM_BUCKETS 128
 #define CDF_MAX_SCORE 50.0
@@ -59,53 +79,35 @@ static void bw_init(buf_writer_t *w, char *buf, size_t buf_size) {
   w->overflow = false;
 }
 
-/* sg_gate_evaluate() borrows command bytes while writing diagnostics and
- * result metadata. Reject aliased spans instead of copying potentially large
- * command strings or corrupting the caller's result storage. */
-static bool sg_memory_spans_overlap(const void *left, size_t left_size,
-                                    const void *right, size_t right_size) {
-  if (!left || !right || left_size == 0 || right_size == 0)
-    return false;
-  uintptr_t left_begin = (uintptr_t)left;
-  uintptr_t right_begin = (uintptr_t)right;
-  if (left_size > UINTPTR_MAX - left_begin ||
-      right_size > UINTPTR_MAX - right_begin)
-    return true;
-  uintptr_t left_end = left_begin + left_size;
-  uintptr_t right_end = right_begin + right_size;
-  return left_begin < right_end && right_begin < left_end;
-}
-
-/* One sg_gate_evaluate() call has one caller-owned lifetime: result strings
- * and depgraph route resolution both end when the call returns. Partition the
- * supplied evaluation buffer instead of allocating a second hidden workspace.
+/* Result strings and temporary depgraph route resolution share caller-owned
+ * storage, not a lifetime: resolver scratch expires when evaluation returns,
+ * while returned strings remain valid until the caller invalidates the buffer.
+ * Partition that buffer instead of allocating a second hidden workspace.
  * The diagnostic writer occupies the prefix; an aligned resolver workspace
  * occupies the tail and is never exposed through sg_result_t. */
-static bool sg_partition_eval_buffer(char *buffer, size_t buffer_size,
-                                     size_t *output_size, void **workspace,
-                                     size_t *workspace_size) {
-  if (!buffer || !output_size || !workspace || !workspace_size)
-    return false;
+static SHELL_NONNULL(2) bool sg_eval_workspace_size(size_t command_length,
+                                                    size_t *required);
+
+static SHELL_NONNULL(1, 4, 5, 6) bool sg_partition_eval_buffer(
+    char *buffer, size_t buffer_size, size_t command_length,
+    size_t *output_size, void **workspace, size_t *workspace_size) {
   size_t required = 0;
-  if (!shell_dep_workspace_size(NULL, &required) || required == 0)
+  if (!sg_eval_workspace_size(command_length, &required))
     return false;
   size_t alignment = shell_dep_workspace_alignment();
-  if (alignment == 0 || required > buffer_size)
+  if (required > buffer_size)
     return false;
-  uintptr_t begin = (uintptr_t)(void *)buffer;
-  if (buffer_size > UINTPTR_MAX - begin)
+  /* The caller supplies buffer_size valid bytes. Keep placement arithmetic
+   * within that object; only capacity for padding and a nonempty result
+   * prefix needs checking here. */
+  size_t prefix = buffer_size - required;
+  size_t padding = (uintptr_t)(void *)(buffer + prefix) % alignment;
+  if (padding >= prefix)
     return false;
-  uintptr_t end = begin + buffer_size;
-  uintptr_t start = end - required;
-  uintptr_t padding = start % alignment;
-  if (padding > start || start - padding < begin)
-    return false;
-  start -= padding;
-  if (start == begin)
-    return false;
-  *output_size = (size_t)(start - begin);
-  *workspace = (void *)start;
-  *workspace_size = (size_t)(end - start);
+  prefix -= padding;
+  *output_size = prefix;
+  *workspace = buffer + prefix;
+  *workspace_size = buffer_size - prefix;
   return true;
 }
 
@@ -208,6 +210,7 @@ static void type_cache_free(type_cache_t *c) {
 }
 
 static void cdf_free(sg_gate_t *gate);
+static bool cdf_ready(const sg_gate_t *gate) SHELL_NONNULL(1);
 static const char *type_cache_lookup(type_cache_t *c, const char *key,
                                      size_t key_len, size_t *value_count,
                                      size_t *value_len) {
@@ -264,6 +267,77 @@ static bool type_cache_insert(type_cache_t *c, const char *key, size_t key_len,
 
 /* --- GATE STATE --- */
 
+typedef struct {
+  const char *text; /* Borrows the immutable configuration string. */
+  size_t length;
+  const size_t *transitions;
+  uint16_t alphabet_size;
+  /* Biased classes; bytes absent from the NUL-free pattern transition to 0. */
+  uint8_t alphabet[UINT8_MAX + 1];
+} sg_path_fragment_t;
+
+static bool sg_path_byte_equals(unsigned char a, unsigned char b) {
+  SG_PATH_WORK();
+  return a == b;
+}
+
+/* Compile a byte-class DFA before configuration publication.
+ * Only bytes present in the pattern need columns (at most 255); all others
+ * immediately return to state 0. Each eval transition is constant-time even
+ * when many suffixes branch from one cached, partially matched CWD state.
+ * transitions holds length * alphabet_size entries. The shadow state is the
+ * longest proper border, so compilation needs no retained fallback table.
+ */
+static SHELL_NONNULL(1, 2) void sg_path_fragment_compile(
+    sg_path_fragment_t *fragment, size_t *transitions) {
+  size_t columns = fragment->alphabet_size;
+  fragment->transitions = transitions;
+  for (size_t column = 0; column < columns; column++) {
+    SG_PATH_WORK();
+    transitions[column] = 0;
+  }
+  SG_PATH_WORK();
+  transitions[fragment->alphabet[(unsigned char)fragment->text[0]] - 1] = 1;
+  size_t shadow = 0;
+  for (size_t i = 1; i < fragment->length; i++) {
+    size_t *row = transitions + i * columns;
+    for (size_t column = 0; column < columns; column++) {
+      SG_PATH_WORK();
+      row[column] = transitions[shadow * columns + column];
+    }
+    unsigned byte_class = fragment->alphabet[(unsigned char)fragment->text[i]];
+    SG_PATH_WORK();
+    row[byte_class - 1] = i + 1;
+    shadow = transitions[shadow * columns + byte_class - 1];
+  }
+}
+
+/* Empty fragments match nothing. text is an explicit span, including any
+ * embedded NUL decoded from ANSI-C quoting. For a nonempty fragment, state is
+ * an unmatched prefix (< length); the caller stops advancing after a match.
+ * No border is recomputed. */
+static SHELL_NONNULL(1, 2, 4) bool sg_path_fragment_advance(
+    const sg_path_fragment_t *fragment, const char *text, size_t length,
+    size_t *state) {
+  if (fragment->length == 0)
+    return false;
+  size_t matched = *state;
+  for (size_t i = 0; i < length; i++) {
+    SG_PATH_WORK();
+    unsigned byte_class = fragment->alphabet[(unsigned char)text[i]];
+    matched = byte_class
+                  ? fragment->transitions[matched * fragment->alphabet_size +
+                                          byte_class - 1]
+                  : 0;
+    if (matched == fragment->length) {
+      *state = matched;
+      return true;
+    }
+  }
+  *state = matched;
+  return false;
+}
+
 struct sg_gate {
   st_policy_ctx_t *pctx;
   st_policy_t *policy;
@@ -282,6 +356,10 @@ struct sg_gate {
 
   bool viol_enabled;
   sg_violation_config_t viol_config;
+  sg_path_fragment_t secret_fragments[SG_VIOL_MAX_PATHS];
+  sg_path_fragment_t profile_fragments[SG_VIOL_MAX_PATHS];
+  size_t path_prefix_lengths[3][SG_VIOL_MAX_PATHS];
+  size_t *path_fragment_tables;
 
   /* Anomaly detection */
   sg_anomaly_model_t *anomaly_model; /* raw command name model */
@@ -297,15 +375,14 @@ struct sg_gate {
       anomaly_combine_mode; /* WEIGHTED or BAYESIAN (default WEIGHTED) */
 
   /* Bayesian CDF histograms */
-  size_t cdf_bucket_count; /* minimum samples before Bayesian is ready */
-  size_t cdf_raw_count;    /* observed normal samples (raw) */
-  size_t cdf_type_count;   /* observed normal samples (type) */
-  size_t *cdf_raw_hist;    /* histogram buckets for raw scores */
-  size_t *cdf_type_hist;   /* histogram buckets for type scores */
+  size_t cdf_raw_count;  /* observed normal samples (raw) */
+  size_t cdf_type_count; /* observed normal samples (type) */
+  size_t *cdf_raw_hist;  /* histogram buckets for raw scores */
+  size_t *cdf_type_hist; /* histogram buckets for type scores */
 
   /* Adaptive threshold */
   bool anomaly_adaptive;          /* use adaptive threshold (default false) */
-  size_t anomaly_window_size;     /* rolling window capacity (default 1000) */
+  size_t anomaly_window_size;     /* configured rolling window capacity */
   double anomaly_k_factor;        /* stddev multiplier (default 3.0) */
   double *anomaly_score_buf;      /* circular buffer of normal scores */
   size_t anomaly_score_count;     /* entries currently in buffer */
@@ -316,6 +393,32 @@ struct sg_gate {
   /* Type sequence LRU cache */
   type_cache_t anomaly_type_cache; /* LRU cache for type sequences */
 };
+
+/* Calibration belongs to one model generation and one effective score
+ * regime. A reset reuses storage; stale observations need not be scrubbed
+ * because the rolling count starts over and only initialized entries are read.
+ * Required gate storage is initialized and exclusively owned by the caller. */
+static SHELL_NONNULL(1) void adaptive_reset(sg_gate_t *gate) {
+  gate->anomaly_score_count = 0;
+  gate->anomaly_score_idx = 0;
+  gate->anomaly_adaptive_armed = false;
+  gate->anomaly_threshold = gate->anomaly_fixed_threshold;
+}
+
+static SHELL_NONNULL(1) void cdf_reset(sg_gate_t *gate) {
+  /* Histograms are either an allocated pair or absent together. */
+  if (gate->cdf_raw_hist) {
+    memset(gate->cdf_raw_hist, 0, CDF_NUM_BUCKETS * sizeof(size_t));
+    memset(gate->cdf_type_hist, 0, CDF_NUM_BUCKETS * sizeof(size_t));
+  }
+  gate->cdf_raw_count = 0;
+  gate->cdf_type_count = 0;
+}
+
+static SHELL_NONNULL(1) bool anomaly_uses_bayesian(const sg_gate_t *gate) {
+  return gate->anomaly_combine_mode == SG_ANOMALY_COMBINE_BAYESIAN &&
+         cdf_ready(gate);
+}
 
 /* --- LIFECYCLE --- */
 
@@ -356,6 +459,7 @@ sg_gate_t *sg_gate_new(void) {
   g->anomaly_skip_on_detected = true;
   g->anomaly_weight_raw = 0.5;
   g->anomaly_weight_type = 0.5;
+  g->anomaly_k_factor = 3.0;
 
   return g;
 }
@@ -368,6 +472,7 @@ void sg_gate_free(sg_gate_t *gate) {
   if (gate->anomaly_model_type)
     sg_anomaly_model_free(gate->anomaly_model_type);
   free(gate->anomaly_score_buf);
+  free(gate->path_fragment_tables);
   type_cache_free(&gate->anomaly_type_cache);
   cdf_free(gate);
   if (gate->policy)
@@ -382,8 +487,6 @@ void sg_gate_free(sg_gate_t *gate) {
 /* --- CONFIGURATION --- */
 
 sg_error_t sg_gate_set_cwd(sg_gate_t *gate, const char *cwd) {
-  if (!gate || !cwd)
-    return SG_ERR_INVALID;
   if (strlen(cwd) >= sizeof(gate->cwd))
     return SG_ERR_TRUNC;
   sg_strlcpy(gate->cwd, cwd, sizeof(gate->cwd));
@@ -391,22 +494,18 @@ sg_error_t sg_gate_set_cwd(sg_gate_t *gate, const char *cwd) {
 }
 
 sg_error_t sg_gate_set_reject_mask(sg_gate_t *gate, uint32_t mask) {
-  if (!gate)
-    return SG_ERR_INVALID;
   gate->reject_mask = mask;
   return SG_OK;
 }
 
 sg_error_t sg_gate_set_stop_mode(sg_gate_t *gate, sg_stop_mode_t mode) {
-  if (!gate || mode < SG_STOP_FIRST_FAIL || mode > SG_EVAL_ALL)
+  if ((mode < SG_STOP_FIRST_FAIL) || (mode > SG_EVAL_ALL))
     return SG_ERR_INVALID;
   gate->stop_mode = mode;
   return SG_OK;
 }
 
 sg_error_t sg_gate_set_suggestions(sg_gate_t *gate, bool enabled) {
-  if (!gate)
-    return SG_ERR_INVALID;
   gate->suggestions = enabled;
   return SG_OK;
 }
@@ -414,8 +513,6 @@ sg_error_t sg_gate_set_suggestions(sg_gate_t *gate, bool enabled) {
 sg_error_t sg_gate_set_expand_var_netargv(sg_gate_t *gate,
                                           sg_expand_netargv_fn fn,
                                           void *user_ctx) {
-  if (!gate)
-    return SG_ERR_INVALID;
   gate->expand_var_netargv_fn = fn;
   gate->expand_var_netargv_ctx = user_ctx;
   return SG_OK;
@@ -424,8 +521,6 @@ sg_error_t sg_gate_set_expand_var_netargv(sg_gate_t *gate,
 sg_error_t sg_gate_set_expand_glob_netargv(sg_gate_t *gate,
                                            sg_expand_netargv_fn fn,
                                            void *user_ctx) {
-  if (!gate)
-    return SG_ERR_INVALID;
   gate->expand_glob_netargv_fn = fn;
   gate->expand_glob_netargv_ctx = user_ctx;
   return SG_OK;
@@ -444,8 +539,6 @@ static bool config_array_valid(const char *const *values, uint32_t count,
 sg_error_t
 sg_gate_set_violation_config_borrowed(sg_gate_t *gate,
                                       const sg_violation_config_t *config) {
-  if (!gate || !config)
-    return SG_ERR_INVALID;
   if (!config_array_valid(config->sensitive_write_paths,
                           config->sensitive_write_path_count,
                           SG_VIOL_MAX_PATHS) ||
@@ -478,8 +571,60 @@ sg_gate_set_violation_config_borrowed(sg_gate_t *gate,
       !config_array_valid(config->shell_profile_paths,
                           config->shell_profile_path_count, SG_VIOL_MAX_PATHS))
     return SG_ERR_INVALID;
+
+  sg_path_fragment_t fragments[2][SG_VIOL_MAX_PATHS] = {0};
+  const char *const *lists[2] = {config->sensitive_secret_paths,
+                                 config->shell_profile_paths};
+  const uint32_t counts[2] = {config->sensitive_secret_path_count,
+                              config->shell_profile_path_count};
+  size_t total = 0;
+  for (unsigned list = 0; list < 2; list++) {
+    for (uint32_t i = 0; i < counts[list]; i++) {
+      size_t length = strlen(lists[list][i]);
+      sg_path_fragment_t *fragment = &fragments[list][i];
+      fragment->text = lists[list][i];
+      fragment->length = length;
+      for (size_t j = 0; j < length; j++) {
+        unsigned char byte = (unsigned char)fragment->text[j];
+        if (fragment->alphabet[byte] == 0)
+          fragment->alphabet[byte] = (uint8_t)++fragment->alphabet_size;
+      }
+      size_t columns = fragment->alphabet_size;
+      if (length && length > (SIZE_MAX / sizeof(size_t) - total) / columns)
+        return SG_ERR_MEMORY;
+      total += length * columns;
+    }
+  }
+  size_t *tables = total ? malloc(total * sizeof(*tables)) : NULL;
+  if (total && !tables)
+    return SG_ERR_MEMORY;
+  size_t offset = 0;
+  for (unsigned list = 0; list < 2; list++) {
+    for (uint32_t i = 0; i < counts[list]; i++) {
+      if (fragments[list][i].length != 0) {
+        sg_path_fragment_compile(&fragments[list][i], tables + offset);
+        offset += fragments[list][i].length * fragments[list][i].alphabet_size;
+      }
+    }
+  }
+  /* Only these tables are owned; string lifetime remains the borrowed API's
+   * caller contract. No old state changes until preparation has succeeded. */
+  free(gate->path_fragment_tables);
+  gate->path_fragment_tables = tables;
+  memcpy(gate->secret_fragments, fragments[0], sizeof(fragments[0]));
+  memcpy(gate->profile_fragments, fragments[1], sizeof(fragments[1]));
   gate->viol_enabled = true;
   gate->viol_config = *config;
+  const char *const *prefixes[] = {config->sensitive_write_paths,
+                                   config->sensitive_dirs,
+                                   config->sensitive_read_paths};
+  uint32_t prefix_counts[] = {config->sensitive_write_path_count,
+                              config->sensitive_dir_count,
+                              config->sensitive_read_path_count};
+  memset(gate->path_prefix_lengths, 0, sizeof(gate->path_prefix_lengths));
+  for (unsigned list = 0; list < 3; list++)
+    for (uint32_t i = 0; i < prefix_counts[list]; i++)
+      gate->path_prefix_lengths[list][i] = strlen(prefixes[list][i]);
   return SG_OK;
 }
 
@@ -487,7 +632,7 @@ sg_gate_set_violation_config_borrowed(sg_gate_t *gate,
 
 sg_error_t sg_gate_enable_anomaly(sg_gate_t *gate, double threshold,
                                   const sg_anomaly_config_t *config) {
-  if (!gate || !isfinite(threshold))
+  if (!isfinite(threshold))
     return SG_ERR_INVALID;
   if (config && (!isfinite(config->alpha) || config->alpha <= 0.0 ||
                  !isfinite(config->unknown_log_prior)))
@@ -504,8 +649,6 @@ sg_error_t sg_gate_enable_anomaly(sg_gate_t *gate, double threshold,
   double *new_score_buf = NULL;
   size_t adaptive_window = gate->anomaly_window_size;
   if (gate->anomaly_adaptive && !gate->anomaly_score_buf) {
-    if (adaptive_window == 0)
-      adaptive_window = 1000;
     new_score_buf = calloc(adaptive_window, sizeof(double));
     if (!new_score_buf) {
       sg_anomaly_model_free(new_raw);
@@ -520,10 +663,8 @@ sg_error_t sg_gate_enable_anomaly(sg_gate_t *gate, double threshold,
   gate->anomaly_model_type = new_type;
   if (new_score_buf) {
     gate->anomaly_score_buf = new_score_buf;
-    gate->anomaly_window_size = adaptive_window;
   }
   gate->anomaly_enabled = true;
-  gate->anomaly_threshold = threshold;
   gate->anomaly_update_only_on_allow = false;
   gate->anomaly_skip_on_detected = true;
   gate->anomaly_weight_raw = 0.5;
@@ -531,16 +672,12 @@ sg_error_t sg_gate_enable_anomaly(sg_gate_t *gate, double threshold,
   gate->anomaly_combine_mode = SG_ANOMALY_COMBINE_WEIGHTED;
   gate->anomaly_fixed_threshold = threshold;
   /* Reset observations while preserving adaptive configuration. */
-  gate->anomaly_score_count = 0;
-  gate->anomaly_score_idx = 0;
-  gate->anomaly_adaptive_armed = false;
+  adaptive_reset(gate);
   cdf_free(gate);
   return SG_OK;
 }
 
 void sg_gate_disable_anomaly(sg_gate_t *gate) {
-  if (!gate)
-    return;
   if (gate->anomaly_model) {
     sg_anomaly_model_free(gate->anomaly_model);
     gate->anomaly_model = NULL;
@@ -552,32 +689,24 @@ void sg_gate_disable_anomaly(sg_gate_t *gate) {
   gate->anomaly_enabled = false;
   free(gate->anomaly_score_buf);
   gate->anomaly_score_buf = NULL;
-  gate->anomaly_score_count = 0;
-  gate->anomaly_score_idx = 0;
-  gate->anomaly_adaptive_armed = false;
+  adaptive_reset(gate);
   type_cache_clear(&gate->anomaly_type_cache);
   cdf_free(gate);
 }
 
 sg_error_t sg_gate_set_anomaly_update_mode(sg_gate_t *gate,
                                            bool update_only_on_allow) {
-  if (!gate)
-    return SG_ERR_INVALID;
   gate->anomaly_update_only_on_allow = update_only_on_allow;
   return SG_OK;
 }
 
 sg_error_t sg_gate_set_anomaly_skip_on_detected(sg_gate_t *gate, bool skip) {
-  if (!gate)
-    return SG_ERR_INVALID;
   gate->anomaly_skip_on_detected = skip;
   return SG_OK;
 }
 
 sg_error_t sg_gate_set_anomaly_weights(sg_gate_t *gate, double weight_raw,
                                        double weight_type) {
-  if (!gate)
-    return SG_ERR_INVALID;
   if (!isfinite(weight_raw) || !isfinite(weight_type) || weight_raw < 0.0 ||
       weight_type < 0.0)
     return SG_ERR_INVALID;
@@ -585,22 +714,23 @@ sg_error_t sg_gate_set_anomaly_weights(sg_gate_t *gate, double weight_raw,
   double sum = weight_raw + weight_type;
   if (sum < 0.99 || sum > 1.01)
     return SG_ERR_INVALID;
+  bool changed = gate->anomaly_weight_raw != weight_raw ||
+                 gate->anomaly_weight_type != weight_type;
   gate->anomaly_weight_raw = weight_raw;
   gate->anomaly_weight_type = weight_type;
+  if (changed && !anomaly_uses_bayesian(gate))
+    adaptive_reset(gate);
   return SG_OK;
 }
 
 /* --- ADAPTIVE THRESHOLD --- */
 
-static void adaptive_recompute_threshold(sg_gate_t *gate) {
-  if (!gate->anomaly_score_buf || gate->anomaly_score_count == 0)
-    return;
-
+/* The configured, armed rolling window is full. All retained scores are
+ * finite and were measured in the current effective score regime. */
+static SHELL_NONNULL(1) void adaptive_recompute_threshold(sg_gate_t *gate) {
   /* Compute mean */
   double sum = 0.0;
-  size_t n = gate->anomaly_score_count < gate->anomaly_window_size
-                 ? gate->anomaly_score_count
-                 : gate->anomaly_window_size;
+  size_t n = gate->anomaly_window_size;
   for (size_t i = 0; i < n; i++)
     sum += gate->anomaly_score_buf[i];
   double mean = sum / (double)n;
@@ -616,16 +746,15 @@ static void adaptive_recompute_threshold(sg_gate_t *gate) {
   gate->anomaly_threshold = mean + gate->anomaly_k_factor * stddev;
 }
 
-static void adaptive_record_score(sg_gate_t *gate, double score) {
-  if (!gate->anomaly_score_buf)
-    return;
-  if (!isfinite(score))
-    return;
-
+/* Adaptive mode supplies an allocated, positive-sized window. The caller
+ * passes one finite, non-anomalous score after a successful evaluation. */
+static SHELL_NONNULL(1) void adaptive_record_score(sg_gate_t *gate,
+                                                   double score) {
   gate->anomaly_score_buf[gate->anomaly_score_idx] = score;
   gate->anomaly_score_idx =
       (gate->anomaly_score_idx + 1) % gate->anomaly_window_size;
-  gate->anomaly_score_count++;
+  if (gate->anomaly_score_count < gate->anomaly_window_size)
+    gate->anomaly_score_count++;
 
   /* Arm adaptive threshold once window is full */
   if (!gate->anomaly_adaptive_armed &&
@@ -641,19 +770,14 @@ static void adaptive_record_score(sg_gate_t *gate, double score) {
 
 sg_error_t sg_gate_set_anomaly_adaptive(sg_gate_t *gate, bool adaptive,
                                         size_t window_size) {
-  if (!gate)
-    return SG_ERR_INVALID;
   if (adaptive && window_size == 0)
     return SG_ERR_INVALID;
 
   if (!adaptive) {
     gate->anomaly_adaptive = false;
-    gate->anomaly_adaptive_armed = false;
-    gate->anomaly_threshold = gate->anomaly_fixed_threshold;
     free(gate->anomaly_score_buf);
     gate->anomaly_score_buf = NULL;
-    gate->anomaly_score_count = 0;
-    gate->anomaly_score_idx = 0;
+    adaptive_reset(gate);
     return SG_OK;
   }
 
@@ -666,17 +790,12 @@ sg_error_t sg_gate_set_anomaly_adaptive(sg_gate_t *gate, bool adaptive,
   free(gate->anomaly_score_buf);
   gate->anomaly_score_buf = new_buf;
   gate->anomaly_window_size = window_size;
-  gate->anomaly_score_count = 0;
-  gate->anomaly_score_idx = 0;
   gate->anomaly_adaptive = true;
-  gate->anomaly_adaptive_armed = false;
-  /* Threshold stays as fixed until window fills */
+  adaptive_reset(gate);
   return SG_OK;
 }
 
 sg_error_t sg_gate_set_anomaly_k_factor(sg_gate_t *gate, double k) {
-  if (!gate)
-    return SG_ERR_INVALID;
   if (!isfinite(k) || k < 0.0)
     return SG_ERR_INVALID;
   gate->anomaly_k_factor = k;
@@ -687,8 +806,6 @@ sg_error_t sg_gate_set_anomaly_k_factor(sg_gate_t *gate, double k) {
 }
 
 sg_error_t sg_gate_set_anomaly_cache_size(sg_gate_t *gate, size_t cache_size) {
-  if (!gate)
-    return SG_ERR_INVALID;
   if (cache_size > 8192)
     return SG_ERR_INVALID;
 
@@ -752,20 +869,19 @@ static void cdf_free(sg_gate_t *gate) {
   free(gate->cdf_type_hist);
   gate->cdf_raw_hist = NULL;
   gate->cdf_type_hist = NULL;
-  gate->cdf_raw_count = 0;
-  gate->cdf_type_count = 0;
+  cdf_reset(gate);
 }
 
 static bool cdf_ready(const sg_gate_t *gate) {
-  size_t min_samples = gate->cdf_bucket_count;
+  size_t min_samples = gate->anomaly_adaptive ? gate->anomaly_window_size
+                                              : CDF_DEFAULT_MIN_SAMPLES;
   return gate->cdf_raw_count >= min_samples &&
          gate->cdf_type_count >= min_samples;
 }
 
 static void combine_anomaly_scores(const sg_gate_t *gate, double raw_score,
                                    double type_score, double *combined) {
-  if (gate->anomaly_combine_mode == SG_ANOMALY_COMBINE_BAYESIAN &&
-      cdf_ready(gate)) {
+  if (anomaly_uses_bayesian(gate)) {
     *combined =
         cdf_log_odds(gate->cdf_raw_hist, gate->cdf_raw_count, raw_score) +
         cdf_log_odds(gate->cdf_type_hist, gate->cdf_type_count, type_score);
@@ -794,30 +910,26 @@ sg_error_t sg_gate_score_anomaly_netseq(const sg_gate_t *gate,
                                         const char *type_netseq,
                                         size_t type_length,
                                         sg_anomaly_sequence_score_t *out) {
-  if (out)
-    *out =
-        (sg_anomaly_sequence_score_t){INFINITY, INFINITY, INFINITY, false, 0};
-  if (!gate || !raw_netseq || !type_netseq || !out)
-    return SG_ERR_INVALID;
+  *out = (sg_anomaly_sequence_score_t){INFINITY, INFINITY, INFINITY, false, 0};
+
   if (!gate->anomaly_enabled || !gate->anomaly_model ||
       !gate->anomaly_model_type)
     return SG_ERR_INVALID;
   size_t raw_count = 0, type_count = 0;
-  if (sg_anomaly_netseq_count(raw_netseq, raw_length, false, &raw_count) !=
-          SG_ANOMALY_OK ||
-      sg_anomaly_netseq_count(type_netseq, type_length, false, &type_count) !=
-          SG_ANOMALY_OK ||
-      raw_count != type_count)
-    return SG_ERR_PARSE;
-  sg_anomaly_status_t raw_status = sg_anomaly_model_score_netseq(
-      gate->anomaly_model, raw_netseq, raw_length, &out->raw_score);
-  sg_anomaly_status_t type_status = sg_anomaly_model_score_netseq(
-      gate->anomaly_model_type, type_netseq, type_length, &out->type_score);
+  double raw_score = INFINITY, type_score = INFINITY;
+  sg_anomaly_status_t raw_status = sg_anomaly_score_netseq_count(
+      gate->anomaly_model, raw_netseq, raw_length, &raw_score, &raw_count);
+  sg_anomaly_status_t type_status =
+      sg_anomaly_score_netseq_count(gate->anomaly_model_type, type_netseq,
+                                    type_length, &type_score, &type_count);
   if (raw_status == SG_ANOMALY_ERR_MEMORY ||
       type_status == SG_ANOMALY_ERR_MEMORY)
     return SG_ERR_MEMORY;
-  if (raw_status != SG_ANOMALY_OK || type_status != SG_ANOMALY_OK)
+  if (raw_status != SG_ANOMALY_OK || type_status != SG_ANOMALY_OK ||
+      raw_count != type_count)
     return SG_ERR_PARSE;
+  out->raw_score = raw_score;
+  out->type_score = type_score;
   out->stage_count = raw_count;
   if (raw_count < 3) {
     out->combined_score = 0.0;
@@ -837,25 +949,27 @@ sg_error_t sg_gate_score_anomaly_netseq(const sg_gate_t *gate,
 
 sg_error_t sg_gate_set_anomaly_combine_mode(sg_gate_t *gate,
                                             sg_anomaly_combine_mode_t mode) {
-  if (!gate)
-    return SG_ERR_INVALID;
   if (mode != SG_ANOMALY_COMBINE_WEIGHTED &&
       mode != SG_ANOMALY_COMBINE_BAYESIAN)
     return SG_ERR_INVALID;
 
   if (mode == SG_ANOMALY_COMBINE_BAYESIAN && !gate->cdf_raw_hist) {
-    gate->cdf_raw_hist = calloc(CDF_NUM_BUCKETS, sizeof(size_t));
-    gate->cdf_type_hist = calloc(CDF_NUM_BUCKETS, sizeof(size_t));
-    if (!gate->cdf_raw_hist || !gate->cdf_type_hist) {
-      cdf_free(gate);
+    size_t *raw = calloc(CDF_NUM_BUCKETS, sizeof(size_t));
+    if (!raw)
+      return SG_ERR_MEMORY;
+    size_t *type = calloc(CDF_NUM_BUCKETS, sizeof(size_t));
+    if (!type) {
+      free(raw);
       return SG_ERR_MEMORY;
     }
-    gate->cdf_bucket_count = gate->anomaly_window_size > 0
-                                 ? gate->anomaly_window_size
-                                 : CDF_DEFAULT_MIN_SAMPLES;
+    gate->cdf_raw_hist = raw;
+    gate->cdf_type_hist = type;
   }
 
+  bool was_bayesian = anomaly_uses_bayesian(gate);
   gate->anomaly_combine_mode = mode;
+  if (was_bayesian != anomaly_uses_bayesian(gate))
+    adaptive_reset(gate);
   return SG_OK;
 }
 
@@ -875,8 +989,8 @@ static uint64_t load_u64_le(const unsigned char *src) {
   return value;
 }
 
-static sg_error_t errno_to_gate_error(void) {
-  return errno == ENOMEM ? SG_ERR_MEMORY : SG_ERR_IO;
+static sg_error_t errno_to_gate_error(int error_number) {
+  return error_number == ENOMEM ? SG_ERR_MEMORY : SG_ERR_IO;
 }
 
 static sg_error_t process_status_to_gate_error(shell_process_status_t status) {
@@ -887,54 +1001,81 @@ static sg_error_t process_status_to_gate_error(shell_process_status_t status) {
   return SG_ERR_PARSE;
 }
 
-static int stream_size(FILE *stream, uint64_t *size) {
-  if (fseek(stream, 0, SEEK_END) != 0)
-    return -1;
-  long end = ftell(stream);
+static SHELL_NONNULL(1, 2) sg_error_t
+    stream_size(FILE *stream, uint64_t *size) {
+  if (sg_io_seek(stream, 0, SEEK_END) != 0)
+    return errno_to_gate_error(errno);
+  long end = sg_io_tell(stream);
   if (end < 0)
-    return -1;
+    return errno_to_gate_error(errno);
   *size = (uint64_t)end;
-  return fseek(stream, 0, SEEK_SET);
+  return sg_io_seek(stream, 0, SEEK_SET) == 0 ? SG_OK
+                                              : errno_to_gate_error(errno);
 }
 
-static int copy_stream(FILE *from, FILE *to, uint64_t count,
-                       XXH3_state_t *hash) {
+/* Required readable/writable streams and initialized hash state. The source
+ * supplies count bytes or produces a typed truncation/I/O result. */
+static SHELL_NONNULL(1, 2, 4) sg_error_t
+    copy_stream(FILE *from, FILE *to, uint64_t count, XXH3_state_t *hash) {
   unsigned char buffer[16384];
   while (count > 0) {
     size_t chunk = count < sizeof(buffer) ? (size_t)count : sizeof(buffer);
-    if (fread(buffer, 1, chunk, from) != chunk ||
-        (to && fwrite(buffer, 1, chunk, to) != chunk) ||
-        (hash && XXH3_64bits_update(hash, buffer, chunk) == XXH_ERROR))
-      return -1;
+    sg_io_read_result_t read = sg_io_read(from, buffer, chunk);
+    if (read != SG_IO_READ_OK)
+      return read == SG_IO_READ_EOF ? SG_ERR_PARSE : errno_to_gate_error(errno);
+    if (sg_io_write(to, buffer, chunk) != 0)
+      return errno_to_gate_error(errno);
+    if (XXH3_64bits_update(hash, buffer, chunk) == XXH_ERROR)
+      return SG_ERR_IO;
     count -= chunk;
   }
-  return 0;
+  return SG_OK;
+}
+
+static sg_error_t anomaly_stream_error(sg_anomaly_status_t status) {
+  switch (status) {
+  case SG_ANOMALY_OK:
+    return SG_OK;
+  case SG_ANOMALY_ERR_MEMORY:
+    return SG_ERR_MEMORY;
+  case SG_ANOMALY_ERR_FORMAT:
+  case SG_ANOMALY_ERR_LIMIT:
+    return SG_ERR_PARSE;
+  default:
+    return SG_ERR_IO;
+  }
 }
 
 sg_error_t sg_gate_save_anomaly_model(const sg_gate_t *gate, const char *path) {
-  if (!gate || !path || !gate->anomaly_enabled || !gate->anomaly_model ||
-      !gate->anomaly_model_type)
+  if ((!gate->anomaly_enabled) || (!gate->anomaly_model) ||
+      (!gate->anomaly_model_type))
     return SG_ERR_INVALID;
 
-  FILE *raw = tmpfile();
-  FILE *type = tmpfile();
-  if (!raw || !type) {
-    if (raw)
-      fclose(raw);
-    if (type)
-      fclose(type);
-    return errno_to_gate_error();
+  FILE *raw = sg_io_tmpfile();
+  if (!raw)
+    return errno_to_gate_error(errno);
+  FILE *type = sg_io_tmpfile();
+  if (!type) {
+    int error_number = errno;
+    fclose(raw);
+    return errno_to_gate_error(error_number);
   }
-  errno = 0;
   uint64_t raw_size = 0, type_size = 0;
-  if (sg_anomaly_write_stream(gate->anomaly_model, raw) != 0 ||
-      sg_anomaly_write_stream(gate->anomaly_model_type, type) != 0 ||
-      stream_size(raw, &raw_size) != 0 || stream_size(type, &type_size) != 0 ||
-      raw_size > UINT64_MAX - type_size) {
-    sg_error_t error = errno_to_gate_error();
+  sg_error_t result =
+      anomaly_stream_error(sg_anomaly_write_stream(gate->anomaly_model, raw));
+  if (result == SG_OK)
+    result = anomaly_stream_error(
+        sg_anomaly_write_stream(gate->anomaly_model_type, type));
+  if (result == SG_OK)
+    result = stream_size(raw, &raw_size);
+  if (result == SG_OK)
+    result = stream_size(type, &type_size);
+  if (result == SG_OK && raw_size > UINT64_MAX - type_size)
+    result = SG_ERR_TRUNC;
+  if (result != SG_OK) {
     fclose(raw);
     fclose(type);
-    return error;
+    return result;
   }
 
   sg_atomic_output_t output;
@@ -957,39 +1098,60 @@ sg_error_t sg_gate_save_anomaly_model(const sg_gate_t *gate, const char *path) {
   memcpy(header, sg_bundle_magic, sizeof(sg_bundle_magic));
   store_u64_le(header + 8, raw_size);
   store_u64_le(header + 16, type_size);
-  int failed =
-      fwrite(header, 1, sizeof(header), output.stream) != sizeof(header) ||
-      copy_stream(raw, output.stream, raw_size, hash) != 0 ||
-      copy_stream(type, output.stream, type_size, hash) != 0;
-  if (!failed) {
+  result = sg_io_write(output.stream, header, sizeof(header)) == 0
+               ? SG_OK
+               : errno_to_gate_error(errno);
+  if (result == SG_OK)
+    result = copy_stream(raw, output.stream, raw_size, hash);
+  if (result == SG_OK)
+    result = copy_stream(type, output.stream, type_size, hash);
+  if (result == SG_OK) {
     store_u64_le(header + 24, XXH3_64bits_digest(hash));
-    failed = fseek(output.stream, 0, SEEK_SET) != 0 ||
-             fwrite(header, 1, sizeof(header), output.stream) != sizeof(header);
+    if (sg_io_seek(output.stream, 0, SEEK_SET) != 0 ||
+        sg_io_write(output.stream, header, sizeof(header)) != 0)
+      result = errno_to_gate_error(errno);
   }
   XXH3_freeState(hash);
-  fclose(raw);
-  fclose(type);
-  if (failed || sg_atomic_output_commit(&output) != 0) {
-    if (output.temporary_path)
+  int saved_errno = errno;
+  if (sg_io_close(raw) != 0 && result == SG_OK) {
+    result = errno_to_gate_error(errno);
+    saved_errno = errno;
+  }
+  if (sg_io_close(type) != 0 && result == SG_OK) {
+    result = errno_to_gate_error(errno);
+    saved_errno = errno;
+  }
+  errno = saved_errno;
+  if (result != SG_OK || sg_atomic_output_commit(&output) != 0) {
+    if (result == SG_OK)
+      saved_errno = errno;
+    if (output.destination_name)
       sg_atomic_output_discard(&output);
-    return SG_ERR_IO;
+    errno = saved_errno;
+    return result != SG_OK ? result : SG_ERR_IO;
   }
   return SG_OK;
 }
 
 sg_error_t sg_gate_load_anomaly_model(sg_gate_t *gate, const char *path) {
-  if (!gate || !path || !gate->anomaly_enabled || !gate->anomaly_model ||
-      !gate->anomaly_model_type)
+  if ((!gate->anomaly_enabled) || (!gate->anomaly_model) ||
+      (!gate->anomaly_model_type))
     return SG_ERR_INVALID;
 
   FILE *bundle = fopen(path, "rb");
-  if (!bundle)
-    return errno_to_gate_error();
+  if (!bundle) {
+    int error_number = errno;
+    return errno_to_gate_error(error_number);
+  }
   unsigned char header[SG_BUNDLE_HEADER_SIZE];
-  if (fread(header, 1, sizeof(header), bundle) != sizeof(header)) {
-    bool io_error = ferror(bundle) != 0;
+  sg_io_read_result_t header_result =
+      sg_io_read(bundle, header, sizeof(header));
+  if (header_result != SG_IO_READ_OK) {
+    sg_error_t result = header_result == SG_IO_READ_EOF
+                            ? SG_ERR_PARSE
+                            : errno_to_gate_error(errno);
     fclose(bundle);
-    return io_error ? SG_ERR_IO : SG_ERR_PARSE;
+    return result;
   }
   uint64_t raw_size = load_u64_le(header + 8);
   uint64_t type_size = load_u64_le(header + 16);
@@ -997,95 +1159,121 @@ sg_error_t sg_gate_load_anomaly_model(sg_gate_t *gate, const char *path) {
   uint64_t file_size = 0;
   if (memcmp(header, sg_bundle_magic, sizeof(sg_bundle_magic)) != 0 ||
       raw_size == 0 || type_size == 0 || raw_size > UINT64_MAX - type_size ||
-      raw_size + type_size > UINT64_MAX - SG_BUNDLE_HEADER_SIZE ||
-      stream_size(bundle, &file_size) != 0) {
+      raw_size + type_size > UINT64_MAX - SG_BUNDLE_HEADER_SIZE) {
     fclose(bundle);
     return SG_ERR_PARSE;
   }
-  if (file_size != SG_BUNDLE_HEADER_SIZE + raw_size + type_size ||
-      fseek(bundle, SG_BUNDLE_HEADER_SIZE, SEEK_SET) != 0) {
+  sg_error_t result = stream_size(bundle, &file_size);
+  if (result != SG_OK) {
+    fclose(bundle);
+    return result;
+  }
+  if (file_size != SG_BUNDLE_HEADER_SIZE + raw_size + type_size) {
     fclose(bundle);
     return SG_ERR_PARSE;
+  }
+  if (sg_io_seek(bundle, SG_BUNDLE_HEADER_SIZE, SEEK_SET) != 0) {
+    result = errno_to_gate_error(errno);
+    fclose(bundle);
+    return result;
   }
 
+  FILE *raw = sg_io_tmpfile();
+  if (!raw) {
+    int error_number = errno;
+    fclose(bundle);
+    return errno_to_gate_error(error_number);
+  }
+  FILE *type = sg_io_tmpfile();
+  if (!type) {
+    int error_number = errno;
+    fclose(raw);
+    fclose(bundle);
+    return errno_to_gate_error(error_number);
+  }
   XXH3_state_t *hash = XXH3_createState();
   if (!hash) {
+    fclose(raw);
+    fclose(type);
     fclose(bundle);
     return SG_ERR_MEMORY;
   }
   XXH3_64bits_reset(hash);
-  int hash_failed = copy_stream(bundle, NULL, raw_size + type_size, hash) != 0;
-  uint64_t actual_hash = XXH3_64bits_digest(hash);
+  /* Hash exactly the bytes staged for the inner readers. A separate checksum
+   * pass followed by a payload rewind could load different, unverified bytes
+   * if the source file is modified in place. */
+  result = copy_stream(bundle, raw, raw_size, hash);
+  if (result == SG_OK)
+    result = copy_stream(bundle, type, type_size, hash);
+  if (result == SG_OK && XXH3_64bits_digest(hash) != expected_hash)
+    result = SG_ERR_PARSE;
+  if (result == SG_OK) {
+    /* Also reject growth after the initial file-size check. */
+    unsigned char trailing;
+    sg_io_read_result_t end = sg_io_read(bundle, &trailing, 1);
+    if (end != SG_IO_READ_EOF)
+      result = end == SG_IO_READ_OK ? SG_ERR_PARSE : errno_to_gate_error(errno);
+  }
+  int saved_errno = errno;
   XXH3_freeState(hash);
-  if (hash_failed || actual_hash != expected_hash ||
-      fseek(bundle, SG_BUNDLE_HEADER_SIZE, SEEK_SET) != 0) {
-    fclose(bundle);
-    return hash_failed ? SG_ERR_IO : SG_ERR_PARSE;
+  if (result == SG_OK && (sg_io_seek(raw, 0, SEEK_SET) != 0 ||
+                          sg_io_seek(type, 0, SEEK_SET) != 0)) {
+    result = errno_to_gate_error(errno);
+    saved_errno = errno;
   }
-
-  FILE *raw = tmpfile();
-  FILE *type = tmpfile();
-  if (!raw || !type) {
-    if (raw)
-      fclose(raw);
-    if (type)
-      fclose(type);
-    fclose(bundle);
-    return errno_to_gate_error();
+  if (sg_io_close(bundle) != 0 && result == SG_OK) {
+    result = errno_to_gate_error(errno);
+    saved_errno = errno;
   }
-  int copy_failed = copy_stream(bundle, raw, raw_size, NULL) != 0 ||
-                    copy_stream(bundle, type, type_size, NULL) != 0 ||
-                    fseek(raw, 0, SEEK_SET) != 0 ||
-                    fseek(type, 0, SEEK_SET) != 0;
-  fclose(bundle);
-  if (copy_failed) {
+  if (result != SG_OK) {
     fclose(raw);
     fclose(type);
-    return SG_ERR_IO;
+    errno = saved_errno;
+    return result;
   }
 
-  sg_anomaly_model_t *loaded_raw = sg_anomaly_model_new();
-  sg_anomaly_model_t *loaded_type = sg_anomaly_model_new();
-  if (!loaded_raw || !loaded_type) {
-    sg_anomaly_model_free(loaded_raw);
-    sg_anomaly_model_free(loaded_type);
-    fclose(raw);
-    fclose(type);
-    return SG_ERR_MEMORY;
+  sg_anomaly_model_t *loaded_raw = NULL;
+  sg_anomaly_model_t *loaded_type = NULL;
+  result = anomaly_stream_error(sg_anomaly_model_read_new(raw, &loaded_raw));
+  if (result == SG_OK)
+    result =
+        anomaly_stream_error(sg_anomaly_model_read_new(type, &loaded_type));
+  saved_errno = errno;
+  if (sg_io_close(raw) != 0 && result == SG_OK) {
+    result = errno_to_gate_error(errno);
+    saved_errno = errno;
   }
-  errno = 0;
-  int raw_result = sg_anomaly_read_stream(loaded_raw, raw);
-  int raw_errno = errno;
-  errno = 0;
-  int type_result = sg_anomaly_read_stream(loaded_type, type);
-  int type_errno = errno;
-  fclose(raw);
-  fclose(type);
-  if (raw_result != 0 || type_result != 0) {
+  if (sg_io_close(type) != 0 && result == SG_OK) {
+    result = errno_to_gate_error(errno);
+    saved_errno = errno;
+  }
+  if (result != SG_OK) {
     sg_anomaly_model_free(loaded_raw);
     sg_anomaly_model_free(loaded_type);
-    if (raw_errno == ENOMEM || type_errno == ENOMEM)
-      return SG_ERR_MEMORY;
-    return SG_ERR_PARSE;
+    errno = saved_errno;
+    return result;
   }
 
   sg_anomaly_model_free(gate->anomaly_model);
   sg_anomaly_model_free(gate->anomaly_model_type);
   gate->anomaly_model = loaded_raw;
   gate->anomaly_model_type = loaded_type;
+  adaptive_reset(gate);
+  cdf_reset(gate);
   type_cache_clear(&gate->anomaly_type_cache);
+  errno = saved_errno;
   return SG_OK;
 }
 
 bool sg_gate_anomaly_had_error(const sg_gate_t *gate) {
-  if (!gate || !gate->anomaly_model)
+  if (!gate->anomaly_model)
     return false;
   return sg_anomaly_model_had_error(gate->anomaly_model) ||
          sg_anomaly_model_had_error(gate->anomaly_model_type);
 }
 
 size_t sg_gate_anomaly_vocab_size(const sg_gate_t *gate) {
-  if (!gate || !gate->anomaly_model)
+  if (!gate->anomaly_model)
     return 0;
   return sg_anomaly_model_vocab_size(gate->anomaly_model);
 }
@@ -1103,7 +1291,7 @@ size_t sg_gate_anomaly_vocab_size(const sg_gate_t *gate) {
 size_t sg_cpl_token_variants_at(const char *pattern, size_t edit_pos,
                                 st_token_variant_t *out_variants,
                                 size_t max_variants) {
-  if (!pattern || !out_variants || max_variants == 0)
+  if (max_variants == 0)
     return 0;
   if (pattern[0] == '\0')
     return 0;
@@ -1201,43 +1389,31 @@ static sg_error_t policy_load_error(st_error_t error) {
 }
 
 sg_error_t sg_gate_load_policy(sg_gate_t *gate, const char *path) {
-  if (!gate || !path)
-    return SG_ERR_INVALID;
   return policy_load_error(
       st_policy_load(gate->policy, path, /*clear_first=*/false));
 }
 
 sg_error_t sg_gate_save_policy(const sg_gate_t *gate, const char *path) {
-  if (!gate || !path)
-    return SG_ERR_INVALID;
   return policy_mutation_error(st_policy_save(gate->policy, path));
 }
 
 sg_error_t sg_gate_add_allow_netpattern(sg_gate_t *gate,
                                         const char *netpattern) {
-  if (!gate)
-    return SG_ERR_INVALID;
   return gate_add_netpattern(gate->policy, netpattern);
 }
 
 sg_error_t sg_gate_remove_allow_netpattern(sg_gate_t *gate,
                                            const char *netpattern) {
-  if (!gate)
-    return SG_ERR_INVALID;
   return gate_remove_netpattern(gate->policy, netpattern);
 }
 
 sg_error_t sg_gate_batch_add_allow_netpatterns(sg_gate_t *gate,
                                                const char *const *netpatterns,
                                                size_t count) {
-  if (!gate)
-    return SG_ERR_INVALID;
   return gate_batch_add_netpatterns(gate->policy, netpatterns, count);
 }
 
 sg_error_t sg_gate_add_allow_cpl(sg_gate_t *gate, const char *pattern) {
-  if (!gate || !pattern)
-    return SG_ERR_INVALID;
   st_netpattern_t netpattern = {0};
   st_error_t error = st_netpattern_from_cpl_owned(pattern, &netpattern);
   sg_error_t result =
@@ -1251,8 +1427,6 @@ sg_error_t sg_gate_add_allow_cpl(sg_gate_t *gate, const char *pattern) {
 }
 
 sg_error_t sg_gate_remove_allow_cpl(sg_gate_t *gate, const char *pattern) {
-  if (!gate || !pattern)
-    return SG_ERR_INVALID;
   st_netpattern_t netpattern = {0};
   st_error_t error = st_netpattern_from_cpl_owned(pattern, &netpattern);
   sg_error_t result =
@@ -1266,36 +1440,26 @@ sg_error_t sg_gate_remove_allow_cpl(sg_gate_t *gate, const char *pattern) {
 }
 
 size_t sg_gate_allow_rule_count(const sg_gate_t *gate) {
-  if (!gate)
-    return 0;
   return st_policy_rule_count(gate->policy);
 }
 
 sg_error_t sg_gate_add_deny_netpattern(sg_gate_t *gate,
                                        const char *netpattern) {
-  if (!gate)
-    return SG_ERR_INVALID;
   return gate_add_netpattern(gate->deny_policy, netpattern);
 }
 
 sg_error_t sg_gate_remove_deny_netpattern(sg_gate_t *gate,
                                           const char *netpattern) {
-  if (!gate)
-    return SG_ERR_INVALID;
   return gate_remove_netpattern(gate->deny_policy, netpattern);
 }
 
 sg_error_t sg_gate_batch_add_deny_netpatterns(sg_gate_t *gate,
                                               const char *const *netpatterns,
                                               size_t count) {
-  if (!gate)
-    return SG_ERR_INVALID;
   return gate_batch_add_netpatterns(gate->deny_policy, netpatterns, count);
 }
 
 sg_error_t sg_gate_add_deny_cpl(sg_gate_t *gate, const char *pattern) {
-  if (!gate || !pattern)
-    return SG_ERR_INVALID;
   st_netpattern_t netpattern = {0};
   st_error_t error = st_netpattern_from_cpl_owned(pattern, &netpattern);
   sg_error_t result =
@@ -1309,8 +1473,6 @@ sg_error_t sg_gate_add_deny_cpl(sg_gate_t *gate, const char *pattern) {
 }
 
 sg_error_t sg_gate_remove_deny_cpl(sg_gate_t *gate, const char *pattern) {
-  if (!gate || !pattern)
-    return SG_ERR_INVALID;
   st_netpattern_t netpattern = {0};
   st_error_t error = st_netpattern_from_cpl_owned(pattern, &netpattern);
   sg_error_t result =
@@ -1324,56 +1486,15 @@ sg_error_t sg_gate_remove_deny_cpl(sg_gate_t *gate, const char *pattern) {
 }
 
 size_t sg_gate_deny_rule_count(const sg_gate_t *gate) {
-  if (!gate)
-    return 0;
   return st_policy_rule_count(gate->deny_policy);
 }
 
 /* --- INTERNAL: TOKEN EXPANSION HELPERS --- */
 
-static bool extract_var_name(const char *tok, size_t len, const char **name,
-                             size_t *name_length) {
-  if (len < 2 || tok[0] != '$')
-    return false;
-
-  size_t start = 1;
-  size_t end = len;
-
-  if (len > 3 && tok[1] == '{' && tok[len - 1] == '}') {
-    start = 2;
-    end = len - 1;
-  }
-
-  size_t nlen = end - start;
-  if (nlen == 0)
-    return false;
-
-  for (size_t i = start; i < end; i++) {
-    char c = tok[i];
-    if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-          (c >= '0' && c <= '9') || c == '_'))
-      return false;
-  }
-
-  *name = tok + start;
-  *name_length = nlen;
-  return true;
-}
-
-static bool has_glob_chars(const char *tok, size_t len) {
-  for (size_t i = 0; i < len; i++) {
-    if (tok[i] == '*' || tok[i] == '?' || tok[i] == '[')
-      return true;
-  }
-  return false;
-}
-
 /* --- INTERNAL: BUILD COMMAND STRING WITH OPTIONAL EXPANSION --- */
 
 static bool measure_expansion_display(const char *encoded, size_t length,
                                       size_t *display_length) {
-  if (!display_length)
-    return false;
   shell_netstring_iter_t iter;
   if (shell_netstring_iter_init(&iter, encoded, length) != SHELL_NETSTRING_OK)
     return false;
@@ -1403,20 +1524,12 @@ static bool measure_expansion_display(const char *encoded, size_t length,
   return true;
 }
 
-static bool write_expansion_display(const char *encoded, size_t length,
-                                    char *display, size_t display_size,
-                                    size_t *written) {
-  if (written)
-    *written = 0;
-  if (!display || !written)
-    return false;
-  size_t measured = 0;
-  if (!measure_expansion_display(encoded, length, &measured) ||
-      measured >= display_size)
-    return false;
+/* The first pass validated this immutable expansion and reserved exactly its
+ * measured display length plus a terminator. No additional preflight scan. */
+static void write_expansion_display(const char *encoded, size_t length,
+                                    char *display) {
   shell_netstring_iter_t iter;
-  if (shell_netstring_iter_init(&iter, encoded, length) != SHELL_NETSTRING_OK)
-    return false;
+  (void)shell_netstring_iter_init(&iter, encoded, length);
   size_t used = 0, count = 0;
   shell_netstring_view_t view;
   while (shell_netstring_iter_next(&iter, &view) == SHELL_NETSTRING_OK) {
@@ -1437,8 +1550,6 @@ static bool write_expansion_display(const char *encoded, size_t length,
     count++;
   }
   display[used] = '\0';
-  *written = used;
-  return true;
 }
 
 typedef struct {
@@ -1450,12 +1561,6 @@ typedef struct {
   size_t display_length;
   bool expanded;
 } command_word_t;
-
-static bool valid_expansion_netargv(const char *netargv, size_t length) {
-  return (netargv != NULL || length == 0) &&
-         (length == 0 || shell_netstring_validate(netargv, length, NULL) ==
-                             SHELL_NETSTRING_OK);
-}
 
 static const char *build_cmd_string(const shell_dep_cmd_t *cmd,
                                     buf_writer_t *bw, const sg_gate_t *gate,
@@ -1483,8 +1588,8 @@ static const char *build_cmd_string(const shell_dep_cmd_t *cmd,
     if (gate->expand_var_netargv_fn) {
       const char *var_name = NULL;
       size_t var_name_length = 0;
-      if (extract_var_name(word->text, word->text_length, &var_name,
-                           &var_name_length)) {
+      if (shell_tokenizer_word_parameter_name(word->text, word->text_length,
+                                              &var_name, &var_name_length)) {
         sg_expand_status_t status = gate->expand_var_netargv_fn(
             var_name, var_name_length, &word->expansion_netargv,
             &word->expansion_length, gate->expand_var_netargv_ctx);
@@ -1496,7 +1601,7 @@ static const char *build_cmd_string(const shell_dep_cmd_t *cmd,
       }
     }
     if (!word->expanded && gate->expand_glob_netargv_fn &&
-        has_glob_chars(word->text, word->text_length)) {
+        shell_tokenizer_word_has_glob(word->text, word->text_length)) {
       sg_expand_status_t status = gate->expand_glob_netargv_fn(
           word->text, word->text_length, &word->expansion_netargv,
           &word->expansion_length, gate->expand_glob_netargv_ctx);
@@ -1508,11 +1613,9 @@ static const char *build_cmd_string(const shell_dep_cmd_t *cmd,
     }
 
     if (word->expanded) {
-      if (!valid_expansion_netargv(word->expansion_netargv,
-                                   word->expansion_length) ||
-          !measure_expansion_display(
-              word->expansion_netargv ? word->expansion_netargv : "",
-              word->expansion_length, &word->display_length)) {
+      if (!measure_expansion_display(word->expansion_netargv,
+                                     word->expansion_length,
+                                     &word->display_length)) {
         *build_error = SG_ERR_EXPAND;
         return NULL;
       }
@@ -1532,12 +1635,14 @@ static const char *build_cmd_string(const shell_dep_cmd_t *cmd,
       bw_mark_overflow(bw);
       return NULL;
     }
-    if (display_total > SIZE_MAX - word->display_length - (i != 0) ||
+    size_t separator_length = i != 0;
+    if (word->display_length > SIZE_MAX - separator_length ||
+        display_total > SIZE_MAX - separator_length - word->display_length ||
         net_total > SIZE_MAX - record_length) {
       bw_mark_overflow(bw);
       return NULL;
     }
-    display_total += (i != 0) + word->display_length;
+    display_total += separator_length + word->display_length;
     net_total += record_length;
   }
 
@@ -1557,16 +1662,9 @@ static const char *build_cmd_string(const shell_dep_cmd_t *cmd,
     if (i)
       display[display_used++] = ' ';
     if (word->expanded) {
-      size_t written = 0;
-      if (!write_expansion_display(
-              word->expansion_netargv ? word->expansion_netargv : "",
-              word->expansion_length, display + display_used,
-              word->display_length + 1, &written) ||
-          written != word->display_length) {
-        *build_error = SG_ERR_EXPAND;
-        return NULL;
-      }
-      display_used += written;
+      write_expansion_display(word->expansion_netargv, word->expansion_length,
+                              display + display_used);
+      display_used += word->display_length;
       if (word->expansion_length) {
         memcpy(encoded + encoded_used, word->expansion_netargv,
                word->expansion_length);
@@ -1836,112 +1934,62 @@ static bool sg_env_name_found(const shell_dep_doc_t *doc,
   return false;
 }
 
-/* Graph document paths retain their original source spelling for diagnostics.
- * Shellsplit traverses an isolated source word without materializing it, so
- * path rules share canonical argv's quote, escape, and ANSI-C semantics. */
-static void sg_visit_decoded_word(const char *word, uint32_t word_len,
-                                  shell_decoded_word_visitor_t visitor,
-                                  void *context) {
-  size_t ignored = 0;
-  (void)shell_visit_decoded_word(word, word_len, visitor, context, &ignored);
-}
+/* FILE documents retain diagnostic source spelling, but absolute configured
+ * paths describe execution identities. Use recorded CWD and static quote
+ * removal once for this lookup, in the eval workspace no longer used by the
+ * graph builder. Relative prefix entries retain source-spelling semantics.
+ * If identity is unavailable, the original decoded-spelling heuristic still
+ * applies; it never supplies an invented CWD for an unresolved path. */
+typedef struct {
+  const char *decoded;
+  size_t decoded_length;
+  const char *identity;
+  size_t length;
+  bool known;
+  bool absolute;
+} sg_file_path_t;
 
 typedef struct {
-  const char *prefix;
-  size_t prefix_len;
-  size_t decoded_len;
-  char first_after_prefix;
-  bool matches;
-} sg_decoded_prefix_match_t;
+  char *decoded;
+  bool has_nul;
+} sg_path_decode_t;
 
-static bool sg_decoded_prefix_visit(unsigned char byte, size_t decoded_pos,
-                                    void *context) {
-  sg_decoded_prefix_match_t *match = context;
-  if (decoded_pos < match->prefix_len &&
-      byte != (unsigned char)match->prefix[decoded_pos]) {
-    match->matches = false;
-    return false;
-  }
-  if (decoded_pos == match->prefix_len)
-    match->first_after_prefix = byte;
-  match->decoded_len = decoded_pos + 1;
+static SHELL_NONNULL(3) bool sg_path_decode_byte(unsigned char byte,
+                                                 size_t position,
+                                                 void *context) {
+  sg_path_decode_t *decode = context;
+  SG_PATH_DECODED();
+  decode->decoded[position] = (char)byte;
+  decode->has_nul |= byte == 0;
   return true;
 }
 
-static bool sg_decoded_path_found(const char *word, uint32_t word_len,
-                                  const char *const *sorted_paths,
-                                  uint32_t count, uint32_t *out_idx) {
-  for (uint32_t i = 0; i < count; i++) {
-    const char *prefix = sorted_paths[i];
-    size_t prefix_len = strlen(prefix);
-    if (prefix_len == 0)
-      continue;
-
-    sg_decoded_prefix_match_t match = {
-        .prefix = prefix,
-        .prefix_len = prefix_len,
-        .matches = true,
-    };
-    sg_visit_decoded_word(word, word_len, sg_decoded_prefix_visit, &match);
-    bool exact = match.decoded_len == prefix_len;
-    bool child =
-        match.decoded_len > prefix_len &&
-        (prefix[prefix_len - 1] == '/' || match.first_after_prefix == '/');
-    if (match.matches && (exact || child)) {
-      *out_idx = i;
-      return true;
-    }
+/* Decode and normalize only the operand, never its shared CWD. Returned views
+ * borrow scratch until its next use. Decoding/normalization cannot expand an
+ * isolated word beyond its source length (plus the terminating NUL). */
+static SHELL_NONNULL(1, 2) sg_file_path_t
+    sg_file_path_prepare(const shell_dep_doc_t *doc, char *scratch,
+                         size_t capacity) {
+  size_t decoded_capacity = capacity / 2;
+  char *identity = scratch + decoded_capacity;
+  sg_file_path_t path = {.decoded = scratch, .identity = identity};
+  sg_path_decode_t decode = {.decoded = scratch};
+  bool is_static =
+      shell_visit_static_word(doc->path, doc->path_len, sg_path_decode_byte,
+                              &decode, &path.decoded_length);
+  if (!is_static)
+    (void)shell_visit_decoded_word(doc->path, doc->path_len,
+                                   sg_path_decode_byte, &decode,
+                                   &path.decoded_length);
+  path.absolute = is_static && path.decoded_length != 0 && scratch[0] == '/';
+  path.known = is_static && path.decoded_length != 0 && !decode.has_nul &&
+               (path.absolute || doc->cwd_known);
+  if (path.known) {
+    SG_PATH_IDENTITY(path.decoded_length);
+    memcpy(identity, scratch, path.decoded_length);
+    path.length = shell_dep_file_path_normalize(identity, path.decoded_length);
   }
-  return false;
-}
-
-typedef struct {
-  const char *needle;
-  size_t needle_len;
-  size_t matched_len;
-  bool found;
-} sg_decoded_contains_match_t;
-
-/* Return the longest proper prefix of needle[0, matched_len) that is also a
- * suffix. Configuration values are small path fragments, so recomputing this
- * fallback avoids allocating a KMP table for every graph document. */
-static size_t sg_decoded_match_fallback(const char *needle,
-                                        size_t matched_len) {
-  for (size_t candidate = matched_len - 1; candidate > 0; candidate--) {
-    if (memcmp(needle, needle + matched_len - candidate, candidate) == 0)
-      return candidate;
-  }
-  return 0;
-}
-
-static bool sg_decoded_contains_visit(unsigned char byte, size_t decoded_pos,
-                                      void *context) {
-  (void)decoded_pos;
-  sg_decoded_contains_match_t *match = context;
-  while (match->matched_len > 0 &&
-         byte != (unsigned char)match->needle[match->matched_len])
-    match->matched_len =
-        sg_decoded_match_fallback(match->needle, match->matched_len);
-  if (byte == (unsigned char)match->needle[match->matched_len])
-    match->matched_len++;
-  if (match->matched_len == match->needle_len) {
-    match->found = true;
-    return false;
-  }
-  return true;
-}
-
-static bool sg_decoded_path_contains(const char *word, uint32_t word_len,
-                                     const char *needle) {
-  size_t needle_len = strlen(needle);
-  if (needle_len == 0)
-    return false;
-  sg_decoded_contains_match_t match = {
-      .needle = needle,
-      .needle_len = needle_len,
-  };
-  sg_visit_decoded_word(word, word_len, sg_decoded_contains_visit, &match);
-  return match.found;
+  return path;
 }
 
 static bool tok_equals(const char *tok, uint32_t tok_len, const char *str) {
@@ -2108,13 +2156,11 @@ static bool sg_word_starts_dash(const char *word, uint32_t word_len) {
  * building the graph. Use that one interpretation for violation names too;
  * policy evaluation continues to receive the original unmodified argv.
  * `builtin external-name` does not execute the external utility. */
-static bool sg_effective_command_word(const shell_dep_node_t *node,
-                                      const char **word, uint32_t *length,
-                                      uint32_t *index) {
-  if (!node || node->type != SHELL_NODE_CMD || !word || !length || !index ||
-      !node->cmd.effective_command_known ||
-      node->cmd.effective_command_wrapper == SHELL_DEP_COMMAND_BUILTIN ||
-      node->cmd.effective_command_token >= node->cmd.token_count)
+static SHELL_NONNULL(1, 2, 3, 4) bool sg_effective_command_word(
+    const shell_dep_node_t *node, const char **word, uint32_t *length,
+    uint32_t *index) {
+  if (node->type != SHELL_NODE_CMD || !node->cmd.effective_command_known ||
+      node->cmd.effective_command_wrapper == SHELL_DEP_COMMAND_BUILTIN)
     return false;
   *index = node->cmd.effective_command_token;
   *word = node->cmd.tokens[*index];
@@ -2219,138 +2265,749 @@ static void emit_violation(sg_violation_t *viol, uint32_t *count, uint32_t max,
   v->detail = detail;
 }
 
-static bool has_control_flow_path(const shell_dep_graph_t *g, uint32_t from,
-                                  uint32_t to) {
-  if (from == to)
-    return true;
-  if (g->node_count > SHELL_DEP_MAX_NODES)
-    return false;
-  bool visited[SHELL_DEP_MAX_NODES] = {false};
-  uint32_t stack[SHELL_DEP_MAX_NODES];
+#define SG_NODE_WORDS ((SHELL_DEP_MAX_NODES + 63) / 64)
 
-  size_t sp = 0;
-  stack[sp++] = from;
-  visited[from] = true;
+enum {
+  SG_FILE_PATH_SENSITIVE_WRITE = 1u << 0,
+  SG_FILE_PATH_SENSITIVE_DIR = 1u << 1,
+  SG_FILE_PATH_SENSITIVE_READ = 1u << 2,
+  SG_FILE_PATH_PROFILE = 1u << 3,
+  SG_FILE_PATH_SECRET = 1u << 4,
+  /* Two roots distinguish identities anchored at an absolute initial CWD
+   * from identities whose initial CWD is itself relative. Inserting one new
+   * identity creates at most one split and one leaf. */
+  SG_FILE_IDENTITY_ROOTS = 2,
+  SG_FILE_IDENTITY_TRIE_NODES =
+      SG_FILE_IDENTITY_ROOTS + 5 * SHELL_DEP_MAX_NODES,
+};
 
-  while (sp > 0) {
-    uint32_t cur = stack[--sp];
-    if (cur == to)
-      return true;
-    for (uint32_t i = 0; i < g->edge_count; i++) {
-      const shell_dep_edge_t *e = &g->edges[i];
-      if (e->from != cur)
-        continue;
-      if (e->type != SHELL_EDGE_SEQ && e->type != SHELL_EDGE_AND &&
-          e->type != SHELL_EDGE_OR && e->type != SHELL_EDGE_PIPE &&
-          e->type != SHELL_EDGE_BACKGROUND && e->type != SHELL_EDGE_GROUP)
-        continue;
-      if (!visited[e->to]) {
-        visited[e->to] = true;
-        stack[sp++] = e->to;
-      }
-    }
+_Static_assert(SG_FILE_IDENTITY_TRIE_NODES <= UINT16_MAX,
+               "file identity trie indexes must fit their stored type");
+
+/* State at an exact trie position. End-of-input prefix acceptance is separate:
+ * /tmp must not make /tmp-more match. DFA states span CWD/operand boundaries.
+ */
+typedef struct {
+  size_t length;
+  uint32_t flags, prefixes[3];
+  size_t fragments[2][SG_VIOL_MAX_PATHS];
+} sg_file_match_t;
+
+static SHELL_NONNULL(1, 3) const
+    char *const *sg_path_prefix_list(const sg_gate_t *gate, unsigned list,
+                                     uint32_t *count) {
+  const sg_violation_config_t *config = &gate->viol_config;
+  if (list == 0) {
+    *count = config->sensitive_write_path_count;
+    return config->sensitive_write_paths;
   }
-  return false;
+  if (list == 1) {
+    *count = config->sensitive_dir_count;
+    return config->sensitive_dirs;
+  }
+  *count = config->sensitive_read_path_count;
+  return config->sensitive_read_paths;
 }
 
-/* Group-owned I/O is real context for every contained command, but it remains
- * attached to the GROUP node in the dependency graph. Derive that context at
- * evaluation time instead of inventing command-to-document edges. */
-static void sg_group_context(const shell_dep_graph_t *graph,
-                             uint32_t command_index, const uint32_t *node_viols,
-                             const uint32_t *node_write_count,
-                             const uint32_t *node_read_count,
-                             uint32_t *violations, uint32_t *write_count,
-                             uint32_t *read_count) {
-  bool visited[SHELL_DEP_MAX_NODES] = {false};
-  uint32_t stack[SHELL_DEP_MAX_NODES];
-  size_t stack_count = 0;
-  stack[stack_count++] = command_index;
-  while (stack_count > 0) {
-    uint32_t child = stack[--stack_count];
-    for (uint32_t i = 0; i < graph->edge_count; i++) {
-      const shell_dep_edge_t *edge = &graph->edges[i];
-      if (edge->type != SHELL_EDGE_GROUP || edge->to != child ||
-          graph->nodes[edge->from].type != SHELL_NODE_GROUP ||
-          visited[edge->from])
-        continue;
-      visited[edge->from] = true;
-      *violations |= node_viols[edge->from];
-      *write_count += node_write_count[edge->from];
-      *read_count += node_read_count[edge->from];
-      if (stack_count < SHELL_DEP_MAX_NODES)
-        stack[stack_count++] = edge->from;
-    }
+/* Modes 1/2 select absolute/relative configuration prefixes. Absolute fragments
+ * use normalized absolute identities when known, never a relative-rooted
+ * identity or its raw spelling. Unknown decoded paths retain all heuristics. */
+static SHELL_NONNULL(1, 4) void sg_file_match_init(const sg_gate_t *gate,
+                                                   unsigned prefix_modes,
+                                                   bool absolute_fragments,
+                                                   sg_file_match_t *match) {
+  memset(match, 0, sizeof(*match));
+  for (unsigned list = 0; list < 3; list++) {
+    uint32_t count;
+    const char *const *prefixes = sg_path_prefix_list(gate, list, &count);
+    for (uint32_t i = 0; i < count; i++)
+      if (gate->path_prefix_lengths[list][i] != 0 &&
+          (prefix_modes & (prefixes[i][0] == '/' ? 1u : 2u)))
+        match->prefixes[list] |= UINT32_C(1) << i;
   }
+  const sg_path_fragment_t *fragments[] = {gate->profile_fragments,
+                                           gate->secret_fragments};
+  const uint32_t counts[] = {gate->viol_config.shell_profile_path_count,
+                             gate->viol_config.sensitive_secret_path_count};
+  for (unsigned list = 0; list < 2; list++)
+    for (uint32_t i = 0; i < counts[list]; i++)
+      if (!absolute_fragments && fragments[list][i].text[0] == '/')
+        match->fragments[list][i] = SIZE_MAX;
 }
 
-/* SUBST may start at a CMD/GROUP directly or at an ENDPOINT collector. Follow
- * only data-flow predecessors that feed that dynamic stream so the sensitive
- * substitution signal survives pipelines, nested substitutions, grouping, and
- * multi-producer collection without inventing command-to-command edges. */
-static bool sg_substitution_source_sensitive(const shell_dep_graph_t *graph,
-                                             uint32_t source,
-                                             const sg_violation_config_t *cfg,
-                                             uint32_t *document_index) {
-  bool visited[SHELL_DEP_MAX_NODES] = {false};
-  uint32_t stack[SHELL_DEP_MAX_NODES];
-  size_t stack_count = 0;
-  if (source >= graph->node_count)
-    return false;
-  stack[stack_count++] = source;
-  while (stack_count > 0) {
-    uint32_t current = stack[--stack_count];
-    if (visited[current])
+static SHELL_NONNULL(1, 2,
+                     4) void sg_file_match_extend(const sg_gate_t *gate,
+                                                  const char *text,
+                                                  size_t length,
+                                                  sg_file_match_t *match) {
+  for (unsigned list = 0; list < 3; list++) {
+    uint32_t count;
+    const char *const *prefixes = sg_path_prefix_list(gate, list, &count);
+    uint32_t flag = UINT32_C(1) << list;
+    if (match->flags & flag)
       continue;
-    visited[current] = true;
-    const shell_dep_node_t *current_node = &graph->nodes[current];
-    if (current_node->type == SHELL_NODE_DOC &&
-        current_node->doc.kind == SHELL_DOC_FILE) {
-      uint32_t ignored;
-      if (sg_decoded_path_found(current_node->doc.path,
-                                current_node->doc.path_len,
-                                cfg->sensitive_read_paths,
-                                cfg->sensitive_read_path_count, &ignored)) {
-        *document_index = current;
-        return true;
-      }
-    }
-    for (uint32_t ei = 0; ei < graph->edge_count; ei++) {
-      const shell_dep_edge_t *edge = &graph->edges[ei];
-      uint32_t candidate = UINT32_MAX;
-      if (edge->type == SHELL_EDGE_READ && edge->to == current)
-        candidate = edge->from;
-      else if (edge->type == SHELL_EDGE_ARG && edge->from == current)
-        candidate = edge->to;
-      else if ((edge->type == SHELL_EDGE_PIPE ||
-                edge->type == SHELL_EDGE_SUBST) &&
-               edge->to == current)
-        candidate = edge->from;
-      else if (current_node->type == SHELL_NODE_ENDPOINT &&
-               edge->type == SHELL_EDGE_WRITE && edge->to == current)
-        candidate = edge->from;
-      else if (current_node->type == SHELL_NODE_GROUP &&
-               edge->type == SHELL_EDGE_GROUP && edge->from == current)
-        candidate = edge->to;
-      if (candidate == UINT32_MAX)
+    for (uint32_t i = 0; i < count; i++) {
+      uint32_t bit = UINT32_C(1) << i;
+      if (!(match->prefixes[list] & bit))
         continue;
-      if (candidate < graph->node_count && !visited[candidate] &&
-          stack_count < SHELL_DEP_MAX_NODES)
-        stack[stack_count++] = candidate;
+      size_t prefix_length = gate->path_prefix_lengths[list][i];
+      for (size_t j = 0; j < length; j++) {
+        size_t position = match->length + j;
+        if (position == prefix_length) {
+          if (sg_path_byte_equals((unsigned char)text[j], '/'))
+            match->flags |= flag;
+          else
+            match->prefixes[list] &= ~bit;
+          break;
+        }
+        if (!sg_path_byte_equals((unsigned char)text[j],
+                                 (unsigned char)prefixes[i][position])) {
+          match->prefixes[list] &= ~bit;
+          break;
+        }
+        if (position + 1 == prefix_length && prefixes[i][position] == '/') {
+          match->flags |= flag;
+          break;
+        }
+      }
+      if (match->flags & flag)
+        break;
     }
   }
-  return false;
+  const sg_path_fragment_t *fragments[] = {gate->profile_fragments,
+                                           gate->secret_fragments};
+  const uint32_t counts[] = {gate->viol_config.shell_profile_path_count,
+                             gate->viol_config.sensitive_secret_path_count};
+  const uint32_t flags[] = {SG_FILE_PATH_PROFILE, SG_FILE_PATH_SECRET};
+  for (unsigned list = 0; list < 2; list++) {
+    if (match->flags & flags[list])
+      continue;
+    for (uint32_t i = 0; i < counts[list]; i++)
+      if (match->fragments[list][i] != SIZE_MAX &&
+          sg_path_fragment_advance(&fragments[list][i], text, length,
+                                   &match->fragments[list][i])) {
+        match->flags |= flags[list];
+        break;
+      }
+  }
+  match->length += length;
+}
+
+static SHELL_NONNULL(1, 2) uint32_t
+    sg_file_match_flags(const sg_gate_t *gate, const sg_file_match_t *match) {
+  uint32_t flags = match->flags;
+  for (unsigned list = 0; list < 3; list++) {
+    uint32_t candidates = match->prefixes[list];
+    while (candidates) {
+      unsigned i = (unsigned)__builtin_ctz(candidates);
+      candidates &= candidates - 1;
+      if (gate->path_prefix_lengths[list][i] == match->length) {
+        flags |= UINT32_C(1) << list;
+        break;
+      }
+    }
+  }
+  return flags;
+}
+
+typedef struct {
+  size_t offset, length;
+  uint32_t group_plus_one;
+  sg_file_match_t match;
+} sg_file_identity_node_t;
+
+/* Valid constructed graph, immutable throughout evaluation. These indexes
+ * live in the resolver workspace after parsing has released its scratch. */
+typedef struct {
+  uint32_t out_head[SHELL_DEP_MAX_NODES], in_head[SHELL_DEP_MAX_NODES];
+  uint32_t out_next[SHELL_DEP_MAX_EDGES], in_next[SHELL_DEP_MAX_EDGES];
+  uint32_t group_violations[SHELL_DEP_MAX_NODES];
+  uint32_t group_writes[SHELL_DEP_MAX_NODES], group_reads[SHELL_DEP_MAX_NODES];
+  shell_pipeline_time_mode_t group_time[SHELL_DEP_MAX_NODES];
+  uint8_t group_substitution[SHELL_DEP_MAX_NODES];
+  /* Only the suffix is initialized when violation analysis is enabled. */
+  uint32_t sensitive_head[SHELL_DEP_MAX_NODES];
+  uint32_t sensitive_next[SHELL_DEP_MAX_EDGES];
+  uint32_t sensitive_target[SHELL_DEP_MAX_EDGES];
+  uint32_t sensitive_doc[SHELL_DEP_MAX_NODES];
+  uint32_t file_group_count;
+  uint32_t file_identity_group[SHELL_DEP_MAX_NODES];
+  uint32_t file_path_flags[SHELL_DEP_MAX_NODES];
+  uint64_t group_read_targets[SHELL_DEP_MAX_NODES][SG_NODE_WORDS];
+  sg_file_identity_node_t file_identity_nodes[SG_FILE_IDENTITY_TRIE_NODES];
+  uint16_t file_identity_children[SG_FILE_IDENTITY_TRIE_NODES][UINT8_MAX + 1];
+  uint16_t file_identity_node_count;
+  size_t file_identity_pool_used;
+  /* Biased stable trie positions, indexed by installed CWD pool offset. */
+  uint16_t cwd_identity[2][SHELL_DEP_CWD_BUF_SIZE];
+  uint16_t cwd_directory[2][SHELL_DEP_CWD_BUF_SIZE];
+  uint32_t pipe_producer_head[SHELL_DEP_MAX_NODES][SHELL_DEP_MAX_NODES];
+  uint32_t pipe_consumer_head[SHELL_DEP_MAX_NODES][SHELL_DEP_MAX_NODES];
+  uint32_t pipe_producer_next[SHELL_DEP_MAX_NODES];
+  uint32_t pipe_consumer_next[SHELL_DEP_MAX_NODES];
+  uint64_t control_reachable[SHELL_DEP_MAX_NODES][SG_NODE_WORDS];
+} sg_graph_index_t;
+
+/* Reuse the resolver workspace for one decoded FILE view and a persistent,
+ * prefix-compressed canonical-identity pool. The pool shares CWD and path
+ * prefixes across documents, so the source/CWD bound reserves all material
+ * without multiplying it by the node count. */
+static bool sg_eval_workspace_size(size_t command_length, size_t *required) {
+  if (!shell_dep_workspace_size(NULL, required))
+    return false;
+  size_t overhead = sizeof(sg_graph_index_t);
+  size_t cwd_space = SHELL_DEP_CWD_BUF_SIZE + 1u;
+  if (command_length > (SIZE_MAX - overhead) / 4 - cwd_space)
+    return false;
+  size_t path_space = overhead + 4 * (command_length + cwd_space);
+  if (path_space > *required)
+    *required = path_space;
+  return true;
+}
+
+static SHELL_NONNULL(1, 2) void sg_graph_index_build(
+    const shell_dep_graph_t *graph, sg_graph_index_t *index) {
+  memset(index, 0, offsetof(sg_graph_index_t, sensitive_head));
+  for (uint32_t node = 0; node < graph->node_count; node++)
+    index->out_head[node] = index->in_head[node] = UINT32_MAX;
+  for (uint32_t ei = graph->edge_count; ei-- > 0;) {
+    SG_EDGE_WORK();
+    const shell_dep_edge_t *edge = &graph->edges[ei];
+    index->out_next[ei] = index->out_head[edge->from];
+    index->out_head[edge->from] = ei;
+    index->in_next[ei] = index->in_head[edge->to];
+    index->in_head[edge->to] = ei;
+  }
+}
+
+/* Extend an exact identity/CWD cursor in a compressed byte trie. Edge labels
+ * borrow the persistent pool; splitting reuses existing bytes and copies only
+ * the divergent suffix. Direct byte transitions keep lookup linear in supplied
+ * operand/CWD bytes, without revisiting a cached directory prefix. */
+static SHELL_NONNULL(1, 2, 4, 6, 8) bool sg_file_identity_intern(
+    sg_graph_index_t *index, const sg_gate_t *gate, uint16_t parent,
+    const char *text, size_t length, char *pool, size_t pool_capacity,
+    uint16_t *terminal) {
+  size_t position = 0;
+  while (position < length) {
+    unsigned char first = (unsigned char)text[position];
+    uint16_t child = index->file_identity_children[parent][first];
+    if (child == 0) {
+      size_t suffix_length = length - position;
+      if (suffix_length > pool_capacity - index->file_identity_pool_used)
+        return false;
+      uint16_t leaf = index->file_identity_node_count++;
+      size_t offset = index->file_identity_pool_used;
+      SG_PATH_IDENTITY(suffix_length);
+      memcpy(pool + offset, text + position, suffix_length);
+      index->file_identity_pool_used += suffix_length;
+      index->file_identity_nodes[leaf] = (sg_file_identity_node_t){
+          .offset = offset,
+          .length = suffix_length,
+          .match = index->file_identity_nodes[parent].match,
+      };
+      sg_file_match_extend(gate, text + position, suffix_length,
+                           &index->file_identity_nodes[leaf].match);
+      index->file_identity_children[parent][first] = leaf;
+      *terminal = leaf;
+      return true;
+    }
+
+    sg_file_identity_node_t *edge = &index->file_identity_nodes[child];
+    size_t available = length - position;
+    size_t shared = edge->length < available ? edge->length : available;
+    size_t common = 0;
+    while (common < shared) {
+      SG_PATH_IDENTITY(1);
+      if (pool[edge->offset + common] != text[position + common])
+        break;
+      common++;
+    }
+    if (common == edge->length) {
+      position += common;
+      parent = child;
+      continue;
+    }
+
+    bool input_ends = common == available;
+    size_t suffix_length = input_ends ? 0 : available - common;
+    /* First-byte transitions guarantee a nonempty common prefix. At most two
+     * nodes per FILE, two per distinct CWD, and one separator node per CWD fit
+     * the fixed bound. Splitting changes only the incoming edge of an existing
+     * node, not its exact identity or cached predicate/CWD position. */
+    if (suffix_length > pool_capacity - index->file_identity_pool_used)
+      return false;
+    uint16_t middle = index->file_identity_node_count++;
+    index->file_identity_nodes[middle] = (sg_file_identity_node_t){
+        .offset = edge->offset,
+        .length = common,
+        .match = index->file_identity_nodes[parent].match,
+    };
+    sg_file_match_extend(gate, pool + edge->offset, common,
+                         &index->file_identity_nodes[middle].match);
+    index->file_identity_children[parent][first] = middle;
+    edge->offset += common;
+    edge->length -= common;
+    index->file_identity_children[middle][(unsigned char)pool[edge->offset]] =
+        child;
+    if (input_ends) {
+      *terminal = middle;
+    } else {
+      uint16_t leaf = index->file_identity_node_count++;
+      size_t offset = index->file_identity_pool_used;
+      SG_PATH_IDENTITY(suffix_length);
+      memcpy(pool + offset, text + position + common, suffix_length);
+      index->file_identity_pool_used += suffix_length;
+      index->file_identity_nodes[leaf] = (sg_file_identity_node_t){
+          .offset = offset,
+          .length = suffix_length,
+          .match = index->file_identity_nodes[middle].match,
+      };
+      sg_file_match_extend(gate, text + position + common, suffix_length,
+                           &index->file_identity_nodes[leaf].match);
+      index->file_identity_children[middle][(unsigned char)pool[offset]] = leaf;
+      *terminal = leaf;
+    }
+    return true;
+  }
+  *terminal = parent;
+  return true;
+}
+
+/* The installed CWD pool offset is a trusted O(1) cache key. Prepare each
+ * distinct directory once, without allocating or storing repeated full paths.
+ * scratch has space for the bounded CWD plus its NUL. Identity/directory nodes
+ * remain stable even if later absolute operands split trie edge labels. */
+static SHELL_NONNULL(1, 2, 3, 4, 5, 6) bool sg_file_cwd_prepare(
+    sg_graph_index_t *index, const sg_gate_t *gate,
+    const shell_dep_graph_t *graph, const shell_dep_doc_t *doc, char *scratch,
+    char *pool, size_t pool_capacity) {
+  unsigned root = doc->cwd_absolute ? 1u : 0u;
+  if (index->cwd_identity[root][doc->cwd_offset] != 0)
+    return true;
+  const char *cwd = graph->cwd_buf.data + doc->cwd_offset;
+  size_t length = 0;
+  while (cwd[length] != '\0') {
+    SG_PATH_IDENTITY(1);
+    length++;
+  }
+  SG_PATH_IDENTITY(length);
+  memcpy(scratch, cwd, length);
+  /* Identity joining inserts '/' even for an empty retained CWD prefix (also
+   * possible on a capacity-truncated graph). Preserve that lexical separator
+   * without changing the separate absolute/relative provenance root. */
+  if (length == 0) {
+    scratch[0] = '/';
+    length = 1;
+  } else
+    length = shell_dep_file_path_normalize(scratch, length);
+  uint16_t identity, directory;
+  if (!sg_file_identity_intern(index, gate, (uint16_t)root, scratch, length,
+                               pool, pool_capacity, &identity))
+    return false;
+  if (length == 1 && scratch[0] == '.')
+    directory = (uint16_t)root;
+  else if (scratch[length - 1] == '/')
+    directory = identity;
+  else if (!sg_file_identity_intern(index, gate, identity, "/", 1, pool,
+                                    pool_capacity, &directory))
+    return false;
+  index->cwd_identity[root][doc->cwd_offset] = identity + 1;
+  index->cwd_directory[root][doc->cwd_offset] = directory + 1;
+  return true;
+}
+
+static SHELL_NONNULL(1, 2, 3, 4, 5) bool sg_graph_violation_index_build(
+    const shell_dep_graph_t *graph, sg_graph_index_t *index,
+    const sg_gate_t *gate, char *path_scratch, char *identity_pool,
+    size_t path_capacity) {
+  size_t offset = offsetof(sg_graph_index_t, sensitive_head);
+  memset((char *)index + offset, 0, sizeof(*index) - offset);
+  index->file_identity_node_count = SG_FILE_IDENTITY_ROOTS;
+  sg_file_match_init(gate, 0, false, &index->file_identity_nodes[0].match);
+  sg_file_match_init(gate, 1, true, &index->file_identity_nodes[1].match);
+  for (uint32_t node = 0; node < graph->node_count; node++) {
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+    shellsplit_test_metadata_charge(SHELLSPLIT_TEST_WORK_GATE_VIOLATION_INDEX);
+#endif
+    index->sensitive_head[node] = index->sensitive_doc[node] = UINT32_MAX;
+    index->file_identity_group[node] = UINT32_MAX;
+    index->pipe_producer_next[node] = 0;
+    index->pipe_consumer_next[node] = 0;
+    const shell_dep_node_t *item = &graph->nodes[node];
+    if (item->type == SHELL_NODE_DOC && item->doc.kind == SHELL_DOC_FILE) {
+      if (item->doc.cwd_known &&
+          !sg_file_cwd_prepare(index, gate, graph, &item->doc, path_scratch,
+                               identity_pool, path_capacity))
+        return false;
+      sg_file_path_t path =
+          sg_file_path_prepare(&item->doc, path_scratch, path_capacity);
+      uint32_t flags = 0;
+      if (path.known) {
+        uint16_t parent = 1, terminal;
+        size_t length = path.length;
+        if (!path.absolute) {
+          unsigned root = item->doc.cwd_absolute ? 1u : 0u;
+          if (length == 1 && path.identity[0] == '.') {
+            parent = index->cwd_identity[root][item->doc.cwd_offset] - 1;
+            length = 0;
+          } else
+            parent = index->cwd_directory[root][item->doc.cwd_offset] - 1;
+        }
+        if (!sg_file_identity_intern(index, gate, parent, path.identity, length,
+                                     identity_pool, path_capacity, &terminal))
+          return false;
+        sg_file_identity_node_t *identity =
+            &index->file_identity_nodes[terminal];
+        if (identity->group_plus_one == 0)
+          identity->group_plus_one = ++index->file_group_count;
+        index->file_identity_group[node] = identity->group_plus_one - 1;
+        flags = sg_file_match_flags(gate, &identity->match);
+      }
+      sg_file_match_t decoded;
+      sg_file_match_init(gate, path.known ? 2u : 3u, !path.known, &decoded);
+      sg_file_match_extend(gate, path.decoded, path.decoded_length, &decoded);
+      index->file_path_flags[node] =
+          flags | sg_file_match_flags(gate, &decoded);
+      if (index->file_path_flags[node] & SG_FILE_PATH_SENSITIVE_READ)
+        index->sensitive_doc[node] = node;
+    }
+  }
+  memset(index->pipe_producer_head, 0, sizeof(index->pipe_producer_head));
+  memset(index->pipe_consumer_head, 0, sizeof(index->pipe_consumer_head));
+  for (uint32_t ei = graph->edge_count; ei-- > 0;) {
+    SG_EDGE_WORK();
+    const shell_dep_edge_t *edge = &graph->edges[ei];
+    uint32_t document = UINT32_MAX;
+    if (edge->type == SHELL_EDGE_READ &&
+        graph->nodes[edge->from].type == SHELL_NODE_DOC)
+      document = edge->from;
+    else if (edge->type == SHELL_EDGE_ARG &&
+             graph->nodes[edge->to].type == SHELL_NODE_DOC)
+      document = edge->to;
+    if (document != UINT32_MAX &&
+        index->file_identity_group[document] != UINT32_MAX) {
+      uint32_t target = edge->type == SHELL_EDGE_READ ? edge->to : edge->from;
+      uint32_t group = index->file_identity_group[document];
+      index->group_read_targets[group][target / 64] |= UINT64_C(1)
+                                                       << (target % 64);
+    }
+    uint32_t source = UINT32_MAX, target = UINT32_MAX;
+    if (edge->type == SHELL_EDGE_READ || edge->type == SHELL_EDGE_PIPE ||
+        edge->type == SHELL_EDGE_SUBST ||
+        (edge->type == SHELL_EDGE_WRITE &&
+         graph->nodes[edge->to].type == SHELL_NODE_ENDPOINT)) {
+      source = edge->from;
+      target = edge->to;
+    } else if (edge->type == SHELL_EDGE_ARG ||
+               (edge->type == SHELL_EDGE_GROUP &&
+                graph->nodes[edge->from].type == SHELL_NODE_GROUP)) {
+      source = edge->to;
+      target = edge->from;
+    }
+    if (source != UINT32_MAX) {
+      index->sensitive_next[ei] = index->sensitive_head[source];
+      index->sensitive_head[source] = ei;
+      index->sensitive_target[ei] = target;
+    }
+  }
+  for (uint32_t node = 0; node < graph->node_count; node++) {
+    if (graph->nodes[node].type != SHELL_NODE_CMD)
+      continue;
+    const shell_dep_cmd_t *command = &graph->nodes[node].cmd;
+    if (command->pipe_stdout_source < graph->node_count &&
+        command->pipe_stdout_target < graph->node_count) {
+      uint32_t *head = &index->pipe_producer_head[command->pipe_stdout_source]
+                                                 [command->pipe_stdout_target];
+      index->pipe_producer_next[node] = *head;
+      *head = node + 1;
+    }
+    if (command->pipe_stdin_source < graph->node_count &&
+        command->pipe_stdin_target < graph->node_count) {
+      uint32_t *head = &index->pipe_consumer_head[command->pipe_stdin_source]
+                                                 [command->pipe_stdin_target];
+      index->pipe_consumer_next[node] = *head;
+      *head = node + 1;
+    }
+  }
+  return true;
+}
+
+static bool sg_control_flow_edge(shell_dep_edge_type_t type) {
+  return type == SHELL_EDGE_SEQ || type == SHELL_EDGE_AND ||
+         type == SHELL_EDGE_OR || type == SHELL_EDGE_PIPE ||
+         type == SHELL_EDGE_BACKGROUND || type == SHELL_EDGE_GROUP;
+}
+
+/* Build reachability once. The Shellsplit graph contract guarantees that
+ * control and containment edges form a DAG. A reverse topological pass can
+ * therefore propagate target bitsets without searching the control graph for
+ * each write/read candidate; callers never supply constructed graphs here. */
+static SHELL_NONNULL(1, 2) void sg_control_reachability_prepare(
+    const shell_dep_graph_t *graph, sg_graph_index_t *index) {
+  uint32_t indegree[SHELL_DEP_MAX_NODES] = {0};
+  uint32_t queue[SHELL_DEP_MAX_NODES];
+  uint32_t order[SHELL_DEP_MAX_NODES];
+  uint32_t head = 0, tail = 0, order_count = 0;
+  for (uint32_t node = 0; node < graph->node_count; node++)
+    index->control_reachable[node][node / 64] |= UINT64_C(1) << (node % 64);
+  for (uint32_t ei = 0; ei < graph->edge_count; ei++) {
+    SG_EDGE_WORK();
+    const shell_dep_edge_t *edge = &graph->edges[ei];
+    if (!sg_control_flow_edge(edge->type))
+      continue;
+    indegree[edge->to]++;
+    index->control_reachable[edge->from][edge->to / 64] |= UINT64_C(1)
+                                                           << (edge->to % 64);
+  }
+  for (uint32_t node = 0; node < graph->node_count; node++)
+    if (indegree[node] == 0)
+      queue[tail++] = node;
+  while (head < tail) {
+    uint32_t node = queue[head++];
+    order[order_count++] = node;
+    for (uint32_t ei = index->out_head[node]; ei != UINT32_MAX;
+         ei = index->out_next[ei]) {
+      SG_EDGE_WORK();
+      const shell_dep_edge_t *edge = &graph->edges[ei];
+      if (sg_control_flow_edge(edge->type) && --indegree[edge->to] == 0)
+        queue[tail++] = edge->to;
+    }
+  }
+
+  for (uint32_t position = order_count; position-- > 0;) {
+    uint32_t node = order[position];
+    uint64_t *reachable = index->control_reachable[node];
+    for (uint32_t ei = index->out_head[node]; ei != UINT32_MAX;
+         ei = index->out_next[ei]) {
+      SG_EDGE_WORK();
+      const shell_dep_edge_t *edge = &graph->edges[ei];
+      if (!sg_control_flow_edge(edge->type))
+        continue;
+      const uint64_t *child = index->control_reachable[edge->to];
+      for (uint32_t word = 0; word < SG_NODE_WORDS; word++)
+        reachable[word] |= child[word];
+    }
+  }
+  /* Outer successors run after a compound completes. Inherit only paths
+   * outside that compound: containment must not invent backward flow between
+   * siblings. Both passes visit containment edges once. */
+  uint64_t descendants[SHELL_DEP_MAX_NODES][SG_NODE_WORDS] = {{0}};
+  for (uint32_t position = order_count; position-- > 0;) {
+    uint32_t node = order[position];
+    descendants[node][node / 64] |= UINT64_C(1) << (node % 64);
+    for (uint32_t ei = index->out_head[node]; ei != UINT32_MAX;
+         ei = index->out_next[ei]) {
+      SG_EDGE_WORK();
+      const shell_dep_edge_t *edge = &graph->edges[ei];
+      if (edge->type != SHELL_EDGE_GROUP ||
+          graph->nodes[node].type != SHELL_NODE_GROUP)
+        continue;
+      for (uint32_t word = 0; word < SG_NODE_WORDS; word++)
+        descendants[node][word] |= descendants[edge->to][word];
+    }
+  }
+  for (uint32_t position = 0; position < order_count; position++) {
+    uint32_t node = order[position];
+    if (graph->nodes[node].type != SHELL_NODE_GROUP)
+      continue;
+    for (uint32_t ei = index->out_head[node]; ei != UINT32_MAX;
+         ei = index->out_next[ei]) {
+      SG_EDGE_WORK();
+      const shell_dep_edge_t *edge = &graph->edges[ei];
+      if (edge->type != SHELL_EDGE_GROUP)
+        continue;
+      for (uint32_t word = 0; word < SG_NODE_WORDS; word++)
+        index->control_reachable[edge->to][word] |=
+            index->control_reachable[node][word] & ~descendants[node][word];
+    }
+  }
+}
+
+typedef struct {
+  uint32_t group_parent[SHELL_DEP_MAX_NODES];
+  bool timing_edge[SHELL_DEP_MAX_NODES];
+  bool timing_compatible[SHELL_DEP_MAX_NODES];
+  bool unsafe_group_ancestor[SHELL_DEP_MAX_NODES];
+} sg_policy_graph_summary_t;
+
+/* Summarize the graph once before policy counting. Group-owned redirects can
+ * be authorized through any contained real simple command, while a group
+ * containing only structural empty-time endpoints has no argv policy subject
+ * and must fail closed. The two queue passes propagate subjects upward and
+ * unsafe redirect-only ancestry downward without repeated edge traversals. */
+static SHELL_NONNULL(1, 2) void sg_policy_graph_summarize(
+    const shell_dep_graph_t *graph, sg_policy_graph_summary_t *summary) {
+  bool observable_io[SHELL_DEP_MAX_NODES] = {false};
+  bool group_has_subject[SHELL_DEP_MAX_NODES] = {false};
+  uint32_t group_children[SHELL_DEP_MAX_NODES] = {0};
+  uint32_t first_group_child[SHELL_DEP_MAX_NODES];
+  uint32_t next_group_sibling[SHELL_DEP_MAX_NODES];
+  for (uint32_t node = 0; node < graph->node_count; node++) {
+    summary->group_parent[node] = UINT32_MAX;
+    summary->timing_compatible[node] = true;
+    first_group_child[node] = UINT32_MAX;
+    next_group_sibling[node] = UINT32_MAX;
+  }
+
+  for (uint32_t edge_index = 0; edge_index < graph->edge_count; edge_index++) {
+    SG_EDGE_WORK();
+    const shell_dep_edge_t *edge = &graph->edges[edge_index];
+    bool observable =
+        edge->type == SHELL_EDGE_READ || edge->type == SHELL_EDGE_WRITE ||
+        edge->type == SHELL_EDGE_APPEND || edge->type == SHELL_EDGE_FD_OPEN ||
+        edge->type == SHELL_EDGE_FD_CLOSE;
+    if (observable) {
+      observable_io[edge->from] = true;
+      observable_io[edge->to] = true;
+    }
+    if (edge->type == SHELL_EDGE_GROUP) {
+      summary->group_parent[edge->to] = edge->from;
+      if (graph->nodes[edge->to].type == SHELL_NODE_CMD &&
+          graph->nodes[edge->to].cmd.token_count > 0)
+        group_has_subject[edge->from] = true;
+      if (graph->nodes[edge->to].type == SHELL_NODE_GROUP) {
+        group_children[edge->from]++;
+        next_group_sibling[edge->to] = first_group_child[edge->from];
+        first_group_child[edge->from] = edge->to;
+      }
+    }
+
+    uint32_t endpoints[2] = {edge->from, edge->to};
+    for (uint32_t endpoint_index = 0; endpoint_index < 2; endpoint_index++) {
+      uint32_t endpoint = endpoints[endpoint_index];
+      if (graph->nodes[endpoint].type != SHELL_NODE_CMD ||
+          graph->nodes[endpoint].cmd.token_count != 0)
+        continue;
+      bool allowed =
+          (edge->type == SHELL_EDGE_TIME && edge->to == endpoint) ||
+          (edge->type == SHELL_EDGE_GROUP && edge->to == endpoint &&
+           graph->nodes[edge->from].type == SHELL_NODE_GROUP) ||
+          edge->type == SHELL_EDGE_SEQ || edge->type == SHELL_EDGE_AND ||
+          edge->type == SHELL_EDGE_OR || edge->type == SHELL_EDGE_BACKGROUND;
+      if (!allowed)
+        summary->timing_compatible[endpoint] = false;
+    }
+    if (edge->type == SHELL_EDGE_TIME && edge->to < graph->node_count)
+      summary->timing_edge[edge->to] = true;
+  }
+
+  uint32_t queue[SHELL_DEP_MAX_NODES];
+  uint32_t head = 0, tail = 0;
+  for (uint32_t node = 0; node < graph->node_count; node++)
+    if (graph->nodes[node].type == SHELL_NODE_GROUP &&
+        group_children[node] == 0)
+      queue[tail++] = node;
+  while (head < tail) {
+    uint32_t group = queue[head++];
+    uint32_t parent = summary->group_parent[group];
+    if (parent == UINT32_MAX)
+      continue;
+    group_has_subject[parent] =
+        group_has_subject[parent] || group_has_subject[group];
+    if (--group_children[parent] == 0)
+      queue[tail++] = parent;
+  }
+
+  head = tail = 0;
+  for (uint32_t node = 0; node < graph->node_count; node++)
+    if (graph->nodes[node].type == SHELL_NODE_GROUP &&
+        summary->group_parent[node] == UINT32_MAX)
+      queue[tail++] = node;
+  while (head < tail) {
+    uint32_t group = queue[head++];
+    uint32_t parent = summary->group_parent[group];
+    summary->unsafe_group_ancestor[group] =
+        (observable_io[group] && !group_has_subject[group]) ||
+        (parent != UINT32_MAX && summary->unsafe_group_ancestor[parent]);
+    for (uint32_t child = first_group_child[group]; child != UINT32_MAX;
+         child = next_group_sibling[child])
+      queue[tail++] = child;
+  }
+}
+
+/* An empty Bash `time` pipeline has a zero-token CMD only so the structural
+ * TIME edge has an execution endpoint. It is policy-neutral only when neither
+ * that endpoint nor an enclosing command group performs I/O without a real
+ * contained argv policy subject. List and containment edges otherwise merely
+ * place the structural endpoint in the surrounding command. */
+static SHELL_NONNULL(1, 2) bool sg_argvless_command_is_empty_timing(
+    const shell_dep_graph_t *graph, const sg_policy_graph_summary_t *summary,
+    uint32_t command_index) {
+  if (graph->nodes[command_index].cmd.pipeline_time_mode ==
+      SHELL_PIPE_TIME_NONE)
+    return false;
+  uint32_t group = summary->group_parent[command_index];
+  return summary->timing_edge[command_index] &&
+         summary->timing_compatible[command_index] &&
+         (group == UINT32_MAX || !summary->unsafe_group_ancestor[group]);
+}
+
+/* Each sensitive FILE is classified once; propagate one diagnostic witness
+ * through the typed data-flow index. A node is enqueued once, so aliases and
+ * cycles cannot multiply work, even when several SUBST queries share it. */
+static SHELL_NONNULL(1, 2) void sg_sensitive_sources_prepare(
+    const shell_dep_graph_t *graph, sg_graph_index_t *index) {
+  uint32_t queue[SHELL_DEP_MAX_NODES];
+  uint32_t head = 0, tail = 0;
+  for (uint32_t node = 0; node < graph->node_count; node++)
+    if (index->sensitive_doc[node] == node)
+      queue[tail++] = node;
+  while (head < tail) {
+    uint32_t source = queue[head++];
+    for (uint32_t ei = index->sensitive_head[source]; ei != UINT32_MAX;
+         ei = index->sensitive_next[ei]) {
+      SG_EDGE_WORK();
+      uint32_t target = index->sensitive_target[ei];
+      if (index->sensitive_doc[target] == UINT32_MAX) {
+        index->sensitive_doc[target] = index->sensitive_doc[source];
+        queue[tail++] = target;
+      }
+    }
+  }
+}
+
+/* Group I/O stays attached to real GROUP nodes. Propagate result context once
+ * down the containment tree; each command then reads its cached ancestry. */
+static SHELL_NONNULL(1, 2, 3, 4, 5, 6) void sg_group_context_prepare(
+    const shell_dep_graph_t *graph, sg_graph_index_t *index,
+    const sg_policy_graph_summary_t *summary, const uint32_t *violations,
+    const uint32_t *writes, const uint32_t *reads) {
+  uint32_t queue[SHELL_DEP_MAX_NODES];
+  uint32_t head = 0, tail = 0;
+  for (uint32_t node = 0; node < graph->node_count; node++)
+    if (graph->nodes[node].type == SHELL_NODE_GROUP &&
+        summary->group_parent[node] == UINT32_MAX)
+      queue[tail++] = node;
+  while (head < tail) {
+    uint32_t parent = queue[head++];
+    for (uint32_t ei = index->out_head[parent]; ei != UINT32_MAX;
+         ei = index->out_next[ei]) {
+      SG_EDGE_WORK();
+      const shell_dep_edge_t *edge = &graph->edges[ei];
+      if (edge->type != SHELL_EDGE_GROUP)
+        continue;
+      uint32_t child = edge->to;
+      index->group_violations[child] =
+          index->group_violations[parent] | violations[parent];
+      index->group_writes[child] = index->group_writes[parent] + writes[parent];
+      index->group_reads[child] = index->group_reads[parent] + reads[parent];
+      shell_pipeline_time_mode_t mode =
+          graph->nodes[parent].group.pipeline_time_mode;
+      index->group_time[child] =
+          mode != SHELL_PIPE_TIME_NONE ? mode : index->group_time[parent];
+      if (graph->nodes[child].type == SHELL_NODE_GROUP)
+        queue[tail++] = child;
+    }
+  }
 }
 
 /* FD_OPEN preserves a redirect's setup-time side effect after its descriptor
  * route has been replaced. It is an output-file effect only when it retains a
  * concrete command/group -> FILE relation; descriptor duplication and input
  * setup deliberately remain topology-only. */
-static bool sg_edge_is_file_output_effect(const shell_dep_graph_t *graph,
-                                          const shell_dep_edge_t *edge) {
-  if (!graph || !edge || edge->from >= graph->node_count ||
-      edge->to >= graph->node_count)
-    return false;
+static SHELL_NONNULL(1, 2) bool sg_edge_is_file_output_effect(
+    const shell_dep_graph_t *graph, const shell_dep_edge_t *edge) {
   const shell_dep_node_t *from = &graph->nodes[edge->from];
   const shell_dep_node_t *to = &graph->nodes[edge->to];
   if ((from->type != SHELL_NODE_CMD && from->type != SHELL_NODE_GROUP) ||
@@ -2363,10 +3020,8 @@ static bool sg_edge_is_file_output_effect(const shell_dep_graph_t *graph,
          (edge->flags & SHELL_DEP_EDGE_FLAG_FD_OPEN_DUP) == 0;
 }
 
-static bool sg_edge_is_output_effect(const shell_dep_graph_t *graph,
-                                     const shell_dep_edge_t *edge) {
-  if (!edge)
-    return false;
+static SHELL_NONNULL(1, 2) bool sg_edge_is_output_effect(
+    const shell_dep_graph_t *graph, const shell_dep_edge_t *edge) {
   return edge->type == SHELL_EDGE_WRITE || edge->type == SHELL_EDGE_APPEND ||
          sg_edge_is_file_output_effect(graph, edge);
 }
@@ -2376,12 +3031,9 @@ static bool sg_edge_is_output_effect(const shell_dep_graph_t *graph,
  * a dynamic pathname can select an input descriptor just as it can select an
  * output descriptor. FD_OPEN_DUP has no document endpoint and must not be
  * mistaken for a pathname-owning redirect. */
-static bool sg_file_setup_consumer(const shell_dep_graph_t *graph,
-                                   const shell_dep_edge_t *edge,
-                                   uint32_t document, uint32_t *consumer) {
-  if (!graph || !edge || !consumer || document >= graph->node_count ||
-      edge->from >= graph->node_count || edge->to >= graph->node_count)
-    return false;
+static SHELL_NONNULL(1, 2, 4) bool sg_file_setup_consumer(
+    const shell_dep_graph_t *graph, const shell_dep_edge_t *edge,
+    uint32_t document, uint32_t *consumer) {
   *consumer = UINT32_MAX;
   if (edge->type == SHELL_EDGE_FD_OPEN &&
       (edge->flags & SHELL_DEP_EDGE_FLAG_FD_OPEN_DUP) != 0)
@@ -2406,11 +3058,10 @@ static bool sg_file_setup_consumer(const shell_dep_graph_t *graph,
  * through its FILE I/O edge or retained FD_OPEN setup, but remains topology
  * only rather than a shell-word inspection dependency. */
 static uint32_t
-sg_substitution_consumers(const shell_dep_graph_t *graph, uint32_t target,
+sg_substitution_consumers(const shell_dep_graph_t *graph,
+                          const sg_graph_index_t *index, uint32_t target,
                           uint32_t edge_flags,
                           uint32_t consumers[SHELL_DEP_MAX_NODES]) {
-  if (target >= graph->node_count)
-    return 0;
   const shell_dep_node_t *node = &graph->nodes[target];
   if (node->type == SHELL_NODE_CMD || node->type == SHELL_NODE_GROUP) {
     consumers[0] = target;
@@ -2420,27 +3071,34 @@ sg_substitution_consumers(const shell_dep_graph_t *graph, uint32_t target,
     return 0;
 
   uint32_t count = 0;
-  for (uint32_t edge_index = 0; edge_index < graph->edge_count; edge_index++) {
-    const shell_dep_edge_t *edge = &graph->edges[edge_index];
-    uint32_t consumer = UINT32_MAX;
-    if ((node->doc.kind == SHELL_DOC_HEREDOC ||
-         node->doc.kind == SHELL_DOC_HERESTRING) &&
-        edge->type == SHELL_EDGE_READ && edge->from == target)
-      consumer = edge->to;
-    else if (node->doc.kind == SHELL_DOC_FILE &&
-             (node->doc.flags & SHELL_DEP_DOC_FLAG_DYNAMIC_NAME) != 0 &&
-             (edge_flags & SHELL_DEP_EDGE_FLAG_SUBST_DYNAMIC_NAME) != 0)
-      (void)sg_file_setup_consumer(graph, edge, target, &consumer);
-    if (consumer >= graph->node_count)
-      continue;
-    shell_dep_node_type_t type = graph->nodes[consumer].type;
-    if (type != SHELL_NODE_CMD && type != SHELL_NODE_GROUP)
-      continue;
-    bool duplicate = false;
-    for (uint32_t previous = 0; previous < count; previous++)
-      duplicate = duplicate || consumers[previous] == consumer;
-    if (!duplicate && count < SHELL_DEP_MAX_NODES)
-      consumers[count++] = consumer;
+  bool seen[SHELL_DEP_MAX_NODES] = {false};
+  for (unsigned incoming = 0; incoming < 2; incoming++) {
+    for (uint32_t edge_index = incoming ? index->in_head[target]
+                                        : index->out_head[target];
+         edge_index != UINT32_MAX;
+         edge_index = incoming ? index->in_next[edge_index]
+                               : index->out_next[edge_index]) {
+      SG_EDGE_WORK();
+      const shell_dep_edge_t *edge = &graph->edges[edge_index];
+      uint32_t consumer = UINT32_MAX;
+      if ((node->doc.kind == SHELL_DOC_HEREDOC ||
+           node->doc.kind == SHELL_DOC_HERESTRING) &&
+          edge->type == SHELL_EDGE_READ && edge->from == target)
+        consumer = edge->to;
+      else if (node->doc.kind == SHELL_DOC_FILE &&
+               (node->doc.flags & SHELL_DEP_DOC_FLAG_DYNAMIC_NAME) != 0 &&
+               (edge_flags & SHELL_DEP_EDGE_FLAG_SUBST_DYNAMIC_NAME) != 0)
+        (void)sg_file_setup_consumer(graph, edge, target, &consumer);
+      if (consumer >= graph->node_count)
+        continue;
+      shell_dep_node_type_t type = graph->nodes[consumer].type;
+      if (type != SHELL_NODE_CMD && type != SHELL_NODE_GROUP)
+        continue;
+      if (!seen[consumer]) {
+        seen[consumer] = true;
+        consumers[count++] = consumer;
+      }
+    }
   }
   return count;
 }
@@ -2454,12 +3112,8 @@ sg_substitution_consumers(const shell_dep_graph_t *graph, uint32_t target,
  * producer. It is nevertheless dynamic topology and must be visible in whole
  * results. Keep this structural distinction in one predicate so whole-result
  * and retained-subcommand passes cannot drift apart. */
-static bool
-sg_edge_is_dynamic_substitution_route(const shell_dep_graph_t *graph,
-                                      const shell_dep_edge_t *edge) {
-  if (!graph || !edge || edge->from >= graph->node_count ||
-      edge->to >= graph->node_count)
-    return false;
+static SHELL_NONNULL(1, 2) bool sg_edge_is_dynamic_substitution_route(
+    const shell_dep_graph_t *graph, const shell_dep_edge_t *edge) {
   if (edge->type == SHELL_EDGE_SUBST)
     return true;
   if (edge->type != SHELL_EDGE_FD_OPEN ||
@@ -2475,9 +3129,10 @@ sg_edge_is_dynamic_substitution_route(const shell_dep_graph_t *graph,
          to == SHELL_NODE_ENDPOINT;
 }
 
-static uint32_t sg_dynamic_substitution_route_consumers(
-    const shell_dep_graph_t *graph, const shell_dep_edge_t *edge,
-    uint32_t consumers[SHELL_DEP_MAX_NODES]) {
+static SHELL_NONNULL(1, 2, 3, 4) uint32_t
+    sg_dynamic_substitution_route_consumers(
+        const shell_dep_graph_t *graph, const sg_graph_index_t *index,
+        const shell_dep_edge_t *edge, uint32_t consumers[SHELL_DEP_MAX_NODES]) {
   if (!sg_edge_is_dynamic_substitution_route(graph, edge))
     return 0;
   if (edge->type == SHELL_EDGE_FD_OPEN &&
@@ -2485,7 +3140,8 @@ static uint32_t sg_dynamic_substitution_route_consumers(
     consumers[0] = edge->to;
     return 1;
   }
-  return sg_substitution_consumers(graph, edge->to, edge->flags, consumers);
+  return sg_substitution_consumers(graph, index, edge->to, edge->flags,
+                                   consumers);
 }
 
 /* --- VIOLATION SCANNING ENGINE --- */
@@ -2545,18 +3201,23 @@ static bool sg_command_is_decoder(const shell_dep_node_t *node,
   return false;
 }
 
-static void sg_violation_scan(
-    const shell_dep_graph_t *graph, const sg_violation_config_t *cfg,
-    buf_writer_t *bw, sg_violation_t *violations, uint32_t max_violations,
-    uint32_t *violation_count, uint32_t *violation_type_flags,
-    uint32_t *violation_dropped, uint32_t *node_viols,
-    uint32_t *cmd_write_count, uint32_t *cmd_read_count,
-    uint32_t *cmd_env_count, void *path_scratch, size_t path_scratch_size) {
+static void
+sg_violation_scan(const shell_dep_graph_t *graph, sg_graph_index_t *index,
+                  const sg_gate_t *gate, buf_writer_t *bw,
+                  sg_violation_t *violations, uint32_t max_violations,
+                  uint32_t *violation_count, uint32_t *violation_type_flags,
+                  uint32_t *violation_dropped, uint32_t *node_viols,
+                  uint32_t *cmd_write_count, uint32_t *cmd_read_count,
+                  uint32_t *cmd_env_count) {
+  const sg_violation_config_t *cfg = &gate->viol_config;
   *violation_count = 0;
   *violation_type_flags = 0;
   *violation_dropped = 0;
+  sg_sensitive_sources_prepare(graph, index);
+  sg_control_reachability_prepare(graph, index);
 
   for (uint32_t ei = 0; ei < graph->edge_count && !bw->overflow; ei++) {
+    SG_EDGE_WORK();
     const shell_dep_edge_t *e = &graph->edges[ei];
     const shell_dep_node_t *from_node = &graph->nodes[e->from];
     const shell_dep_node_t *to_node = &graph->nodes[e->to];
@@ -2576,10 +3237,8 @@ static void sg_violation_scan(
 
     /* --- SG_VIOL_WRITE_SENSITIVE --- */
     if (sg_edge_is_file_output_effect(graph, e)) {
-      uint32_t idx;
-      if (sg_decoded_path_found(to_node->doc.path, to_node->doc.path_len,
-                                cfg->sensitive_write_paths,
-                                cfg->sensitive_write_path_count, &idx)) {
+      uint32_t path_flags = index->file_path_flags[e->to];
+      if (path_flags & SG_FILE_PATH_SENSITIVE_WRITE) {
         const char *desc = bw_printf(bw, "writes to sensitive path");
         const char *det = bw_copy(bw, to_node->doc.path, to_node->doc.path_len);
         emit_violation(violations, violation_count, max_violations,
@@ -2590,10 +3249,7 @@ static void sg_violation_scan(
       }
       /* Profile writes are an effect of redirect setup, regardless of whether
        * the command name is known, is a builtin, or is absent altogether. */
-      for (uint32_t p = 0; p < cfg->shell_profile_path_count; p++) {
-        if (!sg_decoded_path_contains(to_node->doc.path, to_node->doc.path_len,
-                                      cfg->shell_profile_paths[p]))
-          continue;
+      if (path_flags & SG_FILE_PATH_PROFILE) {
         const char *desc = bw_printf(bw, "writing to shell profile/ssh config");
         const char *det = bw_copy(bw, to_node->doc.path, to_node->doc.path_len);
         emit_violation(violations, violation_count, max_violations,
@@ -2601,7 +3257,6 @@ static void sg_violation_scan(
                        e->from, desc, det);
         node_viols[e->from] |= SG_VIOL_PERSISTENCE;
         *violation_type_flags |= SG_VIOL_PERSISTENCE;
-        break;
       }
     }
 
@@ -2636,13 +3291,13 @@ static void sg_violation_scan(
 
     /* --- SG_VIOL_SUBST_SENSITIVE --- */
     if (e->type == SHELL_EDGE_SUBST) {
-      uint32_t doc_idx;
-      if (sg_substitution_source_sensitive(graph, e->from, cfg, &doc_idx)) {
+      uint32_t doc_idx = index->sensitive_doc[e->from];
+      if (doc_idx != UINT32_MAX) {
         const shell_dep_node_t *doc = &graph->nodes[doc_idx];
         *violation_type_flags |= SG_VIOL_SUBST_SENSITIVE;
         uint32_t consumers[SHELL_DEP_MAX_NODES];
         uint32_t consumer_count =
-            sg_substitution_consumers(graph, e->to, e->flags, consumers);
+            sg_substitution_consumers(graph, index, e->to, e->flags, consumers);
         for (uint32_t consumer_index = 0;
              consumer_index < consumer_count && !bw->overflow;
              consumer_index++) {
@@ -2668,17 +3323,16 @@ static void sg_violation_scan(
     if (!sg_command_name_equals(cmd0, cmd0_len, "rm") &&
         !sg_command_name_equals(cmd0, cmd0_len, "rmdir"))
       continue;
-    for (uint32_t ei = 0; ei < graph->edge_count && !bw->overflow; ei++) {
+    for (uint32_t ei = index->out_head[ni]; ei != UINT32_MAX && !bw->overflow;
+         ei = index->out_next[ei]) {
+      SG_EDGE_WORK();
       const shell_dep_edge_t *e = &graph->edges[ei];
-      if (e->from != ni || e->type != SHELL_EDGE_ARG)
+      if (e->type != SHELL_EDGE_ARG)
         continue;
       const shell_dep_node_t *doc = &graph->nodes[e->to];
       if (doc->type != SHELL_NODE_DOC || doc->doc.kind != SHELL_DOC_FILE)
         continue;
-      uint32_t idx;
-      if (sg_decoded_path_found(doc->doc.path, doc->doc.path_len,
-                                cfg->sensitive_dirs, cfg->sensitive_dir_count,
-                                &idx)) {
+      if (index->file_path_flags[e->to] & SG_FILE_PATH_SENSITIVE_DIR) {
         const char *desc = bw_printf(bw, "removal of system directory");
         const char *det = bw_copy(bw, doc->doc.path, doc->doc.path_len);
         emit_violation(violations, violation_count, max_violations,
@@ -2692,59 +3346,44 @@ static void sg_violation_scan(
   }
 
   /* --- SG_VIOL_WRITE_THEN_READ --- */
-  size_t path_capacity = path_scratch_size / 2;
-  char *write_path = path_scratch;
-  char *read_path = write_path ? write_path + path_capacity : NULL;
   for (uint32_t ei = 0; ei < graph->edge_count && !bw->overflow; ei++) {
+    SG_EDGE_WORK();
     const shell_dep_edge_t *e1 = &graph->edges[ei];
     if (!sg_edge_is_file_output_effect(graph, e1))
       continue;
     const shell_dep_node_t *f1 = &graph->nodes[e1->to];
     if (f1->type != SHELL_NODE_DOC || f1->doc.kind != SHELL_DOC_FILE)
       continue;
-    size_t write_path_len = 0;
-    bool write_absolute = false;
-    if (!shell_dep_doc_file_identity_write(graph, &f1->doc, write_path,
-                                           path_capacity, &write_path_len,
-                                           &write_absolute))
+    uint32_t write_doc = e1->to;
+    uint32_t group = index->file_identity_group[write_doc];
+    if (group == UINT32_MAX)
+      continue;
+    const uint64_t *reachable = index->control_reachable[e1->from];
+    const uint64_t *read_targets = index->group_read_targets[group];
+    uint32_t read_cmd = UINT32_MAX;
+    for (uint32_t word = 0; word < SG_NODE_WORDS; word++) {
+      SG_EDGE_WORK();
+      uint64_t candidates = reachable[word] & read_targets[word];
+      if (candidates == 0)
+        continue;
+      uint32_t bit = 0;
+      while ((candidates & UINT64_C(1)) == 0) {
+        candidates >>= 1;
+        bit++;
+      }
+      read_cmd = word * 64 + bit;
+      break;
+    }
+    if (read_cmd == UINT32_MAX)
       continue;
 
-    for (uint32_t ej = 0; ej < graph->edge_count && !bw->overflow; ej++) {
-      const shell_dep_edge_t *e2 = &graph->edges[ej];
-      uint32_t read_cmd;
-      const shell_dep_node_t *f2;
-      if (e2->type == SHELL_EDGE_READ) {
-        read_cmd = e2->to;
-        f2 = &graph->nodes[e2->from];
-      } else if (e2->type == SHELL_EDGE_ARG) {
-        read_cmd = e2->from;
-        f2 = &graph->nodes[e2->to];
-      } else {
-        continue;
-      }
-      if (f2->type != SHELL_NODE_DOC || f2->doc.kind != SHELL_DOC_FILE)
-        continue;
-      size_t read_path_len = 0;
-      bool read_absolute = false;
-      if (!shell_dep_doc_file_identity_write(graph, &f2->doc, read_path,
-                                             path_capacity, &read_path_len,
-                                             &read_absolute) ||
-          write_absolute != read_absolute || write_path_len != read_path_len)
-        continue;
-      if (memcmp(write_path, read_path, write_path_len) != 0)
-        continue;
-
-      if (has_control_flow_path(graph, e1->from, read_cmd)) {
-        const char *desc = bw_printf(bw, "write then read of matching path");
-        const char *det = bw_copy(bw, f1->doc.path, f1->doc.path_len);
-        emit_violation(violations, violation_count, max_violations,
-                       violation_dropped, SG_VIOL_WRITE_THEN_READ,
-                       SG_SEVERITY_MEDIUM, read_cmd, desc, det);
-        node_viols[read_cmd] |= SG_VIOL_WRITE_THEN_READ;
-        *violation_type_flags |= SG_VIOL_WRITE_THEN_READ;
-        break;
-      }
-    }
+    const char *desc = bw_printf(bw, "write then read of matching path");
+    const char *det = bw_copy(bw, f1->doc.path, f1->doc.path_len);
+    emit_violation(violations, violation_count, max_violations,
+                   violation_dropped, SG_VIOL_WRITE_THEN_READ,
+                   SG_SEVERITY_MEDIUM, read_cmd, desc, det);
+    node_viols[read_cmd] |= SG_VIOL_WRITE_THEN_READ;
+    *violation_type_flags |= SG_VIOL_WRITE_THEN_READ;
   }
 
   /* --- SG_VIOL_REDIRECT_FANOUT --- */
@@ -2766,10 +3405,13 @@ static void sg_violation_scan(
   /* Effective pipe routes include commands inside groups and exclude streams
    * replaced by redirects. Both data-to-executor rules must use them. */
   for (uint32_t ei = 0; ei < graph->edge_count && !bw->overflow; ei++) {
+    SG_EDGE_WORK();
     const shell_dep_edge_t *e = &graph->edges[ei];
     if (e->type != SHELL_EDGE_PIPE)
       continue;
-    for (uint32_t producer = 0; producer < graph->node_count; producer++) {
+    for (uint32_t encoded = index->pipe_producer_head[e->from][e->to];
+         encoded != 0; encoded = index->pipe_producer_next[encoded - 1]) {
+      uint32_t producer = encoded - 1;
       const shell_dep_node_t *src = &graph->nodes[producer];
       const char *source_word = NULL;
       uint32_t source_length = 0, source_index = 0;
@@ -2786,7 +3428,9 @@ static void sg_violation_scan(
           sg_command_is_decoder(src, source_word, source_length, source_index);
       if (!is_download && !is_decoder)
         continue;
-      for (uint32_t consumer = 0; consumer < graph->node_count; consumer++) {
+      for (uint32_t encoded = index->pipe_consumer_head[e->from][e->to];
+           encoded != 0; encoded = index->pipe_consumer_next[encoded - 1]) {
+        uint32_t consumer = encoded - 1;
         const shell_dep_node_t *dst = &graph->nodes[consumer];
         const char *target_word = NULL;
         uint32_t target_length = 0, target_index = 0;
@@ -2850,16 +3494,16 @@ static void sg_violation_scan(
     if (!has_recursive)
       continue;
 
-    for (uint32_t ei = 0; ei < graph->edge_count && !bw->overflow; ei++) {
+    for (uint32_t ei = index->out_head[ni]; ei != UINT32_MAX && !bw->overflow;
+         ei = index->out_next[ei]) {
+      SG_EDGE_WORK();
       const shell_dep_edge_t *e = &graph->edges[ei];
-      if (e->from != ni || e->type != SHELL_EDGE_ARG)
+      if (e->type != SHELL_EDGE_ARG)
         continue;
       const shell_dep_node_t *doc = &graph->nodes[e->to];
       if (doc->type != SHELL_NODE_DOC || doc->doc.kind != SHELL_DOC_FILE)
         continue;
-      if (sg_decoded_path_found(doc->doc.path, doc->doc.path_len,
-                                cfg->sensitive_dirs, cfg->sensitive_dir_count,
-                                &idx)) {
+      if (index->file_path_flags[e->to] & SG_FILE_PATH_SENSITIVE_DIR) {
         const char *desc =
             bw_printf(bw, "recursive permission change on system dir");
         const char *det = bw_copy(bw, doc->doc.path, doc->doc.path_len);
@@ -2916,10 +3560,10 @@ static void sg_violation_scan(
     bool has_redirect = false;
     const char *target_path = NULL;
     uint32_t target_path_len = 0;
-    for (uint32_t ei = 0; ei < graph->edge_count && !bw->overflow; ei++) {
+    for (uint32_t ei = index->out_head[ni]; ei != UINT32_MAX && !bw->overflow;
+         ei = index->out_next[ei]) {
+      SG_EDGE_WORK();
       const shell_dep_edge_t *e = &graph->edges[ei];
-      if (e->from != ni)
-        continue;
       if (!sg_edge_is_output_effect(graph, e))
         continue;
       has_redirect = true;
@@ -2961,26 +3605,24 @@ static void sg_violation_scan(
     if (!is_reader)
       continue;
 
-    for (uint32_t ei = 0; ei < graph->edge_count && !bw->overflow; ei++) {
+    for (uint32_t ei = index->out_head[ni]; ei != UINT32_MAX && !bw->overflow;
+         ei = index->out_next[ei]) {
+      SG_EDGE_WORK();
       const shell_dep_edge_t *e = &graph->edges[ei];
-      if (e->from != ni || e->type != SHELL_EDGE_ARG)
+      if (e->type != SHELL_EDGE_ARG)
         continue;
       const shell_dep_node_t *doc = &graph->nodes[e->to];
       if (doc->type != SHELL_NODE_DOC || doc->doc.kind != SHELL_DOC_FILE)
         continue;
-      for (uint32_t p = 0; p < cfg->sensitive_secret_path_count; p++) {
-        if (sg_decoded_path_contains(doc->doc.path, doc->doc.path_len,
-                                     cfg->sensitive_secret_paths[p])) {
-          const char *desc = bw_printf(bw, "reading secret file");
-          const char *det = bw_copy(bw, doc->doc.path, doc->doc.path_len);
-          emit_violation(violations, violation_count, max_violations,
-                         violation_dropped, SG_VIOL_READ_SECRETS,
-                         SG_SEVERITY_MEDIUM, ni, desc, det);
-          node_viols[ni] |= SG_VIOL_READ_SECRETS;
-          *violation_type_flags |= SG_VIOL_READ_SECRETS;
-          break;
-        }
-      }
+      if (!(index->file_path_flags[e->to] & SG_FILE_PATH_SECRET))
+        continue;
+      const char *desc = bw_printf(bw, "reading secret file");
+      const char *det = bw_copy(bw, doc->doc.path, doc->doc.path_len);
+      emit_violation(violations, violation_count, max_violations,
+                     violation_dropped, SG_VIOL_READ_SECRETS,
+                     SG_SEVERITY_MEDIUM, ni, desc, det);
+      node_viols[ni] |= SG_VIOL_READ_SECRETS;
+      *violation_type_flags |= SG_VIOL_READ_SECRETS;
     }
   }
 
@@ -3237,39 +3879,39 @@ static uint32_t sg_violation_categories(uint32_t types) {
  * Keep the public result safe without inventing a direct producer-to-command
  * edge: a GROUP remains the authoritative graph consumer. */
 static void sg_mark_group_substitution_consumers(
-    const shell_dep_graph_t *graph, const uint32_t *node_result_index,
-    uint32_t group_node, bool shell_word, sg_result_t *out) {
-  if (group_node >= graph->node_count ||
-      graph->nodes[group_node].type != SHELL_NODE_GROUP)
-    return;
-
+    const shell_dep_graph_t *graph, sg_graph_index_t *index,
+    const sg_policy_graph_summary_t *summary, const uint32_t *node_result_index,
+    sg_result_t *out) {
   /* A substitution graph can have source text inside this group's span while
    * remaining an independent graph fragment. Only GROUP edges express the
    * structural descendants that inherit a group descriptor. */
-  bool visited[SHELL_DEP_MAX_NODES] = {false};
   uint32_t pending[SHELL_DEP_MAX_NODES];
-  uint32_t pending_count = 0;
-  visited[group_node] = true;
-  pending[pending_count++] = group_node;
-  while (pending_count > 0) {
-    uint32_t current = pending[--pending_count];
-    for (uint32_t edge_index = 0; edge_index < graph->edge_count;
-         edge_index++) {
+  uint32_t head = 0, tail = 0;
+  for (uint32_t node = 0; node < graph->node_count; node++)
+    if (graph->nodes[node].type == SHELL_NODE_GROUP &&
+        summary->group_parent[node] == UINT32_MAX)
+      pending[tail++] = node;
+  while (head < tail) {
+    uint32_t current = pending[head++];
+    for (uint32_t edge_index = index->out_head[current];
+         edge_index != UINT32_MAX; edge_index = index->out_next[edge_index]) {
+      SG_EDGE_WORK();
       const shell_dep_edge_t *edge = &graph->edges[edge_index];
-      if (edge->type != SHELL_EDGE_GROUP || edge->from != current ||
-          edge->to >= graph->node_count)
+      if (edge->type != SHELL_EDGE_GROUP)
         continue;
       uint32_t node = edge->to;
-      if (graph->nodes[node].type == SHELL_NODE_GROUP && !visited[node]) {
-        visited[node] = true;
-        pending[pending_count++] = node;
+      index->group_substitution[node] |= index->group_substitution[current];
+      if (graph->nodes[node].type == SHELL_NODE_GROUP) {
+        pending[tail++] = node;
       }
       if (graph->nodes[node].type != SHELL_NODE_CMD ||
-          node_result_index[node] == UINT32_MAX)
+          node_result_index[node] == UINT32_MAX ||
+          index->group_substitution[node] == 0)
         continue;
       sg_subcommand_result_t *result =
           &out->subcommands[node_result_index[node]];
       result->has_dynamic_substitution_io = true;
+      bool shell_word = (index->group_substitution[node] & 2) != 0;
       if (shell_word) {
         result->requires_substitution_evaluation = true;
       }
@@ -3298,25 +3940,18 @@ static void sg_init_rejected_subcommand(sg_result_t *out,
  * syntax and unsupported-feature paths explicitly reject before reaching this
  * helper; this helper is only for failures while constructing or evaluating
  * an otherwise accepted representation. */
-static sg_error_t sg_fail_undetermined(sg_result_t *out, sg_error_t error) {
-  if (out && error != SG_OK)
-    out->verdict = SG_VERDICT_UNDETERMINED;
+static SHELL_NONNULL(1) sg_error_t
+    sg_fail_undetermined(sg_result_t *out, sg_error_t error) {
+  out->verdict = SG_VERDICT_UNDETERMINED;
   return error;
 }
 
 sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
                             char *buf, size_t buf_size, sg_result_t *out) {
-  if (!gate || !cmd || !buf || !out)
-    return SG_ERR_INVALID;
   if (buf_size == 0)
     return SG_ERR_INVALID;
   if (cmd_len == 0 || memchr(cmd, '\0', cmd_len) != NULL)
     return SG_ERR_INVALID;
-  if (sg_memory_spans_overlap(cmd, cmd_len, buf, buf_size) ||
-      sg_memory_spans_overlap(cmd, cmd_len, out, sizeof(*out)) ||
-      sg_memory_spans_overlap(buf, buf_size, out, sizeof(*out)))
-    return SG_ERR_INVALID;
-
   memset(out, 0, sizeof(*out));
   out->verdict = SG_VERDICT_ALLOW;
 
@@ -3378,12 +4013,14 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
     return SG_OK;
   }
 
-  /* Step 3: Build depgraph */
+  /* Step 3: Consume the unchanged fast parse of this exact source span. The
+   * internal graph entry point borrows cmd for its offset-based token views;
+   * it trusts parser-produced metadata and does not repeat the fast parse. */
   size_t output_size = 0;
   void *dep_workspace = NULL;
   size_t dep_workspace_size = 0;
-  if (!sg_partition_eval_buffer(buf, buf_size, &output_size, &dep_workspace,
-                                &dep_workspace_size)) {
+  if (!sg_partition_eval_buffer(buf, buf_size, cmd_len, &output_size,
+                                &dep_workspace, &dep_workspace_size)) {
     out->verdict = SG_VERDICT_UNDETERMINED;
     out->deny_reason = bw_copy(&bw, "depgraph workspace unavailable", 30);
     if (bw.overflow)
@@ -3402,11 +4039,15 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
   if (derr != SHELL_DEP_OK && !depgraph_truncated) {
     out->verdict = derr == SHELL_DEP_EWORKSPACE ? SG_VERDICT_UNDETERMINED
                                                 : SG_VERDICT_REJECT;
+    bool parse_error = derr == SHELL_DEP_EPARSE || derr == SHELL_DEP_EINPUT;
     out->deny_reason =
         bw_copy(&bw,
                 derr == SHELL_DEP_EWORKSPACE ? "depgraph workspace unavailable"
+                : parse_error                ? "parse error"
                                              : "depgraph error",
-                derr == SHELL_DEP_EWORKSPACE ? 30 : 14);
+                derr == SHELL_DEP_EWORKSPACE ? 30
+                : parse_error                ? 11
+                                             : 14);
     if (derr != SHELL_DEP_EWORKSPACE)
       sg_init_rejected_subcommand(out, out->deny_reason);
     if (bw.overflow) {
@@ -3427,6 +4068,14 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
         out->requires_substitution_evaluation = true;
     }
 
+  /* The bounded resolver workspace is no longer live. Reuse its aligned
+   * prefix for graph indexes and its remainder for path decoding scratch. */
+  sg_graph_index_t *graph_index = dep_workspace;
+  char *path_scratch = (char *)dep_workspace + sizeof(*graph_index);
+  size_t path_scratch_size = dep_workspace_size - sizeof(*graph_index);
+  size_t path_capacity = path_scratch_size / 2;
+  sg_graph_index_build(&graph, graph_index);
+
   /* Step 3.5: Violation scan on the depgraph */
   uint32_t node_viols[SHELL_DEP_MAX_NODES];
   uint32_t cmd_write_count[SHELL_DEP_MAX_NODES];
@@ -3438,11 +4087,20 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
   memset(cmd_env_count, 0, sizeof(cmd_env_count));
 
   if (gate->viol_enabled) {
-    sg_violation_scan(&graph, &gate->viol_config, &bw, out->violations,
+    if (!sg_graph_violation_index_build(&graph, graph_index, gate, path_scratch,
+                                        path_scratch + path_capacity,
+                                        path_capacity)) {
+      out->verdict = SG_VERDICT_UNDETERMINED;
+      out->deny_reason = bw_copy(&bw, "path index workspace unavailable", 32);
+      if (bw.overflow)
+        out->truncated = true;
+      return SG_ERR_MEMORY;
+    }
+    sg_violation_scan(&graph, graph_index, gate, &bw, out->violations,
                       SG_MAX_VIOLATIONS, &out->violation_count,
                       &out->violation_type_flags, &out->violation_dropped_count,
                       node_viols, cmd_write_count, cmd_read_count,
-                      cmd_env_count, dep_workspace, dep_workspace_size);
+                      cmd_env_count);
     out->violation_category_flags =
         sg_violation_categories(out->violation_type_flags);
     out->has_violations = (out->violation_count > 0);
@@ -3459,6 +4117,10 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
   /* Policy evaluation is graph-based. Anomaly sequences are built separately:
    * they include nested executable substitutions in deterministic analysis
    * order, whereas graph CMD nodes preserve dependency topology. */
+  sg_policy_graph_summary_t policy_graph = {0};
+  sg_policy_graph_summarize(&graph, &policy_graph);
+  sg_group_context_prepare(&graph, graph_index, &policy_graph, node_viols,
+                           cmd_write_count, cmd_read_count);
   size_t cmd_count = 0;
   bool has_unpolicyable_io_only_command = false;
   for (uint32_t ni = 0; ni < graph.node_count; ni++) {
@@ -3467,7 +4129,8 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
       continue;
     if (node->cmd.token_count > 0) {
       cmd_count++;
-    } else {
+    } else if (!sg_argvless_command_is_empty_timing(&graph, &policy_graph,
+                                                    ni)) {
       /* A redirect-only simple command is valid shell syntax and remains in
        * the graph so its I/O effects are visible. It has no argv, though, so
        * the canonical argv policy model cannot authorize it. Shellsplit's
@@ -3597,6 +4260,7 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
     sr->group_depth = node->cmd.group_depth;
     sr->group_kinds = node->cmd.group_kinds;
     sr->backgrounded = node->cmd.backgrounded;
+    sr->pipeline_time_mode = node->cmd.pipeline_time_mode;
 
     const char *policy_netargv = NULL;
     sg_error_t build_error = SG_OK;
@@ -3626,9 +4290,11 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
     sr->read_count = cmd_read_count[ni];
     sr->env_count = cmd_env_count[ni];
     sr->violation_type_flags = node_viols[ni];
-    sg_group_context(&graph, ni, node_viols, cmd_write_count, cmd_read_count,
-                     &sr->violation_type_flags, &sr->write_count,
-                     &sr->read_count);
+    sr->violation_type_flags |= graph_index->group_violations[ni];
+    sr->write_count += graph_index->group_writes[ni];
+    sr->read_count += graph_index->group_reads[ni];
+    if (sr->pipeline_time_mode == SHELL_PIPE_TIME_NONE)
+      sr->pipeline_time_mode = graph_index->group_time[ni];
     sr->violation_category_flags =
         sg_violation_categories(sr->violation_type_flags);
 
@@ -3795,6 +4461,10 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
    * because any can consume its inherited descriptor. Only a flagged
    * shell-word edge requests another Shellgate inspection or changes an ALLOW
    * verdict to conditional. */
+  /* A producer can feed several routes after descriptor inheritance. Keep
+   * ambiguity sticky across edges rather than letting the last direct edge
+   * overwrite an earlier GROUP or different simple-command consumer. */
+  uint8_t substitution_mapping_state[SHELL_DEP_MAX_NODES] = {0};
   for (uint32_t ei = 0; ei < graph.edge_count; ei++) {
     const shell_dep_edge_t *edge = &graph.edges[ei];
     if (!sg_edge_is_dynamic_substitution_route(&graph, edge))
@@ -3804,15 +4474,14 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
     if (shell_word)
       out->requires_substitution_evaluation = true;
     uint32_t consumer_nodes[SHELL_DEP_MAX_NODES];
-    uint32_t consumer_count =
-        sg_dynamic_substitution_route_consumers(&graph, edge, consumer_nodes);
+    uint32_t consumer_count = sg_dynamic_substitution_route_consumers(
+        &graph, graph_index, edge, consumer_nodes);
     uint32_t consumer = UINT32_MAX;
     for (uint32_t consumer_index = 0; consumer_index < consumer_count;
          consumer_index++) {
       uint32_t consumer_node = consumer_nodes[consumer_index];
       if (graph.nodes[consumer_node].type == SHELL_NODE_GROUP) {
-        sg_mark_group_substitution_consumers(&graph, node_result_index,
-                                             consumer_node, shell_word, out);
+        graph_index->group_substitution[consumer_node] |= shell_word ? 3 : 1;
         continue;
       }
       uint32_t result_index = node_result_index[consumer_node];
@@ -3827,15 +4496,27 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
       if (consumer_count == 1)
         consumer = result_index;
     }
-    if (edge->type != SHELL_EDGE_SUBST || consumer == UINT32_MAX ||
+    if (edge->type != SHELL_EDGE_SUBST || consumer_count == 0 ||
         (edge->flags & SHELL_DEP_EDGE_FLAG_SUBST_DYNAMIC_NAME) != 0)
       continue;
 
     uint32_t producer = node_result_index[edge->from];
-    if (producer != UINT32_MAX)
-      out->subcommands[producer].substitution_consumer_index =
-          (int32_t)consumer;
+    if (producer == UINT32_MAX)
+      continue;
+    sg_subcommand_result_t *source = &out->subcommands[producer];
+    if (consumer == UINT32_MAX ||
+        (substitution_mapping_state[producer] != 0 &&
+         source->substitution_consumer_index != (int32_t)consumer)) {
+      substitution_mapping_state[producer] = 2;
+      source->substitution_consumer_index = -1;
+    } else if (substitution_mapping_state[producer] != 2) {
+      substitution_mapping_state[producer] = 1;
+      source->substitution_consumer_index = (int32_t)consumer;
+    }
   }
+
+  sg_mark_group_substitution_consumers(&graph, graph_index, &policy_graph,
+                                       node_result_index, out);
 
   out->truncated = bw.overflow || subcommand_truncated;
   out->subcommand_truncated = subcommand_truncated;
@@ -3964,17 +4645,21 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
         out->anomaly_update = SG_ANOMALY_UPDATE_FAILED_MEMORY;
     }
 
-    if (record_history && gate->anomaly_adaptive && !out->anomaly_detected &&
-        isfinite(out->anomaly_score) && anomaly_count >= 3)
-      adaptive_record_score(gate, out->anomaly_score);
-
-    if (record_history &&
-        gate->anomaly_combine_mode == SG_ANOMALY_COMBINE_BAYESIAN &&
-        !out->anomaly_detected && anomaly_count >= 3) {
-      cdf_record(gate->cdf_raw_hist, &gate->cdf_raw_count,
-                 out->anomaly_score_raw);
-      cdf_record(gate->cdf_type_hist, &gate->cdf_type_count,
-                 out->anomaly_score_type);
+    if (record_history && !out->anomaly_detected && anomaly_count >= 3) {
+      bool was_bayesian = anomaly_uses_bayesian(gate);
+      if (gate->anomaly_combine_mode == SG_ANOMALY_COMBINE_BAYESIAN) {
+        cdf_record(gate->cdf_raw_hist, &gate->cdf_raw_count,
+                   out->anomaly_score_raw);
+        cdf_record(gate->cdf_type_hist, &gate->cdf_type_count,
+                   out->anomaly_score_type);
+      }
+      /* The last weighted warm-up score cannot enter a log-odds window.
+       * Commit the CDF transition only after the evaluation/learning
+       * transaction succeeds, retaining its component distributions. */
+      if (was_bayesian != anomaly_uses_bayesian(gate))
+        adaptive_reset(gate);
+      else if (gate->anomaly_adaptive && isfinite(out->anomaly_score))
+        adaptive_record_score(gate, out->anomaly_score);
     }
   }
 
@@ -3989,7 +4674,7 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
 
 size_t sg_gate_evaluate_size_hint(size_t cmd_len) {
   size_t workspace_size = 0;
-  if (!shell_dep_workspace_size(NULL, &workspace_size))
+  if (!sg_eval_workspace_size(cmd_len, &workspace_size))
     return SIZE_MAX;
   size_t alignment = shell_dep_workspace_alignment();
   if (alignment == 0 || cmd_len > (SIZE_MAX - 512) / 4)
@@ -4020,5 +4705,5 @@ const char *sg_verdict_name(sg_verdict_t v) {
 }
 
 uint32_t sg_result_violation_dropped(const sg_result_t *result) {
-  return result ? result->violation_dropped_count : 0;
+  return result->violation_dropped_count;
 }

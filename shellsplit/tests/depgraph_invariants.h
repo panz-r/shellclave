@@ -31,10 +31,12 @@ static bool shellsplit_test_edge_types_match(const shell_dep_graph_t *graph,
            (from == SHELL_NODE_CMD && to == SHELL_NODE_DOC);
   case SHELL_EDGE_WRITE:
   case SHELL_EDGE_APPEND:
-    return (from == SHELL_NODE_CMD || from == SHELL_NODE_GROUP) &&
+    return (from == SHELL_NODE_CMD || from == SHELL_NODE_GROUP ||
+            from == SHELL_NODE_TIME) &&
            (to == SHELL_NODE_DOC || to == SHELL_NODE_ENDPOINT);
   case SHELL_EDGE_PIPE:
-    return (from == SHELL_NODE_CMD || from == SHELL_NODE_GROUP) &&
+    return (from == SHELL_NODE_CMD || from == SHELL_NODE_GROUP ||
+            from == SHELL_NODE_TIME) &&
            /* A terminal ENDPOINT preserves an upstream pipe write after a
             * later redirect replaces its reader.  The production graph
             * validator constrains that endpoint to the terminal form. */
@@ -42,7 +44,7 @@ static bool shellsplit_test_edge_types_match(const shell_dep_graph_t *graph,
             to == SHELL_NODE_ENDPOINT);
   case SHELL_EDGE_SUBST:
     return (from == SHELL_NODE_CMD || from == SHELL_NODE_GROUP ||
-            from == SHELL_NODE_ENDPOINT ||
+            from == SHELL_NODE_ENDPOINT || from == SHELL_NODE_TIME ||
             (from == SHELL_NODE_DOC &&
              graph->nodes[edge->from].doc.kind == SHELL_DOC_FILE)) &&
            (to == SHELL_NODE_CMD || to == SHELL_NODE_GROUP ||
@@ -56,7 +58,8 @@ static bool shellsplit_test_edge_types_match(const shell_dep_graph_t *graph,
                    0)))) &&
            (((from == SHELL_NODE_ENDPOINT || from == SHELL_NODE_DOC) &&
              edge->source_fd == SHELL_DEP_FD_NONE) ||
-            ((from == SHELL_NODE_CMD || from == SHELL_NODE_GROUP) &&
+            ((from == SHELL_NODE_CMD || from == SHELL_NODE_GROUP ||
+              from == SHELL_NODE_TIME) &&
              edge->source_fd != SHELL_DEP_FD_NONE));
   case SHELL_EDGE_SEQ:
   case SHELL_EDGE_AND:
@@ -82,6 +85,13 @@ static bool shellsplit_test_edge_types_match(const shell_dep_graph_t *graph,
   case SHELL_EDGE_FD_CLOSE:
     return (from == SHELL_NODE_CMD || from == SHELL_NODE_GROUP) && from == to &&
            edge->from == edge->to && edge->source_fd != SHELL_DEP_FD_NONE &&
+           edge->target_fd == SHELL_DEP_FD_NONE &&
+           edge->flags == SHELL_DEP_EDGE_FLAG_NONE &&
+           edge->dir == SHELL_DIR_FORWARD;
+  case SHELL_EDGE_TIME:
+    return from == SHELL_NODE_TIME &&
+           (to == SHELL_NODE_CMD || to == SHELL_NODE_GROUP) &&
+           edge->source_fd == SHELL_DEP_FD_NONE &&
            edge->target_fd == SHELL_DEP_FD_NONE &&
            edge->flags == SHELL_DEP_EDGE_FLAG_NONE &&
            edge->dir == SHELL_DIR_FORWARD;
@@ -142,7 +152,7 @@ static bool shellsplit_test_depgraph_invariants(
     return false;
   if ((error == SHELL_DEP_OK && graph->status != SHELL_DEP_STATUS_OK) ||
       (error == SHELL_DEP_ETRUNC &&
-       !(graph->status & SHELL_DEP_STATUS_TRUNCATED)) ||
+       graph->status != SHELL_DEP_STATUS_TRUNCATED) ||
       ((error == SHELL_DEP_EINPUT || error == SHELL_DEP_EPARSE ||
         error == SHELL_DEP_EWORKSPACE) &&
        graph->status != SHELL_DEP_STATUS_ERROR) ||
@@ -161,7 +171,7 @@ static bool shellsplit_test_depgraph_invariants(
   for (uint32_t i = 0; i < graph->edge_count; i++) {
     const shell_dep_edge_t *edge = &graph->edges[i];
     if (edge->from >= graph->node_count || edge->to >= graph->node_count ||
-        edge->type > SHELL_EDGE_FD_CLOSE || edge->dir > SHELL_DIR_UNDIR ||
+        edge->type > SHELL_EDGE_TIME || edge->dir > SHELL_DIR_UNDIR ||
         (edge->flags & ~(SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD |
                          SHELL_DEP_EDGE_FLAG_SUBST_DYNAMIC_NAME |
                          SHELL_DEP_EDGE_FLAG_FD_OPEN_APPEND |
@@ -188,18 +198,170 @@ static bool shellsplit_test_depgraph_invariants(
   for (uint32_t i = 0; i < graph->node_count; i++) {
     const shell_dep_node_t *node = &graph->nodes[i];
     if (node->type == SHELL_NODE_CMD) {
+      if (node->cmd.pipeline_negated !=
+          ((node->cmd.pipeline_negation_count & 1u) != 0))
+        return false;
       if (node->cmd.token_count > max_tokens ||
           node->cmd.cwd_offset >= graph->cwd_buf.len ||
           !memchr(graph->cwd_buf.data + node->cmd.cwd_offset, '\0',
                   graph->cwd_buf.len - node->cmd.cwd_offset))
         return false;
+      if ((node->cmd.pipeline_time_mode == SHELL_PIPE_TIME_NONE) !=
+              (node->cmd.pipeline_time_id == 0) &&
+          !((graph->status & SHELL_DEP_STATUS_TRUNCATED) != 0 &&
+            node->cmd.pipeline_time_mode != SHELL_PIPE_TIME_NONE &&
+            node->cmd.pipeline_time_id == 0))
+        return false;
+      if (node->cmd.pipeline_time_id != 0) {
+        uint32_t timer = node->cmd.pipeline_time_id - 1;
+        if (timer >= graph->node_count ||
+            graph->nodes[timer].type != SHELL_NODE_TIME ||
+            graph->nodes[timer].time.mode != node->cmd.pipeline_time_mode)
+          return false;
+      }
       for (uint32_t j = 0; j < node->cmd.token_count; j++)
         if (!shellsplit_test_span_in_input(input, length, node->cmd.tokens[j],
                                            node->cmd.token_lens[j]))
           return false;
     } else if (node->type == SHELL_NODE_GROUP) {
+      if (node->group.pipeline_negated !=
+          ((node->group.pipeline_negation_count & 1u) != 0))
+        return false;
       if (!shellsplit_test_span_in_input(input, length, node->group.start,
                                          node->group.length))
+        return false;
+      if ((node->group.pipeline_time_mode == SHELL_PIPE_TIME_NONE) !=
+              (node->group.pipeline_time_id == 0) &&
+          !((graph->status & SHELL_DEP_STATUS_TRUNCATED) != 0 &&
+            node->group.pipeline_time_mode != SHELL_PIPE_TIME_NONE &&
+            node->group.pipeline_time_id == 0))
+        return false;
+      if (node->group.pipeline_time_id != 0) {
+        uint32_t timer = node->group.pipeline_time_id - 1;
+        if (timer >= graph->node_count ||
+            graph->nodes[timer].type != SHELL_NODE_TIME ||
+            graph->nodes[timer].time.mode != node->group.pipeline_time_mode)
+          return false;
+      }
+    } else if (node->type == SHELL_NODE_TIME) {
+      uint32_t report_flows = 0;
+      uint32_t target = UINT32_MAX;
+      uint32_t target_count = 0;
+      uint32_t target_timer_count = 0;
+      bool topology_valid = true;
+      for (uint32_t edge = 0; edge < graph->edge_count; edge++)
+        if (graph->edges[edge].from == i) {
+          if (graph->edges[edge].type == SHELL_EDGE_TIME) {
+            target = graph->edges[edge].to;
+            target_count++;
+          } else if ((graph->edges[edge].type == SHELL_EDGE_WRITE ||
+                      graph->edges[edge].type == SHELL_EDGE_APPEND ||
+                      graph->edges[edge].type == SHELL_EDGE_PIPE ||
+                      graph->edges[edge].type == SHELL_EDGE_SUBST) &&
+                     graph->edges[edge].source_fd == node->time.report_fd) {
+            report_flows++;
+          } else {
+            topology_valid = false;
+          }
+        } else if (graph->edges[edge].to == i) {
+          topology_valid = false;
+        }
+      bool target_valid = target < graph->node_count;
+      shell_pipeline_time_mode_t target_mode = SHELL_PIPE_TIME_NONE;
+      uint32_t target_time_id = 0;
+      if (target_valid && graph->nodes[target].type == SHELL_NODE_CMD) {
+        target_mode = graph->nodes[target].cmd.pipeline_time_mode;
+        target_time_id = graph->nodes[target].cmd.pipeline_time_id;
+      } else if (target_valid &&
+                 graph->nodes[target].type == SHELL_NODE_GROUP) {
+        target_mode = graph->nodes[target].group.pipeline_time_mode;
+        target_time_id = graph->nodes[target].group.pipeline_time_id;
+      } else {
+        target_valid = false;
+      }
+      if (target_valid)
+        for (uint32_t edge = 0; edge < graph->edge_count; edge++)
+          if (graph->edges[edge].type == SHELL_EDGE_TIME &&
+              graph->edges[edge].to == target &&
+              graph->edges[edge].from < graph->node_count &&
+              graph->nodes[graph->edges[edge].from].type == SHELL_NODE_TIME)
+            target_timer_count++;
+      if (node->time.report_external_fd_count > SHELL_DEP_TIME_MAX_EXTERNAL_FDS)
+        return false;
+      bool has_external = node->time.report_external_fd_count != 0;
+      bool has_graph = report_flows != 0;
+      bool has_closed =
+          (node->time.report_route_flags & SHELL_TIME_REPORT_ROUTE_CLOSED) != 0;
+      bool has_unavailable = (node->time.report_route_flags &
+                              SHELL_TIME_REPORT_ROUTE_UNAVAILABLE) != 0;
+      bool has_unknown = (node->time.report_route_flags &
+                          SHELL_TIME_REPORT_ROUTE_UNKNOWN) != 0;
+      uint32_t expected_flags =
+          (has_external ? SHELL_TIME_REPORT_ROUTE_EXTERNAL : 0) |
+          (has_graph ? SHELL_TIME_REPORT_ROUTE_GRAPH : 0) |
+          (has_closed ? SHELL_TIME_REPORT_ROUTE_CLOSED : 0) |
+          (has_unavailable ? SHELL_TIME_REPORT_ROUTE_UNAVAILABLE : 0) |
+          (has_unknown ? SHELL_TIME_REPORT_ROUTE_UNKNOWN : 0);
+      bool route_valid =
+          node->time.report_route_flags == expected_flags &&
+          (!has_unknown || (graph->status & SHELL_DEP_STATUS_TRUNCATED) != 0);
+      for (uint32_t fd = 0; fd < node->time.report_external_fd_count; fd++) {
+        route_valid = route_valid &&
+                      node->time.report_external_fds[fd] <= SHELL_DEP_FD_MAX;
+        for (uint32_t prior = 0; prior < fd; prior++)
+          route_valid = route_valid && node->time.report_external_fds[prior] !=
+                                           node->time.report_external_fds[fd];
+      }
+      if (node->time.report_route == SHELL_TIME_REPORT_EXTERNAL)
+        route_valid =
+            route_valid && report_flows == 0 &&
+            node->time.report_target_fd <= SHELL_DEP_FD_MAX &&
+            node->time.report_external_fd_count == 1 &&
+            node->time.report_external_fds[0] == node->time.report_target_fd &&
+            node->time.report_route_flags == SHELL_TIME_REPORT_ROUTE_EXTERNAL;
+      else if (node->time.report_route == SHELL_TIME_REPORT_GRAPH)
+        route_valid =
+            route_valid && report_flows == 1 &&
+            node->time.report_target_fd == SHELL_DEP_FD_NONE &&
+            node->time.report_external_fd_count == 0 &&
+            node->time.report_route_flags == SHELL_TIME_REPORT_ROUTE_GRAPH;
+      else if (node->time.report_route == SHELL_TIME_REPORT_CLOSED)
+        route_valid =
+            route_valid && report_flows == 0 &&
+            node->time.report_target_fd == SHELL_DEP_FD_NONE &&
+            node->time.report_external_fd_count == 0 &&
+            node->time.report_route_flags == SHELL_TIME_REPORT_ROUTE_CLOSED;
+      else if (node->time.report_route == SHELL_TIME_REPORT_UNAVAILABLE)
+        route_valid = route_valid && report_flows == 0 &&
+                      node->time.report_target_fd == SHELL_DEP_FD_NONE &&
+                      node->time.report_external_fd_count == 0 &&
+                      node->time.report_route_flags ==
+                          SHELL_TIME_REPORT_ROUTE_UNAVAILABLE;
+      else if (node->time.report_route == SHELL_TIME_REPORT_UNKNOWN)
+        route_valid =
+            route_valid && report_flows == 0 &&
+            node->time.report_target_fd == SHELL_DEP_FD_NONE &&
+            node->time.report_external_fd_count == 0 &&
+            node->time.report_route_flags == SHELL_TIME_REPORT_ROUTE_UNKNOWN &&
+            (graph->status & SHELL_DEP_STATUS_TRUNCATED) != 0;
+      else if (node->time.report_route == SHELL_TIME_REPORT_MULTIPLE)
+        route_valid = route_valid &&
+                      report_flows + node->time.report_external_fd_count +
+                              (has_closed ? 1u : 0u) +
+                              (has_unavailable ? 1u : 0u) +
+                              (has_unknown ? 1u : 0u) >=
+                          2 &&
+                      node->time.report_target_fd == SHELL_DEP_FD_NONE;
+      else
+        route_valid = false;
+      if (!shellsplit_test_span_in_input(input, length, node->time.start,
+                                         node->time.length) ||
+          node->time.mode < SHELL_PIPE_TIME_DEFAULT ||
+          node->time.mode > SHELL_PIPE_TIME_POSIX ||
+          node->time.report_fd != 2 || !route_valid || !topology_valid ||
+          target_count != 1 || !target_valid ||
+          target_mode != node->time.mode || target_timer_count != 1 ||
+          target_time_id != i + 1)
         return false;
     } else if (node->type != SHELL_NODE_ENDPOINT &&
                (node->type != SHELL_NODE_DOC ||
@@ -214,7 +376,8 @@ static bool shellsplit_test_depgraph_invariants(
                 (node->doc.flags & ~(SHELL_DEP_DOC_FLAG_HEREDOC_STRIP_TABS |
                                      SHELL_DEP_DOC_FLAG_DYNAMIC_NAME |
                                      SHELL_DEP_DOC_FLAG_HEREDOC_LITERAL |
-                                     SHELL_DEP_DOC_FLAG_TRANSIENT)) != 0)) {
+                                     SHELL_DEP_DOC_FLAG_TRANSIENT |
+                                     SHELL_DEP_DOC_FLAG_ENVVAR_APPEND)) != 0)) {
       return false;
     }
   }

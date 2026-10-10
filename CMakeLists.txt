@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(Shellclave VERSION 0.10.0 LANGUAGES C CXX)
+project(Shellclave VERSION 0.11.0 LANGUAGES C CXX)
 
 if(PROJECT_IS_TOP_LEVEL)
   set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -15,6 +15,15 @@ option(SHELLCLAVE_BUILD_TOOLS "Build command-line tools" ${PROJECT_IS_TOP_LEVEL}
 option(SHELLCLAVE_BUILD_BENCHMARKS "Build micro-benchmarks" OFF)
 option(SHELLCLAVE_BUILD_FUZZERS "Build libFuzzer harnesses" OFF)
 option(SHELLCLAVE_ENABLE_COVERAGE "Enable GCC/Clang coverage instrumentation" OFF)
+set(SHELLCLAVE_COVERAGE_VARIANT "tests" CACHE STRING
+    "Coverage implementation variant: tests or production (use separate build directories)")
+set_property(CACHE SHELLCLAVE_COVERAGE_VARIANT PROPERTY STRINGS tests production)
+if(SHELLCLAVE_ENABLE_COVERAGE AND NOT SHELLCLAVE_COVERAGE_VARIANT MATCHES "^(tests|production)$")
+  message(FATAL_ERROR "SHELLCLAVE_COVERAGE_VARIANT must be tests or production")
+endif()
+if(SHELLCLAVE_ENABLE_COVERAGE AND SHELLCLAVE_COVERAGE_VARIANT STREQUAL "tests" AND NOT BUILD_TESTING)
+  message(FATAL_ERROR "The tests coverage variant requires BUILD_TESTING=ON")
+endif()
 option(SHELLCLAVE_ENABLE_SANITIZERS "Enable AddressSanitizer and UBSanitizer" OFF)
 option(SHELLCLAVE_ENABLE_TSAN "Enable ThreadSanitizer" OFF)
 
@@ -25,6 +34,7 @@ endif()
 find_package(Threads REQUIRED)
 
 set(SHELLCLAVE_PUBLIC_HEADERS
+  shellsplit/include/shell_contract.h
   shellsplit/include/env_screener.h
   shellsplit/include/relative_permutation_entropy.h
   shellsplit/include/shell_abstract.h
@@ -46,7 +56,16 @@ function(shellclave_project_target target)
     target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic)
   endif()
   if(SHELLCLAVE_ENABLE_COVERAGE)
-    target_compile_options(${target} PRIVATE --coverage)
+    # Fault-injection seams change compiler block identities. Their counters
+    # cannot be meaningfully merged with the shipping library's CFG. Always
+    # instrument test executables (including inline helper tests), but only
+    # the selected implementation variant; keep production coverage separate.
+    if(NOT (SHELLCLAVE_COVERAGE_VARIANT STREQUAL "tests" AND
+            target MATCHES "^(shellsplit|shelltype|shellgate)$") AND
+       NOT (SHELLCLAVE_COVERAGE_VARIANT STREQUAL "production" AND
+            target MATCHES "^(shellsplit|shelltype|shellgate)_test$"))
+      target_compile_options(${target} PRIVATE --coverage)
+    endif()
     target_link_options(${target} PRIVATE --coverage)
   endif()
   if(SHELLCLAVE_ENABLE_SANITIZERS)
@@ -86,9 +105,10 @@ set_target_properties(shellsplit PROPERTIES EXPORT_NAME shellsplit)
 if(BUILD_TESTING)
   find_package(Python3 REQUIRED COMPONENTS Interpreter)
   add_library(shellsplit_test ${SHELLSPLIT_SOURCES}
-    shellsplit/tests/test_allocator.c)
+    shellsplit/tests/test_allocator.c shellsplit/tests/test_source_scans.c)
   shellclave_project_target(shellsplit_test)
-  target_compile_definitions(shellsplit_test PRIVATE SHELLSPLIT_TEST_ALLOCATOR)
+  target_compile_definitions(shellsplit_test PRIVATE
+    SHELLSPLIT_TEST_ALLOCATOR SHELLSPLIT_TEST_SOURCE_SCANS)
   target_include_directories(shellsplit_test PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/shellsplit/include
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shellsplit/src
@@ -180,8 +200,9 @@ if(BUILD_TESTING)
   shellclave_configure_shellgate_target(shellgate_test shelltype_test shellsplit_test)
   target_sources(shellgate_test PRIVATE shellgate/tests/test_sg_failures.c)
   target_compile_definitions(shellgate_test PRIVATE
-    SHELLGATE_TEST_ALLOCATOR SHELLGATE_TEST_ANOMALY_OPS SHELLGATE_TEST_IO)
-  target_include_directories(shellgate_test PRIVATE shellgate/tests)
+    SHELLGATE_TEST_ALLOCATOR SHELLGATE_TEST_ANOMALY_OPS SHELLGATE_TEST_IO
+    SHELLSPLIT_TEST_SOURCE_SCANS)
+  target_include_directories(shellgate_test PRIVATE shellgate/tests shellsplit/tests)
 endif()
 
 function(shellclave_add_test name source library)
@@ -202,6 +223,32 @@ if(BUILD_TESTING)
         -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/test_bash_ansi_nul_semantics.cmake)
     set_tests_properties(shellsplit_bash_ansi_nul_semantics PROPERTIES
       LABELS shellsplit)
+    add_test(NAME shellsplit_bash_time_semantics
+      COMMAND ${CMAKE_COMMAND}
+        -DSHELLCLAVE_BASH=${SHELLCLAVE_BASH_EXECUTABLE}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/test_bash_time_semantics.cmake)
+    set_tests_properties(shellsplit_bash_time_semantics PROPERTIES
+      LABELS shellsplit)
+    add_test(NAME shellsplit_bash_process_pipe_semantics
+      COMMAND ${CMAKE_COMMAND}
+        -DSHELLCLAVE_BASH=${SHELLCLAVE_BASH_EXECUTABLE}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/test_bash_process_pipe_semantics.cmake)
+    set_tests_properties(shellsplit_bash_process_pipe_semantics PROPERTIES
+      LABELS shellsplit TIMEOUT 10)
+    add_test(NAME shellsplit_bash_word_semantics
+      COMMAND ${CMAKE_COMMAND}
+        -DSHELLCLAVE_BASH=${SHELLCLAVE_BASH_EXECUTABLE}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/test_bash_word_semantics.cmake)
+    set_tests_properties(shellsplit_bash_word_semantics PROPERTIES
+      LABELS shellsplit)
+    if(UNIX)
+      add_test(NAME shellsplit_bash_readline_semantics
+        COMMAND "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_bash_readline_semantics.py"
+          "${SHELLCLAVE_BASH_EXECUTABLE}")
+      set_tests_properties(shellsplit_bash_readline_semantics PROPERTIES
+        LABELS shellsplit TIMEOUT 45 SKIP_RETURN_CODE 77)
+    endif()
     add_test(NAME shellsplit_bash_named_fd_semantics
       COMMAND ${CMAKE_COMMAND}
         -DSHELLCLAVE_BASH=${SHELLCLAVE_BASH_EXECUTABLE}
@@ -218,11 +265,25 @@ if(BUILD_TESTING)
   # keeping this production variant prevents that build from being the only
   # implementation exercised by the parser regression suite.
   shellclave_add_test(shellsplit_fast_parser_production_test shellsplit/tests/fast_parser_test.c shellsplit)
+  target_compile_definitions(shellsplit_fast_parser_test PRIVATE
+    SHELLSPLIT_TEST_SOURCE_SCANS)
   shellclave_add_test(shellsplit_abstract_test shellsplit/tests/abstract_test.c shellsplit_test)
+  # Run identical syntax/codec contracts in both variants. These cases do not
+  # use fault hooks, but must cover the test CFG as well as shipping behavior.
+  shellclave_add_test(shellsplit_semantics_test
+    shellsplit/tests/production_semantics_test.c shellsplit_test)
+  target_compile_definitions(shellsplit_semantics_test PRIVATE
+    SHELLSPLIT_TEST_SOURCE_SCANS)
+  target_include_directories(shellsplit_semantics_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/shellsplit/tests)
   shellclave_add_test(shellsplit_production_semantics_test
     shellsplit/tests/production_semantics_test.c shellsplit)
+  set_tests_properties(shellsplit_semantics_test shellsplit_production_semantics_test
+    PROPERTIES LABELS shellsplit)
   shellclave_add_test(shellsplit_entropy_test shellsplit/tests/entropy_test.c shellsplit_test)
   shellclave_add_test(shellsplit_depgraph_test shellsplit/tests/test_depgraph.c shellsplit_test)
+  target_compile_definitions(shellsplit_depgraph_test PRIVATE
+    SHELLSPLIT_TEST_SOURCE_SCANS)
   # The dependency graph has no allocator-test dependency, so run its full
   # public contract against both the fault-injection and shipping builds.
   shellclave_add_test(shellsplit_depgraph_production_test shellsplit/tests/test_depgraph.c shellsplit)
@@ -242,6 +303,16 @@ if(BUILD_TESTING)
   shellclave_add_test(shelltype_policy_concurrency_test shelltype/tests/test_policy_concurrency.c shelltype_test)
   shellclave_add_test(shelltype_verify_test shelltype/tests/test_verify.c shelltype_test)
   shellclave_add_test(shelltype_integration_test shelltype/tests/test_shelltype_integration.c shelltype_test)
+  foreach(variant IN ITEMS test production)
+    if(variant STREQUAL "test")
+      set(contract_library shelltype_test)
+    else()
+      set(contract_library shelltype)
+    endif()
+    shellclave_add_test(shelltype_public_contract_${variant}
+      shelltype/tests/test_public_contract.c ${contract_library})
+    set_tests_properties(shelltype_public_contract_${variant} PROPERTIES LABELS "shelltype;${variant}")
+  endforeach()
   add_executable(processed_subcommand_integration_test
     tests/test_processed_subcommand.c)
   shellclave_project_target(processed_subcommand_integration_test)
@@ -319,6 +390,10 @@ if(BUILD_TESTING)
   shellclave_add_test(shellgate_corpus_test shellgate/tests/test_corpus.c shellgate_test)
   target_include_directories(shellgate_corpus_test PRIVATE
     "${CMAKE_CURRENT_BINARY_DIR}/tests")
+  shellclave_add_test(shellgate_corpus_production_test shellgate/tests/test_corpus.c shellgate)
+  target_include_directories(shellgate_corpus_production_test PRIVATE
+    "${CMAKE_CURRENT_BINARY_DIR}/tests")
+  set_tests_properties(shellgate_corpus_production_test PROPERTIES LABELS "shellgate;production")
   add_test(NAME shellclave_command_fixture_validation
     COMMAND "${CMAKE_COMMAND}" -P
       "${CMAKE_CURRENT_SOURCE_DIR}/cmake/TestCommandFixtureValidation.cmake")
@@ -346,6 +421,7 @@ if(BUILD_TESTING)
   target_include_directories(shellgate_io_test PRIVATE
     shellgate/src shellgate/tests)
   target_include_directories(shellgate_unit_test PRIVATE shelltype/tests)
+  target_include_directories(shellgate_unit_test PRIVATE shellsplit/tests)
   target_include_directories(shellgate_anomaly_test PRIVATE shellgate/tests)
   set_tests_properties(shellgate_unit_test PROPERTIES LABELS shellgate)
   set_tests_properties(shellgate_anomaly_test PROPERTIES
@@ -395,6 +471,15 @@ if(BUILD_TESTING)
       -DSHELLCLAVE_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
       -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/test_public_api_names.cmake)
   set_tests_properties(shellclave_public_api_names PROPERTIES LABELS api)
+
+  if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    add_test(NAME shellclave_pointer_contracts
+      COMMAND ${CMAKE_COMMAND}
+        -DSHELLCLAVE_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+        -DSHELLCLAVE_C_COMPILER=${CMAKE_C_COMPILER}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/test_pointer_contracts.cmake)
+    set_tests_properties(shellclave_pointer_contracts PROPERTIES LABELS api)
+  endif()
 
   if(NOT SHELLCLAVE_ENABLE_SANITIZERS AND NOT SHELLCLAVE_ENABLE_TSAN
       AND NOT SHELLCLAVE_ENABLE_COVERAGE AND NOT SHELLCLAVE_BUILD_FUZZERS)

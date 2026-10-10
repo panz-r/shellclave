@@ -27,16 +27,10 @@ void shell_interop_free(shell_interop_handle_t *handle) {
 shell_error_t shell_interop_parse(shell_interop_handle_t *handle,
                                   const char *cmd, size_t cmd_len,
                                   size_t *subcommand_count) {
-  if (subcommand_count)
-    *subcommand_count = 0;
-  if (!handle)
-    return SHELL_EINPUT;
+  *subcommand_count = 0;
 
   memset(&handle->result, 0, sizeof(handle->result));
   handle->cmd_buffer[0] = '\0';
-
-  if (!cmd || !subcommand_count)
-    return SHELL_EINPUT;
 
   if (cmd_len == 0)
     return SHELL_EINPUT;
@@ -76,14 +70,13 @@ shell_error_t shell_interop_parse(shell_interop_handle_t *handle,
 
 /* Get subcommand count */
 size_t shell_interop_subcommand_count(const shell_interop_handle_t *handle) {
-  return handle ? handle->result.count : 0;
+  return handle->result.count;
 }
 
 bool shell_interop_subcommand_range(const shell_interop_handle_t *handle,
                                     size_t index, shell_range_t *range) {
-  if (range)
-    memset(range, 0, sizeof(*range));
-  if (!handle || !range || index >= handle->result.count)
+  memset(range, 0, sizeof(*range));
+  if (index >= handle->result.count)
     return false;
   *range = handle->result.cmds[index];
   return true;
@@ -92,11 +85,9 @@ bool shell_interop_subcommand_range(const shell_interop_handle_t *handle,
 bool shell_interop_subcommand_view(const shell_interop_handle_t *handle,
                                    size_t index, const char **data,
                                    size_t *length) {
-  if (data)
-    *data = NULL;
-  if (length)
-    *length = 0;
-  if (!handle || !data || !length || index >= handle->result.count)
+  *data = NULL;
+  *length = 0;
+  if (index >= handle->result.count)
     return false;
   *data = handle->cmd_buffer + handle->result.cmds[index].start;
   *length = handle->result.cmds[index].len;
@@ -146,9 +137,8 @@ shell_error_t shell_interop_format_features(uint32_t features, char *output,
                {SHELL_FEAT_ARRAY, "ARRAY"},
                {SHELL_FEAT_NAMED_FD, "NAMED_FD"},
                {SHELL_FEAT_COMBINED_REDIRECT, "COMBINED_REDIRECT"}};
-  if (written)
-    *written = 0;
-  if (!output || output_size == 0 || !written)
+  *written = 0;
+  if (output_size == 0)
     return SHELL_EINPUT;
   output[0] = '\0';
   size_t length = 0;

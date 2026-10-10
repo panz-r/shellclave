@@ -8,7 +8,7 @@
 
 // Function to compute Shannon entropy for n-grams
 double shell_rpe_ngram_entropy(const char *s, int n) {
-  if (!s || (n != 1 && n != 2))
+  if ((n != 1) && (n != 2))
     return NAN;
   int freq[256 * 256] = {0}; // Supports up to 2-grams
   size_t total_ngrams = 0;
@@ -46,8 +46,6 @@ void fixed_permute_string(char *s, int perm_index);
 // Conditional entropy H(Char_i | Char_{i-1}) - entropy of char given previous
 // char
 double shell_rpe_conditional_entropy(const char *s) {
-  if (!s)
-    return NAN;
   int bigram_freq[256][256] = {0};
   int char_freq[256] = {0};
   int total_bigrams = 0;
@@ -87,7 +85,7 @@ double shell_rpe_conditional_entropy(const char *s) {
 
 // Median conditional entropy over permutations
 double shell_rpe_permutation_conditional_entropy(const char *s, int n_perms) {
-  if (!s || n_perms <= 0)
+  if (n_perms <= 0)
     return NAN;
   if (strlen(s) < 12) {
     return shell_rpe_conditional_entropy(s);
@@ -129,7 +127,7 @@ double shell_rpe_permutation_conditional_entropy(const char *s, int n_perms) {
 
 // Relative conditional entropy ratio
 double shell_rpe_relative_conditional_entropy(const char *s, int n_perms) {
-  if (!s || n_perms <= 0)
+  if (n_perms <= 0)
     return NAN;
   double H_original = shell_rpe_conditional_entropy(s);
   double H_permuted = shell_rpe_permutation_conditional_entropy(s, n_perms);
@@ -168,7 +166,7 @@ void fixed_permute_string(char *s, int perm_index) {
 
 // Function to compute median permutation entropy
 double shell_rpe_permutation_entropy(const char *s, int n_perms, int n) {
-  if (!s || n_perms <= 0 || (n != 1 && n != 2))
+  if ((n_perms <= 0) || ((n != 1) && (n != 2)))
     return NAN;
   if (strlen(s) < 12) {
     return shell_rpe_ngram_entropy(s, n);
@@ -210,7 +208,7 @@ double shell_rpe_permutation_entropy(const char *s, int n_perms, int n) {
 
 // Function to compute relative entropy ratio
 double shell_rpe_relative_entropy_ratio(const char *s, int n_perms, int n) {
-  if (!s || n_perms <= 0 || (n != 1 && n != 2))
+  if ((n_perms <= 0) || ((n != 1) && (n != 2)))
     return NAN;
   double H_original = shell_rpe_ngram_entropy(s, n);
   double H_permuted = shell_rpe_permutation_entropy(s, n_perms, n);
