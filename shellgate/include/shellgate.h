@@ -142,6 +142,13 @@ typedef struct {
    * This is authoritative. Both pointers refer into the caller buffer. */
   const char *netargv;
   size_t netargv_length;
+  /* SG_EXPANSION_UNRESOLVED_* bits for this command and inherited group I/O:
+   * policy may still match processed source, not fully expanded runtime values.
+   * Protected semantic operands also count, independently of rendering.
+   * Resolving a containing word does not resolve nested file-substitution
+   * operands. Reached pathname expansions count even if the open then fails.
+   */
+  uint32_t unresolved_expansion_flags;
   const char *reject_reason;
 
   /* Direct I/O plus I/O owned by an enclosing compound group. write_count also
@@ -197,6 +204,10 @@ typedef struct {
    * when the relevant stream is owned by a compound command. */
   uint32_t command_node_index;
   const char *description;
+  /* Owned by the caller's output buffer, including any copied callback data.
+   * Resolved FILE details use: resolved "<value>" (source "<spelling>").
+   * Quotes/backslashes are escaped; control/non-ASCII bytes use \xHH.
+   * Source-only FILE details retain their original source spelling. */
   const char *detail;
 } sg_violation_t;
 
@@ -259,6 +270,13 @@ typedef struct {
    * classification. */
   bool has_dynamic_substitution_io;
   uint32_t violation_dropped_count;
+  /* Aggregate unresolved argv/path information over the retained constructed
+   * graph, including group-owned I/O and commands omitted by policy early-stop
+   * or output truncation, including nested pathname expansions whose final
+   * I/O edge disappeared after a failed open. Independent of rendering. A
+   * truncated graph covers only retained metadata; failures before graph
+   * construction completes do not provide complete expansion information. */
+  uint32_t unresolved_expansion_flags;
   bool has_violations;
 
   /* Anomaly detection */
@@ -377,10 +395,10 @@ void sg_violation_config_default(sg_violation_config_t *cfg) SHELL_NONNULL(1);
 
 /* --- EXPANSION CALLBACKS --- */
 
-/* Canonical expansion callbacks receive a borrowed query span and return a
- * borrowed canonical netargv span. Neither span need be NUL-terminated; the
- * resolved netargv may contain embedded NUL bytes and is interpreted only by
- * its explicit length. On SG_EXPAND_RESOLVED, the callback must provide a
+/* Whole-word expansion callbacks receive the exact isolated source spelling
+ * and return its final canonical netargv. Neither span need be NUL-terminated;
+ * the resolved netargv may contain embedded NUL bytes and is interpreted only
+ * by its explicit length. On SG_EXPAND_RESOLVED, the callback must provide a
  * canonical netargv (or NULL with length zero for an empty expansion). The
  * returned bytes must remain valid and unchanged until the enclosing
  * sg_gate_evaluate() call returns, including across later callback invocations.
@@ -388,15 +406,23 @@ void sg_violation_config_default(sg_violation_config_t *cfg) SHELL_NONNULL(1);
  * for other statuses. Failed or malformed results make sg_gate_evaluate()
  * return SG_ERR_EXPAND.
  *
- * Variable queries are names from whole unquoted scalar words: $NAME,
- * ${NAME}, $1, or ${12}. Positional names consist only of digits; unbraced
- * positional parameters consume one digit, so $12 and $1abc are compound
- * words and do not invoke this callback. Quoted/compound words, special
- * parameters, parameter operators, and names requiring continuation removal
- * remain unresolved by this name-only interface.
- * Glob queries retain the original source spelling of a word containing
- * active unquoted glob/extglob syntax. Quoted or escaped wildcard bytes and
- * expansion interiors do not by themselves cause a glob callback invocation.
+ * The application performs quote-sensitive composition, splitting and globbing
+ * in Bash expansion order. It must return a result valid for every execution
+ * state reaching this expansion point, accounting for earlier/scoped effects;
+ * otherwise return UNRESOLVED. This library never executes an expansion.
+ * Bash assignment-shaped tilde expansion (name=~, name+=~, name=a:~) also
+ * applies to FILE operands, including $(<name=~), but not here-string data.
+ * Source syntax is validated before callbacks. Command identity, wrappers,
+ * assignments, cd and shell-state/descriptor operands are not resolved here.
+ * This includes printf %b operands in formats containing %n: an expanded
+ * '\c' can suppress later variable writes, including on format reuse.
+ * Ordinary printf data, including %b without %n, remains eligible.
+ * Callback ordering follows analysis phases, not runtime scheduling or policy
+ * short-circuiting. Each eligible dynamic source word is queried at most once.
+ * Resolution does not discharge executable-substitution inspection obligations.
+ * Unresolved words retain processed-source policy behavior and set result
+ * flags. A pathname must resolve to one nonempty NUL-free record. Zero/multiple
+ * records or an empty pathname model redirection failure; NUL is SG_ERR_EXPAND.
  */
 typedef enum {
   SG_EXPAND_UNRESOLVED = 0,
@@ -404,10 +430,38 @@ typedef enum {
   SG_EXPAND_FAILED = -1,
 } sg_expand_status_t;
 
-typedef sg_expand_status_t (*sg_expand_netargv_fn)(
-    const char *name_or_pattern, size_t name_or_pattern_length,
-    const char **netargv, size_t *netargv_length, void *user_ctx)
-    SHELL_NONNULL(1, 3, 4);
+typedef enum {
+  SG_EXPAND_WORD_ARGUMENT = 0,
+  SG_EXPAND_WORD_REDIRECT_PATH,
+  SG_EXPAND_WORD_FILE_SUBSTITUTION_PATH,
+} sg_expand_word_purpose_t;
+
+enum {
+  SG_EXPANSION_UNRESOLVED_ARGV = 1u << 0,
+  SG_EXPANSION_UNRESOLVED_PATH = 1u << 1,
+};
+
+/* Source/word/owner spans borrow immutable source for this evaluation.
+ * owner_offset/length identify the immediate command or group. The request
+ * object and its borrowed NUL-terminated cwd string are valid only during the
+ * callback; copy them if retaining them. cwd is NULL iff cwd_known is false;
+ * a known relative CWD is not an absolute filesystem identity. Mixed quoting
+ * is conveyed by the word's exact spelling, not a single quoted boolean.
+ * Returned netargv storage, unlike the request/CWD, must remain immutable
+ * until evaluation returns, as described above. */
+typedef struct {
+  const char *source;
+  size_t source_length;
+  size_t word_offset, word_length;
+  size_t owner_offset, owner_length;
+  sg_expand_word_purpose_t purpose;
+  const char *cwd;
+  bool cwd_known, cwd_absolute;
+} sg_expand_word_request_t;
+
+typedef sg_expand_status_t (*sg_expand_word_netargv_fn)(
+    const sg_expand_word_request_t *request, const char **netargv,
+    size_t *netargv_length, void *user_ctx) SHELL_NONNULL(1, 2, 3);
 
 /* --- LIFECYCLE --- */
 
@@ -653,11 +707,9 @@ sg_error_t sg_gate_set_stop_mode(sg_gate_t *gate, sg_stop_mode_t mode)
 sg_error_t sg_gate_set_suggestions(sg_gate_t *gate, bool enabled)
     SHELL_NONNULL(1);
 
-sg_error_t sg_gate_set_expand_var_netargv(sg_gate_t *gate,
-                                          sg_expand_netargv_fn fn,
-                                          void *user_ctx) SHELL_NONNULL(1);
-sg_error_t sg_gate_set_expand_glob_netargv(sg_gate_t *gate,
-                                           sg_expand_netargv_fn fn,
+/* NULL fn disables resolution; user_ctx is optional application state. */
+sg_error_t sg_gate_set_expand_word_netargv(sg_gate_t *gate,
+                                           sg_expand_word_netargv_fn fn,
                                            void *user_ctx) SHELL_NONNULL(1);
 
 /*
@@ -729,8 +781,10 @@ size_t sg_gate_deny_rule_count(const sg_gate_t *gate) SHELL_NONNULL(1);
  *   suggestions) are packed into the remaining prefix. Parse errors,
  *   unsupported-feature rejections, and workspace-unavailable diagnostics
  *   occur before that reservation and may use the complete buffer. No result
- *   pointer refers to the private tail when it is reserved. `buf` must remain
- *   valid while reading `sg_result_t` string fields. Use
+ *   pointer refers to private workspace when it is reserved. Resolved paths
+ *   may extend private scratch/identity storage into the prefix before result
+ *   rendering; a larger buffer supplies both that storage and result space.
+ *   `buf` must remain valid while reading `sg_result_t` string fields. Use
  *   sg_gate_evaluate_size_hint() for ordinary successful evaluations. `cmd`,
  *   `buf`, and `out` must occupy non-overlapping storage: command bytes are
  *   borrowed during rendering, `buf` is writable result/workspace storage,
@@ -757,13 +811,15 @@ size_t sg_gate_deny_rule_count(const sg_gate_t *gate) SHELL_NONNULL(1);
  * Returns SG_OK on success, SG_ERR_PARSE for malformed input, SG_ERR_EXPAND
  * when an expansion callback fails or returns malformed canonical data,
  * SG_ERR_MEMORY if the evaluation buffer cannot also hold the bounded
- * depgraph workspace, SG_ERR_TRUNC if the output buffer or bounded
- * subcommand result array was too small (partial results are still valid), or
+ * depgraph workspace or resolved-path analysis storage, SG_ERR_TRUNC if the
+ * output buffer or bounded subcommand result array was too small (partial
+ * results are still valid), or
  * SG_ERR_INVALID for invalid source or buffer sizes.
  * The error code reports the primary failure: `truncated` independently
  * reports incomplete result or diagnostic rendering, so it can also be true
- * with SG_ERR_MEMORY when even the workspace-unavailable diagnostic cannot
- * fit. SG_ERR_TRUNC always sets `truncated`. Inspect `truncated`,
+ * with SG_ERR_EXPAND when its failure diagnostic cannot fit, or SG_ERR_MEMORY
+ * when even the workspace-unavailable diagnostic cannot fit. SG_ERR_TRUNC
+ * always sets `truncated`. Inspect `truncated`,
  * `subcommand_truncated`, and `violation_truncated` to identify the truncated
  * result category. Any truncated result leaves the verdict
  * SG_VERDICT_UNDETERMINED rather than authorizing incomplete output or an
@@ -790,9 +846,10 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
 /*
  * Return a recommended initial evaluation-buffer size for a command of
  * `cmd_len` bytes. The estimate includes both command/result storage and the
- * aligned bounded depgraph workspace, reused for source-sized path decoding
- * and identity comparison scratch. Expansion callbacks and violation
- * details can require additional result-prefix space.
+ * aligned bounded workspace: persistent expansion metadata plus depgraph,
+ * source-sized path decoding and identity comparison scratch. Expansion
+ * callbacks can require additional workspace for resolved path bytes as well
+ * as result-prefix space; violation details can also require more result space.
  */
 size_t sg_gate_evaluate_size_hint(size_t cmd_len);
 

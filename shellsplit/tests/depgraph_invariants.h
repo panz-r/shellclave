@@ -53,7 +53,9 @@ static bool shellsplit_test_edge_types_match(const shell_dep_graph_t *graph,
               graph->nodes[edge->to].doc.kind == SHELL_DOC_HERESTRING ||
               (graph->nodes[edge->to].doc.kind == SHELL_DOC_FILE &&
                (graph->nodes[edge->to].doc.flags &
-                SHELL_DEP_DOC_FLAG_DYNAMIC_NAME) != 0 &&
+                (SHELL_DEP_DOC_FLAG_DYNAMIC_NAME |
+                 SHELL_DEP_DOC_FLAG_RESOLVED_PATH |
+                 SHELL_DEP_DOC_FLAG_EXPANSION_FAILED)) != 0 &&
                (edge->flags & SHELL_DEP_EDGE_FLAG_SUBST_DYNAMIC_NAME) !=
                    0)))) &&
            (((from == SHELL_NODE_ENDPOINT || from == SHELL_NODE_DOC) &&
@@ -371,13 +373,23 @@ static bool shellsplit_test_depgraph_invariants(
                                                node->doc.path_len) ||
                 !shellsplit_test_span_in_input(input, length, node->doc.name,
                                                node->doc.name_len) ||
-                !shellsplit_test_span_in_input(input, length, node->doc.value,
-                                               node->doc.value_len) ||
+                ((node->doc.flags & SHELL_DEP_DOC_FLAG_RESOLVED_PATH)
+                     ? node->doc.kind != SHELL_DOC_FILE ||
+                           node->doc.value == NULL ||
+                           node->doc.value_len == 0 ||
+                           memchr(node->doc.value, 0, node->doc.value_len) !=
+                               NULL
+                     : !shellsplit_test_span_in_input(input, length,
+                                                      node->doc.value,
+                                                      node->doc.value_len)) ||
                 (node->doc.flags & ~(SHELL_DEP_DOC_FLAG_HEREDOC_STRIP_TABS |
                                      SHELL_DEP_DOC_FLAG_DYNAMIC_NAME |
                                      SHELL_DEP_DOC_FLAG_HEREDOC_LITERAL |
                                      SHELL_DEP_DOC_FLAG_TRANSIENT |
-                                     SHELL_DEP_DOC_FLAG_ENVVAR_APPEND)) != 0)) {
+                                     SHELL_DEP_DOC_FLAG_ENVVAR_APPEND |
+                                     SHELL_DEP_DOC_FLAG_RESOLVED_PATH |
+                                     SHELL_DEP_DOC_FLAG_EXPANSION_FAILED)) !=
+                    0)) {
       return false;
     }
   }

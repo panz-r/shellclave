@@ -20,6 +20,7 @@
 #include <fuzzer/FuzzedDataProvider.h>
 
 extern "C" {
+#include "../tests/test_eval_buffer.h"
 #include "shell_depgraph.h"
 #include "shell_netstring.h"
 #include "shell_tokenizer.h"
@@ -47,10 +48,9 @@ size_t eval_buffer_size(size_t command_length, size_t minimum_prefix = 0) {
   size_t hint = sg_gate_evaluate_size_hint(command_length);
   if (hint == SIZE_MAX)
     return 0;
-  size_t workspace = 0;
+  size_t workspace = sg_test_eval_workspace_size(command_length);
   size_t alignment = shell_dep_workspace_alignment();
-  if (!shell_dep_workspace_size(nullptr, &workspace) || alignment == 0 ||
-      minimum_prefix > SIZE_MAX - workspace ||
+  if (workspace == 0 || minimum_prefix > SIZE_MAX - workspace ||
       minimum_prefix + workspace > SIZE_MAX - (alignment - 1))
     return 0;
   size_t minimum = minimum_prefix + workspace + alignment - 1;
@@ -125,6 +125,7 @@ constexpr int kSeedCmdsN = sizeof(kSeedCmds) / sizeof(kSeedCmds[0]);
 
 sg_gate_t *g_anomaly_pool[kPoolSize];
 sg_gate_t *g_policy_pool[kPoolSize];
+sg_gate_t *g_expansion_gate;
 eval_buffer_set g_eval_buffers;
 
 void invariant_failure(const char *message) {
@@ -167,27 +168,6 @@ int valid_buffer_span(const char *value, size_t length, const char *buffer,
   return length <= size - (size_t)offset;
 }
 
-/* Mirror Shellgate's documented aligned workspace placement. Graph-backed
- * results must not expose pointers into this private tail; early parse and
- * feature rejections intentionally retain the complete caller buffer. */
-size_t eval_result_prefix_size(const char *buffer, size_t buffer_size) {
-  size_t workspace_size = 0;
-  size_t alignment = shell_dep_workspace_alignment();
-  if (!buffer || buffer_size == 0 ||
-      !shell_dep_workspace_size(nullptr, &workspace_size) || alignment == 0 ||
-      workspace_size > buffer_size)
-    return 0;
-  uintptr_t begin = (uintptr_t)buffer;
-  if (buffer_size > UINTPTR_MAX - begin)
-    return 0;
-  uintptr_t start = begin + buffer_size - workspace_size;
-  uintptr_t padding = start % alignment;
-  if (padding > start || start - padding < begin)
-    return 0;
-  start -= padding;
-  return start == begin ? 0 : (size_t)(start - begin);
-}
-
 bool valid_verdict(sg_verdict_t verdict) {
   switch (verdict) {
   case SG_VERDICT_ALLOW:
@@ -212,6 +192,8 @@ void validate_result(const sg_result_t *result, sg_error_t error,
       result->subcommand_count > SG_MAX_SUBCOMMAND_RESULTS ||
       result->violation_count > SG_MAX_VIOLATIONS ||
       result->suggestion_count > 2 || result->deny_suggestion_count > 2 ||
+      (result->unresolved_expansion_flags &
+       ~(SG_EXPANSION_UNRESOLVED_ARGV | SG_EXPANSION_UNRESOLVED_PATH)) != 0 ||
       (error == SG_ERR_TRUNC && !result->truncated) ||
       (result->truncated && result->verdict != SG_VERDICT_UNDETERMINED) ||
       (error == SG_ERR_TRUNC &&
@@ -224,6 +206,9 @@ void validate_result(const sg_result_t *result, sg_error_t error,
 
   for (uint32_t i = 0; i < result->subcommand_count; i++) {
     const sg_subcommand_result_t *subcommand = &result->subcommands[i];
+    if ((subcommand->unresolved_expansion_flags &
+         ~result->unresolved_expansion_flags) != 0)
+      invariant_failure("subcommand unresolved flags lack aggregate flags");
     if (!valid_buffer_string(subcommand->display_command, buffer,
                              buffer_size) ||
         !valid_buffer_string(subcommand->reject_reason, buffer, buffer_size) ||
@@ -279,18 +264,22 @@ void validate_result(const sg_result_t *result, sg_error_t error,
 
 void validate_known_graph_result_prefix(const sg_result_t *result,
                                         sg_error_t error, const char *buffer,
-                                        size_t buffer_size) {
-  size_t prefix_size = eval_result_prefix_size(buffer, buffer_size);
+                                        size_t buffer_size,
+                                        size_t command_length) {
+  size_t prefix_size =
+      sg_test_eval_prefix_size(buffer, buffer_size, command_length);
   if (prefix_size == 0)
     invariant_failure("graph result had no public output prefix");
   validate_result(result, error, buffer, prefix_size);
 }
 
 void validate_graph_result_prefix(const sg_result_t *result, sg_error_t error,
-                                  const char *buffer, size_t buffer_size) {
+                                  const char *buffer, size_t buffer_size,
+                                  size_t command_length) {
   if (error != SG_OK || result->verdict == SG_VERDICT_REJECT)
     return;
-  validate_known_graph_result_prefix(result, error, buffer, buffer_size);
+  validate_known_graph_result_prefix(result, error, buffer, buffer_size,
+                                     command_length);
 }
 
 bool results_equal(const sg_result_t &left, const sg_result_t &right) {
@@ -310,6 +299,7 @@ bool results_equal(const sg_result_t &left, const sg_result_t &right) {
       left.requires_substitution_evaluation !=
           right.requires_substitution_evaluation ||
       left.has_dynamic_substitution_io != right.has_dynamic_substitution_io ||
+      left.unresolved_expansion_flags != right.unresolved_expansion_flags ||
       left.violation_dropped_count != right.violation_dropped_count ||
       left.has_violations != right.has_violations ||
       left.anomaly_detected != right.anomaly_detected ||
@@ -332,6 +322,7 @@ bool results_equal(const sg_result_t &left, const sg_result_t &right) {
         a.requires_substitution_evaluation !=
             b.requires_substitution_evaluation ||
         a.has_dynamic_substitution_io != b.has_dynamic_substitution_io ||
+        a.unresolved_expansion_flags != b.unresolved_expansion_flags ||
         a.substitution_consumer_index != b.substitution_consumer_index ||
         a.group_parent_index != b.group_parent_index ||
         a.group_depth != b.group_depth || a.group_kinds != b.group_kinds ||
@@ -364,18 +355,32 @@ bool results_equal(const sg_result_t &left, const sg_result_t &right) {
 struct expansion_query_oracle {
   const char *expected;
   size_t calls;
+  const char *records = "3:hit,";
+  bool unresolved = false;
+  bool check_cwd = false;
+  const char *cwd = nullptr;
+  bool cwd_absolute = false;
 };
 
-sg_expand_status_t oracle_expand_word(const char *query, size_t length,
+sg_expand_status_t oracle_expand_word(const sg_expand_word_request_t *request,
                                       const char **netargv,
                                       size_t *netargv_length, void *userdata) {
   auto *state = static_cast<expansion_query_oracle *>(userdata);
+  const char *query = request->source + request->word_offset;
+  size_t length = request->word_length;
   state->calls++;
   if (!state->expected || strlen(state->expected) != length ||
       memcmp(state->expected, query, length) != 0)
     invariant_failure("unexpected source-word expansion query");
-  *netargv = "3:hit,";
-  *netargv_length = sizeof("3:hit,") - 1;
+  if (state->check_cwd &&
+      (request->cwd_known != (state->cwd != nullptr) ||
+       (state->cwd && (request->cwd_absolute != state->cwd_absolute ||
+                       strcmp(request->cwd, state->cwd) != 0))))
+    invariant_failure("tilde CWD expansion query mismatch");
+  if (state->unresolved)
+    return SG_EXPAND_UNRESOLVED;
+  *netargv = state->records;
+  *netargv_length = strlen(state->records);
   return SG_EXPAND_RESOLVED;
 }
 
@@ -383,17 +388,17 @@ void run_expansion_query_oracles() {
   sg_gate_t *gate = sg_gate_new();
   expansion_query_oracle state = {};
   if (!gate ||
-      sg_gate_set_expand_glob_netargv(gate, oracle_expand_word, &state) !=
+      sg_gate_set_expand_word_netargv(gate, oracle_expand_word, &state) !=
           SG_OK ||
-      sg_gate_set_expand_var_netargv(gate, oracle_expand_word, &state) !=
-          SG_OK ||
+      sg_gate_set_reject_mask(gate, 0) != SG_OK ||
       sg_gate_set_suggestions(gate, false) != SG_OK)
     invariant_failure("expansion oracle setup failed");
   reusable_eval_buffer buffer;
   auto check = [&](const char *word, const char *expected,
-                   bool unsupported = false) {
+                   bool unsupported = false, bool unresolved = false) {
     std::string source = std::string("echo ") + word;
     state = {expected, 0};
+    state.unresolved = unresolved;
     if (!buffer.reset_for(source.size()))
       invariant_failure("expansion oracle buffer allocation failed");
     sg_result_t result = {};
@@ -401,14 +406,516 @@ void run_expansion_query_oracles() {
                                         buffer.data(), buffer.size(), &result);
     if (error != (unsupported ? SG_ERR_PARSE : SG_OK) ||
         (unsupported && result.verdict != SG_VERDICT_REJECT) ||
-        state.calls != static_cast<size_t>(expected != nullptr))
+        state.calls != static_cast<size_t>(expected != nullptr)) {
+      fprintf(stderr,
+              "expansion oracle word=%s unsupported=%d expected=%s "
+              "error=%d verdict=%d calls=%zu\n",
+              word, unsupported, expected ? expected : "<none>", error,
+              result.verdict, state.calls);
       invariant_failure("source-word expansion callback contract mismatch");
+    }
   };
-  for (const auto &fixture : shellsplit_test_glob_words)
-    check(fixture.word, fixture.glob ? fixture.word : nullptr);
-  for (const auto &fixture : shellsplit_test_parameter_words)
-    check(fixture.word, fixture.name, fixture.unsupported);
+  for (const auto &fixture : shellsplit_test_glob_words) {
+    check(fixture.word, fixture.expand ? fixture.word : nullptr);
+  }
+  for (const auto &fixture : shellsplit_test_tilde_words)
+    check(fixture.word, fixture.argument_dynamic ? fixture.word : nullptr,
+          false, true);
+  for (const auto &fixture : shellsplit_test_parameter_words) {
+    check(fixture.word, fixture.expand ? fixture.word : nullptr,
+          fixture.unsupported);
+  }
+  if (sg_gate_set_cwd(gate, "/workspace") != SG_OK)
+    invariant_failure("tilde CWD oracle configuration");
+  for (const auto &fixture : shellsplit_test_tilde_cwd) {
+    if (fixture.other_dynamic)
+      continue; /* These retained cd queries are covered by the component suite.
+                 */
+    state = {"\"$ARG\"", 0};
+    state.unresolved = true;
+    state.check_cwd = true;
+    state.cwd = fixture.cwd;
+    state.cwd_absolute = fixture.absolute;
+    std::string source = std::string("cd ") + fixture.word + "; echo \"$ARG\"";
+    if (!buffer.reset_for(source.size()))
+      invariant_failure("tilde CWD oracle buffer allocation");
+    sg_result_t result = {};
+    if (sg_gate_evaluate(gate, source.data(), source.size(), buffer.data(),
+                         buffer.size(), &result) != SG_OK ||
+        state.calls != 1 ||
+        result.unresolved_expansion_flags != SG_EXPANSION_UNRESOLVED_ARGV)
+      invariant_failure("tilde CWD callback contract");
+  }
+  sg_violation_config_t config;
+  sg_violation_config_default(&config);
+  if (sg_gate_set_violation_config_borrowed(gate, &config) != SG_OK ||
+      sg_gate_set_stop_mode(gate, SG_EVAL_ALL) != SG_OK)
+    invariant_failure("resolved expansion oracle configuration");
+  for (const auto &fixture : shellsplit_test_tilde_path_aliases) {
+    for (unsigned mode = 0; mode < 3; mode++) {
+      state = {fixture.dynamic ? fixture.word : nullptr, 0, fixture.record};
+      state.unresolved = mode != 2;
+      if (sg_gate_set_expand_word_netargv(
+              gate, mode ? oracle_expand_word : nullptr, &state) != SG_OK)
+        invariant_failure("tilde identity oracle configuration");
+      size_t length = strlen(fixture.source);
+      if (!buffer.reset_for(length))
+        invariant_failure("tilde identity oracle buffer allocation");
+      sg_result_t result = {};
+      size_t calls = fixture.dynamic && mode
+                         ? (strcmp(fixture.word, "\"$OUT\"") == 0 ? 2u : 1u)
+                         : 0;
+      bool alias = (!fixture.dynamic || mode == 2) && fixture.resolved_alias;
+      if (sg_gate_evaluate(gate, fixture.source, length, buffer.data(),
+                           buffer.size(), &result) != SG_OK ||
+          state.calls != calls || result.subcommand_count != 2 ||
+          result.unresolved_expansion_flags !=
+              (fixture.dynamic && mode != 2 ? SG_EXPANSION_UNRESOLVED_PATH
+                                            : 0) ||
+          !!(result.violation_type_flags & SG_VIOL_WRITE_THEN_READ) != alias)
+        invariant_failure("tilde path identity alias contract");
+    }
+  }
+  if (sg_gate_set_expand_word_netargv(gate, oracle_expand_word, &state) !=
+      SG_OK)
+    invariant_failure("restore expansion oracle callback");
+  static const struct {
+    const char *command, *word, *records;
+    uint32_t violation;
+    bool inspection, dynamic;
+  } resolved[] = {
+      {"curl $OPTION", "$OPTION", "2:-T,", SG_VIOL_NET_UPLOAD, false, false},
+      {"base64 $OPTION | sh", "$OPTION", "2:-d,", SG_VIOL_SHELL_OBFUSCATION,
+       false, false},
+      {"base64 $OPTION | sh", "$OPTION", "4:'-d',", 0, false, false},
+      {"cat \"$(printf file)\"", "\"$(printf file)\"", "13:/root/.ssh/id,",
+       SG_VIOL_READ_SECRETS, true, true},
+      {"echo >\"$(cat /root/.ssh/id)\"", "\"$(cat /root/.ssh/id)\"",
+       "8:/tmp/out,", SG_VIOL_SUBST_SENSITIVE, false, true},
+      {"true {fd}>\"$(cat /root/.ssh/id)\"", "\"$(cat /root/.ssh/id)\"", "0:,",
+       0, false, false},
+      {"exec {fd}>\"$FAIL\"", "\"$FAIL\"", "0:,", 0, false, false},
+      {"echo >\"$FAIL\" {fd}>/etc/later", "\"$FAIL\"", "0:,", 0, false, false},
+      {"{ echo hi; } >\"$FAIL\" {fd}>/etc/later", "\"$FAIL\"", "0:,", 0, false,
+       false},
+  };
+  for (const auto &fixture : resolved) {
+    state = {fixture.word, 0, fixture.records};
+    size_t length = strlen(fixture.command);
+    if (!buffer.reset_for(length))
+      invariant_failure("resolved expansion oracle buffer allocation");
+    sg_result_t result = {};
+    if (sg_gate_evaluate(gate, fixture.command, length, buffer.data(),
+                         buffer.size(), &result) != SG_OK ||
+        state.calls != 1 || result.subcommand_count == 0 ||
+        result.unresolved_expansion_flags != 0 ||
+        result.requires_substitution_evaluation != fixture.inspection ||
+        result.subcommands[0].has_dynamic_substitution_io != fixture.dynamic)
+      invariant_failure("resolved expansion topology or callback contract");
+    uint32_t flags = fixture.violation == SG_VIOL_SHELL_OBFUSCATION
+                         ? result.violation_type_flags
+                         : result.subcommands[0].violation_type_flags;
+    if (fixture.violation ? (flags & fixture.violation) == 0 : flags != 0)
+      invariant_failure("resolved expansion violation contract");
+  }
+  static const struct {
+    const char *source, *records;
+    uint32_t violation;
+  } equivalents[] = {
+      {"rsync /tmp/x remote$'\\x3a'out", "6:/tmp/x,10:remote:out,",
+       SG_VIOL_NET_UPLOAD},
+      {"rsync /tmp/x remote\\:out", "6:/tmp/x,10:remote:out,",
+       SG_VIOL_NET_UPLOAD},
+      {"socat TCP-LI\"ST\"EN:8000 STDIO", "15:TCP-LISTEN:8000,5:STDIO,",
+       SG_VIOL_NET_LISTENER},
+      {"socat TCP-li\"st\"en:8000 STDIO", "15:TCP-listen:8000,5:STDIO,",
+       SG_VIOL_NET_LISTENER},
+      {"socat TCP-LiStEn:8000 STDIO", "15:TCP-LiStEn:8000,5:STDIO,", 0},
+  };
+  for (const auto &fixture : equivalents) {
+    sg_gate_set_expand_word_netargv(gate, nullptr, nullptr);
+    size_t length = strlen(fixture.source);
+    buffer.reset_for(length);
+    sg_result_t literal = {};
+    if (sg_gate_evaluate(gate, fixture.source, length, buffer.data(),
+                         buffer.size(), &literal) != SG_OK ||
+        literal.subcommand_count != 1 ||
+        literal.violation_type_flags != fixture.violation)
+      invariant_failure("static decoded substring oracle");
+    std::string argv(literal.subcommands[0].netargv,
+                     literal.subcommands[0].netargv_length);
+    const char *source = fixture.violation == SG_VIOL_NET_UPLOAD
+                             ? "rsync $OPTION"
+                             : "socat $OPTION";
+    state = {"$OPTION", 0, fixture.records};
+    sg_gate_set_expand_word_netargv(gate, oracle_expand_word, &state);
+    length = strlen(source);
+    buffer.reset_for(length);
+    sg_result_t expanded = {};
+    if (sg_gate_evaluate(gate, source, length, buffer.data(), buffer.size(),
+                         &expanded) != SG_OK ||
+        state.calls != 1 || expanded.subcommand_count != 1 ||
+        expanded.violation_type_flags != literal.violation_type_flags ||
+        expanded.verdict != literal.verdict ||
+        argv.size() != expanded.subcommands[0].netargv_length ||
+        memcmp(argv.data(), expanded.subcommands[0].netargv, argv.size()) != 0)
+      invariant_failure("canonical argv substring equivalence");
+  }
+  static const struct {
+    const char *source;
+    bool expand;
+  } printf_cases[] = {
+      {"printf '%b%n' \"$V\" fd", false},
+      {"command printf '%b%n' \"$V\" fd", false},
+      {"{ printf '%b%n' \"$V\" fd; }", false},
+      {"printf '%n%b' other \"$V\" fd \"$V\"", false},
+      {"printf '%s%n' \"$V\" fd", true},
+      {"printf '%b' \"$V\"", true},
+  };
+  for (const auto &fixture : printf_cases) {
+    state = {fixture.expand ? "\"$V\"" : nullptr, 0, "2:\\c,"};
+    size_t length = strlen(fixture.source);
+    if (!buffer.reset_for(length))
+      invariant_failure("printf expansion oracle buffer allocation failed");
+    sg_result_t result = {};
+    sg_error_t error = sg_gate_evaluate(gate, fixture.source, length,
+                                        buffer.data(), buffer.size(), &result);
+    uint32_t flags = fixture.expand ? 0 : SG_EXPANSION_UNRESOLVED_ARGV;
+    if (error != SG_OK || state.calls != fixture.expand ||
+        result.subcommand_count != 1 ||
+        result.unresolved_expansion_flags != flags ||
+        result.subcommands[0].unresolved_expansion_flags != flags)
+      invariant_failure("printf state-controlling operand was expanded");
+    validate_known_graph_result_prefix(&result, error, buffer.data(),
+                                       buffer.size(), length);
+  }
+  sg_gate_set_expand_word_netargv(gate, nullptr, nullptr);
+  static const struct {
+    const char *source;
+    uint32_t flags;
+  } unresolved[] = {
+      {"echo \"$DATA\"", SG_EXPANSION_UNRESOLVED_ARGV},
+      {"echo >\"$OUT\"", SG_EXPANSION_UNRESOLVED_PATH},
+      {"{ echo \"$DATA\"; } >\"$OUT\"",
+       SG_EXPANSION_UNRESOLVED_ARGV | SG_EXPANSION_UNRESOLVED_PATH},
+  };
+  for (const auto &fixture : unresolved) {
+    size_t length = strlen(fixture.source);
+    if (!buffer.reset_for(length))
+      invariant_failure("unresolved oracle buffer allocation failed");
+    sg_result_t result = {};
+    sg_error_t error = sg_gate_evaluate(gate, fixture.source, length,
+                                        buffer.data(), buffer.size(), &result);
+    if (error != SG_OK || result.subcommand_count != 1 ||
+        result.unresolved_expansion_flags != fixture.flags ||
+        result.subcommands[0].unresolved_expansion_flags != fixture.flags)
+      invariant_failure("unresolved expansion flags mismatch");
+    validate_known_graph_result_prefix(&result, error, buffer.data(),
+                                       buffer.size(), length);
+    sg_result_t changed = result;
+    changed.unresolved_expansion_flags ^= SG_EXPANSION_UNRESOLVED_ARGV;
+    if (results_equal(result, changed))
+      invariant_failure("replay ignored aggregate unresolved expansion flags");
+    changed = result;
+    changed.subcommands[0].unresolved_expansion_flags ^=
+        SG_EXPANSION_UNRESOLVED_PATH;
+    if (results_equal(result, changed))
+      invariant_failure("replay ignored command unresolved expansion flags");
+  }
+  if (sg_gate_add_allow_cpl(gate, "echo ok") != SG_OK ||
+      sg_gate_add_deny_cpl(gate, "echo denied") != SG_OK)
+    invariant_failure("early-stop expansion oracle policy setup");
+  static const struct {
+    sg_stop_mode_t mode;
+    const char *first;
+  } stops[] = {{SG_STOP_FIRST_FAIL, "echo missing"},
+               {SG_STOP_FIRST_PASS, "echo ok"},
+               {SG_STOP_FIRST_ALLOW, "echo ok"},
+               {SG_STOP_FIRST_DENY, "echo denied"}};
+  for (const auto &stop : stops) {
+    for (const auto &fixture : unresolved) {
+      std::string source = std::string(stop.first) + "; " + fixture.source;
+      buffer.reset_for(source.size());
+      sg_gate_set_stop_mode(gate, SG_EVAL_ALL);
+      sg_result_t full = {};
+      sg_error_t error = sg_gate_evaluate(gate, source.data(), source.size(),
+                                          buffer.data(), buffer.size(), &full);
+      if (error != SG_OK || full.subcommand_count != 2 ||
+          full.unresolved_expansion_flags != fixture.flags ||
+          full.subcommands[0].unresolved_expansion_flags != 0 ||
+          full.subcommands[1].unresolved_expansion_flags != fixture.flags)
+        invariant_failure("full-graph expansion flags mismatch");
+      sg_gate_set_stop_mode(gate, stop.mode);
+      sg_result_t result = {};
+      error = sg_gate_evaluate(gate, source.data(), source.size(),
+                               buffer.data(), buffer.size(), &result);
+      if (error != SG_OK || !result.short_circuited ||
+          result.subcommand_count != 1 ||
+          result.subcommands[0].unresolved_expansion_flags != 0 ||
+          result.unresolved_expansion_flags != full.unresolved_expansion_flags)
+        invariant_failure("early-stop omitted graph expansion uncertainty");
+      validate_known_graph_result_prefix(&result, error, buffer.data(),
+                                         buffer.size(), source.size());
+    }
+  }
+  sg_gate_set_stop_mode(gate, SG_EVAL_ALL);
+  const uint32_t both =
+      SG_EXPANSION_UNRESOLVED_ARGV | SG_EXPANSION_UNRESOLVED_PATH;
+  for (const char *source : {"echo ok; echo \"$DATA\" >\"$OUT\"",
+                             "echo >/etc/private; echo \"$DATA\" >\"$OUT\""}) {
+    size_t length = strlen(source);
+    buffer.reset(sg_test_eval_workspace_size(length) +
+                 shell_dep_workspace_alignment());
+    sg_result_t result = {};
+    sg_error_t error = sg_gate_evaluate(gate, source, length, buffer.data(),
+                                        buffer.size(), &result);
+    if (error != SG_ERR_TRUNC || !result.truncated ||
+        result.verdict != SG_VERDICT_UNDETERMINED ||
+        result.unresolved_expansion_flags != both)
+      invariant_failure("truncation omitted graph expansion uncertainty");
+    validate_known_graph_result_prefix(&result, error, buffer.data(),
+                                       buffer.size(), length);
+  }
   sg_gate_free(gate);
+}
+
+/* Immutable, bounded application results are generated before evaluation.
+ * Source offsets identify physical words; repeated callbacks within one
+ * evaluation are a defect, not a reason to mutate or recycle payload storage.
+ */
+struct generated_expansion_fixture {
+  std::string source;
+  std::string records[3];
+  unsigned modes[3] = {};
+  size_t calls[3] = {};
+  std::vector<uint8_t> seen;
+  bool error_seen = false;
+  bool unresolved_leaf = false;
+};
+
+sg_expand_status_t
+generated_expand_word(const sg_expand_word_request_t *request,
+                      const char **netargv, size_t *length, void *context) {
+  auto &fixture = *static_cast<generated_expansion_fixture *>(context);
+  if (request->source != fixture.source.data() ||
+      request->source_length != fixture.source.size() ||
+      request->word_offset >= fixture.source.size() ||
+      request->word_length > fixture.source.size() - request->word_offset ||
+      request->owner_offset > fixture.source.size() ||
+      request->owner_length > fixture.source.size() - request->owner_offset ||
+      request->purpose > SG_EXPAND_WORD_FILE_SUBSTITUTION_PATH ||
+      fixture.seen[request->word_offset]++)
+    invariant_failure("generated expansion request or call count mismatch");
+  unsigned purpose = request->purpose;
+  fixture.calls[purpose]++;
+  if (purpose == SG_EXPAND_WORD_FILE_SUBSTITUTION_PATH &&
+      fixture.unresolved_leaf && request->word_length == 7 &&
+      memcmp(request->source + request->word_offset, "\"$FILE\"", 7) == 0)
+    return SG_EXPAND_UNRESOLVED;
+  unsigned mode = fixture.modes[purpose];
+  if (mode == 1)
+    return SG_EXPAND_UNRESOLVED;
+  if (mode == 2) {
+    fixture.error_seen = true;
+    return SG_EXPAND_FAILED;
+  }
+  fixture.error_seen |= mode == 3 || (mode == 7 && purpose != 0);
+  *netargv = fixture.records[purpose].data();
+  *length = fixture.records[purpose].size();
+  return SG_EXPAND_RESOLVED;
+}
+
+void append_generated_record(std::string &records, const std::string &payload) {
+  char record[136];
+  size_t written;
+  if (shell_netstring_write(record, sizeof(record), payload.data(),
+                            payload.size(), &written) != SHELL_NETSTRING_OK)
+    invariant_failure("bounded expansion record encoding failed");
+  records.append(record, written);
+}
+
+void run_generated_expansion_case(const uint8_t *data, size_t size) {
+  FuzzedDataProvider fdp(data, size);
+  generated_expansion_fixture fixture;
+  unsigned shape = fdp.ConsumeIntegralInRange<unsigned>(0, 6);
+  unsigned depth = fdp.ConsumeIntegralInRange<unsigned>(1, 4);
+  for (unsigned purpose = 0; purpose < 3; purpose++)
+    fixture.modes[purpose] = fdp.ConsumeIntegralInRange<unsigned>(0, 7);
+  fixture.unresolved_leaf = fdp.ConsumeBool();
+  for (unsigned purpose = 0; purpose < 3; purpose++) {
+    unsigned mode = fixture.modes[purpose];
+    auto &records = fixture.records[purpose];
+    switch (mode) {
+    case 0: {
+      unsigned count =
+          purpose == 0 ? fdp.ConsumeIntegralInRange<unsigned>(1, 4) : 1;
+      for (unsigned i = 0; i < count; i++) {
+        std::string payload = fdp.ConsumeRandomLengthString(128);
+        if (purpose != 0) {
+          std::replace(payload.begin(), payload.end(), '\0', 'x');
+          payload.insert(0, "/tmp/");
+          payload.resize(std::min(payload.size(), size_t(128)));
+        }
+        append_generated_record(records, payload);
+      }
+      break;
+    }
+    case 3: {
+      static const char *malformed[] = {"01:a,", "1:a;", "2:a,",
+                                        "999999999999999999999999999999:x,",
+                                        "1:a,garbage"};
+      records = malformed[fdp.ConsumeIntegralInRange<unsigned>(0, 4)];
+      break;
+    }
+    case 5:
+      append_generated_record(records, "");
+      break;
+    case 6:
+      append_generated_record(records, "one two");
+      append_generated_record(records, "three");
+      break;
+    case 7:
+      append_generated_record(records, std::string("a\0b", 3));
+      break;
+    default:
+      break; /* Unresolved, failed, or a canonical zero-record result. */
+    }
+  }
+  std::string file_word = "\"$FILE\"";
+  for (unsigned i = 0; i < depth; i++)
+    file_word = "\"$(<" + file_word + ")\"";
+  switch (shape) {
+  case 0:
+    fixture.source = "echo \"$ARG\"";
+    break;
+  case 1:
+    fixture.source = "echo >" + file_word;
+    break;
+  case 2:
+    fixture.source = "{ echo one; echo two; } >" + file_word;
+    break;
+  case 3:
+    fixture.source = "echo \"$(echo >" + file_word + ")\"";
+    break;
+  case 4:
+    fixture.source = "echo > >(echo >" + file_word + ") >out";
+    break;
+  case 5:
+    fixture.source = "exec {fd}>\"$OUT\"; echo >&\"$fd\"";
+    break;
+  default:
+    fixture.source = "echo ok; echo \"$ARG\" >\"$OUT\"";
+    break;
+  }
+  fixture.seen.resize(fixture.source.size());
+  /* A failed named open leaves `$fd` unbound. Its later numeric redirection
+   * is unsupported dynamic-FD syntax, rather than a successful alias use. */
+  bool unsupported_fd =
+      shape == 5 && fixture.modes[1] >= 4 && fixture.modes[1] <= 6;
+  if (sg_gate_set_expand_word_netargv(g_expansion_gate, generated_expand_word,
+                                      &fixture) != SG_OK ||
+      sg_gate_set_stop_mode(g_expansion_gate, SG_EVAL_ALL) != SG_OK)
+    invariant_failure("generated expansion gate configuration failed");
+
+  auto evaluate = [&](reusable_eval_buffer &buffer, sg_result_t &result) {
+    std::fill(fixture.seen.begin(), fixture.seen.end(), 0);
+    std::fill(std::begin(fixture.calls), std::end(fixture.calls), 0);
+    fixture.error_seen = false;
+    sg_error_t error = sg_gate_evaluate(g_expansion_gate, fixture.source.data(),
+                                        fixture.source.size(), buffer.data(),
+                                        buffer.size(), &result);
+    if (error != SG_OK && error != SG_ERR_TRUNC && error != SG_ERR_EXPAND &&
+        !(unsupported_fd && error == SG_ERR_PARSE)) {
+      fprintf(stderr,
+              "generated expansion shape=%u modes=%u/%u/%u error=%d "
+              "source=%s reason=%s\n",
+              shape, fixture.modes[0], fixture.modes[1], fixture.modes[2],
+              error, fixture.source.c_str(),
+              result.deny_reason ? result.deny_reason : "<none>");
+      invariant_failure("unexpected generated expansion evaluation error");
+    }
+    if (fixture.error_seen && error != SG_ERR_EXPAND)
+      invariant_failure("diagnostic truncation hid the callback failure");
+    if ((error == SG_ERR_EXPAND || fixture.error_seen) &&
+        result.verdict != SG_VERDICT_UNDETERMINED)
+      invariant_failure("callback error did not fail closed");
+    if (error == SG_ERR_PARSE && result.verdict != SG_VERDICT_REJECT)
+      invariant_failure("unbound descriptor did not fail closed");
+    validate_result(&result, error, buffer.data(), buffer.size());
+    validate_graph_result_prefix(&result, error, buffer.data(), buffer.size(),
+                                 fixture.source.size());
+    return error;
+  };
+  auto &small_buffer = g_eval_buffers.result;
+  auto &replay_buffer = g_eval_buffers.replay;
+  size_t prefix = fdp.ConsumeIntegralInRange<size_t>(1, 128);
+  size_t small_size = sg_test_eval_workspace_size(fixture.source.size()) +
+                      shell_dep_workspace_alignment() + prefix;
+  small_buffer.reset(small_size);
+  replay_buffer.reset(small_size);
+  sg_result_t small = {}, replay = {};
+  sg_error_t small_error = evaluate(small_buffer, small);
+  size_t calls[3];
+  std::copy(std::begin(fixture.calls), std::end(fixture.calls), calls);
+  sg_error_t replay_error = evaluate(replay_buffer, replay);
+  if (replay_error != small_error || !results_equal(small, replay) ||
+      !std::equal(std::begin(calls), std::end(calls), fixture.calls))
+    invariant_failure("generated callback replay differed");
+
+  auto &large_buffer = eval_buffer_for(
+      g_eval_buffers.large, fixture.source.size(), SG_DIAGNOSTIC_BUF_MIN);
+  sg_result_t full = {};
+  sg_error_t full_error = evaluate(large_buffer, full);
+  if (fixture.error_seen) {
+    if (full_error != SG_ERR_EXPAND)
+      invariant_failure("invalid callback data was not rejected");
+  } else if (unsupported_fd) {
+    if (full_error != SG_ERR_PARSE || fixture.calls[1] != 1)
+      invariant_failure("failed named open did not reject unbound alias");
+  } else {
+    static const unsigned purposes[] = {1, 6, 6, 7, 6, 2, 3};
+    uint32_t expected_flags = 0;
+    for (unsigned purpose = 0; purpose < 3; purpose++) {
+      size_t expected_calls = (purposes[shape] >> purpose) & 1u;
+      if (purpose == 2)
+        expected_calls *= depth;
+      if (fixture.calls[purpose] != expected_calls)
+        invariant_failure("generated expansion queries were omitted");
+      if (expected_calls && fixture.modes[purpose] == 1)
+        expected_flags |= purpose == 0 ? SG_EXPANSION_UNRESOLVED_ARGV
+                                       : SG_EXPANSION_UNRESOLVED_PATH;
+    }
+    if ((purposes[shape] & 4) && fixture.unresolved_leaf)
+      expected_flags |= SG_EXPANSION_UNRESOLVED_PATH;
+    if (full_error != SG_OK ||
+        full.unresolved_expansion_flags != expected_flags)
+      invariant_failure("generated expansion uncertainty mismatch");
+    if (small.unresolved_expansion_flags != full.unresolved_expansion_flags ||
+        !std::equal(std::begin(calls), std::end(calls), fixture.calls))
+      invariant_failure("result truncation changed expansion accounting");
+    if (shape == 0) {
+      std::string expected = "4:echo,";
+      if (fixture.modes[0] == 1)
+        append_generated_record(expected, "$ARG");
+      else
+        expected += fixture.records[0];
+      if (full.subcommand_count != 1 ||
+          full.subcommands[0].netargv_length != expected.size() ||
+          memcmp(full.subcommands[0].netargv, expected.data(), expected.size()))
+        invariant_failure("generated binary argv differed from callback data");
+    }
+    if (shape == 6) {
+      sg_gate_set_stop_mode(g_expansion_gate, SG_STOP_FIRST_ALLOW);
+      sg_result_t stopped = {};
+      if (evaluate(large_buffer, stopped) != SG_OK ||
+          !stopped.short_circuited || stopped.subcommand_count != 1 ||
+          stopped.unresolved_expansion_flags != expected_flags)
+        invariant_failure("callback uncertainty changed after early stop");
+    }
+  }
+  /* Fixture payloads must outlive every callback and result copy. Never leave
+   * their borrowed context installed on a reusable gate after returning. */
+  sg_gate_set_expand_word_netargv(g_expansion_gate, nullptr, nullptr);
 }
 
 /* A buffer can be too small both for the mandatory depgraph workspace and for
@@ -428,6 +935,92 @@ void run_evaluation_buffer_contract_oracle() {
       result.verdict != SG_VERDICT_UNDETERMINED)
     invariant_failure("workspace and diagnostic failure contract mismatch");
   validate_result(&result, error, tiny_buffer, sizeof(tiny_buffer));
+  reusable_eval_buffer buffer;
+  for (size_t length : {size_t(11), size_t(64), size_t(4096)}) {
+    size_t alignment = shell_dep_workspace_alignment();
+    size_t size = eval_buffer_size(length);
+    buffer.reset(size + alignment);
+    for (size_t offset = 0; offset < alignment; offset++) {
+      char *base = buffer.data() + offset;
+      size_t prefix = sg_test_eval_prefix_size(base, size, length);
+      if (prefix == 0 || prefix >= size)
+        invariant_failure("buffer prefix calculation failed");
+      base[prefix - 1] = base[prefix] = 0;
+      if (!valid_buffer_string(base + prefix - 1, base, prefix) ||
+          valid_buffer_string(base + prefix, base, prefix) ||
+          !valid_buffer_span(base + prefix - 1, 1, base, prefix) ||
+          valid_buffer_span(base + prefix, 1, base, prefix))
+        invariant_failure("private evaluation cache accepted as public output");
+    }
+  }
+  const char source[] = "echo $VALUE";
+  size_t length = sizeof(source) - 1;
+  size_t workspace = sg_test_eval_workspace_size(length);
+  size_t alignment = shell_dep_workspace_alignment();
+  buffer.reset(workspace + 128 + 2 * alignment);
+  sg_gate_set_reject_mask(gate, 0);
+  sg_gate_set_suggestions(gate, false);
+  for (size_t offset = 0; offset < alignment; offset++) {
+    char *base = buffer.data() + offset;
+    const size_t capacities[] = {workspace - 1, workspace,
+                                 workspace + alignment,
+                                 workspace + 128 + alignment - 1};
+    const sg_error_t errors[] = {SG_ERR_MEMORY, SG_ERR_MEMORY, SG_ERR_TRUNC,
+                                 SG_OK};
+    for (size_t boundary = 0; boundary < 4; boundary++) {
+      size_t size = capacities[boundary];
+      result = {};
+      error = sg_gate_evaluate(gate, source, length, base, size, &result);
+      if (error != errors[boundary] ||
+          result.verdict != SG_VERDICT_UNDETERMINED ||
+          result.truncated != (boundary == 2) ||
+          result.unresolved_expansion_flags !=
+              (boundary < 2 ? 0u : SG_EXPANSION_UNRESOLVED_ARGV))
+        invariant_failure("complete evaluation workspace boundary mismatch");
+      if (boundary < 2) {
+        if (sg_test_eval_prefix_size(base, size, length) != 0 ||
+            !equal_string(result.deny_reason, "depgraph workspace unavailable"))
+          invariant_failure("workspace failure diagnostic mismatch");
+        validate_result(&result, error, base, size);
+      } else {
+        validate_known_graph_result_prefix(&result, error, base, size, length);
+      }
+    }
+  }
+  /* Require the same primary callback error with exact diagnostic capacities,
+   * independently of how mutation happens to select the generated prefix. */
+  generated_expansion_fixture failure;
+  failure.source = "echo \"$ARG\"";
+  failure.seen.resize(failure.source.size());
+  failure.records[0] = "01:a,";
+  length = failure.source.size();
+  workspace = sg_test_eval_workspace_size(length);
+  buffer.reset(workspace + 512 + alignment - 1);
+  if (sg_gate_set_expand_word_netargv(gate, generated_expand_word, &failure) !=
+      SG_OK)
+    invariant_failure("callback error oracle configuration failed");
+  for (unsigned mode : {2u, 3u}) {
+    failure.modes[0] = mode;
+    for (size_t prefix :
+         {size_t(1), size_t(8), size_t(21), size_t(22), size_t(512)}) {
+      char *base = sg_test_eval_buffer_for_prefix(buffer.data(), prefix);
+      size_t size = workspace + prefix;
+      if (sg_test_eval_prefix_size(base, size, length) != prefix)
+        invariant_failure("callback oracle diagnostic capacity mismatch");
+      std::fill(failure.seen.begin(), failure.seen.end(), 0);
+      std::fill(std::begin(failure.calls), std::end(failure.calls), 0);
+      failure.error_seen = false;
+      result = {};
+      error = sg_gate_evaluate(gate, failure.source.data(), length, base, size,
+                               &result);
+      if (error != SG_ERR_EXPAND || !failure.error_seen ||
+          failure.calls[0] != 1 || result.verdict != SG_VERDICT_UNDETERMINED ||
+          result.truncated != (prefix < sizeof("word expansion failed")))
+        invariant_failure("callback and diagnostic failure contract mismatch");
+      validate_known_graph_result_prefix(&result, error, base, size, length);
+    }
+  }
+  sg_gate_set_expand_word_netargv(gate, nullptr, nullptr);
   sg_gate_free(gate);
 }
 
@@ -448,6 +1041,43 @@ void run_semantic_reference_oracles() {
   if (sg_gate_set_violation_config_borrowed(option_gate, &expansion_config) !=
       SG_OK)
     invariant_failure("expansion control violation configuration failed");
+  for (const auto &fixture : shellsplit_test_substitution_status_cases) {
+    for (unsigned success = 0; success < 2; success++) {
+      std::string source = std::string(fixture.source) +
+                           (success ? " && echo >out" : " || echo >out");
+      auto &buffer = eval_buffer_for(g_eval_buffers.result, source.size());
+      sg_result_t result = {};
+      sg_error_t error =
+          sg_gate_evaluate(option_gate, source.data(), source.size(),
+                           buffer.data(), buffer.size(), &result);
+      bool reached =
+          (result.violation_type_flags & SG_VIOL_WRITE_SENSITIVE) != 0;
+      if (error != SG_OK || result.truncated ||
+          reached != (success ? fixture.succeeds : fixture.fails))
+        invariant_failure("substitution outcome reachability mismatch");
+      validate_result(&result, error, buffer.data(), buffer.size());
+    }
+  }
+  for (const auto &fixture : shellsplit_test_empty_paths) {
+    char source[256];
+    int length = std::snprintf(source, sizeof(source), fixture.source, "\"\"");
+    if (length <= 0 || static_cast<size_t>(length) >= sizeof(source))
+      invariant_failure("empty pathname fixture capacity mismatch");
+    auto &buffer = eval_buffer_for(g_eval_buffers.result, length);
+    sg_result_t result = {};
+    sg_error_t error = sg_gate_evaluate(option_gate, source, length,
+                                        buffer.data(), buffer.size(), &result);
+    unsigned writes = 0, reads = 0;
+    for (uint32_t command = 0; command < result.subcommand_count; command++) {
+      writes += result.subcommands[command].write_count;
+      reads += result.subcommands[command].read_count;
+    }
+    if (error != SG_OK || result.truncated ||
+        writes != fixture.opens + fixture.writes || reads != fixture.reads ||
+        result.requires_substitution_evaluation != fixture.shell_word)
+      invariant_failure("static empty pathname setup contract mismatch");
+    validate_result(&result, error, buffer.data(), buffer.size());
+  }
   for (const auto &fixture : shellsplit_test_expansion_time_routes) {
     size_t length = std::strlen(fixture.source);
     auto &buffer = eval_buffer_for(g_eval_buffers.result, length);
@@ -2142,6 +2772,8 @@ sg_gate_t *create_policy_gate(int idx) {
 }
 
 void cleanup() {
+  sg_gate_free(g_expansion_gate);
+  g_expansion_gate = nullptr;
   for (int i = 0; i < kPoolSize; i++) {
     sg_gate_free(g_anomaly_pool[i]);
     sg_gate_free(g_policy_pool[i]);
@@ -2160,6 +2792,12 @@ extern "C" int LLVMFuzzerInitialize(int *argc, char ***argv) {
     g_anomaly_pool[i] = create_pool_gate(i);
   for (int i = 0; i < kPoolSize; i++)
     g_policy_pool[i] = create_policy_gate(i);
+  g_expansion_gate = sg_gate_new();
+  if (!g_expansion_gate ||
+      sg_gate_set_reject_mask(g_expansion_gate, 0) != SG_OK ||
+      sg_gate_set_suggestions(g_expansion_gate, false) != SG_OK ||
+      sg_gate_add_allow_cpl(g_expansion_gate, "echo ok") != SG_OK)
+    invariant_failure("generated expansion gate setup failed");
 
   atexit(cleanup);
   return 0;
@@ -2169,6 +2807,17 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
   static bool semantic_oracles_checked = false;
   if (!semantic_oracles_checked) {
     run_expansion_query_oracles();
+    for (uint8_t shape = 0; shape < 7; shape++)
+      for (uint8_t mode = 0; mode < 8; mode++) {
+        /* FuzzedDataProvider consumes integral choices from the tail. Keep
+         * every shape/outcome reachable in the deterministic startup pass. */
+        const uint8_t expansion_case[] = {128, mode, mode, mode, 0, shape};
+        run_generated_expansion_case(expansion_case, sizeof(expansion_case));
+      }
+    for (uint8_t shape = 1; shape < 5; shape++) {
+      const uint8_t mixed_path_case[] = {0, 1, 0, 0, 0, 3, shape};
+      run_generated_expansion_case(mixed_path_case, sizeof(mixed_path_case));
+    }
     run_evaluation_buffer_contract_oracle();
     run_semantic_reference_oracles();
     run_decoded_path_oracles();
@@ -2199,15 +2848,18 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
 
   /* The fixed oracle pass exhausts every generated case. Select one matrix
    * for each fuzzed payload so the random-input path remains economical. */
-  switch (size == 0 ? 0 : data[0] % 3) {
+  switch (data[0] % 4) {
   case 0:
     run_generated_brace_case(data, size);
     break;
   case 1:
     run_generated_substitution_case(data, size);
     break;
-  default:
+  case 2:
     run_composed_substitution_case(data, size);
+    break;
+  default:
+    run_generated_expansion_case(data, size);
     break;
   }
 
@@ -2260,14 +2912,15 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     invariant_failure("non-finite anomaly score with a trained model");
 
   validate_result(&result, err, result_buf, buf_size);
-  validate_graph_result_prefix(&result, err, result_buf, buf_size);
+  validate_graph_result_prefix(&result, err, result_buf, buf_size, cmd.size());
 
   sg_error_t replay_err = sg_gate_evaluate(g, cmd.data(), cmd.size(),
                                            replay_buf, buf_size, &replay);
   if (replay_err != err || !results_equal(result, replay))
     invariant_failure("frozen-model replay was not deterministic");
   validate_result(&replay, replay_err, replay_buf, buf_size);
-  validate_graph_result_prefix(&replay, replay_err, replay_buf, buf_size);
+  validate_graph_result_prefix(&replay, replay_err, replay_buf, buf_size,
+                               cmd.size());
 
   if (err == SG_OK || err == SG_ERR_TRUNC) {
     size_t large_size = eval_buffer_size(cmd.size(), SG_DIAGNOSTIC_BUF_MIN);
@@ -2280,10 +2933,12 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     sg_error_t large_err = sg_gate_evaluate(g, cmd.data(), cmd.size(),
                                             large_buf, large_size, &large);
     validate_result(&large, large_err, large_buf, large_size);
-    validate_graph_result_prefix(&large, large_err, large_buf, large_size);
+    validate_graph_result_prefix(&large, large_err, large_buf, large_size,
+                                 cmd.size());
     if (err == SG_ERR_TRUNC && large_err == SG_OK &&
         large.verdict != SG_VERDICT_REJECT)
-      validate_known_graph_result_prefix(&result, err, result_buf, buf_size);
+      validate_known_graph_result_prefix(&result, err, result_buf, buf_size,
+                                         cmd.size());
     if (err == SG_OK && (large_err != SG_OK || !results_equal(result, large))) {
       std::fprintf(
           stderr,

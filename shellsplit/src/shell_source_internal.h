@@ -3116,6 +3116,9 @@ typedef struct {
   bool selector_pending;
   bool selector_indirect;
   bool selector_subscript;
+  /* Inherited conditional parameter operand: its substitutions may not run.
+   * Stored in the scope stack so querying a yielded substitution is O(1). */
+  bool conditional;
   /* In a double-quoted parameter default word, Bash expands the decoded
    * contents of $'...' a second time. Keep its source boundary while walking
    * the executable substitutions in that decoded word. */
@@ -3221,8 +3224,11 @@ static inline SHELL_NONNULL(3, 4, 5, 6) shell_source_scan_status_t
         scope->selector_subscript = true;
         scan->has_arrays = true;
         scan->scopes[scan->scope_count++] = *scope;
-        *scope = (shell_source_expansion_scope_t){
-            .suppress_process = true, .closer = ']', .parentheses = 1};
+        *scope =
+            (shell_source_expansion_scope_t){.suppress_process = true,
+                                             .closer = ']',
+                                             .parentheses = 1,
+                                             .conditional = scope->conditional};
         scan->position = position + 1;
         continue;
       }
@@ -3248,6 +3254,11 @@ static inline SHELL_NONNULL(3, 4, 5, 6) shell_source_scan_status_t
       if (input[operator_position] == ':')
         operator_position =
             shell_source_logical_following(input, length, operator_position);
+      scope->conditional |=
+          has_word &&
+          (operand == SHELL_SOURCE_PARAMETER_PATTERN ||
+           input[operator_position] == '-' || input[operator_position] == '+' ||
+           input[operator_position] == '=' || input[operator_position] == '?');
       scan->has_parameter_write |= has_word && input[operator_position] == '=';
       bool indirect_lookup = scope->selector_indirect && !name_enumeration;
       scan->has_parameter_reevaluation |=
@@ -3457,11 +3468,13 @@ static inline SHELL_NONNULL(3, 4, 5, 6) shell_source_scan_status_t
       scan->arithmetic_depth++;
       scan->scopes[scan->scope_count++] = *scope;
       scan->position = open + 1;
-      *scope = (shell_source_expansion_scope_t){.suppress_process = true,
-                                                .arithmetic_scope = true,
-                                                .closer = ')',
-                                                .expansion_start = position,
-                                                .parentheses = 1};
+      *scope =
+          (shell_source_expansion_scope_t){.suppress_process = true,
+                                           .conditional = scope->conditional,
+                                           .arithmetic_scope = true,
+                                           .closer = ')',
+                                           .expansion_start = position,
+                                           .parentheses = 1};
       continue;
     }
     if (c == '$' &&
@@ -4522,13 +4535,42 @@ static SHELL_NONNULL(1) inline shell_source_brace_fragment_t
  * glob syntax, actual brace expansion, and unquoted tilde expansion. Semantic
  * consumers use it before quote removal so they cannot promote a
  * runtime-computed word into a builtin, descriptor name, or concrete path. */
-static inline bool shell_source_word_has_dynamic_syntax_with_tilde_policy(
-    const char *input, size_t length, bool tilde_is_dynamic) {
+typedef enum {
+  SHELL_SOURCE_WORD_GENERIC,
+  SHELL_SOURCE_WORD_ARGUMENT,
+} shell_source_word_context_t;
+
+typedef struct {
+  bool dynamic;       /* Runtime expansion other than a leading tilde. */
+  bool leading_tilde; /* An unquoted, uncancelled leading tilde prefix. */
+} shell_source_word_expansion_t;
+
+/* Argument words (and FILE redirect operands) undergo Bash's assignment-shaped
+ * tilde expansion. Recognize the unquoted name[+]= prefix alongside the word
+ * walk, not by searching every suffix. A tilde prefix must remain unquoted
+ * through its slash/assignment-colon delimiter or the end of the word.
+ * CWD resolution models leading tilde expansion separately, but must still
+ * reject any later runtime expansion. Keep scanning after its delimiter.
+ * NULL or an empty span denotes an unavailable word and is dynamic; otherwise
+ * input is an immutable readable span. leading_tilde is meaningful only when
+ * dynamic is false. */
+static inline shell_source_word_expansion_t
+shell_source_word_expansion(const char *input, size_t length,
+                            shell_source_word_context_t context) {
+  shell_source_word_expansion_t expansion = {0};
   if (!input || length == 0)
-    return true;
+    return (shell_source_word_expansion_t){.dynamic = true};
   bool in_single_quote = false;
   bool in_double_quote = false;
-  bool logical_word_start = true;
+  bool tilde_start = true, tilde_prefix = false;
+  bool leading_prefix = false;
+  enum {
+    PREFIX_NONE,
+    PREFIX_START,
+    PREFIX_NAME,
+    PREFIX_PLUS,
+    PREFIX_VALUE
+  } prefix = context == SHELL_SOURCE_WORD_ARGUMENT ? PREFIX_START : PREFIX_NONE;
   shell_source_brace_scan_t braces = {0};
   shell_source_glob_scan_t glob = {0};
   for (size_t position = 0; position < length;) {
@@ -4550,25 +4592,32 @@ static inline bool shell_source_word_has_dynamic_syntax_with_tilde_policy(
         continue;
       }
       if (position + 1 >= length)
-        return true;
+        return (shell_source_word_expansion_t){.dynamic = true};
+      if (prefix != PREFIX_VALUE)
+        prefix = PREFIX_NONE;
+      tilde_prefix = false;
       shell_source_brace_scan_literal(&braces);
       shell_source_glob_scan_step(&glob, (unsigned char)input[position + 1],
                                   true);
       position += 2;
-      logical_word_start = false;
+      tilde_start = false;
       continue;
     }
     if (!in_double_quote && c == '\'') {
       shell_source_brace_scan_literal(&braces);
       in_single_quote = true;
-      logical_word_start = false;
+      if (prefix != PREFIX_VALUE)
+        prefix = PREFIX_NONE;
+      tilde_start = tilde_prefix = false;
       position++;
       continue;
     }
     if (c == '"') {
       shell_source_brace_scan_literal(&braces);
       in_double_quote = !in_double_quote;
-      logical_word_start = false;
+      if (prefix != PREFIX_VALUE)
+        prefix = PREFIX_NONE;
+      tilde_start = tilde_prefix = false;
       position++;
       continue;
     }
@@ -4578,41 +4627,83 @@ static inline bool shell_source_word_has_dynamic_syntax_with_tilde_policy(
       size_t after = position;
       if (!shell_source_decode_ansi_c_quote(input, length, &after,
                                             shell_source_glob_ansi_byte, &glob))
-        return true;
+        return (shell_source_word_expansion_t){.dynamic = true};
       position = after;
-      logical_word_start = false;
+      if (prefix != PREFIX_VALUE)
+        prefix = PREFIX_NONE;
+      tilde_start = tilde_prefix = false;
       continue;
     }
     if (c == '`' ||
         shell_source_dollar_has_dynamic_syntax(input, length, position))
-      return true;
+      return (shell_source_word_expansion_t){.dynamic = true};
     if (!in_double_quote) {
+      bool value_start = false;
+      if (prefix == PREFIX_START)
+        prefix =
+            isalpha((unsigned char)c) || c == '_' ? PREFIX_NAME : PREFIX_NONE;
+      else if (prefix == PREFIX_NAME) {
+        if (c == '=') {
+          prefix = PREFIX_VALUE;
+          value_start = true;
+        } else if (c == '+')
+          prefix = PREFIX_PLUS;
+        else if (!isalnum((unsigned char)c) && c != '_')
+          prefix = PREFIX_NONE;
+      } else if (prefix == PREFIX_PLUS) {
+        value_start = c == '=';
+        prefix = value_start ? PREFIX_VALUE : PREFIX_NONE;
+      }
+      if (tilde_prefix && (c == '/' || (prefix == PREFIX_VALUE && c == ':'))) {
+        if (!leading_prefix)
+          return (shell_source_word_expansion_t){.dynamic = true};
+        expansion.leading_tilde = true;
+        tilde_prefix = false;
+      }
       if ((c == '<' || c == '>') &&
           shell_source_process_substitution_open(input, length, position, NULL))
-        return true;
+        return (shell_source_word_expansion_t){.dynamic = true};
       if ((c == '?' || c == '*' || c == '+' || c == '@' || c == '!') &&
           shell_source_logical_next_is(input, length, position, '(', NULL))
-        return true;
+        return (shell_source_word_expansion_t){.dynamic = true};
       if (c == '*' || c == '?')
-        return true;
+        return (shell_source_word_expansion_t){.dynamic = true};
       if (shell_source_glob_scan_step(&glob, (unsigned char)c, false))
-        return true;
-      if (c == '~' && logical_word_start && tilde_is_dynamic)
-        return true;
+        return (shell_source_word_expansion_t){.dynamic = true};
+      if (c == '~' && tilde_start) {
+        tilde_prefix = true;
+        leading_prefix = prefix != PREFIX_VALUE;
+      }
       if (shell_source_brace_scan_step(&braces, (unsigned char)c))
-        return true;
+        return (shell_source_word_expansion_t){.dynamic = true};
+      tilde_start = value_start || (prefix == PREFIX_VALUE && c == ':');
     } else
       shell_source_glob_scan_step(&glob, (unsigned char)c, true);
-    logical_word_start = false;
     position++;
   }
-  return in_single_quote || in_double_quote;
+  expansion.dynamic =
+      in_single_quote || in_double_quote || (tilde_prefix && !leading_prefix);
+  expansion.leading_tilde |= tilde_prefix && leading_prefix;
+  return expansion;
+}
+
+static inline bool shell_source_word_has_dynamic_syntax_in_context(
+    const char *input, size_t length, shell_source_word_context_t context) {
+  shell_source_word_expansion_t expansion =
+      shell_source_word_expansion(input, length, context);
+  return expansion.dynamic || expansion.leading_tilde;
 }
 
 static inline bool shell_source_word_has_dynamic_syntax(const char *input,
                                                         size_t length) {
-  return shell_source_word_has_dynamic_syntax_with_tilde_policy(input, length,
-                                                                true);
+  return shell_source_word_has_dynamic_syntax_in_context(
+      input, length, SHELL_SOURCE_WORD_GENERIC);
+}
+
+static inline SHELL_NONNULL(1) bool shell_source_argument_has_dynamic_syntax(
+    const char *input, size_t length) {
+  return shell_source_word_has_dynamic_syntax_in_context(
+      input, length, SHELL_SOURCE_WORD_ARGUMENT);
 }
 
 /* Decode a complete static shell word without allocating.  This is the
@@ -4624,11 +4715,11 @@ static inline bool shell_source_word_has_dynamic_syntax(const char *input,
  * word is a required readable span (including length zero); visitor is
  * required. context is passed through and may be NULL if the visitor allows
  * it. The visitor must not modify the word. */
-static inline SHELL_NONNULL(1, 3) bool shell_source_visit_static_word(
+static inline SHELL_NONNULL(1, 3) bool shell_source_visit_static_word_in_context(
     const char *word, size_t word_length, shell_source_byte_visitor_t visitor,
-    void *context) {
-  if (word_length == 0 ||
-      shell_source_word_has_dynamic_syntax(word, word_length))
+    void *context, shell_source_word_context_t word_context) {
+  if (word_length == 0 || shell_source_word_has_dynamic_syntax_in_context(
+                              word, word_length, word_context))
     return false;
 
   char quote = '\0';
@@ -4669,6 +4760,20 @@ static inline SHELL_NONNULL(1, 3) bool shell_source_visit_static_word(
       return false;
   }
   return quote == '\0';
+}
+
+static inline SHELL_NONNULL(1, 3) bool shell_source_visit_static_word(
+    const char *word, size_t word_length, shell_source_byte_visitor_t visitor,
+    void *context) {
+  return shell_source_visit_static_word_in_context(
+      word, word_length, visitor, context, SHELL_SOURCE_WORD_GENERIC);
+}
+
+static inline SHELL_NONNULL(1, 3) bool shell_source_visit_static_argument(
+    const char *word, size_t word_length, shell_source_byte_visitor_t visitor,
+    void *context) {
+  return shell_source_visit_static_word_in_context(
+      word, word_length, visitor, context, SHELL_SOURCE_WORD_ARGUMENT);
 }
 
 /* Declaration builtins recognize assignment operands after quote removal,
@@ -5059,7 +5164,7 @@ static inline SHELL_NONNULL(1, 2) shell_source_wrapper_step_t
                                  const char *word, size_t word_length) {
   if (state->kind == SHELL_SOURCE_WRAPPER_NONE || word_length == 0)
     return SHELL_SOURCE_WRAPPER_NONEXECUTING;
-  if (shell_source_word_has_dynamic_syntax(word, word_length)) {
+  if (shell_source_argument_has_dynamic_syntax(word, word_length)) {
     state->kind = SHELL_SOURCE_WRAPPER_NONE;
     return SHELL_SOURCE_WRAPPER_DYNAMIC_TARGET;
   }
@@ -5095,23 +5200,14 @@ static inline SHELL_NONNULL(1, 2) shell_source_wrapper_step_t
   return SHELL_SOURCE_WRAPPER_STATIC_TARGET;
 }
 
-/* CWD resolution models the supported leading-tilde forms separately. It
- * still needs the exact same conservative classification for every other
- * expansion, rather than a duplicate scanner that can drift from redirects. */
-static inline bool
-shell_source_word_has_dynamic_syntax_allow_tilde(const char *input,
-                                                 size_t length) {
-  return shell_source_word_has_dynamic_syntax_with_tilde_policy(input, length,
-                                                                false);
-}
-
 /* Redirect topology needs the same static-word rule. The explicit name keeps
  * call sites clear when they must distinguish a concrete FILE DOC from a
  * runtime pathname or a descriptor-ambiguous operand. */
 static inline bool
 shell_source_redirect_word_has_dynamic_path_syntax(const char *input,
                                                    size_t length) {
-  return shell_source_word_has_dynamic_syntax(input, length);
+  return shell_source_word_has_dynamic_syntax_in_context(
+      input, length, SHELL_SOURCE_WORD_ARGUMENT);
 }
 
 /* At a lexical word boundary, skip one complete redirection and its operand.

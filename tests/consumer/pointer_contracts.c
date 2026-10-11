@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "../../shellgate/src/sg_io.h"
+#include "../../shellsplit/src/shell_depgraph_internal.h"
 #include "../../shellsplit/src/shell_pipeline_internal.h"
 #include "../../shellsplit/src/shell_source_internal.h"
 #include "../../shellsplit/src/shell_tokenizer_full_internal.h"
@@ -21,8 +22,12 @@
 #include "../../shellsplit/src/shell_processor.c"
 #elif TEST_BAD == 106
 #include "../../shellsplit/src/shell_tokenizer.c"
-#elif TEST_BAD >= 107 && TEST_BAD <= 109
+#elif (TEST_BAD >= 107 && TEST_BAD <= 109) ||                                  \
+    (TEST_BAD >= 159 && TEST_BAD <= 163)
 #include "../../shellsplit/src/shell_depgraph.c"
+#elif (TEST_BAD >= 150 && TEST_BAD <= 158) ||                                  \
+    (TEST_BAD >= 164 && TEST_BAD <= 166)
+#include "../../shellgate/src/shellgate.c"
 #endif
 
 static bool visit_token(const st_token_view_t *token, void *context) {
@@ -417,6 +422,68 @@ void pointer_contracts(sg_gate_t *gate, st_policy_t *policy) {
   (void)shell_file_path_prefix("destination", NULL);
 #elif TEST_BAD == 149
   (void)shell_processed_command_is_empty_timing(NULL);
+#elif TEST_BAD == 150
+  (void)sg_expansion_cache_size(0, NULL);
+#elif TEST_BAD == 151
+  (void)sg_expansion_lookup(NULL, "");
+#elif TEST_BAD == 152
+  sg_expansion_cache_t cache = {0};
+  (void)sg_expansion_lookup(&cache, NULL);
+#elif TEST_BAD == 153
+  (void)sg_expansion_validate(NULL, false);
+#elif TEST_BAD == 154
+  sg_expansion_cache_t cache = {0};
+  (void)sg_expand_word(NULL, &cache);
+#elif TEST_BAD == 155
+  shell_dep_expand_request_t request = {0};
+  (void)sg_expand_word(&request, NULL);
+#elif TEST_BAD == 156
+  (void)sg_eval_workspace_size(0, NULL);
+#elif TEST_BAD == 157
+  write_expansion_display(NULL, 0, NULL);
+#elif TEST_BAD == 158
+  shell_dep_cmd_t command = {0};
+  buf_writer_t writer = {0};
+  const char *netargv;
+  size_t length;
+  sg_error_t error;
+  (void)build_cmd_string(&command, &writer, NULL, &netargv, &length, &error);
+#elif TEST_BAD == 159
+  (void)dep_bytes_look_like_path(NULL, 0);
+#elif TEST_BAD == 160
+  dep_token_t source = {0};
+  shell_dep_cmd_t command = {0};
+  (void)dep_add_argument_document(NULL, 0, 0, 0, &source, NULL, 0, &command);
+#elif TEST_BAD == 161
+  shell_dep_graph_t graph = {0};
+  shell_dep_cmd_t command = {0};
+  (void)dep_add_argument_document(&graph, 0, 0, 0, NULL, NULL, 0, &command);
+#elif TEST_BAD == 162
+  shell_dep_graph_t graph = {0};
+  dep_token_t source = {0};
+  (void)dep_add_argument_document(&graph, 0, 0, 0, &source, NULL, 0, NULL);
+#elif TEST_BAD == 163
+  dep_token_list_t tokens = {0};
+  dep_exec_analysis_t exec = {0};
+  dep_prepare_expandable_arguments(&tokens, UINT32_MAX, UINT32_MAX, false, NULL,
+                                   &exec, NULL);
+#elif TEST_BAD == 164
+  sg_expansion_cache_t cache = {0};
+  uint32_t flags[SHELL_DEP_MAX_NODES];
+  (void)sg_expansion_flags_prepare(NULL, &cache, flags);
+#elif TEST_BAD == 165
+  shell_dep_graph_t graph = {0};
+  uint32_t flags[SHELL_DEP_MAX_NODES];
+  (void)sg_expansion_flags_prepare(&graph, NULL, flags);
+#elif TEST_BAD == 166
+  shell_dep_graph_t graph = {0};
+  sg_expansion_cache_t cache = {0};
+  (void)sg_expansion_flags_prepare(&graph, &cache, NULL);
+#elif TEST_BAD == 167
+  shell_parse_result_t parsed = {0};
+  shell_dep_graph_t graph = {0};
+  (void)shell_dep_graph_parse_with_fast_resolver("echo", 4, NULL, NULL, &parsed,
+                                                 &graph, NULL, NULL);
 #else
   /* These NULL values have API meanings and must stay accepted. */
   (void)shell_netstring_iter_init(&iter, NULL, 0);
@@ -446,8 +513,7 @@ void pointer_contracts(sg_gate_t *gate, st_policy_t *policy) {
   (void)shell_process_commands("echo", 4, NULL, &processed);
   (void)st_netargv_visit_view((st_netargv_view_t){NULL, 0}, visit_token, NULL,
                               NULL);
-  (void)sg_gate_set_expand_var_netargv(gate, NULL, NULL);
-  (void)sg_gate_set_expand_glob_netargv(gate, NULL, NULL);
+  (void)sg_gate_set_expand_word_netargv(gate, NULL, NULL);
   st_learner_t *learner = st_learner_new(NULL);
   st_policy_ctx_t *context = st_policy_ctx_new();
   (void)st_policy_ctx_intern_view(context, NULL, 0);

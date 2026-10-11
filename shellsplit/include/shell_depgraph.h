@@ -118,6 +118,16 @@ typedef enum {
   /* An ENVVAR document records `name+=value`, not `name=value`. Its value
    * span is the appended source fragment, not the resulting variable value. */
   SHELL_DEP_DOC_FLAG_ENVVAR_APPEND = 1 << 4,
+  /* Internal expansion-aware construction retains original FILE path spelling
+   * and borrows a decoded, nonempty NUL-free pathname in value/value_len. It
+   * is data, never source to quote-remove. Ordinary public source-only parsers
+   * do not set this flag. */
+  SHELL_DEP_DOC_FLAG_RESOLVED_PATH = 1 << 5,
+  /* A reached FILE operand was statically empty after quote removal, or its
+   * resolved expansion yielded zero/multiple words or an empty pathname.
+   * Setup fails without opening the file. Source-only parsers also emit this
+   * flag. Unreached operands retain their source spelling without this flag. */
+  SHELL_DEP_DOC_FLAG_EXPANSION_FAILED = 1 << 6,
 } shell_dep_doc_flags_t;
 
 typedef enum {
@@ -166,7 +176,9 @@ typedef enum {
   SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD = 1 << 0,
   /* This SUBST edge supplies a FILE document's runtime pathname. The value
    * affects I/O topology but is not itself command-word content for a later
-   * Shellgate inspection. The receiving FILE DOC has DYNAMIC_NAME set. */
+   * Shellgate inspection. The dependency remains when expansion changes the
+   * receiving FILE DOC from DYNAMIC_NAME to RESOLVED_PATH or EXPANSION_FAILED.
+   */
   SHELL_DEP_EDGE_FLAG_SUBST_DYNAMIC_NAME = 1 << 1,
   /* A setup-only FD_OPEN output binding used Bash/POSIX append mode (`>>` or
    * `&>>`). An unflagged output FD_OPEN is ordinary truncating output. */
@@ -421,7 +433,8 @@ typedef struct {
  * DOC node - a data artifact
  *
  * Fields are used according to kind:
- *   FILE:      path/path_len
+ *   FILE:      path/path_len (source); RESOLVED_PATH uses value/value_len
+ *              for the separately borrowed decoded pathname
  *   HEREDOC:   name/name_len (borrowed delimiter display span),
  *              value/value_len (source content)
  *   HERESTRING: value/value_len (content; an expandable word can receive
@@ -429,11 +442,13 @@ typedef struct {
  *   ENVVAR:    name/name_len, value/value_len (borrowed assignment spelling;
  *              ENVVAR_APPEND distinguishes `+=` from `=`)
  *
- * All fields borrow source spans. Heredoc delimiter matching applies shell
- * quote removal, but `name` is not a decoded value: one enclosing homogeneous
+ * Fields ordinarily borrow source spans. An internal expansion-aware graph's
+ * RESOLVED_PATH value instead borrows its resolver's decoded payload for the
+ * lifetime of that graph. Heredoc delimiter matching applies shell quote
+ * removal, but `name` is not a decoded value: one enclosing homogeneous
  * `'...'` or `"..."` pair is elided for display, while mixed-quote,
- * backslash, and ANSI-C spellings retain their source span.
- * `value` always preserves physical source bytes; for `<<-`, use
+ * backslash, and ANSI-C spellings retain their source span. Other `value`
+ * fields preserve physical source bytes; for `<<-`, use
  * shell_dep_doc_content_length() and
  * shell_dep_doc_write_content() to obtain logical tab-stripped content. CRLF
  * heredoc framing is recognized, but carriage returns remain content bytes.
@@ -554,7 +569,8 @@ typedef struct {
  * unsupported syntax is rejected even in unreachable stages.
  * Runtime-dependent redirect setup adds possible failure to a proved command
  * or compound outcome, never success before negation. A statically known
- * descriptor failure preserves argument and assignment-value expansions,
+ * descriptor failure (including a statically empty filename) preserves
+ * argument and assignment-value expansions,
  * which precede a simple command's redirects even when their words appear
  * later in the source. It also preserves earlier redirect operand expansions
  * and setup, but suppresses later redirect operands and the command or
@@ -562,6 +578,13 @@ typedef struct {
  * compound's setup failure bypasses its negation and retains its entry
  * directory rather than a directory reached by its body; a simple command's
  * returning setup failure is negated normally.
+ * An argv-less command normally returns its last executed substitution status
+ * (success when none ran). Bash instead runs its redirect setup in a child
+ * when any redirect targets fd 0 or a named FD, including self-duplication and
+ * later redirects. Successful child setup returns success independently of
+ * substitution status. Redirect expansion errors fail that child, while
+ * assignment-value errors still affect the parent. Parent assignments remain
+ * visible, but the child's descriptor allocations and changes do not persist.
  * Unquoted named-FD duplication operands follow the current shell's IFS.
  * A proved all-decimal separator set produces a known setup failure. Partial
  * or unresolved decimal splitting returns SHELL_DEP_EPARSE rather than
@@ -806,8 +829,10 @@ bool shell_dep_doc_env_name_equals(const shell_dep_doc_t *doc, const char *name,
  * path, then removes redundant separators and single-dot components. Parent
  * components remain lexical: collapsing `link/..` would be unsound when
  * `link` is a symlink. It does not resolve symlinks or inspect the filesystem.
- * Dynamic paths and relative
- * paths with an unknown CWD return false. `absolute` distinguishes an actual
+ * The document's dynamic-path classification is authoritative. Unresolved or
+ * failed expansions and relative paths with an unknown CWD return false;
+ * callback-resolved paths use their decoded value without reinterpreting it as
+ * shell syntax. `absolute` distinguishes an actual
  * absolute identity from one rooted at a relative initial CWD; compare it
  * along with the output bytes. `written` excludes the trailing NUL. On
  * failure outputs are cleared and the destination is unchanged.

@@ -22,6 +22,9 @@ enum {
    * persist in the current shell. The graph uses this role to invalidate a
    * descriptor-variable binding without rescanning unrelated prefixes. */
   SHELL_BUILTIN_ROLE_PROMOTES_PREFIX = 64u,
+  /* An operand controls whether later builtin effects occur. It must retain
+   * source semantics when state-changing operands are not expanded. */
+  SHELL_BUILTIN_ROLE_CONTROL = 128u,
 };
 
 enum {
@@ -152,8 +155,8 @@ static inline SHELL_NONNULL(1) unsigned shell_builtin_name_properties(
     const char *name, size_t length) {
   shell_builtin_variable_scan_t scan = {.valid = true,
                                         .names = SHELL_BUILTIN_VARIABLE_MASK};
-  (void)shell_source_visit_static_word(name, length,
-                                       shell_builtin_variable_byte, &scan);
+  (void)shell_source_visit_static_argument(name, length,
+                                           shell_builtin_variable_byte, &scan);
   return shell_builtin_variable_properties(&scan);
 }
 
@@ -168,8 +171,8 @@ static inline SHELL_NONNULL(1) shell_builtin_variable_t
     shell_builtin_variable(const char *word, size_t length) {
   shell_builtin_variable_scan_t scan = {.valid = true,
                                         .names = SHELL_BUILTIN_VARIABLE_MASK};
-  if (!shell_source_visit_static_word(word, length, shell_builtin_variable_byte,
-                                      &scan))
+  if (!shell_source_visit_static_argument(word, length,
+                                          shell_builtin_variable_byte, &scan))
     return SHELL_BUILTIN_VARIABLE_DYNAMIC;
   if (!scan.valid || scan.length == 0)
     return SHELL_BUILTIN_VARIABLE_INVALID;
@@ -442,7 +445,7 @@ static inline SHELL_NONNULL(1, 2) unsigned shell_builtin_declaration_word(
   if (state->options) {
     shell_builtin_declaration_option_t scan = {.kind = state->kind,
                                                .valid = true};
-    if (shell_source_visit_static_word(
+    if (shell_source_visit_static_argument(
             word, length, shell_builtin_declaration_option_byte, &scan) &&
         scan.option && scan.length > 1) {
       if (!scan.valid)
@@ -1219,8 +1222,11 @@ static inline SHELL_NONNULL(1) bool shell_builtin_test_unsupported(
  * commits the latest -v target; TARGET|WRITE identifies a current %n operand.
  * A compiled schedule handles format reuse in constant time per data word.
  * Invalid names terminate processing except that an empty %n name is a no-op.
- * Static %b '\c' terminates before later writes. Unknown formats have unknown
- * scalar writes; variable-cardinality operands in a %n format are unsupported
+ * Static %b '\c' terminates before later writes. CONTROL marks %b operands in
+ * %n-bearing formats, including reuse: expanding those independently of the
+ * effect schedule would disagree about which variable writes occur.
+ * Unknown formats have unknown scalar writes; variable-cardinality operands
+ * in a %n format are unsupported
  * because they cannot be aligned with the schedule. The source boundary checks
  * target syntax before graph construction. */
 static inline SHELL_NONNULL(1, 2) unsigned shell_builtin_printf_word(
@@ -1254,14 +1260,16 @@ static inline SHELL_NONNULL(1, 2) unsigned shell_builtin_printf_word(
           roles |= SHELL_BUILTIN_ROLE_WRITE;
         else if (variable == SHELL_BUILTIN_VARIABLE_INVALID) {
           shell_builtin_printf_escape_t scan = {0};
-          shell_source_visit_static_word(
+          shell_source_visit_static_argument(
               word, length, shell_builtin_printf_escape_byte, &scan);
           if (scan.length != 0)
             state->phase = SHELL_PRINTF_ERROR;
         }
       } else {
+        if (format->has_count)
+          roles |= SHELL_BUILTIN_ROLE_CONTROL;
         shell_builtin_printf_escape_t scan = {0};
-        if (shell_source_visit_static_word(
+        if (shell_source_visit_static_argument(
                 word, length, shell_builtin_printf_escape_byte, &scan) &&
             scan.stop)
           state->phase = SHELL_PRINTF_ERROR;
@@ -1293,7 +1301,7 @@ static inline SHELL_NONNULL(1, 2) unsigned shell_builtin_printf_word(
   if (state->phase == SHELL_PRINTF_OPTIONS) {
     shell_builtin_printf_option_t scan = {
         .target = {.valid = true, .names = SHELL_BUILTIN_VARIABLE_MASK}};
-    if (!shell_source_visit_static_word(
+    if (!shell_source_visit_static_argument(
             word, length, shell_builtin_printf_option_byte, &scan)) {
       state->phase = SHELL_PRINTF_UNKNOWN;
       return SHELL_BUILTIN_ROLE_DYNAMIC;
@@ -1319,7 +1327,7 @@ static inline SHELL_NONNULL(1, 2) unsigned shell_builtin_printf_word(
     }
   }
   state->format.repeat = true;
-  if (!shell_source_visit_static_word(
+  if (!shell_source_visit_static_argument(
           word, length, shell_builtin_printf_format_byte, &state->format)) {
     state->phase = SHELL_PRINTF_UNKNOWN;
     return SHELL_BUILTIN_ROLE_DYNAMIC;
@@ -1469,7 +1477,7 @@ static inline SHELL_NONNULL(1, 2) unsigned shell_builtin_unset_word(
     return 0;
   if (state->options) {
     shell_builtin_unset_option_t scan = {.valid = true};
-    if (shell_source_visit_static_word(
+    if (shell_source_visit_static_argument(
             word, length, shell_builtin_unset_option_byte, &scan) &&
         scan.dash && scan.length > 1) {
       if (scan.end && scan.length == 2)

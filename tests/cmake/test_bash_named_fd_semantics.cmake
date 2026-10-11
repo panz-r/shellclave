@@ -23,6 +23,159 @@ if(NOT supports_named_fds EQUAL 0)
   return()
 endif()
 
+# Fixed, trusted literal spellings only; these probes never execute corpus or
+# fuzz inputs. Compare ordinary and compound setup failures and prove that
+# later redirects/allocations cannot run after quote removal yields no filename.
+execute_process(
+  COMMAND "${CMAKE_COMMAND}" -E env "BASH_ENV=" "${SHELLCLAVE_BASH}" -p -c [=[
+set -e
+tmpdir=$(mktemp -d)
+trap 'rm -rf "$tmpdir"' EXIT
+for empty in "''" '""' "$''" "''\"\""; do
+  for redirect in '>' '<' '>>' '<>' '&>' '&>>' '3>' '{fd}>' '{fd}<>'; do
+    unset fd
+    if eval "true $redirect$empty >\"$tmpdir/later\"" 2>/dev/null; then exit 1; fi
+    test ! -e "$tmpdir/later"
+    test -z "${fd+x}"
+  done
+  for prefix in 'true' '{ true; }' '(true)' '! true' '! { true; }' '! (true)'; do
+    if eval "$prefix >$empty" 2>/dev/null; then
+      test "$prefix" = '! true'
+    else
+      test "$prefix" != '! true'
+    fi
+  done
+  exec {kept}>"$tmpdir/kept"
+  if eval "true >$empty {later}>\"$tmpdir/later\"" 2>/dev/null; then exit 1; fi
+  test -z "${later+x}"
+  printf retained >&"$kept"
+  exec {kept}>&-
+  test "$(<"$tmpdir/kept")" = retained
+done
+test "$(echo "$(<"")" tail 2>/dev/null)" = ' tail'
+# Substitution status is distinct from its captured bytes and from failure of
+# the enclosing command's setup. Fixed expressions only, never fuzz inputs.
+check_status() {
+  if (eval "$2") 2>/dev/null; then actual=0; else actual=1; fi
+  if test "$actual" != "$1"; then
+    printf 'status mismatch: expected=%s actual=%s source=%s\n' "$1" "$actual" "$2" >&2
+    return 1
+  fi
+}
+check_status 1 'X="$(<"")"'
+check_status 0 'X="$(<"")$(true)"'
+check_status 1 'X="$(true)$(<"")"'
+check_status 0 'X="$(false)" Y="$(true)"'
+check_status 1 'X="$(true)" Y="$(false)"'
+check_status 0 'X="$(false)" <<<"$(true)"'
+check_status 0 '<<<"$(true)" X="$(false)"'
+check_status 0 'X="$(true)" <<<"$(false)"'
+check_status 0 'X="$(false)" <<<plain'
+check_status 1 'X="$(false)" Y=<(true)'
+check_status 0 'X=<(false)'
+check_status 0 'true "$(<"")"'
+check_status 0 'X="$(exit 0)"'
+check_status 1 'X="$(exit 7)"'
+check_status 0 'unset MAYBE; X="${MAYBE:+$(false)}"'
+check_status 1 'MAYBE=yes; X="${MAYBE:+$(false)}"'
+# Pattern removal skips its operand for both unset and null values. Pattern
+# replacement/case conversion skip it for unset values, but not null ones.
+for operand in '#$(false)' '##$(false)' '%$(false)' '%%$(false)' \
+               '/$(false)/x' '//$(false)/x' '/#$(false)/x' '/%$(false)/x' \
+               '/x/$(false)' '//x/$(false)' '^$(false)' '^^$(false)' \
+               ',$(false)' ',,$(false)'; do
+  expression='X="${value'"$operand"'}"'
+  check_status 0 "unset value; $expression"
+  check_status 1 "value=x; $expression"
+  case "$operand" in
+    \#*|%*) check_status 0 "value=; $expression";;
+    *) check_status 1 "value=; $expression";;
+  esac
+done
+check_status 1 'unset value; X="$(false)${value#$(true)}"'
+check_status 0 'value=x; X="$(false)${value#$(true)}"'
+check_status 0 'unset value; X="${value#$(false)}$(true)"'
+check_status 1 'unset value; X="${value#$(true)}$(false)"'
+(
+  HOME=/example
+  set -- x=~ x+=~ x=y:~ x=~/path x=one\:~ x=""~ "x"=~ x\=~ 1=~ x=~""
+  test "$1" = x=/example && test "$2" = x+=/example
+  test "$3" = x=y:/example && test "$4" = x=/example/path
+  test "$5" = 'x=one:~' && test "$6" = 'x=~' && test "$7" = 'x=~'
+  test "$8" = 'x=~' && test "$9" = '1=~' && test "${10}" = 'x=~'
+  cd "$tmpdir"
+  HOME=expanded
+  : >x=~
+  test -f x=expanded
+  printf payload >x=~
+  test "$(<x=~)" = payload
+  test "$(cat <<<x=~)" = 'x=~'
+  HOME=%n
+  fd=10
+  printf x=~ fd >/dev/null
+  test "$fd" = 2
+)
+# Quoting anywhere in a tilde prefix disables expansion; quoting after the
+# slash does not. Escaped line endings preserve the logical prefix position.
+(
+  set -- ~""/child ~"/child" "~"/child \~/child ~\/child ~\
+""/child ~\
+/child \
+~/child ~/"child" ~\
+$''/child ./~""/child
+  test "$1" = '~/child' && test "$2" = '~/child'
+  test "$3" = '~/child' && test "$4" = '~/child'
+  test "$5" = '~/child' && test "$6" = '~/child'
+  test "$7" = "$HOME/child" && test "$8" = "$HOME/child"
+  test "$9" = "$HOME/child" && test "${10}" = '~/child'
+  test "${11}" = './~/child'
+)
+# An argv-less command selects its setup child from the complete redirect
+# list, not from document kind, direction, or whether an FD actually changes.
+for redirect in '</dev/null' '0>/dev/null' '<>/dev/null' '0<&0' '0>&0' \
+                '0<&-' '0>&-' '{fd}>/dev/null' '{fd}</dev/null' \
+                '{fd}<<<plain' '< <(true)' '0> >(true)'; do
+  check_status 0 "X=\"\$(false)\" $redirect"
+done
+for redirect in '3</dev/null' '>/dev/null' '3<>/dev/null' '3<&0' '3>&-' \
+                '3<<<plain' '3< <(true)' '> >(true)'; do
+  check_status 1 "X=\"\$(false)\" $redirect"
+done
+check_status 0 '<<<plain >"$(printf /dev/null; false)"'
+check_status 0 '>"$(printf /dev/null; false)" <<<plain'
+check_status 1 '3<<<plain >"$(printf /dev/null; false)"'
+check_status 1 '3<<<"$(false)" X="$(true)"'
+check_status 0 'X="$(false)" 3<<<"$(true)"'
+check_status 1 'X="$(false)" 9>&- 0<&9'
+check_status 1 'X="$(false)" <""'
+check_status 1 '! X="$(false)" 0>&0'
+check_status 0 '! X="$(false)" 3<<<plain'
+check_status 0 'time X="$(false)" 0>&0'
+check_status 0 'X="$(Y="$(false)" 0>&0)"'
+test "$("$BASH" -p -c 'unset v; 3<<<"${v:?}" 0>&0; printf reached' 2>/dev/null)" = reached
+test "$("$BASH" -p -c 'unset v; 3<<<"${v:?}" 0<<<plain; printf reached' 2>/dev/null)" = reached
+test "$("$BASH" -p -c 'unset v; 3<<<"${v:?}" {fd}<<<plain; printf reached' 2>/dev/null)" = reached
+test -z "$("$BASH" -p -c 'unset v; X="${v:?}" 0>&0; printf impossible' 2>/dev/null)"
+test -z "$("$BASH" -p -c 'unset v; : <<<"${v:?}"; printf impossible' 2>/dev/null)"
+# Assignments commit before the setup child; its named binding never escapes.
+unset fd
+X=kept {fd}>/dev/null
+test "$X" = kept && test -z "${fd+x}"
+(exec {fd}>/dev/null
+ original=$fd
+ X=kept {fd}>/dev/null
+ test "$fd" = "$original"
+ IFS=0123456789 0>&0
+ if printf impossible >&$fd 2>/dev/null; then exit 1; fi
+ printf retained >&"$fd")
+test "$(X="$(<"")" && printf impossible; printf reached)" = reached
+]=]
+  RESULT_VARIABLE empty_path_status
+  ERROR_VARIABLE empty_path_error)
+if(NOT empty_path_status EQUAL 0)
+  message(FATAL_ERROR "Bash empty pathname setup contract failed: ${empty_path_error}")
+endif()
+
 # Keep the Shellsplit named-descriptor contract anchored to the executor that
 # defines it. This does not execute parsed fixture data; it only verifies the
 # small Bash semantics modelled by the graph. The hostile nested children prove
@@ -52,6 +205,26 @@ readonly POSIXLY_CORRECT
 test -z "${POSIXLY_CORRECT+x}"
 unset BASH_COMPAT BASH_XTRACEFD
 readonly BASH_COMPAT BASH_XTRACEFD
+
+# Empty redirect targets fail before allocating a named descriptor. Redirects
+# are processed left-to-right: later opens do not run, but an earlier named
+# allocation remains available even when the containing command fails setup.
+$BASH -p -c '
+  target=
+  if true {fd}>"$target"; then exit 1; fi
+  test -z "${fd+x}"
+  if true >"$target" {later}>"$1/later"; then exit 1; fi
+  test -z "${later+x}"
+  test ! -e "$1/later"
+  if { printf unexpected; } >"$target" {later}>"$1/group-later";
+  then exit 1; fi
+  test ! -e "$1/group-later"
+  if exec {kept}>"$1/kept" >"$target"; then exit 1; fi
+  printf retained >&"$kept"
+  test "$(cat "$1/kept")" = retained
+  if true {both}<>"$target"; then exit 1; fi
+  test -z "${both+x}"
+' bash "$tmpdir" 2>/dev/null
 
 # Declaration builtins can promote a same-name command prefix into the current
 # shell. Export -n and declaration queries do not. This distinction controls
@@ -813,6 +986,25 @@ done
   printf -v rendered "%s%n" value
   test "$first" = before
 '
+
+# A %b data expansion can stop before %n writes, including format reuse.
+# This state-controlling operand cannot be expanded independently of the
+# descriptor-mutation schedule. Ordinary %s data has no such stop effect.
+"$BASH" -p -c '
+  set -e
+  exec {fd}>"$1/printf-escape-control"
+  original=$fd
+  value="\\c"
+  printf "%b%n" "$value" fd
+  test "$fd" = "$original"
+  printf retained >&"$fd"
+  target=before
+  printf "%n%b" other "$value" target literal
+  test "$other" = 0 && test "$target" = before
+  printf "%s%n" "$value" target >/dev/null
+  test "$target" = 2
+' bash "$tmpdir"
+test "$(cat "$tmpdir/printf-escape-control")" = retained
 
 # ANSI-C NULs terminate their Bash word fragment. A canonical binary target
 # cannot be treated as a proved invalid scalar name that preserves this route.

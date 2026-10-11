@@ -4,6 +4,47 @@
 #include "shell_depgraph.h"
 #include "shell_tokenizer.h"
 
+/* Private whole-word resolution bridge. The owner/source are unchanged parser
+ * spans. A resolved value was canonically validated by the application-facing
+ * boundary; graph leaves consume these prechecked bytes without decoding them
+ * as shell source. Values and returned metadata remain valid and immutable for
+ * the lifetime of the output graph. Request objects and their borrowed CWD
+ * strings are callback-scoped; source spans retain the source lifetime.
+ * NULL resolver disables resolution. Callback failure returns NULL. */
+typedef enum {
+  SHELL_DEP_EXPAND_ARGUMENT,
+  SHELL_DEP_EXPAND_REDIRECT_PATH,
+  SHELL_DEP_EXPAND_FILE_PATH,
+} shell_dep_expand_purpose_t;
+
+typedef struct {
+  const char *word;
+  size_t word_length;
+  const char *owner;
+  size_t owner_length;
+  const char *cwd;
+  bool cwd_known, cwd_absolute;
+  shell_dep_expand_purpose_t purpose;
+  bool eligible;
+} shell_dep_expand_request_t;
+
+typedef struct {
+  const char *netargv;
+  size_t length, count, display_length;
+  const char *first;
+  size_t first_length;
+  bool resolved;
+  bool dynamic;
+} shell_dep_word_value_t;
+
+typedef const shell_dep_word_value_t *(*shell_dep_expand_fn)(
+    const shell_dep_expand_request_t *request, void *context)SHELL_NONNULL(1);
+
+typedef struct {
+  shell_dep_expand_fn expand;
+  void *context;
+} shell_dep_word_resolver_t;
+
 /* Internal zero-copy consumer of an existing fast parse, not an independent
  * parse of cmd. With non-NULL `fast`, the caller must supply the unmodified
  * result of shell_parse_fast(cmd, cmd_len, ...) for exactly these source bytes
@@ -26,6 +67,21 @@ shell_dep_error_t shell_dep_graph_parse_with_fast(
     const char *cmd, size_t cmd_len, const char *initial_cwd,
     const shell_dep_limits_t *limits, const shell_parse_result_t *fast,
     shell_dep_graph_t *out) SHELL_NONNULL(1, 6);
+
+/* Same source/parse/workspace contract; resolution is part of construction,
+ * before effective setup outcomes and routes are committed. unresolved_paths
+ * references SHELL_DEP_MAX_NODES writable bytes outside out and the graph
+ * workspace. It must not overlap the resolver's returned value entries or
+ * payload spans. It receives one boolean per retained graph node: an active
+ * pathname expansion owned by that CMD/GROUP remained unresolved.
+ * Nested pathname expansions retain their semantic owner even when a resolved
+ * containing word or failed open removes the final byte-flow edge. Child joins
+ * and compaction preserve these facts; unused entries are zero. */
+shell_dep_error_t shell_dep_graph_parse_with_fast_resolver(
+    const char *cmd, size_t cmd_len, const char *initial_cwd,
+    const shell_dep_limits_t *limits, const shell_parse_result_t *fast,
+    shell_dep_graph_t *out, const shell_dep_word_resolver_t *resolver,
+    uint8_t *unresolved_paths) SHELL_NONNULL(1, 5, 6, 8);
 
 /* Identity rendering from an already decoded static FILE word. The caller
  * supplies its complete, nonempty, NUL-free payload and an unchanged document

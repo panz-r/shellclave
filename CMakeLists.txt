@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(Shellclave VERSION 0.11.0 LANGUAGES C CXX)
+project(Shellclave VERSION 0.12.0 LANGUAGES C CXX)
 
 if(PROJECT_IS_TOP_LEVEL)
   set(CMAKE_EXPORT_COMPILE_COMMANDS ON)

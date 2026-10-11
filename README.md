@@ -127,15 +127,58 @@ Shellsplit remains the shell-language boundary: use the binary-safe
 `shell_build_type_netseq_buffer()` to turn shell source into canonical records
 when arguments may contain NUL. The similarly named C-string builders remain
 available for NUL-free compatibility inputs.
-Shellgate expansion callbacks consume and return canonical `netargv` values,
-and its anomaly APIs accept canonical `netsequence` values. Human-facing CPL
-conversion remains explicit at the Shellgate and CLI boundaries. See
+Shellgate's `sg_gate_set_expand_word_netargv()` callback consumes an exact
+source-word request and returns canonical, explicit-length `netargv`. Requests
+identify the argument, redirect-path, or file-substitution-path purpose and the
+known execution CWD. The request and borrowed CWD are callback-scoped; returned
+netargv storage must remain immutable until evaluation returns. Shell-state
+operands remain protected, including `printf %b` data in `%n`-bearing formats;
+assignment-shaped tilde words (`name=~`, `name+=~`, `name=a:~`) are dynamic
+arguments and FILE operands, but here-string data does not use that rule.
+Unresolved dynamic FILE operands do not have a concrete path identity; spelling
+heuristics may still apply. CWD tracking distinguishes actual leading-tilde
+expansion from quote-disabled forms such as `~""/child`. Literal relative paths
+remain subject to CDPATH, while `./~""/child` is a known literal relative path.
+Protected dynamic formats and assignment values still participate in shell-state
+analysis; they cannot leave a named-FD binding falsely established.
+`unresolved_expansion_flags` distinguish unresolved argv and paths even when a
+policy matches their processed source. Aggregate flags cover the retained graph,
+including commands omitted by policy early-stop or diagnostic truncation;
+per-command flags include inherited group I/O. A truncated graph cannot describe
+unretained commands. Its anomaly APIs accept canonical
+`netsequence` values. Human-facing CPL conversion remains explicit at the
+Shellgate and CLI boundaries. See
 [docs/canonical-formats.md](docs/canonical-formats.md) for the wire contracts.
 
 For each `sg_subcommand_result_t`, `netargv` and `netargv_length` are the
-authoritative programmatic result. `command` is a space-joined diagnostic
-display and is deliberately not reparsable; applications must decode the
+authoritative programmatic result. `display_command` is a space-joined
+diagnostic display and is deliberately not reparsable; applications must decode the
 netargv records with `shell_netstring_iter_t` when they need argument values.
+
+The evaluation-buffer size hint is an initial source-based estimate. Large
+resolved path values can require additional private scratch and identity
+storage in that same buffer. Insufficient workspace returns `SG_ERR_MEMORY`
+with an undetermined verdict; it never silently skips known-path analysis.
+Grow the buffer and retry. Failed attempts do not update anomaly learning.
+Path-related violation details copy resolved targets into the result buffer as
+`resolved "<value>" (source "<spelling>")`, escaping quotes, backslashes, control
+bytes and non-ASCII bytes. Source-only details retain their previous spelling.
+Long resolved targets can therefore also require additional result space;
+insufficient result space returns `SG_ERR_TRUNC`, not an allowed verdict.
+
+Graph construction propagates known command-substitution outcomes separately
+from captured bytes. Assignment-only commands normally use the last executed
+substitution's status. Bash executes an argv-less command's redirection setup
+in a child when any redirect targets fd 0 or a named descriptor; successful
+setup then returns success, independent of substitution statuses. Assignment
+expansion still belongs to the parent, while redirect expansion errors remain
+local to that child. Ordinary commands retain their own execution status.
+Known failures suppress impossible conditional effects and callbacks. Runtime
+unknown or conditional substitutions retain the possible outcomes; resolving a
+pathname does not prove that opening the file will succeed.
+Parameter pattern removal, replacement and case-conversion operands may skip
+their substitutions for unset or empty values. Their analysis preserves the
+incoming status as well as the possible substitution outcome.
 
 ## CMake consumption
 

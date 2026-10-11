@@ -260,11 +260,14 @@ shell_visit_decoded_word(const char *text, size_t length,
                          shell_decoded_word_visitor_t visitor, void *context,
                          size_t *decoded_length) SHELL_NONNULL(1, 5);
 
-/** Visit a complete word only when its value is statically determined.
+/** Visit a complete generic word only when its value is statically determined.
  * Quote removal, escapes, and ANSI-C quotes are decoded; parameter, command,
  * arithmetic, glob, brace, process, and tilde expansion make the word
- * non-static. Returns false for a dynamic, malformed, or invalid word. The
- * visitor and decoded_length have the same semantics as above. */
+ * non-static. This context-free helper does not classify assignment-shaped
+ * argument/FILE-operand expansion (e.g. Bash's `name=~`); semantic consumers
+ * must establish the word's expansion context separately. Returns false for
+ * a dynamic, malformed, or invalid word. The visitor and decoded_length have
+ * the same semantics as above. */
 bool shell_visit_static_word(const char *text, size_t length,
                              shell_decoded_word_visitor_t visitor,
                              void *context, size_t *decoded_length)

@@ -588,6 +588,29 @@ static int test_generated_document_boundary(uint8_t selector) {
 }
 
 static int test_fixed_oracles(void) {
+  for (const auto &fixture : shellsplit_test_substitution_status_cases) {
+    for (unsigned success = 0; success < 2; success++) {
+      std::string source =
+          std::string(fixture.source) +
+          (success ? " && echo >/etc/reached" : " || echo >/etc/reached");
+      shell_dep_graph_t graph = {};
+      if (shell_dep_graph_parse(source.data(), source.size(), ".", nullptr,
+                                &graph) != SHELL_DEP_OK ||
+          !shell_dep_graph_validate(&graph).valid)
+        return fixed_oracle_failure(__LINE__);
+      bool reached = false;
+      for (uint32_t e = 0; e < graph.edge_count; e++) {
+        const auto &edge = graph.edges[e];
+        const auto &target = graph.nodes[edge.to];
+        reached |=
+            edge.type == SHELL_EDGE_WRITE && target.type == SHELL_NODE_DOC &&
+            target.doc.kind == SHELL_DOC_FILE && target.doc.path_len == 12 &&
+            !std::memcmp(target.doc.path, "/etc/reached", 12);
+      }
+      if (reached != (success ? fixture.succeeds : fixture.fails))
+        return fixed_oracle_failure(__LINE__);
+    }
+  }
   for (const auto &fixture : shellsplit_test_comment_words) {
     if (test_processor(fixture.source, std::strlen(fixture.source)))
       return fixed_oracle_failure(__LINE__);
@@ -5718,7 +5741,9 @@ static int test_substitution_case(const shell_substitution_fuzz_case_t &item,
         if (graph.nodes[edge->to].type != SHELL_NODE_DOC ||
             graph.nodes[edge->to].doc.kind != SHELL_DOC_FILE ||
             (graph.nodes[edge->to].doc.flags &
-             SHELL_DEP_DOC_FLAG_DYNAMIC_NAME) == 0)
+             (SHELL_DEP_DOC_FLAG_DYNAMIC_NAME |
+              SHELL_DEP_DOC_FLAG_RESOLVED_PATH |
+              SHELL_DEP_DOC_FLAG_EXPANSION_FAILED)) == 0)
           topology_valid = false;
       }
     }
@@ -6241,6 +6266,77 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
            SHELL_TOKEN_GLOB) != fixture.glob ||
           test_tokenizer_state(source, static_cast<size_t>(length)))
         abort();
+    }
+    for (const auto &fixture : shellsplit_test_tilde_words) {
+      size_t length = strlen(fixture.word), decoded = 0;
+      std::string source = std::string("echo >") + fixture.word;
+      shell_dep_graph_t graph = {};
+      bool valid =
+          shell_visit_static_word(fixture.word, length, nullptr, nullptr,
+                                  &decoded) != fixture.generic_dynamic &&
+          shell_dep_graph_parse(source.data(), source.size(), ".", nullptr,
+                                &graph) == SHELL_DEP_OK &&
+          shell_dep_graph_validate(&graph).valid;
+      size_t files = 0;
+      for (uint32_t n = 0; valid && n < graph.node_count; n++) {
+        const auto &node = graph.nodes[n];
+        if (node.type != SHELL_NODE_DOC || node.doc.kind != SHELL_DOC_FILE)
+          continue;
+        files++;
+        valid = node.doc.path_len == length &&
+                !std::memcmp(node.doc.path, fixture.word, length) &&
+                ((node.doc.flags & SHELL_DEP_DOC_FLAG_DYNAMIC_NAME) != 0) ==
+                    fixture.argument_dynamic;
+        char identity[128];
+        std::memset(identity, 'x', sizeof(identity));
+        size_t written = SIZE_MAX;
+        bool absolute = true;
+        bool known = shell_dep_doc_file_identity_write(
+            &graph, &node.doc, identity, sizeof(identity), &written, &absolute);
+        valid = valid && known == !fixture.argument_dynamic;
+        if (!known) {
+          valid = valid && written == 0 && !absolute;
+          for (char byte : identity)
+            valid = valid && byte == 'x';
+        }
+      }
+      if (!valid || files != 1) {
+        fprintf(stderr, "tilde expansion oracle failed: %s\n", fixture.word);
+        abort();
+      }
+    }
+    for (const auto &fixture : shellsplit_test_tilde_cwd) {
+      std::string source = std::string("cd ") + fixture.word + "; pwd >out";
+      shell_dep_graph_t graph = {};
+      bool valid =
+          shell_dep_graph_parse(source.data(), source.size(), "/workspace",
+                                nullptr, &graph) == SHELL_DEP_OK &&
+          shell_dep_graph_validate(&graph).valid;
+      size_t files = 0;
+      for (uint32_t n = 0; valid && n < graph.node_count; n++) {
+        const auto &node = graph.nodes[n];
+        if (node.type != SHELL_NODE_DOC || node.doc.kind != SHELL_DOC_FILE ||
+            node.doc.path_len != 3 || std::memcmp(node.doc.path, "out", 3))
+          continue;
+        files++;
+        char identity[128];
+        size_t written = 0;
+        bool absolute = false;
+        bool known = shell_dep_doc_file_identity_write(
+            &graph, &node.doc, identity, sizeof(identity), &written, &absolute);
+        valid =
+            known == (fixture.cwd != nullptr) && node.doc.cwd_known == known;
+        if (known) {
+          std::string expected = std::string(fixture.cwd) + "/out";
+          valid = valid && absolute == fixture.absolute &&
+                  written == expected.size() && identity == expected;
+        } else
+          valid = valid && written == 0 && !absolute;
+      }
+      if (!valid || files != 1) {
+        fprintf(stderr, "tilde CWD identity oracle failed: %s\n", fixture.word);
+        abort();
+      }
     }
     for (const auto &fixture : shellsplit_test_fragment_words) {
       shell_abstract_command_t *abstract = nullptr;

@@ -426,6 +426,46 @@ static void test_declaration_prefix_promotion_roles(void) {
 
 static void test_printf_effect_schedule(void) {
   static const struct {
+    const char *format, *data;
+    bool control, stopped;
+  } controls[] = {
+      {"'%b%n'", "\"$V\"", true, false},  {"'%b%n'", "'\\c'", true, true},
+      {"'%b%n'", "'\\\\c'", true, false}, {"'%s%n'", "\"$V\"", false, false},
+      {"'%b'", "\"$V\"", false, false},   {"'%b'", "'\\c'", false, true},
+  };
+  for (size_t i = 0; i < sizeof(controls) / sizeof(controls[0]); i++) {
+    shell_builtin_printf_t state = {0};
+    CHECK(shell_builtin_printf_word(&state, controls[i].format,
+                                    strlen(controls[i].format)) ==
+          SHELL_BUILTIN_ROLE_FORMAT);
+    CHECK(shell_builtin_printf_word(&state, controls[i].data,
+                                    strlen(controls[i].data)) ==
+          (controls[i].control ? SHELL_BUILTIN_ROLE_CONTROL : 0));
+    CHECK((state.phase == SHELL_PRINTF_ERROR) == controls[i].stopped);
+    if (state.format.has_count)
+      CHECK(shell_builtin_printf_word(&state, "fd", 2) ==
+            (controls[i].stopped
+                 ? 0
+                 : SHELL_BUILTIN_ROLE_TARGET | SHELL_BUILTIN_ROLE_WRITE));
+  }
+  /* A %b after %n can suppress the next iteration's write. Ownership of
+   * CONTROL comes from the compiled schedule, not another format scan. */
+  shell_builtin_printf_t repeated = {0};
+  CHECK(shell_builtin_printf_word(&repeated, "'%n%b'", 6) ==
+        SHELL_BUILTIN_ROLE_FORMAT);
+  for (size_t iteration = 0; iteration < 16; iteration++) {
+    CHECK(shell_builtin_printf_word(&repeated, "fd", 2) ==
+          (SHELL_BUILTIN_ROLE_TARGET | SHELL_BUILTIN_ROLE_WRITE));
+    CHECK(shell_builtin_printf_word(&repeated, "\"$V\"", 4) ==
+          SHELL_BUILTIN_ROLE_CONTROL);
+  }
+  CHECK(shell_builtin_printf_word(&repeated, "fd", 2) ==
+        (SHELL_BUILTIN_ROLE_TARGET | SHELL_BUILTIN_ROLE_WRITE));
+  CHECK(shell_builtin_printf_word(&repeated, "'\\c'", 4) ==
+        SHELL_BUILTIN_ROLE_CONTROL);
+  CHECK(shell_builtin_printf_word(&repeated, "fd", 2) == 0);
+
+  static const struct {
     const char *word;
     bool writes;
   } escapes[] = {
@@ -4397,6 +4437,102 @@ static void test_forward_word_scanners(void) {
 }
 
 static void test_word_expansion_recognition(void) {
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+  for (unsigned family = 0; family < 6; family++) {
+    size_t previous = 0;
+    for (size_t count = 32; count <= 4096; count *= 2) {
+      char word[8208];
+      size_t length = 0;
+      if (family == 0) {
+        memset(word, 'x', count);
+        length = count;
+        memcpy(word + length, "+=~", 3);
+        length += 3;
+      } else if (family < 3) {
+        memcpy(word, "x=", 2);
+        length = 2;
+        for (size_t i = 0; i < count; i++) {
+          word[length++] = family == 1 ? ':' : '\\';
+          word[length++] = family == 1 ? 'x' : ':';
+        }
+        word[length++] = ':';
+        word[length++] = '~';
+      } else {
+        memcpy(word, "~/", 2);
+        length = 2;
+        memset(word + length, 'x', count);
+        length += count;
+        const char *tail = family == 3 ? "" : family == 4 ? "$value" : "\"\"";
+        memcpy(word + length, tail, strlen(tail));
+        length += strlen(tail);
+      }
+      shellsplit_test_source_scan_reset();
+      shell_source_word_expansion_t expansion =
+          shell_source_word_expansion(word, length, SHELL_SOURCE_WORD_ARGUMENT);
+      CHECK(expansion.dynamic == (family < 3 || family == 4));
+      if (!expansion.dynamic)
+        CHECK(expansion.leading_tilde);
+      size_t work = shellsplit_test_source_scan_work();
+      CHECK(work <= 4 * length && (!previous || work <= 2 * previous + 16));
+      previous = work;
+    }
+  }
+#endif
+  for (size_t i = 0; i < sizeof(shellsplit_test_tilde_cwd) /
+                             sizeof(shellsplit_test_tilde_cwd[0]);
+       i++) {
+    shell_source_word_expansion_t expansion = shell_source_word_expansion(
+        shellsplit_test_tilde_cwd[i].word,
+        strlen(shellsplit_test_tilde_cwd[i].word), SHELL_SOURCE_WORD_ARGUMENT);
+    CHECK(expansion.dynamic == shellsplit_test_tilde_cwd[i].other_dynamic);
+    if (!expansion.dynamic)
+      CHECK(expansion.leading_tilde ==
+            shellsplit_test_tilde_cwd[i].leading_tilde);
+  }
+  for (size_t i = 0; i < sizeof(shellsplit_test_tilde_words) /
+                             sizeof(shellsplit_test_tilde_words[0]);
+       i++) {
+    const char *word = shellsplit_test_tilde_words[i].word;
+    size_t length = strlen(word), decoded;
+    CHECK(shell_source_argument_has_dynamic_syntax(word, length) ==
+          shellsplit_test_tilde_words[i].argument_dynamic);
+    CHECK(shell_source_word_has_dynamic_syntax(word, length) ==
+          shellsplit_test_tilde_words[i].generic_dynamic);
+    CHECK(shell_visit_static_word(word, length, NULL, NULL, &decoded) ==
+          !shellsplit_test_tilde_words[i].generic_dynamic);
+    source_capture_t capture = {0};
+    CHECK(shell_source_visit_static_argument(word, length, capture_source_byte,
+                                             &capture) ==
+          !shellsplit_test_tilde_words[i].argument_dynamic);
+  }
+  for (size_t i = 0;
+       i < sizeof(shellsplit_test_substitution_status_cases) /
+               sizeof(shellsplit_test_substitution_status_cases[0]);
+       i++) {
+    for (unsigned success = 0; success < 2; success++) {
+      char source[512];
+      int length = snprintf(source, sizeof(source), "%s %s echo >/etc/reached",
+                            shellsplit_test_substitution_status_cases[i].source,
+                            success ? "&&" : "||");
+      CHECK(length > 0 && (size_t)length < sizeof(source));
+      shell_dep_graph_t graph = {0};
+      CHECK(shell_dep_graph_parse(source, (size_t)length, ".", NULL, &graph) ==
+            SHELL_DEP_OK);
+      CHECK(shell_dep_graph_validate(&graph).valid);
+      bool reached = false;
+      for (uint32_t e = 0; e < graph.edge_count; e++) {
+        const shell_dep_edge_t *edge = &graph.edges[e];
+        const shell_dep_node_t *target = &graph.nodes[edge->to];
+        reached |=
+            edge->type == SHELL_EDGE_WRITE && target->type == SHELL_NODE_DOC &&
+            target->doc.kind == SHELL_DOC_FILE && target->doc.path_len == 12 &&
+            memcmp(target->doc.path, "/etc/reached", 12) == 0;
+      }
+      CHECK(reached ==
+            (success ? shellsplit_test_substitution_status_cases[i].succeeds
+                     : shellsplit_test_substitution_status_cases[i].fails));
+    }
+  }
   for (size_t i = 0; i < sizeof(shellsplit_test_glob_words) /
                              sizeof(shellsplit_test_glob_words[0]);
        i++) {
