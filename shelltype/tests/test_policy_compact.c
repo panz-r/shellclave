@@ -27,22 +27,12 @@ static void cleanup_nfa_save_directory(void) {
   }
 }
 
-static int pattern_is_cpl(const char *actual, const char *cpl) {
-  if (!actual || !cpl)
-    return actual == cpl;
-  char *encoded = NULL;
-  int equal = st_netpattern_from_cpl(cpl, &encoded) == ST_OK &&
-              strcmp(actual, encoded) == 0;
-  free(encoded);
-  return equal;
-}
-
 #define ASSERT(condition)                                                      \
   do {                                                                         \
     if (!(condition)) {                                                        \
       printf("    assertion failed: %s at %s:%d\n", #condition, __FILE__,      \
              __LINE__);                                                        \
-      return 0;                                                                \
+      exit(EXIT_FAILURE);                                                      \
     }                                                                          \
   } while (0)
 
@@ -86,7 +76,10 @@ static int eval_matches(st_policy_t *policy, const char *command,
   st_error_t error = test_st_policy_eval(policy, command, &result);
   int valid = error == ST_OK && result.matches == (expected_pattern != NULL);
   if (expected_pattern)
-    valid = valid && pattern_is_cpl(result.matching_pattern, expected_pattern);
+    valid = valid && test_pattern_is_cpl(
+                         (st_netpattern_view_t){result.matching_pattern,
+                                                result.matching_pattern_length},
+                         expected_pattern);
   else
     valid = valid && result.matching_pattern == NULL;
   if (!valid)
@@ -272,11 +265,18 @@ static int parsed_nfa_load(const char *path, parsed_nfa_t *nfa) {
   while (fgets(line, sizeof(line), file)) {
     size_t value;
     if (sscanf(line, "States: %zu", &value) == 1) {
-      nfa->states = calloc(value, sizeof(*nfa->states));
+      if (nfa->states || value == 0 || value > SIZE_MAX / sizeof(*nfa->states))
+        goto fail;
+      parsed_nfa_state_t *states = st_test_calloc(value, sizeof(*states));
+      if (!states)
+        goto fail;
+      nfa->states = states;
       nfa->count = value;
     } else if (sscanf(line, "Initial: %zu", &value) == 1) {
       nfa->initial = value;
     } else if (sscanf(line, "State %zu:", &value) == 1) {
+      if (value >= nfa->count)
+        goto fail;
       current = value;
     } else if (current < nfa->count && strstr(line, "EosTarget: yes")) {
       nfa->states[current].accepting = true;
@@ -290,13 +290,14 @@ static int parsed_nfa_load(const char *path, parsed_nfa_t *nfa) {
       size_t target;
       if (sscanf(line, "    Symbol %d -> %zu", &symbol, &target) == 2) {
         parsed_nfa_state_t *state = &nfa->states[current];
+        if (target >= nfa->count ||
+            state->count >= SIZE_MAX / sizeof(*state->transitions))
+          goto fail;
         parsed_transition_t *grown =
             realloc(state->transitions,
                     (state->count + 1) * sizeof(*state->transitions));
         if (!grown) {
-          fclose(file);
-          parsed_nfa_free(nfa);
-          return 0;
+          goto fail;
         }
         state->transitions = grown;
         state->transitions[state->count++] =
@@ -304,10 +305,52 @@ static int parsed_nfa_load(const char *path, parsed_nfa_t *nfa) {
       }
     }
   }
-  int valid = fclose(file) == 0 && nfa->states && nfa->initial < nfa->count;
+  int valid = !ferror(file) && nfa->states && nfa->initial < nfa->count;
+  if (fclose(file) != 0)
+    valid = 0;
   if (!valid)
     parsed_nfa_free(nfa);
   return valid;
+
+fail:
+  fclose(file);
+  parsed_nfa_free(nfa);
+  return 0;
+}
+
+static int test_nfa_fixture_failures_are_atomic(void) {
+  const char *path = "test_compact_invalid.nfa";
+  FILE *file = fopen(path, "w");
+  ASSERT(file != NULL);
+  ASSERT(fputs("States: 1\nInitial: 0\nState 0:\n", file) >= 0);
+  ASSERT(fclose(file) == 0);
+  parsed_nfa_t nfa = {0};
+  st_test_alloc_fail_at(1);
+  int loaded = parsed_nfa_load(path, &nfa);
+  st_test_alloc_reset();
+  ASSERT(!loaded && nfa.states == NULL && nfa.count == 0 && nfa.initial == 0);
+  ASSERT(parsed_nfa_load(path, &nfa));
+  parsed_nfa_free(&nfa);
+
+  static const char *invalid[] = {
+      "States: 0\n",
+      "States: 1\nStates: 1\n",
+      "States: 1\nState 1:\n",
+      "States: 1\nState 0:\n    Symbol 1 -> 1\n",
+  };
+  for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
+    file = fopen(path, "w");
+    ASSERT(file != NULL && fputs(invalid[i], file) >= 0 && fclose(file) == 0);
+    ASSERT(!parsed_nfa_load(path, &nfa));
+    ASSERT(nfa.states == NULL && nfa.count == 0 && nfa.initial == 0);
+  }
+  file = fopen(path, "w");
+  ASSERT(file != NULL && fprintf(file, "States: %zu\n", SIZE_MAX) > 0 &&
+         fclose(file) == 0);
+  ASSERT(!parsed_nfa_load(path, &nfa));
+  ASSERT(nfa.states == NULL && nfa.count == 0 && nfa.initial == 0);
+  ASSERT(unlink(path) == 0);
+  return 1;
 }
 
 static void epsilon_closure(const parsed_nfa_t *nfa, bool *active) {
@@ -447,7 +490,9 @@ static void typed_nfa_walk(typed_nfa_ctx_t *ctx, size_t token_index,
   if (token_index == ctx->tokens->count) {
     const char *found[32] = {0};
     size_t count = parsed_nfa_matches(ctx->nfa, ctx->buffer, found, 32);
+    ASSERT(count <= sizeof(found) / sizeof(found[0]));
     for (size_t i = 0; i < count; i++) {
+      ASSERT(found[i] != NULL);
       bool duplicate = false;
       for (size_t j = 0; j < ctx->match_count; j++)
         duplicate = duplicate || strcmp(ctx->matches[j], found[i]) == 0;
@@ -601,14 +646,14 @@ static int test_nfa_binary_literal_rendering(void) {
   ASSERT(context != NULL && policy != NULL);
   ASSERT(st_netpattern_from_cpl_owned("echo \"a\\x00b\"", &pattern) == ST_OK);
   ASSERT(st_policy_add_netpattern_view(
-             policy, (st_netpattern_view_t){.data = pattern.data,
+             policy, (st_netpattern_view_t){.data = (const char *)pattern.data,
                                             .length = pattern.length}) ==
          ST_OK);
   ASSERT(st_netpattern_from_cpl_owned("empty \"\"", &empty_literal) == ST_OK);
   ASSERT(st_policy_add_netpattern_view(
-             policy, (st_netpattern_view_t){.data = empty_literal.data,
-                                            .length = empty_literal.length}) ==
-         ST_OK);
+             policy,
+             (st_netpattern_view_t){.data = (const char *)empty_literal.data,
+                                    .length = empty_literal.length}) == ST_OK);
 
   st_nfa_render_opts_t options = {.category_mask = 1,
                                   .pattern_id_base = 1,
@@ -662,7 +707,7 @@ static int test_nfa_policy_equivalence(void) {
   ASSERT(parsed_nfa_load(path, &nfa));
 
   for (size_t i = 0; i < sizeof(commands) / sizeof(commands[0]); i++) {
-    const char **policy_matches = NULL;
+    st_netpattern_view_t *policy_matches = NULL;
     size_t policy_count = 0;
     ASSERT(test_st_policy_verify_all(policy, commands[i], &policy_matches,
                                      &policy_count) == ST_OK);
@@ -673,10 +718,10 @@ static int test_nfa_policy_equivalence(void) {
     for (size_t p = 0; p < policy_count; p++) {
       bool found = false;
       for (size_t n = 0; n < nfa_count; n++)
-        found = found || pattern_is_cpl(policy_matches[p], nfa_matches[n]);
+        found = found || test_pattern_is_cpl(policy_matches[p], nfa_matches[n]);
       ASSERT(found);
     }
-    test_st_policy_matches_free(policy_matches);
+    st_policy_matches_free(policy_matches);
   }
 
   parsed_nfa_free(&nfa);
@@ -754,7 +799,7 @@ static int nfa_equivalent_for_commands(st_policy_t *policy, const char *path,
     return 0;
   int equivalent = 1;
   for (size_t i = 0; i < command_count && equivalent; i++) {
-    const char **policy_matches = NULL;
+    st_netpattern_view_t *policy_matches = NULL;
     size_t policy_count = 0;
     if (test_st_policy_verify_all(policy, commands[i], &policy_matches,
                                   &policy_count) != ST_OK) {
@@ -769,10 +814,10 @@ static int nfa_equivalent_for_commands(st_policy_t *policy, const char *path,
     for (size_t p = 0; p < policy_count && equivalent; p++) {
       bool found = false;
       for (size_t n = 0; n < nfa_count; n++)
-        found = found || pattern_is_cpl(policy_matches[p], nfa_matches[n]);
+        found = found || test_pattern_is_cpl(policy_matches[p], nfa_matches[n]);
       equivalent = found;
     }
-    test_st_policy_matches_free(policy_matches);
+    st_policy_matches_free(policy_matches);
   }
   parsed_nfa_free(&nfa);
   return equivalent;
@@ -872,7 +917,7 @@ static int test_nfa_preserves_parameter_branches(void) {
       "chmod 0755",
   };
   for (size_t i = 0; i < sizeof(commands) / sizeof(commands[0]); i++) {
-    const char **policy_matches = NULL;
+    st_netpattern_view_t *policy_matches = NULL;
     size_t policy_count = 0;
     ASSERT(test_st_policy_verify_all(policy, commands[i], &policy_matches,
                                      &policy_count) == ST_OK);
@@ -886,10 +931,10 @@ static int test_nfa_preserves_parameter_branches(void) {
     for (size_t p = 0; p < policy_count; p++) {
       bool found = false;
       for (size_t n = 0; n < nfa_count; n++)
-        found = found || pattern_is_cpl(policy_matches[p], matches[n]);
+        found = found || test_pattern_is_cpl(policy_matches[p], matches[n]);
       ASSERT(found);
     }
-    test_st_policy_matches_free(policy_matches);
+    st_policy_matches_free(policy_matches);
   }
 
   parsed_nfa_free(&nfa);
@@ -918,7 +963,7 @@ static int metadata_matches_expected(st_policy_t *policy, const char *path,
     size_t expected_count = 0;
     while (expected_count < 5 && cases[i].expected[expected_count])
       expected_count++;
-    const char **policy_matches = NULL;
+    st_netpattern_view_t *policy_matches = NULL;
     size_t policy_count = 0;
     ASSERT(test_st_policy_verify_all(policy, cases[i].command, &policy_matches,
                                      &policy_count) == ST_OK);
@@ -932,8 +977,8 @@ static int metadata_matches_expected(st_policy_t *policy, const char *path,
       bool nfa_found = false;
       for (size_t actual = 0; actual < policy_count; actual++)
         policy_found =
-            policy_found ||
-            pattern_is_cpl(policy_matches[actual], cases[i].expected[expected]);
+            policy_found || test_pattern_is_cpl(policy_matches[actual],
+                                                cases[i].expected[expected]);
       for (size_t actual = 0; actual < nfa_count; actual++)
         nfa_found = nfa_found || strcmp(nfa_matches[actual],
                                         cases[i].expected[expected]) == 0;
@@ -942,12 +987,12 @@ static int metadata_matches_expected(st_policy_t *policy, const char *path,
                "counts=%zu/%zu)\n",
                cases[i].command, cases[i].expected[expected], policy_found,
                nfa_found, policy_count, nfa_count);
-        test_st_policy_matches_free(policy_matches);
+        st_policy_matches_free(policy_matches);
         parsed_nfa_free(&nfa);
         return 0;
       }
     }
-    test_st_policy_matches_free(policy_matches);
+    st_policy_matches_free(policy_matches);
   }
   parsed_nfa_free(&nfa);
   return 1;
@@ -1323,6 +1368,7 @@ int main(void) {
   printf("Running compact policy tests...\n\n");
   TEST(test_large_policy_compaction);
   TEST(test_compaction_allocation_failures_are_atomic);
+  TEST(test_nfa_fixture_failures_are_atomic);
   TEST(test_nfa_rendering_contract);
   TEST(test_nfa_binary_literal_rendering);
   TEST(test_nfa_policy_equivalence);

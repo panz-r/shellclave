@@ -236,7 +236,8 @@ int main(int argc, char *argv[]) {
   /* Classify mode */
   if (classify_cmd) {
     st_token_array_t arr = {NULL, 0};
-    st_error_t err = st_netargv_classify(classify_cmd, &arr);
+    st_error_t err = st_netargv_classify_view(
+        (st_netargv_view_t){classify_cmd, strlen(classify_cmd)}, &arr);
     if (err != ST_OK) {
       fprintf(stderr, "Error: normalisation failed (%d)\n", err);
       return 1;
@@ -257,7 +258,7 @@ int main(int argc, char *argv[]) {
     st_error_t err = st_netpattern_from_cpl_owned(validate_pat, &netpattern);
     if (err == ST_OK)
       err = st_netpattern_validate_view(
-          (st_netpattern_view_t){.data = netpattern.data,
+          (st_netpattern_view_t){.data = (const char *)netpattern.data,
                                  .length = netpattern.length},
           &tokens);
     st_netpattern_free(&netpattern);
@@ -340,7 +341,8 @@ int main(int argc, char *argv[]) {
     /* Single command verify */
     if (verify_cmd) {
       st_eval_result_t r = {0};
-      err = st_policy_eval(policy, verify_cmd, &r);
+      err = st_policy_eval_view(
+          policy, (st_netargv_view_t){verify_cmd, strlen(verify_cmd)}, &r);
       if (err != ST_OK) {
         fprintf(stderr, "Error: invalid netargv (%d)\n", err);
         free_policy(policy, context);

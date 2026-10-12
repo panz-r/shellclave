@@ -545,12 +545,6 @@ static sg_anomaly_status_t validate_netseq(const char *netseq, size_t length,
                                             : netstring_status(net_status);
 }
 
-sg_anomaly_status_t sg_anomaly_netseq_count(const char *netseq, size_t length,
-                                            bool enforce_item_limit,
-                                            size_t *count) {
-  return validate_netseq(netseq, length, enforce_item_limit, count);
-}
-
 /* Validate framing while scoring each record once. Publish neither count nor
  * score until the complete sequence is valid, including malformed tails on
  * short samples and untrained models. */
@@ -725,17 +719,17 @@ static SHELL_NONNULL(1, 2, 4) sg_anomaly_status_t
   if (count > SIZE_MAX / 7 || count > SIZE_MAX / sizeof(*txn->items) ||
       count * 7 > SIZE_MAX / sizeof(*txn->actions))
     return SG_ANOMALY_ERR_LIMIT;
+  if (count == 0)
+    return SG_ANOMALY_OK;
 
-  if (count != 0) {
-    /* The model's backing hash tables are independently allocatable. Keep the
-     * per-update journal outside Shellgate's cache-allocation fault seam so a
-     * cache optimization failure cannot masquerade as a failed learn. */
-    txn->items = realloc(NULL, count * sizeof(*txn->items));
-    txn->actions = realloc(NULL, count * 7 * sizeof(*txn->actions));
-    if (!txn->items || !txn->actions) {
-      anomaly_update_txn_free(txn);
-      return SG_ANOMALY_ERR_MEMORY;
-    }
+  /* The model's backing hash tables are independently allocatable. Keep the
+   * per-update journal outside Shellgate's cache-allocation fault seam so a
+   * cache optimization failure cannot masquerade as a failed learn. */
+  txn->items = realloc(NULL, count * sizeof(*txn->items));
+  txn->actions = realloc(NULL, count * 7 * sizeof(*txn->actions));
+  if (!txn->items || !txn->actions) {
+    anomaly_update_txn_free(txn);
+    return SG_ANOMALY_ERR_MEMORY;
   }
   txn->item_count = count;
 
@@ -1061,6 +1055,11 @@ static bool serialized_header_space(unsigned char byte) {
 static SHELL_NONNULL(1) bool serialized_header_separator(const char **cursor) {
   if (!serialized_header_space((unsigned char)**cursor))
     return false;
+  /* The physical-line boundary supplied initialized bytes through the NUL.
+   * The analyzer loses that reader/cursor relationship across iterations. */
+#ifdef __clang_analyzer__
+  __attribute__((suppress))
+#endif
   do {
     (*cursor)++;
   } while (serialized_header_space((unsigned char)**cursor));
@@ -1410,12 +1409,6 @@ size_t sg_anomaly_model_unigram_count_view(const sg_anomaly_model_t *model,
   return key_len > 0 ? count_get(model->uni, key, key_len) : 0;
 }
 
-size_t sg_anomaly_model_unigram_count(const sg_anomaly_model_t *model,
-                                      const char *cmd) {
-  return sg_anomaly_model_unigram_count_view(
-      model, (sg_anomaly_item_view_t){.data = cmd, .length = strlen(cmd)});
-}
-
 size_t sg_anomaly_model_unknown_count(const sg_anomaly_model_t *model) {
   return model->unk_count;
 }
@@ -1438,13 +1431,6 @@ size_t sg_anomaly_model_bigram_count_view(const sg_anomaly_model_t *model,
   return key_len > 0 ? count_get(model->bi, key, key_len) : 0;
 }
 
-size_t sg_anomaly_model_bigram_count(const sg_anomaly_model_t *model,
-                                     const char *prev, const char *curr) {
-  return sg_anomaly_model_bigram_count_view(
-      model, (sg_anomaly_item_view_t){.data = prev, .length = strlen(prev)},
-      (sg_anomaly_item_view_t){.data = curr, .length = strlen(curr)});
-}
-
 size_t sg_anomaly_model_trigram_count_view(const sg_anomaly_model_t *model,
                                            sg_anomaly_item_view_t p2,
                                            sg_anomaly_item_view_t p1,
@@ -1460,15 +1446,6 @@ size_t sg_anomaly_model_trigram_count_view(const sg_anomaly_model_t *model,
   char key[SG_ANOMALY_MAX_KEY_LENGTH];
   size_t key_len = build_key(key, sizeof(key), triple, 3);
   return key_len > 0 ? count_get(model->tri, key, key_len) : 0;
-}
-
-size_t sg_anomaly_model_trigram_count(const sg_anomaly_model_t *model,
-                                      const char *p2, const char *p1,
-                                      const char *curr) {
-  return sg_anomaly_model_trigram_count_view(
-      model, (sg_anomaly_item_view_t){.data = p2, .length = strlen(p2)},
-      (sg_anomaly_item_view_t){.data = p1, .length = strlen(p1)},
-      (sg_anomaly_item_view_t){.data = curr, .length = strlen(curr)});
 }
 
 size_t sg_anomaly_model_fourgram_count_view(const sg_anomaly_model_t *model,
@@ -1488,16 +1465,6 @@ size_t sg_anomaly_model_fourgram_count_view(const sg_anomaly_model_t *model,
   char key[SG_ANOMALY_MAX_KEY_LENGTH];
   size_t key_len = build_key(key, sizeof(key), quad, 4);
   return key_len > 0 ? count_get(model->quad, key, key_len) : 0;
-}
-
-size_t sg_anomaly_model_fourgram_count(const sg_anomaly_model_t *model,
-                                       const char *p3, const char *p2,
-                                       const char *p1, const char *curr) {
-  return sg_anomaly_model_fourgram_count_view(
-      model, (sg_anomaly_item_view_t){.data = p3, .length = strlen(p3)},
-      (sg_anomaly_item_view_t){.data = p2, .length = strlen(p2)},
-      (sg_anomaly_item_view_t){.data = p1, .length = strlen(p1)},
-      (sg_anomaly_item_view_t){.data = curr, .length = strlen(curr)});
 }
 
 size_t sg_anomaly_model_total_contexts(const sg_anomaly_model_t *model) {

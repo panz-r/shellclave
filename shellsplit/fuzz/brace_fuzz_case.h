@@ -580,7 +580,6 @@ struct shell_substitution_fuzz_case_t {
   uint32_t file_substitution_count;
   uint32_t collector_write_count;
   uint32_t result_dynamic_consumer_count;
-  uint32_t command_mapping_count;
   bool requires_substitution_evaluation;
   /* A literal-looking parameter operand can have no shell execution stage.
    * The feature bit is then an independent expectation, not a precondition. */
@@ -623,7 +622,6 @@ struct shell_substitution_fuzz_case_t {
                                  uint32_t file_substitution_count_value,
                                  uint32_t collector_write_count_value,
                                  uint32_t result_dynamic_consumer_count_value,
-                                 uint32_t command_mapping_count_value,
                                  bool requires_substitution_evaluation_value,
                                  bool output_process_value,
                                  uint32_t outer_fd_value)
@@ -634,7 +632,6 @@ struct shell_substitution_fuzz_case_t {
         file_substitution_count(file_substitution_count_value),
         collector_write_count(collector_write_count_value),
         result_dynamic_consumer_count(result_dynamic_consumer_count_value),
-        command_mapping_count(command_mapping_count_value),
         requires_substitution_evaluation(
             requires_substitution_evaluation_value),
         dynamic_name_substitution_count(UINT32_MAX),
@@ -652,7 +649,6 @@ struct shell_substitution_fuzz_case_t {
       uint32_t file_substitution_count_value,
       uint32_t collector_write_count_value,
       uint32_t result_dynamic_consumer_count_value,
-      uint32_t command_mapping_count_value,
       bool requires_substitution_evaluation_value, bool output_process_value,
       uint32_t outer_fd_value, uint32_t heredoc_count_value,
       uint32_t literal_heredoc_count_value,
@@ -665,7 +661,6 @@ struct shell_substitution_fuzz_case_t {
         file_substitution_count(file_substitution_count_value),
         collector_write_count(collector_write_count_value),
         result_dynamic_consumer_count(result_dynamic_consumer_count_value),
-        command_mapping_count(command_mapping_count_value),
         requires_substitution_evaluation(
             requires_substitution_evaluation_value),
         dynamic_name_substitution_count(UINT32_MAX),
@@ -697,7 +692,6 @@ shell_brace_fuzz_substitution_case(const uint8_t *data, size_t size) {
             0,
             0,
             1,
-            1,
             true,
             false,
             1};
@@ -710,7 +704,6 @@ shell_brace_fuzz_substitution_case(const uint8_t *data, size_t size) {
             0,
             2,
             1,
-            0,
             true,
             false,
             1};
@@ -723,12 +716,11 @@ shell_brace_fuzz_substitution_case(const uint8_t *data, size_t size) {
             0,
             0,
             0,
-            0,
             false,
             false,
             1};
   case 3:
-    return {"printf value 2> >(cat)", 2, 0, 1, 1, 0, 1, 1, 0, false, true, 2};
+    return {"printf value 2> >(cat)", 2, 0, 1, 1, 0, 1, 1, false, true, 2};
   case 4:
     return {"echo $(</tmp/fuzz-substitution-input)",
             1,
@@ -738,23 +730,12 @@ shell_brace_fuzz_substitution_case(const uint8_t *data, size_t size) {
             1,
             0,
             1,
-            0,
             true,
             false,
             1};
   case 5:
-    return {"echo $( { printf $(date); } )",
-            3,
-            1,
-            0,
-            2,
-            0,
-            0,
-            2,
-            1,
-            true,
-            false,
-            1};
+    return {
+        "echo $( { printf $(date); } )", 3, 1, 0, 2, 0, 0, 2, true, false, 1};
   case 6:
     return {"echo $(</tmp/one)$(<\"/tmp/two words\")",
             1,
@@ -764,23 +745,12 @@ shell_brace_fuzz_substitution_case(const uint8_t *data, size_t size) {
             2,
             0,
             1,
-            0,
             true,
             false,
             1};
   case 7:
-    return {"{ echo $(</tmp/group-input); }",
-            1,
-            1,
-            0,
-            1,
-            1,
-            0,
-            1,
-            0,
-            true,
-            false,
-            1};
+    return {
+        "{ echo $(</tmp/group-input); }", 1, 1, 0, 1, 1, 0, 1, true, false, 1};
   case 8:
     return {"echo $( { printf $(</tmp/nested-input); } )",
             2,
@@ -790,7 +760,6 @@ shell_brace_fuzz_substitution_case(const uint8_t *data, size_t size) {
             1,
             0,
             2,
-            0,
             true,
             false,
             1};
@@ -803,7 +772,6 @@ shell_brace_fuzz_substitution_case(const uint8_t *data, size_t size) {
             0,
             0,
             1,
-            1,
             true,
             false,
             1,
@@ -814,7 +782,6 @@ shell_brace_fuzz_substitution_case(const uint8_t *data, size_t size) {
   case 10:
     return {"cat <<'EOF'\n$(id)\nEOF",
             1,
-            0,
             0,
             0,
             0,
@@ -840,7 +807,6 @@ shell_brace_fuzz_substitution_case(const uint8_t *data, size_t size) {
             0,
             0,
             0,
-            0,
             true,
             false,
             1,
@@ -857,7 +823,6 @@ shell_brace_fuzz_substitution_case(const uint8_t *data, size_t size) {
             1,
             0,
             1,
-            0,
             true,
             false,
             1,
@@ -874,7 +839,6 @@ shell_brace_fuzz_substitution_case(const uint8_t *data, size_t size) {
             0,
             0,
             2,
-            0,
             true,
             false,
             1,
@@ -883,8 +847,7 @@ shell_brace_fuzz_substitution_case(const uint8_t *data, size_t size) {
             0,
             1};
   case 14:
-    return {
-        "echo $(</tmp/direct)$(id)", 2, 0, 0, 2, 1, 0, 1, 1, true, false, 1};
+    return {"echo $(</tmp/direct)$(id)", 2, 0, 0, 2, 1, 0, 1, true, false, 1};
   case 15:
     return {"cat <<-EOF\r\n\t$(id)\r\n\tEOF\r\n",
             2,
@@ -893,7 +856,6 @@ shell_brace_fuzz_substitution_case(const uint8_t *data, size_t size) {
             1,
             0,
             0,
-            1,
             1,
             true,
             false,
@@ -911,7 +873,6 @@ shell_brace_fuzz_substitution_case(const uint8_t *data, size_t size) {
             0,
             0,
             1,
-            3,
             true,
             false,
             1,
@@ -931,7 +892,6 @@ shell_brace_fuzz_substitution_case(const uint8_t *data, size_t size) {
         0,
         0,
         2,
-        2,
         true,
         false,
         1};
@@ -948,7 +908,6 @@ shell_brace_fuzz_substitution_case(const uint8_t *data, size_t size) {
             0,
             2,
             1,
-            0,
             true,
             false,
             1,
@@ -964,7 +923,6 @@ shell_brace_fuzz_substitution_case(const uint8_t *data, size_t size) {
             1,
             0,
             0,
-            1,
             1,
             true,
             false,
@@ -982,7 +940,6 @@ shell_brace_fuzz_substitution_case(const uint8_t *data, size_t size) {
             0,
             0,
             0,
-            0,
             false,
             false,
             1,
@@ -993,7 +950,6 @@ shell_brace_fuzz_substitution_case(const uint8_t *data, size_t size) {
   case 21:
     return {"cat <<EOF\n\\$(id) \\`date\\`\nEOF",
             1,
-            0,
             0,
             0,
             0,
@@ -1018,7 +974,6 @@ shell_brace_fuzz_substitution_case(const uint8_t *data, size_t size) {
             1,
             2,
             1,
-            1,
             true,
             false,
             1,
@@ -1034,7 +989,6 @@ shell_brace_fuzz_substitution_case(const uint8_t *data, size_t size) {
             2,
             0,
             0,
-            2,
             2,
             true,
             false,
@@ -1052,7 +1006,6 @@ shell_brace_fuzz_substitution_case(const uint8_t *data, size_t size) {
             0,
             3,
             2,
-            0,
             true,
             true,
             2,
@@ -1070,7 +1023,6 @@ shell_brace_fuzz_substitution_case(const uint8_t *data, size_t size) {
         0,
         0,
         2,
-        2,
         true,
         false,
         1,
@@ -1087,7 +1039,6 @@ shell_brace_fuzz_substitution_case(const uint8_t *data, size_t size) {
             0,
             0,
             1,
-            0,
             true,
             false,
             1,
@@ -1102,7 +1053,6 @@ shell_brace_fuzz_substitution_case(const uint8_t *data, size_t size) {
             1,
             0,
             1,
-            0,
             0,
             0,
             0,
@@ -1124,7 +1074,6 @@ shell_brace_fuzz_substitution_case(const uint8_t *data, size_t size) {
             0,
             0,
             1,
-            1,
             true,
             false,
             1,
@@ -1133,7 +1082,7 @@ shell_brace_fuzz_substitution_case(const uint8_t *data, size_t size) {
             6,
             1};
   case 29:
-    return {"{ echo $(id); } | cat", 3, 1, 0, 1, 0, 0, 1, 1, true, false, 1};
+    return {"{ echo $(id); } | cat", 3, 1, 0, 1, 0, 0, 1, true, false, 1};
   case 30:
     return {"{ cat < <(printf config); } | sort",
             3,
@@ -1142,7 +1091,6 @@ shell_brace_fuzz_substitution_case(const uint8_t *data, size_t size) {
             1,
             0,
             0,
-            1,
             1,
             false,
             false,
@@ -1160,7 +1108,6 @@ shell_brace_fuzz_substitution_case(const uint8_t *data, size_t size) {
             0,
             1,
             1,
-            0,
             false,
             true,
             3,
@@ -1172,7 +1119,6 @@ shell_brace_fuzz_substitution_case(const uint8_t *data, size_t size) {
     return {"{ cat <<'EOF'\n$(id)\nEOF\n}",
             1,
             1,
-            0,
             0,
             0,
             0,
@@ -1194,37 +1140,26 @@ shell_brace_fuzz_substitution_case(const uint8_t *data, size_t size) {
             0,
             0,
             1,
-            1,
             false,
             false,
             1};
   case 34: {
     shell_substitution_fuzz_case_t item = {
-        "{ printf value; } > >(cat)", 2, 1, 1, 1, 0, 1, 1, 0, false, true, 1};
+        "{ printf value; } > >(cat)", 2, 1, 1, 1, 0, 1, 1, false, true, 1};
     item.group_substitution_owner = true;
     return item;
   }
   case 35: {
     /* The member's >&3 and the group's fd-3 output each contribute a WRITE
      * into the same process-substitution endpoint. */
-    shell_substitution_fuzz_case_t item = {"{ printf value >&3; } 3> >(cat)",
-                                           2,
-                                           1,
-                                           1,
-                                           1,
-                                           0,
-                                           2,
-                                           1,
-                                           0,
-                                           false,
-                                           true,
-                                           3};
+    shell_substitution_fuzz_case_t item = {
+        "{ printf value >&3; } 3> >(cat)", 2, 1, 1, 1, 0, 2, 1, false, true, 3};
     item.group_substitution_owner = true;
     return item;
   }
   case 36: {
     shell_substitution_fuzz_case_t item = {
-        "{ cat; } < <(printf config)", 2, 1, 0, 1, 0, 0, 1, 0, false, false, 1};
+        "{ cat; } < <(printf config)", 2, 1, 0, 1, 0, 0, 1, false, false, 1};
     item.group_substitution_owner = true;
     return item;
   }
@@ -1238,7 +1173,6 @@ shell_brace_fuzz_substitution_case(const uint8_t *data, size_t size) {
         0,
         0,
         1,
-        0,
         false,
         false,
         1};
@@ -1247,31 +1181,11 @@ shell_brace_fuzz_substitution_case(const uint8_t *data, size_t size) {
     return item;
   }
   case 38:
-    return {"{ echo $(id); } & printf after",
-            3,
-            1,
-            0,
-            1,
-            0,
-            0,
-            1,
-            1,
-            true,
-            false,
-            1};
+    return {
+        "{ echo $(id); } & printf after", 3, 1, 0, 1, 0, 0, 1, true, false, 1};
   case 39:
-    return {"{ echo $(id); } && printf after",
-            3,
-            1,
-            0,
-            1,
-            0,
-            0,
-            1,
-            1,
-            true,
-            false,
-            1};
+    return {
+        "{ echo $(id); } && printf after", 3, 1, 0, 1, 0, 0, 1, true, false, 1};
   case 40:
     return {"printf before || { echo $(id); }",
             3,
@@ -1280,7 +1194,6 @@ shell_brace_fuzz_substitution_case(const uint8_t *data, size_t size) {
             1,
             0,
             0,
-            1,
             1,
             true,
             false,
@@ -1295,7 +1208,6 @@ shell_brace_fuzz_substitution_case(const uint8_t *data, size_t size) {
         0,
         1,
         1,
-        0,
         false,
         true,
         3};
@@ -1312,7 +1224,6 @@ shell_brace_fuzz_substitution_case(const uint8_t *data, size_t size) {
         0,
         1,
         1,
-        0,
         false,
         true,
         3};
@@ -1329,7 +1240,6 @@ shell_brace_fuzz_substitution_case(const uint8_t *data, size_t size) {
         0,
         1,
         2,
-        1,
         true,
         true,
         3};
@@ -1345,7 +1255,6 @@ shell_brace_fuzz_substitution_case(const uint8_t *data, size_t size) {
                                            0,
                                            0,
                                            2,
-                                           0,
                                            false,
                                            false,
                                            1};
@@ -1353,15 +1262,14 @@ shell_brace_fuzz_substitution_case(const uint8_t *data, size_t size) {
     return item;
   }
   case 45:
-    return {
-        "printf payload > >({ sh; })", 2, 1, 1, 1, 0, 1, 1, 0, false, true, 1};
+    return {"printf payload > >({ sh; })", 2, 1, 1, 1, 0, 1, 1, false, true, 1};
   case 46:
-    return {"sh < <(printf config)", 2, 0, 0, 1, 0, 0, 1, 1, false, false, 1};
+    return {"sh < <(printf config)", 2, 0, 0, 1, 0, 0, 1, false, false, 1};
   case 48:
-    return {"printf value 2>> >(cat)", 2, 0, 1, 1, 0, 1, 1, 0, false, true, 2};
+    return {"printf value 2>> >(cat)", 2, 0, 1, 1, 0, 1, 1, false, true, 2};
   case 49: {
     shell_substitution_fuzz_case_t item = {
-        "{ printf value; } 3>> >(cat)", 2, 1, 1, 1, 0, 1, 1, 0, false, true, 3};
+        "{ printf value; } 3>> >(cat)", 2, 1, 1, 1, 0, 1, 1, false, true, 3};
     item.group_substitution_owner = true;
     return item;
   }
@@ -1377,7 +1285,6 @@ shell_brace_fuzz_substitution_case(const uint8_t *data, size_t size) {
         0,
         1,
         2,
-        0,
         false,
         true,
         1};
@@ -1395,7 +1302,6 @@ shell_brace_fuzz_substitution_case(const uint8_t *data, size_t size) {
             0,
             0,
             2,
-            0,
             true,
             false,
             1};
@@ -1412,7 +1318,6 @@ shell_brace_fuzz_substitution_case(const uint8_t *data, size_t size) {
         0,
         0,
         2,
-        1,
         false,
         false,
         1};
@@ -1421,17 +1326,17 @@ shell_brace_fuzz_substitution_case(const uint8_t *data, size_t size) {
   }
   case 53:
     /* A shared pipe with two readers, not a child-to-cat transfer. */
-    return {"cat < >(sh)", 2, 0, 1, 2, 0, 0, 2, 0, false, false, 0};
+    return {"cat < >(sh)", 2, 0, 1, 2, 0, 0, 2, false, false, 0};
   case 54:
-    return {"cat > <(printf input)", 2, 0, 1, 0, 0, 2, 0, 0, false, false, 1};
+    return {"cat > <(printf input)", 2, 0, 1, 0, 0, 2, 0, false, false, 1};
   case 55:
     /* Adjacent `><(` is the compact cross-direction spelling, not a
      * read/write redirect and not a producer-to-cat byte route. */
-    return {"cat><(printf input)", 2, 0, 1, 0, 0, 2, 0, 0, false, false, 1};
+    return {"cat><(printf input)", 2, 0, 1, 0, 0, 2, 0, false, false, 1};
   case 56:
-    return {"cat <> <(printf input)", 2, 0, 1, 1, 0, 2, 1, 0, false, false, 0};
+    return {"cat <> <(printf input)", 2, 0, 1, 1, 0, 2, 1, false, false, 0};
   case 57:
-    return {"cat <> >(sh)", 2, 0, 1, 2, 0, 1, 2, 0, false, true, 0};
+    return {"cat <> >(sh)", 2, 0, 1, 2, 0, 1, 2, false, true, 0};
   case 58: {
     /* The `)` in the deferred body belongs to the heredoc, not the process
      * substitution. The resulting stream is dynamic descriptor I/O only. */
@@ -1442,7 +1347,6 @@ shell_brace_fuzz_substitution_case(const uint8_t *data, size_t size) {
                                            1,
                                            0,
                                            0,
-                                           1,
                                            1,
                                            false,
                                            false,
@@ -1465,7 +1369,6 @@ shell_brace_fuzz_substitution_case(const uint8_t *data, size_t size) {
                                            0,
                                            0,
                                            1,
-                                           1,
                                            true,
                                            false,
                                            1,
@@ -1479,35 +1382,15 @@ shell_brace_fuzz_substitution_case(const uint8_t *data, size_t size) {
   case 60: {
     /* Arithmetic remains opaque while the enclosing command substitution
      * still carries a shell-word inspection edge. */
-    shell_substitution_fuzz_case_t item = {"echo $(printf '%s' $((1 << 2)))",
-                                           2,
-                                           0,
-                                           0,
-                                           1,
-                                           0,
-                                           0,
-                                           1,
-                                           1,
-                                           true,
-                                           false,
-                                           1};
+    shell_substitution_fuzz_case_t item = {
+        "echo $(printf '%s' $((1 << 2)))", 2, 0, 0, 1, 0, 0, 1, true, false, 1};
     item.surface_command_count = 1;
     return item;
   }
   case 61: {
     /* The same lexical boundary applies to process-substitution I/O. */
-    shell_substitution_fuzz_case_t item = {"cat <(printf '%s' $((1 << 2)))",
-                                           2,
-                                           0,
-                                           0,
-                                           1,
-                                           0,
-                                           0,
-                                           1,
-                                           1,
-                                           false,
-                                           false,
-                                           1};
+    shell_substitution_fuzz_case_t item = {
+        "cat <(printf '%s' $((1 << 2)))", 2, 0, 0, 1, 0, 0, 1, false, false, 1};
     item.surface_command_count = 1;
     return item;
   }
@@ -1515,7 +1398,7 @@ shell_brace_fuzz_substitution_case(const uint8_t *data, size_t size) {
     /* A here-string word is a dynamic document consumer, not a direct stdin
      * route from the nested producer. */
     shell_substitution_fuzz_case_t item = {
-        "sh <<< $(printf data)", 2, 0, 0, 1, 0, 0, 1, 1, true, false, 1};
+        "sh <<< $(printf data)", 2, 0, 0, 1, 0, 0, 1, true, false, 1};
     item.herestring_count = 1;
     item.herestring_substitution_count = 1;
     return item;
@@ -1524,7 +1407,7 @@ shell_brace_fuzz_substitution_case(const uint8_t *data, size_t size) {
     /* File-command substitution uses the same document target without
      * inventing an executable producer. */
     shell_substitution_fuzz_case_t item = {
-        "sh <<< $(</tmp/here-input)", 1, 0, 0, 1, 1, 0, 1, 0, true, false, 1};
+        "sh <<< $(</tmp/here-input)", 1, 0, 0, 1, 1, 0, 1, true, false, 1};
     item.herestring_count = 1;
     item.herestring_substitution_count = 1;
     return item;
@@ -1533,7 +1416,7 @@ shell_brace_fuzz_substitution_case(const uint8_t *data, size_t size) {
     /* A brace redirect owns the document. Its member inherits dynamic state
      * without a fabricated direct command-to-document substitution edge. */
     shell_substitution_fuzz_case_t item = {
-        "{ cat; } <<< $(printf data)", 2, 1, 0, 1, 0, 0, 1, 0, true, false, 1};
+        "{ cat; } <<< $(printf data)", 2, 1, 0, 1, 0, 0, 1, true, false, 1};
     item.herestring_count = 1;
     item.herestring_substitution_count = 1;
     return item;
@@ -1541,7 +1424,7 @@ shell_brace_fuzz_substitution_case(const uint8_t *data, size_t size) {
   case 65:
     /* A process substitution can be the operand of Bash's $(<word) shortcut:
      * its producer output is the outer shell-word data, not a static file. */
-    return {"echo $(< <(printf q))", 2, 0, 0, 1, 0, 0, 1, 1, true, false, 1};
+    return {"echo $(< <(printf q))", 2, 0, 0, 1, 0, 0, 1, true, false, 1};
   case 66:
     /* Command output selects the FILE path, then that file's contents supply
      * the outer word. The two SUBST edges intentionally have different flags.
@@ -1554,7 +1437,6 @@ shell_brace_fuzz_substitution_case(const uint8_t *data, size_t size) {
             1,
             0,
             1,
-            0,
             true,
             false,
             1};
@@ -1562,7 +1444,7 @@ shell_brace_fuzz_substitution_case(const uint8_t *data, size_t size) {
     /* A command substitution in a redirection selects a pathname. It is
      * dynamic I/O topology, never shell-word content for cat. */
     shell_substitution_fuzz_case_t item = {
-        "cat >\"$(id)\"", 2, 0, 0, 1, 0, 0, 1, 0, false, false, 1};
+        "cat >\"$(id)\"", 2, 0, 0, 1, 0, 0, 1, false, false, 1};
     item.dynamic_name_substitution_count = 1;
     return item;
   }
@@ -1570,7 +1452,7 @@ shell_brace_fuzz_substitution_case(const uint8_t *data, size_t size) {
     /* The same pathname-selection edge terminates at a FILE document owned by
      * a brace group, rather than fabricating a producer-to-member relation. */
     shell_substitution_fuzz_case_t item = {
-        "{ cat; } >\"$(id)\"", 2, 1, 0, 1, 0, 0, 1, 0, false, false, 1};
+        "{ cat; } >\"$(id)\"", 2, 1, 0, 1, 0, 0, 1, false, false, 1};
     item.dynamic_name_substitution_count = 1;
     return item;
   }
@@ -1591,7 +1473,6 @@ shell_brace_fuzz_substitution_case(const uint8_t *data, size_t size) {
         0,
         0,
         1,
-        1,
         true,
         false,
         1};
@@ -1607,7 +1488,6 @@ shell_brace_fuzz_substitution_case(const uint8_t *data, size_t size) {
             ? "echo \"${x/a/'$(printf hi)'}\""
             : "echo \"${x:-$'\\\\$(printf hi)'}\"",
         1,
-        0,
         0,
         0,
         0,
@@ -1637,7 +1517,6 @@ shell_brace_fuzz_substitution_case(const uint8_t *data, size_t size) {
         0,
         0,
         0,
-        0,
         false,
         false,
         1};
@@ -1646,7 +1525,7 @@ shell_brace_fuzz_substitution_case(const uint8_t *data, size_t size) {
   }
   case 76: {
     shell_substitution_fuzz_case_t item = {
-        "echo \"${x:-$'\\x3c'}\"", 1, 0, 0, 0, 0, 0, 0, 0, false, false, 1};
+        "echo \"${x:-$'\\x3c'}\"", 1, 0, 0, 0, 0, 0, 0, false, false, 1};
     item.surface_command_count = 1;
     item.expected_shell_features = false;
     return item;
@@ -1655,7 +1534,6 @@ shell_brace_fuzz_substitution_case(const uint8_t *data, size_t size) {
     /* External stdout copied before entry is not the new capture. */
     return {"exec 3>&1; echo \"$(printf value >&3)\"",
             3,
-            0,
             0,
             0,
             0,
@@ -1674,7 +1552,6 @@ shell_brace_fuzz_substitution_case(const uint8_t *data, size_t size) {
             0,
             0,
             1,
-            1,
             true,
             false,
             1};
@@ -1689,7 +1566,6 @@ shell_brace_fuzz_substitution_case(const uint8_t *data, size_t size) {
             0,
             0,
             1,
-            1,
             true,
             false,
             1};
@@ -1703,23 +1579,12 @@ shell_brace_fuzz_substitution_case(const uint8_t *data, size_t size) {
             0,
             1,
             2,
-            1,
             true,
             true,
             1};
   case 81:
-    return {"printf source | echo \"$(cat)\"",
-            3,
-            0,
-            0,
-            1,
-            0,
-            0,
-            1,
-            1,
-            true,
-            false,
-            1};
+    return {
+        "printf source | echo \"$(cat)\"", 3, 0, 0, 1, 0, 0, 1, true, false, 1};
   case 82:
     return {"{ echo \"$(time true)\"; } |& cat",
             3,
@@ -1729,7 +1594,6 @@ shell_brace_fuzz_substitution_case(const uint8_t *data, size_t size) {
             0,
             0,
             1,
-            1,
             true,
             false,
             1};
@@ -1738,7 +1602,6 @@ shell_brace_fuzz_substitution_case(const uint8_t *data, size_t size) {
         "cat <<A <<B <<C <<D <<E <<F <<G <<H <<I\n"
         "one\nA\ntwo\nB\nthree\nC\nfour\nD\nfive\nE\nsix\nF\n"
         "seven\nG\neight\nH\n$(id)\nI\n",
-        0,
         0,
         0,
         0,
@@ -1778,7 +1641,6 @@ shell_brace_fuzz_composed_substitution_case(const uint8_t *data, size_t size) {
   uint32_t file_substitutions = 0;
   uint32_t collector_writes = 0;
   uint32_t dynamic_consumers = 1;
-  uint32_t command_mappings = 1;
   bool requires_shell_word = false;
   bool output_process = false;
   uint32_t outer_fd = 1;
@@ -1805,7 +1667,6 @@ shell_brace_fuzz_composed_substitution_case(const uint8_t *data, size_t size) {
     graph_commands = 2;
     endpoints = 1;
     collector_writes = 1;
-    command_mappings = 0;
     output_process = true;
     outer_fd = 3;
     break;
@@ -1813,7 +1674,6 @@ shell_brace_fuzz_composed_substitution_case(const uint8_t *data, size_t size) {
     body = "echo $(</tmp/composed-substitution-input)";
     graph_commands = 1;
     file_substitutions = 1;
-    command_mappings = 0;
     requires_shell_word = true;
     break;
   default:
@@ -1822,7 +1682,6 @@ shell_brace_fuzz_composed_substitution_case(const uint8_t *data, size_t size) {
     graph_commands = literal_heredoc ? 1 : 2;
     substitutions = literal_heredoc ? 0 : 1;
     dynamic_consumers = literal_heredoc ? 0 : 1;
-    command_mappings = literal_heredoc ? 0 : 1;
     heredocs = 1;
     literal_heredocs = literal_heredoc ? 1 : 0;
     heredoc_substitutions = literal_heredoc ? 0 : 1;
@@ -1865,9 +1724,8 @@ shell_brace_fuzz_composed_substitution_case(const uint8_t *data, size_t size) {
 
   shell_substitution_fuzz_case_t item(
       "", graph_commands, depth, endpoints, substitutions, file_substitutions,
-      collector_writes, dynamic_consumers, command_mappings,
-      requires_shell_word, output_process, outer_fd, heredocs, literal_heredocs,
-      0, heredoc_substitutions);
+      collector_writes, dynamic_consumers, requires_shell_word, output_process,
+      outer_fd, heredocs, literal_heredocs, 0, heredoc_substitutions);
   item.command = command;
   item.surface_command_count = 1 + (append_pipeline ? 1 : 0);
   return item;

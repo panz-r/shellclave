@@ -11,17 +11,20 @@ static int check_pipeline(const char *input, const char *expected_clean,
   (void)expected_clean;
   shell_command_info_t *commands = NULL;
   size_t command_count = 0;
-  char *netargv = NULL;
+  shell_netstring_buffer_t netargv = {0};
   if (shell_process_command(input, strlen(input), NULL, &commands,
                             &command_count) != SHELL_PROCESS_OK ||
       command_count != 1 ||
       shell_command_info_has_dangerous_features(&commands[0]))
     goto fail;
-  if (shell_render_netargv(&commands[0], NULL, &netargv) != SHELL_PROCESS_OK)
+  if (shell_render_netargv_buffer(&commands[0], NULL, &netargv) !=
+      SHELL_PROCESS_OK)
     goto fail;
 
   st_token_array_t typed = {0};
-  if (st_netargv_classify(netargv, &typed) != ST_OK ||
+  if (st_netargv_classify_view(
+          (st_netargv_view_t){(const char *)netargv.data, netargv.length},
+          &typed) != ST_OK ||
       typed.count != expected_count) {
     st_token_array_free(&typed);
     goto fail;
@@ -34,12 +37,12 @@ static int check_pipeline(const char *input, const char *expected_clean,
   }
   st_token_array_free(&typed);
   shell_command_infos_free(commands, command_count);
-  free(netargv);
+  shell_netstring_buffer_free(&netargv);
   return 1;
 
 fail:
   shell_command_infos_free(commands, command_count);
-  free(netargv);
+  shell_netstring_buffer_free(&netargv);
   return 0;
 }
 
@@ -55,27 +58,38 @@ static int check_trusted_processed_input(void) {
                              .max_suggestions = ST_DEFAULT_MAX_SUGGESTIONS});
   st_policy_ctx_t *ctx = st_policy_ctx_new();
   st_policy_t *policy = ctx ? st_policy_new(ctx) : NULL;
-  if (!learner || st_netargv_classify(netargv, &typed) != ST_OK ||
+  if (!learner ||
+      st_netargv_classify_view(
+          (st_netargv_view_t){netargv, sizeof(netargv) - 1}, &typed) != ST_OK ||
       typed.count != sizeof(expected) / sizeof(expected[0]))
     goto fail;
   for (size_t i = 0; i < typed.count; i++)
     if (strcmp(typed.tokens[i].text, expected[i]) != 0)
       goto fail;
-  if (st_learner_feed_netargv(learner, netargv) != ST_OK)
+  if (st_learner_feed_netargv_view(
+          learner, (st_netargv_view_t){netargv, sizeof(netargv) - 1}) != ST_OK)
     goto fail;
-  char *netpattern = NULL;
-  if (!policy || st_netpattern_from_cpl("printf * * *", &netpattern) != ST_OK ||
-      st_policy_add_netpattern(policy, netpattern) != ST_OK) {
-    free(netpattern);
+  st_netpattern_t netpattern = {0};
+  if (!policy ||
+      st_netpattern_from_cpl_owned("printf * * *", &netpattern) != ST_OK ||
+      st_policy_add_netpattern_view(
+          policy, (st_netpattern_view_t){(const char *)netpattern.data,
+                                         netpattern.length}) != ST_OK) {
+    st_netpattern_free(&netpattern);
     goto fail;
   }
-  free(netpattern);
+  st_netpattern_free(&netpattern);
   st_eval_result_t result = {0};
-  if (st_policy_eval(policy, netargv, &result) != ST_OK || !result.matches)
+  if (st_policy_eval_view(policy,
+                          (st_netargv_view_t){netargv, sizeof(netargv) - 1},
+                          &result) != ST_OK ||
+      !result.matches)
     goto fail;
   st_netpattern_view_t *matches = NULL;
   size_t match_count = 0;
-  if (st_policy_verify_all(policy, netargv, &matches, &match_count) != ST_OK ||
+  if (st_policy_verify_all_view(
+          policy, (st_netargv_view_t){netargv, sizeof(netargv) - 1}, &matches,
+          &match_count) != ST_OK ||
       match_count != 1) {
     st_policy_matches_free(matches);
     goto fail;

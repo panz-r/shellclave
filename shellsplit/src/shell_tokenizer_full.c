@@ -1231,16 +1231,6 @@ static bool parse_subshell(shell_tokenizer_state_t *state,
   return false;
 }
 
-bool shell_tokenizer_word_has_glob(const char *word, size_t length) {
-  return shell_source_word_has_glob(word, length);
-}
-
-bool shell_tokenizer_word_parameter_name(const char *word, size_t length,
-                                         const char **name,
-                                         size_t *name_length) {
-  return shell_source_word_parameter_name(word, length, name, name_length);
-}
-
 static size_t scan_descriptor_target(const char *input, size_t position,
                                      size_t length) {
   if (!input || position >= length)
@@ -2006,7 +1996,7 @@ ordinary_word:
   size_t token_length = state->position - start_pos;
   const char *token_text = state->input + start_pos;
 
-  if (shell_tokenizer_word_has_glob(token_text, token_length)) {
+  if (shell_source_word_has_glob(token_text, token_length)) {
     token->type = SHELL_TOKEN_GLOB;
   } else {
     token->type = SHELL_TOKEN_COMMAND;
@@ -2185,9 +2175,6 @@ static bool control_function_keyword_has_name(const shell_token_t *token,
   return isalpha((unsigned char)input[position]) || input[position] == '_';
 }
 
-static shell_control_syntax_t control_syntax_scan(const char *input,
-                                                  size_t input_length);
-
 typedef enum {
   CONTROL_FRAME_IF,
   CONTROL_FRAME_LOOP,
@@ -2227,19 +2214,6 @@ static bool token_is_logical_unquoted_word(const shell_token_t *token,
     position++;
   }
   return matched == word_length;
-}
-
-static bool control_token_is(const shell_token_t *token, const char *word) {
-  return token_is_logical_unquoted_word(token, word);
-}
-
-/* Shellsplit does not model control-flow execution. Use the full lexical
- * tokenizer instead of raw source scans so words in comments, quoted text,
- * escapes, redirect operands, and ordinary argument positions are not
- * mistaken for reserved control words. */
-shell_control_syntax_t shell_tokenizer_control_syntax(const char *input,
-                                                      size_t input_length) {
-  return control_syntax_scan(input, input_length);
 }
 
 static bool token_is_plain_word(const char *input, size_t input_length,
@@ -3277,11 +3251,11 @@ static SHELL_NONNULL(1) bool unsupported_semantics_scan_impl(
           "elif", "else",  "fi",    "do",  "done",   "in",   "esac"};
       for (size_t i = 0; i < sizeof(control_words) / sizeof(control_words[0]);
            i++)
-        if (control_token_is(&token, control_words[i]))
+        if (token_is_logical_unquoted_word(&token, control_words[i]))
           return true;
       if (control_token_starts_function_definition(&token, input,
                                                    input_length) ||
-          (control_token_is(&token, "function") &&
+          (token_is_logical_unquoted_word(&token, "function") &&
            control_function_keyword_has_name(&token, input, input_length)))
         return true;
       /* Scalar assignment prefixes do not consume the command-word position.
@@ -3474,7 +3448,7 @@ static SHELL_NONNULL(1) bool unsupported_semantics_scan_impl(
       }
       size_t word_end = semantic_word_end;
       bool dynamic = word_end <= token.position ||
-                     shell_source_redirect_word_has_dynamic_path_syntax(
+                     shell_source_argument_has_dynamic_syntax(
                          input + token.position, word_end - token.position);
       /* A dynamic selector could be `-s` or `-u`, so it may alter the
        * lifetime contract even if the following source bytes look harmless. */
@@ -3605,41 +3579,45 @@ static SHELL_NONNULL(1) shell_control_syntax_t
         continue;
       }
       if (frame->type == CONTROL_FRAME_CASE && !frame->body_started &&
-          frame->case_selector_seen && control_token_is(&token, "in")) {
+          frame->case_selector_seen &&
+          token_is_logical_unquoted_word(&token, "in")) {
         frame->body_started = true;
         saw_control = true;
         continue;
       }
       if (!command_start) {
-        if (!frame->body_started && ((frame->type == CONTROL_FRAME_IF &&
-                                      (control_token_is(&token, "then") ||
-                                       control_token_is(&token, "elif") ||
-                                       control_token_is(&token, "else"))) ||
-                                     (frame->type == CONTROL_FRAME_LOOP &&
-                                      control_token_is(&token, "do"))))
+        if (!frame->body_started &&
+            ((frame->type == CONTROL_FRAME_IF &&
+              (token_is_logical_unquoted_word(&token, "then") ||
+               token_is_logical_unquoted_word(&token, "elif") ||
+               token_is_logical_unquoted_word(&token, "else"))) ||
+             (frame->type == CONTROL_FRAME_LOOP &&
+              token_is_logical_unquoted_word(&token, "do"))))
           frame->misplaced_marker = true;
         continue;
       }
       if (frame->type == CONTROL_FRAME_IF &&
-          (control_token_is(&token, "then") ||
-           control_token_is(&token, "elif") ||
-           control_token_is(&token, "else"))) {
+          (token_is_logical_unquoted_word(&token, "then") ||
+           token_is_logical_unquoted_word(&token, "elif") ||
+           token_is_logical_unquoted_word(&token, "else"))) {
         frame->body_started = true;
         frame->misplaced_marker = false;
         saw_control = true;
         continue;
       }
-      if (frame->type == CONTROL_FRAME_LOOP && control_token_is(&token, "do")) {
+      if (frame->type == CONTROL_FRAME_LOOP &&
+          token_is_logical_unquoted_word(&token, "do")) {
         frame->body_started = true;
         frame->misplaced_marker = false;
         saw_control = true;
         continue;
       }
-      if ((frame->type == CONTROL_FRAME_IF && control_token_is(&token, "fi")) ||
+      if ((frame->type == CONTROL_FRAME_IF &&
+           token_is_logical_unquoted_word(&token, "fi")) ||
           (frame->type == CONTROL_FRAME_LOOP &&
-           control_token_is(&token, "done")) ||
+           token_is_logical_unquoted_word(&token, "done")) ||
           (frame->type == CONTROL_FRAME_CASE &&
-           control_token_is(&token, "esac"))) {
+           token_is_logical_unquoted_word(&token, "esac"))) {
         frame_count--;
         saw_control = true;
         continue;
@@ -3649,38 +3627,38 @@ static SHELL_NONNULL(1) shell_control_syntax_t
       continue;
 
     if (control_token_starts_function_definition(&token, input, input_length) ||
-        (control_token_is(&token, "function") &&
+        (token_is_logical_unquoted_word(&token, "function") &&
          control_function_keyword_has_name(&token, input, input_length)))
       return SHELL_CONTROL_SYNTAX_COMPLETE;
 
     control_frame_t frame;
     bool push_frame = false;
-    if (control_token_is(&token, "if")) {
+    if (token_is_logical_unquoted_word(&token, "if")) {
       frame = CONTROL_FRAME_IF;
       push_frame = true;
-    } else if (control_token_is(&token, "while") ||
-               control_token_is(&token, "until") ||
-               control_token_is(&token, "for") ||
-               control_token_is(&token, "select")) {
+    } else if (token_is_logical_unquoted_word(&token, "while") ||
+               token_is_logical_unquoted_word(&token, "until") ||
+               token_is_logical_unquoted_word(&token, "for") ||
+               token_is_logical_unquoted_word(&token, "select")) {
       frame = CONTROL_FRAME_LOOP;
       push_frame = true;
-    } else if (control_token_is(&token, "coproc")) {
+    } else if (token_is_logical_unquoted_word(&token, "coproc")) {
       /* Bash coprocesses introduce a concurrently executing command and a
        * pair of implicit descriptors.  The semantic command model does not
        * represent either yet, so reject them explicitly rather than treating
        * `coproc` as an ordinary executable name. */
       return SHELL_CONTROL_SYNTAX_COMPLETE;
-    } else if (control_token_is(&token, "case")) {
+    } else if (token_is_logical_unquoted_word(&token, "case")) {
       frame = CONTROL_FRAME_CASE;
       push_frame = true;
-    } else if (control_token_is(&token, "then") ||
-               control_token_is(&token, "elif") ||
-               control_token_is(&token, "else") ||
-               control_token_is(&token, "fi") ||
-               control_token_is(&token, "do") ||
-               control_token_is(&token, "done") ||
-               control_token_is(&token, "in") ||
-               control_token_is(&token, "esac")) {
+    } else if (token_is_logical_unquoted_word(&token, "then") ||
+               token_is_logical_unquoted_word(&token, "elif") ||
+               token_is_logical_unquoted_word(&token, "else") ||
+               token_is_logical_unquoted_word(&token, "fi") ||
+               token_is_logical_unquoted_word(&token, "do") ||
+               token_is_logical_unquoted_word(&token, "done") ||
+               token_is_logical_unquoted_word(&token, "in") ||
+               token_is_logical_unquoted_word(&token, "esac")) {
       return SHELL_CONTROL_SYNTAX_INCOMPLETE;
     }
 
@@ -3706,8 +3684,12 @@ static SHELL_NONNULL(1) shell_control_syntax_t
                      : SHELL_CONTROL_SYNTAX_NONE;
 }
 
-static shell_control_syntax_t control_syntax_scan(const char *input,
-                                                  size_t input_length) {
+/* Shellsplit does not model control-flow execution. Use the full lexical
+ * tokenizer instead of raw source scans so words in comments, quoted text,
+ * escapes, redirect operands, and ordinary argument positions are not
+ * mistaken for reserved control words. */
+shell_control_syntax_t shell_tokenizer_control_syntax(const char *input,
+                                                      size_t input_length) {
   if (!input)
     return SHELL_CONTROL_SYNTAX_NONE;
   shell_source_scope_t previous = shell_source_scope_begin(input, input_length);
@@ -4842,7 +4824,6 @@ shell_tokenize_status_t shell_tokenize_prevalidated_commands(
            * simple command executed inside the compound. */
           current_cmd->pipeline_negation_count = 0;
           current_cmd->pipeline_negated = false;
-          pipeline_modifier_token_count = 0;
         }
         pipeline_scope_time_mode = SHELL_PIPE_TIME_NONE;
         pipeline_scope_negation_count = 0;
@@ -5298,10 +5279,4 @@ const char *shell_token_type_name(shell_token_type_t type) {
   default:
     return "UNKNOWN";
   }
-}
-
-// Check if command has shell scripting features
-bool shell_command_has_shell_features(const shell_command_t *command) {
-  return command->has_variables || command->has_globs ||
-         command->has_subshells || command->has_arithmetic;
 }

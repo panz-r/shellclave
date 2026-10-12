@@ -16,11 +16,22 @@
 #error "SG_DIAGNOSTIC_BUF_MIN must remain available for diagnostic buffers"
 #endif
 
+static shell_expand_status_t
+resolve_input(const shell_expand_word_request_t *request, const char **netargv,
+              std::size_t *length, void *context) {
+  (void)context;
+  if (request->purpose != SHELL_EXPAND_WORD_REDIRECT_PATH)
+    return SHELL_EXPAND_UNRESOLVED;
+  *netargv = "10:/tmp/input,";
+  *length = sizeof("10:/tmp/input,") - 1;
+  return SHELL_EXPAND_RESOLVED;
+}
+
 static bool check_depgraph_workspace_api() {
   std::size_t workspace_size = 0;
   std::size_t alignment = shell_dep_workspace_alignment();
   if (alignment == 0 || (alignment & (alignment - 1)) != 0 ||
-      !shell_dep_workspace_size(nullptr, &workspace_size) ||
+      !shell_dep_resolved_workspace_size(256, nullptr, &workspace_size) ||
       workspace_size == 0 ||
       workspace_size >
           std::numeric_limits<std::size_t>::max() - (alignment - 1))
@@ -65,6 +76,13 @@ static bool check_depgraph_workspace_api() {
     }
     ok = ok && timers == 1 && timed_commands == 2;
   }
+  if (ok) {
+    constexpr char resolved[] = "cat <\"$INPUT\"";
+    ok = shell_dep_graph_parse_resolved(resolved, sizeof(resolved) - 1, ".",
+                                        &limits, &graph, resolve_input, nullptr,
+                                        nullptr) == SHELL_DEP_OK &&
+         shell_dep_graph_validate(&graph).valid;
+  }
   std::free(raw);
   return ok;
 }
@@ -86,6 +104,11 @@ static bool check_validation_details_api() {
 }
 
 int main() {
+  constexpr char exact_token[] = {'4', '2', '\0', 'x'};
+  if (st_token_classify(exact_token, 2) != ST_TYPE_NUMBER ||
+      st_token_classify(exact_token, sizeof(exact_token)) != ST_TYPE_LITERAL ||
+      st_token_classify(nullptr, 0) != ST_TYPE_LITERAL)
+    return 20;
   shell_parse_result_t parsed{};
   if (shell_parse_fast("echo", 4, nullptr, &parsed) != SHELL_OK ||
       parsed.status != SHELL_STATUS_OK || parsed.count != 1)

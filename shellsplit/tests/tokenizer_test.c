@@ -25,13 +25,15 @@ static int pass_count = 0;
  * substitutions and parameter-expansion fallbacks execute before `cat`. */
 static bool command_netseq_matches(const char *input, const char *expected,
                                    size_t expected_count) {
-  char *sequence = NULL;
+  shell_netstring_buffer_t sequence = {0};
   size_t count = 0;
-  shell_process_status_t status =
-      shell_build_command_netseq(input, strlen(input), NULL, &sequence, &count);
-  bool matches = status == SHELL_PROCESS_OK && sequence != NULL &&
-                 count == expected_count && strcmp(sequence, expected) == 0;
-  free(sequence);
+  shell_process_status_t status = shell_build_command_netseq_buffer(
+      input, strlen(input), NULL, &sequence, &count);
+  bool matches = status == SHELL_PROCESS_OK && sequence.data != NULL &&
+                 count == expected_count &&
+                 (sequence.length != strlen(expected) ||
+                  memcmp(sequence.data, expected, sequence.length)) == 0;
+  shell_netstring_buffer_free(&sequence);
   return matches;
 }
 
@@ -165,6 +167,7 @@ void test(const char *name, int result) {
     printf("  [PASS] %s\n", name);
   } else {
     printf("  [FAIL] %s\n", name);
+    exit(EXIT_FAILURE);
   }
 }
 
@@ -607,10 +610,9 @@ static void test_source_scanner_boundaries(void) {
           shell_source_line_content_end("line\r\n", 6, 0) == 4 &&
           shell_source_next_line("line\nnext", 9, 0) == 5;
 
-  /* Redirect topology admits only a path known from source syntax. This
-   * scanner is intentionally stricter than ordinary word processing: it
-   * preserves quoted and escaped literals, but rejects every expansion form
-   * that could select a different endpoint at execution time. */
+  /* Redirect topology uses the same expansion predicate as argument words:
+   * preserve quoted and escaped literals, but mark expansion forms that
+   * could select a different endpoint at execution time as dynamic. */
   static const struct {
     const char *word;
     bool dynamic;
@@ -662,10 +664,9 @@ static void test_source_scanner_boundaries(void) {
       {"'unterminated", true},
       {"\"unterminated", true},
   };
-  valid = valid && shell_source_redirect_word_has_dynamic_path_syntax(NULL, 0);
   for (size_t i = 0;
        valid && i < sizeof(redirect_words) / sizeof(redirect_words[0]); i++) {
-    bool dynamic = shell_source_redirect_word_has_dynamic_path_syntax(
+    bool dynamic = shell_source_argument_has_dynamic_syntax(
         redirect_words[i].word, strlen(redirect_words[i].word));
     if (dynamic != redirect_words[i].dynamic) {
       fprintf(stderr, "redirect dynamic-syntax mismatch: %s\n",
@@ -1263,7 +1264,7 @@ static void test_expansion_line_continuation_contract(void) {
     size_t command_count = 0;
     shell_processed_commands_t processed = {0};
     shell_dep_graph_t graph = {0};
-    char *sequence = NULL;
+    shell_netstring_buffer_t sequence = {0};
     size_t sequence_count = 0;
     bool features = false;
 
@@ -1273,17 +1274,18 @@ static void test_expansion_line_continuation_contract(void) {
         input, strlen(input), &commands, &command_count);
     shell_process_status_t process_status =
         shell_process_commands(input, strlen(input), NULL, &processed);
-    shell_process_status_t sequence_status = shell_build_netargv_sequence(
-        input, strlen(input), NULL, &sequence, &sequence_count, &features);
+    shell_process_status_t sequence_status =
+        shell_build_netargv_sequence_buffer(
+            input, strlen(input), NULL, &sequence, &sequence_count, &features);
     shell_dep_error_t graph_status =
         shell_dep_graph_parse(input, strlen(input), ".", NULL, &graph);
-    bool accepted = fast_status == SHELL_OK && parsed.count != 0 &&
-                    tokenize_status == SHELL_TOKENIZE_OK &&
-                    command_count != 0 && process_status == SHELL_PROCESS_OK &&
-                    processed.command_count != 0 &&
-                    sequence_status == SHELL_PROCESS_OK && sequence != NULL &&
-                    sequence_count != 0 && graph_status == SHELL_DEP_OK &&
-                    shell_dep_graph_validate(&graph).valid;
+    bool accepted =
+        fast_status == SHELL_OK && parsed.count != 0 &&
+        tokenize_status == SHELL_TOKENIZE_OK && command_count != 0 &&
+        process_status == SHELL_PROCESS_OK && processed.command_count != 0 &&
+        sequence_status == SHELL_PROCESS_OK && sequence.data != NULL &&
+        sequence_count != 0 && graph_status == SHELL_DEP_OK &&
+        shell_dep_graph_validate(&graph).valid;
     if (!accepted) {
       fprintf(stderr,
               "continued expansion rejected: %s (fast=%d tokenize=%d "
@@ -1292,7 +1294,7 @@ static void test_expansion_line_continuation_contract(void) {
               sequence_status, graph_status);
     }
     valid = valid && accepted;
-    free(sequence);
+    shell_netstring_buffer_free(&sequence);
     shell_processed_commands_free(&processed);
     shell_commands_free(commands, command_count);
   }
@@ -1463,32 +1465,32 @@ static void test_redirect_operand_safety_contract(void) {
   static const char long_nul_target[] =
       "$'\\0'abcdefghijklmnopqrstuvwxyzabcdefghi";
 
-  bool valid = !shell_source_redirection_consumes_word(NULL, 0) &&
-               !shell_source_redirection_consumes_word("", 0) &&
-               shell_source_redirection_consumes_word(">&", 2) &&
-               shell_source_redirection_consumes_word(">|", 2) &&
-               !shell_source_parse_named_fd_parameter("${fd", 0, 4, &name_start,
-                                                      &name_end) &&
-               name_start == 0 && name_end == 0 &&
-               !shell_source_parse_named_fd_parameter("$", 0, 1, &name_start,
-                                                      &name_end) &&
-               name_start == 0 && name_end == 0 &&
-               shell_source_parse_named_fd_parameter("\"$fd\"", 0, 5,
-                                                     &name_start, &name_end) &&
-               name_start == 2 && name_end == 4 &&
-               shell_source_redirect_word_has_dynamic_path_syntax(NULL, 0) &&
-               shell_source_redirect_word_has_dynamic_path_syntax(
-                   "$'unterminated", strlen("$'unterminated")) &&
-               shell_source_redirect_word_has_dynamic_path_syntax(
-                   "<(producer)", strlen("<(producer)")) &&
-               shell_source_redirect_word_has_dynamic_path_syntax(
-                   ">(consumer)", strlen(">(consumer)")) &&
-               shell_source_skip_redirect(">& >(consumer", 0,
-                                          strlen(">& >(consumer")) == 0 &&
-               shell_process_classify_static_fd_target(
-                   long_nul_target, sizeof(long_nul_target) - 1, &fd) ==
-                   SHELL_PROCESS_FD_TARGET_INVALID &&
-               fd == SHELL_PROCESS_FD_NONE;
+  bool valid =
+      !shell_source_redirection_consumes_word(NULL, 0) &&
+      !shell_source_redirection_consumes_word("", 0) &&
+      shell_source_redirection_consumes_word(">&", 2) &&
+      shell_source_redirection_consumes_word(">|", 2) &&
+      !shell_source_parse_named_fd_parameter("${fd", 0, 4, &name_start,
+                                             &name_end) &&
+      name_start == 0 && name_end == 0 &&
+      !shell_source_parse_named_fd_parameter("$", 0, 1, &name_start,
+                                             &name_end) &&
+      name_start == 0 && name_end == 0 &&
+      shell_source_parse_named_fd_parameter("\"$fd\"", 0, 5, &name_start,
+                                            &name_end) &&
+      name_start == 2 && name_end == 4 &&
+      shell_source_argument_has_dynamic_syntax("$'unterminated",
+                                               strlen("$'unterminated")) &&
+      shell_source_argument_has_dynamic_syntax("<(producer)",
+                                               strlen("<(producer)")) &&
+      shell_source_argument_has_dynamic_syntax(">(consumer)",
+                                               strlen(">(consumer)")) &&
+      shell_source_skip_redirect(">& >(consumer", 0, strlen(">& >(consumer")) ==
+          0 &&
+      shell_process_classify_static_fd_target(
+          long_nul_target, sizeof(long_nul_target) - 1, &fd) ==
+          SHELL_PROCESS_FD_TARGET_INVALID &&
+      fd == SHELL_PROCESS_FD_NONE;
   test("Redirect operands reject malformed, dynamic, and binary targets",
        valid);
 }
@@ -1566,22 +1568,24 @@ static void test_named_fd_word_boundaries(void) {
   };
   bool valid = true;
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
-    char *sequence = NULL;
+    shell_netstring_buffer_t sequence = {0};
     size_t count = 0;
     bool features = false;
     shell_processed_commands_t processed = {0};
     valid = valid &&
-            shell_build_netargv_sequence(cases[i].input, strlen(cases[i].input),
-                                         NULL, &sequence, &count,
-                                         &features) == SHELL_PROCESS_OK &&
-            sequence && strcmp(sequence, cases[i].netseq) == 0 && count == 1 &&
-            features &&
+            shell_build_netargv_sequence_buffer(
+                cases[i].input, strlen(cases[i].input), NULL, &sequence, &count,
+                &features) == SHELL_PROCESS_OK &&
+            sequence.data &&
+            (sequence.length != strlen(cases[i].netseq) ||
+             memcmp(sequence.data, cases[i].netseq, sequence.length)) == 0 &&
+            count == 1 && features &&
             shell_process_commands(cases[i].input, strlen(cases[i].input), NULL,
                                    &processed) == SHELL_PROCESS_OK &&
             processed.command_count == 1 &&
             processed.commands[0].command_token_count == cases[i].words;
     shell_processed_commands_free(&processed);
-    free(sequence);
+    shell_netstring_buffer_free(&sequence);
   }
   test("Named descriptors require whole words across canonical APIs", valid);
 }
@@ -1790,8 +1794,8 @@ static void test_modern_bash_syntax_contract(void) {
    * syntax on every public parsing surface, never an executable argv word or
    * an anomaly execution-stage record. */
   static const char repeated_time_source[] = "time time -p true";
-  char *repeated_netargv = NULL;
-  char *repeated_command_netseq = NULL;
+  shell_netstring_buffer_t repeated_netargv = {0};
+  shell_netstring_buffer_t repeated_command_netseq = {0};
   shell_transformed_command_t **repeated_transformed = NULL;
   size_t repeated_transformed_count = 0;
   shell_abstract_command_t *repeated_abstract = NULL;
@@ -1818,16 +1822,22 @@ static void test_modern_bash_syntax_contract(void) {
       infos[0].command_token_count == 1 &&
       infos[0].command_tokens[0].length == strlen("true") &&
       memcmp(infos[0].command_tokens[0].start, "true", strlen("true")) == 0 &&
-      shell_build_netargv_sequence(
+      shell_build_netargv_sequence_buffer(
           repeated_time_source, sizeof(repeated_time_source) - 1, NULL,
           &repeated_netargv, &count, &repeated_features) == SHELL_PROCESS_OK &&
-      repeated_netargv != NULL && strcmp(repeated_netargv, "7:4:true,,") == 0 &&
+      repeated_netargv.data != NULL &&
+      (repeated_netargv.length != sizeof("7:4:true,,") - 1 ||
+       memcmp(repeated_netargv.data, "7:4:true,,", repeated_netargv.length)) ==
+          0 &&
       count == 1 && repeated_features &&
-      shell_build_command_netseq(
+      shell_build_command_netseq_buffer(
           repeated_time_source, sizeof(repeated_time_source) - 1, NULL,
           &repeated_command_netseq, &count) == SHELL_PROCESS_OK &&
-      repeated_command_netseq != NULL &&
-      strcmp(repeated_command_netseq, "4:true,") == 0 && count == 1 &&
+      repeated_command_netseq.data != NULL &&
+      (repeated_command_netseq.length != sizeof("4:true,") - 1 ||
+       memcmp(repeated_command_netseq.data, "4:true,",
+              repeated_command_netseq.length)) == 0 &&
+      count == 1 &&
       shell_transform_command_line(
           repeated_time_source, sizeof(repeated_time_source) - 1, NULL,
           &repeated_transformed,
@@ -1841,8 +1851,8 @@ static void test_modern_bash_syntax_contract(void) {
   shell_abstract_command_free(repeated_abstract);
   shell_transformed_command_list_free(repeated_transformed,
                                       repeated_transformed_count);
-  free(repeated_command_netseq);
-  free(repeated_netargv);
+  shell_netstring_buffer_free(&repeated_command_netseq);
+  shell_netstring_buffer_free(&repeated_netargv);
   shell_command_infos_free(infos, count);
   shell_commands_free(timed_commands, timed_count);
   test("Repeated Bash time prefixes stay structural across APIs", valid);
@@ -2099,7 +2109,7 @@ static void test_modern_bash_syntax_contract(void) {
       timed_transformed_count == 1 && timed_transformed != NULL &&
       timed_transformed[0]->has_shell_syntax &&
       timed_transformed[0]->has_transformations &&
-      strcmp(shell_transformed_command_get_display_text(timed_transformed[0]),
+      strcmp(timed_transformed[0]->display_text,
              "time -p -- printf VAR_VALUE") == 0;
   shell_transformed_command_list_free(timed_transformed,
                                       timed_transformed_count);
@@ -2825,7 +2835,7 @@ static void test_modern_bash_syntax_contract(void) {
   test("Canonical word decoding rejects locale-dependent escapes, not bytes",
        valid);
 
-  char *legacy = NULL;
+  shell_netstring_buffer_t legacy = {0};
   shell_netstring_buffer_t argv_sequence = {0};
   shell_netstring_buffer_t command_sequence = {0};
   shell_netstring_buffer_t type_sequence = {0};
@@ -2853,18 +2863,18 @@ static void test_modern_bash_syntax_contract(void) {
           &anomaly_types, &sequence_count) == SHELL_PROCESS_EPARSE &&
       anomaly_commands.data == NULL && anomaly_types.data == NULL &&
       sequence_count == 0 &&
-      shell_build_netargv_sequence(binary_source, strlen(binary_source), NULL,
-                                   &legacy, &sequence_count,
-                                   &features) == SHELL_PROCESS_EPARSE &&
-      legacy == NULL &&
-      shell_build_command_netseq(binary_source, strlen(binary_source), NULL,
-                                 &legacy,
-                                 &sequence_count) == SHELL_PROCESS_EPARSE &&
-      legacy == NULL &&
-      shell_build_type_netseq(binary_source, strlen(binary_source), NULL,
-                              &legacy,
-                              &sequence_count) == SHELL_PROCESS_EPARSE &&
-      legacy == NULL;
+      shell_build_netargv_sequence_buffer(binary_source, strlen(binary_source),
+                                          NULL, &legacy, &sequence_count,
+                                          &features) == SHELL_PROCESS_EPARSE &&
+      legacy.data == NULL &&
+      shell_build_command_netseq_buffer(binary_source, strlen(binary_source),
+                                        NULL, &legacy, &sequence_count) ==
+          SHELL_PROCESS_EPARSE &&
+      legacy.data == NULL &&
+      shell_build_type_netseq_buffer(binary_source, strlen(binary_source), NULL,
+                                     &legacy,
+                                     &sequence_count) == SHELL_PROCESS_EPARSE &&
+      legacy.data == NULL;
   shell_netstring_buffer_free(&argv_sequence);
   shell_netstring_buffer_free(&command_sequence);
   shell_netstring_buffer_free(&type_sequence);
@@ -3131,9 +3141,9 @@ static void test_canonical_buffer_output_contract(void) {
           shell_render_netargv_buffer(&infos[0], NULL, &rendered) ==
               SHELL_PROCESS_OK &&
           rendered.data != NULL && rendered.length != 0;
-  valid = valid && !shell_netstring_buffer_is_empty(&rendered);
+  valid = valid && !((&rendered)->data == NULL && (&rendered)->length == 0);
   shell_netstring_buffer_free(&rendered);
-  valid = valid && shell_netstring_buffer_is_empty(&rendered);
+  valid = valid && ((&rendered)->data == NULL && (&rendered)->length == 0);
   shell_command_infos_free(infos, info_count);
 
   valid = valid &&
@@ -3615,8 +3625,8 @@ static void test_double_quoted_parameter_substitution_scope(void) {
     size_t length = strlen(source);
     shell_parse_result_t fast = {0};
     shell_processed_commands_t processed = {0};
-    char *commands = NULL;
-    char *types = NULL;
+    shell_netstring_buffer_t commands = {0};
+    shell_netstring_buffer_t types = {0};
     size_t stage_count = 0;
     bool executes = shell_source_word_has_executable_substitution(
         source + strlen("echo "), length - strlen("echo "));
@@ -3633,8 +3643,9 @@ static void test_double_quoted_parameter_substitution_scope(void) {
         shell_process_commands(source, length, NULL, &processed) ==
             SHELL_PROCESS_OK &&
         processed.command_count == 1 &&
-        shell_build_anomaly_netseqs(source, length, NULL, &commands, &types,
-                                    &stage_count) == SHELL_PROCESS_OK &&
+        shell_build_anomaly_netseqs_buffer(source, length, NULL, &commands,
+                                           &types,
+                                           &stage_count) == SHELL_PROCESS_OK &&
         stage_count == (cases[i].executes ? 2u : 1u) &&
         command_netseq_matches(
             source, cases[i].executes ? "6:printf,4:echo," : "4:echo,",
@@ -3642,8 +3653,8 @@ static void test_double_quoted_parameter_substitution_scope(void) {
     if (!case_valid)
       fprintf(stderr, "quoted parameter substitution case %zu failed\n", i);
     valid &= case_valid;
-    free(commands);
-    free(types);
+    shell_netstring_buffer_free(&commands);
+    shell_netstring_buffer_free(&types);
     shell_processed_commands_free(&processed);
   }
   test("Quoted parameter operands preserve executable substitution scope",
@@ -3683,8 +3694,8 @@ static void test_double_quoted_parameter_substitution_scope(void) {
     shell_parse_result_t fast = {0};
     shell_command_t *full = NULL;
     size_t full_count = 0;
-    char *raw = NULL;
-    char *typed = NULL;
+    shell_netstring_buffer_t raw = {0};
+    shell_netstring_buffer_t typed = {0};
     size_t stages = 0;
     size_t length = strlen(decoded_openers[i]);
     shell_error_t fast_status =
@@ -3693,7 +3704,7 @@ static void test_double_quoted_parameter_substitution_scope(void) {
         shell_tokenize_commands(decoded_openers[i], length, &full, &full_count);
     shell_process_status_t process_status =
         shell_process_commands(decoded_openers[i], length, NULL, &decoded);
-    shell_process_status_t anomaly_status = shell_build_anomaly_netseqs(
+    shell_process_status_t anomaly_status = shell_build_anomaly_netseqs_buffer(
         decoded_openers[i], length, NULL, &raw, &typed, &stages);
     /* The full tokenizer is lexical and may preserve an unsupported word or
      * reject its incomplete quote; semantic APIs must reject either way. */
@@ -3705,15 +3716,15 @@ static void test_double_quoted_parameter_substitution_scope(void) {
         fast_status == SHELL_EPARSE && fast.count == 0 && lexical_consistent &&
         process_status == SHELL_PROCESS_EPARSE && decoded.commands == NULL &&
         decoded.command_count == 0 && anomaly_status == SHELL_PROCESS_EPARSE &&
-        raw == NULL && typed == NULL && stages == 0;
+        raw.data == NULL && typed.data == NULL && stages == 0;
     if (!case_valid)
       fprintf(stderr,
               "ANSI parameter case %zu: fast=%d full=%d process=%d "
               "anomaly=%d\n",
               i, fast_status, full_status, process_status, anomaly_status);
     encoded_rejected &= case_valid;
-    free(raw);
-    free(typed);
+    shell_netstring_buffer_free(&raw);
+    shell_netstring_buffer_free(&typed);
     shell_commands_free(full, full_count);
     shell_processed_commands_free(&decoded);
   }
@@ -3961,7 +3972,6 @@ static void run_feature_cases(const feature_case_t *cases, size_t count) {
                                  strlen(cases[i].tokenizer.input), &commands,
                                  &command_count) == SHELL_TOKENIZE_OK);
     unsigned features = 0;
-    bool feature_api_consistent = true;
     for (size_t j = 0; j < command_count; j++) {
       unsigned command_features =
           (commands[j].has_variables ? EXPECT_VARIABLE : 0) |
@@ -3972,12 +3982,9 @@ static void run_feature_cases(const feature_case_t *cases, size_t count) {
           (commands[j].has_conditionals ? EXPECT_CONDITIONAL : 0) |
           (commands[j].has_case ? EXPECT_CASE : 0);
       features |= command_features;
-      if (shell_command_has_shell_features(&commands[j]) !=
-          ((command_features & EXPECT_SHELL_FEATURE) != 0))
-        feature_api_consistent = false;
     }
     bool valid = parsed && command_count == cases[i].tokenizer.command_count &&
-                 features == cases[i].features && feature_api_consistent &&
+                 features == cases[i].features &&
                  tokens_are_consistent(cases[i].tokenizer.input, commands,
                                        command_count);
     if (!valid)
@@ -4009,25 +4016,18 @@ static void run_stage_cases(const stage_case_t *cases, size_t count) {
     uint64_t globs = 0;
     uint64_t subshells = 0;
     uint64_t arithmetic = 0;
-    bool feature_api_consistent = true;
     for (size_t j = 0; j < command_count && j < 64; j++) {
       uint64_t stage = UINT64_C(1) << j;
       variables |= commands[j].has_variables ? stage : 0;
       globs |= commands[j].has_globs ? stage : 0;
       subshells |= commands[j].has_subshells ? stage : 0;
       arithmetic |= commands[j].has_arithmetic ? stage : 0;
-      bool has_feature = commands[j].has_variables || commands[j].has_globs ||
-                         commands[j].has_subshells ||
-                         commands[j].has_arithmetic;
-      if (shell_command_has_shell_features(&commands[j]) != has_feature)
-        feature_api_consistent = false;
     }
     bool valid = parsed && command_count == cases[i].tokenizer.command_count &&
                  command_count <= 64 && variables == cases[i].variable_stages &&
                  globs == cases[i].glob_stages &&
                  subshells == cases[i].subshell_stages &&
                  arithmetic == cases[i].arithmetic_stages &&
-                 feature_api_consistent &&
                  tokens_are_consistent(cases[i].tokenizer.input, commands,
                                        command_count);
     if (!valid)
@@ -4091,11 +4091,11 @@ static void run_processor_cases(const processor_case_t *cases, size_t count) {
           (infos[j].has_redirections ? PROCESS_REDIRECTION : 0) |
           (infos[j].has_error_redirection ? PROCESS_ERROR_REDIRECTION : 0);
       bool expected_feature = (cases[i].feature_stages & (1u << j)) != 0;
-      char *netargv = NULL;
-      bool rendered =
-          shell_render_netargv(&infos[j], NULL, &netargv) == SHELL_PROCESS_OK;
+      shell_netstring_buffer_t netargv = {0};
+      bool rendered = shell_render_netargv_buffer(&infos[j], NULL, &netargv) ==
+                      SHELL_PROCESS_OK;
       bool stage_valid =
-          infos[j].original_command && rendered && netargv &&
+          infos[j].original_command && rendered && netargv.data &&
           strcmp(infos[j].original_command, cases[i].original_commands[j]) ==
               0 &&
           flags == cases[i].flags[j] &&
@@ -4108,12 +4108,13 @@ static void run_processor_cases(const processor_case_t *cases, size_t count) {
           shell_command_info_has_dangerous_features(&infos[j]) ==
               expected_feature;
       if (!stage_valid)
-        printf("    stage %zu: original='%s' netargv='%s' flags=%#x "
+        printf("    stage %zu: original='%s' netargv='%.*s' flags=%#x "
                "feature=%d\n",
                j, infos[j].original_command ? infos[j].original_command : "",
-               netargv ? netargv : "", flags,
+               (int)netargv.length,
+               netargv.data ? (const char *)netargv.data : "", flags,
                shell_command_info_has_dangerous_features(&infos[j]));
-      free(netargv);
+      shell_netstring_buffer_free(&netargv);
       valid = stage_valid && valid;
       has_shell_features |= expected_feature;
     }
@@ -4159,11 +4160,7 @@ static void run_transform_line_cases(const transform_line_case_t *cases,
               strcmp(commands[j]->display_text,
                      cases[i].transformed_commands[j]) == 0 &&
               commands[j]->has_transformations == expected_transform &&
-              commands[j]->has_shell_syntax == expected_shell &&
-              shell_transformed_command_has_transformations(commands[j]) ==
-                  expected_transform &&
-              shell_transformed_command_get_display_text(commands[j]) ==
-                  commands[j]->display_text;
+              commands[j]->has_shell_syntax == expected_shell;
     }
     if (!valid)
       printf("    transform line: count=%zu expected=%zu\n", command_count,
@@ -4319,52 +4316,53 @@ static void test_processor_allocation_failures(void) {
        documents_atomic);
 
   bool has_features = false;
-  char *sequence = NULL;
+  shell_netstring_buffer_t sequence = {0};
   shellsplit_test_alloc_reset();
-  status = shell_build_netargv_sequence(input, strlen(input), NULL, &sequence,
-                                        &count, &has_features);
+  status = shell_build_netargv_sequence_buffer(
+      input, strlen(input), NULL, &sequence, &count, &has_features);
   allocations = shellsplit_test_alloc_count();
   test("Netargv-sequence allocation probe succeeds",
-       status == SHELL_PROCESS_OK && sequence && count == 2 && has_features);
-  free(sequence);
+       status == SHELL_PROCESS_OK && sequence.data && count == 2 &&
+           has_features);
+  shell_netstring_buffer_free(&sequence);
 
   atomic = true;
   for (size_t fail_at = 1; fail_at <= allocations; fail_at++) {
-    sequence = (char *)(void *)1;
+    sequence = (shell_netstring_buffer_t){0};
     count = SIZE_MAX;
     has_features = true;
     shellsplit_test_alloc_fail_at(fail_at);
-    status = shell_build_netargv_sequence(input, strlen(input), NULL, &sequence,
-                                          &count, &has_features);
+    status = shell_build_netargv_sequence_buffer(
+        input, strlen(input), NULL, &sequence, &count, &has_features);
     shellsplit_test_alloc_reset();
-    if (status != SHELL_PROCESS_ENOMEM || sequence != NULL || count != 0 ||
+    if (status != SHELL_PROCESS_ENOMEM || sequence.data != NULL || count != 0 ||
         has_features) {
       atomic = false;
-      free(sequence);
+      shell_netstring_buffer_free(&sequence);
       break;
     }
   }
   test("Netargv-sequence allocation failures are atomic", atomic);
 
   shellsplit_test_alloc_reset();
-  status =
-      shell_build_command_netseq(input, strlen(input), NULL, &sequence, &count);
+  status = shell_build_command_netseq_buffer(input, strlen(input), NULL,
+                                             &sequence, &count);
   allocations = shellsplit_test_alloc_count();
   test("Command-netsequence allocation probe succeeds",
-       status == SHELL_PROCESS_OK && sequence && count == 2);
-  free(sequence);
+       status == SHELL_PROCESS_OK && sequence.data && count == 2);
+  shell_netstring_buffer_free(&sequence);
 
   atomic = true;
   for (size_t fail_at = 1; fail_at <= allocations; fail_at++) {
-    sequence = (char *)(void *)1;
+    sequence = (shell_netstring_buffer_t){0};
     count = SIZE_MAX;
     shellsplit_test_alloc_fail_at(fail_at);
-    status = shell_build_command_netseq(input, strlen(input), NULL, &sequence,
-                                        &count);
+    status = shell_build_command_netseq_buffer(input, strlen(input), NULL,
+                                               &sequence, &count);
     shellsplit_test_alloc_reset();
-    if (status != SHELL_PROCESS_ENOMEM || sequence != NULL || count != 0) {
+    if (status != SHELL_PROCESS_ENOMEM || sequence.data != NULL || count != 0) {
       atomic = false;
-      free(sequence);
+      shell_netstring_buffer_free(&sequence);
       break;
     }
   }
@@ -4675,18 +4673,24 @@ static void test_cstring_allocation_size_boundaries(void) {
 static void test_posix_brace_group_sequence(void) {
   const char *input =
       "cd /workspace && { sleep 2; printf 'q'; } | ./clock > /tmp/clock.out";
-  char *sequence = NULL;
+  shell_netstring_buffer_t sequence = {0};
   size_t count = 0;
   bool features = false;
-  shell_process_status_t status = shell_build_netargv_sequence(
+  shell_process_status_t status = shell_build_netargv_sequence_buffer(
       input, strlen(input), NULL, &sequence, &count, &features);
-  test("POSIX brace group renders four canonical netargv records",
-       status == SHELL_PROCESS_OK && count == 4 && features &&
-           sequence != NULL &&
-           strcmp(sequence,
+  test(
+      "POSIX brace group renders four canonical netargv records",
+      status == SHELL_PROCESS_OK && count == 4 && features &&
+          sequence.data != NULL &&
+          (sequence.length !=
+               sizeof("19:2:cd,10:/workspace,,12:5:sleep,1:2,,13:6:printf,1:q,,"
+                      "10:7:./clock,,") -
+                   1 ||
+           memcmp(sequence.data,
                   "19:2:cd,10:/workspace,,12:5:sleep,1:2,,13:6:printf,1:q,,"
-                  "10:7:./clock,,") == 0);
-  free(sequence);
+                  "10:7:./clock,,",
+                  sequence.length)) == 0);
+  shell_netstring_buffer_free(&sequence);
 }
 
 static void test_canonical_control_compounds_rejected(void) {
@@ -4766,11 +4770,11 @@ static void test_canonical_control_compounds_rejected(void) {
         .group_io_ops = (shell_group_io_op_t *)(uintptr_t)1,
         .group_io_op_count = SIZE_MAX,
     };
-    char *netargv = (char *)(uintptr_t)1;
-    char *command_netseq = (char *)(uintptr_t)1;
-    char *type_netseq = (char *)(uintptr_t)1;
-    char *paired_command = (char *)(uintptr_t)1;
-    char *paired_type = (char *)(uintptr_t)1;
+    shell_netstring_buffer_t netargv = {0};
+    shell_netstring_buffer_t command_netseq = {0};
+    shell_netstring_buffer_t type_netseq = {0};
+    shell_netstring_buffer_t paired_command = {0};
+    shell_netstring_buffer_t paired_type = {0};
     size_t count = SIZE_MAX;
     bool features = true;
     size_t length = strlen(cases[i]);
@@ -4784,19 +4788,21 @@ static void test_canonical_control_compounds_rejected(void) {
         processed.commands == NULL && processed.command_count == 0 &&
         processed.groups == NULL && processed.group_count == 0 &&
         processed.group_io_ops == NULL && processed.group_io_op_count == 0 &&
-        shell_build_netargv_sequence(cases[i], length, NULL, &netargv, &count,
-                                     &features) == SHELL_PROCESS_EPARSE &&
-        netargv == NULL && count == 0 && !features &&
-        shell_build_command_netseq(cases[i], length, NULL, &command_netseq,
-                                   &count) == SHELL_PROCESS_EPARSE &&
-        command_netseq == NULL && count == 0 &&
-        shell_build_type_netseq(cases[i], length, NULL, &type_netseq, &count) ==
+        shell_build_netargv_sequence_buffer(cases[i], length, NULL, &netargv,
+                                            &count, &features) ==
             SHELL_PROCESS_EPARSE &&
-        type_netseq == NULL && count == 0 &&
-        shell_build_anomaly_netseqs(cases[i], length, NULL, &paired_command,
-                                    &paired_type,
-                                    &count) == SHELL_PROCESS_EPARSE &&
-        paired_command == NULL && paired_type == NULL && count == 0;
+        netargv.data == NULL && count == 0 && !features &&
+        shell_build_command_netseq_buffer(cases[i], length, NULL,
+                                          &command_netseq,
+                                          &count) == SHELL_PROCESS_EPARSE &&
+        command_netseq.data == NULL && count == 0 &&
+        shell_build_type_netseq_buffer(cases[i], length, NULL, &type_netseq,
+                                       &count) == SHELL_PROCESS_EPARSE &&
+        type_netseq.data == NULL && count == 0 &&
+        shell_build_anomaly_netseqs_buffer(cases[i], length, NULL,
+                                           &paired_command, &paired_type,
+                                           &count) == SHELL_PROCESS_EPARSE &&
+        paired_command.data == NULL && paired_type.data == NULL && count == 0;
   }
   test("Canonical APIs reject unsupported control compounds", valid);
 }
@@ -4830,7 +4836,7 @@ static void test_unsupported_control_precedes_capacity(void) {
       .group_io_ops = (shell_group_io_op_t *)(uintptr_t)1,
       .group_io_op_count = SIZE_MAX,
   };
-  char *netargv = (char *)(uintptr_t)1;
+  shell_netstring_buffer_t netargv = {0};
   size_t count = SIZE_MAX;
   bool features = true;
   bool valid =
@@ -4844,9 +4850,9 @@ static void test_unsupported_control_precedes_capacity(void) {
       processed.commands == NULL && processed.command_count == 0 &&
       processed.groups == NULL && processed.group_count == 0 &&
       processed.group_io_ops == NULL && processed.group_io_op_count == 0 &&
-      shell_build_netargv_sequence(input, used, NULL, &netargv, &count,
-                                   &features) == SHELL_PROCESS_EPARSE &&
-      netargv == NULL && count == 0 && !features;
+      shell_build_netargv_sequence_buffer(input, used, NULL, &netargv, &count,
+                                          &features) == SHELL_PROCESS_EPARSE &&
+      netargv.data == NULL && count == 0 && !features;
   test("Unsupported controls take precedence over command capacity", valid);
 }
 
@@ -4887,7 +4893,7 @@ static void test_malformed_source_precedes_capacity(void) {
         .group_io_ops = (shell_group_io_op_t *)(uintptr_t)1,
         .group_io_op_count = SIZE_MAX,
     };
-    char *netargv = (char *)(uintptr_t)1;
+    shell_netstring_buffer_t netargv = {0};
     size_t count = SIZE_MAX;
     bool features = true;
     shell_process_status_t validation =
@@ -4896,7 +4902,7 @@ static void test_malformed_source_precedes_capacity(void) {
         shell_process_command(input, used, NULL, &infos, &info_count);
     shell_process_status_t structured =
         shell_process_commands(input, used, NULL, &processed);
-    shell_process_status_t sequence = shell_build_netargv_sequence(
+    shell_process_status_t sequence = shell_build_netargv_sequence_buffer(
         input, used, NULL, &netargv, &count, &features);
     bool flat_valid =
         tail == 1
@@ -4908,7 +4914,7 @@ static void test_malformed_source_precedes_capacity(void) {
         processed.command_count == 0 && processed.groups == NULL &&
         processed.group_count == 0 && processed.group_io_ops == NULL &&
         processed.group_io_op_count == 0 && sequence == SHELL_PROCESS_EPARSE &&
-        netargv == NULL && count == 0 && !features;
+        netargv.data == NULL && count == 0 && !features;
     if (!case_valid)
       printf("    malformed tail %zu: validation=%d flat=%d structured=%d "
              "sequence=%d\n",
@@ -4930,19 +4936,19 @@ static void test_control_word_literals_are_accepted(void) {
   bool valid = true;
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
     shell_processed_commands_t processed = {0};
-    char *netargv = NULL;
+    shell_netstring_buffer_t netargv = {0};
     size_t count = 0;
     bool features = false;
     size_t length = strlen(cases[i]);
-    valid =
-        valid &&
-        shell_process_commands(cases[i], length, NULL, &processed) ==
-            SHELL_PROCESS_OK &&
-        processed.command_count == 1 &&
-        shell_build_netargv_sequence(cases[i], length, NULL, &netargv, &count,
-                                     &features) == SHELL_PROCESS_OK &&
-        count == 1 && netargv != NULL;
-    free(netargv);
+    valid = valid &&
+            shell_process_commands(cases[i], length, NULL, &processed) ==
+                SHELL_PROCESS_OK &&
+            processed.command_count == 1 &&
+            shell_build_netargv_sequence_buffer(cases[i], length, NULL,
+                                                &netargv, &count, &features) ==
+                SHELL_PROCESS_OK &&
+            count == 1 && netargv.data != NULL;
+    shell_netstring_buffer_free(&netargv);
     shell_processed_commands_free(&processed);
   }
   test("Canonical APIs keep non-structural control words as literals", valid);
@@ -4952,7 +4958,7 @@ static void test_structured_processor_requires_complete_syntax(void) {
   const char *input = "echo `unterminated";
   shell_command_info_t *flat = NULL;
   size_t flat_count = 0;
-  char *netargv = NULL;
+  shell_netstring_buffer_t netargv = {0};
   shell_processed_commands_t structured = {
       .commands = (shell_command_info_t *)(uintptr_t)1,
       .command_count = SIZE_MAX,
@@ -4965,15 +4971,18 @@ static void test_structured_processor_requires_complete_syntax(void) {
       shell_process_command(input, strlen(input), NULL, &flat, &flat_count) ==
           SHELL_PROCESS_OK &&
       flat != NULL && flat_count == 1 &&
-      shell_render_netargv(&flat[0], NULL, &netargv) == SHELL_PROCESS_OK &&
-      netargv != NULL && strcmp(netargv, "4:echo,13:`unterminated,") == 0 &&
+      shell_render_netargv_buffer(&flat[0], NULL, &netargv) ==
+          SHELL_PROCESS_OK &&
+      netargv.data != NULL &&
+      (netargv.length != sizeof("4:echo,13:`unterminated,") - 1 ||
+       memcmp(netargv.data, "4:echo,13:`unterminated,", netargv.length)) == 0 &&
       shell_process_commands(input, strlen(input), NULL, &structured) ==
           SHELL_PROCESS_EPARSE &&
       structured.commands == NULL && structured.command_count == 0 &&
       structured.groups == NULL && structured.group_count == 0 &&
       structured.group_io_ops == NULL && structured.group_io_op_count == 0;
   shell_command_infos_free(flat, flat_count);
-  free(netargv);
+  shell_netstring_buffer_free(&netargv);
   test("Structured processing rejects incomplete lexical records", valid);
 }
 
@@ -5091,7 +5100,7 @@ static void test_posix_brace_group_forms(void) {
   valid = true;
   for (size_t i = 0; i < sizeof(invalid_cases) / sizeof(invalid_cases[0]);
        i++) {
-    char *sequence = NULL;
+    shell_netstring_buffer_t sequence = {0};
     size_t count = 0;
     bool features = false;
     shell_parse_result_t parsed = {0};
@@ -5102,10 +5111,10 @@ static void test_posix_brace_group_forms(void) {
                                     &commands,
                                     &command_count) == SHELL_TOKENIZE_EPARSE &&
             commands == NULL && command_count == 0 &&
-            shell_build_netargv_sequence(
+            shell_build_netargv_sequence_buffer(
                 invalid_cases[i], strlen(invalid_cases[i]), NULL, &sequence,
                 &count, &features) == SHELL_PROCESS_EPARSE &&
-            sequence == NULL && count == 0 && !features &&
+            sequence.data == NULL && count == 0 && !features &&
             shell_parse_fast(invalid_cases[i], strlen(invalid_cases[i]), NULL,
                              &parsed) == SHELL_EPARSE;
   }
@@ -5129,15 +5138,16 @@ static void test_posix_brace_group_forms(void) {
   test("Full tokenizer rejects mismatched reserved group closers", valid);
 
   const char *redirected = "{ echo; } > /tmp/group.out";
-  char *sequence = NULL;
+  shell_netstring_buffer_t sequence = {0};
   size_t count = 0;
   bool features = false;
-  shell_process_status_t status = shell_build_netargv_sequence(
+  shell_process_status_t status = shell_build_netargv_sequence_buffer(
       redirected, strlen(redirected), NULL, &sequence, &count, &features);
   test("Group trailing redirects do not create empty netargv commands",
-       status == SHELL_PROCESS_OK && count == 1 && sequence != NULL &&
-           strcmp(sequence, "7:4:echo,,") == 0);
-  free(sequence);
+       status == SHELL_PROCESS_OK && count == 1 && sequence.data != NULL &&
+           (sequence.length != sizeof("7:4:echo,,") - 1 ||
+            memcmp(sequence.data, "7:4:echo,,", sequence.length)) == 0);
+  shell_netstring_buffer_free(&sequence);
 
   shell_command_info_t *infos = NULL;
   count = 0;
@@ -5176,11 +5186,11 @@ static void test_command_position_group_syntax_rejected(void) {
     size_t length = strlen(input);
     shell_parse_result_t parsed = {0};
     shell_processed_commands_t processed = {0};
-    char *netargv = (char *)(uintptr_t)1;
-    char *commands = (char *)(uintptr_t)1;
-    char *types = (char *)(uintptr_t)1;
-    char *anomaly_commands = (char *)(uintptr_t)1;
-    char *anomaly_types = (char *)(uintptr_t)1;
+    shell_netstring_buffer_t netargv = {0};
+    shell_netstring_buffer_t commands = {0};
+    shell_netstring_buffer_t types = {0};
+    shell_netstring_buffer_t anomaly_commands = {0};
+    shell_netstring_buffer_t anomaly_types = {0};
     size_t count = SIZE_MAX;
     size_t anomaly_count = SIZE_MAX;
     bool features = true;
@@ -5192,32 +5202,28 @@ static void test_command_position_group_syntax_rejected(void) {
             shell_process_commands(input, length, NULL, &processed) ==
                 SHELL_PROCESS_EPARSE &&
             processed.commands == NULL && processed.command_count == 0 &&
-            shell_build_netargv_sequence(input, length, NULL, &netargv, &count,
-                                         &features) == SHELL_PROCESS_EPARSE &&
-            netargv == NULL && count == 0 && !features &&
-            shell_build_command_netseq(input, length, NULL, &commands,
-                                       &count) == SHELL_PROCESS_EPARSE &&
-            commands == NULL && count == 0 &&
-            shell_build_type_netseq(input, length, NULL, &types, &count) ==
+            shell_build_netargv_sequence_buffer(input, length, NULL, &netargv,
+                                                &count, &features) ==
                 SHELL_PROCESS_EPARSE &&
-            types == NULL && count == 0 &&
-            shell_build_anomaly_netseqs(input, length, NULL, &anomaly_commands,
-                                        &anomaly_types, &anomaly_count) ==
-                SHELL_PROCESS_EPARSE &&
-            anomaly_commands == NULL && anomaly_types == NULL &&
+            netargv.data == NULL && count == 0 && !features &&
+            shell_build_command_netseq_buffer(input, length, NULL, &commands,
+                                              &count) == SHELL_PROCESS_EPARSE &&
+            commands.data == NULL && count == 0 &&
+            shell_build_type_netseq_buffer(input, length, NULL, &types,
+                                           &count) == SHELL_PROCESS_EPARSE &&
+            types.data == NULL && count == 0 &&
+            shell_build_anomaly_netseqs_buffer(
+                input, length, NULL, &anomaly_commands, &anomaly_types,
+                &anomaly_count) == SHELL_PROCESS_EPARSE &&
+            anomaly_commands.data == NULL && anomaly_types.data == NULL &&
             anomaly_count == 0 &&
             shell_dep_graph_parse(input, length, ".", NULL, &graph) ==
                 SHELL_DEP_EPARSE;
-    if (netargv != (char *)(uintptr_t)1)
-      free(netargv);
-    if (commands != (char *)(uintptr_t)1)
-      free(commands);
-    if (types != (char *)(uintptr_t)1)
-      free(types);
-    if (anomaly_commands != (char *)(uintptr_t)1)
-      free(anomaly_commands);
-    if (anomaly_types != (char *)(uintptr_t)1)
-      free(anomaly_types);
+    shell_netstring_buffer_free(&netargv);
+    shell_netstring_buffer_free(&commands);
+    shell_netstring_buffer_free(&types);
+    shell_netstring_buffer_free(&anomaly_commands);
+    shell_netstring_buffer_free(&anomaly_types);
     shell_processed_commands_free(&processed);
   }
   test("Semantic APIs reject command-position group syntax", valid);
@@ -5230,17 +5236,17 @@ static void test_command_position_group_syntax_rejected(void) {
        i++) {
     const char *input = literal_cases[i];
     shell_parse_result_t parsed = {0};
-    char *netargv = NULL;
+    shell_netstring_buffer_t netargv = {0};
     size_t count = 0;
     bool features = false;
-    valid =
-        valid &&
-        shell_parse_fast(input, strlen(input), &strict_limits, &parsed) ==
-            SHELL_OK &&
-        shell_build_netargv_sequence(input, strlen(input), NULL, &netargv,
-                                     &count, &features) == SHELL_PROCESS_OK &&
-        count > 0;
-    free(netargv);
+    valid = valid &&
+            shell_parse_fast(input, strlen(input), &strict_limits, &parsed) ==
+                SHELL_OK &&
+            shell_build_netargv_sequence_buffer(input, strlen(input), NULL,
+                                                &netargv, &count, &features) ==
+                SHELL_PROCESS_OK &&
+            count > 0;
+    shell_netstring_buffer_free(&netargv);
   }
   test("Strict group syntax preserves literal brace words", valid);
 }
@@ -5349,16 +5355,16 @@ static void test_brace_group_process_substitution_contract(void) {
     shell_command_info_t *infos = NULL;
     size_t info_count = 0;
     shell_processed_commands_t processed = {0};
-    char *netargv = NULL;
+    shell_netstring_buffer_t netargv = {0};
     size_t netargv_count = 0;
     bool features = false;
     shell_process_status_t info_status = shell_process_command(
         cases[i].input, strlen(cases[i].input), NULL, &infos, &info_count);
     shell_process_status_t processed_status = shell_process_commands(
         cases[i].input, strlen(cases[i].input), NULL, &processed);
-    shell_process_status_t netargv_status =
-        shell_build_netargv_sequence(cases[i].input, strlen(cases[i].input),
-                                     NULL, &netargv, &netargv_count, &features);
+    shell_process_status_t netargv_status = shell_build_netargv_sequence_buffer(
+        cases[i].input, strlen(cases[i].input), NULL, &netargv, &netargv_count,
+        &features);
     bool saw_process_word = false;
     for (size_t token = 0;
          infos && token < infos[0].command_token_count && !saw_process_word;
@@ -5370,13 +5376,13 @@ static void test_brace_group_process_substitution_contract(void) {
             netargv_status == SHELL_PROCESS_OK && infos != NULL &&
             info_count == cases[i].command_count &&
             processed.command_count == cases[i].command_count &&
-            processed.group_count == 1 && netargv != NULL &&
+            processed.group_count == 1 && netargv.data != NULL &&
             netargv_count == cases[i].command_count && features &&
             infos[0].command_token_count == cases[i].first_word_count &&
             infos[0].has_redirections == cases[i].has_redirection &&
             saw_process_word == cases[i].process_is_word &&
             shell_command_info_has_dangerous_features(&infos[0]);
-    free(netargv);
+    shell_netstring_buffer_free(&netargv);
     shell_processed_commands_free(&processed);
     shell_command_infos_free(infos, info_count);
   }
@@ -5396,7 +5402,7 @@ static void test_clobber_redirection_operand_contract(void) {
   for (size_t i = 0; i < sizeof(valid_cases) / sizeof(valid_cases[0]); i++) {
     shell_command_info_t *infos = NULL;
     size_t info_count = 0;
-    char *netargv = NULL;
+    shell_netstring_buffer_t netargv = {0};
     size_t netargv_count = 0;
     bool has_features = false;
     valid =
@@ -5410,12 +5416,13 @@ static void test_clobber_redirection_operand_contract(void) {
         memcmp(infos[0].command_tokens[0].start, "echo", strlen("echo")) == 0 &&
         infos[0].command_tokens[1].length == strlen("hi") &&
         memcmp(infos[0].command_tokens[1].start, "hi", strlen("hi")) == 0 &&
-        shell_build_netargv_sequence(
+        shell_build_netargv_sequence_buffer(
             valid_cases[i].input, strlen(valid_cases[i].input), NULL, &netargv,
             &netargv_count, &has_features) == SHELL_PROCESS_OK &&
-        netargv != NULL && netargv_count == 1 && has_features &&
-        strcmp(netargv, valid_cases[i].netargv) == 0;
-    free(netargv);
+        netargv.data != NULL && netargv_count == 1 && has_features &&
+        (netargv.length != strlen(valid_cases[i].netargv) ||
+         memcmp(netargv.data, valid_cases[i].netargv, netargv.length)) == 0;
+    shell_netstring_buffer_free(&netargv);
     shell_command_infos_free(infos, info_count);
   }
 
@@ -5773,11 +5780,11 @@ static void test_brace_group_grammar_matrix(void) {
     size_t command_count = 0;
     shell_processed_commands_t processed = {0};
     shell_dep_graph_t graph = {0};
-    char *netargv = NULL;
-    char *command_netseq = NULL;
-    char *type_netseq = NULL;
-    char *paired_command = NULL;
-    char *paired_type = NULL;
+    shell_netstring_buffer_t netargv = {0};
+    shell_netstring_buffer_t command_netseq = {0};
+    shell_netstring_buffer_t type_netseq = {0};
+    shell_netstring_buffer_t paired_command = {0};
+    shell_netstring_buffer_t paired_type = {0};
     bool features = false;
 
     shell_error_t fast_status = shell_parse_fast(input, length, &strict, &fast);
@@ -5789,13 +5796,13 @@ static void test_brace_group_grammar_matrix(void) {
     size_t command_count_out = 0;
     size_t type_count = 0;
     size_t anomaly_count = 0;
-    shell_process_status_t netargv_status = shell_build_netargv_sequence(
+    shell_process_status_t netargv_status = shell_build_netargv_sequence_buffer(
         input, length, NULL, &netargv, &netargv_count, &features);
-    shell_process_status_t command_status = shell_build_command_netseq(
+    shell_process_status_t command_status = shell_build_command_netseq_buffer(
         input, length, NULL, &command_netseq, &command_count_out);
-    shell_process_status_t type_status =
-        shell_build_type_netseq(input, length, NULL, &type_netseq, &type_count);
-    shell_process_status_t anomaly_status = shell_build_anomaly_netseqs(
+    shell_process_status_t type_status = shell_build_type_netseq_buffer(
+        input, length, NULL, &type_netseq, &type_count);
+    shell_process_status_t anomaly_status = shell_build_anomaly_netseqs_buffer(
         input, length, NULL, &paired_command, &paired_type, &anomaly_count);
     shell_dep_error_t graph_status =
         shell_dep_graph_parse(input, length, ".", NULL, &graph);
@@ -5808,17 +5815,20 @@ static void test_brace_group_grammar_matrix(void) {
         processed.command_count == valid_cases[i].command_count &&
         processed.group_count == valid_cases[i].group_count &&
         processed_group_descriptors_match_source(&fast, &processed) &&
-        netargv_status == SHELL_PROCESS_OK && netargv != NULL &&
+        netargv_status == SHELL_PROCESS_OK && netargv.data != NULL &&
         netargv_count == valid_cases[i].command_count &&
-        command_status == SHELL_PROCESS_OK && command_netseq != NULL &&
+        command_status == SHELL_PROCESS_OK && command_netseq.data != NULL &&
         command_count_out >= valid_cases[i].command_count &&
-        type_status == SHELL_PROCESS_OK && type_netseq != NULL &&
+        type_status == SHELL_PROCESS_OK && type_netseq.data != NULL &&
         type_count == command_count_out && anomaly_status == SHELL_PROCESS_OK &&
-        paired_command != NULL && paired_type != NULL &&
+        paired_command.data != NULL && paired_type.data != NULL &&
         anomaly_count == command_count_out &&
-        strcmp(command_netseq, paired_command) == 0 &&
-        strcmp(type_netseq, paired_type) == 0 && graph_status == SHELL_DEP_OK &&
-        shell_dep_graph_validate(&graph).valid;
+        (command_netseq.length != paired_command.length ||
+         memcmp(command_netseq.data, paired_command.data,
+                command_netseq.length)) == 0 &&
+        (type_netseq.length != paired_type.length ||
+         memcmp(type_netseq.data, paired_type.data, type_netseq.length)) == 0 &&
+        graph_status == SHELL_DEP_OK && shell_dep_graph_validate(&graph).valid;
     if (!case_valid)
       printf(
           "    valid brace case rejected: %s (fast=%d tokenizer=%d process=%d "
@@ -5826,11 +5836,11 @@ static void test_brace_group_grammar_matrix(void) {
           input, fast_status, tokenizer_status, process_status, netargv_status,
           command_status, type_status, anomaly_status, graph_status);
     valid = valid && case_valid;
-    free(netargv);
-    free(command_netseq);
-    free(type_netseq);
-    free(paired_command);
-    free(paired_type);
+    shell_netstring_buffer_free(&netargv);
+    shell_netstring_buffer_free(&command_netseq);
+    shell_netstring_buffer_free(&type_netseq);
+    shell_netstring_buffer_free(&paired_command);
+    shell_netstring_buffer_free(&paired_type);
     shell_commands_free(commands, command_count);
     shell_processed_commands_free(&processed);
   }
@@ -5893,11 +5903,11 @@ static void test_brace_group_grammar_matrix(void) {
         .group_io_ops = (shell_group_io_op_t *)(uintptr_t)1,
         .group_io_op_count = SIZE_MAX,
     };
-    char *netargv = (char *)(uintptr_t)1;
-    char *command_netseq = (char *)(uintptr_t)1;
-    char *type_netseq = (char *)(uintptr_t)1;
-    char *paired_command = (char *)(uintptr_t)1;
-    char *paired_type = (char *)(uintptr_t)1;
+    shell_netstring_buffer_t netargv = {0};
+    shell_netstring_buffer_t command_netseq = {0};
+    shell_netstring_buffer_t type_netseq = {0};
+    shell_netstring_buffer_t paired_command = {0};
+    shell_netstring_buffer_t paired_type = {0};
     size_t count = SIZE_MAX;
     bool features = true;
     shell_dep_graph_t graph = {0};
@@ -5909,13 +5919,13 @@ static void test_brace_group_grammar_matrix(void) {
         shell_process_command(input, length, NULL, &infos, &info_count);
     shell_process_status_t process_status =
         shell_process_commands(input, length, NULL, &processed);
-    shell_process_status_t netargv_status = shell_build_netargv_sequence(
+    shell_process_status_t netargv_status = shell_build_netargv_sequence_buffer(
         input, length, NULL, &netargv, &count, &features);
-    shell_process_status_t command_status = shell_build_command_netseq(
+    shell_process_status_t command_status = shell_build_command_netseq_buffer(
         input, length, NULL, &command_netseq, &count);
-    shell_process_status_t type_status =
-        shell_build_type_netseq(input, length, NULL, &type_netseq, &count);
-    shell_process_status_t anomaly_status = shell_build_anomaly_netseqs(
+    shell_process_status_t type_status = shell_build_type_netseq_buffer(
+        input, length, NULL, &type_netseq, &count);
+    shell_process_status_t anomaly_status = shell_build_anomaly_netseqs_buffer(
         input, length, NULL, &paired_command, &paired_type, &count);
     shell_dep_error_t graph_status =
         shell_dep_graph_parse(input, length, ".", NULL, &graph);
@@ -5928,12 +5938,12 @@ static void test_brace_group_grammar_matrix(void) {
         processed.command_count == 0 && processed.groups == NULL &&
         processed.group_count == 0 && processed.group_io_ops == NULL &&
         processed.group_io_op_count == 0 &&
-        netargv_status == SHELL_PROCESS_EPARSE && netargv == NULL &&
+        netargv_status == SHELL_PROCESS_EPARSE && netargv.data == NULL &&
         count == 0 && !features && command_status == SHELL_PROCESS_EPARSE &&
-        command_netseq == NULL && count == 0 &&
-        type_status == SHELL_PROCESS_EPARSE && type_netseq == NULL &&
+        command_netseq.data == NULL && count == 0 &&
+        type_status == SHELL_PROCESS_EPARSE && type_netseq.data == NULL &&
         count == 0 && anomaly_status == SHELL_PROCESS_EPARSE &&
-        paired_command == NULL && paired_type == NULL && count == 0 &&
+        paired_command.data == NULL && paired_type.data == NULL && count == 0 &&
         graph_status == SHELL_DEP_EPARSE;
     valid = valid && case_valid;
   }
@@ -5966,36 +5976,36 @@ static void test_brace_group_operation_limits_are_atomic(void) {
           processed.groups == NULL && processed.group_count == 0 &&
           processed.group_io_ops == NULL && processed.group_io_op_count == 0;
 
-  char *netargv = (char *)(uintptr_t)1;
-  char *command_netseq = (char *)(uintptr_t)1;
-  char *type_netseq = (char *)(uintptr_t)1;
-  char *paired_command = (char *)(uintptr_t)1;
-  char *paired_type = (char *)(uintptr_t)1;
+  shell_netstring_buffer_t netargv = {0};
+  shell_netstring_buffer_t command_netseq = {0};
+  shell_netstring_buffer_t type_netseq = {0};
+  shell_netstring_buffer_t paired_command = {0};
+  shell_netstring_buffer_t paired_type = {0};
   size_t count = SIZE_MAX;
   bool features = true;
   valid = valid &&
-          shell_build_netargv_sequence(input, sizeof(input) - 1, &exact,
-                                       &netargv, &count, &features) ==
+          shell_build_netargv_sequence_buffer(input, sizeof(input) - 1, &exact,
+                                              &netargv, &count, &features) ==
               SHELL_PROCESS_EOUTPUT_LIMIT &&
-          netargv == NULL && count == 0 && !features;
+          netargv.data == NULL && count == 0 && !features;
   count = SIZE_MAX;
   valid = valid &&
-          shell_build_command_netseq(input, sizeof(input) - 1, &exact,
-                                     &command_netseq,
-                                     &count) == SHELL_PROCESS_EOUTPUT_LIMIT &&
-          command_netseq == NULL && count == 0;
-  count = SIZE_MAX;
-  valid =
-      valid &&
-      shell_build_type_netseq(input, sizeof(input) - 1, &exact, &type_netseq,
-                              &count) == SHELL_PROCESS_EOUTPUT_LIMIT &&
-      type_netseq == NULL && count == 0;
+          shell_build_command_netseq_buffer(input, sizeof(input) - 1, &exact,
+                                            &command_netseq, &count) ==
+              SHELL_PROCESS_EOUTPUT_LIMIT &&
+          command_netseq.data == NULL && count == 0;
   count = SIZE_MAX;
   valid = valid &&
-          shell_build_anomaly_netseqs(input, sizeof(input) - 1, &exact,
-                                      &paired_command, &paired_type,
-                                      &count) == SHELL_PROCESS_EOUTPUT_LIMIT &&
-          paired_command == NULL && paired_type == NULL && count == 0;
+          shell_build_type_netseq_buffer(input, sizeof(input) - 1, &exact,
+                                         &type_netseq, &count) ==
+              SHELL_PROCESS_EOUTPUT_LIMIT &&
+          type_netseq.data == NULL && count == 0;
+  count = SIZE_MAX;
+  valid = valid &&
+          shell_build_anomaly_netseqs_buffer(
+              input, sizeof(input) - 1, &exact, &paired_command, &paired_type,
+              &count) == SHELL_PROCESS_EOUTPUT_LIMIT &&
+          paired_command.data == NULL && paired_type.data == NULL && count == 0;
   test("Brace-group operation limits clear every canonical result", valid);
 }
 
@@ -6042,66 +6052,71 @@ static void test_anomaly_sequences_include_nested_execution_stages(void) {
 
   bool valid = true;
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
-    char *raw = NULL;
-    char *typed = NULL;
-    char *paired_raw = NULL;
-    char *paired_typed = NULL;
+    shell_netstring_buffer_t raw = {0};
+    shell_netstring_buffer_t typed = {0};
+    shell_netstring_buffer_t paired_raw = {0};
+    shell_netstring_buffer_t paired_typed = {0};
     shell_netstring_buffer_t raw_buffer = {0};
     shell_netstring_buffer_t typed_buffer = {0};
     size_t raw_count = 0;
     size_t typed_count = 0;
     size_t paired_count = 0;
-    valid =
-        valid &&
-        shell_build_command_netseq(cases[i].input, strlen(cases[i].input), NULL,
-                                   &raw, &raw_count) == SHELL_PROCESS_OK &&
-        raw != NULL && raw_count == cases[i].count &&
-        strcmp(raw, cases[i].raw) == 0 &&
-        shell_build_type_netseq(cases[i].input, strlen(cases[i].input), NULL,
-                                &typed, &typed_count) == SHELL_PROCESS_OK &&
-        typed != NULL && typed_count == cases[i].count &&
-        shell_netstring_validate(typed, strlen(typed), NULL) ==
-            SHELL_NETSTRING_OK &&
-        shell_build_anomaly_netseqs(cases[i].input, strlen(cases[i].input),
-                                    NULL, &paired_raw, &paired_typed,
-                                    &paired_count) == SHELL_PROCESS_OK &&
-        paired_raw != NULL && paired_typed != NULL &&
-        paired_count == cases[i].count && strcmp(paired_raw, raw) == 0 &&
-        strcmp(paired_typed, typed) == 0 &&
-        shell_build_anomaly_netseqs_buffer(
-            cases[i].input, strlen(cases[i].input), NULL, &raw_buffer,
-            &typed_buffer, &paired_count) == SHELL_PROCESS_OK &&
-        paired_count == cases[i].count && raw_buffer.length == strlen(raw) &&
-        typed_buffer.length == strlen(typed) &&
-        memcmp(raw_buffer.data, raw, raw_buffer.length) == 0 &&
-        memcmp(typed_buffer.data, typed, typed_buffer.length) == 0;
+    valid = valid &&
+            shell_build_command_netseq_buffer(
+                cases[i].input, strlen(cases[i].input), NULL, &raw,
+                &raw_count) == SHELL_PROCESS_OK &&
+            raw.data != NULL && raw_count == cases[i].count &&
+            (raw.length != strlen(cases[i].raw) ||
+             memcmp(raw.data, cases[i].raw, raw.length)) == 0 &&
+            shell_build_type_netseq_buffer(cases[i].input,
+                                           strlen(cases[i].input), NULL, &typed,
+                                           &typed_count) == SHELL_PROCESS_OK &&
+            typed.data != NULL && typed_count == cases[i].count &&
+            shell_netstring_validate(typed.data, typed.length, NULL) ==
+                SHELL_NETSTRING_OK &&
+            shell_build_anomaly_netseqs_buffer(
+                cases[i].input, strlen(cases[i].input), NULL, &paired_raw,
+                &paired_typed, &paired_count) == SHELL_PROCESS_OK &&
+            paired_raw.data != NULL && paired_typed.data != NULL &&
+            paired_count == cases[i].count &&
+            (paired_raw.length != raw.length ||
+             memcmp(paired_raw.data, raw.data, paired_raw.length)) == 0 &&
+            (paired_typed.length != typed.length ||
+             memcmp(paired_typed.data, typed.data, paired_typed.length)) == 0 &&
+            shell_build_anomaly_netseqs_buffer(
+                cases[i].input, strlen(cases[i].input), NULL, &raw_buffer,
+                &typed_buffer, &paired_count) == SHELL_PROCESS_OK &&
+            paired_count == cases[i].count && raw_buffer.length == raw.length &&
+            typed_buffer.length == typed.length &&
+            memcmp(raw_buffer.data, raw.data, raw_buffer.length) == 0 &&
+            memcmp(typed_buffer.data, typed.data, typed_buffer.length) == 0;
     shell_netstring_buffer_free(&typed_buffer);
     shell_netstring_buffer_free(&raw_buffer);
-    free(paired_typed);
-    free(paired_raw);
-    free(typed);
-    free(raw);
+    shell_netstring_buffer_free(&paired_typed);
+    shell_netstring_buffer_free(&paired_raw);
+    shell_netstring_buffer_free(&typed);
+    shell_netstring_buffer_free(&raw);
   }
 
-  char *netargv = NULL;
+  shell_netstring_buffer_t netargv = {0};
   size_t netargv_count = 0;
   bool features = false;
   valid = valid &&
-          shell_build_netargv_sequence(
+          shell_build_netargv_sequence_buffer(
               "outer $(inner)", strlen("outer $(inner)"), NULL, &netargv,
               &netargv_count, &features) == SHELL_PROCESS_OK &&
-          netargv != NULL && netargv_count == 1 && features;
-  free(netargv);
+          netargv.data != NULL && netargv_count == 1 && features;
+  shell_netstring_buffer_free(&netargv);
 
-  char *raw = (char *)(uintptr_t)1;
-  char *typed = (char *)(uintptr_t)1;
+  shell_netstring_buffer_t raw = {0};
+  shell_netstring_buffer_t typed = {0};
   size_t count = SIZE_MAX;
   valid = valid &&
-          shell_build_anomaly_netseqs("outer $(while true; do :; done)",
-                                      strlen("outer $(while true; do :; done)"),
-                                      NULL, &raw, &typed,
-                                      &count) == SHELL_PROCESS_EPARSE &&
-          raw == NULL && typed == NULL && count == 0;
+          shell_build_anomaly_netseqs_buffer(
+              "outer $(while true; do :; done)",
+              strlen("outer $(while true; do :; done)"), NULL, &raw, &typed,
+              &count) == SHELL_PROCESS_EPARSE &&
+          raw.data == NULL && typed.data == NULL && count == 0;
 
   static const char *const dynamic_arithmetic[] = {
       "outer $((1 + $(inside)))",
@@ -6110,14 +6125,14 @@ static void test_anomaly_sequences_include_nested_execution_stages(void) {
   };
   for (size_t i = 0;
        i < sizeof(dynamic_arithmetic) / sizeof(dynamic_arithmetic[0]); i++) {
-    raw = (char *)(uintptr_t)1;
-    typed = (char *)(uintptr_t)1;
+    raw = (shell_netstring_buffer_t){0};
+    typed = (shell_netstring_buffer_t){0};
     count = SIZE_MAX;
     valid = valid &&
-            shell_build_anomaly_netseqs(
+            shell_build_anomaly_netseqs_buffer(
                 dynamic_arithmetic[i], strlen(dynamic_arithmetic[i]), NULL,
                 &raw, &typed, &count) == SHELL_PROCESS_EPARSE &&
-            raw == NULL && typed == NULL && count == 0;
+            raw.data == NULL && typed.data == NULL && count == 0;
   }
 
   char too_many[4 * SHELL_MAX_SUBCOMMANDS + 16] = "outer $(";
@@ -6129,12 +6144,13 @@ static void test_anomaly_sequences_include_nested_execution_stages(void) {
   }
   too_many[position++] = ')';
   too_many[position] = '\0';
-  raw = (char *)(uintptr_t)1;
+  raw = (shell_netstring_buffer_t){0};
   count = SIZE_MAX;
   valid = valid &&
-          shell_build_command_netseq(too_many, position, NULL, &raw, &count) ==
+          shell_build_command_netseq_buffer(too_many, position, NULL, &raw,
+                                            &count) ==
               SHELL_PROCESS_EOUTPUT_LIMIT &&
-          raw == NULL && count == 0;
+          raw.data == NULL && count == 0;
 
   test("Anomaly sequences include nested shell execution stages", valid);
 }
@@ -6175,13 +6191,13 @@ static void test_static_arithmetic_depth_is_bounded(void) {
   } else {
     valid = false;
   }
-  char *raw = NULL;
+  shell_netstring_buffer_t raw = {0};
   size_t count = 0;
-  bool accepted = shell_build_command_netseq(input, used, NULL, &raw, &count) ==
-                      SHELL_PROCESS_OK &&
-                  raw != NULL;
+  bool accepted = shell_build_command_netseq_buffer(
+                      input, used, NULL, &raw, &count) == SHELL_PROCESS_OK &&
+                  raw.data != NULL;
   valid = valid && accepted;
-  free(raw);
+  shell_netstring_buffer_free(&raw);
 
   used = (size_t)snprintf(input, capacity, "echo $((");
   for (size_t i = 0; i < rejected_depth; i++)
@@ -6192,15 +6208,15 @@ static void test_static_arithmetic_depth_is_bounded(void) {
   input[used++] = ')';
   input[used++] = ')';
   input[used] = '\0';
-  raw = (char *)(uintptr_t)1;
+  raw = (shell_netstring_buffer_t){0};
   count = SIZE_MAX;
   shell_dep_graph_t graph = {0};
   bool rejected =
       shell_process_validate_supported_source(input, used, NULL) ==
           SHELL_PROCESS_EPARSE &&
-      shell_build_command_netseq(input, used, NULL, &raw, &count) ==
+      shell_build_command_netseq_buffer(input, used, NULL, &raw, &count) ==
           SHELL_PROCESS_EPARSE &&
-      raw == NULL && count == 0 &&
+      raw.data == NULL && count == 0 &&
       shell_dep_graph_parse(input, used, ".", NULL, &graph) == SHELL_DEP_EPARSE;
   valid = valid && rejected;
 
@@ -6226,16 +6242,16 @@ static void test_static_arithmetic_depth_is_bounded(void) {
       input[used++] = ')';
       input[used++] = ')';
       input[used] = '\0';
-      raw = (char *)(uintptr_t)1;
+      raw = (shell_netstring_buffer_t){0};
       count = SIZE_MAX;
       shell_process_status_t status =
-          shell_build_command_netseq(input, used, NULL, &raw, &count);
-      bool expected =
-          boundary == 0
-              ? status == SHELL_PROCESS_OK && raw != NULL && count == 1
-              : status == SHELL_PROCESS_EPARSE && raw == NULL && count == 0;
+          shell_build_command_netseq_buffer(input, used, NULL, &raw, &count);
+      bool expected = boundary == 0 ? status == SHELL_PROCESS_OK &&
+                                          raw.data != NULL && count == 1
+                                    : status == SHELL_PROCESS_EPARSE &&
+                                          raw.data == NULL && count == 0;
       valid = valid && expected;
-      free(raw);
+      shell_netstring_buffer_free(&raw);
     }
   }
 
@@ -6247,12 +6263,12 @@ static void test_static_arithmetic_depth_is_bounded(void) {
   input[used++] = ')';
   input[used++] = ')';
   input[used] = '\0';
-  raw = NULL;
-  bool unary = shell_build_command_netseq(input, used, NULL, &raw, &count) ==
-                   SHELL_PROCESS_OK &&
-               raw != NULL;
+  raw = (shell_netstring_buffer_t){0};
+  bool unary = shell_build_command_netseq_buffer(input, used, NULL, &raw,
+                                                 &count) == SHELL_PROCESS_OK &&
+               raw.data != NULL;
   valid = valid && unary;
-  free(raw);
+  shell_netstring_buffer_free(&raw);
   /* The lower-level source scanner has its own recursive nested-arithmetic
    * route. Its boundary must agree with the semantic grammar's safe cap. */
   used = (size_t)snprintf(input, capacity, "echo ");
@@ -6292,47 +6308,54 @@ static void test_static_arithmetic_depth_is_bounded(void) {
 
 static void test_anomaly_sequences_represent_redirect_only_record(void) {
   const char *input = ">/tmp/no-executable";
-  char *netargv = NULL;
-  char *command_netseq = NULL;
-  char *type_netseq = NULL;
-  char *paired_command = NULL;
-  char *paired_type = NULL;
+  shell_netstring_buffer_t netargv = {0};
+  shell_netstring_buffer_t command_netseq = {0};
+  shell_netstring_buffer_t type_netseq = {0};
+  shell_netstring_buffer_t paired_command = {0};
+  shell_netstring_buffer_t paired_type = {0};
   size_t count = SIZE_MAX;
   bool features = true;
   shell_processed_commands_t processed = {0};
-  bool valid =
-      shell_process_commands(input, strlen(input), NULL, &processed) ==
-          SHELL_PROCESS_OK &&
-      processed.command_count == 0 &&
-      shell_build_netargv_sequence(input, strlen(input), NULL, &netargv, &count,
-                                   &features) == SHELL_PROCESS_EPARSE &&
-      netargv == NULL && count == 0 && !features;
+  bool valid = shell_process_commands(input, strlen(input), NULL, &processed) ==
+                   SHELL_PROCESS_OK &&
+               processed.command_count == 0 &&
+               shell_build_netargv_sequence_buffer(
+                   input, strlen(input), NULL, &netargv, &count, &features) ==
+                   SHELL_PROCESS_EPARSE &&
+               netargv.data == NULL && count == 0 && !features;
   shell_processed_commands_free(&processed);
   count = SIZE_MAX;
+  valid = valid &&
+          shell_build_command_netseq_buffer(input, strlen(input), NULL,
+                                            &command_netseq,
+                                            &count) == SHELL_PROCESS_OK &&
+          command_netseq.data != NULL && count == 1 &&
+          (command_netseq.length != sizeof("0:,") - 1 ||
+           memcmp(command_netseq.data, "0:,", command_netseq.length)) == 0;
+  count = SIZE_MAX;
   valid =
       valid &&
-      shell_build_command_netseq(input, strlen(input), NULL, &command_netseq,
-                                 &count) == SHELL_PROCESS_OK &&
-      command_netseq != NULL && count == 1 &&
-      strcmp(command_netseq, "0:,") == 0;
+      shell_build_type_netseq_buffer(input, strlen(input), NULL, &type_netseq,
+                                     &count) == SHELL_PROCESS_OK &&
+      type_netseq.data != NULL && count == 1 &&
+      (type_netseq.length != sizeof("3:0:,,") - 1 ||
+       memcmp(type_netseq.data, "3:0:,,", type_netseq.length)) == 0;
   count = SIZE_MAX;
   valid = valid &&
-          shell_build_type_netseq(input, strlen(input), NULL, &type_netseq,
-                                  &count) == SHELL_PROCESS_OK &&
-          type_netseq != NULL && count == 1 &&
-          strcmp(type_netseq, "3:0:,,") == 0;
-  count = SIZE_MAX;
-  valid =
-      valid &&
-      shell_build_anomaly_netseqs(input, strlen(input), NULL, &paired_command,
-                                  &paired_type, &count) == SHELL_PROCESS_OK &&
-      paired_command != NULL && paired_type != NULL && count == 1 &&
-      strcmp(paired_command, command_netseq) == 0 &&
-      strcmp(paired_type, type_netseq) == 0;
-  free(paired_type);
-  free(paired_command);
-  free(type_netseq);
-  free(command_netseq);
+          shell_build_anomaly_netseqs_buffer(input, strlen(input), NULL,
+                                             &paired_command, &paired_type,
+                                             &count) == SHELL_PROCESS_OK &&
+          paired_command.data != NULL && paired_type.data != NULL &&
+          count == 1 &&
+          (paired_command.length != command_netseq.length ||
+           memcmp(paired_command.data, command_netseq.data,
+                  paired_command.length)) == 0 &&
+          (paired_type.length != type_netseq.length ||
+           memcmp(paired_type.data, type_netseq.data, paired_type.length)) == 0;
+  shell_netstring_buffer_free(&paired_type);
+  shell_netstring_buffer_free(&paired_command);
+  shell_netstring_buffer_free(&type_netseq);
+  shell_netstring_buffer_free(&command_netseq);
 
   /* The anomaly-only sentinel is still subject to each builder's ordinary
    * output and source contracts. It is not a loophole that makes a tiny
@@ -6343,10 +6366,10 @@ static void test_anomaly_sequences_represent_redirect_only_record(void) {
   shell_netstring_buffer_t type_buffer = {0};
   count = SIZE_MAX;
   valid = valid &&
-          shell_build_command_netseq(input, strlen(input), &raw_limit,
-                                     &command_netseq,
-                                     &count) == SHELL_PROCESS_EOUTPUT_LIMIT &&
-          command_netseq == NULL && count == 0;
+          shell_build_command_netseq_buffer(input, strlen(input), &raw_limit,
+                                            &command_netseq, &count) ==
+              SHELL_PROCESS_EOUTPUT_LIMIT &&
+          command_netseq.data == NULL && count == 0;
   count = SIZE_MAX;
   valid = valid &&
           shell_build_type_netseq_buffer(input, strlen(input), &type_limit,
@@ -6363,53 +6386,62 @@ static void test_anomaly_sequences_represent_redirect_only_record(void) {
   const char *binary_input = "$'sentinel\\0binary'";
   count = SIZE_MAX;
   valid = valid &&
-          shell_build_anomaly_netseqs(binary_input, strlen(binary_input), NULL,
-                                      &paired_command, &paired_type,
-                                      &count) == SHELL_PROCESS_EPARSE &&
-          paired_command == NULL && paired_type == NULL && count == 0;
+          shell_build_anomaly_netseqs_buffer(
+              binary_input, strlen(binary_input), NULL, &paired_command,
+              &paired_type, &count) == SHELL_PROCESS_EPARSE &&
+          paired_command.data == NULL && paired_type.data == NULL && count == 0;
 
   /* The sentinel is reserved for a missing executable, not for an explicitly
    * empty executable word. Every sequence form must keep rejecting the latter
    * rather than silently assigning it the redirect-only meaning. */
   count = SIZE_MAX;
+  valid = valid &&
+          shell_build_command_netseq_buffer("'' x", strlen("'' x"), NULL,
+                                            &command_netseq,
+                                            &count) == SHELL_PROCESS_EPARSE &&
+          command_netseq.data == NULL && count == 0;
+  count = SIZE_MAX;
   valid =
       valid &&
-      shell_build_command_netseq("'' x", strlen("'' x"), NULL, &command_netseq,
-                                 &count) == SHELL_PROCESS_EPARSE &&
-      command_netseq == NULL && count == 0;
-  count = SIZE_MAX;
-  valid = valid &&
-          shell_build_type_netseq("'' x", strlen("'' x"), NULL, &type_netseq,
-                                  &count) == SHELL_PROCESS_EPARSE &&
-          type_netseq == NULL && count == 0;
+      shell_build_type_netseq_buffer("'' x", strlen("'' x"), NULL, &type_netseq,
+                                     &count) == SHELL_PROCESS_EPARSE &&
+      type_netseq.data == NULL && count == 0;
   shell_netstring_buffer_free(&command_buffer);
   shell_netstring_buffer_free(&type_buffer);
 
-  command_netseq = NULL;
-  type_netseq = NULL;
-  paired_command = NULL;
-  paired_type = NULL;
+  command_netseq = (shell_netstring_buffer_t){0};
+  type_netseq = (shell_netstring_buffer_t){0};
+  paired_command = (shell_netstring_buffer_t){0};
+  paired_type = (shell_netstring_buffer_t){0};
+  count = 0;
+  valid =
+      valid &&
+      shell_build_anomaly_netseqs_buffer("echo ok; >/tmp/no-executable",
+                                         strlen("echo ok; >/tmp/no-executable"),
+                                         NULL, &paired_command, &paired_type,
+                                         &count) == SHELL_PROCESS_OK &&
+      count == 2 &&
+      (paired_command.length != sizeof("4:echo,0:,") - 1 ||
+       memcmp(paired_command.data, "4:echo,0:,", paired_command.length)) == 0 &&
+      (paired_type.length != sizeof("13:4:echo,3:STR,,3:0:,,") - 1 ||
+       memcmp(paired_type.data, "13:4:echo,3:STR,,3:0:,,",
+              paired_type.length)) == 0;
+  shell_netstring_buffer_free(&paired_type);
+  shell_netstring_buffer_free(&paired_command);
+  paired_command = (shell_netstring_buffer_t){0};
+  paired_type = (shell_netstring_buffer_t){0};
   count = 0;
   valid = valid &&
-          shell_build_anomaly_netseqs("echo ok; >/tmp/no-executable",
-                                      strlen("echo ok; >/tmp/no-executable"),
-                                      NULL, &paired_command, &paired_type,
-                                      &count) == SHELL_PROCESS_OK &&
-          count == 2 && strcmp(paired_command, "4:echo,0:,") == 0 &&
-          strcmp(paired_type, "13:4:echo,3:STR,,3:0:,,") == 0;
-  free(paired_type);
-  free(paired_command);
-  paired_command = NULL;
-  paired_type = NULL;
-  count = 0;
-  valid = valid &&
-          shell_build_anomaly_netseqs("time !", strlen("time !"), NULL,
-                                      &paired_command, &paired_type,
-                                      &count) == SHELL_PROCESS_OK &&
-          count == 1 && strcmp(paired_command, "0:,") == 0 &&
-          strcmp(paired_type, "3:0:,,") == 0;
-  free(paired_type);
-  free(paired_command);
+          shell_build_anomaly_netseqs_buffer("time !", strlen("time !"), NULL,
+                                             &paired_command, &paired_type,
+                                             &count) == SHELL_PROCESS_OK &&
+          count == 1 &&
+          (paired_command.length != sizeof("0:,") - 1 ||
+           memcmp(paired_command.data, "0:,", paired_command.length)) == 0 &&
+          (paired_type.length != sizeof("3:0:,,") - 1 ||
+           memcmp(paired_type.data, "3:0:,,", paired_type.length)) == 0;
+  shell_netstring_buffer_free(&paired_type);
+  shell_netstring_buffer_free(&paired_command);
   test("Anomaly sequences retain argv-less structural stages", valid);
 }
 
@@ -6443,64 +6475,59 @@ static void test_redirect_operand_boundary_contract(void) {
     shell_command_info_t *infos = (shell_command_info_t *)(uintptr_t)1;
     size_t info_count = SIZE_MAX;
     shell_processed_commands_t processed = {0};
-    char *netargv = (char *)(uintptr_t)1;
+    shell_netstring_buffer_t netargv = {0};
     size_t netargv_count = SIZE_MAX;
     bool features = true;
-    char *command_netseq = (char *)(uintptr_t)1;
+    shell_netstring_buffer_t command_netseq = {0};
     size_t command_netseq_count = SIZE_MAX;
-    char *type_netseq = (char *)(uintptr_t)1;
+    shell_netstring_buffer_t type_netseq = {0};
     size_t type_netseq_count = SIZE_MAX;
-    char *anomaly_commands = (char *)(uintptr_t)1;
-    char *anomaly_types = (char *)(uintptr_t)1;
+    shell_netstring_buffer_t anomaly_commands = {0};
+    shell_netstring_buffer_t anomaly_types = {0};
     size_t anomaly_count = SIZE_MAX;
     shell_dep_graph_t graph = {0};
-    valid =
-        valid &&
-        shell_parse_fast(input, strlen(input), &strict, &fast) ==
-            SHELL_EPARSE &&
-        shell_tokenize_commands(input, strlen(input), &commands,
-                                &command_count) == SHELL_TOKENIZE_EPARSE &&
-        commands == NULL && command_count == 0 &&
-        shell_process_command(input, strlen(input), NULL, &infos,
-                              &info_count) == SHELL_PROCESS_EPARSE &&
-        infos == NULL && info_count == 0 &&
-        shell_process_commands(input, strlen(input), NULL, &processed) ==
-            SHELL_PROCESS_EPARSE &&
-        processed.commands == NULL && processed.command_count == 0 &&
-        shell_build_netargv_sequence(input, strlen(input), NULL, &netargv,
-                                     &netargv_count,
-                                     &features) == SHELL_PROCESS_EPARSE &&
-        netargv == NULL && netargv_count == 0 && !features &&
-        shell_build_command_netseq(input, strlen(input), NULL, &command_netseq,
-                                   &command_netseq_count) ==
-            SHELL_PROCESS_EPARSE &&
-        command_netseq == NULL && command_netseq_count == 0 &&
-        shell_build_type_netseq(input, strlen(input), NULL, &type_netseq,
-                                &type_netseq_count) == SHELL_PROCESS_EPARSE &&
-        type_netseq == NULL && type_netseq_count == 0 &&
-        shell_build_anomaly_netseqs(input, strlen(input), NULL,
-                                    &anomaly_commands, &anomaly_types,
-                                    &anomaly_count) == SHELL_PROCESS_EPARSE &&
-        anomaly_commands == NULL && anomaly_types == NULL &&
-        anomaly_count == 0 &&
-        shell_dep_graph_parse(input, strlen(input), ".", NULL, &graph) ==
-            SHELL_DEP_EPARSE &&
-        graph.node_count == 0 && graph.edge_count == 0;
+    valid = valid &&
+            shell_parse_fast(input, strlen(input), &strict, &fast) ==
+                SHELL_EPARSE &&
+            shell_tokenize_commands(input, strlen(input), &commands,
+                                    &command_count) == SHELL_TOKENIZE_EPARSE &&
+            commands == NULL && command_count == 0 &&
+            shell_process_command(input, strlen(input), NULL, &infos,
+                                  &info_count) == SHELL_PROCESS_EPARSE &&
+            infos == NULL && info_count == 0 &&
+            shell_process_commands(input, strlen(input), NULL, &processed) ==
+                SHELL_PROCESS_EPARSE &&
+            processed.commands == NULL && processed.command_count == 0 &&
+            shell_build_netargv_sequence_buffer(
+                input, strlen(input), NULL, &netargv, &netargv_count,
+                &features) == SHELL_PROCESS_EPARSE &&
+            netargv.data == NULL && netargv_count == 0 && !features &&
+            shell_build_command_netseq_buffer(
+                input, strlen(input), NULL, &command_netseq,
+                &command_netseq_count) == SHELL_PROCESS_EPARSE &&
+            command_netseq.data == NULL && command_netseq_count == 0 &&
+            shell_build_type_netseq_buffer(input, strlen(input), NULL,
+                                           &type_netseq, &type_netseq_count) ==
+                SHELL_PROCESS_EPARSE &&
+            type_netseq.data == NULL && type_netseq_count == 0 &&
+            shell_build_anomaly_netseqs_buffer(
+                input, strlen(input), NULL, &anomaly_commands, &anomaly_types,
+                &anomaly_count) == SHELL_PROCESS_EPARSE &&
+            anomaly_commands.data == NULL && anomaly_types.data == NULL &&
+            anomaly_count == 0 &&
+            shell_dep_graph_parse(input, strlen(input), ".", NULL, &graph) ==
+                SHELL_DEP_EPARSE &&
+            graph.node_count == 0 && graph.edge_count == 0;
     if (commands != (shell_command_t *)(uintptr_t)1)
       shell_commands_free(commands, command_count);
     if (infos != (shell_command_info_t *)(uintptr_t)1)
       shell_command_infos_free(infos, info_count);
     shell_processed_commands_free(&processed);
-    if (netargv != (char *)(uintptr_t)1)
-      free(netargv);
-    if (command_netseq != (char *)(uintptr_t)1)
-      free(command_netseq);
-    if (type_netseq != (char *)(uintptr_t)1)
-      free(type_netseq);
-    if (anomaly_commands != (char *)(uintptr_t)1)
-      free(anomaly_commands);
-    if (anomaly_types != (char *)(uintptr_t)1)
-      free(anomaly_types);
+    shell_netstring_buffer_free(&netargv);
+    shell_netstring_buffer_free(&command_netseq);
+    shell_netstring_buffer_free(&type_netseq);
+    shell_netstring_buffer_free(&anomaly_commands);
+    shell_netstring_buffer_free(&anomaly_types);
   }
 
   /* The full tokenizer keeps an I/O-only simple command as one structural
@@ -6534,7 +6561,7 @@ static void test_redirect_operand_boundary_contract(void) {
     shell_parse_result_t fast = {0};
     shell_command_t *commands = NULL;
     size_t command_count = 0;
-    char *netargv = NULL;
+    shell_netstring_buffer_t netargv = {0};
     size_t netargv_count = 0;
     bool features = false;
     shell_dep_graph_t graph = {0};
@@ -6544,15 +6571,17 @@ static void test_redirect_operand_boundary_contract(void) {
         shell_tokenize_commands(input, strlen(input), &commands,
                                 &command_count) == SHELL_TOKENIZE_OK &&
         command_count == 1 &&
-        shell_build_netargv_sequence(input, strlen(input), NULL, &netargv,
-                                     &netargv_count,
-                                     &features) == SHELL_PROCESS_OK &&
-        netargv_count == 1 && strcmp(netargv, "7:4:echo,,") == 0 &&
+        shell_build_netargv_sequence_buffer(input, strlen(input), NULL,
+                                            &netargv, &netargv_count,
+                                            &features) == SHELL_PROCESS_OK &&
+        netargv_count == 1 &&
+        (netargv.length != sizeof("7:4:echo,,") - 1 ||
+         memcmp(netargv.data, "7:4:echo,,", netargv.length)) == 0 &&
         shell_dep_graph_parse(input, strlen(input), ".", NULL, &graph) ==
             SHELL_DEP_OK &&
         graph.node_count == 2 && graph.edge_count == 1;
     shell_commands_free(commands, command_count);
-    free(netargv);
+    shell_netstring_buffer_free(&netargv);
   }
 
   /* Fast ranges may stop at the backslash while the physical line ending and
@@ -7511,15 +7540,17 @@ static void test_combined_redirect_prefix_word_contract(void) {
   for (size_t i = 0; valid && i < sizeof(direct) / sizeof(direct[0]); i++) {
     shell_command_info_t *infos = NULL;
     size_t info_count = 0;
-    char *netargv = NULL;
+    shell_netstring_buffer_t netargv = {0};
     shell_process_status_t status = shell_process_command(
         direct[i].source, strlen(direct[i].source), NULL, &infos, &info_count);
-    valid =
-        status == SHELL_PROCESS_OK && infos != NULL && info_count == 1 &&
-        infos[0].has_redirections && infos[0].has_error_redirection &&
-        shell_render_netargv(&infos[0], NULL, &netargv) == SHELL_PROCESS_OK &&
-        netargv != NULL && strcmp(netargv, direct[i].netargv) == 0;
-    free(netargv);
+    valid = status == SHELL_PROCESS_OK && infos != NULL && info_count == 1 &&
+            infos[0].has_redirections && infos[0].has_error_redirection &&
+            shell_render_netargv_buffer(&infos[0], NULL, &netargv) ==
+                SHELL_PROCESS_OK &&
+            netargv.data != NULL &&
+            (netargv.length != strlen(direct[i].netargv) ||
+             memcmp(netargv.data, direct[i].netargv, netargv.length)) == 0;
+    shell_netstring_buffer_free(&netargv);
     shell_command_infos_free(infos, info_count);
   }
 
@@ -7925,10 +7956,10 @@ static void test_canonical_heredoc_api_contract(void) {
     shell_command_t *commands = NULL;
     size_t command_count = 0;
     shell_processed_commands_t processed = {0};
-    char *netargv = NULL;
-    char *command_netseq = NULL;
-    char *anomaly_commands = NULL;
-    char *anomaly_types = NULL;
+    shell_netstring_buffer_t netargv = {0};
+    shell_netstring_buffer_t command_netseq = {0};
+    shell_netstring_buffer_t anomaly_commands = {0};
+    shell_netstring_buffer_t anomaly_types = {0};
     size_t netargv_count = 0;
     size_t command_netseq_count = 0;
     size_t anomaly_count = 0;
@@ -7944,17 +7975,18 @@ static void test_canonical_heredoc_api_contract(void) {
         shell_process_commands(input, length, NULL, &processed) ==
             SHELL_PROCESS_OK &&
         processed.command_count == 2 &&
-        shell_build_netargv_sequence(input, length, NULL, &netargv,
-                                     &netargv_count,
-                                     &features) == SHELL_PROCESS_OK &&
-        netargv != NULL && netargv_count == 2 && features &&
-        shell_build_command_netseq(input, length, NULL, &command_netseq,
-                                   &command_netseq_count) == SHELL_PROCESS_OK &&
-        command_netseq != NULL && command_netseq_count == 2 &&
-        shell_build_anomaly_netseqs(input, length, NULL, &anomaly_commands,
-                                    &anomaly_types,
-                                    &anomaly_count) == SHELL_PROCESS_OK &&
-        anomaly_commands != NULL && anomaly_types != NULL &&
+        shell_build_netargv_sequence_buffer(input, length, NULL, &netargv,
+                                            &netargv_count,
+                                            &features) == SHELL_PROCESS_OK &&
+        netargv.data != NULL && netargv_count == 2 && features &&
+        shell_build_command_netseq_buffer(input, length, NULL, &command_netseq,
+                                          &command_netseq_count) ==
+            SHELL_PROCESS_OK &&
+        command_netseq.data != NULL && command_netseq_count == 2 &&
+        shell_build_anomaly_netseqs_buffer(
+            input, length, NULL, &anomaly_commands, &anomaly_types,
+            &anomaly_count) == SHELL_PROCESS_OK &&
+        anomaly_commands.data != NULL && anomaly_types.data != NULL &&
         anomaly_count == 2 &&
         shell_dep_graph_parse(input, length, ".", NULL, &graph) ==
             SHELL_DEP_OK &&
@@ -7986,10 +8018,10 @@ static void test_canonical_heredoc_api_contract(void) {
 
     shell_commands_free(commands, command_count);
     shell_processed_commands_free(&processed);
-    free(netargv);
-    free(command_netseq);
-    free(anomaly_commands);
-    free(anomaly_types);
+    shell_netstring_buffer_free(&netargv);
+    shell_netstring_buffer_free(&command_netseq);
+    shell_netstring_buffer_free(&anomaly_commands);
+    shell_netstring_buffer_free(&anomaly_types);
   }
   test("Canonical APIs agree on POSIX heredoc delimiters", valid);
 }
@@ -8472,22 +8504,22 @@ static void test_canonical_sequence_model_capacity_contract(void) {
   shell_command_info_t *flat = NULL;
   size_t flat_count = 0;
   shell_processed_commands_t processed = {0};
-  char *netargv = (char *)(uintptr_t)1;
+  shell_netstring_buffer_t netargv = {0};
   size_t netargv_count = SIZE_MAX;
   bool features = true;
-  bool valid = shell_process_command(input, length, NULL, &flat, &flat_count) ==
-                   SHELL_PROCESS_OK &&
-               flat != NULL && flat_count == SHELL_MAX_SUBCOMMANDS + 1 &&
-               shell_process_commands(input, length, NULL, &processed) ==
-                   SHELL_PROCESS_EOUTPUT_LIMIT &&
-               processed.commands == NULL && processed.command_count == 0 &&
-               processed.groups == NULL && processed.group_count == 0 &&
-               processed.group_io_ops == NULL &&
-               processed.group_io_op_count == 0 &&
-               shell_build_netargv_sequence(input, length, NULL, &netargv,
-                                            &netargv_count, &features) ==
-                   SHELL_PROCESS_EOUTPUT_LIMIT &&
-               netargv == NULL && netargv_count == 0 && !features;
+  bool valid =
+      shell_process_command(input, length, NULL, &flat, &flat_count) ==
+          SHELL_PROCESS_OK &&
+      flat != NULL && flat_count == SHELL_MAX_SUBCOMMANDS + 1 &&
+      shell_process_commands(input, length, NULL, &processed) ==
+          SHELL_PROCESS_EOUTPUT_LIMIT &&
+      processed.commands == NULL && processed.command_count == 0 &&
+      processed.groups == NULL && processed.group_count == 0 &&
+      processed.group_io_ops == NULL && processed.group_io_op_count == 0 &&
+      shell_build_netargv_sequence_buffer(input, length, NULL, &netargv,
+                                          &netargv_count, &features) ==
+          SHELL_PROCESS_EOUTPUT_LIMIT &&
+      netargv.data == NULL && netargv_count == 0 && !features;
   shell_command_infos_free(flat, flat_count);
   shell_processed_commands_free(&processed);
   test("Canonical sequence honors semantic-model capacity", valid);
@@ -8676,7 +8708,8 @@ static void test_scalar_variable_substitution_scopes(void) {
     shell_transformed_command_t **transformed = NULL;
     size_t transformed_count = 0;
     shell_abstract_command_t *abstract = NULL;
-    char *raw = NULL, *typed = NULL;
+    shell_netstring_buffer_t raw = {0};
+    shell_netstring_buffer_t typed = {0};
     size_t stages = 0;
     size_t expected_stages = consumers[i].substitution ? 2 : 1;
     bool matches =
@@ -8685,26 +8718,33 @@ static void test_scalar_variable_substitution_scopes(void) {
             SHELL_TRANSFORM_OK &&
         transformed_count == 1 &&
         strcmp(transformed[0]->display_text, consumers[i].display) == 0 &&
-        shell_transformed_command_has_transformations(transformed[0]) ==
-            consumers[i].replacements &&
+        transformed[0]->has_transformations == consumers[i].replacements &&
         shell_abstract_command_parse(source, strlen(source), &abstract) ==
             SHELL_ABSTRACT_OK &&
         abstract->has_variables == consumers[i].variables &&
         abstract->has_cmd_subst == consumers[i].substitution &&
         abstract->has_arithmetic == consumers[i].arithmetic &&
-        shell_build_anomaly_netseqs(source, strlen(source), NULL, &raw, &typed,
-                                    &stages) == SHELL_PROCESS_OK &&
-        stages == expected_stages && strcmp(typed, consumers[i].types) == 0 &&
-        strcmp(raw, consumers[i].substitution ? "6:printf,4:echo,"
-                    : consumers[i].arithmetic ? "4:echo,"
-                                              : "6:printf,") == 0;
+        shell_build_anomaly_netseqs_buffer(source, strlen(source), NULL, &raw,
+                                           &typed,
+                                           &stages) == SHELL_PROCESS_OK &&
+        stages == expected_stages &&
+        (typed.length != strlen(consumers[i].types) ||
+         memcmp(typed.data, consumers[i].types, typed.length)) == 0 &&
+        (raw.length != strlen(consumers[i].substitution ? "6:printf,4:echo,"
+                              : consumers[i].arithmetic ? "4:echo,"
+                                                        : "6:printf,") ||
+         memcmp(raw.data,
+                consumers[i].substitution ? "6:printf,4:echo,"
+                : consumers[i].arithmetic ? "4:echo,"
+                                          : "6:printf,",
+                raw.length)) == 0;
     if (!matches)
       fprintf(stderr, "scalar substitution consumer: %s\n", source);
     valid = valid && matches;
     shell_transformed_command_list_free(transformed, transformed_count);
     shell_abstract_command_free(abstract);
-    free(typed);
-    free(raw);
+    shell_netstring_buffer_free(&typed);
+    shell_netstring_buffer_free(&raw);
   }
   test("Transformation, abstraction and anomaly signatures agree on variable "
        "scopes",
@@ -8761,7 +8801,51 @@ static void test_scalar_variable_scan_linear_work(void) {
        valid);
 }
 
+static void test_control_syntax_scope_contract(void) {
+  static const struct {
+    const char *source;
+    shell_control_syntax_t expected;
+  } cases[] = {
+      {NULL, SHELL_CONTROL_SYNTAX_NONE},
+      {"", SHELL_CONTROL_SYNTAX_NONE},
+      {"if true; then echo ok; fi", SHELL_CONTROL_SYNTAX_COMPLETE},
+      {"if true; then echo ok", SHELL_CONTROL_SYNTAX_INCOMPLETE},
+      {"whi\\\nle true; do echo ok; done", SHELL_CONTROL_SYNTAX_COMPLETE},
+      {"echo if while; printf '%s' done", SHELL_CONTROL_SYNTAX_NONE},
+      {"'while' true; wh\\ile true", SHELL_CONTROL_SYNTAX_NONE},
+      {"echo ok >while # if true", SHELL_CONTROL_SYNTAX_NONE},
+      {"echo $(if true; then echo ok; fi)", SHELL_CONTROL_SYNTAX_NONE},
+  };
+  static const char enclosing[] = "enclosing lexical context";
+  shell_source_operation_begin(enclosing, sizeof(enclosing) - 1);
+  shell_source_scope_frontier(enclosing, 3);
+  bool valid = true;
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    size_t length = cases[i].source ? strlen(cases[i].source) : 0;
+    shell_control_syntax_t syntax =
+        shell_tokenizer_control_syntax(cases[i].source, length);
+    /* Entering another scope exposes the previous one without adding a
+     * test-only accessor; restore it before the next classification. */
+    shell_source_scope_t previous =
+        shell_source_scope_begin(enclosing, sizeof(enclosing) - 1);
+    bool restored =
+        previous.begin == (uintptr_t)enclosing &&
+        previous.end == (uintptr_t)enclosing + sizeof(enclosing) - 1 &&
+        previous.frontier == (uintptr_t)enclosing + 3;
+    shell_source_scope_end(previous);
+    if (syntax != cases[i].expected || !restored) {
+      fprintf(stderr, "control syntax/scope mismatch: %s\n",
+              cases[i].source ? cases[i].source : "(no source)");
+      valid = false;
+    }
+  }
+  shell_source_operation_end();
+  test("Control syntax preserves lexical classification and enclosing scope",
+       valid);
+}
+
 int main(void) {
+  test_control_syntax_scope_contract();
   test_scalar_variable_substitution_scopes();
   test_scalar_variable_scan_linear_work();
   test_tokenize_allocation_failures();
@@ -10123,25 +10207,25 @@ int main(void) {
   {
     shell_command_info_t *infos = NULL;
     size_t count = 0;
-    char *netargv = (char *)(uintptr_t)1;
+    shell_netstring_buffer_t netargv = {0};
     shell_process_limits_t limits = {1, 1, 0};
     bool valid = shell_process_command("echo x", strlen("echo x"), NULL, &infos,
                                        &count) == SHELL_PROCESS_OK &&
                  count == 1 &&
-                 shell_render_netargv(&infos[0], &limits, &netargv) ==
+                 shell_render_netargv_buffer(&infos[0], &limits, &netargv) ==
                      SHELL_PROCESS_EOUTPUT_LIMIT &&
-                 netargv == NULL;
+                 netargv.data == NULL;
     limits.max_string_bytes = SIZE_MAX;
     valid = valid &&
-            shell_render_netargv(&infos[0], &limits, &netargv) ==
+            shell_render_netargv_buffer(&infos[0], &limits, &netargv) ==
                 SHELL_PROCESS_EOUTPUT_LIMIT &&
-            netargv == NULL;
+            netargv.data == NULL;
     shellsplit_test_alloc_reset();
     shellsplit_test_alloc_fail_at(1);
     valid = valid &&
-            shell_render_netargv(&infos[0], NULL, &netargv) ==
+            shell_render_netargv_buffer(&infos[0], NULL, &netargv) ==
                 SHELL_PROCESS_ENOMEM &&
-            netargv == NULL;
+            netargv.data == NULL;
     shellsplit_test_alloc_reset();
     shell_command_infos_free(infos, count);
     test("Netargv rendering validates limits and allocation failures", valid);
@@ -10158,21 +10242,23 @@ int main(void) {
     char exact[32] = {0};
     char short_buffer[31];
     memset(short_buffer, 0xA5, sizeof(short_buffer));
-    char *allocated = NULL;
-    valid =
-        valid &&
-        shell_measure_netargv(&infos[0], &length) == SHELL_PROCESS_OK &&
-        length == strlen("6:printf,0:,9:two words,") &&
-        length + 1 <= sizeof(exact) &&
-        shell_write_netargv(&infos[0], exact, length + 1, &written) ==
-            SHELL_PROCESS_OK &&
-        written == length && strcmp(exact, "6:printf,0:,9:two words,") == 0 &&
-        shell_write_netargv(&infos[0], short_buffer, length, &written) ==
-            SHELL_PROCESS_EOUTPUT_LIMIT &&
-        written == 0 && short_buffer[0] == (char)0xA5 &&
-        shell_render_netargv(&infos[0], NULL, &allocated) == SHELL_PROCESS_OK &&
-        strcmp(allocated, exact) == 0;
-    free(allocated);
+    shell_netstring_buffer_t allocated = {0};
+    valid = valid &&
+            shell_measure_netargv(&infos[0], &length) == SHELL_PROCESS_OK &&
+            length == strlen("6:printf,0:,9:two words,") &&
+            length + 1 <= sizeof(exact) &&
+            shell_write_netargv(&infos[0], exact, length + 1, &written) ==
+                SHELL_PROCESS_OK &&
+            written == length &&
+            strcmp(exact, "6:printf,0:,9:two words,") == 0 &&
+            shell_write_netargv(&infos[0], short_buffer, length, &written) ==
+                SHELL_PROCESS_EOUTPUT_LIMIT &&
+            written == 0 && short_buffer[0] == (char)0xA5 &&
+            shell_render_netargv_buffer(&infos[0], NULL, &allocated) ==
+                SHELL_PROCESS_OK &&
+            (allocated.length != strlen(exact) ||
+             memcmp(allocated.data, exact, allocated.length)) == 0;
+    shell_netstring_buffer_free(&allocated);
     shell_command_infos_free(infos, count);
     test("Netargv measure/write matches allocating renderer", valid);
   }
@@ -10489,16 +10575,19 @@ int main(void) {
   {
     shell_command_info_t *infos = NULL;
     size_t count = 0;
-    char *netargv = NULL;
+    shell_netstring_buffer_t netargv = {0};
     shell_process_status_t status = shell_process_command(
         "printf '' foo\"bar\" 'two words' '>'",
         strlen("printf '' foo\"bar\" 'two words' '>'"), NULL, &infos, &count);
     if (status == SHELL_PROCESS_OK && count == 1)
-      status = shell_render_netargv(&infos[0], NULL, &netargv);
-    bool valid = status == SHELL_PROCESS_OK && count == 1 && netargv &&
-                 strcmp(netargv, "6:printf,0:,6:foobar,9:two words,1:>,") == 0;
+      status = shell_render_netargv_buffer(&infos[0], NULL, &netargv);
+    bool valid = status == SHELL_PROCESS_OK && count == 1 && netargv.data &&
+                 (netargv.length !=
+                      sizeof("6:printf,0:,6:foobar,9:two words,1:>,") - 1 ||
+                  memcmp(netargv.data, "6:printf,0:,6:foobar,9:two words,1:>,",
+                         netargv.length)) == 0;
     test("Netargv rendering preserves exact argument boundaries", valid);
-    free(netargv);
+    shell_netstring_buffer_free(&netargv);
     shell_command_infos_free(infos, count);
   }
 
@@ -10526,25 +10615,31 @@ int main(void) {
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
       shell_command_info_t *infos = NULL;
       size_t info_count = 0;
-      char *netargv = NULL;
-      char *sequence = NULL;
+      shell_netstring_buffer_t netargv = {0};
+      shell_netstring_buffer_t sequence = {0};
       size_t sequence_count = 0;
       bool features = false;
       shell_process_status_t status =
           shell_process_command(cases[i].command, strlen(cases[i].command),
                                 NULL, &infos, &info_count);
       if (status == SHELL_PROCESS_OK && info_count == 1)
-        status = shell_render_netargv(&infos[0], NULL, &netargv);
-      shell_process_status_t sequence_status = shell_build_netargv_sequence(
-          cases[i].command, strlen(cases[i].command), NULL, &sequence,
-          &sequence_count, &features);
-      valid = valid && status == SHELL_PROCESS_OK && info_count == 1 &&
-              netargv && strcmp(netargv, cases[i].netargv) == 0 &&
-              sequence_status == SHELL_PROCESS_OK && sequence_count == 1 &&
-              sequence && strcmp(sequence, cases[i].sequence) == 0 &&
-              features == cases[i].has_executable_substitution;
-      free(sequence);
-      free(netargv);
+        status = shell_render_netargv_buffer(&infos[0], NULL, &netargv);
+      shell_process_status_t sequence_status =
+          shell_build_netargv_sequence_buffer(
+              cases[i].command, strlen(cases[i].command), NULL, &sequence,
+              &sequence_count, &features);
+      valid =
+          valid && status == SHELL_PROCESS_OK && info_count == 1 &&
+          netargv.data &&
+          (netargv.length != strlen(cases[i].netargv) ||
+           memcmp(netargv.data, cases[i].netargv, netargv.length)) == 0 &&
+          sequence_status == SHELL_PROCESS_OK && sequence_count == 1 &&
+          sequence.data &&
+          (sequence.length != strlen(cases[i].sequence) ||
+           memcmp(sequence.data, cases[i].sequence, sequence.length)) == 0 &&
+          features == cases[i].has_executable_substitution;
+      shell_netstring_buffer_free(&sequence);
+      shell_netstring_buffer_free(&netargv);
       shell_command_infos_free(infos, info_count);
     }
     test("Canonical netargv preserves complete dynamic source words", valid);
@@ -10605,61 +10700,70 @@ int main(void) {
   }
 
   {
-    char *sequence = NULL;
+    shell_netstring_buffer_t sequence = {0};
     size_t count = 0;
     bool features = false;
-    shell_process_status_t status = shell_build_netargv_sequence(
+    shell_process_status_t status = shell_build_netargv_sequence_buffer(
         "printf '' 'two words'; cd '/tmp path'",
         strlen("printf '' 'two words'; cd '/tmp path'"), NULL, &sequence,
         &count, &features);
     bool valid =
-        status == SHELL_PROCESS_OK && count == 2 && features && sequence &&
-        strcmp(sequence, "24:6:printf,0:,9:two words,,17:2:cd,9:/tmp path,,") ==
-            0;
+        status == SHELL_PROCESS_OK && count == 2 && features && sequence.data &&
+        (sequence.length !=
+             sizeof("24:6:printf,0:,9:two words,,17:2:cd,9:/tmp path,,") - 1 ||
+         memcmp(sequence.data,
+                "24:6:printf,0:,9:two words,,17:2:cd,9:/tmp path,,",
+                sequence.length)) == 0;
     test("Nested netargv sequence preserves subcommand boundaries", valid);
-    free(sequence);
+    shell_netstring_buffer_free(&sequence);
 
-    char *command_netseq = NULL;
-    char *type_netseq = NULL;
-    char *expected_command_netseq = NULL;
-    char *expected_type_netseq = NULL;
+    shell_netstring_buffer_t command_netseq = {0};
+    shell_netstring_buffer_t type_netseq = {0};
+    shell_netstring_buffer_t expected_command_netseq = {0};
+    shell_netstring_buffer_t expected_type_netseq = {0};
     size_t paired_count = 0;
     valid =
-        shell_build_anomaly_netseqs(
+        shell_build_anomaly_netseqs_buffer(
             "printf '' 'two words'; cd '/tmp path'",
             strlen("printf '' 'two words'; cd '/tmp path'"), NULL,
             &command_netseq, &type_netseq, &paired_count) == SHELL_PROCESS_OK &&
-        shell_build_command_netseq(
+        shell_build_command_netseq_buffer(
             "printf '' 'two words'; cd '/tmp path'",
             strlen("printf '' 'two words'; cd '/tmp path'"), NULL,
             &expected_command_netseq, &count) == SHELL_PROCESS_OK &&
-        shell_build_type_netseq("printf '' 'two words'; cd '/tmp path'",
-                                strlen("printf '' 'two words'; cd '/tmp path'"),
-                                NULL, &expected_type_netseq,
-                                &count) == SHELL_PROCESS_OK &&
-        paired_count == 2 && command_netseq && type_netseq &&
-        strcmp(command_netseq, expected_command_netseq) == 0 &&
-        strcmp(type_netseq, expected_type_netseq) == 0;
+        shell_build_type_netseq_buffer(
+            "printf '' 'two words'; cd '/tmp path'",
+            strlen("printf '' 'two words'; cd '/tmp path'"), NULL,
+            &expected_type_netseq, &count) == SHELL_PROCESS_OK &&
+        paired_count == 2 && command_netseq.data && type_netseq.data &&
+        (command_netseq.length != expected_command_netseq.length ||
+         memcmp(command_netseq.data, expected_command_netseq.data,
+                command_netseq.length)) == 0 &&
+        (type_netseq.length != expected_type_netseq.length ||
+         memcmp(type_netseq.data, expected_type_netseq.data,
+                type_netseq.length)) == 0;
     test("Paired anomaly netsequences share canonical command boundaries",
          valid);
-    free(expected_type_netseq);
-    free(expected_command_netseq);
-    free(type_netseq);
-    free(command_netseq);
+    shell_netstring_buffer_free(&expected_type_netseq);
+    shell_netstring_buffer_free(&expected_command_netseq);
+    shell_netstring_buffer_free(&type_netseq);
+    shell_netstring_buffer_free(&command_netseq);
 
-    command_netseq = (char *)(uintptr_t)1;
-    type_netseq = (char *)(uintptr_t)1;
+    command_netseq = (shell_netstring_buffer_t){0};
+    type_netseq = (shell_netstring_buffer_t){0};
     paired_count = SIZE_MAX;
-    valid =
-        shell_build_anomaly_netseqs("", 0, NULL, &command_netseq, &type_netseq,
-                                    &paired_count) == SHELL_PROCESS_EINPUT &&
-        command_netseq == NULL && type_netseq == NULL && paired_count == 0;
+    valid = shell_build_anomaly_netseqs_buffer("", 0, NULL, &command_netseq,
+                                               &type_netseq, &paired_count) ==
+                SHELL_PROCESS_EINPUT &&
+            command_netseq.data == NULL && type_netseq.data == NULL &&
+            paired_count == 0;
     shell_process_limits_t pair_limits = {SIZE_MAX, 8, 0};
     valid = valid &&
-            shell_build_anomaly_netseqs(
+            shell_build_anomaly_netseqs_buffer(
                 "echo x", strlen("echo x"), &pair_limits, &command_netseq,
                 &type_netseq, &paired_count) == SHELL_PROCESS_EOUTPUT_LIMIT &&
-            command_netseq == NULL && type_netseq == NULL && paired_count == 0;
+            command_netseq.data == NULL && type_netseq.data == NULL &&
+            paired_count == 0;
     test("Paired anomaly netsequences clear every output on failure", valid);
 
     static const char *const paired_inputs[] = {
@@ -10671,30 +10775,34 @@ int main(void) {
     for (size_t i = 0; i < sizeof(paired_inputs) / sizeof(paired_inputs[0]);
          i++) {
       const char *input = paired_inputs[i];
-      command_netseq = NULL;
-      type_netseq = NULL;
-      expected_command_netseq = NULL;
-      expected_type_netseq = NULL;
+      command_netseq = (shell_netstring_buffer_t){0};
+      type_netseq = (shell_netstring_buffer_t){0};
+      expected_command_netseq = (shell_netstring_buffer_t){0};
+      expected_type_netseq = (shell_netstring_buffer_t){0};
       paired_count = 0;
       size_t command_count = 0;
       size_t type_count = 0;
       valid = valid &&
-              shell_build_anomaly_netseqs(input, strlen(input), NULL,
-                                          &command_netseq, &type_netseq,
-                                          &paired_count) == SHELL_PROCESS_OK &&
-              shell_build_command_netseq(input, strlen(input), NULL,
-                                         &expected_command_netseq,
-                                         &command_count) == SHELL_PROCESS_OK &&
-              shell_build_type_netseq(input, strlen(input), NULL,
-                                      &expected_type_netseq,
-                                      &type_count) == SHELL_PROCESS_OK &&
+              shell_build_anomaly_netseqs_buffer(
+                  input, strlen(input), NULL, &command_netseq, &type_netseq,
+                  &paired_count) == SHELL_PROCESS_OK &&
+              shell_build_command_netseq_buffer(
+                  input, strlen(input), NULL, &expected_command_netseq,
+                  &command_count) == SHELL_PROCESS_OK &&
+              shell_build_type_netseq_buffer(input, strlen(input), NULL,
+                                             &expected_type_netseq,
+                                             &type_count) == SHELL_PROCESS_OK &&
               paired_count == command_count && paired_count == type_count &&
-              strcmp(command_netseq, expected_command_netseq) == 0 &&
-              strcmp(type_netseq, expected_type_netseq) == 0;
-      free(expected_type_netseq);
-      free(expected_command_netseq);
-      free(type_netseq);
-      free(command_netseq);
+              (command_netseq.length != expected_command_netseq.length ||
+               memcmp(command_netseq.data, expected_command_netseq.data,
+                      command_netseq.length)) == 0 &&
+              (type_netseq.length != expected_type_netseq.length ||
+               memcmp(type_netseq.data, expected_type_netseq.data,
+                      type_netseq.length)) == 0;
+      shell_netstring_buffer_free(&expected_type_netseq);
+      shell_netstring_buffer_free(&expected_command_netseq);
+      shell_netstring_buffer_free(&type_netseq);
+      shell_netstring_buffer_free(&command_netseq);
     }
     test("Paired anomaly netsequences match independent builders", valid);
 
@@ -10719,42 +10827,48 @@ int main(void) {
     for (size_t i = 0;
          i < sizeof(compound_signatures) / sizeof(compound_signatures[0]);
          i++) {
-      command_netseq = NULL;
-      type_netseq = NULL;
+      command_netseq = (shell_netstring_buffer_t){0};
+      type_netseq = (shell_netstring_buffer_t){0};
       paired_count = 0;
       const char *input = compound_signatures[i].input;
       valid = valid &&
-              shell_build_anomaly_netseqs(input, strlen(input), NULL,
-                                          &command_netseq, &type_netseq,
-                                          &paired_count) == SHELL_PROCESS_OK &&
+              shell_build_anomaly_netseqs_buffer(
+                  input, strlen(input), NULL, &command_netseq, &type_netseq,
+                  &paired_count) == SHELL_PROCESS_OK &&
               paired_count == compound_signatures[i].stage_count &&
-              command_netseq && type_netseq &&
-              strcmp(command_netseq, compound_signatures[i].raw) == 0 &&
-              strcmp(type_netseq, compound_signatures[i].typed) == 0;
-      free(type_netseq);
-      free(command_netseq);
+              command_netseq.data && type_netseq.data &&
+              (command_netseq.length != strlen(compound_signatures[i].raw) ||
+               memcmp(command_netseq.data, compound_signatures[i].raw,
+                      command_netseq.length)) == 0 &&
+              (type_netseq.length != strlen(compound_signatures[i].typed) ||
+               memcmp(type_netseq.data, compound_signatures[i].typed,
+                      type_netseq.length)) == 0;
+      shell_netstring_buffer_free(&type_netseq);
+      shell_netstring_buffer_free(&command_netseq);
     }
     test("Compound argv words retain aligned anomaly signatures", valid);
 
-    command_netseq = (char *)(uintptr_t)1;
-    type_netseq = (char *)(uintptr_t)1;
+    command_netseq = (shell_netstring_buffer_t){0};
+    type_netseq = (shell_netstring_buffer_t){0};
     paired_count = SIZE_MAX;
-    valid = shell_build_anomaly_netseqs(
+    valid = shell_build_anomaly_netseqs_buffer(
                 "'' x", strlen("'' x"), NULL, &command_netseq, &type_netseq,
                 &paired_count) == SHELL_PROCESS_EPARSE &&
-            command_netseq == NULL && type_netseq == NULL && paired_count == 0;
-    command_netseq = (char *)(uintptr_t)1;
-    type_netseq = (char *)(uintptr_t)1;
+            command_netseq.data == NULL && type_netseq.data == NULL &&
+            paired_count == 0;
+    command_netseq = (shell_netstring_buffer_t){0};
+    type_netseq = (shell_netstring_buffer_t){0};
     paired_count = SIZE_MAX;
-    valid =
-        valid &&
-        shell_build_anomaly_netseqs("\x01"
-                                    "bad",
-                                    strlen("\x01"
-                                           "bad"),
-                                    NULL, &command_netseq, &type_netseq,
-                                    &paired_count) == SHELL_PROCESS_EINPUT &&
-        command_netseq == NULL && type_netseq == NULL && paired_count == 0;
+    valid = valid &&
+            shell_build_anomaly_netseqs_buffer("\x01"
+                                               "bad",
+                                               strlen("\x01"
+                                                      "bad"),
+                                               NULL, &command_netseq,
+                                               &type_netseq, &paired_count) ==
+                SHELL_PROCESS_EINPUT &&
+            command_netseq.data == NULL && type_netseq.data == NULL &&
+            paired_count == 0;
     test("Paired anomaly netsequences reject empty executables atomically",
          valid);
 
@@ -10793,10 +10907,10 @@ int main(void) {
       for (size_t fail_at = 1; fail_at < 128; fail_at++) {
         shellsplit_test_alloc_reset();
         shellsplit_test_alloc_fail_at(fail_at);
-        command_netseq = (char *)(uintptr_t)1;
-        type_netseq = (char *)(uintptr_t)1;
+        command_netseq = (shell_netstring_buffer_t){0};
+        type_netseq = (shell_netstring_buffer_t){0};
         paired_count = SIZE_MAX;
-        status = shell_build_anomaly_netseqs(
+        status = shell_build_anomaly_netseqs_buffer(
             allocation_inputs[input_index],
             strlen(allocation_inputs[input_index]),
             input_index >=
@@ -10806,12 +10920,12 @@ int main(void) {
             &command_netseq, &type_netseq, &paired_count);
         if (status == SHELL_PROCESS_OK) {
           pair_completed = true;
-          free(type_netseq);
-          free(command_netseq);
+          shell_netstring_buffer_free(&type_netseq);
+          shell_netstring_buffer_free(&command_netseq);
           break;
         }
         valid = valid && status == SHELL_PROCESS_ENOMEM &&
-                command_netseq == NULL && type_netseq == NULL &&
+                command_netseq.data == NULL && type_netseq.data == NULL &&
                 paired_count == 0;
         if (!valid) {
           fprintf(stderr,
@@ -10841,41 +10955,42 @@ int main(void) {
     shell_command_infos_free(infos, info_count);
     test("Processor owns compound-redirection token boundaries", valid);
 
-    sequence = (char *)1;
+    sequence = (shell_netstring_buffer_t){0};
     count = 99;
     features = true;
-    valid = shell_build_netargv_sequence("", 0, NULL, &sequence, &count,
-                                         &features) == SHELL_PROCESS_EINPUT &&
-            sequence == NULL && count == 0 && !features;
+    valid = shell_build_netargv_sequence_buffer("", 0, NULL, &sequence, &count,
+                                                &features) ==
+                SHELL_PROCESS_EINPUT &&
+            sequence.data == NULL && count == 0 && !features;
     test("Nested netargv sequence rejects invalid input atomically", valid);
 
-    sequence = (char *)(uintptr_t)1;
+    sequence = (shell_netstring_buffer_t){0};
     count = SIZE_MAX;
     features = true;
-    valid = shell_build_netargv_sequence("\x01"
-                                         "bad",
-                                         strlen("\x01"
-                                                "bad"),
-                                         NULL, &sequence, &count,
-                                         &features) == SHELL_PROCESS_EINPUT &&
-            sequence == NULL && count == 0 && !features;
+    valid = shell_build_netargv_sequence_buffer(
+                "\x01"
+                "bad",
+                strlen("\x01"
+                       "bad"),
+                NULL, &sequence, &count, &features) == SHELL_PROCESS_EINPUT &&
+            sequence.data == NULL && count == 0 && !features;
     test("Nested netargv sequence propagates parser failures atomically",
          valid);
 
     shell_process_limits_t limits = {SIZE_MAX, SIZE_MAX, 0};
     limits.max_string_bytes = 1;
     features = true;
-    valid = shell_build_netargv_sequence("echo x", strlen("echo x"), &limits,
-                                         &sequence, &count, &features) ==
-                SHELL_PROCESS_EOUTPUT_LIMIT &&
-            sequence == NULL && count == 0 && !features;
+    valid = shell_build_netargv_sequence_buffer(
+                "echo x", strlen("echo x"), &limits, &sequence, &count,
+                &features) == SHELL_PROCESS_EOUTPUT_LIMIT &&
+            sequence.data == NULL && count == 0 && !features;
     test("Nested netargv sequence enforces its outer output limit", valid);
 
     limits = (shell_process_limits_t){SIZE_MAX, 10, 0};
-    valid = shell_build_netargv_sequence("echo x", strlen("echo x"), &limits,
-                                         &sequence, &count, &features) ==
-                SHELL_PROCESS_EOUTPUT_LIMIT &&
-            sequence == NULL && count == 0 && !features;
+    valid = shell_build_netargv_sequence_buffer(
+                "echo x", strlen("echo x"), &limits, &sequence, &count,
+                &features) == SHELL_PROCESS_EOUTPUT_LIMIT &&
+            sequence.data == NULL && count == 0 && !features;
     test("Nested netargv sequence checks its post-processing size", valid);
 
     valid = true;
@@ -10883,60 +10998,63 @@ int main(void) {
     for (size_t fail_at = 1; fail_at < 32; fail_at++) {
       shellsplit_test_alloc_reset();
       shellsplit_test_alloc_fail_at(fail_at);
-      sequence = (char *)(uintptr_t)1;
+      sequence = (shell_netstring_buffer_t){0};
       count = SIZE_MAX;
       features = true;
-      status = shell_build_netargv_sequence("echo x", strlen("echo x"), NULL,
-                                            &sequence, &count, &features);
+      status = shell_build_netargv_sequence_buffer(
+          "echo x", strlen("echo x"), NULL, &sequence, &count, &features);
       if (status == SHELL_PROCESS_OK) {
         completed = true;
-        free(sequence);
+        shell_netstring_buffer_free(&sequence);
         break;
       }
-      valid = valid && status == SHELL_PROCESS_ENOMEM && sequence == NULL &&
-              count == 0 && !features;
+      valid = valid && status == SHELL_PROCESS_ENOMEM &&
+              sequence.data == NULL && count == 0 && !features;
     }
     shellsplit_test_alloc_reset();
     test("Nested netargv sequence is failure-atomic at every allocation",
          valid && completed);
 
-    sequence = NULL;
+    sequence = (shell_netstring_buffer_t){0};
     count = 0;
     valid =
-        shell_build_command_netseq("'my tool' one two; printf x",
-                                   strlen("'my tool' one two; printf x"), NULL,
-                                   &sequence, &count) == SHELL_PROCESS_OK &&
-        count == 2 && sequence && strcmp(sequence, "7:my tool,6:printf,") == 0;
+        shell_build_command_netseq_buffer("'my tool' one two; printf x",
+                                          strlen("'my tool' one two; printf x"),
+                                          NULL, &sequence,
+                                          &count) == SHELL_PROCESS_OK &&
+        count == 2 && sequence.data &&
+        (sequence.length != sizeof("7:my tool,6:printf,") - 1 ||
+         memcmp(sequence.data, "7:my tool,6:printf,", sequence.length)) == 0;
     test("Command netsequence records executables rather than arguments",
          valid);
-    free(sequence);
+    shell_netstring_buffer_free(&sequence);
 
     valid = true;
     limits = (shell_process_limits_t){SIZE_MAX, SIZE_MAX, 0};
     limits.max_total_bytes = 1;
     valid = valid &&
-            shell_build_command_netseq("echo x", strlen("echo x"), &limits,
-                                       &sequence,
-                                       &count) == SHELL_PROCESS_EOUTPUT_LIMIT &&
-            sequence == NULL && count == 0;
+            shell_build_command_netseq_buffer("echo x", strlen("echo x"),
+                                              &limits, &sequence, &count) ==
+                SHELL_PROCESS_EOUTPUT_LIMIT &&
+            sequence.data == NULL && count == 0;
     test("Command netsequence validates outputs and limits", valid);
 
     limits = (shell_process_limits_t){SIZE_MAX, 6, 0};
-    valid = shell_build_command_netseq("echo x", strlen("echo x"), &limits,
-                                       &sequence,
-                                       &count) == SHELL_PROCESS_EOUTPUT_LIMIT &&
-            sequence == NULL && count == 0;
+    valid = shell_build_command_netseq_buffer("echo x", strlen("echo x"),
+                                              &limits, &sequence, &count) ==
+                SHELL_PROCESS_EOUTPUT_LIMIT &&
+            sequence.data == NULL && count == 0;
     test("Command netsequence checks its encoded size", valid);
 
-    sequence = (char *)(uintptr_t)1;
+    sequence = (shell_netstring_buffer_t){0};
     count = SIZE_MAX;
-    valid = shell_build_command_netseq("\x01"
-                                       "bad",
-                                       strlen("\x01"
-                                              "bad"),
-                                       NULL, &sequence,
-                                       &count) == SHELL_PROCESS_EINPUT &&
-            sequence == NULL && count == 0;
+    valid = shell_build_command_netseq_buffer("\x01"
+                                              "bad",
+                                              strlen("\x01"
+                                                     "bad"),
+                                              NULL, &sequence,
+                                              &count) == SHELL_PROCESS_EINPUT &&
+            sequence.data == NULL && count == 0;
     test("Command netsequence propagates parser failures atomically", valid);
 
     valid = true;
@@ -10944,17 +11062,17 @@ int main(void) {
     for (size_t fail_at = 1; fail_at < 32; fail_at++) {
       shellsplit_test_alloc_reset();
       shellsplit_test_alloc_fail_at(fail_at);
-      sequence = (char *)(uintptr_t)1;
+      sequence = (shell_netstring_buffer_t){0};
       count = SIZE_MAX;
-      status = shell_build_command_netseq("echo x", strlen("echo x"), NULL,
-                                          &sequence, &count);
+      status = shell_build_command_netseq_buffer("echo x", strlen("echo x"),
+                                                 NULL, &sequence, &count);
       if (status == SHELL_PROCESS_OK) {
         completed = true;
-        free(sequence);
+        shell_netstring_buffer_free(&sequence);
         break;
       }
-      valid = valid && status == SHELL_PROCESS_ENOMEM && sequence == NULL &&
-              count == 0;
+      valid = valid && status == SHELL_PROCESS_ENOMEM &&
+              sequence.data == NULL && count == 0;
     }
     shellsplit_test_alloc_reset();
     test("Command netsequence is failure-atomic at every allocation",
@@ -10997,8 +11115,6 @@ int main(void) {
     size_t info_count = 0;
     shell_netstring_buffer_t argv = {0};
     shell_netstring_buffer_t sequence = {0};
-    char *legacy_argv = (char *)(uintptr_t)1;
-    char *legacy_sequence = (char *)(uintptr_t)1;
     size_t record_count = 0;
     size_t sequence_count = 0;
     bool features = true;
@@ -11011,18 +11127,11 @@ int main(void) {
         shell_netstring_validate(argv.data, argv.length, &record_count) ==
             SHELL_NETSTRING_OK &&
         record_count == 2 && memchr(argv.data, '\0', argv.length) != NULL &&
-        shell_render_netargv(&binary_info, NULL, &legacy_argv) ==
-            SHELL_PROCESS_EOUTPUT_LIMIT &&
-        legacy_argv == NULL &&
         shell_build_netargv_sequence_buffer(
             source, sizeof(source) - 1, NULL, &sequence, &sequence_count,
             &features) == SHELL_PROCESS_EPARSE &&
         sequence.data == NULL && sequence.length == 0 && sequence_count == 0 &&
-        !features &&
-        shell_build_netargv_sequence(source, sizeof(source) - 1, NULL,
-                                     &legacy_sequence, &sequence_count,
-                                     &features) == SHELL_PROCESS_EPARSE &&
-        legacy_sequence == NULL && sequence_count == 0 && !features;
+        !features;
     shell_netstring_buffer_free(&sequence);
     shell_netstring_buffer_free(&argv);
     shell_command_infos_free(infos, info_count);

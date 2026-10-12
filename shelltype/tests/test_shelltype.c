@@ -26,15 +26,6 @@ static const st_suggestion_t *find_suggestion(const st_suggestion_t *items,
                                               size_t count,
                                               const char *pattern);
 
-static int pattern_is_cpl(const char *actual, const char *cpl) {
-  if (!actual || !cpl)
-    return actual == cpl;
-  char *encoded = NULL;
-  int equal = st_netpattern_from_cpl(cpl, &encoded) == ST_OK &&
-              strcmp(actual, encoded) == 0;
-  free(encoded);
-  return equal;
-}
 static char learner_temp_path[256];
 static char learner_template_path[264];
 static char learner_save_directory[256];
@@ -62,7 +53,7 @@ static void cleanup_learner_temp_file(void) {
     if (!(condition)) {                                                        \
       printf("    assertion failed: %s at %s:%d\n", #condition, __FILE__,      \
              __LINE__);                                                        \
-      return 0;                                                                \
+      exit(EXIT_FAILURE);                                                      \
     }                                                                          \
   } while (0)
 
@@ -220,7 +211,9 @@ static int test_feed_netargv_avoids_classifier_allocations(void) {
   ASSERT(from_netargv && from_tokens);
 
   st_test_alloc_reset();
-  ASSERT(st_learner_feed_netargv(from_netargv, netargv) == ST_OK);
+  ASSERT(st_learner_feed_netargv_view(
+             from_netargv, (st_netargv_view_t){netargv, sizeof(netargv) - 1}) ==
+         ST_OK);
   size_t netargv_allocations = st_test_alloc_count();
   st_test_alloc_reset();
   ASSERT(st_learner_feed_tokens(from_tokens, &typed) == ST_OK);
@@ -280,7 +273,9 @@ static int test_timestamp_metadata_feed_is_atomic(void) {
     st_netargv_view_t view = {exact, length};
     st_test_alloc_reset();
     st_learner_t *probe = baseline_learner();
-    ASSERT(probe != NULL && st_learner_feed_netargv(probe, initial) == ST_OK);
+    ASSERT(probe != NULL &&
+           st_learner_feed_netargv_view(
+               probe, (st_netargv_view_t){initial, strlen(initial)}) == ST_OK);
     st_test_alloc_reset();
     ASSERT(st_learner_feed_netargv_view(probe, view) == ST_OK);
     size_t allocations = st_test_alloc_count();
@@ -291,8 +286,12 @@ static int test_timestamp_metadata_feed_is_atomic(void) {
       st_learner_t *expected = baseline_learner();
       st_learner_t *actual = baseline_learner();
       ASSERT(expected != NULL && actual != NULL);
-      ASSERT(st_learner_feed_netargv(expected, initial) == ST_OK &&
-             st_learner_feed_netargv(actual, initial) == ST_OK);
+      ASSERT(st_learner_feed_netargv_view(
+                 expected, (st_netargv_view_t){initial, strlen(initial)}) ==
+                 ST_OK &&
+             st_learner_feed_netargv_view(
+                 actual, (st_netargv_view_t){initial, strlen(initial)}) ==
+                 ST_OK);
       st_test_alloc_fail_at(fail_at);
       st_error_t error = st_learner_feed_netargv_view(actual, view);
       st_test_alloc_reset();
@@ -532,7 +531,9 @@ static int suggestions_equal(const st_suggestion_t *actual, size_t actual_count,
   }
   for (size_t i = 0; i < expected_count; i++)
     if (!actual[i].pattern ||
-        !pattern_is_cpl(actual[i].pattern, expected[i].pattern) ||
+        !test_pattern_is_cpl(
+            (st_netpattern_view_t){actual[i].pattern, actual[i].pattern_length},
+            expected[i].pattern) ||
         actual[i].count != expected[i].count ||
         fabs(actual[i].confidence - expected[i].confidence) > 0.000001) {
       fprintf(stderr,
@@ -567,15 +568,19 @@ static int suggestions_replay_exactly(const st_suggestion_t *suggestions,
                                       const char *const *commands,
                                       size_t command_count) {
   for (size_t suggestion = 0; suggestion < suggestion_count; suggestion++) {
-    ASSERT(test_st_validate_pattern(suggestions[suggestion].pattern, NULL) ==
-           ST_OK);
+    ASSERT(st_netpattern_validate_view(
+               (st_netpattern_view_t){suggestions[suggestion].pattern,
+                                      suggestions[suggestion].pattern_length},
+               NULL) == ST_OK);
     ASSERT(suggestions[suggestion].confidence >= 0.0 &&
            suggestions[suggestion].confidence <= 1.0);
     st_policy_ctx_t *ctx = st_policy_ctx_new();
     st_policy_t *policy = ctx ? st_policy_new(ctx) : NULL;
     ASSERT(policy != NULL);
-    ASSERT(test_st_policy_add(policy, suggestions[suggestion].pattern) ==
-           ST_OK);
+    ASSERT(st_policy_add_netpattern_view(
+               policy, (st_netpattern_view_t){
+                           suggestions[suggestion].pattern,
+                           suggestions[suggestion].pattern_length}) == ST_OK);
     uint32_t matches = 0;
     for (size_t command = 0; command < command_count; command++) {
       st_eval_result_t result = {0};
@@ -828,7 +833,9 @@ static int test_independent_two_token_learner_oracle(void) {
       ASSERT(actual_count == expected_count);
       for (size_t i = 0; i < expected_count; i++) {
         ASSERT(actual != NULL);
-        ASSERT(pattern_is_cpl(actual[i].pattern, expected[i].pattern));
+        ASSERT(test_pattern_is_cpl(
+            (st_netpattern_view_t){actual[i].pattern, actual[i].pattern_length},
+            expected[i].pattern));
         ASSERT(actual[i].count == expected[i].count);
         ASSERT(actual[i].confidence == expected[i].confidence);
       }
@@ -1797,11 +1804,11 @@ static int test_learner_binary_literal_roundtrip(void) {
   st_suggestion_list_free(suggestions, count);
 
   ASSERT(st_learner_blacklist_add_netpattern(
-             loaded, (st_netpattern_view_t){.data = expected.data,
+             loaded, (st_netpattern_view_t){.data = (const char *)expected.data,
                                             .length = expected.length}) ==
          ST_OK);
   ASSERT(st_learner_is_netpattern_blacklisted(
-      loaded, (st_netpattern_view_t){.data = expected.data,
+      loaded, (st_netpattern_view_t){.data = (const char *)expected.data,
                                      .length = expected.length}));
   ASSERT(st_learner_suggest(loaded, &count) == NULL && count == 0);
   st_learner_free(loaded);
@@ -1891,7 +1898,7 @@ static int test_generalization_after_empty_and_binary_arguments(void) {
           st_policy_t *policy = context ? st_policy_new(context) : NULL;
           ASSERT(policy != NULL &&
                  st_policy_add_netpattern_view(
-                     policy, (st_netpattern_view_t){expected.data,
+                     policy, (st_netpattern_view_t){(const char *)expected.data,
                                                     expected.length}) == ST_OK);
           uint32_t replay = 0;
           for (size_t j = 0; j < 2; j++) {
@@ -2029,7 +2036,9 @@ static int feed_suggestion_allocation_fixture(st_learner_t *learner,
                                           "5:ztool,2:42,",
                                           "6:zztool,2:42,"};
     for (size_t i = 0; i < sizeof(records) / sizeof(records[0]); i++)
-      ASSERT(st_learner_feed_netargv(learner, records[i]) == ST_OK);
+      ASSERT(st_learner_feed_netargv_view(
+                 learner,
+                 (st_netargv_view_t){records[i], strlen(records[i])}) == ST_OK);
   }
   /* The second fixture also exceeds the initial candidate/result capacity.
    * Its output cap exercises cleanup of accounted but unpublished rules. */
@@ -2268,7 +2277,9 @@ static const st_suggestion_t *find_suggestion(const st_suggestion_t *items,
                                               size_t count,
                                               const char *pattern) {
   for (size_t i = 0; i < count; i++)
-    if (pattern_is_cpl(items[i].pattern, pattern))
+    if (test_pattern_is_cpl(
+            (st_netpattern_view_t){items[i].pattern, items[i].pattern_length},
+            pattern))
       return &items[i];
   return NULL;
 }

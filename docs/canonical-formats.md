@@ -9,8 +9,8 @@ escaping. `shell_netstring.h` provides a length-aware, byte-oriented iterator
 for applications that need to validate or traverse these records; it can expose
 NUL payload bytes. Canonical netargv, netsequences, and netpatterns support
 embedded NUL in their payloads. Keep the enclosing byte length throughout
-processing; NUL termination is only a convenience for NUL-free compatibility
-inputs. Raw shell source rejects literal NUL bytes. Complete-command semantic
+processing; NUL termination is not part of the canonical transport contract.
+Raw shell source rejects literal NUL bytes. Complete-command semantic
 APIs also reject ANSI-C quotes that decode to NUL, because Bash truncates the
 rest of that quoted segment at execution. Standalone word decoders remain
 byte-faithful, and canonical APIs still accept binary payloads supplied
@@ -31,11 +31,9 @@ escape processing, control-flow isolation, and redirection removal. Another
 caller may perform those steps itself. Shelltype decodes these boundaries and
 classifies arguments; it does not tokenize shell source.
 
-The `*_view` Shelltype entry points accept `st_netargv_view_t` and use its
-explicit length directly. Existing C-string entry points remain convenience
-wrappers that derive that length with `strlen()`. A NULL data pointer is valid
-only for an empty view. The view forms support embedded NUL; the C-string
-wrappers are limited to NUL-free encodings.
+Shelltype entry points accept `st_netargv_view_t` and use its explicit length
+directly, including for embedded NUL bytes. A NULL data pointer is valid only
+for an empty view. The former C-string transport wrappers have been removed.
 
 Use Shellsplit's `shell_render_netargv_buffer()` or
 `shell_build_netargv_sequence_buffer()` to preserve binary payloads in an
@@ -59,8 +57,8 @@ anomaly item; command lists and pipelines produce multiple items.
 
 Use `shell_build_command_netseq_buffer()`, `shell_build_type_netseq_buffer()`,
 or `shell_build_anomaly_netseqs_buffer()` for binary sequence output. Pass
-their explicit lengths to the anomaly APIs; legacy C-string builders support
-only NUL-free output.
+their explicit lengths to the anomaly APIs. The former C-string sequence
+builders have been removed.
 
 ## netpattern and CPL
 
@@ -81,9 +79,10 @@ escaping. Braced types describe a typed substring in one argv element:
 `st_netpattern_from_cpl_owned()` at a user-input boundary and
 `st_netpattern_to_cpl_view()` for display. The owned `st_netpattern_t` and
 borrowed `st_netpattern_view_t` preserve the enclosing length; release owned
-patterns with `st_netpattern_free()`. Legacy C-string converters support only
-NUL-free netpatterns. Policy APIs accept only canonical netpatterns; use their
-view forms for binary patterns.
+patterns with `st_netpattern_free()`. Policy APIs accept canonical netpattern
+views, not CPL or NUL-terminated transport strings. Build and edit policies
+through Shelltype before installing them in a gate; installed policies are
+logically immutable and can be shared by borrowing gates.
 
 `st_netpattern_validate_view()` validates the canonical encoding and policy
 command-position grammar. Its optional details output is an owned

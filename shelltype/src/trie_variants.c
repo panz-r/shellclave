@@ -124,8 +124,8 @@ static SHELL_NONNULL(1, 2, 3) bool variant_prefix_matches(
                                  &length))
       return false;
     return st_pattern_wildcard_matches(
-        capture, length, st_token_classify_bytes(capture, length),
-        token->capture, token->capture_length, token->capture_type);
+        capture, length, st_token_classify(capture, length), token->capture,
+        token->capture_length, token->capture_type);
   }
   if (token->type == ST_TYPE_LITERAL) {
     if (child->type != ST_TYPE_LITERAL)
@@ -167,8 +167,7 @@ static SHELL_NONNULL(1, 2, 3, 6) void collect_variants_at(
                                     token->prefix, token->prefix_length,
                                     token->suffix, token->suffix_length,
                                     &capture, &length))
-          *observed_types |= UINT64_C(1)
-                             << st_token_classify_bytes(capture, length);
+          *observed_types |= UINT64_C(1) << st_token_classify(capture, length);
       } else {
         *observed_types |=
             child->observed_types & ~(UINT64_C(1) << ST_TYPE_ANY);
@@ -266,7 +265,6 @@ size_t st_learner_suggest_token_variants(const st_learner_t *learner,
       (observed_types & (1ULL << current_type))) {
     out_variants[out_count].type = current_type;
     out_variants[out_count].type_symbol = st_type_symbol[current_type];
-    out_variants[out_count].sample_value = NULL;
     out_count++;
     observed_types &= ~(1ULL << current_type);
   }
@@ -279,7 +277,6 @@ size_t st_learner_suggest_token_variants(const st_learner_t *learner,
       break;
     out_variants[out_count].type = selected;
     out_variants[out_count].type_symbol = st_type_symbol[selected];
-    out_variants[out_count].sample_value = NULL;
     out_count++;
     observed_types &= ~(1ULL << selected);
   }
@@ -297,7 +294,6 @@ size_t st_learner_suggest_token_variants(const st_learner_t *learner,
       if (!has_path) {
         out_variants[out_count].type = ST_TYPE_PATH;
         out_variants[out_count].type_symbol = st_type_symbol[ST_TYPE_PATH];
-        out_variants[out_count].sample_value = NULL;
         out_count++;
       }
     }
@@ -312,7 +308,6 @@ size_t st_learner_suggest_token_variants(const st_learner_t *learner,
       if (!has_val) {
         out_variants[out_count].type = ST_TYPE_VALUE;
         out_variants[out_count].type_symbol = st_type_symbol[ST_TYPE_VALUE];
-        out_variants[out_count].sample_value = NULL;
         out_count++;
       }
     }
@@ -326,15 +321,15 @@ size_t st_learner_suggest_token_variants(const st_learner_t *learner,
       out_count < ST_MAX_TOKEN_VARIANTS) {
     out_variants[out_count].type = ST_TYPE_ANY;
     out_variants[out_count].type_symbol = "*";
-    out_variants[out_count].sample_value = NULL;
     out_count++;
   }
 
   return out_count;
 }
 
-/* Apply a type change to a pattern at a given position. Caller must free
- * result. */
+/* Apply a type change to a pattern at a given position. The caller supplies
+ * empty output storage; success transfers ownership for st_netpattern_free(),
+ * and failure leaves it empty. */
 st_error_t st_netpattern_apply_type_at_owned(st_netpattern_view_t netpattern,
                                              size_t edit_pos,
                                              st_token_type_t new_type,
@@ -384,23 +379,4 @@ st_error_t st_netpattern_apply_type_at_owned(st_netpattern_view_t netpattern,
   decoded.tokens[edit_pos].text_length = old_text_length;
   st_token_array_free(&decoded);
   return error;
-}
-
-st_error_t st_netpattern_apply_type_at(const char *netpattern, size_t edit_pos,
-                                       st_token_type_t new_type,
-                                       char **out_netpattern) {
-  *out_netpattern = NULL;
-
-  st_netpattern_t owned = {0};
-  st_error_t error = st_netpattern_apply_type_at_owned(
-      (st_netpattern_view_t){.data = netpattern, .length = strlen(netpattern)},
-      edit_pos, new_type, &owned);
-  if (error != ST_OK)
-    return error;
-  if (memchr(owned.data, '\0', owned.length)) {
-    st_netpattern_free(&owned);
-    return ST_ERR_LIMIT;
-  }
-  *out_netpattern = owned.data;
-  return ST_OK;
 }

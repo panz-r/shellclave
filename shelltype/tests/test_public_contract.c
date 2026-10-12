@@ -136,15 +136,12 @@ static bool check_policy_command_grammar(void) {
     st_netpattern_view_t view = {pattern.data, pattern.length};
     st_error_t expected = cases[i].supported ? ST_OK : ST_ERR_INVALID;
     CHECK(st_netpattern_validate_view(view, NULL) == expected);
-    CHECK(st_netpattern_validate(pattern.data, NULL) == expected);
     CHECK(st_netpattern_validate_view(view, &validated) == expected);
     if (expected == ST_OK) {
       CHECK(validated.count == 2);
       st_token_array_free(&validated);
     } else
       CHECK(validated.tokens == NULL && validated.count == 0);
-    CHECK(st_netpattern_validate(pattern.data, &validated) == expected);
-    st_token_array_free(&validated);
     CHECK(st_netpattern_decode_view(view, &decoded) == ST_OK);
 
     /* Canonical codecs can describe an unsupported policy command word.
@@ -168,15 +165,16 @@ static bool check_policy_command_grammar(void) {
     if (decoded.tokens[0].compound) {
       CHECK(edited.data == NULL && edited.length == 0);
     } else {
-      CHECK(st_netpattern_validate_view(
-                (st_netpattern_view_t){edited.data, edited.length}, NULL) ==
-            ST_OK);
+      CHECK(
+          st_netpattern_validate_view(
+              (st_netpattern_view_t){(const char *)edited.data, edited.length},
+              NULL) == ST_OK);
     }
     st_netpattern_free(&edited);
 
     /* Edits must leave a valid policy head, including when an unchanged head
      * is outside policy grammar. Only a whole-token head edit can repair ANY.
-     * Exercise both output forms at every position and every accepted type. */
+     * Exercise every position and every accepted type. */
     for (size_t position = 0; position < decoded.count; position++) {
       for (st_token_type_t type = ST_TYPE_LITERAL + 1; type < ST_TYPE_COUNT;
            type++) {
@@ -187,22 +185,11 @@ static bool check_policy_command_grammar(void) {
                 : ST_ERR_INVALID;
         CHECK(st_netpattern_apply_type_at_owned(view, position, type,
                                                 &edited) == edit_expected);
-        char *string_edit = NULL;
-        st_error_t string_status = st_netpattern_apply_type_at(
-            pattern.data, position, type, &string_edit);
-        bool string_ok =
-            string_status == edit_expected &&
-            (edit_expected == ST_OK
-                 ? string_edit && edited.data &&
-                       strlen(string_edit) == edited.length &&
-                       memcmp(string_edit, edited.data, edited.length) == 0
-                 : string_edit == NULL);
-        free(string_edit);
-        CHECK(string_ok);
         if (edit_expected == ST_OK)
           CHECK(st_netpattern_validate_view(
-                    (st_netpattern_view_t){edited.data, edited.length}, NULL) ==
-                ST_OK);
+                    (st_netpattern_view_t){(const char *)edited.data,
+                                           edited.length},
+                    NULL) == ST_OK);
         else
           CHECK(edited.data == NULL && edited.length == 0);
         st_netpattern_free(&edited);
@@ -210,76 +197,63 @@ static bool check_policy_command_grammar(void) {
     }
 
     for (unsigned populated = 0; populated < 2; populated++) {
-      for (unsigned string_api = 0; string_api < 2; string_api++) {
-        policy = st_policy_new(context);
-        CHECK(policy != NULL);
-        if (populated)
-          CHECK(st_policy_add_netpattern_view(
-                    policy, (st_netpattern_view_t){baseline.data,
-                                                   baseline.length}) == ST_OK);
-        size_t before = st_policy_rule_count(policy);
-        CHECK(check_match(policy,
-                          (st_netargv_view_t){existing, sizeof(existing) - 1},
-                          populated != 0));
-        for (unsigned omit_conflict = 0; omit_conflict < 2; omit_conflict++) {
-          bool covered = true;
-          st_netpattern_view_t conflict = view;
-          const char *conflict_string = pattern.data;
-          st_error_t status = string_api
-                                  ? st_policy_simulate_add_netpattern(
-                                        policy, pattern.data, &covered,
-                                        omit_conflict ? NULL : &conflict_string)
-                                  : st_policy_simulate_add_netpattern_view(
-                                        policy, view, &covered,
-                                        omit_conflict ? NULL : &conflict);
-          CHECK(status == expected && !covered);
-          if (!omit_conflict) {
-            if (string_api)
-              CHECK(conflict_string == NULL);
-            else
-              CHECK(conflict.data == NULL && conflict.length == 0);
-          }
-          CHECK(st_policy_rule_count(policy) == before);
+      policy = st_policy_new(context);
+      CHECK(policy != NULL);
+      if (populated)
+        CHECK(st_policy_add_netpattern_view(
+                  policy, (st_netpattern_view_t){(const char *)baseline.data,
+                                                 baseline.length}) == ST_OK);
+      size_t before = st_policy_rule_count(policy);
+      CHECK(check_match(policy,
+                        (st_netargv_view_t){existing, sizeof(existing) - 1},
+                        populated != 0));
+      for (unsigned omit_conflict = 0; omit_conflict < 2; omit_conflict++) {
+        bool covered = true;
+        st_netpattern_view_t conflict = view;
+        st_error_t status = st_policy_simulate_add_netpattern_view(
+            policy, view, &covered, omit_conflict ? NULL : &conflict);
+        CHECK(status == expected && !covered);
+        if (!omit_conflict) {
+          CHECK(conflict.data == NULL && conflict.length == 0);
         }
-
-        st_expand_suggestion_t suggestions[3];
-        memset(suggestions, 0xa5, sizeof(suggestions));
-        size_t count = st_policy_suggest_variants(policy, decoded.tokens,
-                                                  decoded.count, suggestions);
-        CHECK((count != 0) == cases[i].supported);
-        if (cases[i].supported) {
-          CHECK(count <= 3);
-          for (size_t j = 0; j < count; j++)
-            CHECK(st_netpattern_validate_view(
-                      (st_netpattern_view_t){suggestions[j].pattern,
-                                             suggestions[j].pattern_length},
-                      NULL) == ST_OK);
-        } else {
-          for (size_t j = 0; j < 3; j++)
-            CHECK(suggestions[j].pattern_length == 0 &&
-                  suggestions[j].pattern[0] == '\0' &&
-                  suggestions[j].based_on == NULL &&
-                  suggestions[j].based_on_length == 0 &&
-                  suggestions[j].confidence == 0.0);
-        }
-
-        CHECK((string_api
-                   ? st_policy_add_netpattern(policy, pattern.data)
-                   : st_policy_add_netpattern_view(policy, view)) == expected);
-        CHECK(st_policy_rule_count(policy) == before + cases[i].supported);
-        CHECK(check_match(policy,
-                          (st_netargv_view_t){existing, sizeof(existing) - 1},
-                          populated != 0));
-        CHECK(check_match(
-            policy, (st_netargv_view_t){missing, sizeof(missing) - 1}, false));
-        if (cases[i].supported)
-          CHECK(check_match(
-              policy,
-              (st_netargv_view_t){cases[i].netargv, strlen(cases[i].netargv)},
-              true));
-        st_policy_free(policy);
-        policy = NULL;
+        CHECK(st_policy_rule_count(policy) == before);
       }
+
+      st_expand_suggestion_t suggestions[3];
+      memset(suggestions, 0xa5, sizeof(suggestions));
+      size_t count = st_policy_suggest_variants(policy, decoded.tokens,
+                                                decoded.count, suggestions);
+      CHECK((count != 0) == cases[i].supported);
+      if (cases[i].supported) {
+        CHECK(count <= 3);
+        for (size_t j = 0; j < count; j++)
+          CHECK(st_netpattern_validate_view(
+                    (st_netpattern_view_t){suggestions[j].pattern,
+                                           suggestions[j].pattern_length},
+                    NULL) == ST_OK);
+      } else {
+        for (size_t j = 0; j < 3; j++)
+          CHECK(suggestions[j].pattern_length == 0 &&
+                suggestions[j].pattern[0] == '\0' &&
+                suggestions[j].based_on == NULL &&
+                suggestions[j].based_on_length == 0 &&
+                suggestions[j].confidence == 0.0);
+      }
+
+      CHECK(st_policy_add_netpattern_view(policy, view) == expected);
+      CHECK(st_policy_rule_count(policy) == before + cases[i].supported);
+      CHECK(check_match(policy,
+                        (st_netargv_view_t){existing, sizeof(existing) - 1},
+                        populated != 0));
+      CHECK(check_match(
+          policy, (st_netargv_view_t){missing, sizeof(missing) - 1}, false));
+      if (cases[i].supported)
+        CHECK(check_match(
+            policy,
+            (st_netargv_view_t){cases[i].netargv, strlen(cases[i].netargv)},
+            true));
+      st_policy_free(policy);
+      policy = NULL;
     }
     st_token_array_free(&decoded);
     st_netpattern_free(&pattern);
@@ -322,8 +296,8 @@ static bool check_compound_capture_spans(void) {
     CHECK(policy != NULL);
     CHECK(st_netpattern_from_cpl_owned(cases[i].cpl, &pattern) == ST_OK);
     CHECK(st_policy_add_netpattern_view(
-              policy, (st_netpattern_view_t){pattern.data, pattern.length}) ==
-          ST_OK);
+              policy, (st_netpattern_view_t){(const char *)pattern.data,
+                                             pattern.length}) == ST_OK);
     for (size_t j = 0; j < sizeof(lengths) / sizeof(lengths[0]); j++) {
       size_t total =
           cases[i].prefix_length + lengths[j] + cases[i].suffix_length;
@@ -380,8 +354,8 @@ static bool check_compound_capture_spans(void) {
   CHECK(st_netpattern_from_cpl_owned("tool --size={#size.MiB}", &pattern) ==
         ST_OK);
   CHECK(st_policy_add_netpattern_view(
-            policy, (st_netpattern_view_t){pattern.data, pattern.length}) ==
-        ST_OK);
+            policy, (st_netpattern_view_t){(const char *)pattern.data,
+                                           pattern.length}) == ST_OK);
   static const char good[] = "--size=10MiB";
   static const char wrong[] = "--size=10MiB\0tail";
   CHECK(build_tool_netargv(good, sizeof(good) - 1, &input));
@@ -498,7 +472,8 @@ static bool check_compound_cpl_component_limits(void) {
   st_netpattern_t pattern = {0}, roundtrip = {0};
   st_token_array_t decoded = {0};
   shell_netstring_buffer_t input = {0};
-  char *cpl = NULL, *span = NULL;
+  char *cpl = NULL;
+  char *span = NULL;
   char prefix[ST_MAX_TOKEN_LEN - 1], suffix[ST_MAX_TOKEN_LEN - 1];
   char word[2 * (ST_MAX_TOKEN_LEN - 1) + 2];
   CHECK(context != NULL);
@@ -556,10 +531,13 @@ static bool check_compound_cpl_component_limits(void) {
       CHECK(roundtrip.length == pattern.length &&
             memcmp(roundtrip.data, pattern.data, pattern.length) == 0);
       st_netpattern_free(&roundtrip);
-      view = (st_netpattern_view_t){pattern.data, pattern.length};
+      view = (st_netpattern_view_t){(const char *)pattern.data, pattern.length};
       if (!binary) {
         st_token_array_free(&decoded);
-        CHECK(st_netpattern_validate(pattern.data, &decoded) == ST_OK);
+        CHECK(st_netpattern_validate_view(
+                  (st_netpattern_view_t){(const char *)pattern.data,
+                                         pattern.length},
+                  &decoded) == ST_OK);
         CHECK(decoded.count == 2 && decoded.tokens[1].compound &&
               decoded.tokens[1].prefix_length == cases[i].prefix &&
               decoded.tokens[1].suffix_length == cases[i].suffix);
@@ -571,7 +549,7 @@ static bool check_compound_cpl_component_limits(void) {
       policy = st_policy_new(context);
       CHECK(policy != NULL);
       CHECK(st_policy_add_netpattern_view(
-                policy, (st_netpattern_view_t){roundtrip.data,
+                policy, (st_netpattern_view_t){(const char *)roundtrip.data,
                                                roundtrip.length}) == ST_OK);
       memcpy(word, prefix, cases[i].prefix);
       memcpy(word + cases[i].prefix, "42", 2);
@@ -627,9 +605,10 @@ static bool check_compound_editor_choices(void) {
   CHECK(context != NULL);
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
     CHECK(st_netpattern_from_cpl_owned(cases[i], &pattern) == ST_OK);
-    CHECK(st_netpattern_decode_view(
-              (st_netpattern_view_t){pattern.data, pattern.length}, &decoded) ==
-          ST_OK);
+    CHECK(
+        st_netpattern_decode_view(
+            (st_netpattern_view_t){(const char *)pattern.data, pattern.length},
+            &decoded) == ST_OK);
     const st_token_t *token = &decoded.tokens[1];
     const char *capture = token->capture_type == ST_TYPE_NUMBER ? "42"
                           : token->capture_type == ST_TYPE_SIZE ? "10MiB"
@@ -652,11 +631,13 @@ static bool check_compound_editor_choices(void) {
       CHECK(choices[j].type != ST_TYPE_LITERAL &&
             st_is_compatible(token->capture_type, choices[j].type));
       CHECK(st_netpattern_apply_type_at_owned(
-                (st_netpattern_view_t){pattern.data, pattern.length}, 1,
-                choices[j].type, &edited) == ST_OK);
-      CHECK(st_netpattern_decode_view(
-                (st_netpattern_view_t){edited.data, edited.length}, &changed) ==
-            ST_OK);
+                (st_netpattern_view_t){(const char *)pattern.data,
+                                       pattern.length},
+                1, choices[j].type, &edited) == ST_OK);
+      CHECK(
+          st_netpattern_decode_view(
+              (st_netpattern_view_t){(const char *)edited.data, edited.length},
+              &changed) == ST_OK);
       const st_token_t *replacement = &changed.tokens[1];
       CHECK(replacement->compound &&
             replacement->capture_type == choices[j].type &&
@@ -669,8 +650,8 @@ static bool check_compound_editor_choices(void) {
       policy = st_policy_new(context);
       CHECK(policy != NULL);
       CHECK(st_policy_add_netpattern_view(
-                policy, (st_netpattern_view_t){edited.data, edited.length}) ==
-            ST_OK);
+                policy, (st_netpattern_view_t){(const char *)edited.data,
+                                               edited.length}) == ST_OK);
       bool matches = false;
       CHECK(st_policy_match_view(
                 policy,
@@ -749,8 +730,8 @@ static bool check_complete_suggestions(void) {
     CHECK(policy != NULL);
     CHECK(st_netpattern_from_cpl_owned(cases[i].policy, &pattern) == ST_OK);
     CHECK(st_policy_add_netpattern_view(
-              policy, (st_netpattern_view_t){pattern.data, pattern.length}) ==
-          ST_OK);
+              policy, (st_netpattern_view_t){(const char *)pattern.data,
+                                             pattern.length}) == ST_OK);
     st_netargv_view_t view = {cases[i].input, cases[i].length};
     CHECK(st_policy_eval_view(policy, view, &result) == ST_OK);
     CHECK(!result.matches && result.suggestion_count == 2 &&
@@ -966,12 +947,13 @@ static bool check_suggestion_rendering(void) {
               error);
     CHECK(error == ST_OK);
     CHECK(st_netpattern_decode_view(
-              (st_netpattern_view_t){expected.data, expected.length},
+              (st_netpattern_view_t){(const char *)expected.data,
+                                     expected.length},
               &decoded) == ST_OK);
     CHECK(st_policy_clear(policy) == ST_OK);
     CHECK(st_policy_add_netpattern_view(
-              policy, (st_netpattern_view_t){expected.data, expected.length}) ==
-          ST_OK);
+              policy, (st_netpattern_view_t){(const char *)expected.data,
+                                             expected.length}) == ST_OK);
     for (size_t probe = 0; probe < 2; probe++)
       CHECK(check_match(policy, patterns[i].accepted[probe], true));
     st_expand_suggestion_t variants[3] = {0};
@@ -1120,6 +1102,12 @@ static bool check_literal_editor_choices(void) {
     size_t length, pos;
     st_token_type_t first_type;
   } cases[] = {
+      {"timeout 42 ls", "7:timeout,2:42,2:ls,",
+       sizeof("7:timeout,2:42,2:ls,") - 1, 1, ST_TYPE_NUMBER},
+      {"emit \"two words\" 42", "4:emit,9:two words,2:42,",
+       sizeof("4:emit,9:two words,2:42,") - 1, 2, ST_TYPE_NUMBER},
+      {"emit \"#n\"", "4:emit,2:#n,", sizeof("4:emit,2:#n,") - 1, 1,
+       ST_TYPE_ANY},
       {"tool zzz", "4:tool,3:zzz,", sizeof("4:tool,3:zzz,") - 1, 1,
        ST_TYPE_ANY},
       {"tool \"\"", "4:tool,0:,", sizeof("4:tool,0:,") - 1, 1, ST_TYPE_ANY},
@@ -1158,9 +1146,15 @@ static bool check_literal_editor_choices(void) {
     CHECK(st_token_variants_at(&decoded, cases[i].pos, &bounded, 0) == 0);
     CHECK(st_token_variants_at(&decoded, cases[i].pos, &bounded, 1) == 1 &&
           bounded.type == choices[0].type);
+    struct {
+      st_token_variant_t choice;
+      unsigned canary;
+    } one = {.canary = 0x51a7u};
+    CHECK(st_token_variants_at(&decoded, cases[i].pos, &one.choice, 1) == 1);
+    CHECK(one.choice.type == choices[0].type && one.canary == 0x51a7u);
+    CHECK(st_token_variants_at(&decoded, decoded.count, choices,
+                               ST_TYPE_COUNT) == 0);
     for (size_t j = 0; j < count; j++) {
-      CHECK(choices[j].sample_value == NULL &&
-            choices[j].sample_value_length == 0);
       for (size_t k = 0; k < j; k++)
         CHECK(choices[k].type != choices[j].type);
       if (choices[j].type == ST_TYPE_LITERAL)
@@ -1170,8 +1164,8 @@ static bool check_literal_editor_choices(void) {
       policy = st_policy_new(context);
       CHECK(policy != NULL);
       CHECK(st_policy_add_netpattern_view(
-                policy, (st_netpattern_view_t){edited.data, edited.length}) ==
-            ST_OK);
+                policy, (st_netpattern_view_t){(const char *)edited.data,
+                                               edited.length}) == ST_OK);
       CHECK(check_match(
           policy, (st_netargv_view_t){cases[i].input, cases[i].length}, true));
       st_policy_free(policy);
@@ -1188,14 +1182,14 @@ static bool check_literal_editor_choices(void) {
   }
   CHECK(st_netpattern_from_cpl_owned("pre{#n}post", &pattern) == ST_OK);
   CHECK(st_netpattern_decode_view(
-            (st_netpattern_view_t){pattern.data, pattern.length}, &decoded) ==
-        ST_OK);
+            (st_netpattern_view_t){(const char *)pattern.data, pattern.length},
+            &decoded) == ST_OK);
   st_token_variant_t invalid_head[ST_MAX_TOKEN_VARIANTS] = {0};
   CHECK(st_token_variants_at(&decoded, 0, invalid_head,
                              ST_MAX_TOKEN_VARIANTS) == 0);
   CHECK(st_netpattern_apply_type_at_owned(
-            (st_netpattern_view_t){pattern.data, pattern.length}, 0,
-            ST_TYPE_VALUE, &edited) == ST_ERR_INVALID);
+            (st_netpattern_view_t){(const char *)pattern.data, pattern.length},
+            0, ST_TYPE_VALUE, &edited) == ST_ERR_INVALID);
   ok = true;
 cleanup:
   st_policy_free(policy);
@@ -1236,9 +1230,10 @@ static bool check_compound_miner_choices(void) {
     policy = st_policy_new(context);
     CHECK(policy != NULL);
     CHECK(st_netpattern_from_cpl_owned(cases[i].cpl, &pattern) == ST_OK);
-    CHECK(st_netpattern_decode_view(
-              (st_netpattern_view_t){pattern.data, pattern.length}, &decoded) ==
-          ST_OK);
+    CHECK(
+        st_netpattern_decode_view(
+            (st_netpattern_view_t){(const char *)pattern.data, pattern.length},
+            &decoded) == ST_OK);
     st_expand_suggestion_t choices[3] = {0};
     size_t count = st_policy_suggest_variants(policy, decoded.tokens,
                                               decoded.count, choices);
@@ -1283,8 +1278,8 @@ static bool learner_choices_are(st_learner_t *learner, const char *cpl,
   st_token_array_t decoded = {0};
   CHECK(st_netpattern_from_cpl_owned(cpl, &pattern) == ST_OK);
   CHECK(st_netpattern_decode_view(
-            (st_netpattern_view_t){pattern.data, pattern.length}, &decoded) ==
-        ST_OK);
+            (st_netpattern_view_t){(const char *)pattern.data, pattern.length},
+            &decoded) == ST_OK);
   for (unsigned terminated = 1;; terminated--) {
     st_token_variant_t choices[ST_MAX_TOKEN_VARIANTS];
     size_t count =
@@ -1298,15 +1293,15 @@ static bool learner_choices_are(st_learner_t *learner, const char *cpl,
     CHECK(count == expected_count);
     for (size_t i = 0; i < count; i++) {
       CHECK(choices[i].type == expected[i] &&
-            strcmp(choices[i].type_symbol, st_type_symbol[expected[i]]) == 0 &&
-            choices[i].sample_value == NULL &&
-            choices[i].sample_value_length == 0);
+            strcmp(choices[i].type_symbol, st_type_symbol[expected[i]]) == 0);
       CHECK(st_netpattern_apply_type_at_owned(
-                (st_netpattern_view_t){pattern.data, pattern.length}, position,
-                choices[i].type, &edited) == ST_OK);
-      CHECK(st_netpattern_validate_view(
-                (st_netpattern_view_t){edited.data, edited.length}, NULL) ==
-            ST_OK);
+                (st_netpattern_view_t){(const char *)pattern.data,
+                                       pattern.length},
+                position, choices[i].type, &edited) == ST_OK);
+      CHECK(
+          st_netpattern_validate_view(
+              (st_netpattern_view_t){(const char *)edited.data, edited.length},
+              NULL) == ST_OK);
       st_netpattern_free(&edited);
     }
     if (!terminated)
@@ -1374,8 +1369,8 @@ static bool check_binary_punctuation_classification(void) {
     CHECK(st_netpattern_from_cpl_owned(regex ? "grep #regex" : "tool #glob",
                                        &pattern) == ST_OK);
     CHECK(st_policy_add_netpattern_view(
-              policy, (st_netpattern_view_t){pattern.data, pattern.length}) ==
-          ST_OK);
+              policy, (st_netpattern_view_t){(const char *)pattern.data,
+                                             pattern.length}) == ST_OK);
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
       CHECK(build_tool_netargv(cases[i].word, cases[i].length, &input));
       if (regex)
@@ -1497,12 +1492,13 @@ static bool check_parameterized_learner_prefixes(void) {
     const char *words[] = {cases[i].matching, cases[i].other, "zzz"};
     for (size_t j = 0; j < 3; j++) {
       st_token_type_t expected_type = j < 2 ? cases[i].type : ST_TYPE_LITERAL;
-      if (st_token_classify(words[j]) != expected_type)
-        fprintf(
-            stderr, "parameter query %s: %s classified as %s, expected %s\n",
-            cases[i].cpl, words[j], st_type_symbol[st_token_classify(words[j])],
-            st_type_symbol[expected_type]);
-      CHECK(st_token_classify(words[j]) == expected_type);
+      if (st_token_classify(words[j], strlen(words[j])) != expected_type)
+        fprintf(stderr,
+                "parameter query %s: %s classified as %s, expected %s\n",
+                cases[i].cpl, words[j],
+                st_type_symbol[st_token_classify(words[j], strlen(words[j]))],
+                st_type_symbol[expected_type]);
+      CHECK(st_token_classify(words[j], strlen(words[j])) == expected_type);
       CHECK(build_tool_netargv(words[j], strlen(words[j]), &records[j]));
       size_t tail = 0;
       CHECK(shell_netstring_encoded_length(2, &tail) == SHELL_NETSTRING_OK);
@@ -1517,8 +1513,8 @@ static bool check_parameterized_learner_prefixes(void) {
     policy = st_policy_new(context);
     CHECK(policy != NULL);
     CHECK(st_policy_add_netpattern_view(
-              policy, (st_netpattern_view_t){pattern.data, pattern.length}) ==
-          ST_OK);
+              policy, (st_netpattern_view_t){(const char *)pattern.data,
+                                             pattern.length}) == ST_OK);
     for (size_t j = 0; j < 3; j++) {
       bool matches = check_match(
           policy,
@@ -1603,7 +1599,9 @@ static bool check_learner_support_rules(st_learner_t *learner,
     uint32_t replay = 0;
     for (size_t j = 0; j < count; j++) {
       bool matched = false;
-      CHECK(st_policy_match(policy, records[j], &matched) == ST_OK);
+      CHECK(st_policy_match_view(
+                policy, (st_netargv_view_t){records[j], strlen(records[j])},
+                &matched) == ST_OK);
       replay += matched ? weights[j] : 0;
     }
     CHECK(replay == suggestions[i].count);
@@ -1713,8 +1711,10 @@ static bool check_learner_overlapping_support(void) {
       for (size_t j = 0; j < cases[i].count; j++) {
         size_t index = reverse ? cases[i].count - j - 1 : j;
         for (uint32_t n = 0; n < cases[i].weights[index]; n++)
-          CHECK(st_learner_feed_netargv(learner, cases[i].records[index]) ==
-                ST_OK);
+          CHECK(st_learner_feed_netargv_view(
+                    learner, (st_netargv_view_t){
+                                 cases[i].records[index],
+                                 strlen(cases[i].records[index])}) == ST_OK);
       }
       CHECK(check_learner_support_rules(
           learner, cases[i].records, cases[i].weights, cases[i].count,
@@ -1868,8 +1868,8 @@ static bool check_timestamp_metadata_agreement(void) {
     policy = st_policy_new(context);
     CHECK(policy != NULL);
     CHECK(st_policy_add_netpattern_view(
-              policy, (st_netpattern_view_t){pattern.data, pattern.length}) ==
-          ST_OK);
+              policy, (st_netpattern_view_t){(const char *)pattern.data,
+                                             pattern.length}) == ST_OK);
     for (size_t j = 0; j < case_count; j++) {
       char word[64];
       size_t value_length = strlen(cases[j].value);
@@ -2129,8 +2129,8 @@ static bool check_lattice_is_not_runtime_acceptance(void) {
   CHECK(st_is_compatible(ST_TYPE_LITERAL, ST_TYPE_OPT));
   CHECK(st_netpattern_from_cpl_owned("tool #n", &pattern) == ST_OK);
   CHECK(st_policy_add_netpattern_view(
-            policy, (st_netpattern_view_t){pattern.data, pattern.length}) ==
-        ST_OK);
+            policy, (st_netpattern_view_t){(const char *)pattern.data,
+                                           pattern.length}) == ST_OK);
   CHECK(check_match(policy, (st_netargv_view_t){"4:tool,3:zzz,", 13}, false));
   CHECK(check_match(policy, (st_netargv_view_t){"4:tool,2:42,", 12}, true));
   ok = true;
@@ -2173,9 +2173,10 @@ static bool check_cpl_unicode_boundaries(void) {
     input[length - 1] = '"';
     input[length] = '\0';
     CHECK(st_netpattern_from_cpl_owned(input, &pattern) == ST_OK);
-    CHECK(st_netpattern_decode_view(
-              (st_netpattern_view_t){pattern.data, pattern.length}, &tokens) ==
-          ST_OK);
+    CHECK(
+        st_netpattern_decode_view(
+            (st_netpattern_view_t){(const char *)pattern.data, pattern.length},
+            &tokens) == ST_OK);
     CHECK(tokens.count == 2 && tokens.tokens[1].type == ST_TYPE_LITERAL &&
           tokens.tokens[1].text_length == cases[i].decoded_length &&
           memcmp(tokens.tokens[1].text, cases[i].decoded,
@@ -2230,7 +2231,8 @@ static bool check_cpl_unicode_boundaries(void) {
           (decoded < ST_MAX_TOKEN_LEN ? ST_OK : ST_ERR_INVALID));
     if (decoded < ST_MAX_TOKEN_LEN) {
       CHECK(st_netpattern_decode_view(
-                (st_netpattern_view_t){pattern.data, pattern.length},
+                (st_netpattern_view_t){(const char *)pattern.data,
+                                       pattern.length},
                 &tokens) == ST_OK);
       CHECK(tokens.count == 2 && tokens.tokens[1].text_length == decoded);
       st_token_array_free(&tokens);
@@ -2303,8 +2305,8 @@ static bool check_save_file_boundaries(void) {
   CHECK(policy && loaded_policy);
   CHECK(st_netpattern_from_cpl_owned("echo \"a\\x00b\"", &pattern) == ST_OK);
   CHECK(st_policy_add_netpattern_view(
-            policy, (st_netpattern_view_t){pattern.data, pattern.length}) ==
-        ST_OK);
+            policy, (st_netpattern_view_t){(const char *)pattern.data,
+                                           pattern.length}) == ST_OK);
   CHECK(st_learner_feed_netargv_view(
             learner, (st_netargv_view_t){netargv, sizeof(netargv) - 1}) ==
         ST_OK);
@@ -2430,8 +2432,8 @@ static bool check_long_save_paths(void) {
   CHECK(policy && loaded_policy);
   CHECK(st_netpattern_from_cpl_owned("echo \"a\\x00b\"", &pattern) == ST_OK);
   CHECK(st_policy_add_netpattern_view(
-            policy, (st_netpattern_view_t){pattern.data, pattern.length}) ==
-        ST_OK);
+            policy, (st_netpattern_view_t){(const char *)pattern.data,
+                                           pattern.length}) == ST_OK);
   CHECK(st_learner_feed_netargv_view(
             learner, (st_netargv_view_t){netargv, sizeof(netargv) - 1}) ==
         ST_OK);

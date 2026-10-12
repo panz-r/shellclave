@@ -28,12 +28,6 @@ sg_anomaly_status_t sg_anomaly_model_read_new(FILE *stream,
                                               sg_anomaly_model_t **out)
     SHELL_NONNULL(1, 2);
 
-/* Validate a canonical sequence and report its outer record count. netseq may
- * be NULL exactly when length is zero, representing an empty byte span. */
-sg_anomaly_status_t sg_anomaly_netseq_count(const char *netseq, size_t length,
-                                            bool enforce_item_limit,
-                                            size_t *count) SHELL_NONNULL(4);
-
 /* Learn matching raw and type sequences as one transaction. Their outer stage
  * counts must agree. If either model cannot accept the sample, neither retains
  * any of its learned counts. `raw`

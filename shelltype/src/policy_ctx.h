@@ -10,13 +10,11 @@
 st_error_t st_policy_ctx_swap_storage(st_policy_ctx_t *destination,
                                       st_policy_ctx_t *replacement)
     SHELL_NONNULL(1, 2);
-/* Required live context and readable NUL-terminated string. Returned interned
+/* Required live context and length < SIZE_MAX readable bytes. Returned interned
  * storage is borrowed until the context is reset, compacted or released;
- * allocation failure returns NULL without invalidating existing strings. */
-const char *st_policy_ctx_intern(st_policy_ctx_t *ctx, const char *str)
-    SHELL_NONNULL(1, 2);
-/* Same ownership as intern, with length < SIZE_MAX readable bytes. data may
- * be NULL only for length == 0. The caller provides a valid span; this is not a
+ * allocation failure returns NULL without invalidating existing strings.
+ * data may be NULL only for length == 0. The caller provides a valid span;
+ * embedded NUL bytes are preserved. This is not a
  * framing or pointer-validation boundary. */
 const char *st_policy_ctx_intern_view(st_policy_ctx_t *ctx, const char *data,
                                       size_t length) SHELL_NONNULL(1);

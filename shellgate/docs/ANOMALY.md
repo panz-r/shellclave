@@ -2,6 +2,15 @@
 
 Shellgate uses a **hybrid dual-model** language model to detect anomalous shell execution-stage sequences. Two independent n-gram models score each stage and their results are combined with configurable weights.
 
+For direct model inspection, borrow const handles with
+`sg_gate_anomaly_raw_model_borrowed()` and
+`sg_gate_anomaly_type_model_borrowed()`, then use the `sg_anomaly_model_*`
+accessors. Both handles are NULL when detection is disabled. Never mutate or
+free these Gate-owned models. Successful replacement, disabling, and Gate
+destruction invalidate the handles; failed replacement preserves them. Gate
+retains coordinated learning, calibration, combined diagnostics, and paired
+bundle persistence rather than duplicating standalone model operations.
+
 ## How It Works
 
 ### Architecture
@@ -141,8 +150,8 @@ sentinel (`0:,`) rather than inventing a command name. The API is read-only: it
 neither learns nor changes adaptive or Bayesian
 threshold state. Use `shell_build_command_netseq_buffer()` and
 `shell_build_type_netseq_buffer()` to construct the matching pair from source
-when payloads may contain NUL; their legacy C-string counterparts are suitable
-only for NUL-free records.
+for every payload, including embedded NUL. The former C-string transport
+adapters have been removed.
 
 ## Type Sequence Caching
 
@@ -154,7 +163,7 @@ sg_gate_set_anomaly_cache_size(gate, 0);    /* disable */
 ```
 
 - Default: disabled (cache_size = 0)
-- On cache hit, `shell_build_type_netseq` is skipped
+- On cache hit, `shell_build_type_netseq_buffer` is skipped
 - Least-recently-used entries are evicted when the cache is full
 - Maximum allowed size: 8192 entries
 - Cache is not persisted through save/load (only the model is saved)

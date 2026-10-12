@@ -34,10 +34,6 @@ typedef struct {
 /* Release an owned canonical buffer and reset it. NULL is a no-op. */
 void shell_netstring_buffer_free(shell_netstring_buffer_t *buffer);
 
-/* Return true only for a valid empty owned-output buffer. */
-bool shell_netstring_buffer_is_empty(const shell_netstring_buffer_t *buffer)
-    SHELL_NONNULL(1);
-
 /* Stateful, allocation-free iterator over concatenated canonical netstrings.
  * The input is byte-oriented: payloads may contain NUL bytes. */
 typedef struct {

@@ -13,6 +13,7 @@ static int failures;
       fprintf(stderr, "%s:%d: check failed: %s\n", __FILE__, __LINE__,         \
               #condition);                                                     \
       failures++;                                                              \
+      exit(EXIT_FAILURE);                                                      \
     }                                                                          \
   } while (0)
 

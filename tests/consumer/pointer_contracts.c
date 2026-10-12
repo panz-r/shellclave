@@ -18,15 +18,17 @@
 #if TEST_BAD >= 29 && TEST_BAD <= 46
 #include "../../shellsplit/src/shell_tokenizer_full.c"
 #elif (TEST_BAD >= 51 && TEST_BAD <= 53) ||                                    \
-    (TEST_BAD >= 56 && TEST_BAD <= 75) || TEST_BAD == 149
+    (TEST_BAD >= 56 && TEST_BAD <= 75) || TEST_BAD == 148
 #include "../../shellsplit/src/shell_processor.c"
 #elif TEST_BAD == 106
 #include "../../shellsplit/src/shell_tokenizer.c"
 #elif (TEST_BAD >= 107 && TEST_BAD <= 109) ||                                  \
-    (TEST_BAD >= 159 && TEST_BAD <= 163)
+    (TEST_BAD >= 158 && TEST_BAD <= 162)
 #include "../../shellsplit/src/shell_depgraph.c"
-#elif (TEST_BAD >= 150 && TEST_BAD <= 158) ||                                  \
-    (TEST_BAD >= 164 && TEST_BAD <= 166)
+#elif TEST_BAD >= 149 && TEST_BAD <= 154
+#include "../../shellsplit/src/shell_expand.c"
+#elif (TEST_BAD >= 155 && TEST_BAD <= 157) ||                                  \
+    (TEST_BAD >= 163 && TEST_BAD <= 165)
 #include "../../shellgate/src/shellgate.c"
 #endif
 
@@ -81,8 +83,8 @@ void pointer_contracts(sg_gate_t *gate, st_policy_t *policy) {
 #elif TEST_BAD == 8
   (void)shell_write_decoded_word("x", 1, buffer, sizeof(buffer), NULL);
 #elif TEST_BAD == 9
-  sg_anomaly_model_t *model = sg_anomaly_model_new();
-  (void)sg_anomaly_model_fourgram_count(model, NULL, "b", "c", "d");
+  sg_anomaly_item_view_t item = {"x", 1};
+  (void)sg_anomaly_model_fourgram_count_view(NULL, item, item, item, item);
 #elif TEST_BAD == 10
   (void)sg_atomic_output_begin(NULL, &gate_output);
 #elif TEST_BAD == 11
@@ -100,10 +102,10 @@ void pointer_contracts(sg_gate_t *gate, st_policy_t *policy) {
 #elif TEST_BAD == 17
   shell_file_write_directory(NULL, 0, (char[2]){0});
 #elif TEST_BAD == 18
-  char *netpattern = NULL;
-  (void)st_netpattern_from_cpl(NULL, &netpattern);
+  st_netpattern_t netpattern = {0};
+  (void)st_netpattern_from_cpl_owned(NULL, &netpattern);
 #elif TEST_BAD == 19
-  (void)st_netpattern_from_cpl("echo", NULL);
+  (void)st_netpattern_from_cpl_owned("echo", NULL);
 #elif TEST_BAD == 20
   (void)shell_pipeline_prefix_step(NULL, SHELL_PIPE_PREFIX_WORD_TIME);
 #elif TEST_BAD == 21
@@ -389,101 +391,142 @@ void pointer_contracts(sg_gate_t *gate, st_policy_t *policy) {
 #elif TEST_BAD == 135
   (void)st_policy_ctx_is_exclusive(NULL);
 #elif TEST_BAD == 136
-  (void)st_policy_ctx_intern(NULL, "value");
+  (void)st_policy_ctx_intern_view(NULL, "value", strlen("value"));
 #elif TEST_BAD == 137
-  (void)st_policy_ctx_intern(st_policy_ctx_new(), NULL);
-#elif TEST_BAD == 138
   (void)st_policy_ctx_intern_view(NULL, NULL, 0);
-#elif TEST_BAD == 139
+#elif TEST_BAD == 138
   (void)st_policy_ctx_swap_storage(NULL, st_policy_ctx_new());
-#elif TEST_BAD == 140
+#elif TEST_BAD == 139
   (void)st_policy_ctx_swap_storage(st_policy_ctx_new(), NULL);
-#elif TEST_BAD == 141
+#elif TEST_BAD == 140
   shell_file_write_directory("unused", 0, NULL);
-#elif TEST_BAD == 142
+#elif TEST_BAD == 141
   (void)shell_file_create_temp_at(0, "destination", NULL);
-#elif TEST_BAD == 143
+#elif TEST_BAD == 142
   (void)shell_file_create_temp_from_bytes(0, "destination", NULL,
                                           (char[12]){0});
-#elif TEST_BAD == 144
+#elif TEST_BAD == 143
   (void)shell_file_create_temp_from_bytes(
       0, "destination", (const unsigned char[SHELL_FILE_TEMP_RANDOM_BYTES]){0},
       NULL);
-#elif TEST_BAD == 145
+#elif TEST_BAD == 144
   (void)shell_file_create_temp_at(0, NULL, (char[12]){0});
-#elif TEST_BAD == 146
+#elif TEST_BAD == 145
   (void)shell_file_create_temp_from_bytes(
       0, NULL, (const unsigned char[SHELL_FILE_TEMP_RANDOM_BYTES]){0},
       (char[12]){0});
-#elif TEST_BAD == 147
+#elif TEST_BAD == 146
   size_t prefix;
   (void)shell_file_path_prefix(NULL, &prefix);
-#elif TEST_BAD == 148
+#elif TEST_BAD == 147
   (void)shell_file_path_prefix("destination", NULL);
-#elif TEST_BAD == 149
+#elif TEST_BAD == 148
   (void)shell_processed_command_is_empty_timing(NULL);
+#elif TEST_BAD == 149
+  (void)shell_expand_cache_size(0, NULL);
 #elif TEST_BAD == 150
-  (void)sg_expansion_cache_size(0, NULL);
+  (void)shell_expand_lookup(NULL, "");
 #elif TEST_BAD == 151
-  (void)sg_expansion_lookup(NULL, "");
+  shell_expand_cache_t cache = {0};
+  (void)shell_expand_lookup(&cache, NULL);
 #elif TEST_BAD == 152
-  sg_expansion_cache_t cache = {0};
-  (void)sg_expansion_lookup(&cache, NULL);
+  (void)shell_expand_validate(NULL, false, false);
 #elif TEST_BAD == 153
-  (void)sg_expansion_validate(NULL, false);
+  shell_expand_cache_t cache = {0};
+  (void)shell_expand_resolve(NULL, &cache);
 #elif TEST_BAD == 154
-  sg_expansion_cache_t cache = {0};
-  (void)sg_expand_word(NULL, &cache);
-#elif TEST_BAD == 155
   shell_dep_expand_request_t request = {0};
-  (void)sg_expand_word(&request, NULL);
-#elif TEST_BAD == 156
+  (void)shell_expand_resolve(&request, NULL);
+#elif TEST_BAD == 155
   (void)sg_eval_workspace_size(0, NULL);
-#elif TEST_BAD == 157
+#elif TEST_BAD == 156
   write_expansion_display(NULL, 0, NULL);
-#elif TEST_BAD == 158
+#elif TEST_BAD == 157
   shell_dep_cmd_t command = {0};
   buf_writer_t writer = {0};
   const char *netargv;
   size_t length;
   sg_error_t error;
   (void)build_cmd_string(&command, &writer, NULL, &netargv, &length, &error);
-#elif TEST_BAD == 159
+#elif TEST_BAD == 158
   (void)dep_bytes_look_like_path(NULL, 0);
-#elif TEST_BAD == 160
+#elif TEST_BAD == 159
   dep_token_t source = {0};
   shell_dep_cmd_t command = {0};
   (void)dep_add_argument_document(NULL, 0, 0, 0, &source, NULL, 0, &command);
-#elif TEST_BAD == 161
+#elif TEST_BAD == 160
   shell_dep_graph_t graph = {0};
   shell_dep_cmd_t command = {0};
   (void)dep_add_argument_document(&graph, 0, 0, 0, NULL, NULL, 0, &command);
-#elif TEST_BAD == 162
+#elif TEST_BAD == 161
   shell_dep_graph_t graph = {0};
   dep_token_t source = {0};
   (void)dep_add_argument_document(&graph, 0, 0, 0, &source, NULL, 0, NULL);
-#elif TEST_BAD == 163
+#elif TEST_BAD == 162
   dep_token_list_t tokens = {0};
   dep_exec_analysis_t exec = {0};
   dep_prepare_expandable_arguments(&tokens, UINT32_MAX, UINT32_MAX, false, NULL,
                                    &exec, NULL);
-#elif TEST_BAD == 164
-  sg_expansion_cache_t cache = {0};
+#elif TEST_BAD == 163
+  shell_expand_cache_t cache = {0};
   uint32_t flags[SHELL_DEP_MAX_NODES];
   (void)sg_expansion_flags_prepare(NULL, &cache, flags);
-#elif TEST_BAD == 165
+#elif TEST_BAD == 164
   shell_dep_graph_t graph = {0};
   uint32_t flags[SHELL_DEP_MAX_NODES];
   (void)sg_expansion_flags_prepare(&graph, NULL, flags);
-#elif TEST_BAD == 166
+#elif TEST_BAD == 165
   shell_dep_graph_t graph = {0};
-  sg_expansion_cache_t cache = {0};
+  shell_expand_cache_t cache = {0};
   (void)sg_expansion_flags_prepare(&graph, &cache, NULL);
-#elif TEST_BAD == 167
+#elif TEST_BAD == 166
   shell_parse_result_t parsed = {0};
   shell_dep_graph_t graph = {0};
   (void)shell_dep_graph_parse_with_fast_resolver("echo", 4, NULL, NULL, &parsed,
                                                  &graph, NULL, NULL);
+#elif TEST_BAD == 167
+  (void)sg_gate_new_with_policies_owned(NULL, policy);
+#elif TEST_BAD == 168
+  (void)sg_gate_new_with_policies_owned(policy, NULL);
+#elif TEST_BAD == 169
+  (void)sg_gate_new_with_policies_borrowed(NULL, policy);
+#elif TEST_BAD == 170
+  (void)sg_gate_new_with_policies_borrowed(policy, NULL);
+#elif TEST_BAD == 171
+  sg_gate_set_allow_policy_owned(NULL, policy);
+#elif TEST_BAD == 172
+  sg_gate_set_allow_policy_owned(gate, NULL);
+#elif TEST_BAD == 173
+  sg_gate_set_deny_policy_owned(NULL, policy);
+#elif TEST_BAD == 174
+  sg_gate_set_deny_policy_owned(gate, NULL);
+#elif TEST_BAD == 175
+  sg_gate_set_allow_policy_borrowed(NULL, policy);
+#elif TEST_BAD == 176
+  sg_gate_set_allow_policy_borrowed(gate, NULL);
+#elif TEST_BAD == 177
+  sg_gate_set_deny_policy_borrowed(NULL, policy);
+#elif TEST_BAD == 178
+  sg_gate_set_deny_policy_borrowed(gate, NULL);
+#elif TEST_BAD == 179
+  (void)sg_gate_allow_policy_borrowed(NULL);
+#elif TEST_BAD == 180
+  (void)sg_gate_deny_policy_borrowed(NULL);
+#elif TEST_BAD == 181
+  (void)sg_gate_anomaly_raw_model_borrowed(NULL);
+#elif TEST_BAD == 182
+  (void)sg_gate_anomaly_type_model_borrowed(NULL);
+#elif TEST_BAD == 183
+  (void)shell_dep_resolved_workspace_size(4, NULL, NULL);
+#elif TEST_BAD == 184
+  (void)shell_dep_graph_parse_resolved("echo", 4, NULL, NULL, NULL, NULL, NULL,
+                                       NULL);
+#elif TEST_BAD == 185
+  shell_dep_graph_t graph = {0};
+  (void)shell_dep_graph_parse_resolved(NULL, 4, NULL, NULL, &graph, NULL, NULL,
+                                       NULL);
+#elif TEST_BAD == 186
+  (void)st_policy_clear(sg_gate_allow_policy_borrowed(gate));
 #else
   /* These NULL values have API meanings and must stay accepted. */
   (void)shell_netstring_iter_init(&iter, NULL, 0);
@@ -514,9 +557,13 @@ void pointer_contracts(sg_gate_t *gate, st_policy_t *policy) {
   (void)st_netargv_visit_view((st_netargv_view_t){NULL, 0}, visit_token, NULL,
                               NULL);
   (void)sg_gate_set_expand_word_netargv(gate, NULL, NULL);
+  const st_policy_t *installed = sg_gate_allow_policy_borrowed(gate);
+  (void)st_policy_eval_view(installed, (st_netargv_view_t){"1:x,", 4},
+                            &evaluation);
   st_learner_t *learner = st_learner_new(NULL);
   st_policy_ctx_t *context = st_policy_ctx_new();
   (void)st_policy_ctx_intern_view(context, NULL, 0);
+  (void)st_token_classify(NULL, 0);
   st_policy_ctx_release(context);
   sg_anomaly_model_t *model = sg_anomaly_model_new_with_config(NULL);
   st_learner_free(learner);

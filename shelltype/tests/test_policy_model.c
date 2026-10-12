@@ -10,16 +10,6 @@
 #include <string.h>
 #include <unistd.h>
 
-static bool pattern_is_cpl(const char *actual, const char *cpl) {
-  if (!actual || !cpl)
-    return actual == cpl;
-  char *encoded = NULL;
-  bool equal = st_netpattern_from_cpl(cpl, &encoded) == ST_OK &&
-               strcmp(actual, encoded) == 0;
-  free(encoded);
-  return equal;
-}
-
 static const char *const patterns[] = {
     "git status",
     "docker ps",
@@ -204,7 +194,10 @@ static int cross_policy_matches_model(st_policy_t *actual, const bool *active,
     if (test_st_policy_eval(actual, cross_probes[probe], &result) != ST_OK ||
         result.matches != (selected != NULL) ||
         ((result.matching_pattern == NULL) != (selected == NULL)) ||
-        (selected && !pattern_is_cpl(result.matching_pattern, selected))) {
+        (selected && !test_pattern_is_cpl(
+                         (st_netpattern_view_t){result.matching_pattern,
+                                                result.matching_pattern_length},
+                         selected))) {
       fprintf(stderr, "cross seed %u step %zu probe %zu: eval differs\n", seed,
               step, probe);
       fprintf(stderr, "  actual=%s expected=%s\n",
@@ -213,12 +206,12 @@ static int cross_policy_matches_model(st_policy_t *actual, const bool *active,
       return 0;
     }
 
-    const char **matches = NULL;
+    st_netpattern_view_t *matches = NULL;
     size_t match_count = 0;
     if (test_st_policy_verify_all(actual, cross_probes[probe], &matches,
                                   &match_count) != ST_OK ||
         match_count != expected_match_count) {
-      test_st_policy_matches_free(matches);
+      st_policy_matches_free(matches);
       return 0;
     }
     for (size_t i = 0; i < sizeof(cross_patterns) / sizeof(cross_patterns[0]);
@@ -227,13 +220,14 @@ static int cross_policy_matches_model(st_policy_t *actual, const bool *active,
         continue;
       bool found = false;
       for (size_t j = 0; j < match_count; j++)
-        found = found || pattern_is_cpl(matches[j], cross_patterns[i].pattern);
+        found =
+            found || test_pattern_is_cpl(matches[j], cross_patterns[i].pattern);
       if (!found) {
-        test_st_policy_matches_free(matches);
+        st_policy_matches_free(matches);
         return 0;
       }
     }
-    test_st_policy_matches_free(matches);
+    st_policy_matches_free(matches);
   }
   return 1;
 }
@@ -381,7 +375,10 @@ static int policy_matches_model(st_policy_t *actual, const bool *active,
     if (test_st_policy_eval(actual, probes[i], &result) != ST_OK ||
         result.matches != (expected != NULL) ||
         ((result.matching_pattern == NULL) != (expected == NULL)) ||
-        (expected && !pattern_is_cpl(result.matching_pattern, expected))) {
+        (expected && !test_pattern_is_cpl(
+                         (st_netpattern_view_t){result.matching_pattern,
+                                                result.matching_pattern_length},
+                         expected))) {
       fprintf(stderr, "seed %u step %zu probe %zu: evaluation differs\n", seed,
               step, i);
       fprintf(stderr, "  actual=%s expected=%s\n",
@@ -389,16 +386,16 @@ static int policy_matches_model(st_policy_t *actual, const bool *active,
               expected ? expected : "(none)");
       return 0;
     }
-    const char **matches = NULL;
+    st_netpattern_view_t *matches = NULL;
     size_t match_count = 0;
     if (test_st_policy_verify_all(actual, probes[i], &matches, &match_count) !=
             ST_OK ||
         match_count != (expected ? 1u : 0u) ||
-        (expected && !pattern_is_cpl(matches[0], expected))) {
-      test_st_policy_matches_free(matches);
+        (expected && !test_pattern_is_cpl(matches[0], expected))) {
+      st_policy_matches_free(matches);
       return 0;
     }
-    test_st_policy_matches_free(matches);
+    st_policy_matches_free(matches);
   }
   return 1;
 }

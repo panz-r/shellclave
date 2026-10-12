@@ -44,7 +44,7 @@ static bool verbose = false;
     if (!(cond)) {                                                             \
       printf("    FAIL: %s at %s:%d\n", #cond, __FILE__, __LINE__);            \
       fail_count++;                                                            \
-      return;                                                                  \
+      exit(EXIT_FAILURE);                                                      \
     }                                                                          \
   } while (0)
 
@@ -54,7 +54,7 @@ static bool verbose = false;
       printf("    FAIL: expected '%s', got '%s' at %s:%d\n", (b), (a),         \
              __FILE__, __LINE__);                                              \
       fail_count++;                                                            \
-      return;                                                                  \
+      exit(EXIT_FAILURE);                                                      \
     }                                                                          \
   } while (0)
 
@@ -67,7 +67,7 @@ static bool verbose = false;
           "    FAIL: expected '%s' (len %u), got '%.*s' (len %u) at %s:%d\n",  \
           _e, _elen, (slen), (s), (slen), __FILE__, __LINE__);                 \
       fail_count++;                                                            \
-      return;                                                                  \
+      exit(EXIT_FAILURE);                                                      \
     }                                                                          \
   } while (0)
 
@@ -6328,6 +6328,103 @@ TEST(nested_composition_matrix) {
   pass_count++;
 }
 
+/* Structural expectations formerly checked through Shellgate's lossy result
+ * projection belong to the graph itself, including compound timer ownership. */
+TEST(direct_component_topology_contract) {
+  static const struct {
+    const char *source;
+    uint32_t commands;
+    uint16_t depths[3];
+    bool background[3];
+    shell_pipeline_time_mode_t command_mode;
+    uint32_t timers;
+    bool timed_group;
+  } cases[] = {
+      {"{ echo one; echo two; } | cat",
+       3,
+       {1, 1, 0},
+       {false, false, false},
+       SHELL_PIPE_TIME_NONE,
+       0,
+       false},
+      {"{ echo one; echo two; } & pwd",
+       3,
+       {1, 1, 0},
+       {true, true, false},
+       SHELL_PIPE_TIME_NONE,
+       0,
+       false},
+      {"{ { echo one; }; cat; }",
+       2,
+       {2, 1},
+       {false, false},
+       SHELL_PIPE_TIME_NONE,
+       0,
+       false},
+      {"time -p printf one | cat",
+       2,
+       {0, 0},
+       {false, false},
+       SHELL_PIPE_TIME_POSIX,
+       1,
+       false},
+      {"time -p { echo one; cat; }",
+       2,
+       {1, 1},
+       {false, false},
+       SHELL_PIPE_TIME_NONE,
+       1,
+       true},
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    shell_dep_graph_t graph;
+    ASSERT(parse(cases[i].source, &graph) == SHELL_DEP_OK);
+    ASSERT(count_type(&graph, SHELL_NODE_CMD) == cases[i].commands);
+    ASSERT(count_type(&graph, SHELL_NODE_TIME) == cases[i].timers);
+    for (uint32_t j = 0; j < cases[i].commands; j++) {
+      int index = find_nth_cmd(&graph, j);
+      ASSERT(index >= 0);
+      const shell_dep_cmd_t *command = &graph.nodes[index].cmd;
+      ASSERT(command->group_depth == cases[i].depths[j]);
+      ASSERT(command->backgrounded == cases[i].background[j]);
+      ASSERT(command->pipeline_time_mode == cases[i].command_mode);
+    }
+    if (cases[i].timers) {
+      bool target = false;
+      for (uint32_t j = 0; j < graph.edge_count; j++) {
+        const shell_dep_edge_t *edge = &graph.edges[j];
+        if (edge->type != SHELL_EDGE_TIME)
+          continue;
+        ASSERT(graph.nodes[edge->from].type == SHELL_NODE_TIME);
+        ASSERT(graph.nodes[edge->to].type ==
+               (cases[i].timed_group ? SHELL_NODE_GROUP : SHELL_NODE_CMD));
+        target = true;
+      }
+      ASSERT(target);
+    }
+    ASSERT(shell_dep_graph_validate(&graph).valid);
+  }
+  shell_dep_graph_t graph;
+  ASSERT(parse("echo $(printf x $(id))", &graph) == SHELL_DEP_OK);
+  ASSERT(count_type(&graph, SHELL_NODE_CMD) == 3);
+  ASSERT(count_edge_type(&graph, SHELL_EDGE_SUBST) == 2);
+  int echo = find_cmd_tokens(&graph, "echo", NULL);
+  int printf_command = find_cmd_tokens(&graph, "printf", "x");
+  int id = find_cmd_tokens(&graph, "id", NULL);
+  ASSERT(echo >= 0 && printf_command >= 0 && id >= 0);
+  bool inner = false, outer = false;
+  for (uint32_t i = 0; i < graph.edge_count; i++) {
+    const shell_dep_edge_t *edge = &graph.edges[i];
+    if (edge->type != SHELL_EDGE_SUBST)
+      continue;
+    inner |= edge->from == (uint32_t)id && edge->to == (uint32_t)printf_command;
+    outer |=
+        edge->from == (uint32_t)printf_command && edge->to == (uint32_t)echo;
+  }
+  ASSERT(inner && outer && shell_dep_graph_validate(&graph).valid);
+  pass_count++;
+}
+
 TEST(dynamic_substitution_io_topology) {
   shell_dep_graph_t graph;
   ASSERT(parse("echo $(printf value)", &graph) == SHELL_DEP_OK);
@@ -9385,7 +9482,6 @@ TEST(descriptor_metadata_scaling) {
       }
       size_t length = strlen(families[family].suffix);
       memcpy(source + used, families[family].suffix, length + 1);
-      used += length;
       shellsplit_test_source_scan_reset();
       shell_dep_graph_t graph;
       shell_dep_error_t status = parse(source, &graph);
@@ -10388,6 +10484,8 @@ TEST(substitution_capacity_error_contract) {
           source, sizeof(source), changes,
           shellsplit_test_substitution_capacity_cases[i], &length));
       shell_dep_graph_t graph;
+      /* Error/status publication must not depend on caller initialization. */
+      memset(&graph, 0xa5, sizeof(graph));
       shell_dep_error_t status =
           shell_dep_graph_parse(source, length, ".", NULL, &graph);
       bool complete = changes < SHELL_DEP_TIME_MAX_EXTERNAL_FDS;
@@ -11541,6 +11639,41 @@ TEST(resolver_workspace_contract) {
                                        &graph) == SHELL_DEP_EWORKSPACE);
   ASSERT(graph.node_count == 0 && graph.edge_count == 0 &&
          graph.cwd_buf.len == 0 && graph.status == SHELL_DEP_STATUS_ERROR);
+  pass_count++;
+}
+
+TEST(resolver_workspace_initialization) {
+  size_t required = 0;
+  ASSERT(shell_dep_workspace_size(NULL, &required));
+  ASSERT(required <= sizeof(shellsplit_test_dep_workspace));
+  shell_dep_limits_t limits = SHELL_DEP_LIMITS_DEFAULT;
+  limits.workspace = shellsplit_test_dep_workspace;
+  limits.workspace_size = required;
+  static const char *const commands[] = {
+      "exec {fd}>out; printf payload >&$fd",
+      "exec {fd}>out; IFS=; printf payload >&$fd",
+      "exec {fd}>out; IFS=0123456789; printf payload >&\"$fd\"",
+      "exec {fd}>out; IFS=0123456789; echo $(printf payload >&\"$fd\")",
+      "exec {fd}>out; IFS=; echo $(printf payload >&$fd)",
+      "exec {fd}>out; printf payload >&$fd",
+  };
+  static const unsigned char patterns[] = {0x5a, 0xa5};
+  for (size_t pattern = 0; pattern < sizeof(patterns); pattern++) {
+    /* Scratch storage has no caller initialization requirement. Later parses
+     * also reuse the previous parse's journal without clearing its bytes. */
+    memset(limits.workspace, patterns[pattern], required);
+    for (size_t i = 0; i < sizeof(commands) / sizeof(commands[0]); i++) {
+      shell_dep_graph_t graph;
+      ASSERT(raw_dep_graph_parse(commands[i], strlen(commands[i]), ".", &limits,
+                                 &graph) == SHELL_DEP_OK);
+      int writer = find_cmd_tokens(&graph, "printf", "payload");
+      int document = find_file_doc(&graph, "out");
+      ASSERT(writer >= 0 && document >= 0);
+      ASSERT(has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)writer,
+                          (uint32_t)document, 1, SHELL_DEP_FD_NONE));
+      ASSERT(shell_dep_graph_validate(&graph).valid);
+    }
+  }
   pass_count++;
 }
 
@@ -14766,7 +14899,7 @@ dep_resolve_failed_path(const shell_dep_expand_request_t *request,
   static const shell_dep_word_value_t unresolved = {0};
   dep_expansion_failure_t *failure = context;
   size_t length = strlen(failure->word);
-  if (request->purpose != SHELL_DEP_EXPAND_REDIRECT_PATH ||
+  if (request->purpose != SHELL_EXPAND_WORD_REDIRECT_PATH ||
       request->word_length != length ||
       memcmp(request->word, failure->word, length) != 0)
     return &unresolved;
@@ -14788,7 +14921,7 @@ static SHELL_NONNULL(1) const shell_dep_word_value_t
                                               .first_length = 8,
                                               .resolved = true,
                                               .dynamic = true};
-  if (request->purpose == SHELL_DEP_EXPAND_ARGUMENT)
+  if (request->purpose == SHELL_EXPAND_WORD_ARGUMENT)
     return &static_word;
   if (request->word_length == 7 && memcmp(request->word, "\"$FILE\"", 7) == 0)
     return &leaf;
@@ -15295,7 +15428,7 @@ dep_resolve_argument_fixture(const shell_dep_expand_request_t *request,
                              void *context) {
   static const shell_dep_word_value_t unresolved = {0};
   dep_argument_fixture_t *fixture = context;
-  if (request->purpose != SHELL_DEP_EXPAND_ARGUMENT || !request->eligible ||
+  if (request->purpose != SHELL_EXPAND_WORD_ARGUMENT || !request->eligible ||
       request->word_length != strlen(fixture->word) ||
       memcmp(request->word, fixture->word, request->word_length) != 0)
     return &unresolved;
@@ -17855,6 +17988,7 @@ int main(int argc, char **argv) {
   RUN(subshell_matrix);
   RUN(nested_composition_matrix);
   RUN(dynamic_substitution_io_topology);
+  RUN(direct_component_topology_contract);
   RUN(file_command_substitution_intersections);
   RUN(file_command_substitution_dynamic_operands);
   RUN(io_number_boundaries);
@@ -17931,6 +18065,7 @@ int main(int argc, char **argv) {
   RUN(null_input);
   RUN(empty_input);
   RUN(resolver_workspace_contract);
+  RUN(resolver_workspace_initialization);
   RUN(adversarial_limits);
   RUN(parse_error);
   RUN(ansi_nul_source_boundary);

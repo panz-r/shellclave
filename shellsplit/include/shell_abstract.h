@@ -108,7 +108,9 @@ typedef struct {
  */
 typedef struct {
   const char *original; // Owned copy of the input command
-  char *display_text;   // Lossy diagnostic abstraction (owned)
+  /* Owned lossy diagnostic abstraction, not shell source or canonical argv.
+   * Programmatic consumers use Shellsplit's canonical sequence builders. */
+  char *display_text;
 
   shell_abstract_element_t **elements; // Array of pointers (owned)
   size_t element_count;
@@ -176,15 +178,6 @@ shell_abstract_command_parse(const char *command, size_t command_length,
     SHELL_NONNULL(1, 3);
 
 /**
- * Get the lossy diagnostic abstraction. This is not shell source or
- * canonical netargv; programmatic consumers must use Shellsplit's canonical
- * sequence builders instead.
- */
-const char *
-shell_abstract_command_get_display_text(const shell_abstract_command_t *cmd)
-    SHELL_NONNULL(1);
-
-/**
  * Get all extracted elements for validation
  */
 const shell_abstract_element_t *const *
@@ -195,43 +188,6 @@ shell_abstract_command_get_elements(const shell_abstract_command_t *cmd,
 shell_abstract_element_t *const *
 shell_abstract_command_get_mutable_elements(shell_abstract_command_t *cmd,
                                             size_t *count) SHELL_NONNULL(1, 2);
-
-/**
- * Get original command
- */
-const char *
-shell_abstract_command_get_source(const shell_abstract_command_t *cmd)
-    SHELL_NONNULL(1);
-
-/**
- * Check if command has specific feature
- */
-bool shell_abstract_command_has_variables(const shell_abstract_command_t *cmd)
-    SHELL_NONNULL(1);
-bool shell_abstract_command_has_pos_vars(const shell_abstract_command_t *cmd)
-    SHELL_NONNULL(1);
-bool shell_abstract_command_has_special_vars(
-    const shell_abstract_command_t *cmd) SHELL_NONNULL(1);
-bool shell_abstract_command_has_globs(const shell_abstract_command_t *cmd)
-    SHELL_NONNULL(1);
-bool shell_abstract_command_has_paths(const shell_abstract_command_t *cmd)
-    SHELL_NONNULL(1);
-bool shell_abstract_command_has_abs_paths(const shell_abstract_command_t *cmd)
-    SHELL_NONNULL(1);
-bool shell_abstract_command_has_rel_paths(const shell_abstract_command_t *cmd)
-    SHELL_NONNULL(1);
-bool shell_abstract_command_has_home_paths(const shell_abstract_command_t *cmd)
-    SHELL_NONNULL(1);
-/* True for executable direct and parameter-expansion-nested command/process
- * substitutions, including command substitutions inside double quotes. */
-bool shell_abstract_command_has_cmd_subst(const shell_abstract_command_t *cmd)
-    SHELL_NONNULL(1);
-bool shell_abstract_command_has_redirects(const shell_abstract_command_t *cmd)
-    SHELL_NONNULL(1);
-bool shell_abstract_command_has_arithmetic(const shell_abstract_command_t *cmd)
-    SHELL_NONNULL(1);
-bool shell_abstract_command_has_strings(const shell_abstract_command_t *cmd)
-    SHELL_NONNULL(1);
 
 /**
  * Get element by abstraction string (e.g., "$AP_1")

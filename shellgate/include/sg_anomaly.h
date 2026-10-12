@@ -50,10 +50,6 @@ typedef enum {
  * fit exactly in the internal concatenated-netstring key limit. */
 #define SG_ANOMALY_MAX_STAGE_LENGTH 1023
 
-/* Compatibility spelling retained for source users from before anomaly items
- * were correctly named stages. New code should use _STAGE_LENGTH. */
-#define SG_ANOMALY_MAX_COMMAND_LENGTH SG_ANOMALY_MAX_STAGE_LENGTH
-
 /* --- ERROR STATE --- */
 
 /*
@@ -218,10 +214,6 @@ size_t sg_anomaly_model_unigram_count_view(const sg_anomaly_model_t *model,
                                            sg_anomaly_item_view_t cmd)
     SHELL_NONNULL(1);
 
-/* NUL-free compatibility convenience wrapper for unigram_count_view(). */
-size_t sg_anomaly_model_unigram_count(const sg_anomaly_model_t *model,
-                                      const char *cmd) SHELL_NONNULL(1, 2);
-
 /* Get count of unseen anomaly stages (for UNK probability estimation). */
 size_t sg_anomaly_model_unknown_count(const sg_anomaly_model_t *model)
     SHELL_NONNULL(1);
@@ -237,11 +229,6 @@ size_t sg_anomaly_model_bigram_count_view(const sg_anomaly_model_t *model,
                                           sg_anomaly_item_view_t curr)
     SHELL_NONNULL(1);
 
-/* NUL-free compatibility convenience wrapper for bigram_count_view(). */
-size_t sg_anomaly_model_bigram_count(const sg_anomaly_model_t *model,
-                                     const char *prev, const char *curr)
-    SHELL_NONNULL(1, 2, 3);
-
 /* Get trigram count for opaque anomaly-stage bytes. Returns 0 if never seen
  * or any view is invalid. */
 size_t sg_anomaly_model_trigram_count_view(const sg_anomaly_model_t *model,
@@ -249,12 +236,6 @@ size_t sg_anomaly_model_trigram_count_view(const sg_anomaly_model_t *model,
                                            sg_anomaly_item_view_t p1,
                                            sg_anomaly_item_view_t curr)
     SHELL_NONNULL(1);
-
-/* NUL-free compatibility convenience wrapper for trigram_count_view(). */
-size_t sg_anomaly_model_trigram_count(const sg_anomaly_model_t *model,
-                                      const char *p2, const char *p1,
-                                      const char *curr)
-    SHELL_NONNULL(1, 2, 3, 4);
 
 /* Get 4-gram count for opaque anomaly-stage bytes. Returns 0 if never seen
  * or any view is invalid. */
@@ -264,12 +245,6 @@ size_t sg_anomaly_model_fourgram_count_view(const sg_anomaly_model_t *model,
                                             sg_anomaly_item_view_t p1,
                                             sg_anomaly_item_view_t curr)
     SHELL_NONNULL(1);
-
-/* NUL-free compatibility convenience wrapper for fourgram_count_view(). */
-size_t sg_anomaly_model_fourgram_count(const sg_anomaly_model_t *model,
-                                       const char *p3, const char *p2,
-                                       const char *p1, const char *curr)
-    SHELL_NONNULL(1, 2, 3, 4, 5);
 
 /* Get total number of unique n-gram contexts across all levels. */
 size_t sg_anomaly_model_total_contexts(const sg_anomaly_model_t *model)

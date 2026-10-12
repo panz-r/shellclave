@@ -102,6 +102,8 @@ static void str_chunks_free(str_chunk_t *chunk) {
 
 static bool str_pool_grow(str_pool_t *p) {
   size_t new_cap = p->capacity * 2;
+  if (new_cap <= p->capacity)
+    return false;
   const char **new_slots = calloc(new_cap, sizeof(const char *));
   if (!new_slots)
     return false;
@@ -352,8 +354,4 @@ const char *st_policy_ctx_intern_view(st_policy_ctx_t *ctx, const char *str,
   ctx->str_pool.count++;
   pthread_mutex_unlock(&ctx->lock);
   return copy;
-}
-
-const char *st_policy_ctx_intern(st_policy_ctx_t *ctx, const char *str) {
-  return st_policy_ctx_intern_view(ctx, str, strlen(str));
 }

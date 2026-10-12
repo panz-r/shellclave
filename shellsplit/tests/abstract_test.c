@@ -36,22 +36,18 @@ static void test_bounded_span_and_statuses(void) {
   static const char abstract_with_suffix[] = {'c', 'a', 't', ' ', '/',
                                               't', 'm', 'p', 'X', '\0'};
   shell_abstract_command_t *result = NULL;
-  bool valid =
-      shell_abstract_command_parse(literal_with_suffix, 4, &result) ==
-          SHELL_ABSTRACT_OK &&
-      result &&
-      strcmp(shell_abstract_command_get_source(result), "echo") == 0 &&
-      strcmp(shell_abstract_command_get_display_text(result), "echo") == 0;
+  bool valid = shell_abstract_command_parse(literal_with_suffix, 4, &result) ==
+                   SHELL_ABSTRACT_OK &&
+               result && strcmp(result->original, "echo") == 0 &&
+               strcmp(result->display_text, "echo") == 0;
   shell_abstract_command_free(result);
 
   result = NULL;
-  valid =
-      valid &&
-      shell_abstract_command_parse(abstract_with_suffix, 8, &result) ==
-          SHELL_ABSTRACT_OK &&
-      result &&
-      strcmp(shell_abstract_command_get_source(result), "cat /tmp") == 0 &&
-      strcmp(shell_abstract_command_get_display_text(result), "cat $AP_1") == 0;
+  valid = valid &&
+          shell_abstract_command_parse(abstract_with_suffix, 8, &result) ==
+              SHELL_ABSTRACT_OK &&
+          result && strcmp(result->original, "cat /tmp") == 0 &&
+          strcmp(result->display_text, "cat $AP_1") == 0;
   shell_abstract_command_free(result);
   TEST("abstraction honors exact non-terminated spans", valid);
 
@@ -146,10 +142,8 @@ static void test_timed_complete_command_abstraction(void) {
     const shell_abstract_element_t *const *elements =
         shell_abstract_command_get_elements(result, &count);
     bool item = status == SHELL_ABSTRACT_OK && result != NULL &&
-                strcmp(shell_abstract_command_get_source(result),
-                       cases[i].source) == 0 &&
-                strcmp(shell_abstract_command_get_display_text(result),
-                       cases[i].display) == 0 &&
+                strcmp(result->original, cases[i].source) == 0 &&
+                strcmp(result->display_text, cases[i].display) == 0 &&
                 elements != NULL && count == cases[i].element_count &&
                 elements[0] != NULL &&
                 elements[0]->type == cases[i].first_type &&
@@ -190,9 +184,7 @@ static void test_compound_variable_quote_boundaries(void) {
     size_t count = 0;
     const shell_abstract_element_t *const *elements =
         result ? shell_abstract_command_get_elements(result, &count) : NULL;
-    valid = result &&
-            strcmp(shell_abstract_command_get_display_text(result),
-                   cases[i].display) == 0 &&
+    valid = result && strcmp(result->display_text, cases[i].display) == 0 &&
             count == cases[i].element_count && elements != NULL &&
             elements[count - 1] != NULL &&
             elements[count - 1]->type == SHELL_ABSTRACT_EV &&
@@ -223,8 +215,7 @@ static void test_compound_variable_quote_boundaries(void) {
     const shell_abstract_element_t *const *elements =
         result ? shell_abstract_command_get_elements(result, &count) : NULL;
     valid = length > 0 && (size_t)length < sizeof(source) && result &&
-            strcmp(shell_abstract_command_get_display_text(result),
-                   "printf prefix$STR_1") == 0 &&
+            strcmp(result->display_text, "printf prefix$STR_1") == 0 &&
             result->has_strings && !result->has_variables && count == 1 &&
             elements && elements[0] &&
             elements[0]->type == SHELL_ABSTRACT_STR &&
@@ -241,8 +232,7 @@ static void test_compound_variable_quote_boundaries(void) {
       continued ? shell_abstract_command_get_elements(continued, &count) : NULL;
   valid = continued && elements && count == 1 && elements[0] &&
           elements[0]->type == SHELL_ABSTRACT_EV &&
-          strcmp(shell_abstract_command_get_display_text(continued),
-                 "printf $EV_1") == 0 &&
+          strcmp(continued->display_text, "printf $EV_1") == 0 &&
           strcmp(elements[0]->original, "${NA\\\nME}") == 0 &&
           elements[0]->data.var.name &&
           strcmp(elements[0]->data.var.name, "NAME") == 0;
@@ -256,8 +246,7 @@ static void test_compound_substitution_boundaries(void) {
   const shell_abstract_element_t *const *elements =
       result ? shell_abstract_command_get_elements(result, &count) : NULL;
   bool valid = result && elements && count == 2 && result->has_cmd_subst &&
-               strcmp(shell_abstract_command_get_display_text(result),
-                      "printf \"x$EV_1$CS_1\"") == 0 &&
+               strcmp(result->display_text, "printf \"x$EV_1$CS_1\"") == 0 &&
                elements[0]->type == SHELL_ABSTRACT_EV &&
                strcmp(elements[0]->original, "$VAR") == 0 &&
                elements[1]->type == SHELL_ABSTRACT_CS &&
@@ -273,8 +262,7 @@ static void test_compound_substitution_boundaries(void) {
   valid = valid && result && elements && count == 1 && result->has_cmd_subst &&
           elements[0]->type == SHELL_ABSTRACT_EV &&
           strcmp(elements[0]->original, "${VAR:-$(id)}") == 0 &&
-          strcmp(shell_abstract_command_get_display_text(result),
-                 "printf prefix$EV_1") == 0;
+          strcmp(result->display_text, "printf prefix$EV_1") == 0;
   shell_abstract_command_free(result);
 
   result = parse_command("printf x$VAR`id` <(producer)");
@@ -429,8 +417,7 @@ static void test_nested_parameter_substitution_metadata(void) {
             elements[0]->type == SHELL_ABSTRACT_EV &&
             strcmp(elements[0]->original,
                    cases[i].source + strlen("printf ")) == 0 &&
-            shell_abstract_command_has_cmd_subst(result) ==
-                cases[i].has_substitution;
+            result->has_cmd_subst == cases[i].has_substitution;
     shell_abstract_command_free(result);
   }
   TEST("nested parameter substitutions remain visible in metadata", valid);
@@ -467,8 +454,7 @@ static void test_quote_aware_substitution_metadata(void) {
   bool valid = true;
   for (size_t i = 0; valid && i < sizeof(cases) / sizeof(cases[0]); i++) {
     shell_abstract_command_t *result = parse_command(cases[i].source);
-    valid = result && shell_abstract_command_has_cmd_subst(result) ==
-                          cases[i].has_substitution;
+    valid = result && result->has_cmd_subst == cases[i].has_substitution;
     shell_abstract_command_free(result);
   }
   TEST("substitution metadata honors quote execution semantics", valid);
@@ -481,8 +467,7 @@ static void test_modern_word_abstractions(void) {
   const shell_abstract_element_t *const *elements =
       result ? shell_abstract_command_get_elements(result, &count) : NULL;
   bool valid = result && elements && count == 2 &&
-               strcmp(shell_abstract_command_get_display_text(result),
-                      "printf $STR_1 $GB_1") == 0 &&
+               strcmp(result->display_text, "printf $STR_1 $GB_1") == 0 &&
                result->has_strings && result->has_globs && elements[0] &&
                elements[1] && elements[0]->type == SHELL_ABSTRACT_STR &&
                strcmp(elements[0]->original, "$'a\\n'") == 0 &&
@@ -511,21 +496,18 @@ enum {
 };
 
 static unsigned feature_mask(shell_abstract_command_t *command) {
-  return (shell_abstract_command_has_variables(command) ? FLAG_VARIABLES : 0) |
-         (shell_abstract_command_has_pos_vars(command) ? FLAG_POS_VARS : 0) |
-         (shell_abstract_command_has_special_vars(command) ? FLAG_SPECIAL_VARS
-                                                           : 0) |
-         (shell_abstract_command_has_globs(command) ? FLAG_GLOBS : 0) |
-         (shell_abstract_command_has_paths(command) ? FLAG_PATHS : 0) |
-         (shell_abstract_command_has_abs_paths(command) ? FLAG_ABS_PATHS : 0) |
-         (shell_abstract_command_has_rel_paths(command) ? FLAG_REL_PATHS : 0) |
-         (shell_abstract_command_has_home_paths(command) ? FLAG_HOME_PATHS
-                                                         : 0) |
-         (shell_abstract_command_has_cmd_subst(command) ? FLAG_CMD_SUBST : 0) |
-         (shell_abstract_command_has_arithmetic(command) ? FLAG_ARITHMETIC
-                                                         : 0) |
-         (shell_abstract_command_has_strings(command) ? FLAG_STRINGS : 0) |
-         (shell_abstract_command_has_redirects(command) ? FLAG_REDIRECTS : 0);
+  return (command->has_variables ? FLAG_VARIABLES : 0) |
+         (command->has_pos_vars ? FLAG_POS_VARS : 0) |
+         (command->has_special_vars ? FLAG_SPECIAL_VARS : 0) |
+         (command->has_globs ? FLAG_GLOBS : 0) |
+         (command->has_paths ? FLAG_PATHS : 0) |
+         (command->has_abs_paths ? FLAG_ABS_PATHS : 0) |
+         (command->has_rel_paths ? FLAG_REL_PATHS : 0) |
+         (command->has_home_paths ? FLAG_HOME_PATHS : 0) |
+         (command->has_cmd_subst ? FLAG_CMD_SUBST : 0) |
+         (command->has_arithmetic ? FLAG_ARITHMETIC : 0) |
+         (command->has_strings ? FLAG_STRINGS : 0) |
+         (command->has_redirects ? FLAG_REDIRECTS : 0);
 }
 
 static bool validate_elements(const char *input,
@@ -643,10 +625,8 @@ static void test_abstraction_matrix(void) {
     shell_abstract_command_t *result = parse_command(cases[i].input);
     bool ok = result != NULL;
     bool valid = ok && result &&
-                 strcmp(shell_abstract_command_get_source(result),
-                        cases[i].input) == 0 &&
-                 strcmp(shell_abstract_command_get_display_text(result),
-                        cases[i].expected) == 0 &&
+                 strcmp(result->original, cases[i].input) == 0 &&
+                 strcmp(result->display_text, cases[i].expected) == 0 &&
                  result->element_count == cases[i].elements &&
                  feature_mask(result) == cases[i].flags &&
                  validate_elements(cases[i].input, result);
@@ -735,29 +715,29 @@ static void test_abstraction_allocation_failures(void) {
   TEST("Timed command abstraction allocation failures are atomic",
        timed_atomic);
 
-  char *netseq = NULL;
+  shell_netstring_buffer_t netseq = {0};
   size_t count = 0;
   shellsplit_test_alloc_reset();
-  shell_process_status_t status =
-      shell_build_type_netseq(input, strlen(input), NULL, &netseq, &count);
+  shell_process_status_t status = shell_build_type_netseq_buffer(
+      input, strlen(input), NULL, &netseq, &count);
   allocations = shellsplit_test_alloc_count();
   /* Two date substitutions and three scoped printf substitutions precede the
    * enclosing echo. Keep the allocation probe on all six execution stages. */
   TEST("type-netsequence allocation probe succeeds",
-       status == SHELL_PROCESS_OK && netseq && count == 6);
-  free(netseq);
+       status == SHELL_PROCESS_OK && netseq.data && count == 6);
+  shell_netstring_buffer_free(&netseq);
 
   bool atomic = true;
   for (size_t fail_at = 1; fail_at <= allocations; fail_at++) {
-    netseq = (char *)(void *)1;
+    netseq = (shell_netstring_buffer_t){0};
     count = SIZE_MAX;
     shellsplit_test_alloc_fail_at(fail_at);
-    status =
-        shell_build_type_netseq(input, strlen(input), NULL, &netseq, &count);
+    status = shell_build_type_netseq_buffer(input, strlen(input), NULL, &netseq,
+                                            &count);
     shellsplit_test_alloc_reset();
-    if (status != SHELL_PROCESS_ENOMEM || netseq != NULL || count != 0) {
+    if (status != SHELL_PROCESS_ENOMEM || netseq.data != NULL || count != 0) {
       atomic = false;
-      free(netseq);
+      shell_netstring_buffer_free(&netseq);
       break;
     }
   }
@@ -1141,76 +1121,82 @@ static void test_invalid_and_null_inputs(void) {
 
 static void test_type_sequence_matrix(void) {
   printf("\n=== Type Sequence Matrix ===\n");
-  char *netseq = NULL;
+  shell_netstring_buffer_t netseq = {0};
   size_t command_count = 0;
   bool valid =
-      shell_build_type_netseq("printf 'two words'; cd /tmp",
-                              strlen("printf 'two words'; cd /tmp"), NULL,
-                              &netseq, &command_count) == SHELL_PROCESS_OK &&
-      command_count == 2 && netseq &&
-      strcmp(netseq, "15:6:printf,3:STR,,10:2:cd,2:AP,,") == 0;
+      shell_build_type_netseq_buffer(
+          "printf 'two words'; cd /tmp", strlen("printf 'two words'; cd /tmp"),
+          NULL, &netseq, &command_count) == SHELL_PROCESS_OK &&
+      command_count == 2 && netseq.data &&
+      (netseq.length != sizeof("15:6:printf,3:STR,,10:2:cd,2:AP,,") - 1 ||
+       memcmp(netseq.data, "15:6:printf,3:STR,,10:2:cd,2:AP,,",
+              netseq.length)) == 0;
   TEST("nested type sequence uses one record per command", valid);
-  free(netseq);
+  shell_netstring_buffer_free(&netseq);
 
-  netseq = NULL;
+  netseq = (shell_netstring_buffer_t){0};
   command_count = 0;
-  valid = shell_build_type_netseq(
+  valid = shell_build_type_netseq_buffer(
               "'my tool' 'two words'", strlen("'my tool' 'two words'"), NULL,
               &netseq, &command_count) == SHELL_PROCESS_OK &&
-          command_count == 1 && netseq &&
-          strcmp(netseq, "16:7:my tool,3:STR,,") == 0;
+          command_count == 1 && netseq.data &&
+          (netseq.length != sizeof("16:7:my tool,3:STR,,") - 1 ||
+           memcmp(netseq.data, "16:7:my tool,3:STR,,", netseq.length)) == 0;
   TEST("nested type sequence preserves spaced executable names", valid);
-  free(netseq);
+  shell_netstring_buffer_free(&netseq);
 
-  netseq = NULL;
+  netseq = (shell_netstring_buffer_t){0};
   command_count = 0;
-  valid = shell_build_type_netseq(
+  valid = shell_build_type_netseq_buffer(
               "foo\"bar\" 'two words'", strlen("foo\"bar\" 'two words'"), NULL,
               &netseq, &command_count) == SHELL_PROCESS_OK &&
-          command_count == 1 && netseq &&
-          strcmp(netseq, "15:6:foobar,3:STR,,") == 0;
+          command_count == 1 && netseq.data &&
+          (netseq.length != sizeof("15:6:foobar,3:STR,,") - 1 ||
+           memcmp(netseq.data, "15:6:foobar,3:STR,,", netseq.length)) == 0;
   TEST("nested type sequence shares quote-fragment decoding", valid);
-  free(netseq);
+  shell_netstring_buffer_free(&netseq);
 
-  netseq = NULL;
+  netseq = (shell_netstring_buffer_t){0};
   command_count = 0;
-  valid = shell_build_type_netseq("my\\\ncommand value",
-                                  strlen("my\\\ncommand value"), NULL, &netseq,
-                                  &command_count) == SHELL_PROCESS_OK &&
-          command_count == 1 && netseq &&
-          strcmp(netseq, "18:9:mycommand,3:STR,,") == 0;
+  valid = shell_build_type_netseq_buffer(
+              "my\\\ncommand value", strlen("my\\\ncommand value"), NULL,
+              &netseq, &command_count) == SHELL_PROCESS_OK &&
+          command_count == 1 && netseq.data &&
+          (netseq.length != sizeof("18:9:mycommand,3:STR,,") - 1 ||
+           memcmp(netseq.data, "18:9:mycommand,3:STR,,", netseq.length)) == 0;
   TEST("nested type sequence shares escaped-newline decoding", valid);
-  free(netseq);
+  shell_netstring_buffer_free(&netseq);
 
-  netseq = (char *)(void *)1;
+  netseq = (shell_netstring_buffer_t){0};
   command_count = SIZE_MAX;
-  valid = shell_build_type_netseq("'' value", strlen("'' value"), NULL, &netseq,
-                                  &command_count) == SHELL_PROCESS_EPARSE &&
-          netseq == NULL && command_count == 0;
+  valid = shell_build_type_netseq_buffer("'' value", strlen("'' value"), NULL,
+                                         &netseq, &command_count) ==
+              SHELL_PROCESS_EPARSE &&
+          netseq.data == NULL && command_count == 0;
   TEST("nested type sequence rejects an empty decoded executable", valid);
 
-  valid = shell_build_type_netseq("", 0, NULL, &netseq, &command_count) ==
-              SHELL_PROCESS_EINPUT &&
-          netseq == NULL && command_count == 0;
+  valid = shell_build_type_netseq_buffer(
+              "", 0, NULL, &netseq, &command_count) == SHELL_PROCESS_EINPUT &&
+          netseq.data == NULL && command_count == 0;
   TEST("nested type sequence validates every argument atomically", valid);
 
   shell_process_limits_t limits = {SIZE_MAX, SIZE_MAX, 0};
   limits.max_string_bytes = 1;
-  valid =
-      shell_build_type_netseq("echo x", strlen("echo x"), &limits, &netseq,
-                              &command_count) == SHELL_PROCESS_EOUTPUT_LIMIT &&
-      netseq == NULL && command_count == 0;
+  valid = shell_build_type_netseq_buffer("echo x", strlen("echo x"), &limits,
+                                         &netseq, &command_count) ==
+              SHELL_PROCESS_EOUTPUT_LIMIT &&
+          netseq.data == NULL && command_count == 0;
   TEST("nested type sequence enforces its outer output limit", valid);
 
   /* Input fits the bound, but its framed type sequence does not. This must
    * fail at the output measurement boundary, not in source parsing. */
   limits.max_string_bytes = 10;
-  netseq = (char *)(void *)1;
+  netseq = (shell_netstring_buffer_t){0};
   command_count = SIZE_MAX;
-  valid =
-      shell_build_type_netseq("echo x", strlen("echo x"), &limits, &netseq,
-                              &command_count) == SHELL_PROCESS_EOUTPUT_LIMIT &&
-      netseq == NULL && command_count == 0;
+  valid = shell_build_type_netseq_buffer("echo x", strlen("echo x"), &limits,
+                                         &netseq, &command_count) ==
+              SHELL_PROCESS_EOUTPUT_LIMIT &&
+          netseq.data == NULL && command_count == 0;
   TEST("nested type sequence checks framed output after parsing", valid);
 }
 

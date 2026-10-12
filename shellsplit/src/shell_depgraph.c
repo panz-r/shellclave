@@ -748,11 +748,6 @@ static bool scan_tokens(const char *cmd, uint32_t range_start,
 
 /* --- TOKEN CLASSIFICATION HELPERS --- */
 
-static SHELL_NONNULL(1, 2) bool dep_token_parse_assignment_word(
-    const dep_token_t *tok, shell_source_assignment_word_t *out) {
-  return shell_source_parse_scalar_assignment_word(tok->start, tok->len, out);
-}
-
 typedef enum {
   DEP_REDIRECT_NONE,
   DEP_REDIRECT_IN,
@@ -1212,7 +1207,9 @@ static SHELL_NONNULL(1, 2, 3) uint32_t
       continue;
     }
     shell_source_assignment_word_t assignment;
-    if (!dep_token_parse_assignment_word(&tokens->tokens[i], &assignment)) {
+    const dep_token_t *word = &tokens->tokens[i];
+    if (!shell_source_parse_scalar_assignment_word(word->start, word->len,
+                                                   &assignment)) {
       *assignment_stop = UINT32_MAX; /* Executable prefixes are temporary. */
       return i;
     }
@@ -1588,7 +1585,7 @@ static void dep_init_edge(shell_dep_edge_t *edge, uint32_t from, uint32_t to,
  * brace, tilde, and process substitutions are equally non-static names. */
 static SHELL_NONNULL(1) uint8_t
     dep_file_name_flags(const char *path, uint32_t path_len) {
-  return shell_source_redirect_word_has_dynamic_path_syntax(path, path_len)
+  return shell_source_argument_has_dynamic_syntax(path, path_len)
              ? SHELL_DEP_DOC_FLAG_DYNAMIC_NAME
              : SHELL_DEP_DOC_FLAG_NONE;
 }
@@ -2897,6 +2894,20 @@ bool shell_dep_workspace_size(const shell_dep_limits_t *limits,
   (void)limits;
 
   *workspace_size = sizeof(dep_route_workspace_t);
+  return true;
+}
+
+bool shell_dep_resolved_workspace_size(size_t command_length,
+                                       const shell_dep_limits_t *limits,
+                                       size_t *workspace_size) {
+  size_t cache_size, graph_size;
+  *workspace_size = 0;
+  size_t alignment = shell_dep_workspace_alignment();
+  if (!shell_expand_cache_size(command_length, &cache_size) ||
+      !shell_dep_workspace_size(limits, &graph_size) ||
+      cache_size > SIZE_MAX - graph_size - alignment)
+    return false;
+  *workspace_size = cache_size + graph_size + alignment;
   return true;
 }
 
@@ -4244,22 +4255,22 @@ static SHELL_NONNULL(1) void dep_ifs_note(dep_named_mutations_t *mutations,
   mutations->ifs_write = true;
 }
 
-static SHELL_NONNULL(1) bool dep_effect_is_ifs(
-    const dep_named_effect_t *effect) {
+/* A prepared target is a readable source span, not an optional token slot. */
+static SHELL_NONNULL(1) bool dep_effect_is_ifs(const char *text,
+                                               uint32_t length,
+                                               dep_named_effect_kind_t kind) {
   dep_named_route_target_t target = {
       .name = "IFS",
       .name_len = 3,
-      .skip = effect->kind == DEP_NAMED_EFFECT_PRINTF_ATTACHED ? 2 : 0};
-  if (effect->kind == DEP_NAMED_EFFECT_STATIC_ASSIGNMENT) {
+      .skip = kind == DEP_NAMED_EFFECT_PRINTF_ATTACHED ? 2 : 0};
+  if (kind == DEP_NAMED_EFFECT_STATIC_ASSIGNMENT) {
     shell_source_decoded_assignment_t ignored;
     (void)shell_source_scan_decoded_assignment(
-        effect->token.start, effect->token.len,
-        dep_named_assignment_target_byte, &target, &ignored);
+        text, length, dep_named_assignment_target_byte, &target, &ignored);
   } else {
     size_t ignored;
-    (void)shell_visit_decoded_word(effect->token.start, effect->token.len,
-                                   dep_named_route_target_byte, &target,
-                                   &ignored);
+    (void)shell_visit_decoded_word(text, length, dep_named_route_target_byte,
+                                   &target, &ignored);
   }
   return !target.order && target.name_position == 3;
 }
@@ -4267,7 +4278,7 @@ static SHELL_NONNULL(1) bool dep_effect_is_ifs(
 static SHELL_NONNULL(1, 2) bool dep_ifs_note_assignment(
     dep_named_mutations_t *mutations, const dep_token_t *word) {
   dep_named_effect_t effect = {*word, DEP_NAMED_EFFECT_STATIC_ASSIGNMENT};
-  if (!dep_effect_is_ifs(&effect))
+  if (!dep_effect_is_ifs(effect.token.start, effect.token.len, effect.kind))
     return false;
   shell_source_decoded_assignment_t assignment;
   (void)shell_source_scan_decoded_assignment(word->start, word->len, NULL, NULL,
@@ -4307,7 +4318,8 @@ static SHELL_NONNULL(1, 2, 3, 4, 5) void dep_prepare_named_mutations(
       continue;
     }
     shell_source_assignment_word_t assignment;
-    if (!dep_token_parse_assignment_word(word, &assignment)) {
+    if (!shell_source_parse_scalar_assignment_word(word->start, word->len,
+                                                   &assignment)) {
       command = token;
       break;
     }
@@ -4341,7 +4353,8 @@ static SHELL_NONNULL(1, 2, 3, 4, 5) void dep_prepare_named_mutations(
         continue;
       }
       shell_source_assignment_word_t assignment;
-      if (dep_token_parse_assignment_word(word, &assignment))
+      if (shell_source_parse_scalar_assignment_word(word->start, word->len,
+                                                    &assignment))
         mutations->effects[mutations->count++] = (dep_named_effect_t){
             {word->start, assignment.name_end}, DEP_NAMED_EFFECT_TOKEN};
     }
@@ -4388,9 +4401,10 @@ static SHELL_NONNULL(1, 2, 3, 4, 5) void dep_prepare_named_mutations(
         continue;
       }
       if (!dep_prefix_assignment_contains(prefix_assignments, target)) {
-        mutations->effects[mutations->count++] =
-            (dep_named_effect_t){*target, DEP_NAMED_EFFECT_TOKEN};
-        if (dep_effect_is_ifs(&mutations->effects[mutations->count - 1]))
+        dep_named_effect_t effect = {*target, DEP_NAMED_EFFECT_TOKEN};
+        mutations->effects[mutations->count++] = effect;
+        if (dep_effect_is_ifs(effect.token.start, effect.token.len,
+                              effect.kind))
           dep_ifs_note(mutations, 0, false);
       }
     }
@@ -4415,9 +4429,10 @@ static SHELL_NONNULL(1, 2, 3, 4, 5) void dep_prepare_named_mutations(
         return;
       }
       if (!dep_prefix_assignment_contains(prefix_assignments, target)) {
-        mutations->effects[mutations->count++] =
-            (dep_named_effect_t){*target, DEP_NAMED_EFFECT_TOKEN};
-        if (dep_effect_is_ifs(&mutations->effects[mutations->count - 1]))
+        dep_named_effect_t effect = {*target, DEP_NAMED_EFFECT_TOKEN};
+        mutations->effects[mutations->count++] = effect;
+        if (dep_effect_is_ifs(effect.token.start, effect.token.len,
+                              effect.kind))
           dep_ifs_note(mutations, DEP_IFS_DIGITS, false);
       }
     }
@@ -4452,11 +4467,21 @@ static SHELL_NONNULL(1, 2, 3, 4, 5) void dep_prepare_named_mutations(
                                             ? DEP_NAMED_EFFECT_PRINTF_ATTACHED
                                             : DEP_NAMED_EFFECT_TOKEN};
       if (roles & SHELL_BUILTIN_ROLE_WRITE) {
-        mutations->effects[mutations->count++] =
+        dep_named_effect_t effect =
             roles & SHELL_BUILTIN_ROLE_FORMAT
                 ? pending
                 : (dep_named_effect_t){*word, DEP_NAMED_EFFECT_TOKEN};
-        if (dep_effect_is_ifs(&mutations->effects[mutations->count - 1])) {
+        mutations->effects[mutations->count++] = effect;
+        bool writes_ifs;
+        /* FORMAT writes require printf's earlier TARGET event. The shared
+         * builtin state machine guarantees pending has that target; symbolic
+         * analysis cannot correlate its role bits across loop iterations. */
+#ifdef __clang_analyzer__
+        __attribute__((suppress))
+#endif
+        writes_ifs = dep_effect_is_ifs(effect.token.start, effect.token.len,
+                                       effect.kind);
+        if (writes_ifs) {
           dep_ifs_value_scan_t scan = {.value = true};
           size_t ignored;
           bool known = (roles & SHELL_BUILTIN_ROLE_FORMAT) &&
@@ -4509,7 +4534,8 @@ static SHELL_NONNULL(1, 2, 3, 4, 5) void dep_prepare_named_mutations(
                  dep_prefix_assignment_contains(prefix_assignments, argument)) {
         mutations->effects[mutations->count++] =
             (dep_named_effect_t){*argument, DEP_NAMED_EFFECT_TOKEN};
-        if (dep_effect_is_ifs(&mutations->effects[mutations->count - 1])) {
+        if (dep_effect_is_ifs(argument->start, argument->len,
+                              DEP_NAMED_EFFECT_TOKEN)) {
           mutations->ifs_write = prefix_ifs.ifs_write;
           mutations->ifs_append = prefix_ifs.ifs_append;
           mutations->ifs = prefix_ifs.ifs;
@@ -4530,7 +4556,8 @@ static SHELL_NONNULL(1, 2, 3, 4, 5) void dep_prepare_named_mutations(
       if (roles & SHELL_BUILTIN_ROLE_WRITE) {
         mutations->effects[mutations->count++] =
             (dep_named_effect_t){*target, DEP_NAMED_EFFECT_TOKEN};
-        if (dep_effect_is_ifs(&mutations->effects[mutations->count - 1]))
+        if (dep_effect_is_ifs(target->start, target->len,
+                              DEP_NAMED_EFFECT_TOKEN))
           dep_ifs_note(mutations, DEP_IFS_DIGITS, false);
       }
     }
@@ -6904,10 +6931,10 @@ static SHELL_NONNULL(1, 2, 3) shell_dep_error_t
  * word/document/owner are the installed operand and its execution owner. */
 static SHELL_NONNULL(1, 2, 3) void dep_record_file_failure(
     shell_dep_graph_t *graph, const dep_parse_context_t *context,
-    const dep_token_t *word, uint32_t owner, shell_dep_expand_purpose_t purpose,
-    uint32_t document) {
+    const dep_token_t *word, uint32_t owner,
+    shell_expand_word_purpose_t purpose, uint32_t document) {
   graph->nodes[document].doc.flags |= SHELL_DEP_DOC_FLAG_EXPANSION_FAILED;
-  if (purpose == SHELL_DEP_EXPAND_REDIRECT_PATH) {
+  if (purpose == SHELL_EXPAND_WORD_REDIRECT_PATH) {
     uint32_t position = (uint32_t)(word->start - context->cmd);
     if (position < context->owner_setup_stop[owner])
       context->owner_setup_stop[owner] = position;
@@ -6924,7 +6951,7 @@ static SHELL_NONNULL(1, 2, 3, 4) shell_dep_error_t
     dep_resolve_word(shell_dep_graph_t *graph,
                      const dep_parse_context_t *context,
                      const dep_token_t *word, const char *cwd, uint32_t owner,
-                     shell_dep_expand_purpose_t purpose, bool eligible,
+                     shell_expand_word_purpose_t purpose, bool eligible,
                      uint32_t document, const shell_dep_word_value_t **result) {
   if (result)
     *result = NULL;
@@ -6933,7 +6960,7 @@ static SHELL_NONNULL(1, 2, 3, 4) shell_dep_error_t
    * prebuilt group documents must not advertise failure to descriptor replay
    * before their operand executes. Static paths need no callback/cache entry.
    */
-  if (eligible && purpose != SHELL_DEP_EXPAND_ARGUMENT &&
+  if (eligible && purpose != SHELL_EXPAND_WORD_ARGUMENT &&
       !(graph->nodes[document].doc.flags & SHELL_DEP_DOC_FLAG_DYNAMIC_NAME)) {
     size_t decoded_length;
     if (shell_measure_decoded_word(word->start, word->len, &decoded_length) ==
@@ -6973,10 +7000,10 @@ static SHELL_NONNULL(1, 2, 3, 4) shell_dep_error_t
     return SHELL_DEP_EPARSE;
   if (result)
     *result = value;
-  if (eligible && purpose != SHELL_DEP_EXPAND_ARGUMENT && value->dynamic &&
+  if (eligible && purpose != SHELL_EXPAND_WORD_ARGUMENT && value->dynamic &&
       !value->resolved)
     context->unresolved_paths[owner] = true;
-  if (!eligible || purpose == SHELL_DEP_EXPAND_ARGUMENT || !value->resolved)
+  if (!eligible || purpose == SHELL_EXPAND_WORD_ARGUMENT || !value->resolved)
     return SHELL_DEP_OK;
 
   shell_dep_doc_t *doc = &graph->nodes[document].doc;
@@ -7162,9 +7189,11 @@ static bool dep_add_resolved_edge_refs(shell_dep_graph_t *graph,
   dep_add_edge(graph, from, to, type, source_fd.value, target_fd.value);
   shell_dep_edge_t *edge = &graph->edges[graph->edge_count - 1];
   edge->flags = flags;
-  if (source_fd.value == SHELL_DEP_FD_NAMED)
+  /* A name is present exactly for a preconstructed named descriptor; numeric
+   * and absent endpoints carry NULL. Project that semantic discriminator. */
+  if (source_fd.name)
     dep_set_named_fd(edge, true, source_fd.name, source_fd.name_len);
-  if (target_fd.value == SHELL_DEP_FD_NAMED)
+  if (target_fd.name)
     dep_set_named_fd(edge, false, target_fd.name, target_fd.name_len);
   return true;
 }
@@ -7456,6 +7485,7 @@ static SHELL_NONNULL(1) void dep_route_journal_reset(
   journal->observable_fd_count = 0;
   journal->observe_undo = false;
   journal->named_closes = false;
+  journal->ifs_seen = false;
   memset(journal->joins, 0, sizeof(journal->joins));
 }
 
@@ -12437,9 +12467,9 @@ static SHELL_NONNULL(1, 5, 6, 8, 9, 11, 18, 19) shell_dep_error_t
       out, document_node, (uint32_t)(cwd - out->cwd_buf.data),
       dep_expansion_cwd_known(out, context, expansion_owner),
       dep_expansion_cwd_absolute(out, context, expansion_owner));
-  shell_dep_error_t resolution_error =
-      dep_resolve_word(out, context, &operand, cwd, expansion_owner,
-                       SHELL_DEP_EXPAND_FILE_PATH, active, document_node, NULL);
+  shell_dep_error_t resolution_error = dep_resolve_word(
+      out, context, &operand, cwd, expansion_owner,
+      SHELL_EXPAND_WORD_FILE_SUBSTITUTION_PATH, active, document_node, NULL);
   if (resolution_error != SHELL_DEP_OK)
     return resolution_error;
   if (active && (out->nodes[document_node].doc.flags &
@@ -12449,7 +12479,6 @@ static SHELL_NONNULL(1, 5, 6, 8, 9, 11, 18, 19) shell_dep_error_t
      * execute and remain connected below. */
     out->edge_count = flow_edge;
     *status = DEP_STATUS_MAY_FAIL;
-    active = false;
   } else if (active)
     out->edges[flow_edge].flags =
         consumer_kind == DEP_SUBST_SHELL_WORD
@@ -12935,24 +12964,6 @@ static SHELL_NONNULL(1) uint32_t
   return cursor;
 }
 
-/* Return the exclusive flattened-range bound of the lexical pipeline scope
- * containing one simple-command range. A nested pipeline can use the same
- * modifier mode as its parent, so mode is never a usable scope identity. */
-static SHELL_NONNULL(1, 2) uint32_t
-    dep_pipeline_member_limit_for_range(const shell_parse_result_t *fast,
-                                        const shell_pipeline_index_t *pipeline,
-                                        uint32_t range) {
-  return shell_pipeline_range_limit(fast, pipeline, range);
-}
-
-/* A compound pipeline member itself lives in its parent's pipeline scope, not
- * in the command interval enclosed by the compound. */
-static SHELL_NONNULL(1, 2) uint32_t
-    dep_pipeline_member_limit_for_group(const shell_parse_result_t *fast,
-                                        const shell_group_t *group) {
-  return shell_pipeline_group_limit(fast, group);
-}
-
 static SHELL_NONNULL(1, 2) void dep_set_command_time_owner(
     shell_dep_graph_t *graph, const uint32_t *range_node, uint32_t range,
     uint32_t timer) {
@@ -13056,8 +13067,7 @@ static SHELL_NONNULL(1, 2, 4, 5, 6, 7, 8, 9, 10, 11) uint32_t
       continue;
     shell_source_compound_tail_t tail = pipeline->group_tail[group];
     uint32_t cursor = descriptor->first_command + descriptor->command_count;
-    uint32_t member_limit =
-        dep_pipeline_member_limit_for_group(fast, descriptor);
+    uint32_t member_limit = shell_pipeline_group_limit(fast, descriptor);
     uint32_t end = (uint32_t)tail.redirect_end;
     if (tail.has_pipeline)
       cursor = dep_pipeline_range_at_or_after(fast, cursor, member_limit,
@@ -13088,8 +13098,7 @@ static SHELL_NONNULL(1, 2, 4, 5, 6, 7, 8, 9, 10, 11) uint32_t
     uint32_t target = range_node[range];
     if (target == UINT32_MAX)
       continue;
-    uint32_t member_limit =
-        dep_pipeline_member_limit_for_range(fast, pipeline, range);
+    uint32_t member_limit = shell_pipeline_range_limit(fast, pipeline, range);
     uint32_t end = dep_timed_pipeline_end(
         cmd, command_length, fast, pipeline, range + 1, member_limit,
         descriptor->start + descriptor->len,
@@ -13288,8 +13297,7 @@ static SHELL_NONNULL(1, 2, 4, 5, 6, 7, 10, 11) bool dep_add_pipeline_time_nodes(
       continue;
     shell_source_compound_tail_t tail = pipeline->group_tail[group];
     uint32_t cursor = descriptor->first_command + descriptor->command_count;
-    uint32_t member_limit =
-        dep_pipeline_member_limit_for_group(fast, descriptor);
+    uint32_t member_limit = shell_pipeline_group_limit(fast, descriptor);
     uint32_t end = (uint32_t)tail.redirect_end;
     if (tail.has_pipeline)
       cursor = dep_pipeline_range_at_or_after(fast, cursor, member_limit,
@@ -13337,8 +13345,7 @@ static SHELL_NONNULL(1, 2, 4, 5, 6, 7, 10, 11) bool dep_add_pipeline_time_nodes(
 
     uint32_t target = range_node[range];
     uint32_t start = descriptor->start;
-    uint32_t member_limit =
-        dep_pipeline_member_limit_for_range(fast, pipeline, range);
+    uint32_t member_limit = shell_pipeline_range_limit(fast, pipeline, range);
     uint32_t end = dep_timed_pipeline_end(
         cmd, command_length, fast, pipeline, range + 1, member_limit,
         start + descriptor->len,
@@ -13542,6 +13549,11 @@ static SHELL_NONNULL(1, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
     stage_document[i] = UINT32_MAX;
     if (fast_result.cmds[i].type & SHELL_TYPE_HEREDOC)
       heredoc_count++;
+    /* map_build initialized every entry below this unchanged parsed count.
+     * The analyzer loses that relationship between its two loop traversals. */
+#ifdef __clang_analyzer__
+    __attribute__((suppress))
+#endif
     if (execution.owner[i] == i && execution.stage[i])
       fast_result.cmds[i] = shell_execution_range(&fast_result, &execution, i);
   }
@@ -14054,7 +14066,7 @@ static SHELL_NONNULL(1, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
               event->document != UINT32_MAX)
             event_error = dep_resolve_word(
                 out, &parse_context, &event->target, event_cwd, event->owner,
-                SHELL_DEP_EXPAND_REDIRECT_PATH,
+                SHELL_EXPAND_WORD_REDIRECT_PATH,
                 dep_owner_phase_active(&parse_context, event->owner,
                                        DEP_SNAPSHOT_REDIRECT_OPERAND,
                                        event->position),
@@ -14355,7 +14367,7 @@ static SHELL_NONNULL(1, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
         shell_dep_error_t resolution_error =
             dep_resolve_word(out, &parse_context, argument,
                              out->cwd_buf.data + *range_cwd_offset,
-                             cmd_node_idx, SHELL_DEP_EXPAND_ARGUMENT,
+                             cmd_node_idx, SHELL_EXPAND_WORD_ARGUMENT,
                              command_word_active && expandable_arguments[word],
                              UINT32_MAX, &argument_values[word]);
         if (resolution_error != SHELL_DEP_OK)
@@ -14557,7 +14569,7 @@ static SHELL_NONNULL(1, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
                   ? dep_resolve_word(
                         out, &parse_context, target,
                         out->cwd_buf.data + *range_cwd_offset, cmd_node_idx,
-                        SHELL_DEP_EXPAND_REDIRECT_PATH,
+                        SHELL_EXPAND_WORD_REDIRECT_PATH,
                         dep_owner_phase_active(&parse_context, cmd_node_idx,
                                                DEP_SNAPSHOT_REDIRECT_OPERAND,
                                                (uint32_t)(tok->start - cmd)),
@@ -14587,7 +14599,8 @@ static SHELL_NONNULL(1, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
        * at the first redirect or interpreting a later assignment as argv. */
       if (command == UINT32_MAX || ti < command) {
         shell_source_assignment_word_t assignment;
-        (void)dep_token_parse_assignment_word(tok, &assignment);
+        (void)shell_source_parse_scalar_assignment_word(tok->start, tok->len,
+                                                        &assignment);
         add_doc_envvar(out, max_nodes, max_edges, tok->start,
                        assignment.name_end, tok->start + assignment.equals + 1,
                        tok->len - assignment.equals - 1, assignment.append,
@@ -15024,6 +15037,48 @@ shell_dep_error_t shell_dep_graph_parse_with_fast(
 }
 
 /* --- GRAPH UTILITIES --- */
+
+shell_dep_error_t shell_dep_graph_parse_resolved(
+    const char *cmd, size_t cmd_len, const char *initial_cwd,
+    const shell_dep_limits_t *limits, shell_dep_graph_t *out,
+    shell_expand_word_netargv_fn expand, void *context,
+    uint8_t *unresolved_paths) {
+  if (unresolved_paths)
+    memset(unresolved_paths, 0, SHELL_DEP_MAX_NODES);
+  size_t required;
+  if (cmd_len == 0 || cmd_len > UINT32_MAX ||
+      !shell_dep_resolved_workspace_size(cmd_len, limits, &required)) {
+    dep_stop_graph_construction(out, SHELL_DEP_EPARSE);
+    return SHELL_DEP_EINPUT;
+  }
+  if (!limits || !limits->workspace || limits->workspace_size < required ||
+      (uintptr_t)limits->workspace % shell_dep_workspace_alignment() != 0)
+    return dep_stop_graph_construction(out, SHELL_DEP_EWORKSPACE);
+
+  shell_expand_cache_t cache;
+  void *graph_workspace;
+  size_t graph_workspace_size;
+  if (!shell_expand_cache_init(expand, context, cmd, cmd_len, false,
+                               limits->workspace, limits->workspace_size,
+                               &cache, &graph_workspace, &graph_workspace_size))
+    return dep_stop_graph_construction(out, SHELL_DEP_EWORKSPACE);
+  shell_dep_limits_t graph_limits = *limits;
+  graph_limits.workspace = graph_workspace;
+  graph_limits.workspace_size = graph_workspace_size;
+  shell_dep_word_resolver_t resolver = {shell_expand_resolve, &cache};
+  shell_source_operation_begin(cmd, cmd_len);
+  dep_subgraph_streams_t streams;
+  shell_dep_error_t status = shell_dep_graph_parse_impl(
+      cmd, cmd_len, initial_cwd, true, initial_cwd && initial_cwd[0] == '/',
+      &graph_limits, 0, NULL, out, &streams, NULL, true, &resolver);
+  shell_source_operation_end();
+  if (cache.error != SHELL_DEP_OK)
+    return dep_stop_graph_construction(out, cache.error);
+  if (unresolved_paths &&
+      (status == SHELL_DEP_OK || status == SHELL_DEP_ETRUNC))
+    memcpy(unresolved_paths, streams.unresolved_paths, out->node_count);
+  return dep_finish_public_graph(out, status);
+}
 
 shell_dep_error_t shell_dep_graph_parse_with_fast_resolver(
     const char *cmd, size_t cmd_len, const char *initial_cwd,
@@ -16089,6 +16144,8 @@ const char *shell_dep_error_string(shell_dep_error_t err) {
     return "Parse error";
   case SHELL_DEP_EWORKSPACE:
     return "Resolver workspace unavailable";
+  case SHELL_DEP_EEXPAND:
+    return "Word resolution failed";
   default:
     return "Unknown error";
   }

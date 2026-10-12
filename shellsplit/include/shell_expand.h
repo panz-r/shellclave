@@ -1,0 +1,79 @@
+#ifndef SHELL_EXPAND_H
+#define SHELL_EXPAND_H
+
+#include "shell_contract.h"
+#include <stdbool.h>
+#include <stddef.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* Whole-word expansion callbacks receive the exact isolated source spelling
+ * and return its final canonical netargv. Neither span need be NUL-terminated;
+ * the resolved netargv may contain embedded NUL bytes and is interpreted only
+ * by its explicit length. On SHELL_EXPAND_RESOLVED, the callback must provide a
+ * canonical netargv (or NULL with length zero for an empty expansion). The
+ * returned bytes must remain valid and unchanged through the enclosing
+ * operation and for as long as its output graph borrows them, including across
+ * later callback invocations. They are never reparsed as shell source. Output
+ * values are ignored for other statuses. Failed or malformed results fail the
+ * enclosing operation.
+ *
+ * The application performs quote-sensitive composition, splitting and globbing
+ * in Bash expansion order. It must return a result valid for every execution
+ * state reaching this expansion point, accounting for earlier/scoped effects;
+ * otherwise return UNRESOLVED. This library never executes an expansion.
+ * Bash assignment-shaped tilde expansion (name=~, name+=~, name=a:~) also
+ * applies to FILE operands, including $(<name=~), but not here-string data.
+ * Source syntax is validated before callbacks. Command identity, wrappers,
+ * assignments, cd and shell-state/descriptor operands are not resolved here.
+ * This includes printf %b operands in formats containing %n: an expanded
+ * '\c' can suppress later variable writes, including on format reuse.
+ * Ordinary printf data, including %b without %n, remains eligible.
+ * Callback ordering follows analysis phases, not runtime scheduling or policy
+ * short-circuiting. Each eligible dynamic source word is queried at most once.
+ * Resolution does not discharge executable-substitution inspection obligations.
+ * Unresolved words retain source spelling; consumers report uncertainty in
+ * their results. A pathname must resolve to one nonempty NUL-free record.
+ * Zero/multiple records or an empty pathname model redirection failure; NUL is
+ * a resolution error.
+ */
+typedef enum {
+  SHELL_EXPAND_UNRESOLVED = 0,
+  SHELL_EXPAND_RESOLVED = 1,
+  SHELL_EXPAND_FAILED = -1,
+} shell_expand_status_t;
+
+typedef enum {
+  SHELL_EXPAND_WORD_ARGUMENT = 0,
+  SHELL_EXPAND_WORD_REDIRECT_PATH,
+  SHELL_EXPAND_WORD_FILE_SUBSTITUTION_PATH,
+} shell_expand_word_purpose_t;
+
+/* Source/word/owner spans borrow immutable source for this operation.
+ * owner_offset/length identify the immediate command or group. The request
+ * object and its borrowed NUL-terminated cwd string are valid only during the
+ * callback; copy them if retaining them. cwd is NULL iff cwd_known is false;
+ * a known relative CWD is not an absolute filesystem identity. Mixed quoting
+ * is conveyed by the word's exact spelling, not a single quoted boolean.
+ * Returned netargv storage, unlike the request/CWD, must remain immutable
+ * through the enclosing operation and any output graph lifetime, as above. */
+typedef struct {
+  const char *source;
+  size_t source_length;
+  size_t word_offset, word_length;
+  size_t owner_offset, owner_length;
+  shell_expand_word_purpose_t purpose;
+  const char *cwd;
+  bool cwd_known, cwd_absolute;
+} shell_expand_word_request_t;
+
+typedef shell_expand_status_t (*shell_expand_word_netargv_fn)(
+    const shell_expand_word_request_t *request, const char **netargv,
+    size_t *netargv_length, void *user_ctx) SHELL_NONNULL(1, 2, 3);
+
+#ifdef __cplusplus
+}
+#endif
+#endif

@@ -31,12 +31,6 @@
 #include "pattern_internal.h"
 #include "read_line.h"
 
-/* Check if a type supports parametrized wildcards.
- * Mirrors type_supports_param() in policy.c. */
-static bool trie_type_supports_param(st_token_type_t t) {
-  return st_type_supports_metadata(t);
-}
-
 /* --- NODE HELPERS --- */
 
 static st_node_t *node_new(const char *token, size_t token_length,
@@ -346,11 +340,6 @@ st_error_t st_learner_feed_netargv_view(st_learner_t *learner,
   return learner_insert_atomic(learner, scratch.tokens, scratch.count);
 }
 
-st_error_t st_learner_feed_netargv(st_learner_t *learner, const char *netargv) {
-  return st_learner_feed_netargv_view(
-      learner, (st_netargv_view_t){.data = netargv, .length = strlen(netargv)});
-}
-
 st_error_t st_learner_feed_tokens(st_learner_t *learner,
                                   const st_token_array_t *typed) {
   if (!learner_tokens_valid(typed->tokens, typed->count))
@@ -396,8 +385,8 @@ static const char *node_suggestion_token(const st_node_t *node,
                                          char buffer[32]) {
   snprintf(buffer, 32, "%s", st_type_symbol[type]);
   if (node && node->metadata_observations >= 2 && !node->metadata_mixed &&
-      node->common_metadata != ST_META_NONE && trie_type_supports_param(type) &&
-      type != ST_TYPE_SEMVER) {
+      node->common_metadata != ST_META_NONE &&
+      st_type_supports_metadata(type) && type != ST_TYPE_SEMVER) {
     const st_metadata_entry_t *common = NULL;
     for (size_t i = 0;
          i < sizeof(st_metadata_entries) / sizeof(st_metadata_entries[0]); i++)
@@ -569,7 +558,8 @@ static bool option_capture(const char *token, size_t token_length,
   if (!equals || equals == token + 2 ||
       (size_t)(equals - token + 1) == token_length)
     return false;
-  st_token_type_t type = st_token_classify(equals + 1);
+  st_token_type_t type = st_token_classify(
+      equals + 1, token_length - (size_t)(equals + 1 - token));
   if (type == ST_TYPE_LITERAL)
     return false;
   *prefix_length = (size_t)(equals - token + 1);
@@ -915,7 +905,7 @@ static SHELL_NONNULL(1, 2) support_match_t
     const char *capture = node->token + token->prefix_length;
     size_t length = node->token_length - token->prefix_length;
     return st_pattern_wildcard_matches(
-               capture, length, st_token_classify_bytes(capture, length),
+               capture, length, st_token_classify(capture, length),
                token->capture, token->capture_length, token->capture_type)
                ? SUPPORT_YES
                : SUPPORT_NO;
@@ -1470,9 +1460,15 @@ static bool parse_u32_field(const char *text, char **end, uint32_t *value) {
   return true;
 }
 
-static bool line_ends_here(const char *text) {
-  return text[0] == '\0' || (text[0] == '\n' && text[1] == '\0') ||
-         (text[0] == '\r' && text[1] == '\n' && text[2] == '\0');
+static SHELL_NONNULL(1) bool line_ends_here(const char *text) {
+  /* text is in a successfully read, terminated line, after a matched header
+   * or parsed field. The analyzer does not model the reader/string relation. */
+#ifdef __clang_analyzer__
+  __attribute__((suppress))
+#endif
+          return text[0] == '\0' ||
+      (text[0] == '\n' && text[1] == '\0') ||
+      (text[0] == '\r' && text[1] == '\n' && text[2] == '\0');
 }
 
 static const st_metadata_entry_t *metadata_by_id(uint16_t id) {
@@ -1483,10 +1479,11 @@ static const st_metadata_entry_t *metadata_by_id(uint16_t id) {
   return NULL;
 }
 
-static bool line_equals(const char *line, const char *expected) {
-  size_t length = strcspn(line, "\r\n");
-  return strlen(expected) == length && strncmp(line, expected, length) == 0 &&
-         line_ends_here(line + length);
+/* expected is a constant header spelling without line-ending bytes. */
+static SHELL_NONNULL(1, 2) bool line_equals(const char *line,
+                                            const char *expected) {
+  size_t length = strlen(expected);
+  return strncmp(line, expected, length) == 0 && line_ends_here(line + length);
 }
 
 typedef struct {

@@ -8,6 +8,8 @@
 void st_test_alloc_fail_at(size_t allocation_index);
 void st_test_alloc_reset(void);
 size_t st_test_alloc_count(void);
+/* Fixture allocations can use the same controlled failure seam. */
+void *st_test_calloc(size_t count, size_t size);
 /* Cumulative requested bytes, including failed attempts and the full requested
  * capacity of each realloc, since the most recent reset/fail-at call. Tests
  * using this metric keep the total representable in size_t. */

@@ -205,8 +205,6 @@ bool shell_env_screener_looks_like_base64(const char *value) {
   return len >= 16;
 }
 
-size_t shell_env_screener_recommended_capacity(void) { return 32; }
-
 static const char *secret_pattern_in_span(const char *name, size_t name_len) {
   for (int i = 0; secret_patterns[i]; i++) {
     const char *pattern = secret_patterns[i];
@@ -430,11 +428,6 @@ double shell_env_screener_combined_score_name(const char *name,
       combine_evidence(posterior, has_prefix, has_name_pattern, is_path);
 
   return posterior;
-}
-
-/* Legacy function for backward compatibility */
-double shell_env_screener_combined_score(const char *value) {
-  return shell_env_screener_combined_score_name(NULL, value);
 }
 
 const char *shell_env_screener_get_whitelist_doc(void) {

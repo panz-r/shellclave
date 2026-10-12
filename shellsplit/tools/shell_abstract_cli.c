@@ -1,4 +1,6 @@
+#ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 200809L
+#endif
 #include "shell_abstract.h"
 #include <getopt.h>
 #include <stdio.h>
@@ -84,25 +86,17 @@ void process_command(const char *cmd, const shell_runtime_context_t *ctx,
   printf("Elements:    %zu\n", result->element_count);
 
   printf("\n--- Flags ---\n");
-  printf("Has variables:     %d\n",
-         shell_abstract_command_has_variables(result));
-  printf("Has pos_vars:      %d\n",
-         shell_abstract_command_has_pos_vars(result));
-  printf("Has special_vars:  %d\n",
-         shell_abstract_command_has_special_vars(result));
-  printf("Has globs:         %d\n", shell_abstract_command_has_globs(result));
-  printf("Has paths:         %d\n", shell_abstract_command_has_paths(result));
-  printf("Has abs_paths:     %d\n",
-         shell_abstract_command_has_abs_paths(result));
-  printf("Has rel_paths:     %d\n",
-         shell_abstract_command_has_rel_paths(result));
-  printf("Has home_paths:    %d\n",
-         shell_abstract_command_has_home_paths(result));
-  printf("Has cmd_subst:     %d\n",
-         shell_abstract_command_has_cmd_subst(result));
-  printf("Has arithmetic:    %d\n",
-         shell_abstract_command_has_arithmetic(result));
-  printf("Has strings:       %d\n", shell_abstract_command_has_strings(result));
+  printf("Has variables:     %d\n", result->has_variables);
+  printf("Has pos_vars:      %d\n", result->has_pos_vars);
+  printf("Has special_vars:  %d\n", result->has_special_vars);
+  printf("Has globs:         %d\n", result->has_globs);
+  printf("Has paths:         %d\n", result->has_paths);
+  printf("Has abs_paths:     %d\n", result->has_abs_paths);
+  printf("Has rel_paths:     %d\n", result->has_rel_paths);
+  printf("Has home_paths:    %d\n", result->has_home_paths);
+  printf("Has cmd_subst:     %d\n", result->has_cmd_subst);
+  printf("Has arithmetic:    %d\n", result->has_arithmetic);
+  printf("Has strings:       %d\n", result->has_strings);
 
   printf("\n--- Elements ---\n");
   for (size_t i = 0; i < result->element_count; i++) {
@@ -128,17 +122,25 @@ void process_command(const char *cmd, const shell_runtime_context_t *ctx,
 }
 
 int main(int argc, char **argv) {
+  int status = EXIT_FAILURE;
   const char *filename = NULL;
   bool expand = false;
-  char *cwd = NULL;
+  const char *cwd = NULL;
+  /* Runtime context only borrows CWD storage. Both argv and this buffer live
+   * through every command processed below; neither needs heap ownership. */
+  char cwd_buffer[4096];
+  shell_runtime_context_t ctx = {0};
   char **env_add = NULL;
+  const char **env = NULL;
+  char *command = NULL;
+  FILE *input = NULL;
   int env_count = 0;
   int env_capacity = 10;
 
   env_add = calloc(env_capacity, sizeof(char *));
   if (!env_add) {
     fprintf(stderr, "Memory error\n");
-    return 1;
+    goto cleanup;
   }
 
   // Parse arguments
@@ -162,21 +164,16 @@ int main(int argc, char **argv) {
     case 'h':
     default:
       print_usage(argv[0]);
-      free(env_add);
-      return opt == 'h' ? 0 : 1;
+      status = opt == 'h' ? EXIT_SUCCESS : EXIT_FAILURE;
+      goto cleanup;
     }
   }
 
   // Build runtime context
-  shell_runtime_context_t ctx = {0};
-
   if (cwd) {
     ctx.cwd = cwd;
   } else {
-    char buf[4096];
-    if (getcwd(buf, sizeof(buf))) {
-      ctx.cwd = strdup(buf);
-    }
+    ctx.cwd = getcwd(cwd_buffer, sizeof(cwd_buffer));
   }
 
   // Build environment (additions first so they take precedence)
@@ -185,12 +182,10 @@ int main(int argc, char **argv) {
   for (char **e = environ; *e; e++)
     env_size++;
 
-  const char **env = calloc(env_size + env_count + 1, sizeof(*env));
+  env = calloc(env_size + env_count + 1, sizeof(*env));
   if (!env) {
     fprintf(stderr, "Memory error\n");
-    free(env_add);
-    free((void *)ctx.cwd);
-    return 1;
+    goto cleanup;
   }
 
   // Add user-specified env vars first (so they override system vars)
@@ -221,17 +216,14 @@ int main(int argc, char **argv) {
 
   if (filename) {
     // Read from file
-    FILE *f = fopen(filename, "r");
-    if (!f) {
+    input = fopen(filename, "r");
+    if (!input) {
       fprintf(stderr, "Error: Cannot open file '%s'\n", filename);
-      free(env_add);
-      free((void *)ctx.cwd);
-      free(env);
-      return 1;
+      goto cleanup;
     }
 
     char line[8192];
-    while (fgets(line, sizeof(line), f)) {
+    while (fgets(line, sizeof(line), input)) {
       // Remove trailing newline
       size_t len = strlen(line);
       if (len > 0 && line[len - 1] == '\n') {
@@ -244,7 +236,10 @@ int main(int argc, char **argv) {
       process_command(line, &ctx, expand);
     }
 
-    fclose(f);
+    if (ferror(input)) {
+      fprintf(stderr, "Error: Cannot read file '%s'\n", filename);
+      goto cleanup;
+    }
   } else if (optind < argc) {
     // Command from arguments - join all remaining args
     size_t total_len = 0;
@@ -252,24 +247,23 @@ int main(int argc, char **argv) {
       total_len += strlen(argv[i]) + 1;
     }
 
-    char *cmd = malloc(total_len);
-    if (!cmd) {
+    command = malloc(total_len);
+    if (!command) {
       fprintf(stderr, "Memory error\n");
-      free(env_add);
-      free((void *)ctx.cwd);
-      free(env);
-      return 1;
+      goto cleanup;
     }
 
-    cmd[0] = '\0';
+    char *position = command;
     for (int i = optind; i < argc; i++) {
       if (i > optind)
-        strcat(cmd, " ");
-      strcat(cmd, argv[i]);
+        *position++ = ' ';
+      size_t length = strlen(argv[i]);
+      memcpy(position, argv[i], length);
+      position += length;
     }
+    *position = '\0';
 
-    process_command(cmd, &ctx, expand);
-    free(cmd);
+    process_command(command, &ctx, expand);
   } else {
     // Read from stdin
     char line[8192];
@@ -284,12 +278,21 @@ int main(int argc, char **argv) {
         continue;
       process_command(line, &ctx, expand);
     }
+    if (ferror(stdin)) {
+      fprintf(stderr, "Error: Cannot read stdin\n");
+      goto cleanup;
+    }
   }
 
+  status = EXIT_SUCCESS;
+cleanup:
+  if (input && fclose(input) != 0) {
+    fprintf(stderr, "Error: Cannot close input file\n");
+    status = EXIT_FAILURE;
+  }
+  free(command);
   free(env_add);
-  if (cwd != ctx.cwd)
-    free((void *)ctx.cwd);
   free(env);
 
-  return 0;
+  return status;
 }

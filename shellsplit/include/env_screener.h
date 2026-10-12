@@ -81,24 +81,10 @@ shell_env_screener_scan(size_t *out_indices, size_t capacity, size_t *out_count,
     SHELL_NONNULL(3);
 
 /**
- * Get recommended initial capacity
- * @return  Recommended capacity for typical use
- */
-size_t shell_env_screener_recommended_capacity(void);
-
-/**
  * Get the whitelist (for documentation)
  * @return  Comma-separated list of whitelisted variable names
  */
 const char *shell_env_screener_get_whitelist_doc(void);
-
-/**
- * Calculate combined entropy score for a value
- * Combines Shannon entropy with relative permutation entropy
- * @param value  The value to score
- * @return      Combined heuristic score
- */
-double shell_env_screener_combined_score(const char *value) SHELL_NONNULL(1);
 
 /**
  * Calculate combined secret score for a name-value pair

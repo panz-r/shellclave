@@ -94,22 +94,42 @@ static const char *const deny_rules[] = {
 };
 
 static sg_gate_t *new_policy_gate(void) {
-  sg_gate_t *gate = sg_gate_new();
-  if (!gate)
+  st_policy_ctx_t *context = st_policy_ctx_new();
+  if (!context)
     return NULL;
-  if (sg_gate_set_stop_mode(gate, SG_EVAL_ALL) != SG_OK ||
-      sg_gate_set_reject_mask(gate, 0) != SG_OK)
+  st_policy_t *allow = st_policy_new(context);
+  st_policy_t *deny = allow ? st_policy_new(context) : NULL;
+  st_policy_ctx_release(context);
+  if (!deny)
     goto fail;
-  for (size_t i = 0; i < ARRAY_COUNT(allow_rules); i++)
-    if (sg_gate_add_allow_cpl(gate, allow_rules[i]) != SG_OK)
-      goto fail;
-  for (size_t i = 0; i < ARRAY_COUNT(deny_rules); i++)
-    if (sg_gate_add_deny_cpl(gate, deny_rules[i]) != SG_OK)
-      goto fail;
+  for (size_t role = 0; role < 2; role++) {
+    const char *const *rules = role ? deny_rules : allow_rules;
+    size_t count = role ? ARRAY_COUNT(deny_rules) : ARRAY_COUNT(allow_rules);
+    for (size_t i = 0; i < count; i++) {
+      st_netpattern_t pattern = {0};
+      st_error_t error = st_netpattern_from_cpl_owned(rules[i], &pattern);
+      if (error == ST_OK)
+        error = st_policy_add_netpattern_view(
+            role ? deny : allow,
+            (st_netpattern_view_t){pattern.data, pattern.length});
+      st_netpattern_free(&pattern);
+      if (error != ST_OK)
+        goto fail;
+    }
+  }
+  sg_gate_t *gate = sg_gate_new_with_policies_owned(allow, deny);
+  if (!gate)
+    goto fail;
+  if (sg_gate_set_stop_mode(gate, SG_EVAL_ALL) != SG_OK ||
+      sg_gate_set_reject_mask(gate, 0) != SG_OK) {
+    sg_gate_free(gate);
+    return NULL;
+  }
   return gate;
 
 fail:
-  sg_gate_free(gate);
+  st_policy_free(allow);
+  st_policy_free(deny);
   return NULL;
 }
 
@@ -291,7 +311,8 @@ static bool train_corpus_model(sg_gate_t *gate) {
     if (evaluate(gate, shellclave_command_corpus_commands[i], &result) != SG_OK)
       return false;
   }
-  return sg_gate_anomaly_vocab_size(gate) > 0;
+  return sg_anomaly_model_vocab_size(sg_gate_anomaly_raw_model_borrowed(gate)) >
+         0;
 }
 
 TEST(anomaly_cache_equivalence) {

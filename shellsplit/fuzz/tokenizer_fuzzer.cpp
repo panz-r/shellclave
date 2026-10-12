@@ -35,6 +35,7 @@
 
 extern "C" {
 #include "../src/shell_depgraph_internal.h"
+#include "../src/shell_source_internal.h"
 #include "../src/shell_tokenizer_full_internal.h"
 
 static const size_t MAX_INPUT_SIZE = 8192;
@@ -187,7 +188,7 @@ static bool tokenizer_iterated_matches_structured(
 static bool tokenizer_unsupported_semantics_rejected(const char *input,
                                                      size_t length) {
   shell_processed_commands_t processed = {};
-  char *sequence = nullptr;
+  shell_netstring_buffer_t sequence = {};
   size_t sequence_count = 0;
   bool has_features = false;
   shell_transformed_command_t **transformed = nullptr;
@@ -201,10 +202,10 @@ static bool tokenizer_unsupported_semantics_rejected(const char *input,
       processed.commands == nullptr && processed.command_count == 0 &&
       processed.groups == nullptr && processed.group_count == 0 &&
       processed.group_io_ops == nullptr && processed.group_io_op_count == 0 &&
-      shell_build_netargv_sequence(input, length, nullptr, &sequence,
-                                   &sequence_count,
-                                   &has_features) == SHELL_PROCESS_EPARSE &&
-      sequence == nullptr && sequence_count == 0 && !has_features &&
+      shell_build_netargv_sequence_buffer(input, length, nullptr, &sequence,
+                                          &sequence_count, &has_features) ==
+          SHELL_PROCESS_EPARSE &&
+      sequence.data == nullptr && sequence_count == 0 && !has_features &&
       shell_transform_command_line(input, length, nullptr, &transformed,
                                    &transformed_count) ==
           SHELL_TRANSFORM_EPARSE &&
@@ -218,7 +219,7 @@ static bool tokenizer_unsupported_semantics_rejected(const char *input,
       graph.status == SHELL_DEP_STATUS_ERROR;
 
   shell_processed_commands_free(&processed);
-  free(sequence);
+  shell_netstring_buffer_free(&sequence);
   shell_transformed_command_list_free(transformed, transformed_count);
   shell_abstract_command_free(abstract);
   return rejected;
@@ -325,16 +326,20 @@ static shell_dep_error_t fuzz_dep_graph_parse(const char *cmd, size_t cmd_len,
 
 #define shell_dep_graph_parse fuzz_dep_graph_parse
 
-extern "C" void LLVMFuzzerInitialize(int *argc, char ***argv) {
+static void run_fixed_oracles();
+
+extern "C" int LLVMFuzzerInitialize(int *argc, char ***argv) {
   (void)argc;
   (void)argv;
   const char *verbose = getenv("SHELLSPLIT_FUZZ_VERBOSE");
   if (verbose && (*verbose == '1' || *verbose == 'y' || *verbose == 'Y')) {
     g_verbose = 1;
   }
+  run_fixed_oracles();
   if (g_verbose) {
     fprintf(stderr, "DEBUG: ShellSplit fuzzer initialized\n");
   }
+  return 0;
 }
 
 static int validate_fast_result(const char *input, size_t length,
@@ -1461,7 +1466,7 @@ static int test_fixed_oracles(void) {
     size_t transformed_count = 0;
     shell_command_info_t *processed = NULL;
     size_t processed_count = 0;
-    char *sequence = NULL;
+    shell_netstring_buffer_t sequence = {};
     size_t sequence_count = 0;
     bool sequence_features = !item.has_cmd_subst;
     bool metadata_ok =
@@ -1484,11 +1489,11 @@ static int test_fixed_oracles(void) {
         processed_count == 1 && processed != nullptr &&
         shell_command_info_has_dangerous_features(processed) ==
             item.has_cmd_subst &&
-        shell_build_netargv_sequence(item.input, strlen(item.input), NULL,
-                                     &sequence, &sequence_count,
-                                     &sequence_features) == SHELL_PROCESS_OK &&
+        shell_build_netargv_sequence_buffer(
+            item.input, strlen(item.input), NULL, &sequence, &sequence_count,
+            &sequence_features) == SHELL_PROCESS_OK &&
         sequence_count == 1 && sequence_features == item.has_cmd_subst;
-    free(sequence);
+    shell_netstring_buffer_free(&sequence);
     shell_command_infos_free(processed, processed_count);
     shell_transformed_command_list_free(transformed, transformed_count);
     shell_abstract_command_free(abstract);
@@ -1627,7 +1632,7 @@ static int test_fixed_oracles(void) {
   size_t close_token_count = 0;
   shell_command_info_t *close_infos = NULL;
   size_t close_info_count = 0;
-  char *close_netargv = NULL;
+  shell_netstring_buffer_t close_netargv = {};
   shell_dep_graph_t close_graph = {};
   bool raw_close_suffix_ok =
       shell_tokenize_commands(raw_close_suffix, sizeof(raw_close_suffix) - 1,
@@ -1645,10 +1650,12 @@ static int test_fixed_oracles(void) {
                             NULL, &close_infos,
                             &close_info_count) == SHELL_PROCESS_OK &&
       close_info_count == 1 && close_infos != nullptr &&
-      shell_render_netargv(&close_infos[0], NULL, &close_netargv) ==
+      shell_render_netargv_buffer(&close_infos[0], NULL, &close_netargv) ==
           SHELL_PROCESS_OK &&
-      close_netargv != nullptr &&
-      strcmp(close_netargv, "6:printf,1:x,4:file,") == 0 &&
+      close_netargv.data != nullptr &&
+      (close_netargv.length != sizeof("6:printf,1:x,4:file,") - 1 ||
+       memcmp(close_netargv.data, "6:printf,1:x,4:file,",
+              close_netargv.length)) == 0 &&
       shell_dep_graph_parse(raw_close_suffix, sizeof(raw_close_suffix) - 1, ".",
                             NULL, &close_graph) == SHELL_DEP_OK &&
       shell_dep_graph_validate(&close_graph).valid;
@@ -1665,7 +1672,7 @@ static int test_fixed_oracles(void) {
                           close_graph.nodes[i].doc.kind == SHELL_DOC_FILE);
   shell_commands_free(close_tokens, close_token_count);
   shell_command_infos_free(close_infos, close_info_count);
-  free(close_netargv);
+  shell_netstring_buffer_free(&close_netargv);
   if (!raw_close_suffix_ok || !close_edge || file_document)
     return fixed_oracle_failure(__LINE__);
 
@@ -2427,18 +2434,22 @@ static int test_fixed_oracles(void) {
 
   static const char compound_words[] =
       "$'c'3>out;cat \"x\"${y}z;my\\\r\ncommand value";
-  char *raw = nullptr;
-  char *typed = nullptr;
+  shell_netstring_buffer_t raw = {};
+  shell_netstring_buffer_t typed = {};
   size_t compound_count = 0;
   bool compound_ok =
-      shell_build_anomaly_netseqs(compound_words, sizeof(compound_words) - 1,
-                                  NULL, &raw, &typed,
-                                  &compound_count) == SHELL_PROCESS_OK &&
-      compound_count == 3 && raw && typed &&
-      strcmp(raw, "2:c3,3:cat,9:mycommand,") == 0 &&
-      strcmp(typed, "5:2:c3,,12:3:cat,3:STR,,18:9:mycommand,3:STR,,") == 0;
-  free(typed);
-  free(raw);
+      shell_build_anomaly_netseqs_buffer(
+          compound_words, sizeof(compound_words) - 1, NULL, &raw, &typed,
+          &compound_count) == SHELL_PROCESS_OK &&
+      compound_count == 3 && raw.data && typed.data &&
+      (raw.length != sizeof("2:c3,3:cat,9:mycommand,") - 1 ||
+       memcmp(raw.data, "2:c3,3:cat,9:mycommand,", raw.length)) == 0 &&
+      (typed.length !=
+           sizeof("5:2:c3,,12:3:cat,3:STR,,18:9:mycommand,3:STR,,") - 1 ||
+       memcmp(typed.data, "5:2:c3,,12:3:cat,3:STR,,18:9:mycommand,3:STR,,",
+              typed.length)) == 0;
+  shell_netstring_buffer_free(&typed);
+  shell_netstring_buffer_free(&raw);
   if (!compound_ok)
     return fixed_oracle_failure(__LINE__);
 
@@ -3334,19 +3345,19 @@ static int test_fixed_oracles(void) {
   };
   for (const char *input : continued_control_cases) {
     shell_processed_commands_t processed = {};
-    char *netargv = nullptr;
+    shell_netstring_buffer_t netargv = {};
     size_t netargv_count = 0;
     bool has_shell_features = false;
     bool control_rejected =
         shell_process_commands(input, strlen(input), nullptr, &processed) ==
             SHELL_PROCESS_EPARSE &&
         processed.commands == nullptr && processed.command_count == 0 &&
-        shell_build_netargv_sequence(input, strlen(input), nullptr, &netargv,
-                                     &netargv_count, &has_shell_features) ==
-            SHELL_PROCESS_EPARSE &&
-        netargv == nullptr && netargv_count == 0 && !has_shell_features;
+        shell_build_netargv_sequence_buffer(
+            input, strlen(input), nullptr, &netargv, &netargv_count,
+            &has_shell_features) == SHELL_PROCESS_EPARSE &&
+        netargv.data == nullptr && netargv_count == 0 && !has_shell_features;
     shell_processed_commands_free(&processed);
-    free(netargv);
+    shell_netstring_buffer_free(&netargv);
     if (!control_rejected)
       return fixed_oracle_failure(__LINE__);
   }
@@ -3473,7 +3484,7 @@ static int test_fixed_oracles(void) {
     shell_command_t *commands = NULL;
     size_t command_count = 0;
     shell_processed_commands_t processed = {};
-    char *netargv = NULL;
+    shell_netstring_buffer_t netargv = {};
     size_t netargv_count = 0;
     bool features = false;
     shell_transformed_command_t **transformed = NULL;
@@ -3489,10 +3500,10 @@ static int test_fixed_oracles(void) {
         shell_process_commands(item.input, length, NULL, &processed) ==
             SHELL_PROCESS_OK &&
         processed.command_count == 1 &&
-        shell_build_netargv_sequence(item.input, length, NULL, &netargv,
-                                     &netargv_count,
-                                     &features) == SHELL_PROCESS_OK &&
-        netargv != NULL && netargv_count == 1 &&
+        shell_build_netargv_sequence_buffer(item.input, length, NULL, &netargv,
+                                            &netargv_count,
+                                            &features) == SHELL_PROCESS_OK &&
+        netargv.data != NULL && netargv_count == 1 &&
         shell_transform_command_line(item.input, length, NULL, &transformed,
                                      &transformed_count) ==
             SHELL_TRANSFORM_OK &&
@@ -3505,7 +3516,7 @@ static int test_fixed_oracles(void) {
         shell_dep_graph_validate(&graph).valid;
     shell_commands_free(commands, command_count);
     shell_processed_commands_free(&processed);
-    free(netargv);
+    shell_netstring_buffer_free(&netargv);
     shell_transformed_command_list_free(transformed, transformed_count);
     shell_abstract_command_free(abstract);
     if (!valid)
@@ -3638,17 +3649,17 @@ static int test_fixed_oracles(void) {
       "> <(cat)foo time echo ok",
   };
   for (const char *input : redirect_boundaries) {
-    char *sequence = NULL;
+    shell_netstring_buffer_t sequence = {};
     size_t command_count = 0;
     bool features = false;
-    if (shell_build_netargv_sequence(input, strlen(input), NULL, &sequence,
-                                     &command_count,
-                                     &features) != SHELL_PROCESS_OK ||
+    if (shell_build_netargv_sequence_buffer(input, strlen(input), NULL,
+                                            &sequence, &command_count,
+                                            &features) != SHELL_PROCESS_OK ||
         command_count != (strstr(input, "echo hi") ? 2u : 1u)) {
-      free(sequence);
+      shell_netstring_buffer_free(&sequence);
       return fixed_oracle_failure(__LINE__);
     }
-    free(sequence);
+    shell_netstring_buffer_free(&sequence);
   }
   static const char *const redirect_followed_by_unsupported[] = {
       "> <(cat)foo declare -a values",
@@ -4102,15 +4113,15 @@ static int test_fixed_oracles(void) {
     shell_command_info_t *infos = NULL;
     size_t info_count = 0;
     shell_processed_commands_t processed = {};
-    char *netargv = NULL;
+    shell_netstring_buffer_t netargv = {};
     size_t netargv_count = 0;
     bool has_shell_features = false;
-    char *command_netseq = NULL;
+    shell_netstring_buffer_t command_netseq = {};
     size_t command_netseq_count = 0;
-    char *type_netseq = NULL;
+    shell_netstring_buffer_t type_netseq = {};
     size_t type_netseq_count = 0;
-    char *anomaly_commands = NULL;
-    char *anomaly_types = NULL;
+    shell_netstring_buffer_t anomaly_commands = {};
+    shell_netstring_buffer_t anomaly_types = {};
     size_t anomaly_count = 0;
     shell_dep_graph_t graph = {};
     bool rejected =
@@ -4124,21 +4135,22 @@ static int test_fixed_oracles(void) {
         shell_process_commands(input, length, NULL, &processed) ==
             SHELL_PROCESS_EPARSE &&
         processed.commands == NULL && processed.command_count == 0 &&
-        shell_build_netargv_sequence(input, length, NULL, &netargv,
-                                     &netargv_count, &has_shell_features) ==
+        shell_build_netargv_sequence_buffer(
+            input, length, NULL, &netargv, &netargv_count,
+            &has_shell_features) == SHELL_PROCESS_EPARSE &&
+        netargv.data == NULL && netargv_count == 0 &&
+        shell_build_command_netseq_buffer(input, length, NULL, &command_netseq,
+                                          &command_netseq_count) ==
             SHELL_PROCESS_EPARSE &&
-        netargv == NULL && netargv_count == 0 &&
-        shell_build_command_netseq(input, length, NULL, &command_netseq,
-                                   &command_netseq_count) ==
+        command_netseq.data == NULL && command_netseq_count == 0 &&
+        shell_build_type_netseq_buffer(input, length, NULL, &type_netseq,
+                                       &type_netseq_count) ==
             SHELL_PROCESS_EPARSE &&
-        command_netseq == NULL && command_netseq_count == 0 &&
-        shell_build_type_netseq(input, length, NULL, &type_netseq,
-                                &type_netseq_count) == SHELL_PROCESS_EPARSE &&
-        type_netseq == NULL && type_netseq_count == 0 &&
-        shell_build_anomaly_netseqs(input, length, NULL, &anomaly_commands,
-                                    &anomaly_types,
-                                    &anomaly_count) == SHELL_PROCESS_EPARSE &&
-        anomaly_commands == NULL && anomaly_types == NULL &&
+        type_netseq.data == NULL && type_netseq_count == 0 &&
+        shell_build_anomaly_netseqs_buffer(
+            input, length, NULL, &anomaly_commands, &anomaly_types,
+            &anomaly_count) == SHELL_PROCESS_EPARSE &&
+        anomaly_commands.data == NULL && anomaly_types.data == NULL &&
         anomaly_count == 0 &&
         shell_dep_graph_parse(input, length, ".", NULL, &graph) ==
             SHELL_DEP_EPARSE &&
@@ -4146,11 +4158,11 @@ static int test_fixed_oracles(void) {
     shell_commands_free(commands, command_count);
     shell_command_infos_free(infos, info_count);
     shell_processed_commands_free(&processed);
-    free(netargv);
-    free(command_netseq);
-    free(type_netseq);
-    free(anomaly_commands);
-    free(anomaly_types);
+    shell_netstring_buffer_free(&netargv);
+    shell_netstring_buffer_free(&command_netseq);
+    shell_netstring_buffer_free(&type_netseq);
+    shell_netstring_buffer_free(&anomaly_commands);
+    shell_netstring_buffer_free(&anomaly_types);
     if (!rejected)
       return fixed_oracle_failure(__LINE__);
   }
@@ -4175,7 +4187,7 @@ static int test_fixed_oracles(void) {
     shell_command_t *commands = NULL;
     size_t command_count = 0;
     shell_processed_commands_t processed = {};
-    char *netargv = NULL;
+    shell_netstring_buffer_t netargv = {};
     size_t netargv_count = 0;
     bool has_shell_features = false;
     shell_dep_graph_t graph = {};
@@ -4185,15 +4197,15 @@ static int test_fixed_oracles(void) {
             SHELL_TOKENIZE_OK &&
         shell_process_commands(input, length, NULL, &processed) ==
             SHELL_PROCESS_OK &&
-        shell_build_netargv_sequence(input, length, NULL, &netargv,
-                                     &netargv_count,
-                                     &has_shell_features) == SHELL_PROCESS_OK &&
+        shell_build_netargv_sequence_buffer(
+            input, length, NULL, &netargv, &netargv_count,
+            &has_shell_features) == SHELL_PROCESS_OK &&
         shell_dep_graph_parse(input, length, ".", NULL, &graph) ==
             SHELL_DEP_OK &&
         shell_dep_graph_validate(&graph).valid;
     shell_commands_free(commands, command_count);
     shell_processed_commands_free(&processed);
-    free(netargv);
+    shell_netstring_buffer_free(&netargv);
     if (!accepted)
       return fixed_oracle_failure(__LINE__);
   }
@@ -4386,6 +4398,129 @@ static int validate_depgraph(const char *input, size_t length,
                                              limits)
              ? 0
              : 1;
+}
+
+struct resolved_fuzz_context {
+  const char *source;
+  size_t length;
+  uint8_t mode;
+  bool invalid_request;
+  size_t calls;
+  std::vector<uint8_t> seen;
+  const char *payload;
+  size_t payload_length;
+};
+
+static shell_expand_status_t
+resolved_fuzz_word(const shell_expand_word_request_t *request,
+                   const char **netargv, size_t *length, void *context) {
+  auto *fixture = static_cast<resolved_fuzz_context *>(context);
+  if (request->source != fixture->source ||
+      request->source_length != fixture->length ||
+      request->word_offset >= fixture->length ||
+      request->word_length > fixture->length - request->word_offset ||
+      request->owner_offset > request->word_offset ||
+      request->owner_length > fixture->length - request->owner_offset ||
+      fixture->seen[request->word_offset]++) {
+    fixture->invalid_request = true;
+    return SHELL_EXPAND_FAILED;
+  }
+  fixture->calls++;
+  *netargv = fixture->payload;
+  *length = fixture->payload_length;
+  if (fixture->mode == 0)
+    return SHELL_EXPAND_UNRESOLVED;
+  if (fixture->mode == 6)
+    return SHELL_EXPAND_FAILED;
+  return SHELL_EXPAND_RESOLVED;
+}
+
+static int test_resolved_depgraph(const char *input, size_t length,
+                                  const char *cwd, uint8_t selector,
+                                  bool truncate) {
+  static std::vector<std::max_align_t> workspace;
+  shell_dep_limits_t limits = SHELL_DEP_LIMITS_DEFAULT;
+  if (truncate) {
+    limits.max_nodes = 1;
+    limits.max_edges = 1;
+  }
+  size_t required = 0;
+  if (!shell_dep_resolved_workspace_size(length, &limits, &required))
+    return 1;
+  size_t slots =
+      (required + sizeof(std::max_align_t) - 1) / sizeof(std::max_align_t);
+  if (workspace.size() < slots)
+    workspace.resize(slots);
+  limits.workspace = workspace.data();
+  limits.workspace_size = required;
+  static const char binary[] = {'3', ':', 'a', '\0', 'b', ','};
+  resolved_fuzz_context fixture = {
+      input,   length, (uint8_t)(selector % 7),
+      false,   0,      std::vector<uint8_t>(length),
+      nullptr, 0};
+  switch (fixture.mode) {
+  case 0:
+  case 1:
+    fixture.payload = "9:/tmp/path,";
+    fixture.payload_length = 12;
+    break;
+  case 3:
+    fixture.payload = "1:a,1:b,";
+    fixture.payload_length = 8;
+    break;
+  case 4:
+    fixture.payload = binary;
+    fixture.payload_length = sizeof(binary);
+    break;
+  case 5:
+    fixture.payload = "01:x,";
+    fixture.payload_length = 5;
+    break;
+  default:
+    break; /* Empty successful expansion, or explicit callback failure. */
+  }
+  shell_dep_graph_t graph = {};
+  uint8_t unresolved[SHELL_DEP_MAX_NODES];
+  memset(unresolved, 0xff, sizeof(unresolved));
+  shell_dep_error_t error =
+      shell_dep_graph_parse_resolved(input, length, cwd, &limits, &graph,
+                                     resolved_fuzz_word, &fixture, unresolved);
+  if (fixture.invalid_request ||
+      validate_depgraph(input, length, error, &graph, &limits) ||
+      (fixture.calls && fixture.mode >= 5 && error != SHELL_DEP_EEXPAND))
+    return 1;
+  for (size_t i = 0; i < SHELL_DEP_MAX_NODES; i++) {
+    if (unresolved[i] > 1 || (i >= graph.node_count && unresolved[i]))
+      return 1;
+    if (i < graph.node_count && graph.nodes[i].type == SHELL_NODE_DOC &&
+        (graph.nodes[i].doc.flags & SHELL_DEP_DOC_FLAG_RESOLVED_PATH)) {
+      const auto &doc = graph.nodes[i].doc;
+      /* Values borrow exactly the callback's immutable encoded buffer. */
+      uintptr_t value = reinterpret_cast<uintptr_t>(doc.value);
+      uintptr_t start = reinterpret_cast<uintptr_t>(fixture.payload);
+      if (!fixture.payload || value < start ||
+          value - start > fixture.payload_length ||
+          doc.value_len > fixture.payload_length - (value - start))
+        return 1;
+    }
+  }
+  return 0;
+}
+
+static int test_generated_resolved_depgraph(uint8_t selector, bool truncate) {
+  static const char *sources[] = {
+      "echo \"$V\"",
+      "echo \"$(cat <\"$IN\")\"",
+      "{ { cat; }; } <\"$IN\"",
+      "false && cat <\"$IN\"; true || echo \"$V\"",
+      "maybe && cat <\"$IN\" || echo \"$V\"",
+      "cat $(<\"$IN\") | cat",
+      "cat < <(cat <\"$IN\")",
+      "{ echo \"$V\"; } > >(cat <\"$IN\")",
+  };
+  const char *source = sources[selector % 8];
+  return test_resolved_depgraph(source, strlen(source), "/workspace",
+                                selector / 8, truncate);
 }
 
 static int test_depgraph(const char *input, size_t length, const char *cwd) {
@@ -4770,8 +4905,7 @@ static int test_abstraction(const char *input, size_t length) {
   bool success = command != NULL;
   if (!success)
     return command != NULL;
-  if (!command || !shell_abstract_command_get_source(command) ||
-      !shell_abstract_command_get_display_text(command)) {
+  if (!command || !command->original || !command->display_text) {
     shell_abstract_command_free(command);
     return 1;
   }
@@ -4785,22 +4919,7 @@ static int test_abstraction(const char *input, size_t length) {
   }
 
   if (shell_abstract_command_get_element(command, count) != NULL ||
-      shell_abstract_command_find_element(command, "__missing__") != NULL ||
-      shell_abstract_command_has_variables(command) != command->has_variables ||
-      shell_abstract_command_has_pos_vars(command) != command->has_pos_vars ||
-      shell_abstract_command_has_special_vars(command) !=
-          command->has_special_vars ||
-      shell_abstract_command_has_globs(command) != command->has_globs ||
-      shell_abstract_command_has_paths(command) != command->has_paths ||
-      shell_abstract_command_has_abs_paths(command) != command->has_abs_paths ||
-      shell_abstract_command_has_rel_paths(command) != command->has_rel_paths ||
-      shell_abstract_command_has_home_paths(command) !=
-          command->has_home_paths ||
-      shell_abstract_command_has_cmd_subst(command) != command->has_cmd_subst ||
-      shell_abstract_command_has_redirects(command) != command->has_redirects ||
-      shell_abstract_command_has_strings(command) != command->has_strings ||
-      shell_abstract_command_has_arithmetic(command) !=
-          command->has_arithmetic) {
+      shell_abstract_command_find_element(command, "__missing__") != NULL) {
     shell_abstract_command_free(command);
     return 1;
   }
@@ -4869,7 +4988,7 @@ static int test_data_helpers(const char *input, size_t length,
   (void)shell_env_screener_calculate_entropy(text);
   (void)shell_env_screener_is_secret_pattern(text);
   (void)shell_env_screener_is_whitelisted(text);
-  (void)shell_env_screener_combined_score(text);
+  (void)shell_env_screener_combined_score_name(NULL, text);
   (void)shell_env_screener_combined_score_name("FUZZ_KEY", text);
   (void)shell_env_screener_looks_like_path(text);
   (void)shell_env_screener_looks_like_base64(text);
@@ -4914,11 +5033,7 @@ static int test_transformer(const char *input, size_t input_length) {
     for (size_t i = 0; i < transformed_count; i++) {
       shell_transformed_command_t *tcmd = transformed_cmds[i];
       if (!tcmd || !tcmd->original_command || !tcmd->display_text ||
-          (tcmd->tokens == NULL) != (tcmd->token_count == 0) ||
-          shell_transformed_command_get_display_text(tcmd) !=
-              tcmd->display_text ||
-          shell_transformed_command_has_transformations(tcmd) !=
-              tcmd->has_transformations) {
+          (tcmd->tokens == NULL) != (tcmd->token_count == 0)) {
         shell_transformed_command_list_free(transformed_cmds,
                                             transformed_count);
         return 1;
@@ -5024,12 +5139,12 @@ static int test_processor(const char *input, size_t input_length) {
   shell_process_status_t status = shell_process_command(
       input, input_length, &limits, &infos, &command_count);
   bool success = status == SHELL_PROCESS_OK;
-  char *sequence = NULL;
+  shell_netstring_buffer_t sequence = {};
   size_t sequence_count = 0;
   bool has_shell_features = false;
-  shell_process_status_t extracted_status =
-      shell_build_netargv_sequence(input, input_length, &limits, &sequence,
-                                   &sequence_count, &has_shell_features);
+  shell_process_status_t extracted_status = shell_build_netargv_sequence_buffer(
+      input, input_length, &limits, &sequence, &sequence_count,
+      &has_shell_features);
   bool extracted = extracted_status == SHELL_PROCESS_OK;
 
   /* The flat processor preserves an empty lexical result for diagnostics,
@@ -5037,7 +5152,7 @@ static int test_processor(const char *input, size_t input_length) {
    * command. This is an intentional semantic boundary, not a differential
    * parser failure. */
   if (success && command_count == 0 && !extracted &&
-      extracted_status == SHELL_PROCESS_EINPUT && sequence == NULL &&
+      extracted_status == SHELL_PROCESS_EINPUT && sequence.data == NULL &&
       sequence_count == 0 && !has_shell_features) {
     shell_command_infos_free(infos, command_count);
     return 0;
@@ -5058,13 +5173,13 @@ static int test_processor(const char *input, size_t input_length) {
         (processed.commands != NULL || processed.command_count == 0);
     for (size_t i = 0; structured_canonical && i < processed.command_count;
          i++) {
-      char *netargv = NULL;
+      shell_netstring_buffer_t netargv = {};
       structured_canonical =
           processed.commands[i].command_token_count != 0 &&
-          shell_render_netargv(&processed.commands[i], &limits, &netargv) ==
-              SHELL_PROCESS_OK &&
-          netargv != NULL;
-      free(netargv);
+          shell_render_netargv_buffer(&processed.commands[i], &limits,
+                                      &netargv) == SHELL_PROCESS_OK &&
+          netargv.data != NULL;
+      shell_netstring_buffer_free(&netargv);
     }
     bool canonical_boundary =
         (processed_status == SHELL_PROCESS_EPARSE &&
@@ -5081,7 +5196,7 @@ static int test_processor(const char *input, size_t input_length) {
               processed.group_io_op_count);
     shell_processed_commands_free(&processed);
     shell_command_infos_free(infos, command_count);
-    free(sequence);
+    shell_netstring_buffer_free(&sequence);
     return canonical_boundary ? 0 : 1;
   }
 
@@ -5099,7 +5214,7 @@ static int test_processor(const char *input, size_t input_length) {
         processed.commands == NULL && processed.command_count == 0 &&
         processed.groups == NULL && processed.group_count == 0 &&
         processed.group_io_ops == NULL && processed.group_io_op_count == 0 &&
-        sequence == NULL && sequence_count == 0 && !has_shell_features;
+        sequence.data == NULL && sequence_count == 0 && !has_shell_features;
     if (!canonical_capacity && g_verbose)
       fprintf(stderr,
               "processor canonical-capacity mismatch: flat=%d/%zu "
@@ -5109,7 +5224,7 @@ static int test_processor(const char *input, size_t input_length) {
               processed.group_io_op_count);
     shell_processed_commands_free(&processed);
     shell_command_infos_free(infos, command_count);
-    free(sequence);
+    shell_netstring_buffer_free(&sequence);
     return canonical_capacity ? 0 : 1;
   }
 
@@ -5119,7 +5234,7 @@ static int test_processor(const char *input, size_t input_length) {
               "processor success mismatch: flat=%d/%zu sequence=%d/%zu\n",
               status, command_count, extracted_status, sequence_count);
     shell_command_infos_free(infos, command_count);
-    free(sequence);
+    shell_netstring_buffer_free(&sequence);
     return 1;
   }
   if (!success) {
@@ -5130,22 +5245,22 @@ static int test_processor(const char *input, size_t input_length) {
         fprintf(stderr, "processor rejection mismatch: flat=%d sequence=%d\n",
                 status, extracted_status);
       shell_command_infos_free(infos, command_count);
-      free(sequence);
+      shell_netstring_buffer_free(&sequence);
       return 1;
     }
     shell_command_infos_free(infos, command_count);
-    free(sequence);
+    shell_netstring_buffer_free(&sequence);
     return 0;
   }
 
-  if ((infos == NULL) != (command_count == 0) || (sequence == NULL) ||
+  if ((infos == NULL) != (command_count == 0) || (sequence.data == NULL) ||
       sequence_count != command_count) {
     if (g_verbose)
-      fprintf(stderr,
-              "processor output mismatch: infos=%p/%zu sequence=%p/%zu\n",
-              (void *)infos, command_count, (void *)sequence, sequence_count);
+      fprintf(
+          stderr, "processor output mismatch: infos=%p/%zu sequence=%p/%zu\n",
+          (void *)infos, command_count, (void *)sequence.data, sequence_count);
     shell_command_infos_free(infos, command_count);
-    free(sequence);
+    shell_netstring_buffer_free(&sequence);
     return 1;
   }
 
@@ -5153,7 +5268,7 @@ static int test_processor(const char *input, size_t input_length) {
   if (infos) {
     for (size_t i = 0; i < command_count; i++) {
       shell_command_info_t *info = &infos[i];
-      char *netargv = NULL;
+      shell_netstring_buffer_t netargv = {};
       if (!info->original_command ||
           (info->shell_tokens == NULL) != (info->shell_token_count == 0) ||
           (info->command_tokens == NULL) != (info->command_token_count == 0) ||
@@ -5163,13 +5278,14 @@ static int test_processor(const char *input, size_t input_length) {
           !tokens_refer_to_owned_command(info->command_tokens,
                                          info->command_token_count,
                                          info->original_command) ||
-          shell_render_netargv(info, &limits, &netargv) != SHELL_PROCESS_OK) {
-        free(netargv);
+          shell_render_netargv_buffer(info, &limits, &netargv) !=
+              SHELL_PROCESS_OK) {
+        shell_netstring_buffer_free(&netargv);
         shell_command_infos_free(infos, command_count);
-        free(sequence);
+        shell_netstring_buffer_free(&sequence);
         return 1;
       }
-      free(netargv);
+      shell_netstring_buffer_free(&netargv);
       expected_features |= shell_command_info_has_dangerous_features(info);
     }
   }
@@ -5180,7 +5296,7 @@ static int test_processor(const char *input, size_t input_length) {
    * material command below. */
   if (command_count == 0) {
     shell_command_infos_free(infos, command_count);
-    free(sequence);
+    shell_netstring_buffer_free(&sequence);
     return expected_features != has_shell_features;
   }
 
@@ -5213,8 +5329,8 @@ static int test_processor(const char *input, size_t input_length) {
         (processed_status == SHELL_PROCESS_OK &&
          ((processed.commands == NULL) != (processed.command_count == 0) ||
           !processed_groups_match_fast(&fast, &processed) ||
-          !processed_argv_matches_sequence(
-              processed, sequence, strlen(sequence), sequence_count)))) {
+          !processed_argv_matches_sequence(processed, sequence.data,
+                                           sequence.length, sequence_count)))) {
       if (g_verbose)
         fprintf(stderr,
                 "processor descriptor mismatch: input=%.*s process=%d/%zu "
@@ -5224,14 +5340,14 @@ static int test_processor(const char *input, size_t input_length) {
                 processed.group_count, fast.group_count);
       shell_processed_commands_free(&processed);
       shell_command_infos_free(infos, command_count);
-      free(sequence);
+      shell_netstring_buffer_free(&sequence);
       return 1;
     }
     shell_processed_commands_free(&processed);
   }
 
   shell_command_infos_free(infos, command_count);
-  free(sequence);
+  shell_netstring_buffer_free(&sequence);
   if (expected_features != has_shell_features && g_verbose)
     fprintf(stderr,
             "processor feature mismatch: input=%.*s flat=%d sequence=%d\n",
@@ -5295,21 +5411,23 @@ static uint16_t graph_group_depth(const shell_dep_graph_t *graph,
   return depth;
 }
 
-static bool valid_generated_outer_netsequence(const char *sequence,
-                                              uint32_t expected_count) {
+static bool
+valid_generated_outer_netsequence(const shell_netstring_buffer_t &sequence,
+                                  uint32_t expected_count) {
   size_t count = 0;
-  return sequence != NULL &&
-         shell_netstring_validate(sequence, strlen(sequence), &count) ==
+  return sequence.data != NULL &&
+         shell_netstring_validate(sequence.data, sequence.length, &count) ==
              SHELL_NETSTRING_OK &&
          count == expected_count;
 }
 
-static bool valid_generated_netargv_sequence(const char *sequence,
-                                             uint32_t expected_count) {
+static bool
+valid_generated_netargv_sequence(const shell_netstring_buffer_t &sequence,
+                                 uint32_t expected_count) {
   if (!valid_generated_outer_netsequence(sequence, expected_count))
     return false;
   shell_netstring_iter_t iterator = {};
-  if (shell_netstring_iter_init(&iterator, sequence, strlen(sequence)) !=
+  if (shell_netstring_iter_init(&iterator, sequence.data, sequence.length) !=
       SHELL_NETSTRING_OK)
     return false;
   for (;;) {
@@ -5504,28 +5622,30 @@ static int test_generated_brace_case(const uint8_t *data, size_t size,
 
   shell_dep_graph_validation_t graph_validation =
       shell_dep_graph_validate(&graph);
-  char *netargv_sequence = NULL;
-  char *command_netseq = NULL;
-  char *type_netseq = NULL;
-  char *paired_command_netseq = NULL;
-  char *paired_type_netseq = NULL;
+  shell_netstring_buffer_t netargv_sequence = {};
+  shell_netstring_buffer_t command_netseq = {};
+  shell_netstring_buffer_t type_netseq = {};
+  shell_netstring_buffer_t paired_command_netseq = {};
+  shell_netstring_buffer_t paired_type_netseq = {};
   size_t netargv_count = 0;
   size_t command_netseq_count = 0;
   size_t type_netseq_count = 0;
   size_t paired_count = 0;
   bool has_shell_features = false;
-  shell_process_status_t netargv_status = shell_build_netargv_sequence(
+  shell_process_status_t netargv_status = shell_build_netargv_sequence_buffer(
       item.command.data(), item.command.size(), NULL, &netargv_sequence,
       &netargv_count, &has_shell_features);
   shell_process_status_t command_netseq_status =
-      shell_build_command_netseq(item.command.data(), item.command.size(), NULL,
-                                 &command_netseq, &command_netseq_count);
+      shell_build_command_netseq_buffer(item.command.data(),
+                                        item.command.size(), NULL,
+                                        &command_netseq, &command_netseq_count);
   shell_process_status_t type_netseq_status =
-      shell_build_type_netseq(item.command.data(), item.command.size(), NULL,
-                              &type_netseq, &type_netseq_count);
-  shell_process_status_t paired_netseq_status = shell_build_anomaly_netseqs(
-      item.command.data(), item.command.size(), NULL, &paired_command_netseq,
-      &paired_type_netseq, &paired_count);
+      shell_build_type_netseq_buffer(item.command.data(), item.command.size(),
+                                     NULL, &type_netseq, &type_netseq_count);
+  shell_process_status_t paired_netseq_status =
+      shell_build_anomaly_netseqs_buffer(
+          item.command.data(), item.command.size(), NULL,
+          &paired_command_netseq, &paired_type_netseq, &paired_count);
   bool sequences_valid =
       netargv_status == SHELL_PROCESS_OK && netargv_count != 0 &&
       valid_generated_netargv_sequence(netargv_sequence, netargv_count) &&
@@ -5541,8 +5661,12 @@ static int test_generated_brace_case(const uint8_t *data, size_t size,
       valid_generated_outer_netsequence(type_netseq, type_netseq_count) &&
       paired_netseq_status == SHELL_PROCESS_OK &&
       paired_count == command_netseq_count &&
-      strcmp(command_netseq, paired_command_netseq) == 0 &&
-      strcmp(type_netseq, paired_type_netseq) == 0;
+      (command_netseq.length != paired_command_netseq.length ||
+       memcmp(command_netseq.data, paired_command_netseq.data,
+              command_netseq.length)) == 0 &&
+      (type_netseq.length != paired_type_netseq.length ||
+       memcmp(type_netseq.data, paired_type_netseq.data, type_netseq.length)) ==
+          0;
   if (!sequences_valid && g_verbose)
     fprintf(stderr,
             "generated sequence mismatch: netargv=%d/%zu command=%d/%zu "
@@ -5550,11 +5674,11 @@ static int test_generated_brace_case(const uint8_t *data, size_t size,
             netargv_status, netargv_count, command_netseq_status,
             command_netseq_count, type_netseq_status, type_netseq_count,
             paired_netseq_status, paired_count, has_shell_features);
-  free(paired_type_netseq);
-  free(paired_command_netseq);
-  free(type_netseq);
-  free(command_netseq);
-  free(netargv_sequence);
+  shell_netstring_buffer_free(&paired_type_netseq);
+  shell_netstring_buffer_free(&paired_command_netseq);
+  shell_netstring_buffer_free(&type_netseq);
+  shell_netstring_buffer_free(&command_netseq);
+  shell_netstring_buffer_free(&netargv_sequence);
   bool group_limits_valid = true;
   bool failed =
       fast_error != SHELL_OK ||
@@ -5643,7 +5767,7 @@ static int test_substitution_case(const shell_substitution_fuzz_case_t &item,
   size_t command_count = 0;
   shell_processed_commands_t processed = {};
   shell_dep_graph_t graph = {};
-  char *netargv_sequence = NULL;
+  shell_netstring_buffer_t netargv_sequence = {};
   size_t netargv_count = 0;
   bool has_shell_features = false;
 
@@ -5655,7 +5779,7 @@ static int test_substitution_case(const shell_substitution_fuzz_case_t &item,
       item.command.data(), item.command.size(), NULL, &processed);
   shell_dep_error_t graph_error = shell_dep_graph_parse(
       item.command.data(), item.command.size(), cwd, NULL, &graph);
-  shell_process_status_t netargv_error = shell_build_netargv_sequence(
+  shell_process_status_t netargv_error = shell_build_netargv_sequence_buffer(
       item.command.data(), item.command.size(), NULL, &netargv_sequence,
       &netargv_count, &has_shell_features);
 
@@ -5838,7 +5962,7 @@ static int test_substitution_case(const shell_substitution_fuzz_case_t &item,
                   netargv_error != SHELL_PROCESS_EPARSE ||
                   graph_error != SHELL_DEP_EPARSE || graph.node_count != 0 ||
                   graph.edge_count != 0 || processed.command_count != 0 ||
-                  processed.commands != NULL || netargv_sequence != NULL ||
+                  processed.commands != NULL || netargv_sequence.data != NULL ||
                   netargv_count != 0 || has_shell_features;
     if (failed && g_verbose)
       fprintf(stderr,
@@ -5846,7 +5970,7 @@ static int test_substitution_case(const shell_substitution_fuzz_case_t &item,
               "(fast=%d full=%d process=%d netargv=%d graph=%d)\n",
               item.command.c_str(), fast_error, full_error, process_error,
               netargv_error, graph_error);
-    free(netargv_sequence);
+    shell_netstring_buffer_free(&netargv_sequence);
     shell_commands_free(commands, command_count);
     shell_processed_commands_free(&processed);
     return failed;
@@ -5864,7 +5988,7 @@ static int test_substitution_case(const shell_substitution_fuzz_case_t &item,
               "nodes=%u edges=%u)\n",
               item.command.c_str(), fast_error, full_error, process_error,
               netargv_error, graph_error, graph.node_count, graph.edge_count);
-    free(netargv_sequence);
+    shell_netstring_buffer_free(&netargv_sequence);
     shell_commands_free(commands, command_count);
     shell_processed_commands_free(&processed);
     return failed;
@@ -5879,7 +6003,7 @@ static int test_substitution_case(const shell_substitution_fuzz_case_t &item,
               "(graph=%d status=%u validation=%d)\n",
               item.command.c_str(), graph_error, graph.status,
               validation.valid);
-    free(netargv_sequence);
+    shell_netstring_buffer_free(&netargv_sequence);
     shell_commands_free(commands, command_count);
     shell_processed_commands_free(&processed);
     return failed;
@@ -5939,7 +6063,7 @@ static int test_substitution_case(const shell_substitution_fuzz_case_t &item,
         heredoc_substitution_count, item.heredoc_substitution_count,
         herestring_count, item.herestring_count, herestring_substitution_count,
         item.herestring_substitution_count, topology_valid, validation.valid);
-  free(netargv_sequence);
+  shell_netstring_buffer_free(&netargv_sequence);
   shell_commands_free(commands, command_count);
   shell_processed_commands_free(&processed);
   return failed;
@@ -5988,15 +6112,18 @@ static int test_generated_redirect_boundary(unsigned selector) {
   else
     input = "cat $'x'" + number + ">out";
   bool empty_stage = mode == 0 || mode == 3;
-  char *raw = NULL, *typed = NULL;
+  shell_netstring_buffer_t raw = {};
+  shell_netstring_buffer_t typed = {};
   size_t count = 0;
   bool valid =
-      shell_build_anomaly_netseqs(input.data(), input.size(), NULL, &raw,
-                                  &typed, &count) == SHELL_PROCESS_OK;
-  valid = valid && count == (empty_stage ? 2u : 1u) &&
-          strcmp(raw, empty_stage ? "3:cat,0:," : "3:cat,") == 0;
-  free(raw);
-  free(typed);
+      shell_build_anomaly_netseqs_buffer(input.data(), input.size(), NULL, &raw,
+                                         &typed, &count) == SHELL_PROCESS_OK;
+  valid =
+      valid && count == (empty_stage ? 2u : 1u) &&
+      (raw.length != strlen(empty_stage ? "3:cat,0:," : "3:cat,") ||
+       memcmp(raw.data, empty_stage ? "3:cat,0:," : "3:cat,", raw.length)) == 0;
+  shell_netstring_buffer_free(&raw);
+  shell_netstring_buffer_free(&typed);
   shell_netstring_buffer_t sequence = {};
   bool features = false;
   shell_process_status_t status = shell_build_netargv_sequence_buffer(
@@ -6152,277 +6279,276 @@ static int test_generated_static_arithmetic_case(const uint8_t *data,
   return valid ? 0 : 1;
 }
 
-extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
-  static bool fixed_oracles_checked = false;
-  if (!fixed_oracles_checked) {
-    for (const auto &fixture : shellsplit_test_array_prefixes) {
-      size_t length = strlen(fixture.source);
-      shell_parse_result_t parsed = {};
-      shell_limits_t strict = SHELL_LIMITS_DEFAULT;
-      strict.strict_mode = true;
-      bool valid = shell_parse_fast(fixture.source, length, &strict, &parsed) ==
-                   SHELL_OK;
-      uint32_t features = 0;
-      for (uint32_t i = 0; i < parsed.count; i++)
-        features |= parsed.cmds[i].features;
-      shell_processed_commands_t processed = {};
-      shell_dep_graph_t graph = {};
-      valid =
-          valid && !!(features & SHELL_FEAT_ARRAY) == fixture.array &&
-          !!(features & SHELL_FEAT_GLOBS) == fixture.glob &&
-          shell_process_commands(fixture.source, length, nullptr, &processed) ==
-              (fixture.array ? SHELL_PROCESS_EPARSE : SHELL_PROCESS_OK) &&
-          shell_dep_graph_parse(fixture.source, length, nullptr, nullptr,
-                                &graph) ==
-              (fixture.array ? SHELL_DEP_EPARSE : SHELL_DEP_OK) &&
-          (fixture.array ? graph.node_count == 0 && graph.edge_count == 0
-                         : shell_dep_graph_validate(&graph).valid);
-      shell_processed_commands_free(&processed);
-      if (!valid) {
-        fprintf(stderr, "array prefix oracle failed: %s\n", fixture.source);
-        abort();
-      }
-    }
-    for (const auto &fixture : shellsplit_test_scoped_expansions) {
-      size_t length = strlen(fixture.source);
-      shell_parse_result_t parsed = {};
-      shell_netstring_buffer_t raw = {}, type = {};
-      size_t stages = 0;
-      shell_process_status_t status = shell_build_anomaly_netseqs_buffer(
-          fixture.source, length, nullptr, &raw, &type, &stages);
-      bool valid = shell_parse_fast(fixture.source, length, nullptr, &parsed) ==
-                   SHELL_OK;
-      uint32_t features = 0;
-      for (uint32_t i = 0; i < parsed.count; i++)
-        features |= parsed.cmds[i].features;
-      valid = valid &&
-              (features & shellsplit_test_expansion_feature_mask) ==
-                  fixture.features &&
-              status == (fixture.supported ? SHELL_PROCESS_OK
-                                           : SHELL_PROCESS_EPARSE) &&
-              stages == fixture.stages;
-      shell_netstring_buffer_free(&raw);
-      shell_netstring_buffer_free(&type);
-      if (!valid) {
-        fprintf(stderr, "heredoc expansion oracle failed: %s\n",
-                fixture.source);
-        abort();
-      }
-    }
-    for (const auto &fixture : shellsplit_test_quoted_arithmetic) {
-      size_t length = strlen(fixture.source);
-      shell_parse_result_t parsed = {};
-      shell_processed_commands_t processed = {};
-      shell_process_status_t status =
-          shell_process_commands(fixture.source, length, NULL, &processed);
-      bool valid =
-          shell_parse_fast(fixture.source, length, NULL, &parsed) == SHELL_OK &&
-          ((parsed.cmds[0].features & SHELL_FEAT_ARITH) != 0) ==
-              fixture.arithmetic &&
-          status ==
-              (fixture.supported ? SHELL_PROCESS_OK : SHELL_PROCESS_EPARSE) &&
-          (fixture.supported
-               ? processed.command_count == 1
-               : processed.command_count == 0 && !processed.commands);
-      shell_processed_commands_free(&processed);
-      if (!valid) {
-        fprintf(stderr, "quoted arithmetic oracle failed: %s\n",
-                fixture.source);
-        abort();
-      }
-    }
-    for (const auto &fixture : shellsplit_test_expansion_features) {
-      shell_abstract_command_t *abstract = nullptr;
-      bool valid =
-          shell_abstract_command_parse(fixture.source, strlen(fixture.source),
-                                       &abstract) == SHELL_ABSTRACT_OK;
-      if (valid) {
-        valid = abstract->has_variables == fixture.variables &&
-                abstract->has_pos_vars == fixture.positional &&
-                abstract->has_special_vars == fixture.special &&
-                abstract->has_arithmetic == fixture.arithmetic &&
-                abstract->has_cmd_subst == fixture.substitution &&
-                abstract->has_globs == fixture.glob &&
-                strcmp(shell_abstract_command_get_display_text(abstract),
-                       fixture.display) == 0;
-        for (size_t j = 1; j < abstract->element_count; j++)
-          valid = valid && abstract->elements[j - 1]->end <=
-                               abstract->elements[j]->start;
-      }
-      shell_abstract_command_free(abstract);
-      if (!valid) {
-        fprintf(stderr, "expansion feature oracle failed: %s\n",
-                fixture.source);
-        abort();
-      }
-    }
-    for (const auto &fixture : shellsplit_test_glob_words) {
-      char source[256];
-      int length = snprintf(source, sizeof(source), "echo %s", fixture.word);
-      if (length <= 0 || static_cast<size_t>(length) >= sizeof(source) ||
-          shell_tokenizer_word_has_glob(fixture.word, strlen(fixture.word)) !=
-              fixture.glob ||
-          (shell_classify_raw_token(fixture.word, strlen(fixture.word)) ==
-           SHELL_TOKEN_GLOB) != fixture.glob ||
-          test_tokenizer_state(source, static_cast<size_t>(length)))
-        abort();
-    }
-    for (const auto &fixture : shellsplit_test_tilde_words) {
-      size_t length = strlen(fixture.word), decoded = 0;
-      std::string source = std::string("echo >") + fixture.word;
-      shell_dep_graph_t graph = {};
-      bool valid =
-          shell_visit_static_word(fixture.word, length, nullptr, nullptr,
-                                  &decoded) != fixture.generic_dynamic &&
-          shell_dep_graph_parse(source.data(), source.size(), ".", nullptr,
-                                &graph) == SHELL_DEP_OK &&
-          shell_dep_graph_validate(&graph).valid;
-      size_t files = 0;
-      for (uint32_t n = 0; valid && n < graph.node_count; n++) {
-        const auto &node = graph.nodes[n];
-        if (node.type != SHELL_NODE_DOC || node.doc.kind != SHELL_DOC_FILE)
-          continue;
-        files++;
-        valid = node.doc.path_len == length &&
-                !std::memcmp(node.doc.path, fixture.word, length) &&
-                ((node.doc.flags & SHELL_DEP_DOC_FLAG_DYNAMIC_NAME) != 0) ==
-                    fixture.argument_dynamic;
-        char identity[128];
-        std::memset(identity, 'x', sizeof(identity));
-        size_t written = SIZE_MAX;
-        bool absolute = true;
-        bool known = shell_dep_doc_file_identity_write(
-            &graph, &node.doc, identity, sizeof(identity), &written, &absolute);
-        valid = valid && known == !fixture.argument_dynamic;
-        if (!known) {
-          valid = valid && written == 0 && !absolute;
-          for (char byte : identity)
-            valid = valid && byte == 'x';
-        }
-      }
-      if (!valid || files != 1) {
-        fprintf(stderr, "tilde expansion oracle failed: %s\n", fixture.word);
-        abort();
-      }
-    }
-    for (const auto &fixture : shellsplit_test_tilde_cwd) {
-      std::string source = std::string("cd ") + fixture.word + "; pwd >out";
-      shell_dep_graph_t graph = {};
-      bool valid =
-          shell_dep_graph_parse(source.data(), source.size(), "/workspace",
-                                nullptr, &graph) == SHELL_DEP_OK &&
-          shell_dep_graph_validate(&graph).valid;
-      size_t files = 0;
-      for (uint32_t n = 0; valid && n < graph.node_count; n++) {
-        const auto &node = graph.nodes[n];
-        if (node.type != SHELL_NODE_DOC || node.doc.kind != SHELL_DOC_FILE ||
-            node.doc.path_len != 3 || std::memcmp(node.doc.path, "out", 3))
-          continue;
-        files++;
-        char identity[128];
-        size_t written = 0;
-        bool absolute = false;
-        bool known = shell_dep_doc_file_identity_write(
-            &graph, &node.doc, identity, sizeof(identity), &written, &absolute);
-        valid =
-            known == (fixture.cwd != nullptr) && node.doc.cwd_known == known;
-        if (known) {
-          std::string expected = std::string(fixture.cwd) + "/out";
-          valid = valid && absolute == fixture.absolute &&
-                  written == expected.size() && identity == expected;
-        } else
-          valid = valid && written == 0 && !absolute;
-      }
-      if (!valid || files != 1) {
-        fprintf(stderr, "tilde CWD identity oracle failed: %s\n", fixture.word);
-        abort();
-      }
-    }
-    for (const auto &fixture : shellsplit_test_fragment_words) {
-      shell_abstract_command_t *abstract = nullptr;
-      bool valid =
-          shell_abstract_command_parse(fixture.source, strlen(fixture.source),
-                                       &abstract) == SHELL_ABSTRACT_OK;
-      if (valid) {
-        valid = abstract->element_count == (fixture.has_variable ? 2u : 1u) &&
-                abstract->has_strings == fixture.string_fragment &&
-                abstract->has_cmd_subst == !fixture.string_fragment &&
-                abstract->has_variables == fixture.has_variable;
-        if (valid) {
-          const shell_abstract_element_t *element = abstract->elements[0];
-          size_t start = static_cast<size_t>(
-              strstr(fixture.source, fixture.fragment) - fixture.source);
-          valid =
-              element->type == (fixture.string_fragment ? SHELL_ABSTRACT_STR
-                                                        : SHELL_ABSTRACT_CS) &&
-              element->start == start &&
-              element->end == start + strlen(fixture.fragment) &&
-              strcmp(element->original, fixture.fragment) == 0 &&
-              element->data.cmd_subst.content &&
-              strcmp(element->data.cmd_subst.content, fixture.content) == 0;
-        }
-      }
-      shell_abstract_command_free(abstract);
-      if (!valid) {
-        fprintf(stderr, "fragment content oracle failed: %s\n", fixture.source);
-        abort();
-      }
-    }
-    for (const auto &fixture : shellsplit_test_parameter_words) {
-      const char *name = nullptr;
-      size_t length = 0;
-      bool matched = shell_tokenizer_word_parameter_name(
-          fixture.word, strlen(fixture.word), &name, &length);
-      if (matched != (fixture.name != nullptr) ||
-          (matched && (length != strlen(fixture.name) ||
-                       memcmp(name, fixture.name, length) != 0)))
-        abort();
-    }
-    if (test_fixed_oracles())
+/* Fixed sweeps belong to startup, not one fuzz input's timeout budget. */
+static void run_fixed_oracles() {
+  for (const auto &fixture : shellsplit_test_array_prefixes) {
+    size_t length = strlen(fixture.source);
+    shell_parse_result_t parsed = {};
+    shell_limits_t strict = SHELL_LIMITS_DEFAULT;
+    strict.strict_mode = true;
+    bool valid =
+        shell_parse_fast(fixture.source, length, &strict, &parsed) == SHELL_OK;
+    uint32_t features = 0;
+    for (uint32_t i = 0; i < parsed.count; i++)
+      features |= parsed.cmds[i].features;
+    shell_processed_commands_t processed = {};
+    shell_dep_graph_t graph = {};
+    valid =
+        valid && !!(features & SHELL_FEAT_ARRAY) == fixture.array &&
+        !!(features & SHELL_FEAT_GLOBS) == fixture.glob &&
+        shell_process_commands(fixture.source, length, nullptr, &processed) ==
+            (fixture.array ? SHELL_PROCESS_EPARSE : SHELL_PROCESS_OK) &&
+        shell_dep_graph_parse(fixture.source, length, nullptr, nullptr,
+                              &graph) ==
+            (fixture.array ? SHELL_DEP_EPARSE : SHELL_DEP_OK) &&
+        (fixture.array ? graph.node_count == 0 && graph.edge_count == 0
+                       : shell_dep_graph_validate(&graph).valid);
+    shell_processed_commands_free(&processed);
+    if (!valid) {
+      fprintf(stderr, "array prefix oracle failed: %s\n", fixture.source);
       abort();
-    static const char *const plain_boundary_cases[] = {
-        ".",     "source", "eval",      "trap",   "alias",
-        "pushd", "popd",   "command .", "/bin/.", "printf .",
-    };
-    for (const char *source : plain_boundary_cases)
-      if (test_plain_differential(source, strlen(source)))
-        abort();
-    for (unsigned selector = 0; selector < 48; selector++)
-      if (test_generated_redirect_boundary(selector))
-        abort();
-    for (unsigned selector = 0; selector < 16; selector++)
-      if (test_composite_redirect_operand(selector, "/tmp"))
-        abort();
-    for (uint8_t selector = 0;
-         selector < SHELL_BRACE_FUZZ_SUBSTITUTION_CASE_COUNT; selector++)
-      if (test_generated_substitution_case(&selector, 1, "/tmp"))
-        abort();
-    for (uint8_t selector = 0;
-         selector < SHELL_BRACE_FUZZ_COMPOSED_SUBSTITUTION_CASE_COUNT;
-         selector++)
-      if (test_composed_substitution_case(&selector, 1, "/tmp"))
-        abort();
-    static const uint8_t local_document_selectors[] = {58, 59, 60};
-    for (uint8_t selector : local_document_selectors)
-      if (test_generated_brace_case(&selector, 1, "/tmp"))
-        abort();
-    /* The invalid/strict-only family encodes its form selector in byte four;
-     * exercise every member at startup so a parser-boundary change cannot
-     * leave a stale expectation to be found only by random mutation. */
-    for (uint8_t selector = 0; selector < 12; selector++) {
-      const uint8_t invalid_case[] = {7, 0, 0, 0, selector};
-      if (test_generated_brace_case(invalid_case, sizeof(invalid_case), "/tmp"))
-        abort();
     }
-    if (test_composed_substitution_matrix("/tmp"))
-      abort();
-    static const uint8_t arithmetic_selectors[] = {0, 4, 1, 5, 2, 6, 3};
-    for (uint8_t selector : arithmetic_selectors)
-      if (test_generated_static_arithmetic_case(&selector, 1))
-        abort();
-    fixed_oracles_checked = true;
   }
+  for (const auto &fixture : shellsplit_test_scoped_expansions) {
+    size_t length = strlen(fixture.source);
+    shell_parse_result_t parsed = {};
+    shell_netstring_buffer_t raw = {}, type = {};
+    size_t stages = 0;
+    shell_process_status_t status = shell_build_anomaly_netseqs_buffer(
+        fixture.source, length, nullptr, &raw, &type, &stages);
+    bool valid =
+        shell_parse_fast(fixture.source, length, nullptr, &parsed) == SHELL_OK;
+    uint32_t features = 0;
+    for (uint32_t i = 0; i < parsed.count; i++)
+      features |= parsed.cmds[i].features;
+    valid = valid &&
+            (features & shellsplit_test_expansion_feature_mask) ==
+                fixture.features &&
+            status ==
+                (fixture.supported ? SHELL_PROCESS_OK : SHELL_PROCESS_EPARSE) &&
+            stages == fixture.stages;
+    shell_netstring_buffer_free(&raw);
+    shell_netstring_buffer_free(&type);
+    if (!valid) {
+      fprintf(stderr, "heredoc expansion oracle failed: %s\n", fixture.source);
+      abort();
+    }
+  }
+  for (const auto &fixture : shellsplit_test_quoted_arithmetic) {
+    size_t length = strlen(fixture.source);
+    shell_parse_result_t parsed = {};
+    shell_processed_commands_t processed = {};
+    shell_process_status_t status =
+        shell_process_commands(fixture.source, length, NULL, &processed);
+    bool valid =
+        shell_parse_fast(fixture.source, length, NULL, &parsed) == SHELL_OK &&
+        ((parsed.cmds[0].features & SHELL_FEAT_ARITH) != 0) ==
+            fixture.arithmetic &&
+        status ==
+            (fixture.supported ? SHELL_PROCESS_OK : SHELL_PROCESS_EPARSE) &&
+        (fixture.supported
+             ? processed.command_count == 1
+             : processed.command_count == 0 && !processed.commands);
+    shell_processed_commands_free(&processed);
+    if (!valid) {
+      fprintf(stderr, "quoted arithmetic oracle failed: %s\n", fixture.source);
+      abort();
+    }
+  }
+  for (const auto &fixture : shellsplit_test_expansion_features) {
+    shell_abstract_command_t *abstract = nullptr;
+    bool valid =
+        shell_abstract_command_parse(fixture.source, strlen(fixture.source),
+                                     &abstract) == SHELL_ABSTRACT_OK;
+    if (valid) {
+      valid = abstract->has_variables == fixture.variables &&
+              abstract->has_pos_vars == fixture.positional &&
+              abstract->has_special_vars == fixture.special &&
+              abstract->has_arithmetic == fixture.arithmetic &&
+              abstract->has_cmd_subst == fixture.substitution &&
+              abstract->has_globs == fixture.glob &&
+              strcmp(abstract->display_text, fixture.display) == 0;
+      for (size_t j = 1; j < abstract->element_count; j++)
+        valid = valid &&
+                abstract->elements[j - 1]->end <= abstract->elements[j]->start;
+    }
+    shell_abstract_command_free(abstract);
+    if (!valid) {
+      fprintf(stderr, "expansion feature oracle failed: %s\n", fixture.source);
+      abort();
+    }
+  }
+  for (const auto &fixture : shellsplit_test_glob_words) {
+    char source[256];
+    int length = snprintf(source, sizeof(source), "echo %s", fixture.word);
+    if (length <= 0 || static_cast<size_t>(length) >= sizeof(source) ||
+        shell_source_word_has_glob(fixture.word, strlen(fixture.word)) !=
+            fixture.glob ||
+        (shell_classify_raw_token(fixture.word, strlen(fixture.word)) ==
+         SHELL_TOKEN_GLOB) != fixture.glob ||
+        test_tokenizer_state(source, static_cast<size_t>(length)))
+      abort();
+  }
+  for (const auto &fixture : shellsplit_test_tilde_words) {
+    size_t length = strlen(fixture.word), decoded = 0;
+    std::string source = std::string("echo >") + fixture.word;
+    shell_dep_graph_t graph = {};
+    bool valid = shell_visit_static_word(fixture.word, length, nullptr, nullptr,
+                                         &decoded) != fixture.generic_dynamic &&
+                 shell_dep_graph_parse(source.data(), source.size(), ".",
+                                       nullptr, &graph) == SHELL_DEP_OK &&
+                 shell_dep_graph_validate(&graph).valid;
+    size_t files = 0;
+    for (uint32_t n = 0; valid && n < graph.node_count; n++) {
+      const auto &node = graph.nodes[n];
+      if (node.type != SHELL_NODE_DOC || node.doc.kind != SHELL_DOC_FILE)
+        continue;
+      files++;
+      valid = node.doc.path_len == length &&
+              !std::memcmp(node.doc.path, fixture.word, length) &&
+              ((node.doc.flags & SHELL_DEP_DOC_FLAG_DYNAMIC_NAME) != 0) ==
+                  fixture.argument_dynamic;
+      char identity[128];
+      std::memset(identity, 'x', sizeof(identity));
+      size_t written = SIZE_MAX;
+      bool absolute = true;
+      bool known = shell_dep_doc_file_identity_write(
+          &graph, &node.doc, identity, sizeof(identity), &written, &absolute);
+      valid = valid && known == !fixture.argument_dynamic;
+      if (!known) {
+        valid = valid && written == 0 && !absolute;
+        for (char byte : identity)
+          valid = valid && byte == 'x';
+      }
+    }
+    if (!valid || files != 1) {
+      fprintf(stderr, "tilde expansion oracle failed: %s\n", fixture.word);
+      abort();
+    }
+  }
+  for (const auto &fixture : shellsplit_test_tilde_cwd) {
+    std::string source = std::string("cd ") + fixture.word + "; pwd >out";
+    shell_dep_graph_t graph = {};
+    bool valid =
+        shell_dep_graph_parse(source.data(), source.size(), "/workspace",
+                              nullptr, &graph) == SHELL_DEP_OK &&
+        shell_dep_graph_validate(&graph).valid;
+    size_t files = 0;
+    for (uint32_t n = 0; valid && n < graph.node_count; n++) {
+      const auto &node = graph.nodes[n];
+      if (node.type != SHELL_NODE_DOC || node.doc.kind != SHELL_DOC_FILE ||
+          node.doc.path_len != 3 || std::memcmp(node.doc.path, "out", 3))
+        continue;
+      files++;
+      char identity[128];
+      size_t written = 0;
+      bool absolute = false;
+      bool known = shell_dep_doc_file_identity_write(
+          &graph, &node.doc, identity, sizeof(identity), &written, &absolute);
+      valid = known == (fixture.cwd != nullptr) && node.doc.cwd_known == known;
+      if (known) {
+        std::string expected = std::string(fixture.cwd) + "/out";
+        valid = valid && absolute == fixture.absolute &&
+                written == expected.size() && identity == expected;
+      } else
+        valid = valid && written == 0 && !absolute;
+    }
+    if (!valid || files != 1) {
+      fprintf(stderr, "tilde CWD identity oracle failed: %s\n", fixture.word);
+      abort();
+    }
+  }
+  for (const auto &fixture : shellsplit_test_fragment_words) {
+    shell_abstract_command_t *abstract = nullptr;
+    bool valid =
+        shell_abstract_command_parse(fixture.source, strlen(fixture.source),
+                                     &abstract) == SHELL_ABSTRACT_OK;
+    if (valid) {
+      valid = abstract->element_count == (fixture.has_variable ? 2u : 1u) &&
+              abstract->has_strings == fixture.string_fragment &&
+              abstract->has_cmd_subst == !fixture.string_fragment &&
+              abstract->has_variables == fixture.has_variable;
+      if (valid) {
+        const shell_abstract_element_t *element = abstract->elements[0];
+        size_t start = static_cast<size_t>(
+            strstr(fixture.source, fixture.fragment) - fixture.source);
+        valid =
+            element->type == (fixture.string_fragment ? SHELL_ABSTRACT_STR
+                                                      : SHELL_ABSTRACT_CS) &&
+            element->start == start &&
+            element->end == start + strlen(fixture.fragment) &&
+            strcmp(element->original, fixture.fragment) == 0 &&
+            element->data.cmd_subst.content &&
+            strcmp(element->data.cmd_subst.content, fixture.content) == 0;
+      }
+    }
+    shell_abstract_command_free(abstract);
+    if (!valid) {
+      fprintf(stderr, "fragment content oracle failed: %s\n", fixture.source);
+      abort();
+    }
+  }
+  for (const auto &fixture : shellsplit_test_parameter_words) {
+    const char *name = nullptr;
+    size_t length = 0;
+    bool matched = shell_source_word_parameter_name(
+        fixture.word, strlen(fixture.word), &name, &length);
+    if (matched != (fixture.name != nullptr) ||
+        (matched && (length != strlen(fixture.name) ||
+                     memcmp(name, fixture.name, length) != 0)))
+      abort();
+  }
+  if (test_fixed_oracles())
+    abort();
+  static const char *const plain_boundary_cases[] = {
+      ".",     "source", "eval",      "trap",   "alias",
+      "pushd", "popd",   "command .", "/bin/.", "printf .",
+  };
+  for (const char *source : plain_boundary_cases)
+    if (test_plain_differential(source, strlen(source)))
+      abort();
+  for (unsigned selector = 0; selector < 48; selector++)
+    if (test_generated_redirect_boundary(selector))
+      abort();
+  for (unsigned selector = 0; selector < 16; selector++)
+    if (test_composite_redirect_operand(selector, "/tmp"))
+      abort();
+  for (uint8_t selector = 0;
+       selector < SHELL_BRACE_FUZZ_SUBSTITUTION_CASE_COUNT; selector++)
+    if (test_generated_substitution_case(&selector, 1, "/tmp"))
+      abort();
+  for (uint8_t selector = 0;
+       selector < SHELL_BRACE_FUZZ_COMPOSED_SUBSTITUTION_CASE_COUNT; selector++)
+    if (test_composed_substitution_case(&selector, 1, "/tmp"))
+      abort();
+  static const uint8_t local_document_selectors[] = {58, 59, 60};
+  for (uint8_t selector : local_document_selectors)
+    if (test_generated_brace_case(&selector, 1, "/tmp"))
+      abort();
+  /* The invalid/strict-only family encodes its form selector in byte four;
+   * exercise every member at startup so a parser-boundary change cannot
+   * leave a stale expectation to be found only by random mutation. */
+  for (uint8_t selector = 0; selector < 12; selector++) {
+    const uint8_t invalid_case[] = {7, 0, 0, 0, selector};
+    if (test_generated_brace_case(invalid_case, sizeof(invalid_case), "/tmp"))
+      abort();
+  }
+  if (test_composed_substitution_matrix("/tmp"))
+    abort();
+  static const uint8_t arithmetic_selectors[] = {0, 4, 1, 5, 2, 6, 3};
+  for (uint8_t selector : arithmetic_selectors)
+    if (test_generated_static_arithmetic_case(&selector, 1))
+      abort();
+  for (uint8_t selector = 0; selector < 8 * 7; selector++)
+    for (bool truncate : {false, true})
+      if (test_generated_resolved_depgraph(selector, truncate)) {
+        fprintf(stderr, "resolved graph oracle failed: %u, truncate=%d\n",
+                selector, truncate);
+        abort();
+      }
+}
 
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
   /* Metadata is derived without consuming command bytes.  Every byte in the
    * fuzz input must remain available to the parsers, including short and
    * malformed prefixes. */
@@ -6472,6 +6598,10 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
   };
   run_check("fast parser", test_fast_parser(cmd.data(), cmd.size()));
   run_check("dependency graph", test_depgraph(cmd.data(), cmd.size(), cwd));
+  run_check("resolved dependency graph",
+            test_resolved_depgraph(cmd.data(), cmd.size(), cwd,
+                                   size ? data[size - 1] : 0,
+                                   size > 1 && (data[1] & 1)));
   run_check("full parser", test_full_parser(input, text_length));
   run_check("tokenizer iterator", test_tokenizer_state(input, text_length));
   run_check("transformer", test_transformer(input, text_length));
@@ -6487,7 +6617,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
   /* Startup exhaustively checks each generated matrix. On fuzzed payloads,
    * choose one without consuming input bytes, so structural coverage does not
    * multiply the cost of every arbitrary-parser iteration. */
-  switch (size == 0 ? 0 : data[0] % 6) {
+  switch (size == 0 ? 0 : data[0] % 7) {
   case 0:
     run_check("generated brace case",
               test_generated_brace_case(data, size, cwd));
@@ -6508,9 +6638,14 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     run_check("generated static arithmetic",
               test_generated_static_arithmetic_case(data, size));
     break;
-  default:
+  case 5:
     run_check("generated document boundary",
               test_generated_document_boundary(data[0]));
+    break;
+  default:
+    run_check(
+        "generated resolved graph",
+        test_generated_resolved_depgraph(data[0], size > 1 && (data[1] & 1)));
     break;
   }
   free(input);

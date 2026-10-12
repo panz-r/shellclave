@@ -8,6 +8,16 @@
 #include <stdlib.h>
 #include <string.h>
 
+static inline bool test_pattern_is_cpl(st_netpattern_view_t pattern,
+                                       const char *cpl) {
+  st_netpattern_t expected = {0};
+  bool equal = st_netpattern_from_cpl_owned(cpl, &expected) == ST_OK &&
+               pattern.length == expected.length &&
+               memcmp(pattern.data, expected.data, pattern.length) == 0;
+  st_netpattern_free(&expected);
+  return equal;
+}
+
 /* Readable argv-fixture notation for tests. It splits whitespace outside
  * quotes but is deliberately not shell source: operator-looking and leading
  * '#' values remain literal fixture words. Production boundaries receive
@@ -44,9 +54,9 @@ static inline bool test_netargv_next_word(const char *fixture, size_t length,
   return true;
 }
 
-static inline char *test_netargv(const char *command) {
+static inline shell_netstring_buffer_t test_netargv(const char *command) {
   if (!command)
-    return NULL;
+    return (shell_netstring_buffer_t){0};
   size_t input_length = strlen(command);
   size_t input = 0, total = 0, start = 0, word_length = 0;
   while (test_netargv_next_word(command, input_length, &input, &start,
@@ -57,14 +67,14 @@ static inline char *test_netargv(const char *command) {
         shell_netstring_encoded_length(decoded_length, &record_length) !=
             SHELL_NETSTRING_OK ||
         total > SIZE_MAX - record_length)
-      return NULL;
+      return (shell_netstring_buffer_t){0};
     total += record_length;
   }
   if (total == SIZE_MAX)
-    return NULL;
+    return (shell_netstring_buffer_t){0};
   char *encoded = malloc(total + 1);
   if (!encoded)
-    return NULL;
+    return (shell_netstring_buffer_t){0};
   input = 0;
   size_t output = 0;
   while (test_netargv_next_word(command, input_length, &input, &start,
@@ -80,188 +90,169 @@ static inline char *test_netargv(const char *command) {
             decoded_length, &written) != SHELL_PROCESS_OK ||
         written != decoded_length) {
       free(encoded);
-      return NULL;
+      return (shell_netstring_buffer_t){0};
     }
     output += prefix_length + written;
     encoded[output++] = ',';
   }
   encoded[output] = '\0';
-  return encoded;
+  return (shell_netstring_buffer_t){(unsigned char *)encoded, output};
 }
 
 static inline st_error_t test_st_classify(const char *command,
                                           st_token_array_t *out) {
-  char *encoded = test_netargv(command);
-  if (!encoded)
+  shell_netstring_buffer_t encoded = test_netargv(command);
+  if (!encoded.data)
     return ST_ERR_MEMORY;
-  st_error_t error = st_netargv_classify(encoded, out);
-  free(encoded);
+  st_error_t error = st_netargv_classify_view(
+      (st_netargv_view_t){(const char *)encoded.data, encoded.length}, out);
+  shell_netstring_buffer_free(&encoded);
   return error;
 }
 
 static inline st_error_t test_st_feed(st_learner_t *learner,
                                       const char *command) {
-  char *encoded = test_netargv(command);
-  if (!encoded)
+  shell_netstring_buffer_t encoded = test_netargv(command);
+  if (!encoded.data)
     return ST_ERR_MEMORY;
-  st_error_t error = st_learner_feed_netargv(learner, encoded);
-  free(encoded);
+  st_error_t error = st_learner_feed_netargv_view(
+      learner, (st_netargv_view_t){(const char *)encoded.data, encoded.length});
+  shell_netstring_buffer_free(&encoded);
   return error;
 }
 
 static inline st_error_t test_st_policy_eval(st_policy_t *policy,
                                              const char *command,
                                              st_eval_result_t *result) {
-  char *encoded = test_netargv(command);
-  if (!encoded)
+  shell_netstring_buffer_t encoded = test_netargv(command);
+  if (!encoded.data)
     return ST_ERR_MEMORY;
-  st_error_t error = st_policy_eval(policy, encoded, result);
-  free(encoded);
+  st_error_t error = st_policy_eval_view(
+      policy, (st_netargv_view_t){(const char *)encoded.data, encoded.length},
+      result);
+  shell_netstring_buffer_free(&encoded);
   return error;
 }
 
 static inline st_error_t
 test_st_policy_match(st_policy_t *policy, const char *command, bool *matches) {
-  char *encoded = test_netargv(command);
-  if (!encoded)
+  shell_netstring_buffer_t encoded = test_netargv(command);
+  if (!encoded.data)
     return ST_ERR_MEMORY;
-  st_error_t error = st_policy_match(policy, encoded, matches);
-  free(encoded);
+  st_error_t error = st_policy_match_view(
+      policy, (st_netargv_view_t){(const char *)encoded.data, encoded.length},
+      matches);
+  shell_netstring_buffer_free(&encoded);
   return error;
 }
 
 static inline st_error_t
 test_st_policy_verify_all(const st_policy_t *policy, const char *command,
-                          const char ***matching_patterns,
+                          st_netpattern_view_t **matching_patterns,
                           size_t *match_count) {
   if (matching_patterns)
     *matching_patterns = NULL;
   if (match_count)
     *match_count = 0;
-  char *encoded = test_netargv(command);
-  if (!encoded && command)
+  shell_netstring_buffer_t encoded = test_netargv(command);
+  if (!encoded.data && command)
     return ST_ERR_MEMORY;
-  st_netpattern_view_t *views = NULL;
-  size_t count = 0;
-  st_error_t error = st_policy_verify_all(policy, encoded, &views, &count);
-  free(encoded);
-  if (error != ST_OK)
-    return error;
-  const char **patterns = count ? calloc(count, sizeof(*patterns)) : NULL;
-  if (!patterns && count != 0) {
-    st_policy_matches_free(views);
-    return ST_ERR_MEMORY;
-  }
-  for (size_t i = 0; i < count; i++) {
-    if (memchr(views[i].data, '\0', views[i].length)) {
-      free(patterns);
-      st_policy_matches_free(views);
-      return ST_ERR_LIMIT;
-    }
-    patterns[i] = views[i].data;
-  }
-  st_policy_matches_free(views);
-  *matching_patterns = patterns;
-  *match_count = count;
+  st_error_t error = st_policy_verify_all_view(
+      policy, (st_netargv_view_t){(const char *)encoded.data, encoded.length},
+      matching_patterns, match_count);
+  shell_netstring_buffer_free(&encoded);
   return error;
-}
-
-/* The test adapter returns an independently allocated legacy pointer array,
- * unlike st_policy_verify_all(), whose typed view array uses the public
- * release function. */
-static inline void test_st_policy_matches_free(const char **matches) {
-  free((void *)matches);
 }
 
 static inline st_error_t test_st_policy_add(st_policy_t *policy,
                                             const char *cpl) {
-  st_token_array_t decoded = {0};
-  if (cpl && st_netpattern_decode(cpl, &decoded) == ST_OK) {
-    st_token_array_free(&decoded);
-    return st_policy_add_netpattern(policy, cpl);
-  }
-  st_token_array_free(&decoded);
-  char *pattern = NULL;
-  st_error_t error = st_netpattern_from_cpl(cpl, &pattern);
+  st_netpattern_t pattern = {0};
+  st_error_t error = st_netpattern_from_cpl_owned(cpl, &pattern);
   if (error != ST_OK)
     return error;
-  error = st_policy_add_netpattern(policy, pattern);
-  free(pattern);
+  error = st_policy_add_netpattern_view(
+      policy,
+      (st_netpattern_view_t){(const char *)pattern.data, pattern.length});
+  st_netpattern_free(&pattern);
   return error;
 }
 
 static inline st_error_t test_st_policy_remove(st_policy_t *policy,
                                                const char *cpl) {
-  st_token_array_t decoded = {0};
-  if (cpl && st_netpattern_decode(cpl, &decoded) == ST_OK) {
-    st_token_array_free(&decoded);
-    return st_policy_remove_netpattern(policy, cpl);
-  }
-  st_token_array_free(&decoded);
-  char *pattern = NULL;
-  st_error_t error = st_netpattern_from_cpl(cpl, &pattern);
+  st_netpattern_t pattern = {0};
+  st_error_t error = st_netpattern_from_cpl_owned(cpl, &pattern);
   if (error != ST_OK)
     return error;
-  error = st_policy_remove_netpattern(policy, pattern);
-  free(pattern);
+  error = st_policy_remove_netpattern_view(
+      policy,
+      (st_netpattern_view_t){(const char *)pattern.data, pattern.length});
+  st_netpattern_free(&pattern);
   return error;
 }
 
 static inline st_error_t
 test_st_policy_batch_add(st_policy_t *policy, const char **cpl, size_t count) {
   if (!cpl)
-    return st_policy_batch_add_netpatterns(policy, NULL, count);
-  char **patterns = calloc(count, sizeof(*patterns));
-  if (!patterns && count != 0)
+    return st_policy_batch_add_netpattern_views(policy, NULL, count);
+  st_netpattern_t *patterns = calloc(count, sizeof(*patterns));
+  st_netpattern_view_t *views = calloc(count, sizeof(*views));
+  if ((!patterns || !views) && count != 0) {
+    free(patterns);
+    free(views);
     return ST_ERR_MEMORY;
+  }
   st_error_t error = ST_OK;
   size_t converted = 0;
   for (; converted < count; converted++) {
-    error = st_netpattern_from_cpl(cpl[converted], &patterns[converted]);
+    error = st_netpattern_from_cpl_owned(cpl[converted], &patterns[converted]);
     if (error != ST_OK)
       break;
+    views[converted] = (st_netpattern_view_t){patterns[converted].data,
+                                              patterns[converted].length};
   }
   if (error == ST_OK)
-    error =
-        st_policy_batch_add_netpatterns(policy, (const char **)patterns, count);
+    error = st_policy_batch_add_netpattern_views(policy, views, count);
   for (size_t i = 0; i < converted; i++)
-    free(patterns[i]);
+    st_netpattern_free(&patterns[i]);
   free(patterns);
+  free(views);
   return error;
 }
 
 static inline st_error_t test_st_validate_pattern(const char *cpl,
                                                   st_token_array_t *tokens) {
-  char *pattern = NULL;
-  st_error_t error = st_netpattern_from_cpl(cpl, &pattern);
+  st_netpattern_t pattern = {0};
+  st_error_t error = st_netpattern_from_cpl_owned(cpl, &pattern);
   if (error != ST_OK)
     return error;
-  error = st_netpattern_validate(pattern, tokens);
-  free(pattern);
+  error = st_netpattern_validate_view(
+      (st_netpattern_view_t){(const char *)pattern.data, pattern.length},
+      tokens);
+  st_netpattern_free(&pattern);
   return error;
 }
 
 static inline st_error_t test_st_blacklist_add(st_learner_t *learner,
                                                const char *cpl) {
-  char *pattern = NULL;
-  st_error_t error = st_netpattern_from_cpl(cpl, &pattern);
+  st_netpattern_t pattern = {0};
+  st_error_t error = st_netpattern_from_cpl_owned(cpl, &pattern);
   if (error == ST_OK)
     error = st_learner_blacklist_add_netpattern(
-        learner,
-        (st_netpattern_view_t){.data = pattern, .length = strlen(pattern)});
-  free(pattern);
+        learner, (st_netpattern_view_t){.data = (const char *)pattern.data,
+                                        .length = pattern.length});
+  st_netpattern_free(&pattern);
   return error;
 }
 
 static inline bool test_st_is_blacklisted(const st_learner_t *learner,
                                           const char *cpl) {
-  char *pattern = NULL;
-  if (st_netpattern_from_cpl(cpl, &pattern) != ST_OK)
+  st_netpattern_t pattern = {0};
+  if (st_netpattern_from_cpl_owned(cpl, &pattern) != ST_OK)
     return false;
   bool found = st_learner_is_netpattern_blacklisted(
-      learner,
-      (st_netpattern_view_t){.data = pattern, .length = strlen(pattern)});
-  free(pattern);
+      learner, (st_netpattern_view_t){.data = (const char *)pattern.data,
+                                      .length = pattern.length});
+  st_netpattern_free(&pattern);
   return found;
 }
 

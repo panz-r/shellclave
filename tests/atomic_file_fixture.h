@@ -36,6 +36,11 @@ static inline SHELL_NONNULL(1) bool test_atomic_temp_files(const char *path,
   DIR *entries = opendir(parent);
   if (!entries)
     return false;
+  int directory_fd = dirfd(entries);
+  if (directory_fd < 0) {
+    closedir(entries);
+    return false;
+  }
   bool ok = true;
   struct dirent *entry;
   errno = 0;
@@ -43,7 +48,7 @@ static inline SHELL_NONNULL(1) bool test_atomic_temp_files(const char *path,
     if (strlen(entry->d_name) == sizeof(SHELL_FILE_TEMP_NAME) - 1 &&
         memcmp(entry->d_name, SHELL_FILE_TEMP_NAME,
                sizeof(SHELL_FILE_TEMP_NAME) - 7) == 0) {
-      if (!remove || unlinkat(dirfd(entries), entry->d_name, 0) != 0)
+      if (!remove || unlinkat(directory_fd, entry->d_name, 0) != 0)
         ok = false;
     }
     errno = 0;
@@ -64,12 +69,17 @@ static inline SHELL_NONNULL(1) bool test_atomic_cleanup_directory(
   DIR *entries = opendir(directory);
   if (!entries)
     return false;
+  int directory_fd = dirfd(entries);
+  if (directory_fd < 0) {
+    closedir(entries);
+    return false;
+  }
   bool ok = true;
   struct dirent *entry;
   while ((entry = readdir(entries)) != NULL) {
     if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
       continue;
-    if (unlinkat(dirfd(entries), entry->d_name, 0) != 0)
+    if (unlinkat(directory_fd, entry->d_name, 0) != 0)
       ok = false;
   }
   if (closedir(entries) != 0)

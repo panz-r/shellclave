@@ -200,7 +200,7 @@ typedef struct st_token_array {
 } st_token_array_t;
 
 /* Borrowed classified netargv payload. `text` is not NUL-terminated and is
- * valid only for the duration of an st_netargv_visit() callback. */
+ * valid only for the duration of an st_netargv_visit_view() callback. */
 typedef struct {
   const char *text;
   size_t text_length;
@@ -290,17 +290,13 @@ void st_learner_get_stats(const st_learner_t *learner,
 
 /* Feed operations are atomic: on error the learner is unchanged. netargv is a
  * canonical concatenation of netstrings, one per already-preprocessed argv
- * element: <decimal byte length>:<bytes>,. The length-aware `_view` form
- * preserves embedded NUL payloads; this legacy C-string form is necessarily
- * limited to NUL-free encodings. For example, argv {"printf", "two words"} is
- * "6:printf,9:two words,". It is not shell source. Shellsplit is one valid
- * producer, but callers may provide an equivalent trusted argv. Empty
+ * element: <decimal byte length>:<bytes>,. The view preserves embedded NUL
+ * payloads and need not be terminated. For example, argv {"printf", "two
+ * words"} is "6:printf,9:two words,". It is not shell source. Shellsplit is one
+ * valid producer, but callers may provide an equivalent trusted argv. Empty
  * arguments and embedded whitespace are preserved. Arguments at or above
  * ST_MAX_TOKEN_LEN are rejected. */
-st_error_t st_learner_feed_netargv(st_learner_t *learner, const char *netargv)
-    SHELL_NONNULL(1, 2);
-/* Length-aware form of st_learner_feed_netargv(). It uses the supplied length
- * directly instead of scanning for a NUL terminator. */
+
 st_error_t st_learner_feed_netargv_view(st_learner_t *learner,
                                         st_netargv_view_t netargv)
     SHELL_NONNULL(1);
@@ -372,21 +368,18 @@ st_error_t st_learner_load(st_learner_t *learner, const char *path)
  * Token text remains the complete concrete input token; it is never replaced
  * with a synthesized wildcard or metadata-bearing symbol.
  * `netargv` uses the canonical concatenated-netstring format documented for
- * st_learner_feed_netargv. Its elements must already be the argv of one
+ * st_learner_feed_netargv_view. Its elements must already be the argv of one
  * isolated subcommand. Shell tokenization, control-flow isolation, redirection
  * removal, quote-fragment assembly, and escape processing belong upstream. This
  * function decodes argument boundaries and assigns types; it does not tokenize
  * shell text. Non-canonical or malformed encodings return ST_ERR_FORMAT.
  * The returned tokens retain each payload's explicit text_length, including
- * embedded NUL bytes. The legacy input form is NUL-free; use the `_view`
- * form when the enclosing netargv itself contains a NUL payload.
+ * embedded NUL bytes. Input uses its explicit byte length, without requiring
+ * a terminating NUL.
  *
- * The caller must free the returned array with st_token_array_free(). The
- * `*_view` form below uses its supplied length directly instead of scanning for
- * a NUL terminator.
+ * The caller must free the returned array with st_token_array_free().
  */
-st_error_t st_netargv_classify(const char *netargv, st_token_array_t *out)
-    SHELL_NONNULL(1, 2);
+
 st_error_t st_netargv_classify_view(st_netargv_view_t netargv,
                                     st_token_array_t *out) SHELL_NONNULL(2);
 
@@ -397,12 +390,9 @@ typedef bool (*st_netargv_token_visitor_t)(const st_token_view_t *token,
  * The callback sees each concrete payload as a borrowed span; returning false
  * stops successfully. If non-NULL, visited_count receives callback
  * invocations. Classification has the same contextual rules as
- * st_netargv_classify(). Only the `_view` form uses its supplied length
- * directly instead of scanning for a NUL terminator; the C-string wrapper is
- * limited to NUL-free netargv. */
-st_error_t st_netargv_visit(const char *netargv,
-                            st_netargv_token_visitor_t visitor, void *user_ctx,
-                            size_t *visited_count) SHELL_NONNULL(1, 2);
+ * st_netargv_classify_view(). Input uses its explicit byte length and may
+ * contain NUL payloads. */
+
 st_error_t st_netargv_visit_view(st_netargv_view_t netargv,
                                  st_netargv_token_visitor_t visitor,
                                  void *user_ctx, size_t *visited_count)
@@ -414,10 +404,13 @@ st_error_t st_netargv_visit_view(st_netargv_view_t netargv,
 void st_token_array_free(st_token_array_t *arr);
 
 /**
- * Classify a single token string into its most specific type.
- * Returns ST_TYPE_LITERAL if no wildcard type matches.
+ * Classify one borrowed, immutable token byte span without command context.
+ * The caller supplies length readable bytes; no terminator is required and
+ * embedded NUL bytes are preserved. text may be NULL only when length is zero.
+ * Empty spans and tokens matching no wildcard type return ST_TYPE_LITERAL.
+ * This is not shell tokenization or a span-storage validation boundary.
  */
-st_token_type_t st_token_classify(const char *token) SHELL_NONNULL(1);
+st_token_type_t st_token_classify(const char *text, size_t length);
 
 /**
  * Extract the file extension from a path (including dot).
@@ -513,16 +506,10 @@ void st_policy_free(st_policy_t *policy);
  * compound component (prefix, capture, suffix) must independently have fewer
  * than ST_MAX_TOKEN_LEN decoded bytes. Structural braces do not count toward
  * those limits; a complete compound spelling may exceed one literal's limit.
- * The legacy char* functions are NUL-free compatibility wrappers. */
-st_error_t st_netpattern_from_cpl(const char *cpl, char **out_netpattern)
-    SHELL_NONNULL(1, 2);
-st_error_t st_netpattern_to_cpl(const char *netpattern, char **out_cpl)
-    SHELL_NONNULL(1, 2);
-st_error_t st_netpattern_encode(const st_token_t *tokens, size_t count,
-                                char **out_netpattern) SHELL_NONNULL(3);
-st_error_t st_netpattern_decode(const char *netpattern,
-                                st_token_array_t *out_tokens)
-    SHELL_NONNULL(1, 2);
+ * Canonical inputs and outputs carry explicit lengths and preserve every byte.
+ * CPL itself is printable text; arbitrary literal bytes use escaped notation.
+ */
+
 /* Owned-output forms require `out_netpattern` to be empty (initialized to {0}
  * or released with st_netpattern_free()). Empty initialized output storage is
  * a caller precondition; it remains empty on failure. */
@@ -531,6 +518,10 @@ st_error_t st_netpattern_from_cpl_owned(const char *cpl,
     SHELL_NONNULL(1, 2);
 st_error_t st_netpattern_to_cpl_view(st_netpattern_view_t netpattern,
                                      char **out_cpl) SHELL_NONNULL(2);
+/* Encoding validates payload limits and compound capture metadata. NULL
+ * tokens, zero count or count above ST_MAX_CMD_TOKENS return
+ * ST_ERR_INVALID. Otherwise tokens supplies count readable entries whose
+ * payload storage remains valid and unchanged throughout the call. */
 st_error_t st_netpattern_encode_owned(const st_token_t *tokens, size_t count,
                                       st_netpattern_t *out_netpattern)
     SHELL_NONNULL(3);
@@ -538,23 +529,19 @@ st_error_t st_netpattern_decode_view(st_netpattern_view_t netpattern,
                                      st_token_array_t *out_tokens)
     SHELL_NONNULL(2);
 /* Policy mutation accepts canonical nested tagged netpatterns only. Human CPL
- * must be converted explicitly with st_netpattern_from_cpl(). */
-st_error_t st_policy_add_netpattern(st_policy_t *policy, const char *pattern)
-    SHELL_NONNULL(1, 2);
+ * must be converted explicitly with st_netpattern_from_cpl_owned(). */
+
 st_error_t st_policy_add_netpattern_view(st_policy_t *policy,
                                          st_netpattern_view_t pattern)
     SHELL_NONNULL(1);
-/* Adds all patterns atomically; on failure the policy is unchanged. */
-st_error_t st_policy_batch_add_netpatterns(st_policy_t *policy,
-                                           const char *const *patterns,
-                                           size_t count) SHELL_NONNULL(1);
-/* Byte-oriented atomic counterpart of st_policy_batch_add_netpatterns(). */
+/* Adds all patterns atomically; on failure the policy is unchanged. NULL
+ * patterns or zero count return ST_ERR_INVALID. Otherwise patterns supplies
+ * count readable views, whose storage remains valid throughout the call. */
 st_error_t
 st_policy_batch_add_netpattern_views(st_policy_t *policy,
                                      const st_netpattern_view_t *patterns,
                                      size_t count) SHELL_NONNULL(1);
-st_error_t st_policy_remove_netpattern(st_policy_t *policy, const char *pattern)
-    SHELL_NONNULL(1, 2);
+
 st_error_t st_policy_remove_netpattern_view(st_policy_t *policy,
                                             st_netpattern_view_t pattern)
     SHELL_NONNULL(1);
@@ -583,7 +570,7 @@ typedef struct {
 } st_expand_suggestion_t;
 
 /**
- * Result of st_policy_eval. The evaluator initializes the whole object, so
+ * Result of st_policy_eval_view. The evaluator initializes the whole object, so
  * only the first suggestion_count entries are meaningful on return.
  */
 typedef struct {
@@ -606,7 +593,7 @@ typedef struct {
  *
  * Walks the policy trie with one canonical netstring-encoded, already
  * preprocessed argv. Shellsplit is one valid producer, but is not required.
- * The length-aware form preserves embedded NUL bytes. Runtime arguments and
+ * Explicit lengths preserve embedded NUL bytes. Runtime arguments and
  * compound captures are not limited by ST_MAX_TOKEN_LEN; that capacity applies
  * to learner/pattern literal storage and fixed-size diagnostic fields.
  * If it matches, sets
@@ -617,7 +604,7 @@ typedef struct {
  * If it doesn't match, generates up to 2 expansion suggestions in
  * result->suggestions[].
  *
- * `result` is required. Use st_policy_match() for a Boolean-only check.
+ * `result` is required. Use st_policy_match_view() for a Boolean-only check.
  * A non-OK suggestion_error does not change the completed match decision.
  * Each published suggestion covers the complete input argv. Unrepresentable
  * candidates are skipped without discarding other candidates; suggestion_error
@@ -626,33 +613,28 @@ typedef struct {
  * ST_ERR_MEMORY, taking precedence over representation errors.
  *
  * NOTE: This function has side effects — it may rebuild internal position
- * filters if the policy epoch has changed (cache warming). The `*_view` form
- * uses its supplied length directly instead of scanning for a NUL terminator.
+ * filters if the policy epoch has changed (cache warming).
  */
-st_error_t st_policy_eval(st_policy_t *policy, const char *netargv,
-                          st_eval_result_t *result) SHELL_NONNULL(1, 2, 3);
-st_error_t st_policy_eval_view(st_policy_t *policy, st_netargv_view_t netargv,
+
+st_error_t st_policy_eval_view(const st_policy_t *policy,
+                               st_netargv_view_t netargv,
                                st_eval_result_t *result) SHELL_NONNULL(1, 3);
 
 /* Match one canonical, already-preprocessed netargv without generating
  * suggestions or allocating result patterns. On success, writes whether any
- * policy rule matches. The `*_view` form uses its supplied length directly
- * instead of scanning for a NUL terminator. */
-st_error_t st_policy_match(st_policy_t *policy, const char *netargv,
-                           bool *matches) SHELL_NONNULL(1, 2, 3);
-st_error_t st_policy_match_view(st_policy_t *policy, st_netargv_view_t netargv,
-                                bool *matches) SHELL_NONNULL(1, 3);
+ * policy rule matches. */
 
-/* netargv has the same encoding and preprocessing contract as st_policy_eval.
- * On success, matching_patterns is a caller-owned outer array released with
- * st_policy_matches_free(); its individual entries are borrowed from stable
- * policy storage and are invalidated by policy mutation, load, clear,
- * compaction, or destruction. On failure, each writable output is cleared even
- * when another argument is invalid. The `*_view` form uses its supplied length
- * directly instead of scanning for a NUL terminator. */
-st_error_t st_policy_verify_all(const st_policy_t *policy, const char *netargv,
-                                st_netpattern_view_t **matching_patterns,
-                                size_t *match_count) SHELL_NONNULL(1, 2, 3, 4);
+st_error_t st_policy_match_view(const st_policy_t *policy,
+                                st_netargv_view_t netargv, bool *matches)
+    SHELL_NONNULL(1, 3);
+
+/* netargv has the same encoding and preprocessing contract as
+ * st_policy_eval_view. On success, matching_patterns is a caller-owned outer
+ * array released with st_policy_matches_free(); its individual entries are
+ * borrowed from stable policy storage and are invalidated by policy mutation,
+ * load, clear, compaction, or destruction. On failure, each writable output is
+ * cleared on malformed input. */
+
 st_error_t st_policy_verify_all_view(const st_policy_t *policy,
                                      st_netargv_view_t netargv,
                                      st_netpattern_view_t **matching_patterns,
@@ -667,13 +649,9 @@ typedef bool (*st_policy_match_visitor_t)(st_netpattern_view_t netpattern,
 /* Visit matching canonical patterns without allocating a result array. The
  * callback runs while the policy read lock is held and must not re-enter that
  * policy. Returning false stops successfully; visited_count reports callbacks
- * that were invoked. The `*_view` form uses its supplied length directly
- * instead of scanning for a NUL terminator. */
-st_error_t st_policy_visit_matches(const st_policy_t *policy,
-                                   const char *netargv,
-                                   st_policy_match_visitor_t visitor,
-                                   void *user_ctx, size_t *visited_count)
-    SHELL_NONNULL(1, 2, 3, 5);
+ * that were invoked. The supplied byte length is used directly; encoded values
+ * need not be NUL-terminated. */
+
 st_error_t st_policy_visit_matches_view(const st_policy_t *policy,
                                         st_netargv_view_t netargv,
                                         st_policy_match_visitor_t visitor,
@@ -811,9 +789,7 @@ st_error_t st_policy_dump_dot(const st_policy_t *policy, const char *path)
  * with would_match set to false and any supplied conflict output cleared.
  * NULL conflicting_netpattern omits the optional conflict output.
  */
-st_error_t st_policy_simulate_add_netpattern(
-    const st_policy_t *policy, const char *netpattern, bool *would_match,
-    const char **conflicting_netpattern) SHELL_NONNULL(1, 2, 3);
+
 st_error_t st_policy_simulate_add_netpattern_view(
     const st_policy_t *policy, st_netpattern_view_t netpattern,
     bool *would_match, st_netpattern_view_t *conflicting_netpattern)
@@ -830,14 +806,11 @@ st_error_t st_policy_simulate_add_netpattern_view(
  * On success it owns the decoded tokens, including exact byte lengths and
  * compound prefix/capture/suffix metadata; release it with
  * st_token_array_free(). On failure it remains empty.
- * The _view form accepts embedded NUL and exact-size, unterminated input.
- * The C-string wrapper is limited to NUL-free encoded patterns.
+ * Accepts embedded NUL and exact-size, unterminated input.
  * Returns ST_OK if valid, or a framing, grammar/parameter, limit, or allocation
  * error. Details reuse the decoding allocations without copying token text.
  */
-st_error_t st_netpattern_validate(const char *pattern,
-                                  st_token_array_t *out_tokens)
-    SHELL_NONNULL(1);
+
 st_error_t st_netpattern_validate_view(st_netpattern_view_t pattern,
                                        st_token_array_t *out_tokens);
 
@@ -847,27 +820,21 @@ st_error_t st_netpattern_validate_view(st_netpattern_view_t pattern,
 typedef struct st_token_variant {
   st_token_type_t type;    /* The type to suggest */
   const char *type_symbol; /* Static type symbol, e.g. "#path" or "*" */
-  /* Reserved compatibility fields. Variant APIs currently return type choices
-   * only, so they always set these to NULL and zero rather than retaining
-   * unused learner sample strings. */
-  const char *sample_value;
-  size_t sample_value_length;
 } st_token_variant_t;
 
 /* Write deterministic lattice widening choices for one decoded pattern token
- * into caller-provided output storage. Results never allocate and always have
- * sample_value == NULL and sample_value_length == 0. For compounds, choices
- * target the capture type, beginning with its current type; applying a choice
- * preserves the literal affixes. No whole-word LITERAL choice is returned for
- * compounds. Ordinary tokens retain their initial LITERAL choice; additional
- * choices cover their runtime classifications in argv context. A generalized
- * predecessor may require a wider choice to cover every possible context.
- * Unclassified literals offer only LITERAL and, outside command position, ANY.
- * A leading whole-token ANY is never offered. Compound command words are not
- * supported policy grammar; unsupported policy heads produce no choices.
- * pattern supplies valid decoded canonical tokens (or an empty array). Token
- * metadata and borrowed storage are caller preconditions, not revalidated.
- * An out-of-range edit position or zero capacity returns zero. */
+ * into caller-provided output storage. Results never allocate. For compounds,
+ * choices target the capture type, beginning with its current type; applying a
+ * choice preserves the literal affixes. No whole-word LITERAL choice is
+ * returned for compounds. Ordinary tokens retain their initial LITERAL choice;
+ * additional choices cover their runtime classifications in argv context. A
+ * generalized predecessor may require a wider choice to cover every possible
+ * context. Unclassified literals offer only LITERAL and, outside command
+ * position, ANY. A leading whole-token ANY is never offered. Compound command
+ * words are not supported policy grammar; unsupported policy heads produce no
+ * choices. pattern supplies valid decoded canonical tokens (or an empty array).
+ * Token metadata and borrowed storage are caller preconditions, not
+ * revalidated. An out-of-range edit position or zero capacity returns zero. */
 size_t st_token_variants_at(const st_token_array_t *pattern, size_t edit_pos,
                             st_token_variant_t *out_variants,
                             size_t max_variants) SHELL_NONNULL(1, 3);
@@ -945,18 +912,17 @@ size_t st_learner_suggest_token_variants(const st_learner_t *learner,
  * @param netpattern      Original canonical netpattern
  * @param edit_pos        Position to change
  * @param new_type        New type to set at that position
- * @param out_netpattern  Receives an allocated canonical netpattern
+ * @param out_netpattern  Receives an owned canonical netpattern
  * The resulting head must be valid policy grammar: neither a whole-token ANY
  * nor a compound token. An argument edit cannot repair an unsupported head;
  * changing a whole-token ANY head to a supported type can. ANY inside an
- * argument's compound capture remains valid. On failure, the string output
- * is NULL and the owned output remains empty.
+ * argument's compound capture remains valid.
+ *
+ * out_netpattern must be empty (initialized to {0} or released with
+ * st_netpattern_free()). On success it owns the canonical bytes; release it
+ * with st_netpattern_free(). On failure it remains empty.
  */
-st_error_t st_netpattern_apply_type_at(const char *netpattern, size_t edit_pos,
-                                       st_token_type_t new_type,
-                                       char **out_netpattern)
-    SHELL_NONNULL(1, 4);
-/* `out_netpattern` follows the owned-output contract documented above. */
+
 st_error_t st_netpattern_apply_type_at_owned(st_netpattern_view_t netpattern,
                                              size_t edit_pos,
                                              st_token_type_t new_type,

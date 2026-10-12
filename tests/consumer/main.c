@@ -46,7 +46,7 @@ static bool check_policy_view_apis(st_netargv_view_t netargv) {
   st_policy_ctx_t *ctx = st_policy_ctx_new();
   st_policy_t *policy = ctx ? st_policy_new(ctx) : NULL;
   st_policy_t *empty = ctx ? st_policy_new(ctx) : NULL;
-  char *netpattern = NULL;
+  st_netpattern_t netpattern = {0};
   st_netpattern_view_t *all_matches = NULL;
   size_t all_count = 0;
   size_t visited_count = 0;
@@ -56,17 +56,23 @@ static bool check_policy_view_apis(st_netargv_view_t netargv) {
   bool matches = false;
   bool ok =
       ctx && policy && empty &&
-      st_netpattern_from_cpl("echo hello", &netpattern) == ST_OK &&
-      st_netpattern_validate(netpattern, &validated) == ST_OK &&
+      st_netpattern_from_cpl_owned("echo hello", &netpattern) == ST_OK &&
+      st_netpattern_validate_view(
+          (st_netpattern_view_t){(const char *)netpattern.data,
+                                 netpattern.length},
+          &validated) == ST_OK &&
       validated.count == 2 && validated.tokens[1].text_length == 5 &&
       memcmp(validated.tokens[1].text, "hello", 5) == 0 &&
-      st_policy_add_netpattern(policy, netpattern) == ST_OK &&
+      st_policy_add_netpattern_view(
+          policy, (st_netpattern_view_t){(const char *)netpattern.data,
+                                         netpattern.length}) == ST_OK &&
       st_policy_eval_view(policy, netargv, &eval) == ST_OK && eval.matches &&
       st_policy_match_view(policy, netargv, &matches) == ST_OK && matches &&
       st_policy_verify_all_view(policy, netargv, &all_matches, &all_count) ==
           ST_OK &&
-      all_count == 1 && all_matches[0].length == strlen(netpattern) &&
-      memcmp(all_matches[0].data, netpattern, all_matches[0].length) == 0 &&
+      all_count == 1 && all_matches[0].length == netpattern.length &&
+      memcmp(all_matches[0].data, netpattern.data, all_matches[0].length) ==
+          0 &&
       st_policy_visit_matches_view(policy, netargv, count_policy_match,
                                    &visited_count, &visited_count) == ST_OK &&
       visited_count == 1 &&
@@ -76,21 +82,71 @@ static bool check_policy_view_apis(st_netargv_view_t netargv) {
 
   st_policy_matches_free(all_matches);
   st_token_array_free(&validated);
-  free(netpattern);
+  st_netpattern_free(&netpattern);
   st_policy_free(empty);
   st_policy_free(policy);
   st_policy_ctx_release(ctx);
   return ok;
 }
 
+/* Exercise the changed canonical signatures with binary, unterminated input. */
+static bool check_gate_netpattern_apis(void) {
+  st_netpattern_t pattern = {0};
+  st_policy_ctx_t *context = st_policy_ctx_new();
+  st_policy_t *allow = context ? st_policy_new(context) : NULL;
+  st_policy_t *deny = allow ? st_policy_new(context) : NULL;
+  st_policy_ctx_release(context);
+  sg_gate_t *gate = NULL;
+  bool ok = deny && st_netpattern_from_cpl_owned("printf \"a\\x00b\"",
+                                                 &pattern) == ST_OK;
+  char *bytes = ok ? malloc(pattern.length) : NULL;
+  ok = ok && bytes != NULL;
+  if (ok) {
+    memcpy(bytes, pattern.data, pattern.length);
+    st_netpattern_view_t view = {bytes, pattern.length};
+    st_netpattern_view_t batch[] = {view, view};
+    ok = memchr(view.data, '\0', view.length) != NULL &&
+         st_policy_add_netpattern_view(allow, view) == ST_OK &&
+         st_policy_batch_add_netpattern_views(allow, batch, 2) == ST_OK &&
+         st_policy_add_netpattern_view(deny, view) == ST_OK &&
+         st_policy_batch_add_netpattern_views(deny, batch, 2) == ST_OK;
+    if (ok) {
+      gate = sg_gate_new_with_policies_owned(allow, deny);
+      if (gate) {
+        allow = deny = NULL;
+        ok = st_policy_rule_count(sg_gate_allow_policy_borrowed(gate)) == 1 &&
+             st_policy_rule_count(sg_gate_deny_policy_borrowed(gate)) == 1;
+      } else
+        ok = false;
+    }
+  }
+  free(bytes);
+  st_netpattern_free(&pattern);
+  sg_gate_free(gate);
+  st_policy_free(allow);
+  st_policy_free(deny);
+  return ok;
+}
+
 /* Exercise the installed caller-owned dependency-graph workspace contract,
  * including its declared alignment, without relying on test-only adapters. */
+static shell_expand_status_t
+resolve_input(const shell_expand_word_request_t *request, const char **netargv,
+              size_t *length, void *context) {
+  (void)context;
+  if (request->purpose != SHELL_EXPAND_WORD_REDIRECT_PATH)
+    return SHELL_EXPAND_UNRESOLVED;
+  *netargv = "10:/tmp/input,";
+  *length = sizeof("10:/tmp/input,") - 1;
+  return SHELL_EXPAND_RESOLVED;
+}
+
 static bool check_depgraph_workspace_api(void) {
   size_t workspace_size = 0;
   size_t alignment = shell_dep_workspace_alignment();
   if (alignment == 0 || (alignment & (alignment - 1)) != 0 ||
-      !shell_dep_workspace_size(NULL, &workspace_size) || workspace_size == 0 ||
-      workspace_size > SIZE_MAX - (alignment - 1))
+      !shell_dep_resolved_workspace_size(256, NULL, &workspace_size) ||
+      workspace_size == 0 || workspace_size > SIZE_MAX - (alignment - 1))
     return false;
 
   unsigned char *raw = malloc(workspace_size + alignment - 1);
@@ -130,11 +186,23 @@ static bool check_depgraph_workspace_api(void) {
     }
     ok = ok && timers == 1 && timed_commands == 2;
   }
+  if (ok) {
+    static const char resolved[] = "cat <\"$INPUT\"";
+    ok = shell_dep_graph_parse_resolved(resolved, sizeof(resolved) - 1, ".",
+                                        &limits, &graph, resolve_input, NULL,
+                                        NULL) == SHELL_DEP_OK &&
+         shell_dep_graph_validate(&graph).valid;
+  }
   free(raw);
   return ok;
 }
 
 int main(void) {
+  const char exact_token[] = {'4', '2', '\0', 'x'};
+  if (st_token_classify(exact_token, 2) != ST_TYPE_NUMBER ||
+      st_token_classify(exact_token, sizeof(exact_token)) != ST_TYPE_LITERAL ||
+      st_token_classify(NULL, 0) != ST_TYPE_LITERAL)
+    return 20;
   static const char command[] = "echo hello && printf done";
   shell_parse_result_t parsed = {0};
   shell_error_t error =
@@ -147,19 +215,19 @@ int main(void) {
       parsed.cmds[1].len != strlen("printf done"))
     return 1;
 
-  char *command_netseq = NULL;
-  char *type_netseq = NULL;
+  shell_netstring_buffer_t command_netseq = {0};
+  shell_netstring_buffer_t type_netseq = {0};
   size_t subcommand_count = 0;
-  if (shell_build_anomaly_netseqs(command, strlen(command), NULL,
-                                  &command_netseq, &type_netseq,
-                                  &subcommand_count) != SHELL_PROCESS_OK ||
+  if (shell_build_anomaly_netseqs_buffer(
+          command, strlen(command), NULL, &command_netseq, &type_netseq,
+          &subcommand_count) != SHELL_PROCESS_OK ||
       subcommand_count != 2) {
-    free(command_netseq);
-    free(type_netseq);
+    shell_netstring_buffer_free(&command_netseq);
+    shell_netstring_buffer_free(&type_netseq);
     return 2;
   }
-  free(command_netseq);
-  free(type_netseq);
+  shell_netstring_buffer_free(&command_netseq);
+  shell_netstring_buffer_free(&type_netseq);
 
   size_t environment_indices[1] = {0};
   size_t environment_count = 0;
@@ -196,7 +264,10 @@ int main(void) {
   st_suggestion_t *suggestions = st_learner_suggest(learner, &suggestion_count);
   char *suggestion_cpl = NULL;
   if (suggestions && suggestion_count == 1)
-    (void)st_netpattern_to_cpl(suggestions[0].pattern, &suggestion_cpl);
+    (void)st_netpattern_to_cpl_view(
+        (st_netpattern_view_t){suggestions[0].pattern,
+                               suggestions[0].pattern_length},
+        &suggestion_cpl);
   if (!suggestions || suggestion_count != 1 || !suggestion_cpl ||
       strcmp(suggestion_cpl, "echo hello") != 0 || suggestions[0].count != 1 ||
       suggestions[0].confidence != 1.0) {
@@ -209,14 +280,26 @@ int main(void) {
   st_suggestion_list_free(suggestions, suggestion_count);
   st_learner_free(learner);
 
-  if (!check_depgraph_workspace_api())
+  if (!check_depgraph_workspace_api() || !check_gate_netpattern_apis())
     return 7;
 
   sg_gate_t *gate = sg_gate_new();
-  if (!gate || sg_gate_add_allow_cpl(gate, "echo hello") != SG_OK) {
+  st_policy_ctx_t *context = st_policy_ctx_new();
+  st_policy_t *policy = context ? st_policy_new(context) : NULL;
+  st_policy_ctx_release(context);
+  st_netpattern_t pattern = {0};
+  if (!gate || !policy ||
+      st_netpattern_from_cpl_owned("echo hello", &pattern) != ST_OK ||
+      st_policy_add_netpattern_view(
+          policy, (st_netpattern_view_t){pattern.data, pattern.length}) !=
+          ST_OK) {
+    st_netpattern_free(&pattern);
+    st_policy_free(policy);
     sg_gate_free(gate);
     return 7;
   }
+  st_netpattern_free(&pattern);
+  sg_gate_set_allow_policy_owned(gate, policy);
   size_t buffer_size = sg_gate_evaluate_size_hint(strlen("echo hello"));
   char *buffer = buffer_size == SIZE_MAX ? NULL : malloc(buffer_size);
   sg_result_t result;

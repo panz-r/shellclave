@@ -481,6 +481,11 @@ shell_transform_command_line(const char *command_line, size_t command_length,
         shell_transform_command(&cmds[i], limits, &tcmds[i]);
     if (status == SHELL_TRANSFORM_OK) {
       size_t command_output = 0;
+      /* The successful single-command transform published an owned object.
+       * The analyzer loses that status/output pairing in allocator seams. */
+#ifdef __clang_analyzer__
+      __attribute__((suppress))
+#endif
       status = measure_transformed_command(tcmds[i], &command_output);
       if (status == SHELL_TRANSFORM_OK) {
         if (command_output > SIZE_MAX - total_output) {
@@ -517,14 +522,4 @@ void shell_transformed_command_list_free(shell_transformed_command_t **commands,
   for (size_t i = 0; i < count; i++)
     shell_transformed_command_free(commands[i]);
   free(commands);
-}
-
-const char *shell_transformed_command_get_display_text(
-    const shell_transformed_command_t *cmd) {
-  return cmd->display_text;
-}
-
-bool shell_transformed_command_has_transformations(
-    const shell_transformed_command_t *cmd) {
-  return cmd->has_transformations;
 }

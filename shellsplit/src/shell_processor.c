@@ -411,7 +411,7 @@ shell_process_classify_legacy_output_target(const char *text, size_t length) {
                                             &name_end))
     return SHELL_PROCESS_LEGACY_REDIRECT_DUPLICATION;
 
-  if (!shell_source_redirect_word_has_dynamic_path_syntax(text, length)) {
+  if (!shell_source_argument_has_dynamic_syntax(text, length)) {
     uint32_t ignored = SHELL_PROCESS_FD_NONE;
     switch (shell_process_classify_static_fd_target(text, length, &ignored)) {
     case SHELL_PROCESS_FD_TARGET_PATH:
@@ -1452,6 +1452,12 @@ static bool process_single_command_internal(shell_command_t *basic_cmd,
   for (size_t i = 0; i < basic_cmd->token_count; i++) {
     const shell_token_t *token = &basic_cmd->tokens[i];
     if (is_shell_operator_token(token)) {
+      /* The preceding count/allocation pass used these same immutable tokens.
+       * The analyzer cannot correlate the two loops; no runtime recheck is
+       * appropriate for their established exact capacities. */
+#ifdef __clang_analyzer__
+      __attribute__((suppress))
+#endif
       shell_tokens[shell_index++] = *token;
       consume_redirection_operand =
           is_redirection_token(token) && redirection_consumes_next_token(token);
@@ -1463,6 +1469,10 @@ static bool process_single_command_internal(shell_command_t *basic_cmd,
         continue;
       }
       consume_redirection_operand = false;
+      /* The count pass includes this first word after a redirect operand. */
+#ifdef __clang_analyzer__
+      __attribute__((suppress))
+#endif
       command_tokens[command_index++] = *token;
     } else {
       if (command_index > 0) {
@@ -1476,6 +1486,10 @@ static bool process_single_command_internal(shell_command_t *basic_cmd,
           continue;
         }
       }
+      /* The count pass includes every non-continuing ordinary word. */
+#ifdef __clang_analyzer__
+      __attribute__((suppress))
+#endif
       command_tokens[command_index++] = *token;
     }
   }
@@ -2357,16 +2371,14 @@ void shell_command_infos_free(shell_command_info_t *infos, size_t count) {
   free(infos);
 }
 
-static shell_process_status_t rendered_word_length(const shell_token_t *token,
-                                                   size_t *length) {
-  return shell_measure_processed_word(token->start, token->length, length);
-}
-
-static char *render_word_into(const shell_token_t *token, char *destination) {
+/* The immutable token has passed measurement; destination has that measured
+ * capacity. Writing cannot fail or require allocation under these guarantees.
+ */
+static SHELL_NONNULL(1, 2) char *render_word_into(const shell_token_t *token,
+                                                  char *destination) {
   size_t written = 0;
-  if (shell_write_processed_word(token->start, token->length, destination,
-                                 SIZE_MAX, &written) != SHELL_PROCESS_OK)
-    return NULL;
+  (void)shell_write_processed_word(token->start, token->length, destination,
+                                   SIZE_MAX, &written);
   return destination + written;
 }
 
@@ -2374,9 +2386,10 @@ shell_process_status_t shell_measure_netargv(const shell_command_info_t *info,
                                              size_t *total) {
   *total = 0;
   for (size_t i = 0; i < info->command_token_count; i++) {
+    const shell_token_t *token = &info->command_tokens[i];
     size_t length = 0;
     shell_process_status_t status =
-        rendered_word_length(&info->command_tokens[i], &length);
+        shell_measure_processed_word(token->start, token->length, &length);
     if (status != SHELL_PROCESS_OK)
       return status;
     size_t record_length = 0;
@@ -2389,12 +2402,12 @@ shell_process_status_t shell_measure_netargv(const shell_command_info_t *info,
   return SHELL_PROCESS_OK;
 }
 
-static char *write_netargv_unchecked(const shell_command_info_t *info,
-                                     char *position) {
+static SHELL_NONNULL(1, 2) char *write_netargv_unchecked(
+    const shell_command_info_t *info, char *position) {
   for (size_t i = 0; i < info->command_token_count; i++) {
     const shell_token_t *token = &info->command_tokens[i];
     size_t length = 0;
-    (void)rendered_word_length(token, &length);
+    (void)shell_measure_processed_word(token->start, token->length, &length);
     size_t prefix_length = 0;
     (void)shell_netstring_write_prefix(position, SIZE_MAX, length,
                                        &prefix_length);
@@ -2431,7 +2444,8 @@ measure_basic_netargv(const shell_command_t *command, size_t *total) {
   shell_token_t word;
   while (shell_processed_word_iterator_next(&iterator, &word)) {
     size_t length = 0;
-    shell_process_status_t status = rendered_word_length(&word, &length);
+    shell_process_status_t status =
+        shell_measure_processed_word(word.start, word.length, &length);
     if (status != SHELL_PROCESS_OK)
       return status;
     size_t record_length = 0;
@@ -2444,14 +2458,14 @@ measure_basic_netargv(const shell_command_t *command, size_t *total) {
   return SHELL_PROCESS_OK;
 }
 
-static char *write_basic_netargv(const shell_command_t *command,
-                                 char *position) {
+static SHELL_NONNULL(1, 2) char *write_basic_netargv(
+    const shell_command_t *command, char *position) {
   shell_processed_word_iterator_t iterator;
   shell_processed_word_iterator_init(&iterator, command);
   shell_token_t word;
   while (shell_processed_word_iterator_next(&iterator, &word)) {
     size_t length = 0;
-    (void)rendered_word_length(&word, &length);
+    (void)shell_measure_processed_word(word.start, word.length, &length);
     size_t prefix_length = 0;
     (void)shell_netstring_write_prefix(position, SIZE_MAX, length,
                                        &prefix_length);
@@ -2460,30 +2474,6 @@ static char *write_basic_netargv(const shell_command_t *command,
     *position++ = ',';
   }
   return position;
-}
-
-shell_process_status_t
-shell_render_netargv(const shell_command_info_t *info,
-                     const shell_process_limits_t *limits, char **netargv) {
-  *netargv = NULL;
-
-  shell_netstring_buffer_t encoded = {0};
-  shell_process_status_t status =
-      shell_render_netargv_buffer(info, limits, &encoded);
-  if (status != SHELL_PROCESS_OK)
-    return status;
-  if (memchr(encoded.data, '\0', encoded.length)) {
-    shell_netstring_buffer_free(&encoded);
-    return SHELL_PROCESS_EOUTPUT_LIMIT;
-  }
-  char *legacy = realloc(encoded.data, encoded.length + 1);
-  if (!legacy) {
-    shell_netstring_buffer_free(&encoded);
-    return SHELL_PROCESS_ENOMEM;
-  }
-  legacy[encoded.length] = '\0';
-  *netargv = legacy;
-  return SHELL_PROCESS_OK;
 }
 
 shell_process_status_t
@@ -2649,27 +2639,6 @@ static SHELL_NONNULL(1, 4, 6, 7) shell_process_status_t
   return status;
 }
 
-shell_process_status_t
-shell_build_netargv_sequence(const char *command_line, size_t command_length,
-                             const shell_process_limits_t *limits,
-                             char **netargv_sequence, size_t *subcommand_count,
-                             bool *has_shell_features) {
-  size_t length = 0;
-  shell_process_status_t status = shell_build_netargv_sequence_impl(
-      command_line, command_length, limits, netargv_sequence, &length,
-      subcommand_count, has_shell_features);
-  if (status != SHELL_PROCESS_OK)
-    return status;
-  if (memchr(*netargv_sequence, '\0', length)) {
-    free(*netargv_sequence);
-    *netargv_sequence = NULL;
-    *subcommand_count = 0;
-    *has_shell_features = false;
-    return SHELL_PROCESS_EOUTPUT_LIMIT;
-  }
-  return SHELL_PROCESS_OK;
-}
-
 shell_process_status_t shell_build_netargv_sequence_buffer(
     const char *command_line, size_t command_length,
     const shell_process_limits_t *limits, shell_netstring_buffer_t *sequence,
@@ -2804,25 +2773,6 @@ static shell_process_status_t shell_build_command_netseq_impl(
 fail_commands:
   shell_anomaly_stages_free(&stages);
   return status;
-}
-
-shell_process_status_t
-shell_build_command_netseq(const char *command_line, size_t command_length,
-                           const shell_process_limits_t *limits,
-                           char **command_netseq, size_t *subcommand_count) {
-  size_t length = 0;
-  shell_process_status_t status = shell_build_command_netseq_impl(
-      command_line, command_length, limits, command_netseq, &length,
-      subcommand_count);
-  if (status != SHELL_PROCESS_OK)
-    return status;
-  if (memchr(*command_netseq, '\0', length)) {
-    free(*command_netseq);
-    *command_netseq = NULL;
-    *subcommand_count = 0;
-    return SHELL_PROCESS_EOUTPUT_LIMIT;
-  }
-  return SHELL_PROCESS_OK;
 }
 
 shell_process_status_t shell_build_command_netseq_buffer(

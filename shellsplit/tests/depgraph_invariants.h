@@ -150,13 +150,13 @@ static bool shellsplit_test_depgraph_invariants(
 
   if (error != SHELL_DEP_OK && error != SHELL_DEP_EINPUT &&
       error != SHELL_DEP_ETRUNC && error != SHELL_DEP_EPARSE &&
-      error != SHELL_DEP_EWORKSPACE)
+      error != SHELL_DEP_EWORKSPACE && error != SHELL_DEP_EEXPAND)
     return false;
   if ((error == SHELL_DEP_OK && graph->status != SHELL_DEP_STATUS_OK) ||
       (error == SHELL_DEP_ETRUNC &&
        graph->status != SHELL_DEP_STATUS_TRUNCATED) ||
       ((error == SHELL_DEP_EINPUT || error == SHELL_DEP_EPARSE ||
-        error == SHELL_DEP_EWORKSPACE) &&
+        error == SHELL_DEP_EWORKSPACE || error == SHELL_DEP_EEXPAND) &&
        graph->status != SHELL_DEP_STATUS_ERROR) ||
       graph->node_count > max_nodes || graph->edge_count > max_edges ||
       graph->cwd_buf.len > max_cwd ||
@@ -165,7 +165,7 @@ static bool shellsplit_test_depgraph_invariants(
     return false;
 
   if (error == SHELL_DEP_EINPUT || error == SHELL_DEP_EPARSE ||
-      error == SHELL_DEP_EWORKSPACE)
+      error == SHELL_DEP_EWORKSPACE || error == SHELL_DEP_EEXPAND)
     return graph->node_count == 0 && graph->edge_count == 0;
   if (!shell_dep_graph_validate(graph).valid)
     return false;

@@ -45,11 +45,14 @@ typedef struct {
  * Transformed command
  */
 typedef struct {
-  const char *original_command;      // Owned original command text
-  const char *display_text;          // Owned lossy diagnostic text
+  const char *original_command; // Owned original command text
+  /* Owned lossy diagnostic text, never a reparsable command or argv transport.
+   * Use Shellsplit's netargv builders for canonical programmatic output. */
+  const char *display_text;
   shell_transformed_token_t *tokens; // Transformed tokens
   size_t token_count;                // Number of tokens
-  bool has_transformations;          // Has token-level placeholder replacements
+  /* Has token-level placeholder replacements; not a source-equality test. */
+  bool has_transformations;
   /* Has semantic shell syntax, including enclosing groups, pipeline prefixes,
    * and executable substitutions embedded in a word. This need not imply that
    * diagnostic display text changed. */
@@ -123,22 +126,6 @@ void shell_transformed_command_free(shell_transformed_command_t *command);
  * every command and the outer pointer array. Safe to call with NULL. */
 void shell_transformed_command_list_free(shell_transformed_command_t **commands,
                                          size_t count);
-
-/**
- * Get lossy diagnostic text after token-level transforms. This is not shell
- * source or canonical netargv; programmatic consumers must use Shellsplit's
- * canonical sequence builders instead.
- */
-const char *shell_transformed_command_get_display_text(
-    const shell_transformed_command_t *cmd) SHELL_NONNULL(1);
-
-/**
- * Return true when at least one token received a diagnostic placeholder
- * replacement. Joining tokens or removing physical line continuations alone
- * does not set this flag; it is not a source/display equality test.
- */
-bool shell_transformed_command_has_transformations(
-    const shell_transformed_command_t *cmd) SHELL_NONNULL(1);
 
 #ifdef __cplusplus
 }

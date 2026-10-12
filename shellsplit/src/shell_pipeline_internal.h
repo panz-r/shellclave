@@ -274,6 +274,9 @@ static SHELL_NONNULL(1, 3, 4, 5) inline shell_pipeline_group_context_t
                                           backgrounded};
 }
 
+/* Return the exclusive flattened-range bound of the lexical pipeline scope
+ * containing one simple-command range. A nested pipeline can use the same
+ * modifier mode as its parent, so mode is never a usable scope identity. */
 static SHELL_NONNULL(1, 2) inline uint32_t
     shell_pipeline_range_limit(const shell_parse_result_t *parsed,
                                const shell_pipeline_index_t *index,
@@ -285,6 +288,8 @@ static SHELL_NONNULL(1, 2) inline uint32_t
                    parsed->groups[container].command_count;
 }
 
+/* A compound pipeline member itself lives in its parent's pipeline scope, not
+ * in the command interval enclosed by the compound. */
 static SHELL_NONNULL(1, 2) inline uint32_t
     shell_pipeline_group_limit(const shell_parse_result_t *parsed,
                                const shell_group_t *group) {

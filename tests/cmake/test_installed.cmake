@@ -19,6 +19,7 @@ set(expected_headers
   shell_abstract.h
   shell_contract.h
   shell_depgraph.h
+  shell_expand.h
   shell_interop.h
   shell_netstring.h
   shell_processor.h

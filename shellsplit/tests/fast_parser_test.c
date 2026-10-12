@@ -25,6 +25,7 @@ static void test(const char *name, int result) {
     printf("  [PASS] %s\n", name);
   } else {
     printf("  [FAIL] %s\n", name);
+    exit(EXIT_FAILURE);
   }
 }
 
@@ -897,8 +898,12 @@ void test_dialect_oracle(void) {
     shell_process_status_t process_error = shell_process_command(
         cases[i].input, strlen(cases[i].input), NULL, &infos, &info_count);
     shell_dep_graph_t graph;
+    memset(&graph, 0xa5, sizeof(graph));
     shell_dep_error_t graph_error = shell_dep_graph_parse(
         cases[i].input, strlen(cases[i].input), ".", NULL, &graph);
+    test("Dialect oracle constructs a complete bounded graph",
+         graph_error == SHELL_DEP_OK &&
+             graph.node_count <= SHELL_DEP_MAX_NODES);
     uint32_t graph_commands = 0;
     for (uint32_t node = 0; node < graph.node_count; node++)
       if (graph.nodes[node].type == SHELL_NODE_CMD)
@@ -3489,7 +3494,7 @@ static void test_word_writer_contract_boundaries(void) {
       .max_string_bytes = 1,
       .max_total_bytes = 1,
   };
-  valid = valid && !shell_netstring_buffer_is_empty(&occupied);
+  valid = valid && !((&occupied)->data == NULL && (&occupied)->length == 0);
   shell_command_infos_free(infos, info_count);
   infos = (shell_command_info_t *)(uintptr_t)1;
   info_count = SIZE_MAX;
@@ -3519,17 +3524,13 @@ static void test_abstract_adapter_contract(void) {
   bool valid = null_status == SHELL_ABSTRACT_EINPUT && null_cleared &&
                malformed_status == SHELL_ABSTRACT_EPARSE && malformed_cleared &&
                parse_status == SHELL_ABSTRACT_OK && abstracted != NULL &&
-               shell_abstract_command_get_source(abstracted) != NULL &&
-               shell_abstract_command_get_display_text(abstracted) != NULL &&
-               shell_abstract_command_has_variables(abstracted) &&
-               shell_abstract_command_has_paths(abstracted) &&
-               shell_abstract_command_has_abs_paths(abstracted) &&
-               shell_abstract_command_has_rel_paths(abstracted) &&
-               shell_abstract_command_has_home_paths(abstracted) &&
-               shell_abstract_command_has_globs(abstracted) &&
-               shell_abstract_command_has_cmd_subst(abstracted) &&
-               shell_abstract_command_has_arithmetic(abstracted) &&
-               shell_abstract_command_has_redirects(abstracted);
+               abstracted->original != NULL &&
+               abstracted->display_text != NULL && abstracted->has_variables &&
+               abstracted->has_paths && abstracted->has_abs_paths &&
+               abstracted->has_rel_paths && abstracted->has_home_paths &&
+               abstracted->has_globs && abstracted->has_cmd_subst &&
+               abstracted->has_arithmetic && abstracted->has_redirects;
+  test("Abstract adapter establishes every required output", valid);
   size_t element_count = 0;
   const shell_abstract_element_t *const *elements =
       shell_abstract_command_get_elements(abstracted, &element_count);
@@ -3682,13 +3683,13 @@ static void test_anomaly_stage_recursion_limit(void) {
   }
   nested[position++] = ')';
   nested[position] = '\0';
-  char *command_netseq = (char *)(uintptr_t)1;
+  shell_netstring_buffer_t command_netseq = {0};
   size_t count = SIZE_MAX;
-  bool rejected =
-      shell_build_command_netseq(nested, position, NULL, &command_netseq,
-                                 &count) == SHELL_PROCESS_EOUTPUT_LIMIT &&
-      command_netseq == NULL && count == 0;
-  free(command_netseq);
+  bool rejected = shell_build_command_netseq_buffer(nested, position, NULL,
+                                                    &command_netseq, &count) ==
+                      SHELL_PROCESS_EOUTPUT_LIMIT &&
+                  command_netseq.data == NULL && count == 0;
+  shell_netstring_buffer_free(&command_netseq);
   test("Anomaly stage extraction bounds recursive substitutions", rejected);
 }
 

@@ -32,7 +32,7 @@ static void cleanup_failure_matrix_files(void) {
     if (!(condition)) {                                                        \
       fprintf(stderr, "check failed: %s at %s:%d\n", #condition, __FILE__,     \
               __LINE__);                                                       \
-      return 0;                                                                \
+      exit(EXIT_FAILURE);                                                      \
     }                                                                          \
   } while (0)
 
@@ -266,6 +266,9 @@ static int test_read_line_bytes(void) {
         SG_IO_READ_ERROR);
   CHECK(errno == EIO && length == 0 && buffer[0] == '\0');
   sg_test_io_reset();
+  /* Restore a determinate position before further I/O after a read error. */
+  CHECK(fseek(stream, 0, SEEK_SET) == 0);
+  CHECK(ftell(stream) == 0);
   CHECK(sg_io_read_line(stream, buffer, sizeof(buffer), &length) ==
         SG_IO_READ_OK);
   CHECK(length == 6 && memcmp(buffer, input, length) == 0 &&

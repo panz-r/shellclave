@@ -8,7 +8,6 @@
 #include "sg_anomaly.h"
 #include "sg_anomaly_internal.h"
 #include "sg_io.h"
-#include "shell_abstract.h"
 #include "shell_depgraph.h"
 #include "shell_depgraph_internal.h"
 #include "shell_netstring.h"
@@ -81,83 +80,6 @@ typedef struct {
   size_t used;
   bool overflow;
 } buf_writer_t;
-
-/* Persistent evaluation metadata, placed above the reusable graph workspace.
- * Direct source-offset handles avoid searches/replays during graph snapshots.
- * Payloads borrow application storage; only final output copies their bytes. */
-typedef struct {
-  shell_dep_word_value_t value;
-} sg_expansion_entry_t;
-
-typedef struct {
-  const sg_gate_t *gate;
-  const char *source;
-  size_t length, count, capacity;
-  uint32_t *offsets;
-  uint8_t *unresolved_paths;
-  sg_expansion_entry_t *entries;
-  sg_error_t error;
-} sg_expansion_cache_t;
-
-#define SG_EXPANSION_CAPACITY                                                  \
-  (SHELL_DEP_MAX_NODES * SHELL_DEP_MAX_TOKENS + SHELL_DEP_MAX_EDGES)
-
-static size_t sg_expansion_capacity(size_t length) {
-  return length < SG_EXPANSION_CAPACITY ? length + 1 : SG_EXPANSION_CAPACITY;
-}
-
-static SHELL_NONNULL(2) bool sg_expansion_cache_size(size_t length,
-                                                     size_t *size) {
-  size_t capacity = sg_expansion_capacity(length);
-  size_t entries =
-      capacity * sizeof(sg_expansion_entry_t) + SHELL_DEP_MAX_NODES;
-  size_t padding = _Alignof(sg_expansion_entry_t) - 1;
-  if (length > (SIZE_MAX - entries - padding) / sizeof(uint32_t) - 1)
-    return false;
-  *size = entries + (length + 1) * sizeof(uint32_t) + padding;
-  return true;
-}
-
-/* The partitioned evaluation tail is aligned for Shellsplit's workspace.
- * Retain the expansion cache at its front and align the remaining resolver
- * workspace once; both regions live until evaluation returns. */
-static SHELL_NONNULL(1, 2, 4, 6, 7, 8) bool sg_expansion_cache_init(
-    const sg_gate_t *gate, const char *source, size_t length, void *workspace,
-    size_t workspace_size, sg_expansion_cache_t *cache,
-    void **resolver_workspace, size_t *resolver_workspace_size) {
-  size_t capacity = sg_expansion_capacity(length);
-  size_t entry_bytes =
-      capacity * sizeof(sg_expansion_entry_t) + SHELL_DEP_MAX_NODES;
-  size_t offset_bytes = (length + 1) * sizeof(uint32_t);
-  uintptr_t base = (uintptr_t)workspace;
-  uintptr_t cursor = base + entry_bytes + offset_bytes;
-  size_t alignment = shell_dep_workspace_alignment();
-  cursor = (cursor + alignment - 1) & ~(uintptr_t)(alignment - 1);
-  if (cursor < base || cursor - base > workspace_size)
-    return false;
-  *cache = (sg_expansion_cache_t){
-      .gate = gate,
-      .source = source,
-      .length = length,
-      .capacity = capacity,
-      .offsets = (uint32_t *)((char *)workspace + entry_bytes),
-      .unresolved_paths =
-          (uint8_t *)workspace + capacity * sizeof(sg_expansion_entry_t),
-      .entries = workspace,
-  };
-  memset(cache->offsets, 0, offset_bytes);
-  *resolver_workspace = (void *)cursor;
-  *resolver_workspace_size = workspace_size - (size_t)(cursor - base);
-  return true;
-}
-
-/* word is within cache's immutable source; its offset indexes the initialized
- * source-sized table. Entries remain immutable until evaluation returns. */
-static SHELL_NONNULL(1, 2) const shell_dep_word_value_t *sg_expansion_lookup(
-    const sg_expansion_cache_t *cache, const char *word) {
-  uint32_t handle = cache->offsets[(size_t)(word - cache->source)];
-  return handle ? &cache->entries[handle - 1].value : NULL;
-}
 
 static void bw_init(buf_writer_t *w, char *buf, size_t buf_size) {
   w->base = buf;
@@ -482,9 +404,10 @@ static SHELL_NONNULL(1, 2, 4) bool sg_path_fragment_advance(
 }
 
 struct sg_gate {
-  st_policy_ctx_t *pctx;
-  st_policy_t *policy;
-  st_policy_t *deny_policy;
+  const st_policy_t *policy;
+  const st_policy_t *deny_policy;
+  bool owns_policy;
+  bool owns_deny_policy;
 
   char cwd[512];
   uint32_t reject_mask;
@@ -492,7 +415,7 @@ struct sg_gate {
   bool suggestions;
   bool strict_mode;
 
-  sg_expand_word_netargv_fn expand_word_netargv_fn;
+  shell_expand_word_netargv_fn expand_word_netargv_fn;
   void *expand_word_netargv_ctx;
 
   bool viol_enabled;
@@ -563,31 +486,14 @@ static SHELL_NONNULL(1) bool anomaly_uses_bayesian(const sg_gate_t *gate) {
 
 /* --- LIFECYCLE --- */
 
-sg_gate_t *sg_gate_new(void) {
+sg_gate_t *sg_gate_new_with_policies_borrowed(const st_policy_t *allow,
+                                              const st_policy_t *deny) {
   sg_gate_t *g = calloc(1, sizeof(*g));
   if (!g)
     return NULL;
 
-  g->pctx = st_policy_ctx_new();
-  if (!g->pctx) {
-    free(g);
-    return NULL;
-  }
-
-  g->policy = st_policy_new(g->pctx);
-  if (!g->policy) {
-    st_policy_ctx_release(g->pctx);
-    free(g);
-    return NULL;
-  }
-
-  g->deny_policy = st_policy_new(g->pctx);
-  if (!g->deny_policy) {
-    st_policy_free(g->policy);
-    st_policy_ctx_release(g->pctx);
-    free(g);
-    return NULL;
-  }
+  g->policy = allow;
+  g->deny_policy = deny;
 
   sg_strlcpy(g->cwd, ".", sizeof(g->cwd));
   g->reject_mask = SG_REJECT_MASK_DEFAULT;
@@ -605,6 +511,35 @@ sg_gate_t *sg_gate_new(void) {
   return g;
 }
 
+sg_gate_t *sg_gate_new_with_policies_owned(st_policy_t *allow,
+                                           st_policy_t *deny) {
+  sg_gate_t *gate = sg_gate_new_with_policies_borrowed(allow, deny);
+  if (gate) {
+    gate->owns_policy = true;
+    gate->owns_deny_policy = true;
+  }
+  return gate;
+}
+
+sg_gate_t *sg_gate_new(void) {
+  st_policy_ctx_t *context = st_policy_ctx_new();
+  if (!context)
+    return NULL;
+  st_policy_t *allow = st_policy_new(context);
+  st_policy_t *deny = allow ? st_policy_new(context) : NULL;
+  st_policy_ctx_release(context);
+  if (!deny) {
+    st_policy_free(allow);
+    return NULL;
+  }
+  sg_gate_t *gate = sg_gate_new_with_policies_owned(allow, deny);
+  if (!gate) {
+    st_policy_free(allow);
+    st_policy_free(deny);
+  }
+  return gate;
+}
+
 void sg_gate_free(sg_gate_t *gate) {
   if (!gate)
     return;
@@ -616,12 +551,10 @@ void sg_gate_free(sg_gate_t *gate) {
   free(gate->path_fragment_tables);
   type_cache_free(&gate->anomaly_type_cache);
   cdf_free(gate);
-  if (gate->policy)
-    st_policy_free(gate->policy);
-  if (gate->deny_policy)
-    st_policy_free(gate->deny_policy);
-  if (gate->pctx)
-    st_policy_ctx_release(gate->pctx);
+  if (gate->owns_policy)
+    st_policy_free((st_policy_t *)gate->policy);
+  if (gate->owns_deny_policy)
+    st_policy_free((st_policy_t *)gate->deny_policy);
   free(gate);
 }
 
@@ -652,103 +585,11 @@ sg_error_t sg_gate_set_suggestions(sg_gate_t *gate, bool enabled) {
 }
 
 sg_error_t sg_gate_set_expand_word_netargv(sg_gate_t *gate,
-                                           sg_expand_word_netargv_fn fn,
+                                           shell_expand_word_netargv_fn fn,
                                            void *user_ctx) {
   gate->expand_word_netargv_fn = fn;
   gate->expand_word_netargv_ctx = user_ctx;
   return SG_OK;
-}
-
-/* Canonical framing and resource arithmetic are checked once here, at the
- * callback boundary. value has zero-initialized count/display/first metadata;
- * netargv is the callback's possibly empty byte span. Successful metadata is
- * consumed without revalidation. */
-static SHELL_NONNULL(1) bool sg_expansion_validate(
-    shell_dep_word_value_t *value, bool path) {
-  shell_netstring_iter_t iter;
-  if (shell_netstring_iter_init(&iter, value->netargv, value->length) !=
-      SHELL_NETSTRING_OK)
-    return false;
-  shell_netstring_view_t view;
-  shell_netstring_status_t status;
-  while ((status = shell_netstring_iter_next(&iter, &view)) ==
-         SHELL_NETSTRING_OK) {
-    if (path && memchr(view.payload, 0, view.payload_length))
-      return false;
-    if (!value->count) {
-      value->first = (const char *)view.payload;
-      value->first_length = view.payload_length;
-    }
-    size_t width = value->count != 0;
-    for (size_t i = 0; i < view.payload_length; i++) {
-      unsigned char byte = view.payload[i];
-      size_t n = byte >= 0x20 && byte <= 0x7e && byte != '\\' ? 1 : 4;
-      if (width > SIZE_MAX - n)
-        return false;
-      width += n;
-    }
-    if (value->display_length > SIZE_MAX - width)
-      return false;
-    value->display_length += width;
-    value->count++;
-  }
-  return status == SHELL_NETSTRING_DONE;
-}
-
-/* request supplies unchanged parser spans within context's original source.
- * context is the initialized evaluation cache; both are required storage. */
-static SHELL_NONNULL(1, 2) const shell_dep_word_value_t *sg_expand_word(
-    const shell_dep_expand_request_t *request, void *context) {
-  sg_expansion_cache_t *cache = context;
-  const shell_dep_word_value_t *cached =
-      sg_expansion_lookup(cache, request->word);
-  if (cached)
-    return cached;
-  if (cache->count == cache->capacity) {
-    cache->error = SG_ERR_TRUNC;
-    return NULL;
-  }
-  sg_expansion_entry_t *entry = &cache->entries[cache->count++];
-  *entry = (sg_expansion_entry_t){0};
-  cache->offsets[(size_t)(request->word - cache->source)] =
-      (uint32_t)cache->count;
-  entry->value.dynamic =
-      request->purpose == SHELL_DEP_EXPAND_ARGUMENT
-          ? shell_source_argument_has_dynamic_syntax(request->word,
-                                                     request->word_length)
-          : shell_source_redirect_word_has_dynamic_path_syntax(
-                request->word, request->word_length);
-  if (!entry->value.dynamic || !request->eligible ||
-      !cache->gate->expand_word_netargv_fn)
-    return &entry->value;
-  sg_expand_word_request_t query = {
-      .source = cache->source,
-      .source_length = cache->length,
-      .word_offset = (size_t)(request->word - cache->source),
-      .word_length = request->word_length,
-      .owner_offset = (size_t)(request->owner - cache->source),
-      .owner_length = request->owner_length,
-      .purpose = (sg_expand_word_purpose_t)request->purpose,
-      .cwd = request->cwd_known ? request->cwd : NULL,
-      .cwd_known = request->cwd_known,
-      .cwd_absolute = request->cwd_absolute,
-  };
-  sg_expand_status_t status = cache->gate->expand_word_netargv_fn(
-      &query, &entry->value.netargv, &entry->value.length,
-      cache->gate->expand_word_netargv_ctx);
-  if (status == SG_EXPAND_UNRESOLVED) {
-    entry->value.netargv = NULL;
-    entry->value.length = 0;
-    return &entry->value;
-  }
-  if (status != SG_EXPAND_RESOLVED ||
-      !sg_expansion_validate(&entry->value,
-                             request->purpose != SHELL_DEP_EXPAND_ARGUMENT)) {
-    cache->error = SG_ERR_EXPAND;
-    return NULL;
-  }
-  entry->value.resolved = true;
-  return &entry->value;
 }
 
 static bool config_array_valid(const char *const *values, uint32_t count,
@@ -815,20 +656,24 @@ sg_gate_set_violation_config_borrowed(sg_gate_t *gate,
           fragment->alphabet[byte] = (uint8_t)++fragment->alphabet_size;
       }
       size_t columns = fragment->alphabet_size;
-      if (length && length > (SIZE_MAX / sizeof(size_t) - total) / columns)
+      if (columns && length > (SIZE_MAX / sizeof(size_t) - total) / columns)
         return SG_ERR_MEMORY;
       total += length * columns;
     }
   }
-  size_t *tables = total ? malloc(total * sizeof(*tables)) : NULL;
-  if (total && !tables)
-    return SG_ERR_MEMORY;
-  size_t offset = 0;
-  for (unsigned list = 0; list < 2; list++) {
-    for (uint32_t i = 0; i < counts[list]; i++) {
-      if (fragments[list][i].length != 0) {
-        sg_path_fragment_compile(&fragments[list][i], tables + offset);
-        offset += fragments[list][i].length * fragments[list][i].alphabet_size;
+  size_t *tables = NULL;
+  if (total != 0) {
+    tables = malloc(total * sizeof(*tables));
+    if (!tables)
+      return SG_ERR_MEMORY;
+    size_t offset = 0;
+    for (unsigned list = 0; list < 2; list++) {
+      for (uint32_t i = 0; i < counts[list]; i++) {
+        if (fragments[list][i].length != 0) {
+          sg_path_fragment_compile(&fragments[list][i], tables + offset);
+          offset +=
+              fragments[list][i].length * fragments[list][i].alphabet_size;
+        }
       }
     }
   }
@@ -1350,8 +1195,7 @@ sg_error_t sg_gate_save_anomaly_model(const sg_gate_t *gate, const char *path) {
   if (result != SG_OK || sg_atomic_output_commit(&output) != 0) {
     if (result == SG_OK)
       saved_errno = errno;
-    if (output.destination_name)
-      sg_atomic_output_discard(&output);
+    sg_atomic_output_discard(&output);
     errno = saved_errno;
     return result != SG_OK ? result : SG_ERR_IO;
   }
@@ -1497,221 +1341,55 @@ bool sg_gate_anomaly_had_error(const sg_gate_t *gate) {
          sg_anomaly_model_had_error(gate->anomaly_model_type);
 }
 
-size_t sg_gate_anomaly_vocab_size(const sg_gate_t *gate) {
-  if (!gate->anomaly_model)
-    return 0;
-  return sg_anomaly_model_vocab_size(gate->anomaly_model);
+const sg_anomaly_model_t *
+sg_gate_anomaly_raw_model_borrowed(const sg_gate_t *gate) {
+  return gate->anomaly_model;
 }
 
-/* --- SUGGESTION TOKEN VARIANTS --- */
-
-/*
- * Given a suggestion pattern string and a token position, return type variants
- * for editing. Chain: literal → most_specific (via st_token_classify) → ...
- *        ... → suggested_wildcard (from suggestion) → ... → #any
- *
- * Variants walk from more specific to more general.
- * st_type_join gives the widening direction toward ST_TYPE_ANY.
- */
-size_t sg_cpl_token_variants_at(const char *pattern, size_t edit_pos,
-                                st_token_variant_t *out_variants,
-                                size_t max_variants) {
-  if (max_variants == 0)
-    return 0;
-  if (pattern[0] == '\0')
-    return 0;
-
-  st_netpattern_t netpattern = {0};
-  st_token_array_t decoded = {0};
-  if (st_netpattern_from_cpl_owned(pattern, &netpattern) != ST_OK ||
-      st_netpattern_decode_view(
-          (st_netpattern_view_t){.data = netpattern.data,
-                                 .length = netpattern.length},
-          &decoded) != ST_OK) {
-    st_netpattern_free(&netpattern);
-    return 0;
-  }
-  st_netpattern_free(&netpattern);
-  size_t out =
-      st_token_variants_at(&decoded, edit_pos, out_variants, max_variants);
-  st_token_array_free(&decoded);
-  return out;
+const sg_anomaly_model_t *
+sg_gate_anomaly_type_model_borrowed(const sg_gate_t *gate) {
+  return gate->anomaly_model_type;
 }
 
-/* --- POLICY MANAGEMENT --- */
-
-static sg_error_t policy_mutation_error(st_error_t error) {
-  switch (error) {
-  case ST_OK:
-    return SG_OK;
-  case ST_ERR_MEMORY:
-    return SG_ERR_MEMORY;
-  case ST_ERR_IO:
-    return SG_ERR_IO;
-  case ST_ERR_INVALID:
-  case ST_ERR_FAILED:
-  case ST_ERR_FORMAT:
-  case ST_ERR_LIMIT:
-    return SG_ERR_INVALID;
-  }
-  return SG_ERR_INVALID;
+/* Policies are stable installed objects; these operations change ownership,
+ * not policy contents. Required pointers and lifetime relationships are caller
+ * preconditions, including detaching borrowers before owned retirement. */
+void sg_gate_set_allow_policy_owned(sg_gate_t *gate, st_policy_t *policy) {
+  if (gate->owns_policy)
+    st_policy_free((st_policy_t *)gate->policy);
+  gate->policy = policy;
+  gate->owns_policy = true;
 }
 
-static sg_error_t gate_add_netpattern(st_policy_t *policy,
-                                      const char *netpattern) {
-  if (!netpattern)
-    return SG_ERR_INVALID;
-  return policy_mutation_error(st_policy_add_netpattern(policy, netpattern));
+void sg_gate_set_deny_policy_owned(sg_gate_t *gate, st_policy_t *policy) {
+  if (gate->owns_deny_policy)
+    st_policy_free((st_policy_t *)gate->deny_policy);
+  gate->deny_policy = policy;
+  gate->owns_deny_policy = true;
 }
 
-static sg_error_t gate_remove_netpattern(st_policy_t *policy,
-                                         const char *netpattern) {
-  if (!netpattern)
-    return SG_ERR_INVALID;
-  return policy_mutation_error(st_policy_remove_netpattern(policy, netpattern));
+void sg_gate_set_allow_policy_borrowed(sg_gate_t *gate,
+                                       const st_policy_t *policy) {
+  if (gate->owns_policy)
+    st_policy_free((st_policy_t *)gate->policy);
+  gate->policy = policy;
+  gate->owns_policy = false;
 }
 
-static sg_error_t gate_add_netpattern_view(st_policy_t *policy,
-                                           st_netpattern_view_t netpattern) {
-  if (!netpattern.data || netpattern.length == 0)
-    return SG_ERR_INVALID;
-  return policy_mutation_error(
-      st_policy_add_netpattern_view(policy, netpattern));
+void sg_gate_set_deny_policy_borrowed(sg_gate_t *gate,
+                                      const st_policy_t *policy) {
+  if (gate->owns_deny_policy)
+    st_policy_free((st_policy_t *)gate->deny_policy);
+  gate->deny_policy = policy;
+  gate->owns_deny_policy = false;
 }
 
-static sg_error_t gate_remove_netpattern_view(st_policy_t *policy,
-                                              st_netpattern_view_t netpattern) {
-  if (!netpattern.data || netpattern.length == 0)
-    return SG_ERR_INVALID;
-  return policy_mutation_error(
-      st_policy_remove_netpattern_view(policy, netpattern));
+const st_policy_t *sg_gate_allow_policy_borrowed(const sg_gate_t *gate) {
+  return gate->policy;
 }
 
-static sg_error_t gate_batch_add_netpatterns(st_policy_t *policy,
-                                             const char *const *netpatterns,
-                                             size_t count) {
-  if (!netpatterns || count == 0)
-    return SG_ERR_INVALID;
-  return policy_mutation_error(
-      st_policy_batch_add_netpatterns(policy, netpatterns, count));
-}
-
-static sg_error_t policy_load_error(st_error_t error) {
-  switch (error) {
-  case ST_OK:
-    return SG_OK;
-  case ST_ERR_MEMORY:
-    return SG_ERR_MEMORY;
-  case ST_ERR_IO:
-    return SG_ERR_IO;
-  case ST_ERR_INVALID:
-  case ST_ERR_FAILED:
-  case ST_ERR_FORMAT:
-  case ST_ERR_LIMIT:
-    return SG_ERR_PARSE;
-  }
-  return SG_ERR_PARSE;
-}
-
-sg_error_t sg_gate_load_policy(sg_gate_t *gate, const char *path) {
-  return policy_load_error(
-      st_policy_load(gate->policy, path, /*clear_first=*/false));
-}
-
-sg_error_t sg_gate_save_policy(const sg_gate_t *gate, const char *path) {
-  return policy_mutation_error(st_policy_save(gate->policy, path));
-}
-
-sg_error_t sg_gate_add_allow_netpattern(sg_gate_t *gate,
-                                        const char *netpattern) {
-  return gate_add_netpattern(gate->policy, netpattern);
-}
-
-sg_error_t sg_gate_remove_allow_netpattern(sg_gate_t *gate,
-                                           const char *netpattern) {
-  return gate_remove_netpattern(gate->policy, netpattern);
-}
-
-sg_error_t sg_gate_batch_add_allow_netpatterns(sg_gate_t *gate,
-                                               const char *const *netpatterns,
-                                               size_t count) {
-  return gate_batch_add_netpatterns(gate->policy, netpatterns, count);
-}
-
-sg_error_t sg_gate_add_allow_cpl(sg_gate_t *gate, const char *pattern) {
-  st_netpattern_t netpattern = {0};
-  st_error_t error = st_netpattern_from_cpl_owned(pattern, &netpattern);
-  sg_error_t result =
-      error == ST_OK ? gate_add_netpattern_view(
-                           gate->policy,
-                           (st_netpattern_view_t){.data = netpattern.data,
-                                                  .length = netpattern.length})
-                     : policy_mutation_error(error);
-  st_netpattern_free(&netpattern);
-  return result;
-}
-
-sg_error_t sg_gate_remove_allow_cpl(sg_gate_t *gate, const char *pattern) {
-  st_netpattern_t netpattern = {0};
-  st_error_t error = st_netpattern_from_cpl_owned(pattern, &netpattern);
-  sg_error_t result =
-      error == ST_OK ? gate_remove_netpattern_view(
-                           gate->policy,
-                           (st_netpattern_view_t){.data = netpattern.data,
-                                                  .length = netpattern.length})
-                     : policy_mutation_error(error);
-  st_netpattern_free(&netpattern);
-  return result;
-}
-
-size_t sg_gate_allow_rule_count(const sg_gate_t *gate) {
-  return st_policy_rule_count(gate->policy);
-}
-
-sg_error_t sg_gate_add_deny_netpattern(sg_gate_t *gate,
-                                       const char *netpattern) {
-  return gate_add_netpattern(gate->deny_policy, netpattern);
-}
-
-sg_error_t sg_gate_remove_deny_netpattern(sg_gate_t *gate,
-                                          const char *netpattern) {
-  return gate_remove_netpattern(gate->deny_policy, netpattern);
-}
-
-sg_error_t sg_gate_batch_add_deny_netpatterns(sg_gate_t *gate,
-                                              const char *const *netpatterns,
-                                              size_t count) {
-  return gate_batch_add_netpatterns(gate->deny_policy, netpatterns, count);
-}
-
-sg_error_t sg_gate_add_deny_cpl(sg_gate_t *gate, const char *pattern) {
-  st_netpattern_t netpattern = {0};
-  st_error_t error = st_netpattern_from_cpl_owned(pattern, &netpattern);
-  sg_error_t result =
-      error == ST_OK ? gate_add_netpattern_view(
-                           gate->deny_policy,
-                           (st_netpattern_view_t){.data = netpattern.data,
-                                                  .length = netpattern.length})
-                     : policy_mutation_error(error);
-  st_netpattern_free(&netpattern);
-  return result;
-}
-
-sg_error_t sg_gate_remove_deny_cpl(sg_gate_t *gate, const char *pattern) {
-  st_netpattern_t netpattern = {0};
-  st_error_t error = st_netpattern_from_cpl_owned(pattern, &netpattern);
-  sg_error_t result =
-      error == ST_OK ? gate_remove_netpattern_view(
-                           gate->deny_policy,
-                           (st_netpattern_view_t){.data = netpattern.data,
-                                                  .length = netpattern.length})
-                     : policy_mutation_error(error);
-  st_netpattern_free(&netpattern);
-  return result;
-}
-
-size_t sg_gate_deny_rule_count(const sg_gate_t *gate) {
-  return st_policy_rule_count(gate->deny_policy);
+const st_policy_t *sg_gate_deny_policy_borrowed(const sg_gate_t *gate) {
+  return gate->deny_policy;
 }
 
 /* --- INTERNAL: TOKEN EXPANSION HELPERS --- */
@@ -1771,10 +1449,10 @@ typedef struct {
 
 static SHELL_NONNULL(1, 2) sg_command_word_view_t
     sg_command_word_view(const shell_dep_cmd_t *cmd,
-                         const sg_expansion_cache_t *cache, uint32_t token) {
+                         const shell_expand_cache_t *cache, uint32_t token) {
   return (sg_command_word_view_t){
       cmd->tokens[token], cmd->token_lens[token],
-      sg_expansion_lookup(cache, cmd->tokens[token])};
+      shell_expand_lookup(cache, cmd->tokens[token])};
 }
 
 /* graph/cache are unchanged constructed/prevalidated views. flags references
@@ -1783,7 +1461,7 @@ static SHELL_NONNULL(1, 2) sg_command_word_view_t
  * Only retained graph metadata is examined; cached word lookups are O(1). */
 static SHELL_NONNULL(1, 2, 3) uint32_t
     sg_expansion_flags_prepare(const shell_dep_graph_t *graph,
-                               const sg_expansion_cache_t *cache,
+                               const shell_expand_cache_t *cache,
                                uint32_t *flags) {
   memset(flags, 0, SHELL_DEP_MAX_NODES * sizeof(*flags));
   uint32_t aggregate = 0;
@@ -1849,7 +1527,7 @@ typedef struct {
 
 typedef struct {
   const shell_dep_cmd_t *command;
-  const sg_expansion_cache_t *cache;
+  const shell_expand_cache_t *cache;
   uint32_t next_token;
   shell_netstring_iter_t records;
   bool expanding;
@@ -1860,7 +1538,7 @@ typedef struct {
  * contribute no arguments; empty records still contribute one argument. */
 static SHELL_NONNULL(1, 2, 3) void sg_argument_iter_init(
     sg_argument_iter_t *iter, const shell_dep_cmd_t *cmd,
-    const sg_expansion_cache_t *cache, uint32_t first) {
+    const shell_expand_cache_t *cache, uint32_t first) {
   *iter =
       (sg_argument_iter_t){.command = cmd, .cache = cache, .next_token = first};
 }
@@ -1900,7 +1578,7 @@ static SHELL_NONNULL(1, 2) bool sg_argument_iter_next(sg_argument_iter_t *iter,
  * the writable result prefix; all outputs are distinct writable storage. */
 static SHELL_NONNULL(1, 2, 3, 4, 5, 6) const
     char *build_cmd_string(const shell_dep_cmd_t *cmd, buf_writer_t *bw,
-                           const sg_expansion_cache_t *cache,
+                           const shell_expand_cache_t *cache,
                            const char **netargv, size_t *netargv_length,
                            sg_error_t *build_error) {
   command_word_t words[SHELL_DEP_MAX_TOKENS];
@@ -2782,7 +2460,6 @@ typedef struct {
   uint32_t group_violations[SHELL_DEP_MAX_NODES];
   uint32_t group_writes[SHELL_DEP_MAX_NODES], group_reads[SHELL_DEP_MAX_NODES];
   uint32_t group_expansions[SHELL_DEP_MAX_NODES];
-  shell_pipeline_time_mode_t group_time[SHELL_DEP_MAX_NODES];
   uint8_t group_substitution[SHELL_DEP_MAX_NODES];
   /* Only the suffix is initialized when violation analysis is enabled. */
   uint32_t sensitive_head[SHELL_DEP_MAX_NODES];
@@ -2828,7 +2505,7 @@ static SHELL_NONNULL(2) bool sg_eval_workspace_size(size_t command_length,
     *required = path_space;
   size_t cache_size;
   size_t alignment = shell_dep_workspace_alignment();
-  if (!sg_expansion_cache_size(command_length, &cache_size) ||
+  if (!shell_expand_cache_size(command_length, &cache_size) ||
       *required > SIZE_MAX - cache_size - alignment)
     return false;
   *required += cache_size + alignment;
@@ -3430,10 +3107,6 @@ static SHELL_NONNULL(1, 2, 3, 4, 5, 6, 7) void sg_group_context_prepare(
       index->group_reads[child] = index->group_reads[parent] + reads[parent];
       index->group_expansions[child] =
           index->group_expansions[parent] | expansions[parent];
-      shell_pipeline_time_mode_t mode =
-          graph->nodes[parent].group.pipeline_time_mode;
-      index->group_time[child] =
-          mode != SHELL_PIPE_TIME_NONE ? mode : index->group_time[parent];
       if (graph->nodes[child].type == SHELL_NODE_GROUP)
         queue[tail++] = child;
     }
@@ -3624,7 +3297,7 @@ static bool sg_base64_short_options_decode(sg_argument_t argument) {
  * Facts remain reusable when a command supplies several graph pipe routes. */
 static SHELL_NONNULL(1, 2, 3, 4) void sg_argument_facts_prepare(
     const shell_dep_graph_t *graph, sg_graph_index_t *index,
-    const sg_violation_config_t *cfg, const sg_expansion_cache_t *cache) {
+    const sg_violation_config_t *cfg, const shell_expand_cache_t *cache) {
   for (uint32_t ni = 0; ni < graph->node_count; ni++) {
     index->argument_facts[ni] = 0;
     index->git_operation[ni] = 0;
@@ -3804,7 +3477,7 @@ static SHELL_NONNULL(
                                uint32_t *node_viols, uint32_t *cmd_write_count,
                                uint32_t *cmd_read_count,
                                uint32_t *cmd_env_count,
-                               const sg_expansion_cache_t *expansions) {
+                               const shell_expand_cache_t *expansions) {
   const sg_violation_config_t *cfg = &gate->viol_config;
   *violation_count = 0;
   *violation_type_flags = 0;
@@ -4318,17 +3991,14 @@ static void sg_mark_group_substitution_consumers(
   }
 }
 
-/* Rejections before per-command evaluation still expose one synthetic result.
- * Preserve the documented sentinel metadata instead of leaving zeroed indices
- * that could be mistaken for a relationship to result zero. */
+/* Rejections before per-command evaluation expose one synthetic policy result.
+ */
 static void sg_init_rejected_subcommand(sg_result_t *out,
                                         const char *reject_reason) {
   out->subcommand_count = 1;
   out->subcommands[0] = (sg_subcommand_result_t){
       .verdict = SG_VERDICT_REJECT,
       .reject_reason = reject_reason,
-      .substitution_consumer_index = -1,
-      .group_parent_index = -1,
   };
 }
 
@@ -4425,12 +4095,13 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
     return SG_ERR_MEMORY;
   }
   bw_init(&bw, buf, output_size);
-  sg_expansion_cache_t expansion_cache;
+  shell_expand_cache_t expansion_cache;
   void *dep_workspace;
   size_t dep_workspace_size;
-  if (!sg_expansion_cache_init(gate, cmd, cmd_len, eval_workspace,
-                               eval_workspace_size, &expansion_cache,
-                               &dep_workspace, &dep_workspace_size)) {
+  if (!shell_expand_cache_init(
+          gate->expand_word_netargv_fn, gate->expand_word_netargv_ctx, cmd,
+          cmd_len, true, eval_workspace, eval_workspace_size, &expansion_cache,
+          &dep_workspace, &dep_workspace_size)) {
     out->verdict = SG_VERDICT_UNDETERMINED;
     out->deny_reason = bw_copy(&bw, "expansion workspace unavailable", 31);
     if (bw.overflow)
@@ -4438,7 +4109,7 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
     return SG_ERR_MEMORY;
   }
   shell_dep_word_resolver_t resolver = {
-      .expand = sg_expand_word,
+      .expand = shell_expand_resolve,
       .context = &expansion_cache,
   };
   shell_dep_limits_t dep_limits = SHELL_DEP_LIMITS_DEFAULT;
@@ -4450,13 +4121,16 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
       cmd, cmd_len, gate->cwd, &dep_limits, &fast, &graph, &resolver,
       expansion_cache.unresolved_paths);
   bool depgraph_truncated = derr == SHELL_DEP_ETRUNC;
-  if (expansion_cache.error != SG_OK) {
+  if (expansion_cache.error != SHELL_DEP_OK) {
+    sg_error_t expansion_error = expansion_cache.error == SHELL_DEP_ETRUNC
+                                     ? SG_ERR_TRUNC
+                                     : SG_ERR_EXPAND;
     out->verdict = SG_VERDICT_UNDETERMINED;
-    out->truncated = expansion_cache.error == SG_ERR_TRUNC;
+    out->truncated = expansion_cache.error == SHELL_DEP_ETRUNC;
     out->deny_reason = bw_copy(&bw, "word expansion failed", 21);
     if (bw.overflow)
       out->truncated = true;
-    return expansion_cache.error;
+    return expansion_error;
   }
   if (derr != SHELL_DEP_OK && !depgraph_truncated) {
     out->verdict = derr == SHELL_DEP_EWORKSPACE ? SG_VERDICT_UNDETERMINED
@@ -4684,12 +4358,6 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
 
     sg_subcommand_result_t *sr = &out->subcommands[out->subcommand_count++];
     node_result_index[ni] = out->subcommand_count - 1;
-    sr->substitution_consumer_index = -1;
-    sr->group_parent_index = -1;
-    sr->group_depth = node->cmd.group_depth;
-    sr->group_kinds = node->cmd.group_kinds;
-    sr->backgrounded = node->cmd.backgrounded;
-    sr->pipeline_time_mode = node->cmd.pipeline_time_mode;
     sr->unresolved_expansion_flags =
         node_expansion_flags[ni] | graph_index->group_expansions[ni];
 
@@ -4726,8 +4394,6 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
     sr->violation_type_flags |= graph_index->group_violations[ni];
     sr->write_count += graph_index->group_writes[ni];
     sr->read_count += graph_index->group_reads[ni];
-    if (sr->pipeline_time_mode == SHELL_PIPE_TIME_NONE)
-      sr->pipeline_time_mode = graph_index->group_time[ni];
     sr->violation_category_flags =
         sg_violation_categories(sr->violation_type_flags);
 
@@ -4894,10 +4560,6 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
    * because any can consume its inherited descriptor. Only a flagged
    * shell-word edge requests another Shellgate inspection or changes an ALLOW
    * verdict to conditional. */
-  /* A producer can feed several routes after descriptor inheritance. Keep
-   * ambiguity sticky across edges rather than letting the last direct edge
-   * overwrite an earlier GROUP or different simple-command consumer. */
-  uint8_t substitution_mapping_state[SHELL_DEP_MAX_NODES] = {0};
   for (uint32_t ei = 0; ei < graph.edge_count; ei++) {
     const shell_dep_edge_t *edge = &graph.edges[ei];
     if (!sg_edge_is_dynamic_substitution_route(&graph, edge))
@@ -4909,7 +4571,6 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
     uint32_t consumer_nodes[SHELL_DEP_MAX_NODES];
     uint32_t consumer_count = sg_dynamic_substitution_route_consumers(
         &graph, graph_index, edge, consumer_nodes);
-    uint32_t consumer = UINT32_MAX;
     for (uint32_t consumer_index = 0; consumer_index < consumer_count;
          consumer_index++) {
       uint32_t consumer_node = consumer_nodes[consumer_index];
@@ -4926,25 +4587,6 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
       if (shell_word &&
           out->subcommands[result_index].verdict == SG_VERDICT_ALLOW)
         out->subcommands[result_index].verdict = SG_VERDICT_ALLOW_CONDITIONAL;
-      if (consumer_count == 1)
-        consumer = result_index;
-    }
-    if (edge->type != SHELL_EDGE_SUBST || consumer_count == 0 ||
-        (edge->flags & SHELL_DEP_EDGE_FLAG_SUBST_DYNAMIC_NAME) != 0)
-      continue;
-
-    uint32_t producer = node_result_index[edge->from];
-    if (producer == UINT32_MAX)
-      continue;
-    sg_subcommand_result_t *source = &out->subcommands[producer];
-    if (consumer == UINT32_MAX ||
-        (substitution_mapping_state[producer] != 0 &&
-         source->substitution_consumer_index != (int32_t)consumer)) {
-      substitution_mapping_state[producer] = 2;
-      source->substitution_consumer_index = -1;
-    } else if (substitution_mapping_state[producer] != 2) {
-      substitution_mapping_state[producer] = 1;
-      source->substitution_consumer_index = (int32_t)consumer;
     }
   }
 
@@ -5135,8 +4777,4 @@ const char *sg_verdict_name(sg_verdict_t v) {
     return "ALLOW_CONDITIONAL";
   }
   return "UNKNOWN";
-}
-
-uint32_t sg_result_violation_dropped(const sg_result_t *result) {
-  return result->violation_dropped_count;
 }

@@ -20,6 +20,7 @@
 #define SHELL_DEPGRAPH_H
 
 #include "shell_contract.h"
+#include "shell_expand.h"
 
 #include <limits.h>
 #include <stdbool.h>
@@ -68,6 +69,8 @@ typedef enum {
    * too small. It is required for compound-group descriptor snapshots and
    * descriptor-route resolution. */
   SHELL_DEP_EWORKSPACE = -4,
+  /* The expansion callback failed or returned malformed canonical bytes. */
+  SHELL_DEP_EEXPAND = -5,
 } shell_dep_error_t;
 
 typedef enum {
@@ -197,7 +200,8 @@ typedef enum {
  * Values from 2 through the buffer maximum are valid. A value of 1 is
  * rejected because even the NUL-terminated root path cannot fit; 0 selects
  * the default. `workspace` is caller-owned scratch storage used only while
- * parsing and resolving descriptor routes; it is never retained by the graph.
+ * parsing and resolving descriptor routes; it is never retained by the graph
+ * and need not be initialized or cleared by the caller between parses.
  * This includes temporary state for reconstructing inherited descriptor
  * routes at compound-group expansion points. Obtain the required maximum
  * size and alignment with shell_dep_workspace_size() and
@@ -791,6 +795,39 @@ shell_dep_error_t
 shell_dep_graph_parse(const char *cmd, size_t cmd_len, const char *initial_cwd,
                       const shell_dep_limits_t *limits, shell_dep_graph_t *out)
     SHELL_NONNULL(1, 5);
+
+/* Size the caller workspace for graph construction with word resolution.
+ * Uses shell_dep_workspace_alignment(). NULL limits selects defaults. Returns
+ * false and clears size on arithmetic overflow; no source bytes are inspected.
+ * The extra reservation is bounded metadata and a source-offset index, not
+ * copies of source or expansion payloads. */
+bool shell_dep_resolved_workspace_size(size_t command_length,
+                                       const shell_dep_limits_t *limits,
+                                       size_t *workspace_size) SHELL_NONNULL(3);
+
+/* Construct a graph using application-supplied canonical whole-word values.
+ * The ordinary graph source/CWD/limits/output contracts apply. Workspace must
+ * meet shell_dep_resolved_workspace_size(), including with a NULL callback
+ * (which leaves dynamic words unresolved). context is optional application
+ * state. Each eligible dynamic source word is queried at most once, in analysis
+ * order, not runtime scheduling order. Source syntax is validated before any
+ * callback; callback effects themselves cannot be rolled back.
+ *
+ * Callback payloads are borrowed by resolved FILE documents: keep them alive
+ * and immutable for the graph lifetime, not just until this function returns.
+ * No expansion is executed or reparsed as shell source. SUBST inspection
+ * obligations are retained. Malformed/failed values return SHELL_DEP_EEXPAND
+ * with an empty error graph. Truncation retains normal partial-graph handling.
+ *
+ * Optional unresolved_paths references SHELL_DEP_MAX_NODES writable bytes,
+ * distinct from inputs, output and workspace. It receives one flag per retained
+ * node for unresolved active pathname expansion, including removed byte-flow
+ * edges. Unused bytes and all flags on errors are zero. */
+shell_dep_error_t shell_dep_graph_parse_resolved(
+    const char *cmd, size_t cmd_len, const char *initial_cwd,
+    const shell_dep_limits_t *limits, shell_dep_graph_t *out,
+    shell_expand_word_netargv_fn expand, void *context,
+    uint8_t *unresolved_paths) SHELL_NONNULL(1, 5);
 
 const char *shell_dep_edge_type_name(shell_dep_edge_type_t type);
 const char *shell_dep_node_type_name(shell_dep_node_type_t type);

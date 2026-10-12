@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(Shellclave VERSION 0.12.0 LANGUAGES C CXX)
+project(Shellclave VERSION 0.13.0 LANGUAGES C CXX)
 
 if(PROJECT_IS_TOP_LEVEL)
   set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -31,6 +31,10 @@ if(SHELLCLAVE_ENABLE_SANITIZERS AND SHELLCLAVE_ENABLE_TSAN)
   message(FATAL_ERROR "ASan/UBSan and TSan cannot be enabled together")
 endif()
 
+if(BUILD_TESTING OR SHELLCLAVE_BUILD_FUZZERS)
+  find_package(Python3 3.8 REQUIRED COMPONENTS Interpreter)
+endif()
+
 find_package(Threads REQUIRED)
 
 set(SHELLCLAVE_PUBLIC_HEADERS
@@ -39,6 +43,7 @@ set(SHELLCLAVE_PUBLIC_HEADERS
   shellsplit/include/relative_permutation_entropy.h
   shellsplit/include/shell_abstract.h
   shellsplit/include/shell_depgraph.h
+  shellsplit/include/shell_expand.h
   shellsplit/include/shell_interop.h
   shellsplit/include/shell_netstring.h
   shellsplit/include/shell_processor.h
@@ -49,6 +54,12 @@ set(SHELLCLAVE_PUBLIC_HEADERS
   shelltype/include/shelltype.h
   shellgate/include/sg_anomaly.h
   shellgate/include/shellgate.h)
+
+function(shellclave_fatal_ubsan target)
+  # A diagnostic must fail verification, including direct executable runs.
+  # Compile non-recovering checks rather than relying on UBSAN_OPTIONS.
+  target_compile_options(${target} PRIVATE -fno-sanitize-recover=undefined)
+endfunction()
 
 function(shellclave_project_target target)
   target_compile_features(${target} PUBLIC c_std_11)
@@ -80,6 +91,9 @@ function(shellclave_project_target target)
     target_compile_options(${target} PRIVATE -fsanitize=fuzzer-no-link,address,undefined -fno-omit-frame-pointer)
     target_link_options(${target} PRIVATE -fsanitize=address,undefined)
   endif()
+  if(SHELLCLAVE_ENABLE_SANITIZERS OR SHELLCLAVE_BUILD_FUZZERS)
+    shellclave_fatal_ubsan(${target})
+  endif()
 endfunction()
 
 set(SHELLSPLIT_SOURCES
@@ -87,6 +101,7 @@ set(SHELLSPLIT_SOURCES
   shellsplit/src/relative_permutation_entropy.c
   shellsplit/src/shell_abstract.c
   shellsplit/src/shell_depgraph.c
+  shellsplit/src/shell_expand.c
   shellsplit/src/shell_interop.c
   shellsplit/src/shell_netstring.c
   shellsplit/src/shell_processor.c
@@ -103,7 +118,6 @@ target_link_libraries(shellsplit PRIVATE m)
 set_target_properties(shellsplit PROPERTIES EXPORT_NAME shellsplit)
 
 if(BUILD_TESTING)
-  find_package(Python3 REQUIRED COMPONENTS Interpreter)
   add_library(shellsplit_test ${SHELLSPLIT_SOURCES}
     shellsplit/tests/test_allocator.c shellsplit/tests/test_source_scans.c)
   shellclave_project_target(shellsplit_test)
@@ -212,9 +226,48 @@ function(shellclave_add_test name source library)
   add_test(NAME ${name} COMMAND ${name})
 endfunction()
 
+function(shellclave_add_concurrency_test name source library)
+  shellclave_add_test(${name} ${source} ${library})
+  set_property(TEST ${name} APPEND PROPERTY LABELS concurrency)
+  add_dependencies(shellclave_concurrency_tests ${name})
+endfunction()
+
 if(BUILD_TESTING)
+  # One registration controls both the race-detector build and test selection.
+  add_custom_target(shellclave_concurrency_tests)
   file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests")
   file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests/headers")
+  shellclave_add_test(shellsplit_abstract_cli_test
+    shellsplit/tests/test_abstract_cli.c shellsplit)
+  set_tests_properties(shellsplit_abstract_cli_test PROPERTIES
+    LABELS "shellsplit;tools")
+  set(supervisor_test_arguments
+    "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_fuzz_supervisor.py"
+    --binary-dir "${CMAKE_CURRENT_BINARY_DIR}/tests/fuzz-supervisor")
+  if(SHELLCLAVE_BUILD_FUZZERS)
+    list(APPEND supervisor_test_arguments
+      --probe $<TARGET_FILE:shellclave_fuzz_startup_probe>)
+  endif()
+  add_test(NAME shellclave_fuzz_supervisor_test
+    COMMAND "${Python3_EXECUTABLE}" ${supervisor_test_arguments})
+  set_tests_properties(shellclave_fuzz_supervisor_test PROPERTIES
+    LABELS "fuzz;supervisor" TIMEOUT 30)
+  if(SHELLCLAVE_ENABLE_SANITIZERS OR SHELLCLAVE_BUILD_FUZZERS)
+    foreach(language IN ITEMS c cpp)
+      set(probe "shellclave_ubsan_${language}_probe")
+      add_executable(${probe} tests/sanitizer_failure_probe.${language})
+      shellclave_project_target(${probe})
+      if(language STREQUAL "cpp")
+        target_compile_features(${probe} PRIVATE cxx_std_11)
+      endif()
+      add_test(NAME shellclave_ubsan_${language}_fatal
+        COMMAND ${CMAKE_COMMAND}
+          -DSHELLCLAVE_UBSAN_PROBE=$<TARGET_FILE:${probe}>
+          -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/test_ubsan_fatal.cmake)
+      set_tests_properties(shellclave_ubsan_${language}_fatal PROPERTIES
+        LABELS sanitizer TIMEOUT 30)
+    endforeach()
+  endif()
   find_program(SHELLCLAVE_BASH_EXECUTABLE NAMES bash)
   if(SHELLCLAVE_BASH_EXECUTABLE)
     add_test(NAME shellsplit_bash_ansi_nul_semantics
@@ -300,7 +353,13 @@ if(BUILD_TESTING)
   shellclave_add_test(shelltype_arena_test shelltype/tests/test_arena.c shelltype_test)
   target_include_directories(shelltype_arena_test PRIVATE shelltype/src shelltype/tests)
   shellclave_add_test(shelltype_policy_test shelltype/tests/test_policy.c shelltype_test)
-  shellclave_add_test(shelltype_policy_concurrency_test shelltype/tests/test_policy_concurrency.c shelltype_test)
+  # Always compile and exercise the real benchmark caller, even when optional
+  # throughput executables are disabled. The test uses bounded iterations.
+  shellclave_add_test(shelltype_policy_benchmark_test
+    shelltype/tests/test_policy_benchmark.c shelltype_test)
+  target_include_directories(shelltype_policy_benchmark_test PRIVATE shelltype/tests)
+  set_tests_properties(shelltype_policy_benchmark_test PROPERTIES LABELS "shelltype;benchmark")
+  shellclave_add_concurrency_test(shelltype_policy_concurrency_test shelltype/tests/test_policy_concurrency.c shelltype_test)
   shellclave_add_test(shelltype_verify_test shelltype/tests/test_verify.c shelltype_test)
   shellclave_add_test(shelltype_integration_test shelltype/tests/test_shelltype_integration.c shelltype_test)
   foreach(variant IN ITEMS test production)
@@ -388,6 +447,13 @@ if(BUILD_TESTING)
   set_tests_properties(shellsplit_corpus_test shellsplit_corpus_production_test
     PROPERTIES LABELS shellsplit)
   shellclave_add_test(shellgate_corpus_test shellgate/tests/test_corpus.c shellgate_test)
+  # Shared-policy concurrency uses shipping libraries, not global fault-injection
+  # counters. Each thread owns a separate gate and evaluation workspace.
+  shellclave_add_concurrency_test(shellgate_policy_sharing_test
+    shellgate/tests/test_policy_sharing.c shellgate)
+  shellclave_add_test(shellsplit_expand_test
+    shellsplit/tests/expand_test.c shellsplit_test)
+  set_property(TEST shellgate_policy_sharing_test APPEND PROPERTY LABELS shellgate production)
   target_include_directories(shellgate_corpus_test PRIVATE
     "${CMAKE_CURRENT_BINARY_DIR}/tests")
   shellclave_add_test(shellgate_corpus_production_test shellgate/tests/test_corpus.c shellgate)
@@ -643,7 +709,26 @@ if(SHELLCLAVE_BUILD_FUZZERS)
   target_link_libraries(fuzz_shelltype PRIVATE shelltype)
   foreach(fuzzer IN ITEMS fuzz_shellgate fuzz_shellsplit fuzz_shelltype)
     target_compile_options(${fuzzer} PRIVATE -Wall -Wextra -Wpedantic)
+    shellclave_fatal_ubsan(${fuzzer})
   endforeach()
+
+  if(BUILD_TESTING)
+    add_executable(shellclave_fuzz_startup_probe tests/fuzz_startup_probe.cpp)
+    shellclave_project_target(shellclave_fuzz_startup_probe)
+    target_link_options(shellclave_fuzz_startup_probe PRIVATE
+      -fsanitize=fuzzer,address,undefined)
+    # Startup sweeps have a separate whole-process deadline: they must not
+    # consume an individual fuzz input's ten-second timeout budget.
+    foreach(component IN ITEMS shellsplit shellgate)
+      add_test(NAME ${component}_fuzz_startup_test
+        COMMAND "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/scripts/run_fuzz_smoke.py" startup
+          $<TARGET_FILE:fuzz_${component}>
+          "${CMAKE_CURRENT_BINARY_DIR}/fuzz-startup-${component}_")
+      set_tests_properties(${component}_fuzz_startup_test PROPERTIES
+        LABELS "fuzz;startup" TIMEOUT 70)
+    endforeach()
+  endif()
 
   set(SHELLCLAVE_FUZZ_RUNS "1000" CACHE STRING
       "Number of libFuzzer smoke-test runs")
@@ -652,7 +737,8 @@ if(SHELLCLAVE_BUILD_FUZZERS)
   # Smoke tests use only the bounded seed sets below. Generated successful
   # inputs are kept in a disposable per-run corpus by the wrapper.
   add_custom_target(fuzz-shellsplit-smoke
-    COMMAND /bin/bash ${CMAKE_CURRENT_SOURCE_DIR}/scripts/run_fuzz_smoke.sh
+    COMMAND "${Python3_EXECUTABLE}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/scripts/run_fuzz_smoke.py" smoke
       $<TARGET_FILE:fuzz_shellsplit>
       ${SHELLCLAVE_SHELLSPLIT_SMOKE_STAGE_DIR}
       ${CMAKE_CURRENT_BINARY_DIR}/fuzz-smoke-corpus/shellsplit
@@ -660,9 +746,11 @@ if(SHELLCLAVE_BUILD_FUZZERS)
       ${SHELLCLAVE_FUZZ_MAX_LEN}
       ${CMAKE_CURRENT_BINARY_DIR}/fuzz-artifacts/smoke/shellsplit_
     DEPENDS fuzz_shellsplit stage-shellsplit-smoke-seeds
+    VERBATIM
     COMMENT "Running the unified Shellsplit fuzzer")
   add_custom_target(fuzz-shellgate-smoke
-    COMMAND /bin/bash ${CMAKE_CURRENT_SOURCE_DIR}/scripts/run_fuzz_smoke.sh
+    COMMAND "${Python3_EXECUTABLE}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/scripts/run_fuzz_smoke.py" smoke
       $<TARGET_FILE:fuzz_shellgate>
       ${SHELLCLAVE_SHELLGATE_SMOKE_STAGE_DIR}
       ${CMAKE_CURRENT_BINARY_DIR}/fuzz-smoke-corpus/shellgate
@@ -670,9 +758,11 @@ if(SHELLCLAVE_BUILD_FUZZERS)
       ${SHELLCLAVE_FUZZ_MAX_LEN}
       ${CMAKE_CURRENT_BINARY_DIR}/fuzz-artifacts/smoke/shellgate_
     DEPENDS fuzz_shellgate stage-shellgate-smoke-seeds
+    VERBATIM
     COMMENT "Running the Shellgate fuzzer")
   add_custom_target(fuzz-shelltype-smoke
-    COMMAND /bin/bash ${CMAKE_CURRENT_SOURCE_DIR}/scripts/run_fuzz_smoke.sh
+    COMMAND "${Python3_EXECUTABLE}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/scripts/run_fuzz_smoke.py" smoke
       $<TARGET_FILE:fuzz_shelltype>
       ${SHELLCLAVE_SHELLTYPE_SMOKE_STAGE_DIR}
       ${CMAKE_CURRENT_BINARY_DIR}/fuzz-smoke-corpus/shelltype
@@ -680,6 +770,7 @@ if(SHELLCLAVE_BUILD_FUZZERS)
       ${SHELLCLAVE_FUZZ_MAX_LEN}
       ${CMAKE_CURRENT_BINARY_DIR}/fuzz-artifacts/smoke/shelltype_
     DEPENDS fuzz_shelltype stage-shelltype-smoke-seeds
+    VERBATIM
     COMMENT "Running the Shelltype fuzzer")
   add_custom_target(fuzz-smoke
     DEPENDS fuzz-shellsplit-smoke fuzz-shellgate-smoke fuzz-shelltype-smoke
@@ -726,24 +817,42 @@ if(PROJECT_IS_TOP_LEVEL)
 
   find_program(SHELLCLAVE_SCAN_BUILD
     NAMES scan-build scan-build-21 scan-build-20 scan-build-19 scan-build-18)
-  if(SHELLCLAVE_SCAN_BUILD)
+  find_program(SHELLCLAVE_CLANG NAMES clang clang-21 clang-20 clang-19 clang-18)
+  find_program(SHELLCLAVE_CLANGXX
+    NAMES clang++ clang++-21 clang++-20 clang++-19 clang++-18)
+  if(SHELLCLAVE_SCAN_BUILD AND SHELLCLAVE_CLANG AND SHELLCLAVE_CLANGXX)
+    set(analyzer_contract_arguments
+      "-DSHELLCLAVE_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
+      "-DSHELLCLAVE_SCAN_BUILD=${SHELLCLAVE_SCAN_BUILD}"
+      "-DSHELLCLAVE_CLANG=${SHELLCLAVE_CLANG}"
+      "-DSHELLCLAVE_CLANGXX=${SHELLCLAVE_CLANGXX}"
+      "-DSHELLCLAVE_ANALYZE_GENERATOR=${CMAKE_GENERATOR}"
+      "-DSHELLCLAVE_ANALYZE_TEST_BINARY=${CMAKE_CURRENT_BINARY_DIR}/clang-analyze-contract")
+    if(BUILD_TESTING)
+      add_test(NAME shellclave_clang_analyzer_contract
+        COMMAND ${CMAKE_COMMAND} ${analyzer_contract_arguments}
+          -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/test_clang_analyze.cmake)
+      set_tests_properties(shellclave_clang_analyzer_contract PROPERTIES
+        LABELS "cmake;analysis" TIMEOUT 120)
+    endif()
     add_custom_target(clang-analyze
+      COMMAND ${CMAKE_COMMAND} ${analyzer_contract_arguments}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/test_clang_analyze.cmake
       COMMAND ${CMAKE_COMMAND}
-        -S ${CMAKE_CURRENT_SOURCE_DIR}
-        -B ${CMAKE_CURRENT_BINARY_DIR}/clang-analyze
-        -G ${CMAKE_GENERATOR}
-        -DCMAKE_BUILD_TYPE=Debug
-        -DCMAKE_C_COMPILER=clang
-        -DCMAKE_CXX_COMPILER=clang++
-      COMMAND ${SHELLCLAVE_SCAN_BUILD} --status-bugs
-        ${CMAKE_COMMAND} --build ${CMAKE_CURRENT_BINARY_DIR}/clang-analyze
-        --clean-first --parallel 2
+        "-DSHELLCLAVE_SCAN_BUILD=${SHELLCLAVE_SCAN_BUILD}"
+        "-DSHELLCLAVE_CLANG=${SHELLCLAVE_CLANG}"
+        "-DSHELLCLAVE_CLANGXX=${SHELLCLAVE_CLANGXX}"
+        "-DSHELLCLAVE_ANALYZE_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}"
+        "-DSHELLCLAVE_ANALYZE_BINARY=${CMAKE_CURRENT_BINARY_DIR}/clang-analyze"
+        "-DSHELLCLAVE_ANALYZE_GENERATOR=${CMAKE_GENERATOR}"
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/RunClangAnalyze.cmake
+      VERBATIM
       USES_TERMINAL
       COMMENT "Running Clang Static Analyzer")
   else()
     add_custom_target(clang-analyze
       COMMAND ${CMAKE_COMMAND} -E echo
-        "scan-build was not found; install the Clang Static Analyzer tools"
+        "scan-build and Clang C/C++ compilers are required for analysis"
       COMMAND ${CMAKE_COMMAND} -E false
       COMMENT "Clang Static Analyzer is unavailable")
   endif()

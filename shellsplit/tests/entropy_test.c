@@ -134,7 +134,6 @@ static int test_posterior_regression_matrix(void) {
     double tolerance = fmax(1e-6, cases[i].expected * 0.01);
     ASSERT(near(score, cases[i].expected, tolerance));
     ASSERT(score >= 0.0 && score <= 1.0);
-    ASSERT(score == shell_env_screener_combined_score(cases[i].value));
   }
 
   const char *value = "someRandomValue1234567890abcdef";
@@ -213,7 +212,6 @@ static int test_detector_matrices(void) {
   ASSERT(whitelist && strstr(whitelist, "DISPLAY") &&
          strstr(whitelist, "PATH"));
   ASSERT(shell_env_screener_get_whitelist_doc() == whitelist);
-  ASSERT(shell_env_screener_recommended_capacity() > 0);
   return 1;
 }
 

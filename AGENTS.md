@@ -1,5 +1,24 @@
 # Repository engineering rules
 
+## Component-oriented interfaces
+
+Applications use Shellsplit, Shelltype, and the anomaly API directly for the
+operations those components own. Components must not shadow each other with
+pass-through APIs, duplicate semantic types, or wrapper layers intended to hide
+another component. Shared interface definitions belong to the component that
+owns their semantics. Higher-order orchestration with genuinely distinct
+behavior is appropriate: combined policy evaluation, coordinated model
+learning, calibration, and transactional paired persistence are examples.
+
+Document ownership and borrowing explicitly. Installed policies are logically
+immutable: build updates through Shelltype on an uninstalled replacement, then
+install that replacement. Evaluation may warm synchronized caches and update
+statistics, but must not change rules. Several gates may borrow the same stable
+policy. Its owner must keep it alive until all borrowing gates detach and all
+readers and borrowed views finish. Replacement and destruction require caller
+synchronization; do not add hidden reference counting or repeated ownership
+checks to enforce these documented requirements.
+
 ## Caller preconditions, not defensive callee checks
 
 The caller is responsible for satisfying a function's documented preconditions.

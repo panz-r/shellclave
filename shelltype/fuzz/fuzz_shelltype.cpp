@@ -169,19 +169,12 @@ static void check_policy_command_grammar_references() {
         require(st_netpattern_apply_type_at_owned(
                     pattern_view(pattern), position, (st_token_type_t)type,
                     &edited) == expected);
-        char *string_edit = nullptr;
-        require(st_netpattern_apply_type_at(pattern.c_str(), position,
-                                            (st_token_type_t)type,
-                                            &string_edit) == expected);
         if (expected == ST_OK) {
           require(st_netpattern_validate_view({edited.data, edited.length},
                                               nullptr) == ST_OK);
-          require(string_edit && strlen(string_edit) == edited.length &&
-                  memcmp(string_edit, edited.data, edited.length) == 0);
         } else {
-          require(!edited.data && edited.length == 0 && !string_edit);
+          require(!edited.data && edited.length == 0);
         }
-        free(string_edit);
         st_netpattern_free(&edited);
       }
     }
@@ -201,13 +194,6 @@ static void check_policy_command_grammar_references() {
                     omit_conflict ? nullptr : &conflict) == reference.expected);
         require(!covered &&
                 (omit_conflict || (!conflict.data && conflict.length == 0)));
-        covered = true;
-        const char *conflict_string = pattern.c_str();
-        require(st_policy_simulate_add_netpattern(
-                    policy, pattern.c_str(), &covered,
-                    omit_conflict ? nullptr : &conflict_string) ==
-                reference.expected);
-        require(!covered && (omit_conflict || !conflict_string));
         require(st_policy_rule_count(policy) == before);
       }
       require(st_policy_add_netpattern_view(policy, pattern_view(pattern)) ==
@@ -508,13 +494,28 @@ static void check_learner_variant_references() {
   };
   st_learner_t *learner = st_learner_new(nullptr);
   require(learner != nullptr);
-  require(st_learner_feed_netargv(learner, "4:tool,9:pre42post,6:/tmp/x,") ==
+  require(st_learner_feed_netargv_view(
+              learner,
+              st_netargv_view_t{"4:tool,9:pre42post,6:/tmp/x,",
+                                sizeof("4:tool,9:pre42post,6:/tmp/x,") - 1}) ==
           ST_OK);
-  require(st_learner_feed_netargv(learner, "4:tool,6:/tmp/a,2:42,") == ST_OK);
-  require(st_learner_feed_netargv(learner, "4:tool,5:1.2.3,2:42,") == ST_OK);
-  require(st_learner_feed_netargv(learner, "4:tool,5:2.7.1,2:42,") == ST_OK);
-  require(st_learner_feed_netargv(
-              learner, "4:tool,20:2026-10-05t12:34:56Z,2:42,") == ST_OK);
+  require(st_learner_feed_netargv_view(
+              learner,
+              st_netargv_view_t{"4:tool,6:/tmp/a,2:42,",
+                                sizeof("4:tool,6:/tmp/a,2:42,") - 1}) == ST_OK);
+  require(st_learner_feed_netargv_view(
+              learner, st_netargv_view_t{"4:tool,5:1.2.3,2:42,",
+                                         sizeof("4:tool,5:1.2.3,2:42,") - 1}) ==
+          ST_OK);
+  require(st_learner_feed_netargv_view(
+              learner, st_netargv_view_t{"4:tool,5:2.7.1,2:42,",
+                                         sizeof("4:tool,5:2.7.1,2:42,") - 1}) ==
+          ST_OK);
+  require(st_learner_feed_netargv_view(
+              learner,
+              st_netargv_view_t{"4:tool,20:2026-10-05t12:34:56Z,2:42,",
+                                sizeof("4:tool,20:2026-10-05t12:34:56Z,2:42,") -
+                                    1}) == ST_OK);
   static const char binary[] = "4:tool,11:pre\0"
                                "42\0post,6:/tmp/x,";
   require(st_learner_feed_netargv_view(learner, {binary, sizeof(binary) - 1}) ==
@@ -534,8 +535,8 @@ static void check_learner_variant_references() {
     require(count == reference.count);
     for (size_t i = 0; i < count; i++)
       require(choices[i].type == reference.types[i] &&
-              choices[i].sample_value == nullptr &&
-              choices[i].sample_value_length == 0);
+              strcmp(choices[i].type_symbol,
+                     st_type_symbol[reference.types[i]]) == 0);
     st_token_array_free(&decoded);
     st_netpattern_free(&encoded);
   }
@@ -548,7 +549,8 @@ static void check_timestamp_suggestion_reference() {
   require(learner != nullptr);
   std::vector<std::string> history;
   for (size_t i = 0; i < ST_DEFAULT_MIN_SUPPORT; i++) {
-    require(st_learner_feed_netargv(learner, input) == ST_OK);
+    require(st_learner_feed_netargv_view(
+                learner, st_netargv_view_t{input, strlen(input)}) == ST_OK);
     history.emplace_back(input);
   }
   size_t count = 0;
@@ -586,7 +588,9 @@ static void check_overlapping_suggestion_reference() {
     std::vector<std::string> history;
     for (size_t i = 0; i < 3; i++)
       for (unsigned j = 0; j < reference.weights[i]; j++) {
-        require(st_learner_feed_netargv(learner, reference.records[i]) ==
+        require(st_learner_feed_netargv_view(
+                    learner, st_netargv_view_t{reference.records[i],
+                                               strlen(reference.records[i])}) ==
                 ST_OK);
         history.emplace_back(reference.records[i]);
       }
@@ -758,10 +762,8 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
       std::string netargv = fields_netargv(text, operation == 6);
       switch (operation) {
       case 0:
-        /* Keep exercising the documented legacy C-string classifier here;
-         * operation 1 checks binary-safe canonical classification/visitation.
-         */
-        (void)st_token_classify(text.c_str());
+        /* Exercise the complete byte span, including embedded NULs. */
+        (void)st_token_classify(text.data(), text.size());
         break;
       case 1: {
         st_token_array_t tokens = {};
@@ -1089,15 +1091,31 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
       st_eval_result_t result = {};
       std::string probe_pattern = canonical_pattern("fuzz probe");
       require(!probe_pattern.empty());
-      require(st_policy_eval(roundtrip, "4:fuzz,5:probe,", &result) == ST_OK);
+      require(
+          st_policy_eval_view(roundtrip,
+                              st_netargv_view_t{"4:fuzz,5:probe,",
+                                                sizeof("4:fuzz,5:probe,") - 1},
+                              &result) == ST_OK);
       require(!result.matches);
-      require(st_policy_add_netpattern(roundtrip, probe_pattern.c_str()) ==
+      require(st_policy_add_netpattern_view(
+                  roundtrip, st_netpattern_view_t{probe_pattern.data(),
+                                                  probe_pattern.size()}) ==
               ST_OK);
-      require(st_policy_eval(roundtrip, "4:fuzz,5:probe,", &result) == ST_OK);
+      require(
+          st_policy_eval_view(roundtrip,
+                              st_netargv_view_t{"4:fuzz,5:probe,",
+                                                sizeof("4:fuzz,5:probe,") - 1},
+                              &result) == ST_OK);
       require(result.matches);
-      require(st_policy_remove_netpattern(roundtrip, probe_pattern.c_str()) ==
+      require(st_policy_remove_netpattern_view(
+                  roundtrip, st_netpattern_view_t{probe_pattern.data(),
+                                                  probe_pattern.size()}) ==
               ST_OK);
-      require(st_policy_eval(roundtrip, "4:fuzz,5:probe,", &result) == ST_OK);
+      require(
+          st_policy_eval_view(roundtrip,
+                              st_netargv_view_t{"4:fuzz,5:probe,",
+                                                sizeof("4:fuzz,5:probe,") - 1},
+                              &result) == ST_OK);
       require(!result.matches);
     }
     st_policy_free(roundtrip);
@@ -1108,15 +1126,19 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
       st_policy_t *scratch_policy = st_policy_new(scratch);
       std::string scratch_pattern = canonical_pattern("fuzz interned");
       require(scratch_policy != nullptr && !scratch_pattern.empty());
-      require(st_policy_add_netpattern(scratch_policy,
-                                       scratch_pattern.c_str()) == ST_OK);
+      require(st_policy_add_netpattern_view(
+                  scratch_policy,
+                  st_netpattern_view_t{scratch_pattern.data(),
+                                       scratch_pattern.size()}) == ST_OK);
       st_policy_free(scratch_policy);
       require(st_policy_ctx_reset(scratch) == ST_OK);
       scratch_policy = st_policy_new(scratch);
       scratch_pattern = canonical_pattern("after reset");
       require(scratch_policy != nullptr && !scratch_pattern.empty());
-      require(st_policy_add_netpattern(scratch_policy,
-                                       scratch_pattern.c_str()) == ST_OK);
+      require(st_policy_add_netpattern_view(
+                  scratch_policy,
+                  st_netpattern_view_t{scratch_pattern.data(),
+                                       scratch_pattern.size()}) == ST_OK);
       st_policy_free(scratch_policy);
       require(st_policy_ctx_reset(scratch) == ST_OK);
     }

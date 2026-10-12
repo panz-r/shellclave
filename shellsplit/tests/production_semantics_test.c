@@ -51,6 +51,7 @@ static bool capture_decoded_byte(unsigned char byte, size_t offset,
       fprintf(stderr, "%s:%d: check failed: %s\n", __FILE__, __LINE__,         \
               #condition);                                                     \
       failures++;                                                              \
+      exit(EXIT_FAILURE);                                                      \
     }                                                                          \
   } while (0)
 
@@ -653,7 +654,7 @@ static void test_abstraction_shapes(void) {
   shell_abstract_command_t *multiple_fragments =
       parse_abstract("printf /a/$X/b/$Y");
   CHECK(multiple_fragments && multiple_fragments->element_count == 4 &&
-        strcmp(shell_abstract_command_get_display_text(multiple_fragments),
+        strcmp(multiple_fragments->display_text,
                "printf $AP_1$EV_1$AP_2$EV_2") == 0 &&
         multiple_fragments->elements[0]->type == SHELL_ABSTRACT_AP &&
         multiple_fragments->elements[1]->type == SHELL_ABSTRACT_EV &&
@@ -684,8 +685,7 @@ static void test_abstraction_shapes(void) {
     shell_abstract_command_t *quoted =
         parse_abstract(quoted_compounds[i].source);
     CHECK(quoted && quoted->element_count == quoted_compounds[i].elements &&
-          strcmp(shell_abstract_command_get_display_text(quoted),
-                 quoted_compounds[i].display) == 0);
+          strcmp(quoted->display_text, quoted_compounds[i].display) == 0);
     if (quoted)
       for (size_t j = 0; j < quoted->element_count; j++) {
         const shell_abstract_element_t *element = quoted->elements[j];
@@ -894,47 +894,49 @@ static void test_canonical_sequences(void) {
   static const char input[] =
       "printf \"$HOME\" $1 $? /absolute ./relative ~/home *.c "
       "$(printf nested) $((1 + 2)) --option; { printf child; }";
-  char *type_netseq = NULL;
-  char *command_netseq = NULL;
-  char *anomaly_type_netseq = NULL;
+  shell_netstring_buffer_t type_netseq = {0};
+  shell_netstring_buffer_t command_netseq = {0};
+  shell_netstring_buffer_t anomaly_type_netseq = {0};
   size_t count = 0;
   size_t type_count = 0;
   size_t record_count = 0;
-  CHECK(shell_build_type_netseq(input, strlen(input), NULL, &type_netseq,
-                                &type_count) == SHELL_PROCESS_OK);
+  CHECK(shell_build_type_netseq_buffer(input, strlen(input), NULL, &type_netseq,
+                                       &type_count) == SHELL_PROCESS_OK);
   /* The command substitution is an execution stage in addition to the
    * enclosing command and the brace-group child. */
-  CHECK(type_netseq && type_count == 3 &&
-        shell_netstring_validate(type_netseq, strlen(type_netseq),
+  CHECK(type_netseq.data && type_count == 3 &&
+        shell_netstring_validate(type_netseq.data, type_netseq.length,
                                  &record_count) == SHELL_NETSTRING_OK &&
         record_count == type_count);
-  CHECK(shell_build_anomaly_netseqs(input, strlen(input), NULL, &command_netseq,
-                                    &anomaly_type_netseq,
-                                    &count) == SHELL_PROCESS_OK);
-  CHECK(command_netseq && anomaly_type_netseq && count == type_count &&
-        shell_netstring_validate(command_netseq, strlen(command_netseq),
+  CHECK(shell_build_anomaly_netseqs_buffer(
+            input, strlen(input), NULL, &command_netseq, &anomaly_type_netseq,
+            &count) == SHELL_PROCESS_OK);
+  CHECK(command_netseq.data && anomaly_type_netseq.data &&
+        count == type_count &&
+        shell_netstring_validate(command_netseq.data, command_netseq.length,
                                  NULL) == SHELL_NETSTRING_OK &&
-        shell_netstring_validate(anomaly_type_netseq,
-                                 strlen(anomaly_type_netseq),
+        shell_netstring_validate(anomaly_type_netseq.data,
+                                 anomaly_type_netseq.length,
                                  NULL) == SHELL_NETSTRING_OK);
-  free(type_netseq);
-  free(command_netseq);
-  free(anomaly_type_netseq);
+  shell_netstring_buffer_free(&type_netseq);
+  shell_netstring_buffer_free(&command_netseq);
+  shell_netstring_buffer_free(&anomaly_type_netseq);
 
   const shell_process_limits_t tiny = {1, SIZE_MAX, 0};
-  type_netseq = NULL;
+  type_netseq = (shell_netstring_buffer_t){0};
   count = 0;
-  CHECK(shell_build_type_netseq("echo value", strlen("echo value"), &tiny,
-                                &type_netseq,
-                                &count) == SHELL_PROCESS_EOUTPUT_LIMIT);
-  CHECK(type_netseq == NULL && count == 0);
-  command_netseq = NULL;
-  anomaly_type_netseq = NULL;
-  CHECK(shell_build_anomaly_netseqs("while true; do :; done",
-                                    strlen("while true; do :; done"), NULL,
-                                    &command_netseq, &anomaly_type_netseq,
-                                    &count) == SHELL_PROCESS_EPARSE);
-  CHECK(command_netseq == NULL && anomaly_type_netseq == NULL && count == 0);
+  CHECK(shell_build_type_netseq_buffer("echo value", strlen("echo value"),
+                                       &tiny, &type_netseq,
+                                       &count) == SHELL_PROCESS_EOUTPUT_LIMIT);
+  CHECK(type_netseq.data == NULL && count == 0);
+  command_netseq = (shell_netstring_buffer_t){0};
+  anomaly_type_netseq = (shell_netstring_buffer_t){0};
+  CHECK(shell_build_anomaly_netseqs_buffer(
+            "while true; do :; done", strlen("while true; do :; done"), NULL,
+            &command_netseq, &anomaly_type_netseq,
+            &count) == SHELL_PROCESS_EPARSE);
+  CHECK(command_netseq.data == NULL && anomaly_type_netseq.data == NULL &&
+        count == 0);
 }
 
 static void test_netstring_error_boundaries(void) {
@@ -1292,7 +1294,7 @@ static void test_substitution_metadata_agreement(void) {
     size_t info_count = 0;
     shell_command_t *commands = NULL;
     size_t command_count = 0;
-    char *sequence = NULL;
+    shell_netstring_buffer_t sequence = {0};
     size_t sequence_count = 0;
     bool features = !cases[i].executable;
     shell_abstract_command_t *abstract = NULL;
@@ -1309,9 +1311,9 @@ static void test_substitution_metadata_agreement(void) {
           command_count == 1 && commands != NULL &&
           shell_processed_command_has_dangerous_features(&commands[0], false) ==
               cases[i].executable);
-    CHECK(shell_build_netargv_sequence(input, length, NULL, &sequence,
-                                       &sequence_count,
-                                       &features) == SHELL_PROCESS_OK &&
+    CHECK(shell_build_netargv_sequence_buffer(input, length, NULL, &sequence,
+                                              &sequence_count,
+                                              &features) == SHELL_PROCESS_OK &&
           sequence_count == 1 && features == cases[i].executable);
     CHECK(shell_abstract_command_parse(input, length, &abstract) ==
               SHELL_ABSTRACT_OK &&
@@ -1325,7 +1327,7 @@ static void test_substitution_metadata_agreement(void) {
 
     shell_transformed_command_list_free(transformed, transformed_count);
     shell_abstract_command_free(abstract);
-    free(sequence);
+    shell_netstring_buffer_free(&sequence);
     shell_commands_free(commands, command_count);
     shell_command_infos_free(infos, info_count);
   }
@@ -1674,7 +1676,7 @@ static void test_processed_command_conveniences(void) {
   size_t netargv_length = 0;
   size_t written = 0;
   char netargv[64] = {0};
-  char *rendered = NULL;
+  shell_netstring_buffer_t rendered = {0};
   CHECK(shell_process_command(input, sizeof(input) - 1, NULL, &infos,
                               &info_count) == SHELL_PROCESS_OK);
   CHECK(infos && info_count == 1 && infos[0].has_redirections &&
@@ -1685,16 +1687,18 @@ static void test_processed_command_conveniences(void) {
         written == netargv_length &&
         shell_netstring_validate(netargv, written, NULL) ==
             SHELL_NETSTRING_OK &&
-        shell_render_netargv(&infos[0], NULL, &rendered) == SHELL_PROCESS_OK &&
-        strcmp(netargv, rendered) == 0);
-  free(rendered);
+        shell_render_netargv_buffer(&infos[0], NULL, &rendered) ==
+            SHELL_PROCESS_OK &&
+        (strlen(netargv) != rendered.length ||
+         memcmp(netargv, rendered.data, strlen(netargv))) == 0);
+  shell_netstring_buffer_free(&rendered);
 
   const shell_process_limits_t tiny = {1, SIZE_MAX, 0};
   CHECK(shell_write_netargv(&infos[0], netargv, netargv_length, &written) ==
             SHELL_PROCESS_EOUTPUT_LIMIT &&
-        shell_render_netargv(&infos[0], &tiny, &rendered) ==
+        shell_render_netargv_buffer(&infos[0], &tiny, &rendered) ==
             SHELL_PROCESS_EOUTPUT_LIMIT &&
-        rendered == NULL);
+        rendered.data == NULL);
   shell_command_infos_free(infos, info_count);
 
   infos = NULL;
@@ -1705,7 +1709,7 @@ static void test_processed_command_conveniences(void) {
 
   infos = NULL;
   info_count = 0;
-  rendered = NULL;
+  rendered = (shell_netstring_buffer_t){0};
   netargv_length = SIZE_MAX;
   CHECK(shell_process_command("> /tmp/out", strlen("> /tmp/out"), NULL, &infos,
                               &info_count) == SHELL_PROCESS_OK &&
@@ -1713,9 +1717,12 @@ static void test_processed_command_conveniences(void) {
         infos[0].has_redirections &&
         shell_measure_netargv(&infos[0], &netargv_length) == SHELL_PROCESS_OK &&
         netargv_length == 0 &&
-        shell_render_netargv(&infos[0], NULL, &rendered) == SHELL_PROCESS_OK &&
-        rendered != NULL && strcmp(rendered, "") == 0);
-  free(rendered);
+        shell_render_netargv_buffer(&infos[0], NULL, &rendered) ==
+            SHELL_PROCESS_OK &&
+        rendered.data != NULL &&
+        (rendered.length != sizeof("") - 1 ||
+         memcmp(rendered.data, "", rendered.length)) == 0);
+  shell_netstring_buffer_free(&rendered);
   shell_command_infos_free(infos, info_count);
 
   /* The shipping library retains binary canonical argv supplied directly,
@@ -1731,8 +1738,6 @@ static void test_processed_command_conveniences(void) {
   };
   shell_netstring_buffer_t binary_argv = {0};
   shell_netstring_buffer_t binary_sequence = {0};
-  char *legacy_argv = (char *)(uintptr_t)1;
-  char *legacy_sequence = (char *)(uintptr_t)1;
   size_t records = 0;
   size_t sequence_count = 0;
   bool has_features = true;
@@ -1746,18 +1751,11 @@ static void test_processed_command_conveniences(void) {
         shell_netstring_validate(binary_argv.data, binary_argv.length,
                                  &records) == SHELL_NETSTRING_OK &&
         records == 2 && memchr(binary_argv.data, '\0', binary_argv.length) &&
-        shell_render_netargv(&binary_info, NULL, &legacy_argv) ==
-            SHELL_PROCESS_EOUTPUT_LIMIT &&
-        legacy_argv == NULL &&
         shell_build_netargv_sequence_buffer(
             binary_source, sizeof(binary_source) - 1, NULL, &binary_sequence,
             &sequence_count, &has_features) == SHELL_PROCESS_EPARSE &&
         sequence_count == 0 && !has_features && binary_sequence.data == NULL &&
-        binary_sequence.length == 0 &&
-        shell_build_netargv_sequence(binary_source, sizeof(binary_source) - 1,
-                                     NULL, &legacy_sequence, &sequence_count,
-                                     &has_features) == SHELL_PROCESS_EPARSE &&
-        legacy_sequence == NULL && sequence_count == 0 && !has_features);
+        binary_sequence.length == 0);
   shell_command_infos_free(infos, info_count);
   shell_netstring_buffer_free(&binary_sequence);
   shell_netstring_buffer_free(&binary_argv);
@@ -1785,17 +1783,17 @@ static void test_processed_command_conveniences(void) {
    * still a real anomaly stage, but deliberately cannot become a netargv
    * command. Compound-tail redirects must likewise remain structural rather
    * than becoming a phantom second argv record. */
-  char *no_argv = (char *)(uintptr_t)1;
+  shell_netstring_buffer_t no_argv = {0};
   size_t no_argv_count = SIZE_MAX;
   bool no_argv_features = true;
   shell_processed_commands_t redirect_only = {0};
   shell_netstring_buffer_t grouped_sequence = {0};
   size_t grouped_count = 0;
   bool grouped_features = false;
-  CHECK(shell_build_netargv_sequence(">out", strlen(">out"), NULL, &no_argv,
-                                     &no_argv_count, &no_argv_features) ==
-            SHELL_PROCESS_EPARSE &&
-        no_argv == NULL && no_argv_count == 0 && !no_argv_features &&
+  CHECK(shell_build_netargv_sequence_buffer(
+            ">out", strlen(">out"), NULL, &no_argv, &no_argv_count,
+            &no_argv_features) == SHELL_PROCESS_EPARSE &&
+        no_argv.data == NULL && no_argv_count == 0 && !no_argv_features &&
         shell_process_commands(">out", strlen(">out"), NULL, &redirect_only) ==
             SHELL_PROCESS_OK &&
         redirect_only.commands == NULL && redirect_only.command_count == 0 &&
@@ -1814,17 +1812,17 @@ static void test_processed_command_conveniences(void) {
    * retain the shell-feature signal, and continue with later list members.
    * A timed redirect-only stage remains unpolicyable rather than disappearing
    * with its observable I/O effect. */
-  char *timed_sequence = (char *)(uintptr_t)1;
+  shell_netstring_buffer_t timed_sequence = {0};
   size_t timed_count = SIZE_MAX;
   bool timed_features = false;
   shell_netstring_buffer_t timed_buffer = {0};
-  CHECK(shell_build_netargv_sequence("time", strlen("time"), NULL,
-                                     &timed_sequence, &timed_count,
-                                     &timed_features) == SHELL_PROCESS_OK &&
-        timed_sequence != NULL && timed_sequence[0] == '\0' &&
+  CHECK(shell_build_netargv_sequence_buffer(
+            "time", strlen("time"), NULL, &timed_sequence, &timed_count,
+            &timed_features) == SHELL_PROCESS_OK &&
+        timed_sequence.data != NULL && timed_sequence.data[0] == '\0' &&
         timed_count == 0 && timed_features);
-  free(timed_sequence);
-  timed_sequence = NULL;
+  shell_netstring_buffer_free(&timed_sequence);
+  timed_sequence = (shell_netstring_buffer_t){0};
   timed_count = SIZE_MAX;
   timed_features = false;
   CHECK(shell_build_netargv_sequence_buffer(
@@ -1854,7 +1852,7 @@ static void test_processed_command_conveniences(void) {
             SHELL_PROCESS_OK &&
         rendered_buffer.data != NULL && rendered_buffer.length != 0);
   shell_netstring_buffer_free(&rendered_buffer);
-  CHECK(shell_netstring_buffer_is_empty(&rendered_buffer));
+  CHECK(((&rendered_buffer)->data == NULL && (&rendered_buffer)->length == 0));
   shell_command_infos_free(infos, info_count);
 
   static const char unsupported_byte[] = {'e', 'c', 'h', 'o', '\0', 'x'};
@@ -2046,7 +2044,7 @@ static void test_production_fd_target_contract(void) {
     shell_processed_commands_t processed = {0};
     shell_command_info_t *flat = NULL;
     size_t flat_count = 0;
-    char *netargv_sequence = NULL;
+    shell_netstring_buffer_t netargv_sequence = {0};
     size_t netargv_count = 0;
     bool has_features = false;
     size_t input_length = strlen(prefixed_dynamic_direct[i]);
@@ -2057,11 +2055,11 @@ static void test_production_fd_target_contract(void) {
           shell_process_command(prefixed_dynamic_direct[i], input_length, NULL,
                                 &flat, &flat_count) == SHELL_PROCESS_OK &&
           flat_count == 1 && flat[0].command_token_count == 2 &&
-          shell_build_netargv_sequence(prefixed_dynamic_direct[i], input_length,
-                                       NULL, &netargv_sequence, &netargv_count,
-                                       &has_features) == SHELL_PROCESS_OK &&
-          netargv_sequence != NULL && netargv_count == 1);
-    free(netargv_sequence);
+          shell_build_netargv_sequence_buffer(
+              prefixed_dynamic_direct[i], input_length, NULL, &netargv_sequence,
+              &netargv_count, &has_features) == SHELL_PROCESS_OK &&
+          netargv_sequence.data != NULL && netargv_count == 1);
+    shell_netstring_buffer_free(&netargv_sequence);
     shell_command_infos_free(flat, flat_count);
     shell_processed_commands_free(&processed);
   }
@@ -2109,10 +2107,10 @@ static void test_production_fd_target_contract(void) {
     };
     shell_command_info_t *flat = (shell_command_info_t *)(uintptr_t)1;
     size_t flat_count = SIZE_MAX;
-    char *netargv_sequence = (char *)(uintptr_t)1;
+    shell_netstring_buffer_t netargv_sequence = {0};
     size_t netargv_count = SIZE_MAX;
     bool has_features = true;
-    char *command_netseq = (char *)(uintptr_t)1;
+    shell_netstring_buffer_t command_netseq = {0};
     size_t command_netseq_count = SIZE_MAX;
     shell_anomaly_stages_t stages = {
         .commands = (shell_command_t *)(uintptr_t)1,
@@ -2125,14 +2123,15 @@ static void test_production_fd_target_contract(void) {
           shell_process_command(invalid_static_direct[i], input_length, NULL,
                                 &flat, &flat_count) == SHELL_PROCESS_EPARSE &&
           flat == NULL && flat_count == 0 &&
-          shell_build_netargv_sequence(invalid_static_direct[i], input_length,
-                                       NULL, &netargv_sequence, &netargv_count,
-                                       &has_features) == SHELL_PROCESS_EPARSE &&
-          netargv_sequence == NULL && netargv_count == 0 && !has_features &&
-          shell_build_command_netseq(
+          shell_build_netargv_sequence_buffer(
+              invalid_static_direct[i], input_length, NULL, &netargv_sequence,
+              &netargv_count, &has_features) == SHELL_PROCESS_EPARSE &&
+          netargv_sequence.data == NULL && netargv_count == 0 &&
+          !has_features &&
+          shell_build_command_netseq_buffer(
               invalid_static_direct[i], input_length, NULL, &command_netseq,
               &command_netseq_count) == SHELL_PROCESS_EPARSE &&
-          command_netseq == NULL && command_netseq_count == 0 &&
+          command_netseq.data == NULL && command_netseq_count == 0 &&
           shell_anomaly_stages_parse(invalid_static_direct[i], input_length,
                                      NULL, &stages) == SHELL_PROCESS_EPARSE &&
           stages.commands == NULL && stages.count == 0);
@@ -2178,20 +2177,23 @@ static void test_production_fd_target_contract(void) {
 
   shell_command_info_t *close_suffix_infos = NULL;
   size_t close_suffix_count = 0;
-  char *close_suffix_netargv = NULL;
+  shell_netstring_buffer_t close_suffix_netargv = {0};
   shell_dep_graph_t close_suffix_graph = {0};
   const char close_suffix[] = "printf x >&-file";
   CHECK(shell_process_command(close_suffix, sizeof(close_suffix) - 1, NULL,
                               &close_suffix_infos,
                               &close_suffix_count) == SHELL_PROCESS_OK &&
         close_suffix_count == 1 && close_suffix_infos != NULL &&
-        shell_render_netargv(&close_suffix_infos[0], NULL,
-                             &close_suffix_netargv) == SHELL_PROCESS_OK &&
-        strcmp(close_suffix_netargv, "6:printf,1:x,4:file,") == 0 &&
+        shell_render_netargv_buffer(&close_suffix_infos[0], NULL,
+                                    &close_suffix_netargv) ==
+            SHELL_PROCESS_OK &&
+        (close_suffix_netargv.length != sizeof("6:printf,1:x,4:file,") - 1 ||
+         memcmp(close_suffix_netargv.data, "6:printf,1:x,4:file,",
+                close_suffix_netargv.length)) == 0 &&
         shell_dep_graph_parse(close_suffix, sizeof(close_suffix) - 1, ".", NULL,
                               &close_suffix_graph) == SHELL_DEP_OK &&
         shell_dep_graph_validate(&close_suffix_graph).valid);
-  free(close_suffix_netargv);
+  shell_netstring_buffer_free(&close_suffix_netargv);
   shell_command_infos_free(close_suffix_infos, close_suffix_count);
 
   static const char *const group_cases[] = {
@@ -2919,9 +2921,7 @@ static void test_transform_api(void) {
     CHECK(commands && count > 0);
     for (size_t j = 0; commands && j < count; j++) {
       CHECK(commands[j]->original_command && commands[j]->display_text &&
-            commands[j]->token_count > 0 &&
-            shell_transformed_command_get_display_text(commands[j]) ==
-                commands[j]->display_text);
+            commands[j]->token_count > 0);
     }
     shell_transformed_command_list_free(commands, count);
   }
@@ -3841,28 +3841,31 @@ build_limited_sequences(unsigned operation, bool cstring, const char *source,
                                                 second, count);
     }
   }
-  char *raw = NULL, *typed = NULL;
+  shell_netstring_buffer_t raw = {0};
+  shell_netstring_buffer_t typed = {0};
   shell_process_status_t status;
   switch (operation) {
   case 0:
-    status = shell_build_netargv_sequence(source, length, limits, &raw, count,
-                                          &features);
+    status = shell_build_netargv_sequence_buffer(source, length, limits, &raw,
+                                                 count, &features);
     break;
   case 1:
-    status = shell_build_command_netseq(source, length, limits, &raw, count);
+    status =
+        shell_build_command_netseq_buffer(source, length, limits, &raw, count);
     break;
   case 2:
-    status = shell_build_type_netseq(source, length, limits, &raw, count);
+    status =
+        shell_build_type_netseq_buffer(source, length, limits, &raw, count);
     break;
   default:
-    status = shell_build_anomaly_netseqs(source, length, limits, &raw, &typed,
-                                         count);
+    status = shell_build_anomaly_netseqs_buffer(source, length, limits, &raw,
+                                                &typed, count);
     break;
   }
-  first->data = (unsigned char *)raw;
-  first->length = raw ? strlen(raw) : 0;
-  second->data = (unsigned char *)typed;
-  second->length = typed ? strlen(typed) : 0;
+  first->data = (unsigned char *)raw.data;
+  first->length = raw.data ? raw.length : 0;
+  second->data = (unsigned char *)typed.data;
+  second->length = typed.data ? typed.length : 0;
   return status;
 }
 
@@ -4185,13 +4188,14 @@ static void test_complete_source_before_capacity(void) {
             !processed.groups && !processed.group_count &&
             !processed.group_io_ops && !processed.group_io_op_count);
       shell_processed_commands_free(&processed);
-      char *sequence = (char *)(uintptr_t)1;
+      shell_netstring_buffer_t sequence = {0};
       size_t count = SIZE_MAX;
       bool features = true;
-      CHECK(shell_build_netargv_sequence(input, length, NULL, &sequence, &count,
-                                         &features) == SHELL_PROCESS_EPARSE);
-      CHECK(!sequence && !count && !features);
-      free(sequence);
+      CHECK(shell_build_netargv_sequence_buffer(input, length, NULL, &sequence,
+                                                &count, &features) ==
+            SHELL_PROCESS_EPARSE);
+      CHECK(!sequence.data && !count && !features);
+      shell_netstring_buffer_free(&sequence);
       shell_transformed_command_t **transformed = NULL;
       size_t transformed_count = 0;
       CHECK(shell_transform_command_line(input, length, NULL, &transformed,
@@ -4392,17 +4396,18 @@ static void test_forward_word_scanners(void) {
         CHECK(shell_dep_graph_parse(source, length + 7, ".", NULL, &graph) ==
                   SHELL_DEP_OK &&
               shell_dep_graph_validate(&graph).valid);
-        char *sequence = NULL;
+        shell_netstring_buffer_t sequence = {0};
         size_t records = 0;
         bool features = false;
-        CHECK(shell_build_netargv_sequence(source, length + 7, NULL, &sequence,
-                                           &records,
-                                           &features) == SHELL_PROCESS_OK &&
+        CHECK(shell_build_netargv_sequence_buffer(
+                  source, length + 7, NULL, &sequence, &records, &features) ==
+                  SHELL_PROCESS_OK &&
               records == 1);
-        if (sequence) {
+        if (sequence.data) {
           shell_netstring_iter_t outer, argv;
           shell_netstring_view_t record, arg;
-          CHECK(shell_netstring_iter_init(&outer, sequence, strlen(sequence)) ==
+          CHECK(shell_netstring_iter_init(&outer, sequence.data,
+                                          sequence.length) ==
                     SHELL_NETSTRING_OK &&
                 shell_netstring_iter_next(&outer, &record) ==
                     SHELL_NETSTRING_OK &&
@@ -4427,7 +4432,7 @@ static void test_forward_word_scanners(void) {
         CHECK(previous_work == 0 || work <= 2 * previous_work + 4096);
         previous_work = work;
 #endif
-        free(sequence);
+        shell_netstring_buffer_free(&sequence);
         shell_processed_commands_free(&processed);
         free(source);
       }
@@ -4539,7 +4544,7 @@ static void test_word_expansion_recognition(void) {
     const char *word = shellsplit_test_glob_words[i].word;
     bool expected = shellsplit_test_glob_words[i].glob;
     size_t length = strlen(word);
-    CHECK(shell_tokenizer_word_has_glob(word, length) == expected);
+    CHECK(shell_source_word_has_glob(word, length) == expected);
     CHECK((shell_classify_raw_token(word, length) == SHELL_TOKEN_GLOB) ==
           expected);
     char source[256];
@@ -4587,8 +4592,8 @@ static void test_word_expansion_recognition(void) {
     const char *expected = shellsplit_test_parameter_words[i].name;
     const char *name = NULL;
     size_t name_length = 0;
-    bool matched = shell_tokenizer_word_parameter_name(word, strlen(word),
-                                                       &name, &name_length);
+    bool matched = shell_source_word_parameter_name(word, strlen(word), &name,
+                                                    &name_length);
     CHECK(matched == (expected != NULL));
     if (matched && expected)
       CHECK(name_length == strlen(expected) &&
@@ -4604,7 +4609,7 @@ static void test_word_expansion_recognition(void) {
       return;
     memset(word, '[', length);
     shellsplit_test_source_scan_reset();
-    CHECK(!shell_tokenizer_word_has_glob(word, length));
+    CHECK(!shell_source_word_has_glob(word, length));
     size_t work = shellsplit_test_source_scan_work();
     CHECK(work <= 4 * length && (previous == 0 || work <= 2 * previous + 8));
     previous = work;
@@ -4626,8 +4631,7 @@ static void test_nested_expansion_features(void) {
                  abstract->has_arithmetic == fixture->arithmetic &&
                  abstract->has_cmd_subst == fixture->substitution &&
                  abstract->has_globs == fixture->glob &&
-                 strcmp(shell_abstract_command_get_display_text(abstract),
-                        fixture->display) == 0;
+                 strcmp(abstract->display_text, fixture->display) == 0;
     if (abstract)
       for (size_t j = 0; j < abstract->element_count; j++) {
         const shell_abstract_element_t *element = abstract->elements[j];
@@ -4641,8 +4645,7 @@ static void test_nested_expansion_features(void) {
     if (!valid)
       fprintf(stderr, "expansion feature mismatch: %s display=%s\n",
               fixture->source,
-              abstract ? shell_abstract_command_get_display_text(abstract)
-                       : "parse failed");
+              abstract ? abstract->display_text : "parse failed");
     CHECK(valid);
     shell_abstract_command_free(abstract);
   }

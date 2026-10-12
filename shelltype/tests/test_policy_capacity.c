@@ -45,7 +45,9 @@ static int files_equal(const char *left_path, const char *right_path) {
       break;
     }
   }
-  if (fclose(left) != 0 || fclose(right) != 0)
+  int left_closed = fclose(left);
+  int right_closed = fclose(right);
+  if (left_closed != 0 || right_closed != 0)
     equal = 0;
   return equal;
 }

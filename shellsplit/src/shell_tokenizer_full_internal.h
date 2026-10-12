@@ -113,15 +113,6 @@ bool shell_tokenizer_arithmetic_has_array_semantics(const char *input,
  * entries. */
 bool shell_tokenizer_token_has_variable(const shell_token_t *token);
 
-/* Classify borrowed source-word spans without validating the containing
- * command again. Glob queries retain source spelling; scalar parameter names
- * are contiguous borrowed spans and match only whole unquoted words. */
-bool shell_tokenizer_word_has_glob(const char *word, size_t length)
-    SHELL_NONNULL(1);
-bool shell_tokenizer_word_parameter_name(const char *word, size_t length,
-                                         const char **name, size_t *name_length)
-    SHELL_NONNULL(1, 3, 4);
-
 /* Tokens borrowing one source buffer belong to the same logical shell word
  * when physically adjacent or separated only by escaped line endings. token
  * is required; end is the preceding fragment's end offset in that source. */

@@ -4,46 +4,7 @@
 #include "shell_depgraph.h"
 #include "shell_tokenizer.h"
 
-/* Private whole-word resolution bridge. The owner/source are unchanged parser
- * spans. A resolved value was canonically validated by the application-facing
- * boundary; graph leaves consume these prechecked bytes without decoding them
- * as shell source. Values and returned metadata remain valid and immutable for
- * the lifetime of the output graph. Request objects and their borrowed CWD
- * strings are callback-scoped; source spans retain the source lifetime.
- * NULL resolver disables resolution. Callback failure returns NULL. */
-typedef enum {
-  SHELL_DEP_EXPAND_ARGUMENT,
-  SHELL_DEP_EXPAND_REDIRECT_PATH,
-  SHELL_DEP_EXPAND_FILE_PATH,
-} shell_dep_expand_purpose_t;
-
-typedef struct {
-  const char *word;
-  size_t word_length;
-  const char *owner;
-  size_t owner_length;
-  const char *cwd;
-  bool cwd_known, cwd_absolute;
-  shell_dep_expand_purpose_t purpose;
-  bool eligible;
-} shell_dep_expand_request_t;
-
-typedef struct {
-  const char *netargv;
-  size_t length, count, display_length;
-  const char *first;
-  size_t first_length;
-  bool resolved;
-  bool dynamic;
-} shell_dep_word_value_t;
-
-typedef const shell_dep_word_value_t *(*shell_dep_expand_fn)(
-    const shell_dep_expand_request_t *request, void *context)SHELL_NONNULL(1);
-
-typedef struct {
-  shell_dep_expand_fn expand;
-  void *context;
-} shell_dep_word_resolver_t;
+#include "shell_expand_internal.h"
 
 /* Internal zero-copy consumer of an existing fast parse, not an independent
  * parse of cmd. With non-NULL `fast`, the caller must supply the unmodified

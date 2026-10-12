@@ -28,26 +28,29 @@ static sg_anomaly_model_t *test_model_with_config(double alpha,
   return sg_anomaly_model_new_with_config(&config);
 }
 
-static char *test_encode_netseq(const char **sequence, size_t count) {
+/* Fixture inputs are ordinary textual names; encoded output is a byte buffer.
+ */
+static shell_netstring_buffer_t test_encode_netseq(const char **sequence,
+                                                   size_t count) {
   if (!sequence && count)
-    return NULL;
+    return (shell_netstring_buffer_t){0};
   size_t total = 0;
   for (size_t i = 0; i < count; i++) {
     if (!sequence[i])
-      return NULL;
+      return (shell_netstring_buffer_t){0};
     size_t length = strlen(sequence[i]);
     size_t record_length = 0;
     if (shell_netstring_encoded_length(length, &record_length) !=
             SHELL_NETSTRING_OK ||
         total > SIZE_MAX - record_length)
-      return NULL;
+      return (shell_netstring_buffer_t){0};
     total += record_length;
   }
   if (total == SIZE_MAX)
-    return NULL;
+    return (shell_netstring_buffer_t){0};
   char *encoded = malloc(total + 1);
   if (!encoded)
-    return NULL;
+    return (shell_netstring_buffer_t){0};
   size_t used = 0;
   for (size_t i = 0; i < count; i++) {
     size_t length = strlen(sequence[i]);
@@ -55,44 +58,45 @@ static char *test_encode_netseq(const char **sequence, size_t count) {
     if (shell_netstring_write(encoded + used, total - used, sequence[i], length,
                               &written) != SHELL_NETSTRING_OK) {
       free(encoded);
-      return NULL;
+      return (shell_netstring_buffer_t){0};
     }
     used += written;
   }
   encoded[used] = '\0';
-  return encoded;
+  return (shell_netstring_buffer_t){(unsigned char *)encoded, used};
 }
 
 static bool test_has_observed(const sg_anomaly_model_t *model,
                               const char **sequence, size_t count) {
-  char *encoded = test_encode_netseq(sequence, count);
+  shell_netstring_buffer_t encoded = test_encode_netseq(sequence, count);
   bool observed = false;
-  if (!encoded ||
-      sg_anomaly_model_has_observed_netseq(model, encoded, strlen(encoded),
-                                           &observed) != SG_ANOMALY_OK)
+  if (!encoded.data || sg_anomaly_model_has_observed_netseq(
+                           model, (const char *)encoded.data, encoded.length,
+                           &observed) != SG_ANOMALY_OK)
     observed = false;
-  free(encoded);
+  shell_netstring_buffer_free(&encoded);
   return observed;
 }
 
 static double test_anomaly_score_array(const sg_anomaly_model_t *model,
                                        const char **sequence, size_t count) {
-  char *encoded = test_encode_netseq(sequence, count);
+  shell_netstring_buffer_t encoded = test_encode_netseq(sequence, count);
   double score = INFINITY;
-  if (encoded) {
-    (void)sg_anomaly_model_score_netseq(model, encoded, strlen(encoded),
-                                        &score);
-    free(encoded);
+  if (encoded.data) {
+    (void)sg_anomaly_model_score_netseq(model, (const char *)encoded.data,
+                                        encoded.length, &score);
+    shell_netstring_buffer_free(&encoded);
   }
   return score;
 }
 
 static void test_anomaly_update_array(sg_anomaly_model_t *model,
                                       const char **sequence, size_t count) {
-  char *encoded = test_encode_netseq(sequence, count);
-  if (encoded) {
-    (void)sg_anomaly_model_update_netseq(model, encoded, strlen(encoded));
-    free(encoded);
+  shell_netstring_buffer_t encoded = test_encode_netseq(sequence, count);
+  if (encoded.data) {
+    (void)sg_anomaly_model_update_netseq(model, (const char *)encoded.data,
+                                         encoded.length);
+    shell_netstring_buffer_free(&encoded);
   }
 }
 
@@ -123,7 +127,7 @@ static void cleanup_anomaly_temp_file(void) {
     if (!(condition)) {                                                        \
       printf("    FAIL: %s at %s:%d\n", #condition, __FILE__, __LINE__);       \
       fail_count++;                                                            \
-      return;                                                                  \
+      exit(EXIT_FAILURE);                                                      \
     }                                                                          \
   } while (0)
 
@@ -133,7 +137,7 @@ static void cleanup_anomaly_temp_file(void) {
       printf("    FAIL: %s != %s (%ld != %ld) at %s:%d\n", #actual, #expected, \
              (long)(actual), (long)(expected), __FILE__, __LINE__);            \
       fail_count++;                                                            \
-      return;                                                                  \
+      exit(EXIT_FAILURE);                                                      \
     }                                                                          \
   } while (0)
 
@@ -144,7 +148,7 @@ static void cleanup_anomaly_temp_file(void) {
              #expected, (double)(actual), (double)(expected), __FILE__,        \
              __LINE__);                                                        \
       fail_count++;                                                            \
-      return;                                                                  \
+      exit(EXIT_FAILURE);                                                      \
     }                                                                          \
   } while (0)
 
@@ -246,10 +250,14 @@ TEST(lifecycle_and_null_safety) {
   }
   const char *empty_stage[] = {"a", "", "c"};
   ASSERT(isfinite(sg_anomaly_score(model, empty_stage, 3)));
-  ASSERT_EQ_INT(sg_anomaly_model_unigram_count(model, ""), 0);
+  ASSERT_EQ_INT(sg_anomaly_model_unigram_count_view(
+                    model, (sg_anomaly_item_view_t){"", (sizeof("") - 1)}),
+                0);
   sg_anomaly_update(model, empty_stage, 3);
   ASSERT_EQ_INT(sg_anomaly_model_total_unigrams(model), 8);
-  ASSERT_EQ_INT(sg_anomaly_model_unigram_count(model, ""), 1);
+  ASSERT_EQ_INT(sg_anomaly_model_unigram_count_view(
+                    model, (sg_anomaly_item_view_t){"", (sizeof("") - 1)}),
+                1);
 
   sg_anomaly_model_free(NULL);
   ASSERT(isinf(sg_anomaly_score(model, NULL, 5)));
@@ -257,13 +265,39 @@ TEST(lifecycle_and_null_safety) {
   char oversized[8192];
   memset(oversized, 'x', sizeof(oversized) - 1);
   oversized[sizeof(oversized) - 1] = '\0';
-  ASSERT_EQ_INT(sg_anomaly_model_bigram_count(model, "", "b"), 0);
-  ASSERT_EQ_INT(sg_anomaly_model_bigram_count(model, oversized, "b"), 0);
-  ASSERT_EQ_INT(sg_anomaly_model_trigram_count(model, "", "b", "c"), 0);
-  ASSERT_EQ_INT(sg_anomaly_model_trigram_count(model, oversized, "b", "c"), 0);
-  ASSERT_EQ_INT(sg_anomaly_model_fourgram_count(model, "", "b", "c", "d"), 0);
-  ASSERT_EQ_INT(
-      sg_anomaly_model_fourgram_count(model, oversized, "b", "c", "d"), 0);
+  ASSERT_EQ_INT(sg_anomaly_model_bigram_count_view(
+                    model, (sg_anomaly_item_view_t){"", (sizeof("") - 1)},
+                    (sg_anomaly_item_view_t){"b", (sizeof("b") - 1)}),
+                0);
+  ASSERT_EQ_INT(sg_anomaly_model_bigram_count_view(
+                    model,
+                    (sg_anomaly_item_view_t){oversized, strlen(oversized)},
+                    (sg_anomaly_item_view_t){"b", (sizeof("b") - 1)}),
+                0);
+  ASSERT_EQ_INT(sg_anomaly_model_trigram_count_view(
+                    model, (sg_anomaly_item_view_t){"", (sizeof("") - 1)},
+                    (sg_anomaly_item_view_t){"b", (sizeof("b") - 1)},
+                    (sg_anomaly_item_view_t){"c", (sizeof("c") - 1)}),
+                0);
+  ASSERT_EQ_INT(sg_anomaly_model_trigram_count_view(
+                    model,
+                    (sg_anomaly_item_view_t){oversized, strlen(oversized)},
+                    (sg_anomaly_item_view_t){"b", (sizeof("b") - 1)},
+                    (sg_anomaly_item_view_t){"c", (sizeof("c") - 1)}),
+                0);
+  ASSERT_EQ_INT(sg_anomaly_model_fourgram_count_view(
+                    model, (sg_anomaly_item_view_t){"", (sizeof("") - 1)},
+                    (sg_anomaly_item_view_t){"b", (sizeof("b") - 1)},
+                    (sg_anomaly_item_view_t){"c", (sizeof("c") - 1)},
+                    (sg_anomaly_item_view_t){"d", (sizeof("d") - 1)}),
+                0);
+  ASSERT_EQ_INT(sg_anomaly_model_fourgram_count_view(
+                    model,
+                    (sg_anomaly_item_view_t){oversized, strlen(oversized)},
+                    (sg_anomaly_item_view_t){"b", (sizeof("b") - 1)},
+                    (sg_anomaly_item_view_t){"c", (sizeof("c") - 1)},
+                    (sg_anomaly_item_view_t){"d", (sizeof("d") - 1)}),
+                0);
   const char *oversized_sequence[] = {oversized, "b", "c", "d"};
   ASSERT(isfinite(sg_anomaly_score(model, oversized_sequence, 4)));
   const char *oversized_middle[] = {"a", oversized, "c", "d"};
@@ -356,10 +390,7 @@ TEST(extreme_alpha_scores_are_finite) {
 }
 
 TEST(update_count_matrix) {
-  /* Stage is the public term. Keep the former command-length spelling as a
-   * source-compatible alias so downstream callers can migrate independently. */
   ASSERT_EQ_INT(SG_ANOMALY_MAX_STAGE_LENGTH, 1023);
-  ASSERT_EQ_INT(SG_ANOMALY_MAX_COMMAND_LENGTH, SG_ANOMALY_MAX_STAGE_LENGTH);
 
   for (size_t length = 1; length <= 5; length++) {
     sg_anomaly_model_t *model = sg_anomaly_model_new();
@@ -374,13 +405,27 @@ TEST(update_count_matrix) {
                   length > 2 ? (length - 2) * 3 : 0);
     ASSERT_EQ_INT(sg_anomaly_model_total_fourgrams(model),
                   length > 3 ? (length - 3) * 3 : 0);
-    ASSERT_EQ_INT(sg_anomaly_model_unigram_count(model, "a"), 3);
-    ASSERT_EQ_INT(sg_anomaly_model_unigram_count(model, "missing"), 0);
-    ASSERT_EQ_INT(sg_anomaly_model_bigram_count(model, "a", "b"),
+    ASSERT_EQ_INT(sg_anomaly_model_unigram_count_view(
+                      model, (sg_anomaly_item_view_t){"a", (sizeof("a") - 1)}),
+                  3);
+    ASSERT_EQ_INT(sg_anomaly_model_unigram_count_view(
+                      model, (sg_anomaly_item_view_t){"missing",
+                                                      (sizeof("missing") - 1)}),
+                  0);
+    ASSERT_EQ_INT(sg_anomaly_model_bigram_count_view(
+                      model, (sg_anomaly_item_view_t){"a", (sizeof("a") - 1)},
+                      (sg_anomaly_item_view_t){"b", (sizeof("b") - 1)}),
                   length > 1 ? 3 : 0);
-    ASSERT_EQ_INT(sg_anomaly_model_trigram_count(model, "a", "b", "c"),
+    ASSERT_EQ_INT(sg_anomaly_model_trigram_count_view(
+                      model, (sg_anomaly_item_view_t){"a", (sizeof("a") - 1)},
+                      (sg_anomaly_item_view_t){"b", (sizeof("b") - 1)},
+                      (sg_anomaly_item_view_t){"c", (sizeof("c") - 1)}),
                   length > 2 ? 3 : 0);
-    ASSERT_EQ_INT(sg_anomaly_model_fourgram_count(model, "a", "b", "c", "d"),
+    ASSERT_EQ_INT(sg_anomaly_model_fourgram_count_view(
+                      model, (sg_anomaly_item_view_t){"a", (sizeof("a") - 1)},
+                      (sg_anomaly_item_view_t){"b", (sizeof("b") - 1)},
+                      (sg_anomaly_item_view_t){"c", (sizeof("c") - 1)},
+                      (sg_anomaly_item_view_t){"d", (sizeof("d") - 1)}),
                   length > 3 ? 3 : 0);
     ASSERT((length < 3) == isinf(sg_anomaly_score(model, commands, length)));
     ASSERT(test_has_observed(model, commands, length));
@@ -404,8 +449,12 @@ TEST(update_count_matrix) {
   ASSERT_EQ_INT(sg_anomaly_model_total_bigrams(model), 3);
   ASSERT_EQ_INT(sg_anomaly_model_total_trigrams(model), 2);
   ASSERT_EQ_INT(sg_anomaly_model_total_fourgrams(model), 1);
-  ASSERT_EQ_INT(sg_anomaly_model_fourgram_count(model, boundary[0], boundary[1],
-                                                boundary[2], boundary[3]),
+  ASSERT_EQ_INT(sg_anomaly_model_fourgram_count_view(
+                    model,
+                    (sg_anomaly_item_view_t){boundary[0], strlen(boundary[0])},
+                    (sg_anomaly_item_view_t){boundary[1], strlen(boundary[1])},
+                    (sg_anomaly_item_view_t){boundary[2], strlen(boundary[2])},
+                    (sg_anomaly_item_view_t){boundary[3], strlen(boundary[3])}),
                 1);
   ASSERT(isfinite(sg_anomaly_score(model, boundary, 4)));
 
@@ -422,7 +471,10 @@ TEST(update_count_matrix) {
   ASSERT(isfinite(over_long_score));
   const char *known[] = {boundary[0], boundary[1], boundary[2]};
   ASSERT(over_long_score > sg_anomaly_score(model, known, 3));
-  ASSERT_EQ_INT(sg_anomaly_model_unigram_count(model, too_long), 0);
+  ASSERT_EQ_INT(
+      sg_anomaly_model_unigram_count_view(
+          model, (sg_anomaly_item_view_t){too_long, strlen(too_long)}),
+      0);
   sg_anomaly_model_free(model);
 }
 
@@ -482,7 +534,10 @@ TEST(model_owns_string_copies) {
   const char *probe[] = {"gcc", "make", "git"};
   ASSERT_EQ_INT(sg_anomaly_model_vocab_size(model), 3);
   for (size_t i = 0; i < 3; i++)
-    ASSERT_EQ_INT(sg_anomaly_model_unigram_count(model, probe[i]), 1);
+    ASSERT_EQ_INT(
+        sg_anomaly_model_unigram_count_view(
+            model, (sg_anomaly_item_view_t){probe[i], strlen(probe[i])}),
+        1);
   ASSERT(isfinite(sg_anomaly_score(model, probe, 3)));
   sg_anomaly_model_free(model);
 }
@@ -807,7 +862,10 @@ TEST(decay_matrix) {
   ASSERT_EQ_INT(sg_anomaly_model_total_fourgrams(model), 4);
   ASSERT_EQ_INT(sg_anomaly_model_unknown_count(model), 2);
   for (size_t i = 0; i < 5; i++)
-    ASSERT_EQ_INT(sg_anomaly_model_unigram_count(model, commands[i]), 2);
+    ASSERT_EQ_INT(
+        sg_anomaly_model_unigram_count_view(
+            model, (sg_anomaly_item_view_t){commands[i], strlen(commands[i])}),
+        2);
   ASSERT(isfinite(sg_anomaly_score(model, commands, 5)));
   sg_anomaly_model_free(model);
 }
@@ -849,9 +907,16 @@ TEST(prune_and_compact_preserve_common_behavior) {
   ASSERT_EQ_INT(sg_anomaly_model_total_bigrams(model), 12);
   ASSERT_EQ_INT(sg_anomaly_model_total_trigrams(model), 8);
   ASSERT_EQ_INT(sg_anomaly_model_total_fourgrams(model), 4);
-  ASSERT_EQ_INT(sg_anomaly_model_unigram_count(model, "gcc"), 0);
   ASSERT_EQ_INT(
-      sg_anomaly_model_fourgram_count(model, "gcc", "make", "test", "install"),
+      sg_anomaly_model_unigram_count_view(
+          model, (sg_anomaly_item_view_t){"gcc", (sizeof("gcc") - 1)}),
+      0);
+  ASSERT_EQ_INT(
+      sg_anomaly_model_fourgram_count_view(
+          model, (sg_anomaly_item_view_t){"gcc", (sizeof("gcc") - 1)},
+          (sg_anomaly_item_view_t){"make", (sizeof("make") - 1)},
+          (sg_anomaly_item_view_t){"test", (sizeof("test") - 1)},
+          (sg_anomaly_item_view_t){"install", (sizeof("install") - 1)}),
       0);
   ASSERT_EQ_INT(sg_anomaly_model_prune(model, 0, &removed), SG_ANOMALY_OK);
   ASSERT_EQ_INT(removed, 0);
@@ -1101,7 +1166,11 @@ TEST(compaction_failures_preserve_counts_and_sticky_error) {
               reference_score_matrix(model) &&
               sg_anomaly_model_unigram_count_view(
                   model, (sg_anomaly_item_view_t){"", 0}) == 2 &&
-              sg_anomaly_model_fourgram_count(model, "a", "b", "c", "e") == 1;
+              sg_anomaly_model_fourgram_count_view(
+                  model, (sg_anomaly_item_view_t){"a", (sizeof("a") - 1)},
+                  (sg_anomaly_item_view_t){"b", (sizeof("b") - 1)},
+                  (sg_anomaly_item_view_t){"c", (sizeof("c") - 1)},
+                  (sg_anomaly_item_view_t){"e", (sizeof("e") - 1)}) == 1;
     sg_test_anomaly_op_reset();
     status = sg_anomaly_model_compact(model);
     operations = sg_test_anomaly_op_count();
@@ -1199,14 +1268,16 @@ TEST(scoring_work_is_linear) {
       ok = length > 0 && (size_t)length < sizeof(names[i]);
       items[i] = names[i];
     }
-    char *sequence = ok ? test_encode_netseq(items, count) : NULL;
-    ok = ok && sequence &&
-         sg_anomaly_model_update_netseq(model, sequence, strlen(sequence)) ==
-             SG_ANOMALY_OK;
+    shell_netstring_buffer_t sequence =
+        ok ? test_encode_netseq(items, count) : (shell_netstring_buffer_t){0};
+    ok = ok && sequence.data &&
+         sg_anomaly_model_update_netseq(model, (const char *)sequence.data,
+                                        sequence.length) == SG_ANOMALY_OK;
     double score = INFINITY;
     sg_test_anomaly_work_reset();
     if (ok)
-      ok = sg_anomaly_model_score_netseq(model, sequence, strlen(sequence),
+      ok = sg_anomaly_model_score_netseq(model, (const char *)sequence.data,
+                                         sequence.length,
                                          &score) == SG_ANOMALY_OK &&
            isfinite(score);
     size_t work = sg_test_anomaly_work_count();
@@ -1221,7 +1292,7 @@ TEST(scoring_work_is_linear) {
       ok = isfinite(sg_anomaly_score(model, items, 4));
     ok = ok && sg_test_anomaly_work_count() <= 8;
     sg_anomaly_model_free(model);
-    free(sequence);
+    shell_netstring_buffer_free(&sequence);
     free(items);
     free(names);
     ASSERT(ok);
@@ -1282,17 +1353,21 @@ TEST(canonical_netseq_contract) {
   sg_anomaly_model_t *model = sg_anomaly_model_new();
   ASSERT(model != NULL);
   static const char valid[] = "9:two words,1::,1:,,";
+  double score = -1;
   size_t count = SIZE_MAX;
-  ASSERT_EQ_INT(
-      sg_anomaly_netseq_count(valid, sizeof(valid) - 1, false, &count),
-      SG_ANOMALY_OK);
+  ASSERT_EQ_INT(sg_anomaly_score_netseq_count(model, valid, sizeof(valid) - 1,
+                                              &score, &count),
+                SG_ANOMALY_OK);
   ASSERT_EQ_INT(count, 3);
-  ASSERT_EQ_INT(sg_anomaly_netseq_count(NULL, 0, false, &count), SG_ANOMALY_OK);
+  ASSERT(isinf(score));
+  ASSERT_EQ_INT(sg_anomaly_score_netseq_count(model, "", 0, &score, &count),
+                SG_ANOMALY_OK);
   ASSERT_EQ_INT(count, 0);
-  ASSERT_EQ_INT(sg_anomaly_netseq_count("", 0, false, &count), SG_ANOMALY_OK);
-  ASSERT_EQ_INT(count, 0);
-  ASSERT_EQ_INT(sg_anomaly_netseq_count("01:x,", 5, false, &count),
-                SG_ANOMALY_ERR_FORMAT);
+  ASSERT(isinf(score));
+  ASSERT_EQ_INT(
+      sg_anomaly_score_netseq_count(model, "01:x,", 5, &score, &count),
+      SG_ANOMALY_ERR_FORMAT);
+  ASSERT(isinf(score) && count == 0);
   ASSERT_EQ_INT(sg_anomaly_model_update_netseq(model, valid, sizeof(valid) - 1),
                 SG_ANOMALY_OK);
   bool observed = false;
@@ -1308,7 +1383,7 @@ TEST(canonical_netseq_contract) {
       sg_anomaly_model_has_observed_netseq(model, "01:a,", 5, &observed),
       SG_ANOMALY_ERR_FORMAT);
   ASSERT_EQ_INT(sg_anomaly_model_vocab_size(model), 3);
-  double score = 0.0;
+  score = 0.0;
   ASSERT_EQ_INT(
       sg_anomaly_model_score_netseq(model, valid, sizeof(valid) - 1, &score),
       SG_ANOMALY_OK);
@@ -1390,33 +1465,36 @@ TEST(canonical_netseq_contract) {
   ASSERT(isinf(score));
 
   const char *oversized_sequence[] = {large, "two words", ":"};
-  char *oversized_netseq = test_encode_netseq(oversized_sequence, 3);
-  ASSERT(oversized_netseq != NULL);
-  ASSERT_EQ_INT(sg_anomaly_model_score_netseq(model, oversized_netseq,
-                                              strlen(oversized_netseq), &score),
-                SG_ANOMALY_OK);
+  shell_netstring_buffer_t oversized_netseq =
+      test_encode_netseq(oversized_sequence, 3);
+  ASSERT(oversized_netseq.data != NULL);
+  ASSERT_EQ_INT(
+      sg_anomaly_model_score_netseq(model, (const char *)oversized_netseq.data,
+                                    oversized_netseq.length, &score),
+      SG_ANOMALY_OK);
   ASSERT(isfinite(score));
-  ASSERT_EQ_INT(sg_anomaly_model_has_observed_netseq(model, oversized_netseq,
-                                                     strlen(oversized_netseq),
-                                                     &observed),
+  ASSERT_EQ_INT(sg_anomaly_model_has_observed_netseq(
+                    model, (const char *)oversized_netseq.data,
+                    oversized_netseq.length, &observed),
                 SG_ANOMALY_OK);
   ASSERT(observed);
-  free(oversized_netseq);
+  shell_netstring_buffer_free(&oversized_netseq);
 
   const char *all_oversized[] = {large, large, large, large};
-  char *all_oversized_netseq = test_encode_netseq(all_oversized, 4);
-  ASSERT(all_oversized_netseq != NULL);
-  ASSERT_EQ_INT(sg_anomaly_model_score_netseq(model, all_oversized_netseq,
-                                              strlen(all_oversized_netseq),
-                                              &score),
+  shell_netstring_buffer_t all_oversized_netseq =
+      test_encode_netseq(all_oversized, 4);
+  ASSERT(all_oversized_netseq.data != NULL);
+  ASSERT_EQ_INT(sg_anomaly_model_score_netseq(
+                    model, (const char *)all_oversized_netseq.data,
+                    all_oversized_netseq.length, &score),
                 SG_ANOMALY_OK);
   ASSERT(isfinite(score));
-  ASSERT_EQ_INT(
-      sg_anomaly_model_has_observed_netseq(
-          model, all_oversized_netseq, strlen(all_oversized_netseq), &observed),
-      SG_ANOMALY_OK);
+  ASSERT_EQ_INT(sg_anomaly_model_has_observed_netseq(
+                    model, (const char *)all_oversized_netseq.data,
+                    all_oversized_netseq.length, &observed),
+                SG_ANOMALY_OK);
   ASSERT(!observed);
-  free(all_oversized_netseq);
+  shell_netstring_buffer_free(&all_oversized_netseq);
   free(large);
   sg_anomaly_model_free(model);
 }
@@ -1445,10 +1523,13 @@ TEST(binary_netseq_persistence) {
   ASSERT_EQ_INT(sg_anomaly_model_trigram_count_view(source, binary, c, d), 1);
   ASSERT_EQ_INT(sg_anomaly_model_fourgram_count_view(source, binary, c, d, e),
                 1);
-  ASSERT_EQ_INT(sg_anomaly_model_unigram_count(source, "a"), 0);
+  ASSERT_EQ_INT(sg_anomaly_model_unigram_count_view(
+                    source, (sg_anomaly_item_view_t){"a", (sizeof("a") - 1)}),
+                0);
   ASSERT_EQ_INT(
       sg_anomaly_model_unigram_count_view(
-          source, (sg_anomaly_item_view_t){.data = binary.data, .length = 0}),
+          source, (sg_anomaly_item_view_t){.data = (const char *)binary.data,
+                                           .length = 0}),
       0);
   ASSERT_EQ_INT(sg_anomaly_model_bigram_count_view(source, binary,
                                                    (sg_anomaly_item_view_t){0}),
@@ -1488,7 +1569,9 @@ TEST(empty_stage_persistence_and_legacy_loading) {
   ASSERT_EQ_INT(sg_anomaly_model_update_netseq(source, sentinel_sequence,
                                                sizeof(sentinel_sequence) - 1),
                 SG_ANOMALY_OK);
-  ASSERT_EQ_INT(sg_anomaly_model_unigram_count(source, ""), 1);
+  ASSERT_EQ_INT(sg_anomaly_model_unigram_count_view(
+                    source, (sg_anomaly_item_view_t){"", (sizeof("") - 1)}),
+                1);
 
   FILE *stream = tmpfile();
   ASSERT(stream != NULL);
@@ -1499,7 +1582,9 @@ TEST(empty_stage_persistence_and_legacy_loading) {
   ASSERT(strcmp(header, "# anomaly-model-v7\n") == 0);
   ASSERT(fseek(stream, 0, SEEK_SET) == 0);
   ASSERT_EQ_INT(sg_anomaly_read_stream(loaded, stream), 0);
-  ASSERT_EQ_INT(sg_anomaly_model_unigram_count(loaded, ""), 1);
+  ASSERT_EQ_INT(sg_anomaly_model_unigram_count_view(
+                    loaded, (sg_anomaly_item_view_t){"", (sizeof("") - 1)}),
+                1);
   ASSERT_EQ_INT(sg_anomaly_model_total_unigrams(loaded), 3);
   ASSERT(fclose(stream) == 0);
 
@@ -1512,7 +1597,7 @@ TEST(empty_stage_persistence_and_legacy_loading) {
   /* v6 uses canonical binary netstring keys but predates the empty
    * redirect-only-stage item, so relabeling this v7 sentinel model must fail
    * atomically. */
-  ASSERT(fseek(stream, strlen("# anomaly-model-v"), SEEK_SET) == 0);
+  ASSERT(fseek(stream, (sizeof("# anomaly-model-v") - 1), SEEK_SET) == 0);
   ASSERT(fputc('6', stream) == '6' && fflush(stream) == 0);
   ASSERT(fseek(stream, 0, SEEK_SET) == 0);
   size_t preserved_unigrams = sg_anomaly_model_total_unigrams(source);
@@ -1530,12 +1615,14 @@ TEST(empty_stage_persistence_and_legacy_loading) {
   stream = tmpfile();
   ASSERT(stream != NULL);
   ASSERT_EQ_INT(sg_anomaly_write_stream(legacy_source, stream), 0);
-  ASSERT(fseek(stream, strlen("# anomaly-model-v"), SEEK_SET) == 0);
+  ASSERT(fseek(stream, (sizeof("# anomaly-model-v") - 1), SEEK_SET) == 0);
   ASSERT(fputc('6', stream) == '6' && fflush(stream) == 0);
   ASSERT(fseek(stream, 0, SEEK_SET) == 0);
   /* A non-empty legacy v6 model remains supported. */
   ASSERT_EQ_INT(sg_anomaly_read_stream(loaded, stream), 0);
-  ASSERT_EQ_INT(sg_anomaly_model_unigram_count(loaded, ""), 0);
+  ASSERT_EQ_INT(sg_anomaly_model_unigram_count_view(
+                    loaded, (sg_anomaly_item_view_t){"", (sizeof("") - 1)}),
+                0);
   ASSERT_EQ_INT(sg_anomaly_model_total_unigrams(loaded), 3);
   ASSERT(fclose(stream) == 0);
   sg_anomaly_model_free(legacy_source);
@@ -1572,8 +1659,14 @@ TEST(typed_stream_io_failure_atomicity) {
       ASSERT_EQ_INT(status, errors[e] == ENOMEM ? SG_ANOMALY_ERR_MEMORY
                                                 : SG_ANOMALY_ERR_IO);
       ASSERT_EQ_INT(sg_anomaly_model_total_unigrams(target), 3);
-      ASSERT_EQ_INT(sg_anomaly_model_unigram_count(target, "x"), 1);
-      ASSERT_EQ_INT(sg_anomaly_model_unigram_count(target, "a"), 0);
+      ASSERT_EQ_INT(
+          sg_anomaly_model_unigram_count_view(
+              target, (sg_anomaly_item_view_t){"x", (sizeof("x") - 1)}),
+          1);
+      ASSERT_EQ_INT(
+          sg_anomaly_model_unigram_count_view(
+              target, (sg_anomaly_item_view_t){"a", (sizeof("a") - 1)}),
+          0);
     }
   }
   for (size_t i = 1; i <= writes; i++) {
@@ -1587,7 +1680,9 @@ TEST(typed_stream_io_failure_atomicity) {
   }
   rewind(stream);
   ASSERT_EQ_INT(sg_anomaly_read_stream(target, stream), SG_ANOMALY_OK);
-  ASSERT_EQ_INT(sg_anomaly_model_unigram_count(target, "a"), 1);
+  ASSERT_EQ_INT(sg_anomaly_model_unigram_count_view(
+                    target, (sg_anomaly_item_view_t){"a", (sizeof("a") - 1)}),
+                1);
   ASSERT(fclose(stream) == 0);
   sg_anomaly_model_free(source);
   sg_anomaly_model_free(target);
@@ -2242,7 +2337,9 @@ TEST(persisted_counter_accumulation_is_exact) {
   ASSERT(write_count_record(stream, 1, "1:a,", 1));
   ASSERT(fflush(stream) == 0 && fseek(stream, 0, SEEK_SET) == 0);
   ASSERT_EQ_INT(sg_anomaly_read_stream(target, stream), SG_ANOMALY_OK);
-  ASSERT_EQ_INT(sg_anomaly_model_unigram_count(target, "a"), (size_t)INT64_MAX);
+  ASSERT_EQ_INT(sg_anomaly_model_unigram_count_view(
+                    target, (sg_anomaly_item_view_t){"a", (sizeof("a") - 1)}),
+                (size_t)INT64_MAX);
   ASSERT_EQ_INT(sg_anomaly_model_total_unigrams(target), (size_t)INT64_MAX);
   ASSERT(fclose(stream) == 0);
   stream = tmpfile();
@@ -2251,8 +2348,10 @@ TEST(persisted_counter_accumulation_is_exact) {
   ASSERT(fseek(stream, 0, SEEK_SET) == 0);
   sg_anomaly_model_t *roundtrip = NULL;
   ASSERT_EQ_INT(sg_anomaly_model_read_new(stream, &roundtrip), SG_ANOMALY_OK);
-  ASSERT_EQ_INT(sg_anomaly_model_unigram_count(roundtrip, "a"),
-                (size_t)INT64_MAX);
+  ASSERT_EQ_INT(
+      sg_anomaly_model_unigram_count_view(
+          roundtrip, (sg_anomaly_item_view_t){"a", (sizeof("a") - 1)}),
+      (size_t)INT64_MAX);
   ASSERT_EQ_INT(sg_anomaly_model_total_unigrams(roundtrip), (size_t)INT64_MAX);
   ASSERT(fclose(stream) == 0);
   sg_anomaly_model_free(roundtrip);
@@ -2344,11 +2443,24 @@ TEST(decay_preserves_integer_precision) {
                        ? expected_dyadic_decay(SIZE_MAX, scales[j].numerator,
                                                scales[j].bits)
                        : expected_near_one_decay(SIZE_MAX));
-      ASSERT_EQ_INT(sg_anomaly_model_unigram_count(model, "a"), expected);
-      ASSERT_EQ_INT(sg_anomaly_model_bigram_count(model, "a", "a"), expected);
-      ASSERT_EQ_INT(sg_anomaly_model_trigram_count(model, "a", "a", "a"),
+      ASSERT_EQ_INT(
+          sg_anomaly_model_unigram_count_view(
+              model, (sg_anomaly_item_view_t){"a", (sizeof("a") - 1)}),
+          expected);
+      ASSERT_EQ_INT(sg_anomaly_model_bigram_count_view(
+                        model, (sg_anomaly_item_view_t){"a", (sizeof("a") - 1)},
+                        (sg_anomaly_item_view_t){"a", (sizeof("a") - 1)}),
                     expected);
-      ASSERT_EQ_INT(sg_anomaly_model_fourgram_count(model, "a", "a", "a", "a"),
+      ASSERT_EQ_INT(sg_anomaly_model_trigram_count_view(
+                        model, (sg_anomaly_item_view_t){"a", (sizeof("a") - 1)},
+                        (sg_anomaly_item_view_t){"a", (sizeof("a") - 1)},
+                        (sg_anomaly_item_view_t){"a", (sizeof("a") - 1)}),
+                    expected);
+      ASSERT_EQ_INT(sg_anomaly_model_fourgram_count_view(
+                        model, (sg_anomaly_item_view_t){"a", (sizeof("a") - 1)},
+                        (sg_anomaly_item_view_t){"a", (sizeof("a") - 1)},
+                        (sg_anomaly_item_view_t){"a", (sizeof("a") - 1)},
+                        (sg_anomaly_item_view_t){"a", (sizeof("a") - 1)}),
                     expected);
       ASSERT_EQ_INT(sg_anomaly_model_total_unigrams(model), expected);
       ASSERT_EQ_INT(sg_anomaly_model_total_bigrams(model), expected);
@@ -2379,17 +2491,22 @@ TEST(decay_preserves_integer_precision) {
   sg_test_alloc_fail_at(1);
   ASSERT_EQ_INT(sg_anomaly_model_decay(model, 0.5), SG_ANOMALY_ERR_MEMORY);
   sg_test_alloc_reset();
-  ASSERT_EQ_INT(sg_anomaly_model_unigram_count(model, "a"), (size_t)INT64_MAX);
+  ASSERT_EQ_INT(sg_anomaly_model_unigram_count_view(
+                    model, (sg_anomaly_item_view_t){"a", (sizeof("a") - 1)}),
+                (size_t)INT64_MAX);
   ASSERT_EQ_INT(sg_anomaly_model_unknown_count(model), SIZE_MAX);
   sg_test_anomaly_op_fail_at(1);
   ASSERT_EQ_INT(sg_anomaly_model_decay(model, 0.5), SG_ANOMALY_ERR_MEMORY);
   sg_test_anomaly_op_reset();
-  ASSERT_EQ_INT(sg_anomaly_model_unigram_count(model, "a"), (size_t)INT64_MAX);
+  ASSERT_EQ_INT(sg_anomaly_model_unigram_count_view(
+                    model, (sg_anomaly_item_view_t){"a", (sizeof("a") - 1)}),
+                (size_t)INT64_MAX);
   ASSERT_EQ_INT(sg_anomaly_model_unknown_count(model), SIZE_MAX);
   /* 0.1 is not exactly 1/10 in binary; these constants are the exact floor
    * of the product with its represented value, not decimal approximations. */
   ASSERT_EQ_INT(sg_anomaly_model_decay(model, 0.1), SG_ANOMALY_OK);
-  ASSERT_EQ_INT(sg_anomaly_model_unigram_count(model, "a"),
+  ASSERT_EQ_INT(sg_anomaly_model_unigram_count_view(
+                    model, (sg_anomaly_item_view_t){"a", (sizeof("a") - 1)}),
                 UINT64_C(922337203685477631));
   ASSERT_EQ_INT(sg_anomaly_model_unknown_count(model),
                 UINT64_C(1844674407370955263));
@@ -2528,6 +2645,92 @@ TEST(paired_netseq_updates_are_failure_atomic) {
   sg_anomaly_model_free(raw);
 }
 
+TEST(count_views_preserve_exact_binary_spans) {
+  sg_anomaly_model_t *model = sg_anomaly_model_new();
+  ASSERT(model != NULL);
+  sg_anomaly_item_view_t items[4];
+  char encoded[24];
+  size_t used = 0;
+  for (size_t i = 0; i < 4; i++) {
+    char *bytes = malloc(3);
+    ASSERT(bytes != NULL);
+    bytes[0] = (char)('a' + i);
+    bytes[1] = '\0';
+    bytes[2] = 'x';
+    items[i] = (sg_anomaly_item_view_t){bytes, 3};
+    size_t written = 0;
+    ASSERT_EQ_INT(shell_netstring_write(encoded + used, sizeof(encoded) - used,
+                                        bytes, 3, &written),
+                  SHELL_NETSTRING_OK);
+    used += written;
+  }
+  ASSERT_EQ_INT(sg_anomaly_model_update_netseq(model, encoded, used),
+                SG_ANOMALY_OK);
+  ASSERT_EQ_INT(sg_anomaly_model_unigram_count_view(model, items[0]), 1);
+  ASSERT_EQ_INT(sg_anomaly_model_bigram_count_view(model, items[0], items[1]),
+                1);
+  ASSERT_EQ_INT(
+      sg_anomaly_model_trigram_count_view(model, items[0], items[1], items[2]),
+      1);
+  ASSERT_EQ_INT(sg_anomaly_model_fourgram_count_view(model, items[0], items[1],
+                                                     items[2], items[3]),
+                1);
+  for (size_t i = 0; i < 4; i++) {
+    char *bytes = (char *)items[i].data;
+    bytes[2] = 'y';
+    ASSERT_EQ_INT(sg_anomaly_model_unigram_count_view(model, items[i]), 0);
+    if (i < 2)
+      ASSERT_EQ_INT(
+          sg_anomaly_model_bigram_count_view(model, items[0], items[1]), 0);
+    if (i < 3)
+      ASSERT_EQ_INT(sg_anomaly_model_trigram_count_view(model, items[0],
+                                                        items[1], items[2]),
+                    0);
+    ASSERT_EQ_INT(sg_anomaly_model_fourgram_count_view(
+                      model, items[0], items[1], items[2], items[3]),
+                  0);
+    bytes[2] = 'x';
+  }
+  /* Empty stages represent argv-less commands, not absent keys. */
+  ASSERT_EQ_INT(sg_anomaly_model_update_netseq(model, "0:,0:,0:,0:,", 12),
+                SG_ANOMALY_OK);
+  sg_anomaly_item_view_t empty = {encoded, 0};
+  ASSERT_EQ_INT(sg_anomaly_model_unigram_count_view(model, empty), 4);
+  ASSERT_EQ_INT(sg_anomaly_model_bigram_count_view(model, empty, empty), 3);
+  ASSERT_EQ_INT(sg_anomaly_model_trigram_count_view(model, empty, empty, empty),
+                2);
+  ASSERT_EQ_INT(
+      sg_anomaly_model_fourgram_count_view(model, empty, empty, empty, empty),
+      1);
+  char overlong[SG_ANOMALY_MAX_STAGE_LENGTH + 1];
+  memset(overlong, 'x', sizeof(overlong));
+  const sg_anomaly_item_view_t invalid[] = {
+      {NULL, 0},
+      {NULL, 1},
+      {overlong, sizeof(overlong)},
+  };
+  for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
+    ASSERT_EQ_INT(sg_anomaly_model_unigram_count_view(model, invalid[i]), 0);
+    for (size_t position = 0; position < 4; position++) {
+      sg_anomaly_item_view_t query[] = {items[0], items[1], items[2], items[3]};
+      query[position] = invalid[i];
+      if (position < 2)
+        ASSERT_EQ_INT(
+            sg_anomaly_model_bigram_count_view(model, query[0], query[1]), 0);
+      if (position < 3)
+        ASSERT_EQ_INT(sg_anomaly_model_trigram_count_view(model, query[0],
+                                                          query[1], query[2]),
+                      0);
+      ASSERT_EQ_INT(sg_anomaly_model_fourgram_count_view(
+                        model, query[0], query[1], query[2], query[3]),
+                    0);
+    }
+  }
+  for (size_t i = 0; i < 4; i++)
+    free((void *)items[i].data);
+  sg_anomaly_model_free(model);
+}
+
 int main(void) {
   atexit(cleanup_anomaly_temp_file);
   atexit(cleanup_anomaly_save_fixture);
@@ -2536,6 +2739,7 @@ int main(void) {
   RUN(config_contract);
   RUN(extreme_alpha_scores_are_finite);
   RUN(update_count_matrix);
+  RUN(count_views_preserve_exact_binary_spans);
   RUN(score_discrimination_matrix);
   RUN(backoff_levels_are_usable);
   RUN(model_owns_string_copies);

@@ -227,12 +227,6 @@ void shell_commands_free(shell_command_t *commands, size_t command_count);
  */
 const char *shell_token_type_name(shell_token_type_t type);
 
-/**
- * Check if command has shell scripting features
- */
-bool shell_command_has_shell_features(const shell_command_t *command)
-    SHELL_NONNULL(1);
-
 #ifdef __cplusplus
 }
 #endif

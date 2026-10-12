@@ -60,12 +60,14 @@ static int suggestions_equal(const st_suggestion_t *actual, size_t actual_count,
     return 0;
   }
   for (size_t i = 0; i < expected_count; i++) {
-    char *expected_pattern = NULL;
+    st_netpattern_t expected_pattern = {0};
     int same = actual[i].pattern &&
-               st_netpattern_from_cpl(expected[i].pattern, &expected_pattern) ==
-                   ST_OK &&
-               strcmp(actual[i].pattern, expected_pattern) == 0;
-    free(expected_pattern);
+               st_netpattern_from_cpl_owned(expected[i].pattern,
+                                            &expected_pattern) == ST_OK &&
+               (actual[i].pattern_length != expected_pattern.length ||
+                memcmp(actual[i].pattern, expected_pattern.data,
+                       actual[i].pattern_length)) == 0;
+    st_netpattern_free(&expected_pattern);
     if (!same || actual[i].count != expected[i].count ||
         fabs(actual[i].confidence - expected[i].confidence) > 0.000001)
       return 0;
@@ -80,8 +82,10 @@ static int suggestions_replay_exactly(const st_suggestion_t *suggestions,
   for (size_t i = 0; i < suggestion_count; i++) {
     st_policy_ctx_t *context = st_policy_ctx_new();
     st_policy_t *policy = context ? st_policy_new(context) : NULL;
-    if (!policy ||
-        test_st_policy_add(policy, suggestions[i].pattern) != ST_OK) {
+    if (!policy || st_policy_add_netpattern_view(
+                       policy, (st_netpattern_view_t){
+                                   suggestions[i].pattern,
+                                   suggestions[i].pattern_length}) != ST_OK) {
       st_policy_free(policy);
       st_policy_ctx_release(context);
       return 0;

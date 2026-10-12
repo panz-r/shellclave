@@ -1353,7 +1353,7 @@ typedef struct {
 
 static inline bool shell_source_match_heredoc_byte(unsigned char byte,
                                                    void *context) {
-  shell_source_heredoc_match_t *match = context;
+  shell_source_heredoc_match_t *match = (shell_source_heredoc_match_t *)context;
   /* Bash truncates one ANSI-C quoted segment at its first decoded NUL. The
    * matcher resets this flag before resuming with later word fragments. */
   if (match->terminated || match->mismatch)
@@ -4275,7 +4275,8 @@ typedef struct {
 
 static SHELL_NONNULL(2) inline bool shell_source_brace_ansi_byte(
     unsigned char byte, void *context) {
-  shell_source_brace_ansi_context_t *ansi = context;
+  shell_source_brace_ansi_context_t *ansi =
+      (shell_source_brace_ansi_context_t *)context;
   ansi->fragment->has_nul = ansi->fragment->has_nul || byte == 0;
   shell_source_glob_scan_step(ansi->glob, byte, true);
   return true;
@@ -4283,7 +4284,7 @@ static SHELL_NONNULL(2) inline bool shell_source_brace_ansi_byte(
 
 static SHELL_NONNULL(2) inline bool shell_source_glob_ansi_byte(
     unsigned char byte, void *context) {
-  shell_source_glob_scan_step(context, byte, true);
+  shell_source_glob_scan_step((shell_source_glob_scan_t *)context, byte, true);
   return true;
 }
 
@@ -4805,7 +4806,8 @@ typedef struct {
  * visitor rejection, not missing caller storage. */
 static inline SHELL_NONNULL(2) bool shell_source_assignment_emit(
     unsigned char byte, void *context) {
-  shell_source_assignment_scan_t *scan = context;
+  shell_source_assignment_scan_t *scan =
+      (shell_source_assignment_scan_t *)context;
   if (!scan->valid)
     return false;
   if (scan->found)
@@ -4911,7 +4913,8 @@ typedef struct {
 /* Required live match accumulator, supplied by word_static_equals. */
 static inline SHELL_NONNULL(2) bool shell_source_static_word_match_byte(
     unsigned char byte, void *context) {
-  shell_source_static_word_match_t *match = context;
+  shell_source_static_word_match_t *match =
+      (shell_source_static_word_match_t *)context;
   if (match->position >= match->expected_length ||
       byte != (unsigned char)match->expected[match->position])
     match->matches = false;
@@ -5049,7 +5052,7 @@ typedef struct {
 /* Required live dash accumulator; context is not optional here. */
 static inline SHELL_NONNULL(2) bool shell_source_static_dash_byte(
     unsigned char byte, void *context) {
-  shell_source_static_dash_t *dash = context;
+  shell_source_static_dash_t *dash = (shell_source_static_dash_t *)context;
   if (dash->position == 0)
     dash->starts_dash = byte == '-';
   dash->position++;
@@ -5080,7 +5083,8 @@ typedef struct {
 /* Required live option accumulator; context is not optional here. */
 static inline SHELL_NONNULL(2) bool shell_source_command_option_byte(
     unsigned char byte, void *context) {
-  shell_source_command_option_scan_t *scan = context;
+  shell_source_command_option_scan_t *scan =
+      (shell_source_command_option_scan_t *)context;
   if (scan->position == 0) {
     scan->valid = byte == '-';
   } else if (byte == 'p') {
@@ -5198,16 +5202,6 @@ static inline SHELL_NONNULL(1, 2) shell_source_wrapper_step_t
   }
   state->kind = SHELL_SOURCE_WRAPPER_NONE;
   return SHELL_SOURCE_WRAPPER_STATIC_TARGET;
-}
-
-/* Redirect topology needs the same static-word rule. The explicit name keeps
- * call sites clear when they must distinguish a concrete FILE DOC from a
- * runtime pathname or a descriptor-ambiguous operand. */
-static inline bool
-shell_source_redirect_word_has_dynamic_path_syntax(const char *input,
-                                                   size_t length) {
-  return shell_source_word_has_dynamic_syntax_in_context(
-      input, length, SHELL_SOURCE_WORD_ARGUMENT);
 }
 
 /* At a lexical word boundary, skip one complete redirection and its operand.

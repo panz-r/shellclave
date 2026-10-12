@@ -17,6 +17,7 @@
 
 /* shelltype provides suggestion and token-variant result types. */
 #include "sg_anomaly.h"
+#include "shell_expand.h"
 #include "shell_tokenizer.h"
 #include "shelltype.h"
 
@@ -171,25 +172,9 @@ typedef struct {
    * does not by itself set requires_substitution_evaluation or claim code
    * execution or risk. */
   bool has_dynamic_substitution_io;
-  /* Replaces `substitution_parent_index`, removed in 0.7.0: result index of
-   * the unique simple-command consumer of this direct producer. A HEREDOC DOC
-   * indirection resolves to its READ owner; group, endpoint, and ambiguous
-   * routes remain -1. */
-  int32_t substitution_consumer_index;
-  /* Legacy field retained for source compatibility. Always -1: group nodes
-   * are graph-only and result entries describe simple commands. Use
-   * group_depth and group_kinds for command membership. */
-  int32_t group_parent_index;
-  uint16_t group_depth; /* Enclosing command-group nesting depth. */
-  uint8_t group_kinds;  /* shell_group_kind_t bitset of enclosing groups. */
-  bool backgrounded;    /* Command runs in the background via '&'. */
-  /* Effective Bash `time` mode for this application-facing command result.
-   * Shellgate flattens the nearest timed enclosing GROUP onto its contained
-   * commands when no nearer local pipeline timing applies. This differs from
-   * the dependency graph, which retains compound timing on the GROUP node.
-   * The reserved prefix is not part of canonical netargv or policy matching.
-   */
-  shell_pipeline_time_mode_t pipeline_time_mode;
+  /* Structural relationships, group membership, background execution, and
+   * pipeline timing belong to Shellsplit's dependency graph, not this policy
+   * result. Applications needing topology use Shellsplit directly. */
   uint32_t violation_category_flags;
   uint32_t violation_type_flags;
 } sg_subcommand_result_t;
@@ -393,80 +378,64 @@ typedef struct {
 
 void sg_violation_config_default(sg_violation_config_t *cfg) SHELL_NONNULL(1);
 
-/* --- EXPANSION CALLBACKS --- */
-
-/* Whole-word expansion callbacks receive the exact isolated source spelling
- * and return its final canonical netargv. Neither span need be NUL-terminated;
- * the resolved netargv may contain embedded NUL bytes and is interpreted only
- * by its explicit length. On SG_EXPAND_RESOLVED, the callback must provide a
- * canonical netargv (or NULL with length zero for an empty expansion). The
- * returned bytes must remain valid and unchanged until the enclosing
- * sg_gate_evaluate() call returns, including across later callback invocations.
- * They are never reparsed as shell source. Output values are ignored
- * for other statuses. Failed or malformed results make sg_gate_evaluate()
- * return SG_ERR_EXPAND.
- *
- * The application performs quote-sensitive composition, splitting and globbing
- * in Bash expansion order. It must return a result valid for every execution
- * state reaching this expansion point, accounting for earlier/scoped effects;
- * otherwise return UNRESOLVED. This library never executes an expansion.
- * Bash assignment-shaped tilde expansion (name=~, name+=~, name=a:~) also
- * applies to FILE operands, including $(<name=~), but not here-string data.
- * Source syntax is validated before callbacks. Command identity, wrappers,
- * assignments, cd and shell-state/descriptor operands are not resolved here.
- * This includes printf %b operands in formats containing %n: an expanded
- * '\c' can suppress later variable writes, including on format reuse.
- * Ordinary printf data, including %b without %n, remains eligible.
- * Callback ordering follows analysis phases, not runtime scheduling or policy
- * short-circuiting. Each eligible dynamic source word is queried at most once.
- * Resolution does not discharge executable-substitution inspection obligations.
- * Unresolved words retain processed-source policy behavior and set result
- * flags. A pathname must resolve to one nonempty NUL-free record. Zero/multiple
- * records or an empty pathname model redirection failure; NUL is SG_ERR_EXPAND.
- */
-typedef enum {
-  SG_EXPAND_UNRESOLVED = 0,
-  SG_EXPAND_RESOLVED = 1,
-  SG_EXPAND_FAILED = -1,
-} sg_expand_status_t;
-
-typedef enum {
-  SG_EXPAND_WORD_ARGUMENT = 0,
-  SG_EXPAND_WORD_REDIRECT_PATH,
-  SG_EXPAND_WORD_FILE_SUBSTITUTION_PATH,
-} sg_expand_word_purpose_t;
-
 enum {
   SG_EXPANSION_UNRESOLVED_ARGV = 1u << 0,
   SG_EXPANSION_UNRESOLVED_PATH = 1u << 1,
 };
 
-/* Source/word/owner spans borrow immutable source for this evaluation.
- * owner_offset/length identify the immediate command or group. The request
- * object and its borrowed NUL-terminated cwd string are valid only during the
- * callback; copy them if retaining them. cwd is NULL iff cwd_known is false;
- * a known relative CWD is not an absolute filesystem identity. Mixed quoting
- * is conveyed by the word's exact spelling, not a single quoted boolean.
- * Returned netargv storage, unlike the request/CWD, must remain immutable
- * until evaluation returns, as described above. */
-typedef struct {
-  const char *source;
-  size_t source_length;
-  size_t word_offset, word_length;
-  size_t owner_offset, owner_length;
-  sg_expand_word_purpose_t purpose;
-  const char *cwd;
-  bool cwd_known, cwd_absolute;
-} sg_expand_word_request_t;
-
-typedef sg_expand_status_t (*sg_expand_word_netargv_fn)(
-    const sg_expand_word_request_t *request, const char **netargv,
-    size_t *netargv_length, void *user_ctx) SHELL_NONNULL(1, 2, 3);
-
 /* --- LIFECYCLE --- */
 
 sg_gate_t *sg_gate_new(void);
 void sg_gate_free(sg_gate_t *gate);
+
+/* Create a gate with supplied allow/deny policies instead of empty policies.
+ * Owned inputs are distinct, exclusively caller-owned objects. Ownership
+ * transfers only on success; on allocation failure the caller still owns both.
+ * Borrowed inputs remain owned by the application (or another gate), which
+ * must keep them alive until all borrowing gates detach and readers finish.
+ * Installed policies are logically immutable: do not mutate, load, compact,
+ * clear or free them. Evaluation can warm caches and update statistics.
+ * Policies need not share a context; each policy retains its own context. */
+sg_gate_t *sg_gate_new_with_policies_owned(st_policy_t *allow,
+                                           st_policy_t *deny)
+    SHELL_NONNULL(1, 2);
+sg_gate_t *sg_gate_new_with_policies_borrowed(const st_policy_t *allow,
+                                              const st_policy_t *deny)
+    SHELL_NONNULL(1, 2);
+
+/* Replace one policy without allocating or copying its rules. Owned setters
+ * transfer exclusive ownership of a caller-owned replacement to this gate;
+ * the replacement must not have another owner. Existing borrowed views do
+ * not prevent ownership transfer, provided their lifetime remains valid.
+ * Borrowed setters retain only a logical read-only view of a policy owned by
+ * the application or another gate. That owner must keep the policy alive
+ * until all borrowers detach and all readers and borrowed views finish.
+ * The retired policy is freed only if this gate owned it. Neither kind of
+ * replacement may alias an owned policy destroyed by this operation. Before
+ * destroying the retired policy, detach every gate borrowing it and finish
+ * its readers and borrowed views.
+ * Serialize replacement/destruction against evaluation of this gate. Build
+ * replacements with Shelltype before installation, never through these views.
+ * These caller lifetime/ownership requirements are not checked at runtime. */
+void sg_gate_set_allow_policy_owned(sg_gate_t *gate, st_policy_t *policy)
+    SHELL_NONNULL(1, 2);
+void sg_gate_set_deny_policy_owned(sg_gate_t *gate, st_policy_t *policy)
+    SHELL_NONNULL(1, 2);
+void sg_gate_set_allow_policy_borrowed(sg_gate_t *gate,
+                                       const st_policy_t *policy)
+    SHELL_NONNULL(1, 2);
+void sg_gate_set_deny_policy_borrowed(sg_gate_t *gate,
+                                      const st_policy_t *policy)
+    SHELL_NONNULL(1, 2);
+
+/* Borrow the installed logical read-only policy. Never mutate or free it.
+ * Its gate association expires at replacement or gate destruction; an owned
+ * retired policy is destroyed then. Shared policy statistics are aggregate,
+ * not per gate. Use Shelltype directly for evaluation, inspection and save. */
+const st_policy_t *sg_gate_allow_policy_borrowed(const sg_gate_t *gate)
+    SHELL_NONNULL(1);
+const st_policy_t *sg_gate_deny_policy_borrowed(const sg_gate_t *gate)
+    SHELL_NONNULL(1);
 
 /* --- ANOMALY DETECTION CONFIGURATION --- */
 
@@ -677,10 +646,15 @@ sg_error_t sg_gate_load_anomaly_model(sg_gate_t *gate, const char *path)
  */
 bool sg_gate_anomaly_had_error(const sg_gate_t *gate) SHELL_NONNULL(1);
 
-/*
- * Returns the number of unique anomaly stages in the anomaly model.
- */
-size_t sg_gate_anomaly_vocab_size(const sg_gate_t *gate) SHELL_NONNULL(1);
+/* Borrow the component models for direct read-only anomaly API operations.
+ * NULL means disabled. Never mutate or free these models. Successful enable,
+ * load, disable or gate destruction invalidates the handles; failed replacement
+ * preserves them. Evaluation may learn in place. Serialize access against gate
+ * evaluation, model replacement and destruction. */
+const sg_anomaly_model_t *
+sg_gate_anomaly_raw_model_borrowed(const sg_gate_t *gate) SHELL_NONNULL(1);
+const sg_anomaly_model_t *
+sg_gate_anomaly_type_model_borrowed(const sg_gate_t *gate) SHELL_NONNULL(1);
 
 /* --- CONFIGURATION --- */
 
@@ -707,9 +681,14 @@ sg_error_t sg_gate_set_stop_mode(sg_gate_t *gate, sg_stop_mode_t mode)
 sg_error_t sg_gate_set_suggestions(sg_gate_t *gate, bool enabled)
     SHELL_NONNULL(1);
 
-/* NULL fn disables resolution; user_ctx is optional application state. */
+/* Uses Shellsplit's public resolution contract. NULL fn disables resolution;
+ * user_ctx is optional application state. Returned payloads must stay immutable
+ * until sg_gate_evaluate() returns; its private graph does not escape that
+ * call. Results are reused for graph construction and policy evaluation, with
+ * at most one query per eligible word. Resolution never discharges SUBST
+ * inspection. */
 sg_error_t sg_gate_set_expand_word_netargv(sg_gate_t *gate,
-                                           sg_expand_word_netargv_fn fn,
+                                           shell_expand_word_netargv_fn fn,
                                            void *user_ctx) SHELL_NONNULL(1);
 
 /*
@@ -723,49 +702,6 @@ sg_error_t sg_gate_set_expand_word_netargv(sg_gate_t *gate,
  */
 sg_error_t sg_gate_set_violation_config_borrowed(
     sg_gate_t *gate, const sg_violation_config_t *config) SHELL_NONNULL(1, 2);
-
-/* --- POLICY MANAGEMENT --- */
-
-/* Loads and atomically appends rules to the existing allow policy. Malformed
- * policy data returns SG_ERR_PARSE; allocation and I/O failures preserve the
- * current policy and return SG_ERR_MEMORY and SG_ERR_IO respectively. */
-sg_error_t sg_gate_load_policy(sg_gate_t *gate, const char *path)
-    SHELL_NONNULL(1, 2);
-/* Policy persistence reports allocation and I/O failures distinctly. */
-sg_error_t sg_gate_save_policy(const sg_gate_t *gate, const char *path)
-    SHELL_NONNULL(1, 2);
-/* Canonical netpattern mutation for programmatic callers. Invalid patterns and
- * policy capacity limits return SG_ERR_INVALID; allocation failures return
- * SG_ERR_MEMORY without changing the policy. Batch additions are atomic. */
-sg_error_t sg_gate_add_allow_netpattern(sg_gate_t *gate, const char *netpattern)
-    SHELL_NONNULL(1, 2);
-sg_error_t sg_gate_remove_allow_netpattern(sg_gate_t *gate,
-                                           const char *netpattern)
-    SHELL_NONNULL(1, 2);
-sg_error_t sg_gate_batch_add_allow_netpatterns(sg_gate_t *gate,
-                                               const char *const *netpatterns,
-                                               size_t count) SHELL_NONNULL(1);
-sg_error_t sg_gate_add_deny_netpattern(sg_gate_t *gate, const char *netpattern)
-    SHELL_NONNULL(1, 2);
-sg_error_t sg_gate_remove_deny_netpattern(sg_gate_t *gate,
-                                          const char *netpattern)
-    SHELL_NONNULL(1, 2);
-sg_error_t sg_gate_batch_add_deny_netpatterns(sg_gate_t *gate,
-                                              const char *const *netpatterns,
-                                              size_t count) SHELL_NONNULL(1);
-
-/* Human-facing CPL adapters. They convert CPL explicitly before using the
- * corresponding canonical netpattern mutation operation. */
-sg_error_t sg_gate_add_allow_cpl(sg_gate_t *gate, const char *pattern)
-    SHELL_NONNULL(1, 2);
-sg_error_t sg_gate_remove_allow_cpl(sg_gate_t *gate, const char *pattern)
-    SHELL_NONNULL(1, 2);
-size_t sg_gate_allow_rule_count(const sg_gate_t *gate) SHELL_NONNULL(1);
-sg_error_t sg_gate_add_deny_cpl(sg_gate_t *gate, const char *pattern)
-    SHELL_NONNULL(1, 2);
-sg_error_t sg_gate_remove_deny_cpl(sg_gate_t *gate, const char *pattern)
-    SHELL_NONNULL(1, 2);
-size_t sg_gate_deny_rule_count(const sg_gate_t *gate) SHELL_NONNULL(1);
 
 /* --- EVALUATION --- */
 
@@ -853,27 +789,9 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
  */
 size_t sg_gate_evaluate_size_hint(size_t cmd_len);
 
-/* --- SUGGESTION TOKEN VARIANTS (for TUI edit mode) --- */
-
-/**
- * Given a human CPL suggestion and a token position, return the possible type
- * variants at that position, ordered from literal/specific to general.
- *
- * @param pattern      Human CPL pattern (e.g., "timeout #n ls")
- * @param edit_pos     Token position to get variants for (0-indexed)
- * @param out_variants Output array (caller allocates, ST_MAX_TOKEN_VARIANTS)
- * @param max_variants Capacity of out_variants
- * @return Number of variants written (0 if position not found or invalid)
- */
-size_t sg_cpl_token_variants_at(const char *pattern, size_t edit_pos,
-                                st_token_variant_t *out_variants,
-                                size_t max_variants) SHELL_NONNULL(1, 3);
-
 /* --- RESULT HELPERS --- */
 
 const char *sg_verdict_name(sg_verdict_t v);
-uint32_t sg_result_violation_dropped(const sg_result_t *result)
-    SHELL_NONNULL(1);
 
 #ifdef __cplusplus
 }

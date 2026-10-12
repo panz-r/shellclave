@@ -230,13 +230,6 @@ static SHELL_NONNULL(1) char *abstract_variable_name_copy(
 }
 
 /**
- * Check if string contains glob characters
- */
-static bool is_glob_pattern(const char *s, size_t len) {
-  return shell_source_word_has_glob(s, len);
-}
-
-/**
  * Check if string is an absolute path
  */
 static bool is_absolute_path(const char *s, size_t len) {
@@ -335,7 +328,7 @@ shell_token_type_t shell_classify_raw_token(const char *text, size_t len) {
 
   /* A word can start/end with quoted fragments and still contain active
    * pattern syntax between them. Classify the whole word, not its endpoints. */
-  bool has_glob = is_glob_pattern(text, len);
+  bool has_glob = shell_source_word_has_glob(text, len);
 
   // Handle quoted strings
   if (!has_glob && ((text[0] == '"' && text[len - 1] == '"') ||
@@ -447,7 +440,7 @@ static shell_abstract_type_t get_abstract_type(shell_token_type_t tok_type,
       return SHELL_ABSTRACT_STR;
     }
     // Check glob before path (path check catches relative paths with /)
-    if (is_glob_pattern(text, len)) {
+    if (shell_source_word_has_glob(text, len)) {
       return SHELL_ABSTRACT_GB;
     }
     if (is_absolute_path(text, len)) {
@@ -1433,21 +1426,9 @@ shell_abstract_command_parse(const char *command, size_t command_length,
 
 /* --- QUERY FUNCTIONS --- */
 
-const char *
-shell_abstract_command_get_display_text(const shell_abstract_command_t *cmd) {
-  return cmd->display_text;
-}
-
-const char *
-shell_abstract_command_get_source(const shell_abstract_command_t *cmd) {
-  return cmd->original;
-}
-
 const shell_abstract_element_t *const *
 shell_abstract_command_get_elements(const shell_abstract_command_t *cmd,
                                     size_t *count) {
-  *count = 0;
-
   *count = cmd->element_count;
   return (const shell_abstract_element_t *const *)cmd->elements;
 }
@@ -1455,8 +1436,6 @@ shell_abstract_command_get_elements(const shell_abstract_command_t *cmd,
 shell_abstract_element_t *const *
 shell_abstract_command_get_mutable_elements(shell_abstract_command_t *cmd,
                                             size_t *count) {
-  *count = 0;
-
   *count = cmd->element_count;
   return cmd->elements;
 }
@@ -1467,57 +1446,6 @@ shell_abstract_command_get_element(shell_abstract_command_t *cmd,
   if (index >= cmd->element_count)
     return NULL;
   return cmd->elements[index];
-}
-
-bool shell_abstract_command_has_variables(const shell_abstract_command_t *cmd) {
-  return cmd->has_variables;
-}
-
-bool shell_abstract_command_has_pos_vars(const shell_abstract_command_t *cmd) {
-  return cmd->has_pos_vars;
-}
-
-bool shell_abstract_command_has_special_vars(
-    const shell_abstract_command_t *cmd) {
-  return cmd->has_special_vars;
-}
-
-bool shell_abstract_command_has_globs(const shell_abstract_command_t *cmd) {
-  return cmd->has_globs;
-}
-
-bool shell_abstract_command_has_paths(const shell_abstract_command_t *cmd) {
-  return cmd->has_paths;
-}
-
-bool shell_abstract_command_has_abs_paths(const shell_abstract_command_t *cmd) {
-  return cmd->has_abs_paths;
-}
-
-bool shell_abstract_command_has_rel_paths(const shell_abstract_command_t *cmd) {
-  return cmd->has_rel_paths;
-}
-
-bool shell_abstract_command_has_home_paths(
-    const shell_abstract_command_t *cmd) {
-  return cmd->has_home_paths;
-}
-
-bool shell_abstract_command_has_cmd_subst(const shell_abstract_command_t *cmd) {
-  return cmd->has_cmd_subst;
-}
-
-bool shell_abstract_command_has_redirects(const shell_abstract_command_t *cmd) {
-  return cmd->has_redirects;
-}
-
-bool shell_abstract_command_has_arithmetic(
-    const shell_abstract_command_t *cmd) {
-  return cmd->has_arithmetic;
-}
-
-bool shell_abstract_command_has_strings(const shell_abstract_command_t *cmd) {
-  return cmd->has_strings;
 }
 
 shell_abstract_element_t *
@@ -1931,24 +1859,6 @@ fail_type_netseq:
 }
 
 shell_process_status_t
-shell_build_type_netseq(const char *command, size_t command_length,
-                        const shell_process_limits_t *limits, char **netseq,
-                        size_t *subcommand_count) {
-  size_t length = 0;
-  shell_process_status_t status = shell_build_type_netseq_impl(
-      command, command_length, limits, netseq, &length, subcommand_count);
-  if (status != SHELL_PROCESS_OK)
-    return status;
-  if (memchr(*netseq, '\0', length)) {
-    free(*netseq);
-    *netseq = NULL;
-    *subcommand_count = 0;
-    return SHELL_PROCESS_EOUTPUT_LIMIT;
-  }
-  return SHELL_PROCESS_OK;
-}
-
-shell_process_status_t
 shell_build_type_netseq_buffer(const char *command, size_t command_length,
                                const shell_process_limits_t *limits,
                                shell_netstring_buffer_t *sequence,
@@ -2162,30 +2072,6 @@ static shell_process_status_t shell_build_anomaly_netseqs_impl(
 fail:
   shell_anomaly_stages_free(&stages);
   return status;
-}
-
-shell_process_status_t
-shell_build_anomaly_netseqs(const char *command_line, size_t command_length,
-                            const shell_process_limits_t *limits,
-                            char **command_netseq, char **type_netseq,
-                            size_t *subcommand_count) {
-  size_t command_length_out = 0;
-  size_t type_length_out = 0;
-  shell_process_status_t status = shell_build_anomaly_netseqs_impl(
-      command_line, command_length, limits, command_netseq, &command_length_out,
-      type_netseq, &type_length_out, subcommand_count);
-  if (status != SHELL_PROCESS_OK)
-    return status;
-  if (memchr(*command_netseq, '\0', command_length_out) ||
-      memchr(*type_netseq, '\0', type_length_out)) {
-    free(*command_netseq);
-    free(*type_netseq);
-    *command_netseq = NULL;
-    *type_netseq = NULL;
-    *subcommand_count = 0;
-    return SHELL_PROCESS_EOUTPUT_LIMIT;
-  }
-  return SHELL_PROCESS_OK;
 }
 
 shell_process_status_t shell_build_anomaly_netseqs_buffer(

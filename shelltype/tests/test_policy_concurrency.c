@@ -12,14 +12,6 @@
 #include <string.h>
 #include <unistd.h>
 
-static int pattern_is_cpl(const char *actual, const char *cpl) {
-  char *encoded = NULL;
-  int equal = actual && cpl && st_netpattern_from_cpl(cpl, &encoded) == ST_OK &&
-              strcmp(actual, encoded) == 0;
-  free(encoded);
-  return equal;
-}
-
 enum {
   READER_COUNT = 6,
   READER_ITERATIONS = 2000,
@@ -77,7 +69,10 @@ static bool policy_matches_exact(st_policy_t *policy, const char *command) {
   st_eval_result_t result = {0};
   return test_st_policy_eval(policy, command, &result) == ST_OK &&
          result.matches && result.matching_pattern &&
-         pattern_is_cpl(result.matching_pattern, command);
+         test_pattern_is_cpl(
+             (st_netpattern_view_t){result.matching_pattern,
+                                    result.matching_pattern_length},
+             command);
 }
 
 static void *policy_reader(void *opaque) {
@@ -91,17 +86,17 @@ static void *policy_reader(void *opaque) {
       record_failure(args->failures, "policy evaluation", args->id, i);
       break;
     }
-    const char **matches = NULL;
+    st_netpattern_view_t *matches = NULL;
     size_t match_count = 0;
     if (test_st_policy_verify_all(args->policy, command, &matches,
                                   &match_count) != ST_OK ||
         match_count != 1 || matches == NULL ||
-        !pattern_is_cpl(matches[0], command)) {
+        !test_pattern_is_cpl(matches[0], command)) {
       record_failure(args->failures, "policy verification", args->id, i);
-      test_st_policy_matches_free(matches);
+      st_policy_matches_free(matches);
       break;
     }
-    test_st_policy_matches_free(matches);
+    st_policy_matches_free(matches);
     size_t count = st_policy_rule_count(args->policy);
     if (count < 2) {
       record_failure(args->failures, "policy count", args->id, i);
@@ -302,7 +297,8 @@ static void *refcount_worker(void *opaque) {
     return NULL;
   for (size_t i = 0; i < REFCOUNT_ITERATIONS; i++) {
     st_policy_ctx_retain(args->ctx);
-    const char *value = st_policy_ctx_intern(args->ctx, "retained-value");
+    const char *value = st_policy_ctx_intern_view(
+        args->ctx, "retained-value", (sizeof("retained-value") - 1));
     sched_yield();
     if (!value || strcmp(value, "retained-value") != 0) {
       record_failure(args->failures, "retained intern", args->id, i);
@@ -388,8 +384,8 @@ static void *intern_worker(void *opaque) {
 
   for (size_t i = 0; i < INTERN_SHARED_COUNT; i++) {
     char value[32];
-    snprintf(value, sizeof(value), "shared-%zu", i);
-    args->shared[i] = st_policy_ctx_intern(args->ctx, value);
+    size_t length = (size_t)snprintf(value, sizeof(value), "shared-%zu", i);
+    args->shared[i] = st_policy_ctx_intern_view(args->ctx, value, length);
     if (!args->shared[i]) {
       record_failure(args->failures, "shared intern", args->id, i);
       return NULL;
@@ -401,9 +397,10 @@ static void *intern_worker(void *opaque) {
   for (size_t i = 0; i < INTERN_UNIQUE_COUNT; i++) {
     size_t index = (i * 769 + args->id * 257) % INTERN_UNIQUE_COUNT;
     char value[48];
-    snprintf(value, sizeof(value), "thread-shared-value-%zu", index);
-    const char *first = st_policy_ctx_intern(args->ctx, value);
-    const char *second = st_policy_ctx_intern(args->ctx, value);
+    size_t length = (size_t)snprintf(value, sizeof(value),
+                                     "thread-shared-value-%zu", index);
+    const char *first = st_policy_ctx_intern_view(args->ctx, value, length);
+    const char *second = st_policy_ctx_intern_view(args->ctx, value, length);
     if (!first || first != second || strcmp(first, value) != 0) {
       record_failure(args->failures, "unique intern", args->id, i);
       return NULL;

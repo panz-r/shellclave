@@ -410,12 +410,9 @@ static st_error_t encode_tagged_record(char tag, const char *value,
   return ST_OK;
 }
 
-static st_error_t netpattern_encode_impl(const st_token_t *tokens, size_t count,
-                                         char **out_netpattern,
-                                         size_t *out_length) {
-  *out_netpattern = NULL;
-  if (out_length)
-    *out_length = 0;
+st_error_t st_netpattern_encode_owned(const st_token_t *tokens, size_t count,
+                                      st_netpattern_t *out_netpattern) {
+  *out_netpattern = (st_netpattern_t){0};
   if (!tokens || count == 0 || count > ST_MAX_CMD_TOKENS)
     return ST_ERR_INVALID;
 
@@ -555,9 +552,7 @@ static st_error_t netpattern_encode_impl(const st_token_t *tokens, size_t count,
     free(records[i]);
   }
   encoded[used] = '\0';
-  *out_netpattern = encoded;
-  if (out_length)
-    *out_length = used;
+  *out_netpattern = (st_netpattern_t){.data = encoded, .length = used};
   return ST_OK;
 }
 
@@ -566,28 +561,6 @@ void st_netpattern_free(st_netpattern_t *pattern) {
     return;
   free(pattern->data);
   *pattern = (st_netpattern_t){0};
-}
-
-st_error_t st_netpattern_encode_owned(const st_token_t *tokens, size_t count,
-                                      st_netpattern_t *out_netpattern) {
-  return netpattern_encode_impl(tokens, count, &out_netpattern->data,
-                                &out_netpattern->length);
-}
-
-st_error_t st_netpattern_encode(const st_token_t *tokens, size_t count,
-                                char **out_netpattern) {
-  *out_netpattern = NULL;
-
-  st_netpattern_t encoded = {0};
-  st_error_t error = st_netpattern_encode_owned(tokens, count, &encoded);
-  if (error != ST_OK)
-    return error;
-  if (memchr(encoded.data, '\0', encoded.length)) {
-    st_netpattern_free(&encoded);
-    return ST_ERR_LIMIT;
-  }
-  *out_netpattern = encoded.data;
-  return ST_OK;
 }
 
 st_error_t st_netpattern_from_cpl_owned(const char *cpl,
@@ -655,44 +628,6 @@ cpl_done:
   }
   free_words(words, count);
   return error;
-}
-
-st_error_t st_netpattern_from_cpl(const char *cpl, char **out_netpattern) {
-  *out_netpattern = NULL;
-
-  st_netpattern_t encoded = {0};
-  st_error_t error = st_netpattern_from_cpl_owned(cpl, &encoded);
-  if (error != ST_OK)
-    return error;
-  if (memchr(encoded.data, '\0', encoded.length)) {
-    st_netpattern_free(&encoded);
-    return ST_ERR_LIMIT;
-  }
-  *out_netpattern = encoded.data;
-  return ST_OK;
-}
-
-static st_error_t read_netstring(const char *encoded, size_t encoded_length,
-                                 size_t *offset, const char **payload,
-                                 size_t *payload_length) {
-  if (!encoded || !offset || !payload || !payload_length ||
-      *offset > encoded_length)
-    return ST_ERR_FORMAT;
-  shell_netstring_iter_t iter;
-  shell_netstring_status_t status = shell_netstring_iter_init(
-      &iter, encoded + *offset, encoded_length - *offset);
-  if (status != SHELL_NETSTRING_OK)
-    return ST_ERR_FORMAT;
-  shell_netstring_view_t view;
-  status = shell_netstring_iter_next(&iter, &view);
-  if (status == SHELL_NETSTRING_EOVERFLOW)
-    return ST_ERR_LIMIT;
-  if (status != SHELL_NETSTRING_OK)
-    return ST_ERR_FORMAT;
-  *payload = (const char *)view.payload;
-  *payload_length = view.payload_length;
-  *offset += view.record_length;
-  return ST_OK;
 }
 
 static bool literal_needs_quotes(const char *text, size_t length) {
@@ -770,24 +705,32 @@ st_error_t st_netpattern_decode_view(st_netpattern_view_t netpattern,
   size_t encoded_length = netpattern.length;
   if (encoded_length == 0 || encoded_length >= ST_MAX_NETPATTERN_LEN)
     return ST_ERR_FORMAT;
-  size_t outer = 0, count = 0, capacity = 0;
+  size_t count = 0, capacity = 0;
+  shell_netstring_iter_t outer;
+  (void)shell_netstring_iter_init(&outer, encoded, encoded_length);
   st_token_t *tokens = NULL;
-  while (outer < encoded_length) {
+  while (outer.offset < outer.length) {
     if (count == ST_MAX_CMD_TOKENS)
       goto limit;
-    const char *record, *tag, *value;
-    size_t record_length, tag_length, value_length, inner = 0;
-    st_error_t error = read_netstring(encoded, encoded_length, &outer, &record,
-                                      &record_length);
-    if (error == ST_ERR_LIMIT)
+    shell_netstring_view_t record, tag_record, value_record;
+    shell_netstring_status_t status =
+        shell_netstring_iter_next(&outer, &record);
+    if (status == SHELL_NETSTRING_EOVERFLOW)
       goto limit;
-    if (error != ST_OK ||
-        read_netstring(record, record_length, &inner, &tag, &tag_length) !=
-            ST_OK ||
-        read_netstring(record, record_length, &inner, &value, &value_length) !=
-            ST_OK ||
-        inner != record_length || tag_length != 1 ||
-        (tag[0] != 'L' && tag[0] != 'T' && tag[0] != 'C') ||
+    if (status != SHELL_NETSTRING_OK)
+      goto format;
+    shell_netstring_iter_t inner;
+    (void)shell_netstring_iter_init(&inner, record.payload,
+                                    record.payload_length);
+    if (shell_netstring_iter_next(&inner, &tag_record) != SHELL_NETSTRING_OK ||
+        shell_netstring_iter_next(&inner, &value_record) !=
+            SHELL_NETSTRING_OK ||
+        inner.offset != inner.length || tag_record.payload_length != 1)
+      goto format;
+    const char *tag = (const char *)tag_record.payload;
+    const char *value = (const char *)value_record.payload;
+    size_t value_length = value_record.payload_length;
+    if ((tag[0] != 'L' && tag[0] != 'T' && tag[0] != 'C') ||
         value_length >= ST_MAX_NETPATTERN_LEN)
       goto format;
     st_token_t token = {0};
@@ -795,19 +738,28 @@ st_error_t st_netpattern_decode_view(st_netpattern_view_t netpattern,
       const char *part_values[3] = {0};
       size_t part_lengths[3] = {0};
       char part_tags[3] = {0};
-      size_t nested = 0, part_count = 0, typed_index = SIZE_MAX;
-      while (nested < value_length && part_count < 3) {
-        const char *part_record, *part_tag, *part_value;
-        size_t part_record_length, part_tag_length, part_value_length;
-        size_t part_inner = 0;
-        if (read_netstring(value, value_length, &nested, &part_record,
-                           &part_record_length) != ST_OK ||
-            read_netstring(part_record, part_record_length, &part_inner,
-                           &part_tag, &part_tag_length) != ST_OK ||
-            read_netstring(part_record, part_record_length, &part_inner,
-                           &part_value, &part_value_length) != ST_OK ||
-            part_inner != part_record_length || part_tag_length != 1 ||
-            (part_tag[0] != 'L' && part_tag[0] != 'T') ||
+      size_t part_count = 0, typed_index = SIZE_MAX;
+      shell_netstring_iter_t nested;
+      (void)shell_netstring_iter_init(&nested, value, value_length);
+      while (nested.offset < nested.length && part_count < 3) {
+        shell_netstring_view_t part_record, part_tag_record, part_value_record;
+        if (shell_netstring_iter_next(&nested, &part_record) !=
+            SHELL_NETSTRING_OK)
+          goto format;
+        shell_netstring_iter_t part_inner;
+        (void)shell_netstring_iter_init(&part_inner, part_record.payload,
+                                        part_record.payload_length);
+        if (shell_netstring_iter_next(&part_inner, &part_tag_record) !=
+                SHELL_NETSTRING_OK ||
+            shell_netstring_iter_next(&part_inner, &part_value_record) !=
+                SHELL_NETSTRING_OK ||
+            part_inner.offset != part_inner.length ||
+            part_tag_record.payload_length != 1)
+          goto format;
+        const char *part_tag = (const char *)part_tag_record.payload;
+        const char *part_value = (const char *)part_value_record.payload;
+        size_t part_value_length = part_value_record.payload_length;
+        if ((part_tag[0] != 'L' && part_tag[0] != 'T') ||
             part_value_length >= ST_MAX_TOKEN_LEN)
           goto format;
         part_tags[part_count] = part_tag[0];
@@ -825,7 +777,8 @@ st_error_t st_netpattern_decode_view(st_netpattern_view_t netpattern,
                                (part_tags[0] == 'T' && part_tags[1] == 'L'))) ||
           (part_count == 3 && part_tags[0] == 'L' && part_tags[1] == 'T' &&
            part_tags[2] == 'L');
-      if (nested != value_length || !canonical_parts || typed_index == SIZE_MAX)
+      if (nested.offset != nested.length || !canonical_parts ||
+          typed_index == SIZE_MAX)
         goto format;
       const char *typed = part_values[typed_index];
       size_t typed_length = part_lengths[typed_index];
@@ -917,10 +870,9 @@ st_error_t st_netpattern_decode_view(st_netpattern_view_t netpattern,
   }
   if (count == 0)
     goto format;
-  char *canonical = NULL;
-  size_t canonical_length = 0;
+  st_netpattern_t canonical = {0};
   st_error_t canonical_error =
-      netpattern_encode_impl(tokens, count, &canonical, &canonical_length);
+      st_netpattern_encode_owned(tokens, count, &canonical);
   if (canonical_error != ST_OK) {
     if (canonical_error == ST_ERR_MEMORY)
       goto memory;
@@ -928,9 +880,9 @@ st_error_t st_netpattern_decode_view(st_netpattern_view_t netpattern,
       goto limit;
     goto format;
   }
-  bool is_canonical = canonical_length == encoded_length &&
-                      memcmp(canonical, encoded, encoded_length) == 0;
-  free(canonical);
+  bool is_canonical = canonical.length == encoded_length &&
+                      memcmp(canonical.data, encoded, encoded_length) == 0;
+  st_netpattern_free(&canonical);
   if (!is_canonical)
     goto format;
   out_tokens->tokens = tokens;
@@ -963,14 +915,6 @@ memory:
   }
   free(tokens);
   return ST_ERR_MEMORY;
-}
-
-st_error_t st_netpattern_decode(const char *netpattern,
-                                st_token_array_t *out_tokens) {
-
-  return st_netpattern_decode_view(
-      (st_netpattern_view_t){.data = netpattern, .length = strlen(netpattern)},
-      out_tokens);
 }
 
 st_error_t st_netpattern_to_cpl_view(st_netpattern_view_t netpattern,
@@ -1074,13 +1018,6 @@ st_error_t st_netpattern_to_cpl_view(st_netpattern_view_t netpattern,
   return ST_OK;
 }
 
-st_error_t st_netpattern_to_cpl(const char *netpattern, char **out_cpl) {
-
-  return st_netpattern_to_cpl_view(
-      (st_netpattern_view_t){.data = netpattern, .length = strlen(netpattern)},
-      out_cpl);
-}
-
 static int compare_bytes(const char *left, size_t left_length,
                          const char *right, size_t right_length) {
   size_t common = left_length < right_length ? left_length : right_length;
@@ -1096,44 +1033,36 @@ int st_netpattern_compare_view(st_netpattern_view_t left,
   if (!left.data || !right.data)
     return left.data ? 1 : right.data ? -1 : 0;
   size_t left_length = left.length, right_length = right.length;
-  size_t lo = 0, ro = 0;
-  while (lo < left_length && ro < right_length) {
-    const char *lr = NULL, *rr = NULL;
-    size_t ll = 0, rl = 0, li = 0, ri = 0;
-    if (read_netstring(left.data, left_length, &lo, &lr, &ll) != ST_OK ||
-        read_netstring(right.data, right_length, &ro, &rr, &rl) != ST_OK) {
-      size_t common = left_length < right_length ? left_length : right_length;
-      int order = common ? memcmp(left.data, right.data, common) : 0;
-      return order                        ? order
-             : left_length > right_length ? 1
-             : left_length < right_length ? -1
-                                          : 0;
-    }
-    const char *lt = NULL, *lv = NULL, *rt = NULL, *rv = NULL;
-    size_t ltl = 0, lvl = 0, rtl = 0, rvl = 0;
-    if (read_netstring(lr, ll, &li, &lt, &ltl) != ST_OK ||
-        read_netstring(lr, ll, &li, &lv, &lvl) != ST_OK || li != ll ||
-        read_netstring(rr, rl, &ri, &rt, &rtl) != ST_OK ||
-        read_netstring(rr, rl, &ri, &rv, &rvl) != ST_OK || ri != rl ||
-        ltl != 1 || rtl != 1)
+  shell_netstring_iter_t lo, ro;
+  (void)shell_netstring_iter_init(&lo, left.data, left_length);
+  (void)shell_netstring_iter_init(&ro, right.data, right_length);
+  while (lo.offset < lo.length && ro.offset < ro.length) {
+    shell_netstring_view_t lr, rr, lt, lv, rt, rv;
+    if (shell_netstring_iter_next(&lo, &lr) != SHELL_NETSTRING_OK ||
+        shell_netstring_iter_next(&ro, &rr) != SHELL_NETSTRING_OK)
       return compare_bytes(left.data, left_length, right.data, right_length);
-    size_t common = lvl < rvl ? lvl : rvl;
-    int value_order = memcmp(lv, rv, common);
+    shell_netstring_iter_t li, ri;
+    (void)shell_netstring_iter_init(&li, lr.payload, lr.payload_length);
+    (void)shell_netstring_iter_init(&ri, rr.payload, rr.payload_length);
+    if (shell_netstring_iter_next(&li, &lt) != SHELL_NETSTRING_OK ||
+        shell_netstring_iter_next(&li, &lv) != SHELL_NETSTRING_OK ||
+        li.offset != li.length ||
+        shell_netstring_iter_next(&ri, &rt) != SHELL_NETSTRING_OK ||
+        shell_netstring_iter_next(&ri, &rv) != SHELL_NETSTRING_OK ||
+        ri.offset != ri.length || lt.payload_length != 1 ||
+        rt.payload_length != 1)
+      return compare_bytes(left.data, left_length, right.data, right_length);
+    size_t common = lv.payload_length < rv.payload_length ? lv.payload_length
+                                                          : rv.payload_length;
+    int value_order = memcmp(lv.payload, rv.payload, common);
     if (value_order != 0)
       return value_order;
-    if (lvl != rvl)
-      return lvl < rvl ? -1 : 1;
-    if (lt[0] != rt[0])
-      return lt[0] < rt[0] ? -1 : 1;
+    if (lv.payload_length != rv.payload_length)
+      return lv.payload_length < rv.payload_length ? -1 : 1;
+    if (lt.payload[0] != rt.payload[0])
+      return lt.payload[0] < rt.payload[0] ? -1 : 1;
   }
-  if (lo == left_length && ro == right_length)
+  if (lo.offset == lo.length && ro.offset == ro.length)
     return 0;
-  return lo == left_length ? -1 : 1;
-}
-
-int st_netpattern_compare(const char *left, const char *right) {
-  return st_netpattern_compare_view(
-      (st_netpattern_view_t){.data = left, .length = left ? strlen(left) : 0},
-      (st_netpattern_view_t){.data = right,
-                             .length = right ? strlen(right) : 0});
+  return lo.offset == lo.length ? -1 : 1;
 }

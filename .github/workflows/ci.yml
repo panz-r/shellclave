@@ -70,10 +70,12 @@ jobs:
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
           -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
           -DSHELLCLAVE_ENABLE_TSAN=ON
-      - run: cmake --build build --parallel 2 --target shelltype_policy_concurrency_test
       - run: >-
-          ctest --test-dir build -R '^shelltype_policy_concurrency_test$'
-          --output-on-failure
+          cmake --build build --parallel 2
+          --target shellclave_concurrency_tests
+      - run: >-
+          ctest --test-dir build -L '^concurrency$' --no-tests=error
+          --output-on-failure --parallel 1
 
   static-analysis:
     runs-on: ubuntu-latest

@@ -183,9 +183,9 @@ typedef struct {
  *
  * Separates shell logic from command arguments. On
  * success, returned command metadata owns all text it refers to and remains
- * valid independently of command_line. Use shell_render_netargv() for the
- * canonical processed-subcommand representation. This legacy flat API retains
- * every lexical simple-command record, including a valid argv-less
+ * valid independently of command_line. Use shell_render_netargv_buffer() for
+ * the canonical processed-subcommand representation. This legacy flat API
+ * retains every lexical simple-command record, including a valid argv-less
  * redirect-only operation with command_token_count == 0. Its empty rendering
  * is diagnostic metadata, not an executable netargv or policy input. The
  * structured API omits those records, while paired anomaly netsequences retain
@@ -329,15 +329,6 @@ shell_process_status_t
 shell_write_netargv(const shell_command_info_t *info, char *destination,
                     size_t destination_size, size_t *written)
     SHELL_NONNULL(1, 2, 4);
-
-/** Encode one command's already-processed arguments as concatenated canonical
- * netstrings. This legacy C-string convenience wrapper owns *netargv. It is
- * suitable only when the encoded payload contains no NUL byte; use
- * shell_render_netargv_buffer() for canonical programmatic transport. */
-shell_process_status_t
-shell_render_netargv(const shell_command_info_t *info,
-                     const shell_process_limits_t *limits, char **netargv)
-    SHELL_NONNULL(1, 3);
 
 /** Encode one command's already-processed arguments as concatenated canonical
  * netstrings in owned byte storage. Payloads, including those decoded from

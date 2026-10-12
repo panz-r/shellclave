@@ -1423,7 +1423,6 @@ static bool span_is_ipv6(st_text_span_t token) {
           groups > 6)
         return false;
       groups += 2;
-      i = end;
       break;
     }
     if (digits == 0 || digits > 4 || groups == 8)
@@ -1917,14 +1916,10 @@ static st_token_type_t st_token_classify_span(st_text_span_t token) {
   return ST_TYPE_LITERAL;
 }
 
-st_token_type_t st_token_classify_bytes(const char *text, size_t length) {
-  return st_token_classify_span((st_text_span_t){text, length});
-}
-
 /* --- PUBLIC: CLASSIFY --- */
 
-st_token_type_t st_token_classify(const char *token) {
-  return st_token_classify_bytes(token, strlen(token));
+st_token_type_t st_token_classify(const char *text, size_t length) {
+  return st_token_classify_span((st_text_span_t){text, length});
 }
 
 /* --- CANONICAL NETSTRING ARGV DECODING --- */
@@ -2085,14 +2080,6 @@ st_error_t st_netargv_visit_view(st_netargv_view_t netargv,
   return error;
 }
 
-st_error_t st_netargv_visit(const char *netargv,
-                            st_netargv_token_visitor_t visitor, void *user_ctx,
-                            size_t *visited_count) {
-  return st_netargv_visit_view(
-      (st_netargv_view_t){.data = netargv, .length = strlen(netargv)}, visitor,
-      user_ctx, visited_count);
-}
-
 /* --- PUBLIC API: NETSTRING ARGV CLASSIFICATION --- */
 
 st_error_t st_netargv_classify_view(st_netargv_view_t netargv,
@@ -2153,11 +2140,6 @@ fail:
   out->tokens = NULL;
   out->count = 0;
   return decode_error == ST_OK ? ST_ERR_MEMORY : decode_error;
-}
-
-st_error_t st_netargv_classify(const char *netargv, st_token_array_t *out) {
-  return st_netargv_classify_view(
-      (st_netargv_view_t){.data = netargv, .length = strlen(netargv)}, out);
 }
 
 void st_token_array_free(st_token_array_t *arr) {

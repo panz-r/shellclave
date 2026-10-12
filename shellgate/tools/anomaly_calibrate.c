@@ -592,11 +592,16 @@ static bool threshold_integer_zero(threshold_integer_t *number) {
   return true;
 }
 
-static bool threshold_integer_copy(threshold_integer_t *destination,
-                                   const threshold_integer_t *source) {
-  if (!destination || !source || !source->digits ||
-      !threshold_integer_reserve(destination, source->count))
+/* source is initialized with count > 0 live limbs; destination is empty or
+ * initialized. Reservation establishes its writable limb span. */
+static SHELL_NONNULL(1, 2) bool threshold_integer_copy(
+    threshold_integer_t *destination, const threshold_integer_t *source) {
+  if (!threshold_integer_reserve(destination, source->count))
     return false;
+  /* The analyzer cannot express the initialized integer's positive count. */
+#ifdef __clang_analyzer__
+  __attribute__((suppress))
+#endif
   memcpy(destination->digits, source->digits, source->count);
   destination->count = source->count;
   return true;
@@ -1426,8 +1431,9 @@ int main(int argc, char **argv) {
     goto cleanup;
   }
   fprintf(stderr, "Loaded %zu normal commands\n", normal_count);
-  fprintf(stderr, "Model trained (vocab=%zu)\n",
-          sg_gate_anomaly_vocab_size(gate));
+  fprintf(
+      stderr, "Model trained (vocab=%zu)\n",
+      sg_anomaly_model_vocab_size(sg_gate_anomaly_raw_model_borrowed(gate)));
 
   normal_scores = calloc(normal_count, sizeof(*normal_scores));
   if (!normal_scores) {
