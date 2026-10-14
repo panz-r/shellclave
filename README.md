@@ -27,7 +27,9 @@ pthreads, and libm. Its CI configuration builds GCC and Clang configurations.
 ```sh
 git clone --recurse-submodules https://github.com/panz-r/shellclave.git
 cd shellclave
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+reference_bash=$(./scripts/prepare-reference-bash)
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+  -DSHELLCLAVE_BASH_EXECUTABLE="$reference_bash"
 cmake --build build
 ctest --test-dir build --output-on-failure
 cmake --install build --prefix "$PWD/install"
@@ -37,6 +39,16 @@ If the clone already exists, initialize dependencies with
 `git submodule update --init --recursive`. CMake builds write
 `compile_commands.json` into the build directory for `cppr`, other
 static-analysis tools, and editor integrations.
+
+Test builds use one pinned executor, Bash 5.3.20. The helper downloads the
+official release and ordered patches using the checksums in
+`scripts/reference-bash.sha256`; it caches the build on disk without replacing
+the system shell. It requires curl, patch, make, a C compiler, and flock.
+`scripts/verify-push` prepares and uses the same reference automatically.
+`BUILD_TESTING=OFF` builds the libraries without Bash or network access.
+To upgrade the modeled Bash version, update the manifest, rerun every
+conformance probe, and include any semantic corrections in the same changeset.
+Older and newer Bash versions are not additional supported dialects.
 
 Useful options are `BUILD_TESTING`, `SHELLCLAVE_BUILD_TOOLS`,
 `SHELLCLAVE_BUILD_FUZZERS`, `SHELLCLAVE_ENABLE_COVERAGE`,
@@ -226,6 +238,31 @@ local to that child. Ordinary commands retain their own execution status.
 Known failures suppress impossible conditional effects and callbacks. Runtime
 unknown or conditional substitutions retain the possible outcomes; resolving a
 pathname does not prove that opening the file will succeed.
+
+Bash descriptor moves (`n>&m-` and `n<&m-`) preserve both the copied route
+and the reached source close. Moves can use tracked allocated descriptors
+such as `3>&${fd}-`. Scope restoration follows Bash's destination-open and
+named-allocation behavior, including later setup failures. Quotation remains
+significant: `"3"-` is a move operand, whereas `"3-"` is an ordinary word.
+Shellsplit exposes compound moves as one `SHELL_GROUP_IO_MOVE_FD` operation;
+static invalid duplication operands use `SHELL_GROUP_IO_FAILED_REDIRECT`.
+Self-moves compare physical descriptor identity, including named sources.
+Unsaved source closes leave persistent compound-body reopens intact. External
+commands reached directly or through chains of `command` wrappers apply
+redirects in a child, preserving parent descriptors and named variables.
+A reached `builtin` wrapper performs setup in the current shell, even when an
+inner `command` executes an external program. Builtins and compound tails apply
+redirects in the current shell. Rebinding a named descriptor leaves its earlier
+allocations open. Temporary redirects restore the state after any allocations
+made earlier in the same setup list.
+Restoration reads live physical scratch slots and disposes each save in undo
+order. This preserves routes when later moves, allocations, or closes overlap
+those slots; compound completion and timing reports use the same unwind rules.
+If a saved descriptor has been closed, its failed restoration stops that undo
+list, leaving the target unchanged and older saves live. Cleanup diagnostics
+do not change the command body's status; enclosing scopes still run their own
+independent cleanup lists.
+
 Parameter pattern removal, replacement and case-conversion operands may skip
 their substitutions for unset or empty values. Their analysis preserves the
 incoming status as well as the possible substitution outcome.

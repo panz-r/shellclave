@@ -1,3 +1,5 @@
+cmake_minimum_required(VERSION 3.20)
+
 # Both the real project and the analyzer contract fixtures use this driver.
 # Configuration must run inside scan-build, not just the subsequent build:
 # CMake caches compiler paths and ignores later CC/CXX environment overrides.
@@ -47,6 +49,7 @@ if(SHELLCLAVE_ANALYZE_INSIDE)
   else()
     list(APPEND configure_arguments
       -DBUILD_TESTING=ON
+      "-DSHELLCLAVE_BASH_EXECUTABLE=${SHELLCLAVE_BASH_EXECUTABLE}"
       -DSHELLCLAVE_BUILD_TOOLS=ON
       -DSHELLCLAVE_BUILD_BENCHMARKS=ON
       -DSHELLCLAVE_BUILD_FUZZERS=OFF
@@ -91,6 +94,10 @@ else()
     "-DSHELLCLAVE_ANALYZE_SOURCE=${SHELLCLAVE_ANALYZE_SOURCE}"
     "-DSHELLCLAVE_ANALYZE_BINARY=${SHELLCLAVE_ANALYZE_BINARY}"
     "-DSHELLCLAVE_ANALYZE_GENERATOR=${SHELLCLAVE_ANALYZE_GENERATOR}")
+  if(DEFINED SHELLCLAVE_BASH_EXECUTABLE)
+    list(APPEND driver_arguments
+      "-DSHELLCLAVE_BASH_EXECUTABLE=${SHELLCLAVE_BASH_EXECUTABLE}")
+  endif()
   if(DEFINED SHELLCLAVE_ANALYZE_FIXTURE)
     list(APPEND driver_arguments
       "-DSHELLCLAVE_ANALYZE_FIXTURE=${SHELLCLAVE_ANALYZE_FIXTURE}")

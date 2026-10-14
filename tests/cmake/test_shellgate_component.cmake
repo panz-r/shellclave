@@ -1,3 +1,5 @@
+cmake_minimum_required(VERSION 3.20)
+
 set(build "${SHELLCLAVE_BINARY_DIR}/shellgate-component-configure")
 file(REMOVE_RECURSE "${build}")
 
@@ -6,6 +8,7 @@ execute_process(
     -B "${build}" -G "${SHELLCLAVE_GENERATOR}"
     "-DCMAKE_C_COMPILER=${SHELLCLAVE_C_COMPILER}"
     "-DCMAKE_CXX_COMPILER=${SHELLCLAVE_CXX_COMPILER}"
+    "-DSHELLCLAVE_BASH_EXECUTABLE=${SHELLCLAVE_BASH_EXECUTABLE}"
     -DBUILD_TESTING=ON -DSHELLCLAVE_BUILD_TOOLS=OFF
   RESULT_VARIABLE result)
 if(result)

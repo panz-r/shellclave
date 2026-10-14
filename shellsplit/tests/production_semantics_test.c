@@ -2016,7 +2016,7 @@ static void test_production_fd_target_contract(void) {
       {"2147483648", SHELL_PROCESS_LEGACY_REDIRECT_UNSUPPORTED},
       {"00000000000000000000000000000000002147483648",
        SHELL_PROCESS_LEGACY_REDIRECT_UNSUPPORTED},
-      {"\"\"", SHELL_PROCESS_LEGACY_REDIRECT_UNSUPPORTED},
+      {"\"\"", SHELL_PROCESS_LEGACY_REDIRECT_PATH},
       {"$'a\\0b'", SHELL_PROCESS_LEGACY_REDIRECT_UNSUPPORTED},
       {"$'a\\0b'$var", SHELL_PROCESS_LEGACY_REDIRECT_UNSUPPORTED},
   };
@@ -2095,7 +2095,6 @@ static void test_production_fd_target_contract(void) {
   static const char *const invalid_static_direct[] = {
       "printf x >&2147483648",
       "printf x >&00000000000000000000000000000000002147483648",
-      "printf x >&\"\"",
       "printf x >&$'a\\0b'",
   };
   for (size_t i = 0;
@@ -2136,6 +2135,43 @@ static void test_production_fd_target_contract(void) {
                                      NULL, &stages) == SHELL_PROCESS_EPARSE &&
           stages.commands == NULL && stages.count == 0);
   }
+
+  /* A quoted empty legacy operand is valid syntax. Bash reaches redirect
+   * setup, fails to open the empty pathname, and suppresses command execution;
+   * every syntax/canonical producer must therefore preserve the command. */
+  static const char empty_legacy[] = "printf x >&\"\"";
+  shell_processed_commands_t empty_processed = {0};
+  shell_command_info_t *empty_flat = NULL;
+  size_t empty_flat_count = 0;
+  shell_netstring_buffer_t empty_netargv = {0};
+  size_t empty_netargv_count = 0;
+  bool empty_features = false;
+  shell_netstring_buffer_t empty_commands = {0};
+  size_t empty_command_count = 0;
+  shell_anomaly_stages_t empty_stages = {0};
+  CHECK(shell_process_commands(empty_legacy, sizeof(empty_legacy) - 1, NULL,
+                               &empty_processed) == SHELL_PROCESS_OK &&
+        empty_processed.command_count == 1 &&
+        shell_process_command(empty_legacy, sizeof(empty_legacy) - 1, NULL,
+                              &empty_flat,
+                              &empty_flat_count) == SHELL_PROCESS_OK &&
+        empty_flat_count == 1 &&
+        shell_build_netargv_sequence_buffer(
+            empty_legacy, sizeof(empty_legacy) - 1, NULL, &empty_netargv,
+            &empty_netargv_count, &empty_features) == SHELL_PROCESS_OK &&
+        empty_netargv_count == 1 &&
+        shell_build_command_netseq_buffer(
+            empty_legacy, sizeof(empty_legacy) - 1, NULL, &empty_commands,
+            &empty_command_count) == SHELL_PROCESS_OK &&
+        empty_command_count == 1 &&
+        shell_anomaly_stages_parse(empty_legacy, sizeof(empty_legacy) - 1, NULL,
+                                   &empty_stages) == SHELL_PROCESS_OK &&
+        empty_stages.count == 1);
+  shell_anomaly_stages_free(&empty_stages);
+  shell_netstring_buffer_free(&empty_commands);
+  shell_netstring_buffer_free(&empty_netargv);
+  shell_command_infos_free(empty_flat, empty_flat_count);
+  shell_processed_commands_free(&empty_processed);
 
   /* The shared low-level validator must stop the redirect operand at a list
    * separator.  Otherwise the trailing semicolon becomes part of `$fd`,
@@ -2266,8 +2302,6 @@ static void test_production_fd_target_contract(void) {
       "{ printf x; } >&$'a\\0b'",
       "{ printf x; } >&-file",
       "{ printf x; } >&",
-      "{ printf x; } 2>&combined",
-      "{ printf x; } {sink}>&combined",
   };
   for (size_t i = 0; i < sizeof(rejected_groups) / sizeof(rejected_groups[0]);
        i++) {

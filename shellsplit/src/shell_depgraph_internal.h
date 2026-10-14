@@ -63,4 +63,15 @@ bool shell_dep_doc_file_identity_from_decoded(
 size_t shell_dep_file_path_normalize(char *path, size_t length)
     SHELL_NONNULL(1);
 
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+/* Exercise valid immutable state construction with 2..SHELL_DEP_MAX_NODES
+ * roots. workspace has shell_dep_workspace_size() bytes at its required
+ * alignment and is exclusively borrowed for this test operation. */
+bool shellsplit_test_route_state_contract(void *workspace, uint32_t count)
+    SHELL_NONNULL(1);
+/* Test-only differential oracle: execute the ordered cleanup program without
+ * segment-cache reuse. The setting is local to the calling test thread. */
+void shellsplit_test_failure_cleanup_reference(bool enabled);
+#endif
+
 #endif

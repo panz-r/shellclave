@@ -50,16 +50,19 @@ done
 
 require_clean_sources
 verified_commit=$(git rev-parse --verify HEAD^{commit})
+reference_bash=$("$repo_root/scripts/prepare-reference-bash" "$build_root/reference-bash")
 
 echo "verify-push: configuring normal build"
-cmake -S . -B "$normal_build" -DCMAKE_BUILD_TYPE=Debug
+cmake -S . -B "$normal_build" -DCMAKE_BUILD_TYPE=Debug \
+  -DSHELLCLAVE_BASH_EXECUTABLE="$reference_bash"
 cmake --build "$normal_build"
 cmake --build "$normal_build" --target format-check clang-analyze
 ctest --test-dir "$normal_build" --output-on-failure
 
 echo "verify-push: configuring sanitizer build"
 cmake -S . -B "$asan_build" -DCMAKE_BUILD_TYPE=Debug \
-  -DSHELLCLAVE_ENABLE_SANITIZERS=ON
+  -DSHELLCLAVE_ENABLE_SANITIZERS=ON \
+  -DSHELLCLAVE_BASH_EXECUTABLE="$reference_bash"
 cmake --build "$asan_build"
 ASAN_OPTIONS=${ASAN_OPTIONS:-detect_leaks=1} \
 LSAN_OPTIONS=${LSAN_OPTIONS:-detect_leaks=1} \
@@ -69,6 +72,7 @@ echo "verify-push: configuring fuzz build"
 cmake -S . -B "$fuzz_build" -DCMAKE_BUILD_TYPE=Debug \
   -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
   -DSHELLCLAVE_BUILD_FUZZERS=ON \
+  -DSHELLCLAVE_BASH_EXECUTABLE="$reference_bash" \
   -DSHELLCLAVE_FUZZ_RUNS="$fuzz_runs" \
   -DSHELLCLAVE_FUZZ_MAX_LEN="$fuzz_max_len"
 echo "verify-push: unified fuzz smoke (shellsplit, shelltype, and shellgate, $fuzz_runs runs)"

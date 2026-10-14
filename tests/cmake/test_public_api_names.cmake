@@ -1,3 +1,5 @@
+cmake_minimum_required(VERSION 3.20)
+
 file(GLOB public_headers
   "${SHELLCLAVE_SOURCE_DIR}/shellsplit/include/*.h"
   "${SHELLCLAVE_SOURCE_DIR}/shelltype/include/*.h"

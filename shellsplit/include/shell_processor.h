@@ -85,9 +85,12 @@ typedef enum {
    * evaluates the nested process but establishes no modeled byte route between
    * the group descriptor and that process. */
   SHELL_GROUP_IO_PROCESS_SUB_UNROUTED,
-  /* Bash `|&` joins stderr to stdout after local group redirections.  Keep
-   * this additive public value last so existing enum values remain stable. */
+  /* Bash `|&` joins stderr to stdout after local group redirections. */
   SHELL_GROUP_IO_PIPE_OUTPUT_STDERR,
+  /* Bash n>&m- / n<&m- copies m into n, then closes m on success. */
+  SHELL_GROUP_IO_MOVE_FD,
+  /* A static duplication operand which Bash rejects during redirect setup. */
+  SHELL_GROUP_IO_FAILED_REDIRECT,
 } shell_group_io_kind_t;
 
 /** Source-relative metadata for one group-owned I/O operation. `source_*`
@@ -96,10 +99,15 @@ typedef enum {
  * descriptor, SHELL_PROCESS_FD_NAMED for a dynamic Bash `{name}` descriptor,
  * or SHELL_PROCESS_FD_NONE for a non-descriptor list relation. For a named
  * descriptor, `fd_name_start..fd_name_end` covers its `{name}` source
- * spelling. `target_fd` is meaningful only for SHELL_GROUP_IO_DUP_FD. A
+ * spelling. `target_fd` is meaningful for DUP_FD and MOVE_FD. A
  * symbolic duplication target such as `>&"$fd"` has target_fd NONE and
  * `target_name_start..target_name_end` covering the bare variable name.
- * Explicit descriptor values are limited to INT_MAX.
+ * MOVE_FD retains one logical operation: copy target_fd (or target_name)
+ * into fd, then close the source only after successful duplication. The
+ * graph models scope restoration; consumers must not substitute an ordinary
+ * independently scoped CLOSE_FD. FAILED_REDIRECT retains a syntactically
+ * complete static operand whose descriptor setup fails; its body and later
+ * redirects do not execute. Explicit descriptor values are limited to INT_MAX.
  * A combined `&>` or `&>>` redirect has two same-span operations, ordered fd
  * 1 then fd 2. Process-substitution kinds retain
  * the complete `<(command)` or `>(command)` operand, rather than representing

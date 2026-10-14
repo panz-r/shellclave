@@ -25,14 +25,18 @@ jobs:
           - cc: clang
             cxx: clang++
             build_type: Release
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0, Node 24
         with:
           submodules: recursive
+      - name: Prepare pinned Bash reference
+        run: |
+          reference_bash=$(./scripts/prepare-reference-bash)
+          printf 'SHELLCLAVE_REFERENCE_BASH=%s\n' "$reference_bash" >> "$GITHUB_ENV"
       - name: Configure
         run: >-
-          cmake -S . -B build
+          cmake -S . -B build -DSHELLCLAVE_BASH_EXECUTABLE="$SHELLCLAVE_REFERENCE_BASH"
           -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
           -DCMAKE_C_COMPILER=${{ matrix.cc }}
           -DCMAKE_CXX_COMPILER=${{ matrix.cxx }}
@@ -46,13 +50,17 @@ jobs:
           ctest --test-dir build --output-on-failure
 
   sanitizers:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0, Node 24
         with:
           submodules: recursive
+      - name: Prepare pinned Bash reference
+        run: |
+          reference_bash=$(./scripts/prepare-reference-bash)
+          printf 'SHELLCLAVE_REFERENCE_BASH=%s\n' "$reference_bash" >> "$GITHUB_ENV"
       - run: >-
-          cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+          cmake -S . -B build -DSHELLCLAVE_BASH_EXECUTABLE="$SHELLCLAVE_REFERENCE_BASH" -DCMAKE_BUILD_TYPE=Debug
           -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
           -DSHELLCLAVE_ENABLE_SANITIZERS=ON
       - run: cmake --build build --parallel 2
@@ -61,13 +69,17 @@ jobs:
           ctest --test-dir build --output-on-failure
 
   thread-sanitizer:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0, Node 24
         with:
           submodules: recursive
+      - name: Prepare pinned Bash reference
+        run: |
+          reference_bash=$(./scripts/prepare-reference-bash)
+          printf 'SHELLCLAVE_REFERENCE_BASH=%s\n' "$reference_bash" >> "$GITHUB_ENV"
       - run: >-
-          cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+          cmake -S . -B build -DSHELLCLAVE_BASH_EXECUTABLE="$SHELLCLAVE_REFERENCE_BASH" -DCMAKE_BUILD_TYPE=Debug
           -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
           -DSHELLCLAVE_ENABLE_TSAN=ON
       - run: >-
@@ -78,11 +90,15 @@ jobs:
           --output-on-failure --parallel 1
 
   static-analysis:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0, Node 24
         with:
           submodules: recursive
+      - name: Prepare pinned Bash reference
+        run: |
+          reference_bash=$(./scripts/prepare-reference-bash)
+          printf 'SHELLCLAVE_REFERENCE_BASH=%s\n' "$reference_bash" >> "$GITHUB_ENV"
       - name: Install Clang Static Analyzer and formatter
         run: |
           sudo apt-get update
@@ -101,16 +117,16 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes clang-format-21 clang-tools-21
       - name: Configure
-        run: cmake -S . -B build
+        run: cmake -S . -B build -DSHELLCLAVE_BASH_EXECUTABLE="$SHELLCLAVE_REFERENCE_BASH"
       - name: Check formatting
         run: cmake --build build --target format-check
       - name: Analyze
         run: cmake --build build --target clang-analyze
 
   fuzz-smoke:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0, Node 24
         with:
           submodules: recursive
       - run: >-
@@ -121,17 +137,21 @@ jobs:
       - run: cmake --build build --target fuzz-smoke
 
   coverage-report:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0, Node 24
         with:
           submodules: recursive
+      - name: Prepare pinned Bash reference
+        run: |
+          reference_bash=$(./scripts/prepare-reference-bash)
+          printf 'SHELLCLAVE_REFERENCE_BASH=%s\n' "$reference_bash" >> "$GITHUB_ENV"
       # Pin the parser behavior used by the report commands below. GCC can
       # emit both wrapped negative counters and counters above 2^32; gcovr
       # 8.6 can handle both warning classes in one invocation.
       - run: python3 -m pip install gcovr==8.6
       - run: >-
-          cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+          cmake -S . -B build -DSHELLCLAVE_BASH_EXECUTABLE="$SHELLCLAVE_REFERENCE_BASH" -DCMAKE_BUILD_TYPE=Debug
           -DSHELLCLAVE_ENABLE_COVERAGE=ON
           -DSHELLCLAVE_COVERAGE_VARIANT=tests
       - run: cmake --build build --parallel 2
@@ -147,7 +167,7 @@ jobs:
           --fail-under-line 93 --fail-under-branch 80 --fail-under-function 100
           --txt=shellsplit-coverage.txt --xml-pretty
           --xml=shellsplit-coverage.xml
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0, Node 24
         with:
           name: shellsplit-coverage
           path: |
@@ -161,7 +181,7 @@ jobs:
           --gcov-ignore-parse-errors=suspicious_hits.warn_once_per_file
           --fail-under-line 91 --fail-under-branch 82 --fail-under-function 100
           --txt=coverage.txt --xml-pretty --xml=coverage.xml
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0, Node 24
         with:
           name: shelltype-coverage
           path: |
@@ -176,7 +196,7 @@ jobs:
           --fail-under-line 93 --fail-under-branch 77 --fail-under-function 100
           --txt=shellgate-coverage.txt --xml-pretty
           --xml=shellgate-coverage.xml
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0, Node 24
         with:
           name: shellgate-coverage
           path: |
@@ -184,22 +204,27 @@ jobs:
             shellgate-coverage.xml
 
   production-coverage:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0, Node 24
         with:
           submodules: recursive
+      - name: Prepare pinned Bash reference
+        run: |
+          reference_bash=$(./scripts/prepare-reference-bash)
+          printf 'SHELLCLAVE_REFERENCE_BASH=%s\n' "$reference_bash" >> "$GITHUB_ENV"
       - run: python3 -m pip install gcovr==8.6
       # Report shipping CFGs separately. Fault-injection and production block
       # identities are different and must never share a coverage denominator.
       - run: >-
-          cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+          cmake -S . -B build -DSHELLCLAVE_BASH_EXECUTABLE="$SHELLCLAVE_REFERENCE_BASH" -DCMAKE_BUILD_TYPE=Debug
           -DSHELLCLAVE_ENABLE_COVERAGE=ON
           -DSHELLCLAVE_COVERAGE_VARIANT=production
       - run: >-
           cmake --build build --parallel 2 --target
           shellsplit_fast_parser_production_test
           shellsplit_depgraph_production_test
+          shellsplit_descriptor_move_production_test
           shellsplit_production_semantics_test
           shellsplit_corpus_production_test
           shelltype_public_contract_production
@@ -215,7 +240,7 @@ jobs:
               --txt="production-$component-coverage.txt" --xml-pretty \
               --xml="production-$component-coverage.xml"
           done
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0, Node 24
         with:
           name: production-coverage
           path: |

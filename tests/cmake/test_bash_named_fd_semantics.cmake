@@ -1,3 +1,5 @@
+cmake_minimum_required(VERSION 3.20)
+
 if(NOT DEFINED SHELLCLAVE_BASH)
   message(FATAL_ERROR "Missing Bash executable")
 endif()
@@ -10,18 +12,6 @@ unset(ENV{SHELLOPTS})
 unset(ENV{POSIXLY_CORRECT})
 unset(ENV{BASH_COMPAT})
 unset(ENV{BASH_XTRACEFD})
-
-execute_process(
-  COMMAND "${CMAKE_COMMAND}" -E env "BASH_ENV=" "${SHELLCLAVE_BASH}" -p -c [=[
-test "${BASH_VERSINFO[0]}" -gt 4 || {
-  test "${BASH_VERSINFO[0]}" -eq 4 && test "${BASH_VERSINFO[1]}" -ge 1
-}
-]=]
-  RESULT_VARIABLE supports_named_fds)
-if(NOT supports_named_fds EQUAL 0)
-  message(STATUS "Skipping Bash named-FD conformance: Bash 4.1 or newer is required")
-  return()
-endif()
 
 # Fixed, trusted literal spellings only; these probes never execute corpus or
 # fuzz inputs. Compare ordinary and compound setup failures and prove that

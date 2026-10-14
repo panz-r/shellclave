@@ -1,3 +1,5 @@
+cmake_minimum_required(VERSION 3.20)
+
 if(NOT DEFINED SHELLCLAVE_BASH)
   message(FATAL_ERROR "Missing Bash executable")
 endif()

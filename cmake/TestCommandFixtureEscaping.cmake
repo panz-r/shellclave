@@ -1,3 +1,5 @@
+cmake_minimum_required(VERSION 3.20)
+
 include("${CMAKE_CURRENT_LIST_DIR}/CommandFixtureValidation.cmake")
 
 shellclave_escape_command_fixture(escaped [=[printf '??=' && echo "?"]=])

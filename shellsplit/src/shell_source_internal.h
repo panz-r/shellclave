@@ -77,11 +77,13 @@ void shell_source_index_put(const char *input, size_t length, size_t position,
  * NULL with length zero) as no match. Nonempty spans require valid immutable
  * storage; their required `after` destination is distinct writable storage.
  * Reject an absent source position before calling the non-null index leaves. */
+/* Use the array index width for balanced scanner unwinds. Narrow unsigned
+ * wrap can become an oversized TLS relocation when GCC folds those paths. */
 #ifdef __cplusplus
-static thread_local unsigned shell_source_scan_depth;
+static thread_local size_t shell_source_scan_depth;
 static thread_local size_t shell_source_scan_heights[SHELL_MAX_SUBCOMMANDS];
 #else
-static _Thread_local unsigned shell_source_scan_depth;
+static _Thread_local size_t shell_source_scan_depth;
 static _Thread_local size_t shell_source_scan_heights[SHELL_MAX_SUBCOMMANDS];
 #endif
 
@@ -3596,14 +3598,15 @@ static inline SHELL_NONNULL(3, 4, 5, 6) shell_source_scan_status_t
         const char *input, size_t length,
         shell_source_substitution_scan_t *scan, size_t *start, size_t *after,
         shell_source_substitution_kind_t *kind) {
-  shell_source_scan_status_t status;
-  do {
-    status = shell_source_next_word_expansion(input, length, scan, start, after,
-                                              kind);
-  } while (status == SHELL_SOURCE_SCAN_FOUND &&
-           (*kind == SHELL_SOURCE_EXPANSION_ARITHMETIC ||
-            *kind == SHELL_SOURCE_EXPANSION_SUBSTRING));
-  return status;
+  for (;;) {
+    shell_source_scan_status_t status = shell_source_next_word_expansion(
+        input, length, scan, start, after, kind);
+    if (status != SHELL_SOURCE_SCAN_FOUND)
+      return status;
+    if (*kind != SHELL_SOURCE_EXPANSION_ARITHMETIC &&
+        *kind != SHELL_SOURCE_EXPANSION_SUBSTRING)
+      return SHELL_SOURCE_SCAN_FOUND;
+  }
 }
 
 /* Classification of a lexically validated word, not a syntax boundary. The
@@ -3974,14 +3977,43 @@ static inline bool shell_source_redirection_consumes_word(const char *input,
   return last == '<' || last == '>' || last == '&';
 }
 
-/* Parse the deliberately narrow parameter form used as a Bash named-FD
- * duplication target. Escaped physical line endings disappear during shell
- * lexical processing, so they are permitted after the dollar marker, after
- * an opening brace, or between identifier bytes. The returned zero-copy span
- * retains the original spelling. This accepts
- * exactly `$name` and `${name}`, optionally wrapped by one complete pair of
- * double quotes; general parameter expansion and concatenated words remain
- * outside descriptor analysis. */
+/* A move suffix is the last source dash outside a completed quoted fragment.
+ * The caller supplies one complete shell word; escaped dashes count too,
+ * whereas a dash inside a final quoted fragment does not. Strip only lexical
+ * continuations and the suffix escape, retaining the exact operand prefix. */
+static inline SHELL_NONNULL(1, 3) bool shell_source_fd_move_prefix(
+    const char *input, size_t length, size_t *prefix_length) {
+  while (length >= 2 &&
+         (input[length - 1] == '\n' || input[length - 1] == '\r')) {
+    size_t slash = length - 2;
+    if (input[length - 1] == '\n' && input[slash] == '\r' && slash != 0)
+      slash--;
+    if (input[slash] != '\\')
+      break;
+    size_t escapes = 0;
+    for (size_t i = slash + 1; i != 0 && input[i - 1] == '\\'; i--)
+      escapes++;
+    if ((escapes & 1u) == 0)
+      break;
+    length = slash;
+  }
+  if (length < 2 || input[length - 1] != '-')
+    return false;
+  size_t prefix = length - 1, escapes = 0;
+  for (size_t i = prefix; i != 0 && input[i - 1] == '\\'; i--)
+    escapes++;
+  if (escapes & 1u)
+    prefix--;
+  if (prefix == 0)
+    return false;
+  *prefix_length = prefix;
+  return true;
+}
+
+/* Parse an exact $name or ${name}, optionally double quoted, for a tracked
+ * named-FD operand. Escaped physical line endings are removed logically;
+ * returned name offsets still borrow the original source spelling. General
+ * parameter evaluation and concatenated words are outside this helper. */
 static inline bool shell_source_parse_named_fd_parameter(const char *input,
                                                          size_t start,
                                                          size_t end,
@@ -4975,73 +5007,135 @@ typedef enum {
   SHELL_SOURCE_BUILTIN_WAIT,
 } shell_source_builtin_kind_t;
 
+typedef struct {
+  const char *name;
+  size_t length;
+  shell_source_builtin_kind_t kind;
+} shell_source_builtin_entry_t;
+
+/* One catalog for default Bash dispatch and semantic identity. NONE entries
+ * are still builtins; their arguments retain the previous ordinary-word
+ * classification. Runtime builtin loading/disabling is unsupported syntax. */
+#define SHELL_BUILTIN_ENTRY(name, kind) {name, sizeof(name) - 1, kind}
+static const shell_source_builtin_entry_t shell_source_builtins[] = {
+    SHELL_BUILTIN_ENTRY("alias", SHELL_SOURCE_BUILTIN_ALIAS),
+    SHELL_BUILTIN_ENTRY("bind", SHELL_SOURCE_BUILTIN_BIND),
+    SHELL_BUILTIN_ENTRY("[", SHELL_SOURCE_BUILTIN_BRACKET),
+    SHELL_BUILTIN_ENTRY("compgen", SHELL_SOURCE_BUILTIN_COMPGEN),
+    SHELL_BUILTIN_ENTRY("complete", SHELL_SOURCE_BUILTIN_COMPLETE),
+    SHELL_BUILTIN_ENTRY("compopt", SHELL_SOURCE_BUILTIN_COMPOPT),
+    SHELL_BUILTIN_ENTRY("declare", SHELL_SOURCE_BUILTIN_DECLARE),
+    SHELL_BUILTIN_ENTRY(".", SHELL_SOURCE_BUILTIN_DOT),
+    SHELL_BUILTIN_ENTRY("enable", SHELL_SOURCE_BUILTIN_ENABLE),
+    SHELL_BUILTIN_ENTRY("eval", SHELL_SOURCE_BUILTIN_EVAL),
+    SHELL_BUILTIN_ENTRY("exec", SHELL_SOURCE_BUILTIN_EXEC),
+    SHELL_BUILTIN_ENTRY("export", SHELL_SOURCE_BUILTIN_EXPORT),
+    SHELL_BUILTIN_ENTRY("fc", SHELL_SOURCE_BUILTIN_FC),
+    SHELL_BUILTIN_ENTRY("getopts", SHELL_SOURCE_BUILTIN_GETOPTS),
+    SHELL_BUILTIN_ENTRY("let", SHELL_SOURCE_BUILTIN_LET),
+    SHELL_BUILTIN_ENTRY("local", SHELL_SOURCE_BUILTIN_LOCAL),
+    SHELL_BUILTIN_ENTRY("mapfile", SHELL_SOURCE_BUILTIN_MAPFILE),
+    SHELL_BUILTIN_ENTRY("printf", SHELL_SOURCE_BUILTIN_PRINTF),
+    SHELL_BUILTIN_ENTRY("popd", SHELL_SOURCE_BUILTIN_POPD),
+    SHELL_BUILTIN_ENTRY("pushd", SHELL_SOURCE_BUILTIN_PUSHD),
+    SHELL_BUILTIN_ENTRY("read", SHELL_SOURCE_BUILTIN_READ),
+    SHELL_BUILTIN_ENTRY("readarray", SHELL_SOURCE_BUILTIN_READARRAY),
+    SHELL_BUILTIN_ENTRY("readonly", SHELL_SOURCE_BUILTIN_READONLY),
+    SHELL_BUILTIN_ENTRY("set", SHELL_SOURCE_BUILTIN_SET),
+    SHELL_BUILTIN_ENTRY("shopt", SHELL_SOURCE_BUILTIN_SHOPT),
+    SHELL_BUILTIN_ENTRY("source", SHELL_SOURCE_BUILTIN_SOURCE),
+    SHELL_BUILTIN_ENTRY("trap", SHELL_SOURCE_BUILTIN_TRAP),
+    SHELL_BUILTIN_ENTRY("test", SHELL_SOURCE_BUILTIN_TEST),
+    SHELL_BUILTIN_ENTRY("typeset", SHELL_SOURCE_BUILTIN_TYPESET),
+    SHELL_BUILTIN_ENTRY("unalias", SHELL_SOURCE_BUILTIN_UNALIAS),
+    SHELL_BUILTIN_ENTRY("unset", SHELL_SOURCE_BUILTIN_UNSET),
+    SHELL_BUILTIN_ENTRY("wait", SHELL_SOURCE_BUILTIN_WAIT),
+    SHELL_BUILTIN_ENTRY(":", SHELL_SOURCE_BUILTIN_NONE),
+    SHELL_BUILTIN_ENTRY("bg", SHELL_SOURCE_BUILTIN_NONE),
+    SHELL_BUILTIN_ENTRY("break", SHELL_SOURCE_BUILTIN_NONE),
+    SHELL_BUILTIN_ENTRY("builtin", SHELL_SOURCE_BUILTIN_NONE),
+    SHELL_BUILTIN_ENTRY("caller", SHELL_SOURCE_BUILTIN_NONE),
+    SHELL_BUILTIN_ENTRY("cd", SHELL_SOURCE_BUILTIN_NONE),
+    SHELL_BUILTIN_ENTRY("command", SHELL_SOURCE_BUILTIN_NONE),
+    SHELL_BUILTIN_ENTRY("continue", SHELL_SOURCE_BUILTIN_NONE),
+    SHELL_BUILTIN_ENTRY("dirs", SHELL_SOURCE_BUILTIN_NONE),
+    SHELL_BUILTIN_ENTRY("disown", SHELL_SOURCE_BUILTIN_NONE),
+    SHELL_BUILTIN_ENTRY("echo", SHELL_SOURCE_BUILTIN_NONE),
+    SHELL_BUILTIN_ENTRY("exit", SHELL_SOURCE_BUILTIN_NONE),
+    SHELL_BUILTIN_ENTRY("false", SHELL_SOURCE_BUILTIN_NONE),
+    SHELL_BUILTIN_ENTRY("fg", SHELL_SOURCE_BUILTIN_NONE),
+    SHELL_BUILTIN_ENTRY("hash", SHELL_SOURCE_BUILTIN_NONE),
+    SHELL_BUILTIN_ENTRY("help", SHELL_SOURCE_BUILTIN_NONE),
+    SHELL_BUILTIN_ENTRY("history", SHELL_SOURCE_BUILTIN_NONE),
+    SHELL_BUILTIN_ENTRY("jobs", SHELL_SOURCE_BUILTIN_NONE),
+    SHELL_BUILTIN_ENTRY("kill", SHELL_SOURCE_BUILTIN_NONE),
+    SHELL_BUILTIN_ENTRY("logout", SHELL_SOURCE_BUILTIN_NONE),
+    SHELL_BUILTIN_ENTRY("pwd", SHELL_SOURCE_BUILTIN_NONE),
+    SHELL_BUILTIN_ENTRY("return", SHELL_SOURCE_BUILTIN_NONE),
+    SHELL_BUILTIN_ENTRY("shift", SHELL_SOURCE_BUILTIN_NONE),
+    SHELL_BUILTIN_ENTRY("suspend", SHELL_SOURCE_BUILTIN_NONE),
+    SHELL_BUILTIN_ENTRY("times", SHELL_SOURCE_BUILTIN_NONE),
+    SHELL_BUILTIN_ENTRY("true", SHELL_SOURCE_BUILTIN_NONE),
+    SHELL_BUILTIN_ENTRY("type", SHELL_SOURCE_BUILTIN_NONE),
+    SHELL_BUILTIN_ENTRY("ulimit", SHELL_SOURCE_BUILTIN_NONE),
+    SHELL_BUILTIN_ENTRY("umask", SHELL_SOURCE_BUILTIN_NONE),
+};
+#undef SHELL_BUILTIN_ENTRY
+enum {
+  SHELL_SOURCE_BUILTIN_COUNT =
+      sizeof(shell_source_builtins) / sizeof(shell_source_builtins[0])
+};
+#ifdef __cplusplus
+static_assert(SHELL_SOURCE_BUILTIN_COUNT <= 64, "builtin bitmap capacity");
+#else
+_Static_assert(SHELL_SOURCE_BUILTIN_COUNT <= 64, "builtin bitmap capacity");
+#endif
+
+typedef struct {
+  uint64_t matches;
+  size_t position;
+} shell_source_builtin_scan_t;
+
+static inline SHELL_NONNULL(2) bool shell_source_builtin_byte(
+    unsigned char byte, void *context) {
+  shell_source_builtin_scan_t *scan = (shell_source_builtin_scan_t *)context;
+  for (size_t i = 0; i < SHELL_SOURCE_BUILTIN_COUNT; i++)
+    if ((scan->matches & (UINT64_C(1) << i)) &&
+        (scan->position >= shell_source_builtins[i].length ||
+         byte != (unsigned char)shell_source_builtins[i].name[scan->position]))
+      scan->matches &= ~(UINT64_C(1) << i);
+  scan->position++;
+  return true;
+}
+
+/* Required immutable word. NULL result means nonstatic or non-builtin.
+ * Decode once against the bounded catalog, rather than walking the source
+ * separately for every candidate spelling. */
+static inline SHELL_NONNULL(1) const
+    shell_source_builtin_entry_t *shell_source_builtin_lookup(const char *word,
+                                                              size_t length) {
+  shell_source_builtin_scan_t scan = {
+      UINT64_MAX >> (64 - SHELL_SOURCE_BUILTIN_COUNT), 0};
+  if (!shell_source_visit_static_word(word, length, shell_source_builtin_byte,
+                                      &scan))
+    return NULL;
+  for (size_t i = 0; i < SHELL_SOURCE_BUILTIN_COUNT; i++)
+    if ((scan.matches & (UINT64_C(1) << i)) &&
+        scan.position == shell_source_builtins[i].length)
+      return &shell_source_builtins[i];
+  return NULL;
+}
+
 static inline SHELL_NONNULL(1) shell_source_builtin_kind_t
     shell_source_static_builtin_kind(const char *word, size_t word_length) {
-  if (shell_source_word_static_equals(word, word_length, "alias"))
-    return SHELL_SOURCE_BUILTIN_ALIAS;
-  if (shell_source_word_static_equals(word, word_length, "bind"))
-    return SHELL_SOURCE_BUILTIN_BIND;
-  if (shell_source_word_static_equals(word, word_length, "["))
-    return SHELL_SOURCE_BUILTIN_BRACKET;
-  if (shell_source_word_static_equals(word, word_length, "compgen"))
-    return SHELL_SOURCE_BUILTIN_COMPGEN;
-  if (shell_source_word_static_equals(word, word_length, "complete"))
-    return SHELL_SOURCE_BUILTIN_COMPLETE;
-  if (shell_source_word_static_equals(word, word_length, "compopt"))
-    return SHELL_SOURCE_BUILTIN_COMPOPT;
-  if (shell_source_word_static_equals(word, word_length, "declare"))
-    return SHELL_SOURCE_BUILTIN_DECLARE;
-  if (shell_source_word_static_equals(word, word_length, "."))
-    return SHELL_SOURCE_BUILTIN_DOT;
-  if (shell_source_word_static_equals(word, word_length, "enable"))
-    return SHELL_SOURCE_BUILTIN_ENABLE;
-  if (shell_source_word_static_equals(word, word_length, "eval"))
-    return SHELL_SOURCE_BUILTIN_EVAL;
-  if (shell_source_word_static_equals(word, word_length, "exec"))
-    return SHELL_SOURCE_BUILTIN_EXEC;
-  if (shell_source_word_static_equals(word, word_length, "export"))
-    return SHELL_SOURCE_BUILTIN_EXPORT;
-  if (shell_source_word_static_equals(word, word_length, "fc"))
-    return SHELL_SOURCE_BUILTIN_FC;
-  if (shell_source_word_static_equals(word, word_length, "getopts"))
-    return SHELL_SOURCE_BUILTIN_GETOPTS;
-  if (shell_source_word_static_equals(word, word_length, "let"))
-    return SHELL_SOURCE_BUILTIN_LET;
-  if (shell_source_word_static_equals(word, word_length, "local"))
-    return SHELL_SOURCE_BUILTIN_LOCAL;
-  if (shell_source_word_static_equals(word, word_length, "mapfile"))
-    return SHELL_SOURCE_BUILTIN_MAPFILE;
-  if (shell_source_word_static_equals(word, word_length, "printf"))
-    return SHELL_SOURCE_BUILTIN_PRINTF;
-  if (shell_source_word_static_equals(word, word_length, "popd"))
-    return SHELL_SOURCE_BUILTIN_POPD;
-  if (shell_source_word_static_equals(word, word_length, "pushd"))
-    return SHELL_SOURCE_BUILTIN_PUSHD;
-  if (shell_source_word_static_equals(word, word_length, "read"))
-    return SHELL_SOURCE_BUILTIN_READ;
-  if (shell_source_word_static_equals(word, word_length, "readarray"))
-    return SHELL_SOURCE_BUILTIN_READARRAY;
-  if (shell_source_word_static_equals(word, word_length, "readonly"))
-    return SHELL_SOURCE_BUILTIN_READONLY;
-  if (shell_source_word_static_equals(word, word_length, "set"))
-    return SHELL_SOURCE_BUILTIN_SET;
-  if (shell_source_word_static_equals(word, word_length, "shopt"))
-    return SHELL_SOURCE_BUILTIN_SHOPT;
-  if (shell_source_word_static_equals(word, word_length, "source"))
-    return SHELL_SOURCE_BUILTIN_SOURCE;
-  if (shell_source_word_static_equals(word, word_length, "trap"))
-    return SHELL_SOURCE_BUILTIN_TRAP;
-  if (shell_source_word_static_equals(word, word_length, "test"))
-    return SHELL_SOURCE_BUILTIN_TEST;
-  if (shell_source_word_static_equals(word, word_length, "typeset"))
-    return SHELL_SOURCE_BUILTIN_TYPESET;
-  if (shell_source_word_static_equals(word, word_length, "unalias"))
-    return SHELL_SOURCE_BUILTIN_UNALIAS;
-  if (shell_source_word_static_equals(word, word_length, "unset"))
-    return SHELL_SOURCE_BUILTIN_UNSET;
-  if (shell_source_word_static_equals(word, word_length, "wait"))
-    return SHELL_SOURCE_BUILTIN_WAIT;
-  return SHELL_SOURCE_BUILTIN_NONE;
+  const shell_source_builtin_entry_t *entry =
+      shell_source_builtin_lookup(word, word_length);
+  return entry ? entry->kind : SHELL_SOURCE_BUILTIN_NONE;
+}
+
+static inline SHELL_NONNULL(1) bool shell_source_word_is_builtin(
+    const char *word, size_t word_length) {
+  return shell_source_builtin_lookup(word, word_length) != NULL;
 }
 
 typedef struct {

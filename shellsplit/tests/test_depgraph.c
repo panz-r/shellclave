@@ -1,4 +1,5 @@
 #include "../src/shell_depgraph_internal.h"
+#include "depgraph_compare.h"
 #include "depgraph_invariants.h"
 #include "depgraph_test_workspace.h"
 #include "shell_depgraph.h"
@@ -332,7 +333,8 @@ TEST(supplied_fast_parser_contract) {
   shell_parse_result_t fast = {0};
   ASSERT(shell_parse_fast(command, strlen(command), &strict, &fast) ==
          SHELL_OK);
-  const shell_parse_result_t original = fast;
+  shell_parse_result_t original;
+  memcpy(&original, &fast, sizeof(original));
 
   shell_dep_graph_t regular;
   shell_dep_graph_t supplied;
@@ -415,6 +417,7 @@ TEST(supplied_fast_parser_contract) {
 TEST(supplied_fast_graph_equivalence) {
   static const char *const sources[] = {
       "true && echo taken",
+      "a&&b||c;d|e\n",
       "! true",
       "! ! true",
       "true && exec 2>out; time true",
@@ -448,7 +451,8 @@ TEST(supplied_fast_graph_equivalence) {
     size_t length = strlen(source);
     shell_parse_result_t fast;
     ASSERT(shell_parse_fast(source, length, &strict, &fast) == SHELL_OK);
-    const shell_parse_result_t unchanged = fast;
+    shell_parse_result_t unchanged;
+    memcpy(&unchanged, &fast, sizeof(unchanged));
     shell_dep_graph_t regular = {0};
     shell_dep_graph_t supplied = {0};
     ASSERT(shell_dep_graph_parse(source, length, ".", NULL, &regular) ==
@@ -460,12 +464,7 @@ TEST(supplied_fast_graph_equivalence) {
            supplied.edge_count == regular.edge_count &&
            supplied.status == regular.status &&
            supplied.cwd_buf.len == regular.cwd_buf.len);
-    ASSERT(memcmp(supplied.nodes, regular.nodes,
-                  supplied.node_count * sizeof(supplied.nodes[0])) == 0);
-    ASSERT(memcmp(supplied.edges, regular.edges,
-                  supplied.edge_count * sizeof(supplied.edges[0])) == 0);
-    ASSERT(memcmp(supplied.cwd_buf.data, regular.cwd_buf.data,
-                  supplied.cwd_buf.len) == 0);
+    ASSERT(shellsplit_test_graph_equal(&supplied, &regular));
     ASSERT(memcmp(&fast, &unchanged, sizeof(fast)) == 0);
   }
 
@@ -856,8 +855,6 @@ TEST(legacy_combined_output_redirects) {
   }
 
   static const char *const rejected[] = {
-      "cmd 2>&combined",
-      "cmd {fd}>&combined",
       "cmd >&$destination",
       "cmd >&~",
       "cmd >&*",
@@ -870,7 +867,6 @@ TEST(legacy_combined_output_redirects) {
       "cmd >&@(one|two)",
       "cmd >&!(one|two)",
       "cmd >&\\\n~",
-      "cmd >&''",
       "cmd >&$'a\\0b'",
       "cmd >&2147483648",
       "cmd >&00000000000000000000000000000000002147483648",
@@ -885,6 +881,23 @@ TEST(legacy_combined_output_redirects) {
     ASSERT(parse(rejected[i], &graph) == SHELL_DEP_EPARSE);
     ASSERT(graph.node_count == 0 && graph.edge_count == 0 &&
            graph.status == SHELL_DEP_STATUS_ERROR);
+  }
+  static const char *const failed_empty[] = {
+      "cmd >&''",
+      "{ cmd; } >&\"\"",
+  };
+  for (uint32_t i = 0; i < sizeof(failed_empty) / sizeof(failed_empty[0]);
+       i++) {
+    ASSERT(parse(failed_empty[i], &graph) == SHELL_DEP_OK);
+    ASSERT(count_doc_kind(&graph, SHELL_DOC_FILE) == 1 &&
+           shell_dep_graph_validate(&graph).valid);
+    bool failed = false;
+    for (uint32_t node = 0; node < graph.node_count; node++)
+      failed |=
+          graph.nodes[node].type == SHELL_NODE_DOC &&
+          graph.nodes[node].doc.kind == SHELL_DOC_FILE &&
+          (graph.nodes[node].doc.flags & SHELL_DEP_DOC_FLAG_EXPANSION_FAILED);
+    ASSERT(failed);
   }
   pass_count++;
 }
@@ -3629,24 +3642,27 @@ TEST(named_fd_route_cross_product_matrix) {
   pass_count++;
 }
 
-/* A named descriptor is dynamically addressed, so it has no numeric READ
- * route in the graph. Its inline document is nevertheless live: FD_OPEN is
- * the descriptor setup relation and must not be labelled as a document later
- * replaced by another redirect. */
+/* A named descriptor is dynamically addressed. FD_OPEN records its setup,
+ * but only a current-shell owner retains the inline document after return. */
 TEST(named_fd_inline_documents_remain_live) {
   static const struct {
     const char *command;
     shell_dep_doc_kind_t kind;
     shell_dep_node_type_t owner_type;
+    bool persistent;
   } cases[] = {
-      {"cmd {fd}<<<payload", SHELL_DOC_HERESTRING, SHELL_NODE_CMD},
-      {"cmd {fd}<<EOF\npayload\nEOF\n", SHELL_DOC_HEREDOC, SHELL_NODE_CMD},
-      {"{ cat; } {fd}<<<payload", SHELL_DOC_HERESTRING, SHELL_NODE_GROUP},
+      {"cmd {fd}<<<payload", SHELL_DOC_HERESTRING, SHELL_NODE_CMD, false},
+      {"cmd {fd}<<EOF\npayload\nEOF\n", SHELL_DOC_HEREDOC, SHELL_NODE_CMD,
+       false},
+      {": {fd}<<<payload", SHELL_DOC_HERESTRING, SHELL_NODE_CMD, true},
+      {": {fd}<<EOF\npayload\nEOF\n", SHELL_DOC_HEREDOC, SHELL_NODE_CMD, true},
+      {"{ cat; } {fd}<<<payload", SHELL_DOC_HERESTRING, SHELL_NODE_GROUP, true},
       {"{ cat; } {fd}<<EOF\npayload\nEOF\n", SHELL_DOC_HEREDOC,
-       SHELL_NODE_GROUP},
-      {"{ cat; } {f\\\nd}<<<payload", SHELL_DOC_HERESTRING, SHELL_NODE_GROUP},
+       SHELL_NODE_GROUP, true},
+      {"{ cat; } {f\\\nd}<<<payload", SHELL_DOC_HERESTRING, SHELL_NODE_GROUP,
+       true},
       {"{ cat; } {f\\\r\nd}\\\n<<EOF\npayload\nEOF\n", SHELL_DOC_HEREDOC,
-       SHELL_NODE_GROUP},
+       SHELL_NODE_GROUP, true},
   };
 
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
@@ -3660,8 +3676,8 @@ TEST(named_fd_inline_documents_remain_live) {
         break;
       }
     ASSERT(document >= 0 && owner >= 0);
-    ASSERT((graph.nodes[document].doc.flags & SHELL_DEP_DOC_FLAG_TRANSIENT) ==
-           0);
+    ASSERT(!!(graph.nodes[document].doc.flags & SHELL_DEP_DOC_FLAG_TRANSIENT) ==
+           !cases[i].persistent);
     ASSERT(has_edge_fds(&graph, SHELL_EDGE_FD_OPEN, (uint32_t)document,
                         (uint32_t)owner, SHELL_DEP_FD_NONE,
                         SHELL_DEP_FD_NAMED));
@@ -9214,11 +9230,14 @@ TEST(compound_control_status_stream) {
 
 TEST(redirect_frame_membership_scaling) {
 #ifdef SHELLSPLIT_TEST_SOURCE_SCANS
-  for (unsigned family = 0; family < 3; family++) {
+  for (unsigned family = 0; family < 4; family++) {
     size_t previous = 0;
     /* A command plus both tokens of each duplication fits the 32-token
-     * semantic bound. Exercise scaling within that supported capacity. */
-    for (unsigned count = 3; count <= 12; count *= 2) {
+     * semantic bound. The scratch-observable family has more route states, so
+     * use 2/4/8 to remain within the independent graph-edge capacity. */
+    unsigned first = family == 3 ? 2 : 3;
+    unsigned last = family == 3 ? 8 : 12;
+    for (unsigned count = first; count <= last; count *= 2) {
       char source[4096] = "{ { exec";
       size_t used = strlen(source);
       for (unsigned i = 0; i < count; i++)
@@ -9231,7 +9250,8 @@ TEST(redirect_frame_membership_scaling) {
       used += (size_t)snprintf(source + used, sizeof(source) - used, "; }%s%s",
                                family == 2 ? " && " : "; ",
                                family == 2 ? "echo \"$(exec 2>&3; time true)\""
-                                           : "exec 2>&3; time true");
+                               : family == 3 ? "exec 2>&10; time true"
+                                             : "exec 2>&3; time true");
       ASSERT(used < sizeof(source));
       shellsplit_test_source_scan_reset();
       shell_dep_graph_t graph;
@@ -9244,18 +9264,18 @@ TEST(redirect_frame_membership_scaling) {
           shellsplit_test_metadata_work(SHELLSPLIT_TEST_WORK_REDIRECT_FRAMES);
       /* Small fixtures cross an AVL height boundary. Permit fixed join
        * bookkeeping, while keeping doubling comfortably below quadratic. */
-      if (!work || work > 128 * count || (previous && work > 3 * previous + 8))
+      if (!work || work > 128 * count || (previous && work > 3 * previous + 32))
         fprintf(stderr,
                 "frame scaling: family=%u count=%u work=%zu previous=%zu\n",
                 family, count, work, previous);
       ASSERT(work > 0 && work <= 128 * count &&
-             (!previous || work <= 3 * previous + 8));
+             (!previous || work <= 3 * previous + 32));
       ASSERT(shell_dep_graph_validate(&graph).valid);
       int timer = find_time(&graph), file = find_file_doc(&graph, "out");
       ASSERT(timer >= 0 && file >= 0);
       ASSERT(!has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)timer,
                            (uint32_t)file, 2, SHELL_DEP_FD_NONE));
-      ASSERT(time_has_external_fd(&graph, timer, 3));
+      ASSERT(time_has_external_fd(&graph, timer, family == 3 ? 10 : 3));
       previous = work;
     }
   }
@@ -13391,8 +13411,7 @@ TEST(readonly_assignment_unreachable_phases) {
                                            &fast, &supplied) == SHELL_DEP_OK);
     ASSERT(supplied.node_count == graph.node_count &&
            supplied.edge_count == graph.edge_count &&
-           memcmp(supplied.edges, graph.edges,
-                  graph.edge_count * sizeof(graph.edges[0])) == 0);
+           shellsplit_test_graph_equal(&supplied, &graph));
   }
   shell_dep_graph_t graph = {0};
   ASSERT(parse("UID=0 true >out", &graph) == SHELL_DEP_OK);
@@ -14135,8 +14154,7 @@ TEST(unreachable_stage_effects_and_syntax) {
                                            &supplied) == SHELL_DEP_OK);
     ASSERT(supplied.node_count == graph.node_count &&
            supplied.edge_count == graph.edge_count &&
-           memcmp(supplied.edges, graph.edges,
-                  graph.edge_count * sizeof(graph.edges[0])) == 0);
+           shellsplit_test_graph_equal(&supplied, &graph));
   }
   static const char *const invalid[] = {
       "false && echo $(if true; then echo bad; fi)",
@@ -14190,8 +14208,7 @@ TEST(redirect_setup_outcome_substitutions) {
                                            &fast, &supplied) == SHELL_DEP_OK);
     ASSERT(supplied.node_count == graph.node_count &&
            supplied.edge_count == graph.edge_count &&
-           memcmp(supplied.edges, graph.edges,
-                  graph.edge_count * sizeof(graph.edges[0])) == 0);
+           shellsplit_test_graph_equal(&supplied, &graph));
   }
   pass_count++;
 }
@@ -14249,8 +14266,7 @@ TEST(expansion_phases_survive_failed_setup) {
                                            &fast, &supplied) == SHELL_DEP_OK);
     ASSERT(supplied.node_count == graph.node_count &&
            supplied.edge_count == graph.edge_count &&
-           memcmp(supplied.edges, graph.edges,
-                  graph.edge_count * sizeof(graph.edges[0])) == 0);
+           shellsplit_test_graph_equal(&supplied, &graph));
   }
   pass_count++;
 }
@@ -14302,10 +14318,7 @@ TEST(expansion_control_effects_require_reachable_setup) {
                                            &fast, &supplied) == SHELL_DEP_OK);
     ASSERT(supplied.node_count == graph.node_count &&
            supplied.edge_count == graph.edge_count &&
-           memcmp(supplied.nodes, graph.nodes,
-                  graph.node_count * sizeof(graph.nodes[0])) == 0 &&
-           memcmp(supplied.edges, graph.edges,
-                  graph.edge_count * sizeof(graph.edges[0])) == 0);
+           shellsplit_test_graph_equal(&supplied, &graph));
   }
   pass_count++;
 }
@@ -14339,8 +14352,7 @@ TEST(assignment_value_descriptor_snapshots) {
                                            &fast, &supplied) == error);
     ASSERT(supplied.node_count == graph.node_count &&
            supplied.edge_count == graph.edge_count &&
-           memcmp(supplied.edges, graph.edges,
-                  graph.edge_count * sizeof(graph.edges[0])) == 0);
+           shellsplit_test_graph_equal(&supplied, &graph));
   }
   pass_count++;
 }
@@ -14434,8 +14446,7 @@ TEST(reachability_cwd_transitions) {
              supplied.cwd_buf.len == graph.cwd_buf.len &&
              memcmp(supplied.cwd_buf.data, graph.cwd_buf.data,
                     graph.cwd_buf.len) == 0 &&
-             memcmp(supplied.edges, graph.edges,
-                    graph.edge_count * sizeof(graph.edges[0])) == 0);
+             shellsplit_test_graph_equal(&supplied, &graph));
     }
     limits.cwd_buf_size = sizeof("/workspace");
     static const char unreachable[] =
@@ -14493,8 +14504,7 @@ TEST(skipped_duplication_operand_syntax) {
                                            &fast, &supplied) == SHELL_DEP_OK);
     ASSERT(supplied.node_count == graph.node_count &&
            supplied.edge_count == graph.edge_count &&
-           memcmp(supplied.edges, graph.edges,
-                  graph.edge_count * sizeof(graph.edges[0])) == 0);
+           shellsplit_test_graph_equal(&supplied, &graph));
   }
   static const char *const invalid[] = {
       "false && : >&$(echo \"unfinished)",

@@ -1,3 +1,5 @@
+cmake_minimum_required(VERSION 3.20)
+
 if(NOT CLANG_FORMAT_EXECUTABLE)
   message(FATAL_ERROR "CLANG_FORMAT_EXECUTABLE is required")
 endif()

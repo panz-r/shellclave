@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# Build the pinned test executor without replacing the machine's shell.
+# stdout is only its absolute executable path; progress goes to stderr.
+set -euo pipefail
+
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+manifest="$repo_root/scripts/reference-bash.sha256"
+reference_version=$(sed -n 's/^# version=//p' "$manifest")
+release_version=${reference_version%.*}
+cache_root=${1:-"$repo_root/build-reference-bash"}
+if [ "$#" -gt 1 ] || [ -z "$cache_root" ]; then
+  echo "usage: prepare-reference-bash [cache-directory]" >&2
+  exit 1
+fi
+for command in curl sha256sum tar patch make cc flock; do
+  if ! command -v "$command" >/dev/null 2>&1; then
+    echo "prepare-reference-bash: $command is required" >&2
+    exit 1
+  fi
+done
+mkdir -p "$cache_root"
+cache_root=$(cd "$cache_root" && pwd)
+# Serialize builders sharing this cache. The recipe digest invalidates a
+# cached build when either its source pin or build instructions change.
+exec 9>"$cache_root/.lock"
+flock 9
+recipe=$(sha256sum "$manifest" "$repo_root/scripts/prepare-reference-bash" \
+  | awk '{print $1}' | sha256sum | awk '{print $1}')
+installation="$cache_root/$reference_version-$recipe"
+executable="$installation/bin/bash"
+if [ -x "$executable" ] &&
+   [ "$("$executable" -p -c 'printf "%s.%s.%s" "${BASH_VERSINFO[0]}" "${BASH_VERSINFO[1]}" "${BASH_VERSINFO[2]}"')" = "$reference_version" ]; then
+  printf '%s\n' "$executable"
+  exit 0
+fi
+
+downloads="$cache_root/downloads"
+mkdir -p "$downloads"
+while read -r checksum filename; do
+  if [[ "$checksum" == \#* ]] || [ -z "$checksum" ]; then
+    continue
+  fi
+  artifact="$downloads/$filename"
+  if [ -f "$artifact" ] &&
+     printf '%s  %s\n' "$checksum" "$artifact" | sha256sum --check --status; then
+    continue
+  fi
+  case "$filename" in
+    bash-*.tar.gz) url="https://ftp.gnu.org/gnu/bash/$filename";;
+    bash??-???) url="https://ftp.gnu.org/gnu/bash/bash-$release_version-patches/$filename";;
+    *) echo "prepare-reference-bash: invalid manifest filename $filename" >&2; exit 1;;
+  esac
+  curl --fail --location --silent --show-error --retry 3 --max-time 120 \
+    "$url" --output "$artifact"
+  printf '%s  %s\n' "$checksum" "$artifact" | sha256sum --check >&2
+done <"$manifest"
+
+build_directory=$(mktemp -d "$cache_root/build.XXXXXX")
+cleanup() { rm -rf -- "$build_directory"; }
+trap cleanup EXIT
+tar -xzf "$downloads/bash-$release_version.tar.gz" -C "$build_directory"
+source_directory="$build_directory/bash-$release_version"
+while read -r checksum filename; do
+  case "$filename" in
+    bash??-???) patch --directory "$source_directory" --strip 0 \
+                     --input "$downloads/$filename" >&2;;
+  esac
+done <"$manifest"
+(
+  cd "$source_directory"
+  # Keep bundled Readline and the default builtin inventory. This is a
+  # standalone reference executable, never part of the library build.
+  ./configure --prefix="$installation" --without-bash-malloc
+  make --jobs=2
+  make install
+) >&2
+actual_version=$("$executable" -p -c 'printf "%s.%s.%s" "${BASH_VERSINFO[0]}" "${BASH_VERSINFO[1]}" "${BASH_VERSINFO[2]}"')
+if [ "$actual_version" != "$reference_version" ]; then
+  echo "prepare-reference-bash: built $actual_version, expected $reference_version" >&2
+  exit 1
+fi
+printf '%s\n' "$executable"

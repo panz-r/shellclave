@@ -1699,8 +1699,9 @@ static void test_modern_bash_syntax_contract(void) {
       SHELL_GROUP_IO_PROCESS_SUB_RW_IN == 13 &&
       SHELL_GROUP_IO_PROCESS_SUB_RW_OUT == 14 &&
       SHELL_GROUP_IO_PROCESS_SUB_UNROUTED == 15 &&
-      SHELL_GROUP_IO_PIPE_OUTPUT_STDERR == 16;
-  test("Group I/O enum appends pipe-both output", enum_values_stable);
+      SHELL_GROUP_IO_PIPE_OUTPUT_STDERR == 16 && SHELL_GROUP_IO_MOVE_FD == 17 &&
+      SHELL_GROUP_IO_FAILED_REDIRECT == 18;
+  test("Group I/O enum appends modern redirect operations", enum_values_stable);
 
   const char *source = "! printf $'a\\0b' @(left|right) items=(one two) &>out";
   shell_tokenizer_state_t state;
@@ -7480,8 +7481,6 @@ static void test_group_combined_named_redirect_and_document_contract(void) {
       "{ printf x; } 2&>combined",
       "{ printf x; } 3&>>combined",
       "{ printf x; } {fd}&>combined",
-      "{ printf x; } 2>&combined",
-      "{ printf x; } {fd}>&combined",
   };
   for (size_t i = 0; valid && i < sizeof(unsupported) / sizeof(unsupported[0]);
        i++) {

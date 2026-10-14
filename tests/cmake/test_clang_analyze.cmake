@@ -1,3 +1,5 @@
+cmake_minimum_required(VERSION 3.20)
+
 set(driver "${SHELLCLAVE_SOURCE_DIR}/cmake/RunClangAnalyze.cmake")
 set(fixture "${SHELLCLAVE_SOURCE_DIR}/tests/analyzer")
 set(generators "${SHELLCLAVE_ANALYZE_GENERATOR}")

@@ -105,21 +105,21 @@ static int fail_count = 0;
     printf("  %-40s ", #name);                                                 \
     int _pf = fail_count;                                                      \
     test_##name();                                                             \
+    cleanup_temp_files();                                                      \
     if (fail_count == _pf) {                                                   \
       printf("PASS\n");                                                        \
       pass_count++;                                                            \
     }                                                                          \
   } while (0)
 
-#define MAX_TEMP_FILES 16
-
 /* The evaluation buffer owns both diagnostic strings and the bounded
  * dependency-graph workspace. Keep normal test evaluation on the public
  * size-hint path's safe side; small-prefix contracts below deliberately pass
  * a narrower view of this same storage. */
-static char eval_buf[20u * 1024u * 1024u];
-static char *temp_files[MAX_TEMP_FILES];
-static int temp_file_count = 0;
+static char eval_buf[24u * 1024u * 1024u];
+static char **temp_files = NULL;
+static size_t temp_file_count = 0;
+static size_t temp_file_capacity = 0;
 
 static uint64_t test_load_u64_le(const unsigned char *source) {
   uint64_t value = 0;
@@ -134,22 +134,27 @@ static void test_store_u64_le(unsigned char *destination, uint64_t value) {
 }
 
 static void cleanup_temp_files(void) {
-  for (int i = 0; i < temp_file_count; i++) {
-    if (temp_files[i]) {
-      unlink(temp_files[i]);
-      free(temp_files[i]);
-      temp_files[i] = NULL;
-    }
+  for (size_t i = 0; i < temp_file_count; i++) {
+    unlink(temp_files[i]);
+    free(temp_files[i]);
   }
+  free(temp_files);
+  temp_files = NULL;
   temp_file_count = 0;
+  temp_file_capacity = 0;
 }
 
 static void register_temp_file(const char *path) {
-  if (temp_file_count >= MAX_TEMP_FILES)
-    return;
+  if (temp_file_count == temp_file_capacity) {
+    size_t capacity = temp_file_capacity ? temp_file_capacity * 2 : 16;
+    char **files = realloc(temp_files, capacity * sizeof(*files));
+    ASSERT_NOT_NULL(files);
+    temp_files = files;
+    temp_file_capacity = capacity;
+  }
   temp_files[temp_file_count] = strdup(path);
-  if (temp_files[temp_file_count] != NULL)
-    temp_file_count++;
+  ASSERT_NOT_NULL(temp_files[temp_file_count]);
+  temp_file_count++;
 }
 
 static const char *temp_policy_file(void) {
@@ -164,6 +169,22 @@ static const char *temp_policy_file(void) {
   }
   register_temp_file(path);
   return path;
+}
+
+TEST(temp_fixture_cleanup) {
+  char paths[24][256];
+  for (size_t i = 0; i < 24; i++) {
+    const char *path = temp_policy_file();
+    ASSERT_NOT_NULL(path);
+    snprintf(paths[i], sizeof(paths[i]), "%s", path);
+    ASSERT(access(paths[i], F_OK) == 0);
+  }
+  cleanup_temp_files();
+  for (size_t i = 0; i < 24; i++) {
+    ASSERT(access(paths[i], F_OK) == -1);
+    ASSERT(errno == ENOENT);
+  }
+  ASSERT_NOT_NULL(temp_policy_file());
 }
 
 static sg_gate_t *gate_with_rules(const char *const *rules, size_t count) {
@@ -4859,8 +4880,8 @@ TEST(eval_input_contract_matrix) {
       {"zero-padded overflowed legacy descriptor target",
        "cmd >&00000000000000000000000000000000002147483648", SG_ERR_PARSE,
        SG_VERDICT_REJECT, false},
-      {"empty legacy descriptor target", "cmd >&\"\"", SG_ERR_PARSE,
-       SG_VERDICT_REJECT, false},
+      {"empty legacy descriptor target", "cmd >&\"\"", SG_OK,
+       SG_VERDICT_UNDETERMINED, false},
       {"NUL-bearing legacy descriptor target", "cmd >&$'a\\0b'", SG_ERR_PARSE,
        SG_VERDICT_REJECT, false},
   };
@@ -10311,6 +10332,385 @@ TEST(violation_rule_matrix) {
 /* Redirect setup changes filesystem state even where a later redirection
  * replaces its byte route. Shellgate must retain that side effect without
  * mistaking input setup or descriptor duplication for a write. */
+TEST(descriptor_setup_dispatch) {
+  sg_gate_t *gate = sg_gate_new();
+  ASSERT(gate != NULL);
+  ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
+  ASSERT_SG_OK(sg_gate_set_stop_mode(gate, SG_EVAL_ALL));
+  sg_violation_config_t config;
+  sg_violation_config_default(&config);
+  config.sensitive_write_paths[0] = "/etc/dispatch-a";
+  config.sensitive_write_path_count = 1;
+  ASSERT_SG_OK(sg_gate_set_violation_config_borrowed(gate, &config));
+  static const struct {
+    const char *source, *netargv;
+    uint32_t writes;
+    bool sensitive;
+  } cases[] = {
+      {"exec 3>/etc/dispatch-a || exit; exec 10>&- 11>&- 12>&-; "
+       "\"$cmd\" payload 1>&3 {fd}>&3 1>&10",
+       "4:$cmd,7:payload,", 1, true},
+      {"exec 3>/etc/dispatch-a || exit; exec 10>&- 11>&- 12>&-; "
+       "command \"$cmd\" payload 1>&3 {fd}>&3 1>&10",
+       "7:command,4:$cmd,7:payload,", 1, true},
+      {"exec 3>/etc/dispatch-a || exit; exec 10>&- 11>&- 12>&-; "
+       "builtin \"$cmd\" payload 1>&3 {fd}>&3 1>&10",
+       "7:builtin,4:$cmd,7:payload,", 0, false},
+      {"exec 3>&1 || exit; exec 10>&- 11>&- 12>&-; "
+       "! 0<&0 1>&3 2>&10 && printf payload >/etc/dispatch-a",
+       "6:printf,7:payload,", 1, true},
+      {"exec 3>&1 || exit; exec 10>&- 11>&- 12>&-; "
+       "0<&0 1>&3 2>&10 && printf payload >/etc/dispatch-a",
+       "6:printf,7:payload,", 0, false},
+      {"exec 3>&1 || exit; exec 10>&- 11>&- 12>&-; "
+       "! 0<<<literal 1>&3 2>&10 && printf payload >/etc/dispatch-a",
+       "6:printf,7:payload,", 1, true},
+      {"exec 3>&1 || exit; exec 10>&- 11>&- 12>&-; "
+       "! 0<<EOF 1>&3 2>&10 && printf payload >/etc/dispatch-a\nliteral\nEOF\n",
+       "6:printf,7:payload,", 1, true},
+      {"exec 1>/tmp/dispatch-original 4>/etc/dispatch-a || exit; "
+       "exec 10>&- 11>&- 12>&-; : 1>&4- 12>&11- 1>&11; printf payload",
+       "6:printf,7:payload,", 1, true},
+      {"exec 1>/tmp/dispatch-original 4>/etc/dispatch-a || exit; "
+       "exec 10>&- 11>&- 12>&-; { :; } 1>&4- 12>&11- 1>&11; printf payload",
+       "6:printf,7:payload,", 1, true},
+      {"exec 1>/tmp/dispatch-original 4>/etc/dispatch-a || exit; "
+       "exec 10>&- 11>&- 12>&-; \"$cmd\" 1>&4- 12>&11- 1>&11; printf payload",
+       "6:printf,7:payload,", 2, true},
+      {"exec 1>/tmp/dispatch-original 4>/etc/dispatch-a || exit; "
+       "exec 10>&- 11>&- 12>&-; /bin/true 1>&4- 12>&11- 1>&11; printf payload",
+       "6:printf,7:payload,", 1, false},
+      {"exec 1>/tmp/dispatch-original || exit; "
+       "exec 9>&- 10>&- 11>&- 12>&-; "
+       "{ echo \"$(exec 10>/etc/dispatch-a; printf payload >&10)\"; } "
+       "1>/tmp/dispatch-temporary",
+       "6:printf,7:payload,", 1, false},
+      {"exec 1>/etc/dispatch-a || exit; "
+       "exec 9>&- 10>&- 11>&- 12>&-; "
+       "{ cat < <(exec 10>/tmp/dispatch-original; printf payload >&10); } "
+       "1>/tmp/dispatch-temporary",
+       "6:printf,7:payload,", 1, true},
+      {"exec 1>/tmp/dispatch-original || exit; "
+       "exec 9>&- 10>&- 11>&- 12>&-; "
+       "{ : > >(exec 10>&-; exec 10>/etc/dispatch-a; printf payload >&10); } "
+       "1>/tmp/dispatch-temporary",
+       "6:printf,7:payload,", 1, true},
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    sg_result_t result = {0};
+    ASSERT_SG_OK(sg_gate_evaluate(gate, cases[i].source,
+                                  strlen(cases[i].source), eval_buf,
+                                  sizeof(eval_buf), &result));
+    bool found = false;
+    for (uint32_t c = 0; c < result.subcommand_count; c++) {
+      const sg_subcommand_result_t *command = &result.subcommands[c];
+      if (strcmp(command->netargv, cases[i].netargv))
+        continue;
+      found = true;
+      ASSERT(command->write_count == cases[i].writes);
+      ASSERT(!!(command->violation_type_flags & SG_VIOL_WRITE_SENSITIVE) ==
+             cases[i].sensitive);
+    }
+    ASSERT(found && !result.truncated);
+  }
+  sg_gate_free(gate);
+}
+
+TEST(descriptor_move_evaluation) {
+  const char *rules[] = {
+      "exec",  ":",           "echo *", "/bin/true",
+      "probe", "printf next", "exit",   "builtin command /bin/true",
+      "cat"};
+  sg_gate_t *gate = gate_with_rules(rules, sizeof(rules) / sizeof(rules[0]));
+  ASSERT(gate != NULL);
+  ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
+  ASSERT_SG_OK(sg_gate_set_stop_mode(gate, SG_EVAL_ALL));
+  sg_violation_config_t config;
+  sg_violation_config_default(&config);
+  config.sensitive_write_paths[0] = "/etc/move-out";
+  config.sensitive_write_path_count = 1;
+  ASSERT_SG_OK(sg_gate_set_violation_config_borrowed(gate, &config));
+  static const struct {
+    const char *source;
+    bool writes;
+  } cases[] = {
+      {"exec 3>/etc/move-out; exec 1>&3-; echo next", true},
+      {"exec 4>&-; exec 3>/etc/move-out; : 4>&3-; echo next >&3", false},
+      {"exec 3>/etc/move-out 4>&1; : 4>&3-; echo next >&3", true},
+      {"exec 4>&-; exec 3>/etc/move-out; { :; } 4>&3-; echo next >&3", false},
+      {"exec 3>/etc/move-out 4>&1; { :; } 4>&3-; echo next >&3", true},
+      {"exec {fd}>/etc/move-out; exec 1>&${fd}-; echo next", true},
+      {"exec 3>/etc/move-out; : 4>&\"3-\"; echo next >&3", true},
+      {"exec 4>&-; exec 3>/etc/move-out; /bin/true 4>&3-; echo next >&3", true},
+      {"exec 4>&-; exec 3>/etc/move-out; builtin command /bin/true 4>&3-; "
+       "echo next >&3",
+       false},
+      {"exec 3>/etc/move-out || exit; builtin command /bin/true {fd}>&3; "
+       "echo next >&\"$fd\"",
+       true},
+      {"exec 3>/etc/move-out 4>/tmp/original || exit; "
+       "exec 10>&- 11>&- 12>&-; : 4>&- 10>&3-; echo next >&3",
+       true},
+      {"exec 3>/etc/move-out || exit; exec 10>&- 11>&-; "
+       "exec {fd}>&3 {fd}>&3; echo next >&10",
+       true},
+      {"exec 3>/etc/move-out || exit; exec 10>&- 11>&-; "
+       ": {fd}>&3 10>&-; echo next >&\"$fd\"",
+       true},
+      {"exec 3>/etc/move-out || exit; exec 10>&- 11>&-; "
+       "{ :; } {fd}>&3 10>&3-; echo next >&10",
+       true},
+      {"exec 4>&-; exec 3>/tmp/original; { exec 3>/etc/move-out; } "
+       "4>&3-; echo next >&3",
+       true},
+      {"exec {fd}>/etc/move-out; /bin/true {fd}>/tmp/local; "
+       "echo next >&\"$fd\"",
+       true},
+      {"exec 10>&-; exec {fd}>/etc/move-out; exec 10>&${fd}-; "
+       "echo next >&\"$fd\"",
+       true},
+      {"exec 3>&- 10>&- 11>&-; probe && exec {fd}>/tmp/move-first || "
+       "exec {pad}>/tmp/move-pad {fd}>/etc/move-out; exec 10>&${fd}-; "
+       "echo next >&10",
+       true},
+      {"exec 3>/tmp/original 4>/etc/move-out; : 3>&4- 3>&4; echo next >&4",
+       true},
+      {"exec 3>/tmp/original 4>/etc/move-out; { :; } 3>&4- 3>&4; "
+       "echo next >&4",
+       true},
+      {"exec 3>/tmp/original 4>/etc/move-out "
+       "10>&- 11>&- 12>&- 13>&-; : 3>&4- {fd}>&3; echo next >&12",
+       true},
+      {"exec 3>/tmp/original 4>/etc/move-out "
+       "10>&- 11>&- 12>&- 13>&-; : 3>&1 3>&4 {fd}>&3; echo next >&12",
+       true},
+      {"exec 3>/etc/move-out; exec 10>&- 11>&-; "
+       "{ echo next >&10; } 3>&1",
+       true},
+      {"exec 3>/etc/move-out; exec 11>&- 12>&-; "
+       "{ :; } 3>&1; echo next >&11",
+       false},
+      {"exec 4>/etc/move-out; : 4>&\"\"-; echo next >&4", true},
+      {"exec 4>/etc/move-out; { :; } 4>&''-; echo next >&4", true},
+      {"exec 1>/etc/move-out || exit; exec 10>&-; exec 10>&10-; "
+       "exec {fd}>&1; echo next >&10",
+       true},
+      {"exec 1>/etc/move-out || exit; exec 10>&-; { :; } 10>&10; "
+       "exec {fd}>&1; echo next >&10",
+       true},
+      {"exec 3>/etc/move-out; exec 10>& - 11>& - 12>& -; "
+       "{ echo next >&11; } 3>&1",
+       false},
+      {"exec 3>&- 10>&- 11>&-; "
+       "{ probe && exec {fd}>/tmp/move-first || "
+       "exec {pad}>/etc/move-out {fd}>/tmp/move-second; } && "
+       "{ exec 10>&${fd}-; echo next >&10; }",
+       false},
+      {"exec 3>&- 10>&- 11>&-; "
+       "{ probe && exec {fd}>/tmp/move-first || "
+       "exec {pad}>/etc/move-out {fd}>/tmp/move-second; } && "
+       "{ exec 4>&${fd}-; echo next >&4; }",
+       false},
+      {"exec 3>/etc/move-out 4>/tmp/original || exit; "
+       "exec 10>&- 11>&- 12>&-; exec {fd}>&3; "
+       ": 3>&${fd}- {fd}>&4; echo next >&10",
+       true},
+      {"exec 3>/etc/move-out || exit; exec 10>&- 11>&- 12>&-; "
+       "exec {fd}>&3; : 3>&${fd}- {fd}>&-; echo next >&10",
+       true},
+      {"exec 3>/etc/move-out || exit; exec 10>&- 11>&- 12>&-; "
+       "exec {fd}>&3; : 3>&${fd}- 11>&3-; echo next >&10",
+       true},
+      {"exec 3>/etc/move-out 4>/tmp/original || exit; "
+       "exec 8>&- 10>&- 11>&- 12>&-; exec {fd}>&3; "
+       ": 3>&${fd}- {fd}>&4 5>&8; echo next >&10",
+       true},
+      {"exec 4>&-; exec 3>/etc/move-out || exit; "
+       "{ :; } 4>&3-; echo next >&3",
+       false},
+      {"exec 4>&-; exec 3>/etc/move-out || exit; "
+       "{ :; } 4>&3- || echo next >&3",
+       false},
+      {"exec 3>/tmp/original 20>/etc/move-out || exit; "
+       "exec 10>&- 11>&- 21>&- 22>&-; { echo next >&10; } 3>&20-",
+       true},
+      {"exec 3>/etc/move-out || exit; exec 10>&- 11>&- 12>&-; "
+       "exec {fd}>&3; exec {fd}>&- 11>&3-; echo next >&11",
+       false},
+      {"exec 3>/etc/move-out || exit; exec 10>&- 11>&-; "
+       "{ exec 10>/tmp/original; echo next >&10; } 3>&1",
+       true},
+      {"exec 10>&-; exec {fd}>&1; : 10>&- 3>&${fd}-; echo next", false},
+      {"exec 3>/tmp/original 4>/etc/move-out || exit; "
+       "exec 10>&3 11>&- 12>&- 13>&-; "
+       "exec 3>&10- 11>&4 10>&-; echo next >&11",
+       true},
+      {"exec 1>/etc/move-out 3>/tmp/original 4>/tmp/original || exit; "
+       "exec 10>&- 11>&- 12>&-; "
+       "{ exec 11>&-; } 3>&1 4>&1; echo next >&3",
+       true},
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    sg_result_t result = {0};
+    sg_error_t error = eval_cmd(gate, cases[i].source, &result);
+    if (error != SG_OK || result.truncated ||
+        result.verdict != SG_VERDICT_ALLOW)
+      fprintf(stderr,
+              "descriptor move case %zu: %s (error %d, verdict %d, "
+              "truncated %d, reason %s)\n",
+              i, cases[i].source, error, result.verdict, result.truncated,
+              result.deny_reason ? result.deny_reason : "none");
+    if (result.verdict != SG_VERDICT_ALLOW)
+      for (uint32_t j = 0; j < result.subcommand_count; j++)
+        fprintf(stderr, "  subcommand %u: %s (verdict %d)\n", j,
+                result.subcommands[j].netargv, result.subcommands[j].verdict);
+    ASSERT_SG_OK(error);
+    ASSERT(!result.truncated && result.verdict == SG_VERDICT_ALLOW);
+    bool found = false;
+    for (uint32_t j = 0; j < result.subcommand_count; j++) {
+      const sg_subcommand_result_t *command = result.subcommands + j;
+      static const char echo_netargv[] = "4:echo,4:next,";
+      if (command->netargv_length != sizeof(echo_netargv) - 1 ||
+          memcmp(command->netargv, echo_netargv, sizeof(echo_netargv) - 1))
+        continue;
+      found = true;
+      ASSERT(!!(command->violation_type_flags & SG_VIOL_WRITE_SENSITIVE) ==
+             cases[i].writes);
+    }
+    ASSERT(found);
+    shell_netstring_buffer_t raw = {0}, typed = {0};
+    size_t stages;
+    ASSERT(shell_build_anomaly_netseqs_buffer(
+               cases[i].source, strlen(cases[i].source), NULL, &raw, &typed,
+               &stages) == SHELL_PROCESS_OK);
+    ASSERT(stages == result.subcommand_count);
+    shell_netstring_buffer_free(&raw);
+    shell_netstring_buffer_free(&typed);
+  }
+  /* Check the final consumer, not an earlier FD_OPEN setup: stopped cleanup
+   * must keep its exact I/O counts and sensitive-path attribution. */
+  static const struct {
+    const char *source;
+    bool read;
+  } stopped_cases[] = {
+      {"exec 4>/etc/move-out 10>/tmp/original || exit; "
+       "exec 11>&- 12>&- 13>&- 14>&-; echo next 10>&4- >&12",
+       false},
+      {"exec 4>/etc/move-out 10>/tmp/original || exit; "
+       "exec 11>&- 12>&- 13>&- 14>&-; "
+       "exec 10>&4- 14>&12-; echo next >&14",
+       false},
+      {"exec 4>/etc/move-out 10>/tmp/original || exit; "
+       "exec 11>&- 12>&- 13>&- 14>&-; "
+       "{ echo next >&14; } 10>&4- 14>&12-",
+       false},
+      {"exec 4</etc/move-out 10</tmp/original || exit; "
+       "exec 11<&- 12<&- 13<&- 14<&-; "
+       "exec 10<&4- 14<&12-; cat <&14",
+       true},
+      {"exec 3>/tmp/original 4>/etc/move-out || exit; "
+       "exec 10>&3 11>&- 12>&- 13>&-; "
+       "exec 3>&10- 11>&4 10>&-; echo next >&11",
+       false},
+      {"exec 1>/etc/move-out 3>/tmp/original 4>/tmp/original || exit; "
+       "exec 10>&- 11>&- 12>&-; "
+       "{ exec 11>&-; } 3>&1 4>&1; echo next >&3",
+       false},
+      {"exec 3</tmp/original 4</etc/move-out || exit; "
+       "exec 10<&3 11<&- 12<&- 13<&-; "
+       "exec 3<&10- 11<&4 10<&-; cat <&11",
+       true},
+      {"exec 0</etc/move-out 3</tmp/original 4</tmp/original || exit; "
+       "exec 10<&- 11<&- 12<&-; "
+       "{ exec 11<&-; } 3<&0 4<&0; cat <&3",
+       true},
+  };
+  for (size_t i = 0; i < sizeof(stopped_cases) / sizeof(stopped_cases[0]);
+       i++) {
+    sg_result_t result = {0};
+    ASSERT_SG_OK(eval_cmd(gate, stopped_cases[i].source, &result));
+    ASSERT(!result.truncated && result.verdict == SG_VERDICT_ALLOW);
+    const char *consumer = stopped_cases[i].read ? "3:cat," : "4:echo,4:next,";
+    bool found = false;
+    for (uint32_t j = 0; j < result.subcommand_count; j++) {
+      const sg_subcommand_result_t *command = result.subcommands + j;
+      if (command->netargv_length != strlen(consumer) ||
+          memcmp(command->netargv, consumer, strlen(consumer)))
+        continue;
+      found = true;
+      ASSERT(command->read_count == (stopped_cases[i].read ? 1u : 0u));
+      ASSERT(command->write_count == (stopped_cases[i].read ? 0u : 1u));
+      ASSERT(!!(command->violation_type_flags & SG_VIOL_WRITE_SENSITIVE) ==
+             !stopped_cases[i].read);
+    }
+    ASSERT(found);
+  }
+  static const struct {
+    const char *source;
+    bool writes;
+  } ifs_cases[] = {
+      {"exec {out}>/etc/move-out; exec {fd}>&1; IFS=0123456789; "
+       ": {out}>&${fd}-; echo next >&\"$out\"",
+       true},
+      {"exec {out}>/etc/move-out; exec {fd}>&1; IFS=0123456789; "
+       "{ :; } {out}>&${fd}-; echo next >&\"$out\"",
+       true},
+      {"exec {out}>/etc/move-out; exec {fd}>&1; IFS=0123456789; "
+       "exec {out}>&${fd}-; echo next",
+       false},
+  };
+  for (size_t i = 0; i < sizeof(ifs_cases) / sizeof(ifs_cases[0]); i++) {
+    sg_result_t result = {0};
+    ASSERT_SG_OK(eval_cmd(gate, ifs_cases[i].source, &result));
+    ASSERT(!result.truncated && result.verdict == SG_VERDICT_UNDETERMINED);
+    bool found = false;
+    for (uint32_t j = 0; j < result.subcommand_count; j++) {
+      const sg_subcommand_result_t *command = result.subcommands + j;
+      if (strcmp(command->netargv, "4:echo,4:next,"))
+        continue;
+      found = true;
+      ASSERT(!!(command->violation_type_flags & SG_VIOL_WRITE_SENSITIVE) ==
+             ifs_cases[i].writes);
+    }
+    ASSERT(found);
+    shell_netstring_buffer_t raw = {0}, typed = {0};
+    size_t stages;
+    ASSERT(shell_build_anomaly_netseqs_buffer(
+               ifs_cases[i].source, strlen(ifs_cases[i].source), NULL, &raw,
+               &typed, &stages) == SHELL_PROCESS_OK);
+    ASSERT(stages == result.subcommand_count + 1);
+    shell_netstring_buffer_free(&raw);
+    shell_netstring_buffer_free(&typed);
+  }
+  sg_result_t invalid = {0};
+  ASSERT(eval_cmd(gate,
+                  "exec {fd}>&1; IFS=0123456789; : {out}>&${fd}-; "
+                  "echo next",
+                  &invalid) == SG_ERR_PARSE);
+  ASSERT(invalid.verdict == SG_VERDICT_REJECT);
+  sg_result_t imported = {0};
+  ASSERT_SG_OK(eval_cmd(gate,
+                        "exec 3>&- 10>&- 11>&-; "
+                        "{ probe && exec {fd}>/tmp/move-first || "
+                        "exec {pad}>/etc/move-out {fd}>/tmp/move-second; } && "
+                        "echo \"$(exec 4>&${fd}-; printf next >&4)\"",
+                        &imported));
+  ASSERT(!imported.truncated && imported.verdict != SG_VERDICT_REJECT);
+  bool found_import = false;
+  for (uint32_t i = 0; i < imported.subcommand_count; i++) {
+    const sg_subcommand_result_t *command = imported.subcommands + i;
+    const char expected[] = "6:printf,4:next,";
+    if (command->netargv_length != sizeof(expected) - 1 ||
+        memcmp(command->netargv, expected, sizeof(expected) - 1))
+      continue;
+    found_import = true;
+    ASSERT(command->write_count == 2 &&
+           !(command->violation_type_flags & SG_VIOL_WRITE_SENSITIVE));
+  }
+  ASSERT(found_import);
+  sg_gate_free(gate);
+}
+
 TEST(fd_open_violation_contract) {
   sg_gate_t *gate = gate_with_violations();
   ASSERT(gate != NULL);
@@ -13895,11 +14295,12 @@ TEST(forward_literal_word_policy_contract) {
 }
 
 int main(void) {
+  ASSERT(atexit(cleanup_temp_files) == 0);
+  RUN(temp_fixture_cleanup);
   RUN(policy_binding_lifecycle);
   RUN(anomaly_component_borrowed_views);
   RUN(malformed_source_before_capacity);
   RUN(substitution_capacity_fails_closed);
-  atexit(cleanup_temp_files);
   printf("shellgate tests\n\n");
 
   printf("Lifecycle:\n");
@@ -14082,6 +14483,8 @@ int main(void) {
   RUN(graph_analysis_scaling);
   RUN(optional_violation_index_and_compound_completion);
   RUN(fd_open_violation_contract);
+  RUN(descriptor_move_evaluation);
+  RUN(descriptor_setup_dispatch);
   RUN(current_shell_builtin_graph_effects);
   RUN(fd_open_dynamic_filename_consumer_contract);
   RUN(group_owned_violation_context);

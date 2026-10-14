@@ -428,7 +428,7 @@ static SHELL_NONNULL(1, 5) void detect_expansion_features(
   scan.scope.arithmetic_scope = arithmetic_body;
   scan.scope.suppress_process = arithmetic_body || heredoc;
   size_t start = 0, end = 0;
-  shell_source_substitution_kind_t kind;
+  shell_source_substitution_kind_t kind = SHELL_SOURCE_SUBST_COMMAND;
   while (shell_source_next_executable_substitution(input, length, &scan, &start,
                                                    &end, &kind) ==
          SHELL_SOURCE_SCAN_FOUND) {

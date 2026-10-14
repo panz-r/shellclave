@@ -1183,6 +1183,207 @@ void run_semantic_reference_oracles() {
       invariant_failure("setup outcome timing contract mismatch");
     validate_result(&result, error, buffer.data(), buffer.size());
   }
+  static const struct {
+    const char *source;
+    bool sensitive;
+    uint32_t write_count;
+  } moves[] = {
+      {"exec 4>out 10>base || exit; exec 11>&- 12>&-; "
+       "printf payload 10>&4- >&12",
+       true, 1},
+      {"exec 4>out 10>base || exit; exec 11>&- 12>&- 13>&- 14>&-; "
+       "{ printf payload >&14; } 10>&4- 14>&12-",
+       true, 1},
+      {"exec 3>out 4>base || exit; exec 10>&- 11>&- 12>&-; "
+       ": 4>&- 10>&3-; printf payload >&3",
+       true, 1},
+      {"exec 3>out || exit; exec 10>&- 11>&-; "
+       "exec {fd}>&3 {fd}>&3; printf payload >&10",
+       true, 1},
+      {"exec 3>out || exit; exec 10>&- 11>&-; "
+       ": {fd}>&3 10>&-; printf payload >&\"$fd\"",
+       true, 1},
+      {"exec 3>out || exit; exec 10>&- 11>&-; "
+       "{ :; } {fd}>&3 10>&3-; printf payload >&10",
+       true, 1},
+      {"exec 3>out || exit; builtin command /bin/true {fd}>&3; "
+       "printf payload >&\"$fd\"",
+       true, 1},
+      {"exec 3>out || exit; exec 4>&-; "
+       "builtin command /bin/true 4>&3-; printf payload >&3",
+       false, 0},
+      {"exec 3>out || exit; exec 4>&-; "
+       "builtin \"$runner\" 4>&3-; printf payload >&3",
+       false, 0},
+      {"exec 3>out 4>base || exit; exec 10>&- 11>&-; "
+       "exec {fd}>&3 {fd}>&4; echo \"$(printf payload >&10)\"",
+       true, 1},
+      {"exec 3>base 4>out; : 3>&4- 3>&4; printf payload >&4", true, 1},
+      {"exec 3>base 4>out; { :; } 3>&4- 3>&4; printf payload >&4", true, 1},
+      {"exec 3>&- 10>&- 11>&-; { probe && exec {fd}>one || "
+       "exec {pad}>out {fd}>two; } && "
+       "{ exec 10>&${fd}-; printf payload >&10; }",
+       false, 2},
+      {"exec 3>&- 10>&- 11>&-; { probe && exec {fd}>one || "
+       "exec {pad}>out {fd}>two; } && "
+       "{ exec 4>&${fd}-; printf payload >&4; }",
+       false, 2},
+      {"exec 3>&- 10>&- 11>&-; { probe && exec {fd}>one || "
+       "exec {pad}>out {fd}>two; } && "
+       "echo \"$(exec 4>&${fd}-; printf payload >&4)\"",
+       false, 2},
+      {"exec 1>out || exit; exec 10>&-; exec 10>&10-; exec {fd}>&1; "
+       "printf payload >&10",
+       true, 1},
+      {"exec 1>out || exit; exec 10>&-; { :; } 10>&10; exec {fd}>&1; "
+       "printf payload >&10",
+       true, 1},
+      {"exec 3>out || exit; exec 10>& - 11>& - 12>& -; "
+       "{ printf payload >&11; } 3>&1",
+       false, 0},
+      {"exec {out}>out; exec {fd}>&1; IFS=0123456789; "
+       ": {out}>&${fd}-; printf payload >&\"$out\"",
+       true, 1},
+      {"exec {out}>out; exec {fd}>&1; IFS=0123456789; "
+       "{ :; } {out}>&${fd}-; printf payload >&\"$out\"",
+       true, 1},
+      {"exec {out}>out; exec {fd}>&1; IFS=0123456789; "
+       "exec {out}>&${fd}-; printf payload",
+       false, 0},
+      {"exec 3>out 4>base || exit; exec 10>&- 11>&- 12>&-; "
+       "exec {fd}>&3; : 3>&${fd}- {fd}>&4; printf payload >&10",
+       true, 1},
+      {"exec 3>out || exit; exec 10>&- 11>&- 12>&-; "
+       "exec {fd}>&3; : 3>&${fd}- {fd}>&-; printf payload >&10",
+       true, 1},
+      {"exec 3>out || exit; exec 10>&- 11>&- 12>&-; "
+       "exec {fd}>&3; : 3>&${fd}- 11>&3-; printf payload >&10",
+       true, 1},
+      {"exec 3>out 4>base || exit; exec 8>&- 10>&- 11>&- 12>&-; "
+       "exec {fd}>&3; : 3>&${fd}- {fd}>&4 5>&8; printf payload >&10",
+       true, 1},
+      {"exec 4>&-; exec 3>out || exit; { :; } 4>&3-; printf payload >&3", false,
+       0},
+      {"exec 4>&-; exec 3>out || exit; { :; } 4>&3- || printf payload >&3",
+       false, 0},
+      {"exec 3>base 20>out || exit; exec 10>&- 11>&- 21>&- 22>&-; "
+       "{ printf payload >&10; } 3>&20-",
+       true, 1},
+      {"exec 3>out 4>base || exit; exec 10>&- 11>&- 12>&-; "
+       "exec {fd}>&3; : 3>&${fd}- {fd}>&4; echo \"$(printf payload >&10)\"",
+       true, 1},
+      {"exec 3>out || exit; exec 10>&- 11>&- 12>&-; "
+       "exec {fd}>&3; : 3>&${fd}- {fd}>&-; cat < <(printf payload >&10)",
+       true, 1},
+      {"exec 3>out || exit; exec 10>&- 11>&- 12>&-; "
+       "exec {fd}>&3; exec {fd}>&- 11>&3-; printf payload >&11",
+       false, 0},
+      {"exec 10>&-; exec {fd}>&1; : 10>&- 3>&${fd}-; printf payload", false, 0},
+  };
+  outcome_config.sensitive_write_paths[0] = "out";
+  if (sg_gate_set_violation_config_borrowed(option_gate, &outcome_config) !=
+      SG_OK)
+    invariant_failure("move outcome configuration failed");
+  for (const auto &fixture : moves) {
+    size_t length = std::strlen(fixture.source);
+    auto &buffer = eval_buffer_for(g_eval_buffers.result, length);
+    sg_result_t result = {};
+    sg_error_t error = sg_gate_evaluate(option_gate, fixture.source, length,
+                                        buffer.data(), buffer.size(), &result);
+    if (error != SG_OK || result.truncated ||
+        result.verdict == SG_VERDICT_REJECT)
+      invariant_failure("move outcome evaluation failed");
+    validate_result(&result, error, buffer.data(), buffer.size());
+    bool found = false;
+    for (uint32_t c = 0; c < result.subcommand_count; c++) {
+      const auto &command = result.subcommands[c];
+      if (std::strcmp(command.netargv, "6:printf,7:payload,"))
+        continue;
+      found = true;
+      bool sensitive =
+          (command.violation_type_flags & SG_VIOL_WRITE_SENSITIVE) != 0;
+      if (sensitive != fixture.sensitive ||
+          command.write_count != fixture.write_count)
+        invariant_failure("move outcome consumer routes mismatch");
+    }
+    if (!found)
+      invariant_failure("move outcome consumer missing");
+  }
+  static const struct {
+    const char *source, *netargv;
+    bool sensitive;
+    uint32_t writes;
+  } dispatch[] = {
+      {"exec 3>out || exit; exec 10>&- 11>&- 12>&-; "
+       "\"$cmd\" payload 1>&3 {fd}>&3 1>&10",
+       "4:$cmd,7:payload,", true, 1},
+      {"exec 3>out || exit; exec 10>&- 11>&- 12>&-; "
+       "command \"$cmd\" payload 1>&3 {fd}>&3 1>&10",
+       "7:command,4:$cmd,7:payload,", true, 1},
+      {"exec 3>out || exit; exec 10>&- 11>&- 12>&-; "
+       "builtin \"$cmd\" payload 1>&3 {fd}>&3 1>&10",
+       "7:builtin,4:$cmd,7:payload,", false, 0},
+      {"exec 3>&1 || exit; exec 10>&- 11>&- 12>&-; "
+       "! 0<&0 1>&3 2>&10 && printf payload >out",
+       "6:printf,7:payload,", true, 1},
+      {"exec 3>&1 || exit; exec 10>&- 11>&- 12>&-; "
+       "0<&0 1>&3 2>&10 && printf payload >out",
+       "6:printf,7:payload,", false, 0},
+      {"exec 1>original 4>out || exit; exec 10>&- 11>&- 12>&-; "
+       ": 1>&4- 12>&11- 1>&11; printf payload",
+       "6:printf,7:payload,", true, 1},
+      {"exec 1>original 4>out || exit; exec 10>&- 11>&- 12>&-; "
+       "{ :; } 1>&4- 12>&11- 1>&11; printf payload",
+       "6:printf,7:payload,", true, 1},
+      {"exec 1>original 4>out || exit; exec 10>&- 11>&- 12>&-; "
+       "\"$cmd\" 1>&4- 12>&11- 1>&11; printf payload",
+       "6:printf,7:payload,", true, 2},
+      {"exec 1>original || exit; exec 9>&- 10>&- 11>&- 12>&-; "
+       "{ echo \"$(exec 10>out; printf payload >&10)\"; } 1>temporary",
+       "6:printf,7:payload,", false, 1},
+      {"exec 1>out || exit; exec 9>&- 10>&- 11>&- 12>&-; "
+       "{ cat < <(exec 10>original; printf payload >&10); } 1>temporary",
+       "6:printf,7:payload,", true, 1},
+      {"exec 1>original || exit; exec 9>&- 10>&- 11>&- 12>&-; "
+       "{ : > >(exec 10>&-; exec 10>out; printf payload >&10); } 1>temporary",
+       "6:printf,7:payload,", true, 1},
+  };
+  for (const auto &fixture : dispatch) {
+    size_t length = std::strlen(fixture.source);
+    auto &buffer = eval_buffer_for(g_eval_buffers.result, length);
+    sg_result_t result = {};
+    sg_error_t error = sg_gate_evaluate(option_gate, fixture.source, length,
+                                        buffer.data(), buffer.size(), &result);
+    if (error != SG_OK || result.truncated)
+      invariant_failure("dispatch evaluation failed");
+    validate_result(&result, error, buffer.data(), buffer.size());
+    bool found = false;
+    for (uint32_t c = 0; c < result.subcommand_count; c++) {
+      const auto &command = result.subcommands[c];
+      if (std::strcmp(command.netargv, fixture.netargv))
+        continue;
+      found = true;
+      if (!!(command.violation_type_flags & SG_VIOL_WRITE_SENSITIVE) !=
+              fixture.sensitive ||
+          command.write_count != fixture.writes)
+        invariant_failure("dispatch consumer routes mismatch");
+    }
+    if (!found)
+      invariant_failure("dispatch consumer missing");
+  }
+  static const char untracked_ifs_move[] =
+      "exec {fd}>&1; IFS=0123456789; : {out}>&${fd}-; printf payload";
+  auto &untracked_buffer =
+      eval_buffer_for(g_eval_buffers.result, sizeof(untracked_ifs_move) - 1);
+  sg_result_t untracked_result = {};
+  sg_error_t untracked_error = sg_gate_evaluate(
+      option_gate, untracked_ifs_move, sizeof(untracked_ifs_move) - 1,
+      untracked_buffer.data(), untracked_buffer.size(), &untracked_result);
+  if (untracked_error != SG_ERR_PARSE ||
+      untracked_result.verdict != SG_VERDICT_REJECT)
+    invariant_failure("untracked IFS move outcome mismatch");
+  validate_result(&untracked_result, untracked_error, untracked_buffer.data(),
+                  untracked_buffer.size());
   for (const char *path : {"base", "one", "two"}) {
     for (const auto &fixture : shellsplit_test_named_cleanup) {
       outcome_config.sensitive_write_paths[0] = path;
@@ -1880,8 +2081,6 @@ void run_semantic_reference_oracles() {
       "exec {fd}<in; exec {fd}<&-; printf x \"$(cat <&$fd)\"",
       "exec {fd}>&-",
       "exec {fd}<&-",
-      "printf x 2>&combined",
-      "printf x {fd}>&combined",
       "printf x >&$destination",
       "printf x >&~",
       "printf x >&*",

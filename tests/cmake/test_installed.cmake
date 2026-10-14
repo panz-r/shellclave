@@ -1,3 +1,5 @@
+cmake_minimum_required(VERSION 3.20)
+
 set(staging "${SHELLCLAVE_BINARY_DIR}/consumer-install-staging")
 set(prefix "${SHELLCLAVE_BINARY_DIR}/consumer install relocated")
 set(build "${SHELLCLAVE_BINARY_DIR}/consumer installed build")

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(Shellclave VERSION 0.13.0 LANGUAGES C CXX)
+project(Shellclave VERSION 0.14.0 LANGUAGES C CXX)
 
 if(PROJECT_IS_TOP_LEVEL)
   set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -269,7 +269,22 @@ if(BUILD_TESTING)
     endforeach()
   endif()
   find_program(SHELLCLAVE_BASH_EXECUTABLE NAMES bash)
+  include(cmake/ReferenceBash.cmake)
+  shellclave_require_reference_bash("${SHELLCLAVE_BASH_EXECUTABLE}")
+  add_test(NAME shellclave_reference_bash_contract
+    COMMAND ${CMAKE_COMMAND}
+      -DSHELLCLAVE_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+      -DSHELLCLAVE_BINARY_DIR=${CMAKE_CURRENT_BINARY_DIR}
+      -DSHELLCLAVE_BASH_EXECUTABLE=${SHELLCLAVE_BASH_EXECUTABLE}
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/test_reference_bash.cmake)
+  set_tests_properties(shellclave_reference_bash_contract PROPERTIES LABELS cmake)
   if(SHELLCLAVE_BASH_EXECUTABLE)
+    add_test(NAME shellsplit_bash_descriptor_moves
+      COMMAND ${CMAKE_COMMAND}
+        -DSHELLCLAVE_BASH=${SHELLCLAVE_BASH_EXECUTABLE}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/test_bash_descriptor_moves.cmake)
+    set_tests_properties(shellsplit_bash_descriptor_moves PROPERTIES
+      LABELS shellsplit TIMEOUT 15)
     add_test(NAME shellsplit_bash_ansi_nul_semantics
       COMMAND ${CMAKE_COMMAND}
         -DSHELLCLAVE_BASH=${SHELLCLAVE_BASH_EXECUTABLE}
@@ -312,6 +327,9 @@ if(BUILD_TESTING)
         "BASH_ENV=${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/bash_env_enable_lastpipe.sh;BASHOPTS=lastpipe;SHELLOPTS=braceexpand:hashall:interactive-comments:monitor;POSIXLY_CORRECT=1")
   endif()
   shellclave_add_test(shellsplit_tokenizer_test shellsplit/tests/tokenizer_test.c shellsplit_test)
+  shellclave_add_test(shellsplit_depgraph_compare_test
+    shellsplit/tests/depgraph_compare_test.c shellsplit)
+  set_tests_properties(shellsplit_depgraph_compare_test PROPERTIES LABELS shellsplit)
   shellclave_add_test(shellsplit_fast_parser_test shellsplit/tests/fast_parser_test.c shellsplit_test)
   # Exercise the same public parser contract against the shipping library. The
   # allocation-failure variant above links the instrumented test library;
@@ -335,6 +353,12 @@ if(BUILD_TESTING)
     PROPERTIES LABELS shellsplit)
   shellclave_add_test(shellsplit_entropy_test shellsplit/tests/entropy_test.c shellsplit_test)
   shellclave_add_test(shellsplit_depgraph_test shellsplit/tests/test_depgraph.c shellsplit_test)
+  shellclave_add_test(shellsplit_descriptor_move_test
+    shellsplit/tests/descriptor_move_test.c shellsplit_test)
+  target_compile_definitions(shellsplit_descriptor_move_test PRIVATE
+    SHELLSPLIT_TEST_ALLOCATOR SHELLSPLIT_TEST_SOURCE_SCANS)
+  shellclave_add_test(shellsplit_descriptor_move_production_test
+    shellsplit/tests/descriptor_move_test.c shellsplit)
   target_compile_definitions(shellsplit_depgraph_test PRIVATE
     SHELLSPLIT_TEST_SOURCE_SCANS)
   # The dependency graph has no allocator-test dependency, so run its full
@@ -576,6 +600,7 @@ if(BUILD_TESTING)
           -DSHELLCLAVE_C_COMPILER=${CMAKE_C_COMPILER}
           -DSHELLCLAVE_CXX_COMPILER=${CMAKE_CXX_COMPILER}
           -DSHELLCLAVE_CTEST_COMMAND=${CMAKE_CTEST_COMMAND}
+          -DSHELLCLAVE_BASH_EXECUTABLE=${SHELLCLAVE_BASH_EXECUTABLE}
           -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/test_shellgate_component.cmake)
       set_tests_properties(shellgate_component_configure PROPERTIES
         LABELS cmake)
@@ -845,6 +870,7 @@ if(PROJECT_IS_TOP_LEVEL)
         "-DSHELLCLAVE_ANALYZE_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}"
         "-DSHELLCLAVE_ANALYZE_BINARY=${CMAKE_CURRENT_BINARY_DIR}/clang-analyze"
         "-DSHELLCLAVE_ANALYZE_GENERATOR=${CMAKE_GENERATOR}"
+        "-DSHELLCLAVE_BASH_EXECUTABLE=${SHELLCLAVE_BASH_EXECUTABLE}"
         -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/RunClangAnalyze.cmake
       VERBATIM
       USES_TERMINAL

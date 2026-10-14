@@ -113,6 +113,9 @@ shell_process_classify_static_fd_target(const char *text, size_t length,
   if (length == 0)
     return SHELL_PROCESS_FD_TARGET_INVALID;
 
+  size_t prefix_length = length;
+  bool move = shell_source_fd_move_prefix(text, length, &prefix_length);
+
   /* Bash decides `>&word` after quote decoding.  Stream the complete word:
    * zero-padded descriptor spellings need not have a bounded source length,
    * while an all-digit spelling that exceeds INT_MAX is a bad descriptor, not
@@ -122,18 +125,23 @@ shell_process_classify_static_fd_target(const char *text, size_t length,
       .exact_dash = true,
   };
   size_t decoded_length = 0;
-  if (shell_visit_decoded_word(text, length, static_fd_target_byte, &target,
+  if (shell_visit_decoded_word(text, move ? prefix_length : length,
+                               static_fd_target_byte, &target,
                                &decoded_length) != SHELL_PROCESS_OK ||
-      target.has_nul || target.length == 0 || target.length != decoded_length)
+      target.has_nul || target.length != decoded_length)
     return SHELL_PROCESS_FD_TARGET_INVALID;
+  if (target.length == 0)
+    return move ? SHELL_PROCESS_FD_TARGET_MOVE_INVALID
+                : SHELL_PROCESS_FD_TARGET_PATH;
   if (target.exact_dash)
     return SHELL_PROCESS_FD_TARGET_CLOSE;
   if (!target.all_digits)
-    return SHELL_PROCESS_FD_TARGET_PATH;
+    return move ? SHELL_PROCESS_FD_TARGET_MOVE_INVALID
+                : SHELL_PROCESS_FD_TARGET_PATH;
   if (target.overflow)
     return SHELL_PROCESS_FD_TARGET_INVALID;
   *fd = target.value;
-  return SHELL_PROCESS_FD_TARGET_FD;
+  return move ? SHELL_PROCESS_FD_TARGET_MOVE : SHELL_PROCESS_FD_TARGET_FD;
 }
 
 typedef struct {
@@ -410,6 +418,9 @@ shell_process_classify_legacy_output_target(const char *text, size_t length) {
   if (shell_source_parse_named_fd_parameter(text, 0, length, &name_start,
                                             &name_end))
     return SHELL_PROCESS_LEGACY_REDIRECT_DUPLICATION;
+  size_t prefix_length;
+  if (shell_source_fd_move_prefix(text, length, &prefix_length))
+    return SHELL_PROCESS_LEGACY_REDIRECT_DUPLICATION;
 
   if (!shell_source_argument_has_dynamic_syntax(text, length)) {
     uint32_t ignored = SHELL_PROCESS_FD_NONE;
@@ -418,6 +429,7 @@ shell_process_classify_legacy_output_target(const char *text, size_t length) {
       return SHELL_PROCESS_LEGACY_REDIRECT_PATH;
     case SHELL_PROCESS_FD_TARGET_FD:
     case SHELL_PROCESS_FD_TARGET_CLOSE:
+    case SHELL_PROCESS_FD_TARGET_MOVE:
       return SHELL_PROCESS_LEGACY_REDIRECT_DUPLICATION;
     case SHELL_PROCESS_FD_TARGET_INVALID:
     default:
@@ -1857,6 +1869,10 @@ scan_group_redirects(const char *input, uint32_t start, uint32_t end,
         return SHELL_PROCESS_EPARSE;
       bool close_target =
           input[target_start] == '-' && target_start + 1 == operand_end;
+      size_t move_prefix = 0;
+      bool move_target = shell_source_fd_move_prefix(
+          input + target_start, operand_end - target_start, &move_prefix);
+      bool failed_target = false;
       if (!close_target) {
         uint32_t target_after = 0;
         uint32_t target_fd = SHELL_PROCESS_FD_NONE;
@@ -1866,7 +1882,10 @@ scan_group_redirects(const char *input, uint32_t start, uint32_t end,
             target_after != operand_end) {
           uint32_t target_name_start = 0;
           uint32_t target_name_end = 0;
-          if (parse_group_fd_parameter(input, target_start, operand_end,
+          if (parse_group_fd_parameter(input, target_start,
+                                       move_target ? target_start +
+                                                         (uint32_t)move_prefix
+                                                   : operand_end,
                                        &target_name_start, &target_name_end)) {
             op.target_name_start = target_name_start;
             op.target_name_end = target_name_end;
@@ -1877,8 +1896,14 @@ scan_group_redirects(const char *input, uint32_t start, uint32_t end,
                     &target_fd);
             if (target == SHELL_PROCESS_FD_TARGET_CLOSE)
               close_target = true;
-            else if (target == SHELL_PROCESS_FD_TARGET_FD)
+            else if (target == SHELL_PROCESS_FD_TARGET_FD ||
+                     target == SHELL_PROCESS_FD_TARGET_MOVE)
               op.target_fd = target_fd;
+            else if ((target == SHELL_PROCESS_FD_TARGET_PATH ||
+                      target == SHELL_PROCESS_FD_TARGET_MOVE_INVALID) &&
+                     !shell_source_argument_has_dynamic_syntax(
+                         input + target_start, operand_end - target_start))
+              failed_target = true;
             else
               return SHELL_PROCESS_EPARSE;
           }
@@ -1888,7 +1913,10 @@ scan_group_redirects(const char *input, uint32_t start, uint32_t end,
           op.target_fd = target_fd;
         }
       }
-      op.kind = close_target ? SHELL_GROUP_IO_CLOSE_FD : SHELL_GROUP_IO_DUP_FD;
+      op.kind = failed_target  ? SHELL_GROUP_IO_FAILED_REDIRECT
+                : close_target ? SHELL_GROUP_IO_CLOSE_FD
+                : move_target  ? SHELL_GROUP_IO_MOVE_FD
+                               : SHELL_GROUP_IO_DUP_FD;
     }
     shell_process_status_t status =
         append_group_io_op(result, &op, max_group_io_ops);

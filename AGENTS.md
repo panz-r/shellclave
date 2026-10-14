@@ -1,5 +1,14 @@
 # Repository engineering rules
 
+## One reference shell
+
+Model the single recent Bash version pinned in `scripts/reference-bash.sha256`.
+CI and pre-push verification use the same reference executable. Upgrade the pin
+deliberately with conformance tests and all required model adaptations; do not
+add version-dialect switches or silently skip reference tests on older shells.
+Runtime callers supply the documented executor. Version checks belong to the
+test/configuration boundary, not library release paths.
+
 ## Component-oriented interfaces
 
 Applications use Shellsplit, Shelltype, and the anomaly API directly for the

@@ -207,8 +207,8 @@ bool shell_tokenizer_arithmetic_has_array_semantics(const char *input,
   shell_source_substitution_scan_t scan = {0};
   scan.scope.arithmetic_scope = true;
   scan.scope.suppress_process = true;
-  size_t start, after;
-  shell_source_substitution_kind_t kind;
+  size_t start = 0, after = 0;
+  shell_source_substitution_kind_t kind = SHELL_SOURCE_SUBST_COMMAND;
   while (shell_source_next_executable_substitution(input, length, &scan, &start,
                                                    &after, &kind) ==
          SHELL_SOURCE_SCAN_FOUND) {

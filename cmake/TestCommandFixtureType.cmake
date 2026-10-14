@@ -1,3 +1,5 @@
+cmake_minimum_required(VERSION 3.20)
+
 include("${CMAKE_CURRENT_LIST_DIR}/CommandFixtureValidation.cmake")
 
 # This script is expected to fail. CTest marks it WILL_FAIL so a malformed

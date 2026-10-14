@@ -1,3 +1,5 @@
+cmake_minimum_required(VERSION 3.20)
+
 set(build "${SHELLCLAVE_BINARY_DIR}/consumer-embedded-build")
 file(REMOVE_RECURSE "${build}")
 execute_process(COMMAND "${CMAKE_COMMAND}" -S "${SHELLCLAVE_SOURCE_DIR}/tests/consumer" -B "${build}"

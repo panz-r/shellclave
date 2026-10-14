@@ -1,3 +1,5 @@
+cmake_minimum_required(VERSION 3.20)
+
 if(NOT DEFINED SHELLCLAVE_UBSAN_PROBE)
   message(FATAL_ERROR "Missing UBSan probe executable")
 endif()

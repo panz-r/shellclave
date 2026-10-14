@@ -154,9 +154,9 @@ typedef enum {
    * process-substitution endpoint until a later `$name` use materializes the
    * actual I/O edge. */
   SHELL_EDGE_FD_OPEN = 13,
-  /* An explicit `>&-` or `<&-` close, including Bash `{name}` descriptors
-   * and persistent numeric `exec` descriptors. The edge records that
-   * source-order setup transition without inventing a byte route. */
+  /* An explicit `>&-` / `<&-` close or a successful move's source close,
+   * including Bash `{name}` and persistent numeric `exec` descriptors. The
+   * edge records that source-order setup transition without a byte route. */
   SHELL_EDGE_FD_CLOSE = 14,
   /* TIME node to the command/group endpoint that roots the measured
    * pipeline. This is structural, not a byte-flow edge. */
@@ -595,19 +595,63 @@ typedef struct {
  * guessing a numeric descriptor. Double-quoted `$name` / `${name}` operands
  * bypass splitting and retain their ordinary binding contract. IFS changes
  * follow the same outcome and scope lifetime as descriptor bindings.
- * Failed setup restores numeric redirects and closes to their entry state,
- * including those on descriptor-only exec. Completed named allocations can
- * survive a later setup failure. Descriptor existence is tracked separately
- * from read/write capability: duplicating a live read-only FD succeeds even
- * though subsequent writes, including timing reports, are unavailable.
- * CWD tracking follows execution outcomes, including commands collapsed
- * by cd_as_cmd=false: unreachable transitions leave it unchanged. A conditional
- * brace body tracks its own executing-path directory; its continuation keeps
- * a known CWD only when paths reaching that continuation agree. Terminated
- * paths do not contribute; input-unit abort paths retain their directory when
- * recovery reaches a later complete input unit. A supported static absolute
- * `cd` can restore a known directory after an ambiguous or dynamic transition.
- * No filesystem success is inferred beyond the existing lexical cd model.
+ * Bash descriptor moves (`n>&m-` / `n<&m-`) copy the binding as a whole and
+ * close m only after successful duplication. Self-moves are no-ops, including
+ * on a closed numeric descriptor. A trailing source dash outside a completed
+ * quoted fragment selects move syntax (`3-`, `"3"-`, `3\\-`); a quoted
+ * whole `"3-"` is instead an ordinary word, which is a legacy pathname for
+ * bare `>&word` and a setup failure with an explicit destination descriptor.
+ * Exact allocated-descriptor references such as `${fd}-` and `"$fd"-` are
+ * supported; general runtime descriptor evaluation remains unsupported.
+ * If known IFS splitting removes every digit from an unquoted reference,
+ * its literal suffix yields `-` and closes the destination instead. Partial
+ * or unresolved decimal splitting remains unsupported; quoted references
+ * bypass splitting.
+ * Numeric moves save their source close for restoration only if the
+ * destination was already open. A newly allocated named destination also
+ * saves it. Otherwise the source close survives an ordinary command or a
+ * compound, and even a later redirect failure, unless an earlier temporary
+ * redirect had already saved that source. Saved source closes are restored
+ * even when a later redirect fails by copying that locally closed source.
+ * Successful descriptor-only exec
+ * keeps both effects. Named variables keep their value; their physical slot
+ * is closed and may be reused. Setup uses existing FD_OPEN duplication and
+ * FD_CLOSE edges, while byte-flow edges use the resulting effective routes.
+ * Temporary undo runs in reverse registration order, restoring from each
+ * live physical save and disposing it after successful restoration. Later
+ * allocations, closes, or moves can reuse or overwrite those slots.
+ * Descriptor-only exec discards ordinary undo but restores overwritten
+ * shell-owned scratch descriptors. A failed restoration stops that undo list:
+ * its target remains unchanged, and older saves remain live. This does not
+ * change the command body's status or prevent independent enclosing scopes from
+ * performing their own cleanup. Conditional named bindings retain their
+ * associated physical/private slot and resource together; byte-flow
+ * alternatives are united only after resolving each association in its own
+ * execution version. A later redirect or redirect-operand substitution may
+ * use a save created earlier in that setup; ordinary argument substitutions
+ * run before setup and cannot see it. Direct external-command setup creates
+ * no undo saves, but can use saves inherited from an active enclosing group.
+ * Runtime dispatch retains separate builtin and external setup versions,
+ * including each version's scratch allocations and setup failures. Argv-less
+ * fd 0/named-FD setup likewise creates no undo saves in its child. Returning
+ * outcomes and timing reports preserve these versions through publication;
+ * ordinary argv expansions still precede both setup variants.
+ * Failed setup uses ordinary numeric undo in current-shell setup, including on
+ * descriptor-only exec. It reads the live saves from that reached prefix, so
+ * a closed save can stop restoration and leave an earlier temporary route
+ * installed. Timing reports exclude successful cleanup when setup never
+ * reached the body. Completed named allocations can survive a later setup
+ * failure. Descriptor existence is tracked separately from read/write
+ * capability: duplicating a live read-only FD succeeds even though subsequent
+ * writes, including timing reports, are unavailable. CWD tracking follows
+ * execution outcomes, including commands collapsed by cd_as_cmd=false:
+ * unreachable transitions leave it unchanged. A conditional brace body tracks
+ * its own executing-path directory; its continuation keeps a known CWD only
+ * when paths reaching that continuation agree. Terminated paths do not
+ * contribute; input-unit abort paths retain their directory when recovery
+ * reaches a later complete input unit. A supported static absolute `cd` can
+ * restore a known directory after an ambiguous or dynamic transition. No
+ * filesystem success is inferred beyond the existing lexical cd model.
  * Subshells, background stages, pipelines and substitutions never export CWD
  * changes. Skipped descriptor-duplication operands retain nested substitution
  * syntax without inventing a FILE resource or an effective
@@ -700,12 +744,23 @@ typedef struct {
  * operand `$name` or `${name}` may reuse that descriptor. Their names use the
  * same escaped-physical-line-ending normalization as source parsing; general
  * parameter expansion is intentionally not interpreted as a descriptor
- * reference. An unknown, closed, reassigned, or
- * syntactically composite named reference is an error rather than a guessed
- * route. With Bash's default `varredir_close` behavior, an ordinary simple
- * command with a command word and a non-isolated brace-group redirect tail
- * retain an open named binding in the current shell; redirect-only and
- * assignment-only commands do not. Subshell groups and groups executing as a
+ * reference. An unknown, closed, reassigned, or syntactically composite named
+ * reference is an error rather than a guessed route, except that a proven
+ * physical self-duplication/move is a no-op even on a closed slot. Its variable
+ * binding must still be established and unchanged. With Bash's default
+ * `varredir_close` behavior, a current-shell
+ * builtin and a non-isolated brace-group redirect tail retain
+ * an open named binding in that shell. External-command redirects run in a
+ * child: neither named allocations nor unsaved move-source closes change its
+ * parent. Static dispatch uses the default Bash builtin set and the effective
+ * command/builtin wrapper; unresolved dispatch retains both compatible
+ * execution scopes. A reached builtin wrapper fixes current-shell redirect
+ * setup even when an inner command wrapper selects an external executable.
+ * Rebinding a descriptor variable does not close its earlier allocations;
+ * their physical slots remain available to numeric uses. Temporary redirects
+ * restore the state at their first modification, including allocations made
+ * earlier in the same setup list. Redirect-only and assignment-only commands do
+ * not retain named allocations. Subshell groups and groups executing as a
  * pipeline member or background job retain bindings only in their private
  * execution scope. A local pipeline/background command never publishes its
  * mutations into an enclosing private group. A conditional unset or
@@ -727,7 +782,8 @@ typedef struct {
  * `alias`, `unalias`, `fc`, `let`, `enable`, `compgen`, `complete`, `compopt`,
  * and `bind`), are rejected as unsupported,
  * so this lifetime and pipeline-scope invariant is never silently changed. The
- * executor must start Bash in the documented clean noninteractive state. Start
+ * executor is the pinned Bash 5.3.20 reference, not an arbitrary Bash version,
+ * and must start in the documented clean noninteractive state. Start
  * it with `POSIXLY_CORRECT` absent (not merely empty), clear `BASH_COMPAT` and
  * `BASH_XTRACEFD`, then make all three variables readonly before evaluating
  * submitted source. `bash -p -c ...` is the
@@ -766,7 +822,10 @@ typedef struct {
  * expansion effects, including parameter/arithmetic failures without a nested
  * command substitution; it does not suppress earlier argv/RHS expansions.
  * Conditional read/write route alternatives retain
- * their original resources across these recursive snapshots. Byte-flow uses
+ * their original resources across these recursive snapshots, including the
+ * path-local close-on-exec property of active saved descriptors. Child-shell
+ * exec overwrite/close operations use that inherited lifetime, not merely
+ * the saved bytes' provenance. Byte-flow uses
  * are emitted only from the final effective descriptor state, not from
  * aliases subsequently replaced or closed; earlier input redirects can still
  * feed a substitution evaluated in a later operand. Recursive joins reserve

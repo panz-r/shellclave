@@ -60,11 +60,17 @@ shell_process_cstring_allocation_size(size_t content_length,
 /* Classify a fully static duplication operand after shell quote decoding.
  * This private helper is shared by the processed-command and dependency-graph
  * layers so `>&\"7\"`, `>&$'7'`, and `>&\"-\"` retain Bash descriptor
- * semantics instead of being confused with legacy combined-output paths. */
+ * semantics instead of being confused with legacy combined-output paths.
+ * A final source move suffix is interpreted before prefix quote decoding;
+ * MOVE_INVALID means that suffix selected move grammar with an empty or
+ * nonnumeric static source. It is a known setup failure, never a pathname.
+ * INVALID retains decoding, embedded-NUL, and descriptor-overflow rejection. */
 typedef enum {
   SHELL_PROCESS_FD_TARGET_PATH,
   SHELL_PROCESS_FD_TARGET_FD,
   SHELL_PROCESS_FD_TARGET_CLOSE,
+  SHELL_PROCESS_FD_TARGET_MOVE,
+  SHELL_PROCESS_FD_TARGET_MOVE_INVALID,
   SHELL_PROCESS_FD_TARGET_INVALID,
 } shell_process_fd_target_t;
 

@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "../tests/depgraph_compare.h"
 #include "../tests/malformed_source_cases.h"
 #include "../tests/word_expansion_cases.h"
 #include "depgraph_invariants.h"
@@ -2209,6 +2210,7 @@ static int test_fixed_oracles(void) {
   }
 
   static const char *const static_legacy_redirect_cases[] = {
+      "printf x >&\"\"",
       "printf x >&literal{path}",
       "printf x >&literal$destination",
       "printf x >&literal${destination}",
@@ -2243,7 +2245,6 @@ static int test_fixed_oracles(void) {
   static const char *const invalid_static_legacy_redirects[] = {
       "printf x >&2147483648",
       "printf x >&00000000000000000000000000000000002147483648",
-      "printf x >&\"\"",
       "printf x >&$'a\\0b'",
   };
   for (const char *input : invalid_static_legacy_redirects) {
@@ -2947,7 +2948,8 @@ static int test_fixed_oracles(void) {
     if (shell_parse_fast(source, strlen(source), &strict, &fast) != SHELL_OK ||
         !fuzz_dep_limits(nullptr, &limits))
       return fixed_oracle_failure(__LINE__);
-    const shell_parse_result_t unchanged = fast;
+    shell_parse_result_t unchanged;
+    memcpy(&unchanged, &fast, sizeof(unchanged));
     if (shell_dep_graph_parse_with_fast(source, strlen(source), ".", &limits,
                                         &fast, &graph) != SHELL_DEP_OK ||
         !shellsplit_test_depgraph_invariants(source, strlen(source),
@@ -3569,9 +3571,8 @@ static int test_fixed_oracles(void) {
       return fixed_oracle_failure(__LINE__);
   }
 
-  /* The lexer preserves descriptor-looking prefix words; the structured
-   * group and graph APIs reject them because Bash gives legacy `>&word`
-   * combined-output syntax only to stdout. */
+  /* Static nonnumeric duplicate operands fail setup; they never become FILE
+   * resources or execute the group body. */
   static const char *const invalid_group_legacy_redirects[] = {
       "{ printf x; } 2>&combined",
       "{ printf x; } {fd}>&combined",
@@ -3584,13 +3585,13 @@ static int test_fixed_oracles(void) {
     };
     shell_dep_graph_t graph = {};
     if (shell_process_commands(input, strlen(input), NULL, &processed) !=
-            SHELL_PROCESS_EPARSE ||
-        processed.commands != NULL || processed.command_count != 0 ||
-        processed.groups != NULL || processed.group_count != 0 ||
-        processed.group_io_ops != NULL || processed.group_io_op_count != 0 ||
+            SHELL_PROCESS_OK ||
+        processed.group_io_op_count != 1 ||
+        processed.group_io_ops[0].kind != SHELL_GROUP_IO_FAILED_REDIRECT ||
         shell_dep_graph_parse(input, strlen(input), NULL, NULL, &graph) !=
-            SHELL_DEP_EPARSE)
+            SHELL_DEP_OK)
       return fixed_oracle_failure(__LINE__);
+    shell_processed_commands_free(&processed);
   }
 
   /* Shellsplit preserves an exact named-FD parameter as a deferred
@@ -3773,8 +3774,8 @@ static int test_fixed_oracles(void) {
         processed_status != SHELL_PROCESS_OK ||
         processed.command_count != item.command_count ||
         processed.group_count != fast.group_count ||
-        memcmp(processed.groups, fast.groups,
-               fast.group_count * sizeof(*fast.groups)) != 0) {
+        !shellsplit_test_groups_equal(processed.groups, fast.groups,
+                                      fast.group_count)) {
       if (g_verbose)
         fprintf(stderr,
                 "brace oracle mismatch: %s (fast=%d count=%u groups=%u "
@@ -4507,6 +4508,368 @@ static int test_resolved_depgraph(const char *input, size_t length,
   return 0;
 }
 
+/* Dispatch uses the low bits of data[0]. Do not reuse those constrained bits
+ * as the fixture selector: multi-byte inputs reach the full selector domain,
+ * and the quotient makes every form reachable even with one input byte. */
+static uint8_t descriptor_move_selector(const uint8_t *data, size_t size) {
+  return size > 1 ? data[1] : data[0] / 8;
+}
+
+static constexpr unsigned descriptor_move_form_count = 77;
+static constexpr unsigned descriptor_move_single_byte_selector_count = 32;
+
+static int test_generated_descriptor_move(uint8_t selector) {
+  unsigned source = 3u + selector % 5u, destination = 8u + selector % 5u;
+  char input[512];
+  unsigned form = selector % descriptor_move_form_count;
+  bool expected_route =
+      form == 1 || form == 4 || form == 5 || form == 7 ||
+      (form >= 8 && form != 12 && form < 26) || form == 28 || form == 29 ||
+      form == 31 || form == 32 || form == 34 || form == 35 ||
+      (form >= 37 && form <= 41) || form == 43 || form == 45 || form == 46 ||
+      form == 47 || form == 48 || form == 51 || form == 52 ||
+      (form >= 54 && form < 64 && form != 61 && form != 63) || form == 64 ||
+      form == 65 || form == 66 || form == 69 || form >= 70;
+  const char *action = form == 2 ? "exec" : ":";
+  if (form >= 73) {
+    const char *body = "exec 10>/tmp/move-pad; printf next >&10";
+    char wrapper[192];
+    if (form == 73)
+      snprintf(wrapper, sizeof(wrapper), "echo \"$(%s)\"", body);
+    else if (form == 74)
+      snprintf(wrapper, sizeof(wrapper), "echo \"$(echo \"$(%s)\")\"", body);
+    else if (form == 75)
+      snprintf(wrapper, sizeof(wrapper), "cat < <(%s)", body);
+    else
+      snprintf(wrapper, sizeof(wrapper), ": > >(%s)", body);
+    snprintf(input, sizeof(input),
+             "exec 1>/tmp/move-fuzz || exit; "
+             "exec 9>&- 10>&- 11>&- 12>&-; { %s; } 1>/tmp/move-first",
+             wrapper);
+  } else if (form >= 70)
+    snprintf(input, sizeof(input),
+             "exec 1>/tmp/move-pad 4>/tmp/move-fuzz || exit; "
+             "exec 10>&- 11>&- 12>&-; %s 1>&4- 12>&11- 1>&11; echo next",
+             form == 70   ? ":"
+             : form == 71 ? "{ :; }"
+                          : "\"$cmd\"");
+  else if (form == 64 || form == 65 || form == 68)
+    snprintf(input, sizeof(input),
+             "exec 3>/tmp/move-fuzz || exit; exec 10>&- 11>&- 12>&-; "
+             "%s\"$cmd\" next 1>&3 {fd}>&3 1>&10",
+             form == 65   ? "command "
+             : form == 68 ? "builtin "
+                          : "");
+  else if (form == 66 || form == 67 || form == 69)
+    snprintf(input, sizeof(input),
+             "exec 3>&1 || exit; exec 10>&- 11>&- 12>&-; "
+             "%s %s 1>&3 2>&10 && echo next >/tmp/move-fuzz",
+             form == 67 ? "" : "!", form == 69 ? "0<<<literal" : "0<&0");
+  else if (form == 63)
+    snprintf(input, sizeof(input),
+             "exec 4>/tmp/move-fuzz 10>/tmp/move-pad || exit; "
+             "exec 11>&- 12>&-; : \"$(echo next >&12)\" 10>&4-");
+  else if (form == 62)
+    snprintf(input, sizeof(input),
+             "exec 4>/tmp/move-fuzz 10>/tmp/move-pad || exit; "
+             "exec 11>&- 12>&-; "
+             ": 10>&4- >\"$(echo next >&12; printf /dev/null)\"");
+  else if (form == 61)
+    snprintf(input, sizeof(input),
+             "exec 4>/tmp/move-fuzz 10>/tmp/move-pad || exit; "
+             "exec 11>&- 12>&-; /bin/echo next 10>&4- >&12");
+  else if (form == 60)
+    snprintf(input, sizeof(input),
+             "exec 4</tmp/move-fuzz 10</tmp/move-pad || exit; "
+             "exec 11<&- 12<&- 13<&- 14<&-; "
+             "exec 10<&4- 14<&12-; cat <&14");
+  else if (form == 59)
+    snprintf(input, sizeof(input),
+             "exec 4>/tmp/move-fuzz 10>/tmp/move-pad || exit; "
+             "exec 11>&- 12>&-; echo next 10>&4- >&12");
+  else if (form == 58)
+    snprintf(input, sizeof(input),
+             "exec 3</tmp/move-pad 4</tmp/move-fuzz || exit; "
+             "exec 10<&3 11<&- 12<&- 13<&-; "
+             "exec 3<&10- 11<&4 10<&-; cat <&11");
+  else if (form == 57)
+    snprintf(input, sizeof(input),
+             "exec 1>/tmp/move-fuzz 3>/tmp/move-pad 4>/tmp/move-pad || exit; "
+             "exec 10>&- 11>&- 12>&-; "
+             "{ probe && exec 11>&-; } 3>&1 4>&1; echo next >&4");
+  else if (form == 56)
+    snprintf(input, sizeof(input),
+             "exec 1>/tmp/move-fuzz 3>/tmp/move-pad 4>/tmp/move-pad || exit; "
+             "exec 10>&- 11>&- 12>&-; "
+             "{ exec 11>&-; } 3>&1 4>&1; echo next >&3");
+  else if (form == 55)
+    snprintf(input, sizeof(input),
+             "exec 3>/tmp/move-pad 4>/tmp/move-fuzz || exit; "
+             "exec 10>&3 11>&- 12>&- 13>&-; "
+             "exec 3>&10- 11>&4 10>&-; echo next >&11");
+  else if (form == 54)
+    snprintf(input, sizeof(input),
+             "exec 3>/tmp/move-fuzz || exit; exec 10>&- 11>&-; "
+             "{ exec 10>/tmp/move-pad; echo next >&10; } 3>&1");
+  else if (form == 53)
+    snprintf(input, sizeof(input),
+             "exec 3>/tmp/move-fuzz || exit; exec 10>&- 11>&- 12>&-; "
+             "exec {fd}>&3; exec {fd}>&- 11>&3-; echo next >&11");
+  else if (form == 52)
+    snprintf(input, sizeof(input),
+             "exec 3>/tmp/move-fuzz 4>/tmp/move-pad || exit; "
+             "exec 8>&- 10>&- 11>&- 12>&-; exec {fd}>&3; "
+             ": 3>&${fd}- {fd}>&4 5>&8; echo next >&10");
+  else if (form == 51)
+    snprintf(input, sizeof(input),
+             "exec 3>/tmp/move-pad 20>/tmp/move-fuzz || exit; "
+             "exec 10>&- 11>&- 21>&- 22>&-; { echo next >&10; } 3>&20-");
+  else if (form == 50)
+    snprintf(input, sizeof(input),
+             "exec 4>&-; exec 3>/tmp/move-fuzz || exit; "
+             "{ :; } 4>&3- || echo next >&3");
+  else if (form == 49)
+    snprintf(input, sizeof(input),
+             "exec 4>&-; exec 3>/tmp/move-fuzz || exit; "
+             "{ :; } 4>&3-; echo next >&3");
+  else if (form >= 46)
+    snprintf(input, sizeof(input),
+             "exec 3>/tmp/move-fuzz 4>/tmp/move-pad || exit; "
+             "exec 10>&- 11>&- 12>&-; exec {fd}>&3; : 3>&${fd}- %s; "
+             "echo next >&10",
+             form == 46   ? "{fd}>&4"
+             : form == 47 ? "{fd}>&-"
+                          : "11>&3-");
+  else if (form == 45)
+    snprintf(input, sizeof(input),
+             "exec 3>/tmp/move-fuzz 4>/tmp/move-pad || exit; exec 10>&- 11>&-; "
+             "exec {fd}>&3 {fd}>&4; echo \"$(printf next >&10)\"");
+  else if (form == 44)
+    snprintf(input, sizeof(input),
+             "exec 3>/tmp/move-fuzz || exit; exec 4>&-; "
+             "builtin \"$runner\" 4>&3-; echo next >&3");
+  else if (form == 43)
+    snprintf(input, sizeof(input),
+             "exec 3>/tmp/move-fuzz || exit; "
+             "builtin command /bin/true {fd}>&3; echo next >&\"$fd\"");
+  else if (form == 42)
+    snprintf(input, sizeof(input),
+             "exec 3>/tmp/move-fuzz || exit; exec 4>&-; "
+             "builtin command /bin/true 4>&3-; echo next >&3");
+  else if (form == 41)
+    snprintf(input, sizeof(input),
+             "exec 3>/tmp/move-fuzz || exit; exec 10>&- 11>&-; "
+             "{ :; } {fd}>&3 10>&3-; echo next >&10");
+  else if (form == 40)
+    snprintf(input, sizeof(input),
+             "exec 3>/tmp/move-fuzz || exit; exec 10>&- 11>&-; "
+             ": {fd}>&3 10>&-; echo next >&\"$fd\"");
+  else if (form == 39)
+    snprintf(input, sizeof(input),
+             "exec 3>/tmp/move-fuzz || exit; exec 10>&- 11>&-; "
+             "exec {fd}>&3 {fd}>&3; echo next >&10");
+  else if (form == 38)
+    snprintf(input, sizeof(input),
+             "exec 3</tmp/move-fuzz 4</tmp/move-pad || exit; "
+             "exec 10<&- 11<&- 12<&-; : 4<&- 10<& 3-; cat <&3");
+  else if (form == 37)
+    snprintf(input, sizeof(input),
+             "exec 3>/tmp/move-fuzz 4>/tmp/move-pad || exit; "
+             "exec 10>&- 11>&- 12>&-; : 4>&- 10>&3-; echo next >&3");
+  else if (form == 36)
+    snprintf(input, sizeof(input),
+             "exec 3</tmp/move-fuzz || exit; exec 10<& - 11<& - 12<& -; "
+             "{ cat <&11; } 3<&0");
+  else if (form == 35)
+    snprintf(input, sizeof(input),
+             "exec 0</tmp/move-fuzz || exit; exec 10<&-; { :; } 10<&10; "
+             "exec {fd}<&0; cat <&10");
+  else if (form == 34)
+    snprintf(input, sizeof(input),
+             "exec 0</tmp/move-fuzz || exit; exec 10<&-; exec 10<&10-; "
+             "exec {fd}<&0; cat <&10");
+  else if (form == 33)
+    snprintf(input, sizeof(input),
+             "exec {out}>/tmp/move-fuzz; exec {fd}>&1; IFS=0123456789; "
+             "exec {out}>&${fd}-; echo next");
+  else if (form == 32)
+    snprintf(input, sizeof(input),
+             "exec {out}>/tmp/move-fuzz; exec {fd}>&1; IFS=0123456789; "
+             "{ :; } {out}>&${fd}-; echo next >&\"$out\"");
+  else if (form == 31)
+    snprintf(input, sizeof(input),
+             "exec {out}>/tmp/move-fuzz; exec {fd}>&1; IFS=0123456789; "
+             ": {out}>&${fd}-; echo next >&\"$out\"");
+  else if (form == 30)
+    snprintf(input, sizeof(input),
+             "exec 3>/tmp/move-fuzz || exit; exec 10>& - 11>& - 12>& -; "
+             "{ echo next >&11; } 3>&1");
+  else if (form == 29)
+    snprintf(input, sizeof(input),
+             "exec 1>/tmp/move-fuzz || exit; exec 10>&-; { :; } 10>&10; "
+             "exec {fd}>&1; echo next >&10");
+  else if (form == 28)
+    snprintf(input, sizeof(input),
+             "exec 1>/tmp/move-fuzz || exit; exec 10>&-; exec 10>&10-; "
+             "exec {fd}>&1; echo next >&10");
+  else if (form == 27)
+    snprintf(input, sizeof(input),
+             "exec 3</tmp/move-fuzz || exit; exec 11<&- 12<&-; "
+             "{ :; } 3<&0; cat <&11");
+  else if (form == 26)
+    snprintf(input, sizeof(input),
+             "exec 3>/tmp/move-fuzz || exit; exec 11>&- 12>&-; "
+             "{ :; } 3>&1; echo next >&11");
+  else if (form == 25)
+    snprintf(input, sizeof(input),
+             "exec 4>/tmp/move-fuzz; { :; } 4>&\"\"; echo next >&4");
+  else if (form == 24)
+    snprintf(input, sizeof(input),
+             "exec 4>/tmp/move-fuzz; : 4>&\"\"-; echo next >&4");
+  else if (form == 23)
+    snprintf(input, sizeof(input),
+             "exec 3>/tmp/old || exit; exec 4>/tmp/move-fuzz || exit; "
+             "exec 10>&- 11>&- 12>&- 13>&-; "
+             ": 3>&1 3>&4 {fd}>&3; echo next >&12");
+  else if (form == 22)
+    snprintf(input, sizeof(input),
+             "exec 3>/tmp/old || exit; exec 4>/tmp/move-fuzz || exit; "
+             "exec 10>&- 11>&- 12>&- 13>&-; "
+             ": 3>&4- {fd}>&3; echo next >&12");
+  else if (form == 21)
+    snprintf(input, sizeof(input),
+             "exec 3>&- 10>&- 11>&-; "
+             "{ probe && exec {fd}>/tmp/move-first || "
+             "exec {pad}>/tmp/move-pad {fd}>/tmp/move-fuzz; } && "
+             "echo \"$(exec 4>&${fd}-; printf next >&4)\"");
+  else if (form >= 17)
+    snprintf(input, sizeof(input),
+             "exec 3%c/tmp/old 4%c/tmp/move-fuzz; %s 3%c&4- 3%c&4; %s",
+             form == 19 ? '<' : '>', form == 19 ? '<' : '>',
+             form == 18   ? "{ :; }"
+             : form == 20 ? "exec"
+                          : ":",
+             form == 19 ? '<' : '>', form == 19 ? '<' : '>',
+             form == 19 ? "cat <&4" : "echo next >&4");
+  else if (form == 16)
+    snprintf(input, sizeof(input),
+             "exec 3>&- 10>&- 11>&-; "
+             "{ probe && exec {fd}>/tmp/move-first || "
+             "exec {pad}>/tmp/move-pad {fd}>/tmp/move-fuzz; } && "
+             "{ exec 10>&${fd}-; echo next >&10; }");
+  else if (form == 8 || form == 11 || form == 12 || form == 13)
+    snprintf(input, sizeof(input),
+             "exec %u>&-; exec %u>/tmp/move-fuzz; %s %u>&%u-; echo next >&%u",
+             destination, source,
+             form == 8    ? "/bin/true"
+             : form == 11 ? "\"$runner\""
+             : form == 12 ? "builtin true"
+                          : "command /bin/true",
+             destination, source, source);
+  else if (form == 9 || form == 15)
+    snprintf(input, sizeof(input),
+             "exec %u>&-; exec %u>/tmp/old; { %sexec %u>/tmp/move-fuzz; %s} "
+             "%u>&%u-; echo next >&%u",
+             destination, source, form == 15 ? "{ " : "", source,
+             form == 15 ? "}; " : "", destination, source, source);
+  else if (form == 10)
+    snprintf(input, sizeof(input),
+             "exec 1>/tmp/move-fuzz; exec 10>&-; exec {fd}>&1 10>&${fd}-; "
+             "echo next >&\"$fd\"");
+  else if (form == 14)
+    snprintf(input, sizeof(input),
+             "exec {fd}>/tmp/move-fuzz; /bin/true {fd}>/tmp/local; "
+             "echo next >&\"$fd\"");
+  else if (form == 7)
+    snprintf(input, sizeof(input),
+             "exec {fd}>/tmp/move-fuzz; exec 1>&${fd}-; echo next");
+  else if (form == 3 || form == 4)
+    snprintf(
+        input, sizeof(input),
+        "exec %u>&%s; exec %u>/tmp/move-fuzz; { :; } %u>&%u-; echo next >&%u",
+        destination, form == 4 ? "1" : "-", source, destination, source,
+        source);
+  else if (form == 5 || form == 6)
+    snprintf(
+        input, sizeof(input),
+        "exec %u>&-; exec %u>/tmp/move-fuzz; : %u>&\"%u%s\"%s; echo next >&%u",
+        destination, source, destination, source, form == 5 ? "-" : "",
+        form == 6 ? "-" : "", source);
+  else
+    snprintf(input, sizeof(input),
+             "exec %u>&%s; exec %u>/tmp/move-fuzz; %s %u>&%u-; echo next >&%u",
+             destination, form == 1 ? "1" : "-", source, action, destination,
+             source, source);
+  shell_dep_graph_t graph = {};
+  shell_dep_error_t graph_error =
+      shell_dep_graph_parse(input, strlen(input), nullptr, nullptr, &graph);
+  if (graph_error != SHELL_DEP_OK || !shell_dep_graph_validate(&graph).valid) {
+    fprintf(stderr, "descriptor move graph oracle %u (error %d): %s\n",
+            selector, graph_error, input);
+    return 1;
+  }
+  bool actual = false;
+  unsigned routes = 0;
+  for (uint32_t i = 0; i < graph.edge_count; i++) {
+    const auto &edge = graph.edges[i];
+    bool reads = form == 19 || form == 27 || (form >= 34 && form <= 36) ||
+                 form == 38 || form == 58 || form == 60;
+    if (edge.type != (reads ? SHELL_EDGE_READ : SHELL_EDGE_WRITE))
+      continue;
+    const auto &owner = graph.nodes[reads ? edge.to : edge.from];
+    const auto &file = graph.nodes[reads ? edge.from : edge.to];
+    const char *command = form == 64                               ? "\"$cmd\""
+                          : form == 65                             ? "command"
+                          : form == 68                             ? "builtin"
+                          : reads                                  ? "cat"
+                          : form == 61                             ? "/bin/echo"
+                          : form == 21 || form == 45 || form >= 73 ? "printf"
+                                                                   : "echo";
+    if (owner.type == SHELL_NODE_CMD && owner.cmd.token_count &&
+        owner.cmd.token_lens[0] == strlen(command) &&
+        !memcmp(owner.cmd.tokens[0], command, strlen(command))) {
+      bool expected =
+          file.type == SHELL_NODE_DOC && file.doc.kind == SHELL_DOC_FILE &&
+          file.doc.path_len == strlen("/tmp/move-fuzz") &&
+          !memcmp(file.doc.path, "/tmp/move-fuzz", file.doc.path_len);
+      actual |= expected;
+      if (form >= 16) {
+        bool first =
+            (form == 16 || form == 21) && file.type == SHELL_NODE_DOC &&
+            file.doc.kind == SHELL_DOC_FILE &&
+            file.doc.path_len == strlen("/tmp/move-first") &&
+            !memcmp(file.doc.path, "/tmp/move-first", file.doc.path_len);
+        bool unchanged =
+            (form == 57 || form == 72) && file.type == SHELL_NODE_DOC &&
+            file.doc.kind == SHELL_DOC_FILE &&
+            file.doc.path_len == strlen("/tmp/move-pad") &&
+            !memcmp(file.doc.path, "/tmp/move-pad", file.doc.path_len);
+        if ((!expected && !first && !unchanged) ||
+            (reads ? edge.target_fd : edge.source_fd) != (reads ? 0u : 1u))
+          return 1;
+        routes++;
+      }
+    }
+  }
+  unsigned expected_routes =
+      expected_route
+          ? (form == 16 || form == 21 || form == 57 || form == 72 ? 2u : 1u)
+          : 0u;
+  if (actual != expected_route || (form >= 16 && routes != expected_routes)) {
+    fprintf(stderr, "descriptor move oracle %u: %s\n", selector, input);
+    return 1;
+  }
+  shell_processed_commands_t processed = {};
+  if (shell_process_commands(input, strlen(input), nullptr, &processed) !=
+      SHELL_PROCESS_OK) {
+    fprintf(stderr, "descriptor move processor oracle %u: %s\n", selector,
+            input);
+    return 1;
+  }
+  shell_processed_commands_free(&processed);
+  return 0;
+}
+
 static int test_generated_resolved_depgraph(uint8_t selector, bool truncate) {
   static const char *sources[] = {
       "echo \"$V\"",
@@ -4551,7 +4914,8 @@ static int test_depgraph(const char *input, size_t length, const char *cwd) {
       shell_error_t fast_error =
           shell_parse_fast(input, length, &strict, &fast);
       if (fast_error == SHELL_OK || fast_error == SHELL_ETRUNC) {
-        const shell_parse_result_t unchanged = fast;
+        shell_parse_result_t unchanged;
+        memcpy(&unchanged, &fast, sizeof(unchanged));
         shell_dep_limits_t effective;
         if (!fuzz_dep_limits(&limits[i], &effective))
           return 1;
@@ -4566,12 +4930,7 @@ static int test_depgraph(const char *input, size_t length, const char *cwd) {
             supplied.status != graph.status ||
             supplied.cwd_buf.len != graph.cwd_buf.len ||
             memcmp(&fast, &unchanged, sizeof(fast)) != 0 ||
-            memcmp(supplied.nodes, graph.nodes,
-                   graph.node_count * sizeof(graph.nodes[0])) != 0 ||
-            memcmp(supplied.edges, graph.edges,
-                   graph.edge_count * sizeof(graph.edges[0])) != 0 ||
-            memcmp(supplied.cwd_buf.data, graph.cwd_buf.data,
-                   graph.cwd_buf.len) != 0)
+            !shellsplit_test_graph_equal(&supplied, &graph))
           return 1;
       }
     }
@@ -6281,6 +6640,25 @@ static int test_generated_static_arithmetic_case(const uint8_t *data,
 
 /* Fixed sweeps belong to startup, not one fuzz input's timeout budget. */
 static void run_fixed_oracles() {
+  bool reachable[256] = {};
+  bool single_byte_selectors[descriptor_move_single_byte_selector_count] = {};
+  for (unsigned first = 6; first < 256; first += 8) {
+    uint8_t input[2] = {(uint8_t)first, 0};
+    single_byte_selectors[descriptor_move_selector(input, 1)] = true;
+    for (unsigned second = 0; second < 256; second++) {
+      input[1] = (uint8_t)second;
+      reachable[descriptor_move_selector(input, 2)] = true;
+    }
+  }
+  for (bool reached : single_byte_selectors)
+    if (!reached)
+      abort();
+  for (bool reached : reachable)
+    if (!reached)
+      abort();
+  for (unsigned i = 0; i < 256; i++)
+    if (test_generated_descriptor_move((uint8_t)i))
+      abort();
   for (const auto &fixture : shellsplit_test_array_prefixes) {
     size_t length = strlen(fixture.source);
     shell_parse_result_t parsed = {};
@@ -6617,7 +6995,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
   /* Startup exhaustively checks each generated matrix. On fuzzed payloads,
    * choose one without consuming input bytes, so structural coverage does not
    * multiply the cost of every arbitrary-parser iteration. */
-  switch (size == 0 ? 0 : data[0] % 7) {
+  switch (size == 0 ? 0 : data[0] % 8) {
   case 0:
     run_check("generated brace case",
               test_generated_brace_case(data, size, cwd));
@@ -6641,6 +7019,11 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
   case 5:
     run_check("generated document boundary",
               test_generated_document_boundary(data[0]));
+    break;
+  case 6:
+    run_check(
+        "generated descriptor move",
+        test_generated_descriptor_move(descriptor_move_selector(data, size)));
     break;
   default:
     run_check(

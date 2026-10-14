@@ -30,10 +30,15 @@ Output:
 
 ```bash
 # From the repository root
-cmake -S . -B build
+reference_bash=$(./scripts/prepare-reference-bash)
+cmake -S . -B build -DSHELLCLAVE_BASH_EXECUTABLE="$reference_bash"
 cmake --build build
 ctest --test-dir build --output-on-failure
 ```
+
+Conformance tests use the pinned Bash reference described in the repository's
+[build instructions](../README.md#requirements-and-build). Library-only builds with
+`BUILD_TESTING=OFF` do not need a Bash executable or network access.
 
 ## Features
 
@@ -432,8 +437,12 @@ completion callbacks and Readline key bindings can execute registered code.
 The complete static builtin forms are rejected rather than pretending their
 operands are inert argv data. Inspection through `command -v`/`-V` does not
 invoke those builtins and remains supported.
-This model requires a known
-noninteractive Bash startup state. Start Bash with `POSIXLY_CORRECT` absent
+This model targets **Bash 5.3.20**, the single pinned reference shared by CI
+and pre-push verification, not a set of version-dependent dialects. Upgrades
+are deliberate changes accompanied by conformance tests and model adaptations.
+The caller supplies this executor; the library does not run a shell or check
+its version. This model requires a known noninteractive Bash startup state.
+Start Bash with `POSIXLY_CORRECT` absent
 (an empty value still enables POSIX mode), clear `BASH_COMPAT` and
 `BASH_XTRACEFD`, then make all three variables readonly before evaluating
 submitted source. Freezing `BASH_XTRACEFD` prevents a later unset or
@@ -548,12 +557,41 @@ operations remain active. A timing report routed to a command or input-process
 substitution's capture becomes an explicit SUBST or collector flow. A descriptor
 copied from external stdout before entering that substitution still bypasses
 its capture, even when later duplicated onto the child's fd 1 or fd 2.
-Numeric compound redirects restore their saved descriptor slots when a
-foreground group finishes, even if an in-body `exec` overwrites or closes
-those slots. Mutations to other descriptors, copies made from temporary
+Numeric compound redirects restore from their live saved descriptor slots in
+reverse registration order when a foreground group finishes. An in-body `exec`
+can overwrite a save, changing the restored route, or close it, causing that
+restoration to fail and stop the remaining undo list. The target then stays
+unchanged and older saves remain live. Cleanup diagnostics leave the body's
+status unchanged; enclosing scopes still perform their independent cleanup.
+Later redirects and redirect-operand substitutions can use saves created by
+earlier redirects in the same setup. Ordinary argument substitutions precede
+that setup. Direct external-command setup creates no undo saves, although it
+can duplicate an enclosing group's live save onto a standard stream before
+executing. Ordered descriptor journals drive both expansion snapshots and
+final routing; concrete tables are derived views, not separate setup replays.
+Runtime command dispatch keeps builtin and external setup versions separate,
+including their scratch allocation, failure, and publication effects. An
+argv-less command with an fd 0 or named-FD redirect performs setup in a child
+without undo saves; negation and conditional continuations use that child's
+real setup outcome. Correlated versions retain deterministic iteration order
+and use indexed root membership rather than repeated list-prefix scans.
+Setup failures use their own immutable, ordered cleanup program, using live
+saved descriptors just like successful completion. Balanced program segments
+reuse unchanged cleanup results through an indexed descriptor-dependency view;
+each possible failure does not walk the accumulated undo prefix again. The
+snapshot and final-route journals share one cleanup scratch pool in the
+caller-owned evaluation workspace. Closing or
+overwriting a save during setup can therefore leave earlier temporary routes
+installed after failure. Timing reports include only reached cleanup outcomes,
+not an unreachable successful restoration path.
+Mutations to other descriptors, copies made from temporary
 descriptors, and named-FD allocations can still persist. Ordinary I/O,
 substitution imports, and timing reports use these same lifetime rules.
 Conditional descriptor alternatives also survive recursive substitutions.
+These snapshots retain the saved descriptors' physical close-on-exec property
+on each execution path. An inner descriptor-only `exec` overwrite therefore
+restores an inherited shell-owned save, while explicitly closing that save
+and reopening its number creates an ordinary persistent descriptor.
 Resolved `exit` builtins (including `command`/`builtin` wrappers) distinguish
 signed decimal status operands from redirection syntax. Valid static operands
 terminate with their status byte; operandless `exit`, including `exit --`,
