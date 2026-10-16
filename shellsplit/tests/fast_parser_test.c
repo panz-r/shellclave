@@ -2601,7 +2601,7 @@ static void test_word_fragment_operator_boundaries(void) {
           !processed.commands[0].has_pipe_output &&
           shell_dep_graph_parse(input, strlen(input), ".", NULL, &graph) ==
               SHELL_DEP_OK &&
-          graph.edge_count == 0;
+          graph.edge_count == 3 && shell_dep_graph_validate(&graph).valid;
       shell_commands_free(commands, command_count);
       shell_processed_commands_free(&processed);
     }

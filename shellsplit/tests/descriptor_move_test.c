@@ -58,6 +58,8 @@ static bool command_routes_exact(const shell_dep_graph_t *graph,
       continue;
     const shell_dep_node_t *file =
         &graph->nodes[kind == SHELL_EDGE_READ ? edge->from : edge->to];
+    if (file->type == SHELL_NODE_FD)
+      continue;
     if (file->type != SHELL_NODE_DOC || file->doc.kind != SHELL_DOC_FILE ||
         (kind == SHELL_EDGE_READ ? edge->target_fd : edge->source_fd) !=
             (kind == SHELL_EDGE_READ ? 0u : 1u))
@@ -1608,6 +1610,18 @@ int main(void) {
                   "move capacity case%zu dimension%u bound%u status%d\n", i,
                   dimension, bound, status);
         CHECK(status == SHELL_DEP_OK || status == SHELL_DEP_ETRUNC);
+        if (!shellsplit_test_depgraph_invariants(capacity_sources[i],
+                                                 strlen(capacity_sources[i]),
+                                                 status, graph, &limited)) {
+          fprintf(stderr,
+                  "move graph case%zu dimension%u bound%u status%d\n%s\n", i,
+                  dimension, bound, status, capacity_sources[i]);
+          shell_dep_graph_dump(graph, stderr);
+          shell_dep_graph_validation_t validation =
+              shell_dep_graph_validate(graph);
+          for (uint32_t error = 0; error < validation.error_count; error++)
+            fprintf(stderr, "%s\n", validation.errors[error].msg);
+        }
         CHECK(shellsplit_test_depgraph_invariants(capacity_sources[i],
                                                   strlen(capacity_sources[i]),
                                                   status, graph, &limited));

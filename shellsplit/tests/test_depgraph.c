@@ -85,6 +85,31 @@ static bool verbose = false;
 
 /* --- HELPERS --- */
 
+static SHELL_NONNULL(1,
+                     2) bool internal_relation(const shell_dep_graph_t *graph,
+                                               const shell_dep_edge_t *edge) {
+  return graph->nodes[edge->from].type != SHELL_NODE_FD &&
+         graph->nodes[edge->to].type != SHELL_NODE_FD;
+}
+
+/* Existing topology fixtures count in-graph relations independently of the
+ * newly explicit external boundary. The boundary suite checks complete counts
+ * and destinations; every suite still validates the complete returned graph. */
+static uint32_t count_internal_nodes(const shell_dep_graph_t *g) {
+  uint32_t count = 0;
+  for (uint32_t i = 0; i < g->node_count; i++)
+    count += g->nodes[i].type != SHELL_NODE_FD;
+  return count;
+}
+
+static uint32_t count_internal_edges(const shell_dep_graph_t *g) {
+  uint32_t count = 0;
+  for (uint32_t i = 0; i < g->edge_count; i++)
+    count += g->nodes[g->edges[i].from].type != SHELL_NODE_FD &&
+             g->nodes[g->edges[i].to].type != SHELL_NODE_FD;
+  return count;
+}
+
 static uint32_t count_type(const shell_dep_graph_t *g,
                            shell_dep_node_type_t type) {
   uint32_t c = 0;
@@ -98,7 +123,9 @@ static uint32_t count_edge_type(const shell_dep_graph_t *g,
                                 shell_dep_edge_type_t type) {
   uint32_t c = 0;
   for (uint32_t i = 0; i < g->edge_count; i++)
-    if (g->edges[i].type == type)
+    if (g->edges[i].type == type &&
+        g->nodes[g->edges[i].from].type != SHELL_NODE_FD &&
+        g->nodes[g->edges[i].to].type != SHELL_NODE_FD)
       c++;
   return c;
 }
@@ -107,7 +134,8 @@ static uint32_t count_out_edge_type(const shell_dep_graph_t *g, uint32_t from,
                                     shell_dep_edge_type_t type) {
   uint32_t count = 0;
   for (uint32_t i = 0; i < g->edge_count; i++)
-    if (g->edges[i].from == from && g->edges[i].type == type)
+    if (g->edges[i].from == from && g->edges[i].type == type &&
+        g->nodes[g->edges[i].to].type != SHELL_NODE_FD)
       count++;
   return count;
 }
@@ -304,7 +332,7 @@ TEST(basic_command_matrix) {
     shell_dep_graph_t g;
     ASSERT(parse(cases[i].command, &g) == SHELL_DEP_OK);
     ASSERT(count_type(&g, SHELL_NODE_CMD) == cases[i].command_count);
-    ASSERT(g.edge_count == cases[i].edge_count);
+    ASSERT(count_internal_edges(&g) == cases[i].edge_count);
     if (cases[i].command_count == 0)
       continue;
     ASSERT(g.nodes[0].type == SHELL_NODE_CMD);
@@ -624,6 +652,9 @@ TEST(redirect_matrix) {
     for (uint32_t j = 0; j < g.edge_count; j++) {
       if (g.edges[j].type != cases[i].edge_type)
         continue;
+      if (g.nodes[g.edges[j].from].type == SHELL_NODE_FD ||
+          g.nodes[g.edges[j].to].type == SHELL_NODE_FD)
+        continue;
       if (cases[i].edge_type == SHELL_EDGE_FD_OPEN)
         continue;
       if (cases[i].edge_type == SHELL_EDGE_READ) {
@@ -716,6 +747,8 @@ TEST(legacy_combined_output_redirects) {
     bool stderr_seen = false;
     for (uint32_t edge = 0; edge < graph.edge_count; edge++) {
       const shell_dep_edge_t *item = &graph.edges[edge];
+      if (!internal_relation(&graph, item))
+        continue;
       if ((item->type == SHELL_EDGE_WRITE || item->type == SHELL_EDGE_APPEND) &&
           item->to == (uint32_t)document) {
         stdout_seen = stdout_seen || item->source_fd == 1;
@@ -952,6 +985,8 @@ TEST(literal_brace_dynamic_redirect_paths) {
     bool dynamic_name_flow = false;
     for (uint32_t edge = 0; edge < graph.edge_count; edge++) {
       const shell_dep_edge_t *current = &graph.edges[edge];
+      if (!internal_relation(&graph, current))
+        continue;
       dynamic_name_flow =
           dynamic_name_flow ||
           (current->type == SHELL_EDGE_SUBST &&
@@ -1038,6 +1073,8 @@ TEST(named_fd_symbolic_duplication_routes) {
   bool routed = false;
   for (uint32_t edge = 0; edge < graph.edge_count; edge++) {
     const shell_dep_edge_t *item = &graph.edges[edge];
+    if (!internal_relation(&graph, item))
+      continue;
     setup = setup || (item->type == SHELL_EDGE_FD_OPEN &&
                       item->from == (uint32_t)command &&
                       item->to == (uint32_t)document &&
@@ -1059,6 +1096,8 @@ TEST(named_fd_symbolic_duplication_routes) {
   routed = false;
   for (uint32_t edge = 0; edge < graph.edge_count; edge++) {
     const shell_dep_edge_t *item = &graph.edges[edge];
+    if (!internal_relation(&graph, item))
+      continue;
     named_dup =
         named_dup ||
         (item->type == SHELL_EDGE_FD_OPEN &&
@@ -1104,7 +1143,8 @@ TEST(named_fd_symbolic_duplication_routes) {
   document = find_file_doc(&graph, "/tmp/out");
   routed = false;
   for (uint32_t edge = 0; edge < graph.edge_count; edge++)
-    routed = routed || (graph.edges[edge].type == SHELL_EDGE_WRITE &&
+    routed = routed || ((graph.edges[edge].type == SHELL_EDGE_WRITE &&
+                         internal_relation(&graph, &graph.edges[edge])) &&
                         graph.edges[edge].from == (uint32_t)command &&
                         graph.edges[edge].to == (uint32_t)document &&
                         graph.edges[edge].source_fd == 1);
@@ -1155,6 +1195,8 @@ TEST(named_fd_unconnected_process_substitution_routes) {
   bool flow = false;
   for (uint32_t edge = 0; edge < graph.edge_count; edge++) {
     const shell_dep_edge_t *item = &graph.edges[edge];
+    if (!internal_relation(&graph, item))
+      continue;
     setup = setup || (item->type == SHELL_EDGE_FD_OPEN &&
                       item->from == (uint32_t)endpoint &&
                       item->to == (uint32_t)setup_owner &&
@@ -1184,6 +1226,8 @@ TEST(named_fd_unconnected_process_substitution_routes) {
   uint32_t setup_edge = UINT32_MAX;
   for (uint32_t edge = 0; edge < graph.edge_count; edge++) {
     const shell_dep_edge_t *item = &graph.edges[edge];
+    if (!internal_relation(&graph, item))
+      continue;
     bool is_setup = item->type == SHELL_EDGE_FD_OPEN &&
                     item->from == (uint32_t)setup_owner &&
                     item->to == (uint32_t)endpoint &&
@@ -1272,7 +1316,8 @@ TEST(named_fd_exec_scope_and_lifecycle) {
   int printf_command = find_nth_cmd(&graph, 1);
   bool routed = false;
   for (uint32_t edge = 0; edge < graph.edge_count; edge++)
-    routed = routed || (graph.edges[edge].type == SHELL_EDGE_WRITE &&
+    routed = routed || ((graph.edges[edge].type == SHELL_EDGE_WRITE &&
+                         internal_relation(&graph, &graph.edges[edge])) &&
                         graph.edges[edge].from == (uint32_t)printf_command &&
                         graph.edges[edge].to == (uint32_t)document &&
                         graph.edges[edge].source_fd == 1);
@@ -1328,7 +1373,8 @@ TEST(named_fd_exec_scope_and_lifecycle) {
   bool brace_routed = false;
   for (uint32_t edge = 0; edge < graph.edge_count; edge++)
     brace_routed =
-        brace_routed || (graph.edges[edge].type == SHELL_EDGE_WRITE &&
+        brace_routed || ((graph.edges[edge].type == SHELL_EDGE_WRITE &&
+                          internal_relation(&graph, &graph.edges[edge])) &&
                          graph.edges[edge].to == (uint32_t)document &&
                          graph.edges[edge].source_fd == 1);
   ASSERT(document >= 0 && brace_routed &&
@@ -1351,7 +1397,8 @@ TEST(named_fd_exec_scope_and_lifecycle) {
     bool child_write = false;
     for (uint32_t edge = 0; edge < graph.edge_count; edge++)
       child_write =
-          child_write || (graph.edges[edge].type == SHELL_EDGE_WRITE &&
+          child_write || ((graph.edges[edge].type == SHELL_EDGE_WRITE &&
+                           internal_relation(&graph, &graph.edges[edge])) &&
                           graph.edges[edge].to == (uint32_t)document &&
                           graph.edges[edge].source_fd == 1);
     ASSERT(document >= 0 && child_write &&
@@ -1380,10 +1427,11 @@ TEST(named_fd_exec_scope_and_lifecycle) {
   document = find_file_doc(&graph, "/tmp/in");
   bool nested_import_read = false;
   for (uint32_t edge = 0; edge < graph.edge_count; edge++)
-    nested_import_read =
-        nested_import_read || (graph.edges[edge].type == SHELL_EDGE_READ &&
-                               graph.edges[edge].from == (uint32_t)document &&
-                               graph.edges[edge].target_fd == 0);
+    nested_import_read = nested_import_read ||
+                         ((graph.edges[edge].type == SHELL_EDGE_READ &&
+                           internal_relation(&graph, &graph.edges[edge])) &&
+                          graph.edges[edge].from == (uint32_t)document &&
+                          graph.edges[edge].target_fd == 0);
   ASSERT(document >= 0 && nested_import_read &&
          shell_dep_graph_validate(&graph).valid);
 
@@ -1419,6 +1467,8 @@ TEST(named_fd_exec_scope_and_lifecycle) {
   bool false_exec_write = false;
   for (uint32_t edge = 0; edge < graph.edge_count; edge++) {
     const shell_dep_edge_t *item = &graph.edges[edge];
+    if (!internal_relation(&graph, item))
+      continue;
     sink_setup = sink_setup || (item->type == SHELL_EDGE_FD_OPEN &&
                                 item->from == (uint32_t)exec_command &&
                                 item->to == (uint32_t)sink &&
@@ -1440,7 +1490,8 @@ TEST(named_fd_exec_scope_and_lifecycle) {
   bool sink_write = false;
   for (uint32_t edge = 0; edge < graph.edge_count; edge++)
     sink_write =
-        sink_write || (graph.edges[edge].type == SHELL_EDGE_WRITE &&
+        sink_write || ((graph.edges[edge].type == SHELL_EDGE_WRITE &&
+                        internal_relation(&graph, &graph.edges[edge])) &&
                        graph.edges[edge].from == (uint32_t)printf_command &&
                        graph.edges[edge].to == (uint32_t)sink &&
                        graph.edges[edge].source_fd == 1);
@@ -1455,6 +1506,8 @@ TEST(named_fd_exec_scope_and_lifecycle) {
   bool source_read = false;
   for (uint32_t edge = 0; edge < graph.edge_count; edge++) {
     const shell_dep_edge_t *item = &graph.edges[edge];
+    if (!internal_relation(&graph, item))
+      continue;
     source_setup =
         source_setup ||
         (item->type == SHELL_EDGE_FD_OPEN && item->from == (uint32_t)producer &&
@@ -1792,6 +1845,8 @@ TEST(named_fd_group_execution_scopes) {
   bool tail_read = false;
   for (uint32_t edge = 0; edge < graph.edge_count; edge++) {
     const shell_dep_edge_t *item = &graph.edges[edge];
+    if (!internal_relation(&graph, item))
+      continue;
     if (item->type != SHELL_EDGE_READ)
       continue;
     reads++;
@@ -2503,7 +2558,6 @@ TEST(named_fd_recursive_snapshot_timing) {
 TEST(group_entry_redirect_expansion_timing) {
   shell_dep_graph_t graph = {0};
   shell_dep_limits_t limits = SHELL_DEP_LIMITS_DEFAULT;
-  limits.cd_as_cmd = true;
   const char *cwd_command = "cd /tmp; { :; } > >(pwd); pwd";
   ASSERT(shell_dep_graph_parse(cwd_command, strlen(cwd_command), "/workspace",
                                &limits, &graph) == SHELL_DEP_OK);
@@ -3625,6 +3679,8 @@ TEST(named_fd_route_cross_product_matrix) {
         bool materialized_append = false;
         for (uint32_t edge = 0; edge < graph.edge_count; edge++) {
           const shell_dep_edge_t *current = &graph.edges[edge];
+          if (!internal_relation(&graph, current))
+            continue;
           append_setup =
               append_setup ||
               (current->type == SHELL_EDGE_FD_OPEN &&
@@ -3705,6 +3761,8 @@ TEST(named_fd_retired_setup_documents) {
   bool named_close = false;
   for (uint32_t edge = 0; edge < graph.edge_count; edge++) {
     const shell_dep_edge_t *current = &graph.edges[edge];
+    if (!internal_relation(&graph, current))
+      continue;
     named_close =
         named_close ||
         (current->type == SHELL_EDGE_FD_CLOSE &&
@@ -3952,8 +4010,8 @@ TEST(redirect_only_command_boundary_ownership) {
   endpoint = find_endpoint(&g);
   ASSERT(echo >= 0 && owner >= 0 && consumer >= 0 && endpoint >= 0);
   ASSERT(g.nodes[owner].cmd.token_count == 0);
-  ASSERT(has_edge_fds(&g, SHELL_EDGE_WRITE, (uint32_t)owner, (uint32_t)endpoint,
-                      1, SHELL_DEP_FD_NONE));
+  ASSERT(has_edge_fds(&g, SHELL_EDGE_FD_OPEN, (uint32_t)owner,
+                      (uint32_t)endpoint, 1, SHELL_DEP_FD_NONE));
   ASSERT(
       has_edge(&g, SHELL_EDGE_SUBST, (uint32_t)endpoint, (uint32_t)consumer));
   ASSERT(!has_edge(&g, SHELL_EDGE_WRITE, (uint32_t)echo, (uint32_t)endpoint));
@@ -3988,9 +4046,10 @@ TEST(cwd_matrix) {
     shell_dep_graph_t g;
     ASSERT(parse_cwd(cases[i].command, cases[i].initial_cwd, &g) ==
            SHELL_DEP_OK);
-    bool conditional = strstr(cases[i].command, "&&") != NULL;
-    ASSERT(count_type(&g, SHELL_NODE_CMD) == (conditional ? 2u : 1u));
-    int command_index = find_nth_cmd(&g, conditional ? 1 : 0);
+    uint32_t expected_commands =
+        i + 1 == sizeof(cases) / sizeof(cases[0]) ? 1u : 2u;
+    ASSERT(count_type(&g, SHELL_NODE_CMD) == expected_commands);
+    int command_index = find_nth_cmd(&g, expected_commands - 1);
     ASSERT(command_index >= 0);
     ASSERT_STR_EQ(get_cwd_str(&g, g.nodes[command_index].cmd.cwd_offset),
                   cases[i].expected_cwd);
@@ -4089,7 +4148,7 @@ TEST(cwd_decoded_operand_matrix) {
        i++) {
     shell_dep_graph_t graph;
     ASSERT(parse_cwd(failed_cd_cases[i], "/home/user", &graph) == SHELL_DEP_OK);
-    int pwd = find_first_cmd(&graph);
+    int pwd = find_cmd_tokens(&graph, "pwd", NULL);
     ASSERT(pwd >= 0);
     ASSERT(graph.nodes[pwd].cmd.cwd_known);
     ASSERT_STR_EQ(get_cwd_str(&graph, graph.nodes[pwd].cmd.cwd_offset),
@@ -4104,13 +4163,12 @@ TEST(cwd_decoded_operand_matrix) {
   ASSERT(shell_dep_graph_parse("cd /tmp; pwd", strlen("cd /tmp; pwd"),
                                "/home/user", &small_cwd_limits,
                                &graph) == SHELL_DEP_ETRUNC);
-  int pwd = find_first_cmd(&graph);
+  int pwd = find_cmd_tokens(&graph, "pwd", NULL);
   ASSERT(pwd >= 0);
   ASSERT(!graph.nodes[pwd].cmd.cwd_known);
   ASSERT((graph.status & SHELL_DEP_STATUS_TRUNCATED) != 0);
 
   shell_dep_limits_t limits = SHELL_DEP_LIMITS_DEFAULT;
-  limits.cd_as_cmd = true;
   memset(&graph, 0, sizeof(graph));
   ASSERT(shell_dep_graph_parse("cd $'\\x2ftmp'; pwd",
                                strlen("cd $'\\x2ftmp'; pwd"), "/home/user",
@@ -4123,12 +4181,13 @@ TEST(cwd_decoded_operand_matrix) {
   pass_count++;
 }
 
-/* cd's redirect setup and nested commands execute before its CWD transition.
- * Plain cd still needs no execution node with default limits. */
+/* Every cd is a command. Its redirect setup and nested commands execute in
+ * the incoming directory, before the tracked CWD transition. */
 TEST(cd_graph_visible_effects) {
   shell_dep_graph_t graph = {0};
   ASSERT(parse_cwd("cd /tmp", "/home/user", &graph) == SHELL_DEP_OK);
-  ASSERT(count_type(&graph, SHELL_NODE_CMD) == 0);
+  ASSERT(count_type(&graph, SHELL_NODE_CMD) == 1 &&
+         count_edge_type(&graph, SHELL_EDGE_CWD) == 1);
 
   ASSERT(parse_cwd("printf before; cd /tmp >/tmp/redirect; pwd", "/home/user",
                    &graph) == SHELL_DEP_OK);
@@ -4213,7 +4272,6 @@ TEST(cd_graph_visible_effects) {
          shell_dep_graph_validate(&graph).valid);
 
   shell_dep_limits_t limits = SHELL_DEP_LIMITS_DEFAULT;
-  limits.cd_as_cmd = true;
   ASSERT(shell_dep_graph_parse("cd /tmp >/tmp/redirect",
                                strlen("cd /tmp >/tmp/redirect"), "/home/user",
                                &limits, &graph) == SHELL_DEP_OK);
@@ -4356,7 +4414,6 @@ TEST(composition_metadata_matrix) {
 
   shell_dep_graph_t g;
   shell_dep_limits_t cwd_limits = SHELL_DEP_LIMITS_DEFAULT;
-  cwd_limits.cd_as_cmd = true;
   memset(&g, 0, sizeof(g));
   ASSERT(shell_dep_graph_parse("cd /tmp | pwd", strlen("cd /tmp | pwd"), ".",
                                &cwd_limits, &g) == SHELL_DEP_OK);
@@ -4397,7 +4454,6 @@ TEST(posix_brace_group_pipeline) {
   const char *command =
       "cd /workspace && { sleep 2; printf 'q'; } | ./clock > /tmp/clock.out";
   shell_dep_limits_t limits = SHELL_DEP_LIMITS_DEFAULT;
-  limits.cd_as_cmd = true;
   shell_dep_graph_t g = {0};
   ASSERT(shell_dep_graph_parse(command, strlen(command), ".", &limits, &g) ==
          SHELL_DEP_OK);
@@ -4520,6 +4576,8 @@ TEST(compound_group_input_redirect_overrides_pipe) {
     bool document_to_group = false;
     for (uint32_t e = 0; e < graph.edge_count; e++) {
       const shell_dep_edge_t *edge = &graph.edges[e];
+      if (!internal_relation(&graph, edge))
+        continue;
       if (edge->type != SHELL_EDGE_READ || edge->to != (uint32_t)group ||
           edge->target_fd != 0)
         continue;
@@ -4530,6 +4588,8 @@ TEST(compound_group_input_redirect_overrides_pipe) {
     bool terminal_pipe = false;
     for (uint32_t e = 0; e < graph.edge_count; e++) {
       const shell_dep_edge_t *edge = &graph.edges[e];
+      if (!internal_relation(&graph, edge))
+        continue;
       terminal_pipe =
           terminal_pipe || (edge->type == SHELL_EDGE_PIPE &&
                             graph.nodes[edge->to].type == SHELL_NODE_ENDPOINT &&
@@ -4550,6 +4610,8 @@ TEST(effective_descriptor_routing) {
   bool second_is_active = false;
   for (uint32_t edge = 0; edge < graph.edge_count; edge++) {
     const shell_dep_edge_t *item = &graph.edges[edge];
+    if (!internal_relation(&graph, item))
+      continue;
     if (item->type != SHELL_EDGE_READ || item->target_fd != 0)
       continue;
     const shell_dep_doc_t *document = &graph.nodes[item->from].doc;
@@ -4565,6 +4627,8 @@ TEST(effective_descriptor_routing) {
   bool input_fd_zero = false;
   for (uint32_t edge = 0; edge < graph.edge_count; edge++) {
     const shell_dep_edge_t *item = &graph.edges[edge];
+    if (!internal_relation(&graph, item))
+      continue;
     if (item->type != SHELL_EDGE_READ)
       continue;
     input_fd_three = input_fd_three || item->target_fd == 3;
@@ -4578,6 +4642,8 @@ TEST(effective_descriptor_routing) {
   input_fd_zero = false;
   for (uint32_t edge = 0; edge < graph.edge_count; edge++) {
     const shell_dep_edge_t *item = &graph.edges[edge];
+    if (!internal_relation(&graph, item))
+      continue;
     if (item->type != SHELL_EDGE_READ)
       continue;
     input_fd_zero = input_fd_zero || item->target_fd == 0;
@@ -4591,6 +4657,8 @@ TEST(effective_descriptor_routing) {
   bool output_fd_one = false;
   for (uint32_t edge = 0; edge < graph.edge_count; edge++) {
     const shell_dep_edge_t *item = &graph.edges[edge];
+    if (!internal_relation(&graph, item))
+      continue;
     if (item->type != SHELL_EDGE_WRITE)
       continue;
     output_fd_zero = output_fd_zero || item->source_fd == 0;
@@ -4606,6 +4674,8 @@ TEST(effective_descriptor_routing) {
   bool pipe_target_one = false;
   for (uint32_t edge = 0; edge < graph.edge_count; edge++) {
     const shell_dep_edge_t *item = &graph.edges[edge];
+    if (!internal_relation(&graph, item))
+      continue;
     if (item->type != SHELL_EDGE_PIPE)
       continue;
     pipe_source_zero = pipe_source_zero || item->source_fd == 0;
@@ -4626,6 +4696,8 @@ TEST(effective_descriptor_routing) {
   bool out_fd_two = false;
   for (uint32_t edge = 0; edge < graph.edge_count; edge++) {
     const shell_dep_edge_t *item = &graph.edges[edge];
+    if (!internal_relation(&graph, item))
+      continue;
     if (item->type != SHELL_EDGE_WRITE)
       continue;
     out_fd_one = out_fd_one || item->source_fd == 1;
@@ -4639,6 +4711,8 @@ TEST(effective_descriptor_routing) {
   bool stderr_pipe = false;
   for (uint32_t edge = 0; edge < graph.edge_count; edge++) {
     const shell_dep_edge_t *item = &graph.edges[edge];
+    if (!internal_relation(&graph, item))
+      continue;
     stderr_pipe = stderr_pipe || (item->type == SHELL_EDGE_PIPE &&
                                   item->source_fd == 2 && item->target_fd == 0);
   }
@@ -4653,6 +4727,8 @@ TEST(effective_descriptor_routing) {
   bool group_pipe_alias = false;
   for (uint32_t edge = 0; edge < graph.edge_count; edge++) {
     const shell_dep_edge_t *item = &graph.edges[edge];
+    if (!internal_relation(&graph, item))
+      continue;
     group_file_stdin = group_file_stdin ||
                        (item->type == SHELL_EDGE_READ &&
                         item->to == (uint32_t)group && item->target_fd == 0);
@@ -4684,6 +4760,8 @@ TEST(sibling_brace_group_pipeline_endpoints) {
   bool trailing_append = false;
   for (uint32_t i = 0; i < graph.edge_count; i++) {
     const shell_dep_edge_t *edge = &graph.edges[i];
+    if (!internal_relation(&graph, edge))
+      continue;
     if (edge->type == SHELL_EDGE_PIPE) {
       pipe_groups = graph.nodes[edge->from].type == SHELL_NODE_GROUP &&
                     graph.nodes[edge->to].type == SHELL_NODE_GROUP &&
@@ -4720,34 +4798,30 @@ TEST(dynamic_command_expansion_cwd) {
       {"{ \"$tool\" >before; } & printf x >after", true},
       {"\"$tool\" <<<\"$(<before)\"; printf x >after", false},
   };
-  for (unsigned cd_as_cmd = 0; cd_as_cmd < 2; cd_as_cmd++) {
-    shell_dep_limits_t limits = SHELL_DEP_LIMITS_DEFAULT;
-    limits.cd_as_cmd = cd_as_cmd != 0;
-    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
-      shell_dep_graph_t graph;
-      ASSERT(shell_dep_graph_parse(cases[i].source, strlen(cases[i].source),
-                                   "/workspace", &limits,
-                                   &graph) == SHELL_DEP_OK);
-      for (uint32_t node = 0; node < graph.node_count; node++) {
-        const shell_dep_node_t *item = &graph.nodes[node];
-        if (item->type != SHELL_NODE_DOC || item->doc.kind != SHELL_DOC_FILE)
-          continue;
-        bool after =
-            item->doc.path_len == 5 && memcmp(item->doc.path, "after", 5) == 0;
-        char identity[64];
-        size_t written = 0;
-        bool absolute = false;
-        bool known = shell_dep_doc_file_identity_write(
-            &graph, &item->doc, identity, sizeof(identity), &written,
-            &absolute);
-        ASSERT(known == (!after || cases[i].later_known));
-        if (known)
-          ASSERT(absolute &&
-                 strcmp(identity,
-                        after ? "/workspace/after" : "/workspace/before") == 0);
-      }
-      ASSERT(shell_dep_graph_validate(&graph).valid);
+  shell_dep_limits_t limits = SHELL_DEP_LIMITS_DEFAULT;
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    shell_dep_graph_t graph;
+    ASSERT(shell_dep_graph_parse(cases[i].source, strlen(cases[i].source),
+                                 "/workspace", &limits,
+                                 &graph) == SHELL_DEP_OK);
+    for (uint32_t node = 0; node < graph.node_count; node++) {
+      const shell_dep_node_t *item = &graph.nodes[node];
+      if (item->type != SHELL_NODE_DOC || item->doc.kind != SHELL_DOC_FILE ||
+          (item->doc.flags & SHELL_DEP_DOC_FLAG_IMPLICIT))
+        continue;
+      bool after =
+          item->doc.path_len == 5 && memcmp(item->doc.path, "after", 5) == 0;
+      char identity[64];
+      size_t written = 0;
+      bool absolute = false;
+      bool known = shell_dep_doc_file_identity_write(
+          &graph, &item->doc, identity, sizeof(identity), &written, &absolute);
+      ASSERT(known == (!after || cases[i].later_known));
+      if (known)
+        ASSERT(absolute && strcmp(identity, after ? "/workspace/after"
+                                                  : "/workspace/before") == 0);
     }
+    ASSERT(shell_dep_graph_validate(&graph).valid);
   }
   pass_count++;
 }
@@ -4911,8 +4985,12 @@ TEST(static_file_identity_and_effective_group_pipe_routes) {
   uint32_t count = 0;
   for (uint32_t node = 0; node < graph.node_count; node++) {
     if (graph.nodes[node].type != SHELL_NODE_DOC ||
-        graph.nodes[node].doc.kind != SHELL_DOC_FILE || count == 3)
+        graph.nodes[node].doc.kind != SHELL_DOC_FILE ||
+        graph.nodes[node].doc.path_len != 5 ||
+        (memcmp(graph.nodes[node].doc.path, "\"out\"", 5) != 0 &&
+         memcmp(graph.nodes[node].doc.path, "./out", 5) != 0))
       continue;
+    ASSERT(count < 3);
     ASSERT(shell_dep_doc_file_identity_write(
         &graph, &graph.nodes[node].doc, identities[count],
         sizeof(identities[count]), &lengths[count], &absolute));
@@ -4928,8 +5006,13 @@ TEST(static_file_identity_and_effective_group_pipe_routes) {
   uint32_t origin_count = 0;
   for (uint32_t node = 0; node < graph.node_count; node++) {
     if (graph.nodes[node].type != SHELL_NODE_DOC ||
-        graph.nodes[node].doc.kind != SHELL_DOC_FILE || origin_count == 2)
+        graph.nodes[node].doc.kind != SHELL_DOC_FILE ||
+        !((graph.nodes[node].doc.path_len == 3 &&
+           memcmp(graph.nodes[node].doc.path, "out", 3) == 0) ||
+          (graph.nodes[node].doc.path_len == 5 &&
+           memcmp(graph.nodes[node].doc.path, "./out", 5) == 0)))
       continue;
+    ASSERT(origin_count < 2);
     ASSERT(shell_dep_doc_file_identity_write(
         &graph, &graph.nodes[node].doc, identities[origin_count],
         sizeof(identities[origin_count]), &lengths[origin_count],
@@ -5158,7 +5241,8 @@ TEST(exec_prepared_outcome_contract) {
            has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)writer,
                         (uint32_t)file, 1, SHELL_DEP_FD_NONE));
     for (uint32_t e = 0; e < graph.edge_count; e++)
-      ASSERT(graph.edges[e].type != SHELL_EDGE_WRITE ||
+      ASSERT((graph.edges[e].type != SHELL_EDGE_WRITE ||
+              !internal_relation(&graph, &graph.edges[e])) ||
              graph.edges[e].from != (uint32_t)writer ||
              graph.edges[e].source_fd != 1 ||
              graph.edges[e].to == (uint32_t)file);
@@ -5231,7 +5315,8 @@ TEST(brace_group_redirect_list_scope) {
   int group = find_group(&g, SHELL_GROUP_BRACE, UINT32_MAX);
   ASSERT(group >= 0);
   for (uint32_t i = 0; i < g.edge_count; i++)
-    if (g.edges[i].type == SHELL_EDGE_WRITE)
+    if ((g.edges[i].type == SHELL_EDGE_WRITE &&
+         internal_relation(&g, &g.edges[i])))
       ASSERT(g.edges[i].from == (uint32_t)group);
 }
 
@@ -5271,6 +5356,8 @@ TEST(compound_group_combined_and_named_redirects) {
   bool named_write = false;
   for (uint32_t i = 0; i < graph.edge_count; i++) {
     const shell_dep_edge_t *edge = &graph.edges[i];
+    if (!internal_relation(&graph, edge))
+      continue;
     named_read = named_read || (edge->type == SHELL_EDGE_FD_OPEN &&
                                 edge->target_fd == SHELL_DEP_FD_NAMED);
     named_write = named_write || (edge->type == SHELL_EDGE_FD_OPEN &&
@@ -5305,7 +5392,8 @@ TEST(compound_group_io_endpoints) {
   ASSERT(source >= 0 && group >= 0);
   ASSERT(has_edge(&g, SHELL_EDGE_PIPE, (uint32_t)source, (uint32_t)group));
   for (uint32_t i = 0; i < g.edge_count; i++) {
-    if (g.edges[i].type == SHELL_EDGE_WRITE)
+    if ((g.edges[i].type == SHELL_EDGE_WRITE &&
+         internal_relation(&g, &g.edges[i])))
       ASSERT(g.edges[i].from == (uint32_t)group);
   }
   ASSERT(shell_dep_graph_validate(&g).valid);
@@ -5328,6 +5416,8 @@ TEST(compound_group_leading_redirect_endpoints) {
   bool append = false;
   for (uint32_t i = 0; i < graph.edge_count; i++) {
     const shell_dep_edge_t *edge = &graph.edges[i];
+    if (!internal_relation(&graph, edge))
+      continue;
     if (edge->type == SHELL_EDGE_READ)
       read = edge->to == (uint32_t)group && edge->target_fd == 0;
     if (edge->type == SHELL_EDGE_WRITE)
@@ -5351,6 +5441,8 @@ TEST(compound_group_read_write_redirect) {
   bool forced_write = false;
   for (uint32_t i = 0; i < graph.edge_count; i++) {
     const shell_dep_edge_t *edge = &graph.edges[i];
+    if (!internal_relation(&graph, edge))
+      continue;
     read_write_read = read_write_read ||
                       (edge->type == SHELL_EDGE_READ &&
                        edge->to == (uint32_t)group && edge->target_fd == 0);
@@ -5386,6 +5478,8 @@ TEST(compound_group_descriptor_operations_preserve_known_routes) {
   bool append = false;
   for (uint32_t i = 0; i < graph.edge_count; i++) {
     const shell_dep_edge_t *edge = &graph.edges[i];
+    if (!internal_relation(&graph, edge))
+      continue;
     if (edge->type == SHELL_EDGE_READ)
       read = read || (edge->to == (uint32_t)group && edge->target_fd == 0);
     if (edge->type == SHELL_EDGE_READ)
@@ -5420,6 +5514,8 @@ TEST(compound_group_heredoc_descriptor_relations) {
   bool file_write = false;
   for (uint32_t i = 0; i < graph.edge_count; i++) {
     const shell_dep_edge_t *edge = &graph.edges[i];
+    if (!internal_relation(&graph, edge))
+      continue;
     heredoc_read =
         heredoc_read || (edge->type == SHELL_EDGE_READ &&
                          edge->to == (uint32_t)group && edge->target_fd == 0);
@@ -5470,7 +5566,8 @@ TEST(canonical_heredoc_delimiter_contract) {
           (current->doc.flags & SHELL_DEP_DOC_FLAG_HEREDOC_LITERAL) != 0;
     }
     for (uint32_t edge = 0; edge < graph.edge_count; edge++)
-      if (graph.edges[edge].type == SHELL_EDGE_READ) {
+      if ((graph.edges[edge].type == SHELL_EDGE_READ &&
+           internal_relation(&graph, &graph.edges[edge]))) {
         ASSERT(graph.edges[edge].to == (uint32_t)group);
         reads++;
       }
@@ -5501,6 +5598,8 @@ TEST(compound_group_leading_descriptor_operations) {
   bool inner_write = false;
   for (uint32_t i = 0; i < graph.edge_count; i++) {
     const shell_dep_edge_t *edge = &graph.edges[i];
+    if (!internal_relation(&graph, edge))
+      continue;
     if (edge->type != SHELL_EDGE_WRITE)
       continue;
     outer_write =
@@ -5524,12 +5623,16 @@ TEST(nested_compound_group_redirect_ownership) {
   ASSERT(inner >= 0);
   ASSERT(count_doc_kind(&graph, SHELL_DOC_FILE) == 3);
   ASSERT(count_edge_type(&graph, SHELL_EDGE_WRITE) == 2);
-  ASSERT(count_edge_type(&graph, SHELL_EDGE_APPEND) == 1);
+  /* The inner group's file open can fail onto the enclosing group's stderr
+   * append route, independently of the outer group's body exposure. */
+  ASSERT(count_edge_type(&graph, SHELL_EDGE_APPEND) == 2);
   bool outer_write = false;
   bool inner_write = false;
   bool outer_append = false;
   for (uint32_t i = 0; i < graph.edge_count; i++) {
     const shell_dep_edge_t *edge = &graph.edges[i];
+    if (!internal_relation(&graph, edge))
+      continue;
     if (edge->type == SHELL_EDGE_WRITE && edge->from == (uint32_t)outer &&
         edge->source_fd == 7)
       outer_write = true;
@@ -5570,6 +5673,8 @@ TEST(brace_group_aggregate_control_scope) {
     bool aggregate_edge = false;
     for (uint32_t e = 0; e < g.edge_count; e++) {
       const shell_dep_edge_t *edge = &g.edges[e];
+      if (!internal_relation(&g, edge))
+        continue;
       if (edge->type == cases[i].edge_type &&
           (cases[i].group_is_source ? edge->from == (uint32_t)group
                                     : edge->to == (uint32_t)group)) {
@@ -5594,6 +5699,8 @@ TEST(nested_brace_group_aggregate_control_scope) {
   bool outer_or = false;
   for (uint32_t i = 0; i < g.edge_count; i++) {
     const shell_dep_edge_t *edge = &g.edges[i];
+    if (!internal_relation(&g, edge))
+      continue;
     inner_and |= edge->type == SHELL_EDGE_AND && edge->from == (uint32_t)inner;
     outer_or |= edge->type == SHELL_EDGE_OR && edge->from == (uint32_t)outer;
   }
@@ -5623,35 +5730,32 @@ TEST(execution_stage_cwd_scope) {
       {"echo \"$( : | cd /tmp; probe >relative )\"", "/workspace"},
       {"echo \"$( cd /tmp; probe >relative )\"", "/tmp"},
   };
-  for (unsigned visible_cd = 0; visible_cd < 2; visible_cd++) {
-    shell_dep_limits_t limits = SHELL_DEP_LIMITS_DEFAULT;
-    limits.cd_as_cmd = visible_cd != 0;
-    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
-      shell_dep_graph_t graph;
-      ASSERT(shell_dep_graph_parse(cases[i].source, strlen(cases[i].source),
-                                   "/workspace", &limits,
-                                   &graph) == SHELL_DEP_OK);
-      int probe = find_cmd_tokens(&graph, "probe", NULL);
-      int file = find_file_doc(&graph, "relative");
-      ASSERT(probe >= 0 && file >= 0);
-      ASSERT(graph.nodes[probe].cmd.cwd_known == (cases[i].cwd != NULL));
-      char identity[512];
-      size_t length = 0;
-      bool absolute = false;
-      bool known = shell_dep_doc_file_identity_write(
-          &graph, &graph.nodes[file].doc, identity, sizeof(identity), &length,
-          &absolute);
-      ASSERT(known == (cases[i].cwd != NULL));
-      if (known) {
-        ASSERT_STR_EQ(get_cwd_str(&graph, graph.nodes[probe].cmd.cwd_offset),
-                      cases[i].cwd);
-        char expected[512];
-        snprintf(expected, sizeof(expected), "%s/relative", cases[i].cwd);
-        ASSERT(absolute && length == strlen(expected));
-        ASSERT_STR_EQ(identity, expected);
-      }
-      ASSERT(shell_dep_graph_validate(&graph).valid);
+  shell_dep_limits_t limits = SHELL_DEP_LIMITS_DEFAULT;
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    shell_dep_graph_t graph;
+    ASSERT(shell_dep_graph_parse(cases[i].source, strlen(cases[i].source),
+                                 "/workspace", &limits,
+                                 &graph) == SHELL_DEP_OK);
+    int probe = find_cmd_tokens(&graph, "probe", NULL);
+    int file = find_file_doc(&graph, "relative");
+    ASSERT(probe >= 0 && file >= 0);
+    ASSERT(graph.nodes[probe].cmd.cwd_known == (cases[i].cwd != NULL));
+    char identity[512];
+    size_t length = 0;
+    bool absolute = false;
+    bool known = shell_dep_doc_file_identity_write(
+        &graph, &graph.nodes[file].doc, identity, sizeof(identity), &length,
+        &absolute);
+    ASSERT(known == (cases[i].cwd != NULL));
+    if (known) {
+      ASSERT_STR_EQ(get_cwd_str(&graph, graph.nodes[probe].cmd.cwd_offset),
+                    cases[i].cwd);
+      char expected[512];
+      snprintf(expected, sizeof(expected), "%s/relative", cases[i].cwd);
+      ASSERT(absolute && length == strlen(expected));
+      ASSERT_STR_EQ(identity, expected);
     }
+    ASSERT(shell_dep_graph_validate(&graph).valid);
   }
   pass_count++;
 }
@@ -5669,36 +5773,32 @@ TEST(file_command_substitution_cwd_context) {
       {"cd \"$value\"; echo \"$(<relative)\"", NULL},
       {"time ( cd /tmp; echo \"$(<relative)\" )", "/tmp/relative"},
   };
-  for (unsigned visible_cd = 0; visible_cd < 2; visible_cd++) {
-    shell_dep_limits_t limits = SHELL_DEP_LIMITS_DEFAULT;
-    limits.cd_as_cmd = visible_cd != 0;
-    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
-      shell_dep_graph_t graph;
-      ASSERT(shell_dep_graph_parse(cases[i].source, strlen(cases[i].source),
-                                   "/workspace", &limits,
-                                   &graph) == SHELL_DEP_OK);
-      int file = find_file_doc(&graph, "relative");
-      ASSERT(file >= 0);
-      char identity[512];
-      size_t length = 0;
-      bool absolute = false;
-      bool known = shell_dep_doc_file_identity_write(
-          &graph, &graph.nodes[file].doc, identity, sizeof(identity), &length,
-          &absolute);
-      ASSERT(known == (cases[i].identity != NULL));
-      if (known) {
-        ASSERT(absolute && length == strlen(cases[i].identity));
-        ASSERT_STR_EQ(identity, cases[i].identity);
-      }
-      ASSERT(shell_dep_graph_validate(&graph).valid);
+  shell_dep_limits_t limits = SHELL_DEP_LIMITS_DEFAULT;
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    shell_dep_graph_t graph;
+    ASSERT(shell_dep_graph_parse(cases[i].source, strlen(cases[i].source),
+                                 "/workspace", &limits,
+                                 &graph) == SHELL_DEP_OK);
+    int file = find_file_doc(&graph, "relative");
+    ASSERT(file >= 0);
+    char identity[512];
+    size_t length = 0;
+    bool absolute = false;
+    bool known = shell_dep_doc_file_identity_write(
+        &graph, &graph.nodes[file].doc, identity, sizeof(identity), &length,
+        &absolute);
+    ASSERT(known == (cases[i].identity != NULL));
+    if (known) {
+      ASSERT(absolute && length == strlen(cases[i].identity));
+      ASSERT_STR_EQ(identity, cases[i].identity);
     }
+    ASSERT(shell_dep_graph_validate(&graph).valid);
   }
   pass_count++;
 }
 
 TEST(brace_group_cwd_scope) {
   shell_dep_limits_t limits = SHELL_DEP_LIMITS_DEFAULT;
-  limits.cd_as_cmd = true;
   shell_dep_graph_t g = {0};
   const char *brace = "{ cd /tmp; pwd; }; pwd";
   ASSERT(shell_dep_graph_parse(brace, strlen(brace), "/home/user", &limits,
@@ -5857,6 +5957,8 @@ TEST(adjacent_substitution_consumers) {
     unsigned producers = 0;
     for (uint32_t edge = 0; edge < graph.edge_count; edge++) {
       const shell_dep_edge_t *flow = &graph.edges[edge];
+      if (!internal_relation(&graph, flow))
+        continue;
       if (flow->type != SHELL_EDGE_SUBST)
         continue;
       ASSERT(flow->source_fd == 1);
@@ -6409,6 +6511,8 @@ TEST(direct_component_topology_contract) {
       bool target = false;
       for (uint32_t j = 0; j < graph.edge_count; j++) {
         const shell_dep_edge_t *edge = &graph.edges[j];
+        if (!internal_relation(&graph, edge))
+          continue;
         if (edge->type != SHELL_EDGE_TIME)
           continue;
         ASSERT(graph.nodes[edge->from].type == SHELL_NODE_TIME);
@@ -6431,6 +6535,8 @@ TEST(direct_component_topology_contract) {
   bool inner = false, outer = false;
   for (uint32_t i = 0; i < graph.edge_count; i++) {
     const shell_dep_edge_t *edge = &graph.edges[i];
+    if (!internal_relation(&graph, edge))
+      continue;
     if (edge->type != SHELL_EDGE_SUBST)
       continue;
     inner |= edge->from == (uint32_t)id && edge->to == (uint32_t)printf_command;
@@ -6450,6 +6556,8 @@ TEST(dynamic_substitution_io_topology) {
   bool direct = false;
   for (uint32_t i = 0; i < graph.edge_count; i++) {
     const shell_dep_edge_t *edge = &graph.edges[i];
+    if (!internal_relation(&graph, edge))
+      continue;
     direct = direct || (edge->type == SHELL_EDGE_SUBST &&
                         edge->from == (uint32_t)producer &&
                         edge->to == (uint32_t)outer && edge->source_fd == 1);
@@ -6464,6 +6572,8 @@ TEST(dynamic_substitution_io_topology) {
   bool file_substitution = false;
   for (uint32_t i = 0; i < graph.edge_count; i++) {
     const shell_dep_edge_t *edge = &graph.edges[i];
+    if (!internal_relation(&graph, edge))
+      continue;
     if (edge->type != SHELL_EDGE_SUBST || edge->to != (uint32_t)outer ||
         edge->source_fd != SHELL_DEP_FD_NONE ||
         edge->target_fd != SHELL_DEP_FD_NONE ||
@@ -6486,6 +6596,8 @@ TEST(dynamic_substitution_io_topology) {
   bool group_to_outer = false;
   for (uint32_t i = 0; i < graph.edge_count; i++) {
     const shell_dep_edge_t *edge = &graph.edges[i];
+    if (!internal_relation(&graph, edge))
+      continue;
     grouped_pipe =
         grouped_pipe || (edge->type == SHELL_EDGE_PIPE &&
                          graph.nodes[edge->from].type == SHELL_NODE_GROUP &&
@@ -6506,6 +6618,8 @@ TEST(dynamic_substitution_io_topology) {
   bool collector_substitution = false;
   for (uint32_t i = 0; i < graph.edge_count; i++) {
     const shell_dep_edge_t *edge = &graph.edges[i];
+    if (!internal_relation(&graph, edge))
+      continue;
     if (edge->type == SHELL_EDGE_WRITE && edge->to == (uint32_t)collector &&
         edge->source_fd == 1)
       collector_writes++;
@@ -6531,6 +6645,8 @@ TEST(dynamic_substitution_io_topology) {
   bool sink_substitution = false;
   for (uint32_t i = 0; i < graph.edge_count; i++) {
     const shell_dep_edge_t *edge = &graph.edges[i];
+    if (!internal_relation(&graph, edge))
+      continue;
     source_write =
         source_write ||
         (edge->type == SHELL_EDGE_WRITE && edge->from == (uint32_t)outer &&
@@ -6579,6 +6695,8 @@ TEST(file_command_substitution_intersections) {
   bool saw_two = false;
   for (uint32_t i = 0; i < graph.edge_count; i++) {
     const shell_dep_edge_t *edge = &graph.edges[i];
+    if (!internal_relation(&graph, edge))
+      continue;
     if (edge->type != SHELL_EDGE_SUBST || edge->to != (uint32_t)outer)
       continue;
     ASSERT(edge->source_fd == SHELL_DEP_FD_NONE &&
@@ -6606,6 +6724,8 @@ TEST(file_command_substitution_intersections) {
   bool group_file_substitution = false;
   for (uint32_t i = 0; i < graph.edge_count; i++) {
     const shell_dep_edge_t *edge = &graph.edges[i];
+    if (!internal_relation(&graph, edge))
+      continue;
     group_file_substitution =
         group_file_substitution ||
         (edge->type == SHELL_EDGE_SUBST && edge->to == (uint32_t)grouped &&
@@ -6628,6 +6748,8 @@ TEST(file_command_substitution_intersections) {
   bool group_output_substitution = false;
   for (uint32_t i = 0; i < graph.edge_count; i++) {
     const shell_dep_edge_t *edge = &graph.edges[i];
+    if (!internal_relation(&graph, edge))
+      continue;
     nested_file_substitution =
         nested_file_substitution ||
         (edge->type == SHELL_EDGE_SUBST && edge->to == (uint32_t)nested &&
@@ -6652,6 +6774,8 @@ TEST(file_command_substitution_intersections) {
   bool command_substitution = false;
   for (uint32_t i = 0; i < graph.edge_count; i++) {
     const shell_dep_edge_t *edge = &graph.edges[i];
+    if (!internal_relation(&graph, edge))
+      continue;
     direct_file =
         direct_file ||
         (edge->type == SHELL_EDGE_SUBST &&
@@ -6675,6 +6799,8 @@ TEST(file_command_substitution_intersections) {
   bool spaced_file_substitution = false;
   for (uint32_t i = 0; i < graph.edge_count; i++) {
     const shell_dep_edge_t *edge = &graph.edges[i];
+    if (!internal_relation(&graph, edge))
+      continue;
     spaced_file_substitution =
         spaced_file_substitution ||
         (edge->type == SHELL_EDGE_SUBST && edge->to == (uint32_t)outer &&
@@ -6696,6 +6822,8 @@ TEST(file_command_substitution_intersections) {
   bool ordinary_substitution = false;
   for (uint32_t i = 0; i < graph.edge_count; i++) {
     const shell_dep_edge_t *edge = &graph.edges[i];
+    if (!internal_relation(&graph, edge))
+      continue;
     ordinary_read =
         ordinary_read || (edge->type == SHELL_EDGE_READ &&
                           graph.nodes[edge->from].type == SHELL_NODE_DOC &&
@@ -6737,6 +6865,8 @@ TEST(file_command_substitution_dynamic_operands) {
   bool process_file_content = false;
   for (uint32_t edge = 0; edge < graph.edge_count; edge++) {
     const shell_dep_edge_t *current = &graph.edges[edge];
+    if (!internal_relation(&graph, current))
+      continue;
     process_file_content =
         process_file_content ||
         (current->type == SHELL_EDGE_SUBST &&
@@ -6767,6 +6897,8 @@ TEST(file_command_substitution_dynamic_operands) {
   bool selected_file_content = false;
   for (uint32_t edge = 0; edge < graph.edge_count; edge++) {
     const shell_dep_edge_t *current = &graph.edges[edge];
+    if (!internal_relation(&graph, current))
+      continue;
     dynamic_name =
         dynamic_name ||
         (current->type == SHELL_EDGE_SUBST &&
@@ -6820,7 +6952,8 @@ TEST(io_number_boundaries) {
   ASSERT(command >= 0);
   bool max_read = false;
   for (uint32_t edge = 0; edge < graph.edge_count; edge++)
-    max_read = max_read || (graph.edges[edge].type == SHELL_EDGE_READ &&
+    max_read = max_read || ((graph.edges[edge].type == SHELL_EDGE_READ &&
+                             internal_relation(&graph, &graph.edges[edge])) &&
                             graph.edges[edge].to == (uint32_t)command &&
                             graph.edges[edge].target_fd == SHELL_DEP_FD_MAX);
   ASSERT(max_read && graph.nodes[command].cmd.token_count == 1 &&
@@ -6834,9 +6967,11 @@ TEST(io_number_boundaries) {
                 strlen("2147483648")) == 0);
   bool default_read = false;
   for (uint32_t edge = 0; edge < graph.edge_count; edge++)
-    default_read = default_read || (graph.edges[edge].type == SHELL_EDGE_READ &&
-                                    graph.edges[edge].to == (uint32_t)command &&
-                                    graph.edges[edge].target_fd == 0);
+    default_read =
+        default_read || ((graph.edges[edge].type == SHELL_EDGE_READ &&
+                          internal_relation(&graph, &graph.edges[edge])) &&
+                         graph.edges[edge].to == (uint32_t)command &&
+                         graph.edges[edge].target_fd == 0);
   ASSERT(default_read && shell_dep_graph_validate(&graph).valid);
 
   ASSERT(parse("cat 2147483647<<<value", &graph) == SHELL_DEP_OK);
@@ -6844,7 +6979,8 @@ TEST(io_number_boundaries) {
   bool max_herestring = false;
   for (uint32_t edge = 0; edge < graph.edge_count; edge++)
     max_herestring =
-        max_herestring || (graph.edges[edge].type == SHELL_EDGE_READ &&
+        max_herestring || ((graph.edges[edge].type == SHELL_EDGE_READ &&
+                            internal_relation(&graph, &graph.edges[edge])) &&
                            graph.edges[edge].to == (uint32_t)command &&
                            graph.edges[edge].target_fd == SHELL_DEP_FD_MAX);
   ASSERT(command >= 0 && max_herestring &&
@@ -6855,10 +6991,11 @@ TEST(io_number_boundaries) {
   command = find_nth_cmd(&graph, 0);
   bool default_herestring = false;
   for (uint32_t edge = 0; edge < graph.edge_count; edge++)
-    default_herestring =
-        default_herestring || (graph.edges[edge].type == SHELL_EDGE_READ &&
-                               graph.edges[edge].to == (uint32_t)command &&
-                               graph.edges[edge].target_fd == 0);
+    default_herestring = default_herestring ||
+                         ((graph.edges[edge].type == SHELL_EDGE_READ &&
+                           internal_relation(&graph, &graph.edges[edge])) &&
+                          graph.edges[edge].to == (uint32_t)command &&
+                          graph.edges[edge].target_fd == 0);
   ASSERT(command >= 0 && default_herestring &&
          graph.nodes[command].cmd.token_count == 2 &&
          shell_dep_graph_validate(&graph).valid);
@@ -6923,7 +7060,8 @@ TEST(inline_document_matrix) {
     }
     ASSERT(found_document);
     for (uint32_t j = 0; j < g.edge_count; j++) {
-      if (g.edges[j].type != SHELL_EDGE_READ)
+      if ((g.edges[j].type != SHELL_EDGE_READ ||
+           !internal_relation(&g, &g.edges[j])))
         continue;
       ASSERT(g.nodes[g.edges[j].from].type == SHELL_NODE_DOC);
       ASSERT(g.nodes[g.edges[j].to].type == SHELL_NODE_CMD);
@@ -7108,6 +7246,8 @@ TEST(expandable_heredoc_substitution_matrix) {
   bool dynamic_document = false;
   for (uint32_t edge = 0; edge < graph.edge_count; edge++) {
     const shell_dep_edge_t *item = &graph.edges[edge];
+    if (!internal_relation(&graph, item))
+      continue;
     dynamic_document =
         dynamic_document ||
         (item->type == SHELL_EDGE_SUBST && item->from == (uint32_t)producer &&
@@ -7174,7 +7314,8 @@ TEST(expandable_heredoc_substitution_matrix) {
   bool heredoc_subst = false;
   for (uint32_t edge = 0; edge < graph.edge_count; edge++) {
     heredoc_read =
-        heredoc_read || (graph.edges[edge].type == SHELL_EDGE_READ &&
+        heredoc_read || ((graph.edges[edge].type == SHELL_EDGE_READ &&
+                          internal_relation(&graph, &graph.edges[edge])) &&
                          graph.edges[edge].from == (uint32_t)document);
     heredoc_subst =
         heredoc_subst || (graph.edges[edge].type == SHELL_EDGE_SUBST &&
@@ -7260,6 +7401,8 @@ TEST(expandable_heredoc_substitution_matrix) {
   bool file_to_document = false;
   for (uint32_t edge = 0; edge < graph.edge_count; edge++) {
     const shell_dep_edge_t *item = &graph.edges[edge];
+    if (!internal_relation(&graph, item))
+      continue;
     file_to_document = file_to_document ||
                        (item->type == SHELL_EDGE_SUBST &&
                         graph.nodes[item->from].type == SHELL_NODE_DOC &&
@@ -7327,6 +7470,8 @@ TEST(heredoc_substitution_cross_product_matrix) {
   ASSERT(document >= 0 && collector >= 0);
   for (uint32_t edge = 0; edge < graph.edge_count; edge++) {
     const shell_dep_edge_t *item = &graph.edges[edge];
+    if (!internal_relation(&graph, item))
+      continue;
     if (item->type == SHELL_EDGE_WRITE && item->to == (uint32_t)collector &&
         item->source_fd == 1)
       collector_writes++;
@@ -7370,6 +7515,8 @@ TEST(heredoc_substitution_cross_product_matrix) {
   bool document_output = false;
   for (uint32_t edge = 0; edge < graph.edge_count; edge++) {
     const shell_dep_edge_t *item = &graph.edges[edge];
+    if (!internal_relation(&graph, item))
+      continue;
     process_input =
         process_input ||
         (item->type == SHELL_EDGE_SUBST && item->from == (uint32_t)producer &&
@@ -7391,6 +7538,8 @@ TEST(heredoc_substitution_cross_product_matrix) {
   bool output_document = false;
   for (uint32_t edge = 0; edge < graph.edge_count; edge++) {
     const shell_dep_edge_t *item = &graph.edges[edge];
+    if (!internal_relation(&graph, item))
+      continue;
     stderr_collector =
         stderr_collector ||
         (item->type == SHELL_EDGE_WRITE && item->source_fd == 2 &&
@@ -7450,6 +7599,8 @@ TEST(group_heredoc_descriptor_substitution_routing) {
     ASSERT(group >= 0 && document >= 0);
     for (uint32_t edge = 0; edge < graph.edge_count; edge++) {
       const shell_dep_edge_t *item = &graph.edges[edge];
+      if (!internal_relation(&graph, item))
+        continue;
       dynamic_edges +=
           item->type == SHELL_EDGE_SUBST && item->to == (uint32_t)document;
       read_at_fd_four =
@@ -7501,6 +7652,8 @@ TEST(brace_group_substitution_boundary_matrix) {
   bool group_pipe = false;
   for (uint32_t edge = 0; edge < graph.edge_count; edge++) {
     const shell_dep_edge_t *item = &graph.edges[edge];
+    if (!internal_relation(&graph, item))
+      continue;
     direct_word_flow =
         direct_word_flow ||
         (item->type == SHELL_EDGE_SUBST && item->from == (uint32_t)producer &&
@@ -7523,6 +7676,8 @@ TEST(brace_group_substitution_boundary_matrix) {
   bool process_input = false;
   for (uint32_t edge = 0; edge < graph.edge_count; edge++) {
     const shell_dep_edge_t *item = &graph.edges[edge];
+    if (!internal_relation(&graph, item))
+      continue;
     process_input =
         process_input ||
         (item->type == SHELL_EDGE_SUBST && item->from == (uint32_t)producer &&
@@ -7541,6 +7696,8 @@ TEST(brace_group_substitution_boundary_matrix) {
   bool collector_input = false;
   for (uint32_t edge = 0; edge < graph.edge_count; edge++) {
     const shell_dep_edge_t *item = &graph.edges[edge];
+    if (!internal_relation(&graph, item))
+      continue;
     fd_three_write = fd_three_write ||
                      (item->type == SHELL_EDGE_WRITE && item->source_fd == 3 &&
                       graph.nodes[item->to].type == SHELL_NODE_ENDPOINT);
@@ -7885,6 +8042,8 @@ TEST(process_substitution_stream_topology) {
   bool nested_group_stream = false;
   for (uint32_t edge = 0; edge < graph.edge_count; edge++) {
     const shell_dep_edge_t *current = &graph.edges[edge];
+    if (!internal_relation(&graph, current))
+      continue;
     if (current->type != SHELL_EDGE_SUBST || current->source_fd != 1 ||
         current->target_fd != SHELL_DEP_FD_NONE ||
         graph.nodes[current->from].type != SHELL_NODE_GROUP)
@@ -7947,6 +8106,8 @@ TEST(process_substitution_stream_topology) {
   bool stderr_to_endpoint = false;
   for (uint32_t i = 0; i < graph.edge_count; i++) {
     const shell_dep_edge_t *edge = &graph.edges[i];
+    if (!internal_relation(&graph, edge))
+      continue;
     if (edge->type != SHELL_EDGE_WRITE ||
         graph.nodes[edge->to].type != SHELL_NODE_ENDPOINT)
       continue;
@@ -7982,8 +8143,9 @@ TEST(process_substitution_stream_topology) {
                       (uint32_t)endpoint, 1, SHELL_DEP_FD_NONE) &&
          has_edge_fds(&graph, SHELL_EDGE_APPEND, (uint32_t)writer,
                       (uint32_t)err_file, 2, SHELL_DEP_FD_NONE) &&
-         !has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)writer,
-                       (uint32_t)endpoint, 2, SHELL_DEP_FD_NONE) &&
+         /* The later stderr open can fail into the existing substitution. */
+         has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)writer,
+                      (uint32_t)endpoint, 2, SHELL_DEP_FD_NONE) &&
          shell_dep_graph_validate(&graph).valid);
 
   ASSERT(parse("cat log >& >(sh) 2>&-", &graph) == SHELL_DEP_OK);
@@ -8004,17 +8166,21 @@ TEST(process_substitution_stream_topology) {
   bool stale_collector_route = false;
   for (uint32_t i = 0; i < graph.edge_count; i++) {
     const shell_dep_edge_t *edge = &graph.edges[i];
+    if (!internal_relation(&graph, edge))
+      continue;
     stale_collector_route =
         stale_collector_route ||
         (edge->type == SHELL_EDGE_WRITE && edge->from == (uint32_t)writer &&
          graph.nodes[edge->to].type == SHELL_NODE_ENDPOINT &&
-         (edge->source_fd == 1 || edge->source_fd == 2));
+         edge->source_fd == 1);
   }
   ASSERT(writer >= 0 && out_file >= 0 &&
          has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)writer,
                       (uint32_t)out_file, 1, SHELL_DEP_FD_NONE) &&
          has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)writer,
                       (uint32_t)out_file, 2, SHELL_DEP_FD_NONE) &&
+         /* stdout is replaced; setup failure still emits stderr to the
+          * existing collector before reaching the later 2>&1. */
          !stale_collector_route && shell_dep_graph_validate(&graph).valid);
 
   ASSERT(parse("{ cat log; } &> >(sh) >out", &graph) == SHELL_DEP_OK);
@@ -8176,6 +8342,8 @@ TEST(process_substitution_stream_topology) {
   bool final_file_write = false;
   for (uint32_t edge = 0; edge < graph.edge_count; edge++) {
     const shell_dep_edge_t *current = &graph.edges[edge];
+    if (!internal_relation(&graph, current))
+      continue;
     final_file_write =
         final_file_write ||
         (current->type == SHELL_EDGE_WRITE &&
@@ -8195,6 +8363,8 @@ TEST(process_substitution_stream_topology) {
   final_file_write = false;
   for (uint32_t edge = 0; edge < graph.edge_count; edge++) {
     const shell_dep_edge_t *current = &graph.edges[edge];
+    if (!internal_relation(&graph, current))
+      continue;
     final_file_write =
         final_file_write ||
         (current->type == SHELL_EDGE_WRITE &&
@@ -8227,6 +8397,8 @@ TEST(process_substitution_stream_topology) {
   final_file_write = false;
   for (uint32_t edge = 0; edge < graph.edge_count; edge++) {
     const shell_dep_edge_t *current = &graph.edges[edge];
+    if (!internal_relation(&graph, current))
+      continue;
     final_file_write =
         final_file_write ||
         (current->type == SHELL_EDGE_WRITE &&
@@ -8537,6 +8709,8 @@ TEST(empty_timing_stream_roles) {
     ASSERT(placeholder >= 0 && graph.nodes[placeholder].cmd.token_count == 0);
     for (uint32_t edge = 0; edge < graph.edge_count; edge++) {
       const shell_dep_edge_t *item = &graph.edges[edge];
+      if (!internal_relation(&graph, item))
+        continue;
       if (item->from != (uint32_t)placeholder &&
           item->to != (uint32_t)placeholder)
         continue;
@@ -8569,7 +8743,8 @@ TEST(empty_timing_stream_roles) {
   bool redirect_flow = false;
   for (uint32_t edge = 0; edge < graph.edge_count; edge++)
     redirect_flow =
-        redirect_flow || (graph.edges[edge].type == SHELL_EDGE_WRITE &&
+        redirect_flow || ((graph.edges[edge].type == SHELL_EDGE_WRITE &&
+                           internal_relation(&graph, &graph.edges[edge])) &&
                           graph.edges[edge].to == (uint32_t)document);
   ASSERT(redirect_flow && shell_dep_graph_validate(&graph).valid);
   pass_count++;
@@ -8619,6 +8794,8 @@ TEST(conditional_ordinary_stream_routes) {
      */
     for (uint32_t edge = 0; edge < graph.edge_count; edge++) {
       const shell_dep_edge_t *item = &graph.edges[edge];
+      if (!internal_relation(&graph, item))
+        continue;
       if (item->type != SHELL_EDGE_READ && item->type != SHELL_EDGE_WRITE &&
           item->type != SHELL_EDGE_APPEND && item->type != SHELL_EDGE_SUBST)
         continue;
@@ -8694,7 +8871,8 @@ TEST(substitution_capture_resource_identity) {
                         SHELL_DEP_FD_NONE) == cases[i].file_write);
     for (uint32_t edge = 0; edge < graph.edge_count; edge++)
       if (graph.edges[edge].type == SHELL_EDGE_SUBST ||
-          graph.edges[edge].type == SHELL_EDGE_WRITE)
+          (graph.edges[edge].type == SHELL_EDGE_WRITE &&
+           internal_relation(&graph, &graph.edges[edge])))
         ASSERT(!cmd_token_eq(&graph.nodes[graph.edges[edge].from], 0, "exec"));
     ASSERT(shell_dep_graph_validate(&graph).valid);
   }
@@ -8772,6 +8950,8 @@ TEST(forward_connector_and_deferred_snapshot_contract) {
   unsigned old_reads = 0, new_reads = 0;
   for (uint32_t e = 0; e < graph.edge_count; e++) {
     const shell_dep_edge_t *edge = &graph.edges[e];
+    if (!internal_relation(&graph, edge))
+      continue;
     if (edge->type != SHELL_EDGE_READ || edge->target_fd != 0 ||
         !cmd_token_eq(&graph.nodes[edge->to], 0, "cat"))
       continue;
@@ -8839,7 +9019,8 @@ TEST(descriptor_snapshot_source_scaling) {
     shell_dep_graph_t graph;
     shell_dep_error_t status = parse(source, &graph);
     size_t work = shellsplit_test_source_scan_work();
-    bool valid = status == SHELL_DEP_OK && graph.node_count == 2 * count &&
+    bool valid = status == SHELL_DEP_OK &&
+                 count_internal_nodes(&graph) == 2 * count &&
                  shell_dep_graph_validate(&graph).valid && work <= 128 * used &&
                  (previous == 0 || work <= previous * 3);
     if (!valid)
@@ -8911,6 +9092,8 @@ TEST(unconnected_process_redirect_replaces_descriptor) {
     bool installed = false;
     for (uint32_t edge = 0; edge < graph.edge_count; edge++) {
       const shell_dep_edge_t *item = &graph.edges[edge];
+      if (!internal_relation(&graph, item))
+        continue;
       uint32_t endpoint = cases[i].input ? item->from : item->to;
       bool route = cases[i].input ? item->type == SHELL_EDGE_SUBST &&
                                         item->to == (uint32_t)owner &&
@@ -9055,6 +9238,8 @@ TEST(process_pipe_descriptor_installation) {
     /* A shared pipe is not a direct transfer between same-direction peers. */
     for (uint32_t edge = 0; edge < graph.edge_count; edge++) {
       const shell_dep_edge_t *item = &graph.edges[edge];
+      if (!internal_relation(&graph, item))
+        continue;
       if (item->type == SHELL_EDGE_SUBST && item->to == (uint32_t)owner &&
           item->target_fd == cases[i].fd)
         ASSERT(item->from == (uint32_t)pipe);
@@ -9081,7 +9266,7 @@ TEST(process_pipe_descriptor_installation) {
   pass_count++;
 }
 
-TEST(collapsed_group_execution_endpoints) {
+TEST(cd_group_execution_endpoints) {
   static const struct {
     const char *connector;
     shell_dep_edge_type_t type;
@@ -9108,7 +9293,7 @@ TEST(collapsed_group_execution_endpoints) {
           ASSERT(group >= 0 && cat >= 0);
           ASSERT(has_edge(&graph, connectors[c].type, (uint32_t)group,
                           (uint32_t)cat));
-          ASSERT(find_cmd_tokens(&graph, "cd", NULL) < 0);
+          ASSERT(find_cmd_tokens(&graph, "cd", NULL) >= 0);
           if (p != 0) {
             int before =
                 find_cmd_tokens(&graph, p == 1 ? "false" : "true", NULL);
@@ -9216,7 +9401,8 @@ TEST(compound_control_status_stream) {
     int file = find_file_doc(&graph, "/dev/null");
     int cat = -1;
     for (uint32_t edge = 0; edge < graph.edge_count; edge++)
-      if (graph.edges[edge].type == SHELL_EDGE_READ &&
+      if ((graph.edges[edge].type == SHELL_EDGE_READ &&
+           internal_relation(&graph, &graph.edges[edge])) &&
           graph.edges[edge].from == (uint32_t)file &&
           graph.edges[edge].target_fd == 0)
         cat = (int)graph.edges[edge].to;
@@ -9383,7 +9569,9 @@ TEST(redirect_checkpoint_history_and_scaling) {
 TEST(group_redirect_ownership_source_scaling) {
 #ifdef SHELLSPLIT_TEST_SOURCE_SCANS
   size_t previous = 0;
-  for (unsigned count = 4; count <= 32; count *= 2) {
+  /* Four internal nodes per row already fill the node limit at 32; include
+   * inherited boundary resources in the same documented capacity budget. */
+  for (unsigned count = 4; count <= 16; count *= 2) {
     size_t capacity = 1100 * count + 1;
     char *source = malloc(capacity);
     ASSERT(source != NULL);
@@ -9470,7 +9658,7 @@ TEST(descriptor_metadata_scaling) {
   } families[] = {
       {"", "cat < <(printf x); ", "", SHELLSPLIT_TEST_WORK_PROCESS_ROUTES, 32},
       {"", "cat < <(printf ignored >/dev/null); ", "",
-       SHELLSPLIT_TEST_WORK_PROCESS_ROUTES, 32},
+       SHELLSPLIT_TEST_WORK_PROCESS_ROUTES, 16},
       {"", "cat < <(printf x) < <(printf ignored >/dev/null); ", "",
        SHELLSPLIT_TEST_WORK_PROCESS_ROUTES, 16},
       {"", "time true; ", "", SHELLSPLIT_TEST_WORK_TIME_BOUNDARIES, 32},
@@ -9803,6 +9991,8 @@ TEST(inherited_route_ownership_scaling) {
         uint32_t writes = 0;
         for (uint32_t e = 0; e < graph.edge_count; e++) {
           const shell_dep_edge_t *edge = &graph.edges[e];
+          if (!internal_relation(&graph, edge))
+            continue;
           if (edge->type == SHELL_EDGE_WRITE && edge->to == (uint32_t)report &&
               edge->source_fd == 2)
             writes++;
@@ -9907,8 +10097,9 @@ TEST(indexed_named_route_mutations) {
       printf("\n    indexed mutations: count=%u delta=%zu", count, delta);
     /* Each absent static target takes one indexed lookup in each outcome
      * journal. It must not visit every inherited descriptor binding. */
-    /* IFS target recognition adds a constant-size logical-name comparison. */
-    ASSERT(delta <= 112 * count &&
+    /* IFS target recognition and the boundary key/emission projections add
+     * constant-many indexed lookups, not a scan of inherited bindings. */
+    ASSERT(delta <= 120 * count &&
            (!previous_delta || delta <= 3 * previous_delta));
     previous_delta = delta;
   }
@@ -9972,7 +10163,8 @@ TEST(indexed_route_snapshot_versions) {
              has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)command,
                           (uint32_t)document, 1, SHELL_DEP_FD_NONE));
       for (uint32_t edge = 0; edge < graph.edge_count; edge++)
-        ASSERT(graph.edges[edge].type != SHELL_EDGE_WRITE ||
+        ASSERT((graph.edges[edge].type != SHELL_EDGE_WRITE ||
+                !internal_relation(&graph, &graph.edges[edge])) ||
                graph.edges[edge].from != (uint32_t)command ||
                graph.edges[edge].source_fd != 1 ||
                graph.edges[edge].to == (uint32_t)document);
@@ -10295,6 +10487,8 @@ TEST(substitution_pipeline_snapshot_order) {
   uint32_t pipe_readers = 0, file_readers = 0;
   for (uint32_t edge = 0; edge < graph.edge_count; edge++) {
     const shell_dep_edge_t *item = &graph.edges[edge];
+    if (!internal_relation(&graph, item))
+      continue;
     if (!cmd_token_eq(&graph.nodes[item->to], 0, "cat"))
       continue;
     pipe_readers +=
@@ -10425,9 +10619,11 @@ TEST(ordinary_stream_route_journal_boundaries) {
                                        input ? NULL : "value");
         uint32_t flows = 0;
         for (uint32_t edge = 0; edge < graph.edge_count; edge++)
-          flows += input ? (graph.edges[edge].type == SHELL_EDGE_READ &&
+          flows += input ? ((graph.edges[edge].type == SHELL_EDGE_READ &&
+                             internal_relation(&graph, &graph.edges[edge])) &&
                             graph.edges[edge].to == (uint32_t)consumer)
-                         : (graph.edges[edge].type == SHELL_EDGE_WRITE &&
+                         : ((graph.edges[edge].type == SHELL_EDGE_WRITE &&
+                             internal_relation(&graph, &graph.edges[edge])) &&
                             graph.edges[edge].from == (uint32_t)consumer);
         ASSERT(consumer >= 0 && flows == 16);
       }
@@ -10460,17 +10656,9 @@ TEST(recursive_fd_import_capacity) {
   char source[4096];
   for (unsigned changes = SHELL_DEP_TIME_MAX_EXTERNAL_FDS - 1;
        changes <= SHELL_DEP_TIME_MAX_EXTERNAL_FDS; changes++) {
-    size_t used =
-        (size_t)snprintf(source, sizeof(source), "exec 2>base || exit;");
-    for (unsigned i = 0; i < changes; i++) {
-      int written = snprintf(source + used, sizeof(source) - used,
-                             " probe && exec 2>route%u;", i);
-      ASSERT(written > 0 && (size_t)written < sizeof(source) - used);
-      used += (size_t)written;
-    }
-    int written = snprintf(source + used, sizeof(source) - used,
-                           " echo \"$(time true)\"");
-    ASSERT(written > 0 && (size_t)written < sizeof(source) - used);
+    size_t used;
+    ASSERT(shellsplit_test_substitution_capacity_source(
+        source, sizeof(source), changes, "echo \"$(time true)\"", &used));
     shell_dep_graph_t graph;
     shell_dep_error_t status = parse(source, &graph);
     ASSERT(status == (changes < SHELL_DEP_TIME_MAX_EXTERNAL_FDS
@@ -10484,7 +10672,8 @@ TEST(recursive_fd_import_capacity) {
       uint32_t reports = 0;
       for (uint32_t edge = 0; edge < graph.edge_count; edge++)
         reports += graph.edges[edge].from == (uint32_t)timer &&
-                   graph.edges[edge].type == SHELL_EDGE_WRITE;
+                   (graph.edges[edge].type == SHELL_EDGE_WRITE &&
+                    internal_relation(&graph, &graph.edges[edge]));
       ASSERT(reports == SHELL_DEP_TIME_MAX_EXTERNAL_FDS);
     }
   }
@@ -10525,6 +10714,8 @@ TEST(substitution_capacity_error_contract) {
         uint32_t inherited_routes = 0;
         for (uint32_t edge = 0; edge < graph.edge_count; edge++) {
           const shell_dep_edge_t *route = &graph.edges[edge];
+          if (!internal_relation(&graph, route))
+            continue;
           if (route->type == SHELL_EDGE_WRITE &&
               route->from == (uint32_t)producer && route->source_fd == 2 &&
               graph.nodes[route->to].type == SHELL_NODE_DOC &&
@@ -10579,6 +10770,8 @@ TEST(recursive_fd_import_survives_endpoint_pruning) {
     bool stale_collector_substitution = false;
     for (uint32_t edge = 0; edge < graph.edge_count; edge++) {
       const shell_dep_edge_t *current = &graph.edges[edge];
+      if (!internal_relation(&graph, current))
+        continue;
       stale_collector_substitution =
           stale_collector_substitution ||
           (current->type == SHELL_EDGE_SUBST && current->to == (uint32_t)sink);
@@ -10693,6 +10886,8 @@ TEST(substitution_scanner_and_flag_contract) {
   bool saw_shell_word = false;
   for (uint32_t edge = 0; edge < graph.edge_count; edge++) {
     const shell_dep_edge_t *current = &graph.edges[edge];
+    if (!internal_relation(&graph, current))
+      continue;
     saw_shell_word =
         saw_shell_word ||
         (current->type == SHELL_EDGE_SUBST &&
@@ -10734,6 +10929,8 @@ TEST(substitution_scanner_and_flag_contract) {
   saw_process_route = false;
   for (uint32_t edge = 0; edge < graph.edge_count; edge++) {
     const shell_dep_edge_t *current = &graph.edges[edge];
+    if (!internal_relation(&graph, current))
+      continue;
     saw_process_route =
         saw_process_route || (current->type == SHELL_EDGE_SUBST &&
                               current->flags == SHELL_DEP_EDGE_FLAG_NONE);
@@ -10747,6 +10944,8 @@ TEST(substitution_scanner_and_flag_contract) {
   saw_shell_word = false;
   for (uint32_t edge = 0; edge < graph.edge_count; edge++) {
     const shell_dep_edge_t *current = &graph.edges[edge];
+    if (!internal_relation(&graph, current))
+      continue;
     saw_shell_word =
         saw_shell_word ||
         (current->type == SHELL_EDGE_SUBST &&
@@ -10792,6 +10991,8 @@ TEST(herestring_substitution_topology) {
   bool shell_word_document = false;
   for (uint32_t edge_index = 0; edge_index < graph.edge_count; edge_index++) {
     const shell_dep_edge_t *edge = &graph.edges[edge_index];
+    if (!internal_relation(&graph, edge))
+      continue;
     shell_word_document =
         shell_word_document ||
         (edge->type == SHELL_EDGE_SUBST && edge->from == (uint32_t)producer &&
@@ -10840,6 +11041,8 @@ TEST(herestring_substitution_topology) {
   shell_word_document = false;
   for (uint32_t edge_index = 0; edge_index < graph.edge_count; edge_index++) {
     const shell_dep_edge_t *edge = &graph.edges[edge_index];
+    if (!internal_relation(&graph, edge))
+      continue;
     shell_word_document =
         shell_word_document ||
         (edge->type == SHELL_EDGE_SUBST && edge->from == (uint32_t)producer &&
@@ -10860,6 +11063,8 @@ TEST(herestring_substitution_topology) {
   shell_word_document = false;
   for (uint32_t edge_index = 0; edge_index < graph.edge_count; edge_index++) {
     const shell_dep_edge_t *edge = &graph.edges[edge_index];
+    if (!internal_relation(&graph, edge))
+      continue;
     shell_word_document =
         shell_word_document ||
         (edge->type == SHELL_EDGE_SUBST && edge->from == (uint32_t)producer &&
@@ -10882,6 +11087,8 @@ TEST(herestring_substitution_topology) {
   bool transient_substitution = false;
   for (uint32_t edge_index = 0; edge_index < graph.edge_count; edge_index++) {
     const shell_dep_edge_t *edge = &graph.edges[edge_index];
+    if (!internal_relation(&graph, edge))
+      continue;
     transient_read = transient_read || (edge->type == SHELL_EDGE_READ &&
                                         edge->from == (uint32_t)document);
     transient_substitution =
@@ -10921,6 +11128,8 @@ TEST(herestring_substitution_topology) {
   bool effective_substitution = false;
   for (uint32_t edge_index = 0; edge_index < graph.edge_count; edge_index++) {
     const shell_dep_edge_t *edge = &graph.edges[edge_index];
+    if (!internal_relation(&graph, edge))
+      continue;
     stale_read =
         stale_read || (edge->type == SHELL_EDGE_READ &&
                        edge->from == (uint32_t)stale_document &&
@@ -11122,7 +11331,8 @@ TEST(heredoc_count_substitution_capacity) {
           (graph.nodes[node].doc.flags & SHELL_DEP_DOC_FLAG_TRANSIENT) != 0;
   for (uint32_t edge = 0; edge < graph.edge_count; edge++)
     live_reads +=
-        graph.edges[edge].type == SHELL_EDGE_READ &&
+        (graph.edges[edge].type == SHELL_EDGE_READ &&
+         internal_relation(&graph, &graph.edges[edge])) &&
         graph.nodes[graph.edges[edge].from].type == SHELL_NODE_DOC &&
         graph.nodes[graph.edges[edge].from].doc.kind == SHELL_DOC_HEREDOC;
   ASSERT(transient_count == SHELL_DEP_MAX_HEREDOCS - 2 && live_reads == 2 &&
@@ -11176,6 +11386,8 @@ TEST(substitution_operand_matrix) {
     bool paired_io = !cases[i].read_write;
     for (uint32_t edge = 0; edge < graph.edge_count; edge++) {
       const shell_dep_edge_t *current = &graph.edges[edge];
+      if (!internal_relation(&graph, current))
+        continue;
       pathname_flow =
           pathname_flow ||
           (current->type == SHELL_EDGE_SUBST &&
@@ -11303,7 +11515,9 @@ TEST(brace_group_document_scope) {
         ASSERT_STRN_EQ(graph.nodes[n].doc.name, graph.nodes[n].doc.name_len,
                        cases[i].name);
       for (uint32_t e = 0; e < graph.edge_count; e++) {
-        if (graph.edges[e].from != n || graph.edges[e].type != SHELL_EDGE_READ)
+        if (graph.edges[e].from != n ||
+            (graph.edges[e].type != SHELL_EDGE_READ ||
+             !internal_relation(&graph, &graph.edges[e])))
           continue;
         group_reads = group >= 0 && graph.edges[e].to == (uint32_t)group;
       }
@@ -11346,6 +11560,8 @@ TEST(brace_group_local_document_scope) {
         ASSERT_STRN_EQ(current->doc.name, current->doc.name_len, cases[i].name);
       for (uint32_t edge = 0; edge < graph.edge_count; edge++) {
         const shell_dep_edge_t *relation = &graph.edges[edge];
+        if (!internal_relation(&graph, relation))
+          continue;
         if (relation->type != SHELL_EDGE_READ || relation->from != node)
           continue;
         command_read =
@@ -11414,8 +11630,8 @@ TEST(brace_group_document_pipeline_composition) {
 TEST(brace_group_document_capacity) {
   const char *command = "{ cat; cat; } <<EOF\npayload\nEOF";
   shell_dep_limits_t limits = SHELL_DEP_LIMITS_DEFAULT;
-  limits.max_nodes = 4;
-  limits.max_edges = 4;
+  limits.max_nodes = 6;
+  limits.max_edges = 6;
   shell_dep_graph_t graph = {0};
   ASSERT(shell_dep_graph_parse(command, strlen(command), ".", &limits,
                                &graph) == SHELL_DEP_OK);
@@ -11498,21 +11714,19 @@ TEST(reused_output_contract) {
   static const struct {
     const char *command;
     shell_dep_edge_type_t edge_type;
-    bool cd_as_cmd;
   } edge_cases[] = {
-      {"FOO=bar env", SHELL_EDGE_ENV, false},
-      {"cat < /tmp/input", SHELL_EDGE_READ, false},
-      {"printf value /tmp/output", SHELL_EDGE_ARG, false},
-      {"{ echo; }", SHELL_EDGE_GROUP, false},
-      {"cd /tmp; pwd", SHELL_EDGE_CWD, true},
-      {"echo one; echo two", SHELL_EDGE_SEQ, false},
+      {"FOO=bar env", SHELL_EDGE_ENV},
+      {"cat < /tmp/input", SHELL_EDGE_READ},
+      {"printf value /tmp/output", SHELL_EDGE_ARG},
+      {"{ echo; }", SHELL_EDGE_GROUP},
+      {"cd /tmp; pwd", SHELL_EDGE_CWD},
+      {"echo one; echo two", SHELL_EDGE_SEQ},
   };
   shell_dep_graph_t graph;
   memset(&graph, 0xA5, sizeof(graph));
 
   for (size_t i = 0; i < sizeof(edge_cases) / sizeof(edge_cases[0]); i++) {
     shell_dep_limits_t limits = SHELL_DEP_LIMITS_DEFAULT;
-    limits.cd_as_cmd = edge_cases[i].cd_as_cmd;
     ASSERT(shell_dep_graph_parse(edge_cases[i].command,
                                  strlen(edge_cases[i].command), ".", &limits,
                                  &graph) == SHELL_DEP_OK);
@@ -11542,7 +11756,7 @@ TEST(reused_output_contract) {
     ASSERT(shell_dep_graph_parse(early_cases[i].command,
                                  strlen(early_cases[i].command), ".", NULL,
                                  &graph) == early_cases[i].error);
-    if (graph.node_count != 0 || graph.edge_count != 0 ||
+    if (count_internal_nodes(&graph) != 0 || graph.edge_count != 0 ||
         graph.cwd_buf.len != 0 || graph.status != early_cases[i].status) {
       printf("    reused graph early case %zu retained output\n", i);
       shell_dep_graph_dump(&graph, stdout);
@@ -11603,8 +11817,7 @@ TEST(resolver_workspace_contract) {
   ASSERT(graph.node_count == 0 && graph.edge_count == 0 &&
          graph.cwd_buf.len == 0 && graph.status == SHELL_DEP_STATUS_ERROR);
 
-  /* A real execution stage requires scratch at the boundary, even when its
-   * otherwise plain cd could later collapse into only a CWD transition. */
+  /* cd is a real execution stage and requires the normal route workspace. */
   ASSERT(raw_dep_graph_parse("cd /tmp", strlen("cd /tmp"), ".", NULL, &graph) ==
          SHELL_DEP_EWORKSPACE);
   ASSERT(graph.node_count == 0 && graph.edge_count == 0 &&
@@ -11810,35 +12023,25 @@ TEST(limit_matrix) {
     uint32_t edge_count;
     uint32_t command_tokens;
   } cases[] = {
-      {"cmd1 ; cmd2", {1, 8, 8, 0, false, NULL, 0}, SHELL_DEP_ETRUNC, 1, 0, 1},
-      {"echo hi > out.txt",
-       {8, 0, 8, 0, false, NULL, 0},
-       SHELL_DEP_ETRUNC,
-       1,
-       0,
-       2},
-      {"echo hello", {8, 8, 1, 0, false, NULL, 0}, SHELL_DEP_ETRUNC, 1, 0, 1},
-      {"cd /tmp && ls",
-       {8, 8, 8, 4, false, NULL, 0},
-       SHELL_DEP_ETRUNC,
-       3,
-       3,
-       2},
+      {"cmd1 ; cmd2", {1, 8, 8, 0, NULL, 0}, SHELL_DEP_ETRUNC, 1, 0, 1},
+      {"echo hi > out.txt", {8, 0, 8, 0, NULL, 0}, SHELL_DEP_ETRUNC, 1, 0, 2},
+      {"echo hello", {8, 8, 1, 0, NULL, 0}, SHELL_DEP_ETRUNC, 1, 0, 1},
+      {"cd /tmp && ls", {8, 8, 8, 4, NULL, 0}, SHELL_DEP_ETRUNC, 3, 3, 2},
       {"echo $(cat /etc/hosts)",
-       {2, 8, 8, 0, false, NULL, 0},
+       {2, 8, 8, 0, NULL, 0},
        SHELL_DEP_ETRUNC,
        0,
        0,
        0},
       {"c 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 "
        "24 25 26 27 28 29 30 31 32 33",
-       {64, 64, SHELL_DEP_MAX_TOKENS, 0, false, NULL, 0},
+       {64, 64, SHELL_DEP_MAX_TOKENS, 0, NULL, 0},
        SHELL_DEP_ETRUNC,
        1,
        0,
        SHELL_DEP_MAX_TOKENS},
       {"echo hello",
-       {UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX, false, NULL, 0},
+       {UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX, NULL, 0},
        SHELL_DEP_OK,
        1,
        0,
@@ -11855,12 +12058,12 @@ TEST(limit_matrix) {
              shell_dep_error_string(error),
              shell_dep_error_string(cases[i].error));
     ASSERT(error == cases[i].error);
-    if (g.node_count != cases[i].node_count ||
-        g.edge_count != cases[i].edge_count)
+    if (count_internal_nodes(&g) != cases[i].node_count ||
+        count_internal_edges(&g) != cases[i].edge_count)
       fprintf(stderr, "limit case %zu nodes=%u edges=%u first-tokens=%u\n", i,
               g.node_count, g.edge_count, g.nodes[0].cmd.token_count);
-    ASSERT(g.node_count == cases[i].node_count);
-    ASSERT(g.edge_count == cases[i].edge_count);
+    ASSERT(count_internal_nodes(&g) == cases[i].node_count);
+    ASSERT(count_internal_edges(&g) == cases[i].edge_count);
     if (error == SHELL_DEP_ETRUNC)
       ASSERT(g.status & SHELL_DEP_STATUS_TRUNCATED);
     if (error == SHELL_DEP_EPARSE)
@@ -11871,7 +12074,6 @@ TEST(limit_matrix) {
   }
 
   shell_dep_limits_t cd_limits = SHELL_DEP_LIMITS_DEFAULT;
-  cd_limits.cd_as_cmd = true;
   shell_dep_graph_t g;
   ASSERT(shell_dep_graph_parse("cd /tmp && pwd", 14, "/home/user", &cd_limits,
                                &g) == SHELL_DEP_OK);
@@ -11897,7 +12099,8 @@ TEST(nested_limit_cross_product) {
       {1, 0, 1, 2, SHELL_DEP_ETRUNC},
       {2, 1, 2, 4, SHELL_DEP_ETRUNC},
       {4, 3, 4, 8, SHELL_DEP_ETRUNC},
-      {8, 8, 8, 32, SHELL_DEP_OK},
+      {8, 8, 8, 32, SHELL_DEP_ETRUNC},
+      {12, 24, 8, 32, SHELL_DEP_OK},
       {SHELL_DEP_MAX_NODES, SHELL_DEP_MAX_EDGES, SHELL_DEP_MAX_TOKENS,
        SHELL_DEP_CWD_BUF_SIZE, SHELL_DEP_OK},
   };
@@ -11907,7 +12110,6 @@ TEST(nested_limit_cross_product) {
                                  bounds[i].edges,
                                  bounds[i].tokens,
                                  bounds[i].cwd,
-                                 false,
                                  NULL,
                                  0};
     shell_dep_graph_t graph;
@@ -11994,7 +12196,7 @@ TEST(validation_matrix) {
   ASSERT(strstr(validation.errors[0].msg, "type mismatch") != NULL);
 
   ASSERT(parse("echo $(<file)", &g) == SHELL_DEP_OK);
-  ASSERT(g.edge_count == 1);
+  ASSERT(count_internal_edges(&g) == 1);
   g.edges[0].source_fd = 0;
   g.edges[0].target_fd = SHELL_DEP_FD_NONE;
   validation = shell_dep_graph_validate(&g);
@@ -12003,7 +12205,7 @@ TEST(validation_matrix) {
   ASSERT(strstr(validation.errors[0].msg, "type mismatch") != NULL);
 
   ASSERT(parse("echo $(id)", &g) == SHELL_DEP_OK);
-  ASSERT(g.edge_count == 1);
+  ASSERT(count_internal_edges(&g) == 1);
   g.edges[0].flags = SHELL_DEP_EDGE_FLAG_SUBST_DYNAMIC_NAME;
   validation = shell_dep_graph_validate(&g);
   ASSERT(!validation.valid);
@@ -12011,7 +12213,7 @@ TEST(validation_matrix) {
   ASSERT(strstr(validation.errors[0].msg, "type mismatch") != NULL);
 
   ASSERT(parse("echo $(id)", &g) == SHELL_DEP_OK);
-  ASSERT(g.edge_count == 1);
+  ASSERT(count_internal_edges(&g) == 1);
   g.edges[0].target_fd = 0;
   validation = shell_dep_graph_validate(&g);
   ASSERT(!validation.valid);
@@ -12034,7 +12236,7 @@ TEST(validation_matrix) {
   ASSERT(strstr(validation.errors[0].msg, "type mismatch") != NULL);
 
   ASSERT(parse("cmd1 | cmd2", &g) == SHELL_DEP_OK);
-  ASSERT(g.edge_count == 1);
+  ASSERT(count_internal_edges(&g) == 1);
   g.edges[0].source_fd = SHELL_DEP_FD_MAX + 1u;
   validation = shell_dep_graph_validate(&g);
   ASSERT(!validation.valid);
@@ -12042,7 +12244,7 @@ TEST(validation_matrix) {
   ASSERT(strstr(validation.errors[0].msg, "descriptor outside") != NULL);
 
   ASSERT(parse("cat < /tmp/input", &g) == SHELL_DEP_OK);
-  ASSERT(g.edge_count == 1);
+  ASSERT(count_internal_edges(&g) == 1);
   g.edges[0].target_fd = SHELL_DEP_FD_MAX + 1u;
   validation = shell_dep_graph_validate(&g);
   ASSERT(!validation.valid);
@@ -12311,7 +12513,7 @@ TEST(validation_rejects_corrupt_command_token_counts) {
   source[length] = '\0';
   shell_dep_graph_t graph = {0};
   ASSERT(parse(source, &graph) == SHELL_DEP_OK);
-  ASSERT(graph.node_count == 1 &&
+  ASSERT(count_internal_nodes(&graph) == 1 &&
          graph.nodes[0].cmd.token_count == SHELL_DEP_MAX_TOKENS);
   ASSERT(shell_dep_graph_validate(&graph).valid);
 
@@ -12406,7 +12608,8 @@ TEST(validation_rejects_oob_topology_and_control_cycles) {
       process_endpoint = node;
   for (uint32_t edge = 0; edge < graph.edge_count; edge++)
     if (graph.edges[edge].to == process_endpoint &&
-        graph.edges[edge].type == SHELL_EDGE_WRITE)
+        (graph.edges[edge].type == SHELL_EDGE_WRITE &&
+         internal_relation(&graph, &graph.edges[edge])))
       incoming = edge;
   ASSERT(process_endpoint != UINT32_MAX && incoming != UINT32_MAX);
   graph.edges[incoming].from = graph.node_count;
@@ -12761,7 +12964,9 @@ TEST(bash_pipe_both_descriptor_routing) {
          shell_dep_graph_validate(&graph).valid);
 
   ASSERT(parse("printf x 2>&1 >/tmp/out |& cat", &graph) == SHELL_DEP_OK);
-  ASSERT(count_edge_type(&graph, SHELL_EDGE_PIPE) == 0 &&
+  /* The output open can fail before |&'s implicit stderr copy. Its error
+   * reaches the pipe through the earlier explicit 2>&1. */
+  ASSERT(count_edge_type(&graph, SHELL_EDGE_PIPE) == 1 &&
          count_edge_type(&graph, SHELL_EDGE_WRITE) == 2 &&
          has_only_public_edge_flags(&graph) &&
          shell_dep_graph_validate(&graph).valid);
@@ -13315,7 +13520,8 @@ TEST(bash_pipeline_time_metadata) {
   one_node.max_nodes = 1;
   ASSERT(shell_dep_graph_parse("time true", strlen("time true"), ".", &one_node,
                                &graph) == SHELL_DEP_ETRUNC);
-  ASSERT(graph.node_count == 1 && count_type(&graph, SHELL_NODE_TIME) == 0 &&
+  ASSERT(count_internal_nodes(&graph) == 1 &&
+         count_type(&graph, SHELL_NODE_TIME) == 0 &&
          (graph.status & SHELL_DEP_STATUS_TRUNCATED) != 0 &&
          shell_dep_graph_validate(&graph).valid);
 
@@ -13324,7 +13530,8 @@ TEST(bash_pipeline_time_metadata) {
   ASSERT(shell_dep_graph_parse("time { true; }", strlen("time { true; }"), ".",
                                &group_without_timer,
                                &graph) == SHELL_DEP_ETRUNC);
-  ASSERT(graph.node_count == 2 && count_type(&graph, SHELL_NODE_TIME) == 0 &&
+  ASSERT(count_internal_nodes(&graph) == 2 &&
+         count_type(&graph, SHELL_NODE_TIME) == 0 &&
          (graph.status & SHELL_DEP_STATUS_TRUNCATED) != 0 &&
          shell_dep_graph_validate(&graph).valid);
 
@@ -13332,9 +13539,8 @@ TEST(bash_pipeline_time_metadata) {
   ASSERT(count_type(&graph, SHELL_NODE_TIME) == 1 &&
          shell_dep_graph_validate(&graph).valid);
 
-  /* The default graph normally collapses a plain current-shell cd into its
-   * tracked CWD transition. A reserved time operation needs an explicit
-   * measured endpoint, so timed cd remains a CMD even with cd_as_cmd=false. */
+  /* A timed cd retains both its ordinary command/CWD relation and the timer's
+   * measured execution endpoint. */
   ASSERT(parse("time cd /tmp", &graph) == SHELL_DEP_OK);
   source = find_first_cmd(&graph);
   timer = -1;
@@ -13420,13 +13626,17 @@ TEST(readonly_assignment_unreachable_phases) {
   ASSERT(count_edge_type(&graph, SHELL_EDGE_WRITE) != 0 &&
          count_edge_type(&graph, SHELL_EDGE_SUBST) != 0);
   shell_dep_limits_t limits = SHELL_DEP_LIMITS_DEFAULT;
-  limits.max_nodes = 3;
+  limits.max_nodes = 4;
   limits.max_edges = 1;
   memset(&graph, 0, sizeof(graph));
   ASSERT(shell_dep_graph_parse("UID=0 >out", strlen("UID=0 >out"), ".", &limits,
                                &graph) == SHELL_DEP_OK);
-  ASSERT(graph.node_count == 3 && graph.edge_count == 0 &&
+  ASSERT(count_internal_nodes(&graph) == 3 && graph.edge_count == 1 &&
          shell_dep_graph_validate(&graph).valid);
+  limits.max_nodes = 3;
+  ASSERT(shell_dep_graph_parse("UID=0 >out", strlen("UID=0 >out"), ".", &limits,
+                               &graph) == SHELL_DEP_ETRUNC);
+  ASSERT(graph.edge_count == 0 && shell_dep_graph_validate(&graph).valid);
   limits.max_nodes = 2;
   memset(&graph, 0, sizeof(graph));
   ASSERT(shell_dep_graph_parse("UID=0 >out", strlen("UID=0 >out"), ".", &limits,
@@ -13693,7 +13903,9 @@ TEST(bash_pipeline_time_context_continuations) {
     uint32_t writes = 0;
     for (uint32_t edge = 0; edge < graph.edge_count; edge++)
       writes += graph.edges[edge].from == (uint32_t)timer &&
-                graph.edges[edge].type == SHELL_EDGE_WRITE;
+                (graph.edges[edge].type == SHELL_EDGE_WRITE &&
+                 internal_relation(&graph, &graph.edges[edge])) &&
+                graph.nodes[graph.edges[edge].to].type != SHELL_NODE_FD;
     uint32_t expected_writes = 0;
     for (size_t file = 0; file < 3 && cases[i].files[file]; file++) {
       int target = find_file_doc(&graph, cases[i].files[file]);
@@ -13804,6 +14016,8 @@ TEST(named_fd_allocation_cleanup) {
     bool used = false;
     for (uint32_t e = 0; e < graph.edge_count; e++) {
       const shell_dep_edge_t *edge = &graph.edges[e];
+      if (!internal_relation(&graph, edge))
+        continue;
       if (edge->type != SHELL_EDGE_PIPE && edge->type != SHELL_EDGE_WRITE &&
           edge->type != SHELL_EDGE_SUBST)
         continue;
@@ -14054,7 +14268,8 @@ TEST(descriptor_presence_and_setup_reports) {
     unsigned writes = 0;
     for (uint32_t e = 0; e < graph.edge_count; e++)
       writes += graph.edges[e].from == (uint32_t)timer &&
-                graph.edges[e].type == SHELL_EDGE_WRITE;
+                (graph.edges[e].type == SHELL_EDGE_WRITE &&
+                 internal_relation(&graph, &graph.edges[e]));
     ASSERT(writes == 1u + cases[i].base);
     ASSERT(shell_dep_graph_validate(&graph).valid);
   }
@@ -14077,8 +14292,10 @@ TEST(scope_termination_descriptor_continuations) {
     unsigned writes = 0;
     for (uint32_t e = 0; e < graph.edge_count; e++) {
       const shell_dep_edge_t *edge = &graph.edges[e];
+      if (!internal_relation(&graph, edge))
+        continue;
       if (edge->from != (uint32_t)writer || edge->type != SHELL_EDGE_WRITE ||
-          edge->source_fd != 1)
+          edge->source_fd != 1 || graph.nodes[edge->to].type == SHELL_NODE_FD)
         continue;
       writes++;
       base |= (int)edge->to == find_file_doc(&graph, "base");
@@ -14228,6 +14445,8 @@ TEST(expansion_phases_survive_failed_setup) {
     bool redirect_write = false, substitution = false, shell_word = false;
     for (uint32_t edge = 0; edge < graph.edge_count; edge++) {
       const shell_dep_edge_t *relation = &graph.edges[edge];
+      if (!internal_relation(&graph, relation))
+        continue;
       if (relation->type == SHELL_EDGE_SUBST) {
         substitution = true;
         shell_word |=
@@ -14404,76 +14623,71 @@ TEST(assignment_and_inactive_event_scaling) {
 }
 
 TEST(reachability_cwd_transitions) {
-  for (unsigned visible = 0; visible < 2; visible++) {
-    shell_dep_limits_t limits = SHELL_DEP_LIMITS_DEFAULT;
-    limits.cd_as_cmd = visible != 0;
-    for (size_t i = 0; i < sizeof(shellsplit_test_cwd_reachability) /
-                               sizeof(shellsplit_test_cwd_reachability[0]);
-         i++) {
-      const char *source = shellsplit_test_cwd_reachability[i].source;
-      const char *expected = shellsplit_test_cwd_reachability[i].identity;
-      shell_dep_graph_t graph = {0};
-      ASSERT(shell_dep_graph_parse(source, strlen(source), "/workspace",
-                                   &limits, &graph) == SHELL_DEP_OK);
-      int file =
-          find_file_doc(&graph, shellsplit_test_cwd_reachability[i].file);
-      ASSERT(file >= 0);
-      char identity[512];
-      size_t length = 0;
-      bool absolute = false;
-      bool known = shell_dep_doc_file_identity_write(
-          &graph, &graph.nodes[file].doc, identity, sizeof(identity), &length,
-          &absolute);
-      if (known != (expected != NULL) ||
-          (known && strcmp(identity, expected) != 0))
-        printf("    CWD case %zu: %s (identity %s)\n", i, source,
-               known ? identity : "unknown");
-      ASSERT(known == (expected != NULL));
-      if (known)
-        ASSERT(absolute && length == strlen(expected) &&
-               strcmp(identity, expected) == 0);
-      ASSERT(shell_dep_graph_validate(&graph).valid);
-      shell_parse_result_t fast = {0};
-      shell_limits_t strict = {SHELL_MAX_SUBCOMMANDS, true};
-      ASSERT(shell_parse_fast(source, strlen(source), &strict, &fast) ==
-             SHELL_OK);
-      shell_dep_graph_t supplied = {0};
-      ASSERT(shell_dep_graph_parse_with_fast(source, strlen(source),
-                                             "/workspace", &limits, &fast,
-                                             &supplied) == SHELL_DEP_OK);
-      ASSERT(supplied.node_count == graph.node_count &&
-             supplied.edge_count == graph.edge_count &&
-             supplied.cwd_buf.len == graph.cwd_buf.len &&
-             memcmp(supplied.cwd_buf.data, graph.cwd_buf.data,
-                    graph.cwd_buf.len) == 0 &&
-             shellsplit_test_graph_equal(&supplied, &graph));
-    }
-    limits.cwd_buf_size = sizeof("/workspace");
-    static const char unreachable[] =
-        "UID=0; cd /a/long/unreachable/destination\nprintf payload >out";
+  shell_dep_limits_t limits = SHELL_DEP_LIMITS_DEFAULT;
+  for (size_t i = 0; i < sizeof(shellsplit_test_cwd_reachability) /
+                             sizeof(shellsplit_test_cwd_reachability[0]);
+       i++) {
+    const char *source = shellsplit_test_cwd_reachability[i].source;
+    const char *expected = shellsplit_test_cwd_reachability[i].identity;
     shell_dep_graph_t graph = {0};
-    ASSERT(shell_dep_graph_parse(unreachable, sizeof(unreachable) - 1,
-                                 "/workspace", &limits,
+    ASSERT(shell_dep_graph_parse(source, strlen(source), "/workspace", &limits,
                                  &graph) == SHELL_DEP_OK);
-    ASSERT(graph.cwd_buf.len == sizeof("/workspace") &&
-           shell_dep_graph_validate(&graph).valid);
-    static const char recovery[] = "cd \"$dir\"; cd /; printf payload >out";
-    ASSERT(shell_dep_graph_parse(recovery, sizeof(recovery) - 1, "/workspace",
-                                 &limits, &graph) == SHELL_DEP_ETRUNC);
-    ASSERT((graph.status & SHELL_DEP_STATUS_TRUNCATED) != 0);
-    limits.cwd_buf_size += sizeof("/");
-    ASSERT(shell_dep_graph_parse(recovery, sizeof(recovery) - 1, "/workspace",
-                                 &limits, &graph) == SHELL_DEP_OK);
-    int file = find_file_doc(&graph, "out");
+    int file = find_file_doc(&graph, shellsplit_test_cwd_reachability[i].file);
     ASSERT(file >= 0);
-    char identity[32];
-    size_t length;
-    bool absolute;
-    ASSERT(shell_dep_doc_file_identity_write(&graph, &graph.nodes[file].doc,
-                                             identity, sizeof(identity),
-                                             &length, &absolute));
-    ASSERT(absolute && strcmp(identity, "/out") == 0);
+    char identity[512];
+    size_t length = 0;
+    bool absolute = false;
+    bool known = shell_dep_doc_file_identity_write(
+        &graph, &graph.nodes[file].doc, identity, sizeof(identity), &length,
+        &absolute);
+    if (known != (expected != NULL) ||
+        (known && strcmp(identity, expected) != 0))
+      printf("    CWD case %zu: %s (identity %s)\n", i, source,
+             known ? identity : "unknown");
+    ASSERT(known == (expected != NULL));
+    if (known)
+      ASSERT(absolute && length == strlen(expected) &&
+             strcmp(identity, expected) == 0);
+    ASSERT(shell_dep_graph_validate(&graph).valid);
+    shell_parse_result_t fast = {0};
+    shell_limits_t strict = {SHELL_MAX_SUBCOMMANDS, true};
+    ASSERT(shell_parse_fast(source, strlen(source), &strict, &fast) ==
+           SHELL_OK);
+    shell_dep_graph_t supplied = {0};
+    ASSERT(shell_dep_graph_parse_with_fast(source, strlen(source), "/workspace",
+                                           &limits, &fast,
+                                           &supplied) == SHELL_DEP_OK);
+    ASSERT(supplied.node_count == graph.node_count &&
+           supplied.edge_count == graph.edge_count &&
+           supplied.cwd_buf.len == graph.cwd_buf.len &&
+           memcmp(supplied.cwd_buf.data, graph.cwd_buf.data,
+                  graph.cwd_buf.len) == 0 &&
+           shellsplit_test_graph_equal(&supplied, &graph));
   }
+  limits.cwd_buf_size = sizeof("/workspace");
+  static const char unreachable[] =
+      "UID=0; cd /a/long/unreachable/destination\nprintf payload >out";
+  shell_dep_graph_t graph = {0};
+  ASSERT(shell_dep_graph_parse(unreachable, sizeof(unreachable) - 1,
+                               "/workspace", &limits, &graph) == SHELL_DEP_OK);
+  ASSERT(graph.cwd_buf.len == sizeof("/workspace") &&
+         shell_dep_graph_validate(&graph).valid);
+  static const char recovery[] = "cd \"$dir\"; cd /; printf payload >out";
+  ASSERT(shell_dep_graph_parse(recovery, sizeof(recovery) - 1, "/workspace",
+                               &limits, &graph) == SHELL_DEP_ETRUNC);
+  ASSERT((graph.status & SHELL_DEP_STATUS_TRUNCATED) != 0);
+  limits.cwd_buf_size += sizeof("/");
+  ASSERT(shell_dep_graph_parse(recovery, sizeof(recovery) - 1, "/workspace",
+                               &limits, &graph) == SHELL_DEP_OK);
+  int file = find_file_doc(&graph, "out");
+  ASSERT(file >= 0);
+  char identity[32];
+  size_t length;
+  bool absolute;
+  ASSERT(shell_dep_doc_file_identity_write(&graph, &graph.nodes[file].doc,
+                                           identity, sizeof(identity), &length,
+                                           &absolute));
+  ASSERT(absolute && strcmp(identity, "/out") == 0);
   pass_count++;
 }
 
@@ -14589,6 +14803,28 @@ TEST(bash_pipeline_time_external_count_validation) {
       SHELL_DEP_TIME_MAX_EXTERNAL_FDS;
   for (uint32_t fd = 0; fd < SHELL_DEP_TIME_MAX_EXTERNAL_FDS; fd++)
     graph.nodes[timer].time.report_external_fds[fd] = fd;
+  /* External summaries are derived conveniences, so a valid fixture retains
+   * a matching WRITE-to-FD relation for every declared alternative. */
+  for (uint32_t fd = 0; fd < SHELL_DEP_TIME_MAX_EXTERNAL_FDS; fd++) {
+    uint32_t endpoint = UINT32_MAX;
+    for (uint32_t node = 0; node < graph.node_count; node++)
+      if (graph.nodes[node].type == SHELL_NODE_FD &&
+          graph.nodes[node].fd.number == fd)
+        endpoint = node;
+    if (endpoint == UINT32_MAX) {
+      endpoint = graph.node_count++;
+      graph.nodes[endpoint] =
+          (shell_dep_node_t){.type = SHELL_NODE_FD, .fd = {.number = fd}};
+    }
+    if (fd != 2)
+      graph.edges[graph.edge_count++] =
+          (shell_dep_edge_t){.from = (uint32_t)timer,
+                             .to = endpoint,
+                             .type = SHELL_EDGE_WRITE,
+                             .dir = SHELL_DIR_FORWARD,
+                             .source_fd = 2,
+                             .target_fd = SHELL_DEP_FD_NONE};
+  }
   ASSERT(shell_dep_graph_validate(&graph).valid);
   ASSERT(shellsplit_test_depgraph_invariants(source, sizeof(source) - 1,
                                              SHELL_DEP_OK, &graph, &limits));
@@ -15020,7 +15256,8 @@ TEST(substitution_status_controls_effects) {
       bool reached = false;
       for (uint32_t edge = 0; edge < graph.edge_count; edge++)
         reached |= graph.edges[edge].to == (uint32_t)document &&
-                   graph.edges[edge].type == SHELL_EDGE_WRITE;
+                   (graph.edges[edge].type == SHELL_EDGE_WRITE &&
+                    internal_relation(&graph, &graph.edges[edge]));
       bool expected =
           success ? shellsplit_test_substitution_status_cases[i].succeeds
                   : shellsplit_test_substitution_status_cases[i].fails;
@@ -15210,6 +15447,8 @@ TEST(static_empty_path_effects) {
         }
         for (uint32_t edge = 0; edge < graph.edge_count; edge++) {
           const shell_dep_edge_t *item = &graph.edges[edge];
+          if (!internal_relation(&graph, item))
+            continue;
           shell_word |= item->type == SHELL_EDGE_SUBST &&
                         (item->flags & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD);
           uint32_t document = graph.nodes[item->from].type == SHELL_NODE_DOC
@@ -15404,6 +15643,8 @@ TEST(resolved_named_redirect_failure_reachability) {
     unsigned opens = 0, writes = 0;
     for (uint32_t edge = 0; edge < graph.edge_count; edge++) {
       const shell_dep_edge_t *item = &graph.edges[edge];
+      if (!internal_relation(&graph, item))
+        continue;
       bool input = graph.nodes[item->from].type == SHELL_NODE_DOC;
       bool output = graph.nodes[item->to].type == SHELL_NODE_DOC;
       if (!input && !output)
@@ -15481,6 +15722,8 @@ TEST(resolved_substitution_argument_documents) {
       unsigned arguments = 0, substitutions = 0;
       for (uint32_t edge = 0; edge < graph.edge_count; edge++) {
         const shell_dep_edge_t *item = &graph.edges[edge];
+        if (!internal_relation(&graph, item))
+          continue;
         if (item->type == SHELL_EDGE_SUBST)
           substitutions++;
         if (item->type != SHELL_EDGE_ARG)
@@ -16717,7 +16960,9 @@ TEST(compound_descriptor_restoration) {
       uint32_t writes = 0;
       for (uint32_t edge = 0; edge < graph.edge_count; edge++)
         writes += graph.edges[edge].from == node &&
-                  graph.edges[edge].type == SHELL_EDGE_WRITE;
+                  (graph.edges[edge].type == SHELL_EDGE_WRITE &&
+                   internal_relation(&graph, &graph.edges[edge])) &&
+                  graph.nodes[graph.edges[edge].to].type != SHELL_NODE_FD;
       if (!cases[i].targets[count]) {
         ASSERT(time->report_route == SHELL_TIME_REPORT_EXTERNAL &&
                time->report_target_fd == 2 && writes == 0);
@@ -17198,7 +17443,7 @@ TEST(validation_defensive_diagnostics_matrix) {
   valid = valid && !shell_dep_graph_validate(&malformed).valid;
 
   shell_dep_graph_t timed = graph;
-  timed.node_count = 3;
+  timed.node_count = 4;
   timed.nodes[0].cmd.pipeline_time_mode = SHELL_PIPE_TIME_DEFAULT;
   timed.nodes[0].cmd.pipeline_time_id = 3;
   timed.nodes[2] = (shell_dep_node_t){
@@ -17213,7 +17458,15 @@ TEST(validation_defensive_diagnostics_matrix) {
                .report_external_fd_count = 1,
                .report_external_fds = {2}},
   };
-  timed.edge_count = 1;
+  timed.nodes[3] =
+      (shell_dep_node_t){.type = SHELL_NODE_FD, .fd = {.number = 2}};
+  timed.edge_count = 2;
+  timed.edges[1] = (shell_dep_edge_t){.type = SHELL_EDGE_WRITE,
+                                      .dir = SHELL_DIR_FORWARD,
+                                      .from = 2,
+                                      .to = 3,
+                                      .source_fd = 2,
+                                      .target_fd = SHELL_DEP_FD_NONE};
   timed.edges[0] = (shell_dep_edge_t){
       .type = SHELL_EDGE_TIME,
       .dir = SHELL_DIR_FORWARD,
@@ -17266,6 +17519,8 @@ TEST(validation_defensive_diagnostics_matrix) {
   unavailable_time.nodes[2].time.report_route_flags =
       SHELL_TIME_REPORT_ROUTE_UNAVAILABLE;
   unavailable_time.nodes[2].time.report_external_fd_count = 0;
+  unavailable_time.node_count = 3;
+  unavailable_time.edge_count = 1;
   valid = valid && shell_dep_graph_validate(&unavailable_time).valid;
   malformed = unavailable_time;
   malformed.nodes[2].time.report_route_flags = SHELL_TIME_REPORT_ROUTE_CLOSED;
@@ -17275,6 +17530,8 @@ TEST(validation_defensive_diagnostics_matrix) {
   malformed.nodes[2].time.report_target_fd = SHELL_DEP_FD_NONE;
   malformed.nodes[2].time.report_route_flags = SHELL_TIME_REPORT_ROUTE_UNKNOWN;
   malformed.nodes[2].time.report_external_fd_count = 0;
+  malformed.node_count = 3;
+  malformed.edge_count = 1;
   valid = valid && !shell_dep_graph_validate(&malformed).valid;
   malformed.status = SHELL_DEP_STATUS_TRUNCATED;
   valid = valid && shell_dep_graph_validate(&malformed).valid;
@@ -17556,7 +17813,8 @@ TEST(document_and_cwd_boundary_contract) {
   shell_dep_error_t normalized_status =
       shell_dep_graph_parse("pwd", 3, "a/..", NULL, &normalized);
   valid = valid && normalized_status == SHELL_DEP_OK &&
-          normalized.node_count == 1 && normalized.cwd_buf.len == 2 &&
+          count_internal_nodes(&normalized) == 1 &&
+          normalized.cwd_buf.len == 2 &&
           strcmp(normalized.cwd_buf.data, ".") == 0 &&
           shell_dep_graph_validate(&normalized).valid;
 
@@ -17573,7 +17831,6 @@ TEST(document_and_cwd_boundary_contract) {
   memset(long_cd + long_cd_prefix, 'x', sizeof(long_cd) - long_cd_prefix - 1);
   long_cd[sizeof(long_cd) - 1] = '\0';
   shell_dep_limits_t limited = SHELL_DEP_LIMITS_DEFAULT;
-  limited.cd_as_cmd = true;
   limited.max_nodes = 2;
   limited.max_edges = 1;
   limited.max_tokens_per_cmd = 1;
@@ -17603,8 +17860,10 @@ TEST(document_and_cwd_boundary_contract) {
       shell_dep_graph_parse("cd /tmp; cd /tmp; pwd",
                             strlen("cd /tmp; cd /tmp; pwd"), ".", NULL,
                             &deduplicated) == SHELL_DEP_OK &&
-      deduplicated.node_count == 1 &&
-      strcmp(deduplicated.cwd_buf.data + deduplicated.nodes[0].cmd.cwd_offset,
+      count_type(&deduplicated, SHELL_NODE_CMD) == 3 &&
+      strcmp(deduplicated.cwd_buf.data +
+                 deduplicated.nodes[find_cmd_tokens(&deduplicated, "pwd", NULL)]
+                     .cmd.cwd_offset,
              "/tmp") == 0 &&
       shell_dep_graph_validate(&deduplicated).valid;
 
@@ -17617,25 +17876,31 @@ TEST(document_and_cwd_boundary_contract) {
       valid &&
       shell_dep_graph_parse("cd \"$HOME\"; pwd", strlen("cd \"$HOME\"; pwd"),
                             ".", NULL, &dynamic_cwd) == SHELL_DEP_OK &&
-      dynamic_cwd.node_count == 1 && !dynamic_cwd.nodes[0].cmd.cwd_known &&
+      count_type(&dynamic_cwd, SHELL_NODE_CMD) == 2 &&
+      !dynamic_cwd.nodes[find_cmd_tokens(&dynamic_cwd, "pwd", NULL)]
+           .cmd.cwd_known &&
       shell_dep_graph_validate(&dynamic_cwd).valid &&
       shell_dep_graph_parse("cd -; pwd", strlen("cd -; pwd"), ".", NULL,
                             &cd_dash) == SHELL_DEP_OK &&
-      cd_dash.node_count == 1 && !cd_dash.nodes[0].cmd.cwd_known &&
+      count_type(&cd_dash, SHELL_NODE_CMD) == 2 &&
+      !cd_dash.nodes[find_cmd_tokens(&cd_dash, "pwd", NULL)].cmd.cwd_known &&
       shell_dep_graph_validate(&cd_dash).valid &&
       shell_dep_graph_parse("cd ~other; pwd", strlen("cd ~other; pwd"), ".",
                             NULL, &named_home) == SHELL_DEP_OK &&
-      named_home.node_count == 1 && !named_home.nodes[0].cmd.cwd_known &&
+      count_type(&named_home, SHELL_NODE_CMD) == 2 &&
+      !named_home.nodes[find_cmd_tokens(&named_home, "pwd", NULL)]
+           .cmd.cwd_known &&
       shell_dep_graph_validate(&named_home).valid &&
       shell_dep_graph_parse("cd /tmp -; pwd", strlen("cd /tmp -; pwd"), ".",
                             NULL, &invalid_cd) == SHELL_DEP_OK &&
-      invalid_cd.node_count == 1 && invalid_cd.nodes[0].cmd.cwd_known &&
+      count_type(&invalid_cd, SHELL_NODE_CMD) == 2 &&
+      invalid_cd.nodes[0].cmd.cwd_known &&
       strcmp(invalid_cd.cwd_buf.data + invalid_cd.nodes[0].cmd.cwd_offset,
              ".") == 0 &&
       shell_dep_graph_validate(&invalid_cd).valid &&
       shell_dep_graph_parse("cd - /tmp; pwd", strlen("cd - /tmp; pwd"), ".",
                             NULL, &dynamic_then_operand) == SHELL_DEP_OK &&
-      dynamic_then_operand.node_count == 1 &&
+      count_type(&dynamic_then_operand, SHELL_NODE_CMD) == 2 &&
       dynamic_then_operand.nodes[0].cmd.cwd_known &&
       strcmp(dynamic_then_operand.cwd_buf.data +
                  dynamic_then_operand.nodes[0].cmd.cwd_offset,
@@ -18026,7 +18291,7 @@ int main(int argc, char **argv) {
   RUN(descriptor_snapshot_source_scaling);
   RUN(unconnected_process_redirect_replaces_descriptor);
   RUN(descriptor_metadata_scaling);
-  RUN(collapsed_group_execution_endpoints);
+  RUN(cd_group_execution_endpoints);
   RUN(numeric_self_duplication_snapshots);
   RUN(compound_control_status_stream);
   RUN(redirect_frame_membership_scaling);

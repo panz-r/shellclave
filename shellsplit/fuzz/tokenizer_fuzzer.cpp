@@ -31,6 +31,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -294,6 +295,19 @@ constexpr int kCwdStrategiesN =
  * inputs instead of relying on the library to allocate a hidden multi-MiB
  * route table. */
 static std::vector<std::max_align_t> g_depgraph_workspace;
+
+/* Existing reference fixtures describe internal document/pipe relations.
+ * Boundary routing has a separate fixed oracle and is never projected out of
+ * the graph or its complete independent invariants. */
+static bool internal_graph_relation(const shell_dep_graph_t &graph,
+                                    const shell_dep_edge_t &edge) {
+  return graph.nodes[edge.from].type != SHELL_NODE_FD &&
+         graph.nodes[edge.to].type != SHELL_NODE_FD &&
+         !(graph.nodes[edge.from].type == SHELL_NODE_DOC &&
+           (graph.nodes[edge.from].doc.flags & SHELL_DEP_DOC_FLAG_IMPLICIT)) &&
+         !(graph.nodes[edge.to].type == SHELL_NODE_DOC &&
+           (graph.nodes[edge.to].doc.flags & SHELL_DEP_DOC_FLAG_IMPLICIT));
+}
 
 static bool fuzz_dep_limits(const shell_dep_limits_t *limits,
                             shell_dep_limits_t *effective) {
@@ -607,6 +621,8 @@ static int test_fixed_oracles(void) {
       bool reached = false;
       for (uint32_t e = 0; e < graph.edge_count; e++) {
         const auto &edge = graph.edges[e];
+        if (!internal_graph_relation(graph, edge))
+          continue;
         const auto &target = graph.nodes[edge.to];
         reached |=
             edge.type == SHELL_EDGE_WRITE && target.type == SHELL_NODE_DOC &&
@@ -661,6 +677,8 @@ static int test_fixed_oracles(void) {
     bool named_write = false;
     for (uint32_t e = 0; e < graph.edge_count; e++) {
       const auto &edge = graph.edges[e];
+      if (!internal_graph_relation(graph, edge))
+        continue;
       named_write |= edge.type == SHELL_EDGE_WRITE && edge.from == writer &&
                      edge.to == file && edge.source_fd == 1;
     }
@@ -677,6 +695,8 @@ static int test_fixed_oracles(void) {
     bool substitution = false, inspection = false;
     for (uint32_t e = 0; e < graph.edge_count; e++) {
       const auto &edge = graph.edges[e];
+      if (!internal_graph_relation(graph, edge))
+        continue;
       if (edge.type == SHELL_EDGE_SUBST) {
         substitution = true;
         inspection |= (edge.flags & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) != 0;
@@ -725,6 +745,8 @@ static int test_fixed_oracles(void) {
     bool writes = false;
     for (uint32_t e = 0; e < graph.edge_count; e++) {
       const auto &edge = graph.edges[e];
+      if (!internal_graph_relation(graph, edge))
+        continue;
       writes |= edge.type == SHELL_EDGE_WRITE && edge.from == writer &&
                 edge.to == file && edge.source_fd == 1;
     }
@@ -775,6 +797,8 @@ static int test_fixed_oracles(void) {
     bool writes = false;
     for (uint32_t e = 0; e < graph.edge_count; e++) {
       const auto &edge = graph.edges[e];
+      if (!internal_graph_relation(graph, edge))
+        continue;
       writes |= edge.type == SHELL_EDGE_WRITE && edge.from == writer &&
                 edge.to == document && edge.source_fd == 1;
     }
@@ -825,6 +849,8 @@ static int test_fixed_oracles(void) {
     unsigned writes = 0;
     for (uint32_t e = 0; e < graph.edge_count; e++) {
       const auto &edge = graph.edges[e];
+      if (!internal_graph_relation(graph, edge))
+        continue;
       if (edge.type == SHELL_EDGE_WRITE && edge.from == timer) {
         writes++;
         to_base |= edge.to == base;
@@ -873,6 +899,8 @@ static int test_fixed_oracles(void) {
     unsigned flows = 0;
     for (uint32_t e = 0; e < graph.edge_count; e++) {
       const auto &edge = graph.edges[e];
+      if (!internal_graph_relation(graph, edge))
+        continue;
       if (edge.type != (fixture.read ? SHELL_EDGE_READ : SHELL_EDGE_WRITE) ||
           (fixture.read ? edge.to : edge.from) != consumer ||
           graph.nodes[fixture.read ? edge.from : edge.to].type !=
@@ -924,8 +952,10 @@ static int test_fixed_oracles(void) {
     unsigned writes = 0;
     for (uint32_t e = 0; e < graph.edge_count; e++) {
       const auto &edge = graph.edges[e];
+      if (!internal_graph_relation(graph, edge))
+        continue;
       if (edge.type == SHELL_EDGE_WRITE && edge.from == writer &&
-          edge.source_fd == 1) {
+          edge.source_fd == 1 && graph.nodes[edge.to].type != SHELL_NODE_FD) {
         writes++;
         to_base |= edge.to == base;
         to_out |= edge.to == out;
@@ -1001,6 +1031,8 @@ static int test_fixed_oracles(void) {
     if (commands != fixture.commands)
       return fixed_oracle_failure(__LINE__);
     for (uint32_t e = 0; e < graph.edge_count; e++) {
+      if (!internal_graph_relation(graph, graph.edges[e]))
+        continue;
       auto type = graph.edges[e].type;
       if (type == SHELL_EDGE_READ || type == SHELL_EDGE_WRITE ||
           type == SHELL_EDGE_APPEND || type == SHELL_EDGE_SUBST ||
@@ -1039,35 +1071,32 @@ static int test_fixed_oracles(void) {
       {"cd /tmp; echo \"$(<out)\"", "/tmp/out"},
       {"cd \"$value\"; echo \"$(<out)\"", nullptr},
   };
-  for (bool cd_as_cmd : {false, true}) {
-    shell_dep_limits_t limits = SHELL_DEP_LIMITS_DEFAULT;
-    limits.cd_as_cmd = cd_as_cmd;
-    for (const auto &item : cwd_files) {
-      shell_dep_graph_t graph = {};
-      if (shell_dep_graph_parse(item.source, strlen(item.source), "/workspace",
-                                &limits, &graph) != SHELL_DEP_OK ||
-          !shell_dep_graph_validate(&graph).valid)
+  shell_dep_limits_t limits = SHELL_DEP_LIMITS_DEFAULT;
+  for (const auto &item : cwd_files) {
+    shell_dep_graph_t graph = {};
+    if (shell_dep_graph_parse(item.source, strlen(item.source), "/workspace",
+                              &limits, &graph) != SHELL_DEP_OK ||
+        !shell_dep_graph_validate(&graph).valid)
+      return fixed_oracle_failure(__LINE__);
+    bool found = false;
+    for (uint32_t i = 0; i < graph.node_count; i++) {
+      const shell_dep_node_t &node = graph.nodes[i];
+      if (node.type != SHELL_NODE_DOC || node.doc.kind != SHELL_DOC_FILE ||
+          node.doc.path_len != 3 || memcmp(node.doc.path, "out", 3))
+        continue;
+      char identity[256];
+      size_t length = 0;
+      bool absolute = false;
+      bool known = shell_dep_doc_file_identity_write(
+          &graph, &node.doc, identity, sizeof(identity), &length, &absolute);
+      if (known != (item.identity != nullptr) ||
+          (known && (!absolute || length != strlen(item.identity) ||
+                     strcmp(identity, item.identity))))
         return fixed_oracle_failure(__LINE__);
-      bool found = false;
-      for (uint32_t i = 0; i < graph.node_count; i++) {
-        const shell_dep_node_t &node = graph.nodes[i];
-        if (node.type != SHELL_NODE_DOC || node.doc.kind != SHELL_DOC_FILE ||
-            node.doc.path_len != 3 || memcmp(node.doc.path, "out", 3))
-          continue;
-        char identity[256];
-        size_t length = 0;
-        bool absolute = false;
-        bool known = shell_dep_doc_file_identity_write(
-            &graph, &node.doc, identity, sizeof(identity), &length, &absolute);
-        if (known != (item.identity != nullptr) ||
-            (known && (!absolute || length != strlen(item.identity) ||
-                       strcmp(identity, item.identity))))
-          return fixed_oracle_failure(__LINE__);
-        found = true;
-      }
-      if (!found)
-        return fixed_oracle_failure(__LINE__);
+      found = true;
     }
+    if (!found)
+      return fixed_oracle_failure(__LINE__);
   }
   static const struct {
     const char *source;
@@ -1768,7 +1797,7 @@ static int test_fixed_oracles(void) {
         !processed.commands[0].has_pipe_output &&
         shell_dep_graph_parse(input, strlen(input), ".", NULL, &graph) ==
             SHELL_DEP_OK &&
-        graph.edge_count == 0 && shell_dep_graph_validate(&graph).valid;
+        graph.edge_count == 3 && shell_dep_graph_validate(&graph).valid;
     shell_commands_free(commands, command_count);
     shell_processed_commands_free(&processed);
     if (!opaque_word_ok)
@@ -2113,6 +2142,8 @@ static int test_fixed_oracles(void) {
   uint32_t stderr_writes = 0;
   for (uint32_t edge = 0; edge < braced_named_graph.edge_count; edge++) {
     const shell_dep_edge_t *current = &braced_named_graph.edges[edge];
+    if (!internal_graph_relation(braced_named_graph, *current))
+      continue;
     if (current->type != SHELL_EDGE_WRITE)
       continue;
     stdout_writes += current->source_fd == 1;
@@ -2189,6 +2220,8 @@ static int test_fixed_oracles(void) {
     bool stale_collector_substitution = false;
     for (uint32_t edge = 0; edge < graph.edge_count; edge++) {
       const shell_dep_edge_t *current = &graph.edges[edge];
+      if (!internal_graph_relation(graph, *current))
+        continue;
       stale_collector_substitution =
           stale_collector_substitution ||
           (sink >= 0 && current->type == SHELL_EDGE_SUBST &&
@@ -2281,11 +2314,11 @@ static int test_fixed_oracles(void) {
       {"cat log &> >(sh) >out", "out", nullptr, SHELL_EDGE_WRITE,
        SHELL_EDGE_WRITE, false, true},
       {"cat log &>> >(sh) 2>>err", nullptr, "err", SHELL_EDGE_WRITE,
-       SHELL_EDGE_APPEND, true, false},
+       SHELL_EDGE_APPEND, true, true},
       {"cat log >& >(sh) 2>&-", nullptr, nullptr, SHELL_EDGE_WRITE,
        SHELL_EDGE_WRITE, true, false},
       {"cat log &> >(sh) >out 2>&1", "out", "out", SHELL_EDGE_WRITE,
-       SHELL_EDGE_WRITE, false, false},
+       SHELL_EDGE_WRITE, false, true},
   };
   for (const combined_process_route_oracle &item :
        combined_process_route_cases) {
@@ -2762,6 +2795,7 @@ static int test_fixed_oracles(void) {
       const shell_dep_edge_t &candidate = graph.edges[edge];
       graph_flow = graph_flow || (candidate.from == timer &&
                                   candidate.type != SHELL_EDGE_TIME &&
+                                  internal_graph_relation(graph, candidate) &&
                                   candidate.source_fd == timing->report_fd);
       if (item.target_file && candidate.from == timer &&
           candidate.type == SHELL_EDGE_WRITE &&
@@ -2958,8 +2992,8 @@ static int test_fixed_oracles(void) {
       return fixed_oracle_failure(__LINE__);
   }
 
-  /* Empty timing targets are structural. In particular, recursive capture
-   * and import joins must never materialize them as byte sources or sinks. */
+  /* Empty timing targets have no body I/O. An asynchronous shell can still
+   * emit its implicit-stdin-open diagnostic through inherited stderr. */
   static const char *const empty_timing_stream_cases[] = {
       "echo \"$(time; true)\"",
       "echo \"`time; true`\"",
@@ -2985,6 +3019,10 @@ static int test_fixed_oracles(void) {
     for (uint32_t edge = 0; edge < graph.edge_count; edge++) {
       const shell_dep_edge_t &item = graph.edges[edge];
       if (item.from != placeholder && item.to != placeholder)
+        continue;
+      if (item.type == SHELL_EDGE_WRITE && item.from == placeholder &&
+          item.source_fd == 2 && graph.nodes[item.to].type == SHELL_NODE_FD &&
+          graph.nodes[item.to].fd.number == 2)
         continue;
       if (item.type != SHELL_EDGE_TIME && item.type != SHELL_EDGE_SEQ &&
           item.type != SHELL_EDGE_AND && item.type != SHELL_EDGE_OR &&
@@ -3820,7 +3858,8 @@ static int test_fixed_oracles(void) {
                         graph.nodes[i].doc.kind == item.kind;
     }
     for (uint32_t i = 0; i < graph.edge_count; i++)
-      read_count += graph.edges[i].type == SHELL_EDGE_READ;
+      read_count += (graph.edges[i].type == SHELL_EDGE_READ &&
+                     internal_graph_relation(graph, graph.edges[i]));
     for (uint32_t i = 0; i < graph.edge_count; i++)
       pipe_count += graph.edges[i].type == SHELL_EDGE_PIPE;
     /* Group-owned input is represented as one DOC -> GROUP relation, not a
@@ -3854,6 +3893,8 @@ static int test_fixed_oracles(void) {
   }
   for (uint32_t edge = 0; edge < group_herestring_graph.edge_count; edge++) {
     const shell_dep_edge_t *current = &group_herestring_graph.edges[edge];
+    if (!internal_graph_relation(group_herestring_graph, *current))
+      continue;
     here_reads += current->type == SHELL_EDGE_READ;
     here_substitutions +=
         current->type == SHELL_EDGE_SUBST &&
@@ -3871,7 +3912,7 @@ static int test_fixed_oracles(void) {
     uint32_t substitution_edges;
   };
   static const dep_oracle_case dep_cases[] = {
-      {"cd /tmp", 0, 0},
+      {"cd /tmp", 1, 0},
       {"cd /tmp >out", 1, 0},
       {"cd \"$(id)\"", 2, 1},
       {"export VALUE=$(id) >out", 2, 1},
@@ -4247,7 +4288,8 @@ static int test_fixed_oracles(void) {
     }
     uint32_t reader = UINT32_MAX;
     for (uint32_t edge = 0; edge < graph.edge_count; edge++) {
-      if (graph.edges[edge].type == SHELL_EDGE_READ &&
+      if ((graph.edges[edge].type == SHELL_EDGE_READ &&
+           internal_graph_relation(graph, graph.edges[edge])) &&
           graph.edges[edge].from == document) {
         reader = graph.edges[edge].to;
         break;
@@ -4812,12 +4854,16 @@ static int test_generated_descriptor_move(uint8_t selector) {
   unsigned routes = 0;
   for (uint32_t i = 0; i < graph.edge_count; i++) {
     const auto &edge = graph.edges[i];
+    if (!internal_graph_relation(graph, edge))
+      continue;
     bool reads = form == 19 || form == 27 || (form >= 34 && form <= 36) ||
                  form == 38 || form == 58 || form == 60;
     if (edge.type != (reads ? SHELL_EDGE_READ : SHELL_EDGE_WRITE))
       continue;
     const auto &owner = graph.nodes[reads ? edge.to : edge.from];
     const auto &file = graph.nodes[reads ? edge.from : edge.to];
+    if (file.type == SHELL_NODE_FD)
+      continue;
     const char *command = form == 64                               ? "\"$cmd\""
                           : form == 65                             ? "command"
                           : form == 68                             ? "builtin"
@@ -4889,16 +4935,16 @@ static int test_generated_resolved_depgraph(uint8_t selector, bool truncate) {
 static int test_depgraph(const char *input, size_t length, const char *cwd) {
   static const shell_dep_limits_t limits[] = {
       SHELL_DEP_LIMITS_DEFAULT,
-      {0, 0, 0, 2, false, nullptr, 0},
-      {4, 4, 2, 32, true, nullptr, 0},
-      {SHELL_DEP_MAX_NODES, SHELL_DEP_MAX_EDGES, SHELL_DEP_MAX_TOKENS, 1, false,
+      {0, 0, 0, 2, nullptr, 0},
+      {4, 4, 2, 32, nullptr, 0},
+      {SHELL_DEP_MAX_NODES, SHELL_DEP_MAX_EDGES, SHELL_DEP_MAX_TOKENS, 1,
        nullptr, 0},
-      {SHELL_DEP_MAX_NODES, SHELL_DEP_MAX_EDGES, SHELL_DEP_MAX_TOKENS, 2, false,
+      {SHELL_DEP_MAX_NODES, SHELL_DEP_MAX_EDGES, SHELL_DEP_MAX_TOKENS, 2,
        nullptr, 0},
       {SHELL_DEP_MAX_NODES, SHELL_DEP_MAX_EDGES, SHELL_DEP_MAX_TOKENS,
-       SHELL_DEP_CWD_BUF_SIZE - 1, false, nullptr, 0},
+       SHELL_DEP_CWD_BUF_SIZE - 1, nullptr, 0},
       {SHELL_DEP_MAX_NODES, SHELL_DEP_MAX_EDGES, SHELL_DEP_MAX_TOKENS,
-       SHELL_DEP_CWD_BUF_SIZE, false, nullptr, 0},
+       SHELL_DEP_CWD_BUF_SIZE, nullptr, 0},
   };
   for (size_t i = 0; i < sizeof(limits) / sizeof(limits[0]); i++) {
     shell_dep_graph_t graph = {};
@@ -5078,6 +5124,7 @@ static bool tokenizer_token_is_line_continuation(const shell_token_t &token) {
 static int test_tokenizer_state(const char *input, size_t length) {
   shell_tokenizer_state_t state = {};
   shell_tokenizer_init(&state, input, length);
+  bool unsupported = shell_tokenizer_has_unsupported_semantics(input, length);
 
   size_t steps = 0;
   size_t previous_end = 0;
@@ -5088,6 +5135,8 @@ static int test_tokenizer_state(const char *input, size_t length) {
   bool terminated = false;
   while (steps++ <= length + 32) {
     shell_token_t token = {};
+    const bool group_command_position =
+        state.lexical_command_position && !state.lexical_redirect_operand;
     bool produced = shell_tokenizer_next(&state, &token);
     if (!produced || token.type == SHELL_TOKEN_END) {
       terminated = true;
@@ -5119,9 +5168,16 @@ static int test_tokenizer_state(const char *input, size_t length) {
     if (token.type == SHELL_TOKEN_PIPE_NEGATE && !expect_command)
       token.type = SHELL_TOKEN_ARGUMENT;
     if (token.type == SHELL_TOKEN_GROUP_START) {
-      expect_command = true;
-      document_only = true;
-      has_heredoc = false;
+      /* The allocating tokenizer treats only command-position openers as
+       * structural. An opener appended to an ordinary word or redirect
+       * pathname is diagnostic input and must not hide the retained newline
+       * that terminates the preceding record. Capture the lexical state
+       * before advancing because the iterator updates it for the opener. */
+      if (group_command_position) {
+        expect_command = true;
+        document_only = true;
+        has_heredoc = false;
+      }
     } else if (token.type == SHELL_TOKEN_GROUP_END) {
       /* A trailing group redirect remains owned by its compound record. */
       document_only = false;
@@ -5144,7 +5200,6 @@ static int test_tokenizer_state(const char *input, size_t length) {
   if (!terminated)
     return 1;
 
-  bool unsupported = shell_tokenizer_has_unsupported_semantics(input, length);
   if (unsupported && !tokenizer_unsupported_semantics_rejected(input, length))
     return 1;
 
@@ -5955,9 +6010,12 @@ static int test_generated_brace_case(const uint8_t *data, size_t size,
       operations_valid = false;
   for (uint32_t i = 0; i < graph.edge_count; i++) {
     const shell_dep_edge_t *edge = &graph.edges[i];
+    if (!internal_graph_relation(graph, *edge))
+      continue;
     bool timing_report = edge->from < graph.node_count &&
                          graph.nodes[edge->from].type == SHELL_NODE_TIME;
-    graph_reads += graph.edges[i].type == SHELL_EDGE_READ;
+    graph_reads += (graph.edges[i].type == SHELL_EDGE_READ &&
+                    internal_graph_relation(graph, graph.edges[i]));
     graph_pipes += edge->type == SHELL_EDGE_PIPE && !timing_report;
     graph_writes += !timing_report && (edge->type == SHELL_EDGE_WRITE ||
                                        edge->type == SHELL_EDGE_APPEND);
@@ -6179,6 +6237,8 @@ static int test_substitution_case(const shell_substitution_fuzz_case_t &item,
       topology_valid = false;
       continue;
     }
+    if (!internal_graph_relation(graph, *edge))
+      continue;
     if (edge->type == SHELL_EDGE_SUBST) {
       substitution_edges++;
       if ((edge->flags & ~(SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD |
@@ -6242,7 +6302,8 @@ static int test_substitution_case(const shell_substitution_fuzz_case_t &item,
     }
   }
   for (uint32_t i = 0; i < graph.edge_count; i++)
-    if (graph.edges[i].type == SHELL_EDGE_READ &&
+    if ((graph.edges[i].type == SHELL_EDGE_READ &&
+         internal_graph_relation(graph, graph.edges[i])) &&
         graph.edges[i].to < graph.node_count &&
         direct_file_consumers[graph.edges[i].to])
       topology_valid = false;
@@ -6257,6 +6318,8 @@ static int test_substitution_case(const shell_substitution_fuzz_case_t &item,
       for (uint32_t edge_index = 0; edge_index < graph.edge_count;
            edge_index++) {
         const shell_dep_edge_t *edge = &graph.edges[edge_index];
+        if (!internal_graph_relation(graph, *edge))
+          continue;
         outer_write =
             outer_write || (edge->type == SHELL_EDGE_WRITE && edge->to == i &&
                             edge->source_fd == item.outer_fd &&
@@ -6280,6 +6343,8 @@ static int test_substitution_case(const shell_substitution_fuzz_case_t &item,
     bool expected_group_pipe = item.group_pipe_target_fd == UINT32_MAX;
     for (uint32_t edge_index = 0; edge_index < graph.edge_count; edge_index++) {
       const shell_dep_edge_t *edge = &graph.edges[edge_index];
+      if (!internal_graph_relation(graph, *edge))
+        continue;
       if (item.output_process && item.collector_write_count != 0) {
         group_owned_flow = group_owned_flow ||
                            (edge->type == SHELL_EDGE_WRITE &&
@@ -6529,7 +6594,8 @@ static int test_generated_redirect_boundary(unsigned selector) {
           empty_commands == (empty_stage ? 1u : 0u);
   if (mode == 3 || mode == 4) {
     for (uint32_t e = 0; valid && e < graph.edge_count; e++) {
-      if (graph.edges[e].type == SHELL_EDGE_READ) {
+      if ((graph.edges[e].type == SHELL_EDGE_READ &&
+           internal_graph_relation(graph, graph.edges[e]))) {
         valid = graph.edges[e].target_fd == (selector / 6) * 10 + 2;
         document_routes++;
       }
@@ -6640,6 +6706,377 @@ static int test_generated_static_arithmetic_case(const uint8_t *data,
 
 /* Fixed sweeps belong to startup, not one fuzz input's timeout budget. */
 static void run_fixed_oracles() {
+  /* These sequential sweeps never need two retained graphs simultaneously.
+   * Reuse one heap-owned result so adding a fixture family cannot enlarge
+   * the sanitizer startup stack by another full graph object. */
+  std::unique_ptr<shell_dep_graph_t> graph_storage(new shell_dep_graph_t{});
+  shell_dep_graph_t &graph = *graph_storage;
+  static const struct {
+    const char *source;
+    uint32_t nodes, edges;
+  } terminal_capacity[] = {
+      {"exec 3>&-; echo 2>&1 >&3 | cat <input", 5, 3},
+      {"exec 3>&-; { echo 2>&1 >&3; } | cat <input", 6, 4},
+      {"echo | : <&-", 3, 1},
+      {"{ time echo; } 2>&1 | cat <input", 7, 3},
+  };
+  for (const auto &fixture : terminal_capacity) {
+    shell_dep_limits_t limits = SHELL_DEP_LIMITS_DEFAULT;
+    limits.max_nodes = fixture.nodes;
+    limits.max_edges = fixture.edges;
+    shell_dep_error_t status = shell_dep_graph_parse(
+        fixture.source, strlen(fixture.source), nullptr, &limits, &graph);
+    if (status != SHELL_DEP_ETRUNC ||
+        !shellsplit_test_depgraph_invariants(
+            fixture.source, strlen(fixture.source), status, &graph, &limits)) {
+      fprintf(stderr, "terminal-pipe capacity oracle failed: %s\n",
+              fixture.source);
+      shell_dep_graph_dump(&graph, stderr);
+      abort();
+    }
+  }
+  static const struct {
+    const char *source;
+    bool capture;
+  } setup_diagnostics[] = {
+      {"exec 3>&-; sh -c \"$(echo 2>&1 >&3)\"", true},
+      {"exec 3>&-; sh -c \"$(echo >&3 2>&1)\"", false},
+      {"exec 3>&-; sh -c \"$({ echo body; } 2>&1 >&3)\"", true},
+      {"exec 3>&-; sh -c \"$(false && echo 2>&1 >&3)\"", false},
+      {"exec 3>&-; cat <(echo 2>&1 >&3)", true},
+      {"sh -c \"$(exec 2>&1; x=${missing:?expansion-marker})\"", true},
+      {"sh -c \"$(exec 2>&1; x=$((1/0)))\"", true},
+      {"sh -c \"$(exec 2>&1; : ${missing:?expansion-marker} 1>&- 2>&-)\"",
+       true},
+      {"sh -c \"$(: 2>&1 >${missing:?expansion-marker})\"", true},
+      {"sh -c \"$(: >${missing:?expansion-marker} 2>&1)\"", false},
+      {"sh -c \"$(exec 2>&1; false 1>&- 2>&- && x=$((1/0)))\"", false},
+      {"sh -c \"$(x=1)\"", false},
+      {"sh -c \"$(exec 2>&1; x=$(<input))\"", true},
+      {"sh -c \"$(exec 2>&1; x=$(<''))\"", true},
+      {"sh -c \"$(exec 2>&1; x=$(< <(true 1>&- 2>&-)))\"", true},
+      {"sh -c \"$(: 2>&1 >$(<input) 1>&- 2>&-)\"", true},
+  };
+  for (const auto &fixture : setup_diagnostics) {
+    shell_dep_error_t status = shell_dep_graph_parse(
+        fixture.source, strlen(fixture.source), nullptr, nullptr, &graph);
+    bool capture = false;
+    for (uint32_t edge = 0; edge < graph.edge_count; edge++)
+      capture |= graph.edges[edge].type == SHELL_EDGE_SUBST &&
+                 graph.edges[edge].source_fd == 2;
+    if (status != SHELL_DEP_OK || !shell_dep_graph_validate(&graph).valid ||
+        capture != fixture.capture) {
+      fprintf(stderr, "setup diagnostic oracle failed: %s\n", fixture.source);
+      shell_dep_graph_dump(&graph, stderr);
+      abort();
+    }
+  }
+  static const char diagnostic_redirect_opener[] =
+      "while IFS= read -r line; do echo \"$line\"; done < input(\n";
+  if (test_tokenizer_state(diagnostic_redirect_opener,
+                           sizeof(diagnostic_redirect_opener) - 1)) {
+    fputs("diagnostic redirect-opener oracle failed\n", stderr);
+    abort();
+  }
+  static const struct {
+    const char *source;
+    bool capture;
+  } cd_captures[] = {
+      {"sh -c \"$(exec 2>&1; cd one two)\"", true},
+      {"sh -c \"$(cd /; cd -)\"", true},
+      {"sh -c \"$({ exec 2>&1; cd one two; })\"", true},
+      {"sh -c \"$(exec 1>&- 2>&-; cd one two)\"", false},
+      {"sh -c \"$(false >&- 2>&- && cd one two)\"", false},
+  };
+  for (const auto &fixture : cd_captures) {
+    shell_dep_error_t status = shell_dep_graph_parse(
+        fixture.source, strlen(fixture.source), nullptr, nullptr, &graph);
+    bool capture = false, cd = false;
+    for (uint32_t node = 0; node < graph.node_count; node++)
+      cd |= graph.nodes[node].type == SHELL_NODE_CMD &&
+            graph.nodes[node].cmd.token_count &&
+            graph.nodes[node].cmd.token_lens[0] == 2 &&
+            !memcmp(graph.nodes[node].cmd.tokens[0], "cd", 2);
+    for (uint32_t edge = 0; edge < graph.edge_count; edge++)
+      capture |= graph.edges[edge].type == SHELL_EDGE_SUBST;
+    if (status != SHELL_DEP_OK || !shell_dep_graph_validate(&graph).valid ||
+        !cd || capture != fixture.capture) {
+      fprintf(stderr, "cd capture oracle failed: %s\n", fixture.source);
+      shell_dep_graph_dump(&graph, stderr);
+      abort();
+    }
+  }
+  static const struct {
+    const char *source;
+    bool capture;
+  } assignment_captures[] = {
+      {"sh -c \"$(x=1)\"", false},
+      {"sh -c \"$(UID=1 2>&1)\"", false},
+      {"sh -c \"$(exec 2>&1; UID=1)\"", true},
+      {"sh -c \"$(exec 2>&1; UID=1 true 1>&- 2>&-)\"", true},
+      {"sh -c \"$(exec 1>&- 2>&-; UID=1)\"", false},
+      {"sh -c \"$(UID=$(printf skipped) true 1>&- 2>&-)\"", false},
+  };
+  for (const auto &fixture : assignment_captures) {
+    shell_dep_error_t status = shell_dep_graph_parse(
+        fixture.source, strlen(fixture.source), nullptr, nullptr, &graph);
+    bool capture = false;
+    for (uint32_t edge = 0; edge < graph.edge_count; edge++)
+      capture |=
+          graph.edges[edge].type == SHELL_EDGE_SUBST &&
+          graph.edges[edge].to == 0 &&
+          (graph.edges[edge].flags & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD);
+    if (status != SHELL_DEP_OK || !shell_dep_graph_validate(&graph).valid ||
+        capture != fixture.capture) {
+      fprintf(stderr, "assignment capture oracle failed: %s\n", fixture.source);
+      shell_dep_graph_dump(&graph, stderr);
+      abort();
+    }
+  }
+  static const struct {
+    const char *source;
+    uint32_t environments, substitutions;
+  } assignment_effects[] = {
+      {"UID=1 true", 0, 0},
+      {"UID=1 EUID+=2 command true", 0, 0},
+      {"UID=1 x=2 true", 1, 0},
+      {"export 'U''ID=1' x=2", 1, 0},
+      {"export -Z x=2", 0, 0},
+      {"UID=$(printf skipped) true", 0, 0},
+      {"UID=$(printf data) $missing", 0, 1},
+      {"UID=$(printf data) $(true)", 0, 2},
+      {"UID=$(printf data) \"$@\"", 0, 1},
+      {"UID=$(printf data) \"${!prefix@}\"", 0, 1},
+      {"UID=$(printf data) \"${@:+data}\"", 0, 1},
+      {"UID=$(printf skipped) \"${!prefix*}\"", 0, 0},
+      {"UID=$(printf skipped) \"${@:-data}\"", 0, 0},
+      {"UID=$(printf skipped) \"${@:-}\"", 0, 0},
+      {"UID=$(printf skipped) \"${@:?error}\"", 0, 0},
+      {"UID=$(printf skipped) \"$missing\"", 0, 0},
+      {"UID=$(printf skipped) $missing true", 0, 0},
+      {"UID=$(printf skipped) $missing-suffix", 0, 0},
+      {"export UID=$(printf data)", 0, 1},
+  };
+  for (const auto &fixture : assignment_effects) {
+    shell_dep_error_t status = shell_dep_graph_parse(
+        fixture.source, strlen(fixture.source), nullptr, nullptr, &graph);
+    uint32_t environments = 0, substitutions = 0;
+    for (uint32_t edge = 0; edge < graph.edge_count; edge++) {
+      environments += graph.edges[edge].type == SHELL_EDGE_ENV;
+      substitutions += graph.edges[edge].type == SHELL_EDGE_SUBST;
+    }
+    if (status != SHELL_DEP_OK || environments != fixture.environments ||
+        substitutions != fixture.substitutions) {
+      fputs("rejected assignment ENV effect mismatch\n", stderr);
+      abort();
+    }
+  }
+  static const char *const timed_group_lines[] = {
+      "time (\nwc\n)",
+      "time {\nwc;\n}",
+      "while true; do :; done; time (\nwc\n)",
+      "while true; do :; done; time {\nwc;\n}",
+  };
+  for (const char *source : timed_group_lines)
+    if (test_tokenizer_state(source, strlen(source))) {
+      fputs("timed-group newline oracle failed\n", stderr);
+      abort();
+    }
+  static const struct {
+    const char *source;
+    bool wc_null;
+  } async_inputs[] = {
+      {"wc -c &", true},
+      {"wc -c &\n", true},
+      {"wc -c &\nwait", true},
+      {"wc -c & # note\n\nwait", true},
+      {"time wc -c &\nwait", true},
+      {"true && wc -c &\nwait", true},
+      {"false || wc -c &\nwait", true},
+      {"printf '%s' \"$(wc -c &\nwait)\"", true},
+      {"cat <(wc -c &\nwait)", true},
+      {"wc -c 3<<EOF &\nbody\nEOF\nwait", false},
+      {"wc -c <&0 &", false},
+      {"wc -c 3</dev/null &", false},
+      {"printf '%s' \"$(wc -c)\" &", false},
+      {"time printf '%s' \"$(wc -c)\" &", true},
+      {"true && printf '%s' \"$(wc -c)\" &", true},
+      {": 3>\"$(wc -c >&2; printf /dev/null)\" &", true},
+      {"UID=1\ntime wc -c & wait", true},
+      {"UID=1\ntrue && wc -c & wait", true},
+      {"UID=1\ntrue && printf '%s' \"$(wc -c)\" & wait", true},
+      {"UID=1; time wc -c & wait", false},
+      {"UID=1; : &\nwc -c &\nwait", true},
+      {"exit 0\ntime wc -c & wait", false},
+  };
+  for (const auto &fixture : async_inputs) {
+    shell_dep_error_t status = shell_dep_graph_parse(
+        fixture.source, strlen(fixture.source), nullptr, nullptr, &graph);
+    bool valid =
+        status == SHELL_DEP_OK && shell_dep_graph_validate(&graph).valid;
+    bool found = false;
+    for (uint32_t edge = 0; valid && edge < graph.edge_count; edge++) {
+      const auto &item = graph.edges[edge];
+      const auto &source = graph.nodes[item.from];
+      const auto &target = graph.nodes[item.to];
+      if (item.type == SHELL_EDGE_READ && item.target_fd == 0 &&
+          source.type == SHELL_NODE_DOC &&
+          (source.doc.flags & SHELL_DEP_DOC_FLAG_IMPLICIT) &&
+          target.type == SHELL_NODE_CMD && target.cmd.token_count &&
+          target.cmd.token_lens[0] == 2 &&
+          !memcmp(target.cmd.tokens[0], "wc", 2))
+        found = true;
+    }
+    if (!valid || found != fixture.wc_null) {
+      fprintf(stderr, "asynchronous stdin oracle failed: %s\n", fixture.source);
+      shell_dep_graph_dump(&graph, stderr);
+      abort();
+    }
+  }
+  static const struct {
+    const char *source;
+    bool reached;
+  } async_completion[] = {
+      {"{ false & } || printf bad >out", false},
+      {"{ false & } && printf good >out", true},
+      {"{ false && true & } || printf bad >out", false},
+      {"{ { false; } & } || printf bad >out", false},
+      {"(false &) || printf bad >out", false},
+      {"{ { false & }; } || printf bad >out", false},
+      {"! { false & } && printf bad >out", false},
+      {"time { false & } || printf bad >out", false},
+      {"echo \"$( { false & } || printf bad >out )\"", false},
+      {"{ true & false; } || printf good >out", true},
+  };
+  for (const auto &fixture : async_completion) {
+    shell_dep_error_t status = shell_dep_graph_parse(
+        fixture.source, strlen(fixture.source), nullptr, nullptr, &graph);
+    bool valid =
+        status == SHELL_DEP_OK && shell_dep_graph_validate(&graph).valid;
+    bool found = false, effects = false;
+    for (uint32_t node = 0; valid && node < graph.node_count; node++) {
+      const auto &command = graph.nodes[node];
+      if (command.type != SHELL_NODE_CMD || !command.cmd.token_count ||
+          command.cmd.token_lens[0] != 6 ||
+          memcmp(command.cmd.tokens[0], "printf", 6))
+        continue;
+      found = true;
+      for (uint32_t edge = 0; edge < graph.edge_count; edge++) {
+        const auto &item = graph.edges[edge];
+        effects |= (item.type == SHELL_EDGE_READ && item.to == node) ||
+                   (item.type == SHELL_EDGE_WRITE && item.from == node);
+      }
+    }
+    if (!valid || !found || effects != fixture.reached) {
+      fprintf(stderr, "asynchronous completion oracle failed: %s\n",
+              fixture.source);
+      shell_dep_graph_dump(&graph, stderr);
+      abort();
+    }
+  }
+  static const char *const background_isolation[] = {
+      "exec 0<&- && true &\ncat", "exec 0<&- && true & # note\n\ncat",
+      "cd /tmp && true &\ncat", "exec 0<&- && true &\ncd /tmp && true &\ncat"};
+  for (const char *source : background_isolation) {
+    shell_dep_error_t status =
+        shell_dep_graph_parse(source, strlen(source), "/", nullptr, &graph);
+    bool valid =
+        status == SHELL_DEP_OK && shell_dep_graph_validate(&graph).valid;
+    bool inherited_stdin = false, background = false;
+    for (uint32_t node = 0; valid && node < graph.node_count; node++) {
+      const auto &command = graph.nodes[node];
+      if (command.type != SHELL_NODE_CMD || !command.cmd.token_count ||
+          command.cmd.token_lens[0] != 3 ||
+          memcmp(command.cmd.tokens[0], "cat", 3))
+        continue;
+      valid = command.cmd.cwd_known &&
+              !strcmp(graph.cwd_buf.data + command.cmd.cwd_offset, "/");
+      for (uint32_t edge = 0; edge < graph.edge_count; edge++) {
+        const auto &item = graph.edges[edge];
+        if (item.to != node)
+          continue;
+        background |= item.type == SHELL_EDGE_BACKGROUND;
+        if (item.type == SHELL_EDGE_READ && item.target_fd == 0) {
+          const auto &resource = graph.nodes[item.from];
+          valid &= resource.type == SHELL_NODE_FD && resource.fd.number == 0;
+          inherited_stdin = true;
+        }
+      }
+    }
+    if (!valid || !inherited_stdin || !background) {
+      fprintf(stderr, "background isolation oracle failed: %s\n", source);
+      shell_dep_graph_dump(&graph, stderr);
+      abort();
+    }
+  }
+  static const struct {
+    const char *source;
+    uint32_t inherited;
+  } boundaries[] = {{"wc -l file.txt", 2},
+                    {"wc -l file.txt 2>&1", 1},
+                    {"wc -l file.txt 2>&1 >out", 1},
+                    {"exec {fd}>&1; wc 2>&$fd", 1},
+                    {"time wc 2>&1", 1}};
+  for (const auto &fixture : boundaries) {
+    shell_dep_error_t status = shell_dep_graph_parse(
+        fixture.source, strlen(fixture.source), nullptr, nullptr, &graph);
+    if (status != SHELL_DEP_OK || !shell_dep_graph_validate(&graph).valid) {
+      fprintf(stderr, "boundary oracle parse failed: %s (%d)\n", fixture.source,
+              status);
+      shell_dep_graph_dump(&graph, stderr);
+      abort();
+    }
+    bool found = false;
+    for (uint32_t i = 0; i < graph.edge_count; i++) {
+      const auto &edge = graph.edges[i];
+      const auto &owner = graph.nodes[edge.from];
+      const auto &target = graph.nodes[edge.to];
+      if (edge.type == SHELL_EDGE_WRITE && edge.source_fd == 2 &&
+          owner.type == SHELL_NODE_CMD && owner.cmd.token_count &&
+          owner.cmd.token_lens[0] == 2 &&
+          !memcmp(owner.cmd.tokens[0], "wc", 2) &&
+          target.type == SHELL_NODE_FD && target.fd.number == fixture.inherited)
+        found = true;
+    }
+    if (!found) {
+      fprintf(stderr, "boundary oracle route failed: %s\n", fixture.source);
+      abort();
+    }
+  }
+  static const struct {
+    const char *source;
+    uint32_t fd, inherited;
+    bool input;
+  } standard_directions[] = {
+      {"wc 0>&1", 0, 1, false},     {"wc 1<&0", 1, 0, true},
+      {"wc 2<&0", 2, 0, true},      {"wc 0>&1 1>&-", 0, 1, false},
+      {"wc 1<&0 0<&-", 1, 0, true}, {"echo \"$(wc 1<&0)\"", 1, 0, true},
+  };
+  for (const auto &fixture : standard_directions) {
+    shell_dep_error_t status = shell_dep_graph_parse(
+        fixture.source, strlen(fixture.source), nullptr, nullptr, &graph);
+    bool valid =
+        status == SHELL_DEP_OK && shell_dep_graph_validate(&graph).valid;
+    unsigned found = 0;
+    for (uint32_t edge = 0; valid && edge < graph.edge_count; edge++) {
+      const auto &item = graph.edges[edge];
+      const auto &owner = graph.nodes[fixture.input ? item.to : item.from];
+      const auto &resource = graph.nodes[fixture.input ? item.from : item.to];
+      if (item.type == (fixture.input ? SHELL_EDGE_READ : SHELL_EDGE_WRITE) &&
+          (fixture.input ? item.target_fd : item.source_fd) == fixture.fd &&
+          owner.type == SHELL_NODE_CMD && owner.cmd.token_count &&
+          owner.cmd.token_lens[0] == 2 &&
+          !memcmp(owner.cmd.tokens[0], "wc", 2)) {
+        valid = resource.type == SHELL_NODE_FD &&
+                resource.fd.number == fixture.inherited;
+        found++;
+      }
+    }
+    if (!valid || found != 1) {
+      fprintf(stderr, "standard direction oracle failed: %s\n", fixture.source);
+      abort();
+    }
+  }
   bool reachable[256] = {};
   bool single_byte_selectors[descriptor_move_single_byte_selector_count] = {};
   for (unsigned first = 6; first < 256; first += 8) {
@@ -6670,7 +7107,6 @@ static void run_fixed_oracles() {
     for (uint32_t i = 0; i < parsed.count; i++)
       features |= parsed.cmds[i].features;
     shell_processed_commands_t processed = {};
-    shell_dep_graph_t graph = {};
     valid =
         valid && !!(features & SHELL_FEAT_ARRAY) == fixture.array &&
         !!(features & SHELL_FEAT_GLOBS) == fixture.glob &&
@@ -6770,7 +7206,6 @@ static void run_fixed_oracles() {
   for (const auto &fixture : shellsplit_test_tilde_words) {
     size_t length = strlen(fixture.word), decoded = 0;
     std::string source = std::string("echo >") + fixture.word;
-    shell_dep_graph_t graph = {};
     bool valid = shell_visit_static_word(fixture.word, length, nullptr, nullptr,
                                          &decoded) != fixture.generic_dynamic &&
                  shell_dep_graph_parse(source.data(), source.size(), ".",
@@ -6806,7 +7241,6 @@ static void run_fixed_oracles() {
   }
   for (const auto &fixture : shellsplit_test_tilde_cwd) {
     std::string source = std::string("cd ") + fixture.word + "; pwd >out";
-    shell_dep_graph_t graph = {};
     bool valid =
         shell_dep_graph_parse(source.data(), source.size(), "/workspace",
                               nullptr, &graph) == SHELL_DEP_OK &&
@@ -6900,6 +7334,14 @@ static void run_fixed_oracles() {
     if (test_composed_substitution_case(&selector, 1, "/tmp"))
       abort();
   static const uint8_t local_document_selectors[] = {58, 59, 60};
+  for (uint8_t depth = 0; depth < 8; depth++)
+    for (uint8_t composition = 0; composition < 6; composition++) {
+      const uint8_t diagnostic_group_case[] = {0,           1, 2, 0, depth,
+                                               composition, 1, 0, 1};
+      if (test_generated_brace_case(diagnostic_group_case,
+                                    sizeof(diagnostic_group_case), "/tmp"))
+        abort();
+    }
   for (uint8_t selector : local_document_selectors)
     if (test_generated_brace_case(&selector, 1, "/tmp"))
       abort();

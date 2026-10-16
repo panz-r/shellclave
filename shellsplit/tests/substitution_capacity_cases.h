@@ -29,24 +29,27 @@ static const char *const shellsplit_test_substitution_capacity_cases[] = {
 };
 
 /* Unknown probe outcomes leave the initial route and each later route live.
+ * Accumulate them on fd 9, then copy once to stderr: shell-owned setup errors
+ * remain on ordinary stderr instead of producing a quadratic public fanout
+ * from every intermediate exec. This isolates the snapshot-alternative bound.
  * `changes == MAX - 1` fits exactly; MAX exceeds the alternative budget by one.
  * Required outputs reference distinct writable storage; tail is terminated. */
 static SHELL_NONNULL(1, 4, 5) bool shellsplit_test_substitution_capacity_source(
     char *source, size_t capacity, unsigned changes, const char *tail,
     size_t *length) {
   *length = 0;
-  int written = snprintf(source, capacity, "exec 2>base || exit;");
+  int written = snprintf(source, capacity, "exec 9>base || exit;");
   if (written < 0 || (size_t)written >= capacity)
     return false;
   size_t used = (size_t)written;
   for (unsigned i = 0; i < changes; i++) {
     written = snprintf(source + used, capacity - used,
-                       " probe && exec 2>route%u;", i);
+                       " probe && exec 9>route%u;", i);
     if (written < 0 || (size_t)written >= capacity - used)
       return false;
     used += (size_t)written;
   }
-  written = snprintf(source + used, capacity - used, " %s", tail);
+  written = snprintf(source + used, capacity - used, " exec 2>&9; %s", tail);
   if (written < 0 || (size_t)written >= capacity - used)
     return false;
   *length = used + (size_t)written;

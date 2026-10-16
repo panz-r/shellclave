@@ -5,8 +5,9 @@
  * command dependency graph from shell command strings.
  *
  * Consumes the output of the fast tokenizer (shell_parse_fast).
- * Produces a linearized, topologically-sorted graph of CMD and DOC
- * nodes with directed/undirected edges. Compound groups are first-class
+ * Produces a linearized graph of execution and data-resource nodes with
+ * directed/undirected edges. Control relations form a DAG; byte relations
+ * need not. Compound groups are first-class
  * execution endpoints: their redirects and external pipes connect to the
  * GROUP node, while GROUP edges express containment rather than I/O.
  *
@@ -89,6 +90,8 @@ typedef enum {
   SHELL_NODE_ENDPOINT,
   /* Shell-owned Bash `time` operation for one pipeline. */
   SHELL_NODE_TIME,
+  /* A descriptor inherited when the complete submitted command starts. */
+  SHELL_NODE_FD,
 } shell_dep_node_type_t;
 
 typedef enum {
@@ -131,6 +134,11 @@ typedef enum {
    * Setup fails without opening the file. Source-only parsers also emit this
    * flag. Unreached operands retain their source spelling without this flag. */
   SHELL_DEP_DOC_FLAG_EXPANSION_FAILED = 1 << 6,
+  /* Bash-supplied resource, not an explicit source redirection. For FILE,
+   * path/path_len borrow a library-owned immutable canonical pathname for
+   * the graph lifetime; do not expand or quote-remove it. Other spans and
+   * CWD fields are empty. Currently used for asynchronous stdin /dev/null. */
+  SHELL_DEP_DOC_FLAG_IMPLICIT = 1 << 7,
 } shell_dep_doc_flags_t;
 
 typedef enum {
@@ -149,10 +157,12 @@ typedef enum {
   SHELL_EDGE_GROUP = 12,
   /* A setup-time redirection binds a descriptor without claiming command-byte
    * flow. It represents named descriptors and ordinary numeric descriptors
-   * whose route is later replaced or closed. Direction preserves file-to-FD
-   * (`<`), FD-to-file (`>`/`>>`), both (`<>`), or a named descriptor's
-   * process-substitution endpoint until a later `$name` use materializes the
-   * actual I/O edge. */
+   * whose route is later replaced or closed, as well as setup-only process
+   * redirects on null commands or descriptor-only exec. Direction preserves
+   * file-to-FD (`<`), FD-to-file (`>`/`>>`), both (`<>`), or a process endpoint
+   * for numeric and named descriptors. `< <(producer)` and `> >(consumer)`
+   * install descriptors without body-byte transfer. A later actual use can
+   * materialize the corresponding byte-flow edge. */
   SHELL_EDGE_FD_OPEN = 13,
   /* An explicit `>&-` / `<&-` close or a successful move's source close,
    * including Bash `{name}` and persistent numeric `exec` descriptors. The
@@ -209,7 +219,7 @@ typedef enum {
  * inputs, writable workspace, and shell_dep_graph_t output must have storage
  * and lifetimes appropriate to their roles; no writable span may overlap a
  * borrowed input or another writable object. A NULL, misaligned, or undersized
- * workspace causes (for nonempty executable source, including a collapsible cd)
+ * workspace causes (for nonempty executable source, including cd)
  * SHELL_DEP_EWORKSPACE rather than a hidden allocation. Storage aliasing is
  * invalid API use and is not checked at runtime.
  */
@@ -218,13 +228,6 @@ typedef struct {
   uint32_t max_edges;
   uint32_t max_tokens_per_cmd;
   uint32_t cwd_buf_size; /* 0 = use default SHELL_DEP_CWD_BUF_SIZE */
-  /* cd_as_cmd: when true, a statically recognized current-shell `cd` (direct
-   *            or through `command`/`builtin`) produces a CMD node with a CWD
-   *            edge. When false (default), a plain `cd` only changes tracked
-   *            CWD; redirects, executable substitutions, local pipeline/
-   *            background execution, and conditional status dependencies still
-   *            require a CMD endpoint so their effects remain visible. */
-  bool cd_as_cmd;
   void *workspace;
   size_t workspace_size;
 } shell_dep_limits_t;
@@ -234,7 +237,6 @@ static const shell_dep_limits_t SHELL_DEP_LIMITS_DEFAULT = {
     SHELL_DEP_MAX_EDGES,
     SHELL_DEP_MAX_TOKENS,
     0, /* cwd_buf_size: use default 16384 */
-    false,
     NULL,
     0};
 
@@ -364,12 +366,26 @@ typedef struct {
   uint8_t reserved;
 } shell_dep_endpoint_t;
 
+/** Full-command I/O boundary resource. `number` is the original inherited
+ * descriptor, not a mutable shell-local slot or an OS file identity. One node
+ * is shared by all retained uses of that number, including recursive scopes.
+ * READ/WRITE edges carry the local execution descriptor on their execution
+ * side and SHELL_DEP_FD_NONE on this resource side. These are available routes,
+ * not predictions that an executable actually reads or writes bytes. The
+ * boundary is not an internal pipe, control relation, or substitution bridge.
+ * Different inherited numbers are not presumed to name distinct OS objects.
+ */
+typedef struct {
+  uint32_t number;
+} shell_dep_fd_t;
+
 /** Effective destination class for Bash's shell-owned timing report. */
 typedef enum {
-  /* The report leaves the parsed graph through report_target_fd. */
+  /* The report leaves the command through a WRITE edge to an inherited FD
+   * node. report_target_fd is that node's inherited descriptor number. */
   SHELL_TIME_REPORT_EXTERNAL = 0,
-  /* One outgoing WRITE, APPEND, PIPE, or SUBST edge identifies the
-   * destination. */
+  /* One outgoing WRITE, APPEND, PIPE, or SUBST edge identifies an internal
+   * destination (not an inherited FD boundary). */
   SHELL_TIME_REPORT_GRAPH,
   /* The effective report descriptor is closed. */
   SHELL_TIME_REPORT_CLOSED,
@@ -416,7 +432,9 @@ typedef enum {
  * destination is explicit. A deterministic destination retains the compact
  * report_route/report_target_fd summary. MULTIPLE uses report_route_flags,
  * every outgoing WRITE/APPEND/PIPE/SUBST edge, and report_external_fds to
- * retain all statically possible destinations. CLOSED contributes a flag but
+ * retain all statically possible destinations. External list entries are
+ * derived from retained WRITE-to-FD edges, not an alternative routing model.
+ * CLOSED contributes a flag but
  * no edge.
  * CLOSED means an explicit close; UNAVAILABLE means the effective descriptor
  * lacks a write-capable route. UNKNOWN remains reserved for capacity
@@ -438,7 +456,8 @@ typedef struct {
  *
  * Fields are used according to kind:
  *   FILE:      path/path_len (source); RESOLVED_PATH uses value/value_len
- *              for the separately borrowed decoded pathname
+ *              for the separately borrowed decoded pathname; IMPLICIT uses
+ *              a library-owned immutable canonical path, not shell source
  *   HEREDOC:   name/name_len (borrowed delimiter display span),
  *              value/value_len (source content)
  *   HERESTRING: value/value_len (content; an expandable word can receive
@@ -448,7 +467,9 @@ typedef struct {
  *
  * Fields ordinarily borrow source spans. An internal expansion-aware graph's
  * RESOLVED_PATH value instead borrows its resolver's decoded payload for the
- * lifetime of that graph. Heredoc delimiter matching applies shell quote
+ * lifetime of that graph. IMPLICIT paths are library-owned and valid for the
+ * graph lifetime; no resolver callback or quote removal applies to them.
+ * Heredoc delimiter matching applies shell quote
  * removal, but `name` is not a decoded value: one enclosing homogeneous
  * `'...'` or `"..."` pair is elided for display, while mixed-quote,
  * backslash, and ANSI-C spellings retain their source span. Other `value`
@@ -470,7 +491,7 @@ typedef struct {
    * expansion point. cwd_absolute distinguishes a real absolute CWD from a
    * relative initial base whose modeled path may look absolute. Unknown CWD
    * or dynamic names cannot establish a static file identity. Other document
-   * kinds leave these fields unused. */
+   * kinds and IMPLICIT absolute FILE documents leave these fields unused. */
   uint32_t cwd_offset;
   bool cwd_known;
   bool cwd_absolute;
@@ -489,6 +510,7 @@ typedef struct {
     shell_dep_group_t group;
     shell_dep_endpoint_t endpoint;
     shell_dep_time_t time;
+    shell_dep_fd_t fd;
   };
 } shell_dep_node_t;
 
@@ -640,11 +662,48 @@ typedef struct {
  * descriptor-only exec. It reads the live saves from that reached prefix, so
  * a closed save can stop restoration and leave an earlier temporary route
  * installed. Timing reports exclude successful cleanup when setup never
- * reached the body. Completed named allocations can survive a later setup
+ * reached the body. Byte-flow edges also include shell-owned setup/undo
+ * diagnostics, including parameter/arithmetic expansion and known
+ * readonly-assignment errors: their CMD/GROUP
+ * owner and source fd 2 identify the stderr capability at the failure point,
+ * before cleanup or later redirects. Such an edge does not imply that the
+ * command body executed. Diagnostics can feed a substitution, pipe, file, or
+ * inherited descriptor; closed/read-only stderr emits no bytes.
+ * Argument/RHS expansion diagnostics use entry stderr; redirect operands and
+ * expandable here-documents use stderr after preceding redirects, before the
+ * current redirect and before cleanup. Expansion failure syntax retains a
+ * possible diagnostic route without evaluating variable or arithmetic values.
+ * Optimized `$(<word)` readers also retain possible open/read diagnostics,
+ * even when pathname resolution removes their stdout content flow. Those
+ * diagnostics use the enclosing expansion phase's stderr; the read failure
+ * remains local to the substitution. Resolving a pathname does not prove I/O
+ * success or remove these possible routes.
+ * Assignment errors use pre-redirection stderr. A failing argv-less readonly
+ * assignment prevents its redirects, while a readonly executable prefix may
+ * still execute the command. Rejected temporary prefixes skip their RHS;
+ * assignment-only and export forms expand it before rejection. Failed
+ * assignments retain syntax but do not contribute effective ENV edges.
+ * Dispatch depends on argv after expansion, not syntactic command words.
+ * When every command word can disappear, both assignment-only and executable
+ * alternatives remain possible: rejected RHS substitutions are retained only
+ * on the former, without terminating the latter's continuation. A quoted empty
+ * scalar word is an argv entry; an unquoted expansion or quoted "$@" can
+ * instead produce no entries. Quoted name enumeration with * and defaulted
+ * positional lists (-/:-) retain at least one entry. Quoted positional-list
+ * error operators (?/:?) either retain an entry or abort expansion; an abort is
+ * not an assignment-only dispatch. These presence proofs do not imply exactly
+ * one argument or resolve command identity. Successful argv-less stages have no
+ * default body streams; their explicit setup and pipeline connections remain
+ * represented. Possible filesystem and implicit asynchronous-stdin open
+ * failures retain diagnostic alternatives without asserting that the open
+ * actually failed. Completed named allocations can survive a later setup
  * failure. Descriptor existence is tracked separately from read/write
  * capability: duplicating a live read-only FD succeeds even though subsequent
  * writes, including timing reports, are unavailable. CWD tracking follows
- * execution outcomes, including commands collapsed by cd_as_cmd=false:
+ * execution outcomes. A statically recognized current-shell cd is an ordinary
+ * CMD node with a CWD edge, including through command/builtin wrappers;
+ * callers need not reconstruct directory changes from its argv. Its words
+ * and redirects use the incoming CWD, before its transition is committed:
  * unreachable transitions leave it unchanged. A conditional brace body tracks
  * its own executing-path directory; its continuation keeps a known CWD only
  * when paths reaching that continuation agree. Terminated paths do not

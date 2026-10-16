@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(Shellclave VERSION 0.14.0 LANGUAGES C CXX)
+project(Shellclave VERSION 0.15.0 LANGUAGES C CXX)
 
 if(PROJECT_IS_TOP_LEVEL)
   set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -279,6 +279,14 @@ if(BUILD_TESTING)
       -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/test_reference_bash.cmake)
   set_tests_properties(shellclave_reference_bash_contract PROPERTIES LABELS cmake)
   if(SHELLCLAVE_BASH_EXECUTABLE)
+    add_test(NAME shellsplit_bash_async_stdin
+      COMMAND ${CMAKE_COMMAND}
+        -DSHELLCLAVE_BASH=${SHELLCLAVE_BASH_EXECUTABLE}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/test_bash_async_stdin.cmake)
+    set_tests_properties(shellsplit_bash_async_stdin PROPERTIES
+      LABELS shellsplit TIMEOUT 15
+      ENVIRONMENT
+        "BASH_ENV=${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/bash_env_enable_lastpipe.sh;BASHOPTS=lastpipe;SHELLOPTS=braceexpand:hashall:interactive-comments:monitor;POSIXLY_CORRECT=1;BASH_COMPAT=42;BASH_XTRACEFD=9")
     add_test(NAME shellsplit_bash_descriptor_moves
       COMMAND ${CMAKE_COMMAND}
         -DSHELLCLAVE_BASH=${SHELLCLAVE_BASH_EXECUTABLE}
@@ -353,6 +361,13 @@ if(BUILD_TESTING)
     PROPERTIES LABELS shellsplit)
   shellclave_add_test(shellsplit_entropy_test shellsplit/tests/entropy_test.c shellsplit_test)
   shellclave_add_test(shellsplit_depgraph_test shellsplit/tests/test_depgraph.c shellsplit_test)
+  shellclave_add_test(shellsplit_boundary_test shellsplit/tests/boundary_test.c shellsplit_test)
+  target_compile_definitions(shellsplit_boundary_test PRIVATE SHELLSPLIT_TEST_SOURCE_SCANS)
+  target_include_directories(shellsplit_boundary_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/shellsplit/tests)
+  shellclave_add_test(shellsplit_boundary_production_test shellsplit/tests/boundary_test.c shellsplit)
+  set_tests_properties(shellsplit_boundary_test shellsplit_boundary_production_test
+    PROPERTIES LABELS shellsplit)
   shellclave_add_test(shellsplit_descriptor_move_test
     shellsplit/tests/descriptor_move_test.c shellsplit_test)
   target_compile_definitions(shellsplit_descriptor_move_test PRIVATE

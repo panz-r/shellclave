@@ -155,7 +155,8 @@ typedef struct {
   /* Direct I/O plus I/O owned by an enclosing compound group. write_count also
    * includes output-file setup that the shell performs before a later redirect
    * replaces that descriptor. These are effective evaluation context counts,
-   * not claims of direct command byte-flow edges. */
+   * not claims of direct command byte-flow edges. Inherited boundary FD routes
+   * are not explicit redirect effects and do not contribute to these counts. */
   uint32_t write_count;
   uint32_t read_count;
   uint32_t env_count;
@@ -166,11 +167,11 @@ typedef struct {
   bool requires_substitution_evaluation;
   /* True when any represented dynamic substitution route reaches this command
    * or an enclosing compound group. This includes dynamic FILE names, ordinary
-   * process-substitution I/O, and named-FD input setup such as
-   * `exec {fd}< <(producer)`. Named-FD output setup is source-only and marks
-   * its downstream substitution consumer instead. Setup is topology only: it
-   * does not by itself set requires_substitution_evaluation or claim code
-   * execution or risk. */
+   * process-substitution I/O, and setup-only input redirects such as
+   * `exec {fd}< <(producer)` or `< <(producer)`. Output setup is source-only
+   * and marks its downstream substitution consumer instead. Setup is topology
+   * only: it does not by itself set requires_substitution_evaluation or claim
+   * code execution or risk. */
   bool has_dynamic_substitution_io;
   /* Structural relationships, group membership, background execution, and
    * pipeline timing belong to Shellsplit's dependency graph, not this policy

@@ -83,6 +83,53 @@ static bool check_depgraph_workspace_api() {
                                         nullptr) == SHELL_DEP_OK &&
          shell_dep_graph_validate(&graph).valid;
   }
+  if (ok) {
+    constexpr char redirected[] = "wc -l file.txt 2>&1";
+    ok = shell_dep_graph_parse(redirected, sizeof(redirected) - 1, ".", &limits,
+                               &graph) == SHELL_DEP_OK;
+    bool stderr_to_stdout = false;
+    for (std::uint32_t i = 0; ok && i < graph.edge_count; ++i) {
+      const auto &edge = graph.edges[i];
+      stderr_to_stdout |= edge.type == SHELL_EDGE_WRITE &&
+                          edge.source_fd == 2 &&
+                          graph.nodes[edge.to].type == SHELL_NODE_FD &&
+                          graph.nodes[edge.to].fd.number == 1;
+    }
+    ok = ok && stderr_to_stdout && shell_dep_graph_validate(&graph).valid;
+  }
+  if (ok) {
+    constexpr char directory[] = "cd /tmp; pwd";
+    ok = shell_dep_graph_parse(directory, sizeof(directory) - 1, "/", &limits,
+                               &graph) == SHELL_DEP_OK &&
+         shell_dep_graph_validate(&graph).valid;
+    unsigned commands = 0, cwd_edges = 0;
+    for (std::uint32_t i = 0; ok && i < graph.node_count; i++)
+      if (graph.nodes[i].type == SHELL_NODE_CMD) {
+        const auto &command = graph.nodes[i].cmd;
+        ok = command.cwd_known &&
+             std::strcmp(graph.cwd_buf.data + command.cwd_offset,
+                         commands == 0 ? "/" : "/tmp") == 0;
+        ++commands;
+      }
+    for (std::uint32_t i = 0; i < graph.edge_count; i++)
+      cwd_edges += graph.edges[i].type == SHELL_EDGE_CWD;
+    ok = ok && commands == 2 && cwd_edges == 1;
+  }
+  if (ok) {
+    constexpr char background[] = "wc -c &";
+    ok = shell_dep_graph_parse(background, sizeof(background) - 1, ".", &limits,
+                               &graph) == SHELL_DEP_OK &&
+         shell_dep_graph_validate(&graph).valid;
+    unsigned implicit = 0;
+    for (std::uint32_t i = 0; ok && i < graph.node_count; ++i)
+      if (graph.nodes[i].type == SHELL_NODE_DOC &&
+          (graph.nodes[i].doc.flags & SHELL_DEP_DOC_FLAG_IMPLICIT)) {
+        ++implicit;
+        ok = graph.nodes[i].doc.path_len == 9 &&
+             std::memcmp(graph.nodes[i].doc.path, "/dev/null", 9) == 0;
+      }
+    ok = ok && implicit == 1;
+  }
   std::free(raw);
   return ok;
 }

@@ -193,6 +193,58 @@ static bool check_depgraph_workspace_api(void) {
                                         NULL) == SHELL_DEP_OK &&
          shell_dep_graph_validate(&graph).valid;
   }
+  if (ok) {
+    static const char redirected[] = "wc -l file.txt 2>&1";
+    ok = shell_dep_graph_parse(redirected, sizeof(redirected) - 1, ".", &limits,
+                               &graph) == SHELL_DEP_OK;
+    bool stderr_to_stdout = false;
+    for (uint32_t i = 0; ok && i < graph.edge_count; i++) {
+      const shell_dep_edge_t *edge = &graph.edges[i];
+      stderr_to_stdout |= edge->type == SHELL_EDGE_WRITE &&
+                          edge->source_fd == 2 &&
+                          graph.nodes[edge->to].type == SHELL_NODE_FD &&
+                          graph.nodes[edge->to].fd.number == 1;
+    }
+    ok = ok && stderr_to_stdout && shell_dep_graph_validate(&graph).valid;
+  }
+  if (ok) {
+    static const char directory[] = "cd /tmp; pwd";
+    ok = shell_dep_graph_parse(directory, sizeof(directory) - 1, "/", &limits,
+                               &graph) == SHELL_DEP_OK &&
+         shell_dep_graph_validate(&graph).valid;
+    unsigned commands = 0, cwd_edges = 0;
+    for (uint32_t i = 0; ok && i < graph.node_count; i++)
+      if (graph.nodes[i].type == SHELL_NODE_CMD) {
+        const shell_dep_cmd_t *command = &graph.nodes[i].cmd;
+        ok = command->cwd_known &&
+             strcmp(graph.cwd_buf.data + command->cwd_offset,
+                    commands == 0 ? "/" : "/tmp") == 0;
+        commands++;
+      }
+    for (uint32_t i = 0; i < graph.edge_count; i++)
+      cwd_edges += graph.edges[i].type == SHELL_EDGE_CWD;
+    ok = ok && commands == 2 && cwd_edges == 1;
+  }
+  if (ok) {
+    static const char background[] = "wc -c &";
+    ok = shell_dep_graph_parse(background, sizeof(background) - 1, ".", &limits,
+                               &graph) == SHELL_DEP_OK &&
+         shell_dep_graph_validate(&graph).valid;
+    unsigned implicit = 0;
+    for (uint32_t i = 0; ok && i < graph.node_count; ++i)
+      if (graph.nodes[i].type == SHELL_NODE_DOC &&
+          (graph.nodes[i].doc.flags & SHELL_DEP_DOC_FLAG_IMPLICIT)) {
+        ++implicit;
+        char path[10];
+        size_t written;
+        bool absolute;
+        ok = shell_dep_doc_file_identity_write(&graph, &graph.nodes[i].doc,
+                                               path, sizeof(path), &written,
+                                               &absolute) &&
+             absolute && written == 9 && strcmp(path, "/dev/null") == 0;
+      }
+    ok = ok && implicit == 1;
+  }
   free(raw);
   return ok;
 }

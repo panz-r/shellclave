@@ -110,6 +110,9 @@ static inline SHELL_NONNULL(1, 2) const
   case SHELL_NODE_ENDPOINT:
     /* Its reserved byte is opaque construction state, not public semantics. */
     break;
+  case SHELL_NODE_FD:
+    SHELLSPLIT_COMPARE_FIELD(fd.number);
+    break;
   }
   return NULL;
 }

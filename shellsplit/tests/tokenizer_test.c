@@ -6580,7 +6580,11 @@ static void test_redirect_operand_boundary_contract(void) {
          memcmp(netargv.data, "7:4:echo,,", netargv.length)) == 0 &&
         shell_dep_graph_parse(input, strlen(input), ".", NULL, &graph) ==
             SHELL_DEP_OK &&
-        graph.node_count == 2 && graph.edge_count == 1;
+        /* A possible failure opening stderr retains inherited stderr for the
+         * shell's diagnostic in addition to the successful file route. */
+        graph.node_count == (i == 1 ? 5u : 4u) &&
+        graph.edge_count == (i == 1 ? 4u : 3u) &&
+        shell_dep_graph_validate(&graph).valid;
     shell_commands_free(commands, command_count);
     shell_netstring_buffer_free(&netargv);
   }

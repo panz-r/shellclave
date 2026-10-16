@@ -2389,7 +2389,8 @@ static void test_modern_shell_syntax_boundaries(void) {
           shell_dep_graph_validate(&graph).valid);
     for (uint32_t edge = 0; edge < graph.edge_count; edge++) {
       pipes += graph.edges[edge].type == SHELL_EDGE_PIPE;
-      writes += graph.edges[edge].type == SHELL_EDGE_WRITE;
+      writes += graph.edges[edge].type == SHELL_EDGE_WRITE &&
+                graph.nodes[graph.edges[edge].to].type != SHELL_NODE_FD;
       stderr_pipe = stderr_pipe || (graph.edges[edge].type == SHELL_EDGE_PIPE &&
                                     graph.edges[edge].source_fd == 2 &&
                                     graph.edges[edge].target_fd == 0);
@@ -6494,8 +6495,10 @@ static void test_adjacent_named_fd_boundaries(void) {
       const shell_dep_edge_t *edge = &graph.edges[j];
       closes += edge->type == SHELL_EDGE_FD_CLOSE;
       opens += edge->type == SHELL_EDGE_FD_OPEN;
-      uses +=
-          edge->type == (i == 1 || i == 3 ? SHELL_EDGE_READ : SHELL_EDGE_WRITE);
+      uses += edge->type ==
+                  (i == 1 || i == 3 ? SHELL_EDGE_READ : SHELL_EDGE_WRITE) &&
+              graph.nodes[edge->from].type != SHELL_NODE_FD &&
+              graph.nodes[edge->to].type != SHELL_NODE_FD;
     }
     CHECK(closes == 1 && opens == 2 && uses == 1);
     CHECK(shell_dep_graph_validate(&graph).valid);

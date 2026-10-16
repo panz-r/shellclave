@@ -790,6 +790,124 @@ static inline SHELL_NONNULL(1, 3, 4) bool shell_builtin_visit_single_word(
   return quote == 0;
 }
 
+/* word is one complete, supported parameter expansion, excluding its outer
+ * quotes. Prove at least one argument when double quoted and expansion
+ * succeeds; an error is not an empty argv alternative. This is deliberately
+ * separate from exact scalar cardinality: defaulted @ can return many words.
+ * Only the selector/operator is inspected, never the operand or its value. */
+static inline SHELL_NONNULL(1) bool shell_builtin_parameter_guarantees_argument(
+    const char *word, size_t length) {
+  if (shell_builtin_parameter_is_scalar(word, length))
+    return true;
+  size_t brace;
+  if (!shell_source_logical_next_is(word, length, 0, '{', &brace))
+    return false; /* The only non-scalar unbraced selector is $@. */
+  size_t head = shell_source_logical_following(word, length, brace);
+  size_t selector_end = head;
+  bool indirect;
+  (void)shell_source_skip_parameter_head(word, length, selector_end,
+                                         &selector_end, &indirect);
+  selector_end =
+      shell_source_skip_escaped_line_endings(word, length, selector_end);
+  if (indirect)
+    return word[selector_end] == '*'; /* Quoted name enumeration joins *. */
+  if (word[head] != '@')
+    return true;
+  if (word[selector_end] == ':')
+    selector_end = shell_source_logical_following(word, length, selector_end);
+  return word[selector_end] == '-' || word[selector_end] == '?';
+}
+
+/* A lower bound, not an exact cardinality or another syntax boundary. word
+ * is a complete, supported shell word. Literal fragments and quoted empty
+ * scalar words survive splitting; a quoted list selector can disappear.
+ * Never inspect expansion output. Brace alternatives all contribute argv:
+ * a surviving literal in any alternative suffices. Classify each outer brace
+ * fragment once, then walk its contents without rebalancing nested prefixes.
+ * The fixed executor has nullglob/failglob disabled. */
+static inline SHELL_NONNULL(1) bool shell_builtin_word_guarantees_argument(
+    const char *word, size_t length) {
+  char quote = 0;
+  bool quoted_list = false;
+  size_t brace_end = 0;
+  for (size_t position = 0; position < length;) {
+    SHELL_SOURCE_WORD_SCAN(1);
+    unsigned char byte = (unsigned char)word[position];
+    if (!quote && brace_end && strchr("{},", byte)) {
+      if (byte == '{' &&
+          shell_source_logical_next_is(word, length, position, '}', NULL))
+        return true; /* An empty, non-expanding inner brace is literal. */
+      if (++position == brace_end)
+        brace_end = 0;
+      continue;
+    }
+    if (byte == '\\' && quote != '\'') {
+      size_t after =
+          shell_source_skip_escaped_line_endings(word, length, position);
+      if (after != position) {
+        position = after;
+        continue;
+      }
+      return true; /* Escaped byte, or a literal backslash in double quotes. */
+    }
+    if (!quote && byte == '$' &&
+        shell_source_logical_next_is(word, length, position, '\'', NULL))
+      return true; /* Even $'' and an ANSI-C NUL preserve one empty argument. */
+    if (!quote && byte == '\'')
+      return true;
+    if (byte == '"') {
+      if (quote) {
+        if (!quoted_list)
+          return true;
+        quote = 0;
+      } else {
+        quote = '"';
+        quoted_list = false;
+      }
+      position++;
+      continue;
+    }
+    size_t after = 0, open = 0;
+    bool dynamic = false, preserves_argument = false;
+    if (byte == '`') {
+      dynamic = preserves_argument = true;
+      (void)shell_source_skip_complete_backtick(word, length, position, &after);
+    } else if (byte == '$' && shell_source_dollar_arithmetic_open(
+                                  word, length, position, &open)) {
+      dynamic = preserves_argument = true;
+      (void)shell_source_skip_arithmetic_expansion(word, length, position,
+                                                   &after);
+    } else if (byte == '$' && shell_source_dollar_parentheses_open(
+                                  word, length, position, &open)) {
+      dynamic = preserves_argument = true;
+      (void)shell_source_find_balanced_parentheses(word, length, open, &after);
+    } else if (byte == '$' && shell_source_skip_variable_expansion(
+                                  word, length, position, &after)) {
+      dynamic = true;
+      preserves_argument = shell_builtin_parameter_guarantees_argument(
+          word + position, after - position);
+    }
+    if (dynamic) {
+      if (quote && preserves_argument)
+        return true;
+      quoted_list |= quote != 0;
+      position = after;
+      continue;
+    }
+    if (!quote && byte == '{') {
+      shell_source_brace_fragment_t brace =
+          shell_source_scan_brace_fragment(word, length, position);
+      if (!brace.own_expands)
+        return true; /* The outer literal brace survives. */
+      brace_end = brace.after;
+      position++;
+      continue;
+    }
+    return true;
+  }
+  return false;
+}
+
 /* getopts accepts an optional --, an optstring, then one variable name. Keep
  * all possible operand positions for a quoted runtime optstring: it might be
  * --, moving the target one word later. Unknown argv cardinality before the

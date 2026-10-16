@@ -23,6 +23,8 @@ static bool shellsplit_test_edge_types_match(const shell_dep_graph_t *graph,
   shell_dep_node_type_t to = graph->nodes[edge->to].type;
   switch (edge->type) {
   case SHELL_EDGE_READ:
+    return (from == SHELL_NODE_DOC || from == SHELL_NODE_FD) &&
+           (to == SHELL_NODE_CMD || to == SHELL_NODE_GROUP);
   case SHELL_EDGE_ENV:
     return from == SHELL_NODE_DOC &&
            (to == SHELL_NODE_CMD || to == SHELL_NODE_GROUP);
@@ -33,7 +35,8 @@ static bool shellsplit_test_edge_types_match(const shell_dep_graph_t *graph,
   case SHELL_EDGE_APPEND:
     return (from == SHELL_NODE_CMD || from == SHELL_NODE_GROUP ||
             from == SHELL_NODE_TIME) &&
-           (to == SHELL_NODE_DOC || to == SHELL_NODE_ENDPOINT);
+           (to == SHELL_NODE_DOC || to == SHELL_NODE_ENDPOINT ||
+            (to == SHELL_NODE_FD && edge->type == SHELL_EDGE_WRITE));
   case SHELL_EDGE_PIPE:
     return (from == SHELL_NODE_CMD || from == SHELL_NODE_GROUP ||
             from == SHELL_NODE_TIME) &&
@@ -247,9 +250,11 @@ static bool shellsplit_test_depgraph_invariants(
       }
     } else if (node->type == SHELL_NODE_TIME) {
       uint32_t report_flows = 0;
+      uint32_t external_flows = 0;
       uint32_t target = UINT32_MAX;
       uint32_t target_count = 0;
       uint32_t target_timer_count = 0;
+      bool external_seen[SHELL_DEP_TIME_MAX_EXTERNAL_FDS] = {false};
       bool topology_valid = true;
       for (uint32_t edge = 0; edge < graph->edge_count; edge++)
         if (graph->edges[edge].from == i) {
@@ -261,7 +266,24 @@ static bool shellsplit_test_depgraph_invariants(
                       graph->edges[edge].type == SHELL_EDGE_PIPE ||
                       graph->edges[edge].type == SHELL_EDGE_SUBST) &&
                      graph->edges[edge].source_fd == node->time.report_fd) {
-            report_flows++;
+            const shell_dep_node_t *destination =
+                &graph->nodes[graph->edges[edge].to];
+            if (destination->type != SHELL_NODE_FD)
+              report_flows++;
+            else {
+              external_flows++;
+              bool declared = false;
+              for (uint32_t fd = 0; fd < node->time.report_external_fd_count;
+                   fd++)
+                if (node->time.report_external_fds[fd] ==
+                    destination->fd.number) {
+                  if (external_seen[fd])
+                    return false;
+                  external_seen[fd] = true;
+                  declared = true;
+                }
+              topology_valid &= declared;
+            }
           } else {
             topology_valid = false;
           }
@@ -290,6 +312,11 @@ static bool shellsplit_test_depgraph_invariants(
             target_timer_count++;
       if (node->time.report_external_fd_count > SHELL_DEP_TIME_MAX_EXTERNAL_FDS)
         return false;
+      if (external_flows != node->time.report_external_fd_count)
+        return false;
+      for (uint32_t fd = 0; fd < node->time.report_external_fd_count; fd++)
+        if (!external_seen[fd])
+          return false;
       bool has_external = node->time.report_external_fd_count != 0;
       bool has_graph = report_flows != 0;
       bool has_closed =
@@ -365,12 +392,21 @@ static bool shellsplit_test_depgraph_invariants(
           target_mode != node->time.mode || target_timer_count != 1 ||
           target_time_id != i + 1)
         return false;
+    } else if (node->type == SHELL_NODE_FD) {
+      if (node->fd.number > SHELL_DEP_FD_MAX)
+        return false;
     } else if (node->type != SHELL_NODE_ENDPOINT &&
                (node->type != SHELL_NODE_DOC ||
                 node->doc.kind < SHELL_DOC_FILE ||
                 node->doc.kind > SHELL_DOC_ENVVAR ||
-                !shellsplit_test_span_in_input(input, length, node->doc.path,
-                                               node->doc.path_len) ||
+                ((node->doc.flags & SHELL_DEP_DOC_FLAG_IMPLICIT)
+                     ? node->doc.kind != SHELL_DOC_FILE ||
+                           node->doc.flags != SHELL_DEP_DOC_FLAG_IMPLICIT ||
+                           node->doc.path_len != 9 || node->doc.path == NULL ||
+                           memcmp(node->doc.path, "/dev/null", 9) != 0
+                     : !shellsplit_test_span_in_input(input, length,
+                                                      node->doc.path,
+                                                      node->doc.path_len)) ||
                 !shellsplit_test_span_in_input(input, length, node->doc.name,
                                                node->doc.name_len) ||
                 ((node->doc.flags & SHELL_DEP_DOC_FLAG_RESOLVED_PATH)
@@ -388,8 +424,8 @@ static bool shellsplit_test_depgraph_invariants(
                                      SHELL_DEP_DOC_FLAG_TRANSIENT |
                                      SHELL_DEP_DOC_FLAG_ENVVAR_APPEND |
                                      SHELL_DEP_DOC_FLAG_RESOLVED_PATH |
-                                     SHELL_DEP_DOC_FLAG_EXPANSION_FAILED)) !=
-                    0)) {
+                                     SHELL_DEP_DOC_FLAG_EXPANSION_FAILED |
+                                     SHELL_DEP_DOC_FLAG_IMPLICIT)) != 0)) {
       return false;
     }
   }

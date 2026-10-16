@@ -506,7 +506,7 @@ static bool function_parentheses_after_name(const char *input, size_t length,
 static bool brace_group_close_delimiter(const char *input, size_t length,
                                         size_t position, char before,
                                         bool newline_separator) {
-  if (before != ';' && before != ')' && !newline_separator)
+  if (before != ';' && before != '&' && before != ')' && !newline_separator)
     return false;
   size_t after = shell_source_logical_following(input, length, position);
   if (after == length)
@@ -690,7 +690,7 @@ static bool brace_groups_valid(const char *input, size_t length) {
         context_possible &&
         (previous == 0 || newline_separator || before == ';' || before == '|' ||
          before == '&' || before == '(' || before == '{');
-    if (possible_brace_open) {
+    if (possible_brace_open || (closing_brace && before == '&')) {
       /* Reuse forward lexical command position rather than reconstructing
        * the prefix for every literal brace after a potentially long word.
        * The iterator advances monotonically and keeps whole word spans. */
@@ -700,8 +700,15 @@ static bool brace_groups_valid(const char *input, size_t length) {
           break;
         have_lexical_token = true;
       }
-      command_boundary = have_lexical_token && lexical_token.position == i &&
-                         lexical_token.type == SHELL_TOKEN_GROUP_START;
+      if (possible_brace_open)
+        command_boundary = have_lexical_token && lexical_token.position == i &&
+                           lexical_token.type == SHELL_TOKEN_GROUP_START;
+      else
+        /* `&` terminates a brace list, but also occurs in redirect operators.
+         * Reuse the forward lexical context: a redirect pathname `}` is not
+         * a reserved group closer. Binary && still fails stage validation. */
+        closing_brace = have_lexical_token && lexical_token.position == i &&
+                        lexical_token.type == SHELL_TOKEN_GROUP_END;
     }
     if (possible_brace_open && command_boundary && i + 1 < length &&
         (isspace((unsigned char)input[i + 1]) || input[i + 1] == '(')) {

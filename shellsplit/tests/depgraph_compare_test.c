@@ -90,7 +90,8 @@ static void test_nodes(void) {
   /* All node kinds can retain different inactive union bytes. Assignment of
    * their active subobjects must not require clearing the whole union. */
   static const shell_dep_node_type_t kinds[] = {
-      SHELL_NODE_DOC, SHELL_NODE_GROUP, SHELL_NODE_TIME, SHELL_NODE_ENDPOINT};
+      SHELL_NODE_DOC, SHELL_NODE_GROUP, SHELL_NODE_TIME, SHELL_NODE_ENDPOINT,
+      SHELL_NODE_FD};
   for (size_t i = 0; i < sizeof(kinds) / sizeof(kinds[0]); i++) {
     memset(&a, 0x55, sizeof(a));
     memset(&b, 0xaa, sizeof(b));
@@ -118,6 +119,12 @@ static void test_nodes(void) {
       CHECK(shellsplit_test_node_difference(&a, &b) == NULL);
       b.type = SHELL_NODE_DOC;
       b.doc = (shell_dep_doc_t){.kind = SHELL_DOC_FILE};
+      break;
+    case SHELL_NODE_FD:
+      a.fd = (shell_dep_fd_t){.number = 1};
+      b.fd = a.fd;
+      CHECK(shellsplit_test_node_difference(&a, &b) == NULL);
+      b.fd.number = 2;
       break;
     case SHELL_NODE_CMD:
       break;

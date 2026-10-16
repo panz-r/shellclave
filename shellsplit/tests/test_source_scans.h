@@ -70,6 +70,12 @@ typedef enum {
   SHELLSPLIT_TEST_WORK_FAILURE_COMPOSITION,
   SHELLSPLIT_TEST_WORK_FAILURE_DEPENDENCIES,
   SHELLSPLIT_TEST_WORK_FAILURE_UNDO,
+  /* Boundary-use indexing, group coalescing, sorting, and publication. */
+  SHELLSPLIT_TEST_WORK_BOUNDARY,
+  /* Owner-local stream inventory construction and actual projection visits. */
+  SHELLSPLIT_TEST_WORK_OWNER_STREAMS,
+  /* Actual prefix-diagnostic visits, sink indexing and publication census. */
+  SHELLSPLIT_TEST_WORK_DIAGNOSTIC_ROUTES,
   SHELLSPLIT_TEST_WORK_COUNT
 } shellsplit_test_metadata_kind_t;
 void shellsplit_test_metadata_charge(shellsplit_test_metadata_kind_t kind);

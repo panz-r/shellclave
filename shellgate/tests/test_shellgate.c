@@ -1783,6 +1783,432 @@ TEST(descriptor_scope_policy_contract) {
   sg_gate_free(gate);
 }
 
+TEST(inherited_boundary_context_contract) {
+  static const char *const rules[] = {"wc -l file.txt", "wc -l other.txt"};
+  sg_gate_t *gate = gate_with_rules(rules, 2);
+  ASSERT(gate != NULL);
+  ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
+  ASSERT_SG_OK(sg_gate_set_stop_mode(gate, SG_EVAL_ALL));
+  sg_violation_config_t config;
+  sg_violation_config_default(&config);
+  config.redirect_fanout_threshold = 0;
+  ASSERT_SG_OK(sg_gate_set_violation_config_borrowed(gate, &config));
+  static const char *const sources[] = {
+      "wc -l file.txt",           "wc -l file.txt 2>&1",
+      "wc -l file.txt 0>&1",      "wc -l file.txt 1<&0",
+      "wc -l file.txt 2<&0",      "wc -l file.txt 1>&0; wc -l other.txt",
+      "{ wc -l file.txt; } 2>&1", "{ wc -l file.txt; } 1<&0",
+      "wc -l file.txt &",         "{ wc -l file.txt; } &",
+      "time wc -l file.txt &",    "wc -l file.txt && wc -l other.txt &"};
+  for (size_t i = 0; i < sizeof(sources) / sizeof(sources[0]); i++) {
+    sg_result_t result = {0};
+    ASSERT_SG_OK(eval_cmd(gate, sources[i], &result));
+    ASSERT(result.verdict == SG_VERDICT_ALLOW &&
+           !result.requires_substitution_evaluation &&
+           !result.has_dynamic_substitution_io &&
+           !(result.violation_type_flags & SG_VIOL_REDIRECT_FANOUT));
+    for (uint32_t command = 0; command < result.subcommand_count; command++)
+      ASSERT(result.subcommands[command].read_count == 0 &&
+             result.subcommands[command].write_count == 0);
+  }
+  sg_gate_free(gate);
+}
+
+TEST(setup_diagnostic_substitution_contract) {
+  static const char *const rules[] = {"exec", "echo", "echo *", "sh * *",
+                                      "cat *"};
+  sg_gate_t *gate = gate_with_rules(rules, 5);
+  ASSERT(gate != NULL);
+  ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
+  ASSERT_SG_OK(sg_gate_set_stop_mode(gate, SG_EVAL_ALL));
+  static const struct {
+    const char *source;
+    bool inspection;
+  } cases[] = {
+      {"exec 3>&-; sh -c \"$(echo 2>&1 >&3)\"", true},
+      {"exec 3>&-; sh -c \"$(echo >&3 2>&1)\"", false},
+      {"exec 3>&-; sh -c \"$(echo 2>&- >&3)\"", false},
+      {"exec 3>&-; sh -c \"$({ echo body; } 2>&1 >&3)\"", true},
+      {"sh -c \"$(echo 2>&1 >'')\"", true},
+      {"sh -c \"$(echo >'' 2>&1)\"", false},
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    sg_result_t result = {0};
+    ASSERT_SG_OK(eval_cmd(gate, cases[i].source, &result));
+    ASSERT(!result.truncated);
+    ASSERT(result.has_dynamic_substitution_io == cases[i].inspection);
+    ASSERT(result.requires_substitution_evaluation == cases[i].inspection);
+    ASSERT(result.verdict == (cases[i].inspection ? SG_VERDICT_ALLOW_CONDITIONAL
+                                                  : SG_VERDICT_ALLOW));
+  }
+  sg_gate_free(gate);
+}
+
+TEST(expansion_diagnostic_substitution_contract) {
+  sg_gate_t *gate = sg_gate_new();
+  ASSERT_NOT_NULL(gate);
+  ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
+  ASSERT_SG_OK(sg_gate_set_stop_mode(gate, SG_EVAL_ALL));
+  static const struct {
+    const char *source;
+    bool inspection;
+  } cases[] = {
+      {"sh -c \"$(exec 2>&1; x=${missing:?expansion-marker})\"", true},
+      {"sh -c \"$(exec 2>&1; x=$((1/0)))\"", true},
+      {"sh -c \"$(exec 2>&1; x=${value:1/0})\"", true},
+      {"sh -c \"$(exec 2>&1; : ${missing:?expansion-marker} 1>&- 2>&-)\"",
+       true},
+      {"sh -c \"$(exec 2>&1; x=$((1/0)) true 1>&- 2>&-)\"", true},
+      {"sh -c \"$(exec 2>&1; export x=${missing:?expansion-marker} 1>&- "
+       "2>&-)\"",
+       true},
+      {"sh -c \"$(exec 2>&-; x=${missing:?expansion-marker})\"", false},
+      {"sh -c \"$(exec 2>&1; false 1>&- 2>&- && "
+       "x=${missing:?expansion-marker})\"",
+       false},
+      {"sh -c \"$(x=1)\"", false},
+      {"sh -c \"$(exec 2>&1; x='${missing:?literal}')\"", false},
+      {"sh -c \"$(: 2>&1 >${missing:?expansion-marker})\"", true},
+      {"sh -c \"$(: >${missing:?expansion-marker} 2>&1)\"", false},
+      {"sh -c \"$(: 2>&1 <<<$((1/0)))\"", true},
+      {"sh -c \"$(: 2>&1 <<EOF 2>&-\n${missing:?expansion-marker}\nEOF\n)\"",
+       true},
+      {"sh -c \"$({ :; } 2>&1 >${missing:?expansion-marker})\"", true},
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    sg_result_t result = {0};
+    ASSERT_SG_OK(eval_cmd(gate, cases[i].source, &result));
+    ASSERT(!result.truncated);
+    if (result.has_dynamic_substitution_io != cases[i].inspection)
+      printf("\n    diagnostic inspection: %s\n", cases[i].source);
+    ASSERT(result.has_dynamic_substitution_io == cases[i].inspection);
+    ASSERT(result.requires_substitution_evaluation == cases[i].inspection);
+    ASSERT(result.subcommand_count != 0 &&
+           result.subcommands[0].netargv_length >= 5 &&
+           memcmp(result.subcommands[0].netargv, "2:sh,", 5) == 0);
+    ASSERT(result.subcommands[0].requires_substitution_evaluation ==
+           cases[i].inspection);
+  }
+  sg_gate_free(gate);
+}
+
+TEST(cd_command_and_capture_contract) {
+  static const char *const rules[] = {
+      "exec",           "sh * *",         "cd *", "cd * *",
+      "command cd * *", "builtin cd * *", "false"};
+  sg_gate_t *gate = gate_with_rules(rules, 7);
+  ASSERT_NOT_NULL(gate);
+  ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
+  ASSERT_SG_OK(sg_gate_set_stop_mode(gate, SG_EVAL_ALL));
+  static const struct {
+    const char *source;
+    bool inspect;
+  } cases[] = {
+      {"sh -c \"$(exec 2>&1; cd one two)\"", true},
+      {"sh -c \"$(cd /; cd -)\"", true},
+      {"sh -c \"$({ exec 2>&1; cd one two; })\"", true},
+      {"sh -c \"$(exec 2>&1; command cd one two)\"", true},
+      {"sh -c \"$(exec 2>&1; builtin cd one two)\"", true},
+      {"sh -c \"$(exec 1>&- 2>&-; cd one two)\"", false},
+      {"sh -c \"$(false >&- 2>&- && cd one two)\"", false},
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    sg_result_t result = {0};
+    ASSERT_SG_OK(eval_cmd(gate, cases[i].source, &result));
+    ASSERT(!result.truncated);
+    ASSERT(result.has_dynamic_substitution_io == cases[i].inspect &&
+           result.requires_substitution_evaluation == cases[i].inspect);
+    ASSERT(result.verdict == (cases[i].inspect ? SG_VERDICT_ALLOW_CONDITIONAL
+                                               : SG_VERDICT_ALLOW));
+  }
+  sg_gate_free(gate);
+
+  /* A retained cd is a normal policy subject, never an implicit allowance. */
+  const char *pwd_rule[] = {"pwd"};
+  gate = gate_with_rules(pwd_rule, 1);
+  ASSERT_NOT_NULL(gate);
+  ASSERT_SG_OK(sg_gate_set_stop_mode(gate, SG_EVAL_ALL));
+  sg_result_t result = {0};
+  ASSERT_SG_OK(eval_cmd(gate, "cd /tmp; pwd", &result));
+  ASSERT(result.verdict == SG_VERDICT_UNDETERMINED &&
+         result.subcommand_count == 2 &&
+         result.subcommands[0].verdict == SG_VERDICT_UNDETERMINED &&
+         result.subcommands[1].verdict == SG_VERDICT_ALLOW);
+  ASSERT_ST_OK(test_policy_replace_cpl(gate, false, "cd #path", false));
+  ASSERT_SG_OK(eval_cmd(gate, "cd /tmp; pwd", &result));
+  ASSERT(result.verdict == SG_VERDICT_ALLOW && result.subcommand_count == 2 &&
+         result.subcommands[0].verdict == SG_VERDICT_ALLOW &&
+         result.subcommands[1].verdict == SG_VERDICT_ALLOW);
+  sg_gate_free(gate);
+}
+
+TEST(assignment_stream_and_diagnostic_contract) {
+  static const char *const rules[] = {
+      "sh * *", "exec", "true", "command true", "builtin true", "printf *"};
+  sg_gate_t *gate = gate_with_rules(rules, 6);
+  ASSERT_NOT_NULL(gate);
+  ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
+  ASSERT_SG_OK(sg_gate_set_stop_mode(gate, SG_EVAL_ALL));
+  static const struct {
+    const char *source;
+    bool inspect, outer_inspect;
+  } cases[] = {
+      {"sh -c \"$(x=1)\"", false, false},
+      {"sh -c \"$(exec 2>&1; x=1)\"", false, false},
+      {"sh -c \"$(x=$(printf data))\"", true, false},
+      {"sh -c \"$(UID=1 2>&1)\"", false, false},
+      {"sh -c \"$(exec 2>&1; UID=1)\"", true, true},
+      {"sh -c \"$(exec 2>&1; UID=1 1>&- 2>&-)\"", true, true},
+      {"sh -c \"$(exec 1>&- 2>&-; UID=1)\"", false, false},
+      {"sh -c \"$(exec 2>&1; UID=1 true 1>&- 2>&-)\"", true, true},
+      {"sh -c \"$(exec 2>&1; UID=1 command true 1>&- 2>&-)\"", true, true},
+      {"sh -c \"$(exec 2>&1; UID=1 builtin true 1>&- 2>&-)\"", true, true},
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    sg_result_t result = {0};
+    ASSERT_SG_OK(eval_cmd(gate, cases[i].source, &result));
+    ASSERT(!result.truncated && result.subcommand_count > 0);
+    ASSERT(result.requires_substitution_evaluation == cases[i].inspect);
+    ASSERT(result.subcommands[0].requires_substitution_evaluation ==
+           cases[i].outer_inspect);
+    if (cases[i].inspect)
+      ASSERT(result.has_dynamic_substitution_io);
+  }
+  for (unsigned input = 0; input < 2; input++) {
+    sg_result_t result = {0};
+    ASSERT_SG_OK(eval_cmd(gate, input ? "< <(true)" : "> >(true)", &result));
+    ASSERT(!result.truncated && result.has_dynamic_substitution_io &&
+           !result.requires_substitution_evaluation);
+    ASSERT(result.verdict == SG_VERDICT_UNDETERMINED);
+  }
+  sg_gate_free(gate);
+}
+
+TEST(rejected_assignment_effect_contract) {
+  static const char *const rules[] = {"true", "command true", "builtin true",
+                                      "export *", "printf *"};
+  sg_gate_t *gate = gate_with_rules(rules, 5);
+  ASSERT_NOT_NULL(gate);
+  ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
+  ASSERT_SG_OK(sg_gate_set_stop_mode(gate, SG_EVAL_ALL));
+  sg_violation_config_t config = {0};
+  config.sensitive_env_names[0] = "UID";
+  config.sensitive_env_names[1] = "EUID";
+  config.sensitive_env_names[2] = "x";
+  config.sensitive_env_name_count = 3;
+  config.sensitive_cmd_names[0] = "true";
+  config.sensitive_cmd_names[1] = "export";
+  config.sensitive_cmd_name_count = 2;
+  ASSERT_SG_OK(sg_gate_set_violation_config_borrowed(gate, &config));
+  static const struct {
+    const char *source;
+    uint32_t environments;
+    bool privileged, inspect;
+  } cases[] = {
+      {"UID=1 true", 0, false, false},
+      {"UID+=1 true", 0, false, false},
+      {"U\\\nID=1 true", 0, false, false},
+      {"UID=1 EUID=2 command true", 0, false, false},
+      {"UID=1 builtin true", 0, false, false},
+      {"UID=$(printf data) true", 0, false, false},
+      {"UID=$(printf data) $missing", 0, false, true},
+      {"UID=$(printf data) $(true)", 0, false, true},
+      {"UID=$(printf data) \"$@\"", 0, false, true},
+      {"UID=$(printf data) \"${!prefix@}\"", 0, false, true},
+      {"UID=$(printf data) ${!prefix*}", 0, false, true},
+      {"UID=$(printf data) \"${@:+data}\"", 0, false, true},
+      {"UID=$(printf skipped) \"${!prefix*}\"", 0, false, false},
+      {"UID=$(printf skipped) \"${@-data}\"", 0, false, false},
+      {"UID=$(printf skipped) \"${@:-data}\"", 0, false, false},
+      {"UID=$(printf skipped) \"${@:-}\"", 0, false, false},
+      {"UID=$(printf skipped) \"${@?error}\"", 0, false, false},
+      {"UID=$(printf skipped) \"${@:?error}\"", 0, false, false},
+      {"UID=$(printf skipped) ''", 0, false, false},
+      {"UID=$(printf skipped) \"$missing\"", 0, false, false},
+      {"UID=$(printf skipped) $missing true", 0, false, false},
+      {"UID=$(printf skipped) $missing-suffix", 0, false, false},
+      {"UID=${missing:?skipped} $maybe; x=2 true", 0, true, false},
+      {"export UID=$(printf data)", 0, false, true},
+      {"export -Z x=$(printf data)", 0, false, true},
+      {"export UID=1", 0, false, false},
+      {"export -p 'U''ID=1' EUID+=2", 0, false, false},
+      {"command export UID=1", 0, false, false},
+      {"builtin export UID=1", 0, false, false},
+      {"export -Z x=1", 0, false, false},
+      {"export -f x=1", 0, false, false},
+      {"x=2 UID=1 true", 1, true, false},
+      {"UID=1 x=2 true", 1, true, false},
+      {"export UID=1 x=2", 1, true, false},
+      {"export -p UID=1 x=2", 1, true, false},
+      {"export -- UID=1 x=2", 1, true, false},
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    sg_result_t result = {0};
+    ASSERT_SG_OK(eval_cmd(gate, cases[i].source, &result));
+    ASSERT(!result.truncated && result.subcommand_count > 0);
+    ASSERT(result.subcommands[0].env_count == cases[i].environments);
+    ASSERT(result.requires_substitution_evaluation == cases[i].inspect);
+    ASSERT(((result.violation_type_flags & SG_VIOL_ENV_PRIVILEGED) != 0) ==
+           cases[i].privileged);
+  }
+  ASSERT_ST_OK(test_policy_replace_cpl(gate, true, "printf forbidden", false));
+  sg_result_t result = {0};
+  ASSERT_SG_OK(eval_cmd(gate, "UID=$(printf forbidden) $maybe", &result));
+  ASSERT(result.verdict == SG_VERDICT_DENY &&
+         result.requires_substitution_evaluation &&
+         result.subcommand_count == 2);
+  ASSERT(result.subcommands[1].verdict == SG_VERDICT_DENY);
+  ASSERT_SG_OK(eval_cmd(gate, "UID=$(printf forbidden >&2) $maybe", &result));
+  ASSERT(result.verdict == SG_VERDICT_DENY && result.subcommand_count == 2 &&
+         !result.requires_substitution_evaluation);
+  static const char *const guaranteed[] = {
+      "UID=$(printf forbidden) $maybe true",
+      "UID=$(printf forbidden) \"${!prefix*}\"",
+      "UID=$(printf forbidden) \"${@-data}\"",
+      "UID=$(printf forbidden) \"${@:-data}\"",
+      "UID=$(printf forbidden) \"${@:-}\"",
+      "UID=$(printf forbidden) \"${@?error}\"",
+      "UID=$(printf forbidden) \"${@:?error}\"",
+  };
+  for (size_t i = 0; i < sizeof(guaranteed) / sizeof(guaranteed[0]); i++) {
+    ASSERT_SG_OK(eval_cmd(gate, guaranteed[i], &result));
+    ASSERT(result.subcommand_count == 1 && result.verdict != SG_VERDICT_DENY &&
+           !result.requires_substitution_evaluation);
+  }
+  ASSERT_SG_OK(
+      eval_cmd(gate, "UID=$(printf forbidden) \"${!prefix@}\"", &result));
+  ASSERT(result.subcommand_count == 2 && result.verdict == SG_VERDICT_DENY &&
+         result.requires_substitution_evaluation);
+  sg_gate_free(gate);
+}
+
+TEST(nested_setup_diagnostic_context_contract) {
+  static const char *const rules[] = {":", "echo *"};
+  sg_gate_t *gate = gate_with_rules(rules, 2);
+  ASSERT(gate != NULL);
+  ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
+  ASSERT_SG_OK(sg_gate_set_stop_mode(gate, SG_EVAL_ALL));
+  sg_violation_config_t config;
+  sg_violation_config_default(&config);
+  ASSERT_SG_OK(sg_gate_set_violation_config_borrowed(gate, &config));
+  sg_result_t result = {0};
+  ASSERT_SG_OK(eval_cmd(
+      gate,
+      "{ :; { echo inner; } 3>/tmp/diag-a 4>/tmp/diag-b; echo outer; } "
+      ">/tmp/diag-out 2>>/tmp/diag-errors",
+      &result));
+  ASSERT(result.verdict == SG_VERDICT_ALLOW && result.subcommand_count == 3);
+  /* The inner group's two opens can report errors into the outer stderr
+   * file: two auxiliary writes plus that diagnostic relation, on top of the
+   * two outer output relations. No command-local body route is revived. */
+  ASSERT(result.subcommands[0].write_count == 2);
+  ASSERT(result.subcommands[1].write_count == 5);
+  ASSERT(result.subcommands[2].write_count == 2);
+  for (uint32_t i = 0; i < result.subcommand_count; i++)
+    ASSERT(result.subcommands[i].read_count == 0);
+  sg_gate_free(gate);
+}
+
+TEST(background_newline_cwd_contract) {
+  static const char *const rules[] = {"cd *", "true", "printf *"};
+  sg_gate_t *gate = gate_with_rules(rules, 3);
+  ASSERT(gate != NULL);
+  ASSERT_SG_OK(sg_gate_set_cwd(gate, "/workspace"));
+  ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
+  ASSERT_SG_OK(sg_gate_set_stop_mode(gate, SG_EVAL_ALL));
+  sg_violation_config_t config;
+  sg_violation_config_default(&config);
+  config.sensitive_write_path_count = 1;
+  static const char *const separators[] = {" ", "\n", " # note\n", "\n\n"};
+  for (unsigned destination = 0; destination < 2; destination++) {
+    config.sensitive_write_paths[0] =
+        destination == 0 ? "/workspace/out" : "/tmp/out";
+    ASSERT_SG_OK(sg_gate_set_violation_config_borrowed(gate, &config));
+    for (size_t separator = 0;
+         separator < sizeof(separators) / sizeof(separators[0]); separator++) {
+      char source[128];
+      snprintf(source, sizeof(source), "cd /tmp && true &%sprintf payload >out",
+               separators[separator]);
+      sg_result_t result = {0};
+      ASSERT_SG_OK(eval_cmd(gate, source, &result));
+      ASSERT(result.verdict == SG_VERDICT_ALLOW && !result.truncated);
+      bool found = false;
+      for (uint32_t command = 0; command < result.subcommand_count; command++) {
+        const sg_subcommand_result_t *item = &result.subcommands[command];
+        if (strcmp(item->netargv, "6:printf,7:payload,"))
+          continue;
+        found = true;
+        ASSERT(item->write_count == 1);
+        ASSERT(((item->violation_type_flags & SG_VIOL_WRITE_SENSITIVE) != 0) ==
+               (destination == 0));
+      }
+      ASSERT(found);
+    }
+  }
+  sg_gate_free(gate);
+}
+
+TEST(background_compound_completion_contract) {
+  static const char *const rules[] = {"true", "false", "printf *", "echo *"};
+  sg_gate_t *gate = gate_with_rules(rules, 4);
+  ASSERT(gate != NULL);
+  ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
+  ASSERT_SG_OK(sg_gate_set_stop_mode(gate, SG_EVAL_ALL));
+  sg_violation_config_t config;
+  sg_violation_config_default(&config);
+  config.sensitive_write_paths[0] = "/etc/completion-out";
+  config.sensitive_write_path_count = 1;
+  ASSERT_SG_OK(sg_gate_set_violation_config_borrowed(gate, &config));
+  static const struct {
+    const char *source;
+    bool reached;
+    sg_verdict_t verdict;
+  } cases[] = {
+      {"{ false & } || printf bad >/etc/completion-out", false,
+       SG_VERDICT_ALLOW},
+      {"{ false & } && printf good >/etc/completion-out", true,
+       SG_VERDICT_ALLOW},
+      {"(false &) || printf bad >/etc/completion-out", false, SG_VERDICT_ALLOW},
+      {"{ { false & }; } || printf bad >/etc/completion-out", false,
+       SG_VERDICT_ALLOW},
+      {"{ false && true & } || printf bad >/etc/completion-out", false,
+       SG_VERDICT_ALLOW},
+      {"! { false & } || printf good >/etc/completion-out", true,
+       SG_VERDICT_ALLOW},
+      {"time { false & } || printf bad >/etc/completion-out", false,
+       SG_VERDICT_ALLOW},
+      {"echo \"$( { false & } || printf bad >/etc/completion-out )\"", false,
+       SG_VERDICT_ALLOW_CONDITIONAL},
+      {"{ false; } || printf good >/etc/completion-out", true,
+       SG_VERDICT_ALLOW},
+      {"{ true & false; } || printf good >/etc/completion-out", true,
+       SG_VERDICT_ALLOW},
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    sg_result_t result = {0};
+    ASSERT_SG_OK(eval_cmd(gate, cases[i].source, &result));
+    if (result.verdict != cases[i].verdict || result.truncated)
+      fprintf(stderr, "background compound gate: %s (verdict=%d)\n",
+              cases[i].source, result.verdict);
+    ASSERT(result.verdict == cases[i].verdict && !result.truncated);
+    bool found = false;
+    for (uint32_t command = 0; command < result.subcommand_count; command++) {
+      const sg_subcommand_result_t *item = &result.subcommands[command];
+      if (strcmp(item->netargv, "6:printf,3:bad,") &&
+          strcmp(item->netargv, "6:printf,4:good,"))
+        continue;
+      found = true;
+      if ((item->write_count != 0) != cases[i].reached)
+        fprintf(stderr, "background compound gate: %s\n", cases[i].source);
+      ASSERT(item->write_count == (cases[i].reached ? 1u : 0u));
+      ASSERT(((item->violation_type_flags & SG_VIOL_WRITE_SENSITIVE) != 0) ==
+             cases[i].reached);
+    }
+    ASSERT(found);
+  }
+  sg_gate_free(gate);
+}
+
 TEST(bash_pipeline_time_policy_contract) {
   static const char *rules[] = {"printf *", "cat",  "sort", "eval *",
                                 "echo *",   "exec", "true"};
@@ -3018,9 +3444,9 @@ TEST(cd_descriptor_effect_policy_contract) {
     uint32_t count;
   } sources[] = {
       {"exec {fd}>/tmp/cd-route; cd / 2>&1; printf x >&$fd", 3},
-      {"exec {fd}>/tmp/cd-route; command builtin cd /; printf x >&$fd", 2},
-      {"exec {PWD}>/tmp/cd-route; (cd /); printf x >&$PWD", 2},
-      {"exec {PWD}>/tmp/cd-route; cd --invalid; printf x >&$PWD", 2},
+      {"exec {fd}>/tmp/cd-route; command builtin cd /; printf x >&$fd", 3},
+      {"exec {PWD}>/tmp/cd-route; (cd /); printf x >&$PWD", 3},
+      {"exec {PWD}>/tmp/cd-route; cd --invalid; printf x >&$PWD", 3},
       {"exec {PWD}>/tmp/cd-route; cd / || printf x >&$PWD", 3},
   };
   sg_result_t result;
@@ -7048,14 +7474,15 @@ TEST(whole_word_expansion_context_contract) {
   ASSERT(contract.valid && contract.calls == 3);
   for (size_t i = 0; i < sizeof(rules) / sizeof(rules[0]); i++)
     ASSERT(rules[i].calls == 1);
-  if (result.verdict != SG_VERDICT_ALLOW || result.subcommand_count != 2)
+  if (result.verdict != SG_VERDICT_ALLOW || result.subcommand_count != 3)
     printf("\n    whole-word result: verdict=%d commands=%u flags=%u\n",
            result.verdict, result.subcommand_count,
            result.unresolved_expansion_flags);
-  ASSERT(result.verdict == SG_VERDICT_ALLOW && result.subcommand_count == 2);
-  ASSERT_STR(result.subcommands[0].display_command, "echo two words");
-  ASSERT_STR(result.subcommands[0].netargv, "4:echo,9:two words,");
-  ASSERT_STR(result.subcommands[1].display_command, "cat /root/.ssh/id");
+  ASSERT(result.verdict == SG_VERDICT_ALLOW && result.subcommand_count == 3);
+  ASSERT_STR(result.subcommands[0].netargv, "2:cd,10:/workspace,");
+  ASSERT_STR(result.subcommands[1].display_command, "echo two words");
+  ASSERT_STR(result.subcommands[1].netargv, "4:echo,9:two words,");
+  ASSERT_STR(result.subcommands[2].display_command, "cat /root/.ssh/id");
   ASSERT(result.unresolved_expansion_flags == 0);
   ASSERT((result.violation_type_flags & SG_VIOL_WRITE_SENSITIVE) != 0);
   ASSERT((result.violation_type_flags & SG_VIOL_READ_SECRETS) != 0);
@@ -7792,16 +8219,17 @@ TEST(expansion_operand_eligibility_contract) {
   ASSERT(contract.valid && contract.calls == 4);
   for (size_t i = 0; i < sizeof(rules) / sizeof(rules[0]); i++)
     ASSERT(rules[i].calls == 1);
-  if (result.subcommand_count != 5) {
+  if (result.subcommand_count != 6) {
     printf("\n    eligibility result commands=%u\n", result.subcommand_count);
     for (uint32_t i = 0; i < result.subcommand_count; i++)
       printf("      %u: %s\n", i, result.subcommands[i].display_command);
   }
-  ASSERT(result.subcommand_count == 5);
-  ASSERT_STR(result.subcommands[1].netargv, "6:printf,2:%s,3:hit,");
-  ASSERT_STR(result.subcommands[2].netargv, "4:echo,3:hit,");
-  ASSERT_STR(result.subcommands[3].netargv, "7:command,4:echo,3:hit,");
-  ASSERT_STR(result.subcommands[4].netargv, "4:exec,4:echo,3:hit,");
+  ASSERT(result.subcommand_count == 6);
+  ASSERT_STR(result.subcommands[1].netargv, "2:cd,4:$DIR,");
+  ASSERT_STR(result.subcommands[2].netargv, "6:printf,2:%s,3:hit,");
+  ASSERT_STR(result.subcommands[3].netargv, "4:echo,3:hit,");
+  ASSERT_STR(result.subcommands[4].netargv, "7:command,4:echo,3:hit,");
+  ASSERT_STR(result.subcommands[5].netargv, "4:exec,4:echo,3:hit,");
   ASSERT((result.unresolved_expansion_flags & SG_EXPANSION_UNRESOLVED_ARGV) !=
          0);
   sg_gate_free(gate);
@@ -8223,7 +8651,9 @@ TEST(nested_path_expansion_linear_metadata) {
   ASSERT_SG_OK(sg_gate_set_suggestions(gate, false));
   ASSERT_SG_OK(sg_gate_set_stop_mode(gate, SG_EVAL_ALL));
   size_t previous = 0;
-  for (unsigned count = 4; count <= 32; count *= 2) {
+  /* Each command retains three documents; 32 rows already fill all 128
+   * non-boundary nodes. Keep scaling below the documented total-node bound. */
+  for (unsigned count = 4; count <= 16; count *= 2) {
     char source[2048];
     size_t used = 0;
     for (unsigned i = 0; i < count; i++) {
@@ -8526,6 +8956,70 @@ TEST(resolved_file_violation_details) {
   ASSERT_SG_OK(eval_cmd(gate, "echo >/etc/passwd", &result));
   ASSERT(result.violation_count > 0);
   ASSERT_STR(result.violations[0].detail, "/etc/passwd");
+  sg_gate_free(gate);
+}
+
+typedef struct {
+  const char *value;
+  unsigned calls;
+} file_diagnostic_fixture_t;
+
+static shell_expand_status_t
+expand_file_diagnostic(const shell_expand_word_request_t *request,
+                       const char **netargv, size_t *length, void *context) {
+  file_diagnostic_fixture_t *fixture = context;
+  if (request->purpose != SHELL_EXPAND_WORD_FILE_SUBSTITUTION_PATH)
+    return SHELL_EXPAND_UNRESOLVED;
+  fixture->calls++;
+  *netargv = fixture->value;
+  *length = strlen(fixture->value);
+  return SHELL_EXPAND_RESOLVED;
+}
+
+TEST(file_substitution_diagnostic_receiver) {
+  static const struct {
+    const char *source, *value;
+    bool outer_inspection;
+  } cases[] = {
+      {"sh -c \"$(exec 2>&1; x=$(<\"$FILE\"))\"", "0:,", true},
+      {"sh -c \"$(exec 2>&1; x=$(<\"$@\"))\"", "", true},
+      {"sh -c \"$(exec 2>&1; x=$(<\"$@\"))\"", "1:a,1:b,", true},
+      {"sh -c \"$(exec 2>&1; x=$(<\"$FILE\"))\"", "10:/tmp/input,", true},
+      {"sh -c \"$(x=$(<\"$FILE\"))\"", "10:/tmp/input,", false},
+      {"sh -c \"$(exec 2>&-; x=$(<\"$FILE\"))\"", "0:,", false},
+      {"sh -c \"$(exec 2<input; x=$(<\"$FILE\"))\"", "0:,", false},
+      {"sh -c \"$(exec 2>&1; x=$(<\"$FILE\") 1>&- 2>&-)\"", "0:,", true},
+      {"sh -c \"$(x=$(<\"$FILE\") 2>&1)\"", "0:,", false},
+      {"sh -c \"$(exec 2>&1; false 1>&- 2>&- && x=$(<\"$FILE\"))\"", "0:,",
+       false},
+      {"sh -c \"$(: 2>&1 >$(<\"$FILE\") 1>&- 2>&-)\"", "0:,", true},
+      {"sh -c \"$(x=$(exec 2>&1; y=$(<\"$FILE\")))\"", "0:,", false},
+  };
+  sg_gate_t *gate = sg_gate_new();
+  ASSERT_NOT_NULL(gate);
+  ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
+  ASSERT_SG_OK(sg_gate_set_stop_mode(gate, SG_EVAL_ALL));
+  ASSERT_SG_OK(sg_gate_set_suggestions(gate, false));
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    file_diagnostic_fixture_t fixture = {cases[i].value, 0};
+    ASSERT_SG_OK(sg_gate_set_expand_word_netargv(gate, expand_file_diagnostic,
+                                                 &fixture));
+    sg_result_t result = {0};
+    ASSERT_SG_OK(eval_cmd(gate, cases[i].source, &result));
+    ASSERT(!result.truncated && result.subcommand_count != 0);
+    ASSERT(fixture.calls == (i == 9 ? 0 : 1));
+    const sg_subcommand_result_t *outer = &result.subcommands[0];
+    ASSERT(outer->netargv_length >= 5 &&
+           memcmp(outer->netargv, "2:sh,", 5) == 0);
+    if (outer->requires_substitution_evaluation != cases[i].outer_inspection)
+      printf("\n    file diagnostic consumer: %s\n", cases[i].source);
+    ASSERT(outer->requires_substitution_evaluation ==
+           cases[i].outer_inspection);
+    ASSERT(outer->has_dynamic_substitution_io == cases[i].outer_inspection);
+    if (cases[i].outer_inspection)
+      ASSERT(result.requires_substitution_evaluation &&
+             result.has_dynamic_substitution_io);
+  }
   sg_gate_free(gate);
 }
 
@@ -9748,7 +10242,7 @@ TEST(shared_cwd_path_linear_work) {
       sg_test_alloc_reset();
       ASSERT_SG_OK(status);
       ASSERT_EQ_UINT(allocations, 0);
-      ASSERT_EQ_UINT(result.subcommand_count, count);
+      ASSERT_EQ_UINT(result.subcommand_count, count + 1);
       ASSERT_EQ_UINT(result.violation_type_flags, SG_VIOL_WRITE_THEN_READ);
       /* Account for actual CWD measurement/copies, trie comparisons, lexical
        * normalization and predicate transitions, not just FILE decoding. The
@@ -9758,7 +10252,7 @@ TEST(shared_cwd_path_linear_work) {
       size_t match = sg_test_path_work_count();
       size_t normalize = shellsplit_test_metadata_work(
           SHELLSPLIT_TEST_WORK_PATH_NORMALIZATION);
-      ASSERT_EQ_UINT(sg_test_path_decoded_count(), 5 * count);
+      ASSERT_EQ_UINT(sg_test_path_decoded_count(), 5 * count + cwd_length);
       ASSERT(identity > 0 && identity < 8 * used);
       ASSERT(normalize > 0 && normalize < 8 * used);
       ASSERT(match > 0 && match < 6 * SG_VIOL_MAX_PATHS * used);
@@ -11775,7 +12269,7 @@ TEST(anomaly_scoring_contract_matrix) {
   sg_gate_t *g = sg_gate_new();
   ASSERT_SG_OK(sg_gate_enable_anomaly(g, 5.0, NULL));
   ASSERT_ST_OK(test_policy_replace_cpl(g, false, "ls", false));
-  ASSERT_ST_OK(test_policy_replace_cpl(g, false, "cd", false));
+  ASSERT_ST_OK(test_policy_replace_cpl(g, false, "cd #path", false));
 
   sg_result_t r;
 
@@ -11818,7 +12312,7 @@ TEST(anomaly_scoring_contract_matrix) {
   ASSERT(g != NULL);
   ASSERT_SG_OK(sg_gate_enable_anomaly(g, 5.0, NULL));
   ASSERT_ST_OK(test_policy_replace_cpl(g, false, "ls", false));
-  ASSERT_ST_OK(test_policy_replace_cpl(g, false, "cd", false));
+  ASSERT_ST_OK(test_policy_replace_cpl(g, false, "cd #path", false));
   ASSERT_ST_OK(test_policy_replace_cpl(g, false, "pwd", false));
   ASSERT_SG_OK(eval_cmd(g, "ls ; cd /tmp ; pwd", &r));
   size_t stable_vocab = test_anomaly_vocabulary(g);
@@ -11850,7 +12344,7 @@ TEST(anomaly_scoring_contract_matrix) {
   ASSERT(g != NULL);
   ASSERT_SG_OK(sg_gate_enable_anomaly(g, 5.0, NULL));
   ASSERT_ST_OK(test_policy_replace_cpl(g, false, "ls", false));
-  ASSERT_ST_OK(test_policy_replace_cpl(g, false, "cd", false));
+  ASSERT_ST_OK(test_policy_replace_cpl(g, false, "cd #path", false));
   ASSERT_ST_OK(test_policy_replace_cpl(g, false, "pwd", false));
   ASSERT_ST_OK(test_policy_replace_cpl(g, false, "cat", false));
   stable_vocab = 0;
@@ -13409,17 +13903,19 @@ TEST(anomaly_short_aligned_sequence_stays_finite) {
 }
 
 TEST(truncated_parse_without_subcommands_is_undetermined) {
-  /* A command that exhausts the bounded graph-token budget without producing
-   * a CMD node (`cd` is modeled as a CWD side effect by default) must not be
-   * mistaken for a successfully evaluated empty command list. */
-  char cmd[2048] = "cd";
-  size_t used = 2;
-  for (size_t i = 0; i < 400; i++) {
-    ASSERT(used + 2 < sizeof(cmd));
-    cmd[used++] = ' ';
-    cmd[used++] = 'x';
+  /* Group-owned redirect documents are built before their command bodies.
+   * Fill the node budget with 32 groups and 96 documents: no CMD can fit, but
+   * the truncated graph must not be treated as an evaluated empty list. */
+  char cmd[2048] = "";
+  for (unsigned i = 0; i < 32; i++)
+    strcat(cmd, "{ ");
+  strcat(cmd, "echo;");
+  for (unsigned i = 0; i < 32; i++) {
+    char tail[64];
+    snprintf(tail, sizeof(tail), " } <in%u >out%u 2>err%u%s", i, i, i,
+             i == 31 ? "" : ";");
+    strcat(cmd, tail);
   }
-  cmd[used] = '\0';
   sg_gate_t *g = sg_gate_new();
   ASSERT(g != NULL);
 
@@ -13429,6 +13925,19 @@ TEST(truncated_parse_without_subcommands_is_undetermined) {
   ASSERT(r.truncated);
   ASSERT_EQ_INT(err, SG_ERR_TRUNC);
   ASSERT_EQ_INT(r.verdict, SG_VERDICT_UNDETERMINED);
+
+  /* Token-budget exhaustion now retains cd's ordinary command endpoint. */
+  strcpy(cmd, "cd");
+  size_t used = 2;
+  for (size_t i = 0; i < 400; i++) {
+    cmd[used++] = ' ';
+    cmd[used++] = 'x';
+  }
+  cmd[used] = '\0';
+  err = eval_with_prefix(g, cmd, 8192, &r);
+  ASSERT_EQ_UINT(r.subcommand_count, 1);
+  ASSERT(r.truncated && err == SG_ERR_TRUNC &&
+         r.verdict == SG_VERDICT_UNDETERMINED);
 
   sg_gate_free(g);
 }
@@ -14320,6 +14829,15 @@ int main(void) {
   RUN(bash_pipe_both_policy_contract);
   RUN(repeated_pipeline_negation_policy_contract);
   RUN(bash_pipeline_time_policy_contract);
+  RUN(inherited_boundary_context_contract);
+  RUN(setup_diagnostic_substitution_contract);
+  RUN(expansion_diagnostic_substitution_contract);
+  RUN(cd_command_and_capture_contract);
+  RUN(assignment_stream_and_diagnostic_contract);
+  RUN(rejected_assignment_effect_contract);
+  RUN(nested_setup_diagnostic_context_contract);
+  RUN(background_newline_cwd_contract);
+  RUN(background_compound_completion_contract);
   RUN(descriptor_scope_policy_contract);
   RUN(timed_pipeline_ordinary_time_policy_contract);
   RUN(grouped_empty_time_io_policy_contract);
@@ -14465,6 +14983,7 @@ int main(void) {
   RUN(substitution_status_callback_reachability);
   RUN(resolved_file_violation_details);
   RUN(file_substitution_path_failure_is_local);
+  RUN(file_substitution_diagnostic_receiver);
   RUN(expansion_bounds_matrix);
   RUN(truncation_cross_product_matrix);
 

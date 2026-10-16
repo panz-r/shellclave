@@ -458,6 +458,12 @@ static inline shell_brace_fuzz_case_t shell_brace_fuzz_case(const uint8_t *data,
                              : composition == 3                     ? 2
                                                                     : 0) +
                             (composition == 5 ? 1 : 0);
+  /* With file-backed outer stderr, every nested group's auxiliary opens can
+   * emit a setup diagnostic into that file. This is an additional GROUP/fd-2
+   * relation at each layer, not another document or redirect operation. */
+  uint32_t nested_writes = 2 + (redirect_kind == 1 ? 1 : 0);
+  if (redirect_kind == 1)
+    write_count += nesting;
   shell_brace_fuzz_case_t item = shell_brace_fuzz_make_case(
       prefix + group + redirect + suffix + bodies, true, true, command_count,
       group_count, group_io_count, document_count, read_count);
@@ -472,8 +478,8 @@ static inline shell_brace_fuzz_case_t shell_brace_fuzz_case(const uint8_t *data,
       item.deepest_command_count + (item.group_count - 1) * 2;
   item.has_background_sibling = composition == 5;
   item.base_read_count = read_count;
-  item.base_write_count = write_count - nesting * 2;
-  item.nested_write_count_per_layer = 2;
+  item.base_write_count = write_count - nesting * nested_writes;
+  item.nested_write_count_per_layer = nested_writes;
   for (uint8_t depth = 0; depth < nesting; depth++) {
     uint16_t group_depth = (uint16_t)(nesting - depth + 1);
     shell_brace_fuzz_add_redirect(

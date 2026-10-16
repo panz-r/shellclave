@@ -1620,6 +1620,9 @@ TEST(descriptor_graph_routes_and_identities) {
     }
     for (uint32_t e = 0; e < graph.edge_count; e++) {
       const shell_dep_edge_t *edge = &graph.edges[e];
+      if (graph.nodes[edge->from].type == SHELL_NODE_FD ||
+          graph.nodes[edge->to].type == SHELL_NODE_FD)
+        continue;
       if (cases[i].write && edge->type == SHELL_EDGE_WRITE) {
         CHECK(edge->source_fd == cases[i].fd);
         CHECK(graph.nodes[edge->from].type ==

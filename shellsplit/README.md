@@ -40,6 +40,83 @@ Conformance tests use the pinned Bash reference described in the repository's
 [build instructions](../README.md#requirements-and-build). Library-only builds with
 `BUILD_TESTING=OFF` do not need a Bash executable or network access.
 
+### Full-command I/O boundaries
+
+`cd` remains an ordinary CMD node, including its possible stdout/stderr flows,
+while Shellsplit tracks its CWD transition for later commands. Its own words
+and redirects use the incoming CWD. The `cd_as_cmd` limits option was removed
+in 0.15.0; consumers must remove that initializer and recompile.
+
+Dependency graphs include inherited descriptor resources as `SHELL_NODE_FD`,
+with their original full-command descriptor number in `node.fd.number`.
+Ordinary executable commands expose potential stdin-read and stdout/stderr-write
+routes even without redirects. Explicitly modeled auxiliary descriptors retain
+their corresponding directions. Setup-only and unreachable bodies do not gain
+ordinary standard-stream byte uses.
+
+Sparse standard-descriptor entries retain both available directions, including
+write routes on fd 0 and read routes on fd 1 or 2. Descriptor copies preserve
+capabilities; the graph does not presume the access mode of an inherited OS
+descriptor. Missing entries supply only the ordinary defaults. Closed and
+known read-only routes never acquire a write edge merely through duplication.
+
+For `wc -l file.txt 2>&1`, the WRITE edge whose `source_fd` is 2 targets an FD
+node numbered 1. Without `2>&1` it targets FD 2. READ edges run from an FD
+resource to an execution endpoint, with its local `target_fd`; WRITE edges run
+the other way, with local `source_fd`. The boundary-resource side uses
+`SHELL_DEP_FD_NONE`. These represent available shell routes, not knowledge of
+what the executable will actually read or write.
+
+All nested scopes share the same inherited resources. Source-order copies,
+scope restoration, and captures are resolved before publication: `2>&1 >out`
+leaves stderr on inherited stdout, while `>out 2>&1` routes both to the file.
+
+Byte flow includes shell-owned expansion, redirect-setup and undo diagnostics, not just
+command-body I/O. They originate at the existing CMD/GROUP endpoint on fd 2,
+using the stderr destination at the failure point. A failed body can therefore
+still supply captured bytes: `exec 3>&-; sh -c "$(echo 2>&1 >&3)"` retains a
+SUBST relation requiring inspection, whereas reversing the two redirects
+leaves the capture empty. Closed or read-only stderr has no diagnostic flow.
+Possible file-open and implicit asynchronous-stdin-open failures retain their
+diagnostic alternatives without asserting a filesystem failure occurred.
+Known readonly assignments contribute diagnostics through pre-redirection
+stderr, including executable prefixes that still run their command.
+Parameter and arithmetic expansion diagnostics retain that same entry stderr
+for arguments and assignment values. Redirect operands and expandable heredocs
+use stderr after preceding redirects, before their own operation. For example,
+`sh -c "$(exec 2>&1; x=$((1/0)))"` retains the diagnostic's SUBST flow even
+though the assignment has no command body. Possible expansion errors do not
+require evaluation of runtime values.
+Optimized `$(<word)` reads retain possible open/read diagnostics separately
+from file content. An empty or ambiguous resolved filename suppresses the
+content flow while preserving stderr at the expansion point. In
+`sh -c "$(exec 2>&1; x=$(<"$FILE"))"`, that diagnostic can reach the outer
+`sh`, even if the application resolves `$FILE` to an empty filename. Pathname
+resolution alone never establishes that the read succeeds.
+ENV edges represent effective assignments, not rejected attempts. A readonly
+write retains syntax and diagnostics without an ENV edge; successful neighboring
+assignments remain effective. Rejected temporary prefixes skip their RHS.
+Assignment-only and export forms expand that RHS before rejection and retain
+those executed substitution flows.
+Syntactic command words do not prove executable dispatch: unquoted expansions
+and quoted list selectors can yield no argv entries. When all words can vanish,
+the graph retains both dispatch alternatives, including RHS execution and an
+input-unit abort only on the assignment-only path. A quoted empty scalar word,
+literal fragment, or a later guaranteed argument rules out that null path.
+Successful argv-less stages do not contribute default body streams to inherited
+resources, captures or descriptor imports. Explicit document setup and pipeline
+bindings remain visible, and genuine substitutions in assignment values and redirect
+operands are retained without inventing output from the enclosing null stage.
+Matching compound exposures remain owned by GROUP nodes. FD resources are not
+internal pipes or substitution collectors, and sharing one does not establish
+an internal producer-to-consumer transfer. Inherited numbers are provenance,
+not proof that two OS descriptors refer to distinct underlying objects.
+
+Boundary nodes and edges consume the existing public capacities. A truncated
+graph is not a complete account of the command's possible routes. Timing
+reports use WRITE-to-FD edges too; their compact external summary lists are
+derived from the retained boundary edges.
+
 ## Features
 
 | Feature | Syntax | Status |
@@ -610,6 +687,31 @@ Timing pipes retain every surviving destination descriptor alias. Recursive
 joins reserve their imported edges and deferred stream uses before copying child topology; exhausting
 the bounded route or graph capacity returns truncation rather than silently
 dropping a destination.
+
+With job control disabled, Bash can supply read-only `/dev/null` as background
+stdin. Its retained resource is one shared FILE DOC flagged
+`SHELL_DEP_DOC_FLAG_IMPLICIT`, with a library-owned canonical pathname rather
+than a source span. Explicit source `/dev/null` documents remain separate.
+Only retained READ uses cause this implicit resource to be published. Bash's
+implicit open is nonfatal: the graph also retains the original stdin alternative
+for open failure. Copies, closes and scope restoration operate on these same
+correlated route facts. Simple-command argv and assignment values expand before
+this setup; redirect operands expand after it. Asynchronous compounds, timed
+pipelines and AND/OR wrappers install it before their contained expansions.
+Bash's interpreter-local `stdin_redir` marker and explicit redirect-instruction
+classification control the exemptions; auxiliary file-input instructions can
+exempt a command even when they do not target fd 0. The marker persists across
+newlines within one submitted `-c` source, and isolated scope changes do not
+escape to the caller's continuation. Process substitution alone is not a
+background-stdin installation. Implicit routes are real flow, not explicit
+redirection syntax or Shellgate redirection-fanout effects.
+
+Top-level recovery from an input-unit abort precedes asynchronous entry and
+stdin setup. The saved parent FD/CWD state is that recovered state; completing
+a background unit cannot restore the preceding abort or retain child changes.
+Returning parent paths observe successful asynchronous launch, not the child's
+exit status. This also determines compound completion when its final list is
+asynchronous; child-local AND/OR decisions still use the child's own status.
 
 Substitution snapshots include pipeline setup before command-word expansion.
 Redirect operands additionally see preceding redirects; an implicit `|&`

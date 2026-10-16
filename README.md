@@ -263,6 +263,58 @@ list, leaving the target unchanged and older saves live. Cleanup diagnostics
 do not change the command body's status; enclosing scopes still run their own
 independent cleanup lists.
 
+The dependency graph exposes the full command's inherited I/O resources as
+`SHELL_NODE_FD` nodes, identified by `node.fd.number`. Ordinary executable
+commands have potential stdin, stdout, and stderr routes by default. READ/WRITE
+edges carry the command-local descriptor on the execution side and
+`SHELL_DEP_FD_NONE` on the boundary-resource side. These describe shell routing,
+not a prediction that a particular executable transfers bytes.
+
+`cd` is always an ordinary CMD node with its I/O and CWD relation. Shellsplit
+also tracks directory changes for subsequent commands; `cd`'s own arguments
+and redirects use its incoming directory. The former `cd_as_cmd` limits field
+has been removed in 0.15.0: remove its initialization and rebuild consumers.
+
+For `wc -l file.txt 2>&1`, follow the WRITE edge with `source_fd == 2`: its FD
+target has `fd.number == 1`. For the unredirected command that target is 2.
+Source order is preserved: `2>&1 >out` still sends stderr to inherited stdout,
+whereas `>out 2>&1` sends both outputs to `out`. Nested scopes share the same
+full-command boundary; captures and pipes retain their separate identities.
+Boundary resources are not internal producer/consumer bridges. They count
+toward the documented node/edge limits; missing capacity reports truncation.
+
+Byte-flow edges also retain shell-owned expansion, redirect-setup and undo diagnostics on
+the existing CMD/GROUP owner's fd 2. They use stderr at the failure point, even
+when the command body does not execute. For example, in
+`exec 3>&-; sh -c "$(echo 2>&1 >&3)"`, the setup error enters the substitution
+capture and requires inspection. Reordering the redirects leaves that capture
+empty. Possible open failures retain alternatives without predicting an OS
+failure; closed or read-only stderr supplies no diagnostic bytes.
+Argument/RHS expansion diagnostics use incoming stderr, while redirect operands
+and expandable heredocs use the reached redirect prefix. Thus
+`sh -c "$(exec 2>&1; x=$((1/0)))"` retains a SUBST flow requiring inspection,
+including when later redirects close the command's outputs.
+Optimized `$(<file)` reads preserve the same diagnostic routes independently
+of their file-content flow. Resolving an empty filename removes the content
+edge, but its captured open error still marks the outer receiving command for
+inspection. A filename resolution callback establishes the filename, not I/O
+success.
+
+Successful argv-less assignments such as `$(x=1)` do not produce captured body
+output. Their ENV effects, explicit redirect setup, and pipeline connections
+remain represented. Known readonly-assignment errors use stderr before the
+command's own redirects: `UID=1` aborts its input unit without applying them,
+while `UID=1 true` can still run `true`. Thus
+`sh -c "$(exec 2>&1; UID=1 true 1>&- 2>&-)"` still requires inspection of the
+captured diagnostic, despite the body closing both outputs.
+Rejected temporary prefix assignments skip their RHS expressions; assignment-only
+and export forms still expand them. Rejected writes do not create effective ENV
+edges, while successful neighboring assignments remain represented.
+This distinction follows post-expansion argv: in
+`UID=$(printf 1) $(true)`, the command word can disappear and the RHS executes
+before rejection. Shellsplit retains that possible flow. Quoted empty scalar
+words and a later guaranteed argument instead preserve executable dispatch.
+
 Parameter pattern removal, replacement and case-conversion operands may skip
 their substitutions for unset or empty values. Their analysis preserves the
 incoming status as well as the possible substitution outcome.

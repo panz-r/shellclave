@@ -123,16 +123,20 @@ static SHELL_NONNULL(1, 3, 4) inline void shell_pipeline_index_connectors(
       break;
     }
     if (list) {
+      bool newline = token.type == SHELL_TOKEN_SEMICOLON &&
+                     (token.start[0] == '\n' || token.start[0] == '\r');
       /* A physical newline after a binary list operator is continuation,
        * not a new list. The lexical API still exposes that newline token. */
-      if (token.type == SHELL_TOKEN_SEMICOLON &&
-          (token.start[0] == '\n' || token.start[0] == '\r') &&
+      if (newline &&
           (connector == SHELL_TYPE_PIPELINE || connector == SHELL_TYPE_AND ||
            connector == SHELL_TYPE_OR))
         continue;
-      if (depth == 0 && token.type == SHELL_TOKEN_SEMICOLON &&
-          (token.start[0] == '\n' || token.start[0] == '\r'))
+      if (depth == 0 && newline)
         input_unit++;
+      /* `&` already terminates its execution unit. Following newlines start
+       * new input units, but retain the background successor and connector. */
+      if (newline && connector == SHELL_TYPE_BACKGROUND)
+        continue;
       if (closed != UINT16_MAX)
         index->group_successor[closed] = next;
       else if (last_range != UINT32_MAX)

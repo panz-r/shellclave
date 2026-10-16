@@ -368,6 +368,16 @@ oracle_expand_word(const shell_expand_word_request_t *request,
   return SHELL_EXPAND_RESOLVED;
 }
 
+shell_expand_status_t
+oracle_empty_file_path(const shell_expand_word_request_t *request,
+                       const char **netargv, size_t *length, void *) {
+  if (request->purpose != SHELL_EXPAND_WORD_FILE_SUBSTITUTION_PATH)
+    return SHELL_EXPAND_UNRESOLVED;
+  *netargv = "0:,";
+  *length = 3;
+  return SHELL_EXPAND_RESOLVED;
+}
+
 void run_expansion_query_oracles() {
   sg_gate_t *gate = sg_gate_new();
   expansion_query_oracle state = {};
@@ -427,8 +437,16 @@ void run_expansion_query_oracles() {
     if (sg_gate_evaluate(gate, source.data(), source.size(), buffer.data(),
                          buffer.size(), &result) != SG_OK ||
         state.calls != 1 ||
-        result.unresolved_expansion_flags != SG_EXPANSION_UNRESOLVED_ARGV)
+        result.unresolved_expansion_flags !=
+            (SG_EXPANSION_UNRESOLVED_ARGV |
+             (fixture.leading_tilde && strchr(fixture.word, '/')
+                  ? SG_EXPANSION_UNRESOLVED_PATH
+                  : 0))) {
+      fprintf(stderr, "tilde CWD source=%s calls=%zu flags=%u leading=%d\n",
+              source.c_str(), state.calls, result.unresolved_expansion_flags,
+              fixture.leading_tilde);
       invariant_failure("tilde CWD callback contract");
+    }
   }
   sg_violation_config_t config;
   sg_violation_config_default(&config);
@@ -1025,6 +1043,136 @@ void run_semantic_reference_oracles() {
   if (sg_gate_set_violation_config_borrowed(option_gate, &expansion_config) !=
       SG_OK)
     invariant_failure("expansion control violation configuration failed");
+  for (const char *source : {"wc -l file.txt", "wc -l file.txt 2>&1",
+                             "wc -l file.txt 1>&0; wc -l other.txt"}) {
+    auto &buffer = eval_buffer_for(g_eval_buffers.result, strlen(source));
+    sg_result_t result = {};
+    sg_error_t error = sg_gate_evaluate(option_gate, source, strlen(source),
+                                        buffer.data(), buffer.size(), &result);
+    if (error != SG_OK || result.truncated ||
+        result.requires_substitution_evaluation ||
+        result.has_dynamic_substitution_io)
+      invariant_failure(
+          "inherited boundary changed shell evaluation semantics");
+    for (uint32_t i = 0; i < result.subcommand_count; i++)
+      if (result.subcommands[i].write_count || result.subcommands[i].read_count)
+        invariant_failure("inherited boundary counted as explicit redirection");
+    validate_result(&result, error, buffer.data(), buffer.size());
+  }
+  static const struct {
+    const char *source;
+    bool capture;
+  } cd_captures[] = {
+      {"sh -c \"$(exec 2>&1; cd one two)\"", true},
+      {"sh -c \"$(cd /; cd -)\"", true},
+      {"sh -c \"$({ exec 2>&1; cd one two; })\"", true},
+      {"sh -c \"$(exec 1>&- 2>&-; cd one two)\"", false},
+      {"sh -c \"$(false >&- 2>&- && cd one two)\"", false},
+  };
+  for (const auto &fixture : cd_captures) {
+    auto &buffer =
+        eval_buffer_for(g_eval_buffers.result, strlen(fixture.source));
+    sg_result_t result = {};
+    sg_error_t error =
+        sg_gate_evaluate(option_gate, fixture.source, strlen(fixture.source),
+                         buffer.data(), buffer.size(), &result);
+    if (error != SG_OK || result.truncated ||
+        result.has_dynamic_substitution_io != fixture.capture ||
+        result.requires_substitution_evaluation != fixture.capture)
+      invariant_failure("cd command output/capture contract mismatch");
+    validate_result(&result, error, buffer.data(), buffer.size());
+  }
+  static const struct {
+    const char *source;
+    bool capture;
+  } assignment_captures[] = {
+      {"sh -c \"$(x=1)\"", false},
+      {"sh -c \"$(UID=1 2>&1)\"", false},
+      {"sh -c \"$(exec 2>&1; UID=1)\"", true},
+      {"sh -c \"$(exec 2>&1; UID=1 true 1>&- 2>&-)\"", true},
+      {"sh -c \"$(exec 1>&- 2>&-; UID=1)\"", false},
+      {"sh -c \"$(UID=$(printf skipped) true 1>&- 2>&-)\"", false},
+      {"sh -c \"$(exec 2>&1; x=${missing:?expansion-marker})\"", true},
+      {"sh -c \"$(exec 2>&1; x=$((1/0)))\"", true},
+      {"sh -c \"$(exec 2>&1; : ${missing:?expansion-marker} 1>&- 2>&-)\"",
+       true},
+      {"sh -c \"$(: 2>&1 >${missing:?expansion-marker})\"", true},
+      {"sh -c \"$(: >${missing:?expansion-marker} 2>&1)\"", false},
+      {"sh -c \"$(exec 2>&1; x=$(<input))\"", true},
+      {"sh -c \"$(exec 2>&1; x=$(<''))\"", true},
+      {"sh -c \"$(exec 2>&1; x=$(< <(true 1>&- 2>&-)))\"", true},
+  };
+  for (const auto &fixture : assignment_captures) {
+    auto &buffer =
+        eval_buffer_for(g_eval_buffers.result, strlen(fixture.source));
+    sg_result_t result = {};
+    sg_error_t error =
+        sg_gate_evaluate(option_gate, fixture.source, strlen(fixture.source),
+                         buffer.data(), buffer.size(), &result);
+    if (error != SG_OK || result.truncated || result.subcommand_count == 0 ||
+        result.requires_substitution_evaluation != fixture.capture ||
+        result.subcommands[0].requires_substitution_evaluation !=
+            fixture.capture)
+      invariant_failure("assignment diagnostic capture contract mismatch");
+    validate_result(&result, error, buffer.data(), buffer.size());
+  }
+  static const char empty_file_source[] =
+      "sh -c \"$(exec 2>&1; x=$(<\"$FILE\"))\"";
+  if (sg_gate_set_expand_word_netargv(option_gate, oracle_empty_file_path,
+                                      nullptr) != SG_OK)
+    invariant_failure("file diagnostic callback setup failed");
+  {
+    auto &buffer =
+        eval_buffer_for(g_eval_buffers.result, sizeof(empty_file_source) - 1);
+    sg_result_t result = {};
+    sg_error_t error = sg_gate_evaluate(option_gate, empty_file_source,
+                                        sizeof(empty_file_source) - 1,
+                                        buffer.data(), buffer.size(), &result);
+    if (error != SG_OK || result.truncated || result.subcommand_count == 0 ||
+        !result.requires_substitution_evaluation ||
+        !result.subcommands[0].requires_substitution_evaluation)
+      invariant_failure("failed file read lost its outer inspection consumer");
+    validate_result(&result, error, buffer.data(), buffer.size());
+  }
+  sg_gate_set_expand_word_netargv(option_gate, nullptr, nullptr);
+  static const struct {
+    const char *source;
+    uint32_t environments;
+    bool inspect;
+  } assignment_effects[] = {
+      {"UID=1 true", 0, false},
+      {"UID=1 EUID+=2 command true", 0, false},
+      {"UID=1 x=2 true", 1, false},
+      {"export 'U''ID=1' x=2", 1, false},
+      {"export -Z x=2", 0, false},
+      {"UID=$(printf skipped) true", 0, false},
+      {"UID=$(printf data) $missing", 0, true},
+      {"UID=$(printf data) $(true)", 0, true},
+      {"UID=$(printf data) \"$@\"", 0, true},
+      {"UID=$(printf data) \"${!prefix@}\"", 0, true},
+      {"UID=$(printf data) \"${@:+data}\"", 0, true},
+      {"UID=$(printf skipped) \"${!prefix*}\"", 0, false},
+      {"UID=$(printf skipped) \"${@:-data}\"", 0, false},
+      {"UID=$(printf skipped) \"${@:-}\"", 0, false},
+      {"UID=$(printf skipped) \"${@:?error}\"", 0, false},
+      {"UID=$(printf skipped) \"$missing\"", 0, false},
+      {"UID=$(printf skipped) $missing true", 0, false},
+      {"UID=$(printf skipped) $missing-suffix", 0, false},
+      {"export UID=$(printf data)", 0, true},
+  };
+  for (const auto &fixture : assignment_effects) {
+    auto &buffer =
+        eval_buffer_for(g_eval_buffers.result, strlen(fixture.source));
+    sg_result_t result = {};
+    sg_error_t error =
+        sg_gate_evaluate(option_gate, fixture.source, strlen(fixture.source),
+                         buffer.data(), buffer.size(), &result);
+    if (error != SG_OK || result.truncated || result.subcommand_count == 0 ||
+        result.subcommands[0].env_count != fixture.environments ||
+        result.requires_substitution_evaluation != fixture.inspect)
+      invariant_failure("rejected assignment ENV effect mismatch");
+    validate_result(&result, error, buffer.data(), buffer.size());
+  }
   for (const auto &fixture : shellsplit_test_substitution_status_cases) {
     for (unsigned success = 0; success < 2; success++) {
       std::string source = std::string(fixture.source) +
@@ -2440,8 +2588,16 @@ void run_generated_brace_case(const uint8_t *data, size_t size) {
           (command->read_count != item.base_read_count ||
            command->write_count != expected_writes ||
            (!!(command->violation_type_flags & SG_VIOL_WRITE_SENSITIVE) !=
-            item.sensitive_write)))
+            item.sensitive_write))) {
+        fprintf(stderr,
+                "generated brace I/O: %s\ncommand %u depth %u: read %u/%u "
+                "write %u/%u sensitive %u/%u\n",
+                item.command.c_str(), i, depth, command->read_count,
+                item.base_read_count, command->write_count, expected_writes,
+                !!(command->violation_type_flags & SG_VIOL_WRITE_SENSITIVE),
+                item.sensitive_write);
         invariant_failure("generated brace inherited I/O context mismatch");
+      }
       group_commands_checked++;
     }
     if (group_commands_checked != item.group_command_count)
@@ -2858,6 +3014,13 @@ static void run_fixed_oracles() {
   };
   run_generated_brace_case(background_group_io_case,
                            sizeof(background_group_io_case));
+  for (uint8_t depth = 0; depth < 8; depth++)
+    for (uint8_t composition = 0; composition < 6; composition++) {
+      const uint8_t diagnostic_group_case[] = {0,           1, 2, 0, depth,
+                                               composition, 1, 0, 1};
+      run_generated_brace_case(diagnostic_group_case,
+                               sizeof(diagnostic_group_case));
+    }
   /* Keep the shared generated invalid/strict-only matrix deterministic.
    * Byte four selects these forms when byte zero is seven. */
   for (uint8_t selector = 0; selector < 12; selector++) {

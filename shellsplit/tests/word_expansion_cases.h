@@ -1908,7 +1908,7 @@ static const struct {
      true},
     {"exec {fd}>/tmp/read-route; read -dE other <<<one; printf x >&$fd", true},
     /* cd writes PWD/OLDPWD only after successful setup and execution. Even a
-     * collapsed cd must invalidate those variable proofs, not the descriptors
+     * cd must invalidate those variable proofs, not the descriptors
      * themselves or unrelated names. Runtime directory values are not treated
      * as proven descriptor-variable bindings. */
     {"exec {PWD}>/tmp/read-route; cd /; printf x >&\"$PWD\"", false},

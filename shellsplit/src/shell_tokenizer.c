@@ -1318,7 +1318,7 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
                           &result->cmds[subcmd_idx].features,                  \
                           execution_pipeline_start);                           \
       subcmd_idx++;                                                            \
-    } else if (subcmd_idx >= max_cmds) {                                       \
+    } else if (_s < _e && subcmd_idx >= max_cmds) {                            \
       result->status = SHELL_STATUS_TRUNCATED;                                 \
       result->count = subcmd_idx;                                              \
       goto truncated;                                                          \
@@ -2348,16 +2348,16 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
       if (logical_and) {
         // End current subcommand (trim whitespace)
         if (subcmd_start < pos) {
-          if (subcmd_idx >= max_cmds) {
-            result->status = SHELL_STATUS_TRUNCATED;
-            result->count = subcmd_idx;
-            goto truncated;
-          }
           uint32_t s = subcmd_start;
           uint32_t e = range_end_before_comment(s, pos, comment_start);
           s = fast_range_trim_start(cmd, s, e);
           e = fast_range_trim_end(cmd, s, e);
           if (s < e) {
+            if (subcmd_idx >= max_cmds) {
+              result->status = SHELL_STATUS_TRUNCATED;
+              result->count = subcmd_idx;
+              goto truncated;
+            }
             result->cmds[subcmd_idx].start = s;
             result->cmds[subcmd_idx].len = e - s;
             result->cmds[subcmd_idx].type = current_type;
@@ -2387,16 +2387,16 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
       if (logical_or) {
         // End current subcommand (trim whitespace)
         if (subcmd_start < pos) {
-          if (subcmd_idx >= max_cmds) {
-            result->status = SHELL_STATUS_TRUNCATED;
-            result->count = subcmd_idx;
-            goto truncated;
-          }
           uint32_t s = subcmd_start;
           uint32_t e = pos;
           s = fast_range_trim_start(cmd, s, e);
           e = fast_range_trim_end(cmd, s, e);
           if (s < e) {
+            if (subcmd_idx >= max_cmds) {
+              result->status = SHELL_STATUS_TRUNCATED;
+              result->count = subcmd_idx;
+              goto truncated;
+            }
             result->cmds[subcmd_idx].start = s;
             result->cmds[subcmd_idx].len = e - s;
             result->cmds[subcmd_idx].type = current_type;
@@ -2426,16 +2426,16 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
       if (c == '|' && !(pos > 0 && cmd[pos - 1] == '>')) {
         // End current subcommand (trim whitespace)
         if (subcmd_start < pos) {
-          if (subcmd_idx >= max_cmds) {
-            result->status = SHELL_STATUS_TRUNCATED;
-            result->count = subcmd_idx;
-            goto truncated;
-          }
           uint32_t s = subcmd_start;
           uint32_t e = pos;
           s = fast_range_trim_start(cmd, s, e);
           e = fast_range_trim_end(cmd, s, e);
           if (s < e) {
+            if (subcmd_idx >= max_cmds) {
+              result->status = SHELL_STATUS_TRUNCATED;
+              result->count = subcmd_idx;
+              goto truncated;
+            }
             result->cmds[subcmd_idx].start = s;
             result->cmds[subcmd_idx].len = e - s;
             result->cmds[subcmd_idx].type = current_type;
@@ -2485,11 +2485,6 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
         bool pending_pipeline_negation =
             range_is_pipeline_negator_prefix(cmd, subcmd_start, pos + 1);
         if (subcmd_start < pos) {
-          if (subcmd_idx >= max_cmds) {
-            result->status = SHELL_STATUS_TRUNCATED;
-            result->count = subcmd_idx;
-            goto truncated;
-          }
           uint32_t s = subcmd_start;
           uint32_t e = range_end_before_comment(s, pos, comment_start);
           s = fast_range_trim_start(cmd, s, e);
@@ -2500,6 +2495,11 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
            * than silently turning it into a semicolon relation. */
           if (s < e && !pending_list_continuation &&
               !pending_pipeline_negation) {
+            if (subcmd_idx >= max_cmds) {
+              result->status = SHELL_STATUS_TRUNCATED;
+              result->count = subcmd_idx;
+              goto truncated;
+            }
             result->cmds[subcmd_idx].start = s;
             result->cmds[subcmd_idx].len = e - s;
             result->cmds[subcmd_idx].type = current_type;
@@ -2664,7 +2664,7 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
   }
 
   // End final subcommand
-  if (subcmd_start < pos && subcmd_idx < max_cmds) {
+  if (subcmd_start < pos) {
     // Trim only separator trivia; escaped whitespace remains word content.
     uint32_t start_pos = subcmd_start;
     uint32_t end_pos = range_end_before_comment(start_pos, pos, comment_start);
@@ -2672,6 +2672,11 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
     end_pos = fast_range_trim_end(cmd, start_pos, end_pos);
 
     if (start_pos < end_pos) {
+      if (subcmd_idx == max_cmds) {
+        result->status = SHELL_STATUS_TRUNCATED;
+        result->count = subcmd_idx;
+        goto truncated;
+      }
       result->cmds[subcmd_idx].start = start_pos;
       result->cmds[subcmd_idx].len = end_pos - start_pos;
       result->cmds[subcmd_idx].type = current_type;
@@ -2684,10 +2689,6 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
                           execution_pipeline_start);
       subcmd_idx++;
     }
-  } else if (subcmd_idx >= max_cmds) {
-    result->status = SHELL_STATUS_TRUNCATED;
-    result->count = subcmd_idx;
-    goto truncated;
   }
 
   /* Control compounds are deliberately outside this range tokenizer's grammar.

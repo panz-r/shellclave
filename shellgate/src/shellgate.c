@@ -1960,6 +1960,13 @@ static SHELL_NONNULL(3) bool sg_path_decode_byte(unsigned char byte,
 static SHELL_NONNULL(1, 2) sg_file_path_t
     sg_file_path_prepare(const shell_dep_doc_t *doc, char *scratch,
                          size_t capacity) {
+  if (doc->flags & SHELL_DEP_DOC_FLAG_IMPLICIT)
+    return (sg_file_path_t){.decoded = doc->path,
+                            .decoded_length = doc->path_len,
+                            .identity = doc->path,
+                            .length = doc->path_len,
+                            .absolute = true,
+                            .known = true};
   if (doc->flags & SHELL_DEP_DOC_FLAG_RESOLVED_PATH) {
     sg_file_path_t path = {.decoded = doc->value,
                            .decoded_length = doc->value_len,
@@ -2967,9 +2974,13 @@ static SHELL_NONNULL(1, 2) void sg_policy_graph_summarize(
     SG_EDGE_WORK();
     const shell_dep_edge_t *edge = &graph->edges[edge_index];
     bool observable =
-        edge->type == SHELL_EDGE_READ || edge->type == SHELL_EDGE_WRITE ||
-        edge->type == SHELL_EDGE_APPEND || edge->type == SHELL_EDGE_FD_OPEN ||
-        edge->type == SHELL_EDGE_FD_CLOSE;
+        graph->nodes[edge->from].type != SHELL_NODE_FD &&
+        graph->nodes[edge->to].type != SHELL_NODE_FD &&
+        !(graph->nodes[edge->from].type == SHELL_NODE_DOC &&
+          (graph->nodes[edge->from].doc.flags & SHELL_DEP_DOC_FLAG_IMPLICIT)) &&
+        (edge->type == SHELL_EDGE_READ || edge->type == SHELL_EDGE_WRITE ||
+         edge->type == SHELL_EDGE_APPEND || edge->type == SHELL_EDGE_FD_OPEN ||
+         edge->type == SHELL_EDGE_FD_CLOSE);
     if (observable) {
       observable_io[edge->from] = true;
       observable_io[edge->to] = true;
@@ -2993,6 +3004,9 @@ static SHELL_NONNULL(1, 2) void sg_policy_graph_summarize(
           graph->nodes[endpoint].cmd.token_count != 0)
         continue;
       bool allowed =
+          (!observable &&
+           (edge->type == SHELL_EDGE_READ || edge->type == SHELL_EDGE_WRITE ||
+            edge->type == SHELL_EDGE_APPEND)) ||
           (edge->type == SHELL_EDGE_TIME && edge->to == endpoint) ||
           (edge->type == SHELL_EDGE_GROUP && edge->to == endpoint &&
            graph->nodes[edge->from].type == SHELL_NODE_GROUP) ||
@@ -3133,7 +3147,9 @@ static SHELL_NONNULL(1, 2) bool sg_edge_is_file_output_effect(
 
 static SHELL_NONNULL(1, 2) bool sg_edge_is_output_effect(
     const shell_dep_graph_t *graph, const shell_dep_edge_t *edge) {
-  return edge->type == SHELL_EDGE_WRITE || edge->type == SHELL_EDGE_APPEND ||
+  return (edge->type == SHELL_EDGE_WRITE &&
+          graph->nodes[edge->to].type != SHELL_NODE_FD) ||
+         edge->type == SHELL_EDGE_APPEND ||
          sg_edge_is_file_output_effect(graph, edge);
 }
 
@@ -3214,7 +3230,7 @@ sg_substitution_consumers(const shell_dep_graph_t *graph,
   return count;
 }
 
-/* Most dynamic substitution topology is a SUBST edge. A named-FD process
+/* Most dynamic substitution topology is a SUBST edge. A setup-only process
  * substitution is intentionally retained as FD_OPEN until a later exact
  * `$name` use materializes byte flow: `exec {name}< <(producer)` and
  * `exec {name}> >(consumer)` set up descriptors but do not themselves move
@@ -3234,9 +3250,9 @@ static SHELL_NONNULL(1, 2) bool sg_edge_is_dynamic_substitution_route(
   shell_dep_node_type_t to = graph->nodes[edge->to].type;
   bool from_execution = from == SHELL_NODE_CMD || from == SHELL_NODE_GROUP;
   bool to_execution = to == SHELL_NODE_CMD || to == SHELL_NODE_GROUP;
-  if (edge->target_fd == SHELL_DEP_FD_NAMED)
+  if (edge->target_fd != SHELL_DEP_FD_NONE)
     return (from_execution || from == SHELL_NODE_ENDPOINT) && to_execution;
-  return edge->source_fd == SHELL_DEP_FD_NAMED && from_execution &&
+  return edge->source_fd != SHELL_DEP_FD_NONE && from_execution &&
          to == SHELL_NODE_ENDPOINT;
 }
 
@@ -3247,7 +3263,7 @@ static SHELL_NONNULL(1, 2, 3, 4) uint32_t
   if (!sg_edge_is_dynamic_substitution_route(graph, edge))
     return 0;
   if (edge->type == SHELL_EDGE_FD_OPEN &&
-      edge->target_fd == SHELL_DEP_FD_NAMED) {
+      edge->target_fd != SHELL_DEP_FD_NONE) {
     consumers[0] = edge->to;
     return 1;
   }
@@ -3499,7 +3515,9 @@ static SHELL_NONNULL(
         cmd_write_count[e->from]++;
     }
     if (to_node->type == SHELL_NODE_CMD || to_node->type == SHELL_NODE_GROUP) {
-      if (e->type == SHELL_EDGE_READ)
+      if (e->type == SHELL_EDGE_READ && from_node->type != SHELL_NODE_FD &&
+          !(from_node->type == SHELL_NODE_DOC &&
+            (from_node->doc.flags & SHELL_DEP_DOC_FLAG_IMPLICIT)))
         cmd_read_count[e->to]++;
       if (e->type == SHELL_EDGE_ENV)
         cmd_env_count[e->to]++;
