@@ -12,15 +12,14 @@
  * Check if character is a shell separator
  */
 static inline bool is_separator(char c) {
-  return c == '|' || c == ';' || c == '&' || c == '<' || c == '>' ||
-         c == '\n' || c == '\r';
+  return c == '|' || c == ';' || c == '&' || c == '<' || c == '>' || c == '\n';
 }
 
 static bool source_range_is_whitespace(const char *cmd, uint32_t start,
                                        uint32_t end) {
   for (uint32_t pos = start; pos < end; pos++) {
     SHELL_SOURCE_PREFIX_SCAN(1);
-    if (!isspace((unsigned char)cmd[pos]))
+    if (!shell_source_space((unsigned char)cmd[pos]))
       return false;
   }
   return true;
@@ -34,9 +33,9 @@ static bool source_range_is_whitespace(const char *cmd, uint32_t start,
  * backslash run), so the parser remains linear across disjoint ranges. */
 static SHELL_NONNULL(1) uint32_t
     fast_range_trim_end(const char *cmd, uint32_t start, uint32_t end) {
-  while (end > start && isspace((unsigned char)cmd[end - 1])) {
+  while (end > start && shell_source_space((unsigned char)cmd[end - 1])) {
     unsigned char byte = (unsigned char)cmd[end - 1];
-    if (byte == '\n' || byte == '\r') {
+    if (byte == '\n') {
       size_t continued =
           shell_source_skip_inline_continuations_backward(cmd, end);
       if (continued < end) {
@@ -57,7 +56,7 @@ static SHELL_NONNULL(1) uint32_t
 
 static SHELL_NONNULL(1) uint32_t
     fast_range_trim_start(const char *cmd, uint32_t start, uint32_t end) {
-  while (start < end && isspace((unsigned char)cmd[start]))
+  while (start < end && shell_source_space((unsigned char)cmd[start]))
     start++;
   return start;
 }
@@ -73,7 +72,8 @@ static bool group_word_ends_here(const char *cmd, uint32_t pos,
   if (pos + 1 == cmd_len)
     return true;
   char next = cmd[pos + 1];
-  return isspace((unsigned char)next) || is_separator(next) || next == ')';
+  return shell_source_space((unsigned char)next) || is_separator(next) ||
+         next == ')';
 }
 
 /* Advance across one shell word without splitting a quoted here-string
@@ -286,7 +286,7 @@ static SHELL_NONNULL(1) bool fast_array_context_next(
    * on the right-hand side of a pipe in a nested executable body. */
   if (context->command_start && context->prefix_open &&
       context->word_end == 0 && context->token.type == SHELL_TOKEN_SEMICOLON &&
-      (context->token.start[0] == '\n' || context->token.start[0] == '\r'))
+      (context->token.start[0] == '\n'))
     return true;
   if (context->token.type == SHELL_TOKEN_PIPE ||
       context->token.type == SHELL_TOKEN_PIPE_BOTH ||
@@ -561,9 +561,8 @@ static void detect_features(const char *cmd, uint32_t start, uint32_t len,
       continue;
     }
 
-    // Skip escapes. Escaped physical line endings are lexically removed, so
-    // consume a complete LF or CRLF continuation rather than exposing its
-    // trailing LF as source syntax on the next iteration.
+    // Backslash-LF is lexically removed. Otherwise skip exactly the quoted
+    // byte, leaving a following LF to be recognized as source syntax.
     if (c == '\\' && i + 1 < len) {
       size_t continued = shell_source_skip_escaped_line_endings(p, len, i);
       i = (uint32_t)(continued != i ? continued : i + 2);
@@ -604,7 +603,7 @@ static void detect_features(const char *cmd, uint32_t start, uint32_t len,
             first = continued;
             continue;
           }
-          if (!isspace((unsigned char)p[first]))
+          if (!shell_source_space((unsigned char)p[first]))
             break;
           first++;
         }
@@ -1103,7 +1102,7 @@ static bool normalize_pipeline_modifiers(const char *cmd, size_t cmd_len,
       continue;
     uint32_t offset = 0;
     while (offset < first->len &&
-           isspace((unsigned char)cmd[first->start + offset]))
+           shell_source_space((unsigned char)cmd[first->start + offset]))
       offset++;
     if (offset >= first->len)
       continue;
@@ -1119,7 +1118,7 @@ static bool normalize_pipeline_modifiers(const char *cmd, size_t cmd_len,
        * incomplete negator is malformed source. */
       if (cmd[first->start + offset] == '!' &&
           (first->start + offset + 1 == range_end ||
-           isspace((unsigned char)cmd[first->start + offset + 1])))
+           shell_source_space((unsigned char)cmd[first->start + offset + 1])))
         return false;
       continue;
     }
@@ -1205,25 +1204,6 @@ static uint32_t range_end_before_comment(uint32_t start, uint32_t end,
                  comment_start < end
              ? comment_start
              : end;
-}
-
-/* A comment-only source is syntactically valid yet has no executable range.
- * This predicate is deliberately lexical: it accepts only whitespace and
- * comments that begin at a shell word boundary. */
-static bool source_is_comment_only(const char *cmd, size_t cmd_len) {
-  bool saw_comment = false;
-  for (size_t pos = 0; pos < cmd_len;) {
-    if (isspace((unsigned char)cmd[pos])) {
-      pos++;
-      continue;
-    }
-    if (!shell_source_comment_starts(cmd[pos], true))
-      return false;
-    saw_comment = true;
-    while (pos < cmd_len && cmd[pos] != '\n' && cmd[pos] != '\r')
-      pos++;
-  }
-  return saw_comment;
 }
 
 /**
@@ -1544,7 +1524,8 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
     }
     bool function_paren = c == '(' && pos + 1 < cmd_len &&
                           cmd[pos + 1] == ')' && pos > subcmd_start &&
-                          pos > 0 && !isspace((unsigned char)cmd[pos - 1]) &&
+                          pos > 0 &&
+                          !shell_source_space((unsigned char)cmd[pos - 1]) &&
                           !is_separator(cmd[pos - 1]);
     bool closes_group = c == ')' && arith_depth == 0 &&
                         substitution_paren_depth == 0 && group_paren_depth > 0;
@@ -1572,10 +1553,10 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
     }
     bool brace_close =
         c == '}' && brace_depth == 0 && brace_group_depth > 0 &&
-        (pos == 0 || isspace((unsigned char)cmd[pos - 1]) ||
-         cmd[pos - 1] == ';' || cmd[pos - 1] == '\n' || cmd[pos - 1] == '\r' ||
-         cmd[pos - 1] == ')') &&
-        (pos + 1 == cmd_len || isspace((unsigned char)cmd[pos + 1]) ||
+        (pos == 0 || shell_source_space((unsigned char)cmd[pos - 1]) ||
+         cmd[pos - 1] == ';' || cmd[pos - 1] == '\n' || cmd[pos - 1] == ')') &&
+        (pos + 1 == cmd_len ||
+         shell_source_space((unsigned char)cmd[pos + 1]) ||
          is_separator(cmd[pos + 1]) || cmd[pos + 1] == ')' ||
          brace_close_redirect);
     /* Prefix interpretation is needed only at a possible group delimiter.
@@ -1585,7 +1566,7 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
         !in_quotes && arith_depth == 0 && substitution_paren_depth == 0 &&
         (brace_open || brace_close || c == '(' ||
          ((c == '{' || c == '}') &&
-          (pos == 0 || isspace((unsigned char)cmd[pos - 1]) ||
+          (pos == 0 || shell_source_space((unsigned char)cmd[pos - 1]) ||
            is_separator(cmd[pos - 1]) || cmd[pos - 1] == ')') &&
           group_word_ends_here(cmd, pos, cmd_len)));
     bool only_whitespace_before_delimiter =
@@ -1673,7 +1654,7 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
         return SHELL_EPARSE;
       }
       uint32_t probe = subcmd_start;
-      while (probe < pos && isspace((unsigned char)cmd[probe]))
+      while (probe < pos && shell_source_space((unsigned char)cmd[probe]))
         probe++;
       if (probe != pos) {
         result->status = SHELL_STATUS_ERROR;
@@ -1707,7 +1688,7 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
         !fast_lexical_token_contains(&documents, pos)) {
       if (comment_start == UINT32_MAX)
         comment_start = pos;
-      while (pos < cmd_len && cmd[pos] != '\n' && cmd[pos] != '\r')
+      while (pos < cmd_len && cmd[pos] != '\n')
         pos++;
       continue;
     }
@@ -1715,11 +1696,8 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
     /* An unquoted escaped physical line ending is removed before list
      * grammar is evaluated. In particular, it cannot become the missing
      * right-hand stage of a pipeline or AND/OR list. */
-    if (!in_quotes && c == '\\' && pos + 1 < cmd_len &&
-        (cmd[pos + 1] == '\n' || cmd[pos + 1] == '\r')) {
+    if (!in_quotes && c == '\\' && pos + 1 < cmd_len && cmd[pos + 1] == '\n') {
       uint32_t after = pos + 2;
-      if (after < cmd_len && cmd[pos + 1] == '\r' && cmd[after] == '\n')
-        after++;
       /* A group closer, a pending list operator, or a redirect list may have
        * left `subcmd_start` at source trivia. Do not emit a phantom command
        * for a continuation that shell removes before parsing the next token. */
@@ -1790,7 +1768,7 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
         // })
         bool has_content = false;
         for (uint32_t i = (uint32_t)brace_start_pos; i < pos; i++) {
-          if (!isspace((unsigned char)cmd[i])) {
+          if (!shell_source_space((unsigned char)cmd[i])) {
             has_content = true;
             break;
           }
@@ -1921,7 +1899,7 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
           /* A group delimiter is syntax, not part of its first command. */
           uint32_t group_source_prefix = subcmd_start;
           while (group_source_prefix < pos &&
-                 isspace((unsigned char)cmd[group_source_prefix]))
+                 shell_source_space((unsigned char)cmd[group_source_prefix]))
             group_source_prefix++;
           if (shell_source_redirect_list_before_group(cmd, subcmd_start, pos) ||
               (heredoc_prefix_start != UINT32_MAX &&
@@ -1989,7 +1967,8 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
                                        &append))
         operator_end = append + 1;
       uint32_t operand = (uint32_t)operator_end;
-      while (operand < cmd_len && isspace((unsigned char)cmd[operand]))
+      while (operand < cmd_len &&
+             shell_source_space((unsigned char)cmd[operand]))
         operand++;
       size_t after = operand;
       if (!shell_source_skip_shell_word(cmd, cmd_len, operand, &after) ||
@@ -2472,7 +2451,7 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
       }
 
       // Handle ; and newlines as command separators
-      if (c == ';' || c == '\n' || c == '\r') {
+      if (c == ';' || c == '\n') {
         // End current subcommand (trim whitespace)
         bool pending_list_continuation =
             (current_type == SHELL_TYPE_PIPELINE ||
@@ -2635,7 +2614,7 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
         if (!process_sub_target &&
             (next_ch == '<' || next_ch == '>' || next_ch == '|' ||
              next_ch == ';' || next_ch == '&' || next_ch == '#' ||
-             next_ch == '\n' || next_ch == '\r')) {
+             next_ch == '\n')) {
           result->status = SHELL_STATUS_ERROR;
           result->count = subcmd_idx;
           return SHELL_EPARSE;
@@ -2702,12 +2681,12 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
     return SHELL_EPARSE;
   }
 
-  /* A comment-only source is valid but has no executable range. Redirects
+  /* Nonempty trivia-only source is valid but has no executable range. Redirects
    * without an operand and incomplete list operators have already returned
    * from the structural scan above, so no second raw-byte operator pass is
    * needed here. */
   if (subcmd_idx == 0) {
-    if (source_is_comment_only(cmd, cmd_len)) {
+    if (shell_source_empty_kind(cmd, cmd_len) != SHELL_SOURCE_NONEMPTY) {
       result->count = 0;
       normalize_result_metadata(cmd, cmd_len, result);
       result->status = SHELL_STATUS_OK;
@@ -2733,7 +2712,7 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
         continue;
       }
       // Skip whitespace
-      if (isspace((unsigned char)ch)) {
+      if (shell_source_space((unsigned char)ch)) {
         continue;
       }
       // This subcommand has actual command content

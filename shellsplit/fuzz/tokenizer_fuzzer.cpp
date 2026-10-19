@@ -29,10 +29,13 @@
 #include "shell_transform.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstring>
 #include <memory>
+#include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 extern "C" {
@@ -61,11 +64,8 @@ static bool token_logically_equals(const shell_token_t &token,
   size_t expected = 0;
   while (source < token.length) {
     if (token.start[source] == '\\' && source + 1 < token.length &&
-        (token.start[source + 1] == '\n' || token.start[source + 1] == '\r')) {
-      bool cr = token.start[source + 1] == '\r';
+        token.start[source + 1] == '\n') {
       source += 2;
-      if (cr && source < token.length && token.start[source] == '\n')
-        source++;
       continue;
     }
     if (spelling[expected] == '\0' || token.start[source] != spelling[expected])
@@ -187,6 +187,37 @@ static bool tokenizer_iterated_matches_structured(
   return offset == structured.size();
 }
 
+static shell_dep_error_t fuzz_dep_graph_parse(const char *cmd, size_t cmd_len,
+                                              const char *initial_cwd,
+                                              const shell_dep_limits_t *limits,
+                                              shell_dep_graph_t *out);
+
+static void tokenizer_observe_semantic_token(const shell_token_t *token,
+                                             void *context) {
+  (void)token;
+  (void)context;
+}
+
+static void tokenizer_observe_read_fd(const char *word, uint32_t fd,
+                                      unsigned kind, const char *parameter,
+                                      size_t length, bool identity,
+                                      void *context) {
+  (void)word;
+  (void)fd;
+  (void)kind;
+  (void)parameter;
+  (void)length;
+  (void)identity;
+  (void)context;
+}
+
+static void tokenizer_observe_process(const char *word, size_t length,
+                                      void *context) {
+  (void)word;
+  (void)length;
+  (void)context;
+}
+
 static bool tokenizer_unsupported_semantics_rejected(const char *input,
                                                      size_t length) {
   shell_processed_commands_t processed = {};
@@ -198,7 +229,25 @@ static bool tokenizer_unsupported_semantics_rejected(const char *input,
   shell_abstract_command_t *abstract = nullptr;
   shell_dep_graph_t graph = {};
 
+  bool source_only = false;
+  bool definitely_unsupported = shell_tokenizer_inspect_semantics(
+      input, length, tokenizer_observe_semantic_token,
+      tokenizer_observe_read_fd, tokenizer_observe_process, &source_only);
+  const shell_dep_limits_t limits = SHELL_DEP_LIMITS_DEFAULT;
+  shell_dep_error_t graph_status =
+      fuzz_dep_graph_parse(input, length, ".", &limits, &graph);
+  /* Only explicitly deferred read interpretations may differ. They must
+   * still produce a complete validated graph or a valid rejection/truncation;
+   * fixed oracles separately assert contextual acceptance and rejection. */
+  bool graph_contract =
+      definitely_unsupported
+          ? graph_status == SHELL_DEP_EPARSE && graph.node_count == 0 &&
+                graph.edge_count == 0 && graph.status == SHELL_DEP_STATUS_ERROR
+          : graph_status != SHELL_DEP_EWORKSPACE &&
+                shellsplit_test_depgraph_invariants(input, length, graph_status,
+                                                    &graph, &limits);
   bool rejected =
+      graph_contract &&
       shell_process_commands(input, length, nullptr, &processed) ==
           SHELL_PROCESS_EPARSE &&
       processed.commands == nullptr && processed.command_count == 0 &&
@@ -214,11 +263,7 @@ static bool tokenizer_unsupported_semantics_rejected(const char *input,
       transformed == nullptr && transformed_count == 0 &&
       shell_abstract_command_parse(input, length, &abstract) ==
           SHELL_ABSTRACT_EPARSE &&
-      abstract == nullptr &&
-      shell_dep_graph_parse(input, length, ".", nullptr, &graph) ==
-          SHELL_DEP_EPARSE &&
-      graph.node_count == 0 && graph.edge_count == 0 &&
-      graph.status == SHELL_DEP_STATUS_ERROR;
+      abstract == nullptr;
 
   shell_processed_commands_free(&processed);
   shell_netstring_buffer_free(&sequence);
@@ -629,8 +674,10 @@ static int test_fixed_oracles(void) {
             target.doc.kind == SHELL_DOC_FILE && target.doc.path_len == 12 &&
             !std::memcmp(target.doc.path, "/etc/reached", 12);
       }
-      if (reached != (success ? fixture.succeeds : fixture.fails))
+      if (reached != (success ? fixture.succeeds : fixture.fails)) {
+        fprintf(stderr, "substitution status oracle: %s\n", source.c_str());
         return fixed_oracle_failure(__LINE__);
+      }
     }
   }
   for (const auto &fixture : shellsplit_test_comment_words) {
@@ -759,8 +806,12 @@ static int test_fixed_oracles(void) {
         fixture.source, std::strlen(fixture.source), ".", nullptr, &graph);
     if (fixture.resolved
             ? error != SHELL_DEP_OK || !shell_dep_graph_validate(&graph).valid
-            : error != SHELL_DEP_EPARSE || graph.node_count || graph.edge_count)
+            : error != SHELL_DEP_EPARSE || graph.node_count ||
+                  graph.edge_count) {
+      fprintf(stderr, "assignment snapshot oracle: %s (error %d)\n",
+              fixture.source, error);
       return fixed_oracle_failure(__LINE__);
+    }
   }
   for (const auto &fixture : shellsplit_test_builtin_routes) {
     shell_dep_graph_t graph = {};
@@ -808,24 +859,27 @@ static int test_fixed_oracles(void) {
   }
   for (const auto &fixture : shellsplit_test_builtin_options) {
     size_t length = std::strlen(fixture.source);
+    bool syntax_supported = fixture.supported || fixture.stateful;
     if (shell_tokenizer_has_unsupported_semantics(fixture.source, length) !=
-        !fixture.supported)
+        !syntax_supported)
       return fixed_oracle_failure(__LINE__);
-    if (!fixture.supported &&
+    if (!syntax_supported &&
         !tokenizer_unsupported_semantics_rejected(fixture.source, length))
       return fixed_oracle_failure(__LINE__);
-    if (fixture.supported) {
-      shell_processed_commands_t processed = {};
-      shell_dep_graph_t graph = {};
-      bool valid = shell_process_commands(fixture.source, length, nullptr,
-                                          &processed) == SHELL_PROCESS_OK &&
-                   shell_dep_graph_parse(fixture.source, length, ".", nullptr,
-                                         &graph) == SHELL_DEP_OK &&
-                   shell_dep_graph_validate(&graph).valid;
-      shell_processed_commands_free(&processed);
-      if (!valid)
-        return fixed_oracle_failure(__LINE__);
-    }
+    shell_processed_commands_t processed = {};
+    bool processed_ok = shell_process_commands(fixture.source, length, nullptr,
+                                               &processed) == SHELL_PROCESS_OK;
+    shell_processed_commands_free(&processed);
+    if (processed_ok != syntax_supported)
+      return fixed_oracle_failure(__LINE__);
+    shell_dep_graph_t graph = {};
+    shell_dep_error_t graph_error =
+        shell_dep_graph_parse(fixture.source, length, ".", nullptr, &graph);
+    if (fixture.supported ? graph_error != SHELL_DEP_OK ||
+                                !shell_dep_graph_validate(&graph).valid
+                          : graph_error != SHELL_DEP_EPARSE ||
+                                graph.node_count || graph.edge_count)
+      return fixed_oracle_failure(__LINE__);
   }
   for (const auto &fixture : shellsplit_test_setup_time_outcomes) {
     shell_dep_graph_t graph = {};
@@ -862,12 +916,39 @@ static int test_fixed_oracles(void) {
         !to_out || to_base != fixture.base || writes != 1u + fixture.base)
       return fixed_oracle_failure(__LINE__);
   }
+  /* Some rows inspect different routes of the same retained graph. Reuse an
+   * adjacent identical source rather than repeating its full semantic parse;
+   * every row's independent route expectation is still checked below. */
+  shell_dep_graph_t cleanup_graph = {};
+  const char *cleanup_source = nullptr;
+  shell_dep_error_t cleanup_status = SHELL_DEP_OK;
+  shell_dep_graph_validation_t cleanup_validation = {};
+  size_t cleanup_case = 0;
   for (const auto &fixture : shellsplit_test_named_cleanup) {
-    shell_dep_graph_t graph = {};
-    if (shell_dep_graph_parse(fixture.source, std::strlen(fixture.source), ".",
-                              nullptr, &graph) != SHELL_DEP_OK ||
-        !shell_dep_graph_validate(&graph).valid)
+    if (g_verbose)
+      fprintf(stderr, "DEBUG: named cleanup case %zu\n", cleanup_case);
+    cleanup_case++;
+    shell_dep_graph_t &graph = cleanup_graph;
+    if (!cleanup_source || std::strcmp(cleanup_source, fixture.source)) {
+      const auto parse_start = std::chrono::steady_clock::now();
+      cleanup_status = shell_dep_graph_parse(
+          fixture.source, std::strlen(fixture.source), ".", nullptr, &graph);
+      if (g_verbose)
+        fprintf(stderr, "DEBUG: named cleanup parse %.3fs\n",
+                std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                              parse_start)
+                    .count());
+      cleanup_validation = shell_dep_graph_validate(&graph);
+      cleanup_source = fixture.source;
+    }
+    shell_dep_error_t status = cleanup_status;
+    shell_dep_graph_validation_t validation = cleanup_validation;
+    if (status != SHELL_DEP_OK || !validation.valid) {
+      fprintf(stderr, "named cleanup oracle parse=%d valid=%d: %s\n", status,
+              validation.valid, fixture.source);
+      shell_dep_graph_dump(&graph, stderr);
       return fixed_oracle_failure(__LINE__);
+    }
     uint32_t consumer = UINT32_MAX, target = UINT32_MAX;
     uint32_t alternative = UINT32_MAX;
     const char *command = fixture.read ? "cat" : "printf";
@@ -1260,7 +1341,7 @@ static int test_fixed_oracles(void) {
       "echo a; time\n",
       "echo a; time; echo b\n",
       "echo a; time { echo b; }\n",
-      "ti\\\r\nme -\\\np true\n",
+      "ti\\\nme -\\\np true\n",
       "VALUE=x time true\n",
       ">out time true\n",
       "echo \"unterminated\n",
@@ -1859,6 +1940,61 @@ static int test_fixed_oracles(void) {
       return fixed_oracle_failure(__LINE__);
   }
 
+  for (const char *input : {"{ printf ok; <(); } 2>errors",
+                            "{ { printf ok; <(); } 2>inner; >(); } >outer"}) {
+    shell_processed_commands_t structured = {};
+    shell_command_info_t *flat = nullptr;
+    size_t flat_count = 0;
+    bool ok = shell_process_commands(input, strlen(input), nullptr,
+                                     &structured) == SHELL_PROCESS_OK &&
+              structured.command_count == 1 &&
+              shell_process_command(input, strlen(input), nullptr, &flat,
+                                    &flat_count) == SHELL_PROCESS_OK &&
+              flat_count >= 2 && flat[0].has_redirections &&
+              flat[0].has_error_redirection;
+    for (size_t i = 1; ok && i < flat_count; i++)
+      ok = !flat[i].has_redirections && !flat[i].has_error_redirection;
+    shell_processed_commands_free(&structured);
+    shell_command_infos_free(flat, flat_count);
+    if (!ok)
+      return fixed_oracle_failure(__LINE__);
+  }
+
+  static const struct {
+    const char *source;
+    const char *paths[2];
+  } file_argument_cases[] = {
+      {"/bin/echo hello", {nullptr, nullptr}},
+      {"<() /bin/echo hello", {nullptr, nullptr}},
+      {"X=x </dev/null <()>() /bin/echo hello", {nullptr, nullptr}},
+      {"<() /bin/echo /tmp/input", {"/tmp/input", nullptr}},
+      {"''<() /bin/echo /tmp/input", {"/bin/echo", "/tmp/input"}},
+      {"command <() /bin/echo /tmp/input", {"/bin/echo", "/tmp/input"}},
+      {"$(printf program) /tmp/input", {"/tmp/input", nullptr}}};
+  for (const auto &item : file_argument_cases) {
+    shell_dep_graph_t graph = {};
+    if (shell_dep_graph_parse(item.source, strlen(item.source), "/workspace",
+                              nullptr, &graph) != SHELL_DEP_OK ||
+        !shell_dep_graph_validate(&graph).valid)
+      return fixed_oracle_failure(__LINE__);
+    size_t seen = 0;
+    for (uint32_t e = 0; e < graph.edge_count; e++) {
+      const shell_dep_edge_t &edge = graph.edges[e];
+      if (edge.type != SHELL_EDGE_ARG)
+        continue;
+      if (seen == 2 || !item.paths[seen])
+        return fixed_oracle_failure(__LINE__);
+      const shell_dep_doc_t &doc = graph.nodes[edge.to].doc;
+      if (doc.path_len != strlen(item.paths[seen]) ||
+          memcmp(doc.path, item.paths[seen], doc.path_len))
+        return fixed_oracle_failure(__LINE__);
+      seen++;
+    }
+    if (seen != static_cast<size_t>(item.paths[0] != nullptr) +
+                    static_cast<size_t>(item.paths[1] != nullptr))
+      return fixed_oracle_failure(__LINE__);
+  }
+
   static const char *const structural_word_cases[] = {
       "echo prefix{left|right}suffix",
       "echo [left|right]",
@@ -1981,7 +2117,7 @@ static int test_fixed_oracles(void) {
   static const char *const named_document_cases[] = {
       "printf x {fd}<<<body",     "printf x {fd}<<EOF\nbody\nEOF\n",
       "{ cat; } {fd}<<<body",     "{ cat; } {fd}<<EOF\nbody\nEOF\n",
-      "printf x {f\\\nd}<<<body", "{ cat; } {f\\\r\nd}\\\n<<EOF\nbody\nEOF\n",
+      "printf x {f\\\nd}<<<body", "{ cat; } {f\\\nd}\\\n<<EOF\nbody\nEOF\n",
   };
   for (const char *input : named_document_cases) {
     shell_parse_result_t parsed = {};
@@ -2030,10 +2166,9 @@ static int test_fixed_oracles(void) {
       "exec {in}<in; exec {copy}>&$in; cat <&$copy",
       "printf {fd}<in > >(cat <&$fd)",
       "printf x {f\\\nd}>out >&$f\\\nd",
-      "exec {f\\\rd}>out; printf x >&$fd",
-      "exec {fd}>out; printf x >&$f\\\rd",
-      "exec {f\\\r\nd}>out; printf x >&$fd",
-      "exec {fd}>out; printf x >&\"${f\\\r\nd}\"",
+      "exec {f\\\nd}>out; printf x >&$fd",
+      "exec {fd}>out; printf x >&$f\\\nd",
+      "exec {fd}>out; printf x >&\"${f\\\nd}\"",
       "exec {fd}>out; printf x >&$\\\n{fd}",
       "exec {source}< <(printf x >/tmp/fuzz-source); cat <&$source",
       "exec {sink}> >(cat </tmp/fuzz-sink); printf x >&$sink",
@@ -2068,6 +2203,41 @@ static int test_fixed_oracles(void) {
      * Those forms have no Bash `{name}` identity, so only named-descriptor
      * syntax is required to produce named edge metadata. */
     if (!named_fd_ok || (std::strchr(input, '{') != nullptr && !named_metadata))
+      return fixed_oracle_failure(__LINE__);
+  }
+
+  /* Only backslash-LF joins a named descriptor. CR is an ordinary byte, and
+   * CR before LF leaves the CR in the preceding word before LF starts another
+   * command. Keep the distinction in fixed oracles, not evolving seeds. */
+  static const struct {
+    const char *input;
+    uint32_t named_edges;
+    uint32_t commands;
+  } non_joining_named_cases[] = {
+      {": {f\\\rd}>out", 0, 1},
+      {": {f\\\r\n: d}>out", 0, 2},
+      {"exec {fd}>out; printf x >&$f\\\rd", 1, 2},
+      {"exec {fd}>out; printf x >&$\\\r{fd}", 1, 2},
+      {"exec {fd}>out; printf x >&$\\\r\n{fd}", 1, 3},
+  };
+  for (size_t index = 0; index < sizeof(non_joining_named_cases) /
+                                     sizeof(non_joining_named_cases[0]);
+       index++) {
+    const char *input = non_joining_named_cases[index].input;
+    shell_dep_graph_t graph = {};
+    if (shell_dep_graph_parse(input, std::strlen(input), "/tmp", nullptr,
+                              &graph) != SHELL_DEP_OK ||
+        !shell_dep_graph_validate(&graph).valid)
+      return fixed_oracle_failure(__LINE__);
+    uint32_t named_edges = 0;
+    uint32_t commands = 0;
+    for (uint32_t node = 0; node < graph.node_count; node++)
+      commands += graph.nodes[node].type == SHELL_NODE_CMD;
+    for (uint32_t edge = 0; edge < graph.edge_count; edge++)
+      named_edges += graph.edges[edge].source_fd == SHELL_DEP_FD_NAMED ||
+                     graph.edges[edge].target_fd == SHELL_DEP_FD_NAMED;
+    if (named_edges != non_joining_named_cases[index].named_edges ||
+        commands != non_joining_named_cases[index].commands)
       return fixed_oracle_failure(__LINE__);
   }
 
@@ -2467,7 +2637,7 @@ static int test_fixed_oracles(void) {
   }
 
   static const char compound_words[] =
-      "$'c'3>out;cat \"x\"${y}z;my\\\r\ncommand value";
+      "$'c'3>out;cat \"x\"${y}z;my\\\ncommand value";
   shell_netstring_buffer_t raw = {};
   shell_netstring_buffer_t typed = {};
   size_t compound_count = 0;
@@ -3195,7 +3365,7 @@ static int test_fixed_oracles(void) {
   static const continued_list_oracle continued_lists[] = {
       {"printf x | # note\ncat", SHELL_TYPE_PIPELINE, SHELL_PIPE_MODE_STDOUT,
        SHELL_EDGE_PIPE, 1},
-      {"printf x |& \\\r\ncat", SHELL_TYPE_PIPELINE,
+      {"printf x |& \\\ncat", SHELL_TYPE_PIPELINE,
        SHELL_PIPE_MODE_STDOUT_AND_STDERR, SHELL_EDGE_PIPE, 2},
       {"printf x &&\ncat", SHELL_TYPE_AND, SHELL_PIPE_MODE_NONE, SHELL_EDGE_AND,
        1},
@@ -3241,11 +3411,11 @@ static int test_fixed_oracles(void) {
   };
   static const continued_expansion_oracle continued_expansions[] = {
       {"printf %s ${f\\\nd}", 1, 0},
-      {"printf %s $\\\r\n(printf child)", 2, 1},
-      {"printf %s $\\\r((1 + 2))", 1, 0},
+      {"printf %s $\\\n(printf child)", 2, 1},
+      {"printf %s $\\\n((1 + 2))", 1, 0},
       {"printf %s $((1)\\\n)", 1, 0},
       {"printf %s $\\\n'ansi'", 1, 0},
-      {"cat <\\\n(printf input) > \\\r\n>(cat)", 3, 2},
+      {"cat <\\\n(printf input) > \\\n>(cat)", 3, 2},
   };
   for (const continued_expansion_oracle &item : continued_expansions) {
     shell_parse_result_t fast = {};
@@ -3288,12 +3458,11 @@ static int test_fixed_oracles(void) {
   }
 
   /* Standalone word decoding preserves bytes, including a NUL produced by an
-   * ANSI-C quote after an escaped LF or CRLF. Complete-command semantics
+   * ANSI-C quote after an escaped LF. Complete-command semantics
    * reject that source: Bash truncates the quoted segment at the NUL. Keep
    * these distinct contracts outside the bounded smoke corpus. */
   static const char *const continued_ansi_words[] = {
       "$\\\n'\\x41\\0B'",
-      "$\\\r\n'\\x41\\0B'",
   };
   static const unsigned char continued_ansi_expected[] = {'A', '\0', 'B'};
   for (size_t index = 0;
@@ -3380,7 +3549,7 @@ static int test_fixed_oracles(void) {
    * its ordinary spelling, rather than becoming an executable command. */
   static const char *const continued_control_cases[] = {
       "whi\\\nle true; do :; done",
-      "i\\\r\nf true; then :; fi",
+      "i\\\nf true; then :; fi",
       "ca\\\nse value in value) :;; esac",
   };
   for (const char *input : continued_control_cases) {
@@ -3713,12 +3882,57 @@ static int test_fixed_oracles(void) {
       return fixed_oracle_failure(__LINE__);
   }
 
-  /* These Bash forms remain lexically visible for diagnostics, but the
-   * canonical argv, transform, abstraction, and graph APIs must refuse a
-   * semantic model they cannot faithfully provide. Keep this independent of
-   * checked-in smoke seeds so the fail-closed boundary runs in every session.
+  /* Declaration-like words containing process-substitution syntax require
+   * stateful builtin interpretation before their assignment-name semantics
+   * are known. The source-preserving layers accept them, but the dependency
+   * graph must fail closed rather than invent execution semantics. Keep this
+   * boundary independent of checked-in smoke seeds so it runs in every
+   * session.
+   */
+  static const char *const stateful_unmodeled_cases[] = {
+      "export OPT<()IND='x[$(printf ARITH >&2)0]'",
+      "declare OPT<()IND=1",
+      "typeset RAN<()DOM=1",
+  };
+  for (const char *input : stateful_unmodeled_cases) {
+    shell_command_t *lexical = NULL;
+    size_t lexical_count = 0;
+    shell_processed_commands_t canonical = {};
+    shell_transformed_command_t **transformed = NULL;
+    size_t transformed_count = 0;
+    shell_abstract_command_t *abstract = NULL;
+    shell_dep_graph_t graph = {};
+    bool rejected =
+        shell_tokenize_commands(input, strlen(input), &lexical,
+                                &lexical_count) == SHELL_TOKENIZE_OK &&
+        lexical != NULL && lexical_count > 0 &&
+        shell_process_commands(input, strlen(input), NULL, &canonical) ==
+            SHELL_PROCESS_OK &&
+        canonical.commands != NULL && canonical.command_count > 0 &&
+        shell_transform_command_line(input, strlen(input), NULL, &transformed,
+                                     &transformed_count) ==
+            SHELL_TRANSFORM_OK &&
+        transformed != NULL && transformed_count > 0 &&
+        shell_abstract_command_parse(input, strlen(input), &abstract) ==
+            SHELL_ABSTRACT_OK &&
+        abstract != NULL &&
+        shell_dep_graph_parse(input, strlen(input), NULL, NULL, &graph) ==
+            SHELL_DEP_EPARSE &&
+        graph.node_count == 0 && graph.edge_count == 0;
+    shell_commands_free(lexical, lexical_count);
+    shell_processed_commands_free(&canonical);
+    shell_transformed_command_list_free(transformed, transformed_count);
+    shell_abstract_command_free(abstract);
+    if (!rejected)
+      return fixed_oracle_failure(__LINE__);
+  }
+
+  /* These Bash forms remain lexically visible for diagnostics, but every
+   * semantic consumer must refuse a model it cannot faithfully provide.
    */
   static const char *const unmodeled_semantic_cases[] = {
+      "readonly v<()=text",
+      "export POSIX<()LY_CORRECT=x",
       "[[ -f /tmp/x ]]",
       "(( count += 1 ))",
       "time eval echo hidden",
@@ -3794,7 +4008,7 @@ static int test_fixed_oracles(void) {
       {"{ ( echo one; ); { echo two; }; }", 2},
       {"{ echo \"$(printf '}')\"; # }\n echo two; }", 2},
       {"{\n echo one\n} | { cat; }", 2},
-      {"{\r\n echo one\r\n} | { cat; }", 2},
+      {"{\n echo one\r\n} | { cat; }", 2},
       {"{ { echo one; } | cat; printf two; } > /tmp/nested-brace.out", 3},
       {"{ cat; cat; } <<< value", 2},
       {"{ cat; cat; } <<< \"two words\"", 2},
@@ -4211,7 +4425,7 @@ static int test_fixed_oracles(void) {
 
   static const char *const accepted_redirect_operands[] = {
       "echo > \\\nout",
-      "echo 2> \\\r\nerr",
+      "echo 2> \\\nerr",
       "echo >\"#name\"",
       "echo >\\#name",
       "echo <<<\"#value\"",
@@ -4331,8 +4545,8 @@ static int test_plain_differential(const char *input, size_t length) {
     unsigned char c = (unsigned char)input[i];
     if (isalnum(c) || c == '_' || c == '-' || c == '.' || c == '/' ||
         c == ' ' || c == '\t') {
-      plain = plain || !isspace(c);
-      if (isspace(c)) {
+      plain = plain || !shell_source_space(c);
+      if (shell_source_space(c)) {
         if (!at_word_start &&
             is_reserved_word(input + word_start, i - word_start))
           return 0;
@@ -4481,7 +4695,7 @@ resolved_fuzz_word(const shell_expand_word_request_t *request,
 static int test_resolved_depgraph(const char *input, size_t length,
                                   const char *cwd, uint8_t selector,
                                   bool truncate) {
-  static std::vector<std::max_align_t> workspace;
+  auto &workspace = g_depgraph_workspace;
   shell_dep_limits_t limits = SHELL_DEP_LIMITS_DEFAULT;
   if (truncate) {
     limits.max_nodes = 1;
@@ -4560,18 +4774,9 @@ static uint8_t descriptor_move_selector(const uint8_t *data, size_t size) {
 static constexpr unsigned descriptor_move_form_count = 77;
 static constexpr unsigned descriptor_move_single_byte_selector_count = 32;
 
-static int test_generated_descriptor_move(uint8_t selector) {
+static void descriptor_move_source(uint8_t selector, char (&input)[512]) {
   unsigned source = 3u + selector % 5u, destination = 8u + selector % 5u;
-  char input[512];
   unsigned form = selector % descriptor_move_form_count;
-  bool expected_route =
-      form == 1 || form == 4 || form == 5 || form == 7 ||
-      (form >= 8 && form != 12 && form < 26) || form == 28 || form == 29 ||
-      form == 31 || form == 32 || form == 34 || form == 35 ||
-      (form >= 37 && form <= 41) || form == 43 || form == 45 || form == 46 ||
-      form == 47 || form == 48 || form == 51 || form == 52 ||
-      (form >= 54 && form < 64 && form != 61 && form != 63) || form == 64 ||
-      form == 65 || form == 66 || form == 69 || form >= 70;
   const char *action = form == 2 ? "exec" : ":";
   if (form >= 73) {
     const char *body = "exec 10>/tmp/move-pad; printf next >&10";
@@ -4842,6 +5047,18 @@ static int test_generated_descriptor_move(uint8_t selector) {
              "exec %u>&%s; exec %u>/tmp/move-fuzz; %s %u>&%u-; echo next >&%u",
              destination, form == 1 ? "1" : "-", source, action, destination,
              source, source);
+}
+
+static int test_descriptor_move(uint8_t selector, const char *input) {
+  unsigned form = selector % descriptor_move_form_count;
+  bool expected_route =
+      form == 1 || form == 4 || form == 5 || form == 7 ||
+      (form >= 8 && form != 12 && form < 26) || form == 28 || form == 29 ||
+      form == 31 || form == 32 || form == 34 || form == 35 ||
+      (form >= 37 && form <= 41) || form == 43 || form == 45 || form == 46 ||
+      form == 47 || form == 48 || form == 51 || form == 52 ||
+      (form >= 54 && form < 64 && form != 61 && form != 63) || form == 64 ||
+      form == 65 || form == 66 || form == 69 || form >= 70;
   shell_dep_graph_t graph = {};
   shell_dep_error_t graph_error =
       shell_dep_graph_parse(input, strlen(input), nullptr, nullptr, &graph);
@@ -4914,6 +5131,12 @@ static int test_generated_descriptor_move(uint8_t selector) {
   }
   shell_processed_commands_free(&processed);
   return 0;
+}
+
+static int test_generated_descriptor_move(uint8_t selector) {
+  char input[512];
+  descriptor_move_source(selector, input);
+  return test_descriptor_move(selector, input);
 }
 
 static int test_generated_resolved_depgraph(uint8_t selector, bool truncate) {
@@ -5049,7 +5272,7 @@ static int test_full_parser(const char *input, size_t length) {
  * next stage, so compare it to the iterator's semantic-token subsequence. */
 static bool tokenizer_token_is_newline(const shell_token_t &token) {
   return token.type == SHELL_TOKEN_SEMICOLON && token.length != 0 &&
-         (token.start[0] == '\n' || token.start[0] == '\r');
+         token.start[0] == '\n';
 }
 
 static bool tokenizer_token_starts_command(const shell_token_t &token) {
@@ -5115,10 +5338,7 @@ static bool tokenizer_token_is_line_continuation(const shell_token_t &token) {
   if (token.type != SHELL_TOKEN_ARGUMENT || !token.is_escaped ||
       token.length < 2 || token.start[0] != '\\')
     return false;
-  if (token.start[1] == '\n')
-    return token.length == 2;
-  return token.start[1] == '\r' &&
-         (token.length == 2 || (token.length == 3 && token.start[2] == '\n'));
+  return token.start[1] == '\n' && token.length == 2;
 }
 
 static int test_tokenizer_state(const char *input, size_t length) {
@@ -6532,7 +6752,7 @@ static int test_generated_redirect_boundary(unsigned selector) {
   else if (mode == 3)
     input = "{ cat; } " + number + "\\\n2<<EOF\nbody\nEOF\n>out";
   else if (mode == 4)
-    input = "cat " + number + "\\\r\n2<<<body";
+    input = "cat " + number + "\\\n2<<<body";
   else
     input = "cat $'x'" + number + ">out";
   bool empty_stage = mode == 0 || mode == 3;
@@ -6704,13 +6924,602 @@ static int test_generated_static_arithmetic_case(const uint8_t *data,
   return valid ? 0 : 1;
 }
 
+static void fixed_oracle_phase(const char *name) {
+  if (!g_verbose)
+    return;
+  static const auto start = std::chrono::steady_clock::now();
+  const double elapsed =
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
+          .count();
+  fprintf(stderr, "DEBUG: fixed oracle phase %s at %.3fs\n", name, elapsed);
+}
+
 /* Fixed sweeps belong to startup, not one fuzz input's timeout budget. */
 static void run_fixed_oracles() {
+  fixed_oracle_phase("read outcomes");
   /* These sequential sweeps never need two retained graphs simultaneously.
    * Reuse one heap-owned result so adding a fixture family cannot enlarge
    * the sanitizer startup stack by another full graph object. */
   std::unique_ptr<shell_dep_graph_t> graph_storage(new shell_dep_graph_t{});
   shell_dep_graph_t &graph = *graph_storage;
+  for (const auto &fixture : shellsplit_test_printf_expansion_cases) {
+    size_t length = strlen(fixture.source), required = 0;
+    shell_dep_limits_t limits = SHELL_DEP_LIMITS_DEFAULT;
+    if (!shell_dep_resolved_workspace_size(length, &limits, &required))
+      abort();
+    g_depgraph_workspace.resize((required + sizeof(std::max_align_t) - 1) /
+                                sizeof(std::max_align_t));
+    limits.workspace = g_depgraph_workspace.data();
+    limits.workspace_size = required;
+    resolved_fuzz_context context = {
+        fixture.source, length, 1, false, 0, std::vector<uint8_t>(length),
+        "2:\\c,",       5};
+    if (shell_dep_graph_parse_resolved(fixture.source, length, "/", &limits,
+                                       &graph, resolved_fuzz_word, &context,
+                                       nullptr) != SHELL_DEP_OK ||
+        context.invalid_request || context.calls != fixture.queries ||
+        !shell_dep_graph_validate(&graph).valid) {
+      fprintf(stderr, "elided printf resolver oracle failed: %s\n",
+              fixture.source);
+      abort();
+    }
+  }
+  for (const auto &fixture : shellsplit_test_control_byte_words) {
+    shell_processed_commands_t processed = {};
+    shell_netstring_buffer_t netargv = {};
+    bool valid =
+        shell_process_commands(fixture.source, strlen(fixture.source), nullptr,
+                               &processed) == SHELL_PROCESS_OK &&
+        processed.command_count == 1 &&
+        shell_render_netargv_buffer(&processed.commands[0], nullptr,
+                                    &netargv) == SHELL_PROCESS_OK &&
+        netargv.length == strlen(fixture.netargv) &&
+        memcmp(netargv.data, fixture.netargv, netargv.length) == 0;
+    shell_netstring_buffer_free(&netargv);
+    shell_processed_commands_free(&processed);
+    if (!valid || test_processor(fixture.source, strlen(fixture.source))) {
+      fprintf(stderr, "control-byte canonical argv oracle failed\n");
+      abort();
+    }
+  }
+  for (const char *body : shellsplit_test_nonblank_bodies) {
+    std::string source =
+        std::string("value=$(true;") + body + ") || printf fallback >out";
+    shell_processed_commands_t processed = {};
+    bool valid = shell_dep_graph_parse(source.data(), source.size(), "/",
+                                       nullptr, &graph) == SHELL_DEP_OK &&
+                 shell_dep_graph_validate(&graph).valid &&
+                 shell_process_commands(source.data(), source.size(), nullptr,
+                                        &processed) == SHELL_PROCESS_OK;
+    bool fallback_write = false;
+    for (uint32_t e = 0; e < graph.edge_count; e++)
+      fallback_write |= graph.edges[e].type == SHELL_EDGE_WRITE;
+    valid &= fallback_write;
+    shell_processed_commands_free(&processed);
+    if (!valid) {
+      fprintf(stderr, "control-byte substitution outcome oracle failed\n");
+      abort();
+    }
+  }
+  static const struct {
+    const char *source;
+    uint32_t fd;
+    bool input;
+  } read_inputs[] = {
+      {"exec {fd}<<<saved && read -n-0\"$fd\" value <<<payload", 0, false},
+      {"exec {fd}<<<saved && read -N \"-00${fd} \" value <<<payload", 0, false},
+      {"exec {fd}<<<saved && read -u-00\"$fd\" value <<<payload", 0, false},
+      {"exec {fd}<<<saved && read -u00\"$fd\" value", SHELL_DEP_FD_NAMED, true},
+      {"unset fd; read -u-00\"$fd\" value <<<payload", 0, true},
+      {"unset fd; read -u3\"$fd\" value 3<<<payload", 3, true},
+      {"unset RANDOM; result=$(read RANDOM <<<payload)", 0, true},
+      {"unset RANDOM; result=`read RANDOM <<<payload`", 0, true},
+      {"unset RANDOM; : <(read RANDOM <<<payload)", 0, true},
+      {"unset BASH_REMATCH; result=$(inner=$(read BASH_REMATCH <<<payload))", 0,
+       true},
+      {"unset RANDOM; result=$(read -n0 RANDOM)", 0, false},
+      {"unset _; : 1; read -n\"$_\" value <<<payload", 0, true},
+      {"unset '_'; builtin : 1; builtin read -n\"${_}\" value <<<payload", 0,
+       true},
+      {"unset count; read -n0 -- \"$target\"; "
+       "read -n\"$count\" value <<<payload",
+       0, true},
+      {"unset fd; read -n\"$fd\" -p\"$fd\" value <<<payload", 0, false},
+      {"unset fd; read -u\"$fd\" -n\"$fd\" value <<<payload", 0, false},
+      {"unset fd; read -n0\"$fd\" value <<<payload", 0, false},
+      {"unset fd; read -- -p\"$fd\" value <<<payload", 0, false},
+      {"unset fd; read -- \"$fd\"- value <<<payload", 0, false},
+      {"exec {fd}<<<saved && read -n-\"$fd\" value <<<payload", 0, false},
+      {"exec {fd}<<<saved && read -N -\"$fd\" value <<<payload", 0, false},
+      {"exec {fd}<<<saved && read -t-\"$fd\" value <<<payload", 0, false},
+      {"exec {fd}<<<saved && read -u-\"$fd\" value <<<payload", 0, false},
+      {"read -n-1\"$unknown\" value <<<payload", 0, false},
+      {"read -u-1\"$unknown\" value <<<payload", 0, false},
+      {"read -n\"$unknown\"x value <<<payload", 0, false},
+      {"read -u\"$unknown\"x value <<<payload", 0, false},
+      {"read -- pre\"$unknown\"- value <<<payload", 0, false},
+      {"read -- \"$unknown\"~ value <<<payload", 0, false},
+      {"unset fd; read -p\"$fd\" -e value <<<payload", 0, true},
+      {"unset fd; read -n\"$fd\" -a value <<<payload", 0, false},
+      {"exec 3<&-; read -u3 -e value <<<payload", 0, false},
+      {"read -t0.0000000\"$unknown\" value <<<payload", 0, false},
+      {"read -t0.0000005\"$unknown\" value <<<payload", 0, true},
+      {"unset empty; read -- $empty~ value <<<payload", 0, false},
+      {"read -- pre<(printf generated >child) value <<<payload", 0, false},
+      {"read -- >(printf generated >child)suffix value <<<payload", 0, false},
+      {"read -p pre<(printf generated >child) value <<<payload", 0, true},
+      {"exec {input}<<<saved && { unset empty; "
+       "read -u\"$input\" oth\"$empty\"er; }",
+       SHELL_DEP_FD_NAMED, true},
+      {"unset empty; read -- -p\"$empty\" RANDOM <<<payload", 0, false},
+      {"read -u3 RANDOM 3<&-", 0, false},
+      {"unset empty; read -n0 other\"$empty\"", 0, false},
+      {"read -- bad-\"$unknown\" value <<<payload", 0, false},
+      {"read -- first bad-\"$unknown\" value <<<payload", 0, true},
+      {"read -t0 -- -p\"$unknown\" value <<<payload", 0, false},
+      {"exec 3<<<payload; <() read -u3 value", 3, true},
+      {"exec 3<<<payload; command <() read <() -u3 value", 3, true},
+      {"<() read -n0 value <<<payload", 0, false},
+      {"printf payload | read value", 0, true},
+      {"read -u3 value <unused 3<input", 3, true},
+      {"read -u3 -u4 value 3<&- 4<<<payload", 0, false},
+      {"read -t0 value <input", 0, false},
+      {"read -N0 value <input", 0, false},
+      {"read -- \"$target\" later <<<payload", 0, true},
+      {"read first \"$target\" later <<<payload", 0, true},
+      {"read -t0 first \"$target\" later <<<payload", 0, false},
+      {"exec 63<&-; read -u63 value <(printf payload)", 63, true},
+      {"exec 63<&-; read -p <(printf payload) -u63 value", 63, true},
+      {"exec 63<&-; read -u63 <(printf payload)", 63, false},
+      {"read -u3 value 3>writeonly", 3, false},
+      {"exec {out}>out && { read out 0<&-; printf x >&\"$out\"; }", 0, false},
+      {"unset fd; exec {fd}<input; read -u\"$fd\" 3 value 3<<<payload", 3,
+       true},
+      {"exec {fd}<<<old; read -u \"$fd\" value {fd}<<<new", SHELL_DEP_FD_NAMED,
+       true},
+      {"exec 3<&-; exec {fd}<<<payload; "
+       "result=$(read -u\"$fd\" -n0 probe) || read -u\"$fd\" value",
+       SHELL_DEP_FD_NAMED, false},
+      {"exec {fd}< <(printf payload); echo \"$(read -u \"$fd\" value)\"",
+       SHELL_DEP_FD_NAMED, true},
+      {"exec 3<&-; test \"$choice\" = yes || exec 3<<<payload; "
+       "read -u3 value && echo reached >reached",
+       3, true},
+      {"exec {fd}<<<payload && read -p\"$fd\" -u\"$fd\" value <unused",
+       SHELL_DEP_FD_NAMED, true},
+      {"exec {fd}<<<payload && read -p\"$fd\" -u \"$fd\" value <unused",
+       SHELL_DEP_FD_NAMED, true},
+      {"read -t4294967296 value <<<payload", 0, false},
+      {"read -t4294967296.5 value <<<payload", 0, true},
+      {"read -t18446744073709551617 value <<<payload", 0, true},
+      {"read -t-18446744073709551615.5 value <<<payload", 0, true},
+      {"read -t18446744073709551616 value <<<payload", 0, false},
+      {"read -t-18446744073709551616.5 value <<<payload", 0, false},
+      {"exec {input}<<<payload && read -u\"$input\" -- \"$input\"",
+       SHELL_DEP_FD_NAMED, false},
+      {"exec {input}<<<payload {out}>out && { "
+       "read -u\"$input\" -- first \"$input\" out; printf x >&\"$out\"; }",
+       SHELL_DEP_FD_NAMED, true},
+      {"exec {out}>out && { unset empty; exec 9<&-; exec {empty}<&9; "
+       "read -- $empty value <<<payload; printf x >&\"$out\"; }",
+       0, true},
+      {"exec {out}>out && { unset empty; exec 9<&-; exec {empty}<&9; "
+       "read -- \"\"$empty value <<<payload; printf x >&\"$out\"; }",
+       0, false},
+      {"exec {fd}>out && { read -p\"$fd\" -u3 fd 3<&-; "
+       "printf x >&\"$fd\"; }",
+       0, false},
+      {"{ time printf payload; } 2>&1 | "
+       "{ exec {fd}<&0; read -u\"$fd\" value; }",
+       SHELL_DEP_FD_NAMED, true},
+      {"exec {out}>out && { unset empty; exec 9<&-; exec {empty}<&9; "
+       "read -p\"$empty\" out value <<<payload; printf x >&\"$out\"; }",
+       0, true},
+  };
+  const shell_dep_limits_t read_limits = SHELL_DEP_LIMITS_DEFAULT;
+  static const struct {
+    const char *source, *required, *forbidden;
+  } conditional_inputs[] = {
+      {"exec <() 3>out; printf reached >&3", "out", nullptr},
+      {"(true; exit <()) && printf reached >reached", "reached", nullptr},
+      {"(false; builtin exit >()) || printf reached >reached", "reached",
+       nullptr},
+      {"exec {out}>out && { unset empty; read -n0 other\"$empty\"; "
+       "printf kept >&\"$out\"; }",
+       "out", nullptr},
+      {"exec {fd}<<<saved && read -n-\"$fd\" value <<<payload "
+       "&& printf accepted >accepted || printf failed >failed",
+       "failed", "accepted"},
+      {"read -n-1\"$unknown\" value <<<payload "
+       "&& printf accepted >accepted || printf failed >failed",
+       "failed", "accepted"},
+      {"read -- pre<(printf generated) value <<<payload "
+       "&& printf accepted >accepted || printf failed >failed",
+       "failed", "accepted"},
+      {"read -t0.0000000\"$unknown\" value <<<payload "
+       "&& printf accepted >accepted",
+       "accepted", nullptr},
+      {"unset empty; read -- -p\"$empty\" RANDOM <<<payload "
+       "&& printf accepted >accepted || printf failed >failed",
+       "failed", "accepted"},
+      {"unset fd; read -n\"$fd\" -p\"$fd\" value <<<payload "
+       "&& printf accepted >accepted || printf failed >failed",
+       "failed", "accepted"},
+      {"unset fd; read -u\"$fd\" -n\"$fd\" value <<<payload "
+       "&& printf accepted >accepted || printf failed >failed",
+       "failed", "accepted"},
+      {"target=bad-name; read -n0 first \"$target\" last <<<payload "
+       "|| printf fallback >fallback",
+       "fallback", nullptr},
+      {"value=$(read -N0 first \"$target\" last <<<payload) "
+       "|| printf fallback >fallback",
+       "fallback", nullptr},
+      {"! read -n0 first \"$target\" last <<<payload "
+       "&& printf fallback >fallback",
+       "fallback", nullptr},
+      {"read -n0 first last <<<payload || printf fallback >fallback", nullptr,
+       "fallback"},
+      {"a=$(true) b=${choice:+$(false)$(true)} || printf fallback >fallback",
+       nullptr, "fallback"},
+      {"a=$(false) b=${choice:+$(true)$(false)} && printf fallback >fallback",
+       nullptr, "fallback"},
+      {"exec 3<&-; a=$(true) b=${choice:+$(read -u11 -n0 probe)$(true)} && "
+       "{ true 3<&11 || printf fallback >fallback; }",
+       "fallback", nullptr},
+      {"a=$(false) b=$(\\\n) || printf fallback >fallback", "fallback",
+       nullptr},
+      {"exec 3<&-; value=${choice:+$(read -u11 -n0 probe)} && "
+       "{ true 3<&11 || printf fallback >fallback; }",
+       "fallback", nullptr},
+      {"exec 3<&-; choice || read -u11 -n0 probe && "
+       "{ true 3<&11 || printf fallback >fallback; }",
+       "fallback", nullptr},
+      {"a=$(false) b=$() || printf fallback >fallback", "fallback", nullptr},
+      {"a=$(false) b=$(# comment\n) || printf fallback >fallback", "fallback",
+       nullptr},
+      {"a=$(false) b=`` || printf fallback >fallback", "fallback", nullptr},
+      {"a=$(false) b=` # comment\n` || printf fallback >fallback", nullptr,
+       "fallback"},
+      {"false; value=$() || printf fallback >fallback", nullptr, "fallback"},
+      {"exec 3<&-; a=$(read -u11 -n0 probe) b=$(</dev/null) && "
+       "{ true 3<&11 || printf fallback >fallback; }",
+       "fallback", nullptr},
+      {"exec 3<&-; a=$(read -u11 -n0 probe) b=$() && "
+       "{ true 3<&11 || printf fallback >fallback; }",
+       nullptr, "fallback"},
+      {"value=$(< <()) && printf success >success || printf fallback >fallback",
+       "fallback", "success"},
+      {"value=$(< >( \n)) && printf success >success || printf fallback "
+       ">fallback",
+       "fallback", "success"},
+      {"value=$(< <(# comment\n)) && printf success >success || printf "
+       "fallback >fallback",
+       "fallback", "success"},
+      {"printf '%s' \"$(< <())\" && printf success >success", "success",
+       nullptr},
+      {"read -n \"$count\" -u11 -n0 probe 11<<<input || "
+       "printf fallback >fallback",
+       "fallback", nullptr},
+      {"read -N \"$count\" -u11 -N0 probe 11<<<input || "
+       "printf fallback >fallback",
+       "fallback", nullptr},
+      {"read -t \"$timeout\" -t1 -u11 -n0 probe 11<<<input || "
+       "printf fallback >fallback",
+       "fallback", nullptr},
+      {"exec 1>&-; value=$(read -u1 -n0 probe); "
+       "true 3>&1 || printf fallback >fallback",
+       "fallback", nullptr},
+      {"exec 3<&- 4<&- 63<&-; path=${choice:+<(:)} read -u63 -n0 value "
+       "|| printf fallback >fallback",
+       "fallback", nullptr},
+      {"exec 3<&- 4<&- 63<&-; path=${outer:+${inner:+<(:)}} "
+       "read -u63 -n0 value || printf fallback >fallback",
+       "fallback", nullptr},
+      {"exec 3<&- 4<&- 63<&-; "
+       "path=${choice:+<(:)$(read -u63 -n0 inner || printf bad >bad)} "
+       "read -u63 -n0 value || printf fallback >fallback",
+       "fallback", "bad"},
+      {"exec 3<&- 4<&- 63<&-; path=<(:) read -u63 -n0 value "
+       "|| printf fallback >fallback",
+       nullptr, "fallback"},
+      {"exec 3<&- 4<&- 63<&-; echo \"$(<prefix<(:))\" "
+       "\"$(read -u63 -n0 value || printf fallback >fallback)\"",
+       nullptr, "fallback"},
+      {"exec 3<&- 4<&- 63<&-; echo \"$(< <(:))\" "
+       "\"$(read -u63 -n0 value || printf fallback >fallback)\"",
+       nullptr, "fallback"},
+  };
+  for (const auto &fixture : conditional_inputs) {
+    shell_dep_error_t status = shell_dep_graph_parse(
+        fixture.source, strlen(fixture.source), nullptr, &read_limits, &graph);
+    bool required = fixture.required == nullptr, forbidden = false;
+    for (uint32_t e = 0; e < graph.edge_count; e++) {
+      const auto &edge = graph.edges[e];
+      const auto &target = graph.nodes[edge.to];
+      if (edge.type != SHELL_EDGE_WRITE || target.type != SHELL_NODE_DOC ||
+          target.doc.kind != SHELL_DOC_FILE)
+        continue;
+      if (fixture.required && target.doc.path_len == strlen(fixture.required) &&
+          !memcmp(target.doc.path, fixture.required, target.doc.path_len))
+        required = true;
+      if (fixture.forbidden &&
+          target.doc.path_len == strlen(fixture.forbidden) &&
+          !memcmp(target.doc.path, fixture.forbidden, target.doc.path_len))
+        forbidden = true;
+    }
+    if (status != SHELL_DEP_OK || !required || forbidden ||
+        !shellsplit_test_depgraph_invariants(fixture.source,
+                                             strlen(fixture.source), status,
+                                             &graph, &read_limits)) {
+      fprintf(stderr, "conditional input oracle failed: %s\n", fixture.source);
+      shell_dep_graph_dump(&graph, stderr);
+      abort();
+    }
+  }
+  for (bool success : {false, true}) {
+    std::string source = "exec 3<&- 4<&- 63<&-; : ${choice:+<(printf payload)} "
+                         "\"$(read -u63 -n0 first ";
+    source += success ? "&&" : "||";
+    source += " read -u63 second)\"";
+    shell_dep_error_t status = shell_dep_graph_parse(
+        source.data(), source.size(), nullptr, &read_limits, &graph);
+    bool input = false;
+    for (uint32_t e = 0; e < graph.edge_count; e++) {
+      const auto &edge = graph.edges[e];
+      const auto &node = graph.nodes[edge.to];
+      if (edge.type != SHELL_EDGE_SUBST || node.type != SHELL_NODE_CMD)
+        continue;
+      for (uint32_t t = 0; t < node.cmd.token_count; t++)
+        input |= node.cmd.token_lens[t] == 6 &&
+                 !memcmp(node.cmd.tokens[t], "second", 6);
+    }
+    if (status != SHELL_DEP_OK || input != success ||
+        !shellsplit_test_depgraph_invariants(source.data(), source.size(),
+                                             status, &graph, &read_limits)) {
+      fprintf(stderr, "process descriptor outcome correlation: %s\n",
+              source.c_str());
+      abort();
+    }
+  }
+  static const struct {
+    const char *source;
+    uint32_t fd;
+    bool input;
+  } private_inputs[] = {
+      {"exec 3<&- 4<&- 63<&-; : ${choice:+<(printf payload)} "
+       "\"$(: | read -u63 -n0 first || read -u63 second)\"",
+       63, false},
+      {"exec 3<&- 4<&- 63<&-; : ${choice:+<(printf payload)} "
+       "\"$(: | read -u63 -n0 first && read -u63 second)\"",
+       63, true},
+      {"exec 3<&- 4<&- 62<&- 63<&-; : ${choice:+<(printf payload)} "
+       "\"$(exec 62<&63; : | { read -u62 -n0 first; } || read -u62 second)\"",
+       62, false},
+      {"exec 3<&- 4<&- 63<&-; : ${choice:+<(printf payload)} "
+       "\"$(: | { read -u63 -n0 first; } && read -u63 second)\"",
+       63, false},
+  };
+  for (const auto &fixture : private_inputs) {
+    shell_dep_error_t status = shell_dep_graph_parse(
+        fixture.source, strlen(fixture.source), nullptr, &read_limits, &graph);
+    bool input = false;
+    for (uint32_t e = 0; e < graph.edge_count; e++) {
+      const auto &edge = graph.edges[e];
+      const auto &target = graph.nodes[edge.to];
+      if (edge.type != SHELL_EDGE_SUBST || target.type != SHELL_NODE_CMD)
+        continue;
+      for (uint32_t t = 0; t < target.cmd.token_count; t++)
+        if (target.cmd.token_lens[t] == 6 &&
+            !memcmp(target.cmd.tokens[t], "second", 6)) {
+          input = true;
+          if (edge.target_fd != fixture.fd ||
+              edge.flags != SHELL_DEP_EDGE_FLAG_NONE)
+            abort();
+        }
+    }
+    if (status != SHELL_DEP_OK || input != fixture.input ||
+        !shellsplit_test_depgraph_invariants(fixture.source,
+                                             strlen(fixture.source), status,
+                                             &graph, &read_limits)) {
+      fprintf(stderr, "private input outcome oracle failed: %s\n",
+              fixture.source);
+      abort();
+    }
+  }
+  fixed_oracle_phase("allocation routing");
+  static const struct {
+    const char *source;
+    bool payload;
+  } allocation_cases[] = {
+      {"read -u11 value {fd}<<<payload", true},
+      {"exec 3<&-; read -u11 -n0 probe && "
+       "read -u11 value {fd}<<<payload",
+       false},
+      {"exec 3<&-; (read -u11 -n0 probe) && "
+       "read -u11 value {fd}<<<payload",
+       false},
+      {"exec 3<&-; : | read -u11 -n0 probe && "
+       "read -u11 value {fd}<<<payload",
+       false},
+      {"exec 3<&-; : <(:) \"$(read -u3 -n0 probe && "
+       "read -u11 value {fd}<<<payload)\"",
+       false},
+      {"exec 3<&- 11<>/dev/null && exec {a}<<<first && "
+       "{ exec 11<&-; : <(:) \"$(read -u3 -n0 probe && "
+       "{ exec {a}<&-; read -u11 value {b}<<<payload; })\"; }",
+       true},
+      {"exec 3<&-; : <(:) \"$(read -u3 -n0 probe && "
+       "{ exec 8>&9- && read -u11 value {fd}<<<payload; })\"",
+       true}};
+  for (const auto &test : allocation_cases) {
+    shell_dep_error_t status = shell_dep_graph_parse(
+        test.source, strlen(test.source), nullptr, &read_limits, &graph);
+    uint32_t reader = UINT32_MAX;
+    unsigned readers = 0, payload_inputs = 0;
+    bool routing = true, inherited_input = false;
+    for (uint32_t n = 0; n < graph.node_count; n++) {
+      const auto &node = graph.nodes[n];
+      if (node.type != SHELL_NODE_CMD || node.cmd.token_count < 3 ||
+          node.cmd.token_lens[0] != 4 || memcmp(node.cmd.tokens[0], "read", 4))
+        continue;
+      for (uint32_t t = 1; t < node.cmd.token_count; t++)
+        if (node.cmd.token_lens[t] == 5 &&
+            !memcmp(node.cmd.tokens[t], "value", 5)) {
+          reader = n;
+          readers++;
+        }
+    }
+    for (uint32_t e = 0; e < graph.edge_count; e++) {
+      const auto &edge = graph.edges[e];
+      bool input = edge.type == SHELL_EDGE_READ ||
+                   edge.type == SHELL_EDGE_PIPE ||
+                   edge.type == SHELL_EDGE_SUBST;
+      if (input && edge.to == reader)
+        routing &= edge.target_fd == 11 && !edge.target_fd_name &&
+                   !edge.target_fd_name_len &&
+                   edge.flags == SHELL_DEP_EDGE_FLAG_NONE;
+      const auto &document = graph.nodes[edge.from];
+      inherited_input |= input && edge.to == reader &&
+                         document.type == SHELL_NODE_FD &&
+                         document.fd.number == 11;
+      if (!input || document.type != SHELL_NODE_DOC ||
+          document.doc.kind != SHELL_DOC_HERESTRING ||
+          document.doc.value_len != 7 ||
+          memcmp(document.doc.value, "payload", 7))
+        continue;
+      routing &= edge.to == reader && edge.type == SHELL_EDGE_READ &&
+                 edge.source_fd == SHELL_DEP_FD_NONE;
+      payload_inputs++;
+    }
+    if (status != SHELL_DEP_OK || readers != 1 || !routing ||
+        (!strcmp(test.source, "read -u11 value {fd}<<<payload") &&
+         !inherited_input) ||
+        payload_inputs != static_cast<unsigned>(test.payload) ||
+        !shellsplit_test_depgraph_invariants(test.source, strlen(test.source),
+                                             status, &graph, &read_limits)) {
+      fprintf(stderr, "named allocation input route mismatch: %s\n",
+              test.source);
+      abort();
+    }
+  }
+  fixed_oracle_phase("process lifetime pressure");
+  for (bool before : {false, true}) {
+    std::string source = "exec 10<&-; ";
+    if (!before)
+      source += "read -n0 -u63 value <(:) <(:); ";
+    for (unsigned i = 0; i < 16; i++)
+      source += ": <(:); ";
+    if (before)
+      source += "read -n0 -u63 value <(:) <(:)";
+    shell_dep_error_t status = shell_dep_graph_parse(
+        source.data(), source.size(), nullptr, &read_limits, &graph);
+    if (status != SHELL_DEP_OK ||
+        !shellsplit_test_depgraph_invariants(source.data(), source.size(),
+                                             status, &graph, &read_limits)) {
+      fprintf(stderr, "process descriptor lifetime pressure: %s\n",
+              source.c_str());
+      abort();
+    }
+  }
+  for (const char *prefix :
+       {"exec 3<<<payload; ", "exec 3<<<payload; time ",
+        "exec 3<<<payload; : 0<&-; ", "exec 3<<<payload; (exec 0<&-); ",
+        "exec 3<<<payload; exec 0<&-; "
+        "exec 0<<<restored && "}) {
+    for (unsigned count : {8u, 16u}) {
+      std::string source = std::string(prefix) + "cat";
+      for (unsigned i = 0; i < count; i++)
+        source += " ${v" + std::to_string(i) + ":+<(printf p" +
+                  std::to_string(i) + ")}";
+      source += "; read -u3 value";
+      shell_dep_error_t status = shell_dep_graph_parse(
+          source.data(), source.size(), nullptr, &read_limits, &graph);
+      unsigned producers = 0;
+      for (uint32_t e = 0; e < graph.edge_count; e++) {
+        const auto &edge = graph.edges[e];
+        const auto &target = graph.nodes[edge.to];
+        if (edge.type == SHELL_EDGE_SUBST && target.type == SHELL_NODE_CMD &&
+            target.cmd.token_count && target.cmd.token_lens[0] == 3 &&
+            !memcmp(target.cmd.tokens[0], "cat", 3))
+          producers++;
+      }
+      if (status != SHELL_DEP_OK || producers != count ||
+          !shellsplit_test_depgraph_invariants(source.data(), source.size(),
+                                               status, &graph, &read_limits)) {
+        fprintf(stderr, "independent process guard oracle failed: %s\n",
+                source.c_str());
+        shell_dep_graph_dump(&graph, stderr);
+        abort();
+      }
+    }
+  }
+  std::string occupied;
+  for (unsigned fd = 3; fd < 64; fd++) {
+    if ((fd - 3) % 8 == 0)
+      occupied += "exec";
+    occupied += " " + std::to_string(fd) + "<>/dev/null";
+    if ((fd - 3) % 8 == 7 || fd == 63)
+      occupied += "; ";
+  }
+  for (const char *value : {"${choice:+<(printf payload)}",
+                            "${outer:+${inner:+<(printf payload)}}"}) {
+    std::string source = occupied + "exec 0<&-; path=" + value + " read value";
+    shell_dep_error_t status = shell_dep_graph_parse(
+        source.data(), source.size(), nullptr, &read_limits, &graph);
+    bool input = false;
+    for (uint32_t e = 0; e < graph.edge_count; e++) {
+      const auto &edge = graph.edges[e];
+      const auto &target = graph.nodes[edge.to];
+      input |= edge.type == SHELL_EDGE_SUBST && edge.target_fd == 0 &&
+               !(edge.flags & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD) &&
+               target.type == SHELL_NODE_CMD && target.cmd.token_count &&
+               target.cmd.token_lens[0] == 4 &&
+               !memcmp(target.cmd.tokens[0], "read", 4);
+    }
+    if (status != SHELL_DEP_OK || !input ||
+        !shellsplit_test_depgraph_invariants(source.data(), source.size(),
+                                             status, &graph, &read_limits)) {
+      fprintf(stderr, "conditional low-pipe oracle failed: %s\n",
+              source.c_str());
+      shell_dep_graph_dump(&graph, stderr);
+      abort();
+    }
+  }
+  for (const auto &fixture : read_inputs) {
+    shell_dep_error_t status = shell_dep_graph_parse(
+        fixture.source, strlen(fixture.source), nullptr, &read_limits, &graph);
+    bool valid = status == SHELL_DEP_OK;
+    bool input = false, found = false;
+    for (uint32_t node = 0; node < graph.node_count; node++) {
+      const auto &owner = graph.nodes[node];
+      if (owner.type != SHELL_NODE_CMD || !owner.cmd.effective_command_known)
+        continue;
+      uint32_t target = owner.cmd.effective_command_token;
+      if (owner.cmd.token_lens[target] != 4 ||
+          memcmp(owner.cmd.tokens[target], "read", 4))
+        continue;
+      found = true;
+      for (uint32_t e = 0; e < graph.edge_count; e++) {
+        const auto &edge = graph.edges[e];
+        if (edge.to != node ||
+            (edge.type != SHELL_EDGE_READ && edge.type != SHELL_EDGE_PIPE &&
+             edge.type != SHELL_EDGE_SUBST))
+          continue;
+        input = true;
+        valid = valid && edge.target_fd == fixture.fd &&
+                !(edge.flags & SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD);
+      }
+    }
+    if (!valid || !found || input != fixture.input ||
+        !shellsplit_test_depgraph_invariants(fixture.source,
+                                             strlen(fixture.source), status,
+                                             &graph, &read_limits)) {
+      fprintf(stderr, "read input oracle failed: %s\n", fixture.source);
+      shell_dep_graph_dump(&graph, stderr);
+      abort();
+    }
+  }
+  fixed_oracle_phase("boundary routing");
   static const struct {
     const char *source;
     uint32_t nodes, edges;
@@ -7093,9 +7902,21 @@ static void run_fixed_oracles() {
   for (bool reached : reachable)
     if (!reached)
       abort();
-  for (unsigned i = 0; i < 256; i++)
-    if (test_generated_descriptor_move((uint8_t)i))
+  /* Every selector remains reachable above. Many selectors render the exact
+   * same program with the same form-specific oracle; verify each such pair
+   * once at startup, not several times after expensive descriptor analysis.
+   * Keying on both values preserves differing expectations for equal source.
+   */
+  fixed_oracle_phase("descriptor moves");
+  std::set<std::pair<unsigned, std::string>> move_cases;
+  for (unsigned i = 0; i < 256; i++) {
+    char input[512];
+    descriptor_move_source(static_cast<uint8_t>(i), input);
+    if (move_cases.emplace(i % descriptor_move_form_count, input).second &&
+        test_descriptor_move(static_cast<uint8_t>(i), input))
       abort();
+  }
+  fixed_oracle_phase("word and syntax matrices");
   for (const auto &fixture : shellsplit_test_array_prefixes) {
     size_t length = strlen(fixture.source);
     shell_parse_result_t parsed = {};
@@ -7312,6 +8133,7 @@ static void run_fixed_oracles() {
   }
   if (test_fixed_oracles())
     abort();
+  fixed_oracle_phase("generated substitution matrices");
   static const char *const plain_boundary_cases[] = {
       ".",     "source", "eval",      "trap",   "alias",
       "pushd", "popd",   "command .", "/bin/.", "printf .",
@@ -7334,6 +8156,14 @@ static void run_fixed_oracles() {
     if (test_composed_substitution_case(&selector, 1, "/tmp"))
       abort();
   static const uint8_t local_document_selectors[] = {58, 59, 60};
+  /* Regression for a trailing heredoc redirect on a nested group followed by
+   * a pipeline. Byte three used to make the shared generator mistake CRLF for
+   * a shell newline and declare the resulting unterminated heredoc valid. */
+  static const uint8_t heredoc_pipeline_group_case[] = {0, 1, 2, 1, 1,
+                                                        2, 7, 1, 1};
+  if (test_generated_brace_case(heredoc_pipeline_group_case,
+                                sizeof(heredoc_pipeline_group_case), "/tmp"))
+    abort();
   for (uint8_t depth = 0; depth < 8; depth++)
     for (uint8_t composition = 0; composition < 6; composition++) {
       const uint8_t diagnostic_group_case[] = {0,           1, 2, 0, depth,
@@ -7366,6 +8196,7 @@ static void run_fixed_oracles() {
                 selector, truncate);
         abort();
       }
+  fixed_oracle_phase("complete");
 }
 
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {

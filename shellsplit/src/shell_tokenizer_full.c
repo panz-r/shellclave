@@ -151,6 +151,10 @@ static SHELL_NONNULL(1) bool arithmetic_has_unsupported_semantics(
 static SHELL_NONNULL(1) bool arithmetic_has_unsupported_semantics_depth(
     const char *input, size_t length, size_t nesting);
 static _Thread_local shell_semantic_token_observer_t semantic_token_observer;
+static _Thread_local shell_semantic_read_fd_observer_t
+    semantic_read_fd_observer;
+static _Thread_local shell_semantic_process_observer_t
+    semantic_process_observer;
 static _Thread_local void *semantic_token_context;
 
 static bool unsupported_semantics_scan(const char *input, size_t input_length,
@@ -164,9 +168,9 @@ static SHELL_NONNULL(1) bool unsupported_semantics_scan_impl(
  * stack. The limit matches Shellsplit's other structural capacities. */
 #define SHELL_STATIC_ARITHMETIC_MAX_NESTING SHELL_MAX_SUBCOMMANDS
 
-/* The tokenizer consumes textual shell input, not arbitrary binary.  Keep C
- * whitespace as valid separators, but reject all other control bytes, DEL,
- * and raw high bytes before a partial token stream can be exposed. */
+/* Source-byte admission is not word separation: CR, VT and FF are readable
+ * text, but only space/tab/LF separate Bash words. Reject other control bytes,
+ * DEL and high bytes before exposing a partial stream. */
 static SHELL_NONNULL(1) bool contains_invalid_shell_byte(const char *input,
                                                          size_t length) {
   if (source_operation.bytes_prechecked &&
@@ -512,7 +516,7 @@ static bool brace_group_close_delimiter(const char *input, size_t length,
   if (after == length)
     return true;
   char following = input[after];
-  if (isspace((unsigned char)following) || following == ';' ||
+  if (shell_source_space((unsigned char)following) || following == ';' ||
       following == '|' || following == '&' || following == ')' ||
       following == '<' || following == '>')
     return true;
@@ -545,10 +549,10 @@ static bool brace_groups_valid(const char *input, size_t length) {
     char c = input[i];
     bool starts_word = word_boundary;
     word_boundary = shell_source_word_separator(c);
-    if (c == ';' || c == '|' || c == '&' || c == '\n' || c == '\r') {
+    if (c == ';' || c == '|' || c == '&' || c == '\n') {
       context_possible = true;
     }
-    if ((c == '\n' || c == '\r') && pending_count > 0) {
+    if ((c == '\n') && pending_count > 0) {
       size_t after = length;
       /* This remains a lexical validator: an incomplete document leaves its
        * body opaque through EOF, while strict higher-level APIs reject the
@@ -649,9 +653,10 @@ static bool brace_groups_valid(const char *input, size_t length) {
      */
     bool possible_brace_open =
         c == '{' && i + 1 < length &&
-        (isspace((unsigned char)input[i + 1]) || input[i + 1] == '(');
+        (shell_source_space((unsigned char)input[i + 1]) ||
+         input[i + 1] == '(');
     if ((c != '{' && c != '}' && c != '(' && c != ')' &&
-         !isspace((unsigned char)c) && !strchr("<>;|&", c)) ||
+         !shell_source_space((unsigned char)c) && !strchr("<>;|&", c)) ||
         (c == '{' && !possible_brace_open)) {
       size_t after = 0;
       if (shell_source_skip_shell_word_impl(input, length, i, &after, true) &&
@@ -666,14 +671,13 @@ static bool brace_groups_valid(const char *input, size_t length) {
     bool continued_line = false;
     do {
       continued_line = false;
-      while (previous > 0 && isspace((unsigned char)input[previous - 1])) {
-        newline_separator = newline_separator || input[previous - 1] == '\n' ||
-                            input[previous - 1] == '\r';
+      while (previous > 0 &&
+             shell_source_space((unsigned char)input[previous - 1])) {
+        newline_separator = newline_separator || input[previous - 1] == '\n';
         previous--;
       }
       if (previous > 0 && input[previous - 1] == '\\' &&
-          ((previous < length && input[previous] == '\n') ||
-           (previous < length && input[previous] == '\r'))) {
+          (previous < length && input[previous] == '\n')) {
         previous--;
         newline_separator = false;
         continued_line = true;
@@ -711,7 +715,8 @@ static bool brace_groups_valid(const char *input, size_t length) {
                         lexical_token.type == SHELL_TOKEN_GROUP_END;
     }
     if (possible_brace_open && command_boundary && i + 1 < length &&
-        (isspace((unsigned char)input[i + 1]) || input[i + 1] == '(')) {
+        (shell_source_space((unsigned char)input[i + 1]) ||
+         input[i + 1] == '(')) {
       if (depth == SHELL_MAX_SUBCOMMANDS)
         return false;
       stack[depth++] = SHELL_GROUP_BRACE;
@@ -826,7 +831,7 @@ static bool token_at_word_boundary(const shell_tokenizer_state_t *state) {
   if (!state || state->position == 0)
     return true;
   char previous = state->input[state->position - 1];
-  return isspace((unsigned char)previous) || previous == ';' ||
+  return shell_source_space((unsigned char)previous) || previous == ';' ||
          previous == '|' || previous == '&' || previous == '(' ||
          previous == '{' || previous == '}';
 }
@@ -894,7 +899,7 @@ static bool is_brace_group_delimiter(const shell_tokenizer_state_t *state,
       shell_source_logical_following(state->input, state->length, p);
   if (opening) {
     if (following >= state->length ||
-        (!isspace((unsigned char)state->input[following]) &&
+        (!shell_source_space((unsigned char)state->input[following]) &&
          state->input[following] != '('))
       return false;
   } else if (state->brace_group_depth == 0) {
@@ -906,7 +911,7 @@ static bool is_brace_group_delimiter(const shell_tokenizer_state_t *state,
     if (before == 0)
       return false;
     char preceding = state->input[before - 1];
-    if (!isspace((unsigned char)preceding) && preceding != ';' &&
+    if (!shell_source_space((unsigned char)preceding) && preceding != ';' &&
         preceding != '|' && preceding != '&' && preceding != '(' &&
         preceding != ')')
       return false;
@@ -914,7 +919,7 @@ static bool is_brace_group_delimiter(const shell_tokenizer_state_t *state,
   if (following == state->length)
     return true;
   char after = state->input[following];
-  if (isspace((unsigned char)after) || (opening && after == '(') ||
+  if (shell_source_space((unsigned char)after) || (opening && after == '(') ||
       after == ';' || after == '|' || after == '&' || after == ')')
     return true;
   if (!opening && (after == '<' || after == '>'))
@@ -954,9 +959,7 @@ shell_token_return_current_group_context(const shell_tokenizer_state_t *state,
 
 static void skip_whitespace(shell_tokenizer_state_t *state) {
   while (state->position < state->length &&
-         state->input[state->position] != '\n' &&
-         state->input[state->position] != '\r' &&
-         isspace((unsigned char)state->input[state->position])) {
+         shell_source_blank((unsigned char)state->input[state->position])) {
     state->position++;
   }
 }
@@ -979,11 +982,7 @@ static bool handle_quotes(shell_tokenizer_state_t *state) {
   }
 
   if (c == '\\' && state->position + 1 < state->length) {
-    bool cr = state->input[state->position + 1] == '\r';
     state->position += 2;
-    if (cr && state->position < state->length &&
-        state->input[state->position] == '\n')
-      state->position++;
     return true;
   }
 
@@ -1284,12 +1283,8 @@ static SHELL_NONNULL(1, 2) bool shell_tokenizer_next_raw(
   for (;;) {
     if (state->position >= state->length)
       return false;
-    if (!state->in_quotes && (state->input[state->position] == '\n' ||
-                              state->input[state->position] == '\r')) {
+    if (!state->in_quotes && state->input[state->position] == '\n') {
       size_t newline = state->position++;
-      if (state->input[newline] == '\r' && state->position < state->length &&
-          state->input[state->position] == '\n')
-        state->position++;
       size_t newline_length = state->position - newline;
       if (state->pending_heredoc_count != 0)
         (void)skip_pending_heredocs(state);
@@ -1307,15 +1302,13 @@ static SHELL_NONNULL(1, 2) bool shell_tokenizer_next_raw(
      * rather than falling through into the word scanner. Apart from fixing
      * ordinary `word \n next` boundaries, this keeps a pending `!` from
      * silently crossing a raw newline. */
-    if (!state->in_quotes && (state->input[state->position] == '\n' ||
-                              state->input[state->position] == '\r'))
+    if (!state->in_quotes && state->input[state->position] == '\n')
       continue;
     if (!state->in_quotes &&
         shell_source_comment_starts(state->input[state->position],
                                     token_starts_word(state))) {
       while (state->position < state->length &&
-             state->input[state->position] != '\n' &&
-             state->input[state->position] != '\r') {
+             state->input[state->position] != '\n') {
         SHELL_SOURCE_WORD_SCAN(1);
         state->position++;
       }
@@ -1337,14 +1330,8 @@ static SHELL_NONNULL(1, 2) bool shell_tokenizer_next_raw(
    * the real operator. Continuations embedded in an ordinary word are still
    * consumed by the word scanner below. */
   if (!state->in_quotes && current_char == '\\' &&
-      start_pos + 1 < state->length &&
-      (state->input[start_pos + 1] == '\n' ||
-       state->input[start_pos + 1] == '\r')) {
+      start_pos + 1 < state->length && state->input[start_pos + 1] == '\n') {
     state->position = start_pos + 2;
-    if (state->input[start_pos + 1] == '\r' &&
-        state->position < state->length &&
-        state->input[state->position] == '\n')
-      state->position++;
     token->type = SHELL_TOKEN_ARGUMENT;
     token->start = state->input + start_pos;
     token->length = state->position - start_pos;
@@ -1390,7 +1377,7 @@ static SHELL_NONNULL(1, 2) bool shell_tokenizer_next_raw(
       }
 
       if (state->position == state->length ||
-          isspace((unsigned char)state->input[state->position]) ||
+          shell_source_space((unsigned char)state->input[state->position]) ||
           is_shell_operator(state->input[state->position])) {
         token->type = SHELL_TOKEN_ARGUMENT;
         token->start = state->input + start_pos;
@@ -1960,11 +1947,7 @@ ordinary_word:
               state->input, state->length, state->position + 2);
           continue;
         }
-        bool cr = state->input[state->position + 1] == '\r';
         state->position += 2;
-        if (cr && state->position < state->length &&
-            state->input[state->position] == '\n')
-          state->position++;
         continue;
       }
       if (c == '\'' || c == '"') {
@@ -1992,7 +1975,7 @@ ordinary_word:
         state->position = extglob_after;
         continue;
       }
-      if (isspace((unsigned char)c) ||
+      if (shell_source_space((unsigned char)c) ||
           (is_shell_operator(c) && c != '{' && c != '}' && c != '[')) {
         break;
       }
@@ -2248,7 +2231,9 @@ static bool token_is_plain_word(const char *input, size_t input_length,
 static SHELL_NONNULL(1, 3, 4) bool token_visit_static_word(
     const char *input, size_t input_length, const shell_token_t *token,
     shell_source_byte_visitor_t visitor, void *context) {
-  if (!control_token_is_word(token) || token->position > input_length)
+  if ((!control_token_is_word(token) &&
+       token->type != SHELL_TOKEN_PROCESS_SUB) ||
+      token->position > input_length)
     return false;
   size_t word_end = 0;
   if (!shell_source_skip_shell_word(input, input_length, token->position,
@@ -2257,44 +2242,7 @@ static SHELL_NONNULL(1, 3, 4) bool token_visit_static_word(
     return false;
   const char *word = input + token->position;
   size_t word_length = word_end - token->position;
-  char quote = '\0';
-  for (size_t position = 0; position < word_length; position++) {
-    char c = word[position];
-    if (quote == '\0' && c == '$' &&
-        shell_source_logical_next_is(word, word_length, position, '\'', NULL)) {
-      size_t after = position;
-      if (!shell_source_decode_ansi_c_quote(word, word_length, &after, visitor,
-                                            context))
-        return false;
-      position = after - 1;
-      continue;
-    }
-    if (quote == '\0' && (c == '\'' || c == '"')) {
-      quote = c;
-      continue;
-    }
-    if (quote != '\0' && c == quote) {
-      quote = '\0';
-      continue;
-    }
-    if (c == '\\' && quote != '\'' && position + 1 < word_length) {
-      char next = word[position + 1];
-      if (quote == '\0' || next == '$' || next == '`' || next == '"' ||
-          next == '\\' || next == '\n' || next == '\r') {
-        if (next != '\n' && next != '\r' &&
-            !visitor((unsigned char)next, context))
-          return false;
-        position++;
-        if (next == '\r' && position + 1 < word_length &&
-            word[position + 1] == '\n')
-          position++;
-        continue;
-      }
-    }
-    if (!visitor((unsigned char)c, context))
-      return false;
-  }
-  return quote == '\0';
+  return shell_source_visit_decoded_word(word, word_length, visitor, context);
 }
 
 typedef struct {
@@ -2332,7 +2280,9 @@ static SHELL_NONNULL(1, 3,
 static SHELL_NONNULL(1, 3) shell_source_builtin_kind_t
     token_static_builtin_kind(const char *input, size_t input_length,
                               const shell_token_t *token) {
-  if (!control_token_is_word(token) || token->position > input_length)
+  if ((!control_token_is_word(token) &&
+       token->type != SHELL_TOKEN_PROCESS_SUB) ||
+      token->position > input_length)
     return SHELL_SOURCE_BUILTIN_NONE;
   size_t word_end = 0;
   if (!shell_source_skip_shell_word(input, input_length, token->position,
@@ -2685,9 +2635,7 @@ static SHELL_NONNULL(1) bool word_has_array_designator_after(const char *input,
     }
     if (c == '\\' && !in_single && position + 1 < length) {
       char next = input[++position];
-      if (next == '\r' && position + 1 < length && input[position + 1] == '\n')
-        position++;
-      if (next == '\n' || next == '\r')
+      if (next == '\n')
         continue;
       if (in_double && next != '$' && next != '`' && next != '"' &&
           next != '\\')
@@ -2786,7 +2734,8 @@ static bool token_starts_bash_compound_command(const shell_token_t *token,
                                               "[[", &after))
     return false;
   after = shell_source_skip_escaped_line_endings(input, input_length, after);
-  return after == input_length || isspace((unsigned char)input[after]);
+  return after == input_length ||
+         shell_source_space((unsigned char)input[after]);
 }
 
 /* Inspect every active expansion regardless of the outer token's diagnostic
@@ -2808,6 +2757,11 @@ static SHELL_NONNULL(1) bool expansion_has_unsupported_semantics(
      * or validate the raw body as though it were an ordinary command list. */
     if (scan.has_backtick_escapes)
       return true;
+    if (semantic_process_observer &&
+        (kind == SHELL_SOURCE_SUBST_PROCESS_INPUT ||
+         kind == SHELL_SOURCE_SUBST_PROCESS_OUTPUT))
+      semantic_process_observer(input + start, after - start,
+                                semantic_token_context);
     if (kind == SHELL_SOURCE_EXPANSION_SUBSTRING) {
       if (substring_has_unsupported_semantics(input + start, after - start))
         return true;
@@ -3020,6 +2974,9 @@ static SHELL_NONNULL(1, 3, 4) bool semantic_set_builtin_target(
   state->printf_builtin = kind == SHELL_SOURCE_BUILTIN_PRINTF;
   state->read_builtin = kind == SHELL_SOURCE_BUILTIN_READ;
   state->read.writing = SHELL_READ_OPTIONS;
+  if (state->read_builtin && semantic_read_fd_observer)
+    semantic_read_fd_observer(input + token->position, 0, 3, NULL, 0, false,
+                              semantic_token_context);
   state->getopts_builtin = kind == SHELL_SOURCE_BUILTIN_GETOPTS;
   state->getopts.phases = SHELL_GETOPTS_OPTIONS;
   state->unset_builtin = kind == SHELL_SOURCE_BUILTIN_UNSET;
@@ -3067,6 +3024,7 @@ static SHELL_NONNULL(1) bool unsupported_semantics_scan_impl(
    * readonly declaration before it can reach that model. */
   semantic_builtin_state_t builtin = {0};
   bool command_start = true;
+  bool awaiting_command = false;
   /* A plain leading integer assignment is temporary once an executable word
    * follows. Without one it performs arithmetic in the current shell. += can
    * perform that arithmetic even for temporary command-prefix assignments. */
@@ -3103,7 +3061,7 @@ static SHELL_NONNULL(1) bool unsupported_semantics_scan_impl(
      * head may regain reserved `time` eligibility after `|` or `|&`. */
     if (command_start && !pipeline_prefix.scanned &&
         !pipeline_prefix.has_stage && token.type == SHELL_TOKEN_SEMICOLON &&
-        (token.start[0] == '\n' || token.start[0] == '\r'))
+        (token.start[0] == '\n'))
       continue;
     bool list_operator =
         token.type == SHELL_TOKEN_PIPE || token.type == SHELL_TOKEN_PIPE_BOTH ||
@@ -3173,6 +3131,7 @@ static SHELL_NONNULL(1) bool unsupported_semantics_scan_impl(
       if (integer_assignment)
         return true;
       command_start = true;
+      awaiting_command = false;
       pipeline_prefix = semantic_pipeline_prefix_initial();
       if (token.type == SHELL_TOKEN_PIPE || token.type == SHELL_TOKEN_PIPE_BOTH)
         pipeline_prefix.eligible = false;
@@ -3193,6 +3152,7 @@ static SHELL_NONNULL(1) bool unsupported_semantics_scan_impl(
         return false;
       compound_prefixes[compound_depth++] = pipeline_prefix;
       command_start = true;
+      awaiting_command = false;
       pipeline_prefix = semantic_pipeline_prefix_initial();
       builtin = (semantic_builtin_state_t){0};
       semantic_word_end = 0;
@@ -3205,6 +3165,7 @@ static SHELL_NONNULL(1) bool unsupported_semantics_scan_impl(
       if (integer_assignment)
         return true;
       command_start = false;
+      awaiting_command = false;
       pipeline_prefix = compound_depth != 0
                             ? compound_prefixes[--compound_depth]
                             : (semantic_pipeline_prefix_t){0};
@@ -3213,18 +3174,19 @@ static SHELL_NONNULL(1) bool unsupported_semantics_scan_impl(
       continue;
     }
     if (full_token_is_redirection(&token)) {
-      /* A named allocation is an implicit variable write. Unstable values,
-       * readonly/array variables and the executor's protected name cannot
-       * supply the stable scalar binding consumed by later $name redirects.
-       * This is a source-semantic rejection, not a graph-side consistency
-       * check or a change to the lexical grammar. */
+      /* Resettable predefined names require graph-side path state. Names whose
+       * prohibited capability can never be removed remain source-semantically
+       * unsupported and need no deferred graph verdict. */
       size_t name_after;
       if (shell_source_parse_named_fd_at_word_start(
-              token.start, 0, token.length, &name_after) &&
-          (shell_builtin_name_properties(token.start + 1, name_after - 2) &
-           (SHELL_VARIABLE_UNSTABLE | SHELL_VARIABLE_READONLY |
-            SHELL_VARIABLE_ARRAY | SHELL_VARIABLE_FROZEN)))
-        return true;
+              token.start, 0, token.length, &name_after)) {
+        unsigned properties =
+            shell_builtin_name_properties(token.start + 1, name_after - 2);
+        if ((properties & (SHELL_VARIABLE_UNSTABLE | SHELL_VARIABLE_READONLY |
+                           SHELL_VARIABLE_ARRAY | SHELL_VARIABLE_FROZEN)) &&
+            !(properties & SHELL_VARIABLE_DESPECIALIZES_ON_UNSET))
+          return true;
+      }
       redirect_operand_end = full_redirect_end(input, input_length, &token);
       continue;
     }
@@ -3246,8 +3208,17 @@ static SHELL_NONNULL(1) bool unsupported_semantics_scan_impl(
          shell_source_array_assignment_is_compound(token.start, token.length)))
       return true;
 
-    if (command_start) {
-      if (token.type == SHELL_TOKEN_PIPE_NEGATE)
+    if (word_token &&
+        shell_source_word_is_elided(input + token.position,
+                                    semantic_word_end - token.position)) {
+      /* Expansion can remove a command word, but cannot reopen the lexical
+       * assignment/reserved-word prefix. Keep looking only for argv[0]. */
+      awaiting_command |= command_start;
+      command_start = false;
+      continue;
+    }
+    if (command_start || awaiting_command) {
+      if (command_start && token.type == SHELL_TOKEN_PIPE_NEGATE)
         continue;
       /* Control syntax is unsupported whether complete or incomplete. The
        * list validator retains its diagnostic control grammar separately;
@@ -3256,20 +3227,22 @@ static SHELL_NONNULL(1) bool unsupported_semantics_scan_impl(
       static const char *const control_words[] = {
           "if",   "while", "until", "for", "select", "case", "coproc", "then",
           "elif", "else",  "fi",    "do",  "done",   "in",   "esac"};
-      for (size_t i = 0; i < sizeof(control_words) / sizeof(control_words[0]);
+      for (size_t i = 0; command_start &&
+                         i < sizeof(control_words) / sizeof(control_words[0]);
            i++)
         if (token_is_logical_unquoted_word(&token, control_words[i]))
           return true;
-      if (control_token_starts_function_definition(&token, input,
-                                                   input_length) ||
-          (token_is_logical_unquoted_word(&token, "function") &&
-           control_function_keyword_has_name(&token, input, input_length)))
+      if (command_start &&
+          (control_token_starts_function_definition(&token, input,
+                                                    input_length) ||
+           (token_is_logical_unquoted_word(&token, "function") &&
+            control_function_keyword_has_name(&token, input, input_length))))
         return true;
       /* Scalar assignment prefixes do not consume the command-word position.
        * Keep looking so `VAR=x declare -a values` cannot evade the semantic
        * rejection. */
       shell_source_assignment_word_t assignment;
-      if (control_token_is_word(&token) &&
+      if (command_start && control_token_is_word(&token) &&
           shell_source_parse_scalar_assignment_word(token.start, token.length,
                                                     &assignment)) {
         /* POSIXLY_CORRECT changes Bash's current-shell assignment lifetime.
@@ -3281,7 +3254,8 @@ static SHELL_NONNULL(1) bool unsupported_semantics_scan_impl(
             shell_builtin_name_properties(token.start, assignment.name_end);
         if (properties & SHELL_VARIABLE_FROZEN)
           return true;
-        if (properties & SHELL_VARIABLE_INTEGER) {
+        if ((properties & SHELL_VARIABLE_INTEGER) &&
+            !(properties & SHELL_VARIABLE_DESPECIALIZES_ON_UNSET)) {
           if (assignment.append)
             return true;
           integer_assignment = true;
@@ -3301,6 +3275,7 @@ static SHELL_NONNULL(1) bool unsupported_semantics_scan_impl(
         builtin = (semantic_builtin_state_t){0};
       }
       command_start = false;
+      awaiting_command = false;
       continue;
     }
     if (builtin.wrapper.kind != SHELL_SOURCE_WRAPPER_NONE) {
@@ -3385,10 +3360,19 @@ static SHELL_NONNULL(1) bool unsupported_semantics_scan_impl(
           shell_builtin_read_word(&builtin.read, input + token.position,
                                   semantic_word_end - token.position);
       if ((roles & SHELL_BUILTIN_ROLE_UNSUPPORTED) ||
+          ((roles & SHELL_BUILTIN_ROLE_READ_CONTEXT) &&
+           !semantic_read_fd_observer) ||
           ((roles & SHELL_BUILTIN_ROLE_TARGET) &&
            word_has_array_designator_after(
                input + token.position, semantic_word_end - token.position, 0)))
         return true;
+      if (semantic_read_fd_observer &&
+          (builtin.read.fd_kind || builtin.read.parameter))
+        semantic_read_fd_observer(
+            input + token.position, builtin.read.fd_number,
+            builtin.read.fd_kind, builtin.read.parameter,
+            builtin.read.parameter_length, builtin.read.parameter_identity,
+            semantic_token_context);
       continue;
     }
     if (builtin.unset_builtin) {
@@ -3495,16 +3479,25 @@ bool shell_tokenizer_has_unsupported_semantics(const char *input,
   return unsupported;
 }
 
-bool shell_tokenizer_inspect_semantics(const char *input, size_t input_length,
-                                       shell_semantic_token_observer_t observer,
-                                       void *context) {
+bool shell_tokenizer_inspect_semantics(
+    const char *input, size_t input_length,
+    shell_semantic_token_observer_t observer,
+    shell_semantic_read_fd_observer_t read_fd,
+    shell_semantic_process_observer_t process, void *context) {
   shell_semantic_token_observer_t previous = semantic_token_observer;
+  shell_semantic_read_fd_observer_t previous_read = semantic_read_fd_observer;
+  shell_semantic_process_observer_t previous_process =
+      semantic_process_observer;
   void *previous_context = semantic_token_context;
   semantic_token_observer = observer;
+  semantic_read_fd_observer = read_fd;
+  semantic_process_observer = process;
   semantic_token_context = context;
   bool unsupported =
       shell_tokenizer_has_unsupported_semantics(input, input_length);
   semantic_token_observer = previous;
+  semantic_read_fd_observer = previous_read;
+  semantic_process_observer = previous_process;
   semantic_token_context = previous_context;
   return unsupported;
 }
@@ -3534,7 +3527,7 @@ static SHELL_NONNULL(1) shell_control_syntax_t
      * exactly as in the unsupported-semantics stream above. */
     if (command_start && !pipeline_prefix.scanned &&
         !pipeline_prefix.has_stage && token.type == SHELL_TOKEN_SEMICOLON &&
-        (token.start[0] == '\n' || token.start[0] == '\r'))
+        (token.start[0] == '\n'))
       continue;
     if (command_start && semantic_token_is_pipeline_prefix(
                              input, input_length, &token, &pipeline_prefix))
@@ -3842,7 +3835,7 @@ static shell_list_state_t shell_list_state_initial(void) {
 
 static bool shell_list_token_is_newline(const shell_token_t *token) {
   return token->type == SHELL_TOKEN_SEMICOLON && token->length != 0 &&
-         (token->start[0] == '\n' || token->start[0] == '\r');
+         (token->start[0] == '\n');
 }
 
 static shell_pipeline_prefix_word_t
@@ -4173,7 +4166,10 @@ static SHELL_NONNULL(1) bool shell_tokenizer_list_syntax_valid_body(
     if (shell_source_is_escaped_line_ending(input, token.position,
                                             token.position + token.length))
       continue;
-    saw_token = true;
+    /* Leading/newline-only trivia is not a pending stage. In particular an
+     * empty substitution body may contain line endings without making its
+     * closing parenthesis satisfy a missing command after &&, |, or !. */
+    saw_token |= !shell_list_token_is_newline(&token);
 
     if (state.redirect_operand) {
       /* The next lexer token begins exactly at the operator end for a raw
@@ -4664,7 +4660,7 @@ shell_tokenize_status_t shell_tokenize_prevalidated_commands(
     size_t input_len = input_length;
     for (size_t i = 0; i < input_len; i++) {
       char c = input[i];
-      if (isspace((unsigned char)c))
+      if (shell_source_space((unsigned char)c))
         continue;
 
       if (c == '&' && i + 1 < input_len &&

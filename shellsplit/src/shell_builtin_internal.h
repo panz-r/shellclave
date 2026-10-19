@@ -25,6 +25,9 @@ enum {
   /* An operand controls whether later builtin effects occur. It must retain
    * source semantics when state-changing operands are not expanded. */
   SHELL_BUILTIN_ROLE_CONTROL = 128u,
+  /* A scalar word's read role or projected target requires captured entry
+   * values. Source-only consumers cannot discharge this graph-context need. */
+  SHELL_BUILTIN_ROLE_READ_CONTEXT = 256u,
 };
 
 enum {
@@ -34,6 +37,7 @@ enum {
   SHELL_READ_TIMEOUT = 8u,
   SHELL_READ_TARGETS = 16u,
   SHELL_READ_POSITIONAL = 32u,
+  SHELL_READ_FD = 64u,
 };
 
 /* A bounded union of possible getopt paths. An empty attached expansion can
@@ -42,6 +46,13 @@ enum {
  * terminates only that path. No source rescanning or runtime evaluation. */
 typedef struct {
   unsigned writing, polling;
+  /* This word's possible -u operand, consumed by the source observer before
+   * graph construction. Zero means no descriptor; 1 static, 2 dynamic. */
+  unsigned fd_kind;
+  uint32_t fd_number;
+  const char *parameter;
+  size_t parameter_length;
+  bool parameter_identity;
 } shell_builtin_read_t;
 
 typedef enum {
@@ -53,19 +64,21 @@ typedef enum {
   SHELL_BUILTIN_VARIABLE_ARITHMETIC,
 } shell_builtin_variable_t;
 
-/* Fresh-shell capabilities, not a shell-variable attribute table. Keep
- * arithmetic writers and descriptor destinations on the same name registry:
- * a stable integer (OPTIND) can hold an allocated FD, but an automatically
- * updated value, readonly variable, or array cannot provide the scalar binding
- * we model. Previous unset/attribute operations do not establish different
- * capabilities without modeling that state. Variables which alter the graph's
- * fixed Bash execution contract are cleared and frozen by the executor. */
+/* Fresh-shell capabilities, not a complete shell-variable attribute table.
+ * The dependency graph combines these initial properties with path-local
+ * successful-unset facts. Variables which alter the graph's fixed Bash
+ * execution contract are cleared and frozen by the executor. */
 enum {
   SHELL_VARIABLE_INTEGER = 1u,
   SHELL_VARIABLE_UNSTABLE = 2u,
   SHELL_VARIABLE_READONLY = 4u,
   SHELL_VARIABLE_ARRAY = 8u,
   SHELL_VARIABLE_FROZEN = 16u,
+  /* Bash removes these special capabilities when the whole variable is
+   * successfully unset. Later writes create an ordinary scalar. */
+  SHELL_VARIABLE_DESPECIALIZES_ON_UNSET = 32u,
+  /* Whole-variable unset fails and leaves the predefined array in place. */
+  SHELL_VARIABLE_UNSET_REJECTED = 64u,
 };
 static const struct {
   const char *name;
@@ -74,11 +87,16 @@ static const struct {
 } shell_builtin_variable_names[] = {
 #define SHELL_VARIABLE(name, properties) {name, sizeof(name) - 1, properties}
     SHELL_VARIABLE("_", SHELL_VARIABLE_UNSTABLE),
-    SHELL_VARIABLE("SECONDS", SHELL_VARIABLE_INTEGER | SHELL_VARIABLE_UNSTABLE),
-    SHELL_VARIABLE("RANDOM", SHELL_VARIABLE_INTEGER | SHELL_VARIABLE_UNSTABLE),
-    SHELL_VARIABLE("SRANDOM", SHELL_VARIABLE_INTEGER | SHELL_VARIABLE_UNSTABLE),
-    SHELL_VARIABLE("OPTIND", SHELL_VARIABLE_INTEGER),
-    SHELL_VARIABLE("HISTCMD", SHELL_VARIABLE_INTEGER | SHELL_VARIABLE_UNSTABLE),
+    SHELL_VARIABLE("SECONDS", SHELL_VARIABLE_INTEGER | SHELL_VARIABLE_UNSTABLE |
+                                  SHELL_VARIABLE_DESPECIALIZES_ON_UNSET),
+    SHELL_VARIABLE("RANDOM", SHELL_VARIABLE_INTEGER | SHELL_VARIABLE_UNSTABLE |
+                                 SHELL_VARIABLE_DESPECIALIZES_ON_UNSET),
+    SHELL_VARIABLE("SRANDOM", SHELL_VARIABLE_INTEGER | SHELL_VARIABLE_UNSTABLE |
+                                  SHELL_VARIABLE_DESPECIALIZES_ON_UNSET),
+    SHELL_VARIABLE("OPTIND", SHELL_VARIABLE_INTEGER |
+                                 SHELL_VARIABLE_DESPECIALIZES_ON_UNSET),
+    SHELL_VARIABLE("HISTCMD", SHELL_VARIABLE_INTEGER | SHELL_VARIABLE_UNSTABLE |
+                                  SHELL_VARIABLE_DESPECIALIZES_ON_UNSET),
     SHELL_VARIABLE("POSIXLY_CORRECT", SHELL_VARIABLE_FROZEN),
     SHELL_VARIABLE("BASH_COMPAT", SHELL_VARIABLE_FROZEN),
     SHELL_VARIABLE("BASH_XTRACEFD", SHELL_VARIABLE_FROZEN),
@@ -89,24 +107,43 @@ static const struct {
     SHELL_VARIABLE("BASHOPTS", SHELL_VARIABLE_READONLY),
     SHELL_VARIABLE("BASH_VERSINFO",
                    SHELL_VARIABLE_READONLY | SHELL_VARIABLE_ARRAY),
-    SHELL_VARIABLE("EPOCHSECONDS", SHELL_VARIABLE_UNSTABLE),
-    SHELL_VARIABLE("EPOCHREALTIME", SHELL_VARIABLE_UNSTABLE),
-    SHELL_VARIABLE("BASH_MONOSECONDS", SHELL_VARIABLE_UNSTABLE),
-    SHELL_VARIABLE("BASH_COMMAND", SHELL_VARIABLE_UNSTABLE),
-    SHELL_VARIABLE("BASHPID", SHELL_VARIABLE_UNSTABLE),
-    SHELL_VARIABLE("BASH_SUBSHELL", SHELL_VARIABLE_UNSTABLE),
-    SHELL_VARIABLE("LINENO", SHELL_VARIABLE_UNSTABLE),
-    SHELL_VARIABLE("BASH_ARGC", SHELL_VARIABLE_ARRAY),
-    SHELL_VARIABLE("BASH_ARGV", SHELL_VARIABLE_ARRAY),
-    SHELL_VARIABLE("BASH_LINENO", SHELL_VARIABLE_ARRAY),
-    SHELL_VARIABLE("BASH_SOURCE", SHELL_VARIABLE_ARRAY),
-    SHELL_VARIABLE("DIRSTACK", SHELL_VARIABLE_ARRAY),
-    SHELL_VARIABLE("FUNCNAME", SHELL_VARIABLE_ARRAY),
-    SHELL_VARIABLE("GROUPS", SHELL_VARIABLE_ARRAY),
-    SHELL_VARIABLE("PIPESTATUS", SHELL_VARIABLE_ARRAY),
-    SHELL_VARIABLE("BASH_ALIASES", SHELL_VARIABLE_ARRAY),
-    SHELL_VARIABLE("BASH_CMDS", SHELL_VARIABLE_ARRAY),
-    SHELL_VARIABLE("BASH_REMATCH", SHELL_VARIABLE_ARRAY),
+    SHELL_VARIABLE("EPOCHSECONDS", SHELL_VARIABLE_UNSTABLE |
+                                       SHELL_VARIABLE_DESPECIALIZES_ON_UNSET),
+    SHELL_VARIABLE("EPOCHREALTIME", SHELL_VARIABLE_UNSTABLE |
+                                        SHELL_VARIABLE_DESPECIALIZES_ON_UNSET),
+    SHELL_VARIABLE("BASH_MONOSECONDS",
+                   SHELL_VARIABLE_UNSTABLE |
+                       SHELL_VARIABLE_DESPECIALIZES_ON_UNSET),
+    SHELL_VARIABLE("BASH_COMMAND", SHELL_VARIABLE_UNSTABLE |
+                                       SHELL_VARIABLE_DESPECIALIZES_ON_UNSET),
+    SHELL_VARIABLE("BASHPID", SHELL_VARIABLE_UNSTABLE |
+                                  SHELL_VARIABLE_DESPECIALIZES_ON_UNSET),
+    SHELL_VARIABLE("BASH_SUBSHELL", SHELL_VARIABLE_UNSTABLE |
+                                        SHELL_VARIABLE_DESPECIALIZES_ON_UNSET),
+    SHELL_VARIABLE("LINENO", SHELL_VARIABLE_UNSTABLE |
+                                 SHELL_VARIABLE_DESPECIALIZES_ON_UNSET),
+    SHELL_VARIABLE("BASH_ARGC",
+                   SHELL_VARIABLE_ARRAY | SHELL_VARIABLE_UNSET_REJECTED),
+    SHELL_VARIABLE("BASH_ARGV",
+                   SHELL_VARIABLE_ARRAY | SHELL_VARIABLE_UNSET_REJECTED),
+    SHELL_VARIABLE("BASH_LINENO",
+                   SHELL_VARIABLE_ARRAY | SHELL_VARIABLE_UNSET_REJECTED),
+    SHELL_VARIABLE("BASH_SOURCE",
+                   SHELL_VARIABLE_ARRAY | SHELL_VARIABLE_UNSET_REJECTED),
+    SHELL_VARIABLE("DIRSTACK", SHELL_VARIABLE_ARRAY |
+                                   SHELL_VARIABLE_DESPECIALIZES_ON_UNSET),
+    SHELL_VARIABLE("FUNCNAME", SHELL_VARIABLE_ARRAY |
+                                   SHELL_VARIABLE_DESPECIALIZES_ON_UNSET),
+    SHELL_VARIABLE("GROUPS", SHELL_VARIABLE_ARRAY |
+                                 SHELL_VARIABLE_DESPECIALIZES_ON_UNSET),
+    SHELL_VARIABLE("PIPESTATUS",
+                   SHELL_VARIABLE_ARRAY | SHELL_VARIABLE_UNSTABLE),
+    SHELL_VARIABLE("BASH_ALIASES", SHELL_VARIABLE_ARRAY |
+                                       SHELL_VARIABLE_DESPECIALIZES_ON_UNSET),
+    SHELL_VARIABLE("BASH_CMDS", SHELL_VARIABLE_ARRAY |
+                                    SHELL_VARIABLE_DESPECIALIZES_ON_UNSET),
+    SHELL_VARIABLE("BASH_REMATCH", SHELL_VARIABLE_ARRAY |
+                                       SHELL_VARIABLE_DESPECIALIZES_ON_UNSET),
 #undef SHELL_VARIABLE
 };
 enum {
@@ -149,6 +186,28 @@ static inline SHELL_NONNULL(1) unsigned shell_builtin_variable_properties(
   return 0;
 }
 
+/* One-based registry identity; zero denotes an ordinary or non-static name. */
+static inline SHELL_NONNULL(1) uint8_t
+    shell_builtin_variable_index(const shell_builtin_variable_scan_t *scan) {
+  for (uint8_t i = 0; i < SHELL_BUILTIN_VARIABLE_NAMES; i++)
+    if ((scan->names & (UINT64_C(1) << i)) &&
+        scan->length == shell_builtin_variable_names[i].length)
+      return (uint8_t)(i + 1);
+  return 0;
+}
+
+static inline unsigned shell_builtin_variable_index_properties(uint8_t index) {
+  return index ? shell_builtin_variable_names[index - 1].properties : 0;
+}
+
+static inline const char *shell_builtin_variable_index_name(uint8_t index) {
+  return shell_builtin_variable_names[index - 1].name;
+}
+
+static inline size_t shell_builtin_variable_index_length(uint8_t index) {
+  return shell_builtin_variable_names[index - 1].length;
+}
+
 /* Required static identifier source span from a parsed assignment or named-FD
  * prefix. Physical continuations are decoded without allocating a name. */
 static inline SHELL_NONNULL(1) unsigned shell_builtin_name_properties(
@@ -158,6 +217,17 @@ static inline SHELL_NONNULL(1) unsigned shell_builtin_name_properties(
   (void)shell_source_visit_static_argument(name, length,
                                            shell_builtin_variable_byte, &scan);
   return shell_builtin_variable_properties(&scan);
+}
+
+static inline SHELL_NONNULL(1) uint8_t
+    shell_builtin_name_index(const char *name, size_t length) {
+  shell_builtin_variable_scan_t scan = {.valid = true,
+                                        .names = SHELL_BUILTIN_VARIABLE_MASK};
+  if (!shell_source_visit_static_argument(name, length,
+                                          shell_builtin_variable_byte, &scan) ||
+      !scan.valid)
+    return 0;
+  return shell_builtin_variable_index(&scan);
 }
 
 /* Classify a quote-removed scalar target. Static invalid names cannot mutate
@@ -177,7 +247,8 @@ static inline SHELL_NONNULL(1) shell_builtin_variable_t
   if (!scan.valid || scan.length == 0)
     return SHELL_BUILTIN_VARIABLE_INVALID;
   unsigned properties = shell_builtin_variable_properties(&scan);
-  if (properties & SHELL_VARIABLE_INTEGER)
+  if ((properties & SHELL_VARIABLE_INTEGER) &&
+      !(properties & SHELL_VARIABLE_DESPECIALIZES_ON_UNSET))
     return SHELL_BUILTIN_VARIABLE_ARITHMETIC;
   if (properties & SHELL_VARIABLE_FROZEN)
     return SHELL_BUILTIN_VARIABLE_FROZEN;
@@ -497,7 +568,9 @@ static inline SHELL_NONNULL(1, 2) unsigned shell_builtin_declaration_word(
   if (!state->no_integer &&
       (state->integer ||
        (assigned &&
-        (shell_builtin_variable_properties(&target) & SHELL_VARIABLE_INTEGER))))
+        (shell_builtin_variable_properties(&target) & SHELL_VARIABLE_INTEGER) &&
+        !(shell_builtin_variable_properties(&target) &
+          SHELL_VARIABLE_DESPECIALIZES_ON_UNSET))))
     return SHELL_BUILTIN_ROLE_UNSUPPORTED;
   if (state->readonly || state->kind == SHELL_SOURCE_BUILTIN_READONLY)
     return SHELL_BUILTIN_ROLE_UNSUPPORTED;
@@ -508,21 +581,36 @@ static inline SHELL_NONNULL(1, 2) unsigned shell_builtin_declaration_word(
 }
 
 typedef struct {
-  uintmax_t whole;
+  unsigned long whole;
   unsigned fraction_digits;
   bool timeout, started, digits, negative, fraction, fractional_nonzero;
   bool trailing_space, invalid;
+  /* An irreversible prefix result, encoded as value + 1 (zero means unknown).
+   * The mutable literal projection separately classifies empty captures;
+   * joining literals across unknown fragments cannot establish a prefix proof.
+   */
+  uint8_t prefix_result;
 } shell_builtin_read_number_t;
 
 /* Bash accepts signed decimal integers (with surrounding whitespace) for
  * -n/-N/-u. Timeout operands instead use a decimal seconds/microseconds pair:
- * no whitespace/exponents, and fractional precision is truncated at 6 digits.
+ * six fractional digits, rounding from the seventh. uconvert with no end
+ * pointer ignores the remaining suffix after those six digits. Its unchecked
+ * long arithmetic wraps in the reference executable; use defined unsigned
+ * arithmetic here, then classify the signed result before converting seconds.
  * Keep only the information needed to prove an option error or polling mode. */
 static inline SHELL_NONNULL(2) bool shell_builtin_read_number_byte(
     unsigned char byte, void *context) {
   shell_builtin_read_number_t *scan = context;
   if (scan->invalid)
     return true;
+  if (scan->fraction && scan->fraction_digits >= 6) {
+    if (scan->fraction_digits == 6) {
+      scan->fractional_nonzero |= byte >= '5' && byte <= '9';
+      scan->fraction_digits++;
+    }
+    return true;
+  }
   if (!scan->timeout && isspace(byte)) {
     if (scan->started)
       scan->trailing_space = true;
@@ -553,9 +641,10 @@ static inline SHELL_NONNULL(2) bool shell_builtin_read_number_byte(
       scan->fractional_nonzero |= byte != '0';
     }
   } else {
-    uintmax_t limit = scan->timeout ? (uintmax_t)LONG_MAX : (uintmax_t)INT_MAX;
     unsigned digit = byte - '0';
-    if (scan->whole > (limit - digit) / 10)
+    if (scan->timeout)
+      scan->whole = scan->whole * 10ul + digit;
+    else if (scan->whole > ((unsigned long)INT_MAX - digit) / 10)
       scan->invalid = true;
     else
       scan->whole = scan->whole * 10 + digit;
@@ -571,14 +660,82 @@ enum {
 };
 
 static inline SHELL_NONNULL(1) unsigned shell_builtin_read_number_value(
-    const shell_builtin_read_number_t *scan, bool dynamic) {
-  if (dynamic)
-    return SHELL_READ_VALUE_UNKNOWN;
-  bool zero = scan->whole == 0 && !scan->fractional_nonzero;
-  if (scan->invalid || (!scan->timeout && !scan->digits) ||
-      (scan->negative && !zero))
+    const shell_builtin_read_number_t *scan, bool dynamic,
+    bool single_argument) {
+  /* Deleting fragments from a valid bounded decimal integer cannot produce
+   * an invalid character/order/overflow scan (only a missing digit). Thus an
+   * invalid literal projection proves failure even after an opaque fragment.
+   * Timeout conversion is not deletion-closed: a fragment can hide later junk
+   * beyond its fractional conversion limit. Splitting can also move that junk
+   * to a different argv entry. */
+  if (dynamic && single_argument && !scan->timeout && scan->invalid)
     return SHELL_READ_VALUE_INVALID;
+  if (dynamic)
+    return scan->prefix_result ? scan->prefix_result - 1u
+                               : SHELL_READ_VALUE_UNKNOWN;
+  if (scan->invalid || (!scan->timeout && !scan->digits))
+    return SHELL_READ_VALUE_INVALID;
+  /* read validates the signed uconvert result, then stores its seconds in
+   * unsigned int. Only the converted pair determines timeout-zero polling. */
+  unsigned long whole = scan->whole;
+  if (scan->timeout) {
+    if (scan->negative)
+      whole = 0ul - whole;
+    /* uconvert signs the fraction only when the pre-sign wrapped whole is
+     * zero. A minus sign can otherwise accompany a positive wrapped result. */
+    if (whole > (unsigned long)LONG_MAX ||
+        (scan->negative && !scan->whole && scan->fractional_nonzero))
+      return SHELL_READ_VALUE_INVALID;
+    whole = (unsigned int)whole;
+  } else if (scan->negative && whole)
+    return SHELL_READ_VALUE_INVALID;
+  bool zero = whole == 0 && !scan->fractional_nonzero;
   return zero ? SHELL_READ_VALUE_ZERO : SHELL_READ_VALUE_NONZERO;
+}
+
+/* Snapshot only before the first opaque fragment. Integer negative nonzero
+ * prefixes cannot become valid by appending bytes. Timeout conversion is
+ * final only after the seventh fractional character decided rounding. */
+static inline SHELL_NONNULL(1) void shell_builtin_read_number_prefix(
+    shell_builtin_read_number_t *scan) {
+  if (scan->invalid || (!scan->timeout && scan->negative && scan->whole) ||
+      (scan->timeout && scan->fraction_digits > 6))
+    scan->prefix_result =
+        (uint8_t)(shell_builtin_read_number_value(scan, false, true) + 1u);
+}
+
+/* Possible shapes, not an array evaluator. The array envelope deliberately
+ * accepts any subscript body; failing to match even this superset proves a
+ * bad target. Unknown scalar fragments take the finite wildcard closure. */
+enum {
+  SHELL_READ_TARGET_START = 1u,
+  SHELL_READ_TARGET_NAME = 2u,
+  SHELL_READ_TARGET_ARRAY = 4u,
+  SHELL_READ_TARGET_CLOSED = 8u,
+  SHELL_READ_TARGET_ACCEPT = SHELL_READ_TARGET_NAME | SHELL_READ_TARGET_CLOSED,
+};
+
+static inline uint8_t shell_builtin_read_target_byte(uint8_t shapes,
+                                                     unsigned char byte) {
+  uint8_t next = shapes & SHELL_READ_TARGET_ARRAY;
+  if (((shapes & SHELL_READ_TARGET_START) && (isalpha(byte) || byte == '_')) ||
+      ((shapes & SHELL_READ_TARGET_NAME) && (isalnum(byte) || byte == '_')))
+    next |= SHELL_READ_TARGET_NAME;
+  if ((shapes & SHELL_READ_TARGET_NAME) && byte == '[')
+    next |= SHELL_READ_TARGET_ARRAY;
+  if ((shapes & SHELL_READ_TARGET_ARRAY) && byte == ']')
+    next |= SHELL_READ_TARGET_CLOSED;
+  return next;
+}
+
+static inline uint8_t shell_builtin_read_target_dynamic(uint8_t shapes) {
+  if (shapes & SHELL_READ_TARGET_START)
+    shapes |= SHELL_READ_TARGET_NAME;
+  if (shapes & SHELL_READ_TARGET_NAME)
+    shapes |= SHELL_READ_TARGET_ARRAY;
+  if (shapes & SHELL_READ_TARGET_ARRAY)
+    shapes |= SHELL_READ_TARGET_CLOSED;
+  return shapes;
 }
 
 typedef struct {
@@ -586,12 +743,50 @@ typedef struct {
   bool option, valid, operand, array, readline, end;
   bool attached_static, attached_dynamic, unresolved;
   unsigned operand_kind;
+  /* Read projection omits scalar fragments; process paths contribute '/'.
+   * Two scalar fragments cannot name one tracked FD. */
+  const char *parameter;
+  size_t parameter_length, parameter_prefix, literal_count;
+  bool parameter_unquoted, multiple_parameters, process_path;
+  /* Keep empty-capture literal identity separate from possible target shapes.
+   * Neither wildcard matching nor process paths manufacture decoded strings. */
+  bool target_invalid;
+  uint8_t target_shapes;
+  shell_builtin_variable_scan_t literal_target;
+  bool literal_ifs;
+  /* A sole scalar with an optional sign, not arbitrary numeric concatenation.
+   * 0 is not this template, 1 nonnegative, 2 negative. Literal decimal suffixes
+   * invalidate the template rather than guessing overflow/wrapping results. */
+  uint8_t number_scalar, timeout_scalar, payload_scalar;
   shell_builtin_read_number_t number, timeout, payload;
 } shell_builtin_read_option_t;
 
 static inline SHELL_NONNULL(2) bool shell_builtin_read_option_byte(
     unsigned char byte, void *context) {
   shell_builtin_read_option_t *scan = context;
+  size_t literal_position = scan->literal_count++;
+  if (!literal_position && !scan->parameter && !scan->process_path)
+    scan->target_shapes = SHELL_READ_TARGET_START;
+  scan->target_shapes =
+      shell_builtin_read_target_byte(scan->target_shapes, byte);
+  if (!literal_position) {
+    scan->literal_target = (shell_builtin_variable_scan_t){
+        .valid = true, .names = SHELL_BUILTIN_VARIABLE_MASK};
+    scan->literal_ifs = true;
+  }
+  shell_builtin_variable_byte(byte, &scan->literal_target);
+  scan->literal_ifs &=
+      literal_position < 3 && byte == (unsigned char)"IFS"[literal_position];
+  if (scan->parameter) {
+    if (!isspace(byte))
+      scan->number_scalar = 0;
+    scan->timeout_scalar = 0;
+    if (scan->payload.timeout || !isspace(byte))
+      scan->payload_scalar = 0;
+  }
+  scan->target_invalid |= literal_position == 0
+                              ? !(isalpha(byte) || byte == '_')
+                              : !(isalnum(byte) || byte == '_');
   shell_builtin_read_number_byte(byte, &scan->number);
   shell_builtin_read_number_byte(byte, &scan->timeout);
   if (scan->unresolved)
@@ -623,9 +818,12 @@ static inline SHELL_NONNULL(2) bool shell_builtin_read_option_byte(
     break;
   case 'n':
   case 'N':
-  case 'u':
     scan->operand = true;
     scan->operand_kind = SHELL_READ_NUMBER;
+    break;
+  case 'u':
+    scan->operand = true;
+    scan->operand_kind = SHELL_READ_FD;
     break;
   case 't':
     scan->operand = true;
@@ -650,13 +848,17 @@ static inline SHELL_NONNULL(2) bool shell_builtin_read_option_byte(
   return true;
 }
 
-/* Visit literal fragments and opaque quoted scalar/substitution fragments of
- * a complete word. Success proves exactly one argv entry, including an empty
- * one. List selectors and unquoted expansion have unresolved cardinality and
- * return false; callbacks may already have seen a prefix in that case. The
- * source boundary separately checks supported nested expansion semantics.
+/* Visit literal and opaque scalar/substitution fragments of a complete word.
+ * With allow_unquoted=false, success proves one argv entry, including empty.
+ * With it true, unquoted scalar cardinality remains the caller's concern.
+ * List selectors are not projected; callbacks may have seen a prefix before
+ * failure. The source boundary separately checks nested expansion semantics.
  * Visitors consume every fragment; context may be NULL if they allow it. */
-typedef void (*shell_builtin_word_dynamic_fn)(void *context);
+typedef void (*shell_builtin_word_dynamic_fn)(const char *word, size_t length,
+                                              bool quoted, void *context);
+/* NULL rejects nonempty process fragments. A visitor receives their guaranteed
+ * pathname contribution, not an evaluated pathname or the child source. */
+typedef void (*shell_builtin_word_process_fn)(void *context);
 
 /* The source scanner has isolated a complete parameter expansion. Prove
  * scalar cardinality without resolving its value or copying its identifier.
@@ -695,23 +897,30 @@ static inline SHELL_NONNULL(1) bool shell_builtin_parameter_is_scalar(
   return true;
 }
 
-static inline SHELL_NONNULL(1, 3, 4) bool shell_builtin_visit_single_word(
+static inline SHELL_NONNULL(1, 3, 4) bool shell_builtin_visit_word_impl(
     const char *word, size_t length, shell_source_byte_visitor_t literal,
-    shell_builtin_word_dynamic_fn dynamic, void *context) {
+    shell_builtin_word_dynamic_fn dynamic, void *context, bool allow_unquoted,
+    shell_builtin_word_process_fn process) {
   char quote = 0;
   bool start = true;
   shell_source_brace_scan_t braces = {0};
   shell_source_glob_scan_t glob = {0};
   for (size_t position = 0; position < length;) {
     unsigned char byte = (unsigned char)word[position];
+    size_t empty_after;
+    if (!quote && (byte == '<' || byte == '>') &&
+        shell_source_empty_process_fragment(word, length, position,
+                                            &empty_after)) {
+      position = empty_after;
+      start = false;
+      continue;
+    }
     if (byte == '\\' && quote != '\'' && position + 1 < length) {
       unsigned char next = (unsigned char)word[position + 1];
       if (!quote || next == '$' || next == '`' || next == '"' || next == '\\' ||
-          next == '\n' || next == '\r') {
+          next == '\n') {
         position += 2;
-        if (next == '\r' && position < length && word[position] == '\n')
-          position++;
-        if (next != '\n' && next != '\r') {
+        if (next != '\n') {
           shell_source_brace_scan_literal(&braces);
           shell_source_glob_scan_step(&glob, next, true);
           literal(next, context);
@@ -743,7 +952,7 @@ static inline SHELL_NONNULL(1, 3, 4) bool shell_builtin_visit_single_word(
     }
     if (quote != '\'' && (byte == '`' || shell_source_dollar_has_dynamic_syntax(
                                              word, length, position))) {
-      if (quote != '"')
+      if (quote != '"' && !allow_unquoted)
         return false;
       size_t after = 0, open = 0;
       if (byte == '`') {
@@ -766,15 +975,27 @@ static inline SHELL_NONNULL(1, 3, 4) bool shell_builtin_visit_single_word(
                                                after - position))
           return false;
       }
-      dynamic(context);
+      dynamic(word + position, after - position, quote == '"', context);
       position = after;
+      start = false;
       continue;
     }
     if (!quote) {
-      if (((byte == '<' || byte == '>') &&
-           shell_source_process_substitution_open(word, length, position,
-                                                  NULL)) ||
-          ((byte == '?' || byte == '*' || byte == '+' || byte == '@' ||
+      size_t open, after;
+      if ((byte == '<' || byte == '>') &&
+          shell_source_process_substitution_open(word, length, position,
+                                                 &open)) {
+        if (!process ||
+            !shell_source_find_balanced_parentheses(word, length, open, &after))
+          return false;
+        process(context);
+        shell_source_brace_scan_literal(&braces);
+        shell_source_glob_scan_step(&glob, '/', true);
+        position = after;
+        start = false;
+        continue;
+      }
+      if (((byte == '?' || byte == '*' || byte == '+' || byte == '@' ||
             byte == '!') &&
            shell_source_logical_next_is(word, length, position, '(', NULL)) ||
           byte == '*' || byte == '?' || (byte == '~' && start) ||
@@ -788,6 +1009,13 @@ static inline SHELL_NONNULL(1, 3, 4) bool shell_builtin_visit_single_word(
     position++;
   }
   return quote == 0;
+}
+
+static inline SHELL_NONNULL(1, 3, 4) bool shell_builtin_visit_single_word(
+    const char *word, size_t length, shell_source_byte_visitor_t literal,
+    shell_builtin_word_dynamic_fn dynamic, void *context) {
+  return shell_builtin_visit_word_impl(word, length, literal, dynamic, context,
+                                       false, NULL);
 }
 
 /* word is one complete, supported parameter expansion, excluding its outer
@@ -868,6 +1096,11 @@ static inline SHELL_NONNULL(1) bool shell_builtin_word_guarantees_argument(
       continue;
     }
     size_t after = 0, open = 0;
+    if (!quote && (byte == '<' || byte == '>') &&
+        shell_source_empty_process_fragment(word, length, position, &after)) {
+      position = after;
+      continue;
+    }
     bool dynamic = false, preserves_argument = false;
     if (byte == '`') {
       dynamic = preserves_argument = true;
@@ -946,8 +1179,11 @@ static inline SHELL_NONNULL(2) bool shell_builtin_getopts_byte(
   return true;
 }
 
-static inline SHELL_NONNULL(1) void shell_builtin_getopts_dynamic(
-    void *context) {
+static inline SHELL_NONNULL(4) void shell_builtin_getopts_dynamic(
+    const char *word, size_t length, bool quoted, void *context) {
+  (void)word;
+  (void)length;
+  (void)quoted;
   shell_builtin_getopts_word_t *scan = context;
   scan->dynamic = true;
 }
@@ -993,21 +1229,67 @@ static inline SHELL_NONNULL(1, 2) unsigned shell_builtin_getopts_word(
   return roles;
 }
 
-static inline SHELL_NONNULL(1) void shell_builtin_read_dynamic(void *context) {
+static inline SHELL_NONNULL(1, 4) void shell_builtin_read_dynamic(
+    const char *word, size_t length, bool quoted, void *context) {
   shell_builtin_read_option_t *scan = context;
+  if (!scan->literal_count && !scan->parameter && !scan->process_path)
+    scan->target_shapes = SHELL_READ_TARGET_START;
+  scan->target_shapes = shell_builtin_read_target_dynamic(scan->target_shapes);
+  if (!scan->parameter && !scan->process_path) {
+    shell_builtin_read_number_prefix(&scan->number);
+    shell_builtin_read_number_prefix(&scan->timeout);
+    shell_builtin_read_number_prefix(&scan->payload);
+    const shell_builtin_read_number_t *numbers[] = {
+        &scan->number, &scan->timeout, &scan->payload};
+    uint8_t *templates[] = {&scan->number_scalar, &scan->timeout_scalar,
+                            &scan->payload_scalar};
+    for (unsigned i = 0; i < 3; i++) {
+      const shell_builtin_read_number_t *number = numbers[i];
+      /* Integer leading zeroes leave a following scalar's value and sign
+       * unchanged. Do not generalize to nonzero prefixes, fractions, trailing
+       * whitespace, or timeout conversion's wrapping grammar. */
+      if (!number->invalid && !number->fraction && !number->trailing_space &&
+          (!number->digits || (!number->timeout && number->whole == 0)))
+        *templates[i] = number->negative ? 2 : 1;
+    }
+  } else {
+    scan->number_scalar = scan->timeout_scalar = scan->payload_scalar = 0;
+  }
+  scan->multiple_parameters |= scan->parameter != NULL;
+  scan->parameter = word;
+  scan->parameter_length = length;
+  scan->parameter_prefix = scan->literal_count;
+  scan->parameter_unquoted |= !quoted;
   if (scan->operand)
     scan->attached_dynamic = true;
   else
     scan->unresolved = true;
 }
 
+/* A process substitution supplies a nonempty pathname containing '/'. Project
+ * that invariant byte without resolving its descriptor or executing its body.
+ * Integer operands cannot contain it; timeout conversion may already be final.
+ * Unquoted scalars can split into earlier arguments, so do not infer a whole
+ * operand failure across such a fragment. */
+static inline SHELL_NONNULL(1) void shell_builtin_read_process(void *context) {
+  shell_builtin_read_option_t *scan = context;
+  shell_builtin_read_option_byte('/', scan);
+  if (!scan->parameter && !scan->process_path) {
+    shell_builtin_read_number_prefix(&scan->number);
+    shell_builtin_read_number_prefix(&scan->timeout);
+    shell_builtin_read_number_prefix(&scan->payload);
+  }
+  scan->number_scalar = scan->timeout_scalar = scan->payload_scalar = 0;
+  scan->process_path = true;
+}
+
 static inline SHELL_NONNULL(1, 3) bool shell_builtin_read_scan_word(
     const char *word, size_t length, shell_builtin_read_option_t *scan) {
   *scan = (shell_builtin_read_option_t){.valid = true,
                                         .timeout = {.timeout = true}};
-  return shell_builtin_visit_single_word(word, length,
-                                         shell_builtin_read_option_byte,
-                                         shell_builtin_read_dynamic, scan);
+  return shell_builtin_visit_word_impl(
+      word, length, shell_builtin_read_option_byte, shell_builtin_read_dynamic,
+      scan, false, shell_builtin_read_process);
 }
 
 /* `test`/`[` variable-existence operands can re-evaluate an array subscript,
@@ -1048,7 +1330,13 @@ static inline SHELL_NONNULL(2) bool shell_builtin_test_byte(unsigned char byte,
   return true;
 }
 
-static inline SHELL_NONNULL(1) void shell_builtin_test_dynamic(void *context) {
+static inline SHELL_NONNULL(4) void shell_builtin_test_dynamic(const char *word,
+                                                               size_t length,
+                                                               bool quoted,
+                                                               void *context) {
+  (void)word;
+  (void)length;
+  (void)quoted;
   shell_builtin_test_scan_t *scan = context;
   scan->dynamic = true;
 }
@@ -1335,7 +1623,8 @@ static inline SHELL_NONNULL(1) bool shell_builtin_test_unsupported(
          (state->phase == SHELL_TEST_LOOKAHEAD && state->head.dynamic);
 }
 
-/* Consume complete logical argv words once, omitting redirects. TARGET records
+/* Consume complete logical argv words once. Callers omit redirects and wholly
+ * elided words; quoted empty arguments remain. TARGET records
  * -v or %n operands (ATTACHED skips two decoded option bytes). FORMAT|WRITE
  * commits the latest -v target; TARGET|WRITE identifies a current %n operand.
  * A compiled schedule handles format reuse in constant time per data word.
@@ -1435,8 +1724,12 @@ static inline SHELL_NONNULL(1, 2) unsigned shell_builtin_printf_word(
         state->phase =
             scan.target.valid ? SHELL_PRINTF_OPTIONS : SHELL_PRINTF_ERROR;
         return SHELL_BUILTIN_ROLE_TARGET | SHELL_BUILTIN_ROLE_ATTACHED |
-               ((shell_builtin_variable_properties(&scan.target) &
-                 (SHELL_VARIABLE_INTEGER | SHELL_VARIABLE_FROZEN))
+               (((shell_builtin_variable_properties(&scan.target) &
+                  SHELL_VARIABLE_INTEGER) &&
+                 !(shell_builtin_variable_properties(&scan.target) &
+                   SHELL_VARIABLE_DESPECIALIZES_ON_UNSET)) ||
+                        (shell_builtin_variable_properties(&scan.target) &
+                         SHELL_VARIABLE_FROZEN)
                     ? SHELL_BUILTIN_ROLE_UNSUPPORTED
                     : 0);
       } else
@@ -1498,27 +1791,124 @@ static inline SHELL_NONNULL(3) unsigned shell_builtin_read_target(
 
 static inline SHELL_NONNULL(1, 2) unsigned shell_builtin_read_word(
     shell_builtin_read_t *state, const char *word, size_t length) {
+  state->fd_kind = 0;
+  state->parameter = NULL;
+  state->parameter_length = 0;
+  state->parameter_identity = false;
+  if (shell_source_word_is_elided(word, length))
+    return 0;
   unsigned phases[2] = {state->writing, state->polling};
   unsigned next[2] = {0};
   unsigned roles = 0;
   shell_builtin_read_option_t scan = {0};
+  bool projected = false;
   unsigned option_phases = SHELL_READ_OPTIONS | SHELL_READ_DATA |
-                           SHELL_READ_NUMBER | SHELL_READ_TIMEOUT;
+                           SHELL_READ_NUMBER | SHELL_READ_TIMEOUT |
+                           SHELL_READ_FD;
+  unsigned target_phases = SHELL_READ_TARGETS | SHELL_READ_POSITIONAL;
   if ((phases[0] | phases[1]) & option_phases) {
-    if (!shell_builtin_read_scan_word(word, length, &scan))
-      return SHELL_BUILTIN_ROLE_UNSUPPORTED;
+    projected = shell_builtin_read_scan_word(word, length, &scan);
+    if (!projected) {
+      scan = (shell_builtin_read_option_t){.valid = true,
+                                           .timeout = {.timeout = true}};
+      if (!shell_builtin_visit_word_impl(word, length,
+                                         shell_builtin_read_option_byte,
+                                         shell_builtin_read_dynamic, &scan,
+                                         true, shell_builtin_read_process) ||
+          scan.multiple_parameters ||
+          !((scan.literal_count && !scan.target_invalid && !scan.option) ||
+            (scan.literal_count == scan.parameter_prefix &&
+             (((phases[0] | phases[1]) & SHELL_READ_FD) ||
+              (scan.operand && scan.operand_kind == SHELL_READ_FD)))))
+        return SHELL_BUILTIN_ROLE_UNSUPPORTED;
+      projected = true;
+    }
     if (((phases[0] | phases[1]) & SHELL_READ_OPTIONS) &&
-        (scan.unresolved || scan.array || scan.readline))
-      return SHELL_BUILTIN_ROLE_UNSUPPORTED;
+        (scan.array || scan.readline))
+      roles |= SHELL_BUILTIN_ROLE_READ_CONTEXT;
+    if (((phases[0] | phases[1]) & SHELL_READ_OPTIONS) && scan.unresolved) {
+      size_t begin, end;
+      bool projected_target =
+          scan.literal_count && !scan.target_invalid && !scan.option;
+      bool invalid_target = !scan.parameter_unquoted && scan.position &&
+                            !scan.option &&
+                            !(scan.target_shapes & SHELL_READ_TARGET_ACCEPT);
+      if (!invalid_target &&
+          (!scan.parameter || scan.multiple_parameters ||
+           (!projected_target && (!((phases[0] | phases[1]) & SHELL_READ_FD) ||
+                                  scan.literal_count)) ||
+           !shell_source_parse_named_fd_parameter(
+               scan.parameter, 0, scan.parameter_length, &begin, &end)))
+        return SHELL_BUILTIN_ROLE_UNSUPPORTED;
+      /* A literal identifier plus one scalar can be resolved as a target
+       * using graph-captured emptiness. Do not guess options from arbitrary
+       * runtime text; source-only consumers require the graph context. */
+      if (!invalid_target)
+        roles |= SHELL_BUILTIN_ROLE_READ_CONTEXT;
+    }
+  } else if (phases[0] & target_phases) {
+    /* Targets are not options. Project exact scalar references for the graph
+     * without rejecting other dynamic targets that retain conservative writes.
+     * A failed visitor may have reported a prefix, never a complete value. */
+    scan = (shell_builtin_read_option_t){.valid = true,
+                                         .timeout = {.timeout = true}};
+    projected = shell_builtin_visit_word_impl(
+        word, length, shell_builtin_read_option_byte,
+        shell_builtin_read_dynamic, &scan, true, shell_builtin_read_process);
+    if (!projected)
+      scan = (shell_builtin_read_option_t){0};
   }
   bool target = ((phases[0] | phases[1]) &
                  (SHELL_READ_TARGETS | SHELL_READ_POSITIONAL)) ||
                 (((phases[0] | phases[1]) & SHELL_READ_OPTIONS) &&
                  (!scan.option || scan.position < 2));
-  shell_builtin_variable_t variable = target
+  bool single_argument = projected && !scan.parameter_unquoted;
+  bool invalid_target =
+      single_argument && !(scan.target_shapes & SHELL_READ_TARGET_ACCEPT);
+  shell_builtin_variable_t variable = target && !invalid_target
                                           ? shell_builtin_variable(word, length)
                                           : SHELL_BUILTIN_VARIABLE_INVALID;
   bool dynamic = scan.unresolved || scan.attached_dynamic;
+  bool full_fd = ((phases[0] | phases[1]) & SHELL_READ_FD) != 0;
+  bool attached_fd = ((phases[0] | phases[1]) & SHELL_READ_OPTIONS) &&
+                     scan.operand_kind == SHELL_READ_FD &&
+                     (scan.attached_static || scan.attached_dynamic);
+  /* A syntactically possible FD role with an invalid whole numeric prefix
+   * cannot select a descriptor. Its scalar value may still refine a target
+   * on the other role path; do not discard that capture with the FD role. */
+  bool parameter_identity =
+      (full_fd && shell_builtin_read_number_value(&scan.number, dynamic,
+                                                  single_argument) !=
+                      SHELL_READ_VALUE_INVALID) ||
+      (attached_fd && shell_builtin_read_number_value(
+                          &scan.payload, scan.attached_dynamic,
+                          single_argument) != SHELL_READ_VALUE_INVALID);
+  if ((((phases[0] | phases[1]) & (option_phases & ~SHELL_READ_DATA)) ||
+       (phases[0] & target_phases)) &&
+      scan.parameter && !scan.multiple_parameters &&
+      (!parameter_identity || scan.literal_count == scan.parameter_prefix ||
+       (full_fd ? scan.number_scalar : scan.payload_scalar))) {
+    size_t begin, end;
+    if (shell_source_parse_named_fd_parameter(
+            scan.parameter, 0, scan.parameter_length, &begin, &end)) {
+      state->parameter = scan.parameter + begin;
+      state->parameter_length = end - begin;
+      state->parameter_identity = parameter_identity;
+    }
+  }
+  if (full_fd || attached_fd) {
+    const shell_builtin_read_number_t *number =
+        attached_fd ? &scan.payload : &scan.number;
+    unsigned value =
+        shell_builtin_read_number_value(number, dynamic, single_argument);
+    state->fd_kind = value == SHELL_READ_VALUE_UNKNOWN   ? 2u
+                     : value == SHELL_READ_VALUE_INVALID ? 0u
+                                                         : 1u;
+    state->fd_number = (uint32_t)number->whole;
+  }
+  bool can_disappear = scan.parameter_unquoted && !scan.literal_count &&
+                       !scan.process_path &&
+                       !shell_builtin_word_guarantees_argument(word, length);
   for (unsigned mode = 0; mode < 2; mode++) {
     if (phases[mode] & (SHELL_READ_TARGETS | SHELL_READ_POSITIONAL))
       roles |= shell_builtin_read_target(variable, mode, next);
@@ -1526,13 +1916,24 @@ static inline SHELL_NONNULL(1, 2) unsigned shell_builtin_read_word(
       shell_builtin_read_operand(SHELL_READ_DATA, SHELL_READ_VALUE_UNKNOWN,
                                  mode, next);
     if (phases[mode] & SHELL_READ_NUMBER)
-      shell_builtin_read_operand(
-          SHELL_READ_NUMBER,
-          shell_builtin_read_number_value(&scan.number, dynamic), mode, next);
+      shell_builtin_read_operand(SHELL_READ_NUMBER,
+                                 shell_builtin_read_number_value(
+                                     &scan.number, dynamic, single_argument),
+                                 mode, next);
+    if (phases[mode] & SHELL_READ_FD)
+      shell_builtin_read_operand(SHELL_READ_FD,
+                                 shell_builtin_read_number_value(
+                                     &scan.number, dynamic, single_argument),
+                                 mode, next);
+    /* A bare unquoted parameter can disappear when empty. Preserve its pending
+     * operand/target phase; graph versions resolve the captured entry value. */
+    if (can_disappear)
+      next[mode] |= phases[mode] & (SHELL_READ_FD | target_phases);
     if (phases[mode] & SHELL_READ_TIMEOUT)
-      shell_builtin_read_operand(
-          SHELL_READ_TIMEOUT,
-          shell_builtin_read_number_value(&scan.timeout, dynamic), mode, next);
+      shell_builtin_read_operand(SHELL_READ_TIMEOUT,
+                                 shell_builtin_read_number_value(
+                                     &scan.timeout, dynamic, single_argument),
+                                 mode, next);
     if (!(phases[mode] & SHELL_READ_OPTIONS))
       continue;
     if (!scan.option || scan.position < 2)
@@ -1543,10 +1944,11 @@ static inline SHELL_NONNULL(1, 2) unsigned shell_builtin_read_word(
         next[mode] |= SHELL_READ_POSITIONAL;
     } else if (scan.operand) {
       if (scan.attached_static || scan.attached_dynamic)
-        shell_builtin_read_operand(scan.operand_kind,
-                                   shell_builtin_read_number_value(
-                                       &scan.payload, scan.attached_dynamic),
-                                   mode, next);
+        shell_builtin_read_operand(
+            scan.operand_kind,
+            shell_builtin_read_number_value(
+                &scan.payload, scan.attached_dynamic, single_argument),
+            mode, next);
       if (!scan.attached_static)
         next[mode] |= scan.operand_kind;
     } else
@@ -1614,8 +2016,10 @@ static inline SHELL_NONNULL(1, 2) unsigned shell_builtin_unset_word(
     return 0;
   unsigned roles = SHELL_BUILTIN_ROLE_TARGET;
   shell_builtin_variable_t variable = shell_builtin_variable(word, length);
-  if (variable == SHELL_BUILTIN_VARIABLE_STATIC ||
-      variable == SHELL_BUILTIN_VARIABLE_ARITHMETIC)
+  unsigned properties = shell_builtin_name_properties(word, length);
+  if ((variable == SHELL_BUILTIN_VARIABLE_STATIC ||
+       variable == SHELL_BUILTIN_VARIABLE_ARITHMETIC) &&
+      !(properties & SHELL_VARIABLE_UNSET_REJECTED))
     roles |= SHELL_BUILTIN_ROLE_WRITE;
   else if (variable == SHELL_BUILTIN_VARIABLE_DYNAMIC)
     roles |= SHELL_BUILTIN_ROLE_WRITE | SHELL_BUILTIN_ROLE_DYNAMIC;

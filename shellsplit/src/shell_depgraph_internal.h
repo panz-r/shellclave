@@ -64,14 +64,35 @@ size_t shell_dep_file_path_normalize(char *path, size_t length)
     SHELL_NONNULL(1);
 
 #ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+/* Exercise the private append-only AVL contract at full capacity. Existing
+ * keys remain discoverable; absent insertions leave every link and height
+ * byte, as well as the root, unchanged. Test builds only. */
+bool shellsplit_test_index_capacity_contract(void);
 /* Exercise valid immutable state construction with 2..SHELL_DEP_MAX_NODES
  * roots. workspace has shell_dep_workspace_size() bytes at its required
  * alignment and is exclusively borrowed for this test operation. */
 bool shellsplit_test_route_state_contract(void *workspace, uint32_t count)
     SHELL_NONNULL(1);
+/* Same workspace contract; check process-allocation predicates against an
+ * independent finite FD-table oracle, including original low-end fallback. */
+bool shellsplit_test_process_domain_contract(void *workspace) SHELL_NONNULL(1);
+/* Same workspace contract; independent rank, low-open, observation, mutation,
+ * and allocation/close/reuse sequence checks for the shared symbolic domain. */
+bool shellsplit_test_allocation_domain_contract(void *workspace)
+    SHELL_NONNULL(1);
+/* Same workspace contract; finite-table checks of selector retirement,
+ * close/reuse identity and scratch collection with multiple live roots. */
+bool shellsplit_test_selector_lifecycle_contract(void *workspace)
+    SHELL_NONNULL(1);
+/* Same workspace contract; force four-way memo collisions, eviction and reset
+ * with valid completed descriptor predicates. */
+bool shellsplit_test_memo_cache_contract(void *workspace) SHELL_NONNULL(1);
 /* Test-only differential oracle: execute the ordered cleanup program without
  * segment-cache reuse. The setting is local to the calling test thread. */
 void shellsplit_test_failure_cleanup_reference(bool enabled);
+/* Differential oracle: rebuild the materialized union instead of reconciling
+ * immutable deltas. Thread-local and absent from shipping builds. */
+void shellsplit_test_materialization_reference(bool enabled);
 #endif
 
 #endif

@@ -41,20 +41,48 @@ shell_control_syntax_t shell_tokenizer_control_syntax(const char *input,
  * one-command semantic model. This includes active parameter writes, prompt
  * re-evaluation, actual indirect dereferencing, test/[ variable-name
  * re-evaluation and shell-option mutations;
- * ordinary parameter data and prefix-name enumeration remain supported. */
+ * ordinary parameter data and prefix-name enumeration remain supported.
+ * Source-only consumers conservatively reject read option ambiguities which
+ * graph construction can resolve from captured descriptor-variable values. */
 bool shell_tokenizer_has_unsupported_semantics(const char *input,
                                                size_t input_length);
 
-/* The same semantic boundary with a token observer. The observer receives
- * each lexical token, including tokens in executable expansion bodies, during
- * the existing traversal. It must not mutate or retain scanner-local storage;
- * token source spans borrow the immutable input. No additional source pass is
- * performed. context is required caller-owned observer storage. */
+/* The same semantic boundary with token, read-FD and process observers. The
+ * token observer receives each lexical token, including executable expansion
+ * bodies, during the existing traversal. It must not mutate or retain
+ * scanner-local storage; token source spans borrow the immutable input. No
+ * additional source pass is performed. context is required caller-owned
+ * observer storage. */
 typedef void (*shell_semantic_token_observer_t)(const shell_token_t *token,
                                                 void *context);
-bool shell_tokenizer_inspect_semantics(const char *input, size_t input_length,
-                                       shell_semantic_token_observer_t observer,
-                                       void *context) SHELL_NONNULL(1, 3, 4);
+/* The same traversal reports possible -u operands (kind 1 static, 2 dynamic;
+ * 0 means none, 3 observes default stdin access), and parameter fragments
+ * affecting option-operand roles.
+ * parameter is an exact borrowed identifier span, or NULL with length zero
+ * when no exact scalar name is present. identity distinguishes descriptor
+ * identity from an empty/nonempty value observation. word points at the read
+ * command (kind 3) or operand in the immutable input, allowing lifetime
+ * indexing without a second source traversal. Graph inspection defers
+ * narrowly marked read ambiguities to its captured-value validation boundary;
+ * every other unsupported feature is still rejected here. */
+typedef void (*shell_semantic_read_fd_observer_t)(const char *word, uint32_t fd,
+                                                  unsigned kind,
+                                                  const char *parameter,
+                                                  size_t parameter_length,
+                                                  bool identity, void *context);
+/* One complete process-expansion span per occurrence, including expansions
+ * hidden inside parameter words. Called before its body is inspected, during
+ * the same traversal; quoting/comments and literal heredocs are respected.
+ * Empty bodies are reported too, so consumers can classify them consistently.
+ * word borrows the immutable source and context is caller-owned storage. */
+typedef void (*shell_semantic_process_observer_t)(const char *word,
+                                                  size_t length, void *context);
+bool shell_tokenizer_inspect_semantics(
+    const char *input, size_t input_length,
+    shell_semantic_token_observer_t observer,
+    shell_semantic_read_fd_observer_t read_fd,
+    shell_semantic_process_observer_t process, void *context)
+    SHELL_NONNULL(1, 3, 4, 5, 6);
 
 /* Whole-source validation boundary: reject embedded NUL, invalid control/DEL
  * and raw high bytes before inspecting list syntax, including bytes in skipped
@@ -125,12 +153,9 @@ static inline SHELL_NONNULL(1) bool shell_tokenizer_token_continues_word(
   size_t gap = token->position - end;
   const char *text = token->start - gap;
   for (size_t i = 0; i < gap;) {
-    if (text[i] != '\\' || i + 1 >= gap ||
-        (text[i + 1] != '\n' && text[i + 1] != '\r'))
+    if (text[i] != '\\' || i + 1 >= gap || text[i + 1] != '\n')
       return false;
     i += 2;
-    if (text[i - 1] == '\r' && i < gap && text[i] == '\n')
-      i++;
   }
   return true;
 }

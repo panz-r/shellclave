@@ -222,14 +222,8 @@ jobs:
           -DSHELLCLAVE_COVERAGE_VARIANT=production
       - run: >-
           cmake --build build --parallel 2 --target
-          shellsplit_fast_parser_production_test
-          shellsplit_depgraph_production_test
-          shellsplit_descriptor_move_production_test
-          shellsplit_production_semantics_test
-          shellsplit_corpus_production_test
-          shelltype_public_contract_production
-          shellgate_corpus_production_test
-      - run: ctest --test-dir build -R production --output-on-failure
+          shellclave_production_tests
+      - run: ctest --test-dir build -L '^production$' --no-tests=error --output-on-failure
       - name: Report production implementation coverage
         run: |
           for component in shellsplit shelltype shellgate; do

@@ -359,7 +359,7 @@ static void test_parameter_expansion_metadata(void) {
       {"printf ${#}", SHELL_ABSTRACT_SV, "#"},
       {"printf ${!}", SHELL_ABSTRACT_SV, "!"},
       {"printf $\\\n{#}", SHELL_ABSTRACT_SV, "#"},
-      {"printf $\\\r\n{!}", SHELL_ABSTRACT_SV, "!"},
+      {"printf $\\\n{!}", SHELL_ABSTRACT_SV, "!"},
       {"printf \"$\\\n{#}\"", SHELL_ABSTRACT_SV, "#"},
       {"printf ${#?}", SHELL_ABSTRACT_SV, "?"},
       {"printf ${!prefix*}", SHELL_ABSTRACT_EV, NULL},
@@ -682,7 +682,7 @@ static void test_abstraction_allocation_failures(void) {
       "time printf \"pre$\\\n(id)$VALUE\"",
       "time printf \"$VALUE$((1 + 2))\"",
       "time printf pre$((1))$((2))$VALUE",
-      "time printf $\\\n(\\\r\n(1 + 2)\\\n)$VALUE",
+      "time printf $\\\n(\\\n(1 + 2)\\\n)$VALUE",
       "time printf x${VALUE:-$((1 + 2))}*",
       "time printf >x$VALUE$((1))",
   };

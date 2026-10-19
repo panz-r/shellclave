@@ -26,10 +26,15 @@ typedef struct {
    * source, not a command string that callers can safely reparse. */
   const char *original_command;
   // Token text points into original_command, and positions are relative to it.
-  shell_token_t *shell_tokens;        // Shell operators and redirections
-  size_t shell_token_count;           // Number of shell tokens
-  shell_token_t *command_tokens;      // Command arguments only
-  size_t command_token_count;         // Number of command arguments
+  shell_token_t *shell_tokens; // Shell operators and redirections
+  size_t shell_token_count;    // Number of shell tokens
+  /* Complete lexical argument words, not expanded argv. Empty process words
+   * remain here; canonical rendering omits them and removes empty process
+   * fragments in surviving words. Quoted empty arguments are preserved.
+   * command_token_count therefore does not establish canonical argv presence.
+   */
+  shell_token_t *command_tokens;
+  size_t command_token_count;
   bool has_pipe_input;                // Has pipe input (| or |&)
   bool has_pipe_output;               // Has pipe output (| or |&)
   shell_pipe_mode_t pipe_output_mode; // stdout or stdout+stderr pipe output
@@ -140,13 +145,14 @@ typedef struct {
  * this array, not the source fast-parser ranges. For an empty group,
  * first_command is the number of retained commands preceding its source
  * interval (possibly command_count at the end of the collection).
- * An argv-less redirect-only
- * operation, such as `>output`, has no `shell_command_info_t` entry. Inspect
- * the dependency graph, or paired anomaly netsequences (an empty raw record
- * paired with a typed record containing empty argv[0]), when a caller needs
- * every structural source stage. `commands` is NULL exactly when
- * `command_count` is zero and is therefore never an
- * authorization-complete view of the source on its own. Group-attached I/O
+ * A statically argv-less operation, such as `>output` or a stage made entirely
+ * of empty process words (`<() >()`), has no `shell_command_info_t` entry.
+ * Quoted empty words remain arguments; runtime expansions are not evaluated
+ * to decide presence. Use the dependency graph or paired anomaly netsequences
+ * (an empty raw record paired with a typed record containing empty argv[0])
+ * when every structural source stage is needed. `commands` is NULL exactly
+ * when `command_count` is zero. This array alone is not an
+ * authorization-complete view of the source. Group-attached I/O
  * and external pipeline state are represented by ordered
  * `group_io_ops`, never attributed to the final enclosed command. Several
  * operations may share a group index and preserve source order; paired
@@ -194,14 +200,16 @@ typedef struct {
  * valid independently of command_line. Use shell_render_netargv_buffer() for
  * the canonical processed-subcommand representation. This legacy flat API
  * retains every lexical simple-command record, including a valid argv-less
- * redirect-only operation with command_token_count == 0. Its empty rendering
+ * redirect-only operation with command_token_count == 0 and wholly elided
+ * process-word stages with nonzero lexical token counts. Their empty rendering
  * is diagnostic metadata, not an executable netargv or policy input. The
  * structured API omits those records, while paired anomaly netsequences retain
  * their explicit empty-stage sentinel for callers that need every stage.
  *
  * For a complete supported compound group, it uses the structured group model
  * to omit group-owned redirect operands from returned text while retaining
- * their redirection flags; independent redirect-only stages remain explicit.
+ * their redirection flags on the final member with a surviving argument;
+ * independent argv-less stages remain explicit.
  * It otherwise retains the full tokenizer's tolerant lexical handling for
  * incomplete parenthesized source, but rejects impossible list-operator chains
  * just like the structured APIs. shell_process_commands() requires a complete
@@ -248,8 +256,9 @@ void shell_command_infos_free(shell_command_info_t *infos, size_t count);
 
 /* Receives one decoded byte from an already-isolated shell word. Returning
  * false stops traversal successfully after the current byte. The callback
- * observes syntactic decoding only: it does not evaluate parameter expansion,
- * command substitution, globbing, or other runtime shell semantics. */
+ * observes syntactic decoding only, including elision of statically empty
+ * process-substitution fragments. It does not execute substitutions or
+ * evaluate parameter expansion, globbing, or other runtime shell semantics. */
 typedef bool (*shell_decoded_word_visitor_t)(unsigned char byte,
                                              size_t decoded_offset,
                                              void *context);
@@ -262,17 +271,24 @@ typedef bool (*shell_decoded_word_visitor_t)(unsigned char byte,
  * delivered prefix length. Non-ASCII ANSI-C Unicode escapes (`\u` / `\U`)
  * return SHELL_PROCESS_EPARSE: their bytes depend on the execution locale,
  * which is not part of the supported shell contract. ASCII Unicode and byte
- * escapes remain supported; literal non-ASCII bytes are not restricted. */
+ * escapes remain supported; literal non-ASCII bytes are not restricted.
+ * Statically empty process substitutions contribute no bytes (`a<()b` decodes
+ * to `ab`); nonempty substitutions retain source spelling. A zero-length
+ * decoded payload does not determine argv presence: quoted empty fragments
+ * preserve an argument, unlike an unquoted wholly elided process word. */
 shell_process_status_t
 shell_visit_decoded_word(const char *text, size_t length,
                          shell_decoded_word_visitor_t visitor, void *context,
                          size_t *decoded_length) SHELL_NONNULL(1, 5);
 
 /** Visit a complete generic word only when its value is statically determined.
- * Quote removal, escapes, and ANSI-C quotes are decoded; parameter, command,
- * arithmetic, glob, brace, process, and tilde expansion make the word
- * non-static. This context-free helper does not classify assignment-shaped
- * argument/FILE-operand expansion (e.g. Bash's `name=~`); semantic consumers
+ * Quote removal, escapes, and ANSI-C quotes are decoded, and statically empty
+ * process-substitution fragments are elided. Parameter, command, arithmetic,
+ * glob, brace, nonempty process, and tilde expansion make the word non-static.
+ * A static zero-length payload does not determine whether argv retains the
+ * word; quoted empty fragments preserve an argument. This context-free helper
+ * does not classify assignment-shaped argument/FILE-operand expansion (e.g.
+ * Bash's `name=~`); semantic consumers
  * must establish the word's expansion context separately. Returns false for
  * a dynamic, malformed, or invalid word. The visitor and decoded_length have
  * the same semantics as above. */
@@ -282,8 +298,9 @@ bool shell_visit_static_word(const char *text, size_t length,
     SHELL_NONNULL(1, 5);
 
 /** Measure the decoded payload of one already-isolated shell word, assembling
- * quote fragments and escapes. This is not shell tokenization: callers must
- * isolate the word before calling it. */
+ * quote fragments and escapes, with the empty process-fragment elision
+ * described by shell_visit_decoded_word(). This is not shell tokenization:
+ * callers must isolate the word before calling it. */
 shell_process_status_t shell_measure_decoded_word(const char *text,
                                                   size_t length,
                                                   size_t *decoded_length)
@@ -291,30 +308,35 @@ shell_process_status_t shell_measure_decoded_word(const char *text,
 
 /** Write the decoded payload of one already-isolated shell word into caller
  * storage. The destination is a byte buffer, not a C string; it must provide
- * at least the length returned by shell_measure_decoded_word(). */
+ * at least the length returned by shell_measure_decoded_word(). Decoding and
+ * empty process-fragment elision match shell_visit_decoded_word(). */
 shell_process_status_t
 shell_write_decoded_word(const char *text, size_t length, char *destination,
                          size_t destination_size, size_t *written)
     SHELL_NONNULL(1, 3, 5);
 
 /** Measure one isolated shell word for canonical argv. Ordinary shell quotes
- * and escapes are removed, while executable substitution and arithmetic
+ * and escapes are removed, and statically empty process-substitution fragments
+ * contribute no bytes. Nonempty executable substitutions and arithmetic
  * fragments retain their exact source spelling so they remain inspectable and
- * syntactically unambiguous. */
+ * syntactically unambiguous. Measuring zero bytes does not determine argv
+ * presence; quoted empty fragments still preserve an argument. */
 shell_process_status_t shell_measure_processed_word(const char *text,
                                                     size_t length,
                                                     size_t *processed_length)
     SHELL_NONNULL(1, 3);
 
 /** Write one word measured by shell_measure_processed_word(). The destination
- * is a byte buffer, not a C string. */
+ * is a byte buffer, not a C string. Empty process-fragment elision matches the
+ * measure operation. */
 shell_process_status_t
 shell_write_processed_word(const char *text, size_t length, char *destination,
                            size_t destination_size, size_t *written)
     SHELL_NONNULL(1, 3, 5);
 
 /** Decode one already-isolated shell word into an owned, NUL-terminated byte
- * buffer, assembling quote fragments and escapes. The decoded payload may
+ * buffer, assembling quote fragments and escapes and eliding statically empty
+ * process fragments as described by shell_visit_decoded_word(). The payload may
  * itself contain NUL bytes, so consumers must use `decoded_length` rather
  * than C-string operations to inspect it. Prefer the measure/write pair when
  * the decoded bytes will be written directly into another representation. */

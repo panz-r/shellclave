@@ -39,6 +39,34 @@ shell_process_status_t
 shell_anomaly_stages_parse(const char *command_line, size_t command_length,
                            const shell_process_limits_t *limits,
                            shell_anomaly_stages_t *stages) SHELL_NONNULL(1, 4);
+
+/* Construct the same owned stages after complete semantic graph acceptance.
+ * The caller has successfully constructed a nontruncated graph from exactly
+ * these immutable source bytes, including contextual read-option validation.
+ * No byte, grammar, or supported-semantics validation is repeated here.
+ * Construction still checks resource limits and allocation failures. stages
+ * must be empty; it remains empty on failure. Source stays alive and unchanged
+ * until the stages are freed. This is not valid for a partial/error graph. */
+shell_process_status_t shell_anomaly_stages_collect_prevalidated(
+    const char *command_line, size_t command_length,
+    const shell_process_limits_t *limits, shell_anomaly_stages_t *stages)
+    SHELL_NONNULL(1, 4);
+
+/* Render a collected, unchanged stage view without reparsing its source.
+ * Stages and their borrowed source remain live throughout rendering. Output
+ * buffers are distinct and empty, and remain empty on failure; count is zero
+ * on failure. limits may be NULL for defaults. Encoded byte limits apply to
+ * each output; the collector has already enforced the group-I/O budget.
+ * Executable-name decoding and empty-executable rejection remain renderer
+ * operations. The paired form publishes both outputs atomically. */
+shell_process_status_t shell_build_command_netseq_from_stages(
+    const shell_anomaly_stages_t *stages, const shell_process_limits_t *limits,
+    shell_netstring_buffer_t *sequence, size_t *subcommand_count)
+    SHELL_NONNULL(1, 3, 4);
+shell_process_status_t shell_build_anomaly_netseqs_from_stages(
+    const shell_anomaly_stages_t *stages, const shell_process_limits_t *limits,
+    shell_netstring_buffer_t *command, shell_netstring_buffer_t *type,
+    size_t *subcommand_count) SHELL_NONNULL(1, 3, 4, 5);
 void shell_anomaly_stages_free(shell_anomaly_stages_t *stages);
 
 /* Validate that complete source is representable by Shellsplit's semantic

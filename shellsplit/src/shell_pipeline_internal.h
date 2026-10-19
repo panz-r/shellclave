@@ -123,8 +123,8 @@ static SHELL_NONNULL(1, 3, 4) inline void shell_pipeline_index_connectors(
       break;
     }
     if (list) {
-      bool newline = token.type == SHELL_TOKEN_SEMICOLON &&
-                     (token.start[0] == '\n' || token.start[0] == '\r');
+      bool newline =
+          token.type == SHELL_TOKEN_SEMICOLON && (token.start[0] == '\n');
       /* A physical newline after a binary list operator is continuation,
        * not a new list. The lexical API still exposes that newline token. */
       if (newline &&
@@ -323,7 +323,7 @@ static SHELL_NONNULL(1, 3, 4, 6, 7) inline shell_source_compound_tail_t
     /* A trimmed fast fragment can end on the escape of a physical newline.
      * Start the tail scan at that escape, not in the middle of its spelling. */
     if (*end != 0 && *end < length && source[*end - 1] == '\\' &&
-        (source[*end] == '\n' || source[*end] == '\r'))
+        (source[*end] == '\n'))
       (*end)--;
     tail = shell_source_parse_compound_tail(source, length, *end);
     *end = (uint32_t)tail.redirect_end;

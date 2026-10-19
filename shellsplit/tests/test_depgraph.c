@@ -507,16 +507,24 @@ TEST(supplied_fast_graph_equivalence) {
   ASSERT(graph.status == SHELL_DEP_STATUS_TRUNCATED && graph.node_count == 0 &&
          graph.edge_count == 0 && shell_dep_graph_validate(&graph).valid);
 
-  const char *whitespace = " \t\n\r";
+  const char *whitespace = " \t\n";
   ASSERT(shell_parse_fast(whitespace, strlen(whitespace), &strict, &prefix) ==
-         SHELL_EPARSE);
+         SHELL_OK);
   ASSERT(shell_dep_graph_parse_with_fast(whitespace, strlen(whitespace), ".",
                                          NULL, &prefix,
                                          &graph) == SHELL_DEP_OK);
   ASSERT(graph.status == SHELL_DEP_STATUS_OK && !graph.node_count &&
          !graph.edge_count);
-  ASSERT(parse("\v", &graph) == SHELL_DEP_EPARSE);
-  ASSERT(parse("\f", &graph) == SHELL_DEP_EPARSE);
+  const char *nonblank = " \t\n\r";
+  ASSERT(shell_parse_fast(nonblank, strlen(nonblank), &strict, &prefix) ==
+         SHELL_OK);
+  ASSERT(prefix.count == 1);
+  ASSERT(shell_dep_graph_parse_with_fast(nonblank, strlen(nonblank), ".", NULL,
+                                         &prefix, &graph) == SHELL_DEP_OK);
+  ASSERT(graph.status == SHELL_DEP_STATUS_OK && graph.node_count &&
+         shell_dep_graph_validate(&graph).valid);
+  ASSERT(parse("\v", &graph) == SHELL_DEP_OK && graph.node_count);
+  ASSERT(parse("\f", &graph) == SHELL_DEP_OK && graph.node_count);
   pass_count++;
 }
 
@@ -1266,28 +1274,23 @@ TEST(named_fd_unconnected_process_substitution_routes) {
 }
 
 /* Named descriptor spans retain their source spelling, but binding identity
- * must use the same escaped-physical-line-ending rules as syntax parsing.
- * Exercise every accepted spelling against a differently wrapped reference so
- * a local descriptor comparator cannot silently diverge from the parser. */
+ * erases backslash-LF exactly as syntax parsing does. Exercise every accepted
+ * spelling against a differently wrapped reference so a local descriptor
+ * comparator cannot silently diverge from the parser. CR remains a source
+ * byte, including immediately before LF, and never joins an identifier. */
 TEST(named_fd_continuation_identity) {
   static const struct {
     const char *command;
     const char *path;
   } cases[] = {
-      {"exec {f\\\rd}>/tmp/bare-cr-declaration; printf bytes >&$fd",
-       "/tmp/bare-cr-declaration"},
-      {"exec {fd}>/tmp/bare-cr-reference; printf bytes >&$f\\\rd",
-       "/tmp/bare-cr-reference"},
-      {"exec {f\\\r\nd}>/tmp/crlf-declaration; printf bytes >&$fd",
-       "/tmp/crlf-declaration"},
-      {"exec {fd}>/tmp/crlf-reference; printf bytes >&\"${f\\\r\nd}\"",
-       "/tmp/crlf-reference"},
+      {"exec {f\\\nd}>/tmp/lf-declaration; printf bytes >&$fd",
+       "/tmp/lf-declaration"},
+      {"exec {fd}>/tmp/lf-reference; printf bytes >&$f\\\nd",
+       "/tmp/lf-reference"},
+      {"exec {fd}>/tmp/lf-braced-reference; printf bytes >&\"${f\\\nd}\"",
+       "/tmp/lf-braced-reference"},
       {"exec {fd}>/tmp/dollar-lf-reference; printf bytes >&$\\\n{fd}",
        "/tmp/dollar-lf-reference"},
-      {"exec {fd}>/tmp/dollar-crlf-reference; printf bytes >&$\\\r\n{fd}",
-       "/tmp/dollar-crlf-reference"},
-      {"exec {fd}>/tmp/dollar-cr-reference; printf bytes >&$\\\r{fd}",
-       "/tmp/dollar-cr-reference"},
       {"exec {fd}>/tmp/dollar-quoted-reference; printf bytes >&\"$\\\n{fd}\"",
        "/tmp/dollar-quoted-reference"},
   };
@@ -1305,8 +1308,51 @@ TEST(named_fd_continuation_identity) {
            count_doc_kind(&graph, SHELL_DOC_FILE) == 1 &&
            shell_dep_graph_validate(&graph).valid);
   }
+
+  shell_dep_graph_t graph = {0};
+  const char bare_cr_declaration[] = ": {f\\\rd}>/tmp/bare-cr-declaration";
+  ASSERT(parse(bare_cr_declaration, &graph) == SHELL_DEP_OK);
+  ASSERT(count_type(&graph, SHELL_NODE_CMD) == 1 &&
+         find_file_doc(&graph, "/tmp/bare-cr-declaration") >= 0);
+  for (uint32_t edge = 0; edge < graph.edge_count; edge++)
+    ASSERT(graph.edges[edge].source_fd != SHELL_DEP_FD_NAMED &&
+           graph.edges[edge].target_fd != SHELL_DEP_FD_NAMED);
+  ASSERT(shell_dep_graph_validate(&graph).valid);
+
+  const char crlf_declaration[] = ": {f\\\r\n: d}>/tmp/crlf-declaration";
+  ASSERT(parse(crlf_declaration, &graph) == SHELL_DEP_OK);
+  ASSERT(count_type(&graph, SHELL_NODE_CMD) == 2 &&
+         find_file_doc(&graph, "/tmp/crlf-declaration") >= 0);
+  for (uint32_t edge = 0; edge < graph.edge_count; edge++)
+    ASSERT(graph.edges[edge].source_fd != SHELL_DEP_FD_NAMED &&
+           graph.edges[edge].target_fd != SHELL_DEP_FD_NAMED);
+  ASSERT(shell_dep_graph_validate(&graph).valid);
+
+  static const char *const non_named_references[] = {
+      "exec {fd}>/tmp/bare-cr-reference; printf bytes >&$f\\\rd",
+      "exec {fd}>/tmp/dollar-cr-reference; printf bytes >&$\\\r{fd}",
+      "exec {fd}>/tmp/dollar-crlf-reference; printf bytes >&$\\\r\n{fd}",
+  };
+  for (size_t i = 0;
+       i < sizeof(non_named_references) / sizeof(non_named_references[0]);
+       i++) {
+    ASSERT(parse(non_named_references[i], &graph) == SHELL_DEP_OK);
+    int named_document = find_doc(&graph, SHELL_DOC_FILE);
+    int writer = find_nth_cmd(&graph, 1);
+    ASSERT(named_document >= 0 && writer >= 0 &&
+           !has_edge_fds(&graph, SHELL_EDGE_WRITE, (uint32_t)writer,
+                         (uint32_t)named_document, 1, SHELL_DEP_FD_NONE) &&
+           shell_dep_graph_validate(&graph).valid);
+  }
   pass_count++;
 }
+
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+TEST(private_index_capacity_is_failure_atomic) {
+  ASSERT(shellsplit_test_index_capacity_contract());
+  pass_count++;
+}
+#endif
 
 TEST(named_fd_exec_scope_and_lifecycle) {
   shell_dep_graph_t graph = {0};
@@ -1724,9 +1770,9 @@ TEST(named_fd_exec_scope_and_lifecycle) {
       "exec {out}> /tmp/out; out+=shadow; printf bytes >&$out",
       "exec {o}> /tmp/one-char; o=shadow; printf bytes >&$o",
       "exec {out}> /tmp/out; o\\\nut=shadow; printf bytes >&$out",
-      "exec {out}> /tmp/out; o\\\r\nut=shadow; printf bytes >&$out",
+      "exec {out}> /tmp/out; o\\\nut=shadow; printf bytes >&$out",
       "exec {out}> /tmp/out; o\\\nut+=shadow; printf bytes >&$out",
-      "exec {out}> /tmp/out; o\\\r\nut+=shadow; printf bytes >&$out",
+      "exec {out}> /tmp/out; o\\\nut+=shadow; printf bytes >&$out",
       "exec {out}> /tmp/out; unset out; printf bytes >&$out",
       "exec {out}> /tmp/out; un'set' out; printf bytes >&$out",
       "exec {out}> /tmp/out; un'set' 'out'; printf bytes >&$out",
@@ -3717,7 +3763,7 @@ TEST(named_fd_inline_documents_remain_live) {
        SHELL_NODE_GROUP, true},
       {"{ cat; } {f\\\nd}<<<payload", SHELL_DOC_HERESTRING, SHELL_NODE_GROUP,
        true},
-      {"{ cat; } {f\\\r\nd}\\\n<<EOF\npayload\nEOF\n", SHELL_DOC_HEREDOC,
+      {"{ cat; } {f\\\nd}\\\n<<EOF\npayload\nEOF\n", SHELL_DOC_HEREDOC,
        SHELL_NODE_GROUP, true},
   };
 
@@ -3831,7 +3877,7 @@ TEST(named_fd_requires_complete_word_boundary) {
       {"cat ${x}{fd}>out", SHELL_DOC_FILE, false, "${x}{fd}", 2},
       {"cat $(x){fd}>out", SHELL_DOC_FILE, false, "$(x){fd}", 2},
       {"cat {f\\\nd}>out", SHELL_DOC_FILE, true, NULL, 1},
-      {"cat {f\\\r\nd}\\\n>out", SHELL_DOC_FILE, true, NULL, 1},
+      {"cat {f\\\nd}\\\n>out", SHELL_DOC_FILE, true, NULL, 1},
       {"cat {fd} >out", SHELL_DOC_FILE, false, "{fd}", 2},
       {"cat {fd}\t>out", SHELL_DOC_FILE, false, "{fd}", 2},
       {"cat {f d}>out", SHELL_DOC_FILE, false, "{f", 3},
@@ -3990,7 +4036,7 @@ TEST(redirect_only_command_boundary_ownership) {
                       SHELL_DEP_FD_NONE, 3));
   ASSERT(shell_dep_graph_validate(&g).valid);
 
-  ASSERT(parse("cmd >out \\\r\n3<<<data", &g) == SHELL_DEP_OK);
+  ASSERT(parse("cmd >out \\\n3<<<data", &g) == SHELL_DEP_OK);
   echo = find_nth_cmd(&g, 0);
   output = find_doc(&g, SHELL_DOC_FILE);
   document = find_doc(&g, SHELL_DOC_HERESTRING);
@@ -5539,8 +5585,7 @@ TEST(canonical_heredoc_delimiter_contract) {
       {"{ cat; } <<\"E\\qF\"\nbody\nE\\qF\n", 1, 1, "E\\qF"},
       {"{ cat; } <<$'EO\\x46'\nbody\nEOF\n", 1, 1, "$'EO\\x46'"},
       {"{ cat; } <<''\n\n", 1, 1, ""},
-      {"{ cat; } << EOF <<-\"F\"\r\none\r\nEOF\r\n\ttwo\r\n\tF\r\n", 2, 1,
-       "EOF"},
+      {"{ cat; } << EOF <<-\"F\"\r\none\r\nEOF\n\ttwo\r\n\tF\r\n", 2, 1, "EOF"},
   };
 
   for (uint32_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
@@ -6206,6 +6251,80 @@ TEST(file_argument_matrix) {
   pass_count++;
 }
 
+TEST(file_argument_positions) {
+  static const struct {
+    const char *source;
+    const char *arguments[2];
+  } cases[] = {
+      {"/bin/echo hello", {NULL, NULL}},
+      {"<() /bin/echo hello", {NULL, NULL}},
+      {"X=x /bin/echo hello", {NULL, NULL}},
+      {"</dev/null /bin/echo hello", {NULL, NULL}},
+      {"X=x </dev/null <()>() /bin/echo hello", {NULL, NULL}},
+      {"<(# comment\n) >() <() /bin/echo hello", {NULL, NULL}},
+      {"/bin/echo /tmp/input", {"/tmp/input", NULL}},
+      {"<() /bin/echo /tmp/input", {"/tmp/input", NULL}},
+      {"X=x /bin/echo /tmp/input", {"/tmp/input", NULL}},
+      {"</dev/null /bin/echo /tmp/input", {"/tmp/input", NULL}},
+      {"X=x </dev/null <()>() /bin/echo /tmp/input", {"/tmp/input", NULL}},
+      {"/bin/<()echo /tmp/input", {"/tmp/input", NULL}},
+      {"'' /bin/echo /tmp/input", {"/bin/echo", "/tmp/input"}},
+      {"''<() /bin/echo /tmp/input", {"/bin/echo", "/tmp/input"}},
+      {"\"$program\" /bin/echo /tmp/input", {"/bin/echo", "/tmp/input"}},
+      {"$(printf program) /bin/echo /tmp/input", {"/bin/echo", "/tmp/input"}},
+      {"\"$(printf program)\" /tmp/input", {"/tmp/input", NULL}},
+      {"<(printf program) /tmp/input", {"/tmp/input", NULL}},
+      {"command /bin/echo /tmp/input", {"/bin/echo", "/tmp/input"}},
+      {"command <() /bin/echo /tmp/input", {"/bin/echo", "/tmp/input"}},
+      {"builtin printf /tmp/input", {"/tmp/input", NULL}},
+      {"exec <() /bin/echo /tmp/input", {"/bin/echo", "/tmp/input"}},
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    shell_dep_graph_t graph = {0};
+    ASSERT(parse(cases[i].source, &graph) == SHELL_DEP_OK);
+    unsigned seen = 0;
+    for (uint32_t e = 0; e < graph.edge_count; e++) {
+      const shell_dep_edge_t *edge = &graph.edges[e];
+      if (edge->type != SHELL_EDGE_ARG)
+        continue;
+      ASSERT(seen < 2 && cases[i].arguments[seen] != NULL);
+      ASSERT(edge->dir == SHELL_DIR_UNDIR &&
+             graph.nodes[edge->to].type == SHELL_NODE_DOC &&
+             graph.nodes[edge->to].doc.kind == SHELL_DOC_FILE);
+      const shell_dep_doc_t *doc = &graph.nodes[edge->to].doc;
+      ASSERT_STRN_EQ(doc->path, doc->path_len, cases[i].arguments[seen]);
+      seen++;
+    }
+    ASSERT(seen == (unsigned)(cases[i].arguments[0] != NULL) +
+                       (unsigned)(cases[i].arguments[1] != NULL));
+    ASSERT(shell_dep_graph_validate(&graph).valid);
+  }
+
+  /* Token truncation cannot turn argv[0] into an argument or hide a later
+   * pathname merely because its source word could not enter the public array.
+   */
+  static const uint32_t capacities[][3] = {{2, 2, 1}, {3, 3, 1},  {6, 5, 1},
+                                           {6, 6, 2}, {8, 12, 1}, {8, 12, 3}};
+  const char *source = "X=x </dev/null <() /bin/echo /tmp/input";
+  for (size_t i = 0; i < sizeof(capacities) / sizeof(capacities[0]); i++) {
+    shell_dep_limits_t limits = SHELL_DEP_LIMITS_DEFAULT;
+    limits.max_nodes = capacities[i][0];
+    limits.max_edges = capacities[i][1];
+    limits.max_tokens_per_cmd = capacities[i][2];
+    shell_dep_graph_t graph = {0};
+    shell_dep_error_t error = shell_dep_graph_parse(
+        source, strlen(source), "/workspace", &limits, &graph);
+    ASSERT(error == SHELL_DEP_OK || error == SHELL_DEP_ETRUNC);
+    ASSERT(graph.node_count <= limits.max_nodes &&
+           graph.edge_count <= limits.max_edges &&
+           find_file_doc(&graph, "/bin/echo") < 0 &&
+           shell_dep_graph_validate(&graph).valid);
+    if (i >= 4)
+      ASSERT(find_file_doc(&graph, "/tmp/input") >= 0);
+  }
+  pass_count++;
+}
+
 /* --- SUBSHELLS --- */
 
 TEST(subshell_matrix) {
@@ -6225,7 +6344,7 @@ TEST(subshell_matrix) {
       {"cat <(whoami)", 2, 1, 0},
       {"echo $(<file)", 1, 1, 1},
       {"echo $\\\n(whoami)", 2, 1, 0},
-      {"cat <\\\r\n(whoami)", 2, 1, 0},
+      {"cat <\\\n(whoami)", 2, 1, 0},
       {"printf bytes > \\\n>(cat)", 2, 1, 0},
   };
 
@@ -9257,9 +9376,16 @@ TEST(process_pipe_descriptor_installation) {
             cases[i].source, strlen(cases[i].source), ".", &limits, &bounded);
         ASSERT(error == SHELL_DEP_OK || error == SHELL_DEP_ETRUNC ||
                error == SHELL_DEP_EPARSE);
-        ASSERT(shellsplit_test_depgraph_invariants(cases[i].source,
-                                                   strlen(cases[i].source),
-                                                   error, &bounded, &limits));
+        bool valid = shellsplit_test_depgraph_invariants(
+            cases[i].source, strlen(cases[i].source), error, &bounded, &limits);
+        if (!valid) {
+          fprintf(
+              stderr,
+              "process pipe capacity: %s dimension=%u capacity=%u status=%d\n",
+              cases[i].source, dimension, capacity, error);
+          shell_dep_graph_dump(&bounded, stderr);
+        }
+        ASSERT(valid);
       }
     }
   }
@@ -9527,7 +9653,14 @@ TEST(redirect_checkpoint_history_and_scaling) {
   for (unsigned family = 0; family < 5; family++) {
     size_t previous = 0;
     for (unsigned count = 4; count <= 8; count *= 2) {
-      char command[4096] = "probe";
+      /* Keep this a checkpoint-growth measurement. Eight process pipes with
+       * wholly unknown inherited occupancy exercise the independent bounded
+       * allocation relation; establish free low and high slots here instead. */
+      char command[4096];
+      snprintf(command, sizeof(command), "%sprobe",
+               family == 1 ? "exec 3>&- 4>&- 5>&- 6>&- 7>&- 8>&- 9>&- "
+                             "63>&- 62>&- 61>&- 60>&- 59>&- 58>&- 57>&- 56>&-; "
+                           : "");
       size_t used = strlen(command);
       for (unsigned i = 0; i < count; i++) {
         /* Keep this checkpoint-growth fixture in the low descriptor range.
@@ -9547,7 +9680,8 @@ TEST(redirect_checkpoint_history_and_scaling) {
       shell_dep_error_t status = parse(command, &graph);
       size_t work =
           shellsplit_test_metadata_work(SHELLSPLIT_TEST_WORK_FD_OPERATIONS);
-      if (status != SHELL_DEP_OK || (previous && work > 3 * previous))
+      if (status != SHELL_DEP_OK || work > 256 * count ||
+          (previous && work > 3 * previous))
         fprintf(stderr,
                 "checkpoint scaling: family=%u count=%u status=%d "
                 "work=%zu previous=%zu\n",
@@ -9718,16 +9852,40 @@ TEST(named_fd_single_setup_scaling) {
       for (unsigned count = 3; count <= 12; count *= 2) {
         char source[4096];
         unsigned last = repeated ? 0 : count - 1;
-        int prefix = snprintf(source, sizeof(source),
-                              "exec 9>&-; exec 10>base || exit; "
-                              "exec {f%u}>initial || exit; %s%s",
-                              last, family == 2 ? "{ true; }" : "true",
-                              family ? " 10>&-" : "");
+        /* Measure publication growth independently of arbitrary inherited
+         * high-slot holes. Ranked-allocation tests cover that symbolic axis. */
+        int prefix = snprintf(
+            source, sizeof(source),
+            "exec 9>&- 11>&- 12>&- 13>&- 14>&- 15>&- 16>&- "
+            "17>&- 18>&- 19>&- 20>&- 21>&- 22>&- 23>&- 24>&-; "
+            "exec 8>base 10>&8 || exit; "
+            "exec {f%u}>initial || exit; %s%s",
+            last, family == 2 ? "{ true; }" : "true", family ? " 10>&-" : "");
         ASSERT(prefix > 0 && (size_t)prefix < sizeof(source));
+        size_t fixture_end = (size_t)prefix -
+                             strlen(family == 2 ? "{ true; }" : "true") -
+                             (family ? strlen(" 10>&-") : 0);
+        char saved = source[fixture_end];
+        source[fixture_end] = '\0';
+        shellsplit_test_source_scan_reset();
+        shell_dep_graph_t graph;
+        ASSERT(parse(source, &graph) == SHELL_DEP_OK);
+        size_t fixture_work =
+            shellsplit_test_metadata_work(SHELLSPLIT_TEST_WORK_FD_OPERATIONS) +
+            shellsplit_test_metadata_work(
+                SHELLSPLIT_TEST_WORK_ROUTE_PUBLICATION) +
+            shellsplit_test_metadata_work(SHELLSPLIT_TEST_WORK_ROUTE_LOOKUP);
+        source[fixture_end] = saved;
         size_t used = (size_t)prefix;
         for (unsigned i = 0; i < count; i++) {
-          int written = snprintf(source + used, sizeof(source) - used,
-                                 " {f%u}>out%u", repeated ? 0 : i, i);
+          /* The failure family has one failing operation after a growing
+           * successful setup. File opens in the other families retain their
+           * distinct possible-failure prefixes. */
+          int written = family == 3
+                            ? snprintf(source + used, sizeof(source) - used,
+                                       " {f%u}>&8", repeated ? 0 : i)
+                            : snprintf(source + used, sizeof(source) - used,
+                                       " {f%u}>out%u", repeated ? 0 : i, i);
           ASSERT(written > 0 && (size_t)written < sizeof(source) - used);
           used += (size_t)written;
         }
@@ -9737,25 +9895,85 @@ TEST(named_fd_single_setup_scaling) {
                                last);
         ASSERT(written > 0 && (size_t)written < sizeof(source) - used);
         shellsplit_test_source_scan_reset();
-        shell_dep_graph_t graph;
         shell_dep_error_t status = parse(source, &graph);
         size_t work =
             shellsplit_test_metadata_work(SHELLSPLIT_TEST_WORK_FD_OPERATIONS) +
             shellsplit_test_metadata_work(
                 SHELLSPLIT_TEST_WORK_ROUTE_PUBLICATION) +
             shellsplit_test_metadata_work(SHELLSPLIT_TEST_WORK_ROUTE_LOOKUP);
-        if (status != SHELL_DEP_OK || !work || work > 12000 * count ||
+        ASSERT(work >= fixture_work);
+        work -= fixture_work;
+        size_t budget = 12000u * count;
+        if (status != SHELL_DEP_OK || !work || work > budget ||
             (previous && work > 3 * previous))
           fprintf(stderr,
                   "single setup: repeated=%u family=%u count=%u "
                   "status=%d work=%zu previous=%zu\n",
                   repeated, family, count, status, work, previous);
-        ASSERT(status == SHELL_DEP_OK && work > 0 && work <= 12000 * count &&
+        ASSERT(status == SHELL_DEP_OK && work > 0 && work <= budget &&
                (!previous || work <= 3 * previous));
         ASSERT(shell_dep_graph_validate(&graph).valid);
         previous = work;
       }
     }
+#endif
+  pass_count++;
+}
+
+TEST(named_fd_failed_prefix_cleanup_scaling) {
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+  /* Unlike the single-failure fixture, every open here can fail. Its distinct
+   * surviving named bindings require distinct route versions. Check source
+   * preparation and actual cleanup execution separately from joining those
+   * semantic alternatives: no growing undo prefix may be replayed per open. */
+  for (unsigned repeated = 0; repeated < 2; repeated++) {
+    size_t previous[4] = {0};
+    for (unsigned count = 3; count <= 12; count *= 2) {
+      char source[4096];
+      unsigned last = repeated ? 0 : count - 1;
+      int prefix = snprintf(
+          source, sizeof(source),
+          "exec 9>&- 11>&- 12>&- 13>&- 14>&- 15>&- 16>&- "
+          "17>&- 18>&- 19>&- 20>&- 21>&- 22>&- 23>&- 24>&-; "
+          "exec 10>base || exit; exec {f%u}>initial || exit; true 10>&-",
+          last);
+      ASSERT(prefix > 0 && (size_t)prefix < sizeof(source));
+      size_t used = (size_t)prefix;
+      for (unsigned i = 0; i < count; i++) {
+        int written = snprintf(source + used, sizeof(source) - used,
+                               " {f%u}>out%u", repeated ? 0 : i, i);
+        ASSERT(written > 0 && (size_t)written < sizeof(source) - used);
+        used += (size_t)written;
+      }
+      int written = snprintf(source + used, sizeof(source) - used,
+                             " 4>&9 || printf value >&$f%u", last);
+      ASSERT(written > 0 && (size_t)written < sizeof(source) - used);
+      shellsplit_test_source_scan_reset();
+      shell_dep_graph_t graph;
+      ASSERT(parse(source, &graph) == SHELL_DEP_OK);
+      const size_t work[] = {
+          shellsplit_test_source_scan_work(),
+          shellsplit_test_metadata_work(SHELLSPLIT_TEST_WORK_FD_OPERATIONS),
+          shellsplit_test_metadata_work(
+              SHELLSPLIT_TEST_WORK_FAILURE_COMPOSITION),
+          shellsplit_test_metadata_work(SHELLSPLIT_TEST_WORK_FAILURE_UNDO)};
+      const size_t budgets[] = {64 * strlen(source), 512 * count, 128 * count,
+                                8 * count};
+      for (unsigned metric = 0; metric < 4; metric++) {
+        if (!work[metric] || work[metric] > budgets[metric] ||
+            (previous[metric] && work[metric] > 3 * previous[metric]))
+          fprintf(stderr,
+                  "failed prefix cleanup: repeated=%u count=%u metric=%u "
+                  "work=%zu previous=%zu budget=%zu\n",
+                  repeated, count, metric, work[metric], previous[metric],
+                  budgets[metric]);
+        ASSERT(work[metric] > 0 && work[metric] <= budgets[metric] &&
+               (!previous[metric] || work[metric] <= 3 * previous[metric]));
+        previous[metric] = work[metric];
+      }
+      ASSERT(shell_dep_graph_validate(&graph).valid);
+    }
+  }
 #endif
   pass_count++;
 }
@@ -10065,7 +10283,7 @@ TEST(indexed_named_route_mutations) {
   }
 #ifdef SHELLSPLIT_TEST_SOURCE_SCANS
   size_t previous_delta = 0;
-  for (unsigned count = 4; count <= 12; count += 4) {
+  for (unsigned count = 3; count <= 12; count *= 2) {
     size_t work[2] = {0};
     for (unsigned with_mutations = 0; with_mutations < 2; with_mutations++) {
       char source[4096] = "exec ";
@@ -10093,14 +10311,20 @@ TEST(indexed_named_route_mutations) {
     }
     ASSERT(work[1] >= work[0]);
     size_t delta = work[1] - work[0];
-    if (verbose)
-      printf("\n    indexed mutations: count=%u delta=%zu", count, delta);
     /* Each absent static target takes one indexed lookup in each outcome
      * journal. It must not visit every inherited descriptor binding. */
     /* IFS target recognition and the boundary key/emission projections add
-     * constant-many indexed lookups, not a scan of inherited bindings. */
-    ASSERT(delta <= 120 * count &&
-           (!previous_delta || delta <= 3 * previous_delta));
+     * constant-many indexed lookups, not a scan of inherited bindings. Include
+     * the logarithmic comparison depth of both owner and proof-domain maps. */
+    unsigned depth = 0;
+    for (unsigned width = count; width; width >>= 1)
+      depth++;
+    size_t budget = 64u * count * (depth + 1);
+    if (verbose || delta > budget ||
+        (previous_delta && delta > 3 * previous_delta))
+      printf("\n    indexed mutations: count=%u delta=%zu budget=%zu", count,
+             delta, budget);
+    ASSERT(delta <= budget && (!previous_delta || delta <= 3 * previous_delta));
     previous_delta = delta;
   }
 #endif
@@ -10353,9 +10577,24 @@ TEST(nested_scope_exit_descriptor_routes) {
 TEST(paired_open_preparation_scaling) {
 #ifdef SHELLSPLIT_TEST_SOURCE_SCANS
   for (unsigned process = 0; process < 2; process++) {
+    const char *prefix =
+        process ? "exec 3>&- 4>&- 5>&- 6>&- 7>&- 8>&- 9>&- "
+                  "63>&- 62>&- 61>&- 60>&- 59>&- 58>&- 57>&- 56>&-; "
+                : "";
+    size_t fixture_work = 0;
+    if (process) {
+      shellsplit_test_source_scan_reset();
+      shell_dep_graph_t fixture;
+      ASSERT(parse(prefix, &fixture) == SHELL_DEP_OK);
+      fixture_work =
+          shellsplit_test_metadata_work(SHELLSPLIT_TEST_WORK_FD_OPERATIONS);
+    }
     size_t previous = 0;
     for (unsigned count = 2; count <= 8; count *= 2) {
-      char source[2048] = "probe";
+      /* Isolate paired-operation preparation from independent inherited-FD
+       * alternatives, just as the process checkpoint fixture does. */
+      char source[2048];
+      snprintf(source, sizeof(source), "%sprobe", prefix);
       size_t used = strlen(source);
       for (unsigned i = 0; i < count; i++)
         used += (size_t)snprintf(source + used, sizeof(source) - used,
@@ -10369,14 +10608,21 @@ TEST(paired_open_preparation_scaling) {
       shell_dep_error_t status = parse(source, &graph);
       size_t work =
           shellsplit_test_metadata_work(SHELLSPLIT_TEST_WORK_FD_OPERATIONS);
+      if (status != SHELL_DEP_OK)
+        fprintf(stderr, "paired preparation: process=%u count=%u status=%d\n",
+                process, count, status);
       ASSERT(status == SHELL_DEP_OK && shell_dep_graph_validate(&graph).valid);
-      if (work == 0 || work > 64 * count || (previous && work > 3 * previous))
+      ASSERT(work >= fixture_work);
+      work -= fixture_work;
+      /* A process-backed <> prepares its temporary pipe end as well as the
+       * two opened capabilities. Keep the doubling-growth bound unchanged. */
+      size_t budget = (process ? 128u : 64u) * count;
+      if (work == 0 || work > budget || (previous && work > 3 * previous))
         fprintf(
             stderr,
             "paired preparation: process=%u count=%u work=%zu previous=%zu\n",
             process, count, work, previous);
-      ASSERT(work > 0 && work <= 64 * count &&
-             (!previous || work <= 3 * previous));
+      ASSERT(work > 0 && work <= budget && (!previous || work <= 3 * previous));
       previous = work;
       if (!process)
         for (unsigned i = 0; i < count; i++) {
@@ -11486,10 +11732,10 @@ TEST(brace_group_document_scope) {
        "payload"},
       {"{ cat; cat; } <<-'EOF'\n\tpayload\n\tEOF", SHELL_DOC_HEREDOC, "EOF",
        "payload"},
-      {"{ cat; cat; } <<EOF\r\npayload\r\nEOF\r\n", SHELL_DOC_HEREDOC, "EOF",
+      {"{ cat; cat; } <<EOF\r\npayload\r\nEOF\r\n", SHELL_DOC_HEREDOC, "EOF\r",
        "payload\r"},
       {"{ cat; cat; } <<-\"EOF\"\r\n\tpayload\r\n\tEOF\r\n", SHELL_DOC_HEREDOC,
-       "EOF", "payload\r"},
+       "\"EOF\"\r", "payload\r"},
       {"{ cat; cat; } <<< \"two words\"", SHELL_DOC_HERESTRING, NULL,
        "\"two words\""},
   };
@@ -11960,8 +12206,8 @@ TEST(dialect_boundary_matrix) {
       "while read line; do echo $line; done",
       "until test -f file; do sleep 1; done",
       "(\\\n( count += 1 ))",
-      "[\\\r[ -n value ]]",
-      "[[\\\r\n -n value ]]",
+      "[\\\n[ -n value ]]",
+      "[[\\\n -n value ]]",
   };
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
     shell_dep_graph_t graph;
@@ -12275,6 +12521,60 @@ TEST(validation_matrix) {
   ASSERT(!validation.valid);
   ASSERT(validation.error_count == 1);
   ASSERT(strstr(validation.errors[0].msg, "invalid edge type") != NULL);
+  pass_count++;
+}
+
+/* ARG associates a command with a possible pathname and therefore only FILE
+ * documents are valid endpoints. Preserve its intentionally undirected
+ * orientation without permitting other document kinds to acquire path
+ * semantics in a caller-supplied graph. */
+TEST(validation_rejects_non_file_argument_documents) {
+  static const struct {
+    const char *source;
+    shell_dep_doc_kind_t kind;
+  } invalid[] = {
+      {"NAME=value cmd", SHELL_DOC_ENVVAR},
+      {"cat <<<payload", SHELL_DOC_HERESTRING},
+      {"cat <<EOF\npayload\nEOF\n", SHELL_DOC_HEREDOC},
+  };
+
+  for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
+    shell_dep_graph_t graph = {0};
+    ASSERT(parse(invalid[i].source, &graph) == SHELL_DEP_OK);
+    int command = find_first_cmd(&graph);
+    int document = find_doc(&graph, invalid[i].kind);
+    ASSERT(command >= 0 && document >= 0 &&
+           graph.edge_count < SHELL_DEP_MAX_EDGES &&
+           shell_dep_graph_validate(&graph).valid);
+    for (unsigned reversed = 0; reversed < 2; reversed++) {
+      shell_dep_graph_t malformed = graph;
+      malformed.edges[malformed.edge_count++] = (shell_dep_edge_t){
+          .type = SHELL_EDGE_ARG,
+          .dir = SHELL_DIR_UNDIR,
+          .from = reversed ? (uint32_t)document : (uint32_t)command,
+          .to = reversed ? (uint32_t)command : (uint32_t)document,
+          .source_fd = SHELL_DEP_FD_NONE,
+          .target_fd = SHELL_DEP_FD_NONE,
+      };
+      shell_dep_graph_validation_t validation =
+          shell_dep_graph_validate(&malformed);
+      ASSERT(!validation.valid && validation.error_count >= 1);
+    }
+  }
+
+  shell_dep_graph_t graph = {0};
+  ASSERT(parse("cmd /tmp/argument", &graph) == SHELL_DEP_OK);
+  uint32_t argument = UINT32_MAX;
+  for (uint32_t edge = 0; edge < graph.edge_count; edge++)
+    if (graph.edges[edge].type == SHELL_EDGE_ARG) {
+      argument = edge;
+      break;
+    }
+  ASSERT(argument != UINT32_MAX && shell_dep_graph_validate(&graph).valid);
+  uint32_t from = graph.edges[argument].from;
+  graph.edges[argument].from = graph.edges[argument].to;
+  graph.edges[argument].to = from;
+  ASSERT(shell_dep_graph_validate(&graph).valid);
   pass_count++;
 }
 
@@ -12836,8 +13136,8 @@ TEST(continued_list_operator_routing) {
   } pipelines[] = {
       {"printf x |\ncat", SHELL_PIPE_MODE_STDOUT, 1},
       {"printf x | # note\ncat", SHELL_PIPE_MODE_STDOUT, 1},
-      {"printf x |&\r\ncat", SHELL_PIPE_MODE_STDOUT_AND_STDERR, 2},
-      {"printf x |& \\\r\ncat", SHELL_PIPE_MODE_STDOUT_AND_STDERR, 2},
+      {"printf x |&\ncat", SHELL_PIPE_MODE_STDOUT_AND_STDERR, 2},
+      {"printf x |& \\\ncat", SHELL_PIPE_MODE_STDOUT_AND_STDERR, 2},
   };
   for (size_t i = 0; i < sizeof(pipelines) / sizeof(pipelines[0]); i++) {
     shell_parse_result_t fast = {0};
@@ -12903,7 +13203,7 @@ TEST(continued_list_operator_routing) {
 
   /* The physical line continuation belongs to the source group's trailing
    * pipeline operator, not to a separate shell list. */
-  static const char continued_group[] = "{ printf x; } \\\r\n|& { cat; }";
+  static const char continued_group[] = "{ printf x; } \\\n|& { cat; }";
   memset(&graph, 0, sizeof(graph));
   ASSERT(shell_dep_graph_parse(continued_group, sizeof(continued_group) - 1,
                                ".", NULL, &graph) == SHELL_DEP_OK);
@@ -14315,7 +14615,10 @@ TEST(scope_termination_descriptor_continuations) {
        i++) {
     const char *source = shellsplit_test_scope_outcomes[i].source;
     shell_dep_graph_t graph = {0};
-    ASSERT(parse(source, &graph) == SHELL_DEP_OK);
+    shell_dep_error_t error = parse(source, &graph);
+    if (error != SHELL_DEP_OK)
+      printf("    scope outcome source: %s (error %d)\n", source, error);
+    ASSERT(error == SHELL_DEP_OK);
     int writer = find_cmd_tokens(&graph, "printf", "payload");
     int file = find_file_doc(&graph, "out");
     ASSERT(writer >= 0 && file >= 0);
@@ -15426,6 +15729,9 @@ TEST(static_empty_path_effects) {
                                                  &limits, &parsed, &graph)
                  : raw_dep_graph_parse(source, (size_t)length, ".", &limits,
                                        &graph);
+        if (error != SHELL_DEP_OK)
+          fprintf(stderr, "empty-path graph mismatch: %s status=%d fast=%u\n",
+                  source, error, fast);
         ASSERT(error == SHELL_DEP_OK);
         unsigned failed = 0, opens = 0, writes = 0, reads = 0;
         bool shell_word = false;
@@ -15690,59 +15996,64 @@ dep_resolve_argument_fixture(const shell_dep_expand_request_t *request,
 TEST(resolved_substitution_argument_documents) {
   static const char *words[] = {"\"$(printf file)\"", "<(printf file)",
                                 "\"pre`printf file`post\""};
+  static const char *prefixes[] = {"", "<() ", "X=x </dev/null <()>() "};
   static const char records[] = "13:/root/.ssh/id,6:/tmp/x,";
-  for (size_t i = 0; i < sizeof(words) / sizeof(words[0]); i++) {
-    for (unsigned empty = 0; empty < 2; empty++) {
-      char source[128];
-      snprintf(source, sizeof(source), "cat %s", words[i]);
-      shell_limits_t parse_limits = {.max_subcommands = SHELL_MAX_SUBCOMMANDS,
-                                     .strict_mode = true};
-      shell_parse_result_t parsed = {0};
-      ASSERT(shell_parse_fast(source, strlen(source), &parse_limits, &parsed) ==
-             SHELL_OK);
-      shell_dep_limits_t limits;
-      ASSERT(shellsplit_test_dep_limits(NULL, &limits));
-      dep_argument_fixture_t fixture = {
-          .word = words[i],
-          .value = {.netargv = empty ? "" : records,
-                    .length = empty ? 0 : sizeof(records) - 1,
-                    .count = empty ? 0 : 2,
-                    .first = empty ? NULL : records + 3,
-                    .first_length = empty ? 0 : 13,
-                    .resolved = true,
-                    .dynamic = true},
-      };
-      shell_dep_word_resolver_t resolver = {
-          .expand = dep_resolve_argument_fixture, .context = &fixture};
-      shell_dep_graph_t graph = {0};
-      uint8_t unresolved_paths[SHELL_DEP_MAX_NODES];
-      ASSERT(shell_dep_graph_parse_with_fast_resolver(
-                 source, strlen(source), "/workspace", &limits, &parsed, &graph,
-                 &resolver, unresolved_paths) == SHELL_DEP_OK);
-      unsigned arguments = 0, substitutions = 0;
-      for (uint32_t edge = 0; edge < graph.edge_count; edge++) {
-        const shell_dep_edge_t *item = &graph.edges[edge];
-        if (!internal_relation(&graph, item))
-          continue;
-        if (item->type == SHELL_EDGE_SUBST)
-          substitutions++;
-        if (item->type != SHELL_EDGE_ARG)
-          continue;
-        arguments++;
-        const shell_dep_doc_t *doc = &graph.nodes[item->to].doc;
-        ASSERT((doc->flags & SHELL_DEP_DOC_FLAG_RESOLVED_PATH) != 0 &&
-               (doc->flags & SHELL_DEP_DOC_FLAG_DYNAMIC_NAME) == 0 &&
-               doc->cwd_known && doc->cwd_absolute);
-        char identity[64];
-        size_t written;
-        bool absolute;
-        ASSERT(shell_dep_doc_file_identity_write(
-            &graph, doc, identity, sizeof(identity), &written, &absolute));
-        ASSERT(absolute && written == doc->value_len &&
-               memcmp(identity, doc->value, written) == 0);
+  for (size_t p = 0; p < sizeof(prefixes) / sizeof(prefixes[0]); p++) {
+    for (size_t i = 0; i < sizeof(words) / sizeof(words[0]); i++) {
+      for (unsigned empty = 0; empty < 2; empty++) {
+        char source[128];
+        snprintf(source, sizeof(source), "%scat %s", prefixes[p], words[i]);
+        shell_limits_t parse_limits = {.max_subcommands = SHELL_MAX_SUBCOMMANDS,
+                                       .strict_mode = true};
+        shell_parse_result_t parsed = {0};
+        ASSERT(shell_parse_fast(source, strlen(source), &parse_limits,
+                                &parsed) == SHELL_OK);
+        shell_dep_limits_t limits;
+        ASSERT(shellsplit_test_dep_limits(NULL, &limits));
+        dep_argument_fixture_t fixture = {
+            .word = words[i],
+            .value = {.netargv = empty ? "" : records,
+                      .length = empty ? 0 : sizeof(records) - 1,
+                      .count = empty ? 0 : 2,
+                      .first = empty ? NULL : records + 3,
+                      .first_length = empty ? 0 : 13,
+                      .resolved = true,
+                      .dynamic = true},
+        };
+        shell_dep_word_resolver_t resolver = {
+            .expand = dep_resolve_argument_fixture, .context = &fixture};
+        shell_dep_graph_t graph = {0};
+        uint8_t unresolved_paths[SHELL_DEP_MAX_NODES];
+        ASSERT(shell_dep_graph_parse_with_fast_resolver(
+                   source, strlen(source), "/workspace", &limits, &parsed,
+                   &graph, &resolver, unresolved_paths) == SHELL_DEP_OK);
+        unsigned arguments = 0, substitutions = 0;
+        for (uint32_t edge = 0; edge < graph.edge_count; edge++) {
+          const shell_dep_edge_t *item = &graph.edges[edge];
+          if (!internal_relation(&graph, item))
+            continue;
+          if (item->type == SHELL_EDGE_SUBST)
+            substitutions++;
+          if (item->type != SHELL_EDGE_ARG)
+            continue;
+          arguments++;
+          const shell_dep_doc_t *doc = &graph.nodes[item->to].doc;
+          ASSERT((doc->flags & SHELL_DEP_DOC_FLAG_RESOLVED_PATH) != 0 &&
+                 (doc->flags & SHELL_DEP_DOC_FLAG_DYNAMIC_NAME) == 0 &&
+                 doc->cwd_known && doc->cwd_absolute);
+          ASSERT(doc->path == strstr(source, words[i]) &&
+                 doc->path_len == strlen(words[i]));
+          char identity[64];
+          size_t written;
+          bool absolute;
+          ASSERT(shell_dep_doc_file_identity_write(
+              &graph, doc, identity, sizeof(identity), &written, &absolute));
+          ASSERT(absolute && written == doc->value_len &&
+                 memcmp(identity, doc->value, written) == 0);
+        }
+        ASSERT(fixture.calls == 1 && arguments == (empty ? 0u : 2u) &&
+               substitutions != 0 && shell_dep_graph_validate(&graph).valid);
       }
-      ASSERT(fixture.calls == 1 && arguments == (empty ? 0u : 2u) &&
-             substitutions != 0 && shell_dep_graph_validate(&graph).valid);
     }
   }
   pass_count++;
@@ -17973,12 +18284,12 @@ TEST(continued_terminal_redirect_topology) {
   } file_cases[] = {
       {"printf payload >\\\n/tmp/write", "/tmp/write", SHELL_EDGE_WRITE, 1,
        false},
-      {"cat <\\\r/tmp/read", "/tmp/read", SHELL_EDGE_READ, 0, true},
-      {"printf payload >>\\\r\n/tmp/append", "/tmp/append", SHELL_EDGE_APPEND,
-       1, false},
+      {"cat <\\\n/tmp/read", "/tmp/read", SHELL_EDGE_READ, 0, true},
+      {"printf payload >>\\\n/tmp/append", "/tmp/append", SHELL_EDGE_APPEND, 1,
+       false},
       {"printf payload >|\\\n/tmp/clobber", "/tmp/clobber", SHELL_EDGE_WRITE, 1,
        false},
-      {"printf payload &>\\\r/tmp/both", "/tmp/both", SHELL_EDGE_WRITE, 1,
+      {"printf payload &>\\\n/tmp/both", "/tmp/both", SHELL_EDGE_WRITE, 1,
        false},
       {"printf payload &>>\\\n/tmp/both-append", "/tmp/both-append",
        SHELL_EDGE_APPEND, 1, false},
@@ -18023,7 +18334,7 @@ TEST(continued_terminal_redirect_topology) {
                       (uint32_t)trace, 1, SHELL_DEP_FD_NONE) &&
          shell_dep_graph_validate(&graph).valid);
 
-  ASSERT(parse("{ echo one; } >\\\r\n/tmp/group", &graph) == SHELL_DEP_OK);
+  ASSERT(parse("{ echo one; } >\\\n/tmp/group", &graph) == SHELL_DEP_OK);
   int group = find_group(&graph, SHELL_GROUP_BRACE, UINT32_MAX);
   int group_file = find_file_doc(&graph, "/tmp/group");
   ASSERT(group >= 0 && group_file >= 0 &&
@@ -18181,6 +18492,9 @@ int main(int argc, char **argv) {
   RUN(named_fd_symbolic_duplication_routes);
   RUN(named_fd_unconnected_process_substitution_routes);
   RUN(named_fd_continuation_identity);
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+  RUN(private_index_capacity_is_failure_atomic);
+#endif
   RUN(named_fd_exec_scope_and_lifecycle);
   RUN(named_fd_group_execution_scopes);
   RUN(named_fd_group_body_replay);
@@ -18258,6 +18572,7 @@ int main(int argc, char **argv) {
 
   printf("\nFile Arguments:\n");
   RUN(file_argument_matrix);
+  RUN(file_argument_positions);
 
   printf("\nSubshells:\n");
   RUN(subshell_matrix);
@@ -18299,6 +18614,7 @@ int main(int argc, char **argv) {
   RUN(group_redirect_ownership_source_scaling);
   RUN(indexed_snapshot_and_time_pipe_scaling);
   RUN(named_fd_single_setup_scaling);
+  RUN(named_fd_failed_prefix_cleanup_scaling);
   RUN(nested_capture_publication_scaling);
   RUN(indexed_route_and_scope_scaling);
   RUN(inherited_route_ownership_scaling);
@@ -18351,6 +18667,7 @@ int main(int argc, char **argv) {
 
   printf("\nGraph Integrity:\n");
   RUN(validation_matrix);
+  RUN(validation_rejects_non_file_argument_documents);
   RUN(validation_rejects_malformed_endpoint_metadata);
   RUN(validation_rejects_malformed_named_fd_metadata);
   RUN(validation_rejects_ambiguous_fd_open_forms);

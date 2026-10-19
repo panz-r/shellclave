@@ -1759,7 +1759,7 @@ void run_semantic_reference_oracles() {
        false},
       {"{ cat; } 1\\\n2<<EOF\nbody\nEOF\n>out", redirect_rules, 2, 1,
        SG_VERDICT_UNDETERMINED, false, false},
-      {"cat 1\\\r\n2<<<body", redirect_rules, 2, 1, SG_VERDICT_ALLOW, false,
+      {"cat 1\\\n2<<<body", redirect_rules, 2, 1, SG_VERDICT_ALLOW, false,
        false},
       {"cat $'x'3>out", redirect_rules, 2, 1, SG_VERDICT_UNDETERMINED, false,
        false},
@@ -1816,7 +1816,7 @@ void run_semantic_reference_oracles() {
           ST_OK)
     invariant_failure("compound-word oracle gate setup failed");
   static const char compound_input[] =
-      "$'c'3>out;cat \"x\"${y}z;my\\\r\ncommand value";
+      "$'c'3>out;cat \"x\"${y}z;my\\\ncommand value";
   reusable_eval_buffer &compound_buffer =
       eval_buffer_for(g_eval_buffers.result, sizeof(compound_input) - 1);
   sg_result_t compound_result = {};
@@ -2351,6 +2351,34 @@ void run_semantic_reference_oracles() {
       std::strcmp(strong_result.deny_reason, redirect_reason) == 0)
     invariant_failure("redirect-only verdict priority mismatch");
   sg_gate_free(strong_redirect_gate);
+
+  /* Semantic graph context, not a second source-only check, proves these
+   * read-option roles. Keep the cold/warm anomaly paths in the fixed sweep. */
+  sg_gate_t *read_gate = sg_gate_new();
+  if (!read_gate || sg_gate_set_reject_mask(read_gate, 0) != SG_OK ||
+      sg_gate_set_stop_mode(read_gate, SG_EVAL_ALL) != SG_OK ||
+      sg_gate_enable_anomaly(read_gate, 1e300, nullptr) != SG_OK ||
+      sg_gate_set_anomaly_cache_size(read_gate, 8) != SG_OK)
+    invariant_failure("contextual read anomaly oracle setup failed");
+  for (const char *input :
+       {"exec {fd}<<<payload && read -p\"$fd\" -u \"$fd\" value",
+        "exec {fd}<<<payload && echo \"$(read -p\"$fd\" -u \"$fd\" value)\""}) {
+    reusable_eval_buffer &buffer =
+        eval_buffer_for(g_eval_buffers.result, std::strlen(input));
+    uint32_t count = std::strstr(input, "echo") ? 3 : 2;
+    for (unsigned repeat = 0; repeat < 2; repeat++) {
+      sg_result_t result = {};
+      sg_error_t error =
+          sg_gate_evaluate(read_gate, input, std::strlen(input), buffer.data(),
+                           buffer.size(), &result);
+      if (error != SG_OK || result.verdict != SG_VERDICT_UNDETERMINED ||
+          result.subcommand_count != count || result.truncated ||
+          !isfinite(result.anomaly_score))
+        invariant_failure("contextual read anomaly oracle mismatch");
+      validate_result(&result, error, buffer.data(), buffer.size());
+    }
+  }
+  sg_gate_free(read_gate);
 }
 
 /* Graph paths preserve source spelling, so quote and escape fragments must not
@@ -3014,6 +3042,13 @@ static void run_fixed_oracles() {
   };
   run_generated_brace_case(background_group_io_case,
                            sizeof(background_group_io_case));
+  /* Keep heredoc-plus-pipeline generation deterministic. Byte three once made
+   * the shared generator mistake CRLF for a shell newline and label an
+   * unterminated heredoc valid. */
+  static const uint8_t heredoc_pipeline_group_case[] = {0, 1, 2, 1, 1,
+                                                        2, 7, 1, 1};
+  run_generated_brace_case(heredoc_pipeline_group_case,
+                           sizeof(heredoc_pipeline_group_case));
   for (uint8_t depth = 0; depth < 8; depth++)
     for (uint8_t composition = 0; composition < 6; composition++) {
       const uint8_t diagnostic_group_case[] = {0,           1, 2, 0, depth,

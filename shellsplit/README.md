@@ -71,6 +71,19 @@ All nested scopes share the same inherited resources. Source-order copies,
 scope restoration, and captures are resolved before publication: `2>&1 >out`
 leaves stderr on inherited stdout, while `>out 2>&1` routes both to the file.
 
+Path-looking arguments have undirected `SHELL_EDGE_ARG` relations to FILE
+documents. The first surviving command word is excluded: `/bin/echo hello`
+and `<() /bin/echo hello` have the same argument-file relations. Assignment
+prefixes and redirects likewise do not advance argv position. Quoted empty
+words do, so `'' /tmp/input` retains `/tmp/input` as an argument. An unresolved
+earlier word may supply argv entries; later pathname arguments remain possible,
+while unresolved substitution spellings are not guessed to be pathnames.
+Ordinary argument resolutions contribute zero or more canonical netargv records
+without resolving command identity. Wrapper targets keep their existing outer
+argument roles; use `effective_command_token` for the separately known
+executable.
+An ARG relation alone does not claim that the command reads or writes the file.
+
 Byte flow includes shell-owned expansion, redirect-setup and undo diagnostics, not just
 command-body I/O. They originate at the existing CMD/GROUP endpoint on fd 2,
 using the stderr destination at the failure point. A failed body can therefore
@@ -235,10 +248,14 @@ expanded words can select a variable lookup. No predicate is executed and no
 runtime variable value is resolved during this analysis.
 
 In assignment-only commands, each RHS expansion sees preceding committed
-assignments, not its own or later assignments. Thus `IFS= X=$(producer)` gives
-the substitution empty IFS, while the prefixes of an executable command still
-expand against its incoming state. Ordered IFS checkpoints share the graph
-evaluation workspace; RHS inspection does not replay assignment prefixes.
+assignments, not its own or later assignments. Temporary prefixes of executable
+commands have two distinct contexts inside a later RHS substitution: ordinary
+scalar argument lookup sees earlier temporary values, while redirection
+expansion and IFS splitting retain the shell binding table. For example,
+`IFS= X=$(producer) command` makes quoted `$IFS` empty inside the child without
+changing its splitting table. Ordered IFS checkpoints and the existing
+prefix-name index share the graph evaluation workspace; RHS inspection does
+not replay assignment prefixes or build a duplicate effects index.
 
 Active parameter-assignment operators (`${name=word}` and `${name:=word}`) are
 recognized lexically but rejected by semantic consumers. Their conditional
@@ -296,6 +313,9 @@ the document node to the command or compound-group endpoint; the descriptor
 syntax never becomes argv. The closing brace must be immediately adjacent to
 the redirect operator after shell lexical processing: escaped physical line
 endings may bridge it, while literal spaces and tabs leave `{fd}` as argv.
+Only backslash-LF is erased while matching the descriptor identifier or an
+exact `$fd`/`${fd}` reference. CR remains a significant word byte, including
+before LF, and therefore cannot form an alternate continuation spelling.
 Named-FD duplication and close forms, such as `{fd}>&1` and `{fd}>&-`, and
 named-FD process-substitution operands such as `{fd}< <(producer)` and
 `{fd}> >(consumer)`, are setup operations. Their later exact `$fd` or `${fd}`
@@ -315,8 +335,15 @@ Commands that are themselves pipeline members or background jobs keep their
 descriptor and named-variable mutations private, including inside an already
 isolated group. An unset or reassignment on a returning conditional path
 invalidates the proof of that named binding for subsequent unconditional uses.
-An explicit reallocation restores a proved binding; conditional rebindings that retain the
-name on every path preserve their alternative routes.
+An explicit reallocation in the same lexical group, or after returning to an
+enclosing group, restores a proved binding; conditional rebindings that retain
+the name on every path preserve their alternative routes. Reallocating an
+orphaned descriptor variable only after entering a deeper compound remains
+unsupported because the current bounded allocator model cannot correlate that
+child allocation with every surviving physical slot without inventing route
+cross-products. Repeating `unset` does not close the orphaned physical
+descriptor or move its allocation scope. That state remains path-local until a
+successful supported reallocation replaces it.
 Assignment-only scalar forms, including `fd=value` and
 `fd+=value`, replace the descriptor variable's visible value; a leading
 assignment remains temporary for the command it decorates. A command-bearing
@@ -402,18 +429,602 @@ both interpretations are tracked without evaluating runtime data. Every `read`
 variable target and variable-mode `unset` target is checked for unsupported
 array-element syntax, while ordinary literals, prompt operands, function-only
 and nameref-only `unset`, and proven option-error paths retain their roles.
-Named-FD analysis invalidates only static `read` target names (or `REPLY` when
-no target is supplied); unresolved target names invalidate all visible bindings.
+Named-FD analysis invalidates only assigned static `read` target names (or
+`REPLY` when no target is supplied); a reached write to an unresolved target
+invalidates all visible bindings.
 A proven invalid option, invalid numeric operand, or missing operand does not
 mutate a descriptor variable. An invalid static `read` target (including the
 launcher's readonly `POSIXLY_CORRECT`) stops assignment at that target, while
-earlier valid targets can still be written. Explicit timeout-zero `read -t0`
-polls for input without assigning any target or `REPLY`; this is distinct from
+earlier valid targets can still be written. Literal invalid identifier prefixes
+remain invalid through scalar expansion: `read -- -p"$fd" value` fails before
+input or assignment, regardless of `$fd`. Captured-empty values likewise expose
+invalid suffixes such as `"$fd"-`; literals across an unknown fragment do not
+establish that empty-value proof. An invalid first identifier consumes no input;
+an invalid later identifier retains input and only earlier assignments. A
+`-t0` poll bypasses target validation, while `-n0`/`-N0` still validate targets
+and assign empty strings to the valid preceding targets. An unresolved target
+retains both
+its writable interpretation and a rejecting interpretation: the latter keeps
+only earlier assignments, never the failing target's arbitrary-name write or
+any later target's write. Its failure continuation can therefore still use a
+descriptor variable named later in the target list unless an earlier unresolved
+target could already have overwritten it. Explicit timeout-zero `read -t0` polls
+for input without assigning any target or `REPLY`; this is distinct from
 `-n0`/`-N0`, which can assign empty strings. Repeated valid `-t` operands use the
 last timeout, with possible-empty attached expansions retaining each possible
 operand/option path. Static invalid `unset` targets cannot affect unrelated
 bindings, but `unset` continues processing later targets. These decisions
 stream decoded bytes without temporary argv strings or runtime expansion.
+Unknown numeric `-n`, `-N`, and `-t` operands retain an early, nonassigning
+invalid-number outcome alongside valid zero/nonzero values. This applies to
+separate and attached operands: later overriding options cannot repair an
+earlier error, nor can later `-u` validation establish a proof on that error
+path. Captured allocation digits are proven valid and do not gain this error
+alternative. Data operands are not subjected to numeric validation.
+Whole-word numeric facts are distinct from attached-option payload facts:
+`-p"$fd"` can supply prompt data as an option, but its literal `-p` prefix is
+invalid when a preceding option needs a numeric operand. Unknown fragments do
+not erase an already-invalid prefix. Captured-empty values refine the literal
+projection without rescanning source; literal fragments on opposite sides of
+an unknown expansion are not themselves proof of invalidity.
+Thus `unset fd; read -n"$fd" -p"$fd" value <<<payload` and the analogous
+`read -u"$fd" -n"$fd"` are modelled builtin argument failures, not unsupported
+syntax. They retain only failure continuations, consume no input, and do not
+assign targets, `REPLY`, or IFS. Argument expansions and redirection setup still
+occur before the builtin fails.
+Explicit supported `unset` targets of stable scalars establish an empty
+captured value even before that variable has named an allocated descriptor.
+These facts follow execution scope and outcomes; subsequent assignments or
+builtin writes invalidate them. Unsetting a descriptor variable does not close
+its physical FD.
+Automatically updated variables retain unknown captured values: for example,
+`unset _; : 1; read -n"$_" value <<<payload` can read input because Bash sets
+`$_` to `1` after `:`. No general implicit-variable value evaluator is added;
+ordinary numeric operands keep their possible valid and invalid outcomes,
+while unresolved descriptor identities retain the existing unsupported boundary.
+
+Named scalar binding facts live in a persistent indexed submap of each
+immutable execution version, separate from physical descriptor state. A bulk
+scalar write resets that submap to an unknown fallback and restores only its
+prepared temporary-prefix exclusions. It does not scan future read names,
+replay mutation history, close physical FDs, or change sibling versions.
+Explicit writes update individual keys; setup failure restores the appropriate
+pre-builtin binding version while retaining reached descriptor setup effects.
+Materialization reconciles changed subtrees, and collection traces the retained
+submap roots in the same bounded evaluation workspace.
+
+The graph models builtin `read`'s selected input precisely: fd 0 by default,
+or the last valid `-u` operand. Each `-u` is checked in order against the
+post-redirection descriptor state; an earlier closed descriptor stops option
+processing. Quoted/escaped static decimal operands and exact tracked `$fd` or
+`${fd}` references are supported, attached or separate. The argument captures
+the variable's entry value, before redirects can reallocate `{fd}`. Unquoted
+references require an incoming IFS that cannot split decimal digits; a
+temporary `IFS=... read` prefix does not affect argument expansion. Other
+runtime descriptor expressions are unsupported by semantic graph parsing,
+not guessed as fd 0 and not passed to the ordinary-data expansion callback.
+An empty attached argument leaves `-u` waiting for the next word; a bare
+unquoted empty reference disappears. A quoted separate empty argument is an
+invalid descriptor. Allocation-failure alternatives preserve these distinctions.
+Entry facts also refine other option operands: a successfully allocated
+`-p"$fd"` cannot be empty and consume the following option as its prompt.
+This includes a following separate `-u "$fd"` operand. Source-only consumers
+remain conservative when competing option/FD roles require descriptor state;
+graph parsing resolves those roles from its captured entry values and rejects
+any reachable interpretation that remains unsupported.
+Unresolved ordinary values retain their possible-empty alternatives. A `;`
+after allocation still permits failure, unlike a success-guarded `&&`.
+Conditional descriptor opens and closes preserve the association between
+existence, byte provenance, and read validation/assignment outcomes.
+Each reached `-u` validation refines the descriptor facts of that execution
+version. A successful `read -u11 -n0 probe` therefore proves fd 11 exists on its
+`&&` continuation, although it consumes no input bytes. Repeated `-u` operands
+retain every preceding validation, not only the final input selector. Option
+errors retain the proofs already established; EOF, polling, invalid targets,
+and access errors do not themselves imply that a descriptor is closed.
+Temporary redirects are undone before publishing continuations, so validating
+a command-local fd 11 does not prove the incoming fd 11 was open.
+
+Retained journal versions always resolve missing facts against their immutable
+entry baseline. A materialized descriptor table is a representative for replay
+or enumeration, not the baseline of other alternatives. For example,
+`read -u11 value {fd}<<<payload` can read inherited fd 11, or the here-string if
+allocation selects an initially free fd 11. Both feasible inputs are retained.
+A preceding successful fd-11 probe excludes allocation-to-11 on that branch.
+Recursive descriptor export and timing-report routing use the same rule.
+Variable writes use the same refined option frontier: words consumed as option
+data do not invalidate descriptor variables or IFS. Writes stop at the first
+invalid/readonly target; earlier assignments and implicit REPLY remain visible.
+Captured entry values also refine exact scalar targets, including after `--`:
+an allocated descriptor expands to an invalid numeric identifier, not an
+unknown writable name. An invalid first target fails before input; an invalid
+later target fails after possible input and earlier assignments, leaving later
+bindings unchanged. A readonly first target can instead fail after input without
+writing any target; an unresolved first target retains both failure timings.
+For example, `read -n0 first "$target" last <<<payload || printf fallback >marker`
+retains the fallback write even though a writable `$target` can make the read
+succeed. Each outcome carries its own assignment prefix through connectors,
+negation and private scopes; writes from successful alternatives are not applied
+to a rejecting alternative. All argument expansions precede builtin validation:
+stopping target assignment does not skip substitutions in later arguments.
+Known-empty unquoted targets disappear only when the whole word permits it;
+adjacent empty quotes preserve an invalid empty argument.
+
+Only the selected readable descriptor contributes READ, PIPE, or process-input
+SUBST flow. Polling (`-t0`), zero counts (`-n0`/`-N0`), invalid options, and an
+invalid first identifier contribute no input byte flow. A readonly identifier
+can fail after reading, unlike an invalid identifier checked before input.
+Zero counts can still assign targets, whereas polling leaves them unchanged.
+Input errors on closed or write-only descriptors leave targets unchanged and
+cannot take a successful `&&` continuation. EOF can still follow assignments.
+The zero-count input probe is different: it assigns even when the probe fails;
+an earlier invalid `-u` still stops before assignment. Process-substitution pipe
+ends exist during word expansion, before redirection setup and `-u` validation.
+They use the reference shell's descending high-FD allocation and original-pipe
+fallback, rather than assuming fd 63. Temporary ends close with their command
+or compound scope; duplicates retain their resource. A generated `/dev/fd/N`
+argument is prompt data or an invalid read target, not an arbitrary writable
+identifier. Empty, blank-only (space/tab/LF), and comment-only process bodies create no
+pipe and disappear as arguments; as standalone redirect operands they fail
+setup with an ambiguous pathname. This also applies inside `$(<word)`:
+`value=$(< <())` is valid syntax but the file substitution fails, so its `&&`
+continuation does not run. `printf '%s' "$(< <())"` still runs `printf` with an
+empty argument; the substitution failure does not replace that command's
+status. Newline-only bodies are valid empty substitutions, not incomplete
+pipelines. Setup-only members do not make their group an fd-0 byte reader.
+Process substitutions inside conditional parameter operands, such as
+`${choice:+<(producer)}`, do not definitely create a descriptor. The graph
+retains both executing and skipped alternatives, with one shared decision
+for substitutions in that operand and parent decisions for nested operands.
+Later substitutions inherit only their executing alternatives, and cleanup
+closes only the pipe ends created on each path. Conditional parameter values
+remain runtime data; these alternatives do not evaluate those values. A
+retained graph combines feasible effects, not a claim that every substitution
+runs on every execution.
+Temporary descriptor state is tracked only when it can affect observable
+shell routing during its command or compound lifetime. Unobserved ends retain
+their graph effects without enumerating combinations of independent guards.
+A later unrelated read, after those ends have closed, does not activate that
+tracking. Nested FD uses, escaping duplicates, named allocations, and possible
+reuse of closed standard streams retain exact descriptor alternatives. The
+existing limits still fail closed when distinguishable states exhaust them.
+Timing alone does not make temporary descriptor identities observable. Entry
+occupancy comes from the current execution snapshot, after preceding commands
+and scope restoration: an earlier temporary close, a subshell-local close, or
+a successfully reopened stream does not enable tracking for unrelated later
+commands. Closes and moves within an owner's lifetime remain relevant. Low
+auxiliary identities likewise follow uses within that lifetime; earlier closes
+still constrain allocation without becoming new observations.
+The allocator keeps a bounded symbolic occupancy domain for fd 0..63. Its
+first-two-free and descending high-slot search conditions remain attached to
+each execution version, including paths retaining an original pipe end. It
+does not enumerate inherited descriptor tables or use the total number of
+substitutions in unrelated commands to select concrete identities. Anonymous
+ends retain their occupancy effects; identity-aware cleanup releases them
+without discarding numeric descriptor changes. Known allocations use a direct
+path when their incoming bindings already prove the selected descriptor.
+Named-FD allocations and temporary target/move-source saves retain those same
+joint occupancy constraints. The first/second-free search and the presence of
+a free low temporary slot are tested together, not by combining independent
+per-FD possibilities. For example, in
+`exec 3<&-; : <(:) "$(read -u3 -n0 probe && read -u11 value {fd}<<<payload)"`,
+the newly allocated here-string cannot reach fd 11. A feasible inherited fd-11
+input is still retained. Proving a source open restricts an execution version;
+an actual open, close, or move changes its occupancy instead.
+Named descriptors, process pipes, and shell saves share private symbolic
+allocation selectors. The relation starts at the first relevant allocation,
+not at the first process substitution. Unobserved numeric choices do not each
+create another execution version. A close releases exactly the selected FD;
+named variables and captured arguments keep their numeric identity after close,
+including when another allocation reuses that FD. Recursive imports preserve
+the same relationship. Temporary-save searches also honor a named source's
+numeric minimum. Selectors whose private lifetime ends are retired, while
+named values remain available. Above fd 63, the existing observed/private tail
+model remains conservative rather than promising exact allocation identities.
+These are three distinct concepts: a physical slot's current resource, a
+variable's retained numeric value, and an internal selector constraining which
+slot was chosen. Closing a named descriptor changes the first, not the second;
+another variable may subsequently acquire that same slot. Recursive shells
+import shared aliases as one physical identity. Closing either alias in a child
+affects both there, but neither parent's binding is changed. Consuming bytes
+can still advance the shared open-file description; the graph represents
+possible provenance, not remaining input or predicted EOF.
+Internally, each selector uses a first-high-bit choice for fd 0..63, with an
+all-low choice for the abstract high tail. Every Boolean assignment has a
+meaning, so equality and retirement do not depend on a separate validity
+predicate. Selector choices precede their matching physical occupancy bits in
+the decision ordering. Reduced-away choices remain unconstrained: assignment
+images still visit those choices and change the selected physical descriptor.
+For example, with fd 3 and fd 63 known free, allocate `{a}<<<first`, close
+`{a}`, then allocate `{b}<<<second` through a successful `&&` chain. Both
+variables retain the same number in 10..63. Closing `$a`'s slot in a child
+prevents a subsequent `read -u"$b"` there from receiving `second`; rebinding
+`a` does not change the value previously captured by a read argument. Without
+a bound below fd 64, the high-tail approximation can retain additional routes.
+This is an explicit precision limit, not evidence that every retained route
+occurs in every execution.
+Symbolic expressions and routing versions remain subject to the existing
+workspace limits and fail closed on exhaustion. Ephemeral predicate collection
+does not retain discarded expressions in the journal.
+Completed event entries are released after their last consumer: a pipeline
+keeps its common entry through its final stage, an asynchronous list keeps its
+parent entry through launch completion, and a group keeps setup and body state
+through publication. Disposed private saves release their selector and scratch
+metadata; named values retain their independent numeric identity after close.
+The public graph still uses the existing nodes, edges, and limits; callers
+continue to obtain private storage requirements through the workspace-size API.
+Failed-setup cleanup dependencies retain every `(descriptor, registration
+ordinal)` pair, including repeated saves of one descriptor. Range queries must
+not see only its latest registration. These persistent dependency trees are
+separate from canonical descriptor facts, including during collection. Failed
+setup replay inherits its caller's collection pins, keeping other read outcomes
+and private entry/undo maps alive while it creates temporary failure versions.
+Each redirect operation also retains its immutable entry until move publication
+and restoration finish; allocator refinement may replace the caller's current
+version without releasing that still-needed entry.
+Recursive cleanup similarly retains each segment's input until its cached
+input/output pair is published, independently of its evolving output version.
+Prepared frame-membership unions are snapshot roots too: a union across paths
+need not occur in any individual descriptor map.
+No source replay or canonical-index reconstruction is needed to preserve those
+lifetimes.
+The focused `shellsplit_read_input_test --selector-lifecycle` selection checks
+these alias/import cases and independently enumerates selector retirement and
+scratch-compaction semantics. The production-linked test accepts the same
+selection; fixed executor expectations are in
+`tests/cmake/test_bash_selector_lifecycle.cmake`. These are deterministic
+regressions, not additions to the tracked smoke corpus.
+
+The trusted reference-Bash read fixtures are registered as independent
+`shellsplit_bash_*` CTest cases: read input, allocation correlation, selector
+lifecycle, read proofs, private read outcomes, and outcome transfers. Each
+script runs exactly one fixed Bash probe with a five-second subprocess bound;
+CTest gives that probe a separate ten-second outer bound. Run the complete
+family with:
+
+```sh
+ctest --test-dir build \
+  -R '^shellsplit_bash_(read_input|allocation_correlation|selector_lifecycle|read_proofs|private_read_outcomes|outcome_transfers)$'
+```
+
+Invoking one script directly runs only its named fixture; there is no umbrella
+script whose timeout accumulates the other probes.
+Descriptor-sensitive builtin outcomes preserve that correlation even with no
+redirect operations. For example, after `${choice:+<(producer)}`, a successful
+`read -u63 -n0 first` can enable a later fd-63 read through `&&`, but its `||`
+continuation cannot borrow that successful path's pipe. This distinction does
+not predict EOF or other unknown runtime outcomes of an ordinary byte read.
+The same correlation applies to private pipeline stages and isolated groups:
+the child returns status to its own parent-entry alternative, not the union of
+all alternatives. Child redirects, assignments, and IFS changes do not escape.
+An observation of an unchanged inherited descriptor can refine that particular
+parent-entry alternative. This is not a child descriptor mutation: a child
+pipe or local open cannot prove that the corresponding parent descriptor
+exists. Observations are recorded when made, so a later child close does not
+erase a valid proof about the inherited descriptor.
+Synchronous command and backtick substitutions return sparse, outcome-indexed
+predicates over imported descriptor bindings, read capabilities, and captured
+argument value classes. Argument capture and nested outcome transfers request
+only their named dependencies, lazily, from immutable imported-entry anchors.
+This happens before option validation, preserving even failures before physical
+FD validation. Each requested value, identity, or access role is memoized in its
+execution version, including unknown facts as empty entries which export no
+predicate. Local writes and child-installed pipes cannot replace entry facts.
+Child entry never walks the root-wide read-name inventory, so independent
+substitutions do not perform a sibling-name cross-product. Collection and
+recursive rewinds retain these anchors through the existing journal-root links.
+An absent-name failure cannot be applied to a successfully allocated name.
+Allocation-site source spans preserve identity across construction, replay, and
+nested imports; journal-local slots and decision selector IDs are not portable
+allocation identities. These predicates contain borrowed identifiers,
+allocation-site pointers and FD numbers, never child-local journal roots. They
+are exported in stable descriptor/key order and exact conjunctions and clauses
+are interned in bounded workspace scratch. Equal status alone does not merge
+different binding, access, argument-value, or allocation-identity predicates.
+The indexes belong only to export scratch: recursive summaries never borrow
+them and parent checkpoint restoration does not retain child index mutations.
+The predicates are consumed before stream-join scratch is reused, then applied
+at the original word, assignment-value, or redirect-operand boundary in both
+construction and route resolution. Child stdout capture is a replacement, not
+an inherited-parent observation: `exec 1>&-; value=$(read -u1 -n0 probe)` remains
+a valid command and cannot prove the parent's stdout open. The existing import
+capture mask excludes these capture-owned observations, without suppressing
+status or auxiliary-FD proofs. Conditional substitutions retain their skipped
+alternative and its preceding phase status, rather than borrowing the executed
+alternative's status.
+Substitutions within one conditional parameter operand share the scanner's
+single guarded decision, including status-only completions. Nested operands
+are dominated by their parent's decision. Completed status-only guards are
+retired at operand/word boundaries. A guard survives longer only when an
+actually tracked process descriptor needs that decision, not merely because
+its operand contains process syntax. Those guards retire with the owner's
+pipe lifetime. This avoids multiplying unrelated operand choices.
+Command-local numeric read-argument captures, read-write signatures, and phase
+substitution statuses retire after outcome computation and restoration, before
+continuation joins. A missing capture is an empty private fact, never an
+inherited descriptor with the same numeric ordinal. Deferred input publication
+keeps its immutable pre-cleanup root. Imported observation predicates are
+separate facts and are not cleared with these local captures. Nonmutating
+executables without descriptor setup reconverge to their selected entry after
+consuming substitution values; their status cannot preserve a discarded private
+read outcome. Reads, assignment-only commands and persistent effects retain
+the predicates selecting their outcomes. Genuine fixed-pool exhaustion still
+returns failure-atomic `SHELL_DEP_ETRUNC`; limits have not been raised.
+Descriptor proofs always use the journal's immutable imported baseline plus
+explicit branch-local facts. Materialized routing tables are representative
+views, not evidence that a descriptor exists on a skipped observation path.
+Ordinary and file-optimized substitutions publish aggregate status and correlated
+events together: a later `$(<file)` replaces earlier substitution status just
+like a parsed child, without erasing earlier observations. Empty and
+blank substitutions are identity transfers, not successful commands;
+comment-only `$()` is also an identity transfer, while comment-only backticks
+return success in the reference Bash. Shared lexical classification, rather
+than graph node count, distinguishes these cases. Blank means space, tab, LF,
+and erased backslash-LF continuations. Comments end at LF; CR within a comment
+is comment text. CR (including CR before LF), vertical tab and form feed outside
+comments are ordinary word bytes and are retained even before LF. Only
+backslash-LF is a continuation: unquoted backslash-CR quotes CR, while inside
+double quotes both backslash and CR survive. These rules also apply to source
+ranges, canonical argv, builtin argument decoding and transformations.
+Heredoc delimiters compare exact bytes after quote removal; CR is not stripped
+from a delimiter or its document. There is no source line-ending normalization.
+Nonempty trivia-only fast-parser input succeeds with zero ranges; zero-length
+input remains invalid, and `shell_process_commands` still rejects inputs with
+no command records.
+Thus `a=$(false) b=$()` fails, whereas `false; value=$()` ends successfully.
+The preserved value belongs to the current command's preceding substitutions,
+not the previous shell command's `$?`. Assignment-only and redirect-only child
+bodies remain real commands with their own completion status. The status of an
+ordinary enclosing executable does not imply that a substitution succeeded.
+
+Empty process substitutions have different argv semantics: `<()`, `>()`, and
+blank/comment/continuation-only bodies, under the same byte rules above, yield
+no pathname. Whole unquoted words consisting of these fragments vanish;
+concatenated literal fragments remain (`a<()b` becomes `ab`), while `''<()`
+preserves one empty argument.
+`exec` and `exit` also consume this logical argument stream: `exec <() 3>out`
+retains descriptor setup, and `(true; exit <())` inherits the prior success.
+An explicit quoted empty word still occupies an argument and can fail.
+Command and wrapper selection, builtin options, graph argv and canonical
+builders share this classification. Lexical token/source records and
+diagnostic abstraction/transformation retain the original syntax. In
+particular, expansion cannot reclassify `<() name=value` as an assignment or
+turn a later word into a reserved grammar prefix. Application-provided netargv
+is already expanded data and is never reinterpreted as shell spelling.
+Resolver eligibility likewise follows surviving argv positions, not raw token
+ordinals. Elisions cannot move a `printf` format, `%n` target or protected `%b`
+operand into an ordinary-data role; quoted empty arguments still occupy slots.
+Callback requests retain exact original source spans.
+`shellsplit_read_input_test --owner-lifetimes` selects the empty-word and
+4/8/16-owner lifetime regressions, including production/supplied-fast parity
+and allocation-free graph parsing.
+`--semantic-words` selects the resolver/elision and semantic blank-byte
+regressions, including exact CR/VT/FF canonical argv, mixed command-substitution
+outcomes, and production graph/supplied-fast parity. The fixed fuzz oracles and
+Shellgate tests reuse the canonical byte cases; pinned-Bash probes anchor byte
+preservation and exact heredoc delimiter matching independently.
+Asynchronous process substitutions do not return completion proofs.
+
+Read target writes, implicit `REPLY`, IFS effects, and restored command-prefix
+bindings likewise remain specific to each execution version. In particular,
+`read -n0 -t"$timeout" fd 0>writeonly` can succeed by polling without assigning
+`fd`, or assign it and fail on the nonpolling path. The latter write must not
+invalidate the successful path's descriptor-variable association.
+With the documented default `pipefail`/`lastpipe` settings, the final stage
+determines the pipeline status; negation inverts that result and asynchronous
+launch success is independent of the child's later outcome.
+
+Bash also performs parent-side cleanup when it forks a compound command
+(`(...)`, or a pipeline/background brace group). Original process-substitution
+ends close in the invoking interpreter, while the new child inherits those
+open FDs with an empty process-end ownership set. This is different from
+publishing a child close. A foreground brace does not itself perform that
+fork cleanup. Duplicates of the original descriptor remain open: for example,
+copying an expansion-created fd 63 into fd 62 preserves that resource across a
+later compound fork, even though the parent's original fd 63 closes. A later
+pipeline stage inherits the post-cleanup parent table. Numeric descriptor
+reuse does not transfer ownership of the original slot to its duplicates.
+
+`shellsplit_read_input_test --private-outcomes` selects the outcome, isolation,
+fork-cleanup, and graph-capacity regressions. The production-linked test accepts
+the same selection. Fixed executor comparisons are in
+`tests/cmake/test_bash_private_read_outcomes.cmake`; these execute only trusted
+test programs, never corpus or fuzz input.
+
+`--read-proofs` selects inherited-input, ordered-validation, private-projection,
+recursive-export, cleanup-cache equivalence, and graph-capacity regressions.
+The trusted executor comparisons are in `tests/cmake/test_bash_read_proofs.cmake`.
+`--operand-classification` selects numeric/target-prefix, frozen timeout,
+process-path/tilde target, captured-empty suffix, signed-scalar,
+reachable-attribute, literal-target, exec/exit elision,
+and pending operand regressions in both read-input test variants, including
+failure-only continuations, preserved bindings, and allocation-free graph
+parsing. A dedicated lazy-observation work counter verifies that independent
+children scale linearly in their actual dependencies, and repeated argument
+requests in one version reuse both known and unknown entry facts.
+
+Whole-word and attached-payload numeric templates are prepared separately.
+Captured allocation digits refine a sole optional sign, including permitted
+numeric whitespace. Irreversible integer errors (including negative nonzero
+prefixes) and completed timeout conversions survive arbitrary later fragments.
+Timeout conversion is complete after six fractional digits and the seventh
+character's rounding decision; its signed/wrapped zero, nonzero, or invalid
+result cannot change with later suffixes. These proofs are captured before the
+first opaque fragment, separately for whole integers, whole timeouts, and
+attached payloads. Literal projection across unknown fragments cannot create
+a frozen prefix proof; it remains available for known-empty captures.
+Other general concatenations remain unknown because conversion can wrap or round.
+Strict integer conversion also retains invalid literal projections after opaque
+fragments, provided one argv entry is proven. `read -n"$unknown"x` and the
+corresponding `-N`/`-u` operands are argument failures, not possible input reads
+or unsupported descriptor lookups. This deletion-closed integer proof is not
+applied to timeout suffixes or unresolved splitting.
+
+Integer leading zeroes retain captured scalar identity: `read -u00"$fd"`
+selects the same allocated descriptor, while `read -n-0"$fd"` and the
+corresponding `-N`/`-u` forms fail before reading or assigning. Surrounding
+integer whitespace is preserved; nonzero numeric prefixes, digit suffixes,
+and timeout concatenations do not acquire an exact-FD proof. If the captured
+scalar is empty, its literal numeric projection is used instead:
+`unset fd; read -u0"$fd" value` reads fd 0, and its edge records numeric fd 0,
+not a descriptor variable named `fd`. Expansion still precedes redirections,
+even when setup subsequently allocates that same variable.
+
+The shared word walker ends leading-tilde recognition after an opaque expansion;
+`$empty~` and `${empty}~` therefore retain a literal tilde, including across
+escaped newlines. Read's optional process-fragment visitor projects a guaranteed
+nonempty pathname containing `/`, without evaluating its body or manufacturing
+an actual path. A constant-size possible-shape bitset recognizes scalar
+identifiers and a conservative `NAME[...]` envelope during the same word walk.
+Opaque fragments take its wildcard closure. A proven single argument with no
+accepting shape is invalid, including `pre"$unknown"-` and `"$unknown"~`.
+A process path can occur inside a dynamically formed subscript; its slash must
+not incorrectly establish failure in that case. Explicit array targets remain
+unsupported, and ambiguous dynamic shapes retain their existing classification.
+Unquoted splitting/list cardinality does not justify a single-target proof.
+Numeric option roles retain conversion rules (including ignored timeout suffixes),
+while prompt/delimiter roles accept pathname data. Child effects are still built
+independently before builtin argument validation. Other word-walker clients
+continue to reject nonempty process fragments unless explicitly supported.
+
+Read argument capture snapshots entry values before redirect setup; it does not
+perform a second semantic preflight. The reached post-setup option frontier
+validates effective Readline/array selectors. Pending prompt/delimiter and numeric
+operands never activate those selectors: after `unset fd`, `read -p"$fd" -e value`
+reads normally, while `read -n"$fd" -e value` is an ordinary numeric failure.
+An earlier descriptor error can stop the scan before a later selector. Any
+reachable unsupported selector still returns `SHELL_DEP_EPARSE`, including in
+recursive graphs; it is not discarded as an empty outcome or reported as capacity
+exhaustion. Source-only consumers reject contextual support they cannot prove.
+Recursive shells borrow path-specific immutable scalar checkpoints, so an
+unset-only variable remains known-empty even when it has never named a file
+descriptor. Only requested keys are queried. Physical FD imports remain
+separate, and versions with identical scalar state share a scalar view rather
+than obstructing descriptor-domain factoring. Child-local writes invalidate
+the inherited proof normally; no variable inventory is copied or rescanned.
+Successful whole-variable unsets also remove resettable predefined capabilities
+in descendants: after `unset RANDOM`, `result=$(read RANDOM <<<payload)` assigns
+an ordinary scalar, just as a parenthesized subshell does. Command, backtick,
+and process substitutions import the path's compact capability mask in constant
+space, independently of physical descriptor identities and orphan scopes.
+The mask remains part of execution-version identity at conditional joins;
+child-local unsets and assignments never change their parent's capabilities.
+Earlier temporary assignments are visible in later RHS substitutions too;
+they invalidate inherited argument-value proofs without changing physical FD
+imports. Child-local binding updates supersede this inherited value shadow.
+
+An empty exact scalar fragment selects a prepared
+literal identifier: `unset empty; read -n0 other"$empty"` changes only `other`.
+Target identity is looked up in the source name index during preparation;
+key-only named-allocation entries do not enable read-observation tracking.
+No owned target strings, whole-inventory scans, or source replay are required
+for execution alternatives. The same selected identity controls attribute
+validation and mutation publication, including IFS and temporary prefixes.
+Value capture is independent of a competing FD role: a provably invalid numeric
+prefix cannot suppress target refinement after an earlier dynamic `-u`.
+
+`--binding-invalidation` selects unstable-value, bulk-write, scope/rollback,
+and direct binding-work scaling regressions in both variants.
+`--variable-lifecycle` selects predefined-variable unsets, recursive capability
+inheritance, conditional joins, and child-isolation regressions in both variants.
+`--zero-prefix` checks integer leading-zero refinement, empty numeric selectors,
+descriptor identity through setup, and failure-atomic assignment effects.
+The `--outcome-effects` and `--recursive-proofs` selections cover assignment
+correlation and recursive transfers; both also run in the production-linked
+test. `--transfer-regressions` checks unknown-option errors, capture isolation,
+named-entry correlation, nested aliases, and bounded graph capacities in both
+builds; the allocator-instrumented selection also verifies zero heap use.
+`--substitution-status` checks ordinary/file completion replacement, empty-body
+identity, the reference shell's comment-only backtick behavior, conditional and
+nested transfers, phase ordering, zero heap use, and bounded graph capacities.
+`--bounded-work` checks unchanged scaling bounds with a known FD layout, plus
+bounded symbolic-pool exhaustion, supplied-fast equivalence, and workspace
+recovery with unknown inherited descriptors. Symbolic capacity can be exhausted
+even when a command's eventual graph would fit its node and edge limits; the
+result is failure-atomic truncation, not an approximate graph.
+Their trusted executor fixture is
+`tests/cmake/test_bash_outcome_transfers.cmake`.
+Source-only processor and anomaly-sequence builders cannot prove read-option
+roles or literal target projections that depend on captured scalar values.
+They reject those contextual forms conservatively. Shellgate instead reuses
+complete graph acceptance when
+collecting anomaly stages, so enabling scoring does not reject a supported
+contextual `read`. Both cold and warm type-cache paths retain the same lexical
+stage order and signatures; they do not serialize dependency-graph node order.
+A truncated parse or graph establishes no such proof: Shellgate skips anomaly
+scoring, cache access, and learning while retaining partial policy diagnostics
+and returning an undetermined truncation result.
+
+If graph capacity omits setup metadata, subsequent context-dependent semantic
+rejection reports truncation rather than diagnosing unsupported syntax from an
+incomplete snapshot. This rule applies during expansion and final routing;
+unfinished graphs remain failure-atomic.
+Read frontiers reuse the caller's evaluation workspace; no decoded argv, source
+reparse, or copy of the descriptor table is needed per option path.
+Static read arguments have one entry support check, independent of how many
+descriptor alternatives reach the owner. Captured or dynamic arguments still
+use their own entry version; descriptor validation and outcome refinement
+remain path-specific after setup.
+Completed setup roots are retained before continuation cleanup can collect the
+journal. Deferred byte/report publication needs those versions even when undo
+returns a different state; sibling outcomes and accumulated timing reports stay
+pinned through their publication as well. A live descriptor map also retains
+its process-end ownership tree: those isolated set nodes have sentinel values,
+not descriptor snapshots, and remain live until shell cleanup removes the ends.
+Provably infallible prepared setups (identity, numeric close/self-copy, and
+temporary process-end installation) do not replay an allocation/undo program
+to construct nonexistent setup-failure outcomes.
+Process cleanup retains its initial occupancy comparison only when needed;
+later pipes do not pin unused prefix domains. Domain imports preserve failed
+results for the immutable-source batch and stop at the first failed child, so
+bounded-pool exhaustion cannot cause repeated traversal of shared subtrees.
+For ordinary command bodies, deferred I/O retains only a sparse union of resolved
+byte routes, not dead undo/allocator history. Read and compound analysis retain
+their correlated semantic versions. Descriptor-only `exec` has no body I/O to
+cache; its returning descriptor state and timing reports have separate lifetimes.
+
+Selector-dependent occupancy changes use a memoized decision-DAG image instead
+of repeatedly partitioning the full domain by each possible FD. Named-source
+save searches share a suffix free-count automaton. Canonical decision nodes
+retain exact AVL interning with a compact-ID front cache. Computed operations
+instead use a bounded four-way memo cache with full-key comparisons: eviction
+only causes recomputation, never loss of semantic alternatives. Only semantic
+node pressure requires scratch compaction; memo occupancy does not. Reset,
+collection, and compaction invalidate memo entries before IDs can be reused.
+The `--memo-cache` selection forces collisions, eviction and ID reuse, and
+checks a constant comparison-work bound. The finite selector oracle checks assignment images independently of
+the decision-DAG operations, including reduced-away choices, multiple high bits
+with the same first choice, idempotent updates, and the high-tail choice.
+Checkpoint and paired-operation scaling fixtures establish free descriptor
+slots to isolate checkpoint growth; a separate capacity regression leaves
+inherited occupancy unknown and checks valid, fail-closed exhaustion. These
+changes do not enlarge public result types or change limits.
+Fuzzer builds use `-O2` with symbols, assertions, coverage instrumentation, and
+ASan/UBSan intact. Fixed startup oracles retain their 60-second whole-process
+deadline (70 seconds at CTest); no smoke cases or deadlines are relaxed.
+The semantic expansion traversal discovers process substitutions inside
+conditional parameter words as well as standalone arguments. Nonempty bodies
+create temporary pipe ends; empty/comment-only bodies do not allocate pipes.
+Thus `path=${choice:+<(producer)} read value` still represents a possible
+input through fd 0 if occupied high slots force the original pipe end onto
+closed stdin. Conditional creation and no-creation alternatives remain distinct.
+In the reference Bash's optimized `$(<word)` form, process descriptors created
+while expanding the filename remain visible during the enclosing command's
+remaining expansions, including later command substitutions. They close with
+that command, not when the file substitution finishes.
+Timeout classification follows the reference Bash's validated conversion to
+unsigned seconds: `-t4294967296` polls, while `-t4294967296.5` does not.
+Its whole-part conversion wraps at the reference's long width before sign
+validation: `-t18446744073709551616` polls, while
+`-t18446744073709551617` can consume input. Shellsplit reproduces that wrapping
+with defined unsigned arithmetic, including the reference's fractional rules.
+Unused file, inline-document and process input redirects retain their FD_OPEN
+setup effects; they are not reads. A process-input SUBST edge is data I/O, without the
+`SUBST_SHELL_WORD` data-to-code flag. These rules also apply through groups,
+pipelines, background jobs, and recursive substitutions. Explicitly observed
+high `-u` descriptors include Bash's temporary descriptor saves. This is a
+graph-semantics refinement in 0.16.0; no new public node or edge type is needed.
+
 `printf` likewise processes every `-v` option before its format, including
 attached and quoted targets; only the last selected `-v` variable is written.
 Static formats also track every `%n` scalar target, including format reuse,
@@ -439,17 +1050,33 @@ later assignments are still processed. Option errors stop the invocation;
 option parsing stops at `--` or the first operand. Top-level `local` cannot
 write in the supported function-free model. These builtin roles are shared
 between supported-syntax validation and descriptor mutation analysis.
+Declaration operands undergo quote removal and empty process-fragment elision
+before assignment recognition: `export f<()d=value` and `export fd+<()=value`
+write and append to `fd`. Their ENVVAR documents retain original source spans;
+the logical-name accessors return the decoded identifier. The same recognition
+drives descriptor invalidation, temporary-prefix handling, IFS tracking, and
+integer/protected/readonly restrictions. Quoted or escaped process-looking text
+stays literal. A command-position `fd<()=value` is still an executable word,
+because expansion cannot create a lexical assignment prefix.
 State-changing `declare`/`typeset -i` forms are unsupported: the integer
 attribute makes later assignments arithmetic evaluations that can change
 unrelated variables. Non-mutating queries, option errors, invalid scalar names,
 and canceled `-i`/`+i` attribute requests remain supported.
 Declaration assignments to Bash's predefined mutable integer names (`SECONDS`,
 `RANDOM`, `SRANDOM`, `OPTIND`, and `HISTCMD`) have the same restriction unless
-that invocation explicitly uses `+i`. A prior `unset` or attribute change is
-not enough to assume the variable is now a plain scalar without modeling that
-state. These names remain available to non-mutating declaration queries.
-Arbitrary-text `read` and `printf -v` writes to these five names are also
-unsupported because integer attributes can evaluate the value. `read -t0`,
+that invocation explicitly uses `+i`. The graph tracks a successful
+whole-variable `unset` on each execution path: a later write in the same shell
+then sees an ordinary scalar, while a conditional unset, an unset in another
+pipeline/subshell scope, or a path join retaining the original binding remains
+unsupported. Attribute-changing declarations other than the directly modeled
+`+i` invocation are still outside the supported state model. These names
+remain available to non-mutating declaration queries.
+Reachable `read` and `printf -v` writes to these five names are also
+unsupported because integer attributes can evaluate the value. Read target
+capabilities are checked after captured argument roles and redirect setup:
+`read -u3 RANDOM 3<&-` is a known builtin failure, not unsupported syntax.
+Earlier invalid targets similarly prevent later arithmetic assignments.
+`read -t0`,
 `unset`, and `%n`'s fixed decimal writes do not have that arithmetic side effect.
 Even `SECONDS`' initial non-evaluating setter cannot be relied on after a
 declaration changes the binding, so there is no setter-specific exception.
@@ -460,7 +1087,10 @@ unsupported for these names.
 Named-FD destinations must provide a stable scalar binding. Bash's predefined
 getters and automatically updated `_`, readonly names, arrays, and the executor-protected
 `POSIXLY_CORRECT`, `BASH_COMPAT`, and `BASH_XTRACEFD` are unsupported
-destinations, even after an earlier unset or attribute change.
+destinations. A predefined getter or array which Bash actually removes on
+`unset` becomes an ordinary scalar destination on that path; automatically
+recreated variables, unset-rejected arrays, readonly names, and frozen executor
+variables do not.
 `OPTIND` has a stable integer binding and remains a supported destination;
 numeric FD allocation cannot evaluate arbitrary assignment text.
 Writes by `read`, `unset`, and ordinary `declare`/`typeset` to a same-name
@@ -552,9 +1182,11 @@ and process substitutions with the same capture rules as their standard
 streams. When a later redirect, close, or `|&`
 binding supersedes an ordinary numeric file descriptor, the graph retains an
 `FD_OPEN` setup edge rather than a stale byte-flow edge; a FILE document with
-no remaining effective route is marked `TRANSIENT`. Transient heredoc and
-here-string documents have no `FD_OPEN` edge. Setup-only append opens carry
-`FD_OPEN_APPEND`.
+no remaining effective route is marked `TRANSIENT`. Heredocs and here-strings
+also retain reached `FD_OPEN` setup when their input is replaced or unused,
+and are marked `TRANSIENT` when no byte-use or live named binding remains.
+The flag does not erase setup or imply it never executed. Setup-only append
+opens carry `FD_OPEN_APPEND`.
 If a process substitution redirects away its nested inherited stream, its pipe
 still replaces the previous descriptor route. The graph retains an internal
 unconnected endpoint without inventing byte flow through the child. Numeric
@@ -656,8 +1288,23 @@ Setup failures use their own immutable, ordered cleanup program, using live
 saved descriptors just like successful completion. Balanced program segments
 reuse unchanged cleanup results through an indexed descriptor-dependency view;
 each possible failure does not walk the accumulated undo prefix again. The
-snapshot and final-route journals share one cleanup scratch pool in the
-caller-owned evaluation workspace. Closing or
+dependency view includes private saved-slot capabilities and the shared
+symbolic occupancy relation, so changing either invalidates affected cached
+cleanup results. Numeric prefixes whose saves cannot be observed return their
+entry table directly on failure. This includes low-target setup followed by a
+final high redirect: failure precedes that high target's replacement. Such
+prefixes still record diagnostics through the actual preceding stderr routes,
+without enumerating unobservable save/no-save histories. High-source copies,
+process allocation, moves, and later failures after a high-target change retain
+the ordered correlated cleanup path. Scaling regressions distinguish one forced
+failure after a growing successful setup from multiple possible file-open
+failures with distinct surviving named bindings. The former bounds total
+descriptor-map work; the latter bounds source preparation, cleanup-program
+composition, and executed undo leaves, separately from joining the distinct
+symbolic outcomes. Unrelated mutation targets retain an indexed `n log n`
+comparison budget across two input-size doublings, rather than scanning every
+inherited binding. The snapshot and final-route journals share one cleanup
+scratch pool in the caller-owned evaluation workspace. Closing or
 overwriting a save during setup can therefore leave earlier temporary routes
 installed after failure. Timing reports include only reached cleanup outcomes,
 not an unreachable successful restoration path.

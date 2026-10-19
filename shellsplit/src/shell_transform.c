@@ -195,10 +195,8 @@ static SHELL_NONNULL(1) size_t
   size_t written = 0;
   for (size_t i = 0; i < length; i++) {
     char c = text[i];
-    if (c == '\\' && quote != '\'' && i + 1 < length &&
-        (text[i + 1] == '\n' || text[i + 1] == '\r')) {
-      bool crlf = text[i + 1] == '\r' && i + 2 < length && text[i + 2] == '\n';
-      i += crlf ? 2 : 1;
+    if (c == '\\' && quote != '\'' && i + 1 < length && text[i + 1] == '\n') {
+      i++;
       continue;
     }
     if (destination)

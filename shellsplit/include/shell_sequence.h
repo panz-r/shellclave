@@ -44,6 +44,9 @@ shell_process_status_t shell_build_netargv_sequence_buffer(
  * empty payload is the anomaly-only sentinel argv[0]. This is not a netargv
  * transport and must never be used to authorize execution. All executable
  * stages retain their decoded executable-name records.
+ * Source-only sequence builders validate without descriptor-entry context;
+ * read roles/target projections requiring captured scalar values may return
+ * SHELL_PROCESS_EPARSE even when semantic graph construction proves support.
  * Byte limits apply to the final encoded sequence, not unreturned arguments
  * or other borrowed source text. A nonzero max_group_io_ops is one cumulative
  * budget across the immediate list and all collected nested execution bodies.
@@ -61,8 +64,9 @@ shell_process_status_t shell_build_command_netseq_buffer(
 
 /* Build one canonical netstring record per supported typed execution-stage
  * signature. Nested substitutions use the same child-before-parent,
- * source-order analysis sequence as shell_build_command_netseq_buffer(). An
- * argv-less redirect-only or structural empty Bash `time` stage is represented
+ * source-order analysis sequence and context-free supported-source boundary as
+ * shell_build_command_netseq_buffer(). An argv-less redirect-only or structural
+ * empty Bash `time` stage is represented
  * by a one-word nested netargv with an empty sentinel argv[0]. That sentinel is
  * anomaly-only and is never a policy-evaluable netargv.
  * Control compounds, function declarations, array semantics, and unmodeled
@@ -81,7 +85,7 @@ shell_build_type_netseq_buffer(const char *command_line, size_t command_length,
  * parse of shell source. Both include all supported nested execution stages in
  * child-before-parent, source-order analysis order. An argv-less redirect-only
  * or structural empty Bash `time` stage contributes the anomaly-only empty
- * argv[0] sentinel described above.
+ * argv[0] sentinel and context-free supported-source boundary described above.
  * Each output independently observes `limits`. Control
  * compounds, function declarations, array semantics, and unmodeled Bash
  * `[[ … ]]`, `(( … ))`, `$"…"`, and `;&` / `;;&` forms are rejected

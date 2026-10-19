@@ -264,8 +264,12 @@ typedef struct {
  *
  * On success, result contains ranges into cmd. Complete heredoc bodies are
  * data, not executable ranges; their declaration remains a single
- * SHELL_TYPE_HEREDOC range. Comment-only source spans yield no range. On
- * truncation, completed ranges remain available and result->status includes
+ * SHELL_TYPE_HEREDOC range. Nonempty trivia-only spans (space, tab, LF, erased
+ * backslash-LF continuations, comments ending at LF) succeed with no range.
+ * CR, VT and FF are ordinary word bytes, including CR before LF; no line-ending
+ * normalization is performed. Only backslash-LF is a continuation.
+ * Zero-length input remains SHELL_EINPUT. On truncation, completed ranges
+ * remain available and result->status includes
  * SHELL_STATUS_TRUNCATED.
  * In strict_mode, complete-source syntax validation precedes range/group
  * capacity checks: a malformed suffix is SHELL_EPARSE, not SHELL_ETRUNC.

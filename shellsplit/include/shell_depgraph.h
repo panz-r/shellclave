@@ -112,10 +112,11 @@ typedef enum {
   SHELL_DEP_DOC_FLAG_DYNAMIC_NAME = 1 << 1,
   /* The heredoc delimiter was quoted and its body is literal. */
   SHELL_DEP_DOC_FLAG_HEREDOC_LITERAL = 1 << 2,
-  /* A document is evaluated during redirection setup but every ordinary
-   * descriptor route to it is later replaced or closed. A transient FILE
+  /* A document is evaluated during redirection setup but retains no effective
+   * byte-use or persistent named-descriptor route. A transient FILE
    * document retains its FD_OPEN setup edge without claiming byte flow.
-   * Transient heredoc and here-string documents have no FD_OPEN edge. A named
+   * Heredoc and here-string documents likewise retain reached FD_OPEN setup
+   * when no effective byte use remains, including a zero-count read. A named
    * setup is non-transient only while the final persistent descriptor table
    * still routes that name to the document; a later persistent close or rebind
    * leaves the historical FD_OPEN edge as setup evidence and marks its document
@@ -146,6 +147,12 @@ typedef enum {
   SHELL_EDGE_WRITE = 1,
   SHELL_EDGE_APPEND = 2,
   SHELL_EDGE_PIPE = 3,
+  /* Possible pathname argument of a simple command, represented only by a
+   * FILE document and excluding its first surviving argv word. Prefix
+   * assignments, redirects and elided words do not advance that position;
+   * quoted empty words do. Wrapper targets remain arguments of their outer
+   * command. ARG is an undirected association, not a byte-use edge or
+   * executable-identity declaration. */
   SHELL_EDGE_ARG = 4,
   SHELL_EDGE_ENV = 5,
   SHELL_EDGE_SUBST = 6,
@@ -282,7 +289,11 @@ typedef enum {
 /**
  * CMD node - an isolated shell command
  *
- * Tokens are zero-copy pointers into the original input string.
+ * Tokens are zero-copy pointers into the original input string. Wholly elided
+ * empty process-substitution words are omitted; surviving concatenated words
+ * retain their source spelling (for example a<()b, whose static value is ab).
+ * Quoted empty arguments survive. This expansion does not reopen the lexical
+ * assignment-prefix or reserved-word positions.
  * cwd_offset is the offset into graph->cwd_buf.data for the resolved working
  * directory.
  */
@@ -475,8 +486,9 @@ typedef struct {
  * backslash, and ANSI-C spellings retain their source span. Other `value`
  * fields preserve physical source bytes; for `<<-`, use
  * shell_dep_doc_content_length() and
- * shell_dep_doc_write_content() to obtain logical tab-stripped content. CRLF
- * heredoc framing is recognized, but carriage returns remain content bytes.
+ * shell_dep_doc_write_content() to obtain logical tab-stripped content. Source
+ * line boundaries use LF; carriage returns remain significant in both
+ * delimiter words and content bytes.
  * An ENVVAR assignment's name and value spans belong to one contiguous source
  * word; its `=` or `+=` delimiter lies between them and can contain escaped
  * line continuations. Quoting can cross that delimiter, so use
@@ -688,7 +700,9 @@ typedef struct {
  * alternatives remain possible: rejected RHS substitutions are retained only
  * on the former, without terminating the latter's continuation. A quoted empty
  * scalar word is an argv entry; an unquoted expansion or quoted "$@" can
- * instead produce no entries. Quoted name enumeration with * and defaulted
+ * instead produce no entries. Empty process fragments produce no pathname;
+ * wholly unquoted empty-process words disappear before command/wrapper and
+ * builtin-argument selection. Quoted name enumeration with * and defaulted
  * positional lists (-/:-) retain at least one entry. Quoted positional-list
  * error operators (?/:?) either retain an entry or abort expansion; an abort is
  * not an assignment-only dispatch. These presence proofs do not imply exactly
@@ -729,6 +743,22 @@ typedef struct {
  * expression roles. Quoting such a target does not disable its subscript
  * evaluation. Static scalar queries and non-evaluating string/file predicates
  * remain supported; expression argument cardinality must be known.
+ * Declaration operands recognize assignments after quote removal and empty
+ * process-fragment elision. Scalar writes invalidate the same named bindings
+ * as plain spellings; integer/protected/readonly restrictions still apply.
+ * ENVVAR names retain their raw spans and decode through the name accessors.
+ * This does not change lexical command-prefix assignment recognition.
+ * A successful whole-variable unset of a resettable predefined Bash getter,
+ * integer, or array is retained in the path-local execution journal. Later
+ * writes in that shell and its descendants are ordinary scalar writes.
+ * Command, backtick, and process substitutions inherit the path's capability
+ * mask, separately from physical descriptor imports. Child-local changes do
+ * not publish into their parent. A
+ * conditional unset, a child-shell unset observed from its parent, or a join
+ * which can retain the original predefined binding does not establish that
+ * proof. Automatically recreated, unset-rejected, readonly, and executor-
+ * frozen variables never acquire it. This is shell-state semantics, not a
+ * source-only tokenizer decision.
  * `getopts` likewise rejects integer/protected or runtime-expanded destinations
  * and unknown operand cardinality before its target. Quoted runtime optstrings
  * must leave every possible target position safe (including an expanded --).
@@ -795,36 +825,43 @@ typedef struct {
  * artifact without a stale byte-flow edge. A replaced FILE document retains
  * its FD_OPEN setup-time descriptor binding and carries
  * SHELL_DEP_DOC_FLAG_TRANSIENT when no effective route remains. Replaced
- * heredoc and here-string documents have no FD_OPEN edge. An expandable
- * document retains its setup-time SUBST flow as well.
+ * heredoc and here-string documents likewise retain their FD_OPEN setup,
+ * including input installed but not consumed by a modelled builtin. An
+ * expandable document retains its setup-time SUBST flow as well.
  *
  * Bash named descriptors (`{name}>file`) retain the bare descriptor name on
  * their FD_OPEN, FD_CLOSE, and affected routing edges. A whole redirection
  * operand `$name` or `${name}` may reuse that descriptor. Their names use the
- * same escaped-physical-line-ending normalization as source parsing; general
- * parameter expansion is intentionally not interpreted as a descriptor
- * reference. An unknown, closed, reassigned, or syntactically composite named
- * reference is an error rather than a guessed route, except that a proven
- * physical self-duplication/move is a no-op even on a closed slot. Its variable
- * binding must still be established and unchanged. With Bash's default
- * `varredir_close` behavior, a current-shell
- * builtin and a non-isolated brace-group redirect tail retain
- * an open named binding in that shell. External-command redirects run in a
- * child: neither named allocations nor unsaved move-source closes change its
- * parent. Static dispatch uses the default Bash builtin set and the effective
- * command/builtin wrapper; unresolved dispatch retains both compatible
- * execution scopes. A reached builtin wrapper fixes current-shell redirect
- * setup even when an inner command wrapper selects an external executable.
- * Rebinding a descriptor variable does not close its earlier allocations;
- * their physical slots remain available to numeric uses. Temporary redirects
- * restore the state at their first modification, including allocations made
- * earlier in the same setup list. Redirect-only and assignment-only commands do
- * not retain named allocations. Subshell groups and groups executing as a
- * pipeline member or background job retain bindings only in their private
- * execution scope. A local pipeline/background command never publishes its
- * mutations into an enclosing private group. A conditional unset or
- * reassignment invalidates the binding proof for later unconditional uses; an
- * explicit reallocation establishes a new binding. Leading assignments on a
+ * same source normalization as parsing: only backslash-LF is erased. CR stays
+ * significant, including before LF, so it cannot join an identifier across a
+ * physical line. General parameter expansion is intentionally not interpreted
+ * as a descriptor reference. An unknown, closed, reassigned, or syntactically
+ * composite named reference is an error rather than a guessed route, except
+ * that a proven physical self-duplication/move is a no-op even on a closed
+ * slot. Its variable binding must still be established and unchanged. With
+ * Bash's default `varredir_close` behavior, a current-shell builtin and a
+ * non-isolated brace-group redirect tail retain an open named binding in that
+ * shell. External-command redirects run in a child: neither named allocations
+ * nor unsaved move-source closes change its parent. Static dispatch uses the
+ * default Bash builtin set and the effective command/builtin wrapper;
+ * unresolved dispatch retains both compatible execution scopes. A reached
+ * builtin wrapper fixes current-shell redirect setup even when an inner command
+ * wrapper selects an external executable. Rebinding a descriptor variable does
+ * not close its earlier allocations; their physical slots remain available to
+ * numeric uses. Temporary redirects restore the state at their first
+ * modification, including allocations made earlier in the same setup list.
+ * Redirect-only and assignment-only commands do not retain named allocations.
+ * Subshell groups and groups executing as a pipeline member or background job
+ * retain bindings only in their private execution scope. A local
+ * pipeline/background command never publishes its mutations into an enclosing
+ * private group. A conditional unset or reassignment invalidates the binding
+ * proof for later unconditional uses; an explicit reallocation in the same
+ * lexical group or after returning to an enclosing group establishes a new
+ * binding. Reallocation of an orphaned descriptor variable only after entering
+ * a deeper compound is rejected until its physical-slot alternatives can remain
+ * correlated across that boundary. Repeated unsets do not close the orphaned
+ * physical descriptor or change the scope where it was orphaned; only a
+ * successful supported reallocation clears that state. Leading assignments on a
  * command are temporary: they do not replace a visible descriptor-variable
  * binding while that command's redirects or nested substitutions expand.
  * Opening a named file/document route first consumes Bash's lowest free
@@ -857,7 +894,132 @@ typedef struct {
  * Completion and Readline can expand input data as shell source or execute
  * registered callbacks even in a fresh noninteractive shell with terminal
  * input. Ordinary `read` remains supported; e/E bytes used as option operands
- * or variable names are not Readline selectors.
+ * or variable names are not Readline selectors. Their effective roles are
+ * validated against captured entry values after redirect setup, not a union
+ * of all syntactically possible roles. Earlier option/descriptor failures
+ * terminate that path before later selectors can activate.
+ * Recursive analysis inherits known-empty scalar facts independently of
+ * descriptor routing, including variables which have never named an FD.
+ * Builtin `read` uses only its selected readable input: fd 0 by default, or
+ * the last valid `-u` operand, validated in option order after redirect setup.
+ * Static decimal operands and exact tracked `$fd`/`${fd}` references are
+ * supported (including attached and quoted forms). Named argument values are
+ * captured before redirects can reallocate their variables. Assignment RHS
+ * substitutions see preceding prefix assignments, including temporary ones;
+ * ordinary argv expands before those temporary assignments. Bash redirection
+ * expansion and IFS splitting retain the separate shell binding table.
+ * Unquoted names
+ * require incoming IFS not to split digits. Other runtime descriptor values
+ * are unsupported, not ordinary-data resolver requests. Timeout-zero polling,
+ * zero character counts, and pre-input validation failures have no byte READ.
+ * Unknown numeric count/timeout operands also retain early invalid-number
+ * failures; later options cannot repair them or add descriptor proofs to them.
+ * Invalid literal identifier prefixes survive dynamic target expansions;
+ * captured-empty values also refine invalid suffixes. An invalid first target
+ * fails before input, later errors retain only earlier assignments, and
+ * timeout-zero polling bypasses target validation.
+ * Whole-word and attached signed scalar operands retain separate numeric
+ * facts; known allocation digits with a minus sign fail before input. Integer
+ * leading zeroes preserve that sign and exact descriptor identity; a captured
+ * empty fragment leaves the literal numeric operand, published with its
+ * numeric FD rather than the empty variable's name. Negative
+ * nonzero integer prefixes also prove failure across unknown suffixes. Invalid
+ * integer literal suffixes prove failure for a single argument too; timeouts
+ * and unresolved splitting do not share that deletion-closed rule. A
+ * completed timeout conversion (six fractional digits plus the seventh
+ * character's rounding decision) retains its result across later fragments;
+ * incomplete/general concatenations retain unknown wrapping/rounding behavior.
+ * An expansion ends leading-tilde recognition. Single-argument target proofs
+ * recognize scalar identifiers and a conservative NAME[...] envelope; invalid
+ * literal suffixes cannot be repaired by an opaque fragment. A process path
+ * can occur inside a dynamically formed subscript, so '/' alone does not prove
+ * failure. Explicit array targets remain unsupported. Unquoted splitting and
+ * list expansion do not establish a single-target proof.
+ * Their child effects remain visible even when read fails. Pathnames used as
+ * prompt/delimiter data are not target errors. Known-empty scalar
+ * fragments select their prepared literal target identity, not an arbitrary
+ * variable write. Arithmetic targets are unsupported only if assignment is
+ * reachable after option and descriptor validation.
+ * Every reached -u validates existence and refines its continuation; failure
+ * from EOF, polling, targets or later options is not a proof of absence.
+ * Temporary redirects are restored before returning those facts. Private
+ * scopes may return observations of unchanged inherited descriptors, never
+ * evidence derived from child-installed pipes or descriptors.
+ * This includes synchronous command/backtick substitutions: their predicates
+ * retain imported argument value classes and allocation identity, paired with
+ * their returning status even on failures before FD validation. Child capture
+ * pipes cannot prove parent descriptor availability. Named dependencies are
+ * captured lazily from immutable imported-entry anchors and memoized per
+ * version/role, including unknowns; child entry does not scan sibling names.
+ * Conditional substitutions keep a skipped path with its prior status. All
+ * substitutions within one conditional operand share its decision; nested
+ * operands cannot execute on a skipped parent. Descriptor proofs use immutable
+ * imported facts and branch-local changes, never a representative routing
+ * table. Ordinary and file-optimized substitutions supersede status without
+ * erasing earlier observations. Empty or blank substitutions (space, tab, LF
+ * and erased backslash-LF continuations), and comment-only $(), preserve the
+ * current command's preceding substitution status; comment-only backticks
+ * return success. A new assignment-only command starts with success, not the
+ * previous command's status. Success of an ordinary enclosing executable does
+ * not imply that a substitution succeeded. Comments end at LF; CR, VT and FF
+ * outside comments are not blank. Nonblank bodies which cannot produce retained
+ * commands are rejected, never modeled as empty success. Numeric argument
+ * captures and phase status are command-local; deferred I/O retains its
+ * pre-cleanup immutable snapshot. Exported predicates are interned by complete
+ * meaning, not by status alone. Nonmutating executables without descriptor
+ * setup discard private substitution outcome distinctions at their continuation
+ * boundary. Read target/REPLY/IFS writes remain paired with the paths that
+ * assign them; a successful poll does not inherit writes from a failing
+ * nonpolling path. Unused input redirects retain setup, not consumption;
+ * process-input SUBST is ordinary I/O without SUBST_SHELL_WORD. Temporary high
+ * descriptor saves remain observable when explicitly selected with `-u`.
+ * Conditional parameter operands retain creation and no-creation alternatives
+ * for their process-substitution descriptors. Substitutions in one operand
+ * share its execution decision, and nested operands respect their parent.
+ * Unobserved temporary descriptors retain graph effects without enumerating
+ * independent guard combinations. Descriptor observation is scoped to the
+ * command/compound lifetime, including nested uses and escaping aliases. Timing
+ * alone does not require physical identities. Incoming standard-FD occupancy
+ * uses the actual phase snapshot, including scope restoration and reopening;
+ * historical closes outside this lifetime do not enable tracking. Symbolic
+ * occupancy preserves the first-two-free and high-slot-search conditions for
+ * moved and retained pipe ends, without enumerating inherited descriptor tables
+ * or increasing pressure for unrelated source lifetimes. Named allocations and
+ * temporary descriptor saves retain the same joint constraints, including
+ * low-slot availability. Existence observations restrict a version;
+ * opens/closes change it. Private allocation selectors preserve named/save/pipe
+ * identities in fd 0..63 through closes, reuse, undo, and recursive imports,
+ * without a separate version per hidden numeric choice. Named variables retain
+ * their selected numeric value after close. The existing conservative
+ * observed/private tail model applies above that range. Imported aliases of one
+ * selected descriptor share one child-local slot; closing either alias affects
+ * both in that child, not its parent bindings. Child reads can still advance
+ * shared open-file descriptions. The graph models possible provenance, not byte
+ * availability or predicted EOF. Cleanup releases the selected descriptor;
+ * explicit descriptor changes remain. Descriptor-sensitive builtin outcomes
+ * keep their selected versions through connectors, even when the builtin has no
+ * redirects. Private pipeline/group outcomes select their own parent-entry
+ * alternatives without publishing child mutations. Forking a compound closes
+ * the invoking shell's original process-substitution ends; the child inherits
+ * those FDs, and explicit duplicates survive the parent's cleanup. Later
+ * pipeline stages inherit that post-cleanup parent table, not the preceding
+ * child's mutations. Process expansions inside parameter words likewise
+ * preserve original-pipe fallback onto a closed standard stream.
+ * Empty/comment-only process substitutions create no pathname: inside
+ * $(<word) they produce execution failure, not a parse error or a pipe.
+ * Captured values can resolve competing option/FD roles which source-only
+ * consumers conservatively reject, and identify invalid numeric/empty targets
+ * even after `--`. Invalid first targets fail before input; invalid later
+ * targets retain possible input and preceding writes, then fail. Timeout-zero
+ * classification includes Bash's whole-part wrapping and validated conversion
+ * to unsigned seconds.
+ * Stable scalar unsets can establish empty captured values. Automatically
+ * updated variables such as $_ retain unknown captures, even after unset:
+ * `unset _; : 1; read -n"$_" value <<<payload` must retain possible input.
+ * Bulk scalar writes invalidate named bindings in each immutable execution
+ * version, not physical descriptors. Prepared temporary-prefix exclusions and
+ * setup-failure restoration preserve their own incoming bindings; no global
+ * observation-inventory or mutation-history scan is required per write.
  *
  * Shell builtin roles use a static quote-removed spelling: `e'x'ec` and
  * `com'mand' -p e'x'ec` have the same descriptor semantics as their plain
@@ -1019,7 +1181,7 @@ void shell_dep_graph_dump(const shell_dep_graph_t *g, FILE *fp)
  *   (PIPE/SEQ/AND/OR require CMD/GROUP endpoints; SUBST additionally permits
  *    ENDPOINT and DOC(FILE) sources and DOC(HEREDOC/HERESTRING) targets; READ
  * requires DOC→CMD/GROUP, WRITE/APPEND require an execution endpoint→DOC or
- * ENDPOINT, ENV requires DOC→CMD, ARG requires CMD↔DOC; FD_OPEN is a
+ * ENDPOINT, ENV requires DOC→CMD, ARG requires CMD↔DOC(FILE); FD_OPEN is a
  * forward setup binding: execution→DOC for output, DOC→execution for input,
  * execution→ENDPOINT for process-substitution output, or
  * execution/ENDPOINT→execution for descriptor routing. An internal retained

@@ -295,21 +295,30 @@ static void test_builtin_option_semantics(void) {
           shellsplit_test_builtin_options[i].source, contexts[c].suffix);
       CHECK(length > 0 && (size_t)length < sizeof(source));
       bool supported = shellsplit_test_builtin_options[i].supported;
+      bool syntax_supported =
+          supported || shellsplit_test_builtin_options[i].stateful;
       if (shell_tokenizer_has_unsupported_semantics(source, (size_t)length) !=
-          !supported)
+          !syntax_supported)
         fprintf(stderr, "builtin option classification mismatch: %s\n", source);
       CHECK(shell_tokenizer_has_unsupported_semantics(source, (size_t)length) ==
-            !supported);
+            !syntax_supported);
       shell_processed_commands_t processed = {0};
       CHECK(shell_process_commands(source, (size_t)length, NULL, &processed) ==
-            (supported ? SHELL_PROCESS_OK : SHELL_PROCESS_EPARSE));
-      if (!supported)
+            (syntax_supported ? SHELL_PROCESS_OK : SHELL_PROCESS_EPARSE));
+      if (!syntax_supported)
         CHECK(processed.commands == NULL && processed.command_count == 0 &&
               processed.groups == NULL && processed.group_count == 0);
       shell_processed_commands_free(&processed);
       shell_dep_graph_t graph = {0};
-      CHECK(shell_dep_graph_parse(source, (size_t)length, NULL, NULL, &graph) ==
-            (supported ? SHELL_DEP_OK : SHELL_DEP_EPARSE));
+      shell_dep_error_t graph_status =
+          shell_dep_graph_parse(source, (size_t)length, NULL, NULL, &graph);
+      if (graph_status != (supported ? SHELL_DEP_OK : SHELL_DEP_EPARSE))
+        fprintf(stderr,
+                "builtin option graph classification mismatch: %s "
+                "status=%d expected=%d\n",
+                source, graph_status,
+                supported ? SHELL_DEP_OK : SHELL_DEP_EPARSE);
+      CHECK(graph_status == (supported ? SHELL_DEP_OK : SHELL_DEP_EPARSE));
       if (supported)
         CHECK(shell_dep_graph_validate(&graph).valid);
       else
@@ -319,16 +328,16 @@ static void test_builtin_option_semantics(void) {
       bool features = false;
       CHECK(shell_build_netargv_sequence_buffer(source, (size_t)length, NULL,
                                                 &sequence, &count, &features) ==
-            (supported ? SHELL_PROCESS_OK : SHELL_PROCESS_EPARSE));
-      if (!supported)
+            (syntax_supported ? SHELL_PROCESS_OK : SHELL_PROCESS_EPARSE));
+      if (!syntax_supported)
         CHECK(sequence.data == NULL && sequence.length == 0 && count == 0 &&
               !features);
       shell_netstring_buffer_free(&sequence);
       shell_netstring_buffer_t raw = {0}, type = {0};
       CHECK(shell_build_anomaly_netseqs_buffer(source, (size_t)length, NULL,
                                                &raw, &type, &count) ==
-            (supported ? SHELL_PROCESS_OK : SHELL_PROCESS_EPARSE));
-      if (!supported)
+            (syntax_supported ? SHELL_PROCESS_OK : SHELL_PROCESS_EPARSE));
+      if (!syntax_supported)
         CHECK(raw.data == NULL && type.data == NULL && count == 0);
       shell_netstring_buffer_free(&raw);
       shell_netstring_buffer_free(&type);
@@ -336,14 +345,14 @@ static void test_builtin_option_semantics(void) {
       size_t transformed_count = 0;
       CHECK(shell_transform_command_line(source, (size_t)length, NULL,
                                          &transformed, &transformed_count) ==
-            (supported ? SHELL_TRANSFORM_OK : SHELL_TRANSFORM_EPARSE));
-      if (!supported)
+            (syntax_supported ? SHELL_TRANSFORM_OK : SHELL_TRANSFORM_EPARSE));
+      if (!syntax_supported)
         CHECK(transformed == NULL && transformed_count == 0);
       shell_transformed_command_list_free(transformed, transformed_count);
       shell_abstract_command_t *abstract = NULL;
       CHECK(shell_abstract_command_parse(source, (size_t)length, &abstract) ==
-            (supported ? SHELL_ABSTRACT_OK : SHELL_ABSTRACT_EPARSE));
-      if (!supported)
+            (syntax_supported ? SHELL_ABSTRACT_OK : SHELL_ABSTRACT_EPARSE));
+      if (!syntax_supported)
         CHECK(abstract == NULL);
       shell_abstract_command_free(abstract);
     }
@@ -979,7 +988,7 @@ static void test_production_source_scanner_contract(void) {
                                       &after) &&
           after == strlen("{trace}") &&
           !shell_source_parse_named_fd("{9}>out", 0, strlen("{9}>out"), &after);
-  static const char continued_named[] = "{f\\\r\nd}\\\n>out";
+  static const char continued_named[] = "{f\\\nd}\\\n>out";
   size_t marker = (size_t)(strrchr(continued_named, '>') - continued_named);
   size_t operator_position = 0;
   valid = valid &&
@@ -998,10 +1007,10 @@ static void test_production_source_scanner_contract(void) {
   valid = valid && shell_source_comment_starts('#', true) &&
           !shell_source_comment_starts('#', false) &&
           !shell_source_comment_starts('x', true) &&
-          shell_source_line_content_end("line\r\n", 6, 0) == 4 &&
+          shell_source_line_end("line\r\n", 6, 0) == 5 &&
           shell_source_next_line("line\nnext", 9, 0) == 5;
-  static const char list_trivia[] = " \\\r\n# note\r\n\t\nstage";
-  size_t stage_start = strlen(" \\\r\n# note\r\n\t\n");
+  static const char list_trivia[] = " \\\n# note\r\n\t\nstage";
+  size_t stage_start = strlen(" \\\n# note\r\n\t\n");
   valid = valid &&
           shell_source_skip_list_trivia(list_trivia, sizeof(list_trivia) - 1,
                                         0) == stage_start &&
@@ -2007,7 +2016,7 @@ static void test_production_fd_target_contract(void) {
       {"file[[:digit:]]", SHELL_PROCESS_LEGACY_REDIRECT_PATH},
       {"\\", SHELL_PROCESS_LEGACY_REDIRECT_UNSUPPORTED},
       {"\"\\", SHELL_PROCESS_LEGACY_REDIRECT_UNSUPPORTED},
-      {"\"\\\r\n\"$var", SHELL_PROCESS_LEGACY_REDIRECT_UNSUPPORTED},
+      {"\"\\\n\"$var", SHELL_PROCESS_LEGACY_REDIRECT_UNSUPPORTED},
       {"$'unterminated$var", SHELL_PROCESS_LEGACY_REDIRECT_UNSUPPORTED},
       {"prefix<(unterminated", SHELL_PROCESS_LEGACY_REDIRECT_UNSUPPORTED},
       {"{one,two}", SHELL_PROCESS_LEGACY_REDIRECT_UNSUPPORTED},
@@ -2325,7 +2334,7 @@ static void test_modern_shell_syntax_boundaries(void) {
       "printf x |& cat",
       "! ! printf x |& cat",
       "! \\\nprintf x |& cat",
-      "! \\\r\nprintf x |& cat",
+      "! \\\nprintf x |& cat",
       "printf x 2>/tmp/err |& cat",
       "printf x 3>/tmp/trace |& cat",
       "{ printf x; } |& { cat; }",
@@ -3538,7 +3547,8 @@ static void test_document_prefix_boundaries(void) {
         continue;
       documents++;
       const shell_dep_doc_t *doc = &graph.nodes[node].doc;
-      bool first = doc->value_len == 3 && memcmp(doc->value, "one", 3) == 0;
+      bool first = (doc->value_len == 3 && memcmp(doc->value, "one", 3) == 0) ||
+                   (doc->value_len == 4 && memcmp(doc->value, "one\r", 4) == 0);
       uint32_t owner =
           command_nodes[cases[i].split_documents && first ? 0 : count - 1];
       uint32_t read_fds = 0;
@@ -4691,9 +4701,9 @@ static void test_nested_expansion_features(void) {
       {"printf $((1 + 2))", "$((1 + 2))", "1 + 2"},
       {"printf \"$VALUE$((1 + 2))\"", "$((1 + 2))", "1 + 2"},
       {"printf pre$((1 + $((2))))$VALUE", "$((1 + $((2))))", "1 + $((2))"},
-      {"printf $\\\n(\\\r\n(1 + 2)\\\n)$VALUE", "$\\\n(\\\r\n(1 + 2)\\\n)",
+      {"printf $\\\n(\\\n(1 + 2)\\\n)$VALUE", "$\\\n(\\\n(1 + 2)\\\n)",
        "1 + 2"},
-      {"printf \"$VALUE$((1\\\n + 2)\\\r\n)\"", "$((1\\\n + 2)\\\r\n)",
+      {"printf \"$VALUE$((1\\\n + 2)\\\n)\"", "$((1\\\n + 2)\\\n)",
        "1\\\n + 2"},
   };
   for (size_t i = 0; i < sizeof(arithmetic) / sizeof(arithmetic[0]); i++) {

@@ -12,6 +12,7 @@
 #include "shell_depgraph_internal.h"
 #include "shell_netstring.h"
 #include "shell_processor.h"
+#include "shell_processor_internal.h"
 #include "shell_sequence.h"
 #include "shell_source_internal.h"
 #include "shell_tokenizer.h"
@@ -4049,14 +4050,9 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
                         .strict_mode = gate->strict_mode};
   shell_error_t ferr = shell_parse_fast(cmd, cmd_len, &lim, &fast);
   bool parse_truncated = ferr == SHELL_ETRUNC;
-  bool whitespace_only = true;
-  for (size_t i = 0; i < cmd_len; i++) {
-    if (!isspace((unsigned char)cmd[i])) {
-      whitespace_only = false;
-      break;
-    }
-  }
-  if (whitespace_only) {
+  /* A successful zero-range parse already establishes semantic trivia.
+   * Do not override a parse error with a second, broader C-whitespace scan. */
+  if (ferr == SHELL_OK && fast.count == 0) {
     out->verdict = SG_VERDICT_ALLOW;
     return SG_OK;
   }
@@ -4269,7 +4265,12 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
   size_t cmd_seq_length = 0;
   size_t type_seq_length = 0;
 
-  if (gate->anomaly_enabled && gate->anomaly_model_type) {
+  /* Only a complete graph establishes contextual semantic support. A bounded
+   * prefix still gets policy diagnostics below, but must not be scored or
+   * cached as a complete anomaly sequence. */
+  bool anomaly_ready = !parse_truncated && !depgraph_truncated &&
+                       gate->anomaly_enabled && gate->anomaly_model;
+  if (anomaly_ready && gate->anomaly_model_type) {
     const char *cached = type_cache_lookup(
         &gate->anomaly_type_cache, cmd, cmd_len, &type_count, &type_seq_length);
     if (cached) {
@@ -4281,16 +4282,25 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
    * hybrid model. Build first, rather than inferring a count from the graph:
    * command and process substitutions are execution stages but are not
    * top-level graph list members. */
-  if (gate->anomaly_enabled && gate->anomaly_model) {
+  if (anomaly_ready) {
     shell_netstring_buffer_t raw = {0};
     shell_netstring_buffer_t typed = {0};
-    shell_process_status_t command_status;
-    if (type_seq) {
-      command_status = shell_build_command_netseq_buffer(cmd, cmd_len, NULL,
-                                                         &raw, &anomaly_count);
-    } else {
-      command_status = shell_build_anomaly_netseqs_buffer(
-          cmd, cmd_len, NULL, &raw, &typed, &anomaly_count);
+    /* The graph accepted this exact immutable source, including read options
+     * whose supported roles depend on captured descriptor values. Collect
+     * lexical analysis stages without repeating a context-free support check.
+     * The stage order is not the dependency graph's node order. */
+    shell_anomaly_stages_t stages = {0};
+    shell_process_status_t command_status =
+        shell_anomaly_stages_collect_prevalidated(cmd, cmd_len, NULL, &stages);
+    if (command_status == SHELL_PROCESS_OK) {
+      command_status =
+          type_seq ? shell_build_command_netseq_from_stages(&stages, NULL, &raw,
+                                                            &anomaly_count)
+                   : shell_build_anomaly_netseqs_from_stages(
+                         &stages, NULL, &raw, &typed, &anomaly_count);
+    }
+    shell_anomaly_stages_free(&stages);
+    if (!type_seq) {
       type_count = anomaly_count;
       if (command_status == SHELL_PROCESS_OK) {
         type_seq = (const char *)typed.data;

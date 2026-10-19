@@ -302,9 +302,9 @@ TEST(cross_surface_edge_syntax) {
       "echo $(<prefix<(producer))",
       "cat < prefix<(producer)$(printf path)",
       "printf x 2>&1 3>&- {out}>out {in}<in {both}<>read-write",
-      "printf x {out\\\r\nfd}>out {in\\\r\nfd}<in",
-      "cat >out\\\r\nsuffix next",
-      "$'c'3>out;cat \"x\"${y}z;my\\\r\ncommand value",
+      "printf x {out\\\nfd}>out {in\\\nfd}<in",
+      "cat >out\\\nsuffix next",
+      "$'c'3>out;cat \"x\"${y}z;my\\\ncommand value",
       "printf prefix$'literal'${NAME} \"$ONE$TWO\"",
       "cat <<EOF\n$(producer)\nEOF\n",
       "cat <<EOF\nwhile true; do :; done\n$\"locale\"\n\\$(literal)\n"
@@ -312,7 +312,7 @@ TEST(cross_surface_edge_syntax) {
       "cat <<'EOF'\n$(while true; do :; done)\n${items[0]}\n"
       "$((items[0]))\n$\"locale\"\nEOF\n",
       "cat <<${items[0]}\nbody\n${items[0]}\n",
-      "cat <<EOF <<-'LITERAL'\r\n$(printf value)\r\nEOF\r\n"
+      "cat <<EOF <<-'LITERAL'\r\n$(printf value)\r\nEOF\n"
       "\t$(while true; do :; done)\r\n\tLITERAL\r\n",
       "printf $'a\\tb' @(left|right)",
       "printf ${VALUE#prefix${SUFFIX:-$(producer)}}",
@@ -589,7 +589,7 @@ TEST(public_failure_and_limit_contracts) {
  * output clear on limit failures. */
 TEST(source_and_word_boundary_contracts) {
   static const char unsupported_byte[] = {'e', 'c', 'h', 'o', '\x01'};
-  static const char crlf_continuation[] = "left\\\r\nright";
+  static const char lf_continuation[] = "left\\\nright";
   static const char expected_word[] = "leftright";
   static const char *const unsupported = "while true; do :; done";
 
@@ -636,17 +636,16 @@ TEST(source_and_word_boundary_contracts) {
   size_t measured = 0;
   char decoded[sizeof(expected_word)];
   size_t written = SIZE_MAX;
-  CHECK(shell_measure_decoded_word(crlf_continuation,
-                                   sizeof(crlf_continuation) - 1,
+  CHECK(shell_measure_decoded_word(lf_continuation, sizeof(lf_continuation) - 1,
                                    &measured) == SHELL_PROCESS_OK);
   CHECK(measured == sizeof(expected_word) - 1);
-  CHECK(shell_write_decoded_word(
-            crlf_continuation, sizeof(crlf_continuation) - 1, decoded,
-            measured - 1, &written) == SHELL_PROCESS_EOUTPUT_LIMIT);
+  CHECK(shell_write_decoded_word(lf_continuation, sizeof(lf_continuation) - 1,
+                                 decoded, measured - 1,
+                                 &written) == SHELL_PROCESS_EOUTPUT_LIMIT);
   CHECK(written == 0);
-  CHECK(shell_write_decoded_word(
-            crlf_continuation, sizeof(crlf_continuation) - 1, decoded,
-            sizeof(decoded), &written) == SHELL_PROCESS_OK);
+  CHECK(shell_write_decoded_word(lf_continuation, sizeof(lf_continuation) - 1,
+                                 decoded, sizeof(decoded),
+                                 &written) == SHELL_PROCESS_OK);
   CHECK(written == measured && memcmp(decoded, expected_word, written) == 0);
 
   return true;
@@ -665,13 +664,13 @@ TEST(continued_list_topology) {
   } cases[] = {
       {"printf x | # note\ncat", SHELL_TYPE_PIPELINE, SHELL_PIPE_MODE_STDOUT,
        SHELL_EDGE_PIPE, 1},
-      {"printf x |& \\\r\ncat", SHELL_TYPE_PIPELINE,
+      {"printf x |& \\\ncat", SHELL_TYPE_PIPELINE,
        SHELL_PIPE_MODE_STDOUT_AND_STDERR, SHELL_EDGE_PIPE, 2},
       {"printf x |\\\n& cat", SHELL_TYPE_PIPELINE,
        SHELL_PIPE_MODE_STDOUT_AND_STDERR, SHELL_EDGE_PIPE, 2},
-      {"printf x |\\\r& cat", SHELL_TYPE_PIPELINE,
+      {"printf x |\\\n& cat", SHELL_TYPE_PIPELINE,
        SHELL_PIPE_MODE_STDOUT_AND_STDERR, SHELL_EDGE_PIPE, 2},
-      {"printf x |\\\r\n& cat", SHELL_TYPE_PIPELINE,
+      {"printf x |\\\n& cat", SHELL_TYPE_PIPELINE,
        SHELL_PIPE_MODE_STDOUT_AND_STDERR, SHELL_EDGE_PIPE, 2},
       {"echo prefix{left|right}suffix", SHELL_TYPE_PIPELINE,
        SHELL_PIPE_MODE_STDOUT, SHELL_EDGE_PIPE, 1},
@@ -683,7 +682,7 @@ TEST(continued_list_topology) {
        SHELL_EDGE_AND, 1},
       {"printf x || # note\ncat", SHELL_TYPE_OR, SHELL_PIPE_MODE_NONE,
        SHELL_EDGE_OR, 1},
-      {"printf x |\\\r\n| cat", SHELL_TYPE_OR, SHELL_PIPE_MODE_NONE,
+      {"printf x |\\\n| cat", SHELL_TYPE_OR, SHELL_PIPE_MODE_NONE,
        SHELL_EDGE_OR, 1},
       {"printf x\ncat", SHELL_TYPE_SEMICOLON, SHELL_PIPE_MODE_NONE,
        SHELL_EDGE_SEQ, 1},
@@ -811,12 +810,11 @@ TEST(continued_punctuation_is_lossless_and_canonical) {
     size_t raw_operator_length;
   } cases[] = {
       {"printf x &>out", "printf x &\\\n>out", SHELL_TOKEN_REDIRECT_BOTH, 4},
-      {"printf x &>>out", "printf x &\\\r\n>\\\r\n>out",
-       SHELL_TOKEN_REDIRECT_BOTH_APPEND, 9},
+      {"printf x &>>out", "printf x &\\\n>\\\n>out",
+       SHELL_TOKEN_REDIRECT_BOTH_APPEND, 7},
       {"printf x >&1", "printf x >\\\n&1", SHELL_TOKEN_REDIRECT_ERR, 5},
-      {"cat <>state", "cat <\\\r>state", SHELL_TOKEN_REDIRECT_READ_WRITE, 4},
-      {"printf x >|out", "printf x >\\\r\n|out", SHELL_TOKEN_REDIRECT_CLOBBER,
-       5},
+      {"cat <>state", "cat <\\\n>state", SHELL_TOKEN_REDIRECT_READ_WRITE, 4},
+      {"printf x >|out", "printf x >\\\n|out", SHELL_TOKEN_REDIRECT_CLOBBER, 4},
       {"cat <<<word", "cat <\\\n<\\\n<word", SHELL_TOKEN_HERESTRING, 7},
       {"cat <<EOF\nbody\nEOF\n", "cat <\\\n<EOF\nbody\nEOF\n",
        SHELL_TOKEN_HEREDOC, 7},
@@ -1107,7 +1105,7 @@ TEST(malformed_syntax_is_rejected_atomically) {
       "printf x | # note",
       "printf x |& \\\n",
       "printf x && # note",
-      "printf x ||\r\n",
+      "printf x ||\n",
       "! # note\nprintf x",
       "! \nprintf x",
       "! !",
@@ -1523,7 +1521,7 @@ TEST(numeric_redirect_canonical_boundaries) {
       {"cat 2 >&1", "3:cat,1:2,"},
       {"cat 0<<<x", "3:cat,"},
       {"cat 3\\\n>out", "3:cat,"},
-      {"cat 3\\\r\n>out", "3:cat,"},
+      {"cat 3\\\n>out", "3:cat,"},
       {"cat 1\\\n2>out", "3:cat,"},
       {"cat 3\\\n >out", "3:cat,1:3,"},
       {"cat \"3\">out", "3:cat,1:3,"},
@@ -1535,7 +1533,7 @@ TEST(numeric_redirect_canonical_boundaries) {
       {"cat x\\ 3>out", "3:cat,3:x 3,"},
       {"cat $'x'\\\n3>out", "3:cat,2:x3,"},
       {"cat 1\\\n2<<EOF\nbody\nEOF\n", "3:cat,"},
-      {"cat 1\\\r\n2<<-'EOF'\n\tbody\n\tEOF\n", "3:cat,"},
+      {"cat 1\\\n2<<-'EOF'\n\tbody\n\tEOF\n", "3:cat,"},
       {"cat 1\\\n2<<<body", "3:cat,"},
       {"{ cat; } 1\\\n2<<<body", "3:cat,"},
       {"{ cat; } 1\\\n2<<EOF\nbody\nEOF\n", "3:cat,"},
@@ -1588,11 +1586,11 @@ TEST(descriptor_graph_routes_and_identities) {
       {"cat \"\"0<<<body", "0", 0, false},
       {"cat $'x'0<<EOF\nbody\nEOF\n", "x0", 0, false},
       {"cat 1\\\n2>out", NULL, 12, true},
-      {"cat 1\\\r\n2<<<body", NULL, 12, false},
+      {"cat 1\\\n2<<<body", NULL, 12, false},
       {"cat 1\\\n2<<EOF\nbody\nEOF\n", NULL, 12, false},
-      {"cat 1\\\r\n2<<-'EOF'\n\tbody\n\tEOF\n", NULL, 12, false},
+      {"cat 1\\\n2<<-'EOF'\n\tbody\n\tEOF\n", NULL, 12, false},
       {"{ cat; } 1\\\n2<<<body", NULL, 12, false},
-      {"{ cat; } 1\\\r\n2<<EOF\nbody\nEOF\n", NULL, 12, false},
+      {"{ cat; } 1\\\n2<<EOF\nbody\nEOF\n", NULL, 12, false},
       {"(cat)3>out", NULL, 3, true},
   };
   for (size_t i = 0; i < ARRAY_COUNT(cases); i++) {

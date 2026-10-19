@@ -1874,31 +1874,19 @@ shell_build_type_netseq_buffer(const char *command, size_t command_length,
   return SHELL_PROCESS_OK;
 }
 
-static shell_process_status_t shell_build_anomaly_netseqs_impl(
-    const char *command_line, size_t command_length,
-    const shell_process_limits_t *limits, char **command_netseq,
-    size_t *command_length_out, char **type_netseq, size_t *type_length_out,
+shell_process_status_t shell_build_anomaly_netseqs_from_stages(
+    const shell_anomaly_stages_t *stages, const shell_process_limits_t *limits,
+    shell_netstring_buffer_t *command, shell_netstring_buffer_t *type,
     size_t *subcommand_count) {
-  *command_netseq = NULL;
-  if (command_length_out)
-    *command_length_out = 0;
-  *type_netseq = NULL;
-  if (type_length_out)
-    *type_length_out = 0;
   *subcommand_count = 0;
-
-  shell_anomaly_stages_t stages = {0};
-  shell_process_status_t status =
-      shell_anomaly_stages_parse(command_line, command_length, limits, &stages);
-  if (status != SHELL_PROCESS_OK)
-    return status;
+  shell_process_status_t status = SHELL_PROCESS_OK;
 
   size_t command_total = 0;
   size_t type_total = 0;
   size_t rendered_count = 0;
-  for (size_t c = 0; c < stages.count; c++) {
+  for (size_t c = 0; c < stages->count; c++) {
     shell_processed_word_iterator_t iterator;
-    shell_processed_word_iterator_init(&iterator, &stages.commands[c]);
+    shell_processed_word_iterator_init(&iterator, &stages->commands[c]);
     shell_token_t word;
     if (!shell_processed_word_iterator_next(&iterator, &word)) {
       size_t raw_record_length = 0;
@@ -1988,9 +1976,9 @@ static shell_process_status_t shell_build_anomaly_netseqs_impl(
 
   char *raw_position = raw;
   char *type_position = typed;
-  for (size_t c = 0; c < stages.count; c++) {
+  for (size_t c = 0; c < stages->count; c++) {
     shell_processed_word_iterator_t iterator;
-    shell_processed_word_iterator_init(&iterator, &stages.commands[c]);
+    shell_processed_word_iterator_init(&iterator, &stages->commands[c]);
     shell_token_t word;
     if (!shell_processed_word_iterator_next(&iterator, &word)) {
       size_t prefix_length = 0;
@@ -2059,18 +2047,14 @@ static shell_process_status_t shell_build_anomaly_netseqs_impl(
   }
   *raw_position = '\0';
   *type_position = '\0';
-  shell_anomaly_stages_free(&stages);
-  *command_netseq = raw;
-  *type_netseq = typed;
-  if (command_length_out)
-    *command_length_out = command_total;
-  if (type_length_out)
-    *type_length_out = type_total;
+  command->data = (unsigned char *)raw;
+  command->length = command_total;
+  type->data = (unsigned char *)typed;
+  type->length = type_total;
   *subcommand_count = rendered_count;
   return SHELL_PROCESS_OK;
 
 fail:
-  shell_anomaly_stages_free(&stages);
   return status;
 }
 
@@ -2078,18 +2062,13 @@ shell_process_status_t shell_build_anomaly_netseqs_buffer(
     const char *command_line, size_t command_length,
     const shell_process_limits_t *limits, shell_netstring_buffer_t *command,
     shell_netstring_buffer_t *type, size_t *subcommand_count) {
-  char *raw = NULL;
-  char *typed = NULL;
-  size_t raw_length = 0;
-  size_t typed_length = 0;
-  shell_process_status_t status = shell_build_anomaly_netseqs_impl(
-      command_line, command_length, limits, &raw, &raw_length, &typed,
-      &typed_length, subcommand_count);
-  if (status != SHELL_PROCESS_OK)
-    return status;
-  command->data = (unsigned char *)raw;
-  command->length = raw_length;
-  type->data = (unsigned char *)typed;
-  type->length = typed_length;
-  return SHELL_PROCESS_OK;
+  *subcommand_count = 0;
+  shell_anomaly_stages_t stages = {0};
+  shell_process_status_t status =
+      shell_anomaly_stages_parse(command_line, command_length, limits, &stages);
+  if (status == SHELL_PROCESS_OK)
+    status = shell_build_anomaly_netseqs_from_stages(&stages, limits, command,
+                                                     type, subcommand_count);
+  shell_anomaly_stages_free(&stages);
+  return status;
 }

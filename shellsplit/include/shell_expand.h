@@ -31,6 +31,9 @@ extern "C" {
  * This includes printf %b operands in formats containing %n: an expanded
  * '\c' can suppress later variable writes, including on format reuse.
  * Ordinary printf data, including %b without %n, remains eligible.
+ * Eligibility follows surviving argv positions: wholly elided process words
+ * consume no builtin argument slot, while quoted empty arguments do. Requests
+ * still identify the original source spelling and offsets.
  * Callback ordering follows analysis phases, not runtime scheduling or policy
  * short-circuiting. Each eligible dynamic source word is queried at most once.
  * Resolution does not discharge executable-substitution inspection obligations.

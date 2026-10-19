@@ -26,6 +26,16 @@
  * This compiles away in shipping builds. */
 #define SHELL_SOURCE_WORD_SCAN(length) SHELL_SOURCE_PREFIX_SCAN(length)
 
+/* Bash grammar blanks are space/tab; only LF ends a source line. CR, VT and
+ * FF remain word bytes. Numeric operands and arithmetic use separate rules. */
+static inline bool shell_source_blank(unsigned char byte) {
+  return byte == ' ' || byte == '\t';
+}
+
+static inline bool shell_source_space(unsigned char byte) {
+  return shell_source_blank(byte) || byte == '\n';
+}
+
 /* Operation-local lexical index. Delimiter consumers reuse source boundaries
  * found during the forward nested walk instead of balancing each ancestor's
  * suffix again. Entries refer only to the immutable root span and expire at
@@ -133,11 +143,8 @@ static inline SHELL_NONNULL(4, 5) shell_source_io_number_t
     /* Escaped physical line endings disappear before IO-number recognition.
      * Horizontal space and ordinary line endings must remain boundaries. */
     if (position > start && input[position] == '\\' && position + 1 < end &&
-        (input[position + 1] == '\n' || input[position + 1] == '\r')) {
-      bool cr = input[position + 1] == '\r';
+        input[position + 1] == '\n') {
       position += 2;
-      if (cr && position < end && input[position] == '\n')
-        position++;
       continue;
     }
     if (!isdigit((unsigned char)input[position]))
@@ -186,14 +193,6 @@ static inline size_t shell_source_line_end(const char *input, size_t length,
   return end;
 }
 
-static inline size_t
-shell_source_line_content_end(const char *input, size_t length, size_t start) {
-  size_t end = shell_source_line_end(input, length, start);
-  if (end > start && input[end - 1] == '\r')
-    end--;
-  return end;
-}
-
 static inline size_t shell_source_next_line(const char *input, size_t length,
                                             size_t start) {
   size_t end = shell_source_line_end(input, length, start);
@@ -212,9 +211,9 @@ static inline bool shell_source_comment_starts(char byte, bool word_boundary) {
 /* Only unquoted, unescaped shell syntax separates words. An opaque word
  * fragment (including a substitution) must leave the boundary false. */
 static inline bool shell_source_word_separator(char byte) {
-  return isspace((unsigned char)byte) || byte == ';' || byte == '|' ||
-         byte == '&' || byte == '<' || byte == '>' || byte == '(' ||
-         byte == ')';
+  return shell_source_space((unsigned char)byte) || byte == ';' ||
+         byte == '|' || byte == '&' || byte == '<' || byte == '>' ||
+         byte == '(' || byte == ')';
 }
 
 /* Advance across shell grammar that may separate a pending list connector or
@@ -227,27 +226,71 @@ static inline size_t shell_source_skip_list_trivia(const char *input,
   if (!input || position > length)
     return 0;
   while (position < length) {
-    if (isspace((unsigned char)input[position])) {
+    if (shell_source_space((unsigned char)input[position])) {
       position++;
       continue;
     }
     if (input[position] == '\\' && position + 1 < length &&
-        (input[position + 1] == '\n' || input[position + 1] == '\r')) {
+        input[position + 1] == '\n') {
       position += 2;
-      if (position < length && input[position - 1] == '\r' &&
-          input[position] == '\n')
-        position++;
       continue;
     }
     if (shell_source_comment_starts(input[position], true)) {
-      while (position < length && input[position] != '\n' &&
-             input[position] != '\r')
+      while (position < length && input[position] != '\n')
         position++;
       continue;
     }
     break;
   }
   return position;
+}
+
+/* Semantic blank bytes, shared with the source grammar.
+ * Callers supply a position within the source span. Only Bash's space, tab,
+ * LF and erased backslash-LF may disappear here: CR (even before LF), VT and
+ * FF are word content, not evidence that a substitution is empty. */
+static inline SHELL_NONNULL(1) size_t
+    shell_source_skip_blank_continuations(const char *input, size_t length,
+                                          size_t position) {
+  while (position < length) {
+    char byte = input[position];
+    if (byte == ' ' || byte == '\t' || byte == '\n') {
+      position++;
+    } else if (byte == '\\' && position + 1 < length &&
+               input[position + 1] == '\n') {
+      position += 2;
+    } else {
+      break;
+    }
+  }
+  return position;
+}
+
+/* Complete-source lexical emptiness. The source is a valid byte span; this
+ * boundary classifies trivia, not malformed shell grammar. Comments remain
+ * distinguishable because Bash gives comment-only backticks a completion
+ * status, unlike blank backticks and empty $(). Comments end only at LF; a
+ * CR inside a comment remains comment text. */
+typedef enum {
+  SHELL_SOURCE_NONEMPTY,
+  SHELL_SOURCE_BLANK,
+  SHELL_SOURCE_COMMENT,
+} shell_source_empty_kind_t;
+
+static inline SHELL_NONNULL(1) shell_source_empty_kind_t
+    shell_source_empty_kind(const char *input, size_t length) {
+  bool comment = false;
+  for (size_t position = 0; position < length;) {
+    position = shell_source_skip_blank_continuations(input, length, position);
+    if (position == length)
+      break;
+    if (!shell_source_comment_starts(input[position], true))
+      return SHELL_SOURCE_NONEMPTY;
+    comment = true;
+    while (position < length && input[position] != '\n')
+      position++;
+  }
+  return comment ? SHELL_SOURCE_COMMENT : SHELL_SOURCE_BLANK;
 }
 
 /* True when an interval contains only the shell grammar that may separate a
@@ -270,19 +313,13 @@ static inline size_t shell_source_skip_pipeline_negator_gap(const char *input,
     return 0;
   while (position < length) {
     unsigned char current = (unsigned char)input[position];
-    if (isspace(current) && current != '\n' && current != '\r') {
+    if (shell_source_blank(current)) {
       position++;
       continue;
     }
     if (input[position] == '\\' && position + 1 < length) {
       if (input[position + 1] == '\n') {
         position += 2;
-        continue;
-      }
-      if (input[position + 1] == '\r') {
-        position += 2;
-        if (position < length && input[position] == '\n')
-          position++;
         continue;
       }
     }
@@ -299,25 +336,8 @@ static inline bool shell_source_is_escaped_line_ending(const char *input,
                                                        size_t end) {
   if (!input || start >= end)
     return false;
-  /* The iterator may split CRLF into a `\\\r` token followed by an LF
-   * separator. Both pieces belong to the same escaped physical line ending
-   * and must be invisible to list grammar. */
-  if (input[start] == '\n')
-    return start >= 2 && input[start - 2] == '\\' && input[start - 1] == '\r' &&
-           start + 1 == end;
-  if (input[start] != '\\')
-    return false;
-  start++;
-  if (start >= end)
-    return false;
-  if (input[start] == '\n')
-    return start + 1 == end;
-  if (input[start] != '\r')
-    return false;
-  /* The lexer may expose CRLF as either a `\\\r` token followed by LF or
-   * one complete continuation token. Accept both representations. */
-  return start + 1 == end ||
-         (start + 1 < end && input[start + 1] == '\n' && start + 2 == end);
+  return input[start] == '\\' && start + 1 < end && input[start + 1] == '\n' &&
+         start + 2 == end;
 }
 
 /* Advance across horizontal space and escaped physical line endings. Unlike
@@ -340,12 +360,6 @@ static inline size_t shell_source_skip_inline_continuations(const char *input,
       position += 2;
       continue;
     }
-    if (input[position + 1] == '\r') {
-      position += 2;
-      if (position < length && input[position] == '\n')
-        position++;
-      continue;
-    }
     break;
   }
   return position;
@@ -366,12 +380,6 @@ static inline size_t shell_source_skip_escaped_line_endings(const char *input,
       position += 2;
       continue;
     }
-    if (input[position + 1] == '\r') {
-      position += 2;
-      if (position < length && input[position] == '\n')
-        position++;
-      continue;
-    }
     break;
   }
   return position;
@@ -386,15 +394,6 @@ static inline size_t shell_source_skip_escaped_line_endings_backward(
     return 0;
   while (position >= 2) {
     if (input[position - 1] == '\n' && input[position - 2] == '\\') {
-      position -= 2;
-      continue;
-    }
-    if (position >= 3 && input[position - 1] == '\n' &&
-        input[position - 2] == '\r' && input[position - 3] == '\\') {
-      position -= 3;
-      continue;
-    }
-    if (input[position - 1] == '\r' && input[position - 2] == '\\') {
       position -= 2;
       continue;
     }
@@ -516,7 +515,7 @@ static SHELL_NONNULL(1, 4) inline bool shell_source_match_plain_word(
         !shell_source_process_substitution_open(input, end, cursor, NULL);
     bool operator_boundary =
         next == ';' || next == '|' || next == '&' || next == '(' || next == ')';
-    if (!isspace(next) && !redirect_boundary && !operator_boundary)
+    if (!shell_source_space(next) && !redirect_boundary && !operator_boundary)
       return false;
   }
   if (after)
@@ -543,7 +542,7 @@ static SHELL_NONNULL(1) inline bool shell_source_match_pipeline_negator(
       shell_source_skip_escaped_line_endings(input, end, position + 1);
   if (cursor < end) {
     unsigned char next = (unsigned char)input[cursor];
-    if (isspace(next)) {
+    if (shell_source_space(next)) {
       /* Whitespace always delimits the reserved word. */
     } else if ((next == '<' || next == '>') &&
                !shell_source_process_substitution_open(input, end, cursor,
@@ -679,8 +678,7 @@ static SHELL_NONNULL(1) inline shell_source_pipeline_prefix_t
       .valid = true,
   };
   for (;;) {
-    while (start < end && isspace((unsigned char)input[start]) &&
-           input[start] != '\n' && input[start] != '\r') {
+    while (start < end && shell_source_blank((unsigned char)input[start])) {
       SHELL_SOURCE_PREFIX_SCAN(1);
       start++;
     }
@@ -721,7 +719,7 @@ static SHELL_NONNULL(1) inline shell_source_pipeline_prefix_t
       break;
     position = shell_source_skip_pipeline_negator_gap(input, end, after);
 
-    if (position >= end || input[position] == '\n' || input[position] == '\r' ||
+    if (position >= end || input[position] == '\n' ||
         shell_source_comment_starts(input[position], true))
       break;
   }
@@ -1151,10 +1149,8 @@ shell_source_heredoc_word_has_unsupported_ansi_c(const char *word,
     if (c == '\\' && quote != '\'' && position + 1 < length) {
       char next = word[position + 1];
       if (quote == '\0' || next == '$' || next == '`' || next == '"' ||
-          next == '\\' || next == '\n' || next == '\r') {
+          next == '\\' || next == '\n') {
         position++;
-        if (next == '\r' && position + 1 < length && word[position + 1] == '\n')
-          position++;
       }
     }
   }
@@ -1299,7 +1295,7 @@ shell_source_parse_heredoc_delimiter(const char *input, size_t length,
       if (c == '\\' && quote == '"' && cursor + 1 < length &&
           (input[cursor + 1] == '$' || input[cursor + 1] == '`' ||
            input[cursor + 1] == '"' || input[cursor + 1] == '\\' ||
-           input[cursor + 1] == '\n' || input[cursor + 1] == '\r')) {
+           input[cursor + 1] == '\n')) {
         size_t continued =
             shell_source_skip_escaped_line_endings(input, length, cursor);
         cursor = continued != cursor ? continued : cursor + 2;
@@ -1330,8 +1326,8 @@ shell_source_parse_heredoc_delimiter(const char *input, size_t length,
       cursor++;
       continue;
     }
-    if (isspace((unsigned char)c) || c == ';' || c == '&' || c == '|' ||
-        c == '<' || c == '>' || c == '(' || c == ')')
+    if (shell_source_space((unsigned char)c) || c == ';' || c == '&' ||
+        c == '|' || c == '<' || c == '>' || c == '(' || c == ')')
       break;
     cursor++;
   }
@@ -1385,7 +1381,7 @@ static SHELL_NONNULL(1, 4) inline bool shell_source_line_is_heredoc_delimiter(
   shell_source_heredoc_match_t match = {
       .input = input,
       .text = text,
-      .end = shell_source_line_content_end(input, length, text),
+      .end = shell_source_line_end(input, length, text),
   };
   char quote = '\0';
   for (size_t word = 0; word < pending->word_length;) {
@@ -1493,7 +1489,7 @@ static SHELL_NONNULL(1, 3, 4, 5, 6) inline shell_source_declaration_status_t
     SHELL_SOURCE_WORD_SCAN(1);
     size_t position = *cursor;
     char c = input[position];
-    if (c == '\n' || c == '\r')
+    if (c == '\n')
       return SHELL_SOURCE_DECL_LINE_END;
     if (shell_source_comment_starts(c, *word_boundary)) {
       *cursor = shell_source_line_end(input, length, position);
@@ -2812,7 +2808,7 @@ static SHELL_NONNULL(1) inline bool shell_source_glob_scan_step(
     CLOSE_EQUAL = 1u << 9
   };
   SHELL_SOURCE_WORD_SCAN(1);
-  if (!literal && (isspace(byte) || strchr("|&;<>()", byte))) {
+  if (!literal && (shell_source_space(byte) || strchr("|&;<>()", byte))) {
     scan->states = 0;
     return false;
   }
@@ -2884,7 +2880,7 @@ static SHELL_NONNULL(1) inline shell_source_glob_probe_t
       cursor += 2;
       continue;
     }
-    if (isspace((unsigned char)c) || strchr("|&;<>()", c))
+    if (shell_source_space((unsigned char)c) || strchr("|&;<>()", c))
       break;
     if (c == '[' && cursor + 1 < length &&
         (input[cursor + 1] == ':' || input[cursor + 1] == '.' ||
@@ -3121,6 +3117,9 @@ typedef struct {
   /* Inherited conditional parameter operand: its substitutions may not run.
    * Stored in the scope stack so querying a yielded substitution is O(1). */
   bool conditional;
+  /* One-based operand offsets identify conditional execution without a
+   * source-prefix rescan. Nonconditional nested scopes inherit this pair. */
+  size_t guard_start, guard_parent;
   /* In a double-quoted parameter default word, Bash expands the decoded
    * contents of $'...' a second time. Keep its source boundary while walking
    * the executable substitutions in that decoded word. */
@@ -3132,6 +3131,62 @@ typedef struct {
   size_t word_start;
   size_t expansion_start;
 } shell_source_expansion_scope_t;
+
+/* Empty process substitutions produce no pathname in the reference Bash.
+ * Classify a fragment at a known word position without balancing its suffix:
+ * a nonempty body stops at its first nontrivia byte. Syntax validation owns
+ * completeness. This keeps adjacent-fragment decoding linear. */
+static inline SHELL_NONNULL(1, 4) bool shell_source_empty_process_fragment(
+    const char *word, size_t length, size_t start, size_t *after) {
+  size_t open;
+  if (!shell_source_process_substitution_open(word, length, start, &open))
+    return false;
+  size_t position = open + 1;
+  while (position < length) {
+    position = shell_source_skip_blank_continuations(word, length, position);
+    if (position == length)
+      break;
+    unsigned char byte = (unsigned char)word[position++];
+    if (byte == ')') {
+      *after = position;
+      return true;
+    }
+    if (byte == '#') {
+      while (position < length && word[position] != '\n')
+        position++;
+    } else
+      return false;
+  }
+  return false;
+}
+
+/* One complete process fragment; expansion traversal uses this to distinguish
+ * a real endpoint from a substitution that produces no pathname. */
+static inline SHELL_NONNULL(1) bool shell_source_empty_process_word(
+    const char *word, size_t length) {
+  size_t after;
+  return shell_source_empty_process_fragment(word, length, 0, &after) &&
+         after == length;
+}
+
+/* A whole unquoted word consisting only of empty process fragments and line
+ * continuations vanishes from argv. Quotes, even empty ones, preserve a word.
+ * This is expansion semantics, never lexical assignment/reserved-word
+ * recognition. Callers retain the original lexical command-prefix boundary. */
+static inline SHELL_NONNULL(1) bool shell_source_word_is_elided(
+    const char *word, size_t length) {
+  size_t position = 0;
+  while (position < length) {
+    position = shell_source_skip_escaped_line_endings(word, length, position);
+    if (position == length)
+      break;
+    size_t after;
+    if (!shell_source_empty_process_fragment(word, length, position, &after))
+      return false;
+    position = after;
+  }
+  return true;
+}
 
 typedef struct {
   size_t position;
@@ -3226,11 +3281,13 @@ static inline SHELL_NONNULL(3, 4, 5, 6) shell_source_scan_status_t
         scope->selector_subscript = true;
         scan->has_arrays = true;
         scan->scopes[scan->scope_count++] = *scope;
-        *scope =
-            (shell_source_expansion_scope_t){.suppress_process = true,
-                                             .closer = ']',
-                                             .parentheses = 1,
-                                             .conditional = scope->conditional};
+        *scope = (shell_source_expansion_scope_t){
+            .suppress_process = true,
+            .closer = ']',
+            .parentheses = 1,
+            .conditional = scope->conditional,
+            .guard_start = scope->guard_start,
+            .guard_parent = scope->guard_parent};
         scan->position = position + 1;
         continue;
       }
@@ -3256,11 +3313,16 @@ static inline SHELL_NONNULL(3, 4, 5, 6) shell_source_scan_status_t
       if (input[operator_position] == ':')
         operator_position =
             shell_source_logical_following(input, length, operator_position);
-      scope->conditional |=
+      bool conditional =
           has_word &&
           (operand == SHELL_SOURCE_PARAMETER_PATTERN ||
            input[operator_position] == '-' || input[operator_position] == '+' ||
            input[operator_position] == '=' || input[operator_position] == '?');
+      if (conditional) {
+        scope->guard_parent = scope->guard_start;
+        scope->guard_start = word_start + 1;
+      }
+      scope->conditional |= conditional;
       scan->has_parameter_write |= has_word && input[operator_position] == '=';
       bool indirect_lookup = scope->selector_indirect && !name_enumeration;
       scan->has_parameter_reevaluation |=
@@ -3300,10 +3362,8 @@ static inline SHELL_NONNULL(3, 4, 5, 6) shell_source_scan_status_t
     bool heredoc_root = scope->heredoc && scope->closer == 0;
     if (heredoc_root && c == '\\' && position + 1 < length) {
       char next = input[position + 1];
-      scan->position += (next == '$' || next == '`' || next == '\\' ||
-                         next == '\n' || next == '\r')
-                            ? 2
-                            : 1;
+      scan->position +=
+          (next == '$' || next == '`' || next == '\\' || next == '\n') ? 2 : 1;
       continue;
     }
     if (scope->ansi_end && c == '\\') {
@@ -3473,6 +3533,8 @@ static inline SHELL_NONNULL(3, 4, 5, 6) shell_source_scan_status_t
       *scope =
           (shell_source_expansion_scope_t){.suppress_process = true,
                                            .conditional = scope->conditional,
+                                           .guard_start = scope->guard_start,
+                                           .guard_parent = scope->guard_parent,
                                            .arithmetic_scope = true,
                                            .closer = ')',
                                            .expansion_start = position,
@@ -3687,9 +3749,6 @@ static inline bool shell_source_skip_shell_word_impl(const char *input,
       if (position + 1 >= length)
         return false;
       position += 2;
-      if (input[position - 1] == '\r' && position < length &&
-          input[position] == '\n')
-        position++;
       continue;
     }
     if (c == '\'' || c == '"' || c == '`') {
@@ -3721,9 +3780,9 @@ static inline bool shell_source_skip_shell_word_impl(const char *input,
       position = substitution_after;
       continue;
     }
-    if ((stop_groups && (c == '(' || c == ')')) || isspace((unsigned char)c) ||
-        c == '|' || c == ';' || c == '&' || c == '<' || c == '>' || c == '\n' ||
-        c == '\r')
+    if ((stop_groups && (c == '(' || c == ')')) ||
+        shell_source_space((unsigned char)c) || c == '|' || c == ';' ||
+        c == '&' || c == '<' || c == '>' || c == '\n')
       break;
     position++;
   }
@@ -3787,10 +3846,8 @@ static inline bool shell_source_word_boundary(const char *input, size_t length,
   if (target == 0)
     return true;
   unsigned char previous = (unsigned char)input[target - 1];
-  if (isspace(previous)) {
+  if (shell_source_space(previous)) {
     size_t before = target - 1;
-    if (previous == '\n' && before && input[before - 1] == '\r')
-      before--;
     size_t slashes = 0;
     while (before && input[before - 1] == '\\') {
       before--;
@@ -3830,7 +3887,7 @@ static inline bool shell_source_word_boundary(const char *input, size_t length,
     }
     size_t brace_next = shell_source_logical_following(input, length, position);
     if (c == '{' && brace_next < length &&
-        (isspace((unsigned char)input[brace_next]) ||
+        (shell_source_space((unsigned char)input[brace_next]) ||
          input[brace_next] == '(')) {
       braces++;
       position++;
@@ -3842,7 +3899,7 @@ static inline bool shell_source_word_boundary(const char *input, size_t length,
       continue;
     }
     /* Process substitutions are word fragments, not redirect operators. */
-    if (isspace((unsigned char)c) || strchr(";|&()", c) ||
+    if (shell_source_space((unsigned char)c) || strchr(";|&()", c) ||
         ((c == '<' || c == '>') && !shell_source_process_substitution_open(
                                        input, length, position, NULL))) {
       position++;
@@ -3983,11 +4040,8 @@ static inline bool shell_source_redirection_consumes_word(const char *input,
  * continuations and the suffix escape, retaining the exact operand prefix. */
 static inline SHELL_NONNULL(1, 3) bool shell_source_fd_move_prefix(
     const char *input, size_t length, size_t *prefix_length) {
-  while (length >= 2 &&
-         (input[length - 1] == '\n' || input[length - 1] == '\r')) {
+  while (length >= 2 && input[length - 1] == '\n') {
     size_t slash = length - 2;
-    if (input[length - 1] == '\n' && input[slash] == '\r' && slash != 0)
-      slash--;
     if (input[slash] != '\\')
       break;
     size_t escapes = 0;
@@ -4076,10 +4130,6 @@ shell_source_skip_inline_continuations_backward(const char *input,
   while (position) {
     size_t ending = position;
     if (input[ending - 1] == '\n') {
-      ending--;
-      if (ending && input[ending - 1] == '\r')
-        ending--;
-    } else if (input[ending - 1] == '\r') {
       ending--;
     } else {
       break;
@@ -4202,8 +4252,8 @@ static inline size_t shell_source_skip_redirect_word(const char *input,
           shell_source_skip_balanced_parentheses(input, end, substitution_open);
       continue;
     }
-    if (isspace((unsigned char)c) || c == '|' || c == ';' || c == '&' ||
-        c == '<' || c == '>' || c == '(' || c == ')')
+    if (shell_source_space((unsigned char)c) || c == '|' || c == ';' ||
+        c == '&' || c == '<' || c == '>' || c == '(' || c == ')')
       break;
     position++;
   }
@@ -4693,9 +4743,18 @@ shell_source_word_expansion(const char *input, size_t length,
         expansion.leading_tilde = true;
         tilde_prefix = false;
       }
-      if ((c == '<' || c == '>') &&
-          shell_source_process_substitution_open(input, length, position, NULL))
-        return (shell_source_word_expansion_t){.dynamic = true};
+      if ((c == '<' || c == '>') && shell_source_process_substitution_open(
+                                        input, length, position, NULL)) {
+        size_t after;
+        if (!shell_source_empty_process_fragment(input, length, position,
+                                                 &after))
+          return (shell_source_word_expansion_t){.dynamic = true};
+        position = after;
+        tilde_start = tilde_prefix = false;
+        if (prefix != PREFIX_VALUE)
+          prefix = PREFIX_NONE;
+        continue;
+      }
       if ((c == '?' || c == '*' || c == '+' || c == '@' || c == '!') &&
           shell_source_logical_next_is(input, length, position, '(', NULL))
         return (shell_source_word_expansion_t){.dynamic = true};
@@ -4739,25 +4798,30 @@ static inline SHELL_NONNULL(1) bool shell_source_argument_has_dynamic_syntax(
       input, length, SHELL_SOURCE_WORD_ARGUMENT);
 }
 
-/* Decode a complete static shell word without allocating.  This is the
- * source-level counterpart of Shellsplit's processed-word rendering: quote
- * removal and ANSI-C quotes are resolved, while any syntax whose value needs
- * expansion keeps the word out of the static-command path.  Keep wrapper
- * recognition here so semantic validation and dependency analysis cannot
- * grow subtly different interpretations of `command` and `builtin`.
+/* Visit a complete word's literal projection without allocating: remove quotes,
+ * decode ANSI-C fragments, and erase empty process fragments. Dynamic spelling
+ * is not evaluated; callers requiring a static value use the wrapper below.
+ * Shared projection keeps semantic option-prefix recognition and graph static
+ * command/wrapper recognition aligned without confusing spelling with a value.
  * word is a required readable span (including length zero); visitor is
  * required. context is passed through and may be NULL if the visitor allows
  * it. The visitor must not modify the word. */
-static inline SHELL_NONNULL(1, 3) bool shell_source_visit_static_word_in_context(
+static inline SHELL_NONNULL(1, 3) bool shell_source_visit_decoded_word(
     const char *word, size_t word_length, shell_source_byte_visitor_t visitor,
-    void *context, shell_source_word_context_t word_context) {
-  if (word_length == 0 || shell_source_word_has_dynamic_syntax_in_context(
-                              word, word_length, word_context))
+    void *context) {
+  if (word_length == 0)
     return false;
 
   char quote = '\0';
   for (size_t position = 0; position < word_length; position++) {
     char c = word[position];
+    size_t after;
+    if (!quote && (c == '<' || c == '>') &&
+        shell_source_empty_process_fragment(word, word_length, position,
+                                            &after)) {
+      position = after - 1;
+      continue;
+    }
     if (quote == '\0' && c == '$' &&
         shell_source_logical_next_is(word, word_length, position, '\'', NULL)) {
       size_t after = position;
@@ -4778,14 +4842,10 @@ static inline SHELL_NONNULL(1, 3) bool shell_source_visit_static_word_in_context
     if (c == '\\' && quote != '\'' && position + 1 < word_length) {
       char next = word[position + 1];
       if (quote == '\0' || next == '$' || next == '`' || next == '"' ||
-          next == '\\' || next == '\n' || next == '\r') {
-        if (next != '\n' && next != '\r' &&
-            !visitor((unsigned char)next, context))
+          next == '\\' || next == '\n') {
+        if (next != '\n' && !visitor((unsigned char)next, context))
           return false;
         position++;
-        if (next == '\r' && position + 1 < word_length &&
-            word[position + 1] == '\n')
-          position++;
         continue;
       }
     }
@@ -4793,6 +4853,17 @@ static inline SHELL_NONNULL(1, 3) bool shell_source_visit_static_word_in_context
       return false;
   }
   return quote == '\0';
+}
+
+/* A decoded spelling is not a runtime value. Static consumers first exclude
+ * dynamic syntax; option-prefix recognizers may instead inspect the literal
+ * projection while retaining their separate unresolved-value state. */
+static inline SHELL_NONNULL(1, 3) bool shell_source_visit_static_word_in_context(
+    const char *word, size_t word_length, shell_source_byte_visitor_t visitor,
+    void *context, shell_source_word_context_t word_context) {
+  return !shell_source_word_has_dynamic_syntax_in_context(word, word_length,
+                                                          word_context) &&
+         shell_source_visit_decoded_word(word, word_length, visitor, context);
 }
 
 static inline SHELL_NONNULL(1, 3) bool shell_source_visit_static_word(
@@ -4809,10 +4880,10 @@ static inline SHELL_NONNULL(1, 3) bool shell_source_visit_static_argument(
       word, word_length, visitor, context, SHELL_SOURCE_WORD_ARGUMENT);
 }
 
-/* Declaration builtins recognize assignment operands after quote removal,
- * unlike an assignment in the shell's command-prefix position. Inspect only
- * the name: expansion in the value does not make a literal write target
- * dynamic. `source_delimiter` is false when ANSI-C decoding produced the
+/* Declaration builtins recognize assignment operands after quote removal and
+ * empty process-fragment elision, unlike lexical command-prefix assignments.
+ * Inspect only the name: expansion in the value does not make a literal write
+ * target dynamic. `source_delimiter` is false when ANSI-C decoding produced the
  * equals sign, because that word cannot be split into borrowed name/value
  * source spans. Callers that need those spans must reject that form. */
 typedef struct {
@@ -4888,7 +4959,16 @@ static inline SHELL_NONNULL(1, 5) bool shell_source_scan_decoded_assignment(
   };
   char quote = '\0';
   for (size_t position = 0; position < word_length; position++) {
+    SHELL_SOURCE_WORD_SCAN(1);
     char c = word[position];
+    size_t empty_after;
+    if (!quote && (c == '<' || c == '>') &&
+        shell_source_empty_process_fragment(word, word_length, position,
+                                            &empty_after)) {
+      SHELL_SOURCE_WORD_SCAN(empty_after - position - 1);
+      position = empty_after - 1;
+      continue;
+    }
     if (quote == '\0' && c == '$' &&
         shell_source_logical_next_is(word, word_length, position, '\'', NULL)) {
       size_t after = position;
@@ -4914,12 +4994,9 @@ static inline SHELL_NONNULL(1, 5) bool shell_source_scan_decoded_assignment(
     if (c == '\\' && quote != '\'' && position + 1 < word_length) {
       char next = word[position + 1];
       if (quote == '\0' || next == '$' || next == '`' || next == '"' ||
-          next == '\\' || next == '\n' || next == '\r') {
+          next == '\\' || next == '\n') {
         position++;
-        if (next == '\r' && position + 1 < word_length &&
-            word[position + 1] == '\n')
-          position++;
-        if (next == '\n' || next == '\r')
+        if (next == '\n')
           continue;
         c = next;
       }
@@ -5337,7 +5414,7 @@ static inline size_t shell_source_skip_redirect(const char *input,
    * line endings have already been removed by shell lexical processing, so
    * they may still bridge the descriptor and its operator. */
   if ((named_fd || numeric_fd == SHELL_SOURCE_IO_NUMBER_VALID) &&
-      cursor < end && isspace((unsigned char)input[cursor]))
+      cursor < end && shell_source_space((unsigned char)input[cursor]))
     return position;
   if (combined_output) {
     cursor = combined_after;

@@ -115,7 +115,11 @@ static inline shell_brace_fuzz_case_t shell_brace_fuzz_case(const uint8_t *data,
   static const char *const commands[] = {"echo", "printf", "cat", "sort"};
   const char *first = commands[shell_brace_fuzz_byte(data, size, 1) % 4];
   const char *second = commands[shell_brace_fuzz_byte(data, size, 2) % 4];
-  const char *eol = shell_brace_fuzz_byte(data, size, 3) & 1 ? "\r\n" : "\n";
+  /* Bash treats CR as an ordinary byte, not part of a line ending. Valid
+   * generated heredocs therefore use LF consistently; dedicated source and
+   * heredoc boundary matrices cover literal CR without misclassifying an
+   * unterminated document as valid. */
+  const char *eol = "\n";
   uint8_t form = shell_brace_fuzz_byte(data, size, 0);
   if (form % 64 == 60) {
     shell_brace_fuzz_case_t item = shell_brace_fuzz_make_case(

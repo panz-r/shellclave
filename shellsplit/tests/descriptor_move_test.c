@@ -97,6 +97,23 @@ static void failure_prefix_scaling(const shell_dep_limits_t *limits,
                          direction);
         CHECK(n > 0 && (size_t)n < sizeof(source));
         size_t used = (size_t)n;
+        /* This measures cleanup composition, not the cross product of
+         * unknown inherited scratch-slot occupancies. Reserve a known-free
+         * save range; distinct targets below are reopened after this setup.
+         * Unknown-occupancy exhaustion has separate capacity regressions. */
+        for (unsigned fd = 12; fd < 25; fd++) {
+          unsigned physical = distinct && fd >= 19 ? fd + 17 : fd;
+          n = snprintf(source + used, sizeof(source) - used, "%s%u>&-%s",
+                       (fd - 12) % 8 == 0 ? "exec " : "", physical,
+                       (fd - 11) % 8 == 0 || fd == 24 ? "; " : " ");
+          CHECK(n > 0 && (size_t)n < sizeof(source) - used);
+          used += (size_t)n;
+        }
+        if (distinct) {
+          n = snprintf(source + used, sizeof(source) - used, "exec 19>&-; ");
+          CHECK(n > 0 && (size_t)n < sizeof(source) - used);
+          used += (size_t)n;
+        }
         if (distinct)
           for (unsigned i = 0; i < count; i++) {
             n = snprintf(source + used, sizeof(source) - used,
@@ -153,16 +170,18 @@ static void failure_prefix_scaling(const shell_dep_limits_t *limits,
          * The old full-prefix replay exceeds this at count 16 (240 visits).
          * Dependency indexing may add logarithmic factors, not prefix replay.
          */
-        if (!undo || undo > 6 * count ||
+        if (undo > 6 * count ||
             (previous_undo && undo > 3 * previous_undo + 4) ||
             work > 64 * count * height * height)
           fprintf(stderr,
                   "failure scaling read%u distinct%u count%u undo%zu work%zu "
                   "previous%zu\n",
                   read, distinct, count, undo, work, previous_undo);
-        CHECK(undo && undo <= 6 * count);
+        /* Direct frame restoration can avoid both composition and evaluated
+         * undo leaves. Only excessive work is a regression. */
+        CHECK(undo <= 6 * count);
         CHECK(!previous_undo || undo <= 3 * previous_undo + 4);
-        CHECK(work && work <= 64 * count * height * height);
+        CHECK(work <= 64 * count * height * height);
         CHECK(shellsplit_test_source_scan_work() <= 512 * used);
         previous_undo = undo;
         shell_dep_graph_t *reference = malloc(sizeof(*reference));
@@ -238,6 +257,27 @@ static void failure_cleanup_cache_equivalence(const shell_dep_limits_t *limits,
       }
     }
   }
+  /* These setups reach journal collection while preserving an operation's
+   * entry and sibling read outcomes. Compare public results with the uncached
+   * interpreter as well as exercising the lifetime under sanitizers. */
+  static const char *const lifetime_cases[] = {
+      "exec 4>/tmp/move-b 10>/tmp/move-a || exit; "
+      "exec 11>&- 12>&- 13>&- 14>&- 3>&- 63>&-; "
+      ": 10>&4- > >(echo next >&12)",
+      "exec 4</tmp/move-b 10</tmp/move-a || exit; "
+      "exec 11<&- 12<&- 13<&- 14<&-; read line 10<&4- <&12",
+  };
+  for (size_t i = 0; i < sizeof(lifetime_cases) / sizeof(lifetime_cases[0]);
+       i++) {
+    const char *source = lifetime_cases[i];
+    CHECK(shell_dep_graph_parse(source, strlen(source), "/", limits, graph) ==
+          SHELL_DEP_OK);
+    shellsplit_test_failure_cleanup_reference(true);
+    CHECK(shell_dep_graph_parse(source, strlen(source), "/", limits,
+                                reference) == SHELL_DEP_OK);
+    shellsplit_test_failure_cleanup_reference(false);
+    CHECK(shellsplit_test_graph_equal(graph, reference));
+  }
   free(reference);
 }
 #endif
@@ -254,8 +294,8 @@ int main(void) {
       {"3\\-", SHELL_PROCESS_FD_TARGET_MOVE, 3},
       {"$'3'-", SHELL_PROCESS_FD_TARGET_MOVE, 3},
       {"3-\\\n", SHELL_PROCESS_FD_TARGET_MOVE, 3},
-      {"3-\\\r\n", SHELL_PROCESS_FD_TARGET_MOVE, 3},
-      {"3-\\\r", SHELL_PROCESS_FD_TARGET_MOVE, 3},
+      {"3-\\\n", SHELL_PROCESS_FD_TARGET_MOVE, 3},
+      {"3-\\\n", SHELL_PROCESS_FD_TARGET_MOVE, 3},
       {"\"3-\"", SHELL_PROCESS_FD_TARGET_PATH, SHELL_PROCESS_FD_NONE},
       {"$'3-'", SHELL_PROCESS_FD_TARGET_PATH, SHELL_PROCESS_FD_NONE},
       {"3-''", SHELL_PROCESS_FD_TARGET_PATH, SHELL_PROCESS_FD_NONE},
@@ -1079,11 +1119,11 @@ int main(void) {
        ": \"$(echo next >&12)\" 10>&4-",
        "echo", SHELL_EDGE_WRITE, restored, 0},
       {"exec 4>/tmp/move-b 10>/tmp/move-a || exit; exec 11>&- 12>&- 13>&- "
-       "14>&-; "
+       "14>&- 3>&- 63>&-; "
        ": 10>&4- > >(echo next >&12)",
        "echo", SHELL_EDGE_WRITE, restored, 1},
       {"exec 4>/tmp/move-b 10>/tmp/move-a || exit; exec 11>&- 12>&- 13>&- "
-       "14>&-; "
+       "14>&- 3>&- 63>&-; "
        ": <(echo next >&12) 10>&4-",
        "echo", SHELL_EDGE_WRITE, restored, 0},
       {"exec 4>/tmp/move-b 10>/tmp/move-a || exit; exec 11>&- 12>&- 13>&- "

@@ -6,6 +6,62 @@
 #include <stdbool.h>
 #include <stddef.h>
 
+/* Every body contains an ordinary command word, not separator trivia. LF
+ * ends a line; a preceding CR, escaped or not, remains part of that word. */
+static const char *const shellsplit_test_nonblank_bodies[] = {
+    "\r", "\r\n", "\\\r", "\\\r\n", "\v", "\f"};
+
+static const struct {
+  const char *source;
+  const char *netargv;
+} shellsplit_test_control_byte_words[] = {
+    {"echo <()\\\r", "4:echo,1:\r,"},
+    {"echo <()\r", "4:echo,1:\r,"},
+    {"echo <()\\\r\n# comment", "4:echo,1:\r,"},
+    {"echo a\rb a\vb a\fb", "4:echo,3:a\rb,3:a\vb,3:a\fb,"},
+    {"echo '\\\r' \"\\\r\" \\\r", "4:echo,2:\\\r,2:\\\r,1:\r,"},
+    {"echo x\\\r\n# comment", "4:echo,2:x\r,"},
+    {"echo x\\\n#", "4:echo,2:x#,"},
+    {"echo 1\\\r2>out", "4:echo,3:1\r2,"},
+    {"printf '%s' <(\n# note\rtext\n)tail", "6:printf,2:%s,4:tail,"},
+};
+
+/* Query counts are for the exact source word "$V". Elided process words
+ * cannot shift printf options, format or data roles; quoted empties can. */
+static const struct {
+  const char *source;
+  size_t queries;
+} shellsplit_test_printf_expansion_cases[] = {
+    {"printf '%b%n' \"$V\" target", 0},
+    {"command printf '%b%n' \"$V\" target", 0},
+    {"{ printf '%b%n' \"$V\" target; }", 0},
+    {"printf '%n%b' other \"$V\" target \"$V\"", 0},
+    {"printf '%s%n' \"$V\" target", 1},
+    {"printf '%b' \"$V\"", 1},
+    {"command printf '%b' \"$V\"", 1},
+    {"{ printf '%b' \"$V\"; }", 1},
+    {"printf <() '%b%n' \"$V\" target", 0},
+    {"printf <() '%s%n' \"$V\" target", 1},
+    {"printf '%b%n' <() \"$V\" target", 0},
+    {"printf '%s%n' <() \"$V\" target", 1},
+    {"<() printf <() '%b%n' <() \"$V\" target", 0},
+    {"<() printf <() '%s%n' <() \"$V\" target", 1},
+    {"command <() printf <() '%b%n' \"$V\" <() target", 0},
+    {"builtin printf <() '%s%n' \"$V\" <() target", 1},
+    {"{ printf <() '%b%n' <() \"$V\" target; }", 0},
+    {"{ printf <() '%s%n' <() \"$V\" target; }", 1},
+    {"printf <() -v <() output <() -- <() '%b%n' \"$V\" target", 0},
+    {"printf <() -v <() output <() -- <() '%s%n' \"$V\" target", 1},
+    {"printf 2>err <() '%b%n' <() \"$V\" target", 0},
+    {"printf 2>err <() '%s%n' <() \"$V\" target", 1},
+    {"printf '%b%n' first target <() \"$V\" other", 0},
+    {"printf '%s%n' first target <() \"$V\" other", 1},
+    {"printf '%s%n' \"$V\" target <() \"$V\" other", 2},
+    {"printf '%b%n' ''<() target <() \"$V\" other", 0},
+    {"printf ''<() '%b%n' \"$V\" target", 1},
+    {"printf <() '%b' <() \"$V\"", 1},
+};
+
 /* Possible returning outcomes after each prefix. These are independent of
  * stdout capture: even an empty/redirected substitution has an exit status.
  * File opens remain fallible; inline documents use the existing successful
@@ -24,6 +80,10 @@ static const struct {
     {"X=\"$(false)\"", false, true},
     {"X=\"`false`\"", false, true},
     {"X=\"$(true)\"", true, false},
+    {"a=$(false) b=$(# comment\rfalse\n)", false, true},
+    {"a=$(false) b=`# comment\rfalse\n`", true, false},
+    {"a=$(false) b=$(# comment\r\n)", false, true},
+    {"a=$(true) b=$(# comment\r\n)", true, false},
     {"X=\"$(exit 0)\"", true, false},
     {"X=\"$(exit 7)\"", false, true},
     {"X=\"$(<\"\")$(true)\"", true, false},
@@ -529,10 +589,15 @@ static const shellsplit_test_named_cleanup_case_t
          "nested", "one", false, false, NULL},
         {"exec {a}>base || exit; true {a}>one {a}>&- && time exec 2>&$a", NULL,
          "one", false, true, NULL},
-        {"exec 3>p 4>p 5>p 6>p 7>p 8>p 9>p 10>base || exit; "
+        /* Establish occupied low FDs separately. Failure exits before the
+         * tested cleanup, so cross-products of an eight-open setup's undo
+         * paths add no coverage of the named-allocation expectations. */
+        {"exec 3>p && exec 4>p && exec 5>p && exec 6>p && exec 7>p && "
+         "exec 8>p && exec 9>p && exec 10>base || exit; "
          "true 10>&- {a}>one && printf occupied >&$a",
          "occupied", "one", false, false, NULL},
-        {"exec 3>p 4>p 5>p 6>p 7>p 8>p 9>p 10>base || exit; "
+        {"exec 3>p && exec 4>p && exec 5>p && exec 6>p && exec 7>p && "
+         "exec 8>p && exec 9>p && exec 10>base || exit; "
          "probe && exec 3>&-; true 10>&- {a}>one && "
          "printf conditional >&$a",
          "conditional", "base", false, false, "one"},
@@ -591,6 +656,10 @@ static const char *const shellsplit_test_invalidated_reallocation[] = {
     "{ exec {fd}>out; true; } >setup; printf payload >&$fd",
     "exec {fd}>base && unset fd; { exec {fd}>out; true; } >setup; "
     "echo \"$(printf payload >&$fd)\"",
+    "unset DIRSTACK; exec {DIRSTACK}>base; unset DIRSTACK; "
+    "unset DIRSTACK; { exec {DIRSTACK}>out; true; }",
+    "unset DIRSTACK; exec {DIRSTACK}>base; probe && unset DIRSTACK; "
+    "unset DIRSTACK; { exec {DIRSTACK}>out; true; }",
 };
 
 /* Assignment position survives complete pipeline modifiers and scalar words,
@@ -1286,9 +1355,19 @@ static const uint32_t shellsplit_test_expansion_feature_mask =
 #define SHELLSPLIT_TEST_SHORT_SET_OPTION(flag)                                 \
   {"set -" flag "; true", false}, { "set +" flag "; true", false }
 
+/* Most cases are state-independent and intentionally omit the final false
+ * member. Keep that compact fixture notation without hiding other aggregate
+ * initializer warnings in its consumers. */
+#if defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmissing-field-initializers"
+#endif
 static const struct {
   const char *source;
+  /* Semantic consumers accept this command in a fresh reference shell. */
   bool supported;
+  /* Lexing/processing is valid, but graph support depends on prior state. */
+  bool stateful;
 } shellsplit_test_builtin_options[] = {
     /* Completion word lists are expanded again, callbacks execute source, and
      * Readline key bindings can run registered code during noninteractive read.
@@ -1342,21 +1421,21 @@ static const struct {
     /* getopts writes an option letter through its destination's attributes.
      * Writing OPTIND can recursively interpret a scalar's value as arithmetic.
      * Unquoted expansions can also shift the destination's argv position. */
-    {"getopts a OPTIND -a", false},
-    {"getopts a SECONDS -a", false},
-    {"getopts a RANDOM -a", false},
-    {"getopts a SRANDOM -a", false},
-    {"getopts a HISTCMD -a", false},
-    {"getopts a \"OPT\"'IND' -a", false},
-    {"getopts a $'OPTIND' -a", false},
+    {"getopts a OPTIND -a", false, true},
+    {"getopts a SECONDS -a", false, true},
+    {"getopts a RANDOM -a", false, true},
+    {"getopts a SRANDOM -a", false, true},
+    {"getopts a HISTCMD -a", false, true},
+    {"getopts a \"OPT\"'IND' -a", false, true},
+    {"getopts a $'OPTIND' -a", false, true},
     {"getopts a \"$target\" -a", false},
     {"getopts a $target -a", false},
     {"getopts a OPT{IND,name} -a", false},
     {"getopts a * -a", false},
     {"getopts a \"$@\" -a", false},
     {"getopts $spec name OPTIND", false},
-    {"getopts \"$spec\" name OPTIND", false},
-    {"getopts -- \"$spec\" OPTIND -a", false},
+    {"getopts \"$spec\" name OPTIND", false, true},
+    {"getopts -- \"$spec\" OPTIND -a", false, true},
     {"getopts \"$spec\" name \"$target\"", false},
     {"getopts a POSIXLY_CORRECT -a", false},
     {"getopts a BASH_COMPAT -a", false},
@@ -1479,24 +1558,24 @@ static const struct {
     {"_=value; printf '%s' \"$_\"", true},
     /* Wrappers affect only the first executable. The inner assignment keeps
      * its assignment-only/temporary role in every enclosing test context. */
-    {"printf x; OPTIND='fd=2'", false},
-    {"printf x; RANDOM='fd=2'", false},
-    {"printf x; SRANDOM='fd=2'", false},
-    {"printf x; SECONDS='fd=2'", false},
-    {"printf x; HISTCMD='fd=2'", false},
-    {"printf x; OPTIND='fd=2' >/dev/null", false},
-    {"printf x; OPTIND='fd=2'; printf x", false},
-    {"printf x; OPTIND+='fd=2' printf x", false},
+    {"printf x; OPTIND='fd=2'", false, true},
+    {"printf x; RANDOM='fd=2'", false, true},
+    {"printf x; SRANDOM='fd=2'", false, true},
+    {"printf x; SECONDS='fd=2'", false, true},
+    {"printf x; HISTCMD='fd=2'", false, true},
+    {"printf x; OPTIND='fd=2' >/dev/null", false, true},
+    {"printf x; OPTIND='fd=2'; printf x", false, true},
+    {"printf x; OPTIND+='fd=2' printf x", false, true},
     {"printf x; OPTIND='fd=2' printf x", true},
     {"printf x; OPTIND='fd=2' builtin printf x", true},
     {"printf x; OPTIND='fd=2' OTHER=x printf x", true},
-    {"printf x; { OPTIND='fd=2'; }", false},
-    {"printf x; (OPTIND='fd=2')", false},
+    {"printf x; { OPTIND='fd=2'; }", false, true},
+    {"printf x; (OPTIND='fd=2')", false, true},
     {"exec {OPTIND}>/dev/null; printf x >&$OPTIND", true},
-    {"exec {RANDOM}>/dev/null", false},
-    {"exec {SRANDOM}>/dev/null", false},
-    {"exec {SECONDS}>/dev/null", false},
-    {"exec {HISTCMD}>/dev/null", false},
+    {"exec {RANDOM}>/dev/null", false, true},
+    {"exec {SRANDOM}>/dev/null", false, true},
+    {"exec {SECONDS}>/dev/null", false, true},
+    {"exec {HISTCMD}>/dev/null", false, true},
     {"exec {UID}>/dev/null", false},
     {"exec {EUID}>/dev/null", false},
     {"exec {PPID}>/dev/null", false},
@@ -1506,25 +1585,25 @@ static const struct {
     {"exec {POSIXLY_CORRECT}>/dev/null", false},
     {"exec {BASH_COMPAT}>/dev/null", false},
     {"exec {BASH_XTRACEFD}>/dev/null", false},
-    {"exec {EPOCHSECONDS}>/dev/null", false},
-    {"exec {EPOCHREALTIME}>/dev/null", false},
-    {"exec {BASH_MONOSECONDS}>/dev/null", false},
-    {"exec {BASH_COMMAND}>/dev/null", false},
-    {"exec {BASHPID}>/dev/null", false},
-    {"exec {BASH_SUBSHELL}>/dev/null", false},
-    {"exec {LINENO}>/dev/null", false},
+    {"exec {EPOCHSECONDS}>/dev/null", false, true},
+    {"exec {EPOCHREALTIME}>/dev/null", false, true},
+    {"exec {BASH_MONOSECONDS}>/dev/null", false, true},
+    {"exec {BASH_COMMAND}>/dev/null", false, true},
+    {"exec {BASHPID}>/dev/null", false, true},
+    {"exec {BASH_SUBSHELL}>/dev/null", false, true},
+    {"exec {LINENO}>/dev/null", false, true},
     {"exec {BASH_ARGC}>/dev/null", false},
     {"exec {BASH_ARGV}>/dev/null", false},
     {"exec {BASH_LINENO}>/dev/null", false},
     {"exec {BASH_SOURCE}>/dev/null", false},
-    {"exec {DIRSTACK}>/dev/null", false},
-    {"exec {FUNCNAME}>/dev/null", false},
-    {"exec {GROUPS}>/dev/null", false},
+    {"exec {DIRSTACK}>/dev/null", false, true},
+    {"exec {FUNCNAME}>/dev/null", false, true},
+    {"exec {GROUPS}>/dev/null", false, true},
     {"exec {PIPESTATUS}>/dev/null", false},
-    {"exec {BASH_ALIASES}>/dev/null", false},
-    {"exec {BASH_CMDS}>/dev/null", false},
-    {"exec {BASH_REMATCH}>/dev/null", false},
-    {"exec {RA\\\nNDOM}>/dev/null", false},
+    {"exec {BASH_ALIASES}>/dev/null", false, true},
+    {"exec {BASH_CMDS}>/dev/null", false, true},
+    {"exec {BASH_REMATCH}>/dev/null", false, true},
+    {"exec {RA\\\nNDOM}>/dev/null", false, true},
     {"exec {RANDOM_OTHER}>/dev/null", true},
     {"exec {UID_OTHER}>/dev/null", true},
     {"let result=1", false},
@@ -1659,34 +1738,34 @@ static const struct {
     {"declare -i +i scratch='out=2'", true},
     {"declare +i -i scratch='out=2'", true},
     {"local -i scratch='out=2'", true},
-    {"declare SECONDS='out=2'", false},
-    {"typeset RANDOM='out=2'", false},
-    {"declare SRANDOM='out=2'", false},
-    {"declare OPTIND='out=2'", false},
-    {"declare HISTCMD='out=2'", false},
-    {"declare \"SECONDS=out=2\"", false},
-    {"declare S'E'CONDS='out=2'", false},
+    {"declare SECONDS='out=2'", false, true},
+    {"typeset RANDOM='out=2'", false, true},
+    {"declare SRANDOM='out=2'", false, true},
+    {"declare OPTIND='out=2'", false, true},
+    {"declare HISTCMD='out=2'", false, true},
+    {"declare \"SECONDS=out=2\"", false, true},
+    {"declare S'E'CONDS='out=2'", false, true},
     {"declare -p SECONDS='out=2'", true},
     {"declare +i SECONDS='out=2'", true},
     {"declare SECOND='out=2'", true},
     {"declare SECONDS_OTHER='out=2'", true},
     {"local SECONDS='out=2'", true},
-    {"read RANDOM <<<out=2", false},
-    {"read SRANDOM <<<out=2", false},
-    {"read OPTIND <<<out=2", false},
-    {"read HISTCMD <<<out=2", false},
-    {"printf -v RANDOM %s out=2", false},
-    {"printf -vRANDOM %s out=2", false},
-    {"printf -vSRANDOM %s out=2", false},
-    {"printf -v OPTIND %s out=2", false},
-    {"printf -vHISTCMD %s out=2", false},
+    {"read RANDOM <<<out=2", false, true},
+    {"read SRANDOM <<<out=2", false, true},
+    {"read OPTIND <<<out=2", false, true},
+    {"read HISTCMD <<<out=2", false, true},
+    {"printf -v RANDOM %s out=2", false, true},
+    {"printf -vRANDOM %s out=2", false, true},
+    {"printf -vSRANDOM %s out=2", false, true},
+    {"printf -v OPTIND %s out=2", false, true},
+    {"printf -vHISTCMD %s out=2", false, true},
     {"printf '%n' RANDOM", true},
     {"printf '%n' OPTIND", true},
     {"unset RANDOM", true},
     {"read -t0 RANDOM", true},
-    {"printf -v SECONDS %s out=2", false},
-    {"read SECONDS <<<out=2", false},
-    {"declare +i SECONDS=1; printf -v SECONDS %s out=2", false},
+    {"printf -v SECONDS %s out=2", false, true},
+    {"read SECONDS <<<out=2", false, true},
+    {"declare +i SECONDS=1; printf -v SECONDS %s out=2", false, true},
     {"declare -p fd=changed", true},
     {"declare -pr fd=changed", true},
     {"typeset -F fd=changed", true},
@@ -1730,19 +1809,19 @@ static const struct {
     {"read -p \"$prompt\"$other values <<<one", false},
     {"read -$'p' prompt -$'a' values <<<one", false},
     {"read values$\\\n'[0]' <<<one", false},
-    {"read value values$\\\r\n'[0]' <<<one", false},
+    {"read value values$\\\n'[0]' <<<one", false},
     {"read values$\\\n\\\n'[0]' <<<one", false},
     {"unset -v values$\\\n'[0]'", false},
-    {"unset -v values$\\\r\n'[0]'", false},
+    {"unset -v values$\\\n'[0]'", false},
     {"declare values$\\\n'[0]=one'", false},
-    {"declare values$\\\r\n'[0]+=one'", false},
+    {"declare values$\\\n'[0]+=one'", false},
     {"printf -v values$\\\n'[0]' one", false},
-    {"printf -vvalues$\\\r\n'[0]' one", false},
+    {"printf -vvalues$\\\n'[0]' one", false},
     {"read values$\\\n'[0' <<<one", true},
     {"read values$\\\n'[0]suffix' <<<one", true},
     {"read -p values$\\\n'[0]' value <<<one", true},
     {"unset -f values$\\\n'[0]'", true},
-    {"unset -n values$\\\r\n'[0]'", true},
+    {"unset -n values$\\\n'[0]'", true},
     {"printf %s values$\\\n'[0]'", true},
     {"read 'bad-name' values$\\\n'[0]' <<<one", true},
     {"read -n invalid \"values[0]\" <<<one", true},
@@ -1880,6 +1959,9 @@ static const struct {
     SHELLSPLIT_TEST_SHORT_SET_OPTION("P"),
     SHELLSPLIT_TEST_SHORT_SET_OPTION("T"),
 };
+#if defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
 #undef SHELLSPLIT_TEST_NAMED_SET_OPTION
 #undef SHELLSPLIT_TEST_SHORT_SET_OPTION
 
@@ -2460,8 +2542,9 @@ static const struct {
      false},
 };
 
-/* RHS routing follows commit order; temporary executable prefixes do not
- * replace the incoming allocation during expansion. Parsed, never executed. */
+/* Redirection expansion inside RHS substitutions follows Bash's shell binding
+ * table, not its temporary assignment environment. Ordinary argument lookup
+ * sees that environment separately. Parsed, never executed. */
 static const struct {
   const char *source;
   bool resolved;
@@ -2845,7 +2928,9 @@ static const struct {
     {"(! { exit 1; }; true) || exec 1>out; printf payload", true},
     {"(! (exit 1); true) || exec 1>out; printf payload", false},
     {"(exec 1>inner; true) || exec 1>out; printf payload", false},
-    {"(exit 1) | true || exec 1>out; printf payload", true},
+    /* The pipeline status is that of `true`; the fallback redirect is not
+     * reached and the final payload remains on inherited stdout. */
+    {"(exit 1) | true || exec 1>out; printf payload", false},
     {"(exit 1) & true || exec 1>out; printf payload", false},
     {"(X='${missing?absent}' true) || exec 1>out; printf payload", false},
     {"(X='1/0' true) || exec 1>out; printf payload", false},
@@ -2876,7 +2961,7 @@ static const struct {
     {"echo \\ #", "4:echo,2: #,", 0},
     {"echo \\\t#", "4:echo,2:\t#,", 0},
     {"echo x\\\n#", "4:echo,2:x#,", 0},
-    {"echo x\\\r\n#", "4:echo,2:x#,", 0},
+    {"echo x\\\n#", "4:echo,2:x#,", 0},
     {"echo \\\n# ignored\n", "4:echo,", 0},
     {"echo x\\\\ # ignored", "4:echo,2:x\\,", 0},
     {"echo $(printf x)#", "4:echo,12:$(printf x)#,", SHELL_FEAT_SUBSHELL},

@@ -239,8 +239,9 @@ static bool result_invariants(const char *input, size_t input_len,
          range->pipeline_time_mode == SHELL_PIPE_TIME_NONE) ||
         view != input + range->start || length != range->len ||
         copied != expected_copy || memcmp(copy, view, expected_copy) != 0 ||
-        copy[copied] != '\0' || isspace((unsigned char)input[range->start]) ||
-        isspace((unsigned char)input[range->start + range->len - 1]))
+        copy[copied] != '\0' ||
+        shell_source_space((unsigned char)input[range->start]) ||
+        shell_source_space((unsigned char)input[range->start + range->len - 1]))
       return false;
     previous_end = range->start + range->len;
   }
@@ -312,7 +313,7 @@ void test_layer1_basic_inputs(void) {
 
   err = shell_parse_fast("   \t\n  ", strlen("   \t\n  "), NULL, &result);
   test("Whitespace-only input has no command",
-       err == SHELL_EPARSE && result.status == SHELL_STATUS_ERROR &&
+       err == SHELL_OK && result.status == SHELL_STATUS_OK &&
            result.count == 0);
 
   // Test: simple command
@@ -1429,7 +1430,7 @@ static void test_strict_heredoc_completion(void) {
 
   static const char complete[] = "cat <<A <<-'B'\r\n"
                                  "one\r\n"
-                                 "A\r\n"
+                                 "A\n"
                                  "\ttwo\r\n"
                                  "\tB\r\n";
   shell_parse_result_t result = {0};
@@ -1439,7 +1440,7 @@ static void test_strict_heredoc_completion(void) {
           result.status == SHELL_STATUS_OK;
   static const char ansi_complete[] = "cat <<$'EO\\x46' <<-$'B'\r\n"
                                       "one\r\n"
-                                      "EOF\r\n"
+                                      "EOF\n"
                                       "\ttwo\r\n"
                                       "\tB\r\n";
   memset(&result, 0, sizeof(result));
@@ -1516,6 +1517,47 @@ static bool make_nested_heredoc_substitution(char *command, size_t capacity,
   return written >= 0 && (size_t)written < capacity - used;
 }
 
+static void test_semantic_blank_bytes(void) {
+  static const char *const blank[] = {" \t\n", "\\\n \t", "# comment\rfalse",
+                                      "# comment\r\n\t"};
+  for (unsigned strict = 0; strict < 2; strict++) {
+    shell_limits_t limits = SHELL_LIMITS_DEFAULT;
+    limits.strict_mode = strict != 0;
+    bool valid = true;
+    for (size_t i = 0; i < sizeof(blank) / sizeof(blank[0]); i++) {
+      shell_parse_result_t parsed;
+      valid = valid &&
+              shell_parse_fast(blank[i], strlen(blank[i]), &limits, &parsed) ==
+                  SHELL_OK &&
+              parsed.status == SHELL_STATUS_OK && parsed.count == 0;
+    }
+    for (size_t i = 0; i < sizeof(shellsplit_test_nonblank_bodies) /
+                               sizeof(shellsplit_test_nonblank_bodies[0]);
+         i++) {
+      const char *source = shellsplit_test_nonblank_bodies[i];
+      shell_parse_result_t parsed;
+      valid = valid &&
+              shell_parse_fast(source, strlen(source), &limits, &parsed) ==
+                  SHELL_OK &&
+              parsed.status == SHELL_STATUS_OK && parsed.count == 1;
+    }
+    static const char pipeline[] = "left |&\r\nright";
+    shell_parse_result_t parsed;
+    valid =
+        valid &&
+        shell_parse_fast(pipeline, sizeof(pipeline) - 1, &limits, &parsed) ==
+            SHELL_OK &&
+        parsed.count == 3 && parsed.cmds[1].start == 7 &&
+        parsed.cmds[1].len == 1 && parsed.cmds[1].type == SHELL_TYPE_PIPELINE &&
+        parsed.cmds[1].pipe_input_mode == SHELL_PIPE_MODE_STDOUT_AND_STDERR &&
+        parsed.cmds[2].start == 9 &&
+        parsed.cmds[2].type == SHELL_TYPE_SEMICOLON;
+    test(strict ? "Strict blank classification preserves Bash command bytes"
+                : "Blank classification preserves Bash command bytes",
+         valid);
+  }
+}
+
 static void test_substitution_comment_and_heredoc_capacity(void) {
   printf("\n--- Substitution Comment and Heredoc Capacity ---\n");
   shell_limits_t limits = {.max_subcommands = SHELL_MAX_SUBCOMMANDS,
@@ -1568,13 +1610,13 @@ static void test_substitution_comment_and_heredoc_capacity(void) {
 static void test_source_scanner_contract(void) {
   printf("\n--- Shared Source Scanner Contract ---\n");
   static const char lines[] = "one\r\ntwo\nlast";
-  test("source scanner recognizes CRLF and final physical lines",
-       shell_source_line_end(lines, sizeof(lines) - 1, 0) == 4 &&
-           shell_source_line_content_end(lines, sizeof(lines) - 1, 0) == 3 &&
-           shell_source_next_line(lines, sizeof(lines) - 1, 0) == 5 &&
-           shell_source_line_end(lines, sizeof(lines) - 1, 5) == 8 &&
-           shell_source_next_line(lines, sizeof(lines) - 1, 9) ==
-               sizeof(lines) - 1);
+  test(
+      "source scanner retains CR before LF and recognizes final physical lines",
+      shell_source_line_end(lines, sizeof(lines) - 1, 0) == 4 &&
+          shell_source_next_line(lines, sizeof(lines) - 1, 0) == 5 &&
+          shell_source_line_end(lines, sizeof(lines) - 1, 5) == 8 &&
+          shell_source_next_line(lines, sizeof(lines) - 1, 9) ==
+              sizeof(lines) - 1);
 
   test("source scanner uses logical shell-word comment boundaries",
        shell_source_comment_starts('#', true) &&
@@ -1592,11 +1634,12 @@ static void test_source_scanner_contract(void) {
   static const char delimiter[] = "- \t\"E\"'O'\\F rest";
   bool parsed = shell_source_parse_heredoc_delimiter(
       delimiter, sizeof(delimiter) - 1, &position, &pending);
-  test(
-      "source scanner decodes quoted and tab-stripped heredoc delimiters",
-      parsed && pending.strip_tabs && position < sizeof(delimiter) - 1 &&
-          shell_source_line_is_heredoc_delimiter("\tEOF\r\n", 6, 0, &pending) &&
-          !shell_source_line_is_heredoc_delimiter("\tEOG\n", 5, 0, &pending));
+  test("source scanner decodes quoted and tab-stripped heredoc delimiters",
+       parsed && pending.strip_tabs && position < sizeof(delimiter) - 1 &&
+           shell_source_line_is_heredoc_delimiter("\tEOF\n", 5, 0, &pending) &&
+           !shell_source_line_is_heredoc_delimiter("\tEOF\r\n", 6, 0,
+                                                   &pending) &&
+           !shell_source_line_is_heredoc_delimiter("\tEOG\n", 5, 0, &pending));
   position = 0;
   static const char escaped_delimiter[] = "\"E\\\"F\"";
   static const char retained_backslash_delimiter[] = "\"E\\qF\"";
@@ -1663,19 +1706,19 @@ static void test_source_scanner_contract(void) {
   bool decoded_nul = false;
   bool locale_dependent = false;
   position = 0;
-  test("ANSI-C NUL probe distinguishes malformed and inactive quotes",
-       shell_source_ansi_c_quote_facts("$'a\\0b'", 7, &position, &decoded_nul,
-                                       &locale_dependent) &&
-           decoded_nul && !locale_dependent && position == 7 &&
-           !shell_source_heredoc_word_has_unsupported_ansi_c(NULL, 0) &&
-           !shell_source_heredoc_word_has_unsupported_ansi_c("\\$'a\\0b'", 8) &&
-           !shell_source_heredoc_word_has_unsupported_ansi_c("\"$'a\\0b'\"",
-                                                             9) &&
-           !shell_source_heredoc_word_has_unsupported_ansi_c("'$'a\\0b''", 9) &&
-           !shell_source_heredoc_word_has_unsupported_ansi_c("$'unterminated",
-                                                             14) &&
-           shell_source_heredoc_word_has_unsupported_ansi_c("\\\r\n$'a\\0b'",
-                                                            10));
+  test(
+      "ANSI-C NUL probe distinguishes malformed and inactive quotes",
+      shell_source_ansi_c_quote_facts("$'a\\0b'", 7, &position, &decoded_nul,
+                                      &locale_dependent) &&
+          decoded_nul && !locale_dependent && position == 7 &&
+          !shell_source_heredoc_word_has_unsupported_ansi_c(NULL, 0) &&
+          !shell_source_heredoc_word_has_unsupported_ansi_c("\\$'a\\0b'", 8) &&
+          !shell_source_heredoc_word_has_unsupported_ansi_c("\"$'a\\0b'\"",
+                                                            9) &&
+          !shell_source_heredoc_word_has_unsupported_ansi_c("'$'a\\0b''", 9) &&
+          !shell_source_heredoc_word_has_unsupported_ansi_c("$'unterminated",
+                                                            14) &&
+          shell_source_heredoc_word_has_unsupported_ansi_c("\\\n$'a\\0b'", 10));
   position = 0;
   test("ANSI-C Unicode facts do not conflate byte escapes with code points",
        shell_source_ansi_c_quote_facts("$'\\u00e9'", 9, &position, &decoded_nul,
@@ -1704,7 +1747,7 @@ static void test_source_scanner_contract(void) {
   static const char sequence[] =
       "cat <<<'not a document' <<E'OF' <<-\\D'ONE'\r\n"
       "one\r\n"
-      "EOF\r\n"
+      "EOF\n"
       "\ttwo\r\n"
       "\tDONE\r\n"
       "printf retained";
@@ -1803,14 +1846,14 @@ static void test_source_scanner_contract(void) {
            !shell_source_skip_arithmetic_expansion(
                malformed_ansi_arithmetic, sizeof(malformed_ansi_arithmetic) - 1,
                0, &after));
-  static const char continued_assignment[] = "N\\\r\nAME=value";
+  static const char continued_assignment[] = "N\\\nAME=value";
   shell_source_decoded_assignment_t assignment = {0};
-  test("source scanner preserves assignment positions after CRLF continuation",
+  test("source scanner preserves assignment positions after LF continuation",
        shell_source_scan_decoded_assignment(continued_assignment,
                                             sizeof(continued_assignment) - 1,
                                             NULL, NULL, &assignment) &&
            assignment.name_length == 4 && assignment.source_delimiter &&
-           assignment.equals == 7 && assignment.name_end == 7 &&
+           assignment.equals == 6 && assignment.name_end == 6 &&
            !assignment.append);
   test(
       "source scanner rejects malformed nested and direct scanner inputs",
@@ -2393,12 +2436,12 @@ static void test_terminal_redirect_continuation_fast_ranges(void) {
     const char *command;
   } cases[] = {
       {">\\\n", "printf value >\\\n/tmp/out"},
-      {"<\\\r", "cat <\\\r/tmp/in"},
-      {">>\\\r\n", "printf value >>\\\r\n/tmp/log"},
+      {"<\\\n", "cat <\\\n/tmp/in"},
+      {">>\\\n", "printf value >>\\\n/tmp/log"},
       {">|\\\n", "printf value >|\\\n/tmp/force"},
-      {"&>\\\r", "printf value &>\\\r/tmp/both"},
+      {"&>\\\n", "printf value &>\\\n/tmp/both"},
       {"&>>\\\n", "printf value &>>\\\n/tmp/both-append"},
-      {"<>\\\r", "cat <>\\\r/tmp/read-write"},
+      {"<>\\\n", "cat <>\\\n/tmp/read-write"},
       {"{fd}>\\\n", "exec {fd}>\\\n/tmp/trace"},
   };
   shell_limits_t strict = {
@@ -2493,7 +2536,7 @@ static void test_group_context_on_redirect_and_operator_ranges(void) {
 }
 
 /* A physical linebreak after a list connector belongs to the pending stage,
- * rather than becoming an intervening semicolon. Exercise comments, CRLF, and
+ * rather than becoming an intervening semicolon. Exercise comments and
  * escaped line endings because each reaches the same source-span boundary by
  * a different scanner path. */
 static void test_list_connector_continuation_metadata(void) {
@@ -2505,7 +2548,7 @@ static void test_list_connector_continuation_metadata(void) {
   } cases[] = {
       {"newline pipeline", "left |\nright", SHELL_TYPE_PIPELINE,
        SHELL_PIPE_MODE_STDOUT},
-      {"CRLF pipe-both", "left |&\r\nright", SHELL_TYPE_PIPELINE,
+      {"newline pipe-both", "left |&\nright", SHELL_TYPE_PIPELINE,
        SHELL_PIPE_MODE_STDOUT_AND_STDERR},
       {"commented pipeline", "left | # note\nright", SHELL_TYPE_PIPELINE,
        SHELL_PIPE_MODE_STDOUT},
@@ -2515,7 +2558,7 @@ static void test_list_connector_continuation_metadata(void) {
        SHELL_TYPE_PIPELINE, SHELL_PIPE_MODE_STDOUT},
       {"escaped newline pipeline", "left | \\\nright", SHELL_TYPE_PIPELINE,
        SHELL_PIPE_MODE_STDOUT},
-      {"escaped CRLF pipe-both", "left |& \\\r\nright", SHELL_TYPE_PIPELINE,
+      {"escaped newline pipe-both", "left |& \\\nright", SHELL_TYPE_PIPELINE,
        SHELL_PIPE_MODE_STDOUT_AND_STDERR},
       {"newline AND", "left &&\nright", SHELL_TYPE_AND, SHELL_PIPE_MODE_NONE},
       {"commented OR", "left || # note\nright", SHELL_TYPE_OR,
@@ -2527,7 +2570,7 @@ static void test_list_connector_continuation_metadata(void) {
       "left | # note",
       "left |& \\\n",
       "left && # note",
-      "left ||\r\n",
+      "left ||\n",
   };
   shell_limits_t strict = {
       .max_subcommands = SHELL_MAX_SUBCOMMANDS,
@@ -2754,7 +2797,7 @@ static void test_pipeline_negation_trivia_metadata(void) {
   } cases[] = {
       {"! \\\nprintf x", 1, 1, SHELL_PIPE_MODE_NONE},
       {"! ! printf x |& cat", 2, 2, SHELL_PIPE_MODE_STDOUT_AND_STDERR},
-      {"! ! ! \\\r\nprintf x | cat", 2, 3, SHELL_PIPE_MODE_STDOUT},
+      {"! ! ! \\\nprintf x | cat", 2, 3, SHELL_PIPE_MODE_STDOUT},
   };
   shell_limits_t strict = {
       .max_subcommands = SHELL_MAX_SUBCOMMANDS,
@@ -4021,6 +4064,7 @@ int main(void) {
   test_strict_mode();
   test_strict_heredoc_completion();
   test_nested_heredoc_rejection();
+  test_semantic_blank_bytes();
   test_substitution_comment_and_heredoc_capacity();
   test_source_scanner_contract();
   test_arithmetic_shift_heredoc_boundary();

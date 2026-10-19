@@ -577,10 +577,7 @@ static bool scan_word_token(const char *cmd, uint32_t end, uint32_t *position) {
       /* The escaped byte is literal, so an escaped `$(` must not require a
        * matching close parenthesis. Parentheses are ordinary word bytes here.
        */
-      bool cr = cmd[pos + 1] == '\r';
       pos += 2;
-      if (cr && pos < end && cmd[pos] == '\n')
-        pos++;
       continue;
     }
     if (c == '$' && shell_source_logical_next_is(cmd, end, pos, '\'', NULL)) {
@@ -612,8 +609,8 @@ static bool scan_word_token(const char *cmd, uint32_t end, uint32_t *position) {
       pos = (uint32_t)after;
       continue;
     }
-    if (isspace((unsigned char)c) || c == '|' || c == ';' || c == '&' ||
-        c == '<' || c == '>')
+    if (shell_source_space((unsigned char)c) || c == '|' || c == ';' ||
+        c == '&' || c == '<' || c == '>')
       break;
     pos++;
   }
@@ -638,7 +635,7 @@ static bool scan_tokens(const char *cmd, uint32_t range_start,
         pos = (uint32_t)continued;
         continue;
       }
-      if (!isspace((unsigned char)cmd[pos]))
+      if (!shell_source_space((unsigned char)cmd[pos]))
         break;
       pos++;
     }
@@ -703,7 +700,7 @@ static bool scan_tokens(const char *cmd, uint32_t range_start,
           target = (uint32_t)target_continued;
           continue;
         }
-        if (!isspace((unsigned char)cmd[target]))
+        if (!shell_source_space((unsigned char)cmd[target]))
           break;
         target++;
       }
@@ -750,7 +747,7 @@ static bool scan_tokens(const char *cmd, uint32_t range_start,
       out->count++;
     }
   }
-  while (pos < end && isspace((unsigned char)cmd[pos]))
+  while (pos < end && shell_source_space((unsigned char)cmd[pos]))
     pos++;
   return pos < end;
 }
@@ -1064,11 +1061,13 @@ static SHELL_NONNULL(1) bool dep_token_static_starts_dash(
          word.length == decoded_length && word.length > 0 && word.starts_dash;
 }
 
-/* A redirect and its operand are not arguments to the builtin. tokens is a
+/* Redirects and wholly elided words are not builtin arguments. tokens is a
  * prepared command and index names one of its tokens. */
-static SHELL_NONNULL(1, 2) bool dep_skip_builtin_redirect(
+static SHELL_NONNULL(1, 2) bool dep_skip_nonargument(
     const dep_token_list_t *tokens, uint32_t *index) {
   const dep_token_t *word = &tokens->tokens[*index];
+  if (shell_source_word_is_elided(word->start, word->len))
+    return true;
   if (classify_redirect(word) == DEP_REDIRECT_NONE)
     return false;
   if (shell_source_redirection_consumes_word(word->start, word->len) &&
@@ -1127,7 +1126,7 @@ static SHELL_NONNULL(1, 3, 4) dep_cd_target_t
   *operand = NULL;
   *physical = false;
   for (uint32_t i = command + 1; i < tokens->count; i++) {
-    if (dep_skip_builtin_redirect(tokens, &i))
+    if (dep_skip_nonargument(tokens, &i))
       continue;
 
     const dep_token_t *token = &tokens->tokens[i];
@@ -1213,10 +1212,14 @@ static SHELL_NONNULL(1, 2, 3, 4, 5) uint32_t
       continue;
     }
     if (command != UINT32_MAX) {
-      if (*argv_presence != DEP_ARGV_PRESENT &&
-          shell_builtin_word_guarantees_argument(tokens->tokens[i].start,
-                                                 tokens->tokens[i].len))
-        *argv_presence = DEP_ARGV_PRESENT;
+      if (*argv_presence != DEP_ARGV_PRESENT) {
+        if (shell_builtin_word_guarantees_argument(tokens->tokens[i].start,
+                                                   tokens->tokens[i].len))
+          *argv_presence = DEP_ARGV_PRESENT;
+        else if (!shell_source_word_is_elided(tokens->tokens[i].start,
+                                              tokens->tokens[i].len))
+          *argv_presence |= DEP_ARGV_PRESENT;
+      }
       continue;
     }
     shell_source_assignment_word_t assignment;
@@ -1227,6 +1230,8 @@ static SHELL_NONNULL(1, 2, 3, 4, 5) uint32_t
       *argv_presence =
           shell_builtin_word_guarantees_argument(word->start, word->len)
               ? DEP_ARGV_PRESENT
+          : shell_source_word_is_elided(word->start, word->len)
+              ? DEP_ARGV_EMPTY
               : DEP_ARGV_EMPTY | DEP_ARGV_PRESENT;
       continue;
     }
@@ -1928,21 +1933,19 @@ typedef enum {
 } dep_route_kind_t;
 
 typedef struct {
-  uint32_t value;
   /* A named Bash descriptor is identified by its logical variable spelling,
    * not by the shared SHELL_DEP_FD_NAMED sentinel. */
   const char *name;
-  uint32_t name_len;
+  uint32_t value, name_len;
 } dep_fd_ref_t;
 
 static dep_fd_ref_t dep_fd_numeric(uint32_t value) {
-  return (dep_fd_ref_t){value, NULL, 0};
+  return (dep_fd_ref_t){.value = value};
 }
 
-/* Named redirection spellings use the same escaped-physical-line-ending
- * normalization as their source parser. Compare logical identifier bytes so
- * `{f\\\nd}`, `{f\\\r\nd}`, and `{f\\\rd}` are never confused with another
- * name solely because the source happens to be physically wrapped.
+/* Named redirection spellings erase backslash-LF just like their source
+ * parser. Compare logical identifier bytes so `{f\\\nd}` is never confused
+ * with another name solely because the source happens to be wrapped.
  * name is NULL only for a zero-length name. Outputs are required, and
  * *position <= name_len. The returned position remains within that span. */
 static SHELL_NONNULL(3, 4) bool dep_fd_name_next_byte(const char *name,
@@ -2006,14 +2009,20 @@ typedef struct {
 
 /* One-based AVL links into an append-only record array. The index does not
  * own records: comparison callbacks receive the pending key separately.
- * A failed capacity insertion leaves the existing index unchanged. Insertion
- * callers inspecting a possible capacity failure initialize match to zero.
- * A successful lookup/insertion replaces it with the one-based record index;
- * capacity failure leaves it unchanged. */
+ * A lookup still traverses the complete tree when candidate exceeds capacity,
+ * so an existing key remains discoverable in a full index. If that lookup
+ * reaches an empty link, insertion fails with match still zero and leaves the
+ * root, links and heights byte-for-byte unchanged. A successful lookup or
+ * insertion replaces match with the one-based record index. */
+/* All these private indexes have at most UINT16_MAX records. Their callers
+ * preflight bounded capacities; keys and public descriptor IDs remain 32-bit.
+ */
 typedef struct {
-  uint32_t left, right;
+  uint16_t left, right;
   uint8_t height;
-} dep_index_node_t;
+} __attribute__((packed)) dep_index_node_t;
+_Static_assert(sizeof(dep_index_node_t) == 5,
+               "private AVL links must not carry alignment padding");
 
 typedef int (*dep_index_compare_t)(const void *, uint32_t, const void *);
 
@@ -2084,14 +2093,64 @@ static SHELL_NONNULL(1, 5, 6, 7, 8) uint32_t
     return root;
   }
   dep_index_node_t *node = &nodes[root - 1];
+  uint32_t child =
+      dep_index_insert(nodes, order > 0 ? node->left : node->right, candidate,
+                       capacity, compare, context, key, match);
+  if (!*match)
+    return root;
   if (order > 0)
-    node->left = dep_index_insert(nodes, node->left, candidate, capacity,
-                                  compare, context, key, match);
+    node->left = (uint16_t)child;
   else
-    node->right = dep_index_insert(nodes, node->right, candidate, capacity,
-                                   compare, context, key, match);
+    node->right = (uint16_t)child;
   return dep_index_rebalance(nodes, root);
 }
+
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+static SHELL_NONNULL(1, 3) int dep_test_index_compare(const void *context,
+                                                      uint32_t member,
+                                                      const void *key) {
+  const uint32_t *values = context;
+  uint32_t candidate = *(const uint32_t *)key;
+  return values[member] < candidate ? -1 : values[member] > candidate;
+}
+
+bool shellsplit_test_index_capacity_contract(void) {
+  dep_index_node_t nodes[3] = {{0}};
+  const uint32_t values[] = {20, 10, 30};
+  uint32_t root = 0;
+  for (uint32_t candidate = 1; candidate <= 3; candidate++) {
+    uint32_t match = 0;
+    root = dep_index_insert(nodes, root, candidate, 3, dep_test_index_compare,
+                            values, &values[candidate - 1], &match);
+    if (match != candidate)
+      return false;
+  }
+
+  dep_index_node_t expected[3];
+  memcpy(expected, nodes, sizeof(expected));
+  uint32_t expected_root = root;
+  const uint32_t missing[] = {5, 40};
+  for (size_t i = 0; i < sizeof(missing) / sizeof(missing[0]); i++) {
+    uint32_t match = 0;
+    uint32_t unchanged = dep_index_insert(
+        nodes, root, 4, 3, dep_test_index_compare, values, &missing[i], &match);
+    if (unchanged != expected_root || match != 0 ||
+        memcmp(nodes, expected, sizeof(nodes)) != 0)
+      return false;
+  }
+
+  for (uint32_t member = 0; member < 3; member++) {
+    uint32_t match = 0;
+    uint32_t unchanged =
+        dep_index_insert(nodes, root, 4, 3, dep_test_index_compare, values,
+                         &values[member], &match);
+    if (unchanged != expected_root || match != member + 1 ||
+        memcmp(nodes, expected, sizeof(nodes)) != 0)
+      return false;
+  }
+  return true;
+}
+#endif
 
 /* Remove a known member without moving record identities. The caller keeps
  * record keys unchanged until removal completes. Both helpers receive a
@@ -2134,6 +2193,10 @@ static SHELL_NONNULL(1, 3, 4, 5) uint32_t
 
 #define DEP_MAX_FD_ROUTES (SHELL_DEP_MAX_EDGES + 8)
 
+typedef struct dep_fd_imports dep_fd_imports_t;
+typedef struct dep_route_journal dep_route_journal_t;
+typedef struct dep_snapshot_source dep_snapshot_source_t;
+
 typedef struct {
   /* A descriptor may support both directions (`<>file`). Keep them separate:
    * a later output route must not erase the input relation to the same file. */
@@ -2143,6 +2206,10 @@ typedef struct {
    * index; removals update it instead of rebuilding or rescanning the table. */
   dep_index_node_t index[DEP_MAX_FD_ROUTES];
   uint32_t root;
+  /* Recursive analysis borrows the immutable parent value map. Physical
+   * descriptors are still imported explicitly; an unset-only scalar must not
+   * become a descriptor merely to preserve its known-empty value. */
+  const dep_fd_imports_t *scalar_imports;
 } dep_owner_routes_t;
 
 typedef struct {
@@ -2159,13 +2226,23 @@ typedef struct {
   /* Binding records preserve the physical close-on-exec scratch property in
    * their own execution versions. This uses existing record padding. */
   bool scratch;
+  /* Original process-substitution end, not a duplicate of its resource. */
+  bool process_owned;
+  /* Evaluation-wide BDD selector; zero means no low-FD identity. */
+  uint32_t selector;
+  /* Borrowed allocation-site identity, stable across construction/replay and
+   * recursive imports. Unlike selector IDs, this never names scratch storage.
+   */
+  const char *allocation;
   /* Membership in exporting execution versions; zero means a shared fact. */
   uint64_t paths[(SHELL_DEP_MAX_NODES + 63) / 64];
 } dep_fd_import_t;
 
 #define DEP_MAX_FD_IMPORTS (DEP_MAX_FD_ROUTES * 3)
 
-typedef struct {
+typedef struct dep_process_domain_pool dep_process_domain_pool_t;
+
+struct dep_fd_imports {
   dep_fd_import_t entries[DEP_MAX_FD_IMPORTS];
   dep_index_node_t index[DEP_MAX_FD_IMPORTS];
   uint32_t root;
@@ -2175,20 +2252,44 @@ typedef struct {
   uint32_t path_count;
   uint32_t path_ifs[SHELL_DEP_MAX_NODES];
   uint8_t path_stdin_redir[SHELL_DEP_MAX_NODES];
-} dep_fd_imports_t;
+  const dep_process_domain_pool_t *process_domains;
+  uint32_t path_process_domain[SHELL_DEP_MAX_NODES];
+  uint8_t process_capture_mask;
+  /* Parent checkpoints outlive this recursive parse, including its final
+   * replay. Look up only requested scalar keys, never export the whole map.
+   * Roots belong to scalar_journal, not to the child's replay journal. */
+  const dep_route_journal_t *scalar_journal;
+  const dep_owner_routes_t *scalar_baseline;
+  uint32_t path_scalar_root[SHELL_DEP_MAX_NODES];
+  bool path_assignment_only[SHELL_DEP_MAX_NODES];
+  const dep_snapshot_source_t *assignment_source;
+  const char *assignment_command;
+  uint32_t assignment_position;
+  /* Synchronous command substitutions return inherited observations. */
+  bool observe_return;
+};
 
 typedef struct {
   uint32_t owner;
   uint32_t fd;
   uint8_t access;
   uint32_t import_index;
+  const char *fd_name;
+  uint32_t fd_name_len;
 } dep_fd_import_use_t;
 
 typedef struct dep_route_workspace dep_route_workspace_t;
 typedef struct dep_snapshot_frame dep_snapshot_frame_t;
 
-/* Construction-time identity for the descriptor route created by one
- * process-substitution redirect operand.  Several operands may have the same
+typedef struct dep_process_guard {
+  const char *source;
+  const struct dep_process_guard *parent;
+  uint32_t depth;
+  bool observed;
+} dep_process_guard_t;
+
+/* Construction-time identity for a process substitution's temporary pipe end
+ * or its redirected installation. Several operands may have the same
  * owner and descriptor, so route resolution must use source identity rather
  * than claiming the first compatible graph edge.  This journal is private to
  * one recursive parse; copied child graphs have already resolved their own
@@ -2197,17 +2298,28 @@ typedef struct {
   uint32_t position;
   uint32_t edge;
   dep_fd_ref_t fd;
+  const char *source;
+  const dep_process_guard_t *guard;
   uint32_t next;
   uint8_t access;
+  bool temporary, command_word, byte_use, standalone;
 } dep_process_route_t;
 
 typedef struct {
-  dep_process_route_t entries[SHELL_DEP_MAX_EDGES];
+  dep_process_route_t entries[SHELL_DEP_MAX_EDGES * 2];
+  dep_process_guard_t guards[SHELL_DEP_MAX_EDGES * 2];
+  dep_index_node_t guard_index[SHELL_DEP_MAX_EDGES * 2];
+  uint32_t guard_root, guard_count;
   /* One-based owner-local chains. Appending a route never requires a search;
    * snapshot cursors consume only the newly installed operations. */
   uint32_t first[SHELL_DEP_MAX_NODES];
   uint32_t last[SHELL_DEP_MAX_NODES];
+  /* Prepared once from observations within each temporary-end lifetime. */
+  bool track[SHELL_DEP_MAX_NODES];
+  bool tracking_ready[SHELL_DEP_MAX_NODES];
+  uint16_t observed_low[SHELL_DEP_MAX_NODES];
   uint32_t count;
+  bool private_edges;
 } dep_process_route_map_t;
 
 typedef struct {
@@ -2218,10 +2330,20 @@ typedef struct {
   /* Capture GROUP records normally describe exposure, not a byte producer.
    * Shell-owned diagnostics and imported child flows are actual group uses. */
   bool actual_group;
+  const char *fd_name;
+  uint32_t fd_name_len;
 } dep_stream_use_t;
 
-/* Phase-local substitution transfers. The incoming bit denotes a path on
- * which no substitution ran; the two low bits denote returning outcomes. */
+static SHELL_NONNULL(1) dep_fd_ref_t
+    dep_stream_fd(const dep_stream_use_t *use) {
+  return (dep_fd_ref_t){
+      .name = use->fd_name, .value = use->fd, .name_len = use->fd_name_len};
+}
+
+/* Phase-local substitution transfers. The incoming bit denotes a path with no
+ * status-replacing substitution; empty bodies and skipped operands preserve
+ * the current command's preceding value. The low bits are returning outcomes.
+ */
 typedef struct {
   uint8_t phase[3];
   /* Unconditional expansion errors are separate from the assignment-only
@@ -2269,6 +2391,10 @@ typedef struct {
   uint8_t unresolved_paths[SHELL_DEP_MAX_NODES];
   /* Completed child-shell status, consumed before its stream slot is reused. */
   uint8_t status;
+  /* Derived during existing parsing, never from graph node count. Blank
+   * substitutions preserve status; comment-only $() does too, but comment-only
+   * backticks execute an empty child and return success in reference Bash. */
+  uint8_t empty_kind;
   /* Private join metadata: public graph edges remain the sole externally
    * visible representation of inherited descriptor byte flow. */
   dep_fd_imports_t fd_imports;
@@ -2290,8 +2416,61 @@ typedef struct {
   dep_subgraph_streams_t streams;
 } dep_recursive_parse_t;
 
+typedef enum {
+  DEP_OBSERVATION_BINDING,
+  DEP_OBSERVATION_VALUE,
+  DEP_OBSERVATION_IDENTITY,
+  DEP_OBSERVATION_ACCESS,
+} dep_observation_kind_t;
+
+/* Portable predicates over imported descriptors and captured argument values,
+ * never journal-local roots. Allocation sites borrow the original source;
+ * clauses are alternatives and conditions within a clause are conjunctive. */
+typedef struct {
+  dep_fd_ref_t fd;
+  const char *allocation;
+  uint32_t next, value;
+  dep_observation_kind_t kind;
+} dep_observation_condition_t;
+typedef struct {
+  uint32_t conditions, next;
+  uint8_t status;
+} dep_observation_clause_t;
+typedef struct {
+  dep_observation_condition_t conditions[DEP_MAX_FD_IMPORTS];
+  dep_observation_clause_t clauses[SHELL_DEP_MAX_NODES * 5];
+  uint32_t condition_count, clause_count;
+} dep_observation_transfer_t;
+typedef struct {
+  dep_index_node_t condition_index[DEP_MAX_FD_IMPORTS];
+  dep_index_node_t clause_index[SHELL_DEP_MAX_NODES * 5];
+  uint32_t condition_root, clause_root;
+} dep_observation_index_t;
+typedef struct {
+  uint32_t clauses, next, position, key;
+  const dep_process_guard_t *guard, *previous_guard;
+  /* Borrowed guards belong to the enclosing parse's scanner inventory.
+   * previous_guard permits prompt retirement of completed status-only scopes.
+   * A clause-free event only closes scopes; it cannot replace phase status. */
+  /* Phase status before this event, when an unrecorded earlier substitution
+   * or the incoming shell status supplies the conditional skipped outcome. */
+  uint8_t incoming_status;
+  bool conditional;
+} dep_observation_event_t;
+typedef struct {
+  dep_observation_transfer_t transfer;
+  dep_observation_event_t events[SHELL_DEP_MAX_EDGES];
+  uint32_t event_count;
+} dep_observation_program_t;
+
 typedef struct dep_import_join {
-  dep_fd_imports_t imports;
+  union {
+    dep_fd_imports_t imports;
+    dep_observation_transfer_t observations;
+  };
+  /* Export-local indexes; never borrowed by a recursive child's summary or
+   * checkpointed with the parent's append-only observation program. */
+  dep_observation_index_t observation_index;
   uint32_t import_indices[SHELL_DEP_MAX_EDGES];
   dep_stream_use_t endpoints[SHELL_DEP_MAX_EDGES];
   dep_index_node_t endpoint_index[SHELL_DEP_MAX_EDGES];
@@ -2309,6 +2488,9 @@ typedef struct dep_import_join {
 } dep_import_join_t;
 
 #define DEP_EXECUTION_EVENT_CAPACITY (SHELL_MAX_GROUPS + SHELL_MAX_SUBCOMMANDS)
+#define DEP_OBSERVATION_ROOT_EVENT DEP_EXECUTION_EVENT_CAPACITY
+#define DEP_SCALAR_IMPORT_EVENT (DEP_OBSERVATION_ROOT_EVENT + 2)
+#define DEP_VARIABLE_STATE_EVENT (DEP_OBSERVATION_ROOT_EVENT + 3)
 typedef struct {
   /* Zero means synchronous. Otherwise names the first event, biased by one.
    * Only direct stages participate; compound descendants use their own scope.
@@ -2393,13 +2575,19 @@ typedef enum {
   DEP_FD_OP_FAILED,
   /* A resolved physical self-copy, never an independently parsed operation. */
   DEP_FD_OP_IDENTITY,
+  /* A process substitution creates its parent pipe end during expansion,
+   * independently of opening a redirect onto that pipe's pathname. */
+  DEP_FD_OP_PROCESS,
 } dep_fd_op_kind_t;
 
 static bool dep_fd_op_copies(dep_fd_op_kind_t kind) {
   return kind == DEP_FD_OP_DUP || kind == DEP_FD_OP_MOVE;
 }
 
-typedef enum {
+/* Journal access kinds are unsigned single-bit masks, including bit 31.
+ * Do not depend on a compiler's choice of enum signedness for ordering them. */
+typedef uint32_t dep_fd_access_t;
+enum {
   DEP_FD_ACCESS_READ = 1 << 0,
   DEP_FD_ACCESS_WRITE = 1 << 1,
   DEP_FD_ACCESS_BOTH = DEP_FD_ACCESS_READ | DEP_FD_ACCESS_WRITE,
@@ -2408,6 +2596,17 @@ typedef enum {
   DEP_FD_ACCESS_BINDING = 1 << 2,
   /* Private allocator candidates left by reached closes. */
   DEP_FD_ACCESS_AVAILABLE = 1 << 3,
+  /* Event-keyed immutable parent version of a private execution alternative.
+   * This is outcome provenance, not a child descriptor mutation to publish. */
+  DEP_FD_ACCESS_PRIVATE_ENTRY = 1 << 4,
+  /* Innermost private-entry event plus one; UINT32_MAX identifies a root
+   * imported-entry observation anchor. Neither value is a map reference. */
+  DEP_FD_ACCESS_PRIVATE_SCOPE = 1 << 8,
+  /* Numeric sentinel keys retain transient read effects and the predefined
+   * variable capability mask. Named keys retain descriptor-orphan state. */
+  DEP_FD_ACCESS_EFFECT_STATE = 1 << 9,
+  DEP_FD_ACCESS_SUBSTITUTION_STATUS = 1 << 10,
+  DEP_FD_ACCESS_INHERITED_OBSERVATION = 1 << 11,
   /* Operation-keyed command-local Bash redirection undo descriptors. */
   DEP_FD_ACCESS_SAVED = 1 << 5,
   DEP_FD_ACCESS_LOW_STATE = 1 << 6,
@@ -2433,10 +2632,28 @@ typedef enum {
   DEP_FD_ACCESS_SETUP_MODE = 1 << 23,
   /* Path-local cleanup-program and dependency-index roots during setup. */
   DEP_FD_ACCESS_FAILURE_UNDO = 1 << 24,
+  /* A read -u argument's physical identity at command-word expansion. Keys
+   * are owner-local token ordinals, disjoint from ordinary FD facts. */
+  DEP_FD_ACCESS_READ_ARGUMENT = 1 << 25,
+  DEP_FD_ACCESS_PROCESS_SLOT = 1 << 26,
+  /* Symbolic occupancy of Bash's fixed low/high allocation domain. An
+   * empty fact means no domain; value zero in a nonempty fact is impossible.
+   * Clearing a domain must not turn it into the impossible terminal. */
+  DEP_FD_ACCESS_PROCESS_DOMAIN = 1 << 27,
+  DEP_FD_ACCESS_PROCESS_BEFORE = 1 << 28,
+  DEP_FD_ACCESS_SELECTOR = 1 << 29,
+  /* Root of the interpreter's persistent set of original process-pipe FDs.
+   * Forking a compound closes these in the parent, not in its child. */
+  DEP_FD_ACCESS_PROCESS_OWNED = 1 << 30,
   /* Expansion context, not a descriptor capability. Stored under numeric key
    * zero in the same immutable execution journal; never materialized as I/O. */
   DEP_FD_ACCESS_IFS = 1 << 12,
-} dep_fd_access_t;
+};
+
+/* A version owns one resettable named-scalar map. Its holder stores the root
+ * and INHERITED (baseline) or DYNAMIC (unknown) fallback. Physical descriptor
+ * facts and allocation occupancy stay in the outer map. */
+#define DEP_FD_ACCESS_NAMED_BINDINGS ((dep_fd_access_t)UINT32_C(0x80000000))
 
 typedef enum {
   DEP_MOVE_SOURCE_UNSAVED,
@@ -2467,7 +2684,7 @@ enum {
   /* Private command transfer, never a completed-flow outcome: operandless
    * exit terminates with the status of the path that actually reaches it. */
   DEP_STATUS_EXIT_INCOMING = 1u << 5,
-  /* Identity transfer for a phase with no executed command substitution. */
+  /* Identity transfer for a phase with no status-replacing substitution. */
   DEP_EXPANSION_INCOMING = 1u << 7,
 };
 
@@ -2504,6 +2721,13 @@ typedef struct {
   bool undo_observable;
   /* External setup has no undo list. Command/group setup owns its saves. */
   uint8_t undo_mode;
+  /* NULL for unconditional setup. Borrowed from this parse's guard pool. */
+  const dep_process_guard_t *guard;
+  /* Process allocation observes low auxiliary identities only within its
+   * owner lifetime. Prior closes still constrain occupancy, not identity. */
+  uint16_t process_observed_low;
+  /* One-based predefined-variable identity for a named destination. */
+  uint8_t variable;
 } dep_fd_op_t;
 
 /* Every redirect replaces the descriptor as a whole. Access describes the
@@ -2567,11 +2791,18 @@ typedef enum {
   DEP_NAMED_EFFECT_TOKEN,
   DEP_NAMED_EFFECT_STATIC_ASSIGNMENT,
   DEP_NAMED_EFFECT_PRINTF_ATTACHED,
+  DEP_NAMED_EFFECT_UNSET,
 } dep_named_effect_kind_t;
 
 typedef struct {
   dep_token_t token;
-  dep_named_effect_kind_t kind;
+  /* One-based read-observation key, resolved once in this parse frame. */
+  uint32_t observation;
+  uint8_t kind;
+  /* One-based predefined-variable registry identity, or zero. */
+  uint8_t variable;
+  /* Fresh-shell properties which require ordinary-scalar state. */
+  uint8_t prohibited_properties;
 } dep_named_effect_t;
 
 /* Cumulative IFS assignment effects, ordered by commit boundary. An RHS
@@ -2584,7 +2815,14 @@ typedef struct {
 
 /* Borrowed logical identifiers, indexed once per command. */
 typedef struct {
-  dep_token_t names[SHELL_DEP_MAX_TOKENS];
+  const char *start;
+  uint32_t len;
+  uint8_t variable;
+  bool append;
+} dep_variable_token_t;
+
+typedef struct {
+  dep_variable_token_t names[SHELL_DEP_MAX_TOKENS];
   dep_index_node_t index[SHELL_DEP_MAX_TOKENS];
   uint32_t root, count;
 } dep_prefix_assignment_set_t;
@@ -2614,6 +2852,8 @@ typedef struct {
   /* cd's implicit variable writes follow successful execution only. Ordinary
    * mutating builtins may write even when they subsequently return failure. */
   bool success_only;
+  /* Zero is the root list; otherwise this is the one-based lexical group. */
+  uint8_t scope;
   /* NULL means arbitrary writes can affect every visible binding. A retained
    * index excludes command-prefix bindings restored after this builtin. */
   const dep_prefix_assignment_set_t *restored_prefixes;
@@ -2624,8 +2864,8 @@ typedef struct {
 
 /* cd changes variable contents, not the open descriptors they used to name. */
 static const dep_named_mutations_t dep_cd_mutations = {
-    .effects = {{{"PWD", 3}, DEP_NAMED_EFFECT_TOKEN},
-                {{"OLDPWD", 6}, DEP_NAMED_EFFECT_TOKEN}},
+    .effects = {{.token = {"PWD", 3}, .kind = DEP_NAMED_EFFECT_TOKEN},
+                {.token = {"OLDPWD", 6}, .kind = DEP_NAMED_EFFECT_TOKEN}},
     .count = 2,
     .success_only = true};
 
@@ -2646,14 +2886,21 @@ typedef struct {
 } dep_route_set_t;
 
 typedef struct {
-  dep_fd_ref_t fd;
+  /* Numeric references store their value; named references store their span
+   * length and are discriminated by the parallel borrowed-name pointer. */
+  uint32_t fd_key;
   /* Immutable AVL node: versions share untouched subtrees, not a history
    * tail which every lookup must rescan. */
-  uint32_t snapshot;
-  uint32_t left, right;
-  uint8_t height;
-  dep_fd_access_t access;
-} dep_route_change_t;
+  uint16_t snapshot : 11, height : 5;
+  uint16_t left, right;
+  /* Descriptor facts are single-bit access kinds, stored as their bit index. */
+  /* Access keys use 0..31; 63 marks a cleanup-index sentinel. One reclaimed
+   * bit summarizes visible named bindings, allowing materialization to skip
+   * proof-only submaps without increasing the journal byte budget. */
+  uint8_t access_key : 6, named_live : 1, interned : 1;
+} __attribute__((packed)) dep_route_change_t;
+_Static_assert(sizeof(dep_route_change_t) == 11,
+               "route cores keep borrowed names in the parallel name table");
 
 /* Immutable alternative lists carry route roots. */
 typedef struct {
@@ -2689,19 +2936,134 @@ typedef struct {
 #define DEP_ROUTE_CHANGE_CAPACITY                                              \
   (DEP_ROUTE_OPERATION_CAPACITY * SHELL_DEP_MAX_TOKENS * 3)
 #define DEP_ROUTE_SNAPSHOT_CAPACITY (DEP_ROUTE_OPERATION_CAPACITY * 4)
+#define DEP_ROUTE_TREE_CACHE_CAPACITY 512u
+#define DEP_PROCESS_APPLY_CAPACITY DEP_ROUTE_CHANGE_CAPACITY
+#define DEP_PROCESS_APPLY_WAYS 4u
+#define DEP_PROCESS_APPLY_SETS                                                 \
+  (DEP_PROCESS_APPLY_CAPACITY / DEP_PROCESS_APPLY_WAYS)
+_Static_assert((DEP_ROUTE_TREE_CACHE_CAPACITY &
+                (DEP_ROUTE_TREE_CACHE_CAPACITY - 1)) == 0,
+               "route-tree cache capacity is a power of two");
+
+/* Reduced ordered decision diagrams over fd 0..63 (high means free) and
+ * sparse allocation selectors (0..63, or 64 for the existing high tail).
+ * Each selector choice is ordered beside its corresponding occupancy bit.
+ * Terminals 0/1 are impossible/unconstrained. Node and apply pools are bounded
+ * by actual routing work, not an enumeration of inherited descriptor tables. */
+typedef struct {
+  uint32_t low : 16, high : 16;
+  uint32_t fd : 31, low_full : 1;
+  uint64_t free, occupied;
+} dep_process_domain_node_t;
+typedef struct {
+  uint16_t left, result;
+  uint32_t right;
+  unsigned operation;
+} dep_process_domain_apply_t;
+/* Route records and decision nodes share the former aggregate private byte
+ * budget. Compact descriptor references reduce route-node padding; assign the
+ * reclaimed bytes to retained decisions without changing a public limit or
+ * enlarging the evaluation workspace. Apply storage keeps its original bound.
+ */
+#define DEP_ROUTE_STORAGE_BYTES                                                \
+  ((sizeof(dep_route_change_t) + sizeof(const char *) +                        \
+    sizeof(dep_index_node_t)) *                                                \
+       DEP_ROUTE_CHANGE_CAPACITY +                                             \
+   sizeof(uint16_t) * DEP_ROUTE_TREE_CACHE_CAPACITY + 4u * sizeof(uint32_t))
+#define DEP_ROUTE_AND_DOMAIN_BYTE_BUDGET (116u * DEP_ROUTE_CHANGE_CAPACITY)
+#define DEP_PROCESS_DOMAIN_BYTE_BUDGET                                         \
+  (DEP_ROUTE_AND_DOMAIN_BYTE_BUDGET - DEP_ROUTE_STORAGE_BYTES)
+#define DEP_PROCESS_DOMAIN_BUDGET_CAPACITY                                     \
+  ((DEP_PROCESS_DOMAIN_BYTE_BUDGET -                                           \
+    (sizeof(dep_process_domain_apply_t) + sizeof(dep_index_node_t)) *          \
+        DEP_PROCESS_APPLY_CAPACITY) /                                          \
+   (sizeof(dep_process_domain_node_t) + sizeof(dep_index_node_t) +             \
+    sizeof(uint16_t)))
+#define DEP_PROCESS_DOMAIN_CAPACITY                                            \
+  (DEP_PROCESS_DOMAIN_BUDGET_CAPACITY + 2u < UINT16_MAX                        \
+       ? DEP_PROCESS_DOMAIN_BUDGET_CAPACITY                                    \
+       : UINT16_MAX - 3u)
+_Static_assert(DEP_PROCESS_DOMAIN_CAPACITY + 2u < UINT16_MAX,
+               "biased decision roots and private AVL links fit 16 bits");
+_Static_assert(DEP_ROUTE_CHANGE_CAPACITY <= UINT16_MAX,
+               "other private indexes fit 16 bits");
+_Static_assert(DEP_PROCESS_APPLY_CAPACITY <= UINT16_MAX,
+               "decision apply indexes fit 16 bits");
+_Static_assert((sizeof(dep_process_domain_node_t) + sizeof(dep_index_node_t) +
+                sizeof(uint16_t)) *
+                           DEP_PROCESS_DOMAIN_CAPACITY +
+                       (sizeof(dep_process_domain_apply_t) +
+                        sizeof(dep_index_node_t)) *
+                           DEP_PROCESS_APPLY_CAPACITY <=
+                   DEP_PROCESS_DOMAIN_BYTE_BUDGET,
+               "decision and apply storage must not grow the workspace budget");
+
+struct dep_process_domain_pool {
+  dep_process_domain_node_t nodes[DEP_PROCESS_DOMAIN_CAPACITY];
+  dep_index_node_t index[DEP_PROCESS_DOMAIN_CAPACITY];
+  uint32_t root, count;
+  uint32_t free_node, free_count, node_allocations;
+  dep_process_domain_apply_t applies[DEP_PROCESS_APPLY_CAPACITY];
+  /* Four-way memo sets are evictable: only decision nodes are semantic
+   * storage. The low nibble counts valid ways; the high nibble is the next
+   * victim. memo_ready is the lazy-reset flag, not a tree root. */
+  uint8_t apply_sets[DEP_PROCESS_APPLY_SETS];
+  bool memo_ready;
+  /* Exact node interning retains its AVL authority. Compact IDs allow a
+   * larger front cache without increasing the old memo-index byte budget. */
+  uint16_t node_cache[16384];
+  /* A batch maps node IDs from one immutable source pool. Reset import_count
+   * before changing/resetting that source. Scratch compaction also clears it:
+   * compaction borrows this array as its forwarding map and relocates IDs. */
+  /* Roots fit the same 16-bit bound as node links. Zero is unvisited and
+   * UINT16_MAX is the transient import-recursion sentinel. */
+  uint16_t import_cache[DEP_PROCESS_DOMAIN_CAPACITY];
+  uint32_t import_count;
+};
+#define DEP_READ_OBSERVATION_CAPACITY DEP_ROUTE_OPERATION_CAPACITY
+enum {
+  DEP_READ_OBSERVE_VALUE = 1u,
+  DEP_READ_OBSERVE_IDENTITY = 2u,
+  DEP_READ_OBSERVE_ACCESS = 4u,
+};
+typedef struct {
+  dep_fd_ref_t fd;
+  unsigned role;
+  uint8_t variable;
+} dep_read_observation_t;
+/* Source names and static selectors are indexed once for role lookup, never
+ * enumerated at child entry. Private slots retain
+ * their allocation's borrowed name, so observation needs no mutable alias
+ * inventory and cannot outlive a recursive journal rewind. */
+typedef struct {
+  dep_read_observation_t entries[DEP_READ_OBSERVATION_CAPACITY];
+  dep_index_node_t index[DEP_READ_OBSERVATION_CAPACITY];
+  uint32_t root, count;
+  /* Key-only named allocations support prepared mutation lookup; they do
+   * not request observation capture or retain read-version correlations. */
+  bool active, identity;
+} dep_read_observations_t;
 typedef enum {
   DEP_ALLOCATION_BINDING,
   DEP_ALLOCATION_TARGET_UNDO,
   DEP_ALLOCATION_MOVE_UNDO,
+  DEP_ALLOCATION_PROCESS,
+  DEP_ALLOCATION_PROCESS_GUARD,
+  DEP_ALLOCATION_IMPORT,
 } dep_allocation_role_t;
 
 typedef struct {
   const char *name;
+  /* Original allocation spelling, retained when this is an imported alias. */
+  const char *allocation;
+  uint32_t name_length;
   uint32_t position;
   uint32_t fd;
   dep_allocation_role_t role;
   /* Union for frame membership, not path-dependent restoration facts. */
   uint32_t closed_slots;
+  uint32_t selector;
+  unsigned observations;
 } dep_allocation_t;
 
 /* Immutable ordered cleanup programs share unchanged prefix segments.
@@ -2732,17 +3094,29 @@ typedef struct {
   uint32_t root, count;
 } dep_diagnostics_t;
 
-typedef struct {
+struct dep_route_journal {
   dep_route_change_t entries[DEP_ROUTE_CHANGE_CAPACITY];
+  const char *entry_names[DEP_ROUTE_CHANGE_CAPACITY];
+  dep_index_node_t tree_index[DEP_ROUTE_CHANGE_CAPACITY];
+  uint32_t tree_root;
+  uint32_t tree_allocations;
+  uint16_t tree_free, tree_free_count;
+  bool tree_reuse;
   dep_route_link_t links[DEP_ROUTE_CHANGE_CAPACITY];
   dep_route_member_t members[DEP_ROUTE_CHANGE_CAPACITY];
   dep_route_set_t snapshots[DEP_ROUTE_SNAPSHOT_CAPACITY];
   dep_index_node_t snapshot_index[DEP_ROUTE_SNAPSHOT_CAPACITY];
   uint32_t snapshot_root;
+  uint32_t snapshot_allocations;
+  uint16_t snapshot_free, snapshot_free_count;
+  bool snapshot_reuse;
   uint32_t count;
   uint32_t link_count;
   uint32_t member_count;
   uint32_t snapshot_count;
+  /* Exact AVL interning is authoritative. This bounded front cache only
+   * avoids repeated index walks for nearby identical completed nodes. */
+  uint16_t tree_cache[DEP_ROUTE_TREE_CACHE_CAPACITY];
   /* Allocation identity is independent of the variable's current spelling.
    * Intern source operations once; paired opens and prefix versions reuse it.
    * Private slot numbers occupy the domain excluded from public io_numbers. */
@@ -2755,6 +3129,12 @@ typedef struct {
    * from source-indexed operations before final route replay. */
   uint32_t observable_fds[DEP_ROUTE_OPERATION_CAPACITY];
   uint32_t observable_fd_count;
+  dep_process_domain_pool_t process_domains;
+  dep_process_domain_pool_t *process_scratch;
+  /* Shared by construction and replay; recursive imports can retain symbols
+   * after the corresponding journal-local allocation keys retire. */
+  uint32_t *next_selector;
+  dep_read_observations_t read_observations;
   bool scratch_observable;
   bool named_closes;
   bool ifs_seen;
@@ -2772,7 +3152,52 @@ typedef struct {
   dep_diagnostics_t *diagnostics;
   uint32_t diagnostic_owner;
   bool diagnostic_cleanup;
-} dep_route_journal_t;
+};
+_Static_assert(DEP_ROUTE_SNAPSHOT_CAPACITY + 1u <= UINT16_MAX,
+               "route snapshot IDs fit packed journal nodes");
+_Static_assert(DEP_ROUTE_SNAPSHOT_CAPACITY < (1u << 11),
+               "route snapshot IDs fit packed route nodes");
+_Static_assert(DEP_ROUTE_ALLOCATION_CAPACITY + 1u < (1u << 11),
+               "failure-registration ordinals fit packed route nodes");
+_Static_assert(DEP_ROUTE_STORAGE_BYTES <= 48u * DEP_ROUTE_CHANGE_CAPACITY,
+               "canonical route storage must not grow the journal budget");
+_Static_assert(DEP_ROUTE_STORAGE_BYTES + DEP_PROCESS_DOMAIN_BYTE_BUDGET ==
+                   DEP_ROUTE_AND_DOMAIN_BYTE_BUDGET,
+               "route compaction must fund decisions without workspace growth");
+
+static SHELL_NONNULL(1, 2) dep_fd_ref_t
+    dep_route_change_fd(const dep_route_journal_t *journal,
+                        const dep_route_change_t *change) {
+  uint32_t slot = (uint32_t)(change - journal->entries);
+  const char *name = journal->entry_names[slot];
+  return name ? (dep_fd_ref_t){.name = name,
+                               .value = SHELL_DEP_FD_NAMED,
+                               .name_len = change->fd_key}
+              : dep_fd_numeric(change->fd_key);
+}
+
+static SHELL_NONNULL(1, 2) void dep_route_change_set_fd(
+    dep_route_journal_t *journal, dep_route_change_t *change, dep_fd_ref_t fd) {
+  uint32_t slot = (uint32_t)(change - journal->entries);
+  journal->entry_names[slot] = fd.name;
+  change->fd_key = fd.name ? fd.name_len : fd.value;
+}
+
+/* Descriptor-map callers supply one access bit. */
+static uint8_t dep_fd_access_key(dep_fd_access_t access) {
+  return (uint8_t)__builtin_ctz((uint32_t)access);
+}
+
+static SHELL_NONNULL(1) dep_fd_access_t
+    dep_route_change_access(const dep_route_change_t *change) {
+  return (dep_fd_access_t)(UINT32_C(1) << change->access_key);
+}
+
+static SHELL_NONNULL(1, 3) int dep_route_tree_node_compare(const void *context,
+                                                           uint32_t index,
+                                                           const void *pending);
+static SHELL_NONNULL(1) void dep_route_tree_rollback(
+    dep_route_journal_t *journal, uint32_t count);
 
 static SHELL_NONNULL(1, 3) int dep_allocation_compare(const void *context,
                                                       uint32_t index,
@@ -2974,17 +3399,57 @@ typedef struct {
 } dep_snapshot_table_t;
 
 typedef struct {
+  dep_named_effect_t effect;
+  dep_named_effect_t empty_effect;
+  dep_fd_ref_t parameter;
+  uint32_t number, payload;
+  unsigned number_value, timeout_value, payload_value, operand_kind;
+  unsigned empty_number_value, empty_timeout_value, empty_payload_value;
+  shell_builtin_variable_t variable;
+  uint32_t parameter_prefix, position;
+  bool option, valid, end, attached_static, attached_dynamic, dynamic;
+  bool parameter_unquoted, can_disappear, may_fd, capture, restored;
+  bool parameter_suffix, invalid_target, invalid_empty_target;
+  bool unsupported_option;
+  bool empty_known, empty_ifs, empty_restored;
+  uint8_t number_scalar, timeout_scalar, payload_scalar;
+  uint8_t parameter_variable;
+} dep_read_word_t;
+
+typedef struct {
+  dep_read_word_t words[SHELL_DEP_MAX_TOKENS];
+  dep_named_effect_t default_effect;
+  uint32_t count;
+  /* Only dynamic/captured argv needs per-version entry interpretation. */
+  bool active, default_restored, ifs_restored, entry_dependent;
+} dep_read_plan_t;
+
+enum {
+  DEP_READ_OPTIONS,
+  DEP_READ_DATA,
+  DEP_READ_NUMBER,
+  DEP_READ_TIMEOUT,
+  DEP_READ_FD,
+  DEP_READ_POSITIONAL,
+  DEP_READ_TARGETS,
+  DEP_READ_STOPPED_TARGETS,
+  DEP_READ_PHASES
+};
+
+typedef struct {
+  dep_route_state_t states[4][DEP_READ_PHASES][SHELL_DEP_MAX_TOKENS + 1];
+  uint64_t ready[4][DEP_READ_PHASES];
+} dep_read_frontier_t;
+
+struct dep_snapshot_source {
   dep_token_list_t tokens;
   dep_named_mutations_t mutations;
   /* Prefix commits before the first readonly rejection on the null path. */
   dep_named_mutations_t null_mutations;
   dep_prefix_assignment_set_t prefix_assignments;
   dep_exec_analysis_t exec;
-  /* Assignment-only effects are indexed by identifier. The first commit for
-   * a name invalidates its incoming allocation; RHS snapshots need only that
-   * commit's position, not a replay or a full descriptor table per value. */
-  dep_index_node_t assignment_index[SHELL_DEP_MAX_TOKENS];
-  uint32_t assignment_root;
+  dep_read_plan_t read;
+  uint32_t observation_first[3], observation_last[3];
   dep_assignment_ifs_t assignment_ifs[SHELL_DEP_MAX_TOKENS];
   uint32_t assignment_ifs_count, assignment_ifs_cursor;
   uint32_t redirect_entry_table;
@@ -3003,6 +3468,9 @@ typedef struct {
   uint32_t op_count;
   uint32_t edge_cursor;
   uint32_t process_route_cursor;
+  uint32_t process_word_cursor;
+  /* One-based position of an empty process redirect's ambiguous pathname. */
+  uint32_t empty_process_failure;
   bool deferred_document;
   bool undo_observable;
   /* Accumulated by the ordered setup walk, including cached prefixes. */
@@ -3019,7 +3487,7 @@ typedef struct {
   uint8_t assignment_dispatch;
   uint32_t readonly_stop;
   bool prepared;
-} dep_snapshot_source_t;
+};
 
 typedef struct {
   uint32_t owner;
@@ -3129,7 +3597,15 @@ struct dep_snapshot_frame {
  * reusable workspace for the duration of a parse. Isolated descriptor scopes
  * remain lazy overlays because most commands have none. */
 struct dep_route_workspace {
+  /* Read evaluation completes before publication or recursive construction;
+   * every owner reuses these two bounded, mode/phase/selector frontiers. */
+  dep_read_frontier_t read_frontiers[2];
+  /* Allocation predicates are ephemeral; retain only their completed domains
+   * in journals. Both replay streams share this nonrecursive scratch pool. */
+  dep_process_domain_pool_t process_scratch;
+  uint32_t next_selector;
   dep_import_join_t import_join;
+  dep_observation_program_t observations;
   dep_diagnostics_t diagnostics;
   /* Snapshot and final-route cleanup walks do not overlap. Both journals
    * borrow this one scratch pool; no retained flow owns a cleanup program. */
@@ -3161,6 +3637,9 @@ struct dep_route_workspace {
   uint16_t route_slot_count[SHELL_DEP_MAX_NODES];
   uint8_t route_listed[SHELL_DEP_MAX_NODES][(DEP_MAX_FD_ROUTES + 7) / 8];
   uint8_t route_standard_mask[SHELL_DEP_MAX_NODES];
+  /* Recognized read bodies publish their selected input separately. A group
+   * only needs generic input exposure for an opaque descendant body. */
+  bool generic_read[SHELL_DEP_MAX_NODES];
   dep_owner_routes_t scoped_routes[SHELL_MAX_GROUPS];
   bool scoped_routes_active[SHELL_MAX_GROUPS];
   /* Recursive expansion and final resolution use these at different times
@@ -3201,6 +3680,9 @@ struct dep_route_workspace {
   /* Effective read/write alternatives at each owner, including command-local
    * redirects. This reuses the descriptor journal so ordinary byte-flow and
    * shell-owned timing reports cannot disagree at conditional joins. */
+  /* Deferred I/O publication: ordinary commands retain resolved byte-route
+   * unions; read/group owners retain correlated execution versions. Never
+   * use this cache as a baseline for another owner's semantic evaluation. */
   dep_route_state_t owner_route_state[SHELL_DEP_MAX_NODES];
   dep_route_set_t group_shell_time_routes[SHELL_MAX_GROUPS];
   bool group_shell_time_routes_ready[SHELL_MAX_GROUPS];
@@ -3379,6 +3861,7 @@ static SHELL_NONNULL(1, 3,
  * routes is an empty destination; imports may be NULL for a root shell. */
 static SHELL_NONNULL(1) bool dep_import_routes(
     dep_owner_routes_t *routes, const dep_fd_imports_t *imports) {
+  routes->scalar_imports = imports;
   if (!imports)
     return true;
   uint32_t order[DEP_MAX_FD_IMPORTS], count = 0;
@@ -3420,6 +3903,13 @@ static SHELL_NONNULL(1, 3) int dep_fd_import_use_compare(const void *context,
     return a->owner < b->owner ? -1 : 1;
   if (a->fd != b->fd)
     return a->fd < b->fd ? -1 : 1;
+  int descriptor_order = dep_fd_ref_compare(
+      (dep_fd_ref_t){
+          .name = a->fd_name, .value = a->fd, .name_len = a->fd_name_len},
+      (dep_fd_ref_t){
+          .name = b->fd_name, .value = b->fd, .name_len = b->fd_name_len});
+  if (descriptor_order)
+    return descriptor_order;
   if (a->access != b->access)
     return a->access < b->access ? -1 : 1;
   const dep_fd_import_t *left = &streams->fd_imports.entries[a->import_index];
@@ -3438,10 +3928,14 @@ static SHELL_NONNULL(1, 3) int dep_fd_import_use_compare(const void *context,
  * deduplication. Keys use resource provenance rather than an import slot:
  * distinct aliases can refer to the same route. */
 static SHELL_NONNULL(1) bool dep_record_fd_import_use(
-    dep_subgraph_streams_t *streams, uint32_t owner, uint32_t fd,
+    dep_subgraph_streams_t *streams, uint32_t owner, dep_fd_ref_t fd,
     dep_fd_access_t access, uint32_t import_index) {
-  dep_fd_import_use_t key = {
-      .owner = owner, .fd = fd, .access = access, .import_index = import_index};
+  dep_fd_import_use_t key = {.owner = owner,
+                             .fd = fd.value,
+                             .access = access,
+                             .import_index = import_index,
+                             .fd_name = fd.name,
+                             .fd_name_len = fd.name_len};
   uint32_t candidate = streams->fd_import_use_count + 1, match = 0;
   streams->fd_import_use_root = dep_index_insert(
       streams->fd_import_use_index, streams->fd_import_use_root, candidate,
@@ -3472,6 +3966,59 @@ static int dep_fd_ref_compare(dep_fd_ref_t a, dep_fd_ref_t b) {
   }
 }
 
+static SHELL_NONNULL(1, 3) int dep_read_observation_compare(const void *context,
+                                                            uint32_t index,
+                                                            const void *key) {
+  DEP_METADATA_WORK(SHELLSPLIT_TEST_WORK_ROUTE_LOOKUP);
+  const dep_read_observations_t *observations = context;
+  return dep_fd_ref_compare(observations->entries[index].fd,
+                            *(const dep_fd_ref_t *)key);
+}
+
+static SHELL_NONNULL(1) bool dep_read_observe(
+    dep_read_observations_t *observations, dep_fd_ref_t fd, unsigned role) {
+  uint32_t candidate = observations->count + 1, match = 0;
+  observations->root =
+      dep_index_insert(observations->index, observations->root, candidate,
+                       DEP_READ_OBSERVATION_CAPACITY,
+                       dep_read_observation_compare, observations, &fd, &match);
+  if (!match)
+    return false;
+  if (match == candidate)
+    observations->entries[observations->count++] = (dep_read_observation_t){
+        .fd = fd,
+        .role = role,
+        .variable = fd.value == SHELL_DEP_FD_NAMED
+                        ? shell_builtin_name_index(fd.name, fd.name_len)
+                        : 0};
+  else
+    observations->entries[match - 1].role |= role;
+  observations->active |= role != 0;
+  observations->identity |=
+      fd.value == SHELL_DEP_FD_NAMED && (role & DEP_READ_OBSERVE_IDENTITY);
+  return true;
+}
+
+static SHELL_NONNULL(1) const dep_read_observation_t *dep_read_observation_find(
+    const dep_read_observations_t *observations, dep_fd_ref_t fd) {
+  uint32_t cursor = observations->root;
+  while (cursor) {
+    int order = dep_read_observation_compare(observations, cursor - 1, &fd);
+    if (!order)
+      return &observations->entries[cursor - 1];
+    cursor = order > 0 ? observations->index[cursor - 1].left
+                       : observations->index[cursor - 1].right;
+  }
+  return NULL;
+}
+
+static SHELL_NONNULL(1) unsigned dep_read_observation(
+    const dep_read_observations_t *observations, dep_fd_ref_t fd) {
+  const dep_read_observation_t *use =
+      dep_read_observation_find(observations, fd);
+  return use ? use->role : 0;
+}
+
 static SHELL_NONNULL(1, 3) int dep_import_compare(const void *context,
                                                   uint32_t index,
                                                   const void *key) {
@@ -3489,6 +4036,12 @@ static SHELL_NONNULL(1, 3) int dep_import_compare(const void *context,
     return a->route.kind < b->route.kind ? -1 : 1;
   if (a->scratch != b->scratch)
     return a->scratch ? 1 : -1;
+  if (a->process_owned != b->process_owned)
+    return a->process_owned ? 1 : -1;
+  if (a->selector != b->selector)
+    return a->selector < b->selector ? -1 : 1;
+  if (a->allocation != b->allocation)
+    return (uintptr_t)a->allocation < (uintptr_t)b->allocation ? -1 : 1;
   return a->route.value < b->route.value ? -1
                                          : a->route.value != b->route.value;
 }
@@ -3534,6 +4087,7 @@ static SHELL_NONNULL(1, 3,
  */
 static SHELL_NONNULL(1) bool dep_fd_import_install_capture(
     dep_fd_imports_t *imports, uint32_t fd, dep_fd_access_t access) {
+  imports->process_capture_mask |= (uint8_t)(1u << fd);
   dep_fd_ref_t ref = dep_fd_numeric(fd);
   uint8_t present = 0;
   for (uint32_t i = 0; i < imports->count; i++)
@@ -3559,6 +4113,8 @@ static SHELL_NONNULL(1) bool dep_fd_import_install_capture(
           slot->access == direction) {
         slot->route = route;
         slot->origin = NULL;
+        slot->selector = 0;
+        slot->allocation = NULL;
       }
     }
     if ((present & direction) == 0)
@@ -3607,9 +4163,7 @@ static SHELL_NONNULL(1, 2) int dep_stream_order(const dep_stream_use_t *a,
     return a->access < b->access ? -1 : 1;
   if (a->owner != b->owner)
     return a->owner < b->owner ? -1 : 1;
-  if (a->fd != b->fd)
-    return a->fd < b->fd ? -1 : 1;
-  return 0;
+  return dep_fd_ref_compare(dep_stream_fd(a), dep_stream_fd(b));
 }
 
 static SHELL_NONNULL(1, 3) int dep_stream_compare(const void *context,
@@ -3630,9 +4184,10 @@ static SHELL_NONNULL(1, 3) int dep_external_stream_compare(const void *context,
 
 static SHELL_NONNULL(1, 2, 3, 4) bool dep_record_stream_use(
     dep_stream_use_t *uses, uint32_t *count, dep_index_node_t *index,
-    uint32_t *root, uint32_t owner, uint32_t fd, dep_fd_access_t access,
+    uint32_t *root, uint32_t owner, dep_fd_ref_t fd, dep_fd_access_t access,
     uint32_t anchor) {
-  dep_stream_use_t key = {owner, fd, anchor, access, false};
+  dep_stream_use_t key = {owner, fd.value, anchor,     access,
+                          false, fd.name,  fd.name_len};
   uint32_t candidate = *count + 1, match = 0;
   *root = dep_index_insert(index, *root, candidate, SHELL_DEP_MAX_EDGES,
                            dep_stream_compare, uses, &key, &match);
@@ -3644,9 +4199,10 @@ static SHELL_NONNULL(1, 2, 3, 4) bool dep_record_stream_use(
 }
 
 static SHELL_NONNULL(1) bool dep_record_actual_capture(
-    dep_subgraph_streams_t *streams, uint32_t owner, uint32_t fd,
+    dep_subgraph_streams_t *streams, uint32_t owner, dep_fd_ref_t fd,
     dep_fd_access_t access, uint32_t anchor) {
-  dep_stream_use_t key = {owner, fd, anchor, access, true};
+  dep_stream_use_t key = {owner, fd.value, anchor,     access,
+                          true,  fd.name,  fd.name_len};
   uint32_t candidate = streams->capture_use_count + 1, match = 0;
   streams->capture_root =
       dep_index_insert(streams->capture_index, streams->capture_root, candidate,
@@ -3662,9 +4218,10 @@ static SHELL_NONNULL(1) bool dep_record_actual_capture(
 }
 
 static SHELL_NONNULL(1) bool dep_record_external_use(
-    dep_subgraph_streams_t *streams, uint32_t owner, uint32_t fd,
+    dep_subgraph_streams_t *streams, uint32_t owner, dep_fd_ref_t fd,
     dep_fd_access_t access, uint32_t inherited) {
-  dep_stream_use_t key = {owner, fd, inherited, access, false};
+  dep_stream_use_t key = {owner, fd.value, inherited,  access,
+                          false, fd.name,  fd.name_len};
   uint32_t candidate = streams->external_use_count + 1, match = 0;
   streams->external_root = dep_index_insert(
       streams->external_index, streams->external_root, candidate,
@@ -3700,7 +4257,7 @@ static SHELL_NONNULL(1, 6, 7, 8, 9) bool dep_collect_pipe_uses(
   return dep_collect_pipe_uses(streams, node->left, anchor, access, pipe, uses,
                                count, index, output_root) &&
          dep_record_stream_use(uses, count, index, output_root, item->owner,
-                               item->fd, access, pipe) &&
+                               dep_stream_fd(item), access, pipe) &&
          dep_collect_pipe_uses(streams, node->right, anchor, access, pipe, uses,
                                count, index, output_root);
 }
@@ -3955,6 +4512,9 @@ dep_add_prepared_dup_operations(const char *cmd, dep_token_list_t tokens,
         false,
         false,
         false,
+        NULL,
+        0,
+        0,
     };
   }
   return true;
@@ -3988,31 +4548,39 @@ static SHELL_NONNULL(2, 5, 6) bool dep_add_prepared_process_operations(
   for (; route != 0; route = process_routes->entries[route - 1].next) {
     DEP_METADATA_WORK(SHELLSPLIT_TEST_WORK_PROCESS_ROUTES);
     const dep_process_route_t *binding = &process_routes->entries[route - 1];
-    if (*op_count == op_capacity)
-      return false;
+    if (cursor)
+      *cursor = route;
     /* Named routes remain visible setup; only numeric routes are replaced
      * by effective byte-flow materialization. */
     if (dynamic_edges)
-      dynamic_edges[binding->edge] = binding->fd.value != SHELL_DEP_FD_NAMED;
-    ops[(*op_count)++] = (dep_fd_op_t){binding->position,
-                                       DEP_FD_OP_DYNAMIC,
-                                       binding->fd.value,
-                                       SHELL_DEP_FD_NONE,
-                                       binding->fd.name,
-                                       binding->fd.name_len,
-                                       NULL,
-                                       0,
-                                       binding->edge,
-                                       binding->access,
-                                       false,
-                                       false,
-                                       false,
-                                       NULL,
-                                       false,
-                                       false,
-                                       false};
-    if (cursor)
-      *cursor = route;
+      dynamic_edges[binding->edge] |=
+          binding->temporary ? binding->standalone && !binding->byte_use
+                             : binding->fd.value != SHELL_DEP_FD_NAMED;
+    if (binding->temporary && !process_routes->track[owner])
+      continue;
+    if (*op_count == op_capacity)
+      return false;
+    ops[(*op_count)++] = (dep_fd_op_t){
+        binding->position,
+        binding->temporary ? DEP_FD_OP_PROCESS : DEP_FD_OP_DYNAMIC,
+        binding->fd.value,
+        SHELL_DEP_FD_NONE,
+        binding->temporary ? binding->source : binding->fd.name,
+        binding->fd.name_len,
+        NULL,
+        0,
+        binding->edge,
+        binding->access,
+        false,
+        false,
+        false,
+        NULL,
+        false,
+        false,
+        false,
+        binding->guard,
+        process_routes->observed_low[owner],
+        0};
   }
   return true;
 }
@@ -4025,9 +4593,15 @@ static SHELL_NONNULL(1, 3) int dep_fd_operation_compare(const void *context,
   const dep_fd_op_t *key = pending;
   if (ops[index].pos != key->pos)
     return ops[index].pos < key->pos ? -1 : 1;
-  return dep_fd_ref_compare(
-      (dep_fd_ref_t){ops[index].fd, ops[index].fd_name, ops[index].fd_name_len},
-      (dep_fd_ref_t){key->fd, key->fd_name, key->fd_name_len});
+  if ((ops[index].kind == DEP_FD_OP_PROCESS) !=
+      (key->kind == DEP_FD_OP_PROCESS))
+    return ops[index].kind == DEP_FD_OP_PROCESS ? -1 : 1;
+  return dep_fd_ref_compare((dep_fd_ref_t){.name = ops[index].fd_name,
+                                           .value = ops[index].fd,
+                                           .name_len = ops[index].fd_name_len},
+                            (dep_fd_ref_t){.name = key->fd_name,
+                                           .value = key->fd,
+                                           .name_len = key->fd_name_len});
 }
 
 /* Stable merge ordering preserves paired opens. Scratch addresses count
@@ -4070,6 +4644,10 @@ static SHELL_NONNULL(1) void dep_prepare_fd_operation_resets(
       first_high_open = ops[i].pos;
   for (uint32_t i = 0; i < count; i++) {
     DEP_METADATA_WORK(SHELLSPLIT_TEST_WORK_FD_OPERATIONS);
+    ops[i].variable =
+        ops[i].fd == SHELL_DEP_FD_NAMED
+            ? shell_builtin_name_index(ops[i].fd_name, ops[i].fd_name_len)
+            : 0;
     ops[i].undo_observable =
         undo_observable ||
         (first_high_open != UINT32_MAX &&
@@ -4080,16 +4658,19 @@ static SHELL_NONNULL(1) void dep_prepare_fd_operation_resets(
                             ops, &ops[i], &match);
     ops[i].resets_descriptor =
         match == i + 1 && ops[i].kind != DEP_FD_OP_CLOSE &&
+        ops[i].kind != DEP_FD_OP_PROCESS &&
         (ops[i].fd == SHELL_DEP_FD_NAMED || !dep_fd_op_copies(ops[i].kind));
     ops[i].paired_open =
         i != 0 && ops[i].pos == ops[i - 1].pos &&
         ops[i].kind == ops[i - 1].kind &&
         (ops[i].kind == DEP_FD_OP_DOCUMENT ||
          ops[i].kind == DEP_FD_OP_DYNAMIC) &&
-        dep_fd_ref_equal(
-            (dep_fd_ref_t){ops[i].fd, ops[i].fd_name, ops[i].fd_name_len},
-            (dep_fd_ref_t){ops[i - 1].fd, ops[i - 1].fd_name,
-                           ops[i - 1].fd_name_len});
+        dep_fd_ref_equal((dep_fd_ref_t){.name = ops[i].fd_name,
+                                        .value = ops[i].fd,
+                                        .name_len = ops[i].fd_name_len},
+                         (dep_fd_ref_t){.name = ops[i - 1].fd_name,
+                                        .value = ops[i - 1].fd,
+                                        .name_len = ops[i - 1].fd_name_len});
   }
 }
 
@@ -4106,9 +4687,12 @@ static SHELL_NONNULL(1, 3) int dep_closed_fd_compare(const void *context,
   const dep_fd_op_t *op = &ops[index];
   return dep_fd_ref_compare(
       op->kind == DEP_FD_OP_MOVE
-          ? (dep_fd_ref_t){op->target_fd, op->target_fd_name,
-                           op->target_fd_name_len}
-          : (dep_fd_ref_t){op->fd, op->fd_name, op->fd_name_len},
+          ? (dep_fd_ref_t){.name = op->target_fd_name,
+                           .value = op->target_fd,
+                           .name_len = op->target_fd_name_len}
+          : (dep_fd_ref_t){.name = op->fd_name,
+                           .value = op->fd,
+                           .name_len = op->fd_name_len},
       *(const dep_fd_ref_t *)key);
 }
 
@@ -4122,8 +4706,9 @@ static SHELL_NONNULL(1) void dep_prepare_fd_close_history(dep_fd_op_t *ops,
     DEP_METADATA_WORK(SHELLSPLIT_TEST_WORK_FD_OPERATIONS);
     dep_fd_op_t *op = &ops[i];
     if (dep_fd_op_copies(op->kind)) {
-      dep_fd_ref_t fd = {op->target_fd, op->target_fd_name,
-                         op->target_fd_name_len};
+      dep_fd_ref_t fd = {.name = op->target_fd_name,
+                         .value = op->target_fd,
+                         .name_len = op->target_fd_name_len};
       uint32_t cursor = root;
       while (cursor) {
         int order = dep_closed_fd_compare(ops, cursor - 1, &fd);
@@ -4136,12 +4721,14 @@ static SHELL_NONNULL(1) void dep_prepare_fd_close_history(dep_fd_op_t *ops,
     }
     if (op->kind == DEP_FD_OP_CLOSE ||
         (op->kind == DEP_FD_OP_MOVE && !dep_fd_op_numeric_self_dup(op))) {
-      dep_fd_ref_t fd =
-          op->kind == DEP_FD_OP_MOVE
-              ? (dep_fd_ref_t){op->target_fd, op->target_fd_name,
-                               op->target_fd_name_len}
-              : (dep_fd_ref_t){op->fd, op->fd_name, op->fd_name_len};
-      uint32_t match;
+      dep_fd_ref_t fd = op->kind == DEP_FD_OP_MOVE
+                            ? (dep_fd_ref_t){.name = op->target_fd_name,
+                                             .value = op->target_fd,
+                                             .name_len = op->target_fd_name_len}
+                            : (dep_fd_ref_t){.name = op->fd_name,
+                                             .value = op->fd,
+                                             .name_len = op->fd_name_len};
+      uint32_t match = 0;
       root = dep_index_insert(closed, root, i + 1, count, dep_closed_fd_compare,
                               ops, &fd, &match);
     }
@@ -4186,7 +4773,12 @@ static SHELL_NONNULL(2) bool dep_exec_option_byte(unsigned char byte,
   return true;
 }
 
-static SHELL_NONNULL(1) void dep_exec_option_dynamic(void *context) {
+static SHELL_NONNULL(4) void dep_exec_option_dynamic(const char *word,
+                                                     size_t length, bool quoted,
+                                                     void *context) {
+  (void)word;
+  (void)length;
+  (void)quoted;
   dep_exec_option_t *option = context;
   option->dynamic = true;
   if (option->tail_is_argv0)
@@ -4227,6 +4819,7 @@ static SHELL_NONNULL(1,
                                              const dep_owner_routes_t *source) {
   destination->fd_count = source->fd_count;
   destination->root = source->root;
+  destination->scalar_imports = source->scalar_imports;
   memcpy(destination->fd, source->fd,
          source->fd_count * sizeof(destination->fd[0]));
   memcpy(destination->index, source->index,
@@ -4335,7 +4928,9 @@ static SHELL_NONNULL(1, 2) bool dep_merge_persistent_named_routes(
     const dep_fd_op_t *item = &ops[op];
     if (!dep_fd_op_persists(item, false, true))
       continue;
-    dep_fd_ref_t fd = {SHELL_DEP_FD_NAMED, item->fd_name, item->fd_name_len};
+    dep_fd_ref_t fd = {.name = item->fd_name,
+                       .value = SHELL_DEP_FD_NAMED,
+                       .name_len = item->fd_name_len};
     const dep_fd_route_entry_t *source = dep_route_find(state, fd);
     if (!source)
       continue;
@@ -4382,13 +4977,9 @@ static SHELL_NONNULL(1) dep_exec_analysis_t
   uint8_t outcomes = 0;
   bool have_target = false, unknown_target = false;
   for (uint32_t i = command + 1; i < tokens->count; i++) {
-    const dep_token_t *word = &tokens->tokens[i];
-    if (classify_redirect(word) != DEP_REDIRECT_NONE) {
-      if (shell_source_redirection_consumes_word(word->start, word->len) &&
-          i + 1 < tokens->count)
-        i++;
+    if (dep_skip_nonargument(tokens, &i))
       continue;
-    }
+    const dep_token_t *word = &tokens->tokens[i];
     dep_exec_option_t option = {0};
     bool single = shell_builtin_visit_single_word(
         word->start, word->len, dep_exec_option_byte, dep_exec_option_dynamic,
@@ -4527,6 +5118,53 @@ static SHELL_NONNULL(2) bool dep_named_assignment_target_byte(
   return dep_named_route_target_byte(byte, 0, context);
 }
 
+typedef struct {
+  shell_builtin_variable_scan_t variable;
+  unsigned skip;
+} dep_variable_scan_t;
+
+static SHELL_NONNULL(2) bool dep_variable_assignment_byte(unsigned char byte,
+                                                          void *context) {
+  dep_variable_scan_t *scan = context;
+  return shell_builtin_variable_byte(byte, &scan->variable);
+}
+
+static SHELL_NONNULL(3) bool dep_variable_word_byte(unsigned char byte,
+                                                    size_t position,
+                                                    void *context) {
+  (void)position;
+  dep_variable_scan_t *scan = context;
+  if (scan->skip) {
+    scan->skip--;
+    return true;
+  }
+  return shell_builtin_variable_byte(byte, &scan->variable);
+}
+
+/* Prepared effects retain the registry identity needed by path-sensitive
+ * validation. Decode the already-isolated target once, while preparing the
+ * command, rather than rescanning source words during every route replay. */
+static SHELL_NONNULL(1) uint8_t
+    dep_named_effect_variable(const dep_named_effect_t *effect) {
+  dep_variable_scan_t scan = {
+      .variable = {.valid = true, .names = SHELL_BUILTIN_VARIABLE_MASK},
+      .skip = effect->kind == DEP_NAMED_EFFECT_PRINTF_ATTACHED ? 2 : 0};
+  if (effect->kind == DEP_NAMED_EFFECT_STATIC_ASSIGNMENT) {
+    shell_source_decoded_assignment_t assignment;
+    if (!shell_source_scan_decoded_assignment(
+            effect->token.start, effect->token.len,
+            dep_variable_assignment_byte, &scan, &assignment))
+      return 0;
+  } else {
+    size_t decoded;
+    if (shell_visit_decoded_word(effect->token.start, effect->token.len,
+                                 dep_variable_word_byte, &scan,
+                                 &decoded) != SHELL_PROCESS_OK)
+      return 0;
+  }
+  return shell_builtin_variable_index(&scan.variable);
+}
+
 /* Mutation collection has already proved a static identifier target. Decode
  * only for indexed comparison, not for repeated validation or materialization.
  * assignment selects just the name preceding = or +=; skip removes printf's
@@ -4578,7 +5216,7 @@ static SHELL_NONNULL(1, 2) const dep_fd_route_entry_t *dep_find_named_target(
 static SHELL_NONNULL(1, 3) int dep_prefix_assignment_compare_word(
     const dep_prefix_assignment_set_t *assignments, uint32_t index,
     const dep_token_t *word, bool assignment) {
-  const dep_token_t *expected = &assignments->names[index];
+  const dep_variable_token_t *expected = &assignments->names[index];
   DEP_METADATA_WORK(SHELLSPLIT_TEST_WORK_PREFIX_LOOKUP);
   DEP_METADATA_WORK(SHELLSPLIT_TEST_WORK_ROUTE_LOOKUP);
   dep_named_route_target_t target = {.name = expected->start,
@@ -4608,14 +5246,20 @@ static SHELL_NONNULL(1,
 }
 
 static SHELL_NONNULL(1, 2) void dep_prefix_assignment_insert(
-    dep_prefix_assignment_set_t *assignments, const dep_token_t *name) {
+    dep_prefix_assignment_set_t *assignments, const dep_token_t *name,
+    bool append) {
   uint32_t candidate = assignments->count + 1;
   uint32_t match = 0;
   assignments->root = dep_index_insert(
       assignments->index, assignments->root, candidate, SHELL_DEP_MAX_TOKENS,
       dep_prefix_assignment_compare, assignments, name, &match);
-  if (match == candidate)
-    assignments->names[assignments->count++] = *name;
+  if (match == candidate) {
+    dep_variable_token_t *inserted = &assignments->names[assignments->count++];
+    inserted->start = name->start;
+    inserted->len = name->len;
+    inserted->variable = shell_builtin_name_index(name->start, name->len);
+    inserted->append = append;
+  }
 }
 
 static SHELL_NONNULL(1, 2) bool dep_prefix_assignment_contains_kind(
@@ -4659,6 +5303,96 @@ static SHELL_NONNULL(1, 2) const dep_fd_route_entry_t *dep_named_effect_target(
       effect->kind == DEP_NAMED_EFFECT_PRINTF_ATTACHED ? 2 : 0);
 }
 
+/* Resolve only explicit mutation targets, once during owner preparation.
+ * The indexed inventory lends its already-isolated identifier; later journal
+ * versions need neither decoded strings nor another source lookup. */
+static SHELL_NONNULL(1, 2) void dep_prepare_observed_effect(
+    dep_named_effect_t *effect, const dep_read_observations_t *observations) {
+  effect->variable = dep_named_effect_variable(effect);
+  uint32_t root = observations->root;
+  while (root) {
+    DEP_METADATA_WORK(SHELLSPLIT_TEST_WORK_ROUTE_LOOKUP);
+    dep_fd_ref_t ref = observations->entries[root - 1].fd;
+    int order = -1;
+    if (ref.value == SHELL_DEP_FD_NAMED) {
+      dep_named_route_target_t target = {
+          .name = ref.name,
+          .name_len = ref.name_len,
+          .skip = effect->kind == DEP_NAMED_EFFECT_PRINTF_ATTACHED ? 2 : 0};
+      if (effect->kind == DEP_NAMED_EFFECT_STATIC_ASSIGNMENT) {
+        shell_source_decoded_assignment_t ignored;
+        (void)shell_source_scan_decoded_assignment(
+            effect->token.start, effect->token.len,
+            dep_named_assignment_target_byte, &target, &ignored);
+      } else {
+        size_t ignored;
+        (void)shell_visit_decoded_word(effect->token.start, effect->token.len,
+                                       dep_named_route_target_byte, &target,
+                                       &ignored);
+      }
+      order = target.order;
+      unsigned char trailing;
+      if (!order && dep_fd_name_next_byte(ref.name, ref.name_len,
+                                          &target.name_position, &trailing))
+        order = 1;
+    }
+    if (!order) {
+      effect->observation = root;
+      break;
+    }
+    root = order > 0 ? observations->index[root - 1].left
+                     : observations->index[root - 1].right;
+  }
+}
+
+static void dep_read_projection_parameter(const char *word, size_t length,
+                                          bool quoted, void *context) {
+  (void)word;
+  (void)length;
+  (void)quoted;
+  (void)context;
+}
+
+static SHELL_NONNULL(2) bool dep_read_projection_byte(unsigned char byte,
+                                                      void *context) {
+  dep_named_route_target_t *target = context;
+  /* The fragment visitor deliberately consumes the complete word, even after
+   * a literal callback returns false. Preserve the first differing byte. */
+  return target->order || dep_named_assignment_target_byte(byte, context);
+}
+
+/* Resolve a literal projection against borrowed identifier keys once, during
+ * word preparation. A missing key is an ordinary unobserved target, not a
+ * reason to clear the whole binding map. The sole scalar fragment has already
+ * been classified; this indexed comparison does not evaluate it. */
+static SHELL_NONNULL(1, 2) uint32_t
+    dep_read_projection_key(const dep_token_t *word,
+                            const dep_read_observations_t *observations) {
+  uint32_t root = observations->root;
+  while (root) {
+    DEP_METADATA_WORK(SHELLSPLIT_TEST_WORK_ROUTE_LOOKUP);
+    dep_fd_ref_t ref = observations->entries[root - 1].fd;
+    int order = -1;
+    if (ref.value == SHELL_DEP_FD_NAMED) {
+      dep_named_route_target_t target = {.name = ref.name,
+                                         .name_len = ref.name_len};
+      (void)shell_builtin_visit_word_impl(
+          word->start, word->len, dep_read_projection_byte,
+          dep_read_projection_parameter, &target, true, NULL);
+      order = target.order;
+      unsigned char trailing;
+      if (!order && dep_fd_name_next_byte(ref.name, ref.name_len,
+                                          &target.name_position, &trailing))
+        order = 1;
+    }
+    if (!order)
+      return root;
+    root = order > 0 ? observations->index[root - 1].left
+                     : observations->index[root - 1].right;
+  }
+  return 0;
+}
+
 static SHELL_NONNULL(1) bool dep_named_mutation_affects(
     const dep_named_mutations_t *mutations, dep_fd_ref_t fd) {
   return fd.value == SHELL_DEP_FD_NAMED &&
@@ -4698,6 +5432,10 @@ static SHELL_NONNULL(1, 3, 4) const dep_token_t *dep_effective_static_builtin(
   if (current_redirects)
     *current_redirects = false;
 
+  while (command < tokens->count && dep_skip_nonargument(tokens, &command))
+    command++;
+  if (command == tokens->count)
+    return NULL;
   const dep_token_t *candidate = &tokens->tokens[command];
   shell_source_wrapper_state_t wrapper = {0};
   shell_source_wrapper_step_t step =
@@ -4719,6 +5457,8 @@ static SHELL_NONNULL(1, 3, 4) const dep_token_t *dep_effective_static_builtin(
 
   for (uint32_t i = command + 1; i < tokens->count; i++) {
     const dep_token_t *word = &tokens->tokens[i];
+    if (shell_source_word_is_elided(word->start, word->len))
+      continue;
     dep_redirect_t redirect = classify_redirect(word);
     if (redirect != DEP_REDIRECT_NONE) {
       if (shell_source_redirection_consumes_word(word->start, word->len) &&
@@ -4834,7 +5574,8 @@ static SHELL_NONNULL(1) bool dep_effect_is_ifs(const char *text,
 
 static SHELL_NONNULL(1, 2) bool dep_ifs_note_assignment(
     dep_named_mutations_t *mutations, const dep_token_t *word) {
-  dep_named_effect_t effect = {*word, DEP_NAMED_EFFECT_STATIC_ASSIGNMENT};
+  dep_named_effect_t effect = {.token = *word,
+                               .kind = DEP_NAMED_EFFECT_STATIC_ASSIGNMENT};
   if (!dep_effect_is_ifs(effect.token.start, effect.token.len, effect.kind))
     return false;
   shell_source_decoded_assignment_t assignment;
@@ -4851,6 +5592,154 @@ static SHELL_NONNULL(1, 2) bool dep_ifs_note_assignment(
   return true;
 }
 
+/* Compile complete builtin words once. The shared read recognizer supplies
+ * option roles; execution versions retain numeric values and borrowed names,
+ * never a second decoded argv. */
+static SHELL_NONNULL(1, 2, 3, 4) void dep_read_prepare(
+    dep_read_plan_t *plan, const dep_token_list_t *tokens,
+    const dep_prefix_assignment_set_t *prefixes,
+    const dep_read_observations_t *observations) {
+  *plan = (dep_read_plan_t){0};
+  uint32_t stop, rejected;
+  uint8_t presence;
+  bool isolated;
+  uint32_t command =
+      dep_first_command_index(tokens, &stop, &isolated, &rejected, &presence);
+  if (command == UINT32_MAX)
+    return;
+  bool dynamic = false;
+  uint32_t effective = command;
+  const dep_token_t *builtin = dep_effective_static_builtin(
+      tokens, command, &effective, &dynamic, NULL, NULL, NULL);
+  if (!builtin || dynamic ||
+      shell_source_static_builtin_kind(builtin->start, builtin->len) !=
+          SHELL_SOURCE_BUILTIN_READ)
+    return;
+  plan->active = true;
+  plan->default_effect = (dep_named_effect_t){.token = {"REPLY", 5},
+                                              .kind = DEP_NAMED_EFFECT_TOKEN};
+  dep_prepare_observed_effect(&plan->default_effect, observations);
+  shell_builtin_read_t roles = {.writing = SHELL_READ_OPTIONS};
+  bool dynamic_target = false;
+  for (uint32_t i = effective + 1; i < tokens->count; i++) {
+    if (dep_skip_nonargument(tokens, &i))
+      continue;
+    const dep_token_t *token = &tokens->tokens[i];
+    shell_builtin_read_option_t scan = {.valid = true,
+                                        .timeout = {.timeout = true}};
+    bool projected = shell_builtin_visit_word_impl(
+        token->start, token->len, shell_builtin_read_option_byte,
+        shell_builtin_read_dynamic, &scan, true, shell_builtin_read_process);
+    bool single_argument = projected && !scan.parameter_unquoted;
+    bool invalid_target =
+        single_argument && !(scan.target_shapes & SHELL_READ_TARGET_ACCEPT);
+    unsigned phases = roles.writing | roles.polling;
+    dep_read_word_t *word = &plan->words[plan->count++];
+    *word = (dep_read_word_t){
+        .effect = {.token = *token, .kind = DEP_NAMED_EFFECT_TOKEN},
+        .number = (uint32_t)scan.number.whole,
+        .payload = (uint32_t)scan.payload.whole,
+        .number_value = shell_builtin_read_number_value(
+            &scan.number, scan.unresolved || scan.attached_dynamic,
+            single_argument),
+        .timeout_value = shell_builtin_read_number_value(
+            &scan.timeout, scan.unresolved || scan.attached_dynamic,
+            single_argument),
+        .payload_value = shell_builtin_read_number_value(
+            &scan.payload, scan.attached_dynamic, single_argument),
+        .empty_number_value =
+            shell_builtin_read_number_value(&scan.number, false, true),
+        .empty_timeout_value =
+            shell_builtin_read_number_value(&scan.timeout, false, true),
+        .empty_payload_value =
+            shell_builtin_read_number_value(&scan.payload, false, true),
+        .operand_kind = scan.operand_kind,
+        .variable = invalid_target
+                        ? SHELL_BUILTIN_VARIABLE_INVALID
+                        : shell_builtin_variable(token->start, token->len),
+        .position = (uint32_t)scan.position,
+        .parameter_prefix = (uint32_t)scan.parameter_prefix,
+        .parameter_suffix = scan.literal_count != scan.parameter_prefix,
+        .invalid_target = invalid_target,
+        .invalid_empty_target = projected && scan.target_invalid,
+        .unsupported_option = scan.array || scan.readline,
+        .number_scalar = scan.number_scalar,
+        .timeout_scalar = scan.timeout_scalar,
+        .payload_scalar = scan.payload_scalar,
+        .parameter_unquoted = scan.parameter_unquoted,
+        .can_disappear =
+            scan.parameter_unquoted && !scan.literal_count &&
+            !shell_builtin_word_guarantees_argument(token->start, token->len),
+        .option = scan.option,
+        .valid = scan.valid,
+        .end = scan.end,
+        .attached_static = scan.attached_static,
+        .attached_dynamic = scan.attached_dynamic,
+        .dynamic = scan.unresolved || scan.attached_dynamic,
+        .capture = (phases & (SHELL_READ_OPTIONS | SHELL_READ_NUMBER |
+                              SHELL_READ_TIMEOUT | SHELL_READ_FD)) != 0 ||
+                   (roles.writing &
+                    (SHELL_READ_POSITIONAL | SHELL_READ_TARGETS)) != 0};
+    word->may_fd =
+        ((phases & SHELL_READ_FD) &&
+         word->number_value != SHELL_READ_VALUE_INVALID) ||
+        ((phases & SHELL_READ_OPTIONS) && scan.operand_kind == SHELL_READ_FD &&
+         word->payload_value != SHELL_READ_VALUE_INVALID);
+    if (word->variable == SHELL_BUILTIN_VARIABLE_STATIC)
+      dep_prepare_observed_effect(&word->effect, observations);
+    if (projected && scan.parameter && !scan.multiple_parameters &&
+        (!word->may_fd || !word->parameter_suffix || scan.number_scalar ||
+         scan.payload_scalar)) {
+      size_t begin, end;
+      if (shell_source_parse_named_fd_parameter(
+              scan.parameter, 0, scan.parameter_length, &begin, &end)) {
+        word->parameter = (dep_fd_ref_t){.name = scan.parameter + begin,
+                                         .value = SHELL_DEP_FD_NAMED,
+                                         .name_len = (uint32_t)(end - begin)};
+        word->parameter_variable = shell_builtin_name_index(
+            word->parameter.name, word->parameter.name_len);
+        word->empty_known = true;
+        word->empty_ifs = scan.literal_count == 3 && scan.literal_ifs;
+        word->empty_effect.kind = DEP_NAMED_EFFECT_TOKEN;
+        word->empty_effect.variable =
+            shell_builtin_variable_index(&scan.literal_target);
+        if (scan.literal_count && !scan.target_invalid) {
+          uint32_t key = dep_read_projection_key(token, observations);
+          word->empty_effect.observation = key;
+          if (key) {
+            dep_fd_ref_t name = observations->entries[key - 1].fd;
+            word->empty_effect.token = (dep_token_t){name.name, name.name_len};
+          } else if (word->empty_effect.variable) {
+            uint8_t variable = word->empty_effect.variable;
+            word->empty_effect.token = (dep_token_t){
+                shell_builtin_variable_index_name(variable),
+                (uint32_t)shell_builtin_variable_index_length(variable)};
+          } else if (word->empty_ifs) {
+            word->empty_effect.token = (dep_token_t){"IFS", 3};
+          }
+          if (word->empty_effect.token.len)
+            word->empty_restored = dep_prefix_assignment_contains(
+                prefixes, &word->empty_effect.token);
+        }
+      }
+    }
+    plan->entry_dependent |= word->dynamic ||
+                             word->parameter.value == SHELL_DEP_FD_NAMED ||
+                             word->effect.variable != 0;
+    unsigned role = shell_builtin_read_word(&roles, token->start, token->len);
+    if ((role & SHELL_BUILTIN_ROLE_WRITE) &&
+        !(role & SHELL_BUILTIN_ROLE_DYNAMIC))
+      word->restored = dep_prefix_assignment_contains(prefixes, token);
+    dynamic_target |= (role & SHELL_BUILTIN_ROLE_DYNAMIC) != 0;
+  }
+  if (dynamic_target)
+    plan->ifs_restored =
+        dep_prefix_assignment_contains(prefixes, &(dep_token_t){"IFS", 3});
+  if (shell_builtin_read_default_write(&roles))
+    plan->default_restored =
+        dep_prefix_assignment_contains(prefixes, &(dep_token_t){"REPLY", 5});
+}
+
 /* Prepared tokens are source-ordered, preclassified command words (at most
  * SHELL_DEP_MAX_TOKENS). The required checkpoint destination has that many
  * entries; its borrowed commit boundaries share the tokens' source lifetime. */
@@ -4859,7 +5748,7 @@ static SHELL_NONNULL(1, 2, 3, 4, 5, 6) void dep_prepare_named_mutations(
     dep_prefix_assignment_set_t *prefix_assignments,
     dep_assignment_ifs_t *assignment_ifs, uint32_t *assignment_ifs_count,
     dep_named_mutations_t *null_mutations, uint32_t readonly_stop,
-    bool cd_writes) {
+    bool cd_writes, uint8_t argv_presence) {
   *mutations = (dep_named_mutations_t){0};
   *null_mutations = (dep_named_mutations_t){.before_redirect = true};
   *prefix_assignments = (dep_prefix_assignment_set_t){0};
@@ -4883,10 +5772,12 @@ static SHELL_NONNULL(1, 2, 3, 4, 5, 6) void dep_prepare_named_mutations(
       break;
     }
     dep_token_t name = {word->start, (uint32_t)assignment.name_end};
-    dep_prefix_assignment_insert(prefix_assignments, &name);
+    dep_prefix_assignment_insert(prefix_assignments, &name, assignment.append);
     if (token < readonly_stop) {
       null_mutations->effects[null_mutations->count++] =
-          (dep_named_effect_t){name, DEP_NAMED_EFFECT_TOKEN};
+          (dep_named_effect_t){.token = name,
+                               .kind = DEP_NAMED_EFFECT_TOKEN,
+                               .prohibited_properties = SHELL_VARIABLE_INTEGER};
       (void)dep_ifs_note_assignment(null_mutations, word);
     }
     if (dep_ifs_note_assignment(&prefix_ifs, word)) {
@@ -4896,13 +5787,14 @@ static SHELL_NONNULL(1, 2, 3, 4, 5, 6) void dep_prepare_named_mutations(
     }
   }
 
-  /* A leading assignment is temporary when a command word follows. In
+  /* A leading assignment is temporary when expanded argv is present. In
    * particular, Bash expands that command's redirect list against the
    * pre-existing descriptor-variable binding. An assignment-only command,
    * however, changes the current shell variable and invalidates just that
-   * logical named-FD route. Defer mutation until the command shape is known
+   * logical named-FD route, including when empty process words disappear.
+   * Defer mutation until the command shape is known
    * so the two cases cannot be confused. */
-  if (command == UINT32_MAX) {
+  if (command == UINT32_MAX || argv_presence == DEP_ARGV_EMPTY) {
     *mutations = *null_mutations;
     return;
   }
@@ -4931,7 +5823,7 @@ static SHELL_NONNULL(1, 2, 3, 4, 5, 6) void dep_prepare_named_mutations(
     mutations->restored_prefixes = prefix_assignments;
     shell_builtin_unset_t state = {.options = true};
     for (uint32_t i = effective_command + 1; i < tokens.count; i++) {
-      if (dep_skip_builtin_redirect(&tokens, &i))
+      if (dep_skip_nonargument(&tokens, &i))
         continue;
       const dep_token_t *target = &tokens.tokens[i];
       unsigned roles =
@@ -4947,7 +5839,15 @@ static SHELL_NONNULL(1, 2, 3, 4, 5, 6) void dep_prepare_named_mutations(
         continue;
       }
       if (!dep_prefix_assignment_contains(prefix_assignments, target)) {
-        dep_named_effect_t effect = {*target, DEP_NAMED_EFFECT_TOKEN};
+        unsigned properties =
+            shell_builtin_name_properties(target->start, target->len);
+        dep_named_effect_t effect = {
+            .token = *target,
+            .kind =
+                (properties & SHELL_VARIABLE_UNSTABLE) &&
+                        !(properties & SHELL_VARIABLE_DESPECIALIZES_ON_UNSET)
+                    ? DEP_NAMED_EFFECT_TOKEN
+                    : DEP_NAMED_EFFECT_UNSET};
         mutations->effects[mutations->count++] = effect;
         if (dep_effect_is_ifs(effect.token.start, effect.token.len,
                               effect.kind))
@@ -4961,7 +5861,7 @@ static SHELL_NONNULL(1, 2, 3, 4, 5, 6) void dep_prepare_named_mutations(
     mutations->restored_prefixes = prefix_assignments;
     shell_builtin_read_t state = {.writing = SHELL_READ_OPTIONS};
     for (uint32_t i = effective_command + 1; i < tokens.count; i++) {
-      if (dep_skip_builtin_redirect(&tokens, &i))
+      if (dep_skip_nonargument(&tokens, &i))
         continue;
       const dep_token_t *target = &tokens.tokens[i];
       unsigned roles =
@@ -4975,7 +5875,8 @@ static SHELL_NONNULL(1, 2, 3, 4, 5, 6) void dep_prepare_named_mutations(
         return;
       }
       if (!dep_prefix_assignment_contains(prefix_assignments, target)) {
-        dep_named_effect_t effect = {*target, DEP_NAMED_EFFECT_TOKEN};
+        dep_named_effect_t effect = {.token = *target,
+                                     .kind = DEP_NAMED_EFFECT_TOKEN};
         mutations->effects[mutations->count++] = effect;
         if (dep_effect_is_ifs(effect.token.start, effect.token.len,
                               effect.kind))
@@ -4987,8 +5888,9 @@ static SHELL_NONNULL(1, 2, 3, 4, 5, 6) void dep_prepare_named_mutations(
     if (shell_builtin_read_default_write(&state) &&
         !dep_prefix_assignment_contains(prefix_assignments,
                                         &(dep_token_t){"REPLY", 5}))
-      mutations->effects[mutations->count++] = (dep_named_effect_t){
-          {.start = "REPLY", .len = 5}, DEP_NAMED_EFFECT_TOKEN};
+      mutations->effects[mutations->count++] =
+          (dep_named_effect_t){.token = {.start = "REPLY", .len = 5},
+                               .kind = DEP_NAMED_EFFECT_TOKEN};
     return;
   }
 
@@ -4996,7 +5898,7 @@ static SHELL_NONNULL(1, 2, 3, 4, 5, 6) void dep_prepare_named_mutations(
     shell_builtin_printf_t state = {0};
     dep_named_effect_t pending = {0};
     for (uint32_t i = effective_command + 1; i < tokens.count; i++) {
-      if (dep_skip_builtin_redirect(&tokens, &i))
+      if (dep_skip_nonargument(&tokens, &i))
         continue;
       const dep_token_t *word = &tokens.tokens[i];
       unsigned roles =
@@ -5008,15 +5910,18 @@ static SHELL_NONNULL(1, 2, 3, 4, 5, 6) void dep_prepare_named_mutations(
       }
       if ((roles & SHELL_BUILTIN_ROLE_TARGET) &&
           state.phase == SHELL_PRINTF_OPTIONS)
-        pending =
-            (dep_named_effect_t){*word, roles & SHELL_BUILTIN_ROLE_ATTACHED
-                                            ? DEP_NAMED_EFFECT_PRINTF_ATTACHED
-                                            : DEP_NAMED_EFFECT_TOKEN};
+        pending = (dep_named_effect_t){
+            .token = *word,
+            .kind = roles & SHELL_BUILTIN_ROLE_ATTACHED
+                        ? DEP_NAMED_EFFECT_PRINTF_ATTACHED
+                        : DEP_NAMED_EFFECT_TOKEN,
+            .prohibited_properties = SHELL_VARIABLE_INTEGER};
       if (roles & SHELL_BUILTIN_ROLE_WRITE) {
         dep_named_effect_t effect =
             roles & SHELL_BUILTIN_ROLE_FORMAT
                 ? pending
-                : (dep_named_effect_t){*word, DEP_NAMED_EFFECT_TOKEN};
+                : (dep_named_effect_t){.token = *word,
+                                       .kind = DEP_NAMED_EFFECT_TOKEN};
         mutations->effects[mutations->count++] = effect;
         bool writes_ifs;
         /* FORMAT writes require printf's earlier TARGET event. The shared
@@ -5056,7 +5961,7 @@ static SHELL_NONNULL(1, 2, 3, 4, 5, 6) void dep_prepare_named_mutations(
         .options = true,
         .promotes_prefix = builtin_kind == SHELL_SOURCE_BUILTIN_EXPORT};
     for (uint32_t i = effective_command + 1; i < tokens.count; i++) {
-      if (dep_skip_builtin_redirect(&tokens, &i))
+      if (dep_skip_nonargument(&tokens, &i))
         continue;
       const dep_token_t *argument = &tokens.tokens[i];
       unsigned roles = shell_builtin_declaration_word(&state, argument->start,
@@ -5073,13 +5978,16 @@ static SHELL_NONNULL(1, 2, 3, 4, 5, 6) void dep_prepare_named_mutations(
             !dep_prefix_assignment_contains_kind(prefix_assignments, argument,
                                                  true)) {
           mutations->effects[mutations->count++] = (dep_named_effect_t){
-              *argument, DEP_NAMED_EFFECT_STATIC_ASSIGNMENT};
+              .token = *argument,
+              .kind = DEP_NAMED_EFFECT_STATIC_ASSIGNMENT,
+              .prohibited_properties =
+                  state.no_integer ? 0 : SHELL_VARIABLE_INTEGER};
           dep_ifs_note_assignment(mutations, argument);
         }
       } else if ((roles & SHELL_BUILTIN_ROLE_PROMOTES_PREFIX) &&
                  dep_prefix_assignment_contains(prefix_assignments, argument)) {
-        mutations->effects[mutations->count++] =
-            (dep_named_effect_t){*argument, DEP_NAMED_EFFECT_TOKEN};
+        mutations->effects[mutations->count++] = (dep_named_effect_t){
+            .token = *argument, .kind = DEP_NAMED_EFFECT_TOKEN};
         if (dep_effect_is_ifs(argument->start, argument->len,
                               DEP_NAMED_EFFECT_TOKEN)) {
           mutations->ifs_write = prefix_ifs.ifs_write;
@@ -5094,14 +6002,16 @@ static SHELL_NONNULL(1, 2, 3, 4, 5, 6) void dep_prepare_named_mutations(
   if (builtin_kind == SHELL_SOURCE_BUILTIN_GETOPTS) {
     shell_builtin_getopts_t state = {.phases = SHELL_GETOPTS_OPTIONS};
     for (uint32_t i = effective_command + 1; i < tokens.count; i++) {
-      if (dep_skip_builtin_redirect(&tokens, &i))
+      if (dep_skip_nonargument(&tokens, &i))
         continue;
       const dep_token_t *target = &tokens.tokens[i];
       unsigned roles =
           shell_builtin_getopts_word(&state, target->start, target->len);
       if (roles & SHELL_BUILTIN_ROLE_WRITE) {
-        mutations->effects[mutations->count++] =
-            (dep_named_effect_t){*target, DEP_NAMED_EFFECT_TOKEN};
+        mutations->effects[mutations->count++] = (dep_named_effect_t){
+            .token = *target,
+            .kind = DEP_NAMED_EFFECT_TOKEN,
+            .prohibited_properties = SHELL_VARIABLE_INTEGER};
         if (dep_effect_is_ifs(target->start, target->len,
                               DEP_NAMED_EFFECT_TOKEN))
           dep_ifs_note(mutations, DEP_IFS_DIGITS, false);
@@ -5113,10 +6023,10 @@ static SHELL_NONNULL(1, 2, 3, 4, 5, 6) void dep_prepare_named_mutations(
      * A completed invocation has at least a command, optstring and target,
      * leaving two effect slots beyond its possible destination words. */
     if (state.phases & SHELL_GETOPTS_DATA) {
-      mutations->effects[mutations->count++] =
-          (dep_named_effect_t){{"OPTIND", 6}, DEP_NAMED_EFFECT_TOKEN};
-      mutations->effects[mutations->count++] =
-          (dep_named_effect_t){{"OPTARG", 6}, DEP_NAMED_EFFECT_TOKEN};
+      mutations->effects[mutations->count++] = (dep_named_effect_t){
+          .token = {"OPTIND", 6}, .kind = DEP_NAMED_EFFECT_TOKEN};
+      mutations->effects[mutations->count++] = (dep_named_effect_t){
+          .token = {"OPTARG", 6}, .kind = DEP_NAMED_EFFECT_TOKEN};
     }
   }
 }
@@ -5138,6 +6048,7 @@ static SHELL_NONNULL(1, 2) void dep_apply_named_mutations(
     const dep_named_effect_t *effect = &mutations->effects[i];
     switch (effect->kind) {
     case DEP_NAMED_EFFECT_TOKEN:
+    case DEP_NAMED_EFFECT_UNSET:
       dep_remove_named_target(routes, &effect->token, false, 0);
       break;
     case DEP_NAMED_EFFECT_STATIC_ASSIGNMENT:
@@ -5296,26 +6207,31 @@ typedef enum {
   DEP_SNAPSHOT_SETUP,
 } dep_snapshot_phase_t;
 
+static SHELL_NONNULL(1, 2, 3, 4) bool dep_observation_apply(
+    dep_route_state_t *state, dep_route_journal_t *journal,
+    const dep_owner_routes_t *baseline,
+    const dep_observation_program_t *program, uint32_t event);
+
+/* cursor is the last consumed event in this phase, or zero. */
+static SHELL_NONNULL(1, 2, 3, 4, 5, 7) bool dep_observation_pending(
+    dep_route_state_t *state, dep_route_journal_t *journal,
+    const dep_owner_routes_t *baseline,
+    const dep_observation_program_t *program,
+    const dep_snapshot_source_t *source, unsigned phase, uint32_t *cursor,
+    uint32_t before) {
+  uint32_t event = *cursor ? program->events[*cursor - 1].next
+                           : source->observation_first[phase];
+  while (event && program->events[event - 1].position <= before) {
+    if (!dep_observation_apply(state, journal, baseline, program, event))
+      return false;
+    *cursor = event;
+    event = program->events[event - 1].next;
+  }
+  return true;
+}
+
 static SHELL_NONNULL(1) uint32_t
     dep_owner_event(const dep_parse_context_t *context, uint32_t owner);
-
-/* Compose one reached word's transfer with its phase, without depending on
- * the order in which assignment and redirect syntax is visited. */
-static SHELL_NONNULL(1) void dep_record_substitution_status(
-    const dep_parse_context_t *context, uint32_t owner,
-    dep_snapshot_phase_t phase, uint8_t status, bool conditional) {
-  if (phase == DEP_SNAPSHOT_ASSIGNMENT_VALUE) {
-    const dep_snapshot_source_t *source =
-        &context->workspace
-             ->snapshot_sources[context->snapshot->prepared_source[owner]];
-    conditional |=
-        source->argv_presence == (DEP_ARGV_EMPTY | DEP_ARGV_PRESENT) &&
-        source->assignment_dispatch == DEP_ARGV_EMPTY;
-  }
-  uint8_t *prior =
-      &context->expansion_status[dep_owner_event(context, owner)].phase[phase];
-  *prior = status | (conditional ? *prior : 0);
-}
 
 /* Expansion errors belong to their executing shell. Null-command assignments
  * expand before the setup child exists; only redirect-phase errors return to
@@ -5383,30 +6299,26 @@ static uint8_t dep_substitution_status(uint8_t status) {
               : 0);
 }
 
-static SHELL_NONNULL(1, 3) int dep_assignment_compare(const void *context,
-                                                      uint32_t index,
-                                                      const void *key) {
-  const dep_snapshot_source_t *source = context;
-  const dep_token_t *name = &source->null_mutations.effects[index].token;
-  DEP_METADATA_WORK(SHELLSPLIT_TEST_WORK_ROUTE_PUBLICATION);
-  return dep_fd_ref_compare(
-      (dep_fd_ref_t){SHELL_DEP_FD_NAMED, name->start, name->len},
-      *(const dep_fd_ref_t *)key);
-}
-
-/* Indexed first-commit lookup over preclassified identifier spans. Required
- * source and fd; position is an RHS boundary in the original source. */
+/* The existing prefix-name index retains each name's first assignment. Both
+ * temporary and assignment-only prefixes are visible to later RHS expansions;
+ * no second effects index or replay of those assignments is needed. position
+ * is an RHS boundary in the original source. */
 static SHELL_NONNULL(1, 2) bool dep_assignment_precedes(
     const dep_snapshot_source_t *source, const char *cmd, dep_fd_ref_t fd,
     uint32_t position) {
-  uint32_t root = source->assignment_root;
+  const dep_prefix_assignment_set_t *assignments = &source->prefix_assignments;
+  uint32_t root = assignments->root;
   while (root) {
-    int order = dep_assignment_compare(source, root - 1, &fd);
+    DEP_METADATA_WORK(SHELLSPLIT_TEST_WORK_ROUTE_PUBLICATION);
+    const dep_variable_token_t *name = &assignments->names[root - 1];
+    int order = dep_fd_ref_compare((dep_fd_ref_t){.name = name->start,
+                                                  .value = SHELL_DEP_FD_NAMED,
+                                                  .name_len = name->len},
+                                   fd);
     if (!order)
-      return (uint32_t)(source->null_mutations.effects[root - 1].token.start -
-                        cmd) < position;
-    root = order > 0 ? source->assignment_index[root - 1].left
-                     : source->assignment_index[root - 1].right;
+      return (uint32_t)(name->start - cmd) < position;
+    root = order > 0 ? assignments->index[root - 1].left
+                     : assignments->index[root - 1].right;
   }
   return false;
 }
@@ -5472,6 +6384,9 @@ static SHELL_NONNULL(1,
   uint32_t pending = *(const uint32_t *)key;
   if (source->ops[index].pos != source->ops[pending].pos)
     return source->ops[index].pos < source->ops[pending].pos ? -1 : 1;
+  if ((source->ops[index].kind == DEP_FD_OP_PROCESS) !=
+      (source->ops[pending].kind == DEP_FD_OP_PROCESS))
+    return source->ops[index].kind == DEP_FD_OP_PROCESS ? -1 : 1;
   return index < pending ? -1 : index != pending;
 }
 
@@ -5562,6 +6477,10 @@ static SHELL_NONNULL(1, 2, 4) bool dep_owner_observes_undo(
     uint32_t count) {
   if (graph->nodes[owner].type == SHELL_NODE_GROUP)
     return true;
+  if (context->workspace
+          ->snapshot_sources[context->snapshot->prepared_source[owner]]
+          .read.active)
+    return true;
   uint32_t features = context->fast->cmds[context->node_range[owner]].features;
   if (features &
       (SHELL_FEAT_SUBSHELL | SHELL_FEAT_PROCESS_SUB | SHELL_FEAT_HEREDOC))
@@ -5641,8 +6560,6 @@ static SHELL_NONNULL(1, 2, 4) bool dep_snapshot_fd_operations(
       source->ops[source->op_count++] = dep_pipe_both_operation();
     }
     dep_prepare_fd_close_history(source->ops, source->op_count);
-    source->undo_observable = dep_owner_observes_undo(
-        graph, context, owner, &source->tokens, source->ops, source->op_count);
     if (graph->nodes[owner].type == SHELL_NODE_CMD) {
       dep_token_list_t mutations = source->tokens;
       if (stopped)
@@ -5652,21 +6569,35 @@ static SHELL_NONNULL(1, 2, 4) bool dep_snapshot_fd_operations(
           source->assignment_ifs, &source->assignment_ifs_count,
           &source->null_mutations,
           source->argv_presence & DEP_ARGV_EMPTY ? source->readonly_stop : 0,
-          context->range_cd_writes[context->node_range[owner]]);
-      if (source->argv_presence & DEP_ARGV_EMPTY) {
-        for (uint32_t effect = 0; effect < source->null_mutations.count;
-             effect++) {
-          const dep_token_t *name =
-              &source->null_mutations.effects[effect].token;
-          dep_fd_ref_t key = {SHELL_DEP_FD_NAMED, name->start, name->len};
-          uint32_t match = 0;
-          source->assignment_root = dep_index_insert(
-              source->assignment_index, source->assignment_root, effect + 1,
-              SHELL_DEP_MAX_TOKENS, dep_assignment_compare, source, &key,
-              &match);
-        }
+          context->range_cd_writes[context->node_range[owner]],
+          source->argv_presence);
+      uint32_t event = context->node_group[owner] != UINT32_MAX
+                           ? context->node_group[owner]
+                           : SHELL_MAX_GROUPS + context->node_range[owner];
+      int32_t enclosing;
+      if (event >= SHELL_MAX_GROUPS)
+        enclosing = dep_range_group(&context->execution->pipeline,
+                                    event - SHELL_MAX_GROUPS);
+      else {
+        uint16_t parent = context->fast->groups[event].parent;
+        enclosing = parent == UINT16_MAX ? -1 : (int32_t)parent;
       }
+      source->mutations.scope = source->null_mutations.scope =
+          (uint8_t)(enclosing + 1);
+      for (uint32_t i = 0; i < source->mutations.count; i++)
+        dep_prepare_observed_effect(
+            &source->mutations.effects[i],
+            &context->workspace->snapshot_journal.read_observations);
+      for (uint32_t i = 0; i < source->null_mutations.count; i++)
+        dep_prepare_observed_effect(
+            &source->null_mutations.effects[i],
+            &context->workspace->snapshot_journal.read_observations);
+      dep_read_prepare(&source->read, &source->tokens,
+                       &source->prefix_assignments,
+                       &context->workspace->snapshot_journal.read_observations);
     }
+    source->undo_observable = dep_owner_observes_undo(
+        graph, context, owner, &source->tokens, source->ops, source->op_count);
     /* Bash counts input instructions, not every operation targeting fd 0.
      * Named allocations and descriptor moves do not count. Reuse this owner's
      * prepared token/operation inventory; no source-prefix replay. */
@@ -5724,7 +6655,10 @@ static SHELL_NONNULL(1, 2, 4) bool dep_snapshot_fd_operations(
         NULL,
         false,
         false,
-        false};
+        false,
+        NULL,
+        0,
+        0};
     operation->document_flags = &graph->nodes[document].doc.flags;
     source->edge_cursor = cursor;
   }
@@ -5749,7 +6683,7 @@ static SHELL_NONNULL(1, 2, 4) bool dep_snapshot_fd_operations(
             graph->nodes[dep_edge_document_index(graph,
                                                  &graph->edges[op->edge_index])]
                     .doc.kind == SHELL_DOC_FILE));
-      uint32_t match;
+      uint32_t match = 0;
       source->op_root =
           dep_index_insert(source->op_index, source->op_root, i + 1,
                            sizeof(source->ops) / sizeof(source->ops[0]),
@@ -5769,13 +6703,62 @@ static SHELL_NONNULL(1, 2, 3) dep_route_set_t
                                const dep_route_journal_t *changes,
                                const dep_owner_routes_t *baseline,
                                dep_fd_ref_t fd, dep_fd_access_t access);
+/* Collection is enabled only at explicit completed-operation boundaries.
+ * Root spans are borrowed from the active replay; NULL frame selects final
+ * resolution. A recursive construction frame disables collection because its
+ * caller can still hold in-flight imports. Live FAILURE_UNDO facts discover
+ * their cleanup programs and caches; historical program nodes are not roots. */
+typedef struct dep_domain_collection {
+  dep_route_workspace_t *workspace;
+  const dep_snapshot_frame_t *frame;
+  const dep_route_state_t *roots[5];
+  /* Optional contiguous outcome roots retained during read publication. */
+  const dep_route_state_t *states;
+  uint32_t state_count;
+  /* Borrowed cursor whose already-consumed prefix has been superseded. The
+   * immutable link chain keeps the remaining roots available without copying
+   * or rescanning the complete alternative set. */
+  const dep_route_iterator_t *remaining;
+  /* Current source versions which a final decision transform supersedes.
+   * Their descriptor maps stay live, but the transform may clear their old
+   * PROCESS_DOMAIN fact before collection. */
+  dep_route_state_t *release_domains[3];
+  const uint32_t *decisions;
+  uint32_t decision_count;
+  const dep_fd_flow_t *flow;
+  const struct dep_domain_collection *parent;
+} dep_domain_collection_t;
+
 /* Required prepared route tables and journal. ops addresses op_count prepared
  * operations; NULL is permitted only for an empty operation span.
+ * collection is NULL for a replay with unenumerated transient roots.
  */
 static SHELL_NONNULL(1, 2, 3) bool dep_route_state_apply(
     dep_route_state_t *state, dep_route_journal_t *changes,
     const dep_owner_routes_t *baseline, const dep_fd_op_t *ops,
-    uint32_t op_count, bool begin_frame);
+    uint32_t op_count, bool begin_frame,
+    const dep_domain_collection_t *collection);
+static SHELL_NONNULL(1, 2, 3, 4) bool dep_process_open(
+    dep_route_state_t *state, dep_route_journal_t *journal,
+    const dep_owner_routes_t *baseline, const dep_fd_op_t *op);
+
+static SHELL_NONNULL(1, 2, 3, 4) bool dep_process_close_owner(
+    dep_route_state_t *state, dep_route_journal_t *journal,
+    const dep_owner_routes_t *baseline, const dep_parse_context_t *context,
+    uint32_t owner);
+static SHELL_NONNULL(1, 2, 3, 4) bool dep_process_guard_prepare(
+    dep_route_state_t *state, dep_route_journal_t *journal,
+    const dep_owner_routes_t *baseline, const dep_process_guard_t *guard);
+static SHELL_NONNULL(1, 2) uint32_t
+    dep_process_guard_key(dep_route_journal_t *journal,
+                          const dep_process_guard_t *guard, bool create);
+static SHELL_NONNULL(1, 2, 3, 4, 5, 6) bool dep_process_guard_select(
+    const dep_route_state_t *state, dep_route_journal_t *journal,
+    const dep_owner_routes_t *baseline, const dep_process_guard_t *guard,
+    dep_route_state_t *selected, bool *possible);
+static SHELL_NONNULL(1, 2, 3, 4) bool dep_fd_merge_versions(
+    dep_route_state_t *destination, const dep_route_state_t *source,
+    dep_route_journal_t *journal, const dep_owner_routes_t *baseline);
 static SHELL_NONNULL(1, 2, 3) dep_route_set_t
     dep_fd_fact(const dep_route_state_t *state,
                 const dep_route_journal_t *journal,
@@ -5786,6 +6769,160 @@ static SHELL_NONNULL(1, 2, 3) dep_route_set_t
                     const dep_route_journal_t *journal,
                     const dep_owner_routes_t *baseline, dep_fd_ref_t fd,
                     dep_fd_access_t access);
+static SHELL_NONNULL(1, 2) const dep_route_change_t *dep_route_state_change(
+    const dep_route_state_t *state, const dep_route_journal_t *changes,
+    dep_fd_ref_t fd, dep_fd_access_t access);
+static SHELL_NONNULL(1, 2, 3) bool dep_observation_require(
+    dep_route_state_t *state, dep_route_journal_t *journal,
+    const dep_owner_routes_t *baseline, dep_fd_ref_t fd, unsigned roles);
+
+static dep_fd_ref_t dep_variable_ref(uint8_t variable) {
+  return (dep_fd_ref_t){
+      .name = shell_builtin_variable_index_name(variable),
+      .value = SHELL_DEP_FD_NAMED,
+      .name_len = (uint32_t)shell_builtin_variable_index_length(variable)};
+}
+
+enum {
+  /* `unset name` removed a live named-FD binding without closing its physical
+   * descriptor. This state, including its original allocation scope, survives
+   * repeated unsets until a successful named-FD allocation replaces it. Until
+   * allocator correlation includes that orphaned slot, a later `{name}>...`
+   * must remain outside the supported graph boundary. */
+  DEP_EFFECT_STATE_ORPHANED_ALLOCATION = 1u << 1,
+  DEP_EFFECT_STATE_SCOPE_SHIFT = 2,
+};
+
+static SHELL_NONNULL(1) bool dep_effect_state_has(const dep_route_set_t *state,
+                                                  uint32_t flag) {
+  for (uint32_t i = 0; i < state->count; i++)
+    if (state->routes[i].value & flag)
+      return true;
+  return false;
+}
+
+/* Return every predefined capability still possible at this execution point.
+ * Successful whole-variable unsets record a compact registry mask in the same
+ * immutable version as descriptor bindings. Unlike descriptor-orphan state,
+ * these capabilities are inherited by recursive shells. Keeping alternatives
+ * separate makes conditional unsets conservative without scanning variables. */
+static SHELL_NONNULL(2, 3, 4) unsigned dep_variable_properties(
+    uint8_t variable, const dep_route_state_t *state,
+    const dep_route_journal_t *journal, const dep_owner_routes_t *baseline) {
+  unsigned initial = shell_builtin_variable_index_properties(variable);
+  if (!(initial & SHELL_VARIABLE_DESPECIALIZES_ON_UNSET))
+    return initial;
+  unsigned properties = 0;
+  uint32_t word = (variable - 1u) / 32u;
+  uint32_t bit = UINT32_C(1) << ((variable - 1u) % 32u);
+  dep_route_iterator_t versions = dep_route_iterator(state);
+  uint32_t root;
+  while (dep_route_next(&versions, journal, &root)) {
+    dep_route_state_t one = dep_route_state_single(root);
+    dep_route_set_t marker = dep_fd_raw_fact(
+        &one, journal, baseline, dep_fd_numeric(DEP_VARIABLE_STATE_EVENT),
+        DEP_FD_ACCESS_EFFECT_STATE);
+    if (!marker.count || !(marker.routes[word].value & bit))
+      properties |= initial;
+  }
+  return properties;
+}
+
+static SHELL_NONNULL(2, 3, 4) shell_builtin_variable_t
+    dep_variable_classification(uint8_t variable,
+                                const dep_route_state_t *state,
+                                const dep_route_journal_t *journal,
+                                const dep_owner_routes_t *baseline) {
+  unsigned properties =
+      dep_variable_properties(variable, state, journal, baseline);
+  if (properties & SHELL_VARIABLE_INTEGER)
+    return SHELL_BUILTIN_VARIABLE_ARITHMETIC;
+  if (properties & SHELL_VARIABLE_FROZEN)
+    return SHELL_BUILTIN_VARIABLE_FROZEN;
+  return properties & SHELL_VARIABLE_READONLY ? SHELL_BUILTIN_VARIABLE_READONLY
+                                              : SHELL_BUILTIN_VARIABLE_STATIC;
+}
+
+static SHELL_NONNULL(1, 2, 3, 4) bool dep_effects_supported(
+    const dep_named_mutations_t *mutations, const dep_route_state_t *state,
+    const dep_route_journal_t *journal, const dep_owner_routes_t *baseline) {
+  for (uint32_t i = 0; i < mutations->count; i++) {
+    const dep_named_effect_t *effect = &mutations->effects[i];
+    if (effect->variable && effect->prohibited_properties &&
+        (dep_variable_properties(effect->variable, state, journal, baseline) &
+         effect->prohibited_properties))
+      return false;
+  }
+  return true;
+}
+
+/* This is the stateful builtin validation boundary. Syntax preparation has
+ * already proved static target spellings; only the route journal can decide
+ * whether a resettable predefined name is still special on every live path. */
+static SHELL_NONNULL(1) bool dep_scope_is_descendant(
+    const shell_parse_result_t *fast, uint8_t scope, uint8_t ancestor) {
+  if (!scope || scope == ancestor)
+    return false;
+  if (!ancestor)
+    return true;
+  uint16_t group = (uint16_t)(scope - 1);
+  while (fast->groups[group].parent != UINT16_MAX) {
+    group = fast->groups[group].parent;
+    if ((uint8_t)(group + 1) == ancestor)
+      return true;
+  }
+  return false;
+}
+
+static SHELL_NONNULL(1, 2, 3, 4, 5) bool dep_source_variables_supported(
+    const dep_snapshot_source_t *source, const dep_route_state_t *state,
+    const dep_route_journal_t *journal, const dep_owner_routes_t *baseline,
+    const shell_parse_result_t *fast) {
+  if (!dep_effects_supported(&source->mutations, state, journal, baseline) ||
+      ((source->argv_presence & DEP_ARGV_EMPTY) &&
+       !dep_effects_supported(&source->null_mutations, state, journal,
+                              baseline)))
+    return false;
+  /* Bash restores a plain NAME=value temporary environment, including
+   * arithmetic side effects of predefined integer variables. NAME+=value is
+   * evaluated against the existing integer and its nested arithmetic writes
+   * survive, so that spelling still needs ordinary-scalar state. */
+  for (uint32_t i = 0; i < source->prefix_assignments.count; i++) {
+    const dep_variable_token_t *prefix = &source->prefix_assignments.names[i];
+    if (prefix->append && prefix->variable &&
+        (dep_variable_properties(prefix->variable, state, journal, baseline) &
+         SHELL_VARIABLE_INTEGER))
+      return false;
+  }
+  for (uint32_t i = 0; i < source->op_count; i++) {
+    const dep_fd_op_t *op = &source->ops[i];
+    uint8_t variable = op->variable;
+    if (variable &&
+        (dep_variable_properties(variable, state, journal, baseline) &
+         (SHELL_VARIABLE_UNSTABLE | SHELL_VARIABLE_READONLY |
+          SHELL_VARIABLE_ARRAY | SHELL_VARIABLE_FROZEN)))
+      return false;
+    if (op->fd == SHELL_DEP_FD_NAMED && op->resets_descriptor) {
+      dep_fd_ref_t fd = {
+          .name = op->fd_name, .value = op->fd, .name_len = op->fd_name_len};
+      dep_route_set_t effect_state = dep_fd_raw_fact(
+          state, journal, baseline, fd, DEP_FD_ACCESS_EFFECT_STATE);
+      for (uint32_t route = 0; route < effect_state.count; route++) {
+        uint32_t value = effect_state.routes[route].value;
+        if ((value & DEP_EFFECT_STATE_ORPHANED_ALLOCATION) &&
+            dep_scope_is_descendant(
+                fast, source->mutations.scope,
+                (uint8_t)(value >> DEP_EFFECT_STATE_SCOPE_SHIFT)))
+          return false;
+      }
+    }
+  }
+  return true;
+}
+static SHELL_NONNULL(1) uint8_t
+    dep_read_binding_outcomes(const dep_route_set_t *facts);
+static SHELL_NONNULL(1) unsigned dep_read_value_class(
+    const dep_route_set_t *facts);
 
 static SHELL_NONNULL(1, 3) int dep_diagnostic_compare(const void *context,
                                                       uint32_t index,
@@ -5850,10 +6987,10 @@ static SHELL_NONNULL(1, 2,
                                           const dep_route_journal_t *journal,
                                           const dep_owner_routes_t *baseline,
                                           dep_fd_ref_t fd);
-static SHELL_NONNULL(1, 2, 3, 4, 7) bool dep_fd_bindings(
+static SHELL_NONNULL(1, 2, 3, 4, 5, 8) bool dep_fd_bindings(
     dep_route_state_t *state, dep_route_journal_t *journal,
-    const dep_owner_routes_t *before, const dep_owner_routes_t *after,
-    const dep_fd_op_t *ops, uint32_t op_count,
+    const dep_owner_routes_t *baseline, const dep_owner_routes_t *before,
+    const dep_owner_routes_t *after, const dep_fd_op_t *ops, uint32_t op_count,
     const dep_named_mutations_t *mutations);
 /* Concrete tables are derived journal views. Update only changed slots;
  * they do not independently interpret setup operations or validate operands. */
@@ -5873,7 +7010,8 @@ static SHELL_NONNULL(1, 2, 3, 4) bool dep_route_state_publish(
     dep_route_state_t *state, dep_route_journal_t *changes,
     const dep_route_state_t *executed_state,
     const dep_owner_routes_t *entry_baseline, const dep_fd_op_t *ops,
-    uint32_t op_count, bool descriptor_exec);
+    uint32_t op_count, bool descriptor_exec,
+    const dep_domain_collection_t *collection);
 static bool dep_restore_continuation_route_state(
     dep_route_state_t *continuation, dep_route_journal_t *changes,
     const dep_owner_routes_t *destination,
@@ -5882,6 +7020,11 @@ static bool dep_restore_continuation_route_state(
 static SHELL_NONNULL(1, 2) bool dep_route_state_store_access(
     dep_route_state_t *state, dep_route_journal_t *changes, dep_fd_ref_t fd,
     dep_fd_access_t access, dep_route_set_t routes);
+/* collection may be NULL when this update has no collection checkpoint. */
+static SHELL_NONNULL(1, 2) bool dep_route_state_store_access_collected(
+    dep_route_state_t *state, dep_route_journal_t *changes, dep_fd_ref_t fd,
+    dep_fd_access_t access, dep_route_set_t routes,
+    const dep_domain_collection_t *collection);
 static void dep_route_set_set(dep_route_set_t *snapshot, dep_fd_route_t route);
 
 static uint32_t dep_ifs_join(uint32_t left, uint32_t right) {
@@ -5978,6 +7121,10 @@ static SHELL_NONNULL(1, 2,
   return true;
 }
 
+static SHELL_NONNULL(1, 2, 3) bool dep_fd_private_begin(
+    dep_route_state_t *state, dep_route_journal_t *journal,
+    const dep_owner_routes_t *baseline, uint32_t event);
+
 /* The owner's inventory is prepared once. Early wrappers have already
  * installed stdin at their execution-unit entry; simple commands do so only
  * at redirect setup, after their argv and assignment-value expansions. */
@@ -6008,6 +7155,1196 @@ static SHELL_NONNULL(1, 2, 4, 5, 6) bool dep_owner_stdin(
                                     source->stdin_redirect || incoming);
   }
   return true;
+}
+
+typedef struct {
+  uint64_t input, targets;
+  uint8_t status;
+  bool default_target, unsupported, assigned_failure, unassigned_failure,
+      exhausted;
+} dep_read_result_t;
+
+enum {
+  DEP_READ_SUCCESS,
+  DEP_READ_ASSIGNED_FAILURE,
+  DEP_READ_UNASSIGNED_FAILURE,
+  DEP_READ_OUTCOMES
+};
+
+typedef struct {
+  dep_route_state_t outcomes[DEP_READ_OUTCOMES];
+  dep_route_state_t inputs[SHELL_DEP_MAX_TOKENS + 1];
+  uint64_t input_mask;
+  uint8_t mask;
+} dep_read_versions_t;
+
+static SHELL_NONNULL(1, 2, 3, 4) dep_read_result_t dep_read_evaluate(
+    const dep_read_plan_t *plan, const dep_route_state_t *state,
+    dep_route_journal_t *journal, const dep_owner_routes_t *baseline,
+    dep_read_versions_t *observations, dep_read_frontier_t *frontier);
+
+static SHELL_NONNULL(2, 3) bool dep_read_scalar_shadowed(
+    uint32_t root, const dep_route_journal_t *journal,
+    const dep_owner_routes_t *baseline, dep_fd_ref_t fd);
+
+/* Capture argument values before redirects can reassign their variables.
+ * These private facts travel with execution versions, keeping entry identity
+ * correlated with the physical descriptor after setup. */
+static SHELL_NONNULL(1, 2, 3, 4) shell_dep_error_t
+    dep_read_capture(const dep_read_plan_t *plan, dep_route_state_t *state,
+                     dep_route_journal_t *journal,
+                     const dep_owner_routes_t *baseline) {
+  if (!plan->active)
+    return SHELL_DEP_OK;
+  /* Static argv needs no entry snapshots. Semantic validation belongs to the
+   * reached post-setup frontier, where earlier descriptor failures are known.
+   */
+  if (!plan->entry_dependent)
+    return SHELL_DEP_OK;
+  dep_route_state_t result = {0};
+  dep_route_iterator_t iterator = dep_route_iterator(state);
+  uint32_t root;
+  bool first = true;
+  while (dep_route_next(&iterator, journal, &root)) {
+    dep_route_state_t one = dep_route_state_single(root);
+    for (uint32_t i = 0; i < plan->count; i++) {
+      const dep_read_word_t *word = &plan->words[i];
+      if (!word->capture || word->parameter.value != SHELL_DEP_FD_NAMED)
+        continue;
+      if (!dep_observation_require(
+              &one, journal, baseline, word->parameter,
+              DEP_READ_OBSERVE_VALUE |
+                  (word->may_fd
+                       ? DEP_READ_OBSERVE_IDENTITY | DEP_READ_OBSERVE_ACCESS
+                       : 0)))
+        return SHELL_DEP_ETRUNC;
+      dep_route_set_t binding = dep_fd_raw_fact(
+          &one, journal, baseline, word->parameter, DEP_FD_ACCESS_BINDING);
+      if (dep_read_scalar_shadowed(one.root, journal, baseline,
+                                   word->parameter))
+        dep_route_set_set(&binding,
+                          (dep_fd_route_t){DEP_ROUTE_DYNAMIC, UINT32_MAX});
+      /* Bash can update these values without any explicit scalar writer.
+       * Their spelling/target validity is static, their captured value is not.
+       */
+      if (word->parameter_variable &&
+          (dep_variable_properties(word->parameter_variable, &one, journal,
+                                   baseline) &
+           SHELL_VARIABLE_UNSTABLE))
+        dep_route_set_set(&binding,
+                          (dep_fd_route_t){DEP_ROUTE_DYNAMIC, UINT32_MAX});
+      if (word->may_fd && binding.count == 1 &&
+          binding.routes[0].kind == DEP_ROUTE_INHERITED) {
+        /* Exported private allocations retain provenance, not the parent's
+         * journal-local slot number. Adopt a child-local identity once, so
+         * an argument keeps that FD if a redirect later rebinds its name. */
+        dep_fd_op_t imported = {.pos = UINT32_MAX,
+                                .fd_name = word->parameter.name,
+                                .fd_name_len = word->parameter.name_len};
+        uint32_t slot = dep_allocation_slot(journal, &imported);
+        if (slot == SHELL_DEP_FD_NONE)
+          return SHELL_DEP_ETRUNC;
+        dep_route_set_t alias = {0};
+        dep_route_set_set(&alias, (dep_fd_route_t){DEP_ROUTE_ALIAS, slot});
+        for (uint32_t access = DEP_FD_ACCESS_READ;
+             access <= DEP_FD_ACCESS_BINDING; access <<= 1) {
+          dep_route_set_t entry =
+              dep_fd_raw_fact(&one, journal, baseline, word->parameter,
+                              (dep_fd_access_t)access);
+          if (!dep_route_state_store_access(&one, journal, dep_fd_numeric(slot),
+                                            (dep_fd_access_t)access, entry) ||
+              !dep_route_state_store_access(&one, journal, word->parameter,
+                                            (dep_fd_access_t)access, alias))
+            return SHELL_DEP_ETRUNC;
+        }
+        binding = alias;
+      }
+      if (word->parameter_unquoted &&
+          (dep_ifs_get(&one, journal, baseline) & DEP_IFS_DIGITS) &&
+          !(binding.count == 1 &&
+            (binding.routes[0].kind == DEP_ROUTE_ABSENT ||
+             binding.routes[0].kind == DEP_ROUTE_UNAVAILABLE)))
+        dep_route_set_set(&binding,
+                          (dep_fd_route_t){DEP_ROUTE_DYNAMIC, UINT32_MAX});
+      if (!word->may_fd) {
+        unsigned value = dep_read_value_class(&binding);
+        dep_route_set_set(&binding,
+                          (dep_fd_route_t){value == 1   ? DEP_ROUTE_ABSENT
+                                           : value == 2 ? DEP_ROUTE_INHERITED
+                                                        : DEP_ROUTE_DYNAMIC,
+                                           0});
+      }
+      if (!dep_route_state_store_access(&one, journal, dep_fd_numeric(i),
+                                        DEP_FD_ACCESS_READ_ARGUMENT, binding))
+        return SHELL_DEP_ETRUNC;
+    }
+    if (first) {
+      result = one;
+      first = false;
+    } else if (!dep_route_state_add_root(&result, journal, one.root))
+      return SHELL_DEP_ETRUNC;
+  }
+  result.correlated = state->correlated;
+  *state = result;
+  return SHELL_DEP_OK;
+}
+
+/* selection is zero for default stdin, or one plus an operand ordinal selected
+ * by dep_read_evaluate. Its entry capture and completed setup are in state.
+ * Optional display receives the logical name only when its captured allocation
+ * supplies the descriptor number. An empty fragment instead leaves a static
+ * numeric operand, not a use of that variable's descriptor. */
+static SHELL_NONNULL(1, 2, 4, 5) dep_fd_ref_t
+    dep_read_descriptor(const dep_read_plan_t *plan,
+                        const dep_route_state_t *state, uint32_t selection,
+                        const dep_route_journal_t *journal,
+                        const dep_owner_routes_t *baseline,
+                        dep_fd_ref_t *display) {
+  dep_fd_ref_t physical = dep_fd_numeric(0), logical = physical;
+  if (selection) {
+    const dep_read_word_t *word = &plan->words[selection - 1];
+    physical = dep_fd_numeric(
+        word->operand_kind == SHELL_READ_FD ? word->payload : word->number);
+    logical = physical;
+    if (word->parameter.value == SHELL_DEP_FD_NAMED) {
+      dep_route_set_t captured = dep_fd_raw_fact(state, journal, baseline,
+                                                 dep_fd_numeric(selection - 1),
+                                                 DEP_FD_ACCESS_READ_ARGUMENT);
+      if (captured.routes[0].kind == DEP_ROUTE_ALIAS) {
+        physical = dep_fd_numeric(captured.routes[0].value);
+        logical = word->parameter;
+      }
+    }
+  }
+  if (display)
+    *display = logical;
+  return physical;
+}
+
+static unsigned dep_read_operand_phase(unsigned kind) {
+  return kind == SHELL_READ_DATA      ? DEP_READ_DATA
+         : kind == SHELL_READ_TIMEOUT ? DEP_READ_TIMEOUT
+         : kind == SHELL_READ_FD      ? DEP_READ_FD
+                                      : DEP_READ_NUMBER;
+}
+
+/* Descriptor presence is getopt validation, not read permission. External
+ * streams have unknown runtime capabilities; explicit opens/closures establish
+ * definite access. Nonmutating queries cache the selector masks; refining
+ * queries resolve only each live frontier cell's selected descriptor. */
+static SHELL_NONNULL(1) unsigned dep_read_access_outcomes(
+    const dep_route_set_t *input) {
+  unsigned result = 0;
+  for (uint32_t i = 0; i < input->count; i++) {
+    dep_route_kind_t kind = input->routes[i].kind;
+    if (kind == DEP_ROUTE_CLOSED || kind == DEP_ROUTE_ABSENT ||
+        kind == DEP_ROUTE_UNAVAILABLE)
+      result |= DEP_STATUS_MAY_FAIL;
+    else {
+      result |= DEP_STATUS_MAY_SUCCEED;
+      if (kind == DEP_ROUTE_INHERITED || kind == DEP_ROUTE_UNSEEN ||
+          (kind == DEP_ROUTE_DYNAMIC && input->routes[i].value == UINT32_MAX))
+        result |= DEP_STATUS_MAY_FAIL;
+    }
+  }
+  return result;
+}
+
+static SHELL_NONNULL(1, 2, 3, 4, 5, 6, 7) void dep_read_input_masks(
+    const dep_read_plan_t *plan, const dep_route_state_t *state,
+    const dep_route_journal_t *journal, const dep_owner_routes_t *baseline,
+    uint64_t *present, uint64_t *readable, uint64_t *errors) {
+  *present = *readable = *errors = 0;
+  for (uint32_t selection = 0; selection <= plan->count; selection++) {
+    if (selection) {
+      const dep_read_word_t *word = &plan->words[selection - 1];
+      if (!word->may_fd)
+        continue;
+      if (word->parameter.value == SHELL_DEP_FD_NAMED) {
+        dep_route_set_t argument = dep_fd_raw_fact(
+            state, journal, baseline, dep_fd_numeric(selection - 1),
+            DEP_FD_ACCESS_READ_ARGUMENT);
+        if (argument.count != 1 ||
+            (argument.routes[0].kind != DEP_ROUTE_ALIAS &&
+             argument.routes[0].kind != DEP_ROUTE_ABSENT &&
+             argument.routes[0].kind != DEP_ROUTE_UNAVAILABLE))
+          continue;
+      }
+    }
+    uint64_t bit = UINT64_C(1) << selection;
+    dep_fd_ref_t fd =
+        dep_read_descriptor(plan, state, selection, journal, baseline, NULL);
+    dep_route_set_t binding =
+        dep_fd_raw_fact(state, journal, baseline, fd, DEP_FD_ACCESS_BINDING);
+    if (dep_read_binding_outcomes(&binding) & DEP_STATUS_MAY_SUCCEED)
+      *present |= bit;
+    dep_route_set_t input =
+        dep_fd_fact(state, journal, baseline, fd, DEP_FD_ACCESS_READ);
+    unsigned access = dep_read_access_outcomes(&input);
+    if (access & DEP_STATUS_MAY_SUCCEED)
+      *readable |= bit;
+    if (access & DEP_STATUS_MAY_FAIL)
+      *errors |= bit;
+  }
+}
+
+static SHELL_NONNULL(1, 2, 3,
+                     4) bool dep_fd_merge(dep_route_state_t *destination,
+                                          const dep_route_state_t *source,
+                                          dep_route_journal_t *journal,
+                                          const dep_owner_routes_t *baseline);
+
+/* One completed setup version, refined by an actual descriptor observation.
+ * possible=false discards an infeasible alternative. */
+static SHELL_NONNULL(1, 2, 3, 6) bool dep_read_observe_binding(
+    dep_route_state_t *state, dep_route_journal_t *journal,
+    const dep_owner_routes_t *baseline, uint32_t fd, bool free, bool *possible);
+
+static SHELL_NONNULL(1, 3, 4, 5) bool dep_read_state_add(
+    dep_route_state_t *destination, bool ready, const dep_route_state_t *state,
+    dep_route_journal_t *journal, const dep_owner_routes_t *baseline) {
+  if (ready)
+    return dep_fd_merge(destination, state, journal, baseline);
+  *destination = *state;
+  return true;
+}
+
+/* state is one imported entry or its root observation anchor. The sparse map
+ * contains only predicate operands, not executable bindings or map IDs. Its
+ * one PRIVATE_ENTRY holder is the only additional journal-root reference. */
+static SHELL_NONNULL(1, 2, 3) bool dep_observation_remember(
+    dep_route_state_t *state, dep_route_journal_t *journal,
+    const dep_owner_routes_t *baseline, dep_fd_ref_t fd, dep_fd_access_t access,
+    dep_route_set_t fact) {
+  dep_route_set_t recorded = dep_fd_raw_fact(
+      state, journal, baseline, dep_fd_numeric(DEP_OBSERVATION_ROOT_EVENT + 1),
+      DEP_FD_ACCESS_PRIVATE_ENTRY);
+  dep_route_state_t observations =
+      dep_route_state_single(recorded.count ? recorded.routes[0].value : 0);
+  if (!dep_route_state_store_access(&observations, journal, fd, access, fact))
+    return false;
+  dep_route_set_set(&recorded,
+                    (dep_fd_route_t){DEP_ROUTE_INHERITED, observations.root});
+  return dep_route_state_store_access(
+      state, journal, dep_fd_numeric(DEP_OBSERVATION_ROOT_EVENT + 1),
+      DEP_FD_ACCESS_PRIVATE_ENTRY, recorded);
+}
+
+/* Require one named dependency of a selected immutable execution version.
+ * Private-entry links lead back to the imported entry, before local writes or
+ * pipes. Its sparse map memoizes each requested role, including unknown facts
+ * as explicit empty entries. No child scans the root's read-name inventory.
+ * Argument capture calls this before option validation, so early failures
+ * retain their entry dependencies as well as successful descriptor queries. */
+static SHELL_NONNULL(1, 2, 3) bool dep_observation_require(
+    dep_route_state_t *state, dep_route_journal_t *journal,
+    const dep_owner_routes_t *baseline, dep_fd_ref_t fd, unsigned roles) {
+  dep_route_set_t scope = dep_fd_raw_fact(state, journal, baseline,
+                                          dep_fd_numeric(SHELL_DEP_FD_NONE),
+                                          DEP_FD_ACCESS_PRIVATE_SCOPE);
+  if (!scope.count)
+    return true;
+  if (scope.routes[0].value != UINT32_MAX) {
+    dep_fd_ref_t event = dep_fd_numeric(scope.routes[0].value - 1);
+    dep_route_set_t origin = dep_fd_raw_fact(state, journal, baseline, event,
+                                             DEP_FD_ACCESS_PRIVATE_ENTRY);
+    dep_route_state_t parent = dep_route_state_single(origin.routes[0].value);
+    if (!dep_observation_require(&parent, journal, baseline, fd, roles))
+      return false;
+    if (parent.root == origin.routes[0].value)
+      return true;
+    origin.routes[0].value = parent.root;
+    return dep_route_state_store_access(state, journal, event,
+                                        DEP_FD_ACCESS_PRIVATE_ENTRY, origin);
+  }
+  const dep_fd_access_t accesses[] = {
+      DEP_FD_ACCESS_READ_ARGUMENT, DEP_FD_ACCESS_SELECTOR, DEP_FD_ACCESS_READ};
+  const unsigned requests[] = {DEP_READ_OBSERVE_VALUE,
+                               DEP_READ_OBSERVE_IDENTITY,
+                               DEP_READ_OBSERVE_ACCESS};
+  for (unsigned i = 0; i < 3; i++) {
+    if (!(roles & requests[i]))
+      continue;
+    dep_route_set_t recorded =
+        dep_fd_raw_fact(state, journal, baseline,
+                        dep_fd_numeric(DEP_OBSERVATION_ROOT_EVENT + 1),
+                        DEP_FD_ACCESS_PRIVATE_ENTRY);
+    dep_route_state_t memo =
+        dep_route_state_single(recorded.count ? recorded.routes[0].value : 0);
+    if (dep_route_state_change(&memo, journal, fd, accesses[i]))
+      continue;
+    DEP_METADATA_WORK(SHELLSPLIT_TEST_WORK_READ_OBSERVATIONS);
+    dep_route_set_t binding =
+        dep_fd_raw_fact(state, journal, baseline, fd, DEP_FD_ACCESS_BINDING);
+    dep_route_set_t fact = {.ready = true};
+    if (requests[i] == DEP_READ_OBSERVE_VALUE) {
+      const dep_read_observation_t *use =
+          dep_read_observation_find(&journal->read_observations, fd);
+      unsigned value = dep_read_value_class(&binding);
+      if (use && use->variable &&
+          (dep_variable_properties(use->variable, state, journal, baseline) &
+           SHELL_VARIABLE_UNSTABLE))
+        value = 3;
+      if (value != 3)
+        dep_route_set_set(&fact, (dep_fd_route_t){DEP_ROUTE_INHERITED, value});
+    } else if (requests[i] == DEP_READ_OBSERVE_IDENTITY && binding.count == 1 &&
+               binding.routes[0].kind == DEP_ROUTE_ALIAS) {
+      uint32_t slot = binding.routes[0].value;
+      if (slot <= SHELL_DEP_FD_MAX ||
+          journal->allocations[slot - SHELL_DEP_FD_MAX - 1].allocation)
+        dep_route_set_set(&fact, (dep_fd_route_t){DEP_ROUTE_ALIAS, slot});
+    } else if (requests[i] == DEP_READ_OBSERVE_ACCESS) {
+      dep_route_set_t input =
+          dep_fd_fact(state, journal, baseline, fd, DEP_FD_ACCESS_READ);
+      unsigned access = dep_read_access_outcomes(&input);
+      if (access != DEP_STATUS_EITHER)
+        dep_route_set_set(&fact, (dep_fd_route_t){DEP_ROUTE_INHERITED, access});
+    }
+    if (!dep_observation_remember(state, journal, baseline, fd, accesses[i],
+                                  fact))
+      return false;
+  }
+  return true;
+}
+
+/* Forget completed operands before preparing another decision. Only guards
+ * needed by tracked process descriptors keep the owner's pipe lifetime. Walking
+ * the two ancestry paths visits exited scopes, never a source prefix or all
+ * guards. */
+static SHELL_NONNULL(1, 2, 3) bool dep_observation_leave(
+    dep_route_state_t *state, dep_route_journal_t *journal,
+    const dep_owner_routes_t *baseline, const dep_process_guard_t *previous,
+    const dep_process_guard_t *next) {
+  const dep_process_guard_t *common = previous, *other = next;
+  while (common != other) {
+    if (common && (!other || common->depth >= other->depth))
+      common = common->parent;
+    else
+      other = other->parent;
+  }
+  if (previous == common)
+    return true;
+  dep_route_state_t result = {0};
+  bool ready = false;
+  dep_route_iterator_t versions = dep_route_iterator(state);
+  uint32_t root;
+  while (dep_route_next(&versions, journal, &root)) {
+    dep_route_state_t one = dep_route_state_single(root);
+    one.correlated = state->correlated;
+    for (const dep_process_guard_t *guard = previous; guard != common;
+         guard = guard->parent) {
+      if (guard->observed)
+        continue;
+      uint32_t key = dep_process_guard_key(journal, guard, false);
+      if (key != SHELL_DEP_FD_NONE &&
+          !dep_route_state_store_access(&one, journal, dep_fd_numeric(key),
+                                        DEP_FD_ACCESS_PROCESS_SLOT,
+                                        (dep_route_set_t){.ready = true}))
+        return false;
+    }
+    if (!ready)
+      result = one;
+    else if (!dep_fd_merge_versions(&result, &one, journal, baseline))
+      return false;
+    ready = true;
+  }
+  *state = result;
+  return true;
+}
+
+/* Predicates describe input identity, not a child-local descriptor mutation.
+ * Apply them while that expansion's parent version is still current. */
+static SHELL_NONNULL(1, 2, 3, 4) bool dep_observation_apply(
+    dep_route_state_t *state, dep_route_journal_t *journal,
+    const dep_owner_routes_t *baseline,
+    const dep_observation_program_t *program, uint32_t event) {
+  const dep_observation_event_t *operation = &program->events[event - 1];
+  if (!dep_observation_leave(state, journal, baseline,
+                             operation->previous_guard, operation->guard))
+    return false;
+  if (!operation->clauses)
+    return true;
+  if (operation->guard &&
+      !dep_process_guard_prepare(state, journal, baseline, operation->guard))
+    return false;
+  dep_route_state_t result = {0};
+  bool ready = false;
+  dep_route_iterator_t versions = dep_route_iterator(state);
+  uint32_t root;
+  while (dep_route_next(&versions, journal, &root)) {
+    dep_route_state_t entry = dep_route_state_single(root);
+    bool executes = !operation->guard ||
+                    dep_fd_raw_fact(&entry, journal, baseline,
+                                    dep_fd_numeric(dep_process_guard_key(
+                                        journal, operation->guard, false)),
+                                    DEP_FD_ACCESS_PROCESS_SLOT)
+                        .routes[0]
+                        .value;
+    if (operation->conditional || !executes) {
+      dep_route_state_t skipped = entry;
+      dep_route_set_t status = dep_fd_raw_fact(
+          &skipped, journal, baseline, dep_fd_numeric(operation->key),
+          DEP_FD_ACCESS_SUBSTITUTION_STATUS);
+      if (!status.count) {
+        dep_route_set_set(
+            &status,
+            (dep_fd_route_t){DEP_ROUTE_INHERITED, operation->incoming_status});
+        if (!dep_route_state_store_access(
+                &skipped, journal, dep_fd_numeric(operation->key),
+                DEP_FD_ACCESS_SUBSTITUTION_STATUS, status))
+          return false;
+      }
+      if (!dep_read_state_add(&result, ready, &skipped, journal, baseline))
+        return false;
+      ready = true;
+    }
+    if (!executes)
+      continue;
+    for (uint32_t c = operation->clauses; c;
+         c = program->transfer.clauses[c - 1].next) {
+      const dep_observation_clause_t *clause =
+          &program->transfer.clauses[c - 1];
+      dep_route_state_t one = entry;
+      bool possible = true;
+      for (uint32_t condition = clause->conditions; condition && possible;
+           condition = program->transfer.conditions[condition - 1].next) {
+        const dep_observation_condition_t *test =
+            &program->transfer.conditions[condition - 1];
+        if (test->fd.value == SHELL_DEP_FD_NAMED &&
+            !dep_observation_require(&one, journal, baseline, test->fd,
+                                     test->kind == DEP_OBSERVATION_VALUE
+                                         ? DEP_READ_OBSERVE_VALUE
+                                         : DEP_READ_OBSERVE_IDENTITY |
+                                               DEP_READ_OBSERVE_ACCESS))
+          return false;
+        if (test->kind != DEP_OBSERVATION_BINDING) {
+          dep_route_set_t binding = dep_fd_raw_fact(
+              &one, journal, baseline, test->fd, DEP_FD_ACCESS_BINDING);
+          if (test->kind == DEP_OBSERVATION_VALUE)
+            possible = (dep_read_value_class(&binding) & test->value) != 0;
+          else if (test->kind == DEP_OBSERVATION_ACCESS) {
+            dep_route_set_t input = dep_fd_fact(&one, journal, baseline,
+                                                test->fd, DEP_FD_ACCESS_READ);
+            possible = (dep_read_access_outcomes(&input) & test->value) != 0;
+          } else if (binding.count == 1 &&
+                     binding.routes[0].kind == DEP_ROUTE_ALIAS) {
+            uint32_t slot = binding.routes[0].value;
+            if (slot <= SHELL_DEP_FD_MAX)
+              possible = !test->allocation && slot == test->value;
+            else {
+              const char *allocation =
+                  journal->allocations[slot - SHELL_DEP_FD_MAX - 1].allocation;
+              /* An unclassified identity adds no proof either way. */
+              possible = !allocation || allocation == test->allocation;
+            }
+          } else
+            possible = dep_read_value_class(&binding) == 3;
+          continue;
+        }
+        uint32_t fd = test->fd.value;
+        if (fd == SHELL_DEP_FD_NAMED) {
+          dep_route_set_t binding = dep_fd_raw_fact(
+              &one, journal, baseline, test->fd, DEP_FD_ACCESS_BINDING);
+          if (binding.count != 1 || binding.routes[0].kind != DEP_ROUTE_ALIAS) {
+            possible = false;
+            continue;
+          }
+          fd = binding.routes[0].value;
+        }
+        if (!dep_read_observe_binding(&one, journal, baseline, fd,
+                                      test->value != 0, &possible))
+          return false;
+      }
+      if (!possible)
+        continue;
+      dep_route_set_t status = {0};
+      dep_route_set_set(&status,
+                        (dep_fd_route_t){DEP_ROUTE_INHERITED, clause->status});
+      if (!dep_route_state_store_access(
+              &one, journal, dep_fd_numeric(operation->key),
+              DEP_FD_ACCESS_SUBSTITUTION_STATUS, status) ||
+          !dep_read_state_add(&result, ready, &one, journal, baseline))
+        return false;
+      ready = true;
+    }
+  }
+  if (!ready)
+    return false;
+  *state = result;
+  return true;
+}
+
+/* Exact immutable conjunction/list interning. Keys include every semantic
+ * field, including allocation provenance; status alone is never equivalence.
+ * AVL indexes bound lookup independently of imported path/record count. */
+static int dep_observation_condition_compare(const void *context,
+                                             uint32_t index, const void *key) {
+  const dep_observation_transfer_t *transfer = context;
+  const dep_observation_condition_t *a = &transfer->conditions[index];
+  const dep_observation_condition_t *b = key;
+  int fd = dep_fd_ref_compare(a->fd, b->fd);
+  if (fd)
+    return fd;
+  if (a->kind != b->kind)
+    return a->kind < b->kind ? -1 : 1;
+  if (a->value != b->value)
+    return a->value < b->value ? -1 : 1;
+  if (a->allocation != b->allocation)
+    return (uintptr_t)a->allocation < (uintptr_t)b->allocation ? -1 : 1;
+  return a->next < b->next ? -1 : a->next != b->next;
+}
+
+static SHELL_NONNULL(1, 2) uint32_t
+    dep_observation_condition_intern(dep_observation_transfer_t *transfer,
+                                     dep_observation_index_t *index,
+                                     dep_observation_condition_t condition) {
+  uint32_t candidate = transfer->condition_count + 1, match = 0;
+  index->condition_root =
+      dep_index_insert(index->condition_index, index->condition_root, candidate,
+                       DEP_MAX_FD_IMPORTS, dep_observation_condition_compare,
+                       transfer, &condition, &match);
+  if (match == candidate)
+    transfer->conditions[transfer->condition_count++] = condition;
+  return match;
+}
+
+static int dep_observation_clause_compare(const void *context, uint32_t index,
+                                          const void *key) {
+  const dep_observation_transfer_t *transfer = context;
+  const dep_observation_clause_t *a = &transfer->clauses[index];
+  const dep_observation_clause_t *b = key;
+  if (a->conditions != b->conditions)
+    return a->conditions < b->conditions ? -1 : 1;
+  if (a->status != b->status)
+    return a->status < b->status ? -1 : 1;
+  return a->next < b->next ? -1 : a->next != b->next;
+}
+
+static SHELL_NONNULL(1, 2) uint32_t
+    dep_observation_clause_intern(dep_observation_transfer_t *transfer,
+                                  dep_observation_index_t *index,
+                                  dep_observation_clause_t clause) {
+  uint32_t candidate = transfer->clause_count + 1, match = 0;
+  index->clause_root =
+      dep_index_insert(index->clause_index, index->clause_root, candidate,
+                       SHELL_DEP_MAX_NODES * 5, dep_observation_clause_compare,
+                       transfer, &clause, &match);
+  if (match == candidate)
+    transfer->clauses[transfer->clause_count++] = clause;
+  return match;
+}
+
+/* Only requested predicates are exported. Empty entries memoize unknown facts
+ * without constraining an outcome. Child-local IDs are converted before the
+ * child journal dies; no inherited table or global name inventory is walked. */
+static SHELL_NONNULL(1, 2, 3, 6) bool dep_observation_export_conditions(
+    dep_observation_transfer_t *transfer, dep_observation_clause_t *clause,
+    const dep_route_journal_t *journal, uint32_t root, uint8_t capture_mask,
+    dep_observation_index_t *index) {
+  if (!root)
+    return true;
+  const dep_route_change_t *node = &journal->entries[root - 1];
+  if (!dep_observation_export_conditions(transfer, clause, journal, node->left,
+                                         capture_mask, index))
+    return false;
+  dep_fd_ref_t fd = dep_route_change_fd(journal, node);
+  if (fd.value < 3 && (capture_mask & (1u << fd.value)))
+    return dep_observation_export_conditions(transfer, clause, journal,
+                                             node->right, capture_mask, index);
+  const dep_route_set_t *fact = &journal->snapshots[node->snapshot - 1];
+  if (!fact->count)
+    return dep_observation_export_conditions(transfer, clause, journal,
+                                             node->right, capture_mask, index);
+  dep_fd_access_t access = dep_route_change_access(node);
+  if (access == DEP_FD_ACCESS_NAMED_BINDINGS)
+    return dep_observation_export_conditions(transfer, clause, journal,
+                                             fact->routes[0].value,
+                                             capture_mask, index) &&
+           dep_observation_export_conditions(transfer, clause, journal,
+                                             node->right, capture_mask, index);
+  dep_observation_condition_t condition = {
+      .fd = fd, .next = clause->conditions, .value = fact->routes[0].value};
+  if (access == DEP_FD_ACCESS_READ_ARGUMENT)
+    condition.kind = DEP_OBSERVATION_VALUE;
+  else if (access == DEP_FD_ACCESS_READ)
+    condition.kind = DEP_OBSERVATION_ACCESS;
+  else if (access == DEP_FD_ACCESS_SELECTOR) {
+    condition.kind = DEP_OBSERVATION_IDENTITY;
+    if (condition.value > SHELL_DEP_FD_MAX) {
+      condition.allocation =
+          journal->allocations[condition.value - SHELL_DEP_FD_MAX - 1]
+              .allocation;
+      condition.value = 0;
+    }
+  }
+  if (fd.value > SHELL_DEP_FD_MAX && fd.value != SHELL_DEP_FD_NAMED) {
+    const dep_allocation_t *allocation =
+        &journal->allocations[fd.value - SHELL_DEP_FD_MAX - 1];
+    /* An anonymous imported private end has no stable caller-side spelling.
+     * It contributes no additional public-number predicate. */
+    if (!allocation->name)
+      return dep_observation_export_conditions(
+          transfer, clause, journal, node->right, capture_mask, index);
+    fd = (dep_fd_ref_t){.name = allocation->name,
+                        .name_len = allocation->name_length,
+                        .value = SHELL_DEP_FD_NAMED};
+    condition.fd = fd;
+  }
+  uint32_t condition_id =
+      dep_observation_condition_intern(transfer, index, condition);
+  if (!condition_id)
+    return false;
+  clause->conditions = condition_id;
+  return dep_observation_export_conditions(transfer, clause, journal,
+                                           node->right, capture_mask, index);
+}
+
+static SHELL_NONNULL(1, 2) bool dep_observation_export(
+    dep_route_workspace_t *workspace, const dep_owner_routes_t *baseline,
+    uint8_t capture_mask) {
+  dep_observation_transfer_t *transfer = &workspace->import_join.observations;
+  transfer->condition_count = transfer->clause_count = 0;
+  dep_observation_index_t *index = &workspace->import_join.observation_index;
+  index->condition_root = index->clause_root = 0;
+  dep_route_journal_t *journal = &workspace->route_journal;
+  const dep_fd_flow_t *flow = &workspace->fd_stream.scope[0];
+  if (!journal->read_observations.active) {
+    for (unsigned outcome = 0; outcome < 5; outcome++)
+      if (flow->mask & (1u << outcome))
+        transfer->clauses[transfer->clause_count++] =
+            (dep_observation_clause_t){
+                .status = dep_substitution_status((uint8_t)(1u << outcome))};
+    return true;
+  }
+  for (unsigned outcome = 0; outcome < 5; outcome++) {
+    if (!(flow->mask & (1u << outcome)))
+      continue;
+    dep_route_iterator_t versions = dep_route_iterator(&flow->state[outcome]);
+    uint32_t root;
+    while (dep_route_next(&versions, journal, &root)) {
+      dep_route_state_t one = dep_route_state_single(root);
+      dep_route_set_t origin = dep_fd_raw_fact(
+          &one, journal, baseline, dep_fd_numeric(DEP_OBSERVATION_ROOT_EVENT),
+          DEP_FD_ACCESS_PRIVATE_ENTRY);
+      one = dep_route_state_single(origin.routes[0].value);
+      dep_route_set_t observed =
+          dep_fd_raw_fact(&one, journal, baseline,
+                          dep_fd_numeric(DEP_OBSERVATION_ROOT_EVENT + 1),
+                          DEP_FD_ACCESS_PRIVATE_ENTRY);
+      dep_observation_clause_t clause = {
+          .status = dep_substitution_status((uint8_t)(1u << outcome))};
+      if (observed.count && !dep_observation_export_conditions(
+                                transfer, &clause, journal,
+                                observed.routes[0].value, capture_mask, index))
+        return false;
+      if (!dep_observation_clause_intern(transfer, index, clause))
+        return false;
+    }
+  }
+  return true;
+}
+
+/* Keep the write signature on each immutable version: two paths with the
+ * same status/selector can still assign different targets (polling writes
+ * none, rejected targets keep only their earlier prefix). Unequal effect
+ * facts prevent premature factoring. */
+static SHELL_NONNULL(1, 2, 3) bool dep_read_note_write(
+    dep_route_state_t *state, dep_route_journal_t *journal,
+    const dep_owner_routes_t *baseline, uint32_t targets, bool reply) {
+  dep_route_state_t result = {0};
+  dep_route_iterator_t paths = dep_route_iterator(state);
+  uint32_t root;
+  bool ready = false;
+  while (dep_route_next(&paths, journal, &root)) {
+    dep_route_state_t one = dep_route_state_single(root);
+    dep_route_set_t effects = dep_fd_raw_fact(&one, journal, baseline,
+                                              dep_fd_numeric(SHELL_DEP_FD_NONE),
+                                              DEP_FD_ACCESS_EFFECT_STATE);
+    if (!effects.count) {
+      effects.count = 2;
+      effects.routes[0] = effects.routes[1] =
+          (dep_fd_route_t){DEP_ROUTE_INHERITED, 0};
+    }
+    effects.routes[0].value |= targets;
+    effects.routes[1].value |= reply;
+    if (!dep_route_state_store_access(&one, journal,
+                                      dep_fd_numeric(SHELL_DEP_FD_NONE),
+                                      DEP_FD_ACCESS_EFFECT_STATE, effects) ||
+        !dep_read_state_add(&result, ready, &one, journal, baseline))
+      return false;
+    ready = true;
+  }
+  *state = result;
+  return true;
+}
+
+static SHELL_NONNULL(1, 5, 6, 7) bool dep_read_frontier_add(
+    dep_read_frontier_t *frontier, unsigned mode, unsigned phase, uint64_t bits,
+    const dep_route_state_t *state, dep_route_journal_t *journal,
+    const dep_owner_routes_t *baseline) {
+  for (; bits; bits &= bits - 1) {
+    unsigned selection = (unsigned)__builtin_ctzll(bits);
+    uint64_t bit = UINT64_C(1) << selection;
+    if (!dep_read_state_add(&frontier->states[mode][phase][selection],
+                            (frontier->ready[mode][phase] & bit) != 0, state,
+                            journal, baseline))
+      return false;
+    frontier->ready[mode][phase] |= bit;
+  }
+  return true;
+}
+
+static SHELL_NONNULL(1, 3, 4, 5) bool dep_read_outcome_add(
+    dep_read_versions_t *observations, unsigned outcome,
+    const dep_route_state_t *state, dep_route_journal_t *journal,
+    const dep_owner_routes_t *baseline) {
+  if (!dep_read_state_add(&observations->outcomes[outcome],
+                          (observations->mask & (1u << outcome)) != 0, state,
+                          journal, baseline))
+    return false;
+  observations->mask |= (uint8_t)(1u << outcome);
+  return true;
+}
+
+/* Only the selected descriptor is queried at each live frontier cell; the
+ * prepared word stream and the entire descriptor table are never rescanned. */
+static SHELL_NONNULL(1, 2, 3, 4, 6, 7, 8) void dep_read_selection_masks(
+    const dep_read_plan_t *plan, const dep_route_state_t *state,
+    const dep_route_journal_t *journal, const dep_owner_routes_t *baseline,
+    uint32_t selection, uint64_t *present, uint64_t *readable,
+    uint64_t *errors) {
+  uint64_t bit = UINT64_C(1) << selection;
+  dep_fd_ref_t fd =
+      dep_read_descriptor(plan, state, selection, journal, baseline, NULL);
+  dep_route_set_t binding =
+      dep_fd_raw_fact(state, journal, baseline, fd, DEP_FD_ACCESS_BINDING);
+  dep_route_set_t input =
+      dep_fd_fact(state, journal, baseline, fd, DEP_FD_ACCESS_READ);
+  unsigned access = dep_read_access_outcomes(&input);
+  *present =
+      (dep_read_binding_outcomes(&binding) & DEP_STATUS_MAY_SUCCEED) ? bit : 0;
+  *readable = (access & DEP_STATUS_MAY_SUCCEED) ? bit : 0;
+  *errors = (access & DEP_STATUS_MAY_FAIL) ? bit : 0;
+}
+
+static SHELL_NONNULL(1, 3, 4, 5) bool dep_read_fail(
+    dep_read_result_t *result, bool assigned, const dep_route_state_t *state,
+    dep_route_journal_t *journal, const dep_owner_routes_t *baseline,
+    dep_read_versions_t *observations) {
+  if (assigned)
+    result->assigned_failure = true;
+  else
+    result->unassigned_failure = true;
+  result->status |= DEP_STATUS_MAY_FAIL;
+  return !observations ||
+         dep_read_outcome_add(observations,
+                              assigned ? DEP_READ_ASSIGNED_FAILURE
+                                       : DEP_READ_UNASSIGNED_FAILURE,
+                              state, journal, baseline);
+}
+
+/* Complete a target/option path once, with its own assignment prefix. A target
+ * rejection is terminal: carrying all earlier stopping points through every
+ * remaining word would repeatedly query and merge an ever-growing path set.
+ * observations is optional for the nonmutating role/status query. */
+static SHELL_NONNULL(1, 2, 3, 4) bool dep_read_complete(
+    dep_read_result_t *result, dep_route_state_t *state,
+    dep_route_journal_t *journal, const dep_owner_routes_t *baseline,
+    unsigned mode, unsigned phase, uint64_t bit, uint64_t present,
+    uint64_t readable, uint64_t errors, dep_read_versions_t *observations) {
+  bool finished = phase == DEP_READ_OPTIONS || phase == DEP_READ_POSITIONAL ||
+                  phase == DEP_READ_TARGETS ||
+                  phase == DEP_READ_STOPPED_TARGETS;
+  if (!finished)
+    return dep_read_fail(result, false, state, journal, baseline, observations);
+  bool good = phase != DEP_READ_STOPPED_TARGETS;
+  bool success =
+      (mode & 2u) ? (bit & present) != 0 : good && (bit & readable) != 0;
+  bool default_target =
+      !(mode & 2u) &&
+      (phase == DEP_READ_OPTIONS || phase == DEP_READ_POSITIONAL) &&
+      ((mode & 1u) || (bit & readable));
+  if (observations && default_target &&
+      !dep_read_note_write(state, journal, baseline, 0, true))
+    return false;
+  if (success) {
+    result->status |= DEP_STATUS_MAY_SUCCEED;
+    if (observations && !dep_read_outcome_add(observations, DEP_READ_SUCCESS,
+                                              state, journal, baseline))
+      return false;
+  }
+  if (mode & 2u) {
+    if (!dep_read_fail(result, false, state, journal, baseline, observations))
+      return false;
+  } else {
+    if ((((mode & 1u) ? (bit & errors) != 0 : (bit & readable) != 0) ||
+         (!good && ((mode & 1u) || (bit & readable)))) &&
+        !dep_read_fail(result, true, state, journal, baseline, observations))
+      return false;
+    if (!(mode & 1u) && (bit & errors) &&
+        !dep_read_fail(result, false, state, journal, baseline, observations))
+      return false;
+  }
+  result->default_target |= default_target;
+  if (!mode && (bit & readable)) {
+    result->input |= bit;
+    if (observations) {
+      unsigned selection = (unsigned)__builtin_ctzll(bit);
+      if (!dep_read_state_add(&observations->inputs[selection],
+                              (observations->input_mask & bit) != 0, state,
+                              journal, baseline))
+        return false;
+      observations->input_mask |= bit;
+    }
+  }
+  return true;
+}
+
+/* Argument facts are captured at expansion, before redirect setup. Both role
+ * evaluation and mutation publication use these same per-version facts. */
+static SHELL_NONNULL(1, 3, 4, 5, 6, 7) dep_route_set_t
+    dep_read_argument(const dep_read_word_t *word, uint32_t index,
+                      const dep_route_state_t *state,
+                      const dep_route_journal_t *journal,
+                      const dep_owner_routes_t *baseline, bool *empty,
+                      bool *positive) {
+  dep_route_set_t argument = {0};
+  *empty = *positive = false;
+  if (word->capture && word->parameter.value == SHELL_DEP_FD_NAMED) {
+    argument = dep_fd_raw_fact(state, journal, baseline, dep_fd_numeric(index),
+                               DEP_FD_ACCESS_READ_ARGUMENT);
+    *empty = *positive = argument.count != 0;
+    for (uint32_t a = 0; a < argument.count; a++) {
+      dep_route_kind_t kind = argument.routes[a].kind;
+      *empty &= kind == DEP_ROUTE_ABSENT || kind == DEP_ROUTE_UNAVAILABLE;
+      *positive &= kind == DEP_ROUTE_ALIAS || kind == DEP_ROUTE_INHERITED ||
+                   kind == DEP_ROUTE_CLOSED;
+    }
+  }
+  return argument;
+}
+
+static SHELL_NONNULL(1, 2, 3, 4) shell_builtin_variable_t
+    dep_read_target(const dep_read_word_t *word, const dep_route_state_t *state,
+                    const dep_route_journal_t *journal,
+                    const dep_owner_routes_t *baseline, bool empty,
+                    bool positive) {
+  if (empty && word->empty_known) {
+    if (word->invalid_empty_target ||
+        (!word->parameter_prefix && !word->parameter_suffix))
+      return SHELL_BUILTIN_VARIABLE_INVALID;
+    return word->empty_effect.variable
+               ? dep_variable_classification(word->empty_effect.variable, state,
+                                             journal, baseline)
+               : SHELL_BUILTIN_VARIABLE_STATIC;
+  }
+  if (word->invalid_target || (positive && !word->parameter_prefix))
+    return SHELL_BUILTIN_VARIABLE_INVALID;
+  return word->effect.variable
+             ? dep_variable_classification(word->effect.variable, state,
+                                           journal, baseline)
+             : word->variable;
+}
+
+/* The bounded option frontier tracks the selected descriptor together with
+ * zero-character and polling modes. Words are preclassified once; no source
+ * or descriptor table is rescanned for each alternative. observations and
+ * frontier are NULL for a nonmutating role/status query. Otherwise frontier
+ * provides two reusable workspace frontiers and observations receives the
+ * refined terminal/input versions. The caller pins those versions across any
+ * subsequent collection; only the frontier scratch can be reused immediately.
+ */
+static SHELL_NONNULL(1, 2, 3, 4) dep_read_result_t dep_read_evaluate(
+    const dep_read_plan_t *plan, const dep_route_state_t *state,
+    dep_route_journal_t *journal, const dep_owner_routes_t *baseline,
+    dep_read_versions_t *observations, dep_read_frontier_t *frontier) {
+  uint64_t phases[4][DEP_READ_PHASES] = {{1}};
+  dep_read_result_t result = {0};
+  if (observations) {
+    memset(frontier, 0, 2 * sizeof(*frontier));
+    *observations = (dep_read_versions_t){0};
+    frontier[0].states[0][DEP_READ_OPTIONS][0] = *state;
+    if (!dep_route_state_store_access(
+            &frontier[0].states[0][DEP_READ_OPTIONS][0], journal,
+            dep_fd_numeric(SHELL_DEP_FD_NONE), DEP_FD_ACCESS_EFFECT_STATE,
+            (dep_route_set_t){.ready = true}))
+      goto exhausted;
+  }
+#define READ_NEXT(m, p, bits)                                                  \
+  do {                                                                         \
+    next[(m)][(p)] |= (bits);                                                  \
+    if (observations &&                                                        \
+        !dep_read_frontier_add(&frontier[(i + 1) & 1u], (m), (p), (bits),      \
+                               &one, journal, baseline))                       \
+      goto exhausted;                                                          \
+  } while (0)
+#define READ_FAIL(assigned)                                                    \
+  do {                                                                         \
+    if (!dep_read_fail(&result, (assigned), &one, journal, baseline,           \
+                       observations))                                          \
+      goto exhausted;                                                          \
+  } while (0)
+#define READ_STOP()                                                            \
+  do {                                                                         \
+    if (!dep_read_complete(&result, &one, journal, baseline, mode,             \
+                           DEP_READ_STOPPED_TARGETS, choices, present,         \
+                           readable, errors, observations))                    \
+      goto exhausted;                                                          \
+  } while (0)
+
+  uint64_t present = UINT64_MAX, readable = UINT64_MAX, errors = 0;
+  if (!observations)
+    dep_read_input_masks(plan, state, journal, baseline, &present, &readable,
+                         &errors);
+  for (uint32_t i = 0; i < plan->count; i++) {
+    DEP_METADATA_WORK(SHELLSPLIT_TEST_WORK_READ_INPUT);
+    const dep_read_word_t *word = &plan->words[i];
+    bool named = word->parameter.value == SHELL_DEP_FD_NAMED;
+    bool empty = false, positive = false;
+    dep_route_set_t argument =
+        dep_read_argument(word, i, state, journal, baseline, &empty, &positive);
+    uint64_t next[4][DEP_READ_PHASES] = {{0}};
+    if (observations)
+      memset(&frontier[(i + 1) & 1u], 0, sizeof(frontier[0]));
+    for (unsigned mode = 0; mode < 4; mode++) {
+      for (unsigned phase = 0; phase < DEP_READ_PHASES; phase++) {
+        uint64_t pending = phases[mode][phase];
+        while (pending) {
+          DEP_METADATA_WORK(SHELLSPLIT_TEST_WORK_READ_INPUT);
+          unsigned selection = (unsigned)__builtin_ctzll(pending);
+          uint64_t choices = UINT64_C(1) << selection;
+          pending &= pending - 1;
+          dep_route_state_t one =
+              observations ? frontier[i & 1u].states[mode][phase][selection]
+                           : *state;
+          shell_builtin_variable_t variable =
+              dep_read_target(word, &one, journal, baseline, empty, positive);
+          bool writable = variable == SHELL_BUILTIN_VARIABLE_STATIC ||
+                          variable == SHELL_BUILTIN_VARIABLE_DYNAMIC;
+          if (observations)
+            dep_read_selection_masks(plan, &one, journal, baseline, selection,
+                                     &present, &readable, &errors);
+          if (phase == DEP_READ_TARGETS) {
+            bool elided = empty && word->can_disappear;
+            if (!elided && !(mode & 2u) &&
+                (choices & (mode & 1u ? UINT64_MAX : readable)) &&
+                variable == SHELL_BUILTIN_VARIABLE_ARITHMETIC) {
+              result.unsupported = true;
+              continue;
+            }
+            /* An unresolved later target can reject assignment after earlier
+             * writes. Fork before recording this target: the stopped version
+             * must retain exactly that earlier prefix, not an arbitrary-name
+             * write which would invalidate every visible descriptor binding.
+             * Polling never reaches target validation or assignment. */
+            if (!elided && !(mode & 2u) &&
+                variable == SHELL_BUILTIN_VARIABLE_DYNAMIC)
+              READ_STOP();
+            if (writable && !elided && !(mode & 2u) &&
+                (choices & (mode & 1u ? UINT64_MAX : readable))) {
+              result.targets |= UINT64_C(1) << i;
+              if (observations && !dep_read_note_write(&one, journal, baseline,
+                                                       UINT32_C(1) << i, false))
+                goto exhausted;
+            }
+            if (writable || elided)
+              READ_NEXT(mode, DEP_READ_TARGETS, choices);
+            else
+              READ_STOP();
+            continue;
+          }
+          if (empty && word->can_disappear) {
+            READ_NEXT(mode, phase, choices);
+            continue;
+          }
+          bool option = phase == DEP_READ_OPTIONS;
+          /* Selector bytes are capabilities only on an actual option path.
+           * Pending prompt/numeric operands use this same prepared word as
+           * data. Earlier -u errors have already terminated their paths. */
+          if (option && word->unsupported_option) {
+            result.unsupported = true;
+            continue;
+          }
+          if (option && word->dynamic && !word->option &&
+              !word->parameter_prefix &&
+              !(empty && word->empty_known && !word->invalid_empty_target &&
+                (word->parameter_prefix || word->parameter_suffix))) {
+            /* Source inspection deliberately deferred this competing option /
+             * FD interpretation. Known allocation digits are an invalid first
+             * target; unknown values could instead enable unsupported options.
+             */
+            if (!empty && !positive)
+              result.unsupported = true;
+            else if (mode & 2u)
+              READ_STOP();
+            else
+              READ_FAIL(false);
+            continue;
+          }
+          if (phase == DEP_READ_POSITIONAL ||
+              (option && (!word->option || word->position < 2))) {
+            /* Attribute-dependent arithmetic is unsupported only when this
+             * execution reaches an actual assignment. Earlier argument/FD
+             * failures and polling never evaluate the target's contents. */
+            if (!(mode & 2u) &&
+                (choices & (mode & 1u ? UINT64_MAX : readable)) &&
+                variable == SHELL_BUILTIN_VARIABLE_ARITHMETIC) {
+              result.unsupported = true;
+              continue;
+            }
+            /* Bash's timeout-zero availability probe precedes target checks. */
+            if ((mode & 2u) || variable != SHELL_BUILTIN_VARIABLE_INVALID) {
+              if (!(mode & 2u) && variable == SHELL_BUILTIN_VARIABLE_DYNAMIC) {
+                /* An invalid first identifier fails before input; a readonly
+                 * one can fail after input. Neither alternative writes this
+                 * target. Keep both separate from the writable version. */
+                READ_FAIL(false);
+                READ_STOP();
+              }
+              if (writable && !(mode & 2u) &&
+                  (choices & (mode & 1u ? UINT64_MAX : readable))) {
+                result.targets |= UINT64_C(1) << i;
+                if (observations &&
+                    !dep_read_note_write(&one, journal, baseline,
+                                         UINT32_C(1) << i, false))
+                  goto exhausted;
+              }
+              if (writable)
+                READ_NEXT(mode, DEP_READ_TARGETS, choices);
+              else
+                READ_STOP();
+            } else
+              READ_FAIL(false);
+            continue;
+          }
+          if (option && !word->valid) {
+            if (word->end && word->position == 2)
+              READ_NEXT(mode, DEP_READ_POSITIONAL, choices);
+            else
+              READ_FAIL(false);
+            continue;
+          }
+          if (option && !word->operand_kind) {
+            READ_NEXT(mode, DEP_READ_OPTIONS, choices);
+            continue;
+          }
+          unsigned operand =
+              option ? dep_read_operand_phase(word->operand_kind) : phase;
+          bool nonempty = word->attached_static || positive;
+          if (option && !nonempty)
+            READ_NEXT(mode, operand, choices);
+          if (option && !word->attached_static && !word->attached_dynamic)
+            continue;
+          unsigned value =
+              option ? (empty ? word->empty_payload_value : word->payload_value)
+              : operand == DEP_READ_TIMEOUT
+                  ? (empty ? word->empty_timeout_value : word->timeout_value)
+                  : (empty ? word->empty_number_value : word->number_value);
+          /* Preparation distinguishes whole-word and attached numeric
+           * templates. Captured allocation digits refine a signed scalar,
+           * including integer leading zeroes, not arbitrary concatenation
+           * (which can wrap or round). */
+          uint8_t scalar = option                        ? word->payload_scalar
+                           : operand == DEP_READ_TIMEOUT ? word->timeout_scalar
+                                                         : word->number_scalar;
+          if (value == SHELL_READ_VALUE_UNKNOWN && named && scalar && positive)
+            value = scalar == 2 ? SHELL_READ_VALUE_INVALID
+                                : SHELL_READ_VALUE_NONZERO;
+          if (option && empty && !word->attached_static)
+            continue;
+          if (operand == DEP_READ_DATA) {
+            READ_NEXT(mode, DEP_READ_OPTIONS, choices);
+          } else if (value == SHELL_READ_VALUE_INVALID) {
+            /* A whole option-looking word can be a pending numeric operand.
+             * Its invalid prefix fails before any dynamic FD lookup, even
+             * when its attached payload is a tracked parameter. */
+            READ_FAIL(false);
+          } else if (operand == DEP_READ_FD) {
+            bool exact_fd = named && scalar == 1;
+            if (word->dynamic && !empty &&
+                (!exact_fd || argument.count != 1 ||
+                 argument.routes[0].kind == DEP_ROUTE_DYNAMIC ||
+                 argument.routes[0].kind == DEP_ROUTE_UNSEEN)) {
+              result.unsupported = true;
+              continue;
+            }
+            if (named && !empty) {
+              if (argument.routes[0].kind != DEP_ROUTE_ALIAS) {
+                READ_FAIL(false);
+                continue;
+              }
+            }
+            dep_fd_ref_t fd =
+                dep_read_descriptor(plan, &one, i + 1, journal, baseline, NULL);
+            {
+              dep_route_set_t binding = dep_fd_raw_fact(
+                  &one, journal, baseline, fd, DEP_FD_ACCESS_BINDING);
+              uint8_t outcomes = dep_read_binding_outcomes(&binding);
+              if (outcomes & DEP_STATUS_MAY_FAIL) {
+                dep_route_state_t live = one;
+                bool possible = true;
+                if (observations &&
+                    !dep_read_observe_binding(&one, journal, baseline, fd.value,
+                                              true, &possible))
+                  goto exhausted;
+                if (possible)
+                  READ_FAIL(false);
+                one = live;
+              }
+              if (!(outcomes & DEP_STATUS_MAY_SUCCEED))
+                continue;
+              if (observations) {
+                bool possible;
+                if (!dep_read_observe_binding(&one, journal, baseline, fd.value,
+                                              false, &possible))
+                  goto exhausted;
+                if (!possible)
+                  continue;
+              }
+            }
+            READ_NEXT(mode, DEP_READ_OPTIONS, UINT64_C(1) << (i + 1));
+          } else {
+            unsigned bit = operand == DEP_READ_TIMEOUT ? 2u : 1u;
+            if (value == SHELL_READ_VALUE_UNKNOWN) {
+              /* Unknown data can also be an invalid number. This failure
+               * precedes later options, FD validation and target writes. */
+              READ_FAIL(false);
+              READ_NEXT(mode | bit, DEP_READ_OPTIONS, choices);
+              READ_NEXT(mode & ~bit, DEP_READ_OPTIONS, choices);
+            } else
+              READ_NEXT(value == SHELL_READ_VALUE_ZERO ? mode | bit
+                                                       : mode & ~bit,
+                        DEP_READ_OPTIONS, choices);
+          }
+        }
+      }
+    }
+    memcpy(phases, next, sizeof(phases));
+  }
+  for (unsigned mode = 0; mode < 4; mode++)
+    for (unsigned phase = 0; phase < DEP_READ_PHASES; phase++)
+      for (uint64_t pending = phases[mode][phase]; pending;
+           pending &= pending - 1) {
+        unsigned selection = (unsigned)__builtin_ctzll(pending);
+        uint64_t bit = UINT64_C(1) << selection;
+        dep_route_state_t one =
+            observations
+                ? frontier[plan->count & 1u].states[mode][phase][selection]
+                : *state;
+        if (observations)
+          dep_read_selection_masks(plan, &one, journal, baseline, selection,
+                                   &present, &readable, &errors);
+        if (!dep_read_complete(&result, &one, journal, baseline, mode, phase,
+                               bit, present, readable, errors, observations))
+          goto exhausted;
+      }
+#undef READ_NEXT
+#undef READ_FAIL
+#undef READ_STOP
+  return result;
+exhausted:
+  result.exhausted = true;
+  return result;
 }
 
 static SHELL_NONNULL(1, 2, 3,
@@ -6066,8 +8403,9 @@ static SHELL_NONNULL(1, 2, 3, 4) bool dep_fd_physical_self(
     return true;
   if (op->target_fd != SHELL_DEP_FD_NAMED)
     return false;
-  dep_fd_ref_t source = {op->target_fd, op->target_fd_name,
-                         op->target_fd_name_len};
+  dep_fd_ref_t source = {.name = op->target_fd_name,
+                         .value = op->target_fd,
+                         .name_len = op->target_fd_name_len};
   dep_route_iterator_t iterator = dep_route_iterator(state);
   uint32_t root;
   while (dep_route_next(&iterator, journal, &root)) {
@@ -6129,8 +8467,9 @@ static SHELL_NONNULL(1, 2, 3, 4) bool dep_fd_source_closed_locally(
   uint32_t root;
   while (dep_route_next(&iterator, journal, &root)) {
     dep_route_state_t one = dep_route_state_single(root);
-    dep_fd_ref_t source = {op->target_fd, op->target_fd_name,
-                           op->target_fd_name_len};
+    dep_fd_ref_t source = {.name = op->target_fd_name,
+                           .value = op->target_fd,
+                           .name_len = op->target_fd_name_len};
     if (source.value == SHELL_DEP_FD_NAMED) {
       dep_route_set_t slots = dep_fd_raw_fact(&one, journal, baseline, source,
                                               DEP_FD_ACCESS_BINDING);
@@ -6203,14 +8542,24 @@ static bool dep_snapshot_install_pipeline(dep_owner_routes_t *routes,
   return true;
 }
 
+static SHELL_NONNULL(1, 2) bool dep_process_owned(
+    const dep_route_state_t *state, const dep_route_journal_t *journal,
+    dep_fd_ref_t fd);
+
 /* path is a retained execution-version index, below SHELL_DEP_MAX_NODES. */
 static SHELL_NONNULL(1, 5) bool dep_snapshot_export_route(
     dep_fd_imports_t *imports, dep_fd_ref_t fd, dep_fd_access_t access,
     dep_fd_route_t route, const shell_dep_graph_t *origin,
-    const dep_fd_imports_t *inherited, uint32_t path, bool scratch) {
+    const dep_fd_imports_t *inherited, uint32_t path, bool scratch,
+    uint32_t selector, bool process_owned, const char *allocation) {
   DEP_METADATA_WORK(SHELLSPLIT_TEST_WORK_IMPORT_EXPORTS);
-  dep_fd_import_t item = {
-      .fd = fd, .route = route, .access = access, .scratch = scratch};
+  dep_fd_import_t item = {.fd = fd,
+                          .route = route,
+                          .access = access,
+                          .scratch = scratch,
+                          .process_owned = process_owned,
+                          .selector = selector,
+                          .allocation = allocation};
   if (access == DEP_FD_ACCESS_BINDING) {
     /* Presence is not byte provenance. Keep its proof unchanged across a
      * child shell instead of inferring it from independently joined modes. */
@@ -6440,7 +8789,9 @@ static SHELL_NONNULL(1, 2, 7) bool dep_apply_persistent_owner_routes(
                             DEP_NAMED_MUTATION_BEFORE_REDIRECT);
   if (descriptor_exec) {
     for (uint32_t op = 0; op < op_count; op++) {
-      dep_fd_ref_t fd = {ops[op].fd, ops[op].fd_name, ops[op].fd_name_len};
+      dep_fd_ref_t fd = {.name = ops[op].fd_name,
+                         .value = ops[op].fd,
+                         .name_len = ops[op].fd_name_len};
       if (dep_publication_restores_fd(publication, fd))
         continue;
       const dep_fd_route_entry_t *source = dep_route_find(executed, fd);
@@ -6538,7 +8889,13 @@ static SHELL_NONNULL(2) bool dep_exit_operand_byte(unsigned char byte,
   return true;
 }
 
-static SHELL_NONNULL(1) void dep_exit_operand_dynamic(void *context) {
+static SHELL_NONNULL(4) void dep_exit_operand_dynamic(const char *word,
+                                                      size_t length,
+                                                      bool quoted,
+                                                      void *context) {
+  (void)word;
+  (void)length;
+  (void)quoted;
   ((dep_exit_operand_t *)context)->dynamic = true;
 }
 
@@ -6554,13 +8911,9 @@ static SHELL_NONNULL(1) uint8_t
   unsigned phases = OPTIONS;
   uint8_t outcomes = 0;
   for (uint32_t i = command + 1; i < tokens->count && phases; i++) {
-    const dep_token_t *word = &tokens->tokens[i];
-    if (classify_redirect(word) != DEP_REDIRECT_NONE) {
-      if (shell_source_redirection_consumes_word(word->start, word->len) &&
-          i + 1 < tokens->count)
-        i++;
+    if (dep_skip_nonargument(tokens, &i))
       continue;
-    }
+    const dep_token_t *word = &tokens->tokens[i];
     dep_exit_operand_t operand = {.end_options = true, .help = true};
     bool single = shell_builtin_visit_single_word(
         word->start, word->len, dep_exit_operand_byte, dep_exit_operand_dynamic,
@@ -6614,6 +8967,17 @@ static uint8_t dep_status_resolve(uint8_t status, uint8_t incoming) {
   return resolved;
 }
 
+/* A private interpreter's termination is a return to its parent, not a reason
+ * to discard the child's known status. Launch success is handled separately
+ * by the asynchronous-list cursor. */
+static uint8_t dep_status_child_return(uint8_t status) {
+  return (status & (DEP_STATUS_EITHER | DEP_STATUS_EXIT_INCOMING)) |
+         ((status & DEP_STATUS_TERMINAL_SUCCESS) ? DEP_STATUS_MAY_SUCCEED : 0) |
+         ((status & (DEP_STATUS_TERMINAL_FAILURE | DEP_STATUS_ABORT_FAILURE))
+              ? DEP_STATUS_MAY_FAIL
+              : 0);
+}
+
 /* One transfer description for both control outcomes and their CWD payloads.
  * Each source bit maps to completed-scope bits; added outcomes occur at entry,
  * before the body runs. group is an indexed, validated source group. */
@@ -6632,19 +8996,14 @@ static SHELL_NONNULL(1) bool dep_group_setup_stopped(
 
 static SHELL_NONNULL(1) dep_group_completion_t
     dep_group_completion(const dep_parse_context_t *context, uint32_t group) {
-  const shell_pipeline_index_t *pipeline = &context->execution->pipeline;
   const shell_group_t *descriptor = &context->fast->groups[group];
-  bool isolated_process =
-      pipeline->group_tail[group].has_pipeline ||
-      pipeline->group_connector[group] == SHELL_TYPE_PIPELINE ||
-      context->group_exec[group].backgrounded;
   uint8_t added = context->event_static_status[group] & DEP_STATUS_STOP;
   if (context->group_exec[group].setup_can_fail)
     added |= DEP_STATUS_MAY_FAIL;
   dep_group_completion_t result = {0};
   for (unsigned i = 0; i < 5; i++) {
     uint8_t outcome = (uint8_t)(1u << i);
-    if (descriptor->kind == SHELL_GROUP_SUBSHELL) {
+    if (context->group_exec[group].isolated) {
       if (outcome == DEP_STATUS_TERMINAL_SUCCESS)
         outcome = DEP_STATUS_MAY_SUCCEED;
       else if (outcome &
@@ -6656,14 +9015,10 @@ static SHELL_NONNULL(1) dep_group_completion_t
      * An enclosing compound may still negate that returned setup failure. */
     if (added & (1u << i))
       result.added |= outcome;
-    if (isolated_process)
-      outcome = DEP_STATUS_EITHER;
-    else if (group_is_pipeline_negated(descriptor))
+    if (group_is_pipeline_negated(descriptor))
       outcome = dep_status_negate(outcome);
     result.outcome[i] = outcome;
   }
-  if (isolated_process)
-    result.added = DEP_STATUS_EITHER;
   if (dep_group_setup_stopped(context, group))
     memset(result.outcome, 0, sizeof(result.outcome));
   return result;
@@ -6737,6 +9092,7 @@ static SHELL_NONNULL(1) uint32_t
   uint32_t slot = workspace->snapshot_table_count++;
   workspace->snapshot_tables[slot].routes.fd_count = 0;
   workspace->snapshot_tables[slot].routes.root = 0;
+  workspace->snapshot_tables[slot].routes.scalar_imports = NULL;
   workspace->snapshot_tables[slot].alternatives = (dep_route_state_t){0};
   return slot;
 }
@@ -6829,11 +9185,17 @@ static SHELL_NONNULL(1, 3, 4) void dep_snapshot_diagnostic_positions(
  * Newly discovered file/process operations precede neither an already expanded
  * operand nor a crossed heredoc: construction installs them at their operand.
  */
+static SHELL_NONNULL(1, 2, 3) void dep_route_domains_collect(
+    dep_route_journal_t *journal, const dep_domain_collection_t *collection,
+    const dep_route_state_t *live, const dep_route_state_t *pending);
+
 static SHELL_NONNULL(1, 2, 3, 6, 7) shell_dep_error_t
     dep_snapshot_operand_table(
         const shell_dep_graph_t *graph, dep_route_workspace_t *workspace,
         dep_snapshot_source_t *source, uint32_t entry_table, uint32_t position,
         uint32_t *result, const dep_parse_context_t *context, uint32_t owner) {
+  const dep_owner_routes_t *baseline =
+      &workspace->snapshot_tables[context->snapshot->persistent[0]].routes;
   /* All successful assignment-only commits precede redirect expansion. Cache
    * this one phase entry separately from the immutable command/RHS entry. */
   uint32_t event = context->node_group[owner] == UINT32_MAX
@@ -6857,21 +9219,18 @@ static SHELL_NONNULL(1, 2, 3, 6, 7) shell_dep_error_t
       dep_route_state_t previous_state = alternatives;
       if (async_setup &&
           (!dep_owner_stdin(context, source, owner, &alternatives,
-                            &workspace->snapshot_journal,
-                            &workspace->snapshot_tables[entry_table].routes,
-                            false) ||
-           !dep_fd_materialize_from(
-               &alternatives, &previous_state, &workspace->snapshot_journal,
-               &workspace->snapshot_tables[entry_table].routes,
-               &workspace->snapshot_tables[table].routes,
-               &workspace->snapshot_tables[table].routes)))
+                            &workspace->snapshot_journal, baseline, false) ||
+           !dep_fd_materialize_from(&alternatives, &previous_state,
+                                    &workspace->snapshot_journal, baseline,
+                                    &workspace->snapshot_tables[table].routes,
+                                    &workspace->snapshot_tables[table].routes)))
         return SHELL_DEP_ETRUNC;
       if (!dep_fd_bindings(&alternatives, &workspace->snapshot_journal,
+                           baseline,
                            &workspace->snapshot_tables[entry_table].routes,
                            &workspace->snapshot_tables[table].routes, NULL, 0,
                            &source->mutations) ||
-          !dep_ifs_apply(&alternatives, &workspace->snapshot_journal,
-                         &workspace->snapshot_tables[entry_table].routes,
+          !dep_ifs_apply(&alternatives, &workspace->snapshot_journal, baseline,
                          &source->mutations))
         return SHELL_DEP_ETRUNC;
       if (!dep_snapshot_table_publish(&workspace->snapshot_tables[table],
@@ -6944,35 +9303,38 @@ static SHELL_NONNULL(1, 2, 3, 6, 7) shell_dep_error_t
     dep_copy_routes(&tables[table].routes, &tables[incoming].routes);
     dep_route_state_t alternatives =
         dep_snapshot_alternatives(&tables[incoming]);
+    dep_domain_collection_t collection = {.workspace = workspace,
+                                          .frame = context->snapshot};
     for (uint32_t op = batch; op < end; op++) {
       if (ops[op].pos >= context->owner_setup_stop[owner])
         break;
-      unsigned expansion = dep_fd_ifs_expansion(ops + op, &alternatives,
-                                                &workspace->snapshot_journal,
-                                                &tables[incoming].routes);
+      dep_route_domains_collect(&workspace->snapshot_journal, &collection,
+                                &alternatives, NULL);
+      unsigned expansion = dep_fd_ifs_expansion(
+          ops + op, &alternatives, &workspace->snapshot_journal, baseline);
       if (expansion == 2)
         return SHELL_DEP_EPARSE;
       dep_fd_op_t effective = dep_fd_effective_operation(
-          ops + op, &alternatives, &workspace->snapshot_journal,
-          &tables[incoming].routes);
+          ops + op, &alternatives, &workspace->snapshot_journal, baseline);
       /* Only tracked variable-to-descriptor associations are supported.
        * Check this semantic boundary against the ordered journal, including
        * saves created earlier in this setup, never a concrete representative.
        * Numeric closed sources instead fail setup at runtime below. */
       dep_fd_ref_t operand =
           effective.kind == DEP_FD_OP_CLOSE
-              ? (dep_fd_ref_t){effective.fd, effective.fd_name,
-                               effective.fd_name_len}
-              : (dep_fd_ref_t){effective.target_fd, effective.target_fd_name,
-                               effective.target_fd_name_len};
+              ? (dep_fd_ref_t){.name = effective.fd_name,
+                               .value = effective.fd,
+                               .name_len = effective.fd_name_len}
+              : (dep_fd_ref_t){.name = effective.target_fd_name,
+                               .value = effective.target_fd,
+                               .name_len = effective.target_fd_name_len};
       if ((effective.kind == DEP_FD_OP_CLOSE ||
            dep_fd_op_copies(effective.kind)) &&
-          !dep_fd_bound(&alternatives, &workspace->snapshot_journal,
-                        &tables[incoming].routes, operand))
+          !dep_fd_bound(&alternatives, &workspace->snapshot_journal, baseline,
+                        operand))
         return SHELL_DEP_EPARSE;
-      uint8_t outcomes = dep_fd_operation_outcomes(ops + op, &alternatives,
-                                                   &workspace->snapshot_journal,
-                                                   &tables[incoming].routes);
+      uint8_t outcomes = dep_fd_operation_outcomes(
+          ops + op, &alternatives, &workspace->snapshot_journal, baseline);
       if ((outcomes & DEP_STATUS_MAY_FAIL) &&
           (ops[op].kind != DEP_FD_OP_DOCUMENT ||
            graph->nodes[owner].type == SHELL_NODE_GROUP ||
@@ -6988,7 +9350,7 @@ static SHELL_NONNULL(1, 2, 3, 6, 7) shell_dep_error_t
         if (!expansion &&
             !dep_fd_source_closed_locally(ops + op, &alternatives,
                                           &workspace->snapshot_journal,
-                                          &tables[incoming].routes) &&
+                                          baseline) &&
             ops[op].target_fd == SHELL_DEP_FD_NAMED)
           return SHELL_DEP_EPARSE;
         context->owner_setup_stop[owner] = ops[op].pos;
@@ -6996,8 +9358,8 @@ static SHELL_NONNULL(1, 2, 3, 6, 7) shell_dep_error_t
       }
       dep_route_state_t previous_state = alternatives;
       if (!dep_route_state_apply(&alternatives, &workspace->snapshot_journal,
-                                 &tables[incoming].routes, ops + op, 1,
-                                 !previous && op == 0))
+                                 baseline, ops + op, 1, !previous && op == 0,
+                                 &collection))
         return SHELL_DEP_ETRUNC;
       /* The journal application above consumed the original MOVE identity.
        * All later publication and frame restoration must consume its effective
@@ -7006,8 +9368,7 @@ static SHELL_NONNULL(1, 2, 3, 6, 7) shell_dep_error_t
       ops[op] = effective;
       if (!dep_fd_materialize_from(
               &alternatives, &previous_state, &workspace->snapshot_journal,
-              &tables[incoming].routes, &tables[table].routes,
-              &tables[table].routes))
+              baseline, &tables[table].routes, &tables[table].routes))
         return SHELL_DEP_ETRUNC;
     }
     if (!dep_snapshot_table_publish(&tables[table], &alternatives) ||
@@ -7053,19 +9414,76 @@ static SHELL_NONNULL(1, 2, 3, 4, 5, 6) bool dep_fd_materialize_from(
     const dep_route_state_t *state, const dep_route_state_t *previous,
     const dep_route_journal_t *journal, const dep_owner_routes_t *baseline,
     const dep_owner_routes_t *source, dep_owner_routes_t *destination);
-static SHELL_NONNULL(1, 2, 4, 5, 6, 7, 8, 13, 15) bool dep_fd_finish_owner(
-    const dep_parse_context_t *context, dep_fd_stream_t *stream, uint32_t event,
-    dep_route_journal_t *journal, const dep_owner_routes_t *baseline,
-    const dep_owner_routes_t *incoming, const dep_owner_routes_t *executed,
-    const dep_route_state_t *executed_state, const dep_fd_op_t *ops,
-    uint32_t op_count, bool descriptor_exec, bool named_binding,
-    const dep_named_mutations_t *mutations, dep_route_state_t *report_state,
-    const dep_route_state_t *setup_entry);
+static SHELL_NONNULL(1, 2, 4, 5, 6, 7, 8, 13, 15) shell_dep_error_t
+    dep_fd_finish_owner(
+        const dep_parse_context_t *context, dep_fd_stream_t *stream,
+        uint32_t event, dep_route_journal_t *journal,
+        const dep_owner_routes_t *baseline, const dep_owner_routes_t *incoming,
+        const dep_owner_routes_t *executed,
+        const dep_route_state_t *executed_state, const dep_fd_op_t *ops,
+        uint32_t op_count, bool descriptor_exec, bool named_binding,
+        const dep_named_mutations_t *mutations, dep_route_state_t *report_state,
+        const dep_route_state_t *setup_entry);
 
 static SHELL_NONNULL(1, 2, 4, 5, 6) bool dep_fd_complete_group(
     const dep_parse_context_t *context, dep_fd_stream_t *stream, uint32_t group,
     dep_route_journal_t *journal, const dep_owner_routes_t *baseline,
     const dep_redirect_frame_t *frames);
+/* Captures and aggregate substitution status belong to one command's
+ * evaluation, not its continuation. Deferred input publication retains its
+ * own immutable pre-cleanup root. Retire only prepared owner-local keys;
+ * imported predicates in PRIVATE_ENTRY observation trees remain intact. */
+static SHELL_NONNULL(1, 3, 4, 5) bool dep_fd_retire_owner_facts(
+    const dep_parse_context_t *context, uint32_t event,
+    dep_route_state_t *state, dep_route_journal_t *journal,
+    const dep_owner_routes_t *baseline) {
+  if (event < SHELL_MAX_GROUPS)
+    return true;
+  uint32_t slot =
+      context->snapshot
+          ->prepared_source[context->range_node[event - SHELL_MAX_GROUPS]];
+  const dep_snapshot_source_t *source =
+      &context->workspace->snapshot_sources[slot];
+  if (!source->read.active && !source->observation_first[0] &&
+      !source->observation_first[1] && !source->observation_first[2])
+    return true;
+  dep_route_state_t result = {0};
+  dep_route_iterator_t versions = dep_route_iterator(state);
+  uint32_t root;
+  bool ready = false;
+  while (dep_route_next(&versions, journal, &root)) {
+    dep_route_state_t one = dep_route_state_single(root);
+    one.correlated = state->correlated;
+    for (uint32_t i = 0; i < source->read.count; i++) {
+      const dep_read_word_t *word = &source->read.words[i];
+      if (word->capture && word->parameter.value == SHELL_DEP_FD_NAMED &&
+          !dep_route_state_store_access(&one, journal, dep_fd_numeric(i),
+                                        DEP_FD_ACCESS_READ_ARGUMENT,
+                                        (dep_route_set_t){.ready = true}))
+        return false;
+    }
+    if (source->read.active &&
+        !dep_route_state_store_access(
+            &one, journal, dep_fd_numeric(SHELL_DEP_FD_NONE),
+            DEP_FD_ACCESS_EFFECT_STATE, (dep_route_set_t){.ready = true}))
+      return false;
+    for (uint32_t phase = 0; phase < 3; phase++)
+      if (source->observation_first[phase] &&
+          !dep_route_state_store_access(&one, journal,
+                                        dep_fd_numeric(slot * 3 + phase),
+                                        DEP_FD_ACCESS_SUBSTITUTION_STATUS,
+                                        (dep_route_set_t){.ready = true}))
+        return false;
+    if (!ready)
+      result = one;
+    else if (!dep_fd_merge_versions(&result, &one, journal, baseline))
+      return false;
+    ready = true;
+  }
+  *state = result;
+  return true;
+}
+
 static SHELL_NONNULL(1, 2, 4, 5, 6) bool dep_fd_finish(
     const dep_parse_context_t *context, dep_fd_stream_t *stream, uint32_t event,
     const dep_fd_flow_t *executed, dep_route_journal_t *journal,
@@ -7718,6 +10136,50 @@ static SHELL_NONNULL(1) bool dep_snapshot_frame_initialize(
  * operands add only preceding operations to that entry snapshot. This advances
  * semantic setup and returns its cached table; it does not export descriptors
  * merely to establish whether an expansion can execute. */
+/* Consume the new word-expansion suffix once. Redirect operands use the same
+ * process operations in the ordered setup index instead. */
+static SHELL_NONNULL(1, 2, 3) bool dep_snapshot_process_words(
+    const dep_parse_context_t *context, dep_snapshot_source_t *source,
+    dep_snapshot_table_t *entry, uint32_t owner) {
+  const dep_owner_routes_t *baseline =
+      &context->workspace->snapshot_tables[context->snapshot->persistent[0]]
+           .routes;
+  uint32_t cursor = source->process_word_cursor;
+  uint32_t route = cursor ? context->process_routes->entries[cursor - 1].next
+                          : context->process_routes->first[owner];
+  dep_route_state_t state = dep_snapshot_alternatives(entry), previous = state;
+  dep_domain_collection_t collection = {.workspace = context->workspace,
+                                        .frame = context->snapshot};
+  bool changed = false;
+  for (; route; route = context->process_routes->entries[route - 1].next) {
+    const dep_process_route_t *item =
+        &context->process_routes->entries[route - 1];
+    source->process_word_cursor = route;
+    if (!item->temporary || !item->command_word ||
+        !context->process_routes->track[owner])
+      continue;
+    dep_fd_op_t op = {.pos = item->position,
+                      .kind = DEP_FD_OP_PROCESS,
+                      .fd_name = item->source,
+                      .edge_index = item->edge,
+                      .access = item->access,
+                      .guard = item->guard,
+                      .process_observed_low =
+                          context->process_routes->observed_low[owner]};
+    dep_route_domains_collect(&context->workspace->snapshot_journal,
+                              &collection, &state, &previous);
+    if (!dep_process_open(&state, &context->workspace->snapshot_journal,
+                          baseline, &op))
+      return false;
+    changed = true;
+  }
+  return !changed ||
+         (dep_fd_materialize_from(&state, &previous,
+                                  &context->workspace->snapshot_journal,
+                                  baseline, &entry->routes, &entry->routes) &&
+          dep_snapshot_table_publish(entry, &state));
+}
+
 static SHELL_NONNULL(1, 3, 7) shell_dep_error_t
     dep_snapshot_phase_table(const shell_dep_graph_t *graph,
                              const dep_subgraph_streams_t *streams,
@@ -7746,6 +10208,8 @@ static SHELL_NONNULL(1, 3, 7) shell_dep_error_t
         uint32_t op_count = 0, completed;
         if (!dep_snapshot_fd_operations(graph, context, owner, &prepared))
           return SHELL_DEP_EPARSE;
+        if (!dep_snapshot_process_words(context, prepared, entry, owner))
+          return SHELL_DEP_ETRUNC;
         shell_dep_error_t error = dep_snapshot_operand_table(
             graph, workspace, prepared, (uint32_t)(entry - tables), UINT32_MAX,
             &completed, context, owner);
@@ -7760,8 +10224,7 @@ static SHELL_NONNULL(1, 3, 7) shell_dep_error_t
         dep_copy_routes(&pipeline, &entry->routes);
         dep_route_state_t ignored = dep_snapshot_alternatives(entry);
         if (prepared->mutations.before_redirect &&
-            !dep_ifs_apply(&ignored, changes, &entry->routes,
-                           &prepared->mutations))
+            !dep_ifs_apply(&ignored, changes, baseline, &prepared->mutations))
           return SHELL_DEP_ETRUNC;
         bool pipe_both = false;
         if (!dep_snapshot_install_pipeline(&pipeline, &ignored, changes,
@@ -7777,13 +10240,14 @@ static SHELL_NONNULL(1, 3, 7) shell_dep_error_t
             return SHELL_DEP_ETRUNC;
           frame->active_groups[frame->active_group_count++] = event;
         }
-        if (!dep_fd_finish_owner(
-                context, &frame->fd_stream, event, changes, baseline,
-                &entry->routes, &executed, &alternatives, workspace->ops,
-                op_count, descriptor_exec,
-                dep_owner_persists_named_binding(graph, context, owner),
-                &prepared->mutations, NULL, &ignored))
-          return SHELL_DEP_ETRUNC;
+        error = dep_fd_finish_owner(
+            context, &frame->fd_stream, event, changes, baseline,
+            &entry->routes, &executed, &alternatives, workspace->ops, op_count,
+            descriptor_exec,
+            dep_owner_persists_named_binding(graph, context, owner),
+            &prepared->mutations, NULL, &ignored);
+        if (error != SHELL_DEP_OK)
+          return error;
       } else {
         dep_fd_flow_t none = {0};
         if (!dep_fd_finish(context, &frame->fd_stream, event, &none, changes,
@@ -7858,6 +10322,13 @@ static SHELL_NONNULL(1, 3, 7) shell_dep_error_t
         return SHELL_DEP_EPARSE;
       if (frame->execution[owner] != DEP_EXECUTION_NEVER) {
         dep_route_state_t prior = selected;
+        if (!dep_source_variables_supported(prepared, &selected, changes,
+                                            baseline, context->fast))
+          return SHELL_DEP_EPARSE;
+        shell_dep_error_t capture =
+            dep_read_capture(&prepared->read, &selected, changes, baseline);
+        if (capture != SHELL_DEP_OK)
+          return capture;
         if (!dep_owner_stdin(context, prepared, owner, &selected, changes,
                              baseline, true) ||
             !dep_fd_materialize_from(&selected, &prior, changes, baseline,
@@ -7872,10 +10343,12 @@ static SHELL_NONNULL(1, 3, 7) shell_dep_error_t
     frame->current_owner = owner;
   }
 
+  dep_snapshot_source_t *prepared;
+  if (!dep_snapshot_fd_operations(graph, context, current_owner, &prepared))
+    return SHELL_DEP_EPARSE;
+  if (!dep_snapshot_process_words(context, prepared, entry, current_owner))
+    return SHELL_DEP_ETRUNC;
   if (phase == DEP_SNAPSHOT_REDIRECT_OPERAND || phase == DEP_SNAPSHOT_SETUP) {
-    dep_snapshot_source_t *prepared;
-    if (!dep_snapshot_fd_operations(graph, context, current_owner, &prepared))
-      return SHELL_DEP_EPARSE;
     return dep_snapshot_operand_table(graph, workspace, prepared,
                                       (uint32_t)(entry - tables), position,
                                       table, context, current_owner);
@@ -7939,10 +10412,11 @@ static SHELL_NONNULL(1, 3) shell_dep_error_t
 /* Recursive expansions request an import from one of the three expansion
  * phases, not SETUP. Reuse the established checkpoint; exporting descriptors
  * is separate from resolving the operand's reachability. */
-static SHELL_NONNULL(1, 3, 7) shell_dep_error_t dep_snapshot_fd_imports(
+static SHELL_NONNULL(1, 3, 7, 9) shell_dep_error_t dep_snapshot_fd_imports(
     const shell_dep_graph_t *graph, const dep_subgraph_streams_t *streams,
     const dep_parse_context_t *context, uint32_t current_owner,
-    uint32_t position, dep_snapshot_phase_t phase, dep_fd_imports_t *imports) {
+    uint32_t position, dep_snapshot_phase_t phase, dep_fd_imports_t *imports,
+    const dep_process_guard_t *guard, bool *active) {
   *imports = (dep_fd_imports_t){0};
   uint32_t table;
   shell_dep_error_t error = dep_snapshot_phase_table(
@@ -7953,10 +10427,24 @@ static SHELL_NONNULL(1, 3, 7) shell_dep_error_t dep_snapshot_fd_imports(
   dep_route_workspace_t *workspace = context->workspace;
   dep_route_journal_t *changes = &workspace->snapshot_journal;
   dep_snapshot_frame_t *frame = context->snapshot;
-  const dep_snapshot_table_t *entry = &workspace->snapshot_tables[table];
+  dep_snapshot_table_t *entry = &workspace->snapshot_tables[table];
   const dep_owner_routes_t *snapshot = &entry->routes;
+  const dep_owner_routes_t *baseline =
+      &workspace->snapshot_tables[frame->persistent[0]].routes;
   dep_route_state_t alternatives = dep_snapshot_alternatives(entry);
-  imports->ifs = dep_ifs_get(&alternatives, changes, snapshot);
+  if (guard) {
+    dep_route_state_t executing;
+    bool possible;
+    if (!dep_process_guard_select(&alternatives, changes, baseline, guard,
+                                  &executing, &possible))
+      return SHELL_DEP_ETRUNC;
+    if (!possible) {
+      *active = false;
+      return SHELL_DEP_OK;
+    }
+    alternatives = executing;
+  }
+  imports->ifs = dep_ifs_get(&alternatives, changes, baseline);
   const dep_snapshot_source_t *assignment_source = NULL;
   bool null_path = false, command_path = true;
   const dep_assignment_ifs_t *assignment_ifs = NULL;
@@ -7974,12 +10462,12 @@ static SHELL_NONNULL(1, 3, 7) shell_dep_error_t dep_snapshot_fd_imports(
         source->assignment_ifs_cursor++;
       }
       if (source->assignment_ifs_cursor) {
-        const dep_assignment_ifs_t *prefix =
+        assignment_ifs =
             &source->assignment_ifs[source->assignment_ifs_cursor - 1];
-        uint32_t assigned = prefix->value | (prefix->append ? imports->ifs : 0);
+        uint32_t assigned =
+            assignment_ifs->value | (assignment_ifs->append ? imports->ifs : 0);
         imports->ifs =
             command_path ? dep_ifs_join(imports->ifs, assigned) : assigned;
-        assignment_ifs = prefix;
       }
     }
   }
@@ -7990,6 +10478,12 @@ static SHELL_NONNULL(1, 3, 7) shell_dep_error_t dep_snapshot_fd_imports(
   if (paths > SHELL_DEP_MAX_NODES)
     return SHELL_DEP_ETRUNC;
   imports->path_count = paths;
+  imports->scalar_journal = changes;
+  imports->scalar_baseline = baseline;
+  imports->assignment_source = assignment_source;
+  imports->assignment_command = context->cmd;
+  imports->assignment_position = position;
+  imports->process_domains = &changes->process_domains;
   dep_route_iterator_t iterator = dep_route_iterator(&alternatives);
   uint32_t root = 0;
   for (uint32_t path = 0; path < paths; path++) {
@@ -7998,20 +10492,28 @@ static SHELL_NONNULL(1, 3, 7) shell_dep_error_t dep_snapshot_fd_imports(
     dep_route_state_t selected =
         base_paths == 1 ? alternatives : dep_route_state_single(root);
     bool assignment_only = null_path && (variants == 1 || path % variants == 0);
-    uint32_t ifs = dep_ifs_get(&selected, changes, snapshot);
+    imports->path_scalar_root[path] = selected.root;
+    imports->path_assignment_only[path] = assignment_only;
+    uint32_t ifs = dep_ifs_get(&selected, changes, baseline);
     imports->path_ifs[path] =
         assignment_only && assignment_ifs
             ? assignment_ifs->value | (assignment_ifs->append ? ifs : 0)
             : ifs;
     imports->path_stdin_redir[path] =
-        dep_fd_raw_fact(&selected, changes, snapshot, dep_fd_numeric(0),
+        dep_fd_raw_fact(&selected, changes, baseline, dep_fd_numeric(0),
                         DEP_FD_ACCESS_STDIN_REDIR)
             .routes[0]
             .value;
+    dep_route_set_t domain =
+        dep_fd_raw_fact(&selected, changes, baseline, dep_fd_numeric(0),
+                        DEP_FD_ACCESS_PROCESS_DOMAIN);
+    if (domain.count)
+      imports->path_process_domain[path] = domain.routes[0].value + 1;
     for (uint32_t i = 0; i < snapshot->fd_count; i++) {
       const dep_fd_route_entry_t *item = &snapshot->fd[i];
+      bool process_owned = dep_process_owned(&selected, changes, item->fd);
       if (item->fd.value > SHELL_DEP_FD_MAX &&
-          item->fd.value != SHELL_DEP_FD_NAMED)
+          item->fd.value != SHELL_DEP_FD_NAMED && !process_owned)
         continue;
       if (assignment_only &&
           dep_assignment_precedes(assignment_source, context->cmd, item->fd,
@@ -8020,26 +10522,53 @@ static SHELL_NONNULL(1, 3, 7) shell_dep_error_t dep_snapshot_fd_imports(
       for (uint32_t access = DEP_FD_ACCESS_READ;
            access <= DEP_FD_ACCESS_BINDING; access <<= 1) {
         bool scratch = access == DEP_FD_ACCESS_BINDING &&
-                       dep_fd_raw_fact(&selected, changes, snapshot, item->fd,
+                       dep_fd_raw_fact(&selected, changes, baseline, item->fd,
                                        DEP_FD_ACCESS_SCRATCH)
                                .count != 0;
         dep_route_set_t routes = dep_fd_raw_fact(
-            &selected, changes, snapshot, item->fd, (dep_fd_access_t)access);
+            &selected, changes, baseline, item->fd, (dep_fd_access_t)access);
         /* Physical aliases remain associations in the child. Abstract slot
          * IDs are local to this journal; export their resolved provenance. */
         bool abstract = false;
-        for (uint32_t route = 0; route < routes.count; route++)
+        uint32_t selector = 0;
+        const char *allocation = NULL;
+        if (item->fd.value > SHELL_DEP_FD_MAX &&
+            item->fd.value < SHELL_DEP_FD_NAMED) {
+          dep_route_set_t identity = dep_fd_raw_fact(
+              &selected, changes, baseline, item->fd, DEP_FD_ACCESS_SELECTOR);
+          if (identity.count)
+            selector = identity.routes[0].value;
+          allocation =
+              changes->allocations[item->fd.value - SHELL_DEP_FD_MAX - 1]
+                  .allocation;
+        }
+        for (uint32_t route = 0; route < routes.count; route++) {
           abstract |= routes.routes[route].kind == DEP_ROUTE_ALIAS &&
                       routes.routes[route].value > SHELL_DEP_FD_MAX;
+          if (routes.routes[route].kind == DEP_ROUTE_ALIAS &&
+              routes.routes[route].value > SHELL_DEP_FD_MAX) {
+            dep_route_set_t identity =
+                dep_fd_raw_fact(&selected, changes, baseline,
+                                dep_fd_numeric(routes.routes[route].value),
+                                DEP_FD_ACCESS_SELECTOR);
+            if (identity.count)
+              selector = identity.routes[0].value;
+            allocation = changes
+                             ->allocations[routes.routes[route].value -
+                                           SHELL_DEP_FD_MAX - 1]
+                             .allocation;
+          }
+        }
         if (abstract)
-          routes = dep_fd_fact(&selected, changes, snapshot, item->fd,
+          routes = dep_fd_fact(&selected, changes, baseline, item->fd,
                                (dep_fd_access_t)access);
         if (routes.truncated)
           return SHELL_DEP_ETRUNC;
         for (uint32_t route = 0; route < routes.count; route++)
           if (!dep_snapshot_export_route(
                   imports, item->fd, (dep_fd_access_t)access,
-                  routes.routes[route], graph, inherited, path, scratch))
+                  routes.routes[route], graph, inherited, path, scratch,
+                  selector, process_owned, allocation))
             return SHELL_DEP_ETRUNC;
       }
     }
@@ -8066,12 +10595,41 @@ static SHELL_NONNULL(1, 2, 3) shell_dep_error_t
   dep_snapshot_source_t *prepared;
   if (!dep_snapshot_fd_operations(graph, context, owner, &prepared))
     return SHELL_DEP_EPARSE;
-  if (prepared->setup_needs_walk) {
+  if (prepared->setup_needs_walk || prepared->read.active) {
     uint32_t table;
     shell_dep_error_t error = dep_snapshot_phase_table(
         graph, streams, context, owner, UINT32_MAX, DEP_SNAPSHOT_SETUP, &table);
     if (error != SHELL_DEP_OK)
       return error;
+    if (prepared->read.active) {
+      dep_snapshot_table_t *snapshot =
+          &context->workspace->snapshot_tables[table];
+      dep_route_state_t alternatives = dep_snapshot_alternatives(snapshot);
+      uint8_t status = 0;
+      dep_route_iterator_t iterator = dep_route_iterator(&alternatives);
+      uint32_t root;
+      while (dep_route_next(&iterator, &context->workspace->snapshot_journal,
+                            &root)) {
+        dep_route_state_t one = dep_route_state_single(root);
+        dep_read_result_t read = dep_read_evaluate(
+            &prepared->read, &one, &context->workspace->snapshot_journal,
+            &context->workspace
+                 ->snapshot_tables[context->snapshot->persistent[0]]
+                 .routes,
+            NULL, NULL);
+        if (read.unsupported)
+          return SHELL_DEP_EPARSE;
+        status |= read.status;
+      }
+      uint32_t event = dep_owner_event(context, owner);
+      context->event_body_status[event] = status;
+      if (context->fast->cmds[context->node_range[owner]]
+              .pipeline_negation_count &
+          1u)
+        status = dep_status_negate(status);
+      context->event_static_status[event] =
+          status | (context->event_static_status[event] & DEP_STATUS_STOP);
+    }
   }
   if (may_fail)
     *may_fail = prepared->setup_may_fail;
@@ -8226,18 +10784,24 @@ static SHELL_NONNULL(1, 2, 3, 4, 5, 6, 8) void dep_mark_live_named_tree(
   dep_mark_live_named_tree(graph, original_edges, state, journal, baseline,
                            named_setup_documents, original_edge_count,
                            live_named_documents, change->left);
-  if (change->fd.value == SHELL_DEP_FD_NAMED &&
-      change->access == DEP_FD_ACCESS_BINDING) {
-    dep_route_set_t bindings = dep_fd_fact(state, journal, baseline, change->fd,
-                                           DEP_FD_ACCESS_BINDING);
+  dep_fd_ref_t fd = dep_route_change_fd(journal, change);
+  if (dep_route_change_access(change) == DEP_FD_ACCESS_NAMED_BINDINGS)
+    dep_mark_live_named_tree(
+        graph, original_edges, state, journal, baseline, named_setup_documents,
+        original_edge_count, live_named_documents,
+        journal->snapshots[change->snapshot - 1].routes[0].value);
+  if (fd.value == SHELL_DEP_FD_NAMED &&
+      dep_route_change_access(change) == DEP_FD_ACCESS_BINDING) {
+    dep_route_set_t bindings =
+        dep_fd_fact(state, journal, baseline, fd, DEP_FD_ACCESS_BINDING);
     bool live = false;
     for (uint32_t i = 0; i < bindings.count; i++)
       live |= bindings.routes[i].kind == DEP_ROUTE_INHERITED;
     if (live)
       for (uint32_t access = DEP_FD_ACCESS_READ; access <= DEP_FD_ACCESS_WRITE;
            access <<= 1) {
-        dep_route_set_t routes = dep_fd_fact(
-            state, journal, baseline, change->fd, (dep_fd_access_t)access);
+        dep_route_set_t routes =
+            dep_fd_fact(state, journal, baseline, fd, (dep_fd_access_t)access);
         for (uint32_t i = 0; i < routes.count; i++) {
           dep_fd_route_t route = routes.routes[i];
           if (route.kind != DEP_ROUTE_DOC || route.value >= original_edge_count)
@@ -8559,21 +11123,43 @@ static void dep_route_set_set(dep_route_set_t *snapshot, dep_fd_route_t route) {
   (void)dep_route_set_add(snapshot, route);
 }
 
-static SHELL_NONNULL(2) const dep_route_change_t *dep_route_root_change(
+static SHELL_NONNULL(2) const dep_route_change_t *dep_route_map_change(
     uint32_t root, const dep_route_journal_t *changes, dep_fd_ref_t fd,
     dep_fd_access_t access) {
   uint32_t cursor = root;
   while (cursor != 0) {
     DEP_METADATA_WORK(SHELLSPLIT_TEST_WORK_ROUTE_LOOKUP);
+    if (fd.value == SHELL_DEP_FD_NAMED && access == DEP_FD_ACCESS_BINDING)
+      DEP_METADATA_WORK(SHELLSPLIT_TEST_WORK_BINDING_INVALIDATION);
     const dep_route_change_t *change = &changes->entries[cursor - 1];
-    int order = dep_fd_ref_compare(change->fd, fd);
-    if (order == 0)
-      order = change->access < access ? -1 : change->access != access;
+    int order = dep_fd_ref_compare(dep_route_change_fd(changes, change), fd);
+    if (order == 0) {
+      dep_fd_access_t change_access = dep_route_change_access(change);
+      order = change_access < access ? -1 : change_access != access;
+    }
     if (order == 0)
       return change;
     cursor = order > 0 ? change->left : change->right;
   }
   return NULL;
+}
+
+/* A missing holder is the initial, empty override map with baseline fallback.
+ * This is a value, not an epoch or a pointer into a mutable materialization. */
+static SHELL_NONNULL(2) dep_fd_route_t
+    dep_named_bindings(uint32_t root, const dep_route_journal_t *journal) {
+  const dep_route_change_t *holder = dep_route_map_change(
+      root, journal, dep_fd_numeric(0), DEP_FD_ACCESS_NAMED_BINDINGS);
+  return holder ? journal->snapshots[holder->snapshot - 1].routes[0]
+                : (dep_fd_route_t){DEP_ROUTE_INHERITED, 0};
+}
+
+static SHELL_NONNULL(2) const dep_route_change_t *dep_route_root_change(
+    uint32_t root, const dep_route_journal_t *journal, dep_fd_ref_t fd,
+    dep_fd_access_t access) {
+  if (fd.value == SHELL_DEP_FD_NAMED && access == DEP_FD_ACCESS_BINDING)
+    root = dep_named_bindings(root, journal).value;
+  return dep_route_map_change(root, journal, fd, access);
 }
 
 /* Path-independent queries use dep_fd_raw_fact(). This helper is reserved for
@@ -8608,13 +11194,26 @@ static SHELL_NONNULL(1, 3) int dep_route_snapshot_compare(const void *context,
 static SHELL_NONNULL(1, 2) uint32_t
     dep_route_set_intern(dep_route_journal_t *changes,
                          const dep_route_set_t *routes) {
-  uint32_t candidate = changes->snapshot_count + 1, match = 0;
+  uint32_t candidate = changes->snapshot_reuse && changes->snapshot_free
+                           ? changes->snapshot_free
+                           : changes->snapshot_count + 1;
+  uint16_t next_free = candidate <= changes->snapshot_count
+                           ? changes->snapshot_index[candidate - 1].left
+                           : 0;
+  uint32_t match = 0;
   changes->snapshot_root =
       dep_index_insert(changes->snapshot_index, changes->snapshot_root,
                        candidate, DEP_ROUTE_SNAPSHOT_CAPACITY,
                        dep_route_snapshot_compare, changes, routes, &match);
   if (match == candidate) {
-    changes->snapshots[changes->snapshot_count++] = *routes;
+    if (candidate <= changes->snapshot_count) {
+      changes->snapshot_free = next_free;
+      changes->snapshot_free_count--;
+    } else {
+      changes->snapshot_count++;
+    }
+    changes->snapshots[candidate - 1] = *routes;
+    changes->snapshot_allocations++;
   }
   return match;
 }
@@ -8631,21 +11230,846 @@ static SHELL_NONNULL(1, 3) uint32_t
                          dep_route_snapshot_compare, journal, key);
 }
 
+static SHELL_NONNULL(1, 3) int dep_process_domain_compare(const void *context,
+                                                          uint32_t index,
+                                                          const void *pending) {
+  const dep_process_domain_node_t *node =
+      &((const dep_process_domain_pool_t *)context)->nodes[index];
+  const dep_process_domain_node_t *key = pending;
+  DEP_METADATA_WORK(SHELLSPLIT_TEST_WORK_PROCESS_ROUTES);
+  if (node->fd != key->fd)
+    return node->fd < key->fd ? -1 : 1;
+  if (node->low != key->low)
+    return node->low < key->low ? -1 : 1;
+  return node->high < key->high ? -1 : node->high != key->high;
+}
+
+static SHELL_NONNULL(1) uint64_t
+    dep_process_domain_mask(const dep_process_domain_pool_t *pool,
+                            uint32_t root, bool free) {
+  return root < 2 ? (root ? UINT64_MAX : 0)
+         : free   ? pool->nodes[root - 2].free
+                  : pool->nodes[root - 2].occupied;
+}
+
+static uint32_t dep_process_cache_slot(uint32_t first, uint32_t second,
+                                       uint32_t third) {
+  uint32_t hash = first * UINT32_C(0x9e3779b9);
+  hash ^= second * UINT32_C(0x85ebca6b);
+  hash ^= third * UINT32_C(0xc2b2ae35);
+  hash ^= hash >> 16;
+  return hash & 16383u;
+}
+
+static SHELL_NONNULL(1) uint32_t
+    dep_process_domain_node(dep_process_domain_pool_t *pool, uint32_t fd,
+                            uint32_t low, uint32_t high) {
+  if (low == UINT32_MAX || high == UINT32_MAX)
+    return UINT32_MAX;
+  if (low == high)
+    return low;
+  dep_process_domain_node_t key = {.fd = fd, .low = low, .high = high};
+  if (!pool->count) {
+    memset(pool->node_cache, 0, sizeof(pool->node_cache));
+    pool->free_node = pool->free_count = pool->node_allocations = 0;
+  }
+  uint32_t cache = dep_process_cache_slot(fd, low, high);
+  uint32_t cached = pool->node_cache[cache];
+  if (cached && cached <= pool->count &&
+      !dep_process_domain_compare(pool, cached - 1, &key))
+    return cached + 1;
+  uint32_t candidate = pool->free_node ? pool->free_node : pool->count + 1;
+  uint32_t match = 0;
+  pool->root = dep_index_insert(pool->index, pool->root, candidate,
+                                DEP_PROCESS_DOMAIN_CAPACITY,
+                                dep_process_domain_compare, pool, &key, &match);
+  if (!match)
+    return UINT32_MAX;
+  pool->node_cache[cache] = match;
+  if (match == candidate) {
+    uint64_t bit = fd < 64 ? UINT64_C(1) << fd : 0;
+    key.free = ((dep_process_domain_mask(pool, low, true) |
+                 dep_process_domain_mask(pool, high, true)) &
+                ~bit) |
+               (high ? bit : 0);
+    key.occupied = ((dep_process_domain_mask(pool, low, false) |
+                     dep_process_domain_mask(pool, high, false)) &
+                    ~bit) |
+                   (low ? bit : 0);
+    key.low_full = (low && (low == 1 || pool->nodes[low - 2].low_full)) ||
+                   (fd >= DEP_BASH_VARREDIR_MIN_FD && high &&
+                    (high == 1 || pool->nodes[high - 2].low_full));
+    if (pool->free_node) {
+      pool->free_node = pool->nodes[candidate - 1].low;
+      pool->free_count--;
+    } else {
+      pool->count++;
+    }
+    pool->nodes[candidate - 1] = key;
+    pool->node_allocations++;
+  }
+  return match + 1;
+}
+
+#define DEP_SELECTOR_VALUES 65u
+#define DEP_SELECTOR_BITS 64u
+
+/* Allocation-choice predicates precede physical occupancy for the selected
+ * descriptor. That lets a one-pass selector image update the physical branch
+ * below its choice without rebuilding an out-of-order decision diagram.
+ * Distinct selector identities still share descriptor-major order, so choices
+ * for later descriptors do not form one Cartesian selector prefix. */
+static uint64_t dep_process_variable_order(uint32_t variable) {
+  if (variable < 64)
+    return (uint64_t)variable * UINT32_MAX + UINT32_MAX - 1u;
+  uint32_t offset = (variable - 64) % 65;
+  uint32_t identity = (variable - 64) / 65 + 1;
+  return (uint64_t)offset * UINT32_MAX + identity;
+}
+
+static SHELL_NONNULL(1, 3) bool dep_process_apply_equal(const void *context,
+                                                        uint32_t index,
+                                                        const void *pending) {
+  const dep_process_domain_apply_t *node =
+      &((const dep_process_domain_pool_t *)context)->applies[index];
+  const dep_process_domain_apply_t *key = pending;
+  DEP_METADATA_WORK(SHELLSPLIT_TEST_WORK_PROCESS_ROUTES);
+  return node->operation == key->operation && node->left == key->left &&
+         node->right == key->right;
+}
+
+static SHELL_NONNULL(1, 2) uint32_t
+    dep_process_apply_find(dep_process_domain_pool_t *pool,
+                           const dep_process_domain_apply_t *key) {
+  if (!pool->memo_ready) {
+    memset(pool->apply_sets, 0, sizeof(pool->apply_sets));
+    pool->memo_ready = true;
+  }
+  uint32_t set = dep_process_cache_slot(key->operation, key->left, key->right) %
+                 DEP_PROCESS_APPLY_SETS;
+  uint32_t count = pool->apply_sets[set] & 15u;
+  for (uint32_t way = 0; way < count; way++)
+    if (dep_process_apply_equal(pool, set * DEP_PROCESS_APPLY_WAYS + way, key))
+      return set * DEP_PROCESS_APPLY_WAYS + way + 1;
+  return 0;
+}
+
+static SHELL_NONNULL(1, 2) uint32_t
+    dep_process_apply_save(dep_process_domain_pool_t *pool,
+                           dep_process_domain_apply_t *key) {
+  uint32_t match = dep_process_apply_find(pool, key);
+  if (!match) {
+    uint32_t set =
+        dep_process_cache_slot(key->operation, key->left, key->right) %
+        DEP_PROCESS_APPLY_SETS;
+    uint8_t used = pool->apply_sets[set];
+    uint32_t count = used & 15u;
+    uint32_t way = count < DEP_PROCESS_APPLY_WAYS ? count : used >> 4;
+    pool->apply_sets[set] = count < DEP_PROCESS_APPLY_WAYS
+                                ? (uint8_t)(count + 1)
+                                : (uint8_t)(4u | (((way + 1) & 3u) << 4));
+    match = set * DEP_PROCESS_APPLY_WAYS + way + 1;
+  }
+  pool->applies[match - 1] = *key;
+  return key->result;
+}
+
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+bool shellsplit_test_memo_cache_contract(void *workspace) {
+  dep_process_domain_pool_t *pool =
+      &((dep_route_workspace_t *)workspace)->process_scratch;
+  memset(pool, 0, sizeof(*pool));
+  uint32_t root = dep_process_domain_node(pool, 0, 0, 1);
+  dep_process_domain_apply_t keys[DEP_PROCESS_APPLY_WAYS + 1];
+  uint32_t count = 0, set = 0;
+  for (uint32_t fd = 1; count < DEP_PROCESS_APPLY_WAYS + 1; fd++) {
+    dep_process_domain_apply_t key = {
+        .left = root, .operation = fd + 2, .result = root};
+    uint32_t bucket = dep_process_cache_slot(key.operation, key.left, 0) %
+                      DEP_PROCESS_APPLY_SETS;
+    if (!count)
+      set = bucket;
+    if (bucket != set)
+      continue;
+    /* Existentially removing a variable absent from this one-bit function
+     * leaves it unchanged: these are valid completed memo expressions. */
+    keys[count++] = key;
+    if (dep_process_apply_save(pool, &key) != root)
+      return false;
+  }
+  if (dep_process_apply_find(pool, &keys[0]))
+    return false;
+  for (uint32_t i = 1; i < count; i++) {
+    uint32_t cached = dep_process_apply_find(pool, &keys[i]);
+    if (!cached || pool->applies[cached - 1].result != root)
+      return false;
+  }
+  pool->memo_ready = false;
+  for (uint32_t i = 0; i < count; i++)
+    if (dep_process_apply_find(pool, &keys[i]))
+      return false;
+  /* Reusing node IDs after a pool reset must not resurrect the old result.
+   * This time the eliminated variable is present, so the expression is true. */
+  pool->root = pool->count = 0;
+  pool->memo_ready = false;
+  if (dep_process_domain_node(pool, keys[0].operation - 2, 0, 1) != root)
+    return false;
+  keys[0].result = 1;
+  if (dep_process_apply_save(pool, &keys[0]) != 1)
+    return false;
+  uint32_t cached = dep_process_apply_find(pool, &keys[0]);
+  return cached && pool->applies[cached - 1].result == 1;
+}
+#endif
+
+/* Operations 0/1 are conjunction/union; 2+variable forgets one bit;
+ * UINT32_MAX complements a predicate.
+ * Roots belong to pool, or are UINT32_MAX propagating pool exhaustion.
+ * Compositions use an evictable memo cache; semantic node exhaustion fails
+ * closed. No returned node identity depends on retaining a memo entry. */
+static SHELL_NONNULL(1) uint32_t
+    dep_process_domain_apply(dep_process_domain_pool_t *pool,
+                             unsigned operation, uint32_t left,
+                             uint32_t right) {
+  if (left == UINT32_MAX || right == UINT32_MAX)
+    return UINT32_MAX;
+  if (operation < 2) {
+    if (left > right) {
+      uint32_t swap = left;
+      left = right;
+      right = swap;
+    }
+    if (left == right || (!operation && left == 0) || (operation && left == 1))
+      return left;
+    if ((!operation && left == 1) || (operation && left == 0))
+      return right;
+  } else if (operation == UINT32_MAX) {
+    if (left < 2)
+      return !left;
+  } else if (left < 2 || dep_process_variable_order(pool->nodes[left - 2].fd) >
+                             dep_process_variable_order(operation - 2))
+    return left;
+  dep_process_domain_apply_t key = {
+      .operation = operation, .left = left, .right = right};
+  uint32_t cached = dep_process_apply_find(pool, &key);
+  if (cached)
+    return pool->applies[cached - 1].result;
+  dep_process_domain_node_t a = pool->nodes[left - 2];
+  uint32_t result;
+  if (operation >= 2 && operation != UINT32_MAX && a.fd == operation - 2) {
+    result = dep_process_domain_apply(pool, 1, a.low, a.high);
+  } else if (operation >= 2) {
+    uint32_t low = dep_process_domain_apply(pool, operation, a.low, 0);
+    if (low == UINT32_MAX)
+      return low;
+    uint32_t high = dep_process_domain_apply(pool, operation, a.high, 0);
+    result = dep_process_domain_node(pool, a.fd, low, high);
+  } else {
+    dep_process_domain_node_t b = pool->nodes[right - 2];
+    uint32_t fd =
+        dep_process_variable_order(a.fd) < dep_process_variable_order(b.fd)
+            ? a.fd
+            : b.fd;
+    uint32_t low = dep_process_domain_apply(
+        pool, operation, a.fd == fd ? a.low : left, b.fd == fd ? b.low : right);
+    if (low == UINT32_MAX)
+      return low;
+    uint32_t high =
+        dep_process_domain_apply(pool, operation, a.fd == fd ? a.high : left,
+                                 b.fd == fd ? b.high : right);
+    result = dep_process_domain_node(pool, fd, low, high);
+  }
+  if (result == UINT32_MAX)
+    return result;
+  key.result = result;
+  return dep_process_apply_save(pool, &key);
+}
+
+static SHELL_NONNULL(1) uint32_t
+    dep_process_domain_assign(dep_process_domain_pool_t *pool, uint32_t root,
+                              uint32_t fd, bool free, bool occupied) {
+  if (root == UINT32_MAX || !root)
+    return root;
+  /* Physical fd is 0..63. Fuse existential removal and the new value in
+   * one memoized walk; never retain an intermediate unconstrained version. */
+  dep_process_domain_apply_t key = {.left = root,
+                                    .right = fd * 4u + (free ? 1u : 0u) +
+                                             (occupied ? 2u : 0u),
+                                    .operation = UINT32_MAX - 4u};
+  uint32_t match = dep_process_apply_find(pool, &key);
+  if (match)
+    return pool->applies[match - 1].result;
+  dep_process_domain_node_t node =
+      root < 2 ? (dep_process_domain_node_t){.fd = INT32_MAX}
+               : pool->nodes[root - 2];
+  uint32_t result;
+  if (root >= 2 &&
+      dep_process_variable_order(node.fd) < dep_process_variable_order(fd)) {
+    uint32_t low =
+        dep_process_domain_assign(pool, node.low, fd, free, occupied);
+    if (low == UINT32_MAX)
+      return low;
+    uint32_t high =
+        dep_process_domain_assign(pool, node.high, fd, free, occupied);
+    result = dep_process_domain_node(pool, node.fd, low, high);
+  } else {
+    uint32_t rest = node.fd == fd
+                        ? dep_process_domain_apply(pool, 1, node.low, node.high)
+                        : root;
+    result = free && occupied
+                 ? rest
+                 : dep_process_domain_node(pool, fd, occupied ? rest : 0,
+                                           free ? rest : 0);
+  }
+  if (result == UINT32_MAX)
+    return result;
+  key.result = (uint16_t)result;
+  return dep_process_apply_save(pool, &key);
+}
+
+static SHELL_NONNULL(1) uint32_t
+    dep_selector_choice(dep_process_domain_pool_t *pool, uint32_t selector,
+                        uint32_t value) {
+  /* Unary first-high encoding has no invalid Boolean valuations: the first
+   * high bit chooses 0..63 and the all-low path chooses the abstract tail 64.
+   * Earlier highs must therefore be excluded; later bits are irrelevant. */
+  uint32_t root = value == DEP_SELECTOR_BITS
+                      ? 1
+                      : dep_process_domain_node(pool, selector + value, 0, 1);
+  uint32_t preceding = DEP_SELECTOR_BITS;
+  if (value < DEP_SELECTOR_BITS)
+    preceding = value;
+  while (preceding-- != 0)
+    root = dep_process_domain_node(pool, selector + preceding, root, 0);
+  return root;
+}
+
+static SHELL_NONNULL(1) uint32_t
+    dep_selector_equal(dep_process_domain_pool_t *pool, uint32_t left,
+                       uint32_t right) {
+  if (left == right)
+    return 1;
+  if (left > right) {
+    uint32_t swap = left;
+    left = right;
+    right = swap;
+  }
+  /* Both spans use the same first-high encoding. Build equality as one
+   * descriptor-major ladder: matching highs terminate successfully, while
+   * matching lows continue to the next value. The all-low path is the shared
+   * abstract tail. This is linear in the selector width and admits every
+   * Boolean assignment through exactly one semantic value. */
+  uint32_t equal = 1;
+  for (uint32_t value = DEP_SELECTOR_BITS; value-- != 0;) {
+    uint32_t right_low = dep_process_domain_node(pool, right + value, equal, 0);
+    uint32_t right_high = dep_process_domain_node(pool, right + value, 0, 1);
+    if (right_low == UINT32_MAX || right_high == UINT32_MAX)
+      return UINT32_MAX;
+    equal = dep_process_domain_node(pool, left + value, right_low, right_high);
+    if (equal == UINT32_MAX)
+      return equal;
+  }
+  return equal;
+}
+
+/* Existentially retire the complete selector span in one memoized DAG walk.
+ * The cache key includes the selector, unlike a sequence of single-bit
+ * forgets which repeatedly reconstructs the same unaffected prefixes. */
+static SHELL_NONNULL(1) uint32_t
+    dep_selector_forget(dep_process_domain_pool_t *pool, uint32_t root,
+                        uint32_t selector) {
+  if (root < 2 || root == UINT32_MAX)
+    return root;
+  dep_process_domain_node_t node = pool->nodes[root - 2];
+  if (dep_process_variable_order(node.fd) >
+      dep_process_variable_order(selector + DEP_SELECTOR_BITS - 1))
+    return root;
+  dep_process_domain_apply_t key = {
+      .operation = UINT32_MAX - 2, .left = root, .right = selector};
+  uint32_t cached = dep_process_apply_find(pool, &key);
+  if (cached)
+    return pool->applies[cached - 1].result;
+  uint32_t low = dep_selector_forget(pool, node.low, selector);
+  if (low == UINT32_MAX)
+    return low;
+  uint32_t high = dep_selector_forget(pool, node.high, selector);
+  uint32_t result =
+      node.fd >= selector && node.fd - selector < DEP_SELECTOR_BITS
+          ? dep_process_domain_apply(pool, 1, low, high)
+          : dep_process_domain_node(pool, node.fd, low, high);
+  if (result == UINT32_MAX)
+    return result;
+  key.result = (uint16_t)result;
+  return dep_process_apply_save(pool, &key);
+}
+
+/* Rebase a batch from one immutable source pool. Before starting a batch from
+ * a different or reset source, the caller clears destination->import_count.
+ * Terminals and same-pool roots need no copying. */
+static SHELL_NONNULL(1, 2) uint32_t
+    dep_process_domain_import_inner(dep_process_domain_pool_t *destination,
+                                    const dep_process_domain_pool_t *source,
+                                    uint32_t root) {
+  if (source == destination || root < 2)
+    return root;
+  if (destination->import_count < root - 1) {
+    memset(destination->import_cache + destination->import_count, 0,
+           (root - 1 - destination->import_count) *
+               sizeof(*destination->import_cache));
+    destination->import_count = root - 1;
+  }
+  if (destination->import_cache[root - 2]) {
+    return destination->import_cache[root - 2] == UINT16_MAX
+               ? UINT32_MAX
+               : (uint32_t)destination->import_cache[root - 2] - 1;
+  }
+  /* Mark the active recursion before descending. Source domains are DAGs;
+   * seeing this sentinel therefore propagates corruption/exhaustion rather
+   * than recursing indefinitely. Stored roots are biased by one so terminal
+   * false remains distinguishable from an unvisited cache entry. */
+  destination->import_cache[root - 2] = UINT16_MAX;
+  const dep_process_domain_node_t *node = &source->nodes[root - 2];
+  uint32_t low =
+      dep_process_domain_import_inner(destination, source, node->low);
+  if (low == UINT32_MAX)
+    return UINT32_MAX;
+  uint32_t high =
+      dep_process_domain_import_inner(destination, source, node->high);
+  if (high == UINT32_MAX)
+    return UINT32_MAX;
+  uint32_t result = dep_process_domain_node(destination, node->fd, low, high);
+  if (result != UINT32_MAX)
+    destination->import_cache[root - 2] = result + 1;
+  /* Exhaustion is permanent for this immutable-source batch. Keep the same
+   * failed sentinel instead of revisiting shared failing subtrees; a new
+   * batch or compaction explicitly clears the import cache. */
+  return result;
+}
+
+static SHELL_NONNULL(1, 2) uint32_t
+    dep_process_domain_import(dep_process_domain_pool_t *destination,
+                              const dep_process_domain_pool_t *source,
+                              uint32_t root) {
+  return dep_process_domain_import_inner(destination, source, root);
+}
+
 static SHELL_NONNULL(1) void dep_route_journal_reset(
     dep_route_journal_t *journal) {
   journal->count = 0;
+  journal->tree_root = 0;
+  journal->tree_allocations = 0;
+  journal->tree_free = journal->tree_free_count = 0;
+  journal->tree_reuse = true;
   journal->snapshot_count = 0;
+  journal->snapshot_allocations = 0;
+  journal->snapshot_free = journal->snapshot_free_count = 0;
+  journal->snapshot_reuse = true;
+  memset(journal->tree_cache, 0, sizeof(journal->tree_cache));
   journal->snapshot_root = 0;
   journal->link_count = 0;
   journal->member_count = 0;
   journal->allocation_root = journal->allocation_count = 0;
   journal->observable_fd_count = 0;
+  journal->process_domains.root = journal->process_domains.count = 0;
+  journal->process_domains.free_node = journal->process_domains.free_count =
+      journal->process_domains.node_allocations = 0;
+  journal->process_domains.memo_ready = false;
+  journal->process_domains.import_count = 0;
+  journal->read_observations.root = journal->read_observations.count = 0;
+  journal->read_observations.active = false;
+  journal->read_observations.identity = false;
   journal->scratch_observable = false;
   journal->named_closes = false;
   journal->ifs_seen = false;
   journal->diagnostics = NULL;
   journal->diagnostic_cleanup = false;
   memset(journal->joins, 0, sizeof(journal->joins));
+}
+
+/* Keep ephemeral predicate construction bounded independently of how many
+ * candidate FDs are examined. Only live expression roots enter the journal;
+ * rebuilding scratch drops unreachable intermediate nodes and apply entries.
+ * roots is the complete live scratch-root span for this construction step.
+ * Callers use its rewritten IDs afterwards; no other scratch IDs survive.
+ * Roots in the separate retained journal are unaffected. */
+static SHELL_NONNULL(1, 2) bool dep_process_domain_compact(
+    dep_route_journal_t *journal, uint32_t *roots, uint32_t count) {
+  dep_process_domain_pool_t *scratch = journal->process_scratch;
+  uint32_t previous = scratch->count;
+  memset(scratch->import_cache, 0, previous * sizeof(*scratch->import_cache));
+  for (uint32_t i = 0; i < count; i++) {
+    if (roots[i] == UINT32_MAX)
+      return false;
+    if (roots[i] >= 2)
+      scratch->import_cache[roots[i] - 2] = 1;
+  }
+  /* Interned children precede their parents. Mark backwards, then relocate
+   * forwards in place using the existing import cache as a forwarding map.
+   * No ephemeral predicate enters the retained journal during collection. */
+  for (uint32_t i = previous; i-- != 0;) {
+    if (!scratch->import_cache[i])
+      continue;
+    dep_process_domain_node_t node = scratch->nodes[i];
+    if (node.low >= 2)
+      scratch->import_cache[node.low - 2] = 1;
+    if (node.high >= 2)
+      scratch->import_cache[node.high - 2] = 1;
+  }
+  uint32_t retained = 0;
+  for (uint32_t i = 0; i < previous; i++) {
+    if (!scratch->import_cache[i])
+      continue;
+    dep_process_domain_node_t node = scratch->nodes[i];
+    if (node.low >= 2)
+      node.low = scratch->import_cache[node.low - 2];
+    if (node.high >= 2)
+      node.high = scratch->import_cache[node.high - 2];
+    scratch->import_cache[i] = retained + 2;
+    scratch->nodes[retained++] = node;
+  }
+  for (uint32_t i = 0; i < count; i++)
+    if (roots[i] >= 2)
+      roots[i] = scratch->import_cache[roots[i] - 2];
+  scratch->root = 0;
+  scratch->memo_ready = false;
+  scratch->count = retained;
+  scratch->free_node = scratch->free_count = 0;
+  scratch->node_allocations = retained;
+  scratch->import_count = 0;
+  memset(scratch->node_cache, 0, sizeof(scratch->node_cache));
+  for (uint32_t i = 0; i < retained; i++) {
+    uint32_t match = 0;
+    scratch->root = dep_index_insert(
+        scratch->index, scratch->root, i + 1, DEP_PROCESS_DOMAIN_CAPACITY,
+        dep_process_domain_compare, scratch, &scratch->nodes[i], &match);
+  }
+  return true;
+}
+
+static SHELL_NONNULL(1) void dep_process_domain_mark(
+    dep_process_domain_pool_t *pool, uint32_t root) {
+  if (root < 2 || (pool->import_cache[root - 2] & 5u))
+    return;
+  pool->import_cache[root - 2] |= 1u;
+  dep_process_domain_node_t node = pool->nodes[root - 2];
+  dep_process_domain_mark(pool, node.low);
+  dep_process_domain_mark(pool, node.high);
+}
+
+/* Return the exact number of nonterminal nodes reachable from one compact
+ * scratch root. The scratch mark array has no retained IDs or free-list marks;
+ * callers reset it between roots and use the count only to reserve a bounded
+ * incremental import. */
+static SHELL_NONNULL(1) uint32_t
+    dep_process_domain_reachable(dep_process_domain_pool_t *pool,
+                                 uint32_t root) {
+  memset(pool->import_cache, 0, pool->count * sizeof(*pool->import_cache));
+  dep_process_domain_mark(pool, root);
+  uint32_t count = 0;
+  for (uint32_t i = 0; i < pool->count; i++)
+    count += (pool->import_cache[i] & 1u) != 0;
+  return count;
+}
+
+static SHELL_NONNULL(1) void dep_process_domain_mark_map(
+    dep_route_journal_t *journal, uint32_t root);
+
+/* Only cleanup-program nodes reachable from a live FAILURE_UNDO fact retain
+ * their cached input/output maps. Superseded persistent prefixes are history,
+ * not roots merely because their records remain in the bounded workspace. */
+static SHELL_NONNULL(1) void dep_process_domain_mark_failure(
+    dep_route_journal_t *journal, uint32_t root) {
+  if (!root || (journal->process_domains.import_cache[root - 1] & 8u))
+    return;
+  journal->process_domains.import_cache[root - 1] |= 8u;
+  const dep_failure_cleanup_t *node = &journal->failure->nodes[root - 1];
+  dep_process_domain_mark_failure(journal, node->left);
+  dep_process_domain_mark_failure(journal, node->right);
+  if (node->ready) {
+    dep_process_domain_mark_map(journal, node->input);
+    dep_process_domain_mark_map(journal, node->output);
+  }
+}
+
+/* Immutable map versions can retain entry/undo maps as values. Mark those
+ * references as well as AVL children; historical, unreachable map versions do
+ * not pin their intermediate decision expressions. uses trees share the node
+ * store but their snapshots are ordinal-index sentinels, not descriptor facts.
+ * The shared mark array has disjoint bits for decision nodes, route-map nodes,
+ * cleanup nodes, and already-free decision slots. */
+static SHELL_NONNULL(1) void dep_process_domain_mark_tree(
+    dep_route_journal_t *journal, uint32_t root, bool descriptor_facts) {
+  if (!root || (journal->process_domains.import_cache[root - 1] & 2u))
+    return;
+  journal->process_domains.import_cache[root - 1] |= 2u;
+  const dep_route_change_t *entry = &journal->entries[root - 1];
+  dep_process_domain_mark_tree(journal, entry->left, descriptor_facts);
+  dep_process_domain_mark_tree(journal, entry->right, descriptor_facts);
+  if (!descriptor_facts)
+    return;
+  journal->process_domains.import_cache[entry->snapshot - 1] |= 16u;
+  const dep_route_set_t *fact = &journal->snapshots[entry->snapshot - 1];
+  if (!fact->count)
+    return;
+  dep_fd_access_t access = dep_route_change_access(entry);
+  if (access == DEP_FD_ACCESS_PROCESS_DOMAIN ||
+      access == DEP_FD_ACCESS_PROCESS_BEFORE)
+    dep_process_domain_mark(&journal->process_domains, fact->routes[0].value);
+  else if (access == DEP_FD_ACCESS_NAMED_BINDINGS ||
+           access == DEP_FD_ACCESS_ENTRY ||
+           access == DEP_FD_ACCESS_SETUP_FRAME ||
+           access == DEP_FD_ACCESS_UNDO_ENTRY ||
+           access == DEP_FD_ACCESS_MOVE_ENTRY ||
+           access == DEP_FD_ACCESS_PRIVATE_ENTRY)
+    dep_process_domain_mark_map(journal, fact->routes[0].value);
+  else if (access == DEP_FD_ACCESS_FAILURE_UNDO) {
+    dep_process_domain_mark_failure(journal, fact->routes[0].value);
+    if (fact->count > 1)
+      dep_process_domain_mark_tree(journal, fact->routes[1].value, false);
+  } else if (access == DEP_FD_ACCESS_PROCESS_OWNED)
+    /* Ownership is an isolated set of descriptor keys, with sentinel values
+     * rather than snapshot IDs. Its root is live through this fact just like
+     * the cleanup program's dependency tree above. */
+    dep_process_domain_mark_tree(journal, fact->routes[0].value, false);
+}
+
+static SHELL_NONNULL(1) void dep_process_domain_mark_map(
+    dep_route_journal_t *journal, uint32_t root) {
+  dep_process_domain_mark_tree(journal, root, true);
+}
+
+static SHELL_NONNULL(1, 2) void dep_process_domain_mark_state(
+    dep_route_journal_t *journal, const dep_route_state_t *state) {
+  dep_route_iterator_t iterator = dep_route_iterator(state);
+  uint32_t root;
+  while (dep_route_next(&iterator, journal, &root))
+    dep_process_domain_mark_map(journal, root);
+}
+
+static SHELL_NONNULL(1, 2) void dep_process_domain_mark_flow(
+    dep_route_journal_t *journal, const dep_fd_flow_t *flow) {
+  for (unsigned i = 0; i < 5; i++)
+    if (flow->mask & (1u << i))
+      dep_process_domain_mark_state(journal, &flow->state[i]);
+}
+
+/* A completed root-parse prefix has no borrowed decision IDs outside these
+ * published tables, the execution stream, and its current local state. Reuse
+ * unreachable slots without changing any live ID. Recursive construction is
+ * deliberately excluded: its caller can hold an in-flight import or prefix.
+ * Scratch construction remains dense and uses its separate compacting pass.
+ * Ordinary sweeps are amortized over a quarter-pool's new allocations. Once
+ * only one eighth remains, sweep after an eighth-pool so the next bounded
+ * scratch import cannot consume the remaining headroom before collection. */
+static SHELL_NONNULL(1, 3, 4) bool dep_route_collection_begin(
+    dep_route_journal_t *journal, uint32_t decision_reserve,
+    bool *collect_process, bool *collect_routes) {
+  dep_process_domain_pool_t *pool = &journal->process_domains;
+  uint32_t decision_available =
+      DEP_PROCESS_DOMAIN_CAPACITY - pool->count + pool->free_count;
+  bool reserve_process = decision_reserve > decision_available;
+  bool decision_pressure =
+      pool->count >= DEP_PROCESS_DOMAIN_CAPACITY * 7 / 8 &&
+      pool->node_allocations >= DEP_PROCESS_DOMAIN_CAPACITY / 8;
+  *collect_process =
+      reserve_process ||
+      (pool->count >= DEP_PROCESS_DOMAIN_CAPACITY / 2 &&
+       (pool->node_allocations >= DEP_PROCESS_DOMAIN_CAPACITY / 4 ||
+        decision_pressure));
+  uint32_t route_interval = DEP_ROUTE_CHANGE_CAPACITY / 16;
+  uint32_t route_available =
+      DEP_ROUTE_CHANGE_CAPACITY - journal->count + journal->tree_free_count;
+  uint32_t snapshot_interval = DEP_ROUTE_SNAPSHOT_CAPACITY / 4;
+  uint32_t snapshot_available = DEP_ROUTE_SNAPSHOT_CAPACITY -
+                                journal->snapshot_count +
+                                journal->snapshot_free_count;
+  bool snapshot_pressure =
+      journal->snapshot_count >= DEP_ROUTE_SNAPSHOT_CAPACITY * 3 / 4 &&
+      (journal->snapshot_allocations >= snapshot_interval ||
+       snapshot_available < DEP_ROUTE_OPERATION_CAPACITY);
+  *collect_routes = snapshot_pressure ||
+                    (journal->count >= DEP_ROUTE_CHANGE_CAPACITY * 3 / 4 &&
+                     (journal->tree_allocations >= route_interval ||
+                      route_available < DEP_ROUTE_OPERATION_CAPACITY));
+  /* Unreachable interned route nodes and snapshots can contain decision roots.
+   * They are not roots merely because their canonical records remain cached,
+   * but they must be evicted in the same pass that reclaims those decisions;
+   * otherwise later interning could resurrect a freed decision ID. */
+  *collect_routes |= *collect_process;
+  if (!*collect_process && !*collect_routes)
+    return false;
+  pool->import_count = 0;
+  uint32_t marks = pool->count > journal->count ? pool->count : journal->count;
+  if (journal->snapshot_count > marks)
+    marks = journal->snapshot_count;
+  if (journal->failure->count > marks)
+    marks = journal->failure->count;
+  memset(pool->import_cache, 0, marks * sizeof(*pool->import_cache));
+  if (*collect_process)
+    for (uint32_t free = pool->free_node; free;
+         free = pool->nodes[free - 1].low)
+      pool->import_cache[free - 1] = 4u;
+  return true;
+}
+
+static SHELL_NONNULL(1) void dep_process_domain_collection_end(
+    dep_route_journal_t *journal) {
+  dep_process_domain_pool_t *pool = &journal->process_domains;
+  for (uint32_t i = 0; i < pool->count; i++) {
+    if (pool->import_cache[i] & 5u)
+      continue;
+    pool->root =
+        dep_index_erase(pool->index, pool->root, dep_process_domain_compare,
+                        pool, &pool->nodes[i]);
+    pool->nodes[i].low = pool->free_node;
+    pool->free_node = i + 1;
+    pool->free_count++;
+  }
+  pool->node_allocations = 0;
+  pool->memo_ready = false;
+  memset(pool->node_cache, 0, sizeof(pool->node_cache));
+}
+
+/* Completed-operation collection keeps stable IDs. Dead interior records join
+ * a private free list; a dead suffix also lowers the high-water mark. Rebuild
+ * the free chain once after the sweep rather than unlinking arbitrary IDs. */
+static SHELL_NONNULL(1) void dep_route_tree_collection_end(
+    dep_route_journal_t *journal) {
+  for (uint32_t i = 0; i < journal->count; i++) {
+    dep_route_change_t *node = &journal->entries[i];
+    if (!node->snapshot || (journal->process_domains.import_cache[i] & 2u))
+      continue;
+    if (node->interned)
+      journal->tree_root =
+          dep_index_erase(journal->tree_index, journal->tree_root,
+                          dep_route_tree_node_compare, journal, node);
+    node->interned = false;
+    node->snapshot = 0;
+  }
+  while (journal->count && !journal->entries[journal->count - 1].snapshot)
+    journal->count--;
+  journal->tree_free = journal->tree_free_count = 0;
+  for (uint32_t i = journal->count; i-- != 0;)
+    if (!journal->entries[i].snapshot) {
+      journal->tree_index[i].left = journal->tree_free;
+      journal->tree_free = (uint16_t)(i + 1);
+      journal->tree_free_count++;
+    }
+  journal->tree_allocations = 0;
+  /* Joins borrow route IDs without retaining their inputs or result. Any
+   * route sweep can recycle those IDs, including a route-only collection
+   * that does not reclaim decision nodes. */
+  memset(journal->joins, 0, sizeof(journal->joins));
+}
+
+/* Snapshot identities are referenced by live route nodes. Keep their stable
+ * IDs while reclaiming unreferenced interned values; a UINT32_MAX count marks
+ * a private free slot after it has been removed from the canonical index. */
+static SHELL_NONNULL(1) void dep_route_snapshot_collection_end(
+    dep_route_journal_t *journal) {
+  for (uint32_t i = 0; i < journal->snapshot_count; i++) {
+    dep_route_set_t *snapshot = &journal->snapshots[i];
+    if (snapshot->count == UINT32_MAX ||
+        (journal->process_domains.import_cache[i] & 16u))
+      continue;
+    journal->snapshot_root =
+        dep_snapshot_index_remove(journal, journal->snapshot_root, snapshot);
+    snapshot->count = UINT32_MAX;
+  }
+  while (journal->snapshot_count &&
+         journal->snapshots[journal->snapshot_count - 1].count == UINT32_MAX)
+    journal->snapshot_count--;
+  journal->snapshot_free = journal->snapshot_free_count = 0;
+  for (uint32_t i = journal->snapshot_count; i-- != 0;)
+    if (journal->snapshots[i].count == UINT32_MAX) {
+      journal->snapshot_index[i].left = journal->snapshot_free;
+      journal->snapshot_free = (uint16_t)(i + 1);
+      journal->snapshot_free_count++;
+    }
+  journal->snapshot_allocations = 0;
+}
+
+static SHELL_NONNULL(1, 2, 3) void dep_route_domains_collect_required(
+    dep_route_journal_t *journal, const dep_domain_collection_t *collection,
+    const dep_route_state_t *live, const dep_route_state_t *pending,
+    uint32_t decision_reserve) {
+  dep_route_workspace_t *workspace = collection->workspace;
+  const dep_snapshot_frame_t *frame = collection->frame;
+  bool collect_process, collect_routes;
+  if ((frame && frame != workspace->snapshot_frames) ||
+      !dep_route_collection_begin(journal, decision_reserve, &collect_process,
+                                  &collect_routes))
+    return;
+  if (collect_routes)
+    for (uint32_t i = 0; i < journal->failure->count; i++)
+      journal->failure->nodes[i].ready = false;
+  for (const dep_domain_collection_t *pins = collection; pins;
+       pins = pins->parent) {
+    for (uint32_t i = 0; i < 5; i++)
+      if (pins->roots[i])
+        dep_process_domain_mark_state(journal, pins->roots[i]);
+    for (uint32_t i = 0; i < pins->state_count; i++)
+      dep_process_domain_mark_state(journal, pins->states + i);
+    if (pins->flow)
+      dep_process_domain_mark_flow(journal, pins->flow);
+    if (pins->remaining) {
+      dep_route_iterator_t remaining = *pins->remaining;
+      uint32_t root;
+      while (dep_route_next(&remaining, journal, &root))
+        dep_process_domain_mark_map(journal, root);
+    }
+    for (uint32_t i = 0; i < pins->decision_count; i++)
+      dep_process_domain_mark(&journal->process_domains, pins->decisions[i]);
+  }
+  dep_process_domain_mark_state(journal, live);
+  if (pending)
+    dep_process_domain_mark_state(journal, pending);
+  /* Prepared frame membership can union slots from several execution paths.
+   * No one descriptor map necessarily retains that union snapshot; allocation
+   * records own it until their journal/frame is released. */
+  if (collect_routes)
+    for (uint32_t i = 0; i < journal->allocation_count; i++)
+      if (journal->allocations[i].closed_slots)
+        journal->process_domains
+            .import_cache[journal->allocations[i].closed_slots - 1] |= 16u;
+  if (frame) {
+    for (uint32_t i = 0; i < workspace->snapshot_table_count; i++)
+      dep_process_domain_mark_state(
+          journal, &workspace->snapshot_tables[i].alternatives);
+  } else {
+    dep_process_domain_mark_state(journal, &workspace->persistent_route_state);
+    for (uint32_t i = 0; i < SHELL_MAX_GROUPS; i++) {
+      dep_process_domain_mark_state(journal, &workspace->scoped_route_state[i]);
+      dep_process_domain_mark_state(journal, &workspace->group_route_state[i]);
+      dep_process_domain_mark_state(journal,
+                                    &workspace->group_shell_route_state[i]);
+    }
+    for (uint32_t i = 0; i < SHELL_DEP_MAX_NODES; i++)
+      dep_process_domain_mark_state(journal, &workspace->owner_route_state[i]);
+  }
+  const dep_fd_stream_t *stream =
+      frame ? &frame->fd_stream : &workspace->fd_stream;
+  for (uint32_t i = 0; i < SHELL_MAX_GROUPS + 1; i++)
+    dep_process_domain_mark_flow(journal, &stream->scope[i]);
+  for (uint32_t i = 0; i < SHELL_MAX_GROUPS; i++)
+    dep_process_domain_mark_flow(journal, &stream->setup_failure[i]);
+  for (uint32_t i = 0; i < DEP_EXECUTION_EVENT_CAPACITY; i++) {
+    dep_process_domain_mark_flow(journal, &stream->entry[i]);
+    dep_process_domain_mark_flow(journal, &stream->async_entry[i]);
+    dep_process_domain_mark_state(journal, &stream->selected[i]);
+  }
+  if (collect_routes) {
+    dep_route_snapshot_collection_end(journal);
+    dep_route_tree_collection_end(journal);
+  }
+  if (collect_process)
+    dep_process_domain_collection_end(journal);
+}
+
+static SHELL_NONNULL(1, 2, 3) void dep_route_domains_collect(
+    dep_route_journal_t *journal, const dep_domain_collection_t *collection,
+    const dep_route_state_t *live, const dep_route_state_t *pending) {
+  dep_route_domains_collect_required(journal, collection, live, pending, 0);
 }
 
 static SHELL_NONNULL(1) void dep_route_journal_rewind(
@@ -8659,6 +12083,13 @@ static SHELL_NONNULL(1, 3) int dep_allocation_compare(const void *context,
   const dep_allocation_t *left =
       &((const dep_route_journal_t *)context)->allocations[index];
   const dep_allocation_t *right = key;
+  if (left->role == DEP_ALLOCATION_IMPORT ||
+      right->role == DEP_ALLOCATION_IMPORT) {
+    if (left->role != right->role)
+      return left->role < right->role ? -1 : 1;
+    return left->position < right->position ? -1
+                                            : left->position != right->position;
+  }
   if (left->name != right->name)
     return (uintptr_t)left->name < (uintptr_t)right->name ? -1 : 1;
   if (left->position != right->position)
@@ -8697,8 +12128,52 @@ static SHELL_NONNULL(1, 2) uint32_t
 /* Paired halves of a named open retain one binding allocation identity. */
 static SHELL_NONNULL(1, 2) uint32_t
     dep_allocation_slot(dep_route_journal_t *journal, const dep_fd_op_t *op) {
-  dep_allocation_t key = {.name = op->fd_name, .position = op->pos};
+  dep_allocation_t key = {
+      .name = op->fd_name,
+      .allocation = op->pos == UINT32_MAX ? NULL : op->fd_name,
+      .name_length = op->fd_name_len,
+      .position = op->pos,
+      .observations = op->fd_name_len
+                          ? dep_read_observation(
+                                &journal->read_observations,
+                                (dep_fd_ref_t){.name = op->fd_name,
+                                               .value = SHELL_DEP_FD_NAMED,
+                                               .name_len = op->fd_name_len})
+                          : 0};
   return dep_allocation_key_slot(journal, &key, true);
+}
+
+/* Several exported variable names can hold the same descriptor number. Adopt
+ * the identity once per child journal, not separately for each spelling. */
+static SHELL_NONNULL(1) uint32_t
+    dep_import_allocation_slot(dep_route_journal_t *journal, dep_fd_ref_t name,
+                               uint32_t selector, const char *allocation) {
+  dep_allocation_t key = {.name = name.name,
+                          .allocation = allocation,
+                          .name_length = name.name_len,
+                          .position = selector,
+                          .role = DEP_ALLOCATION_IMPORT,
+                          .selector = selector};
+  uint32_t slot = dep_allocation_key_slot(journal, &key, true);
+  if (slot != SHELL_DEP_FD_NONE)
+    journal->allocations[slot - SHELL_DEP_FD_MAX - 1].observations |=
+        dep_read_observation(&journal->read_observations, name);
+  return slot;
+}
+
+static SHELL_NONNULL(1) uint32_t
+    dep_allocation_selector(dep_route_journal_t *journal, uint32_t key) {
+  dep_allocation_t *allocation =
+      &journal->allocations[key - SHELL_DEP_FD_MAX - 1];
+  if (!allocation->selector) {
+    /* Shared by construction and replay, and not rewound with child journals.
+     * A parent/imported predicate can still reference a child's numeric IDs
+     * after its journal-local allocation records have been released. */
+    if (*journal->next_selector >= (INT32_MAX - 130) / 65)
+      return 0;
+    allocation->selector = 64 + 65 * (*journal->next_selector)++;
+  }
+  return allocation->selector;
 }
 
 /* Every reached explicit target save and implicit move-source save has its
@@ -8711,6 +12186,41 @@ static SHELL_NONNULL(1, 2) uint32_t
   dep_allocation_t key = {
       .name = op->fd_name, .position = op->pos, .fd = op->fd, .role = role};
   return dep_allocation_key_slot(journal, &key, create);
+}
+
+static SHELL_NONNULL(1,
+                     3) int dep_route_tree_node_compare(const void *context,
+                                                        uint32_t index,
+                                                        const void *pending) {
+  const dep_route_change_t *left =
+      &((const dep_route_journal_t *)context)->entries[index];
+  const dep_route_change_t *right = pending;
+  const dep_route_journal_t *journal = context;
+  int order = dep_fd_ref_compare(dep_route_change_fd(journal, left),
+                                 dep_route_change_fd(journal, right));
+  if (order)
+    return order;
+  if (left->access_key != right->access_key)
+    return left->access_key < right->access_key ? -1 : 1;
+  if (left->snapshot != right->snapshot)
+    return left->snapshot < right->snapshot ? -1 : 1;
+  if (left->left != right->left)
+    return left->left < right->left ? -1 : 1;
+  if (left->right != right->right)
+    return left->right < right->right ? -1 : 1;
+  return left->height < right->height ? -1 : left->height != right->height;
+}
+
+static SHELL_NONNULL(1) void dep_route_tree_rollback(
+    dep_route_journal_t *journal, uint32_t count) {
+  while (journal->count > count) {
+    dep_route_change_t *node = &journal->entries[journal->count - 1];
+    if (node->interned)
+      journal->tree_root =
+          dep_index_erase(journal->tree_index, journal->tree_root,
+                          dep_route_tree_node_compare, journal, node);
+    journal->count--;
+  }
 }
 
 static SHELL_NONNULL(1) void dep_route_journal_rewind(
@@ -8729,7 +12239,7 @@ static SHELL_NONNULL(1) void dep_route_journal_rewind(
         &journal->snapshots[journal->snapshot_count - 1]);
     journal->snapshot_count--;
   }
-  journal->count = nodes;
+  dep_route_tree_rollback(journal, nodes);
   journal->link_count = links;
   journal->member_count = members;
   memset(journal->joins, 0, sizeof(journal->joins));
@@ -8740,12 +12250,28 @@ static SHELL_NONNULL(1) unsigned dep_route_tree_height(
   return root ? journal->entries[root - 1].height : 0;
 }
 
+static SHELL_NONNULL(1) void dep_route_tree_named_live(
+    dep_route_journal_t *journal, uint32_t root) {
+  dep_route_change_t *node = &journal->entries[root - 1];
+  node->named_live =
+      (node->left && journal->entries[node->left - 1].named_live) ||
+      (node->right && journal->entries[node->right - 1].named_live);
+  if (node->access_key == dep_fd_access_key(DEP_FD_ACCESS_BINDING) &&
+      journal->entry_names[root - 1]) {
+    const dep_route_set_t *fact = &journal->snapshots[node->snapshot - 1];
+    for (uint32_t i = 0; i < fact->count; i++)
+      node->named_live |= fact->routes[i].kind == DEP_ROUTE_ALIAS ||
+                          fact->routes[i].kind == DEP_ROUTE_INHERITED;
+  }
+}
+
 static SHELL_NONNULL(1) int dep_route_tree_balance(dep_route_journal_t *journal,
                                                    uint32_t root) {
   dep_route_change_t *node = &journal->entries[root - 1];
   unsigned left = dep_route_tree_height(journal, node->left);
   unsigned right = dep_route_tree_height(journal, node->right);
   node->height = (uint8_t)(1 + (left > right ? left : right));
+  dep_route_tree_named_live(journal, root);
   return (int)left - (int)right;
 }
 
@@ -8756,13 +12282,36 @@ static SHELL_NONNULL(1) int dep_route_tree_skew(
          (int)dep_route_tree_height(journal, node->right);
 }
 
+static SHELL_NONNULL(1) uint32_t
+    dep_route_tree_available(const dep_route_journal_t *journal) {
+  return DEP_ROUTE_CHANGE_CAPACITY - journal->count +
+         (journal->tree_reuse ? journal->tree_free_count : 0);
+}
+
+static SHELL_NONNULL(1) uint32_t
+    dep_route_tree_allocate(dep_route_journal_t *journal) {
+  uint32_t result;
+  if (journal->tree_reuse && journal->tree_free) {
+    result = journal->tree_free;
+    journal->tree_free = journal->tree_index[result - 1].left;
+    journal->tree_free_count--;
+  } else {
+    result = ++journal->count;
+  }
+  journal->tree_allocations++;
+  return result;
+}
+
 /* append preflights one update's maximum path/rotation storage. Only freshly
  * cloned nodes may be mutated; all published roots remain immutable. */
 static SHELL_NONNULL(1) uint32_t
     dep_route_tree_clone(dep_route_journal_t *journal, uint32_t root) {
   DEP_METADATA_WORK(SHELLSPLIT_TEST_WORK_ROUTE_LOOKUP);
-  journal->entries[journal->count] = journal->entries[root - 1];
-  return ++journal->count;
+  uint32_t result = dep_route_tree_allocate(journal);
+  journal->entries[result - 1] = journal->entries[root - 1];
+  journal->entry_names[result - 1] = journal->entry_names[root - 1];
+  journal->entries[result - 1].interned = false;
+  return result;
 }
 
 static SHELL_NONNULL(1) uint32_t
@@ -8785,36 +12334,8 @@ static SHELL_NONNULL(1) uint32_t
 }
 
 static SHELL_NONNULL(1) uint32_t
-    dep_route_tree_set(dep_route_journal_t *journal, uint32_t root,
-                       dep_fd_ref_t fd, dep_fd_access_t access,
-                       uint32_t snapshot) {
-  DEP_METADATA_WORK(SHELLSPLIT_TEST_WORK_ROUTE_LOOKUP);
-  if (!root) {
-    journal->entries[journal->count] = (dep_route_change_t){
-        .fd = fd, .snapshot = snapshot, .height = 1, .access = access};
-    return ++journal->count;
-  }
-  const dep_route_change_t *old = &journal->entries[root - 1];
-  int order = dep_fd_ref_compare(old->fd, fd);
-  if (!order)
-    order = old->access < access ? -1 : old->access != access;
-  if (!order && old->snapshot == snapshot)
-    return root;
-  uint32_t next = 0;
-  if (order) {
-    uint32_t child = order > 0 ? old->left : old->right;
-    next = dep_route_tree_set(journal, child, fd, access, snapshot);
-    if (next == child)
-      return root;
-  }
-  root = dep_route_tree_clone(journal, root);
+    dep_route_tree_rebalance(dep_route_journal_t *journal, uint32_t root) {
   dep_route_change_t *node = &journal->entries[root - 1];
-  if (!order)
-    node->snapshot = snapshot;
-  else if (order > 0)
-    node->left = next;
-  else
-    node->right = next;
   int balance = dep_route_tree_balance(journal, root);
   if (balance > 1) {
     if (dep_route_tree_skew(journal, node->left) < 0) {
@@ -8833,11 +12354,131 @@ static SHELL_NONNULL(1) uint32_t
   return root;
 }
 
-static SHELL_NONNULL(1, 2) bool dep_route_state_append_one(
+static SHELL_NONNULL(1) uint32_t
+    dep_route_tree_intern(dep_route_journal_t *journal, uint32_t root) {
+  dep_route_tree_named_live(journal, root);
+  dep_route_change_t *node = &journal->entries[root - 1];
+  dep_fd_ref_t fd = dep_route_change_fd(journal, node);
+  uint32_t hash = fd.value ^ node->snapshot * UINT32_C(0x9e3779b9) ^
+                  node->left * UINT32_C(0x85ebca6b) ^
+                  node->right * UINT32_C(0xc2b2ae35) ^ node->access_key ^
+                  (uint32_t)(uintptr_t)fd.name ^ fd.name_len;
+  hash = (hash ^ (hash >> 16)) & (DEP_ROUTE_TREE_CACHE_CAPACITY - 1);
+  uint32_t cached = journal->tree_cache[hash];
+  if (cached && cached <= journal->count &&
+      journal->entries[cached - 1].interned) {
+    const dep_route_change_t *old = &journal->entries[cached - 1];
+    if (old->snapshot == node->snapshot && old->left == node->left &&
+        old->right == node->right && old->access_key == node->access_key &&
+        old->height == node->height &&
+        dep_fd_ref_equal(dep_route_change_fd(journal, old), fd))
+      return cached;
+  }
+  uint32_t match = 0;
+  journal->tree_root = dep_index_insert(
+      journal->tree_index, journal->tree_root, root, DEP_ROUTE_CHANGE_CAPACITY,
+      dep_route_tree_node_compare, journal, node, &match);
+  if (match == root)
+    node->interned = true;
+  journal->tree_cache[hash] = (uint16_t)match;
+  return match;
+}
+
+static SHELL_NONNULL(1) uint32_t
+    dep_route_tree_set_key(dep_route_journal_t *journal, uint32_t root,
+                           dep_fd_ref_t fd, uint8_t access_key,
+                           uint32_t snapshot) {
+  DEP_METADATA_WORK(SHELLSPLIT_TEST_WORK_ROUTE_LOOKUP);
+  if (fd.value == SHELL_DEP_FD_NAMED &&
+      access_key == dep_fd_access_key(DEP_FD_ACCESS_BINDING))
+    DEP_METADATA_WORK(SHELLSPLIT_TEST_WORK_BINDING_INVALIDATION);
+  if (!root) {
+    uint32_t result = dep_route_tree_allocate(journal);
+    journal->entries[result - 1] = (dep_route_change_t){
+        .snapshot = snapshot, .height = 1, .access_key = access_key};
+    dep_route_change_set_fd(journal, &journal->entries[result - 1], fd);
+    return dep_route_tree_intern(journal, result);
+  }
+  const dep_route_change_t *old = &journal->entries[root - 1];
+  int order = dep_fd_ref_compare(dep_route_change_fd(journal, old), fd);
+  if (!order)
+    order = old->access_key < access_key ? -1 : old->access_key != access_key;
+  if (!order && old->snapshot == snapshot)
+    return root;
+  uint32_t next = 0;
+  if (order) {
+    uint32_t child = order > 0 ? old->left : old->right;
+    next = dep_route_tree_set_key(journal, child, fd, access_key, snapshot);
+    if (next == child)
+      return root;
+  }
+  root = dep_route_tree_clone(journal, root);
+  dep_route_change_t *node = &journal->entries[root - 1];
+  if (!order)
+    node->snapshot = snapshot;
+  else if (order > 0)
+    node->left = next;
+  else
+    node->right = next;
+  return dep_route_tree_intern(journal,
+                               dep_route_tree_rebalance(journal, root));
+}
+
+/* access is one descriptor-fact bit; composite capability masks are expanded
+ * by callers before entering the immutable journal. */
+static SHELL_NONNULL(1) uint32_t
+    dep_route_tree_set(dep_route_journal_t *journal, uint32_t root,
+                       dep_fd_ref_t fd, dep_fd_access_t access,
+                       uint32_t snapshot) {
+  return dep_route_tree_set_key(journal, root, fd, dep_fd_access_key(access),
+                                snapshot);
+}
+
+/* Persistent erase for the interpreter's live process-end set. Storage for
+ * at most four clones/rotations per level is preflighted by its caller. */
+static SHELL_NONNULL(1) uint32_t
+    dep_process_owned_erase(dep_route_journal_t *journal, uint32_t root,
+                            dep_fd_ref_t fd) {
+  if (!root)
+    return 0;
+  dep_route_change_t node = journal->entries[root - 1];
+  dep_fd_ref_t node_fd =
+      dep_route_change_fd(journal, &journal->entries[root - 1]);
+  int order = dep_fd_ref_compare(node_fd, fd);
+  if (!order && (!node.left || !node.right))
+    return node.left ? node.left : node.right;
+  uint32_t next = root;
+  if (order) {
+    uint32_t child = order > 0 ? node.left : node.right;
+    next = dep_process_owned_erase(journal, child, fd);
+    if (next == child)
+      return root;
+  } else {
+    uint32_t successor = node.right;
+    while (journal->entries[successor - 1].left)
+      successor = journal->entries[successor - 1].left;
+    node_fd = dep_route_change_fd(journal, &journal->entries[successor - 1]);
+    node.fd_key = node_fd.name ? node_fd.name_len : node_fd.value;
+    node.right = dep_process_owned_erase(journal, node.right, node_fd);
+  }
+  root = dep_route_tree_clone(journal, root);
+  if (!order) {
+    node.interned = false;
+    journal->entries[root - 1] = node;
+    journal->entry_names[root - 1] = node_fd.name;
+  } else if (order > 0)
+    journal->entries[root - 1].left = next;
+  else
+    journal->entries[root - 1].right = next;
+  return dep_route_tree_intern(journal,
+                               dep_route_tree_rebalance(journal, root));
+}
+
+static SHELL_NONNULL(1, 2) bool dep_route_state_append_map(
     dep_route_state_t *state, dep_route_journal_t *changes, dep_fd_ref_t fd,
     dep_fd_access_t access, dep_route_set_t routes) {
   if (dep_route_tree_height(changes, state->root) + 5 >
-      DEP_ROUTE_CHANGE_CAPACITY - changes->count) {
+      dep_route_tree_available(changes)) {
     state->truncated = true;
     return false;
   }
@@ -8847,6 +12488,65 @@ static SHELL_NONNULL(1, 2) bool dep_route_state_append_one(
     return false;
   }
   state->root = dep_route_tree_set(changes, state->root, fd, access, snapshot);
+  return true;
+}
+
+static SHELL_NONNULL(1, 2) bool dep_route_state_append_one(
+    dep_route_state_t *state, dep_route_journal_t *journal, dep_fd_ref_t fd,
+    dep_fd_access_t access, dep_route_set_t routes) {
+  if (fd.value != SHELL_DEP_FD_NAMED || access != DEP_FD_ACCESS_BINDING)
+    return dep_route_state_append_map(state, journal, fd, access, routes);
+  DEP_METADATA_WORK(SHELLSPLIT_TEST_WORK_BINDING_INVALIDATION);
+  dep_fd_route_t holder = dep_named_bindings(state->root, journal);
+  dep_route_state_t names = dep_route_state_single(holder.value);
+  if (!dep_route_state_append_map(&names, journal, fd, access, routes))
+    return false;
+  if (names.root == holder.value)
+    return true;
+  holder.value = names.root;
+  dep_route_set_set(&routes, holder);
+  return dep_route_state_append_map(state, journal, dep_fd_numeric(0),
+                                    DEP_FD_ACCESS_NAMED_BINDINGS, routes);
+}
+
+/* Actual scalar writes, not descriptor closes/restoration, supersede an
+ * inherited temporary value. Keep a sparse immutable write set: equal route
+ * values can still result from distinct assignments. Root parses and import
+ * construction have no marker; recursive execution installs it afterwards. */
+static SHELL_NONNULL(1, 2) bool dep_read_note_assignment(
+    dep_route_state_t *state, dep_route_journal_t *journal, dep_fd_ref_t fd) {
+  if (!dep_route_state_change(state, journal,
+                              dep_fd_numeric(DEP_SCALAR_IMPORT_EVENT),
+                              DEP_FD_ACCESS_PRIVATE_ENTRY))
+    return true;
+  dep_route_state_t result = {0};
+  dep_route_iterator_t versions = dep_route_iterator(state);
+  uint32_t root;
+  bool first = true;
+  while (dep_route_next(&versions, journal, &root)) {
+    dep_route_state_t one = dep_route_state_single(root);
+    const dep_route_change_t *marker = dep_route_state_change(
+        &one, journal, dep_fd_numeric(DEP_SCALAR_IMPORT_EVENT),
+        DEP_FD_ACCESS_PRIVATE_ENTRY);
+    dep_route_set_t fact = journal->snapshots[marker->snapshot - 1];
+    dep_route_state_t written = dep_route_state_single(fact.routes[0].value);
+    dep_route_set_t present = {0};
+    dep_route_set_set(&present, (dep_fd_route_t){DEP_ROUTE_INHERITED, 1});
+    if (!dep_route_state_append_map(&written, journal, fd,
+                                    DEP_FD_ACCESS_READ_ARGUMENT, present))
+      return false;
+    fact.routes[0].value = written.root;
+    if (!dep_route_state_append_map(&one, journal,
+                                    dep_fd_numeric(DEP_SCALAR_IMPORT_EVENT),
+                                    DEP_FD_ACCESS_PRIVATE_ENTRY, fact) ||
+        (!first && !dep_route_state_add_root(&result, journal, one.root)))
+      return false;
+    if (first)
+      result = one;
+    first = false;
+  }
+  result.correlated = state->correlated;
+  *state = result;
   return true;
 }
 
@@ -8871,9 +12571,128 @@ static SHELL_NONNULL(1, 2, 3) dep_route_set_t
   return result;
 }
 
-static SHELL_NONNULL(1, 2) bool dep_route_state_store_access(
+/* Apply one first-high selector in a memoized source-DAG/choice walk. A high
+ * choice updates that physical descriptor; value 64 is the unchanged abstract
+ * tail. Keep the selector itself so later close/reuse operations remain
+ * correlated with the same physical choice. Explicit lifecycle retirement uses
+ * dep_selector_forget(). This avoids 65 whole-domain cofactors while
+ * preserving unrelated selector identities. */
+static SHELL_NONNULL(1) uint32_t
+    dep_selector_image_walk(dep_process_domain_pool_t *pool, uint32_t root,
+                            uint32_t selector, uint32_t value, bool free,
+                            bool occupied) {
+  if (!root || root == UINT32_MAX || value == DEP_SELECTOR_BITS)
+    return root;
+  uint32_t variable = selector + value;
+  dep_process_domain_node_t node =
+      root < 2 ? (dep_process_domain_node_t){.fd = INT32_MAX}
+               : pool->nodes[root - 2];
+  dep_process_domain_apply_t key = {
+      .operation = UINT32_MAX - 1,
+      .left = root,
+      .right = variable * 4u + (free ? 1u : 0u) + (occupied ? 2u : 0u),
+  };
+  uint32_t cached = dep_process_apply_find(pool, &key);
+  if (cached)
+    return pool->applies[cached - 1].result;
+  DEP_METADATA_WORK(SHELLSPLIT_TEST_WORK_SELECTOR_IMAGE);
+  uint32_t result;
+  if (root >= 2 && dep_process_variable_order(node.fd) <
+                       dep_process_variable_order(variable)) {
+    uint32_t low = dep_selector_image_walk(pool, node.low, selector, value,
+                                           free, occupied);
+    if (low == UINT32_MAX)
+      return low;
+    uint32_t high = dep_selector_image_walk(pool, node.high, selector, value,
+                                            free, occupied);
+    result = dep_process_domain_node(pool, node.fd, low, high);
+  } else {
+    /* Reduction can omit a selector bit, including every bit when all choices
+     * share the same incoming table. An omitted bit remains unconstrained;
+     * both choices must still participate in the assignment image. */
+    uint32_t low =
+        dep_selector_image_walk(pool, node.fd == variable ? node.low : root,
+                                selector, value + 1, free, occupied);
+    if (low == UINT32_MAX)
+      return low;
+    uint32_t high = dep_process_domain_assign(
+        pool, node.fd == variable ? node.high : root, value, free, occupied);
+    result = dep_process_domain_node(pool, variable, low, high);
+  }
+  if (result == UINT32_MAX)
+    return result;
+  key.result = (uint16_t)result;
+  return dep_process_apply_save(pool, &key);
+}
+
+static SHELL_NONNULL(1) uint32_t
+    dep_selector_image(dep_process_domain_pool_t *pool, uint32_t root,
+                       uint32_t selector, bool free, bool occupied) {
+  return dep_selector_image_walk(pool, root, selector, 0, free, occupied);
+}
+
+static SHELL_NONNULL(1, 3) uint32_t dep_process_domain_commit_scratch(
+    dep_route_journal_t *journal, uint32_t result,
+    const dep_route_state_t *live, const dep_domain_collection_t *collection) {
+  dep_process_domain_pool_t *pool = journal->process_scratch;
+  if (result == UINT32_MAX)
+    return UINT32_MAX;
+  if (!dep_process_domain_compact(journal, &result, 1))
+    return UINT32_MAX;
+  if (collection)
+    dep_route_domains_collect_required(journal, collection, live, NULL,
+                                       pool->count);
+  journal->process_domains.import_count = 0;
+  result = dep_process_domain_import(&journal->process_domains, pool, result);
+  return result;
+}
+
+static SHELL_NONNULL(1, 3) uint32_t dep_process_domain_assign_retained(
+    dep_route_journal_t *journal, uint32_t domain,
+    const dep_route_state_t *live, uint32_t fd, bool free, bool occupied,
+    const dep_domain_collection_t *collection) {
+  dep_process_domain_pool_t *pool = journal->process_scratch;
+  pool->root = pool->count = 0;
+  pool->memo_ready = false;
+  pool->import_count = 0;
+  domain = dep_process_domain_import(pool, &journal->process_domains, domain);
+  uint32_t result = dep_process_domain_assign(pool, domain, fd, free, occupied);
+  return dep_process_domain_commit_scratch(journal, result, live, collection);
+}
+
+static SHELL_NONNULL(1, 3) uint32_t dep_process_domain_assume_retained(
+    dep_route_journal_t *journal, uint32_t domain,
+    const dep_route_state_t *live, uint32_t fd, bool free,
+    const dep_domain_collection_t *collection) {
+  dep_process_domain_pool_t *pool = journal->process_scratch;
+  pool->root = pool->count = 0;
+  pool->memo_ready = false;
+  pool->import_count = 0;
+  domain = dep_process_domain_import(pool, &journal->process_domains, domain);
+  uint32_t result = dep_process_domain_apply(
+      pool, 0, domain,
+      dep_process_domain_node(pool, fd, free ? 0 : 1, free ? 1 : 0));
+  return dep_process_domain_commit_scratch(journal, result, live, collection);
+}
+
+static SHELL_NONNULL(1, 3) uint32_t
+    dep_selector_assign(dep_route_journal_t *journal, uint32_t domain,
+                        const dep_route_state_t *live, uint32_t selector,
+                        bool free, bool occupied,
+                        const dep_domain_collection_t *collection) {
+  dep_process_domain_pool_t *pool = journal->process_scratch;
+  pool->root = pool->count = 0;
+  pool->memo_ready = false;
+  pool->import_count = 0;
+  domain = dep_process_domain_import(pool, &journal->process_domains, domain);
+  uint32_t result = dep_selector_image(pool, domain, selector, free, occupied);
+  return dep_process_domain_commit_scratch(journal, result, live, collection);
+}
+
+static SHELL_NONNULL(1, 2) bool dep_route_state_store_access_impl(
     dep_route_state_t *state, dep_route_journal_t *changes, dep_fd_ref_t fd,
-    dep_fd_access_t access, dep_route_set_t routes) {
+    dep_fd_access_t access, dep_route_set_t routes,
+    const dep_domain_collection_t *collection) {
   dep_route_state_t previous = *state;
   dep_route_state_t updated = {0};
   uint32_t count = dep_route_state_count(&previous);
@@ -8881,6 +12700,63 @@ static SHELL_NONNULL(1, 2) bool dep_route_state_store_access(
   for (uint32_t i = 0; i < count; i++) {
     uint32_t root = dep_route_take(&iterator, changes);
     dep_route_state_t one = dep_route_state_single(root);
+    const dep_route_change_t *selector =
+        access == DEP_FD_ACCESS_BINDING && fd.value > SHELL_DEP_FD_MAX &&
+                fd.value < SHELL_DEP_FD_NAMED
+            ? dep_route_state_change(&one, changes, fd, DEP_FD_ACCESS_SELECTOR)
+            : NULL;
+    if (access == DEP_FD_ACCESS_BINDING &&
+        (fd.value < 64 ||
+         (selector && changes->snapshots[selector->snapshot - 1].count))) {
+      const dep_route_change_t *domain = dep_route_state_change(
+          &one, changes, dep_fd_numeric(0), DEP_FD_ACCESS_PROCESS_DOMAIN);
+      if (domain && changes->snapshots[domain->snapshot - 1].count) {
+        bool free = false, occupied = false;
+        for (uint32_t route = 0; route < routes.count; route++) {
+          dep_route_kind_t kind = routes.routes[route].kind;
+          bool closed = kind == DEP_ROUTE_CLOSED || kind == DEP_ROUTE_ABSENT ||
+                        kind == DEP_ROUTE_UNAVAILABLE;
+          bool unknown = kind == DEP_ROUTE_UNSEEN || kind == DEP_ROUTE_DYNAMIC;
+          free |= closed || unknown;
+          occupied |= !closed;
+        }
+        uint32_t value =
+            changes->snapshots[domain->snapshot - 1].routes[0].value;
+        uint32_t selector_value =
+            selector
+                ? changes->snapshots[selector->snapshot - 1].routes[0].value
+                : 0;
+        dep_route_state_t transform_live = one;
+        if (collection &&
+            !dep_route_state_append_one(
+                &transform_live, changes, dep_fd_numeric(0),
+                DEP_FD_ACCESS_PROCESS_DOMAIN, (dep_route_set_t){.ready = true}))
+          return false;
+        dep_domain_collection_t pins = {
+            .roots = {count > 1 ? &previous : NULL, &updated, &transform_live},
+            .parent = collection};
+        if (collection) {
+          pins.workspace = collection->workspace;
+          pins.frame = collection->frame;
+        }
+        const dep_domain_collection_t *transform_collection =
+            collection ? &pins : NULL;
+        value = selector ? dep_selector_assign(changes, value, &transform_live,
+                                               selector_value, free, occupied,
+                                               transform_collection)
+                         : dep_process_domain_assign_retained(
+                               changes, value, &transform_live, fd.value, free,
+                               occupied, transform_collection);
+        dep_route_set_t fact = {0};
+        dep_route_set_set(&fact, (dep_fd_route_t){DEP_ROUTE_INHERITED, value});
+        if (value == UINT32_MAX ||
+            !dep_route_state_append_one(&transform_live, changes,
+                                        dep_fd_numeric(0),
+                                        DEP_FD_ACCESS_PROCESS_DOMAIN, fact))
+          return false;
+        one = transform_live;
+      }
+    }
     if (!dep_route_state_append_one(&one, changes, fd, access, routes)) {
       state->truncated = true;
       return false;
@@ -8895,6 +12771,78 @@ static SHELL_NONNULL(1, 2) bool dep_route_state_store_access(
   updated.truncated = previous.truncated;
   updated.correlated = previous.correlated;
   *state = updated;
+  return true;
+}
+
+static SHELL_NONNULL(1, 2) bool dep_route_state_store_access(
+    dep_route_state_t *state, dep_route_journal_t *changes, dep_fd_ref_t fd,
+    dep_fd_access_t access, dep_route_set_t routes) {
+  return dep_route_state_store_access_impl(state, changes, fd, access, routes,
+                                           NULL);
+}
+
+static SHELL_NONNULL(1, 2) bool dep_route_state_store_access_collected(
+    dep_route_state_t *state, dep_route_journal_t *changes, dep_fd_ref_t fd,
+    dep_fd_access_t access, dep_route_set_t routes,
+    const dep_domain_collection_t *collection) {
+  return dep_route_state_store_access_impl(state, changes, fd, access, routes,
+                                           collection);
+}
+
+/* Undo/process-private identities cannot be referenced after disposal.
+ * The caller first closes the selected physical slot, then retires only the
+ * operation's selector. If that operation reused a named slot, the slot's own
+ * selector remains live: named values survive close and retain that identity.
+ * Retirement forgets identity, never restores an earlier occupancy snapshot. */
+static SHELL_NONNULL(1, 2) bool dep_selector_retire(
+    dep_route_state_t *state, dep_route_journal_t *journal, uint32_t slot,
+    const dep_domain_collection_t *collection) {
+  const dep_route_change_t *identity = dep_route_state_change(
+      state, journal, dep_fd_numeric(slot), DEP_FD_ACCESS_SELECTOR);
+  if (!identity || !journal->snapshots[identity->snapshot - 1].count)
+    return true;
+  uint32_t selector =
+      journal->snapshots[identity->snapshot - 1].routes[0].value;
+  const dep_route_change_t *fact = dep_route_state_change(
+      state, journal, dep_fd_numeric(0), DEP_FD_ACCESS_PROCESS_DOMAIN);
+  dep_process_domain_pool_t *pool = journal->process_scratch;
+  pool->root = pool->count = 0;
+  pool->memo_ready = false;
+  pool->import_count = 0;
+  uint32_t root = dep_process_domain_import(
+      pool, &journal->process_domains,
+      journal->snapshots[fact->snapshot - 1].routes[0].value);
+  root = dep_selector_forget(pool, root, selector);
+  if (root == UINT32_MAX)
+    return false;
+  dep_route_state_t live = *state;
+  if (collection &&
+      !dep_route_state_append_one(&live, journal, dep_fd_numeric(0),
+                                  DEP_FD_ACCESS_PROCESS_DOMAIN,
+                                  (dep_route_set_t){.ready = true}))
+    return false;
+  dep_domain_collection_t pins = {
+      .roots = {&live},
+      .parent = collection,
+  };
+  if (collection) {
+    pins.workspace = collection->workspace;
+    pins.frame = collection->frame;
+  }
+  root = dep_process_domain_commit_scratch(journal, root, &live,
+                                           collection ? &pins : NULL);
+  dep_route_set_t domain = {0};
+  dep_route_set_set(&domain, (dep_fd_route_t){DEP_ROUTE_INHERITED, root});
+  if (root == UINT32_MAX ||
+      !dep_route_state_append_one(&live, journal, dep_fd_numeric(0),
+                                  DEP_FD_ACCESS_PROCESS_DOMAIN, domain) ||
+      !dep_route_state_append_one(&live, journal, dep_fd_numeric(slot),
+                                  DEP_FD_ACCESS_SELECTOR,
+                                  (dep_route_set_t){.ready = true}))
+    return false;
+  live.truncated = state->truncated;
+  live.correlated = state->correlated;
+  *state = live;
   return true;
 }
 
@@ -8958,6 +12906,99 @@ bool shellsplit_test_route_state_contract(void *workspace, uint32_t count) {
 }
 #endif
 
+/* A selected single execution version; ownership never comes from a concrete
+ * capability baseline. Missing and explicitly empty sets both mean no ends. */
+static SHELL_NONNULL(1, 2) uint32_t
+    dep_process_owned_root(const dep_route_state_t *state,
+                           const dep_route_journal_t *journal) {
+  const dep_route_change_t *change =
+      dep_route_state_change(state, journal, dep_fd_numeric(SHELL_DEP_FD_NONE),
+                             DEP_FD_ACCESS_PROCESS_OWNED);
+  dep_route_set_t owned = change ? journal->snapshots[change->snapshot - 1]
+                                 : (dep_route_set_t){.ready = true};
+  return owned.count ? owned.routes[0].value : 0;
+}
+
+static SHELL_NONNULL(1, 2) bool dep_process_owned(
+    const dep_route_state_t *state, const dep_route_journal_t *journal,
+    dep_fd_ref_t fd) {
+  return dep_route_root_change(dep_process_owned_root(state, journal), journal,
+                               fd, DEP_FD_ACCESS_PROCESS_OWNED) != NULL;
+}
+
+/* state contains one immutable execution version. Ownership is shell cleanup
+ * metadata, not capability copying: dup/open/close do not transfer this set. */
+static SHELL_NONNULL(1,
+                     2) bool dep_process_owned_set(dep_route_state_t *state,
+                                                   dep_route_journal_t *journal,
+                                                   dep_fd_ref_t fd,
+                                                   bool present) {
+  uint32_t root = dep_process_owned_root(state, journal);
+  if (4 * dep_route_tree_height(journal, root) + 8 >
+      dep_route_tree_available(journal))
+    return false;
+  root = present ? dep_route_tree_set(journal, root, fd,
+                                      DEP_FD_ACCESS_PROCESS_OWNED, 1)
+                 : dep_process_owned_erase(journal, root, fd);
+  dep_route_set_t owned = {.ready = true};
+  if (root)
+    dep_route_set_set(&owned, (dep_fd_route_t){DEP_ROUTE_INHERITED, root});
+  return dep_route_state_store_access(state, journal,
+                                      dep_fd_numeric(SHELL_DEP_FD_NONE),
+                                      DEP_FD_ACCESS_PROCESS_OWNED, owned);
+}
+
+/* Visit only live owned ends, not every descriptor or earlier source command.
+ * The child keeps these FDs but clears its ownership set; the forking parent
+ * closes exactly these original numbers, including an overwritten original.
+ */
+static SHELL_NONNULL(1, 2, 3) bool dep_process_fork_parent(
+    dep_route_state_t *parent, dep_route_journal_t *journal,
+    const dep_owner_routes_t *baseline, uint32_t root) {
+  if (!root)
+    return true;
+  dep_route_change_t node = journal->entries[root - 1];
+  if (!dep_process_fork_parent(parent, journal, baseline, node.left) ||
+      !dep_process_fork_parent(parent, journal, baseline, node.right))
+    return false;
+  dep_route_set_t closed = {0};
+  dep_route_set_set(&closed, (dep_fd_route_t){DEP_ROUTE_CLOSED, UINT32_MAX});
+  dep_fd_ref_t fd = dep_route_change_fd(journal, &journal->entries[root - 1]);
+  for (uint32_t access = DEP_FD_ACCESS_READ; access <= DEP_FD_ACCESS_BINDING;
+       access <<= 1)
+    if (!dep_route_state_store_access(parent, journal, fd,
+                                      (dep_fd_access_t)access, closed))
+      return false;
+  return true;
+}
+
+static SHELL_NONNULL(1, 2, 3) bool dep_process_cleanup(
+    dep_route_state_t *state, dep_route_journal_t *journal,
+    const dep_owner_routes_t *baseline) {
+  dep_route_iterator_t iterator = dep_route_iterator(state);
+  dep_route_state_t result = {0};
+  uint32_t root;
+  bool first = true;
+  while (dep_route_next(&iterator, journal, &root)) {
+    dep_route_state_t one = dep_route_state_single(root);
+    uint32_t owned = dep_process_owned_root(&one, journal);
+    if (owned &&
+        (!dep_process_fork_parent(&one, journal, baseline, owned) ||
+         !dep_route_state_store_access(
+             &one, journal, dep_fd_numeric(SHELL_DEP_FD_NONE),
+             DEP_FD_ACCESS_PROCESS_OWNED, (dep_route_set_t){.ready = true})))
+      return false;
+    if (first) {
+      result = one;
+      first = false;
+    } else if (!dep_route_state_add_root(&result, journal, one.root))
+      return false;
+  }
+  result.correlated = state->correlated;
+  *state = result;
+  return true;
+}
+
 /* Fixed scopes need no journal tag. Ambiguous setup is forked once; the tag
  * keeps every later prefix and failure walk on that same dispatch choice. */
 static SHELL_NONNULL(1, 2) bool dep_setup_begin(dep_route_state_t *state,
@@ -9007,16 +13048,91 @@ static SHELL_NONNULL(1, 2, 3) uint8_t
  * for a root shell. The workspace journal owns all import-construction scratch.
  * The concrete baseline already has representative routes for singleton facts.
  */
+typedef struct {
+  dep_fd_route_t bindings;
+  uint32_t inherited, entry, variables;
+  bool assignment_only;
+} dep_scalar_import_key_t;
+
+static SHELL_NONNULL(1, 3) int dep_scalar_import_compare(const void *context,
+                                                         uint32_t index,
+                                                         const void *pending) {
+  const dep_scalar_import_key_t *keys = context, *key = pending;
+  const dep_scalar_import_key_t *item = &keys[index];
+  if (item->bindings.kind != key->bindings.kind)
+    return item->bindings.kind < key->bindings.kind ? -1 : 1;
+  if (item->bindings.value != key->bindings.value)
+    return item->bindings.value < key->bindings.value ? -1 : 1;
+  if (item->inherited != key->inherited)
+    return item->inherited < key->inherited ? -1 : 1;
+  if (item->entry != key->entry)
+    return item->entry < key->entry ? -1 : 1;
+  if (item->variables != key->variables)
+    return item->variables < key->variables ? -1 : 1;
+  return item->assignment_only == key->assignment_only ? 0
+         : item->assignment_only                       ? 1
+                                                       : -1;
+}
+
 static SHELL_NONNULL(1, 2) bool dep_import_route_alternatives(
     dep_route_state_t *state, dep_route_journal_t *changes,
     const dep_fd_imports_t *imports) {
   if (!imports)
     return true;
+  changes->process_domains.import_count = 0;
   uint32_t order[DEP_MAX_FD_IMPORTS], count = 0;
   dep_import_order(imports, imports->root, order, &count);
   uint32_t paths = imports->path_count ? imports->path_count : 1;
+  dep_scalar_import_key_t scalar_keys[SHELL_DEP_MAX_NODES];
+  dep_index_node_t scalar_index[SHELL_DEP_MAX_NODES];
+  uint32_t scalar_root = 0;
   for (uint32_t path = 0; path < paths; path++) {
     dep_route_state_t one = *state;
+    if (imports->scalar_journal) {
+      uint32_t parent = imports->path_scalar_root[path];
+      dep_fd_route_t bindings =
+          dep_named_bindings(parent, imports->scalar_journal);
+      const dep_route_change_t *inherited =
+          bindings.kind == DEP_ROUTE_DYNAMIC
+              ? NULL
+              : dep_route_root_change(parent, imports->scalar_journal,
+                                      dep_fd_numeric(SHELL_DEP_FD_NONE),
+                                      DEP_FD_ACCESS_READ_ARGUMENT);
+      const dep_route_change_t *entry = dep_route_root_change(
+          parent, imports->scalar_journal,
+          dep_fd_numeric(DEP_SCALAR_IMPORT_EVENT), DEP_FD_ACCESS_PRIVATE_ENTRY);
+      const dep_route_change_t *variables = dep_route_root_change(
+          parent, imports->scalar_journal,
+          dep_fd_numeric(DEP_VARIABLE_STATE_EVENT), DEP_FD_ACCESS_EFFECT_STATE);
+      scalar_keys[path] = (dep_scalar_import_key_t){
+          .bindings = bindings,
+          .inherited = inherited ? inherited->snapshot : 0,
+          .entry = entry ? entry->snapshot : 0,
+          .variables = variables ? variables->snapshot : 0,
+          .assignment_only = imports->path_assignment_only[path]};
+      uint32_t match = 0;
+      scalar_root = dep_index_insert(
+          scalar_index, scalar_root, path + 1, SHELL_DEP_MAX_NODES,
+          dep_scalar_import_compare, scalar_keys, &scalar_keys[path], &match);
+      /* Versions differing only in physical FDs share their scalar view, so
+       * this dependency must not obstruct descriptor-domain factoring. */
+      dep_route_set_t scalar_path = {0};
+      dep_route_set_set(&scalar_path,
+                        (dep_fd_route_t){DEP_ROUTE_INHERITED, match - 1});
+      if (!dep_route_state_store_access(
+              &one, changes, dep_fd_numeric(SHELL_DEP_FD_NONE),
+              DEP_FD_ACCESS_READ_ARGUMENT, scalar_path))
+        return false;
+      /* Copy only executor-independent capability bits, never parent-local
+       * allocation IDs or orphan scopes. Two words cover the fixed registry;
+       * importing a child does not enumerate its parent's variable names. */
+      if (variables &&
+          !dep_route_state_store_access(
+              &one, changes, dep_fd_numeric(DEP_VARIABLE_STATE_EVENT),
+              DEP_FD_ACCESS_EFFECT_STATE,
+              imports->scalar_journal->snapshots[variables->snapshot - 1]))
+        return false;
+    }
     uint32_t ifs = imports->path_count ? imports->path_ifs[path] : imports->ifs;
     if (ifs && !dep_ifs_store(&one, changes, ifs))
       return false;
@@ -9031,10 +13147,15 @@ static SHELL_NONNULL(1, 2) bool dep_import_route_alternatives(
     do {
       i++;
     } while (i < count && imports->entries[order[i]].access == first->access &&
-             dep_fd_ref_equal(imports->entries[order[i]].fd, first->fd));
+             dep_fd_ref_equal(imports->entries[order[i]].fd, first->fd) &&
+             (first->fd.value <= SHELL_DEP_FD_MAX ||
+              first->fd.value == SHELL_DEP_FD_NAMED ||
+              imports->entries[order[i]].selector == first->selector));
     for (uint32_t path = 0; path < paths; path++) {
       dep_route_set_t routes = {.ready = true};
-      bool scratch = false;
+      bool scratch = false, process_owned = false;
+      uint32_t selector = 0;
+      const char *allocation = NULL;
       for (uint32_t j = begin; j < i; j++) {
         uint32_t index = order[j];
         const dep_fd_import_t *item = &imports->entries[index];
@@ -9045,34 +13166,121 @@ static SHELL_NONNULL(1, 2) bool dep_import_route_alternatives(
         if (!shared && !(item->paths[path / 64] & ((uint64_t)1 << (path % 64))))
           continue;
         scratch |= item->scratch;
+        process_owned |= item->process_owned;
+        selector = item->selector;
+        allocation = item->allocation;
         dep_route_set_add(
             &routes, item->origin ? (dep_fd_route_t){DEP_ROUTE_IMPORTED, index}
                                   : item->route);
       }
       dep_route_state_t one =
           dep_route_state_single(changes->import_roots[path]);
-      if (routes.truncated || ((paths > 1 || routes.count > 1 ||
+      dep_fd_ref_t destination = first->fd;
+      if (selector) {
+        uint32_t slot = dep_import_allocation_slot(changes, first->fd, selector,
+                                                   allocation);
+        if (slot == SHELL_DEP_FD_NONE)
+          return false;
+        destination = dep_fd_numeric(slot);
+        dep_route_set_t identity = {0}, alias = {0};
+        dep_route_set_set(&identity,
+                          (dep_fd_route_t){DEP_ROUTE_INHERITED, selector});
+        dep_route_set_set(&alias, (dep_fd_route_t){DEP_ROUTE_ALIAS, slot});
+        if (!dep_route_state_store_access(&one, changes, destination,
+                                          DEP_FD_ACCESS_SELECTOR, identity) ||
+            ((first->fd.value <= SHELL_DEP_FD_MAX ||
+              first->fd.value == SHELL_DEP_FD_NAMED) &&
+             !dep_route_state_store_access(&one, changes, first->fd,
+                                           (dep_fd_access_t)first->access,
+                                           alias)))
+          return false;
+      }
+      if (routes.truncated || ((selector || paths > 1 || routes.count > 1 ||
                                 first->access == DEP_FD_ACCESS_BINDING) &&
                                !dep_route_state_store_access(
-                                   &one, changes, first->fd,
+                                   &one, changes, destination,
                                    (dep_fd_access_t)first->access, routes)))
         return false;
       if (first->access == DEP_FD_ACCESS_BINDING && scratch) {
         dep_route_set_t owned = {0};
         dep_route_set_set(&owned,
                           (dep_fd_route_t){DEP_ROUTE_INHERITED, UINT32_MAX});
-        if (!dep_route_state_store_access(&one, changes, first->fd,
+        if (!dep_route_state_store_access(&one, changes, destination,
                                           DEP_FD_ACCESS_SCRATCH, owned))
+          return false;
+      }
+      if (first->access == DEP_FD_ACCESS_BINDING && process_owned &&
+          !dep_process_owned_set(&one, changes, destination, true))
+        return false;
+      if (selector && first->access == DEP_FD_ACCESS_BINDING &&
+          routes.count == 1 && routes.routes[0].kind == DEP_ROUTE_CLOSED) {
+        const dep_route_change_t *prior = dep_route_state_change(
+            &one, changes, dep_fd_numeric(SHELL_DEP_FD_NONE),
+            DEP_FD_ACCESS_AVAILABLE);
+        dep_route_set_t available =
+            prior ? changes->snapshots[prior->snapshot - 1]
+                  : (dep_route_set_t){.ready = true};
+        if (!dep_route_set_add(
+                &available,
+                (dep_fd_route_t){DEP_ROUTE_ALIAS, destination.value}) ||
+            !dep_route_state_store_access(&one, changes,
+                                          dep_fd_numeric(SHELL_DEP_FD_NONE),
+                                          DEP_FD_ACCESS_AVAILABLE, available))
           return false;
       }
       changes->import_roots[path] = one.root;
     }
+  }
+  for (uint32_t path = 0; path < paths; path++) {
+    if (imports->scalar_journal) {
+      dep_route_state_t one =
+          dep_route_state_single(changes->import_roots[path]);
+      dep_route_set_t entry = {0};
+      dep_route_set_set(&entry, (dep_fd_route_t){DEP_ROUTE_INHERITED, 0});
+      if (!dep_route_state_store_access(&one, changes,
+                                        dep_fd_numeric(DEP_SCALAR_IMPORT_EVENT),
+                                        DEP_FD_ACCESS_PRIVATE_ENTRY, entry))
+        return false;
+      changes->import_roots[path] = one.root;
+    }
+    if (!imports->path_process_domain[path])
+      continue;
+    uint32_t domain = dep_process_domain_import(
+        &changes->process_domains, imports->process_domains,
+        imports->path_process_domain[path] - 1);
+    for (uint32_t fd = 0; fd < 3; fd++)
+      if (imports->process_capture_mask & (1u << fd))
+        domain = dep_process_domain_assign(&changes->process_domains, domain,
+                                           fd, false, true);
+    if (domain == UINT32_MAX)
+      return false;
+    dep_route_state_t one = dep_route_state_single(changes->import_roots[path]);
+    dep_route_set_t fact = {0};
+    dep_route_set_set(&fact, (dep_fd_route_t){DEP_ROUTE_INHERITED, domain});
+    if (!dep_route_state_store_access(&one, changes, dep_fd_numeric(0),
+                                      DEP_FD_ACCESS_PROCESS_DOMAIN, fact))
+      return false;
+    changes->import_roots[path] = one.root;
   }
   *state = dep_route_state_single(changes->import_roots[0]);
   state->correlated = paths > 1;
   for (uint32_t path = 1; path < paths; path++)
     if (!dep_route_state_add_root(state, changes, changes->import_roots[path]))
       return false;
+  if (imports->observe_return && changes->read_observations.active) {
+    dep_route_set_t marker = {0};
+    dep_route_set_set(&marker,
+                      (dep_fd_route_t){DEP_ROUTE_INHERITED, UINT32_MAX});
+    const dep_owner_routes_t baseline = {0};
+    /* Keep immutable entry anchors only. Actual argument/descriptor uses
+     * capture their sparse dependencies before consuming the entry facts. */
+    if (!dep_route_state_store_access(state, changes,
+                                      dep_fd_numeric(SHELL_DEP_FD_NONE),
+                                      DEP_FD_ACCESS_PRIVATE_SCOPE, marker) ||
+        !dep_fd_private_begin(state, changes, &baseline,
+                              DEP_OBSERVATION_ROOT_EVENT))
+      return false;
+  }
   return true;
 }
 
@@ -9110,6 +13318,25 @@ static SHELL_NONNULL(1, 2, 3) dep_fd_occupancy_t
     dep_fd_occupancy(const dep_route_state_t *state,
                      const dep_route_journal_t *journal,
                      const dep_owner_routes_t *baseline, uint32_t fd) {
+  if (fd < 64) {
+    dep_route_set_t domain =
+        dep_fd_raw_fact(state, journal, baseline, dep_fd_numeric(0),
+                        DEP_FD_ACCESS_PROCESS_DOMAIN);
+    if (domain.count) {
+      dep_fd_occupancy_t result = {0};
+      uint64_t bit = UINT64_C(1) << fd;
+      for (uint32_t i = 0; i < domain.count; i++) {
+        uint32_t root = domain.routes[i].value;
+        result.may_be_free |=
+            (dep_process_domain_mask(&journal->process_domains, root, true) &
+             bit) != 0;
+        result.may_be_occupied |=
+            (dep_process_domain_mask(&journal->process_domains, root, false) &
+             bit) != 0;
+      }
+      return result;
+    }
+  }
   dep_route_set_t binding = dep_fd_fact(
       state, journal, baseline, dep_fd_numeric(fd), DEP_FD_ACCESS_BINDING);
   dep_fd_occupancy_t result = {0};
@@ -9184,9 +13411,137 @@ static SHELL_NONNULL(1, 2, 3, 4) bool dep_allocation_rank_slots(
 }
 
 typedef struct {
-  dep_route_set_t slots[2];
+  /* Visible numeric routes remain separate; hidden choices share a selector
+   * relation instead of multiplying execution-map versions. */
+  dep_fd_route_t slots[64 + SHELL_DEP_TIME_MAX_EXTERNAL_FDS];
+  uint32_t domains[64 + SHELL_DEP_TIME_MAX_EXTERNAL_FDS];
+  uint32_t count, tail_domain;
+  uint32_t selector, key;
+} dep_allocation_choices_t;
+
+typedef struct {
+  dep_allocation_choices_t slots[2];
   bool resource;
 } dep_named_allocation_choices_t;
+
+static SHELL_NONNULL(1, 2, 3, 5) bool dep_fd_assume_binding(
+    dep_route_state_t *state, dep_route_journal_t *journal,
+    const dep_owner_routes_t *baseline, uint32_t fd, bool *possible, bool free,
+    const dep_domain_collection_t *collection);
+
+/* Compare byte identities, not binding validity: a previous observation may
+ * already have refined UNSEEN into live. A child pipe/open/close changes its
+ * capabilities, so observing it cannot establish anything about its parent.
+ * Setup provenance also distinguishes replacement by the same byte source.
+ */
+static SHELL_NONNULL(1, 2, 3, 4) bool dep_read_same_descriptor(
+    const dep_route_state_t *a, const dep_route_state_t *b,
+    const dep_route_journal_t *journal, const dep_owner_routes_t *baseline,
+    uint32_t fd) {
+  const dep_fd_access_t accesses[] = {DEP_FD_ACCESS_READ, DEP_FD_ACCESS_WRITE,
+                                      DEP_FD_ACCESS_SETUP_FRAME};
+  for (unsigned i = 0; i < sizeof(accesses) / sizeof(accesses[0]); i++) {
+    dep_route_set_t left =
+        dep_fd_raw_fact(a, journal, baseline, dep_fd_numeric(fd), accesses[i]);
+    dep_route_set_t right =
+        dep_fd_raw_fact(b, journal, baseline, dep_fd_numeric(fd), accesses[i]);
+    if (left.count != right.count || left.truncated || right.truncated)
+      return false;
+    for (uint32_t r = 0; r < left.count; r++)
+      if (left.routes[r].kind != right.routes[r].kind ||
+          left.routes[r].value != right.routes[r].value)
+        return false;
+  }
+  return true;
+}
+
+/* Propagate only observations of unchanged inherited identities into private
+ * origins, at the observation point. Later child mutations cannot erase the
+ * proof, or turn a child-installed descriptor into a parent observation.
+ * PRIVATE_SCOPE follows lexical nesting without scanning descriptor maps.
+ */
+static SHELL_NONNULL(1, 2, 3, 6) bool dep_read_observe_binding(
+    dep_route_state_t *state, dep_route_journal_t *journal,
+    const dep_owner_routes_t *baseline, uint32_t fd, bool free,
+    bool *possible) {
+  dep_route_state_t result = {0};
+  *possible = false;
+  dep_route_iterator_t paths = dep_route_iterator(state);
+  uint32_t root;
+  while (dep_route_next(&paths, journal, &root)) {
+    dep_route_state_t one = dep_route_state_single(root);
+    dep_route_set_t binding = dep_fd_raw_fact(
+        &one, journal, baseline, dep_fd_numeric(fd), DEP_FD_ACCESS_BINDING);
+    unsigned wanted = free ? DEP_STATUS_MAY_FAIL : DEP_STATUS_MAY_SUCCEED;
+    unsigned validity = dep_read_binding_outcomes(&binding);
+    if (!(validity & wanted))
+      continue;
+    dep_route_state_t before = one;
+    bool feasible = true;
+    if (validity == DEP_STATUS_EITHER &&
+        !dep_fd_assume_binding(&one, journal, baseline, fd, &feasible, free,
+                               NULL))
+      return false;
+    if (!feasible)
+      continue;
+    dep_route_set_t scope = dep_fd_raw_fact(&before, journal, baseline,
+                                            dep_fd_numeric(SHELL_DEP_FD_NONE),
+                                            DEP_FD_ACCESS_PRIVATE_SCOPE);
+    if (scope.count) {
+      if (scope.routes[0].value == UINT32_MAX) {
+        dep_route_set_t fact = {0};
+        dep_route_set_set(&fact, (dep_fd_route_t){DEP_ROUTE_INHERITED, free});
+        if (!dep_observation_remember(
+                &one, journal, baseline, dep_fd_numeric(fd),
+                DEP_FD_ACCESS_INHERITED_OBSERVATION, fact))
+          return false;
+      } else {
+        dep_fd_ref_t event = dep_fd_numeric(scope.routes[0].value - 1);
+        dep_route_set_t origin = dep_fd_raw_fact(
+            &before, journal, baseline, event, DEP_FD_ACCESS_PRIVATE_ENTRY);
+        dep_route_state_t parent =
+            dep_route_state_single(origin.routes[0].value);
+        if (dep_read_same_descriptor(&before, &parent, journal, baseline, fd)) {
+          if (!dep_read_observe_binding(&parent, journal, baseline, fd, free,
+                                        &feasible))
+            return false;
+          if (!feasible)
+            continue;
+          dep_route_set_set(&origin,
+                            (dep_fd_route_t){DEP_ROUTE_INHERITED, parent.root});
+          if (!dep_route_state_store_access(
+                  &one, journal, event, DEP_FD_ACCESS_PRIVATE_ENTRY, origin))
+            return false;
+        }
+      }
+    }
+    if (!dep_read_state_add(&result, *possible, &one, journal, baseline))
+      return false;
+    *possible = true;
+  }
+  if (*possible)
+    *state = result;
+  return true;
+}
+
+/* choices is an empty caller-owned destination. low_mode is -1 for no
+ * temporary resource open, 0 for a free low slot,
+ * and 1 for a full low interval (the temporary open consumes a high slot).
+ * rank zero selects the union of the two resource-open modes.
+ * Choices retain their joint pre-allocation predicate, not independent
+ * per-descriptor possibility masks. */
+static SHELL_NONNULL(1, 2, 3, 10) bool dep_allocation_domain_choices(
+    dep_route_state_t *state, dep_route_journal_t *journal,
+    const dep_owner_routes_t *baseline, uint32_t key, unsigned rank,
+    uint32_t minimum, int low_mode, uint32_t source_selector,
+    bool release_source, dep_allocation_choices_t *choices,
+    const dep_domain_collection_t *collection);
+static SHELL_NONNULL(1) bool dep_allocation_choice_add(
+    dep_allocation_choices_t *choices, dep_fd_route_t slot, uint32_t domain);
+static SHELL_NONNULL(1,
+                     2) bool dep_allocation_select(dep_route_state_t *state,
+                                                   dep_route_journal_t *journal,
+                                                   uint32_t domain);
 
 /* Low-descriptor occupancy determines whether Bash's temporary file open
  * consumes a high slot. A previous allocation path can refine that state. */
@@ -9199,6 +13554,18 @@ static SHELL_NONNULL(1, 2, 3) unsigned dep_fd_low_modes(
         dep_fd_occupancy(state, journal, baseline, fd);
     low_free |= occupancy.may_be_free;
     low_full &= occupancy.may_be_occupied;
+  }
+  dep_route_set_t domain =
+      dep_fd_raw_fact(state, journal, baseline, dep_fd_numeric(0),
+                      DEP_FD_ACCESS_PROCESS_DOMAIN);
+  if (domain.count) {
+    low_full = false;
+    for (uint32_t i = 0; i < domain.count; i++) {
+      uint32_t root = domain.routes[i].value;
+      low_full |=
+          root == 1 ||
+          (root >= 2 && journal->process_domains.nodes[root - 2].low_full);
+    }
   }
   dep_route_set_t mode = dep_fd_raw_fact(state, journal, baseline,
                                          dep_fd_numeric(SHELL_DEP_FD_NONE),
@@ -9231,16 +13598,17 @@ static SHELL_NONNULL(1, 2, 3, 6) bool dep_allocation_rank_choices(
 }
 
 static SHELL_NONNULL(1, 2, 3, 4, 5) bool dep_named_allocation_choices(
-    const dep_route_state_t *state, dep_route_journal_t *journal,
+    dep_route_state_t *state, dep_route_journal_t *journal,
     const dep_owner_routes_t *baseline, const dep_fd_op_t *op,
-    dep_named_allocation_choices_t *choices) {
+    dep_named_allocation_choices_t *choices,
+    const dep_domain_collection_t *collection) {
   uint32_t private_slot = dep_allocation_slot(journal, op);
   if (private_slot == SHELL_DEP_FD_NONE)
     return false;
   if (dep_fd_op_copies(op->kind)) {
-    if (!dep_allocation_rank_choices(state, journal, baseline, private_slot, 1,
-                                     &choices->slots[0],
-                                     DEP_BASH_VARREDIR_MIN_FD))
+    if (!dep_allocation_domain_choices(state, journal, baseline, private_slot,
+                                       1, DEP_BASH_VARREDIR_MIN_FD, -1, 0, true,
+                                       &choices->slots[0], collection))
       return false;
     dep_route_set_t available = dep_fd_raw_fact(
         state, journal, baseline, dep_fd_numeric(SHELL_DEP_FD_NONE),
@@ -9248,7 +13616,14 @@ static SHELL_NONNULL(1, 2, 3, 4, 5) bool dep_named_allocation_choices(
     for (uint32_t candidate = 0; candidate < available.count; candidate++)
       if (available.routes[candidate].kind == DEP_ROUTE_ALIAS &&
           available.routes[candidate].value > SHELL_DEP_FD_MAX &&
-          !dep_route_set_add(&choices->slots[0], available.routes[candidate]))
+          !dep_fd_raw_fact(state, journal, baseline,
+                           dep_fd_numeric(available.routes[candidate].value),
+                           DEP_FD_ACCESS_SELECTOR)
+               .count &&
+          choices->slots[0].tail_domain &&
+          !dep_allocation_choice_add(&choices->slots[0],
+                                     available.routes[candidate],
+                                     choices->slots[0].tail_domain))
         return false;
   } else {
     /* Bash opens the resource first, duplicates it with F_DUPFD starting at
@@ -9258,12 +13633,27 @@ static SHELL_NONNULL(1, 2, 3, 4, 5) bool dep_named_allocation_choices(
     unsigned modes = dep_fd_low_modes(state, journal, baseline);
     bool low_free = (modes & 1u) != 0, low_full = (modes & 2u) != 0;
     choices->resource = true;
-    if ((low_free && !dep_allocation_rank_choices(
-                         state, journal, baseline, private_slot, 1,
-                         &choices->slots[0], DEP_BASH_VARREDIR_MIN_FD)) ||
-        (low_full && !dep_allocation_rank_choices(
-                         state, journal, baseline, private_slot, 2,
-                         &choices->slots[1], DEP_BASH_VARREDIR_MIN_FD)))
+    if (low_free &&
+        !dep_allocation_domain_choices(
+            state, journal, baseline, private_slot, 1, DEP_BASH_VARREDIR_MIN_FD,
+            0, 0, !low_full, &choices->slots[0], collection))
+      return false;
+    dep_domain_collection_t first_domains = {
+        .workspace = collection ? collection->workspace : NULL,
+        .frame = collection ? collection->frame : NULL,
+        .decisions = choices->slots[0].domains,
+        .decision_count = choices->slots[0].count,
+        .parent = collection};
+    dep_domain_collection_t first_tail = {
+        .workspace = first_domains.workspace,
+        .frame = first_domains.frame,
+        .decisions = &choices->slots[0].tail_domain,
+        .decision_count = choices->slots[0].tail_domain ? 1u : 0u,
+        .parent = &first_domains};
+    if (low_full &&
+        !dep_allocation_domain_choices(
+            state, journal, baseline, private_slot, 2, DEP_BASH_VARREDIR_MIN_FD,
+            1, 0, true, &choices->slots[1], collection ? &first_tail : NULL))
       return false;
     dep_route_set_t available = dep_fd_raw_fact(
         state, journal, baseline, dep_fd_numeric(SHELL_DEP_FD_NONE),
@@ -9272,14 +13662,1647 @@ static SHELL_NONNULL(1, 2, 3, 4, 5) bool dep_named_allocation_choices(
       if (available.routes[candidate].kind != DEP_ROUTE_ALIAS ||
           available.routes[candidate].value <= SHELL_DEP_FD_MAX)
         continue;
-      if (low_free &&
-          !dep_route_set_add(&choices->slots[0], available.routes[candidate]))
+      if (dep_fd_raw_fact(state, journal, baseline,
+                          dep_fd_numeric(available.routes[candidate].value),
+                          DEP_FD_ACCESS_SELECTOR)
+              .count)
+        continue;
+      if (low_free && choices->slots[0].tail_domain &&
+          !dep_allocation_choice_add(&choices->slots[0],
+                                     available.routes[candidate],
+                                     choices->slots[0].tail_domain))
         return false;
     }
   }
   if (!choices->slots[0].count && !choices->slots[1].count)
     return false;
   return true;
+}
+
+static SHELL_NONNULL(1, 2) uint32_t
+    dep_process_key(dep_route_journal_t *journal, const dep_fd_op_t *op,
+                    bool create) {
+  dep_allocation_t key = {
+      .name = op->fd_name, .position = op->pos, .role = DEP_ALLOCATION_PROCESS};
+  return dep_allocation_key_slot(journal, &key, create);
+}
+
+static SHELL_NONNULL(1, 2) uint32_t
+    dep_process_guard_key(dep_route_journal_t *journal,
+                          const dep_process_guard_t *guard, bool create) {
+  dep_allocation_t key = {.name = guard->source,
+                          .role = DEP_ALLOCATION_PROCESS_GUARD};
+  return dep_allocation_key_slot(journal, &key, create);
+}
+
+/* One source operand makes one decision per version. Parent guards dominate
+ * nested operands; repeated substitutions and indexed replay reuse that
+ * decision instead of independently forking or reviving a skipped pipe. */
+static SHELL_NONNULL(1, 2, 3, 4) bool dep_process_guard_prepare(
+    dep_route_state_t *state, dep_route_journal_t *journal,
+    const dep_owner_routes_t *baseline, const dep_process_guard_t *guard) {
+  uint32_t key = dep_process_guard_key(journal, guard, true);
+  if (key == SHELL_DEP_FD_NONE)
+    return false;
+  dep_route_iterator_t iterator = dep_route_iterator(state);
+  uint32_t root;
+  bool pending = false;
+  while (dep_route_next(&iterator, journal, &root)) {
+    DEP_METADATA_WORK(SHELLSPLIT_TEST_WORK_PROCESS_ROUTES);
+    dep_route_state_t one = dep_route_state_single(root);
+    pending |= !dep_fd_raw_fact(&one, journal, baseline, dep_fd_numeric(key),
+                                DEP_FD_ACCESS_PROCESS_SLOT)
+                    .count;
+  }
+  if (!pending)
+    return true;
+  uint32_t parent_key = SHELL_DEP_FD_NONE;
+  if (guard->parent) {
+    if (!dep_process_guard_prepare(state, journal, baseline, guard->parent))
+      return false;
+    parent_key = dep_process_guard_key(journal, guard->parent, false);
+  }
+  dep_route_state_t result = {0};
+  bool first = true;
+  iterator = dep_route_iterator(state);
+  while (dep_route_next(&iterator, journal, &root)) {
+    dep_route_state_t one = dep_route_state_single(root);
+    dep_route_set_t fact =
+        dep_fd_raw_fact(&one, journal, baseline, dep_fd_numeric(key),
+                        DEP_FD_ACCESS_PROCESS_SLOT);
+    bool parent = !guard->parent || dep_fd_raw_fact(&one, journal, baseline,
+                                                    dep_fd_numeric(parent_key),
+                                                    DEP_FD_ACCESS_PROCESS_SLOT)
+                                        .routes[0]
+                                        .value;
+    unsigned count = fact.count || !parent ? 1 : 2;
+    for (unsigned choice = 0; choice < count; choice++) {
+      DEP_METADATA_WORK(SHELLSPLIT_TEST_WORK_PROCESS_ROUTES);
+      dep_route_state_t branch = one;
+      if (!fact.count) {
+        dep_route_set_t decision = {.ready = true};
+        dep_route_set_set(&decision,
+                          (dep_fd_route_t){DEP_ROUTE_INHERITED, choice});
+        if (!dep_route_state_store_access(&branch, journal, dep_fd_numeric(key),
+                                          DEP_FD_ACCESS_PROCESS_SLOT, decision))
+          return false;
+      }
+      if (first) {
+        result = branch;
+        first = false;
+      } else if (!dep_route_state_add_root(&result, journal, branch.root))
+        return false;
+    }
+  }
+  result.correlated = true;
+  *state = result;
+  return true;
+}
+
+/* Reuse the nearest established operand decision. A newly encountered scope
+ * has not forked yet; its nearest established ancestor still dominates it. */
+static SHELL_NONNULL(1, 2, 3, 4, 5, 6) bool dep_process_guard_select(
+    const dep_route_state_t *state, dep_route_journal_t *journal,
+    const dep_owner_routes_t *baseline, const dep_process_guard_t *guard,
+    dep_route_state_t *selected, bool *possible) {
+  uint32_t key = SHELL_DEP_FD_NONE;
+  const dep_process_guard_t *cursor = guard;
+  for (; cursor; cursor = cursor->parent) {
+    key = dep_process_guard_key(journal, cursor, false);
+    if (key != SHELL_DEP_FD_NONE)
+      break;
+  }
+  if (key == SHELL_DEP_FD_NONE) {
+    *selected = *state;
+    *possible = true;
+    return true;
+  }
+  *selected = (dep_route_state_t){0};
+  *possible = false;
+  dep_route_iterator_t iterator = dep_route_iterator(state);
+  uint32_t root;
+  while (dep_route_next(&iterator, journal, &root)) {
+    DEP_METADATA_WORK(SHELLSPLIT_TEST_WORK_PROCESS_ROUTES);
+    dep_route_state_t one = dep_route_state_single(root);
+    if (!dep_fd_raw_fact(&one, journal, baseline, dep_fd_numeric(key),
+                         DEP_FD_ACCESS_PROCESS_SLOT)
+             .routes[0]
+             .value)
+      continue;
+    if (!*possible) {
+      *selected = one;
+      *possible = true;
+    } else if (!dep_route_state_add_root(selected, journal, root))
+      return false;
+  }
+  selected->correlated = state->correlated;
+  return true;
+}
+
+/* A three-state free-count automaton builds an interval predicate. State two
+ * means >=2; callers request zero, one, <=1, or >=2 free descriptors. */
+static SHELL_NONNULL(1) uint32_t
+    dep_process_domain_count(dep_process_domain_pool_t *pool, uint32_t begin,
+                             uint32_t end, unsigned minimum, unsigned maximum) {
+  uint32_t next[3];
+  for (unsigned count = 0; count < 3; count++)
+    next[count] = count >= minimum && count <= maximum;
+  for (uint32_t fd = end; fd-- > begin;) {
+    uint32_t current[3];
+    for (unsigned count = 0; count < 3; count++)
+      current[count] = dep_process_domain_node(pool, fd, next[count],
+                                               next[count < 2 ? count + 1 : 2]);
+    memcpy(next, current, sizeof(next));
+  }
+  return next[0];
+}
+
+/* This is a joint predicate. Taking the union of the individual free-bit
+ * masks would invent a second free slot on paths which have at most one. */
+static SHELL_NONNULL(1) uint32_t
+    dep_allocation_domain_predicate(dep_process_domain_pool_t *pool,
+                                    uint32_t begin, uint32_t end, unsigned rank,
+                                    int low_mode) {
+  if (!rank)
+    return dep_process_domain_apply(
+        pool, 1, dep_allocation_domain_predicate(pool, begin, end, 1, 0),
+        dep_allocation_domain_predicate(pool, begin, end, 2, 1));
+  uint32_t predicate =
+      dep_process_domain_count(pool, begin, end, rank - 1, rank - 1);
+  if (low_mode >= 0)
+    predicate = dep_process_domain_apply(
+        pool, 0, predicate,
+        dep_process_domain_count(pool, 0, DEP_BASH_VARREDIR_MIN_FD,
+                                 low_mode ? 0 : 1, low_mode ? 0 : 2));
+  return predicate;
+}
+
+/* F_DUPFD saves of a named source start above its captured numeric value,
+ * not above the private journal key which represents that value. */
+static SHELL_NONNULL(1) uint32_t
+    dep_allocation_source_predicate(dep_process_domain_pool_t *pool,
+                                    uint32_t minimum, uint32_t end,
+                                    unsigned rank, int low_mode,
+                                    uint32_t source_selector) {
+  if (!source_selector)
+    return dep_allocation_domain_predicate(pool, minimum, end, rank, low_mode);
+  if (!rank)
+    return dep_process_domain_apply(
+        pool, 1,
+        dep_allocation_source_predicate(pool, minimum, end, 1, 0,
+                                        source_selector),
+        dep_allocation_source_predicate(pool, minimum, end, 2, 1,
+                                        source_selector));
+  uint32_t result = 0;
+  for (uint32_t source = 0; source < DEP_SELECTOR_VALUES; source++) {
+    uint32_t begin = source + 1 > minimum ? source + 1 : minimum;
+    if (begin > end)
+      continue;
+    uint32_t selected = dep_process_domain_apply(
+        pool, 0, dep_selector_choice(pool, source_selector, source),
+        dep_process_domain_count(pool, begin, end, rank - 1, rank - 1));
+    result = dep_process_domain_apply(pool, 1, result, selected);
+    if (result == UINT32_MAX)
+      return result;
+  }
+  if (low_mode >= 0)
+    result = dep_process_domain_apply(
+        pool, 0, result,
+        dep_process_domain_count(pool, 0, DEP_BASH_VARREDIR_MIN_FD,
+                                 low_mode ? 0 : 1, low_mode ? 0 : 2));
+  return result;
+}
+
+/* Repeated tail identities have the same completed predicate. Concrete low
+ * identities are emitted once. This helper does not merge distinct domains. */
+static SHELL_NONNULL(1) bool dep_allocation_choice_add(
+    dep_allocation_choices_t *choices, dep_fd_route_t slot, uint32_t domain) {
+  for (uint32_t i = 0; i < choices->count; i++)
+    if (choices->slots[i].value == slot.value)
+      return true;
+  if (choices->count == sizeof(choices->slots) / sizeof(choices->slots[0]))
+    return false;
+  choices->slots[choices->count] = slot;
+  choices->domains[choices->count++] = domain;
+  return true;
+}
+
+static SHELL_NONNULL(1, 2, 3, 4, 6, 7) bool dep_allocation_reuse_hidden(
+    dep_process_domain_pool_t *pool, const dep_route_state_t *state,
+    dep_route_journal_t *journal, const dep_owner_routes_t *baseline,
+    uint32_t selector, uint32_t *hidden, dep_allocation_choices_t *choices) {
+  dep_route_set_t available = dep_fd_raw_fact(state, journal, baseline,
+                                              dep_fd_numeric(SHELL_DEP_FD_NONE),
+                                              DEP_FD_ACCESS_AVAILABLE);
+  if (available.truncated)
+    return false;
+  for (uint32_t i = 0; i < available.count; i++) {
+    uint32_t slot = available.routes[i].value;
+    if (available.routes[i].kind != DEP_ROUTE_ALIAS || slot <= SHELL_DEP_FD_MAX)
+      continue;
+    dep_route_set_t identity = dep_fd_raw_fact(
+        state, journal, baseline, dep_fd_numeric(slot), DEP_FD_ACCESS_SELECTOR);
+    if (!identity.count)
+      continue;
+    uint32_t equal =
+        dep_selector_equal(pool, selector, identity.routes[0].value);
+    uint32_t reused = dep_process_domain_apply(pool, 0, *hidden, equal);
+    if (reused == UINT32_MAX ||
+        (reused &&
+         !dep_allocation_choice_add(
+             choices, (dep_fd_route_t){DEP_ROUTE_ALIAS, slot}, reused)))
+      return false;
+    uint32_t low_equal = dep_process_domain_apply(
+        pool, 0, equal,
+        dep_process_domain_apply(pool, UINT32_MAX,
+                                 dep_selector_choice(pool, selector, 64), 0));
+    *hidden = dep_process_domain_apply(
+        pool, 0, *hidden,
+        dep_process_domain_apply(pool, UINT32_MAX, low_equal, 0));
+    if (*hidden == UINT32_MAX)
+      return false;
+  }
+  return true;
+}
+
+static SHELL_NONNULL(1,
+                     2) bool dep_allocation_select(dep_route_state_t *state,
+                                                   dep_route_journal_t *journal,
+                                                   uint32_t domain) {
+  dep_route_set_t fact = {0};
+  dep_route_set_set(&fact, (dep_fd_route_t){DEP_ROUTE_INHERITED, domain});
+  return dep_route_state_store_access(state, journal, dep_fd_numeric(0),
+                                      DEP_FD_ACCESS_PROCESS_DOMAIN, fact);
+}
+
+static SHELL_NONNULL(1, 2, 3) bool dep_allocation_select_slot(
+    dep_route_state_t *state, dep_route_journal_t *journal,
+    const dep_allocation_choices_t *choices, uint32_t index) {
+  if (!dep_allocation_select(state, journal, choices->domains[index]))
+    return false;
+  uint32_t slot = choices->slots[index].value;
+  if (slot <= SHELL_DEP_FD_MAX)
+    return true;
+  dep_route_set_t identity = {0};
+  dep_route_set_set(&identity,
+                    (dep_fd_route_t){DEP_ROUTE_INHERITED, choices->selector});
+  if (!dep_route_state_store_access(state, journal,
+                                    dep_fd_numeric(choices->key),
+                                    DEP_FD_ACCESS_SELECTOR, identity))
+    return false;
+  const dep_route_change_t *prior = dep_route_state_change(
+      state, journal, dep_fd_numeric(slot), DEP_FD_ACCESS_SELECTOR);
+  if (prior && journal->snapshots[prior->snapshot - 1].count)
+    return true;
+  return dep_route_state_store_access(state, journal, dep_fd_numeric(slot),
+                                      DEP_FD_ACCESS_SELECTOR, identity);
+}
+
+/* A successful existence check constrains the entry world; it does not open
+ * a closed descriptor. Actual opens/closes use store_access's assignment
+ * operation instead. possible=false is an infeasible path, not exhaustion. */
+static SHELL_NONNULL(1, 2, 3, 5) bool dep_fd_assume_binding(
+    dep_route_state_t *state, dep_route_journal_t *journal,
+    const dep_owner_routes_t *baseline, uint32_t fd, bool *possible, bool free,
+    const dep_domain_collection_t *collection) {
+  *possible = true;
+  if (fd < 64) {
+    dep_route_set_t domain =
+        dep_fd_raw_fact(state, journal, baseline, dep_fd_numeric(0),
+                        DEP_FD_ACCESS_PROCESS_DOMAIN);
+    if (domain.count) {
+      uint32_t root = dep_process_domain_assume_retained(
+          journal, domain.routes[0].value, state, fd, free, collection);
+      if (root == UINT32_MAX)
+        return false;
+      if (!root) {
+        *possible = false;
+        return true;
+      }
+      if (!dep_allocation_select(state, journal, root))
+        return false;
+    }
+  }
+  dep_route_set_t fact = {0};
+  dep_route_set_set(
+      &fact, (dep_fd_route_t){free ? DEP_ROUTE_CLOSED : DEP_ROUTE_INHERITED,
+                              UINT32_MAX});
+  return dep_route_state_store_access(state, journal, dep_fd_numeric(fd),
+                                      DEP_FD_ACCESS_BINDING, fact);
+}
+
+static SHELL_NONNULL(1, 2, 3, 10) bool dep_allocation_domain_choices(
+    dep_route_state_t *state, dep_route_journal_t *journal,
+    const dep_owner_routes_t *baseline, uint32_t key, unsigned rank,
+    uint32_t minimum, int low_mode, uint32_t source_selector,
+    bool release_source, dep_allocation_choices_t *choices,
+    const dep_domain_collection_t *collection) {
+  dep_route_set_t existing =
+      dep_fd_raw_fact(state, journal, baseline, dep_fd_numeric(0),
+                      DEP_FD_ACCESS_PROCESS_DOMAIN);
+  choices->key = key;
+  choices->selector = dep_allocation_selector(journal, key);
+  if (!choices->selector)
+    return false;
+  dep_process_domain_pool_t *pool = journal->process_scratch;
+  pool->root = pool->count = 0;
+  pool->memo_ready = false;
+  pool->import_count = 0;
+  uint32_t domain =
+      existing.count
+          ? dep_process_domain_import(pool, &journal->process_domains,
+                                      existing.routes[0].value)
+          : 1;
+  if (!existing.count)
+    for (uint32_t fd = 64; fd-- != 0;) {
+      dep_fd_occupancy_t occupancy =
+          dep_fd_occupancy(state, journal, baseline, fd);
+      domain = dep_process_domain_node(pool, fd,
+                                       occupancy.may_be_occupied ? domain : 0,
+                                       occupancy.may_be_free ? domain : 0);
+    }
+  if (domain == UINT32_MAX)
+    return false;
+  bool observable[64] = {false};
+  for (uint32_t i = 0; i < journal->observable_fd_count; i++)
+    if (journal->observable_fds[i] < 64)
+      observable[journal->observable_fds[i]] = true;
+  uint64_t possible_free = dep_process_domain_mask(pool, domain, true);
+  uint64_t possible_occupied = dep_process_domain_mask(pool, domain, false);
+  unsigned certain = 0;
+  bool bounded = false;
+  uint32_t hidden = 0;
+  for (uint32_t fd = minimum; fd < 64; fd++) {
+    if (!(possible_free & (UINT64_C(1) << fd)))
+      continue;
+    uint32_t selected = dep_process_domain_apply(
+        pool, 0, domain,
+        dep_process_domain_apply(
+            pool, 0, dep_process_domain_node(pool, fd, 0, 1),
+            dep_allocation_source_predicate(pool, minimum, fd, rank, low_mode,
+                                            source_selector)));
+    if (selected == UINT32_MAX)
+      return false;
+    if (selected) {
+      if (observable[fd]) {
+        if (!dep_allocation_choice_add(
+                choices, (dep_fd_route_t){DEP_ROUTE_ALIAS, fd}, selected))
+          return false;
+      } else {
+        hidden = dep_process_domain_apply(
+            pool, 1, hidden,
+            dep_process_domain_apply(
+                pool, 0, selected,
+                dep_selector_choice(pool, choices->selector, fd)));
+        if (hidden == UINT32_MAX)
+          return false;
+      }
+    }
+    if (pool->count > DEP_ROUTE_CHANGE_CAPACITY / 4) {
+      uint32_t roots[64 + SHELL_DEP_TIME_MAX_EXTERNAL_FDS + 2];
+      roots[0] = domain;
+      roots[1] = hidden;
+      memcpy(roots + 2, choices->domains, choices->count * sizeof(uint32_t));
+      if (!dep_process_domain_compact(journal, roots, choices->count + 2))
+        return false;
+      domain = roots[0];
+      hidden = roots[1];
+      memcpy(choices->domains, roots + 2, choices->count * sizeof(uint32_t));
+    }
+    /* With a fixed minimum, enough certainly free lower slots prove every
+     * higher candidate impossible. Do not construct those predicates just
+     * to intersect them with the same known-free prefix and obtain zero.
+     * A selector-relative minimum needs its own joint source condition. */
+    if (!source_selector && !(possible_occupied & (UINT64_C(1) << fd)) &&
+        ++certain == (rank ? rank : 2)) {
+      bounded = true;
+      break;
+    }
+  }
+  /* Above Bash's fixed high search range, retain the existing observed/private
+   * tail model, but only with feasible free-count and low-open conditions. */
+  dep_route_set_t tail = {0};
+  uint32_t tail_domains[SHELL_DEP_TIME_MAX_EXTERNAL_FDS] = {0};
+  for (unsigned requested = rank ? rank : 1;
+       !bounded && requested <= (rank ? rank : 2); requested++) {
+    for (unsigned low = 0; low < requested; low++) {
+      uint32_t selected = dep_process_domain_apply(
+          pool, 0, domain,
+          dep_allocation_source_predicate(pool, minimum < 64 ? minimum : 64, 64,
+                                          low + 1, -1, source_selector));
+      int mode = rank ? low_mode : (int)requested - 1;
+      if (mode >= 0)
+        selected = dep_process_domain_apply(
+            pool, 0, selected,
+            dep_process_domain_count(pool, 0, DEP_BASH_VARREDIR_MIN_FD,
+                                     mode ? 0 : 1, mode ? 0 : 2));
+      if (selected == UINT32_MAX)
+        return false;
+      if (!selected)
+        continue;
+      dep_route_set_t slots = {0};
+      if (!dep_allocation_rank_choices(state, journal, baseline, key,
+                                       requested - low, &slots,
+                                       minimum < 64 ? 64 : minimum))
+        return false;
+      choices->tail_domain =
+          dep_process_domain_apply(pool, 1, choices->tail_domain, selected);
+      if (choices->tail_domain == UINT32_MAX)
+        return false;
+      for (uint32_t i = 0; i < slots.count; i++) {
+        uint32_t match = 0;
+        while (match < tail.count &&
+               tail.routes[match].value != slots.routes[i].value)
+          match++;
+        if (match == tail.count && !dep_route_set_add(&tail, slots.routes[i]))
+          return false;
+        tail_domains[match] =
+            dep_process_domain_apply(pool, 1, tail_domains[match], selected);
+        if (tail_domains[match] == UINT32_MAX)
+          return false;
+      }
+    }
+  }
+  for (uint32_t i = 0; i < tail.count; i++)
+    if (tail.routes[i].value == key) {
+      hidden = dep_process_domain_apply(
+          pool, 1, hidden,
+          dep_process_domain_apply(
+              pool, 0, tail_domains[i],
+              dep_selector_choice(pool, choices->selector, 64)));
+    } else if (!dep_allocation_choice_add(choices, tail.routes[i],
+                                          tail_domains[i]))
+      return false;
+  /* A closed named variable still stores its numeric value. Reusing that
+   * physical descriptor updates the old alias too. Partition by identity,
+   * never by each unobserved numeric candidate. The high tail retains its
+   * existing conservative reuse alternatives. */
+  if (!dep_allocation_reuse_hidden(pool, state, journal, baseline,
+                                   choices->selector, &hidden, choices) ||
+      hidden == UINT32_MAX ||
+      (hidden && !dep_allocation_choice_add(
+                     choices, (dep_fd_route_t){DEP_ROUTE_ALIAS, key}, hidden)))
+    return false;
+  choices->tail_domain = dep_process_domain_apply(
+      pool, 0, choices->tail_domain,
+      dep_selector_choice(pool, choices->selector, 64));
+  if (choices->tail_domain == UINT32_MAX)
+    return false;
+  /* Candidate construction deliberately retains intermediate predicates so
+   * each subsequent rank can reuse them. Only the completed choice domains
+   * cross into the retained journal. Compact that exact root set before
+   * reserving/importing it; otherwise dead selector and counting prefixes can
+   * make a bounded import appear larger than its semantic decision DAG. */
+  uint32_t retained[64 + SHELL_DEP_TIME_MAX_EXTERNAL_FDS + 1];
+  memcpy(retained, choices->domains, choices->count * sizeof(*retained));
+  retained[choices->count] = choices->tail_domain;
+  if (!dep_process_domain_compact(journal, retained, choices->count + 1))
+    return false;
+  memcpy(choices->domains, retained, choices->count * sizeof(*retained));
+  choices->tail_domain = retained[choices->count];
+  if (collection && release_source) {
+    if (existing.count &&
+        !dep_route_state_append_one(state, journal, dep_fd_numeric(0),
+                                    DEP_FD_ACCESS_PROCESS_DOMAIN,
+                                    (dep_route_set_t){.ready = true}))
+      return false;
+    for (const dep_domain_collection_t *pins = collection; pins;
+         pins = pins->parent)
+      for (uint32_t i = 0; i < 3; i++)
+        if (pins->release_domains[i] &&
+            !dep_route_state_append_one(
+                pins->release_domains[i], journal, dep_fd_numeric(0),
+                DEP_FD_ACCESS_PROCESS_DOMAIN, (dep_route_set_t){.ready = true}))
+          return false;
+  }
+  uint32_t imported[64 + SHELL_DEP_TIME_MAX_EXTERNAL_FDS + 1];
+  uint32_t imported_count = 0;
+  for (uint32_t i = 0; i <= choices->count; i++) {
+    uint32_t scratch_root =
+        i == choices->count ? choices->tail_domain : choices->domains[i];
+    if (collection) {
+      dep_domain_collection_t pins = {.workspace = collection->workspace,
+                                      .frame = collection->frame,
+                                      .roots = {state},
+                                      .decisions = imported,
+                                      .decision_count = imported_count,
+                                      .parent = collection};
+      uint32_t reserve = dep_process_domain_reachable(pool, scratch_root);
+      dep_route_domains_collect_required(journal, &pins, state, NULL, reserve);
+    }
+    journal->process_domains.import_count = 0;
+    uint32_t retained_root = dep_process_domain_import(
+        &journal->process_domains, pool, scratch_root);
+    if (retained_root == UINT32_MAX)
+      return false;
+    imported[imported_count++] = retained_root;
+    if (i == choices->count)
+      choices->tail_domain = retained_root;
+    else
+      choices->domains[i] = retained_root;
+  }
+  return choices->tail_domain != UINT32_MAX;
+}
+
+/* Preserve the conditions which selected an original end, not just its FD.
+ * move_to_high_fd ignores slots 0..3, so unused low slots do not force a move.
+ * All predicates describe pre-pipe occupancy; only the retained parent end
+ * remains occupied after the child end and original duplicates close. */
+static SHELL_NONNULL(1) uint32_t
+    dep_process_domain_choice(dep_process_domain_pool_t *pool, uint32_t fd,
+                              unsigned rank) {
+  uint32_t moved = 0;
+  if (fd >= 4)
+    moved = dep_process_domain_apply(
+        pool, 0, dep_process_domain_count(pool, 0, fd, 2, 2),
+        dep_process_domain_count(pool, fd + 1, 64, 0, 0));
+  uint32_t tail;
+  if (fd >= 4)
+    tail = dep_process_domain_count(pool, fd + 1, 64, 0, rank == 1 ? 1 : 0);
+  else if (rank == 2)
+    tail = dep_process_domain_count(pool, 4, 64, 0, 0);
+  else {
+    uint32_t no_low = dep_process_domain_count(pool, fd + 1, 4, 0, 0);
+    uint32_t low = dep_process_domain_count(pool, fd + 1, 4, 1, 2);
+    tail = dep_process_domain_apply(
+        pool, 1,
+        dep_process_domain_apply(pool, 0, no_low,
+                                 dep_process_domain_count(pool, 4, 64, 0, 1)),
+        dep_process_domain_apply(pool, 0, low,
+                                 dep_process_domain_count(pool, 4, 64, 0, 0)));
+  }
+  uint32_t retained = dep_process_domain_apply(
+      pool, 0, dep_process_domain_count(pool, 0, fd, rank - 1, rank - 1), tail);
+  return dep_process_domain_apply(
+      pool, 0, dep_process_domain_node(pool, fd, 0, 1),
+      dep_process_domain_apply(pool, 1, moved, retained));
+}
+
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+static unsigned dep_test_nth_free(unsigned free, unsigned rank) {
+  for (unsigned fd = 10; fd < 14; fd++)
+    if ((free & (1u << (fd - 10))) && !--rank)
+      return fd;
+  return 64;
+}
+
+static SHELL_NONNULL(1) bool dep_test_selector_sequences(
+    dep_route_workspace_t *workspace) {
+  dep_route_journal_t *journal = &workspace->route_journal;
+  const dep_owner_routes_t baseline = {0};
+  for (unsigned rank_a = 1; rank_a <= 2; rank_a++)
+    for (unsigned rank_b = 1; rank_b <= 2; rank_b++)
+      for (unsigned early_close = 0; early_close < 2; early_close++)
+        for (unsigned relative = 0; relative < 2; relative++) {
+          dep_route_journal_reset(journal);
+          journal->process_scratch = &workspace->process_scratch;
+          workspace->next_selector = 0;
+          journal->next_selector = &workspace->next_selector;
+          dep_process_domain_pool_t *pool = &journal->process_domains;
+          uint32_t domain = 1;
+          for (uint32_t fd = 64; fd-- != 0;)
+            if (fd < 10 || fd >= 14)
+              domain = dep_process_domain_node(pool, fd, fd == 8 ? 0 : domain,
+                                               fd == 8 ? domain : 0);
+          domain = dep_process_domain_apply(
+              pool, 0, domain, dep_process_domain_count(pool, 10, 14, 2, 2));
+          dep_route_state_t initial = {0};
+          dep_route_set_t fact = {0};
+          dep_route_set_set(&fact,
+                            (dep_fd_route_t){DEP_ROUTE_INHERITED, domain});
+          if (!dep_route_state_store_access(&initial, journal,
+                                            dep_fd_numeric(0),
+                                            DEP_FD_ACCESS_PROCESS_DOMAIN, fact))
+            return false;
+          dep_fd_op_t a = {.fd_name = "a", .pos = 1};
+          dep_fd_op_t b = {.fd_name = "b", .pos = 2};
+          uint32_t key_a = dep_allocation_slot(journal, &a);
+          uint32_t key_b = dep_allocation_slot(journal, &b);
+          dep_allocation_choices_t choices_a = {0};
+          if (!dep_allocation_domain_choices(&initial, journal, &baseline,
+                                             key_a, rank_a, 10, -1, 0, false,
+                                             &choices_a, NULL) ||
+              choices_a.count != 1)
+            return false;
+          dep_route_state_t after_a = initial;
+          dep_route_set_t live = {0}, closed = {0};
+          dep_route_set_set(&live,
+                            (dep_fd_route_t){DEP_ROUTE_INHERITED, UINT32_MAX});
+          dep_route_set_set(&closed,
+                            (dep_fd_route_t){DEP_ROUTE_CLOSED, UINT32_MAX});
+          if (!dep_allocation_select_slot(&after_a, journal, &choices_a, 0) ||
+              !dep_route_state_store_access(&after_a, journal,
+                                            dep_fd_numeric(key_a),
+                                            DEP_FD_ACCESS_BINDING, live))
+            return false;
+          if (early_close) {
+            dep_route_set_t available = {0};
+            dep_route_set_set(&available,
+                              (dep_fd_route_t){DEP_ROUTE_ALIAS, key_a});
+            if (!dep_route_state_store_access(&after_a, journal,
+                                              dep_fd_numeric(key_a),
+                                              DEP_FD_ACCESS_BINDING, closed) ||
+                !dep_route_state_store_access(
+                    &after_a, journal, dep_fd_numeric(SHELL_DEP_FD_NONE),
+                    DEP_FD_ACCESS_AVAILABLE, available))
+              return false;
+          }
+          dep_allocation_choices_t choices_b = {0};
+          if (!dep_allocation_domain_choices(
+                  &after_a, journal, &baseline, key_b, rank_b, 10, -1,
+                  relative ? choices_a.selector : 0, false, &choices_b, NULL))
+            return false;
+          uint32_t roots[64 + SHELL_DEP_TIME_MAX_EXTERNAL_FDS];
+          for (uint32_t i = 0; i < choices_b.count; i++) {
+            dep_route_state_t selected = after_a;
+            if (!dep_allocation_select_slot(&selected, journal, &choices_b,
+                                            i) ||
+                !dep_route_state_store_access(
+                    &selected, journal,
+                    dep_fd_numeric(choices_b.slots[i].value),
+                    DEP_FD_ACCESS_BINDING, live) ||
+                (!early_close && !dep_route_state_store_access(
+                                     &selected, journal, dep_fd_numeric(key_a),
+                                     DEP_FD_ACCESS_BINDING, closed)))
+              return false;
+            roots[i] =
+                dep_fd_raw_fact(&selected, journal, &baseline,
+                                dep_fd_numeric(0), DEP_FD_ACCESS_PROCESS_DOMAIN)
+                    .routes[0]
+                    .value;
+          }
+          pool = journal->process_scratch;
+          pool->root = pool->count = 0;
+          pool->memo_ready = false;
+          pool->import_count = 0;
+          uint32_t union_root = 0;
+          for (uint32_t i = 0; i < choices_b.count; i++)
+            union_root = dep_process_domain_apply(
+                pool, 1, union_root,
+                dep_process_domain_import(pool, &journal->process_domains,
+                                          roots[i]));
+          if (union_root == UINT32_MAX)
+            return false;
+          /* Import names sharing a selected descriptor into another journal.
+           * Rebased local keys must not split one physical alias into two. */
+          dep_route_journal_t *child = &workspace->snapshot_journal;
+          dep_route_journal_reset(child);
+          child->process_scratch = &workspace->process_scratch;
+          child->next_selector = &workspace->next_selector;
+          dep_fd_ref_t name_a = {
+              .name = "a", .value = SHELL_DEP_FD_NAMED, .name_len = 1};
+          dep_fd_ref_t name_b = {
+              .name = "b", .value = SHELL_DEP_FD_NAMED, .name_len = 1};
+          uint32_t imported_a = dep_import_allocation_slot(
+              child, name_a, choices_a.selector, NULL);
+          uint32_t imported_b = dep_import_allocation_slot(
+              child, name_b, choices_a.selector, NULL);
+          if (imported_a == SHELL_DEP_FD_NONE || imported_a != imported_b)
+            return false;
+          bool expected[16][5][5] = {{{false}}};
+          for (unsigned inherited = 0; inherited < 16; inherited++) {
+            if (dep_test_nth_free(inherited, 2) == 64)
+              continue;
+            unsigned chosen_a = dep_test_nth_free(inherited, rank_a);
+            unsigned free = inherited & ~(1u << (chosen_a - 10));
+            if (early_close)
+              free |= 1u << (chosen_a - 10);
+            unsigned candidates =
+                relative ? free & ~((1u << (chosen_a - 9)) - 1) : free;
+            unsigned chosen_b = dep_test_nth_free(candidates, rank_b);
+            if (chosen_b < 64)
+              free &= ~(1u << (chosen_b - 10));
+            if (!early_close)
+              free |= 1u << (chosen_a - 10);
+            expected[free][chosen_a - 10][chosen_b == 64 ? 4 : chosen_b - 10] =
+                true;
+          }
+          for (unsigned free = 0; free < 16; free++)
+            for (unsigned ca = 0; ca < 5; ca++)
+              for (unsigned cb = 0; cb < 5; cb++) {
+                uint32_t cursor = union_root;
+                while (cursor >= 2) {
+                  const dep_process_domain_node_t *node =
+                      &pool->nodes[cursor - 2];
+                  bool high;
+                  if (node->fd < 64)
+                    high = ((UINT64_C(1) << 8 | (uint64_t)free << 10) >>
+                            node->fd) &
+                           1u;
+                  else {
+                    unsigned chosen = (node->fd - 64) / 65 ? cb : ca;
+                    uint32_t choice = (node->fd - 64) % 65;
+                    unsigned value = chosen == 4 ? 64 : chosen + 10;
+                    high = choice == value;
+                  }
+                  cursor = high ? node->high : node->low;
+                }
+                if ((cursor != 0) != expected[free][ca][cb])
+                  return false;
+              }
+        }
+  return true;
+}
+
+static SHELL_NONNULL(1) bool dep_process_domain_evaluate(
+    const dep_process_domain_pool_t *pool, uint32_t root, uint64_t free) {
+  while (root >= 2) {
+    const dep_process_domain_node_t *node = &pool->nodes[root - 2];
+    root = free & (UINT64_C(1) << node->fd) ? node->high : node->low;
+  }
+  return root != 0;
+}
+
+bool shellsplit_test_process_domain_contract(void *storage) {
+  dep_process_domain_pool_t *pool =
+      &((dep_route_workspace_t *)storage)->process_scratch;
+  pool->root = pool->count = 0;
+  pool->memo_ready = false;
+  pool->import_count = 0;
+  for (unsigned rank = 1; rank <= 2; rank++)
+    for (uint32_t fd = 0; fd < 6; fd++) {
+      uint32_t predicate = dep_process_domain_choice(pool, fd, rank);
+      if (predicate == UINT32_MAX)
+        return false;
+      for (uint64_t free = 0; free < 64; free++) {
+        uint32_t originals[2] = {64, 65}, found = 0;
+        for (uint32_t bit = 0; bit < 6 && found < 2; bit++)
+          if (free & (UINT64_C(1) << bit))
+            originals[found++] = bit;
+        if (found == 1)
+          originals[1] = 64;
+        uint32_t selected = originals[rank - 1];
+        for (uint32_t bit = 6; bit-- > 4;)
+          if ((free & (UINT64_C(1) << bit)) && bit != originals[0] &&
+              bit != originals[1]) {
+            selected = bit;
+            break;
+          }
+        if (dep_process_domain_evaluate(pool, predicate, free) !=
+            (fd == selected))
+          return false;
+      }
+    }
+  return true;
+}
+
+bool shellsplit_test_allocation_domain_contract(void *storage) {
+  dep_process_domain_pool_t *pool =
+      &((dep_route_workspace_t *)storage)->process_scratch;
+  pool->root = pool->count = 0;
+  pool->memo_ready = false;
+  pool->import_count = 0;
+  /* Vary two low slots and four high slots. Every other slot is occupied.
+   * The concrete oracle counts available slots, independently of BDD logic. */
+  for (unsigned rank = 0; rank <= 2; rank++)
+    for (int mode = -1; mode <= 1; mode++) {
+      if (!rank && mode != -1)
+        continue;
+      for (uint32_t fd = 10; fd < 14; fd++) {
+        uint32_t predicate = dep_process_domain_apply(
+            pool, 0, dep_process_domain_node(pool, fd, 0, 1),
+            dep_allocation_domain_predicate(pool, 10, fd, rank, mode));
+        if (predicate == UINT32_MAX)
+          return false;
+        for (uint64_t pattern = 0; pattern < 64; pattern++) {
+          uint64_t free = pattern << 8;
+          bool low = (pattern & 3u) != 0;
+          unsigned wanted = rank ? rank : (low ? 1 : 2);
+          unsigned seen = 0;
+          uint32_t selected = 64;
+          for (uint32_t bit = 10; bit < 14; bit++)
+            if ((free & (UINT64_C(1) << bit)) && ++seen == wanted) {
+              selected = bit;
+              break;
+            }
+          bool permitted = mode < 0 || low == (mode == 0);
+          if (dep_process_domain_evaluate(pool, predicate, free) !=
+              (permitted && selected == fd))
+            return false;
+        }
+      }
+    }
+  uint32_t free11 = dep_process_domain_node(pool, 11, 0, 1);
+  uint32_t used11 = dep_process_domain_node(pool, 11, 1, 0);
+  uint32_t exactly_one = dep_process_domain_node(pool, 10, free11, used11);
+  uint32_t observed = dep_process_domain_apply(
+      pool, 0, exactly_one, dep_process_domain_node(pool, 10, 1, 0));
+  uint32_t assigned =
+      dep_process_domain_assign(pool, exactly_one, 10, false, true);
+  if (observed == UINT32_MAX || assigned == UINT32_MAX)
+    return false;
+  return !dep_process_domain_evaluate(pool, observed, 0) &&
+         dep_process_domain_evaluate(pool, observed, UINT64_C(1) << 11) &&
+         dep_process_domain_evaluate(pool, assigned, 0) &&
+         dep_process_domain_evaluate(pool, assigned, UINT64_C(1) << 11) &&
+         dep_test_selector_sequences(storage);
+}
+
+/* Evaluate complete finite-table assignments independently of BDD operations.
+ * Each nonphysical variable belongs to one of these four selector spans. */
+static SHELL_NONNULL(1, 4, 5) bool dep_test_lifecycle_bits(
+    const dep_process_domain_pool_t *pool, uint32_t root, uint64_t free,
+    const uint32_t selectors[4], const uint64_t bits[4]) {
+  while (root >= 2) {
+    const dep_process_domain_node_t *node = &pool->nodes[root - 2];
+    bool high = false;
+    if (node->fd < 64)
+      high = (free >> node->fd) & 1u;
+    else
+      for (unsigned i = 0; i < 4; i++)
+        if (node->fd >= selectors[i] && node->fd - selectors[i] < 64) {
+          high = (bits[i] >> (node->fd - selectors[i])) & 1u;
+          break;
+        }
+    root = high ? node->high : node->low;
+  }
+  return root != 0;
+}
+
+/* One-high valuations are representatives, not a validity restriction. */
+static SHELL_NONNULL(1, 4, 5) bool dep_test_lifecycle_value(
+    const dep_process_domain_pool_t *pool, uint32_t root, uint64_t free,
+    const uint32_t selectors[4], const unsigned values[4]) {
+  uint64_t bits[4];
+  for (unsigned i = 0; i < 4; i++)
+    bits[i] = values[i] < 64 ? UINT64_C(1) << values[i] : 0;
+  return dep_test_lifecycle_bits(pool, root, free, selectors, bits);
+}
+
+/* Independent image oracle: enumerate concrete source tables, not BDD apply
+ * operations. The second selector deliberately correlates with the source
+ * occupancy, so changing the selected slot must preserve unrelated identity.
+ */
+static SHELL_NONNULL(1) bool dep_test_selector_image(
+    dep_route_workspace_t *workspace) {
+  dep_route_journal_t *journal = &workspace->route_journal;
+  dep_route_journal_reset(journal);
+  journal->process_scratch = &workspace->process_scratch;
+  dep_process_domain_pool_t *pool = &journal->process_domains;
+  const uint32_t selectors[4] = {64, 129, 194, 259};
+  uint32_t domain = 0;
+  for (unsigned pattern = 0; pattern < 16; pattern++) {
+    uint32_t cube = 1;
+    for (uint32_t fd = 64; fd-- != 0;) {
+      bool free = fd >= 10 && fd < 14 && (pattern & (1u << (fd - 10)));
+      cube =
+          dep_process_domain_node(pool, fd, free ? 0 : cube, free ? cube : 0);
+    }
+    cube = dep_process_domain_apply(
+        pool, 0, cube,
+        dep_selector_choice(pool, selectors[1], 10 + (pattern & 3u)));
+    uint32_t choices = 0;
+    for (unsigned choice = 0; choice < 5; choice++)
+      choices = dep_process_domain_apply(
+          pool, 1, choices,
+          dep_selector_choice(pool, selectors[0],
+                              choice == 4 ? 64 : 10 + choice));
+    domain = dep_process_domain_apply(
+        pool, 1, domain, dep_process_domain_apply(pool, 0, cube, choices));
+  }
+  if (domain == UINT32_MAX)
+    return false;
+  const dep_route_state_t live = {0};
+  for (unsigned mode = 0; mode < 4; mode++) {
+    size_t before =
+        shellsplit_test_metadata_work(SHELLSPLIT_TEST_WORK_SELECTOR_IMAGE);
+    uint32_t input_nodes = pool->count;
+    uint32_t image = dep_selector_assign(journal, domain, &live, selectors[0],
+                                         mode & 1u, mode & 2u, NULL);
+    size_t work =
+        shellsplit_test_metadata_work(SHELLSPLIT_TEST_WORK_SELECTOR_IMAGE) -
+        before;
+    uint32_t repeated = dep_selector_assign(journal, image, &live, selectors[0],
+                                            mode & 1u, mode & 2u, NULL);
+    /* Each input sub-DAG/physical-level pair is transformed at most once. */
+    if (!work || work > 64u * (input_nodes + 1u) || image == UINT32_MAX ||
+        repeated != image)
+      return false;
+    for (unsigned pattern = 0; pattern < 16; pattern++)
+      for (unsigned choice = 0; choice < 5; choice++)
+        for (unsigned alias = 0; alias < 4; alias++) {
+          bool expected = false;
+          for (unsigned inherited = 0; inherited < 16; inherited++) {
+            if ((inherited & 3u) != alias)
+              continue;
+            if (choice == 4)
+              expected |= pattern == inherited;
+            else {
+              unsigned cleared = inherited & ~(1u << choice);
+              expected |=
+                  ((mode & 2u) && pattern == cleared) ||
+                  ((mode & 1u) && pattern == (cleared | (1u << choice)));
+            }
+          }
+          const unsigned values[4] = {choice == 4 ? 64 : 10 + choice,
+                                      10 + alias, 64, 64};
+          if (dep_test_lifecycle_value(pool, image, (uint64_t)pattern << 10,
+                                       selectors, values) != expected)
+            return false;
+        }
+  }
+  return true;
+}
+
+/* A reduced source DAG need not contain any selector variable. Its image must
+ * still assign the chosen physical FD, including after all choices coalesce. */
+static SHELL_NONNULL(1) bool dep_test_unconstrained_selector_image(
+    dep_route_workspace_t *workspace) {
+  dep_route_journal_t *journal = &workspace->route_journal;
+  const uint32_t selectors[4] = {64, 129, 194, 259};
+  const dep_route_state_t live = {0};
+  for (unsigned pattern = 0; pattern < 2; pattern++) {
+    dep_route_journal_reset(journal);
+    journal->process_scratch = &workspace->process_scratch;
+    dep_process_domain_pool_t *pool = &journal->process_domains;
+    uint32_t source = 1;
+    for (uint32_t fd = 64; fd-- != 0;) {
+      bool free = pattern && fd >= 10 && fd < 14;
+      source = dep_process_domain_node(pool, fd, free ? 0 : source,
+                                       free ? source : 0);
+    }
+    uint32_t image = dep_selector_assign(journal, source, &live, selectors[0],
+                                         !pattern, pattern, NULL);
+    if (image == UINT32_MAX)
+      return false;
+    for (unsigned choice = 0; choice < 5; choice++) {
+      unsigned value = choice == 4 ? 64 : 10 + choice;
+      const unsigned values[4] = {value, 64, 64, 64};
+      const uint64_t bits[4] = {value < 64 ? UINT64_MAX << value : 0, 0, 0, 0};
+      for (unsigned actual = 0; actual < 16; actual++) {
+        unsigned expected = pattern ? 15u : 0u;
+        if (choice < 4)
+          expected ^= 1u << choice;
+        if (dep_test_lifecycle_value(pool, image, (uint64_t)actual << 10,
+                                     selectors,
+                                     values) != (actual == expected) ||
+            dep_test_lifecycle_bits(pool, image, (uint64_t)actual << 10,
+                                    selectors, bits) != (actual == expected))
+          return false;
+      }
+    }
+  }
+  return true;
+}
+
+static SHELL_NONNULL(1) bool dep_test_domain_joins(
+    dep_route_workspace_t *workspace);
+
+/* Ownership-tree values are sentinels, not descriptor snapshots. Collection
+ * must retain their keys through the enclosing PROCESS_OWNED fact. */
+static SHELL_NONNULL(1) bool dep_test_owned_collection(
+    dep_route_workspace_t *workspace) {
+  dep_route_journal_t *journal = &workspace->route_journal;
+  dep_route_journal_reset(journal);
+  dep_route_state_t state = {0};
+  if (!dep_process_owned_set(&state, journal, dep_fd_numeric(3), true) ||
+      !dep_process_owned_set(&state, journal, dep_fd_numeric(63), true))
+    return false;
+  const dep_owner_routes_t baseline = {0};
+  dep_route_state_t extra = state, joined = state;
+  dep_route_set_t closed = {0};
+  dep_route_set_set(&closed, (dep_fd_route_t){DEP_ROUTE_CLOSED, UINT32_MAX});
+  if (!dep_route_state_store_access(&extra, journal, dep_fd_numeric(7),
+                                    DEP_FD_ACCESS_READ, closed) ||
+      !dep_fd_merge(&joined, &extra, journal, &baseline))
+    return false;
+  bool cached = false;
+  for (uint32_t i = 0; i < DEP_ROUTE_OPERATION_CAPACITY; i++)
+    cached |= journal->joins[i].baseline != NULL;
+  if (!cached)
+    return false;
+  uint32_t root = dep_process_owned_root(&state, journal);
+  uint32_t count = journal->count > journal->snapshot_count
+                       ? journal->count
+                       : journal->snapshot_count;
+  memset(journal->process_domains.import_cache, 0,
+         count * sizeof(*journal->process_domains.import_cache));
+  dep_process_domain_mark_state(journal, &state);
+  if (!(journal->process_domains.import_cache[root - 1] & 2u))
+    return false;
+  dep_route_snapshot_collection_end(journal);
+  dep_route_tree_collection_end(journal);
+  for (uint32_t i = 0; i < DEP_ROUTE_OPERATION_CAPACITY; i++)
+    if (journal->joins[i].baseline)
+      return false;
+  return dep_process_owned(&state, journal, dep_fd_numeric(3)) &&
+         dep_process_owned(&state, journal, dep_fd_numeric(63)) &&
+         dep_process_owned_set(&state, journal, dep_fd_numeric(3), false) &&
+         !dep_process_owned(&state, journal, dep_fd_numeric(3)) &&
+         dep_process_owned(&state, journal, dep_fd_numeric(63));
+}
+
+bool shellsplit_test_selector_lifecycle_contract(void *storage) {
+  dep_route_workspace_t *workspace = storage;
+  if (!dep_test_owned_collection(workspace) ||
+      !dep_test_selector_image(workspace) ||
+      !dep_test_unconstrained_selector_image(workspace) ||
+      !dep_test_domain_joins(workspace))
+    return false;
+  dep_route_journal_t *journal = &workspace->route_journal;
+  dep_route_journal_reset(journal);
+  journal->process_scratch = &workspace->process_scratch;
+  workspace->next_selector = 0;
+  journal->next_selector = &workspace->next_selector;
+  dep_process_domain_pool_t *pool = &journal->process_domains;
+  const dep_owner_routes_t baseline = {0};
+  uint32_t domain = 0;
+  /* At least three of fd 10..13 are free. The low temporary resource slot
+   * is known free; other FDs are occupied. Build only real concrete worlds. */
+  for (unsigned inherited = 0; inherited < 16; inherited++) {
+    if (dep_test_nth_free(inherited, 3) == 64)
+      continue;
+    uint64_t free = UINT64_C(1) << 8 | (uint64_t)inherited << 10;
+    uint32_t cube = 1;
+    for (uint32_t fd = 64; fd-- != 0;) {
+      bool available = (free >> fd) & 1u;
+      cube = dep_process_domain_node(pool, fd, available ? 0 : cube,
+                                     available ? cube : 0);
+    }
+    domain = dep_process_domain_apply(pool, 1, domain, cube);
+  }
+  if (domain == UINT32_MAX)
+    return false;
+  dep_route_state_t state = {0};
+  dep_route_set_t fact = {0}, live = {0}, closed = {0};
+  dep_route_set_set(&fact, (dep_fd_route_t){DEP_ROUTE_INHERITED, domain});
+  dep_route_set_set(&live, (dep_fd_route_t){DEP_ROUTE_INHERITED, UINT32_MAX});
+  dep_route_set_set(&closed, (dep_fd_route_t){DEP_ROUTE_CLOSED, UINT32_MAX});
+  if (!dep_route_state_store_access(&state, journal, dep_fd_numeric(0),
+                                    DEP_FD_ACCESS_PROCESS_DOMAIN, fact))
+    return false;
+  const dep_fd_op_t operations[4] = {
+      {.pos = 1, .fd = SHELL_DEP_FD_NAMED, .fd_name = "a", .fd_name_len = 1},
+      {.pos = 2, .fd = 0, .kind = DEP_FD_OP_DUP, .target_fd = 1},
+      {.pos = 3, .fd = SHELL_DEP_FD_NAMED, .fd_name = "b", .fd_name_len = 1},
+      {.pos = 4, .fd = SHELL_DEP_FD_NAMED, .fd_name = "c", .fd_name_len = 1}};
+  uint32_t keys[4], selectors[4], roots[4];
+  for (unsigned i = 0; i < 3; i++) {
+    keys[i] = i == 1 ? dep_undo_slot(journal, &operations[i],
+                                     DEP_ALLOCATION_TARGET_UNDO, true)
+                     : dep_allocation_slot(journal, &operations[i]);
+    dep_allocation_choices_t choices = {0};
+    if (keys[i] == SHELL_DEP_FD_NONE ||
+        !dep_allocation_domain_choices(&state, journal, &baseline, keys[i], 1,
+                                       10, -1, 0, false, &choices, NULL) ||
+        choices.count != 1 || choices.slots[0].value != keys[i] ||
+        !dep_allocation_select_slot(&state, journal, &choices, 0) ||
+        !dep_route_state_store_access(&state, journal, dep_fd_numeric(keys[i]),
+                                      DEP_FD_ACCESS_BINDING, live))
+      return false;
+    selectors[i] = choices.selector;
+  }
+  roots[0] = dep_fd_raw_fact(&state, journal, &baseline, dep_fd_numeric(0),
+                             DEP_FD_ACCESS_PROCESS_DOMAIN)
+                 .routes[0]
+                 .value;
+  if (!dep_route_state_store_access(&state, journal, dep_fd_numeric(keys[1]),
+                                    DEP_FD_ACCESS_BINDING, closed) ||
+      !dep_selector_retire(&state, journal, keys[1], NULL) ||
+      dep_fd_raw_fact(&state, journal, &baseline, dep_fd_numeric(keys[1]),
+                      DEP_FD_ACCESS_SELECTOR)
+          .count)
+    return false;
+  roots[1] = dep_fd_raw_fact(&state, journal, &baseline, dep_fd_numeric(0),
+                             DEP_FD_ACCESS_PROCESS_DOMAIN)
+                 .routes[0]
+                 .value;
+  /* A named value keeps its selection when closed; the next lowest-free
+   * allocation must reuse its slot rather than splitting the old alias. */
+  dep_route_set_t available = {0};
+  dep_route_set_set(&available, (dep_fd_route_t){DEP_ROUTE_ALIAS, keys[0]});
+  if (!dep_route_state_store_access(&state, journal, dep_fd_numeric(keys[0]),
+                                    DEP_FD_ACCESS_BINDING, closed) ||
+      !dep_route_state_store_access(&state, journal,
+                                    dep_fd_numeric(SHELL_DEP_FD_NONE),
+                                    DEP_FD_ACCESS_AVAILABLE, available))
+    return false;
+  roots[2] = dep_fd_raw_fact(&state, journal, &baseline, dep_fd_numeric(0),
+                             DEP_FD_ACCESS_PROCESS_DOMAIN)
+                 .routes[0]
+                 .value;
+  keys[3] = dep_allocation_slot(journal, &operations[3]);
+  dep_allocation_choices_t choices = {0};
+  bool reuse_choices =
+      keys[3] != SHELL_DEP_FD_NONE &&
+      dep_allocation_domain_choices(&state, journal, &baseline, keys[3], 1, 10,
+                                    -1, 0, false, &choices, NULL);
+  if (!reuse_choices || choices.count != 1 ||
+      choices.slots[0].value != keys[0] ||
+      !dep_allocation_select_slot(&state, journal, &choices, 0) ||
+      !dep_route_state_store_access(&state, journal, dep_fd_numeric(keys[0]),
+                                    DEP_FD_ACCESS_BINDING, live))
+    return false;
+  selectors[3] = choices.selector;
+  roots[3] = dep_fd_raw_fact(&state, journal, &baseline, dep_fd_numeric(0),
+                             DEP_FD_ACCESS_PROCESS_DOMAIN)
+                 .routes[0]
+                 .value;
+  for (unsigned i = 0; i < 4; i++) {
+    if (i == 1)
+      continue;
+    dep_route_set_t identity =
+        dep_fd_raw_fact(&state, journal, &baseline, dep_fd_numeric(keys[i]),
+                        DEP_FD_ACCESS_SELECTOR);
+    if (identity.count != 1 || identity.routes[0].value != selectors[i])
+      return false;
+  }
+
+  pool = journal->process_scratch;
+  pool->root = pool->count = 0;
+  pool->memo_ready = false;
+  pool->import_count = 0;
+  /* Dead nodes precede live imports, forcing actual relocation. */
+  for (uint32_t fd = 16; fd < 32; fd++)
+    (void)dep_process_domain_node(pool, fd, 0, 1);
+  uint32_t imported[4];
+  for (unsigned i = 0; i < 4; i++) {
+    imported[i] =
+        dep_process_domain_import(pool, &journal->process_domains, roots[i]);
+    if (imported[i] == UINT32_MAX)
+      return false;
+  }
+  for (unsigned round = 0; round < 2; round++) {
+    for (unsigned pattern = 0; pattern < 16; pattern++)
+      for (unsigned a = 0; a < 5; a++)
+        for (unsigned t = 0; t < 5; t++)
+          for (unsigned b = 0; b < 5; b++)
+            for (unsigned c = 0; c < 5; c++) {
+              unsigned values[4] = {a == 4 ? 64 : 10 + a, t == 4 ? 64 : 10 + t,
+                                    b == 4 ? 64 : 10 + b, c == 4 ? 64 : 10 + c};
+              bool expected[4] = {false};
+              for (unsigned inherited = 0; inherited < 16; inherited++) {
+                if (dep_test_nth_free(inherited, 3) == 64)
+                  continue;
+                unsigned ca = dep_test_nth_free(inherited, 1);
+                unsigned free = inherited & ~(1u << (ca - 10));
+                unsigned ct = dep_test_nth_free(free, 1);
+                free &= ~(1u << (ct - 10));
+                unsigned cb = dep_test_nth_free(free, 1);
+                free &= ~(1u << (cb - 10));
+                if (values[0] != ca || values[2] != cb)
+                  continue;
+                expected[0] |= pattern == free && values[1] == ct;
+                free |= 1u << (ct - 10);
+                expected[1] |= pattern == free;
+                free |= 1u << (ca - 10);
+                expected[2] |= pattern == free;
+                free &= ~(1u << (ca - 10));
+                expected[3] |= pattern == free && values[3] == ca;
+              }
+              uint64_t free = UINT64_C(1) << 8 | (uint64_t)pattern << 10;
+              for (unsigned phase = 0; phase < 4; phase++)
+                if (dep_test_lifecycle_value(pool, imported[phase], free,
+                                             selectors,
+                                             values) != expected[phase])
+                  return false;
+            }
+    if (round == 0) {
+      uint32_t previous = pool->count;
+      if (!dep_process_domain_compact(journal, imported, 4) ||
+          pool->count >= previous)
+        return false;
+      /* Collection invalidates the old import cache. Canonical re-imports
+       * must use relocated IDs without resurrecting the discarded nodes. */
+      for (unsigned i = 0; i < 4; i++)
+        if (dep_process_domain_import(pool, &journal->process_domains,
+                                      roots[i]) != imported[i])
+          return false;
+    }
+  }
+  /* No retired variable may remain, including bits outside the enumerated
+   * physical choices. Reuse the workspace cache as a backwards DAG mark map;
+   * invalidate its source mapping before doing so. */
+  pool->import_count = 0;
+  memset(pool->import_cache, 0, pool->count * sizeof(*pool->import_cache));
+  for (unsigned phase = 1; phase < 4; phase++)
+    pool->import_cache[imported[phase] - 2] = 1;
+  for (uint32_t i = pool->count; i-- != 0;) {
+    if (!pool->import_cache[i])
+      continue;
+    const dep_process_domain_node_t *node = &pool->nodes[i];
+    if (node->fd >= selectors[1] && node->fd - selectors[1] < 65)
+      return false;
+    if (node->low >= 2)
+      pool->import_cache[node->low - 2] = 1;
+    if (node->high >= 2)
+      pool->import_cache[node->high - 2] = 1;
+  }
+  return true;
+}
+#endif
+
+static SHELL_NONNULL(1, 2, 3) bool dep_process_add_choice(
+    dep_process_domain_pool_t *pool, dep_route_set_t *slots, uint32_t *domains,
+    uint32_t slot, uint32_t domain) {
+  if (domain == UINT32_MAX)
+    return false;
+  uint32_t i = 0;
+  for (; i < slots->count; i++)
+    if (slots->routes[i].value == slot)
+      break;
+  if (i == slots->count) {
+    if (!dep_route_set_add(slots, (dep_fd_route_t){DEP_ROUTE_ALIAS, slot}))
+      return false;
+    domains[i] = domain;
+  } else {
+    domains[i] = dep_process_domain_apply(pool, 1, domains[i], domain);
+    if (domains[i] == UINT32_MAX)
+      return false;
+  }
+  return true;
+}
+
+static SHELL_NONNULL(1, 2, 3, 4, 5, 7, 8) bool dep_process_choices(
+    const dep_route_state_t *state, dep_route_journal_t *journal,
+    const dep_owner_routes_t *baseline, const dep_fd_op_t *op,
+    dep_route_set_t *slots, uint32_t key, uint32_t *domains, uint32_t *before) {
+  dep_process_domain_pool_t *pool = journal->process_scratch;
+  pool->root = pool->count = 0;
+  pool->memo_ready = false;
+  pool->import_count = 0;
+  dep_fd_occupancy_t occupancy[64];
+  bool observable[64] = {false};
+  for (uint32_t i = 0; i < journal->observable_fd_count; i++)
+    if (journal->observable_fds[i] < 64 &&
+        (journal->observable_fds[i] >= DEP_BASH_VARREDIR_MIN_FD ||
+         (op->process_observed_low & (1u << journal->observable_fds[i]))))
+      observable[journal->observable_fds[i]] = true;
+  uint32_t certain_free[65] = {0};
+  bool definite = true;
+  for (uint32_t fd = 0; fd < 64; fd++) {
+    occupancy[fd] = dep_fd_occupancy(state, journal, baseline, fd);
+    bool free = occupancy[fd].may_be_free && !occupancy[fd].may_be_occupied;
+    certain_free[fd + 1] = certain_free[fd] + free;
+    definite &= occupancy[fd].may_be_free != occupancy[fd].may_be_occupied;
+  }
+  uint32_t direct = SHELL_DEP_FD_NONE;
+  for (uint32_t fd = 64; fd-- > 4;) {
+    if (!occupancy[fd].may_be_free)
+      continue;
+    if (!occupancy[fd].may_be_occupied && certain_free[fd] >= 2)
+      direct = fd;
+    break;
+  }
+  if (direct == SHELL_DEP_FD_NONE && definite) {
+    uint32_t rank = op->access == DEP_FD_ACCESS_READ ? 1 : 2;
+    for (uint32_t fd = 0; fd < 64; fd++)
+      if (occupancy[fd].may_be_free && certain_free[fd + 1] == rank) {
+        direct = fd;
+        break;
+      }
+  }
+  dep_route_set_t available = dep_fd_raw_fact(state, journal, baseline,
+                                              dep_fd_numeric(SHELL_DEP_FD_NONE),
+                                              DEP_FD_ACCESS_AVAILABLE);
+  bool named_alias = available.truncated;
+  for (uint32_t i = 0; i < available.count; i++)
+    named_alias |= available.routes[i].kind == DEP_ROUTE_ALIAS &&
+                   available.routes[i].value > SHELL_DEP_FD_MAX;
+  if (direct != SHELL_DEP_FD_NONE && !named_alias) {
+    /* This path adds no occupancy assumptions: known free originals and a
+     * known highest slot already prove the one physical result. */
+    *before = domains[0] = 0;
+    return dep_route_set_add(slots, (dep_fd_route_t){DEP_ROUTE_ALIAS, direct});
+  }
+  dep_route_set_t existing =
+      dep_fd_raw_fact(state, journal, baseline, dep_fd_numeric(0),
+                      DEP_FD_ACCESS_PROCESS_DOMAIN);
+  uint32_t domain =
+      existing.count
+          ? dep_process_domain_import(pool, &journal->process_domains,
+                                      existing.routes[0].value)
+          : 1;
+  if (!existing.count)
+    for (uint32_t fd = 64; fd-- != 0;)
+      domain = dep_process_domain_node(
+          pool, fd, occupancy[fd].may_be_occupied ? domain : 0,
+          occupancy[fd].may_be_free ? domain : 0);
+  if (domain == UINT32_MAX)
+    return false;
+  unsigned rank = op->access == DEP_FD_ACCESS_READ ? 1 : 2;
+  uint32_t selector = dep_allocation_selector(journal, key), hidden = 0;
+  if (!selector)
+    return false;
+  for (uint32_t fd = 0; fd < 64; fd++) {
+    if (!occupancy[fd].may_be_free)
+      continue;
+    uint32_t selected = dep_process_domain_apply(
+        pool, 0, domain, dep_process_domain_choice(pool, fd, rank));
+    if (selected == UINT32_MAX)
+      return false;
+    if (!selected)
+      continue;
+    uint32_t slot = observable[fd] ? fd : key;
+    if (slot == key) {
+      selected = dep_process_domain_apply(
+          pool, 0, selected, dep_selector_choice(pool, selector, fd));
+    }
+    uint32_t after = dep_process_domain_assign(pool, selected, fd, false, true);
+    if (slot == key)
+      hidden = dep_process_domain_apply(pool, 1, hidden, after);
+    else if (!dep_process_add_choice(pool, slots, domains, slot, after))
+      return false;
+    if (hidden == UINT32_MAX)
+      return false;
+    if (pool->count > DEP_ROUTE_CHANGE_CAPACITY / 4) {
+      uint32_t roots[SHELL_DEP_TIME_MAX_EXTERNAL_FDS + 2];
+      roots[0] = domain;
+      roots[1] = hidden;
+      memcpy(roots + 2, domains, slots->count * sizeof(uint32_t));
+      if (!dep_process_domain_compact(journal, roots, slots->count + 2))
+        return false;
+      domain = roots[0];
+      hidden = roots[1];
+      memcpy(domains, roots + 2, slots->count * sizeof(uint32_t));
+    }
+  }
+  for (unsigned low = 0; low < rank; low++) {
+    uint32_t selected = dep_process_domain_apply(
+        pool, 0, domain, dep_process_domain_count(pool, 0, 64, low, low));
+    if (selected == UINT32_MAX)
+      return false;
+    if (!selected)
+      continue;
+    dep_route_set_t fallback = {.ready = true};
+    if (!dep_allocation_rank_choices(state, journal, baseline, key, rank - low,
+                                     &fallback, 64))
+      return false;
+    for (uint32_t i = 0; i < fallback.count; i++)
+      if (fallback.routes[i].value >= 64) {
+        if (fallback.routes[i].value == key)
+          hidden = dep_process_domain_apply(
+              pool, 1, hidden,
+              dep_process_domain_apply(
+                  pool, 0, selected, dep_selector_choice(pool, selector, 64)));
+        else if (!dep_process_add_choice(pool, slots, domains,
+                                         fallback.routes[i].value, selected))
+          return false;
+      }
+  }
+  dep_allocation_choices_t reuse = {0};
+  if (!dep_allocation_reuse_hidden(pool, state, journal, baseline, selector,
+                                   &hidden, &reuse) ||
+      !dep_process_add_choice(pool, slots, domains, key, hidden))
+    return false;
+  for (uint32_t i = 0; i < reuse.count; i++)
+    if (!dep_process_add_choice(pool, slots, domains, reuse.slots[i].value,
+                                reuse.domains[i]))
+      return false;
+  journal->process_domains.import_count = 0;
+  /* Cleanup compares against the initial occupancy only when this operation
+   * introduced the first domain. Later operations already have one; retaining
+   * each unused prefix here pins every intermediate allocation relation. */
+  *before =
+      existing.count
+          ? 0
+          : dep_process_domain_import(&journal->process_domains, pool, domain);
+  if (*before == UINT32_MAX)
+    return false;
+  for (uint32_t i = 0; i < slots->count; i++) {
+    domains[i] =
+        dep_process_domain_import(&journal->process_domains, pool, domains[i]);
+    if (domains[i] == UINT32_MAX)
+      return false;
+  }
+  return slots->count != 0;
+}
+
+static SHELL_NONNULL(1, 2, 3, 4) bool dep_process_open(
+    dep_route_state_t *state, dep_route_journal_t *journal,
+    const dep_owner_routes_t *baseline, const dep_fd_op_t *op) {
+  uint32_t key = dep_process_key(journal, op, true);
+  if (key == SHELL_DEP_FD_NONE)
+    return false;
+  uint32_t guard_key = SHELL_DEP_FD_NONE;
+  if (op->guard) {
+    if (!dep_process_guard_prepare(state, journal, baseline, op->guard))
+      return false;
+    guard_key = dep_process_guard_key(journal, op->guard, false);
+  }
+  dep_route_state_t result = {0};
+  bool first = true;
+  dep_route_iterator_t iterator = dep_route_iterator(state);
+  uint32_t root;
+  while (dep_route_next(&iterator, journal, &root)) {
+    dep_route_state_t one = dep_route_state_single(root);
+    dep_route_set_t installed =
+        dep_fd_raw_fact(&one, journal, baseline, dep_fd_numeric(key),
+                        DEP_FD_ACCESS_PROCESS_SLOT);
+    if (!installed.count && op->guard &&
+        !dep_fd_raw_fact(&one, journal, baseline, dep_fd_numeric(guard_key),
+                         DEP_FD_ACCESS_PROCESS_SLOT)
+             .routes[0]
+             .value) {
+      dep_route_set_t skipped = {.ready = true};
+      dep_route_set_set(&skipped,
+                        (dep_fd_route_t){DEP_ROUTE_ABSENT, UINT32_MAX});
+      if (!dep_route_state_store_access(&one, journal, dep_fd_numeric(key),
+                                        DEP_FD_ACCESS_PROCESS_SLOT, skipped))
+        return false;
+      if (first) {
+        result = one;
+        first = false;
+      } else if (!dep_route_state_add_root(&result, journal, one.root))
+        return false;
+      continue;
+    }
+    dep_route_set_t choices = {.ready = true};
+    uint32_t domains[SHELL_DEP_TIME_MAX_EXTERNAL_FDS];
+    uint32_t before = 0;
+    if (installed.count)
+      choices = installed;
+    else if (!dep_process_choices(&one, journal, baseline, op, &choices, key,
+                                  domains, &before))
+      return false;
+    for (uint32_t i = 0; i < choices.count; i++) {
+      dep_route_state_t branch = one;
+      if (!installed.count) {
+        if (domains[i]) {
+          dep_route_set_t original = {
+              .routes = {{DEP_ROUTE_INHERITED, before},
+                         {DEP_ROUTE_INHERITED,
+                          dep_fd_raw_fact(&one, journal, baseline,
+                                          dep_fd_numeric(0),
+                                          DEP_FD_ACCESS_PROCESS_DOMAIN)
+                                  .count != 0}},
+              .count = 2,
+              .ready = true};
+          if (!dep_route_state_store_access(
+                  &branch, journal, dep_fd_numeric(key),
+                  DEP_FD_ACCESS_PROCESS_BEFORE, original))
+            return false;
+          dep_route_set_t domain = {0};
+          dep_route_set_set(&domain,
+                            (dep_fd_route_t){DEP_ROUTE_INHERITED, domains[i]});
+          if (!dep_route_state_store_access(&branch, journal, dep_fd_numeric(0),
+                                            DEP_FD_ACCESS_PROCESS_DOMAIN,
+                                            domain))
+            return false;
+        }
+        dep_fd_ref_t fd = dep_fd_numeric(choices.routes[i].value);
+        if (domains[i]) {
+          uint32_t selector =
+              journal->allocations[key - SHELL_DEP_FD_MAX - 1].selector;
+          dep_route_set_t identity = {0};
+          dep_route_set_set(&identity,
+                            (dep_fd_route_t){DEP_ROUTE_INHERITED, selector});
+          if (!dep_route_state_store_access(&branch, journal,
+                                            dep_fd_numeric(key),
+                                            DEP_FD_ACCESS_SELECTOR, identity))
+            return false;
+          if (fd.value > SHELL_DEP_FD_MAX &&
+              !dep_fd_raw_fact(&one, journal, baseline, fd,
+                               DEP_FD_ACCESS_SELECTOR)
+                   .count &&
+              !dep_route_state_store_access(&branch, journal, fd,
+                                            DEP_FD_ACCESS_SELECTOR, identity))
+            return false;
+        }
+        for (unsigned access = DEP_FD_ACCESS_READ;
+             access <= DEP_FD_ACCESS_BINDING; access <<= 1) {
+          dep_route_set_t fact = {.ready = true};
+          dep_route_set_set(
+              &fact, access == DEP_FD_ACCESS_BINDING
+                         ? (dep_fd_route_t){DEP_ROUTE_INHERITED, UINT32_MAX}
+                     : access == op->access
+                         ? (dep_fd_route_t){DEP_ROUTE_DYNAMIC, op->edge_index}
+                         : (dep_fd_route_t){DEP_ROUTE_UNAVAILABLE, UINT32_MAX});
+          /* The selected domain already includes this pipe's occupancy.
+           * Publish its binding without computing that relational image again.
+           * The proven numeric fast path has no such post-domain. */
+          bool stored =
+              access == DEP_FD_ACCESS_BINDING && domains[i]
+                  ? dep_route_state_append_one(&branch, journal, fd,
+                                               (dep_fd_access_t)access, fact)
+                  : dep_route_state_store_access(&branch, journal, fd,
+                                                 (dep_fd_access_t)access, fact);
+          if (!stored)
+            return false;
+        }
+        dep_route_set_t selected = {.ready = true};
+        dep_route_set_set(&selected, (dep_fd_route_t){DEP_ROUTE_ALIAS,
+                                                      choices.routes[i].value});
+        if (!dep_route_state_store_access(&branch, journal, dep_fd_numeric(key),
+                                          DEP_FD_ACCESS_PROCESS_SLOT, selected))
+          return false;
+        if (!dep_process_owned_set(&branch, journal, fd, true))
+          return false;
+      }
+      branch.correlated = state->correlated || choices.count > 1;
+      if (first) {
+        result = branch;
+        first = false;
+      } else if (!dep_route_state_add_root(&result, journal, branch.root))
+        return false;
+    }
+  }
+  result.correlated = state->correlated || dep_route_state_count(&result) > 1;
+  *state = result;
+  return !first;
+}
+
+static SHELL_NONNULL(1, 2, 3, 4) bool dep_process_close_owner(
+    dep_route_state_t *state, dep_route_journal_t *journal,
+    const dep_owner_routes_t *baseline, const dep_parse_context_t *context,
+    uint32_t owner) {
+  if (!context->process_routes->track[owner] ||
+      !context->process_routes->first[owner])
+    return true;
+  uint32_t order[SHELL_DEP_MAX_EDGES * 2], count = 0;
+  for (uint32_t i = context->process_routes->first[owner]; i;
+       i = context->process_routes->entries[i - 1].next)
+    if (context->process_routes->entries[i - 1].temporary)
+      order[count++] = i - 1;
+  dep_route_state_t result = {0};
+  bool first = true;
+  dep_route_iterator_t iterator = dep_route_iterator(state);
+  uint32_t root;
+  while (dep_route_next(&iterator, journal, &root)) {
+    dep_route_state_t one = dep_route_state_single(root);
+    for (uint32_t i = count; i-- != 0;) {
+      const dep_process_route_t *route =
+          &context->process_routes->entries[order[i]];
+      dep_fd_op_t op = {.pos = route->position, .fd_name = route->source};
+      uint32_t key = dep_process_key(journal, &op, false);
+      if (key == SHELL_DEP_FD_NONE)
+        continue;
+      dep_route_set_t slots =
+          dep_fd_raw_fact(&one, journal, baseline, dep_fd_numeric(key),
+                          DEP_FD_ACCESS_PROCESS_SLOT);
+      dep_route_set_t original =
+          dep_fd_raw_fact(&one, journal, baseline, dep_fd_numeric(key),
+                          DEP_FD_ACCESS_PROCESS_BEFORE);
+      for (uint32_t slot = 0; slot < slots.count; slot++) {
+        if (slots.routes[slot].kind != DEP_ROUTE_ALIAS)
+          continue;
+        if (!dep_process_owned(&one, journal,
+                               dep_fd_numeric(slots.routes[slot].value)))
+          continue;
+        for (unsigned access = DEP_FD_ACCESS_READ;
+             access <= DEP_FD_ACCESS_BINDING; access <<= 1) {
+          dep_route_set_t closed = {.ready = true};
+          dep_route_set_set(&closed,
+                            (dep_fd_route_t){DEP_ROUTE_CLOSED, UINT32_MAX});
+          if (!dep_route_state_store_access(
+                  &one, journal, dep_fd_numeric(slots.routes[slot].value),
+                  (dep_fd_access_t)access, closed))
+            return false;
+        }
+      }
+      for (uint32_t slot = 0; slot < slots.count; slot++)
+        if (slots.routes[slot].kind == DEP_ROUTE_ALIAS &&
+            !dep_process_owned_set(
+                &one, journal, dep_fd_numeric(slots.routes[slot].value), false))
+          return false;
+      if (!dep_selector_retire(&one, journal, key, NULL))
+        return false;
+      if (slots.count &&
+          !dep_route_state_store_access(&one, journal, dep_fd_numeric(key),
+                                        DEP_FD_ACCESS_PROCESS_SLOT,
+                                        (dep_route_set_t){.ready = true}))
+        return false;
+      if (original.count) {
+        dep_route_set_t domain =
+            dep_fd_raw_fact(&one, journal, baseline, dep_fd_numeric(0),
+                            DEP_FD_ACCESS_PROCESS_DOMAIN);
+        if (!original.routes[1].value &&
+            domain.routes[0].value == original.routes[0].value &&
+            !dep_route_state_store_access(&one, journal, dep_fd_numeric(0),
+                                          DEP_FD_ACCESS_PROCESS_DOMAIN,
+                                          (dep_route_set_t){.ready = true}))
+          return false;
+        if (!dep_route_state_store_access(&one, journal, dep_fd_numeric(key),
+                                          DEP_FD_ACCESS_PROCESS_BEFORE,
+                                          (dep_route_set_t){.ready = true}))
+          return false;
+      }
+      /* Guard choices have the same owner lifetime as its expansion-created
+       * pipes. Retaining them would correlate unrelated later commands and
+       * multiply versions after all observable descriptor effects agree. */
+      for (const dep_process_guard_t *guard = route->guard; guard;
+           guard = guard->parent) {
+        uint32_t guard_key = dep_process_guard_key(journal, guard, false);
+        if (guard_key == SHELL_DEP_FD_NONE ||
+            !dep_fd_raw_fact(&one, journal, baseline, dep_fd_numeric(guard_key),
+                             DEP_FD_ACCESS_PROCESS_SLOT)
+                 .count)
+          break;
+        if (!dep_route_state_store_access(
+                &one, journal, dep_fd_numeric(guard_key),
+                DEP_FD_ACCESS_PROCESS_SLOT, (dep_route_set_t){.ready = true}))
+          return false;
+      }
+    }
+    one.correlated = state->correlated;
+    if (first) {
+      result = one;
+      first = false;
+    } else if (!dep_fd_merge_versions(&result, &one, journal, baseline))
+      return false;
+  }
+  *state = result;
+  return !first;
 }
 
 /* Each immutable version owns either one selected scratch slot or no save.
@@ -9289,9 +15312,16 @@ static SHELL_NONNULL(1, 2, 3, 4, 5) bool dep_prepare_numeric_undo_one(
     dep_route_state_t *state, dep_route_journal_t *journal,
     const dep_owner_routes_t *baseline, const dep_fd_op_t *op,
     const dep_fd_op_t *key_op, uint32_t rank, dep_allocation_role_t role,
-    bool optional) {
-  bool observable = op->undo_observable && journal->scratch_observable &&
-                    journal->observable_fd_count && op->fd <= SHELL_DEP_FD_MAX;
+    bool optional, const dep_domain_collection_t *collection) {
+  bool symbolic_target =
+      op->fd > SHELL_DEP_FD_MAX && op->fd < SHELL_DEP_FD_NAMED &&
+      dep_fd_raw_fact(state, journal, baseline, dep_fd_numeric(op->fd),
+                      DEP_FD_ACCESS_SELECTOR)
+          .count;
+  bool observable = op->undo_observable &&
+                    (symbolic_target || (journal->scratch_observable &&
+                                         journal->observable_fd_count &&
+                                         op->fd <= SHELL_DEP_FD_MAX));
   dep_fd_ref_t target = dep_fd_numeric(op->fd);
   dep_route_set_t binding =
       dep_fd_fact(state, journal, baseline, target, DEP_FD_ACCESS_BINDING);
@@ -9356,25 +15386,31 @@ static SHELL_NONNULL(1, 2, 3, 4, 5) bool dep_prepare_numeric_undo_one(
       return false;
     if (op->kind == DEP_FD_OP_MOVE && may_be_live && may_be_free) {
       dep_route_state_t live = before, free = before;
+      dep_domain_collection_t move_pins = {
+          .roots = {&before, &result, &live, &free}, .parent = collection};
+      if (collection) {
+        move_pins.workspace = collection->workspace;
+        move_pins.frame = collection->frame;
+      }
+      const dep_domain_collection_t *move_collection =
+          collection ? &move_pins : NULL;
       dep_route_set_t fact = {0};
       dep_route_set_set(&fact, (dep_fd_route_t){DEP_ROUTE_ALIAS, undo_key});
       if (!dep_route_state_store_access(&live, journal,
                                         dep_fd_numeric(undo_key),
                                         DEP_FD_ACCESS_SAVED, fact))
         return false;
-      dep_route_set_set(&fact,
-                        (dep_fd_route_t){DEP_ROUTE_INHERITED, UINT32_MAX});
-      if (!dep_route_state_store_access(&live, journal, target,
-                                        DEP_FD_ACCESS_BINDING, fact))
+      bool possible;
+      if (!dep_fd_assume_binding(&live, journal, baseline, op->fd, &possible,
+                                 false, move_collection))
         return false;
       dep_route_set_set(&fact, (dep_fd_route_t){DEP_ROUTE_ABSENT, UINT32_MAX});
       if (!dep_route_state_store_access(&free, journal,
                                         dep_fd_numeric(undo_key),
                                         DEP_FD_ACCESS_SAVED, fact))
         return false;
-      dep_route_set_set(&fact, (dep_fd_route_t){DEP_ROUTE_CLOSED, UINT32_MAX});
-      if (!dep_route_state_store_access(&free, journal, target,
-                                        DEP_FD_ACCESS_BINDING, fact) ||
+      if (!dep_fd_assume_binding(&free, journal, baseline, op->fd, &possible,
+                                 true, move_collection) ||
           !dep_route_state_add_root(&live, journal, free.root))
         return false;
       live.correlated = true;
@@ -9387,6 +15423,14 @@ static SHELL_NONNULL(1, 2, 3, 4, 5) bool dep_prepare_numeric_undo_one(
   bool have_result = false;
   if (may_be_free || optional) {
     dep_route_state_t unsaved = before;
+    dep_domain_collection_t unsaved_pins = {
+        .roots = {&before, &result, &unsaved}, .parent = collection};
+    if (collection) {
+      unsaved_pins.workspace = collection->workspace;
+      unsaved_pins.frame = collection->frame;
+    }
+    const dep_domain_collection_t *unsaved_collection =
+        collection ? &unsaved_pins : NULL;
     dep_route_set_t absent = {0};
     dep_route_set_set(&absent, (dep_fd_route_t){DEP_ROUTE_ABSENT, UINT32_MAX});
     if (!dep_route_state_store_access(&unsaved, journal,
@@ -9397,6 +15441,10 @@ static SHELL_NONNULL(1, 2, 3, 4, 5) bool dep_prepare_numeric_undo_one(
       dep_route_set_t closed = {0};
       dep_route_set_set(&closed,
                         (dep_fd_route_t){DEP_ROUTE_CLOSED, UINT32_MAX});
+      bool possible;
+      if (!dep_fd_assume_binding(&unsaved, journal, baseline, op->fd, &possible,
+                                 true, unsaved_collection))
+        return false;
       for (uint32_t access = DEP_FD_ACCESS_READ;
            access <= DEP_FD_ACCESS_BINDING; access <<= 1)
         if (!dep_route_state_store_access(&unsaved, journal, target,
@@ -9407,87 +15455,108 @@ static SHELL_NONNULL(1, 2, 3, 4, 5) bool dep_prepare_numeric_undo_one(
     have_result = true;
   }
   if (may_be_live) {
-    dep_route_set_t slots = {0};
+    dep_allocation_choices_t slots = {0};
     dep_route_state_t occupied = before;
+    dep_domain_collection_t occupied_pins = {.roots = {&before, &result},
+                                             .release_domains = {&before},
+                                             .parent = collection};
+    if (collection) {
+      occupied_pins.workspace = collection->workspace;
+      occupied_pins.frame = collection->frame;
+    }
+    const dep_domain_collection_t *occupied_collection =
+        collection ? &occupied_pins : NULL;
     dep_route_set_t live = {0};
     dep_route_set_set(&live, (dep_fd_route_t){DEP_ROUTE_INHERITED, UINT32_MAX});
     uint32_t minimum = DEP_BASH_VARREDIR_MIN_FD;
     uint32_t source_fd = op->target_fd;
+    uint32_t source_selector = 0;
     if (source_fd == SHELL_DEP_FD_NAMED) {
-      dep_route_set_t source = dep_fd_raw_fact(
-          &before, journal, baseline,
-          (dep_fd_ref_t){source_fd, op->target_fd_name, op->target_fd_name_len},
-          DEP_FD_ACCESS_BINDING);
+      dep_route_set_t source =
+          dep_fd_raw_fact(&before, journal, baseline,
+                          (dep_fd_ref_t){.name = op->target_fd_name,
+                                         .value = source_fd,
+                                         .name_len = op->target_fd_name_len},
+                          DEP_FD_ACCESS_BINDING);
       if (source.count == 1 && source.routes[0].kind == DEP_ROUTE_ALIAS)
         source_fd = source.routes[0].value;
     }
     if (role == DEP_ALLOCATION_TARGET_UNDO && dep_fd_op_copies(op->kind) &&
         source_fd >= minimum && source_fd <= SHELL_DEP_FD_MAX)
       minimum = source_fd + 1;
-    if (!dep_route_state_store_access(&occupied, journal, target,
-                                      DEP_FD_ACCESS_BINDING, live) ||
-        !dep_allocation_rank_choices(&occupied, journal, baseline, undo_key,
-                                     rank ? rank : 1, &slots, minimum) ||
-        (!rank && !dep_allocation_rank_choices(&occupied, journal, baseline,
-                                               undo_key, 2, &slots, minimum)))
+    if (role == DEP_ALLOCATION_TARGET_UNDO && dep_fd_op_copies(op->kind) &&
+        source_fd > SHELL_DEP_FD_MAX && source_fd < SHELL_DEP_FD_NAMED) {
+      dep_route_set_t identity =
+          dep_fd_raw_fact(&before, journal, baseline, dep_fd_numeric(source_fd),
+                          DEP_FD_ACCESS_SELECTOR);
+      if (identity.count)
+        source_selector = identity.routes[0].value;
+    }
+    bool possible;
+    int low_mode = op->resets_descriptor &&
+                           (op->kind == DEP_FD_OP_DOCUMENT ||
+                            op->kind == DEP_FD_OP_DYNAMIC) &&
+                           rank
+                       ? (int)rank - 1
+                       : -1;
+    if (!dep_fd_assume_binding(&occupied, journal, baseline, op->fd, &possible,
+                               false, occupied_collection))
+      return false;
+    /* Restoration must keep the target's proven entry presence. Its old
+     * unrefined binding included the no-save world which this branch rejected.
+     */
+    dep_route_set_t entry = {0};
+    dep_route_set_set(&entry,
+                      (dep_fd_route_t){DEP_ROUTE_INHERITED, occupied.root});
+    if (!dep_route_state_store_access(&occupied, journal,
+                                      dep_fd_numeric(undo_key),
+                                      DEP_FD_ACCESS_UNDO_ENTRY, entry) ||
+        !dep_allocation_domain_choices(&occupied, journal, baseline, undo_key,
+                                       rank, minimum, low_mode, source_selector,
+                                       true, &slots, occupied_collection))
       return false;
     /* Saved descriptors have the target's capabilities. The chosen slot is
      * live only in this version, so later allocation and cleanup retain the
      * same physical identity instead of an independent union of candidates. */
     for (uint32_t slot = 0; slot < slots.count; slot++) {
       dep_route_state_t saved = occupied;
+      dep_domain_collection_t saved_pins = {
+          .roots = {&before, &result, &occupied},
+          .decisions = slots.domains,
+          .decision_count = slots.count,
+          .parent = collection};
+      if (collection) {
+        saved_pins.workspace = collection->workspace;
+        saved_pins.frame = collection->frame;
+      }
+      const dep_domain_collection_t *saved_collection =
+          collection ? &saved_pins : NULL;
+      if (!dep_allocation_select_slot(&saved, journal, &slots, slot))
+        return false;
       dep_route_set_t undo = {0};
-      dep_route_set_set(&undo, slots.routes[slot]);
-      dep_fd_ref_t scratch = dep_fd_numeric(slots.routes[slot].value);
-      /* A concrete lowest-free choice proves every preceding observable high
-       * descriptor occupied. Keep that proof with this ownership version so
-       * the next save cannot choose a contradictory earlier slot. The second
-       * rank includes a transient open and does not make this claim. */
-      if (rank == 1 && scratch.value <= SHELL_DEP_FD_MAX)
-        for (uint32_t i = 0; i < journal->observable_fd_count &&
-                             journal->observable_fds[i] < scratch.value;
-             i++)
-          if (journal->observable_fds[i] >= minimum &&
-              !dep_route_state_store_access(
-                  &saved, journal, dep_fd_numeric(journal->observable_fds[i]),
-                  DEP_FD_ACCESS_BINDING, live))
-            return false;
+      dep_route_set_set(&undo, slots.slots[slot]);
+      dep_fd_ref_t scratch = dep_fd_numeric(slots.slots[slot].value);
+      /* The selection predicate already records preceding occupancy, including
+       * a named source's path-dependent F_DUPFD minimum. Do not assign extra
+       * descriptor facts independently of that relation. */
       for (uint32_t access = DEP_FD_ACCESS_READ;
            access <= DEP_FD_ACCESS_BINDING; access <<= 1) {
-        if (scratch.value > SHELL_DEP_FD_MAX)
-          break;
         dep_route_set_t routes =
             access == DEP_FD_ACCESS_BINDING
                 ? live
                 : dep_fd_raw_fact(&before, journal, baseline, target,
                                   (dep_fd_access_t)access);
-        if (!dep_route_state_store_access(&saved, journal, scratch,
-                                          (dep_fd_access_t)access, routes))
+        if (!dep_route_state_store_access_collected(&saved, journal, scratch,
+                                                    (dep_fd_access_t)access,
+                                                    routes, saved_collection))
           return false;
       }
       if (!dep_route_state_store_access(&saved, journal,
                                         dep_fd_numeric(undo_key),
                                         DEP_FD_ACCESS_SAVED, undo) ||
-          (scratch.value <= SHELL_DEP_FD_MAX &&
-           !dep_route_state_store_access(&saved, journal, scratch,
-                                         DEP_FD_ACCESS_SCRATCH, live)))
+          !dep_route_state_store_access(&saved, journal, scratch,
+                                        DEP_FD_ACCESS_SCRATCH, live))
         return false;
-      /* The private tail has no numeric observer. For an ordinary target
-       * replacement, its save/no-save histories become indistinguishable
-       * after this operation installs the target. Factor that pair now instead
-       * of multiplying unknown inherited low-FD occupancy histories. A move
-       * keeps them separate because destination presence controls source undo.
-       */
-      if (scratch.value > SHELL_DEP_FD_MAX && may_be_free && !optional &&
-          op->kind != DEP_FD_OP_MOVE) {
-        if (!dep_route_set_add(
-                &undo, (dep_fd_route_t){DEP_ROUTE_ABSENT, UINT32_MAX}) ||
-            !dep_route_state_store_access(&result, journal,
-                                          dep_fd_numeric(undo_key),
-                                          DEP_FD_ACCESS_SAVED, undo))
-          return false;
-        continue;
-      }
       if (!have_result) {
         result = saved;
         have_result = true;
@@ -9507,7 +15576,7 @@ static SHELL_NONNULL(1, 2, 3, 4, 5) bool dep_prepare_numeric_undo(
     dep_route_state_t *state, dep_route_journal_t *journal,
     const dep_owner_routes_t *baseline, const dep_fd_op_t *op,
     const dep_fd_op_t *key_op, uint32_t rank, dep_allocation_role_t role,
-    bool optional) {
+    bool optional, const dep_domain_collection_t *collection) {
   if (op->undo_mode == DEP_UNDO_CHILD || op->paired_open ||
       op->kind == DEP_FD_OP_IDENTITY || dep_fd_op_numeric_self_dup(op))
     return true;
@@ -9533,8 +15602,19 @@ static SHELL_NONNULL(1, 2, 3, 4, 5) bool dep_prepare_numeric_undo(
   while (dep_route_next(&iterator, journal, &source_root)) {
     dep_route_state_t one = dep_route_state_single(source_root);
     one.correlated = before.correlated;
+    dep_domain_collection_t branch_pins = {
+        .roots = {&result, &one},
+        .remaining = &iterator,
+        .release_domains = {&one},
+        .parent = collection,
+    };
+    if (collection) {
+      branch_pins.workspace = collection->workspace;
+      branch_pins.frame = collection->frame;
+    }
     if (!dep_prepare_numeric_undo_one(&one, journal, baseline, &effective,
-                                      key_op, rank, role, optional))
+                                      key_op, rank, role, optional,
+                                      collection ? &branch_pins : NULL))
       return false;
     dep_route_iterator_t branches = dep_route_iterator(&one);
     uint32_t root;
@@ -9594,7 +15674,8 @@ static SHELL_NONNULL(1, 3) bool dep_record_closed_slots(
 static SHELL_NONNULL(1, 2, 3) bool dep_route_state_apply_one(
     dep_route_state_t *route_state, dep_route_journal_t *changes,
     const dep_owner_routes_t *baseline_before, const dep_fd_op_t *ops,
-    uint32_t op_count, const dep_fd_route_t *allocated) {
+    uint32_t op_count, const dep_fd_route_t *allocated,
+    const dep_domain_collection_t *collection) {
   if (op_count == 0)
     return !route_state->truncated;
   if (dep_route_state_count(route_state) > 1) {
@@ -9605,8 +15686,17 @@ static SHELL_NONNULL(1, 2, 3) bool dep_route_state_apply_one(
     while (dep_route_next(&iterator, changes, &source_root)) {
       dep_route_state_t one = dep_route_state_single(source_root);
       one.correlated = before.correlated;
+      dep_domain_collection_t branch_pins = {.roots = {&result, &one},
+                                             .remaining = &iterator,
+                                             .release_domains = {&one},
+                                             .parent = collection};
+      if (collection) {
+        branch_pins.workspace = collection->workspace;
+        branch_pins.frame = collection->frame;
+      }
       if (!dep_route_state_apply_one(&one, changes, baseline_before, ops,
-                                     op_count, allocated))
+                                     op_count, allocated,
+                                     collection ? &branch_pins : NULL))
         return false;
       dep_route_iterator_t branches = dep_route_iterator(&one);
       uint32_t root;
@@ -9632,6 +15722,19 @@ static SHELL_NONNULL(1, 2, 3) bool dep_route_state_apply_one(
         dep_setup_mode(&after, changes, baseline_before, scoped.undo_mode);
     const dep_fd_op_t *op = &scoped;
     dep_route_state_t before_operation = after;
+    /* Move publication and restoration consume the operation's entry after
+     * allocation/refinement can collect older versions. Retain both that
+     * immutable entry and the evolving map for the entire operation. Caller
+     * release_domains may replace their own entry, so they do not pin this
+     * local copy on our behalf. */
+    dep_domain_collection_t operation_pins = {
+        .roots = {&before_operation, &after}, .parent = collection};
+    if (collection) {
+      operation_pins.workspace = collection->workspace;
+      operation_pins.frame = collection->frame;
+    }
+    const dep_domain_collection_t *operation_collection =
+        collection ? &operation_pins : NULL;
     dep_fd_op_t effective =
         dep_fd_effective_operation(op, &after, changes, baseline_before);
     if (effective.kind == DEP_FD_OP_IDENTITY) {
@@ -9656,7 +15759,7 @@ static SHELL_NONNULL(1, 2, 3) bool dep_route_state_apply_one(
     }
     if (op->kind == DEP_FD_OP_MOVE && effective.kind == DEP_FD_OP_CLOSE) {
       if (!dep_route_state_apply_one(&after, changes, baseline_before,
-                                     &effective, 1, NULL))
+                                     &effective, 1, NULL, operation_collection))
         return false;
       uint32_t key = dep_allocation_slot(changes, op);
       dep_route_set_t marker = {0};
@@ -9671,7 +15774,8 @@ static SHELL_NONNULL(1, 2, 3) bool dep_route_state_apply_one(
     if (op->kind == DEP_FD_OP_FAILED)
       continue;
     DEP_METADATA_WORK(SHELLSPLIT_TEST_WORK_FD_OPERATIONS);
-    dep_fd_ref_t target = {op->fd, op->fd_name, op->fd_name_len};
+    dep_fd_ref_t target = {
+        .name = op->fd_name, .value = op->fd, .name_len = op->fd_name_len};
     dep_route_set_t available = dep_fd_raw_fact(
         &after, changes, baseline_before, dep_fd_numeric(SHELL_DEP_FD_NONE),
         DEP_FD_ACCESS_AVAILABLE);
@@ -9682,6 +15786,9 @@ static SHELL_NONNULL(1, 2, 3) bool dep_route_state_apply_one(
     /* A named reset reaches this leaf only after dep_route_state_apply has
      * selected its physical allocation. All other effective operations pass
      * no allocation and carry resets_descriptor == false. */
+    if (named && op->resets_descriptor && op->kind != DEP_FD_OP_CLOSE &&
+        !dep_read_note_assignment(&after, changes, target))
+      return false;
     if (named && op->resets_descriptor) {
       dep_route_set_set(
           &slots, indirect
@@ -9737,9 +15844,9 @@ static SHELL_NONNULL(1, 2, 3) bool dep_route_state_apply_one(
         physical.fd = slots.routes[slot].value;
         physical.fd_name = NULL;
         physical.fd_name_len = 0;
-        if (!dep_prepare_numeric_undo(&after, changes, baseline_before,
-                                      &physical, op, 1,
-                                      DEP_ALLOCATION_TARGET_UNDO, false))
+        if (!dep_prepare_numeric_undo(
+                &after, changes, baseline_before, &physical, op, 1,
+                DEP_ALLOCATION_TARGET_UNDO, false, operation_collection))
           return false;
       }
       uint32_t allocation = dep_allocation_slot(changes, op);
@@ -9750,8 +15857,9 @@ static SHELL_NONNULL(1, 2, 3) bool dep_route_state_apply_one(
     }
     dep_route_set_t copied_routes[2] = {0}, copied_scratch = {.ready = true};
     if (dep_fd_op_copies(op->kind)) {
-      dep_fd_ref_t source = {op->target_fd, op->target_fd_name,
-                             op->target_fd_name_len};
+      dep_fd_ref_t source = {.name = op->target_fd_name,
+                             .value = op->target_fd,
+                             .name_len = op->target_fd_name_len};
       if (dep_fd_op_numeric_self_dup(op))
         continue;
       if (source.value == SHELL_DEP_FD_NAMED) {
@@ -9850,8 +15958,9 @@ static SHELL_NONNULL(1, 2, 3) bool dep_route_state_apply_one(
             if (!dep_route_set_add(&installed, prior.routes[route]))
               return false;
         }
-        if (!dep_route_state_store_access(&after, changes, fd,
-                                          DEP_FD_ACCESS_BINDING, installed))
+        if (!dep_route_state_store_access_collected(
+                &after, changes, fd, DEP_FD_ACCESS_BINDING, installed,
+                operation_collection))
           return false;
         /* dup2 clears close-on-exec; Bash propagates it from a scratch
          * source only to nonstandard descriptors. Opens and closes discard
@@ -9891,11 +16000,29 @@ static SHELL_NONNULL(1, 2, 3) bool dep_route_state_apply_one(
       }
     }
     if (named && indirect)
+      for (uint32_t slot = 0; slot < slots.count; slot++)
+        if (slots.routes[slot].kind == DEP_ROUTE_ALIAS &&
+            slots.routes[slot].value > SHELL_DEP_FD_MAX)
+          changes->allocations[slots.routes[slot].value - SHELL_DEP_FD_MAX - 1]
+              .observations |=
+              dep_read_observation(&changes->read_observations, target);
+    if (named && indirect)
       for (uint32_t access = DEP_FD_ACCESS_READ;
            access <= DEP_FD_ACCESS_BINDING; access <<= 1)
-        if (!dep_route_state_store_access(&after, changes, target,
-                                          (dep_fd_access_t)access, slots))
+        if (!dep_route_state_store_access_collected(
+                &after, changes, target, (dep_fd_access_t)access, slots,
+                operation_collection))
           return false;
+    if (named && op->resets_descriptor) {
+      dep_route_set_t prior = dep_fd_raw_fact(
+          &after, changes, baseline_before, target, DEP_FD_ACCESS_EFFECT_STATE);
+      if (dep_effect_state_has(&prior, DEP_EFFECT_STATE_ORPHANED_ALLOCATION)) {
+        dep_route_set_t retained = {.ready = true};
+        if (!dep_route_state_store_access(&after, changes, target,
+                                          DEP_FD_ACCESS_EFFECT_STATE, retained))
+          return false;
+      }
+    }
     if (!dep_route_state_store_access(&after, changes,
                                       dep_fd_numeric(SHELL_DEP_FD_NONE),
                                       DEP_FD_ACCESS_AVAILABLE, available))
@@ -9927,10 +16054,11 @@ static SHELL_NONNULL(1, 2, 3) bool dep_route_state_apply_one(
           &entry, (dep_fd_route_t){DEP_ROUTE_INHERITED, before_operation.root});
       dep_fd_op_t close = dep_fd_move_close(op);
       if (close.fd == SHELL_DEP_FD_NAMED) {
-        moved = dep_fd_raw_fact(
-            &before_operation, changes, baseline_before,
-            (dep_fd_ref_t){close.fd, close.fd_name, close.fd_name_len},
-            DEP_FD_ACCESS_READ);
+        moved = dep_fd_raw_fact(&before_operation, changes, baseline_before,
+                                (dep_fd_ref_t){.name = close.fd_name,
+                                               .value = close.fd,
+                                               .name_len = close.fd_name_len},
+                                DEP_FD_ACCESS_READ);
         for (uint32_t j = 0; j < moved.count; j++) {
           if (moved.routes[j].kind != DEP_ROUTE_ALIAS)
             continue;
@@ -9941,9 +16069,11 @@ static SHELL_NONNULL(1, 2, 3) bool dep_route_state_apply_one(
           if ((occupancy.may_be_occupied &&
                !dep_prepare_numeric_undo(
                    &after, changes, baseline_before, &physical, &close, 1,
-                   DEP_ALLOCATION_MOVE_UNDO, occupancy.may_be_free)) ||
+                   DEP_ALLOCATION_MOVE_UNDO, occupancy.may_be_free,
+                   operation_collection)) ||
               !dep_route_state_apply_one(&after, changes, baseline_before,
-                                         &physical, 1, NULL))
+                                         &physical, 1, NULL,
+                                         operation_collection))
             return false;
         }
       } else {
@@ -9951,9 +16081,10 @@ static SHELL_NONNULL(1, 2, 3) bool dep_route_state_apply_one(
         if ((occupancy.may_be_occupied &&
              !dep_prepare_numeric_undo(&after, changes, baseline_before, &close,
                                        &close, 1, DEP_ALLOCATION_MOVE_UNDO,
-                                       occupancy.may_be_free)) ||
+                                       occupancy.may_be_free,
+                                       operation_collection)) ||
             !dep_route_state_apply_one(&after, changes, baseline_before, &close,
-                                       1, NULL))
+                                       1, NULL, operation_collection))
           return false;
       }
       if (!dep_route_state_store_access(&after, changes, dep_fd_numeric(key),
@@ -9978,7 +16109,8 @@ static SHELL_NONNULL(1, 2, 3) bool dep_route_state_apply_one(
 static SHELL_NONNULL(1, 2, 3) bool dep_route_state_apply(
     dep_route_state_t *route_state, dep_route_journal_t *changes,
     const dep_owner_routes_t *baseline_before, const dep_fd_op_t *ops,
-    uint32_t op_count, bool begin_frame) {
+    uint32_t op_count, bool begin_frame,
+    const dep_domain_collection_t *collection) {
   dep_route_state_t current = *route_state;
   if (begin_frame && op_count &&
       !dep_setup_begin(&current, changes, ops[0].undo_mode))
@@ -10007,16 +16139,43 @@ static SHELL_NONNULL(1, 2, 3) bool dep_route_state_apply(
     current = framed;
   }
   for (uint32_t op_index = 0; op_index < op_count; op_index++) {
+    if (collection)
+      dep_route_domains_collect(changes, collection, &current, NULL);
     const dep_fd_op_t *op = &ops[op_index];
+    if (op->kind == DEP_FD_OP_PROCESS) {
+      if (!dep_process_open(&current, changes, baseline_before, op))
+        return false;
+      continue;
+    }
     dep_route_state_t next = {0};
     bool have_next = false;
     dep_route_iterator_t iterator = dep_route_iterator(&current);
     uint32_t root;
     while (dep_route_next(&iterator, changes, &root)) {
+      if (collection)
+        dep_route_domains_collect(changes, collection, &current, &next);
       dep_route_state_t one = dep_route_state_single(root);
       one.correlated = current.correlated;
+      dep_domain_collection_t allocation_pins = {.roots = {&next, &one},
+                                                 .remaining = &iterator,
+                                                 .release_domains = {&one},
+                                                 .parent = collection};
+      if (collection) {
+        allocation_pins.workspace = collection->workspace;
+        allocation_pins.frame = collection->frame;
+      }
+      const dep_domain_collection_t *branch_collection =
+          collection ? &allocation_pins : NULL;
       dep_fd_op_t effective =
           dep_fd_effective_operation(op, &one, changes, baseline_before);
+      /* Overwriting an existing shell-owned save makes this operation's
+       * undo observable too. Establish that before choosing low-open modes,
+       * not later inside undo preparation after a fixed rank was selected. */
+      if (!effective.undo_observable &&
+          dep_fd_raw_fact(&one, changes, baseline_before,
+                          dep_fd_numeric(effective.fd), DEP_FD_ACCESS_SCRATCH)
+              .count)
+        effective.undo_observable = true;
       if (!(dep_fd_operation_outcomes(&effective, &one, changes,
                                       baseline_before) &
             DEP_STATUS_MAY_SUCCEED))
@@ -10027,13 +16186,13 @@ static SHELL_NONNULL(1, 2, 3) bool dep_route_state_apply(
        * lifetime. Capability uncertainty remains in the read/write facts. */
       if (dep_fd_op_copies(effective.kind) &&
           effective.target_fd <= SHELL_DEP_FD_MAX) {
-        dep_route_set_t live = {0};
-        dep_route_set_set(&live,
-                          (dep_fd_route_t){DEP_ROUTE_INHERITED, UINT32_MAX});
-        if (!dep_route_state_store_access(&one, changes,
-                                          dep_fd_numeric(effective.target_fd),
-                                          DEP_FD_ACCESS_BINDING, live))
+        bool possible;
+        if (!dep_fd_assume_binding(&one, changes, baseline_before,
+                                   effective.target_fd, &possible, false,
+                                   branch_collection))
           return false;
+        if (!possible)
+          continue;
       }
       uint32_t undo_rank = 1;
       if (effective.fd != SHELL_DEP_FD_NAMED && effective.resets_descriptor &&
@@ -10054,6 +16213,8 @@ static SHELL_NONNULL(1, 2, 3) bool dep_route_state_apply(
           for (uint32_t mode = 0; mode < 2; mode++) {
             if (!(modes & (1u << mode)))
               continue;
+            if (collection)
+              dep_route_domains_collect(changes, collection, &current, &next);
             dep_route_state_t branch = one;
             dep_route_set_t low = {0};
             dep_route_set_set(&low,
@@ -10061,11 +16222,11 @@ static SHELL_NONNULL(1, 2, 3) bool dep_route_state_apply(
             if (!dep_route_state_store_access(&branch, changes,
                                               dep_fd_numeric(SHELL_DEP_FD_NONE),
                                               DEP_FD_ACCESS_LOW_STATE, low) ||
-                !dep_prepare_numeric_undo(&branch, changes, baseline_before,
-                                          &effective, op, mode + 1,
-                                          DEP_ALLOCATION_TARGET_UNDO, false) ||
+                !dep_prepare_numeric_undo(
+                    &branch, changes, baseline_before, &effective, op, mode + 1,
+                    DEP_ALLOCATION_TARGET_UNDO, false, branch_collection) ||
                 !dep_route_state_apply_one(&branch, changes, baseline_before,
-                                           op, 1, NULL))
+                                           op, 1, NULL, branch_collection))
               return false;
             if (effective.fd < DEP_BASH_VARREDIR_MIN_FD && target.may_be_free &&
                 !dep_route_state_store_access(
@@ -10087,18 +16248,46 @@ static SHELL_NONNULL(1, 2, 3) bool dep_route_state_apply(
       if (!identity && effective.fd != SHELL_DEP_FD_NAMED &&
           !dep_prepare_numeric_undo(&one, changes, baseline_before, &effective,
                                     op, undo_rank, DEP_ALLOCATION_TARGET_UNDO,
-                                    false))
+                                    false, branch_collection))
         return false;
       if (effective.fd == SHELL_DEP_FD_NAMED && effective.resets_descriptor &&
           (changes->observable_fd_count || changes->named_closes)) {
         dep_named_allocation_choices_t choices = {0};
         if (!dep_named_allocation_choices(&one, changes, baseline_before,
-                                          &effective, &choices))
+                                          &effective, &choices,
+                                          branch_collection))
           return false;
+        dep_domain_collection_t choice_domains[2] = {
+            {.workspace = collection ? collection->workspace : NULL,
+             .frame = collection ? collection->frame : NULL,
+             .decisions = choices.slots[0].domains,
+             .decision_count = choices.slots[0].count,
+             .parent = branch_collection},
+            {.workspace = collection ? collection->workspace : NULL,
+             .frame = collection ? collection->frame : NULL,
+             .decisions = choices.slots[1].domains,
+             .decision_count = choices.slots[1].count}};
+        dep_domain_collection_t choice_tails[2] = {
+            {.workspace = choice_domains[0].workspace,
+             .frame = choice_domains[0].frame,
+             .decisions = &choices.slots[0].tail_domain,
+             .decision_count = choices.slots[0].tail_domain ? 1u : 0u,
+             .parent = &choice_domains[0]},
+            {.workspace = choice_domains[0].workspace,
+             .frame = choice_domains[0].frame,
+             .decisions = &choices.slots[1].tail_domain,
+             .decision_count = choices.slots[1].tail_domain ? 1u : 0u,
+             .parent = &choice_domains[1]}};
+        choice_domains[1].parent = &choice_tails[0];
+        const dep_domain_collection_t *choice_collection =
+            collection ? &choice_tails[1] : NULL;
         for (uint32_t mode = 0; mode < 2; mode++)
           for (uint32_t slot = 0; slot < choices.slots[mode].count; slot++) {
-            dep_fd_route_t selected = choices.slots[mode].routes[slot];
+            dep_fd_route_t selected = choices.slots[mode].slots[slot];
             dep_route_state_t branch = one;
+            if (!dep_allocation_select_slot(&branch, changes,
+                                            &choices.slots[mode], slot))
+              return false;
             if (choices.resource) {
               dep_route_set_t low = {0};
               dep_route_set_set(&low,
@@ -10115,7 +16304,7 @@ static SHELL_NONNULL(1, 2, 3) bool dep_route_state_apply(
              * factorized in the ordinary operation path below. */
             branch.correlated = true;
             if (!dep_route_state_apply_one(&branch, changes, baseline_before,
-                                           op, 1, &selected))
+                                           op, 1, &selected, choice_collection))
               return false;
             if (!have_next) {
               next = branch;
@@ -10143,7 +16332,7 @@ static SHELL_NONNULL(1, 2, 3) bool dep_route_state_apply(
             return false;
         }
         if (!dep_route_state_apply_one(&one, changes, baseline_before, op, 1,
-                                       NULL))
+                                       NULL, branch_collection))
           return false;
         if (!have_next) {
           next = one;
@@ -10161,25 +16350,29 @@ static SHELL_NONNULL(1, 2, 3) bool dep_route_state_apply(
 
 static SHELL_NONNULL(1) dep_fd_ref_t
     dep_fd_operation_target(const dep_fd_op_t *op) {
-  return (dep_fd_ref_t){op->fd, op->fd_name, op->fd_name_len};
+  return (dep_fd_ref_t){
+      .name = op->fd_name, .value = op->fd, .name_len = op->fd_name_len};
 }
 
 /* Discard a consumed undo registration without closing its physical save.
  * Bash disposes the whole list even when a restoration stopped execution;
  * older scratch descriptors then remain live (with their existing CLEXEC
  * markers) and may still be observed by the caller or an enclosing frame. */
-static SHELL_NONNULL(1,
-                     2) bool dep_fd_discard_undo(dep_route_state_t *state,
-                                                 dep_route_journal_t *journal,
-                                                 uint32_t key) {
+static SHELL_NONNULL(1, 2) bool dep_fd_discard_undo(
+    dep_route_state_t *state, dep_route_journal_t *journal, uint32_t key,
+    const dep_domain_collection_t *collection) {
   if (key == SHELL_DEP_FD_NONE)
     return true;
   dep_fd_ref_t operation = dep_fd_numeric(key);
   if (journal->allocations[key - SHELL_DEP_FD_MAX - 1].role ==
       DEP_ALLOCATION_BINDING)
-    return dep_route_state_store_access(state, journal, operation,
-                                        DEP_FD_ACCESS_ALLOCATION_SLOTS,
-                                        (dep_route_set_t){.ready = true});
+    return collection
+               ? dep_route_state_store_access_collected(
+                     state, journal, operation, DEP_FD_ACCESS_ALLOCATION_SLOTS,
+                     (dep_route_set_t){.ready = true}, collection)
+               : dep_route_state_store_access(state, journal, operation,
+                                              DEP_FD_ACCESS_ALLOCATION_SLOTS,
+                                              (dep_route_set_t){.ready = true});
   return dep_route_state_store_access(state, journal, operation,
                                       DEP_FD_ACCESS_SAVED,
                                       (dep_route_set_t){.ready = true}) &&
@@ -10201,17 +16394,25 @@ static SHELL_NONNULL(1,
 static SHELL_NONNULL(1, 2, 3, 4) bool dep_fd_retire_operation(
     dep_route_state_t *state, dep_route_journal_t *journal,
     const dep_owner_routes_t *baseline, const dep_route_state_t *source,
-    uint32_t undo_key) {
+    uint32_t undo_key, const dep_domain_collection_t *collection) {
   if (undo_key == SHELL_DEP_FD_NONE)
     return true;
   if (journal->allocations[undo_key - SHELL_DEP_FD_MAX - 1].role ==
       DEP_ALLOCATION_BINDING)
-    return dep_fd_discard_undo(state, journal, undo_key);
+    return dep_fd_discard_undo(state, journal, undo_key, collection);
+  dep_domain_collection_t pins = {
+      .roots = {state, source},
+      .parent = collection,
+  };
+  if (collection) {
+    pins.workspace = collection->workspace;
+    pins.frame = collection->frame;
+  }
+  const dep_domain_collection_t *retire_collection = collection ? &pins : NULL;
   dep_route_set_t undo = dep_fd_raw_fact(
       source, journal, baseline, dep_fd_numeric(undo_key), DEP_FD_ACCESS_SAVED);
   for (uint32_t slot = 0; slot < undo.count; slot++) {
-    if (undo.routes[slot].kind != DEP_ROUTE_ALIAS ||
-        undo.routes[slot].value > SHELL_DEP_FD_MAX)
+    if (undo.routes[slot].kind != DEP_ROUTE_ALIAS)
       continue;
     dep_fd_ref_t fd = dep_fd_numeric(undo.routes[slot].value);
     for (uint32_t access = DEP_FD_ACCESS_READ; access <= DEP_FD_ACCESS_BINDING;
@@ -10222,12 +16423,43 @@ static SHELL_NONNULL(1, 2, 3, 4) bool dep_fd_retire_operation(
                                              ? DEP_ROUTE_CLOSED
                                              : DEP_ROUTE_ABSENT,
                                          UINT32_MAX});
-      if (!dep_route_state_store_access(state, journal, fd,
-                                        (dep_fd_access_t)access, disposed))
+      if (!(retire_collection
+                ? dep_route_state_store_access_collected(
+                      state, journal, fd, (dep_fd_access_t)access, disposed,
+                      retire_collection)
+                : dep_route_state_store_access(
+                      state, journal, fd, (dep_fd_access_t)access, disposed)))
         return false;
     }
   }
-  return dep_fd_discard_undo(state, journal, undo_key);
+  if (!dep_selector_retire(state, journal, undo_key, retire_collection))
+    return false;
+  /* A disposed operation-private save has no remaining numeric identity. Its
+   * physical close is already in the domain; retain only the ordinary absent
+   * facts so a no-save path and a completed-save path can share this map. A
+   * reused named slot keeps its own selector and its closed binding. */
+  for (uint32_t slot = 0; slot < undo.count; slot++)
+    if (undo.routes[slot].kind == DEP_ROUTE_ALIAS &&
+        undo.routes[slot].value == undo_key) {
+      for (uint32_t access = DEP_FD_ACCESS_READ;
+           access <= DEP_FD_ACCESS_BINDING; access <<= 1) {
+        dep_route_set_t absent = {0};
+        dep_route_set_set(&absent,
+                          (dep_fd_route_t){access == DEP_FD_ACCESS_BINDING
+                                               ? DEP_ROUTE_UNAVAILABLE
+                                               : DEP_ROUTE_ABSENT,
+                                           UINT32_MAX});
+        if (!dep_route_state_append_one(state, journal,
+                                        dep_fd_numeric(undo_key),
+                                        (dep_fd_access_t)access, absent))
+          return false;
+      }
+      if (!dep_route_state_store_access(
+              state, journal, dep_fd_numeric(undo_key), DEP_FD_ACCESS_SCRATCH,
+              (dep_route_set_t){.ready = true}))
+        return false;
+    }
+  return dep_fd_discard_undo(state, journal, undo_key, retire_collection);
 }
 
 typedef enum {
@@ -10236,10 +16468,10 @@ typedef enum {
   DEP_UNDO_EXHAUSTED,
 } dep_undo_result_t;
 
-/* Apply one undo in the selected physical execution version. A saved numeric
- * scratch descriptor is read at unwind time, not copied from a stale entry
- * map. Abstract saves cannot be observed/overwritten numerically and reuse the
- * operation's immutable entry. MOVE_UNDO absence means no source undo; target
+/* Apply one undo in the selected execution version. Numeric and symbolic
+ * scratch descriptors are read at unwind time, not copied from a stale entry
+ * map. Only unobserved saves without a selector reuse the immutable entry.
+ * MOVE_UNDO absence means no source undo; target
  * absence means Bash registered a close of the initially unopened target.
  * exec discards ordinary restoration, but disposes saves and restores targets
  * which themselves were shell-owned scratch descriptors. A failed dup stops
@@ -10250,17 +16482,20 @@ typedef enum {
 static SHELL_NONNULL(1, 2, 3) dep_undo_result_t
     dep_fd_unwind_key(dep_route_state_t *state, dep_route_journal_t *journal,
                       const dep_owner_routes_t *baseline, uint32_t key,
-                      bool exec, bool stopped) {
+                      bool exec, bool stopped,
+                      const dep_domain_collection_t *collection) {
   if (key == SHELL_DEP_FD_NONE)
     return stopped ? DEP_UNDO_STOPPED : DEP_UNDO_DONE;
   if (stopped)
-    return dep_fd_discard_undo(state, journal, key) ? DEP_UNDO_STOPPED
-                                                    : DEP_UNDO_EXHAUSTED;
+    return dep_fd_discard_undo(state, journal, key, collection)
+               ? DEP_UNDO_STOPPED
+               : DEP_UNDO_EXHAUSTED;
   dep_fd_ref_t operation = dep_fd_numeric(key);
   dep_route_set_t target = dep_fd_raw_fact(state, journal, baseline, operation,
                                            DEP_FD_ACCESS_UNDO_TARGET);
   if (!target.count)
-    return dep_fd_retire_operation(state, journal, baseline, state, key)
+    return dep_fd_retire_operation(state, journal, baseline, state, key,
+                                   collection)
                ? DEP_UNDO_DONE
                : DEP_UNDO_EXHAUSTED;
   dep_fd_ref_t fd = dep_fd_numeric(target.routes[0].value);
@@ -10280,7 +16515,7 @@ static SHELL_NONNULL(1, 2, 3) dep_undo_result_t
      * save, and do_redirections stops the remainder of this undo list. */
     for (uint32_t slot = 0; slot < undo.count; slot++) {
       dep_fd_route_t saved = undo.routes[slot];
-      if (saved.kind != DEP_ROUTE_ALIAS || saved.value > SHELL_DEP_FD_MAX)
+      if (saved.kind != DEP_ROUTE_ALIAS)
         continue;
       dep_route_set_t binding =
           dep_fd_raw_fact(&before, journal, baseline,
@@ -10289,8 +16524,9 @@ static SHELL_NONNULL(1, 2, 3) dep_undo_result_t
         if (journal->diagnostic_cleanup &&
             !dep_record_diagnostic(state, journal, baseline))
           return DEP_UNDO_EXHAUSTED;
-        return dep_fd_discard_undo(state, journal, key) ? DEP_UNDO_STOPPED
-                                                        : DEP_UNDO_EXHAUSTED;
+        return dep_fd_discard_undo(state, journal, key, collection)
+                   ? DEP_UNDO_STOPPED
+                   : DEP_UNDO_EXHAUSTED;
       }
     }
     for (uint32_t access = DEP_FD_ACCESS_READ; access <= DEP_FD_ACCESS_BINDING;
@@ -10308,7 +16544,11 @@ static SHELL_NONNULL(1, 2, 3) dep_undo_result_t
             dep_route_set_set(&routes,
                               (dep_fd_route_t){DEP_ROUTE_CLOSED, UINT32_MAX});
           }
-        } else if (saved.value > SHELL_DEP_FD_MAX) {
+        } else if (saved.value > SHELL_DEP_FD_MAX &&
+                   !dep_fd_raw_fact(&before, journal, baseline,
+                                    dep_fd_numeric(saved.value),
+                                    DEP_FD_ACCESS_SELECTOR)
+                        .count) {
           dep_route_state_t original =
               dep_route_state_single(entry.routes[0].value);
           routes = dep_fd_raw_fact(&original, journal, baseline, fd,
@@ -10340,7 +16580,16 @@ static SHELL_NONNULL(1, 2, 3) dep_undo_result_t
             DEP_FD_ACCESS_LOW_STATE, (dep_route_set_t){.ready = true}))
       return DEP_UNDO_EXHAUSTED;
   }
-  if (!dep_fd_retire_operation(state, journal, baseline, &before, key))
+  dep_domain_collection_t pins = {
+      .roots = {state, &before},
+      .parent = collection,
+  };
+  if (collection) {
+    pins.workspace = collection->workspace;
+    pins.frame = collection->frame;
+  }
+  if (!dep_fd_retire_operation(state, journal, baseline, &before, key,
+                               collection ? &pins : NULL))
     return DEP_UNDO_EXHAUSTED;
   dep_route_set_t available = dep_fd_raw_fact(state, journal, baseline,
                                               dep_fd_numeric(SHELL_DEP_FD_NONE),
@@ -10355,9 +16604,13 @@ static SHELL_NONNULL(1, 2, 3) dep_undo_result_t
       (void)dep_allocation_remove_candidate(&available, fd.value);
   }
   for (uint32_t slot = 0; slot < undo.count; slot++)
-    if (undo.routes[slot].kind == DEP_ROUTE_ALIAS &&
-        undo.routes[slot].value <= SHELL_DEP_FD_MAX) {
-      (void)dep_route_set_add(&available, undo.routes[slot]);
+    if (undo.routes[slot].kind == DEP_ROUTE_ALIAS) {
+      if (undo.routes[slot].value <= SHELL_DEP_FD_MAX ||
+          dep_fd_raw_fact(state, journal, baseline,
+                          dep_fd_numeric(undo.routes[slot].value),
+                          DEP_FD_ACCESS_SELECTOR)
+              .count)
+        (void)dep_route_set_add(&available, undo.routes[slot]);
       if (!dep_route_state_store_access(
               state, journal, dep_fd_numeric(undo.routes[slot].value),
               DEP_FD_ACCESS_SCRATCH, (dep_route_set_t){.ready = true}))
@@ -10377,7 +16630,8 @@ static SHELL_NONNULL(1, 2, 3, 4) bool dep_route_state_publish_one(
     dep_route_state_t *route_state, dep_route_journal_t *changes,
     const dep_route_state_t *executed_state,
     const dep_owner_routes_t *entry_baseline, const dep_fd_op_t *ops,
-    uint32_t op_count, bool descriptor_exec) {
+    uint32_t op_count, bool descriptor_exec,
+    const dep_domain_collection_t *collection) {
   dep_route_state_t original = *route_state;
   bool correlated = route_state->correlated;
   *route_state = *executed_state;
@@ -10386,14 +16640,19 @@ static SHELL_NONNULL(1, 2, 3, 4) bool dep_route_state_publish_one(
   /* Bash prepends each newly registered undo. Source-close undo is registered
    * after a move's destination save, so it runs first during unwind. */
   for (uint32_t i = op_count; i != 0; i--) {
+    if (collection)
+      dep_route_domains_collect(changes, collection, route_state,
+                                executed_state);
     DEP_METADATA_WORK(SHELLSPLIT_TEST_WORK_ROUTE_PUBLICATION);
     const dep_fd_op_t *op = ops + i - 1;
+    if (op->kind == DEP_FD_OP_PROCESS)
+      continue;
     if (op->kind == DEP_FD_OP_MOVE && !dep_fd_op_numeric_self_dup(op)) {
       dep_fd_op_t close = dep_fd_move_close(op);
       dep_undo_result_t result = dep_fd_unwind_key(
           route_state, changes, entry_baseline,
           dep_undo_slot(changes, &close, DEP_ALLOCATION_MOVE_UNDO, false),
-          descriptor_exec, stopped);
+          descriptor_exec, stopped, collection);
       if (result == DEP_UNDO_EXHAUSTED)
         return false;
       stopped = result == DEP_UNDO_STOPPED;
@@ -10402,7 +16661,7 @@ static SHELL_NONNULL(1, 2, 3, 4) bool dep_route_state_publish_one(
         dep_undo_slot(changes, op, DEP_ALLOCATION_TARGET_UNDO, false);
     dep_undo_result_t result =
         dep_fd_unwind_key(route_state, changes, entry_baseline, target_key,
-                          descriptor_exec, stopped);
+                          descriptor_exec, stopped, collection);
     if (result == DEP_UNDO_EXHAUSTED)
       return false;
     stopped = result == DEP_UNDO_STOPPED;
@@ -10430,7 +16689,7 @@ static SHELL_NONNULL(1, 2, 3, 4) bool dep_route_state_publish_one(
         (changes->observable_fd_count || changes->named_closes) &&
         !dep_fd_retire_operation(route_state, changes, entry_baseline,
                                  executed_state,
-                                 dep_allocation_slot(changes, op)))
+                                 dep_allocation_slot(changes, op), collection))
       return false;
   }
   return !route_state->truncated &&
@@ -10446,22 +16705,73 @@ static SHELL_NONNULL(1, 2, 3, 4) bool dep_route_state_publish_one(
               DEP_FD_ACCESS_SETUP_MODE, (dep_route_set_t){.ready = true}));
 }
 
-static SHELL_NONNULL(1, 2, 3,
-                     4) bool dep_fd_merge(dep_route_state_t *destination,
-                                          const dep_route_state_t *source,
-                                          dep_route_journal_t *journal,
-                                          const dep_owner_routes_t *baseline);
+static SHELL_NONNULL(1, 2, 3) bool dep_fd_merge_root(
+    dep_route_state_t *destination, dep_route_journal_t *journal,
+    const dep_owner_routes_t *baseline, uint32_t source_root);
+
+static SHELL_NONNULL(1, 2, 3, 4) bool dep_fd_merge_versions(
+    dep_route_state_t *destination, const dep_route_state_t *source,
+    dep_route_journal_t *journal, const dep_owner_routes_t *baseline) {
+  /* Preserve only distinguishable observation classes. Unrelated changes
+   * may still factor inside each class after one observed name forced a
+   * split; keeping every whole-state combination grows exponentially. Joins
+   * use immutable changed-key paths and their cache, never source rescans. */
+  uint32_t roots[DEP_ROUTE_STATE_CAPACITY], count = 0;
+  for (unsigned side = 0; side < 2; side++) {
+    dep_route_iterator_t iterator =
+        dep_route_iterator(side ? source : destination);
+    uint32_t root;
+    while (dep_route_next(&iterator, journal, &root)) {
+      bool merged = false;
+      for (uint32_t i = 0; i < count; i++) {
+        DEP_METADATA_WORK(SHELLSPLIT_TEST_WORK_ROUTE_ALTERNATIVES);
+        dep_route_state_t candidate = dep_route_state_single(roots[i]);
+        if (!dep_fd_merge_root(&candidate, journal, baseline, root))
+          return false;
+        if (!candidate.correlated) {
+          roots[i] = candidate.root;
+          merged = true;
+          break;
+        }
+      }
+      if (!merged) {
+        if (count == DEP_ROUTE_STATE_CAPACITY)
+          return false;
+        roots[count++] = root;
+      }
+    }
+  }
+  dep_route_state_t result = dep_route_state_single(roots[0]);
+  for (uint32_t i = 1; i < count; i++)
+    if (!dep_route_state_add_root(&result, journal, roots[i]))
+      return false;
+  result.correlated = count > 1;
+  *destination = result;
+  return true;
+}
 
 static SHELL_NONNULL(1, 2, 3, 4) bool dep_route_state_publish(
     dep_route_state_t *route_state, dep_route_journal_t *changes,
     const dep_route_state_t *executed_state,
     const dep_owner_routes_t *entry_baseline, const dep_fd_op_t *ops,
-    uint32_t op_count, bool descriptor_exec) {
+    uint32_t op_count, bool descriptor_exec,
+    const dep_domain_collection_t *collection) {
   dep_route_state_t entry = *route_state;
-  if (op_count == 0)
-    return !entry.truncated &&
-           dep_ifs_copy(route_state, executed_state, changes, entry_baseline);
+  if (op_count == 0) {
+    /* No descriptor setup needs undoing. In particular a builtin evaluated
+     * one path of a correlated entry: its continuation is that path, not all
+     * of the owner's original alternatives. Argument captures are private
+     * journal facts; scalar mutations/restoration are published below. */
+    *route_state = *executed_state;
+    return !route_state->truncated;
+  }
   dep_route_state_t published = {0};
+  dep_domain_collection_t pins = {.roots = {&entry, executed_state, &published},
+                                  .parent = collection};
+  if (collection) {
+    pins.workspace = collection->workspace;
+    pins.frame = collection->frame;
+  }
   bool have_published = false;
   uint32_t entry_count = dep_route_state_count(&entry);
   uint32_t executed_count = dep_route_state_count(executed_state);
@@ -10480,9 +16790,9 @@ static SHELL_NONNULL(1, 2, 3, 4) bool dep_route_state_publish(
     uint32_t original = saved.count == 1 ? saved.routes[0].value : entry_root;
     dep_route_state_t branch = dep_route_state_single(original);
     branch.correlated = entry.correlated || executed_state->correlated;
-    if (!dep_route_state_publish_one(&branch, changes, &executed_branch,
-                                     entry_baseline, ops, op_count,
-                                     descriptor_exec))
+    if (!dep_route_state_publish_one(
+            &branch, changes, &executed_branch, entry_baseline, ops, op_count,
+            descriptor_exec, collection ? &pins : NULL))
       return false;
     if (!have_published) {
       published = branch;
@@ -10512,7 +16822,7 @@ static SHELL_NONNULL(1, 2, 3) bool dep_fd_restore_slots_one(
   for (uint32_t i = scratch_count; i != 0; i--) {
     DEP_METADATA_WORK(SHELLSPLIT_TEST_WORK_REDIRECT_FRAMES);
     dep_undo_result_t result = dep_fd_unwind_key(
-        state, journal, baseline, scratch_keys[i - 1], false, stopped);
+        state, journal, baseline, scratch_keys[i - 1], false, stopped, NULL);
     if (result == DEP_UNDO_EXHAUSTED)
       return false;
     stopped = result == DEP_UNDO_STOPPED;
@@ -10572,10 +16882,81 @@ static SHELL_NONNULL(2, 3) dep_route_set_t
     dep_fd_raw_root_fact(uint32_t root, const dep_route_journal_t *journal,
                          const dep_owner_routes_t *baseline, dep_fd_ref_t fd,
                          dep_fd_access_t access) {
+  if (access == DEP_FD_ACCESS_NAMED_BINDINGS) {
+    dep_route_set_t result = {0};
+    dep_route_set_set(&result, dep_named_bindings(root, journal));
+    return result;
+  }
+  bool proven_live = false;
+  if (fd.value < 64 &&
+      (access == DEP_FD_ACCESS_BINDING || access == DEP_FD_ACCESS_READ ||
+       access == DEP_FD_ACCESS_WRITE)) {
+    const dep_route_change_t *domain = dep_route_root_change(
+        root, journal, dep_fd_numeric(0), DEP_FD_ACCESS_PROCESS_DOMAIN);
+    if (domain && journal->snapshots[domain->snapshot - 1].count) {
+      uint32_t value = journal->snapshots[domain->snapshot - 1].routes[0].value;
+      uint64_t bit = UINT64_C(1) << fd.value;
+      if (!(dep_process_domain_mask(&journal->process_domains, value, false) &
+            bit)) {
+        dep_route_set_t closed = {0};
+        dep_route_set_set(&closed,
+                          (dep_fd_route_t){DEP_ROUTE_CLOSED, UINT32_MAX});
+        return closed;
+      }
+      proven_live =
+          !(dep_process_domain_mask(&journal->process_domains, value, true) &
+            bit);
+    }
+  }
   const dep_route_change_t *change =
       dep_route_root_change(root, journal, fd, access);
-  if (change)
-    return journal->snapshots[change->snapshot - 1];
+  if (change) {
+    dep_route_set_t fact = journal->snapshots[change->snapshot - 1];
+    if (proven_live && access == DEP_FD_ACCESS_BINDING && fact.count == 1 &&
+        fact.routes[0].kind == DEP_ROUTE_UNSEEN)
+      fact.routes[0].kind = DEP_ROUTE_INHERITED;
+    return fact;
+  }
+  if (fd.value == SHELL_DEP_FD_NAMED && access == DEP_FD_ACCESS_BINDING &&
+      dep_named_bindings(root, journal).kind == DEP_ROUTE_DYNAMIC) {
+    dep_route_set_t result = {0};
+    dep_route_set_set(&result, (dep_fd_route_t){DEP_ROUTE_DYNAMIC, UINT32_MAX});
+    return result;
+  }
+  const dep_fd_route_entry_t *slot = NULL;
+  if (fd.value == SHELL_DEP_FD_NAMED && access == DEP_FD_ACCESS_BINDING)
+    slot = dep_route_find(baseline, fd);
+  if (!slot && fd.value == SHELL_DEP_FD_NAMED &&
+      access == DEP_FD_ACCESS_BINDING && baseline->scalar_imports) {
+    const dep_fd_imports_t *imports = baseline->scalar_imports;
+    const dep_route_change_t *paths =
+        dep_route_root_change(root, journal, dep_fd_numeric(SHELL_DEP_FD_NONE),
+                              DEP_FD_ACCESS_READ_ARGUMENT);
+    if (paths) {
+      dep_route_set_t result = {.ready = true};
+      const dep_route_set_t *versions =
+          &journal->snapshots[paths->snapshot - 1];
+      for (uint32_t i = 0; i < versions->count; i++) {
+        uint32_t path = versions->routes[i].value;
+        dep_fd_route_t value = {DEP_ROUTE_UNSEEN, UINT32_MAX};
+        if (!(imports->path_assignment_only[path] &&
+              dep_assignment_precedes(imports->assignment_source,
+                                      imports->assignment_command, fd,
+                                      imports->assignment_position))) {
+          dep_route_set_t parent = dep_fd_raw_root_fact(
+              imports->path_scalar_root[path], imports->scalar_journal,
+              imports->scalar_baseline, fd, access);
+          /* Live aliases arrive via the physical imports above. Only absent
+           * scalar values need this fallback; never transplant a parent-local
+           * allocation ID or invent a descriptor from scalar provenance. */
+          if (dep_read_value_class(&parent) == 1)
+            value.kind = DEP_ROUTE_ABSENT;
+        }
+        (void)dep_route_set_add(&result, value);
+      }
+      return result;
+    }
+  }
   if (access == DEP_FD_ACCESS_IFS || access == DEP_FD_ACCESS_STDIN_REDIR) {
     dep_route_set_t result = {0};
     dep_route_set_set(&result, (dep_fd_route_t){DEP_ROUTE_INHERITED, 0});
@@ -10583,20 +16964,32 @@ static SHELL_NONNULL(2, 3) dep_route_set_t
   }
   if (access == DEP_FD_ACCESS_AVAILABLE)
     return (dep_route_set_t){.ready = true};
-  if (access == DEP_FD_ACCESS_SAVED || access == DEP_FD_ACCESS_SETUP_FRAME ||
+  if (access == DEP_FD_ACCESS_PROCESS_OWNED ||
+      access == DEP_FD_ACCESS_PRIVATE_SCOPE ||
+      access == DEP_FD_ACCESS_READ_ARGUMENT ||
+      access == DEP_FD_ACCESS_EFFECT_STATE ||
+      access == DEP_FD_ACCESS_SUBSTITUTION_STATUS ||
+      access == DEP_FD_ACCESS_INHERITED_OBSERVATION ||
+      access == DEP_FD_ACCESS_PRIVATE_ENTRY || access == DEP_FD_ACCESS_SAVED ||
+      access == DEP_FD_ACCESS_SETUP_FRAME ||
       access == DEP_FD_ACCESS_ALLOCATION_SLOTS ||
       access == DEP_FD_ACCESS_UNDO_ENTRY ||
       access == DEP_FD_ACCESS_UNDO_TARGET ||
       access == DEP_FD_ACCESS_UNDO_EXEC || access == DEP_FD_ACCESS_SCRATCH ||
       access == DEP_FD_ACCESS_SETUP_MODE ||
-      access == DEP_FD_ACCESS_FAILURE_UNDO)
+      access == DEP_FD_ACCESS_FAILURE_UNDO ||
+      access == DEP_FD_ACCESS_PROCESS_SLOT ||
+      access == DEP_FD_ACCESS_PROCESS_BEFORE ||
+      access == DEP_FD_ACCESS_SELECTOR ||
+      access == DEP_FD_ACCESS_PROCESS_DOMAIN)
     return (dep_route_set_t){.ready = true};
   if (access == DEP_FD_ACCESS_LOW_STATE || access == DEP_FD_ACCESS_ENTRY ||
       access == DEP_FD_ACCESS_MOVE_ENTRY ||
       access == DEP_FD_ACCESS_MOVE_RESTORE ||
       access == DEP_FD_ACCESS_MOVE_SLOTS)
     return (dep_route_set_t){.ready = true};
-  const dep_fd_route_entry_t *slot = dep_route_find(baseline, fd);
+  if (!(fd.value == SHELL_DEP_FD_NAMED && access == DEP_FD_ACCESS_BINDING))
+    slot = dep_route_find(baseline, fd);
   dep_route_set_t result = {0};
   if (!slot && fd.value > SHELL_DEP_FD_MAX && fd.value < SHELL_DEP_FD_NAMED) {
     dep_route_set_set(&result, (dep_fd_route_t){access == DEP_FD_ACCESS_BINDING
@@ -10607,7 +17000,8 @@ static SHELL_NONNULL(2, 3) dep_route_set_t
   }
   dep_fd_route_t route =
       access == DEP_FD_ACCESS_BINDING
-          ? (dep_fd_route_t){slot || (fd.value != SHELL_DEP_FD_NAMED &&
+          ? (dep_fd_route_t){proven_live || slot ||
+                                     (fd.value != SHELL_DEP_FD_NAMED &&
                                       fd.value < 3)
                                  ? DEP_ROUTE_INHERITED
                                  : DEP_ROUTE_UNSEEN,
@@ -10617,6 +17011,45 @@ static SHELL_NONNULL(2, 3) dep_route_set_t
              : (dep_fd_route_t){DEP_ROUTE_INHERITED, fd.value};
   dep_route_set_set(&result, route);
   return result;
+}
+
+/* Bash's temporary assignment environment is visible to ordinary argument
+ * lookup inside a later RHS substitution, but not to redirection expansion.
+ * Keep that value shadow separate from physical FD imports. A child-local
+ * binding update supersedes the inherited shadow; compare only the requested
+ * key in the sparse write set, not every name in the binding inventory. */
+static SHELL_NONNULL(2, 3) bool dep_read_scalar_shadowed(
+    uint32_t root, const dep_route_journal_t *journal,
+    const dep_owner_routes_t *baseline, dep_fd_ref_t fd) {
+  const dep_fd_imports_t *imports = baseline->scalar_imports;
+  if (!imports)
+    return false;
+  const dep_route_change_t *anchor = dep_route_root_change(
+      root, journal, dep_fd_numeric(DEP_SCALAR_IMPORT_EVENT),
+      DEP_FD_ACCESS_PRIVATE_ENTRY);
+  if (!anchor)
+    return false;
+  dep_fd_route_t entry = journal->snapshots[anchor->snapshot - 1].routes[0];
+  if (dep_route_map_change(entry.value, journal, fd,
+                           DEP_FD_ACCESS_READ_ARGUMENT))
+    return false;
+  const dep_route_change_t *paths =
+      dep_route_root_change(root, journal, dep_fd_numeric(SHELL_DEP_FD_NONE),
+                            DEP_FD_ACCESS_READ_ARGUMENT);
+  if (!paths)
+    return false;
+  if (imports->assignment_source &&
+      dep_assignment_precedes(imports->assignment_source,
+                              imports->assignment_command, fd,
+                              imports->assignment_position))
+    return true;
+  const dep_route_set_t *versions = &journal->snapshots[paths->snapshot - 1];
+  for (uint32_t i = 0; i < versions->count; i++)
+    if (dep_read_scalar_shadowed(
+            imports->path_scalar_root[versions->routes[i].value],
+            imports->scalar_journal, imports->scalar_baseline, fd))
+      return true;
+  return false;
 }
 
 static SHELL_NONNULL(1, 2, 3) dep_route_set_t
@@ -10677,6 +17110,10 @@ static SHELL_NONNULL(1, 2,
     return true;
   dep_route_set_t facts =
       dep_fd_raw_fact(state, journal, baseline, fd, DEP_FD_ACCESS_BINDING);
+  dep_route_set_t effect_state =
+      dep_fd_raw_fact(state, journal, baseline, fd, DEP_FD_ACCESS_EFFECT_STATE);
+  if (dep_effect_state_has(&effect_state, DEP_EFFECT_STATE_ORPHANED_ALLOCATION))
+    return false;
   bool live = false;
   for (uint32_t i = 0; i < facts.count; i++) {
     if (facts.routes[i].kind == DEP_ROUTE_DYNAMIC ||
@@ -10729,11 +17166,96 @@ static SHELL_NONNULL(1, 2, 3) dep_fd_route_t
   return dep_fd_representative(raw);
 }
 
-static SHELL_NONNULL(1, 2, 3) bool dep_fd_merge_key(
+/* Binding outcomes are independent of access mode: a write-only descriptor
+ * passes read's -u existence check, but never contributes a READ capability.
+ * Unknown inherited descriptors retain both possible validation outcomes. */
+static SHELL_NONNULL(1) uint8_t
+    dep_read_binding_outcomes(const dep_route_set_t *facts) {
+  uint8_t outcomes = 0;
+  for (uint32_t i = 0; i < facts->count; i++) {
+    dep_route_kind_t kind = facts->routes[i].kind;
+    if (kind == DEP_ROUTE_CLOSED || kind == DEP_ROUTE_ABSENT ||
+        kind == DEP_ROUTE_UNAVAILABLE)
+      outcomes |= DEP_STATUS_MAY_FAIL;
+    else if (kind == DEP_ROUTE_UNSEEN || kind == DEP_ROUTE_DYNAMIC)
+      outcomes |= DEP_STATUS_EITHER;
+    else
+      outcomes |= DEP_STATUS_MAY_SUCCEED;
+  }
+  return outcomes;
+}
+
+/* Empty, nonempty decimal, or unknown. Value-only observations need no
+ * allocation identity; different nonempty aliases have the same option role. */
+static SHELL_NONNULL(1) unsigned dep_read_value_class(
+    const dep_route_set_t *facts) {
+  unsigned value = 0;
+  for (uint32_t i = 0; i < facts->count; i++) {
+    dep_route_kind_t kind = facts->routes[i].kind;
+    value |= kind == DEP_ROUTE_ABSENT || kind == DEP_ROUTE_UNAVAILABLE ? 1u
+             : kind == DEP_ROUTE_ALIAS || kind == DEP_ROUTE_INHERITED ||
+                     kind == DEP_ROUTE_CLOSED
+                 ? 2u
+                 : 3u;
+  }
+  return value ? value : 3u;
+}
+
+static SHELL_NONNULL(1) unsigned dep_read_binding_observation(
+    const dep_route_journal_t *journal, dep_fd_ref_t fd) {
+  if (fd.value > SHELL_DEP_FD_MAX && fd.value < SHELL_DEP_FD_NAMED) {
+    const dep_allocation_t *allocation =
+        &journal->allocations[fd.value - SHELL_DEP_FD_MAX - 1];
+    if ((allocation->role != DEP_ALLOCATION_BINDING &&
+         allocation->role != DEP_ALLOCATION_IMPORT) ||
+        !allocation->name)
+      return 0;
+    return (allocation->observations |
+            dep_read_observation(
+                &journal->read_observations,
+                (dep_fd_ref_t){.name = allocation->name,
+                               .value = SHELL_DEP_FD_NAMED,
+                               .name_len = allocation->name_length})) &
+           (DEP_READ_OBSERVE_IDENTITY | DEP_READ_OBSERVE_ACCESS);
+  }
+  unsigned role = dep_read_observation(&journal->read_observations, fd);
+  if (role || !journal->read_observations.identity ||
+      fd.value < DEP_BASH_VARREDIR_MIN_FD || fd.value > SHELL_DEP_FD_MAX)
+    return role;
+  /* Explicit physical slots can coincide with an observed named allocation.
+   * The source inventory already contains their sorted identities; private
+   * allocations above use their owning name instead of observing every slot. */
+  uint32_t begin = 0, end = journal->observable_fd_count;
+  while (begin < end) {
+    DEP_METADATA_WORK(SHELLSPLIT_TEST_WORK_ROUTE_LOOKUP);
+    uint32_t middle = begin + (end - begin) / 2;
+    if (journal->observable_fds[middle] < fd.value)
+      begin = middle + 1;
+    else
+      end = middle;
+  }
+  return begin < journal->observable_fd_count &&
+                 journal->observable_fds[begin] == fd.value
+             ? DEP_READ_OBSERVE_IDENTITY | DEP_READ_OBSERVE_ACCESS
+             : 0;
+}
+
+typedef struct {
+  bool domain_changed;
+  bool other_changed;
+} dep_fd_merge_relation_t;
+
+static SHELL_NONNULL(1, 2, 3, 9) bool dep_fd_merge_tree(
+    dep_route_state_t *result, dep_route_journal_t *journal,
+    const dep_owner_routes_t *baseline, uint32_t left_root, uint32_t right_root,
+    uint32_t root, uint32_t other_root, bool missing_only,
+    dep_fd_merge_relation_t *relation);
+
+static SHELL_NONNULL(1, 2, 3, 10) bool dep_fd_merge_key(
     dep_route_state_t *result, dep_route_journal_t *journal,
     const dep_owner_routes_t *baseline, uint32_t left_root, uint32_t right_root,
     dep_fd_ref_t fd, dep_fd_access_t access, uint32_t left_snapshot,
-    uint32_t right_snapshot) {
+    uint32_t right_snapshot, dep_fd_merge_relation_t *relation) {
   dep_route_set_t routes =
       left_snapshot
           ? journal->snapshots[left_snapshot - 1]
@@ -10742,24 +17264,95 @@ static SHELL_NONNULL(1, 2, 3) bool dep_fd_merge_key(
       right_snapshot
           ? journal->snapshots[right_snapshot - 1]
           : dep_fd_raw_root_fact(right_root, journal, baseline, fd, access);
-  if (access == DEP_FD_ACCESS_SAVED ||
+  bool equal = routes.count == additional.count;
+  for (uint32_t i = 0; equal && i < routes.count; i++)
+    equal = routes.routes[i].kind == additional.routes[i].kind &&
+            routes.routes[i].value == additional.routes[i].value;
+  if (access == DEP_FD_ACCESS_NAMED_BINDINGS) {
+    dep_fd_route_t left = dep_named_bindings(left_root, journal);
+    dep_fd_route_t right = dep_named_bindings(right_root, journal);
+    if (left.kind != right.kind) {
+      result->correlated = true;
+      return true;
+    }
+    return dep_fd_merge_tree(result, journal, baseline, left_root, right_root,
+                             left.value, right.value, false, relation) &&
+           dep_fd_merge_tree(result, journal, baseline, left_root, right_root,
+                             right.value, left.value, true, relation);
+  }
+  if (!equal) {
+    relation->domain_changed |= access == DEP_FD_ACCESS_PROCESS_DOMAIN;
+    relation->other_changed |= access != DEP_FD_ACCESS_PROCESS_DOMAIN;
+  }
+  if (access == DEP_FD_ACCESS_READ &&
+      (dep_read_binding_observation(journal, fd) & DEP_READ_OBSERVE_ACCESS) &&
+      dep_read_access_outcomes(&routes) !=
+          dep_read_access_outcomes(&additional)) {
+    result->correlated = true;
+    return true;
+  }
+  if (access == DEP_FD_ACCESS_PROCESS_OWNED ||
+      access == DEP_FD_ACCESS_PRIVATE_SCOPE ||
+      access == DEP_FD_ACCESS_EFFECT_STATE ||
+      access == DEP_FD_ACCESS_SUBSTITUTION_STATUS ||
+      access == DEP_FD_ACCESS_INHERITED_OBSERVATION ||
+      access == DEP_FD_ACCESS_PRIVATE_ENTRY || access == DEP_FD_ACCESS_SAVED ||
       access == DEP_FD_ACCESS_ALLOCATION_SLOTS ||
       access == DEP_FD_ACCESS_UNDO_ENTRY ||
       access == DEP_FD_ACCESS_UNDO_TARGET ||
       access == DEP_FD_ACCESS_UNDO_EXEC || access == DEP_FD_ACCESS_SCRATCH ||
       access == DEP_FD_ACCESS_SETUP_MODE ||
       access == DEP_FD_ACCESS_FAILURE_UNDO ||
-      access == DEP_FD_ACCESS_STDIN_REDIR) {
+      access == DEP_FD_ACCESS_STDIN_REDIR ||
+      access == DEP_FD_ACCESS_READ_ARGUMENT ||
+      access == DEP_FD_ACCESS_PROCESS_SLOT ||
+      access == DEP_FD_ACCESS_PROCESS_BEFORE ||
+      access == DEP_FD_ACCESS_SELECTOR) {
     /* A scratch slot and an ordinary descriptor on another path cannot share
      * a factored map. Preserve ownership until the frame disposes its saves. */
-    if (routes.count != additional.count ||
-        (routes.count &&
-         (routes.routes[0].kind != additional.routes[0].kind ||
-          routes.routes[0].value != additional.routes[0].value))) {
+    if (!equal) {
       result->correlated = true;
       return true;
     }
     return true;
+  }
+  if (access == DEP_FD_ACCESS_PROCESS_DOMAIN) {
+    if (equal)
+      return true;
+    journal->process_domains.memo_ready = false;
+    uint32_t domain = 0;
+    for (unsigned side = 0; side < 2; side++) {
+      const dep_route_set_t *facts = side ? &additional : &routes;
+      if (!facts->count) {
+        /* Missing means this path has not needed a symbolic domain yet. Its
+         * ordinary descriptor facts still constrain initial occupancy; it is
+         * neither an impossible world nor an empty contribution to union. */
+        dep_route_state_t entry =
+            dep_route_state_single(side ? right_root : left_root);
+        uint32_t initial = 1;
+        for (uint32_t physical = 64; physical-- != 0;) {
+          dep_fd_occupancy_t occupancy =
+              dep_fd_occupancy(&entry, journal, baseline, physical);
+          initial =
+              dep_process_domain_node(&journal->process_domains, physical,
+                                      occupancy.may_be_occupied ? initial : 0,
+                                      occupancy.may_be_free ? initial : 0);
+        }
+        domain = dep_process_domain_apply(&journal->process_domains, 1, domain,
+                                          initial);
+        if (domain == UINT32_MAX)
+          return false;
+      }
+      for (uint32_t i = 0; i < facts->count; i++) {
+        domain = dep_process_domain_apply(&journal->process_domains, 1, domain,
+                                          facts->routes[i].value);
+        if (domain == UINT32_MAX)
+          return false;
+      }
+    }
+    dep_route_set_t joined = {0};
+    dep_route_set_set(&joined, (dep_fd_route_t){DEP_ROUTE_INHERITED, domain});
+    return dep_route_state_append_one(result, journal, fd, access, joined);
   }
   if (fd.value == SHELL_DEP_FD_NAMED &&
       (access == DEP_FD_ACCESS_READ || access == DEP_FD_ACCESS_WRITE)) {
@@ -10827,6 +17420,27 @@ static SHELL_NONNULL(1, 2, 3) bool dep_fd_merge_key(
                                       (dep_route_set_t){.ready = true});
   }
   if (access == DEP_FD_ACCESS_BINDING) {
+    /* A read's operand value, descriptor existence and byte route are one
+     * execution alternative. Do not manufacture a closed binding with a live
+     * capability (or let the representative discard a feasible open path). */
+    unsigned observation = dep_read_binding_observation(journal, fd);
+    bool different_argument = routes.count != additional.count;
+    if (fd.value == SHELL_DEP_FD_NAMED &&
+        (observation & DEP_READ_OBSERVE_IDENTITY))
+      for (uint32_t i = 0; !different_argument && i < routes.count; i++)
+        different_argument =
+            routes.routes[i].kind != additional.routes[i].kind ||
+            routes.routes[i].value != additional.routes[i].value;
+    if (observation && (fd.value == SHELL_DEP_FD_NAMED
+                            ? (observation & DEP_READ_OBSERVE_IDENTITY
+                                   ? different_argument
+                                   : dep_read_value_class(&routes) !=
+                                         dep_read_value_class(&additional))
+                            : dep_read_binding_outcomes(&routes) !=
+                                  dep_read_binding_outcomes(&additional))) {
+      result->correlated = true;
+      return true;
+    }
     bool unknown = false, unseen = false, live = false;
     for (unsigned side = 0; side < 2; side++) {
       const dep_route_set_t *facts = side ? &additional : &routes;
@@ -10856,43 +17470,47 @@ static SHELL_NONNULL(1, 2, 3) bool dep_fd_merge_key(
 /* Factor independent changed keys during this one join. If an alias would
  * select another path's resource, correlated marks that the original roots
  * must survive instead. No second map walk or source replay is needed. */
-static SHELL_NONNULL(1, 2, 3) bool dep_fd_merge_tree(
+static SHELL_NONNULL(1, 2, 3, 9) bool dep_fd_merge_tree(
     dep_route_state_t *result, dep_route_journal_t *journal,
     const dep_owner_routes_t *baseline, uint32_t left_root, uint32_t right_root,
-    uint32_t root, uint32_t other_root, bool missing_only) {
+    uint32_t root, uint32_t other_root, bool missing_only,
+    dep_fd_merge_relation_t *relation) {
   if (!root || root == other_root || result->correlated)
     return true;
   dep_route_change_t change = journal->entries[root - 1];
+  dep_fd_ref_t fd = dep_route_change_fd(journal, &journal->entries[root - 1]);
+  dep_fd_access_t access = dep_route_change_access(&change);
   const dep_route_change_t *other =
       other_root ? &journal->entries[other_root - 1] : NULL;
-  if (other && (dep_fd_ref_compare(change.fd, other->fd) != 0 ||
-                change.access != other->access))
-    other =
-        dep_route_root_change(other_root, journal, change.fd, change.access);
+  if (other &&
+      (dep_fd_ref_compare(fd, dep_route_change_fd(journal, other)) != 0 ||
+       access != dep_route_change_access(other)))
+    other = dep_route_map_change(other_root, journal, fd, access);
   if (!other)
     other = dep_route_root_change(missing_only ? left_root : right_root,
-                                  journal, change.fd, change.access);
+                                  journal, fd, access);
   if (other == &journal->entries[root - 1])
     return true;
   bool same_key = other != NULL;
   if (!dep_fd_merge_tree(result, journal, baseline, left_root, right_root,
-                         change.left, other ? other->left : 0, missing_only))
+                         change.left, other ? other->left : 0, missing_only,
+                         relation))
     return false;
   if (result->correlated)
     return true;
   if ((!missing_only && (!same_key || change.snapshot != other->snapshot)) ||
       (missing_only && !same_key &&
-       !dep_route_root_change(left_root, journal, change.fd, change.access))) {
+       !dep_route_root_change(left_root, journal, fd, access))) {
     if (!dep_fd_merge_key(
-            result, journal, baseline, left_root, right_root, change.fd,
-            change.access,
+            result, journal, baseline, left_root, right_root, fd, access,
             missing_only ? (other ? other->snapshot : 0) : change.snapshot,
-            missing_only ? change.snapshot : (other ? other->snapshot : 0)))
+            missing_only ? change.snapshot : (other ? other->snapshot : 0),
+            relation))
       return false;
   }
   return dep_fd_merge_tree(result, journal, baseline, left_root, right_root,
-                           change.right, other ? other->right : 0,
-                           missing_only);
+                           change.right, other ? other->right : 0, missing_only,
+                           relation);
 }
 
 static SHELL_NONNULL(1) dep_route_join_t *dep_fd_join_cache(
@@ -10925,11 +17543,14 @@ static SHELL_NONNULL(1, 2, 3) bool dep_fd_merge_root(
     destination->root = cached->result;
     return true;
   }
+  dep_fd_merge_relation_t relation = {0};
   if (!dep_fd_merge_tree(destination, journal, baseline, left_root, source_root,
-                         left_root, source_root, false) ||
+                         left_root, source_root, false, &relation) ||
       !dep_fd_merge_tree(destination, journal, baseline, left_root, source_root,
-                         source_root, left_root, true))
+                         source_root, left_root, true, &relation))
     return false;
+  if (relation.domain_changed && relation.other_changed)
+    destination->correlated = true;
   /* UINT32_MAX caches an unfactorable association, not a journal root. */
   *cached = (dep_route_join_t){
       low, high, destination->correlated ? UINT32_MAX : destination->root,
@@ -10944,16 +17565,11 @@ static SHELL_NONNULL(1, 2, 3,
                                           const dep_owner_routes_t *baseline) {
   if (destination->truncated || source->truncated)
     return false;
+  if (journal->read_observations.active && !journal->named_closes)
+    return dep_fd_merge_versions(destination, source, journal, baseline);
   bool correlated = destination->correlated || source->correlated;
-  if (correlated && journal->named_closes) {
-    destination->correlated = true;
-    dep_route_iterator_t iterator = dep_route_iterator(source);
-    uint32_t root;
-    while (dep_route_next(&iterator, journal, &root))
-      if (!dep_route_state_add_root(destination, journal, root))
-        return false;
-    return true;
-  }
+  if (correlated && journal->named_closes)
+    return dep_fd_merge_versions(destination, source, journal, baseline);
   dep_route_state_t collapsed = dep_route_state_single(destination->root);
   dep_route_iterator_t iterator = dep_route_iterator(destination);
   /* The primary version is already represented by collapsed. */
@@ -10978,6 +17594,45 @@ static SHELL_NONNULL(1, 2, 3,
   }
   return true;
 }
+
+/* A path which has not needed a symbolic relation still contributes all of
+ * its ordinary occupancy possibilities when joined with a refined path. */
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+static SHELL_NONNULL(1) bool dep_test_domain_joins(
+    dep_route_workspace_t *workspace) {
+  dep_route_journal_t *journal = &workspace->route_journal;
+  const dep_owner_routes_t baseline = {0};
+  for (unsigned reverse = 0; reverse < 2; reverse++) {
+    dep_route_journal_reset(journal);
+    journal->process_scratch = &workspace->process_scratch;
+    dep_process_domain_pool_t *pool = &journal->process_domains;
+    uint32_t initial = 1;
+    for (uint32_t fd = 3; fd-- != 0;)
+      initial = dep_process_domain_node(pool, fd, initial, 0);
+    uint32_t constrained = dep_process_domain_apply(
+        pool, 0, initial, dep_process_domain_node(pool, 10, 0, 1));
+    dep_route_state_t ordinary = {0}, refined = {0};
+    if (constrained == UINT32_MAX ||
+        !dep_allocation_select(&refined, journal, constrained))
+      return false;
+    dep_route_state_t joined = reverse ? refined : ordinary;
+    if (!dep_fd_merge(&joined, reverse ? &ordinary : &refined, journal,
+                      &baseline))
+      return false;
+    dep_route_set_t domain =
+        dep_fd_raw_fact(&joined, journal, &baseline, dep_fd_numeric(0),
+                        DEP_FD_ACCESS_PROCESS_DOMAIN);
+    if (dep_route_state_count(&joined) != 1 || domain.count != 1 ||
+        domain.routes[0].value != initial ||
+        !dep_process_domain_evaluate(pool, domain.routes[0].value, 0) ||
+        !dep_process_domain_evaluate(pool, domain.routes[0].value,
+                                     UINT64_C(1) << 10) ||
+        dep_process_domain_evaluate(pool, domain.routes[0].value, 1))
+      return false;
+  }
+  return true;
+}
+#endif
 
 static SHELL_NONNULL(1, 4,
                      5) bool dep_fd_add(dep_fd_flow_t *flow, unsigned outcome,
@@ -11045,6 +17700,103 @@ static SHELL_NONNULL(1, 2) uint8_t
                                       : DEP_STATUS_EITHER;
 }
 
+static SHELL_NONNULL(1) bool dep_fd_private(const dep_parse_context_t *context,
+                                            uint32_t event) {
+  return event < SHELL_MAX_GROUPS
+             ? context->group_exec[event].isolated
+             : context->execution->pipeline
+                   .local_process[event - SHELL_MAX_GROUPS];
+}
+
+static SHELL_NONNULL(1) bool dep_fd_outgoing_pipeline(
+    const dep_parse_context_t *context, uint32_t event) {
+  const shell_pipeline_index_t *pipeline = &context->execution->pipeline;
+  return event < SHELL_MAX_GROUPS
+             ? pipeline->group_tail[event].has_pipeline
+             : pipeline->range_successor[event - SHELL_MAX_GROUPS] ==
+                   SHELL_TYPE_PIPELINE;
+}
+
+/* Tag each actual entry alternative before installing child pipes, capturing
+ * words or applying redirects. Nested private scopes use distinct event keys;
+ * restoring the immutable root also restores the enclosing scope's tag.
+ * Joins keep distinct origins separate until their outcomes are projected.
+ */
+static SHELL_NONNULL(1, 2, 3) bool dep_fd_private_begin(
+    dep_route_state_t *state, dep_route_journal_t *journal,
+    const dep_owner_routes_t *baseline, uint32_t event) {
+  dep_route_state_t tagged = {0};
+  dep_route_iterator_t iterator = dep_route_iterator(state);
+  uint32_t root;
+  bool first = true;
+  while (dep_route_next(&iterator, journal, &root)) {
+    dep_route_state_t one = dep_route_state_single(root);
+    uint32_t owned = dep_process_owned_root(&one, journal);
+    dep_route_state_t returned = one;
+    if (owned && event != DEP_OBSERVATION_ROOT_EVENT) {
+      if (event < SHELL_MAX_GROUPS &&
+          !dep_process_fork_parent(&returned, journal, baseline, owned))
+        return false;
+      if (!dep_route_state_store_access(
+              &one, journal, dep_fd_numeric(SHELL_DEP_FD_NONE),
+              DEP_FD_ACCESS_PROCESS_OWNED, (dep_route_set_t){.ready = true}))
+        return false;
+      if (event < SHELL_MAX_GROUPS &&
+          !dep_route_state_store_access(
+              &returned, journal, dep_fd_numeric(SHELL_DEP_FD_NONE),
+              DEP_FD_ACCESS_PROCESS_OWNED, (dep_route_set_t){.ready = true}))
+        return false;
+    }
+    dep_route_set_t origin = {0};
+    dep_route_set_set(&origin,
+                      (dep_fd_route_t){DEP_ROUTE_INHERITED, returned.root});
+    if (!dep_route_state_store_access(&one, journal, dep_fd_numeric(event),
+                                      DEP_FD_ACCESS_PRIVATE_ENTRY, origin))
+      return false;
+    dep_route_set_t scope = {0};
+    dep_route_set_set(&scope, (dep_fd_route_t){DEP_ROUTE_INHERITED, event + 1});
+    if (!dep_route_state_store_access(&one, journal,
+                                      dep_fd_numeric(SHELL_DEP_FD_NONE),
+                                      DEP_FD_ACCESS_PRIVATE_SCOPE, scope))
+      return false;
+    if (first) {
+      tagged = one;
+      first = false;
+    } else if (!dep_route_state_add_root(&tagged, journal, one.root))
+      return false;
+  }
+  tagged.correlated = state->correlated;
+  *state = tagged;
+  return true;
+}
+
+/* state is a completed alternative from this event's private_begin frame.
+ * Project observations/status, never child bindings or local setup. Immutable
+ * origins avoid matching a child against an unrelated parent version, and do
+ * not infer parent availability from a descriptor opened in the child.
+ */
+static SHELL_NONNULL(1, 2, 3, 5) bool dep_fd_private_project(
+    const dep_route_state_t *state, dep_route_journal_t *journal,
+    const dep_owner_routes_t *baseline, uint32_t event,
+    dep_route_state_t *projected) {
+  dep_route_iterator_t iterator = dep_route_iterator(state);
+  uint32_t root;
+  bool first = true;
+  while (dep_route_next(&iterator, journal, &root)) {
+    dep_route_state_t one = dep_route_state_single(root);
+    dep_route_set_t origin =
+        dep_fd_raw_fact(&one, journal, baseline, dep_fd_numeric(event),
+                        DEP_FD_ACCESS_PRIVATE_ENTRY);
+    dep_route_state_t parent = dep_route_state_single(origin.routes[0].value);
+    if (first) {
+      *projected = parent;
+      first = false;
+    } else if (!dep_fd_merge(projected, &parent, journal, baseline))
+      return false;
+  }
+  return true;
+}
+
 static SHELL_NONNULL(1, 2, 4, 5, 6) bool dep_fd_begin(
     const dep_parse_context_t *context, dep_fd_stream_t *stream, uint32_t event,
     dep_route_journal_t *journal, const dep_owner_routes_t *baseline,
@@ -11072,12 +17824,21 @@ static SHELL_NONNULL(1, 2, 4, 5, 6) bool dep_fd_begin(
     stream->async_entry[event] = *flow;
     if (context->async->wrapper[event]) {
       for (unsigned outcome = 0; outcome < 2; outcome++)
-        if ((flow->mask & (1u << outcome)) &&
-            !dep_async_stdin(&flow->state[outcome], journal, baseline,
-                             context->effects_active &&
-                                 (dep_fd_run_mask(context, stream, event) &
-                                  (1u << outcome))))
-          return false;
+        if (flow->mask & (1u << outcome)) {
+          bool executing =
+              (dep_fd_run_mask(context, stream, event) & (1u << outcome)) != 0;
+          if (executing &&
+              (!dep_process_cleanup(&stream->async_entry[event].state[outcome],
+                                    journal, baseline) ||
+               !dep_route_state_store_access(&flow->state[outcome], journal,
+                                             dep_fd_numeric(SHELL_DEP_FD_NONE),
+                                             DEP_FD_ACCESS_PROCESS_OWNED,
+                                             (dep_route_set_t){.ready = true})))
+            return false;
+          if (!dep_async_stdin(&flow->state[outcome], journal, baseline,
+                               context->effects_active && executing))
+            return false;
+        }
     }
   }
   uint16_t connector =
@@ -11088,16 +17849,38 @@ static SHELL_NONNULL(1, 2, 4, 5, 6) bool dep_fd_begin(
     stream->entry[event] = stream->entry[stream->pipeline_event[scope] - 1];
   } else {
     stream->entry[event] = *flow;
-    bool outgoing = event < SHELL_MAX_GROUPS
-                        ? pipeline->group_tail[event].has_pipeline
-                        : pipeline->range_successor[event - SHELL_MAX_GROUPS] ==
-                              SHELL_TYPE_PIPELINE;
+    bool outgoing = dep_fd_outgoing_pipeline(context, event);
     stream->pipeline_event[scope] = outgoing ? event + 1 : 0;
   }
   if (!dep_fd_select(&stream->entry[event],
                      dep_fd_run_mask(context, stream, event), journal, baseline,
                      selected))
     return false;
+  if (dep_fd_private(context, event) &&
+      !dep_fd_private_begin(selected, journal, baseline, event))
+    return false;
+  if (event < SHELL_MAX_GROUPS && dep_fd_private(context, event)) {
+    /* A following pipeline stage forks from the parent *after* compound-fork
+     * process-end cleanup, not from the first stage's untouched entry table.
+     * The current child's selected version was captured before that cleanup.
+     */
+    uint32_t first = stream->pipeline_event[scope]
+                         ? stream->pipeline_event[scope] - 1
+                         : event;
+    uint8_t run = dep_fd_run_mask(context, stream, event);
+    for (unsigned outcome = 0; outcome < 5; outcome++)
+      if ((stream->entry[first].mask & run & (1u << outcome)) &&
+          !dep_process_cleanup(&stream->entry[first].state[outcome], journal,
+                               baseline))
+        return false;
+    stream->entry[event] = stream->entry[first];
+    if (async_unit == event + 1 && !context->async->wrapper[event])
+      for (unsigned outcome = 0; outcome < 5; outcome++)
+        if ((stream->async_entry[event].mask & run & (1u << outcome)) &&
+            !dep_process_cleanup(&stream->async_entry[event].state[outcome],
+                                 journal, baseline))
+          return false;
+  }
   stream->selected[event] = *selected;
   return true;
 }
@@ -11112,14 +17895,27 @@ static SHELL_NONNULL(1, 2, 4, 5, 6) bool dep_fd_finish(
   result.mask &= (uint8_t)~run;
   if (entry->mask & run)
     for (unsigned i = 0; i < 5; i++)
-      if ((executed->mask & (1u << i)) &&
-          !dep_fd_add(&result, i, executed->state[i], journal, baseline))
-        return false;
+      if (executed->mask & (1u << i)) {
+        dep_route_state_t returned = executed->state[i];
+        if (!dep_fd_retire_owner_facts(context, event, &returned, journal,
+                                       baseline) ||
+            (dep_fd_private(context, event) &&
+             !dep_fd_private_project(&returned, journal, baseline, event,
+                                     &returned)) ||
+            !dep_fd_add(&result, i, returned, journal, baseline))
+          return false;
+      }
   if (executed->mask & DEP_STATUS_EXIT_INCOMING)
     for (unsigned i = 0; i < 2; i++)
-      if ((entry->mask & run & (1u << i)) &&
-          !dep_fd_add(&result, i + 2, entry->state[i], journal, baseline))
-        return false;
+      if (entry->mask & run & (1u << i)) {
+        unsigned target = i + 2;
+        if (dep_fd_private(context, event))
+          target = i ^ (context->fast->cmds[event - SHELL_MAX_GROUPS]
+                            .pipeline_negation_count &
+                        1u);
+        if (!dep_fd_add(&result, target, entry->state[i], journal, baseline))
+          return false;
+      }
   stream->scope[dep_snapshot_event_group(context, event) + 1] = result;
   uint32_t unit = context->async->unit[event];
   if (unit && context->async->last[unit - 1] == event) {
@@ -11137,7 +17933,24 @@ static SHELL_NONNULL(1, 2, 4, 5, 6) bool dep_fd_finish(
         return false;
     }
     stream->scope[dep_snapshot_event_group(context, event) + 1] = result;
+    stream->async_entry[unit - 1] = (dep_fd_flow_t){0};
   }
+  /* Per-event entries are live only while that event is being completed. A
+   * pipeline additionally retains its first entry until the final stage, since
+   * every stage starts from the same pre-pipeline shell state. Clearing dead
+   * slots here lets bounded domain collection reclaim terminal alternatives
+   * instead of retaining the whole historical event stream. */
+  uint32_t scope = (uint32_t)(dep_snapshot_event_group(context, event) + 1);
+  uint32_t first =
+      stream->pipeline_event[scope] ? stream->pipeline_event[scope] - 1 : event;
+  bool outgoing = dep_fd_outgoing_pipeline(context, event);
+  if (event != first)
+    stream->entry[event] = (dep_fd_flow_t){0};
+  if (!outgoing) {
+    stream->entry[first] = (dep_fd_flow_t){0};
+    stream->pipeline_event[scope] = 0;
+  }
+  stream->selected[event] = (dep_route_state_t){0};
   return true;
 }
 
@@ -11148,18 +17961,29 @@ static SHELL_NONNULL(1, 2, 3, 4) bool dep_fd_materialize_tree(
   if (!root)
     return true;
   const dep_route_change_t *change = &journal->entries[root - 1];
+  dep_fd_ref_t fd = dep_route_change_fd(journal, change);
   if (!dep_fd_materialize_tree(state, journal, baseline, destination,
                                change->left))
     return false;
-  if (change->access <= DEP_FD_ACCESS_BINDING &&
-      dep_fd_bound(state, journal, baseline, change->fd)) {
-    dep_fd_route_entry_t *slot = dep_route_slot(destination, change->fd, true);
+  if (dep_route_change_access(change) == DEP_FD_ACCESS_NAMED_BINDINGS &&
+      journal->snapshots[change->snapshot - 1].routes[0].value &&
+      journal
+          ->entries[journal->snapshots[change->snapshot - 1].routes[0].value -
+                    1]
+          .named_live &&
+      !dep_fd_materialize_tree(
+          state, journal, baseline, destination,
+          journal->snapshots[change->snapshot - 1].routes[0].value))
+    return false;
+  if (dep_route_change_access(change) <= DEP_FD_ACCESS_BINDING &&
+      dep_fd_bound(state, journal, baseline, fd)) {
+    dep_fd_route_entry_t *slot = dep_route_slot(destination, fd, true);
     if (!slot)
       return false;
-    slot->read_route = dep_fd_materialized_route(
-        state, journal, baseline, change->fd, DEP_FD_ACCESS_READ);
-    slot->write_route = dep_fd_materialized_route(
-        state, journal, baseline, change->fd, DEP_FD_ACCESS_WRITE);
+    slot->read_route = dep_fd_materialized_route(state, journal, baseline, fd,
+                                                 DEP_FD_ACCESS_READ);
+    slot->write_route = dep_fd_materialized_route(state, journal, baseline, fd,
+                                                  DEP_FD_ACCESS_WRITE);
   }
   return dep_fd_materialize_tree(state, journal, baseline, destination,
                                  change->right);
@@ -11169,6 +17993,7 @@ static SHELL_NONNULL(1, 2, 3, 4) bool dep_fd_materialize(
     const dep_route_state_t *state, const dep_route_journal_t *journal,
     const dep_owner_routes_t *baseline, dep_owner_routes_t *destination) {
   destination->fd_count = destination->root = 0;
+  destination->scalar_imports = baseline->scalar_imports;
   for (uint32_t i = 0; i < baseline->fd_count; i++) {
     dep_fd_ref_t fd = baseline->fd[i].fd;
     if (dep_fd_bound(state, journal, baseline, fd)) {
@@ -11194,119 +18019,458 @@ static SHELL_NONNULL(1, 2, 3, 4) bool dep_fd_materialize(
 /* Reconcile immutable map versions by shared subtree identity. Ordinary
  * straight-line updates touch only their AVL paths, not every inherited FD.
  * Tree rotations fall back to the changed subtree, never source replay. */
-static SHELL_NONNULL(1, 2, 3, 4, 5) bool dep_fd_materialize_delta(
-    const dep_route_state_t *state, const dep_route_state_t *previous,
-    const dep_route_journal_t *journal, const dep_owner_routes_t *baseline,
-    dep_owner_routes_t *destination, uint32_t root, uint32_t old_root,
-    bool reverse) {
+static SHELL_NONNULL(1, 2, 3, 4) bool dep_fd_materialize_key(
+    const dep_route_state_t *state, const dep_route_journal_t *journal,
+    const dep_owner_routes_t *baseline, dep_owner_routes_t *destination,
+    dep_fd_ref_t fd) {
+  dep_fd_route_entry_t *slot = dep_route_slot(destination, fd, false);
+  if (!dep_fd_bound(state, journal, baseline, fd)) {
+    if (slot)
+      dep_route_remove(destination, (uint32_t)(slot - destination->fd));
+    return true;
+  }
+  slot = dep_route_slot(destination, fd, true);
+  if (!slot)
+    return false;
+  slot->read_route = dep_fd_materialized_route(state, journal, baseline, fd,
+                                               DEP_FD_ACCESS_READ);
+  slot->write_route = dep_fd_materialized_route(state, journal, baseline, fd,
+                                                DEP_FD_ACCESS_WRITE);
+  return true;
+}
+
+/* Named keys sort after physical/private numeric slots. Query the immutable
+ * baseline's index rather than walking it for each proof-only map change. */
+static SHELL_NONNULL(1) bool dep_routes_have_named(
+    const dep_owner_routes_t *routes) {
+  uint32_t last = routes->root;
+  if (!last)
+    return false;
+  while (routes->index[last - 1].right)
+    last = routes->index[last - 1].right;
+  return routes->fd[last - 1].fd.value == SHELL_DEP_FD_NAMED;
+}
+
+/* opposite is the complete opposite version, even while root/old_root descend
+ * into child subtrees or the named-scalar map. Queries use the final union,
+ * never an arbitrarily chosen primary branch of the previous union. */
+static SHELL_NONNULL(1, 2, 3, 4) bool dep_fd_materialize_delta(
+    const dep_route_state_t *state, const dep_route_journal_t *journal,
+    const dep_owner_routes_t *baseline, dep_owner_routes_t *destination,
+    uint32_t root, uint32_t old_root, uint32_t opposite) {
   if (!root || root == old_root)
     return true;
   const dep_route_change_t *change = &journal->entries[root - 1];
+  dep_fd_ref_t fd = dep_route_change_fd(journal, change);
+  dep_fd_access_t access = dep_route_change_access(change);
   const dep_route_change_t *old =
       old_root ? &journal->entries[old_root - 1] : NULL;
-  if (old && (dep_fd_ref_compare(change->fd, old->fd) != 0 ||
-              change->access != old->access))
-    old = dep_route_root_change(old_root, journal, change->fd, change->access);
+  if (old && (dep_fd_ref_compare(fd, dep_route_change_fd(journal, old)) != 0 ||
+              access != dep_route_change_access(old)))
+    old = dep_route_map_change(old_root, journal, fd, access);
   if (!old)
-    old = dep_route_state_change(reverse ? state : previous, journal,
-                                 change->fd, change->access);
+    old = dep_route_root_change(opposite, journal, fd, access);
   if (old == change)
     return true;
-  bool same_key = old && dep_fd_ref_compare(change->fd, old->fd) == 0 &&
-                  change->access == old->access;
-  if (!dep_fd_materialize_delta(state, previous, journal, baseline, destination,
+  bool same_key =
+      old && dep_fd_ref_compare(fd, dep_route_change_fd(journal, old)) == 0 &&
+      access == dep_route_change_access(old);
+  if (!dep_fd_materialize_delta(state, journal, baseline, destination,
                                 change->left, same_key ? old->left : 0,
-                                reverse))
+                                opposite))
     return false;
   const dep_route_change_t *prior =
-      same_key ? old
-               : dep_route_state_change(reverse ? state : previous, journal,
-                                        change->fd, change->access);
-  if (change->access <= DEP_FD_ACCESS_BINDING &&
+      same_key ? old : dep_route_root_change(opposite, journal, fd, access);
+  if (access == DEP_FD_ACCESS_NAMED_BINDINGS &&
       (!prior || prior->snapshot != change->snapshot)) {
-    dep_fd_route_entry_t *slot = dep_route_slot(destination, change->fd, false);
-    if (!dep_fd_bound(state, journal, baseline, change->fd)) {
-      if (slot)
-        dep_route_remove(destination, (uint32_t)(slot - destination->fd));
-    } else {
-      slot = dep_route_slot(destination, change->fd, true);
-      if (!slot)
-        return false;
-      slot->read_route = dep_fd_materialized_route(
-          state, journal, baseline, change->fd, DEP_FD_ACCESS_READ);
-      slot->write_route = dep_fd_materialized_route(
-          state, journal, baseline, change->fd, DEP_FD_ACCESS_WRITE);
-    }
+    uint32_t names = journal->snapshots[change->snapshot - 1].routes[0].value;
+    uint32_t previous_names =
+        prior ? journal->snapshots[prior->snapshot - 1].routes[0].value : 0;
+    if ((dep_routes_have_named(baseline) ||
+         (names && journal->entries[names - 1].named_live) ||
+         (previous_names && journal->entries[previous_names - 1].named_live)) &&
+        !dep_fd_materialize_delta(state, journal, baseline, destination, names,
+                                  previous_names, opposite))
+      return false;
+    dep_route_kind_t fallback =
+        journal->snapshots[change->snapshot - 1].routes[0].kind;
+    dep_route_kind_t old_fallback =
+        prior ? journal->snapshots[prior->snapshot - 1].routes[0].kind
+              : DEP_ROUTE_INHERITED;
+    if (fallback != old_fallback)
+      for (uint32_t i = 0; i < baseline->fd_count; i++)
+        if (baseline->fd[i].fd.value == SHELL_DEP_FD_NAMED &&
+            !dep_fd_materialize_key(state, journal, baseline, destination,
+                                    baseline->fd[i].fd))
+          return false;
   }
-  return dep_fd_materialize_delta(state, previous, journal, baseline,
-                                  destination, change->right,
-                                  same_key ? old->right : 0, reverse);
+  if (access <= DEP_FD_ACCESS_BINDING &&
+      (!prior || prior->snapshot != change->snapshot)) {
+    if (!dep_fd_materialize_key(state, journal, baseline, destination, fd))
+      return false;
+  }
+  return dep_fd_materialize_delta(state, journal, baseline, destination,
+                                  change->right, same_key ? old->right : 0,
+                                  opposite);
 }
+
+static SHELL_NONNULL(1, 2) bool dep_route_has_root(
+    const dep_route_state_t *state, const dep_route_journal_t *journal,
+    uint32_t root) {
+  if (state->root == root)
+    return true;
+  uint32_t cursor = state->membership_root;
+  while (cursor) {
+    DEP_METADATA_WORK(SHELLSPLIT_TEST_WORK_ROUTE_MEMBERSHIP);
+    const dep_route_member_t *member = &journal->members[cursor - 1];
+    if (member->value == root)
+      return true;
+    cursor = root < member->value ? member->left : member->right;
+  }
+  return false;
+}
+
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+static _Thread_local bool dep_materialization_reference;
+static _Thread_local dep_owner_routes_t dep_materialization_source;
+
+void shellsplit_test_materialization_reference(bool enabled) {
+  dep_materialization_reference = enabled;
+}
+
+/* The reference path deliberately does not pair immutable AVL subtrees. Copy
+ * the previous concrete image, collect every explicit key in both versions,
+ * then recompute those keys from the new state. A named-map fallback changes
+ * every materialized named binding, including source-only bindings which have
+ * no explicit entry in either tree, so include those keys when such a map is
+ * present. This is test-only and intentionally linear in the retained state. */
+static SHELL_NONNULL(1, 2, 4) bool dep_fd_collect_materialize_keys(
+    const dep_route_journal_t *journal, dep_owner_routes_t *keys, uint32_t root,
+    bool *named_fallback) {
+  if (!root)
+    return true;
+  const dep_route_change_t *change = &journal->entries[root - 1];
+  if (!dep_fd_collect_materialize_keys(journal, keys, change->left,
+                                       named_fallback))
+    return false;
+  dep_fd_access_t access = dep_route_change_access(change);
+  if (access == DEP_FD_ACCESS_NAMED_BINDINGS) {
+    *named_fallback = true;
+    uint32_t names = journal->snapshots[change->snapshot - 1].routes[0].value;
+    if (!dep_fd_collect_materialize_keys(journal, keys, names, named_fallback))
+      return false;
+  }
+  if (access <= DEP_FD_ACCESS_BINDING &&
+      !dep_route_slot(keys, dep_route_change_fd(journal, change), true))
+    return false;
+  return dep_fd_collect_materialize_keys(journal, keys, change->right,
+                                         named_fallback);
+}
+
+static SHELL_NONNULL(1, 2, 3, 4, 5, 6) bool dep_fd_materialize_reference(
+    const dep_route_state_t *state, const dep_route_state_t *previous,
+    const dep_route_journal_t *journal, const dep_owner_routes_t *baseline,
+    const dep_owner_routes_t *source, dep_owner_routes_t *destination) {
+  if (state->truncated || previous->truncated)
+    return false;
+  dep_copy_routes(&dep_materialization_source, source);
+  destination->fd_count = destination->root = 0;
+  destination->scalar_imports = baseline->scalar_imports;
+  bool named_fallback = false;
+  dep_route_iterator_t versions = dep_route_iterator(state);
+  uint32_t root;
+  while (dep_route_next(&versions, journal, &root))
+    if (!dep_fd_collect_materialize_keys(journal, destination, root,
+                                         &named_fallback))
+      return false;
+  versions = dep_route_iterator(previous);
+  while (dep_route_next(&versions, journal, &root))
+    if (!dep_fd_collect_materialize_keys(journal, destination, root,
+                                         &named_fallback))
+      return false;
+  for (uint32_t i = 0; i < baseline->fd_count; i++)
+    if (!dep_route_slot(destination, baseline->fd[i].fd, true))
+      return false;
+  if (named_fallback)
+    for (uint32_t i = 0; i < dep_materialization_source.fd_count; i++)
+      if (dep_materialization_source.fd[i].fd.value == SHELL_DEP_FD_NAMED &&
+          !dep_route_slot(destination, dep_materialization_source.fd[i].fd,
+                          true))
+        return false;
+  for (uint32_t i = 0; i < destination->fd_count; i++)
+    if (!dep_fd_materialize_key(state, journal, baseline,
+                                &dep_materialization_source,
+                                destination->fd[i].fd))
+      return false;
+  dep_copy_routes(destination, &dep_materialization_source);
+  return true;
+}
+#endif
 
 /* destination may be source for an in-place scope advance. */
 static SHELL_NONNULL(1, 2, 3, 4, 5, 6) bool dep_fd_materialize_from(
     const dep_route_state_t *state, const dep_route_state_t *previous,
     const dep_route_journal_t *journal, const dep_owner_routes_t *baseline,
     const dep_owner_routes_t *source, dep_owner_routes_t *destination) {
-  if (state->alternative_count || previous->alternative_count)
-    return dep_fd_materialize(state, journal, baseline, destination);
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+  if (dep_materialization_reference)
+    return dep_fd_materialize_reference(state, previous, journal, baseline,
+                                        source, destination);
+#endif
   if (destination != source)
     dep_copy_routes(destination, source);
-  return !state->truncated &&
-         dep_fd_materialize_delta(state, previous, journal, baseline,
-                                  destination, state->root, previous->root,
-                                  false) &&
-         dep_fd_materialize_delta(state, previous, journal, baseline,
-                                  destination, previous->root, state->root,
-                                  true);
-}
-
-/* Update only prepared mutation targets. NULL after means null-command
- * assignment commits: matched variables lose their allocation proof without
- * materializing a second descriptor table. Otherwise after is the completed
- * table and only bindings actually removed from it lose that proof. */
-static SHELL_NONNULL(1, 2, 3, 5) bool dep_fd_mutation_bindings(
-    dep_route_state_t *state, dep_route_journal_t *journal,
-    const dep_owner_routes_t *before, const dep_owner_routes_t *after,
-    const dep_named_mutations_t *mutations) {
-  uint32_t targets = mutations->clear ? before->fd_count : mutations->count;
-  for (uint32_t i = 0; i < targets; i++) {
-    const dep_fd_route_entry_t *target =
-        mutations->clear
-            ? &before->fd[i]
-            : dep_named_effect_target(before, &mutations->effects[i]);
-    if (!target)
-      continue;
-    dep_fd_ref_t fd = target->fd;
-    if (!dep_named_mutation_affects(mutations, fd) ||
-        (after && dep_route_find(after, fd)))
-      continue;
-    dep_route_set_t bound = {0};
-    dep_route_set_set(&bound, (dep_fd_route_t){DEP_ROUTE_DYNAMIC, UINT32_MAX});
-    if (!dep_route_state_store_access(state, journal, fd, DEP_FD_ACCESS_BINDING,
-                                      bound))
+  if (state->truncated)
+    return false;
+  /* Unchanged alternatives contribute the same union. Pair only the unmatched
+   * roots, then reconcile their changed subtrees in both directions. A repeated
+   * arbitrary writer must not rebuild a large unchanged failure alternative. */
+  uint32_t added[DEP_ROUTE_STATE_CAPACITY], removed[DEP_ROUTE_STATE_CAPACITY];
+  uint32_t added_count = 0, removed_count = 0, root;
+  dep_route_iterator_t versions = dep_route_iterator(state);
+  while (dep_route_next(&versions, journal, &root))
+    if (!dep_route_has_root(previous, journal, root))
+      added[added_count++] = root;
+  versions = dep_route_iterator(previous);
+  while (dep_route_next(&versions, journal, &root))
+    if (!dep_route_has_root(state, journal, root))
+      removed[removed_count++] = root;
+  uint32_t count = added_count > removed_count ? added_count : removed_count;
+  for (uint32_t i = 0; i < count; i++) {
+    uint32_t current = i < added_count ? added[i] : 0;
+    uint32_t prior = i < removed_count ? removed[i] : 0;
+    if (!dep_fd_materialize_delta(state, journal, baseline, destination,
+                                  current, prior, prior) ||
+        !dep_fd_materialize_delta(state, journal, baseline, destination, prior,
+                                  current, current))
       return false;
   }
   return true;
 }
 
-/* Record changes in the proof domain as well as route changes. A removed
- * binding must remain absent in every later version until reallocated. */
-static SHELL_NONNULL(1, 2, 3, 4, 7) bool dep_fd_bindings(
+/* Explicit targets have a prepared observation key even before the first
+ * allocation of that name. Bulk writes reset the scalar map instead of
+ * enumerating this source-wide inventory. index is below mutations->count. */
+static SHELL_NONNULL(1, 2, 3) dep_fd_ref_t
+    dep_mutation_binding_target(const dep_named_mutations_t *mutations,
+                                const dep_owner_routes_t *before,
+                                const dep_route_journal_t *journal,
+                                uint32_t index) {
+  const dep_named_effect_t *effect = &mutations->effects[index];
+  if (effect->variable)
+    return dep_variable_ref(effect->variable);
+  if (effect->observation)
+    return journal->read_observations.entries[effect->observation - 1].fd;
+  const dep_fd_route_entry_t *target = dep_named_effect_target(before, effect);
+  return target ? target->fd : dep_fd_numeric(SHELL_DEP_FD_NONE);
+}
+
+/* Effect state belongs to each immutable execution version. Representative
+ * before/after tables enumerate changed names but cannot prove whether one
+ * version still has a live named binding. Preserve an existing orphan's
+ * original scope: Bash does not close its physical descriptor on a redundant
+ * unset. A successful named allocation clears that marker in the setup path.
+ * variable is the resettable predefined registry identity, or zero for an
+ * ordinary unset. Its capability mask is separate from named orphan facts so
+ * descendants inherit attributes without importing journal-local scopes. */
+static SHELL_NONNULL(1, 2, 3) bool dep_fd_note_unset_effects(
     dep_route_state_t *state, dep_route_journal_t *journal,
-    const dep_owner_routes_t *before, const dep_owner_routes_t *after,
-    const dep_fd_op_t *ops, uint32_t op_count,
+    const dep_owner_routes_t *baseline, dep_fd_ref_t fd, uint8_t variable,
+    uint8_t scope) {
+  dep_route_state_t previous = *state;
+  dep_route_state_t updated = {0};
+  dep_route_iterator_t versions = dep_route_iterator(&previous);
+  uint32_t count = dep_route_state_count(&previous);
+  for (uint32_t path = 0; path < count; path++) {
+    dep_route_state_t one =
+        dep_route_state_single(dep_route_take(&versions, journal));
+    dep_route_set_t marker = dep_fd_raw_fact(&one, journal, baseline, fd,
+                                             DEP_FD_ACCESS_EFFECT_STATE);
+    dep_route_set_t binding =
+        dep_fd_raw_fact(&one, journal, baseline, fd, DEP_FD_ACCESS_BINDING);
+    bool was_despecialized = false;
+    if (variable) {
+      dep_route_set_t capabilities = dep_fd_raw_fact(
+          &one, journal, baseline, dep_fd_numeric(DEP_VARIABLE_STATE_EVENT),
+          DEP_FD_ACCESS_EFFECT_STATE);
+      uint32_t word = (variable - 1u) / 32u;
+      uint32_t bit = UINT32_C(1) << ((variable - 1u) % 32u);
+      if (!capabilities.count) {
+        capabilities.count = 2;
+        capabilities.routes[0] = capabilities.routes[1] =
+            (dep_fd_route_t){DEP_ROUTE_INHERITED, 0};
+      }
+      was_despecialized = (capabilities.routes[word].value & bit) != 0;
+      if (!was_despecialized) {
+        capabilities.routes[word].value |= bit;
+        if (!dep_route_state_append_one(
+                &one, journal, dep_fd_numeric(DEP_VARIABLE_STATE_EVENT),
+                DEP_FD_ACCESS_EFFECT_STATE, capabilities)) {
+          state->truncated = true;
+          return false;
+        }
+      }
+    }
+    bool live = false;
+    for (uint32_t route = 0; route < binding.count; route++)
+      live |= binding.routes[route].kind == DEP_ROUTE_INHERITED ||
+              binding.routes[route].kind == DEP_ROUTE_ALIAS;
+    /* A resettable predefined variable has an inherited scalar/array binding,
+     * not an inherited named descriptor. Its first unset establishes the
+     * distinction; only a later binding can own an allocation. */
+    if (variable && !was_despecialized)
+      live = false;
+
+    uint32_t additions = 0;
+    if (live)
+      additions |= DEP_EFFECT_STATE_ORPHANED_ALLOCATION |
+                   ((uint32_t)scope << DEP_EFFECT_STATE_SCOPE_SHIFT);
+    bool changed = false;
+    if (additions) {
+      if (!marker.count) {
+        dep_route_set_set(&marker,
+                          (dep_fd_route_t){DEP_ROUTE_INHERITED, additions});
+        changed = true;
+      } else {
+        for (uint32_t route = 0; route < marker.count; route++) {
+          uint32_t prior = marker.routes[route].value;
+          if ((additions & DEP_EFFECT_STATE_ORPHANED_ALLOCATION) &&
+              !(marker.routes[route].value &
+                DEP_EFFECT_STATE_ORPHANED_ALLOCATION))
+            marker.routes[route].value |= additions;
+          changed |= marker.routes[route].value != prior;
+        }
+      }
+    }
+    if (changed) {
+      if (!dep_route_state_append_one(&one, journal, fd,
+                                      DEP_FD_ACCESS_EFFECT_STATE, marker)) {
+        state->truncated = true;
+        return false;
+      }
+    }
+    if (path == 0)
+      updated.root = one.root;
+    else if (!dep_route_state_add_root(&updated, journal, one.root)) {
+      state->truncated = true;
+      return false;
+    }
+  }
+  updated.truncated = previous.truncated;
+  updated.correlated = previous.correlated;
+  *state = updated;
+  return true;
+}
+
+/* Update prepared mutation targets, including observed variables which have
+ * never named an allocation. A stable explicit unset establishes emptiness;
+ * ordinary writes invalidate that value just like an allocation association.
+ * NULL after means null-command assignment commits. Other unobserved targets
+ * retain the existing before/after route-removal contract. */
+static SHELL_NONNULL(1, 2, 3, 4, 6) bool dep_fd_mutation_bindings(
+    dep_route_state_t *state, dep_route_journal_t *journal,
+    const dep_owner_routes_t *baseline, const dep_owner_routes_t *before,
+    const dep_owner_routes_t *after, const dep_named_mutations_t *mutations) {
+  if (mutations->clear) {
+    dep_route_state_t result = {0};
+    dep_route_iterator_t versions = dep_route_iterator(state);
+    uint32_t root;
+    bool ready = false;
+    while (dep_route_next(&versions, journal, &root)) {
+      DEP_METADATA_WORK(SHELLSPLIT_TEST_WORK_BINDING_INVALIDATION);
+      dep_route_state_t original = dep_route_state_single(root);
+      dep_route_state_t cleared = original;
+      dep_route_set_t holder = {0};
+      dep_route_set_set(&holder, (dep_fd_route_t){DEP_ROUTE_DYNAMIC, 0});
+      if (!dep_route_state_append_one(&cleared, journal, dep_fd_numeric(0),
+                                      DEP_FD_ACCESS_NAMED_BINDINGS, holder))
+        return false;
+      const dep_prefix_assignment_set_t *prefixes =
+          mutations->restored_prefixes;
+      for (uint32_t p = 0; prefixes && p < prefixes->count; p++) {
+        DEP_METADATA_WORK(SHELLSPLIT_TEST_WORK_BINDING_INVALIDATION);
+        dep_fd_ref_t fd = {.name = prefixes->names[p].start,
+                           .name_len = prefixes->names[p].len,
+                           .value = SHELL_DEP_FD_NAMED};
+        if (!dep_route_state_append_one(
+                &cleared, journal, fd, DEP_FD_ACCESS_BINDING,
+                dep_fd_raw_fact(&original, journal, baseline, fd,
+                                DEP_FD_ACCESS_BINDING)))
+          return false;
+      }
+      if (!dep_read_state_add(&result, ready, &cleared, journal, baseline))
+        return false;
+      ready = true;
+    }
+    result.correlated |= state->correlated;
+    *state = result;
+    return true;
+  }
+  uint32_t targets = mutations->count;
+  for (uint32_t i = 0; i < targets; i++) {
+    dep_fd_ref_t fd =
+        dep_mutation_binding_target(mutations, before, journal, i);
+    const dep_named_effect_t *effect = &mutations->effects[i];
+    bool unset = effect->kind == DEP_NAMED_EFFECT_UNSET;
+    bool despecializes =
+        unset && effect->variable &&
+        (shell_builtin_variable_index_properties(effect->variable) &
+         SHELL_VARIABLE_DESPECIALIZES_ON_UNSET);
+    if (!dep_named_mutation_affects(mutations, fd) ||
+        (!unset && after && dep_route_find(after, fd) && !effect->observation))
+      continue;
+    if (unset && !dep_fd_note_unset_effects(
+                     state, journal, baseline, fd,
+                     despecializes ? effect->variable : 0, mutations->scope))
+      return false;
+    dep_route_set_t bound = {0};
+    dep_route_set_set(&bound, (dep_fd_route_t){unset ? DEP_ROUTE_UNAVAILABLE
+                                                     : DEP_ROUTE_DYNAMIC,
+                                               UINT32_MAX});
+    if (despecializes) {
+      /* The predefined name entered the descriptor inventory before it was
+       * removed. Invalidate every access through that spelling; otherwise a
+       * failed later allocation would fall back to the inventory's inherited
+       * named endpoint. Any orphaned physical descriptor remains tracked by
+       * the separate marker below. */
+      for (uint32_t access = DEP_FD_ACCESS_READ;
+           access <= DEP_FD_ACCESS_BINDING; access <<= 1)
+        if (!dep_route_state_store_access(state, journal, fd,
+                                          (dep_fd_access_t)access, bound))
+          return false;
+    } else if (!dep_route_state_store_access(state, journal, fd,
+                                             DEP_FD_ACCESS_BINDING, bound)) {
+      return false;
+    }
+    if (!dep_read_note_assignment(state, journal, fd))
+      return false;
+  }
+  return true;
+}
+
+/* baseline is the journal's immutable imported table. before/after are
+ * representative publication views, used only to enumerate changed names.
+ * They must not supply descriptor-existence or IFS proofs. Empty/unknown scalar
+ * values and allocation identities remain facts of each execution version. */
+static SHELL_NONNULL(1, 2, 3, 4, 5, 8) bool dep_fd_bindings(
+    dep_route_state_t *state, dep_route_journal_t *journal,
+    const dep_owner_routes_t *baseline, const dep_owner_routes_t *before,
+    const dep_owner_routes_t *after, const dep_fd_op_t *ops, uint32_t op_count,
     const dep_named_mutations_t *mutations) {
   /* Allocations come only from this owner's prepared operations. Ordinary
    * numeric commands must not search every inherited descriptor variable. */
   for (uint32_t i = 0; i < op_count; i++) {
     if (ops[i].fd != SHELL_DEP_FD_NAMED)
       continue;
-    dep_fd_ref_t fd = {ops[i].fd, ops[i].fd_name, ops[i].fd_name_len};
+    dep_fd_ref_t fd = {.name = ops[i].fd_name,
+                       .value = ops[i].fd,
+                       .name_len = ops[i].fd_name_len};
+    if (ops[i].resets_descriptor && ops[i].kind != DEP_FD_OP_CLOSE &&
+        !dep_read_note_assignment(state, journal, fd))
+      return false;
     dep_route_set_t bound = {0};
     const dep_fd_route_entry_t *slot = dep_route_find(after, fd);
     dep_route_set_t existing =
-        dep_fd_raw_fact(state, journal, before, fd, DEP_FD_ACCESS_BINDING);
+        dep_fd_raw_fact(state, journal, baseline, fd, DEP_FD_ACCESS_BINDING);
     if (slot && existing.routes[0].kind == DEP_ROUTE_ALIAS)
       continue;
     dep_route_set_set(
@@ -11321,9 +18485,10 @@ static SHELL_NONNULL(1, 2, 3, 4, 7) bool dep_fd_bindings(
                                       bound))
       return false;
   }
-  return dep_fd_mutation_bindings(state, journal, before, after, mutations) &&
+  return dep_fd_mutation_bindings(state, journal, baseline, before, after,
+                                  mutations) &&
          (mutations->before_redirect ||
-          dep_ifs_apply(state, journal, before, mutations));
+          dep_ifs_apply(state, journal, baseline, mutations));
 }
 
 /* Only a not-yet-established allocation may become known absent when skipped.
@@ -11360,7 +18525,7 @@ static SHELL_NONNULL(1, 2, 3, 4) uint8_t
   op = &effective;
   if (op->kind == DEP_FD_OP_FAILED)
     return DEP_STATUS_MAY_FAIL;
-  if (op->kind == DEP_FD_OP_IDENTITY)
+  if (op->kind == DEP_FD_OP_IDENTITY || op->kind == DEP_FD_OP_PROCESS)
     return DEP_STATUS_MAY_SUCCEED;
   if (op->kind == DEP_FD_OP_DOCUMENT && op->document_flags &&
       (*op->document_flags & SHELL_DEP_DOC_FLAG_EXPANSION_FAILED))
@@ -11368,7 +18533,8 @@ static SHELL_NONNULL(1, 2, 3, 4) uint8_t
   if (op->kind == DEP_FD_OP_CLOSE) {
     if (op->fd != SHELL_DEP_FD_NAMED)
       return DEP_STATUS_MAY_SUCCEED;
-    dep_fd_ref_t target = {op->fd, op->fd_name, op->fd_name_len};
+    dep_fd_ref_t target = {
+        .name = op->fd_name, .value = op->fd, .name_len = op->fd_name_len};
     dep_route_set_t facts = dep_fd_raw_fact(state, journal, baseline, target,
                                             DEP_FD_ACCESS_BINDING);
     uint8_t outcomes = 0;
@@ -11386,9 +18552,11 @@ static SHELL_NONNULL(1, 2, 3, 4) uint8_t
   }
   if (!dep_fd_op_copies(op->kind))
     return DEP_STATUS_EITHER;
-  dep_fd_ref_t target = {op->fd, op->fd_name, op->fd_name_len};
-  dep_fd_ref_t source = {op->target_fd, op->target_fd_name,
-                         op->target_fd_name_len};
+  dep_fd_ref_t target = {
+      .name = op->fd_name, .value = op->fd, .name_len = op->fd_name_len};
+  dep_fd_ref_t source = {.name = op->target_fd_name,
+                         .value = op->target_fd,
+                         .name_len = op->target_fd_name_len};
   if (target.value != SHELL_DEP_FD_NAMED && dep_fd_ref_equal(target, source))
     return DEP_STATUS_MAY_SUCCEED;
   dep_route_set_t facts =
@@ -11440,18 +18608,51 @@ static SHELL_NONNULL(1, 2, 3) bool dep_fd_setup_modified_source(
   return frame.count && modified.routes[0].value == frame.routes[0].value;
 }
 
-/* The dependency tree indexes (numeric descriptor, registration ordinal).
- * Ordinals use the access key's ordering, not its descriptor-fact meaning.
- * All roots here are isolated from descriptor-map and snapshot consumers. */
+/* Persistent multimap of (numeric descriptor, registration ordinal). A later
+ * registration must not overwrite an earlier use of the same descriptor:
+ * cleanup cache queries can address either ordinal interval. The reserved
+ * access tag identifies sentinel-valued nodes, which are deliberately not
+ * interned with descriptor facts. GC walks this tree with
+ * descriptor_facts=false. */
+static SHELL_NONNULL(1) uint32_t
+    dep_failure_use_insert(dep_route_journal_t *journal, uint32_t root,
+                           uint32_t fd, uint32_t ordinal) {
+  if (!root) {
+    root = dep_route_tree_allocate(journal);
+    journal->entries[root - 1] = (dep_route_change_t){
+        .fd_key = fd, .snapshot = ordinal + 1, .height = 1, .access_key = 63};
+    journal->entry_names[root - 1] = NULL;
+    return root;
+  }
+  const dep_route_change_t *old = &journal->entries[root - 1];
+  int order = old->fd_key < fd ? -1 : old->fd_key != fd;
+  if (!order)
+    order = old->snapshot < ordinal + 1 ? -1 : old->snapshot != ordinal + 1;
+  if (!order)
+    return root;
+  uint32_t child = order > 0 ? old->left : old->right;
+  uint32_t next = dep_failure_use_insert(journal, child, fd, ordinal);
+  if (next == child)
+    return root;
+  root = dep_route_tree_clone(journal, root);
+  if (order > 0)
+    journal->entries[root - 1].left = next;
+  else
+    journal->entries[root - 1].right = next;
+  return dep_route_tree_rebalance(journal, root);
+}
+
 static SHELL_NONNULL(1, 2) bool dep_failure_use(dep_route_journal_t *journal,
                                                 uint32_t *uses, uint32_t fd,
                                                 uint32_t ordinal) {
   if (dep_route_tree_height(journal, *uses) + 5 >
-      DEP_ROUTE_CHANGE_CAPACITY - journal->count)
+      dep_route_tree_available(journal))
     return false;
   DEP_METADATA_WORK(SHELLSPLIT_TEST_WORK_FAILURE_COMPOSITION);
-  *uses = dep_route_tree_set(journal, *uses, dep_fd_numeric(fd),
-                             (dep_fd_access_t)ordinal, 1);
+  /* Dependency roots are isolated from descriptor maps. Their otherwise
+   * unused snapshot key stores the bounded registration ordinal plus one;
+   * zero remains the reclaimed-route sentinel. */
+  *uses = dep_failure_use_insert(journal, *uses, fd, ordinal);
   return true;
 }
 
@@ -11462,11 +18663,12 @@ static SHELL_NONNULL(1) bool dep_failure_uses(
   while (uses) {
     DEP_METADATA_WORK(SHELLSPLIT_TEST_WORK_FAILURE_DEPENDENCIES);
     const dep_route_change_t *node = &journal->entries[uses - 1];
-    if (node->fd.value < fd ||
-        (node->fd.value == fd && (uint32_t)node->access < begin))
+    uint32_t node_fd = dep_route_change_fd(journal, node).value;
+    uint32_t ordinal = node->snapshot - 1;
+    if (node_fd < fd || (node_fd == fd && ordinal < begin))
       uses = node->right;
     else {
-      if (node->fd.value == fd && (uint32_t)node->access < end)
+      if (node_fd == fd && ordinal < end)
         return true;
       uses = node->left;
     }
@@ -11505,7 +18707,10 @@ static SHELL_NONNULL(1) uint32_t
 /* Register the selected physical ownership version once. Later setup may
  * mutate a live save's capabilities, but cannot change this registration's
  * physical target or saved-slot identity. Those descriptors form its indexed
- * read/write footprint. Private operation facts are included for retirement.
+ * read/write footprint. Private operation facts are included for retirement;
+ * saved private aliases are capabilities too, not merely numeric FDs. The
+ * shared symbolic occupancy relation uses the same global dependency key as
+ * allocator candidates and low-occupancy metadata.
  */
 static SHELL_NONNULL(1, 2, 3, 4, 5) bool dep_fd_failure_undo_push(
     dep_route_state_t *state, dep_route_journal_t *journal,
@@ -11533,7 +18738,6 @@ static SHELL_NONNULL(1, 2, 3, 4, 5) bool dep_fd_failure_undo_push(
       return false;
     for (uint32_t i = 0; i < saved.count; i++)
       if (saved.routes[i].kind == DEP_ROUTE_ALIAS &&
-          saved.routes[i].value <= SHELL_DEP_FD_MAX &&
           !dep_failure_use(journal, uses, saved.routes[i].value, ordinal))
         return false;
   }
@@ -11559,15 +18763,17 @@ static SHELL_NONNULL(1, 2, 3) bool dep_failure_delta(
     return true;
   DEP_METADATA_WORK(SHELLSPLIT_TEST_WORK_FAILURE_DEPENDENCIES);
   dep_route_change_t change = journal->entries[root - 1];
+  dep_fd_ref_t fd = dep_route_change_fd(journal, &journal->entries[root - 1]);
+  dep_fd_access_t access = dep_route_change_access(&change);
   const dep_route_change_t *other =
       other_root ? &journal->entries[other_root - 1] : NULL;
-  if (other && (dep_fd_ref_compare(change.fd, other->fd) != 0 ||
-                change.access != other->access))
-    other =
-        dep_route_root_change(other_root, journal, change.fd, change.access);
+  if (other &&
+      (dep_fd_ref_compare(fd, dep_route_change_fd(journal, other)) != 0 ||
+       access != dep_route_change_access(other)))
+    other = dep_route_root_change(other_root, journal, fd, access);
   if (!other)
-    other = dep_route_root_change(missing_only ? input : previous, journal,
-                                  change.fd, change.access);
+    other = dep_route_root_change(missing_only ? input : previous, journal, fd,
+                                  access);
   if (other == &journal->entries[root - 1])
     return true;
   if (!dep_failure_delta(journal, baseline, compatible, uses, begin, end,
@@ -11577,24 +18783,27 @@ static SHELL_NONNULL(1, 2, 3) bool dep_failure_delta(
   bool changed =
       missing_only ? !other : (!other || change.snapshot != other->snapshot);
   if (changed && *compatible) {
-    bool physical = change.fd.value <= SHELL_DEP_FD_MAX;
-    bool relevant = change.fd.value != SHELL_DEP_FD_NONE ||
-                    change.access == DEP_FD_ACCESS_AVAILABLE ||
-                    change.access == DEP_FD_ACCESS_LOW_STATE;
-    if (relevant &&
-        !(stopped && (physical || change.fd.value == SHELL_DEP_FD_NONE)) &&
-        change.fd.value != SHELL_DEP_FD_NAMED &&
-        dep_failure_uses(journal, uses, change.fd.value, begin, end)) {
+    bool physical = fd.value <= SHELL_DEP_FD_MAX;
+    bool relevant =
+        access != DEP_FD_ACCESS_NAMED_BINDINGS &&
+        (fd.value != SHELL_DEP_FD_NONE || access == DEP_FD_ACCESS_AVAILABLE ||
+         access == DEP_FD_ACCESS_LOW_STATE);
+    if (relevant && !(stopped && (physical || fd.value == SHELL_DEP_FD_NONE)) &&
+        fd.value != SHELL_DEP_FD_NAMED &&
+        dep_failure_uses(journal, uses,
+                         access == DEP_FD_ACCESS_PROCESS_DOMAIN
+                             ? SHELL_DEP_FD_NONE
+                             : fd.value,
+                         begin, end)) {
       *compatible = false;
       return true;
     }
     if (overlay) {
       dep_route_set_t routes =
-          missing_only ? dep_fd_raw_root_fact(input, journal, baseline,
-                                              change.fd, change.access)
-                       : journal->snapshots[change.snapshot - 1];
-      if (!dep_route_state_append_one(overlay, journal, change.fd,
-                                      change.access, routes))
+          missing_only
+              ? dep_fd_raw_root_fact(input, journal, baseline, fd, access)
+              : journal->snapshots[change.snapshot - 1];
+      if (!dep_route_state_append_one(overlay, journal, fd, access, routes))
         return false;
     }
   }
@@ -11614,15 +18823,26 @@ void shellsplit_test_failure_cleanup_reference(bool enabled) {
 }
 #endif
 
-static SHELL_NONNULL(1, 2, 3, 4) bool dep_failure_evaluate(
+static SHELL_NONNULL(1, 2, 3, 4, 9) bool dep_failure_evaluate(
     dep_route_state_t *state, dep_route_journal_t *journal,
     const dep_owner_routes_t *baseline, bool *stopped, uint32_t root,
-    uint32_t uses, uint32_t begin, uint32_t width) {
+    uint32_t uses, uint32_t begin, uint32_t width,
+    const dep_domain_collection_t *collection) {
   if (!root)
     return true;
   DEP_METADATA_WORK(SHELLSPLIT_TEST_WORK_FAILURE_COMPOSITION);
   dep_failure_cleanup_t *node = &journal->failure->nodes[root - 1];
-  uint32_t input = state->root;
+  /* The cache publishes this input after recursive cleanup, which can collect
+   * maps while mutating state. Preserve the immutable cache input separately
+   * from that evolving output, including across both child segments. */
+  dep_route_state_t input_state = *state;
+  uint32_t input = input_state.root;
+  dep_domain_collection_t evaluation_pins = {
+      .workspace = collection->workspace,
+      .frame = collection->frame,
+      .roots = {&input_state, state},
+      .parent = collection,
+  };
   bool stopped_in = *stopped;
   bool reuse = node->ready && node->stopped_in == stopped_in;
 #ifdef SHELLSPLIT_TEST_SOURCE_SCANS
@@ -11657,17 +18877,17 @@ static SHELL_NONNULL(1, 2, 3, 4) bool dep_failure_evaluate(
   if (width == 1) {
     DEP_METADATA_WORK(SHELLSPLIT_TEST_WORK_FAILURE_UNDO);
     DEP_METADATA_WORK(SHELLSPLIT_TEST_WORK_ROUTE_PUBLICATION);
-    dep_undo_result_t result =
-        dep_fd_unwind_key(state, journal, baseline, node->key, false, *stopped);
+    dep_undo_result_t result = dep_fd_unwind_key(
+        state, journal, baseline, node->key, false, *stopped, &evaluation_pins);
     if (result == DEP_UNDO_EXHAUSTED)
       return false;
     *stopped = result == DEP_UNDO_STOPPED;
   } else {
     width /= 2;
     if (!dep_failure_evaluate(state, journal, baseline, stopped, node->right,
-                              uses, begin + width, width) ||
+                              uses, begin + width, width, &evaluation_pins) ||
         !dep_failure_evaluate(state, journal, baseline, stopped, node->left,
-                              uses, begin, width))
+                              uses, begin, width, &evaluation_pins))
       return false;
   }
   node->input = input;
@@ -11678,13 +18898,13 @@ static SHELL_NONNULL(1, 2, 3, 4) bool dep_failure_evaluate(
   return true;
 }
 
-static SHELL_NONNULL(1, 2, 3) bool dep_fd_failure_cleanup(
+static SHELL_NONNULL(1, 2, 3, 7) bool dep_fd_failure_cleanup(
     dep_route_state_t *failed, dep_route_journal_t *journal,
     const dep_owner_routes_t *baseline, uint32_t head, uint32_t uses,
-    uint32_t width) {
+    uint32_t width, const dep_domain_collection_t *collection) {
   bool stopped = false;
   if (!dep_failure_evaluate(failed, journal, baseline, &stopped, head, uses, 0,
-                            width))
+                            width, collection))
     return false;
   /* A failed restore leaves physical stderr unchanged. Older stopped entries
    * only retire metadata, so this is also the exact diagnostic route on a
@@ -11694,6 +18914,9 @@ static SHELL_NONNULL(1, 2, 3) bool dep_fd_failure_cleanup(
   return dep_route_state_store_access(
              failed, journal, dep_fd_numeric(SHELL_DEP_FD_NONE),
              DEP_FD_ACCESS_ENTRY, (dep_route_set_t){.ready = true}) &&
+         dep_route_state_store_access(
+             failed, journal, dep_fd_numeric(SHELL_DEP_FD_NONE),
+             DEP_FD_ACCESS_LOW_STATE, (dep_route_set_t){.ready = true}) &&
          dep_route_state_store_access(
              failed, journal, dep_fd_numeric(SHELL_DEP_FD_NONE),
              DEP_FD_ACCESS_FAILURE_UNDO, (dep_route_set_t){.ready = true}) &&
@@ -11707,15 +18930,17 @@ static SHELL_NONNULL(1, 2, 3) bool dep_fd_failure_cleanup(
 }
 
 static SHELL_NONNULL(1, 2, 3, 5, 6) bool dep_fd_correlated_setup_failures(
-    dep_route_journal_t *journal, const dep_owner_routes_t *incoming,
+    dep_route_journal_t *journal, const dep_owner_routes_t *baseline,
     const dep_fd_op_t *ops, uint32_t op_count, dep_fd_flow_t *failures,
-    const dep_route_state_t *setup_entry) {
+    const dep_route_state_t *setup_entry, dep_domain_collection_t collection) {
   *failures = (dep_fd_flow_t){0};
   journal->failure->count = 0;
   uint32_t width = 1;
   while (width < op_count * 3)
     width *= 2;
   dep_route_state_t local = {0};
+  collection.roots[3] = &local;
+  collection.flow = failures;
   uint32_t count = dep_route_state_count(setup_entry);
   dep_route_iterator_t iterator = dep_route_iterator(setup_entry);
   for (uint32_t path = 0; path < count; path++) {
@@ -11729,7 +18954,7 @@ static SHELL_NONNULL(1, 2, 3, 5, 6) bool dep_fd_correlated_setup_failures(
       return false;
     for (uint32_t op = 0; op < op_count; op++)
       if (ops[op].fd == SHELL_DEP_FD_NAMED && ops[op].resets_descriptor &&
-          !dep_fd_mark_absent(&one, journal, incoming,
+          !dep_fd_mark_absent(&one, journal, baseline,
                               dep_fd_operation_target(ops + op)))
         return false;
     if (path == 0)
@@ -11741,11 +18966,13 @@ static SHELL_NONNULL(1, 2, 3, 5, 6) bool dep_fd_correlated_setup_failures(
   if (op_count && !dep_setup_begin(&local, journal, ops[0].undo_mode))
     return false;
   dep_owner_routes_t undo_targets = {0};
+  collection.roots[3] = NULL;
   for (uint32_t begin = 0; begin < op_count;) {
     uint32_t end = begin + 1;
     while (end < op_count && ops[end].pos == ops[begin].pos)
       end++;
     dep_route_state_t next = {0};
+    collection.roots[4] = &next;
     bool have_next = false;
     for (uint32_t op = begin; op < end; op++)
       if (dep_fd_op_saves_numeric(ops + op) &&
@@ -11756,27 +18983,42 @@ static SHELL_NONNULL(1, 2, 3, 5, 6) bool dep_fd_correlated_setup_failures(
     while (dep_route_next(&paths, journal, &root)) {
       dep_route_state_t one = dep_route_state_single(root);
       one.correlated = true;
+      dep_domain_collection_t path_pins = {
+          .workspace = collection.workspace,
+          .frame = collection.frame,
+          .roots = {&one},
+          .remaining = &paths,
+          .release_domains = {&one},
+          .parent = &collection,
+      };
+      dep_route_domains_collect(journal, &path_pins, &one, &next);
       dep_route_set_t history = dep_fd_raw_fact(
-          &one, journal, incoming, dep_fd_numeric(SHELL_DEP_FD_NONE),
+          &one, journal, baseline, dep_fd_numeric(SHELL_DEP_FD_NONE),
           DEP_FD_ACCESS_FAILURE_UNDO);
       uint32_t head = history.count ? history.routes[0].value : 0;
       uint32_t uses = history.count ? history.routes[1].value : 0;
       uint8_t outcomes =
-          dep_fd_operation_outcomes(ops + begin, &one, journal, incoming);
+          dep_fd_operation_outcomes(ops + begin, &one, journal, baseline);
       if (outcomes & DEP_STATUS_MAY_FAIL) {
         dep_route_state_t failed = one;
-        if (!dep_record_diagnostic(&one, journal, incoming) ||
-            !dep_fd_failure_cleanup(&failed, journal, incoming, head, uses,
-                                    width))
+        dep_domain_collection_t failure_pins = {
+            .workspace = collection.workspace,
+            .frame = collection.frame,
+            .roots = {&one, &failed},
+            .parent = &path_pins,
+        };
+        if (!dep_record_diagnostic(&one, journal, baseline) ||
+            !dep_fd_failure_cleanup(&failed, journal, baseline, head, uses,
+                                    width, &failure_pins))
           return false;
         const dep_fd_op_t *op = ops + begin;
         /* Only an unmodified source proves parent absence. A local close or
          * temporary redirect can instead be restored during this cleanup. */
         if (dep_fd_op_copies(op->kind) && op->target_fd <= SHELL_DEP_FD_MAX &&
-            !dep_fd_setup_modified_source(&one, journal, incoming,
+            !dep_fd_setup_modified_source(&one, journal, baseline,
                                           op->target_fd) &&
             !dep_route_find(&undo_targets, dep_fd_numeric(op->target_fd)) &&
-            !dep_fd_ifs_expansion(op, &one, journal, incoming)) {
+            !dep_fd_ifs_expansion(op, &one, journal, baseline)) {
           dep_route_set_t closed = {0};
           dep_route_set_set(&closed,
                             (dep_fd_route_t){DEP_ROUTE_CLOSED, UINT32_MAX});
@@ -11787,13 +19029,13 @@ static SHELL_NONNULL(1, 2, 3, 5, 6) bool dep_fd_correlated_setup_failures(
                                               (dep_fd_access_t)access, closed))
               return false;
         }
-        if (!dep_fd_add(failures, 1, failed, journal, incoming))
+        if (!dep_fd_add(failures, 1, failed, journal, baseline))
           return false;
       }
       if (!(outcomes & DEP_STATUS_MAY_SUCCEED))
         continue;
-      if (!dep_route_state_apply(&one, journal, incoming, ops + begin,
-                                 end - begin, false))
+      if (!dep_route_state_apply(&one, journal, baseline, ops + begin,
+                                 end - begin, false, &path_pins))
         return false;
       dep_route_iterator_t branches = dep_route_iterator(&one);
       uint32_t applied_root;
@@ -11806,12 +19048,12 @@ static SHELL_NONNULL(1, 2, 3, 5, 6) bool dep_fd_correlated_setup_failures(
           if (ops[op].paired_open)
             continue;
           if (ops[op].fd == SHELL_DEP_FD_NAMED && ops[op].resets_descriptor &&
-              !dep_fd_failure_undo_push(&applied, journal, incoming,
+              !dep_fd_failure_undo_push(&applied, journal, baseline,
                                         &branch_head, &branch_uses, width,
                                         dep_allocation_slot(journal, ops + op)))
             return false;
           if (!dep_fd_failure_undo_push(
-                  &applied, journal, incoming, &branch_head, &branch_uses,
+                  &applied, journal, baseline, &branch_head, &branch_uses,
                   width,
                   dep_undo_slot(journal, ops + op, DEP_ALLOCATION_TARGET_UNDO,
                                 false)))
@@ -11820,7 +19062,7 @@ static SHELL_NONNULL(1, 2, 3, 5, 6) bool dep_fd_correlated_setup_failures(
               !dep_fd_op_numeric_self_dup(ops + op)) {
             dep_fd_op_t close = dep_fd_move_close(ops + op);
             if (!dep_fd_failure_undo_push(
-                    &applied, journal, incoming, &branch_head, &branch_uses,
+                    &applied, journal, baseline, &branch_head, &branch_uses,
                     width,
                     dep_undo_slot(journal, &close, DEP_ALLOCATION_MOVE_UNDO,
                                   false)))
@@ -11856,12 +19098,14 @@ static SHELL_NONNULL(1, 2, 3, 5, 6) bool dep_fd_correlated_setup_failures(
 /* Consume each prepared redirect batch once. Keep immutable prefix versions;
  * never copy a growing descriptor table or replay the source for each failure.
  * Apply registered cleanup, retaining named allocations and stopped undo. */
-static SHELL_NONNULL(1, 2, 3, 4, 9, 10, 11) bool dep_fd_setup_failures(
+static SHELL_NONNULL(1, 2, 3, 4, 9, 10, 11, 12) bool dep_fd_setup_failures(
     const dep_route_state_t *entry, dep_route_journal_t *journal,
-    const dep_owner_routes_t *incoming, const dep_route_state_t *completed,
+    const dep_owner_routes_t *baseline, const dep_route_state_t *completed,
     const dep_fd_op_t *ops, uint32_t op_count, bool descriptor_exec,
     bool named_binding, const dep_named_mutations_t *mutations,
-    dep_fd_flow_t *failures, const dep_route_state_t *setup_entry) {
+    dep_fd_flow_t *failures, const dep_route_state_t *setup_entry,
+    const dep_parse_context_t *context,
+    const dep_domain_collection_t *parent_pins) {
   if (!op_count) {
     *failures = (dep_fd_flow_t){0};
     return true;
@@ -11870,19 +19114,49 @@ static SHELL_NONNULL(1, 2, 3, 4, 9, 10, 11) bool dep_fd_setup_failures(
    * returns the entry version itself. Do not manufacture an equivalent map
    * by undoing the completed tree, which loses shared identity and makes
    * successive conditional failures merge ever-growing descriptor tables. */
-  bool numeric_only = !mutations->count && !mutations->clear &&
-                      !journal->scratch_observable,
-       has_move = false, has_named = false;
+  bool numeric_only = !mutations->count && !mutations->clear, has_move = false,
+       has_named = false, high_target = false, fallible = false;
   for (uint32_t op = 0; op < op_count; op++) {
+    fallible |= ops[op].kind != DEP_FD_OP_PROCESS &&
+                ops[op].kind != DEP_FD_OP_IDENTITY &&
+                !(ops[op].kind == DEP_FD_OP_CLOSE &&
+                  ops[op].fd != SHELL_DEP_FD_NAMED) &&
+                !dep_fd_op_numeric_self_dup(ops + op);
     has_move |= ops[op].kind == DEP_FD_OP_MOVE;
     has_named |= ops[op].fd == SHELL_DEP_FD_NAMED;
     numeric_only &=
         ops[op].fd != SHELL_DEP_FD_NAMED && ops[op].kind != DEP_FD_OP_MOVE;
+    if (journal->scratch_observable) {
+      /* A low numeric target cannot overwrite a Bash save (all saves start at
+       * fd 10). Until a high target is applied, failed setup therefore restores
+       * the entry table regardless of which inherited low FDs needed saves.
+       * A final high redirect can fail before it changes that target; no later
+       * failure observes its successful overwrite. High-source copies and pipe
+       * allocation can inspect those saves and need the correlated engine. */
+      numeric_only &= (!high_target || ops[op].paired_open ||
+                       ops[op].kind == DEP_FD_OP_CLOSE ||
+                       ops[op].kind == DEP_FD_OP_IDENTITY ||
+                       dep_fd_op_numeric_self_dup(ops + op)) &&
+                      ops[op].kind != DEP_FD_OP_PROCESS &&
+                      (!dep_fd_op_copies(ops[op].kind) ||
+                       dep_fd_op_numeric_self_dup(ops + op) ||
+                       ops[op].target_fd < DEP_BASH_VARREDIR_MIN_FD);
+      high_target |= ops[op].fd >= DEP_BASH_VARREDIR_MIN_FD &&
+                     ops[op].kind != DEP_FD_OP_IDENTITY &&
+                     !dep_fd_op_numeric_self_dup(ops + op);
+    }
+  }
+  /* These prepared operations have no shell setup-failure outcome. In
+   * particular, do not replay symbolic process-pipe allocation and cleanup
+   * merely to discover that every operation necessarily succeeds. */
+  if (!fallible) {
+    *failures = (dep_fd_flow_t){0};
+    return true;
   }
   if (numeric_only) {
     *failures = (dep_fd_flow_t){0};
     failures->state[1] = *entry;
-    if (!dep_ifs_copy(&failures->state[1], setup_entry, journal, incoming))
+    if (!dep_ifs_copy(&failures->state[1], setup_entry, journal, baseline))
       return false;
     dep_route_state_t local = *setup_entry;
     for (uint32_t begin = 0; begin < op_count;) {
@@ -11890,17 +19164,23 @@ static SHELL_NONNULL(1, 2, 3, 4, 9, 10, 11) bool dep_fd_setup_failures(
       while (end < op_count && ops[end].pos == ops[begin].pos)
         end++;
       uint8_t outcomes =
-          dep_fd_operation_outcomes(ops + begin, &local, journal, incoming);
+          dep_fd_operation_outcomes(ops + begin, &local, journal, baseline);
       if (outcomes & DEP_STATUS_MAY_FAIL) {
-        if (!dep_record_diagnostic(&local, journal, incoming))
+        if (!dep_record_diagnostic(&local, journal, baseline))
           return false;
         failures->mask = DEP_STATUS_MAY_FAIL;
       }
       if (!(outcomes & DEP_STATUS_MAY_SUCCEED) || end == op_count)
         break;
-      if (!dep_route_state_apply(&local, journal, incoming, ops + begin,
-                                 end - begin, begin == 0))
-        return false;
+      for (uint32_t op = begin; op < end; op++) {
+        dep_fd_op_t diagnostic = ops[op];
+        /* Only capabilities are observed by this proven restoring prefix.
+         * Its scratch choices cannot affect either setup failure or stderr. */
+        diagnostic.undo_mode = DEP_UNDO_CHILD;
+        if (!dep_route_state_apply(&local, journal, baseline, &diagnostic, 1,
+                                   op == 0, NULL))
+          return false;
+      }
       begin = end;
     }
     return true;
@@ -11913,35 +19193,43 @@ static SHELL_NONNULL(1, 2, 3, 4, 9, 10, 11) bool dep_fd_setup_failures(
   if (single_allocation) {
     *failures = (dep_fd_flow_t){0};
     uint8_t outcomes =
-        dep_fd_operation_outcomes(ops, setup_entry, journal, incoming);
+        dep_fd_operation_outcomes(ops, setup_entry, journal, baseline);
     if (outcomes & DEP_STATUS_MAY_FAIL) {
-      if (!dep_record_diagnostic(setup_entry, journal, incoming))
+      if (!dep_record_diagnostic(setup_entry, journal, baseline))
         return false;
       failures->mask = DEP_STATUS_MAY_FAIL;
       failures->state[1] = *entry;
-      if (!dep_fd_mark_absent(&failures->state[1], journal, incoming,
+      if (!dep_fd_mark_absent(&failures->state[1], journal, baseline,
                               dep_fd_operation_target(ops)))
         return false;
     }
     return true;
   }
   if (has_move || has_named || journal->scratch_observable ||
-      entry->correlated || completed->correlated)
-    return dep_fd_correlated_setup_failures(journal, incoming, ops, op_count,
-                                            failures, setup_entry);
+      entry->correlated || completed->correlated) {
+    dep_domain_collection_t collection = {
+        .workspace = context->workspace,
+        .frame = journal == &context->workspace->snapshot_journal
+                     ? context->snapshot
+                     : NULL,
+        .roots = {entry, completed, setup_entry, NULL, NULL},
+        .parent = parent_pins};
+    return dep_fd_correlated_setup_failures(journal, baseline, ops, op_count,
+                                            failures, setup_entry, collection);
+  }
   dep_route_state_t local = *setup_entry, persistent = *entry;
   *failures = (dep_fd_flow_t){0};
   /* Keep the completed tree's key layout, restoring only changed values. Both
    * outcome versions then share their unchanged subtrees even across AVL
    * rotations caused by this owner's new identities. */
   failures->state[1] = *completed;
-  if (!dep_ifs_copy(&failures->state[1], setup_entry, journal, incoming) ||
-      !dep_ifs_copy(&persistent, setup_entry, journal, incoming))
+  if (!dep_ifs_copy(&failures->state[1], setup_entry, journal, baseline) ||
+      !dep_ifs_copy(&persistent, setup_entry, journal, baseline))
     return false;
   if (!dep_route_state_store_access(
           &failures->state[1], journal, dep_fd_numeric(SHELL_DEP_FD_NONE),
           DEP_FD_ACCESS_AVAILABLE,
-          dep_fd_raw_fact(entry, journal, incoming,
+          dep_fd_raw_fact(entry, journal, baseline,
                           dep_fd_numeric(SHELL_DEP_FD_NONE),
                           DEP_FD_ACCESS_AVAILABLE)))
     return false;
@@ -11955,52 +19243,46 @@ static SHELL_NONNULL(1, 2, 3, 4, 9, 10, 11) bool dep_fd_setup_failures(
     for (uint32_t access = DEP_FD_ACCESS_READ; access <= last; access <<= 1)
       if (!dep_route_state_store_access(
               &failures->state[1], journal, fd, (dep_fd_access_t)access,
-              dep_fd_raw_fact(entry, journal, incoming, fd,
+              dep_fd_raw_fact(entry, journal, baseline, fd,
                               (dep_fd_access_t)access)))
         return false;
   }
   if (!mutations->before_redirect) {
-    uint32_t targets = mutations->clear ? incoming->fd_count : mutations->count;
-    for (uint32_t i = 0; i < targets; i++) {
-      const dep_fd_route_entry_t *target =
-          mutations->clear
-              ? &incoming->fd[i]
-              : dep_named_effect_target(incoming, &mutations->effects[i]);
-      if (!target)
-        continue;
-      dep_fd_ref_t fd = target->fd;
-      if (dep_named_mutation_affects(mutations, fd) &&
-          !dep_route_state_store_access(
-              &failures->state[1], journal, fd, DEP_FD_ACCESS_BINDING,
-              dep_fd_raw_fact(entry, journal, incoming, fd,
-                              DEP_FD_ACCESS_BINDING)))
-        return false;
-    }
+    /* This path has only numeric setup. No named allocation can have changed
+     * the entry scalar map; restore that immutable version as one value. The
+     * correlated engine above retains reached named allocations separately. */
+    DEP_METADATA_WORK(SHELLSPLIT_TEST_WORK_BINDING_INVALIDATION);
+    if (!dep_route_state_store_access(
+            &failures->state[1], journal, dep_fd_numeric(0),
+            DEP_FD_ACCESS_NAMED_BINDINGS,
+            dep_fd_raw_fact(entry, journal, baseline, dep_fd_numeric(0),
+                            DEP_FD_ACCESS_NAMED_BINDINGS)))
+      return false;
   }
   for (uint32_t begin = 0; begin < op_count;) {
     uint32_t end = begin + 1;
     while (end < op_count && ops[end].pos == ops[begin].pos)
       end++;
     uint8_t outcomes =
-        dep_fd_operation_outcomes(ops + begin, &local, journal, incoming);
+        dep_fd_operation_outcomes(ops + begin, &local, journal, baseline);
     if (outcomes & DEP_STATUS_MAY_FAIL) {
-      if (!dep_record_diagnostic(&local, journal, incoming))
+      if (!dep_record_diagnostic(&local, journal, baseline))
         return false;
-      uint32_t ifs = dep_ifs_get(&persistent, journal, incoming);
+      uint32_t ifs = dep_ifs_get(&persistent, journal, baseline);
       if (failures->mask)
         ifs = dep_ifs_join(ifs,
-                           dep_ifs_get(&failures->state[1], journal, incoming));
+                           dep_ifs_get(&failures->state[1], journal, baseline));
       if (!dep_ifs_store(&failures->state[1], journal, ifs))
         return false;
       if (!(failures->mask
                 ? dep_fd_join_slot(&failures->state[1], &persistent, journal,
-                                   incoming, dep_fd_numeric(SHELL_DEP_FD_NONE),
+                                   baseline, dep_fd_numeric(SHELL_DEP_FD_NONE),
                                    DEP_FD_ACCESS_AVAILABLE)
                 : dep_route_state_store_access(
                       &failures->state[1], journal,
                       dep_fd_numeric(SHELL_DEP_FD_NONE),
                       DEP_FD_ACCESS_AVAILABLE,
-                      dep_fd_raw_fact(&persistent, journal, incoming,
+                      dep_fd_raw_fact(&persistent, journal, baseline,
                                       dep_fd_numeric(SHELL_DEP_FD_NONE),
                                       DEP_FD_ACCESS_AVAILABLE))))
         return false;
@@ -12008,21 +19290,66 @@ static SHELL_NONNULL(1, 2, 3, 4, 9, 10, 11) bool dep_fd_setup_failures(
     }
     if (!(outcomes & DEP_STATUS_MAY_SUCCEED))
       break;
-    if (!dep_route_state_apply(&local, journal, incoming, ops + begin,
-                               end - begin, begin == 0))
+    if (!dep_route_state_apply(&local, journal, baseline, ops + begin,
+                               end - begin, begin == 0, NULL))
       return false;
     begin = end;
   }
   return true;
 }
 
+/* Project the same refined target roles used for input selection into scalar
+ * mutation effects. The syntactic recognizer's union can include an identifier
+ * which this execution consumes as option data instead. Words and variable
+ * classes are already prepared; no tokenization or decoded argv is needed. */
+static SHELL_NONNULL(1, 2, 3, 4, 5, 6, 7) void dep_read_mutations(
+    const dep_read_plan_t *plan, const dep_read_result_t *read,
+    const dep_prefix_assignment_set_t *prefixes, const dep_route_state_t *state,
+    const dep_route_journal_t *journal, const dep_owner_routes_t *baseline,
+    dep_named_mutations_t *mutations) {
+  *mutations = (dep_named_mutations_t){.restored_prefixes = prefixes};
+  for (uint32_t i = 0; i < plan->count; i++) {
+    DEP_METADATA_WORK(SHELLSPLIT_TEST_WORK_READ_INPUT);
+    if (!(read->targets & (UINT64_C(1) << i)))
+      continue;
+    const dep_read_word_t *word = &plan->words[i];
+    bool empty, positive;
+    (void)dep_read_argument(word, i, state, journal, baseline, &empty,
+                            &positive);
+    shell_builtin_variable_t variable =
+        dep_read_target(word, state, journal, baseline, empty, positive);
+    if (variable == SHELL_BUILTIN_VARIABLE_DYNAMIC) {
+      mutations->clear = true;
+      if (!plan->ifs_restored)
+        dep_ifs_note(mutations, DEP_IFS_DIGITS, false);
+      return;
+    }
+    bool projected = empty && word->empty_known;
+    dep_named_effect_t effect = projected ? word->empty_effect : word->effect;
+    if (!(projected ? word->empty_restored : word->restored) &&
+        effect.token.len) {
+      mutations->effects[mutations->count++] = effect;
+      if (projected ? word->empty_ifs
+                    : dep_effect_is_ifs(effect.token.start, effect.token.len,
+                                        effect.kind))
+        dep_ifs_note(mutations, DEP_IFS_DIGITS, false);
+    }
+  }
+  if (read->default_target && !plan->default_restored)
+    mutations->effects[mutations->count++] = plan->default_effect;
+}
+
 /* report_state is optional. It receives the timing shell's returning outcomes,
  * including move-source effects but excluding skipped predecessors and child
  * publication. A directly timed exec retains its local descriptor setup.
+ * read_result is NULL for ordinary owners, or a prepared read outcome.
+ * parent_pins optionally retains sibling outcome versions during publication.
+ * A supplied report_state is initialized storage: collection tracks its
+ * evolving version as well as the sibling reports retained by parent_pins.
  */
 static SHELL_NONNULL(
     1, 2, 4, 5, 6, 7, 8, 13, 15,
-    18) bool dep_fd_finish_owner_scope(const dep_parse_context_t *context,
+    20) bool dep_fd_finish_owner_scope(const dep_parse_context_t *context,
                                        dep_fd_stream_t *stream, uint32_t event,
                                        dep_route_journal_t *journal,
                                        const dep_owner_routes_t *baseline,
@@ -12036,8 +19363,18 @@ static SHELL_NONNULL(
                                        dep_route_state_t *report_state,
                                        const dep_route_state_t *setup_entry,
                                        uint8_t mode, bool setup_survived,
+                                       const dep_read_result_t *read_result,
+                                       const dep_domain_collection_t
+                                           *parent_pins,
                                        dep_fd_flow_t *finished) {
   dep_route_state_t selected = stream->selected[event];
+  dep_domain_collection_t collection = {
+      .workspace = context->workspace,
+      .frame = journal == &context->workspace->snapshot_journal
+                   ? context->snapshot
+                   : NULL,
+      .roots = {&selected, executed_state, setup_entry, report_state, NULL}};
+  collection.parent = parent_pins;
   uint32_t all_op_count = op_count;
   uint32_t stop =
       context->owner_setup_stop[dep_snapshot_event_owner(context, event)];
@@ -12056,19 +19393,19 @@ static SHELL_NONNULL(
     if (body->mask)
       body->mask = dep_expansion_status(context, event, body->mask);
     dep_route_state_t local = *executed_state;
-    if (!dep_fd_bindings(&local, journal, incoming, executed, ops, op_count,
-                         mutations))
+    if (!dep_fd_bindings(&local, journal, baseline, incoming, executed, ops,
+                         op_count, mutations))
       return false;
     body->state[0] = body->state[1] = local;
     dep_fd_flow_t *failure = &stream->setup_failure[event];
     dep_route_state_t persistent = selected;
-    if (!dep_route_state_publish(&persistent, journal, &local, incoming, ops,
-                                 op_count, false) ||
-        !dep_fd_bindings(&persistent, journal, incoming, executed, ops,
-                         op_count, mutations) ||
-        !dep_fd_setup_failures(&selected, journal, incoming, &persistent, ops,
+    if (!dep_route_state_publish(&persistent, journal, &local, baseline, ops,
+                                 op_count, false, &collection) ||
+        !dep_fd_bindings(&persistent, journal, baseline, incoming, executed,
+                         ops, op_count, mutations) ||
+        !dep_fd_setup_failures(&selected, journal, baseline, &persistent, ops,
                                all_op_count, false, true, mutations, failure,
-                               setup_entry))
+                               setup_entry, context, &collection))
       return false;
     return true;
   }
@@ -12076,6 +19413,16 @@ static SHELL_NONNULL(
   const dep_snapshot_source_t *source =
       &context->workspace->snapshot_sources
            [context->snapshot->prepared_source[context->range_node[range]]];
+  dep_read_result_t read = {0};
+  dep_named_mutations_t read_mutations;
+  if (source->read.active) {
+    read = read_result ? *read_result
+                       : dep_read_evaluate(&source->read, executed_state,
+                                           journal, baseline, NULL, NULL);
+    dep_read_mutations(&source->read, &read, &source->prefix_assignments,
+                       executed_state, journal, baseline, &read_mutations);
+    mutations = &read_mutations;
+  }
   bool nullable_readonly =
       source->argv_presence == (DEP_ARGV_EMPTY | DEP_ARGV_PRESENT) &&
       source->readonly_stop != UINT32_MAX;
@@ -12093,11 +19440,11 @@ static SHELL_NONNULL(
         mutations->before_redirect ? mutations : &unchanged;
     dep_owner_routes_t parent;
     dep_copy_routes(&parent, incoming);
-    if (!dep_ifs_copy(&child_continued, setup_entry, journal, incoming) ||
+    if (!dep_ifs_copy(&child_continued, setup_entry, journal, baseline) ||
         !dep_apply_persistent_owner_routes(&parent, executed, ops, 0, false,
                                            false, parent_mutations, NULL) ||
-        !dep_fd_bindings(&child_continued, journal, incoming, &parent, ops, 0,
-                         parent_mutations))
+        !dep_fd_bindings(&child_continued, journal, baseline, incoming, &parent,
+                         ops, 0, parent_mutations))
       return false;
   }
   if (setup_survived && current_setup && (!private || report_state)) {
@@ -12105,29 +19452,66 @@ static SHELL_NONNULL(
     dep_copy_routes(&persistent, incoming);
     journal->diagnostic_cleanup = true;
     bool restored =
-        dep_route_state_publish(&continued, journal, executed_state, incoming,
-                                ops, op_count, descriptor_exec);
+        dep_route_state_publish(&continued, journal, executed_state, baseline,
+                                ops, op_count, descriptor_exec, &collection);
     journal->diagnostic_cleanup = false;
     if (!restored ||
         !dep_apply_persistent_owner_routes(&persistent, executed, ops, op_count,
                                            descriptor_exec, named_binding,
                                            mutations, NULL) ||
-        !dep_fd_bindings(&continued, journal, incoming, &persistent, ops,
-                         op_count, mutations))
+        !dep_fd_bindings(&continued, journal, baseline, incoming, &persistent,
+                         ops, op_count, mutations))
       return false;
   }
   if (child_setup)
     continued = child_continued;
   dep_fd_flow_t failures;
-  if (!dep_fd_setup_failures(&selected, journal, incoming, &continued, ops,
+  if (!dep_fd_setup_failures(&selected, journal, baseline, &continued, ops,
                              all_op_count, descriptor_exec, named_binding,
-                             mutations, &failures, setup_entry))
+                             mutations, &failures, setup_entry, context,
+                             &collection))
     return false;
   if (child_setup && failures.mask)
     failures.state[1] = child_continued;
   uint8_t body_status = context->event_body_status[event];
+  if (source->argv_presence == DEP_ARGV_EMPTY &&
+      !context->expansion_status[event].isolated_setup &&
+      (source->observation_first[0] || source->observation_first[1] ||
+       source->observation_first[2])) {
+    body_status = DEP_STATUS_MAY_SUCCEED;
+    uint32_t slot =
+        context->snapshot->prepared_source[context->range_node[range]];
+    for (unsigned phase = 0; phase < 3; phase++) {
+      uint8_t status = context->expansion_status[event].phase[phase];
+      if (source->observation_first[phase]) {
+        dep_route_set_t observed = dep_fd_raw_fact(
+            executed_state, journal, baseline, dep_fd_numeric(slot * 3 + phase),
+            DEP_FD_ACCESS_SUBSTITUTION_STATUS);
+        if (observed.count)
+          status = (uint8_t)observed.routes[0].value;
+      }
+      body_status = (status & DEP_STATUS_EITHER) |
+                    ((status & DEP_EXPANSION_INCOMING) ? body_status : 0);
+    }
+  }
+  if (source->read.active)
+    body_status = read.status;
+  /* A nonmutating executable consumes its substitution values, not their
+   * completion status. With no setup or persistent effects, all of those
+   * private observation paths reconverge to the selected entry. Retaining
+   * their input predicates would enumerate discarded results in every later
+   * command. Assignment-only commands, reads, and descriptor/variable effects
+   * still retain the predicates selecting their actual outcomes. Deferred
+   * I/O uses executed_state, not this continuation projection. */
+  if (source->argv_presence == DEP_ARGV_PRESENT && !source->read.active &&
+      !all_op_count && !descriptor_exec && !mutations->count &&
+      !mutations->clear && !mutations->ifs_write &&
+      !context->process_routes->first[context->range_node[range]] &&
+      (source->observation_first[0] || source->observation_first[1] ||
+       source->observation_first[2]))
+    continued = selected;
   if (private)
-    body_status = DEP_STATUS_EITHER;
+    body_status = dep_status_child_return(body_status);
   if (!setup_survived)
     body_status = 0;
   dep_route_state_t failed_body = continued;
@@ -12136,25 +19520,35 @@ static SHELL_NONNULL(
       dep_owner_exec(context, context->range_node[range])->kind ==
           DEP_EXEC_RUNTIME;
   if (setup_survived && current_setup && (!private || report_state) &&
-      (runtime_exec || mutations->success_only)) {
+      (runtime_exec || mutations->success_only ||
+       (source->read.active && read.unassigned_failure))) {
     /* Runtime exec option errors do not retain numeric redirects. Likewise,
      * failed cd execution preserves PWD/OLDPWD while keeping any descriptor
-     * variables allocated during its successful redirect setup. */
+     * variables allocated during its successful redirect setup. A read failure
+     * before assignment publishes no target writes; partial assignment failures
+     * instead use their terminal version's exact earlier-write signature. */
     dep_owner_routes_t persistent;
     dep_named_mutations_t no_mutations = {0};
     const dep_named_mutations_t *failed_mutations =
-        mutations->success_only ? &no_mutations : mutations;
+        mutations->success_only ||
+                (source->read.active && read.unassigned_failure)
+            ? &no_mutations
+            : mutations;
     dep_copy_routes(&persistent, incoming);
     failed_body = selected;
-    if (!dep_route_state_publish(&failed_body, journal, executed_state,
-                                 incoming, ops, op_count,
-                                 descriptor_exec && !runtime_exec) ||
+    if (!dep_route_state_publish(
+            &failed_body, journal, executed_state, baseline, ops, op_count,
+            descriptor_exec && !runtime_exec, &collection) ||
         !dep_apply_persistent_owner_routes(&persistent, executed, ops, op_count,
                                            descriptor_exec && !runtime_exec,
                                            named_binding, failed_mutations,
                                            NULL) ||
-        !dep_fd_bindings(&failed_body, journal, incoming, &persistent, ops,
-                         op_count, failed_mutations))
+        !dep_fd_bindings(&failed_body, journal, baseline, incoming, &persistent,
+                         ops, op_count, failed_mutations))
+      return false;
+    if (source->read.active && read.unassigned_failure &&
+        read.assigned_failure &&
+        !dep_fd_merge(&failed_body, &continued, journal, baseline))
       return false;
   }
   bool negated = context->fast->cmds[range].pipeline_negation_count & 1u;
@@ -12168,20 +19562,21 @@ static SHELL_NONNULL(
   if (context->owner_setup_stop[context->range_node[range]] != UINT32_MAX)
     outcomes.mask = stops;
   for (unsigned i = 0; i < 5; i++)
-    outcomes.state[i] = i < 2 && !private ? continued : selected;
-  outcomes.state[negated ? 0 : 1] = private ? selected : failed_body;
-  if (failures.mask &&
-      !dep_fd_add(&outcomes, negated ? 0 : 1,
-                  private ? selected : failures.state[1], journal, baseline))
+    outcomes.state[i] = private ? *executed_state
+                        : i < 2 ? continued
+                                : selected;
+  outcomes.state[negated ? 0 : 1] = private ? *executed_state : failed_body;
+  if (failures.mask && !dep_fd_add(&outcomes, negated ? 0 : 1,
+                                   failures.state[1], journal, baseline))
     return false;
   if (nullable_readonly && !private) {
     /* Only the empty-argv alternative commits these prefixes. Its readonly
      * failure precedes redirects and must not borrow the executable body's
      * descriptor mutations. Keep it separate through input-unit recovery. */
     dep_route_state_t stopped = selected;
-    if (!dep_fd_mutation_bindings(&stopped, journal, incoming, NULL,
+    if (!dep_fd_mutation_bindings(&stopped, journal, baseline, baseline, NULL,
                                   &source->null_mutations) ||
-        !dep_ifs_apply(&stopped, journal, incoming, &source->null_mutations))
+        !dep_ifs_apply(&stopped, journal, baseline, &source->null_mutations))
       return false;
     uint8_t null_status =
         DEP_STATUS_ABORT_FAILURE |
@@ -12206,6 +19601,16 @@ static SHELL_NONNULL(
         return false;
     }
   }
+  if (!private)
+    for (unsigned i = 0; i < 5; i++)
+      if ((outcomes.mask & (1u << i)) &&
+          !dep_process_close_owner(&outcomes.state[i], journal, baseline,
+                                   context, context->range_node[range]))
+        return false;
+  if (report_state &&
+      !dep_process_close_owner(report_state, journal, baseline, context,
+                               context->range_node[range]))
+    return false;
   *finished = outcomes;
   return true;
 }
@@ -12239,26 +19644,110 @@ static SHELL_NONNULL(1, 2, 3, 5, 6) bool dep_setup_select(
 
 /* Setup and publication share the same scope choices. Finish the outcome
  * stream only once after completing each selected dispatch independently. */
-static SHELL_NONNULL(1, 2, 4, 5, 6, 7, 8, 13, 15) bool dep_fd_finish_owner(
-    const dep_parse_context_t *context, dep_fd_stream_t *stream, uint32_t event,
-    dep_route_journal_t *journal, const dep_owner_routes_t *baseline,
-    const dep_owner_routes_t *incoming, const dep_owner_routes_t *executed,
-    const dep_route_state_t *executed_state, const dep_fd_op_t *ops,
-    uint32_t op_count, bool descriptor_exec, bool named_binding,
-    const dep_named_mutations_t *mutations, dep_route_state_t *report_state,
-    const dep_route_state_t *setup_entry) {
+static SHELL_NONNULL(1, 2, 4, 5, 6, 7, 8, 13, 15) shell_dep_error_t
+    dep_fd_finish_owner(
+        const dep_parse_context_t *context, dep_fd_stream_t *stream,
+        uint32_t event, dep_route_journal_t *journal,
+        const dep_owner_routes_t *baseline, const dep_owner_routes_t *incoming,
+        const dep_owner_routes_t *executed,
+        const dep_route_state_t *executed_state, const dep_fd_op_t *ops,
+        uint32_t op_count, bool descriptor_exec, bool named_binding,
+        const dep_named_mutations_t *mutations, dep_route_state_t *report_state,
+        const dep_route_state_t *setup_entry) {
   uint32_t owner = dep_snapshot_event_owner(context, event);
   uint8_t modes = dep_owner_undo_mode(context, owner);
   bool survived = context->owner_setup_stop[owner] == UINT32_MAX;
   dep_fd_flow_t outcomes = {0};
+  const dep_snapshot_source_t *prepared =
+      &context->workspace
+           ->snapshot_sources[context->snapshot->prepared_source[owner]];
+  if (event >= SHELL_MAX_GROUPS && survived &&
+      (prepared->read.active || prepared->observation_first[0] ||
+       prepared->observation_first[1] || prepared->observation_first[2])) {
+    dep_route_iterator_t iterator = dep_route_iterator(executed_state);
+    uint32_t root;
+    bool report_ready = false;
+    while (dep_route_next(&iterator, journal, &root)) {
+      dep_route_state_t one = dep_route_state_single(root);
+      const dep_read_plan_t *plan = &prepared->read;
+      dep_read_versions_t observations = {.outcomes = {one}, .mask = 1};
+      dep_read_result_t read = {0};
+      if (plan->active)
+        read = dep_read_evaluate(plan, &one, journal, baseline, &observations,
+                                 context->workspace->read_frontiers);
+      if (read.exhausted)
+        return SHELL_DEP_ETRUNC;
+      if (read.unsupported)
+        return SHELL_DEP_EPARSE;
+      dep_domain_collection_t read_pins = {
+          .remaining = &iterator,
+          .states = observations.outcomes,
+          .state_count = DEP_READ_OUTCOMES,
+          .flow = &outcomes,
+          .roots = {report_ready ? report_state : NULL, &one}};
+      for (unsigned kind = 0; kind < DEP_READ_OUTCOMES; kind++) {
+        if (!(observations.mask & (1u << kind)))
+          continue;
+        dep_route_iterator_t versions =
+            dep_route_iterator(&observations.outcomes[kind]);
+        uint32_t version;
+        while (dep_route_next(&versions, journal, &version)) {
+          dep_route_state_t terminal = dep_route_state_single(version);
+          dep_read_result_t local_read = read;
+          dep_route_set_t effects = dep_fd_raw_fact(
+              &terminal, journal, baseline, dep_fd_numeric(SHELL_DEP_FD_NONE),
+              DEP_FD_ACCESS_EFFECT_STATE);
+          local_read.targets = effects.count ? effects.routes[0].value : 0;
+          local_read.default_target = effects.count && effects.routes[1].value;
+          local_read.status = kind == DEP_READ_SUCCESS ? DEP_STATUS_MAY_SUCCEED
+                                                       : DEP_STATUS_MAY_FAIL;
+          local_read.assigned_failure = kind == DEP_READ_ASSIGNED_FAILURE;
+          local_read.unassigned_failure = kind == DEP_READ_UNASSIGNED_FAILURE;
+          read_pins.roots[0] = report_ready ? report_state : NULL;
+          dep_route_state_t report = {0};
+          dep_fd_flow_t path;
+          uint8_t mode = dep_setup_mode(&terminal, journal, baseline, modes);
+          if (!dep_fd_finish_owner_scope(
+                  context, stream, event, journal, baseline, incoming, executed,
+                  &terminal, ops, op_count, descriptor_exec,
+                  named_binding &&
+                      (modes != DEP_UNDO_BOTH || mode == DEP_UNDO_COMMAND),
+                  mutations, report_state ? &report : NULL, setup_entry, mode,
+                  true, plan->active ? &local_read : NULL, &read_pins, &path))
+            return SHELL_DEP_ETRUNC;
+          for (unsigned outcome = 0; outcome < 5; outcome++)
+            if ((path.mask & (1u << outcome)) &&
+                (!dep_fd_retire_owner_facts(
+                     context, event, &path.state[outcome], journal, baseline) ||
+                 !dep_fd_add(&outcomes, outcome, path.state[outcome], journal,
+                             baseline)))
+              return SHELL_DEP_ETRUNC;
+          if (report_state) {
+            if (!report_ready) {
+              *report_state = report;
+              report_ready = true;
+            } else if (!dep_fd_merge(report_state, &report, journal, baseline))
+              return SHELL_DEP_ETRUNC;
+          }
+        }
+      }
+    }
+    return dep_fd_finish(context, stream, event, &outcomes, journal, baseline)
+               ? SHELL_DEP_OK
+               : SHELL_DEP_ETRUNC;
+  }
   if (modes != DEP_UNDO_BOTH) {
-    if (!dep_fd_finish_owner_scope(
-            context, stream, event, journal, baseline, incoming, executed,
-            executed_state, ops, op_count, descriptor_exec, named_binding,
-            mutations, report_state, setup_entry, modes, survived, &outcomes))
-      return false;
+    if (!dep_fd_finish_owner_scope(context, stream, event, journal, baseline,
+                                   incoming, executed, executed_state, ops,
+                                   op_count, descriptor_exec, named_binding,
+                                   mutations, report_state, setup_entry, modes,
+                                   survived, NULL, NULL, &outcomes))
+      return SHELL_DEP_ETRUNC;
     return event < SHELL_MAX_GROUPS ||
-           dep_fd_finish(context, stream, event, &outcomes, journal, baseline);
+                   dep_fd_finish(context, stream, event, &outcomes, journal,
+                                 baseline)
+               ? SHELL_DEP_OK
+               : SHELL_DEP_ETRUNC;
   }
   bool report_ready = false;
   for (uint8_t mode = DEP_UNDO_CHILD; mode <= DEP_UNDO_COMMAND; mode <<= 1) {
@@ -12267,9 +19756,9 @@ static SHELL_NONNULL(1, 2, 4, 5, 6, 7, 8, 13, 15) bool dep_fd_finish_owner(
     if (!op_count) {
       selected = *executed_state;
       found = true;
-    } else if (!dep_setup_select(executed_state, journal, incoming, mode,
+    } else if (!dep_setup_select(executed_state, journal, baseline, mode,
                                  &selected, &found))
-      return false;
+      return SHELL_DEP_ETRUNC;
     if (!found)
       selected = *setup_entry;
     /* This scratch span's lifetime ends before another owner or recursive
@@ -12280,34 +19769,39 @@ static SHELL_NONNULL(1, 2, 4, 5, 6, 7, 8, 13, 15) bool dep_fd_finish_owner(
       scoped_ops[op].undo_mode = mode;
     }
     dep_fd_flow_t scoped;
-    dep_route_state_t report;
+    dep_route_state_t report = {0};
+    dep_domain_collection_t pins = {
+        .flow = &outcomes, .roots = {report_ready ? report_state : NULL}};
     if (!dep_fd_finish_owner_scope(
             context, stream, event, journal, baseline, incoming, executed,
             &selected, scoped_ops, op_count, descriptor_exec,
             mode == DEP_UNDO_COMMAND && named_binding, mutations,
             report_state ? &report : NULL, setup_entry, mode, survived && found,
-            &scoped))
-      return false;
+            NULL, &pins, &scoped))
+      return SHELL_DEP_ETRUNC;
     for (unsigned outcome = 0; outcome < 5; outcome++)
       if ((scoped.mask & (1u << outcome)) &&
           !dep_fd_add(&outcomes, outcome, scoped.state[outcome], journal,
                       baseline))
-        return false;
+        return SHELL_DEP_ETRUNC;
     if (report_state) {
       if (!report_ready) {
         *report_state = report;
         report_ready = true;
       } else if (!dep_fd_merge(report_state, &report, journal, baseline))
-        return false;
+        return SHELL_DEP_ETRUNC;
     }
   }
-  return dep_fd_finish(context, stream, event, &outcomes, journal, baseline);
+  return dep_fd_finish(context, stream, event, &outcomes, journal, baseline)
+             ? SHELL_DEP_OK
+             : SHELL_DEP_ETRUNC;
 }
 
 /* An allocation skipped only because this compound's setup failed is known
  * absent, not an arbitrary variable value. Joining absence with the successful
  * allocation retains its possible routes, but invents no route on absence.
- * Explicit reassignment/unset remains unknown and still invalidates proof. */
+ * Explicit scalar writes invalidate allocation associations; stable unsets
+ * retain emptiness, never a proof that the old physical descriptor closed. */
 static SHELL_NONNULL(1, 2, 3, 4) bool dep_fd_setup_absences(
     dep_route_state_t *failed, const dep_route_state_t *body,
     dep_route_journal_t *journal, const dep_owner_routes_t *baseline,
@@ -12315,21 +19809,32 @@ static SHELL_NONNULL(1, 2, 3, 4) bool dep_fd_setup_absences(
   if (!root || root == entry_root)
     return true;
   dep_route_change_t change = journal->entries[root - 1];
+  dep_fd_ref_t fd = dep_route_change_fd(journal, &journal->entries[root - 1]);
+  dep_fd_access_t access = dep_route_change_access(&change);
   const dep_route_change_t *entry =
       entry_root ? &journal->entries[entry_root - 1] : NULL;
-  bool same_key = entry && dep_fd_ref_compare(change.fd, entry->fd) == 0 &&
-                  change.access == entry->access;
+  bool same_key =
+      entry &&
+      dep_fd_ref_compare(fd, dep_route_change_fd(journal, entry)) == 0 &&
+      access == dep_route_change_access(entry);
   if (!dep_fd_setup_absences(failed, body, journal, baseline, change.left,
                              same_key ? entry->left : 0))
     return false;
-  if (change.access == DEP_FD_ACCESS_BINDING &&
-      dep_fd_fact(body, journal, baseline, change.fd, DEP_FD_ACCESS_BINDING)
+  if (access == DEP_FD_ACCESS_NAMED_BINDINGS &&
+      !dep_fd_setup_absences(
+          failed, body, journal, baseline,
+          journal->snapshots[change.snapshot - 1].routes[0].value,
+          same_key ? journal->snapshots[entry->snapshot - 1].routes[0].value
+                   : 0))
+    return false;
+  if (access == DEP_FD_ACCESS_BINDING &&
+      dep_fd_fact(body, journal, baseline, fd, DEP_FD_ACCESS_BINDING)
               .routes[0]
               .kind == DEP_ROUTE_INHERITED &&
-      dep_fd_fact(failed, journal, baseline, change.fd, DEP_FD_ACCESS_BINDING)
+      dep_fd_fact(failed, journal, baseline, fd, DEP_FD_ACCESS_BINDING)
               .routes[0]
               .kind == DEP_ROUTE_UNSEEN) {
-    if (!dep_fd_mark_absent(failed, journal, baseline, change.fd))
+    if (!dep_fd_mark_absent(failed, journal, baseline, fd))
       return false;
   }
   return dep_fd_setup_absences(failed, body, journal, baseline, change.right,
@@ -12353,14 +19858,17 @@ static SHELL_NONNULL(1, 2, 4, 5, 6) bool dep_fd_complete_group(
     return false;
   if (context->group_exec[group].isolated)
     failed = entry;
+  else if (completion.added &&
+           !dep_process_close_owner(&failed, journal, baseline, context,
+                                    context->group_node[group]))
+    return false;
   for (unsigned i = 0; i < 5; i++) {
     if ((completion.added & (1u << i)) &&
         !dep_fd_add(&completed, i, failed, journal, baseline))
       return false;
     if (!(body.mask & (1u << i)))
       continue;
-    dep_route_state_t state =
-        context->group_exec[group].isolated ? entry : body.state[i];
+    dep_route_state_t state = body.state[i];
     if (!context->group_exec[group].isolated) {
       journal->diagnostic_cleanup = true;
       bool restored = dep_fd_restore_slots(&state, journal, baseline,
@@ -12369,22 +19877,33 @@ static SHELL_NONNULL(1, 2, 4, 5, 6) bool dep_fd_complete_group(
       journal->diagnostic_cleanup = false;
       if (!restored)
         return false;
+      if (!dep_process_close_owner(&state, journal, baseline, context,
+                                   context->group_node[group]))
+        return false;
     }
     for (unsigned target = 0; target < 5; target++)
       if ((completion.outcome[i] & (1u << target)) &&
           !dep_fd_add(&completed, target, state, journal, baseline))
         return false;
   }
-  return dep_fd_finish(context, stream, group, &completed, journal, baseline);
+  if (!dep_fd_finish(context, stream, group, &completed, journal, baseline))
+    return false;
+  /* Group setup failure, body, and selected-entry versions have no consumer
+   * after completion has published them into the parent flow. */
+  stream->scope[group + 1] = (dep_fd_flow_t){0};
+  stream->setup_failure[group] = (dep_fd_flow_t){0};
+  return true;
 }
 
-/* Restore the completed body's temporary numeric frame for its shell-owned
- * timing report. Continuations are transferred separately by dep_fd_stream. */
-static SHELL_NONNULL(1, 2, 3, 4, 5, 6) bool dep_publish_completed_scope(
+/* Restore the completed body's temporary numeric frame and dispose its
+ * process pipes before the shell-owned timing report. Continuations are
+ * transferred separately by dep_fd_stream. */
+static SHELL_NONNULL(1, 2, 3, 4, 5, 6, 7) bool dep_publish_completed_scope(
     dep_owner_routes_t *destination, dep_route_state_t *destination_state,
     const dep_owner_routes_t *completed,
     const dep_route_state_t *completed_state, dep_route_journal_t *journal,
-    const dep_route_publication_t *publication) {
+    const dep_route_publication_t *publication,
+    const dep_parse_context_t *context) {
   DEP_METADATA_WORK(SHELLSPLIT_TEST_WORK_ROUTE_PUBLICATION);
   dep_owner_routes_t restored;
   dep_copy_routes(&restored, completed);
@@ -12392,6 +19911,13 @@ static SHELL_NONNULL(1, 2, 3, 4, 5, 6) bool dep_publish_completed_scope(
   if (!dep_restore_continuation_routes(&restored, destination, publication) ||
       !dep_restore_continuation_route_state(&alternatives, journal, destination,
                                             publication))
+    return false;
+  dep_route_state_t before_cleanup = alternatives;
+  if (!dep_process_close_owner(
+          &alternatives, journal, destination, context,
+          context->group_node[publication->source_group]) ||
+      !dep_fd_materialize_from(&alternatives, &before_cleanup, journal,
+                               destination, &restored, &restored))
     return false;
   dep_copy_routes(destination, &restored);
   *destination_state = alternatives;
@@ -12425,17 +19951,18 @@ static SHELL_NONNULL(1, 2, 3, 4) bool dep_complete_route_group(
                           completed))
     return false;
   workspace->group_time_routes[group] = dep_time_report_for_fd2(
-      completed_state, &workspace->route_journal, completed);
+      completed_state, &workspace->route_journal, baseline);
   if (workspace->group_shell_time_routes_ready[group]) {
     if (workspace->fd_stream.scope[group + 1].mask) {
       if (!dep_publish_completed_scope(
               &workspace->scoped_routes[group],
               &workspace->group_shell_route_state[group], completed,
-              completed_state, &workspace->route_journal, &publication))
+              completed_state, &workspace->route_journal, &publication,
+              context))
         return false;
-      workspace->group_shell_time_routes[group] = dep_time_report_for_fd2(
-          &workspace->group_shell_route_state[group], &workspace->route_journal,
-          &workspace->scoped_routes[group]);
+      workspace->group_shell_time_routes[group] =
+          dep_time_report_for_fd2(&workspace->group_shell_route_state[group],
+                                  &workspace->route_journal, baseline);
     } else
       /* No body version reached completion. An entry fallback is not a
        * successful cleanup path and must not invent a report destination. */
@@ -12470,10 +19997,10 @@ static SHELL_NONNULL(1, 2, 3, 4) bool dep_complete_route_group(
     return false;
   if (parent >= 0) {
     workspace->group_time_routes[parent] = dep_time_report_for_fd2(
-        destination_state, &workspace->route_journal, destination);
+        destination_state, &workspace->route_journal, baseline);
   } else {
     workspace->persistent_time_routes = dep_time_report_for_fd2(
-        destination_state, &workspace->route_journal, destination);
+        destination_state, &workspace->route_journal, baseline);
   }
   return true;
 }
@@ -12532,12 +20059,24 @@ static int dep_numeric_value_compare(const void *left, const void *right) {
 }
 
 typedef struct {
+  uint32_t position, fd;
+} dep_low_observation_t;
+
+typedef struct {
   uint32_t fds[DEP_ROUTE_OPERATION_CAPACITY];
   bool required[DEP_ROUTE_OPERATION_CAPACITY];
   dep_index_node_t index[DEP_ROUTE_OPERATION_CAPACITY];
   uint32_t root, count;
+  dep_read_observations_t read_observations;
+  /* Source positions of descriptor-sensitive operations, including nested
+   * bodies. Sort once, then query command/group lifetimes by lower bound. */
+  uint32_t positions[DEP_ROUTE_OPERATION_CAPACITY];
+  uint32_t position_count;
+  dep_low_observation_t low[DEP_ROUTE_OPERATION_CAPACITY];
+  uint32_t low_count;
   bool overflow;
   bool named_fds;
+  bool has_process;
   bool named_closes;
   bool scratch_observable;
   const char *pending_operand;
@@ -12545,6 +20084,115 @@ typedef struct {
   const char *source;
   size_t source_length;
 } dep_observable_inventory_t;
+
+static SHELL_NONNULL(1, 2) void dep_inventory_position(
+    dep_observable_inventory_t *inventory, const char *source) {
+  if (inventory->position_count == DEP_ROUTE_OPERATION_CAPACITY) {
+    inventory->overflow = true;
+    return;
+  }
+  inventory->positions[inventory->position_count++] =
+      (uint32_t)(source - inventory->source);
+}
+
+/* Collect low numeric references at the semantic validation boundary. High
+ * descriptors retain the shared named-allocation/scratch identity model. */
+static SHELL_NONNULL(1, 2) void dep_inventory_low(
+    dep_observable_inventory_t *inventory, const char *source, uint32_t fd) {
+  if (fd < 3 || fd >= DEP_BASH_VARREDIR_MIN_FD)
+    return;
+  if (inventory->low_count == DEP_ROUTE_OPERATION_CAPACITY) {
+    inventory->overflow = true;
+    return;
+  }
+  inventory->low[inventory->low_count++] =
+      (dep_low_observation_t){(uint32_t)(source - inventory->source), fd};
+}
+
+static SHELL_NONNULL(1, 2) int dep_low_observation_compare(const void *left,
+                                                           const void *right) {
+  const dep_low_observation_t *a = left, *b = right;
+  if (a->fd != b->fd)
+    return a->fd < b->fd ? -1 : 1;
+  return a->position < b->position ? -1 : a->position != b->position;
+}
+
+/* The fixed low-auxiliary range is below Bash's named-allocation minimum.
+ * Query its indexed references, never an owner's source. Standard streams
+ * are always potential observable pipe ends. */
+static SHELL_NONNULL(1, 4) bool dep_process_lifetime_observed(
+    const dep_observable_inventory_t *inventory, uint32_t begin, uint32_t end,
+    uint16_t *observed_low) {
+  *observed_low = 7u;
+  uint32_t low = 0, high = inventory->position_count;
+  while (low < high) {
+    DEP_METADATA_WORK(SHELLSPLIT_TEST_WORK_PROCESS_ROUTES);
+    uint32_t middle = low + (high - low) / 2;
+    if (inventory->positions[middle] < begin)
+      low = middle + 1;
+    else
+      high = middle;
+  }
+  if (low == inventory->position_count || inventory->positions[low] >= end)
+    return false;
+  for (uint32_t fd = 3; fd < DEP_BASH_VARREDIR_MIN_FD; fd++) {
+    low = 0;
+    high = inventory->low_count;
+    dep_low_observation_t key = {begin, fd};
+    while (low < high) {
+      DEP_METADATA_WORK(SHELLSPLIT_TEST_WORK_PROCESS_ROUTES);
+      uint32_t middle = low + (high - low) / 2;
+      if (dep_low_observation_compare(&inventory->low[middle], &key) < 0)
+        low = middle + 1;
+      else
+        high = middle;
+    }
+    if (low < inventory->low_count && inventory->low[low].fd == fd &&
+        inventory->low[low].position < end)
+      *observed_low |= (uint16_t)(1u << fd);
+  }
+  return true;
+}
+
+/* Finalize before recording any temporary end or guard for this owner. The
+ * existing phase checkpoint advances earlier owners once and applies scope
+ * restoration/pipeline setup. Only the three standard bindings are queried;
+ * a past close in another lifetime must not enable Cartesian enumeration. */
+static SHELL_NONNULL(1, 2, 3) shell_dep_error_t
+    dep_prepare_process_tracking(const shell_dep_graph_t *graph,
+                                 const dep_subgraph_streams_t *streams,
+                                 const dep_parse_context_t *context,
+                                 uint32_t owner, uint32_t position,
+                                 dep_snapshot_phase_t phase) {
+  dep_process_route_map_t *process = context->process_routes;
+  if (process->tracking_ready[owner])
+    return SHELL_DEP_OK;
+  if (!process->track[owner]) {
+    uint32_t table;
+    shell_dep_error_t error = dep_snapshot_phase_table(
+        graph, streams, context, owner, position, phase, &table);
+    if (error != SHELL_DEP_OK)
+      return error;
+    const dep_snapshot_table_t *entry =
+        &context->workspace->snapshot_tables[table];
+    dep_route_state_t state = dep_snapshot_alternatives(entry);
+    for (uint32_t fd = 0; fd < 3; fd++) {
+      DEP_METADATA_WORK(SHELLSPLIT_TEST_WORK_PROCESS_ROUTES);
+      if (dep_fd_occupancy(
+              &state, &context->workspace->snapshot_journal,
+              &context->workspace
+                   ->snapshot_tables[context->snapshot->persistent[0]]
+                   .routes,
+              fd)
+              .may_be_free) {
+        process->track[owner] = true;
+        break;
+      }
+    }
+  }
+  process->tracking_ready[owner] = true;
+  return SHELL_DEP_OK;
+}
 
 static SHELL_NONNULL(1, 3) int dep_observable_compare(const void *context,
                                                       uint32_t index,
@@ -12556,7 +20204,7 @@ static SHELL_NONNULL(1, 3) int dep_observable_compare(const void *context,
 
 static SHELL_NONNULL(1) void dep_inventory_add(
     dep_observable_inventory_t *inventory, uint32_t fd, bool required) {
-  if (fd < DEP_BASH_VARREDIR_MIN_FD || fd > SHELL_DEP_FD_MAX)
+  if (fd > SHELL_DEP_FD_MAX)
     return;
   uint32_t candidate = inventory->count + 1, match = 0;
   inventory->root =
@@ -12573,6 +20221,48 @@ static SHELL_NONNULL(1) void dep_inventory_add(
   }
 }
 
+static SHELL_NONNULL(1, 7) void dep_observe_read_fd(
+    const char *word, uint32_t fd, unsigned kind, const char *parameter,
+    size_t parameter_length, bool identity, void *context) {
+  dep_observable_inventory_t *inventory = context;
+  /* Ordinary standard streams cannot observe private high ends. Explicit
+   * auxiliary selectors and named identities can, including in nested shells.
+   * Possible standard-slot reuse is retained by the owner's entry snapshot. */
+  if (kind == 2 || (kind == 1 && fd >= 3) || identity)
+    dep_inventory_position(inventory, word);
+  if (kind == 1)
+    dep_inventory_low(inventory, word, fd);
+  if (parameter &&
+      !dep_read_observe(&inventory->read_observations,
+                        (dep_fd_ref_t){.name = parameter,
+                                       .value = SHELL_DEP_FD_NAMED,
+                                       .name_len = (uint32_t)parameter_length},
+                        identity ? DEP_READ_OBSERVE_IDENTITY |
+                                       DEP_READ_OBSERVE_ACCESS
+                                 : DEP_READ_OBSERVE_VALUE))
+    inventory->overflow = true;
+  if (kind == 2) {
+    inventory->named_fds = true;
+    inventory->scratch_observable = true;
+  } else if (kind == 1 || kind == 3) {
+    if (!dep_read_observe(&inventory->read_observations, dep_fd_numeric(fd),
+                          kind == 3 ? DEP_READ_OBSERVE_ACCESS
+                                    : DEP_READ_OBSERVE_IDENTITY |
+                                          DEP_READ_OBSERVE_ACCESS))
+      inventory->overflow = true;
+    if (kind == 1)
+      dep_inventory_add(inventory, fd, true);
+    inventory->scratch_observable |= fd >= DEP_BASH_VARREDIR_MIN_FD;
+  }
+}
+
+static SHELL_NONNULL(1, 3) void dep_observe_process(const char *word,
+                                                    size_t length,
+                                                    void *context) {
+  dep_observable_inventory_t *inventory = context;
+  inventory->has_process |= !shell_source_empty_process_word(word, length);
+}
+
 /* The semantic boundary already visits root and expansion-body tokens.
  * Collect observable numeric identities there, before any operand snapshot
  * needs allocation decisions. This is metadata extraction, not another parse
@@ -12580,6 +20270,7 @@ static SHELL_NONNULL(1) void dep_inventory_add(
 static SHELL_NONNULL(1, 2) void dep_observe_descriptor_token(
     const shell_token_t *token, void *context) {
   dep_observable_inventory_t *inventory = context;
+  bool current_shell = token->start - token->position == inventory->source;
   if (inventory->pending_operand &&
       token->start >= inventory->pending_operand) {
     uint32_t fd = 0;
@@ -12587,16 +20278,24 @@ static SHELL_NONNULL(1, 2) void dep_observe_descriptor_token(
         token->start, token->length, &fd);
     if (kind == SHELL_PROCESS_FD_TARGET_FD ||
         kind == SHELL_PROCESS_FD_TARGET_MOVE) {
+      if (fd >= 3 || inventory->pending_destination >= 3)
+        dep_inventory_position(inventory, token->start);
+      dep_inventory_low(inventory, token->start, fd);
       dep_inventory_add(inventory, fd, true);
       inventory->scratch_observable |= fd >= DEP_BASH_VARREDIR_MIN_FD;
     }
     inventory->named_closes |= kind == SHELL_PROCESS_FD_TARGET_MOVE;
+    if (current_shell && ((kind == SHELL_PROCESS_FD_TARGET_CLOSE &&
+                           inventory->pending_destination < 3) ||
+                          (kind == SHELL_PROCESS_FD_TARGET_MOVE && fd < 3)))
+      dep_inventory_position(inventory, token->start);
     inventory->scratch_observable |=
         (kind == SHELL_PROCESS_FD_TARGET_MOVE ||
          (kind == SHELL_PROCESS_FD_TARGET_CLOSE && token->group_depth != 0)) &&
         inventory->pending_destination >= DEP_BASH_VARREDIR_MIN_FD &&
         inventory->pending_destination <= SHELL_DEP_FD_MAX;
     if (shell_source_argument_has_dynamic_syntax(token->start, token->length)) {
+      dep_inventory_position(inventory, token->start);
       size_t start = (size_t)(token->start - inventory->source);
       size_t end = shell_source_skip_redirect_word(inventory->source, start,
                                                    inventory->source_length);
@@ -12623,11 +20322,23 @@ static SHELL_NONNULL(1, 2) void dep_observe_descriptor_token(
   }
   size_t after = 0;
   uint32_t fd = 0;
+  bool sensitive = false;
   if (shell_source_parse_io_number(token->start, 0, token->length, &after,
                                    &fd) == SHELL_SOURCE_IO_NUMBER_VALID) {
+    sensitive = fd >= 3;
     dep_inventory_add(inventory, fd, false);
   } else if (shell_source_parse_named_fd_redirect(token->start, 0,
                                                   token->length, &after)) {
+    size_t name_after;
+    (void)shell_source_parse_named_fd_at_word_start(token->start, 0,
+                                                    token->length, &name_after);
+    if (!dep_read_observe(&inventory->read_observations,
+                          (dep_fd_ref_t){.name = token->start + 1,
+                                         .value = SHELL_DEP_FD_NAMED,
+                                         .name_len = (uint32_t)name_after - 2},
+                          0))
+      inventory->overflow = true;
+    sensitive = true;
     inventory->named_fds = true;
     inventory->scratch_observable = true;
     dep_token_t raw = {.start = token->start, .len = (uint32_t)token->length};
@@ -12641,6 +20352,13 @@ static SHELL_NONNULL(1, 2) void dep_observe_descriptor_token(
   if (dep_parse_dup_redirect(&raw, &source, &target, &source_name, &source_len,
                              &target_name, &target_len, &close, &access,
                              &target_unquoted, &move)) {
+    sensitive |= source >= 3 || (!close && target >= 3);
+    dep_inventory_low(inventory, token->start, source);
+    if (!close && target != source)
+      dep_inventory_low(inventory, token->start, target);
+    sensitive |= current_shell &&
+                 ((close && source < 3) ||
+                  (move && (target < 3 || (target_unquoted && source < 3))));
     inventory->named_closes |= (source == SHELL_DEP_FD_NAMED && close) || move;
     inventory->scratch_observable |=
         ((move || (close && token->group_depth != 0)) &&
@@ -12656,10 +20374,15 @@ static SHELL_NONNULL(1, 2) void dep_observe_descriptor_token(
      * source frontier. The destination remains observable even when the next
      * word is `-` and contributes no numeric source of its own. */
     uint32_t destination = redirect_fd(&raw, DEP_REDIRECT_DUP);
+    sensitive |= destination >= 3;
+    dep_inventory_low(inventory, token->start, destination);
     dep_inventory_add(inventory, destination, true);
     inventory->pending_operand = token->start + token->length;
     inventory->pending_destination = destination;
-  }
+  } else
+    dep_inventory_low(inventory, token->start, fd);
+  if (sensitive)
+    dep_inventory_position(inventory, token->start);
 }
 
 /* Reuse the inventory collected by the source validation boundary. Explicit
@@ -12676,6 +20399,7 @@ static SHELL_NONNULL(1) void dep_prepare_observable_fds(
       workspace->snapshot_journal.observable_fd_count;
   journal->scratch_observable = workspace->snapshot_journal.scratch_observable;
   journal->named_closes = workspace->snapshot_journal.named_closes;
+  journal->read_observations = workspace->snapshot_journal.read_observations;
   memcpy(journal->observable_fds, workspace->snapshot_journal.observable_fds,
          journal->observable_fd_count * sizeof(journal->observable_fds[0]));
 }
@@ -12704,8 +20428,9 @@ static SHELL_NONNULL(1, 3, 4) bool dep_publish_diagnostics(
     const shell_dep_edge_t *edge = &graph->edges[i];
     if ((edge->type == SHELL_EDGE_WRITE || edge->type == SHELL_EDGE_APPEND) &&
         edge->source_fd == 2 &&
-        !dep_record_stream_use(sinks, &count, index, &root, edge->from, 2,
-                               DEP_FD_ACCESS_WRITE, edge->to))
+        !dep_record_stream_use(sinks, &count, index, &root, edge->from,
+                               dep_fd_numeric(2), DEP_FD_ACCESS_WRITE,
+                               edge->to))
       return false;
   }
   for (uint32_t i = 0; i < workspace->diagnostics.count; i++) {
@@ -12714,19 +20439,21 @@ static SHELL_NONNULL(1, 3, 4) bool dep_publish_diagnostics(
     dep_fd_route_t route = use->route;
     bool retained;
     if (route.kind == DEP_ROUTE_INHERITED) {
-      retained = dep_record_external_use(streams, use->owner, 2,
+      retained = dep_record_external_use(streams, use->owner, dep_fd_numeric(2),
                                          DEP_FD_ACCESS_WRITE, route.value);
     } else if (route.kind == DEP_ROUTE_CAPTURE) {
-      retained = dep_record_actual_capture(streams, use->owner, 2,
-                                           DEP_FD_ACCESS_WRITE, route.value);
+      retained =
+          dep_record_actual_capture(streams, use->owner, dep_fd_numeric(2),
+                                    DEP_FD_ACCESS_WRITE, route.value);
     } else if (route.kind == DEP_ROUTE_IMPORTED) {
-      retained = dep_record_fd_import_use(streams, use->owner, 2,
-                                          DEP_FD_ACCESS_WRITE, route.value);
+      retained =
+          dep_record_fd_import_use(streams, use->owner, dep_fd_numeric(2),
+                                   DEP_FD_ACCESS_WRITE, route.value);
     } else if (route.kind == DEP_ROUTE_PIPE) {
       retained = dep_record_stream_use(
           streams->pipe_uses, &streams->pipe_use_count, streams->pipe_index,
-          &streams->pipe_root, use->owner, 2, DEP_FD_ACCESS_WRITE,
-          workspace->pipes[route.value].from);
+          &streams->pipe_root, use->owner, dep_fd_numeric(2),
+          DEP_FD_ACCESS_WRITE, workspace->pipes[route.value].from);
     } else {
       /* Runtime-unknown routes are not concrete resource references. Do not
        * return a complete graph after losing their diagnostic destination. */
@@ -12741,8 +20468,9 @@ static SHELL_NONNULL(1, 3, 4) bool dep_publish_diagnostics(
                    ? SHELL_EDGE_APPEND
                    : SHELL_EDGE_WRITE;
       uint32_t before = count;
-      if (!dep_record_stream_use(sinks, &count, index, &root, use->owner, 2,
-                                 DEP_FD_ACCESS_WRITE, original->to))
+      if (!dep_record_stream_use(sinks, &count, index, &root, use->owner,
+                                 dep_fd_numeric(2), DEP_FD_ACCESS_WRITE,
+                                 original->to))
         return false;
       if (count == before)
         continue;
@@ -12752,6 +20480,175 @@ static SHELL_NONNULL(1, 3, 4) bool dep_publish_diagnostics(
     }
     if (!retained)
       return false;
+  }
+  return true;
+}
+
+/* Ordinary deferred body I/O needs the union of byte routes, not the setup's
+ * private undo/allocator history. Resolve aliases against their own versions
+ * now, while those versions are live. This is one sparse publication cache per
+ * owner, never a descriptor-table copy per execution alternative. Read and
+ * compound owners still need their full correlated semantic versions. */
+static SHELL_NONNULL(1, 2, 3, 4, 6) bool dep_retain_owner_io(
+    dep_route_workspace_t *workspace, const dep_parse_context_t *context,
+    const shell_dep_graph_t *graph, const dep_route_state_t *state,
+    uint32_t owner, const dep_owner_routes_t *baseline) {
+  dep_route_state_t *retained = &workspace->owner_route_state[owner];
+  if (graph->nodes[owner].type == SHELL_NODE_GROUP ||
+      workspace->snapshot_sources[context->snapshot->prepared_source[owner]]
+          .read.active) {
+    *retained = *state;
+    return true;
+  }
+  if (dep_owner_exec(context, owner)->kind == DEP_EXEC_DESCRIPTORS)
+    return true;
+  uint32_t count = workspace->route_slot_count[owner];
+  for (uint32_t use = 0; use < count + 3; use++) {
+    uint32_t fd = use < count
+                      ? workspace->routes[owner]
+                            .fd[dep_owner_route_slot(workspace, owner, use)]
+                            .fd.value
+                      : use - count;
+    if (fd > SHELL_DEP_FD_MAX ||
+        (use >= count && (workspace->route_standard_mask[owner] & (1u << fd))))
+      continue;
+    for (uint32_t access = DEP_FD_ACCESS_READ; access <= DEP_FD_ACCESS_WRITE;
+         access <<= 1) {
+      dep_route_set_t routes =
+          dep_fd_fact(state, &workspace->route_journal, baseline,
+                      dep_fd_numeric(fd), (dep_fd_access_t)access);
+      if (routes.truncated ||
+          !dep_route_state_store_access(retained, &workspace->route_journal,
+                                        dep_fd_numeric(fd),
+                                        (dep_fd_access_t)access, routes))
+        return false;
+    }
+  }
+  return true;
+}
+
+/* Emit read's selected input through the same deferred resources as ordinary
+ * body I/O. A captured allocation keeps its argument's name even when redirects
+ * subsequently reassign that variable. An empty scalar leaves a literal FD,
+ * published numerically. A selected auxiliary FD is a real use, unlike an
+ * unreferenced allocation or undo save. */
+static SHELL_NONNULL(1, 3, 4, 5, 6, 7, 8) bool dep_publish_read_inputs(
+    shell_dep_graph_t *graph, uint32_t max_edges,
+    dep_route_workspace_t *workspace, dep_subgraph_streams_t *streams,
+    const dep_parse_context_t *context, const bool *eligible,
+    bool *used_documents, const dep_owner_routes_t *baseline) {
+  dep_stream_use_t *keys = workspace->import_join.endpoints;
+  dep_index_node_t *index = workspace->import_join.endpoint_index;
+  uint32_t count = 0, key_root = 0;
+  for (uint32_t owner = 0; owner < graph->node_count; owner++) {
+    if (!eligible[owner] || graph->nodes[owner].type != SHELL_NODE_CMD)
+      continue;
+    const dep_read_plan_t *plan =
+        &workspace->snapshot_sources[context->snapshot->prepared_source[owner]]
+             .read;
+    if (!plan->active)
+      continue;
+    dep_route_iterator_t iterator =
+        dep_route_iterator(&workspace->owner_route_state[owner]);
+    uint32_t root;
+    while (dep_route_next(&iterator, &workspace->route_journal, &root)) {
+      dep_route_state_t state = dep_route_state_single(root);
+      dep_read_versions_t observations;
+      dep_read_result_t result =
+          dep_read_evaluate(plan, &state, &workspace->route_journal, baseline,
+                            &observations, workspace->read_frontiers);
+      if (result.exhausted)
+        return false;
+      for (uint32_t selection = 0; selection <= plan->count; selection++) {
+        if (!(result.input & (UINT64_C(1) << selection)))
+          continue;
+        state = observations.inputs[selection];
+        dep_fd_ref_t display;
+        dep_fd_ref_t physical =
+            dep_read_descriptor(plan, &state, selection,
+                                &workspace->route_journal, baseline, &display);
+        dep_route_set_t routes =
+            dep_fd_fact(&state, &workspace->route_journal, baseline, physical,
+                        DEP_FD_ACCESS_READ);
+        if (routes.truncated)
+          return false;
+        for (uint32_t choice = 0; choice < routes.count; choice++) {
+          dep_fd_route_t route = routes.routes[choice];
+          bool retained = true;
+          if (route.kind == DEP_ROUTE_CLOSED ||
+              route.kind == DEP_ROUTE_ABSENT ||
+              route.kind == DEP_ROUTE_UNAVAILABLE)
+            continue;
+          if (route.kind == DEP_ROUTE_INHERITED ||
+              route.kind == DEP_ROUTE_NULL_INPUT)
+            retained = dep_record_external_use(streams, owner, display,
+                                               DEP_FD_ACCESS_READ, route.value);
+          else if (route.kind == DEP_ROUTE_CAPTURE)
+            retained = dep_record_actual_capture(
+                streams, owner, display, DEP_FD_ACCESS_READ, route.value);
+          else if (route.kind == DEP_ROUTE_IMPORTED)
+            retained = dep_record_fd_import_use(
+                streams, owner, display, DEP_FD_ACCESS_READ, route.value);
+          else if (route.kind == DEP_ROUTE_PIPE) {
+            const shell_dep_edge_t *pipe = &workspace->pipes[route.value];
+            /* An enclosing group may already expose this same pipe side for
+             * ordinary members. Keep a selected auxiliary use distinct, but
+             * do not duplicate its aggregate fd-0 relation on a read member. */
+            if (graph->nodes[pipe->to].type == SHELL_NODE_GROUP &&
+                workspace->generic_read[pipe->to] &&
+                display.value == pipe->target_fd)
+              continue;
+            retained = dep_record_stream_use(
+                streams->pipe_uses, &streams->pipe_use_count,
+                streams->pipe_index, &streams->pipe_root, owner, display,
+                DEP_FD_ACCESS_READ, workspace->pipes[route.value].to);
+          } else {
+            if ((route.kind != DEP_ROUTE_DOC &&
+                 route.kind != DEP_ROUTE_DYNAMIC) ||
+                route.value >= workspace->original_edge_count)
+              return false;
+            const shell_dep_edge_t *original =
+                &workspace->original_edges[route.value];
+            if (graph->nodes[original->to].type == SHELL_NODE_GROUP &&
+                workspace->generic_read[original->to] &&
+                display.value != SHELL_DEP_FD_NAMED &&
+                display.value == original->target_fd &&
+                dep_route_owned_by_enclosing_group(
+                    graph, context->fast, &context->execution->pipeline,
+                    context->node_range, context->node_group, owner, original))
+              continue;
+            uint32_t from = original->from;
+            shell_dep_edge_type_t type = route.kind == DEP_ROUTE_DOC
+                                             ? SHELL_EDGE_READ
+                                             : SHELL_EDGE_SUBST;
+            if (type == SHELL_EDGE_READ &&
+                graph->nodes[from].type != SHELL_NODE_DOC)
+              from = original->to;
+            uint32_t before = count;
+            if (!dep_record_stream_use(keys, &count, index, &key_root, owner,
+                                       display, DEP_FD_ACCESS_READ, from))
+              return false;
+            used_documents[route.value] |=
+                original->to == owner && original->target_fd == display.value &&
+                (display.value != SHELL_DEP_FD_NAMED ||
+                 dep_fd_ref_equal(
+                     (dep_fd_ref_t){.name = original->target_fd_name,
+                                    .value = original->target_fd,
+                                    .name_len = original->target_fd_name_len},
+                     display));
+            if (count == before)
+              continue;
+            retained = dep_add_resolved_edge_refs(
+                graph, max_edges, from, owner, type,
+                dep_fd_numeric(type == SHELL_EDGE_READ ? SHELL_DEP_FD_NONE
+                                                       : original->source_fd),
+                display, SHELL_DEP_EDGE_FLAG_NONE);
+          }
+          if (!retained)
+            return false;
+        }
+      }
+    }
   }
   return true;
 }
@@ -12827,6 +20724,8 @@ static SHELL_NONNULL(1, 2, 4, 5, 6, 7, 8, 9, 10, 13, 15, 16,
   memset(workspace->group_shell_route_state, 0,
          sizeof(workspace->group_shell_route_state));
   dep_route_journal_reset(&workspace->route_journal);
+  workspace->route_journal.process_scratch = &workspace->process_scratch;
+  workspace->route_journal.next_selector = &workspace->next_selector;
   workspace->route_journal.failure = &workspace->failure;
   workspace->diagnostics.count = workspace->diagnostics.root = 0;
   workspace->route_journal.diagnostics = &workspace->diagnostics;
@@ -13036,9 +20935,9 @@ static SHELL_NONNULL(1, 2, 4, 5, 6, 7, 8, 9, 10, 13, 15, 16,
                     workspace->scoped_time_routes_ready[report_parent]
                 ? workspace->scoped_route_state[report_parent]
                 : workspace->persistent_route_state;
-        workspace->scoped_time_routes[named_scope] = dep_time_report_for_fd2(
-            &workspace->scoped_route_state[named_scope],
-            &workspace->route_journal, &workspace->scoped_routes[named_scope]);
+        workspace->scoped_time_routes[named_scope] =
+            dep_time_report_for_fd2(&workspace->scoped_route_state[named_scope],
+                                    &workspace->route_journal, &flow_baseline);
         workspace->scoped_time_routes_ready[named_scope] = true;
       }
       persistent = &workspace->scoped_routes[named_scope];
@@ -13065,6 +20964,15 @@ static SHELL_NONNULL(1, 2, 4, 5, 6, 7, 8, 9, 10, 13, 15, 16,
     dep_snapshot_source_t *stdin_source;
     if (!dep_snapshot_fd_operations(graph, context, owner, &stdin_source))
       return SHELL_DEP_EPARSE;
+    if (!dep_source_variables_supported(stdin_source, &selected_state,
+                                        &workspace->route_journal,
+                                        &flow_baseline, context->fast))
+      return SHELL_DEP_EPARSE;
+    shell_dep_error_t capture =
+        dep_read_capture(&stdin_source->read, &selected_state,
+                         &workspace->route_journal, &flow_baseline);
+    if (capture != SHELL_DEP_OK)
+      return capture;
     /* This is the assignment-phase version: enclosing scopes and early async
      * wrappers are installed, but this owner's redirects and |& copy are not.
      */
@@ -13157,6 +21065,9 @@ static SHELL_NONNULL(1, 2, 4, 5, 6, 7, 8, 9, 10, 13, 15, 16,
           false,
           false,
           false,
+          NULL,
+          0,
+          0,
       };
     }
 
@@ -13202,6 +21113,9 @@ static SHELL_NONNULL(1, 2, 4, 5, 6, 7, 8, 9, 10, 13, 15, 16,
           false,
           false,
           false,
+          NULL,
+          0,
+          0,
       };
     }
 
@@ -13241,6 +21155,16 @@ static SHELL_NONNULL(1, 2, 4, 5, 6, 7, 8, 9, 10, 13, 15, 16,
         return SHELL_DEP_ETRUNC;
       ops[op_count++] = dep_pipe_both_operation();
     }
+    if (stdin_source->empty_process_failure) {
+      if (op_count == op_capacity)
+        return SHELL_DEP_ETRUNC;
+      ops[op_count++] =
+          (dep_fd_op_t){.pos = stdin_source->empty_process_failure - 1,
+                        .kind = DEP_FD_OP_FAILED,
+                        .fd = SHELL_DEP_FD_NONE,
+                        .target_fd = SHELL_DEP_FD_NONE,
+                        .edge_index = UINT32_MAX};
+    }
     dep_sort_fd_operations(ops, op_count, workspace->op_scratch);
     bool undo_observable = dep_owner_observes_undo(
         graph, context, owner, &owner_tokens, ops, op_count);
@@ -13278,18 +21202,58 @@ static SHELL_NONNULL(1, 2, 4, 5, 6, 7, 8, 9, 10, 13, 15, 16,
     }
     if (mutations->before_redirect &&
         (!dep_fd_bindings(&local_route_state, &workspace->route_journal,
-                          incoming, &workspace->owner_initial, NULL, 0,
-                          mutations) ||
+                          &flow_baseline, incoming, &workspace->owner_initial,
+                          NULL, 0, mutations) ||
          !dep_ifs_apply(&local_route_state, &workspace->route_journal,
-                        &workspace->owner_initial, mutations)))
+                        &flow_baseline, mutations)))
+      return SHELL_DEP_ETRUNC;
+    dep_route_state_t before_process_words = local_route_state;
+    dep_domain_collection_t process_collection = {.workspace = workspace};
+    uint32_t observation_cursor[3] = {0};
+    for (uint32_t process = process_routes->first[owner]; process;
+         process = process_routes->entries[process - 1].next) {
+      const dep_process_route_t *route = &process_routes->entries[process - 1];
+      if (!dep_observation_pending(
+              &local_route_state, &workspace->route_journal, &flow_baseline,
+              &workspace->observations, stdin_source, DEP_SNAPSHOT_COMMAND_WORD,
+              &observation_cursor[DEP_SNAPSHOT_COMMAND_WORD], route->position))
+        return SHELL_DEP_ETRUNC;
+      if (!route->temporary || !route->command_word ||
+          !process_routes->track[owner])
+        continue;
+      dep_fd_op_t op = {.pos = route->position,
+                        .kind = DEP_FD_OP_PROCESS,
+                        .fd_name = route->source,
+                        .edge_index = route->edge,
+                        .access = route->access,
+                        .guard = route->guard,
+                        .process_observed_low =
+                            process_routes->observed_low[owner]};
+      dep_route_domains_collect(&workspace->route_journal, &process_collection,
+                                &local_route_state, &before_process_words);
+      if (!dep_process_open(&local_route_state, &workspace->route_journal,
+                            &flow_baseline, &op))
+        return SHELL_DEP_ETRUNC;
+      if (route->standalone && (stdin_source->read.active || !route->byte_use))
+        dynamic_route_edges[route->edge] = true;
+    }
+    for (unsigned phase = DEP_SNAPSHOT_COMMAND_WORD;
+         phase <= DEP_SNAPSHOT_ASSIGNMENT_VALUE; phase++)
+      if (!dep_observation_pending(
+              &local_route_state, &workspace->route_journal, &flow_baseline,
+              &workspace->observations, stdin_source, phase,
+              &observation_cursor[phase], UINT32_MAX))
+        return SHELL_DEP_ETRUNC;
+    if (!dep_fd_materialize_from(&local_route_state, &before_process_words,
+                                 &workspace->route_journal, &flow_baseline,
+                                 state, state))
       return SHELL_DEP_ETRUNC;
     dep_route_state_t before_async_setup = local_route_state;
     if (!dep_owner_stdin(context, stdin_source, owner, &local_route_state,
-                         &workspace->route_journal, &workspace->owner_initial,
-                         false) ||
+                         &workspace->route_journal, &flow_baseline, false) ||
         !dep_fd_materialize_from(&local_route_state, &before_async_setup,
-                                 &workspace->route_journal,
-                                 &workspace->owner_initial, state, state))
+                                 &workspace->route_journal, &flow_baseline,
+                                 state, state))
       return SHELL_DEP_ETRUNC;
     dep_route_state_t setup_entry = local_route_state;
     uint32_t reached_op_count = 0;
@@ -13308,28 +21272,39 @@ static SHELL_NONNULL(1, 2, 4, 5, 6, 7, 8, 9, 10, 13, 15, 16,
              diagnostic_positions[diagnostic_cursor] <=
                  context->owner_setup_stop[owner]) {
         if (!dep_record_diagnostic(&local_route_state,
-                                   &workspace->route_journal,
-                                   &workspace->owner_initial))
+                                   &workspace->route_journal, &flow_baseline))
           return SHELL_DEP_ETRUNC;
         diagnostic_cursor++;
       }
       if (ops[op].pos >= context->owner_setup_stop[owner])
         break;
-      dep_fd_op_t effective = dep_fd_effective_operation(
-          ops + op, &local_route_state, &workspace->route_journal,
-          &workspace->owner_initial);
+      if (!dep_observation_pending(
+              &local_route_state, &workspace->route_journal, &flow_baseline,
+              &workspace->observations, stdin_source,
+              DEP_SNAPSHOT_REDIRECT_OPERAND,
+              &observation_cursor[DEP_SNAPSHOT_REDIRECT_OPERAND], ops[op].pos))
+        return SHELL_DEP_ETRUNC;
+      dep_fd_op_t effective =
+          dep_fd_effective_operation(ops + op, &local_route_state,
+                                     &workspace->route_journal, &flow_baseline);
       if (!dep_route_state_apply(&local_route_state, &workspace->route_journal,
-                                 &workspace->owner_initial, ops + op, 1,
-                                 op == 0))
+                                 &flow_baseline, ops + op, 1, op == 0, NULL))
         return SHELL_DEP_ETRUNC;
       ops[op] = effective;
       reached_op_count++;
     }
+    if (!dep_observation_pending(
+            &local_route_state, &workspace->route_journal, &flow_baseline,
+            &workspace->observations, stdin_source,
+            DEP_SNAPSHOT_REDIRECT_OPERAND,
+            &observation_cursor[DEP_SNAPSHOT_REDIRECT_OPERAND],
+            context->owner_setup_stop[owner]))
+      return SHELL_DEP_ETRUNC;
     while (diagnostic_cursor < diagnostic_count &&
            diagnostic_positions[diagnostic_cursor] <=
                context->owner_setup_stop[owner]) {
       if (!dep_record_diagnostic(&local_route_state, &workspace->route_journal,
-                                 &workspace->owner_initial))
+                                 &flow_baseline))
         return SHELL_DEP_ETRUNC;
       diagnostic_cursor++;
     }
@@ -13371,9 +21346,12 @@ static SHELL_NONNULL(1, 2, 4, 5, 6, 7, 8, 9, 10, 13, 15, 16,
               (dep_fd_transition_t){owner, dep_fd_move_close(item)};
       }
     }
-    if (descriptor_exec || (graph->nodes[owner].type == SHELL_NODE_CMD &&
-                            graph->nodes[owner].cmd.token_count == 0)) {
-      for (uint32_t op = 0; op < op_count; op++)
+    bool precise_input =
+        graph->nodes[owner].type == SHELL_NODE_CMD && stdin_source->read.active;
+    if (descriptor_exec || precise_input ||
+        (graph->nodes[owner].type == SHELL_NODE_CMD &&
+         graph->nodes[owner].cmd.token_count == 0)) {
+      for (uint32_t op = 0; op < reached_op_count; op++)
         if ((ops[op].kind == DEP_FD_OP_DOCUMENT ||
              ops[op].kind == DEP_FD_OP_DYNAMIC) &&
             ops[op].fd != SHELL_DEP_FD_NAMED &&
@@ -13383,7 +21361,8 @@ static SHELL_NONNULL(1, 2, 4, 5, 6, 7, 8, 9, 10, 13, 15, 16,
           /* A null command installs process descriptors without transferring
            * body bytes. FILE/document redirects keep their setup effects. */
           if (descriptor_exec || original->type == SHELL_EDGE_SUBST ||
-              graph->nodes[original->to].type == SHELL_NODE_ENDPOINT)
+              (!precise_input &&
+               graph->nodes[original->to].type == SHELL_NODE_ENDPOINT))
             setup_only_edges[ops[op].edge_index] = true;
         }
     }
@@ -13396,8 +21375,8 @@ static SHELL_NONNULL(1, 2, 4, 5, 6, 7, 8, 9, 10, 13, 15, 16,
     dep_route_state_t owner_time_state = selected_state;
     dep_route_state_t incoming_time_context = selected_state;
     if (!dep_fd_materialize_from(&local_route_state, &setup_entry,
-                                 &workspace->route_journal,
-                                 &workspace->owner_initial, state, state))
+                                 &workspace->route_journal, &flow_baseline,
+                                 state, state))
       graph->status |= SHELL_DEP_STATUS_TRUNCATED;
     /* Byte-use selection is distinct from setup replacement. A numeric close
      * removes a previous explicit use; a named allocation never adds one just
@@ -13440,21 +21419,28 @@ static SHELL_NONNULL(1, 2, 4, 5, 6, 7, 8, 9, 10, 13, 15, 16,
     /* Success continuations retain exec mutations and named allocations,
      * but never numeric command-local redirects. Replay locally first so a
      * persistent allocation may copy a temporary descriptor in this list. */
+    /* Deferred byte/report publication still needs this completed setup after
+     * continuation cleanup. Register its lifetime before cleanup can collect
+     * the journal, not after it has returned a different continuation. */
+    if (!dep_retain_owner_io(workspace, context, graph, &local_route_state,
+                             owner, &flow_baseline))
+      return SHELL_DEP_ETRUNC;
     if (!dep_route_state_publish(&owner_time_state, &workspace->route_journal,
-                                 &local_route_state, incoming, ops,
-                                 reached_op_count, descriptor_exec))
+                                 &local_route_state, &flow_baseline, ops,
+                                 reached_op_count, descriptor_exec, NULL))
       graph->status |= SHELL_DEP_STATUS_TRUNCATED;
     uint32_t source_event = dep_owner_event(context, owner);
     uint32_t report_boundary = target_time_boundary[owner];
     bool report_owns_scope =
         report_boundary != 0 &&
         (!one_shot_scope || time_boundaries[report_boundary - 1].target_scope);
-    if (!dep_fd_finish_owner(
-            context, fd_stream, source_event, &workspace->route_journal,
-            &flow_baseline, incoming, state, &local_route_state, ops, op_count,
-            descriptor_exec, named_binding, mutations,
-            report_owns_scope ? &owner_time_state : NULL, &setup_entry))
-      return SHELL_DEP_ETRUNC;
+    shell_dep_error_t finish_error = dep_fd_finish_owner(
+        context, fd_stream, source_event, &workspace->route_journal,
+        &flow_baseline, incoming, state, &local_route_state, ops, op_count,
+        descriptor_exec, named_binding, mutations,
+        report_owns_scope ? &owner_time_state : NULL, &setup_entry);
+    if (finish_error != SHELL_DEP_OK)
+      return finish_error;
     if (source_event >= SHELL_MAX_GROUPS) {
       /* Keep a concrete table for this selected version, not an eager union
        * of success, failure and stopped paths. The next owner selects its
@@ -13477,7 +21463,7 @@ static SHELL_NONNULL(1, 2, 4, 5, 6, 7, 8, 9, 10, 13, 15, 16,
       workspace->group_route_state[group] = local_route_state;
       workspace->group_time_routes[group] =
           dep_time_report_for_fd2(&workspace->group_route_state[group],
-                                  &workspace->route_journal, state);
+                                  &workspace->route_journal, &flow_baseline);
       workspace->group_time_routes_ready[group] = true;
       active_groups[active_group_count++] = group;
       DEP_METADATA_WORK(SHELLSPLIT_TEST_WORK_TIME_BOUNDARIES);
@@ -13492,9 +21478,9 @@ static SHELL_NONNULL(1, 2, 4, 5, 6, 7, 8, 9, 10, 13, 15, 16,
          * own group indices, and scoped_routes_active[group] deliberately
          * remains false. This avoids another full route table per group. */
         dep_copy_routes(&workspace->scoped_routes[group], incoming);
-        workspace->group_shell_time_routes[group] = dep_time_report_for_fd2(
-            &workspace->group_shell_route_state[group],
-            &workspace->route_journal, &workspace->scoped_routes[group]);
+        workspace->group_shell_time_routes[group] =
+            dep_time_report_for_fd2(&workspace->group_shell_route_state[group],
+                                    &workspace->route_journal, &flow_baseline);
         workspace->group_shell_time_routes_ready[group] = true;
       }
     }
@@ -13522,8 +21508,6 @@ static SHELL_NONNULL(1, 2, 4, 5, 6, 7, 8, 9, 10, 13, 15, 16,
       }
     }
 
-    workspace->owner_route_state[owner] = local_route_state;
-
     /* Mark this owner's direct document redirects from its indexed syntax
      * edges. Searching the completed FD table here cost O(owner_count * fd
      * count), even though every candidate document was already known. */
@@ -13546,7 +21530,7 @@ static SHELL_NONNULL(1, 2, 4, 5, 6, 7, 8, 9, 10, 13, 15, 16,
           : named_scope >= 0 ? &workspace->scoped_time_routes[named_scope]
                              : &workspace->persistent_time_routes;
       *scope_reports = dep_time_report_for_fd2(
-          scope_route_state, &workspace->route_journal, persistent);
+          scope_route_state, &workspace->route_journal, &flow_baseline);
     }
   }
   while (active_group_count) {
@@ -13560,11 +21544,30 @@ static SHELL_NONNULL(1, 2, 4, 5, 6, 7, 8, 9, 10, 13, 15, 16,
                                &time_boundary_cursor, UINT32_MAX);
 
   bool external_eligible[SHELL_DEP_MAX_NODES] = {false};
+  memset(workspace->generic_read, 0, sizeof(workspace->generic_read));
   for (uint32_t owner = 0; owner < graph->node_count; owner++)
-    if (resolved_owner[owner])
+    if (resolved_owner[owner]) {
       external_eligible[owner] = dep_owner_has_body_io(
           graph, context, owner,
           control_execution[owner] != DEP_EXECUTION_NEVER);
+      if (graph->nodes[owner].type == SHELL_NODE_CMD &&
+          !workspace
+               ->snapshot_sources[context->snapshot->prepared_source[owner]]
+               .read.active) {
+        workspace->generic_read[owner] = external_eligible[owner];
+        int32_t group = dep_range_group(pipeline, node_range[owner]);
+        if (group >= 0)
+          workspace->generic_read[group_node[group]] |=
+              workspace->generic_read[owner];
+      }
+    }
+  for (uint32_t group = fast->group_count; group-- > 0;) {
+    uint32_t parent = fast->groups[group].parent;
+    if (group_node[group] != UINT32_MAX && parent != UINT16_MAX &&
+        group_node[parent] != UINT32_MAX)
+      workspace->generic_read[group_node[parent]] |=
+          workspace->generic_read[group_node[group]];
+  }
   for (uint32_t owner = 0; owner < graph->node_count; owner++) {
     if (!local_owner[owner] || graph->nodes[owner].type != SHELL_NODE_CMD)
       continue;
@@ -13630,6 +21633,11 @@ static SHELL_NONNULL(1, 2, 4, 5, 6, 7, 8, 9, 10, 13, 15, 16,
     graph->edges[kept++] = original_edges[edge];
   }
   graph->edge_count = kept;
+  bool read_documents[SHELL_DEP_MAX_EDGES] = {false};
+  if (!dep_publish_read_inputs(graph, max_edges, workspace, streams, context,
+                               external_eligible, read_documents,
+                               &flow_baseline))
+    return SHELL_DEP_ETRUNC;
 
   /* Descriptor duplication and close are shell setup operations. A symbolic
    * descriptor has no fixed numeric byte route until a later use, while a
@@ -13638,7 +21646,9 @@ static SHELL_NONNULL(1, 2, 4, 5, 6, 7, 8, 9, 10, 13, 15, 16,
   for (uint32_t transition = 0; transition < fd_transition_count;
        transition++) {
     const dep_fd_transition_t *item = &fd_transitions[transition];
-    dep_fd_ref_t source = {item->op.fd, item->op.fd_name, item->op.fd_name_len};
+    dep_fd_ref_t source = {.name = item->op.fd_name,
+                           .value = item->op.fd,
+                           .name_len = item->op.fd_name_len};
     if (item->op.kind == DEP_FD_OP_CLOSE) {
       dep_add_resolved_edge_refs(
           graph, max_edges, item->owner, item->owner, SHELL_EDGE_FD_CLOSE,
@@ -13646,8 +21656,9 @@ static SHELL_NONNULL(1, 2, 4, 5, 6, 7, 8, 9, 10, 13, 15, 16,
     } else {
       dep_add_resolved_edge_refs(
           graph, max_edges, item->owner, item->owner, SHELL_EDGE_FD_OPEN,
-          (dep_fd_ref_t){item->op.target_fd, item->op.target_fd_name,
-                         item->op.target_fd_name_len},
+          (dep_fd_ref_t){.name = item->op.target_fd_name,
+                         .value = item->op.target_fd,
+                         .name_len = item->op.target_fd_name_len},
           source, SHELL_DEP_EDGE_FLAG_FD_OPEN_DUP);
     }
   }
@@ -13676,22 +21687,25 @@ static SHELL_NONNULL(1, 2, 4, 5, 6, 7, 8, 9, 10, 13, 15, 16,
         (uint32_t)(spelling - cmd) >= context->owner_setup_stop[owner])
       continue;
     if (context->owner_setup_stop[owner] == UINT32_MAX &&
-        owner_edges->effective_document[edge] && !setup_only_edges[edge]) {
+        owner_edges->effective_document[edge] && !setup_only_edges[edge] &&
+        (original->type != SHELL_EDGE_READ || workspace->generic_read[owner] ||
+         !external_eligible[owner])) {
       /* An argv-less stage has no body. Its explicit document binding still
        * represents reached redirect setup, unlike an inherited default use. */
       if (!external_eligible[owner])
         dep_add_resolved_edge_refs(
             graph, max_edges, original->from, original->to, original->type,
-            (dep_fd_ref_t){original->source_fd, original->source_fd_name,
-                           original->source_fd_name_len},
-            (dep_fd_ref_t){original->target_fd, original->target_fd_name,
-                           original->target_fd_name_len},
+            (dep_fd_ref_t){.name = original->source_fd_name,
+                           .value = original->source_fd,
+                           .name_len = original->source_fd_name_len},
+            (dep_fd_ref_t){.name = original->target_fd_name,
+                           .value = original->target_fd,
+                           .name_len = original->target_fd_name_len},
             original->flags);
       continue;
     }
-    if (graph->nodes[document].doc.kind != SHELL_DOC_FILE)
+    if (read_documents[edge])
       continue;
-
     uint8_t flags = original->type == SHELL_EDGE_APPEND
                         ? SHELL_DEP_EDGE_FLAG_FD_OPEN_APPEND
                         : SHELL_DEP_EDGE_FLAG_NONE;
@@ -13699,14 +21713,16 @@ static SHELL_NONNULL(1, 2, 4, 5, 6, 7, 8, 9, 10, 13, 15, 16,
       dep_add_resolved_edge_refs(
           graph, max_edges, document, owner, SHELL_EDGE_FD_OPEN,
           dep_fd_numeric(SHELL_DEP_FD_NONE),
-          (dep_fd_ref_t){original->target_fd, original->target_fd_name,
-                         original->target_fd_name_len},
+          (dep_fd_ref_t){.name = original->target_fd_name,
+                         .value = original->target_fd,
+                         .name_len = original->target_fd_name_len},
           flags);
     } else {
       dep_add_resolved_edge_refs(
           graph, max_edges, owner, document, SHELL_EDGE_FD_OPEN,
-          (dep_fd_ref_t){original->source_fd, original->source_fd_name,
-                         original->source_fd_name_len},
+          (dep_fd_ref_t){.name = original->source_fd_name,
+                         .value = original->source_fd,
+                         .name_len = original->source_fd_name_len},
           dep_fd_numeric(SHELL_DEP_FD_NONE), flags);
     }
   }
@@ -13714,9 +21730,17 @@ static SHELL_NONNULL(1, 2, 4, 5, 6, 7, 8, 9, 10, 13, 15, 16,
   /* Persistent exec and null-command process descriptors are setup. Keep
    * their endpoint relation without claiming that a body transferred bytes. */
   for (uint32_t edge = 0; edge < original_edge_count; edge++) {
-    if (!setup_only_edges[edge])
-      continue;
     const shell_dep_edge_t *original = &original_edges[edge];
+    bool precise_group_input =
+        original->type == SHELL_EDGE_SUBST &&
+        original->target_fd != SHELL_DEP_FD_NONE &&
+        graph->nodes[original->to].type == SHELL_NODE_GROUP &&
+        resolved_owner[original->to] &&
+        !workspace->generic_read[original->to] &&
+        control_execution[original->to] != DEP_EXECUTION_NEVER;
+    if ((!setup_only_edges[edge] && !precise_group_input) ||
+        read_documents[edge])
+      continue;
     if (original->type == SHELL_EDGE_WRITE &&
         original->from < graph->node_count &&
         original->to < graph->node_count &&
@@ -13730,8 +21754,13 @@ static SHELL_NONNULL(1, 2, 4, 5, 6, 7, 8, 9, 10, 13, 15, 16,
                original->to < graph->node_count) {
       dep_add_resolved_edge_refs(
           graph, max_edges, original->from, original->to, SHELL_EDGE_FD_OPEN,
-          dep_fd_numeric(original->source_fd),
-          dep_fd_numeric(original->target_fd), original->flags);
+          (dep_fd_ref_t){.name = original->source_fd_name,
+                         .value = original->source_fd,
+                         .name_len = original->source_fd_name_len},
+          (dep_fd_ref_t){.name = original->target_fd_name,
+                         .value = original->target_fd,
+                         .name_len = original->target_fd_name_len},
+          SHELL_DEP_EDGE_FLAG_NONE);
     }
   }
 
@@ -13744,6 +21773,8 @@ static SHELL_NONNULL(1, 2, 4, 5, 6, 7, 8, 9, 10, 13, 15, 16,
       if (state->fd[i].fd.value > SHELL_DEP_FD_MAX)
         continue;
       for (uint32_t access = 0; access < 2; access++) {
+        if (access == 0 && !workspace->generic_read[owner])
+          continue;
         dep_route_state_t owner_state = workspace->owner_route_state[owner];
         dep_fd_access_t direction =
             access == 0 ? DEP_FD_ACCESS_READ : DEP_FD_ACCESS_WRITE;
@@ -13762,7 +21793,7 @@ static SHELL_NONNULL(1, 2, 4, 5, 6, 7, 8, 9, 10, 13, 15, 16,
                 !dep_record_stream_use(
                     streams->capture_uses, &streams->capture_use_count,
                     streams->capture_index, &streams->capture_root, owner,
-                    state->fd[i].fd.value, direction, route.value))
+                    state->fd[i].fd, direction, route.value))
               graph->status |= SHELL_DEP_STATUS_TRUNCATED;
             continue;
           }
@@ -13773,7 +21804,7 @@ static SHELL_NONNULL(1, 2, 4, 5, 6, 7, 8, 9, 10, 13, 15, 16,
             if ((state->fd[i].fd.value <= 2 ||
                  (dep_owner_route_touched(workspace, owner, i) & direction) !=
                      0) &&
-                !dep_record_fd_import_use(streams, owner, state->fd[i].fd.value,
+                !dep_record_fd_import_use(streams, owner, state->fd[i].fd,
                                           direction, route.value))
               graph->status |= SHELL_DEP_STATUS_TRUNCATED;
             continue;
@@ -13881,6 +21912,14 @@ static SHELL_NONNULL(1, 2, 4, 5, 6, 7, 8, 9, 10, 13, 15, 16,
                            control_execution[owner] != DEP_EXECUTION_NEVER &&
                            graph->nodes[owner].type == SHELL_NODE_CMD &&
                            graph->nodes[owner].cmd.token_count == 0);
+      if (access == DEP_FD_ACCESS_READ && !workspace->generic_read[owner] &&
+          graph->nodes[owner].type != SHELL_NODE_CMD)
+        pipe_binding = false;
+      if (access == DEP_FD_ACCESS_READ &&
+          graph->nodes[owner].type == SHELL_NODE_CMD &&
+          graph->nodes[owner].cmd.token_count &&
+          !workspace->generic_read[owner])
+        pipe_binding = false;
       for (uint32_t use = 0;
            pipe_binding && context->owner_setup_stop[owner] == UINT32_MAX &&
            use < workspace->route_slot_count[owner];
@@ -13898,8 +21937,8 @@ static SHELL_NONNULL(1, 2, 4, 5, 6, 7, 8, 9, 10, 13, 15, 16,
           if (choices.routes[choice].kind == DEP_ROUTE_PIPE &&
               choices.routes[choice].value == pipe &&
               !dep_record_stream_use(uses, count, index, root, owner,
-                                     state->fd[fd].fd.value,
-                                     (dep_fd_access_t)access, pipe))
+                                     state->fd[fd].fd, (dep_fd_access_t)access,
+                                     pipe))
             graph->status |= SHELL_DEP_STATUS_TRUNCATED;
       }
       if (!dep_collect_pipe_uses(streams, streams->pipe_root, owner,
@@ -13938,12 +21977,14 @@ static SHELL_NONNULL(1, 2, 4, 5, 6, 7, 8, 9, 10, 13, 15, 16,
           terminal = graph->node_count++;
           graph->nodes[terminal].type = SHELL_NODE_ENDPOINT;
           graph->nodes[terminal].endpoint.reserved = DEP_ENDPOINT_TERMINAL_PIPE;
-          dep_add_edge(graph, sources[out].owner, terminal, SHELL_EDGE_PIPE,
-                       sources[out].fd, 0);
+          dep_add_resolved_edge_refs(
+              graph, max_edges, sources[out].owner, terminal, SHELL_EDGE_PIPE,
+              dep_stream_fd(&sources[out]), dep_fd_numeric(0),
+              SHELL_DEP_EDGE_FLAG_NONE);
           if (workspace->time_pipe_target_count < SHELL_DEP_MAX_EDGES) {
             workspace->time_pipe_targets[workspace->time_pipe_target_count++] =
-                (dep_stream_use_t){terminal, 0, pipe, DEP_FD_ACCESS_READ,
-                                   false};
+                (dep_stream_use_t){terminal, 0,    pipe, DEP_FD_ACCESS_READ,
+                                   false,    NULL, 0};
             workspace->time_pipe_count[pipe]++;
           } else {
             graph->status |= SHELL_DEP_STATUS_TRUNCATED;
@@ -13951,15 +21992,15 @@ static SHELL_NONNULL(1, 2, 4, 5, 6, 7, 8, 9, 10, 13, 15, 16,
         } else
           complete = dep_add_resolved_edge_refs(
               graph, max_edges, sources[out].owner, terminal, SHELL_EDGE_PIPE,
-              dep_fd_numeric(sources[out].fd), dep_fd_numeric(0),
+              dep_stream_fd(&sources[out]), dep_fd_numeric(0),
               SHELL_DEP_EDGE_FLAG_NONE);
       } else {
         for (uint32_t in = 0; in < target_count; in++)
           complete =
               dep_add_resolved_edge_refs(
                   graph, max_edges, sources[out].owner, targets[in].owner,
-                  SHELL_EDGE_PIPE, dep_fd_numeric(sources[out].fd),
-                  dep_fd_numeric(targets[in].fd), SHELL_DEP_EDGE_FLAG_NONE) &&
+                  SHELL_EDGE_PIPE, dep_stream_fd(&sources[out]),
+                  dep_stream_fd(&targets[in]), SHELL_DEP_EDGE_FLAG_NONE) &&
               complete;
       }
       if (!complete && graph->nodes[sources[out].owner].type == SHELL_NODE_TIME)
@@ -14007,6 +22048,10 @@ static SHELL_NONNULL(1, 2, 4, 5, 6, 7, 8, 9, 10, 13, 15, 16,
                                &flow_baseline, workspace->named_setup_documents,
                                workspace->live_named_documents);
   streams->status = fd_stream->scope[0].mask;
+  if (imports && imports->observe_return &&
+      !dep_observation_export(workspace, &flow_baseline,
+                              imports->process_capture_mask))
+    return SHELL_DEP_ETRUNC;
   /* TIME nodes consume the just-resolved descriptor snapshots. Add their
    * report flow before endpoint pruning so concrete endpoint indices and
    * imported-route owners are compacted together with the rest of the graph. */
@@ -14029,7 +22074,7 @@ typedef enum {
 
 typedef struct {
   uint32_t nodes[SHELL_DEP_MAX_EDGES];
-  uint32_t fds[SHELL_DEP_MAX_EDGES];
+  dep_fd_ref_t fds[SHELL_DEP_MAX_EDGES];
   uint32_t count;
 } dep_endpoint_list_t;
 
@@ -14058,9 +22103,7 @@ static SHELL_NONNULL(1,
     return use->anchor < key->anchor ? -1 : 1;
   if (use->access != key->access)
     return use->access < key->access ? -1 : 1;
-  if (use->fd != key->fd)
-    return use->fd < key->fd ? -1 : 1;
-  return 0;
+  return dep_fd_ref_compare(dep_stream_fd(use), dep_stream_fd(key));
 }
 
 static SHELL_NONNULL(1,
@@ -14073,7 +22116,7 @@ static SHELL_NONNULL(1,
     return a->anchor < b->anchor ? -1 : 1;
   if (a->access != b->access)
     return a->access < b->access ? -1 : 1;
-  return a->fd < b->fd ? -1 : a->fd != b->fd;
+  return dep_fd_ref_compare(dep_stream_fd(a), dep_stream_fd(b));
 }
 
 static SHELL_NONNULL(1, 2, 4) void dep_collect_capture_endpoints(
@@ -14167,12 +22210,12 @@ static SHELL_NONNULL(1, 2, 4) void dep_collect_capture_endpoints(
          !use->actual_group))
       continue;
     dep_record_stream_use(scratch->endpoints, &count, scratch->endpoint_index,
-                          &root, scratch->capture_endpoint[i], use->fd, access,
-                          use->anchor);
+                          &root, scratch->capture_endpoint[i],
+                          dep_stream_fd(use), access, use->anchor);
   }
   for (uint32_t i = 0; i < count; i++) {
     endpoints->nodes[i] = scratch->endpoints[i].owner;
-    endpoints->fds[i] = scratch->endpoints[i].fd;
+    endpoints->fds[i] = dep_stream_fd(&scratch->endpoints[i]);
   }
   endpoints->count = count;
 }
@@ -14188,10 +22231,16 @@ static SHELL_NONNULL(1) void dep_add_edge(shell_dep_graph_t *graph,
 
 static SHELL_NONNULL(1) void dep_add_subst_edge(shell_dep_graph_t *graph,
                                                 uint32_t from, uint32_t to,
-                                                uint32_t source_fd,
-                                                uint32_t target_fd,
+                                                dep_fd_ref_t source_fd,
+                                                dep_fd_ref_t target_fd,
                                                 dep_subst_kind_t kind) {
-  dep_add_edge(graph, from, to, SHELL_EDGE_SUBST, source_fd, target_fd);
+  dep_add_edge(graph, from, to, SHELL_EDGE_SUBST, source_fd.value,
+               target_fd.value);
+  shell_dep_edge_t *edge = &graph->edges[graph->edge_count - 1];
+  if (source_fd.value == SHELL_DEP_FD_NAMED)
+    dep_set_named_fd(edge, true, source_fd.name, source_fd.name_len);
+  if (target_fd.value == SHELL_DEP_FD_NAMED)
+    dep_set_named_fd(edge, false, target_fd.name, target_fd.name_len);
   graph->edges[graph->edge_count - 1].flags =
       kind == DEP_SUBST_SHELL_WORD
           ? SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD
@@ -14244,8 +22293,9 @@ static SHELL_NONNULL(1, 2, 5, 6) void dep_append_subgraph(
   }
   for (uint32_t i = 0; i < subgraph_streams->external_use_count; i++) {
     const dep_stream_use_t *use = &subgraph_streams->external_uses[i];
-    dep_record_external_use(out_streams, node_offset + use->owner, use->fd,
-                            (dep_fd_access_t)use->access, use->anchor);
+    dep_record_external_use(out_streams, node_offset + use->owner,
+                            dep_stream_fd(use), (dep_fd_access_t)use->access,
+                            use->anchor);
   }
 }
 
@@ -14339,9 +22389,12 @@ static SHELL_NONNULL(1, 4, 5) bool dep_materialize_fd_import_uses(
       return false;
     if (origin != out) {
       uint32_t import_index = out_streams->join->import_indices[i];
-      if (!dep_record_fd_import_use(out_streams, node_offset + use->owner,
-                                    use->fd, (dep_fd_access_t)use->access,
-                                    import_index))
+      if (!dep_record_fd_import_use(
+              out_streams, node_offset + use->owner,
+              (dep_fd_ref_t){.name = use->fd_name,
+                             .value = use->fd,
+                             .name_len = use->fd_name_len},
+              (dep_fd_access_t)use->access, import_index))
         return false;
       continue;
     }
@@ -14349,8 +22402,12 @@ static SHELL_NONNULL(1, 4, 5) bool dep_materialize_fd_import_uses(
     if (child >= out->node_count)
       return false;
     if (route.kind == DEP_ROUTE_CAPTURE) {
-      if (!dep_record_actual_capture(out_streams, child, use->fd,
-                                     (dep_fd_access_t)use->access, route.value))
+      if (!dep_record_actual_capture(
+              out_streams, child,
+              (dep_fd_ref_t){.name = use->fd_name,
+                             .value = use->fd,
+                             .name_len = use->fd_name_len},
+              (dep_fd_access_t)use->access, route.value))
         return false;
       continue;
     }
@@ -14358,7 +22415,10 @@ static SHELL_NONNULL(1, 4, 5) bool dep_materialize_fd_import_uses(
         route.kind == DEP_ROUTE_PIPE_OUTPUT) {
       if (!dep_record_stream_use(
               out_streams->pipe_uses, &out_streams->pipe_use_count,
-              out_streams->pipe_index, &out_streams->pipe_root, child, use->fd,
+              out_streams->pipe_index, &out_streams->pipe_root, child,
+              (dep_fd_ref_t){.name = use->fd_name,
+                             .value = use->fd,
+                             .name_len = use->fd_name_len},
               (dep_fd_access_t)use->access, route.value))
         return false;
       continue;
@@ -14377,11 +22437,14 @@ static SHELL_NONNULL(1, 4, 5) bool dep_materialize_fd_import_uses(
       if ((type != SHELL_EDGE_READ && type != SHELL_EDGE_SUBST) ||
           original->from >= out->node_count)
         return false;
-      dep_add_resolved_edge_refs(
-          out, max_edges, original->from, child, type,
-          dep_fd_numeric(original->source_fd), dep_fd_numeric(use->fd),
-          type == SHELL_EDGE_SUBST ? original->flags
-                                   : SHELL_DEP_EDGE_FLAG_NONE);
+      dep_add_resolved_edge_refs(out, max_edges, original->from, child, type,
+                                 dep_fd_numeric(original->source_fd),
+                                 (dep_fd_ref_t){.name = use->fd_name,
+                                                .value = use->fd,
+                                                .name_len = use->fd_name_len},
+                                 type == SHELL_EDGE_SUBST
+                                     ? original->flags
+                                     : SHELL_DEP_EDGE_FLAG_NONE);
     } else {
       shell_dep_edge_type_t type = original->type;
       if (type == SHELL_EDGE_FD_OPEN)
@@ -14391,9 +22454,12 @@ static SHELL_NONNULL(1, 4, 5) bool dep_materialize_fd_import_uses(
       if ((type != SHELL_EDGE_WRITE && type != SHELL_EDGE_APPEND) ||
           original->to >= out->node_count)
         return false;
-      dep_add_resolved_edge_refs(
-          out, max_edges, child, original->to, type, dep_fd_numeric(use->fd),
-          dep_fd_numeric(original->target_fd), SHELL_DEP_EDGE_FLAG_NONE);
+      dep_add_resolved_edge_refs(out, max_edges, child, original->to, type,
+                                 (dep_fd_ref_t){.name = use->fd_name,
+                                                .value = use->fd,
+                                                .name_len = use->fd_name_len},
+                                 dep_fd_numeric(original->target_fd),
+                                 SHELL_DEP_EDGE_FLAG_NONE);
     }
   }
   return (out->status & SHELL_DEP_STATUS_TRUNCATED) == 0;
@@ -14437,8 +22503,8 @@ static SHELL_NONNULL(1, 5, 6, 7) bool dep_connect_substitution(
     uint32_t effective_cwd_buf_size, dep_subgraph_streams_t *out_streams,
     const shell_dep_graph_t *subgraph,
     const dep_subgraph_streams_t *subgraph_streams, uint32_t consumer_node,
-    dep_subst_kind_t kind, uint32_t producer_fd,
-    const dep_fd_ref_t *named_setup_fd, uint32_t *route_edge) {
+    dep_subst_kind_t kind, dep_fd_ref_t producer_fd, uint32_t *route_edge) {
+  bool named_setup = producer_fd.value == SHELL_DEP_FD_NAMED;
   dep_endpoint_list_t endpoints;
   dep_collect_capture_endpoints(subgraph, subgraph_streams,
                                 kind == DEP_SUBST_PROCESS_OUTPUT
@@ -14450,7 +22516,8 @@ static SHELL_NONNULL(1, 5, 6, 7) bool dep_connect_substitution(
       kind == DEP_SUBST_PROCESS_OUTPUT || endpoints.count > 1;
   bool retain_unconnected =
       endpoints.count == 0 &&
-      (kind == DEP_SUBST_PROCESS_INPUT || kind == DEP_SUBST_PROCESS_OUTPUT);
+      (kind == DEP_SUBST_PROCESS_INPUT || kind == DEP_SUBST_PROCESS_OUTPUT ||
+       kind == DEP_SUBST_PROCESS_WORD);
   uint32_t extra_nodes =
       (endpoints.count > 0 && needs_collector) || retain_unconnected ? 1 : 0;
   uint32_t extra_edges = 0;
@@ -14489,30 +22556,32 @@ static SHELL_NONNULL(1, 5, 6, 7) bool dep_connect_substitution(
     uint32_t endpoint = out->node_count++;
     out->nodes[endpoint].type = SHELL_NODE_ENDPOINT;
     out->nodes[endpoint].endpoint.reserved = DEP_ENDPOINT_PROCESS_PIPE;
-    dep_fd_ref_t fd =
-        named_setup_fd ? *named_setup_fd : dep_fd_numeric(producer_fd);
     if (route_edge)
       *route_edge = out->edge_count;
-    if (kind == DEP_SUBST_PROCESS_INPUT) {
+    if (kind == DEP_SUBST_PROCESS_INPUT || kind == DEP_SUBST_PROCESS_WORD) {
       return dep_add_resolved_edge_refs(
           out, max_edges, endpoint, consumer_node,
-          named_setup_fd ? SHELL_EDGE_FD_OPEN : SHELL_EDGE_SUBST,
-          dep_fd_numeric(SHELL_DEP_FD_NONE), fd, SHELL_DEP_EDGE_FLAG_NONE);
+          named_setup ? SHELL_EDGE_FD_OPEN : SHELL_EDGE_SUBST,
+          dep_fd_numeric(SHELL_DEP_FD_NONE),
+          kind == DEP_SUBST_PROCESS_INPUT ? producer_fd
+                                          : dep_fd_numeric(SHELL_DEP_FD_NONE),
+          SHELL_DEP_EDGE_FLAG_NONE);
     }
     return dep_add_resolved_edge_refs(
         out, max_edges, consumer_node, endpoint,
-        named_setup_fd ? SHELL_EDGE_FD_OPEN : SHELL_EDGE_WRITE, fd,
+        named_setup ? SHELL_EDGE_FD_OPEN : SHELL_EDGE_WRITE, producer_fd,
         dep_fd_numeric(SHELL_DEP_FD_NONE), SHELL_DEP_EDGE_FLAG_NONE);
   }
 
   if (!needs_collector) {
     uint32_t producer = node_offset + endpoints.nodes[0];
-    uint32_t source_fd = endpoints.fds[0];
+    dep_fd_ref_t source_fd = endpoints.fds[0];
     if (route_edge)
       *route_edge = out->edge_count;
     dep_add_subst_edge(out, producer, consumer_node, source_fd,
-                       kind == DEP_SUBST_PROCESS_INPUT ? producer_fd
-                                                       : SHELL_DEP_FD_NONE,
+                       kind == DEP_SUBST_PROCESS_INPUT
+                           ? producer_fd
+                           : dep_fd_numeric(SHELL_DEP_FD_NONE),
                        kind);
     return true;
   }
@@ -14523,25 +22592,30 @@ static SHELL_NONNULL(1, 5, 6, 7) bool dep_connect_substitution(
   if (kind == DEP_SUBST_PROCESS_OUTPUT) {
     if (route_edge)
       *route_edge = out->edge_count;
-    dep_add_edge(out, consumer_node, collector, SHELL_EDGE_WRITE, producer_fd,
-                 SHELL_DEP_FD_NONE);
+    dep_add_resolved_edge_refs(
+        out, max_edges, consumer_node, collector, SHELL_EDGE_WRITE, producer_fd,
+        dep_fd_numeric(SHELL_DEP_FD_NONE), SHELL_DEP_EDGE_FLAG_NONE);
     for (uint32_t i = 0; i < endpoints.count; i++)
       dep_add_subst_edge(out, collector, node_offset + endpoints.nodes[i],
-                         SHELL_DEP_FD_NONE, endpoints.fds[i],
+                         dep_fd_numeric(SHELL_DEP_FD_NONE), endpoints.fds[i],
                          DEP_SUBST_PROCESS_OUTPUT);
   } else {
     for (uint32_t i = 0; i < endpoints.count; i++) {
       uint32_t producer = node_offset + endpoints.nodes[i];
-      uint32_t source_fd = endpoints.fds[i];
-      dep_add_edge(out, producer, collector, SHELL_EDGE_WRITE, source_fd,
+      dep_fd_ref_t source_fd = endpoints.fds[i];
+      dep_add_edge(out, producer, collector, SHELL_EDGE_WRITE, source_fd.value,
                    SHELL_DEP_FD_NONE);
+      if (source_fd.value == SHELL_DEP_FD_NAMED)
+        dep_set_named_fd(&out->edges[out->edge_count - 1], true, source_fd.name,
+                         source_fd.name_len);
     }
     if (route_edge)
       *route_edge = out->edge_count;
-    dep_add_subst_edge(out, collector, consumer_node, SHELL_DEP_FD_NONE,
-                       kind == DEP_SUBST_PROCESS_INPUT ? producer_fd
-                                                       : SHELL_DEP_FD_NONE,
-                       kind);
+    dep_add_subst_edge(
+        out, collector, consumer_node, dep_fd_numeric(SHELL_DEP_FD_NONE),
+        kind == DEP_SUBST_PROCESS_INPUT ? producer_fd
+                                        : dep_fd_numeric(SHELL_DEP_FD_NONE),
+        kind);
   }
   return true;
 }
@@ -14549,17 +22623,39 @@ static SHELL_NONNULL(1, 5, 6, 7) bool dep_connect_substitution(
 static SHELL_NONNULL(1) void dep_record_process_substitution_route(
     dep_process_route_map_t *routes, uint32_t edge, uint32_t owner,
     uint32_t position, bool input, dep_fd_ref_t fd) {
-  /* Each recorded installation owns a graph edge, so the bounded edge
-   * capacity also guarantees journal capacity. */
+  /* Each parent-facing edge has at most one temporary creation and one
+   * redirect installation, bounded by twice the graph edge capacity. */
   uint32_t slot = ++routes->count;
   DEP_METADATA_WORK(SHELLSPLIT_TEST_WORK_PROCESS_ROUTES);
   routes->entries[slot - 1] = (dep_process_route_t){
-      position, edge, fd, 0, input ? DEP_FD_ACCESS_READ : DEP_FD_ACCESS_WRITE};
+      .position = position,
+      .edge = edge,
+      .fd = fd,
+      .access = input ? DEP_FD_ACCESS_READ : DEP_FD_ACCESS_WRITE};
   if (routes->last[owner] != 0)
     routes->entries[routes->last[owner] - 1].next = slot;
   else
     routes->first[owner] = slot;
   routes->last[owner] = slot;
+}
+
+static SHELL_NONNULL(1, 5) void dep_record_process_temporary(
+    dep_process_route_map_t *routes, uint32_t edge, uint32_t owner,
+    uint32_t position, const char *source, bool input, bool command_word,
+    bool byte_use, bool standalone, const dep_process_guard_t *guard) {
+  dep_record_process_substitution_route(routes, edge, owner, position, input,
+                                        dep_fd_numeric(SHELL_DEP_FD_NONE));
+  dep_process_route_t *route = &routes->entries[routes->last[owner] - 1];
+  route->temporary = true;
+  route->source = source;
+  route->guard = guard;
+  route->command_word = command_word;
+  route->byte_use = byte_use;
+  route->standalone = standalone;
+  routes->private_edges |= standalone && !byte_use;
+  for (const dep_process_guard_t *current = routes->track[owner] ? guard : NULL;
+       current && !current->observed; current = current->parent)
+    routes->guards[current - routes->guards].observed = true;
 }
 
 /* Cross-direction and read/write opens need resource identity independently
@@ -14603,11 +22699,13 @@ static SHELL_NONNULL(1, 5, 6, 7, 10, 11) bool dep_install_process_pipe(
   out->nodes[pipe].endpoint.reserved = DEP_ENDPOINT_PROCESS_PIPE;
   for (uint32_t i = 0; i < endpoints.count; i++) {
     if (child_writes)
-      dep_add_edge(out, offset + endpoints.nodes[i], pipe, SHELL_EDGE_WRITE,
-                   endpoints.fds[i], SHELL_DEP_FD_NONE);
+      dep_add_resolved_edge_refs(out, max_edges, offset + endpoints.nodes[i],
+                                 pipe, SHELL_EDGE_WRITE, endpoints.fds[i],
+                                 dep_fd_numeric(SHELL_DEP_FD_NONE),
+                                 SHELL_DEP_EDGE_FLAG_NONE);
     else
       dep_add_subst_edge(out, pipe, offset + endpoints.nodes[i],
-                         SHELL_DEP_FD_NONE, endpoints.fds[i],
+                         dep_fd_numeric(SHELL_DEP_FD_NONE), endpoints.fds[i],
                          DEP_SUBST_PROCESS_OUTPUT);
   }
   bool named = fd->value == SHELL_DEP_FD_NAMED;
@@ -14636,12 +22734,17 @@ static SHELL_NONNULL(1, 5, 6, 7, 10, 11) bool dep_install_process_pipe(
  * cannot be exposed as completed topology or resumed after a partial snapshot.
  * The caller supplies a non-success construction result. Empty/invalid nested
  * source is a parse failure; capacity exhaustion is not a syntax error. Root
- * input validation remains responsible for public EINPUT handling. */
+ * input validation remains responsible for public EINPUT handling. Once graph
+ * capacity has omitted setup metadata, context-dependent semantic rejection
+ * cannot establish unsupported syntax from that incomplete state. This applies
+ * during expansion/snapshot construction as well as final route resolution. */
 static SHELL_NONNULL(1) shell_dep_error_t
     dep_stop_graph_construction(shell_dep_graph_t *out,
                                 shell_dep_error_t error) {
   if (error == SHELL_DEP_EINPUT)
     error = SHELL_DEP_EPARSE;
+  if (error == SHELL_DEP_EPARSE && (out->status & SHELL_DEP_STATUS_TRUNCATED))
+    error = SHELL_DEP_ETRUNC;
   out->node_count = 0;
   out->edge_count = 0;
   out->cwd_buf.len = 0;
@@ -14679,19 +22782,63 @@ static SHELL_NONNULL(1, 5, 6, 8, 9, 10, 12, 14) shell_dep_error_t
   const char *sub_content = extract_subshell_content(target, &sub_len);
   if (!sub_content)
     return SHELL_DEP_EPARSE;
+  if (shell_source_empty_process_word(target->start, target->len)) {
+    /* No pathname is produced: redirect expansion is ambiguous, not an open
+     * of a fictional /dev/fd/N. Earlier argv expansions still ran. */
+    uint32_t position = (uint32_t)(redirect_token->start - context->cmd);
+    if (!dep_owner_phase_active(context, consumer_node,
+                                DEP_SNAPSHOT_REDIRECT_OPERAND, position))
+      return SHELL_DEP_OK;
+    uint32_t table;
+    shell_dep_error_t error = dep_snapshot_phase_table(
+        out, out_streams, context, consumer_node, position,
+        DEP_SNAPSHOT_REDIRECT_OPERAND, &table);
+    if (error != SHELL_DEP_OK)
+      return error;
+    if (!dep_owner_phase_active(context, consumer_node,
+                                DEP_SNAPSHOT_REDIRECT_OPERAND, position))
+      return SHELL_DEP_OK;
+    dep_snapshot_source_t *source =
+        &context->workspace->snapshot_sources
+             [context->snapshot->prepared_source[consumer_node]];
+    uint32_t slot = source->op_count;
+    if (slot == sizeof(source->ops) / sizeof(source->ops[0]))
+      return SHELL_DEP_ETRUNC;
+    source->ops[source->op_count++] =
+        (dep_fd_op_t){.pos = position,
+                      .kind = DEP_FD_OP_FAILED,
+                      .fd = SHELL_DEP_FD_NONE,
+                      .target_fd = SHELL_DEP_FD_NONE,
+                      .edge_index = UINT32_MAX};
+    uint32_t match = 0;
+    source->op_root =
+        dep_index_insert(source->op_index, source->op_root, slot + 1,
+                         sizeof(source->ops) / sizeof(source->ops[0]),
+                         dep_snapshot_operation_compare, source, &slot, &match);
+    source->setup_may_fail = source->setup_needs_walk = true;
+    source->empty_process_failure = position + 1;
+    return SHELL_DEP_OK;
+  }
+  uint32_t position = (uint32_t)(redirect_token->start - context->cmd);
+  bool active = dep_owner_phase_active(context, consumer_node,
+                                       DEP_SNAPSHOT_REDIRECT_OPERAND, position);
+  if (active) {
+    shell_dep_error_t error =
+        dep_prepare_process_tracking(out, out_streams, context, consumer_node,
+                                     position, DEP_SNAPSHOT_REDIRECT_OPERAND);
+    if (error != SHELL_DEP_OK)
+      return error;
+  }
   dep_recursive_parse_t *child = dep_recursive_parse_prepare(limits, depth + 1);
   shell_dep_graph_t *subgraph = &child->graph;
   dep_subgraph_streams_t *subgraph_streams = &child->streams;
   dep_fd_imports_t *fd_imports = &child->streams.fd_imports;
-  uint32_t position = (uint32_t)(redirect_token->start - context->cmd);
-  bool active = dep_owner_phase_active(context, consumer_node,
-                                       DEP_SNAPSHOT_REDIRECT_OPERAND, position);
   shell_dep_error_t snapshot_error =
       !active
           ? SHELL_DEP_OK
           : dep_snapshot_fd_imports(out, out_streams, context, consumer_node,
                                     position, DEP_SNAPSHOT_REDIRECT_OPERAND,
-                                    fd_imports);
+                                    fd_imports, NULL, &active);
   if (snapshot_error != SHELL_DEP_OK)
     return snapshot_error;
   active =
@@ -14710,7 +22857,7 @@ static SHELL_NONNULL(1, 5, 6, 8, 9, 10, 12, 14) shell_dep_error_t
       context->resolver);
   if (error != SHELL_DEP_OK)
     return error;
-  if (subgraph->node_count == 0)
+  if (subgraph->node_count == 0 && !active)
     return SHELL_DEP_OK;
 
   if (!active)
@@ -14730,14 +22877,16 @@ static SHELL_NONNULL(1, 5, 6, 8, 9, 10, 12, 14) shell_dep_error_t
   if (redirected_fd == SHELL_DEP_FD_NAMED) {
     if (!dep_named_fd_name(redirect_token, &named_fd_name, &named_fd_name_len))
       return SHELL_DEP_EPARSE;
-    named_setup_fd =
-        (dep_fd_ref_t){SHELL_DEP_FD_NAMED, named_fd_name, named_fd_name_len};
+    named_setup_fd = (dep_fd_ref_t){.name = named_fd_name,
+                                    .value = SHELL_DEP_FD_NAMED,
+                                    .name_len = named_fd_name_len};
     named_setup = &named_setup_fd;
   }
   uint32_t route_edge = UINT32_MAX, second_route_edge = UINT32_MAX;
   bool combined =
       redirect == DEP_REDIRECT_BOTH || redirect == DEP_REDIRECT_BOTH_APPEND;
-  if ((!input && !output) || redirect == DEP_REDIRECT_READ_WRITE) {
+  if ((!input && !output) || redirect == DEP_REDIRECT_READ_WRITE ||
+      subgraph->node_count == 0) {
     dep_fd_access_t access =
         redirect == DEP_REDIRECT_READ_WRITE ? DEP_FD_ACCESS_BOTH
         : redirect == DEP_REDIRECT_IN       ? DEP_FD_ACCESS_READ
@@ -14746,12 +22895,31 @@ static SHELL_NONNULL(1, 5, 6, 8, 9, 10, 12, 14) shell_dep_error_t
                           ? *named_setup
                           : dep_fd_numeric(combined ? 1 : redirected_fd);
     uint32_t parent_edges[3] = {UINT32_MAX, UINT32_MAX, UINT32_MAX};
-    if (!dep_install_process_pipe(
-            out, max_nodes, max_edges, effective_cwd_buf_size, out_streams,
-            subgraph, subgraph_streams, consumer_node, target->start[0] == '<',
-            &fd, parent_edges, access, combined))
+    bool child_writes = target->start[0] == '<';
+    bool native_marker =
+        !(access & (child_writes ? DEP_FD_ACCESS_READ : DEP_FD_ACCESS_WRITE));
+    if (native_marker && out->edge_count == max_edges)
       return SHELL_DEP_ETRUNC;
+    if (!dep_install_process_pipe(
+            out, max_nodes, max_edges - (native_marker ? 1u : 0u),
+            effective_cwd_buf_size, out_streams, subgraph, subgraph_streams,
+            consumer_node, child_writes, &fd, parent_edges, access, combined))
+      return SHELL_DEP_ETRUNC;
+    uint32_t temporary_edge = parent_edges[child_writes ? 0 : 1];
+    if (native_marker) {
+      const shell_dep_edge_t *opposite =
+          &out->edges[parent_edges[child_writes ? 1 : 0]];
+      uint32_t pipe = child_writes ? opposite->to : opposite->from;
+      temporary_edge = out->edge_count;
+      dep_add_edge(out, child_writes ? pipe : consumer_node,
+                   child_writes ? consumer_node : pipe,
+                   child_writes ? SHELL_EDGE_SUBST : SHELL_EDGE_WRITE,
+                   SHELL_DEP_FD_NONE, SHELL_DEP_FD_NONE);
+    }
     uint32_t position = (uint32_t)(target->start - context->cmd);
+    dep_record_process_temporary(
+        context->process_routes, temporary_edge, consumer_node, position,
+        target->start, child_writes, false, false, native_marker, NULL);
     for (unsigned i = 0; i < 3; i++)
       if (parent_edges[i] != UINT32_MAX)
         dep_record_process_substitution_route(
@@ -14764,7 +22932,8 @@ static SHELL_NONNULL(1, 5, 6, 8, 9, 10, 12, 14) shell_dep_error_t
     connected = dep_connect_substitution(
         out, max_nodes, max_edges, effective_cwd_buf_size, out_streams,
         subgraph, subgraph_streams, consumer_node, DEP_SUBST_PROCESS_INPUT,
-        redirected_fd, named_setup, &route_edge);
+        named_setup ? *named_setup : dep_fd_numeric(redirected_fd),
+        &route_edge);
   } else {
     /* A combined output redirect needs one extra edge after connecting the
      * process substitution: stderr joins stdout's collector. Reserve it
@@ -14777,7 +22946,9 @@ static SHELL_NONNULL(1, 5, 6, 8, 9, 10, 12, 14) shell_dep_error_t
       connected = dep_connect_substitution(
           out, max_nodes, connect_max_edges, effective_cwd_buf_size,
           out_streams, subgraph, subgraph_streams, consumer_node,
-          DEP_SUBST_PROCESS_OUTPUT, combined ? 1 : redirected_fd, named_setup,
+          DEP_SUBST_PROCESS_OUTPUT,
+          named_setup ? *named_setup
+                      : dep_fd_numeric(combined ? 1 : redirected_fd),
           &route_edge);
     if (connected && combined &&
         (out->status & SHELL_DEP_STATUS_TRUNCATED) == 0) {
@@ -14804,6 +22975,9 @@ static SHELL_NONNULL(1, 5, 6, 8, 9, 10, 12, 14) shell_dep_error_t
   }
   if (connected && (input || output)) {
     uint32_t position = (uint32_t)(target->start - context->cmd);
+    dep_record_process_temporary(
+        context->process_routes, route_edge, consumer_node, position,
+        target->start, target->start[0] == '<', false, false, false, NULL);
     dep_record_process_substitution_route(
         context->process_routes, route_edge, consumer_node, position, input,
         named_setup ? *named_setup
@@ -14826,6 +23000,123 @@ static SHELL_NONNULL(1, 5, 6, 7, 8, 10) shell_dep_error_t
         uint32_t snapshot_position, dep_snapshot_phase_t snapshot_phase,
         uint32_t consumer_node, dep_subst_kind_t kind);
 
+/* Keep the existing producer/collector resource identity for the temporary
+ * parent pipe end. Word expansion creates it even when its generated pathname
+ * is only option data or a rejected read target, not a byte-use argument. */
+static SHELL_NONNULL(1, 5, 6, 7, 8, 9) bool dep_connect_process_word(
+    shell_dep_graph_t *out, uint32_t max_nodes, uint32_t max_edges,
+    uint32_t cwd_size, dep_subgraph_streams_t *out_streams,
+    const shell_dep_graph_t *child, const dep_subgraph_streams_t *streams,
+    const dep_parse_context_t *context, const dep_token_t *fragment,
+    uint32_t owner, dep_snapshot_phase_t phase, bool byte_use,
+    const dep_process_guard_t *guard) {
+  uint32_t edge = UINT32_MAX;
+  bool input = fragment->start[0] == '<';
+  if (child->node_count == 0) {
+    dep_fd_ref_t fd = dep_fd_numeric(SHELL_DEP_FD_NONE);
+    uint32_t edges[3] = {UINT32_MAX, UINT32_MAX, UINT32_MAX};
+    if (!dep_install_process_pipe(
+            out, max_nodes, max_edges, cwd_size, out_streams, child, streams,
+            owner, input, &fd, edges,
+            input ? DEP_FD_ACCESS_READ : DEP_FD_ACCESS_WRITE, false))
+      return false;
+    edge = edges[input ? 0 : 1];
+  } else if (!dep_connect_substitution(
+                 out, max_nodes, max_edges, cwd_size, out_streams, child,
+                 streams, owner,
+                 input ? DEP_SUBST_PROCESS_WORD : DEP_SUBST_PROCESS_OUTPUT,
+                 dep_fd_numeric(input ? 1 : SHELL_DEP_FD_NONE), &edge))
+    return false;
+  /* A successful process connection always retains its parent-facing pipe
+   * edge, including a child with no exposed stream. */
+  const shell_dep_node_t *producer = &out->nodes[out->edges[edge].from];
+  bool exposed_input =
+      input && !(producer->type == SHELL_NODE_ENDPOINT &&
+                 producer->endpoint.reserved == DEP_ENDPOINT_PROCESS_PIPE);
+  dep_record_process_temporary(context->process_routes, edge, owner,
+                               (uint32_t)(fragment->start - context->cmd),
+                               fragment->start, input,
+                               phase != DEP_SNAPSHOT_REDIRECT_OPERAND,
+                               byte_use && exposed_input, true, guard);
+  return true;
+}
+
+static SHELL_NONNULL(1, 3) int dep_process_guard_compare(const void *context,
+                                                         uint32_t index,
+                                                         const void *key) {
+  DEP_METADATA_WORK(SHELLSPLIT_TEST_WORK_PROCESS_ROUTES);
+  const dep_process_route_map_t *map = context;
+  uintptr_t left = (uintptr_t)map->guards[index].source;
+  uintptr_t right = (uintptr_t)key;
+  return left < right ? -1 : left != right;
+}
+
+static SHELL_NONNULL(1, 2) const dep_process_guard_t *dep_process_guard_find(
+    const dep_process_route_map_t *map, const char *source) {
+  uint32_t cursor = map->guard_root;
+  while (cursor) {
+    int order = dep_process_guard_compare(map, cursor - 1, source);
+    if (!order)
+      return &map->guards[cursor - 1];
+    cursor = order > 0 ? map->guard_index[cursor - 1].left
+                       : map->guard_index[cursor - 1].right;
+  }
+  return NULL;
+}
+
+/* Intern only guards owning an executable substitution. Existing guards stop
+ * the ancestor walk immediately; each newly needed scope is visited once,
+ * using the forward iterator's stack rather than rescanning source text. */
+static SHELL_NONNULL(1, 2, 3, 4) bool dep_process_word_guard(
+    dep_process_route_map_t *map, const dep_token_t *word,
+    const shell_source_substitution_scan_t *scan,
+    const dep_process_guard_t **guard, bool process,
+    const dep_process_guard_t *inherited) {
+  *guard = inherited;
+  const shell_source_expansion_scope_t *scope = &scan->scope;
+  const shell_source_expansion_scope_t *pending[SHELL_MAX_SUBCOMMANDS + 1];
+  uint32_t count = 0, cursor = scan->scope_count;
+  while (scope->guard_start) {
+    *guard = dep_process_guard_find(map, word->start + scope->guard_start - 1);
+    if (*guard)
+      break;
+    pending[count++] = scope;
+    size_t parent = scope->guard_parent;
+    if (!parent) {
+      *guard = inherited;
+      break;
+    }
+    *guard = dep_process_guard_find(map, word->start + parent - 1);
+    if (*guard)
+      break;
+    while (scan->scopes[--cursor].guard_start != parent) {
+      DEP_METADATA_WORK(SHELLSPLIT_TEST_WORK_PROCESS_ROUTES);
+    }
+    scope = &scan->scopes[cursor];
+  }
+  while (count) {
+    scope = pending[--count];
+    const char *source = word->start + scope->guard_start - 1;
+    uint32_t candidate = map->guard_count + 1, match = 0;
+    map->guard_root =
+        dep_index_insert(map->guard_index, map->guard_root, candidate,
+                         sizeof(map->guards) / sizeof(map->guards[0]),
+                         dep_process_guard_compare, map, source, &match);
+    if (!match)
+      return false;
+    map->guards[map->guard_count++] = (dep_process_guard_t){
+        .source = source,
+        .parent = *guard,
+        .depth = *guard ? (*guard)->depth + 1 : 1,
+    };
+    *guard = &map->guards[match - 1];
+  }
+  for (const dep_process_guard_t *current = process ? *guard : NULL;
+       current && !current->observed; current = current->parent)
+    map->guards[current - map->guards].observed = true;
+  return true;
+}
+
 static SHELL_NONNULL(1, 5, 6, 7, 8, 10) shell_dep_error_t
     dep_connect_expansions_kind(
         shell_dep_graph_t *out, uint32_t max_nodes, uint32_t max_edges,
@@ -14835,11 +23126,13 @@ static SHELL_NONNULL(1, 5, 6, 7, 8, 10) shell_dep_error_t
         const dep_parse_context_t *context, uint32_t expansion_owner,
         uint32_t snapshot_position, dep_snapshot_phase_t snapshot_phase,
         uint32_t consumer_node, dep_subst_kind_t kind, bool heredoc,
-        bool syntax_only);
+        bool syntax_only, const dep_process_guard_t *inherited_guard);
 
 /* Bash's $(<word) has no external command at its outer level: it reads the
  * resolved word as a file. A static word is one DOC→SUBST flow; a dynamic
- * word first receives an explicitly tagged filename-selection flow. */
+ * word first receives an explicitly tagged filename-selection flow. status
+ * is written only when handled; the caller publishes its completion through
+ * the same aggregate/correlated transfer as an ordinary child. */
 static SHELL_NONNULL(1, 5, 6, 8, 9, 11, 18, 19) shell_dep_error_t
     dep_connect_file_command_substitution(
         shell_dep_graph_t *out, uint32_t max_nodes, uint32_t max_edges,
@@ -14849,15 +23142,16 @@ static SHELL_NONNULL(1, 5, 6, 8, 9, 11, 18, 19) shell_dep_error_t
         const dep_parse_context_t *context, uint32_t expansion_owner,
         uint32_t snapshot_position, dep_snapshot_phase_t snapshot_phase,
         uint32_t consumer_node, dep_subst_kind_t consumer_kind,
-        bool syntax_only, bool *handled, uint8_t *status) {
+        bool syntax_only, bool *handled, uint8_t *status,
+        const dep_process_guard_t *guard) {
   *handled = false;
-  *status = DEP_STATUS_EITHER;
   const char *file_path = NULL;
   uint32_t file_path_len = 0;
   if (!dep_file_command_substitution(content, content_len, &file_path,
                                      &file_path_len))
     return SHELL_DEP_OK;
   *handled = true;
+  *status = DEP_STATUS_EITHER;
 
   dep_token_t operand = {file_path, file_path_len};
   bool active =
@@ -14885,6 +23179,12 @@ static SHELL_NONNULL(1, 5, 6, 8, 9, 11, 18, 19) shell_dep_error_t
       return error;
   }
   if (dep_redirect_target_is_process_substitution(&operand)) {
+    if (shell_source_empty_process_word(operand.start, operand.len)) {
+      /* Valid syntax, but no pathname: Bash reports an ambiguous input
+       * redirect. This is substitution failure, not an empty child parse. */
+      *status = DEP_STATUS_MAY_FAIL;
+      return SHELL_DEP_OK;
+    }
     uint32_t sub_len = 0;
     const char *sub_content = extract_subshell_content(&operand, &sub_len);
     if (!sub_content)
@@ -14898,7 +23198,8 @@ static SHELL_NONNULL(1, 5, 6, 8, 9, 11, 18, 19) shell_dep_error_t
         !active ? SHELL_DEP_OK
                 : dep_snapshot_fd_imports(out, out_streams, context,
                                           expansion_owner, snapshot_position,
-                                          snapshot_phase, fd_imports);
+                                          snapshot_phase, fd_imports, guard,
+                                          &active);
     if (snapshot_error != SHELL_DEP_OK)
       return snapshot_error;
     active =
@@ -14920,15 +23221,37 @@ static SHELL_NONNULL(1, 5, 6, 8, 9, 11, 18, 19) shell_dep_error_t
     if (subgraph->node_count == 0)
       return SHELL_DEP_OK;
 
-    bool connected =
-        active && operand.start[0] == '<'
-            ? dep_connect_substitution(
-                  out, max_nodes, max_edges, effective_cwd_buf_size,
-                  out_streams, subgraph, subgraph_streams, consumer_node,
-                  consumer_kind, 1, NULL, NULL)
-            : dep_append_disconnected_substitution(
-                  out, max_nodes, max_edges, effective_cwd_buf_size,
-                  out_streams, subgraph, subgraph_streams);
+    bool connected;
+    if (active && operand.start[0] == '<') {
+      uint32_t edge = UINT32_MAX;
+      connected = dep_connect_substitution(
+          out, max_nodes, max_edges, effective_cwd_buf_size, out_streams,
+          subgraph, subgraph_streams, consumer_node, DEP_SUBST_PROCESS_WORD,
+          dep_fd_numeric(1), &edge);
+      if (connected) {
+        const shell_dep_node_t *producer = &out->nodes[out->edges[edge].from];
+        bool exposed =
+            !(producer->type == SHELL_NODE_ENDPOINT &&
+              producer->endpoint.reserved == DEP_ENDPOINT_PROCESS_PIPE);
+        if (exposed)
+          out->edges[edge].flags = consumer_kind == DEP_SUBST_SHELL_WORD
+                                       ? SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD
+                                       : SHELL_DEP_EDGE_FLAG_SUBST_DYNAMIC_NAME;
+        dep_record_process_temporary(
+            context->process_routes, edge, expansion_owner,
+            (uint32_t)(operand.start - context->cmd), operand.start, true,
+            snapshot_phase != DEP_SNAPSHOT_REDIRECT_OPERAND, exposed, !exposed,
+            guard);
+      }
+    } else if (active)
+      connected = dep_connect_process_word(
+          out, max_nodes, max_edges, effective_cwd_buf_size, out_streams,
+          subgraph, subgraph_streams, context, &operand, expansion_owner,
+          snapshot_phase, false, guard);
+    else
+      connected = dep_append_disconnected_substitution(
+          out, max_nodes, max_edges, effective_cwd_buf_size, out_streams,
+          subgraph, subgraph_streams);
     return connected ? SHELL_DEP_OK : SHELL_DEP_ETRUNC;
   }
 
@@ -14974,18 +23297,127 @@ static SHELL_NONNULL(1, 5, 6, 8, 9, 11, 18, 19) shell_dep_error_t
 
   /* Pathname substitutions execute inside this file substitution. Their
    * status/termination cannot replace its eventual open status or escape into
-   * the parent shell. Preserve only their graph effects here. */
+   * the parent shell. Bash optimizes the filename expansion in the enclosing
+   * execution context: its process descriptors remain visible to later words
+   * until that command finishes. Preserve those descriptor effects while
+   * isolating the substitution's status. */
   uint32_t event = dep_owner_event(context, expansion_owner);
   dep_expansion_status_t saved = context->expansion_status[event];
   uint8_t saved_static = context->event_static_status[event];
   shell_dep_error_t error = dep_connect_expansions_kind(
       out, max_nodes, max_edges, effective_cwd_buf_size, out_streams, &operand,
       cwd, limits, depth, context, expansion_owner, snapshot_position,
-      snapshot_phase, document_node, DEP_SUBST_DYNAMIC_NAME, false,
-      syntax_only);
+      snapshot_phase, document_node, DEP_SUBST_DYNAMIC_NAME, false, syntax_only,
+      guard);
   context->expansion_status[event] = saved;
   context->event_static_status[event] = saved_static;
   return error;
+}
+
+/* Publish aggregate and correlated completion together, before stream joining
+ * reuses a child's optional portable summary. NULL means status-only (including
+ * file shortcuts), not a child summary left in scratch. Identity transfers do
+ * not replace this command's preceding substitution status. Other completions
+ * supersede status without erasing earlier descriptor observations. A scoped
+ * identity also closes completed guards without replacing completion status.
+ * All synchronous children in one scanner-declared operand reuse its guard. */
+static SHELL_NONNULL(1, 2, 3) shell_dep_error_t dep_complete_substitution(
+    const shell_dep_graph_t *graph, const dep_subgraph_streams_t *streams,
+    const dep_parse_context_t *context, uint32_t owner, uint32_t position,
+    uint32_t word_position, dep_snapshot_phase_t phase, bool conditional,
+    uint8_t status, const dep_observation_transfer_t *returned,
+    const dep_process_guard_t *guard) {
+  dep_route_workspace_t *workspace = context->workspace;
+  uint32_t slot = context->snapshot->prepared_source[owner];
+  dep_snapshot_source_t *source = &workspace->snapshot_sources[slot];
+  dep_observation_program_t *program = &workspace->observations;
+  const dep_process_guard_t *previous_guard =
+      source->observation_last[phase]
+          ? program->events[source->observation_last[phase] - 1].guard
+          : NULL;
+  bool identity = status == DEP_EXPANSION_INCOMING;
+  if (identity && (!previous_guard || previous_guard == guard))
+    return SHELL_DEP_OK;
+  uint8_t *prior =
+      &context->expansion_status[dep_owner_event(context, owner)].phase[phase];
+  uint8_t incoming = *prior;
+  conditional = (conditional && !guard) ||
+                (phase == DEP_SNAPSHOT_ASSIGNMENT_VALUE &&
+                 source->argv_presence == (DEP_ARGV_EMPTY | DEP_ARGV_PRESENT) &&
+                 source->assignment_dispatch == DEP_ARGV_EMPTY);
+  uint32_t conditions = returned ? returned->condition_count : 0;
+  uint32_t count = identity ? 0 : returned ? returned->clause_count : 1;
+  if (!guard && !conditions && !source->observation_first[phase]) {
+    if (identity)
+      return SHELL_DEP_OK;
+    *prior = status | (conditional ? incoming : 0);
+    return SHELL_DEP_OK;
+  }
+  uint32_t condition_base = program->transfer.condition_count;
+  uint32_t clause_base = program->transfer.clause_count;
+  if (program->event_count == SHELL_DEP_MAX_EDGES ||
+      conditions > DEP_MAX_FD_IMPORTS - condition_base ||
+      count > SHELL_DEP_MAX_NODES * 5 - clause_base)
+    return SHELL_DEP_ETRUNC;
+  for (uint32_t i = 0; i < conditions; i++) {
+    dep_observation_condition_t condition = returned->conditions[i];
+    if (condition.next)
+      condition.next += condition_base;
+    program->transfer.conditions[condition_base + i] = condition;
+  }
+  uint32_t clauses = 0;
+  for (uint32_t i = 0; i < count; i++) {
+    dep_observation_clause_t clause =
+        returned ? returned->clauses[i]
+                 : (dep_observation_clause_t){.status = status};
+    if (clause.conditions)
+      clause.conditions += condition_base;
+    clause.next = clauses;
+    program->transfer.clauses[clause_base + i] = clause;
+    clauses = clause_base + i + 1;
+  }
+  program->transfer.condition_count += conditions;
+  program->transfer.clause_count += count;
+  uint32_t event = ++program->event_count;
+  program->events[event - 1] = (dep_observation_event_t){
+      .clauses = clauses,
+      .position =
+          phase == DEP_SNAPSHOT_REDIRECT_OPERAND ? position : word_position,
+      .key = slot * 3 + phase,
+      .incoming_status = incoming,
+      .guard = guard,
+      .previous_guard = previous_guard,
+      .conditional = conditional};
+  if (source->observation_last[phase])
+    program->events[source->observation_last[phase] - 1].next = event;
+  else
+    source->observation_first[phase] = event;
+  source->observation_last[phase] = event;
+  uint32_t table;
+  shell_dep_error_t error = dep_snapshot_phase_table(
+      graph, streams, context, owner, position, phase, &table);
+  if (error != SHELL_DEP_OK)
+    return error;
+  dep_snapshot_table_t *entry = &workspace->snapshot_tables[table];
+  const dep_owner_routes_t *baseline =
+      &workspace->snapshot_tables[context->snapshot->persistent[0]].routes;
+  dep_route_state_t state = dep_snapshot_alternatives(entry), before = state;
+  if (!dep_observation_apply(&state, &workspace->snapshot_journal, baseline,
+                             program, event) ||
+      !dep_fd_materialize_from(&state, &before, &workspace->snapshot_journal,
+                               baseline, &entry->routes, &entry->routes) ||
+      !dep_snapshot_table_publish(entry, &state))
+    return SHELL_DEP_ETRUNC;
+  dep_route_set_t completed = dep_fd_raw_fact(
+      &state, &workspace->snapshot_journal, baseline,
+      dep_fd_numeric(slot * 3 + phase), DEP_FD_ACCESS_SUBSTITUTION_STATUS);
+  if (completed.count) {
+    *prior = 0;
+    for (uint32_t i = 0; i < completed.count; i++)
+      *prior |= (uint8_t)completed.routes[i].value;
+  } else if (!identity)
+    *prior = status | (conditional ? incoming : 0);
+  return SHELL_DEP_OK;
 }
 
 /* Analyze expansion-bearing words wherever shell syntax can consume them. The
@@ -15001,12 +23433,13 @@ static SHELL_NONNULL(1, 5, 6, 7, 8, 10) shell_dep_error_t
         const dep_parse_context_t *context, uint32_t expansion_owner,
         uint32_t snapshot_position, dep_snapshot_phase_t snapshot_phase,
         uint32_t consumer_node, dep_subst_kind_t kind, bool heredoc,
-        bool syntax_only) {
+        bool syntax_only, const dep_process_guard_t *inherited_guard) {
   bool active =
       !syntax_only && dep_owner_phase_active(context, expansion_owner,
                                              snapshot_phase, snapshot_position);
   shell_source_substitution_scan_t scan = {
       .scope = {.heredoc = heredoc, .suppress_process = heredoc}};
+  bool guarded = false;
   dep_token_t subshell;
   shell_source_scan_status_t scan_status =
       dep_next_word_substitution(word, &scan, &subshell);
@@ -15027,12 +23460,35 @@ static SHELL_NONNULL(1, 5, 6, 7, 8, 10) shell_dep_error_t
                                     snapshot_position);
   }
   while (scan_status == SHELL_SOURCE_SCAN_FOUND) {
-    uint8_t substitution_status = DEP_STATUS_MAY_SUCCEED;
+    bool executing = active;
+    if (active) {
+      shell_dep_error_t error = dep_prepare_process_tracking(
+          out, out_streams, context, expansion_owner, snapshot_position,
+          snapshot_phase);
+      if (error != SHELL_DEP_OK)
+        return error;
+    }
+    const dep_process_guard_t *guard = NULL;
+    if (!dep_process_word_guard(
+            context->process_routes, word, &scan, &guard,
+            context->process_routes->track[expansion_owner] &&
+                (subshell.start[0] == '<' || subshell.start[0] == '>') &&
+                !shell_source_empty_process_word(subshell.start, subshell.len),
+            inherited_guard))
+      return SHELL_DEP_ETRUNC;
+    guarded |= guard != inherited_guard;
+    uint8_t substitution_status = DEP_EXPANSION_INCOMING;
+    dep_recursive_parse_t *child = NULL;
+    const dep_observation_transfer_t *returned = NULL;
     uint32_t sub_len = 0;
     const char *sub_content = extract_subshell_content(&subshell, &sub_len);
     if (!sub_content)
       return SHELL_DEP_EPARSE;
-    if (sub_len > 0) {
+    bool process_fragment =
+        subshell.start[0] == '<' || subshell.start[0] == '>';
+    if (sub_len > 0 &&
+        !(process_fragment &&
+          shell_source_empty_process_word(subshell.start, subshell.len))) {
       bool file_handled = false;
       shell_dep_error_t file_error = SHELL_DEP_OK;
       if (subshell.start[0] == '$')
@@ -15040,76 +23496,106 @@ static SHELL_NONNULL(1, 5, 6, 7, 8, 10) shell_dep_error_t
             out, max_nodes, max_edges, effective_cwd_buf_size, out_streams,
             sub_content, sub_len, cwd, limits, depth, context, expansion_owner,
             snapshot_position, snapshot_phase, consumer_node, kind, syntax_only,
-            &file_handled, &substitution_status);
+            &file_handled, &substitution_status, guard);
       if (file_error != SHELL_DEP_OK)
         return file_error;
       if (file_handled)
-        active =
-            active && dep_owner_phase_active(context, expansion_owner,
-                                             snapshot_phase, snapshot_position);
+        executing = executing &&
+                    dep_owner_phase_active(context, expansion_owner,
+                                           snapshot_phase, snapshot_position);
       if (!file_handled) {
-        dep_recursive_parse_t *child =
-            dep_recursive_parse_prepare(limits, depth + 1);
+        child = dep_recursive_parse_prepare(limits, depth + 1);
         shell_dep_graph_t *subgraph = &child->graph;
         dep_subgraph_streams_t *subgraph_streams = &child->streams;
         dep_fd_imports_t *fd_imports = &child->streams.fd_imports;
         shell_dep_error_t snapshot_error =
-            !active
+            !executing
                 ? SHELL_DEP_OK
                 : dep_snapshot_fd_imports(out, out_streams, context,
                                           expansion_owner, snapshot_position,
-                                          snapshot_phase, fd_imports);
+                                          snapshot_phase, fd_imports, guard,
+                                          &executing);
         if (snapshot_error != SHELL_DEP_OK)
           return snapshot_error;
-        active =
-            active && dep_owner_phase_active(context, expansion_owner,
-                                             snapshot_phase, snapshot_position);
-        if (active && !dep_fd_import_install_capture(
-                          fd_imports, subshell.start[0] == '>' ? 0 : 1,
-                          subshell.start[0] == '>' ? DEP_FD_ACCESS_READ
-                                                   : DEP_FD_ACCESS_WRITE))
+        executing = executing &&
+                    dep_owner_phase_active(context, expansion_owner,
+                                           snapshot_phase, snapshot_position);
+        if (executing && !dep_fd_import_install_capture(
+                             fd_imports, subshell.start[0] == '>' ? 0 : 1,
+                             subshell.start[0] == '>' ? DEP_FD_ACCESS_READ
+                                                      : DEP_FD_ACCESS_WRITE))
           return SHELL_DEP_ETRUNC;
+        fd_imports->observe_return = executing && !process_fragment;
         shell_dep_error_t error = shell_dep_graph_parse_impl(
             sub_content, sub_len, cwd,
             dep_expansion_cwd_known(out, context, expansion_owner),
             dep_expansion_cwd_absolute(out, context, expansion_owner), limits,
-            depth + 1, NULL, subgraph, subgraph_streams, fd_imports, active,
+            depth + 1, NULL, subgraph, subgraph_streams, fd_imports, executing,
             context->resolver);
         if (error != SHELL_DEP_OK)
           return error;
-        substitution_status = dep_substitution_status(subgraph_streams->status);
-        if (subgraph->node_count > 0) {
-          /* A process substitution in a filename or document operand
-           * contributes a descriptor pathname, not its stream bytes. Retain
-           * its commands without inventing stdout-to-document byte flow. */
-          bool disconnected =
-              !active || subshell.start[0] == '>' ||
-              (subshell.start[0] == '<' &&
-               (kind == DEP_SUBST_DYNAMIC_NAME ||
-                out->nodes[consumer_node].type == SHELL_NODE_DOC));
-          bool connected =
-              !disconnected ||
-              dep_append_disconnected_substitution(
-                  out, max_nodes, max_edges, effective_cwd_buf_size,
-                  out_streams, subgraph, subgraph_streams);
-          if (!disconnected)
-            connected = dep_connect_substitution(
-                out, max_nodes, max_edges, effective_cwd_buf_size, out_streams,
-                subgraph, subgraph_streams, consumer_node,
-                subshell.start[0] == '<' ? DEP_SUBST_PROCESS_WORD : kind, 1,
-                NULL, NULL);
-          if (!connected)
-            return SHELL_DEP_ETRUNC;
-        }
+        bool preserves_status =
+            subgraph_streams->empty_kind == SHELL_SOURCE_BLANK ||
+            (subgraph_streams->empty_kind == SHELL_SOURCE_COMMENT &&
+             subshell.start[0] == '$');
+        if (!preserves_status)
+          substitution_status =
+              dep_substitution_status(subgraph_streams->status);
+        if (subgraph_streams->empty_kind == SHELL_SOURCE_NONEMPTY)
+          returned = &context->workspace->import_join.observations;
       }
     }
-    if (active && (subshell.start[0] == '$' || subshell.start[0] == '`'))
-      dep_record_substitution_status(context, expansion_owner, snapshot_phase,
-                                     substitution_status,
-                                     scan.scope.conditional);
+    if (executing && !process_fragment) {
+      shell_dep_error_t error = dep_complete_substitution(
+          out, out_streams, context, expansion_owner, snapshot_position,
+          (uint32_t)(subshell.start - context->cmd), snapshot_phase,
+          scan.scope.conditional, substitution_status, returned, guard);
+      if (error != SHELL_DEP_OK)
+        return error;
+    }
+    if (child) {
+      shell_dep_graph_t *subgraph = &child->graph;
+      dep_subgraph_streams_t *subgraph_streams = &child->streams;
+      if (subgraph->node_count > 0 || process_fragment) {
+        /* A process substitution in a filename or document operand
+         * contributes a descriptor pathname, not its stream bytes. Retain
+         * its commands without inventing stdout-to-document byte flow. */
+        bool disconnected = !executing;
+        bool connected = !disconnected ||
+                         dep_append_disconnected_substitution(
+                             out, max_nodes, max_edges, effective_cwd_buf_size,
+                             out_streams, subgraph, subgraph_streams);
+        if (!disconnected && process_fragment)
+          connected = dep_connect_process_word(
+              out, max_nodes, max_edges, effective_cwd_buf_size, out_streams,
+              subgraph, subgraph_streams, context, &subshell, expansion_owner,
+              snapshot_phase,
+              kind != DEP_SUBST_DYNAMIC_NAME &&
+                  out->nodes[consumer_node].type != SHELL_NODE_DOC,
+              guard);
+        else if (!disconnected)
+          connected = dep_connect_substitution(
+              out, max_nodes, max_edges, effective_cwd_buf_size, out_streams,
+              subgraph, subgraph_streams, consumer_node, kind,
+              dep_fd_numeric(1), NULL);
+        if (!connected)
+          return SHELL_DEP_ETRUNC;
+      }
+    }
+    active =
+        active && dep_owner_phase_active(context, expansion_owner,
+                                         snapshot_phase, snapshot_position);
     scan_status = dep_next_word_substitution(word, &scan, &subshell);
   }
   if (active) {
+    if (guarded) {
+      shell_dep_error_t completion = dep_complete_substitution(
+          out, out_streams, context, expansion_owner, snapshot_position,
+          (uint32_t)(word->start + word->len - context->cmd), snapshot_phase,
+          false, DEP_EXPANSION_INCOMING, NULL, inherited_guard);
+      if (completion != SHELL_DEP_OK)
+        return completion;
+    }
     shell_dep_error_t error = dep_record_expansion_result(
         out, out_streams, context, expansion_owner, snapshot_position,
         snapshot_phase,
@@ -15134,7 +23620,7 @@ static SHELL_NONNULL(1, 5, 6, 7, 8, 10) shell_dep_error_t
   return dep_connect_expansions_kind(
       out, max_nodes, max_edges, effective_cwd_buf_size, out_streams, word, cwd,
       limits, depth, context, expansion_owner, snapshot_position,
-      snapshot_phase, consumer_node, kind, false, false);
+      snapshot_phase, consumer_node, kind, false, false, NULL);
 }
 
 /* Inspect an operand whose execution is known not to occur. Required retained
@@ -15151,7 +23637,8 @@ static SHELL_NONNULL(1, 5, 6, 7, 8, 10) shell_dep_error_t
   return dep_connect_expansions_kind(
       out, max_nodes, max_edges, cwd_size, streams, operand, cwd, limits, depth,
       context, owner, (uint32_t)(operand->start - context->cmd),
-      DEP_SNAPSHOT_REDIRECT_OPERAND, owner, DEP_SUBST_SHELL_WORD, false, true);
+      DEP_SNAPSHOT_REDIRECT_OPERAND, owner, DEP_SUBST_SHELL_WORD, false, true,
+      NULL);
 }
 
 /* Use the same scoped stream and route construction as ordinary words, but
@@ -15169,7 +23656,7 @@ static SHELL_NONNULL(1, 5, 6, 8, 9, 11) shell_dep_error_t
       out, max_nodes, max_edges, effective_cwd_buf_size, out_streams, &body,
       cwd, limits, depth, context, expansion_owner, snapshot_position,
       DEP_SNAPSHOT_REDIRECT_OPERAND, document_node, DEP_SUBST_SHELL_WORD, true,
-      false);
+      false, NULL);
 }
 
 static shell_dep_error_t dep_connect_word_substitutions(
@@ -15339,9 +23826,11 @@ static SHELL_NONNULL(1, 2) int dep_group_event_compare(const void *left,
 
 /* Mark only words whose expansion cannot alter shell dispatch or builtin
  * state. Redirect operands and assignment prefixes are handled by their own
- * phases. Unknown dispatch remains unresolved. printf data is ordinary argv
- * except state-controlling %b operands in %n formats; those, its options,
- * destination and format retain their semantic roles. */
+ * phases. Wholly elided words never advance argv roles, just as in semantic
+ * validation and mutation analysis. Unknown dispatch remains unresolved.
+ * printf data is ordinary argv except state-controlling %b operands in %n
+ * formats; those, its options, destination and format retain their semantic
+ * roles. */
 static SHELL_NONNULL(1, 6, 7) void dep_prepare_expandable_arguments(
     const dep_token_list_t *tokens, uint32_t command,
     uint32_t effective_command, bool dynamic_command,
@@ -15385,14 +23874,8 @@ static SHELL_NONNULL(1, 6, 7) void dep_prepare_expandable_arguments(
 
   if (ordinary_after != UINT32_MAX) {
     for (uint32_t i = ordinary_after + 1; i < tokens->count; i++) {
-      dep_redirect_t redirect = classify_redirect(&tokens->tokens[i]);
-      if (redirect != DEP_REDIRECT_NONE) {
-        if (shell_source_redirection_consumes_word(tokens->tokens[i].start,
-                                                   tokens->tokens[i].len) &&
-            i + 1 < tokens->count)
-          i++;
+      if (dep_skip_nonargument(tokens, &i))
         continue;
-      }
       eligible[i] = true;
     }
     return;
@@ -15402,14 +23885,8 @@ static SHELL_NONNULL(1, 6, 7) void dep_prepare_expandable_arguments(
     return;
   shell_builtin_printf_t state = {0};
   for (uint32_t i = effective_command + 1; i < tokens->count; i++) {
-    dep_redirect_t redirect = classify_redirect(&tokens->tokens[i]);
-    if (redirect != DEP_REDIRECT_NONE) {
-      if (shell_source_redirection_consumes_word(tokens->tokens[i].start,
-                                                 tokens->tokens[i].len) &&
-          i + 1 < tokens->count)
-        i++;
+    if (dep_skip_nonargument(tokens, &i))
       continue;
-    }
     shell_builtin_printf_phase_t phase = state.phase;
     unsigned roles = shell_builtin_printf_word(&state, tokens->tokens[i].start,
                                                tokens->tokens[i].len);
@@ -15422,13 +23899,6 @@ static SHELL_NONNULL(1, 6, 7) void dep_prepare_expandable_arguments(
 }
 
 /* --- MAIN PARSER --- */
-
-static bool dep_source_is_whitespace(const char *cmd, uint32_t length) {
-  for (uint32_t i = 0; i < length; i++)
-    if (cmd[i] != ' ' && cmd[i] != '\t' && cmd[i] != '\n' && cmd[i] != '\r')
-      return false;
-  return true;
-}
 
 /* Parser metadata is trusted. Capacity truncation can leave open compound
  * descriptors; disable those (and their descendants) before building a partial
@@ -15631,14 +24101,15 @@ static SHELL_NONNULL(1, 4, 5) bool dep_materialize_one_time_report_route(
     if (!dep_record_stream_use(
             streams->capture_uses, &streams->capture_use_count,
             streams->capture_index, &streams->capture_root, timer,
-            time->report_fd, DEP_FD_ACCESS_WRITE, route.value))
+            dep_fd_numeric(time->report_fd), DEP_FD_ACCESS_WRITE, route.value))
       return false;
     time->report_route_flags |= SHELL_TIME_REPORT_ROUTE_GRAPH;
     return true;
   }
   if (route.kind == DEP_ROUTE_INHERITED) {
     if (!dep_time_record_external_fd(time, route.value) ||
-        !dep_record_external_use(streams, timer, time->report_fd,
+        !dep_record_external_use(streams, timer,
+                                 dep_fd_numeric(time->report_fd),
                                  DEP_FD_ACCESS_WRITE, route.value))
       return false;
     time->report_route_flags |= SHELL_TIME_REPORT_ROUTE_EXTERNAL;
@@ -15653,7 +24124,8 @@ static SHELL_NONNULL(1, 4, 5) bool dep_materialize_one_time_report_route(
     return true;
   }
   if (route.kind == DEP_ROUTE_IMPORTED) {
-    if (!dep_record_fd_import_use(streams, timer, time->report_fd,
+    if (!dep_record_fd_import_use(streams, timer,
+                                  dep_fd_numeric(time->report_fd),
                                   DEP_FD_ACCESS_WRITE, route.value))
       return false;
     time->report_route_flags |= SHELL_TIME_REPORT_ROUTE_GRAPH;
@@ -15669,7 +24141,7 @@ static SHELL_NONNULL(1, 4, 5) bool dep_materialize_one_time_report_route(
       const dep_stream_use_t *target = &workspace->time_pipe_targets[start + i];
       if (!dep_add_resolved_edge_refs(
               graph, max_edges, timer, target->owner, SHELL_EDGE_PIPE,
-              dep_fd_numeric(time->report_fd), dep_fd_numeric(target->fd),
+              dep_fd_numeric(time->report_fd), dep_stream_fd(target),
               SHELL_DEP_EDGE_FLAG_NONE))
         return false;
       time->report_route_flags |= SHELL_TIME_REPORT_ROUTE_GRAPH;
@@ -15984,7 +24456,11 @@ static SHELL_NONNULL(1, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
         shell_parse_fast(cmd, cmd_len, &strict_fast_limits, &fast_result);
   }
   dep_prepare_partial_groups(&fast_result);
-  if (dep_source_is_whitespace(cmd, (uint32_t)cmd_len)) {
+  shell_source_empty_kind_t empty = fast_result.count
+                                        ? SHELL_SOURCE_NONEMPTY
+                                        : shell_source_empty_kind(cmd, cmd_len);
+  if (empty == SHELL_SOURCE_BLANK) {
+    streams->empty_kind = SHELL_SOURCE_BLANK;
     out->status = 0;
     return SHELL_DEP_OK;
   }
@@ -15999,7 +24475,8 @@ static SHELL_NONNULL(1, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
   dep_observable_inventory_t observable = {.source = cmd,
                                            .source_length = cmd_len};
   if (shell_tokenizer_inspect_semantics(
-          cmd, cmd_len, dep_observe_descriptor_token, &observable)) {
+          cmd, cmd_len, dep_observe_descriptor_token, dep_observe_read_fd,
+          dep_observe_process, &observable)) {
     out->status = SHELL_DEP_STATUS_ERROR;
     return SHELL_DEP_EPARSE;
   }
@@ -16007,11 +24484,18 @@ static SHELL_NONNULL(1, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
     out->status = SHELL_DEP_STATUS_TRUNCATED;
     return SHELL_DEP_ETRUNC;
   }
+  qsort(observable.positions, observable.position_count,
+        sizeof(observable.positions[0]), dep_numeric_value_compare);
+  qsort(observable.low, observable.low_count, sizeof(observable.low[0]),
+        dep_low_observation_compare);
   out->status = fast_result.status;
 
-  if (fast_result.count == 0)
+  if (fast_result.count == 0) {
+    /* The shared lexical classifier includes erased physical continuations. */
+    streams->empty_kind = (uint8_t)empty;
     return (out->status & SHELL_DEP_STATUS_TRUNCATED) ? SHELL_DEP_ETRUNC
                                                       : SHELL_DEP_OK;
+  }
 
   /* Reject unavailable scratch once after syntax and empty-source handling.
    * Internal consumers below rely on this aligned, sufficiently sized buffer.
@@ -16082,6 +24566,7 @@ static SHELL_NONNULL(1, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
   uint32_t group_node[SHELL_MAX_GROUPS];
   for (uint32_t i = 0; i < SHELL_MAX_GROUPS; i++)
     group_node[i] = UINT32_MAX;
+  dep_process_route_map_t process_routes = {0};
   for (uint32_t i = 0; i < fast_result.group_count; i++) {
     const shell_group_t *group = &fast_result.groups[i];
     if (group->end <= group->start || group->end > cmd_len) {
@@ -16095,6 +24580,12 @@ static SHELL_NONNULL(1, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
     uint32_t node_index = out->node_count++;
     group_node[i] = node_index;
     node_group[node_index] = i;
+    uint32_t end = (uint32_t)execution.pipeline.group_tail[i].redirect_end;
+    if (end < group->end)
+      end = group->end;
+    process_routes.track[node_index] =
+        dep_process_lifetime_observed(&observable, group->start, end,
+                                      &process_routes.observed_low[node_index]);
     shell_dep_node_t *node = &out->nodes[node_index];
     node->type = SHELL_NODE_GROUP;
     node->group.start = cmd + group->start;
@@ -16140,17 +24631,28 @@ static SHELL_NONNULL(1, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
   uint32_t owner_setup_stop[SHELL_DEP_MAX_NODES];
   for (uint32_t node = 0; node < SHELL_DEP_MAX_NODES; node++)
     owner_assignment_stop[node] = owner_setup_stop[node] = UINT32_MAX;
-  dep_process_route_map_t process_routes = {0};
   dep_route_workspace_t *route_workspace = limits->workspace;
   streams->join = &route_workspace->import_join;
   if (depth == 0) {
+    route_workspace->next_selector = 0;
+    route_workspace->observations.event_count = 0;
+    route_workspace->observations.transfer.clause_count = 0;
+    route_workspace->observations.transfer.condition_count = 0;
     route_workspace->snapshot_table_count = 0;
     dep_route_journal_reset(&route_workspace->snapshot_journal);
+    route_workspace->snapshot_journal.process_scratch =
+        &route_workspace->process_scratch;
+    route_workspace->snapshot_journal.next_selector =
+        &route_workspace->next_selector;
     route_workspace->snapshot_journal.failure = &route_workspace->failure;
-    if (!observable.named_fds) {
+    {
       uint32_t retained = 0;
       for (uint32_t i = 0; i < observable.count; i++)
-        if (observable.required[i])
+        if ((observable.required[i] ||
+             (observable.named_fds &&
+              observable.fds[i] >= DEP_BASH_VARREDIR_MIN_FD)) &&
+            (observable.has_process ||
+             observable.fds[i] >= DEP_BASH_VARREDIR_MIN_FD))
           observable.fds[retained++] = observable.fds[i];
       observable.count = retained;
     }
@@ -16160,6 +24662,8 @@ static SHELL_NONNULL(1, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
     route_workspace->snapshot_journal.scratch_observable =
         observable.scratch_observable;
     route_workspace->snapshot_journal.named_closes = observable.named_closes;
+    route_workspace->snapshot_journal.read_observations =
+        observable.read_observations;
     memcpy(route_workspace->snapshot_journal.observable_fds, observable.fds,
            observable.count * sizeof(observable.fds[0]));
     route_workspace->snapshot_source_count = 0;
@@ -16655,14 +25159,13 @@ static SHELL_NONNULL(1, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
 
     /* The fast parser may end this range at the backslash of an escaped
      * physical line ending, with the following redirect range beginning after
-     * LF/CRLF. That backslash is grammar, not a trailing argv word. */
+     * LF. That backslash is grammar, not a trailing argv word. */
     uint32_t token_length = rlen;
     uint32_t range_end = rstart + rlen;
     bool empty_timed_pipeline =
         shell_pipeline_range_is_empty_timing(cmd, range);
     if (token_length != 0 && range_end < cmd_len &&
-        cmd[range_end - 1] == '\\' &&
-        (cmd[range_end] == '\n' || cmd[range_end] == '\r'))
+        cmd[range_end - 1] == '\\' && cmd[range_end] == '\n')
       token_length--;
 
     dep_token_list_t tokens;
@@ -16725,7 +25228,7 @@ static SHELL_NONNULL(1, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
         successor == SHELL_TYPE_AND || successor == SHELL_TYPE_OR;
     uint32_t source_event = SHELL_MAX_GROUPS + si;
     expansion_status[source_event].isolated_setup =
-        command == UINT32_MAX && isolated_setup;
+        argv_presence == DEP_ARGV_EMPTY && isolated_setup;
     expansion_status[source_event].redirect_scopes =
         dep_command_redirect_scopes(command, effective_builtin, dynamic_command,
                                     effective_wrapper, current_redirects);
@@ -16793,6 +25296,10 @@ static SHELL_NONNULL(1, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
                      dep_token_static_equals(effective_builtin, "export");
 
     if (out->node_count >= max_nodes) {
+      /* Earlier substitutions may still have private route markers awaiting
+       * final resolution. An incomplete construction cannot expose them. */
+      if (process_routes.private_edges)
+        return dep_stop_graph_construction(out, SHELL_DEP_ETRUNC);
       out->status |= SHELL_DEP_STATUS_TRUNCATED;
       return SHELL_DEP_ETRUNC;
     }
@@ -16801,6 +25308,9 @@ static SHELL_NONNULL(1, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
     shell_dep_node_t *node = &out->nodes[out->node_count++];
     node_range[cmd_node_idx] = si;
     range_node[si] = cmd_node_idx;
+    process_routes.track[cmd_node_idx] = dep_process_lifetime_observed(
+        &observable, range->start, execution.end[si],
+        &process_routes.observed_low[cmd_node_idx]);
     node->type = SHELL_NODE_CMD;
     node->cmd.pipe_stdin_source = UINT32_MAX;
     node->cmd.pipe_stdin_target = UINT32_MAX;
@@ -16870,7 +25380,8 @@ static SHELL_NONNULL(1, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
       uint32_t fd = inline_document_target_fd(cmd, prefix_start, marker);
       /* Inline documents are absent from the owner's ordinary token list.
        * Complete the classification here, before expanding any operands. */
-      if (command == UINT32_MAX && (fd == 0 || fd == SHELL_DEP_FD_NAMED))
+      if (argv_presence == DEP_ARGV_EMPTY &&
+          (fd == 0 || fd == SHELL_DEP_FD_NAMED))
         expansion_status[source_event].isolated_setup = true;
       if (!add_document_read(out, max_nodes, max_edges, cmd_node_idx, kind,
                              name, name_len, value, value_len, fd, flags,
@@ -16888,8 +25399,7 @@ static SHELL_NONNULL(1, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
     }
     if (!dep_snapshot_record_owner_tokens(&parse_context, cmd_node_idx, &tokens,
                                           readonly_stop, argv_presence)) {
-      out->status |= SHELL_DEP_STATUS_TRUNCATED;
-      return SHELL_DEP_ETRUNC;
+      return dep_stop_graph_construction(out, SHELL_DEP_ETRUNC);
     }
     dep_snapshot_source_t *assignment_source =
         &route_workspace->snapshot_sources[parse_context.snapshot
@@ -16901,6 +25411,8 @@ static SHELL_NONNULL(1, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
       out->status |= SHELL_DEP_STATUS_TRUNCATED;
 
     bool expandable_arguments[SHELL_DEP_MAX_TOKENS];
+    bool argument_substitutions[SHELL_DEP_MAX_TOKENS] = {false};
+    bool prefix_expanded[SHELL_DEP_MAX_TOKENS] = {false};
     const shell_dep_word_value_t *argument_values[SHELL_DEP_MAX_TOKENS] = {0};
     dep_prepare_expandable_arguments(&tokens, command, effective_command,
                                      dynamic_command, effective_builtin,
@@ -16924,7 +25436,55 @@ static SHELL_NONNULL(1, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
                              UINT32_MAX, &argument_values[word]);
         if (resolution_error != SHELL_DEP_OK)
           return dep_stop_graph_construction(out, resolution_error);
+        shell_source_substitution_scan_t scan = {0};
+        dep_token_t fragment;
+        argument_substitutions[word] =
+            dep_next_word_substitution(argument, &scan, &fragment) ==
+            SHELL_SOURCE_SCAN_FOUND;
+        /* Bash expands the complete argv before its redirect list. In
+         * particular a later word's process FD is already visible to an
+         * earlier redirect operand. Prefix assignment RHSs stay in their
+         * distinct, later assignment phase below. */
+        shell_dep_error_t expansion_error = dep_connect_word_substitutions(
+            out, max_nodes, max_edges, effective_cwd_buf_size, streams,
+            argument, out->cwd_buf.data + *range_cwd_offset, limits, depth,
+            &parse_context, cmd_node_idx, range->start,
+            DEP_SNAPSHOT_COMMAND_WORD, cmd_node_idx);
+        if (expansion_error != SHELL_DEP_OK)
+          return dep_stop_graph_construction(out, expansion_error);
       }
+    }
+
+    /* For a statically present command, temporary assignment RHSs follow
+     * argv expansion but precede its redirects, including redirects written
+     * before the assignments. Null/nullable dispatch keeps its existing
+     * ordered assignment checkpoints below. */
+    for (uint32_t word = 0; command != UINT32_MAX &&
+                            argv_presence == DEP_ARGV_PRESENT && word < command;
+         word++) {
+      const dep_token_t *token = &tokens.tokens[word];
+      dep_redirect_t redirect = classify_redirect(token);
+      if (redirect != DEP_REDIRECT_NONE) {
+        if (shell_source_redirection_consumes_word(token->start, token->len))
+          word++;
+        continue;
+      }
+      prefix_expanded[word] = true;
+      if (rejected_assignments & (UINT32_C(1) << word))
+        continue;
+      shell_source_assignment_word_t assignment;
+      (void)shell_source_parse_scalar_assignment_word(token->start, token->len,
+                                                      &assignment);
+      assignment_source->assignment_dispatch = DEP_ARGV_PRESENT;
+      dep_token_t value = {token->start + assignment.equals + 1,
+                           token->len - assignment.equals - 1};
+      shell_dep_error_t error = dep_connect_word_substitutions(
+          out, max_nodes, max_edges, effective_cwd_buf_size, streams, &value,
+          out->cwd_buf.data + *range_cwd_offset, limits, depth, &parse_context,
+          cmd_node_idx, (uint32_t)(token->start - cmd),
+          DEP_SNAPSHOT_ASSIGNMENT_VALUE, cmd_node_idx);
+      if (error != SHELL_DEP_OK)
+        return dep_stop_graph_construction(out, error);
     }
 
     if (is_cd && active) {
@@ -16944,7 +25504,7 @@ static SHELL_NONNULL(1, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
                                                 .options = true,
                                                 .promotes_prefix = true};
 
-    bool found_command = false;
+    bool saw_argv_word = false;
     while (ti < tokens.count) {
       const dep_token_t *tok = &tokens.tokens[ti];
       shell_dep_error_t document_error = dep_expand_inline_documents(
@@ -17107,7 +25667,7 @@ static SHELL_NONNULL(1, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
           dispatch &= (uint8_t)~DEP_ARGV_EMPTY;
         if (rejected_assignments & (UINT32_C(1) << ti))
           dispatch &= (uint8_t)~DEP_ARGV_PRESENT;
-        if (!dispatch) {
+        if (!dispatch || prefix_expanded[ti]) {
           ti++;
           continue;
         }
@@ -17124,6 +25684,18 @@ static SHELL_NONNULL(1, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
         ti++;
         continue;
       }
+
+      if (shell_source_word_is_elided(tok->start, tok->len)) {
+        ti++;
+        continue;
+      }
+
+      /* Assign argv roles after removing prefixes, redirects and elided words.
+       * An unresolved word may supply argv[0]; later words can therefore be
+       * arguments. Track this independently of the bounded public token array.
+       */
+      bool is_argument = saw_argv_word;
+      saw_argv_word = true;
 
       /* Export assignments remain ENVVAR documents, but their surrounding
        * redirect list and other words use the ordinary command graph. */
@@ -17142,13 +25714,6 @@ static SHELL_NONNULL(1, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
             tok->len - export_assignment.equals - 1, export_assignment.append,
             active && (export_roles & SHELL_BUILTIN_ROLE_WRITE), cmd_node_idx,
             &out->status);
-        shell_dep_error_t expansion_error = dep_connect_word_substitutions(
-            out, max_nodes, max_edges, effective_cwd_buf_size, streams, tok,
-            out->cwd_buf.data + *range_cwd_offset, limits, depth,
-            &parse_context, cmd_node_idx, range->start,
-            DEP_SNAPSHOT_COMMAND_WORD, cmd_node_idx);
-        if (expansion_error != SHELL_DEP_OK)
-          return dep_stop_graph_construction(out, expansion_error);
         if (node->cmd.token_count < max_tokens) {
           uint32_t idx = node->cmd.token_count++;
           node->cmd.tokens[idx] = tok->start;
@@ -17158,119 +25723,7 @@ static SHELL_NONNULL(1, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
         continue;
       }
 
-      shell_source_substitution_scan_t subshell_scan = {0};
-      shell_source_scan_status_t subshell_status;
-      dep_token_t subshell_token;
-      bool had_subshell = false;
-      while ((subshell_status = dep_next_word_substitution(tok, &subshell_scan,
-                                                           &subshell_token)) ==
-             SHELL_SOURCE_SCAN_FOUND) {
-        uint8_t substitution_status = DEP_STATUS_MAY_SUCCEED;
-        had_subshell = true;
-        uint32_t sub_len = 0;
-        const char *sub_content =
-            extract_subshell_content(&subshell_token, &sub_len);
-        const char *sub_cwd_str = out->cwd_buf.data + *range_cwd_offset;
-        if (!sub_content) {
-          /* An unterminated command or process substitution cannot have a
-           * trustworthy dynamic-flow topology. Reject it rather than keeping
-           * the outer command and silently omitting a possible SUBST edge. */
-          out->node_count = 0;
-          out->edge_count = 0;
-          out->status = SHELL_DEP_STATUS_ERROR;
-          out->cwd_buf.len = 0;
-          return SHELL_DEP_EPARSE;
-        }
-        if (sub_content && sub_len > 0) {
-          bool file_handled = false;
-          shell_dep_error_t file_error = SHELL_DEP_OK;
-          if (subshell_token.start[0] == '$')
-            file_error = dep_connect_file_command_substitution(
-                out, max_nodes, max_edges, effective_cwd_buf_size, streams,
-                sub_content, sub_len, sub_cwd_str, limits, depth,
-                &parse_context, cmd_node_idx, range->start,
-                DEP_SNAPSHOT_COMMAND_WORD, cmd_node_idx, DEP_SUBST_SHELL_WORD,
-                false, &file_handled, &substitution_status);
-          if (file_error != SHELL_DEP_OK)
-            return dep_stop_graph_construction(out, file_error);
-          if (!file_handled) {
-            dep_recursive_parse_t *child =
-                dep_recursive_parse_prepare(limits, depth + 1);
-            shell_dep_graph_t *subgraph = &child->graph;
-            dep_subgraph_streams_t *subgraph_streams = &child->streams;
-            dep_fd_imports_t *fd_imports = &child->streams.fd_imports;
-            shell_dep_error_t snapshot_error =
-                !active ? SHELL_DEP_OK
-                        : dep_snapshot_fd_imports(out, streams, &parse_context,
-                                                  cmd_node_idx, range->start,
-                                                  DEP_SNAPSHOT_COMMAND_WORD,
-                                                  fd_imports);
-            if (snapshot_error != SHELL_DEP_OK)
-              return dep_stop_graph_construction(out, snapshot_error);
-            if (active &&
-                !dep_fd_import_install_capture(
-                    fd_imports, subshell_token.start[0] == '>' ? 0 : 1,
-                    subshell_token.start[0] == '>' ? DEP_FD_ACCESS_READ
-                                                   : DEP_FD_ACCESS_WRITE))
-              return dep_stop_graph_construction(out, SHELL_DEP_ETRUNC);
-            shell_dep_error_t sub_err = shell_dep_graph_parse_impl(
-                sub_content, sub_len, sub_cwd_str, node->cmd.cwd_known,
-                node->cmd.cwd_absolute, limits, depth + 1, NULL, subgraph,
-                subgraph_streams, fd_imports, active, parse_context.resolver);
-            if (sub_err != SHELL_DEP_OK)
-              return dep_stop_graph_construction(out, sub_err);
-            substitution_status =
-                dep_substitution_status(subgraph_streams->status);
-            if (subgraph->node_count > 0) {
-              bool connected =
-                  (active && subshell_token.start[0] != '>') ||
-                  dep_append_disconnected_substitution(
-                      out, max_nodes, max_edges, effective_cwd_buf_size,
-                      streams, subgraph, subgraph_streams);
-              if (active && subshell_token.start[0] != '>')
-                connected = dep_connect_substitution(
-                    out, max_nodes, max_edges, effective_cwd_buf_size, streams,
-                    subgraph, subgraph_streams, cmd_node_idx,
-                    subshell_token.start[0] == '<' ? DEP_SUBST_PROCESS_WORD
-                                                   : DEP_SUBST_SHELL_WORD,
-                    1, NULL, NULL);
-              if (!connected)
-                return dep_stop_graph_construction(out, SHELL_DEP_ETRUNC);
-            }
-          }
-        }
-        if (active &&
-            (subshell_token.start[0] == '$' || subshell_token.start[0] == '`'))
-          dep_record_substitution_status(
-              &parse_context, cmd_node_idx, DEP_SNAPSHOT_COMMAND_WORD,
-              substitution_status, subshell_scan.scope.conditional);
-      }
-
-      if (subshell_status == SHELL_SOURCE_SCAN_MALFORMED) {
-        out->node_count = 0;
-        out->edge_count = 0;
-        out->status = SHELL_DEP_STATUS_ERROR;
-        out->cwd_buf.len = 0;
-        return SHELL_DEP_EPARSE;
-      }
-      if (active) {
-        shell_dep_error_t error = dep_record_expansion_result(
-            out, streams, &parse_context, cmd_node_idx, range->start,
-            DEP_SNAPSHOT_COMMAND_WORD,
-            (subshell_scan.has_expansion_termination
-                 ? DEP_STATUS_TERMINAL_FAILURE
-                 : 0) |
-                (subshell_scan.has_expansion_abort ? DEP_STATUS_ABORT_FAILURE
-                                                   : 0));
-        if (error != SHELL_DEP_OK)
-          return dep_stop_graph_construction(out, error);
-      }
-
-      /* Keep substitution topology above, but use the same argv and resolved
-       * FILE relations as every other word. Unresolved substitution spellings
-       * are not guessed to be pathname arguments. */
-      if (!found_command && !had_subshell)
-        found_command = true;
+      bool had_subshell = argument_substitutions[ti];
 
       if (node->cmd.token_count < max_tokens) {
         uint32_t idx = node->cmd.token_count++;
@@ -17278,7 +25731,11 @@ static SHELL_NONNULL(1, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
         node->cmd.token_lens[idx] = tok->len;
       }
 
-      if (found_command && ti > 0) {
+      /* Only argument words supply FILE/ARG relations. Wrapper targets remain
+       * arguments of their outer command; effective executable identity is
+       * recorded separately below. Unresolved substitution spellings are not
+       * guessed to be pathname arguments. */
+      if (is_argument) {
         const shell_dep_word_value_t *value = argument_values[ti];
         if (value && value->resolved) {
           shell_netstring_iter_t iter;
@@ -17339,11 +25796,11 @@ static SHELL_NONNULL(1, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
     /* Status proof is construction metadata, not a reason to rescan graph
      * edges later. Keep ordinary return outcomes distinct from expansion,
      * exit, and command-replacement outcomes that terminate this shell. */
-    if (!cwd_isolated) {
+    {
       uint8_t expansion_outcomes =
           event_static_status[source_event] & DEP_STATUS_STOP;
       uint8_t outcomes =
-          command == UINT32_MAX
+          argv_presence == DEP_ARGV_EMPTY
               ? dep_null_command_status(&parse_context, source_event)
               : DEP_STATUS_EITHER;
       if (effective_builtin)
@@ -17377,9 +25834,15 @@ static SHELL_NONNULL(1, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
        * values can expand before rejection, but this simple command's redirect
        * operands and setup are not reached after a readonly assignment fails.
        */
-      if (command == UINT32_MAX && readonly_assignment)
+      if (argv_presence == DEP_ARGV_EMPTY && readonly_assignment)
         outcomes = DEP_STATUS_ABORT_FAILURE;
       event_body_status[source_event] = outcomes;
+      if (cwd_isolated) {
+        outcomes = dep_status_child_return(dep_status_resolve(
+            outcomes, parse_context.snapshot->cwd_entry[source_event].mask &
+                          dep_cwd_run_mask(&parse_context, source_event)));
+        expansion_outcomes = dep_status_child_return(expansion_outcomes);
+      }
       /* Apply local pipeline negation after every command phase has contributed
        * its outcomes. Only returning paths are inverted; exit, replacement and
        * expansion/assignment termination retain their shell exit status. */
@@ -17391,9 +25854,7 @@ static SHELL_NONNULL(1, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
         event_static_status[source_event] |=
             DEP_STATUS_ABORT_FAILURE |
             expansion_status[source_event].null_assignment_errors;
-    } else
-      /* Pipeline/background members terminate their child, not this list. */
-      event_static_status[source_event] = DEP_STATUS_EITHER;
+    }
 
     bool setup_may_fail;
     shell_dep_error_t setup_error = dep_complete_owner_setup(
@@ -17452,15 +25913,8 @@ static SHELL_NONNULL(1, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
       node_range, range_node, node_group, group_node, group_exec, max_nodes,
       max_edges, streams, &streams->fd_imports, &process_routes,
       route_workspace, &parse_context);
-  if (route_error != SHELL_DEP_OK) {
-    /* Capacity can omit a setup resource or connector. If routing cannot
-     * resolve that incomplete state, report the established capacity stop,
-     * not unsupported syntax inferred from the missing operation. */
-    if (route_error == SHELL_DEP_EPARSE &&
-        (out->status & SHELL_DEP_STATUS_TRUNCATED))
-      route_error = SHELL_DEP_ETRUNC;
+  if (route_error != SHELL_DEP_OK)
     return dep_stop_graph_construction(out, route_error);
-  }
   return (out->status & SHELL_DEP_STATUS_TRUNCATED) ? SHELL_DEP_ETRUNC
                                                     : SHELL_DEP_OK;
 }
@@ -17528,8 +25982,8 @@ static SHELL_NONNULL(1, 2, 3, 4) void dep_external_owner_routes(
   } else if (phase == DEP_EXTERNAL_FLOW) {
     uint32_t owner = workspace->external_outermost[resource];
     if (!dep_record_external_use(
-            streams, owner == UINT32_MAX ? key->owner : owner, key->fd,
-            (dep_fd_access_t)key->access, key->anchor))
+            streams, owner == UINT32_MAX ? key->owner : owner,
+            dep_stream_fd(key), (dep_fd_access_t)key->access, key->anchor))
       graph->status |= SHELL_DEP_STATUS_TRUNCATED;
   }
 }
@@ -17557,6 +26011,8 @@ static SHELL_NONNULL(1, 2, 3) void dep_external_owner_collect(
     }
     for (uint32_t access = DEP_FD_ACCESS_READ; access <= DEP_FD_ACCESS_WRITE;
          access <<= 1) {
+      if (access == DEP_FD_ACCESS_READ && !workspace->generic_read[owner])
+        continue;
       bool used =
           sparse ? fd <= 2 || (dep_owner_route_touched(workspace, owner, slot) &
                                access) != 0
@@ -17573,8 +26029,8 @@ static SHELL_NONNULL(1, 2, 3) void dep_external_owner_collect(
         if (choices.routes[choice].kind != DEP_ROUTE_INHERITED &&
             choices.routes[choice].kind != DEP_ROUTE_NULL_INPUT)
           continue;
-        dep_stream_use_t key = {owner, fd, choices.routes[choice].value, access,
-                                false};
+        dep_stream_use_t key = {
+            owner, fd, choices.routes[choice].value, access, false, NULL, 0};
         dep_external_owner_routes(graph, streams, workspace, &key, phase);
       }
     }
@@ -17674,8 +26130,9 @@ static int dep_external_use_compare(const void *left, const void *right) {
     return a->anchor < b->anchor ? -1 : 1;
   if (a->owner != b->owner)
     return a->owner < b->owner ? -1 : 1;
-  if (a->fd != b->fd)
-    return a->fd < b->fd ? -1 : 1;
+  int fd_order = dep_fd_ref_compare(dep_stream_fd(a), dep_stream_fd(b));
+  if (fd_order)
+    return fd_order;
   return a->access < b->access ? -1 : a->access != b->access;
 }
 
@@ -17747,6 +26204,9 @@ static SHELL_NONNULL(1, 2, 3) void dep_publish_external_routes(
     if (timer)
       graph->nodes[item->owner].time.report_route_flags |=
           SHELL_TIME_REPORT_ROUTE_EXTERNAL;
+    if (item->fd == SHELL_DEP_FD_NAMED)
+      dep_set_named_fd(&graph->edges[graph->edge_count - 1], !input,
+                       item->fd_name, item->fd_name_len);
   }
 }
 
@@ -17820,7 +26280,18 @@ static SHELL_NONNULL(1, 9, 10) shell_dep_error_t shell_dep_graph_parse_impl(
   uint32_t links = workspace->snapshot_journal.link_count;
   uint32_t members = workspace->snapshot_journal.member_count;
   uint32_t allocations = workspace->snapshot_journal.allocation_count;
+  uint32_t tree_allocations = workspace->snapshot_journal.tree_allocations;
+  bool tree_reuse = workspace->snapshot_journal.tree_reuse;
+  uint32_t snapshot_allocations =
+      workspace->snapshot_journal.snapshot_allocations;
+  bool snapshot_reuse = workspace->snapshot_journal.snapshot_reuse;
   uint32_t sources = workspace->snapshot_source_count;
+  uint32_t observation_events = workspace->observations.event_count;
+  uint32_t observation_clauses = workspace->observations.transfer.clause_count;
+  uint32_t observation_conditions =
+      workspace->observations.transfer.condition_count;
+  workspace->snapshot_journal.tree_reuse = false;
+  workspace->snapshot_journal.snapshot_reuse = false;
   shell_dep_error_t status = shell_dep_graph_parse_raw(
       cmd, cmd_len, initial_cwd, initial_cwd_known, initial_cwd_absolute,
       limits, depth, provided_fast, out, streams, imports, effects_active,
@@ -17828,7 +26299,14 @@ static SHELL_NONNULL(1, 9, 10) shell_dep_error_t shell_dep_graph_parse_impl(
   workspace->snapshot_table_count = tables;
   dep_route_journal_rewind(&workspace->snapshot_journal, changes, snapshots,
                            links, allocations, members);
+  workspace->snapshot_journal.tree_allocations = tree_allocations;
+  workspace->snapshot_journal.tree_reuse = tree_reuse;
+  workspace->snapshot_journal.snapshot_allocations = snapshot_allocations;
+  workspace->snapshot_journal.snapshot_reuse = snapshot_reuse;
   workspace->snapshot_source_count = sources;
+  workspace->observations.event_count = observation_events;
+  workspace->observations.transfer.clause_count = observation_clauses;
+  workspace->observations.transfer.condition_count = observation_conditions;
   return status;
 }
 
@@ -18124,6 +26602,19 @@ static SHELL_NONNULL(1) bool dep_fd_open_edge_form_valid(
          (from_execution && to_execution && edge->from != edge->to &&
           edge->source_fd != SHELL_DEP_FD_NONE &&
           edge->target_fd != SHELL_DEP_FD_NONE);
+}
+
+/* ARG is the command-to-path association. Other document kinds have distinct
+ * shell semantics and must not acquire pathname meaning merely because ARG is
+ * undirected. Endpoint bounds are established before this helper is called. */
+static SHELL_NONNULL(1) bool dep_arg_edge_endpoints_valid(
+    const shell_dep_graph_t *graph, const shell_dep_edge_t *edge,
+    shell_dep_node_type_t from, shell_dep_node_type_t to) {
+  if (from == SHELL_NODE_CMD && to == SHELL_NODE_DOC)
+    return graph->nodes[edge->to].doc.kind == SHELL_DOC_FILE;
+  if (from == SHELL_NODE_DOC && to == SHELL_NODE_CMD)
+    return graph->nodes[edge->from].doc.kind == SHELL_DOC_FILE;
+  return false;
 }
 
 static bool dep_time_owner_valid(const shell_dep_graph_t *graph,
@@ -18994,8 +27485,7 @@ shell_dep_graph_validate(const shell_dep_graph_t *g) {
            e->target_fd == SHELL_DEP_FD_NONE;
       break;
     case SHELL_EDGE_ARG:
-      ok = ((ft == SHELL_NODE_CMD && tt == SHELL_NODE_DOC) ||
-            (ft == SHELL_NODE_DOC && tt == SHELL_NODE_CMD));
+      ok = dep_arg_edge_endpoints_valid(g, e, ft, tt);
       break;
     case SHELL_EDGE_CWD:
       ok = (ft == SHELL_NODE_CMD && tt == SHELL_NODE_CMD) &&

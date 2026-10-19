@@ -291,7 +291,7 @@ static void test_list_syntax_contract(void) {
       "{ echo one; }; echo two",
       "( echo one; ) && echo two",
       "! ! command",
-      "! \\\r\nprintf command",
+      "! \\\nprintf command",
       "! ! { printf command; } | cat",
       "echo !",
       "name()",
@@ -421,13 +421,13 @@ static void test_source_scanner_boundaries(void) {
       {"cat\t", true},
       {"cat\r\n", true},
       {"cat \\\n", true},
-      {"cat \\\r\n", true},
+      {"cat \\\n", true},
       {"cat x\\ ", false},
       {"cat $'x'", false},
       {"cat ''", false},
       {"cat \"\"", false},
       {"cat $'x'\\\n", false},
-      {"cat $'x'\\\r\n", false},
+      {"cat $'x'\\\n", false},
       {"cat $(echo)", false},
       {"cat ${value}", false},
       {"cat $((1))", false},
@@ -523,18 +523,13 @@ static void test_source_scanner_boundaries(void) {
     bool descriptor;
     bool redirect;
   } named_boundaries[] = {
-      {"{fd}>out", true, true},
-      {"{f\\\nd}>out", true, true},
-      {"{f\\\r\nd}\\\r\n>out", true, true},
-      {"{fd} >out", true, false},
-      {"{fd}\t>out", true, false},
-      {"{f d}>out", false, false},
-      {"x{fd}>out", false, false},
-      {"''{fd}>out", false, false},
-      {"$'x'{fd}>out", false, false},
-      {"${x}{fd}>out", false, false},
-      {"$(x){fd}>out", false, false},
-      {"{9}>out", false, false},
+      {"{fd}>out", true, true},         {"{f\\\nd}>out", true, true},
+      {"{f\\\nd}\\\n>out", true, true}, {"{f\\\rd}>out", false, false},
+      {"{f\\\r\nd}>out", false, false}, {"{fd} >out", true, false},
+      {"{fd}\t>out", true, false},      {"{f d}>out", false, false},
+      {"x{fd}>out", false, false},      {"''{fd}>out", false, false},
+      {"$'x'{fd}>out", false, false},   {"${x}{fd}>out", false, false},
+      {"$(x){fd}>out", false, false},   {"{9}>out", false, false},
       {"{}>out", false, false},
   };
   for (size_t i = 0; i < sizeof(named_boundaries) / sizeof(named_boundaries[0]);
@@ -559,7 +554,7 @@ static void test_source_scanner_boundaries(void) {
   size_t parameter_start = 0;
   size_t parameter_end = 0;
   size_t expansion_end = 0;
-  static const char continued_parameter[] = "\"${f\\\r\nd}\"";
+  static const char continued_parameter[] = "\"${f\\\nd}\"";
   static const char continued_after_dollar_lf[] = "$\\\n{fd}";
   static const char continued_after_dollar_crlf[] = "$\\\r\n{fd}";
   static const char continued_after_dollar_cr[] = "$\\\r{fd}";
@@ -573,15 +568,13 @@ static void test_source_scanner_boundaries(void) {
           continued_after_dollar_lf, 0, sizeof(continued_after_dollar_lf) - 1,
           &parameter_start, &parameter_end) &&
       parameter_start == 4 && parameter_end == 6 &&
-      shell_source_parse_named_fd_parameter(
+      !shell_source_parse_named_fd_parameter(
           continued_after_dollar_crlf, 0,
           sizeof(continued_after_dollar_crlf) - 1, &parameter_start,
           &parameter_end) &&
-      parameter_start == 5 && parameter_end == 7 &&
-      shell_source_parse_named_fd_parameter(
+      !shell_source_parse_named_fd_parameter(
           continued_after_dollar_cr, 0, sizeof(continued_after_dollar_cr) - 1,
           &parameter_start, &parameter_end) &&
-      parameter_start == 4 && parameter_end == 6 &&
       shell_source_parse_named_fd_parameter(quoted_after_dollar_lf, 0,
                                             sizeof(quoted_after_dollar_lf) - 1,
                                             &parameter_start, &parameter_end) &&
@@ -593,7 +586,7 @@ static void test_source_scanner_boundaries(void) {
       shell_source_parse_named_fd_parameter(continued_parameter, 0,
                                             sizeof(continued_parameter) - 1,
                                             &parameter_start, &parameter_end) &&
-      parameter_start == 3 && parameter_end == 8 &&
+      parameter_start == 3 && parameter_end == 7 &&
       !shell_source_parse_named_fd_parameter("${fd:-1}", 0, 8, &parameter_start,
                                              &parameter_end) &&
       !shell_source_parse_named_fd_parameter(
@@ -607,7 +600,7 @@ static void test_source_scanner_boundaries(void) {
   valid = valid && shell_source_comment_starts('#', true) &&
           !shell_source_comment_starts('#', false) &&
           !shell_source_comment_starts('x', true) &&
-          shell_source_line_content_end("line\r\n", 6, 0) == 4 &&
+          shell_source_line_end("line\r\n", 6, 0) == 5 &&
           shell_source_next_line("line\nnext", 9, 0) == 5;
 
   /* Redirect topology uses the same expansion predicate as argument words:
@@ -715,8 +708,8 @@ static void test_source_scanner_boundaries(void) {
             fd == fd_targets[i].fd;
   }
 
-  static const char list_trivia[] = " \\\r\n# note\r\n\t\nstage";
-  size_t stage = strlen(" \\\r\n# note\r\n\t\n");
+  static const char list_trivia[] = " \\\n# note\r\n\t\nstage";
+  size_t stage = strlen(" \\\n# note\r\n\t\n");
   valid = valid &&
           shell_source_skip_list_trivia(list_trivia, sizeof(list_trivia) - 1,
                                         0) == stage &&
@@ -724,23 +717,20 @@ static void test_source_scanner_boundaries(void) {
           shell_source_skip_list_trivia("word", 4, 0) == 0 &&
           shell_source_skip_list_trivia(NULL, 0, 0) == 0;
 
-  /* Escaped physical endings are list/redirect grammar, not word text. Cover
-   * both lexer representations of CRLF (one token or `\\\r` plus LF) so
-   * the source helper cannot regress one platform's token stream. */
+  /* Only backslash-LF is erased by the shell grammar. CR and CRLF remain
+   * ordinary word bytes followed, in the latter case, by a separator LF. */
   static const char lf_continuation[] = "\\\n";
-  static const char crlf_continuation[] = "\\\r\n";
+  static const char crlf_word[] = "\\\r\n";
   valid =
       valid && !shell_source_is_escaped_line_ending(NULL, 0, 0) &&
       !shell_source_is_escaped_line_ending("x", 0, 1) &&
       !shell_source_is_escaped_line_ending("\\", 0, 1) &&
       shell_source_is_escaped_line_ending(lf_continuation, 0,
                                           sizeof(lf_continuation) - 1) &&
-      shell_source_is_escaped_line_ending(crlf_continuation, 0,
-                                          sizeof(crlf_continuation) - 1) &&
-      shell_source_is_escaped_line_ending(crlf_continuation, 2,
-                                          sizeof(crlf_continuation) - 1) &&
-      shell_source_is_escaped_line_ending(crlf_continuation, 0, 2) &&
-      shell_source_skip_inline_continuations(" \t\\\n\\\r\nword", 11, 0) == 7 &&
+      !shell_source_is_escaped_line_ending(crlf_word, 0,
+                                           sizeof(crlf_word) - 1) &&
+      !shell_source_is_escaped_line_ending(crlf_word, 0, 2) &&
+      shell_source_skip_inline_continuations(" \t\\\n\\\nword", 10, 0) == 6 &&
       shell_source_skip_inline_continuations("word", 4, 0) == 0 &&
       shell_source_skip_inline_continuations(NULL, 0, 0) == 0 &&
       shell_source_skip_redirect("> >(cmd", 0, strlen("> >(cmd")) == 0 &&
@@ -862,9 +852,11 @@ static void test_source_scanner_boundaries(void) {
    * malformed inner expansion must not make a later `]` look like a valid
    * outer terminator. */
   static const char *const valid_subscripts[] = {
-      "[a\\\nb]",         "[a\\\r\nb]",          "[$'hidden ]' + 1]",
-      "['hidden ]' + 1]", "[\"hidden ]\" + 1]",  "[`printf ']'` + 1]",
-      "[$((1 + 2)) + 1]", "[$(printf ']') + 1]", "[[nested]]",
+      "[a\\\nb]",           "[a\\\nb]",
+      "[$'hidden ]' + 1]",  "['hidden ]' + 1]",
+      "[\"hidden ]\" + 1]", "[`printf ']'` + 1]",
+      "[$((1 + 2)) + 1]",   "[$(printf ']') + 1]",
+      "[[nested]]",
   };
   for (size_t i = 0;
        valid && i < sizeof(valid_subscripts) / sizeof(valid_subscripts[0]);
@@ -1250,10 +1242,10 @@ static void test_current_shell_wrapper_chain_contract(void) {
 static void test_expansion_line_continuation_contract(void) {
   static const char *const accepted[] = {
       "printf %s ${f\\\nd}",
-      "printf %s $\\\r\n(printf child)",
-      "printf %s $\\\r((1 + 2))",
+      "printf %s $\\\n(printf child)",
+      "printf %s $\\\n((1 + 2))",
       "printf %s $((1)\\\n)",
-      "cat <\\\n(printf input) > \\\r\n>(cat)",
+      "cat <\\\n(printf input) > \\\n>(cat)",
       "printf %s $\\\n'ansi'",
   };
   bool valid = true;
@@ -1321,18 +1313,18 @@ static void test_expansion_line_continuation_contract(void) {
     uint32_t feature;
   } feature_pairs[] = {
       {"printf %s ${value}", "printf %s $\\\n{value}", SHELL_FEAT_VARS},
-      {"printf %s $(printf child)", "printf %s $\\\r\n(printf child)",
+      {"printf %s $(printf child)", "printf %s $\\\n(printf child)",
        SHELL_FEAT_SUBSHELL},
       {"printf %s $((1 + 2))", "printf %s $\\\n((1 + 2))", SHELL_FEAT_ARITH},
-      {"printf %s $(<file)", "printf %s $\\\r\n(<file)",
+      {"printf %s $(<file)", "printf %s $\\\n(<file)",
        SHELL_FEAT_SUBSHELL_FILE},
       {"cat <(printf input)", "cat <\\\n(printf input)",
        SHELL_FEAT_PROCESS_SUB},
-      {"printf %s $'literal'", "printf %s $\\\r\n'literal'",
+      {"printf %s $'literal'", "printf %s $\\\n'literal'",
        SHELL_FEAT_ANSI_C_QUOTE},
       {"printf %s @(one|two)", "printf %s @\\\n(one|two)", SHELL_FEAT_EXTGLOB},
       {"printf %s {fd}>out", "printf %s {f\\\nd}>out", SHELL_FEAT_NAMED_FD},
-      {"printf x &>out", "printf x &\\\r\n>out", SHELL_FEAT_COMBINED_REDIRECT},
+      {"printf x &>out", "printf x &\\\n>out", SHELL_FEAT_COMBINED_REDIRECT},
   };
   valid = true;
   for (size_t i = 0; i < sizeof(feature_pairs) / sizeof(feature_pairs[0]);
@@ -1414,7 +1406,7 @@ static void test_expansion_line_continuation_contract(void) {
 
   static const char *const ansi_words[] = {
       "$\\\n'\\x41\\0B'",
-      "$\\\r\n'\\x41\\0B'",
+      "$\\\n'\\x41\\0B'",
   };
   static const unsigned char ansi_expected[] = {'A', '\0', 'B'};
   valid = true;
@@ -1505,12 +1497,12 @@ static void test_terminal_redirect_continuation_contract(void) {
     size_t token_count;
   } cases[] = {
       {"printf payload >\\\n/tmp/write", "printf", 2},
-      {"cat <\\\r/tmp/read", "cat", 1},
-      {"printf payload >>\\\r\n/tmp/append", "printf", 2},
+      {"cat <\\\n/tmp/read", "cat", 1},
+      {"printf payload >>\\\n/tmp/append", "printf", 2},
       {"printf payload >|\\\n/tmp/clobber", "printf", 2},
-      {"printf payload &>\\\r/tmp/both", "printf", 2},
+      {"printf payload &>\\\n/tmp/both", "printf", 2},
       {"printf payload &>>\\\n/tmp/both-append", "printf", 2},
-      {"cat <>\\\r/tmp/read-write", "cat", 1},
+      {"cat <>\\\n/tmp/read-write", "cat", 1},
       {"exec {fd}>\\\n/tmp/trace", "exec", 1},
   };
   bool valid = true;
@@ -1528,7 +1520,7 @@ static void test_terminal_redirect_continuation_contract(void) {
     shell_command_infos_free(infos, count);
   }
 
-  static const char group_command[] = "{ echo one; } >\\\r\n/tmp/group";
+  static const char group_command[] = "{ echo one; } >\\\n/tmp/group";
   shell_processed_commands_t processed = {0};
   valid = valid &&
           shell_process_commands(group_command, sizeof(group_command) - 1, NULL,
@@ -1539,7 +1531,7 @@ static void test_terminal_redirect_continuation_contract(void) {
           processed.group_io_ops[0].fd == 1 &&
           processed.group_io_ops[0].source_end -
                   processed.group_io_ops[0].source_start ==
-              strlen(">\\\r\n/tmp/group");
+              strlen(">\\\n/tmp/group");
   shell_processed_commands_free(&processed);
   test("Terminal redirect continuations retain operand ownership", valid);
 }
@@ -1555,7 +1547,7 @@ static void test_named_fd_word_boundaries(void) {
       {"cat ${x}{fd}>out", "17:3:cat,8:${x}{fd},,", 2},
       {"cat $(x){fd}>out", "17:3:cat,8:$(x){fd},,", 2},
       {"cat {f\\\nd}>out", "6:3:cat,,", 1},
-      {"cat {f\\\r\nd}\\\n>out", "6:3:cat,,", 1},
+      {"cat {f\\\nd}\\\n>out", "6:3:cat,,", 1},
       {"cat {fd} >out", "13:3:cat,4:{fd},,", 2},
       {"cat {fd}\t>out", "13:3:cat,4:{fd},,", 2},
       {"cat {f d}>out", "16:3:cat,2:{f,2:d},,", 3},
@@ -2401,7 +2393,7 @@ static void test_modern_bash_syntax_contract(void) {
   } continued_group_pipelines[] = {
       {"{ left; } | # note\n{ right; }", SHELL_PIPE_MODE_STDOUT,
        SHELL_GROUP_IO_PIPE_OUTPUT},
-      {"{ left; } |& \\\r\n{ right; }", SHELL_PIPE_MODE_STDOUT_AND_STDERR,
+      {"{ left; } |& \\\n{ right; }", SHELL_PIPE_MODE_STDOUT_AND_STDERR,
        SHELL_GROUP_IO_PIPE_OUTPUT_STDERR},
   };
   valid = true;
@@ -4162,6 +4154,13 @@ static void run_transform_line_cases(const transform_line_case_t *cases,
                      cases[i].transformed_commands[j]) == 0 &&
               commands[j]->has_transformations == expected_transform &&
               commands[j]->has_shell_syntax == expected_shell;
+      if (!valid && commands[j])
+        fprintf(stderr,
+                "    stage %zu: original=[%s] display=[%s] "
+                "transformed=%d syntax=%d\n",
+                j, commands[j]->original_command, commands[j]->display_text,
+                commands[j]->has_transformations,
+                commands[j]->has_shell_syntax);
     }
     if (!valid)
       printf("    transform line: count=%zu expected=%zu\n", command_count,
@@ -4459,7 +4458,7 @@ static void test_transform_source_limit_preflight(void) {
 
 static void test_transform_allocation_failures(void) {
   static const char input[] =
-      "echo prefix$USER-suffix \"literal\"${NAME}\\\r\n-tail a b c d e f g h "
+      "echo prefix$USER-suffix \"literal\"${NAME}\\\n-tail a b c d e f g h "
       "i j k l m n o p \"$OUTER$(printf '\"$INNER')$AFTER\" "
       "\"$OUTER`printf '$INNER'`$AFTER\" "
       "$OUTER<(printf '$INNER')$AFTER | grep '*.txt'";
@@ -5038,6 +5037,9 @@ static void test_processed_comment_only_source_is_empty(void) {
   static const char *const cases[] = {
       "# comment-only source",
       "# <(printf data)",
+      " \t\n",
+      "\\\n",
+      "\\\n # continued empty source\n \\\n",
   };
   bool valid = true;
   for (size_t i = 0; valid && i < sizeof(cases) / sizeof(cases[0]); i++) {
@@ -5053,8 +5055,21 @@ static void test_processed_comment_only_source_is_empty(void) {
         processed.group_io_ops == NULL && processed.group_io_op_count == 0;
     shell_processed_commands_free(&processed);
   }
-  test("Structured processing rejects comment-only source without records",
+  test("Structured processing rejects trivia-only source without records",
        valid);
+  /* Backslash-CR retains a command word, unlike a backslash-LF continuation. */
+  static const char nonblank[] = " \\\n \\\r\n \t";
+  shell_parse_result_t fast = {0};
+  shell_processed_commands_t processed = {0};
+  bool retained = shell_parse_fast(nonblank, sizeof(nonblank) - 1, NULL,
+                                   &fast) == SHELL_OK &&
+                  fast.count == 1 &&
+                  shell_process_commands(nonblank, sizeof(nonblank) - 1, NULL,
+                                         &processed) == SHELL_PROCESS_OK &&
+                  processed.command_count == 1;
+  shell_processed_commands_free(&processed);
+  test("Nonblank physical line endings cannot become empty successful source",
+       retained);
 }
 
 static void test_posix_brace_group_forms(void) {
@@ -5614,9 +5629,12 @@ static void test_brace_group_boundaries_and_redirections(void) {
     size_t command_count;
     uint32_t group_count;
   } boundary_cases[] = {
-      {"{\n echo one\n}", 1, 1},      {"{ echo one; } | { cat; }", 2, 2},
-      {"{\r\n  echo one\r\n}", 1, 1}, {"echo \\{ \\}", 1, 0},
-      {"echo {foo}", 1, 0},           {"echo foo}", 1, 0},
+      {"{\n echo one\n}", 1, 1},
+      {"{ echo one; } | { cat; }", 2, 2},
+      {"{ \r\n  echo one\r\n}", 2, 1},
+      {"echo \\{ \\}", 1, 0},
+      {"echo {foo}", 1, 0},
+      {"echo foo}", 1, 0},
   };
   bool valid = true;
   for (size_t i = 0; i < sizeof(boundary_cases) / sizeof(boundary_cases[0]);
@@ -5746,7 +5764,7 @@ static void test_brace_group_grammar_matrix(void) {
       {"a && ! b", 2, 0},
       {"a & ! b", 2, 0},
       {"{\n echo one\n}", 1, 1},
-      {"{\r\n  echo one\r\n}", 1, 1},
+      {"{ \r\n  echo one\r\n}", 2, 1},
       {"{ echo one; } && { cat; }", 2, 2},
       {"cat /tmp/in | { printf '%s\\n' \"$value\"; } > /tmp/out", 2, 1},
       {"{ echo \"}\"; # } remains text\n printf two; }", 2, 1},
@@ -6548,7 +6566,7 @@ static void test_redirect_operand_boundary_contract(void) {
 
   static const char *const accepted[] = {
       "echo > \\\nout",
-      "echo 2> \\\r\nerr",
+      "echo 2> \\\nerr",
       "echo >\"#name\"",
       "echo >\\#name",
       "echo <<<\"#value\"",
@@ -6594,7 +6612,7 @@ static void test_redirect_operand_boundary_contract(void) {
    * the continuation and leave only the executable in canonical argv. */
   static const char *const continued_io_numbers[] = {
       "cmd >out \\\n3<<<data",
-      "cmd >out \\\r\n3<<<data",
+      "cmd >out \\\n3<<<data",
   };
   for (size_t i = 0;
        i < sizeof(continued_io_numbers) / sizeof(continued_io_numbers[0]);
@@ -6957,7 +6975,7 @@ static void test_processed_group_io_contract(void) {
     size_t operator_length;
   } continued_sibling_pipelines[] = {
       {"{ echo one; } \\\n| { cat; }", SHELL_GROUP_IO_PIPE_OUTPUT, 1},
-      {"{ echo one; } \\\r\n|& { cat; }", SHELL_GROUP_IO_PIPE_OUTPUT_STDERR, 2},
+      {"{ echo one; } \\\n|& { cat; }", SHELL_GROUP_IO_PIPE_OUTPUT_STDERR, 2},
   };
   for (size_t pipeline = 0;
        valid && pipeline < sizeof(continued_sibling_pipelines) /
@@ -6986,9 +7004,9 @@ static void test_processed_group_io_contract(void) {
 
   /* Continuations may occur before the redirect list, between the operator
    * and its operand, or between adjacent redirects. None creates a new
-   * command boundary. Exercise LF and CRLF physical lines in one fixture. */
+   * command boundary. Exercise LF continuations at every boundary. */
   static const char continued_redirects[] =
-      "{ echo one; } \\\n> \\\nout \\\n2> \\\r\nerr \\\n| cat";
+      "{ echo one; } \\\n> \\\nout \\\n2> \\\nerr \\\n| cat";
   memset(&result, 0, sizeof(result));
   status = shell_process_commands(
       continued_redirects, sizeof(continued_redirects) - 1, NULL, &result);
@@ -7943,8 +7961,12 @@ static void test_canonical_heredoc_api_contract(void) {
       {"escaped whitespace delimiter", "cat <<A\\ B\nbody\nA B\nprintf after\n",
        1, 1, "A\\ B"},
       {"empty single-quoted delimiter", "cat <<''\n\nprintf after\n", 1, 1, ""},
+      {"CR distinguishes delimiter lines",
+       "cat <<EOF\nEOF\r\nEOF\nprintf after\n", 1, 0, "EOF"},
+      {"CR survives quote removal and matches exactly",
+       "cat <<\"EOF\"\r\nEOF\nEOF\r\nprintf after\n", 1, 1, "\"EOF\"\r"},
       {"mixed FIFO CRLF delimiters",
-       "cat << EOF <<-\"F\"\r\none\r\nEOF\r\n\ttwo\r\n\tF\r\n"
+       "cat << EOF <<-\"F\"\r\none\r\nEOF\n\ttwo\r\n\tF\r\n"
        "printf after\r\n",
        2, 1, "EOF"},
   };
@@ -8057,7 +8079,7 @@ static void test_heredoc_expansion_semantic_contract(void) {
 
   static const char visited[] = "cat <<EOF <<-'LITERAL'\r\n"
                                 "$(printf active)\r\n"
-                                "EOF\r\n"
+                                "EOF\n"
                                 "\t$(while true; do :; done)\r\n"
                                 "\tLITERAL\r\n";
   heredoc_body_capture_t capture = {0};
@@ -8086,8 +8108,8 @@ static void test_heredoc_expansion_semantic_contract(void) {
  * must reject that source atomically. */
 static void test_continued_bash_compound_syntax_contract(void) {
   static const char *const unsupported[] = {
-      "(\\\n( count += 1 ))", "(\\\r( count += 1 ))", "(\\\r\n( count += 1 ))",
-      "[\\\n[ -n value ]]",   "[\\\r[ -n value ]]",   "[[\\\r\n -n value ]]",
+      "(\\\n( count += 1 ))", "(\\\n( count += 1 ))", "(\\\n( count += 1 ))",
+      "[\\\n[ -n value ]]",   "[\\\n[ -n value ]]",   "[[\\\n -n value ]]",
   };
   bool valid = true;
   for (size_t i = 0; i < sizeof(unsupported) / sizeof(unsupported[0]); i++) {
@@ -8528,8 +8550,153 @@ static void test_canonical_sequence_model_capacity_contract(void) {
   test("Canonical sequence honors semantic-model capacity", valid);
 }
 
+static void test_empty_process_argv(void) {
+  static const char source[] = "<() printf a<()b <()>() ''<() \"<()\"";
+  static const char expected[] = "6:printf,2:ab,0:,3:<(),";
+  shell_command_info_t *infos = NULL;
+  size_t count = 0;
+  shell_netstring_buffer_t argv = {0}, sequence = {0}, raw = {0}, typed = {0};
+  bool valid = shell_process_command(source, sizeof(source) - 1, NULL, &infos,
+                                     &count) == SHELL_PROCESS_OK &&
+               count == 1;
+  if (valid)
+    valid = shell_render_netargv_buffer(&infos[0], NULL, &argv) ==
+                SHELL_PROCESS_OK &&
+            argv.length == sizeof(expected) - 1 &&
+            !memcmp(argv.data, expected, argv.length);
+  shell_command_infos_free(infos, count);
+  shell_netstring_buffer_free(&argv);
+  bool features = false;
+  valid = valid &&
+          shell_build_netargv_sequence_buffer(source, sizeof(source) - 1, NULL,
+                                              &sequence, &count,
+                                              &features) == SHELL_PROCESS_OK &&
+          count == 1;
+  shell_netstring_iter_t iterator;
+  shell_netstring_view_t record;
+  valid = valid &&
+          shell_netstring_iter_init(&iterator, sequence.data,
+                                    sequence.length) == SHELL_NETSTRING_OK &&
+          shell_netstring_iter_next(&iterator, &record) == SHELL_NETSTRING_OK &&
+          record.payload_length == sizeof(expected) - 1 &&
+          !memcmp(record.payload, expected, record.payload_length);
+  valid =
+      valid &&
+      shell_build_anomaly_netseqs_buffer(source, sizeof(source) - 1, NULL, &raw,
+                                         &typed, &count) == SHELL_PROCESS_OK &&
+      count == 1;
+  valid = valid && command_netseq_matches("<() printf ok", "6:printf,", 1);
+  shell_netstring_buffer_free(&raw);
+  shell_netstring_buffer_free(&typed);
+  shell_netstring_buffer_free(&sequence);
+  test("Canonical argv elides empty process words, not quoted empty arguments",
+       valid);
+  test("Empty process words preserve allocation failure atomicity",
+       process_commands_allocation_failure_atomic(source));
+}
+
+static void test_elided_group_records(void) {
+  static const struct {
+    const char *source;
+    size_t flat_count, structured_count, groups;
+    size_t flagged;
+    bool stderr_redirect;
+  } cases[] = {
+      {"{ printf ok; <(); } 2>errors", 2, 1, 1, 0, true},
+      {"{ printf ok; <()>() ; } >out", 2, 1, 1, 0, false},
+      {"{ { printf ok; <(); } 2>inner; >(); } >outer", 3, 1, 2, 0, true},
+      {"{ <(); >(); } 2>errors", 2, 0, 1, SIZE_MAX, true},
+      {"{ printf ok; ''<(); } 2>errors", 2, 2, 1, 1, true},
+      {"{ printf ok; $value; } 2>errors", 2, 2, 1, 1, true},
+      {"<(); { >(); }; printf ok", 3, 1, 1, SIZE_MAX, false}};
+  bool valid = true;
+  for (size_t i = 0; valid && i < sizeof(cases) / sizeof(cases[0]); i++) {
+    shell_command_info_t *flat = NULL;
+    size_t count = 0;
+    shell_processed_commands_t structured = {0};
+    valid = shell_process_command(cases[i].source, strlen(cases[i].source),
+                                  NULL, &flat, &count) == SHELL_PROCESS_OK &&
+            count == cases[i].flat_count &&
+            shell_process_commands(cases[i].source, strlen(cases[i].source),
+                                   NULL, &structured) == SHELL_PROCESS_OK &&
+            structured.command_count == cases[i].structured_count &&
+            structured.group_count == cases[i].groups;
+    for (size_t c = 0; valid && c < count; c++)
+      valid = flat[c].has_redirections == (c == cases[i].flagged) &&
+              flat[c].has_error_redirection ==
+                  (c == cases[i].flagged && cases[i].stderr_redirect);
+    for (size_t g = 0; valid && g < structured.group_count; g++) {
+      const shell_group_t *group = &structured.groups[g];
+      valid = group->first_command == 0 &&
+              group->command_count == (i == 6 ? 0 : cases[i].structured_count);
+    }
+    valid = valid &&
+            (structured.commands == NULL) == (cases[i].structured_count == 0);
+    shell_command_infos_free(flat, count);
+    shell_processed_commands_free(&structured);
+  }
+  test("Elided stages preserve flat flags and structured group indexes", valid);
+  test("Elided group records remain allocation-failure atomic",
+       process_commands_allocation_failure_atomic(cases[2].source) &&
+           process_commands_allocation_failure_atomic(cases[3].source));
+
+  /* Anomaly sequences retain both structural stages, including the empty
+   * sentinel; structured omission must not remove that observation. */
+  shell_netstring_buffer_t raw = {0}, typed = {0};
+  size_t count = 0;
+  const char *source = "{ printf ok; <(); } 2>errors";
+  valid =
+      shell_build_anomaly_netseqs_buffer(source, strlen(source), NULL, &raw,
+                                         &typed, &count) == SHELL_PROCESS_OK &&
+      count == 2;
+  if (valid) {
+    shell_netstring_iter_t raw_iter, typed_iter;
+    shell_netstring_view_t raw_record, typed_record;
+    valid = shell_netstring_iter_init(&raw_iter, raw.data, raw.length) ==
+                SHELL_NETSTRING_OK &&
+            shell_netstring_iter_init(&typed_iter, typed.data, typed.length) ==
+                SHELL_NETSTRING_OK;
+    for (size_t i = 0; valid && i < count; i++) {
+      valid = shell_netstring_iter_next(&raw_iter, &raw_record) ==
+                  SHELL_NETSTRING_OK &&
+              shell_netstring_iter_next(&typed_iter, &typed_record) ==
+                  SHELL_NETSTRING_OK;
+      if (valid && i == 1)
+        valid = raw_record.payload_length == 0 &&
+                typed_record.payload_length == 3 &&
+                !memcmp(typed_record.payload, "0:,", 3);
+    }
+  }
+  shell_netstring_buffer_free(&raw);
+  shell_netstring_buffer_free(&typed);
+  test("Elided stages remain explicit anomaly records", valid);
+
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+  size_t previous = 0;
+  valid = true;
+  for (unsigned groups = 4; valid && groups <= 16; groups *= 2) {
+    char source[2048] = "";
+    for (unsigned g = 0; g < groups; g++)
+      strcat(source, "{ printf ok; <()>()<(); } 2>errors; ");
+    shell_command_info_t *flat = NULL;
+    size_t count = 0;
+    shellsplit_test_source_scan_reset();
+    valid = shell_process_command(source, strlen(source), NULL, &flat,
+                                  &count) == SHELL_PROCESS_OK &&
+            count == 2 * groups;
+    size_t work = shellsplit_test_source_scan_work();
+    valid = valid && work && (!previous || work <= 3 * previous);
+    previous = work;
+    for (size_t i = 0; valid && i < count; i++)
+      valid = flat[i].has_error_redirection == (i % 2 == 0);
+    shell_command_infos_free(flat, count);
+  }
+  test("Elided group flag projection retains linear source work", valid);
+#endif
+}
+
 static void test_processed_word_iterator_boundary_contract(void) {
-  static const char continuation_source[] = ">x\\\r\ny next";
+  static const char continuation_source[] = ">x\\\ny next";
   shell_token_t redirect_tokens[] = {
       {.type = SHELL_TOKEN_REDIRECT_OUT,
        .start = continuation_source,
@@ -8540,13 +8707,13 @@ static void test_processed_word_iterator_boundary_contract(void) {
        .length = 1,
        .position = 1},
       {.type = SHELL_TOKEN_ARGUMENT,
-       .start = continuation_source + 5,
+       .start = continuation_source + 4,
        .length = 1,
-       .position = 5},
+       .position = 4},
       {.type = SHELL_TOKEN_ARGUMENT,
-       .start = continuation_source + 7,
+       .start = continuation_source + 6,
        .length = 4,
-       .position = 7},
+       .position = 6},
   };
   shell_command_t redirect_command = {
       .tokens = redirect_tokens,
@@ -8556,21 +8723,21 @@ static void test_processed_word_iterator_boundary_contract(void) {
   shell_token_t word = {0};
   shell_processed_word_iterator_init(&iterator, &redirect_command);
   bool redirect_valid = shell_processed_word_iterator_next(&iterator, &word) &&
-                        word.start == continuation_source + 7 &&
+                        word.start == continuation_source + 6 &&
                         word.length == 4 &&
                         !shell_processed_word_iterator_next(&iterator, &word);
   bool valid = redirect_valid;
 
-  static const char fragment_source[] = "a\\\r\nb";
+  static const char fragment_source[] = "a\\\nb";
   shell_token_t fragments[] = {
       {.type = SHELL_TOKEN_ARGUMENT,
        .start = fragment_source,
        .length = 1,
        .position = 0},
       {.type = SHELL_TOKEN_ARGUMENT,
-       .start = fragment_source + 4,
+       .start = fragment_source + 3,
        .length = 1,
-       .position = 4,
+       .position = 3,
        .is_quoted = true,
        .is_escaped = true},
   };
@@ -8580,7 +8747,7 @@ static void test_processed_word_iterator_boundary_contract(void) {
   };
   shell_processed_word_iterator_init(&iterator, &fragment_command);
   bool fragment_valid = shell_processed_word_iterator_next(&iterator, &word) &&
-                        word.start == fragment_source && word.length == 5 &&
+                        word.start == fragment_source && word.length == 4 &&
                         word.is_quoted && word.is_escaped &&
                         !shell_processed_word_iterator_next(&iterator, &word);
   valid = valid && fragment_valid;
@@ -8600,8 +8767,14 @@ static void test_processed_word_iterator_boundary_contract(void) {
                                .start = invalid_gap_source + 2,
                                .length = 1,
                                .position = 2};
+  static const char crlf_source[] = "a\\\r\nb";
+  shell_token_t crlf = {.type = SHELL_TOKEN_ARGUMENT,
+                        .start = crlf_source + 4,
+                        .length = 1,
+                        .position = 4};
   bool continuation_valid =
       shell_tokenizer_token_continues_word(&lf, 1) &&
+      !shell_tokenizer_token_continues_word(&crlf, 1) &&
       !shell_tokenizer_token_continues_word(&invalid_gap, 1) &&
       !shell_tokenizer_token_continues_word(&invalid_gap, 3);
   valid = valid && continuation_valid;
@@ -8804,6 +8977,151 @@ static void test_scalar_variable_scan_linear_work(void) {
        valid);
 }
 
+static void test_prevalidated_anomaly_stages(void) {
+  static const struct {
+    const char *source;
+    const char *raw;
+    bool contextual;
+  } cases[] = {
+      {"echo ok; >out; echo \"$(printf x)\" <(printf y); time",
+       "4:echo,0:,6:printf,6:printf,4:echo,0:,", false},
+      {"exec {fd}<<<payload && read -p\"$fd\" -u \"$fd\" value",
+       "4:exec,4:read,", true},
+      {"exec {fd}<<<payload && echo \"$(read -p\"$fd\" -u \"$fd\" value)\"",
+       "4:exec,4:read,4:echo,", true},
+  };
+  shell_dep_graph_t *graph = malloc(sizeof(*graph));
+  bool valid = graph != NULL;
+  for (size_t i = 0; valid && i < sizeof(cases) / sizeof(cases[0]); i++) {
+    const char *source = cases[i].source;
+    size_t length = strlen(source);
+    valid =
+        shell_dep_graph_parse(source, length, "/", NULL, graph) == SHELL_DEP_OK;
+    if (!valid)
+      break;
+    shell_anomaly_stages_t stages = {0};
+    shellsplit_test_source_scan_reset();
+    valid = shell_anomaly_stages_collect_prevalidated(
+                source, length, NULL, &stages) == SHELL_PROCESS_OK &&
+            shellsplit_test_metadata_work(
+                SHELLSPLIT_TEST_WORK_SEMANTIC_BODIES) == 0 &&
+            shellsplit_test_metadata_work(
+                SHELLSPLIT_TEST_WORK_PROCESS_STRICT_PARSE) == 0 &&
+            shellsplit_test_metadata_work(
+                SHELLSPLIT_TEST_WORK_BYTE_VALIDATION_PASSES) == 0;
+    shell_netstring_buffer_t raw = {0}, typed = {0}, raw_only = {0};
+    size_t count = SIZE_MAX, raw_count = SIZE_MAX;
+    valid = valid &&
+            shell_build_anomaly_netseqs_from_stages(
+                &stages, NULL, &raw, &typed, &count) == SHELL_PROCESS_OK &&
+            shell_build_command_netseq_from_stages(
+                &stages, NULL, &raw_only, &raw_count) == SHELL_PROCESS_OK &&
+            count == stages.count && raw_count == count &&
+            raw.length == strlen(cases[i].raw) &&
+            memcmp(raw.data, cases[i].raw, raw.length) == 0 &&
+            raw_only.length == raw.length &&
+            memcmp(raw.data, raw_only.data, raw.length) == 0;
+    shell_netstring_buffer_t public_raw = {0}, public_typed = {0};
+    size_t public_count = SIZE_MAX;
+    shell_process_status_t status = shell_build_anomaly_netseqs_buffer(
+        source, length, NULL, &public_raw, &public_typed, &public_count);
+    if (cases[i].contextual) {
+      valid = valid && status == SHELL_PROCESS_EPARSE && !public_raw.data &&
+              !public_typed.data && public_count == 0;
+      public_count = SIZE_MAX;
+      valid = valid &&
+              shell_build_command_netseq_buffer(source, length, NULL,
+                                                &public_raw, &public_count) ==
+                  SHELL_PROCESS_EPARSE &&
+              !public_raw.data && public_count == 0;
+      public_count = SIZE_MAX;
+      valid = valid &&
+              shell_build_type_netseq_buffer(source, length, NULL,
+                                             &public_typed, &public_count) ==
+                  SHELL_PROCESS_EPARSE &&
+              !public_typed.data && public_count == 0;
+    } else {
+      valid = valid && status == SHELL_PROCESS_OK && public_count == count &&
+              public_raw.length == raw.length &&
+              public_typed.length == typed.length &&
+              memcmp(public_raw.data, raw.data, raw.length) == 0 &&
+              memcmp(public_typed.data, typed.data, typed.length) == 0;
+    }
+    shell_netstring_buffer_free(&public_raw);
+    shell_netstring_buffer_free(&public_typed);
+    shell_netstring_buffer_free(&raw);
+    shell_netstring_buffer_free(&typed);
+    shell_netstring_buffer_free(&raw_only);
+
+    /* Every render allocation is still an operational failure boundary; the
+     * already validated borrowed stage view remains reusable after failure. */
+    for (unsigned paired = 0; valid && paired < 2; paired++) {
+      shellsplit_test_alloc_reset();
+      status = paired ? shell_build_anomaly_netseqs_from_stages(
+                            &stages, NULL, &raw, &typed, &count)
+                      : shell_build_command_netseq_from_stages(&stages, NULL,
+                                                               &raw, &count);
+      size_t allocations = shellsplit_test_alloc_count();
+      shellsplit_test_alloc_reset();
+      valid = status == SHELL_PROCESS_OK && allocations != 0;
+      shell_netstring_buffer_free(&raw);
+      shell_netstring_buffer_free(&typed);
+      for (size_t fail = 1; valid && fail <= allocations; fail++) {
+        shellsplit_test_alloc_fail_at(fail);
+        status = paired ? shell_build_anomaly_netseqs_from_stages(
+                              &stages, NULL, &raw, &typed, &count)
+                        : shell_build_command_netseq_from_stages(&stages, NULL,
+                                                                 &raw, &count);
+        shellsplit_test_alloc_reset();
+        valid = status == SHELL_PROCESS_ENOMEM && count == 0 && !raw.data &&
+                !raw.length && !typed.data && !typed.length;
+      }
+      shell_process_limits_t short_limit = {1, 1, 0};
+      status = paired ? shell_build_anomaly_netseqs_from_stages(
+                            &stages, &short_limit, &raw, &typed, &count)
+                      : shell_build_command_netseq_from_stages(
+                            &stages, &short_limit, &raw, &count);
+      valid = valid && status == SHELL_PROCESS_EOUTPUT_LIMIT && count == 0 &&
+              !raw.data && !typed.data;
+    }
+    shell_anomaly_stages_free(&stages);
+    shellsplit_test_alloc_reset();
+    status = shell_anomaly_stages_collect_prevalidated(source, length, NULL,
+                                                       &stages);
+    size_t allocations = shellsplit_test_alloc_count();
+    shellsplit_test_alloc_reset();
+    valid = valid && status == SHELL_PROCESS_OK && allocations != 0;
+    shell_anomaly_stages_free(&stages);
+    for (size_t fail = 1; valid && fail <= allocations; fail++) {
+      shellsplit_test_alloc_fail_at(fail);
+      status = shell_anomaly_stages_collect_prevalidated(source, length, NULL,
+                                                         &stages);
+      shellsplit_test_alloc_reset();
+      valid = status == SHELL_PROCESS_ENOMEM && !stages.commands &&
+              stages.count == 0;
+      shell_anomaly_stages_free(&stages);
+    }
+  }
+  free(graph);
+  test("Graph-validated anomaly stages share renderers and atomic failures",
+       valid);
+
+  static const char grouped[] = "{ echo a; } >one; { echo b; } >two";
+  graph = malloc(sizeof(*graph));
+  valid = graph && shell_dep_graph_parse(grouped, sizeof(grouped) - 1, "/",
+                                         NULL, graph) == SHELL_DEP_OK;
+  shell_anomaly_stages_t stages = {0};
+  shell_process_limits_t group_limit = {SIZE_MAX, SIZE_MAX, 1};
+  valid = valid &&
+          shell_anomaly_stages_collect_prevalidated(
+              grouped, sizeof(grouped) - 1, &group_limit, &stages) ==
+              SHELL_PROCESS_EOUTPUT_LIMIT &&
+          !stages.commands && stages.count == 0;
+  shell_anomaly_stages_free(&stages);
+  free(graph);
+  test("Prevalidated anomaly collection retains the group-I/O budget", valid);
+}
+
 static void test_control_syntax_scope_contract(void) {
   static const struct {
     const char *source;
@@ -8848,6 +9166,7 @@ static void test_control_syntax_scope_contract(void) {
 }
 
 int main(void) {
+  test_prevalidated_anomaly_stages();
   test_control_syntax_scope_contract();
   test_scalar_variable_substitution_scopes();
   test_scalar_variable_scan_linear_work();
@@ -8911,6 +9230,8 @@ int main(void) {
   test_brace_group_maximum_contract();
   test_canonical_sequence_model_capacity_contract();
   test_processed_word_iterator_boundary_contract();
+  test_empty_process_argv();
+  test_elided_group_records();
   test_token_type_names();
   test_list_syntax_contract();
   test_source_scanner_boundaries();
@@ -9563,11 +9884,23 @@ int main(void) {
        {"echo \"x\"VAR_VALUEz"},
        UINT32_C(0x1),
        {NULL}},
-      {"Transform line: removes CRLF word continuations",
-       "echo \"x\"\\\r\n${y}z",
+      {"Transform line: preserves escaped CR before a newline",
+       "echo \"x\"\\\r\n# comment",
        1,
-       {"echo \"x\"VAR_VALUEz"},
+       {"echo \"x\"\\\r \n"},
+       UINT32_C(0x10000),
+       {NULL}},
+      {"Transform line: preserves escaped CR next to a variable",
+       "echo \"x\"\\\r${y}z",
+       1,
+       {"echo \"x\"\\\rVAR_VALUEz"},
        UINT32_C(0x1),
+       {NULL}},
+      {"Transform line: preserves VT and FF word bytes",
+       "echo a\vb a\fb",
+       1,
+       {"echo a\vb a\fb"},
+       0,
        {NULL}},
       {"Transform line: joins substitution suffixes",
        "echo $(id)suffix",
@@ -10105,6 +10438,54 @@ int main(void) {
                                      &length) &&
             length == 0;
     test("Static-word visitor rejects runtime and malformed words", valid);
+  }
+
+  {
+    static const struct {
+      const char *word;
+      const char *payload;
+      bool is_static;
+    } cases[] = {{"a<()b", "ab", true},
+                 {"<()", "", true},
+                 {"''<()", "", true},
+                 {"a>( \t\n)b", "ab", true},
+                 {"a<(printf x)b", "a<(printf x)b", false}};
+    bool valid = true;
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+      const char *word = cases[i].word;
+      size_t length = strlen(word), measured = SIZE_MAX, written = SIZE_MAX;
+      size_t visited = SIZE_MAX, owned_length = SIZE_MAX;
+      char bytes[64] = {0};
+      char *owned = NULL;
+      size_t expected = strlen(cases[i].payload);
+      valid = valid &&
+              shell_measure_decoded_word(word, length, &measured) ==
+                  SHELL_PROCESS_OK &&
+              measured == expected &&
+              shell_write_decoded_word(word, length, bytes, sizeof(bytes),
+                                       &written) == SHELL_PROCESS_OK &&
+              written == expected &&
+              memcmp(bytes, cases[i].payload, expected) == 0 &&
+              shell_visit_decoded_word(word, length, NULL, NULL, &visited) ==
+                  SHELL_PROCESS_OK &&
+              visited == expected &&
+              shell_decode_word(word, length, &owned, &owned_length) ==
+                  SHELL_PROCESS_OK &&
+              owned_length == expected &&
+              memcmp(owned, cases[i].payload, expected) == 0 &&
+              shell_measure_processed_word(word, length, &measured) ==
+                  SHELL_PROCESS_OK &&
+              measured == expected &&
+              shell_write_processed_word(word, length, bytes, sizeof(bytes),
+                                         &written) == SHELL_PROCESS_OK &&
+              written == expected &&
+              memcmp(bytes, cases[i].payload, expected) == 0 &&
+              shell_visit_static_word(word, length, NULL, NULL, &visited) ==
+                  cases[i].is_static;
+      free(owned);
+    }
+    test("Word helpers elide empty process payloads, retaining nonempty source",
+         valid);
   }
 
   {
@@ -10671,7 +11052,7 @@ int main(void) {
         {"plain", "plain"},
         {"'two words'", "two words"},
         {"a\\ b", "a b"},
-        {"a\\\r\nb", "ab"},
+        {"a\\\nb", "ab"},
         {"\"a\\\"b\"", "a\"b"},
         {"$(printf x)", "$(printf x)"},
         {"<(printf x)", "<(printf x)"},
@@ -10824,7 +11205,7 @@ int main(void) {
         {"cat ${x}3>out", "3:cat,", "11:3:cat,2:EV,,", 1},
         {"cat @(one|two)suffix>out", "3:cat,", "11:3:cat,2:GB,,", 1},
         {"my\\\ncommand value", "9:mycommand,", "18:9:mycommand,3:STR,,", 1},
-        {"my\\\r\ncommand value", "9:mycommand,", "18:9:mycommand,3:STR,,", 1},
+        {"my\\\ncommand value", "9:mycommand,", "18:9:mycommand,3:STR,,", 1},
     };
     valid = true;
     for (size_t i = 0;

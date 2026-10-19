@@ -1480,6 +1480,12 @@ static void diagnostic_flows(shell_dep_limits_t *limits,
       {"sh -c \"$(exec 2>&1; echo ok &)\"", true},
       {"exec 10>&-; sh -c \"$({ exec 10>&-; } 2>&1)\"", true},
       {"exec 3>&- 10>&-; sh -c \"$(: 2>&1 10>&- 4>&3)\"", true},
+      {"exec 3>&- 4>&- 63>&-; sh -c \"$(read -u63 -n0 probe; "
+       "{ true 2>&1 5>left 6>right 7>&3; })\"",
+       true},
+      {"exec 3>&- 4>&- 63>&-; sh -c \"$(read -u63 -n0 probe; "
+       "{ true 5>left 6>right 2>&- 7>&3; })\"",
+       false},
   };
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
     parse(cases[i].source, limits, graph);

@@ -271,6 +271,7 @@ static int verify_brace_templates(void) {
     BRACE_TEMPLATE_DOCUMENT = 1u << 4,
     BRACE_TEMPLATE_REDIRECT = 1u << 5,
     BRACE_TEMPLATE_INVALID = 1u << 6,
+    BRACE_TEMPLATE_LITERAL_CR = 1u << 7,
   };
   static const struct {
     const char *command;
@@ -279,7 +280,13 @@ static int verify_brace_templates(void) {
   } cases[] = {
       {"{ echo one; }", true, BRACE_TEMPLATE_BASIC},
       {"{\n echo one\n}", true, BRACE_TEMPLATE_NEWLINE},
-      {"{\r\n  echo one\r\n}", true, BRACE_TEMPLATE_NEWLINE},
+      /* CR is word content, not a Bash grammar blank. The first source has
+       * no opening group and an unexpected closer; the second has two simple
+       * commands, with } an argument of echo. LF alone opens a real group. */
+      {"{\r\n  echo one\r\n}", false,
+       BRACE_TEMPLATE_INVALID | BRACE_TEMPLATE_LITERAL_CR},
+      {"{\n echo one\r\n}", true,
+       BRACE_TEMPLATE_NEWLINE | BRACE_TEMPLATE_LITERAL_CR},
       {"{ { echo one; } | cat; printf two; } > /tmp/nested-brace.out", true,
        BRACE_TEMPLATE_NESTED | BRACE_TEMPLATE_COMPOSITION |
            BRACE_TEMPLATE_REDIRECT},
@@ -293,7 +300,7 @@ static int verify_brace_templates(void) {
       {"{ echo one; } 3>/tmp/trace </tmp/in 2>>/tmp/group.err", true,
        BRACE_TEMPLATE_REDIRECT},
       {"{ echo one }", false, BRACE_TEMPLATE_INVALID},
-      {"{\r\n echo one }", false, BRACE_TEMPLATE_INVALID},
+      {"{\r\n echo one }", true, BRACE_TEMPLATE_LITERAL_CR},
       {"{ echo one;", false, BRACE_TEMPLATE_INVALID},
       {"{ ( echo one; } )", false, BRACE_TEMPLATE_INVALID},
   };
@@ -309,7 +316,7 @@ static int verify_brace_templates(void) {
   uint32_t expected = BRACE_TEMPLATE_BASIC | BRACE_TEMPLATE_NEWLINE |
                       BRACE_TEMPLATE_NESTED | BRACE_TEMPLATE_COMPOSITION |
                       BRACE_TEMPLATE_DOCUMENT | BRACE_TEMPLATE_REDIRECT |
-                      BRACE_TEMPLATE_INVALID;
+                      BRACE_TEMPLATE_INVALID | BRACE_TEMPLATE_LITERAL_CR;
   if (observed != expected) {
     fprintf(stderr, "FAIL: incomplete deterministic brace template coverage\n");
     failed++;

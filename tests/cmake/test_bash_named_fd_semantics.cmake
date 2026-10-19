@@ -1298,6 +1298,36 @@ unset IFS
   test "$(cat "$1/ifs-assignment-prefix")" = clearprocess || exit 107
 ' fixture "$tmpdir"
 
+# Named-descriptor identity follows Bash lexical continuation exactly. Only
+# backslash-LF is erased; CR remains in the word, and CR before LF leaves that
+# word before starting the next command.
+unset fd
+eval ': {f\
+d}>"$tmpdir/lf-name"'
+test -n "${fd+x}"
+printf joined >&"$fd"
+test "$(cat "$tmpdir/lf-name")" = joined
+exec {fd}>&-
+unset fd
+
+printf -v probe ': {f\\\rd}>"$tmpdir/bare-cr-name"'
+eval "$probe"
+test -z "${fd+x}" && test -e "$tmpdir/bare-cr-name"
+
+printf -v probe ': {f\\\r\n: d}>"$tmpdir/crlf-name"'
+eval "$probe"
+test -z "${fd+x}" && test -e "$tmpdir/crlf-name"
+
+(
+  cd "$tmpdir"
+  unset f
+  exec {fd}>named-reference
+  printf -v probe 'printf ordinary >&$f\\\rd'
+  eval "$probe"
+  test ! -s named-reference
+  test "$(cat $'\rd')" = ordinary
+)
+
 # A parameter assignment is a real shell-state write, not just an expansion
 # failure possibility. With fd 10, digit-zero IFS selects stdout instead.
 "$BASH" -p -c '
