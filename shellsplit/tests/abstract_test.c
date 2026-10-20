@@ -279,7 +279,7 @@ static void test_compound_substitution_boundaries(void) {
 
   static const char *const literal_cases[] = {
       "printf \"x$VAR<(producer)\"",
-      "printf x$VAR\\$(id)",
+      "printf \"x$VAR\\$(id)\"",
       "printf x$VAR$'$(id)'",
       "printf x$VAR'$(id)'",
   };
@@ -447,7 +447,7 @@ static void test_quote_aware_substitution_metadata(void) {
       {"printf \"$(id)\"", true},         {"printf \"`id`\"", true},
       {"printf prefix$(id)suffix", true}, {"printf x >\"$(id)\"", true},
       {"printf '<(id)'", false},          {"printf $'$(id)'", false},
-      {"printf \\$(id)", false},          {"printf \"<(id)\"", false},
+      {"printf \"\\$(id)\"", false},      {"printf \"<(id)\"", false},
       {"printf \">(id)\"", false},        {"printf ${VALUE:-\"<(id)\"}", false},
       {"printf ${VALUE:-<(id)}", true},   {"printf ${VALUE:->(id)}", true},
   };

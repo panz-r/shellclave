@@ -36,6 +36,30 @@ static inline SHELL_NONNULL(1, 2) const
 }
 
 static inline SHELL_NONNULL(1, 2) const
+    char *shellsplit_test_doc_difference(const shell_dep_doc_t *a,
+                                         const shell_dep_doc_t *b) {
+  SHELLSPLIT_COMPARE_FIELD(kind);
+  SHELLSPLIT_COMPARE_FIELD(flags);
+  if (a->kind == SHELL_DOC_FILE) {
+    SHELLSPLIT_COMPARE_FIELD(path);
+    SHELLSPLIT_COMPARE_FIELD(path_len);
+    SHELLSPLIT_COMPARE_FIELD(cwd_offset);
+    SHELLSPLIT_COMPARE_FIELD(cwd_known);
+    SHELLSPLIT_COMPARE_FIELD(cwd_absolute);
+  }
+  if (a->kind == SHELL_DOC_HEREDOC || a->kind == SHELL_DOC_ENVVAR) {
+    SHELLSPLIT_COMPARE_FIELD(name);
+    SHELLSPLIT_COMPARE_FIELD(name_len);
+  }
+  if (a->kind != SHELL_DOC_FILE ||
+      (a->flags & SHELL_DEP_DOC_FLAG_RESOLVED_PATH)) {
+    SHELLSPLIT_COMPARE_FIELD(value);
+    SHELLSPLIT_COMPARE_FIELD(value_len);
+  }
+  return NULL;
+}
+
+static inline SHELL_NONNULL(1, 2) const
     char *shellsplit_test_node_difference(const shell_dep_node_t *a,
                                           const shell_dep_node_t *b) {
   SHELLSPLIT_COMPARE_FIELD(type);
@@ -66,25 +90,7 @@ static inline SHELL_NONNULL(1, 2) const
     SHELLSPLIT_COMPARE_FIELD(cmd.pipe_stdout_target);
     break;
   case SHELL_NODE_DOC:
-    SHELLSPLIT_COMPARE_FIELD(doc.kind);
-    SHELLSPLIT_COMPARE_FIELD(doc.flags);
-    if (a->doc.kind == SHELL_DOC_FILE) {
-      SHELLSPLIT_COMPARE_FIELD(doc.path);
-      SHELLSPLIT_COMPARE_FIELD(doc.path_len);
-      SHELLSPLIT_COMPARE_FIELD(doc.cwd_offset);
-      SHELLSPLIT_COMPARE_FIELD(doc.cwd_known);
-      SHELLSPLIT_COMPARE_FIELD(doc.cwd_absolute);
-    }
-    if (a->doc.kind == SHELL_DOC_HEREDOC || a->doc.kind == SHELL_DOC_ENVVAR) {
-      SHELLSPLIT_COMPARE_FIELD(doc.name);
-      SHELLSPLIT_COMPARE_FIELD(doc.name_len);
-    }
-    if (a->doc.kind != SHELL_DOC_FILE ||
-        (a->doc.flags & SHELL_DEP_DOC_FLAG_RESOLVED_PATH)) {
-      SHELLSPLIT_COMPARE_FIELD(doc.value);
-      SHELLSPLIT_COMPARE_FIELD(doc.value_len);
-    }
-    break;
+    return shellsplit_test_doc_difference(&a->doc, &b->doc);
   case SHELL_NODE_GROUP:
     SHELLSPLIT_COMPARE_FIELD(group.start);
     SHELLSPLIT_COMPARE_FIELD(group.length);

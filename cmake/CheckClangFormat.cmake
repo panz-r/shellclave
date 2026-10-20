@@ -8,6 +8,7 @@ if(NOT SHELLCLAVE_SOURCE_DIR)
 endif()
 
 file(GLOB_RECURSE sources LIST_DIRECTORIES false
+  "${SHELLCLAVE_SOURCE_DIR}/examples/*.c"
   "${SHELLCLAVE_SOURCE_DIR}/shellsplit/*.c"
   "${SHELLCLAVE_SOURCE_DIR}/shellsplit/*.h"
   "${SHELLCLAVE_SOURCE_DIR}/shellsplit/*.cpp"

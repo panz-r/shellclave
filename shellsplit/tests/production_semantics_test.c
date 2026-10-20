@@ -1288,7 +1288,7 @@ static void test_substitution_metadata_agreement(void) {
   } cases[] = {
       {"printf $'it\\'s $(id)'", false},
       {"printf '$(id)'", false},
-      {"printf \\$(id)", false},
+      {"printf \"\\$(id)\"", false},
       {"printf \"<(id)\"", false},
       {"printf \"$(id)\"", true},
       {"printf ${value:-$(id)}", true},
@@ -2902,6 +2902,10 @@ static void test_full_tokenizer_structural_matrix(void) {
       "worker ( ) { :; }",
       "function worker () { :; }",
       "worker ( ) ( : )",
+      "9worker () { :; }",
+      "foo.bar () { :; }",
+      "foo-bar () { :; }",
+      "\"worker\" () { :; }",
       "{ cmd; } 2>err",
       "( cmd; ) >out",
       "! ! cmd |& next | final",
@@ -2919,18 +2923,9 @@ static void test_full_tokenizer_structural_matrix(void) {
   }
 
   static const char *const rejected[] = {
-      "cmd |",
-      "cmd |&",
-      "cmd | ! next",
-      "cmd && && next",
-      "{ ; }",
-      "()",
-      "worker (",
-      "worker ( x ) { :; }",
-      "9worker () { :; }",
-      "cmd >\noutput",
-      "cmd > # note",
-      "cmd <<<\nword",
+      "cmd |",         "cmd |&",       "cmd | ! next",  "cmd && && next",
+      "{ ; }",         "()",           "worker (",      "worker ( x ) { :; }",
+      "cmd >\noutput", "cmd > # note", "cmd <<<\nword",
   };
   for (size_t i = 0; i < sizeof(rejected) / sizeof(rejected[0]); i++) {
     shell_command_t *commands = (shell_command_t *)(uintptr_t)1;
@@ -3588,6 +3583,11 @@ static void test_document_prefix_boundaries(void) {
 
 static void check_byte_validation_work(size_t passes, size_t bytes) {
 #ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+  if (shellsplit_test_metadata_work(
+          SHELLSPLIT_TEST_WORK_BYTE_VALIDATION_BYTES) != bytes)
+    fprintf(stderr, "byte boundary: expected %zu bytes, visited %zu\n", bytes,
+            shellsplit_test_metadata_work(
+                SHELLSPLIT_TEST_WORK_BYTE_VALIDATION_BYTES));
   CHECK(shellsplit_test_metadata_work(
             SHELLSPLIT_TEST_WORK_BYTE_VALIDATION_PASSES) == passes);
   CHECK(shellsplit_test_metadata_work(
@@ -3700,8 +3700,11 @@ static void test_single_byte_validation_boundary(void) {
         if (!heredoc_data)
           CHECK(!parsed.count && !parsed.group_count &&
                 parsed.status == SHELL_STATUS_ERROR);
-        check_byte_validation_work(1, bytes[b] >= 128 ? length
-                                                      : invalid_position + 1);
+        /* NUL is inadmissible representation. Other byte restrictions scan
+         * the complete span so a later NUL cannot become mere unsupported
+         * input; this remains one linear boundary pass. */
+        check_byte_validation_work(1, bytes[b] == 0 ? invalid_position + 1
+                                                    : length);
       }
     }
     source[invalid_position] = saved;
@@ -3798,7 +3801,7 @@ static void test_public_source_validation_boundary(void) {
     reset_byte_validation_work();
     CHECK(exercise_source_operation(operation, source, sizeof(source) - 1) ==
           SHELL_PROCESS_EINPUT);
-    check_byte_validation_work(1, 9);
+    check_byte_validation_work(1, sizeof(source) - 1);
     source[8] = 'a';
     reset_byte_validation_work();
     CHECK(exercise_source_operation(operation, source, sizeof(source) - 1) ==
@@ -4801,6 +4804,14 @@ static void test_quoted_arithmetic_boundaries(void) {
 static void test_forward_nested_substitutions(void) {
   /* Both nesting depth and leaf suffix length must scale linearly. Real
    * recursive balancing transitions are charged, not a nominal word length. */
+  char word[2048];
+  char source[sizeof(word) + 7] = "printf ";
+  shell_limits_t limits = SHELL_LIMITS_DEFAULT;
+  /* Deep array-reference families exceed the default private scratch. Reuse
+   * a sufficient public capacity across cases in both library variants. */
+  CHECK(shell_source_workspace_size(sizeof(source), &limits.workspace_size));
+  limits.workspace = malloc(limits.workspace_size);
+  CHECK(limits.workspace != NULL);
   for (unsigned family = 0; family < 4; family++) {
     for (size_t leaf = 64; leaf <= 1024; leaf *= 2) {
 #ifdef SHELLSPLIT_TEST_SOURCE_SCANS
@@ -4812,7 +4823,6 @@ static void test_forward_nested_substitutions(void) {
                              : family == 3 ? "${a["
                                            : "${x:-";
         const char *closer = family == 1 ? "))" : family == 3 ? "]}" : "}";
-        char word[2048];
         size_t length = 0;
         for (size_t i = 0; i < depth; i++) {
           const char *prefix = family == 2 && i % 2 ? "$((1 + " : opener;
@@ -4853,11 +4863,22 @@ static void test_forward_nested_substitutions(void) {
         CHECK(work <= 8 * length + 128 &&
               (previous == 0 || work <= 2 * previous + 128));
         previous = work;
-        char source[sizeof(word) + 7] = "printf ";
+#endif
         memcpy(source + 7, word, length);
         shell_parse_result_t parsed;
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
         shellsplit_test_source_scan_reset();
-        CHECK(shell_parse_fast(source, length + 7, NULL, &parsed) == SHELL_OK);
+#endif
+        shell_error_t error =
+            shell_parse_fast(source, length + 7, &limits, &parsed);
+        if (error != SHELL_OK)
+          fprintf(stderr,
+                  "nested scan parse family=%u leaf=%zu depth=%zu error=%d\n",
+                  family, leaf, depth, error);
+        CHECK(error == SHELL_OK);
+        CHECK(parsed.count == 1 &&
+              !!(parsed.cmds[0].features & SHELL_FEAT_ARRAY) == (family == 3));
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
         size_t fast_work = shellsplit_test_source_scan_work();
         bool linear = fast_work <= 48 * (length + 7) + 1024 &&
                       (!previous_fast ||
@@ -4875,6 +4896,7 @@ static void test_forward_nested_substitutions(void) {
       }
     }
   }
+  free(limits.workspace);
   static const char *const malformed[] = {
       "${x:-$(printf x)",
       "$((1 + $(printf x))",

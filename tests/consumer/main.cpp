@@ -143,6 +143,17 @@ static bool check_depgraph_workspace_api() {
       ok = shell_dep_graph_parse_with_fast(source, draft->prefix_length, "/",
                                            &limits, &draft->prefix,
                                            &graph) == SHELL_DEP_OK;
+    if (ok) {
+      constexpr char unsupported[] = "printf '%s' '日本'";
+      constexpr char malformed[] = "cat <<\n";
+      constexpr char nul[] = "echo\0x";
+      ok = shell_parse_draft(unsupported, sizeof(unsupported) - 1, nullptr,
+                             draft) == SHELL_SOURCE_UNSUPPORTED &&
+           shell_parse_draft(malformed, sizeof(malformed) - 1, nullptr,
+                             draft) == SHELL_SOURCE_INVALID &&
+           shell_parse_draft(nul, sizeof(nul) - 1, nullptr, draft) ==
+               SHELL_SOURCE_INVALID_INPUT;
+    }
     std::free(draft);
   }
   std::free(raw);

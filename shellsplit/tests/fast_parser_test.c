@@ -119,7 +119,7 @@ static void test_array_assignment_prefix_features(void) {
   /* Repeated words, fragments within one value, and a long scalar name all
    * require linear forward work. Counting real source visits catches suffix
    * probes that a nominal per-input charge would miss. */
-  for (unsigned family = 0; family < 3; family++) {
+  for (unsigned family = 0; family < 4; family++) {
 #ifdef SHELLSPLIT_TEST_SOURCE_SCANS
     size_t previous_work = 0;
 #endif
@@ -129,12 +129,14 @@ static void test_array_assignment_prefix_features(void) {
       char source[16384];
       size_t used = sizeof(prefix) - 1;
       memcpy(source, prefix, used);
-      if (family == 1) {
-        memcpy(source + used, "A=", 2);
-        used += 2;
+      if (family == 1 || family == 3) {
+        const char *assignment = family == 1 ? "A=" : "A[1 + 2]=";
+        size_t prefix_length = strlen(assignment);
+        memcpy(source + used, assignment, prefix_length);
+        used += prefix_length;
       }
       for (size_t i = 0; i < units; i++) {
-        const char *part = family == 0 ? "A=\"\" " : family == 1 ? "'x'" : "A";
+        const char *part = family == 0 ? "A=\"\" " : family == 2 ? "A" : "'x'";
         size_t length = strlen(part);
         memcpy(source + used, part, length);
         used += length;
@@ -587,7 +589,7 @@ static void test_feature_matrix(void) {
        NO_CHECK, 0, 0, SHELL_FEAT_VARS | SHELL_FEAT_ARRAY, SHELL_FEAT_GLOBS},
       {"quoted literal array syntax", "echo '${items[0]}'", 1, NO_CHECK, 0, 0,
        0, SHELL_FEAT_ARRAY},
-      {"odd escaped substitution", "echo \\$(id)", 1, NO_CHECK, 0, 0, 0,
+      {"quoted escaped substitution", "echo \"\\$(id)\"", 1, NO_CHECK, 0, 0, 0,
        SHELL_FEAT_SUBSHELL},
       {"even escaped substitution", "echo \\\\$(id)", 1, NO_CHECK, 0, 0,
        SHELL_FEAT_SUBSHELL, 0},
@@ -875,7 +877,7 @@ void test_dialect_oracle(void) {
       {"echo $(id)`pwd`", 1, 3, SHELL_TYPE_SUBSTITUTION, SHELL_TYPE_SIMPLE},
       {"echo \"$(id)$(pwd)\"", 1, 3, SHELL_TYPE_SUBSTITUTION,
        SHELL_TYPE_SIMPLE},
-      {"echo \\$(id)", 1, 1, SHELL_TYPE_SIMPLE, SHELL_TYPE_SIMPLE},
+      {"echo \"\\$(id)\"", 1, 1, SHELL_TYPE_SIMPLE, SHELL_TYPE_SIMPLE},
       {"echo $(cat /tmp/a | sort)", 1, 3, SHELL_TYPE_SUBSTITUTION,
        SHELL_TYPE_SIMPLE},
       {"cat <(sort <(cat /tmp/a))", 1, 3, SHELL_TYPE_SUBSTITUTION,
@@ -3329,7 +3331,7 @@ static void test_semantic_classifier_boundaries(void) {
       {"echo `while true; do :; done`", true},
       {"echo ${value:-$(while true; do :; done)}", true},
       {"echo $((items[0]))", true},
-      {"echo \\$(while true; do :; done)", false},
+      {"echo \"\\$(while true; do :; done)\"", false},
       {"echo \"$(printf x)\"", false},
       {"echo $'while'", false},
       {"echo $'$\"localized\"'", false},
@@ -3895,6 +3897,67 @@ static void test_nested_double_quote_boundaries(void) {
            result.count == 1);
 }
 
+static void test_literal_brace_scaling(void) {
+  bool valid = true;
+  for (unsigned form = 0; form < 4; ++form) {
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+    size_t previous = 0;
+#endif
+    for (size_t count = 128; count <= 8192; count *= 2) {
+      char *source = malloc(count * 5 + 64);
+      if (!source) {
+        valid = false;
+        break;
+      }
+      const char *prefix = form == 0   ? ""
+                           : form == 1 ? "time"
+                           : form == 2 ? "! time"
+                                       : ">";
+      size_t length = strlen(prefix);
+      memcpy(source, prefix, length);
+      memset(source + length, ' ', count);
+      length += count;
+      if (form == 3) {
+        memcpy(source + length, "out ", 4);
+        length += 4;
+      }
+      memcpy(source + length, "printf x ", 9);
+      length += 9;
+      for (size_t i = 0; i < count; ++i) {
+        source[length++] = (i & 1) ? '}' : '{';
+        source[length++] = ' ';
+      }
+      source[length] = '\0';
+      shell_limits_t strict = SHELL_LIMITS_DEFAULT;
+      strict.strict_mode = true;
+      shell_parse_result_t parsed;
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+      shellsplit_test_source_scan_reset();
+#endif
+      bool item =
+          shell_parse_fast(source, length, &strict, &parsed) == SHELL_OK &&
+          parsed.count == 1 && !parsed.group_count &&
+          parsed.cmds[0].pipeline_time_mode == (form == 1 || form == 2
+                                                    ? SHELL_PIPE_TIME_DEFAULT
+                                                    : SHELL_PIPE_TIME_NONE) &&
+          parsed.cmds[0].pipeline_negation_count == (form == 2 ? 1u : 0u);
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+      size_t work = shellsplit_test_source_scan_work();
+      item = item && work < 128 * length &&
+             (!previous || work <= previous * 2 + 2048);
+      previous = work;
+#endif
+      if (!item)
+        fprintf(stderr, "literal brace scaling: form=%u count=%zu\n", form,
+                count);
+      valid &= item;
+      free(source);
+    }
+  }
+  test("Literal brace boundaries use forward prefix facts with linear work",
+       valid);
+}
+
 static void test_prefix_scan_scaling(void) {
   static const struct {
     const char *prefix;
@@ -4053,6 +4116,7 @@ int main(void) {
   test_pipeline_negation_trivia_metadata();
   test_pipeline_time_metadata();
   test_prefix_scan_scaling();
+  test_literal_brace_scaling();
   test_named_document_and_negation_metadata();
   test_document_pipeline_modifiers();
   test_strict_operator_boundary_matrix();

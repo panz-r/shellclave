@@ -254,11 +254,32 @@ function(shellclave_add_concurrency_test name source library)
   add_dependencies(shellclave_concurrency_tests ${name})
 endfunction()
 
+if(BUILD_TESTING OR SHELLCLAVE_BUILD_TOOLS)
+  add_executable(shellclave_gate_example examples/gate_policy.c)
+  shellclave_project_target(shellclave_gate_example)
+  target_link_libraries(shellclave_gate_example PRIVATE Shellclave::shellgate)
+  add_executable(shellclave_source_example examples/source_admission.c)
+  shellclave_project_target(shellclave_source_example)
+  target_link_libraries(shellclave_source_example PRIVATE Shellclave::shellsplit)
+endif()
+
 if(BUILD_TESTING)
   # One registration controls both the race-detector build and test selection.
   add_custom_target(shellclave_concurrency_tests)
   # The same membership drives production coverage's build and CTest label.
   add_custom_target(shellclave_production_tests)
+  shellclave_add_production_test(shellgate_example_contract
+    tests/test_gate_example.c shellgate)
+  add_test(NAME shellclave_gate_example COMMAND shellclave_gate_example)
+  set_tests_properties(shellclave_gate_example PROPERTIES LABELS "shellgate;example")
+  add_test(NAME shellclave_source_example COMMAND shellclave_source_example)
+  set_tests_properties(shellclave_source_example PROPERTIES LABELS "shellsplit;example")
+  add_test(NAME shellclave_documentation_contract
+    COMMAND "${Python3_EXECUTABLE}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_documentation.py"
+      --example $<TARGET_FILE:shellclave_gate_example>
+      --source-example $<TARGET_FILE:shellclave_source_example>)
+  set_tests_properties(shellclave_documentation_contract PROPERTIES LABELS docs)
   file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests")
   file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests/headers")
   shellclave_add_test(shellsplit_abstract_cli_test
@@ -364,6 +385,13 @@ if(BUILD_TESTING)
         -DSHELLCLAVE_BASH=${SHELLCLAVE_BASH_EXECUTABLE}
         -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/test_bash_source_semantics.cmake)
     set_tests_properties(shellsplit_bash_source_semantics PROPERTIES LABELS shellsplit)
+    add_test(NAME shellsplit_bash_source_status
+      COMMAND "${Python3_EXECUTABLE}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_bash_source_status.py"
+        --bash "${SHELLCLAVE_BASH_EXECUTABLE}"
+        --probe $<TARGET_FILE:shellsplit_source_status_production_test>)
+    set_tests_properties(shellsplit_bash_source_status PROPERTIES
+      LABELS shellsplit TIMEOUT 45)
     if(UNIX)
       add_test(NAME shellsplit_bash_readline_semantics
         COMMAND "${Python3_EXECUTABLE}"
@@ -385,6 +413,9 @@ if(BUILD_TESTING)
   shellclave_add_test(shellsplit_depgraph_compare_test
     shellsplit/tests/depgraph_compare_test.c shellsplit)
   set_tests_properties(shellsplit_depgraph_compare_test PROPERTIES LABELS shellsplit)
+  shellclave_add_test(shellsplit_source_compare_test
+    shellsplit/tests/source_compare_test.c shellsplit)
+  set_tests_properties(shellsplit_source_compare_test PROPERTIES LABELS shellsplit)
   shellclave_add_test(shellsplit_fast_parser_test shellsplit/tests/fast_parser_test.c shellsplit_test)
   # Exercise the same public parser contract against the shipping library. The
   # allocation-failure variant above links the instrumented test library;
@@ -413,6 +444,10 @@ if(BUILD_TESTING)
   target_include_directories(shellsplit_source_test PRIVATE shellsplit/tests)
   shellclave_add_production_test(shellsplit_source_production_test shellsplit/tests/source_test.c shellsplit)
   set_property(TEST shellsplit_source_test APPEND PROPERTY LABELS shellsplit)
+  shellclave_add_test(shellsplit_source_status_test
+    shellsplit/tests/source_status_test.c shellsplit_test)
+  shellclave_add_production_test(shellsplit_source_status_production_test
+    shellsplit/tests/source_status_test.c shellsplit)
   target_compile_definitions(shellsplit_boundary_test PRIVATE SHELLSPLIT_TEST_SOURCE_SCANS)
   target_include_directories(shellsplit_boundary_test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/shellsplit/tests)
@@ -891,6 +926,7 @@ endif()
 
 if(PROJECT_IS_TOP_LEVEL)
   file(GLOB_RECURSE SHELLCLAVE_FORMAT_SOURCES CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/examples/*.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/shellsplit/*.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/shellsplit/*.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/shellsplit/*.cpp"

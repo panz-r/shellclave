@@ -5,6 +5,7 @@
 #include "shell_source.h"
 #include "shell_tokenizer_full.h"
 #include "shell_transform.h"
+#include "source_compare.h"
 #ifdef SHELLSPLIT_TEST_SOURCE_SCANS
 #include "test_source_scans.h"
 #endif
@@ -119,7 +120,7 @@ static void byte_domains(void) {
   };
   for (size_t c = 0; c < sizeof(invalid) / sizeof(invalid[0]); c++) {
     CHECK(shell_parse_draft(invalid[c], strlen(invalid[c]), NULL, &draft) ==
-          SHELL_SOURCE_INVALID);
+          SHELL_SOURCE_UNSUPPORTED);
     CHECK(!draft.prefix_length && !draft.prefix.count && !draft.tail_start);
     CHECK(shell_dep_graph_parse(invalid[c], strlen(invalid[c]), "/workspace",
                                 &limits, &graph) == SHELL_DEP_EPARSE);
@@ -177,7 +178,7 @@ static void selector_recovery(void) {
           shell_parse_result_t fast;
           CHECK(shell_parse_fast(source, draft.prefix_length, &strict, &fast) ==
                 SHELL_OK);
-          CHECK(!memcmp(&fast, &draft.prefix, sizeof(fast)));
+          CHECK(shellsplit_test_parse_equal(&fast, &draft.prefix));
         }
       }
       CHECK(draft.prefix_length == (size_t)size);
@@ -188,7 +189,7 @@ static void selector_recovery(void) {
       "echo before; echo ${!prefix*x}", "echo before; echo ${name!\\"};
   for (size_t c = 0; c < sizeof(malformed) / sizeof(malformed[0]); c++) {
     CHECK(shell_parse_draft(malformed[c], strlen(malformed[c]), NULL, &draft) ==
-          SHELL_SOURCE_INVALID);
+          SHELL_SOURCE_UNSUPPORTED);
     CHECK(!draft.prefix_length && !draft.prefix.count);
   }
 }
@@ -270,13 +271,16 @@ static void tentative_delimiters(void) {
         SHELL_SOURCE_COMPLETE);
   CHECK(draft.header_count == 4 && draft.heredocs[0].complete);
   content(&draft.heredocs[0].content, "$(printf good)\n`x`z\n");
-  static const char *const bad_code[] = {
-      "echo before; cat <<`日本`\n`日x\n",
-      "echo before; cat <<`|`tail\n`|`z\n",
+  static const struct {
+    const char *source;
+    shell_source_status_t status;
+  } bad_code[] = {
+      {"echo before; cat <<`日本`\n`日x\n", SHELL_SOURCE_UNSUPPORTED},
+      {"echo before; cat <<`|`tail\n`|`z\n", SHELL_SOURCE_INVALID},
   };
   for (size_t c = 0; c < sizeof(bad_code) / sizeof(bad_code[0]); c++) {
-    CHECK(shell_parse_draft(bad_code[c], strlen(bad_code[c]), NULL, &draft) ==
-          SHELL_SOURCE_INVALID);
+    CHECK(shell_parse_draft(bad_code[c].source, strlen(bad_code[c].source),
+                            NULL, &draft) == bad_code[c].status);
     CHECK(!draft.prefix_length && !draft.prefix.count);
   }
 }
@@ -322,19 +326,26 @@ static void recovery(void) {
       fprintf(stderr, "unfinished status %d: %s\n", status, unfinished[n]);
     CHECK(status == SHELL_SOURCE_INCOMPLETE && draft.prefix_length == 0);
   }
-  static const char *invalid[] = {
-      "cat >#comment",  "{ cat; } >#comment",
-      "cat && ;",       "cat >\nfile",
-      "cat )",          "cat | | echo",
-      "echo 日本",      "cat <<EOF\n$(echo 日本)\nEOF\n",
-      "({ echo; ) &&",  "echo $(echo &&) &&",
-      "echo ${bad!} &&"};
+  static const struct {
+    const char *source;
+    shell_source_status_t status;
+  } invalid[] = {{"cat >#comment", SHELL_SOURCE_INVALID},
+                 {"{ cat; } >#comment", SHELL_SOURCE_INVALID},
+                 {"cat && ;", SHELL_SOURCE_INVALID},
+                 {"cat >\nfile", SHELL_SOURCE_INVALID},
+                 {"cat )", SHELL_SOURCE_INVALID},
+                 {"cat | | echo", SHELL_SOURCE_INVALID},
+                 {"echo 日本", SHELL_SOURCE_UNSUPPORTED},
+                 {"cat <<EOF\n$(echo 日本)\nEOF\n", SHELL_SOURCE_UNSUPPORTED},
+                 {"({ echo; ) &&", SHELL_SOURCE_INVALID},
+                 {"echo $(echo &&) &&", SHELL_SOURCE_INVALID},
+                 {"echo ${bad!} &&", SHELL_SOURCE_UNSUPPORTED}};
   for (size_t n = 0; n < sizeof(invalid) / sizeof(invalid[0]); n++) {
-    int status =
-        shell_parse_draft(invalid[n], strlen(invalid[n]), NULL, &draft);
-    if (status != SHELL_SOURCE_INVALID)
-      fprintf(stderr, "invalid status %d: %s\n", status, invalid[n]);
-    CHECK(status == SHELL_SOURCE_INVALID && draft.prefix_length == 0);
+    shell_source_status_t status = shell_parse_draft(
+        invalid[n].source, strlen(invalid[n].source), NULL, &draft);
+    if (status != invalid[n].status)
+      fprintf(stderr, "invalid status %d: %s\n", status, invalid[n].source);
+    CHECK(status == invalid[n].status && draft.prefix_length == 0);
   }
   CHECK(shell_parse_draft("", 0, NULL, &draft) == SHELL_SOURCE_COMPLETE &&
         !draft.prefix_length);
@@ -350,7 +361,7 @@ static void recovery(void) {
         strict_limits.strict_mode = true;
         CHECK(shell_parse_fast(whole, draft.prefix_length, &strict_limits,
                                &strict) == SHELL_OK);
-        CHECK(!memcmp(&strict, &draft.prefix, sizeof(strict)));
+        CHECK(shellsplit_test_parse_equal(&strict, &draft.prefix));
       }
       for (uint32_t h = 0; h < draft.header_count; h++)
         for (uint32_t w = 0; w < draft.headers[h].word_count; w++)
@@ -359,6 +370,218 @@ static void recovery(void) {
                 cut);
     }
   }
+}
+
+static void bang_redirect_words(void) {
+  static const struct {
+    const char *source;
+    bool read, document;
+  } cases[] = {
+      {"printf ok > !", false, false},     {"printf ok < !", true, false},
+      {"printf ok > \\\n!", false, false}, {"{ printf ok; } > !", false, false},
+      {"( printf ok ) < !", true, false},  {"printf ok <<< !", true, true}};
+  for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); ++c) {
+    const char *source = cases[c].source;
+    size_t length = strlen(source);
+    CHECK(shell_parse_draft(source, length, NULL, &draft) ==
+          SHELL_SOURCE_COMPLETE);
+    CHECK(draft.prefix_length == length);
+    shell_tokenizer_state_t lexer;
+    CHECK(shell_tokenizer_init(&lexer, source, length, NULL));
+    shell_token_t token;
+    unsigned bangs = 0;
+    while (shell_tokenizer_next(&lexer, &token)) {
+      if (token.length != 1 || token.start[0] != '!')
+        continue;
+      CHECK(token.type == SHELL_TOKEN_ARGUMENT);
+      CHECK(token.start == source + token.position);
+      ++bangs;
+    }
+    CHECK(bangs == 1);
+    shell_processed_commands_t processed = {0};
+    CHECK(shell_process_commands(source, length, NULL, &processed) ==
+          SHELL_PROCESS_OK);
+    CHECK(processed.command_count == 1 &&
+          processed.commands[0].command_token_count == 2 &&
+          processed.commands[0].pipeline_negation_count == 0);
+    shell_processed_commands_free(&processed);
+    shell_netstring_buffer_t sequence = {0};
+    size_t count;
+    bool features;
+    CHECK(shell_build_netargv_sequence_buffer(source, length, NULL, &sequence,
+                                              &count,
+                                              &features) == SHELL_PROCESS_OK);
+    static const char expected[] = "14:6:printf,2:ok,,";
+    CHECK(count == 1 && features && sequence.length == sizeof(expected) - 1 &&
+          !memcmp(sequence.data, expected, sizeof(expected) - 1));
+    shell_netstring_buffer_free(&sequence);
+    CHECK(shell_dep_graph_parse_with_fast(source, length, "/workspace", &limits,
+                                          &draft.prefix,
+                                          &graph) == SHELL_DEP_OK);
+    CHECK(shell_dep_graph_validate(&graph).valid);
+    uint32_t document = UINT32_MAX;
+    unsigned commands = 0;
+    for (uint32_t n = 0; n < graph.node_count; ++n) {
+      const shell_dep_node_t *node = &graph.nodes[n];
+      if (node->type == SHELL_NODE_CMD) {
+        ++commands;
+        CHECK(node->cmd.token_count == 2 && !node->cmd.pipeline_negated);
+      }
+      if (node->type != SHELL_NODE_DOC)
+        continue;
+      if (cases[c].document) {
+        if (node->doc.kind == SHELL_DOC_HERESTRING) {
+          CHECK(node->doc.value_len == 1 && node->doc.value[0] == '!');
+          document = n;
+        }
+      } else if (node->doc.kind == SHELL_DOC_FILE && node->doc.path_len == 1 &&
+                 node->doc.path[0] == '!')
+        document = n;
+    }
+    CHECK(commands == 1 && document != UINT32_MAX);
+    bool routed = false;
+    for (uint32_t e = 0; e < graph.edge_count; ++e) {
+      const shell_dep_edge_t *edge = &graph.edges[e];
+      routed |= cases[c].read
+                    ? edge->type == SHELL_EDGE_READ && edge->from == document
+                    : edge->type == SHELL_EDGE_WRITE && edge->to == document;
+    }
+    CHECK(routed);
+  }
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+  size_t previous[2] = {0};
+  for (unsigned fragments = 16; fragments <= 256; fragments *= 2) {
+    char source[4096];
+    for (unsigned form = 0; form < 2; ++form) {
+      size_t used = 0;
+      for (unsigned f = 0; f < fragments; ++f) {
+        memcpy(source + used, form ? "x\"\"" : "> ! ", form ? 3 : 4);
+        used += form ? 3 : 4;
+      }
+      static const char tail[] = " printf ok";
+      memcpy(source + used, tail, sizeof(tail));
+      used += sizeof(tail) - 1;
+      shellsplit_test_source_scan_reset();
+      CHECK(shell_parse_draft(source, used, NULL, &draft) ==
+            SHELL_SOURCE_COMPLETE);
+      size_t work = shellsplit_test_source_scan_work();
+      CHECK(!previous[form] || work <= previous[form] * 3);
+      previous[form] = work;
+    }
+  }
+#endif
+}
+
+static void lexical_command_roles(void) {
+  static const struct {
+    const char *source, *sequence;
+    unsigned words;
+    bool file;
+  } cases[] = {
+      {">out {", "4:1:{,,", 1, true},
+      {">out { }", "8:1:{,1:},,", 2, true},
+      {">out \\\n{", "4:1:{,,", 1, true},
+      {"2>&1 {", "4:1:{,,", 1, false},
+  };
+  for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); ++c) {
+    const char *source = cases[c].source;
+    size_t length = strlen(source);
+    CHECK(shell_parse_draft(source, length, NULL, &draft) ==
+          SHELL_SOURCE_COMPLETE);
+    CHECK(draft.header_count == 1 && !draft.headers[0].compound &&
+          draft.headers[0].complete &&
+          draft.headers[0].word_count == cases[c].words &&
+          draft.headers[0].redirect_count == 1 && !draft.prefix.group_count);
+    const shell_source_span_t *word = &draft.headers[0].words[0];
+    CHECK(word->length == 1 && source[word->start] == '{');
+    shell_tokenizer_state_t lexer;
+    CHECK(shell_tokenizer_init(&lexer, source, length, NULL));
+    shell_token_t token;
+    unsigned braces = 0;
+    while (shell_tokenizer_next(&lexer, &token)) {
+      CHECK(token.type != SHELL_TOKEN_GROUP_START &&
+            token.type != SHELL_TOKEN_GROUP_END);
+      if (token.length == 1 &&
+          (token.start[0] == '{' || token.start[0] == '}')) {
+        CHECK(token.start == source + token.position);
+        ++braces;
+      }
+    }
+    CHECK(braces == cases[c].words);
+    shell_processed_commands_t processed = {0};
+    CHECK(shell_process_commands(source, length, NULL, &processed) ==
+          SHELL_PROCESS_OK);
+    CHECK(processed.command_count == 1 &&
+          processed.commands[0].command_token_count == cases[c].words);
+    shell_processed_commands_free(&processed);
+    shell_netstring_buffer_t sequence = {0};
+    size_t count;
+    bool features;
+    CHECK(shell_build_netargv_sequence_buffer(source, length, NULL, &sequence,
+                                              &count,
+                                              &features) == SHELL_PROCESS_OK);
+    CHECK(count == 1 && sequence.length == strlen(cases[c].sequence) &&
+          !memcmp(sequence.data, cases[c].sequence, sequence.length));
+    shell_netstring_buffer_free(&sequence);
+    CHECK(shell_dep_graph_parse_with_fast(source, length, "/workspace", &limits,
+                                          &draft.prefix,
+                                          &graph) == SHELL_DEP_OK);
+    CHECK(shell_dep_graph_validate(&graph).valid);
+    uint32_t command = UINT32_MAX, destination = UINT32_MAX;
+    unsigned commands = 0;
+    for (uint32_t n = 0; n < graph.node_count; ++n) {
+      const shell_dep_node_t *node = &graph.nodes[n];
+      CHECK(node->type != SHELL_NODE_GROUP);
+      if (node->type == SHELL_NODE_CMD) {
+        ++commands;
+        command = n;
+        CHECK(node->cmd.token_count == cases[c].words &&
+              node->cmd.token_lens[0] == 1 && node->cmd.tokens[0][0] == '{');
+      }
+      if (cases[c].file && node->type == SHELL_NODE_DOC &&
+          node->doc.kind == SHELL_DOC_FILE && node->doc.path_len == 3 &&
+          !memcmp(node->doc.path, "out", 3))
+        destination = n;
+      if (!cases[c].file && node->type == SHELL_NODE_FD && node->fd.number == 1)
+        destination = n;
+    }
+    CHECK(commands == 1 && destination != UINT32_MAX);
+    bool routed = false;
+    for (uint32_t e = 0; e < graph.edge_count; ++e) {
+      const shell_dep_edge_t *edge = &graph.edges[e];
+      routed |= edge->type == SHELL_EDGE_WRITE && edge->from == command &&
+                edge->to == destination &&
+                edge->source_fd == (cases[c].file ? 1u : 2u);
+    }
+    CHECK(routed);
+  }
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+  size_t previous[2] = {0};
+  for (unsigned fragments = 16; fragments <= 256; fragments *= 2) {
+    char source[4096];
+    for (unsigned form = 0; form < 2; ++form) {
+      const char *opening = form ? "" : "a[0]=x";
+      size_t used = strlen(opening);
+      memcpy(source, opening, used);
+      for (unsigned f = 0; f < fragments; ++f) {
+        const char *fragment = form ? ">out " : "\"\"x";
+        size_t length = strlen(fragment);
+        memcpy(source + used, fragment, length);
+        used += length;
+      }
+      const char *tail = form ? "{" : " a=(x)";
+      size_t length = strlen(tail);
+      memcpy(source + used, tail, length);
+      used += length;
+      shellsplit_test_source_scan_reset();
+      CHECK(shell_parse_draft(source, used, NULL, &draft) ==
+            (form ? SHELL_SOURCE_COMPLETE : SHELL_SOURCE_UNSUPPORTED));
+      size_t work = shellsplit_test_source_scan_work();
+      CHECK(!previous[form] || work <= previous[form] * 3);
+      previous[form] = work;
+    }
+  }
+#endif
 }
 
 static void pending_pipeline_prefixes(void) {
@@ -370,23 +593,17 @@ static void pending_pipeline_prefixes(void) {
       int length = snprintf(source, sizeof(source), "echo ok%s %s",
                             separators[s], prefixes[p]);
       CHECK(length > 0 && (size_t)length < sizeof(source));
-      size_t prefix = s < 3 ? strlen("echo ok") + strlen(separators[s]) : 0;
       CHECK(shell_parse_draft(source, (size_t)length, NULL, &draft) ==
-            SHELL_SOURCE_INCOMPLETE);
-      CHECK(draft.need == SHELL_SOURCE_NEEDS_COMMAND &&
-            draft.prefix_length == prefix);
-      if (prefix)
-        CHECK(shell_dep_graph_parse_with_fast(source, prefix, "/workspace",
-                                              &limits, &draft.prefix,
-                                              &graph) == SHELL_DEP_OK);
+            SHELL_SOURCE_UNSUPPORTED);
+      CHECK(!draft.prefix_length && !draft.prefix.count);
       memcpy(source + length, " true", sizeof(" true"));
       for (size_t cut = (size_t)length; cut <= strlen(source); cut++) {
         shell_source_status_t status =
             shell_parse_draft(source, cut, NULL, &draft);
-        CHECK(status == SHELL_SOURCE_COMPLETE ||
-              status == SHELL_SOURCE_INCOMPLETE);
-        if (status == SHELL_SOURCE_INCOMPLETE)
-          CHECK(draft.prefix_length == prefix);
+        CHECK(status == ((cut <= (size_t)length + 1) ? SHELL_SOURCE_UNSUPPORTED
+                                                     : SHELL_SOURCE_COMPLETE));
+        CHECK(draft.prefix_length ==
+              (status == SHELL_SOURCE_COMPLETE ? cut : 0));
       }
       parse(source);
     }
@@ -419,7 +636,7 @@ static void pending_pipeline_prefixes(void) {
   }
   static const char invalid[] = "echo ok; !\ntrue";
   CHECK(shell_parse_draft(invalid, sizeof(invalid) - 1, NULL, &draft) ==
-        SHELL_SOURCE_INVALID);
+        SHELL_SOURCE_UNSUPPORTED);
   CHECK(!draft.prefix_length);
 }
 
@@ -465,7 +682,7 @@ static void keyword_recovery(void) {
       snprintf(source, sizeof(source), "echo before; %s%s", words[w],
                boundaries[b]);
       CHECK(shell_parse_draft(source, strlen(source), NULL, &draft) ==
-            SHELL_SOURCE_INVALID);
+            SHELL_SOURCE_UNSUPPORTED);
       CHECK(!draft.prefix_length && !draft.tail_start && !draft.prefix.count);
       for (uint32_t h = 0; h < draft.header_count; h++)
         CHECK(!draft.headers[h].complete);
@@ -476,7 +693,7 @@ static void keyword_recovery(void) {
       snprintf(word, sizeof(word), closed[c], words[w]);
       snprintf(source, sizeof(source), "echo before; echo %s", word);
       CHECK(shell_parse_draft(source, strlen(source), NULL, &draft) ==
-            SHELL_SOURCE_INVALID);
+            SHELL_SOURCE_UNSUPPORTED);
       CHECK(!draft.prefix_length && !draft.prefix.count);
       char suffixed[64];
       snprintf(suffixed, sizeof(suffixed), "%sx", words[w]);
@@ -509,7 +726,7 @@ static void keyword_recovery(void) {
                                         "echo before; function name"};
   for (size_t c = 0; c < sizeof(invalid) / sizeof(invalid[0]); c++) {
     CHECK(shell_parse_draft(invalid[c], strlen(invalid[c]), NULL, &draft) ==
-          SHELL_SOURCE_INVALID);
+          SHELL_SOURCE_UNSUPPORTED);
     CHECK(!draft.prefix_length);
   }
 #ifdef SHELLSPLIT_TEST_SOURCE_SCANS
@@ -633,7 +850,7 @@ static void local_completeness(void) {
       strict_limits.strict_mode = true;
       CHECK(shell_parse_fast(timing[c].source, draft.prefix_length,
                              &strict_limits, &strict) == SHELL_OK);
-      CHECK(!memcmp(&strict, &draft.prefix, sizeof(strict)));
+      CHECK(shellsplit_test_parse_equal(&strict, &draft.prefix));
     }
   }
 }
@@ -713,7 +930,7 @@ static void unfinished_children(void) {
       const shell_source_header_t *child = &draft.headers[h + 2];
       CHECK(child->complete && child->source.start == children[h].source.start);
       if (h + 1 < cases[c].children || cases[c].last_complete)
-        CHECK(!memcmp(child, &children[h], sizeof(*child)));
+        CHECK(shellsplit_test_header_equal(child, &children[h]));
     }
   }
 
@@ -809,7 +1026,7 @@ static void backtick_escape_domains(void) {
   };
   for (size_t c = 0; c < sizeof(invalid) / sizeof(invalid[0]); c++) {
     CHECK(shell_parse_draft(invalid[c], strlen(invalid[c]), NULL, &draft) ==
-          SHELL_SOURCE_INVALID);
+          SHELL_SOURCE_UNSUPPORTED);
     CHECK(!draft.prefix_length && !draft.prefix.count);
     for (uint32_t h = 0; h < draft.header_count; h++)
       CHECK(!draft.headers[h].complete);
@@ -1209,6 +1426,640 @@ static void continued_operators(void) {
     shell_source_span_t word = draft.headers[1].words[0];
     CHECK(word.length == 4 &&
           !memcmp(ordinary_time[i] + word.start, "time", 4));
+  }
+}
+
+static void lexical_boundaries(void) {
+  static shell_dep_graph_t ordinary;
+  static const char *const comments[] = {
+      "echo before #comment \\\necho after",
+      "echo before #comment \\\\\necho after",
+      "echo before #comment \\\\\\\necho after",
+  };
+  for (size_t c = 0; c < sizeof(comments) / sizeof(comments[0]); ++c) {
+    const char *source = comments[c];
+    size_t length = strlen(source);
+    uint32_t newline = (uint32_t)(strchr(source, '\n') - source);
+    CHECK(shell_parse_draft(source, length, NULL, &draft) ==
+          SHELL_SOURCE_COMPLETE);
+    CHECK(draft.header_count == 2 && draft.prefix.count == 2);
+    CHECK(draft.headers[0].source.start == 0 &&
+          draft.headers[0].source.length == newline &&
+          draft.headers[1].source.start == newline + 1 &&
+          draft.headers[1].source.length == strlen("echo after"));
+    const char *words[] = {"echo", "before", "echo", "after"};
+    uint32_t offsets[] = {0, 5, newline + 1, newline + 6};
+    for (unsigned h = 0; h < 2; ++h) {
+      CHECK(draft.headers[h].complete && !draft.headers[h].compound &&
+            draft.headers[h].word_count == 2);
+      for (unsigned w = 0; w < 2; ++w) {
+        const shell_source_span_t *word = &draft.headers[h].words[w];
+        unsigned index = h * 2 + w;
+        CHECK(word->start == offsets[index] &&
+              word->length == strlen(words[index]) &&
+              !memcmp(source + word->start, words[index], word->length));
+      }
+    }
+    shell_tokenizer_state_t lexer;
+    CHECK(shell_tokenizer_init(&lexer, source, length, NULL));
+    shell_token_t token;
+    unsigned separators = 0;
+    while (shell_tokenizer_next(&lexer, &token))
+      if (token.type == SHELL_TOKEN_SEMICOLON) {
+        CHECK(token.position == newline && token.length == 1 &&
+              !token.is_quoted && !token.is_escaped);
+        ++separators;
+      }
+    CHECK(separators == 1);
+    CHECK(shell_dep_graph_parse_with_fast(source, length, "/workspace", &limits,
+                                          &draft.prefix,
+                                          &graph) == SHELL_DEP_OK);
+    CHECK(shell_dep_graph_parse(source, length, "/workspace", &limits,
+                                &ordinary) == SHELL_DEP_OK);
+    CHECK(shellsplit_test_graph_equal(&graph, &ordinary));
+  }
+  static const char *const framed[] = {
+      ": #comment \\\n{ :; }",
+      "cat <<EOF #comment \\\npayload\nEOF\necho after",
+      "echo $(echo before #comment \\\necho after)",
+  };
+  for (size_t c = 0; c < sizeof(framed) / sizeof(framed[0]); ++c) {
+    const char *source = framed[c];
+    size_t length = strlen(source);
+    CHECK(shell_parse_draft(source, length, NULL, &draft) ==
+          SHELL_SOURCE_COMPLETE);
+    CHECK(draft.header_count == (c == 1 ? 2u : 3u));
+    for (uint32_t h = 0; h < draft.header_count; ++h)
+      CHECK(draft.headers[h].complete);
+    if (c == 1) {
+      CHECK(draft.heredoc_count == 1 && draft.heredocs[0].complete &&
+            draft.heredocs[0].header == 0 &&
+            draft.headers[0].redirect_count == 1 &&
+            draft.headers[1].word_count == 2);
+      content(&draft.heredocs[0].content, "payload\n");
+    }
+    CHECK(shell_dep_graph_parse_with_fast(source, length, "/workspace", &limits,
+                                          &draft.prefix,
+                                          &graph) == SHELL_DEP_OK);
+    CHECK(shell_dep_graph_parse(source, length, "/workspace", &limits,
+                                &ordinary) == SHELL_DEP_OK);
+    CHECK(shellsplit_test_graph_equal(&graph, &ordinary));
+  }
+  static const char pending[] = "echo before #comment \\\necho 'unfinished";
+  CHECK(shell_parse_draft(pending, sizeof(pending) - 1, NULL, &draft) ==
+        SHELL_SOURCE_INCOMPLETE);
+  CHECK(draft.prefix_length == (size_t)(strchr(pending, '\n') - pending) + 1 &&
+        draft.prefix.count == 1 && draft.header_count == 2 &&
+        draft.headers[0].complete && !draft.headers[1].complete);
+
+  static const struct {
+    const char *source;
+    unsigned words;
+  } ordinary_time[] = {
+      {": | time {", 2},       {": |& time {", 2},
+      {": |\ntime {", 2},      {": | #comment \\\ntime {", 2},
+      {": |\\\ntime {", 2},    {": |\ntime -p -- {", 4},
+      {": |&\n\"time\" {", 2}, {": |\n\n\\time {", 2},
+      {": |&\ntime\"\" {", 2},
+  };
+  for (size_t c = 0; c < sizeof(ordinary_time) / sizeof(ordinary_time[0]);
+       ++c) {
+    const char *source = ordinary_time[c].source;
+    size_t length = strlen(source);
+    CHECK(shell_parse_draft(source, length, NULL, &draft) ==
+          SHELL_SOURCE_COMPLETE);
+    CHECK(draft.header_count == 2 && draft.prefix.count == 2 &&
+          !draft.prefix.group_count && draft.headers[1].complete &&
+          draft.headers[1].word_count == ordinary_time[c].words);
+    shell_source_span_t brace =
+        draft.headers[1].words[ordinary_time[c].words - 1];
+    CHECK(brace.length == 1 && source[brace.start] == '{');
+    shell_processed_commands_t processed = {0};
+    shell_process_status_t process_status =
+        shell_process_commands(source, length, NULL, &processed);
+    if (process_status != SHELL_PROCESS_OK)
+      fprintf(stderr, "ordinary time processing %d: %s\n", process_status,
+              source);
+    CHECK(process_status == SHELL_PROCESS_OK);
+    CHECK(processed.command_count == 2 &&
+          processed.commands[1].command_token_count == ordinary_time[c].words);
+    shell_processed_commands_free(&processed);
+    CHECK(shell_dep_graph_parse_with_fast(source, length, "/workspace", &limits,
+                                          &draft.prefix,
+                                          &graph) == SHELL_DEP_OK);
+    unsigned commands = 0;
+    for (uint32_t n = 0; n < graph.node_count; ++n) {
+      const shell_dep_node_t *node = &graph.nodes[n];
+      CHECK(node->type != SHELL_NODE_TIME && node->type != SHELL_NODE_GROUP);
+      if (node->type == SHELL_NODE_CMD) {
+        CHECK(node->cmd.pipeline_time_mode == SHELL_PIPE_TIME_NONE);
+        if (commands++)
+          CHECK(node->cmd.token_count == ordinary_time[c].words);
+      }
+    }
+    CHECK(commands == 2);
+    CHECK(shell_dep_graph_parse(source, length, "/workspace", &limits,
+                                &ordinary) == SHELL_DEP_OK);
+    CHECK(shellsplit_test_graph_equal(&graph, &ordinary));
+  }
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+  size_t previous[3] = {0};
+  for (unsigned repeats = 8; repeats <= 32; repeats *= 2) {
+    for (unsigned form = 0; form < 3; ++form) {
+      char source[8192];
+      const char *opening = form ? ": |\n" : "";
+      size_t used = strlen(opening);
+      memcpy(source, opening, used);
+      const char *piece = form == 0   ? ": #comment \\\n"
+                          : form == 1 ? "#comment \\\n"
+                                      : "\\\n";
+      size_t piece_length = strlen(piece);
+      for (unsigned i = 0; i < repeats; ++i) {
+        memcpy(source + used, piece, piece_length);
+        used += piece_length;
+      }
+      const char *tail = form ? "time {" : "echo after";
+      size_t tail_length = strlen(tail);
+      memcpy(source + used, tail, tail_length);
+      used += tail_length;
+      shellsplit_test_source_scan_reset();
+      shell_source_status_t status =
+          shell_parse_draft(source, used, NULL, &draft);
+      if (status != (form == 1 ? SHELL_SOURCE_INVALID : SHELL_SOURCE_COMPLETE))
+        fprintf(stderr, "boundary work form=%u repeats=%u status=%d\n", form,
+                repeats, status);
+      CHECK(status ==
+            (form == 1 ? SHELL_SOURCE_INVALID : SHELL_SOURCE_COMPLETE));
+      size_t work = shellsplit_test_source_scan_work();
+      CHECK(!previous[form] || work <= previous[form] * 3);
+      previous[form] = work;
+    }
+  }
+#endif
+}
+
+static void forward_prefix_products(void) {
+  static shell_dep_graph_t ordinary;
+  static const struct {
+    const char *source;
+    unsigned commands, groups, timers;
+  } cases[] = {
+      {"time printf x { }", 1, 0, 1},
+      {"! time printf x \\\n{ }", 1, 0, 1},
+      {"printf x | time { }", 2, 0, 0},
+      {"time { printf x; } >out | ( ! time printf y )", 2, 2, 2},
+      {"time <<<word printf x", 1, 0, 1},
+      {"time <<'Q' printf x\npayload\nQ\nprintf after", 2, 0, 1},
+      {": <<<x {", 1, 0, 0},
+      {": <<<x }", 1, 0, 0},
+      {"<<<x {", 1, 0, 0},
+      {"time <<<x {", 1, 0, 1},
+      {"! time <<<x }", 1, 0, 1},
+      {"printf x | time <<<x {", 2, 0, 0},
+      {"{ : <<<x }; }", 1, 1, 0},
+      {": <<'Q' {\npayload\nQ\n", 1, 0, 0},
+      {"time <<'Q' }\npayload\nQ\n", 1, 0, 1},
+      {"{ time : <<'Q' }; }\npayload\nQ\n", 1, 1, 1},
+      {": {fd}>|out", 1, 0, 0},
+      {": {fd}>\\\n|out", 1, 0, 0},
+  };
+  for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); ++c) {
+    const char *source = cases[c].source;
+    size_t length = strlen(source);
+    CHECK(shell_parse_draft(source, length, NULL, &draft) ==
+          SHELL_SOURCE_COMPLETE);
+    for (uint32_t h = 0; h < draft.header_count; ++h)
+      CHECK(draft.headers[h].complete);
+    shell_processed_commands_t processed = {0};
+    CHECK(shell_process_commands(source, length, NULL, &processed) ==
+          SHELL_PROCESS_OK);
+    if (processed.command_count != cases[c].commands)
+      fprintf(stderr, "forward prefix commands: %s actual=%zu expected=%u\n",
+              source, processed.command_count, cases[c].commands);
+    CHECK(processed.command_count == cases[c].commands);
+    shell_processed_commands_free(&processed);
+    CHECK(shell_dep_graph_parse_with_fast(source, length, "/workspace", &limits,
+                                          &draft.prefix,
+                                          &graph) == SHELL_DEP_OK);
+    CHECK(shell_dep_graph_validate(&graph).valid);
+    unsigned commands = 0, groups = 0, timers = 0;
+    for (uint32_t n = 0; n < graph.node_count; ++n) {
+      commands += graph.nodes[n].type == SHELL_NODE_CMD;
+      groups += graph.nodes[n].type == SHELL_NODE_GROUP;
+      timers += graph.nodes[n].type == SHELL_NODE_TIME;
+    }
+    CHECK(commands == cases[c].commands && groups == cases[c].groups &&
+          timers == cases[c].timers);
+    CHECK(shell_dep_graph_parse(source, length, "/workspace", &limits,
+                                &ordinary) == SHELL_DEP_OK);
+    CHECK(shellsplit_test_graph_equal(&graph, &ordinary));
+  }
+}
+
+static void indexed_word_boundaries(void) {
+  const char *const assignments[] = {
+      "a[1 + 2]=x",          "a[1 + 2]+=x\"\"", "a[$(printf 1) + 2]=x",
+      "a[1 + 2]=\"$value\"", "a[1 + 2]=x\\\ny", "a\\\n[1 + 2]\\\n=\\\nx"};
+  for (size_t i = 0; i < sizeof(assignments) / sizeof(assignments[0]); ++i) {
+    char source[256];
+    int n = snprintf(source, sizeof(source), "%s printf x", assignments[i]);
+    CHECK(n > 0 && (size_t)n < sizeof(source));
+    CHECK(shell_parse_draft(source, (size_t)n, NULL, &draft) ==
+          SHELL_SOURCE_COMPLETE);
+    CHECK(draft.headers[0].word_count == 3 &&
+          draft.headers[0].assignment_count == 1);
+    CHECK(draft.headers[0].words[0].start == 0 &&
+          draft.headers[0].words[0].length == strlen(assignments[i]));
+    n = snprintf(source, sizeof(source), "%s a=(x)", assignments[i]);
+    CHECK(n > 0 && (size_t)n < sizeof(source));
+    CHECK(shell_parse_draft(source, (size_t)n, NULL, &draft) ==
+          SHELL_SOURCE_UNSUPPORTED);
+    CHECK(!draft.prefix_length && !draft.headers[0].complete);
+    CHECK(draft.headers[0].words[0].length == strlen(assignments[i]));
+  }
+  const char *const ordinary[] = {"echo a[1 + 2]=x", "declare >out a[1 + 2]=x"};
+  for (size_t i = 0; i < sizeof(ordinary) / sizeof(ordinary[0]); ++i) {
+    CHECK(shell_parse_draft(ordinary[i], strlen(ordinary[i]), NULL, &draft) ==
+          SHELL_SOURCE_COMPLETE);
+    CHECK(draft.headers[0].word_count == 4 &&
+          !draft.headers[0].assignment_count);
+    CHECK(draft.headers[0].words[1].length == 3);
+    CHECK(draft.headers[0].words[2].length == 1);
+    CHECK(draft.headers[0].words[3].length == 4);
+  }
+  static const char *const declarations[] = {"declare", "typeset", "export",
+                                             "readonly", "local"};
+  for (size_t i = 0; i < sizeof(declarations) / sizeof(declarations[0]); ++i) {
+    char source[128];
+    int n = snprintf(source, sizeof(source), "%s a[1 + 2]=x", declarations[i]);
+    CHECK(n > 0 && (size_t)n < sizeof(source));
+    CHECK(shell_parse_draft(source, (size_t)n, NULL, &draft) ==
+          SHELL_SOURCE_COMPLETE);
+    CHECK(draft.headers[0].word_count == 4 &&
+          !draft.headers[0].assignment_count);
+    static const char *const words[] = {"a[1", "+", "2]=x"};
+    shell_processed_commands_t processed = {0};
+    CHECK(shell_process_commands(source, (size_t)n, NULL, &processed) ==
+          SHELL_PROCESS_OK);
+    CHECK(processed.command_count == 1 &&
+          processed.commands[0].command_token_count == 4);
+    for (size_t w = 0; w < 3; ++w) {
+      shell_source_span_t span = draft.headers[0].words[w + 1];
+      const shell_token_t *token = &processed.commands[0].command_tokens[w + 1];
+      CHECK(span.length == strlen(words[w]) &&
+            !memcmp(source + span.start, words[w], span.length));
+      CHECK(token->length == span.length &&
+            !memcmp(token->start, words[w], span.length));
+    }
+    shell_processed_commands_free(&processed);
+    CHECK(shell_dep_graph_parse_with_fast(source, (size_t)n, "/workspace",
+                                          &limits, &draft.prefix,
+                                          &graph) == SHELL_DEP_OK);
+    CHECK(graph.nodes[0].type == SHELL_NODE_CMD &&
+          graph.nodes[0].cmd.token_count == 4);
+    n = snprintf(source, sizeof(source), "%s 'a[1 + 2]=x'", declarations[i]);
+    CHECK(n > 0 && (size_t)n < sizeof(source));
+    CHECK(shell_parse_draft(source, (size_t)n, NULL, &draft) ==
+          SHELL_SOURCE_COMPLETE);
+    CHECK(draft.headers[0].word_count == 2 &&
+          draft.headers[0].words[1].length == strlen("'a[1 + 2]=x'"));
+  }
+}
+
+static void indexed_prefix_uncertainty(void) {
+  static const char *const sources[] = {"a[1 + (2)]=x",
+                                        "a[1 + (2)]=x printf ok",
+                                        "a[$(printf 1) + (2)]=x",
+                                        "a\\\n[1 + (2)]=x",
+                                        "a[${v:-]} + (2)]=x",
+                                        "a[${v:-[} + (2)]=x",
+                                        "a[${v:-${w:-]}} + (2)]=x",
+                                        "a[${v:-$(printf ])} + (2)]=x",
+                                        "a[<(printf ]) + (2)]=x",
+                                        "a[>(printf [) + (2)]=x",
+                                        "a[${indices[0]:-]} + (2)]=x",
+                                        "a[$\\\n{v:-]} + (2)]=x",
+                                        "a[<\\\n(printf ]) + (2)]=x",
+                                        "a\\\n[$\\\n{v:-]} + (2)]\\\n=\\\nx"};
+  for (size_t c = 0; c < sizeof(sources) / sizeof(sources[0]); ++c) {
+    size_t length = strlen(sources[c]);
+    for (size_t end = 0; end <= length; ++end) {
+      shell_source_status_t status =
+          shell_parse_draft(sources[c], end, NULL, &draft);
+      if (status == SHELL_SOURCE_INVALID)
+        fprintf(stderr, "false INVALID indexed prefix: %.*s\n", (int)end,
+                sources[c]);
+      CHECK(status != SHELL_SOURCE_INVALID && status != SHELL_SOURCE_TRUNCATED);
+      if (status == SHELL_SOURCE_UNSUPPORTED)
+        CHECK(!draft.prefix_length && !draft.prefix.count);
+    }
+  }
+  static const char *const unresolved[] = {
+      "a[1 + (",           "a[1 + (2",  "a[1 + (2)",         "a[1 + (2)]",
+      "a[$(printf 1) + (", "a=(x\\ y)", "declare a=(x\\ y)", "a[\\(]=(x\\ y)",
+      "a[\\(]=(x",         "a[${v:-[}"};
+  for (size_t c = 0; c < sizeof(unresolved) / sizeof(unresolved[0]); ++c)
+    CHECK(shell_parse_draft(unresolved[c], strlen(unresolved[c]), NULL,
+                            &draft) == SHELL_SOURCE_UNSUPPORTED);
+  static const char *const unfinished[] = {"a[${v:-]", "a[<(printf ]",
+                                           "a[>(printf ["};
+  for (size_t c = 0; c < sizeof(unfinished) / sizeof(unfinished[0]); ++c)
+    CHECK(shell_parse_draft(unfinished[c], strlen(unfinished[c]), NULL,
+                            &draft) == SHELL_SOURCE_INCOMPLETE);
+  static const char *const invalid[] = {"echo a[1 + (2)]=x",
+                                        "declare a[1 + (2)]=x", "a[1 + (2)] ;"};
+  for (size_t c = 0; c < sizeof(invalid) / sizeof(invalid[0]); ++c)
+    CHECK(shell_parse_draft(invalid[c], strlen(invalid[c]), NULL, &draft) ==
+          SHELL_SOURCE_INVALID);
+}
+
+static void indexed_expansion_boundaries(void) {
+  static const char *const assignments[] = {
+      "a[${v:-]}]=x",
+      "a[${v:-]} + (2)]=x",
+      "a[${v:-[} + (2)]=x",
+      "a[${v:-${w:-]}} + (2)]=x",
+      "a[${v:-$(printf ])} + (2)]=x",
+      "a[<(printf ]) + (2)]=x",
+      "a[>(printf [) + (2)]=x",
+      "a[${indices[0]:-]} + (2)]=x",
+      "a[$\\\n{v:-]} + (2)]=x",
+      "a[<\\\n(printf ]) + (2)]=x",
+      "a\\\n[$\\\n{v:-]} + (2)]\\\n=\\\nx"};
+  for (size_t c = 0; c < sizeof(assignments) / sizeof(assignments[0]); ++c)
+    for (unsigned preceding = 0; preceding < 2; ++preceding) {
+      char source[256];
+      const char *prefix = preceding ? "v=0; " : "";
+      int n = snprintf(source, sizeof(source), "%s%s", prefix, assignments[c]);
+      CHECK(n > 0 && (size_t)n < sizeof(source));
+      size_t length = (size_t)n;
+      CHECK(shell_parse_draft(source, length, NULL, &draft) ==
+            SHELL_SOURCE_COMPLETE);
+      CHECK(draft.prefix_length == length &&
+            draft.header_count >= preceding + 1);
+      const shell_source_header_t *header = &draft.headers[preceding];
+      CHECK(header->complete && header->assignment_count == 1 &&
+            header->word_count == 1 &&
+            header->words[0].start == strlen(prefix) &&
+            header->words[0].length == strlen(assignments[c]));
+      CHECK(draft.prefix.cmds[preceding].features & SHELL_FEAT_ARRAY);
+      CHECK(shell_dep_graph_parse_with_fast(source, length, "/workspace",
+                                            &limits, &draft.prefix,
+                                            &graph) == SHELL_DEP_EPARSE);
+      CHECK(!graph.node_count && !graph.edge_count);
+      CHECK(shell_dep_graph_parse(source, length, "/workspace", &limits,
+                                  &graph) == SHELL_DEP_EPARSE);
+      CHECK(!graph.node_count && !graph.edge_count);
+      shell_processed_commands_t processed = {0};
+      CHECK(shell_process_commands(source, length, NULL, &processed) ==
+            SHELL_PROCESS_EPARSE);
+      CHECK(!processed.command_count && !processed.commands);
+      shell_processed_commands_free(&processed);
+      shell_transformed_command_t **transformed = NULL;
+      size_t count = 0;
+      CHECK(shell_transform_command_line(source, length, NULL, &transformed,
+                                         &count) == SHELL_TRANSFORM_EPARSE);
+      CHECK(!count && !transformed);
+      shell_abstract_command_t *abstracted = NULL;
+      CHECK(shell_abstract_command_parse(source, length, &abstracted) ==
+            SHELL_ABSTRACT_EPARSE);
+      CHECK(!abstracted);
+    }
+  /* A bracket inside an unfinished expansion is not a shorter successful
+   * subscript. Completing the immutable view must not reuse that EOF failure,
+   * nor may the full match leak back into the shorter view. */
+  static const char subscript[] = "[${v:-]} + (2)]";
+  size_t short_length = (size_t)(strchr(subscript, ']') + 1 - subscript);
+  size_t after;
+  shell_source_operation_begin(subscript, sizeof(subscript) - 1);
+  CHECK(!shell_source_skip_array_subscript(subscript, short_length, 0, &after));
+  CHECK(shell_source_skip_array_subscript(subscript, sizeof(subscript) - 1, 0,
+                                          &after) &&
+        after == sizeof(subscript) - 1);
+  CHECK(!shell_source_skip_array_subscript(subscript, short_length, 0, &after));
+  shell_source_operation_end();
+}
+
+static void indexed_boundary_work(void) {
+  static const char parent[] = "[[]]", child[] = "[different]";
+  shell_source_operation_begin(parent, sizeof(parent) - 1);
+  size_t boundary;
+  CHECK(shell_source_skip_array_subscript(parent, sizeof(parent) - 1, 0,
+                                          &boundary) &&
+        boundary == 4);
+  shell_source_workspace_scope_t nested =
+      shell_source_workspace_begin(child, sizeof(child) - 1, NULL, 0);
+  CHECK(shell_source_skip_array_subscript(child, sizeof(child) - 1, 0,
+                                          &boundary) &&
+        boundary == 11);
+  shell_source_workspace_end(nested);
+  CHECK(shell_source_skip_array_subscript(parent, sizeof(parent) - 1, 1,
+                                          &boundary) &&
+        boundary == 3);
+  shell_source_operation_end();
+  /* Every outer opening shares one forward matching walk, even when skipped
+   * expansions contain misleading brackets or reenter subscript matching.
+   * Repeat all real candidates after both unfinished and complete walks. */
+  static const char *const scopes[] = {
+      "[${v:-]} ",     "[${v:-[} ",           "[<(printf ]) ",
+      "[>(printf [) ", "[${v:-$(printf ])} ", "[${indices[0]:-]} "};
+  for (size_t count = 256; count <= 2048; count *= 2)
+    for (size_t c = 0; c < sizeof(scopes) / sizeof(scopes[0]); ++c) {
+      size_t piece = strlen(scopes[c]);
+      size_t unfinished_length = count * piece;
+      size_t length = unfinished_length + count;
+      char *source = malloc(length);
+      CHECK(source);
+      for (size_t i = 0; i < count; ++i)
+        memcpy(source + i * piece, scopes[c], piece);
+      memset(source + unfinished_length, ']', count);
+      size_t size;
+      CHECK(shell_source_workspace_size(length, &size));
+      void *storage = malloc(size);
+      CHECK(storage);
+      shell_source_operation_begin(source, length);
+      shell_source_workspace_scope_t previous =
+          shell_source_workspace_begin(source, length, storage, size);
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+      shellsplit_test_source_scan_reset();
+#endif
+      for (size_t i = 0; i < count; ++i) {
+        size_t after;
+        CHECK(!shell_source_skip_array_subscript(source, unfinished_length,
+                                                 i * piece, &after));
+      }
+      for (size_t i = 0; i < count; ++i) {
+        size_t after;
+        CHECK(shell_source_skip_array_subscript(source, length, i * piece,
+                                                &after) &&
+              after == length - i);
+        CHECK(!shell_source_skip_array_subscript(source, unfinished_length,
+                                                 i * piece, &after));
+      }
+      CHECK(!shell_source_scratch_exhausted());
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+      size_t work = shellsplit_test_source_scan_work();
+      if (work > length * 100)
+        fprintf(stderr, "nested subscript work family=%zu count=%zu work=%zu\n",
+                c, count, work);
+      CHECK(work <= length * 100);
+#endif
+      shell_source_workspace_end(previous);
+      shell_source_operation_end();
+      free(storage);
+      free(source);
+    }
+  /* More simultaneously live facts than the evicting lexical index holds.
+   * This must succeed with sized scratch, not stop at a new syntax limit. */
+  for (size_t count = 1024; count <= 8192; count *= 2) {
+    char *source = malloc(count * 6 + 32);
+    CHECK(source);
+    size_t size;
+    CHECK(shell_source_workspace_size(count * 6 + 32, &size));
+    unsigned char *storage = malloc(size + 1);
+    CHECK(storage);
+    shell_limits_t lexical = SHELL_LIMITS_DEFAULT;
+    lexical.strict_mode = true;
+    lexical.workspace = storage + 1; /* Arbitrary caller alignment. */
+    lexical.workspace_size = size;
+    for (unsigned form = 0; form < 3; ++form) {
+      size_t at = 0;
+      if (form != 2) {
+        const char *head = form ? "declare " : "printf ";
+        at = strlen(head);
+        memcpy(source, head, at);
+      }
+      const char *piece = form == 2 ? "a[; " : "a[ ";
+      size_t piece_length = strlen(piece);
+      for (size_t i = 0; i < count; ++i) {
+        memcpy(source + at, piece, piece_length);
+        at += piece_length;
+      }
+      for (size_t i = 0; i < count; ++i) {
+        memcpy(source + at, "] ", 2);
+        at += 2;
+      }
+      source[at] = '\0';
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+      shellsplit_test_source_scan_reset();
+#endif
+      if (form != 2) {
+        shell_parse_result_t fast;
+        CHECK(shell_parse_fast(source, at, &lexical, &fast) == SHELL_OK);
+        CHECK(fast.count == 1);
+      } else {
+        shell_tokenizer_state_t iterator;
+        shell_token_t token;
+        CHECK(shell_tokenizer_init(&iterator, source, at, &lexical));
+        size_t tokens = 0;
+        while (shell_tokenizer_next(&iterator, &token))
+          ++tokens;
+        CHECK(!iterator.heredoc_error && tokens >= count * 2);
+      }
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+      size_t work = shellsplit_test_source_scan_work();
+      if (work > at * 100)
+        fprintf(stderr, "array work form=%u count=%zu length=%zu work=%zu\n",
+                form, count, at, work);
+      CHECK(work <= at * 100);
+#endif
+    }
+    /* Unfinished facts are endpoint-qualified and reusable too. */
+    memset(source, '[', count);
+    shell_source_operation_begin(source, count);
+    shell_source_workspace_scope_t previous = shell_source_workspace_begin(
+        source, count, lexical.workspace, lexical.workspace_size);
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+    shellsplit_test_source_scan_reset();
+#endif
+    for (size_t i = 0; i < count; ++i) {
+      size_t after;
+      CHECK(!shell_source_skip_array_subscript(source, count, i, &after));
+    }
+    CHECK(!shell_source_scratch_exhausted());
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+    CHECK(shellsplit_test_source_scan_work() <= count * 4);
+#endif
+    shell_source_workspace_end(previous);
+    shell_source_operation_end();
+    /* A successful larger-end match must not be reused as a complete match
+     * inside a shorter immutable view. */
+    memset(source, '[', count);
+    memset(source + count, ']', count);
+    shell_source_operation_begin(source, count * 2);
+    previous = shell_source_workspace_begin(
+        source, count * 2, lexical.workspace, lexical.workspace_size);
+    size_t after;
+    CHECK(!shell_source_skip_array_subscript(source, count, 0, &after));
+    CHECK(shell_source_skip_array_subscript(source, count * 2, 0, &after) &&
+          after == count * 2);
+    CHECK(!shell_source_skip_array_subscript(source, count, 0, &after));
+    shell_source_workspace_end(previous);
+    shell_source_operation_end();
+    if (count == 1024) {
+      memcpy(source, "a[", 2);
+      memset(source + 2, '[', count);
+      memset(source + 2 + count, ']', count + 1);
+      memcpy(source + 3 + count * 2, "=x", 2);
+      size_t length = count * 2 + 5;
+      CHECK(shell_parse_draft(source, length, NULL, &draft) ==
+            SHELL_SOURCE_TRUNCATED);
+      CHECK(!draft.prefix_length && !draft.prefix.count);
+      CHECK(shell_parse_draft(source, length, &lexical, &draft) ==
+            SHELL_SOURCE_COMPLETE);
+      CHECK(draft.headers[0].word_count == 1 &&
+            draft.headers[0].words[0].length == length);
+      shell_command_t *owned_commands = NULL;
+      size_t owned_count = 0;
+      CHECK(shell_tokenize_commands(source, length, &owned_commands,
+                                    &owned_count) == SHELL_TOKENIZE_OK);
+      CHECK(owned_count == 1);
+      shell_commands_free(owned_commands, owned_count);
+      shell_tokenizer_state_t first, second;
+      shell_token_t token, other_token;
+      CHECK(shell_tokenizer_init(&first, source, length, NULL));
+      CHECK(!shell_tokenizer_next(&first, &token) && first.heredoc_error);
+      /* Alternate independent live iterators after their first negative
+       * candidate prepared every nested boundary in separate arenas. */
+      for (size_t i = 0; i < count; ++i)
+        memcpy(source + i * 4, "a[; ", 4);
+      for (size_t i = 0; i < count; ++i)
+        memcpy(source + count * 4 + i * 2, "] ", 2);
+      length = count * 6;
+      shell_limits_t other = lexical;
+      other.workspace = malloc(size);
+      CHECK(other.workspace);
+      CHECK(shell_tokenizer_init(&first, source, length, &lexical));
+      CHECK(shell_tokenizer_init(&second, source, length, &other));
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+      shellsplit_test_source_scan_reset();
+#endif
+      for (;;) {
+        bool found = shell_tokenizer_next(&first, &token);
+        CHECK(shell_tokenizer_next(&second, &other_token) == found);
+        if (!found)
+          break;
+        CHECK(token.type == other_token.type &&
+              token.position == other_token.position &&
+              token.length == other_token.length);
+      }
+      CHECK(!first.heredoc_error && !second.heredoc_error);
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+      CHECK(shellsplit_test_source_scan_work() <= length * 100);
+#endif
+      free(other.workspace);
+#ifdef SHELLSPLIT_TEST_ALLOCATOR
+      shell_command_t *commands = NULL;
+      size_t command_count = 0;
+      shellsplit_test_alloc_fail_at(1);
+      CHECK(shell_tokenize_commands(source, length, &commands,
+                                    &command_count) == SHELL_TOKENIZE_ENOMEM);
+      CHECK(!commands && !command_count);
+      shellsplit_test_alloc_reset();
+#endif
+    }
+    free(storage);
+    free(source);
   }
 }
 
@@ -1732,7 +2583,7 @@ static void delimiter_fragments(void) {
   };
   for (size_t c = 0; c < sizeof(unsupported) / sizeof(unsupported[0]); c++) {
     CHECK(shell_parse_draft(unsupported[c], strlen(unsupported[c]), NULL,
-                            &draft) == SHELL_SOURCE_INVALID);
+                            &draft) == SHELL_SOURCE_UNSUPPORTED);
     CHECK(!draft.prefix_length && !draft.prefix.count);
   }
 
@@ -1924,17 +2775,29 @@ static void pending_redirectors(void) {
             !draft.headers[1].word_count && !draft.headers[1].assignment_count);
       CHECK(draft.headers[1].source.start + draft.headers[1].source.length ==
             length);
-      CHECK(!memcmp(&child, &draft.headers[2], sizeof(child)));
+      CHECK(shellsplit_test_header_equal(&child, &draft.headers[2]));
       CHECK(draft.redirect_count == redirects);
-      if (redirects)
-        CHECK(!memcmp(&existing, &draft.redirects[0], sizeof(existing)));
+      if (redirects) {
+        bool equal =
+            shellsplit_test_redirect_equal(&existing, &draft.redirects[0]);
+        if (!equal)
+          fprintf(stderr, "pending redirector compound %zu case %zu: %s\n", c,
+                  t, source);
+        CHECK(equal);
+      }
       strcpy(source + length, cases[t].completion);
       length = strlen(source);
       CHECK(shell_parse_draft(source, length, NULL, &draft) ==
             SHELL_SOURCE_COMPLETE);
       CHECK(draft.headers[1].complete && !draft.headers[1].word_count &&
             draft.redirect_count == redirects + 1);
-      CHECK(!memcmp(&child, &draft.headers[2], sizeof(child)));
+      CHECK(shellsplit_test_header_equal(&child, &draft.headers[2]));
+      if (redirects) {
+        CHECK(shellsplit_test_io_equal(&existing.io, &draft.redirects[0].io));
+        CHECK(existing.header == draft.redirects[0].header &&
+              existing.heredoc == draft.redirects[0].heredoc &&
+              draft.redirects[0].next == redirects);
+      }
       for (size_t cut = 0; cut <= length; cut++) {
         shell_source_status_t status =
             shell_parse_draft(source, cut, NULL, &draft);
@@ -1969,7 +2832,7 @@ static void pending_redirectors(void) {
             SHELL_SOURCE_COMPLETE);
       CHECK(draft.header_count == 4 && draft.headers[1].complete &&
             draft.headers[2].complete && !draft.headers[2].word_count &&
-            !memcmp(&nested_child, &draft.headers[3], sizeof(nested_child)));
+            shellsplit_test_header_equal(&nested_child, &draft.headers[3]));
     }
     for (size_t t = 0; t < sizeof(invalid) / sizeof(invalid[0]); t++) {
       count = snprintf(source, sizeof(source), "%s%s%s", prefix, compounds[c],
@@ -1988,12 +2851,12 @@ static void pending_redirectors(void) {
       CHECK(draft.need == operands[t].need &&
             draft.prefix_length == strlen("echo before;") &&
             !draft.headers[1].complete && !draft.headers[1].word_count);
-      CHECK(!memcmp(&child, &draft.headers[2], sizeof(child)));
+      CHECK(shellsplit_test_header_equal(&child, &draft.headers[2]));
       strcpy(source + count, operands[t].completion);
       CHECK(shell_parse_draft(source, strlen(source), NULL, &draft) ==
             SHELL_SOURCE_COMPLETE);
       CHECK(!draft.headers[1].word_count &&
-            !memcmp(&child, &draft.headers[2], sizeof(child)));
+            shellsplit_test_header_equal(&child, &draft.headers[2]));
     }
   }
 #ifdef SHELLSPLIT_TEST_SOURCE_SCANS
@@ -2048,14 +2911,19 @@ static void missing_redirect_operands(void) {
         CHECK(draft.incomplete_at == strlen(prefix) + strlen(commands[c]));
         CHECK(draft.prefix_length == strlen("echo ok;") &&
               draft.tail_start == draft.prefix_length);
+        if (!(draft.header_count >= 2 && draft.headers[0].complete &&
+              !draft.headers[1].complete))
+          fprintf(stderr,
+                  "missing redirect header: %s headers=%u first=%d second=%d\n",
+                  source, draft.header_count, draft.headers[0].complete,
+                  draft.headers[1].complete);
         CHECK(draft.header_count >= 2 && draft.headers[0].complete &&
               !draft.headers[1].complete);
         if (c != 0) {
           CHECK(draft.header_count == 3 && draft.headers[2].complete);
           if (t == 0)
             closed_child = draft.headers[2];
-          CHECK(
-              !memcmp(&closed_child, &draft.headers[2], sizeof(closed_child)));
+          CHECK(shellsplit_test_header_equal(&closed_child, &draft.headers[2]));
         }
       }
       for (size_t b = 0; b < sizeof(invalid) / sizeof(invalid[0]); b++) {
@@ -2073,8 +2941,7 @@ static void missing_redirect_operands(void) {
               SHELL_SOURCE_COMPLETE);
         CHECK(draft.headers[1].complete && draft.prefix_length == length);
         if (c != 0)
-          CHECK(
-              !memcmp(&closed_child, &draft.headers[2], sizeof(closed_child)));
+          CHECK(shellsplit_test_header_equal(&closed_child, &draft.headers[2]));
         for (size_t cut = 0; cut <= length; cut++) {
           shell_source_status_t status =
               shell_parse_draft(source, cut, NULL, &draft);
@@ -2176,10 +3043,10 @@ static void nested_redirect_recovery(void) {
               SHELL_SOURCE_COMPLETE);
         CHECK(draft.header_count == headers && draft.redirect_count == 2 &&
               draft.redirects[0].header == 2 &&
-              !memcmp(&existing, &draft.redirects[0].io, sizeof(existing)) &&
-              !memcmp(&leaf, &draft.headers[headers - 1], sizeof(leaf)));
+              shellsplit_test_io_equal(&existing, &draft.redirects[0].io) &&
+              shellsplit_test_header_equal(&leaf, &draft.headers[headers - 1]));
         if (c != 0)
-          CHECK(!memcmp(&closed, &draft.headers[3], sizeof(closed)));
+          CHECK(shellsplit_test_header_equal(&closed, &draft.headers[3]));
         for (size_t cut = 0; cut <= (size_t)count; cut++) {
           shell_source_status_t status =
               shell_parse_draft(source, cut, NULL, &draft);
@@ -2236,7 +3103,7 @@ static void nested_redirect_recovery(void) {
     CHECK(shell_parse_draft(source, (size_t)count, NULL, &draft) ==
           SHELL_SOURCE_COMPLETE);
     CHECK(draft.heredocs[0].complete &&
-          !memcmp(&leaf, &draft.headers[4], sizeof(leaf)));
+          shellsplit_test_header_equal(&leaf, &draft.headers[4]));
     for (size_t cut = 0; cut <= (size_t)count; cut++) {
       shell_source_status_t status =
           shell_parse_draft(source, cut, NULL, &draft);
@@ -2311,7 +3178,7 @@ static void duplication_recovery(void) {
           SHELL_SOURCE_COMPLETE);
     CHECK(draft.header_count == headers);
     if (closed_child)
-      CHECK(!memcmp(&child, &draft.headers[2], sizeof(child)));
+      CHECK(shellsplit_test_header_equal(&child, &draft.headers[2]));
     size_t first_quote = (size_t)(strchr(completed, '"') - completed);
     for (size_t cut = first_quote; cut < (size_t)count; cut++) {
       shell_source_status_t status =
@@ -2602,7 +3469,7 @@ overlapping_source(const shell_expand_word_request_t *request,
         SHELL_SOURCE_INCOMPLETE);
   CHECK(draft.heredoc_count == 1 && !draft.heredocs[0].complete);
   CHECK(shell_parse_draft(input->source + input->data, input->data_length, NULL,
-                          &draft) == SHELL_SOURCE_INVALID);
+                          &draft) == SHELL_SOURCE_UNSUPPORTED);
   CHECK(shell_parse_draft(input->source, input->length, NULL, &draft) ==
         SHELL_SOURCE_COMPLETE);
   CHECK(draft.heredoc_count == 1 && draft.heredocs[0].complete);
@@ -2628,7 +3495,7 @@ static void callback_domains(void) {
   CHECK(shell_parse_draft(source, input.prefix, NULL, &draft) ==
         SHELL_SOURCE_INCOMPLETE);
   CHECK(shell_parse_draft(source + input.data, input.data_length, NULL,
-                          &draft) == SHELL_SOURCE_INVALID);
+                          &draft) == SHELL_SOURCE_UNSUPPORTED);
   shell_dep_limits_t resolved = limits;
   CHECK(shell_dep_resolved_workspace_size(input.length, &limits,
                                           &resolved.workspace_size));
@@ -2936,6 +3803,8 @@ int main(void) {
   selector_recovery();
   tentative_delimiters();
   recovery();
+  bang_redirect_words();
+  lexical_command_roles();
   pending_pipeline_prefixes();
   keyword_recovery();
   prefixes();
@@ -2946,6 +3815,12 @@ int main(void) {
   allocating_delimiters();
   capacity_and_work();
   continued_operators();
+  lexical_boundaries();
+  forward_prefix_products();
+  indexed_word_boundaries();
+  indexed_prefix_uncertainty();
+  indexed_expansion_boundaries();
+  indexed_boundary_work();
   delimiter_regressions();
   delimiter_phases();
   delimiter_fragments();

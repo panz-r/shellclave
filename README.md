@@ -4,559 +4,343 @@
 
 # Shellclave
 
-Shellclave is a C11 toolkit for parsing shell command lines and evaluating
-command policy.
+Shellclave is a C11 toolkit for **analyzing and classifying shell commands**.
+It identifies commands and their dependencies, matches their arguments against
+policy rules, and reports modeled I/O routes, unresolved expansions, and
+statistical anomalies.
 
-- **shellsplit** provides bounded, zero-copy parsing plus a richer allocating
-  tokenizer, command abstraction, transforms, and dependency graphs.
-- **shelltype** learns typed command patterns and evaluates serialized policy.
-- **shellgate** combines both libraries into an allow/deny gate with advisory
-  lexical violation checks and optional statistical anomaly scoring.
+An application screening commands from an AI agent can use Shellclave to
+classify a proposed command, inspect its file and substitution dependencies,
+and decide whether to run it, request review, or refuse it. The application
+owns execution and its security controls.
 
-Gate evaluation uses the [documented Bash execution model](shellsplit/README.md),
-not executor-neutral shell semantics. Applications must establish its clean
-noninteractive startup state before executing accepted source and inspect
-and evaluate dynamic content as required by conditional substitution results.
-Shellclave itself does not execute commands.
+Submitted source is the entire input supplied for one evaluation. It can contain
+lists, pipelines, groups, and nested substitutions. Policy rules match individual
+command argument sequences within that input.
 
-## Requirements and build
+For example, with an allow rule `git status --short` and a deny rule
+`git reset --hard`:
 
-The root CMake project requires CMake 3.20+, C11 and C++11 compilers,
-pthreads, and libm. Its CI configuration builds GCC and Clang configurations.
+| Submitted source | Policy classification |
+|---|---|
+| `git status --short` | `ALLOW` |
+| `git reset --hard` | `DENY` |
+| `git log --oneline` | `UNDETERMINED`: no matching rule |
+
+Shellsplit analyzes the source and constructs command and I/O relationships.
+Shelltype matches argument sequences against policy rules. Shellgate combines
+these operations with advisory violation findings and optional anomaly scoring.
+
+## Security model and limitations
+
+An `ALLOW` verdict means that every command included in policy evaluation
+matched an allow rule and none matched a deny rule. The
+[policy coverage rules](#what-policy-rules-cover) below define which commands
+participate. The fields below identify incomplete coverage and unresolved
+argument or pathname expansions.
+
+First check the return code and completeness flags. Then interpret the verdict
+and any unresolved-expansion or substitution-inspection requirements. These
+conditions can occur together. Verdict names here abbreviate the public
+`SG_VERDICT_*` constants.
+
+A shell word is a syntactic unit whose expansion can produce zero or more
+arguments. Substitution inspection concerns bytes supplied by substitution
+routes and incorporated into a shell word. The flag
+`requires_substitution_evaluation` identifies that requirement. The broader
+`has_dynamic_substitution_io` flag also covers process-substitution streams and
+dynamic filenames. Those I/O roles are distinct from shell-word inspection;
+the receiving role determines how the application must inspect the data.
+
+| Result or condition | Application action |
+|---|---|
+| `SG_OK` and `ALLOW` | Check completeness, unresolved values, and application-specific requirements |
+| `ALLOW_CONDITIONAL` | Inspect generated shell-word content in its receiving context before deciding whether to execute; use Shellsplit's graph to locate the substitution routes |
+| `DENY` | Refuse according to the explicit deny-policy match |
+| `REJECT` | Refuse execution because the source is malformed, uses unsupported semantics, or contains a feature prohibited by the gate configuration |
+| `UNDETERMINED` | Keep the execution decision pending until the reason for the indeterminate result has been resolved |
+| Any evaluation error | Withhold authorization; diagnose the error or retry within resource limits |
+| `truncated` or `short_circuited` | Treat the result as incomplete for a full-command decision |
+| Nonzero `unresolved_expansion_flags` | Resolve the relevant values or apply an explicit application rule for uncertainty |
+
+Choose `SG_EVAL_ALL` to evaluate all argv-policy subjects in the modeled input.
+Early-stop modes can return an `ALLOW` describing only the evaluated prefix.
+For unresolved arguments or paths, matching may use their processed source
+spelling rather than their final runtime values. Check
+`unresolved_expansion_flags` when that distinction affects the application's
+decision. Full-input policy evaluation covers argument matching; execution
+authorization also depends on effects and application controls.
+
+### What policy rules cover
+
+Each retained command with an argument sequence is an argv-policy subject.
+The command name is `argv[0]`, so a command without operands still receives
+matching. Builtins and external programs are both subjects. Prefix assignments
+and redirections are separate from the matched arguments; Shellsplit models
+their effects alongside the command.
+
+| Submitted source | Argv-policy coverage | Separate analysis |
+|---|---|---|
+| `whoami` | One subject: `whoami` | Command I/O routes |
+| `git status --short >report.txt` | One subject: `git status --short` | File setup and stdout routing |
+| `VALUE=example git status --short` | One subject: `git status --short` | Prefix assignment effects |
+| `>report.txt` | No subject; `UNDETERMINED` | Redirection setup |
+| `VALUE=example` | No subject; `UNDETERMINED` | Shell-state assignment |
+| `# comment` | No subject; `ALLOW` | Policy-neutral source |
+| `cd /tmp` | One subject: `cd /tmp`; requires a matching rule | CWD changes and command I/O |
+| `echo "$(whoami)"` | Two subjects: `echo` with its argument, and `whoami` | Generated shell-word content and substitution routes |
+
+Groups organize their contained subjects. Supported command, backtick, and
+process substitutions contribute nested command subjects as well as dependency
+routes. Bash's `$(<file)` shortcut instead contributes a file-content route
+without an inner argv command. Matching a producer's arguments leaves its
+generated content subject to the receiving context's inspection requirements.
+
+An assignment-only or redirect-only operation leaves policy coverage
+undetermined even alongside an allowed command; an explicit deny or rejection
+still takes precedence. Assignment and redirection effects require authorization
+beyond argv matching.
+Comment-only input introduces no command or shell-state effects and can return
+`ALLOW` with zero subjects. The eligible empty `time` forms are described in the
+[shell model reference](docs/shell-model.md#groups-pipelines-background-execution-and-timing).
+
+### I/O effects and additional signals
+
+Policy matching and I/O authorization are separate decisions:
+`git status --short >report.txt` has the same command arguments as the plain
+form. The redirection can create or truncate `report.txt` during setup, even
+when the command produces no output. The graph represents reached setup effects
+and possible output routes. Applications enforcing file access rules inspect
+Shellsplit's graph directly.
+
+For that command, the graph contains these relationships:
+
+```text
+FD(0) --READ(target_fd=0)--> CMD[git status --short]
+CMD[git status --short] --WRITE(source_fd=1)--> FILE[report.txt]
+CMD[git status --short] --WRITE(source_fd=2)--> FD(2)
+```
+
+`FD(n)` is an inherited full-command descriptor resource. These edges describe
+possible byte-flow routes; program behavior determines whether bytes travel.
+Opening `report.txt` during redirection setup can create or truncate it even
+when no bytes traverse the `WRITE` edge. Obtain these facts through Shellsplit's
+[`shell_depgraph.h`](shellsplit/include/shell_depgraph.h)
+interfaces, using the same source and initial CWD. Use
+`shell_dep_graph_parse_resolved()` when supplying word-resolution facts, keeping
+those facts consistent with policy evaluation. The
+[graph guide](shellsplit/README.md#graph-io-and-state-facts) distinguishes byte
+routes from setup effects, including overwritten redirects.
+
+Violation findings are advisory signals that the application can incorporate
+into its decision. Anomaly scores measure how unusual an execution-stage
+sequence is relative to the learned model. Its entries include simple commands
+in lists and nested substitutions, plus redirect-only operations and empty timed
+pipelines. This analysis sequence differs from runtime scheduling and from the
+commands eligible for argv-policy evaluation. Applications can use higher scores
+to prioritize additional risk analysis. These signals have separate meanings
+from the policy verdict.
+
+Execution must use the pinned Bash version with the documented startup state.
+The [security model](SECURITY.md) defines executor preparation, substitution
+inspection, filesystem responsibilities, and pre-1.0 deployment guidance.
+
+## Supported shell model
+
+The reference executor is **Bash 5.3.20**, pinned in
+`scripts/reference-bash.sha256`. The analysis assumes that the application
+executes the submitted source in a fresh, noninteractive shell. CI and
+pre-push verification use that same reference.
+
+| Area | Current analysis support |
+|---|---|
+| Composition | Lists, `&&`, `\|\|`, pipelines including `\|&`, `!`, `time`, background execution |
+| Groups and I/O | Brace and subshell groups, redirects, descriptor copies, moves and closes, named file descriptors, heredocs and here-strings |
+| Expansions | Quoting, parameters, substitutions, globs/extglob, arithmetic restricted to numeric literals and operators with bounded nesting |
+| Unsupported constructs | `if` constructs, loops, `case`, `select`, `coproc`, functions, arrays, `[[ … ]]`, `(( … ))`, and the builtin forms listed in the reference |
+| Runtime uncertainty | Represents multiple possible outcomes and reports unresolved arguments and paths explicitly |
+
+Shellgate's default rejection mask additionally rejects arithmetic, heredocs,
+and here-strings. An application may adjust that mask for supported constructs;
+unsupported semantics still cause rejection. Extglob requires executor startup
+configuration before Bash parses the command.
+
+The [shell model reference](docs/shell-model.md) describes supported behavior,
+startup requirements, substitutions, builtins, I/O, working-directory facts,
+and capacity limits. Updates to the reference Bash version include conformance
+tests and the required model adaptations.
+
+## Build and install
+
+Library consumers need CMake 3.20+, a C11 compiler, a C++11 compiler, pthreads,
+and libm.
+Dependencies are pinned submodules; initialize them when cloning.
 
 ```sh
 git clone --recurse-submodules https://github.com/panz-r/shellclave.git
 cd shellclave
-reference_bash=$(./scripts/prepare-reference-bash)
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
-  -DSHELLCLAVE_BASH_EXECUTABLE="$reference_bash"
-cmake --build build
-ctest --test-dir build --output-on-failure
+  -DBUILD_TESTING=OFF -DSHELLCLAVE_BUILD_TOOLS=OFF
+cmake --build build --parallel 2
 cmake --install build --prefix "$PWD/install"
 ```
 
-If the clone already exists, initialize dependencies with
-`git submodule update --init --recursive`. CMake builds write
-`compile_commands.json` into the build directory for `cppr`, other
-static-analysis tools, and editor integrations.
+With submodules available locally, this build needs neither reference Bash nor
+network access. For an existing clone, run
+`git submodule update --init --recursive` to obtain missing dependencies.
 
-Test builds use one pinned executor, Bash 5.3.20. The helper downloads the
-official release and ordered patches using the checksums in
-`scripts/reference-bash.sha256`; it caches the build on disk without replacing
-the system shell. It requires curl, patch, make, a C compiler, and flock.
-`scripts/verify-push` prepares and uses the same reference automatically.
-`BUILD_TESTING=OFF` builds the libraries without Bash or network access.
-To upgrade the modeled Bash version, update the manifest, rerun every
-conformance probe, and include any semantic corrections in the same changeset.
-Older and newer Bash versions are not additional supported dialects.
-
-Useful options are `BUILD_TESTING`, `SHELLCLAVE_BUILD_TOOLS`,
-`SHELLCLAVE_BUILD_FUZZERS`, `SHELLCLAVE_ENABLE_COVERAGE`,
-`SHELLCLAVE_ENABLE_SANITIZERS`, and `SHELLCLAVE_ENABLE_TSAN`.
-
-## Minimal API examples
-
-Parse without allocation:
-
-```c
-#include <shell_tokenizer.h>
-#include <string.h>
-
-shell_parse_result_t parsed;
-shell_limits_t limits = SHELL_LIMITS_DEFAULT;
-limits.strict_mode = true;
-const char command[] = "printf '%s\\n' ok";
-shell_error_t error = shell_parse_fast(command, strlen(command), &limits, &parsed);
-```
-
-Use each component directly for the information it owns: Shellsplit's dependency
-graph represents groups, background execution, timing, and substitution edges;
-Shellgate returns policy verdicts, dynamic-content flags, diagnostics, and I/O
-context, not a second graph representation. For policy editors, convert CPL with
-`st_netpattern_from_cpl_owned()`, decode once with `st_netpattern_decode_view()`,
-and reuse that token array with Shelltype's `st_token_variants_at()`.
-Public result fields such as `violation_dropped_count`, `display_text`, and
-`has_transformations` are accessed directly. Diagnostic display text is lossy;
-use canonical netargv for programmatic command data.
-
-Learn command shapes:
-
-```c
-#include <shelltype.h>
-#include <stdio.h>
-#include <stdlib.h>
-
-st_learner_t *learner = st_learner_new(&(st_learner_config_t){.min_support = 2, .min_confidence = 0.5});
-if (learner != NULL) {
-    static const char status[] = "3:git,6:status,7:--short,";
-    static const char log[] = "3:git,3:log,9:--oneline,";
-    (void)st_learner_feed_netargv_view(learner, (st_netargv_view_t){status, sizeof(status) - 1});
-    (void)st_learner_feed_netargv_view(learner, (st_netargv_view_t){status, sizeof(status) - 1});
-    (void)st_learner_feed_netargv_view(learner, (st_netargv_view_t){log, sizeof(log) - 1});
-
-    size_t count = 0;
-    st_suggestion_t *suggestions = st_learner_suggest(learner, &count);
-    for (size_t i = 0; i < count; ++i) {
-        char *cpl = NULL;
-        if (st_netpattern_to_cpl_view((st_netpattern_view_t){suggestions[i].pattern, suggestions[i].pattern_length}, &cpl) == ST_OK) {
-            printf("%s (count=%u, confidence=%.2f)\n", cpl,
-                   suggestions[i].count, suggestions[i].confidence);
-            free(cpl);
-        }
-    }
-    st_suggestion_list_free(suggestions, count);
-    st_learner_free(learner);
-}
-```
-
-Evaluate a gate rule:
-
-```c
-#include <shellgate.h>
-#include <stdint.h>
-#include <stdlib.h>
-#include <string.h>
-#include <stdio.h>
-
-sg_gate_t *gate = sg_gate_new();
-st_policy_ctx_t *context = st_policy_ctx_new();
-st_policy_t *allow = context ? st_policy_new(context) : NULL;
-st_policy_ctx_release(context);
-st_netpattern_t pattern = {0};
-const char command[] = "git status --short";
-sg_result_t result;
-if (gate != NULL && allow != NULL) {
-    st_error_t policy_error = st_netpattern_from_cpl_owned(
-        "git status #opt", &pattern);
-    if (policy_error == ST_OK)
-        policy_error = st_policy_add_netpattern_view(
-            allow, (st_netpattern_view_t){pattern.data, pattern.length});
-    if (policy_error == ST_OK) {
-        sg_gate_set_allow_policy_owned(gate, allow);
-        allow = NULL; /* ownership transferred; installed policies are immutable */
-        size_t output_size = sg_gate_evaluate_size_hint(strlen(command));
-        char *output = output_size == SIZE_MAX ? NULL : malloc(output_size);
-        sg_error_t error = output == NULL ? SG_ERR_MEMORY :
-            sg_gate_evaluate(gate, command, strlen(command), output,
-                             output_size, &result);
-        if (error == SG_OK) {
-            printf("verdict: %d\n", result.verdict);
-        }
-        free(output);
-    }
-}
-st_netpattern_free(&pattern);
-st_policy_free(allow);
-sg_gate_free(gate);
-```
-
-Ownership, destruction, and concurrency contracts are documented in the public
-headers.
-
-Use each component directly: Shellsplit parses and constructs dependency graphs,
-Shelltype builds and persists policies, and the anomaly API inspects models.
-Shellgate combines those capabilities for evaluation; it does not duplicate their
-management APIs. Build a replacement policy before installing it. Gates normally
-own policies, but `sg_gate_new_with_policies_borrowed()` supports sharing stable
-policies without copying. Borrowers must detach and readers finish before the
-owner frees or replaces a shared policy. Policy views from Gate are read-only.
-
-## Canonical machine boundaries
-
-Shellclave uses canonical netstrings whenever values cross a machine-facing
-API boundary. A `netargv` is a concatenation of netstrings, one per argument;
-a `netsequence` is an outer concatenation whose records each represent one
-isolated subcommand. This preserves empty arguments, whitespace, punctuation,
-and nested per-command type signatures without quoting heuristics.
-
-Shellsplit remains the shell-language boundary: use the binary-safe
-`shell_build_netargv_sequence_buffer()`,
-`shell_build_command_netseq_buffer()`, or
-`shell_build_type_netseq_buffer()` to turn shell source into canonical records
-for all canonical transport. Canonical APIs require explicit byte lengths;
-the former NUL-free C-string adapters have been removed. Shelltype consumes
-`st_netargv_view_t` and `st_netpattern_view_t`, and owns encoded patterns in
-`st_netpattern_t`. Build and edit policies through Shelltype using
-`st_netpattern_view_t` (or arrays of views for batches). CPL and shell source
-remain text interfaces. Initialize owned outputs to `{0}` and use the
-documented release function before reusing their storage.
-The context-free `st_token_classify(text, length)` also accepts borrowed,
-unterminated spans and embedded NULs; NULL is meaningful only for an empty
-span. Anomaly n-gram count queries use `sg_anomaly_item_view_t` through the
-`*_count_view()` APIs, not C-string adapters. Empty stages represent argv-less
-commands and are distinct from missing observations.
-Shellsplit's shared `shell_expand_word_netargv_fn` callback consumes an exact
-source-word request and returns canonical, explicit-length `netargv`. Requests
-identify the argument, redirect-path, or file-substitution-path purpose and the
-known execution CWD. Use `shell_dep_graph_parse_resolved()` directly for graph
-analysis, or register the same callback with `sg_gate_set_expand_word_netargv()`
-for combined evaluation. The request and borrowed CWD are callback-scoped;
-returned netargv storage must remain immutable until evaluation returns, or
-for the lifetime of a standalone graph that borrows it. Size standalone
-resolution workspace with `shell_dep_resolved_workspace_size()`. Shell-state
-operands remain protected, including `printf %b` data in `%n`-bearing formats;
-assignment-shaped tilde words (`name=~`, `name+=~`, `name=a:~`) are dynamic
-arguments and FILE operands, but here-string data does not use that rule.
-Unresolved dynamic FILE operands do not have a concrete path identity; spelling
-heuristics may still apply. CWD tracking distinguishes actual leading-tilde
-expansion from quote-disabled forms such as `~""/child`. Literal relative paths
-remain subject to CDPATH, while `./~""/child` is a known literal relative path.
-Protected dynamic formats and assignment values still participate in shell-state
-analysis; they cannot leave a named-FD binding falsely established.
-`unresolved_expansion_flags` distinguish unresolved argv and paths even when a
-policy matches their processed source. Aggregate flags cover the retained graph,
-including commands omitted by policy early-stop or diagnostic truncation;
-per-command flags include inherited group I/O. A truncated graph cannot describe
-unretained commands. Its anomaly APIs accept canonical
-`netsequence` values. Human-facing CPL conversion remains explicit through
-Shelltype in applications and CLI tools. See
-[docs/canonical-formats.md](docs/canonical-formats.md) for the wire contracts.
-
-For each `sg_subcommand_result_t`, `netargv` and `netargv_length` are the
-authoritative programmatic result. `display_command` is a space-joined
-diagnostic display and is deliberately not reparsable; applications must decode the
-netargv records with `shell_netstring_iter_t` when they need argument values.
-
-The evaluation-buffer size hint is an initial source-based estimate. Large
-resolved path values can require additional private scratch and identity
-storage in that same buffer. Insufficient workspace returns `SG_ERR_MEMORY`
-with an undetermined verdict; it never silently skips known-path analysis.
-Grow the buffer and retry. Failed attempts do not update anomaly learning.
-Anomaly stage construction reuses complete graph semantic validation, including
-context-dependent `read` options; enabling scoring does not apply a second,
-context-free support check. Partial parses or graphs are not scored, cached,
-or learned from, and retain their undetermined truncation result.
-Path-related violation details copy resolved targets into the result buffer as
-`resolved "<value>" (source "<spelling>")`, escaping quotes, backslashes, control
-bytes and non-ASCII bytes. Source-only details retain their previous spelling.
-Long resolved targets can therefore also require additional result space;
-insufficient result space returns `SG_ERR_TRUNC`, not an allowed verdict.
-
-Graph construction propagates known command-substitution outcomes separately
-from captured bytes. Assignment-only commands normally use the last executed
-substitution's status. Bash executes an argv-less command's redirection setup
-in a child when any redirect targets fd 0 or a named descriptor; successful
-setup then returns success, independent of substitution statuses. Assignment
-expansion still belongs to the parent, while redirect expansion errors remain
-local to that child. Ordinary commands retain their own execution status.
-Known failures suppress impossible conditional effects and callbacks. Runtime
-unknown or conditional substitutions retain the possible outcomes; resolving a
-pathname does not prove that opening the file will succeed.
-
-Bash descriptor moves (`n>&m-` and `n<&m-`) preserve both the copied route
-and the reached source close. Moves can use tracked allocated descriptors
-such as `3>&${fd}-`. Scope restoration follows Bash's destination-open and
-named-allocation behavior, including later setup failures. Quotation remains
-significant: `"3"-` is a move operand, whereas `"3-"` is an ordinary word.
-Shellsplit exposes compound moves as one `SHELL_GROUP_IO_MOVE_FD` operation;
-static invalid duplication operands use `SHELL_GROUP_IO_FAILED_REDIRECT`.
-Self-moves compare physical descriptor identity, including named sources.
-Unsaved source closes leave persistent compound-body reopens intact. External
-commands reached directly or through chains of `command` wrappers apply
-redirects in a child, preserving parent descriptors and named variables.
-A reached `builtin` wrapper performs setup in the current shell, even when an
-inner `command` executes an external program. Builtins and compound tails apply
-redirects in the current shell. Rebinding a named descriptor leaves its earlier
-allocations open. Temporary redirects restore the state after any allocations
-made earlier in the same setup list.
-Restoration reads live physical scratch slots and disposes each save in undo
-order. This preserves routes when later moves, allocations, or closes overlap
-those slots; compound completion and timing reports use the same unwind rules.
-If a saved descriptor has been closed, its failed restoration stops that undo
-list, leaving the target unchanged and older saves live. Cleanup diagnostics
-do not change the command body's status; enclosing scopes still run their own
-independent cleanup lists.
-
-The dependency graph exposes the full command's inherited I/O resources as
-`SHELL_NODE_FD` nodes, identified by `node.fd.number`. Ordinary executable
-commands have potential stdin, stdout, and stderr routes by default. READ/WRITE
-edges carry the command-local descriptor on the execution side and
-`SHELL_DEP_FD_NONE` on the boundary-resource side. These describe shell routing,
-not a prediction that a particular executable transfers bytes.
-
-Builtin `read` has a more precise input model: each execution path uses fd 0
-or its selected `-u` descriptor. Timeout-zero polling and zero character counts do
-not transfer input bytes. Unused redirects retain setup effects.
-Conditional process-substitution descriptors retain both execution and skip
-paths where their state is observable; unobserved ends do not force enumeration
-of independent guard combinations. Timing and restored historical closes do
-not independently enable that tracking. Substitutions nested in parameter words
-retain original-pipe fallback when high descriptors are occupied.
-Allocation preserves the occupancy conditions for both moved and retained pipe
-ends. Named-FD allocation and shell-owned descriptor saves use those same joint
-conditions; mutually exclusive free slots cannot become an impossible new route.
-Private symbolic selectors retain allocation identity from creation through
-close, reuse, and recursive imports without enumerating hidden numeric choices.
-Closed named variables keep their numeric values; the existing model above fd
-63 remains conservative.
-Imported aliases of the same selected slot stay aliases in child shells:
-closing either closes the shared slot there, while parent bindings remain
-unchanged. Descriptor scope isolation does not imply independent input offsets;
-child reads can consume bytes through a shared open-file description.
-Unrelated commands do not increase enumeration pressure. Descriptor-sensitive
-`read` outcomes keep their executing and skipped paths distinct through `&&`
-and `||`, including reads without redirects and private pipeline stages.
-Each reached `-u` preserves its descriptor-existence proof on the appropriate
-continuations, without pretending that validation opens or consumes the stream.
-Inherited and command-local input alternatives retain separate provenance.
-Unknown numeric `read` operands retain invalid-number failures as well as valid
-zero/nonzero outcomes. An early option error cannot inherit later FD validation
-or target writes, and its fallback command's I/O remains visible.
-Invalid literal target prefixes remain invalid across scalar expansion:
-`read -- -p"$fd" value` fails before input or assignment. Captured-empty values
-also refine invalid suffixes; later target errors retain only earlier writes,
-and timeout-zero polling still bypasses target validation.
-Captured allocation digits refine signed count, timeout, and descriptor
-operands too: applying a minus sign to those digits fails before input or
-assignment.
-Negative nonzero integer prefixes remain invalid across arbitrary suffixes.
-For proven single arguments, invalid integer suffixes also survive unknown
-fragments: `read -n"$unknown"x` fails before input or assignment, rather than
-requesting a runtime descriptor resolver or inventing a successful read.
-Timeout operands retain their completed conversion after the seventh fractional
-character decides rounding: `-t0.0000000"$unknown"` is polling for every suffix,
-without input or target assignments. Incomplete conversions remain unknown.
-Scalar expansions end leading-tilde recognition, so `$empty~` contains a literal
-tilde, not a home-directory expansion. Single-argument target shape proofs cover
-invalid literal suffixes such as `pre"$unknown"-`. They account for a possible
-`NAME[...]` envelope: a pathname can occur inside an expanded subscript, so a
-slash alone does not prove failure. Explicit array targets remain unsupported.
-Producers still execute even if read rejects their pathname arguments.
-Unresolved splitting or list expansion does not establish a single-target failure.
-Argument values are captured before redirects; effective option roles are
-validated after setup. For example, `unset fd; read -p"$fd" -e value` uses `-e`
-as prompt data, not a Readline selector. Actual Readline/array options remain
-unsupported on any reachable option path.
-Known-empty scalar fragments leave literal target identities (`other"$empty"`
-assigns only `other`), preserving unrelated bindings and IFS. Arithmetic target
-restrictions apply only to reachable assignments, not targets following an
-earlier argument or descriptor failure.
-Stable scalar unsets can establish empty captured values; Bash-updated variables
-such as `$_` remain unknown, so `unset _; : 1; read -n"$_" value <<<payload`
-retains its possible input. Bulk writes reset the immutable named-binding map
-without scanning all observed names or closing physical descriptors. Temporary
-prefix exclusions and setup-failure restoration preserve their own bindings.
-Assignment effects stay attached to their read outcome: a successful polling
-path does not inherit writes from a failing zero-count path. Synchronous
-command and backtick substitutions return observations of unchanged inherited
-descriptors, not child mutations or facts about child-installed capture pipes.
-Their outcomes retain imported argument value classes and allocation-site
-identity, including option failures before any physical FD is checked. Each
-dependency is captured lazily from the immutable imported entry and memoized
-per execution version; child entry never scans unrelated sibling read names.
-A failed probe of an absent named binding cannot become a failure of a different,
-successfully allocated binding. For example, success of
-`value=$(read -u11 -n0 probe)` proves fd 11 exists for its `&&` continuation.
-Success of `printf '%s' "$(read -u11 -n0 probe)"` does not prove the read
-succeeded; `printf` supplies that command's status.
-Completed command-local argument captures and substitution status do not become
-history carried by later commands. A nonmutating executable with no descriptor
-setup rejoins its original entry after consuming substitution values; reads,
-assignment-only commands, and persistent effects retain their selecting facts.
-Deferred I/O publication uses separate immutable execution snapshots.
-Conditional substitutions preserve the skipped path's preceding status, not
-the status of an execution that did not occur. Substitutions in the same
-conditional operand share one execute/skip decision, including nested operands.
-Only guards with an actually tracked process-descriptor dependency survive
-their operand; syntax containing a process substitution is not itself such a
-dependency. Remaining pipe guards retire with their owning command.
-An observation on an executed path cannot establish descriptor availability
-on a skipped path; representative route tables are not descriptor proofs.
-Ordinary and file-optimized substitutions replace completion status without
-erasing earlier observations. Empty or blank substitutions (space, tab, LF and
-erased backslash-LF continuations) preserve the current command's preceding
-substitution status, as does comment-only
-`$()`; comment-only backticks return success. For example,
-`a=$(false) b=$()` fails, but `false; value=$()` ends successfully: a new
-assignment-only command does not inherit the previous command's status.
-Comments end at LF, not CR. Literal CR, vertical tab and form feed are not
-semantic blank bytes: they remain ordinary word bytes, including CR before LF.
-Only backslash-LF is a continuation. No CRLF normalization is performed;
-heredoc delimiters and document bytes retain CR as well.
-An empty process substitution is different: `<()` and `>()` produce no pathname
-and an unquoted word made entirely of them vanishes from argv. Thus `<() read
--u3 value` selects `read`, and `a<()b` has the static value `ab`. Quoted empty
-fragments still preserve an argument. This expansion does not reopen lexical
-assignment or reserved-word recognition: `<() name=value` is a command word,
-not an assignment prefix. Lexical processor tokens and diagnostic views retain
-the source; graph command tokens and canonical argv omit wholly elided words.
-Resolver argument roles use those same surviving positions while retaining
-original request offsets, including `printf`'s protected `%b`/`%n` operands.
-Declaration operands are recognized after that elision: `export fd<()=value`
-writes `fd`, and integer/protected/readonly declarations retain their usual
-supported-syntax restrictions. This does not change lexical assignment-prefix
-recognition. The structured processor omits wholly elided stages; the flat
-processor retains their diagnostic records and places group-redirection flags
-on the final member with a surviving argument.
-Private execution returns its outcome to the corresponding parent alternative,
-without publishing child descriptor or variable mutations. Bash's own fork
-cleanup is separate: forking a compound closes the parent's original
-process-substitution ends, while the child inherits the open descriptors.
-Explicit duplicates survive that cleanup. Ordinary byte reads retain unknown
-EOF/error outcomes rather than predicting available input from graph topology.
-Later reads must not assume descriptors
-were created or remain open after their command finishes. Empty process
-operands in file substitutions are valid syntax with a failing file read. See the
-[Shellsplit builtin contracts](shellsplit/README.md) for named-FD selection,
-argument expansion ordering, and unsupported runtime descriptor expressions.
-
-`cd` is always an ordinary CMD node with its I/O and CWD relation. Shellsplit
-also tracks directory changes for subsequent commands; `cd`'s own arguments
-and redirects use its incoming directory. The former `cd_as_cmd` limits field
-has been removed in 0.15.0: remove its initialization and rebuild consumers.
-
-For `wc -l file.txt 2>&1`, follow the WRITE edge with `source_fd == 2`: its FD
-target has `fd.number == 1`. For the unredirected command that target is 2.
-Source order is preserved: `2>&1 >out` still sends stderr to inherited stdout,
-whereas `>out 2>&1` sends both outputs to `out`. Nested scopes share the same
-full-command boundary; captures and pipes retain their separate identities.
-Boundary resources are not internal producer/consumer bridges. They count
-toward the documented node/edge limits; missing capacity reports truncation.
-
-Byte-flow edges also retain shell-owned expansion, redirect-setup and undo diagnostics on
-the existing CMD/GROUP owner's fd 2. They use stderr at the failure point, even
-when the command body does not execute. For example, in
-`exec 3>&-; sh -c "$(echo 2>&1 >&3)"`, the setup error enters the substitution
-capture and requires inspection. Reordering the redirects leaves that capture
-empty. Possible open failures retain alternatives without predicting an OS
-failure; closed or read-only stderr supplies no diagnostic bytes.
-Argument/RHS expansion diagnostics use incoming stderr, while redirect operands
-and expandable heredocs use the reached redirect prefix. Thus
-`sh -c "$(exec 2>&1; x=$((1/0)))"` retains a SUBST flow requiring inspection,
-including when later redirects close the command's outputs.
-Optimized `$(<file)` reads preserve the same diagnostic routes independently
-of their file-content flow. Resolving an empty filename removes the content
-edge, but its captured open error still marks the outer receiving command for
-inspection. A filename resolution callback establishes the filename, not I/O
-success.
-
-Successful argv-less assignments such as `$(x=1)` do not produce captured body
-output. Their ENV effects, explicit redirect setup, and pipeline connections
-remain represented. Known readonly-assignment errors use stderr before the
-command's own redirects: `UID=1` aborts its input unit without applying them,
-while `UID=1 true` can still run `true`. Thus
-`sh -c "$(exec 2>&1; UID=1 true 1>&- 2>&-)"` still requires inspection of the
-captured diagnostic, despite the body closing both outputs.
-Rejected temporary prefix assignments skip their RHS expressions; assignment-only
-and export forms still expand them. Rejected writes do not create effective ENV
-edges, while successful neighboring assignments remain represented.
-Later assignment RHS substitutions see earlier prefix assignments, including
-temporary prefixes of an executable command, during ordinary scalar argument
-lookup. Bash's redirection expansion and IFS splitter instead retain the shell
-binding table; Shellsplit keeps these value and routing contexts separate.
-This distinction follows post-expansion argv: in
-`UID=$(printf 1) $(true)`, the command word can disappear and the RHS executes
-before rejection. Shellsplit retains that possible flow. Quoted empty scalar
-words and a later guaranteed argument instead preserve executable dispatch.
-
-Parameter pattern removal, replacement and case-conversion operands may skip
-their substitutions for unset or empty values. Their analysis preserves the
-incoming status as well as the possible substitution outcome.
-
-## CMake consumption
-
-Embedded use:
-
-```cmake
-add_subdirectory(path/to/shellclave)
-target_link_libraries(example PRIVATE Shellclave::shellgate)
-```
-
-Installed use:
+Using the installed package:
 
 ```cmake
 find_package(Shellclave CONFIG REQUIRED)
 target_link_libraries(example PRIVATE Shellclave::shellgate)
 ```
 
-The other exported targets are `Shellclave::shellsplit` and
-`Shellclave::shelltype`.
+Pass `-DCMAKE_PREFIX_PATH=/path/to/install` when configuring the application.
+To include Shellclave in a parent CMake project, use
+`add_subdirectory(path/to/shellclave)` and the same target names. Set
+`BUILD_TESTING=OFF` before adding the subdirectory for a library-only build.
+The other targets are `Shellclave::shellsplit` and `Shellclave::shelltype`.
 
-## Hardening and fuzzing
+Contributor builds prepare the pinned reference and run conformance tests;
+see [Contributing](CONTRIBUTING.md).
 
-```sh
-cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug \
-  -DSHELLCLAVE_ENABLE_SANITIZERS=ON
-cmake --build build-asan
-ctest --test-dir build-asan --output-on-failure
+## Gate example: inspect evaluation results
 
-cmake -S . -B build
-cmake --build build --target clang-analyze
+The [complete program](examples/gate_policy.c) builds small illustrative policies
+and analyzes ten submitted inputs. It reports the policy verdict and each
+independent analysis condition, including cases where several occur together.
+An application combines these results with graph-based I/O checks and its
+execution controls before authorizing execution. This program only analyzes
+and reports the inputs.
 
-cmake -S . -B build-fuzz -DCMAKE_C_COMPILER=clang \
-  -DCMAKE_CXX_COMPILER=clang++ -DSHELLCLAVE_BUILD_FUZZERS=ON \
-  -DBUILD_TESTING=OFF
-cmake --build build-fuzz --target fuzz-smoke
-```
+The rule strings use CPL, Shelltype's human-readable policy notation for argument
+sequences. Bare words specify literal arguments, and `*` matches exactly one
+argument of any type. Shelltype interprets CPL patterns; Bash interprets the
+submitted shell source. See [CPL syntax](docs/canonical-formats.md#netpattern-and-cpl)
+for the full policy notation.
 
-Sanitizer and fuzz builds compile UBSan checks as non-recovering: detected
-undefined behavior prints its diagnostic and fails the process, even if
-`UBSAN_OPTIONS` requests recovery. No environment setting is needed to make
-these findings fail CI, pre-push verification, or direct test runs.
+The Git rules demonstrate exact matches; the `echo` and `whoami` rules let the
+remaining cases demonstrate unresolved values and substitution inspection.
 
-The `fuzz-smoke` target runs the unified Shellsplit fuzzer, the Shelltype
-canonical-format and policy fuzzer, and the Shellgate fuzzer. The Shellsplit
-fuzzer exercises all Shellsplit parser and helper APIs from that single target.
-Fuzz builds require Python 3.8 or newer. The shared standard-library supervisor
-gives each smoke process a fixed 15-minute deadline, including initialization
-and symbolization, in CI and pre-push verification as well as direct target
-runs. The per-input limit remains ten seconds. Startup-only tests have a
-60-second process deadline. Timeout or cancellation terminates the private
-process group, allowing five seconds before killing remaining descendants.
-Only disposable generated corpora are removed; selected seeds and crash
-artifacts are preserved. Timeout exits with status 124.
-
-Run the Clang Static Analyzer:
+Build and run [the example](examples/gate_policy.c):
 
 ```sh
-cmake -S . -B build-analyze
-cmake --build build-analyze --target clang-analyze
+cmake -S . -B build -DBUILD_TESTING=OFF -DSHELLCLAVE_BUILD_TOOLS=ON
+cmake --build build --target shellclave_gate_example --parallel 2
+./build/shellclave_gate_example
 ```
 
-The target first verifies analyzer interception with clean and defective C/C++
-fixtures, then configures and rebuilds first-party code through `scan-build`
-compiler wrappers. Diagnostics fail the target and pre-push verification. Existing
-ordinary-compiler caches are migrated automatically. Reports and temporary
-analysis files stay under the build directory.
+The result-reporting excerpt below checks errors before accessing metadata and
+marks incomplete coverage before presenting the reported verdict. The complete
+source includes policy construction, the `sg_gate_evaluate()` calls, and result
+buffer cleanup. The executable's exit status reports whether the demonstration
+completed.
 
-The fixed smoke seed corpora are tracked. Generated fuzzing corpora and
-coverage reports stay in build directories and are ignored. Crash artifacts
-are deliberately neither ignored nor tracked: a new crash appears in
-`git status` for inspection and triage.
+<!-- gate-example:start -->
+```c
+/* Report policy and independent conditions; application authorization is
+ * separate. On error, result storage need not contain initialized metadata. */
+static SHELL_NONNULL(1, 2, 4) void report_analysis(FILE *output,
+                                                   const char *source,
+                                                   sg_error_t error,
+                                                   const sg_result_t *result) {
+  fprintf(output, "%s: ", source);
+  if (error != SG_OK) {
+    fprintf(output, "evaluation failed (%d)\n", error);
+    return;
+  }
+  if (result->truncated || result->short_circuited)
+    fputs("incomplete evaluation; reported ", output);
+  fprintf(output, "argv policy %s", sg_verdict_name(result->verdict));
+  if (result->requires_substitution_evaluation)
+    fputs("; substitution inspection required", output);
+  if (result->unresolved_expansion_flags & SG_EXPANSION_UNRESOLVED_ARGV)
+    fputs("; unresolved argv", output);
+  if (result->unresolved_expansion_flags & SG_EXPANSION_UNRESOLVED_PATH)
+    fputs("; unresolved pathname", output);
+  if (result->has_dynamic_substitution_io)
+    fputs("; dynamic substitution I/O present", output);
+  fputc('\n', output);
+}
+```
+<!-- gate-example:end -->
 
-Coverage builds select one implementation variant with
-`SHELLCLAVE_COVERAGE_VARIANT=tests` (the default) or `production`.
-Use separate, fresh build directories for the two profiles. Test executables
-and inline-helper tests remain instrumented, but only the selected library
-variant emits counters. Allocation/I/O fault seams change compiler block
-identities; merging their counters with production produces duplicated,
-incompatible branch graphs. CI retains the existing coverage gates for the
-test profile and publishes a separate production report from production-linked
-parser, policy, persistence, and end-to-end corpus contracts. Both profiles
-use gcovr 8.6; production reports are not substituted for the gated test report.
+Example output:
 
-Build and run the production suite in its separate coverage build directory:
-
-```sh
-cmake --build build-production --parallel 2 --target shellclave_production_tests
-ctest --test-dir build-production -L '^production$' --no-tests=error --output-on-failure
+```text
+git status --short: argv policy ALLOW
+git reset --hard: argv policy DENY
+git log --oneline: argv policy UNDETERMINED
+if true; then :; fi: argv policy REJECT
+echo "$(whoami)": argv policy ALLOW_CONDITIONAL; substitution inspection required; unresolved argv; dynamic substitution I/O present
+echo "$VALUE": argv policy ALLOW; unresolved argv
+echo ok >"$OUT": argv policy ALLOW; unresolved pathname
+git status --short >report.txt: argv policy ALLOW
+echo "$(whoami)" >"$OUT": argv policy ALLOW_CONDITIONAL; substitution inspection required; unresolved argv; unresolved pathname; dynamic substitution I/O present
+echo ok < <(whoami): argv policy ALLOW; dynamic substitution I/O present
 ```
 
-Register production-linked coverage tests with `shellclave_add_production_test()`
-in CMake. That helper adds the shipping library's component label, the
-`production` label, and the aggregate build dependency together. Tests already
-registered with another suite, such as policy-sharing concurrency, use
-`shellclave_register_production_test()`; that generic helper adds only production
-membership, so its caller must retain the component and other suite labels.
-`shellclave_test_suite_contract` checks that build and test memberships agree
-and that every production test retains its component label. CI uses the same
-aggregate and label, so it builds every executable it selects.
+The redirected `git status` command receives `ALLOW` because its arguments match
+the policy. Creating or truncating `report.txt` requires separate application
+authorization before execution.
 
-## Dependencies
+The process-substitution case has dynamic I/O without shell-word inspection.
+The nested `whoami` command participates in argv-policy matching, while its
+process-substitution stream introduces a separate I/O relationship.
+`has_dynamic_substitution_io` identifies topology; the application determines
+the receiving role and its authorization requirements. The combined substitution
+and pathname case retains every condition, so inspecting generated word content
+alone leaves the unresolved pathname to be addressed separately.
 
-Pinned submodules under `deps/` provide draugr and xxHash. Normal builds never
-download dependencies. Parent projects may provide existing `draugr`,
-`xxhash`, or `xxHash::xxhash` targets before adding Shellclave. Revisions and
-licenses are recorded in [THIRD_PARTY.md](THIRD_PARTY.md).
+Check the return code before interpreting result metadata. If evaluation failed
+because the supplied buffer was too small, enlarge it within application limits
+and retry. Exceeding a fixed parser or graph limit requires reducing or refusing
+the input. Failed evaluations retain their error status even when diagnostic
+text also overflows.
 
-Contributions are described in [CONTRIBUTING.md](CONTRIBUTING.md).
+Result-string pointers refer to storage in the caller-provided evaluation
+buffer. Read or copy the strings before freeing or reusing that buffer. The
+public headers specify ownership, supported inputs, and concurrency requirements.
+
+## Component interfaces
+
+Use each component directly for the operation it owns:
+
+For pre-dispatch syntax rejection with a separate review path for unsupported
+source, use Shellsplit's [typed source admission](shellsplit/README.md#classifying-input-before-dispatch).
+The [compiled example](examples/source_admission.c) distinguishes these cases
+from incomplete input and resource failures. Unsupported analysis requires an
+application decision; it does not establish valid Bash or execution permission.
+
+| Component | Main interfaces | Reference |
+|---|---|---|
+| Shellsplit | Bounded parsing, retained drafts, canonical arguments, dependency graphs, word-resolution callbacks | [Shellsplit guide](shellsplit/README.md) |
+| Shelltype | Argument type classification, pattern learning, policy construction, matching and persistence | [Public API](shelltype/include/shelltype.h) |
+| Shellgate | Combined evaluation, policy verdicts, advisory findings, anomaly integration | [Public API](shellgate/include/shellgate.h) |
+| Anomaly API | Models, scoring, calibration and persistence | [Anomaly guide](shellgate/docs/ANOMALY.md) |
+
+Netstrings encode byte payloads with explicit lengths. A netargv concatenates
+one netstring per argument. A netsequence concatenates outer netstrings; in an
+argv sequence, each outer payload is one complete netargv. Use
+`shell_build_netargv_sequence_buffer()` for that representation. The anomaly
+builders instead produce executable-name or typed execution-stage payloads.
+See [Canonical formats](docs/canonical-formats.md) for each variant.
+
+Canonical describes the encoding; argument values can still contain unresolved
+source spelling. Shelltype accepts explicit-length views of canonical argument
+data. `display_command` and other display strings are human-readable diagnostics.
+Use `netargv` and `netargv_length` for programmatic argument handling.
+
+Treat installed policy rules as immutable. Build an updated policy through
+Shelltype, then install it as a replacement. Gates can own policies or borrow
+policies shared by several gates. The owner must keep a shared policy alive
+until every borrowing gate has detached and every reader has finished using it.
+
+## Further reading
+
+- [Security model and vulnerability reporting](SECURITY.md)
+- [Shell semantics and execution model](docs/shell-model.md)
+- [API migration notes](docs/migration.md)
+- [Contributor builds and verification](CONTRIBUTING.md)
+- [Dependencies and licenses](THIRD_PARTY.md)

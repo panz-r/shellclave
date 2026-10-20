@@ -124,7 +124,7 @@ typedef enum {
 typedef struct {
   uint32_t max_subcommands; // Max subcommands to return
   bool strict_mode;         // Reject incomplete or malformed syntax
-  /* Optional borrowed delimiter scratch. NULL/zero selects bounded private
+  /* Optional borrowed source scratch. NULL/zero selects bounded private
    * storage; a larger supplied buffer extends that capacity. A buffer of
    * shell_source_workspace_size() supplies a sufficient capacity bound.
    * Exhaustion returns ETRUNC with zero retained ranges, not a
@@ -135,7 +135,9 @@ typedef struct {
 } shell_limits_t;
 
 /* Capacity for operation-local delimiter normalization, including literal
- * command-fragment printing. No source is read and no storage is allocated.
+ * command-fragment printing, and non-evicting subscript boundary facts.
+ * Public iterators retain those facts in the buffer between next() calls.
+ * No source is read and no storage is allocated.
  * Required output is cleared on arithmetic overflow (false). The buffer may
  * have any alignment and must not alias source or result storage. Existing
  * syntax/depth/output limits still apply independently of this byte bound. */
@@ -291,6 +293,9 @@ typedef struct {
  * capacity checks: a malformed suffix is SHELL_EPARSE, not SHELL_ETRUNC.
  * Non-strict parsing retains diagnostic tolerance for unfinished source; its
  * ranges are not a guarantee that the source can be modeled semantically.
+ * SHELL_EPARSE is a coarse failure code, including unsupported byte domains;
+ * it does not prove a Bash syntax error. Use shell_parse_draft() from
+ * shell_source.h for typed syntax/unsupported/input/resource classification.
  */
 shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
                                const shell_limits_t *limits,

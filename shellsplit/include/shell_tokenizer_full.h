@@ -168,19 +168,21 @@ typedef struct {
   /* Previous word-fragment end, including redirect operands. Operators reset
    * it, letting adjacent descriptor syntax reuse forward lexical context. */
   size_t lexical_operand_end;
+  /* Private reserved-word/assignment roles and bounded token history. */
   uint8_t lexical_prefix;
   bool lexical_command_position;
   bool lexical_redirect_operand;
-  void *workspace; /* Borrowed optional delimiter scratch for iteration. */
+  void *workspace; /* Borrowed optional source scratch for iteration. */
   size_t workspace_size;
 } shell_tokenizer_state_t;
 
 /**
  * Initialize a tokenizer over exactly `input_length` source bytes. NULL input
  * is valid only with zero length. The state pointer is required; returns false
- * for invalid input or unavailable delimiter scratch. NULL limits selects
+ * for invalid input or unavailable source scratch. NULL limits selects
  * defaults; only its optional workspace applies to lexical iteration. Larger
- * scratch is borrowed through iteration, not owned by the state. Exhaustion
+ * scratch retains delimiter storage and non-evicting subscript facts. It is
+ * borrowed exclusively through iteration, not owned by the state. Exhaustion
  * while advancing stops iteration and sets heredoc_error; callers can restart
  * with a larger buffer. Storage must not alias input, state, or token output.
  */

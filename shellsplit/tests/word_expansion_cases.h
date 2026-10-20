@@ -671,6 +671,15 @@ static const struct {
   bool glob;
 } shellsplit_test_array_prefixes[] = {
     {"a[0]=b", true, false},
+    {"v=0; a[${v:-]}]=x", true, false},
+    {"a[${v:-]} + (2)]=x", true, false},
+    {"a[${v:-[} + (2)]=x", true, false},
+    {"a[${v:-${w:-]}} + (2)]=x", true, false},
+    {"a[${v:-$(printf ])} + (2)]=x", true, false},
+    {"a[<(printf ]) + (2)]=x", true, false},
+    {"a[>(printf [) + (2)]=x", true, true},
+    {"a[${indices[0]:-]} + (2)]=x", true, false},
+    {"a\\\n[$\\\n{v:-]} + (2)]\\\n=\\\nx", true, false},
     {"! a[0]=b", true, false},
     {"time a[0]=b", true, false},
     {"time -p a[0]=b", true, false},

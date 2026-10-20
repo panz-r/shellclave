@@ -15,16 +15,6 @@ static inline bool is_separator(char c) {
   return c == '|' || c == ';' || c == '&' || c == '<' || c == '>' || c == '\n';
 }
 
-static bool source_range_is_whitespace(const char *cmd, uint32_t start,
-                                       uint32_t end) {
-  for (uint32_t pos = start; pos < end; pos++) {
-    SHELL_SOURCE_PREFIX_SCAN(1);
-    if (!shell_source_space((unsigned char)cmd[pos]))
-      return false;
-  }
-  return true;
-}
-
 /* Trim only lexical separator whitespace from a fast-parser range. An
  * unquoted backslash makes horizontal whitespace part of the preceding word,
  * while a backslash plus a physical line ending disappears before token
@@ -169,25 +159,26 @@ static SHELL_NONNULL(1, 4, 5, 6, 7, 8) bool skip_array_assignment(
   *value_start = 0;
   *value_after = 0;
 
-  size_t cursor = position + 1;
+  size_t cursor = shell_source_logical_following(input, length, position);
   while (cursor < length && shell_identifier_continue(input[cursor]))
-    cursor++;
+    cursor = shell_source_logical_following(input, length, cursor);
   bool indexed = false;
   if (cursor < length && input[cursor] == '[') {
     *subscript_start = cursor;
     if (!shell_source_skip_array_subscript(input, length, cursor, &cursor))
       return false;
     *subscript_after = cursor;
+    cursor = shell_source_skip_escaped_line_endings(input, length, cursor);
     indexed = true;
   }
   if (cursor < length && input[cursor] == '+')
-    cursor++;
+    cursor = shell_source_logical_following(input, length, cursor);
   if (cursor >= length || input[cursor] != '=')
     return false;
-  if (!indexed && (cursor + 1 >= length || input[cursor + 1] != '('))
+  cursor = shell_source_logical_following(input, length, cursor);
+  if (!indexed && (cursor >= length || input[cursor] != '('))
     return false;
 
-  cursor++;
   if (cursor < length && input[cursor] == '(') {
     size_t group_start = cursor;
     if (!shell_source_find_balanced_parentheses(input, length, cursor, &cursor))
@@ -207,6 +198,11 @@ typedef struct {
   shell_tokenizer_state_t state;
   shell_token_t token;
   shell_pipeline_prefix_state_t prefix;
+  /* Snapshot the stage before the current token. Byte-oriented clients may
+   * query its interior, so these facts stay stable until the next token. */
+  shell_pipeline_prefix_state_t before_prefix;
+  size_t syntax_end, before_syntax_end;
+  bool before_prefix_open;
   size_t word_end;
   bool ready;
   bool command_start;
@@ -255,7 +251,10 @@ static SHELL_NONNULL(1, 2) bool fast_array_context_init(
       .command_start = true,
       .prefix_open = true,
   };
-  return shell_tokenizer_init(&context->state, input, length, NULL);
+  bool initialized = shell_tokenizer_init(&context->state, input, length, NULL);
+  if (!allow_initial_time)
+    context->state.lexical_prefix &= (uint8_t)~LEXICAL_TIME_MASK;
+  return initialized;
 }
 
 static SHELL_NONNULL(1) bool fast_array_context_next(
@@ -264,13 +263,17 @@ static SHELL_NONNULL(1) bool fast_array_context_next(
     return false;
   context->ready = true;
   context->token_array_assignment = false;
+  context->before_prefix = context->prefix;
+  context->before_prefix_open = context->prefix_open;
+  context->before_syntax_end = context->syntax_end;
   if (shell_source_is_escaped_line_ending(
           context->state.input, context->token.position,
           context->token.position + context->token.length))
     return true;
-  /* A physical newline while waiting for a connector's first word is list
-   * continuation trivia. In particular, it must not re-enable reserved time
-   * on the right-hand side of a pipe in a nested executable body. */
+  context->syntax_end = context->token.position + context->token.length;
+  /* Continuation LF does not start a new stage. Lexical time recognition is
+   * maintained by the iterator; the list boundary rejects a reserved keyword
+   * in a post-pipe stage before this prevalidated feature walk. */
   if (context->command_start && context->prefix_open &&
       context->word_end == 0 && context->token.type == SHELL_TOKEN_SEMICOLON &&
       (context->token.start[0] == '\n'))
@@ -973,24 +976,6 @@ static void normalize_result_metadata(const char *cmd, size_t cmd_len,
   }
 }
 
-/* A reserved `!` before a compound group belongs to the surrounding pipeline,
- * not to the group's first inner command. */
-static bool range_is_pipeline_modifier_prefix(const char *cmd, uint32_t start,
-                                              uint32_t end) {
-  shell_source_pipeline_prefix_t prefix =
-      shell_source_parse_pipeline_prefix(cmd, start, end);
-  return prefix.valid && prefix.has_modifier && prefix.stage_start == end;
-}
-
-static bool range_is_pipeline_negator_prefix(const char *cmd, uint32_t start,
-                                             uint32_t end) {
-  shell_source_pipeline_prefix_t prefix =
-      shell_source_parse_pipeline_prefix(cmd, start, end);
-  return prefix.valid && prefix.has_modifier &&
-         prefix.time_mode == SHELL_PIPE_TIME_NONE &&
-         prefix.negation_count != 0 && prefix.stage_start == end;
-}
-
 /* A flattened range that begins a compound can represent that compound as an
  * outer pipeline member. The prebuilt index selects its outermost descriptor,
  * so modifier metadata belongs to the GROUP rather than its first inner word.
@@ -1335,9 +1320,8 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
 
   uint32_t pos = 0;
   uint32_t subcmd_start = 0;
-  /* Emitted fragments are not command boundaries. Keep the complete stage's
-   * prefix origin and grammar context across inline document redirects. */
-  uint32_t execution_start = 0;
+  /* Emitted fragments are not stage boundaries. Keep their grammar context
+   * across inline documents; prefix facts come from the forward iterator. */
   bool execution_pipeline_start = true;
   uint32_t subcmd_idx = 0;
   uint16_t current_type = SHELL_TYPE_SIMPLE;
@@ -1372,12 +1356,20 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
         pos >= heredoc_bodies[next_heredoc_body].start) {
       pos = heredoc_bodies[next_heredoc_body].end;
       subcmd_start = pos;
-      execution_start = pos;
       execution_pipeline_start = true;
       comment_start = UINT32_MAX;
       continue;
     }
     char c = cmd[pos];
+    /* The forward lexer has already established assignment eligibility and
+     * its exact prefix span. Subscript operators and parentheses belong to
+     * that word, not this enclosing command list. Reuse the token boundary;
+     * feature collection inspects the subscript separately. */
+    if (!in_quotes && shell_identifier_start(c) &&
+        fast_array_assignment_at(&documents, pos)) {
+      pos = (uint32_t)(documents.token.position + documents.token.length);
+      continue;
+    }
     /* A nested expansion owns its quotes even inside an outer double-quoted
      * word. Consume its whole span before the outer quote state sees any
      * delimiter or command-list operator from its body. */
@@ -1546,9 +1538,9 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
          shell_source_space((unsigned char)cmd[pos + 1]) ||
          is_separator(cmd[pos + 1]) || cmd[pos + 1] == ')' ||
          brace_close_redirect);
-    /* Prefix interpretation is needed only at a possible group delimiter.
-     * Repeating these scans on ordinary bytes makes a whitespace run quadratic.
-     */
+    /* One forward token stream supplies trivia and prefix facts. Neither a
+     * literal brace nor a continuation may restart at the stage's source
+     * origin: many literal braces after one long gap would be quadratic. */
     bool check_group_boundary =
         !in_quotes && arith_depth == 0 && substitution_paren_depth == 0 &&
         (brace_open || brace_close || c == '(' ||
@@ -1556,16 +1548,26 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
           (pos == 0 || shell_source_space((unsigned char)cmd[pos - 1]) ||
            is_separator(cmd[pos - 1]) || cmd[pos - 1] == ')') &&
           group_word_ends_here(cmd, pos, cmd_len)));
+    bool delimiter_token =
+        check_group_boundary && fast_lexical_token_at(&documents, pos);
     bool only_whitespace_before_delimiter =
-        check_group_boundary &&
-        source_range_is_whitespace(cmd, subcmd_start, pos);
+        delimiter_token && documents.before_syntax_end <= subcmd_start;
     bool directly_after_closed_group =
-        check_group_boundary && last_closed_group_end != UINT32_MAX &&
-        source_range_is_whitespace(cmd, last_closed_group_end, pos);
+        delimiter_token && last_closed_group_end != UINT32_MAX &&
+        documents.before_syntax_end <= last_closed_group_end;
+    /* Fragment emission does not reopen command grammar. The forward lexer
+     * has already classified literal braces after a document as word data. */
+    bool structural_delimiter =
+        delimiter_token &&
+        (documents.token.type == SHELL_TOKEN_GROUP_START ||
+         documents.token.type == SHELL_TOKEN_GROUP_END ||
+         documents.token.type == SHELL_TOKEN_SUBSHELL_START ||
+         documents.token.type == SHELL_TOKEN_SUBSHELL_END);
     bool command_boundary =
-        check_group_boundary &&
+        delimiter_token &&
+        (structural_delimiter || documents.before_prefix_open) &&
         (only_whitespace_before_delimiter ||
-         range_is_pipeline_modifier_prefix(cmd, execution_start, pos)) &&
+         (execution_pipeline_start && documents.before_prefix_open)) &&
         !directly_after_closed_group;
     /* When a compound is itself a later pipeline member, its first inner
      * command shares the flattened PIPELINE range type used to connect the
@@ -1597,8 +1599,7 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
         return SHELL_EPARSE;
       }
       brace_group_stack[brace_group_stack_depth++] = SHELL_GROUP_BRACE;
-      shell_source_pipeline_prefix_t group_prefix =
-          shell_source_parse_pipeline_prefix(cmd, execution_start, pos);
+      shell_pipeline_prefix_state_t group_prefix = documents.before_prefix;
       if (group_prefix.has_modifier && current_type == SHELL_TYPE_PIPELINE &&
           !inherited_group_pipeline) {
         result->status = SHELL_STATUS_ERROR;
@@ -1616,7 +1617,6 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
       group_depth++;
       group_kinds |= SHELL_GROUP_BRACE;
       subcmd_start = pos + 1;
-      execution_start = subcmd_start;
       execution_pipeline_start = true;
       pos++;
       continue;
@@ -1632,7 +1632,7 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
       return SHELL_EPARSE;
     }
     if (!in_quotes && arith_depth == 0 && substitution_paren_depth == 0 &&
-        brace_close &&
+        brace_close && structural_delimiter &&
         (only_whitespace_before_delimiter || directly_after_closed_group)) {
       if (brace_group_stack_depth == 0 ||
           brace_group_stack[brace_group_stack_depth - 1] != SHELL_GROUP_BRACE) {
@@ -1688,12 +1688,14 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
       /* A group closer, a pending list operator, or a redirect list may have
        * left `subcmd_start` at source trivia. Do not emit a phantom command
        * for a continuation that shell removes before parsing the next token. */
-      if (shell_source_is_list_trivia(cmd, subcmd_start, after)) {
+      bool standalone = fast_lexical_token_at(&documents, pos) &&
+                        shell_source_is_escaped_line_ending(
+                            cmd, documents.token.position,
+                            documents.token.position + documents.token.length);
+      if (standalone && documents.before_syntax_end <= subcmd_start) {
         subcmd_start = after;
-        if (shell_source_is_list_trivia(cmd, execution_start, after))
-          execution_start = after;
         comment_start = UINT32_MAX;
-      } else if (range_is_pipeline_modifier_prefix(cmd, subcmd_start, after)) {
+      } else if (documents.prefix_open) {
         /* Keep pending pipeline modifiers with their following stage.
          * Normalization strips them after the complete range is emitted. */
         comment_start = UINT32_MAX;
@@ -1863,8 +1865,7 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
             }
             brace_group_stack[brace_group_stack_depth++] = SHELL_GROUP_SUBSHELL;
           }
-          shell_source_pipeline_prefix_t group_prefix =
-              shell_source_parse_pipeline_prefix(cmd, execution_start, pos);
+          shell_pipeline_prefix_state_t group_prefix = documents.before_prefix;
           if (group_prefix.has_modifier &&
               current_type == SHELL_TYPE_PIPELINE &&
               !inherited_group_pipeline) {
@@ -1879,15 +1880,10 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
             group_modifiers |= SHELL_CMD_MOD_PIPE_TIMED;
           OPEN_GROUP(SHELL_GROUP_SUBSHELL, pos, group_modifiers,
                      group_prefix.negation_count, group_prefix.time_mode);
-          execution_start = pos + 1;
           execution_pipeline_start = true;
           group_depth++, group_paren_depth++;
           group_kinds |= SHELL_GROUP_SUBSHELL;
           /* A group delimiter is syntax, not part of its first command. */
-          uint32_t group_source_prefix = subcmd_start;
-          while (group_source_prefix < pos &&
-                 shell_source_space((unsigned char)cmd[group_source_prefix]))
-            group_source_prefix++;
           if (shell_source_redirect_list_before_group(cmd, subcmd_start, pos) ||
               (heredoc_prefix_start != UINT32_MAX &&
                shell_source_redirect_list_before_group(
@@ -1896,8 +1892,7 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
             result->count = subcmd_idx;
             return SHELL_EPARSE;
           }
-          if (group_source_prefix == pos ||
-              range_is_pipeline_modifier_prefix(cmd, subcmd_start, pos))
+          if (only_whitespace_before_delimiter || documents.before_prefix_open)
             subcmd_start = pos + 1;
         }
       } else if (function_paren) {
@@ -2010,13 +2005,10 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
         shell_source_match_logical_punctuation(cmd, cmd_len, pos, "<<<",
                                                &here_string_after)) {
       uint32_t redirect_prefix_start = fast_document_prefix(&documents, pos);
-      shell_source_pipeline_prefix_t document_prefix =
-          shell_source_parse_pipeline_prefix(cmd, execution_start,
-                                             redirect_prefix_start);
+      shell_pipeline_prefix_state_t document_prefix = documents.before_prefix;
       bool modified_document_stage =
           document_prefix.valid && document_prefix.has_modifier &&
-          document_prefix.stage_start == redirect_prefix_start &&
-          execution_pipeline_start;
+          documents.before_prefix_open && execution_pipeline_start;
       bool trailing_group_redirect =
           last_closed_group_end != UINT32_MAX &&
           shell_source_skip_inline_continuations(cmd, pos,
@@ -2128,13 +2120,10 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
         shell_source_match_logical_punctuation(cmd, cmd_len, pos, "<<",
                                                &heredoc_operator_after)) {
       uint32_t redirect_prefix_start = fast_document_prefix(&documents, pos);
-      shell_source_pipeline_prefix_t document_prefix =
-          shell_source_parse_pipeline_prefix(cmd, execution_start,
-                                             redirect_prefix_start);
+      shell_pipeline_prefix_state_t document_prefix = documents.before_prefix;
       bool modified_document_stage =
           document_prefix.valid && document_prefix.has_modifier &&
-          document_prefix.stage_start == redirect_prefix_start &&
-          execution_pipeline_start;
+          documents.before_prefix_open && execution_pipeline_start;
       /* A trailing group redirection may carry an io_number immediately
        * before `<<`.  It is still a redirect on the completed group, not a
        * synthetic command containing that number. */
@@ -2302,7 +2291,6 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
         pos++;
         subcmd_start = pos;
         current_type = SHELL_TYPE_BACKGROUND;
-        execution_start = subcmd_start;
         execution_pipeline_start = true;
         current_pipe_input_mode = SHELL_PIPE_MODE_NONE;
         comment_start = UINT32_MAX;
@@ -2342,7 +2330,6 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
         pos = (uint32_t)operator_after;
         subcmd_start = pos;
         current_type = SHELL_TYPE_AND;
-        execution_start = subcmd_start;
         execution_pipeline_start = true;
         current_pipe_input_mode = SHELL_PIPE_MODE_NONE;
         last_closed_group_end = UINT32_MAX;
@@ -2381,7 +2368,6 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
         pos = (uint32_t)operator_after;
         subcmd_start = pos;
         current_type = SHELL_TYPE_OR;
-        execution_start = subcmd_start;
         execution_pipeline_start = true;
         current_pipe_input_mode = SHELL_PIPE_MODE_NONE;
         last_closed_group_end = UINT32_MAX;
@@ -2428,7 +2414,6 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
         pos = (uint32_t)(pipe_stderr ? pipe_after : (size_t)pos + 1);
         subcmd_start = pos;
         current_type = SHELL_TYPE_PIPELINE;
-        execution_start = subcmd_start;
         execution_pipeline_start = false;
         current_pipe_input_mode = pipe_stderr
                                       ? SHELL_PIPE_MODE_STDOUT_AND_STDERR
@@ -2439,17 +2424,14 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
 
       // Handle ; and newlines as command separators
       if (c == ';' || c == '\n') {
+        bool separator_token = fast_lexical_token_at(&documents, pos);
         // End current subcommand (trim whitespace)
         bool pending_list_continuation =
             (current_type == SHELL_TYPE_PIPELINE ||
              current_type == SHELL_TYPE_AND || current_type == SHELL_TYPE_OR) &&
-            shell_source_is_list_trivia(cmd, subcmd_start, pos + 1);
-        /* Unlike a binary list connector, a leading `!` cannot cross a raw
-         * comment or physical line ending. Recognize only a same-logical-line
-         * modifier prefix so strict validation rejects an incomplete pipeline
-         * rather than treating the reserved word as an executable command. */
-        bool pending_pipeline_negation =
-            range_is_pipeline_negator_prefix(cmd, subcmd_start, pos + 1);
+            separator_token && documents.before_syntax_end <= subcmd_start;
+        /* A bare negator cannot continue across LF. The shared grammar
+         * boundary owns that diagnosis; no source-prefix rescan is needed. */
         if (subcmd_start < pos) {
           uint32_t s = subcmd_start;
           uint32_t e = range_end_before_comment(s, pos, comment_start);
@@ -2459,8 +2441,7 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
            * continue the next stage. The full tokenizer already recognizes
            * this grammar; retain the fast parser's connector metadata rather
            * than silently turning it into a semicolon relation. */
-          if (s < e && !pending_list_continuation &&
-              !pending_pipeline_negation) {
+          if (s < e && !pending_list_continuation) {
             if (subcmd_idx >= max_cmds) {
               result->status = SHELL_STATUS_TRUNCATED;
               result->count = subcmd_idx;
@@ -2483,21 +2464,13 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
         if (pending_list_continuation) {
           pos++;
           subcmd_start = pos;
-          execution_start = pos;
           comment_start = UINT32_MAX;
           continue;
         }
-        if (pending_pipeline_negation) {
-          pos++;
-          comment_start = UINT32_MAX;
-          continue;
-        }
-
         // Start new subcommand with SEMICOLON type
         pos++;
         subcmd_start = pos;
         current_type = SHELL_TYPE_SEMICOLON;
-        execution_start = subcmd_start;
         execution_pipeline_start = true;
         current_pipe_input_mode = SHELL_PIPE_MODE_NONE;
         comment_start = UINT32_MAX;

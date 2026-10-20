@@ -43,6 +43,7 @@ void shell_source_operation_begin(const char *input, size_t length) {
   source_operation.workspace_size = source_operation.scratch_used = 0;
   source_operation.scratch_exhausted = false;
   source_operation.owned_workspace = NULL;
+  source_operation.arrays = (shell_source_array_index_t){0};
 }
 
 void shell_source_operation_prechecked(void) {
@@ -53,29 +54,50 @@ bool shell_source_operation_begin_owned(const char *input, size_t length) {
   shell_source_operation_begin(input, length);
   if (source_operation.depth != 1)
     return true;
-  /* One conservative sizing scan, not another syntax pass. Ordinary source
-   * needs no delimiter arena. Flat delimiters retain their small two-byte
-   * bound; only potentially grouped delimiter spelling needs printer pieces.
-   * Quoted/data occurrences may overreserve, but never underreserve. */
+  /* One conservative sizing scan, not another syntax pass. Source without
+   * documents or many brackets needs no arena. Flat delimiters retain their
+   * two-byte bound, plus the measured bracket-record storage; only grouped
+   * delimiter spelling needs the source-sized printer bound. Quoted/data
+   * bracket occurrences may overreserve records, not a whole printer arena. */
   bool document = false, grouped = false;
+  size_t brackets = 0;
   for (size_t i = 0; i < length; i++) {
+    SHELL_SOURCE_WORD_SCAN(1);
+    brackets += input[i] == '[';
     document |= input[i] == '<' &&
                 shell_source_logical_next_is(input, length, i, '<', NULL);
     grouped |= shell_source_heredoc_fragment_open(input, length, i) ||
                shell_source_process_substitution_open(input, length, i, NULL);
   }
-  if (!document)
+  source_operation.arrays.count = brackets;
+  bool array_storage = brackets > SHELL_SOURCE_INLINE_ARRAYS;
+  if (!document && !array_storage)
     return true;
   size_t size = 0;
-  bool sized = grouped ? shell_source_workspace_size(length, &size)
-                       : length <= SIZE_MAX / 2;
-  if (!grouped && sized)
-    size = 2 * length;
+  bool printer = document && grouped;
+  bool sized = true;
+  if (printer)
+    sized = shell_source_workspace_size(length, &size);
+  else {
+    if (document) {
+      sized = length <= SIZE_MAX / 2;
+      if (sized)
+        size = 2 * length;
+    }
+    size_t padding = _Alignof(shell_source_array_boundary_t) - 1;
+    if (brackets) {
+      sized = sized && size <= SIZE_MAX - padding &&
+              brackets <= (SIZE_MAX - size - padding) /
+                              sizeof(shell_source_array_boundary_t);
+      if (sized)
+        size += brackets * sizeof(shell_source_array_boundary_t) + padding;
+    }
+  }
   if (!sized) {
     shell_source_operation_end();
     return false;
   }
-  if (size <= sizeof(source_operation.scratch))
+  if (size <= sizeof(source_operation.scratch) && !array_storage)
     return true;
   source_operation.owned_workspace = malloc(size);
   if (!source_operation.owned_workspace) {
@@ -135,29 +157,49 @@ shell_source_workspace_scope_t shell_source_workspace_begin(const char *source,
           begin <= source_operation.workspace_end &&
           length <= source_operation.workspace_end - begin,
       source_operation.workspace_begin,
-      source_operation.workspace_end};
+      source_operation.workspace_end,
+      source_operation.arrays,
+      false,
+      {{0}}};
   if (!previous.inherit) {
     source_operation.scratch_exhausted = false;
     source_operation.workspace = NULL;
     source_operation.workspace_size = source_operation.scratch_used = 0;
     source_operation.workspace_begin = begin;
     source_operation.workspace_end = begin + length;
+    source_operation.arrays = (shell_source_array_index_t){0};
   }
-  if (buffer && size > sizeof(source_operation.scratch)) {
+  bool replace = buffer && size > sizeof(source_operation.scratch) &&
+                 buffer != source_operation.workspace;
+  previous.share_arrays = previous.inherit && !replace;
+  if (!previous.share_arrays && previous.arrays.prepared &&
+      !previous.arrays.entries)
+    memcpy(previous.inline_arrays, source_operation.inline_arrays,
+           sizeof(previous.inline_arrays));
+  if (replace) {
     source_operation.workspace = buffer;
     source_operation.workspace_size = size;
     source_operation.scratch_used = 0;
+    source_operation.arrays = (shell_source_array_index_t){0};
   }
   return previous;
 }
 
 void shell_source_workspace_end(shell_source_workspace_scope_t previous) {
   bool failed = source_operation.scratch_exhausted;
+  size_t size = source_operation.workspace_size;
+  shell_source_array_index_t arrays = source_operation.arrays;
   source_operation.workspace = previous.buffer;
-  source_operation.workspace_size = previous.size;
+  source_operation.workspace_size =
+      previous.share_arrays ? size : previous.size;
   source_operation.scratch_used = previous.used;
   source_operation.workspace_begin = previous.begin;
   source_operation.workspace_end = previous.end;
+  source_operation.arrays = previous.share_arrays ? arrays : previous.arrays;
+  if (!previous.share_arrays && previous.arrays.prepared &&
+      !previous.arrays.entries)
+    memcpy(source_operation.inline_arrays, previous.inline_arrays,
+           sizeof(previous.inline_arrays));
   source_operation.scratch_exhausted =
       previous.exhausted || (previous.inherit && failed);
 }
@@ -186,6 +228,95 @@ void shell_source_scratch_release(size_t mark) {
 bool shell_source_scratch_exhausted(void) {
   return source_operation.scratch_exhausted ||
          (source_operation.depth && !source_operation.index);
+}
+
+/* Reserve persistent facts from the arena's tail. Temporary delimiter marks
+ * release only its front; they cannot overwrite the index while unwinding.
+ * Counting and filling are two linear storage-preparation passes, not syntax
+ * validation. Ordinary bracket data is deliberately allowed to overreserve. */
+static void source_array_index_prepare(void) {
+  shell_source_array_index_t *index = &source_operation.arrays;
+  if (index->prepared)
+    return;
+  index->prepared = true;
+  const char *source = (const char *)source_operation.workspace_begin;
+  size_t length =
+      source_operation.workspace_end - source_operation.workspace_begin;
+  /* Allocating adapters already measured this immutable view. Zero can mean
+   * unmeasured: a requested opening bracket proves the count is nonzero. */
+  size_t count = index->count;
+  if (!count) {
+    for (size_t i = 0; i < length; ++i) {
+      SHELL_SOURCE_WORD_SCAN(1);
+      count += source[i] == '[';
+    }
+  }
+  index->count = count;
+  shell_source_array_boundary_t *entries = source_operation.inline_arrays;
+  if (count > SHELL_SOURCE_INLINE_ARRAYS || source_operation.workspace) {
+    size_t capacity = source_operation.workspace_size;
+    size_t alignment = _Alignof(shell_source_array_boundary_t);
+    if (!source_operation.workspace || count > SIZE_MAX / sizeof(*entries))
+      goto exhausted;
+    size_t bytes = count * sizeof(*entries);
+    uintptr_t base = (uintptr_t)source_operation.workspace;
+    if (bytes > capacity)
+      goto exhausted;
+    uintptr_t at = (base + capacity - bytes) & ~(uintptr_t)(alignment - 1);
+    if (at < base || at - base < source_operation.scratch_used)
+      goto exhausted;
+    source_operation.workspace_size = at - base;
+    index->entries = entries = (shell_source_array_boundary_t *)at;
+  }
+  size_t entry = 0;
+  for (size_t i = 0; i < length; ++i) {
+    SHELL_SOURCE_WORD_SCAN(1);
+    if (source[i] == '[')
+      entries[entry++] =
+          (shell_source_array_boundary_t){.key = (uintptr_t)(source + i)};
+  }
+  return;
+exhausted:
+  source_operation.scratch_exhausted = true;
+}
+
+shell_source_array_boundary_t *
+shell_source_array_boundary(const char *opening) {
+  source_array_index_prepare();
+  if (source_operation.scratch_exhausted)
+    return NULL;
+  shell_source_array_index_t *index = &source_operation.arrays;
+  shell_source_array_boundary_t *entries =
+      index->entries ? index->entries : source_operation.inline_arrays;
+  uintptr_t key = (uintptr_t)opening;
+  size_t low = 0, high = index->count;
+  while (low < high) {
+    size_t mid = low + (high - low) / 2;
+    if (entries[mid].key < key)
+      low = mid + 1;
+    else
+      high = mid;
+  }
+  return &entries[low];
+}
+
+/* A public iterator can outlive one next() operation. Its supplied workspace
+ * retains the same private facts between calls; no iterator/result grows to
+ * own them. Small default iterations have at most eight bracket candidates,
+ * so recreating their bounded inline index cannot cause quadratic work. */
+typedef struct {
+  shell_source_array_index_t arrays;
+  size_t scratch_size;
+} source_iterator_workspace_t;
+
+static SHELL_NONNULL(1) void source_iterator_workspace_save(
+    const shell_tokenizer_state_t *state) {
+  source_iterator_workspace_t saved = {source_operation.arrays,
+                                       source_operation.workspace_size};
+  if (!saved.arrays.entries)
+    saved.arrays = (shell_source_array_index_t){0};
+  memcpy((char *)state->workspace + state->workspace_size - sizeof(saved),
+         &saved, sizeof(saved));
 }
 
 shell_source_scope_t shell_source_scope_begin(const char *input,
@@ -317,36 +448,44 @@ static SHELL_NONNULL(1) bool unsupported_semantics_scan_impl(
  * text, but only space/tab/LF separate Bash words. Reject other control bytes,
  * DEL before exposing a partial stream. High bytes belong only to heredoc
  * delimiter/data islands, never ordinary executable source. */
-static SHELL_NONNULL(1) bool contains_invalid_shell_byte(const char *input,
-                                                         size_t length) {
+shell_source_status_t shell_source_bytes_status(const char *input,
+                                                size_t length) {
   if (source_operation.bytes_prechecked &&
       source_operation_contains(input, length))
-    return false;
+    return SHELL_SOURCE_COMPLETE;
 #ifdef SHELLSPLIT_TEST_SOURCE_SCANS
   shellsplit_test_metadata_charge(SHELLSPLIT_TEST_WORK_BYTE_VALIDATION_PASSES);
 #endif
   bool high_bytes = false;
+  bool unsupported = false;
   for (size_t i = 0; i < length; i++) {
     SHELL_SOURCE_WORD_SCAN(1);
 #ifdef SHELLSPLIT_TEST_SOURCE_SCANS
     shellsplit_test_metadata_charge(SHELLSPLIT_TEST_WORK_BYTE_VALIDATION_BYTES);
 #endif
     unsigned char byte = (unsigned char)input[i];
-    if (byte == '\0' || (byte < 0x20 && !isspace(byte)) || byte == 0x7F)
-      return true;
+    if (byte == '\0')
+      return SHELL_SOURCE_INVALID_INPUT;
+    unsupported |= (byte < 0x20 && !isspace(byte)) || byte == 0x7F;
     high_bytes |= byte >= 0x80;
   }
-  if (high_bytes && !shell_source_heredoc_bytes_valid(input, length))
-    return true;
+  if (unsupported)
+    return SHELL_SOURCE_UNSUPPORTED;
+  if (high_bytes) {
+    shell_source_status_t status =
+        shell_source_heredoc_bytes_status(input, length);
+    if (status != SHELL_SOURCE_COMPLETE)
+      return status;
+  }
   if (source_operation.depth != 0 &&
       (uintptr_t)input == source_operation.begin &&
       length == source_operation.end - source_operation.begin)
     source_operation.bytes_prechecked = true;
-  return false;
+  return SHELL_SOURCE_COMPLETE;
 }
 
 bool shell_source_bytes_valid(const char *input, size_t length) {
-  return !contains_invalid_shell_byte(input, length);
+  return shell_source_bytes_status(input, length) == SHELL_SOURCE_COMPLETE;
 }
 
 /* Bash arithmetic accepts indexed and associative array references.  They do
@@ -619,40 +758,6 @@ static SHELL_NONNULL(1) bool substring_has_unsupported_semantics(
   return parser.position != length;
 }
 
-/* Shell function names are NAME tokens, not arbitrary shell words. Keep this
- * separate from the surrounding tokenizer so every consumer agrees that
- * `name ( )` is a function declarator while `9name ( )` is malformed. */
-static bool function_name_end(const char *input, size_t end, size_t position,
-                              size_t *after) {
-  if (!input || !after || position >= end ||
-      !(isalpha((unsigned char)input[position]) || input[position] == '_'))
-    return false;
-  position++;
-  while (position < end &&
-         (isalnum((unsigned char)input[position]) || input[position] == '_'))
-    position++;
-  *after = position;
-  return true;
-}
-
-/* Parse the optional parenthesized part of a function declarator. Shell
- * lexical processing removes escaped physical line endings, so accept those
- * alongside horizontal space, but never cross a raw line break or comment. */
-static bool function_parentheses_after_name(const char *input, size_t length,
-                                            size_t position, size_t *after) {
-  if (!input || !after)
-    return false;
-  position = shell_source_skip_inline_continuations(input, length, position);
-  if (position == length || input[position] != '(')
-    return false;
-  position =
-      shell_source_skip_inline_continuations(input, length, position + 1);
-  if (position == length || input[position] != ')')
-    return false;
-  *after = shell_source_skip_inline_continuations(input, length, position + 1);
-  return true;
-}
-
 /* A closing brace is a reserved word only when it is separated from adjacent
  * shell words. Keep word-shaped text such as `}suffix` opaque to the group
  * stack, while recognizing group trailing redirections (`}2>out`). */
@@ -916,8 +1021,7 @@ void shell_tokenizer_init_prechecked(shell_tokenizer_state_t *state,
   state->input = input;
   state->length = input_length;
   state->lexical_command_position = true;
-  state->lexical_prefix =
-      1; /* Reserved time is eligible at a pipeline start. */
+  state->lexical_prefix = LEXICAL_TIME_ALLOWED | LEXICAL_ASSIGNMENT_ALLOWED;
 }
 
 bool shell_tokenizer_init(shell_tokenizer_state_t *state, const char *input,
@@ -928,11 +1032,22 @@ bool shell_tokenizer_init(shell_tokenizer_state_t *state, const char *input,
     state->workspace_size = limits->workspace_size;
   }
   shell_source_operation_begin(state->input, input_length);
+  bool independent = source_operation.depth == 1;
+  if (!independent ||
+      state->workspace_size <= sizeof(source_operation.scratch) +
+                                   sizeof(source_iterator_workspace_t)) {
+    state->workspace = NULL;
+    state->workspace_size = 0;
+  }
   shell_source_workspace_scope_t previous = shell_source_workspace_begin(
       state->input, input_length, state->workspace, state->workspace_size);
+  if (independent && state->workspace)
+    source_operation.workspace_size -= sizeof(source_iterator_workspace_t);
   bool valid = !((!input && input_length != 0) ||
-                 contains_invalid_shell_byte(state->input, input_length));
+                 !shell_source_bytes_valid(state->input, input_length));
   valid = valid && !shell_source_scratch_exhausted();
+  if (independent && state->workspace)
+    source_iterator_workspace_save(state);
   shell_source_workspace_end(previous);
   shell_source_operation_end();
   if (valid)
@@ -1006,41 +1121,75 @@ static SHELL_NONNULL(1) bool token_starts_word(
              state->position;
 }
 
-static bool parse_array_assignment_end(const char *input, size_t length,
-                                       size_t start, size_t *end) {
-  if (!input || !end || start >= length ||
-      !(isalpha((unsigned char)input[start]) || input[start] == '_'))
-    return false;
-  size_t position = start + 1;
+typedef enum {
+  ARRAY_WORD_NONE,
+  ARRAY_WORD_INDEXED,
+  ARRAY_WORD_COMPOUND,
+  ARRAY_WORD_UNCLASSIFIED,
+} array_word_t;
+
+/* Only a leading indexed assignment can absorb unquoted subscript blanks.
+ * Declaration operands retain ordinary word boundaries; their special syntax
+ * is the compound-array opener, not arbitrary assignment-looking operands.
+ * end owns the assignment prefix through '=' or the compound body's '('. */
+static SHELL_NONNULL(1, 5) array_word_t
+    array_assignment_probe(const char *input, size_t length, size_t start,
+                           bool leading, size_t *end) {
+  if (!(isalpha((unsigned char)input[start]) || input[start] == '_'))
+    return ARRAY_WORD_NONE;
+  size_t limit = length;
+  if (!leading && !shell_source_skip_shell_word(input, length, start, &limit))
+    return ARRAY_WORD_NONE;
+  size_t position = shell_source_logical_following(input, length, start);
   bool indexed = false;
   while (position < length &&
          (isalnum((unsigned char)input[position]) || input[position] == '_'))
-    position++;
+    position = shell_source_logical_following(input, length, position);
   if (position < length && input[position] == '[') {
     indexed = true;
     size_t close = 0;
-    if (!shell_source_skip_array_subscript(input, length, position, &close))
-      return false;
-    position = close;
+    /* A declaration's ordinary word cannot acquire its closing bracket from
+     * a later operand. Avoid preparing array facts for this negative shape. */
+    if (!leading && !memchr(input + position, ']', limit - position))
+      return ARRAY_WORD_NONE;
+    if (!shell_source_skip_array_subscript(input, limit, position, &close))
+      return leading ? ARRAY_WORD_UNCLASSIFIED : ARRAY_WORD_NONE;
+    position = shell_source_skip_escaped_line_endings(input, length, close);
   }
   if (position < length && input[position] == '+')
-    position++;
-  if (position >= length || input[position] != '=')
-    return false;
-  if (position + 1 >= length || input[position + 1] != '(') {
+    position = shell_source_logical_following(input, length, position);
+  if (position >= limit || input[position] != '=') {
+    /* A final backslash can still become a removed LF before '=' or '+='.
+     * Do not expose subscript parentheses as list syntax at that prefix. */
+    bool pending = position == length ||
+                   (position + 1 == length && input[position] == '\\');
+    return leading && indexed && pending ? ARRAY_WORD_UNCLASSIFIED
+                                         : ARRAY_WORD_NONE;
+  }
+  size_t rhs = shell_source_logical_following(input, length, position);
+  if (rhs == length || input[rhs] != '(') {
     /* a[0]=value and map[key]+=value are still array syntax even though the
      * RHS is not a compound assignment. The semantic layer rejects them. */
-    if (!indexed)
-      return false;
+    if (!indexed || !leading)
+      return ARRAY_WORD_NONE;
     *end = position + 1;
-    return true;
+    return ARRAY_WORD_INDEXED;
   }
-  size_t after = 0;
-  if (!shell_source_find_balanced_parentheses(input, length, position + 1,
-                                              &after))
-    return false;
-  *end = after;
-  return true;
+  *end = rhs;
+  return ARRAY_WORD_COMPOUND;
+}
+
+bool shell_tokenizer_word_end(const char *source, size_t length,
+                              const shell_token_t *token, size_t *end) {
+  size_t start = token->position;
+  if (token->type == SHELL_TOKEN_ARRAY_ASSIGNMENT) {
+    start += token->length;
+    if (source[start - 1] == ')') {
+      *end = start;
+      return true;
+    }
+  }
+  return shell_source_skip_shell_word(source, length, start, end);
 }
 
 static bool is_brace_group_delimiter(const shell_tokenizer_state_t *state,
@@ -1440,6 +1589,33 @@ static size_t scan_descriptor_target(const char *input, size_t position,
              : target_start;
 }
 
+/* start..operator_position is an already-recognized optional descriptor.
+ * Bare, numeric and named spellings use the same operator boundary. */
+static SHELL_NONNULL(1, 2) bool full_redirect_token(
+    shell_tokenizer_state_t *state, shell_token_t *token, size_t start,
+    size_t operator_position, bool numeric) {
+  size_t after;
+  bool duplicate;
+  shell_token_type_t type = shell_source_redirect_operator(
+      state->input, state->length, operator_position, &after, &duplicate);
+  if (type == SHELL_TOKEN_HEREDOC) {
+    parse_heredoc(state, token, start, operator_position, false);
+    return shell_token_return_current_group_context(state, token);
+  }
+  if (duplicate)
+    after = scan_descriptor_target(state->input, after, state->length);
+  if (numeric && type == SHELL_TOKEN_REDIRECT_OUT)
+    type = SHELL_TOKEN_REDIRECT_ERR;
+  *token = (shell_token_t){
+      .type = type,
+      .start = state->input + start,
+      .position = start,
+      .length = after - start,
+      .is_escaped = memchr(state->input + start, '\\', after - start) != NULL};
+  state->position = after;
+  return shell_token_return_current_group_context(state, token);
+}
+
 static SHELL_NONNULL(1, 2) bool shell_tokenizer_next_raw(
     shell_tokenizer_state_t *state, shell_token_t *token) {
   memset(token, 0, sizeof(*token));
@@ -1514,11 +1690,7 @@ static SHELL_NONNULL(1, 2) bool shell_tokenizer_next_raw(
 
   // Handle quotes first
   char opening_quote = current_char;
-  bool escaped_substitution = !state->in_quotes && current_char == '\\' &&
-                              state->position + 2 < state->length &&
-                              state->input[state->position + 1] == '$' &&
-                              state->input[state->position + 2] == '(';
-  if (!escaped_substitution && handle_quotes(state)) {
+  if (handle_quotes(state)) {
     word_had_quotes = true;
     if (state->in_quotes) {
       while (state->position < state->length) {
@@ -1711,10 +1883,24 @@ static SHELL_NONNULL(1, 2) bool shell_tokenizer_next_raw(
     }
   }
 
-  if (!state->in_quotes) {
+  bool pending_redirect_word =
+      state->lexical_redirect_operand &&
+      (state->lexical_operand_end == 0 ||
+       shell_source_skip_escaped_line_endings(state->input, state->length,
+                                              state->lexical_operand_end) ==
+           state->position);
+  if (!state->in_quotes && !pending_redirect_word && token_starts_word(state) &&
+      (state->lexical_prefix &
+       (LEXICAL_ASSIGNMENT_ALLOWED | LEXICAL_DECLARATION_OPERANDS))) {
     size_t after = 0;
-    if (parse_array_assignment_end(state->input, state->length, state->position,
-                                   &after)) {
+    array_word_t array = array_assignment_probe(
+        state->input, state->length, state->position,
+        (state->lexical_prefix & LEXICAL_ASSIGNMENT_ALLOWED) != 0, &after);
+    if (array == ARRAY_WORD_COMPOUND &&
+        !shell_source_find_balanced_parentheses(state->input, state->length,
+                                                after, &after))
+      array = ARRAY_WORD_UNCLASSIFIED;
+    if (array == ARRAY_WORD_INDEXED || array == ARRAY_WORD_COMPOUND) {
       token->type = SHELL_TOKEN_ARRAY_ASSIGNMENT;
       token->start = state->input + state->position;
       token->length = after - state->position;
@@ -1731,54 +1917,8 @@ static SHELL_NONNULL(1, 2) bool shell_tokenizer_next_raw(
     size_t redirect = 0;
     if (shell_source_parse_named_fd_redirect_at_word_start(
             state->input, state->position, state->length, &redirect)) {
-      size_t operator_start = redirect;
-      char direction = state->input[redirect++];
-      size_t operator_after = 0;
-      if (direction == '<' && shell_source_match_logical_punctuation(
-                                  state->input, state->length, operator_start,
-                                  "<<<", &operator_after)) {
-        token->type = SHELL_TOKEN_HERESTRING;
-        token->start = state->input + state->position;
-        token->position = state->position;
-        token->is_quoted = false;
-        state->position = operator_after;
-        token->length = state->position - token->position;
-        token->is_escaped = memchr(token->start, '\\', token->length) != NULL;
-        return shell_token_return_current_group_context(state, token);
-      }
-      if (direction == '<' && shell_source_match_logical_punctuation(
-                                  state->input, state->length, operator_start,
-                                  "<<", &operator_after)) {
-        parse_heredoc(state, token, state->position, operator_start, false);
-        return shell_token_return_current_group_context(state, token);
-      }
-      token->type =
-          direction == '<' ? SHELL_TOKEN_REDIRECT_IN : SHELL_TOKEN_REDIRECT_OUT;
-      redirect = shell_source_skip_escaped_line_endings(
-          state->input, state->length, redirect);
-      if (direction == '>' && redirect < state->length &&
-          state->input[redirect] == '>') {
-        token->type = SHELL_TOKEN_REDIRECT_APPEND;
-        redirect++;
-      } else if (direction == '<' && redirect < state->length &&
-                 state->input[redirect] == '>') {
-        token->type = SHELL_TOKEN_REDIRECT_READ_WRITE;
-        redirect++;
-      }
-      redirect = shell_source_skip_escaped_line_endings(
-          state->input, state->length, redirect);
-      if (redirect < state->length && state->input[redirect] == '&') {
-        token->type = SHELL_TOKEN_REDIRECT_ERR;
-        redirect =
-            scan_descriptor_target(state->input, redirect + 1, state->length);
-      }
-      token->start = state->input + state->position;
-      token->length = redirect - state->position;
-      token->position = state->position;
-      token->is_quoted = false;
-      token->is_escaped = memchr(token->start, '\\', token->length) != NULL;
-      state->position = redirect;
-      return shell_token_return_current_group_context(state, token);
+      return full_redirect_token(state, token, state->position, redirect,
+                                 false);
     }
   }
 
@@ -1789,6 +1929,14 @@ static SHELL_NONNULL(1, 2) bool shell_tokenizer_next_raw(
   } else if (!state->in_quotes && is_shell_operator(current_char)) {
     size_t logical_next = shell_source_logical_following(
         state->input, state->length, state->position);
+    if (current_char == '<' || current_char == '>') {
+      if (parse_process_substitution(state, token, start_pos, is_quoted))
+        return shell_token_return_current_group_context(state, token);
+      return full_redirect_token(state, token, start_pos, start_pos, false);
+    }
+    if (current_char == '&' && logical_next < state->length &&
+        state->input[logical_next] == '>')
+      return full_redirect_token(state, token, start_pos, start_pos, false);
     if (logical_next < state->length) {
       char next_char = state->input[logical_next];
 
@@ -1803,70 +1951,6 @@ static SHELL_NONNULL(1, 2) bool shell_tokenizer_next_raw(
         return shell_token_return_current_group_context(state, token);
       } else if (current_char == '&' && next_char == '&') {
         token->type = SHELL_TOKEN_AND;
-        token->start = state->input + state->position;
-        token->position = state->position;
-        token->is_quoted = false;
-        state->position = logical_next + 1;
-        token->length = state->position - token->position;
-        token->is_escaped = token->length != 2;
-        return shell_token_return_current_group_context(state, token);
-      } else if (current_char == '&' && next_char == '>') {
-        token->type = SHELL_TOKEN_REDIRECT_BOTH;
-        token->start = state->input + state->position;
-        token->position = state->position;
-        token->is_quoted = false;
-        state->position = logical_next + 1;
-        size_t append = shell_source_logical_following(
-            state->input, state->length, logical_next);
-        if (append < state->length && state->input[append] == '>') {
-          token->type = SHELL_TOKEN_REDIRECT_BOTH_APPEND;
-          state->position = append + 1;
-        }
-        token->length = state->position - token->position;
-        token->is_escaped =
-            token->length !=
-            (token->type == SHELL_TOKEN_REDIRECT_BOTH_APPEND ? 3u : 2u);
-        return shell_token_return_current_group_context(state, token);
-      } else if (current_char == '>' && next_char == '>') {
-        token->type = SHELL_TOKEN_REDIRECT_APPEND;
-        token->start = state->input + state->position;
-        token->position = state->position;
-        token->is_quoted = false;
-        state->position = logical_next + 1;
-
-        // Check for >>&N (append and redirect)
-        size_t descriptor = shell_source_logical_following(
-            state->input, state->length, logical_next);
-        if (descriptor < state->length && state->input[descriptor] == '&') {
-          state->position = descriptor + 1;
-          state->position = scan_descriptor_target(
-              state->input, state->position, state->length);
-        }
-        token->length = state->position - token->position;
-        token->is_escaped = token->length != 2;
-        return shell_token_return_current_group_context(state, token);
-      } else if (current_char == '>' && next_char == '&') {
-        token->type = SHELL_TOKEN_REDIRECT_ERR;
-        token->start = state->input + state->position;
-        token->position = state->position;
-        token->is_quoted = false;
-        state->position = logical_next + 1;
-        state->position = scan_descriptor_target(state->input, state->position,
-                                                 state->length);
-        token->length = state->position - token->position;
-        token->is_escaped = token->length != 2;
-        return shell_token_return_current_group_context(state, token);
-      } else if (current_char == '>' && next_char == '|') {
-        token->type = SHELL_TOKEN_REDIRECT_CLOBBER;
-        token->start = state->input + state->position;
-        token->position = state->position;
-        token->is_quoted = false;
-        state->position = logical_next + 1;
-        token->length = state->position - token->position;
-        token->is_escaped = token->length != 2;
-        return shell_token_return_current_group_context(state, token);
-      } else if (current_char == '<' && next_char == '>') {
-        token->type = SHELL_TOKEN_REDIRECT_READ_WRITE;
         token->start = state->input + state->position;
         token->position = state->position;
         token->is_quoted = false;
@@ -1889,53 +1973,6 @@ static SHELL_NONNULL(1, 2) bool shell_tokenizer_next_raw(
         operator_length = logical_next - state->position;
       } else {
         token->type = SHELL_TOKEN_PIPE;
-      }
-      break;
-    case '>':
-      if (parse_process_substitution(state, token, start_pos, is_quoted))
-        return shell_token_return_current_group_context(state, token);
-      token->type = SHELL_TOKEN_REDIRECT_OUT;
-      break;
-    case '<':
-      // Check for heredoc: <<, process substitution: <(cmd), here-string: <<<
-      if (shell_source_logical_following(state->input, state->length,
-                                         state->position) < state->length) {
-        // Check for <<< (here-string)
-        size_t here_string_after = 0;
-        if (shell_source_match_logical_punctuation(state->input, state->length,
-                                                   state->position, "<<<",
-                                                   &here_string_after)) {
-          // Here-string: <<<
-          token->type = SHELL_TOKEN_HERESTRING;
-          token->start = state->input + start_pos;
-          token->position = start_pos;
-          token->is_quoted = is_quoted;
-          state->position = here_string_after;
-          token->length = state->position - token->position;
-          token->is_escaped = token->length != 3;
-          return shell_token_return_current_group_context(state, token);
-        }
-
-        if (parse_heredoc(state, token, start_pos, start_pos, is_quoted))
-          return shell_token_return_current_group_context(state, token);
-
-        if (parse_process_substitution(state, token, start_pos, is_quoted))
-          return shell_token_return_current_group_context(state, token);
-      }
-      token->type = SHELL_TOKEN_REDIRECT_IN;
-      // Check for <&N (input duplication)
-      size_t descriptor_after = 0;
-      if (shell_source_match_logical_punctuation(state->input, state->length,
-                                                 state->position, "<&",
-                                                 &descriptor_after)) {
-        token->start = state->input + start_pos;
-        token->position = start_pos;
-        token->is_quoted = is_quoted;
-        token->is_escaped = descriptor_after - start_pos != 2;
-        state->position = scan_descriptor_target(state->input, descriptor_after,
-                                                 state->length);
-        token->length = state->position - start_pos;
-        return shell_token_return_current_group_context(state, token);
       }
       break;
     case '&':
@@ -2027,56 +2064,8 @@ static SHELL_NONNULL(1, 2) bool shell_tokenizer_next_raw(
     if (check_pos < state->length) {
       char after_digit = state->input[check_pos];
       if (after_digit == '>' || after_digit == '<') {
-        token->type = after_digit == '<' ? SHELL_TOKEN_REDIRECT_IN
-                                         : SHELL_TOKEN_REDIRECT_ERR;
-        token->start = state->input + state->position;
-        token->position = state->position;
-        token->is_quoted = false;
-        token->is_escaped = false;
-
-        size_t end = check_pos + 1;
-        size_t operator_after = 0;
-        if (after_digit == '<' && shell_source_match_logical_punctuation(
-                                      state->input, state->length, check_pos,
-                                      "<<<", &operator_after)) {
-          /* Keep numeric-FD here-strings as one operator, just like bare
-           * and named-FD here-strings. Splitting off the first '<' makes
-           * the remaining bytes look like a heredoc delimiter. */
-          token->type = SHELL_TOKEN_HERESTRING;
-          end = operator_after;
-        } else if (after_digit == '<' &&
-                   shell_source_match_logical_punctuation(
-                       state->input, state->length, check_pos, "<<",
-                       &operator_after)) {
-          parse_heredoc(state, token, state->position, check_pos, false);
-          return shell_token_return_current_group_context(state, token);
-        }
-        if (token->type != SHELL_TOKEN_HERESTRING) {
-          end = shell_source_skip_escaped_line_endings(state->input,
-                                                       state->length, end);
-          if (after_digit == '>' && end < state->length &&
-              state->input[end] == '>') {
-            token->type = SHELL_TOKEN_REDIRECT_APPEND;
-            end++;
-          } else if (after_digit == '>' && end < state->length &&
-                     state->input[end] == '|') {
-            token->type = SHELL_TOKEN_REDIRECT_CLOBBER;
-            end++;
-          } else if (after_digit == '<' && end < state->length &&
-                     state->input[end] == '>') {
-            token->type = SHELL_TOKEN_REDIRECT_READ_WRITE;
-            end++;
-          }
-          end = shell_source_skip_escaped_line_endings(state->input,
-                                                       state->length, end);
-          if (end < state->length && state->input[end] == '&') {
-            end = scan_descriptor_target(state->input, end + 1, state->length);
-          }
-        }
-        token->length = end - state->position;
-        token->is_escaped = memchr(token->start, '\\', token->length) != NULL;
-        state->position = end;
-        return shell_token_return_current_group_context(state, token);
+        return full_redirect_token(state, token, state->position, check_pos,
+                                   true);
       }
     }
   }
@@ -2105,16 +2094,8 @@ ordinary_word:
       }
     } else {
       if (c == '\\' && state->position + 1 < state->length) {
-        /* An escaped '$' disarms command substitution as a whole.  Continue
-         * across its balanced parentheses so a literal `\\$(name)` remains
-         * one shell word instead of exposing a spurious subshell group. */
-        if (state->input[state->position + 1] == '$' &&
-            state->position + 2 < state->length &&
-            state->input[state->position + 2] == '(') {
-          state->position = shell_source_skip_balanced_parentheses(
-              state->input, state->length, state->position + 2);
-          continue;
-        }
+        /* An escape protects its next byte only. In unquoted \$(name),
+         * the dollar is literal but the parentheses remain shell syntax. */
         state->position += 2;
         continue;
       }
@@ -2173,19 +2154,6 @@ ordinary_word:
   return true;
 }
 
-static bool full_token_is_redirection(const shell_token_t *token) {
-  return token->type == SHELL_TOKEN_REDIRECT_IN ||
-         token->type == SHELL_TOKEN_REDIRECT_OUT ||
-         token->type == SHELL_TOKEN_REDIRECT_ERR ||
-         token->type == SHELL_TOKEN_REDIRECT_APPEND ||
-         token->type == SHELL_TOKEN_REDIRECT_READ_WRITE ||
-         token->type == SHELL_TOKEN_REDIRECT_CLOBBER ||
-         token->type == SHELL_TOKEN_REDIRECT_BOTH ||
-         token->type == SHELL_TOKEN_REDIRECT_BOTH_APPEND ||
-         token->type == SHELL_TOKEN_HEREDOC ||
-         token->type == SHELL_TOKEN_HERESTRING;
-}
-
 /* Source spans include every lexical fragment of a redirect operand. */
 static size_t full_redirect_end(const char *input, size_t input_length,
                                 const shell_token_t *token) {
@@ -2199,9 +2167,9 @@ static bool full_redirection_consumes_next(const shell_token_t *token) {
 }
 
 /* The raw scanner preserves diagnostic lexical tokens. This small forward
- * state machine decides only their command position, so literal braces never
- * trigger a scan of the preceding source. Prefix words are recognized as
- * complete logical words, not fragments such as time"". */
+ * state machine preserves reserved-word, assignment and declaration roles,
+ * so literal braces never trigger a scan of preceding source. Prefix words
+ * are complete logical words, not fragments such as time"". */
 static bool shell_tokenizer_next_body(shell_tokenizer_state_t *state,
                                       shell_token_t *token) {
   shell_source_scope_frontier(state->input, state->position);
@@ -2223,18 +2191,30 @@ static bool shell_tokenizer_next_body(shell_tokenizer_state_t *state,
     state->lexical_command_position = true;
     state->lexical_redirect_operand = false;
     state->lexical_operand_end = 0;
-    state->lexical_prefix =
-        token->type == SHELL_TOKEN_PIPE || token->type == SHELL_TOKEN_PIPE_BOTH
-            ? 0
-            : 1;
+    /* Bash's time_command_acceptable() excludes a plain pipe immediately
+     * before LF, but not |&. A second LF changes that two-token history.
+     * Comments leave their LF visible; removed continuations do not update
+     * this state. Keep lexical recognition separate from stage grammar. */
+    if (token->type == SHELL_TOKEN_PIPE)
+      state->lexical_prefix =
+          LEXICAL_PREVIOUS_PIPE | LEXICAL_ASSIGNMENT_ALLOWED;
+    else if (token->type == SHELL_TOKEN_PIPE_BOTH ||
+             (token->type == SHELL_TOKEN_SEMICOLON &&
+              (state->lexical_prefix & LEXICAL_PREVIOUS_PIPE)))
+      state->lexical_prefix = LEXICAL_ASSIGNMENT_ALLOWED;
+    else
+      state->lexical_prefix = LEXICAL_TIME_ALLOWED | LEXICAL_ASSIGNMENT_ALLOWED;
     return true;
   default:
     break;
   }
   if (full_token_is_redirection(token)) {
+    /* A redirect commits simple-command syntax even while argv[0] is still
+     * pending. Later braces are ordinary words, not reserved group openers. */
+    state->lexical_command_position = false;
     state->lexical_redirect_operand = full_redirection_consumes_next(token);
     state->lexical_operand_end = 0;
-    state->lexical_prefix = 0;
+    state->lexical_prefix &= LEXICAL_ASSIGNMENT_ALLOWED;
     return true;
   }
   if (state->lexical_redirect_operand) {
@@ -2242,39 +2222,73 @@ static bool shell_tokenizer_next_body(shell_tokenizer_state_t *state,
         shell_tokenizer_token_continues_word(token,
                                              state->lexical_operand_end)) {
       state->lexical_operand_end = token->position + token->length;
+      /* Reserved-looking bytes are word data in a redirect operand. Publish
+       * that role once, before any consumer interprets pipeline modifiers. */
+      if (token->type == SHELL_TOKEN_PIPE_NEGATE)
+        token->type = SHELL_TOKEN_ARGUMENT;
       return true;
     }
     state->lexical_redirect_operand = false;
   }
+  bool continues =
+      state->lexical_operand_end != 0 &&
+      shell_tokenizer_token_continues_word(token, state->lexical_operand_end);
   state->lexical_operand_end = token->position + token->length;
+  if (continues)
+    return true;
   if (state->lexical_command_position) {
-    enum { TIME_ALLOWED = 1, P_ALLOWED = 2, DASH_ALLOWED = 4 };
     size_t after = 0;
     if (token->type == SHELL_TOKEN_PIPE_NEGATE) {
-      state->lexical_prefix &= TIME_ALLOWED;
+      state->lexical_prefix &=
+          LEXICAL_TIME_ALLOWED | LEXICAL_ASSIGNMENT_ALLOWED;
       return true;
     }
-    if ((state->lexical_prefix & TIME_ALLOWED) &&
+    if ((state->lexical_prefix & LEXICAL_TIME_ALLOWED) &&
         shell_source_match_plain_word(state->input, state->length,
                                       token->position, "time", 4, &after)) {
-      state->lexical_prefix = TIME_ALLOWED | P_ALLOWED | DASH_ALLOWED;
+      state->lexical_prefix = LEXICAL_TIME_ALLOWED | LEXICAL_TIME_P_ALLOWED |
+                              LEXICAL_TIME_DASH_ALLOWED |
+                              LEXICAL_ASSIGNMENT_ALLOWED;
       return true;
     }
-    if ((state->lexical_prefix & P_ALLOWED) &&
+    if ((state->lexical_prefix & LEXICAL_TIME_P_ALLOWED) &&
         shell_source_match_plain_word(state->input, state->length,
                                       token->position, "-p", 2, &after)) {
-      state->lexical_prefix &= (uint8_t)~P_ALLOWED;
+      state->lexical_prefix &= (uint8_t)~LEXICAL_TIME_P_ALLOWED;
       return true;
     }
-    if ((state->lexical_prefix & DASH_ALLOWED) &&
+    if ((state->lexical_prefix & LEXICAL_TIME_DASH_ALLOWED) &&
         shell_source_match_plain_word(state->input, state->length,
                                       token->position, "--", 2, &after)) {
-      state->lexical_prefix &= TIME_ALLOWED;
+      state->lexical_prefix &=
+          LEXICAL_TIME_ALLOWED | LEXICAL_ASSIGNMENT_ALLOWED;
       return true;
     }
   }
+  bool assignment_open = state->lexical_prefix & LEXICAL_ASSIGNMENT_ALLOWED;
+  shell_source_assignment_word_t assignment;
+  bool assignment_word =
+      assignment_open &&
+      (token->type == SHELL_TOKEN_ARRAY_ASSIGNMENT ||
+       shell_source_parse_scalar_assignment_word(
+           token->start, state->length - token->position, &assignment));
+  bool declaration =
+      assignment_open && !assignment_word &&
+      (shell_source_match_plain_word(state->input, state->length,
+                                     token->position, "declare", 7, NULL) ||
+       shell_source_match_plain_word(state->input, state->length,
+                                     token->position, "typeset", 7, NULL) ||
+       shell_source_match_plain_word(state->input, state->length,
+                                     token->position, "local", 5, NULL) ||
+       shell_source_match_plain_word(state->input, state->length,
+                                     token->position, "export", 6, NULL) ||
+       shell_source_match_plain_word(state->input, state->length,
+                                     token->position, "readonly", 8, NULL));
   state->lexical_command_position = false;
-  state->lexical_prefix = 0;
+  state->lexical_prefix =
+      assignment_word ? LEXICAL_ASSIGNMENT_ALLOWED
+      : declaration   ? LEXICAL_DECLARATION_OPERANDS
+                      : state->lexical_prefix & LEXICAL_DECLARATION_OPERANDS;
   return true;
 }
 
@@ -2283,6 +2297,15 @@ bool shell_tokenizer_next(shell_tokenizer_state_t *state,
   shell_source_operation_begin(state->input, state->length);
   shell_source_workspace_scope_t previous = shell_source_workspace_begin(
       state->input, state->length, state->workspace, state->workspace_size);
+  bool independent = source_operation.depth == 1 && state->workspace;
+  if (independent) {
+    source_iterator_workspace_t saved;
+    memcpy(&saved,
+           (char *)state->workspace + state->workspace_size - sizeof(saved),
+           sizeof(saved));
+    source_operation.workspace_size = saved.scratch_size;
+    source_operation.arrays = saved.arrays;
+  }
   bool found = shell_tokenizer_next_body(state, token);
   if (shell_source_scratch_exhausted()) {
     state->heredoc_error = true;
@@ -2291,6 +2314,8 @@ bool shell_tokenizer_next(shell_tokenizer_state_t *state,
     token->type = SHELL_TOKEN_END;
     found = false;
   }
+  if (independent)
+    source_iterator_workspace_save(state);
   shell_source_workspace_end(previous);
   shell_source_operation_end();
   return found;
@@ -2308,19 +2333,15 @@ static bool control_token_is_word(const shell_token_t *token) {
 static bool control_token_starts_function_definition(const shell_token_t *token,
                                                      const char *input,
                                                      size_t input_length) {
-  if (!control_token_is_word(token) || token->is_quoted ||
-      token->position > input_length ||
+  if (!control_token_is_word(token) || token->position > input_length ||
       token->length > input_length - token->position)
     return false;
 
-  size_t name_end = 0;
-  if (!function_name_end(token->start, token->length, 0, &name_end) ||
-      shell_source_skip_escaped_line_endings(token->start, token->length,
-                                             name_end) != token->length)
+  size_t word_end;
+  if (!shell_source_skip_shell_word(input, input_length, token->position,
+                                    &word_end))
     return false;
-  size_t after = 0;
-  return function_parentheses_after_name(
-      input, input_length, token->position + token->length, &after);
+  return shell_source_function_declarator_after(input, input_length, word_end);
 }
 
 /* The Bash `function` spelling needs a name before a compound body. Keep the
@@ -2891,7 +2912,7 @@ static bool token_starts_bash_compound_command(const shell_token_t *token,
   if (!token || !input || token->position > input_length ||
       token->length == 0 || token->length > input_length - token->position)
     return false;
-  if (shell_token_is_literal(input, token))
+  if (shell_token_is_literal(token))
     return false;
 
   size_t position = token->position;
@@ -3243,9 +3264,9 @@ static SHELL_NONNULL(1) bool unsupported_semantics_scan_impl(
         token.type == SHELL_TOKEN_CASE_FALLTHROUGH ||
         token.type == SHELL_TOKEN_CASE_TEST_NEXT)
       return true;
-    /* No stage or prefix word has followed the previous list boundary yet.
-     * A physical newline is continuation trivia, not a new pipeline whose
-     * head may regain reserved `time` eligibility after `|` or `|&`. */
+    /* Continuation LF does not begin a new pipeline stage. The lexical
+     * iterator independently retains Bash's time-keyword history; the list
+     * boundary rejects a reserved time where only a stage is permitted. */
     if (command_start && !pipeline_prefix.scanned &&
         !pipeline_prefix.has_stage && token.type == SHELL_TOKEN_SEMICOLON &&
         (token.start[0] == '\n'))
@@ -3980,6 +4001,12 @@ typedef struct {
   bool needs_stage;
   bool pipeline_start;
   shell_pipeline_prefix_state_t prefix;
+  /* Lexical assignment eligibility differs from reserved-word eligibility:
+   * leading assignments/redirects still leave the command name pending.
+   * Declaration syntax requires a literal unquoted command spelling, not a
+   * runtime or quote-removed builtin identity. Each word is classified once. */
+  bool assignment_prefix_open, declaration_operands;
+  size_t word_end;
   /* True only after a real list terminator completed the preceding stage.
    * An otherwise empty `time` prefix may end at top-level EOF, but it may not
    * use a containing `)` as an implicit terminator. */
@@ -4010,6 +4037,7 @@ static shell_list_state_t shell_list_state_initial(void) {
   return (shell_list_state_t){
       .needs_stage = true,
       .pipeline_start = true,
+      .assignment_prefix_open = true,
       .prefix = shell_pipeline_prefix_state_initial(true),
       .may_end = false,
       .redirect_operand = false,
@@ -4058,9 +4086,9 @@ bool shell_tokenizer_compound_prefix_span(const char *input,
   return true;
 }
 
-/* Structural punctuation can be returned as a standalone token immediately
- * after a preceding escape. The token itself then has no escape byte to mark,
- * so inspect the source run that ends at its position. */
+/* Escapes belong to the token which consumed them. In particular, a raw LF
+ * emitted after a skipped comment is structural even if the comment ends in
+ * backslash. Continuation-only escapes do not quote an operator. */
 static SHELL_NONNULL(1) bool shell_list_token_has_noncontinuation_escape(
     const shell_token_t *token) {
   for (size_t position = 0; position < token->length;) {
@@ -4077,15 +4105,10 @@ static SHELL_NONNULL(1) bool shell_list_token_has_noncontinuation_escape(
   return false;
 }
 
-bool shell_token_is_literal(const char *input, const shell_token_t *token) {
-  if (token->is_quoted ||
-      (token->is_escaped && shell_list_token_has_noncontinuation_escape(token)))
-    return true;
-  size_t backslashes = 0;
-  for (size_t pos = (size_t)(token->start - input);
-       pos > 0 && input[pos - 1] == '\\'; pos--)
-    backslashes++;
-  return (backslashes % 2) != 0;
+bool shell_token_is_literal(const shell_token_t *token) {
+  return token->is_quoted ||
+         (token->is_escaped &&
+          shell_list_token_has_noncontinuation_escape(token));
 }
 
 /* Control-compound detection deliberately tolerates incomplete syntax so a
@@ -4102,7 +4125,7 @@ static bool full_redirect_operands_have_inline_boundaries(const char *input,
   size_t operator_end = 0;
   shell_token_t token;
   while (shell_tokenizer_next(&tokenizer, &token)) {
-    bool literal_token = shell_token_is_literal(input, &token);
+    bool literal_token = shell_token_is_literal(&token);
     if (shell_source_is_escaped_line_ending(input, token.position,
                                             token.position + token.length))
       continue;
@@ -4113,25 +4136,17 @@ static bool full_redirect_operands_have_inline_boundaries(const char *input,
            shell_source_skip_inline_continuations(
                input, token.position, operator_end) != token.position))
         return false;
-      if (!literal_token && full_token_is_redirection(&token) &&
-          token.position == operator_end) {
-        operand_pending = full_redirection_consumes_next(&token);
-        operator_end = token.position + token.length;
-        continue;
-      }
       if (!literal_token &&
           (full_token_is_redirection(&token) ||
            token.type == SHELL_TOKEN_GROUP_END ||
            token.type == SHELL_TOKEN_SUBSHELL_END ||
-           token.type == SHELL_TOKEN_PIPE_NEGATE ||
            token.type == SHELL_TOKEN_PIPE ||
            token.type == SHELL_TOKEN_PIPE_BOTH ||
            token.type == SHELL_TOKEN_AND || token.type == SHELL_TOKEN_OR ||
            token.type == SHELL_TOKEN_SEMICOLON ||
            token.type == SHELL_TOKEN_BACKGROUND ||
-           ((token.type == SHELL_TOKEN_GROUP_START ||
-             token.type == SHELL_TOKEN_SUBSHELL_START) &&
-            (token.position == 0 || input[token.position - 1] != '$'))))
+           token.type == SHELL_TOKEN_GROUP_START ||
+           token.type == SHELL_TOKEN_SUBSHELL_START))
         return false;
       operand_pending = false;
     }
@@ -4155,6 +4170,7 @@ typedef enum {
   SHELL_LIST_END_TOP_LEVEL,
   SHELL_LIST_END_PARENTHESIZED,
   SHELL_LIST_END_RECEIVED,
+  SHELL_LIST_END_RECEIVED_CHILD,
 } shell_list_end_context_t;
 
 static bool
@@ -4318,6 +4334,8 @@ static SHELL_NONNULL(1) bool shell_tokenizer_list_syntax_valid_body(
     const char *input, size_t input_length,
     shell_list_end_context_t end_context, size_t recursion_depth,
     bool require_complete, shell_source_draft_state_t *draft) {
+  bool can_append = end_context == SHELL_LIST_END_RECEIVED ||
+                    end_context == SHELL_LIST_END_RECEIVED_CHILD;
   if (!draft && !shell_list_validate_substitutions(
                     input, input_length, recursion_depth, require_complete))
     return false;
@@ -4365,11 +4383,57 @@ static SHELL_NONNULL(1) bool shell_tokenizer_list_syntax_valid_body(
          (state.group_redirect_word_open &&
           token.position == state.group_redirect_word_end)))
       break;
-    bool literal_token = shell_token_is_literal(input, &token);
+    bool literal_token = shell_token_is_literal(&token);
+
+    /* Reuse subscript boundaries only where this lexical role can own an
+     * assignment. Ordinary words must not trigger whole-suffix lookahead. */
+    bool array_candidate =
+        !state.after_group && !state.redirect_operand &&
+        token.position >= state.word_end && control_token_is_word(&token) &&
+        (state.assignment_prefix_open || state.declaration_operands);
+    size_t array_end = 0;
+    /* Escapes inside a subscript/body do not quote its outer assignment
+     * spelling. Recognize that spelling rather than using a whole-token flag.
+     */
+    array_word_t array =
+        array_candidate
+            ? array_assignment_probe(input, input_length, token.position,
+                                     state.assignment_prefix_open, &array_end)
+            : ARRAY_WORD_NONE;
+    if (array == ARRAY_WORD_COMPOUND ||
+        (draft && array == ARRAY_WORD_UNCLASSIFIED)) {
+      /* Array recovery is not modeled. An unresolved subscript cannot prove
+       * an outer group/list error, and cannot qualify a recovery prefix. */
+      if (draft)
+        draft->failure = SHELL_SOURCE_UNSUPPORTED;
+      if (draft)
+        return false;
+    }
+    bool redirect_word = state.redirect_operand;
+
+    /* Diagnostic lexing keeps an unmatched '}' as a word, including in
+     * unsupported function syntax. In modeled list grammar its reserved
+     * command-position role nevertheless proves an unmatched close. */
+    if (draft && !literal_token && state.needs_stage &&
+        token_is_plain_word(input, input_length, &token, "}"))
+      return false;
 
     /* Case terminators are not separators in an ordinary command list.
      * Actual control constructs took their diagnostic path above. Reject a
      * bare clause operator here even if there is no command to allocate. */
+    if (draft && !literal_token && state.needs_stage &&
+        token_starts_bash_compound_command(&token, input, input_length)) {
+      size_t word_end;
+      bool pending_keyword =
+          can_append &&
+          shell_source_unsupported_keyword(input, input_length, token.position,
+                                           &word_end) &&
+          word_end == input_length;
+      if (!pending_keyword) {
+        draft->failure = SHELL_SOURCE_UNSUPPORTED;
+        return false;
+      }
+    }
     if (!literal_token && (token.type == SHELL_TOKEN_CASE_TERMINATE ||
                            token.type == SHELL_TOKEN_CASE_FALLTHROUGH ||
                            token.type == SHELL_TOKEN_CASE_TEST_NEXT))
@@ -4421,27 +4485,19 @@ static SHELL_NONNULL(1) bool shell_tokenizer_list_syntax_valid_body(
                                                  state.redirect_operator_end) !=
               token.position)
         return false;
-      /* Adjacent redirect fragments can belong to one operator. Keep
-       * extending it until its actual shell-word operand begins. */
-      if (!literal_token && full_token_is_redirection(&token) &&
-          token.position == state.redirect_operator_end) {
-        state.redirect_operand = full_redirection_consumes_next(&token);
-        state.redirect_operator_end = token.position + token.length;
-        continue;
-      }
+      /* Operators are complete longest-match tokens. An adjacent operator
+       * cannot replace this operator's missing shell-word operand. */
       if (!literal_token &&
           (full_token_is_redirection(&token) ||
            token.type == SHELL_TOKEN_GROUP_END ||
            token.type == SHELL_TOKEN_SUBSHELL_END ||
-           token.type == SHELL_TOKEN_PIPE_NEGATE ||
            token.type == SHELL_TOKEN_PIPE ||
            token.type == SHELL_TOKEN_PIPE_BOTH ||
            token.type == SHELL_TOKEN_AND || token.type == SHELL_TOKEN_OR ||
            token.type == SHELL_TOKEN_SEMICOLON ||
            token.type == SHELL_TOKEN_BACKGROUND ||
-           ((token.type == SHELL_TOKEN_GROUP_START ||
-             token.type == SHELL_TOKEN_SUBSHELL_START) &&
-            (token.position == 0 || input[token.position - 1] != '$'))))
+           token.type == SHELL_TOKEN_GROUP_START ||
+           token.type == SHELL_TOKEN_SUBSHELL_START))
         return false;
       state.redirect_operand = false;
       state.redirect_operator_end = 0;
@@ -4460,7 +4516,6 @@ static SHELL_NONNULL(1) bool shell_tokenizer_list_syntax_valid_body(
           token.type != SHELL_TOKEN_SUBSHELL_START &&
           token.type != SHELL_TOKEN_GROUP_END &&
           token.type != SHELL_TOKEN_SUBSHELL_END &&
-          token.type != SHELL_TOKEN_PIPE_NEGATE &&
           token.type != SHELL_TOKEN_PIPE &&
           token.type != SHELL_TOKEN_PIPE_BOTH &&
           token.type != SHELL_TOKEN_AND && token.type != SHELL_TOKEN_OR &&
@@ -4470,52 +4525,22 @@ static SHELL_NONNULL(1) bool shell_tokenizer_list_syntax_valid_body(
         continue;
       }
       if (state.group_redirect_operand) {
-        /* Adjacent redirect fragments extend one operator rather than
-         * introducing a second redirect with a missing first operand. */
-        if (!literal_token && full_token_is_redirection(&token) &&
-            token.position == state.group_redirect_operator_end) {
-          state.group_redirect_operator_end = token.position + token.length;
-          continue;
-        }
-        /* The iterator exposes the `(` in `$(command)` as a group token.
-         * It is nevertheless one redirect operand, not a bare group after a
-         * completed compound command. Let the existing balanced-group path
-         * consume it, then re-establish the post-group boundary at its close.
-         */
         if (!literal_token &&
-            (token.type == SHELL_TOKEN_GROUP_START ||
-             token.type == SHELL_TOKEN_SUBSHELL_START) &&
-            token.position != 0 && input[token.position - 1] == '$') {
-          state.group_redirect_operand = false;
-          state.after_group = false;
-          if (group_count == SHELL_MAX_GROUPS)
-            return false;
-          groups[group_count++] = (shell_list_group_state_t){
-              .parent = state,
-              .opening_type = token.type,
-              .opening_position = token.position,
-          };
-          state = shell_list_state_initial();
-          continue;
-        } else {
-          if (!literal_token &&
-              (full_token_is_redirection(&token) ||
-               token.type == SHELL_TOKEN_GROUP_START ||
-               token.type == SHELL_TOKEN_SUBSHELL_START ||
-               token.type == SHELL_TOKEN_GROUP_END ||
-               token.type == SHELL_TOKEN_SUBSHELL_END ||
-               token.type == SHELL_TOKEN_PIPE_NEGATE ||
-               token.type == SHELL_TOKEN_PIPE ||
-               token.type == SHELL_TOKEN_PIPE_BOTH ||
-               token.type == SHELL_TOKEN_AND || token.type == SHELL_TOKEN_OR ||
-               token.type == SHELL_TOKEN_SEMICOLON ||
-               token.type == SHELL_TOKEN_BACKGROUND))
-            return false;
-          state.group_redirect_operand = false;
-          state.group_redirect_word_open = true;
-          state.group_redirect_word_end = token.position + token.length;
-          continue;
-        }
+            (full_token_is_redirection(&token) ||
+             token.type == SHELL_TOKEN_GROUP_START ||
+             token.type == SHELL_TOKEN_SUBSHELL_START ||
+             token.type == SHELL_TOKEN_GROUP_END ||
+             token.type == SHELL_TOKEN_SUBSHELL_END ||
+             token.type == SHELL_TOKEN_PIPE ||
+             token.type == SHELL_TOKEN_PIPE_BOTH ||
+             token.type == SHELL_TOKEN_AND || token.type == SHELL_TOKEN_OR ||
+             token.type == SHELL_TOKEN_SEMICOLON ||
+             token.type == SHELL_TOKEN_BACKGROUND))
+          return false;
+        state.group_redirect_operand = false;
+        state.group_redirect_word_open = true;
+        state.group_redirect_word_end = token.position + token.length;
+        continue;
       }
       if (full_token_is_redirection(&token)) {
         state.group_redirect_operand = full_redirection_consumes_next(&token);
@@ -4525,7 +4550,7 @@ static SHELL_NONNULL(1) bool shell_tokenizer_list_syntax_valid_body(
       }
       /* Received EOF has not committed a new redirector's lexical role.
        * Closed children cannot gain an operator outside their delimiter. */
-      if (draft && end_context == SHELL_LIST_END_RECEIVED) {
+      if (draft && can_append) {
         size_t at;
         shell_source_fd_prefix_t prefix = shell_source_pending_fd_prefix(
             input, token.position, input_length, &at);
@@ -4553,13 +4578,15 @@ static SHELL_NONNULL(1) bool shell_tokenizer_list_syntax_valid_body(
                            token.type == SHELL_TOKEN_SUBSHELL_START)) {
       /* A compound command begins a pipeline stage; it cannot be appended to
        * an already complete simple command (`echo (cmd)`). Command
-       * substitutions retain their leading dollar and are one shell word,
-       * not this grammar production. */
-      if (!state.needs_stage &&
-          (token.position == 0 || input[token.position - 1] != '$'))
+       * substitutions are opaque word tokens. A raw preceding '$' does not
+       * prove substitution: it may have been escaped. */
+      if (!state.needs_stage)
         return false;
-      if (group_count == SHELL_MAX_GROUPS)
+      if (group_count == SHELL_MAX_GROUPS) {
+        if (draft)
+          draft->failure = SHELL_SOURCE_TRUNCATED;
         return false;
+      }
       groups[group_count++] = (shell_list_group_state_t){
           .parent = state,
           .opening_type = token.type,
@@ -4598,16 +4625,17 @@ static SHELL_NONNULL(1) bool shell_tokenizer_list_syntax_valid_body(
       state.group_redirect_word_open = false;
       state.group_redirect_word_end = 0;
       state.group_redirect_operator_end = 0;
+      state.assignment_prefix_open = false;
+      state.declaration_operands = false;
+      state.word_end = 0;
       continue;
     }
 
-    if (!literal_token && token.type == SHELL_TOKEN_PIPE_NEGATE) {
-      if (!state.needs_stage) {
-        /* `!` is only a pipeline modifier at a pipeline start. Elsewhere the
-         * full tokenizer intentionally preserves it as a simple-command word
-         * (for example, `echo !`). */
-        continue;
-      }
+    /* Outside a pending stage, ! follows the ordinary-word role transition
+     * below. In particular a redirect/assignment prefix can leave argv[0]
+     * pending while already excluding reserved pipeline syntax. */
+    if (!literal_token && token.type == SHELL_TOKEN_PIPE_NEGATE &&
+        state.needs_stage) {
       if (!state.pipeline_start)
         return false;
       if (shell_pipeline_prefix_step(&state.prefix,
@@ -4619,6 +4647,14 @@ static SHELL_NONNULL(1) bool shell_tokenizer_list_syntax_valid_body(
       state.may_end = false;
       continue;
     }
+
+    /* Lexical time recognition can return after continuation LF even while
+     * the grammar still needs a post-pipe stage. That reserved word is not
+     * an executable command named time, and Bash rejects it here. */
+    if (!literal_token && state.needs_stage && !state.pipeline_start &&
+        tokenizer.lexical_command_position &&
+        token_is_plain_word(input, input_length, &token, "time"))
+      return false;
 
     if (!literal_token && state.needs_stage && state.pipeline_start) {
       shell_pipeline_prefix_step_t step = shell_pipeline_prefix_step(
@@ -4634,12 +4670,14 @@ static SHELL_NONNULL(1) bool shell_tokenizer_list_syntax_valid_body(
 
     if (!literal_token && token.type == SHELL_TOKEN_SEMICOLON &&
         shell_list_token_is_newline(&token) && state.needs_stage) {
-      /* A binary list connector continues across physical lines. A pending
-       * `!` does not: its next stage must stay on the same logical line (or
-       * use an escaped physical continuation). */
+      /* A binary connector continues across LF. Bash also admits a standalone
+       * negation terminated by LF; that empty pipeline is not modeled. */
       if (state.prefix.negation_count != 0 &&
-          state.prefix.time_mode == SHELL_PIPE_TIME_NONE)
+          state.prefix.time_mode == SHELL_PIPE_TIME_NONE) {
+        if (draft)
+          draft->failure = SHELL_SOURCE_UNSUPPORTED;
         return false;
+      }
       if (state.prefix.time_mode != SHELL_PIPE_TIME_NONE) {
         state = shell_list_state_initial();
         state.may_end = true;
@@ -4659,8 +4697,13 @@ static SHELL_NONNULL(1) bool shell_tokenizer_list_syntax_valid_body(
           state.needs_stage && state.prefix.time_mode != SHELL_PIPE_TIME_NONE &&
           (token.type == SHELL_TOKEN_SEMICOLON ||
            token.type == SHELL_TOKEN_BACKGROUND);
-      if (state.needs_stage && !ends_empty_timed_pipeline)
+      if (state.needs_stage && !ends_empty_timed_pipeline) {
+        if (draft && state.prefix.negation_count != 0 &&
+            (token.type == SHELL_TOKEN_SEMICOLON ||
+             token.type == SHELL_TOKEN_BACKGROUND))
+          draft->failure = SHELL_SOURCE_UNSUPPORTED;
         return false;
+      }
       state.needs_stage = true;
       state.pipeline_start =
           token.type != SHELL_TOKEN_PIPE && token.type != SHELL_TOKEN_PIPE_BOTH;
@@ -4677,6 +4720,9 @@ static SHELL_NONNULL(1) bool shell_tokenizer_list_syntax_valid_body(
       state.group_redirect_word_open = false;
       state.group_redirect_word_end = 0;
       state.group_redirect_operator_end = 0;
+      state.assignment_prefix_open = true;
+      state.declaration_operands = false;
+      state.word_end = 0;
       continue;
     }
 
@@ -4685,15 +4731,52 @@ static SHELL_NONNULL(1) bool shell_tokenizer_list_syntax_valid_body(
       size_t word_end;
       if (shell_source_unsupported_keyword(input, input_length, token.position,
                                            &word_end)) {
-        if (word_end != input_length || end_context != SHELL_LIST_END_RECEIVED)
+        if (word_end != input_length || !can_append) {
+          draft->failure = SHELL_SOURCE_UNSUPPORTED;
           return false;
+        }
         draft->need = SHELL_SOURCE_NEEDS_COMMAND;
         draft->incomplete_at = (uint32_t)token.position;
         return true;
       }
-      if (control_token_starts_function_definition(&token, input, input_length))
+      if (control_token_starts_function_definition(&token, input,
+                                                   input_length)) {
+        draft->failure = SHELL_SOURCE_UNSUPPORTED;
         return false;
+      }
     }
+    if (!full_token_is_redirection(&token) &&
+        token.position >= state.word_end) {
+      size_t word_end;
+      /* Scalar indexed-assignment tokens end at '='. Their value fragments
+       * retain the same assignment role through the complete shell word. */
+      if (!shell_tokenizer_word_end(input, input_length, &token, &word_end))
+        /* Diagnostic tokenization may retain an unfinished word. Its
+         * remaining fragments still consume one lexical role; completeness
+         * belongs to the existing strict/draft validation boundaries. */
+        word_end = input_length;
+      state.word_end = word_end;
+      if (!redirect_word && state.assignment_prefix_open) {
+        shell_source_assignment_word_t assignment;
+        bool assignment_word =
+            token.type == SHELL_TOKEN_ARRAY_ASSIGNMENT ||
+            shell_source_parse_scalar_assignment_word(
+                input + token.position, word_end - token.position, &assignment);
+        if (!assignment_word) {
+          state.declaration_operands =
+              token_is_plain_word(input, input_length, &token, "declare") ||
+              token_is_plain_word(input, input_length, &token, "typeset") ||
+              token_is_plain_word(input, input_length, &token, "local") ||
+              token_is_plain_word(input, input_length, &token, "export") ||
+              token_is_plain_word(input, input_length, &token, "readonly");
+          state.assignment_prefix_open = false;
+        }
+      }
+    }
+    /* Bash's lexical declaration-operand eligibility ends at a redirection.
+     * A leading redirect still leaves the first command word pending. */
+    if (full_token_is_redirection(&token))
+      state.declaration_operands = false;
     state.needs_stage = false;
     state.pipeline_start = false;
     state.prefix = shell_pipeline_prefix_state_initial(false);
@@ -4710,6 +4793,16 @@ static SHELL_NONNULL(1) bool shell_tokenizer_list_syntax_valid_body(
   }
 
   if (draft) {
+    /* A pending document must not hide a separately proven grammar error in
+     * a closed child. EOF may terminate its body, not a group or connector. */
+    if (draft->heredoc_eof && !can_append &&
+        (group_count || tokenizer.in_quotes || state.redirect_operand ||
+         state.group_redirect_operand ||
+         (saw_token && state.needs_stage && !state.may_end &&
+          state.prefix.time_mode == SHELL_PIPE_TIME_NONE &&
+          (state.prefix.negation_count == 0 ||
+           end_context != SHELL_LIST_END_TOP_LEVEL))))
+      return false;
     if (draft->need == SHELL_SOURCE_NEEDS_NONE) {
       if (tokenizer.heredoc_error) {
         draft->need = SHELL_SOURCE_NEEDS_HEREDOC_HEADER;
@@ -4734,6 +4827,12 @@ static SHELL_NONNULL(1) bool shell_tokenizer_list_syntax_valid_body(
         draft->incomplete_at = (uint32_t)groups[0].opening_position;
       } else if (saw_token && state.needs_stage && !state.may_end &&
                  state.prefix.time_mode == SHELL_PIPE_TIME_NONE) {
+        if (state.prefix.negation_count != 0 &&
+            (end_context == SHELL_LIST_END_RECEIVED ||
+             end_context == SHELL_LIST_END_TOP_LEVEL)) {
+          draft->failure = SHELL_SOURCE_UNSUPPORTED;
+          return false;
+        }
         draft->need = SHELL_SOURCE_NEEDS_COMMAND;
         draft->incomplete_at = (uint32_t)last_position;
       }
@@ -4777,16 +4876,22 @@ shell_tokenizer_list_syntax_valid_impl(const char *input, size_t input_length,
 }
 
 shell_source_status_t
-shell_source_draft_grammar(const char *source, size_t length, bool received_eof,
+shell_source_draft_grammar(const char *source, size_t length,
+                           shell_source_draft_end_t end_context,
                            shell_source_draft_state_t *result) {
   shell_source_scope_t previous = shell_source_scope_begin(source, length);
   bool valid = shell_tokenizer_list_syntax_valid_body(
       source, length,
-      received_eof ? SHELL_LIST_END_RECEIVED : SHELL_LIST_END_TOP_LEVEL, 0,
-      false, result);
+      end_context == SHELL_SOURCE_END_RECEIVED ? SHELL_LIST_END_RECEIVED
+      : end_context == SHELL_SOURCE_END_OPEN_CHILD
+          ? SHELL_LIST_END_RECEIVED_CHILD
+      : end_context == SHELL_SOURCE_END_BACKTICK ? SHELL_LIST_END_TOP_LEVEL
+                                                 : SHELL_LIST_END_PARENTHESIZED,
+      0, false, result);
   shell_source_scope_end(previous);
   if (!valid)
-    return SHELL_SOURCE_INVALID;
+    return result->failure == SHELL_SOURCE_COMPLETE ? SHELL_SOURCE_INVALID
+                                                    : result->failure;
   return result->need == SHELL_SOURCE_NEEDS_NONE ? SHELL_SOURCE_COMPLETE
                                                  : SHELL_SOURCE_INCOMPLETE;
 }
@@ -4864,7 +4969,7 @@ static SHELL_NONNULL(1, 3, 4) shell_tokenize_status_t
                                  bool reject_unsupported) {
   *commands = NULL;
   *command_count = 0;
-  if (contains_invalid_shell_byte(input, input_length))
+  if (!shell_source_bytes_valid(input, input_length))
     return SHELL_TOKENIZE_EINPUT;
   if (!(require_complete
             ? shell_tokenizer_complete_syntax_valid(input, input_length)
@@ -4886,6 +4991,11 @@ shell_tokenize_status_t shell_tokenize_prevalidated_commands(
 
   shell_tokenizer_state_t state;
   shell_tokenizer_init_prechecked(&state, input, input_length);
+  /* Sliced post-pipe stages retain their root parse's ordinary-word role.
+   * Prefix metadata alone is insufficient: lexical brace recognition must
+   * see that an initial executable named time already commits the command. */
+  if (!allow_initial_time)
+    state.lexical_prefix &= (uint8_t)~LEXICAL_TIME_MASK;
 
   size_t count = 0;
   bool expect_command = true;
@@ -4903,9 +5013,8 @@ shell_tokenize_status_t shell_tokenize_prevalidated_commands(
     if (shell_source_is_escaped_line_ending(input, token.position,
                                             token.position + token.length))
       continue;
-    /* The list-syntax validator has already rejected a raw physical newline
-     * after a pending `!`. Here a newline only continues a validated binary
-     * list operator. */
+    /* The supported-list boundary has already declined empty negation at LF.
+     * Here a newline only continues a validated binary list operator. */
     if (expect_command && shell_list_token_is_newline(&token)) {
       if (pipeline_prefix.time_mode == SHELL_PIPE_TIME_NONE)
         continue;
@@ -5023,6 +5132,8 @@ shell_tokenize_status_t shell_tokenize_prevalidated_commands(
   memset(*commands, 0, count * sizeof(shell_command_t));
 
   shell_tokenizer_init_prechecked(&state, input, input_length);
+  if (!allow_initial_time)
+    state.lexical_prefix &= (uint8_t)~LEXICAL_TIME_MASK;
   size_t current_command = 0;
   shell_command_t *current_cmd = &(*commands)[current_command];
 

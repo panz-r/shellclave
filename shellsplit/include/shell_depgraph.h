@@ -65,6 +65,9 @@ typedef enum {
   SHELL_DEP_OK = 0,
   SHELL_DEP_EINPUT = -1,
   SHELL_DEP_ETRUNC = -2,
+  /* Coarse syntax or unsupported/unclassified semantic failure. This alone
+   * does not establish a Bash syntax error. shell_parse_draft() supplies the
+   * source-level classification; COMPLETE still permits semantic rejection. */
   SHELL_DEP_EPARSE = -3,
   /* Caller-owned dependency-analysis workspace was absent, misaligned, or
    * too small. It is required for compound-group descriptor snapshots and
@@ -219,10 +222,10 @@ typedef enum {
  * the default. `workspace` is caller-owned scratch storage used only while
  * parsing and resolving descriptor routes; it is never retained by the graph
  * and need not be initialized or cleared by the caller between parses.
- * Bytes beyond shell_dep_workspace_size()'s fixed prefix serve as delimiter
- * scratch. shell_source_workspace_size(command_length, &bytes) gives a
- * sufficient extra capacity; unusually large normalized delimiters can require
- * EWORKSPACE and a retry.
+ * Bytes beyond shell_dep_workspace_size()'s fixed prefix serve as source
+ * scratch for delimiter preparation and non-evicting subscript boundaries.
+ * shell_source_workspace_size(command_length, &bytes) gives a sufficient
+ * extra capacity; larger inputs can require EWORKSPACE and a retry.
  * The fixed prefix includes the operation's lexical index, independent of
  * parsing performed by application expansion callbacks, and temporary state
  * for reconstructing inherited descriptor routes at compound-group expansion
@@ -265,7 +268,7 @@ size_t shell_dep_workspace_alignment(void);
 
 /**
  * Return the fixed temporary workspace for lexical indexing, graph state and
- * descriptor-route resolution. Additional source-sized delimiter scratch can
+ * descriptor-route resolution. Additional source-sized lexical scratch can
  * share its tail, as described by shell_dep_limits_t. `limits` may be NULL; the
  * current fixed-capacity implementation returns the same maximum size for every
  * valid limits configuration. The size is independent of command text, so

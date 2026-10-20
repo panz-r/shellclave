@@ -852,10 +852,25 @@ static void test_source_scanner_boundaries(void) {
    * malformed inner expansion must not make a later `]` look like a valid
    * outer terminator. */
   static const char *const valid_subscripts[] = {
-      "[a\\\nb]",           "[a\\\nb]",
-      "[$'hidden ]' + 1]",  "['hidden ]' + 1]",
-      "[\"hidden ]\" + 1]", "[`printf ']'` + 1]",
-      "[$((1 + 2)) + 1]",   "[$(printf ']') + 1]",
+      "[a\\\nb]",
+      "[a\\\nb]",
+      "[$'hidden ]' + 1]",
+      "['hidden ]' + 1]",
+      "[\"hidden ]\" + 1]",
+      "[`printf ']'` + 1]",
+      "[$((1 + 2)) + 1]",
+      "[$(printf ']') + 1]",
+      "[${v:-]} + (2)]",
+      "[${v:-[} + (2)]",
+      "[${v:-${w:-]}}]",
+      "[${v:-$(printf ])}]",
+      "[<(printf ]) + 1]",
+      "[>(printf [) + 1]",
+      "[${indices[0]:-]}]",
+      "[$\\\n{v:-]} + 1]",
+      "[<\\\n(printf ]) + 1]",
+      "[${v:-\"] [\"}]",
+      "[${v:-<(printf ])}]",
       "[[nested]]",
   };
   for (size_t i = 0;
@@ -867,10 +882,10 @@ static void test_source_scanner_boundaries(void) {
             after == length;
   }
   static const char *const invalid_subscripts[] = {
-      "[$'unterminated]",
-      "['unterminated]",
-      "[$((1 + 2]",
-      "[$(printf x]",
+      "[$'unterminated]", "['unterminated]", "[$((1 + 2]",
+      "[$(printf x]",     "[${v:-]",         "[${v:-[}",
+      "[<(printf ]",      "[>(printf [",     "[${}]",
+      "[${v!}]",
   };
   for (size_t i = 0;
        valid && i < sizeof(invalid_subscripts) / sizeof(invalid_subscripts[0]);
@@ -1695,16 +1710,16 @@ static void test_modern_bash_syntax_contract(void) {
       SHELL_GROUP_IO_FAILED_REDIRECT == 18;
   test("Group I/O enum appends modern redirect operations", enum_values_stable);
 
-  const char *source = "! printf $'a\\0b' @(left|right) items=(one two) &>out";
+  const char *source = "! items=(one two) printf $'a\\0b' @(left|right) &>out";
   shell_tokenizer_state_t state;
   shell_token_t token;
   shell_parse_result_t parsed = {0};
   shell_command_info_t *infos = NULL;
   size_t count = 0;
   shell_token_type_t expected[] = {
-      SHELL_TOKEN_PIPE_NEGATE,      SHELL_TOKEN_COMMAND,
-      SHELL_TOKEN_ANSI_C_QUOTED,    SHELL_TOKEN_EXTGLOB,
-      SHELL_TOKEN_ARRAY_ASSIGNMENT, SHELL_TOKEN_REDIRECT_BOTH,
+      SHELL_TOKEN_PIPE_NEGATE, SHELL_TOKEN_ARRAY_ASSIGNMENT,
+      SHELL_TOKEN_COMMAND,     SHELL_TOKEN_ANSI_C_QUOTED,
+      SHELL_TOKEN_EXTGLOB,     SHELL_TOKEN_REDIRECT_BOTH,
       SHELL_TOKEN_COMMAND,
   };
   bool valid = shell_tokenizer_init(&state, source, strlen(source), NULL);
@@ -2632,7 +2647,14 @@ static void test_modern_bash_syntax_contract(void) {
   }
   test("Malformed shell lists fail atomically across semantic adapters", valid);
 
-  valid = shell_parse_fast(source, strlen(source), NULL, &parsed) == SHELL_OK &&
+  test("Fast parser rejects misplaced compound-array syntax",
+       shell_parse_fast("printf items=(one two)",
+                        strlen("printf items=(one two)"), NULL,
+                        &parsed) == SHELL_EPARSE);
+  static const char feature_source[] =
+      "! items=(one two) printf $'a\\0b' @(left|right) &>out";
+  valid = shell_parse_fast(feature_source, sizeof(feature_source) - 1, NULL,
+                           &parsed) == SHELL_OK &&
           parsed.count == 1 &&
           (parsed.cmds[0].modifiers & SHELL_CMD_MOD_PIPE_NEGATED) != 0 &&
           (parsed.cmds[0].features & SHELL_FEAT_ANSI_C_QUOTE) != 0 &&
@@ -9314,13 +9336,13 @@ int main(void) {
        0,
        0},
       {"Tokenizer iterator: descriptor redirection family",
-       "cmd >>&9 >&10 <&0 3>&- 4<&- 12>>log",
+       ">>log>&10 <&0 3>&- 4<&- 12>>log",
        8,
-       {SHELL_TOKEN_COMMAND, SHELL_TOKEN_REDIRECT_APPEND,
+       {SHELL_TOKEN_REDIRECT_APPEND, SHELL_TOKEN_COMMAND,
         SHELL_TOKEN_REDIRECT_ERR, SHELL_TOKEN_REDIRECT_IN,
         SHELL_TOKEN_REDIRECT_ERR, SHELL_TOKEN_REDIRECT_IN,
         SHELL_TOKEN_REDIRECT_APPEND, SHELL_TOKEN_COMMAND},
-       {"cmd", ">>&9", ">&10", "<&0", "3>&-", "4<&-", "12>>", "log"},
+       {">>", "log", ">&10", "<&0", "3>&-", "4<&-", "12>>", "log"},
        0,
        0,
        0},

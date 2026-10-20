@@ -6,6 +6,20 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* Private bits in the existing iterator byte; no additional public state.
+ * Assignment eligibility survives prefix assignments and leading redirects,
+ * unlike reserved-word eligibility. Declaration operands have their own role.
+ */
+enum {
+  LEXICAL_TIME_ALLOWED = 1,
+  LEXICAL_TIME_P_ALLOWED = 2,
+  LEXICAL_TIME_DASH_ALLOWED = 4,
+  LEXICAL_PREVIOUS_PIPE = 8,
+  LEXICAL_ASSIGNMENT_ALLOWED = 16,
+  LEXICAL_DECLARATION_OPERANDS = 32,
+  LEXICAL_TIME_MASK = 15,
+};
+
 /* Initialize iteration over a domain-checked immutable source span. The
  * caller has excluded embedded NUL and invalid shell source bytes. This is
  * initialization, not another syntax or caller-correspondence boundary. */
@@ -13,10 +27,32 @@ void shell_tokenizer_init_prechecked(shell_tokenizer_state_t *state,
                                      const char *input, size_t input_length)
     SHELL_NONNULL(1, 2);
 
-/* Classify a parser-produced token borrowing this same immutable source.
- * Escaped physical continuations do not quote structural operators. */
-bool shell_token_is_literal(const char *input, const shell_token_t *token)
-    SHELL_NONNULL(1, 2);
+/* Classify a parser-produced token from its own lexical provenance. Skipped
+ * comments cannot quote an emitted LF, and escaped physical continuations do
+ * not quote structural operators. */
+bool shell_token_is_literal(const shell_token_t *token) SHELL_NONNULL(1);
+
+static inline SHELL_NONNULL(1) bool full_token_is_redirection(
+    const shell_token_t *token) {
+  return token->type == SHELL_TOKEN_REDIRECT_IN ||
+         token->type == SHELL_TOKEN_REDIRECT_OUT ||
+         token->type == SHELL_TOKEN_REDIRECT_ERR ||
+         token->type == SHELL_TOKEN_REDIRECT_APPEND ||
+         token->type == SHELL_TOKEN_REDIRECT_READ_WRITE ||
+         token->type == SHELL_TOKEN_REDIRECT_CLOBBER ||
+         token->type == SHELL_TOKEN_REDIRECT_BOTH ||
+         token->type == SHELL_TOKEN_REDIRECT_BOTH_APPEND ||
+         token->type == SHELL_TOKEN_HEREDOC ||
+         token->type == SHELL_TOKEN_HERESTRING;
+}
+
+/* Complete-word extent beginning at a parser-produced word token. An indexed
+ * assignment token already owns its balanced subscript and ends at '=';
+ * scan only the RHS, never reinterpret its subscript as outer word syntax.
+ * False means an unfinished word. source is the token's immutable source. */
+bool shell_tokenizer_word_end(const char *source, size_t length,
+                              const shell_token_t *token, size_t *end)
+    SHELL_NONNULL(1, 3, 4);
 
 /* Construct bounded fast ranges for a supported, syntax-validated immutable
  * list within the current source operation. This is the metadata counterpart

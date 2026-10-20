@@ -9,6 +9,12 @@
  * parsed only, never executed. Include failures inside otherwise closed words
  * and documents, not just visibly unfinished outer delimiters. */
 static const char *const shellsplit_test_malformed_tails[] = {
+    ": |&\ntime :",
+    ": |\n\ntime :",
+    "echo $(: |&\ntime :)",
+    "cat <(: |\n\ntime :)",
+    "echo \\$(name)",
+    "echo \\$((1+2))",
     "echo `unfinished",
     "echo $(unfinished",
     "echo $((1",

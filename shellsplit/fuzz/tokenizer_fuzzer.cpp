@@ -14,6 +14,7 @@
 
 #include "../tests/depgraph_compare.h"
 #include "../tests/malformed_source_cases.h"
+#include "../tests/source_compare.h"
 #include "../tests/word_expansion_cases.h"
 #include "depgraph_invariants.h"
 #include "env_screener.h"
@@ -3170,6 +3171,8 @@ static int test_fixed_oracles(void) {
         !fuzz_dep_limits(nullptr, &limits))
       return fixed_oracle_failure(__LINE__);
     shell_parse_result_t unchanged;
+    /* This byte-for-byte snapshot checks immutability of one object, not
+     * semantic equality of independently constructed results or C copies. */
     memcpy(&unchanged, &fast, sizeof(unchanged));
     if (shell_dep_graph_parse_with_fast(source, strlen(source), ".", &limits,
                                         &fast, &graph) != SHELL_DEP_OK ||
@@ -3837,6 +3840,10 @@ static int test_fixed_oracles(void) {
 
   if (shell_parse_fast("printf $'a\\0b' @(one|two) xs=(one two) &>out",
                        strlen("printf $'a\\0b' @(one|two) xs=(one two) &>out"),
+                       NULL, &modern) != SHELL_EPARSE)
+    return fixed_oracle_failure(__LINE__);
+  if (shell_parse_fast("xs=(one two) printf $'a\\0b' @(one|two) &>out",
+                       strlen("xs=(one two) printf $'a\\0b' @(one|two) &>out"),
                        NULL, &modern) != SHELL_OK ||
       modern.count != 1 ||
       (modern.cmds[0].features &
@@ -4155,7 +4162,7 @@ static int test_fixed_oracles(void) {
       {"cat < <(id)<(pwd)", 3, 0},
       {"echo $(<prefix<(id))", 2, 1},
       {"echo $(id)`pwd`", 3, 2},
-      {"echo \\$(id)", 1, 0},
+      {"echo \"\\$(id)\"", 1, 0},
       {"echo \\\\$(id)", 2, 1},
       {"echo \"$(id)$(pwd)\"", 3, 2},
       {"sh <<< $(printf data)", 2, 1},
@@ -5201,6 +5208,8 @@ static int test_depgraph(const char *input, size_t length, const char *cwd) {
           shell_parse_fast(input, length, &strict, &fast);
       if (fast_error == SHELL_OK || fast_error == SHELL_ETRUNC) {
         shell_parse_result_t unchanged;
+        /* A memcpy snapshot preserves even padding for this immutability
+         * check; independently constructed metadata uses field comparison. */
         memcpy(&unchanged, &fast, sizeof(unchanged));
         shell_dep_limits_t effective;
         if (!fuzz_dep_limits(&limits[i], &effective))
@@ -6968,6 +6977,10 @@ static void fixed_oracle_phase(const char *name) {
 
 /* Fixed sweeps belong to startup, not one fuzz input's timeout budget. */
 static void run_fixed_oracles() {
+  /* CI's background_operator.txt selects this generated pending redirector.
+   * Keep the exact pair independently of corpus staging and mutation. */
+  if (test_draft_redirector_prefix(99, 109))
+    abort();
   for (uint8_t selector = 0; selector < 12; selector++)
     for (uint8_t operand = 0; operand < 3; operand++)
       if (test_draft_nested_redirect(selector, operand)) {
@@ -7973,6 +7986,132 @@ static void run_fixed_oracles() {
       abort();
   }
   fixed_oracle_phase("word and syntax matrices");
+  {
+    const struct {
+      const char *source;
+      shell_source_status_t status;
+    } cases[] = {
+        {"printf ok", SHELL_SOURCE_COMPLETE},
+        {"cat <<<<x", SHELL_SOURCE_INVALID},
+        {"{ :; } <<<>x", SHELL_SOURCE_INVALID},
+        {"echo $(: >>&x)", SHELL_SOURCE_INVALID},
+        {": {fd}>|out", SHELL_SOURCE_COMPLETE},
+        {": <<<<(:)", SHELL_SOURCE_COMPLETE},
+        {"a[1 + 2]=x", SHELL_SOURCE_COMPLETE},
+        {"v=0; a[${v:-]}]=x", SHELL_SOURCE_COMPLETE},
+        {"a[${v:-]} + (2)]=x", SHELL_SOURCE_COMPLETE},
+        {"a[<(printf ]) + (2)]=x", SHELL_SOURCE_COMPLETE},
+        {"a[>(printf [) + (2)]=x", SHELL_SOURCE_COMPLETE},
+        {"a[1 + 2]=x a=(x)", SHELL_SOURCE_UNSUPPORTED},
+        {"a[1 + 2]=x : a=(x)", SHELL_SOURCE_INVALID},
+        {"echo a[1 + 2]=x", SHELL_SOURCE_COMPLETE},
+        {"time <<<x {", SHELL_SOURCE_COMPLETE},
+        {"{ : <<<x }; }", SHELL_SOURCE_COMPLETE},
+        {": <<'Q' {\npayload\nQ\n", SHELL_SOURCE_COMPLETE},
+        {"cat <<'EOF'\né\nEOF\ncat <<\n", SHELL_SOURCE_INVALID},
+        {"cat <<'é'\né\ncat <<#comment", SHELL_SOURCE_INVALID},
+        {"cat <<'EOF'\né\nEOF\ncat <<", SHELL_SOURCE_INCOMPLETE},
+        {"cat <<'EOF'\né\nEOF\ncat <<\nprintf 'é'", SHELL_SOURCE_UNSUPPORTED},
+        {"echo before #comment \\\necho after", SHELL_SOURCE_COMPLETE},
+        {": #comment \\\na=(x)", SHELL_SOURCE_UNSUPPORTED},
+        {": #comment \\\n{ :; }", SHELL_SOURCE_COMPLETE},
+        {": |\ntime {", SHELL_SOURCE_COMPLETE},
+        {": |& time {", SHELL_SOURCE_COMPLETE},
+        {": |&\ntime :", SHELL_SOURCE_INVALID},
+        {": |\n\ntime :", SHELL_SOURCE_INVALID},
+        {"echo $(: |&\ntime :)", SHELL_SOURCE_INVALID},
+        {"cat /workspace/before.txt\ncat <<\ncat /workspace/not-a-read.txt",
+         SHELL_SOURCE_INVALID},
+        {"printf '%s' '日本'", SHELL_SOURCE_UNSUPPORTED},
+        {"if true; then :; fi", SHELL_SOURCE_UNSUPPORTED},
+        {"foo.bar() { :; }", SHELL_SOURCE_UNSUPPORTED},
+        {"echo $[1 + (2)]", SHELL_SOURCE_UNSUPPORTED},
+        {"cat <<", SHELL_SOURCE_INCOMPLETE},
+        {"cat <<EOF\npayload\n", SHELL_SOURCE_INCOMPLETE},
+        {"echo ${x!}", SHELL_SOURCE_UNSUPPORTED},
+        {"printf ok > !", SHELL_SOURCE_COMPLETE},
+        {"{ printf ok; } > !", SHELL_SOURCE_COMPLETE},
+        {"printf ok <<< !", SHELL_SOURCE_COMPLETE},
+        {"!", SHELL_SOURCE_UNSUPPORTED},
+        {"!; :", SHELL_SOURCE_UNSUPPORTED},
+        {"! &", SHELL_SOURCE_UNSUPPORTED},
+        {"echo `!`", SHELL_SOURCE_UNSUPPORTED},
+        {"echo $(!)", SHELL_SOURCE_INVALID},
+        {"echo $(!", SHELL_SOURCE_INCOMPLETE},
+        {"echo a=(x)", SHELL_SOURCE_INVALID},
+        {"a=(", SHELL_SOURCE_UNSUPPORTED},
+        {"a=\\\n(x)", SHELL_SOURCE_UNSUPPORTED},
+        {"declare a=(x)", SHELL_SOURCE_UNSUPPORTED},
+        {"declare >out a=(x)", SHELL_SOURCE_INVALID},
+        {"de\"clare\" a=(x)", SHELL_SOURCE_INVALID},
+        {"command declare a=(x)", SHELL_SOURCE_INVALID},
+        {"echo \"$((1+))\"", SHELL_SOURCE_COMPLETE},
+        {"echo \\$(whoami)", SHELL_SOURCE_INVALID},
+        {"echo \\$((1+2))", SHELL_SOURCE_INVALID},
+        {"echo \"\\$(whoami)\"", SHELL_SOURCE_COMPLETE},
+        {"echo \\$\\(whoami\\)", SHELL_SOURCE_COMPLETE},
+        {"echo \\\\$(whoami)", SHELL_SOURCE_COMPLETE},
+        {"a[0]=x a=(x)", SHELL_SOURCE_UNSUPPORTED},
+        {"a[0]=x\"\" declare a=(x)", SHELL_SOURCE_UNSUPPORTED},
+        {"a[0]=x : a=(x)", SHELL_SOURCE_INVALID},
+        {"a[1 + (", SHELL_SOURCE_UNSUPPORTED},
+        {"a[1 + (2)]", SHELL_SOURCE_UNSUPPORTED},
+        {"a=(x\\ y)", SHELL_SOURCE_UNSUPPORTED},
+        {"declare a=(x\\ y)", SHELL_SOURCE_UNSUPPORTED},
+        {"a[\\(]=(x", SHELL_SOURCE_UNSUPPORTED},
+        {"declare a[1 + 2]=x", SHELL_SOURCE_COMPLETE},
+        {"declare a[1 + (2)]=x", SHELL_SOURCE_INVALID},
+        {">out {", SHELL_SOURCE_COMPLETE},
+        {"2>&1 {", SHELL_SOURCE_COMPLETE},
+        {">out { :; }", SHELL_SOURCE_INVALID},
+        {"echo $(: <<EOF)", SHELL_SOURCE_UNSUPPORTED},
+        {"echo `: <<EOF\npayload\n`", SHELL_SOURCE_UNSUPPORTED},
+        {"echo `: <<EOF; !`", SHELL_SOURCE_UNSUPPORTED},
+        {"echo $(: <<)", SHELL_SOURCE_INVALID},
+        {"echo $(: <<EOF &&)", SHELL_SOURCE_INVALID},
+        {"echo $(: <<EOF >)", SHELL_SOURCE_INVALID},
+    };
+    auto *draft = static_cast<shell_source_result_t *>(
+        malloc(sizeof(shell_source_result_t)));
+    if (draft) {
+      for (const auto &fixture : cases) {
+        if (shell_parse_draft(fixture.source, strlen(fixture.source), nullptr,
+                              draft) != fixture.status) {
+          fprintf(stderr, "source classification oracle failed: %s\n",
+                  fixture.source);
+          abort();
+        }
+        if (fixture.status == SHELL_SOURCE_COMPLETE)
+          for (uint32_t h = 0; h < draft->header_count; ++h)
+            if (!draft->headers[h].complete) {
+              fprintf(stderr, "complete source has unfinished header: %s\n",
+                      fixture.source);
+              abort();
+            }
+      }
+      for (const char *source :
+           {"a[1 + (2)]=x", "a[$(printf 1) + (2)]=x", "a[${v:-]} + (2)]=x",
+            "a[<(printf ]) + (2)]=x", "a\\\n[$\\\n{v:-]} + (2)]\\\n=\\\nx"}) {
+        for (size_t end = 0; end <= strlen(source); ++end) {
+          if (shell_parse_draft(source, end, nullptr, draft) ==
+              SHELL_SOURCE_INVALID) {
+            fprintf(stderr, "false INVALID indexed prefix: %.*s\n", (int)end,
+                    source);
+            abort();
+          }
+        }
+      }
+      static const char declaration[] = "declare a[1 + 2]=x";
+      if (shell_parse_draft(declaration, sizeof(declaration) - 1, nullptr,
+                            draft) != SHELL_SOURCE_COMPLETE ||
+          draft->headers[0].word_count != 4 ||
+          draft->headers[0].words[1].length != 3) {
+        fputs("declaration operand boundary oracle failed\n", stderr);
+        abort();
+      }
+      free(draft);
+    }
+  }
   for (const auto &fixture : shellsplit_test_array_prefixes) {
     size_t length = strlen(fixture.source);
     shell_parse_result_t parsed = {};
@@ -8262,7 +8401,7 @@ static int test_draft_source(const char *source, size_t length) {
     return 0;
   shell_source_status_t status = shell_parse_draft(source, length, NULL, draft);
   bool valid = draft->prefix_length <= length && draft->tail_start <= length;
-  if (status == SHELL_SOURCE_INVALID || status == SHELL_SOURCE_TRUNCATED)
+  if (status != SHELL_SOURCE_COMPLETE && status != SHELL_SOURCE_INCOMPLETE)
     valid &= draft->prefix_length == 0 && draft->prefix.count == 0;
   else {
     valid &= status != SHELL_SOURCE_COMPLETE || draft->prefix_length == length;
@@ -8272,10 +8411,11 @@ static int test_draft_source(const char *source, size_t length) {
       limits.strict_mode = true;
       valid &= shell_parse_fast(source, draft->prefix_length, &limits,
                                 &strict) == SHELL_OK;
-      valid &= !memcmp(&strict, &draft->prefix, sizeof(strict));
+      valid &= shellsplit_test_parse_equal(&strict, &draft->prefix);
     }
     for (uint32_t h = 0; h < draft->header_count; h++) {
       const auto &header = draft->headers[h];
+      valid &= status != SHELL_SOURCE_COMPLETE || header.complete;
       valid &= header.source.start <= length &&
                header.source.length <= length - header.source.start;
       uint32_t redirect = header.first_redirect;
@@ -8362,6 +8502,9 @@ static int test_draft_redirect_operand(uint8_t selector, uint8_t value) {
   process += "(cat)";
   valid &= shell_parse_draft(process.data(), process.size(), nullptr, draft) ==
            SHELL_SOURCE_COMPLETE;
+  if (!valid)
+    fprintf(stderr, "draft redirect operand: selector=%u value=%u\n", selector,
+            value);
   free(draft);
   return !valid;
 }
@@ -8426,16 +8569,21 @@ static int test_draft_redirector_prefix(uint8_t selector, uint8_t value) {
       !draft->headers[1].assignment_count &&
       draft->headers[1].source.start + draft->headers[1].source.length ==
           source.size() &&
-      !memcmp(&child, &draft->headers[2], sizeof(child)) &&
+      shellsplit_test_header_equal(&child, &draft->headers[2]) &&
       draft->redirect_count == redirects;
   if (redirects)
-    valid &= !memcmp(&existing, &draft->redirects[0], sizeof(existing));
+    valid &= shellsplit_test_redirect_equal(&existing, &draft->redirects[0]);
   source += fixture.completion;
   valid &= shell_parse_draft(source.data(), source.size(), nullptr, draft) ==
            SHELL_SOURCE_COMPLETE;
   valid &= draft->headers[1].complete && !draft->headers[1].word_count &&
            draft->redirect_count == redirects + 1 &&
-           !memcmp(&child, &draft->headers[2], sizeof(child));
+           shellsplit_test_header_equal(&child, &draft->headers[2]);
+  if (redirects)
+    valid &= shellsplit_test_io_equal(&existing.io, &draft->redirects[0].io) &&
+             existing.header == draft->redirects[0].header &&
+             existing.heredoc == draft->redirects[0].heredoc &&
+             draft->redirects[0].next == redirects;
   source = std::string(prefix) + "echo $( " + compound + fixture.received +
            (fixture.escape ? "\n)" : ")");
   valid &= shell_parse_draft(source.data(), source.size(), nullptr, draft) ==
@@ -8458,7 +8606,7 @@ static int test_draft_redirector_prefix(uint8_t selector, uint8_t value) {
            SHELL_SOURCE_COMPLETE;
   valid &= draft->header_count == 4 && draft->headers[1].complete &&
            draft->headers[2].complete && !draft->headers[2].word_count &&
-           !memcmp(&child, &draft->headers[3], sizeof(child));
+           shellsplit_test_header_equal(&child, &draft->headers[3]);
   source = (value & 1) ? "echo 2" : "echo {fd}";
   valid &= shell_parse_draft(source.data(), source.size(), nullptr, draft) ==
            SHELL_SOURCE_COMPLETE;
@@ -8467,6 +8615,11 @@ static int test_draft_redirector_prefix(uint8_t selector, uint8_t value) {
   valid &= shell_parse_draft(source.data(), source.size(), nullptr, draft) ==
            SHELL_SOURCE_INCOMPLETE;
   valid &= draft->need == SHELL_SOURCE_NEEDS_GROUP;
+  if (!valid)
+    fprintf(stderr,
+            "draft redirector prefix: selector=%u value=%u compound=[%s] "
+            "received=[%s] completion=[%s]\n",
+            selector, value, compound, fixture.received, fixture.completion);
   free(draft);
   return !valid;
 }
@@ -8513,10 +8666,10 @@ static int test_draft_nested_redirect(uint8_t selector, uint8_t value) {
   valid &= shell_parse_draft(source.data(), source.size(), nullptr, draft) ==
            SHELL_SOURCE_COMPLETE;
   valid &= draft->header_count == headers && draft->redirect_count == 2 &&
-           !memcmp(&leaf, &draft->headers[headers - 1], sizeof(leaf)) &&
-           !memcmp(&existing, &draft->redirects[0].io, sizeof(existing));
+           shellsplit_test_header_equal(&leaf, &draft->headers[headers - 1]) &&
+           shellsplit_test_io_equal(&existing, &draft->redirects[0].io);
   if (command != 0)
-    valid &= !memcmp(&closed, &draft->headers[3], sizeof(closed));
+    valid &= shellsplit_test_header_equal(&closed, &draft->headers[3]);
   source = std::string(prefix) + heads[outer] + commands[command] +
            " > <(echo &&) tail";
   valid &= shell_parse_draft(source.data(), source.size(), nullptr, draft) ==
@@ -8530,6 +8683,9 @@ static int test_draft_nested_redirect(uint8_t selector, uint8_t value) {
     valid &=
         !draft->prefix_length && !draft->prefix.count && !draft->tail_start;
   }
+  if (!valid)
+    fprintf(stderr, "nested draft redirect: selector=%u value=%u\n", selector,
+            value);
   free(draft);
   return !valid;
 }
@@ -8645,15 +8801,15 @@ static int test_draft_closed_children(uint8_t selector, uint8_t value) {
            !received->headers[1].complete;
   for (unsigned c = 0; c < children; c++)
     valid &= received->headers[c + 2].complete &&
-             !memcmp(&received->headers[c + 2], &completed->headers[c + 2],
-                     sizeof(shell_source_header_t));
+             shellsplit_test_header_equal(&received->headers[c + 2],
+                                          &completed->headers[c + 2]);
   valid &= received->heredoc_count == unsigned(document) &&
            received->heredoc_count == completed->heredoc_count;
   if (document)
     valid &= received->heredocs[0].complete &&
              received->heredocs[0].content.value_len == payload.size() &&
-             !memcmp(&received->heredocs[0], &completed->heredocs[0],
-                     sizeof(shell_source_heredoc_t));
+             shellsplit_test_heredoc_equal(&received->heredocs[0],
+                                           &completed->heredocs[0]);
   std::string malformed = (value & 1) ? "echo before; cat <(printf "
                                       : "echo before; echo \"$(printf ";
   malformed += token + " &&) tail";
@@ -8671,9 +8827,10 @@ static int test_draft_closed_children(uint8_t selector, uint8_t value) {
       "echo before; cat <<EOF\n${value:$(printf " + token + ") + 日本",
       "echo before; echo `printf \\$value" + std::string(value & 1 ? "`" : ""),
   };
-  for (const std::string &input : rejected) {
+  for (size_t i = 0; i < sizeof(rejected) / sizeof(rejected[0]); ++i) {
+    const std::string &input = rejected[i];
     valid &= shell_parse_draft(input.data(), input.size(), NULL, received) ==
-             SHELL_SOURCE_INVALID;
+             (i == 0 ? SHELL_SOURCE_INVALID : SHELL_SOURCE_UNSUPPORTED);
     valid &= !received->prefix_length && !received->prefix.count;
   }
   /* A tentative delimiter line is not body code, even if its received prefix
@@ -8701,7 +8858,9 @@ static int test_draft_closed_children(uint8_t selector, uint8_t value) {
   std::string body = opening + candidate + "x\n" + delimiter + "\n";
   bool invalid_body = unicode || malformed_child;
   valid &= shell_parse_draft(body.data(), body.size(), NULL, received) ==
-           (invalid_body ? SHELL_SOURCE_INVALID : SHELL_SOURCE_COMPLETE);
+           (unicode           ? SHELL_SOURCE_UNSUPPORTED
+            : malformed_child ? SHELL_SOURCE_INVALID
+                              : SHELL_SOURCE_COMPLETE);
   valid &= invalid_body
                ? received->prefix_length == 0 && received->prefix.count == 0
                : received->header_count == 3;
@@ -8809,8 +8968,9 @@ static int test_draft_closed_children(uint8_t selector, uint8_t value) {
            received->heredocs[0].confirmed_length == data.size();
   std::string continued_control =
       "echo before; cat <<$(i\\\nf true; th\\\nen :; f\\\ni)\n";
-  valid &= shell_parse_draft(continued_control.data(), continued_control.size(),
-                             &source_limits, received) == SHELL_SOURCE_INVALID;
+  valid &=
+      shell_parse_draft(continued_control.data(), continued_control.size(),
+                        &source_limits, received) == SHELL_SOURCE_UNSUPPORTED;
   valid &= !received->prefix_length && !received->prefix.count;
   static const char *const keywords[] = {"if", "function", "[[", "]]"};
   std::string keyword = keywords[selector % 4];
@@ -8826,7 +8986,7 @@ static int test_draft_closed_children(uint8_t selector, uint8_t value) {
                              NULL, completed) == SHELL_SOURCE_COMPLETE;
   std::string keyword_closed = "echo before; echo $(" + keyword + ")";
   valid &= shell_parse_draft(keyword_closed.data(), keyword_closed.size(), NULL,
-                             received) == SHELL_SOURCE_INVALID;
+                             received) == SHELL_SOURCE_UNSUPPORTED;
   valid &= !received->prefix_length && !received->prefix.count;
   std::string reprinted =
       "echo $(cat << -EOF\n" + token + "\nEOF\nprintf EXPOSED\n-EOF\n)";
@@ -8835,6 +8995,9 @@ static int test_draft_closed_children(uint8_t selector, uint8_t value) {
                                   &unsupported) == SHELL_PROCESS_EPARSE;
   valid &= !unsupported.commands && !unsupported.command_count;
   shell_processed_commands_free(&unsupported);
+  if (!valid)
+    fprintf(stderr, "draft child retention: selector=%u value=%u\n", selector,
+            value);
   free(received);
   free(completed);
   return !valid;

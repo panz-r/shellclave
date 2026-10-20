@@ -66,10 +66,14 @@ typedef struct {
 /* Two pieces per source byte cover words, operators, and wrappers. Each
  * allocation permits arbitrary caller alignment. The remaining 16 bytes per
  * source byte cover printed spelling and live decoded nested delimiters.
+ * Subscript facts and the public iterator's private continuation record use
+ * an additional boundary entry plus 64 bytes per source byte. This covers
+ * arbitrary alignment and keeps persistent facts outside delimiter marks.
  * This intentionally bounds storage, not semantic/parser capacities. */
 bool shell_source_workspace_size(size_t length, size_t *size) {
   const size_t factor =
-      2 * (sizeof(literal_piece_t) + _Alignof(literal_piece_t) - 1) + 16;
+      2 * (sizeof(literal_piece_t) + _Alignof(literal_piece_t) - 1) + 16 +
+      sizeof(shell_source_array_boundary_t) + 64;
   *size = 0;
   if (length > SIZE_MAX / factor)
     return false;

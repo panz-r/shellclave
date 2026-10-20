@@ -27,13 +27,13 @@ For example, argv `printf`, `two words`, and the empty string is:
 
 The elements must already describe one isolated subcommand. Shellsplit can
 produce this representation after shell parsing, quote-fragment assembly,
-escape processing, control-flow isolation, and redirection removal. Another
+escape processing, command-stage isolation, and redirection removal. Another
 caller may perform those steps itself. Shelltype decodes these boundaries and
 classifies arguments; it does not tokenize shell source.
 
 Shelltype entry points accept `st_netargv_view_t` and use its explicit length
 directly, including for embedded NUL bytes. A NULL data pointer is valid only
-for an empty view. The former C-string transport wrappers have been removed.
+for an empty view.
 
 Use Shellsplit's `shell_render_netargv_buffer()` or
 `shell_build_netargv_sequence_buffer()` to preserve binary payloads in an
@@ -42,23 +42,28 @@ owned `shell_netstring_buffer_t`. Release it with
 
 Shellgate publishes this value as `sg_subcommand_result_t.netargv` with an explicit
 length. It is the authoritative result for applications. The adjacent
-`command` member is a readable, lossy diagnostic display and is never shell
+`display_command` member is a readable, lossy diagnostic display and is never shell
 source or a replacement for netargv.
 
 ## netsequences
 
-A netsequence is an outer concatenation of netstrings whose payloads are
-already-canonical records. Shellsplit uses this framing to return a collection
-of isolated netargv values in one buffer. The anomaly raw model uses one outer
-record per decoded executable name. Its type model uses one outer record per
-subcommand, with a nested netargv signature containing the executable followed
-by abstract type symbols. A multi-argument command therefore remains one
-anomaly item; command lists and pipelines produce multiple items.
+A netsequence concatenates outer netstrings, one per item. The producing API
+defines the outer payload:
+
+| Sequence | Builder | Outer payload |
+|---|---|---|
+| Argv sequence | `shell_build_netargv_sequence_buffer()` | One complete canonical netargv per isolated subcommand |
+| Raw anomaly sequence | `shell_build_command_netseq_buffer()` | One decoded executable name per execution stage |
+| Typed anomaly sequence | `shell_build_type_netseq_buffer()` | One nested netargv signature per execution stage: executable followed by abstract type symbols |
+
+An argv-less redirect-only operation or empty timed pipeline contributes an
+empty executable-name sentinel to anomaly sequences. Those stages are distinct
+from commands with policy-evaluable argv. A multi-argument executable stage
+remains one anomaly item; its arguments are nested in its type signature.
 
 Use `shell_build_command_netseq_buffer()`, `shell_build_type_netseq_buffer()`,
 or `shell_build_anomaly_netseqs_buffer()` for binary sequence output. Pass
-their explicit lengths to the anomaly APIs. The former C-string sequence
-builders have been removed.
+their explicit lengths to the anomaly APIs.
 
 ## netpattern and CPL
 

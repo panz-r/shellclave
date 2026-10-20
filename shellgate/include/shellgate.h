@@ -660,12 +660,11 @@ sg_gate_anomaly_type_model_borrowed(const sg_gate_t *gate) SHELL_NONNULL(1);
 /* --- CONFIGURATION --- */
 
 /*
- * Strict mode (enabled by default):
- * The fast parser rejects ambiguous input as a parse error, including:
- *   - Control characters (0x01-0x1F, 0x7F)
- *   - High bytes (0x80-0xFF)
- *   - Unclosed quotes (in strict mode only)
- *   - Unclosed braces in ${VAR} expressions
+ * Strict mode (enabled by default): the parser rejects malformed syntax,
+ * including unclosed quotes and parameter expansions, and prohibited source
+ * bytes. Executable source has a restricted byte domain; heredoc delimiters
+ * and body data admit non-ASCII bytes under the documented scoped rules.
+ * Literal NUL, DEL, and prohibited control bytes remain invalid.
  *
  * This is always enabled for security hardening.  Permissive mode
  * (strict_mode=false) is not exposed publicly.

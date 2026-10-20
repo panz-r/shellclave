@@ -15,8 +15,8 @@ static SHELL_NONNULL(1) bool ascii_span(const char *source, size_t start,
   return true;
 }
 
-static SHELL_NONNULL(1) bool source_byte_islands(const char *source,
-                                                 size_t length, size_t depth);
+static SHELL_NONNULL(1) shell_source_status_t
+    source_byte_islands(const char *source, size_t length, size_t depth);
 
 static SHELL_NONNULL(1, 4) void code_bytes(const char *source, size_t start,
                                            size_t end, void *context) {
@@ -26,8 +26,9 @@ static SHELL_NONNULL(1, 4) void code_bytes(const char *source, size_t start,
 
 /* Executable substitutions are code domains, even inside an expandable
  * document. Literal data outside those domains is not shell source. */
-static SHELL_NONNULL(1) bool word_byte_islands(const char *word, size_t length,
-                                               size_t depth, bool heredoc) {
+static SHELL_NONNULL(1) shell_source_status_t
+    word_byte_islands(const char *word, size_t length, size_t depth,
+                      bool heredoc) {
   shell_source_substitution_scan_t scan = {
       .scope = {.heredoc = heredoc,
                 .suppress_process = heredoc,
@@ -42,7 +43,7 @@ static SHELL_NONNULL(1) bool word_byte_islands(const char *word, size_t length,
                                                     &after, &kind)) ==
          SHELL_SOURCE_SCAN_FOUND) {
     if (!valid || scan.has_backtick_escapes)
-      return false;
+      return SHELL_SOURCE_UNSUPPORTED;
     if (kind == SHELL_SOURCE_EXPANSION_ARITHMETIC ||
         kind == SHELL_SOURCE_EXPANSION_SUBSTRING)
       continue;
@@ -54,23 +55,26 @@ static SHELL_NONNULL(1) bool word_byte_islands(const char *word, size_t length,
         shell_source_process_substitution_open(word, length, start, &open);
       body = open + 1;
     }
-    if (!source_byte_islands(word + body, after - body - 1, depth + 1))
-      return false;
+    shell_source_status_t child =
+        source_byte_islands(word + body, after - body - 1, depth + 1);
+    if (child != SHELL_SOURCE_COMPLETE)
+      return child;
   }
+  if (scan.exhausted)
+    return SHELL_SOURCE_TRUNCATED;
   if (!valid || scan.has_backtick_escapes ||
       status == SHELL_SOURCE_SCAN_MALFORMED)
-    return false;
+    return SHELL_SOURCE_UNSUPPORTED;
   if (scan.unfinished.body_start)
     return source_byte_islands(word + scan.unfinished.body_start,
                                scan.unfinished.body_length, depth + 1);
-  return true;
+  return SHELL_SOURCE_COMPLETE;
 }
 
-static SHELL_NONNULL(1) bool source_byte_islands_body(const char *source,
-                                                      size_t length,
-                                                      size_t depth) {
+static SHELL_NONNULL(1) shell_source_status_t
+    source_byte_islands_body(const char *source, size_t length, size_t depth) {
   if (depth >= SHELL_MAX_SUBCOMMANDS)
-    return false;
+    return SHELL_SOURCE_TRUNCATED;
   shell_tokenizer_state_t lexer;
   shell_tokenizer_init_prechecked(&lexer, source, length);
   shell_source_pending_heredoc_t pending[SHELL_MAX_SUBCOMMANDS];
@@ -78,7 +82,7 @@ static SHELL_NONNULL(1) bool source_byte_islands_body(const char *source,
   shell_token_t token;
   while (shell_tokenizer_next(&lexer, &token)) {
     if (!ascii_span(source, checked, token.position))
-      return false;
+      return SHELL_SOURCE_UNSUPPORTED;
     size_t end = token.position + token.length;
     if (token.type == SHELL_TOKEN_HEREDOC) {
       if (lexer.heredoc_error) {
@@ -88,9 +92,26 @@ static SHELL_NONNULL(1) bool source_byte_islands_body(const char *source,
         shell_source_match_logical_punctuation(source, length, op, "<<",
                                                &after_operator);
         shell_source_pending_heredoc_t partial;
-        return shell_source_probe_heredoc_delimiter(
-                   source, length, &after_operator, &partial) ==
-               SHELL_HEREDOC_WORD_INCOMPLETE;
+        shell_source_heredoc_word_status_t status =
+            shell_source_probe_heredoc_delimiter(source, length,
+                                                 &after_operator, &partial);
+        if (status == SHELL_HEREDOC_WORD_INCOMPLETE)
+          return SHELL_SOURCE_COMPLETE;
+        if (status == SHELL_HEREDOC_WORD_INVALID)
+          return SHELL_SOURCE_UNSUPPORTED;
+        if (status == SHELL_HEREDOC_WORD_MISSING) {
+          /* Byte admission does not diagnose this grammar error or invent a
+           * body. Keep checking later code/data islands; the collector will
+           * report INVALID once the whole byte domain has been admitted. */
+          checked = end;
+          continue;
+        }
+        /* A complete word which could not join a full pending queue is a
+         * resource stop. A previous missing word can leave heredoc_error
+         * sticky, so a successfully appended declaration still proceeds. */
+        if (lexer.pending_heredoc_count == count &&
+            count == SHELL_MAX_SUBCOMMANDS)
+          return SHELL_SOURCE_TRUNCATED;
       }
       if (lexer.pending_heredoc_count > count) {
         const shell_pending_heredoc_t *raw =
@@ -102,8 +123,11 @@ static SHELL_NONNULL(1) bool source_byte_islands_body(const char *source,
       }
       /* An unfinished quoted delimiter is still a data island. Syntax
        * validation, not byte admission, decides whether it is complete. */
-    } else if (!word_byte_islands(token.start, token.length, depth, false)) {
-      return false;
+    } else {
+      shell_source_status_t status =
+          word_byte_islands(token.start, token.length, depth, false);
+      if (status != SHELL_SOURCE_COMPLETE)
+        return status;
     }
     checked = end;
     if (token.type == SHELL_TOKEN_SEMICOLON && token.length == 1 &&
@@ -113,10 +137,12 @@ static SHELL_NONNULL(1) bool source_byte_islands_body(const char *source,
             shell_source_frame_heredoc(source, length, checked, &pending[h]);
         /* A tentative closing line is not executable body data. Its raw
          * bytes remain available in framing, without assuming an expansion. */
-        if (!shell_source_heredoc_delimiter_is_quoted(&pending[h]) &&
-            !word_byte_islands(source + checked, frame.confirmed_end - checked,
-                               depth, true))
-          return false;
+        if (!shell_source_heredoc_delimiter_is_quoted(&pending[h])) {
+          shell_source_status_t status = word_byte_islands(
+              source + checked, frame.confirmed_end - checked, depth, true);
+          if (status != SHELL_SOURCE_COMPLETE)
+            return status;
+        }
         checked = frame.after;
         if (!frame.complete)
           break;
@@ -124,18 +150,21 @@ static SHELL_NONNULL(1) bool source_byte_islands_body(const char *source,
       count = 0;
     }
   }
-  return ascii_span(source, checked, length);
+  return ascii_span(source, checked, length) ? SHELL_SOURCE_COMPLETE
+                                             : SHELL_SOURCE_UNSUPPORTED;
 }
 
-static SHELL_NONNULL(1) bool source_byte_islands(const char *source,
-                                                 size_t length, size_t depth) {
+static SHELL_NONNULL(1) shell_source_status_t
+    source_byte_islands(const char *source, size_t length, size_t depth) {
   shell_source_scope_t previous = shell_source_scope_begin(source, length);
-  bool valid = source_byte_islands_body(source, length, depth);
+  shell_source_status_t status =
+      source_byte_islands_body(source, length, depth);
   shell_source_scope_end(previous);
-  return valid;
+  return status;
 }
 
-bool shell_source_heredoc_bytes_valid(const char *source, size_t length) {
+shell_source_status_t shell_source_heredoc_bytes_status(const char *source,
+                                                        size_t length) {
   return source_byte_islands(source, length, 0);
 }
 
@@ -145,7 +174,7 @@ typedef struct {
   uint32_t header;
   uint32_t last_redirect[SHELL_SOURCE_MAX_HEADERS];
   shell_redirect_word_t redirect_word;
-  bool truncated;
+  shell_source_status_t failure;
 } source_collector_t;
 
 /* One lexical body's recovery facts. Record spans remain root-relative;
@@ -172,7 +201,7 @@ static SHELL_NONNULL(1) uint32_t
                bool compound) {
   shell_source_result_t *out = collector->result;
   if (out->header_count == SHELL_SOURCE_MAX_HEADERS) {
-    collector->truncated = true;
+    collector->failure = SHELL_SOURCE_TRUNCATED;
     return UINT32_MAX;
   }
   uint32_t id = out->header_count++;
@@ -192,7 +221,7 @@ static SHELL_NONNULL(1, 2, 3) shell_process_status_t
   shell_source_result_t *out = collector->result;
   collector->redirect_word = *word;
   if (out->redirect_count == SHELL_SOURCE_MAX_REDIRECTS) {
-    collector->truncated = true;
+    collector->failure = SHELL_SOURCE_TRUNCATED;
     return SHELL_PROCESS_EOUTPUT_LIMIT;
   }
   uint32_t id = out->redirect_count++;
@@ -208,7 +237,7 @@ static SHELL_NONNULL(1, 2, 3) shell_process_status_t
   collector->last_redirect[collector->header] = id;
   if (op->kind == SHELL_GROUP_IO_HEREDOC) {
     if (out->heredoc_count == SHELL_SOURCE_MAX_HEREDOCS) {
-      collector->truncated = true;
+      collector->failure = SHELL_SOURCE_TRUNCATED;
       return SHELL_PROCESS_EOUTPUT_LIMIT;
     }
     uint32_t doc = out->heredoc_count++;
@@ -226,10 +255,10 @@ static SHELL_NONNULL(1, 2, 3) shell_process_status_t
 
 static SHELL_NONNULL(1, 2) shell_source_status_t
     collect(source_collector_t *collector, source_body_t *body, size_t length,
-            size_t depth, bool received_eof);
+            size_t depth, shell_source_draft_end_t end_context);
 
 /* Keep one ordered iterator for complete and unfinished words alike. Closed
- * children retain their records and must have complete grammar even when a
+ * children retain their records and must have classified grammar even when a
  * later quote or substitution has not arrived. The executable-only adapter
  * consumes arithmetic completion events without collecting their children
  * twice. Heredoc roots use their own quoting and EOF diagnostics. */
@@ -256,9 +285,18 @@ static SHELL_NONNULL(1, 2) bool collect_expansions(
       body = open + 1;
     }
     source_body_t child = {.base = base + body};
-    if (collect(collector, &child, after - body - 1, depth + 1, false) !=
-        SHELL_SOURCE_COMPLETE)
+    shell_source_status_t status = collect(
+        collector, &child, after - body - 1, depth + 1,
+        kind == SHELL_SOURCE_SUBST_BACKTICK ? SHELL_SOURCE_END_BACKTICK
+                                            : SHELL_SOURCE_END_PARENTHESIZED);
+    if (status != SHELL_SOURCE_COMPLETE) {
+      collector->failure = status;
       return false;
+    }
+  }
+  if (scan.exhausted) {
+    collector->failure = SHELL_SOURCE_TRUNCATED;
+    return false;
   }
   if (terminal == SHELL_SOURCE_SCAN_MALFORMED || scan.has_backtick_escapes)
     return false;
@@ -279,10 +317,12 @@ static SHELL_NONNULL(1, 2) bool collect_expansions(
     size_t body = scan.unfinished.body_start;
     size_t received = scan.unfinished.body_length;
     source_body_t child = {.base = base + body};
-    shell_source_status_t status =
-        collect(collector, &child, received, depth + 1, true);
-    if (status == SHELL_SOURCE_INVALID || status == SHELL_SOURCE_TRUNCATED)
+    shell_source_status_t status = collect(
+        collector, &child, received, depth + 1, SHELL_SOURCE_END_OPEN_CHILD);
+    if (status != SHELL_SOURCE_COMPLETE && status != SHELL_SOURCE_INCOMPLETE) {
+      collector->failure = status;
       return false;
+    }
   }
   return true;
 }
@@ -299,7 +339,7 @@ static SHELL_NONNULL(1, 2) bool collect_body(source_collector_t *collector,
                                              source_body_t *body, size_t length,
                                              size_t depth) {
   if (depth >= SHELL_MAX_GROUPS) {
-    collector->truncated = true;
+    collector->failure = SHELL_SOURCE_TRUNCATED;
     return false;
   }
   size_t base = body->base;
@@ -335,13 +375,13 @@ static SHELL_NONNULL(1, 2) bool collect_body(source_collector_t *collector,
         break;
       }
     }
-    bool structural = !shell_token_is_literal(source, &token);
+    bool structural = !shell_token_is_literal(&token);
     bool newline = token.type == SHELL_TOKEN_SEMICOLON && token.length == 1 &&
                    token.start[0] == '\n';
     if (structural && (token.type == SHELL_TOKEN_GROUP_START ||
                        token.type == SHELL_TOKEN_SUBSHELL_START)) {
       if (group_count == SHELL_MAX_GROUPS) {
-        collector->truncated = true;
+        collector->failure = SHELL_SOURCE_TRUNCATED;
         return false;
       }
       current = header_new(collector, base + start, depth + group_count, true);
@@ -356,8 +396,10 @@ static SHELL_NONNULL(1, 2) bool collect_body(source_collector_t *collector,
     if (structural && (token.type == SHELL_TOKEN_GROUP_END ||
                        token.type == SHELL_TOKEN_SUBSHELL_END)) {
       header_finish(collector, current, base + start);
-      if (!group_count)
+      if (!group_count) {
+        collector->failure = SHELL_SOURCE_INVALID;
         return false;
+      }
       current = groups[--group_count];
       header_finish(collector, current, base + end);
       continue;
@@ -403,8 +445,10 @@ static SHELL_NONNULL(1, 2) bool collect_body(source_collector_t *collector,
             doc->closing_delimiter = (shell_source_span_t){
                 (uint32_t)(base + frame.delimiter_start),
                 (uint32_t)(frame.delimiter_end - frame.delimiter_start)};
-          else
+          else {
+            body->grammar.heredoc_eof = true;
             need(body, SHELL_SOURCE_NEEDS_HEREDOC_BODY, doc->declaration.start);
+          }
           /* Keep raw received content above, but publish children only from
            * confirmed data. Appending may finish the candidate delimiter. */
           if (!(doc->content.flags & SHELL_DEP_DOC_FLAG_HEREDOC_LITERAL) &&
@@ -441,10 +485,21 @@ static SHELL_NONNULL(1, 2) bool collect_body(source_collector_t *collector,
     collector->header = current;
     /* A leading process substitution is a word fragment, not a redirect.
      * Its following quote/expansion belongs to that same word. */
+    bool process_word =
+        shell_source_process_substitution_open(source, length, start, NULL);
     size_t redirect_end =
-        shell_source_process_substitution_open(source, length, start, NULL)
-            ? start
-            : shell_source_skip_redirect(source, start, length);
+        process_word ? start
+                     : shell_source_skip_redirect(source, start, length);
+    /* The complete operator still has a redirect role without its word.
+     * Preserve that role for numeric/named prefixes as well as bare forms;
+     * later grammar, not an invented argv word, diagnoses the missing word. */
+    if (!process_word && redirect_end == start &&
+        token.type != SHELL_TOKEN_HEREDOC &&
+        full_token_is_redirection(&token)) {
+      out->headers[current].complete = false;
+      covered = end;
+      continue;
+    }
     if (redirect_end != start) {
       uint32_t old_docs = out->heredoc_count;
       bool found;
@@ -452,8 +507,11 @@ static SHELL_NONNULL(1, 2) bool collect_body(source_collector_t *collector,
           collector->source, (uint32_t)(base + start),
           (uint32_t)(base + redirect_end), UINT16_MAX, true, redirect_append,
           collector, &found);
-      if (status != SHELL_PROCESS_OK)
+      if (status != SHELL_PROCESS_OK) {
+        if (status == SHELL_PROCESS_EOUTPUT_LIMIT)
+          collector->failure = SHELL_SOURCE_TRUNCATED;
         return false;
+      }
       for (uint32_t id = old_docs; id < out->heredoc_count; id++) {
         shell_source_heredoc_t *doc = &out->heredocs[id];
         size_t position = start;
@@ -503,12 +561,20 @@ static SHELL_NONNULL(1, 2) bool collect_body(source_collector_t *collector,
       shell_source_match_logical_punctuation(source, length, op, "<<",
                                              &after_operator);
       shell_source_pending_heredoc_t partial;
-      if (shell_source_probe_heredoc_delimiter(source, length, &after_operator,
-                                               &partial) !=
-          SHELL_HEREDOC_WORD_INCOMPLETE)
+      shell_source_heredoc_word_status_t delimiter_status =
+          shell_source_probe_heredoc_delimiter(source, length, &after_operator,
+                                               &partial);
+      if (delimiter_status != SHELL_HEREDOC_WORD_INCOMPLETE) {
+        if (delimiter_status == SHELL_HEREDOC_WORD_MISSING)
+          collector->failure = SHELL_SOURCE_INVALID;
+        else if (delimiter_status == SHELL_HEREDOC_WORD_COMPLETE &&
+                 lexer.heredoc_error &&
+                 lexer.pending_heredoc_count == SHELL_MAX_SUBCOMMANDS)
+          collector->failure = SHELL_SOURCE_TRUNCATED;
         return false;
+      }
       if (out->heredoc_count == SHELL_SOURCE_MAX_HEREDOCS) {
-        collector->truncated = true;
+        collector->failure = SHELL_SOURCE_TRUNCATED;
         return false;
       }
       out->heredocs[out->heredoc_count++] = (shell_source_heredoc_t){
@@ -523,7 +589,7 @@ static SHELL_NONNULL(1, 2) bool collect_body(source_collector_t *collector,
       break;
     }
     size_t word_end = start;
-    if (!shell_source_skip_shell_word(source, length, start, &word_end)) {
+    if (!shell_tokenizer_word_end(source, length, &token, &word_end)) {
       out->headers[current].complete = false;
       if (!collect_expansions(collector, body, base + start, length - start,
                               depth + group_count, false, true))
@@ -535,21 +601,27 @@ static SHELL_NONNULL(1, 2) bool collect_body(source_collector_t *collector,
       continue;
     }
     shell_source_header_t *header = &out->headers[current];
+    if (header->word_count == 0 && header->redirect_count == 0 &&
+        shell_source_function_declarator_after(source, length, word_end))
+      return false;
     /* The grammar diagnoses this appendable tail. Project that same word
      * fact here while its owning header is available; closed child sources
-     * will be rejected by their grammar instead of claiming completeness. */
-    if (word_end == length && header->word_count == 0 &&
-        header->redirect_count == 0 &&
-        shell_source_unsupported_keyword(source, length, start, NULL))
+     * will be declined by their grammar instead of claiming completeness. */
+    if (header->word_count == 0 && header->redirect_count == 0 &&
+        shell_source_unsupported_keyword(source, length, start, NULL)) {
+      if (word_end != length)
+        return false;
       header->complete = false;
+    }
     if (header->word_count == SHELL_DEP_MAX_TOKENS) {
-      collector->truncated = true;
+      collector->failure = SHELL_SOURCE_TRUNCATED;
       return false;
     }
     shell_source_assignment_word_t assignment;
     if (header->assignment_count == header->word_count &&
-        shell_source_parse_scalar_assignment_word(
-            source + start, word_end - start, &assignment))
+        (token.type == SHELL_TOKEN_ARRAY_ASSIGNMENT ||
+         shell_source_parse_scalar_assignment_word(
+             source + start, word_end - start, &assignment)))
       header->assignment_count++;
     header->words[header->word_count++] = (shell_source_span_t){
         (uint32_t)(base + start), (uint32_t)(word_end - start)};
@@ -558,9 +630,11 @@ static SHELL_NONNULL(1, 2) bool collect_body(source_collector_t *collector,
       return false;
     covered = word_end;
   }
-  for (size_t h = 0; h < document_count; h++)
+  for (size_t h = 0; h < document_count; h++) {
+    body->grammar.heredoc_eof = true;
     need(body, SHELL_SOURCE_NEEDS_HEREDOC_HEADER,
          out->heredocs[documents[h]].declaration.start);
+  }
   header_finish(collector, current, base + length);
   /* Received extents remain useful even when the enclosing delimiter has not
    * arrived. Completeness belongs to that header, not its closed descendants.
@@ -580,18 +654,22 @@ static SHELL_NONNULL(1, 2) bool collect_body(source_collector_t *collector,
  * distinct from the enclosing body's frame throughout this invocation. */
 static SHELL_NONNULL(1, 2) shell_source_status_t
     collect(source_collector_t *collector, source_body_t *body, size_t length,
-            size_t depth, bool received_eof) {
+            size_t depth, shell_source_draft_end_t end_context) {
   const char *source = collector->source + body->base;
   shell_source_scope_t previous = shell_source_scope_begin(source, length);
   shell_source_status_t status;
   if (collect_body(collector, body, length, depth))
-    status = shell_source_draft_grammar(source, length, received_eof,
-                                        &body->grammar);
-  else
     status =
-        collector->truncated ? SHELL_SOURCE_TRUNCATED : SHELL_SOURCE_INVALID;
-  if (!received_eof && status == SHELL_SOURCE_INCOMPLETE)
-    status = SHELL_SOURCE_INVALID;
+        shell_source_draft_grammar(source, length, end_context, &body->grammar);
+  else
+    status = collector->failure;
+  if (end_context != SHELL_SOURCE_END_RECEIVED &&
+      end_context != SHELL_SOURCE_END_OPEN_CHILD &&
+      status == SHELL_SOURCE_INCOMPLETE)
+    /* Bash accepts implicit document termination at child EOF with warnings.
+     * Its framing is not modeled; inability to append is not a syntax proof. */
+    status = body->grammar.heredoc_eof ? SHELL_SOURCE_UNSUPPORTED
+                                       : SHELL_SOURCE_INVALID;
   shell_source_scope_end(previous);
   return status;
 }
@@ -606,22 +684,25 @@ shell_source_status_t shell_parse_draft(const char *source, size_t length,
   shell_source_workspace_scope_t previous = shell_source_workspace_begin(
       source, length, limits ? limits->workspace : NULL,
       limits ? limits->workspace_size : 0);
-  shell_source_status_t status = SHELL_SOURCE_INVALID;
-  if (!shell_source_bytes_valid(source, length))
+  shell_source_status_t status = shell_source_bytes_status(source, length);
+  if (status != SHELL_SOURCE_COMPLETE)
     goto done;
-  source_collector_t collector = {.source = source, .result = out};
+  source_collector_t collector = {
+      .source = source, .result = out, .failure = SHELL_SOURCE_UNSUPPORTED};
   source_body_t root = {0};
-  status = collect(&collector, &root, length, 0, true);
+  status = collect(&collector, &root, length, 0, SHELL_SOURCE_END_RECEIVED);
   out->prefix_length = root.grammar.prefix_length;
   out->incomplete_at = root.grammar.incomplete_at;
   out->need = root.grammar.need;
   if (status == SHELL_SOURCE_COMPLETE)
     out->prefix_length = (uint32_t)length;
-  if (status == SHELL_SOURCE_INVALID || status == SHELL_SOURCE_TRUNCATED)
+  if (status != SHELL_SOURCE_COMPLETE && status != SHELL_SOURCE_INCOMPLETE)
     goto done;
   if (out->prefix_length) {
     if (!shell_tokenizer_complete_syntax_valid(source, out->prefix_length)) {
-      status = SHELL_SOURCE_INVALID;
+      /* The diagnostic grammar already classified every modeled context.
+       * Failure of this coarser strict boundary is not a new syntax proof. */
+      status = SHELL_SOURCE_UNSUPPORTED;
       goto done;
     }
     shell_limits_t strict = limits ? *limits : SHELL_LIMITS_DEFAULT;
@@ -629,8 +710,8 @@ shell_source_status_t shell_parse_draft(const char *source, size_t length,
     shell_error_t error = shell_parse_prevalidated(source, out->prefix_length,
                                                    &strict, &out->prefix);
     if (error != SHELL_OK) {
-      status =
-          error == SHELL_ETRUNC ? SHELL_SOURCE_TRUNCATED : SHELL_SOURCE_INVALID;
+      status = error == SHELL_ETRUNC ? SHELL_SOURCE_TRUNCATED
+                                     : SHELL_SOURCE_UNSUPPORTED;
       goto done;
     }
   }
@@ -638,7 +719,7 @@ shell_source_status_t shell_parse_draft(const char *source, size_t length,
 done:
   if (shell_source_scratch_exhausted())
     status = SHELL_SOURCE_TRUNCATED;
-  if (status == SHELL_SOURCE_INVALID || status == SHELL_SOURCE_TRUNCATED) {
+  if (status != SHELL_SOURCE_COMPLETE && status != SHELL_SOURCE_INCOMPLETE) {
     memset(&out->prefix, 0, sizeof(out->prefix));
     out->prefix_length = out->tail_start = 0;
     for (uint32_t h = 0; h < out->header_count; h++)
