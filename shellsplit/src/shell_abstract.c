@@ -1417,7 +1417,9 @@ abstract_command_parse(const char *command, size_t command_length,
 shell_abstract_status_t
 shell_abstract_command_parse(const char *command, size_t command_length,
                              shell_abstract_command_t **out) {
-  shell_source_operation_begin(command, command_length);
+  *out = NULL;
+  if (!shell_source_operation_begin_owned(command, command_length))
+    return SHELL_ABSTRACT_ENOMEM;
   shell_abstract_status_t status =
       abstract_command_parse(command, command_length, out);
   shell_source_operation_end();
@@ -1865,8 +1867,12 @@ shell_build_type_netseq_buffer(const char *command, size_t command_length,
                                size_t *subcommand_count) {
   char *encoded = NULL;
   size_t length = 0;
+  *subcommand_count = 0;
+  if (!shell_source_operation_begin_owned(command, command_length))
+    return SHELL_PROCESS_ENOMEM;
   shell_process_status_t status = shell_build_type_netseq_impl(
       command, command_length, limits, &encoded, &length, subcommand_count);
+  shell_source_operation_end();
   if (status != SHELL_PROCESS_OK)
     return status;
   sequence->data = (unsigned char *)encoded;
@@ -2063,6 +2069,8 @@ shell_process_status_t shell_build_anomaly_netseqs_buffer(
     const shell_process_limits_t *limits, shell_netstring_buffer_t *command,
     shell_netstring_buffer_t *type, size_t *subcommand_count) {
   *subcommand_count = 0;
+  if (!shell_source_operation_begin_owned(command_line, command_length))
+    return SHELL_PROCESS_ENOMEM;
   shell_anomaly_stages_t stages = {0};
   shell_process_status_t status =
       shell_anomaly_stages_parse(command_line, command_length, limits, &stages);
@@ -2070,5 +2078,6 @@ shell_process_status_t shell_build_anomaly_netseqs_buffer(
     status = shell_build_anomaly_netseqs_from_stages(&stages, limits, command,
                                                      type, subcommand_count);
   shell_anomaly_stages_free(&stages);
+  shell_source_operation_end();
   return status;
 }

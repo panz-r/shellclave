@@ -124,7 +124,23 @@ typedef enum {
 typedef struct {
   uint32_t max_subcommands; // Max subcommands to return
   bool strict_mode;         // Reject incomplete or malformed syntax
+  /* Optional borrowed delimiter scratch. NULL/zero selects bounded private
+   * storage; a larger supplied buffer extends that capacity. A buffer of
+   * shell_source_workspace_size() supplies a sufficient capacity bound.
+   * Exhaustion returns ETRUNC with zero retained ranges, not a
+   * malformed-source result.
+   * It is used only during parsing and must not overlap inputs or outputs. */
+  void *workspace;
+  size_t workspace_size;
 } shell_limits_t;
+
+/* Capacity for operation-local delimiter normalization, including literal
+ * command-fragment printing. No source is read and no storage is allocated.
+ * Required output is cleared on arithmetic overflow (false). The buffer may
+ * have any alignment and must not alias source or result storage. Existing
+ * syntax/depth/output limits still apply independently of this byte bound. */
+bool shell_source_workspace_size(size_t source_length, size_t *workspace_size)
+    SHELL_NONNULL(2);
 
 /**
  * Strict mode rejects unterminated quotes, substitutions, parentheses,
@@ -138,7 +154,7 @@ typedef struct {
  */
 #ifdef __cplusplus
 static const shell_limits_t SHELL_LIMITS_DEFAULT = {SHELL_MAX_SUBCOMMANDS,
-                                                    false};
+                                                    false, NULL, 0};
 #else
 static const shell_limits_t SHELL_LIMITS_DEFAULT = {
     .max_subcommands = SHELL_MAX_SUBCOMMANDS, .strict_mode = false};

@@ -219,8 +219,14 @@ typedef enum {
  * the default. `workspace` is caller-owned scratch storage used only while
  * parsing and resolving descriptor routes; it is never retained by the graph
  * and need not be initialized or cleared by the caller between parses.
- * This includes temporary state for reconstructing inherited descriptor
- * routes at compound-group expansion points. Obtain the required maximum
+ * Bytes beyond shell_dep_workspace_size()'s fixed prefix serve as delimiter
+ * scratch. shell_source_workspace_size(command_length, &bytes) gives a
+ * sufficient extra capacity; unusually large normalized delimiters can require
+ * EWORKSPACE and a retry.
+ * The fixed prefix includes the operation's lexical index, independent of
+ * parsing performed by application expansion callbacks, and temporary state
+ * for reconstructing inherited descriptor routes at compound-group expansion
+ * points. Obtain the fixed graph-state
  * size and alignment with shell_dep_workspace_size() and
  * shell_dep_workspace_alignment(). The limits object, command and initial-CWD
  * inputs, writable workspace, and shell_dep_graph_t output must have storage
@@ -258,13 +264,14 @@ const char *shell_dep_error_string(shell_dep_error_t err);
 size_t shell_dep_workspace_alignment(void);
 
 /**
- * Return the temporary workspace required for one dependency-graph parse and
- * descriptor-route resolution.
- * `limits` may be NULL; the current fixed-capacity implementation returns the
- * same maximum size for every valid limits configuration. The size is
- * independent of command text, so callers can reuse one buffer across
- * evaluations. `workspace_size` is required and receives the size; the current
- * fixed-capacity sizing operation always succeeds.
+ * Return the fixed temporary workspace for lexical indexing, graph state and
+ * descriptor-route resolution. Additional source-sized delimiter scratch can
+ * share its tail, as described by shell_dep_limits_t. `limits` may be NULL; the
+ * current fixed-capacity implementation returns the same maximum size for every
+ * valid limits configuration. The size is independent of command text, so
+ * callers can reuse one buffer across evaluations. `workspace_size` is required
+ * and receives the size; the current fixed-capacity sizing operation always
+ * succeeds.
  */
 bool shell_dep_workspace_size(const shell_dep_limits_t *limits,
                               size_t *workspace_size) SHELL_NONNULL(2);
@@ -325,7 +332,16 @@ typedef struct {
    * otherwise this is the owning TIME node index plus one. The biased form
    * keeps zero-initialized public graph values valid. */
   uint32_t pipeline_time_id;
-  bool cwd_known; /* Known across paths that reach this command's expansion */
+  /* Static lexical CWD shared by all modeled paths reaching this expansion.
+   * cd success installs its destination; pre-change failure preserves entry.
+   * Reporting/physical failures may follow a directory change and join those
+   * possibilities rather than claiming that nonzero status means no change.
+   * Thus cd /path && command can be known, while cd /path; command joins both
+   * outcomes. Argumentless cd can also report after CDPATH lookup of a relative
+   * HOME; its failure does not prove entry CWD or PWD/OLDPWD unchanged.
+   * Dynamic HOME/CDPATH/physical resolution remains unknown. The
+   * offset is not an authoritative path unless cwd_known is true. */
+  bool cwd_known;
   bool cwd_absolute; /* False when CWD is rooted at a relative initial path */
   /* Effective fd-0 and fd-1 pipeline endpoint pairs after redirects and
    * descriptor copies. Both fields in a pair are UINT32_MAX when that stream
@@ -1076,11 +1092,29 @@ shell_dep_graph_parse(const char *cmd, size_t cmd_len, const char *initial_cwd,
                       const shell_dep_limits_t *limits, shell_dep_graph_t *out)
     SHELL_NONNULL(1, 5);
 
+/* Build from the unchanged strict result of shell_parse_fast(), or the
+ * qualified prefix result of shell_parse_draft(). cmd and cmd_len must be
+ * exactly the immutable source span described by fast. Supplying different
+ * source bytes or edited metadata is invalid API use; no correspondence
+ * check or second fast parse is performed. Successful supplied results also
+ * establish byte admission, which graph construction does not repeat. Error
+ * and truncated results retain their ordinary handling; truncation alone
+ * does not establish byte admission. Graph construction still checks
+ * supported semantics and its resource limits. Borrowed source must outlive
+ * the graph, and fast and out must be distinct. NULL fast requests ordinary
+ * shell_dep_graph_parse() behavior. Other source/workspace contracts above
+ * apply, including error and truncation handling. */
+shell_dep_error_t shell_dep_graph_parse_with_fast(
+    const char *cmd, size_t cmd_len, const char *initial_cwd,
+    const shell_dep_limits_t *limits, const shell_parse_result_t *fast,
+    shell_dep_graph_t *out) SHELL_NONNULL(1, 6);
+
 /* Size the caller workspace for graph construction with word resolution.
  * Uses shell_dep_workspace_alignment(). NULL limits selects defaults. Returns
  * false and clears size on arithmetic overflow; no source bytes are inspected.
- * The extra reservation is bounded metadata and a source-offset index, not
- * copies of source or expansion payloads. */
+ * The extra reservation includes bounded metadata, a source-offset index and
+ * shell_source_workspace_size() bytes for delimiter preparation in that buffer.
+ * Source and expansion payloads otherwise remain borrowed. */
 bool shell_dep_resolved_workspace_size(size_t command_length,
                                        const shell_dep_limits_t *limits,
                                        size_t *workspace_size) SHELL_NONNULL(3);
@@ -1113,8 +1147,12 @@ const char *shell_dep_edge_type_name(shell_dep_edge_type_t type);
 const char *shell_dep_node_type_name(shell_dep_node_type_t type);
 const char *shell_dep_doc_kind_name(shell_dep_doc_kind_t kind);
 
-/** Measure the logical value bytes of a document without allocating. For a
- * `<<-` heredoc this removes all leading tabs from each physical body line. */
+/** Measure document content without allocating. Heredoc spans include every
+ * body byte before the closing delimiter line, including the final LF when
+ * present. For a literal heredoc this is its exact payload; `<<-` removes
+ * leading tabs from each body line. Expandable bodies remain unevaluated
+ * source templates, not claims about expanded runtime bytes. Empty bodies
+ * have zero length; carriage returns are never normalized. */
 bool shell_dep_doc_content_length(const shell_dep_doc_t *doc,
                                   size_t *content_length) SHELL_NONNULL(1, 2);
 

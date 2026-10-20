@@ -3,6 +3,33 @@
 
 #include "shell_processor.h"
 
+/* The actual shell word excludes operator-owned punctuation (notably the &
+ * in <& and >&) and inline trivia. Completeness is lexical, not a claim that
+ * the operand evaluates to a valid descriptor or pathname. In lexical mode,
+ * start == end means no operand word has begun; a nonempty incomplete span
+ * instead contains an unfinished word. Missing operands belong to the list
+ * grammar, not expansion recovery. */
+typedef struct {
+  uint32_t start, end;
+  bool complete;
+} shell_redirect_word_t;
+
+/* Visit a preframed redirect list using the processor's shared classifier.
+ * lexical permits unresolved dynamic duplication operands, retained with
+ * target_fd=NONE and their original operand span. Semantic consumers reject
+ * those cases instead. visitor and context are required and live throughout.
+ * Nonlexical callers supply complete, preframed operand words; only the
+ * received-draft boundary diagnoses unfinished words here.
+ * found distinguishes a redirect from ordinary following source. */
+typedef shell_process_status_t (*shell_redirect_visitor_t)(
+    void *context, const shell_group_io_op_t *op,
+    const shell_redirect_word_t *word);
+shell_process_status_t
+shell_process_visit_redirects(const char *input, uint32_t start, uint32_t end,
+                              uint16_t group_index, bool lexical,
+                              shell_redirect_visitor_t visitor, void *context,
+                              bool *found) SHELL_NONNULL(1, 6, 7, 8);
+
 /* Private borrowed-token view used by single-buffer netsequence producers.
  * The caller frees command/token arrays with shell_commands_free(); token
  * text borrows the immutable source. Every returned record is nonempty, with
@@ -46,11 +73,13 @@ shell_anomaly_stages_parse(const char *command_line, size_t command_length,
  * No byte, grammar, or supported-semantics validation is repeated here.
  * Construction still checks resource limits and allocation failures. stages
  * must be empty; it remains empty on failure. Source stays alive and unchanged
- * until the stages are freed. This is not valid for a partial/error graph. */
+ * until the stages are freed. This is not valid for a partial/error graph.
+ * source_limits optionally borrows delimiter scratch for this collection;
+ * only its workspace fields apply, with the ordinary non-aliasing contract. */
 shell_process_status_t shell_anomaly_stages_collect_prevalidated(
     const char *command_line, size_t command_length,
-    const shell_process_limits_t *limits, shell_anomaly_stages_t *stages)
-    SHELL_NONNULL(1, 4);
+    const shell_process_limits_t *limits, const shell_limits_t *source_limits,
+    shell_anomaly_stages_t *stages) SHELL_NONNULL(1, 5);
 
 /* Render a collected, unchanged stage view without reparsing its source.
  * Stages and their borrowed source remain live throughout rendering. Output
@@ -58,7 +87,10 @@ shell_process_status_t shell_anomaly_stages_collect_prevalidated(
  * on failure. limits may be NULL for defaults. Encoded byte limits apply to
  * each output; the collector has already enforced the group-I/O budget.
  * Executable-name decoding and empty-executable rejection remain renderer
- * operations. The paired form publishes both outputs atomically. */
+ * operations. The paired form publishes both outputs atomically. For nested
+ * words requiring additional delimiter scratch, keep the root source
+ * operation and its borrowed arena active through collection AND rendering;
+ * the public builders and gate orchestration establish this lifetime. */
 shell_process_status_t shell_build_command_netseq_from_stages(
     const shell_anomaly_stages_t *stages, const shell_process_limits_t *limits,
     shell_netstring_buffer_t *sequence, size_t *subcommand_count)

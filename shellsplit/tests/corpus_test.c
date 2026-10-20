@@ -111,7 +111,8 @@ TEST(canonical_processing_surfaces_agree) {
   for (size_t i = 0; i < SHELLCLAVE_COMMAND_CORPUS_COUNT; i++) {
     const char *input = shellclave_command_corpus_commands[i];
     size_t length = strlen(input);
-    shell_limits_t strict = {SHELL_MAX_SUBCOMMANDS, true};
+    shell_limits_t strict = {.max_subcommands = SHELL_MAX_SUBCOMMANDS,
+                             .strict_mode = true};
     shell_parse_result_t fast = {0};
     shell_command_t *commands = NULL;
     size_t command_count = 0;
@@ -410,7 +411,8 @@ TEST(parameter_word_literal_braces_cross_surface) {
   for (size_t i = 0; i < ARRAY_COUNT(cases); i++) {
     const char *input = cases[i].input;
     size_t length = strlen(input);
-    shell_limits_t strict = {SHELL_MAX_SUBCOMMANDS, true};
+    shell_limits_t strict = {.max_subcommands = SHELL_MAX_SUBCOMMANDS,
+                             .strict_mode = true};
     shell_parse_result_t fast = {0};
     shell_command_t *commands = NULL;
     size_t tokenized_count = 0;
@@ -492,7 +494,8 @@ TEST(parameter_word_literal_braces_cross_surface) {
  * shell syntax rather than becoming an opaque parameter-word byte. */
 TEST(parameter_word_literal_brace_boundary) {
   static const char input[] = "printf ${VALUE:-{left}| cat";
-  shell_limits_t strict = {SHELL_MAX_SUBCOMMANDS, true};
+  shell_limits_t strict = {.max_subcommands = SHELL_MAX_SUBCOMMANDS,
+                           .strict_mode = true};
   shell_parse_result_t fast = {0};
   shell_command_t *commands = NULL;
   size_t command_count = 0;
@@ -690,7 +693,8 @@ TEST(continued_list_topology) {
   for (size_t i = 0; i < ARRAY_COUNT(cases); i++) {
     const char *input = cases[i].input;
     size_t length = strlen(input);
-    shell_limits_t strict = {SHELL_MAX_SUBCOMMANDS, true};
+    shell_limits_t strict = {.max_subcommands = SHELL_MAX_SUBCOMMANDS,
+                             .strict_mode = true};
     shell_parse_result_t fast = {0};
     shell_processed_commands_t processed = {0};
     shell_dep_graph_t graph = {0};
@@ -768,7 +772,7 @@ static bool has_raw_operator_token(const char *input,
                                    size_t expected_length) {
   shell_tokenizer_state_t state;
   shell_token_t token;
-  if (!shell_tokenizer_init(&state, input, strlen(input)))
+  if (!shell_tokenizer_init(&state, input, strlen(input), NULL))
     return false;
   while (shell_tokenizer_next(&state, &token))
     if (token.type == expected_type && token.length == expected_length &&
@@ -781,7 +785,7 @@ static bool has_operator_token(const char *input,
                                shell_token_type_t expected_type) {
   shell_tokenizer_state_t state;
   shell_token_t token;
-  if (!shell_tokenizer_init(&state, input, strlen(input)))
+  if (!shell_tokenizer_init(&state, input, strlen(input), NULL))
     return false;
   while (shell_tokenizer_next(&state, &token))
     if (token.type == expected_type)
@@ -825,7 +829,8 @@ TEST(continued_punctuation_is_lossless_and_canonical) {
     const char *continued = cases[i].continued;
     size_t compact_length = strlen(compact);
     size_t continued_length = strlen(continued);
-    shell_limits_t strict = {SHELL_MAX_SUBCOMMANDS, true};
+    shell_limits_t strict = {.max_subcommands = SHELL_MAX_SUBCOMMANDS,
+                             .strict_mode = true};
     shell_parse_result_t compact_fast = {0};
     shell_parse_result_t continued_fast = {0};
     shell_command_t *compact_tokens = NULL;
@@ -980,7 +985,8 @@ TEST(continued_punctuation_respects_lexical_boundaries) {
   for (size_t i = 0; i < ARRAY_COUNT(cases); i++) {
     shell_tokenizer_state_t state;
     shell_token_t token;
-    CHECK(shell_tokenizer_init(&state, cases[i].input, strlen(cases[i].input)));
+    CHECK(shell_tokenizer_init(&state, cases[i].input, strlen(cases[i].input),
+                               NULL));
     while (shell_tokenizer_next(&state, &token))
       CHECK(token.type != cases[i].forbidden);
     CHECK(!has_operator_token(cases[i].input, cases[i].forbidden));
@@ -1025,7 +1031,8 @@ TEST(redirect_only_stages_remain_graph_visible) {
   for (size_t i = 0; i < ARRAY_COUNT(cases); i++) {
     const char *input = cases[i].input;
     size_t length = strlen(input);
-    shell_limits_t strict = {SHELL_MAX_SUBCOMMANDS, true};
+    shell_limits_t strict = {.max_subcommands = SHELL_MAX_SUBCOMMANDS,
+                             .strict_mode = true};
     shell_parse_result_t fast = {0};
     shell_command_t *commands = NULL;
     size_t command_count = 0;
@@ -1301,7 +1308,8 @@ TEST(named_fd_process_substitutions_are_canonical) {
   for (size_t i = 0; i < ARRAY_COUNT(cases); i++) {
     const char *input = cases[i];
     size_t length = strlen(input);
-    shell_limits_t strict = {SHELL_MAX_SUBCOMMANDS, true};
+    shell_limits_t strict = {.max_subcommands = SHELL_MAX_SUBCOMMANDS,
+                             .strict_mode = true};
     shell_parse_result_t fast = {0};
     shell_processed_commands_t processed = {0};
     shell_netstring_buffer_t netargv = {0};
@@ -1500,7 +1508,7 @@ TEST(numeric_herestring_operator_boundaries) {
   for (size_t i = 0; i < ARRAY_COUNT(inputs); i++) {
     shell_tokenizer_state_t state;
     shell_token_t token;
-    CHECK(shell_tokenizer_init(&state, inputs[i], strlen(inputs[i])));
+    CHECK(shell_tokenizer_init(&state, inputs[i], strlen(inputs[i]), NULL));
     CHECK(shell_tokenizer_next(&state, &token));
     CHECK(token.type == SHELL_TOKEN_HERESTRING && token.position == 0 &&
           token.length == lengths[i] && token.start == inputs[i]);
@@ -1674,7 +1682,7 @@ TEST(composite_redirect_word_boundaries) {
       "> <(cat)declare echo ok",      "> <(cat)\"while\" echo ok",
       "> prefix<(cat)while echo ok",  "> prefix<(cat)\\\nwhile echo ok",
       "> <(cat)foo time echo ok",     "{ cat; } > <(cat)while",
-      "{ cat; } > prefix<(cat)while",
+      "{ cat; } > prefix<(cat)while", "> <(cat)foo [[ x ]]",
   };
   for (size_t i = 0; i < ARRAY_COUNT(supported); i++) {
     shell_processed_commands_t processed = {0};
@@ -1686,7 +1694,6 @@ TEST(composite_redirect_word_boundaries) {
 
   static const char *const unsupported[] = {
       "> <(cat)foo declare -a values",
-      "> <(cat)foo [[ x ]]",
       "> <(cat)foo while true; do :; done",
       "{ cat; } > <(cat)foo while true; do :; done",
   };

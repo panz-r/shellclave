@@ -1132,7 +1132,7 @@ static void test_executable_substitution_scanner_contract(void) {
     shell_source_substitution_kind_t kind = SHELL_SOURCE_SUBST_COMMAND;
     valid = shell_source_next_executable_substitution(
                 incomplete[i], strlen(incomplete[i]), &scan, &start, &after,
-                &kind) == SHELL_SOURCE_SCAN_MALFORMED;
+                &kind) == SHELL_SOURCE_SCAN_INCOMPLETE;
   }
   static const char *const literal[] = {
       "\"${x:-\"<(printf hi)\"}\"",
@@ -1298,7 +1298,7 @@ static void test_expansion_line_continuation_contract(void) {
   bool saw_subshell = false;
   bool saw_variable = false;
   valid = shell_tokenizer_init(&state, command_substitution,
-                               sizeof(command_substitution) - 1);
+                               sizeof(command_substitution) - 1, NULL);
   while (valid && shell_tokenizer_next(&state, &token)) {
     saw_subshell = saw_subshell || token.type == SHELL_TOKEN_SUBSHELL;
     saw_variable = saw_variable || token.type == SHELL_TOKEN_VARIABLE ||
@@ -1707,7 +1707,7 @@ static void test_modern_bash_syntax_contract(void) {
       SHELL_TOKEN_ARRAY_ASSIGNMENT, SHELL_TOKEN_REDIRECT_BOTH,
       SHELL_TOKEN_COMMAND,
   };
-  bool valid = shell_tokenizer_init(&state, source, strlen(source));
+  bool valid = shell_tokenizer_init(&state, source, strlen(source), NULL);
   for (size_t i = 0; valid && i < sizeof(expected) / sizeof(expected[0]); i++)
     valid = shell_tokenizer_next(&state, &token) && token.type == expected[i];
   valid = valid && !shell_tokenizer_next(&state, &token);
@@ -2321,8 +2321,8 @@ static void test_modern_bash_syntax_contract(void) {
   const char *pipe_both_source = "left|&right";
   shell_token_type_t pipe_both_tokens[] = {
       SHELL_TOKEN_COMMAND, SHELL_TOKEN_PIPE_BOTH, SHELL_TOKEN_COMMAND};
-  valid =
-      shell_tokenizer_init(&state, pipe_both_source, strlen(pipe_both_source));
+  valid = shell_tokenizer_init(&state, pipe_both_source,
+                               strlen(pipe_both_source), NULL);
   for (size_t i = 0;
        valid && i < sizeof(pipe_both_tokens) / sizeof(pipe_both_tokens[0]); i++)
     valid = shell_tokenizer_next(&state, &token) &&
@@ -3317,7 +3317,7 @@ static void test_ansi_c_structural_scanner_contract(void) {
   const char *arithmetic = "echo $(( $(printf $'foo\\'bar)') + 1 ))";
   shell_tokenizer_state_t state;
   shell_token_t token;
-  valid = shell_tokenizer_init(&state, arithmetic, strlen(arithmetic)) &&
+  valid = shell_tokenizer_init(&state, arithmetic, strlen(arithmetic), NULL) &&
           shell_tokenizer_next(&state, &token) &&
           token.type == SHELL_TOKEN_COMMAND &&
           shell_tokenizer_next(&state, &token) &&
@@ -3338,7 +3338,7 @@ static void test_ansi_c_structural_scanner_contract(void) {
     const char *input = array_subscripts[i];
     shell_processed_commands_t processed = {0};
     shell_dep_graph_t graph = {0};
-    valid = valid && shell_tokenizer_init(&state, input, strlen(input)) &&
+    valid = valid && shell_tokenizer_init(&state, input, strlen(input), NULL) &&
             shell_tokenizer_next(&state, &token) &&
             token.type == SHELL_TOKEN_COMMAND &&
             shell_tokenizer_next(&state, &token) &&
@@ -3425,7 +3425,8 @@ static void test_nested_quote_and_ansi_completion(void) {
   shell_tokenizer_state_t state;
   shell_token_t token;
   shell_processed_commands_t processed = {0};
-  bool lexical = shell_tokenizer_init(&state, incomplete, strlen(incomplete));
+  bool lexical =
+      shell_tokenizer_init(&state, incomplete, strlen(incomplete), NULL);
   bool saw_ansi = false;
   while (lexical && shell_tokenizer_next(&state, &token))
     saw_ansi = saw_ansi || token.type == SHELL_TOKEN_ANSI_C_QUOTED;
@@ -3823,7 +3824,7 @@ typedef struct {
 static void run_iterator_cases(const iterator_case_t *cases, size_t count) {
   for (size_t i = 0; i < count; i++) {
     shell_tokenizer_state_t state;
-    shell_tokenizer_init(&state, cases[i].input, strlen(cases[i].input));
+    shell_tokenizer_init(&state, cases[i].input, strlen(cases[i].input), NULL);
     bool valid = state.input == cases[i].input && state.position == 0 &&
                  state.length == strlen(cases[i].input);
     for (size_t j = 0; j < cases[i].token_count; j++) {
@@ -3854,7 +3855,7 @@ static void run_iterator_cases(const iterator_case_t *cases, size_t count) {
 static void test_iterator_argument_contracts(void) {
   shell_tokenizer_state_t state;
   memset(&state, 0xA5, sizeof(state));
-  shell_tokenizer_init(&state, NULL, 0);
+  shell_tokenizer_init(&state, NULL, 0, NULL);
   shell_token_t token;
   memset(&token, 0xA5, sizeof(token));
   bool null_input =
@@ -5272,7 +5273,7 @@ static void test_full_tokenizer_group_context(void) {
       "{ printf \"$value\" $(id) <(producer) >out <<EOF\nbody\nEOF\n; }";
   shell_tokenizer_state_t state;
   shell_token_t token;
-  bool valid = shell_tokenizer_init(&state, input, strlen(input));
+  bool valid = shell_tokenizer_init(&state, input, strlen(input), NULL);
   bool saw_quoted_variable = false;
   bool saw_substitution = false;
   bool saw_process_substitution = false;
@@ -5324,7 +5325,8 @@ static void test_full_tokenizer_group_context(void) {
       {SHELL_TOKEN_GROUP_END, 1, SHELL_GROUP_BRACE},
   };
   const char *nested_input = "{ ( echo ); }";
-  valid = shell_tokenizer_init(&state, nested_input, strlen(nested_input));
+  valid =
+      shell_tokenizer_init(&state, nested_input, strlen(nested_input), NULL);
   for (size_t i = 0;
        valid && i < sizeof(nested_expected) / sizeof(nested_expected[0]); i++) {
     valid = shell_tokenizer_next(&state, &token) &&
@@ -5793,7 +5795,8 @@ static void test_brace_group_grammar_matrix(void) {
   for (size_t i = 0; i < sizeof(valid_cases) / sizeof(valid_cases[0]); i++) {
     const char *input = valid_cases[i].input;
     size_t length = strlen(input);
-    shell_limits_t strict = {SHELL_MAX_SUBCOMMANDS, true};
+    shell_limits_t strict = {.max_subcommands = SHELL_MAX_SUBCOMMANDS,
+                             .strict_mode = true};
     shell_parse_result_t fast = {0};
     shell_command_t *commands = NULL;
     size_t command_count = 0;
@@ -5908,7 +5911,8 @@ static void test_brace_group_grammar_matrix(void) {
        i++) {
     const char *input = invalid_cases[i];
     size_t length = strlen(input);
-    shell_limits_t strict = {SHELL_MAX_SUBCOMMANDS, true};
+    shell_limits_t strict = {.max_subcommands = SHELL_MAX_SUBCOMMANDS,
+                             .strict_mode = true};
     shell_parse_result_t fast = {0};
     shell_command_t *commands = (shell_command_t *)(uintptr_t)1;
     size_t command_count = SIZE_MAX;
@@ -7864,7 +7868,7 @@ static void test_heredoc_iterator_contract(void) {
   static const char *const texts[] = {"cat", "<<E'OF'", "<<-\\D'ONE'",
                                       "\n",  "printf",  "done"};
   shell_tokenizer_state_t state;
-  shell_tokenizer_init(&state, input, sizeof(input) - 1);
+  shell_tokenizer_init(&state, input, sizeof(input) - 1, NULL);
   bool valid = true;
   for (size_t i = 0; i < sizeof(types) / sizeof(types[0]); i++) {
     shell_token_t token;
@@ -7886,7 +7890,7 @@ static void test_heredoc_iterator_contract(void) {
    * newline as a list separator; the structured command tokenizer below
    * consumes it as the document-only stage boundary. */
   static const char named_heredoc[] = "cat& {fd}<<EOF\nbody\nEOF\n";
-  shell_tokenizer_init(&state, named_heredoc, sizeof(named_heredoc) - 1);
+  shell_tokenizer_init(&state, named_heredoc, sizeof(named_heredoc) - 1, NULL);
   static const shell_token_type_t named_types[] = {
       SHELL_TOKEN_COMMAND,
       SHELL_TOKEN_BACKGROUND,
@@ -7904,7 +7908,8 @@ static void test_heredoc_iterator_contract(void) {
           !state.heredoc_error && state.pending_heredoc_count == 0;
 
   static const char named_herestring[] = "{fd}<<<payload";
-  shell_tokenizer_init(&state, named_herestring, sizeof(named_herestring) - 1);
+  shell_tokenizer_init(&state, named_herestring, sizeof(named_herestring) - 1,
+                       NULL);
   bool named_herestring_advanced = shell_tokenizer_next(&state, &token);
   bool named_herestring_valid =
       named_herestring_advanced && token.type == SHELL_TOKEN_HERESTRING &&
@@ -9002,7 +9007,7 @@ static void test_prevalidated_anomaly_stages(void) {
     shell_anomaly_stages_t stages = {0};
     shellsplit_test_source_scan_reset();
     valid = shell_anomaly_stages_collect_prevalidated(
-                source, length, NULL, &stages) == SHELL_PROCESS_OK &&
+                source, length, NULL, NULL, &stages) == SHELL_PROCESS_OK &&
             shellsplit_test_metadata_work(
                 SHELLSPLIT_TEST_WORK_SEMANTIC_BODIES) == 0 &&
             shellsplit_test_metadata_work(
@@ -9087,7 +9092,7 @@ static void test_prevalidated_anomaly_stages(void) {
     shell_anomaly_stages_free(&stages);
     shellsplit_test_alloc_reset();
     status = shell_anomaly_stages_collect_prevalidated(source, length, NULL,
-                                                       &stages);
+                                                       NULL, &stages);
     size_t allocations = shellsplit_test_alloc_count();
     shellsplit_test_alloc_reset();
     valid = valid && status == SHELL_PROCESS_OK && allocations != 0;
@@ -9095,7 +9100,7 @@ static void test_prevalidated_anomaly_stages(void) {
     for (size_t fail = 1; valid && fail <= allocations; fail++) {
       shellsplit_test_alloc_fail_at(fail);
       status = shell_anomaly_stages_collect_prevalidated(source, length, NULL,
-                                                         &stages);
+                                                         NULL, &stages);
       shellsplit_test_alloc_reset();
       valid = status == SHELL_PROCESS_ENOMEM && !stages.commands &&
               stages.count == 0;
@@ -9114,7 +9119,7 @@ static void test_prevalidated_anomaly_stages(void) {
   shell_process_limits_t group_limit = {SIZE_MAX, SIZE_MAX, 1};
   valid = valid &&
           shell_anomaly_stages_collect_prevalidated(
-              grouped, sizeof(grouped) - 1, &group_limit, &stages) ==
+              grouped, sizeof(grouped) - 1, &group_limit, NULL, &stages) ==
               SHELL_PROCESS_EOUTPUT_LIMIT &&
           !stages.commands && stages.count == 0;
   shell_anomaly_stages_free(&stages);
@@ -10944,7 +10949,7 @@ int main(void) {
     bool in_bounds = true;
     size_t input_len = strlen(input);
 
-    shell_tokenizer_init(&state, input, strlen(input));
+    shell_tokenizer_init(&state, input, strlen(input), NULL);
     while (shell_tokenizer_next(&state, &token)) {
       if (token.position > input_len ||
           token.length > input_len - token.position ||

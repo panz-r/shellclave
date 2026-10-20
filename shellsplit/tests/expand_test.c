@@ -207,7 +207,7 @@ int main(void) {
     bool absolute_cwd;
   } cases[] = {
       {"echo \"$V\"", 1, 0, 0, false},
-      {"cd /workspace; { echo \"$V\"; } >\"$OUT\"", 1, 1, 0, true},
+      {"cd /workspace && { echo \"$V\"; } >\"$OUT\"", 1, 1, 0, true},
       {"cat $(<\"$IN\")", 1, 0, 1, false},
       {"exec \"$V\"", 0, 0, 0, false},
       {"cd \"$V\"", 0, 0, 0, false},

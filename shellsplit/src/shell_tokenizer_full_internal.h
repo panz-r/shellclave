@@ -13,6 +13,11 @@ void shell_tokenizer_init_prechecked(shell_tokenizer_state_t *state,
                                      const char *input, size_t input_length)
     SHELL_NONNULL(1, 2);
 
+/* Classify a parser-produced token borrowing this same immutable source.
+ * Escaped physical continuations do not quote structural operators. */
+bool shell_token_is_literal(const char *input, const shell_token_t *token)
+    SHELL_NONNULL(1, 2);
+
 /* Construct bounded fast ranges for a supported, syntax-validated immutable
  * list within the current source operation. This is the metadata counterpart
  * of prevalidated token construction, used for operational group-I/O limits.

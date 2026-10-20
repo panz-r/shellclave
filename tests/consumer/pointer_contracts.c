@@ -9,6 +9,7 @@
 #include "../../shelltype/src/policy_ctx.h"
 #include "shell_netstring.h"
 #include "shell_processor.h"
+#include "shell_source.h"
 #include "shell_transform.h"
 #include "shellgate.h"
 #include "shelltype.h"
@@ -527,6 +528,13 @@ void pointer_contracts(sg_gate_t *gate, st_policy_t *policy) {
                                        NULL);
 #elif TEST_BAD == 186
   (void)st_policy_clear(sg_gate_allow_policy_borrowed(gate));
+#elif TEST_BAD == 187
+  static shell_source_result_t draft;
+  (void)shell_parse_draft(NULL, 0, NULL, &draft);
+#elif TEST_BAD == 188
+  (void)shell_parse_draft("", 0, NULL, NULL);
+#elif TEST_BAD == 189
+  (void)shell_source_workspace_size(0, NULL);
 #else
   /* These NULL values have API meanings and must stay accepted. */
   (void)shell_netstring_iter_init(&iter, NULL, 0);

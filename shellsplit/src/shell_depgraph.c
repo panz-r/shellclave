@@ -408,27 +408,17 @@ bool shell_dep_doc_file_identity_write(const shell_dep_graph_t *graph,
   return true;
 }
 
-/* current_offset references an installed pool entry. Absolute and symbolic
- * HOME-rooted targets do not read that entry; relative targets require a known
- * incoming directory. effective_size is the validated pool bound. */
-static SHELL_NONNULL(1, 3, 6) uint32_t
+/* current_offset references an installed pool entry. rel is a decoded nonempty
+ * static path; relative targets require a known incoming directory.
+ * effective_size is the validated pool bound. */
+static SHELL_NONNULL(1, 3, 5) uint32_t
     cwd_resolve_dedup(shell_dep_graph_t *g, uint32_t current_offset,
-                      const char *rel, bool tilde_expanded,
-                      uint32_t effective_size, uint32_t *status) {
-  if (rel[0] == '\0')
-    return current_offset;
-
+                      const char *rel, uint32_t effective_size,
+                      uint32_t *status) {
   char temp_path[SHELL_DEP_CWD_BUF_SIZE];
   size_t rel_len = strlen(rel);
 
   if (rel[0] == '/') {
-    if (rel_len >= effective_size) {
-      *status |= SHELL_DEP_STATUS_TRUNCATED;
-      return current_offset;
-    }
-    memcpy(temp_path, rel, rel_len);
-    temp_path[rel_len] = '\0';
-  } else if (tilde_expanded) {
     if (rel_len >= effective_size) {
       *status |= SHELL_DEP_STATUS_TRUNCATED;
       return current_offset;
@@ -1298,17 +1288,18 @@ static bool dep_redirect_is_legacy_combined_output(const dep_token_t *redirect,
  * The resolver stores C strings, so decoded NUL and output overflow make the
  * destination unknowable rather than silently truncating or fabricating one.
  * tok is a parser-owned word; destination has destination_size writable bytes.
- * tilde_expanded and truncated are optional outputs. */
-static SHELL_NONNULL(1, 2) bool decode_static_cwd_operand(
-    const dep_token_t *tok, char *destination, size_t destination_size,
-    bool *tilde_expanded, bool *truncated) {
-  if (tilde_expanded)
-    *tilde_expanded = false;
+ * Runtime-dependent tilde expansion is not materialized as a symbolic HOME
+ * string. truncated is an optional output for a static destination overflow. */
+static SHELL_NONNULL(1,
+                     2) bool decode_static_cwd_operand(const dep_token_t *tok,
+                                                       char *destination,
+                                                       size_t destination_size,
+                                                       bool *truncated) {
   if (truncated)
     *truncated = false;
   shell_source_word_expansion_t expansion = shell_source_word_expansion(
       tok->start, tok->len, SHELL_SOURCE_WORD_ARGUMENT);
-  if (destination_size == 0 || expansion.dynamic)
+  if (destination_size == 0 || expansion.dynamic || expansion.leading_tilde)
     return false;
 
   size_t decoded_length = 0;
@@ -1330,42 +1321,20 @@ static SHELL_NONNULL(1, 2) bool decode_static_cwd_operand(
     return false;
   destination[written] = '\0';
 
-  /* Quote removal cannot create a tilde expansion point. Classification also
-   * handles escaped line endings before and inside the logical prefix. */
-  if (!expansion.leading_tilde)
-    return true;
-  if (destination[1] == '\0') {
-    if (destination_size < sizeof("$HOME")) {
-      if (truncated)
-        *truncated = true;
-      return false;
-    }
-    memcpy(destination, "$HOME", sizeof("$HOME"));
-    if (tilde_expanded)
-      *tilde_expanded = true;
-    return true;
-  }
-  if (destination[1] != '/')
-    return false; /* ~user needs the runtime account database. */
-  if (written + sizeof("$HOME") - 1 > destination_size) {
-    if (truncated)
-      *truncated = true;
-    return false;
-  }
-  memmove(destination + sizeof("$HOME") - 1, destination + 1, written);
-  memcpy(destination, "$HOME", sizeof("$HOME") - 1);
-  if (tilde_expanded)
-    *tilde_expanded = true;
   return true;
 }
 
-/* CDPATH can redirect a bare relative operand before the fallback relative to
- * the current directory. Dot-prefixed paths and an actual tilde expansion are
- * stable under that lookup. A literal `$HOME` spelling is still relative. */
-static bool cwd_operand_uses_cdpath(const char *destination,
-                                    bool tilde_expanded) {
-  return destination && destination[0] != '\0' && destination[0] != '/' &&
-         destination[0] != '.' && !tilde_expanded;
+/* CDPATH can redirect a relative operand unless its first component is exactly
+ * "." or "..". A dot-prefixed name such as .hidden still uses CDPATH.
+ * destination is a nonempty decoded static path;
+ * runtime tilde expansion was excluded before decoding. */
+static SHELL_NONNULL(1) bool cwd_operand_uses_cdpath(const char *destination) {
+  if (destination[0] == '/')
+    return false;
+  if (destination[0] != '.')
+    return true;
+  size_t dots = destination[1] == '.' ? 2 : 1;
+  return destination[dots] != '/' && destination[dots] != '\0';
 }
 
 /* A group is a pipeline member in its own right. Detect a directly preceding
@@ -1549,25 +1518,18 @@ static uint32_t prescan_heredocs(const char *cmd, size_t cmd_len,
         heredocs[h - 1].has_source_span)
       body_start = heredocs[h - 1].body_after_pos;
 
-    for (uint32_t line = body_start; line < cmd_len;) {
-      if (shell_source_line_is_heredoc_delimiter(cmd, cmd_len, line,
-                                                 &hd->pending)) {
-        hd->content_start_pos = body_start;
-        hd->content_end_pos = line;
-        hd->body_after_pos =
-            (uint32_t)shell_source_next_line(cmd, cmd_len, line);
-        hd->has_source_span = true;
-        for (uint32_t i = hd->marker_idx + 1; i < result->count; i++) {
-          if (result->cmds[i].start >= body_start &&
-              result->cmds[i].start < hd->body_after_pos)
-            skip[i] = true;
-        }
-        break;
+    shell_source_heredoc_frame_t frame =
+        shell_source_frame_heredoc(cmd, cmd_len, body_start, &hd->pending);
+    if (frame.complete) {
+      hd->content_start_pos = body_start;
+      hd->content_end_pos = (uint32_t)frame.body_end;
+      hd->body_after_pos = (uint32_t)frame.after;
+      hd->has_source_span = true;
+      for (uint32_t i = hd->marker_idx + 1; i < result->count; i++) {
+        if (result->cmds[i].start >= body_start &&
+            result->cmds[i].start < hd->body_after_pos)
+          skip[i] = true;
       }
-      uint32_t next = (uint32_t)shell_source_next_line(cmd, cmd_len, line);
-      if (next <= line)
-        break;
-      line = next;
     }
     if (!hd->has_source_span) {
       /* The permissive parser treats an unfinished heredoc as opaque data to
@@ -2523,6 +2485,7 @@ typedef struct {
   /* Prepared cd argument analysis, shared by CWD transitions and implicit
    * variable effects. Collapsed commands retain effects without graph nodes. */
   const bool *range_cd_writes;
+  const bool *range_cd_failure_writes;
   /* First setup operation which cannot succeed. Earlier expansions/setup
    * remain observable; the command body and later operands do not run. */
   uint32_t *owner_setup_stop;
@@ -2849,9 +2812,10 @@ typedef struct {
   uint32_t count;
   bool clear;
   bool before_redirect;
-  /* cd's implicit variable writes follow successful execution only. Ordinary
-   * mutating builtins may write even when they subsequently return failure. */
+  /* Pre-change cd failures do not write. Reporting/physical failures can
+   * instead follow a successful chdir, joining changed and unchanged states. */
   bool success_only;
+  bool failure_alternative;
   /* Zero is the root list; otherwise this is the one-based lexical group. */
   uint8_t scope;
   /* NULL means arbitrary writes can affect every visible binding. A retained
@@ -3597,6 +3561,9 @@ struct dep_snapshot_frame {
  * reusable workspace for the duration of a parse. Isolated descriptor scopes
  * remain lazy overlays because most commands have none. */
 struct dep_route_workspace {
+  /* Retain lexical facts across application resolver callbacks without
+   * occupying the allocation-free parser's independent TLS backing. */
+  shell_source_index_t source_index;
   /* Read evaluation completes before publication or recursive construction;
    * every owner reuses these two bounded, mode/phase/selector frontiers. */
   dep_read_frontier_t read_frontiers[2];
@@ -3714,17 +3681,51 @@ bool shell_dep_workspace_size(const shell_dep_limits_t *limits,
   return true;
 }
 
+/* Validate optional scratch once at the graph boundary. Syntax-only and empty
+ * inputs may still be classified without it; construction requires a prepared
+ * non-NULL workspace. Internal parsers inherit these size/alignment guarantees.
+ */
+static shell_dep_limits_t dep_prepare_limits(const shell_dep_limits_t *limits) {
+  shell_dep_limits_t prepared = limits ? *limits : SHELL_DEP_LIMITS_DEFAULT;
+  if (!prepared.workspace ||
+      prepared.workspace_size < sizeof(dep_route_workspace_t) ||
+      (uintptr_t)prepared.workspace % _Alignof(dep_route_workspace_t) != 0) {
+    prepared.workspace = NULL;
+    prepared.workspace_size = 0;
+  }
+  return prepared;
+}
+
+/* Graph state occupies the fixed prefix. Additional bytes in that same
+ * evaluation buffer are available to lexical preparation throughout parsing,
+ * including while a recursive child borrows the parent's route journals. */
+static SHELL_NONNULL(1, 3) shell_source_workspace_scope_t
+    dep_source_workspace(const char *source, size_t length,
+                         const shell_dep_limits_t *limits) {
+  if (limits->workspace) {
+    dep_route_workspace_t *workspace = limits->workspace;
+    shell_source_operation_index(&workspace->source_index);
+    return shell_source_workspace_begin(
+        source, length,
+        (unsigned char *)limits->workspace + sizeof(dep_route_workspace_t),
+        limits->workspace_size - sizeof(dep_route_workspace_t));
+  }
+  return shell_source_workspace_begin(source, length, NULL, 0);
+}
+
 bool shell_dep_resolved_workspace_size(size_t command_length,
                                        const shell_dep_limits_t *limits,
                                        size_t *workspace_size) {
-  size_t cache_size, graph_size;
+  size_t cache_size, graph_size, delimiter_size;
   *workspace_size = 0;
   size_t alignment = shell_dep_workspace_alignment();
   if (!shell_expand_cache_size(command_length, &cache_size) ||
       !shell_dep_workspace_size(limits, &graph_size) ||
-      cache_size > SIZE_MAX - graph_size - alignment)
+      !shell_source_workspace_size(command_length, &delimiter_size) ||
+      cache_size > SIZE_MAX - graph_size - alignment ||
+      delimiter_size > SIZE_MAX - cache_size - graph_size - alignment)
     return false;
-  *workspace_size = cache_size + graph_size + alignment;
+  *workspace_size = cache_size + graph_size + alignment + delimiter_size;
   return true;
 }
 
@@ -5748,7 +5749,7 @@ static SHELL_NONNULL(1, 2, 3, 4, 5, 6) void dep_prepare_named_mutations(
     dep_prefix_assignment_set_t *prefix_assignments,
     dep_assignment_ifs_t *assignment_ifs, uint32_t *assignment_ifs_count,
     dep_named_mutations_t *null_mutations, uint32_t readonly_stop,
-    bool cd_writes, uint8_t argv_presence) {
+    bool cd_writes, bool cd_failure_writes, uint8_t argv_presence) {
   *mutations = (dep_named_mutations_t){0};
   *null_mutations = (dep_named_mutations_t){.before_redirect = true};
   *prefix_assignments = (dep_prefix_assignment_set_t){0};
@@ -5815,6 +5816,7 @@ static SHELL_NONNULL(1, 2, 3, 4, 5, 6) void dep_prepare_named_mutations(
      * same-name temporary prefixes. cd argument validity was prepared once
      * during construction, before either route stream consumes its effects. */
     *mutations = dep_cd_mutations;
+    mutations->failure_alternative = cd_failure_writes;
     return;
   }
   shell_source_builtin_kind_t builtin_kind =
@@ -6570,6 +6572,7 @@ static SHELL_NONNULL(1, 2, 4) bool dep_snapshot_fd_operations(
           &source->null_mutations,
           source->argv_presence & DEP_ARGV_EMPTY ? source->readonly_stop : 0,
           context->range_cd_writes[context->node_range[owner]],
+          context->range_cd_failure_writes[context->node_range[owner]],
           source->argv_presence);
       uint32_t event = context->node_group[owner] != UINT32_MAX
                            ? context->node_group[owner]
@@ -10035,7 +10038,8 @@ static SHELL_NONNULL(1,
 /* event is a begun simple-command source event, not a group event. */
 static SHELL_NONNULL(1) void dep_cwd_finish_command(
     const dep_parse_context_t *context, uint32_t event,
-    dep_cwd_state_t candidate) {
+    dep_cwd_state_t candidate, bool changes_directory, bool setup_may_fail,
+    bool may_change_on_failure) {
   dep_cwd_flow_t executed = {.mask = context->event_static_status[event]};
   dep_cwd_state_t stopped =
       dep_cwd_selected(&context->snapshot->cwd_entry[event],
@@ -10045,8 +10049,23 @@ static SHELL_NONNULL(1) void dep_cwd_finish_command(
       context->execution->pipeline
           .local_process[context->execution->owner[event - SHELL_MAX_GROUPS]])
     candidate = stopped;
+  bool negated =
+      context->fast->cmds[event - SHELL_MAX_GROUPS].pipeline_negation_count &
+      1u;
   for (unsigned i = 0; i < 5; i++)
-    executed.state[i] = i < 2 ? candidate : stopped;
+    executed.state[i] = i < 2 && (!changes_directory || i == (unsigned)negated)
+                            ? candidate
+                            : stopped;
+  /* Shell return status is not the chdir phase's status: reporting a selected
+   * directory, or physical resolution, can fail after changing directory. */
+  if (changes_directory && may_change_on_failure) {
+    unsigned failure = negated ? 0 : 1;
+    executed.state[failure] = dep_cwd_join(stopped, candidate);
+  }
+  if (!changes_directory && setup_may_fail) {
+    unsigned failure = negated ? 0 : 1;
+    executed.state[failure] = dep_cwd_join(executed.state[failure], stopped);
+  }
   dep_cwd_finish(context, event, &executed);
 }
 
@@ -19523,7 +19542,7 @@ static SHELL_NONNULL(
       (runtime_exec || mutations->success_only ||
        (source->read.active && read.unassigned_failure))) {
     /* Runtime exec option errors do not retain numeric redirects. Likewise,
-     * failed cd execution preserves PWD/OLDPWD while keeping any descriptor
+     * pre-change cd failure preserves PWD/OLDPWD while keeping any descriptor
      * variables allocated during its successful redirect setup. A read failure
      * before assignment publishes no target writes; partial assignment failures
      * instead use their terminal version's exact earlier-write signature. */
@@ -19548,6 +19567,9 @@ static SHELL_NONNULL(
       return false;
     if (source->read.active && read.unassigned_failure &&
         read.assigned_failure &&
+        !dep_fd_merge(&failed_body, &continued, journal, baseline))
+      return false;
+    if (mutations->failure_alternative &&
         !dep_fd_merge(&failed_body, &continued, journal, baseline))
       return false;
   }
@@ -22078,7 +22100,7 @@ typedef struct {
   uint32_t count;
 } dep_endpoint_list_t;
 
-static shell_dep_error_t shell_dep_graph_parse_impl(
+static SHELL_NONNULL(1, 6, 9, 10) shell_dep_error_t shell_dep_graph_parse_impl(
     const char *cmd, size_t cmd_len, const char *initial_cwd,
     bool initial_cwd_known, bool initial_cwd_absolute,
     const shell_dep_limits_t *limits, uint32_t depth,
@@ -23604,8 +23626,8 @@ static SHELL_NONNULL(1, 5, 6, 7, 8, 10) shell_dep_error_t
     if (error != SHELL_DEP_OK)
       return error;
   }
-  return scan_status == SHELL_SOURCE_SCAN_MALFORMED ? SHELL_DEP_EPARSE
-                                                    : SHELL_DEP_OK;
+  return scan_status != SHELL_SOURCE_SCAN_DONE ? SHELL_DEP_EPARSE
+                                               : SHELL_DEP_OK;
 }
 
 static SHELL_NONNULL(1, 5, 6, 7, 8, 10) shell_dep_error_t
@@ -24350,7 +24372,7 @@ static SHELL_NONNULL(1, 2, 4, 5, 6, 7, 10, 11) bool dep_add_pipeline_time_nodes(
   return true;
 }
 
-static SHELL_NONNULL(1, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
+static SHELL_NONNULL(1, 6, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
     const char *cmd, size_t cmd_len, const char *initial_cwd,
     bool initial_cwd_known, bool initial_cwd_absolute,
     const shell_dep_limits_t *limits, uint32_t depth,
@@ -24400,12 +24422,6 @@ static SHELL_NONNULL(1, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
     out->status = SHELL_DEP_STATUS_ERROR;
     out->cwd_buf.len = 0;
     return SHELL_DEP_EPARSE;
-  }
-
-  shell_dep_limits_t default_limits;
-  if (!limits) {
-    default_limits = SHELL_DEP_LIMITS_DEFAULT;
-    limits = &default_limits;
   }
 
   uint32_t max_nodes = limits->max_nodes;
@@ -24497,13 +24513,10 @@ static SHELL_NONNULL(1, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
                                                       : SHELL_DEP_OK;
   }
 
-  /* Reject unavailable scratch once after syntax and empty-source handling.
-   * Internal consumers below rely on this aligned, sufficiently sized buffer.
+  /* The public boundary prepared size/alignment; only construction needs the
+   * resource. Syntax and empty-source classification above need no workspace.
    */
-  if (depth == 0 &&
-      (!limits->workspace ||
-       limits->workspace_size < sizeof(dep_route_workspace_t) ||
-       (uintptr_t)limits->workspace % _Alignof(dep_route_workspace_t) != 0)) {
+  if (depth == 0 && !limits->workspace) {
     out->status = SHELL_DEP_STATUS_ERROR;
     return SHELL_DEP_EWORKSPACE;
   }
@@ -24627,6 +24640,7 @@ static SHELL_NONNULL(1, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
     memset(expansion_status[event].phase, DEP_EXPANSION_INCOMING,
            sizeof(expansion_status[event].phase));
   bool range_cd_writes[SHELL_MAX_SUBCOMMANDS] = {false};
+  bool range_cd_failure_writes[SHELL_MAX_SUBCOMMANDS] = {false};
   uint32_t owner_assignment_stop[SHELL_DEP_MAX_NODES];
   uint32_t owner_setup_stop[SHELL_DEP_MAX_NODES];
   for (uint32_t node = 0; node < SHELL_DEP_MAX_NODES; node++)
@@ -24690,6 +24704,7 @@ static SHELL_NONNULL(1, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
       .event_body_status = event_body_status,
       .expansion_status = expansion_status,
       .range_cd_writes = range_cd_writes,
+      .range_cd_failure_writes = range_cd_failure_writes,
       .owner_assignment_stop = owner_assignment_stop,
       .owner_setup_stop = owner_setup_stop,
       .effects_active = effects_active,
@@ -24922,8 +24937,6 @@ static SHELL_NONNULL(1, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
     uint32_t content_length = hd->content_end_pos - hd->content_start_pos;
     group_exec[group].setup_can_fail = true;
     const char *content = content_length ? cmd + hd->content_start_pos : NULL;
-    if (content_length && content[content_length - 1] == '\n')
-      content_length--;
     uint32_t document = UINT32_MAX;
     uint32_t marker_start = marker->start;
     uint32_t prefix_start = execution.pipeline.document_start[hd->marker_idx];
@@ -25247,43 +25260,42 @@ static SHELL_NONNULL(1, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
        * the incoming state below. */
       if (cd_physical && cd_target_kind != DEP_CD_INVALID)
         cd_target_kind = DEP_CD_DYNAMIC;
+      /* A relative runtime HOME can also select CDPATH and print the chosen
+       * directory. Reporting may fail after chdir, just as with cd - or a
+       * dynamic operand. Share this phase fact with PWD/OLDPWD effects. */
+      range_cd_failure_writes[si] =
+          cd_target_kind == DEP_CD_DYNAMIC || cd_target_kind == DEP_CD_HOME;
       if (cd_target_kind == DEP_CD_OPERAND && !cwd_isolated) {
         char arg_buf[256];
-        bool tilde_expanded = false;
         bool truncated = false;
         if (!decode_static_cwd_operand(cd_operand, arg_buf, sizeof(arg_buf),
-                                       &tilde_expanded, &truncated)) {
+                                       &truncated)) {
           cd_next_cwd_known = false;
+          range_cd_failure_writes[si] = true;
           if (truncated)
             out->status |= SHELL_DEP_STATUS_TRUNCATED;
-        } else if (cwd_operand_uses_cdpath(arg_buf, tilde_expanded)) {
+        } else if (cwd_operand_uses_cdpath(arg_buf)) {
           cd_next_cwd_known = false;
-        } else if (arg_buf[0] == '/' || tilde_expanded || cd_next_cwd_known) {
-          if (arg_buf[0] == '/' || tilde_expanded)
+          range_cd_failure_writes[si] = true;
+        } else if (arg_buf[0] == '/' || cd_next_cwd_known) {
+          if (arg_buf[0] == '/')
             cd_next_cwd_known = true;
           if (arg_buf[0] == '/')
             cd_next_cwd_absolute = true;
-          else if (tilde_expanded)
-            cd_next_cwd_absolute = false;
           uint32_t status_before = out->status;
-          cd_next_cwd_offset = cwd_resolve_dedup(
-              out, cd_next_cwd_offset, arg_buf, tilde_expanded,
-              effective_cwd_buf_size, &out->status);
+          cd_next_cwd_offset =
+              cwd_resolve_dedup(out, cd_next_cwd_offset, arg_buf,
+                                effective_cwd_buf_size, &out->status);
           if ((out->status & ~status_before) != 0)
             cd_next_cwd_known = false;
         }
-      } else if (cd_target_kind == DEP_CD_HOME && !cwd_isolated &&
-                 cd_next_cwd_known) {
+      } else if (cd_target_kind == DEP_CD_HOME && !cwd_isolated) {
+        cd_next_cwd_known = false;
         cd_next_cwd_absolute = false;
-        cd_next_cwd_offset =
-            cwd_resolve_dedup(out, cd_next_cwd_offset, "$HOME", true,
-                              effective_cwd_buf_size, &out->status);
       } else if (cd_target_kind == DEP_CD_DYNAMIC && !cwd_isolated &&
                  cd_next_cwd_known) {
         cd_next_cwd_known = false;
       }
-      if (next_conditional && cd_target_kind != DEP_CD_INVALID)
-        cd_next_cwd_known = false;
     }
 
     /* A runtime command may resolve to `cd`, but its words and redirects
@@ -25369,8 +25381,6 @@ static SHELL_NONNULL(1, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
         name_len = hd->delimiter_len;
         value = cmd + hd->content_start_pos;
         value_len = hd->content_end_pos - hd->content_start_pos;
-        if (value_len != 0 && value[value_len - 1] == '\n')
-          value_len--;
         if (hd->literal)
           flags |= SHELL_DEP_DOC_FLAG_HEREDOC_LITERAL;
         if (hd->pending.strip_tabs)
@@ -25893,7 +25903,9 @@ static SHELL_NONNULL(1, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
     dep_cwd_finish_command(&parse_context, source_event,
                            (dep_cwd_state_t){*range_cwd_offset,
                                              *range_cwd_known,
-                                             *range_cwd_absolute});
+                                             *range_cwd_absolute},
+                           is_cd && cd_target_kind != DEP_CD_INVALID,
+                           setup_may_fail, range_cd_failure_writes[si]);
   }
 
   dep_execution_control_edges(out, &parse_context, max_edges);
@@ -26261,7 +26273,7 @@ static SHELL_NONNULL(1, 3) shell_dep_error_t
  * syntax without importing executable routes. Both inherit the workspace
  * validated at root entry.
  */
-static SHELL_NONNULL(1, 9, 10) shell_dep_error_t shell_dep_graph_parse_impl(
+static SHELL_NONNULL(1, 6, 9, 10) shell_dep_error_t shell_dep_graph_parse_impl(
     const char *cmd, size_t cmd_len, const char *initial_cwd,
     bool initial_cwd_known, bool initial_cwd_absolute,
     const shell_dep_limits_t *limits, uint32_t depth,
@@ -26314,11 +26326,18 @@ shell_dep_error_t shell_dep_graph_parse(const char *cmd, size_t cmd_len,
                                         const char *initial_cwd,
                                         const shell_dep_limits_t *limits,
                                         shell_dep_graph_t *out) {
+  shell_dep_limits_t prepared = dep_prepare_limits(limits);
+  limits = &prepared;
   shell_source_operation_begin(cmd, cmd_len);
+  shell_source_workspace_scope_t previous =
+      dep_source_workspace(cmd, cmd_len, limits);
   dep_subgraph_streams_t streams = {0};
   shell_dep_error_t status = shell_dep_graph_parse_impl(
       cmd, cmd_len, initial_cwd, true, initial_cwd && initial_cwd[0] == '/',
       limits, 0, NULL, out, &streams, NULL, true, NULL);
+  if (shell_source_scratch_exhausted())
+    status = dep_stop_graph_construction(out, SHELL_DEP_EWORKSPACE);
+  shell_source_workspace_end(previous);
   shell_source_operation_end();
   return dep_finish_public_graph(out, status, &streams, limits);
 }
@@ -26329,11 +26348,20 @@ shell_dep_error_t shell_dep_graph_parse_with_fast(
     shell_dep_graph_t *out) {
   if (!fast)
     return shell_dep_graph_parse(cmd, cmd_len, initial_cwd, limits, out);
+  shell_dep_limits_t prepared = dep_prepare_limits(limits);
+  limits = &prepared;
   shell_source_operation_begin(cmd, cmd_len);
+  if (fast->status == SHELL_STATUS_OK)
+    shell_source_operation_prechecked();
+  shell_source_workspace_scope_t previous =
+      dep_source_workspace(cmd, cmd_len, limits);
   dep_subgraph_streams_t streams = {0};
   shell_dep_error_t status = shell_dep_graph_parse_impl(
       cmd, cmd_len, initial_cwd, true, initial_cwd && initial_cwd[0] == '/',
       limits, 0, fast, out, &streams, NULL, true, NULL);
+  if (shell_source_scratch_exhausted())
+    status = dep_stop_graph_construction(out, SHELL_DEP_EWORKSPACE);
+  shell_source_workspace_end(previous);
   shell_source_operation_end();
   return dep_finish_public_graph(out, status, &streams, limits);
 }
@@ -26369,10 +26397,15 @@ shell_dep_error_t shell_dep_graph_parse_resolved(
   graph_limits.workspace_size = graph_workspace_size;
   shell_dep_word_resolver_t resolver = {shell_expand_resolve, &cache};
   shell_source_operation_begin(cmd, cmd_len);
+  shell_source_workspace_scope_t previous =
+      dep_source_workspace(cmd, cmd_len, &graph_limits);
   dep_subgraph_streams_t streams = {0};
   shell_dep_error_t status = shell_dep_graph_parse_impl(
       cmd, cmd_len, initial_cwd, true, initial_cwd && initial_cwd[0] == '/',
       &graph_limits, 0, NULL, out, &streams, NULL, true, &resolver);
+  if (shell_source_scratch_exhausted())
+    status = dep_stop_graph_construction(out, SHELL_DEP_EWORKSPACE);
+  shell_source_workspace_end(previous);
   shell_source_operation_end();
   if (cache.error != SHELL_DEP_OK)
     return dep_stop_graph_construction(out, cache.error);
@@ -26388,16 +26421,25 @@ shell_dep_error_t shell_dep_graph_parse_with_fast_resolver(
     const shell_dep_limits_t *limits, const shell_parse_result_t *fast,
     shell_dep_graph_t *out, const shell_dep_word_resolver_t *resolver,
     uint8_t *unresolved_paths) {
+  shell_dep_limits_t prepared = dep_prepare_limits(limits);
+  limits = &prepared;
   shell_source_operation_begin(cmd, cmd_len);
+  if (fast->status == SHELL_STATUS_OK)
+    shell_source_operation_prechecked();
+  shell_source_workspace_scope_t previous =
+      dep_source_workspace(cmd, cmd_len, limits);
   dep_subgraph_streams_t streams = {0};
   shell_dep_error_t status = shell_dep_graph_parse_impl(
       cmd, cmd_len, initial_cwd, true, initial_cwd && initial_cwd[0] == '/',
       limits, 0, fast, out, &streams, NULL, true, resolver);
+  if (shell_source_scratch_exhausted())
+    status = dep_stop_graph_construction(out, SHELL_DEP_EWORKSPACE);
   status = dep_finish_public_graph(out, status, &streams, limits);
   memset(unresolved_paths, 0, SHELL_DEP_MAX_NODES * sizeof(*unresolved_paths));
   if (status == SHELL_DEP_OK || status == SHELL_DEP_ETRUNC)
     memcpy(unresolved_paths, streams.unresolved_paths,
            out->node_count * sizeof(*unresolved_paths));
+  shell_source_workspace_end(previous);
   shell_source_operation_end();
   return status;
 }

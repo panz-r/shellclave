@@ -430,7 +430,8 @@ void run_expansion_query_oracles() {
     state.check_cwd = true;
     state.cwd = fixture.cwd;
     state.cwd_absolute = fixture.absolute;
-    std::string source = std::string("cd ") + fixture.word + "; echo \"$ARG\"";
+    std::string source =
+        std::string("cd ") + fixture.word + " && echo \"$ARG\"";
     if (!buffer.reset_for(source.size()))
       invariant_failure("tilde CWD oracle buffer allocation");
     sg_result_t result = {};
@@ -1057,6 +1058,23 @@ void run_semantic_reference_oracles() {
     for (uint32_t i = 0; i < result.subcommand_count; i++)
       if (result.subcommands[i].write_count || result.subcommands[i].read_count)
         invariant_failure("inherited boundary counted as explicit redirection");
+    validate_result(&result, error, buffer.data(), buffer.size());
+  }
+  for (const char *source : {"cat <<${x:-\"EOF\"}\npayload\n${x:-\"EOF\"}\n",
+                             "cat <<$(printf   eof)\npayload\n$(printf eof)\n",
+                             "cat <<$(a 1>f)\npayload\n$(a > f)\n",
+                             "cat <<$(a|&b)\npayload\n$(a 2>&1 | b)\n",
+                             "cat <<$(a >&-file)\npayload\n$(a file 1>&-)\n",
+                             "cat <<\"${x:-$'\\0'}\"\npayload\n${x:-\n",
+                             "cat <<$(a >&$fd-)\npayload\n$(a 1>&$fd-)\n"}) {
+    auto &buffer = eval_buffer_for(g_eval_buffers.result, strlen(source));
+    sg_result_t result = {};
+    sg_error_t error = sg_gate_evaluate(option_gate, source, strlen(source),
+                                        buffer.data(), buffer.size(), &result);
+    if (error != SG_OK || result.truncated || result.subcommand_count != 1 ||
+        result.requires_substitution_evaluation ||
+        result.has_dynamic_substitution_io)
+      invariant_failure("literal delimiter introduced executable children");
     validate_result(&result, error, buffer.data(), buffer.size());
   }
   static const struct {

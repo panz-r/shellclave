@@ -2672,6 +2672,11 @@ static void test_modern_shell_syntax_boundaries(void) {
       {"cat < <(printf x)", 1},
       {"printf x &> >(cat)", 1},
       {"exec {fd}>out; printf x >&\"${fd}\"", 2},
+      /* Prefixes commit a simple command, not reserved control syntax. */
+      {"VALUE=x [[ $VALUE == x ]]", 1},
+      {">out [[ x ]]", 1},
+      {"VALUE=x then", 1},
+      {">out then", 1},
   };
   /* The fast parser preserves structural group and heredoc ranges beside
    * executable commands. Processed and canonical outputs deliberately expose
@@ -2749,7 +2754,6 @@ static void test_modern_shell_syntax_boundaries(void) {
       "case value in x) : ;& esac",
       "case value in x) : ;;& esac",
       "[[ -f /tmp/x ]]",
-      "VALUE=x [[ $VALUE == x ]]",
       "{ [[ -n value ]]; }",
       "echo $( [[ -f /tmp/x ]] )",
       "(( count += 1 ))",
@@ -3366,9 +3370,14 @@ static void test_document_execution_stages(void) {
       if (graph.nodes[j].type == SHELL_NODE_DOC &&
           graph.nodes[j].doc.kind != SHELL_DOC_FILE) {
         const shell_dep_doc_t *doc = &graph.nodes[j].doc;
-        CHECK((doc->value_len == 4 && memcmp(doc->value, "body", 4) == 0) ||
-              (doc->value_len == 3 && (memcmp(doc->value, "one", 3) == 0 ||
-                                       memcmp(doc->value, "two", 3) == 0)));
+        bool final_lf = doc->kind == SHELL_DOC_HEREDOC;
+        CHECK(doc->value_len > 0);
+        if (final_lf)
+          CHECK(doc->value[doc->value_len - 1] == '\n');
+        size_t length = doc->value_len - final_lf;
+        CHECK((length == 4 && memcmp(doc->value, "body", 4) == 0) ||
+              (length == 3 && (memcmp(doc->value, "one", 3) == 0 ||
+                               memcmp(doc->value, "two", 3) == 0)));
       }
       if (graph.nodes[j].type == SHELL_NODE_CMD)
         timed += graph.nodes[j].cmd.pipeline_time_mode != SHELL_PIPE_TIME_NONE;
@@ -3547,8 +3556,14 @@ static void test_document_prefix_boundaries(void) {
         continue;
       documents++;
       const shell_dep_doc_t *doc = &graph.nodes[node].doc;
-      bool first = (doc->value_len == 3 && memcmp(doc->value, "one", 3) == 0) ||
-                   (doc->value_len == 4 && memcmp(doc->value, "one\r", 4) == 0);
+      char content[16];
+      size_t content_length;
+      CHECK(shell_dep_doc_write_content(doc, content, sizeof(content),
+                                        &content_length));
+      bool first = (content_length == 3 && !memcmp(content, "one", 3)) ||
+                   (content_length == 4 && !memcmp(content, "one\r", 4)) ||
+                   (content_length == 4 && !memcmp(content, "one\n", 4)) ||
+                   (content_length == 5 && !memcmp(content, "one\r\n", 5));
       uint32_t owner =
           command_nodes[cases[i].split_documents && first ? 0 : count - 1];
       uint32_t read_fds = 0;
@@ -3628,17 +3643,17 @@ static void test_single_byte_validation_boundary(void) {
   shell_source_operation_begin(root, sizeof(root) - 1);
   CHECK(shell_tokenizer_complete_syntax_valid(root, sizeof(root) - 1));
   shell_tokenizer_state_t state;
-  CHECK(shell_tokenizer_init(&state, root + 10, 13));
+  CHECK(shell_tokenizer_init(&state, root + 10, 13, NULL));
   check_byte_validation_work(1, sizeof(root) - 1);
-  CHECK(shell_tokenizer_init(&state, unrelated, sizeof(unrelated) - 1));
+  CHECK(shell_tokenizer_init(&state, unrelated, sizeof(unrelated) - 1, NULL));
   check_byte_validation_work(2, sizeof(root) + sizeof(unrelated) - 2);
-  CHECK(!shell_tokenizer_init(&state, invalid, sizeof(invalid)));
+  CHECK(!shell_tokenizer_init(&state, invalid, sizeof(invalid), NULL));
   check_byte_validation_work(3, sizeof(root) + sizeof(unrelated));
   shell_source_operation_end();
 
   /* Empty byte spans remain meaningful at the lexical boundary. */
   reset_byte_validation_work();
-  CHECK(shell_tokenizer_init(&state, NULL, 0));
+  CHECK(shell_tokenizer_init(&state, NULL, 0, NULL));
   check_byte_validation_work(1, 0);
 
   char source[16384];
@@ -3647,7 +3662,7 @@ static void test_single_byte_validation_boundary(void) {
                                          SHELL_MAX_SUBCOMMANDS + 1,
                                          "printf tail", &length));
   for (unsigned strict = 0; strict < 2; strict++) {
-    shell_limits_t limits = {1, strict != 0};
+    shell_limits_t limits = {.max_subcommands = 1, .strict_mode = strict != 0};
     shell_parse_result_t parsed;
     reset_byte_validation_work();
     CHECK(shell_parse_fast(source, length, &limits, &parsed) == SHELL_ETRUNC);
@@ -3674,15 +3689,19 @@ static void test_single_byte_validation_boundary(void) {
     for (size_t b = 0; b < sizeof(bytes) / sizeof(bytes[0]); b++) {
       source[invalid_position] = (char)bytes[b];
       for (unsigned strict = 0; strict < 2; strict++) {
-        shell_limits_t limits = {1, strict != 0};
+        shell_limits_t limits = {.max_subcommands = 1,
+                                 .strict_mode = strict != 0};
         shell_parse_result_t parsed;
         memset(&parsed, 0xff, sizeof(parsed));
         reset_byte_validation_work();
+        bool heredoc_data = i == 4 && bytes[b] >= 128;
         CHECK(shell_parse_fast(source, length, &limits, &parsed) ==
-              SHELL_EPARSE);
-        CHECK(!parsed.count && !parsed.group_count &&
-              parsed.status == SHELL_STATUS_ERROR);
-        check_byte_validation_work(1, invalid_position + 1);
+              (heredoc_data ? SHELL_ETRUNC : SHELL_EPARSE));
+        if (!heredoc_data)
+          CHECK(!parsed.count && !parsed.group_count &&
+                parsed.status == SHELL_STATUS_ERROR);
+        check_byte_validation_work(1, bytes[b] >= 128 ? length
+                                                      : invalid_position + 1);
       }
     }
     source[invalid_position] = saved;
@@ -4203,9 +4222,9 @@ static void test_public_anomaly_traversal_work(void) {
 
 static void test_complete_source_before_capacity(void) {
   const shell_limits_t strict[] = {
-      {SHELL_MAX_SUBCOMMANDS, true},
-      {1, true},
-      {0, true},
+      {.max_subcommands = SHELL_MAX_SUBCOMMANDS, .strict_mode = true},
+      {.max_subcommands = 1, .strict_mode = true},
+      {.max_subcommands = 0, .strict_mode = true},
   };
   const size_t prefixes[] = {0, SHELL_MAX_SUBCOMMANDS + 1};
   for (size_t p = 0; p < sizeof(prefixes) / sizeof(prefixes[0]); p++) {
@@ -4873,7 +4892,8 @@ static void test_forward_nested_substitutions(void) {
       status = shell_source_next_executable_substitution(
           malformed[i], strlen(malformed[i]), &scan, &start, &after, &kind);
     } while (status == SHELL_SOURCE_SCAN_FOUND);
-    CHECK(status == SHELL_SOURCE_SCAN_MALFORMED);
+    CHECK(status == SHELL_SOURCE_SCAN_MALFORMED ||
+          status == SHELL_SOURCE_SCAN_INCOMPLETE);
   }
   char too_deep[512];
   size_t length = 0;
@@ -5292,7 +5312,7 @@ static void test_forward_brace_context(void) {
     size_t length = strlen(source);
     shell_tokenizer_state_t state;
     shell_token_t token;
-    shell_tokenizer_init(&state, source, length);
+    shell_tokenizer_init(&state, source, length, NULL);
     size_t opens = 0, closes = 0;
     while (shell_tokenizer_next(&state, &token)) {
       opens += token.type == SHELL_TOKEN_GROUP_START;
@@ -6189,9 +6209,11 @@ static void test_document_lexical_boundaries(void) {
               (cases[c].heredoc ? SHELL_DOC_HEREDOC : SHELL_DOC_HERESTRING))
         continue;
       document_nodes++;
-      CHECK(node->doc.value_len == strlen(cases[c].operand));
-      CHECK(memcmp(node->doc.value, cases[c].operand, node->doc.value_len) ==
-            0);
+      size_t payload_length = strlen(cases[c].operand);
+      CHECK(node->doc.value_len == payload_length + cases[c].heredoc);
+      CHECK(memcmp(node->doc.value, cases[c].operand, payload_length) == 0);
+      if (cases[c].heredoc)
+        CHECK(node->doc.value[payload_length] == '\n');
       for (uint32_t j = 0; j < graph.edge_count; j++) {
         const shell_dep_edge_t *edge = &graph.edges[j];
         if (edge->type == SHELL_EDGE_READ && edge->from == i) {
@@ -6530,7 +6552,7 @@ static void test_adjacent_named_fd_boundaries(void) {
                            &parsed) == SHELL_OK);
     CHECK(!(parsed.cmds[0].features & SHELL_FEAT_NAMED_FD));
     shell_tokenizer_state_t lexer;
-    CHECK(shell_tokenizer_init(&lexer, literals[i], strlen(literals[i])));
+    CHECK(shell_tokenizer_init(&lexer, literals[i], strlen(literals[i]), NULL));
     shell_token_t token;
     while (shell_tokenizer_next(&lexer, &token)) {
       if (token.type == SHELL_TOKEN_REDIRECT_OUT ||

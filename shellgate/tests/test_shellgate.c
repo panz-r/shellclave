@@ -5115,6 +5115,104 @@ TEST(anomaly_group_heredoc_substitution_contract) {
   sg_gate_free(gate);
 }
 
+TEST(anomaly_large_quoted_delimiter_workspace) {
+  char command[4096];
+  char nested[4200];
+  size_t at = 0, delimiter_length = 1024;
+  memcpy(command + at, "cat <<'", 7);
+  at += 7;
+  memset(command + at, 'E', delimiter_length);
+  at += delimiter_length;
+  memcpy(command + at, "'\npayload\n", 10);
+  at += 10;
+  memset(command + at, 'E', delimiter_length);
+  at += delimiter_length;
+  command[at++] = '\n';
+  command[at] = '\0';
+  snprintf(nested, sizeof(nested), "echo \"$(%s)\"", command);
+  sg_gate_t *gate = gate_with_rules((const char *[]){"cat", "echo *"}, 2);
+  ASSERT(gate != NULL);
+  ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
+  ASSERT_SG_OK(sg_gate_enable_anomaly(gate, 1e300, NULL));
+  for (unsigned variant = 0; variant < 2; variant++) {
+    for (unsigned pass = 0; pass < 3; pass++) {
+      sg_result_t result;
+      ASSERT_SG_OK(eval_cmd(gate, variant ? nested : command, &result));
+      ASSERT(result.verdict ==
+                 (variant ? SG_VERDICT_ALLOW_CONDITIONAL : SG_VERDICT_ALLOW) &&
+             !result.truncated);
+      ASSERT(result.subcommand_count == (variant ? 2 : 1));
+      ASSERT(result.anomaly_update == SG_ANOMALY_UPDATE_APPLIED);
+    }
+  }
+  ASSERT(test_anomaly_vocabulary(gate) > 0);
+  /* Protected ANSI-C spelling survives the later double-quote-removal state.
+   * This delimiter expands beyond its header's source length. */
+  static const char opening[] = "cat <<`\"`$'";
+  at = sizeof(opening) - 1;
+  memcpy(command, opening, at);
+  for (unsigned i = 0; i < 300; i++) {
+    memcpy(command + at, "\\'", 2);
+    at += 2;
+  }
+  memcpy(command + at, "'\npayload\n``'", 13);
+  at += 13;
+  for (unsigned i = 0; i < 300; i++) {
+    memcpy(command + at, "'\\''", 4);
+    at += 4;
+  }
+  memcpy(command + at, "'\n", 3);
+  snprintf(nested, sizeof(nested), "echo \"$(%s)\"", command);
+  for (unsigned variant = 0; variant < 2; variant++) {
+    sg_result_t result;
+    ASSERT_SG_OK(eval_cmd(gate, variant ? nested : command, &result));
+    ASSERT(result.verdict ==
+               (variant ? SG_VERDICT_ALLOW_CONDITIONAL : SG_VERDICT_ALLOW) &&
+           !result.truncated);
+    ASSERT(result.subcommand_count == (variant ? 2 : 1));
+    ASSERT(result.anomaly_update == SG_ANOMALY_UPDATE_APPLIED);
+  }
+  sg_gate_free(gate);
+}
+
+TEST(heredoc_phase_policy_boundary) {
+  static const char source[] =
+      "cat <<`\"`$'\\x3a'\n``':'\nprintf 'HIDDEN\\n'\n``:\n:\n";
+  sg_gate_t *gate = gate_with_rules((const char *[]){"cat", ":"}, 2);
+  ASSERT(gate != NULL);
+  ASSERT_ST_OK(test_policy_replace_cpl(gate, true, "printf *", false));
+  ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
+  ASSERT_SG_OK(sg_gate_set_stop_mode(gate, SG_EVAL_ALL));
+  sg_result_t result;
+  ASSERT_SG_OK(eval_cmd(gate, source, &result));
+  ASSERT(result.verdict == SG_VERDICT_DENY && result.subcommand_count == 4 &&
+         !result.truncated);
+  ASSERT(result.subcommands[0].verdict == SG_VERDICT_ALLOW &&
+         result.subcommands[1].verdict == SG_VERDICT_DENY);
+  static const char *const exposed[] = {
+      "cat <<$(: >&-file)\n$(: file 1>&-)\nprintf HIDDEN\n$(: >&-file)\n:\n",
+      "cat <<\"${x:-$'\\0'}\"\n${x:-\nprintf HIDDEN\n${x:-}\n:\n",
+      ("cat <<\"${\\\n#x:-$'a'}\"\n${#x:-a}\nprintf HIDDEN\nexit 0\n"
+       "${#x:-'a'}\n:\n"),
+  };
+  for (size_t c = 0; c < sizeof(exposed) / sizeof(exposed[0]); c++) {
+    ASSERT_SG_OK(eval_cmd(gate, exposed[c], &result));
+    ASSERT(result.verdict == SG_VERDICT_DENY && !result.truncated);
+    ASSERT(result.subcommand_count >= 2 &&
+           result.subcommands[0].verdict == SG_VERDICT_ALLOW &&
+           result.subcommands[1].verdict == SG_VERDICT_DENY);
+  }
+  static const char continued_control[] =
+      "cat <<$(i\\\nf true; th\\\nen :; f\\\ni)\n";
+  ASSERT(eval_cmd(gate, continued_control, &result) == SG_ERR_PARSE);
+  ASSERT(result.verdict == SG_VERDICT_REJECT && !result.truncated);
+  static const char reprinted[] =
+      "echo \"$(cat << -EOF\npayload\nEOF\nprintf EXPOSED\n-EOF\n)\"";
+  ASSERT(eval_cmd(gate, reprinted, &result) == SG_ERR_PARSE);
+  ASSERT(result.verdict == SG_VERDICT_REJECT && !result.truncated);
+  sg_gate_free(gate);
+}
+
 TEST(anomaly_mixed_heredoc_substitution_contract) {
   static const char command[] =
       "cat <<EOF\n$(</tmp/mixed-file)$(id)$(printf one; printf two)\nEOF";
@@ -7520,7 +7618,7 @@ TEST(whole_word_expansion_context_contract) {
       sg_gate_set_expand_word_netargv(gate, expand_by_source_word, &contract));
 
   static const char command[] =
-      "cd /workspace; echo pre\"$VALUE\"post >\"$OUT\"; cat \"$INPUT\"";
+      "cd /workspace && echo pre\"$VALUE\"post >\"$OUT\" && cat \"$INPUT\"";
   sg_result_t result = {0};
   ASSERT_SG_OK(eval_cmd(gate, command, &result));
   ASSERT(contract.valid && contract.calls == 3);
@@ -7751,7 +7849,7 @@ TEST(tilde_cwd_expansion_contract) {
                                                  &contract));
     char source[256];
     int length =
-        snprintf(source, sizeof(source), "cd %s; echo \"$ARG\" >\"$OUT\"",
+        snprintf(source, sizeof(source), "cd %s && echo \"$ARG\" >\"$OUT\"",
                  shellsplit_test_tilde_cwd[i].word);
     ASSERT(length > 0 && (size_t)length < sizeof(source));
     sg_result_t result = {0};
@@ -9825,10 +9923,12 @@ TEST(file_identity_violation_paths) {
        SG_VIOL_WRITE_SENSITIVE, true},
       {"/workspace", "cd /workspace/other; printf x >sensitive",
        SG_VIOL_WRITE_SENSITIVE, false},
+      {"/workspace/other", "cd /workspace 2>&1 && printf x >sensitive",
+       SG_VIOL_WRITE_SENSITIVE, true},
+      {"/workspace/other", "cd 2>& 1 /workspace && printf x >sensitive",
+       SG_VIOL_WRITE_SENSITIVE, true},
       {"/workspace/other", "cd /workspace 2>&1; printf x >sensitive",
-       SG_VIOL_WRITE_SENSITIVE, true},
-      {"/workspace/other", "cd 2>& 1 /workspace; printf x >sensitive",
-       SG_VIOL_WRITE_SENSITIVE, true},
+       SG_VIOL_WRITE_SENSITIVE, false},
       {"/workspace", "time -p cd / 2>&1; printf x >sensitive",
        SG_VIOL_WRITE_SENSITIVE, false},
       {"/workspace", "cd --invalid || printf x >sensitive",
@@ -10313,14 +10413,14 @@ TEST(shared_cwd_path_linear_work) {
     }
     ASSERT_SG_OK(sg_gate_set_violation_config_borrowed(gate, &config));
     for (unsigned distinct = 0; distinct < 2; distinct++) {
-      int written = snprintf(command, sizeof(command), "cd %.*s; ",
+      int written = snprintf(command, sizeof(command), "cd %.*s && ",
                              (int)cwd_length, fragment);
       ASSERT(written > 0 && (size_t)written < sizeof(command));
       size_t used = (size_t)written;
       for (unsigned i = 0; i < count; i++) {
-        written =
-            snprintf(command + used, sizeof(command) - used, "%s ./f%02u; ",
-                     i % 2 ? "cat" : "printf x >", distinct ? i / 2 : 0);
+        written = snprintf(command + used, sizeof(command) - used,
+                           "%s ./f%02u%s", i % 2 ? "cat" : "printf x >",
+                           distinct ? i / 2 : 0, i + 1 == count ? "" : " && ");
         ASSERT(written > 0 && (size_t)written < sizeof(command) - used);
         used += (size_t)written;
       }
@@ -10708,7 +10808,8 @@ TEST(violation_rule_matrix) {
        "printf data >out; cd -LP /tmp; cat ./out", SG_VIOL_WRITE_THEN_READ, 1,
        NULL},
       {"write/read absolute CWD",
-       "cd /tmp/root; printf data >out; cat /tmp/root/out", NULL,
+       "cd /tmp/root && printf data >out && cat /tmp/root/out",
+       "cd /tmp/root; printf data >out; cat /tmp/root/out",
        SG_VIOL_WRITE_THEN_READ, 1, NULL},
       {"sensitive substitution", "echo $(cat /etc/shadow)",
        "echo $(cat /etc/passwd)", SG_VIOL_SUBST_SENSITIVE, 1, NULL},
@@ -15203,6 +15304,8 @@ int main(int argc, char **argv) {
   RUN(compound_heredoc_substitution_cross_product_contract);
   RUN(compound_brace_substitution_boundary_contract);
   RUN(anomaly_group_heredoc_substitution_contract);
+  RUN(anomaly_large_quoted_delimiter_workspace);
+  RUN(heredoc_phase_policy_boundary);
   RUN(anomaly_mixed_heredoc_substitution_contract);
 
   printf("\nFeature rejection:\n");

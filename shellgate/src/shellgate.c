@@ -2504,6 +2504,11 @@ static SHELL_NONNULL(2) bool sg_eval_workspace_size(size_t command_length,
                                                     size_t *required) {
   if (!shell_dep_workspace_size(NULL, required))
     return false;
+  size_t delimiter_size;
+  if (!shell_source_workspace_size(command_length, &delimiter_size) ||
+      delimiter_size > SIZE_MAX - *required)
+    return false;
+  *required += delimiter_size; /* Delimiter preparation in the graph tail. */
   size_t overhead = sizeof(sg_graph_index_t);
   size_t cwd_space = SHELL_DEP_CWD_BUF_SIZE + 1u;
   if (command_length > (SIZE_MAX - overhead) / 4 - cwd_space)
@@ -4047,7 +4052,9 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
   /* Step 1: Fast parse to check features */
   shell_parse_result_t fast;
   shell_limits_t lim = {.max_subcommands = 64,
-                        .strict_mode = gate->strict_mode};
+                        .strict_mode = gate->strict_mode,
+                        .workspace = buf,
+                        .workspace_size = buf_size};
   shell_error_t ferr = shell_parse_fast(cmd, cmd_len, &lim, &fast);
   bool parse_truncated = ferr == SHELL_ETRUNC;
   /* A successful zero-range parse already establishes semantic trivia.
@@ -4290,8 +4297,20 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
      * lexical analysis stages without repeating a context-free support check.
      * The stage order is not the dependency graph's node order. */
     shell_anomaly_stages_t stages = {0};
+    /* Graph/path preparation is finished. Its temporary tail now supplies
+     * delimiter scratch; the graph index and expansion cache stay live. */
+    shell_limits_t stage_limits = SHELL_LIMITS_DEFAULT;
+    stage_limits.workspace = (char *)dep_workspace + sizeof(*graph_index);
+    stage_limits.workspace_size = dep_workspace_size - sizeof(*graph_index);
+    /* Keep lexical facts and delimiter scratch alive through both collection
+     * and rendering; nested words are still inspected by the renderers. */
+    shell_source_operation_begin(cmd, cmd_len);
+    shell_source_workspace_scope_t previous_source =
+        shell_source_workspace_begin(cmd, cmd_len, stage_limits.workspace,
+                                     stage_limits.workspace_size);
     shell_process_status_t command_status =
-        shell_anomaly_stages_collect_prevalidated(cmd, cmd_len, NULL, &stages);
+        shell_anomaly_stages_collect_prevalidated(cmd, cmd_len, NULL,
+                                                  &stage_limits, &stages);
     if (command_status == SHELL_PROCESS_OK) {
       command_status =
           type_seq ? shell_build_command_netseq_from_stages(&stages, NULL, &raw,
@@ -4300,6 +4319,8 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
                          &stages, NULL, &raw, &typed, &anomaly_count);
     }
     shell_anomaly_stages_free(&stages);
+    shell_source_workspace_end(previous_source);
+    shell_source_operation_end();
     if (!type_seq) {
       type_count = anomaly_count;
       if (command_status == SHELL_PROCESS_OK) {

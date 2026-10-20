@@ -819,10 +819,10 @@ static void cd_commands(shell_dep_limits_t *limits, shell_dep_graph_t *graph,
   static const struct {
     const char *source, *spelling, *cwd;
   } cases[] = {
-      {"cd /tmp; pwd", "cd", "/tmp"},
-      {"c'd' /tmp; pwd", "c'd'", "/tmp"},
-      {"command cd /tmp; pwd", "command", "/tmp"},
-      {"builtin cd /tmp; pwd", "builtin", "/tmp"},
+      {"cd /tmp; pwd", "cd", NULL},
+      {"c'd' /tmp; pwd", "c'd'", NULL},
+      {"command cd /tmp; pwd", "command", NULL},
+      {"builtin cd /tmp; pwd", "builtin", NULL},
       {"cd one two; pwd", "cd", "/"},
       {"false && cd /tmp; pwd", "cd", "/"},
       {"(cd /tmp); pwd", "cd", "/"},
@@ -836,9 +836,10 @@ static void cd_commands(shell_dep_limits_t *limits, shell_dep_graph_t *graph,
     CHECK(cd != UINT32_MAX && pwd != UINT32_MAX);
     CHECK(graph->nodes[cd].cmd.cwd_known &&
           !strcmp(graph->cwd_buf.data + graph->nodes[cd].cmd.cwd_offset, "/"));
-    CHECK(graph->nodes[pwd].cmd.cwd_known &&
-          !strcmp(graph->cwd_buf.data + graph->nodes[pwd].cmd.cwd_offset,
-                  cases[i].cwd));
+    CHECK(graph->nodes[pwd].cmd.cwd_known == (cases[i].cwd != NULL));
+    if (cases[i].cwd)
+      CHECK(!strcmp(graph->cwd_buf.data + graph->nodes[pwd].cmd.cwd_offset,
+                    cases[i].cwd));
     bool cwd_edge = false;
     for (uint32_t edge = 0; edge < graph->edge_count; edge++)
       cwd_edge |= graph->edges[edge].type == SHELL_EDGE_CWD &&

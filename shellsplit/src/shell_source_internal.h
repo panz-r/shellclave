@@ -46,20 +46,91 @@ enum {
   SHELL_SOURCE_INDEX_PARAMETER,
   SHELL_SOURCE_INDEX_DOUBLE_QUOTE,
   SHELL_SOURCE_INDEX_ARITHMETIC = 5,
+  SHELL_SOURCE_INDEX_HEREDOC_BODY,
+  SHELL_SOURCE_INDEX_UNCLOSED_PARENS,
+  SHELL_SOURCE_INDEX_BACKTICK,
+  SHELL_SOURCE_INDEX_UNCLOSED_BACKTICK,
+  SHELL_SOURCE_INDEX_LITERAL_FRAGMENT,
 };
 typedef struct {
   uintptr_t begin, end, frontier;
 } shell_source_scope_t;
+/* Private backing, owned by one operation. Graphs reserve it in their existing
+ * workspace; allocation-free defaults lease the bounded TLS instance. */
+#define SHELL_SOURCE_INDEX_CAPACITY 4096u
+typedef struct {
+  uintptr_t key;
+  size_t value, height;
+  unsigned kind, generation;
+} shell_source_index_entry_t;
+typedef struct {
+  shell_source_index_entry_t entries[SHELL_SOURCE_INDEX_CAPACITY];
+} shell_source_index_t;
+typedef struct {
+  uintptr_t begin, end;
+  shell_source_scope_t scope;
+  unsigned depth, generation;
+  bool bytes_prechecked, owns_default_index;
+  shell_source_index_t *index;
+  unsigned char scratch[256];
+  void *workspace;
+  uintptr_t workspace_begin, workspace_end;
+  size_t workspace_size, scratch_used;
+  bool scratch_exhausted;
+  void *owned_workspace;
+} shell_source_operation_t;
 #ifdef __cplusplus
 extern "C" {
 #endif
 void shell_source_operation_begin(const char *input, size_t length)
     SHELL_NONNULL(1);
+/* The root graph adapter already has a successful strict parse or qualified
+ * draft prefix for exactly this operation's immutable root. Transfer its
+ * byte-admission guarantee without traversing the source. Error/truncated
+ * results establish no such guarantee. Independent callbacks do not inherit
+ * it; recursive implementation views share their root's proof. */
+void shell_source_operation_prechecked(void);
 void shell_source_operation_end(void);
+/* Allocating adapters reserve one operation-owned arena, reused by internal
+ * views and released by operation_end. False means allocation failure and
+ * leaves no active operation. Allocation-free boundaries never call this. */
+bool shell_source_operation_begin_owned(const char *input, size_t length)
+    SHELL_NONNULL(1);
+/* Internal consumers explicitly share this operation. Application callbacks
+ * suspend it instead: their public calls are independent validation domains,
+ * even when their input overlaps the enclosing source. No cache is copied. */
+shell_source_operation_t shell_source_operation_suspend(void);
+void shell_source_operation_restore(shell_source_operation_t previous);
+/* Bind initialized operation-local backing before any source traversal. The
+ * required index is writable, aligned, and lives through the operation. */
+void shell_source_operation_index(shell_source_index_t *index) SHELL_NONNULL(1);
+/* Borrow optional additional scratch for this operation. NULL/zero keeps the
+ * bounded private default. Contained consumers inherit their owner's buffer;
+ * application callbacks have independent operations regardless of overlap. */
+typedef struct {
+  void *buffer;
+  size_t size, used;
+  bool exhausted, inherit;
+  uintptr_t begin, end;
+} shell_source_workspace_scope_t;
+shell_source_workspace_scope_t
+shell_source_workspace_begin(const char *source, size_t length, void *buffer,
+                             size_t size) SHELL_NONNULL(1);
+void shell_source_workspace_end(shell_source_workspace_scope_t previous);
+size_t shell_source_scratch_mark(void);
+void *shell_source_scratch_take(size_t size);
+void shell_source_scratch_release(size_t mark);
+bool shell_source_scratch_exhausted(void);
 /* External source-byte boundary, shared by tokenizer and processor adapters.
- * Reject NUL, non-whitespace control bytes, DEL and high bytes. Successful
+ * Reject NUL, non-whitespace control bytes and DEL. Non-ASCII is admitted only
+ * in heredoc delimiter/data islands, not nested executable code. Successful
  * checks of the operation's immutable root cover its contained spans. */
 bool shell_source_bytes_valid(const char *input, size_t length)
+    SHELL_NONNULL(1);
+
+/* High-byte admission after control/NUL rejection. Only heredoc delimiter and
+ * data islands admit non-ASCII; executable substitutions re-enter code. */
+bool shell_source_heredoc_bytes_valid(const char *input, size_t length)
     SHELL_NONNULL(1);
 /* Enter one borrowed lexical body, restoring its enclosing body on exit.
  * Index capacity belongs to this active scope and its ancestors, not to facts
@@ -523,6 +594,32 @@ static SHELL_NONNULL(1, 4) inline bool shell_source_match_plain_word(
   return true;
 }
 
+/* Classify unsupported reserved syntax only after the caller establishes a
+ * grammar-reserved-word position. Quotes, ordinary escapes and adjoining word
+ * fragments prevent a match; physical continuations do not. `after` optionally
+ * receives the logical word's physical end, so a draft can distinguish an
+ * appendable word at received EOF from a committed unsupported construct.
+ * Supported groups and pipeline prefixes are handled by their own grammar. */
+static SHELL_NONNULL(1) inline bool shell_source_unsupported_keyword(
+    const char *input, size_t end, size_t position, size_t *after) {
+  static const char *const words[] = {
+      "if",     "then",   "else",     "elif", "fi",   "for",
+      "while",  "until",  "do",       "done", "case", "esac",
+      "select", "coproc", "function", "[[",   "in",   "]]"};
+  /* Consume a shared physical prefix only once. Most command words cannot
+   * start a keyword at all; do not enter the logical-word matcher for every
+   * keyword on every ordinary command in semantic sweeps. */
+  position = shell_source_skip_escaped_line_endings(input, end, position);
+  if (position == end)
+    return false;
+  for (size_t i = 0; i < sizeof(words) / sizeof(words[0]); i++)
+    if (input[position] == words[i][0] &&
+        shell_source_match_plain_word(input, end, position, words[i],
+                                      strlen(words[i]), after))
+      return true;
+  return false;
+}
+
 /* Recognize the reserved pipeline-negation word at one shell word boundary.
  * Shell operators delimit reserved words without requiring whitespace, and
  * escaped physical line endings disappear before that decision.  Keep the
@@ -814,7 +911,8 @@ static inline size_t shell_source_skip_quoted_text(const char *input,
  * removes backslashes before $, `, \\, and newline before parsing its body;
  * an enclosing double quote also enables removal before ". Inner body quotes
  * do not protect against this outer removal. Optional escape_sensitive receives
- * that semantic fact on completion; NULL requests delimiter location only.
+ * that semantic fact on completion or received EOF; NULL requests delimiter
+ * location only.
  * The borrowed raw body cannot represent the removed layer faithfully, so the
  * supported-source boundary rejects active escape-sensitive forms.
  * input supplies length immutable bytes (NULL only for length zero),
@@ -824,24 +922,51 @@ static inline SHELL_NONNULL(5) bool shell_source_scan_backtick(
     size_t *after, bool *escape_sensitive) {
   if (position >= length || input[position] != '`')
     return false;
-  bool sensitive = false;
+  size_t cached_after, escapes;
+  bool complete = shell_source_index_get(input, length, position,
+                                         SHELL_SOURCE_INDEX_BACKTICK,
+                                         &cached_after, &escapes) &&
+                  cached_after <= length;
+  if (complete || (shell_source_index_get(input, length, position,
+                                          SHELL_SOURCE_INDEX_UNCLOSED_BACKTICK,
+                                          &cached_after, &escapes) &&
+                   cached_after == length)) {
+    if (escape_sensitive)
+      *escape_sensitive = (escapes & (double_quoted ? 3u : 1u)) != 0;
+    if (complete)
+      *after = cached_after;
+    return complete;
+  }
+  /* Cache quote-independent facts, not the caller's quote-dependent answer.
+   * The same raw child may first be located by a delimiter-only consumer. */
+  escapes = 0;
   for (size_t cursor = position + 1; cursor < length; cursor++) {
     SHELL_SOURCE_WORD_SCAN(1);
+    SHELL_SOURCE_DELIMITER_SCAN(input, cursor);
     if (input[cursor] == '\\' && cursor + 1 < length) {
       char next = input[cursor + 1];
-      sensitive |= next == '$' || next == '`' || next == '\\' || next == '\n' ||
-                   (double_quoted && next == '"');
+      if (next == '$' || next == '`' || next == '\\' || next == '\n')
+        escapes |= 1u;
+      if (next == '"')
+        escapes |= 2u;
       SHELL_SOURCE_WORD_SCAN(1);
+      SHELL_SOURCE_DELIMITER_SCAN(input, cursor + 1);
       cursor++;
       continue;
     }
     if (input[cursor] == '`') {
       *after = cursor + 1;
+      shell_source_index_put(input, length, position,
+                             SHELL_SOURCE_INDEX_BACKTICK, *after, escapes);
       if (escape_sensitive)
-        *escape_sensitive = sensitive;
+        *escape_sensitive = (escapes & (double_quoted ? 3u : 1u)) != 0;
       return true;
     }
   }
+  shell_source_index_put(input, length, position,
+                         SHELL_SOURCE_INDEX_UNCLOSED_BACKTICK, length, escapes);
+  if (escape_sensitive)
+    *escape_sensitive = (escapes & (double_quoted ? 3u : 1u)) != 0;
   return false;
 }
 
@@ -1115,44 +1240,104 @@ static inline SHELL_NONNULL(3, 4, 5) bool shell_source_ansi_c_quote_facts(
                                                has_nul, locale_dependent);
 }
 
-/* Heredoc delimiters do quote removal but do not expand parameter-like text.
- * Inspect only active ANSI-C quotes, not literal dollars in other quotes. */
+typedef enum {
+  SHELL_HEREDOC_WORD_INVALID,
+  SHELL_HEREDOC_WORD_COMPLETE,
+  SHELL_HEREDOC_WORD_INCOMPLETE,
+} shell_source_heredoc_word_status_t;
+
+/* Delimiter-only fragments are balanced and normalized lexically, never
+ * evaluated as expansions. position points to a recognized opener. */
+shell_source_heredoc_word_status_t
+shell_source_heredoc_fragment(const char *input, size_t length,
+                              size_t *position) SHELL_NONNULL(1, 3);
+
+/* input supplies length immutable bytes and position < length. Recognition
+ * does not establish balanced or supported syntax; the declaration boundary
+ * probes that separately. */
+static inline SHELL_NONNULL(1) bool shell_source_heredoc_fragment_open(
+    const char *input, size_t length, size_t position) {
+  if (input[position] != '$')
+    return shell_source_process_substitution_open(input, length, position,
+                                                  NULL);
+  size_t next = shell_source_logical_following(input, length, position);
+  return next < length &&
+         (input[next] == '{' || input[next] == '(' || input[next] == '[');
+}
+
+/* Forward lexical facts for an already complete delimiter word. Balanced
+ * dollar/process and backtick fragments are delimiter spelling, not quoting
+ * of the heredoc body. Quotes inside them do not set its quoted flag.
+ * position starts at a fragment boundary and receives the next active ANSI-C
+ * opener, or length. quoted accumulates actual outer quoting. No syntax is
+ * revalidated here; the declaration probe established complete fragments. */
+static inline SHELL_NONNULL(1, 3, 4) size_t
+    shell_source_next_heredoc_ansi(const char *word, size_t length,
+                                   size_t *position, bool *quoted) {
+  char quote = '\0';
+  while (*position < length) {
+    SHELL_SOURCE_WORD_SCAN(1);
+    size_t cursor = *position;
+    char c = word[cursor];
+    if (quote != '\'' && (!quote || c == '$') &&
+        shell_source_heredoc_fragment_open(word, length, cursor)) {
+      (void)shell_source_heredoc_fragment(word, length, position);
+      continue;
+    }
+    if (quote != '\'' && c == '`') {
+      size_t after = length;
+      (void)shell_source_skip_complete_backtick(word, length, cursor, &after);
+      *position = after;
+      continue;
+    }
+    if (!quote && c == '$' &&
+        shell_source_logical_next_is(word, length, cursor, '\'', NULL)) {
+      *quoted = true;
+      return cursor;
+    }
+    if (!quote && (c == '\'' || c == '"')) {
+      *quoted = true;
+      quote = c;
+    } else if (quote && c == quote) {
+      quote = '\0';
+    } else if (c == '\\' && quote != '\'') {
+      size_t continued =
+          shell_source_skip_escaped_line_endings(word, length, cursor);
+      if (continued != cursor) {
+        *position = continued;
+        continue;
+      }
+      if (!quote || word[cursor + 1] == '$' || word[cursor + 1] == '`' ||
+          word[cursor + 1] == '"' || word[cursor + 1] == '\\') {
+        *quoted = true;
+        (*position)++;
+      }
+    }
+    (*position)++;
+  }
+  return length;
+}
+
+/* The word is lexically complete (it may have unsupported semantics).
+ * NULL/zero represents no word. Heredoc delimiters do quote removal but do not
+ * expand parameter-like text. Inspect only active ANSI-C quotes, not literal
+ * dollars in other quotes or raw backtick fragments. */
 static inline bool
 shell_source_heredoc_word_has_unsupported_ansi_c(const char *word,
                                                  size_t length) {
   if (!word)
     return false;
-  char quote = '\0';
-  for (size_t position = 0; position < length; position++) {
-    char c = word[position];
-    if (quote == '\0' && c == '$' &&
-        shell_source_logical_next_is(word, length, position, '\'', NULL)) {
-      bool has_nul = false;
-      bool locale_dependent = false;
-      size_t after = position;
-      if (!shell_source_ansi_c_quote_facts(word, length, &after, &has_nul,
-                                           &locale_dependent))
-        return false;
-      if (has_nul || locale_dependent)
-        return true;
-      position = after - 1;
-      continue;
-    }
-    if (quote == '\0' && (c == '\'' || c == '"')) {
-      quote = c;
-      continue;
-    }
-    if (quote != '\0' && c == quote) {
-      quote = '\0';
-      continue;
-    }
-    if (c == '\\' && quote != '\'' && position + 1 < length) {
-      char next = word[position + 1];
-      if (quote == '\0' || next == '$' || next == '`' || next == '"' ||
-          next == '\\' || next == '\n') {
-        position++;
-      }
-    }
+  size_t position = 0;
+  bool quoted = false;
+  while (shell_source_next_heredoc_ansi(word, length, &position, &quoted) <
+         length) {
+    bool has_nul = false;
+    bool locale_dependent = false;
+    if (!shell_source_ansi_c_quote_facts(word, length, &position, &has_nul,
+                                         &locale_dependent))
+      return false;
+    if (has_nul || locale_dependent)
+      return true;
   }
   return false;
 }
@@ -1256,12 +1441,13 @@ typedef struct {
   bool strip_tabs;
 } shell_source_pending_heredoc_t;
 
-/* Read the delimiter word after a `<<` or `<<-` operator. Here-document
- * delimiter processing applies quote removal only: parameter-like bytes stay
- * literal. Retain the original word and decode it while comparing physical
- * lines, so mixed quotes and backslash-quoted delimiters remain zero-copy. */
-static inline bool
-shell_source_parse_heredoc_delimiter(const char *input, size_t length,
+/* Read the delimiter word after a `<<` or `<<-` operator. Grouped fragments
+ * undergo lexical normalization, never runtime expansion. Retain the original
+ * word, then prepare its normalized delimiter once
+ * before comparing body lines. Unchanged flat unquoted spellings remain
+ * zero-copy. */
+static inline shell_source_heredoc_word_status_t
+shell_source_probe_heredoc_delimiter(const char *input, size_t length,
                                      size_t *position,
                                      shell_source_pending_heredoc_t *pending) {
   size_t cursor =
@@ -1271,21 +1457,37 @@ shell_source_parse_heredoc_delimiter(const char *input, size_t length,
     pending->strip_tabs = true;
     cursor++;
   }
-  while (cursor < length && (input[cursor] == ' ' || input[cursor] == '\t'))
-    cursor++;
+  cursor = shell_source_skip_inline_continuations(input, length, cursor);
+  pending->word = input + cursor;
+  pending->word_length = length - cursor;
   if (cursor == length)
-    return false;
+    return SHELL_HEREDOC_WORD_INCOMPLETE;
   /* The delimiter is a shell word. A raw hash at its start therefore begins a
    * comment, including the `<<-#comment` spelling where the immediately
    * preceding byte is the heredoc operator's optional dash. Quoted and
    * backslash-escaped hashes remain ordinary delimiter bytes below. */
   if (input[cursor] == '#')
-    return false;
+    return SHELL_HEREDOC_WORD_INVALID;
 
   size_t start = cursor;
   char quote = '\0';
   while (cursor < length) {
     char c = input[cursor];
+    if (quote == '"' && c == '`') {
+      size_t after;
+      if (!shell_source_skip_complete_backtick(input, length, cursor, &after))
+        return SHELL_HEREDOC_WORD_INCOMPLETE;
+      cursor = after;
+      continue;
+    }
+    if (quote != '\'' && (!quote || c == '$') &&
+        shell_source_heredoc_fragment_open(input, length, cursor)) {
+      shell_source_heredoc_word_status_t status =
+          shell_source_heredoc_fragment(input, length, &cursor);
+      if (status != SHELL_HEREDOC_WORD_COMPLETE)
+        return status;
+      continue;
+    }
     if (quote != '\0') {
       if (c == quote) {
         quote = '\0';
@@ -1306,18 +1508,35 @@ shell_source_parse_heredoc_delimiter(const char *input, size_t length,
     }
     if (c == '\\') {
       if (cursor + 1 >= length)
-        return false;
+        return SHELL_HEREDOC_WORD_INCOMPLETE;
       size_t continued =
           shell_source_skip_escaped_line_endings(input, length, cursor);
       cursor = continued != cursor ? continued : cursor + 2;
       continue;
     }
     if (c == '$' &&
+        shell_source_logical_next_is(input, length, cursor, '"', NULL))
+      return SHELL_HEREDOC_WORD_INVALID; /* Locale-dependent delimiter. */
+    if (c == '$' &&
         shell_source_logical_next_is(input, length, cursor, '\'', NULL)) {
       size_t after = 0;
-      if (!shell_source_skip_complete_ansi_c_quote(input, length, cursor,
-                                                   &after))
-        return false;
+      bool has_nul, locale_dependent;
+      after = cursor;
+      if (!shell_source_ansi_c_quote_facts(input, length, &after, &has_nul,
+                                           &locale_dependent))
+        return SHELL_HEREDOC_WORD_INCOMPLETE;
+      if (locale_dependent)
+        return SHELL_HEREDOC_WORD_INVALID;
+      cursor = after;
+      continue;
+    }
+    if (c == '`') {
+      /* Backticks are retained literal delimiter spelling, but still group
+       * lexical spaces and operators. Do not parse the enclosed text as a
+       * command or let its punctuation split the declaration. */
+      size_t after;
+      if (!shell_source_skip_complete_backtick(input, length, cursor, &after))
+        return SHELL_HEREDOC_WORD_INCOMPLETE;
       cursor = after;
       continue;
     }
@@ -1326,6 +1545,10 @@ shell_source_parse_heredoc_delimiter(const char *input, size_t length,
       cursor++;
       continue;
     }
+    if ((c == '<' || c == '>') &&
+        shell_source_logical_following(input, length, cursor) == length)
+      return SHELL_HEREDOC_WORD_INCOMPLETE; /* A following '(' can form a word.
+                                             */
     if (shell_source_space((unsigned char)c) || c == ';' || c == '&' ||
         c == '|' || c == '<' || c == '>' || c == '(' || c == ')')
       break;
@@ -1333,119 +1556,381 @@ shell_source_parse_heredoc_delimiter(const char *input, size_t length,
   }
   /* A shell word is required, but quote removal may legitimately produce an
    * empty delimiter: `<<''` and `<<""` terminate on a blank physical line. */
-  if (cursor == start || quote != '\0')
-    return false;
+  if (quote != '\0')
+    return SHELL_HEREDOC_WORD_INCOMPLETE;
+  if (cursor == start)
+    return SHELL_HEREDOC_WORD_INVALID;
   pending->word = input + start;
   pending->word_length = cursor - start;
   *position = cursor;
-  return true;
+  return SHELL_HEREDOC_WORD_COMPLETE;
+}
+
+static inline bool
+shell_source_parse_heredoc_delimiter(const char *input, size_t length,
+                                     size_t *position,
+                                     shell_source_pending_heredoc_t *pending) {
+  return shell_source_probe_heredoc_delimiter(
+             input, length, position, pending) == SHELL_HEREDOC_WORD_COMPLETE;
 }
 
 typedef struct {
-  const char *input;
-  size_t text;
-  size_t end;
-  bool mismatch;
-  bool terminated;
-} shell_source_heredoc_match_t;
+  unsigned char *bytes; /* NULL measures the decoded representation. */
+  size_t length;
+} shell_source_heredoc_decode_t;
 
-static inline bool shell_source_match_heredoc_byte(unsigned char byte,
-                                                   void *context) {
-  shell_source_heredoc_match_t *match = (shell_source_heredoc_match_t *)context;
-  /* Bash truncates one ANSI-C quoted segment at its first decoded NUL. The
-   * matcher resets this flag before resuming with later word fragments. */
-  if (match->terminated || match->mismatch)
+static inline SHELL_NONNULL(2) void shell_source_heredoc_decode_byte(
+    unsigned char byte, shell_source_heredoc_decode_t *decoded) {
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+  shellsplit_test_metadata_charge(SHELLSPLIT_TEST_WORK_HEREDOC_PREPARATION);
+#endif
+  if (decoded->bytes)
+    decoded->bytes[decoded->length] = byte;
+  decoded->length++;
+}
+
+typedef struct {
+  shell_source_heredoc_decode_t *decoded;
+  bool quoted, escape;
+  char quote;
+} shell_source_heredoc_remove_t;
+
+/* Consume the virtual lexical spelling, not the raw source. Quotes in a
+ * literal backtick may affect this pass but never its lexical quoted flag. */
+static inline SHELL_NONNULL(2) void shell_source_heredoc_remove_byte(
+    unsigned char byte, shell_source_heredoc_remove_t *remove) {
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+  shellsplit_test_metadata_charge(SHELLSPLIT_TEST_WORK_HEREDOC_PREPARATION);
+#endif
+  if (!remove->quoted) {
+    shell_source_heredoc_decode_byte(byte, remove->decoded);
+    return;
+  }
+  if (remove->escape) {
+    remove->escape = false;
+    if (remove->quote == '"' && byte != '$' && byte != '`' && byte != '"' &&
+        byte != '\\' && byte != '\n')
+      shell_source_heredoc_decode_byte('\\', remove->decoded);
+  } else if (remove->quote == '\'') {
+    if (byte == '\'') {
+      remove->quote = '\0';
+      return;
+    }
+  } else if (byte == '\\') {
+    remove->escape = true;
+    return;
+  } else if (byte == '"') {
+    remove->quote = remove->quote ? '\0' : '"';
+    return;
+  } else if (byte == '\'' && !remove->quote) {
+    remove->quote = '\'';
+    return;
+  }
+  shell_source_heredoc_decode_byte(byte, remove->decoded);
+}
+
+typedef struct {
+  shell_source_heredoc_remove_t *remove;
+  unsigned char first;
+  bool have_first, started, terminated;
+} shell_source_heredoc_ansi_t;
+
+static inline SHELL_NONNULL(2) void shell_source_heredoc_protect_byte(
+    unsigned char byte, shell_source_heredoc_remove_t *remove) {
+  shell_source_heredoc_remove_byte(byte, remove);
+  if (byte == '\'') {
+    shell_source_heredoc_remove_byte('\\', remove);
+    shell_source_heredoc_remove_byte('\'', remove);
+    shell_source_heredoc_remove_byte('\'', remove);
+  }
+}
+
+/* Bash lexically replaces $'...' with sh_single_quote(decoded). Delay the
+ * first byte to implement its singleton-apostrophe spelling (\\') without
+ * another scan or an intermediate allocation. NUL ends only this segment. */
+static inline SHELL_NONNULL(2) bool shell_source_heredoc_ansi_byte(
+    unsigned char byte, void *context) {
+  shell_source_heredoc_ansi_t *ansi = (shell_source_heredoc_ansi_t *)context;
+  if (ansi->terminated)
     return true;
-  if (byte == '\0') {
-    match->terminated = true;
+  if (!byte) {
+    ansi->terminated = true;
     return true;
   }
-  if (match->text == match->end || match->input[match->text] != (char)byte) {
-    match->mismatch = true;
+  if (!ansi->have_first) {
+    ansi->first = byte;
+    ansi->have_first = true;
     return true;
   }
-  match->text++;
+  if (!ansi->started) {
+    shell_source_heredoc_remove_byte('\'', ansi->remove);
+    shell_source_heredoc_protect_byte(ansi->first, ansi->remove);
+    ansi->started = true;
+  }
+  shell_source_heredoc_protect_byte(byte, ansi->remove);
   return true;
 }
 
-/* Match quote-removed delimiter bytes against one physical line. The caller
- * supplies immutable input[0..length), line <= length, and an initialized
- * descriptor borrowing valid immutable word[0..word_length) storage. */
-static SHELL_NONNULL(1, 4) inline bool shell_source_line_is_heredoc_delimiter(
-    const char *input, size_t length, size_t line,
-    const shell_source_pending_heredoc_t *pending) {
-  size_t text = line;
-  if (pending->strip_tabs)
-    while (text < length && input[text] == '\t')
-      text++;
-  shell_source_heredoc_match_t match = {
-      .input = input,
-      .text = text,
-      .end = shell_source_line_end(input, length, text),
-  };
-  char quote = '\0';
+/* Measure/fill the same forward stream: lexical continuation removal and
+ * protected ANSI-C translation first, then whole-word quote removal. Actual
+ * lexical quotes control body expansion independently of the second phase. */
+static inline SHELL_NONNULL(1, 2, 3) void shell_source_decode_heredoc(
+    const shell_source_pending_heredoc_t *pending,
+    shell_source_heredoc_decode_t *decoded, bool *quoted) {
+  char lexical_quote = '\0';
+  *quoted = false;
+  size_t lexical = 0;
+  size_t ansi = shell_source_next_heredoc_ansi(
+      pending->word, pending->word_length, &lexical, quoted);
+  shell_source_heredoc_remove_t remove = {decoded, *quoted, false, '\0'};
+  size_t backtick_end = 0;
   for (size_t word = 0; word < pending->word_length;) {
+    SHELL_SOURCE_WORD_SCAN(1);
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+    shellsplit_test_metadata_charge(SHELLSPLIT_TEST_WORK_HEREDOC_PREPARATION);
+#endif
     char c = pending->word[word++];
-    if (quote == '\0' && c == '$' &&
-        shell_source_logical_next_is(pending->word, pending->word_length,
-                                     word - 1, '\'', NULL)) {
+    if (word - 1 == ansi) {
       size_t position = word - 1;
-      if (!shell_source_decode_ansi_c_quote(
-              pending->word, pending->word_length, &position,
-              shell_source_match_heredoc_byte, &match))
-        return false;
-      match.terminated = false;
+      shell_source_heredoc_ansi_t fragment = {&remove, 0, false, false, false};
+      /* The declaration probe admitted this complete fragment; our visitor
+       * cannot fail. Do not revalidate syntax in either measure or fill. */
+      (void)shell_source_decode_ansi_c_quote(
+          pending->word, pending->word_length, &position,
+          shell_source_heredoc_ansi_byte, &fragment);
+      if (!fragment.started) {
+        if (fragment.have_first && fragment.first == '\'') {
+          shell_source_heredoc_remove_byte('\\', &remove);
+          shell_source_heredoc_remove_byte('\'', &remove);
+        } else {
+          shell_source_heredoc_remove_byte('\'', &remove);
+          if (fragment.have_first)
+            shell_source_heredoc_remove_byte(fragment.first, &remove);
+          shell_source_heredoc_remove_byte('\'', &remove);
+        }
+      } else {
+        shell_source_heredoc_remove_byte('\'', &remove);
+      }
       word = position;
+      lexical = position;
+      ansi = shell_source_next_heredoc_ansi(pending->word, pending->word_length,
+                                            &lexical, quoted);
       continue;
     }
-    if (quote != '\0') {
-      if (c == quote) {
-        quote = '\0';
-        continue;
-      }
-      if (c == '\\' && quote == '"' && word < pending->word_length) {
-        size_t continued = shell_source_skip_escaped_line_endings(
-            pending->word, pending->word_length, word - 1);
-        if (continued != word - 1) {
-          word = continued;
-          continue;
-        }
-        if (pending->word[word] == '$' || pending->word[word] == '`' ||
-            pending->word[word] == '"' || pending->word[word] == '\\')
-          c = pending->word[word++];
-      }
-    } else if (c == '\'' || c == '"') {
-      quote = c;
-      continue;
-    } else if (c == '\\') {
+    if (word > backtick_end && lexical_quote != '\'' && c == '`')
+      (void)shell_source_skip_complete_backtick(
+          pending->word, pending->word_length, word - 1, &backtick_end);
+    bool in_backtick = word <= backtick_end;
+    if (c == '\\' && lexical_quote != '\'') {
       size_t continued = shell_source_skip_escaped_line_endings(
           pending->word, pending->word_length, word - 1);
       if (continued != word - 1) {
         word = continued;
         continue;
       }
-      if (word == pending->word_length)
-        return false;
-      c = pending->word[word++];
+      shell_source_heredoc_remove_byte((unsigned char)c, &remove);
+      /* A complete word has a following byte for every lexical escape. */
+      if (in_backtick || !lexical_quote || pending->word[word] == '$' ||
+          pending->word[word] == '`' || pending->word[word] == '"' ||
+          pending->word[word] == '\\')
+        shell_source_heredoc_remove_byte((unsigned char)pending->word[word++],
+                                         &remove);
+      continue;
     }
-    if (!shell_source_match_heredoc_byte((unsigned char)c, &match))
-      return false;
+    if (!in_backtick) {
+      if (c == lexical_quote)
+        lexical_quote = '\0';
+      else if (!lexical_quote && (c == '\'' || c == '"'))
+        lexical_quote = c;
+    }
+    shell_source_heredoc_remove_byte((unsigned char)c, &remove);
   }
-  return quote == '\0' && !match.mismatch && match.text == match.end;
 }
 
-/* A quoted delimiter disables expansion of its document body. The parser
- * retains the raw word span for zero-copy matching, so derive that flag from
- * the syntax that quote removal will process. The required descriptor borrows
- * valid immutable word[0..word_length) storage. */
+typedef struct {
+  const unsigned char *bytes;
+  size_t length;
+  bool quoted;
+} shell_source_heredoc_delimiter_t;
+
+/* Construct normalized spelling from a complete admitted delimiter word.
+ * Pieces and bytes use the current operation's borrowed arena and expire
+ * when its caller releases the delimiter-preparation scratch mark. */
+bool shell_source_prepare_literal_heredoc(
+    const shell_source_pending_heredoc_t *pending,
+    shell_source_heredoc_delimiter_t *delimiter) SHELL_NONNULL(1, 2);
+
+/* pending borrows a complete immutable delimiter word admitted by the
+ * declaration probe, not an unfinished raw spelling. The operation's scratch
+ * remains live through all comparisons using the returned delimiter. */
+static inline SHELL_NONNULL(1, 2) bool shell_source_prepare_heredoc(
+    const shell_source_pending_heredoc_t *pending,
+    shell_source_heredoc_delimiter_t *delimiter) {
+  /* A dollar fragment needs lexical grouping and Bash command printing. The
+   * common flat spelling retains its allocation-free streaming fast path. */
+  for (size_t i = 0; i < pending->word_length; i++)
+    if (shell_source_heredoc_fragment_open(pending->word, pending->word_length,
+                                           i))
+      return shell_source_prepare_literal_heredoc(pending, delimiter);
+  shell_source_heredoc_decode_t measure = {NULL, 0};
+  shell_source_decode_heredoc(pending, &measure, &delimiter->quoted);
+  delimiter->length = measure.length;
+  /* Grouped fragments took the printer path above. An unquoted flat word
+   * can only lose continuations, so equal length proves byte identity here;
+   * it would not prove identity for a printed command fragment. */
+  if (!delimiter->quoted && measure.length == pending->word_length) {
+    delimiter->bytes = (const unsigned char *)pending->word;
+    return true;
+  }
+  unsigned char *bytes =
+      (unsigned char *)shell_source_scratch_take(measure.length);
+  if (!bytes)
+    return false;
+  shell_source_heredoc_decode_t fill = {bytes, 0};
+  bool quoted;
+  /* The same immutable spelling and emitter fill exactly the measured bytes. */
+  shell_source_decode_heredoc(pending, &fill, &quoted);
+  delimiter->bytes = bytes;
+  return true;
+}
+
+/* Match one logical body line against an already prepared delimiter.
+ * A final unpaired backslash in an unquoted line may acquire LF on append;
+ * it cannot yet be committed as a mismatching content byte. */
+static inline SHELL_NONNULL(1, 4, 5, 6) bool shell_source_match_prepared_heredoc(
+    const char *input, size_t length, size_t line,
+    const shell_source_heredoc_delimiter_t *delimiter, size_t *after,
+    bool *prefix, bool strip_tabs) {
+  size_t position = line, matched = 0;
+  bool mismatch = false, escaped = false, line_start = true;
+  *prefix = false;
+  while (position < length) {
+    SHELL_SOURCE_LINE_SCAN(1);
+    unsigned char byte = (unsigned char)input[position];
+    if (byte == '\n')
+      break;
+    if (!delimiter->quoted && !escaped && byte == '\\') {
+      if (position + 1 == length) {
+        *after = length;
+        *prefix = !mismatch;
+        return false;
+      }
+      if (input[position + 1] == '\n') {
+        SHELL_SOURCE_LINE_SCAN(1);
+        position += 2;
+        continue;
+      }
+    }
+    if (strip_tabs && line_start && byte == '\t') {
+      position++;
+      continue;
+    }
+    line_start = false;
+    escaped = !delimiter->quoted && !escaped && byte == '\\';
+    if (matched == delimiter->length || byte != delimiter->bytes[matched])
+      mismatch = true;
+    else if (!mismatch)
+      matched++;
+    position++;
+  }
+  *after = position < length ? position + 1 : position;
+  *prefix = !mismatch && matched < delimiter->length && position == length;
+  return !mismatch && matched == delimiter->length;
+}
+
+/* Single-line projection used by isolated framing tests. Streaming consumers
+ * prepare once for the whole document, not once for each candidate line. */
+static inline SHELL_NONNULL(1, 4, 5, 6) bool shell_source_match_heredoc_line(
+    const char *input, size_t length, size_t line,
+    const shell_source_pending_heredoc_t *pending, size_t *after,
+    bool *prefix) {
+  size_t mark = shell_source_scratch_mark();
+  shell_source_heredoc_delimiter_t delimiter;
+  *after = length;
+  *prefix = false;
+  bool result =
+      shell_source_prepare_heredoc(pending, &delimiter) &&
+      shell_source_match_prepared_heredoc(input, length, line, &delimiter,
+                                          after, prefix, pending->strip_tabs);
+  shell_source_scratch_release(mark);
+  return result;
+}
+typedef struct {
+  size_t body_start, body_end, confirmed_end;
+  size_t delimiter_start, delimiter_end, after;
+  bool complete, delimiter_prefix;
+} shell_source_heredoc_frame_t;
+
+/* Boolean projection for consumers which do not retain draft framing. */
+static inline SHELL_NONNULL(1, 4) bool shell_source_line_is_heredoc_delimiter(
+    const char *input, size_t length, size_t line,
+    const shell_source_pending_heredoc_t *pending) {
+  size_t after;
+  bool prefix;
+  return shell_source_match_heredoc_line(input, length, line, pending, &after,
+                                         &prefix);
+}
+
+/* One shared framing walk, retaining raw source spans and the received versus
+ * confirmed body prefix. No delimiter is synthesized for unfinished input. */
+static inline SHELL_NONNULL(1, 4) shell_source_heredoc_frame_t
+    shell_source_frame_heredoc(const char *input, size_t length,
+                               size_t body_start,
+                               const shell_source_pending_heredoc_t *pending) {
+  shell_source_heredoc_frame_t frame = {.body_start = body_start,
+                                        .body_end = length,
+                                        .confirmed_end = length,
+                                        .delimiter_start = length,
+                                        .delimiter_end = length,
+                                        .after = length};
+  size_t body_end, delimiter_length;
+  if (shell_source_index_get(input, length, body_start,
+                             SHELL_SOURCE_INDEX_HEREDOC_BODY, &body_end,
+                             &delimiter_length)) {
+    frame.body_end = frame.confirmed_end = frame.delimiter_start = body_end;
+    frame.delimiter_end = frame.after = body_end + delimiter_length;
+    frame.complete = true;
+    return frame;
+  }
+  size_t mark = shell_source_scratch_mark();
+  shell_source_heredoc_delimiter_t delimiter;
+  if (!shell_source_prepare_heredoc(pending, &delimiter))
+    return frame;
+  for (size_t line = body_start; line < length;) {
+    size_t after;
+    bool prefix;
+    if (shell_source_match_prepared_heredoc(input, length, line, &delimiter,
+                                            &after, &prefix,
+                                            pending->strip_tabs)) {
+      frame.body_end = frame.confirmed_end = frame.delimiter_start = line;
+      frame.delimiter_end = frame.after = after;
+      frame.complete = true;
+      shell_source_index_put(input, length, body_start,
+                             SHELL_SOURCE_INDEX_HEREDOC_BODY, line,
+                             after - line);
+      break;
+    }
+    if (prefix) {
+      frame.confirmed_end = line;
+      frame.delimiter_prefix = true;
+    }
+    line = after;
+  }
+  shell_source_scratch_release(mark);
+  return frame;
+}
+
+/* A quoted delimiter disables expansion of its document body. Derive the
+ * lexical flag, not the mere presence of quote-looking text inside literal
+ * backticks. The required descriptor borrows a complete immutable delimiter
+ * word[0..word_length). */
 static SHELL_NONNULL(1) inline bool shell_source_heredoc_delimiter_is_quoted(
     const shell_source_pending_heredoc_t *pending) {
-  for (size_t i = 0; i < pending->word_length; i++) {
-    char c = pending->word[i];
-    if (c == '\\' || c == '\'' || c == '"')
-      return true;
-  }
-  return false;
+  size_t position = 0;
+  bool quoted = false;
+  (void)shell_source_next_heredoc_ansi(pending->word, pending->word_length,
+                                       &position, &quoted);
+  return quoted;
 }
 
 static inline SHELL_NONNULL(4) bool shell_source_find_balanced_parentheses(
@@ -1605,30 +2090,18 @@ static SHELL_NONNULL(1, 4, 8) inline bool shell_source_visit_pending_heredoc_bod
     const shell_source_pending_heredoc_t *pending, size_t pending_count,
     shell_source_heredoc_body_visitor_t visitor, void *context, size_t *after) {
   for (size_t h = 0; h < pending_count; h++) {
-    size_t body_start = line;
-    bool found = false;
-    while (line < length) {
-      if (shell_source_line_is_heredoc_delimiter(input, length, line,
-                                                 &pending[h])) {
-        size_t body_length = line - body_start;
-        if (visitor &&
-            !visitor(input, body_start, body_length,
-                     shell_source_heredoc_delimiter_is_quoted(&pending[h]),
-                     context))
-          return false;
-        line = shell_source_next_line(input, length, line);
-        found = true;
-        break;
-      }
-      size_t next = shell_source_next_line(input, length, line);
-      if (next <= line)
-        break;
-      line = next;
-    }
-    if (!found) {
+    shell_source_heredoc_frame_t frame =
+        shell_source_frame_heredoc(input, length, line, &pending[h]);
+    if (!frame.complete) {
       *after = length;
       return false;
     }
+    if (visitor &&
+        !visitor(input, frame.body_start, frame.body_end - frame.body_start,
+                 shell_source_heredoc_delimiter_is_quoted(&pending[h]),
+                 context))
+      return false;
+    line = frame.after;
   }
   *after = line;
   return true;
@@ -2040,6 +2513,12 @@ static inline bool shell_source_find_balanced_parentheses(const char *input,
   if (position >= length)
     return false;
   size_t height;
+  size_t failed_end;
+  if (shell_source_index_get(input, length, position,
+                             SHELL_SOURCE_INDEX_UNCLOSED_PARENS, &failed_end,
+                             &height) &&
+      failed_end == length)
+    return false;
   if (shell_source_index_get(input, length, position, SHELL_SOURCE_INDEX_PARENS,
                              after, &height)) {
     if (height > SHELL_MAX_SUBCOMMANDS - shell_source_scan_depth)
@@ -2055,6 +2534,12 @@ static inline bool shell_source_find_balanced_parentheses(const char *input,
   if (complete)
     shell_source_index_put(input, length, position, SHELL_SOURCE_INDEX_PARENS,
                            *after, height);
+  else
+    /* Immutable received EOF is part of this negative fact. Do not reuse it
+     * for a different span end (for example a separately qualified prefix).
+     * Nested draft consumers reuse the failed forward walk, not its suffix. */
+    shell_source_index_put(input, length, position,
+                           SHELL_SOURCE_INDEX_UNCLOSED_PARENS, length, height);
   return complete;
 }
 
@@ -2184,16 +2669,33 @@ static inline bool shell_source_parameter_is_special(unsigned char c) {
          c == '-';
 }
 
-static inline bool shell_source_skip_parameter_base(const char *input,
-                                                    size_t length,
-                                                    size_t *position) {
-  if (!input || !position || *position >= length)
-    return false;
+typedef enum {
+  SHELL_SOURCE_PARAMETER_COMPLETE,
+  SHELL_SOURCE_PARAMETER_INCOMPLETE,
+  SHELL_SOURCE_PARAMETER_MALFORMED,
+} shell_source_parameter_status_t;
 
+/* At a selector boundary, a final backslash can still acquire a continuation
+ * LF. Other invalid bytes cannot be repaired by appending. position <= length;
+ * input supplies that immutable span, including at zero length. */
+static inline SHELL_NONNULL(1) bool shell_source_parameter_at_eof(
+    const char *input, size_t length, size_t position) {
+  return position == length ||
+         (input[position] == '\\' && position + 1 == length);
+}
+
+/* Consume a scalar base on a forward cursor. Required position is in
+ * [0,length] and receives the consumed/terminal offset for every status.
+ * COMPLETE means one base, not a complete enclosing ${...} expansion. */
+static inline SHELL_NONNULL(1, 3) shell_source_parameter_status_t
+    shell_source_skip_parameter_base(const char *input, size_t length,
+                                     size_t *position) {
   size_t cursor =
       shell_source_skip_escaped_line_endings(input, length, *position);
-  if (cursor >= length)
-    return false;
+  *position = cursor;
+  if (shell_source_parameter_at_eof(input, length, cursor))
+    return SHELL_SOURCE_PARAMETER_INCOMPLETE;
+  SHELL_SOURCE_WORD_SCAN(1);
   unsigned char c = (unsigned char)input[cursor];
   if (isalpha(c) || c == '_') {
     cursor++;
@@ -2201,6 +2703,7 @@ static inline bool shell_source_skip_parameter_base(const char *input,
       cursor = shell_source_skip_escaped_line_endings(input, length, cursor);
       if (cursor >= length)
         break;
+      SHELL_SOURCE_WORD_SCAN(1);
       c = (unsigned char)input[cursor];
       if (!(isalnum(c) || c == '_'))
         break;
@@ -2210,15 +2713,19 @@ static inline bool shell_source_skip_parameter_base(const char *input,
     do {
       cursor++;
       cursor = shell_source_skip_escaped_line_endings(input, length, cursor);
+      if (cursor < length)
+        SHELL_SOURCE_WORD_SCAN(1);
     } while (cursor < length && isdigit((unsigned char)input[cursor]));
   } else if (shell_source_parameter_is_special(c)) {
     cursor++;
   } else {
-    return false;
+    return SHELL_SOURCE_PARAMETER_MALFORMED;
   }
 
   *position = cursor;
-  return true;
+  return cursor < length && shell_source_parameter_at_eof(input, length, cursor)
+             ? SHELL_SOURCE_PARAMETER_INCOMPLETE
+             : SHELL_SOURCE_PARAMETER_COMPLETE;
 }
 
 /* Skip the parameter selector immediately after `${`.  `#` prefixes the
@@ -2228,24 +2735,26 @@ static inline bool shell_source_skip_parameter_base(const char *input,
  * without misclassifying the enclosing expansion. */
 /* Recognize only the selector's scalar head. The word walker consumes a
  * following subscript in its forward scope stream; it never balances that
- * suffix merely to revisit it. Outputs and source span are required storage. */
-static SHELL_NONNULL(1, 4, 5) inline bool shell_source_skip_parameter_head(
-    const char *input, size_t length, size_t position, size_t *after,
-    bool *indirect) {
+ * suffix merely to revisit it. Required source span and outputs are distinct;
+ * position <= length. after retains forward progress on every status, rather
+ * than making EOF consumers infer it from the original selector start. */
+static SHELL_NONNULL(1, 4, 5) inline shell_source_parameter_status_t
+    shell_source_skip_parameter_head(const char *input, size_t length,
+                                     size_t position, size_t *after,
+                                     bool *indirect) {
   *indirect = false;
-  if (position >= length)
-    return false;
-
   position = shell_source_skip_escaped_line_endings(input, length, position);
-  if (position >= length)
-    return false;
+  *after = position;
+  if (shell_source_parameter_at_eof(input, length, position))
+    return SHELL_SOURCE_PARAMETER_INCOMPLETE;
   if (input[position] == '#') {
     size_t next = shell_source_logical_following(input, length, position);
-    if (next >= length)
-      return false;
+    *after = next;
+    if (shell_source_parameter_at_eof(input, length, next))
+      return SHELL_SOURCE_PARAMETER_INCOMPLETE;
     if (input[next] == '}') {
       *after = next;
-      return true;
+      return SHELL_SOURCE_PARAMETER_COMPLETE;
     }
     /* `${##word}` means pattern removal from the special `$#`, not the
      * length of a parameter named `#word`. Leave the first `#` for the base
@@ -2254,20 +2763,20 @@ static SHELL_NONNULL(1, 4, 5) inline bool shell_source_skip_parameter_head(
       position = next;
   } else if (input[position] == '!') {
     position = shell_source_logical_following(input, length, position);
-    if (position >= length)
-      return false;
+    *after = position;
+    if (shell_source_parameter_at_eof(input, length, position))
+      return SHELL_SOURCE_PARAMETER_INCOMPLETE;
     if (input[position] == '}') {
       *after = position;
-      return true;
+      return SHELL_SOURCE_PARAMETER_COMPLETE;
     }
     *indirect = true;
   }
 
-  if (!shell_source_skip_parameter_base(input, length, &position))
-    return false;
-
+  shell_source_parameter_status_t status =
+      shell_source_skip_parameter_base(input, length, &position);
   *after = position;
-  return true;
+  return status;
 }
 
 /* input supplies length immutable bytes (NULL only for length zero),
@@ -2278,8 +2787,9 @@ static inline SHELL_NONNULL(4) bool shell_source_skip_parameter_selector(
   if (position >= length)
     return false;
   bool indirect;
-  if (!shell_source_skip_parameter_head(input, length, position, &position,
-                                        &indirect))
+  if (shell_source_skip_parameter_head(input, length, position, &position,
+                                       &indirect) !=
+      SHELL_SOURCE_PARAMETER_COMPLETE)
     return false;
   position = shell_source_skip_escaped_line_endings(input, length, position);
   if (position < length && input[position] == '[') {
@@ -3088,6 +3598,7 @@ typedef enum {
   SHELL_SOURCE_SCAN_DONE = 0,
   SHELL_SOURCE_SCAN_FOUND,
   SHELL_SOURCE_SCAN_MALFORMED,
+  SHELL_SOURCE_SCAN_INCOMPLETE,
 } shell_source_scan_status_t;
 
 static inline bool
@@ -3105,6 +3616,10 @@ typedef struct {
    * Their parameter defaults inherit expansion semantics, but not ANSI-C or
    * locale quoting. Pattern operands establish ordinary word quoting. */
   bool heredoc;
+  /* Byte admission is independent of quoting: heredoc literal text and its
+   * parameter words remain data, even where pattern quoting changes. Math,
+   * substring offsets and array subscripts establish code domains. */
+  bool data_domain;
   /* Inherited double quoting ignores apostrophes for expansion, but the
    * parameter grammar still pairs them when finding its closing brace. */
   char delimiter_quote;
@@ -3225,7 +3740,30 @@ typedef struct {
   bool has_ansi_locale;
   bool has_locale_quote;
   unsigned arithmetic_depth;
+  /* Optional boundary observer. NULL disables it. Regions are nonempty,
+   * ordered, disjoint code spans, excluding executable child bodies (which
+   * the boundary visits separately). Completion events never repeat a span.
+   * context is borrowed for the iteration and interpreted only by visitor. */
+  void (*code_visitor)(const char *source, size_t start, size_t end,
+                       void *context);
+  void *code_context;
+  size_t code_start;
+  /* Valid only at INCOMPLETE: body_start != 0 identifies an unfinished
+   * executable child and its entire received body, without a closing byte.
+   * Arithmetic/quote-only EOF has body_start == 0. No rescan is required to
+   * distinguish backticks, command substitutions and process substitutions. */
+  struct {
+    shell_source_substitution_kind_t kind;
+    size_t body_start, body_length;
+  } unfinished;
 } shell_source_substitution_scan_t;
+
+static inline SHELL_NONNULL(2) void shell_source_report_word_code(
+    const char *input, shell_source_substitution_scan_t *scan, size_t end) {
+  if (scan->code_visitor && !scan->scope.data_domain && scan->code_start < end)
+    scan->code_visitor(input, scan->code_start, end, scan->code_context);
+  scan->code_start = end;
+}
 
 /* The selector has already been structurally recognized. Record its parameter
  * category without copying a name or rescanning its operand. */
@@ -3250,8 +3788,10 @@ static SHELL_NONNULL(1, 4) inline void shell_source_note_parameter(
  * the operand of a completed substring expansion.
  * Executable substitutions inside math precede its completion event; nested
  * arithmetic is owned by the outer math event and never emitted repeatedly.
- * MALFORMED reports source
- * syntax or nesting-limit failure, never invalid pointer arguments. Consume
+ * MALFORMED reports invalid source syntax or nesting-limit failure;
+ * INCOMPLETE reports an unfinished expansion at received EOF. Both reject
+ * strict consumers; draft consumers distinguish them. Neither reports invalid
+ * pointer arguments. Consume
  * through DONE before publishing results: a later malformed enclosing scope
  * can follow a complete substitution. Parameter and arithmetic scopes close
  * during forward traversal, never by balancing and revisiting their suffixes.
@@ -3262,10 +3802,10 @@ static SHELL_NONNULL(1, 4) inline void shell_source_note_parameter(
  * parameter patterns still establish their own quote contexts.
  */
 static inline SHELL_NONNULL(3, 4, 5, 6) shell_source_scan_status_t
-    shell_source_next_word_expansion(const char *input, size_t length,
-                                     shell_source_substitution_scan_t *scan,
-                                     size_t *start, size_t *after,
-                                     shell_source_substitution_kind_t *kind) {
+    shell_source_next_word_expansion_body(
+        const char *input, size_t length,
+        shell_source_substitution_scan_t *scan, size_t *start, size_t *after,
+        shell_source_substitution_kind_t *kind) {
   while (scan->position < length) {
     SHELL_SOURCE_WORD_SCAN(1);
     shell_source_expansion_scope_t *scope = &scan->scope;
@@ -3273,13 +3813,14 @@ static inline SHELL_NONNULL(3, 4, 5, 6) shell_source_scan_status_t
     if (scope->selector_pending) {
       position =
           shell_source_skip_escaped_line_endings(input, length, position);
-      if (position == length)
-        return SHELL_SOURCE_SCAN_MALFORMED;
+      if (shell_source_parameter_at_eof(input, length, position))
+        return SHELL_SOURCE_SCAN_INCOMPLETE;
       if (!scope->selector_subscript && input[position] == '[') {
         if (scan->scope_count == SHELL_MAX_SUBCOMMANDS)
           return SHELL_SOURCE_SCAN_MALFORMED;
         scope->selector_subscript = true;
         scan->has_arrays = true;
+        shell_source_report_word_code(input, scan, position + 1);
         scan->scopes[scan->scope_count++] = *scope;
         *scope = (shell_source_expansion_scope_t){
             .suppress_process = true,
@@ -3291,16 +3832,20 @@ static inline SHELL_NONNULL(3, 4, 5, 6) shell_source_scan_status_t
         scan->position = position + 1;
         continue;
       }
-      bool name_enumeration =
-          scope->selector_indirect && !scope->selector_subscript &&
-          (input[position] == '*' || input[position] == '@') &&
-          shell_source_logical_next_is(input, length, position, '}', NULL);
-      if (name_enumeration)
-        position++;
+      bool name_enumeration = false;
+      if (scope->selector_indirect && !scope->selector_subscript &&
+          (input[position] == '*' || input[position] == '@')) {
+        size_t next = shell_source_logical_following(input, length, position);
+        if (shell_source_parameter_at_eof(input, length, next))
+          return SHELL_SOURCE_SCAN_INCOMPLETE;
+        name_enumeration = input[next] == '}';
+        if (name_enumeration)
+          position = next;
+      }
       position =
           shell_source_skip_escaped_line_endings(input, length, position);
       if (position == length)
-        return SHELL_SOURCE_SCAN_MALFORMED;
+        return SHELL_SOURCE_SCAN_INCOMPLETE;
       size_t word_start = position;
       bool has_word = input[position] != '}';
       if (has_word && !shell_source_parameter_word_operator(
@@ -3343,6 +3888,8 @@ static inline SHELL_NONNULL(3, 4, 5, 6) shell_source_scan_status_t
           return SHELL_SOURCE_SCAN_MALFORMED;
         scope->substring_scope = true;
         scope->arithmetic_scope = true;
+        shell_source_report_word_code(input, scan, word_start);
+        scope->data_domain = false;
         scope->suppress_process = true;
         scan->has_arithmetic = true;
         scan->has_expansion_abort = true;
@@ -3390,7 +3937,7 @@ static inline SHELL_NONNULL(3, 4, 5, 6) shell_source_scan_status_t
       size_t ansi_after = 0;
       if (!shell_source_skip_complete_ansi_c_quote(input, length, position,
                                                    &ansi_after))
-        return SHELL_SOURCE_SCAN_MALFORMED;
+        return SHELL_SOURCE_SCAN_INCOMPLETE;
       scan->has_ansi_c = true;
       size_t nul_after = position;
       bool has_nul = false;
@@ -3414,7 +3961,7 @@ static inline SHELL_NONNULL(3, 4, 5, 6) shell_source_scan_status_t
       size_t ansi_after = 0;
       if (!shell_source_skip_complete_ansi_c_quote(input, length, position,
                                                    &ansi_after))
-        return SHELL_SOURCE_SCAN_MALFORMED;
+        return SHELL_SOURCE_SCAN_INCOMPLETE;
       scan->has_ansi_c = true;
       size_t nul_after = position;
       bool has_nul = false;
@@ -3476,12 +4023,20 @@ static inline SHELL_NONNULL(3, 4, 5, 6) shell_source_scan_status_t
     if (c == '`') {
       size_t substitution_after = 0;
       bool escape_sensitive = false;
-      if (!shell_source_scan_backtick(input, length, position,
-                                      scope->in_double_quote ||
-                                          scope->inherited_double_quote,
-                                      &substitution_after, &escape_sensitive))
-        return SHELL_SOURCE_SCAN_MALFORMED;
+      bool complete = shell_source_scan_backtick(
+          input, length, position,
+          scope->in_double_quote || scope->inherited_double_quote,
+          &substitution_after, &escape_sensitive);
       scan->has_backtick_escapes |= escape_sensitive;
+      shell_source_report_word_code(input, scan, position);
+      if (!complete) {
+        scan->unfinished.kind = SHELL_SOURCE_SUBST_BACKTICK;
+        scan->unfinished.body_start = position + 1;
+        scan->unfinished.body_length = length - position - 1;
+        scan->code_start = length;
+        return SHELL_SOURCE_SCAN_INCOMPLETE;
+      }
+      scan->code_start = substitution_after;
       *start = position;
       *after = substitution_after;
       *kind = SHELL_SOURCE_SUBST_BACKTICK;
@@ -3495,9 +4050,14 @@ static inline SHELL_NONNULL(3, 4, 5, 6) shell_source_scan_status_t
           shell_source_skip_escaped_line_endings(input, length, brace + 1);
       size_t head_after = 0;
       bool indirect;
-      if (!shell_source_skip_parameter_head(input, length, selector,
-                                            &head_after, &indirect))
-        return SHELL_SOURCE_SCAN_MALFORMED;
+      shell_source_parameter_status_t head = shell_source_skip_parameter_head(
+          input, length, selector, &head_after, &indirect);
+      if (head != SHELL_SOURCE_PARAMETER_COMPLETE) {
+        scan->position = head_after;
+        return head == SHELL_SOURCE_PARAMETER_INCOMPLETE
+                   ? SHELL_SOURCE_SCAN_INCOMPLETE
+                   : SHELL_SOURCE_SCAN_MALFORMED;
+      }
       if (scan->scope_count >= SHELL_MAX_SUBCOMMANDS)
         return SHELL_SOURCE_SCAN_MALFORMED;
       shell_source_note_parameter(input, length, selector, scan);
@@ -3528,6 +4088,7 @@ static inline SHELL_NONNULL(3, 4, 5, 6) shell_source_scan_status_t
       scan->has_arithmetic = true;
       scan->has_expansion_abort = true;
       scan->arithmetic_depth++;
+      shell_source_report_word_code(input, scan, open + 1);
       scan->scopes[scan->scope_count++] = *scope;
       scan->position = open + 1;
       *scope =
@@ -3544,9 +4105,16 @@ static inline SHELL_NONNULL(3, 4, 5, 6) shell_source_scan_status_t
     if (c == '$' &&
         shell_source_dollar_parentheses_open(input, length, position, &open)) {
       size_t substitution_after = 0;
+      shell_source_report_word_code(input, scan, position);
       if (!shell_source_find_balanced_parentheses(input, length, open,
-                                                  &substitution_after))
-        return SHELL_SOURCE_SCAN_MALFORMED;
+                                                  &substitution_after)) {
+        scan->unfinished.kind = SHELL_SOURCE_SUBST_COMMAND;
+        scan->unfinished.body_start = open + 1;
+        scan->unfinished.body_length = length - open - 1;
+        scan->code_start = length;
+        return SHELL_SOURCE_SCAN_INCOMPLETE;
+      }
+      scan->code_start = substitution_after;
       *start = position;
       *after = substitution_after;
       *kind = SHELL_SOURCE_SUBST_COMMAND;
@@ -3559,9 +4127,17 @@ static inline SHELL_NONNULL(3, 4, 5, 6) shell_source_scan_status_t
         shell_source_process_substitution_open(input, length, position,
                                                &open)) {
       size_t substitution_after = 0;
+      shell_source_report_word_code(input, scan, position);
       if (!shell_source_find_balanced_parentheses(input, length, open,
-                                                  &substitution_after))
-        return SHELL_SOURCE_SCAN_MALFORMED;
+                                                  &substitution_after)) {
+        scan->unfinished.kind = c == '<' ? SHELL_SOURCE_SUBST_PROCESS_INPUT
+                                         : SHELL_SOURCE_SUBST_PROCESS_OUTPUT;
+        scan->unfinished.body_start = open + 1;
+        scan->unfinished.body_length = length - open - 1;
+        scan->code_start = length;
+        return SHELL_SOURCE_SCAN_INCOMPLETE;
+      }
+      scan->code_start = substitution_after;
       *start = position;
       *after = substitution_after;
       *kind = c == '<' ? SHELL_SOURCE_SUBST_PROCESS_INPUT
@@ -3590,6 +4166,7 @@ static inline SHELL_NONNULL(3, 4, 5, 6) shell_source_scan_status_t
         bool substring = scope->substring_scope;
         size_t operand_start = scope->word_start;
         scan->position++;
+        shell_source_report_word_code(input, scan, scan->position);
         *scope = scan->scopes[--scan->scope_count];
         if (substring) {
           *start = operand_start;
@@ -3607,10 +4184,13 @@ static inline SHELL_NONNULL(3, 4, 5, 6) shell_source_scan_status_t
           if (--scope->parentheses == 0) {
             size_t close =
                 shell_source_logical_following(input, length, position);
-            if (close >= length || input[close] != ')')
+            if (close >= length)
+              return SHELL_SOURCE_SCAN_INCOMPLETE;
+            if (input[close] != ')')
               return SHELL_SOURCE_SCAN_MALFORMED;
             size_t arithmetic_start = scope->expansion_start;
             scan->position = close + 1;
+            shell_source_report_word_code(input, scan, scan->position);
             *scope = scan->scopes[--scan->scope_count];
             if (--scan->arithmetic_depth == 0) {
               *start = arithmetic_start;
@@ -3628,6 +4208,7 @@ static inline SHELL_NONNULL(3, 4, 5, 6) shell_source_scan_status_t
           scope->parentheses++;
         if (c == ']' && --scope->parentheses == 0) {
           scan->position++;
+          shell_source_report_word_code(input, scan, scan->position);
           *scope = scan->scopes[--scan->scope_count];
           continue;
         }
@@ -3648,8 +4229,26 @@ static inline SHELL_NONNULL(3, 4, 5, 6) shell_source_scan_status_t
     }
     scan->position++;
   }
-  return scan->scope_count ? SHELL_SOURCE_SCAN_MALFORMED
+  return scan->scope_count ? SHELL_SOURCE_SCAN_INCOMPLETE
                            : SHELL_SOURCE_SCAN_DONE;
+}
+
+/* The observer also sees received code at unfinished arithmetic/quote EOF.
+ * An unfinished executable child is opaque to the parent just like a closed
+ * child. Its descriptor supplies the boundary's separate recursive domain.
+ * Initialize scope.data_domain for a literal heredoc root, independently of
+ * scope.heredoc's quote rules. Observer-free semantic consumers use the same
+ * expansion events and need no byte-domain traversal of their own. */
+static inline SHELL_NONNULL(3, 4, 5, 6) shell_source_scan_status_t
+    shell_source_next_word_expansion(const char *input, size_t length,
+                                     shell_source_substitution_scan_t *scan,
+                                     size_t *start, size_t *after,
+                                     shell_source_substitution_kind_t *kind) {
+  shell_source_scan_status_t status = shell_source_next_word_expansion_body(
+      input, length, scan, start, after, kind);
+  size_t end = status == SHELL_SOURCE_SCAN_INCOMPLETE ? length : scan->position;
+  shell_source_report_word_code(input, scan, end);
+  return status;
 }
 
 /* Compatibility adapter for consumers that need only executable command or
@@ -3914,39 +4513,112 @@ static inline bool shell_source_word_boundary(const char *input, size_t length,
   return position == target;
 }
 
-/* Bash's {name}>word descriptor allocator. The caller's forward lexical
- * cursor has established a word start and 0 <= start <= end in input.
- * Recognition removes physical continuations without copying; after is an
- * absolute source offset. Required pointers refer to valid storage. */
+typedef enum {
+  SHELL_SOURCE_FD_PREFIX_NONE,
+  SHELL_SOURCE_FD_PREFIX_CLOSED,
+  SHELL_SOURCE_FD_PREFIX_PENDING,
+  SHELL_SOURCE_FD_PREFIX_ESCAPE,
+} shell_source_fd_prefix_t;
+
+/* One forward recognition of Bash's {name} redirector. A known word start
+ * and start <= end are required. CLOSED supplies the offset after '}',
+ * PENDING reaches received EOF in an appendable name, and ESCAPE locates
+ * its final backslash which can still acquire LF. NONE is not a name prefix.
+ * Continuations are removed without copying; quotes/ordinary escapes are
+ * not identifier bytes. Complete consumers accept CLOSED only. */
+static SHELL_NONNULL(1, 4) inline shell_source_fd_prefix_t
+    shell_source_probe_named_fd_at_word_start(const char *input, size_t start,
+                                              size_t end, size_t *after) {
+  *after = start;
+  if (start == end || input[start] != '{')
+    return SHELL_SOURCE_FD_PREFIX_NONE;
+
+  size_t position = start + 1;
+  bool first = true;
+  for (;;) {
+    size_t next = shell_source_skip_escaped_line_endings(input, end, position);
+    SHELL_SOURCE_WORD_SCAN(next - position);
+    position = next;
+    if (position == end) {
+      *after = end;
+      return SHELL_SOURCE_FD_PREFIX_PENDING;
+    }
+    SHELL_SOURCE_WORD_SCAN(1);
+    unsigned char c = (unsigned char)input[position];
+    if (c == '\\' && position + 1 == end) {
+      *after = position;
+      return SHELL_SOURCE_FD_PREFIX_ESCAPE;
+    }
+    if (c == '}') {
+      if (first)
+        return SHELL_SOURCE_FD_PREFIX_NONE;
+      *after = position + 1;
+      return SHELL_SOURCE_FD_PREFIX_CLOSED;
+    }
+    if (first ? !(isalpha(c) || c == '_') : !(isalnum(c) || c == '_'))
+      return SHELL_SOURCE_FD_PREFIX_NONE;
+    first = false;
+    position++;
+  }
+}
+
+/* Complete {name} recognition, with the original no-match offset contract.
+ * Known word start, start <= end, and distinct required output storage. */
 static SHELL_NONNULL(
     1,
     4) inline bool shell_source_parse_named_fd_at_word_start(const char *input,
                                                              size_t start,
                                                              size_t end,
                                                              size_t *after) {
-  *after = start;
-  if (start == end || input[start] != '{')
-    return false;
+  size_t parsed;
+  bool complete =
+      shell_source_probe_named_fd_at_word_start(input, start, end, &parsed) ==
+      SHELL_SOURCE_FD_PREFIX_CLOSED;
+  *after = complete ? parsed : start;
+  return complete;
+}
 
-  size_t position = start + 1;
-  bool first = true;
-  while (position < end) {
-    position = shell_source_skip_escaped_line_endings(input, end, position);
-    if (position >= end)
-      return false;
-    unsigned char c = (unsigned char)input[position];
-    if (c == '}') {
-      if (first)
-        return false;
-      *after = position + 1;
-      return true;
+/* Received-tail projection at a nonempty known word start. Only PENDING or
+ * ESCAPE can be returned besides NONE; diagnostic receives the redirector's
+ * start or its final backslash respectively. Numeric bounds and identifier
+ * spelling are the same as complete redirect recognition. This is local
+ * lexical work, not a rescan of preceding source or a new public parse mode.
+ */
+static SHELL_NONNULL(1, 4) inline shell_source_fd_prefix_t
+    shell_source_pending_fd_prefix(const char *input, size_t start, size_t end,
+                                   size_t *diagnostic) {
+  size_t after;
+  if (input[start] == '{') {
+    shell_source_fd_prefix_t status =
+        shell_source_probe_named_fd_at_word_start(input, start, end, &after);
+    if (status == SHELL_SOURCE_FD_PREFIX_NONE)
+      return status;
+    if (status != SHELL_SOURCE_FD_PREFIX_CLOSED) {
+      *diagnostic = status == SHELL_SOURCE_FD_PREFIX_ESCAPE ? after : start;
+      return status;
     }
-    if (first ? !(isalpha(c) || c == '_') : !(isalnum(c) || c == '_'))
-      return false;
-    first = false;
-    position++;
+  } else {
+    if (!isdigit((unsigned char)input[start]))
+      return SHELL_SOURCE_FD_PREFIX_NONE;
+    uint32_t descriptor;
+    shell_source_io_number_t number =
+        shell_source_parse_io_number(input, start, end, &after, &descriptor);
+    SHELL_SOURCE_WORD_SCAN(after - start);
+    if (number != SHELL_SOURCE_IO_NUMBER_VALID)
+      return SHELL_SOURCE_FD_PREFIX_NONE;
   }
-  return false;
+  size_t next = shell_source_skip_escaped_line_endings(input, end, after);
+  SHELL_SOURCE_WORD_SCAN(next - after);
+  after = next;
+  if (after == end) {
+    *diagnostic = start;
+    return SHELL_SOURCE_FD_PREFIX_PENDING;
+  }
+  if (after + 1 == end && input[after] == '\\') {
+    *diagnostic = after;
+    return SHELL_SOURCE_FD_PREFIX_ESCAPE;
+  }
+  return SHELL_SOURCE_FD_PREFIX_NONE;
 }
 
 /* Arbitrary-position recognition boundary for consumers which have not yet
@@ -5375,6 +6047,16 @@ static inline SHELL_NONNULL(1, 2) shell_source_wrapper_step_t
   return SHELL_SOURCE_WRAPPER_STATIC_TARGET;
 }
 
+/* At a preframed duplication-operand start, recognize Bash's raw close token.
+ * Inline trivia/continuations have already been skipped. Quotes and escapes
+ * are word spelling, whereas the immediate '-' consumes just one byte even
+ * when another word follows without whitespace. position <= end. */
+static inline SHELL_NONNULL(1) size_t
+    shell_source_redirect_close_end(const char *input, size_t position,
+                                    size_t end) {
+  return position < end && input[position] == '-' ? position + 1 : position;
+}
+
 /* At a lexical word boundary, skip one complete redirection and its operand.
  * The calling redirect-list walk supplies the boundary. Return the original
  * position when it is not a valid redirect at that offset. This is shared by
@@ -5463,8 +6145,9 @@ static inline size_t shell_source_skip_redirect(const char *input,
      * `>&-file` as `>&-`, then parses `file` as the following command word.
      * Preserve that lexical boundary here. Quoted and escaped spellings still
      * take the normal whole-word path and are classified after decoding. */
-    if (cursor < end && input[cursor] == '-') {
-      cursor++;
+    size_t close_end = shell_source_redirect_close_end(input, cursor, end);
+    if (close_end != cursor) {
+      cursor = close_end;
     } else if (cursor < end && (input[cursor] == '<' || input[cursor] == '>')) {
       /* `>& >(consumer)` uses Bash's legacy combined-output spelling. Its
        * operand is still one process-substitution word, not a second redirect

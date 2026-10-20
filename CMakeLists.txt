@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(Shellclave VERSION 0.16.0 LANGUAGES C CXX)
+project(Shellclave VERSION 0.17.0 LANGUAGES C CXX)
 
 if(PROJECT_IS_TOP_LEVEL)
   set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -48,6 +48,7 @@ set(SHELLCLAVE_PUBLIC_HEADERS
   shellsplit/include/shell_netstring.h
   shellsplit/include/shell_processor.h
   shellsplit/include/shell_sequence.h
+  shellsplit/include/shell_source.h
   shellsplit/include/shell_tokenizer.h
   shellsplit/include/shell_tokenizer_full.h
   shellsplit/include/shell_transform.h
@@ -105,9 +106,11 @@ set(SHELLSPLIT_SOURCES
   shellsplit/src/shell_abstract.c
   shellsplit/src/shell_depgraph.c
   shellsplit/src/shell_expand.c
+  shellsplit/src/shell_heredoc.c
   shellsplit/src/shell_interop.c
   shellsplit/src/shell_netstring.c
   shellsplit/src/shell_processor.c
+  shellsplit/src/shell_source.c
   shellsplit/src/shell_tokenizer.c
   shellsplit/src/shell_tokenizer_full.c
   shellsplit/src/shell_transform.c)
@@ -356,6 +359,11 @@ if(BUILD_TESTING)
         -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/test_bash_word_semantics.cmake)
     set_tests_properties(shellsplit_bash_word_semantics PROPERTIES
       LABELS shellsplit)
+    add_test(NAME shellsplit_bash_source_semantics
+      COMMAND ${CMAKE_COMMAND}
+        -DSHELLCLAVE_BASH=${SHELLCLAVE_BASH_EXECUTABLE}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/test_bash_source_semantics.cmake)
+    set_tests_properties(shellsplit_bash_source_semantics PROPERTIES LABELS shellsplit)
     if(UNIX)
       add_test(NAME shellsplit_bash_readline_semantics
         COMMAND "${Python3_EXECUTABLE}"
@@ -400,6 +408,11 @@ if(BUILD_TESTING)
   shellclave_add_test(shellsplit_entropy_test shellsplit/tests/entropy_test.c shellsplit_test)
   shellclave_add_test(shellsplit_depgraph_test shellsplit/tests/test_depgraph.c shellsplit_test)
   shellclave_add_test(shellsplit_boundary_test shellsplit/tests/boundary_test.c shellsplit_test)
+  shellclave_add_test(shellsplit_source_test shellsplit/tests/source_test.c shellsplit_test)
+  target_compile_definitions(shellsplit_source_test PRIVATE SHELLSPLIT_TEST_SOURCE_SCANS SHELLSPLIT_TEST_ALLOCATOR)
+  target_include_directories(shellsplit_source_test PRIVATE shellsplit/tests)
+  shellclave_add_production_test(shellsplit_source_production_test shellsplit/tests/source_test.c shellsplit)
+  set_property(TEST shellsplit_source_test APPEND PROPERTY LABELS shellsplit)
   target_compile_definitions(shellsplit_boundary_test PRIVATE SHELLSPLIT_TEST_SOURCE_SCANS)
   target_include_directories(shellsplit_boundary_test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/shellsplit/tests)

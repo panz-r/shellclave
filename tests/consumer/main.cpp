@@ -1,4 +1,5 @@
 #include <shell_depgraph.h>
+#include <shell_source.h>
 #include <shell_tokenizer.h>
 #include <shellgate.h>
 #include <shelltype.h>
@@ -98,7 +99,7 @@ static bool check_depgraph_workspace_api() {
     ok = ok && stderr_to_stdout && shell_dep_graph_validate(&graph).valid;
   }
   if (ok) {
-    constexpr char directory[] = "cd /tmp; pwd";
+    constexpr char directory[] = "cd /tmp && pwd";
     ok = shell_dep_graph_parse(directory, sizeof(directory) - 1, "/", &limits,
                                &graph) == SHELL_DEP_OK &&
          shell_dep_graph_validate(&graph).valid;
@@ -129,6 +130,20 @@ static bool check_depgraph_workspace_api() {
              std::memcmp(graph.nodes[i].doc.path, "/dev/null", 9) == 0;
       }
     ok = ok && implicit == 1;
+  }
+  if (ok) {
+    constexpr char source[] = "echo before\ncat <<'EOF'\nalpha\n";
+    auto *draft = static_cast<shell_source_result_t *>(
+        std::malloc(sizeof(shell_source_result_t)));
+    ok = draft &&
+         shell_parse_draft(source, sizeof(source) - 1, NULL, draft) ==
+             SHELL_SOURCE_INCOMPLETE &&
+         draft->prefix_length == sizeof("echo before\n") - 1;
+    if (ok)
+      ok = shell_dep_graph_parse_with_fast(source, draft->prefix_length, "/",
+                                           &limits, &draft->prefix,
+                                           &graph) == SHELL_DEP_OK;
+    std::free(draft);
   }
   std::free(raw);
   return ok;

@@ -6,34 +6,10 @@
 
 #include "shell_expand_internal.h"
 
-/* Internal zero-copy consumer of an existing fast parse, not an independent
- * parse of cmd. With non-NULL `fast`, the caller must supply the unmodified
- * result of shell_parse_fast(cmd, cmd_len, ...) for exactly these source bytes
- * and length. Use strict_mode=true for semantic graph construction. A result
- * from another source, edited metadata, or changed source bytes is INVALID
- * API USE: this function does not reparse to detect or reconcile a mismatch.
- * Parser-produced errors and truncated results retain their error/partial
- * graph handling; they are not permission to fabricate descriptors.
- *
- * `cmd` is supplied separately only because the fixed-size parse result stores
- * zero-copy offsets, not a source pointer. The source must remain alive and
- * unchanged for the lifetime of the graph, which borrows token spans from it.
- * Graph construction copies `fast` into local mutable working metadata so it
- * can derive execution ranges without modifying the caller's result; the copy
- * is not an alias-safety mechanism. `fast`, when present, and `out` must be
- * distinct. NULL `fast` delegates to shell_dep_graph_parse(). Like that API,
- * this requires caller-owned resolver workspace in limits when effective
- * routes are resolved. */
-shell_dep_error_t shell_dep_graph_parse_with_fast(
-    const char *cmd, size_t cmd_len, const char *initial_cwd,
-    const shell_dep_limits_t *limits, const shell_parse_result_t *fast,
-    shell_dep_graph_t *out) SHELL_NONNULL(1, 6);
-
-/* Same source/parse/workspace contract; resolution is part of construction,
- * before effective setup outcomes and routes are committed. unresolved_paths
- * references SHELL_DEP_MAX_NODES writable bytes outside out and the graph
- * workspace. It must not overlap the resolver's returned value entries or
- * payload spans. It receives one boolean per retained graph node: an active
+/* The public supplied-fast parse contract also applies to this resolver path.
+ * unresolved_paths is distinct writable storage for SHELL_DEP_MAX_NODES bytes,
+ * outside the graph, workspace, resolver value entries and borrowed payloads.
+ * It receives one boolean per retained graph node: an active
  * pathname expansion owned by that CMD/GROUP remained unresolved.
  * Nested pathname expansions retain their semantic owner even when a resolved
  * containing word or failed open removes the final byte-flow edge. Child joins

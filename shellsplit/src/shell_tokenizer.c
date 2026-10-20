@@ -129,30 +129,17 @@ static SHELL_NONNULL(1, 3, 5) bool collect_heredoc_body_spans(
     position = shell_source_next_line(cmd, length, position);
     for (uint32_t h = 0; h < pending_count; h++) {
       size_t body_start = position;
-      bool found = false;
-      while (position <= length) {
-        size_t line_start = position;
-        if (shell_source_line_is_heredoc_delimiter(cmd, length, line_start,
-                                                   &pending[h])) {
-          position = shell_source_next_line(cmd, length, line_start);
-          if (*span_count == capacity)
-            return false;
-          heredoc_body_span_t *span = &spans[(*span_count)++];
-          *span =
-              (heredoc_body_span_t){(uint32_t)body_start, (uint32_t)position,
-                                    (uint32_t)pending_positions[h], 0};
-          if (!shell_source_heredoc_delimiter_is_quoted(&pending[h]))
-            detect_expansion_features(cmd + body_start, line_start - body_start,
-                                      false, false, &span->features, true);
-          found = true;
-          break;
-        }
-        if (position == length)
-          break;
-        position = shell_source_next_line(cmd, length, line_start);
-      }
-      if (!found)
+      shell_source_heredoc_frame_t frame =
+          shell_source_frame_heredoc(cmd, length, body_start, &pending[h]);
+      if (!frame.complete || *span_count == capacity)
         return false;
+      position = frame.after;
+      heredoc_body_span_t *span = &spans[(*span_count)++];
+      *span = (heredoc_body_span_t){(uint32_t)body_start, (uint32_t)position,
+                                    (uint32_t)pending_positions[h], 0};
+      if (!shell_source_heredoc_delimiter_is_quoted(&pending[h]))
+        detect_expansion_features(cmd + body_start, frame.body_end - body_start,
+                                  false, false, &span->features, true);
     }
   }
   return true;
@@ -268,7 +255,7 @@ static SHELL_NONNULL(1, 2) bool fast_array_context_init(
       .command_start = true,
       .prefix_open = true,
   };
-  return shell_tokenizer_init(&context->state, input, length);
+  return shell_tokenizer_init(&context->state, input, length, NULL);
 }
 
 static SHELL_NONNULL(1) bool fast_array_context_next(
@@ -2770,8 +2757,17 @@ shell_error_t shell_parse_fast(const char *cmd, size_t cmd_len,
                                const shell_limits_t *limits,
                                shell_parse_result_t *result) {
   shell_source_operation_begin(cmd, cmd_len);
+  shell_source_workspace_scope_t previous = shell_source_workspace_begin(
+      cmd, cmd_len, limits ? limits->workspace : NULL,
+      limits ? limits->workspace_size : 0);
   shell_error_t error =
       shell_parse_fast_impl(cmd, cmd_len, limits, result, false);
+  if (shell_source_scratch_exhausted()) {
+    memset(result, 0, sizeof(*result));
+    result->status = SHELL_STATUS_TRUNCATED;
+    error = SHELL_ETRUNC;
+  }
+  shell_source_workspace_end(previous);
   shell_source_operation_end();
   return error;
 }

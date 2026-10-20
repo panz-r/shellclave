@@ -431,11 +431,11 @@ overflow:
   return SHELL_TRANSFORM_EOVERFLOW;
 }
 
-shell_transform_status_t
-shell_transform_command_line(const char *command_line, size_t command_length,
-                             const shell_transform_limits_t *limits,
-                             shell_transformed_command_t ***transformed_cmds,
-                             size_t *transformed_count) {
+static SHELL_NONNULL(1, 4, 5) shell_transform_status_t
+    transform_command_line(const char *command_line, size_t command_length,
+                           const shell_transform_limits_t *limits,
+                           shell_transformed_command_t ***transformed_cmds,
+                           size_t *transformed_count) {
   *transformed_cmds = NULL;
   *transformed_count = 0;
 
@@ -511,6 +511,22 @@ shell_transform_command_line(const char *command_line, size_t command_length,
   *transformed_count = success_count;
   shell_commands_free(cmds, cmd_count);
   return SHELL_TRANSFORM_OK;
+}
+
+shell_transform_status_t
+shell_transform_command_line(const char *command_line, size_t command_length,
+                             const shell_transform_limits_t *limits,
+                             shell_transformed_command_t ***transformed_cmds,
+                             size_t *transformed_count) {
+  *transformed_cmds = NULL;
+  *transformed_count = 0;
+  if (!shell_source_operation_begin_owned(command_line, command_length))
+    return SHELL_TRANSFORM_ENOMEM;
+  shell_transform_status_t status =
+      transform_command_line(command_line, command_length, limits,
+                             transformed_cmds, transformed_count);
+  shell_source_operation_end();
+  return status;
 }
 
 void shell_transformed_command_list_free(shell_transformed_command_t **commands,

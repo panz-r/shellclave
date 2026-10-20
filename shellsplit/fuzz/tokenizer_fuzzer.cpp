@@ -42,6 +42,7 @@ extern "C" {
 #include "../src/shell_depgraph_internal.h"
 #include "../src/shell_source_internal.h"
 #include "../src/shell_tokenizer_full_internal.h"
+#include "shell_source.h"
 
 static const size_t MAX_INPUT_SIZE = 8192;
 static int g_verbose = 0;
@@ -387,6 +388,10 @@ static shell_dep_error_t fuzz_dep_graph_parse(const char *cmd, size_t cmd_len,
 #define shell_dep_graph_parse fuzz_dep_graph_parse
 
 static void run_fixed_oracles();
+static int test_draft_closed_children(uint8_t selector, uint8_t value);
+static int test_draft_redirect_operand(uint8_t selector, uint8_t value);
+static int test_draft_redirector_prefix(uint8_t selector, uint8_t value);
+static int test_draft_nested_redirect(uint8_t selector, uint8_t value);
 
 extern "C" int LLVMFuzzerInitialize(int *argc, char ***argv) {
   (void)argc;
@@ -532,9 +537,9 @@ static int validate_fast_result(const char *input, size_t length,
 static int test_fast_parser(const char *input, size_t length) {
   static const shell_limits_t limits[] = {
       SHELL_LIMITS_DEFAULT,
-      {SHELL_MAX_SUBCOMMANDS, true},
-      {1, false},
-      {1, true},
+      {SHELL_MAX_SUBCOMMANDS, true, nullptr, 0},
+      {1, false, nullptr, 0},
+      {1, true, nullptr, 0},
   };
 
   for (size_t i = 0; i < sizeof(limits) / sizeof(limits[0]); i++) {
@@ -561,7 +566,7 @@ static int fixed_oracle_failure(int line) {
 static int test_supported_document(const std::string &source, size_t commands,
                                    bool named) {
   shell_parse_result_t parsed = {};
-  shell_limits_t limits = {SHELL_MAX_SUBCOMMANDS, true};
+  shell_limits_t limits = {SHELL_MAX_SUBCOMMANDS, true, nullptr, 0};
   shell_processed_commands_t processed = {};
   shell_netstring_buffer_t sequence = {}, raw = {}, typed = {};
   size_t count = 0, anomaly_count = 0;
@@ -1147,9 +1152,9 @@ static int test_fixed_oracles(void) {
       {"( : | cd /tmp; printf x >out )", "/workspace/out"},
       {"cd /tmp <<<body | :; printf x >out", "/workspace/out"},
       {"time cd /tmp <<<body | :; printf x >out", "/workspace/out"},
-      {"{ cd /tmp; printf x >out; } &", "/tmp/out"},
+      {"{ cd /tmp; printf x >out; } &", nullptr},
       {"( : | cd /tmp; echo \"$(<out)\" )", "/workspace/out"},
-      {"cd /tmp; echo \"$(<out)\"", "/tmp/out"},
+      {"cd /tmp; echo \"$(<out)\"", nullptr},
       {"cd \"$value\"; echo \"$(<out)\"", nullptr},
   };
   shell_dep_limits_t limits = SHELL_DEP_LIMITS_DEFAULT;
@@ -1240,7 +1245,7 @@ static int test_fixed_oracles(void) {
         return fixed_oracle_failure(__LINE__);
       for (uint32_t capacity : {uint32_t(1), uint32_t(SHELL_MAX_SUBCOMMANDS)}) {
         shell_parse_result_t fast = {};
-        shell_limits_t limits = {capacity, true};
+        shell_limits_t limits = {capacity, true, nullptr, 0};
         if (shell_parse_fast(source, length, &limits, &fast) != SHELL_EPARSE ||
             fast.count || fast.group_count || fast.status != SHELL_STATUS_ERROR)
           return fixed_oracle_failure(__LINE__);
@@ -1310,6 +1315,16 @@ static int test_fixed_oracles(void) {
   };
   for (const char *source : iterator_document_lists)
     if (test_tokenizer_state(source, strlen(source)))
+      return fixed_oracle_failure(__LINE__);
+  /* Diagnostic function-like headers can leave an ordinary word in the
+   * current flat record before an empty body/group. A later opener must not
+   * erase that word's pending newline. No function semantics are accepted. */
+  static const char *const empty_function_diagnostics[] = {
+      "foo() { }\n", "foo() {\n}\n", "foo() ( )\n", "foo() { { }; }\n",
+      "foo() {\n:; }\n"};
+  for (const char *source : empty_function_diagnostics)
+    if (test_tokenizer_state(source, strlen(source)) ||
+        !tokenizer_unsupported_semantics_rejected(source, strlen(source)))
       return fixed_oracle_failure(__LINE__);
   static const char *const bang_context_cases[] = {
       "printf '%s' !\n",      "printf '%s' ! !\n", "printf '%s' ! | cat\n",
@@ -1391,6 +1406,8 @@ static int test_fixed_oracles(void) {
       "echo before; case value in value) : ;; esac; echo after | cat",
       "echo before; items=(one); echo after | cat",
       "echo before; eval echo hidden; echo after | cat",
+      "echo before; foo() { }\necho after | cat",
+      "echo before; foo() {\n:; }\necho after | cat",
       ("echo before; for ((i=0; i<3; i++)); do echo inside; done; echo after | "
        "cat"),
   };
@@ -1440,7 +1457,7 @@ static int test_fixed_oracles(void) {
   for (const char *source : unsupported_loss_cases) {
     size_t length = strlen(source);
     shell_tokenizer_state_t state = {};
-    shell_tokenizer_init(&state, source, length);
+    shell_tokenizer_init(&state, source, length, NULL);
     std::vector<shell_token_t> lexical;
     shell_token_t token = {};
     while (shell_tokenizer_next(&state, &token))
@@ -3148,7 +3165,7 @@ static int test_fixed_oracles(void) {
     shell_parse_result_t fast = {};
     shell_dep_graph_t graph = {};
     shell_dep_limits_t limits;
-    const shell_limits_t strict = {SHELL_MAX_SUBCOMMANDS, true};
+    const shell_limits_t strict = {SHELL_MAX_SUBCOMMANDS, true, nullptr, 0};
     if (shell_parse_fast(source, strlen(source), &strict, &fast) != SHELL_OK ||
         !fuzz_dep_limits(nullptr, &limits))
       return fixed_oracle_failure(__LINE__);
@@ -3855,6 +3872,7 @@ static int test_fixed_oracles(void) {
       "> <(cat)while echo ok",
       "> prefix<(cat)while echo ok",
       "> <(cat)foo time echo ok",
+      "> <(cat)foo [[ x ]]",
   };
   for (const char *input : redirect_boundaries) {
     shell_netstring_buffer_t sequence = {};
@@ -3871,7 +3889,6 @@ static int test_fixed_oracles(void) {
   }
   static const char *const redirect_followed_by_unsupported[] = {
       "> <(cat)foo declare -a values",
-      "> <(cat)foo [[ x ]]",
       "> <(cat)foo while true; do :; done",
   };
   for (const char *input : redirect_followed_by_unsupported) {
@@ -5178,7 +5195,7 @@ static int test_depgraph(const char *input, size_t length, const char *cwd) {
     if (i == 0) {
       /* The supplied path consumes the same strict parse as the public path.
        * Compare real results, not arbitrary source/metadata combinations. */
-      const shell_limits_t strict = {SHELL_MAX_SUBCOMMANDS, true};
+      const shell_limits_t strict = {SHELL_MAX_SUBCOMMANDS, true, nullptr, 0};
       shell_parse_result_t fast = {};
       shell_error_t fast_error =
           shell_parse_fast(input, length, &strict, &fast);
@@ -5343,13 +5360,14 @@ static bool tokenizer_token_is_line_continuation(const shell_token_t &token) {
 
 static int test_tokenizer_state(const char *input, size_t length) {
   shell_tokenizer_state_t state = {};
-  shell_tokenizer_init(&state, input, length);
+  shell_tokenizer_init(&state, input, length, NULL);
   bool unsupported = shell_tokenizer_has_unsupported_semantics(input, length);
 
   size_t steps = 0;
   size_t previous_end = 0;
   std::vector<shell_token_t> iterated;
   bool expect_command = true;
+  size_t stage_token = 0;
   bool document_only = true;
   bool has_heredoc = false;
   bool terminated = false;
@@ -5379,6 +5397,7 @@ static int test_tokenizer_state(const char *input, size_t length) {
     if (has_heredoc && document_only && tokenizer_token_is_newline(token)) {
       has_heredoc = false;
       expect_command = true;
+      stage_token = iterated.size();
       previous_end = token.position + token.length;
       continue;
     }
@@ -5393,8 +5412,20 @@ static int test_tokenizer_state(const char *input, size_t length) {
        * pathname is diagnostic input and must not hide the retained newline
        * that terminates the preceding record. Capture the lexical state
        * before advancing because the iterator updates it for the opener. */
-      if (group_command_position) {
+      tokenizer_structural_prefix_span prefix = {};
+      bool modifier_only = group_command_position && !expect_command &&
+                           stage_token < iterated.size() &&
+                           tokenizer_structural_prefix_starts_at(
+                               input, length, iterated[stage_token], &prefix) &&
+                           prefix.end == token.position;
+      /* The allocating API flattens group punctuation without discarding an
+       * ordinary diagnostic word already in this stage (for example foo in
+       * `foo() { }`). Only a proved compound-owned modifier prefix starts a
+       * fresh empty inner record here. Track its first token directly, not by
+       * rescanning all preceding lexical tokens at each opener. */
+      if (group_command_position && (expect_command || modifier_only)) {
         expect_command = true;
+        stage_token = iterated.size();
         document_only = true;
         has_heredoc = false;
       }
@@ -5408,6 +5439,7 @@ static int test_tokenizer_state(const char *input, size_t length) {
         expect_command = false;
       if (tokenizer_token_is_list_operator(token)) {
         expect_command = true;
+        stage_token = iterated.size();
         document_only = true;
         has_heredoc = false;
       } else {
@@ -6108,7 +6140,7 @@ static int test_generated_brace_case(const uint8_t *data, size_t size,
   shell_parse_result_t fast = {};
   shell_error_t fast_error =
       shell_parse_fast(item.command.data(), item.command.size(), NULL, &fast);
-  shell_limits_t strict_limits = {SHELL_MAX_SUBCOMMANDS, true};
+  shell_limits_t strict_limits = {SHELL_MAX_SUBCOMMANDS, true, nullptr, 0};
   shell_parse_result_t strict_fast = {};
   shell_error_t strict_error = shell_parse_fast(
       item.command.data(), item.command.size(), &strict_limits, &strict_fast);
@@ -6936,6 +6968,30 @@ static void fixed_oracle_phase(const char *name) {
 
 /* Fixed sweeps belong to startup, not one fuzz input's timeout budget. */
 static void run_fixed_oracles() {
+  for (uint8_t selector = 0; selector < 12; selector++)
+    for (uint8_t operand = 0; operand < 3; operand++)
+      if (test_draft_nested_redirect(selector, operand)) {
+        fprintf(stderr, "nested draft redirect oracle failed: %u, %u\n",
+                selector, operand);
+        abort();
+      }
+  for (uint8_t selector = 0; selector < 16; selector++)
+    for (uint8_t value = 0; value < 24; value++)
+      if (test_draft_redirector_prefix(selector, value)) {
+        fprintf(stderr, "pending redirector oracle failed: %u, %u\n", selector,
+                value);
+        abort();
+      }
+  for (uint8_t selector = 0; selector < 18; selector++)
+    for (uint8_t ending = 0; ending < 10; ending++)
+      if (test_draft_redirect_operand(selector, ending)) {
+        fprintf(stderr, "missing redirect operand oracle failed: %u, %u\n",
+                selector, ending);
+        abort();
+      }
+  for (uint8_t selector = 0; selector < 18; selector++)
+    if (test_draft_closed_children(selector, selector))
+      abort();
   fixed_oracle_phase("read outcomes");
   /* These sequential sweeps never need two retained graphs simultaneously.
    * Reuse one heap-owned result so adding a fixture family cannot enlarge
@@ -8061,7 +8117,7 @@ static void run_fixed_oracles() {
     }
   }
   for (const auto &fixture : shellsplit_test_tilde_cwd) {
-    std::string source = std::string("cd ") + fixture.word + "; pwd >out";
+    std::string source = std::string("cd ") + fixture.word + " && pwd >out";
     bool valid =
         shell_dep_graph_parse(source.data(), source.size(), "/workspace",
                               nullptr, &graph) == SHELL_DEP_OK &&
@@ -8199,6 +8255,591 @@ static void run_fixed_oracles() {
   fixed_oracle_phase("complete");
 }
 
+static int test_draft_source(const char *source, size_t length) {
+  auto *draft = static_cast<shell_source_result_t *>(
+      malloc(sizeof(shell_source_result_t)));
+  if (!draft)
+    return 0;
+  shell_source_status_t status = shell_parse_draft(source, length, NULL, draft);
+  bool valid = draft->prefix_length <= length && draft->tail_start <= length;
+  if (status == SHELL_SOURCE_INVALID || status == SHELL_SOURCE_TRUNCATED)
+    valid &= draft->prefix_length == 0 && draft->prefix.count == 0;
+  else {
+    valid &= status != SHELL_SOURCE_COMPLETE || draft->prefix_length == length;
+    if (draft->prefix_length) {
+      shell_parse_result_t strict = {};
+      shell_limits_t limits = SHELL_LIMITS_DEFAULT;
+      limits.strict_mode = true;
+      valid &= shell_parse_fast(source, draft->prefix_length, &limits,
+                                &strict) == SHELL_OK;
+      valid &= !memcmp(&strict, &draft->prefix, sizeof(strict));
+    }
+    for (uint32_t h = 0; h < draft->header_count; h++) {
+      const auto &header = draft->headers[h];
+      valid &= header.source.start <= length &&
+               header.source.length <= length - header.source.start;
+      uint32_t redirect = header.first_redirect;
+      for (uint32_t r = 0; r < header.redirect_count; r++) {
+        if (redirect >= draft->redirect_count) {
+          valid = false;
+          break;
+        }
+        valid &= draft->redirects[redirect].header == h;
+        redirect = draft->redirects[redirect].next;
+      }
+      valid &= redirect == UINT32_MAX;
+      for (uint32_t w = 0; w < header.word_count; w++)
+        valid &= header.words[w].start <= length &&
+                 header.words[w].length <= length - header.words[w].start;
+    }
+    for (uint32_t d = 0; d < draft->heredoc_count; d++) {
+      const auto &doc = draft->heredocs[d];
+      valid &= doc.header < draft->header_count &&
+               doc.confirmed_length <= doc.content.value_len;
+      valid &= !doc.complete || (doc.body_started && doc.header_complete);
+      if (doc.redirect != UINT32_MAX)
+        valid &= doc.redirect < draft->redirect_count &&
+                 draft->redirects[doc.redirect].heredoc == d;
+    }
+  }
+  free(draft);
+  return !valid;
+}
+
+/* Missing words stay in list grammar; actual word fragments use expansion
+ * recovery. Independently prescribed separators must invalidate the whole
+ * draft rather than hiding behind an invented unfinished substitution. */
+static int test_draft_redirect_operand(uint8_t selector, uint8_t value) {
+  static const char prefix[] = "echo before; ";
+  static const char *const commands[] = {"cat ", "{ :; } ", "( : ) "};
+  static const char *const redirects[] = {">&",  "<&",     "2>&",
+                                          "0<&", "{fd}>&", "{fd}<&"};
+  static const char *const trivia[] = {"", " ", "\t", "\\\n", " \t\\\n "};
+  static const char *const invalid[] = {
+      "\n", ";",   " #comment", " && cat", " | cat",
+      " )", " < ", " > ",       " <\\\n ", " >\\\n "};
+  const char *command = commands[selector % 3];
+  std::string source =
+      std::string(prefix) + command + redirects[selector / 3 % 6];
+  auto *draft = static_cast<shell_source_result_t *>(
+      malloc(sizeof(shell_source_result_t)));
+  if (!draft)
+    return 0;
+  std::string pending = source + trivia[value % 5];
+  bool valid = shell_parse_draft(pending.data(), pending.size(), nullptr,
+                                 draft) == SHELL_SOURCE_INCOMPLETE;
+  valid &= draft->need == SHELL_SOURCE_NEEDS_REDIRECT &&
+           draft->incomplete_at == strlen(prefix) + strlen(command) &&
+           draft->prefix_length == sizeof("echo before;") - 1 &&
+           draft->tail_start == draft->prefix_length &&
+           draft->header_count >= 2 && draft->headers[0].complete &&
+           !draft->headers[1].complete;
+  std::string completed = pending + " \"$(printf 1)\"";
+  valid &= shell_parse_draft(completed.data(), completed.size(), nullptr,
+                             draft) == SHELL_SOURCE_COMPLETE;
+  valid &=
+      draft->prefix_length == completed.size() && draft->headers[1].complete;
+  std::string rejected = source + invalid[value % 10];
+  valid &= shell_parse_draft(rejected.data(), rejected.size(), nullptr,
+                             draft) == SHELL_SOURCE_INVALID;
+  valid &= !draft->prefix_length && !draft->prefix.count && !draft->tail_start;
+  for (uint32_t h = 0; h < draft->header_count; h++)
+    valid &= !draft->headers[h].complete;
+  std::string process = source + ((value & 1) ? " <\\" : " >");
+  valid &= shell_parse_draft(process.data(), process.size(), nullptr, draft) ==
+           SHELL_SOURCE_INCOMPLETE;
+  valid &= draft->need == ((value & 1) ? SHELL_SOURCE_NEEDS_ESCAPE
+                                       : SHELL_SOURCE_NEEDS_SUBSTITUTION) &&
+           draft->incomplete_at == source.size() + ((value & 1) ? 2 : 1) &&
+           draft->prefix_length == sizeof("echo before;") - 1;
+  if (value & 1) {
+    process += '\n';
+    valid &= shell_parse_draft(process.data(), process.size(), nullptr,
+                               draft) == SHELL_SOURCE_INCOMPLETE;
+    valid &= draft->need == SHELL_SOURCE_NEEDS_SUBSTITUTION &&
+             draft->incomplete_at == source.size() + 1;
+  }
+  process += "(cat)";
+  valid &= shell_parse_draft(process.data(), process.size(), nullptr, draft) ==
+           SHELL_SOURCE_COMPLETE;
+  free(draft);
+  return !valid;
+}
+
+/* Received EOF may still turn a compound-tail number or identifier into a
+ * redirector. It must not invent an ordinary word, child group, or redirect;
+ * a closed substitution instead commits its final word and must reject it. */
+static int test_draft_redirector_prefix(uint8_t selector, uint8_t value) {
+  static const char prefix[] = "echo before; ";
+  static const char *const compounds[] = {"{ :; } ", "( : ) ", "time { :; } ",
+                                          "{ :; } >existing ",
+                                          "( : ) >existing "};
+  static const struct {
+    const char *received, *completion;
+    bool escape;
+  } cases[] = {
+      {"2", ">out", false},          {"0002", ">out", false},
+      {"2147483647", ">out", false}, {"{", "fd}>out", false},
+      {"{f", "d}>out", false},       {"{fd", "}>out", false},
+      {"{fd}", ">out", false},       {"{_x9}", ">out", false},
+      {"00\\\n02", ">out", false},   {"{f\\\nd}", ">out", false},
+      {"{fd}\\\n", ">out", false},   {"{\\\n", "fd}>out", false},
+      {"2\\", "\n>out", true},       {"{\\", "\nfd}>out", true},
+      {"{fd\\", "\n}>out", true},    {"{fd}\\", "\n>out", true},
+  };
+  static const char *const invalid[] = {
+      "2 ",         "2\n",        "2;",
+      "2 #comment", "2147483648", "99999999999999999999999999999999999",
+      "'2'",        "\\2",        "{9",
+      "{}",         "{fd-x",      "{fd}x",
+      "{fd} ",      "{fd}\\ ",    "{fd}\\\\",
+      "{ ",         "'",          "\"",
+      "`",          "$(",         "${",
+      "{fd}'",      "{f'",        "2\""};
+  const auto &fixture = cases[selector % 16];
+  const char *compound = compounds[value % 5];
+  auto *draft = static_cast<shell_source_result_t *>(
+      malloc(sizeof(shell_source_result_t)));
+  if (!draft)
+    return 0;
+  std::string source = std::string(prefix) + compound;
+  bool valid = shell_parse_draft(source.data(), source.size(), nullptr,
+                                 draft) == SHELL_SOURCE_COMPLETE;
+  valid &= draft->header_count == 3 && draft->headers[2].complete;
+  shell_source_header_t child = draft->headers[2];
+  uint32_t redirects = draft->redirect_count;
+  shell_source_redirect_t existing = {};
+  if (redirects)
+    existing = draft->redirects[0];
+  size_t start = source.size();
+  source += fixture.received;
+  valid &= shell_parse_draft(source.data(), source.size(), nullptr, draft) ==
+           SHELL_SOURCE_INCOMPLETE;
+  valid &=
+      draft->need == (fixture.escape ? SHELL_SOURCE_NEEDS_ESCAPE
+                                     : SHELL_SOURCE_NEEDS_REDIRECT) &&
+      draft->incomplete_at == (fixture.escape ? source.size() - 1 : start) &&
+      draft->prefix_length == sizeof("echo before;") - 1 &&
+      draft->tail_start == draft->prefix_length && draft->header_count == 3 &&
+      draft->headers[0].complete && !draft->headers[1].complete &&
+      draft->headers[1].compound && !draft->headers[1].word_count &&
+      !draft->headers[1].assignment_count &&
+      draft->headers[1].source.start + draft->headers[1].source.length ==
+          source.size() &&
+      !memcmp(&child, &draft->headers[2], sizeof(child)) &&
+      draft->redirect_count == redirects;
+  if (redirects)
+    valid &= !memcmp(&existing, &draft->redirects[0], sizeof(existing));
+  source += fixture.completion;
+  valid &= shell_parse_draft(source.data(), source.size(), nullptr, draft) ==
+           SHELL_SOURCE_COMPLETE;
+  valid &= draft->headers[1].complete && !draft->headers[1].word_count &&
+           draft->redirect_count == redirects + 1 &&
+           !memcmp(&child, &draft->headers[2], sizeof(child));
+  source = std::string(prefix) + "echo $( " + compound + fixture.received +
+           (fixture.escape ? "\n)" : ")");
+  valid &= shell_parse_draft(source.data(), source.size(), nullptr, draft) ==
+           SHELL_SOURCE_INVALID;
+  valid &= !draft->prefix_length && !draft->prefix.count && !draft->tail_start;
+  source = std::string(prefix) + compound + invalid[value % 24];
+  valid &= shell_parse_draft(source.data(), source.size(), nullptr, draft) ==
+           SHELL_SOURCE_INVALID;
+  valid &= !draft->prefix_length && !draft->prefix.count && !draft->tail_start;
+  source = std::string(prefix) + "{ " + compound + fixture.received;
+  valid &= shell_parse_draft(source.data(), source.size(), nullptr, draft) ==
+           SHELL_SOURCE_INCOMPLETE;
+  valid &= draft->header_count == 4 && !draft->headers[1].complete &&
+           !draft->headers[2].complete && !draft->headers[2].word_count &&
+           draft->headers[3].complete &&
+           draft->prefix_length == sizeof("echo before;") - 1;
+  child = draft->headers[3];
+  source += std::string(fixture.completion) + "; }";
+  valid &= shell_parse_draft(source.data(), source.size(), nullptr, draft) ==
+           SHELL_SOURCE_COMPLETE;
+  valid &= draft->header_count == 4 && draft->headers[1].complete &&
+           draft->headers[2].complete && !draft->headers[2].word_count &&
+           !memcmp(&child, &draft->headers[3], sizeof(child));
+  source = (value & 1) ? "echo 2" : "echo {fd}";
+  valid &= shell_parse_draft(source.data(), source.size(), nullptr, draft) ==
+           SHELL_SOURCE_COMPLETE;
+  valid &= draft->header_count == 1 && draft->headers[0].word_count == 2;
+  source = std::string(prefix) + "{";
+  valid &= shell_parse_draft(source.data(), source.size(), nullptr, draft) ==
+           SHELL_SOURCE_INCOMPLETE;
+  valid &= draft->need == SHELL_SOURCE_NEEDS_GROUP;
+  free(draft);
+  return !valid;
+}
+
+/* Each received body needs its own unfinished-word facts, even while its
+ * enclosing substitution owns the root diagnostic and qualified boundary. */
+static int test_draft_nested_redirect(uint8_t selector, uint8_t value) {
+  static const char prefix[] = "echo before; ";
+  static const char *const heads[] = {"echo $( ", "cat <( ", "cat >( ",
+                                      "echo `"};
+  static const char *const closes[] = {")", ")", ")", "`"};
+  static const char *const commands[] = {"cat 2>existing", "{ :; } 2>existing",
+                                         "( : ) 2>existing"};
+  static const char *const operands[] = {" > <(printf ", " > >(printf ",
+                                         " >`printf "};
+  static const char *const ends[] = {")", ")", "`"};
+  unsigned outer = selector % 4, command = selector / 4 % 3,
+           operand = value % 3;
+  if (outer == 3 && operand == 2)
+    operand = 0; /* Escaped nested backticks are outside supported source. */
+  std::string source = std::string(prefix) + heads[outer] + commands[command] +
+                       operands[operand] + std::to_string(value);
+  auto *draft = static_cast<shell_source_result_t *>(
+      malloc(sizeof(shell_source_result_t)));
+  if (!draft)
+    return 0;
+  uint32_t headers = command == 0 ? 4 : 5;
+  bool valid = shell_parse_draft(source.data(), source.size(), nullptr,
+                                 draft) == SHELL_SOURCE_INCOMPLETE;
+  size_t opening = source.find(outer == 3 ? '`' : '(');
+  valid &= draft->need == SHELL_SOURCE_NEEDS_SUBSTITUTION &&
+           draft->incomplete_at == (outer == 3 ? opening : opening - 1) &&
+           draft->prefix_length == sizeof("echo before;") - 1 &&
+           draft->tail_start == draft->prefix_length &&
+           draft->header_count == headers && draft->headers[0].complete &&
+           !draft->headers[1].complete && !draft->headers[2].complete &&
+           draft->redirect_count == (operand == 2 ? 2u : 1u) &&
+           draft->redirects[0].header == 2;
+  shell_source_header_t leaf = draft->headers[headers - 1];
+  shell_source_header_t closed = draft->headers[3];
+  shell_group_io_op_t existing = draft->redirects[0].io;
+  valid &= leaf.complete && leaf.word_count == 2;
+  source += std::string(ends[operand]) + closes[outer];
+  valid &= shell_parse_draft(source.data(), source.size(), nullptr, draft) ==
+           SHELL_SOURCE_COMPLETE;
+  valid &= draft->header_count == headers && draft->redirect_count == 2 &&
+           !memcmp(&leaf, &draft->headers[headers - 1], sizeof(leaf)) &&
+           !memcmp(&existing, &draft->redirects[0].io, sizeof(existing));
+  if (command != 0)
+    valid &= !memcmp(&closed, &draft->headers[3], sizeof(closed));
+  source = std::string(prefix) + heads[outer] + commands[command] +
+           " > <(echo &&) tail";
+  valid &= shell_parse_draft(source.data(), source.size(), nullptr, draft) ==
+           SHELL_SOURCE_INVALID;
+  valid &= !draft->prefix_length && !draft->prefix.count && !draft->tail_start;
+  if (command != 0) {
+    source =
+        std::string(prefix) + heads[outer] + commands[command] + " ordinary'";
+    valid &= shell_parse_draft(source.data(), source.size(), nullptr, draft) ==
+             SHELL_SOURCE_INVALID;
+    valid &=
+        !draft->prefix_length && !draft->prefix.count && !draft->tail_start;
+  }
+  free(draft);
+  return !valid;
+}
+
+/* Completing only a suffix preserves earlier children in confirmed code.
+ * Tentative delimiter lines instead contribute no children until they become
+ * body data. Derive known syntax from fuzz bytes, including selector EOFs. */
+static int test_draft_closed_children(uint8_t selector, uint8_t value) {
+  std::string token = std::to_string(value);
+  std::string child = "$(printf " + token + ")";
+  std::string word, completion;
+  std::string payload;
+  unsigned children = 1;
+  bool document = false;
+  switch (selector % 18) {
+  case 0:
+    word = "echo \"" + child + " tail";
+    completion = "\"";
+    break;
+  case 1:
+    word = "echo " + child + "\\";
+    completion = "x";
+    break;
+  case 2:
+    word = "cat >\"" + child + " tail";
+    completion = "\"";
+    break;
+  case 3:
+    word = "cat <(printf " + token + ")'tail";
+    completion = "'";
+    break;
+  case 4:
+    word = "echo \"`printf " + token + "` tail";
+    completion = "\"";
+    break;
+  case 5:
+    word = "echo \"${value:-" + child + "} tail";
+    completion = "\"";
+    break;
+  case 6:
+    word = "echo \"$(( " + child + " + 1 )) tail";
+    completion = "\"";
+    break;
+  case 7:
+    word = "echo \"$(cat <<'DRAFT_CHILD'\n" + token + "\nDRAFT_CHILD\n) tail";
+    completion = "\"";
+    document = true;
+    payload = token + "\n";
+    break;
+  case 8:
+    word = "echo " + child + "$(printf " + token;
+    completion = ")";
+    children = 2;
+    break;
+  case 9:
+    word = "echo `printf " + token;
+    completion = "`";
+    break;
+  case 10:
+    word = "cat >`printf " + token;
+    completion = "`";
+    break;
+  case 11:
+    word = "echo ${value:-`printf " + token;
+    completion = "`}";
+    break;
+  case 12:
+    word = "echo `echo " + child;
+    completion = "`";
+    children = 2;
+    break;
+  case 13:
+    word = "echo \"`cat <<'DRAFT_CHILD'\n" + token + "\nDRAFT_CHILD\n";
+    completion = "`\"";
+    document = true;
+    payload = token + "\n";
+    break;
+  case 16:
+    word = "cat 2>&\"" + child + " tail";
+    completion = "\"";
+    break;
+  case 17:
+    word = "cat <&\"" + child + " tail";
+    completion = "\"";
+    break;
+  default:
+    payload = selector % 16 == 14 ? "日本 $((" + token + " + 1)) 語\n"
+                                  : "日本 ${value:1} 語\n";
+    word = "echo \"$(cat <<DRAFT_CHILD\n" + payload + "DRAFT_CHILD\n) tail";
+    completion = "\"";
+    document = true;
+    break;
+  }
+  std::string source = "echo before; " + word + completion;
+  auto *received = static_cast<shell_source_result_t *>(
+      malloc(sizeof(shell_source_result_t)));
+  auto *completed = static_cast<shell_source_result_t *>(
+      malloc(sizeof(shell_source_result_t)));
+  if (!received || !completed) {
+    free(received);
+    free(completed);
+    return 0;
+  }
+  shell_source_status_t received_status = shell_parse_draft(
+      source.data(), source.size() - completion.size(), NULL, received);
+  shell_source_status_t completed_status =
+      shell_parse_draft(source.data(), source.size(), NULL, completed);
+  bool valid = received_status == SHELL_SOURCE_INCOMPLETE &&
+               completed_status == SHELL_SOURCE_COMPLETE;
+  valid &= received->prefix_length == sizeof("echo before;") - 1 &&
+           received->header_count == children + 2 &&
+           completed->header_count == children + 2 &&
+           !received->headers[1].complete;
+  for (unsigned c = 0; c < children; c++)
+    valid &= received->headers[c + 2].complete &&
+             !memcmp(&received->headers[c + 2], &completed->headers[c + 2],
+                     sizeof(shell_source_header_t));
+  valid &= received->heredoc_count == unsigned(document) &&
+           received->heredoc_count == completed->heredoc_count;
+  if (document)
+    valid &= received->heredocs[0].complete &&
+             received->heredocs[0].content.value_len == payload.size() &&
+             !memcmp(&received->heredocs[0], &completed->heredocs[0],
+                     sizeof(shell_source_heredoc_t));
+  std::string malformed = (value & 1) ? "echo before; cat <(printf "
+                                      : "echo before; echo \"$(printf ";
+  malformed += token + " &&) tail";
+  valid &= shell_parse_draft(malformed.data(), malformed.size(), NULL,
+                             received) == SHELL_SOURCE_INVALID;
+  valid &= !received->prefix_length && !received->prefix.count;
+  for (uint32_t h = 0; h < received->header_count; h++)
+    valid &= !received->headers[h].complete;
+  /* A later EOF cannot repair a closed invalid child in a received backtick.
+   * Neither a child nor a completion event may hide non-ASCII arithmetic code.
+   * Escape-sensitive raw backticks have no faithful borrowed body view. */
+  const std::string rejected[] = {
+      "echo before; echo `echo $(printf " + token + " &&) tail",
+      "echo before; cat <<EOF\n$(( 日本 + $(printf " + token + ") ))\nEOF\n",
+      "echo before; cat <<EOF\n${value:$(printf " + token + ") + 日本",
+      "echo before; echo `printf \\$value" + std::string(value & 1 ? "`" : ""),
+  };
+  for (const std::string &input : rejected) {
+    valid &= shell_parse_draft(input.data(), input.size(), NULL, received) ==
+             SHELL_SOURCE_INVALID;
+    valid &= !received->prefix_length && !received->prefix.count;
+  }
+  /* A tentative delimiter line is not body code, even if its received prefix
+   * contains a closed backtick or non-ASCII bytes inside an apparent child. */
+  bool unicode = (selector & 1) != 0;
+  bool malformed_child = !unicode && (selector & 2);
+  std::string command = malformed_child ? "|" : token;
+  std::string candidate = "`" + command + "`" + (unicode ? "`日" : "");
+  std::string delimiter = "`" + command + "`" + (unicode ? "`日本`" : "tail");
+  std::string opening = "echo before; cat <<" + delimiter + "\n";
+  std::string pending = opening + candidate;
+  std::string closed = opening + delimiter + "\n";
+  valid &= shell_parse_draft(pending.data(), pending.size(), NULL, received) ==
+           SHELL_SOURCE_INCOMPLETE;
+  valid &= received->prefix_length == sizeof("echo before;") - 1 &&
+           received->header_count == 2 && received->heredoc_count == 1 &&
+           received->heredocs[0].delimiter_prefix &&
+           received->heredocs[0].confirmed_length == 0 &&
+           received->heredocs[0].content.value_len == candidate.size();
+  valid &= shell_parse_draft(closed.data(), closed.size(), NULL, completed) ==
+           SHELL_SOURCE_COMPLETE;
+  valid &= completed->header_count == 2 && completed->heredoc_count == 1 &&
+           completed->heredocs[0].complete &&
+           completed->heredocs[0].content.value_len == 0;
+  std::string body = opening + candidate + "x\n" + delimiter + "\n";
+  bool invalid_body = unicode || malformed_child;
+  valid &= shell_parse_draft(body.data(), body.size(), NULL, received) ==
+           (invalid_body ? SHELL_SOURCE_INVALID : SHELL_SOURCE_COMPLETE);
+  valid &= invalid_body
+               ? received->prefix_length == 0 && received->prefix.count == 0
+               : received->header_count == 3;
+
+  static const char *const heads[] = {"${#",   "${!",   "${!v*",
+                                      "${v\\", "${#\\", "${!v*\\"};
+  static const char *const ends[] = {"v}", "v}", "}", "\n}", "\nv}", "\n}"};
+  unsigned head = selector % (sizeof(heads) / sizeof(heads[0]));
+  std::string partial = std::string("echo before; echo ") + heads[head];
+  std::string full = partial + ends[head];
+  valid &= shell_parse_draft(partial.data(), partial.size(), NULL, received) ==
+           SHELL_SOURCE_INCOMPLETE;
+  valid &= received->prefix_length == sizeof("echo before;") - 1;
+  valid &= shell_parse_draft(full.data(), full.size(), NULL, completed) ==
+           SHELL_SOURCE_COMPLETE;
+
+  /* Known Bash phase boundaries, not merely agreement between consumers of
+   * the same decoder. The command after the terminator must remain visible. */
+  std::string declaration, terminator;
+  std::string data = token + "\n";
+  switch (selector % 4) {
+  case 0:
+    declaration = "cat <<`\"`$'\\x3a'\n";
+    terminator = "``':'";
+    data.clear();
+    break;
+  case 1:
+    declaration = "cat <<`'a\\\nb'`''\n";
+    terminator = "`ab`";
+    break;
+  case 2:
+    declaration = "cat <<- \t\\\n \tEOF\n";
+    terminator = "EOF";
+    break;
+  default:
+    declaration = "cat <<`\"`$'";
+    terminator = "``'";
+    for (unsigned i = 0; i < 2u + value % 8u; i++) {
+      declaration += "\\'";
+      terminator += "'\\''";
+    }
+    declaration += "'\n";
+    terminator += "'";
+    break;
+  }
+  std::string phase_opening = "echo before; " + declaration;
+  std::string phase_closed =
+      phase_opening + data + terminator + "\nprintf " + token;
+  if (selector % 4 == 0)
+    phase_closed += "\n``:\n:\n";
+  std::string phase_pending =
+      phase_opening + data + terminator.substr(0, terminator.size() / 2);
+  valid &= shell_parse_draft(phase_pending.data(), phase_pending.size(), NULL,
+                             received) == SHELL_SOURCE_INCOMPLETE;
+  valid &= received->prefix_length == sizeof("echo before;") - 1 &&
+           received->heredoc_count == 1 &&
+           received->heredocs[0].confirmed_length == data.size();
+  valid &= shell_parse_draft(phase_closed.data(), phase_closed.size(), NULL,
+                             completed) == SHELL_SOURCE_COMPLETE;
+  valid &= completed->header_count == (selector % 4 == 0 ? 5u : 3u) &&
+           completed->heredoc_count == 1 && completed->heredocs[0].complete &&
+           completed->heredocs[0].content.value_len == data.size() &&
+           completed->heredocs[0].closing_delimiter.start ==
+               phase_opening.size() + data.size() &&
+           completed->heredocs[0].closing_delimiter.length ==
+               terminator.size() + 1 &&
+           completed->headers[2].words[0].length == sizeof("printf") - 1 &&
+           !memcmp(phase_closed.data() + completed->headers[2].words[0].start,
+                   "printf", sizeof("printf") - 1);
+
+  /* Close-token boundaries, raw ANSI-C NUL, word-form moves and continuation
+   * phase ordering must select Bash's actual terminator, not merely agree
+   * across our own parsers. */
+  static const char *const delimiter_words[] = {
+      "$(a >&-file)", "\"${x:-$'\\0'}\"", "$(a >&$fd-)", "\"${\\\n#x:-$'a'}\""};
+  static const char *const delimiter_lines[] = {"$(a file 1>&-)", "${x:-",
+                                                "$(a 1>&$fd-)", "${#x:-a}"};
+  unsigned boundary = selector % 4;
+  std::string boundary_open = std::string("echo before; cat <<") +
+                              delimiter_words[boundary] + "\n" + data;
+  std::string boundary_closed =
+      boundary_open + delimiter_lines[boundary] + "\nprintf " + token;
+  size_t delimiter_size;
+  if (!shell_source_workspace_size(boundary_closed.size(), &delimiter_size))
+    abort();
+  std::vector<unsigned char> delimiter_storage(delimiter_size);
+  shell_limits_t source_limits = SHELL_LIMITS_DEFAULT;
+  source_limits.workspace = delimiter_storage.data();
+  source_limits.workspace_size = delimiter_storage.size();
+  valid &=
+      shell_parse_draft(boundary_closed.data(), boundary_closed.size(),
+                        &source_limits, completed) == SHELL_SOURCE_COMPLETE;
+  valid &=
+      completed->header_count == 3 && completed->heredoc_count == 1 &&
+      completed->heredocs[0].complete &&
+      completed->heredocs[0].content.value_len == data.size() &&
+      completed->heredocs[0].closing_delimiter.start == boundary_open.size();
+  std::string boundary_pending =
+      boundary_open + std::string(delimiter_lines[boundary]).substr(0, 3);
+  valid &=
+      shell_parse_draft(boundary_pending.data(), boundary_pending.size(),
+                        &source_limits, received) == SHELL_SOURCE_INCOMPLETE;
+  valid &= received->prefix_length == sizeof("echo before;") - 1 &&
+           received->heredoc_count == 1 &&
+           received->heredocs[0].confirmed_length == data.size();
+  std::string continued_control =
+      "echo before; cat <<$(i\\\nf true; th\\\nen :; f\\\ni)\n";
+  valid &= shell_parse_draft(continued_control.data(), continued_control.size(),
+                             &source_limits, received) == SHELL_SOURCE_INVALID;
+  valid &= !received->prefix_length && !received->prefix.count;
+  static const char *const keywords[] = {"if", "function", "[[", "]]"};
+  std::string keyword = keywords[selector % 4];
+  std::string keyword_open = "echo before; " + keyword;
+  valid &= shell_parse_draft(keyword_open.data(), keyword_open.size(), NULL,
+                             received) == SHELL_SOURCE_INCOMPLETE;
+  valid &= received->need == SHELL_SOURCE_NEEDS_COMMAND &&
+           received->incomplete_at == sizeof("echo before; ") - 1 &&
+           received->prefix_length == sizeof("echo before;") - 1 &&
+           received->header_count == 2 && !received->headers[1].complete;
+  std::string keyword_repaired = keyword_open + "x";
+  valid &= shell_parse_draft(keyword_repaired.data(), keyword_repaired.size(),
+                             NULL, completed) == SHELL_SOURCE_COMPLETE;
+  std::string keyword_closed = "echo before; echo $(" + keyword + ")";
+  valid &= shell_parse_draft(keyword_closed.data(), keyword_closed.size(), NULL,
+                             received) == SHELL_SOURCE_INVALID;
+  valid &= !received->prefix_length && !received->prefix.count;
+  std::string reprinted =
+      "echo $(cat << -EOF\n" + token + "\nEOF\nprintf EXPOSED\n-EOF\n)";
+  shell_processed_commands_t unsupported = {};
+  valid &= shell_process_commands(reprinted.data(), reprinted.size(), NULL,
+                                  &unsupported) == SHELL_PROCESS_EPARSE;
+  valid &= !unsupported.commands && !unsupported.command_count;
+  shell_processed_commands_free(&unsupported);
+  free(received);
+  free(completed);
+  return !valid;
+}
+
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
   /* Metadata is derived without consuming command bytes.  Every byte in the
    * fuzz input must remain available to the parsers, including short and
@@ -8248,6 +8889,25 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     }
   };
   run_check("fast parser", test_fast_parser(cmd.data(), cmd.size()));
+  run_check("draft source", test_draft_source(cmd.data(), cmd.size()));
+  run_check(
+      "draft redirect operand",
+      test_draft_redirect_operand(size ? data[0] : 0, size > 1 ? data[1] : 0));
+  run_check(
+      "draft redirector prefix",
+      test_draft_redirector_prefix(size ? data[0] : 0, size > 1 ? data[1] : 0));
+  run_check(
+      "nested draft redirect",
+      test_draft_nested_redirect(size ? data[0] : 0, size > 1 ? data[1] : 0));
+  run_check(
+      "draft child retention",
+      test_draft_closed_children(size ? data[0] : 0, size > 1 ? data[1] : 0));
+  std::string draft_document = (size && (data[0] & 1))
+                                   ? "echo before\ncat <<DRAFT_END\n"
+                                   : "echo before\ncat <<'DRAFT_END'\n";
+  draft_document += cmd;
+  run_check("draft document",
+            test_draft_source(draft_document.data(), draft_document.size()));
   run_check("dependency graph", test_depgraph(cmd.data(), cmd.size(), cwd));
   run_check("resolved dependency graph",
             test_resolved_depgraph(cmd.data(), cmd.size(), cwd,

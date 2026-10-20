@@ -5,6 +5,11 @@ It preserves source ranges, identifies shell features, and provides richer
 allocating tokenization, abstraction, transformation, and dependency-graph
 APIs.
 
+`shell_source.h` also retains heredoc framing, lexical headers and ordered
+redirects for received drafts. See [source, draft and static CWD contracts](../docs/source-draft-contract.md)
+for the 0.17 API and migration examples. Strict graph parsing remains strict;
+draft analysis exposes a separately qualified prefix, never execution approval.
+
 ## Overview
 
 ShellSplit parses shell commands and extracts individual command stages for
@@ -155,11 +160,19 @@ derived from the retained boundary edges.
 | Locale-dependent ANSI-C Unicode | non-ASCII `\u` / `\U` escapes | lexically recognized, rejected by semantic APIs |
 | Assigning parameter defaults | `${name=word}`, `${name:=word}` | lexically recognized, rejected by semantic APIs |
 | Parameter re-evaluation | `${value@P}`, indirect `${!ref}` | lexically recognized, rejected by semantic APIs |
-| Escape-sensitive backticks | active legacy bodies requiring removal of an escape layer | lexically recognized, rejected by semantic APIs |
+| Escape-sensitive backticks | active legacy bodies requiring removal of an escape layer | lexically recognized, rejected by semantic and draft APIs |
 | Current-shell metaprogramming | static `eval`, `let`, source loaders, traps, aliases, history replay, dynamic builtin loading, completion/Readline configuration, Readline-enabled `read`, `mapfile`/`readarray`, `wait -p`, and directory-stack operations | detected, rejected as unsupported |
 | Unmodeled Bash syntax | `[[ … ]]`, `(( … ))`, `$"…"`, arrays and associative arrays, array-element targets, and dynamic or mutating arithmetic expansions | detected, rejected as unsupported |
 | Control Features | loops, conditionals, `case`, `select`, `coproc`, and functions | detected, rejected as unsupported |
 | Bash `case` fall-through | `;&`, `;;&` | detected, rejected as unsupported |
+
+Heredoc delimiter words retain balanced literal parameter, arithmetic, command,
+and process-substitution fragments. These fragments are not executed; Bash's
+lexical normalization and command printing determine the terminating line.
+Quotes inside a fragment do not by themselves disable body expansion. See the
+[source/draft contract](../docs/source-draft-contract.md) for exact payloads,
+unfinished-input recovery, and workspace sizing with
+`shell_source_workspace_size()`.
 
 The fast parser is zero-copy and bounded rather than a complete POSIX shell
 grammar. It reports parse errors and output truncation through return codes;
@@ -171,6 +184,10 @@ backslashes, and newlines, plus double quotes when the substitution is
 double-quoted. Semantic APIs reject active bodies requiring that removal rather
 than treating their raw source spelling as the nested program. This includes
 escaped nested backticks and continuations even inside inner single quotes.
+The draft source API also returns `INVALID` for these active forms, complete or
+unfinished, with no qualified prefix. Supported unfinished backticks retain
+their local child headers, redirects and heredocs with exact source offsets;
+closed invalid descendants cannot be repaired by completing the outer word.
 Single-quoted words and quoted heredoc bodies keep backticks literal. Escapes
 whose backslash survives into the nested shell remain supported. Prefer `$(…)`
 for nested substitutions; its ordinary source spans need no legacy escape layer.
@@ -768,6 +785,20 @@ double quotes both backslash and CR survive. These rules also apply to source
 ranges, canonical argv, builtin argument decoding and transformations.
 Heredoc delimiters compare exact bytes after quote removal; CR is not stripped
 from a delimiter or its document. There is no source line-ending normalization.
+Literal backtick fragments group delimiter spaces and operators without
+creating executable children. Their internal quote-looking bytes do not
+protect the body; actual outer quoting does.
+Raw non-ASCII delimiter/body bytes are admitted as heredoc data, not as an
+extension of the executable-source byte domain. Content helpers preserve the
+body's final LF and apply `<<-` tab removal; expandable content is a template,
+while quote-protected content is an exact literal payload.
+Draft inspection excludes tentative closing-delimiter lines from executable
+child analysis until they become confirmed body data; raw content still
+retains every received byte. Unfinished parameter heads and name enumeration,
+including pending selector continuations, remain append-repairable rather
+than being reported as malformed. See the
+[source/draft contract](../docs/source-draft-contract.md) for confirmed-content
+and prefix qualification rules.
 Nonempty trivia-only fast-parser input succeeds with zero ranges; zero-length
 input remains invalid, and `shell_process_commands` still rejects inputs with
 no command records.
@@ -1210,20 +1241,27 @@ and statically recognized direct or `command`/`builtin`-wrapped `cd`. A
 foreground brace group shares and may update its surrounding CWD; subshell,
 pipeline, background, and substitution scopes do not. Dynamically selected
 commands make a subsequent current-shell CWD unknown rather than inventing a
-transition.
-Plain `cd` remains a node-free CWD transition by default. Its successful
-execution also replaces the named-descriptor proofs for `PWD` and `OLDPWD`,
+transition. Successful `cd` installs its static destination; pre-change failure
+retains the entry directory. Reporting/physical failure can instead follow a
+directory change; those paths join the possibilities and retain corresponding
+`PWD`/`OLDPWD` effects. Thus `cd /path && command` can have a known destination,
+while `cd /path; command` joins success and failure and is normally unknown.
+Argumentless `cd` can also select CDPATH through a relative runtime HOME and
+fail while reporting after chdir; failure does not prove CWD or bindings
+unchanged in that case.
+HOME, CDPATH-dependent operands, dynamic expansion, and physical `cd -P`
+resolution do not produce invented static directory identities.
+Every `cd` retains an ordinary command node. Its successful execution also
+replaces the named-descriptor proofs for `PWD` and `OLDPWD`,
 including through temporary same-name prefixes. Those runtime directory
 values are not treated as proven descriptor bindings. Numeric descriptor
-copies and unrelated variables remain usable. Only successful execution in
+copies and unrelated variables remain usable. Only a reached directory change in
 the current shell publishes these writes: skipped commands, invalid static
-arguments, failed setup/execution, and isolated child scopes do not. Descriptor
+arguments, setup/pre-change failures, and isolated child scopes do not. Descriptor
 variables allocated by successfully reached redirect setup still persist,
-even when a later redirect or `cd` itself fails. These effects also apply when
-no command node is retained.
-A `cd` with redirects or executable substitutions has a command endpoint:
-its I/O and nested commands
-use the incoming CWD, and subsequent commands use the tracked destination.
+even when a later redirect or `cd` itself fails. Its I/O, words, redirects,
+and nested expansions use the incoming CWD; later commands use the directory
+fact selected by the outcomes reaching them.
 The same ordinary I/O path handles `export` redirects while preserving its
 assignment ENVVAR documents.
 ENVVAR names are borrowed source spellings; use the graph's ENVVAR-name helpers
@@ -1392,17 +1430,38 @@ mutations; they occur after Bash has already parsed the submitted command.
 
 ### Dependency-graph workspace
 
+The fixed workspace also holds the operation-local lexical index. Application
+expansion callbacks parse in independent contexts, including overlapping views
+of the parent source, without inheriting its validation proofs or evicting its
+cached boundaries. Allocating processor/tokenizer, abstraction, transformation,
+and sequence APIs reserve and release their own temporary delimiter arena;
+only allocation-free source APIs require caller scratch for large delimiters.
+
 Dependency-graph parsing remains allocation-free, but route resolution uses
-caller-owned scratch storage. Measure it once, align one reusable allocation,
-and keep the command bytes, graph output, and workspace disjoint:
+caller-owned scratch storage. Measure its fixed prefix once, add the queried
+source-dependent delimiter capacity, and align one reusable allocation. Keep
+the command bytes, graph output, and workspace disjoint:
 
 ```c
+#include "shell_depgraph.h"
 #include <stdlib.h>
+#include <stdint.h>
 
 size_t workspace_size = 0;
 size_t alignment = shell_dep_workspace_alignment();
 shell_dep_workspace_size(NULL, &workspace_size);
+size_t delimiter_size;
+if (!shell_source_workspace_size(command_length, &delimiter_size) ||
+    delimiter_size > SIZE_MAX - workspace_size)
+  return 1;
+workspace_size += delimiter_size;
+size_t padding = (alignment - workspace_size % alignment) % alignment;
+if (padding > SIZE_MAX - workspace_size)
+  return 1;
+workspace_size += padding;
 void *workspace = aligned_alloc(alignment, workspace_size);
+if (!workspace)
+  return 1;
 
 shell_dep_limits_t limits = SHELL_DEP_LIMITS_DEFAULT;
 limits.workspace = workspace;
@@ -1414,10 +1473,13 @@ free(workspace);
 ```
 
 `aligned_alloc()` requires an allocation size that is a multiple of the
-alignment; the current measured size has that property. Applications with a
-different allocator can over-allocate and align manually. An absent,
-misaligned, or undersized workspace returns `SHELL_DEP_EWORKSPACE`. Command
-bytes, configuration, workspace, and graph output must obey the non-overlap
+alignment; the example rounds up after adding delimiter scratch. Applications
+with a different allocator can over-allocate and align manually. An absent,
+misaligned, or undersized workspace returns `SHELL_DEP_EWORKSPACE`. Use
+`shell_source_workspace_size()` instead of a flat-delimiter byte estimate:
+grouped delimiter fragments also need workspace-backed normalization pieces.
+See [the source contracts](../docs/source-draft-contract.md).
+Command bytes, configuration, workspace, and graph output must obey the non-overlap
 requirements documented by the API; invalid caller storage is not inspected at
 runtime.
 

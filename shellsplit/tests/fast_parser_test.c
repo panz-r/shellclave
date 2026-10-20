@@ -746,7 +746,8 @@ static void test_feature_matrix(void) {
       "time ({(echo ok)})", "({ echo a; echo b; }) | cat"};
   for (size_t i = 0; i < sizeof(compact_groups) / sizeof(compact_groups[0]);
        i++) {
-    shell_limits_t limits = {SHELL_MAX_SUBCOMMANDS, true};
+    shell_limits_t limits = {.max_subcommands = SHELL_MAX_SUBCOMMANDS,
+                             .strict_mode = true};
     shell_error_t error = shell_parse_fast(
         compact_groups[i], strlen(compact_groups[i]), &limits, &metadata);
     test("Compact nested delimiters retain lexical group membership",
@@ -968,7 +969,8 @@ void test_dialect_oracle(void) {
   static const char *strict_errors[] = {"echo 'x", "echo \"x", "$(("};
   for (size_t i = 0; i < sizeof(strict_errors) / sizeof(strict_errors[0]);
        i++) {
-    shell_limits_t strict = {SHELL_MAX_SUBCOMMANDS, true};
+    shell_limits_t strict = {.max_subcommands = SHELL_MAX_SUBCOMMANDS,
+                             .strict_mode = true};
     shell_parse_result_t result = {0};
     shell_error_t error = shell_parse_fast(
         strict_errors[i], strlen(strict_errors[i]), &strict, &result);
@@ -1460,7 +1462,8 @@ static void test_nested_heredoc_rejection(void) {
   };
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
     for (int strict = 0; strict <= 1; strict++) {
-      shell_limits_t limits = {SHELL_MAX_SUBCOMMANDS, strict != 0};
+      shell_limits_t limits = {.max_subcommands = SHELL_MAX_SUBCOMMANDS,
+                               .strict_mode = strict != 0};
       shell_parse_result_t result = {0};
       shell_error_t error =
           shell_parse_fast(cases[i], strlen(cases[i]), &limits, &result);
@@ -1478,7 +1481,8 @@ static void test_nested_heredoc_rejection(void) {
       "cat <(cat <<EOF\n)\nEOF\n)",
   };
   for (size_t i = 0; i < sizeof(valid_cases) / sizeof(valid_cases[0]); i++) {
-    shell_limits_t limits = {SHELL_MAX_SUBCOMMANDS, true};
+    shell_limits_t limits = {.max_subcommands = SHELL_MAX_SUBCOMMANDS,
+                             .strict_mode = true};
     shell_parse_result_t result = {0};
     shell_error_t error = shell_parse_fast(
         valid_cases[i], strlen(valid_cases[i]), &limits, &result);
@@ -1647,8 +1651,6 @@ static void test_source_scanner_contract(void) {
   shell_source_pending_heredoc_t escaped_pending = {0};
   shell_source_pending_heredoc_t retained_backslash_pending = {0};
   shell_source_pending_heredoc_t empty_pending = {0};
-  shell_source_pending_heredoc_t dangling_pending = {
-      .word = "\\", .word_length = 1, .strip_tabs = false};
   bool escaped_parsed = shell_source_parse_heredoc_delimiter(
       escaped_delimiter, sizeof(escaped_delimiter) - 1, &position,
       &escaped_pending);
@@ -1659,8 +1661,7 @@ static void test_source_scanner_contract(void) {
   position = 0;
   bool empty_parsed = shell_source_parse_heredoc_delimiter(
       empty_delimiter, sizeof(empty_delimiter) - 1, &position, &empty_pending);
-  test("source scanner handles escaped delimiter bytes and rejects dangling "
-       "ones",
+  test("source scanner handles escaped and empty delimiter bytes",
        escaped_parsed &&
            shell_source_line_is_heredoc_delimiter("E\"F\n", 4, 0,
                                                   &escaped_pending) &&
@@ -1668,9 +1669,11 @@ static void test_source_scanner_contract(void) {
            shell_source_line_is_heredoc_delimiter(
                "E\\qF\n", 5, 0, &retained_backslash_pending) &&
            empty_parsed &&
-           shell_source_line_is_heredoc_delimiter("\n", 1, 0, &empty_pending) &&
-           !shell_source_line_is_heredoc_delimiter("\\\n", 2, 0,
-                                                   &dangling_pending));
+           shell_source_line_is_heredoc_delimiter("\n", 1, 0, &empty_pending));
+  position = 0;
+  test("declaration boundary retains dangling escapes as incomplete",
+       shell_source_probe_heredoc_delimiter("\\", 1, &position, &pending) ==
+           SHELL_HEREDOC_WORD_INCOMPLETE);
   static const char ansi_delimiter[] = "$'EO\\x46'";
   static const char ansi_nul_delimiter[] = "$'E\\0F'";
   static const char ansi_nul_suffix[] = "$'E\\0F'X$'Y\\0Z'W";
@@ -1716,9 +1719,11 @@ static void test_source_scanner_contract(void) {
           !shell_source_heredoc_word_has_unsupported_ansi_c("\"$'a\\0b'\"",
                                                             9) &&
           !shell_source_heredoc_word_has_unsupported_ansi_c("'$'a\\0b''", 9) &&
-          !shell_source_heredoc_word_has_unsupported_ansi_c("$'unterminated",
-                                                            14) &&
           shell_source_heredoc_word_has_unsupported_ansi_c("\\\n$'a\\0b'", 10));
+  position = 0;
+  test("ANSI-C syntax boundary rejects an unfinished quote",
+       !shell_source_ansi_c_quote_facts("$'unterminated", 14, &position,
+                                        &decoded_nul, &locale_dependent));
   position = 0;
   test("ANSI-C Unicode facts do not conflate byte escapes with code points",
        shell_source_ansi_c_quote_facts("$'\\u00e9'", 9, &position, &decoded_nul,
@@ -3357,7 +3362,10 @@ static void test_semantic_classifier_boundaries(void) {
       {"command -- declare \"arr[$(printf 0)]\"", true},
       {"declare scalar='[literal]'", false},
       {"[[ -f /tmp/x ]]", true},
-      {"VALUE=x [[ $VALUE == x ]]", true},
+      {"VALUE=x [[ $VALUE == x ]]", false},
+      {">out [[ x ]]", false},
+      {"VALUE=x then", false},
+      {">out then", false},
       {"{ [[ -n value ]]; }", true},
       {"echo $( [[ -f /tmp/x ]] )", true},
       {"(( count += 1 ))", true},
@@ -3398,11 +3406,11 @@ static void test_semantic_classifier_boundaries(void) {
                shell_tokenizer_has_unsupported_semantics(NULL, 0);
   shell_tokenizer_state_t escaped_glob_state;
   shell_token_t escaped_glob = {0};
-  valid =
-      valid &&
-      shell_tokenizer_init(&escaped_glob_state, "[a\\]]", strlen("[a\\]]")) &&
-      shell_tokenizer_next(&escaped_glob_state, &escaped_glob) &&
-      escaped_glob.type == SHELL_TOKEN_GLOB;
+  valid = valid &&
+          shell_tokenizer_init(&escaped_glob_state, "[a\\]]", strlen("[a\\]]"),
+                               NULL) &&
+          shell_tokenizer_next(&escaped_glob_state, &escaped_glob) &&
+          escaped_glob.type == SHELL_TOKEN_GLOB;
   for (size_t i = 0; i < sizeof(source_cases) / sizeof(source_cases[0]); i++) {
     bool got = shell_tokenizer_has_unsupported_semantics(
         source_cases[i].input, strlen(source_cases[i].input));

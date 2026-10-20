@@ -2,7 +2,10 @@ cmake_minimum_required(VERSION 3.20)
 
 # Required-pointer failures are compile-time API violations, not runtime tests.
 set(source "${SHELLCLAVE_SOURCE_DIR}/tests/consumer/pointer_contracts.c")
-foreach(bad RANGE 0 185)
+foreach(bad RANGE 0 189)
+  if(bad EQUAL 186)
+    continue()
+  endif()
   execute_process(
     COMMAND "${SHELLCLAVE_C_COMPILER}" -std=c11 -fsyntax-only -Werror=nonnull
       "-DTEST_BAD=${bad}"

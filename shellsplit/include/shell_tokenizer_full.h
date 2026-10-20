@@ -171,15 +171,22 @@ typedef struct {
   uint8_t lexical_prefix;
   bool lexical_command_position;
   bool lexical_redirect_operand;
+  void *workspace; /* Borrowed optional delimiter scratch for iteration. */
+  size_t workspace_size;
 } shell_tokenizer_state_t;
 
 /**
  * Initialize a tokenizer over exactly `input_length` source bytes. NULL input
  * is valid only with zero length. The state pointer is required; returns false
- * for invalid input.
+ * for invalid input or unavailable delimiter scratch. NULL limits selects
+ * defaults; only its optional workspace applies to lexical iteration. Larger
+ * scratch is borrowed through iteration, not owned by the state. Exhaustion
+ * while advancing stops iteration and sets heredoc_error; callers can restart
+ * with a larger buffer. Storage must not alias input, state, or token output.
  */
 bool shell_tokenizer_init(shell_tokenizer_state_t *state, const char *input,
-                          size_t input_length) SHELL_NONNULL(1);
+                          size_t input_length, const shell_limits_t *limits)
+    SHELL_NONNULL(1);
 
 /**
  * Get the next lexical token. A heredoc declaration is one

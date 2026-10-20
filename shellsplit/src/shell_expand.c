@@ -137,8 +137,10 @@ shell_expand_resolve(const shell_dep_expand_request_t *request, void *context) {
       .cwd_known = request->cwd_known,
       .cwd_absolute = request->cwd_absolute,
   };
+  shell_source_operation_t previous = shell_source_operation_suspend();
   shell_expand_status_t status = cache->expand(
       &query, &entry->value.netargv, &entry->value.length, cache->context);
+  shell_source_operation_restore(previous);
   if (status == SHELL_EXPAND_UNRESOLVED) {
     entry->value.netargv = NULL;
     entry->value.length = 0;

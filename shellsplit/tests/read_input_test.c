@@ -835,8 +835,8 @@ static void inherited_variable_capabilities(void) {
       "unset BASH_REMATCH; result=$(read BASH_REMATCH <<<payload)",
       "unset RANDOM; result=$(read -p\"$RANDOM\" -e value <<<payload)",
       "unset RANDOM; RANDOM=changed result=$(read RANDOM <<<payload) :",
-      "test \"$choice\" = yes && unset RANDOM || unset RANDOM; "
-      "result=$(read RANDOM <<<payload)",
+      ("test \"$choice\" = yes && unset RANDOM || unset RANDOM; "
+       "result=$(read RANDOM <<<payload)"),
   };
   for (size_t i = 0; i < sizeof(supported) / sizeof(supported[0]); i++) {
     parse(supported[i]);
@@ -2767,8 +2767,9 @@ static void inline_document_setup(void) {
     for (uint32_t e = 0; e < graph->edge_count; e++) {
       const shell_dep_edge_t *edge = &graph->edges[e];
       const shell_dep_node_t *node = &graph->nodes[edge->from];
-      if (node->type != SHELL_NODE_DOC || node->doc.value_len != 5 ||
-          !node->doc.value || memcmp(node->doc.value, "first", 5))
+      if (node->type != SHELL_NODE_DOC ||
+          node->doc.value_len != (i == 1 ? 6u : 5u) || !node->doc.value ||
+          memcmp(node->doc.value, "first", 5))
         continue;
       CHECK(edge->type == SHELL_EDGE_FD_OPEN);
       CHECK(edge->target_fd == 0);
@@ -2777,7 +2778,7 @@ static void inline_document_setup(void) {
     }
     CHECK(first);
     if (i < 2)
-      CHECK(document_input(command("cat"), "second"));
+      CHECK(document_input(command("cat"), i == 1 ? "second\n" : "second"));
     else
       CHECK(inputs(command("read"), 0, NULL) == 0);
   }

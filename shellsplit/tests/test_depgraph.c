@@ -357,7 +357,8 @@ TEST(token_zero_copy) {
 
 TEST(supplied_fast_parser_contract) {
   const char *command = "cd /tmp && printf 'two words' >out | sed s/x/y/";
-  const shell_limits_t strict = {SHELL_MAX_SUBCOMMANDS, true};
+  const shell_limits_t strict = {.max_subcommands = SHELL_MAX_SUBCOMMANDS,
+                                 .strict_mode = true};
   shell_parse_result_t fast = {0};
   ASSERT(shell_parse_fast(command, strlen(command), &strict, &fast) ==
          SHELL_OK);
@@ -377,7 +378,8 @@ TEST(supplied_fast_parser_contract) {
   ASSERT(memcmp(&fast, &original, sizeof(fast)) == 0);
 
   /* Exercise real parser truncation rather than inventing partial metadata. */
-  const shell_limits_t short_limits = {1, true};
+  const shell_limits_t short_limits = {.max_subcommands = 1,
+                                       .strict_mode = true};
   ASSERT(shell_parse_fast(command, strlen(command), &short_limits, &fast) ==
          SHELL_ETRUNC);
   memset(&supplied, 0, sizeof(supplied));
@@ -473,7 +475,8 @@ TEST(supplied_fast_graph_equivalence) {
       "echo \"$(time printf x)\"",
       "cat <<EOF\nbody\nEOF\n",
   };
-  const shell_limits_t strict = {SHELL_MAX_SUBCOMMANDS, true};
+  const shell_limits_t strict = {.max_subcommands = SHELL_MAX_SUBCOMMANDS,
+                                 .strict_mode = true};
   for (size_t i = 0; i < sizeof(sources) / sizeof(sources[0]); i++) {
     const char *source = sources[i];
     size_t length = strlen(source);
@@ -497,7 +500,8 @@ TEST(supplied_fast_graph_equivalence) {
   }
 
   shell_parse_result_t prefix;
-  const shell_limits_t zero_capacity = {0, true};
+  const shell_limits_t zero_capacity = {.max_subcommands = 0,
+                                        .strict_mode = true};
   const char *source = "echo ok; echo end";
   ASSERT(shell_parse_fast(source, strlen(source), &zero_capacity, &prefix) ==
          SHELL_ETRUNC);
@@ -2604,7 +2608,7 @@ TEST(named_fd_recursive_snapshot_timing) {
 TEST(group_entry_redirect_expansion_timing) {
   shell_dep_graph_t graph = {0};
   shell_dep_limits_t limits = SHELL_DEP_LIMITS_DEFAULT;
-  const char *cwd_command = "cd /tmp; { :; } > >(pwd); pwd";
+  const char *cwd_command = "cd /tmp && { :; } > >(pwd); pwd";
   ASSERT(shell_dep_graph_parse(cwd_command, strlen(cwd_command), "/workspace",
                                &limits, &graph) == SHELL_DEP_OK);
   int nested_pwd = find_cmd_tokens(&graph, "pwd", NULL);
@@ -2616,10 +2620,10 @@ TEST(group_entry_redirect_expansion_timing) {
   ASSERT(shell_dep_graph_validate(&graph).valid);
 
   static const char *const other_group_operands[] = {
-      "cd /tmp; { :; } >$(pwd)",
-      "cd /tmp; { :; } <<<$(pwd)",
-      "cd /tmp; { :; } <<EOF\n$(pwd)\nEOF\n",
-      "( cd /tmp; { :; } > >(pwd) ); pwd",
+      "cd /tmp && { :; } >$(pwd)",
+      "cd /tmp && { :; } <<<$(pwd)",
+      "cd /tmp && { :; } <<EOF\n$(pwd)\nEOF\n",
+      "( cd /tmp && { :; } > >(pwd) ); pwd",
   };
   for (uint32_t i = 0;
        i < sizeof(other_group_operands) / sizeof(other_group_operands[0]);
@@ -2633,7 +2637,7 @@ TEST(group_entry_redirect_expansion_timing) {
     ASSERT(shell_dep_graph_validate(&graph).valid);
   }
 
-  const char *isolated = "cd /tmp; ( { :; } > >(pwd) ); pwd";
+  const char *isolated = "cd /tmp && ( { :; } > >(pwd) ); pwd";
   ASSERT(shell_dep_graph_parse(isolated, strlen(isolated), "/workspace",
                                &limits, &graph) == SHELL_DEP_OK);
   nested_pwd = find_cmd_tokens(&graph, "pwd", NULL);
@@ -4075,16 +4079,16 @@ TEST(cwd_matrix) {
   } cases[] = {
       {"cd ../foo && ls", "/home/user", "/home/foo"},
       {"cd /tmp && ls", "/home/user", "/tmp"},
-      {"cd && ls", "/home/user", "$HOME"},
+      {"cd && ls", "/home/user", NULL},
       {"cd .. && pwd", "/home/user/docs", "/home/user"},
       {"cd ./foo && ls", "/home/user", "/home/user/foo"},
       {"cd ../../foo && ls", "/home/user", "/foo"},
-      {"cd /../../foo; pwd", "/home/user", "/foo"},
+      {"cd /../../foo && pwd", "/home/user", "/foo"},
       {"cd /tmp//nested/../final && ls", "/home/user", "/tmp/final"},
-      {"cd ..; pwd", ".", ".."},
-      {"cd ../../foo; pwd", ".", "../../foo"},
-      {"cd ./a/../..; pwd", ".", ".."},
-      {"cd ./a/..; pwd", ".", "."},
+      {"cd .. && pwd", ".", ".."},
+      {"cd ../../foo && pwd", ".", "../../foo"},
+      {"cd ./a/../.. && pwd", ".", ".."},
+      {"cd ./a/.. && pwd", ".", "."},
       {"ls", ".", "."},
   };
 
@@ -4097,8 +4101,11 @@ TEST(cwd_matrix) {
     ASSERT(count_type(&g, SHELL_NODE_CMD) == expected_commands);
     int command_index = find_nth_cmd(&g, expected_commands - 1);
     ASSERT(command_index >= 0);
-    ASSERT_STR_EQ(get_cwd_str(&g, g.nodes[command_index].cmd.cwd_offset),
-                  cases[i].expected_cwd);
+    ASSERT(g.nodes[command_index].cmd.cwd_known ==
+           (cases[i].expected_cwd != NULL));
+    if (cases[i].expected_cwd)
+      ASSERT_STR_EQ(get_cwd_str(&g, g.nodes[command_index].cmd.cwd_offset),
+                    cases[i].expected_cwd);
     shell_dep_graph_validation_t validation = shell_dep_graph_validate(&g);
     ASSERT(validation.valid);
     ASSERT(validation.error_count == 0);
@@ -4112,25 +4119,22 @@ TEST(cwd_decoded_operand_matrix) {
     const char *initial_cwd;
     const char *expected_cwd;
   } static_cases[] = {
-      {"cd \"/tmp\"; pwd", "/home/user", "/tmp"},
-      {"c'd' '/tmp'; pwd", "/home/user", "/tmp"},
-      {"cd /tmp\\ dir; pwd", "/home/user", "/tmp dir"},
-      {"cd /tmp$; pwd", "/home/user", "/tmp$"},
-      {"cd /tmp[part; pwd", "/home/user", "/tmp[part"},
-      {"cd /tmp{part}; pwd", "/home/user", "/tmp{part}"},
-      {"cd $'\\x2ftmp'; pwd", "/home/user", "/tmp"},
-      {"cd ~; pwd", "/home/user", "$HOME"},
-      {"cd ~/project; pwd", "/home/user", "$HOME/project"},
-      {"cd ~/project; cd ./child; pwd", "/home/user", "$HOME/project/child"},
-      {"cd -e /tmp; pwd", "/home/user", "/tmp"},
-      {"cd -PL /tmp; pwd", "/home/user", "/tmp"},
-      {"cd /tmp > log; pwd", "/home/user", "/tmp"},
-      {"cd /tmp >&log; pwd", "/home/user", "/tmp"},
-      {"command cd /tmp; pwd", "/home/user", "/tmp"},
-      {"command -p cd /tmp; pwd", "/home/user", "/tmp"},
-      {"builtin cd /tmp; pwd", "/home/user", "/tmp"},
-      {"command builtin cd /tmp; pwd", "/home/user", "/tmp"},
-      {"CDPREFIX=1 command cd /tmp; pwd", "/home/user", "/tmp"},
+      {"cd \"/tmp\" && pwd", "/home/user", "/tmp"},
+      {"c'd' '/tmp' && pwd", "/home/user", "/tmp"},
+      {"cd /tmp\\ dir && pwd", "/home/user", "/tmp dir"},
+      {"cd /tmp$ && pwd", "/home/user", "/tmp$"},
+      {"cd /tmp[part && pwd", "/home/user", "/tmp[part"},
+      {"cd /tmp{part} && pwd", "/home/user", "/tmp{part}"},
+      {"cd $'\\x2ftmp' && pwd", "/home/user", "/tmp"},
+      {"cd -e /tmp && pwd", "/home/user", "/tmp"},
+      {"cd -PL /tmp && pwd", "/home/user", "/tmp"},
+      {"cd /tmp > log && pwd", "/home/user", "/tmp"},
+      {"cd /tmp >&log && pwd", "/home/user", "/tmp"},
+      {"command cd /tmp && pwd", "/home/user", "/tmp"},
+      {"command -p cd /tmp && pwd", "/home/user", "/tmp"},
+      {"builtin cd /tmp && pwd", "/home/user", "/tmp"},
+      {"command builtin cd /tmp && pwd", "/home/user", "/tmp"},
+      {"CDPREFIX=1 command cd /tmp && pwd", "/home/user", "/tmp"},
   };
   for (size_t i = 0; i < sizeof(static_cases) / sizeof(static_cases[0]); i++) {
     shell_dep_graph_t graph;
@@ -4145,6 +4149,9 @@ TEST(cwd_decoded_operand_matrix) {
   }
 
   static const char *const dynamic_cases[] = {
+      "cd ~ && pwd",
+      "cd ~/project && pwd",
+      "cd && pwd",
       "cd $HOME; pwd",
       "cd ${HOME}; pwd",
       "cd \"$HOME\"; pwd",
@@ -4360,17 +4367,17 @@ TEST(cd_graph_visible_effects) {
 
 TEST(cd_redirect_operand_ownership) {
   static const char *const sources[] = {
-      "cd / 2>&1; cat <./file",
-      "cd 2>&1 /; cat <./file",
-      "cd / 2>& 1; cat <./file",
-      "cd 2>& 1 /; cat <./file",
-      "cd -L / 2>&1; cat <./file",
-      "command builtin cd / 2>&1; cat <./file",
-      "time -p cd / 2>&1; cat <./file",
-      "exec {fd}>&1; cd / 2>&$fd; cat <./file",
-      "exec {fd}>&1; cd 2>&\"$fd\" /; cat <./file",
-      "{ cd / 2>&1; cat <./file; }",
-      "(cd / 2>&1; cat <./file)",
+      "cd / 2>&1 && cat <./file",
+      "cd 2>&1 / && cat <./file",
+      "cd / 2>& 1 && cat <./file",
+      "cd 2>& 1 / && cat <./file",
+      "cd -L / 2>&1 && cat <./file",
+      "command builtin cd / 2>&1 && cat <./file",
+      "time -p cd / 2>&1 && cat <./file",
+      "exec {fd}>&1; cd / 2>&$fd && cat <./file",
+      "exec {fd}>&1; cd 2>&\"$fd\" / && cat <./file",
+      "{ cd / 2>&1 && cat <./file; }",
+      "(cd / 2>&1 && cat <./file)",
   };
   shell_dep_graph_t graph = {0};
   for (size_t i = 0; i < sizeof(sources) / sizeof(sources[0]); i++) {
@@ -4492,7 +4499,8 @@ TEST(composition_metadata_matrix) {
                                strlen("cd /tmp && pwd; pwd"), ".", &cwd_limits,
                                &g) == SHELL_DEP_OK);
   ASSERT(count_type(&g, SHELL_NODE_CMD) == 3);
-  ASSERT(!g.nodes[find_nth_cmd(&g, 1)].cmd.cwd_known);
+  ASSERT(g.nodes[find_nth_cmd(&g, 1)].cmd.cwd_known);
+  ASSERT(!g.nodes[find_nth_cmd(&g, 2)].cmd.cwd_known);
   pass_count++;
 }
 
@@ -4983,7 +4991,7 @@ TEST(tilde_cwd_identity) {
                              sizeof(shellsplit_test_tilde_cwd[0]);
        i++) {
     char source[256];
-    int length = snprintf(source, sizeof(source), "cd %s; pwd >out",
+    int length = snprintf(source, sizeof(source), "cd %s && pwd >out",
                           shellsplit_test_tilde_cwd[i].word);
     ASSERT(length > 0 && (size_t)length < sizeof(source));
     shell_dep_graph_t graph;
@@ -5022,8 +5030,8 @@ TEST(tilde_cwd_identity) {
 
 TEST(static_file_identity_and_effective_group_pipe_routes) {
   shell_dep_graph_t graph = {0};
-  ASSERT(parse("cd /tmp/first; printf x >\"out\"; cat ./out; "
-               "cd /tmp/second; cat ./out",
+  ASSERT(parse("cd /tmp/first && printf x >\"out\" && cat ./out && "
+               "cd /tmp/second && cat ./out",
                &graph) == SHELL_DEP_OK);
   char identities[3][128] = {{0}};
   size_t lengths[3] = {0};
@@ -5047,7 +5055,7 @@ TEST(static_file_identity_and_effective_group_pipe_routes) {
          strcmp(identities[1], identities[0]) == 0 &&
          strcmp(identities[2], "/tmp/second/out") == 0);
 
-  ASSERT(parse("printf x >out; cd /; cat ./out", &graph) == SHELL_DEP_OK);
+  ASSERT(parse("printf x >out; cd / && cat ./out", &graph) == SHELL_DEP_OK);
   bool origin_absolute[2] = {false, false};
   uint32_t origin_count = 0;
   for (uint32_t node = 0; node < graph.node_count; node++) {
@@ -5147,7 +5155,7 @@ TEST(static_file_identity_and_effective_group_pipe_routes) {
                                             &absolute) &&
          written == 0);
 
-  ASSERT(parse("cd /tmp/group; { printf x; } >out", &graph) == SHELL_DEP_OK);
+  ASSERT(parse("cd /tmp/group && { printf x; } >out", &graph) == SHELL_DEP_OK);
   file = find_file_doc(&graph, "out");
   ASSERT(file >= 0 &&
          shell_dep_doc_file_identity_write(&graph, &graph.nodes[file].doc,
@@ -5155,7 +5163,7 @@ TEST(static_file_identity_and_effective_group_pipe_routes) {
                                            &written, &absolute) &&
          absolute && strcmp(identities[0], "/tmp/group/out") == 0);
 
-  ASSERT(parse("echo $(cd /tmp/nested; cat ./file)", &graph) == SHELL_DEP_OK);
+  ASSERT(parse("echo $(cd /tmp/nested && cat ./file)", &graph) == SHELL_DEP_OK);
   file = find_file_doc(&graph, "./file");
   ASSERT(file >= 0 &&
          shell_dep_doc_file_identity_write(&graph, &graph.nodes[file].doc,
@@ -5764,16 +5772,16 @@ TEST(execution_stage_cwd_scope) {
       {"( time : | cd /tmp; probe >relative )", "/workspace"},
       {"cd /tmp <<<body | :; probe >relative", "/workspace"},
       {"time cd /tmp <<<body | :; probe >relative", "/workspace"},
-      {"time { cd /tmp; probe >relative; } &", "/tmp"},
-      {"time { cd /tmp; probe >relative; } | cat", "/tmp"},
-      {"{ cd /tmp; probe >relative; } &", "/tmp"},
+      {"time { cd /tmp; probe >relative; } &", NULL},
+      {"time { cd /tmp; probe >relative; } | cat", NULL},
+      {"{ cd /tmp; probe >relative; } &", NULL},
       {"cd /tmp & probe >relative", "/workspace"},
-      {"( cd /tmp; : | cd /; probe >relative )", "/tmp"},
+      {"( cd /tmp; : | cd /; probe >relative )", NULL},
       {"cd \"$value\" | :; probe >relative", "/workspace"},
       {"{ cd \"$value\"; probe >relative; } | cat", NULL},
-      {"cd /tmp; probe >relative", "/tmp"},
+      {"cd /tmp; probe >relative", NULL},
       {"echo \"$( : | cd /tmp; probe >relative )\"", "/workspace"},
-      {"echo \"$( cd /tmp; probe >relative )\"", "/tmp"},
+      {"echo \"$( cd /tmp; probe >relative )\"", NULL},
   };
   shell_dep_limits_t limits = SHELL_DEP_LIMITS_DEFAULT;
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
@@ -5810,13 +5818,13 @@ TEST(file_command_substitution_cwd_context) {
     const char *source;
     const char *identity;
   } cases[] = {
-      {"cd /tmp; echo \"$(<relative)\"", "/tmp/relative"},
-      {"( cd /tmp; echo \"$(<relative)\" )", "/tmp/relative"},
+      {"cd /tmp; echo \"$(<relative)\"", NULL},
+      {"( cd /tmp; echo \"$(<relative)\" )", NULL},
       {"( : | cd /tmp; echo \"$(<relative)\" )", "/workspace/relative"},
       {"{ echo value; } >\"$(<relative)\"", "/workspace/relative"},
       {"cat <<EOF\n$(<relative)\nEOF\n", "/workspace/relative"},
       {"cd \"$value\"; echo \"$(<relative)\"", NULL},
-      {"time ( cd /tmp; echo \"$(<relative)\" )", "/tmp/relative"},
+      {"time ( cd /tmp; echo \"$(<relative)\" )", NULL},
   };
   shell_dep_limits_t limits = SHELL_DEP_LIMITS_DEFAULT;
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
@@ -5880,16 +5888,15 @@ TEST(brace_group_cwd_scope) {
   ASSERT_STR_EQ(get_cwd_str(&g, g.nodes[find_nth_cmd(&g, 3)].cmd.cwd_offset),
                 "/home/user");
 
-  /* A physical continuation inside `||` must not turn the brace group into a
-   * pipeline subshell. The group remains in the current shell, so its `cd`
-   * reaches the right-hand side of the logical list. */
+  /* A continued || remains a logical list. Its right-hand side runs on cd
+   * failure, which retains the incoming CWD rather than its success target. */
   memset(&g, 0, sizeof(g));
   const char *continued_or = "{ cd /tmp; } |\\\n| pwd";
   ASSERT(shell_dep_graph_parse(continued_or, strlen(continued_or), "/home/user",
                                &limits, &g) == SHELL_DEP_OK);
   ASSERT(count_type(&g, SHELL_NODE_CMD) == 2);
   ASSERT_STR_EQ(get_cwd_str(&g, g.nodes[find_nth_cmd(&g, 1)].cmd.cwd_offset),
-                "/tmp");
+                "/home/user");
   ASSERT(shell_dep_graph_validate(&g).valid);
 
   /* Background execution is also aggregate: every enclosed simple command
@@ -7136,21 +7143,21 @@ TEST(inline_document_matrix) {
     const char *value;
   } cases[] = {
       {"cat <<EOF\nhello\nEOF", SHELL_DOC_HEREDOC, 1, 0, 0, 0, 0, "EOF",
-       "hello"},
+       "hello\n"},
       {"sort <<DELIM\nline1\nline2\nDELIM", SHELL_DOC_HEREDOC, 1, 0, 0, 0, 0,
-       "DELIM", "line1\nline2"},
+       "DELIM", "line1\nline2\n"},
       {"cat <<EOF | sort\nhello\nEOF", SHELL_DOC_HEREDOC, 2, 0, 1, 0, 0, "EOF",
-       "hello"},
+       "hello\n"},
       {"cat <<EOF\n$(id)\nEOF", SHELL_DOC_HEREDOC, 2, 0, 0, 0, 1, "EOF",
-       "$(id)"},
+       "$(id)\n"},
       {"cat <<EOF\nbody\nEOF\npwd", SHELL_DOC_HEREDOC, 2, 0, 0, 0, 0, "EOF",
-       "body"},
+       "body\n"},
       {"cat <<E'OF'\nbody\nEOF\npwd", SHELL_DOC_HEREDOC, 2, 0, 0, 0, 0, "E'OF'",
-       "body"},
+       "body\n"},
       {"cat <<EOF > out.txt\nhello\nEOF", SHELL_DOC_HEREDOC, 1, 1, 0, 1, 0,
-       "EOF", "hello"},
+       "EOF", "hello\n"},
       {"cat <<-'EOF'\n\tsecret\n\tEOF", SHELL_DOC_HEREDOC, 1, 0, 0, 0, 0, "EOF",
-       "secret"},
+       "secret\n"},
       {"cat <<< hello", SHELL_DOC_HERESTRING, 1, 0, 0, 0, 0, NULL, "hello"},
   };
 
@@ -7245,7 +7252,7 @@ TEST(named_document_and_structural_stage_routing) {
 
   shell_dep_graph_t cwd = {0};
   ASSERT(parse("cd /tmp && <<<body; pwd", &cwd) == SHELL_DEP_OK);
-  int pwd = find_nth_cmd(&cwd, 1);
+  int pwd = find_cmd_tokens(&cwd, "pwd", NULL);
   ASSERT(pwd >= 0 && !cwd.nodes[pwd].cmd.cwd_known &&
          shell_dep_graph_validate(&cwd).valid);
 
@@ -7280,19 +7287,19 @@ TEST(heredoc_content_writer_contract) {
     }
   ASSERT(document != NULL);
   ASSERT(document->flags == SHELL_DEP_DOC_FLAG_HEREDOC_STRIP_TABS);
-  ASSERT_STRN_EQ(document->value, document->value_len, "\tone\r\n\t\ttwo\r");
+  ASSERT_STRN_EQ(document->value, document->value_len, "\tone\r\n\t\ttwo\r\n");
 
   size_t length = 0;
   size_t written = SIZE_MAX;
   char content[32];
   memset(content, 0xA5, sizeof(content));
   ASSERT(shell_dep_doc_content_length(document, &length));
-  ASSERT(length == strlen("one\r\ntwo\r"));
+  ASSERT(length == strlen("one\r\ntwo\r\n"));
   ASSERT(!shell_dep_doc_write_content(document, content, length - 1, &written));
   ASSERT(written == 0 && (unsigned char)content[0] == 0xA5);
   ASSERT(shell_dep_doc_write_content(document, content, length, &written));
   ASSERT(written == length);
-  ASSERT_STRN_EQ(content, (uint32_t)written, "one\r\ntwo\r");
+  ASSERT_STRN_EQ(content, (uint32_t)written, "one\r\ntwo\r\n");
   ASSERT(shell_dep_graph_validate(&graph).valid);
 
   const char *bare_cr = "cat <<-EOF\n\tone\r\tstill-same-line\n\ttwo\nEOF\n";
@@ -7305,7 +7312,7 @@ TEST(heredoc_content_writer_contract) {
       break;
     }
   ASSERT(document != NULL &&
-         doc_content_equals(document, "one\r\tstill-same-line\ntwo") &&
+         doc_content_equals(document, "one\r\tstill-same-line\ntwo\n") &&
          shell_dep_graph_validate(&graph).valid);
   pass_count++;
 }
@@ -11729,13 +11736,13 @@ TEST(brace_group_document_scope) {
     const char *value;
   } cases[] = {
       {"{ cat; cat; } <<EOF\npayload\nEOF", SHELL_DOC_HEREDOC, "EOF",
-       "payload"},
+       "payload\n"},
       {"{ cat; cat; } <<-'EOF'\n\tpayload\n\tEOF", SHELL_DOC_HEREDOC, "EOF",
-       "payload"},
+       "payload\n"},
       {"{ cat; cat; } <<EOF\r\npayload\r\nEOF\r\n", SHELL_DOC_HEREDOC, "EOF\r",
-       "payload\r"},
+       "payload\r\n"},
       {"{ cat; cat; } <<-\"EOF\"\r\n\tpayload\r\n\tEOF\r\n", SHELL_DOC_HEREDOC,
-       "\"EOF\"\r", "payload\r"},
+       "\"EOF\"\r", "payload\r\n"},
       {"{ cat; cat; } <<< \"two words\"", SHELL_DOC_HERESTRING, NULL,
        "\"two words\""},
   };
@@ -11782,7 +11789,7 @@ TEST(brace_group_local_document_scope) {
     const char *value;
   } cases[] = {
       {"{ cat <<\"A B\"; printf after; }\nbody\nA B\n", SHELL_DOC_HEREDOC,
-       "A B", "body"},
+       "A B", "body\n"},
       {"{ cat <<<value; printf after; }", SHELL_DOC_HERESTRING, NULL, "value"},
   };
 
@@ -11842,10 +11849,10 @@ TEST(brace_group_multiple_documents) {
     if (node->type != SHELL_NODE_DOC || node->doc.kind != SHELL_DOC_HEREDOC)
       continue;
     if (node->doc.name_len == 1 && node->doc.name[0] == 'A') {
-      ASSERT(doc_content_equals(&node->doc, "one"));
+      ASSERT(doc_content_equals(&node->doc, "one\n"));
       found_a = true;
     } else if (node->doc.name_len == 1 && node->doc.name[0] == 'B') {
-      ASSERT(doc_content_equals(&node->doc, "two"));
+      ASSERT(doc_content_equals(&node->doc, "two\n"));
       found_b = true;
     }
   }
@@ -13058,7 +13065,8 @@ TEST(graph_dump_contract) {
   ASSERT(strstr(text, "CMD cwd=\".\"") != NULL);
   ASSERT(strstr(text, "DOC ENVVAR name=\"FOO\" value=\"bar\"") != NULL);
   ASSERT(strstr(text, "DOC FILE path=\"file.txt\"") != NULL);
-  ASSERT(strstr(text, "DOC HEREDOC delim=\"EOF\" content=\"hello\"") != NULL);
+  ASSERT(strstr(text, "DOC HEREDOC delim=\"EOF\" content=\"hello\\n\"") !=
+         NULL);
   ASSERT(strstr(text, "DOC HERESTRING content=\"hello\"") != NULL);
   ASSERT(strstr(text, "PIPE[1:0]") != NULL);
   ASSERT(strstr(text, "ARG[4294967295:4294967295] <>") != NULL);
@@ -13908,7 +13916,8 @@ TEST(readonly_assignment_unreachable_phases) {
            count_edge_type(&graph, SHELL_EDGE_FD_CLOSE) == 0);
     ASSERT(shell_dep_graph_validate(&graph).valid);
     shell_parse_result_t fast = {0};
-    shell_limits_t strict = {SHELL_MAX_SUBCOMMANDS, true};
+    shell_limits_t strict = {.max_subcommands = SHELL_MAX_SUBCOMMANDS,
+                             .strict_mode = true};
     ASSERT(shell_parse_fast(cases[i].source, strlen(cases[i].source), &strict,
                             &fast) == SHELL_OK);
     shell_dep_graph_t supplied = {0};
@@ -14665,7 +14674,8 @@ TEST(unreachable_stage_effects_and_syntax) {
     ASSERT(count_edge_type(&graph, SHELL_EDGE_SUBST) ==
            (i + 1 == sizeof(inactive) / sizeof(inactive[0]) ? 1u : 0u));
     shell_parse_result_t fast = {0};
-    shell_limits_t strict = {SHELL_MAX_SUBCOMMANDS, true};
+    shell_limits_t strict = {.max_subcommands = SHELL_MAX_SUBCOMMANDS,
+                             .strict_mode = true};
     ASSERT(shell_parse_fast(inactive[i], strlen(inactive[i]), &strict, &fast) ==
            SHELL_OK);
     shell_dep_graph_t supplied = {0};
@@ -14720,7 +14730,8 @@ TEST(redirect_setup_outcome_substitutions) {
            (cases[i].executes ? 1u : 0u));
     ASSERT(shell_dep_graph_validate(&graph).valid);
     shell_parse_result_t fast = {0};
-    shell_limits_t strict = {SHELL_MAX_SUBCOMMANDS, true};
+    shell_limits_t strict = {.max_subcommands = SHELL_MAX_SUBCOMMANDS,
+                             .strict_mode = true};
     ASSERT(shell_parse_fast(source, (size_t)length, &strict, &fast) ==
            SHELL_OK);
     shell_dep_graph_t supplied = {0};
@@ -14779,7 +14790,8 @@ TEST(expansion_phases_survive_failed_setup) {
     ASSERT(shell_word == (fixture->active && fixture->shell_word));
     ASSERT(!redirect_write && (!substitution || fixture->active));
     shell_parse_result_t fast = {0};
-    shell_limits_t strict = {SHELL_MAX_SUBCOMMANDS, true};
+    shell_limits_t strict = {.max_subcommands = SHELL_MAX_SUBCOMMANDS,
+                             .strict_mode = true};
     size_t length = strlen(fixture->source);
     ASSERT(shell_parse_fast(fixture->source, length, &strict, &fast) ==
            SHELL_OK);
@@ -14831,7 +14843,8 @@ TEST(expansion_control_effects_require_reachable_setup) {
                           (uint32_t)file, 1, SHELL_DEP_FD_NONE));
     }
     shell_parse_result_t fast = {0};
-    shell_limits_t strict = {SHELL_MAX_SUBCOMMANDS, true};
+    shell_limits_t strict = {.max_subcommands = SHELL_MAX_SUBCOMMANDS,
+                             .strict_mode = true};
     size_t length = strlen(fixture->source);
     ASSERT(shell_parse_fast(fixture->source, length, &strict, &fast) ==
            SHELL_OK);
@@ -14866,7 +14879,8 @@ TEST(assignment_value_descriptor_snapshots) {
     } else
       ASSERT(graph.node_count == 0 && graph.edge_count == 0);
     shell_parse_result_t fast = {0};
-    shell_limits_t strict = {SHELL_MAX_SUBCOMMANDS, true};
+    shell_limits_t strict = {.max_subcommands = SHELL_MAX_SUBCOMMANDS,
+                             .strict_mode = true};
     ASSERT(shell_parse_fast(source, strlen(source), &strict, &fast) ==
            SHELL_OK);
     shell_dep_graph_t supplied = {0};
@@ -14953,7 +14967,8 @@ TEST(reachability_cwd_transitions) {
              strcmp(identity, expected) == 0);
     ASSERT(shell_dep_graph_validate(&graph).valid);
     shell_parse_result_t fast = {0};
-    shell_limits_t strict = {SHELL_MAX_SUBCOMMANDS, true};
+    shell_limits_t strict = {.max_subcommands = SHELL_MAX_SUBCOMMANDS,
+                             .strict_mode = true};
     ASSERT(shell_parse_fast(source, strlen(source), &strict, &fast) ==
            SHELL_OK);
     shell_dep_graph_t supplied = {0};
@@ -14975,7 +14990,7 @@ TEST(reachability_cwd_transitions) {
                                "/workspace", &limits, &graph) == SHELL_DEP_OK);
   ASSERT(graph.cwd_buf.len == sizeof("/workspace") &&
          shell_dep_graph_validate(&graph).valid);
-  static const char recovery[] = "cd \"$dir\"; cd /; printf payload >out";
+  static const char recovery[] = "cd \"$dir\"; cd / && printf payload >out";
   ASSERT(shell_dep_graph_parse(recovery, sizeof(recovery) - 1, "/workspace",
                                &limits, &graph) == SHELL_DEP_ETRUNC);
   ASSERT((graph.status & SHELL_DEP_STATUS_TRUNCATED) != 0);
@@ -15013,7 +15028,8 @@ TEST(skipped_duplication_operand_syntax) {
            count_edge_type(&graph, SHELL_EDGE_FD_CLOSE) == 0);
     ASSERT(shell_dep_graph_validate(&graph).valid);
     shell_parse_result_t fast = {0};
-    shell_limits_t strict = {SHELL_MAX_SUBCOMMANDS, true};
+    shell_limits_t strict = {.max_subcommands = SHELL_MAX_SUBCOMMANDS,
+                             .strict_mode = true};
     ASSERT(shell_parse_fast(source, strlen(source), &strict, &fast) ==
            SHELL_OK);
     shell_dep_graph_t supplied = {0};
@@ -15286,7 +15302,9 @@ TEST(document_execution_stage_ownership) {
     if (owner < 0 || doc < 0)
       printf("\n    execution stage: %s\n", cases[i].source);
     ASSERT(owner >= 0 && doc >= 0);
-    ASSERT(doc_content_equals(&graph.nodes[doc].doc, "body"));
+    ASSERT(doc_content_equals(
+        &graph.nodes[doc].doc,
+        graph.nodes[doc].doc.kind == SHELL_DOC_HERESTRING ? "body" : "body\n"));
     /* Overwritten fd-0 documents must be transient rather than read routes. */
     bool replaced = strstr(cases[i].source, "<<<body <input") != NULL;
     ASSERT(has_edge_fds(&graph, SHELL_EDGE_READ, (uint32_t)doc, (uint32_t)owner,
@@ -15633,9 +15651,9 @@ TEST(null_command_setup_scope_and_routes) {
     shell_dep_graph_t graph;
     ASSERT(parse(source, &graph) == SHELL_DEP_OK);
     int echo = find_cmd_tokens(&graph, "echo", "marker");
-    ASSERT(echo >= 0 && graph.nodes[echo].cmd.cwd_known);
-    ASSERT_STR_EQ(get_cwd_str(&graph, graph.nodes[echo].cmd.cwd_offset),
-                  cases[i].reached ? "/etc" : ".");
+    ASSERT(echo >= 0 && graph.nodes[echo].cmd.cwd_known == !cases[i].reached);
+    if (!cases[i].reached)
+      ASSERT_STR_EQ(get_cwd_str(&graph, graph.nodes[echo].cmd.cwd_offset), ".");
     ASSERT(shell_dep_graph_validate(&graph).valid);
     snprintf(source, sizeof(source),
              "exec 2>old || exit; %s %s exec 2>new; time true", cases[i].prefix,
@@ -18158,7 +18176,9 @@ TEST(document_and_cwd_boundary_contract) {
   shell_dep_graph_t relative_limited = {0};
   valid = valid &&
           shell_dep_graph_parse("cd ~/x; pwd", strlen("cd ~/x; pwd"), ".",
-                                &tiny_cwd, &home_limited) == SHELL_DEP_ETRUNC &&
+                                &tiny_cwd, &home_limited) == SHELL_DEP_OK &&
+          !home_limited.nodes[find_cmd_tokens(&home_limited, "pwd", NULL)]
+               .cmd.cwd_known &&
           shell_dep_graph_validate(&home_limited).valid &&
           shell_dep_graph_parse("cd ./relative; pwd",
                                 strlen("cd ./relative; pwd"), ".", &tiny_cwd,
@@ -18168,8 +18188,8 @@ TEST(document_and_cwd_boundary_contract) {
   shell_dep_graph_t deduplicated = {0};
   valid =
       valid &&
-      shell_dep_graph_parse("cd /tmp; cd /tmp; pwd",
-                            strlen("cd /tmp; cd /tmp; pwd"), ".", NULL,
+      shell_dep_graph_parse("cd /tmp && cd /tmp && pwd",
+                            strlen("cd /tmp && cd /tmp && pwd"), ".", NULL,
                             &deduplicated) == SHELL_DEP_OK &&
       count_type(&deduplicated, SHELL_NODE_CMD) == 3 &&
       strcmp(deduplicated.cwd_buf.data +

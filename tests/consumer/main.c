@@ -1,6 +1,7 @@
 #include <env_screener.h>
 #include <shell_depgraph.h>
 #include <shell_sequence.h>
+#include <shell_source.h>
 #include <shell_tokenizer.h>
 #include <shellgate.h>
 #include <shelltype.h>
@@ -208,7 +209,7 @@ static bool check_depgraph_workspace_api(void) {
     ok = ok && stderr_to_stdout && shell_dep_graph_validate(&graph).valid;
   }
   if (ok) {
-    static const char directory[] = "cd /tmp; pwd";
+    static const char directory[] = "cd /tmp && pwd";
     ok = shell_dep_graph_parse(directory, sizeof(directory) - 1, "/", &limits,
                                &graph) == SHELL_DEP_OK &&
          shell_dep_graph_validate(&graph).valid;
@@ -244,6 +245,20 @@ static bool check_depgraph_workspace_api(void) {
              absolute && written == 9 && strcmp(path, "/dev/null") == 0;
       }
     ok = ok && implicit == 1;
+  }
+  if (ok) {
+    static const char source[] = "echo before\ncat >target <<'EOF'\nalpha\n";
+    shell_source_result_t *draft = malloc(sizeof(*draft));
+    ok = draft &&
+         shell_parse_draft(source, sizeof(source) - 1, NULL, draft) ==
+             SHELL_SOURCE_INCOMPLETE &&
+         draft->prefix_length == sizeof("echo before\n") - 1 &&
+         draft->heredoc_count == 1 && draft->heredocs[0].content.value_len == 6;
+    if (ok)
+      ok = shell_dep_graph_parse_with_fast(source, draft->prefix_length, "/",
+                                           &limits, &draft->prefix,
+                                           &graph) == SHELL_DEP_OK;
+    free(draft);
   }
   free(raw);
   return ok;
