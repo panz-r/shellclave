@@ -5,9 +5,29 @@ define the current API; rebuild consumers after updating the library.
 
 ## Unreleased: typed source admission
 
+Ordinary single and double quotes now admit literal high bytes, including
+invalid UTF-8 and concatenated fragments. `printf '%s' '日本'` is COMPLETE and
+available to semantic consumers. Unquoted `printf '%s' 日本` remains
+UNSUPPORTED. Canonical values and source offsets preserve exact bytes.
+
+Single-quoted backslashes now retain their literal meaning at closing quotes,
+including before command separators. Source classification, structured
+processing, and diagnostic transformations agree on these command boundaries.
+Byte-oriented syntax and token classification are independent of the embedding
+application's locale, including ASCII-only identifier checks, numeric operand
+whitespace, case-insensitive metadata names, and diagnostic byte escaping.
+No application locale initialization is required for analysis.
+
+Executor startup must set `LC_ALL` to C/POSIX or an installed UTF-8 locale and
+make it readonly. `LC_ALL` joins the protected executor-variable set alongside
+`BASH_COMPAT`. Assignments and declaration/`printf`/`getopts` writes are
+unsupported; modeled `read` and `unset` retain their readonly-target failure
+behavior. The library relies on this fixed execution contract. Update launchers
+before submitting the newly admitted source.
+
 `shell_source_status_t` adds UNSUPPORTED and INVALID_INPUT after the existing
 values, without enlarging retained result structures. Update exhaustive status
-switches. INVALID now establishes a grammar error; ordinary non-ASCII source,
+switches. INVALID now establishes a grammar error; unquoted non-ASCII source,
 unsupported committed constructs, and unclassified expansion forms are
 UNSUPPORTED. Embedded NUL is INVALID_INPUT. Source limits remain TRUNCATED.
 

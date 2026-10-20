@@ -18,7 +18,6 @@
 #include "shell_tokenizer.h"
 #include "shell_tokenizer_full_internal.h"
 #include "shelltype.h"
-#include <ctype.h>
 #include <math.h>
 #include <stdarg.h>
 #include <stdint.h>

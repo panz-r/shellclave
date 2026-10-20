@@ -1378,6 +1378,18 @@ static const struct {
   /* Lexing/processing is valid, but graph support depends on prior state. */
   bool stateful;
 } shellsplit_test_builtin_options[] = {
+    /* LC_ALL is fixed and readonly in trusted executor startup. All writing
+     * builtin paths share the existing frozen-variable constraint. */
+    {"export LC_ALL=C", false},
+    {"declare LC_ALL=C", false},
+    {"unset LC_ALL", true},
+    {"read LC_ALL <<<C", true},
+    {"printf -v LC_ALL %s C", false},
+    {"printf '%n' LC_ALL", false},
+    {"getopts a LC_ALL -a", false},
+    {"exec {LC_ALL}>out", false},
+    {"command builtin printf -v LC_ALL %s C", false},
+    {"printf '%s' LC_ALL", true},
     /* Completion word lists are expanded again, callbacks execute source, and
      * Readline key bindings can run registered code during noninteractive read.
      * Reject the builtin family until those separate runtime grammars exist. */

@@ -901,13 +901,17 @@ typedef struct {
  * and must start in the documented clean noninteractive state. Start
  * it with `POSIXLY_CORRECT` absent (not merely empty), clear `BASH_COMPAT` and
  * `BASH_XTRACEFD`, then make all three variables readonly before evaluating
- * submitted source. `bash -p -c ...` is the
+ * submitted source. Set LC_ALL to C/POSIX or an installed UTF-8 locale before
+ * launching Bash and make it readonly in trusted startup. The parser uses
+ * byte-oriented syntax under this fixed contract, independently of the
+ * embedding application's locale. Analysis does not change that locale.
+ * `bash -p -c ...` is the
  * supported basis: privileged mode ignores `BASH_ENV`, `BASHOPTS`, and
  * `SHELLOPTS`, and declines imported shell functions that could shadow a
  * modelled builtin such as `exec`. An equivalent launcher must establish the
  * same option and command-lookup state before source validation, including no
  * startup aliases or traps, no disabled or shadowed modelled builtins, and a
- * frozen `POSIXLY_CORRECT`, `BASH_COMPAT`, and `BASH_XTRACEFD`. A
+ * frozen `POSIXLY_CORRECT`, `BASH_COMPAT`, `BASH_XTRACEFD`, and `LC_ALL`. A
  * runtime-expanded command word is
  * intentionally not promoted to one of these builtin roles.
  * Completion and Readline can expand input data as shell source or execute

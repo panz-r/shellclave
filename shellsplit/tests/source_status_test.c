@@ -1,3 +1,4 @@
+#include "shell_sequence.h"
 #include "shell_source.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -48,7 +49,7 @@ static void heredoc_failure_domains(void) {
       {"cat << < file", SHELL_SOURCE_INVALID},
       {"cat <<; cat <<'Q'\né\nQ\n", SHELL_SOURCE_INVALID},
       {"cat <<$\"END\"\npayload\nEND\n", SHELL_SOURCE_UNSUPPORTED},
-      {"cat <<\nprintf 'é'", SHELL_SOURCE_UNSUPPORTED},
+      {"cat <<\nprintf é", SHELL_SOURCE_UNSUPPORTED},
   };
   for (size_t b = 0; b < sizeof(bodies) / sizeof(bodies[0]); ++b)
     for (size_t d = 0; d < sizeof(delimiters) / sizeof(delimiters[0]); ++d) {
@@ -126,11 +127,24 @@ static void redirect_operator_boundaries(void) {
 
 int main(int argc, char **argv) {
   /* The Bash qualification driver supplies bytes without shell evaluation. */
-  if (argc == 2 && !strcmp(argv[1], "--probe")) {
+  if (argc == 2 &&
+      (!strcmp(argv[1], "--probe") || !strcmp(argv[1], "--argv"))) {
     char source[16384];
     size_t length = fread(source, 1, sizeof(source), stdin);
     CHECK(!ferror(stdin) && length < sizeof(source));
-    printf("%d\n", shell_parse_draft(source, length, NULL, &draft));
+    if (!strcmp(argv[1], "--probe"))
+      printf("%d\n", shell_parse_draft(source, length, NULL, &draft));
+    else {
+      shell_netstring_buffer_t encoded = {0};
+      size_t count = 0;
+      bool features = false;
+      CHECK(shell_build_netargv_sequence_buffer(source, length, NULL, &encoded,
+                                                &count,
+                                                &features) == SHELL_PROCESS_OK);
+      CHECK(count == 1 &&
+            fwrite(encoded.data, 1, encoded.length, stdout) == encoded.length);
+      shell_netstring_buffer_free(&encoded);
+    }
     return EXIT_SUCCESS;
   }
   CHECK(argc == 1);
@@ -198,8 +212,9 @@ int main(int argc, char **argv) {
       {"{ :; } >$(printf file)", SHELL_SOURCE_COMPLETE},
       {"echo 'unfinished", SHELL_SOURCE_INCOMPLETE},
       {"echo $(echo 'unfinished", SHELL_SOURCE_INCOMPLETE},
-      {"printf '%s' '日本'", SHELL_SOURCE_UNSUPPORTED},
-      {"echo $(printf '%s' '日本')", SHELL_SOURCE_UNSUPPORTED},
+      {"printf '%s' '日本'", SHELL_SOURCE_COMPLETE},
+      {"echo $(printf '%s' '日本')", SHELL_SOURCE_COMPLETE},
+      {"printf '%s' 日本", SHELL_SOURCE_UNSUPPORTED},
       {"printf '\001'", SHELL_SOURCE_UNSUPPORTED},
       {"printf '\177'", SHELL_SOURCE_UNSUPPORTED},
       {"if true; then :; fi", SHELL_SOURCE_UNSUPPORTED},
@@ -304,7 +319,7 @@ int main(int argc, char **argv) {
       {"read -nwrong value <<<payload", SHELL_SOURCE_COMPLETE},
       {"echo before; if", SHELL_SOURCE_INCOMPLETE},
       {"echo before; if ", SHELL_SOURCE_UNSUPPORTED},
-      {"printf '%s' '日本'\ncat <<\n", SHELL_SOURCE_UNSUPPORTED},
+      {"printf '%s' '日本'\ncat <<\n", SHELL_SOURCE_INVALID},
       {"if true; then :; fi\ncat <<\n", SHELL_SOURCE_UNSUPPORTED},
       {"cat <<\nif true; then :; fi", SHELL_SOURCE_INVALID},
       {"cat <<'EOF'\n日本\nEOF\n", SHELL_SOURCE_COMPLETE},

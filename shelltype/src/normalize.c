@@ -18,12 +18,11 @@
 #include "shell_netstring.h"
 #include "shelltype.h"
 
-#include <ctype.h>
+#include "shell_ascii.h"
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <strings.h>
 
 #include "alloc.h"
 
@@ -941,7 +940,8 @@ static bool span_eq(st_text_span_t text, const char *literal) {
 
 static bool span_eq_ci(st_text_span_t text, const char *literal) {
   size_t length = strlen(literal);
-  return text.length == length && strncasecmp(text.data, literal, length) == 0;
+  return text.length == length &&
+         shell_ascii_equal_ci(text.data, literal, length);
 }
 
 static bool span_starts(st_text_span_t text, const char *literal) {
@@ -966,7 +966,8 @@ static bool span_has_pair(st_text_span_t text, char first, char second) {
   return false;
 }
 
-static bool span_all_ascii(st_text_span_t text, int (*predicate)(int)) {
+static SHELL_NONNULL(2) bool span_all_ascii(st_text_span_t text,
+                                            bool (*predicate)(unsigned char)) {
   for (size_t i = 0; i < text.length; i++)
     if (!predicate((unsigned char)text.data[i]))
       return false;
@@ -980,7 +981,7 @@ static bool span_is_decimal_number(st_text_span_t token) {
   if (i == token.length)
     return false;
   for (; i < token.length; i++)
-    if (!isdigit((unsigned char)token.data[i]))
+    if (!shell_ascii_digit((unsigned char)token.data[i]))
       return false;
   return true;
 }
@@ -989,7 +990,7 @@ static bool span_is_hex_number(st_text_span_t token) {
   return token.length > 2 && token.data[0] == '0' &&
          (token.data[1] == 'x' || token.data[1] == 'X') &&
          span_all_ascii((st_text_span_t){token.data + 2, token.length - 2},
-                        isxdigit);
+                        shell_ascii_xdigit);
 }
 
 static bool span_is_hex_hash(st_text_span_t token) {
@@ -998,9 +999,9 @@ static bool span_is_hex_hash(st_text_span_t token) {
   bool has_alpha = false;
   for (size_t i = 0; i < token.length; i++) {
     unsigned char c = (unsigned char)token.data[i];
-    if (!isxdigit(c))
+    if (!shell_ascii_xdigit(c))
       return false;
-    has_alpha |= isalpha(c) != 0;
+    has_alpha |= shell_ascii_alpha(c) != 0;
   }
   return has_alpha;
 }
@@ -1009,12 +1010,12 @@ static bool span_is_ipv4(st_text_span_t token) {
   size_t position = 0;
   for (size_t segment = 0; segment < 4; segment++) {
     if (position == token.length ||
-        !isdigit((unsigned char)token.data[position]))
+        !shell_ascii_digit((unsigned char)token.data[position]))
       return false;
     unsigned value = 0;
     size_t digits = 0;
     while (position < token.length &&
-           isdigit((unsigned char)token.data[position])) {
+           shell_ascii_digit((unsigned char)token.data[position])) {
       value = value * 10u + (unsigned)(token.data[position] - '0');
       if (++digits > 3 || value > 255)
         return false;
@@ -1034,7 +1035,7 @@ static bool span_is_mac(st_text_span_t token) {
   char separator = '\0';
   for (size_t i = 0; i < token.length; i++) {
     if (i % 3 != 2) {
-      if (!isxdigit((unsigned char)token.data[i]))
+      if (!shell_ascii_xdigit((unsigned char)token.data[i]))
         return false;
     } else if (separator == '\0') {
       if (token.data[i] != ':' && token.data[i] != '-')
@@ -1066,7 +1067,7 @@ static bool span_is_cron_like(st_text_span_t token) {
   bool has_digit_or_star = false;
   for (size_t i = 0; i < token.length; i++) {
     char c = token.data[i];
-    if (isdigit((unsigned char)c) || c == '*')
+    if (shell_ascii_digit((unsigned char)c) || c == '*')
       has_digit_or_star = true;
     else if (c != '-' && c != ',' && c != '/')
       return false;
@@ -1089,7 +1090,7 @@ static bool span_is_filename(st_text_span_t token) {
 
 static bool span_has_whitespace(st_text_span_t token) {
   for (size_t i = 0; i < token.length; i++)
-    if (isspace((unsigned char)token.data[i]))
+    if (shell_ascii_space((unsigned char)token.data[i]))
       return true;
   return false;
 }
@@ -1098,7 +1099,7 @@ static bool span_is_short_option(st_text_span_t token) {
   if (token.length < 2 || token.data[0] != '-' || token.data[1] == '-')
     return false;
   return span_all_ascii((st_text_span_t){token.data + 1, token.length - 1},
-                        isalnum);
+                        shell_ascii_alnum);
 }
 
 static bool span_is_long_option(st_text_span_t token) {
@@ -1106,7 +1107,7 @@ static bool span_is_long_option(st_text_span_t token) {
     return false;
   for (size_t i = 2; i < token.length; i++) {
     char c = token.data[i];
-    if (!isalnum((unsigned char)c) && c != '-' && c != '=')
+    if (!shell_ascii_alnum((unsigned char)c) && c != '-' && c != '=')
       return false;
   }
   return true;
@@ -1119,11 +1120,12 @@ static bool span_is_url(st_text_span_t token) {
   size_t scheme_length = (size_t)(colon - token.data);
   if (scheme_length == 0 || scheme_length + 2 >= token.length ||
       colon[1] != '/' || colon[2] != '/' ||
-      !isalpha((unsigned char)token.data[0]))
+      !shell_ascii_alpha((unsigned char)token.data[0]))
     return false;
   for (size_t i = 1; i < scheme_length; i++) {
     char c = token.data[i];
-    if (!isalnum((unsigned char)c) && c != '+' && c != '-' && c != '.')
+    if (!shell_ascii_alnum((unsigned char)c) && c != '+' && c != '-' &&
+        c != '.')
       return false;
   }
   return true;
@@ -1136,7 +1138,7 @@ static bool span_is_uuid(st_text_span_t token) {
   size_t position = 0;
   for (size_t group = 0; group < sizeof(groups) / sizeof(groups[0]); group++) {
     for (size_t i = 0; i < groups[group]; i++)
-      if (!isxdigit((unsigned char)token.data[position++]))
+      if (!shell_ascii_xdigit((unsigned char)token.data[position++]))
         return false;
     if (group + 1 != sizeof(groups) / sizeof(groups[0]) &&
         token.data[position++] != '-')
@@ -1154,12 +1156,12 @@ static bool span_is_email(st_text_span_t token) {
   for (size_t i = 0; i < token.length; i++) {
     char c = token.data[i];
     if (i < at_index) {
-      if (!isalnum((unsigned char)c) && c != '.' && c != '_' && c != '-' &&
-          c != '+')
+      if (!shell_ascii_alnum((unsigned char)c) && c != '.' && c != '_' &&
+          c != '-' && c != '+')
         return false;
     } else if (i > at_index) {
       has_dot |= c == '.';
-      if (!isalnum((unsigned char)c) && c != '.' && c != '-')
+      if (!shell_ascii_alnum((unsigned char)c) && c != '.' && c != '-')
         return false;
     }
   }
@@ -1172,8 +1174,8 @@ static bool span_is_hostname(st_text_span_t token) {
       "dev", "app", "cloud", "local", "int", "biz", "info", NULL};
   if (token.length == 0 || token.data[0] == '-' ||
       token.data[token.length - 1] == '-' ||
-      !isalnum((unsigned char)token.data[0]) ||
-      !isalnum((unsigned char)token.data[token.length - 1]))
+      !shell_ascii_alnum((unsigned char)token.data[0]) ||
+      !shell_ascii_alnum((unsigned char)token.data[token.length - 1]))
     return false;
   bool has_dot = false;
   bool has_hyphen_before_dot = false;
@@ -1190,7 +1192,7 @@ static bool span_is_hostname(st_text_span_t token) {
       last_dot = i;
       if (i != 0 && token.data[i - 1] == '.')
         return false;
-    } else if (!isalnum((unsigned char)c)) {
+    } else if (!shell_ascii_alnum((unsigned char)c)) {
       return false;
     }
   }
@@ -1211,8 +1213,8 @@ static bool span_is_duration(st_text_span_t token) {
   size_t i = token.data[0] == '-' ? 1 : 0;
   bool has_digit = false;
   bool has_dot = false;
-  while (i < token.length &&
-         (isdigit((unsigned char)token.data[i]) || token.data[i] == '.')) {
+  while (i < token.length && (shell_ascii_digit((unsigned char)token.data[i]) ||
+                              token.data[i] == '.')) {
     if (token.data[i] == '.') {
       if (has_dot)
         return false;
@@ -1240,11 +1242,11 @@ static bool span_is_size(st_text_span_t token) {
   bool has_dot = false;
   bool has_digit = false;
   while (number_end < token.length &&
-         (isdigit((unsigned char)token.data[number_end]) ||
+         (shell_ascii_digit((unsigned char)token.data[number_end]) ||
           token.data[number_end] == '.')) {
     if (token.data[number_end] == '.') {
       if (has_dot || number_end + 1 == token.length ||
-          !isdigit((unsigned char)token.data[number_end + 1]))
+          !shell_ascii_digit((unsigned char)token.data[number_end + 1]))
         return false;
       has_dot = true;
     } else {
@@ -1266,10 +1268,11 @@ static bool span_is_size(st_text_span_t token) {
 
 static bool span_parse_semver_number(st_text_span_t token, size_t *position) {
   size_t start = *position;
-  if (start == token.length || !isdigit((unsigned char)token.data[start]))
+  if (start == token.length ||
+      !shell_ascii_digit((unsigned char)token.data[start]))
     return false;
   while (*position < token.length &&
-         isdigit((unsigned char)token.data[*position]))
+         shell_ascii_digit((unsigned char)token.data[*position]))
     (*position)++;
   return token.data[start] != '0' || *position == start + 1;
 }
@@ -1281,9 +1284,9 @@ static bool span_parse_semver_identifiers(st_text_span_t token,
     size_t start = *position;
     bool numeric = true;
     while (*position < token.length &&
-           (isalnum((unsigned char)token.data[*position]) ||
+           (shell_ascii_alnum((unsigned char)token.data[*position]) ||
             token.data[*position] == '-')) {
-      if (!isdigit((unsigned char)token.data[*position]))
+      if (!shell_ascii_digit((unsigned char)token.data[*position]))
         numeric = false;
       (*position)++;
     }
@@ -1327,7 +1330,7 @@ static bool span_parse_digits(st_text_span_t token, size_t position,
   *value = 0;
   for (size_t i = 0; i < count; i++) {
     char c = token.data[position + i];
-    if (!isdigit((unsigned char)c))
+    if (!shell_ascii_digit((unsigned char)c))
       return false;
     *value = *value * 10 + (c - '0');
   }
@@ -1398,8 +1401,8 @@ static bool span_is_ipv6(st_text_span_t token) {
         span_find((st_text_span_t){zone + 1, token.length - end - 1}, '%'))
       return false;
     for (size_t i = end + 1; i < token.length; i++)
-      if (!isalnum((unsigned char)token.data[i]) && token.data[i] != '_' &&
-          token.data[i] != '.' && token.data[i] != '-')
+      if (!shell_ascii_alnum((unsigned char)token.data[i]) &&
+          token.data[i] != '_' && token.data[i] != '.' && token.data[i] != '-')
         return false;
   }
   if (end < 2)
@@ -1414,7 +1417,7 @@ static bool span_is_ipv6(st_text_span_t token) {
   }
   while (i < end) {
     size_t start = i, digits = 0;
-    while (i < end && isxdigit((unsigned char)token.data[i])) {
+    while (i < end && shell_ascii_xdigit((unsigned char)token.data[i])) {
       i++;
       digits++;
     }
@@ -1466,23 +1469,26 @@ static bool span_is_env_var(st_text_span_t token) {
     begin++;
     end--;
   }
-  if (!isalpha((unsigned char)token.data[begin]) && token.data[begin] != '_')
+  if (!shell_ascii_alpha((unsigned char)token.data[begin]) &&
+      token.data[begin] != '_')
     return false;
   for (size_t i = begin + 1; i < end; i++)
-    if (!isalnum((unsigned char)token.data[i]) && token.data[i] != '_')
+    if (!shell_ascii_alnum((unsigned char)token.data[i]) &&
+        token.data[i] != '_')
       return false;
   return true;
 }
 
 static bool span_is_hyphenated(st_text_span_t token) {
-  if (token.length == 0 ||
-      (!isalpha((unsigned char)token.data[0]) && token.data[0] != '_'))
+  if (token.length == 0 || (!shell_ascii_alpha((unsigned char)token.data[0]) &&
+                            token.data[0] != '_'))
     return false;
   bool hyphen = false;
   for (size_t i = 1; i < token.length; i++) {
     if (token.data[i] == '-')
       hyphen = true;
-    else if (!isalnum((unsigned char)token.data[i]) && token.data[i] != '_')
+    else if (!shell_ascii_alnum((unsigned char)token.data[i]) &&
+             token.data[i] != '_')
       return false;
   }
   return hyphen;
@@ -1508,11 +1514,12 @@ static bool span_is_branch(st_text_span_t token) {
         return false;
       slash = true;
     } else if (c == '.' ||
-               (!isalnum((unsigned char)c) && c != '-' && c != '_')) {
+               (!shell_ascii_alnum((unsigned char)c) && c != '-' && c != '_')) {
       return false;
     }
   }
-  return slash && isalnum((unsigned char)token.data[token.length - 1]);
+  return slash &&
+         shell_ascii_alnum((unsigned char)token.data[token.length - 1]);
 }
 
 static bool span_is_sha(st_text_span_t token) {
@@ -1551,9 +1558,10 @@ static bool span_is_image(st_text_span_t token) {
       st_text_span_t digest = {token.data + i + 1, token.length - i - 1};
       if (digest.length != 71 || !span_starts(digest, "sha256:"))
         return false;
-      return span_all_ascii((st_text_span_t){digest.data + 7, 64}, isxdigit);
-    } else if (!isalnum((unsigned char)c) && c != '.' && c != '-' && c != '_' &&
-               c != '/') {
+      return span_all_ascii((st_text_span_t){digest.data + 7, 64},
+                            shell_ascii_xdigit);
+    } else if (!shell_ascii_alnum((unsigned char)c) && c != '.' && c != '-' &&
+               c != '_' && c != '/') {
       return false;
     }
   }
@@ -1566,14 +1574,14 @@ static bool span_is_pkg(st_text_span_t token) {
   size_t i = 0;
   if (token.data[0] == '@') {
     for (i = 1; i < token.length && token.data[i] != '/'; i++)
-      if (!isalnum((unsigned char)token.data[i]) && token.data[i] != '-' &&
-          token.data[i] != '_')
+      if (!shell_ascii_alnum((unsigned char)token.data[i]) &&
+          token.data[i] != '-' && token.data[i] != '_')
         return false;
     if (i == 1 || i == token.length || ++i == token.length)
       return false;
     for (; i < token.length && token.data[i] != '@'; i++)
-      if (!isalnum((unsigned char)token.data[i]) && token.data[i] != '.' &&
-          token.data[i] != '-' && token.data[i] != '_')
+      if (!shell_ascii_alnum((unsigned char)token.data[i]) &&
+          token.data[i] != '.' && token.data[i] != '-' && token.data[i] != '_')
         return false;
     if (i == token.length)
       return true;
@@ -1581,8 +1589,8 @@ static bool span_is_pkg(st_text_span_t token) {
       return false;
   } else {
     for (; i < token.length && token.data[i] != '@'; i++)
-      if (!isalnum((unsigned char)token.data[i]) && token.data[i] != '.' &&
-          token.data[i] != '-' && token.data[i] != '_')
+      if (!shell_ascii_alnum((unsigned char)token.data[i]) &&
+          token.data[i] != '.' && token.data[i] != '-' && token.data[i] != '_')
         return false;
     if (i == 0 || i == token.length || ++i == token.length)
       return false;
@@ -1590,10 +1598,10 @@ static bool span_is_pkg(st_text_span_t token) {
   bool version_char = token.data[0] == '@';
   for (; i < token.length; i++) {
     char c = token.data[i];
-    if (!isalnum((unsigned char)c) && c != '.' && c != '-' && c != '^' &&
-        c != '~' && c != '<' && c != '>' && c != '=')
+    if (!shell_ascii_alnum((unsigned char)c) && c != '.' && c != '-' &&
+        c != '^' && c != '~' && c != '<' && c != '>' && c != '=')
       return false;
-    if (isdigit((unsigned char)c) || c == '.' || c == '-')
+    if (shell_ascii_digit((unsigned char)c) || c == '.' || c == '-')
       version_char = true;
   }
   return version_char;
@@ -1604,8 +1612,8 @@ static bool span_is_fingerprint(st_text_span_t token) {
     if (token.length != 50)
       return false;
     for (size_t i = 7; i < token.length; i++)
-      if (!isalnum((unsigned char)token.data[i]) && token.data[i] != '+' &&
-          token.data[i] != '/' && token.data[i] != '=')
+      if (!shell_ascii_alnum((unsigned char)token.data[i]) &&
+          token.data[i] != '+' && token.data[i] != '/' && token.data[i] != '=')
         return false;
     return true;
   }
@@ -1613,8 +1621,8 @@ static bool span_is_fingerprint(st_text_span_t token) {
     return false;
   for (size_t i = 0; i < 16; i++) {
     size_t pos = i * 3;
-    if (!isxdigit((unsigned char)token.data[pos]) ||
-        !isxdigit((unsigned char)token.data[pos + 1]) ||
+    if (!shell_ascii_xdigit((unsigned char)token.data[pos]) ||
+        !shell_ascii_xdigit((unsigned char)token.data[pos + 1]) ||
         (i < 15 && token.data[pos + 2] != ':'))
       return false;
   }
@@ -1702,12 +1710,13 @@ static bool span_is_user(st_text_span_t token) {
                                       "oprofile-agent",
                                       NULL};
   if (token.length == 0 || token.length > 32 ||
-      (!islower((unsigned char)token.data[0]) && token.data[0] != '_'))
+      (!shell_ascii_lower((unsigned char)token.data[0]) &&
+       token.data[0] != '_'))
     return false;
   for (size_t i = 1; i < token.length; i++)
-    if (!islower((unsigned char)token.data[i]) &&
-        !isdigit((unsigned char)token.data[i]) && token.data[i] != '_' &&
-        token.data[i] != '-')
+    if (!shell_ascii_lower((unsigned char)token.data[i]) &&
+        !shell_ascii_digit((unsigned char)token.data[i]) &&
+        token.data[i] != '_' && token.data[i] != '-')
       return false;
   for (const char *const *user = users; *user; user++)
     if (span_eq(token, *user))
@@ -1759,7 +1768,7 @@ static bool span_is_range(st_text_span_t token) {
   for (size_t i = 0; i < token.length; i++) {
     if (token.data[i] == '-')
       hyphens++;
-    else if (!isdigit((unsigned char)token.data[i]))
+    else if (!shell_ascii_digit((unsigned char)token.data[i]))
       return false;
   }
   return hyphens == 1;
@@ -1790,7 +1799,8 @@ static bool span_is_user_group(st_text_span_t token) {
                            token.length - (size_t)(colon - token.data) - 1},
           ':') ||
       span_has(token, '.') || span_has(token, '/') ||
-      (!islower((unsigned char)token.data[0]) && token.data[0] != '_'))
+      (!shell_ascii_lower((unsigned char)token.data[0]) &&
+       token.data[0] != '_'))
     return false;
   size_t user_length = (size_t)(colon - token.data);
   bool hyphen = span_has(token, '-');
@@ -1812,9 +1822,9 @@ static bool span_is_user_group(st_text_span_t token) {
     char c = token.data[i];
     if (i == user_length)
       continue;
-    if (!isalnum((unsigned char)c) && c != '_' && c != '-')
+    if (!shell_ascii_alnum((unsigned char)c) && c != '_' && c != '-')
       return false;
-    if (islower((unsigned char)c)) {
+    if (shell_ascii_lower((unsigned char)c)) {
       if (i < user_length)
         user_lower = true;
       else

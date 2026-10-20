@@ -50,6 +50,43 @@ static SHELL_NONNULL(1, 3, 4) bool report_is(const char *source,
   return valid;
 }
 
+static int quoted_policy_bytes(void) {
+  st_policy_ctx_t *context = st_policy_ctx_new();
+  st_policy_t *allow = context ? st_policy_new(context) : NULL;
+  st_policy_t *deny = allow ? st_policy_new(context) : NULL;
+  st_policy_ctx_release(context);
+  CHECK(deny && add_rule(allow, "printf %s 日本") &&
+        add_rule(allow, "printf %s é") &&
+        add_rule(allow, "printf %s \x80\xff"));
+  sg_gate_t *gate = sg_gate_new_with_policies_owned(allow, deny);
+  CHECK(gate && sg_gate_set_stop_mode(gate, SG_EVAL_ALL) == SG_OK);
+  static const struct {
+    const char *source;
+    sg_verdict_t verdict;
+  } cases[] = {
+      {"printf %s '日本'", SG_VERDICT_ALLOW},
+      {"printf %s \"日本\"", SG_VERDICT_ALLOW},
+      {"printf %s 'é'", SG_VERDICT_ALLOW},
+      {"printf %s 'é'", SG_VERDICT_UNDETERMINED},
+      {"printf %s '\x80\xff'", SG_VERDICT_ALLOW},
+      {"printf %s '\x80\xfe'", SG_VERDICT_UNDETERMINED},
+  };
+  size_t size = sg_gate_evaluate_size_hint(256);
+  CHECK(size != SIZE_MAX);
+  char *buffer = malloc(size);
+  CHECK(buffer);
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+    sg_result_t result;
+    CHECK(sg_gate_evaluate(gate, cases[i].source, strlen(cases[i].source),
+                           buffer, size, &result) == SG_OK);
+    CHECK(result.verdict == cases[i].verdict && !result.truncated &&
+          !result.short_circuited && !result.unresolved_expansion_flags);
+  }
+  free(buffer);
+  sg_gate_free(gate);
+  return EXIT_SUCCESS;
+}
+
 static int graph_example(void) {
   const char source[] = "git status --short >report.txt";
   static shell_dep_graph_t graph;
@@ -98,6 +135,7 @@ static int graph_example(void) {
 }
 
 int main(void) {
+  CHECK(quoted_policy_bytes() == EXIT_SUCCESS);
   CHECK(gate_example_main() == EXIT_SUCCESS);
   sg_gate_t *gate = example_gate();
   CHECK(gate != NULL);
@@ -125,6 +163,12 @@ int main(void) {
       {"cd /tmp", SG_VERDICT_UNDETERMINED, 1, 0, false, false,
        "argv policy UNDETERMINED\n"},
       {"echo \"\"", SG_VERDICT_ALLOW, 1, 0, false, false,
+       "argv policy ALLOW\n"},
+      {"echo '日本'", SG_VERDICT_ALLOW, 1, 0, false, false,
+       "argv policy ALLOW\n"},
+      {"echo '\x80\xff'", SG_VERDICT_ALLOW, 1, 0, false, false,
+       "argv policy ALLOW\n"},
+      {"echo '日本' >'résumé.txt'", SG_VERDICT_ALLOW, 1, 0, false, false,
        "argv policy ALLOW\n"},
       {"echo one two", SG_VERDICT_UNDETERMINED, 1, 0, false, false,
        "argv policy UNDETERMINED\n"},

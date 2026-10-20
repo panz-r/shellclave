@@ -259,10 +259,13 @@ static bool check_depgraph_workspace_api(void) {
                                            &limits, &draft->prefix,
                                            &graph) == SHELL_DEP_OK;
     if (ok) {
-      static const char unsupported[] = "printf '%s' '日本'";
+      static const char quoted[] = "printf '%s' '日本'";
+      static const char unsupported[] = "printf '%s' 日本";
       static const char malformed[] = "cat <<\n";
       static const char nul[] = "echo\0x";
-      ok = shell_parse_draft(unsupported, sizeof(unsupported) - 1, NULL,
+      ok = shell_parse_draft(quoted, sizeof(quoted) - 1, NULL, draft) ==
+               SHELL_SOURCE_COMPLETE &&
+           shell_parse_draft(unsupported, sizeof(unsupported) - 1, NULL,
                              draft) == SHELL_SOURCE_UNSUPPORTED &&
            shell_parse_draft(malformed, sizeof(malformed) - 1, NULL, draft) ==
                SHELL_SOURCE_INVALID &&

@@ -33,7 +33,8 @@ class SourceStatusContract(unittest.TestCase):
             (b': |&\n"time" {', 0), (b": |\n\n\\time {", 0),
             (b': |&\ntime"" {', 0), (b"echo $(: |\ntime {)", 0),
             (b": |\ntime", 0),
-            ("printf '%s' '日本'".encode(), 4),
+            ("printf '%s' '日本'".encode(), 0),
+            ("printf '%s' 日本".encode(), 4),
             (b"if true; then :; fi", 4),
             (b"case x in x) :;; esac", 4),
             (b"f() { :; }", 4),
@@ -161,7 +162,8 @@ class SourceStatusContract(unittest.TestCase):
                 self.assertEqual(self.classify(prefix + b"cat <<'unfinished"), 1)
                 self.assertEqual(self.classify(prefix + b":"), 0)
                 # Unknown code remains unknown even after a known bad header.
-                self.assertEqual(self.classify(prefix + "cat <<\nprintf 'é'".encode()), 4)
+                self.assertEqual(self.classify(prefix + "cat <<\nprintf é".encode()), 4)
+                self.assertEqual(self.classify(prefix + "cat <<\nprintf 'é'".encode()), 2)
 
     def test_redirect_operators_are_complete_lexical_units(self):
         invalid = [b"<<<<x", b"<<<>x", b">>&x", b"<>&3", b">><x", b"<<< >x"]
@@ -196,12 +198,98 @@ class SourceStatusContract(unittest.TestCase):
                 self.assertEqual(self.classify(source), 2)
 
     def test_mixed_unknown_is_not_a_validity_claim(self):
-        cases = ["printf '%s' '日本'\ncat <<\n".encode(),
+        cases = ["printf '%s' 日本\ncat <<\n".encode(),
                  b"if true; then :; fi\ncat <<\n"]
         for source in cases:
             with self.subTest(source=source):
                 self.assertNotEqual(self.syntax(source), 0)
                 self.assertEqual(self.classify(source), 4)
+
+    def test_fixed_executor_locale(self):
+        environment = dict(os.environ, BASH_ENV="", ENV="", LC_ALL="C")
+        for operation in (b"LC_ALL=POSIX", b"LC_ALL=POSIX printf ok",
+                          b"export LC_ALL=POSIX", b"declare LC_ALL=POSIX",
+                          b"unset LC_ALL", b"read LC_ALL <<<POSIX",
+                          b"printf -v LC_ALL %s POSIX", b"printf '%n' LC_ALL",
+                          b"getopts a LC_ALL -a"):
+            with self.subTest(operation=operation):
+                reference = subprocess.run(
+                    [self.bash, "--noprofile", "--norc", "-p", "-c",
+                     b"readonly LC_ALL; " + operation +
+                     b"; printf '\\nLC_ALL=%s\\n' \"$LC_ALL\""], env=environment,
+                    capture_output=True, timeout=10)
+                self.assertIn(b"readonly", reference.stderr)
+                # Some builtins continue after a rejected assignment and can
+                # return zero. Assert the fixed variable, not their status.
+                if reference.returncode == 0:
+                    self.assertTrue(reference.stdout.endswith(b"\nLC_ALL=C\n"))
+
+    def test_quoted_bytes_match_reference_argv(self):
+        words = ["'日本'".encode(), '"日本"'.encode(),
+                 "pre'日本'\".txt\"".encode(), b"'\x80\xff\xc0\xaf'",
+                 b'"\x80\xff\xc0\xaf"', "'é'\"\\$\"'文'".encode(),
+                 '"a\\\n日本"'.encode(), b"''\"\xe6\"''",
+                 "'é'".encode(), "'é'".encode(),
+                 "'é\\'".encode(), b"'\x80\xff\\'",
+                 "pre'é\\'\".txt\"".encode(), '"é\\q"'.encode(),
+                 '"é\\\\"'.encode(), '"é\\\"q"'.encode(), '"é\\`q"'.encode()]
+        payload = bytes(range(128, 256))
+        words += [b"'" + payload + b"'", b'"' + payload + b'"']
+
+        def netstring(value):
+            return str(len(value)).encode() + b":" + value + b","
+
+        for locale in ("C", "C.UTF-8"):
+            environment = dict(os.environ, BASH_ENV="", ENV="", LC_ALL=locale)
+            if locale != "C":
+                charmap = subprocess.run(["locale", "charmap"],
+                                         env=environment, capture_output=True,
+                                         check=True, timeout=10).stdout.strip()
+                self.assertEqual(charmap.upper().replace(b"-", b""), b"UTF8")
+            for word in words:
+                source = b"printf '%s\\0' " + word
+                with self.subTest(locale=locale, word=word):
+                    reference = subprocess.run(
+                        [self.bash, "--noprofile", "--norc", "-p", "-c",
+                         b"readonly LC_ALL; " + source], env=environment,
+                        capture_output=True, check=True, timeout=10).stdout
+                    self.assertTrue(reference.endswith(b"\0"))
+                    self.assertEqual(reference.count(b"\0"), 1)
+                    expected = netstring(b"".join(netstring(v) for v in
+                                                 (b"printf", b"%s\\0",
+                                                  reference[:-1])))
+                    actual = subprocess.run([self.probe, "--argv"],
+                                            input=source, capture_output=True,
+                                            check=True, timeout=10).stdout
+                    self.assertEqual(actual, expected)
+                    self.assertEqual(self.classify(source), 0)
+
+    def test_quoted_backslash_list_boundaries(self):
+        for first in ("é".encode(), b"\xe9"):
+            source = b"printf '%s\\0' '" + first + b"\\'; printf '%s\\0' 'a\\'"
+            self.assertEqual(self.classify(source), 0)
+            self.assertEqual(self.syntax(source), 0)
+            for locale in ("C", "C.UTF-8"):
+                environment = dict(os.environ, BASH_ENV="", ENV="", LC_ALL=locale)
+                result = subprocess.run(
+                    [self.bash, "--noprofile", "--norc", "-p", "-c", source],
+                    env=environment, capture_output=True, check=True, timeout=10)
+                self.assertEqual(result.stdout, first + b"\\\0a\\\0")
+            for tail in (b"", b"; printf '", b" &&"):
+                incomplete = b"printf '" + first + b"\\" + (b"'" if tail else b"") + tail
+                self.assertEqual(self.classify(incomplete), 1)
+
+    def test_invalid_high_byte_read_target_preserves_input(self):
+        source = (b"readonly LC_ALL; exec 3<<<payload; read '\xe9' IFS fd <&3; "
+                  b"status=$?; IFS= read -r remaining <&3; "
+                  b"printf 'read=%s;remaining=%s\\n' \"$status\" \"$remaining\"")
+        for locale in ("C", "C.UTF-8"):
+            environment = dict(os.environ, BASH_ENV="", ENV="", LC_ALL=locale)
+            result = subprocess.run(
+                [self.bash, "--noprofile", "--norc", "-p", "-c", source],
+                env=environment, capture_output=True, check=True, timeout=10)
+            self.assertEqual(result.stdout, b"read=1;remaining=payload\n")
+            self.assertIn(b"not a valid identifier", result.stderr)
 
     def test_indexed_assignment_prefixes_do_not_prove_syntax_errors(self):
         for source in [b"a[1 + (2)]=x", b"a[1 + (2)]=x printf ok",

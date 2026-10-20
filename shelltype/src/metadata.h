@@ -3,10 +3,9 @@
 
 #include "shelltype.h"
 
-#include <ctype.h>
+#include "shell_ascii.h"
 #include <stddef.h>
 #include <string.h>
-#include <strings.h>
 
 /* Closed metadata vocabulary for parametrized policy transitions. Metadata is
  * deliberately not part of st_token_type_t: joins and compatibility operate
@@ -132,9 +131,9 @@ static inline SHELL_NONNULL(2) const
     if (entry->type != type)
       continue;
     if ((strlen(entry->name) == length &&
-         strncasecmp(name, entry->name, length) == 0) ||
+         shell_ascii_equal_ci(name, entry->name, length)) ||
         (entry->alias && strlen(entry->alias) == length &&
-         strncasecmp(name, entry->alias, length) == 0))
+         shell_ascii_equal_ci(name, entry->alias, length)))
       return entry;
   }
   return NULL;
@@ -166,8 +165,8 @@ static inline SHELL_NONNULL(2) st_metadata_id_t
     size_t suffix = 0;
     if (length && text[0] == '-')
       suffix++;
-    while (suffix < length &&
-           (isdigit((unsigned char)text[suffix]) || text[suffix] == '.'))
+    while (suffix < length && (shell_ascii_digit((unsigned char)text[suffix]) ||
+                               text[suffix] == '.'))
       suffix++;
     const st_metadata_entry_t *metadata =
         st_metadata_lookup_span(type, text + suffix, length - suffix);

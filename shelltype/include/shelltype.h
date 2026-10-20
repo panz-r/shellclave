@@ -408,6 +408,9 @@ void st_token_array_free(st_token_array_t *arr);
  * The caller supplies length readable bytes; no terminator is required and
  * embedded NUL bytes are preserved. text may be NULL only when length is zero.
  * Empty spans and tokens matching no wildcard type return ST_TYPE_LITERAL.
+ * Classification uses fixed ASCII character sets, independent of the host
+ * locale. High bytes remain literal data rather than identifier characters;
+ * path and other byte-shaped types retain their documented rules.
  * This is not shell tokenization or a span-storage validation boundary.
  */
 st_token_type_t st_token_classify(const char *text, size_t length);

@@ -1,8 +1,8 @@
 #ifndef SHELL_SOURCE_INTERNAL_H
 #define SHELL_SOURCE_INTERNAL_H
 
+#include "shell_ascii.h"
 #include "shell_source.h"
-#include <ctype.h>
 #include <limits.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -140,8 +140,9 @@ void *shell_source_scratch_take(size_t size);
 void shell_source_scratch_release(size_t mark);
 bool shell_source_scratch_exhausted(void);
 /* External source-byte boundary, shared by tokenizer and processor adapters.
- * Reject NUL, non-whitespace control bytes and DEL. Non-ASCII is admitted only
- * in heredoc delimiter/data islands, not nested executable code. Successful
+ * Reject NUL, non-whitespace control bytes and DEL. High bytes are literal
+ * data in ordinary quotes and heredoc islands; nested executable source
+ * establishes its own word contexts. Successful
  * checks of the operation's immutable root cover its contained spans. */
 bool shell_source_bytes_valid(const char *input, size_t length)
     SHELL_NONNULL(1);
@@ -152,10 +153,10 @@ bool shell_source_bytes_valid(const char *input, size_t length)
 shell_source_status_t shell_source_bytes_status(const char *input,
                                                 size_t length) SHELL_NONNULL(1);
 
-/* High-byte admission after control/NUL rejection. Only heredoc delimiter and
- * data islands admit non-ASCII; executable substitutions re-enter code. */
-shell_source_status_t shell_source_heredoc_bytes_status(const char *input,
-                                                        size_t length)
+/* High-byte admission after control/NUL rejection. Ordinary quoted literals
+ * and heredoc data preserve bytes; arithmetic/selectors remain code. */
+shell_source_status_t shell_source_scoped_bytes_status(const char *input,
+                                                       size_t length)
     SHELL_NONNULL(1);
 /* Enter one borrowed lexical body, restoring its enclosing body on exit.
  * Index capacity belongs to this active scope and its ancestors, not to facts
@@ -248,7 +249,7 @@ static inline SHELL_NONNULL(4, 5) shell_source_io_number_t
       position += 2;
       continue;
     }
-    if (!isdigit((unsigned char)input[position]))
+    if (!shell_ascii_digit((unsigned char)input[position]))
       break;
     uint32_t digit = (uint32_t)(input[position] - '0');
     if (value > ((uint64_t)INT_MAX - digit) / 10u)
@@ -925,8 +926,8 @@ static inline SHELL_NONNULL(1, 3) bool shell_source_parse_scalar_assignment_word
       }
       return false;
     }
-    if (identifier_length == 0 ? !(isalpha(byte) || byte == '_')
-                               : !(isalnum(byte) || byte == '_'))
+    if (identifier_length == 0 ? !(shell_ascii_alpha(byte) || byte == '_')
+                               : !(shell_ascii_alnum(byte) || byte == '_'))
       return false;
     identifier_length++;
     position++;
@@ -2342,7 +2343,7 @@ static inline bool shell_source_skip_arithmetic_number(const char *input,
     return false;
 
   position = shell_source_skip_escaped_line_endings(input, length, position);
-  if (position >= length || !isdigit((unsigned char)input[position]))
+  if (position >= length || !shell_ascii_digit((unsigned char)input[position]))
     return false;
 
   unsigned char first = (unsigned char)input[position++];
@@ -2357,7 +2358,7 @@ static inline bool shell_source_skip_arithmetic_number(const char *input,
       for (;;) {
         size_t next =
             shell_source_skip_escaped_line_endings(input, length, position);
-        if (next >= length || !isxdigit((unsigned char)input[next]))
+        if (next >= length || !shell_ascii_xdigit((unsigned char)input[next]))
           break;
         position = next + 1;
         digits++;
@@ -2378,7 +2379,7 @@ static inline bool shell_source_skip_arithmetic_number(const char *input,
   for (;;) {
     size_t next =
         shell_source_skip_escaped_line_endings(input, length, position);
-    if (next >= length || !isdigit((unsigned char)input[next]))
+    if (next >= length || !shell_ascii_digit((unsigned char)input[next]))
       break;
     unsigned char digit = (unsigned char)input[next] - (unsigned char)'0';
     if (legacy_octal && digit > 7)
@@ -2408,7 +2409,7 @@ static inline bool shell_source_skip_arithmetic_number(const char *input,
     unsigned char byte = (unsigned char)input[next];
     unsigned int value = 0;
     bool valid_digit = true;
-    if (isdigit(byte))
+    if (shell_ascii_digit(byte))
       value = byte - (unsigned char)'0';
     else if (byte >= 'a' && byte <= 'z')
       value = 10u + byte - (unsigned char)'a';
@@ -2748,13 +2749,13 @@ static inline SHELL_NONNULL(
   cursor = shell_source_logical_following(input, length, cursor);
   if (cursor < length && (input[cursor] == '#' || input[cursor] == '!'))
     cursor = shell_source_logical_following(input, length, cursor);
-  if (cursor >= length ||
-      !(isalpha((unsigned char)input[cursor]) || input[cursor] == '_'))
+  if (cursor >= length || !(shell_ascii_alpha((unsigned char)input[cursor]) ||
+                            input[cursor] == '_'))
     return false;
   while (cursor < length) {
     cursor = shell_source_skip_escaped_line_endings(input, length, cursor);
-    if (cursor >= length ||
-        !(isalnum((unsigned char)input[cursor]) || input[cursor] == '_'))
+    if (cursor >= length || !(shell_ascii_alnum((unsigned char)input[cursor]) ||
+                              input[cursor] == '_'))
       break;
     cursor++;
   }
@@ -2804,7 +2805,7 @@ static inline SHELL_NONNULL(1, 3) shell_source_parameter_status_t
     return SHELL_SOURCE_PARAMETER_INCOMPLETE;
   SHELL_SOURCE_WORD_SCAN(1);
   unsigned char c = (unsigned char)input[cursor];
-  if (isalpha(c) || c == '_') {
+  if (shell_ascii_alpha(c) || c == '_') {
     cursor++;
     while (cursor < length) {
       cursor = shell_source_skip_escaped_line_endings(input, length, cursor);
@@ -2812,17 +2813,18 @@ static inline SHELL_NONNULL(1, 3) shell_source_parameter_status_t
         break;
       SHELL_SOURCE_WORD_SCAN(1);
       c = (unsigned char)input[cursor];
-      if (!(isalnum(c) || c == '_'))
+      if (!(shell_ascii_alnum(c) || c == '_'))
         break;
       cursor++;
     }
-  } else if (isdigit(c)) {
+  } else if (shell_ascii_digit(c)) {
     do {
       cursor++;
       cursor = shell_source_skip_escaped_line_endings(input, length, cursor);
       if (cursor < length)
         SHELL_SOURCE_WORD_SCAN(1);
-    } while (cursor < length && isdigit((unsigned char)input[cursor]));
+    } while (cursor < length &&
+             shell_ascii_digit((unsigned char)input[cursor]));
   } else if (shell_source_parameter_is_special(c)) {
     cursor++;
   } else {
@@ -3291,13 +3293,13 @@ static inline SHELL_NONNULL(4) bool shell_source_skip_variable_expansion(
                                                  after);
 
   char character = input[next];
-  if (isdigit((unsigned char)character) || character == '#' ||
+  if (shell_ascii_digit((unsigned char)character) || character == '#' ||
       character == '?' || character == '$' || character == '!' ||
       character == '@' || character == '*' || character == '-') {
     *after = next + 1;
     return true;
   }
-  if (!(isalpha((unsigned char)character) || character == '_'))
+  if (!(shell_ascii_alpha((unsigned char)character) || character == '_'))
     return false;
 
   position = next + 1;
@@ -3308,7 +3310,8 @@ static inline SHELL_NONNULL(4) bool shell_source_skip_variable_expansion(
       position = continued;
       continue;
     }
-    if (!(isalnum((unsigned char)input[position]) || input[position] == '_'))
+    if (!(shell_ascii_alnum((unsigned char)input[position]) ||
+          input[position] == '_'))
       break;
     position++;
   }
@@ -3727,6 +3730,10 @@ typedef struct {
    * parameter words remain data, even where pattern quoting changes. Math,
    * substring offsets and array subscripts establish code domains. */
   bool data_domain;
+  /* Ordinary word roots permit literal quote data. Parameter operands inherit
+   * that permission; math, substring arithmetic and subscripts clear it so
+   * quoting cannot hide their code from byte admission. */
+  bool quoted_data;
   /* Inherited double quoting ignores apostrophes for expansion, but the
    * parameter grammar still pairs them when finding its closing brace. */
   char delimiter_quote;
@@ -3868,7 +3875,13 @@ typedef struct {
 
 static inline SHELL_NONNULL(2) void shell_source_report_word_code(
     const char *input, shell_source_substitution_scan_t *scan, size_t end) {
-  if (scan->code_visitor && !scan->scope.data_domain && scan->code_start < end)
+  const shell_source_expansion_scope_t *scope = &scan->scope;
+  bool quoted = scope->quoted_data && !scope->selector_pending &&
+                !scope->ansi_end &&
+                (scope->in_single_quote || scope->in_double_quote ||
+                 scope->inherited_double_quote);
+  if (scan->code_visitor && !scope->data_domain && !quoted &&
+      scan->code_start < end)
     scan->code_visitor(input, scan->code_start, end, scan->code_context);
   scan->code_start = end;
 }
@@ -3884,7 +3897,8 @@ static SHELL_NONNULL(1, 4) inline void shell_source_note_parameter(
       selector = next;
   }
   scan->has_variables = true;
-  scan->has_positional |= isdigit((unsigned char)input[selector]) != 0;
+  scan->has_positional |=
+      shell_ascii_digit((unsigned char)input[selector]) != 0;
   scan->has_special |= shell_source_parameter_is_special(input[selector]);
 }
 
@@ -3988,6 +4002,7 @@ static inline SHELL_NONNULL(3, 4, 5, 6) shell_source_scan_status_t
           indirect_lookup || (has_word && input[operator_position] == '=');
       scan->has_expansion_termination |=
           has_word && input[operator_position] == '?';
+      shell_source_report_word_code(input, scan, word_start);
       if (operand == SHELL_SOURCE_PARAMETER_PATTERN) {
         scope->inherited_double_quote = false;
         scope->suppress_process = false;
@@ -3998,8 +4013,8 @@ static inline SHELL_NONNULL(3, 4, 5, 6) shell_source_scan_status_t
           return SHELL_SOURCE_SCAN_MALFORMED;
         scope->substring_scope = true;
         scope->arithmetic_scope = true;
-        shell_source_report_word_code(input, scan, word_start);
         scope->data_domain = false;
+        scope->quoted_data = false;
         scope->suppress_process = true;
         scan->has_arithmetic = true;
         scan->has_expansion_abort = true;
@@ -4012,6 +4027,7 @@ static inline SHELL_NONNULL(3, 4, 5, 6) shell_source_scan_status_t
     }
     if (scope->ansi_end && position >= scope->ansi_end) {
       scan->position = scope->ansi_end + 1;
+      shell_source_report_word_code(input, scan, scan->position);
       scope->ansi_end = 0;
       continue;
     }
@@ -4086,6 +4102,7 @@ static inline SHELL_NONNULL(3, 4, 5, 6) shell_source_scan_status_t
               position == scope->word_start && ansi_after < length &&
                   input[ansi_after] == '}'))
         return SHELL_SOURCE_SCAN_MALFORMED;
+      shell_source_report_word_code(input, scan, position);
       scope->ansi_end = ansi_after - 1;
       scan->position =
           shell_source_logical_following(input, length, position) + 1;
@@ -4110,12 +4127,14 @@ static inline SHELL_NONNULL(3, 4, 5, 6) shell_source_scan_status_t
     }
     if (!heredoc_root && c == '\'' && !scope->ansi_end &&
         !scope->in_double_quote && !scope->inherited_double_quote) {
+      shell_source_report_word_code(input, scan, position);
       scope->in_single_quote = !scope->in_single_quote;
       scan->position++;
       continue;
     }
     if (!heredoc_root && c == '"' && !scope->ansi_end &&
         !scope->in_single_quote) {
+      shell_source_report_word_code(input, scan, position);
       scope->in_double_quote = !scope->in_double_quote;
       scan->position++;
       continue;
@@ -4161,6 +4180,7 @@ static inline SHELL_NONNULL(3, 4, 5, 6) shell_source_scan_status_t
     }
     if (c == '$' &&
         shell_source_logical_next_is(input, length, position, '{', NULL)) {
+      shell_source_report_word_code(input, scan, position);
       size_t brace = shell_source_logical_following(input, length, position);
       size_t selector =
           shell_source_skip_escaped_line_endings(input, length, brace + 1);
@@ -4335,7 +4355,7 @@ static inline SHELL_NONNULL(3, 4, 5, 6) shell_source_scan_status_t
       }
       if (scope->arithmetic_scope && !scope->in_single_quote &&
           !scope->in_double_quote) {
-        if (isdigit((unsigned char)c)) {
+        if (shell_ascii_digit((unsigned char)c)) {
           size_t number_after;
           if (shell_source_skip_arithmetic_number(input, length, position,
                                                   &number_after)) {
@@ -4343,7 +4363,7 @@ static inline SHELL_NONNULL(3, 4, 5, 6) shell_source_scan_status_t
             continue;
           }
         }
-        if (isalpha((unsigned char)c) || c == '_')
+        if (shell_ascii_alpha((unsigned char)c) || c == '_')
           scan->has_arithmetic_variables = true;
       }
     }
@@ -4409,11 +4429,13 @@ shell_source_word_has_executable_substitution(const char *input,
  * a[0]=word, a=(one two) cannot be an ordinary command or redirect argument. */
 static inline SHELL_NONNULL(1) bool shell_source_array_assignment_is_compound(
     const char *input, size_t length) {
-  if (length < 3 || !(isalpha((unsigned char)input[0]) || input[0] == '_'))
+  if (length < 3 ||
+      !(shell_ascii_alpha((unsigned char)input[0]) || input[0] == '_'))
     return false;
   size_t position = shell_source_logical_following(input, length, 0);
   while (position < length &&
-         (isalnum((unsigned char)input[position]) || input[position] == '_'))
+         (shell_ascii_alnum((unsigned char)input[position]) ||
+          input[position] == '_'))
     position = shell_source_logical_following(input, length, position);
   if (position < length && input[position] == '[') {
     if (!shell_source_skip_array_subscript(input, length, position, &position))
@@ -4677,7 +4699,8 @@ static SHELL_NONNULL(1, 4) inline shell_source_fd_prefix_t
       *after = position + 1;
       return SHELL_SOURCE_FD_PREFIX_CLOSED;
     }
-    if (first ? !(isalpha(c) || c == '_') : !(isalnum(c) || c == '_'))
+    if (first ? !(shell_ascii_alpha(c) || c == '_')
+              : !(shell_ascii_alnum(c) || c == '_'))
       return SHELL_SOURCE_FD_PREFIX_NONE;
     first = false;
     position++;
@@ -4720,7 +4743,7 @@ static SHELL_NONNULL(1, 4) inline shell_source_fd_prefix_t
       return status;
     }
   } else {
-    if (!isdigit((unsigned char)input[start]))
+    if (!shell_ascii_digit((unsigned char)input[start]))
       return SHELL_SOURCE_FD_PREFIX_NONE;
     uint32_t descriptor;
     shell_source_io_number_t number =
@@ -4904,7 +4927,8 @@ static inline bool shell_source_parse_named_fd_parameter(const char *input,
       continue;
     }
     unsigned char c = (unsigned char)input[position];
-    if (first ? !(isalpha(c) || c == '_') : !(isalnum(c) || c == '_'))
+    if (first ? !(shell_ascii_alpha(c) || c == '_')
+              : !(shell_ascii_alnum(c) || c == '_'))
       return false;
     first = false;
     position++;
@@ -5267,13 +5291,14 @@ static SHELL_NONNULL(1, 3, 4) inline bool shell_source_word_parameter_name(
   size_t end = braced ? length - 1 : length;
   if (start == end)
     return false;
-  bool positional = isdigit((unsigned char)input[start]) != 0;
+  bool positional = shell_ascii_digit((unsigned char)input[start]) != 0;
   if (!positional &&
-      !(isalpha((unsigned char)input[start]) || input[start] == '_'))
+      !(shell_ascii_alpha((unsigned char)input[start]) || input[start] == '_'))
     return false;
   for (size_t position = start; position < end; position++) {
     unsigned char byte = (unsigned char)input[position];
-    if (positional ? !isdigit(byte) : !(isalnum(byte) || byte == '_'))
+    if (positional ? !shell_ascii_digit(byte)
+                   : !(shell_ascii_alnum(byte) || byte == '_'))
       return false;
   }
   *name = input + start;
@@ -5517,15 +5542,15 @@ shell_source_word_expansion(const char *input, size_t length,
     if (!in_double_quote) {
       bool value_start = false;
       if (prefix == PREFIX_START)
-        prefix =
-            isalpha((unsigned char)c) || c == '_' ? PREFIX_NAME : PREFIX_NONE;
+        prefix = shell_ascii_alpha((unsigned char)c) || c == '_' ? PREFIX_NAME
+                                                                 : PREFIX_NONE;
       else if (prefix == PREFIX_NAME) {
         if (c == '=') {
           prefix = PREFIX_VALUE;
           value_start = true;
         } else if (c == '+')
           prefix = PREFIX_PLUS;
-        else if (!isalnum((unsigned char)c) && c != '_')
+        else if (!shell_ascii_alnum((unsigned char)c) && c != '_')
           prefix = PREFIX_NONE;
       } else if (prefix == PREFIX_PLUS) {
         value_start = c == '=';
@@ -5727,9 +5752,9 @@ static inline SHELL_NONNULL(2) bool shell_source_assignment_emit(
     scan->plus_position = scan->source_position;
     return true;
   }
-  if (scan->pending_plus ||
-      (scan->result.name_length == 0 ? !(isalpha(byte) || byte == '_')
-                                     : !(isalnum(byte) || byte == '_')))
+  if (scan->pending_plus || (scan->result.name_length == 0
+                                 ? !(shell_ascii_alpha(byte) || byte == '_')
+                                 : !(shell_ascii_alnum(byte) || byte == '_')))
     return scan->valid = false;
   if (scan->visitor && !scan->visitor(byte, scan->context))
     return scan->valid = false;

@@ -99,7 +99,8 @@ int main(void) {
   } cases[] = {
       {"ordinary", "printf ok"},
       {"malformed heredoc", "cat /workspace/before.txt\ncat <<\ncat tail"},
-      {"unsupported bytes", "printf '%s' '日本'"},
+      {"quoted text", "printf '%s' '日本'"},
+      {"unsupported bytes", "printf '%s' 日本"},
       {"unsupported grammar", "if true; then :; fi"},
       {"unsupported semantics", "eval 'printf ok'"},
       {"unfinished document", "cat <<EOF\npayload\n"},

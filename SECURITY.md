@@ -112,8 +112,14 @@ basis is the pinned `bash -p -c ...`, with these preparations:
 
 1. Start with `POSIXLY_CORRECT` absent; an empty value still enables POSIX mode.
 2. Remove `BASH_COMPAT` and `BASH_XTRACEFD` from the startup environment.
-3. Make all three names readonly in trusted startup code before submitted source.
-4. Preserve the modeled option and command-lookup state: no startup aliases or
+3. Set `LC_ALL` to `C` (the portable default), `POSIX`, or an installed UTF-8
+   locale before launching Bash. Make it readonly in trusted startup code so
+   submitted source cannot change character interpretation. C/POSIX and UTF-8
+   use the same byte-oriented syntax model; quoted bytes are preserved without
+   encoding validation or normalization. The embedding application's locale is
+   independent: analysis uses fixed byte predicates and leaves it unchanged.
+4. Make the three cleared names readonly before submitted source.
+5. Preserve the modeled option and command-lookup state: no startup aliases or
    traps, imported/shadowing functions, or disabled modeled builtins. Privileged
    Bash ignores `BASH_ENV`, `BASHOPTS`, and `SHELLOPTS` and declines imported
    environment functions.

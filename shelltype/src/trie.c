@@ -13,8 +13,8 @@
 #include "shelltype.h"
 #include "trie_internal.h"
 
+#include "shell_ascii.h"
 #include <assert.h>
-#include <ctype.h>
 #include <errno.h>
 #include <limits.h>
 #include <stdbool.h>
@@ -1450,7 +1450,7 @@ bool st_learner_is_netpattern_blacklisted(const st_learner_t *learner,
 /* --- PUBLIC API – SERIALISATION --- */
 
 static bool parse_u32_field(const char *text, char **end, uint32_t *value) {
-  if (!text || !end || !value || !isdigit((unsigned char)text[0]))
+  if (!text || !end || !value || !shell_ascii_digit((unsigned char)text[0]))
     return false;
   errno = 0;
   unsigned long parsed = strtoul(text, end, 10);

@@ -4,6 +4,7 @@
 #include "../src/shell_tokenizer_full_internal.h"
 #include "depgraph_test_workspace.h"
 #include "malformed_source_cases.h"
+#include "quoted_byte_cases.h"
 #include "shell_abstract.h"
 #include "shell_depgraph.h"
 #include "shell_netstring.h"
@@ -108,6 +109,82 @@ static void test_logical_comment_boundaries(void) {
     CHECK(shell_dep_graph_parse(source, length, "/", NULL, &graph) ==
           SHELL_DEP_OK);
     CHECK(shell_dep_graph_validate(&graph).valid);
+  }
+}
+
+static void test_quoted_literal_bytes(void) {
+  shell_limits_t strict = SHELL_LIMITS_DEFAULT;
+  strict.strict_mode = true;
+  for (size_t i = 0; i < sizeof(shellsplit_test_quoted_bytes) /
+                             sizeof(shellsplit_test_quoted_bytes[0]);
+       ++i) {
+    const char *word = shellsplit_test_quoted_bytes[i].word;
+    const char *value = shellsplit_test_quoted_bytes[i].value;
+    size_t value_length = strlen(value);
+    char source[256], expected[256];
+    int length = snprintf(source, sizeof(source), "printf %%s %s", word);
+    int encoded = snprintf(expected, sizeof(expected), "6:printf,2:%%s,%zu:%s,",
+                           value_length, value);
+    CHECK(length > 0 && (size_t)length < sizeof(source) && encoded > 0 &&
+          (size_t)encoded < sizeof(expected));
+    shell_parse_result_t fast;
+    CHECK(shell_parse_fast(source, (size_t)length, &strict, &fast) == SHELL_OK);
+    CHECK(fast.count == 1 && fast.cmds[0].len == (size_t)length);
+    shell_processed_commands_t processed = {0};
+    CHECK(shell_process_commands(source, (size_t)length, NULL, &processed) ==
+          SHELL_PROCESS_OK);
+    CHECK(processed.command_count == 1);
+    shell_netstring_buffer_t argv = {0};
+    CHECK(shell_render_netargv_buffer(&processed.commands[0], NULL, &argv) ==
+          SHELL_PROCESS_OK);
+    CHECK(argv.length == (size_t)encoded &&
+          !memcmp(argv.data, expected, (size_t)encoded));
+    shell_netstring_buffer_free(&argv);
+    shell_processed_commands_free(&processed);
+    shell_dep_graph_t graph;
+    CHECK(shell_dep_graph_parse_with_fast(source, (size_t)length, "/workspace",
+                                          NULL, &fast, &graph) == SHELL_DEP_OK);
+    CHECK(shell_dep_graph_validate(&graph).valid);
+    unsigned commands = 0;
+    for (uint32_t n = 0; n < graph.node_count; ++n) {
+      const shell_dep_node_t *node = &graph.nodes[n];
+      if (node->type == SHELL_NODE_CMD) {
+        ++commands;
+        CHECK(node->cmd.token_count == 3 &&
+              node->cmd.tokens[2] == source + 10 &&
+              node->cmd.token_lens[2] == strlen(word) &&
+              !memcmp(node->cmd.tokens[2], word, strlen(word)));
+      }
+    }
+    CHECK(commands == 1);
+    shell_abstract_command_t *abstract = NULL;
+    CHECK(shell_abstract_command_parse(source, (size_t)length, &abstract) ==
+          SHELL_ABSTRACT_OK);
+    shell_abstract_command_free(abstract);
+    shell_transformed_command_t **transformed = NULL;
+    size_t count = 0;
+    CHECK(shell_transform_command_line(source, (size_t)length, NULL,
+                                       &transformed,
+                                       &count) == SHELL_TRANSFORM_OK);
+    CHECK(count == 1);
+    shell_transformed_command_list_free(transformed, count);
+  }
+  static const char *const locale_assignments[] = {
+      "LC_ALL=C",
+      "LC_ALL=C printf ok",
+      "LC_ALL+=.UTF-8 printf ok",
+  };
+  for (size_t i = 0;
+       i < sizeof(locale_assignments) / sizeof(locale_assignments[0]); ++i) {
+    const char *source = locale_assignments[i];
+    shell_processed_commands_t processed = {0};
+    CHECK(shell_process_commands(source, strlen(source), NULL, &processed) ==
+          SHELL_PROCESS_EPARSE);
+    CHECK(!processed.commands && !processed.command_count);
+    shell_dep_graph_t graph;
+    CHECK(shell_dep_graph_parse(source, strlen(source), NULL, NULL, &graph) ==
+          SHELL_DEP_EPARSE);
+    CHECK(!graph.node_count && !graph.edge_count);
   }
 }
 
@@ -3670,8 +3747,9 @@ static void test_single_byte_validation_boundary(void) {
     check_byte_validation_work(1, length);
   }
 
-  /* Invalid bytes inside otherwise opaque syntax or past the range capacity
-   * are rejected by the same boundary, not accepted as a truncated prefix. */
+  /* Prohibited bytes inside opaque syntax or past the range capacity still
+   * fail admission. Quoted literal/heredoc high bytes remain admitted data;
+   * the command capacity then determines the truncation outcome. */
   static const char *const tails[] = {
       "printf tail",
       "# comment",
@@ -3694,10 +3772,10 @@ static void test_single_byte_validation_boundary(void) {
         shell_parse_result_t parsed;
         memset(&parsed, 0xff, sizeof(parsed));
         reset_byte_validation_work();
-        bool heredoc_data = i == 4 && bytes[b] >= 128;
+        bool literal_data = (i == 2 || i == 4) && bytes[b] >= 128;
         CHECK(shell_parse_fast(source, length, &limits, &parsed) ==
-              (heredoc_data ? SHELL_ETRUNC : SHELL_EPARSE));
-        if (!heredoc_data)
+              (literal_data ? SHELL_ETRUNC : SHELL_EPARSE));
+        if (!literal_data)
           CHECK(!parsed.count && !parsed.group_count &&
                 parsed.status == SHELL_STATUS_ERROR);
         /* NUL is inadmissible representation. Other byte restrictions scan
@@ -6585,6 +6663,7 @@ static void test_adjacent_named_fd_boundaries(void) {
 }
 
 int main(void) {
+  test_quoted_literal_bytes();
   test_logical_comment_boundaries();
   test_comment_boundary_io();
   test_comment_boundary_work();

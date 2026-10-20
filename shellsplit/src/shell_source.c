@@ -24,15 +24,18 @@ static SHELL_NONNULL(1, 4) void code_bytes(const char *source, size_t start,
   *valid = ascii_span(source, start, end) && *valid;
 }
 
-/* Executable substitutions are code domains, even inside an expandable
- * document. Literal data outside those domains is not shell source. */
+/* Executable substitutions establish independent source contexts, even inside
+ * quotes or an expandable document. Indexed assignment prefixes keep their
+ * subscript code domain; their separately tokenized values use ordinary word
+ * quoting. */
 static SHELL_NONNULL(1) shell_source_status_t
     word_byte_islands(const char *word, size_t length, size_t depth,
-                      bool heredoc) {
+                      bool heredoc, bool quoted_data) {
   shell_source_substitution_scan_t scan = {
       .scope = {.heredoc = heredoc,
                 .suppress_process = heredoc,
-                .data_domain = heredoc},
+                .data_domain = heredoc,
+                .quoted_data = quoted_data},
       .code_visitor = code_bytes};
   bool valid = true;
   scan.code_context = &valid;
@@ -125,7 +128,8 @@ static SHELL_NONNULL(1) shell_source_status_t
        * validation, not byte admission, decides whether it is complete. */
     } else {
       shell_source_status_t status =
-          word_byte_islands(token.start, token.length, depth, false);
+          word_byte_islands(token.start, token.length, depth, false,
+                            token.type != SHELL_TOKEN_ARRAY_ASSIGNMENT);
       if (status != SHELL_SOURCE_COMPLETE)
         return status;
     }
@@ -138,8 +142,9 @@ static SHELL_NONNULL(1) shell_source_status_t
         /* A tentative closing line is not executable body data. Its raw
          * bytes remain available in framing, without assuming an expansion. */
         if (!shell_source_heredoc_delimiter_is_quoted(&pending[h])) {
-          shell_source_status_t status = word_byte_islands(
-              source + checked, frame.confirmed_end - checked, depth, true);
+          shell_source_status_t status =
+              word_byte_islands(source + checked, frame.confirmed_end - checked,
+                                depth, true, true);
           if (status != SHELL_SOURCE_COMPLETE)
             return status;
         }
@@ -163,8 +168,8 @@ static SHELL_NONNULL(1) shell_source_status_t
   return status;
 }
 
-shell_source_status_t shell_source_heredoc_bytes_status(const char *source,
-                                                        size_t length) {
+shell_source_status_t shell_source_scoped_bytes_status(const char *source,
+                                                       size_t length) {
   return source_byte_islands(source, length, 0);
 }
 

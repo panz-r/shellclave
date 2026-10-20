@@ -67,7 +67,8 @@ typedef enum {
 /* Fresh-shell capabilities, not a complete shell-variable attribute table.
  * The dependency graph combines these initial properties with path-local
  * successful-unset facts. Variables which alter the graph's fixed Bash
- * execution contract are cleared and frozen by the executor. */
+ * execution contract are frozen by the executor. LC_ALL is initialized to
+ * C/POSIX or UTF-8; the other frozen names are cleared before freezing. */
 enum {
   SHELL_VARIABLE_INTEGER = 1u,
   SHELL_VARIABLE_UNSTABLE = 2u,
@@ -100,6 +101,7 @@ static const struct {
     SHELL_VARIABLE("POSIXLY_CORRECT", SHELL_VARIABLE_FROZEN),
     SHELL_VARIABLE("BASH_COMPAT", SHELL_VARIABLE_FROZEN),
     SHELL_VARIABLE("BASH_XTRACEFD", SHELL_VARIABLE_FROZEN),
+    SHELL_VARIABLE("LC_ALL", SHELL_VARIABLE_FROZEN),
     SHELL_VARIABLE("UID", SHELL_VARIABLE_READONLY),
     SHELL_VARIABLE("EUID", SHELL_VARIABLE_READONLY),
     SHELL_VARIABLE("PPID", SHELL_VARIABLE_READONLY),
@@ -163,8 +165,8 @@ static inline SHELL_NONNULL(2) bool shell_builtin_variable_byte(
     unsigned char byte, void *context) {
   shell_builtin_variable_scan_t *scan = context;
   size_t position = scan->length++;
-  scan->valid &= position == 0 ? isalpha(byte) || byte == '_'
-                               : isalnum(byte) || byte == '_';
+  scan->valid &= position == 0 ? shell_ascii_alpha(byte) || byte == '_'
+                               : shell_ascii_alnum(byte) || byte == '_';
   if (scan->names) {
     for (unsigned i = 0; i < SHELL_BUILTIN_VARIABLE_NAMES; i++) {
       if ((scan->names & (UINT64_C(1) << i)) &&
@@ -364,7 +366,7 @@ static inline SHELL_NONNULL(2) bool shell_builtin_printf_format_byte(
     }
   }
   if (format->phase == SHELL_PRINTF_WIDTH) {
-    if (isdigit(byte))
+    if (shell_ascii_digit(byte))
       return true;
     format->phase = SHELL_PRINTF_PRECISION;
   }
@@ -376,7 +378,7 @@ static inline SHELL_NONNULL(2) bool shell_builtin_printf_format_byte(
     }
   }
   if (format->phase == SHELL_PRINTF_PRECISION_DIGITS) {
-    if (isdigit(byte))
+    if (shell_ascii_digit(byte))
       return true;
     format->phase = SHELL_PRINTF_LENGTH;
     if (byte == '*') {
@@ -611,7 +613,7 @@ static inline SHELL_NONNULL(2) bool shell_builtin_read_number_byte(
     }
     return true;
   }
-  if (!scan->timeout && isspace(byte)) {
+  if (!scan->timeout && shell_ascii_space(byte)) {
     if (scan->started)
       scan->trailing_space = true;
     return true;
@@ -718,8 +720,10 @@ enum {
 static inline uint8_t shell_builtin_read_target_byte(uint8_t shapes,
                                                      unsigned char byte) {
   uint8_t next = shapes & SHELL_READ_TARGET_ARRAY;
-  if (((shapes & SHELL_READ_TARGET_START) && (isalpha(byte) || byte == '_')) ||
-      ((shapes & SHELL_READ_TARGET_NAME) && (isalnum(byte) || byte == '_')))
+  if (((shapes & SHELL_READ_TARGET_START) &&
+       (shell_ascii_alpha(byte) || byte == '_')) ||
+      ((shapes & SHELL_READ_TARGET_NAME) &&
+       (shell_ascii_alnum(byte) || byte == '_')))
     next |= SHELL_READ_TARGET_NAME;
   if ((shapes & SHELL_READ_TARGET_NAME) && byte == '[')
     next |= SHELL_READ_TARGET_ARRAY;
@@ -778,15 +782,15 @@ static inline SHELL_NONNULL(2) bool shell_builtin_read_option_byte(
   scan->literal_ifs &=
       literal_position < 3 && byte == (unsigned char)"IFS"[literal_position];
   if (scan->parameter) {
-    if (!isspace(byte))
+    if (!shell_ascii_space(byte))
       scan->number_scalar = 0;
     scan->timeout_scalar = 0;
-    if (scan->payload.timeout || !isspace(byte))
+    if (scan->payload.timeout || !shell_ascii_space(byte))
       scan->payload_scalar = 0;
   }
   scan->target_invalid |= literal_position == 0
-                              ? !(isalpha(byte) || byte == '_')
-                              : !(isalnum(byte) || byte == '_');
+                              ? !(shell_ascii_alpha(byte) || byte == '_')
+                              : !(shell_ascii_alnum(byte) || byte == '_');
   shell_builtin_read_number_byte(byte, &scan->number);
   shell_builtin_read_number_byte(byte, &scan->timeout);
   if (scan->unresolved)
@@ -885,12 +889,13 @@ static inline SHELL_NONNULL(1) bool shell_builtin_parameter_is_scalar(
   }
   if (strchr("#?$!-*@", first))
     return next == end && (first != '@' || length_selector);
-  bool positional = isdigit(first) != 0;
-  if (!positional && !(isalpha(first) || first == '_'))
+  bool positional = shell_ascii_digit(first) != 0;
+  if (!positional && !(shell_ascii_alpha(first) || first == '_'))
     return false;
   for (position = next; position < end;) {
     unsigned char byte = (unsigned char)word[position];
-    if (positional ? !isdigit(byte) : !(isalnum(byte) || byte == '_'))
+    if (positional ? !shell_ascii_digit(byte)
+                   : !(shell_ascii_alnum(byte) || byte == '_'))
       return false;
     position = shell_source_skip_escaped_line_endings(word, end, position + 1);
   }

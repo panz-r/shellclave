@@ -22,8 +22,8 @@
 #include "shell_netstring.h"
 #include "shelltype.h"
 
+#include "shell_ascii.h"
 #include <assert.h>
-#include <ctype.h>
 #include <errno.h>
 #include <limits.h>
 #include <pthread.h>
@@ -33,7 +33,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <strings.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -657,7 +656,7 @@ const char *st_size_suffix(const char *text) {
   if (*p == '-')
     p++;
   /* skip digits and dots */
-  while (*p && (isdigit((unsigned char)*p) || *p == '.'))
+  while (*p && (shell_ascii_digit((unsigned char)*p) || *p == '.'))
     p++;
   if (*p == '\0')
     return NULL; /* no suffix */

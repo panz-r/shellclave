@@ -144,10 +144,13 @@ static bool check_depgraph_workspace_api() {
                                            &limits, &draft->prefix,
                                            &graph) == SHELL_DEP_OK;
     if (ok) {
-      constexpr char unsupported[] = "printf '%s' '日本'";
+      constexpr char quoted[] = "printf '%s' '日本'";
+      constexpr char unsupported[] = "printf '%s' 日本";
       constexpr char malformed[] = "cat <<\n";
       constexpr char nul[] = "echo\0x";
-      ok = shell_parse_draft(unsupported, sizeof(unsupported) - 1, nullptr,
+      ok = shell_parse_draft(quoted, sizeof(quoted) - 1, nullptr, draft) ==
+               SHELL_SOURCE_COMPLETE &&
+           shell_parse_draft(unsupported, sizeof(unsupported) - 1, nullptr,
                              draft) == SHELL_SOURCE_UNSUPPORTED &&
            shell_parse_draft(malformed, sizeof(malformed) - 1, nullptr,
                              draft) == SHELL_SOURCE_INVALID &&

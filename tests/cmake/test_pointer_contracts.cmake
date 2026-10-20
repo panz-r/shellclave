@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.20)
 
 # Required-pointer failures are compile-time API violations, not runtime tests.
 set(source "${SHELLCLAVE_SOURCE_DIR}/tests/consumer/pointer_contracts.c")
-foreach(bad RANGE 0 189)
+foreach(bad RANGE 0 191)
   if(bad EQUAL 186)
     continue()
   endif()
@@ -11,6 +11,7 @@ foreach(bad RANGE 0 189)
       "-DTEST_BAD=${bad}"
       "-I${SHELLCLAVE_SOURCE_DIR}/shellsplit/include"
       "-I${SHELLCLAVE_SOURCE_DIR}/shellsplit/src"
+      "-I${SHELLCLAVE_SOURCE_DIR}/common"
       "-I${SHELLCLAVE_SOURCE_DIR}/shelltype/include"
       "-I${SHELLCLAVE_SOURCE_DIR}/shellgate/include"
       "-I${SHELLCLAVE_SOURCE_DIR}/deps/xxhash"
@@ -31,6 +32,7 @@ execute_process(
     -DTEST_BAD=186
     "-I${SHELLCLAVE_SOURCE_DIR}/shellsplit/include"
     "-I${SHELLCLAVE_SOURCE_DIR}/shellsplit/src"
+    "-I${SHELLCLAVE_SOURCE_DIR}/common"
     "-I${SHELLCLAVE_SOURCE_DIR}/shelltype/include"
     "-I${SHELLCLAVE_SOURCE_DIR}/shellgate/include"
     "-I${SHELLCLAVE_SOURCE_DIR}/deps/xxhash" "${source}"

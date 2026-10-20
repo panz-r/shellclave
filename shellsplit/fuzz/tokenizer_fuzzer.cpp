@@ -14,6 +14,7 @@
 
 #include "../tests/depgraph_compare.h"
 #include "../tests/malformed_source_cases.h"
+#include "../tests/quoted_byte_cases.h"
 #include "../tests/source_compare.h"
 #include "../tests/word_expansion_cases.h"
 #include "depgraph_invariants.h"
@@ -7986,6 +7987,69 @@ static void run_fixed_oracles() {
       abort();
   }
   fixed_oracle_phase("word and syntax matrices");
+  for (const auto &fixture : shellsplit_test_quoted_bytes) {
+    char source[256], expected[256];
+    int length =
+        snprintf(source, sizeof(source), "printf %%s %s", fixture.word);
+    int encoded = snprintf(expected, sizeof(expected), "6:printf,2:%%s,%zu:%s,",
+                           strlen(fixture.value), fixture.value);
+    if (length <= 0 || static_cast<size_t>(length) >= sizeof(source) ||
+        encoded <= 0 || static_cast<size_t>(encoded) >= sizeof(expected))
+      abort();
+    shell_parse_result_t parsed = {};
+    shell_processed_commands_t processed = {};
+    shell_netstring_buffer_t argv = {};
+    bool valid =
+        shell_parse_fast(source, length, nullptr, &parsed) == SHELL_OK &&
+        shell_process_commands(source, length, nullptr, &processed) ==
+            SHELL_PROCESS_OK &&
+        processed.command_count == 1;
+    if (valid)
+      valid = shell_render_netargv_buffer(&processed.commands[0], nullptr,
+                                          &argv) == SHELL_PROCESS_OK &&
+              argv.length == static_cast<size_t>(encoded) &&
+              !memcmp(argv.data, expected, argv.length) &&
+              shell_dep_graph_parse(source, length, "/workspace", nullptr,
+                                    &graph) == SHELL_DEP_OK &&
+              shell_dep_graph_validate(&graph).valid;
+    shell_netstring_buffer_free(&argv);
+    shell_processed_commands_free(&processed);
+    if (!valid) {
+      fprintf(stderr, "quoted literal byte oracle failed: %s\n", source);
+      abort();
+    }
+  }
+  {
+    static const char *const lists[] = {
+        "printf 'é\\'; cat file; printf 'a\\'",
+        "printf '\xe9\\'\ncat file\nprintf 'a\\'",
+    };
+    for (const char *source : lists) {
+      shell_processed_commands_t processed = {};
+      shell_transformed_command_t **transformed = nullptr;
+      size_t count = 0;
+      bool valid = shell_process_commands(source, strlen(source), nullptr,
+                                          &processed) == SHELL_PROCESS_OK &&
+                   processed.command_count == 3 &&
+                   shell_transform_command_line(source, strlen(source), nullptr,
+                                                &transformed,
+                                                &count) == SHELL_TRANSFORM_OK &&
+                   count == 3;
+      if (valid)
+        for (size_t i = 0; i < count; ++i)
+          valid &= processed.commands[i].command_token_count == 2 &&
+                   transformed[i]->token_count == (i == 2 ? 2 : 3) &&
+                   !strcmp(transformed[i]->tokens[0].original,
+                           i == 1 ? "cat" : "printf");
+      shell_transformed_command_list_free(transformed, count);
+      shell_processed_commands_free(&processed);
+      if (!valid) {
+        fprintf(stderr, "quoted backslash command boundary oracle failed: %s\n",
+                source);
+        abort();
+      }
+    }
+  }
   {
     const struct {
       const char *source;
@@ -8011,7 +8075,7 @@ static void run_fixed_oracles() {
         {"cat <<'EOF'\né\nEOF\ncat <<\n", SHELL_SOURCE_INVALID},
         {"cat <<'é'\né\ncat <<#comment", SHELL_SOURCE_INVALID},
         {"cat <<'EOF'\né\nEOF\ncat <<", SHELL_SOURCE_INCOMPLETE},
-        {"cat <<'EOF'\né\nEOF\ncat <<\nprintf 'é'", SHELL_SOURCE_UNSUPPORTED},
+        {"cat <<'EOF'\né\nEOF\ncat <<\nprintf é", SHELL_SOURCE_UNSUPPORTED},
         {"echo before #comment \\\necho after", SHELL_SOURCE_COMPLETE},
         {": #comment \\\na=(x)", SHELL_SOURCE_UNSUPPORTED},
         {": #comment \\\n{ :; }", SHELL_SOURCE_COMPLETE},
@@ -8022,7 +8086,8 @@ static void run_fixed_oracles() {
         {"echo $(: |&\ntime :)", SHELL_SOURCE_INVALID},
         {"cat /workspace/before.txt\ncat <<\ncat /workspace/not-a-read.txt",
          SHELL_SOURCE_INVALID},
-        {"printf '%s' '日本'", SHELL_SOURCE_UNSUPPORTED},
+        {"printf '%s' '日本'", SHELL_SOURCE_COMPLETE},
+        {"printf '%s' 日本", SHELL_SOURCE_UNSUPPORTED},
         {"if true; then :; fi", SHELL_SOURCE_UNSUPPORTED},
         {"foo.bar() { :; }", SHELL_SOURCE_UNSUPPORTED},
         {"echo $[1 + (2)]", SHELL_SOURCE_UNSUPPORTED},

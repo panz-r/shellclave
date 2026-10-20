@@ -190,55 +190,60 @@ typedef struct shell_source_result {
  * UNSUPPORTED, not a syntax-error claim. Distinguish append-repairable input
  * from a complete or invalid source. Retain complete top-level list units
  * before an unfinished tail, excluding every pending heredoc body from command
- * syntax. Heredoc literal text and parameter words may contain non-ASCII bytes;
- * arithmetic/substring operands and executable children retain the restricted
- * code byte domain, including at unfinished EOF. Content remains a template,
- * not evaluated expansion output. Admitted non-ASCII heredoc data/delimiters
- * do not change later grammar or resource outcomes: a committed missing
- * delimiter word is INVALID, an unfinished word is INCOMPLETE, and pending
- * document capacity exhaustion is TRUNCATED. Unsupported delimiter forms
- * remain UNSUPPORTED. Byte admission still checks later code after a missing
- * delimiter; it does not invent a body or assume the remaining bytes are data.
- * Unsupported escape-sensitive backticks are
- * UNSUPPORTED and invalidate prefix qualification, not append-repairable input.
- * Unfinished parameter heads, name enumeration and pending backslash-LF
- * continuations are INCOMPLETE; unclassified selector failures are UNSUPPORTED.
- * At received EOF, an unquoted command-position unsupported keyword such as
- * `if`, `function` or `[[` remains INCOMPLETE (NEEDS_COMMAND): an appended
- * suffix can make it an ordinary word. Its header is incomplete. Whitespace
- * or an operator commits that keyword and makes the source UNSUPPORTED.
- * A closed substitution likewise commits its child's final word; appending
- * outside its delimiter cannot repair it. Quoted/escaped/suffixed lookalikes
- * and words in argument or redirect-operand positions are ordinary words.
- * An assignment or redirection prefix also commits a simple command: its
- * pending executable word does not regain reserved-word eligibility.
- * Thus >out { names an ordinary executable word. An unquoted escape protects
- * its next byte only: echo \$(name) has literal '$' followed by unquoted
- * parentheses and is INVALID; quoted literal spellings remain ordinary words.
- * NEEDS_REDIRECT locates an unfinished compound-tail descriptor prefix, or
- * the operator of a missing non-heredoc operand, including
- * after inline blanks or removed backslash-LF. An actual unfinished operand
- * quote/escape/substitution retains its own need and local child records.
- * A final logical < or > in operand position may still acquire `(` and uses
- * NEEDS_SUBSTITUTION for simple commands and compound tails alike. Whitespace
- * after that punctuation rules out this process-substitution completion.
- * A final backslash there remains NEEDS_ESCAPE until LF has arrived.
- * Redirect operators use longest-match lexical boundaries, shared by bare,
- * numeric and named descriptors. A second operator cannot supply a missing
- * operand: <<<<x is INVALID, while <<<<(:) has a process-substitution word.
- * Named >| has the same clobber operator as the unprefixed spelling.
- * NULL limits uses defaults; only its command bound and optional source
- * workspace apply (draft grammar always distinguishes unfinished input).
- * Decoded delimiters and non-evicting subscript boundary facts use bounded
- * private scratch or a larger supplied buffer.
- * shell_source_workspace_size() gives a checked sufficient byte capacity,
- * including lexical printing of delimiter-only command fragments. Such
- * fragments are not evaluated and do not contribute executable child headers.
- * Exhaustion returns
- * TRUNCATED without a qualified prefix, allowing a retry. The workspace is
- * borrowed only for the call and must not alias source or output. No partial
- * result authorizes executing a partial command or promoting a native
- * operation. Applications retain their operation/atomic-write policy.
+ * syntax. Ordinary single-quoted text and literal double-quoted fragments
+ * admit high bytes without encoding validation or normalization. Parameter
+ * operands inherit their applicable quote context. Executable children
+ * establish independent word contexts; arithmetic, substring arithmetic and
+ * selectors retain restricted code bytes, including at unfinished EOF.
+ * Heredoc literal text and parameter words retain their existing data domains.
+ * The executor fixes LC_ALL to C/POSIX or UTF-8 before parsing submitted
+ * source. Analysis uses fixed byte predicates independent of the embedding
+ * application's locale and leaves that locale unchanged. Offsets remain byte
+ * counts. Content remains a template, not evaluated
+ * expansion output. Admitted non-ASCII heredoc data/delimiters do not change
+ * later grammar or resource outcomes: a committed missing delimiter word is
+ * INVALID, an unfinished word is INCOMPLETE, and pending document capacity
+ * exhaustion is TRUNCATED. Unsupported delimiter forms remain UNSUPPORTED. Byte
+ * admission still checks later code after a missing delimiter; it does not
+ * invent a body or assume the remaining bytes are data. Unsupported
+ * escape-sensitive backticks are UNSUPPORTED and invalidate prefix
+ * qualification, not append-repairable input. Unfinished parameter heads, name
+ * enumeration and pending backslash-LF continuations are INCOMPLETE;
+ * unclassified selector failures are UNSUPPORTED. At received EOF, an unquoted
+ * command-position unsupported keyword such as `if`, `function` or `[[` remains
+ * INCOMPLETE (NEEDS_COMMAND): an appended suffix can make it an ordinary word.
+ * Its header is incomplete. Whitespace or an operator commits that keyword and
+ * makes the source UNSUPPORTED. A closed substitution likewise commits its
+ * child's final word; appending outside its delimiter cannot repair it.
+ * Quoted/escaped/suffixed lookalikes and words in argument or redirect-operand
+ * positions are ordinary words. An assignment or redirection prefix also
+ * commits a simple command: its pending executable word does not regain
+ * reserved-word eligibility. Thus >out { names an ordinary executable word. An
+ * unquoted escape protects its next byte only: echo \$(name) has literal '$'
+ * followed by unquoted parentheses and is INVALID; quoted literal spellings
+ * remain ordinary words. NEEDS_REDIRECT locates an unfinished compound-tail
+ * descriptor prefix, or the operator of a missing non-heredoc operand,
+ * including after inline blanks or removed backslash-LF. An actual unfinished
+ * operand quote/escape/substitution retains its own need and local child
+ * records. A final logical < or > in operand position may still acquire `(` and
+ * uses NEEDS_SUBSTITUTION for simple commands and compound tails alike.
+ * Whitespace after that punctuation rules out this process-substitution
+ * completion. A final backslash there remains NEEDS_ESCAPE until LF has
+ * arrived. Redirect operators use longest-match lexical boundaries, shared by
+ * bare, numeric and named descriptors. A second operator cannot supply a
+ * missing operand: <<<<x is INVALID, while <<<<(:) has a process-substitution
+ * word. Named >| has the same clobber operator as the unprefixed spelling. NULL
+ * limits uses defaults; only its command bound and optional source workspace
+ * apply (draft grammar always distinguishes unfinished input). Decoded
+ * delimiters and non-evicting subscript boundary facts use bounded private
+ * scratch or a larger supplied buffer. shell_source_workspace_size() gives a
+ * checked sufficient byte capacity, including lexical printing of
+ * delimiter-only command fragments. Such fragments are not evaluated and do not
+ * contribute executable child headers. Exhaustion returns TRUNCATED without a
+ * qualified prefix, allowing a retry. The workspace is borrowed only for the
+ * call and must not alias source or output. No partial result authorizes
+ * executing a partial command or promoting a native operation. Applications
+ * retain their operation/atomic-write policy.
  */
 shell_source_status_t shell_parse_draft(const char *source, size_t length,
                                         const shell_limits_t *limits,

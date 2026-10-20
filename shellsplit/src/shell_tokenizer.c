@@ -1,9 +1,9 @@
 #include "shell_tokenizer.h"
+#include "shell_ascii.h"
 #include "shell_pipeline_internal.h"
 #include "shell_source_internal.h"
 #include "shell_tokenizer_full.h"
 #include "shell_tokenizer_full_internal.h"
-#include <ctype.h>
 #include <string.h>
 
 /* --- FAST PARSER IMPLEMENTATION --- */
@@ -136,11 +136,11 @@ static SHELL_NONNULL(1, 3, 5) bool collect_heredoc_body_spans(
 }
 
 static bool shell_identifier_start(char c) {
-  return isalpha((unsigned char)c) || c == '_';
+  return shell_ascii_alpha((unsigned char)c) || c == '_';
 }
 
 static bool shell_identifier_continue(char c) {
-  return isalnum((unsigned char)c) || c == '_';
+  return shell_ascii_alnum((unsigned char)c) || c == '_';
 }
 
 /* Recognize assignment syntax that establishes an array without treating the
@@ -598,7 +598,7 @@ static void detect_features(const char *cmd, uint32_t start, uint32_t len,
           first++;
         }
         if (!has_array && first < content_end &&
-            (isalpha((unsigned char)p[first]) || p[first] == '_'))
+            (shell_ascii_alpha((unsigned char)p[first]) || p[first] == '_'))
           *features |= SHELL_FEAT_VARS;
         if (content_length != 0)
           detect_arithmetic_features(p, content_start,
@@ -762,11 +762,11 @@ static void detect_features(const char *cmd, uint32_t start, uint32_t len,
               i = (uint32_t)after;
               continue;
             }
-          } else if (isdigit((unsigned char)next) || next == '#' ||
+          } else if (shell_ascii_digit((unsigned char)next) || next == '#' ||
                      next == '?' || next == '$' || next == '!' || next == '@' ||
                      next == '*' || next == '-') {
             *features |= SHELL_FEAT_VARS;
-          } else if (isalpha((unsigned char)next) || next == '_') {
+          } else if (shell_ascii_alpha((unsigned char)next) || next == '_') {
             *features |= SHELL_FEAT_VARS;
           }
         }
@@ -873,7 +873,7 @@ static void detect_control_features(const char *cmd, uint32_t start,
       continue;
     }
 
-    if (isalnum((unsigned char)c) || c == '_') {
+    if (shell_ascii_alnum((unsigned char)c) || c == '_') {
       if (word_start == UINT32_MAX)
         word_start = i;
       continue;
@@ -1521,7 +1521,8 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
                       fast_lexical_token_at(&documents, pos) &&
                       documents.token.type == SHELL_TOKEN_GROUP_START;
     bool brace_close_redirect = false;
-    if (c == '}' && pos + 1 < cmd_len && isdigit((unsigned char)cmd[pos + 1])) {
+    if (c == '}' && pos + 1 < cmd_len &&
+        shell_ascii_digit((unsigned char)cmd[pos + 1])) {
       size_t redirect = 0;
       uint32_t descriptor = 0;
       shell_source_io_number_t io_number = shell_source_parse_io_number(

@@ -1,10 +1,10 @@
 #include "shell_tokenizer_full.h"
 #include "alloc.h"
+#include "shell_ascii.h"
 #include "shell_builtin_internal.h"
 #include "shell_source_draft_internal.h"
 #include "shell_source_internal.h"
 #include "shell_tokenizer_full_internal.h"
-#include <ctype.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -446,8 +446,8 @@ static SHELL_NONNULL(1) bool unsupported_semantics_scan_impl(
 
 /* Source-byte admission is not word separation: CR, VT and FF are readable
  * text, but only space/tab/LF separate Bash words. Reject other control bytes,
- * DEL before exposing a partial stream. High bytes belong only to heredoc
- * delimiter/data islands, never ordinary executable source. */
+ * DEL before exposing a partial stream. High bytes belong to ordinary quoted
+ * literals and scoped heredoc data, with byte offsets and no decoding. */
 shell_source_status_t shell_source_bytes_status(const char *input,
                                                 size_t length) {
   if (source_operation.bytes_prechecked &&
@@ -466,14 +466,14 @@ shell_source_status_t shell_source_bytes_status(const char *input,
     unsigned char byte = (unsigned char)input[i];
     if (byte == '\0')
       return SHELL_SOURCE_INVALID_INPUT;
-    unsupported |= (byte < 0x20 && !isspace(byte)) || byte == 0x7F;
+    unsupported |= (byte < 0x20 && !shell_ascii_space(byte)) || byte == 0x7F;
     high_bytes |= byte >= 0x80;
   }
   if (unsupported)
     return SHELL_SOURCE_UNSUPPORTED;
   if (high_bytes) {
     shell_source_status_t status =
-        shell_source_heredoc_bytes_status(input, length);
+        shell_source_scoped_bytes_status(input, length);
     if (status != SHELL_SOURCE_COMPLETE)
       return status;
   }
@@ -540,7 +540,7 @@ static SHELL_NONNULL(1) void arithmetic_skip_space(
     parser->position = shell_source_skip_escaped_line_endings(
         parser->input, parser->length, parser->position);
     if (parser->position >= parser->length ||
-        !isspace((unsigned char)parser->input[parser->position]))
+        !shell_ascii_space((unsigned char)parser->input[parser->position]))
       return;
     parser->position++;
   }
@@ -573,7 +573,7 @@ static SHELL_NONNULL(1) bool arithmetic_parse_primary(
   if (parser->position >= parser->length)
     return false;
 
-  if (isdigit((unsigned char)parser->input[parser->position]))
+  if (shell_ascii_digit((unsigned char)parser->input[parser->position]))
     return shell_source_skip_arithmetic_number(
         parser->input, parser->length, parser->position, &parser->position);
 
@@ -774,10 +774,10 @@ static bool brace_group_close_delimiter(const char *input, size_t length,
       following == '|' || following == '&' || following == ')' ||
       following == '<' || following == '>')
     return true;
-  if (!isdigit((unsigned char)following))
+  if (!shell_ascii_digit((unsigned char)following))
     return false;
   size_t cursor = after;
-  while (cursor < length && isdigit((unsigned char)input[cursor]))
+  while (cursor < length && shell_ascii_digit((unsigned char)input[cursor]))
     cursor++;
   cursor = shell_source_skip_escaped_line_endings(input, length, cursor);
   return cursor < length && (input[cursor] == '<' || input[cursor] == '>');
@@ -1135,7 +1135,7 @@ typedef enum {
 static SHELL_NONNULL(1, 5) array_word_t
     array_assignment_probe(const char *input, size_t length, size_t start,
                            bool leading, size_t *end) {
-  if (!(isalpha((unsigned char)input[start]) || input[start] == '_'))
+  if (!(shell_ascii_alpha((unsigned char)input[start]) || input[start] == '_'))
     return ARRAY_WORD_NONE;
   size_t limit = length;
   if (!leading && !shell_source_skip_shell_word(input, length, start, &limit))
@@ -1143,7 +1143,8 @@ static SHELL_NONNULL(1, 5) array_word_t
   size_t position = shell_source_logical_following(input, length, start);
   bool indexed = false;
   while (position < length &&
-         (isalnum((unsigned char)input[position]) || input[position] == '_'))
+         (shell_ascii_alnum((unsigned char)input[position]) ||
+          input[position] == '_'))
     position = shell_source_logical_following(input, length, position);
   if (position < length && input[position] == '[') {
     indexed = true;
@@ -1232,7 +1233,7 @@ static bool is_brace_group_delimiter(const shell_tokenizer_state_t *state,
     return true;
   if (!opening && (after == '<' || after == '>'))
     return true;
-  if (!opening && isdigit((unsigned char)after)) {
+  if (!opening && shell_ascii_digit((unsigned char)after)) {
     size_t cursor = 0;
     uint32_t descriptor = 0;
     return shell_source_parse_io_number(state->input, following, state->length,
@@ -1289,7 +1290,13 @@ static bool handle_quotes(shell_tokenizer_state_t *state) {
     }
   }
 
-  if (c == '\\' && state->position + 1 < state->length) {
+  /* Backslashes are literal in ordinary single quotes. In double quotes,
+   * only the shell's five escapable bytes suppress the next byte's syntax.
+   * ANSI-C quotes are consumed by their dedicated scanner. */
+  if (c == '\\' && state->position + 1 < state->length &&
+      (!state->in_quotes ||
+       (state->quote_char == '"' &&
+        strchr("$`\"\\\n", state->input[state->position + 1])))) {
     state->position += 2;
     return true;
   }
@@ -1336,7 +1343,7 @@ static bool parse_variable(shell_tokenizer_state_t *state,
   if (state->position < state->length) {
     char next = state->input[state->position];
     // Handle: $0-$9, $#, $?, $$, $!, $@, $*, $-
-    if (isdigit((unsigned char)next) || next == '#' || next == '?' ||
+    if (shell_ascii_digit((unsigned char)next) || next == '#' || next == '?' ||
         next == '$' || next == '!' || next == '@' || next == '*' ||
         next == '-') {
       state->position++;
@@ -1359,7 +1366,7 @@ static bool parse_variable(shell_tokenizer_state_t *state,
       continue;
     }
     char c = state->input[state->position];
-    if (!isalnum((unsigned char)c) && c != '_') {
+    if (!shell_ascii_alnum((unsigned char)c) && c != '_') {
       break;
     }
     state->position++;
@@ -2054,7 +2061,8 @@ static SHELL_NONNULL(1, 2) bool shell_tokenizer_next_raw(
   // An IO number must touch its operator. Whitespace leaves a numeric argv
   // word, and a physical newline starts a separate command.
   if (!state->in_quotes && !word_had_quotes &&
-      isdigit((unsigned char)current_char) && token_starts_word(state)) {
+      shell_ascii_digit((unsigned char)current_char) &&
+      token_starts_word(state)) {
     size_t check_pos = 0;
     uint32_t descriptor = 0;
     shell_source_io_number_t io_number = shell_source_parse_io_number(
@@ -2361,7 +2369,8 @@ static bool control_function_keyword_has_name(const shell_token_t *token,
     position++;
   if (position >= input_length)
     return false;
-  return isalpha((unsigned char)input[position]) || input[position] == '_';
+  return shell_ascii_alpha((unsigned char)input[position]) ||
+         input[position] == '_';
 }
 
 typedef enum {
@@ -2756,14 +2765,14 @@ static SHELL_NONNULL(2) bool declaration_array_emit(unsigned char byte,
   switch (scan->state) {
   case DECLARATION_ARRAY_NAME:
     if (!scan->have_name) {
-      if (!(isalpha(byte) || byte == '_')) {
+      if (!(shell_ascii_alpha(byte) || byte == '_')) {
         scan->state = DECLARATION_ARRAY_OTHER;
         return true;
       }
       scan->have_name = true;
       return true;
     }
-    if (isalnum(byte) || byte == '_')
+    if (shell_ascii_alnum(byte) || byte == '_')
       return true;
     if (byte == '=') {
       scan->state = DECLARATION_ARRAY_OTHER;

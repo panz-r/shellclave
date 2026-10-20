@@ -12,6 +12,13 @@ The modeled executor is **Bash 5.3.20**, pinned in
 noninteractive shell. The [security model](../SECURITY.md#executor-startup)
 specifies the required startup preparation. Reference upgrades include
 conformance tests and any required modeling corrections in one changeset.
+`LC_ALL` is fixed to C/POSIX or an installed UTF-8 locale and made readonly in
+trusted startup. Analysis uses byte-oriented syntax and values under this
+executor contract.
+The embedding application's locale does not affect syntax, builtin operand
+classification, Shelltype token classification, or diagnostic byte escaping.
+Those operations use explicit ASCII character sets and preserve other bytes as
+data. Library calls leave the application's locale unchanged.
 
 Shellsplit exposes several levels of analysis:
 
@@ -54,13 +61,28 @@ the dollar is literal but the parentheses remain shell punctuation, making
 the source INVALID. Quoting the entire spelling or escaping the parentheses
 produces ordinary literal word content.
 
-Ordinary executable source uses the restricted byte domain. Heredoc delimiter
-and body data can retain non-ASCII bytes; active executable children and
-arithmetic operands retain their code restrictions. Canonical netstrings carry
-arbitrary binary payloads independently of shell-source admission.
+Ordinary single-quoted literals and literal portions of double-quoted words
+preserve high bytes exactly, including invalid UTF-8. This applies to command
+names, arguments, assignment values and filenames, including concatenated
+fragments such as `pre'日本'".txt"`. Offsets and lengths count source bytes;
+normalization and character decoding are outside this representation.
+Backslashes are literal inside ordinary single quotes. In double quotes they
+escape only `$`, backtick, `"`, backslash, and newline; a backslash before any
+other byte is retained. Closing quotes therefore retain the same word and
+command boundaries across source, processor, graph, and diagnostic APIs.
+Heredoc delimiter and body data retain their existing byte domains.
 
-ANSI-C quoting supports static byte decoding. Complete-command semantic APIs
-reject escapes decoding to NUL and locale-dependent non-ASCII Unicode escapes.
+Unquoted high bytes remain UNSUPPORTED. Command, process and supported backtick
+substitutions establish independent source contexts: `"$(printf '%s' '日本')"`
+is admitted, while `"$(printf 日本)"` is UNSUPPORTED. Arithmetic, substring
+arithmetic, array subscripts and parameter selectors retain restricted code
+domains even inside an enclosing quote. Ordinary parameter operands inherit
+their applicable quote context, as in `"${value:-日本}"`. Canonical netstrings
+carry arbitrary binary payloads independently of shell-source admission.
+
+Raw high bytes in ANSI-C quoting remain UNSUPPORTED. ANSI-C quoting supports
+static byte decoding. Complete-command semantic APIs reject escapes decoding
+to NUL and locale-dependent non-ASCII Unicode escapes.
 Isolated-word and canonical APIs preserve their documented byte-oriented
 behavior. Locale-translated `$"…"` source is unsupported.
 The source classifier also declines legacy `$[...]` arithmetic and function

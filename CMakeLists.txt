@@ -64,6 +64,7 @@ endfunction()
 
 function(shellclave_project_target target)
   target_compile_features(${target} PUBLIC c_std_11)
+  target_include_directories(${target} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/common)
   if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic)
   endif()
@@ -268,6 +269,28 @@ if(BUILD_TESTING)
   add_custom_target(shellclave_concurrency_tests)
   # The same membership drives production coverage's build and CTest label.
   add_custom_target(shellclave_production_tests)
+  find_program(SHELLCLAVE_LOCALEDEF NAMES localedef REQUIRED)
+  foreach(variant IN ITEMS tests production)
+    if(variant STREQUAL "production")
+      set(byte_test shellclave_byte_semantics_production_test)
+      set(byte_library shellgate)
+    else()
+      set(byte_test shellclave_byte_semantics_test)
+      set(byte_library shellgate_test)
+    endif()
+    add_executable(${byte_test} tests/test_byte_semantics.c)
+    shellclave_project_target(${byte_test})
+    target_link_libraries(${byte_test} PRIVATE ${byte_library})
+    add_test(NAME ${byte_test}
+      COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_host_locale.py"
+        --probe $<TARGET_FILE:${byte_test}> --localedef "${SHELLCLAVE_LOCALEDEF}"
+        --scratch "${CMAKE_CURRENT_BINARY_DIR}")
+    set_tests_properties(${byte_test} PROPERTIES LABELS "api;shellsplit;shelltype;shellgate"
+      TIMEOUT 120)
+    if(variant STREQUAL "production")
+      shellclave_register_production_test(${byte_test})
+    endif()
+  endforeach()
   shellclave_add_production_test(shellgate_example_contract
     tests/test_gate_example.c shellgate)
   add_test(NAME shellclave_gate_example COMMAND shellclave_gate_example)
@@ -855,6 +878,7 @@ if(SHELLCLAVE_BUILD_FUZZERS)
   target_link_options(fuzz_shelltype PRIVATE -fsanitize=fuzzer,address,undefined)
   target_link_libraries(fuzz_shelltype PRIVATE shelltype)
   foreach(fuzzer IN ITEMS fuzz_shellgate fuzz_shellsplit fuzz_shelltype)
+    target_include_directories(${fuzzer} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/common)
     target_compile_options(${fuzzer} PRIVATE -O2 -Wall -Wextra -Wpedantic)
     shellclave_fatal_ubsan(${fuzzer})
   endforeach()
@@ -926,6 +950,7 @@ endif()
 
 if(PROJECT_IS_TOP_LEVEL)
   file(GLOB_RECURSE SHELLCLAVE_FORMAT_SOURCES CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/common/*.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/examples/*.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/shellsplit/*.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/shellsplit/*.h"

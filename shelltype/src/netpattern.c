@@ -3,7 +3,7 @@
 #include "shell_netstring.h"
 #include "shelltype.h"
 
-#include <ctype.h>
+#include "shell_ascii.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -637,8 +637,8 @@ static bool literal_needs_quotes(const char *text, size_t length) {
     return true;
   for (size_t i = 0; i < length; i++) {
     unsigned char c = (unsigned char)text[i];
-    if (isspace(c) || c < 0x20 || c == 0x7f || c == '"' || c == '\\' ||
-        c == '{' || c == '}')
+    if (shell_ascii_space(c) || c < 0x20 || c == 0x7f || c == '"' ||
+        c == '\\' || c == '{' || c == '}')
       return true;
   }
   return false;

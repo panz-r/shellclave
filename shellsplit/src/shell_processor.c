@@ -7,7 +7,6 @@
 #include "shell_source_internal.h"
 #include "shell_tokenizer_full.h"
 #include "shell_tokenizer_full_internal.h"
-#include <ctype.h>
 #include <limits.h>
 #include <stdint.h>
 #include <stdio.h>

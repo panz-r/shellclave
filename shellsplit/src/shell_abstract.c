@@ -1,6 +1,7 @@
 #define _XOPEN_SOURCE 700
 #include "shell_abstract.h"
 #include "alloc.h"
+#include "shell_ascii.h"
 #include "shell_netstring.h"
 #include "shell_processor.h"
 #include "shell_processor_internal.h"
@@ -8,7 +9,6 @@
 #include "shell_source_internal.h"
 #include "shell_tokenizer_full.h"
 #include "shell_tokenizer_full_internal.h"
-#include <ctype.h>
 #include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -59,18 +59,20 @@ static SHELL_NONNULL(1, 4, 5) bool abstract_parse_parameter_name(
     return false;
   unsigned char first = (unsigned char)text[position];
   out->name_start = position;
-  if (isdigit(first)) {
-    do {
-      position++;
-      position = shell_source_skip_escaped_line_endings(text, length, position);
-    } while (position < length && isdigit((unsigned char)text[position]));
-    out->type = SHELL_ABSTRACT_PV;
-  } else if (isalpha(first) || first == '_') {
+  if (shell_ascii_digit(first)) {
     do {
       position++;
       position = shell_source_skip_escaped_line_endings(text, length, position);
     } while (position < length &&
-             (isalnum((unsigned char)text[position]) || text[position] == '_'));
+             shell_ascii_digit((unsigned char)text[position]));
+    out->type = SHELL_ABSTRACT_PV;
+  } else if (shell_ascii_alpha(first) || first == '_') {
+    do {
+      position++;
+      position = shell_source_skip_escaped_line_endings(text, length, position);
+    } while (position < length &&
+             (shell_ascii_alnum((unsigned char)text[position]) ||
+              text[position] == '_'));
     out->type = SHELL_ABSTRACT_EV;
   } else if (abstract_special_parameter((char)first)) {
     position++;
@@ -272,7 +274,7 @@ static bool is_home_path(const char *s, size_t len) {
     return false;
   if (s[0] == '~') {
     return len == 1 || s[1] == '/' ||
-           (len >= 2 && isalpha((unsigned char)s[1]));
+           (len >= 2 && shell_ascii_alpha((unsigned char)s[1]));
   }
   return false;
 }
@@ -284,7 +286,7 @@ static bool is_short_option(const char *s, size_t len) {
   if (len == 0)
     return false;
   return len >= 2 && s[0] == '-' && s[1] != '-' &&
-         !isdigit((unsigned char)s[1]);
+         !shell_ascii_digit((unsigned char)s[1]);
 }
 
 /**

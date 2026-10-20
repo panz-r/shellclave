@@ -10,6 +10,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "shell_depgraph.h"
+#include "shell_ascii.h"
 #include "shell_builtin_internal.h"
 #include "shell_depgraph_internal.h"
 #include "shell_netstring.h"
@@ -20,7 +21,6 @@
 #include "shell_tokenizer.h"
 #include "shell_tokenizer_full.h"
 #include "shell_tokenizer_full_internal.h"
-#include <ctype.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -26457,7 +26457,7 @@ static SHELL_NONNULL(1, 2) void dep_dump_escaped_span(FILE *fp,
       fputs("\\n", fp);
     else if (byte == '\r')
       fputs("\\r", fp);
-    else if (isprint(byte))
+    else if (shell_ascii_print(byte))
       fputc(byte, fp);
     else
       fprintf(fp, "\\x%02x", byte);

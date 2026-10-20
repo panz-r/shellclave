@@ -93,9 +93,16 @@ application retains control of execution policy.
 | INVALID_INPUT | Embedded NUL prevents unchanged submission to the executor; reject the input representation |
 | TRUNCATED | A resource or representation limit stopped analysis; retry within a resource budget or report the limit |
 
-UNSUPPORTED makes no claim that Bash accepts the source. Ordinary quoted
-non-ASCII text and unsupported control constructs use that outcome. COMPLETE
-establishes source grammar, not supported execution semantics. For example,
+UNSUPPORTED makes no claim that Bash accepts the source. Unquoted non-ASCII
+bytes and unsupported control constructs use that outcome. Ordinary single
+and double quotes preserve literal high bytes, including invalid UTF-8, without
+normalization; source offsets and canonical lengths count bytes. Syntax and
+builtin operand classification use fixed ASCII sets, independent of the
+application's locale. Backslashes inside ordinary single quotes are literal,
+including immediately before the closing quote. Execution
+uses a fixed C/POSIX or UTF-8 `LC_ALL`, made readonly by trusted startup as
+specified in the [executor contract](../SECURITY.md#executor-startup).
+COMPLETE establishes source grammar, not supported execution semantics. For example,
 `eval 'printf ok'` still fails graph construction.
 
 Standalone empty negation is UNSUPPORTED, including `!;` and top-level `!` at

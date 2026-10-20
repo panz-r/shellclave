@@ -36,6 +36,12 @@ directories, add large fuzz corpora, or globally suppress warnings. Run the
 ASan/UBSan configuration for changes that touch parsing, memory ownership,
 serialization, or concurrency; run TSan for policy/context synchronization.
 
+Host-locale regressions require `localedef` and the `en_US` and `ISO-8859-1`
+locale sources (`locales` on Debian/Ubuntu). Tests generate private locale data
+in the build directory and remove it afterward; they do not change system
+locale settings. The single-byte host locale tests analysis independence, not
+an additional supported Bash executor locale.
+
 Run `cmake --build build --target format` before submitting changes;
 `format-check` verifies the result without modifying files. These targets cover
 first-party C and C++ sources only and never format the `deps/` submodules.

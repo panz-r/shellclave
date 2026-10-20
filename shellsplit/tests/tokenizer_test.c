@@ -4513,7 +4513,7 @@ static void test_transform_allocation_failures(void) {
 }
 
 static void test_output_limit_boundaries(void) {
-  static const char input[] = "echo one ; printf two";
+  static const char input[] = "echo one'日本' ; printf 'two\x80\xff'";
   shell_command_info_t *infos = NULL;
   size_t count = 0;
   shell_process_status_t process_status =
@@ -9201,6 +9201,11 @@ int main(void) {
   test_processor_allocation_failures();
   test_transform_allocation_failures();
   test_transform_source_limit_preflight();
+  test("Quoted byte processing is allocation-failure atomic",
+       process_commands_allocation_failure_atomic(
+           "{ printf '%s' '日本'; } >'résumé.txt'") &&
+           process_command_allocation_failure_atomic(
+               "printf '%s' '\x80\xff' >'réport.txt'"));
   test("Later timing prefixes are allocation-failure atomic",
        process_command_allocation_failure_atomic(
            "echo a; time -p echo b; time; ! echo c") &&
@@ -10909,7 +10914,6 @@ int main(void) {
        0},
       {"Embedded control character is rejected", "cmd\x01suffix", 0},
       {"Embedded high byte is rejected", "cmd\x80suffix", 0},
-      {"Quoted high byte is rejected", "echo '\x80'", 0},
       {"Bare separator is rejected", "|", 0},
   };
   run_rejected_cases(invalid_input_cases, sizeof(invalid_input_cases) /

@@ -535,6 +535,10 @@ void pointer_contracts(sg_gate_t *gate, st_policy_t *policy) {
   (void)shell_parse_draft("", 0, NULL, NULL);
 #elif TEST_BAD == 189
   (void)shell_source_workspace_size(0, NULL);
+#elif TEST_BAD == 190
+  (void)shell_ascii_equal_ci(NULL, "x", 1);
+#elif TEST_BAD == 191
+  (void)shell_ascii_equal_ci("x", NULL, 1);
 #else
   /* These NULL values have API meanings and must stay accepted. */
   (void)shell_netstring_iter_init(&iter, NULL, 0);

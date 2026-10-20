@@ -662,8 +662,10 @@ sg_gate_anomaly_type_model_borrowed(const sg_gate_t *gate) SHELL_NONNULL(1);
 /*
  * Strict mode (enabled by default): the parser rejects malformed syntax,
  * including unclosed quotes and parameter expansions, and prohibited source
- * bytes. Executable source has a restricted byte domain; heredoc delimiters
- * and body data admit non-ASCII bytes under the documented scoped rules.
+ * bytes. Ordinary quoted literals and heredoc data admit high bytes under
+ * scoped rules; executable children establish independent word contexts.
+ * Arithmetic and selectors retain restricted code bytes. The executor fixes
+ * LC_ALL to C/POSIX or UTF-8 as specified in the startup contract.
  * Literal NUL, DEL, and prohibited control bytes remain invalid.
  *
  * This is always enabled for security hardening.  Permissive mode
@@ -732,7 +734,8 @@ sg_error_t sg_gate_set_violation_config_borrowed(
  * executor-neutral shell interpretation. Execution must honor that contract,
  * including privileged Bash startup with POSIXLY_CORRECT absent,
  * BASH_COMPAT/BASH_XTRACEFD cleared, all three variables then made readonly,
- * and no imported/shadowing functions, startup aliases or traps.
+ * LC_ALL fixed to C/POSIX or UTF-8 and made readonly, and no
+ * imported/shadowing functions, startup aliases or traps.
  * The library does not execute commands or choose the application's executor.
  * A result with `SG_VERDICT_ALLOW_CONDITIONAL` contains a substitution
  * dependency: the caller must satisfy its dynamic-content inspection and
