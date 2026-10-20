@@ -5,10 +5,10 @@ It preserves source ranges, identifies shell features, and provides richer
 allocating tokenization, abstraction, transformation, and dependency-graph
 APIs.
 
-`shell_source.h` also retains heredoc framing, lexical headers and ordered
-redirects for received drafts. See [source, draft and static CWD contracts](../docs/source-draft-contract.md)
-for the 0.17 API and migration examples. Strict graph parsing remains strict;
-draft analysis exposes a separately qualified prefix, never execution approval.
+[`shell_source.h`](include/shell_source.h) also retains heredoc framing,
+lexical headers and ordered redirects for received drafts. Strict graph parsing
+remains strict; draft analysis exposes a separately qualified prefix, never
+execution approval.
 
 ## Overview
 
@@ -169,8 +169,9 @@ derived from the retained boundary edges.
 Heredoc delimiter words retain balanced literal parameter, arithmetic, command,
 and process-substitution fragments. These fragments are not executed; Bash's
 lexical normalization and command printing determine the terminating line.
-Quotes inside a fragment do not by themselves disable body expansion. See the
-[source/draft contract](../docs/source-draft-contract.md) for exact payloads,
+Quotes inside a fragment do not by themselves disable body expansion. See
+[`shell_source.h`](include/shell_source.h) and
+[`shell_depgraph.h`](include/shell_depgraph.h) for exact payloads,
 unfinished-input recovery, and workspace sizing with
 `shell_source_workspace_size()`.
 
@@ -796,8 +797,8 @@ Draft inspection excludes tentative closing-delimiter lines from executable
 child analysis until they become confirmed body data; raw content still
 retains every received byte. Unfinished parameter heads and name enumeration,
 including pending selector continuations, remain append-repairable rather
-than being reported as malformed. See the
-[source/draft contract](../docs/source-draft-contract.md) for confirmed-content
+than being reported as malformed. See
+[`shell_source.h`](include/shell_source.h) for confirmed-content
 and prefix qualification rules.
 Nonempty trivia-only fast-parser input succeeds with zero ranges; zero-length
 input remains invalid, and `shell_process_commands` still rejects inputs with
@@ -1478,7 +1479,6 @@ with a different allocator can over-allocate and align manually. An absent,
 misaligned, or undersized workspace returns `SHELL_DEP_EWORKSPACE`. Use
 `shell_source_workspace_size()` instead of a flat-delimiter byte estimate:
 grouped delimiter fragments also need workspace-backed normalization pieces.
-See [the source contracts](../docs/source-draft-contract.md).
 Command bytes, configuration, workspace, and graph output must obey the non-overlap
 requirements documented by the API; invalid caller storage is not inspected at
 runtime.
