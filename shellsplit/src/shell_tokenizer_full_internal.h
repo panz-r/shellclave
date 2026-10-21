@@ -125,9 +125,10 @@ bool shell_tokenizer_inspect_semantics(
     shell_semantic_process_observer_t process, void *context)
     SHELL_NONNULL(1, 3, 4, 5, 6);
 
-/* Whole-source validation boundary: reject embedded NUL, invalid control/DEL
- * and raw high bytes before inspecting list syntax, including bytes in skipped
- * comments, quotes, expansions and document bodies. A successful root check
+/* Whole-source validation boundary: reject embedded NUL and prohibited
+ * control/DEL bytes, then qualify high bytes by their source domain. Ordinary
+ * word and heredoc data admit them; code and skipped comments stay restricted.
+ * A successful root check
  * is reused by contained immutable spans for the current source operation;
  * unrelated spans still receive their own byte check. NULL is rejected.
  * Validate the shell list operators exposed by the lexer. This is deliberately

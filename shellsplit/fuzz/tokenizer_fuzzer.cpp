@@ -14,8 +14,8 @@
 
 #include "../tests/depgraph_compare.h"
 #include "../tests/malformed_source_cases.h"
-#include "../tests/quoted_byte_cases.h"
 #include "../tests/source_compare.h"
+#include "../tests/word_byte_cases.h"
 #include "../tests/word_expansion_cases.h"
 #include "depgraph_invariants.h"
 #include "env_screener.h"
@@ -4292,7 +4292,7 @@ static int test_fixed_oracles(void) {
     if (command_count != item.command_count || !edge_seen)
       return fixed_oracle_failure(__LINE__);
   }
-  static const char *const invalid[] = {"echo é"};
+  static const char *const invalid[] = {"echo $'é'", "echo $((é))"};
   for (const char *input : invalid) {
     shell_parse_result_t fast = {};
     if (shell_parse_fast(input, strlen(input), NULL, &fast) != SHELL_EPARSE ||
@@ -7987,7 +7987,7 @@ static void run_fixed_oracles() {
       abort();
   }
   fixed_oracle_phase("word and syntax matrices");
-  for (const auto &fixture : shellsplit_test_quoted_bytes) {
+  for (const auto &fixture : shellsplit_test_word_bytes) {
     char source[256], expected[256];
     int length =
         snprintf(source, sizeof(source), "printf %%s %s", fixture.word);
@@ -8001,6 +8001,9 @@ static void run_fixed_oracles() {
     shell_netstring_buffer_t argv = {};
     bool valid =
         shell_parse_fast(source, length, nullptr, &parsed) == SHELL_OK &&
+        parsed.count == 1 &&
+        !(parsed.cmds[0].features &
+          (SHELL_FEAT_LOOPS | SHELL_FEAT_CONDITIONALS | SHELL_FEAT_CASE)) &&
         shell_process_commands(source, length, nullptr, &processed) ==
             SHELL_PROCESS_OK &&
         processed.command_count == 1;
@@ -8015,7 +8018,7 @@ static void run_fixed_oracles() {
     shell_netstring_buffer_free(&argv);
     shell_processed_commands_free(&processed);
     if (!valid) {
-      fprintf(stderr, "quoted literal byte oracle failed: %s\n", source);
+      fprintf(stderr, "literal word byte oracle failed: %s\n", source);
       abort();
     }
   }
@@ -8075,7 +8078,8 @@ static void run_fixed_oracles() {
         {"cat <<'EOF'\né\nEOF\ncat <<\n", SHELL_SOURCE_INVALID},
         {"cat <<'é'\né\ncat <<#comment", SHELL_SOURCE_INVALID},
         {"cat <<'EOF'\né\nEOF\ncat <<", SHELL_SOURCE_INCOMPLETE},
-        {"cat <<'EOF'\né\nEOF\ncat <<\nprintf é", SHELL_SOURCE_UNSUPPORTED},
+        {"cat <<'EOF'\né\nEOF\ncat <<\nprintf é", SHELL_SOURCE_INVALID},
+        {"cat <<'EOF'\né\nEOF\ncat <<\nprintf $'é'", SHELL_SOURCE_UNSUPPORTED},
         {"echo before #comment \\\necho after", SHELL_SOURCE_COMPLETE},
         {": #comment \\\na=(x)", SHELL_SOURCE_UNSUPPORTED},
         {": #comment \\\n{ :; }", SHELL_SOURCE_COMPLETE},
@@ -8087,7 +8091,8 @@ static void run_fixed_oracles() {
         {"cat /workspace/before.txt\ncat <<\ncat /workspace/not-a-read.txt",
          SHELL_SOURCE_INVALID},
         {"printf '%s' '日本'", SHELL_SOURCE_COMPLETE},
-        {"printf '%s' 日本", SHELL_SOURCE_UNSUPPORTED},
+        {"printf '%s' 日本", SHELL_SOURCE_COMPLETE},
+        {"printf '%s' $'日本'", SHELL_SOURCE_UNSUPPORTED},
         {"if true; then :; fi", SHELL_SOURCE_UNSUPPORTED},
         {"foo.bar() { :; }", SHELL_SOURCE_UNSUPPORTED},
         {"echo $[1 + (2)]", SHELL_SOURCE_UNSUPPORTED},

@@ -70,7 +70,7 @@ typedef struct {
   bool has_glob;
   bool has_redirect;
   bool has_subshell;
-  bool has_binary;       // Contains binary/control chars
+  bool has_binary;       // Contains the raw non-UTF-8 byte fixture
   bool has_control_char; // Contains control characters
   bool has_high_bytes;   // Contains high bytes (0x80+)
 } shell_ast_t;
@@ -150,15 +150,15 @@ ast_node_t *shell_ast_add_backtick(shell_ast_t *ast, const char *content,
 // Glob pattern
 ast_node_t *shell_ast_add_glob(shell_ast_t *ast, const char *pattern);
 
-/* --- GENERATOR-SPECIFIC INVALID PATTERNS --- */
+/* --- GENERATOR-SPECIFIC ADVERSARIAL PATTERNS --- */
 
-// Binary/control chars embedded
+// Raw non-UTF-8 bytes forming a valid literal command word
 void shell_ast_add_binary(shell_ast_t *ast);
 
 // Control character at start
 void shell_ast_add_control_char(shell_ast_t *ast);
 
-// High bytes (binary data)
+// High bytes forming a valid literal command word
 void shell_ast_add_high_bytes(shell_ast_t *ast);
 
 // Unclosed quote

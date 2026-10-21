@@ -36,6 +36,15 @@ unsupported. A feature flag is recognition, not a promise of semantic support.
 Shellgate's default mask also rejects arithmetic, heredocs, and here-strings;
 changing that mask enables only constructs the semantic model supports.
 
+Control flags recognize complete unquoted lexical words after removal of
+backslash-LF continuations. Punctuation and quoted or expanded fragments stay
+within their word: `日本.if` and `日本''if` have no conditional flag. Standalone
+keyword spellings remain lexical markers even in argument positions, so
+`echo if` still has that flag. Comments, redirect operands, parameter operands,
+arithmetic text and document text do not supply outer control words.
+Executable substitutions are inspected in their own command context, including
+when nested in those data operands.
+
 Supported composition includes simple commands, lists, `&&`, `||`, pipelines,
 `|&`, background execution, brace groups, parenthesized groups, negation, and
 pipeline timing. Redirection support includes files, combined output, heredocs,
@@ -61,10 +70,10 @@ the dollar is literal but the parentheses remain shell punctuation, making
 the source INVALID. Quoting the entire spelling or escaping the parentheses
 produces ordinary literal word content.
 
-Ordinary single-quoted literals and literal portions of double-quoted words
-preserve high bytes exactly, including invalid UTF-8. This applies to command
-names, arguments, assignment values and filenames, including concatenated
-fragments such as `pre'日本'".txt"`. Offsets and lengths count source bytes;
+Ordinary literal word content, whether unquoted, escaped, single-quoted or
+double-quoted, preserves high bytes exactly, including invalid UTF-8. This
+applies to command names, arguments, assignment values and filenames, including
+concatenated fragments such as `pre'日本'".txt"`. Offsets and lengths count source bytes;
 normalization and character decoding are outside this representation.
 Backslashes are literal inside ordinary single quotes. In double quotes they
 escape only `$`, backtick, `"`, backslash, and newline; a backslash before any
@@ -72,13 +81,20 @@ other byte is retained. Closing quotes therefore retain the same word and
 command boundaries across source, processor, graph, and diagnostic APIs.
 Heredoc delimiter and body data retain their existing byte domains.
 
-Unquoted high bytes remain UNSUPPORTED. Command, process and supported backtick
-substitutions establish independent source contexts: `"$(printf '%s' '日本')"`
-is admitted, while `"$(printf 日本)"` is UNSUPPORTED. Arithmetic, substring
-arithmetic, array subscripts and parameter selectors retain restricted code
+ASCII rules continue to determine variable names and shell syntax. Thus
+`$name日本` expands `name` followed by literal text, `$日本` is literal text,
+and `日本=value` names a command rather than an assignment. High bytes do not
+introduce word boundaries or turn part of a word into a reserved word.
+Command, process and supported backtick substitutions establish independent
+source contexts: both `"$(printf '%s' '日本')"` and `"$(printf 日本)"` are
+admitted. Arithmetic, substring arithmetic, array subscripts and parameter
+selectors retain restricted code
 domains even inside an enclosing quote. Ordinary parameter operands inherit
-their applicable quote context, as in `"${value:-日本}"`. Canonical netstrings
-carry arbitrary binary payloads independently of shell-source admission.
+their applicable quote context, as in `${value:-日本}` or `"${value:-日本}"`.
+Pattern and replacement operands also retain high bytes without evaluating
+their runtime results. Comments retain their ASCII byte restriction.
+Canonical netstrings carry arbitrary binary payloads independently of
+shell-source admission.
 
 Raw high bytes in ANSI-C quoting remain UNSUPPORTED. ANSI-C quoting supports
 static byte decoding. Complete-command semantic APIs reject escapes decoding

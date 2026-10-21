@@ -165,9 +165,9 @@ and here-strings. An application may adjust that mask for supported constructs;
 unsupported semantics still cause rejection. Extglob requires executor startup
 configuration before Bash parses the command.
 
-Ordinary single-quoted text and literal portions of double-quoted words retain
-non-ASCII bytes, including filenames and concatenated fragments. For example,
-`printf '%s\n' '日本'` is supported. Values and offsets remain byte-based, with
+Ordinary word content retains non-ASCII bytes in unquoted, escaped, and quoted
+fragments, including filenames. For example, `cat résumé.txt` and
+`printf '%s\n' 日本` are supported. Values and offsets remain byte-based, with
 no UTF-8 validation or normalization. Analysis and token classification use
 fixed byte rules, independent of the application's locale. The executor uses a
 fixed C/POSIX or UTF-8 locale, established through the

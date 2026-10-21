@@ -5,10 +5,26 @@ define the current API; rebuild consumers after updating the library.
 
 ## Unreleased: typed source admission
 
-Ordinary single and double quotes now admit literal high bytes, including
-invalid UTF-8 and concatenated fragments. `printf '%s' '日本'` is COMPLETE and
-available to semantic consumers. Unquoted `printf '%s' 日本` remains
-UNSUPPORTED. Canonical values and source offsets preserve exact bytes.
+Ordinary words now admit literal high bytes in unquoted, escaped, single-quoted
+and double-quoted fragments, including invalid UTF-8 and concatenations.
+Both `printf '%s' 日本` and `printf '%s' '日本'` are COMPLETE and available to
+semantic consumers. Canonical values and source offsets preserve exact bytes.
+Parameter default and pattern operands admit the same literal data; variable
+names, arithmetic and subscripts retain their restricted code domains.
+Raw high bytes in active ANSI-C quotes and comments remain UNSUPPORTED.
+Previously unsupported sources now reach the normal grammar and semantic
+checks. For example, `printf 日本\ncat <<\n` is INVALID rather than
+UNSUPPORTED because the later heredoc declaration has no delimiter.
+
+Control-feature detection now uses complete lexical words. Ordinary words such
+as `日本.if`, `日本''if`, `x-while` and `/tmp/in` no longer trigger false
+conditional, loop or case rejections under Shellgate's default feature mask.
+They reach normal argv-policy matching. Keyword text in comments, redirect
+operands and expansion/document data also stays out of outer control flags;
+executable substitutions retain their own flags. Standalone unquoted keyword
+spellings remain lexical markers, including in ordinary argument positions.
+The allocating tokenizer uses the same complete-word and redirect-operand
+boundaries for its lexical control metadata.
 
 Single-quoted backslashes now retain their literal meaning at closing quotes,
 including before command separators. Source classification, structured
@@ -27,7 +43,7 @@ before submitting the newly admitted source.
 
 `shell_source_status_t` adds UNSUPPORTED and INVALID_INPUT after the existing
 values, without enlarging retained result structures. Update exhaustive status
-switches. INVALID now establishes a grammar error; unquoted non-ASCII source,
+switches. INVALID now establishes a grammar error; restricted non-ASCII code,
 unsupported committed constructs, and unclassified expansion forms are
 UNSUPPORTED. Embedded NUL is INVALID_INPUT. Source limits remain TRUNCATED.
 

@@ -446,7 +446,7 @@ static SHELL_NONNULL(1) bool unsupported_semantics_scan_impl(
 
 /* Source-byte admission is not word separation: CR, VT and FF are readable
  * text, but only space/tab/LF separate Bash words. Reject other control bytes,
- * DEL before exposing a partial stream. High bytes belong to ordinary quoted
+ * DEL before exposing a partial stream. High bytes belong to ordinary word
  * literals and scoped heredoc data, with byte offsets and no decoding. */
 shell_source_status_t shell_source_bytes_status(const char *input,
                                                 size_t length) {
@@ -1055,42 +1055,40 @@ bool shell_tokenizer_init(shell_tokenizer_state_t *state, const char *input,
   return valid;
 }
 
-static void check_keyword(shell_tokenizer_state_t *state,
-                          const char *token_text, size_t token_len) {
-  if (token_text == NULL || token_len == 0)
-    return;
-
-  // Track control-flow keywords for depth validation.
-  // then/else/elif are recognized as flow keywords but do not directly adjust
-  // depth here.
-  if (token_len == 2 && strncmp(token_text, "if", 2) == 0) {
+/* The forward lexical context calls this only at the start of an ordinary
+ * logical word, after excluding redirect operands. Match through its complete
+ * source boundary, not merely the current fragment's end. These counters
+ * retain lexical control metadata; list grammar is validated separately. */
+static SHELL_NONNULL(1, 2) void check_keyword(shell_tokenizer_state_t *state,
+                                              const shell_token_t *token) {
+  const char *input = state->input;
+  size_t length = state->length, position = token->position;
+  if (shell_source_match_plain_word(input, length, position, "if", 2, NULL)) {
     state->if_depth++;
-  } else if (token_len == 4) {
-    if (strncmp(token_text, "then", 4) == 0 ||
-        strncmp(token_text, "else", 4) == 0 ||
-        strncmp(token_text, "elif", 4) == 0) {
-      /* no depth change */
-    }
-  } else if (token_len == 2 && strncmp(token_text, "fi", 2) == 0) {
+  } else if (shell_source_match_plain_word(input, length, position, "fi", 2,
+                                           NULL)) {
     if (state->if_depth > 0)
       state->if_depth--;
   }
 
-  if (token_len == 5) {
-    if (strncmp(token_text, "while", 5) == 0 ||
-        strncmp(token_text, "until", 5) == 0) {
-      state->loop_depth++;
-    }
-  } else if (token_len == 3 && strncmp(token_text, "for", 3) == 0) {
+  if (shell_source_match_plain_word(input, length, position, "while", 5,
+                                    NULL) ||
+      shell_source_match_plain_word(input, length, position, "until", 5,
+                                    NULL) ||
+      shell_source_match_plain_word(input, length, position, "for", 3, NULL) ||
+      shell_source_match_plain_word(input, length, position, "select", 6,
+                                    NULL)) {
     state->loop_depth++;
-  } else if (token_len == 4 && strncmp(token_text, "done", 4) == 0) {
+  } else if (shell_source_match_plain_word(input, length, position, "done", 4,
+                                           NULL)) {
     if (state->loop_depth > 0)
       state->loop_depth--;
   }
 
-  if (token_len == 4 && strncmp(token_text, "case", 4) == 0) {
+  if (shell_source_match_plain_word(input, length, position, "case", 4, NULL)) {
     state->case_depth++;
-  } else if (token_len == 4 && strncmp(token_text, "esac", 4) == 0) {
+  } else if (shell_source_match_plain_word(input, length, position, "esac", 4,
+                                           NULL)) {
     if (state->case_depth > 0)
       state->case_depth--;
   }
@@ -2157,8 +2155,6 @@ ordinary_word:
   shell_token_set_group_context(token, shell_tokenizer_group_depth(state),
                                 state->group_kinds);
 
-  check_keyword(state, token_text, token_length);
-
   return true;
 }
 
@@ -2244,6 +2240,7 @@ static bool shell_tokenizer_next_body(shell_tokenizer_state_t *state,
   state->lexical_operand_end = token->position + token->length;
   if (continues)
     return true;
+  check_keyword(state, token);
   if (state->lexical_command_position) {
     size_t after = 0;
     if (token->type == SHELL_TOKEN_PIPE_NEGATE) {

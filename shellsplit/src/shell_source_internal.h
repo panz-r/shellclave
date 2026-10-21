@@ -3730,10 +3730,10 @@ typedef struct {
    * parameter words remain data, even where pattern quoting changes. Math,
    * substring offsets and array subscripts establish code domains. */
   bool data_domain;
-  /* Ordinary word roots permit literal quote data. Parameter operands inherit
-   * that permission; math, substring arithmetic and subscripts clear it so
-   * quoting cannot hide their code from byte admission. */
-  bool quoted_data;
+  /* Ordinary word roots permit literal bytes regardless of quoting. Parameter
+   * operands inherit that permission; names, math, substring arithmetic,
+   * subscripts and active ANSI-C fragments retain restricted code bytes. */
+  bool word_data;
   /* Inherited double quoting ignores apostrophes for expansion, but the
    * parameter grammar still pairs them when finding its closing brace. */
   char delimiter_quote;
@@ -3876,11 +3876,9 @@ typedef struct {
 static inline SHELL_NONNULL(2) void shell_source_report_word_code(
     const char *input, shell_source_substitution_scan_t *scan, size_t end) {
   const shell_source_expansion_scope_t *scope = &scan->scope;
-  bool quoted = scope->quoted_data && !scope->selector_pending &&
-                !scope->ansi_end &&
-                (scope->in_single_quote || scope->in_double_quote ||
-                 scope->inherited_double_quote);
-  if (scan->code_visitor && !scope->data_domain && !quoted &&
+  bool literal =
+      scope->word_data && !scope->selector_pending && !scope->ansi_end;
+  if (scan->code_visitor && !scope->data_domain && !literal &&
       scan->code_start < end)
     scan->code_visitor(input, scan->code_start, end, scan->code_context);
   scan->code_start = end;
@@ -4014,7 +4012,7 @@ static inline SHELL_NONNULL(3, 4, 5, 6) shell_source_scan_status_t
         scope->substring_scope = true;
         scope->arithmetic_scope = true;
         scope->data_domain = false;
-        scope->quoted_data = false;
+        scope->word_data = false;
         scope->suppress_process = true;
         scan->has_arithmetic = true;
         scan->has_expansion_abort = true;
@@ -4060,10 +4058,13 @@ static inline SHELL_NONNULL(3, 4, 5, 6) shell_source_scan_status_t
     if (!scope->heredoc && !scope->in_single_quote && !scope->in_double_quote &&
         !scope->inherited_double_quote && c == '$' &&
         shell_source_logical_next_is(input, length, position, '\'', NULL)) {
+      shell_source_report_word_code(input, scan, position);
       size_t ansi_after = 0;
       if (!shell_source_skip_complete_ansi_c_quote(input, length, position,
-                                                   &ansi_after))
+                                                   &ansi_after)) {
+        scope->ansi_end = length;
         return SHELL_SOURCE_SCAN_INCOMPLETE;
+      }
       scan->has_ansi_c = true;
       size_t nul_after = position;
       bool has_nul = false;
@@ -4078,6 +4079,11 @@ static inline SHELL_NONNULL(3, 4, 5, 6) shell_source_scan_status_t
               position == scope->word_start && ansi_after < length &&
                   input[ansi_after] == '}'))
         return SHELL_SOURCE_SCAN_MALFORMED;
+      /* Active ANSI-C source keeps its existing byte domain. Flush it once
+       * while its scope is restricted, then resume the enclosing word. */
+      scope->ansi_end = ansi_after - 1;
+      shell_source_report_word_code(input, scan, ansi_after);
+      scope->ansi_end = 0;
       scan->position = ansi_after;
       continue;
     }
@@ -4086,8 +4092,11 @@ static inline SHELL_NONNULL(3, 4, 5, 6) shell_source_scan_status_t
         shell_source_logical_next_is(input, length, position, '\'', NULL)) {
       size_t ansi_after = 0;
       if (!shell_source_skip_complete_ansi_c_quote(input, length, position,
-                                                   &ansi_after))
+                                                   &ansi_after)) {
+        shell_source_report_word_code(input, scan, position);
+        scope->ansi_end = length;
         return SHELL_SOURCE_SCAN_INCOMPLETE;
+      }
       scan->has_ansi_c = true;
       size_t nul_after = position;
       bool has_nul = false;

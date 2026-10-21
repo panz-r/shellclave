@@ -4,7 +4,6 @@
 #include "../src/shell_tokenizer_full_internal.h"
 #include "depgraph_test_workspace.h"
 #include "malformed_source_cases.h"
-#include "quoted_byte_cases.h"
 #include "shell_abstract.h"
 #include "shell_depgraph.h"
 #include "shell_netstring.h"
@@ -13,6 +12,7 @@
 #include "shell_tokenizer.h"
 #include "shell_tokenizer_full.h"
 #include "shell_transform.h"
+#include "word_byte_cases.h"
 #include "word_expansion_cases.h"
 
 #include <stdio.h>
@@ -115,11 +115,11 @@ static void test_logical_comment_boundaries(void) {
 static void test_quoted_literal_bytes(void) {
   shell_limits_t strict = SHELL_LIMITS_DEFAULT;
   strict.strict_mode = true;
-  for (size_t i = 0; i < sizeof(shellsplit_test_quoted_bytes) /
-                             sizeof(shellsplit_test_quoted_bytes[0]);
+  for (size_t i = 0; i < sizeof(shellsplit_test_word_bytes) /
+                             sizeof(shellsplit_test_word_bytes[0]);
        ++i) {
-    const char *word = shellsplit_test_quoted_bytes[i].word;
-    const char *value = shellsplit_test_quoted_bytes[i].value;
+    const char *word = shellsplit_test_word_bytes[i].word;
+    const char *value = shellsplit_test_word_bytes[i].value;
     size_t value_length = strlen(value);
     char source[256], expected[256];
     int length = snprintf(source, sizeof(source), "printf %%s %s", word);
@@ -3748,7 +3748,7 @@ static void test_single_byte_validation_boundary(void) {
   }
 
   /* Prohibited bytes inside opaque syntax or past the range capacity still
-   * fail admission. Quoted literal/heredoc high bytes remain admitted data;
+   * fail admission. Word literal/heredoc high bytes remain admitted data;
    * the command capacity then determines the truncation outcome. */
   static const char *const tails[] = {
       "printf tail",
@@ -3756,9 +3756,11 @@ static void test_single_byte_validation_boundary(void) {
       "printf 'quoted'",
       "printf $(printf nested)",
       "cat <<'EOF'\nbody\nEOF\n",
+      "printf $((1))",
+      "printf $'ansi'",
   };
   static const unsigned char bytes[] = {0, 1, 31, 127, 128, 255};
-  static const size_t positions[] = {8, 4, 9, 17, 13};
+  static const size_t positions[] = {8, 4, 9, 17, 13, 10, 10};
   for (size_t i = 0; i < sizeof(tails) / sizeof(tails[0]); i++) {
     CHECK(shellsplit_test_source_with_tail(
         source, sizeof(source), SHELL_MAX_SUBCOMMANDS + 1, tails[i], &length));
@@ -3772,7 +3774,7 @@ static void test_single_byte_validation_boundary(void) {
         shell_parse_result_t parsed;
         memset(&parsed, 0xff, sizeof(parsed));
         reset_byte_validation_work();
-        bool literal_data = (i == 2 || i == 4) && bytes[b] >= 128;
+        bool literal_data = i < 5 && i != 1 && bytes[b] >= 128;
         CHECK(shell_parse_fast(source, length, &limits, &parsed) ==
               (literal_data ? SHELL_ETRUNC : SHELL_EPARSE));
         if (!literal_data)

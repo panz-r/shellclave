@@ -77,6 +77,7 @@ class DocumentationContract(unittest.TestCase):
             "ordinary: analysis available; application authorization required",
             "malformed heredoc: syntax error; reject before dispatch",
             "quoted text: analysis available; application authorization required",
+            "unquoted text: analysis available; application authorization required",
             "unsupported bytes: explicit exact-source approval required",
             "unsupported grammar: explicit exact-source approval required",
             "unsupported semantics: explicit exact-source approval required",

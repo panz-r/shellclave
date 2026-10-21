@@ -34,7 +34,8 @@ class SourceStatusContract(unittest.TestCase):
             (b': |&\ntime"" {', 0), (b"echo $(: |\ntime {)", 0),
             (b": |\ntime", 0),
             ("printf '%s' '日本'".encode(), 0),
-            ("printf '%s' 日本".encode(), 4),
+            ("printf '%s' 日本".encode(), 0),
+            ("printf '%s' $'日本'".encode(), 4),
             (b"if true; then :; fi", 4),
             (b"case x in x) :;; esac", 4),
             (b"f() { :; }", 4),
@@ -162,7 +163,8 @@ class SourceStatusContract(unittest.TestCase):
                 self.assertEqual(self.classify(prefix + b"cat <<'unfinished"), 1)
                 self.assertEqual(self.classify(prefix + b":"), 0)
                 # Unknown code remains unknown even after a known bad header.
-                self.assertEqual(self.classify(prefix + "cat <<\nprintf é".encode()), 4)
+                self.assertEqual(self.classify(prefix + "cat <<\nprintf é".encode()), 2)
+                self.assertEqual(self.classify(prefix + "cat <<\nprintf $'é'".encode()), 4)
                 self.assertEqual(self.classify(prefix + "cat <<\nprintf 'é'".encode()), 2)
 
     def test_redirect_operators_are_complete_lexical_units(self):
@@ -198,7 +200,7 @@ class SourceStatusContract(unittest.TestCase):
                 self.assertEqual(self.classify(source), 2)
 
     def test_mixed_unknown_is_not_a_validity_claim(self):
-        cases = ["printf '%s' 日本\ncat <<\n".encode(),
+        cases = ["printf '%s' $'日本'\ncat <<\n".encode(),
                  b"if true; then :; fi\ncat <<\n"]
         for source in cases:
             with self.subTest(source=source):
@@ -224,7 +226,7 @@ class SourceStatusContract(unittest.TestCase):
                 if reference.returncode == 0:
                     self.assertTrue(reference.stdout.endswith(b"\nLC_ALL=C\n"))
 
-    def test_quoted_bytes_match_reference_argv(self):
+    def test_literal_word_bytes_match_reference_argv(self):
         words = ["'日本'".encode(), '"日本"'.encode(),
                  "pre'日本'\".txt\"".encode(), b"'\x80\xff\xc0\xaf'",
                  b'"\x80\xff\xc0\xaf"', "'é'\"\\$\"'文'".encode(),
@@ -234,7 +236,15 @@ class SourceStatusContract(unittest.TestCase):
                  "pre'é\\'\".txt\"".encode(), '"é\\q"'.encode(),
                  '"é\\\\"'.encode(), '"é\\\"q"'.encode(), '"é\\`q"'.encode()]
         payload = bytes(range(128, 256))
-        words += [b"'" + payload + b"'", b'"' + payload + b'"']
+        words += [payload, b"'" + payload + b"'", b'"' + payload + b'"',
+                  "日本".encode(), "résumé.txt".encode(),
+                  "pre日'本'\".txt\"".encode(), "\\日本".encode(),
+                  "日\\\n本".encode(), "日本\\ word".encode(),
+                  "$日本".encode(), "日本=value".encode(),
+                  "if日本".encode(), "日本if".encode(),
+                  "日本.if".encode(), "日本''if".encode(),
+                  "日本-while".encode(), "日本/in".encode(),
+                  b"x.if", b"x''while", "日本$'ascii'case".encode()]
 
         def netstring(value):
             return str(len(value)).encode() + b":" + value + b","
@@ -278,6 +288,26 @@ class SourceStatusContract(unittest.TestCase):
             for tail in (b"", b"; printf '", b" &&"):
                 incomplete = b"printf '" + first + b"\\" + (b"'" if tail else b"") + tail
                 self.assertEqual(self.classify(incomplete), 1)
+
+    def test_unquoted_word_roles(self):
+        cases = [
+            ("name=日; printf '%s' $name日本", "日日本"),
+            ("printf '%s' $日本", "$日本"),
+            ("unset v; printf '%s' ${v:-日本}", "日本"),
+            ("v=日本語; printf '%s' ${v#日本}", "語"),
+            ("v=日本語; printf '%s' ${v/日本/文}", "文語"),
+            ("exec 3<<<payload; read 日本 IFS fd <&3; IFS= read -r value <&3; printf '%s' \"$value\"", "payload"),
+        ]
+        for locale in ("C", "C.UTF-8"):
+            environment = dict(os.environ, BASH_ENV="", ENV="", LC_ALL=locale)
+            for source, expected in cases:
+                with self.subTest(locale=locale, source=source):
+                    self.assertEqual(self.classify(source.encode()), 0)
+                    reference = subprocess.run(
+                        [self.bash, "--noprofile", "--norc", "-p", "-c",
+                         "readonly LC_ALL; " + source], env=environment,
+                        capture_output=True, check=True, timeout=10)
+                    self.assertEqual(reference.stdout, expected.encode())
 
     def test_invalid_high_byte_read_target_preserves_input(self):
         source = (b"readonly LC_ALL; exec 3<<<payload; read '\xe9' IFS fd <&3; "

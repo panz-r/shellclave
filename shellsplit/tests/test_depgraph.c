@@ -12196,7 +12196,7 @@ TEST(parse_error) {
            graph.cwd_buf.len == 0);
   }
   shell_dep_graph_t g = {0};
-  const char invalid[] = "\x80";
+  const char invalid[] = "echo $((\x80))";
   ASSERT(shell_dep_graph_parse(invalid, sizeof(invalid) - 1, ".", NULL, &g) ==
          SHELL_DEP_EPARSE);
   pass_count++;

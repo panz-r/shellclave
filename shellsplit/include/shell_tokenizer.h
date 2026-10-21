@@ -93,7 +93,14 @@ typedef enum {
 } shell_group_kind_t;
 
 /**
- * Subcommand features - what's inside the subcommand
+ * Subcommand features - what's inside the subcommand.
+ * Control flags recognize complete unquoted lexical words, including words
+ * inside executable substitutions. Quotes, escapes and adjacent fragments
+ * prevent a match; physical backslash-LF continuations are removed. Comments,
+ * redirect operands and literal expansion/document data do not contribute
+ * control words. These flags do not establish a complete control-flow grammar
+ * or semantic support; standalone keyword spellings remain lexical markers
+ * even in ordinary argument positions.
  */
 typedef enum {
   SHELL_FEAT_NONE = 0,

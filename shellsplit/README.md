@@ -93,9 +93,10 @@ application retains control of execution policy.
 | INVALID_INPUT | Embedded NUL prevents unchanged submission to the executor; reject the input representation |
 | TRUNCATED | A resource or representation limit stopped analysis; retry within a resource budget or report the limit |
 
-UNSUPPORTED makes no claim that Bash accepts the source. Unquoted non-ASCII
-bytes and unsupported control constructs use that outcome. Ordinary single
-and double quotes preserve literal high bytes, including invalid UTF-8, without
+UNSUPPORTED makes no claim that Bash accepts the source. Unsupported control
+constructs and high bytes in restricted code contexts use that outcome.
+Ordinary words preserve literal high bytes in unquoted, escaped, and quoted
+fragments, including invalid UTF-8, without
 normalization; source offsets and canonical lengths count bytes. Syntax and
 builtin operand classification use fixed ASCII sets, independent of the
 application's locale. Backslashes inside ordinary single quotes are literal,

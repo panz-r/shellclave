@@ -1,3 +1,4 @@
+#include "../shellsplit/tests/word_byte_cases.h"
 #include "shell_abstract.h"
 #include "shell_ascii.h"
 #include "shell_depgraph.h"
@@ -50,6 +51,63 @@ static void byte_predicates(void) {
     CHECK(shell_ascii_equal_ci(left, right, sizeof(left)));
     right[2] = (char)(folded ^ 0x80u);
     CHECK(!shell_ascii_equal_ci(left, right, sizeof(left)));
+  }
+}
+
+static void word_literals(void) {
+  for (size_t i = 0; i < sizeof(shellsplit_test_word_bytes) /
+                             sizeof(shellsplit_test_word_bytes[0]);
+       ++i) {
+    const char *word = shellsplit_test_word_bytes[i].word;
+    const char *value = shellsplit_test_word_bytes[i].value;
+    char source[256], expected[256];
+    int length = snprintf(source, sizeof(source), "printf %%s %s", word);
+    int encoded = snprintf(expected, sizeof(expected), "6:printf,2:%%s,%zu:%s,",
+                           strlen(value), value);
+    CHECK(length > 0 && (size_t)length < sizeof(source) && encoded > 0 &&
+          (size_t)encoded < sizeof(expected));
+    CHECK(shell_parse_draft(source, (size_t)length, NULL, &draft) ==
+          SHELL_SOURCE_COMPLETE);
+    CHECK(draft.prefix.count == 1 &&
+          !(draft.prefix.cmds[0].features &
+            (SHELL_FEAT_CONDITIONALS | SHELL_FEAT_LOOPS | SHELL_FEAT_CASE)));
+    shell_netstring_buffer_t sequence = {0};
+    size_t count;
+    bool features;
+    CHECK(shell_build_netargv_sequence_buffer(source, (size_t)length, NULL,
+                                              &sequence, &count,
+                                              &features) == SHELL_PROCESS_OK);
+    shell_netstring_iter_t records;
+    shell_netstring_view_t record;
+    CHECK(count == 1 &&
+          shell_netstring_iter_init(&records, sequence.data, sequence.length) ==
+              SHELL_NETSTRING_OK);
+    CHECK(shell_netstring_iter_next(&records, &record) == SHELL_NETSTRING_OK &&
+          record.payload_length == (size_t)encoded &&
+          !memcmp(record.payload, expected, (size_t)encoded));
+    CHECK(shell_netstring_iter_next(&records, &record) == SHELL_NETSTRING_DONE);
+    printf("word[%zu]=%s\n", i, expected);
+    shell_netstring_buffer_free(&sequence);
+  }
+  static const char *const names[] = {"if日本",   "日本if",     "while日本",
+                                      "日本case", "time日本",   "exec日本",
+                                      "cd日本",   "日本=value", "\x80\xff"};
+  for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
+    char source[64];
+    int length = snprintf(source, sizeof(source), "%s argument", names[i]);
+    CHECK(length > 0 && (size_t)length < sizeof(source));
+    CHECK(shell_dep_graph_parse(source, (size_t)length, "/workspace", &limits,
+                                &graph) == SHELL_DEP_OK);
+    unsigned commands = 0;
+    for (uint32_t n = 0; n < graph.node_count; ++n)
+      if (graph.nodes[n].type == SHELL_NODE_CMD) {
+        CHECK(
+            graph.nodes[n].cmd.token_count == 2 &&
+            graph.nodes[n].cmd.token_lens[0] == strlen(names[i]) &&
+            !memcmp(graph.nodes[n].cmd.tokens[0], names[i], strlen(names[i])));
+        ++commands;
+      }
+    CHECK(commands == 1 && shell_dep_graph_validate(&graph).valid);
   }
 }
 
@@ -174,6 +232,10 @@ static void invalid_read_targets(void) {
       "read -n'\xe9' value <<<payload && printf wrong >unexpected || printf "
       "fallback",
       "exec {fd}>/dev/null; read '\xe9' IFS fd <<<payload; printf data >&$fd",
+      "read \xe9 fd <<<payload && printf wrong >unexpected || printf fallback",
+      "read -n\xe9 value <<<payload && printf wrong >unexpected || printf "
+      "fallback",
+      "exec {fd}>/dev/null; read \xe9 IFS fd <<<payload; printf data >&$fd",
   };
   for (size_t c = 0; c < sizeof(sources) / sizeof(sources[0]); ++c) {
     const char *source = sources[c];
@@ -213,8 +275,8 @@ static void invalid_read_targets(void) {
       fallback |= edge->type == SHELL_EDGE_WRITE && edge->from == printing &&
                   edge->source_fd == 1;
     }
-    CHECK(c != 2 || preserved);
-    CHECK(c == 2 || (unexpected != UINT32_MAX && fallback));
+    CHECK(c % 3 != 2 || preserved);
+    CHECK(c % 3 == 2 || (unexpected != UINT32_MAX && fallback));
     shell_dep_graph_dump(&graph, stdout);
   }
 }
@@ -231,7 +293,7 @@ static void classification_and_policy(void) {
   st_policy_t *allow = st_policy_new(context), *deny = st_policy_new(context);
   st_policy_ctx_release(context);
   CHECK(allow && deny);
-  const char *rules[] = {"printf \xe9", "id #user"};
+  const char *rules[] = {"printf \xe9", "id #user", "echo *"};
   for (size_t i = 0; i < sizeof(rules) / sizeof(rules[0]); ++i) {
     st_netpattern_t rule = {0};
     CHECK(st_netpattern_from_cpl_owned(rules[i], &rule) == ST_OK);
@@ -246,9 +308,17 @@ static void classification_and_policy(void) {
     sg_verdict_t verdict;
   } cases[] = {
       {"printf '\xe9'", SG_VERDICT_ALLOW},
+      {"printf \xe9", SG_VERDICT_ALLOW},
       {"printf '\xe8'", SG_VERDICT_UNDETERMINED},
       {"id root", SG_VERDICT_ALLOW},
       {"id '\xe9name'", SG_VERDICT_UNDETERMINED},
+      {"id \xe9name", SG_VERDICT_UNDETERMINED},
+      {"echo 日本if", SG_VERDICT_ALLOW},
+      {"echo 日本''if", SG_VERDICT_ALLOW},
+      {"echo 日本.if", SG_VERDICT_ALLOW},
+      {"echo '日本.if'", SG_VERDICT_ALLOW},
+      {"echo 日本-while", SG_VERDICT_ALLOW},
+      {"echo 日本.in", SG_VERDICT_ALLOW},
   };
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
     size_t size = sg_gate_evaluate_size_hint(strlen(cases[i].source));
@@ -277,6 +347,7 @@ int main(int argc, char **argv) {
   CHECK(shell_dep_workspace_size(&limits, &limits.workspace_size));
   limits.workspace = malloc(limits.workspace_size);
   CHECK(limits.workspace);
+  word_literals();
   quoted_lists();
   invalid_read_targets();
   classification_and_policy();

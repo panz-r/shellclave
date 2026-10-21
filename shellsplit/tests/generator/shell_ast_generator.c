@@ -669,7 +669,8 @@ static void gen_valid_shell(shell_ast_generator_t *gen, shell_ast_t *ast) {
   }
 }
 
-static void gen_invalid_shell(shell_ast_generator_t *gen, shell_ast_t *ast) {
+static void gen_adversarial_shell(shell_ast_generator_t *gen,
+                                  shell_ast_t *ast) {
   typedef void (*invalid_generator_t)(shell_ast_generator_t *, shell_ast_t *);
   static const invalid_generator_t generators[] = {
       gen_unclosed_heredoc,        gen_mismatched_quotes,
@@ -724,11 +725,11 @@ shell_ast_t *shell_ast_generator_generate(shell_ast_generator_t *gen) {
   if (!ast)
     return NULL;
 
-  // Increase invalid generation rate to test more edge cases
-  bool generate_invalid = (random_range(gen, 100) < 30);
+  // Include malformed syntax and unusual valid byte words in the stress cases.
+  bool generate_adversarial = (random_range(gen, 100) < 30);
 
-  if (generate_invalid) {
-    gen_invalid_shell(gen, ast);
+  if (generate_adversarial) {
+    gen_adversarial_shell(gen, ast);
   } else {
     gen_valid_shell(gen, ast);
   }

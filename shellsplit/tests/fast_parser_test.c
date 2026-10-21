@@ -171,6 +171,206 @@ static void test_array_assignment_prefix_features(void) {
   test("Assignment-prefix classification has linear source work", valid);
 }
 
+static void test_control_word_boundaries(void) {
+  static const char *const keywords[] = {
+      "while", "until", "for", "select", "if", "then",
+      "elif",  "else",  "fi",  "case",   "in", "esac",
+  };
+  static const char *const forms[] = {
+      "x.%s", "日本.%s",  "日本''%s", "%s.txt",   "'%s'", "\\%s",
+      "%s''", "%s$EMPTY", "name=%s",  "${v:-%s}", ">%s",  "<<<%s",
+  };
+  const uint32_t controls =
+      SHELL_FEAT_LOOPS | SHELL_FEAT_CONDITIONALS | SHELL_FEAT_CASE;
+  bool valid = true;
+  for (size_t k = 0; k < sizeof(keywords) / sizeof(keywords[0]); ++k) {
+    for (size_t f = 0; f < sizeof(forms) / sizeof(forms[0]); ++f) {
+      char word[128], source[192];
+      int word_length = snprintf(word, sizeof(word), forms[f], keywords[k]);
+      int length =
+          snprintf(source, sizeof(source), "printf %%s %s; echo tail", word);
+      bool fits = word_length > 0 && (size_t)word_length < sizeof(word) &&
+                  length > 0 && (size_t)length < sizeof(source);
+      for (unsigned mode = 0; fits && mode < 3; ++mode) {
+        shell_limits_t limits = SHELL_LIMITS_DEFAULT;
+        limits.strict_mode = mode != 0;
+        if (mode == 2)
+          limits.max_subcommands = 1;
+        shell_parse_result_t parsed;
+        shell_error_t error =
+            shell_parse_fast(source, (size_t)length, &limits, &parsed);
+        bool item =
+            error == (mode == 2 ? SHELL_ETRUNC : SHELL_OK) && parsed.count >= 1;
+        for (uint32_t i = 0; i < parsed.count; ++i)
+          item &= (parsed.cmds[i].features & controls) == 0;
+        if (!item)
+          fprintf(stderr, "control word boundary: mode=%u source=%s\n", mode,
+                  source);
+        valid &= item;
+      }
+      valid &= fits;
+      shell_command_t *commands = NULL;
+      size_t count = 0;
+      bool full =
+          fits && shell_tokenize_commands(source, (size_t)length, &commands,
+                                          &count) == SHELL_TOKENIZE_OK;
+      for (size_t i = 0; i < count; ++i)
+        full &= !commands[i].has_loops && !commands[i].has_conditionals &&
+                !commands[i].has_case;
+      if (!full)
+        fprintf(stderr, "tokenizer control word boundary: source=%s\n", source);
+      shell_commands_free(commands, count);
+      valid &= full;
+    }
+  }
+  test("Control spellings use complete words in all range modes", valid);
+
+  static const struct {
+    const char *source;
+    uint32_t expected;
+  } contexts[] = {
+      {"if true; then :; fi", SHELL_FEAT_CONDITIONALS},
+      {"while false; do :; done", SHELL_FEAT_LOOPS},
+      {"case x in x) :;; esac", SHELL_FEAT_CASE},
+      {"printf %s if", SHELL_FEAT_CONDITIONALS},
+      {"printf %s whi\\\nle", SHELL_FEAT_LOOPS},
+      {"echo \"$(if true; then :; fi)\"", SHELL_FEAT_CONDITIONALS},
+      {"echo ${v:-$(while false; do :; done)}", SHELL_FEAT_LOOPS},
+      {"cat <(if true; then :; fi)", SHELL_FEAT_CONDITIONALS},
+      {"echo `if true; then :; fi`", SHELL_FEAT_CONDITIONALS},
+      {"cat <<EOF\n$(if true; then :; fi)\nEOF\n", SHELL_FEAT_CONDITIONALS},
+      {"cat <<<$(if true; then :; fi)", SHELL_FEAT_CONDITIONALS},
+      {"echo ok # if while case\n", 0},
+      {"echo \"$(printf ok # if while case\n)\"", 0},
+      {"cat <<'EOF'\nif while case\nEOF\n", 0},
+      {"cat <<EOF\nif while case\nEOF\n", 0},
+      {"cat <<if\nwhile case\nif\n", 0},
+      {"echo ${v:-if} ${v/case/while} $if", 0},
+      {"printf %s while<()", 0},
+      {"printf %s <()while", 0},
+      {"echo ok >while", 0},
+      {"echo while<()", 0},
+      {"echo <()while", 0},
+  };
+  valid = true;
+  for (size_t c = 0; c < sizeof(contexts) / sizeof(contexts[0]); ++c) {
+    shell_parse_result_t parsed;
+    shell_limits_t limits = SHELL_LIMITS_DEFAULT;
+    limits.strict_mode = true;
+    bool item = shell_parse_fast(contexts[c].source, strlen(contexts[c].source),
+                                 &limits, &parsed) == SHELL_OK;
+    uint32_t features = 0;
+    for (uint32_t i = 0; i < parsed.count; ++i)
+      features |= parsed.cmds[i].features;
+    item &= (features & controls) == contexts[c].expected;
+    if (!item)
+      fprintf(stderr, "control context: source=%s features=%x expected=%x\n",
+              contexts[c].source, features & controls, contexts[c].expected);
+    if (!contexts[c].expected) {
+      shell_command_t *commands = NULL;
+      size_t count = 0;
+      item &= shell_tokenize_commands(contexts[c].source,
+                                      strlen(contexts[c].source), &commands,
+                                      &count) == SHELL_TOKENIZE_OK;
+      for (size_t i = 0; i < count; ++i)
+        item &= !commands[i].has_loops && !commands[i].has_conditionals &&
+                !commands[i].has_case;
+      shell_commands_free(commands, count);
+    }
+    valid &= item;
+  }
+  test("Control features distinguish executable children from word data",
+       valid);
+
+  valid = true;
+  for (unsigned family = 0; family < 3; ++family) {
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+    size_t previous = 0;
+#endif
+    for (size_t units = 64; units <= 2048; units *= 2) {
+      char source[16384] = "printf %s ";
+      size_t length = strlen(source);
+      if (family == 2)
+        source[length++] = 'i';
+      const char *fragment = family == 0   ? "x''"
+                             : family == 1 ? "x.if "
+                                           : "\\\n";
+      size_t size = strlen(fragment);
+      for (size_t i = 0; i < units; ++i) {
+        memcpy(source + length, fragment, size);
+        length += size;
+      }
+      const char *tail = family == 2 ? "f" : family == 0 ? "if" : "tail";
+      size_t tail_length = strlen(tail);
+      memcpy(source + length, tail, tail_length + 1);
+      length += tail_length;
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+      shellsplit_test_source_scan_reset();
+#endif
+      shell_parse_result_t parsed;
+      shell_limits_t limits = SHELL_LIMITS_DEFAULT;
+      limits.strict_mode = true;
+      bool item =
+          shell_parse_fast(source, length, &limits, &parsed) == SHELL_OK &&
+          parsed.count == 1 &&
+          (parsed.cmds[0].features & controls) ==
+              (family == 2 ? SHELL_FEAT_CONDITIONALS : 0);
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+      size_t work = shellsplit_test_source_scan_work();
+      item &= work <= 128 * length + 1024 &&
+              (!previous || work <= 2 * previous + 2048);
+      previous = work;
+#endif
+      if (!item)
+        fprintf(stderr, "control feature scaling: family=%u units=%zu\n",
+                family, units);
+      valid &= item;
+    }
+  }
+  test("Control-word classification has linear source work", valid);
+
+  valid = true;
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+  size_t previous = 0;
+#endif
+  for (size_t depth = 2; depth <= 16; depth *= 2) {
+    char source[1024];
+    size_t length = 0;
+    static const char opener[] = "echo ${v:-$(";
+    for (size_t i = 0; i < depth; ++i) {
+      memcpy(source + length, opener, sizeof(opener) - 1);
+      length += sizeof(opener) - 1;
+    }
+    static const char body[] = "echo 日本''if";
+    memcpy(source + length, body, sizeof(body) - 1);
+    length += sizeof(body) - 1;
+    for (size_t i = 0; i < depth; ++i) {
+      memcpy(source + length, ")}", 2);
+      length += 2;
+    }
+    source[length] = '\0';
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+    shellsplit_test_source_scan_reset();
+#endif
+    shell_parse_result_t parsed;
+    shell_limits_t limits = SHELL_LIMITS_DEFAULT;
+    limits.strict_mode = true;
+    bool item =
+        shell_parse_fast(source, length, &limits, &parsed) == SHELL_OK &&
+        parsed.count == 1 && !(parsed.cmds[0].features & controls);
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+    size_t work = shellsplit_test_source_scan_work();
+    item &= work <= 256 * length + 1024 &&
+            (!previous || work <= 3 * previous + 1024);
+    previous = work;
+#endif
+    if (!item)
+      fprintf(stderr, "nested control feature scaling: depth=%zu\n", depth);
+    valid &= item;
+  }
+  test("Nested control-feature walks visit each executable body once", valid);
+}
+
 typedef struct {
   const char *name;
   const char *input;
@@ -984,14 +1184,14 @@ void test_dialect_oracle(void) {
   shell_parse_result_t result = {0};
   shell_error_t error =
       shell_parse_fast(non_ascii, sizeof(non_ascii) - 1, NULL, &result);
-  test("fast parser rejects non-ASCII shell text",
-       error == SHELL_EPARSE && result.count == 0);
+  test("fast parser preserves non-ASCII word text",
+       error == SHELL_OK && result.count == 1);
   shell_command_t *commands = NULL;
   size_t command_count = 0;
-  test("full tokenizer rejects non-ASCII shell text",
-       !(shell_tokenize_commands(non_ascii, strlen(non_ascii), &commands,
-                                 &command_count) == SHELL_TOKENIZE_OK) &&
-           commands == NULL && command_count == 0);
+  test("full tokenizer preserves non-ASCII word text",
+       shell_tokenize_commands(non_ascii, strlen(non_ascii), &commands,
+                               &command_count) == SHELL_TOKENIZE_OK &&
+           commands != NULL && command_count == 1);
   shell_commands_free(commands, command_count);
 }
 
@@ -2234,12 +2434,11 @@ static void test_fast_parser_limitations(void) {
        SHELL_STATUS_ERROR, 0},
       {"reject multiple control characters", "\x07\x1btext",
        sizeof("\x07\x1btext") - 1, SHELL_STATUS_ERROR, 0},
-      {"reject high bytes", high_bytes, sizeof(high_bytes), SHELL_STATUS_ERROR,
-       0},
+      {"retain high bytes", high_bytes, sizeof(high_bytes), SHELL_STATUS_OK, 1},
       {"reject embedded control character", "cmd\x01suffix",
        sizeof("cmd\x01suffix") - 1, SHELL_STATUS_ERROR, 0},
-      {"reject embedded high byte", embedded_high_byte,
-       sizeof(embedded_high_byte), SHELL_STATUS_ERROR, 0},
+      {"retain embedded high byte", embedded_high_byte,
+       sizeof(embedded_high_byte), SHELL_STATUS_OK, 1},
       {"permissive parse retains unfinished quoted byte", quoted_high_byte,
        sizeof(quoted_high_byte), SHELL_STATUS_OK, 1},
       {"reject high byte in arithmetic", arithmetic_high_byte,
@@ -4080,6 +4279,7 @@ int main(void) {
   test_layer1_whitespace_trimming();
   test_layer1_heredoc();
   test_feature_matrix();
+  test_control_word_boundaries();
   test_array_assignment_prefix_features();
   test_layer1_utility_functions();
   test_layer1_error_handling();

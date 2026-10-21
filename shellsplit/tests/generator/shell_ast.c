@@ -650,7 +650,7 @@ ast_node_t *shell_ast_add_glob(shell_ast_t *ast, const char *pattern) {
   return node;
 }
 
-/* --- INVALID PATTERN GENERATORS --- */
+/* --- ADVERSARIAL PATTERN GENERATORS --- */
 
 void shell_ast_add_binary(shell_ast_t *ast) {
   if (!ast)
@@ -659,12 +659,12 @@ void shell_ast_add_binary(shell_ast_t *ast) {
   ast_node_t *node = ast_node_create(AST_COMMAND);
   if (node) {
     node->value = strdup("\xFF\xFE");
-    node->is_valid = false;
+    node->is_valid = true;
 
     ast->root = node;
     ast->node_count++;
     ast->has_binary = true;
-    ast->has_valid_structure = false;
+    ast->has_valid_structure = true;
   }
 }
 
@@ -690,11 +690,11 @@ void shell_ast_add_high_bytes(shell_ast_t *ast) {
   ast_node_t *node = ast_node_create(AST_COMMAND);
   if (node) {
     node->value = strdup("\x80\xFF");
-    node->is_valid = false;
+    node->is_valid = true;
     ast->root = node;
     ast->node_count++;
     ast->has_high_bytes = true;
-    ast->has_valid_structure = false;
+    ast->has_valid_structure = true;
   }
 }
 

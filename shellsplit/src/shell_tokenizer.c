@@ -394,8 +394,20 @@ static SHELL_NONNULL(1) uint32_t
              : marker;
 }
 
-static void detect_features(const char *cmd, uint32_t start, uint32_t len,
-                            uint32_t *features, bool allow_initial_time);
+typedef enum {
+  FAST_FEATURE_WORD,
+  FAST_FEATURE_COMMAND_BODY,
+} fast_feature_context_t;
+
+static SHELL_NONNULL(1, 4) void detect_features(const char *cmd, uint32_t start,
+                                                uint32_t len,
+                                                uint32_t *features,
+                                                bool allow_initial_time,
+                                                fast_feature_context_t context);
+static SHELL_NONNULL(1, 4) void detect_control_features(const char *cmd,
+                                                        uint32_t start,
+                                                        uint32_t len,
+                                                        uint32_t *features);
 
 /* A recognized command-substitution body begins after its opener. Check only
  * that prefix, not quoted source elsewhere in the containing command. */
@@ -435,7 +447,8 @@ static SHELL_NONNULL(1, 5) void detect_expansion_features(
     }
     if (end > body_start + 1)
       detect_features(input, (uint32_t)body_start,
-                      (uint32_t)(end - body_start - 1), features, true);
+                      (uint32_t)(end - body_start - 1), features, true,
+                      FAST_FEATURE_COMMAND_BODY);
   }
   if (scan.has_variables || scan.has_arithmetic_variables)
     *features |= SHELL_FEAT_VARS;
@@ -463,11 +476,14 @@ static SHELL_NONNULL(1, 4) void detect_arithmetic_features(const char *cmd,
   detect_expansion_features(cmd + start, end - start, false, true, features,
                             false);
 }
-/**
- * Detect features in a subcommand range
- */
-static void detect_features(const char *cmd, uint32_t start, uint32_t len,
-                            uint32_t *features, bool allow_initial_time) {
+/* Gather features in one immutable source range. Only command-body contexts
+ * collect lexical control words; operand contexts still discover executable
+ * children and give each child its own command-body context. */
+static SHELL_NONNULL(1,
+                     4) void detect_features(const char *cmd, uint32_t start,
+                                             uint32_t len, uint32_t *features,
+                                             bool allow_initial_time,
+                                             fast_feature_context_t context) {
   static _Thread_local unsigned nesting;
   if (nesting >= SHELL_MAX_SUBCOMMANDS)
     return;
@@ -624,7 +640,8 @@ static void detect_features(const char *cmd, uint32_t start, uint32_t len,
           /* Revisit the parameter as its own unquoted syntactic scope. This
            * preserves array-subscript detection as well as nested features,
            * without letting its quotes alter the enclosing quote state. */
-          detect_features(p, i, (uint32_t)(after - i), features, true);
+          detect_features(p, i, (uint32_t)(after - i), features, true,
+                          FAST_FEATURE_WORD);
           i = (uint32_t)after;
           continue;
         } else {
@@ -635,8 +652,8 @@ static void detect_features(const char *cmd, uint32_t start, uint32_t len,
         }
         if (after > content_start + 1)
           detect_features(p, (uint32_t)content_start,
-                          (uint32_t)(after - content_start - 1), features,
-                          true);
+                          (uint32_t)(after - content_start - 1), features, true,
+                          FAST_FEATURE_COMMAND_BODY);
         i = (uint32_t)after;
         continue;
       }
@@ -656,11 +673,11 @@ static void detect_features(const char *cmd, uint32_t start, uint32_t len,
         if (subscript_after > subscript_start + 1)
           detect_features(p, (uint32_t)subscript_start + 1,
                           (uint32_t)(subscript_after - subscript_start - 2),
-                          features, true);
+                          features, true, FAST_FEATURE_WORD);
         if (value_after > value_start)
           detect_features(p, (uint32_t)value_start,
-                          (uint32_t)(value_after - value_start), features,
-                          true);
+                          (uint32_t)(value_after - value_start), features, true,
+                          FAST_FEATURE_WORD);
         i = (uint32_t)after;
         continue;
       }
@@ -711,7 +728,8 @@ static void detect_features(const char *cmd, uint32_t start, uint32_t len,
                                                  &after)) {
         if (after > process_open + 1)
           detect_features(p, (uint32_t)process_open + 1,
-                          (uint32_t)(after - process_open - 2), features, true);
+                          (uint32_t)(after - process_open - 2), features, true,
+                          FAST_FEATURE_COMMAND_BODY);
         i = (uint32_t)after;
         continue;
       }
@@ -743,7 +761,7 @@ static void detect_features(const char *cmd, uint32_t start, uint32_t len,
               if (after > next_position + 1)
                 detect_features(p, (uint32_t)next_position + 1,
                                 (uint32_t)(after - next_position - 2), features,
-                                true);
+                                true, FAST_FEATURE_COMMAND_BODY);
               i = (uint32_t)after;
               continue;
             }
@@ -758,7 +776,7 @@ static void detect_features(const char *cmd, uint32_t start, uint32_t len,
               if (after > subscript_start + 1)
                 detect_features(p, (uint32_t)subscript_start + 1,
                                 (uint32_t)(after - subscript_start - 2),
-                                features, true);
+                                features, true, FAST_FEATURE_WORD);
               i = (uint32_t)after;
               continue;
             }
@@ -774,6 +792,16 @@ static void detect_features(const char *cmd, uint32_t start, uint32_t len,
       break;
     case '`':
       *features |= SHELL_FEAT_SUBSHELL;
+      {
+        size_t after = 0;
+        if (shell_source_skip_complete_backtick(p, len, i, &after)) {
+          if (after > i + 2)
+            detect_features(p, i + 1, (uint32_t)(after - i - 2), features, true,
+                            FAST_FEATURE_COMMAND_BODY);
+          i = (uint32_t)after;
+          continue;
+        }
+      }
       break;
     case '&':
       if (!in_double_quotes && !(i + 1 < len && p[i + 1] == '&') &&
@@ -799,111 +827,109 @@ static void detect_features(const char *cmd, uint32_t start, uint32_t len,
 
     i++;
   }
+  if (context == FAST_FEATURE_COMMAND_BODY)
+    detect_control_features(cmd, start, len, features);
   shell_source_scope_end(previous);
   nesting--;
 }
 
-/* Match an unquoted reserved spelling after lexical line-continuation removal.
- * Ordinary backslash escapes and quotes deliberately fail: `wh\\ile` is a
- * command word, while `whi\\\nle` is the reserved `while` word. */
-static bool detect_logical_unquoted_word_is(const char *text, size_t start,
-                                            size_t end, const char *word) {
-  if (!text || !word || start > end)
-    return false;
-  size_t matched = 0;
-  size_t word_length = strlen(word);
-  for (size_t position = start; position < end;) {
-    size_t continued =
-        shell_source_skip_escaped_line_endings(text, end, position);
-    if (continued != position) {
-      position = continued;
-      continue;
-    }
-    char c = text[position++];
-    if (c == '\\' || c == '\'' || c == '"' || c == '`' ||
-        matched == word_length || c != word[matched])
-      return false;
-    matched++;
-  }
-  return matched == word_length;
-}
-
-/* Detect control-flow features in one subcommand.
- * This is intentionally lexical: the fast parser reports feature presence,
- * while the full parser remains responsible for detailed shell structure. */
-static void detect_control_features(const char *cmd, uint32_t start,
-                                    uint32_t len, uint32_t *features) {
-  const char *p = cmd + start;
-  uint32_t word_start = UINT32_MAX;
-  bool in_single = false;
-  bool in_double = false;
-
-  for (uint32_t i = 0; i <= len; i++) {
-    char c = i < len ? p[i] : ' ';
-    if (in_single) {
-      if (c == '\'')
-        in_single = false;
-      continue;
-    }
-    if (in_double) {
-      if (c == '"')
-        in_double = false;
-      else if (c == '\\' && i + 1 < len)
-        i++;
-      continue;
-    }
-    if (c == '\'') {
-      in_single = true;
-      if (word_start != UINT32_MAX) {
-        word_start = UINT32_MAX;
-      }
-      continue;
-    }
-    if (c == '"') {
-      in_double = true;
-      if (word_start != UINT32_MAX)
-        word_start = UINT32_MAX;
-      continue;
-    }
-    if (c == '\\' && i + 1 < len) {
-      if (word_start == UINT32_MAX)
-        word_start = i;
-      size_t continued = shell_source_skip_escaped_line_endings(p, len, i);
-      i = (uint32_t)(continued != i ? continued - 1 : i + 1);
-      continue;
-    }
-
-    if (shell_ascii_alnum((unsigned char)c) || c == '_') {
-      if (word_start == UINT32_MAX)
-        word_start = i;
-      continue;
-    }
-
-    if (word_start != UINT32_MAX) {
-      if (detect_logical_unquoted_word_is(p, word_start, i, "while") ||
-          detect_logical_unquoted_word_is(p, word_start, i, "until") ||
-          detect_logical_unquoted_word_is(p, word_start, i, "for") ||
-          detect_logical_unquoted_word_is(p, word_start, i, "select"))
-        *features |= SHELL_FEAT_LOOPS;
-      if (detect_logical_unquoted_word_is(p, word_start, i, "if") ||
-          detect_logical_unquoted_word_is(p, word_start, i, "then") ||
-          detect_logical_unquoted_word_is(p, word_start, i, "elif") ||
-          detect_logical_unquoted_word_is(p, word_start, i, "else") ||
-          detect_logical_unquoted_word_is(p, word_start, i, "fi"))
-        *features |= SHELL_FEAT_CONDITIONALS;
-      if (detect_logical_unquoted_word_is(p, word_start, i, "case") ||
-          detect_logical_unquoted_word_is(p, word_start, i, "in") ||
-          detect_logical_unquoted_word_is(p, word_start, i, "esac"))
-        *features |= SHELL_FEAT_CASE;
-      word_start = UINT32_MAX;
+/* Classify one complete logical word from the prechecked lexical stream.
+ * Every keyword probe is bounded by a fixed spelling plus its physical line
+ * continuations. Quotes, expansions and punctuation remain in this span, so
+ * no fragment or suffix can become an independent keyword. */
+static SHELL_NONNULL(1, 4) void detect_control_word(const char *input,
+                                                    size_t start, size_t end,
+                                                    uint32_t *features) {
+  static const struct {
+    const char *word;
+    size_t length;
+    uint32_t feature;
+  } keywords[] = {
+      {"while", 5, SHELL_FEAT_LOOPS},
+      {"until", 5, SHELL_FEAT_LOOPS},
+      {"for", 3, SHELL_FEAT_LOOPS},
+      {"select", 6, SHELL_FEAT_LOOPS},
+      {"if", 2, SHELL_FEAT_CONDITIONALS},
+      {"then", 4, SHELL_FEAT_CONDITIONALS},
+      {"elif", 4, SHELL_FEAT_CONDITIONALS},
+      {"else", 4, SHELL_FEAT_CONDITIONALS},
+      {"fi", 2, SHELL_FEAT_CONDITIONALS},
+      {"case", 4, SHELL_FEAT_CASE},
+      {"in", 2, SHELL_FEAT_CASE},
+      {"esac", 4, SHELL_FEAT_CASE},
+  };
+  for (size_t k = 0; k < sizeof(keywords) / sizeof(keywords[0]); ++k) {
+    SHELL_SOURCE_WORD_SCAN(1);
+    if (shell_source_match_plain_word(input, end, start, keywords[k].word,
+                                      keywords[k].length, NULL)) {
+      *features |= keywords[k].feature;
+      break;
     }
   }
 }
 
-static void detect_all_features(const char *cmd, uint32_t start, uint32_t len,
-                                uint32_t *features, bool allow_initial_time) {
-  detect_features(cmd, start, len, features, allow_initial_time);
-  detect_control_features(cmd, start, len, features);
+/* Each command body's lexer supplies words, operators, comments and deferred
+ * document boundaries once. Redirect operands are data. Executable children
+ * receive their own command-body feature walk through expansion discovery;
+ * this pass never scans an enclosing word's substitution body again. Flags
+ * remain lexical word recognition, not a complete control-flow grammar. */
+static SHELL_NONNULL(1, 4) void detect_control_features(const char *cmd,
+                                                        uint32_t start,
+                                                        uint32_t len,
+                                                        uint32_t *features) {
+  const char *input = cmd + start;
+  shell_tokenizer_state_t state;
+  shell_tokenizer_init_prechecked(&state, input, len);
+  size_t word_start = SIZE_MAX, word_end = 0;
+  bool redirect_operand = false, word_data = false;
+  shell_token_t token;
+  while (shell_tokenizer_next(&state, &token)) {
+    if (shell_source_is_escaped_line_ending(input, token.position,
+                                            token.position + token.length))
+      continue;
+    bool redirect = full_token_is_redirection(&token);
+    bool boundary = redirect;
+    switch (token.type) {
+    case SHELL_TOKEN_PIPE:
+    case SHELL_TOKEN_PIPE_BOTH:
+    case SHELL_TOKEN_SEMICOLON:
+    case SHELL_TOKEN_AND:
+    case SHELL_TOKEN_OR:
+    case SHELL_TOKEN_BACKGROUND:
+    case SHELL_TOKEN_SUBSHELL_START:
+    case SHELL_TOKEN_SUBSHELL_END:
+    case SHELL_TOKEN_GROUP_START:
+    case SHELL_TOKEN_GROUP_END:
+    case SHELL_TOKEN_CASE_TERMINATE:
+    case SHELL_TOKEN_CASE_FALLTHROUGH:
+    case SHELL_TOKEN_CASE_TEST_NEXT:
+      boundary = true;
+      break;
+    default:
+      break;
+    }
+    bool continues = !boundary && word_start != SIZE_MAX &&
+                     shell_tokenizer_token_continues_word(&token, word_end);
+    if (word_start != SIZE_MAX && !continues) {
+      if (!word_data)
+        detect_control_word(input, word_start, word_end, features);
+      word_start = SIZE_MAX;
+    }
+    if (boundary) {
+      redirect_operand =
+          redirect && token.type != SHELL_TOKEN_HEREDOC &&
+          shell_source_redirection_consumes_word(token.start, token.length);
+      continue;
+    }
+    if (word_start == SIZE_MAX) {
+      word_start = token.position;
+      word_data = redirect_operand;
+      redirect_operand = false;
+    }
+    word_end = token.position + token.length;
+  }
+  if (word_start != SIZE_MAX && !word_data)
+    detect_control_word(input, word_start, word_end, features);
 }
 
 /* Deferred bodies and declaration operators have the same source order.
@@ -1266,9 +1292,8 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
       result->cmds[subcmd_idx].features = 0;                                   \
       result->cmds[subcmd_idx].group_depth = group_depth;                      \
       result->cmds[subcmd_idx].group_kinds = group_kinds;                      \
-      detect_all_features(cmd, _s, _e - _s,                                    \
-                          &result->cmds[subcmd_idx].features,                  \
-                          execution_pipeline_start);                           \
+      detect_features(cmd, _s, _e - _s, &result->cmds[subcmd_idx].features,    \
+                      execution_pipeline_start, FAST_FEATURE_COMMAND_BODY);    \
       subcmd_idx++;                                                            \
     } else if (_s < _e && subcmd_idx >= max_cmds) {                            \
       result->status = SHELL_STATUS_TRUNCATED;                                 \
@@ -2036,8 +2061,8 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
           result->cmds[subcmd_idx].features = 0;
           result->cmds[subcmd_idx].group_depth = group_depth;
           result->cmds[subcmd_idx].group_kinds = group_kinds;
-          detect_all_features(cmd, s, e - s, &result->cmds[subcmd_idx].features,
-                              execution_pipeline_start);
+          detect_features(cmd, s, e - s, &result->cmds[subcmd_idx].features,
+                          execution_pipeline_start, FAST_FEATURE_COMMAND_BODY);
           subcmd_idx++;
           /* The incoming pipe belongs to the command stage, not to each
            * subsequently emitted redirect fragment. */
@@ -2164,8 +2189,8 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
           result->cmds[subcmd_idx].features = 0;
           result->cmds[subcmd_idx].group_depth = group_depth;
           result->cmds[subcmd_idx].group_kinds = group_kinds;
-          detect_all_features(cmd, s, e - s, &result->cmds[subcmd_idx].features,
-                              execution_pipeline_start);
+          detect_features(cmd, s, e - s, &result->cmds[subcmd_idx].features,
+                          execution_pipeline_start, FAST_FEATURE_COMMAND_BODY);
           subcmd_idx++;
           current_pipe_input_mode = SHELL_PIPE_MODE_NONE;
         }
@@ -2320,9 +2345,9 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
             result->cmds[subcmd_idx].features = 0;
             result->cmds[subcmd_idx].group_depth = group_depth;
             result->cmds[subcmd_idx].group_kinds = group_kinds;
-            detect_all_features(cmd, s, e - s,
-                                &result->cmds[subcmd_idx].features,
-                                execution_pipeline_start);
+            detect_features(cmd, s, e - s, &result->cmds[subcmd_idx].features,
+                            execution_pipeline_start,
+                            FAST_FEATURE_COMMAND_BODY);
             subcmd_idx++;
           }
         }
@@ -2358,9 +2383,9 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
             result->cmds[subcmd_idx].features = 0;
             result->cmds[subcmd_idx].group_depth = group_depth;
             result->cmds[subcmd_idx].group_kinds = group_kinds;
-            detect_all_features(cmd, s, e - s,
-                                &result->cmds[subcmd_idx].features,
-                                execution_pipeline_start);
+            detect_features(cmd, s, e - s, &result->cmds[subcmd_idx].features,
+                            execution_pipeline_start,
+                            FAST_FEATURE_COMMAND_BODY);
             subcmd_idx++;
           }
         }
@@ -2396,9 +2421,9 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
             result->cmds[subcmd_idx].features = 0;
             result->cmds[subcmd_idx].group_depth = group_depth;
             result->cmds[subcmd_idx].group_kinds = group_kinds;
-            detect_all_features(cmd, s, e - s,
-                                &result->cmds[subcmd_idx].features,
-                                execution_pipeline_start);
+            detect_features(cmd, s, e - s, &result->cmds[subcmd_idx].features,
+                            execution_pipeline_start,
+                            FAST_FEATURE_COMMAND_BODY);
             subcmd_idx++;
           }
         }
@@ -2455,9 +2480,9 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
             result->cmds[subcmd_idx].features = 0;
             result->cmds[subcmd_idx].group_depth = group_depth;
             result->cmds[subcmd_idx].group_kinds = group_kinds;
-            detect_all_features(cmd, s, e - s,
-                                &result->cmds[subcmd_idx].features,
-                                execution_pipeline_start);
+            detect_features(cmd, s, e - s, &result->cmds[subcmd_idx].features,
+                            execution_pipeline_start,
+                            FAST_FEATURE_COMMAND_BODY);
             subcmd_idx++;
           }
         }
@@ -2624,9 +2649,9 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
       result->cmds[subcmd_idx].features = 0;
       result->cmds[subcmd_idx].group_depth = group_depth;
       result->cmds[subcmd_idx].group_kinds = group_kinds;
-      detect_all_features(cmd, start_pos, end_pos - start_pos,
-                          &result->cmds[subcmd_idx].features,
-                          execution_pipeline_start);
+      detect_features(cmd, start_pos, end_pos - start_pos,
+                      &result->cmds[subcmd_idx].features,
+                      execution_pipeline_start, FAST_FEATURE_COMMAND_BODY);
       subcmd_idx++;
     }
   }

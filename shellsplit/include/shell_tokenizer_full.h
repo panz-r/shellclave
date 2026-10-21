@@ -104,13 +104,15 @@ typedef struct {
    * represented by metadata rather than attached to an inner command. */
   size_t start_pos;
   size_t end_pos;
-  size_t group_depth;    // Enclosing command-group nesting depth
-  uint8_t group_kinds;   // shell_group_kind_t bitset of enclosing groups
-  bool has_variables;    // Contains variables ($VAR, ${VAR}, etc.)
-  bool has_globs;        // Contains glob patterns (*, ?, [abc])
-  bool has_subshells;    // Contains subshells ($(cmd), `cmd`)
-  bool has_arithmetic;   // Contains arithmetic expansion ($((expr))
-  bool has_loops;        // Contains loops (while, for, until)
+  size_t group_depth;  // Enclosing command-group nesting depth
+  uint8_t group_kinds; // shell_group_kind_t bitset of enclosing groups
+  bool has_variables;  // Contains variables ($VAR, ${VAR}, etc.)
+  bool has_globs;      // Contains glob patterns (*, ?, [abc])
+  bool has_subshells;  // Contains subshells ($(cmd), `cmd`)
+  bool has_arithmetic; // Contains arithmetic expansion ($((expr))
+  /* Lexical control metadata uses complete unquoted words outside redirect
+   * operands. It does not establish supported control-flow semantics. */
+  bool has_loops;        // Contains loop spellings (while, for, until, select)
   bool has_conditionals; // Contains conditionals (if/then/elif/else/fi)
   bool has_case;         // Contains case statements
   bool has_groups;       // Contains command groups

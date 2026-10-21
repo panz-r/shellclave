@@ -1,12 +1,12 @@
 #include "../src/shell_depgraph_internal.h"
 #include "../src/shell_source_internal.h"
-#include "quoted_byte_cases.h"
 #include "shell_abstract.h"
 #include "shell_sequence.h"
 #include "shell_source.h"
 #include "shell_tokenizer_full.h"
 #include "shell_transform.h"
 #include "source_compare.h"
+#include "word_byte_cases.h"
 #ifdef SHELLSPLIT_TEST_SOURCE_SCANS
 #include "test_source_scans.h"
 #endif
@@ -115,8 +115,8 @@ static void byte_domains(void) {
       "echo before; cat <<EOF\n${value:日本",
       "echo before; cat <<EOF\n$(( $(printf 1) + 日本",
       "echo before; cat <<EOF\n${value:$(printf 1) + 日本",
-      "echo before; cat <<EOF\n`echo 日本",
-      "echo before; cat <<EOF\n$(echo 日本",
+      "echo before; cat <<EOF\n`echo $((日本",
+      "echo before; cat <<EOF\n$(echo $((日本",
       "echo before; cat <<EOF\n${value[日本]}\nEOF\n",
   };
   for (size_t c = 0; c < sizeof(invalid) / sizeof(invalid[0]); c++) {
@@ -276,7 +276,7 @@ static void tentative_delimiters(void) {
     const char *source;
     shell_source_status_t status;
   } bad_code[] = {
-      {"echo before; cat <<`日本`\n`日x\n", SHELL_SOURCE_UNSUPPORTED},
+      {"echo before; cat <<`日本`\n`$((日x\n", SHELL_SOURCE_UNSUPPORTED},
       {"echo before; cat <<`|`tail\n`|`z\n", SHELL_SOURCE_INVALID},
   };
   for (size_t c = 0; c < sizeof(bad_code) / sizeof(bad_code[0]); c++) {
@@ -330,17 +330,18 @@ static void recovery(void) {
   static const struct {
     const char *source;
     shell_source_status_t status;
-  } invalid[] = {{"cat >#comment", SHELL_SOURCE_INVALID},
-                 {"{ cat; } >#comment", SHELL_SOURCE_INVALID},
-                 {"cat && ;", SHELL_SOURCE_INVALID},
-                 {"cat >\nfile", SHELL_SOURCE_INVALID},
-                 {"cat )", SHELL_SOURCE_INVALID},
-                 {"cat | | echo", SHELL_SOURCE_INVALID},
-                 {"echo 日本", SHELL_SOURCE_UNSUPPORTED},
-                 {"cat <<EOF\n$(echo 日本)\nEOF\n", SHELL_SOURCE_UNSUPPORTED},
-                 {"({ echo; ) &&", SHELL_SOURCE_INVALID},
-                 {"echo $(echo &&) &&", SHELL_SOURCE_INVALID},
-                 {"echo ${bad!} &&", SHELL_SOURCE_UNSUPPORTED}};
+  } invalid[] = {
+      {"cat >#comment", SHELL_SOURCE_INVALID},
+      {"{ cat; } >#comment", SHELL_SOURCE_INVALID},
+      {"cat && ;", SHELL_SOURCE_INVALID},
+      {"cat >\nfile", SHELL_SOURCE_INVALID},
+      {"cat )", SHELL_SOURCE_INVALID},
+      {"cat | | echo", SHELL_SOURCE_INVALID},
+      {"echo $'日本'", SHELL_SOURCE_UNSUPPORTED},
+      {"cat <<EOF\n$(echo $'日本')\nEOF\n", SHELL_SOURCE_UNSUPPORTED},
+      {"({ echo; ) &&", SHELL_SOURCE_INVALID},
+      {"echo $(echo &&) &&", SHELL_SOURCE_INVALID},
+      {"echo ${bad!} &&", SHELL_SOURCE_UNSUPPORTED}};
   for (size_t n = 0; n < sizeof(invalid) / sizeof(invalid[0]); n++) {
     shell_source_status_t status = shell_parse_draft(
         invalid[n].source, strlen(invalid[n].source), NULL, &draft);
@@ -1086,12 +1087,12 @@ static void record_code(const char *source, size_t start, size_t end,
   regions->end = end;
 }
 
-static void quoted_byte_source(void) {
-  for (size_t i = 0; i < sizeof(shellsplit_test_quoted_bytes) /
-                             sizeof(shellsplit_test_quoted_bytes[0]);
+static void word_byte_source(void) {
+  for (size_t i = 0; i < sizeof(shellsplit_test_word_bytes) /
+                             sizeof(shellsplit_test_word_bytes[0]);
        ++i) {
     char source[256];
-    const char *word = shellsplit_test_quoted_bytes[i].word;
+    const char *word = shellsplit_test_word_bytes[i].word;
     int n = snprintf(source, sizeof(source), "printf %%s %s", word);
     CHECK(n > 0 && (size_t)n < sizeof(source));
     CHECK(shell_parse_draft(source, (size_t)n, NULL, &draft) ==
@@ -1113,17 +1114,35 @@ static void quoted_byte_source(void) {
       {"printf ${v:-'日本'}", SHELL_SOURCE_COMPLETE},
       {"printf \"日本$(printf '語')\"", SHELL_SOURCE_COMPLETE},
       {"printf \"日本`printf '語'`\"", SHELL_SOURCE_COMPLETE},
-      {"printf \"日本`printf 語`\"", SHELL_SOURCE_UNSUPPORTED},
+      {"printf \"日本`printf 語`\"", SHELL_SOURCE_COMPLETE},
       {"printf '日本' < <(printf '語')", SHELL_SOURCE_COMPLETE},
-      {"printf '日本' < <(printf 語)", SHELL_SOURCE_UNSUPPORTED},
-      {"printf '日'語", SHELL_SOURCE_UNSUPPORTED},
-      {"printf 日本", SHELL_SOURCE_UNSUPPORTED},
-      {"printf \"日本$(printf 語)\"", SHELL_SOURCE_UNSUPPORTED},
+      {"printf '日本' < <(printf 語)", SHELL_SOURCE_COMPLETE},
+      {"printf '日'語", SHELL_SOURCE_COMPLETE},
+      {"printf 日本", SHELL_SOURCE_COMPLETE},
+      {"printf \"日本$(printf 語)\"", SHELL_SOURCE_COMPLETE},
       {"printf \"$(( '語' ))\"", SHELL_SOURCE_UNSUPPORTED},
       {"printf \"${v:'語'}\"", SHELL_SOURCE_UNSUPPORTED},
       {"printf \"${v['語']}\"", SHELL_SOURCE_UNSUPPORTED},
-      {"printf ${v:-日本}", SHELL_SOURCE_UNSUPPORTED},
+      {"printf ${v:-日本}", SHELL_SOURCE_COMPLETE},
+      {"printf ${v#日本}", SHELL_SOURCE_COMPLETE},
+      {"printf ${v/日本/語}", SHELL_SOURCE_COMPLETE},
+      {"printf ${日本}", SHELL_SOURCE_UNSUPPORTED},
+      {"printf $v日本", SHELL_SOURCE_COMPLETE},
+      {"v=日本; printf %s \"$v\"", SHELL_SOURCE_COMPLETE},
+      {"a[1]=日本", SHELL_SOURCE_COMPLETE},
+      {"日本=value", SHELL_SOURCE_COMPLETE},
+      {"if日本 value", SHELL_SOURCE_COMPLETE},
+      {"日本if value", SHELL_SOURCE_COMPLETE},
+      {"printf 日本 # 日本", SHELL_SOURCE_UNSUPPORTED},
+      {"printf 日本\ncat <<\n", SHELL_SOURCE_INVALID},
+      {"printf 日本 &&", SHELL_SOURCE_INCOMPLETE},
       {"printf $'日本'", SHELL_SOURCE_UNSUPPORTED},
+      {"printf 日本$'ascii", SHELL_SOURCE_INCOMPLETE},
+      /* A standalone unfinished quote is classified by lexical framing;
+       * INCOMPLETE does not promise supported semantics after completion. */
+      {"printf 日本$'é", SHELL_SOURCE_INCOMPLETE},
+      {"printf \"${v:-日本$'ascii", SHELL_SOURCE_INCOMPLETE},
+      {"printf \"${v:-日本$'é", SHELL_SOURCE_UNSUPPORTED},
       {"printf \"${v:-$'日本'}\"", SHELL_SOURCE_UNSUPPORTED},
       {"printf \"${v:-$'x'}日本\"", SHELL_SOURCE_COMPLETE},
       {"printf '\001'", SHELL_SOURCE_UNSUPPORTED},
@@ -1139,7 +1158,7 @@ static void quoted_byte_source(void) {
       fprintf(stderr, "quoted byte status %d: %s\n", status, cases[c].source);
     CHECK(status == cases[c].status);
   }
-  static const char received[] = "printf '日本'\nprintf \"語\"";
+  static const char received[] = "printf 日本\nprintf 語";
   for (size_t end = 0; end < sizeof(received); ++end) {
     shell_source_status_t status =
         shell_parse_draft(received, end, NULL, &draft);
@@ -1162,132 +1181,159 @@ static void quoted_byte_source(void) {
 
 static void quoted_byte_work(void) {
 #ifdef SHELLSPLIT_TEST_SOURCE_SCANS
-  for (unsigned operation = 0; operation < 4; ++operation) {
-    size_t previous = 0, previous_length = 0;
-    for (size_t count = 32; count <= 1024; count *= 2) {
-      char source[8192] = "printf ";
-      size_t length = 7;
-      for (size_t i = 0; i < count; ++i) {
-        memcpy(source + length, "'\x80\\'", 4);
-        length += 4;
+  for (unsigned form = 0; form < 2; ++form) {
+    for (unsigned operation = 0; operation < 4; ++operation) {
+      size_t previous = 0, previous_length = 0;
+      for (size_t count = 32; count <= 1024; count *= 2) {
+        char source[8192] = "printf ";
+        size_t length = 7;
+        for (size_t i = 0; i < count; ++i) {
+          const char *fragment = form ? "\x80\\\n" : "'\x80\\'";
+          size_t size = strlen(fragment);
+          memcpy(source + length, fragment, size);
+          length += size;
+        }
+        shellsplit_test_source_scan_reset();
+        if (operation == 0) {
+          shell_parse_result_t fast;
+          CHECK(shell_parse_fast(source, length, NULL, &fast) == SHELL_OK);
+        } else if (operation == 1) {
+          CHECK(shell_parse_draft(source, length, NULL, &draft) ==
+                SHELL_SOURCE_COMPLETE);
+        } else if (operation == 2) {
+          shell_processed_commands_t processed = {0};
+          CHECK(shell_process_commands(source, length, NULL, &processed) ==
+                SHELL_PROCESS_OK);
+          CHECK(processed.command_count == 1);
+          shell_processed_commands_free(&processed);
+        } else {
+          shell_transformed_command_t **transformed = NULL;
+          size_t count = 0;
+          CHECK(shell_transform_command_line(source, length, NULL, &transformed,
+                                             &count) == SHELL_TRANSFORM_OK);
+          CHECK(count == 1);
+          shell_transformed_command_list_free(transformed, count);
+        }
+        size_t work = shellsplit_test_source_scan_work();
+        CHECK(work <= 128 * length + 1024);
+        CHECK(!previous ||
+              work <= previous + 128 * (length - previous_length) + 1024);
+        previous = work;
+        previous_length = length;
       }
-      shellsplit_test_source_scan_reset();
-      if (operation == 0) {
-        shell_parse_result_t fast;
-        CHECK(shell_parse_fast(source, length, NULL, &fast) == SHELL_OK);
-      } else if (operation == 1) {
-        CHECK(shell_parse_draft(source, length, NULL, &draft) ==
-              SHELL_SOURCE_COMPLETE);
-      } else if (operation == 2) {
-        shell_processed_commands_t processed = {0};
-        CHECK(shell_process_commands(source, length, NULL, &processed) ==
-              SHELL_PROCESS_OK);
-        CHECK(processed.command_count == 1);
-        shell_processed_commands_free(&processed);
-      } else {
-        shell_transformed_command_t **transformed = NULL;
-        size_t count = 0;
-        CHECK(shell_transform_command_line(source, length, NULL, &transformed,
-                                           &count) == SHELL_TRANSFORM_OK);
-        CHECK(count == 1);
-        shell_transformed_command_list_free(transformed, count);
-      }
-      size_t work = shellsplit_test_source_scan_work();
-      CHECK(work <= 128 * length + 1024);
-      CHECK(!previous ||
-            work <= previous + 128 * (length - previous_length) + 1024);
-      previous = work;
-      previous_length = length;
     }
   }
 #endif
 }
 
+typedef struct {
+  const char *argument, *path;
+  unsigned calls;
+} word_byte_resolution_t;
+
 static SHELL_NONNULL(1, 2, 3, 4) shell_expand_status_t
     quoted_byte_resolution(const shell_expand_word_request_t *request,
                            const char **records, size_t *length,
                            void *context) {
-  unsigned *calls = context;
+  word_byte_resolution_t *input = context;
   CHECK(request->cwd_known && request->cwd_absolute &&
         !strcmp(request->cwd, "/workspace"));
-  static const char argument[] = "\"日本$VALUE\"";
-  static const char path[] = "\"ré$OUT\"";
-  const char *expected =
-      request->purpose == SHELL_EXPAND_WORD_ARGUMENT ? argument : path;
+  const char *expected = request->purpose == SHELL_EXPAND_WORD_ARGUMENT
+                             ? input->argument
+                             : input->path;
   CHECK(request->word_length == strlen(expected) &&
         !memcmp(request->source + request->word_offset, expected,
                 request->word_length));
   *records = request->purpose == SHELL_EXPAND_WORD_ARGUMENT ? "9:日本語,"
                                                             : "12:résumé.txt,";
   *length = strlen(*records);
-  ++*calls;
+  ++input->calls;
   return SHELL_EXPAND_RESOLVED;
 }
 
 static void quoted_byte_paths(void) {
-  static const char source[] =
-      "cd './données' && printf %s '日本' >'résumé.txt'";
-  CHECK(shell_parse_draft(source, sizeof(source) - 1, NULL, &draft) ==
-        SHELL_SOURCE_COMPLETE);
-  for (unsigned supplied = 0; supplied < 2; ++supplied) {
-    shell_dep_error_t error =
-        supplied ? shell_dep_graph_parse_with_fast(source, sizeof(source) - 1,
-                                                   "/workspace", &limits,
-                                                   &draft.prefix, &graph)
-                 : shell_dep_graph_parse(source, sizeof(source) - 1,
-                                         "/workspace", &limits, &graph);
-    CHECK(error == SHELL_DEP_OK && shell_dep_graph_validate(&graph).valid);
+  static const struct {
+    const char *source, *path;
+  } cases[] = {
+      {"cd './données' && printf %s '日本' >'résumé.txt'", "'résumé.txt'"},
+      {"cd ./données && printf %s 日本 >résumé.txt", "résumé.txt"},
+  };
+  for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); ++c) {
+    const char *source = cases[c].source;
+    size_t length = strlen(source);
+    CHECK(shell_parse_draft(source, length, NULL, &draft) ==
+          SHELL_SOURCE_COMPLETE);
+    for (unsigned supplied = 0; supplied < 2; ++supplied) {
+      shell_dep_error_t error =
+          supplied
+              ? shell_dep_graph_parse_with_fast(source, length, "/workspace",
+                                                &limits, &draft.prefix, &graph)
+              : shell_dep_graph_parse(source, length, "/workspace", &limits,
+                                      &graph);
+      CHECK(error == SHELL_DEP_OK && shell_dep_graph_validate(&graph).valid);
+      unsigned matches = 0;
+      for (uint32_t n = 0; n < graph.node_count; ++n) {
+        const shell_dep_node_t *node = &graph.nodes[n];
+        if (node->type != SHELL_NODE_DOC || node->doc.kind != SHELL_DOC_FILE ||
+            node->doc.path != strstr(source, cases[c].path))
+          continue;
+        char identity[128];
+        size_t written;
+        bool absolute;
+        CHECK(node->doc.cwd_known &&
+              shell_dep_doc_file_identity_write(&graph, &node->doc, identity,
+                                                sizeof(identity), &written,
+                                                &absolute));
+        static const char expected[] = "/workspace/données/résumé.txt";
+        CHECK(absolute && written == sizeof(expected) - 1 &&
+              !memcmp(identity, expected, written));
+        ++matches;
+      }
+      CHECK(matches == 1);
+    }
+  }
+  static const char *const sources[] = {
+      "printf %s \"日本$VALUE\" >\"ré$OUT\"",
+      "printf %s 日本$VALUE >ré$OUT",
+  };
+  for (unsigned form = 0; form < 2; ++form) {
+    const char *dynamic = sources[form];
+    size_t length = strlen(dynamic);
+    shell_dep_limits_t resolved = limits;
+    CHECK(shell_dep_resolved_workspace_size(length, &limits,
+                                            &resolved.workspace_size));
+    resolved.workspace = malloc(resolved.workspace_size);
+    CHECK(resolved.workspace);
+    word_byte_resolution_t input = {form ? "日本$VALUE" : "\"日本$VALUE\"",
+                                    form ? "ré$OUT" : "\"ré$OUT\"", 0};
+    uint8_t unresolved[SHELL_DEP_MAX_NODES] = {0};
+    shell_dep_error_t error = shell_dep_graph_parse_resolved(
+        dynamic, length, "/workspace", &resolved, &graph,
+        quoted_byte_resolution, &input, unresolved);
+    if (error != SHELL_DEP_OK)
+      fprintf(stderr, "word callback graph: error=%d calls=%u\n", error,
+              input.calls);
+    CHECK(error == SHELL_DEP_OK);
+    CHECK(input.calls == 2 && !unresolved[0] &&
+          shell_dep_graph_validate(&graph).valid);
     unsigned matches = 0;
     for (uint32_t n = 0; n < graph.node_count; ++n) {
       const shell_dep_node_t *node = &graph.nodes[n];
-      if (node->type != SHELL_NODE_DOC || node->doc.kind != SHELL_DOC_FILE ||
-          node->doc.path != strstr(source, "'résumé.txt'"))
+      if (node->type != SHELL_NODE_DOC || node->doc.kind != SHELL_DOC_FILE)
         continue;
       char identity[128];
       size_t written;
       bool absolute;
-      CHECK(node->doc.cwd_known && shell_dep_doc_file_identity_write(
-                                       &graph, &node->doc, identity,
-                                       sizeof(identity), &written, &absolute));
-      static const char expected[] = "/workspace/données/résumé.txt";
+      CHECK(shell_dep_doc_file_identity_write(
+          &graph, &node->doc, identity, sizeof(identity), &written, &absolute));
+      static const char expected[] = "/workspace/résumé.txt";
       CHECK(absolute && written == sizeof(expected) - 1 &&
             !memcmp(identity, expected, written));
       ++matches;
     }
     CHECK(matches == 1);
+    free(resolved.workspace);
   }
-  static const char dynamic[] = "printf %s \"日本$VALUE\" >\"ré$OUT\"";
-  shell_dep_limits_t resolved = limits;
-  CHECK(shell_dep_resolved_workspace_size(sizeof(dynamic) - 1, &limits,
-                                          &resolved.workspace_size));
-  resolved.workspace = malloc(resolved.workspace_size);
-  CHECK(resolved.workspace);
-  unsigned calls = 0;
-  uint8_t unresolved[SHELL_DEP_MAX_NODES] = {0};
-  shell_dep_error_t error = shell_dep_graph_parse_resolved(
-      dynamic, sizeof(dynamic) - 1, "/workspace", &resolved, &graph,
-      quoted_byte_resolution, &calls, unresolved);
-  if (error != SHELL_DEP_OK)
-    fprintf(stderr, "quoted callback graph: error=%d calls=%u\n", error, calls);
-  CHECK(error == SHELL_DEP_OK);
-  CHECK(calls == 2 && !unresolved[0] && shell_dep_graph_validate(&graph).valid);
-  unsigned matches = 0;
-  for (uint32_t n = 0; n < graph.node_count; ++n) {
-    const shell_dep_node_t *node = &graph.nodes[n];
-    if (node->type != SHELL_NODE_DOC || node->doc.kind != SHELL_DOC_FILE)
-      continue;
-    char identity[128];
-    size_t written;
-    bool absolute;
-    CHECK(shell_dep_doc_file_identity_write(
-        &graph, &node->doc, identity, sizeof(identity), &written, &absolute));
-    static const char expected[] = "/workspace/résumé.txt";
-    CHECK(absolute && written == sizeof(expected) - 1 &&
-          !memcmp(identity, expected, written));
-    ++matches;
-  }
-  CHECK(matches == 1);
-  free(resolved.workspace);
 }
 
 static void code_region_stream(void) {
@@ -1320,9 +1366,9 @@ static void code_region_stream(void) {
     if ((unsigned char)word[i] >= 0x80)
       CHECK(!regions.visited[i]);
   static const char quoted[] =
-      "'日本'\"語\"${x:-'文'}$((1))${x:2}$(printf '別')";
+      "日'本'語${x:-文}$((1))${x:2}$(printf 別)$'ascii'";
   regions = (code_regions_t){0};
-  scan = (shell_source_substitution_scan_t){.scope = {.quoted_data = true},
+  scan = (shell_source_substitution_scan_t){.scope = {.word_data = true},
                                             .code_visitor = record_code,
                                             .code_context = &regions};
   while ((status = shell_source_next_word_expansion(
@@ -1331,7 +1377,8 @@ static void code_region_stream(void) {
   }
   CHECK(status == SHELL_SOURCE_SCAN_DONE);
   CHECK(regions.visited[strchr(quoted, '1') - quoted] &&
-        regions.visited[strchr(quoted, '2') - quoted]);
+        regions.visited[strchr(quoted, '2') - quoted] &&
+        regions.visited[strstr(quoted, "ascii") - quoted]);
   CHECK(!regions.visited[strstr(quoted, "printf") - quoted]);
   for (size_t i = 0; i < sizeof(quoted) - 1; ++i)
     if ((unsigned char)quoted[i] >= 0x80)
@@ -3707,12 +3754,13 @@ overlapping_source(const shell_expand_word_request_t *request,
 }
 
 static void callback_domains(void) {
-  static const char source[] = "cat <<'EOF'\necho 日本\nEOF\necho \"$word\"";
+  static const char source[] =
+      "cat <<'EOF'\necho $((日本))\nEOF\necho \"$word\"";
   overlapping_source_t input = {.source = source,
                                 .length = sizeof(source) - 1,
                                 .data = 12,
-                                .data_length = sizeof("echo 日本") - 1};
-  input.data = (size_t)(strstr(source, "echo 日本") - source);
+                                .data_length = sizeof("echo $((日本))") - 1};
+  input.data = (size_t)(strstr(source, "echo $((日本))") - source);
   input.prefix = (size_t)(strstr(source, "\nEOF") - source) + 1;
   CHECK(shell_parse_draft(source, input.prefix, NULL, &draft) ==
         SHELL_SOURCE_INCOMPLETE);
@@ -3732,7 +3780,7 @@ static void callback_domains(void) {
                                        &input, NULL) == SHELL_DEP_OK);
   CHECK(input.calls == 2 && shell_dep_graph_validate(&graph).valid);
   /* The supplied-fast path imports the parent's byte proof, but callbacks
-   * must still reject high-byte heredoc data reinterpreted as shell code. */
+   * still reject high-byte heredoc data reinterpreted as arithmetic code. */
   shell_limits_t strict = SHELL_LIMITS_DEFAULT;
   strict.strict_mode = true;
   shell_parse_result_t fast;
@@ -4022,7 +4070,7 @@ int main(void) {
   CHECK(limits.workspace);
   heredocs();
   byte_domains();
-  quoted_byte_source();
+  word_byte_source();
   quoted_byte_work();
   quoted_byte_paths();
   selector_recovery();

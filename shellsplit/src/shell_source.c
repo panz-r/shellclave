@@ -27,15 +27,15 @@ static SHELL_NONNULL(1, 4) void code_bytes(const char *source, size_t start,
 /* Executable substitutions establish independent source contexts, even inside
  * quotes or an expandable document. Indexed assignment prefixes keep their
  * subscript code domain; their separately tokenized values use ordinary word
- * quoting. */
+ * data. */
 static SHELL_NONNULL(1) shell_source_status_t
     word_byte_islands(const char *word, size_t length, size_t depth,
-                      bool heredoc, bool quoted_data) {
+                      bool heredoc, bool word_data) {
   shell_source_substitution_scan_t scan = {
       .scope = {.heredoc = heredoc,
                 .suppress_process = heredoc,
                 .data_domain = heredoc,
-                .quoted_data = quoted_data},
+                .word_data = word_data},
       .code_visitor = code_bytes};
   bool valid = true;
   scan.code_context = &valid;
