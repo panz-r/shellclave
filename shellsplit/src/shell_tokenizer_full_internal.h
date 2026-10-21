@@ -127,7 +127,7 @@ bool shell_tokenizer_inspect_semantics(
 
 /* Whole-source validation boundary: reject embedded NUL and prohibited
  * control/DEL bytes, then qualify high bytes by their source domain. Ordinary
- * word and heredoc data admit them; code and skipped comments stay restricted.
+ * word, comment and heredoc data admit them; code domains stay restricted.
  * A successful root check
  * is reused by contained immutable spans for the current source operation;
  * unrelated spans still receive their own byte check. NULL is rejected.

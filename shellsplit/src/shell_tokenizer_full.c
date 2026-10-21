@@ -447,7 +447,9 @@ static SHELL_NONNULL(1) bool unsupported_semantics_scan_impl(
 /* Source-byte admission is not word separation: CR, VT and FF are readable
  * text, but only space/tab/LF separate Bash words. Reject other control bytes,
  * DEL before exposing a partial stream. High bytes belong to ordinary word
- * literals and scoped heredoc data, with byte offsets and no decoding. */
+ * literals, comments and scoped heredoc data, with byte offsets and no
+ * decoding.
+ */
 shell_source_status_t shell_source_bytes_status(const char *input,
                                                 size_t length) {
   if (source_operation.bytes_prechecked &&

@@ -172,6 +172,8 @@ no UTF-8 validation or normalization. Analysis and token classification use
 fixed byte rules, independent of the application's locale. The executor uses a
 fixed C/POSIX or UTF-8 locale, established through the
 [startup contract](SECURITY.md#executor-startup).
+Comments admit the same literal bytes: `cat résumé.txt # 説明` analyzes the
+command while retaining its original source offsets.
 
 The [shell model reference](docs/shell-model.md) describes supported behavior,
 startup requirements, substitutions, builtins, I/O, working-directory facts,

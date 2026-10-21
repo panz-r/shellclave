@@ -187,6 +187,8 @@ typedef struct {
  * borrowed exclusively through iteration, not owned by the state. Exhaustion
  * while advancing stops iteration and sets heredoc_error; callers can restart
  * with a larger buffer. Storage must not alias input, state, or token output.
+ * Comments admit literal high bytes and end at raw LF or EOF. They are skipped
+ * during iteration; NUL and prohibited control/DEL bytes remain rejected.
  */
 bool shell_tokenizer_init(shell_tokenizer_state_t *state, const char *input,
                           size_t input_length, const shell_limits_t *limits)

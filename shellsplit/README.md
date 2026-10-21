@@ -96,10 +96,13 @@ application retains control of execution policy.
 UNSUPPORTED makes no claim that Bash accepts the source. Unsupported control
 constructs and high bytes in restricted code contexts use that outcome.
 Ordinary words preserve literal high bytes in unquoted, escaped, and quoted
-fragments, including invalid UTF-8, without
-normalization; source offsets and canonical lengths count bytes. Syntax and
-builtin operand classification use fixed ASCII sets, independent of the
-application's locale. Backslashes inside ordinary single quotes are literal,
+fragments, including invalid UTF-8, without normalization; source offsets and
+canonical lengths count bytes. Comments admit the same literal bytes and end
+at raw LF or EOF. They contribute no
+semantic tokens or effects; whole-source NUL and prohibited-control/DEL checks
+still apply. Syntax and builtin operand classification use fixed ASCII sets,
+independent of the application's locale. Backslashes inside ordinary single
+quotes are literal,
 including immediately before the closing quote. Execution
 uses a fixed C/POSIX or UTF-8 `LC_ALL`, made readonly by trusted startup as
 specified in the [executor contract](../SECURITY.md#executor-startup).

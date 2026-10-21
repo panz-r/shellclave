@@ -5,13 +5,20 @@ define the current API; rebuild consumers after updating the library.
 
 ## Unreleased: typed source admission
 
+Comments now admit literal high bytes, including invalid UTF-8. Their existing
+raw-LF/EOF boundaries and source offsets are preserved. Comment-only source is
+COMPLETE and policy-neutral; comment text contributes no argv subjects or graph
+effects. Whole-source NUL, prohibited-control-byte and DEL restrictions still
+apply, and later syntax, unsupported code and resource limits retain their own
+outcomes.
+
 Ordinary words now admit literal high bytes in unquoted, escaped, single-quoted
 and double-quoted fragments, including invalid UTF-8 and concatenations.
 Both `printf '%s' 日本` and `printf '%s' '日本'` are COMPLETE and available to
 semantic consumers. Canonical values and source offsets preserve exact bytes.
 Parameter default and pattern operands admit the same literal data; variable
 names, arithmetic and subscripts retain their restricted code domains.
-Raw high bytes in active ANSI-C quotes and comments remain UNSUPPORTED.
+Raw high bytes in active ANSI-C quotes remain UNSUPPORTED.
 Previously unsupported sources now reach the normal grammar and semantic
 checks. For example, `printf 日本\ncat <<\n` is INVALID rather than
 UNSUPPORTED because the later heredoc declaration has no delimiter.

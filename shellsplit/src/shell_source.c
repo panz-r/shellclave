@@ -81,11 +81,14 @@ static SHELL_NONNULL(1) shell_source_status_t
   shell_tokenizer_state_t lexer;
   shell_tokenizer_init_prechecked(&lexer, source, length);
   shell_source_pending_heredoc_t pending[SHELL_MAX_SUBCOMMANDS];
-  size_t count = 0, checked = 0;
+  size_t count = 0;
   shell_token_t token;
+  /* The lexer owns comment/trivia classification, including trailing comments
+   * at EOF. Those skipped spans admit literal high bytes; emitted words keep
+   * their scoped code checks. Deferred bodies are qualified separately below.
+   * The root boundary already checked NUL and prohibited control/DEL bytes
+   * everywhere, including skipped data. */
   while (shell_tokenizer_next(&lexer, &token)) {
-    if (!ascii_span(source, checked, token.position))
-      return SHELL_SOURCE_UNSUPPORTED;
     size_t end = token.position + token.length;
     if (token.type == SHELL_TOKEN_HEREDOC) {
       if (lexer.heredoc_error) {
@@ -106,7 +109,6 @@ static SHELL_NONNULL(1) shell_source_status_t
           /* Byte admission does not diagnose this grammar error or invent a
            * body. Keep checking later code/data islands; the collector will
            * report INVALID once the whole byte domain has been admitted. */
-          checked = end;
           continue;
         }
         /* A complete word which could not join a full pending queue is a
@@ -133,30 +135,30 @@ static SHELL_NONNULL(1) shell_source_status_t
       if (status != SHELL_SOURCE_COMPLETE)
         return status;
     }
-    checked = end;
     if (token.type == SHELL_TOKEN_SEMICOLON && token.length == 1 &&
         token.start[0] == '\n' && count) {
+      size_t body_start = end;
       for (size_t h = 0; h < count; h++) {
         shell_source_heredoc_frame_t frame =
-            shell_source_frame_heredoc(source, length, checked, &pending[h]);
+            shell_source_frame_heredoc(source, length, body_start, &pending[h]);
         /* A tentative closing line is not executable body data. Its raw
          * bytes remain available in framing, without assuming an expansion. */
         if (!shell_source_heredoc_delimiter_is_quoted(&pending[h])) {
-          shell_source_status_t status =
-              word_byte_islands(source + checked, frame.confirmed_end - checked,
-                                depth, true, true);
+          shell_source_status_t status = word_byte_islands(
+              source + body_start, frame.confirmed_end - body_start, depth,
+              true, true);
           if (status != SHELL_SOURCE_COMPLETE)
             return status;
         }
-        checked = frame.after;
+        body_start = frame.after;
         if (!frame.complete)
           break;
       }
       count = 0;
     }
   }
-  return ascii_span(source, checked, length) ? SHELL_SOURCE_COMPLETE
-                                             : SHELL_SOURCE_UNSUPPORTED;
+  return shell_source_scratch_exhausted() ? SHELL_SOURCE_TRUNCATED
+                                          : SHELL_SOURCE_COMPLETE;
 }
 
 static SHELL_NONNULL(1) shell_source_status_t

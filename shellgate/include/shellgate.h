@@ -662,8 +662,8 @@ sg_gate_anomaly_type_model_borrowed(const sg_gate_t *gate) SHELL_NONNULL(1);
 /*
  * Strict mode (enabled by default): the parser rejects malformed syntax,
  * including unclosed quotes and parameter expansions, and prohibited source
- * bytes. Ordinary word literals and heredoc data admit high bytes under
- * scoped rules; executable children establish independent word contexts.
+ * bytes. Comments, ordinary word literals and heredoc data admit high bytes
+ * under scoped rules; executable children establish independent word contexts.
  * Arithmetic and selectors retain restricted code bytes. The executor fixes
  * LC_ALL to C/POSIX or UTF-8 as specified in the startup contract.
  * Literal NUL, DEL, and prohibited control bytes remain invalid.

@@ -3748,8 +3748,8 @@ static void test_single_byte_validation_boundary(void) {
   }
 
   /* Prohibited bytes inside opaque syntax or past the range capacity still
-   * fail admission. Word literal/heredoc high bytes remain admitted data;
-   * the command capacity then determines the truncation outcome. */
+   * fail admission. Word literal/comment/heredoc high bytes remain admitted
+   * data; the command capacity then determines the truncation outcome. */
   static const char *const tails[] = {
       "printf tail",
       "# comment",
@@ -3774,7 +3774,7 @@ static void test_single_byte_validation_boundary(void) {
         shell_parse_result_t parsed;
         memset(&parsed, 0xff, sizeof(parsed));
         reset_byte_validation_work();
-        bool literal_data = i < 5 && i != 1 && bytes[b] >= 128;
+        bool literal_data = i < 5 && bytes[b] >= 128;
         CHECK(shell_parse_fast(source, length, &limits, &parsed) ==
               (literal_data ? SHELL_ETRUNC : SHELL_EPARSE));
         if (!literal_data)

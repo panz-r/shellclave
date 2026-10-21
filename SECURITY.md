@@ -115,9 +115,10 @@ basis is the pinned `bash -p -c ...`, with these preparations:
 3. Set `LC_ALL` to `C` (the portable default), `POSIX`, or an installed UTF-8
    locale before launching Bash. Make it readonly in trusted startup code so
    submitted source cannot change character interpretation. C/POSIX and UTF-8
-   use the same byte-oriented syntax model; literal word bytes are preserved
-   without encoding validation or normalization. The embedding application's locale is
-   independent: analysis uses fixed byte predicates and leaves it unchanged.
+   use the same byte-oriented syntax model; literal word and comment bytes are
+   preserved without encoding validation or normalization. The embedding
+   application's locale is independent: analysis uses fixed byte predicates and
+   leaves it unchanged.
 4. Make the three cleared names readonly before submitted source.
 5. Preserve the modeled option and command-lookup state: no startup aliases or
    traps, imported/shadowing functions, or disabled modeled builtins. Privileged

@@ -1133,7 +1133,7 @@ static void word_byte_source(void) {
       {"日本=value", SHELL_SOURCE_COMPLETE},
       {"if日本 value", SHELL_SOURCE_COMPLETE},
       {"日本if value", SHELL_SOURCE_COMPLETE},
-      {"printf 日本 # 日本", SHELL_SOURCE_UNSUPPORTED},
+      {"printf 日本 # 日本", SHELL_SOURCE_COMPLETE},
       {"printf 日本\ncat <<\n", SHELL_SOURCE_INVALID},
       {"printf 日本 &&", SHELL_SOURCE_INCOMPLETE},
       {"printf $'日本'", SHELL_SOURCE_UNSUPPORTED},
@@ -1177,6 +1177,236 @@ static void word_byte_source(void) {
         SHELL_SOURCE_INCOMPLETE);
   CHECK(draft.prefix_length == strlen("printf '日本'\n") &&
         draft.need == SHELL_SOURCE_NEEDS_QUOTE);
+}
+
+static void comment_byte_source(void) {
+  static const char *const payloads[] = {
+      "説明 if while case $(false) >phantom <<MISSING ' \"",
+      "\x80\xff\xc0\xaf",
+      "line\xe2\x80\xa8separator\xc2\x85text",
+  };
+  static const struct {
+    const char *format;
+    unsigned commands, files, documents;
+  } cases[] = {
+      {"# %s", 0, 0, 0},
+      {"cat input.txt >output.txt # %s", 1, 2, 0},
+      {"# %s\ncat input.txt >output.txt", 1, 2, 0},
+      {"cat input.txt # %s\nprintf tail", 2, 1, 0},
+      {"echo \"$(printf inner # %s\n)\"", 2, 0, 0},
+      {"cat <(printf inner # %s\n)", 2, 0, 0},
+      {"echo `printf inner # %s\n`", 2, 0, 0},
+      {"cat <<EOF # %s\n# literal\nEOF\n", 1, 0, 1},
+      {"cat <<'EOF' # %s\n# literal\nEOF\n", 1, 0, 1},
+      {"echo ok && # %s\nprintf tail", 2, 0, 0},
+      {"cat input.txt # %s \\\nprintf tail", 2, 1, 0},
+  };
+  static const char baseline[] = "cat input.txt >output.txt";
+  shell_netstring_buffer_t expected = {0};
+  size_t count;
+  bool features;
+  CHECK(shell_build_netargv_sequence_buffer(baseline, sizeof(baseline) - 1,
+                                            NULL, &expected, &count,
+                                            &features) == SHELL_PROCESS_OK &&
+        count == 1);
+  for (size_t p = 0; p < sizeof(payloads) / sizeof(payloads[0]); ++p) {
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); ++c) {
+      char source[512];
+      int length =
+          snprintf(source, sizeof(source), cases[c].format, payloads[p]);
+      CHECK(length > 0 && (size_t)length < sizeof(source));
+      shell_source_status_t status =
+          shell_parse_draft(source, (size_t)length, NULL, &draft);
+      if (status != SHELL_SOURCE_COMPLETE)
+        fprintf(stderr, "comment byte status %d: %s\n", status, source);
+      CHECK(status == SHELL_SOURCE_COMPLETE);
+      CHECK(draft.header_count == cases[c].commands);
+      for (uint32_t r = 0; r < draft.prefix.count; ++r)
+        CHECK(
+            !(draft.prefix.cmds[r].features &
+              (SHELL_FEAT_CONDITIONALS | SHELL_FEAT_LOOPS | SHELL_FEAT_CASE)));
+      if (c == 1 || c == 2) {
+        const char *command = strstr(source, "cat input.txt");
+        CHECK(command &&
+              draft.headers[0].words[0].start == (size_t)(command - source) &&
+              draft.headers[0].words[0].length == 3);
+        for (uint32_t r = 0; r < draft.prefix.count; ++r)
+          CHECK(draft.prefix.cmds[r].features == 0);
+        shell_netstring_buffer_t actual = {0};
+        CHECK(shell_build_netargv_sequence_buffer(source, (size_t)length, NULL,
+                                                  &actual, &count, &features) ==
+                  SHELL_PROCESS_OK &&
+              count == 1);
+        CHECK(actual.length == expected.length &&
+              !memcmp(actual.data, expected.data, actual.length));
+        shell_netstring_buffer_free(&actual);
+      }
+      CHECK(shell_dep_graph_parse_with_fast(
+                source, draft.prefix_length, "/workspace", &limits,
+                &draft.prefix, &graph) == SHELL_DEP_OK);
+      CHECK(shell_dep_graph_validate(&graph).valid);
+      unsigned commands = 0, files = 0, documents = 0;
+      for (uint32_t n = 0; n < graph.node_count; ++n) {
+        const shell_dep_node_t *node = &graph.nodes[n];
+        commands += node->type == SHELL_NODE_CMD;
+        if (node->type != SHELL_NODE_DOC)
+          continue;
+        if (node->doc.kind == SHELL_DOC_FILE) {
+          ++files;
+          CHECK((node->doc.path_len == 9 &&
+                 !memcmp(node->doc.path, "input.txt", 9)) ||
+                (node->doc.path_len == 10 &&
+                 !memcmp(node->doc.path, "output.txt", 10)));
+          CHECK(node->doc.path ==
+                strstr(source,
+                       node->doc.path_len == 9 ? "input.txt" : "output.txt"));
+        }
+        if (node->doc.kind == SHELL_DOC_HEREDOC) {
+          ++documents;
+          content(&node->doc, "# literal\n");
+        }
+      }
+      if (commands != cases[c].commands || files != cases[c].files ||
+          documents != cases[c].documents)
+        fprintf(stderr,
+                "comment graph: commands=%u files=%u documents=%u: %s\n",
+                commands, files, documents, source);
+      CHECK(commands == cases[c].commands && files == cases[c].files &&
+            documents == cases[c].documents);
+    }
+  }
+  shell_netstring_buffer_free(&expected);
+
+  static const struct {
+    const char *source;
+    shell_source_status_t status;
+  } outcomes[] = {
+      {"# 日本\nprintf ok && # 説明", SHELL_SOURCE_INCOMPLETE},
+      {"# 日本\ncat <<\n", SHELL_SOURCE_INVALID},
+      {"cat <<# 日本", SHELL_SOURCE_INVALID},
+      {"# 日本\nprintf $'日'", SHELL_SOURCE_UNSUPPORTED},
+      {"# 日本\nprintf $((日))", SHELL_SOURCE_UNSUPPORTED},
+      {"# 日本\nprintf ${日}", SHELL_SOURCE_UNSUPPORTED},
+      {"# 日本\nif true; then :; fi", SHELL_SOURCE_UNSUPPORTED},
+      {"echo \"$(printf ok # 日本\n", SHELL_SOURCE_INCOMPLETE},
+      {"printf %s word#日本 \\#日本 '#日本' ${v#日本}", SHELL_SOURCE_COMPLETE},
+      {"printf %s ''#日本 <()#日本", SHELL_SOURCE_COMPLETE},
+  };
+  for (size_t c = 0; c < sizeof(outcomes) / sizeof(outcomes[0]); ++c)
+    CHECK(shell_parse_draft(outcomes[c].source, strlen(outcomes[c].source),
+                            NULL, &draft) == outcomes[c].status);
+
+  static const char incomplete[] = "printf before # 日本\nprintf 'unfinished";
+  static const char prefix[] = "printf before # 日本\n";
+  CHECK(shell_parse_draft(incomplete, sizeof(incomplete) - 1, NULL, &draft) ==
+        SHELL_SOURCE_INCOMPLETE);
+  CHECK(draft.prefix_length == sizeof(prefix) - 1 &&
+        draft.need == SHELL_SOURCE_NEEDS_QUOTE && draft.header_count == 2 &&
+        draft.headers[0].complete && !draft.headers[1].complete);
+  CHECK(shell_dep_graph_parse_with_fast(incomplete, draft.prefix_length,
+                                        "/workspace", &limits, &draft.prefix,
+                                        &graph) == SHELL_DEP_OK);
+  CHECK(shell_dep_graph_validate(&graph).valid);
+  unsigned prefix_commands = 0;
+  for (uint32_t n = 0; n < graph.node_count; ++n)
+    if (graph.nodes[n].type == SHELL_NODE_CMD) {
+      CHECK(graph.nodes[n].cmd.token_count == 2 &&
+            graph.nodes[n].cmd.token_lens[1] == 6 &&
+            !memcmp(graph.nodes[n].cmd.tokens[1], "before", 6));
+      ++prefix_commands;
+    }
+  CHECK(prefix_commands == 1);
+
+  static const char hashes[] =
+      "printf %s word#日本 \\#日本 '#日本' ''#日本 <()#日本";
+  static const char hash_argv[] =
+      "6:printf,2:%s,11:word#日本,7:#日本,7:#日本,7:#日本,7:#日本,";
+  shell_netstring_buffer_t encoded = {0};
+  CHECK(shell_build_netargv_sequence_buffer(hashes, sizeof(hashes) - 1, NULL,
+                                            &encoded, &count,
+                                            &features) == SHELL_PROCESS_OK &&
+        count == 1);
+  shell_netstring_iter_t records;
+  shell_netstring_view_t record;
+  CHECK(shell_netstring_iter_init(&records, encoded.data, encoded.length) ==
+        SHELL_NETSTRING_OK);
+  CHECK(shell_netstring_iter_next(&records, &record) == SHELL_NETSTRING_OK &&
+        record.payload_length == sizeof(hash_argv) - 1 &&
+        !memcmp(record.payload, hash_argv, record.payload_length));
+  CHECK(shell_netstring_iter_next(&records, &record) == SHELL_NETSTRING_DONE);
+  shell_netstring_buffer_free(&encoded);
+
+  static const char received[] = "printf ok # 日本\x80\xff";
+  for (size_t end = strlen("printf ok #"); end < sizeof(received); ++end)
+    CHECK(shell_parse_draft(received, end, NULL, &draft) ==
+          SHELL_SOURCE_COMPLETE);
+  char invalid[] = "printf ok # 日本?";
+  static const unsigned char rejected[] = {0, 1, 31, 127};
+  for (size_t b = 0; b < sizeof(rejected); ++b) {
+    invalid[sizeof(invalid) - 2] = (char)rejected[b];
+    CHECK(
+        shell_parse_draft(invalid, sizeof(invalid) - 1, NULL, &draft) ==
+        (rejected[b] ? SHELL_SOURCE_UNSUPPORTED : SHELL_SOURCE_INVALID_INPUT));
+    CHECK(!draft.prefix_length && !draft.prefix.count);
+  }
+
+  char large[2048] = "# 日本\ncat <<'";
+  size_t at = strlen(large);
+  memset(large + at, 'E', 512);
+  at += 512;
+  memcpy(large + at, "'\nx\n", 4);
+  at += 4;
+  memset(large + at, 'E', 512);
+  at += 512;
+  large[at++] = '\n';
+  CHECK(shell_parse_draft(large, at, NULL, &draft) == SHELL_SOURCE_TRUNCATED);
+  CHECK(!draft.prefix_length && !draft.prefix.count);
+  size_t size;
+  CHECK(shell_source_workspace_size(at, &size));
+  void *scratch = malloc(size);
+  CHECK(scratch);
+  shell_limits_t storage = SHELL_LIMITS_DEFAULT;
+  storage.workspace = scratch;
+  storage.workspace_size = size;
+  CHECK(shell_parse_draft(large, at, &storage, &draft) ==
+        SHELL_SOURCE_COMPLETE);
+  CHECK(draft.heredoc_count == 1 && draft.heredocs[0].complete);
+  content(&draft.heredocs[0].content, "x\n");
+  free(scratch);
+}
+
+static void comment_byte_work(void) {
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+  for (unsigned form = 0; form < 2; ++form) {
+    size_t previous = 0;
+    for (size_t count = 64; count <= 4096; count *= 2) {
+      char source[16384];
+      size_t length = 0;
+      if (!form)
+        source[length++] = '#';
+      const char *fragment = form ? "#\x80\n" : "\x80";
+      size_t size = strlen(fragment);
+      for (size_t i = 0; i < count; ++i) {
+        memcpy(source + length, fragment, size);
+        length += size;
+      }
+      static const char tail[] = "\nprintf ok";
+      memcpy(source + length, tail, sizeof(tail));
+      length += sizeof(tail) - 1;
+      shellsplit_test_source_scan_reset();
+      CHECK(shell_parse_draft(source, length, NULL, &draft) ==
+            SHELL_SOURCE_COMPLETE);
+      size_t work = shellsplit_test_source_scan_work();
+      CHECK(work <= 128 * length + 1024 &&
+            (!previous || work <= 2 * previous + 2048));
+      CHECK(shellsplit_test_metadata_work(
+                SHELLSPLIT_TEST_WORK_BYTE_VALIDATION_PASSES) == 1 &&
+            shellsplit_test_metadata_work(
+                SHELLSPLIT_TEST_WORK_BYTE_VALIDATION_BYTES) == length);
+      previous = work;
+    }
+  }
+#endif
 }
 
 static void quoted_byte_work(void) {
@@ -4071,6 +4301,8 @@ int main(void) {
   heredocs();
   byte_domains();
   word_byte_source();
+  comment_byte_source();
+  comment_byte_work();
   quoted_byte_work();
   quoted_byte_paths();
   selector_recovery();

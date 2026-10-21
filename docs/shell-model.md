@@ -92,7 +92,13 @@ selectors retain restricted code
 domains even inside an enclosing quote. Ordinary parameter operands inherit
 their applicable quote context, as in `${value:-日本}` or `"${value:-日本}"`.
 Pattern and replacement operands also retain high bytes without evaluating
-their runtime results. Comments retain their ASCII byte restriction.
+their runtime results. Comments admit literal high bytes, including invalid
+UTF-8, and end at raw LF or EOF. Quotes, expansion spellings and Unicode line
+separators inside a comment remain comment data. The whole-source NUL,
+prohibited-control-byte and DEL restrictions still apply. Thus
+`cat résumé.txt # 説明` has the same command arguments and effects as the
+command without its comment; source offsets continue to refer to the original
+bytes.
 Canonical netstrings carry arbitrary binary payloads independently of
 shell-source admission.
 

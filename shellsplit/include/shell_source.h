@@ -190,12 +190,14 @@ typedef struct shell_source_result {
  * UNSUPPORTED, not a syntax-error claim. Distinguish append-repairable input
  * from a complete or invalid source. Retain complete top-level list units
  * before an unfinished tail, excluding every pending heredoc body from command
- * syntax. Ordinary literal word fragments, unquoted, escaped or quoted,
- * admit high bytes without encoding validation or normalization. Parameter
- * operands inherit that data domain and their applicable quote context.
- * Executable children
- * establish independent word contexts; arithmetic, substring arithmetic and
- * selectors retain restricted code bytes, including at unfinished EOF.
+ * syntax. Comments and ordinary literal word fragments, unquoted, escaped or
+ * quoted, admit high bytes without encoding validation or normalization. A
+ * comment ends at raw LF or EOF; its bytes do not supply tokens or expansions.
+ * The whole-source NUL, prohibited control-byte and DEL checks still apply.
+ * Parameter operands inherit the word data domain and their applicable quote
+ * context. Executable children establish independent word contexts;
+ * arithmetic, substring arithmetic and selectors retain restricted code bytes,
+ * including at unfinished EOF.
  * Heredoc literal text and parameter words retain their existing data domains.
  * The executor fixes LC_ALL to C/POSIX or UTF-8 before parsing submitted
  * source. Analysis uses fixed byte predicates independent of the embedding

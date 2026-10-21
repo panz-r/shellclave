@@ -8054,6 +8054,22 @@ static void run_fixed_oracles() {
     }
   }
   {
+    static const char *const comments[] = {
+        "# 日本 if while case $(false) >phantom",
+        "printf ok # \x80\xff",
+        "# 日本\nprintf ok # 説明",
+        "echo before # 日本 \\\necho after",
+        "echo \"$(printf inner # 日本\n)\"",
+        "cat <<EOF # 日本\n# literal\nEOF\n",
+    };
+    for (const char *source : comments)
+      if (test_processor(source, strlen(source)) ||
+          test_depgraph(source, strlen(source), "/workspace")) {
+        fprintf(stderr, "comment byte semantic oracle failed: %s\n", source);
+        abort();
+      }
+  }
+  {
     const struct {
       const char *source;
       shell_source_status_t status;
@@ -8081,6 +8097,13 @@ static void run_fixed_oracles() {
         {"cat <<'EOF'\né\nEOF\ncat <<\nprintf é", SHELL_SOURCE_INVALID},
         {"cat <<'EOF'\né\nEOF\ncat <<\nprintf $'é'", SHELL_SOURCE_UNSUPPORTED},
         {"echo before #comment \\\necho after", SHELL_SOURCE_COMPLETE},
+        {"# 日本 if while case $(false) >phantom", SHELL_SOURCE_COMPLETE},
+        {"printf ok # \x80\xff", SHELL_SOURCE_COMPLETE},
+        {"echo before # 日本 \\\necho after", SHELL_SOURCE_COMPLETE},
+        {"echo \"$(printf inner # 日本\n)\"", SHELL_SOURCE_COMPLETE},
+        {"# 日本\ncat <<\n", SHELL_SOURCE_INVALID},
+        {"# 日本\nprintf $'日'", SHELL_SOURCE_UNSUPPORTED},
+        {"printf ok && # 日本", SHELL_SOURCE_INCOMPLETE},
         {": #comment \\\na=(x)", SHELL_SOURCE_UNSUPPORTED},
         {": #comment \\\n{ :; }", SHELL_SOURCE_COMPLETE},
         {": |\ntime {", SHELL_SOURCE_COMPLETE},

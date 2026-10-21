@@ -90,6 +90,49 @@ class SourceStatusContract(unittest.TestCase):
                 self.assertEqual(self.syntax(source), 0)
                 self.assertEqual(self.classify(source), expected)
 
+    def test_comment_byte_domains(self):
+        payloads = ["日本 if while case $(false) >phantom <<MISSING ' \"".encode(),
+                    bytes(range(128, 256)),
+                    "line\u2028separator\u0085data".encode()]
+        for locale in ("C", "C.UTF-8"):
+            environment = dict(os.environ, BASH_ENV="", ENV="", LC_ALL=locale)
+            for payload in payloads:
+                cases = [
+                    (b"# " + payload, b""),
+                    (b"# " + payload + b"\nprintf ok", b"ok"),
+                    (b"printf ok # " + payload, b"ok"),
+                    (b"printf before # " + payload + b" \\\nprintf after", b"beforeafter"),
+                    (b'printf "%s" "$(printf inner # ' + payload + b'\n)"', b"inner"),
+                    (b'printf "%s" "`printf inner # ' + payload + b'\n`"', b"inner"),
+                    (b"read -r value <<EOF # " + payload +
+                     b'\npayload\nEOF\nprintf "%s" "$value"', b"payload"),
+                ]
+                for source, expected in cases:
+                    with self.subTest(locale=locale, source=source):
+                        self.assertEqual(self.classify(source), 0)
+                        reference = subprocess.run(
+                            [self.bash, "--noprofile", "--norc", "-p", "-c",
+                             b"readonly LC_ALL; " + source], env=environment,
+                            capture_output=True, check=True, timeout=10)
+                        self.assertEqual(reference.stdout, expected)
+        cases = [
+            ("printf ok && # 日本".encode(), 1),
+            ("# 日本\ncat <<\n".encode(), 2),
+            ("cat <<# 日本".encode(), 2),
+            ("# 日本\nprintf $'日'".encode(), 4),
+            ("# 日本\nprintf $((日))".encode(), 4),
+            ("# 日本\nif true; then :; fi".encode(), 4),
+            ("printf %s word#日本 \\#日本 '#日本' ${v#日本}".encode(), 0),
+            (b"# \x80\x00", 5),
+            (b"# \x80\x01", 4),
+            (b"# \x80\x7f", 4),
+        ]
+        for source, expected in cases:
+            with self.subTest(source=source):
+                self.assertEqual(self.classify(source), expected)
+                if expected == 2:
+                    self.assertNotEqual(self.syntax(source), 0)
+
     def test_time_token_history(self):
         # Expectations are keyed to logical LF tokens, not physical lines.
         # | and |& differ in Bash's two-token reserved-word lookbehind.
