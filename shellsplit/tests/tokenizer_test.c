@@ -1,6 +1,7 @@
 #include "../src/shell_processor_internal.h"
 #include "../src/shell_source_internal.h"
 #include "../src/shell_tokenizer_full_internal.h"
+#include "control_word_cases.h"
 #include "depgraph_test_workspace.h"
 #include "shell_abstract.h"
 #include "shell_depgraph.h"
@@ -9163,6 +9164,9 @@ static void test_control_syntax_scope_contract(void) {
       {"'while' true; wh\\ile true", SHELL_CONTROL_SYNTAX_NONE},
       {"echo ok >while # if true", SHELL_CONTROL_SYNTAX_NONE},
       {"echo $(if true; then echo ok; fi)", SHELL_CONTROL_SYNTAX_NONE},
+      {"fi $(printf x)", SHELL_CONTROL_SYNTAX_INCOMPLETE},
+      {"if $(printf x)then; then :; fi", SHELL_CONTROL_SYNTAX_COMPLETE},
+      {"case $(printf x)in in x) :;; esac", SHELL_CONTROL_SYNTAX_COMPLETE},
   };
   static const char enclosing[] = "enclosing lexical context";
   shell_source_operation_begin(enclosing, sizeof(enclosing) - 1);
@@ -9192,9 +9196,64 @@ static void test_control_syntax_scope_contract(void) {
        valid);
 }
 
+static void test_control_word_fragments(void) {
+  bool valid = true;
+  for (size_t i = 0; i < sizeof(shellsplit_test_control_word_fragments) /
+                             sizeof(shellsplit_test_control_word_fragments[0]);
+       i++) {
+    const char *source = shellsplit_test_control_word_fragments[i].source;
+    bool item = shell_tokenizer_control_syntax(source, strlen(source)) ==
+                SHELL_CONTROL_SYNTAX_NONE;
+    if (!item)
+      fprintf(stderr, "control word fragment: %s\n", source);
+    valid = item && valid;
+  }
+  test("Control syntax recognizes complete words rather than fragments", valid);
+
+  valid = true;
+  for (unsigned family = 0; family < 2; family++) {
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+    size_t previous = 0;
+#endif
+    for (size_t units = 64; units <= 512; units *= 2) {
+      char source[8192];
+      memcpy(source, family ? "if" : "fi", 2);
+      size_t length = 2;
+      const char *fragment = family ? "$(printf x)" : "\\\n";
+      size_t size = strlen(fragment);
+      for (size_t i = 0; i < units; i++) {
+        memcpy(source + length, fragment, size);
+        length += size;
+      }
+      if (!family) {
+        memcpy(source + length, "$(printf x)", 11);
+        length += 11;
+      }
+      source[length] = '\0';
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+      shellsplit_test_source_scan_reset();
+#endif
+      bool item = shell_tokenizer_control_syntax(source, length) ==
+                  SHELL_CONTROL_SYNTAX_NONE;
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+      size_t work = shellsplit_test_source_scan_work();
+      item = item && work <= 128 * length + 1024 &&
+             (!previous || work <= 2 * previous + 2048);
+      previous = work;
+#endif
+      if (!item)
+        fprintf(stderr, "control fragment scaling: family=%u units=%zu\n",
+                family, units);
+      valid = item && valid;
+    }
+  }
+  test("Control fragment classification has linear source work", valid);
+}
+
 int main(void) {
   test_prevalidated_anomaly_stages();
   test_control_syntax_scope_contract();
+  test_control_word_fragments();
   test_scalar_variable_substitution_scopes();
   test_scalar_variable_scan_linear_work();
   test_tokenize_allocation_failures();
@@ -9317,6 +9376,34 @@ int main(void) {
        1,
        1,
        1},
+      {"Tokenizer iterator: conditional markers do not open nesting",
+       "if then elif else fi",
+       5,
+       {SHELL_TOKEN_COMMAND, SHELL_TOKEN_COMMAND, SHELL_TOKEN_COMMAND,
+        SHELL_TOKEN_COMMAND, SHELL_TOKEN_COMMAND},
+       {"if", "then", "elif", "else", "fi"},
+       0,
+       0,
+       0},
+      {"Tokenizer iterator: all loop openers share depth accounting",
+       "for while until select done",
+       5,
+       {SHELL_TOKEN_COMMAND, SHELL_TOKEN_COMMAND, SHELL_TOKEN_COMMAND,
+        SHELL_TOKEN_COMMAND, SHELL_TOKEN_COMMAND},
+       {"for", "while", "until", "select", "done"},
+       0,
+       3,
+       0},
+      {"Tokenizer iterator: unmatched closers leave depths at zero",
+       "fi for do done done case esac esac",
+       8,
+       {SHELL_TOKEN_COMMAND, SHELL_TOKEN_COMMAND, SHELL_TOKEN_COMMAND,
+        SHELL_TOKEN_COMMAND, SHELL_TOKEN_COMMAND, SHELL_TOKEN_COMMAND,
+        SHELL_TOKEN_COMMAND, SHELL_TOKEN_COMMAND},
+       {"fi", "for", "do", "done", "done", "case", "esac", "esac"},
+       0,
+       0,
+       0},
       {"Tokenizer iterator: process substitutions",
        "diff <(left \"(x)\") >(right)",
        3,

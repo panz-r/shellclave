@@ -1,5 +1,6 @@
 #include "../src/shell_depgraph_internal.h"
 #include "../src/shell_source_internal.h"
+#include "control_word_cases.h"
 #include "shell_abstract.h"
 #include "shell_sequence.h"
 #include "shell_source.h"
@@ -752,6 +753,70 @@ static void keyword_recovery(void) {
     previous_work = work;
   }
 #endif
+}
+
+static void keyword_word_fragments(void) {
+  for (size_t i = 0; i < sizeof(shellsplit_test_control_word_fragments) /
+                             sizeof(shellsplit_test_control_word_fragments[0]);
+       i++) {
+    const char *source = shellsplit_test_control_word_fragments[i].source;
+    size_t length = strlen(source);
+    shell_source_status_t status =
+        shell_parse_draft(source, length, NULL, &draft);
+    if (status != SHELL_SOURCE_COMPLETE)
+      fprintf(stderr, "control fragment draft: status=%d source=%s\n",
+              (int)status, source);
+    CHECK(status == SHELL_SOURCE_COMPLETE);
+    CHECK(draft.prefix_length == length && draft.tail_start == length);
+    for (uint32_t h = 0; h < draft.header_count; h++)
+      CHECK(draft.headers[h].complete);
+    CHECK(shell_dep_graph_parse_with_fast(source, length, "/workspace", &limits,
+                                          &draft.prefix,
+                                          &graph) == SHELL_DEP_OK);
+    CHECK(shell_dep_graph_validate(&graph).valid);
+    unsigned producers = 0, substitutions = 0;
+    for (uint32_t n = 0; n < graph.node_count; n++) {
+      const shell_dep_node_t *node = &graph.nodes[n];
+      if (node->type == SHELL_NODE_CMD && node->cmd.token_count &&
+          node->cmd.token_lens[0] == strlen("printf") &&
+          !memcmp(node->cmd.tokens[0], "printf", strlen("printf")))
+        producers++;
+    }
+    CHECK(producers == shellsplit_test_control_word_fragments[i].producers);
+    for (uint32_t e = 0; e < graph.edge_count; e++)
+      substitutions += graph.edges[e].type == SHELL_EDGE_SUBST;
+    if (substitutions != shellsplit_test_control_word_fragments[i].subst_edges)
+      fprintf(stderr, "control fragment substitutions: count=%u source=%s\n",
+              substitutions, source);
+    CHECK(substitutions ==
+          shellsplit_test_control_word_fragments[i].subst_edges);
+  }
+
+  static const char continued[] = "f\\\ni\\\n$(printf x)";
+  CHECK(shell_parse_draft(continued, sizeof(continued) - 1, NULL, &draft) ==
+        SHELL_SOURCE_COMPLETE);
+  CHECK(draft.headers[0].word_count == 1);
+  CHECK(draft.headers[0].words[0].start == 0 &&
+        draft.headers[0].words[0].length == sizeof(continued) - 1);
+  CHECK(draft.header_count == 2 && draft.headers[1].word_count == 2);
+  CHECK(draft.headers[1].words[0].start ==
+        (size_t)(strstr(continued, "printf") - continued));
+
+  static const char *const partial[] = {
+      "echo before; fi$(printf x",
+      "echo before; then<(printf x",
+      "echo before; esac`printf x",
+  };
+  for (size_t i = 0; i < sizeof(partial) / sizeof(partial[0]); i++) {
+    CHECK(shell_parse_draft(partial[i], strlen(partial[i]), NULL, &draft) ==
+          SHELL_SOURCE_INCOMPLETE);
+    CHECK(draft.prefix_length == strlen("echo before;") &&
+          draft.tail_start == draft.prefix_length && draft.prefix.count == 1);
+    CHECK(shell_dep_graph_parse_with_fast(partial[i], draft.prefix_length,
+                                          "/workspace", &limits, &draft.prefix,
+                                          &graph) == SHELL_DEP_OK);
+    CHECK(shell_dep_graph_validate(&graph).valid);
+  }
 }
 
 static void prefixes(void) {
@@ -4312,6 +4377,7 @@ int main(void) {
   lexical_command_roles();
   pending_pipeline_prefixes();
   keyword_recovery();
+  keyword_word_fragments();
   prefixes();
   local_completeness();
   unfinished_children();

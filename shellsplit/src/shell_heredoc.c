@@ -1,6 +1,7 @@
 /* Lexical spelling of delimiter-only dollar fragments. These fragments are
  * parsed, but not expanded or executed. In particular Bash prints a parsed
  * $(...) back into the delimiter word before applying quote removal. */
+#include "shell_keywords_internal.h"
 #include "shell_source_internal.h"
 #include <stdio.h>
 
@@ -719,7 +720,7 @@ static SHELL_NONNULL(1, 2, 3) bool literal_redirect(literal_parser_t *parser,
 
 static SHELL_NONNULL(1) bool literal_reserved(const literal_parser_t *parser,
                                               size_t start, size_t end) {
-  return shell_source_unsupported_keyword(parser->input, end, start, NULL) ||
+  return shell_source_keyword(parser->input, end, start, NULL) ||
          shell_source_match_plain_word(parser->input, end, start, "!", 1, NULL);
 }
 

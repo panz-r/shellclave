@@ -1,5 +1,6 @@
 #include "shell_tokenizer.h"
 #include "shell_ascii.h"
+#include "shell_keywords_internal.h"
 #include "shell_pipeline_internal.h"
 #include "shell_source_internal.h"
 #include "shell_tokenizer_full.h"
@@ -833,39 +834,15 @@ static SHELL_NONNULL(1,
   nesting--;
 }
 
-/* Classify one complete logical word from the prechecked lexical stream.
- * Every keyword probe is bounded by a fixed spelling plus its physical line
- * continuations. Quotes, expansions and punctuation remain in this span, so
- * no fragment or suffix can become an independent keyword. */
+/* The forward lexer supplies one complete logical word and its operand role.
+ * Its keyword's feature bits are shared with the other frontend projections. */
 static SHELL_NONNULL(1, 4) void detect_control_word(const char *input,
                                                     size_t start, size_t end,
                                                     uint32_t *features) {
-  static const struct {
-    const char *word;
-    size_t length;
-    uint32_t feature;
-  } keywords[] = {
-      {"while", 5, SHELL_FEAT_LOOPS},
-      {"until", 5, SHELL_FEAT_LOOPS},
-      {"for", 3, SHELL_FEAT_LOOPS},
-      {"select", 6, SHELL_FEAT_LOOPS},
-      {"if", 2, SHELL_FEAT_CONDITIONALS},
-      {"then", 4, SHELL_FEAT_CONDITIONALS},
-      {"elif", 4, SHELL_FEAT_CONDITIONALS},
-      {"else", 4, SHELL_FEAT_CONDITIONALS},
-      {"fi", 2, SHELL_FEAT_CONDITIONALS},
-      {"case", 4, SHELL_FEAT_CASE},
-      {"in", 2, SHELL_FEAT_CASE},
-      {"esac", 4, SHELL_FEAT_CASE},
-  };
-  for (size_t k = 0; k < sizeof(keywords) / sizeof(keywords[0]); ++k) {
-    SHELL_SOURCE_WORD_SCAN(1);
-    if (shell_source_match_plain_word(input, end, start, keywords[k].word,
-                                      keywords[k].length, NULL)) {
-      *features |= keywords[k].feature;
-      break;
-    }
-  }
+  const shell_keyword_t *keyword =
+      shell_source_keyword(input, end, start, NULL);
+  if (keyword)
+    *features |= keyword->features;
 }
 
 /* Each command body's lexer supplies words, operators, comments and deferred

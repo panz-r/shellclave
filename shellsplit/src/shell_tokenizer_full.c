@@ -2,425 +2,14 @@
 #include "alloc.h"
 #include "shell_ascii.h"
 #include "shell_builtin_internal.h"
+#include "shell_keywords_internal.h"
+#include "shell_source_admission_internal.h"
 #include "shell_source_draft_internal.h"
 #include "shell_source_internal.h"
 #include "shell_tokenizer_full_internal.h"
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-
-/* Internal views share one immutable source operation. User callbacks suspend
- * its scalar state and keep its cache live in the owning workspace. */
-#define SHELL_SOURCE_INDEX_PROBES (4u * SHELL_MAX_SUBCOMMANDS)
-typedef shell_source_index_entry_t source_index_entry_t;
-static _Thread_local shell_source_operation_t source_operation;
-static _Thread_local shell_source_index_t default_index;
-static _Thread_local unsigned default_generation;
-static _Thread_local bool default_index_borrowed;
-
-void shell_source_operation_begin(const char *input, size_t length) {
-  if (source_operation.depth++ != 0)
-    return;
-  source_operation.begin = (uintptr_t)input;
-  source_operation.end = (uintptr_t)input + length;
-  source_operation.scope = (shell_source_scope_t){
-      source_operation.begin, source_operation.end, source_operation.begin};
-  source_operation.bytes_prechecked = false;
-  source_operation.index = NULL;
-  source_operation.owns_default_index = !default_index_borrowed;
-  if (source_operation.owns_default_index) {
-    default_index_borrowed = true;
-    source_operation.index = &default_index;
-    if (++default_generation == 0) {
-      memset(&default_index, 0, sizeof(default_index));
-      default_generation = 1;
-    }
-    source_operation.generation = default_generation;
-  }
-  source_operation.workspace = NULL;
-  source_operation.workspace_begin = source_operation.begin;
-  source_operation.workspace_end = source_operation.end;
-  source_operation.workspace_size = source_operation.scratch_used = 0;
-  source_operation.scratch_exhausted = false;
-  source_operation.owned_workspace = NULL;
-  source_operation.arrays = (shell_source_array_index_t){0};
-}
-
-void shell_source_operation_prechecked(void) {
-  source_operation.bytes_prechecked = true;
-}
-
-bool shell_source_operation_begin_owned(const char *input, size_t length) {
-  shell_source_operation_begin(input, length);
-  if (source_operation.depth != 1)
-    return true;
-  /* One conservative sizing scan, not another syntax pass. Source without
-   * documents or many brackets needs no arena. Flat delimiters retain their
-   * two-byte bound, plus the measured bracket-record storage; only grouped
-   * delimiter spelling needs the source-sized printer bound. Quoted/data
-   * bracket occurrences may overreserve records, not a whole printer arena. */
-  bool document = false, grouped = false;
-  size_t brackets = 0;
-  for (size_t i = 0; i < length; i++) {
-    SHELL_SOURCE_WORD_SCAN(1);
-    brackets += input[i] == '[';
-    document |= input[i] == '<' &&
-                shell_source_logical_next_is(input, length, i, '<', NULL);
-    grouped |= shell_source_heredoc_fragment_open(input, length, i) ||
-               shell_source_process_substitution_open(input, length, i, NULL);
-  }
-  source_operation.arrays.count = brackets;
-  bool array_storage = brackets > SHELL_SOURCE_INLINE_ARRAYS;
-  if (!document && !array_storage)
-    return true;
-  size_t size = 0;
-  bool printer = document && grouped;
-  bool sized = true;
-  if (printer)
-    sized = shell_source_workspace_size(length, &size);
-  else {
-    if (document) {
-      sized = length <= SIZE_MAX / 2;
-      if (sized)
-        size = 2 * length;
-    }
-    size_t padding = _Alignof(shell_source_array_boundary_t) - 1;
-    if (brackets) {
-      sized = sized && size <= SIZE_MAX - padding &&
-              brackets <= (SIZE_MAX - size - padding) /
-                              sizeof(shell_source_array_boundary_t);
-      if (sized)
-        size += brackets * sizeof(shell_source_array_boundary_t) + padding;
-    }
-  }
-  if (!sized) {
-    shell_source_operation_end();
-    return false;
-  }
-  if (size <= sizeof(source_operation.scratch) && !array_storage)
-    return true;
-  source_operation.owned_workspace = malloc(size);
-  if (!source_operation.owned_workspace) {
-    shell_source_operation_end();
-    return false;
-  }
-  source_operation.workspace = source_operation.owned_workspace;
-  source_operation.workspace_size = size;
-  return true;
-}
-
-void shell_source_operation_end(void) {
-  if (--source_operation.depth == 0) {
-    free(source_operation.owned_workspace);
-    source_operation.owned_workspace = NULL;
-    if (source_operation.owns_default_index)
-      default_index_borrowed = false;
-    source_operation.owns_default_index = false;
-    source_operation.index = NULL;
-    source_operation.workspace = NULL;
-    source_operation.workspace_size = source_operation.scratch_used = 0;
-  }
-}
-
-shell_source_operation_t shell_source_operation_suspend(void) {
-  shell_source_operation_t previous = source_operation;
-  source_operation = (shell_source_operation_t){0};
-  return previous;
-}
-
-void shell_source_operation_restore(shell_source_operation_t previous) {
-  source_operation = previous;
-}
-
-void shell_source_operation_index(shell_source_index_t *index) {
-  if (source_operation.depth != 1)
-    return; /* An internal subparse already shares its owner's backing. */
-  if (source_operation.owns_default_index)
-    default_index_borrowed = false;
-  source_operation.owns_default_index = false;
-  memset(index, 0, sizeof(*index));
-  source_operation.index = index;
-  source_operation.generation = 1;
-}
-
-shell_source_workspace_scope_t shell_source_workspace_begin(const char *source,
-                                                            size_t length,
-                                                            void *buffer,
-                                                            size_t size) {
-  uintptr_t begin = (uintptr_t)source;
-  shell_source_workspace_scope_t previous = {
-      source_operation.workspace,
-      source_operation.workspace_size,
-      source_operation.scratch_used,
-      source_operation.scratch_exhausted,
-      begin >= source_operation.workspace_begin &&
-          begin <= source_operation.workspace_end &&
-          length <= source_operation.workspace_end - begin,
-      source_operation.workspace_begin,
-      source_operation.workspace_end,
-      source_operation.arrays,
-      false,
-      {{0}}};
-  if (!previous.inherit) {
-    source_operation.scratch_exhausted = false;
-    source_operation.workspace = NULL;
-    source_operation.workspace_size = source_operation.scratch_used = 0;
-    source_operation.workspace_begin = begin;
-    source_operation.workspace_end = begin + length;
-    source_operation.arrays = (shell_source_array_index_t){0};
-  }
-  bool replace = buffer && size > sizeof(source_operation.scratch) &&
-                 buffer != source_operation.workspace;
-  previous.share_arrays = previous.inherit && !replace;
-  if (!previous.share_arrays && previous.arrays.prepared &&
-      !previous.arrays.entries)
-    memcpy(previous.inline_arrays, source_operation.inline_arrays,
-           sizeof(previous.inline_arrays));
-  if (replace) {
-    source_operation.workspace = buffer;
-    source_operation.workspace_size = size;
-    source_operation.scratch_used = 0;
-    source_operation.arrays = (shell_source_array_index_t){0};
-  }
-  return previous;
-}
-
-void shell_source_workspace_end(shell_source_workspace_scope_t previous) {
-  bool failed = source_operation.scratch_exhausted;
-  size_t size = source_operation.workspace_size;
-  shell_source_array_index_t arrays = source_operation.arrays;
-  source_operation.workspace = previous.buffer;
-  source_operation.workspace_size =
-      previous.share_arrays ? size : previous.size;
-  source_operation.scratch_used = previous.used;
-  source_operation.workspace_begin = previous.begin;
-  source_operation.workspace_end = previous.end;
-  source_operation.arrays = previous.share_arrays ? arrays : previous.arrays;
-  if (!previous.share_arrays && previous.arrays.prepared &&
-      !previous.arrays.entries)
-    memcpy(source_operation.inline_arrays, previous.inline_arrays,
-           sizeof(previous.inline_arrays));
-  source_operation.scratch_exhausted =
-      previous.exhausted || (previous.inherit && failed);
-}
-
-size_t shell_source_scratch_mark(void) { return source_operation.scratch_used; }
-
-void *shell_source_scratch_take(size_t size) {
-  size_t capacity = source_operation.workspace
-                        ? source_operation.workspace_size
-                        : sizeof(source_operation.scratch);
-  if (size > capacity - source_operation.scratch_used) {
-    source_operation.scratch_exhausted = true;
-    return NULL;
-  }
-  unsigned char *base = source_operation.workspace ? source_operation.workspace
-                                                   : source_operation.scratch;
-  void *result = base + source_operation.scratch_used;
-  source_operation.scratch_used += size;
-  return result;
-}
-
-void shell_source_scratch_release(size_t mark) {
-  source_operation.scratch_used = mark;
-}
-
-bool shell_source_scratch_exhausted(void) {
-  return source_operation.scratch_exhausted ||
-         (source_operation.depth && !source_operation.index);
-}
-
-/* Reserve persistent facts from the arena's tail. Temporary delimiter marks
- * release only its front; they cannot overwrite the index while unwinding.
- * Counting and filling are two linear storage-preparation passes, not syntax
- * validation. Ordinary bracket data is deliberately allowed to overreserve. */
-static void source_array_index_prepare(void) {
-  shell_source_array_index_t *index = &source_operation.arrays;
-  if (index->prepared)
-    return;
-  index->prepared = true;
-  const char *source = (const char *)source_operation.workspace_begin;
-  size_t length =
-      source_operation.workspace_end - source_operation.workspace_begin;
-  /* Allocating adapters already measured this immutable view. Zero can mean
-   * unmeasured: a requested opening bracket proves the count is nonzero. */
-  size_t count = index->count;
-  if (!count) {
-    for (size_t i = 0; i < length; ++i) {
-      SHELL_SOURCE_WORD_SCAN(1);
-      count += source[i] == '[';
-    }
-  }
-  index->count = count;
-  shell_source_array_boundary_t *entries = source_operation.inline_arrays;
-  if (count > SHELL_SOURCE_INLINE_ARRAYS || source_operation.workspace) {
-    size_t capacity = source_operation.workspace_size;
-    size_t alignment = _Alignof(shell_source_array_boundary_t);
-    if (!source_operation.workspace || count > SIZE_MAX / sizeof(*entries))
-      goto exhausted;
-    size_t bytes = count * sizeof(*entries);
-    uintptr_t base = (uintptr_t)source_operation.workspace;
-    if (bytes > capacity)
-      goto exhausted;
-    uintptr_t at = (base + capacity - bytes) & ~(uintptr_t)(alignment - 1);
-    if (at < base || at - base < source_operation.scratch_used)
-      goto exhausted;
-    source_operation.workspace_size = at - base;
-    index->entries = entries = (shell_source_array_boundary_t *)at;
-  }
-  size_t entry = 0;
-  for (size_t i = 0; i < length; ++i) {
-    SHELL_SOURCE_WORD_SCAN(1);
-    if (source[i] == '[')
-      entries[entry++] =
-          (shell_source_array_boundary_t){.key = (uintptr_t)(source + i)};
-  }
-  return;
-exhausted:
-  source_operation.scratch_exhausted = true;
-}
-
-shell_source_array_boundary_t *
-shell_source_array_boundary(const char *opening) {
-  source_array_index_prepare();
-  if (source_operation.scratch_exhausted)
-    return NULL;
-  shell_source_array_index_t *index = &source_operation.arrays;
-  shell_source_array_boundary_t *entries =
-      index->entries ? index->entries : source_operation.inline_arrays;
-  uintptr_t key = (uintptr_t)opening;
-  size_t low = 0, high = index->count;
-  while (low < high) {
-    size_t mid = low + (high - low) / 2;
-    if (entries[mid].key < key)
-      low = mid + 1;
-    else
-      high = mid;
-  }
-  return &entries[low];
-}
-
-/* A public iterator can outlive one next() operation. Its supplied workspace
- * retains the same private facts between calls; no iterator/result grows to
- * own them. Small default iterations have at most eight bracket candidates,
- * so recreating their bounded inline index cannot cause quadratic work. */
-typedef struct {
-  shell_source_array_index_t arrays;
-  size_t scratch_size;
-} source_iterator_workspace_t;
-
-static SHELL_NONNULL(1) void source_iterator_workspace_save(
-    const shell_tokenizer_state_t *state) {
-  source_iterator_workspace_t saved = {source_operation.arrays,
-                                       source_operation.workspace_size};
-  if (!saved.arrays.entries)
-    saved.arrays = (shell_source_array_index_t){0};
-  memcpy((char *)state->workspace + state->workspace_size - sizeof(saved),
-         &saved, sizeof(saved));
-}
-
-shell_source_scope_t shell_source_scope_begin(const char *input,
-                                              size_t length) {
-  shell_source_scope_t previous = source_operation.scope;
-  source_operation.scope = (shell_source_scope_t){
-      (uintptr_t)input, (uintptr_t)input + length, (uintptr_t)input};
-  return previous;
-}
-
-void shell_source_scope_end(shell_source_scope_t previous) {
-  source_operation.scope = previous;
-}
-
-void shell_source_scope_frontier(const char *input, size_t position) {
-  /* A separate word-view iterator must not advance its enclosing body. This
-   * selects the scratch owner; it does not validate a source/parse contract. */
-  if (input && (uintptr_t)input == source_operation.scope.begin)
-    source_operation.scope.frontier = (uintptr_t)input + position;
-}
-
-static SHELL_NONNULL(1) bool source_operation_contains(const char *input,
-                                                       size_t length) {
-  uintptr_t begin = (uintptr_t)input;
-  return source_operation.depth != 0 && begin >= source_operation.begin &&
-         begin <= source_operation.end &&
-         length <= source_operation.end - begin;
-}
-
-static SHELL_NONNULL(1) source_index_entry_t *source_index_entry(
-    const char *input, size_t length, size_t position, unsigned kind) {
-  if (!source_operation.index || !source_operation_contains(input, length))
-    return NULL;
-  uintptr_t key = (uintptr_t)input + position;
-  size_t slot = ((key >> 3) ^ key ^ (kind * 31u)) % SHELL_SOURCE_INDEX_CAPACITY;
-  source_index_entry_t *available = NULL;
-  for (size_t probe = 0; probe < SHELL_SOURCE_INDEX_PROBES; probe++) {
-    source_index_entry_t *entry = &source_operation.index->entries[slot];
-    if (entry->generation != source_operation.generation)
-      return available ? available : entry;
-    if (entry->key == key && entry->kind == kind)
-      return entry;
-    uintptr_t after = entry->value;
-    /* Completed siblings and facts outside the current body must not crowd
-     * out its boundaries. Enclosing boundaries stay live while a child owns
-     * the scratch. Keep probing for an exact hit before reusing a slot,
-     * preserving collision chains. */
-    if (!available && (after < source_operation.scope.begin ||
-                       entry->key > source_operation.scope.end ||
-                       (entry->key >= source_operation.scope.begin &&
-                        after <= source_operation.scope.frontier)))
-      available = entry;
-    slot = (slot + 1) % SHELL_SOURCE_INDEX_CAPACITY;
-  }
-  return available;
-}
-
-bool shell_source_index_get(const char *input, size_t length, size_t position,
-                            unsigned kind, size_t *value, size_t *height) {
-  source_index_entry_t *entry =
-      source_index_entry(input, length, position, kind);
-  if (!entry || entry->generation != source_operation.generation ||
-      entry->key != (uintptr_t)input + position || entry->kind != kind)
-    return false;
-  *value = entry->value - (uintptr_t)input;
-  *height = entry->height;
-  return true;
-}
-
-void shell_source_index_put(const char *input, size_t length, size_t position,
-                            unsigned kind, size_t value, size_t height) {
-  source_index_entry_t *entry =
-      source_index_entry(input, length, position, kind);
-  if (!entry) {
-    if (!source_operation.index || !source_operation_contains(input, length))
-      return;
-    uintptr_t key = (uintptr_t)input + position;
-    size_t slot =
-        ((key >> 3) ^ key ^ (kind * 31u)) % SHELL_SOURCE_INDEX_CAPACITY;
-    entry = &source_operation.index->entries[slot];
-    size_t smallest = entry->value - entry->key;
-    for (size_t probe = 1; probe < SHELL_SOURCE_INDEX_PROBES; probe++) {
-      source_index_entry_t *candidate =
-          &source_operation.index
-               ->entries[(slot + probe) % SHELL_SOURCE_INDEX_CAPACITY];
-      size_t span = candidate->value - candidate->key;
-      if (span < smallest) {
-        entry = candidate;
-        smallest = span;
-      }
-    }
-    /* A short sibling must not evict an enclosing subtree boundary: losing
-     * that boundary causes its complete suffix to be visited at every level.
-     * Prefer the entries that avoid the largest source traversal. */
-    size_t span = value - position;
-    if (span < smallest)
-      return;
-  }
-  *entry = (source_index_entry_t){.key = (uintptr_t)input + position,
-                                  .value = (uintptr_t)input + value,
-                                  .kind = kind,
-                                  .height = height,
-                                  .generation = source_operation.generation};
-}
 
 static SHELL_NONNULL(1) bool arithmetic_has_unsupported_semantics(
     const char *input, size_t length);
@@ -443,52 +32,6 @@ static SHELL_NONNULL(1) bool unsupported_semantics_scan_impl(
  * nested-expansion chains reject as unsupported instead of consuming the C
  * stack. The limit matches Shellsplit's other structural capacities. */
 #define SHELL_STATIC_ARITHMETIC_MAX_NESTING SHELL_MAX_SUBCOMMANDS
-
-/* Source-byte admission is not word separation: CR, VT and FF are readable
- * text, but only space/tab/LF separate Bash words. Reject other control bytes,
- * DEL before exposing a partial stream. High bytes belong to ordinary word
- * literals, comments and scoped heredoc data, with byte offsets and no
- * decoding.
- */
-shell_source_status_t shell_source_bytes_status(const char *input,
-                                                size_t length) {
-  if (source_operation.bytes_prechecked &&
-      source_operation_contains(input, length))
-    return SHELL_SOURCE_COMPLETE;
-#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
-  shellsplit_test_metadata_charge(SHELLSPLIT_TEST_WORK_BYTE_VALIDATION_PASSES);
-#endif
-  bool high_bytes = false;
-  bool unsupported = false;
-  for (size_t i = 0; i < length; i++) {
-    SHELL_SOURCE_WORD_SCAN(1);
-#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
-    shellsplit_test_metadata_charge(SHELLSPLIT_TEST_WORK_BYTE_VALIDATION_BYTES);
-#endif
-    unsigned char byte = (unsigned char)input[i];
-    if (byte == '\0')
-      return SHELL_SOURCE_INVALID_INPUT;
-    unsupported |= (byte < 0x20 && !shell_ascii_space(byte)) || byte == 0x7F;
-    high_bytes |= byte >= 0x80;
-  }
-  if (unsupported)
-    return SHELL_SOURCE_UNSUPPORTED;
-  if (high_bytes) {
-    shell_source_status_t status =
-        shell_source_scoped_bytes_status(input, length);
-    if (status != SHELL_SOURCE_COMPLETE)
-      return status;
-  }
-  if (source_operation.depth != 0 &&
-      (uintptr_t)input == source_operation.begin &&
-      length == source_operation.end - source_operation.begin)
-    source_operation.bytes_prechecked = true;
-  return SHELL_SOURCE_COMPLETE;
-}
-
-bool shell_source_bytes_valid(const char *input, size_t length) {
-  return shell_source_bytes_status(input, length) == SHELL_SOURCE_COMPLETE;
-}
 
 /* Bash arithmetic accepts indexed and associative array references.  They do
  * not become ordinary scalar words merely because the outer lexer represents
@@ -1033,67 +576,43 @@ bool shell_tokenizer_init(shell_tokenizer_state_t *state, const char *input,
     state->workspace = limits->workspace;
     state->workspace_size = limits->workspace_size;
   }
-  shell_source_operation_begin(state->input, input_length);
-  bool independent = source_operation.depth == 1;
-  if (!independent ||
-      state->workspace_size <= sizeof(source_operation.scratch) +
-                                   sizeof(source_iterator_workspace_t)) {
-    state->workspace = NULL;
-    state->workspace_size = 0;
-  }
-  shell_source_workspace_scope_t previous = shell_source_workspace_begin(
-      state->input, input_length, state->workspace, state->workspace_size);
-  if (independent && state->workspace)
-    source_operation.workspace_size -= sizeof(source_iterator_workspace_t);
-  bool valid = !((!input && input_length != 0) ||
-                 !shell_source_bytes_valid(state->input, input_length));
-  valid = valid && !shell_source_scratch_exhausted();
-  if (independent && state->workspace)
-    source_iterator_workspace_save(state);
-  shell_source_workspace_end(previous);
-  shell_source_operation_end();
+  if (!input && input_length != 0)
+    return false;
+  shell_source_iterator_scope_t previous =
+      shell_source_iterator_begin(state->input, input_length, &state->workspace,
+                                  &state->workspace_size, true);
+  bool valid = shell_source_bytes_valid(state->input, input_length) &&
+               !shell_source_scratch_exhausted();
+  shell_source_iterator_end(previous, state->workspace, state->workspace_size);
   if (valid)
     state->length = input_length;
   return valid;
 }
 
-/* The forward lexical context calls this only at the start of an ordinary
- * logical word, after excluding redirect operands. Match through its complete
- * source boundary, not merely the current fragment's end. These counters
- * retain lexical control metadata; list grammar is validated separately. */
+/* The iterator supplies a whole-word start and its redirect role. Keyword
+ * identity and counter effects belong to the shared lexical classifier. */
 static SHELL_NONNULL(1, 2) void check_keyword(shell_tokenizer_state_t *state,
                                               const shell_token_t *token) {
-  const char *input = state->input;
-  size_t length = state->length, position = token->position;
-  if (shell_source_match_plain_word(input, length, position, "if", 2, NULL)) {
-    state->if_depth++;
-  } else if (shell_source_match_plain_word(input, length, position, "fi", 2,
-                                           NULL)) {
-    if (state->if_depth > 0)
-      state->if_depth--;
+  const shell_keyword_t *keyword =
+      shell_source_keyword(state->input, state->length, token->position, NULL);
+  if (!keyword)
+    return;
+  int *depth;
+  switch (keyword->depth) {
+  case SHELL_KEYWORD_DEPTH_CONDITIONAL:
+    depth = &state->if_depth;
+    break;
+  case SHELL_KEYWORD_DEPTH_LOOP:
+    depth = &state->loop_depth;
+    break;
+  case SHELL_KEYWORD_DEPTH_CASE:
+    depth = &state->case_depth;
+    break;
+  default:
+    return;
   }
-
-  if (shell_source_match_plain_word(input, length, position, "while", 5,
-                                    NULL) ||
-      shell_source_match_plain_word(input, length, position, "until", 5,
-                                    NULL) ||
-      shell_source_match_plain_word(input, length, position, "for", 3, NULL) ||
-      shell_source_match_plain_word(input, length, position, "select", 6,
-                                    NULL)) {
-    state->loop_depth++;
-  } else if (shell_source_match_plain_word(input, length, position, "done", 4,
-                                           NULL)) {
-    if (state->loop_depth > 0)
-      state->loop_depth--;
-  }
-
-  if (shell_source_match_plain_word(input, length, position, "case", 4, NULL)) {
-    state->case_depth++;
-  } else if (shell_source_match_plain_word(input, length, position, "esac", 4,
-                                           NULL)) {
-    if (state->case_depth > 0)
-      state->case_depth--;
-  }
+  if (keyword->delta > 0 || *depth > 0)
+    *depth += keyword->delta;
 }
 
 static bool is_shell_operator(char c) {
@@ -2301,18 +1820,9 @@ static bool shell_tokenizer_next_body(shell_tokenizer_state_t *state,
 
 bool shell_tokenizer_next(shell_tokenizer_state_t *state,
                           shell_token_t *token) {
-  shell_source_operation_begin(state->input, state->length);
-  shell_source_workspace_scope_t previous = shell_source_workspace_begin(
-      state->input, state->length, state->workspace, state->workspace_size);
-  bool independent = source_operation.depth == 1 && state->workspace;
-  if (independent) {
-    source_iterator_workspace_t saved;
-    memcpy(&saved,
-           (char *)state->workspace + state->workspace_size - sizeof(saved),
-           sizeof(saved));
-    source_operation.workspace_size = saved.scratch_size;
-    source_operation.arrays = saved.arrays;
-  }
+  shell_source_iterator_scope_t previous = shell_source_iterator_begin(
+      state->input, state->length, &state->workspace, &state->workspace_size,
+      false);
   bool found = shell_tokenizer_next_body(state, token);
   if (shell_source_scratch_exhausted()) {
     state->heredoc_error = true;
@@ -2321,10 +1831,7 @@ bool shell_tokenizer_next(shell_tokenizer_state_t *state,
     token->type = SHELL_TOKEN_END;
     found = false;
   }
-  if (independent)
-    source_iterator_workspace_save(state);
-  shell_source_workspace_end(previous);
-  shell_source_operation_end();
+  shell_source_iterator_end(previous, state->workspace, state->workspace_size);
   return found;
 }
 
@@ -2384,34 +1891,6 @@ typedef struct {
   bool case_selector_seen;
   bool misplaced_marker;
 } control_frame_state_t;
-
-/* Reserved words are matched after lexical line-continuation removal, but
- * unlike ordinary command names they cannot contain quotes or an ordinary
- * backslash escape.  `whi\\\nle` is therefore the `while` keyword, whereas
- * `wh\\ile` remains an executable named "while". */
-static bool token_is_logical_unquoted_word(const shell_token_t *token,
-                                           const char *word) {
-  if (!control_token_is_word(token) || !word)
-    return false;
-
-  size_t word_length = strlen(word);
-  size_t matched = 0;
-  for (size_t position = 0; position < token->length;) {
-    size_t continued = shell_source_skip_escaped_line_endings(
-        token->start, token->length, position);
-    if (continued != position) {
-      position = continued;
-      continue;
-    }
-    char c = token->start[position];
-    if (c == '\\' || c == '\'' || c == '"' || c == '`' ||
-        matched == word_length || c != word[matched])
-      return false;
-    matched++;
-    position++;
-  }
-  return matched == word_length;
-}
 
 static bool token_is_plain_word(const char *input, size_t input_length,
                                 const shell_token_t *token, const char *word) {
@@ -3447,8 +2926,7 @@ static SHELL_NONNULL(1) bool unsupported_semantics_scan_impl(
        * this forward semantic pass only needs the command-position keyword
        * or function introducer, not another descendant walk. */
       if (reserved_word_position &&
-          (shell_source_unsupported_keyword(input, input_length, token.position,
-                                            NULL) ||
+          (shell_source_keyword(input, input_length, token.position, NULL) ||
            control_token_starts_function_definition(&token, input,
                                                     input_length)))
         return true;
@@ -3732,13 +3210,29 @@ static SHELL_NONNULL(1) shell_control_syntax_t
   control_frame_state_t frames[SHELL_MAX_SUBCOMMANDS];
   size_t frame_count = 0;
   shell_token_t token;
-  while (shell_tokenizer_next(&state, &token)) {
+  for (;;) {
+    /* Capture the iterator's forward adjacency history before it publishes
+     * this token's end. A token can be just one fragment of a shell word. */
+    size_t preceding_word_end = state.lexical_operand_end;
+    if (!shell_tokenizer_next(&state, &token))
+      break;
     /* A continued physical line belongs to the surrounding lexical source
      * word. It cannot consume the command-start position between a function
      * name and its declarator. */
     if (shell_source_is_escaped_line_ending(input, token.position,
                                             token.position + token.length))
       continue;
+    bool continues =
+        preceding_word_end != 0 &&
+        shell_tokenizer_token_continues_word(&token, preceding_word_end);
+    /* Neither a suffix fragment nor a keyword-shaped prefix followed by an
+     * expansion is a reserved word. Use the original source boundary; token
+     * EOF is not word EOF. Keyword lookahead leaves nested bodies opaque. */
+    const shell_keyword_t *facts =
+        !continues && control_token_is_word(&token)
+            ? shell_source_keyword(input, input_length, token.position, NULL)
+            : NULL;
+    shell_keyword_kind_t keyword = facts ? facts->kind : SHELL_KEYWORD_NONE;
     /* Retain the connector's prefix eligibility across physical newlines,
      * exactly as in the unsupported-semantics stream above. */
     if (command_start && !pipeline_prefix.scanned &&
@@ -3796,8 +3290,7 @@ static SHELL_NONNULL(1) shell_control_syntax_t
         continue;
       }
       if (frame->type == CONTROL_FRAME_CASE && !frame->body_started &&
-          frame->case_selector_seen &&
-          token_is_logical_unquoted_word(&token, "in")) {
+          frame->case_selector_seen && keyword == SHELL_KEYWORD_IN) {
         frame->body_started = true;
         saw_control = true;
         continue;
@@ -3805,36 +3298,32 @@ static SHELL_NONNULL(1) shell_control_syntax_t
       if (!command_start) {
         if (!frame->body_started &&
             ((frame->type == CONTROL_FRAME_IF &&
-              (token_is_logical_unquoted_word(&token, "then") ||
-               token_is_logical_unquoted_word(&token, "elif") ||
-               token_is_logical_unquoted_word(&token, "else"))) ||
+              (keyword == SHELL_KEYWORD_THEN || keyword == SHELL_KEYWORD_ELIF ||
+               keyword == SHELL_KEYWORD_ELSE)) ||
              (frame->type == CONTROL_FRAME_LOOP &&
-              token_is_logical_unquoted_word(&token, "do"))))
+              keyword == SHELL_KEYWORD_DO)))
           frame->misplaced_marker = true;
         continue;
       }
       if (frame->type == CONTROL_FRAME_IF &&
-          (token_is_logical_unquoted_word(&token, "then") ||
-           token_is_logical_unquoted_word(&token, "elif") ||
-           token_is_logical_unquoted_word(&token, "else"))) {
+          (keyword == SHELL_KEYWORD_THEN || keyword == SHELL_KEYWORD_ELIF ||
+           keyword == SHELL_KEYWORD_ELSE)) {
         frame->body_started = true;
         frame->misplaced_marker = false;
         saw_control = true;
         continue;
       }
-      if (frame->type == CONTROL_FRAME_LOOP &&
-          token_is_logical_unquoted_word(&token, "do")) {
+      if (frame->type == CONTROL_FRAME_LOOP && keyword == SHELL_KEYWORD_DO) {
         frame->body_started = true;
         frame->misplaced_marker = false;
         saw_control = true;
         continue;
       }
-      if ((frame->type == CONTROL_FRAME_IF &&
-           token_is_logical_unquoted_word(&token, "fi")) ||
+      if ((frame->type == CONTROL_FRAME_IF && keyword == SHELL_KEYWORD_FI) ||
           (frame->type == CONTROL_FRAME_LOOP &&
-           token_is_logical_unquoted_word(&token, "done")) ||
+           keyword == SHELL_KEYWORD_DONE) ||
           (frame->type == CONTROL_FRAME_CASE &&
-           token_is_logical_unquoted_word(&token, "esac"))) {
+           keyword == SHELL_KEYWORD_ESAC)) {
         frame_count--;
         saw_control = true;
         continue;
@@ -3844,38 +3333,33 @@ static SHELL_NONNULL(1) shell_control_syntax_t
       continue;
 
     if (control_token_starts_function_definition(&token, input, input_length) ||
-        (token_is_logical_unquoted_word(&token, "function") &&
+        (keyword == SHELL_KEYWORD_FUNCTION &&
          control_function_keyword_has_name(&token, input, input_length)))
       return SHELL_CONTROL_SYNTAX_COMPLETE;
 
     control_frame_t frame;
     bool push_frame = false;
-    if (token_is_logical_unquoted_word(&token, "if")) {
+    if (keyword == SHELL_KEYWORD_IF) {
       frame = CONTROL_FRAME_IF;
       push_frame = true;
-    } else if (token_is_logical_unquoted_word(&token, "while") ||
-               token_is_logical_unquoted_word(&token, "until") ||
-               token_is_logical_unquoted_word(&token, "for") ||
-               token_is_logical_unquoted_word(&token, "select")) {
+    } else if (keyword == SHELL_KEYWORD_WHILE ||
+               keyword == SHELL_KEYWORD_UNTIL || keyword == SHELL_KEYWORD_FOR ||
+               keyword == SHELL_KEYWORD_SELECT) {
       frame = CONTROL_FRAME_LOOP;
       push_frame = true;
-    } else if (token_is_logical_unquoted_word(&token, "coproc")) {
+    } else if (keyword == SHELL_KEYWORD_COPROC) {
       /* Bash coprocesses introduce a concurrently executing command and a
        * pair of implicit descriptors.  The semantic command model does not
        * represent either yet, so reject them explicitly rather than treating
        * `coproc` as an ordinary executable name. */
       return SHELL_CONTROL_SYNTAX_COMPLETE;
-    } else if (token_is_logical_unquoted_word(&token, "case")) {
+    } else if (keyword == SHELL_KEYWORD_CASE) {
       frame = CONTROL_FRAME_CASE;
       push_frame = true;
-    } else if (token_is_logical_unquoted_word(&token, "then") ||
-               token_is_logical_unquoted_word(&token, "elif") ||
-               token_is_logical_unquoted_word(&token, "else") ||
-               token_is_logical_unquoted_word(&token, "fi") ||
-               token_is_logical_unquoted_word(&token, "do") ||
-               token_is_logical_unquoted_word(&token, "done") ||
-               token_is_logical_unquoted_word(&token, "in") ||
-               token_is_logical_unquoted_word(&token, "esac")) {
+    } else if (keyword == SHELL_KEYWORD_THEN || keyword == SHELL_KEYWORD_ELIF ||
+               keyword == SHELL_KEYWORD_ELSE || keyword == SHELL_KEYWORD_FI ||
+               keyword == SHELL_KEYWORD_DO || keyword == SHELL_KEYWORD_DONE ||
+               keyword == SHELL_KEYWORD_IN || keyword == SHELL_KEYWORD_ESAC) {
       return SHELL_CONTROL_SYNTAX_INCOMPLETE;
     }
 
@@ -3904,8 +3388,8 @@ static SHELL_NONNULL(1) shell_control_syntax_t
 
 /* Shellsplit does not model control-flow execution. Use the full lexical
  * tokenizer instead of raw source scans so words in comments, quoted text,
- * escapes, redirect operands, and ordinary argument positions are not
- * mistaken for reserved control words. */
+ * escapes, redirect operands, adjacent word fragments, and ordinary argument
+ * positions are not mistaken for reserved control words. */
 shell_control_syntax_t shell_tokenizer_control_syntax(const char *input,
                                                       size_t input_length) {
   if (!input)
@@ -4432,11 +3916,10 @@ static SHELL_NONNULL(1) bool shell_tokenizer_list_syntax_valid_body(
     if (draft && !literal_token && state.needs_stage &&
         token_starts_bash_compound_command(&token, input, input_length)) {
       size_t word_end;
-      bool pending_keyword =
-          can_append &&
-          shell_source_unsupported_keyword(input, input_length, token.position,
-                                           &word_end) &&
-          word_end == input_length;
+      bool pending_keyword = can_append &&
+                             shell_source_keyword(input, input_length,
+                                                  token.position, &word_end) &&
+                             word_end == input_length;
       if (!pending_keyword) {
         draft->failure = SHELL_SOURCE_UNSUPPORTED;
         return false;
@@ -4737,8 +4220,8 @@ static SHELL_NONNULL(1) bool shell_tokenizer_list_syntax_valid_body(
     if (draft && !literal_token && state.needs_stage &&
         !full_token_is_redirection(&token)) {
       size_t word_end;
-      if (shell_source_unsupported_keyword(input, input_length, token.position,
-                                           &word_end)) {
+      if (shell_source_keyword(input, input_length, token.position,
+                               &word_end)) {
         if (word_end != input_length || !can_append) {
           draft->failure = SHELL_SOURCE_UNSUPPORTED;
           return false;

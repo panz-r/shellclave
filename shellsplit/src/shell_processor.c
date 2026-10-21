@@ -4,6 +4,7 @@
 #include "shell_netstring.h"
 #include "shell_pipeline_internal.h"
 #include "shell_processor_internal.h"
+#include "shell_source_admission_internal.h"
 #include "shell_source_internal.h"
 #include "shell_tokenizer_full.h"
 #include "shell_tokenizer_full_internal.h"

@@ -73,6 +73,38 @@ and applicable migration notes. Keep each commit self-contained, including
 transitive fixes and adaptations, and report precise verification results in
 the pull request.
 
+## Shellsplit frontend ownership
+
+Shared source operations, scratch storage, lexical indexes, and iterator
+workspace lifetimes belong to `shell_source_runtime.c` and its private header.
+Runtime-only consumers include that header rather than the recursive scanner.
+The runtime keeps the operation state private; tokenizers use its iterator
+scopes instead of accessing storage fields.
+
+Source-byte admission belongs to `shell_source_admission.c`. It owns both the
+whole-source byte check and scoped admission of words, comments, substitutions,
+and heredocs. Retained draft collection remains in `shell_source.c`; lexical
+iteration and list grammar retain their own responsibilities.
+
+`shell_keywords.c` defines keyword spellings and classification facts once.
+Its consumers separately interpret grammar eligibility, feature presence, and
+nesting counters. Keep the spelling table sorted and preserve those different
+projections when extending it. Small continuation, punctuation, and word-boundary
+primitives belong to `shell_source_lexical_internal.h`; scan instrumentation
+belongs to its own private header. Recursive expansion scanners remain in
+`shell_source_internal.h` with their existing nesting accounting.
+
+Keyword callers establish a whole-word start using forward lexical history
+and supply a source view covering any adjacent fragments. A token boundary
+alone is insufficient: `fi$(printf x)` is one ordinary word. Reuse the
+iterator's adjacency facts and the classifier's bounded lookahead; do not
+walk expansion bodies again to establish reserved-word eligibility.
+
+Keep these interfaces private and document caller preconditions on them.
+Changes to one responsibility should update its owner and the consumer
+projections that actually need different behavior. Preserve public result
+layouts, resource contracts, and byte offsets during source reorganization.
+
 ## Hardening and fuzzing
 
 These commands use the reference path prepared in the development build above.

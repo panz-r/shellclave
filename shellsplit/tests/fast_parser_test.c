@@ -1,6 +1,7 @@
 #include "../src/shell_pipeline_internal.h"
 #include "../src/shell_source_internal.h"
 #include "../src/shell_tokenizer_full_internal.h"
+#include "control_word_cases.h"
 #include "depgraph_test_workspace.h"
 #include "shell_abstract.h"
 #include "shell_depgraph.h"
@@ -225,6 +226,41 @@ static void test_control_word_boundaries(void) {
   }
   test("Control spellings use complete words in all range modes", valid);
 
+  valid = true;
+  for (size_t i = 0; i < sizeof(shellsplit_test_control_word_fragments) /
+                             sizeof(shellsplit_test_control_word_fragments[0]);
+       i++) {
+    const char *source = shellsplit_test_control_word_fragments[i].source;
+    for (unsigned strict = 0; strict < 2; strict++) {
+      shell_limits_t limits = SHELL_LIMITS_DEFAULT;
+      limits.strict_mode = strict != 0;
+      shell_parse_result_t parsed;
+      bool item = shell_parse_fast(source, strlen(source), &limits, &parsed) ==
+                  SHELL_OK;
+      uint32_t features = 0;
+      for (uint32_t c = 0; c < parsed.count; c++)
+        features |= parsed.cmds[c].features;
+      item &= (features & controls) ==
+              shellsplit_test_control_word_fragments[i].range_control_features;
+      if (!item)
+        fprintf(stderr, "control fragment range: strict=%u source=%s\n", strict,
+                source);
+      valid = item && valid;
+    }
+    shell_command_t *commands = NULL;
+    size_t count = 0;
+    bool item = shell_tokenize_commands(source, strlen(source), &commands,
+                                        &count) == SHELL_TOKENIZE_OK;
+    for (size_t c = 0; c < count; c++)
+      item &= !commands[c].has_conditionals && !commands[c].has_loops &&
+              !commands[c].has_case;
+    shell_commands_free(commands, count);
+    if (!item)
+      fprintf(stderr, "control fragment tokens: source=%s\n", source);
+    valid = item && valid;
+  }
+  test("Keyword-shaped command fragments remain ordinary words", valid);
+
   static const struct {
     const char *source;
     uint32_t expected;
@@ -233,6 +269,10 @@ static void test_control_word_boundaries(void) {
       {"while false; do :; done", SHELL_FEAT_LOOPS},
       {"case x in x) :;; esac", SHELL_FEAT_CASE},
       {"printf %s if", SHELL_FEAT_CONDITIONALS},
+      {"printf %s then elif else", SHELL_FEAT_CONDITIONALS},
+      {"printf %s do done", 0},
+      {"printf %s coproc function", 0},
+      {"printf %s 'select' select\"\"", 0},
       {"printf %s whi\\\nle", SHELL_FEAT_LOOPS},
       {"echo \"$(if true; then :; fi)\"", SHELL_FEAT_CONDITIONALS},
       {"echo ${v:-$(while false; do :; done)}", SHELL_FEAT_LOOPS},

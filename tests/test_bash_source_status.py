@@ -90,6 +90,23 @@ class SourceStatusContract(unittest.TestCase):
                 self.assertEqual(self.syntax(source), 0)
                 self.assertEqual(self.classify(source), expected)
 
+    def test_keyword_fragments_are_ordinary_words(self):
+        cases = [
+            b"fi$(printf x)", b"if$(printf x) then",
+            b"then<(printf x)", b"done>(printf x)",
+            b"esac`printf x`", b"fi$((1))", b"$(printf x)fi",
+            b"<(printf x)done", b"`printf x`else",
+            b"f\\\ni\\\n$(printf x)", b"$(printf x)\\\nfi",
+            b"time -p fi$(printf x)", b"! fi$(printf x) | cat",
+            b"true && fi$(printf x)", b"{ fi$(printf x); }",
+            b"( fi$(printf x) )", b"cat >fi$(printf x)",
+            b"echo $(fi$(printf x))",
+        ]
+        for source in cases:
+            with self.subTest(source=source):
+                self.assertEqual(self.syntax(source), 0)
+                self.assertEqual(self.classify(source), 0)
+
     def test_comment_byte_domains(self):
         payloads = ["日本 if while case $(false) >phantom <<MISSING ' \"".encode(),
                     bytes(range(128, 256)),

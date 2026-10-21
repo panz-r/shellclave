@@ -109,9 +109,12 @@ set(SHELLSPLIT_SOURCES
   shellsplit/src/shell_expand.c
   shellsplit/src/shell_heredoc.c
   shellsplit/src/shell_interop.c
+  shellsplit/src/shell_keywords.c
   shellsplit/src/shell_netstring.c
   shellsplit/src/shell_processor.c
   shellsplit/src/shell_source.c
+  shellsplit/src/shell_source_admission.c
+  shellsplit/src/shell_source_runtime.c
   shellsplit/src/shell_tokenizer.c
   shellsplit/src/shell_tokenizer_full.c
   shellsplit/src/shell_transform.c)

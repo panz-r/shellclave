@@ -2,7 +2,9 @@
 
 #include "../../shellgate/src/sg_io.h"
 #include "../../shellsplit/src/shell_depgraph_internal.h"
+#include "../../shellsplit/src/shell_keywords_internal.h"
 #include "../../shellsplit/src/shell_pipeline_internal.h"
+#include "../../shellsplit/src/shell_source_admission_internal.h"
 #include "../../shellsplit/src/shell_source_internal.h"
 #include "../../shellsplit/src/shell_tokenizer_full_internal.h"
 #include "../../shelltype/src/io.h"
@@ -539,6 +541,20 @@ void pointer_contracts(sg_gate_t *gate, st_policy_t *policy) {
   (void)shell_ascii_equal_ci(NULL, "x", 1);
 #elif TEST_BAD == 191
   (void)shell_ascii_equal_ci("x", NULL, 1);
+#elif TEST_BAD == 192
+  (void)shell_source_keyword(NULL, 0, 0, NULL);
+#elif TEST_BAD == 193
+  void *workspace = NULL;
+  (void)shell_source_iterator_begin(NULL, 0, &workspace, &start, true);
+#elif TEST_BAD == 194
+  (void)shell_source_iterator_begin("", 0, NULL, &start, true);
+#elif TEST_BAD == 195
+  void *workspace = NULL;
+  (void)shell_source_iterator_begin("", 0, &workspace, NULL, true);
+#elif TEST_BAD == 196
+  (void)shell_source_operation_bytes_admitted(NULL, 0);
+#elif TEST_BAD == 197
+  shell_source_operation_note_admitted(NULL, 0);
 #else
   /* These NULL values have API meanings and must stay accepted. */
   (void)shell_netstring_iter_init(&iter, NULL, 0);
@@ -558,6 +574,13 @@ void pointer_contracts(sg_gate_t *gate, st_policy_t *policy) {
   (void)shell_source_skip_extglob(NULL, 0, 0, &after);
   (void)shell_tokenizer_token_continues_word(&token, 0);
   (void)shell_source_bytes_valid("", 0);
+  (void)shell_source_keyword("", 0, 0, NULL);
+  void *source_workspace = NULL;
+  size_t source_workspace_size = 0;
+  shell_source_iterator_scope_t source_scope = shell_source_iterator_begin(
+      "", 0, &source_workspace, &source_workspace_size, true);
+  shell_source_iterator_end(source_scope, source_workspace,
+                            source_workspace_size);
   shell_source_decoded_assignment_t assignment;
   (void)shell_source_scan_decoded_assignment("x=y", 3, NULL, NULL, &assignment);
   (void)shell_source_match_plain_word("time", 4, 0, "time", 4, NULL);

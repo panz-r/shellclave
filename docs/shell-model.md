@@ -45,6 +45,13 @@ arithmetic text and document text do not supply outer control words.
 Executable substitutions are inspected in their own command context, including
 when nested in those data operands.
 
+Grammar recognition also requires an eligible, complete unquoted word before
+expansion. In `fi$(printf x)`, `fi` is a fragment of an ordinary command word,
+not a reserved closer; `$(printf x)fi` likewise has no standalone `fi` word.
+Substitution output cannot turn an ordinary word into a reserved word.
+This grammar role is distinct from lexical feature detection: `echo if` has
+a conditional feature flag, but its argument is not a reserved word.
+
 Supported composition includes simple commands, lists, `&&`, `||`, pipelines,
 `|&`, background execution, brace groups, parenthesized groups, negation, and
 pipeline timing. Redirection support includes files, combined output, heredocs,
