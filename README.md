@@ -166,8 +166,10 @@ unsupported semantics still cause rejection. Extglob requires executor startup
 configuration before Bash parses the command.
 
 Ordinary word content retains non-ASCII bytes in unquoted, escaped, and quoted
-fragments, including filenames. For example, `cat résumé.txt` and
-`printf '%s\n' 日本` are supported. Values and offsets remain byte-based, with
+fragments, including ANSI-C quotes and filenames. For example, `cat résumé.txt`
+and `printf '%s\n' $'日本\t語'` are supported. ANSI-C quotes preserve literal
+bytes alongside supported escapes; `\u` and `\U` escapes producing non-ASCII
+values remain unsupported. Values and offsets remain byte-based, with
 no UTF-8 validation or normalization. Analysis and token classification use
 fixed byte rules, independent of the application's locale. The executor uses a
 fixed C/POSIX or UTF-8 locale, established through the

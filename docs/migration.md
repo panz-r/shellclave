@@ -18,10 +18,30 @@ Both `printf '%s' 日本` and `printf '%s' '日本'` are COMPLETE and available 
 semantic consumers. Canonical values and source offsets preserve exact bytes.
 Parameter default and pattern operands admit the same literal data; variable
 names, arithmetic and subscripts retain their restricted code domains.
-Raw high bytes in active ANSI-C quotes remain UNSUPPORTED.
-Previously unsupported sources now reach the normal grammar and semantic
-checks. For example, `printf 日本\ncat <<\n` is INVALID rather than
-UNSUPPORTED because the later heredoc declaration has no delimiter.
+ANSI-C fragments now admit the same literal bytes, including `$'日本\t語'`,
+with existing escape decoding. Non-ASCII Unicode escapes and decoded NUL keep
+their complete-command semantic restrictions; arithmetic and selectors keep
+their restricted code domains. Incomplete quotes retain draft recovery and
+original offsets. Newly admitted words proceed through the ordinary grammar
+and semantic checks. For example, `printf $'日本'\ncat <<\n` is INVALID rather
+than UNSUPPORTED because the later heredoc declaration has no delimiter.
+
+ANSI-C encoded-syntax checks now share escape decoding with canonical words
+and heredoc delimiters. Wrapped octal bytes such as `\444` (`$`) and `\540`
+(backtick) return UNSUPPORTED when they introduce decoded syntax in parameter
+operands; semantic graph consumers reject those sources. Previously, such
+inputs could produce successful graphs missing the nested commands. Ordinary
+ANSI-C literal words retain their exact decoded bytes. Backslash runs in these
+parameter operands are scanned in linear work, including before raw command
+substitutions.
+
+ANSI-C control escapes now consume doubled backslash operands correctly and
+preserve apostrophes protected by the consumed backslash. For example,
+`$'日本\c\\X'` decodes to Japanese bytes followed by `0x1c` and `X`, without
+an extra backslash; `$'日本\c\'X'` preserves the apostrophe before `X`.
+This corrects canonical argument bytes and shared heredoc delimiter
+normalization. Public interfaces and source-admission restrictions are
+unchanged.
 
 Control-feature detection now uses complete lexical words. Ordinary words such
 as `日本.if`, `日本''if`, `x-while` and `/tmp/in` no longer trigger false

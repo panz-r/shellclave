@@ -191,8 +191,10 @@ typedef struct shell_source_result {
  * from a complete or invalid source. Retain complete top-level list units
  * before an unfinished tail, excluding every pending heredoc body from command
  * syntax. Comments and ordinary literal word fragments, unquoted, escaped or
- * quoted, admit high bytes without encoding validation or normalization. A
- * comment ends at raw LF or EOF; its bytes do not supply tokens or expansions.
+ * quoted (including ANSI-C), admit high bytes without encoding validation or
+ * normalization. ANSI-C escape decoding retains its separate semantic
+ * restrictions. A comment ends at raw LF or EOF; its bytes do not supply
+ * tokens or expansions.
  * The whole-source NUL, prohibited control-byte and DEL checks still apply.
  * Parameter operands inherit the word data domain and their applicable quote
  * context. Executable children establish independent word contexts;

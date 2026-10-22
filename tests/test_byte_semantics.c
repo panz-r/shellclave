@@ -86,6 +86,40 @@ static void word_literals(void) {
           record.payload_length == (size_t)encoded &&
           !memcmp(record.payload, expected, (size_t)encoded));
     CHECK(shell_netstring_iter_next(&records, &record) == SHELL_NETSTRING_DONE);
+    char decoded[256];
+    size_t measured, written;
+    CHECK(shell_measure_decoded_word(word, strlen(word), &measured) ==
+              SHELL_PROCESS_OK &&
+          measured == strlen(value));
+    CHECK(shell_write_decoded_word(word, strlen(word), decoded, sizeof(decoded),
+                                   &written) == SHELL_PROCESS_OK &&
+          written == measured && !memcmp(decoded, value, written));
+    CHECK(measured &&
+          shell_write_decoded_word(word, strlen(word), decoded, measured - 1,
+                                   &written) == SHELL_PROCESS_EOUTPUT_LIMIT &&
+          !written);
+    shell_abstract_command_t *abstract = NULL;
+    CHECK(shell_abstract_command_parse(source, (size_t)length, &abstract) ==
+          SHELL_ABSTRACT_OK);
+    CHECK(!abstract->has_variables && !abstract->has_cmd_subst);
+    shell_abstract_command_free(abstract);
+    shell_transformed_command_t **transformed = NULL;
+    CHECK(shell_transform_command_line(source, (size_t)length, NULL,
+                                       &transformed,
+                                       &count) == SHELL_TRANSFORM_OK);
+    CHECK(count == 1 && transformed[0]->token_count >= 3 &&
+          !strcmp(transformed[0]->original_command, source));
+    /* Diagnostic tokens retain lexical fragments, not canonical argv words. */
+    size_t offset = 0;
+    for (size_t t = 2; t < transformed[0]->token_count; t++) {
+      const char *fragment = transformed[0]->tokens[t].original;
+      size_t size = strlen(fragment);
+      CHECK(size <= strlen(word) - offset &&
+            !memcmp(fragment, word + offset, size));
+      offset += size;
+    }
+    CHECK(offset == strlen(word));
+    shell_transformed_command_list_free(transformed, count);
     printf("word[%zu]=%s\n", i, expected);
     shell_netstring_buffer_free(&sequence);
   }
@@ -123,6 +157,9 @@ static void quoted_lists(void) {
       {"printf pre'é\\'\".txt\"; cat file; printf 'a\\'",
        3,
        {"preé\\.txt", "file", "a\\"}},
+      {"printf $'日本\\t語'; cat $'résumé.txt'; printf $'é\\\\'",
+       3,
+       {"日本\t語", "résumé.txt", "é\\"}},
   };
   shell_limits_t strict = SHELL_LIMITS_DEFAULT;
   strict.strict_mode = true;
@@ -236,6 +273,11 @@ static void invalid_read_targets(void) {
       "read -n\xe9 value <<<payload && printf wrong >unexpected || printf "
       "fallback",
       "exec {fd}>/dev/null; read \xe9 IFS fd <<<payload; printf data >&$fd",
+      "read $'\xe9' fd <<<payload && printf wrong >unexpected || printf "
+      "fallback",
+      "read -n$'\xe9' value <<<payload && printf wrong >unexpected || printf "
+      "fallback",
+      "exec {fd}>/dev/null; read $'\xe9' IFS fd <<<payload; printf data >&$fd",
   };
   for (size_t c = 0; c < sizeof(sources) / sizeof(sources[0]); ++c) {
     const char *source = sources[c];
@@ -309,6 +351,8 @@ static void classification_and_policy(void) {
   } cases[] = {
       {"printf '\xe9'", SG_VERDICT_ALLOW},
       {"printf \xe9", SG_VERDICT_ALLOW},
+      {"printf $'\xe9'", SG_VERDICT_ALLOW},
+      {"printf $'\xe8'", SG_VERDICT_UNDETERMINED},
       {"printf \xe9 # 日本 if while case $(false) >phantom", SG_VERDICT_ALLOW},
       {"# \x80\xff\n printf '\xe9'", SG_VERDICT_ALLOW},
       {"# 日本 if while case", SG_VERDICT_ALLOW},
@@ -321,6 +365,7 @@ static void classification_and_policy(void) {
       {"echo 日本''if", SG_VERDICT_ALLOW},
       {"echo 日本.if", SG_VERDICT_ALLOW},
       {"echo '日本.if'", SG_VERDICT_ALLOW},
+      {"echo $'日本.if'", SG_VERDICT_ALLOW},
       {"echo 日本-while", SG_VERDICT_ALLOW},
       {"echo 日本.in", SG_VERDICT_ALLOW},
   };

@@ -50,6 +50,8 @@ static void heredoc_failure_domains(void) {
       {"cat <<; cat <<'Q'\né\nQ\n", SHELL_SOURCE_INVALID},
       {"cat <<$\"END\"\npayload\nEND\n", SHELL_SOURCE_UNSUPPORTED},
       {"cat <<\nprintf é", SHELL_SOURCE_INVALID},
+      {"cat <<\nprintf $'é'", SHELL_SOURCE_INVALID},
+      {"cat <<\nprintf $((é))", SHELL_SOURCE_UNSUPPORTED},
   };
   for (size_t b = 0; b < sizeof(bodies) / sizeof(bodies[0]); ++b)
     for (size_t d = 0; d < sizeof(delimiters) / sizeof(delimiters[0]); ++d) {
@@ -215,7 +217,7 @@ int main(int argc, char **argv) {
       {"printf '%s' '日本'", SHELL_SOURCE_COMPLETE},
       {"echo $(printf '%s' '日本')", SHELL_SOURCE_COMPLETE},
       {"printf '%s' 日本", SHELL_SOURCE_COMPLETE},
-      {"printf '%s' $'日本'", SHELL_SOURCE_UNSUPPORTED},
+      {"printf '%s' $'日本'", SHELL_SOURCE_COMPLETE},
       {"printf '\001'", SHELL_SOURCE_UNSUPPORTED},
       {"printf '\177'", SHELL_SOURCE_UNSUPPORTED},
       {"if true; then :; fi", SHELL_SOURCE_UNSUPPORTED},

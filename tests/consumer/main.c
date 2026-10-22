@@ -261,12 +261,15 @@ static bool check_depgraph_workspace_api(void) {
     if (ok) {
       static const char quoted[] = "printf '%s' '日本'";
       static const char unquoted[] = "printf '%s' 日本";
-      static const char unsupported[] = "printf '%s' $'日本'";
+      static const char ansi[] = "printf '%s' $'日本'";
+      static const char unsupported[] = "if true; then :; fi";
       static const char malformed[] = "cat <<\n";
       static const char nul[] = "echo\0x";
       ok = shell_parse_draft(quoted, sizeof(quoted) - 1, NULL, draft) ==
                SHELL_SOURCE_COMPLETE &&
            shell_parse_draft(unquoted, sizeof(unquoted) - 1, NULL, draft) ==
+               SHELL_SOURCE_COMPLETE &&
+           shell_parse_draft(ansi, sizeof(ansi) - 1, NULL, draft) ==
                SHELL_SOURCE_COMPLETE &&
            shell_parse_draft(unsupported, sizeof(unsupported) - 1, NULL,
                              draft) == SHELL_SOURCE_UNSUPPORTED &&

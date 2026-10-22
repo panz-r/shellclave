@@ -1,5 +1,6 @@
 #include "../src/shell_depgraph_internal.h"
 #include "../src/shell_source_internal.h"
+#include "ansi_parameter_cases.h"
 #include "control_word_cases.h"
 #include "shell_abstract.h"
 #include "shell_sequence.h"
@@ -338,8 +339,8 @@ static void recovery(void) {
       {"cat >\nfile", SHELL_SOURCE_INVALID},
       {"cat )", SHELL_SOURCE_INVALID},
       {"cat | | echo", SHELL_SOURCE_INVALID},
-      {"echo $'日本'", SHELL_SOURCE_UNSUPPORTED},
-      {"cat <<EOF\n$(echo $'日本')\nEOF\n", SHELL_SOURCE_UNSUPPORTED},
+      {"echo $((日本))", SHELL_SOURCE_UNSUPPORTED},
+      {"cat <<EOF\n$(echo $((日本)))\nEOF\n", SHELL_SOURCE_UNSUPPORTED},
       {"({ echo; ) &&", SHELL_SOURCE_INVALID},
       {"echo $(echo &&) &&", SHELL_SOURCE_INVALID},
       {"echo ${bad!} &&", SHELL_SOURCE_UNSUPPORTED}};
@@ -1201,14 +1202,14 @@ static void word_byte_source(void) {
       {"printf 日本 # 日本", SHELL_SOURCE_COMPLETE},
       {"printf 日本\ncat <<\n", SHELL_SOURCE_INVALID},
       {"printf 日本 &&", SHELL_SOURCE_INCOMPLETE},
-      {"printf $'日本'", SHELL_SOURCE_UNSUPPORTED},
+      {"printf $'日本'", SHELL_SOURCE_COMPLETE},
       {"printf 日本$'ascii", SHELL_SOURCE_INCOMPLETE},
       /* A standalone unfinished quote is classified by lexical framing;
        * INCOMPLETE does not promise supported semantics after completion. */
       {"printf 日本$'é", SHELL_SOURCE_INCOMPLETE},
       {"printf \"${v:-日本$'ascii", SHELL_SOURCE_INCOMPLETE},
-      {"printf \"${v:-日本$'é", SHELL_SOURCE_UNSUPPORTED},
-      {"printf \"${v:-$'日本'}\"", SHELL_SOURCE_UNSUPPORTED},
+      {"printf \"${v:-日本$'é", SHELL_SOURCE_INCOMPLETE},
+      {"printf \"${v:-$'日本'}\"", SHELL_SOURCE_COMPLETE},
       {"printf \"${v:-$'x'}日本\"", SHELL_SOURCE_COMPLETE},
       {"printf '\001'", SHELL_SOURCE_UNSUPPORTED},
       {"printf '\177'", SHELL_SOURCE_UNSUPPORTED},
@@ -1242,6 +1243,189 @@ static void word_byte_source(void) {
         SHELL_SOURCE_INCOMPLETE);
   CHECK(draft.prefix_length == strlen("printf '日本'\n") &&
         draft.need == SHELL_SOURCE_NEEDS_QUOTE);
+}
+
+static void ansi_byte_source(void) {
+  static const struct {
+    const char *source;
+    unsigned commands, substitutions;
+  } cases[] = {
+      {"$'日本' argument", 1, 0},
+      {"name=$'日本'", 1, 0},
+      {"name=$'日本' printf ok", 1, 0},
+      {"printf %s ${v:-$'日本'}", 1, 0},
+      {"printf %s \"${v:-$'日本$(printf child)'}\"", 2, 1},
+      {"printf %s $'日本$(printf phantom)`printf phantom`'", 1, 0},
+      {"printf %s \"$(printf %s $'日本')\"", 2, 1},
+      {"cat < <(printf %s $'日本')", 2, 1},
+      {"printf %s `printf %s $'日本'`", 2, 1},
+      {"cat <<< $'日本\\t語'", 1, 0},
+      {"cat <<$'日本'\npayload\n日本\n", 1, 0},
+      {"cat <<$'日\\444'\npayload\n日$\n", 1, 0},
+      {"printf %s \"${v:-$'\\444'}\"", 1, 0},
+      {"printf %s \"${v:-$'\\474'}\"", 1, 0},
+      {"printf %s \"${v:-$'\\450'}\"", 1, 0},
+      {"printf %s \"${v:-$\\\n'\\444'}\"", 1, 0},
+  };
+  for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+    const char *source = cases[c].source;
+    CHECK(shell_parse_draft(source, strlen(source), NULL, &draft) ==
+          SHELL_SOURCE_COMPLETE);
+    CHECK(draft.prefix_length == strlen(source));
+    const char *child = strstr(source, "printf child");
+    if (child) {
+      CHECK(draft.header_count == 2 && draft.headers[1].word_count == 2);
+      CHECK(draft.headers[1].words[0].start == (size_t)(child - source) &&
+            draft.headers[1].words[0].length == strlen("printf"));
+    }
+    CHECK(shell_dep_graph_parse_with_fast(source, strlen(source), "/workspace",
+                                          &limits, &draft.prefix,
+                                          &graph) == SHELL_DEP_OK);
+    CHECK(shell_dep_graph_validate(&graph).valid);
+    parse(source);
+    unsigned commands = 0, substitutions = 0;
+    for (uint32_t n = 0; n < graph.node_count; n++)
+      commands += graph.nodes[n].type == SHELL_NODE_CMD;
+    for (uint32_t e = 0; e < graph.edge_count; e++)
+      substitutions += graph.edges[e].type == SHELL_EDGE_SUBST;
+    if (commands != cases[c].commands ||
+        substitutions != cases[c].substitutions)
+      fprintf(stderr, "ANSI-C graph commands=%u substitutions=%u: %s\n",
+              commands, substitutions, source);
+    CHECK(commands == cases[c].commands &&
+          substitutions == cases[c].substitutions);
+  }
+  static const char *const restricted[] = {
+      "printf $(( $'日本' ))",
+      "printf ${v:$'日本'}",
+      "printf ${v[$'日本']}",
+      "a[$'日本']=x",
+  };
+  for (size_t c = 0; c < sizeof(restricted) / sizeof(restricted[0]); c++) {
+    CHECK(shell_parse_draft(restricted[c], strlen(restricted[c]), NULL,
+                            &draft) == SHELL_SOURCE_UNSUPPORTED);
+    CHECK(!draft.prefix_length && !draft.prefix.count);
+  }
+  static const char *const unsupported[] = {
+      "printf $'日本\\0tail'",       "printf $'日本\\c\x80'",
+      "printf $'日本\\c\\'\\0tail'", "printf $'日本\\u65e5'",
+      "printf $'日本\\c\\'\\u65e5'", "printf $'日本\\U000065e5'",
+  };
+  for (size_t c = 0; c < sizeof(unsupported) / sizeof(unsupported[0]); c++) {
+    CHECK(shell_dep_graph_parse(unsupported[c], strlen(unsupported[c]),
+                                "/workspace", &limits,
+                                &graph) == SHELL_DEP_EPARSE);
+    CHECK(!graph.node_count && !graph.edge_count);
+  }
+  for (size_t c = 0; c < sizeof(shellsplit_test_ansi_encoded_cases) /
+                             sizeof(shellsplit_test_ansi_encoded_cases[0]);
+       ++c) {
+    const char *source = shellsplit_test_ansi_encoded_cases[c].source;
+    size_t length = strlen(source);
+    CHECK(shell_parse_draft(source, length, NULL, &draft) ==
+          SHELL_SOURCE_UNSUPPORTED);
+    CHECK(!draft.prefix_length && !draft.prefix.count);
+    shell_parse_result_t fast;
+    CHECK(shell_parse_fast(source, length, NULL, &fast) == SHELL_EPARSE &&
+          !fast.count);
+    shell_processed_commands_t processed = {0};
+    shell_process_status_t process_status =
+        shell_process_commands(source, length, NULL, &processed);
+    if (process_status != shellsplit_test_ansi_encoded_cases[c].process_status)
+      fprintf(stderr, "ANSI encoded source process status=%d: %s\n",
+              process_status, source);
+    CHECK(process_status ==
+          shellsplit_test_ansi_encoded_cases[c].process_status);
+    CHECK(!processed.commands && !processed.command_count);
+    shell_netstring_buffer_t commands = {0}, types = {0};
+    size_t stages = 0;
+    CHECK(shell_build_anomaly_netseqs_buffer(source, length, NULL, &commands,
+                                             &types, &stages) ==
+          shellsplit_test_ansi_encoded_cases[c].process_status);
+    CHECK(!commands.data && !types.data && !stages);
+    CHECK(shell_dep_graph_parse(source, length, "/workspace", &limits,
+                                &graph) == SHELL_DEP_EPARSE);
+    CHECK(!graph.node_count && !graph.edge_count);
+  }
+  static const char *const received[] = {
+      "printf before; printf $'日本\\t語'",
+      "printf before; printf \"${v:-$'日本'}\"",
+      "printf before; printf \"$(printf $'日本')\"",
+      "printf before; cat <<$'日本'\npayload\n日本\n",
+      "printf before; printf $'日本\\c\\\\'",
+      "printf before; printf $'日本\\c\\'X'",
+  };
+  for (size_t c = 0; c < sizeof(received) / sizeof(received[0]); c++) {
+    for (size_t cut = 0; cut <= strlen(received[c]); cut++) {
+      shell_source_status_t status =
+          shell_parse_draft(received[c], cut, NULL, &draft);
+      if (status != SHELL_SOURCE_COMPLETE && status != SHELL_SOURCE_INCOMPLETE)
+        fprintf(stderr, "ANSI-C cut=%zu status=%d: %.*s\n", cut, status,
+                (int)cut, received[c]);
+      CHECK(status == SHELL_SOURCE_COMPLETE ||
+            status == SHELL_SOURCE_INCOMPLETE);
+      if (draft.prefix_length) {
+        shell_parse_result_t fast;
+        shell_limits_t strict = SHELL_LIMITS_DEFAULT;
+        strict.strict_mode = true;
+        CHECK(shell_parse_fast(received[c], draft.prefix_length, &strict,
+                               &fast) == SHELL_OK);
+        CHECK(shellsplit_test_parse_equal(&fast, &draft.prefix));
+      }
+    }
+  }
+  static const char unfinished[] = "printf before; printf $'日本\\'";
+  CHECK(shell_parse_draft(unfinished, sizeof(unfinished) - 1, NULL, &draft) ==
+        SHELL_SOURCE_INCOMPLETE);
+  CHECK(draft.prefix_length == strlen("printf before;") &&
+        draft.need == SHELL_SOURCE_NEEDS_QUOTE);
+  static const char nul[] = "printf $'日本\0tail'";
+  CHECK(shell_parse_draft(nul, sizeof(nul) - 1, NULL, &draft) ==
+        SHELL_SOURCE_INVALID_INPUT);
+}
+
+/* Delimiter normalization accepts decoded control bytes. A complete public
+ * source containing their raw closing-line spelling remains unsupported. */
+static void ansi_control_delimiters(void) {
+  static const struct {
+    const char *word, *delimiter;
+  } cases[] = {
+      {"$'\\c\\\\'", "\x1c"},
+      {"$'日本\\c\\\\'", "日本\x1c"},
+      {"$'日本\\c\\\\X'", "日本\x1cX"},
+      {"$'日本\\c\\'X'", "日本\x1c'X"},
+  };
+  for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); ++c) {
+    const char *word = cases[c].word;
+    size_t length = strlen(word), size;
+    CHECK(shell_source_workspace_size(length, &size));
+    void *scratch = malloc(size);
+    CHECK(scratch);
+    shell_source_operation_begin(word, length);
+    shell_source_workspace_scope_t previous =
+        shell_source_workspace_begin(word, length, scratch, size);
+    shell_source_pending_heredoc_t pending;
+    shell_source_heredoc_delimiter_t delimiter;
+    size_t position = 0;
+    CHECK(shell_source_probe_heredoc_delimiter(word, length, &position,
+                                               &pending) ==
+          SHELL_HEREDOC_WORD_COMPLETE);
+    CHECK(position == length &&
+          shell_source_prepare_heredoc(&pending, &delimiter));
+    CHECK(delimiter.quoted && delimiter.length == strlen(cases[c].delimiter) &&
+          !memcmp(delimiter.bytes, cases[c].delimiter, delimiter.length));
+    shell_source_workspace_end(previous);
+    shell_source_operation_end();
+    free(scratch);
+
+    char source[128];
+    int count = snprintf(source, sizeof(source), "cat <<%s\npayload\n%s\n",
+                         word, cases[c].delimiter);
+    CHECK(count > 0 && (size_t)count < sizeof(source));
+    CHECK(shell_parse_draft(source, (size_t)count, NULL, &draft) ==
+          SHELL_SOURCE_UNSUPPORTED);
+    CHECK(!draft.prefix_length && !draft.prefix.count);
+  }
 }
 
 static void comment_byte_source(void) {
@@ -1349,7 +1533,7 @@ static void comment_byte_source(void) {
       {"# 日本\nprintf ok && # 説明", SHELL_SOURCE_INCOMPLETE},
       {"# 日本\ncat <<\n", SHELL_SOURCE_INVALID},
       {"cat <<# 日本", SHELL_SOURCE_INVALID},
-      {"# 日本\nprintf $'日'", SHELL_SOURCE_UNSUPPORTED},
+      {"# 日本\nprintf $'日'", SHELL_SOURCE_COMPLETE},
       {"# 日本\nprintf $((日))", SHELL_SOURCE_UNSUPPORTED},
       {"# 日本\nprintf ${日}", SHELL_SOURCE_UNSUPPORTED},
       {"# 日本\nif true; then :; fi", SHELL_SOURCE_UNSUPPORTED},
@@ -1476,14 +1660,16 @@ static void comment_byte_work(void) {
 
 static void quoted_byte_work(void) {
 #ifdef SHELLSPLIT_TEST_SOURCE_SCANS
-  for (unsigned form = 0; form < 2; ++form) {
+  for (unsigned form = 0; form < 3; ++form) {
     for (unsigned operation = 0; operation < 4; ++operation) {
       size_t previous = 0, previous_length = 0;
       for (size_t count = 32; count <= 1024; count *= 2) {
         char source[8192] = "printf ";
         size_t length = 7;
         for (size_t i = 0; i < count; ++i) {
-          const char *fragment = form ? "\x80\\\n" : "'\x80\\'";
+          const char *fragment = form == 2 ? "$'\x80\\t'"
+                                 : form    ? "\x80\\\n"
+                                           : "'\x80\\'";
           size_t size = strlen(fragment);
           memcpy(source + length, fragment, size);
           length += size;
@@ -1521,6 +1707,105 @@ static void quoted_byte_work(void) {
 #endif
 }
 
+static void ansi_parameter_runs(void) {
+  for (unsigned data = 0; data < 2; ++data) {
+    for (unsigned form = 0; form < 3; ++form) {
+      for (unsigned residue = 0; residue < 4; ++residue) {
+        size_t previous[4] = {0};
+        for (size_t count = 32; count <= 1024; count *= 2) {
+          char source[8192] = "printf %s \"${v:-";
+          size_t ansi_start = strlen(source), length = ansi_start;
+          const char *literal = data ? "$'日本" : "$'ascii";
+          memcpy(source + length, literal, strlen(literal));
+          length += strlen(literal);
+          unsigned runs = form == 1 ? 2 : 1;
+          size_t child_offsets[2];
+          for (unsigned run = 0; run < runs; ++run) {
+            memset(source + length, '\\', count + residue);
+            length += count + residue;
+            const char *child =
+                form == 2 ? "`printf child`" : "$(printf child)";
+            child_offsets[run] = length + (form == 2 ? 1 : 2);
+            memcpy(source + length, child, strlen(child));
+            length += strlen(child);
+          }
+          memcpy(source + length, "'}\"", 4);
+          length += 3;
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+          shellsplit_test_source_scan_reset();
+#endif
+          CHECK(shell_source_ansi_quote_has_encoded_syntax(
+                    source, ansi_start, length - 2, true) == (form == 2));
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+          size_t guard_work = shellsplit_test_source_scan_work();
+          CHECK(guard_work >= length - ansi_start - 3 &&
+                guard_work <= 8 * length + 32);
+#endif
+          unsigned children = residue == 0 || residue == 3 ? runs : 0;
+          for (unsigned operation = 0; operation < 4; ++operation) {
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+            shellsplit_test_source_scan_reset();
+#endif
+            if (operation == 0) {
+              CHECK(shell_parse_draft(source, length, NULL, &draft) ==
+                    (form == 2 ? SHELL_SOURCE_UNSUPPORTED
+                               : SHELL_SOURCE_COMPLETE));
+              if (form != 2) {
+                CHECK(draft.header_count == 1 + children);
+                for (unsigned child = 0; child < children; ++child)
+                  CHECK(draft.headers[child + 1].words[0].start ==
+                        child_offsets[child]);
+              } else
+                CHECK(!draft.prefix_length && !draft.prefix.count);
+            } else if (operation == 1) {
+              shell_parse_result_t fast;
+              CHECK(shell_parse_fast(source, length, NULL, &fast) ==
+                    (form == 2 ? SHELL_EPARSE : SHELL_OK));
+            } else if (operation == 2) {
+              shell_processed_commands_t processed = {0};
+              CHECK(shell_process_commands(source, length, NULL, &processed) ==
+                    (form == 2
+                         ? (data ? SHELL_PROCESS_EINPUT : SHELL_PROCESS_EPARSE)
+                         : SHELL_PROCESS_OK));
+              CHECK(processed.command_count == (form == 2 ? 0u : 1u));
+              shell_processed_commands_free(&processed);
+            } else {
+              CHECK(shell_dep_graph_parse(source, length, "/workspace", &limits,
+                                          &graph) ==
+                    (form == 2 ? SHELL_DEP_EPARSE : SHELL_DEP_OK));
+              if (form != 2) {
+                unsigned commands = 0, substitutions = 0;
+                for (uint32_t n = 0; n < graph.node_count; ++n)
+                  commands += graph.nodes[n].type == SHELL_NODE_CMD;
+                for (uint32_t e = 0; e < graph.edge_count; ++e)
+                  substitutions += graph.edges[e].type == SHELL_EDGE_SUBST;
+                CHECK(commands == 1 + children && substitutions == children);
+              } else
+                CHECK(!graph.node_count && !graph.edge_count);
+            }
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+            size_t work = shellsplit_test_source_scan_work();
+            if (work > 256 * length + 4096 ||
+                (previous[operation] && work > 2 * previous[operation] + 4096))
+              fprintf(stderr,
+                      "ANSI run work=%zu previous=%zu size=%zu form=%u "
+                      "residue=%u operation=%u\n",
+                      work, previous[operation], length, form, residue,
+                      operation);
+            CHECK(work <= 256 * length + 4096 &&
+                  (!previous[operation] ||
+                   work <= 2 * previous[operation] + 4096));
+            previous[operation] = work;
+#else
+            (void)previous;
+#endif
+          }
+        }
+      }
+    }
+  }
+}
+
 typedef struct {
   const char *argument, *path;
   unsigned calls;
@@ -1548,10 +1833,18 @@ static SHELL_NONNULL(1, 2, 3, 4) shell_expand_status_t
 
 static void quoted_byte_paths(void) {
   static const struct {
-    const char *source, *path;
+    const char *source, *path, *identity;
   } cases[] = {
-      {"cd './données' && printf %s '日本' >'résumé.txt'", "'résumé.txt'"},
-      {"cd ./données && printf %s 日本 >résumé.txt", "résumé.txt"},
+      {"cd './données' && printf %s '日本' >'résumé.txt'", "'résumé.txt'",
+       "/workspace/données/résumé.txt"},
+      {"cd ./données && printf %s 日本 >résumé.txt", "résumé.txt",
+       "/workspace/données/résumé.txt"},
+      {"cd $'./données' && printf %s $'日本' >$'résumé.txt'", "$'résumé.txt'",
+       "/workspace/données/résumé.txt"},
+      {"printf %s x >$'日本\\c\\\\X'", "$'日本\\c\\\\X'",
+       "/workspace/日本\x1cX"},
+      {"printf %s x >$'日本\\c\\'X'", "$'日本\\c\\'X'",
+       "/workspace/日本\x1c'X"},
   };
   for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); ++c) {
     const char *source = cases[c].source;
@@ -1579,9 +1872,8 @@ static void quoted_byte_paths(void) {
               shell_dep_doc_file_identity_write(&graph, &node->doc, identity,
                                                 sizeof(identity), &written,
                                                 &absolute));
-        static const char expected[] = "/workspace/données/résumé.txt";
-        CHECK(absolute && written == sizeof(expected) - 1 &&
-              !memcmp(identity, expected, written));
+        CHECK(absolute && written == strlen(cases[c].identity) &&
+              !memcmp(identity, cases[c].identity, written));
         ++matches;
       }
       CHECK(matches == 1);
@@ -1661,7 +1953,7 @@ static void code_region_stream(void) {
     if ((unsigned char)word[i] >= 0x80)
       CHECK(!regions.visited[i]);
   static const char quoted[] =
-      "日'本'語${x:-文}$((1))${x:2}$(printf 別)$'ascii'";
+      "日'本'語${x:-文}$((1))${x:2}$(printf 別)$'ascii日本'";
   regions = (code_regions_t){0};
   scan = (shell_source_substitution_scan_t){.scope = {.word_data = true},
                                             .code_visitor = record_code,
@@ -1673,7 +1965,7 @@ static void code_region_stream(void) {
   CHECK(status == SHELL_SOURCE_SCAN_DONE);
   CHECK(regions.visited[strchr(quoted, '1') - quoted] &&
         regions.visited[strchr(quoted, '2') - quoted] &&
-        regions.visited[strstr(quoted, "ascii") - quoted]);
+        !regions.visited[strstr(quoted, "ascii") - quoted]);
   CHECK(!regions.visited[strstr(quoted, "printf") - quoted]);
   for (size_t i = 0; i < sizeof(quoted) - 1; ++i)
     if ((unsigned char)quoted[i] >= 0x80)
@@ -4366,9 +4658,12 @@ int main(void) {
   heredocs();
   byte_domains();
   word_byte_source();
+  ansi_byte_source();
+  ansi_control_delimiters();
   comment_byte_source();
   comment_byte_work();
   quoted_byte_work();
+  ansi_parameter_runs();
   quoted_byte_paths();
   selector_recovery();
   tentative_delimiters();

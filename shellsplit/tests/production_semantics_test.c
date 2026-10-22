@@ -1864,6 +1864,17 @@ static void test_processed_command_conveniences(void) {
                                  &decoded_length) == SHELL_PROCESS_OK &&
         decoded_length == 2 && decoded.length == 2 && decoded.bytes[0] == 'a' &&
         decoded.bytes[1] == ' ');
+  static const char *const control_words[] = {"$'\\c\\\\X'", "$'\\c\\'X'"};
+  for (size_t i = 0; i < sizeof(control_words) / sizeof(control_words[0]);
+       ++i) {
+    decoded = (source_capture_t){.stop_after = 1};
+    decoded_length = SIZE_MAX;
+    CHECK(shell_visit_decoded_word(control_words[i], strlen(control_words[i]),
+                                   capture_decoded_byte, &decoded,
+                                   &decoded_length) == SHELL_PROCESS_OK &&
+          decoded_length == 1 && decoded.length == 1 &&
+          decoded.bytes[0] == 0x1c);
+  }
 
   /* A canonical policy argv requires a program word. Redirect-only source is
    * still a real anomaly stage, but deliberately cannot become a netargv
@@ -3750,21 +3761,26 @@ static void test_single_byte_validation_boundary(void) {
   /* Prohibited bytes inside opaque syntax or past the range capacity still
    * fail admission. Word literal/comment/heredoc high bytes remain admitted
    * data; the command capacity then determines the truncation outcome. */
-  static const char *const tails[] = {
-      "printf tail",
-      "# comment",
-      "printf 'quoted'",
-      "printf $(printf nested)",
-      "cat <<'EOF'\nbody\nEOF\n",
-      "printf $((1))",
-      "printf $'ansi'",
+  static const struct {
+    const char *source;
+    size_t position;
+    bool literal_data;
+  } tails[] = {
+      {"printf tail", 8, true},
+      {"# comment", 4, true},
+      {"printf 'quoted'", 9, true},
+      {"printf $(printf nested)", 17, true},
+      {"cat <<'EOF'\nbody\nEOF\n", 13, true},
+      {"printf $((1))", 10, false},
+      {"printf $'ansi'", 10, true},
   };
   static const unsigned char bytes[] = {0, 1, 31, 127, 128, 255};
-  static const size_t positions[] = {8, 4, 9, 17, 13, 10, 10};
   for (size_t i = 0; i < sizeof(tails) / sizeof(tails[0]); i++) {
-    CHECK(shellsplit_test_source_with_tail(
-        source, sizeof(source), SHELL_MAX_SUBCOMMANDS + 1, tails[i], &length));
-    size_t invalid_position = length - strlen(tails[i]) + positions[i];
+    CHECK(shellsplit_test_source_with_tail(source, sizeof(source),
+                                           SHELL_MAX_SUBCOMMANDS + 1,
+                                           tails[i].source, &length));
+    size_t invalid_position =
+        length - strlen(tails[i].source) + tails[i].position;
     char saved = source[invalid_position];
     for (size_t b = 0; b < sizeof(bytes) / sizeof(bytes[0]); b++) {
       source[invalid_position] = (char)bytes[b];
@@ -3774,7 +3790,7 @@ static void test_single_byte_validation_boundary(void) {
         shell_parse_result_t parsed;
         memset(&parsed, 0xff, sizeof(parsed));
         reset_byte_validation_work();
-        bool literal_data = i < 5 && bytes[b] >= 128;
+        bool literal_data = tails[i].literal_data && bytes[b] >= 128;
         CHECK(shell_parse_fast(source, length, &limits, &parsed) ==
               (literal_data ? SHELL_ETRUNC : SHELL_EPARSE));
         if (!literal_data)

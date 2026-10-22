@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "../tests/ansi_parameter_cases.h"
 #include "../tests/depgraph_compare.h"
 #include "../tests/malformed_source_cases.h"
 #include "../tests/source_compare.h"
@@ -4292,7 +4293,7 @@ static int test_fixed_oracles(void) {
     if (command_count != item.command_count || !edge_seen)
       return fixed_oracle_failure(__LINE__);
   }
-  static const char *const invalid[] = {"echo $'é'", "echo $((é))"};
+  static const char *const invalid[] = {"echo ${é}", "echo $((é))"};
   for (const char *input : invalid) {
     shell_parse_result_t fast = {};
     if (shell_parse_fast(input, strlen(input), NULL, &fast) != SHELL_EPARSE ||
@@ -7987,6 +7988,36 @@ static void run_fixed_oracles() {
       abort();
   }
   fixed_oracle_phase("word and syntax matrices");
+  {
+    auto *draft = static_cast<shell_source_result_t *>(
+        malloc(sizeof(shell_source_result_t)));
+    if (!draft)
+      abort();
+    for (const auto &fixture : shellsplit_test_ansi_encoded_cases) {
+      const char *source = fixture.source;
+      size_t length = strlen(source);
+      shell_parse_result_t fast = {};
+      shell_processed_commands_t processed = {};
+      bool rejected =
+          shell_parse_draft(source, length, nullptr, draft) ==
+              SHELL_SOURCE_UNSUPPORTED &&
+          !draft->prefix_length && !draft->prefix.count &&
+          shell_parse_fast(source, length, nullptr, &fast) == SHELL_EPARSE &&
+          !fast.count &&
+          shell_process_commands(source, length, nullptr, &processed) ==
+              fixture.process_status &&
+          !processed.commands && !processed.command_count &&
+          shell_dep_graph_parse(source, length, "/workspace", nullptr,
+                                &graph) == SHELL_DEP_EPARSE &&
+          !graph.node_count && !graph.edge_count;
+      shell_processed_commands_free(&processed);
+      if (!rejected) {
+        fprintf(stderr, "encoded ANSI-C syntax oracle failed: %s\n", source);
+        abort();
+      }
+    }
+    free(draft);
+  }
   for (const auto &fixture : shellsplit_test_word_bytes) {
     char source[256], expected[256];
     int length =
@@ -8095,14 +8126,14 @@ static void run_fixed_oracles() {
         {"cat <<'é'\né\ncat <<#comment", SHELL_SOURCE_INVALID},
         {"cat <<'EOF'\né\nEOF\ncat <<", SHELL_SOURCE_INCOMPLETE},
         {"cat <<'EOF'\né\nEOF\ncat <<\nprintf é", SHELL_SOURCE_INVALID},
-        {"cat <<'EOF'\né\nEOF\ncat <<\nprintf $'é'", SHELL_SOURCE_UNSUPPORTED},
+        {"cat <<'EOF'\né\nEOF\ncat <<\nprintf $'é'", SHELL_SOURCE_INVALID},
         {"echo before #comment \\\necho after", SHELL_SOURCE_COMPLETE},
         {"# 日本 if while case $(false) >phantom", SHELL_SOURCE_COMPLETE},
         {"printf ok # \x80\xff", SHELL_SOURCE_COMPLETE},
         {"echo before # 日本 \\\necho after", SHELL_SOURCE_COMPLETE},
         {"echo \"$(printf inner # 日本\n)\"", SHELL_SOURCE_COMPLETE},
         {"# 日本\ncat <<\n", SHELL_SOURCE_INVALID},
-        {"# 日本\nprintf $'日'", SHELL_SOURCE_UNSUPPORTED},
+        {"# 日本\nprintf $'日'", SHELL_SOURCE_COMPLETE},
         {"printf ok && # 日本", SHELL_SOURCE_INCOMPLETE},
         {": #comment \\\na=(x)", SHELL_SOURCE_UNSUPPORTED},
         {": #comment \\\n{ :; }", SHELL_SOURCE_COMPLETE},
@@ -8115,7 +8146,7 @@ static void run_fixed_oracles() {
          SHELL_SOURCE_INVALID},
         {"printf '%s' '日本'", SHELL_SOURCE_COMPLETE},
         {"printf '%s' 日本", SHELL_SOURCE_COMPLETE},
-        {"printf '%s' $'日本'", SHELL_SOURCE_UNSUPPORTED},
+        {"printf '%s' $'日本'", SHELL_SOURCE_COMPLETE},
         {"if true; then :; fi", SHELL_SOURCE_UNSUPPORTED},
         {"foo.bar() { :; }", SHELL_SOURCE_UNSUPPORTED},
         {"echo $[1 + (2)]", SHELL_SOURCE_UNSUPPORTED},

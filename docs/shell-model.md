@@ -77,10 +77,10 @@ the dollar is literal but the parentheses remain shell punctuation, making
 the source INVALID. Quoting the entire spelling or escaping the parentheses
 produces ordinary literal word content.
 
-Ordinary literal word content, whether unquoted, escaped, single-quoted or
-double-quoted, preserves high bytes exactly, including invalid UTF-8. This
-applies to command names, arguments, assignment values and filenames, including
-concatenated fragments such as `pre'日本'".txt"`. Offsets and lengths count source bytes;
+Ordinary literal word content, whether unquoted, escaped, single-quoted,
+double-quoted or ANSI-C quoted, preserves high bytes exactly, including invalid
+UTF-8. This applies to command names, arguments, assignment values and filenames,
+including concatenated fragments such as `pre'日本'".txt"`. Offsets and lengths count source bytes;
 normalization and character decoding are outside this representation.
 Backslashes are literal inside ordinary single quotes. In double quotes they
 escape only `$`, backtick, `"`, backslash, and newline; a backslash before any
@@ -109,9 +109,26 @@ bytes.
 Canonical netstrings carry arbitrary binary payloads independently of
 shell-source admission.
 
-Raw high bytes in ANSI-C quoting remain UNSUPPORTED. ANSI-C quoting supports
-static byte decoding. Complete-command semantic APIs reject escapes decoding
-to NUL and locale-dependent non-ASCII Unicode escapes.
+ANSI-C quotes combine literal bytes with static escape decoding:
+`$'日本\t語'` contains the original Japanese bytes separated by one tab.
+Concatenated fragments, assignment values and filenames use the same rules.
+For the control escape `\c`, a doubled backslash is one operand: `$'日本\c\\X'`
+decodes to the Japanese bytes, byte `0x1c`, and `X`. An apostrophe protected by
+the consumed backslash remains literal: `$'日本\c\'X'` additionally contains
+an apostrophe before `X`. Canonical arguments and heredoc delimiter
+normalization use the same decoder; raw control bytes in source retain their
+admission restrictions.
+Arithmetic, substring arithmetic and selectors retain their restricted code
+domains even when their text contains ANSI-C quotes. Complete-command semantic
+APIs reject escapes decoding to NUL and locale-dependent non-ASCII `\u`/`\U`
+escapes. Double-quoted parameter operands retain their existing expansion
+rules; encoded executable syntax requiring decoded source remains unsupported.
+Octal byte escapes are truncated modulo 256: `\444` produces the same `$`
+byte as `\044`. In a double-quoted parameter operand, ANSI-C decoding precedes
+another expansion. A spelling such as `"${v:-$'日本\444(printf child)'}"`
+therefore returns UNSUPPORTED, just like its `\x24` equivalent. This preserves
+the graph's raw-source contract instead of omitting the decoded nested command.
+The same escape in an ordinary ANSI-C word remains literal word data.
 Isolated-word and canonical APIs preserve their documented byte-oriented
 behavior. Locale-translated `$"…"` source is unsupported.
 The source classifier also declines legacy `$[...]` arithmetic and function

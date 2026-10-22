@@ -35,7 +35,7 @@ class SourceStatusContract(unittest.TestCase):
             (b": |\ntime", 0),
             ("printf '%s' '日本'".encode(), 0),
             ("printf '%s' 日本".encode(), 0),
-            ("printf '%s' $'日本'".encode(), 4),
+            ("printf '%s' $'日本'".encode(), 0),
             (b"if true; then :; fi", 4),
             (b"case x in x) :;; esac", 4),
             (b"f() { :; }", 4),
@@ -136,7 +136,7 @@ class SourceStatusContract(unittest.TestCase):
             ("printf ok && # 日本".encode(), 1),
             ("# 日本\ncat <<\n".encode(), 2),
             ("cat <<# 日本".encode(), 2),
-            ("# 日本\nprintf $'日'".encode(), 4),
+            ("# 日本\nprintf $'日'".encode(), 0),
             ("# 日本\nprintf $((日))".encode(), 4),
             ("# 日本\nif true; then :; fi".encode(), 4),
             ("printf %s word#日本 \\#日本 '#日本' ${v#日本}".encode(), 0),
@@ -222,9 +222,11 @@ class SourceStatusContract(unittest.TestCase):
                 self.assertEqual(self.classify(prefix + b"cat <<"), 1)
                 self.assertEqual(self.classify(prefix + b"cat <<'unfinished"), 1)
                 self.assertEqual(self.classify(prefix + b":"), 0)
-                # Unknown code remains unknown even after a known bad header.
+                # Literal byte forms preserve the bad-header diagnosis;
+                # restricted code remains unknown.
                 self.assertEqual(self.classify(prefix + "cat <<\nprintf é".encode()), 2)
-                self.assertEqual(self.classify(prefix + "cat <<\nprintf $'é'".encode()), 4)
+                self.assertEqual(self.classify(prefix + "cat <<\nprintf $'é'".encode()), 2)
+                self.assertEqual(self.classify(prefix + "cat <<\nprintf $((é))".encode()), 4)
                 self.assertEqual(self.classify(prefix + "cat <<\nprintf 'é'".encode()), 2)
 
     def test_redirect_operators_are_complete_lexical_units(self):
@@ -260,7 +262,7 @@ class SourceStatusContract(unittest.TestCase):
                 self.assertEqual(self.classify(source), 2)
 
     def test_mixed_unknown_is_not_a_validity_claim(self):
-        cases = ["printf '%s' $'日本'\ncat <<\n".encode(),
+        cases = ["printf '%s' $((日本))\ncat <<\n".encode(),
                  b"if true; then :; fi\ncat <<\n"]
         for source in cases:
             with self.subTest(source=source):
@@ -297,6 +299,7 @@ class SourceStatusContract(unittest.TestCase):
                  '"é\\\\"'.encode(), '"é\\\"q"'.encode(), '"é\\`q"'.encode()]
         payload = bytes(range(128, 256))
         words += [payload, b"'" + payload + b"'", b'"' + payload + b'"',
+                  b"$'" + payload + b"'",
                   "日本".encode(), "résumé.txt".encode(),
                   "pre日'本'\".txt\"".encode(), "\\日本".encode(),
                   "日\\\n本".encode(), "日本\\ word".encode(),
@@ -304,7 +307,29 @@ class SourceStatusContract(unittest.TestCase):
                   "if日本".encode(), "日本if".encode(),
                   "日本.if".encode(), "日本''if".encode(),
                   "日本-while".encode(), "日本/in".encode(),
-                  b"x.if", b"x''while", "日本$'ascii'case".encode()]
+                  b"x.if", b"x''while", "日本$'ascii'case".encode(),
+                  "$'日本'".encode(), "$'日\\t本'".encode(),
+                  "$'résumé.txt'".encode(), "pre$'日\\x41'\"本\"".encode(),
+                  "$'é\\'日\\\\本'".encode(), "$'\\日本'".encode(),
+                  b"$'\x80\xff\xc0\xaf'", "$'\\cé'".encode(),
+                  b"$'\\c\xff'", "$'日\\\n本'".encode(),
+                  "$'日本\\u0041'".encode(),
+                  "$'日本\\444(printf child)'".encode(),
+                  "$'日本\\540printf child\\540'".encode(),
+                  "$'日本\\534'".encode(),
+                  "$'日本$(printf phantom)`printf phantom`*?'".encode(),
+                  '"$\'日本\'"'.encode()]
+        # A backslash control operand consumes its doubled spelling; an
+        # apostrophe protected by that operand remains literal word data.
+        for prefix in (b"", b"ascii", "日本".encode()):
+            for count in range(1, 7):
+                fragment = b"$'" + prefix + b"\\c" + b"\\" * count
+                words.append(fragment + b"X'")
+                if count % 2 == 0:
+                    words.append(fragment + b"'")
+            words += [b"$'" + prefix + b"\\c\\'X'",
+                      b"$'" + prefix + b"\\c\\''",
+                      b"pre$'" + prefix + b"\\c\\\\'\"tail\""]
 
         def netstring(value):
             return str(len(value)).encode() + b":" + value + b","
@@ -333,6 +358,88 @@ class SourceStatusContract(unittest.TestCase):
                                             check=True, timeout=10).stdout
                     self.assertEqual(actual, expected)
                     self.assertEqual(self.classify(source), 0)
+
+    def test_ansi_control_escape_incomplete_quotes(self):
+        for prefix in (b"ascii", "日本".encode()):
+            for count in (1, 3, 5):
+                source = b"printf $'" + prefix + b"\\c" + b"\\" * count + b"'"
+                with self.subTest(source=source):
+                    self.assertNotEqual(self.syntax(source), 0)
+                    self.assertEqual(self.classify(source), 1)
+
+    def test_ansi_byte_contexts(self):
+        cases = [
+            ("value=$'日本\\t語'; printf '%s' \"$value\"", "日本\t語"),
+            ("unset v; printf '%s' ${v:-$'日本'}", "日本"),
+            ('unset v; printf \'%s\' "${v:-$\'日本\\t語\'}"', "日本\t語"),
+            ('unset v; printf \'%s\' "${v:-$\'日本$(printf child)\'}"', "日本child"),
+            ("v=日本語; printf '%s' ${v#$'日本'}", "語"),
+            ("v=日本語; printf '%s' ${v/$'日本'/$'文'}", "文語"),
+            ('printf \'%s\' "$(printf %s $\'日本\')"', "日本"),
+            ("cat < <(printf %s $'日本')", "日本"),
+            ("printf '%s' `printf %s $'日本'`", "日本"),
+            ("cat <<$'日本'\npayload\n日本\n", "payload\n"),
+        ]
+        for locale in ("C", "C.UTF-8"):
+            environment = dict(os.environ, BASH_ENV="", ENV="", LC_ALL=locale)
+            for source, expected in cases:
+                with self.subTest(locale=locale, source=source):
+                    self.assertEqual(self.classify(source.encode()), 0)
+                    result = subprocess.run(
+                        [self.bash, "--noprofile", "--norc", "-p", "-c",
+                         "readonly LC_ALL; " + source], env=environment,
+                        capture_output=True, check=True, timeout=10)
+                    self.assertEqual(result.stdout, expected.encode())
+        for source in ["printf $(( $'日本' ))", "printf ${v:$'日本'}",
+                       "printf ${v[$'日本']}", "a[$'日本']=x",
+                       'printf "${v:-$\'日本\\x24(printf child)\'}"']:
+            with self.subTest(source=source):
+                self.assertEqual(self.classify(source.encode()), 4)
+        self.assertEqual(self.classify("printf $'日本'\ncat <<\n".encode()), 2)
+
+    def test_ansi_decoded_parameter_syntax(self):
+        for locale in ("C", "C.UTF-8"):
+            environment = dict(os.environ, BASH_ENV="", ENV="", LC_ALL=locale)
+
+            def expand(source):
+                return subprocess.run(
+                    [self.bash, "--noprofile", "--norc", "-p", "-c",
+                     b"readonly LC_ALL; unset v; " + source],
+                    env=environment, capture_output=True, check=True,
+                    timeout=10).stdout
+
+            for prefix in (b"ascii", "日本".encode()):
+                for opener in (b"\\044", b"\\444", b"\\x24",
+                               b"\\u0024", b"\\U00000024"):
+                    source = (b"printf '%s' \"${v:-$'" + prefix + opener +
+                              b"(printf child)'}\"")
+                    with self.subTest(locale=locale, source=source):
+                        self.assertEqual(expand(source), prefix + b"child")
+                        self.assertEqual(self.classify(source), 4)
+                for opener in (b"\\140", b"\\540", b"\\x60"):
+                    source = (b"printf '%s' \"${v:-$'" + prefix + opener +
+                              b"printf child" + opener + b"'}\"")
+                    with self.subTest(locale=locale, source=source):
+                        self.assertEqual(expand(source), prefix + b"child")
+                        self.assertEqual(self.classify(source), 4)
+                for residue in range(4):
+                    count = 8 + residue
+                    fragment = b"\\" * count + b"$(printf child)"
+                    source = (b"printf '%s' \"${v:-$'" + prefix + fragment +
+                              b"'}\"")
+                    output = (b"child" if residue in (0, 3)
+                              else b"$(printf child)")
+                    with self.subTest(locale=locale, source=source):
+                        self.assertEqual(expand(source), prefix +
+                                         b"\\" * ((count + 1) // 4) + output)
+                        self.assertEqual(self.classify(source), 0)
+            for byte in b"$<>()":
+                escape = ("\\%03o" % (byte + 256)).encode()
+                for quote in (b"$'", b"$\\\n'"):
+                    source = b"printf '%s' \"${v:-" + quote + escape + b"'}\""
+                    with self.subTest(locale=locale, source=source):
+                        self.assertEqual(expand(source), bytes([byte]))
+                        self.assertEqual(self.classify(source), 0)
 
     def test_quoted_backslash_list_boundaries(self):
         for first in ("é".encode(), b"\xe9"):

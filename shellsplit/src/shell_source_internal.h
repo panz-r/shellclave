@@ -535,10 +535,150 @@ shell_source_ansi_emit_codepoint(shell_source_byte_visitor_t visitor,
   return true;
 }
 
+/* Decode one escape after its backslash. Required immutable text supplies
+ * length readable bytes; *position < length names the escape character and
+ * advances past its payload, including a doubled control-backslash operand
+ * or the literal apostrophe protected by that operand. The quote decoder
+ * owns framing validation.
+ * A NULL visitor suppresses output; context is passed through unchanged.
+ * Optional locale_dependent accumulates into caller-initialized storage.
+ * Sharing this operation keeps byte truncation and Unicode handling identical
+ * in word decoding, delimiter matching, and executable-syntax classification.
+ */
+static inline SHELL_NONNULL(1, 3) bool shell_source_decode_ansi_escape(
+    const char *text, size_t length, size_t *position,
+    shell_source_byte_visitor_t visitor, void *context,
+    bool *locale_dependent) {
+  SHELL_SOURCE_WORD_SCAN(1);
+  char escape = text[(*position)++];
+  unsigned char decoded = 0;
+  switch (escape) {
+  case 'a':
+    decoded = '\a';
+    break;
+  case 'b':
+    decoded = '\b';
+    break;
+  case 'e':
+  case 'E':
+    decoded = 0x1b;
+    break;
+  case 'f':
+    decoded = '\f';
+    break;
+  case 'n':
+    decoded = '\n';
+    break;
+  case 'r':
+    decoded = '\r';
+    break;
+  case 't':
+    decoded = '\t';
+    break;
+  case 'v':
+    decoded = '\v';
+    break;
+  case '\\':
+  case '\'':
+  case '"':
+  case '?':
+    decoded = (unsigned char)escape;
+    break;
+  case 'c':
+    if (*position == length || text[*position] == '\'') {
+      if (!shell_source_ansi_emit(visitor, context, (unsigned char)'\\'))
+        return false;
+      decoded = 'c';
+    } else {
+      SHELL_SOURCE_WORD_SCAN(1);
+      unsigned char operand = (unsigned char)text[(*position)++];
+      decoded = operand == '?' ? 0x7f : (unsigned char)(operand & 0x1f);
+      /* Bash consumes a doubled backslash as one control operand. A quote
+       * protected by the consumed backslash stays literal: emit it here so
+       * the enclosing decoder cannot mistake it for the closing delimiter.
+       * Consume the complete unit before invoking a cancellable visitor. */
+      if (operand == '\\' && *position < length &&
+          (text[*position] == '\\' || text[*position] == '\'')) {
+        SHELL_SOURCE_WORD_SCAN(1);
+        unsigned char protected_byte = (unsigned char)text[(*position)++];
+        if (protected_byte == '\'') {
+          if (!shell_source_ansi_emit(visitor, context, decoded))
+            return false;
+          decoded = protected_byte;
+        }
+      }
+    }
+    break;
+  case 'x': {
+    unsigned value = 0;
+    size_t consumed = 0;
+    while (consumed < 2 && *position < length) {
+      SHELL_SOURCE_WORD_SCAN(1);
+      int digit = shell_source_ansi_hex_value(text[*position]);
+      if (digit < 0)
+        break;
+      value = (value << 4) | (unsigned)digit;
+      (*position)++;
+      consumed++;
+    }
+    if (consumed == 0) {
+      if (!shell_source_ansi_emit(visitor, context, (unsigned char)'\\'))
+        return false;
+      decoded = 'x';
+      break;
+    }
+    decoded = (unsigned char)value;
+    break;
+  }
+  case 'u':
+  case 'U': {
+    size_t digits = escape == 'u' ? 4 : 8;
+    uint32_t codepoint = 0;
+    size_t consumed = 0;
+    while (consumed < digits && *position < length) {
+      SHELL_SOURCE_WORD_SCAN(1);
+      int digit = shell_source_ansi_hex_value(text[*position]);
+      if (digit < 0)
+        break;
+      codepoint = (codepoint << 4) | (uint32_t)digit;
+      (*position)++;
+      consumed++;
+    }
+    if (consumed == 0) {
+      if (!shell_source_ansi_emit(visitor, context, (unsigned char)'\\'))
+        return false;
+      decoded = (unsigned char)escape;
+    } else {
+      if (locale_dependent && codepoint > 0x7f)
+        *locale_dependent = true;
+      return shell_source_ansi_emit_codepoint(visitor, context, codepoint);
+    }
+    break;
+  }
+  default:
+    if (escape >= '0' && escape <= '7') {
+      unsigned value = (unsigned)(escape - '0');
+      for (size_t i = 0; i < 2 && *position < length; i++) {
+        SHELL_SOURCE_WORD_SCAN(1);
+        if (text[*position] < '0' || text[*position] > '7')
+          break;
+        value = (value << 3) | (unsigned)(text[(*position)++] - '0');
+      }
+      decoded = (unsigned char)value;
+    } else {
+      if (!shell_source_ansi_emit(visitor, context, (unsigned char)'\\'))
+        return false;
+      decoded = (unsigned char)escape;
+    }
+    break;
+  }
+  return shell_source_ansi_emit(visitor, context, decoded);
+}
+
 /* Required writable position <= length, advanced past the closing quote on
  * success. text supplies length immutable bytes (NULL only for length zero).
- * A NULL visitor requests validation without emitting bytes. */
-/* locale_dependent is an optional fact output, initialized by the caller.
+ * A NULL visitor requests validation without emitting bytes.
+ * Optional locale_dependent accumulates into caller-initialized storage.
  * Non-ASCII Unicode escapes need Bash's execution locale; the internal byte
  * decoder retains UTF-8 for lexical delimiter recognition only. */
 static inline SHELL_NONNULL(3) bool shell_source_decode_ansi_c_quote_impl(
@@ -552,123 +692,16 @@ static inline SHELL_NONNULL(3) bool shell_source_decode_ansi_c_quote_impl(
     return false;
   *position = quote + 1;
   while (*position < length) {
+    SHELL_SOURCE_WORD_SCAN(1);
     unsigned char value = (unsigned char)text[(*position)++];
     if (value == '\'')
       return true;
     if (value != '\\') {
       if (!shell_source_ansi_emit(visitor, context, value))
         return false;
-      continue;
-    }
-    if (*position == length)
-      return false;
-    char escape = text[(*position)++];
-    unsigned char decoded = 0;
-    switch (escape) {
-    case 'a':
-      decoded = '\a';
-      break;
-    case 'b':
-      decoded = '\b';
-      break;
-    case 'e':
-    case 'E':
-      decoded = 0x1b;
-      break;
-    case 'f':
-      decoded = '\f';
-      break;
-    case 'n':
-      decoded = '\n';
-      break;
-    case 'r':
-      decoded = '\r';
-      break;
-    case 't':
-      decoded = '\t';
-      break;
-    case 'v':
-      decoded = '\v';
-      break;
-    case '\\':
-    case '\'':
-    case '"':
-    case '?':
-      decoded = (unsigned char)escape;
-      break;
-    case 'c':
-      if (*position == length || text[*position] == '\'') {
-        if (!shell_source_ansi_emit(visitor, context, (unsigned char)'\\'))
-          return false;
-        decoded = 'c';
-      } else {
-        decoded = (unsigned char)text[(*position)++];
-        decoded = decoded == '?' ? 0x7f : (unsigned char)(decoded & 0x1f);
-      }
-      break;
-    case 'x': {
-      int digit = *position < length
-                      ? shell_source_ansi_hex_value(text[*position])
-                      : -1;
-      if (digit < 0) {
-        if (!shell_source_ansi_emit(visitor, context, (unsigned char)'\\'))
-          return false;
-        decoded = 'x';
-        break;
-      }
-      unsigned value = 0;
-      for (size_t digits = 0; digits < 2 && digit >= 0; digits++) {
-        value = (value << 4) | (unsigned)digit;
-        (*position)++;
-        digit = *position < length
-                    ? shell_source_ansi_hex_value(text[*position])
-                    : -1;
-      }
-      decoded = (unsigned char)value;
-      break;
-    }
-    case 'u':
-    case 'U': {
-      size_t digits = escape == 'u' ? 4 : 8;
-      uint32_t codepoint = 0;
-      size_t consumed = 0;
-      while (consumed < digits && *position + consumed < length) {
-        int digit = shell_source_ansi_hex_value(text[*position + consumed]);
-        if (digit < 0)
-          break;
-        codepoint = (codepoint << 4) | (uint32_t)digit;
-        consumed++;
-      }
-      if (consumed == 0) {
-        if (!shell_source_ansi_emit(visitor, context, (unsigned char)'\\'))
-          return false;
-        decoded = (unsigned char)escape;
-      } else {
-        *position += consumed;
-        if (locale_dependent && codepoint > 0x7f)
-          *locale_dependent = true;
-        if (!shell_source_ansi_emit_codepoint(visitor, context, codepoint))
-          return false;
-        continue;
-      }
-      break;
-    }
-    default:
-      if (escape >= '0' && escape <= '7') {
-        unsigned value = (unsigned)(escape - '0');
-        for (size_t i = 0; i < 2 && *position < length &&
-                           text[*position] >= '0' && text[*position] <= '7';
-             i++)
-          value = (value << 3) | (unsigned)(text[(*position)++] - '0');
-        decoded = (unsigned char)value;
-      } else {
-        if (!shell_source_ansi_emit(visitor, context, (unsigned char)'\\'))
-          return false;
-        decoded = (unsigned char)escape;
-      }
-      break;
-    }
-    if (!shell_source_ansi_emit(visitor, context, decoded))
+    } else if (*position == length ||
+               !shell_source_decode_ansi_escape(text, length, position, visitor,
+                                                context, locale_dependent))
       return false;
   }
   return false;
@@ -805,15 +838,31 @@ static inline bool shell_source_ansi_expansion_metabyte(unsigned value) {
          value == '}' || value == '\'' || value == '"';
 }
 
-static inline bool shell_source_ansi_quote_has_encoded_syntax(const char *text,
-                                                              size_t start,
-                                                              size_t after,
-                                                              bool isolated) {
-  if (!text || after < start + 3)
-    return false;
+typedef struct {
+  unsigned count;
+  unsigned char byte;
+} shell_source_ansi_syntax_byte_t;
+
+static inline SHELL_NONNULL(2) bool shell_source_ansi_syntax_byte(
+    unsigned char byte, void *context) {
+  shell_source_ansi_syntax_byte_t *decoded =
+      (shell_source_ansi_syntax_byte_t *)context;
+  decoded->count++;
+  decoded->byte = byte;
+  return true;
+}
+
+/* text[start..after) is a prechecked complete ANSI-C fragment. isolated means
+ * it occupies the whole parameter operand. The raw-facts pass and escape pass
+ * each move forward: a backslash run is consumed once, including its pairs.
+ * Classify actual decoded bytes, including octal truncation modulo 256. */
+static inline SHELL_NONNULL(1) bool shell_source_ansi_quote_has_encoded_syntax(
+    const char *text, size_t start, size_t after, bool isolated) {
+  size_t body_start = shell_source_logical_following(text, after, start) + 1;
   bool has_raw_substitution = false;
   size_t raw_double_quotes = 0;
-  for (size_t i = start + 2; i + 1 < after; i++)
+  for (size_t i = body_start; i + 1 < after; i++) {
+    SHELL_SOURCE_WORD_SCAN(1);
     if (text[i] == '"') {
       raw_double_quotes++;
     } else {
@@ -822,17 +871,21 @@ static inline bool shell_source_ansi_quote_has_encoded_syntax(const char *text,
           (text[i] == '$' &&
            shell_source_logical_next_is(text, after - 1, i, '(', NULL));
     }
+  }
   if (raw_double_quotes % 2 != 0)
     return true;
-  for (size_t position = start + 2; position + 1 < after;) {
+  for (size_t position = body_start; position + 1 < after;) {
+    SHELL_SOURCE_WORD_SCAN(1);
     if (text[position] != '\\') {
       position++;
       continue;
     }
     size_t escape_start = position;
     size_t slashes = position;
-    while (slashes + 1 < after && text[slashes] == '\\')
+    while (slashes + 1 < after && text[slashes] == '\\') {
+      SHELL_SOURCE_WORD_SCAN(1);
       slashes++;
+    }
     /* Bash pairs backticks while parsing the ANSI-C word. Two or more
      * backslashes before a raw backtick can make that pairing ambiguous
      * across the later parameter-word expansion. */
@@ -845,44 +898,27 @@ static inline bool shell_source_ansi_quote_has_encoded_syntax(const char *text,
           shell_source_logical_next_is(text, after - 1, slashes, '(', NULL)));
     if (has_raw_substitution && !before_raw_opener)
       return true;
-    position++;
-    if (position + 1 >= after)
-      break;
-    unsigned value = 0;
-    char escape = text[position++];
-    if (escape == '\'' || escape == '"' ||
-        (escape == '\\' && !before_raw_opener))
+    size_t slash_count = slashes - position;
+    if (slash_count >= 2 && !before_raw_opener)
       return true;
-    if (escape == 'x' || escape == 'u' || escape == 'U') {
-      size_t limit = escape == 'x' ? 2 : escape == 'u' ? 4 : 8;
-      size_t digits = 0;
-      while (digits < limit && position + 1 < after) {
-        int digit = shell_source_ansi_hex_value(text[position]);
-        if (digit < 0)
-          break;
-        value = (value << 4) | (unsigned)digit;
-        position++;
-        digits++;
-      }
-      bool literal_byte = value == '$' || value == '<' || value == '>' ||
-                          value == '(' || value == ')';
-      if (digits && shell_source_ansi_expansion_metabyte(value) &&
-          !(isolated && escape_start == start + 2 && position == after - 1 &&
-            literal_byte))
-        return true;
-    } else if (escape >= '0' && escape <= '7') {
-      value = (unsigned)(escape - '0');
-      for (size_t digits = 0; digits < 2 && position + 1 < after &&
-                              text[position] >= '0' && text[position] <= '7';
-           digits++)
-        value = (value << 3) | (unsigned)(text[position++] - '0');
-      bool literal_byte = value == '$' || value == '<' || value == '>' ||
-                          value == '(' || value == ')';
-      if (shell_source_ansi_expansion_metabyte(value) &&
-          !(isolated && escape_start == start + 2 && position == after - 1 &&
-            literal_byte))
-        return true;
-    }
+    position = slashes;
+    if (slash_count % 2 == 0)
+      continue;
+    if (text[position] == '\'' || text[position] == '"')
+      return true;
+    shell_source_ansi_syntax_byte_t decoded = {0, 0};
+    (void)shell_source_decode_ansi_escape(
+        text, after, &position, shell_source_ansi_syntax_byte, &decoded, NULL);
+    bool literal_byte = decoded.byte == '$' || decoded.byte == '<' ||
+                        decoded.byte == '>' || decoded.byte == '(' ||
+                        decoded.byte == ')';
+    /* Unknown escapes emit two literal bytes (backslash and character).
+     * Numeric escapes and escaped punctuation emit one decoded byte. */
+    if (decoded.count == 1 &&
+        shell_source_ansi_expansion_metabyte(decoded.byte) &&
+        !(isolated && escape_start == body_start && position == after - 1 &&
+          literal_byte))
+      return true;
   }
   return false;
 }
@@ -3133,7 +3169,8 @@ typedef struct {
   bool data_domain;
   /* Ordinary word roots permit literal bytes regardless of quoting. Parameter
    * operands inherit that permission; names, math, substring arithmetic,
-   * subscripts and active ANSI-C fragments retain restricted code bytes. */
+   * subscripts retain restricted code bytes. ANSI-C fragments inherit their
+   * containing data/code domain independently of their escape processing. */
   bool word_data;
   /* Inherited double quoting ignores apostrophes for expansion, but the
    * parameter grammar still pairs them when finding its closing brace. */
@@ -3277,8 +3314,7 @@ typedef struct {
 static inline SHELL_NONNULL(2) void shell_source_report_word_code(
     const char *input, shell_source_substitution_scan_t *scan, size_t end) {
   const shell_source_expansion_scope_t *scope = &scan->scope;
-  bool literal =
-      scope->word_data && !scope->selector_pending && !scope->ansi_end;
+  bool literal = scope->word_data && !scope->selector_pending;
   if (scan->code_visitor && !scope->data_domain && !literal &&
       scan->code_start < end)
     scan->code_visitor(input, scan->code_start, end, scan->code_context);
@@ -3480,8 +3516,8 @@ static inline SHELL_NONNULL(3, 4, 5, 6) shell_source_scan_status_t
               position == scope->word_start && ansi_after < length &&
                   input[ansi_after] == '}'))
         return SHELL_SOURCE_SCAN_MALFORMED;
-      /* Active ANSI-C source keeps its existing byte domain. Flush it once
-       * while its scope is restricted, then resume the enclosing word. */
+      /* Flush this opaque fragment in its containing byte domain. ansi_end
+       * controls quote/expansion processing, not whether bytes are code. */
       scope->ansi_end = ansi_after - 1;
       shell_source_report_word_code(input, scan, ansi_after);
       scope->ansi_end = 0;

@@ -751,6 +751,25 @@ static void test_source_scanner_boundaries(void) {
           !shell_source_decode_ansi_c_quote("$'ab'", strlen("$'ab'"), &position,
                                             capture_source_byte, &rejected) &&
           rejected.length == 1;
+  static const char *const control_backslashes[] = {"$'\\c\\\\X'",
+                                                    "$'\\c\\'X'"};
+  for (size_t i = 0;
+       i < sizeof(control_backslashes) / sizeof(control_backslashes[0]); ++i) {
+    position = 0;
+    valid = valid &&
+            !shell_source_decode_ansi_c_quote(
+                control_backslashes[i], strlen(control_backslashes[i]),
+                &position, reject_source_byte, NULL) &&
+            position == 6;
+  }
+  source_byte_capture_t protected_quote = {.stop_after = 1};
+  position = 0;
+  valid = valid &&
+          !shell_source_decode_ansi_c_quote("$'\\c\\'X'", strlen("$'\\c\\'X'"),
+                                            &position, capture_source_byte,
+                                            &protected_quote) &&
+          position == 6 && protected_quote.length == 1 &&
+          protected_quote.bytes[0] == 0x1c;
   /* Incomplete ANSI-C escapes remain literal bytes. This matters to the
    * canonical netargv builder because dropping the backslash changes argv. */
   source_byte_capture_t incomplete_control = {0};
@@ -9270,6 +9289,11 @@ int main(void) {
            "{ printf '%s' 日本; } >résumé.txt") &&
            process_command_allocation_failure_atomic(
                "printf '%s' \x80\xff >résumé.txt"));
+  test("ANSI-C byte processing is allocation-failure atomic",
+       process_commands_allocation_failure_atomic(
+           "{ printf '%s' $'日本\\t語'; } >$'résumé.txt'") &&
+           process_command_allocation_failure_atomic(
+               "printf '%s' $'\x80\xff' >$'résumé.txt'"));
   test("Later timing prefixes are allocation-failure atomic",
        process_command_allocation_failure_atomic(
            "echo a; time -p echo b; time; ! echo c") &&
@@ -11000,8 +11024,8 @@ int main(void) {
        "cmd",
        0},
       {"Multiple leading control characters are rejected", "\x07\x1btext", 0},
-      {"Raw high bytes in active ANSI-C quotes are rejected",
-       "echo $'\x80\xff'", 0},
+      {"ANSI-C quotes do not admit high bytes in arithmetic",
+       "echo $(( $'\x80\xff' ))", 0},
       {"Embedded control character is rejected", "cmd\x01suffix", 0},
       {"High bytes in arithmetic are rejected", "echo $((\x80))", 0},
       {"Bare separator is rejected", "|", 0},
