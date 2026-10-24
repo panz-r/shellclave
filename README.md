@@ -37,7 +37,7 @@ An `ALLOW` verdict means that every command included in policy evaluation
 matched an allow rule and none matched a deny rule. The
 [policy coverage rules](#what-policy-rules-cover) below define which commands
 participate. The fields below identify incomplete coverage and unresolved
-argument or pathname expansions.
+argument, pathname or conditional-string expansions.
 
 First check the return code and completeness flags. Then interpret the verdict
 and any unresolved-expansion or substitution-inspection requirements. These
@@ -87,6 +87,7 @@ their effects alongside the command.
 | `>report.txt` | No subject; `UNDETERMINED` | Redirection setup |
 | `VALUE=example` | No subject; `UNDETERMINED` | Shell-state assignment |
 | `# comment` | No subject; `ALLOW` | Policy-neutral source |
+| `[[ -n word ]]` | No subject; `ALLOW` when conditionals are enabled | String truth and substitution dependencies |
 | `(( 2 + 3 ))` | No subject; `ALLOW` when arithmetic is enabled | Expression truth and status |
 | `(( 1 )) >report.txt` | No subject; `UNDETERMINED` when arithmetic is enabled | File setup; no stdout byte flow |
 | `cd /tmp` | One subject: `cd /tmp`; requires a matching rule | CWD changes and command I/O |
@@ -137,8 +138,9 @@ routes from setup effects, including overwritten redirects.
 Violation findings are advisory signals that the application can incorporate
 into its decision. Anomaly scores measure how unusual an execution-stage
 sequence is relative to the learned model. Its entries include simple commands
-in lists and nested substitutions, plus redirect-only operations and empty timed
-pipelines. This analysis sequence differs from runtime scheduling and from the
+in lists and nested substitutions, plus redirect-only operations, arithmetic
+and conditional commands, and empty timed pipelines. This analysis sequence
+differs from runtime scheduling and from the
 commands eligible for argv-policy evaluation. Applications can use higher scores
 to prioritize additional risk analysis. These signals have separate meanings
 from the policy verdict.
@@ -156,15 +158,15 @@ pre-push verification use that same reference.
 
 | Area | Current analysis support |
 |---|---|
-| Composition | Lists, `&&`, `\|\|`, pipelines including `\|&`, `!`, `time`, background execution, literal-only `(( expression ))` commands |
+| Composition | Lists, `&&`, `\|\|`, pipelines including `\|&`, `!`, `time`, background execution, literal-only `(( expression ))` commands, unary string `[[ … ]]` tests |
 | Groups and I/O | Brace and subshell groups, redirects, descriptor copies, moves and closes, named file descriptors, heredocs and here-strings |
 | Expansions | Quoting, parameters, substitutions, globs/extglob, arithmetic restricted to numeric literals and operators with bounded nesting |
-| Unsupported constructs | `if` constructs, loops, `case`, `select`, `coproc`, functions, arrays, `[[ … ]]`, dynamic or mutating arithmetic, and the builtin forms listed in the reference |
-| Runtime uncertainty | Represents multiple possible outcomes and reports unresolved arguments and paths explicitly |
+| Unsupported constructs | `if` constructs, loops, `case`, `select`, `coproc`, functions, arrays, wider `[[ … ]]` predicates, dynamic or mutating arithmetic, and the builtin forms listed in the reference |
+| Runtime uncertainty | Represents multiple possible outcomes and reports unresolved arguments, paths and conditional strings explicitly |
 
-Shellgate's default rejection mask additionally rejects arithmetic, heredocs,
-and here-strings. An application may adjust that mask for supported constructs;
-unsupported semantics still cause rejection. Extglob requires executor startup
+Shellgate's default rejection mask additionally rejects arithmetic, conditional
+commands, heredocs, and here-strings. An application may adjust that mask for
+supported constructs; unsupported semantics still cause rejection. Extglob requires executor startup
 configuration before Bash parses the command.
 
 Ordinary word content retains non-ASCII bytes in unquoted, escaped, and quoted
@@ -278,6 +280,8 @@ static SHELL_NONNULL(1, 2, 4) void report_analysis(FILE *output,
     fputs("; unresolved argv", output);
   if (result->unresolved_expansion_flags & SG_EXPANSION_UNRESOLVED_PATH)
     fputs("; unresolved pathname", output);
+  if (result->unresolved_expansion_flags & SG_EXPANSION_UNRESOLVED_CONDITION)
+    fputs("; unresolved condition", output);
   if (result->has_dynamic_substitution_io)
     fputs("; dynamic substitution I/O present", output);
   fputc('\n', output);

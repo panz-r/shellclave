@@ -6,6 +6,7 @@ set(SHELLCLAVE_SHELLGATE_SMOKE_SEEDS
   arithmetic_command.txt
   basic_commands.txt
   composition.txt
+  conditional_command.txt
   malformed.txt
   paths.txt
   policy_features.txt
@@ -28,6 +29,7 @@ set(SHELLCLAVE_SHELLSPLIT_SMOKE_SEEDS
   case_select.txt
   comments_and_newlines.txt
   composition.txt
+  conditional_command.txt
   compound_expansions.txt
   compound_subshell.txt
   conditional_expression.txt

@@ -2,6 +2,7 @@
 
 #include "../../shellgate/src/sg_io.h"
 #include "../../shellsplit/src/shell_arithmetic_internal.h"
+#include "../../shellsplit/src/shell_conditional_internal.h"
 #include "../../shellsplit/src/shell_depgraph_internal.h"
 #include "../../shellsplit/src/shell_keywords_internal.h"
 #include "../../shellsplit/src/shell_pipeline_internal.h"
@@ -585,6 +586,15 @@ void pointer_contracts(sg_gate_t *gate, st_policy_t *policy) {
   shell_token_t arithmetic = {
       .type = SHELL_TOKEN_ARITHMETIC_COMMAND, .start = "((1))", .length = 5};
   shell_tokenizer_arithmetic_content(&arithmetic, true, &content, NULL);
+#elif TEST_BAD == 208
+  (void)shell_conditional_parse(NULL, 0, 0);
+#elif TEST_BAD == 209
+  bool empty;
+  (void)shell_conditional_static_empty(NULL, 0, &empty);
+#elif TEST_BAD == 210
+  (void)shell_conditional_static_empty("x", 1, NULL);
+#elif TEST_BAD == 211
+  (void)shell_conditional_word_dynamic(NULL, 0);
 #else
   /* These NULL values have API meanings and must stay accepted. */
   (void)shell_netstring_iter_init(&iter, NULL, 0);

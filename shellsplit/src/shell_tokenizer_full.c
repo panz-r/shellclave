@@ -3,6 +3,7 @@
 #include "shell_arithmetic_internal.h"
 #include "shell_ascii.h"
 #include "shell_builtin_internal.h"
+#include "shell_conditional_internal.h"
 #include "shell_keywords_internal.h"
 #include "shell_source_admission_internal.h"
 #include "shell_source_draft_internal.h"
@@ -142,6 +143,21 @@ static bool brace_groups_valid(const char *input, size_t length) {
         return false;
       i = after - 1;
       continue;
+    }
+    if (c == '[') {
+      while (!have_lexical_token ||
+             lexical_token.position + lexical_token.length <= i) {
+        if (!shell_tokenizer_next(&lexical, &lexical_token))
+          break;
+        have_lexical_token = true;
+      }
+      if (have_lexical_token && lexical_token.position == i &&
+          lexical_token.type == SHELL_TOKEN_CONDITIONAL_COMMAND) {
+        i += lexical_token.length - 1;
+        context_possible = false;
+        word_boundary = false;
+        continue;
+      }
     }
     if (c == '(') {
       size_t content, end, after;
@@ -1153,6 +1169,23 @@ static SHELL_NONNULL(1, 2) bool shell_tokenizer_next_raw(
   }
 
   if (!state->in_quotes && state->lexical_command_position &&
+      current_char == '[') {
+    shell_conditional_t condition =
+        shell_conditional_parse(state->input, state->length, state->position);
+    if (condition.frame != SHELL_CONDITIONAL_NONE &&
+        condition.frame != SHELL_CONDITIONAL_UNSUPPORTED) {
+      *token = (shell_token_t){.type = SHELL_TOKEN_CONDITIONAL_COMMAND,
+                               .start = state->input + state->position,
+                               .position = state->position,
+                               .length = condition.after - state->position};
+      state->position = condition.after;
+      state->in_conditional = condition.frame == SHELL_CONDITIONAL_INCOMPLETE;
+      state->conditional_invalid = condition.frame == SHELL_CONDITIONAL_INVALID;
+      return shell_token_return_current_group_context(state, token);
+    }
+  }
+
+  if (!state->in_quotes && state->lexical_command_position &&
       current_char == '(') {
     size_t content, end, after;
     shell_arithmetic_frame_t frame = shell_source_arithmetic_command(
@@ -1539,7 +1572,8 @@ static bool shell_tokenizer_next_body(shell_tokenizer_state_t *state,
   default:
     break;
   }
-  if (token->type == SHELL_TOKEN_ARITHMETIC_COMMAND) {
+  if (token->type == SHELL_TOKEN_ARITHMETIC_COMMAND ||
+      token->type == SHELL_TOKEN_CONDITIONAL_COMMAND) {
     state->lexical_command_position = false;
     state->lexical_redirect_operand = false;
     state->lexical_operand_end = token->position + token->length;
@@ -1679,6 +1713,8 @@ static bool control_token_starts_function_definition(const shell_token_t *token,
 static bool control_function_keyword_has_name(const shell_token_t *token,
                                               const char *input,
                                               size_t input_length) {
+  if (token && token->type == SHELL_TOKEN_CONDITIONAL_COMMAND)
+    return false;
   if (!token || !input || token->position > input_length ||
       token->length > input_length - token->position)
     return false;
@@ -2209,6 +2245,8 @@ static SHELL_NONNULL(1) bool word_has_array_designator_after(const char *input,
 static bool token_starts_bash_compound_command(const shell_token_t *token,
                                                const char *input,
                                                size_t input_length) {
+  if (token && token->type == SHELL_TOKEN_CONDITIONAL_COMMAND)
+    return false;
   if (!token || !input || token->position > input_length ||
       token->length == 0 || token->length > input_length - token->position)
     return false;
@@ -2554,6 +2592,17 @@ static SHELL_NONNULL(1) bool unsupported_semantics_scan_impl(
     if (shell_source_is_escaped_line_ending(input, token.position,
                                             token.position + token.length))
       continue;
+    if (token.type == SHELL_TOKEN_CONDITIONAL_COMMAND) {
+      shell_conditional_t condition =
+          shell_conditional_parse(input, input_length, token.position);
+      if (condition.frame != SHELL_CONDITIONAL_COMPLETE ||
+          word_has_unsupported_semantics(input + condition.operand,
+                                         condition.operand_length))
+        return true;
+      command_start = false;
+      pipeline_prefix.scanned = pipeline_prefix.has_stage = true;
+      continue;
+    }
     if (token.type == SHELL_TOKEN_ARITHMETIC_COMMAND) {
       if (state.in_arithmetic)
         return true;
@@ -3605,6 +3654,18 @@ static bool shell_list_validate_substitutions(const char *input,
     if (token.position > input_length ||
         token.length > input_length - token.position)
       return false;
+    if (token.type == SHELL_TOKEN_CONDITIONAL_COMMAND) {
+      /* The compound token includes grammar and comments. Only its operand
+       * is a word-expansion span; conditional parsing owns the trivia. */
+      shell_conditional_t condition =
+          shell_conditional_parse(input, input_length, token.position);
+      if (condition.operand_length &&
+          !shell_list_validate_substitution_span(
+              input + condition.operand, condition.operand_length,
+              recursion_depth, require_complete))
+        return false;
+      continue;
+    }
     if (token.type != SHELL_TOKEN_HEREDOC) {
       if (!shell_list_validate_substitution_span(
               token.start, token.length, recursion_depth, require_complete))
@@ -3634,6 +3695,7 @@ static bool shell_list_validate_substitutions(const char *input,
          !(tokenizer.in_quotes || tokenizer.in_subshell ||
            tokenizer.paren_depth || tokenizer.brace_depth ||
            tokenizer.brace_group_depth || tokenizer.in_arithmetic ||
+           tokenizer.in_conditional || tokenizer.conditional_invalid ||
            tokenizer.arith_depth || tokenizer.heredoc_error);
 }
 
@@ -3891,6 +3953,35 @@ static SHELL_NONNULL(1) bool shell_tokenizer_list_syntax_valid_body(
         return false;
       /* A containing-group closer is handled below.  Separators clear this
        * state through their ordinary transition. */
+    }
+    if (token.type == SHELL_TOKEN_CONDITIONAL_COMMAND) {
+      if (!state.needs_stage || state.redirect_operand)
+        return false;
+      shell_conditional_t condition =
+          shell_conditional_parse(input, input_length, token.position);
+      if (condition.frame == SHELL_CONDITIONAL_UNSUPPORTED) {
+        if (draft)
+          draft->failure = SHELL_SOURCE_UNSUPPORTED;
+        return false;
+      }
+      if (condition.frame == SHELL_CONDITIONAL_INVALID)
+        return false;
+      if (condition.frame == SHELL_CONDITIONAL_INCOMPLETE) {
+        if (!draft)
+          return !require_complete;
+        draft->need = SHELL_SOURCE_NEEDS_CONDITIONAL;
+        draft->incomplete_at = (uint32_t)token.position;
+        break;
+      }
+      if (!shell_list_validate_expansion_span(
+              input + condition.operand, condition.operand_length,
+              recursion_depth, require_complete, false, false))
+        return false;
+      state.needs_stage = false;
+      state.pipeline_start = false;
+      state.assignment_prefix_open = false;
+      state.after_group = true;
+      continue;
     }
     if (token.type == SHELL_TOKEN_ARITHMETIC_COMMAND) {
       if (!state.needs_stage || state.redirect_operand)
@@ -4185,6 +4276,7 @@ static SHELL_NONNULL(1) bool shell_tokenizer_list_syntax_valid_body(
       (group_count != 0 || tokenizer.in_quotes || tokenizer.in_subshell ||
        tokenizer.paren_depth != 0 || tokenizer.brace_depth != 0 ||
        tokenizer.brace_group_depth != 0 || tokenizer.in_arithmetic ||
+       tokenizer.in_conditional || tokenizer.conditional_invalid ||
        tokenizer.arith_depth != 0 || tokenizer.heredoc_error))
     return false;
   /* The lexical API intentionally retains incomplete parenthesized prefixes
@@ -4395,6 +4487,7 @@ shell_tokenize_status_t shell_tokenize_prevalidated_commands(
                            token.type == SHELL_TOKEN_SPECIAL_VAR ||
                            token.type == SHELL_TOKEN_ARITHMETIC ||
                            token.type == SHELL_TOKEN_ARITHMETIC_COMMAND ||
+                           token.type == SHELL_TOKEN_CONDITIONAL_COMMAND ||
                            token.type == SHELL_TOKEN_GLOB ||
                            token.type == SHELL_TOKEN_ANSI_C_QUOTED ||
                            token.type == SHELL_TOKEN_EXTGLOB ||
@@ -4539,7 +4632,8 @@ shell_tokenize_status_t shell_tokenize_prevalidated_commands(
     }
     closed_group_at_end = token.type == SHELL_TOKEN_GROUP_END;
     saw_loop = saw_loop || state.loop_depth > 0;
-    saw_conditional = saw_conditional || state.if_depth > 0;
+    saw_conditional = saw_conditional || state.if_depth > 0 ||
+                      token.type == SHELL_TOKEN_CONDITIONAL_COMMAND;
     saw_case = saw_case || state.case_depth > 0;
     if (token.type == SHELL_TOKEN_GROUP_START ||
         token.type == SHELL_TOKEN_GROUP_END) {
@@ -4740,6 +4834,7 @@ shell_tokenize_status_t shell_tokenize_prevalidated_commands(
          token.type == SHELL_TOKEN_ARRAY_ASSIGNMENT ||
          token.type == SHELL_TOKEN_ARITHMETIC ||
          token.type == SHELL_TOKEN_ARITHMETIC_COMMAND ||
+         token.type == SHELL_TOKEN_CONDITIONAL_COMMAND ||
          token.type == SHELL_TOKEN_PROCESS_SUB)) {
       /* The leading `!` is retained as the pipeline's syntax token, but it
        * does not occupy a simple-command slot. The first following word must
@@ -4858,6 +4953,24 @@ shell_tokenize_status_t shell_tokenize_prevalidated_commands(
     case SHELL_TOKEN_PIPE_BOTH:
       current_cmd->pipe_output_mode = SHELL_PIPE_MODE_STDOUT_AND_STDERR;
       break;
+    case SHELL_TOKEN_CONDITIONAL_COMMAND: {
+      current_cmd->kind = SHELL_COMMAND_CONDITIONAL;
+      current_cmd->ends_group = true;
+      shell_conditional_t condition =
+          shell_conditional_parse(token.start, token.length, 0);
+      shell_source_substitution_scan_t scan = {0};
+      size_t start, after;
+      shell_source_substitution_kind_t kind;
+      while (shell_source_next_executable_substitution(
+                 token.start + condition.operand, condition.operand_length,
+                 &scan, &start, &after, &kind) == SHELL_SOURCE_SCAN_FOUND)
+        current_cmd->has_subshells |= kind == SHELL_SOURCE_SUBST_COMMAND ||
+                                      kind == SHELL_SOURCE_SUBST_BACKTICK;
+      current_cmd->has_variables |=
+          scan.has_variables || scan.has_arithmetic_variables;
+      current_cmd->has_arithmetic |= scan.has_arithmetic;
+      break;
+    }
     case SHELL_TOKEN_ARITHMETIC_COMMAND:
       current_cmd->kind = SHELL_COMMAND_ARITHMETIC;
       current_cmd->ends_group = true;
@@ -5020,6 +5133,8 @@ const char *shell_token_type_name(shell_token_type_t type) {
     return "PIPE_TIME_OPTION";
   case SHELL_TOKEN_ARITHMETIC_COMMAND:
     return "ARITHMETIC_COMMAND";
+  case SHELL_TOKEN_CONDITIONAL_COMMAND:
+    return "CONDITIONAL_COMMAND";
   case SHELL_TOKEN_REDIRECT_IN:
     return "REDIRECT_IN";
   case SHELL_TOKEN_REDIRECT_OUT:

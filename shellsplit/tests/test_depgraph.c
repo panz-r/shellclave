@@ -12212,8 +12212,8 @@ TEST(dialect_boundary_matrix) {
       "while read line; do echo $line; done",
       "until test -f file; do sleep 1; done",
       "(\\\n( count += 1 ))",
-      "[\\\n[ -n value ]]",
-      "[[\\\n -n value ]]",
+      "[\\\n[ -f value ]]",
+      "[[\\\n -f value ]]",
   };
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
     shell_dep_graph_t graph;

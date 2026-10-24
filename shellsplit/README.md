@@ -168,6 +168,14 @@ failure continuations carry their own state facts. Check `cwd_known` before
 reading offsets and use a FILE document's own CWD for pathname interpretation.
 See [CWD and paths](../docs/shell-model.md#cwd-and-lexical-path-facts).
 
+Unary string conditions (`[[ word ]]`, `[[ -n word ]]`, `[[ -z word ]]` and
+their negations) have kind `SHELL_COMMAND_CONDITIONAL`, no argv, and retained
+expression/operand spans. The graph exposes TRUE/FALSE/UNKNOWN predicate truth
+and explicit redirect setup through `has_redirections`. Use the conditional
+expansion callback purpose to supply a final string value. Redirects are
+installed before nested operand substitutions; the condition body has no
+stdin/stdout byte use. See [conditional semantics](../docs/shell-model.md#unary-string-conditions).
+
 ## Dependency-graph workspace
 
 Graph construction uses one temporary workspace. Allocating processor/tokenizer,

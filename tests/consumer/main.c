@@ -295,6 +295,17 @@ static bool check_depgraph_workspace_api(void) {
                                            &graph) == SHELL_DEP_OK &&
            graph.nodes[0].cmd.kind == SHELL_COMMAND_ARITHMETIC &&
            graph.nodes[0].cmd.arithmetic_truth == SHELL_ARITHMETIC_NONZERO;
+      const char condition[] = "[[ -z '' ]]";
+      ok = ok &&
+           shell_parse_draft(condition, sizeof(condition) - 1, NULL, draft) ==
+               SHELL_SOURCE_COMPLETE &&
+           draft->headers[0].kind == SHELL_COMMAND_CONDITIONAL &&
+           shell_dep_graph_parse_with_fast(condition, sizeof(condition) - 1,
+                                           ".", &limits, &draft->prefix,
+                                           &graph) == SHELL_DEP_OK &&
+           graph.nodes[0].cmd.kind == SHELL_COMMAND_CONDITIONAL &&
+           graph.nodes[0].cmd.conditional_truth == SHELL_CONDITIONAL_TRUE &&
+           graph.nodes[0].cmd.token_count == 0;
     }
     free(draft);
   }

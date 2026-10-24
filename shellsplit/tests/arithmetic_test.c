@@ -426,7 +426,7 @@ int main(int argc, char **argv) {
   parse("printf %s \"$( ((1<<2)); printf ok)\"");
   parse("cat <<EOF\n$( ((1<<2)); printf ok)\nEOF\n");
   parse("((1)) <<<payload");
-  CHECK(graph->nodes[0].cmd.arithmetic_has_redirections);
+  CHECK(graph->nodes[0].cmd.has_redirections);
   parse("((1)) {fd}>output; printf value >&$fd");
   parse("time ((1)) & cat <input");
   const char *two = "((1)); ((0))";

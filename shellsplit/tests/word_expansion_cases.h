@@ -1402,6 +1402,42 @@ static const uint32_t shellsplit_test_expansion_feature_mask =
     SHELL_FEAT_ARRAY | SHELL_FEAT_PROCESS_SUB | SHELL_FEAT_ANSI_C_QUOTE |
     SHELL_FEAT_SUBSHELL_FILE;
 
+/* Used as ordinary arguments and conditional operands. Exact feature masks
+ * distinguish literal pattern punctuation from active expansion syntax. */
+static const uint32_t shellsplit_test_extglob_feature_mask =
+    SHELL_FEAT_VARS | SHELL_FEAT_GLOBS | SHELL_FEAT_SUBSHELL |
+    SHELL_FEAT_ARITH | SHELL_FEAT_HEREDOC | SHELL_FEAT_HERESTRING |
+    SHELL_FEAT_PROCESS_SUB | SHELL_FEAT_LOOPS | SHELL_FEAT_CONDITIONALS |
+    SHELL_FEAT_CASE | SHELL_FEAT_SUBSHELL_FILE | SHELL_FEAT_PIPELINE |
+    SHELL_FEAT_GROUP | SHELL_FEAT_BACKGROUND | SHELL_FEAT_EXTGLOB |
+    SHELL_FEAT_ANSI_C_QUOTE | SHELL_FEAT_ARRAY | SHELL_FEAT_NAMED_FD |
+    SHELL_FEAT_COMBINED_REDIRECT;
+
+static const struct {
+  const char *word;
+  uint32_t features;
+} shellsplit_test_extglob_features[] = {
+    {"@(left|right)", SHELL_FEAT_EXTGLOB},
+    {"pre@(@(if|for|case)|tail)suffix", SHELL_FEAT_EXTGLOB},
+    {"@($value)", SHELL_FEAT_EXTGLOB | SHELL_FEAT_VARS},
+    {"pre@(@($value)|tail)suffix", SHELL_FEAT_EXTGLOB | SHELL_FEAT_VARS},
+    {"@($((1)))", SHELL_FEAT_EXTGLOB | SHELL_FEAT_ARITH},
+    {"@($(printf x))", SHELL_FEAT_EXTGLOB | SHELL_FEAT_SUBSHELL},
+    {"@(`printf x`)", SHELL_FEAT_EXTGLOB | SHELL_FEAT_SUBSHELL},
+    {"@($(<file))",
+     SHELL_FEAT_EXTGLOB | SHELL_FEAT_SUBSHELL | SHELL_FEAT_SUBSHELL_FILE},
+    {"@(<(printf x))", SHELL_FEAT_EXTGLOB | SHELL_FEAT_PROCESS_SUB},
+    {"@($'x')", SHELL_FEAT_EXTGLOB | SHELL_FEAT_ANSI_C_QUOTE},
+    {"@(${value:-$(printf x)})",
+     SHELL_FEAT_EXTGLOB | SHELL_FEAT_VARS | SHELL_FEAT_SUBSHELL},
+    {"@($(printf x | cat))",
+     SHELL_FEAT_EXTGLOB | SHELL_FEAT_SUBSHELL | SHELL_FEAT_PIPELINE},
+    {"@('$(printf x)')", SHELL_FEAT_EXTGLOB},
+    {"'@($(printf x))'", 0},
+    {"\"@($(printf x))\"", SHELL_FEAT_SUBSHELL},
+    {"\\@\\(left\\|right\\)", 0},
+};
+
 /* Fixed builtin option grammar expectations. Operand bytes are data, not
  * options; selectors resume after each operand and stop at positional words.
  * Parsed by semantic consumers and fuzz oracles, never executed as a corpus. */

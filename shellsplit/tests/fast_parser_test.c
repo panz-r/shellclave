@@ -2367,6 +2367,32 @@ static void test_source_scanner_contract(void) {
        redirect_contract);
 }
 
+static void test_extglob_expansion_features(void) {
+  for (unsigned conditional = 0; conditional < 2; ++conditional) {
+    for (size_t i = 0; i < sizeof(shellsplit_test_extglob_features) /
+                               sizeof(shellsplit_test_extglob_features[0]);
+         ++i) {
+      char source[256];
+      snprintf(source, sizeof(source),
+               conditional ? "[[ -n %s ]]" : "printf %s",
+               shellsplit_test_extglob_features[i].word);
+      shell_parse_result_t parsed = {0};
+      shell_limits_t limits = SHELL_LIMITS_DEFAULT;
+      limits.strict_mode = true;
+      bool valid = shell_parse_fast(source, strlen(source), &limits, &parsed) ==
+                   SHELL_OK;
+      uint32_t features = 0;
+      for (uint32_t c = 0; c < parsed.count; ++c)
+        features |= parsed.cmds[c].features;
+      uint32_t expected = shellsplit_test_extglob_features[i].features |
+                          (conditional ? SHELL_FEAT_CONDITIONALS : 0);
+      test(source,
+           valid && parsed.count == 1 &&
+               (features & shellsplit_test_extglob_feature_mask) == expected);
+    }
+  }
+}
+
 static void test_arithmetic_shift_heredoc_boundary(void) {
   printf("\n--- Arithmetic Shift Heredoc Boundary ---\n");
   static const struct {
@@ -3627,7 +3653,7 @@ static void test_semantic_classifier_boundaries(void) {
       {">out [[ x ]]", false},
       {"VALUE=x then", false},
       {">out then", false},
-      {"{ [[ -n value ]]; }", true},
+      {"{ [[ -n value ]]; }", false},
       {"echo $( [[ -f /tmp/x ]] )", true},
       {"(( count += 1 ))", true},
       {"! (( 1 ))", false},
@@ -4339,6 +4365,7 @@ int main(void) {
   test_layer1_whitespace_trimming();
   test_layer1_heredoc();
   test_feature_matrix();
+  test_extglob_expansion_features();
   test_control_word_boundaries();
   test_array_assignment_prefix_features();
   test_layer1_utility_functions();

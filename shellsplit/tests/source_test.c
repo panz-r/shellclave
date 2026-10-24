@@ -723,11 +723,21 @@ static void keyword_recovery(void) {
     for (size_t b = 0; b < sizeof(boundaries) / sizeof(boundaries[0]); b++) {
       snprintf(source, sizeof(source), "echo before; %s%s", words[w],
                boundaries[b]);
-      CHECK(shell_parse_draft(source, strlen(source), NULL, &draft) ==
-            SHELL_SOURCE_UNSUPPORTED);
-      CHECK(!draft.prefix_length && !draft.tail_start && !draft.prefix.count);
-      for (uint32_t h = 0; h < draft.header_count; h++)
-        CHECK(!draft.headers[h].complete);
+      if (!strcmp(words[w], "[[")) {
+        CHECK(shell_parse_draft(source, strlen(source), NULL, &draft) ==
+              (b < 3 ? SHELL_SOURCE_INCOMPLETE : SHELL_SOURCE_INVALID));
+        if (b < 3) {
+          CHECK(draft.need == SHELL_SOURCE_NEEDS_CONDITIONAL);
+          CHECK(draft.prefix_length == strlen("echo before;"));
+        } else
+          CHECK(!draft.prefix_length && !draft.prefix.count);
+      } else {
+        CHECK(shell_parse_draft(source, strlen(source), NULL, &draft) ==
+              SHELL_SOURCE_UNSUPPORTED);
+        CHECK(!draft.prefix_length && !draft.tail_start && !draft.prefix.count);
+        for (uint32_t h = 0; h < draft.header_count; h++)
+          CHECK(!draft.headers[h].complete);
+      }
     }
     static const char *const closed[] = {"$(%s)", "<(%s)", ">(%s)", "`%s`"};
     for (size_t c = 0; c < sizeof(closed) / sizeof(closed[0]); c++) {

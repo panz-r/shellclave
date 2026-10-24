@@ -382,6 +382,9 @@ void sg_violation_config_default(sg_violation_config_t *cfg) SHELL_NONNULL(1);
 enum {
   SG_EXPANSION_UNRESOLVED_ARGV = 1u << 0,
   SG_EXPANSION_UNRESOLVED_PATH = 1u << 1,
+  /* An expanded conditional string remains unresolved, independently of argv.
+   */
+  SG_EXPANSION_UNRESOLVED_CONDITION = 1u << 2,
 };
 
 /* --- LIFECYCLE --- */

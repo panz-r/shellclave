@@ -21,11 +21,15 @@ extern "C" {
  * Parsed shell command metadata, including original text and tokenized details.
  */
 typedef struct {
-  /* Owned text for this flattened simple-command stage. Structural pipeline
+  /* Owned text for this flattened command stage. Structural pipeline
    * prefixes and enclosing group delimiters may be absent; this is diagnostic
    * source, not a command string that callers can safely reparse. */
   const char *original_command;
   shell_command_kind_t kind;
+  /* Conditional spans borrow original_command, with its owned lifetime.
+   * Other command kinds leave these fields zero. */
+  const char *conditional_expression, *conditional_operand;
+  size_t conditional_expression_length, conditional_operand_length;
   /* Arithmetic content borrows original_command, excluding its delimiters.
    * Other command kinds leave these fields zero. Empty expressions are valid.
    */
@@ -147,23 +151,23 @@ typedef struct {
 
 /** Owned canonical command result with the structural group descriptors from
  * the same source command. `commands` has one entry per retained executable
- * simple-command range or arithmetic command; each group's first_command and
- * command_count index this array, not the source fast-parser ranges. For an
- * empty group, first_command is the number of retained commands preceding its
- * source interval (possibly command_count at the end of the collection). A
- * statically argv-less operation, such as `>output` or a stage made entirely of
- * empty process words (`<() >()`), has no `shell_command_info_t` entry. Quoted
- * empty words remain arguments; runtime expansions are not evaluated to decide
- * presence. Use the dependency graph or paired anomaly netsequences (an empty
- * raw record paired with a typed record containing empty argv[0]) when every
- * structural source stage is needed. `commands` is NULL exactly when
- * `command_count` is zero. This array alone is not an authorization-complete
- * view of the source. Group-attached I/O and external pipeline state are
- * represented by ordered `group_io_ops`, never attributed to the final enclosed
- * command. Several operations may share a group index and preserve source
- * order; paired pipeline relations with the same source span are output then
- * input. Group indexes refer to `groups`, whose source spans remain
- * authoritative. */
+ * simple-command range, arithmetic command or conditional command; each group's
+ * first_command and command_count index this array, not the source fast-parser
+ * ranges. For an empty group, first_command is the number of retained commands
+ * preceding its source interval (possibly command_count at the end of the
+ * collection). A statically argv-less operation, such as `>output` or a stage
+ * made entirely of empty process words (`<() >()`), has no
+ * `shell_command_info_t` entry. Quoted empty words remain arguments; runtime
+ * expansions are not evaluated to decide presence. Use the dependency graph or
+ * paired anomaly netsequences (an empty raw record paired with a typed record
+ * containing empty argv[0]) when every structural source stage is needed.
+ * `commands` is NULL exactly when `command_count` is zero. This array alone is
+ * not an authorization-complete view of the source. Group-attached I/O and
+ * external pipeline state are represented by ordered `group_io_ops`, never
+ * attributed to the final enclosed command. Several operations may share a
+ * group index and preserve source order; paired pipeline relations with the
+ * same source span are output then input. Group indexes refer to `groups`,
+ * whose source spans remain authoritative. */
 typedef struct {
   shell_command_info_t *commands;
   size_t command_count;
@@ -206,13 +210,14 @@ typedef struct {
  * valid independently of command_line. Use shell_render_netargv_buffer() for
  * the canonical processed-subcommand representation. Arithmetic entries have
  * kind ARITHMETIC, no command tokens and their owned expression view.
- * This legacy flat API
- * retains every lexical simple-command record, including a valid argv-less
- * redirect-only operation with command_token_count == 0 and wholly elided
- * process-word stages with nonzero lexical token counts. Their empty rendering
- * is diagnostic metadata, not an executable netargv or policy input. The
- * structured API omits those records, while paired anomaly netsequences retain
- * their explicit empty-stage sentinel for callers that need every stage.
+ * Conditional entries likewise retain owned expression/operand views without
+ * argv. This legacy flat API retains every lexical simple-command record,
+ * including a valid argv-less redirect-only operation with command_token_count
+ * == 0 and wholly elided process-word stages with nonzero lexical token counts.
+ * Their empty rendering is diagnostic metadata, not an executable netargv or
+ * policy input. The structured API omits those records, while paired anomaly
+ * netsequences retain their explicit empty-stage sentinel for callers that need
+ * every stage.
  *
  * For a complete supported compound group, it uses the structured group model
  * to omit group-owned redirect operands from returned text while retaining
@@ -221,13 +226,13 @@ typedef struct {
  * It otherwise retains the full tokenizer's tolerant lexical handling for
  * incomplete parenthesized source, but rejects impossible list-operator chains
  * just like the structured APIs. shell_process_commands() requires a complete
- * form it can model. Recognized control compounds (loops, conditionals, `case`,
- * `select`, `coproc`, and function declarations), shell-semantic array
+ * form it can model. Recognized control compounds (loops, if constructs,
+ * `case`, `select`, `coproc`, and function declarations), shell-semantic array
  * assignments, references, declarations, and element targets (including
  * `printf -v name[0]` and `read -a name`), and unmodeled current-shell forms
  * (`mapfile`/`readarray`, `wait -p`, `pushd`/`popd`, and dynamic or mutating
  * arithmetic expansions) return SHELL_PROCESS_EPARSE. Other unmodeled Bash
- * forms (`[[ … ]]`, dynamic/mutating arithmetic commands,
+ * forms (wider `[[ … ]]` predicates, dynamic/mutating arithmetic commands,
  * locale quotes `$"…"`, and case
  * fall-through `;&` / `;;&`) also return SHELL_PROCESS_EPARSE. Supported
  * compound groups contain simple-command lists, pipelines, and nested

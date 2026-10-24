@@ -77,6 +77,7 @@ typedef enum {
   SHELL_TOKEN_PIPE_TIME,          // Bash reserved `time` pipeline modifier
   SHELL_TOKEN_PIPE_TIME_OPTION,   // `time`'s consumed -p or -- option
   SHELL_TOKEN_ARITHMETIC_COMMAND, // Bash ((expression)), not an argv word
+  SHELL_TOKEN_CONDITIONAL_COMMAND, // Bash [[...]], without argv
   SHELL_TOKEN_TYPE_COUNT
 } shell_token_type_t;
 
@@ -115,7 +116,7 @@ typedef struct {
   /* Lexical control metadata uses complete unquoted words outside redirect
    * operands. It does not establish supported control-flow semantics. */
   bool has_loops;        // Contains loop spellings (while, for, until, select)
-  bool has_conditionals; // Contains conditionals (if/then/elif/else/fi)
+  bool has_conditionals; // Contains if/then/elif/else/fi or [[...]]
   bool has_case;         // Contains case statements
   bool has_groups;       // Contains command groups
   bool ends_group;     // Last command content closes a group (redirections may
@@ -145,18 +146,20 @@ typedef struct {
  * Tokenizer state
  */
 typedef struct {
-  const char *input;     // Input string
-  size_t position;       // Current position
-  size_t length;         // Total length
-  bool in_quotes;        // Currently in quotes
-  bool in_subshell;      // Currently in subshell
-  char quote_char;       // Current quote character
-  int paren_depth;       // Parentheses depth
-  int brace_depth;       // Brace depth for ${VAR}
-  int brace_group_depth; // POSIX brace-group nesting depth
-  uint8_t group_kinds;   // shell_group_kind_t bitset of enclosing groups
-  bool in_arithmetic;    // Currently in arithmetic expansion
-  int arith_depth;       // Arithmetic expansion nesting depth ($((...))
+  const char *input;        // Input string
+  size_t position;          // Current position
+  size_t length;            // Total length
+  bool in_quotes;           // Currently in quotes
+  bool in_subshell;         // Currently in subshell
+  char quote_char;          // Current quote character
+  int paren_depth;          // Parentheses depth
+  int brace_depth;          // Brace depth for ${VAR}
+  int brace_group_depth;    // POSIX brace-group nesting depth
+  uint8_t group_kinds;      // shell_group_kind_t bitset of enclosing groups
+  bool in_conditional;      // Received unfinished conditional command
+  bool conditional_invalid; // Established conditional grammar error
+  bool in_arithmetic;       // Currently in arithmetic expansion
+  int arith_depth;          // Arithmetic expansion nesting depth ($((...))
 
   shell_pending_heredoc_t pending_heredocs[SHELL_MAX_SUBCOMMANDS];
   size_t pending_heredoc_count;

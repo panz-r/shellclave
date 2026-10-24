@@ -1,5 +1,6 @@
 #include "shell_tokenizer.h"
 #include "shell_ascii.h"
+#include "shell_conditional_internal.h"
 #include "shell_keywords_internal.h"
 #include "shell_pipeline_internal.h"
 #include "shell_source_internal.h"
@@ -397,6 +398,7 @@ static SHELL_NONNULL(1) uint32_t
 
 typedef enum {
   FAST_FEATURE_WORD,
+  FAST_FEATURE_CONDITIONAL_WORD,
   FAST_FEATURE_COMMAND_BODY,
 } fast_feature_context_t;
 
@@ -420,7 +422,8 @@ static SHELL_NONNULL(1, 4) void detect_file_substitution_feature(
     *features |= SHELL_FEAT_SUBSHELL_FILE;
 }
 
-/* Gather a parameter operand or arithmetic body in one quote-aware stream.
+/* Gather a parameter operand, extglob word or arithmetic body in one
+ * quote-aware stream.
  * Operand punctuation is not outer shell syntax. Only executable substitution
  * bodies get their separate shell-command walk; heredoc roots are data. */
 static SHELL_NONNULL(1, 5) void detect_expansion_features(
@@ -505,6 +508,11 @@ static SHELL_NONNULL(1,
   fast_array_context_t array_context;
   bool have_array_context =
       fast_array_context_init(&array_context, p, len, allow_initial_time);
+  if (have_array_context && context == FAST_FEATURE_CONDITIONAL_WORD) {
+    array_context.command_start = array_context.prefix_open = false;
+    array_context.state.lexical_command_position = false;
+    array_context.state.lexical_prefix &= (uint8_t)~LEXICAL_ASSIGNMENT_ALLOWED;
+  }
 
   while (i < len) {
     shell_source_scope_frontier(p, i);
@@ -516,6 +524,18 @@ static SHELL_NONNULL(1,
       continue;
     }
     char c = p[i];
+    if (!in_single_quotes && !in_double_quotes && c == '[' &&
+        have_array_context && fast_lexical_token_at(&array_context, i) &&
+        array_context.token.type == SHELL_TOKEN_CONDITIONAL_COMMAND) {
+      *features |= SHELL_FEAT_CONDITIONALS;
+      shell_conditional_t condition = shell_conditional_parse(p, len, i);
+      if (condition.operand_length)
+        detect_features(p, (uint32_t)condition.operand,
+                        (uint32_t)condition.operand_length, features, true,
+                        FAST_FEATURE_CONDITIONAL_WORD);
+      i = (uint32_t)condition.after;
+      continue;
+    }
     if (!in_single_quotes && !in_double_quotes && c == '(' &&
         have_array_context && fast_lexical_token_at(&array_context, i) &&
         array_context.token.type == SHELL_TOKEN_ARITHMETIC_COMMAND) {
@@ -721,6 +741,10 @@ static SHELL_NONNULL(1,
       size_t extglob_after = 0;
       if (shell_source_skip_extglob(p, len, i, &extglob_after)) {
         *features |= SHELL_FEAT_EXTGLOB;
+        /* Pattern punctuation is literal here; active expansions still run.
+         * Their executable children establish independent command contexts. */
+        detect_expansion_features(p + i, extglob_after - i, false, false,
+                                  features, false);
         i = (uint32_t)extglob_after;
         continue;
       }
@@ -829,13 +853,14 @@ static SHELL_NONNULL(1,
     case '*':
     case '?':
       // Globs do NOT expand in double quotes
-      if (!in_double_quotes) {
+      if (!in_double_quotes && context != FAST_FEATURE_CONDITIONAL_WORD) {
         *features |= SHELL_FEAT_GLOBS;
       }
       break;
     case '[':
       // Globs do NOT expand in double quotes, and not in heredoc context
-      if (!in_double_quotes && !(i > 0 && p[i - 1] == '<')) {
+      if (!in_double_quotes && context != FAST_FEATURE_CONDITIONAL_WORD &&
+          !(i > 0 && p[i - 1] == '<')) {
         *features |= SHELL_FEAT_GLOBS;
       }
       break;
@@ -959,6 +984,10 @@ static void normalize_result_metadata(const char *cmd, size_t cmd_len,
         token.type == SHELL_TOKEN_ARITHMETIC_COMMAND) {
       result->cmds[i].kind = SHELL_COMMAND_ARITHMETIC;
       result->cmds[i].features |= SHELL_FEAT_ARITH;
+    }
+    if (token.type == SHELL_TOKEN_CONDITIONAL_COMMAND) {
+      result->cmds[i].kind = SHELL_COMMAND_CONDITIONAL;
+      result->cmds[i].features |= SHELL_FEAT_CONDITIONALS;
     }
     if (result->cmds[i].type == SHELL_TYPE_SIMPLE &&
         (result->cmds[i].features & SHELL_FEAT_SUBSHELL)) {
@@ -1389,8 +1418,10 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
       continue;
     }
     char c = cmd[pos];
-    if (!in_quotes && c == '(' && fast_lexical_token_at(&documents, pos) &&
-        documents.token.type == SHELL_TOKEN_ARITHMETIC_COMMAND) {
+    if (!in_quotes && (c == '(' || c == '[') &&
+        fast_lexical_token_at(&documents, pos) &&
+        (documents.token.type == SHELL_TOKEN_ARITHMETIC_COMMAND ||
+         documents.token.type == SHELL_TOKEN_CONDITIONAL_COMMAND)) {
       pos = (uint32_t)(documents.token.position + documents.token.length);
       continue;
     }

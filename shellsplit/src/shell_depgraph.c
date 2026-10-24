@@ -13,6 +13,7 @@
 #include "shell_arithmetic_internal.h"
 #include "shell_ascii.h"
 #include "shell_builtin_internal.h"
+#include "shell_conditional_internal.h"
 #include "shell_depgraph_internal.h"
 #include "shell_netstring.h"
 #include "shell_pipeline_internal.h"
@@ -637,6 +638,13 @@ static bool scan_tokens(const char *cmd, uint32_t range_start,
                                           &expression_end, &after) ==
           SHELL_ARITHMETIC_FRAME_COMPLETE) {
         pos = (uint32_t)after;
+        continue;
+      }
+    }
+    if (out->count == 0 && cmd[pos] == '[') {
+      shell_conditional_t condition = shell_conditional_parse(cmd, end, pos);
+      if (condition.frame == SHELL_CONDITIONAL_COMPLETE) {
+        pos = (uint32_t)condition.after;
         continue;
       }
     }
@@ -2271,7 +2279,7 @@ typedef struct {
   const dep_process_guard_t *guard;
   uint32_t next;
   uint8_t access;
-  bool temporary, command_word, byte_use, standalone;
+  bool temporary, command_word, body_word, byte_use, standalone;
 } dep_process_route_t;
 
 typedef struct {
@@ -2309,12 +2317,28 @@ static SHELL_NONNULL(1) dep_fd_ref_t
       .name = use->fd_name, .value = use->fd, .name_len = use->fd_name_len};
 }
 
+typedef enum {
+  /* Command arguments expand before the simple command's redirections. */
+  DEP_SNAPSHOT_COMMAND_WORD,
+  /* RHS imports select null-path commits or temporary-prefix visibility,
+   * never this assignment's own commit. */
+  DEP_SNAPSHOT_ASSIGNMENT_VALUE,
+  /* A redirect operand expands while its redirect list is applied
+   * left-to-right, after preceding redirects but before its own operation. */
+  DEP_SNAPSHOT_REDIRECT_OPERAND,
+  /* Compound operands expand after their complete redirect setup. */
+  DEP_SNAPSHOT_BODY_WORD,
+  /* Internal completion consumes the full setup without exporting imports.
+   * This value also counts the exportable expansion phases. */
+  DEP_SNAPSHOT_SETUP,
+} dep_snapshot_phase_t;
+
 /* Phase-local substitution transfers. The incoming bit denotes a path with no
  * status-replacing substitution; empty bodies and skipped operands preserve
  * the current command's preceding value. The low bits are returning outcomes.
  */
 typedef struct {
-  uint8_t phase[3];
+  uint8_t phase[DEP_SNAPSHOT_SETUP];
   /* Unconditional expansion errors are separate from the assignment-only
    * alternative of a command whose entire argv can disappear. */
   uint8_t errors;
@@ -3420,7 +3444,8 @@ struct dep_snapshot_source {
   dep_prefix_assignment_set_t prefix_assignments;
   dep_exec_analysis_t exec;
   dep_read_plan_t read;
-  uint32_t observation_first[3], observation_last[3];
+  uint32_t observation_first[DEP_SNAPSHOT_SETUP],
+      observation_last[DEP_SNAPSHOT_SETUP];
   dep_assignment_ifs_t assignment_ifs[SHELL_DEP_MAX_TOKENS];
   uint32_t assignment_ifs_count, assignment_ifs_cursor;
   uint32_t redirect_entry_table;
@@ -3439,7 +3464,7 @@ struct dep_snapshot_source {
   uint32_t op_count;
   uint32_t edge_cursor;
   uint32_t process_route_cursor;
-  uint32_t process_word_cursor;
+  uint32_t process_word_cursor, body_process_cursor;
   /* One-based position of an empty process redirect's ambiguous pathname. */
   uint32_t empty_process_failure;
   bool deferred_document;
@@ -4814,7 +4839,7 @@ static SHELL_NONNULL(1, 2) bool dep_owner_persists_named_binding(
   return graph->nodes[owner].type == SHELL_NODE_GROUP ||
          (graph->nodes[owner].type == SHELL_NODE_CMD &&
           (graph->nodes[owner].cmd.token_count != 0 ||
-           graph->nodes[owner].cmd.kind == SHELL_COMMAND_ARITHMETIC) &&
+           graph->nodes[owner].cmd.kind != SHELL_COMMAND_SIMPLE) &&
           (context
                ->expansion_status[SHELL_MAX_GROUPS + context->node_range[owner]]
                .redirect_scopes &
@@ -6204,19 +6229,6 @@ static int dep_ordered_owner_compare(const void *left, const void *right) {
   return 0;
 }
 
-typedef enum {
-  /* Command arguments expand before the simple command's redirections. */
-  DEP_SNAPSHOT_COMMAND_WORD,
-  /* RHS imports select null-path commits or temporary-prefix visibility,
-   * never this assignment's own commit. */
-  DEP_SNAPSHOT_ASSIGNMENT_VALUE,
-  /* A redirect operand expands while its redirect list is applied
-   * left-to-right, after preceding redirects but before its own operation. */
-  DEP_SNAPSHOT_REDIRECT_OPERAND,
-  /* Internal completion consumes the full setup without exporting imports. */
-  DEP_SNAPSHOT_SETUP,
-} dep_snapshot_phase_t;
-
 static SHELL_NONNULL(1, 2, 3, 4) bool dep_observation_apply(
     dep_route_state_t *state, dep_route_journal_t *journal,
     const dep_owner_routes_t *baseline,
@@ -6278,7 +6290,7 @@ static SHELL_NONNULL(1) uint8_t
     dep_expansion_status(const dep_parse_context_t *context, uint32_t event,
                          uint8_t incoming) {
   const dep_expansion_status_t *expansion = &context->expansion_status[event];
-  for (unsigned phase = 0; phase < 3; phase++) {
+  for (unsigned phase = 0; phase <= DEP_SNAPSHOT_BODY_WORD; phase++) {
     uint8_t status = expansion->phase[phase];
     incoming = (status & DEP_STATUS_EITHER) |
                ((status & DEP_EXPANSION_INCOMING) ? incoming : 0);
@@ -9456,7 +9468,8 @@ static SHELL_NONNULL(1, 3, 4, 5) bool dep_fd_retire_owner_facts(
   const dep_snapshot_source_t *source =
       &context->workspace->snapshot_sources[slot];
   if (!source->read.active && !source->observation_first[0] &&
-      !source->observation_first[1] && !source->observation_first[2])
+      !source->observation_first[1] && !source->observation_first[2] &&
+      !source->observation_first[3])
     return true;
   dep_route_state_t result = {0};
   dep_route_iterator_t versions = dep_route_iterator(state);
@@ -9478,12 +9491,12 @@ static SHELL_NONNULL(1, 3, 4, 5) bool dep_fd_retire_owner_facts(
             &one, journal, dep_fd_numeric(SHELL_DEP_FD_NONE),
             DEP_FD_ACCESS_EFFECT_STATE, (dep_route_set_t){.ready = true}))
       return false;
-    for (uint32_t phase = 0; phase < 3; phase++)
+    for (uint32_t phase = 0; phase <= DEP_SNAPSHOT_BODY_WORD; phase++)
       if (source->observation_first[phase] &&
-          !dep_route_state_store_access(&one, journal,
-                                        dep_fd_numeric(slot * 3 + phase),
-                                        DEP_FD_ACCESS_SUBSTITUTION_STATUS,
-                                        (dep_route_set_t){.ready = true}))
+          !dep_route_state_store_access(
+              &one, journal, dep_fd_numeric(slot * DEP_SNAPSHOT_SETUP + phase),
+              DEP_FD_ACCESS_SUBSTITUTION_STATUS,
+              (dep_route_set_t){.ready = true}))
         return false;
     if (!ready)
       result = one;
@@ -10167,11 +10180,12 @@ static SHELL_NONNULL(1) bool dep_snapshot_frame_initialize(
  * process operations in the ordered setup index instead. */
 static SHELL_NONNULL(1, 2, 3) bool dep_snapshot_process_words(
     const dep_parse_context_t *context, dep_snapshot_source_t *source,
-    dep_snapshot_table_t *entry, uint32_t owner) {
+    dep_snapshot_table_t *entry, uint32_t owner, bool body) {
   const dep_owner_routes_t *baseline =
       &context->workspace->snapshot_tables[context->snapshot->persistent[0]]
            .routes;
-  uint32_t cursor = source->process_word_cursor;
+  uint32_t cursor =
+      body ? source->body_process_cursor : source->process_word_cursor;
   uint32_t route = cursor ? context->process_routes->entries[cursor - 1].next
                           : context->process_routes->first[owner];
   dep_route_state_t state = dep_snapshot_alternatives(entry), previous = state;
@@ -10181,8 +10195,11 @@ static SHELL_NONNULL(1, 2, 3) bool dep_snapshot_process_words(
   for (; route; route = context->process_routes->entries[route - 1].next) {
     const dep_process_route_t *item =
         &context->process_routes->entries[route - 1];
-    source->process_word_cursor = route;
-    if (!item->temporary || !item->command_word ||
+    if (body)
+      source->body_process_cursor = route;
+    else
+      source->process_word_cursor = route;
+    if (!item->temporary || !(body ? item->body_word : item->command_word) ||
         !context->process_routes->track[owner])
       continue;
     dep_fd_op_t op = {.pos = item->position,
@@ -10235,7 +10252,7 @@ static SHELL_NONNULL(1, 3, 7) shell_dep_error_t
         uint32_t op_count = 0, completed;
         if (!dep_snapshot_fd_operations(graph, context, owner, &prepared))
           return SHELL_DEP_EPARSE;
-        if (!dep_snapshot_process_words(context, prepared, entry, owner))
+        if (!dep_snapshot_process_words(context, prepared, entry, owner, false))
           return SHELL_DEP_ETRUNC;
         shell_dep_error_t error = dep_snapshot_operand_table(
             graph, workspace, prepared, (uint32_t)(entry - tables), UINT32_MAX,
@@ -10373,12 +10390,25 @@ static SHELL_NONNULL(1, 3, 7) shell_dep_error_t
   dep_snapshot_source_t *prepared;
   if (!dep_snapshot_fd_operations(graph, context, current_owner, &prepared))
     return SHELL_DEP_EPARSE;
-  if (!dep_snapshot_process_words(context, prepared, entry, current_owner))
+  if (!dep_snapshot_process_words(context, prepared, entry, current_owner,
+                                  false))
     return SHELL_DEP_ETRUNC;
-  if (phase == DEP_SNAPSHOT_REDIRECT_OPERAND || phase == DEP_SNAPSHOT_SETUP) {
-    return dep_snapshot_operand_table(graph, workspace, prepared,
-                                      (uint32_t)(entry - tables), position,
-                                      table, context, current_owner);
+  if (phase == DEP_SNAPSHOT_REDIRECT_OPERAND || phase == DEP_SNAPSHOT_SETUP ||
+      phase == DEP_SNAPSHOT_BODY_WORD) {
+    shell_dep_error_t error = dep_snapshot_operand_table(
+        graph, workspace, prepared, (uint32_t)(entry - tables),
+        phase == DEP_SNAPSHOT_BODY_WORD ? UINT32_MAX : position, table, context,
+        current_owner);
+    if (error != SHELL_DEP_OK || phase != DEP_SNAPSHOT_BODY_WORD)
+      return error;
+    dep_snapshot_table_t *body = &tables[*table];
+    if (!dep_snapshot_process_words(context, prepared, body, current_owner,
+                                    true))
+      return SHELL_DEP_ETRUNC;
+    /* dep_complete_substitution applies each returned observation once to
+     * this cached body table. Imports consume that established state; replay
+     * here would apply the newly appended observation a second time. */
+    return SHELL_DEP_OK;
   }
   *table = (uint32_t)(entry - tables);
   return SHELL_DEP_OK;
@@ -10397,7 +10427,8 @@ static SHELL_NONNULL(1, 3) shell_dep_error_t
   dep_snapshot_source_t *source =
       &context->workspace
            ->snapshot_sources[context->snapshot->prepared_source[owner]];
-  if (phase == DEP_SNAPSHOT_REDIRECT_OPERAND) {
+  if (phase == DEP_SNAPSHOT_REDIRECT_OPERAND ||
+      phase == DEP_SNAPSHOT_BODY_WORD) {
     uint32_t table;
     shell_dep_error_t error = dep_snapshot_phase_table(
         graph, streams, context, owner, position, phase, &table);
@@ -10436,7 +10467,7 @@ static SHELL_NONNULL(1, 3) shell_dep_error_t
   return error;
 }
 
-/* Recursive expansions request an import from one of the three expansion
+/* Recursive expansions request an import from one of the expansion
  * phases, not SETUP. Reuse the established checkpoint; exporting descriptors
  * is separate from resolving the operand's reachability. */
 static SHELL_NONNULL(1, 3, 7, 9) shell_dep_error_t dep_snapshot_fd_imports(
@@ -10699,6 +10730,7 @@ static SHELL_NONNULL(1, 2, 3, 4) shell_dep_error_t
    * before their operand executes. Static paths need no callback/cache entry.
    */
   if (eligible && purpose != SHELL_EXPAND_WORD_ARGUMENT &&
+      purpose != SHELL_EXPAND_WORD_CONDITIONAL &&
       !(graph->nodes[document].doc.flags & SHELL_DEP_DOC_FLAG_DYNAMIC_NAME)) {
     size_t decoded_length;
     if (shell_process_measure_word_value(word->start, word->len,
@@ -10738,10 +10770,12 @@ static SHELL_NONNULL(1, 2, 3, 4) shell_dep_error_t
     return SHELL_DEP_EPARSE;
   if (result)
     *result = value;
-  if (eligible && purpose != SHELL_EXPAND_WORD_ARGUMENT && value->dynamic &&
+  if (eligible && purpose != SHELL_EXPAND_WORD_ARGUMENT &&
+      purpose != SHELL_EXPAND_WORD_CONDITIONAL && value->dynamic &&
       !value->resolved)
     context->unresolved_paths[owner] = true;
-  if (!eligible || purpose == SHELL_EXPAND_WORD_ARGUMENT || !value->resolved)
+  if (!eligible || purpose == SHELL_EXPAND_WORD_ARGUMENT ||
+      purpose == SHELL_EXPAND_WORD_CONDITIONAL || !value->resolved)
     return SHELL_DEP_OK;
 
   shell_dep_doc_t *doc = &graph->nodes[document].doc;
@@ -16743,10 +16777,15 @@ static SHELL_NONNULL(1, 2, 3, 4) bool dep_fd_merge_versions(
    * may still factor inside each class after one observed name forced a
    * split; keeping every whole-state combination grows exponentially. Joins
    * use immutable changed-key paths and their cache, never source rescans. */
-  uint32_t roots[DEP_ROUTE_STATE_CAPACITY], count = 0;
+  /* Every state includes its primary root, including the empty-map root.
+   * Seed it directly, then join remaining destination versions and source. */
+  uint32_t roots[DEP_ROUTE_STATE_CAPACITY], count = 1;
+  roots[0] = destination->root;
   for (unsigned side = 0; side < 2; side++) {
     dep_route_iterator_t iterator =
         dep_route_iterator(side ? source : destination);
+    if (!side)
+      (void)dep_route_take(&iterator, journal);
     uint32_t root;
     while (dep_route_next(&iterator, journal, &root)) {
       bool merged = false;
@@ -19504,16 +19543,17 @@ static SHELL_NONNULL(
   if (source->argv_presence == DEP_ARGV_EMPTY &&
       !context->expansion_status[event].isolated_setup &&
       (source->observation_first[0] || source->observation_first[1] ||
-       source->observation_first[2])) {
+       (source->observation_first[2] || source->observation_first[3]))) {
     body_status = DEP_STATUS_MAY_SUCCEED;
     uint32_t slot =
         context->snapshot->prepared_source[context->range_node[range]];
-    for (unsigned phase = 0; phase < 3; phase++) {
+    for (unsigned phase = 0; phase <= DEP_SNAPSHOT_BODY_WORD; phase++) {
       uint8_t status = context->expansion_status[event].phase[phase];
       if (source->observation_first[phase]) {
-        dep_route_set_t observed = dep_fd_raw_fact(
-            executed_state, journal, baseline, dep_fd_numeric(slot * 3 + phase),
-            DEP_FD_ACCESS_SUBSTITUTION_STATUS);
+        dep_route_set_t observed =
+            dep_fd_raw_fact(executed_state, journal, baseline,
+                            dep_fd_numeric(slot * DEP_SNAPSHOT_SETUP + phase),
+                            DEP_FD_ACCESS_SUBSTITUTION_STATUS);
         if (observed.count)
           status = (uint8_t)observed.routes[0].value;
       }
@@ -19535,7 +19575,7 @@ static SHELL_NONNULL(
       !mutations->clear && !mutations->ifs_write &&
       !context->process_routes->first[context->range_node[range]] &&
       (source->observation_first[0] || source->observation_first[1] ||
-       source->observation_first[2]))
+       (source->observation_first[2] || source->observation_first[3])))
     continued = selected;
   if (private)
     body_status = dep_status_child_return(body_status);
@@ -19693,7 +19733,8 @@ static SHELL_NONNULL(1, 2, 4, 5, 6, 7, 8, 13, 15) shell_dep_error_t
            ->snapshot_sources[context->snapshot->prepared_source[owner]];
   if (event >= SHELL_MAX_GROUPS && survived &&
       (prepared->read.active || prepared->observation_first[0] ||
-       prepared->observation_first[1] || prepared->observation_first[2])) {
+       prepared->observation_first[1] ||
+       (prepared->observation_first[2] || prepared->observation_first[3]))) {
     dep_route_iterator_t iterator = dep_route_iterator(executed_state);
     uint32_t root;
     bool report_ready = false;
@@ -21239,7 +21280,7 @@ static SHELL_NONNULL(1, 2, 4, 5, 6, 7, 8, 9, 10, 13, 15, 16,
       return SHELL_DEP_ETRUNC;
     dep_route_state_t before_process_words = local_route_state;
     dep_domain_collection_t process_collection = {.workspace = workspace};
-    uint32_t observation_cursor[3] = {0};
+    uint32_t observation_cursor[DEP_SNAPSHOT_SETUP] = {0};
     for (uint32_t process = process_routes->first[owner]; process;
          process = process_routes->entries[process - 1].next) {
       const dep_process_route_t *route = &process_routes->entries[process - 1];
@@ -21338,6 +21379,39 @@ static SHELL_NONNULL(1, 2, 4, 5, 6, 7, 8, 9, 10, 13, 15, 16,
         return SHELL_DEP_ETRUNC;
       diagnostic_cursor++;
     }
+    for (uint32_t process = process_routes->first[owner];
+         context->owner_setup_stop[owner] == UINT32_MAX && process;
+         process = process_routes->entries[process - 1].next) {
+      const dep_process_route_t *route = &process_routes->entries[process - 1];
+      if (!route->temporary || !route->body_word ||
+          !process_routes->track[owner])
+        continue;
+      if (!dep_observation_pending(
+              &local_route_state, &workspace->route_journal, &flow_baseline,
+              &workspace->observations, stdin_source, DEP_SNAPSHOT_BODY_WORD,
+              &observation_cursor[DEP_SNAPSHOT_BODY_WORD],
+              (uint32_t)(route->source - cmd)))
+        return SHELL_DEP_ETRUNC;
+      dep_fd_op_t op = {.pos = route->position,
+                        .kind = DEP_FD_OP_PROCESS,
+                        .fd_name = route->source,
+                        .edge_index = route->edge,
+                        .access = route->access,
+                        .guard = route->guard,
+                        .process_observed_low =
+                            process_routes->observed_low[owner]};
+      if (!dep_process_open(&local_route_state, &workspace->route_journal,
+                            &flow_baseline, &op))
+        return SHELL_DEP_ETRUNC;
+      if (route->standalone && !route->byte_use)
+        dynamic_route_edges[route->edge] = true;
+    }
+    if (context->owner_setup_stop[owner] == UINT32_MAX &&
+        !dep_observation_pending(
+            &local_route_state, &workspace->route_journal, &flow_baseline,
+            &workspace->observations, stdin_source, DEP_SNAPSHOT_BODY_WORD,
+            &observation_cursor[DEP_SNAPSHOT_BODY_WORD], UINT32_MAX))
+      return SHELL_DEP_ETRUNC;
     if (graph->nodes[owner].type == SHELL_NODE_CMD &&
         graph->nodes[owner].cmd.kind == SHELL_COMMAND_ARITHMETIC &&
         graph->nodes[owner].cmd.arithmetic_truth == SHELL_ARITHMETIC_UNKNOWN &&
@@ -21728,7 +21802,7 @@ static SHELL_NONNULL(1, 2, 4, 5, 6, 7, 8, 9, 10, 13, 15, 16,
         (original->type != SHELL_EDGE_READ || workspace->generic_read[owner] ||
          !external_eligible[owner]) &&
         !(graph->nodes[owner].type == SHELL_NODE_CMD &&
-          graph->nodes[owner].cmd.kind == SHELL_COMMAND_ARITHMETIC)) {
+          graph->nodes[owner].cmd.kind != SHELL_COMMAND_SIMPLE)) {
       /* An argv-less stage has no body. Its explicit document binding still
        * represents reached redirect setup, unlike an inherited default use. */
       if (!external_eligible[owner])
@@ -21952,7 +22026,7 @@ static SHELL_NONNULL(1, 2, 4, 5, 6, 7, 8, 9, 10, 13, 15, 16,
            control_execution[owner] != DEP_EXECUTION_NEVER &&
            graph->nodes[owner].type == SHELL_NODE_CMD &&
            graph->nodes[owner].cmd.token_count == 0 &&
-           graph->nodes[owner].cmd.kind != SHELL_COMMAND_ARITHMETIC);
+           graph->nodes[owner].cmd.kind == SHELL_COMMAND_SIMPLE);
       if (access == DEP_FD_ACCESS_READ && !workspace->generic_read[owner] &&
           graph->nodes[owner].type != SHELL_NODE_CMD)
         pipe_binding = false;
@@ -22683,14 +22757,21 @@ static SHELL_NONNULL(1) void dep_record_process_substitution_route(
 static SHELL_NONNULL(1, 5) void dep_record_process_temporary(
     dep_process_route_map_t *routes, uint32_t edge, uint32_t owner,
     uint32_t position, const char *source, bool input, bool command_word,
-    bool byte_use, bool standalone, const dep_process_guard_t *guard) {
+    bool byte_use, bool standalone, const dep_process_guard_t *guard,
+    bool body_word) {
   dep_record_process_substitution_route(routes, edge, owner, position, input,
                                         dep_fd_numeric(SHELL_DEP_FD_NONE));
   dep_process_route_t *route = &routes->entries[routes->last[owner] - 1];
   route->temporary = true;
   route->source = source;
   route->guard = guard;
-  route->command_word = command_word;
+  route->command_word = command_word && !body_word;
+  route->body_word = body_word;
+  /* Body process allocations have their own post-setup phase. MAX excludes
+   * them from source-position redirect checkpoints; the body cursor opens
+   * them in expansion order after setup, retaining source as their identity. */
+  if (body_word)
+    route->position = UINT32_MAX;
   route->byte_use = byte_use;
   route->standalone = standalone;
   routes->private_edges |= standalone && !byte_use;
@@ -22960,7 +23041,7 @@ static SHELL_NONNULL(1, 5, 6, 8, 9, 10, 12, 14) shell_dep_error_t
     uint32_t position = (uint32_t)(target->start - context->cmd);
     dep_record_process_temporary(
         context->process_routes, temporary_edge, consumer_node, position,
-        target->start, child_writes, false, false, native_marker, NULL);
+        target->start, child_writes, false, false, native_marker, NULL, false);
     for (unsigned i = 0; i < 3; i++)
       if (parent_edges[i] != UINT32_MAX)
         dep_record_process_substitution_route(
@@ -23016,9 +23097,10 @@ static SHELL_NONNULL(1, 5, 6, 8, 9, 10, 12, 14) shell_dep_error_t
   }
   if (connected && (input || output)) {
     uint32_t position = (uint32_t)(target->start - context->cmd);
-    dep_record_process_temporary(
-        context->process_routes, route_edge, consumer_node, position,
-        target->start, target->start[0] == '<', false, false, false, NULL);
+    dep_record_process_temporary(context->process_routes, route_edge,
+                                 consumer_node, position, target->start,
+                                 target->start[0] == '<', false, false, false,
+                                 NULL, false);
     dep_record_process_substitution_route(
         context->process_routes, route_edge, consumer_node, position, input,
         named_setup ? *named_setup
@@ -23074,11 +23156,11 @@ static SHELL_NONNULL(1, 5, 6, 7, 8, 9) bool dep_connect_process_word(
   bool exposed_input =
       input && !(producer->type == SHELL_NODE_ENDPOINT &&
                  producer->endpoint.reserved == DEP_ENDPOINT_PROCESS_PIPE);
-  dep_record_process_temporary(context->process_routes, edge, owner,
-                               (uint32_t)(fragment->start - context->cmd),
-                               fragment->start, input,
-                               phase != DEP_SNAPSHOT_REDIRECT_OPERAND,
-                               byte_use && exposed_input, true, guard);
+  dep_record_process_temporary(
+      context->process_routes, edge, owner,
+      (uint32_t)(fragment->start - context->cmd), fragment->start, input,
+      phase != DEP_SNAPSHOT_REDIRECT_OPERAND, byte_use && exposed_input, true,
+      guard, phase == DEP_SNAPSHOT_BODY_WORD);
   return true;
 }
 
@@ -23282,7 +23364,7 @@ static SHELL_NONNULL(1, 5, 6, 8, 9, 11, 18, 19) shell_dep_error_t
             context->process_routes, edge, expansion_owner,
             (uint32_t)(operand.start - context->cmd), operand.start, true,
             snapshot_phase != DEP_SNAPSHOT_REDIRECT_OPERAND, exposed, !exposed,
-            guard);
+            guard, snapshot_phase == DEP_SNAPSHOT_BODY_WORD);
       }
     } else if (active)
       connected = dep_connect_process_word(
@@ -23424,7 +23506,7 @@ static SHELL_NONNULL(1, 2, 3) shell_dep_error_t dep_complete_substitution(
       .clauses = clauses,
       .position =
           phase == DEP_SNAPSHOT_REDIRECT_OPERAND ? position : word_position,
-      .key = slot * 3 + phase,
+      .key = slot * DEP_SNAPSHOT_SETUP + phase,
       .incoming_status = incoming,
       .guard = guard,
       .previous_guard = previous_guard,
@@ -23449,9 +23531,10 @@ static SHELL_NONNULL(1, 2, 3) shell_dep_error_t dep_complete_substitution(
                                baseline, &entry->routes, &entry->routes) ||
       !dep_snapshot_table_publish(entry, &state))
     return SHELL_DEP_ETRUNC;
-  dep_route_set_t completed = dep_fd_raw_fact(
-      &state, &workspace->snapshot_journal, baseline,
-      dep_fd_numeric(slot * 3 + phase), DEP_FD_ACCESS_SUBSTITUTION_STATUS);
+  dep_route_set_t completed =
+      dep_fd_raw_fact(&state, &workspace->snapshot_journal, baseline,
+                      dep_fd_numeric(slot * DEP_SNAPSHOT_SETUP + phase),
+                      DEP_FD_ACCESS_SUBSTITUTION_STATUS);
   if (completed.count) {
     *prior = 0;
     for (uint32_t i = 0; i < completed.count; i++)
@@ -25217,6 +25300,11 @@ static SHELL_NONNULL(1, 6, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
     if (empty_timed_pipeline)
       tokens = (dep_token_list_t){0};
     bool arithmetic_command = range->kind == SHELL_COMMAND_ARITHMETIC;
+    bool conditional_command = range->kind == SHELL_COMMAND_CONDITIONAL;
+    bool compound_command = arithmetic_command || conditional_command;
+    shell_conditional_t condition = {0};
+    if (conditional_command)
+      condition = shell_conditional_parse(cmd, cmd_len, range->start);
     size_t arithmetic_content = 0, arithmetic_end = 0, arithmetic_after = 0;
     shell_arithmetic_result_t arithmetic = {0};
     if (arithmetic_command) {
@@ -25226,7 +25314,7 @@ static SHELL_NONNULL(1, 6, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
       arithmetic = shell_arithmetic_analyze(
           cmd + arithmetic_content, arithmetic_end - arithmetic_content);
     }
-    if (tokens.count == 0 && !empty_timed_pipeline && !arithmetic_command &&
+    if (tokens.count == 0 && !empty_timed_pipeline && !compound_command &&
         !shell_execution_document(&lexical_documents[si]))
       continue;
 
@@ -25236,7 +25324,7 @@ static SHELL_NONNULL(1, 6, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
     uint32_t command =
         dep_first_command_index(&tokens, &readonly_stop, &isolated_setup,
                                 &rejected_assignments, &argv_presence);
-    if (arithmetic_command) {
+    if (compound_command) {
       argv_presence = DEP_ARGV_PRESENT;
       isolated_setup = false;
     }
@@ -25364,11 +25452,24 @@ static SHELL_NONNULL(1, 6, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
     node->cmd.arithmetic_expression = NULL;
     node->cmd.arithmetic_expression_length = 0;
     node->cmd.arithmetic_truth = SHELL_ARITHMETIC_UNKNOWN;
-    node->cmd.arithmetic_has_redirections =
-        arithmetic_command &&
-        (tokens.count != 0 ||
-         lexical_documents[si].type == SHELL_TYPE_HEREDOC ||
-         lexical_documents[si].type == SHELL_TYPE_HERESTRING);
+    node->cmd.has_redirections =
+        lexical_documents[si].type == SHELL_TYPE_HEREDOC ||
+        lexical_documents[si].type == SHELL_TYPE_HERESTRING;
+    for (uint32_t t = 0; t < tokens.count; ++t)
+      node->cmd.has_redirections |=
+          classify_redirect(&tokens.tokens[t]) != DEP_REDIRECT_NONE;
+    node->cmd.conditional_expression = NULL;
+    node->cmd.conditional_expression_length = 0;
+    node->cmd.conditional_operand = NULL;
+    node->cmd.conditional_operand_length = 0;
+    node->cmd.conditional_truth = SHELL_CONDITIONAL_UNKNOWN;
+    if (conditional_command) {
+      node->cmd.conditional_expression = cmd + condition.content;
+      node->cmd.conditional_expression_length =
+          (uint32_t)(condition.end - condition.content);
+      node->cmd.conditional_operand = cmd + condition.operand;
+      node->cmd.conditional_operand_length = (uint32_t)condition.operand_length;
+    }
     if (arithmetic_command) {
       node->cmd.arithmetic_expression = cmd + arithmetic_content;
       node->cmd.arithmetic_expression_length =
@@ -25446,8 +25547,7 @@ static SHELL_NONNULL(1, 6, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
       if (argv_presence == DEP_ARGV_EMPTY &&
           (fd == 0 || fd == SHELL_DEP_FD_NAMED))
         expansion_status[source_event].isolated_setup = true;
-      if (arithmetic_command)
-        node->cmd.arithmetic_has_redirections = true;
+      node->cmd.has_redirections = true;
       if (!add_document_read(out, max_nodes, max_edges, cmd_node_idx, kind,
                              name, name_len, value, value_len, fd, flags,
                              &out->status, &stage_document[fragment],
@@ -25838,6 +25938,44 @@ static SHELL_NONNULL(1, 6, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
     if (document_error != SHELL_DEP_OK)
       return dep_stop_graph_construction(out, document_error);
 
+    if (conditional_command) {
+      uint32_t body_table;
+      shell_dep_error_t body_error = dep_snapshot_phase_table(
+          out, streams, &parse_context, cmd_node_idx, UINT32_MAX,
+          DEP_SNAPSHOT_BODY_WORD, &body_table);
+      if (body_error != SHELL_DEP_OK)
+        return dep_stop_graph_construction(out, body_error);
+      bool body_active = dep_owner_phase_active(
+          &parse_context, cmd_node_idx, DEP_SNAPSHOT_BODY_WORD, UINT32_MAX);
+      dep_token_t operand = {cmd + condition.operand,
+                             (uint32_t)condition.operand_length};
+      const shell_dep_word_value_t *value = NULL;
+      body_error = dep_resolve_word(out, &parse_context, &operand,
+                                    out->cwd_buf.data + *range_cwd_offset,
+                                    cmd_node_idx, SHELL_EXPAND_WORD_CONDITIONAL,
+                                    body_active, UINT32_MAX, &value);
+      if (body_error != SHELL_DEP_OK)
+        return dep_stop_graph_construction(out, body_error);
+      body_error = dep_connect_word_substitutions(
+          out, max_nodes, max_edges, effective_cwd_buf_size, streams, &operand,
+          out->cwd_buf.data + *range_cwd_offset, limits, depth, &parse_context,
+          cmd_node_idx, UINT32_MAX, DEP_SNAPSHOT_BODY_WORD, cmd_node_idx);
+      if (body_error != SHELL_DEP_OK)
+        return dep_stop_graph_construction(out, body_error);
+      bool empty;
+      bool known = value && value->resolved;
+      if (known)
+        empty = value->first_length == 0;
+      else
+        known =
+            shell_conditional_static_empty(operand.start, operand.len, &empty);
+      if (known) {
+        bool truth = (empty == condition.empty) != condition.negated;
+        node->cmd.conditional_truth =
+            truth ? SHELL_CONDITIONAL_TRUE : SHELL_CONDITIONAL_FALSE;
+      }
+    }
+
     const dep_token_t *execution_target = effective_builtin;
     shell_dep_command_wrapper_t execution_wrapper = effective_wrapper;
     if (exec_analysis.kind != DEP_EXEC_NONE) {
@@ -25874,6 +26012,12 @@ static SHELL_NONNULL(1, 6, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
         outcomes = !arithmetic.known  ? DEP_STATUS_EITHER
                    : arithmetic.value ? DEP_STATUS_MAY_SUCCEED
                                       : DEP_STATUS_MAY_FAIL;
+      if (conditional_command)
+        outcomes = node->cmd.conditional_truth == SHELL_CONDITIONAL_UNKNOWN
+                       ? DEP_STATUS_EITHER
+                   : node->cmd.conditional_truth == SHELL_CONDITIONAL_TRUE
+                       ? DEP_STATUS_MAY_SUCCEED
+                       : DEP_STATUS_MAY_FAIL;
       if (expansion_status[source_event].redirect_scopes &
           DEP_REDIRECT_BAD_BUILTIN)
         outcomes = DEP_STATUS_MAY_FAIL;
@@ -26556,7 +26700,18 @@ void shell_dep_graph_dump(const shell_dep_graph_t *g, FILE *fp) {
                 : n->cmd.arithmetic_truth == SHELL_ARITHMETIC_NONZERO
                     ? "nonzero"
                     : "unknown",
-                n->cmd.arithmetic_has_redirections ? "yes" : "no");
+                n->cmd.has_redirections ? "yes" : "no");
+      }
+      if (n->cmd.kind == SHELL_COMMAND_CONDITIONAL) {
+        fputs(" conditional=\"", fp);
+        dep_dump_escaped_span(fp, n->cmd.conditional_expression,
+                              n->cmd.conditional_expression_length);
+        fprintf(fp, "\" truth=%s redirects=%s",
+                n->cmd.conditional_truth == SHELL_CONDITIONAL_TRUE ? "true"
+                : n->cmd.conditional_truth == SHELL_CONDITIONAL_FALSE
+                    ? "false"
+                    : "unknown",
+                n->cmd.has_redirections ? "yes" : "no");
       }
       fprintf(fp, " tokens=[");
       for (uint32_t j = 0; j < n->cmd.token_count; j++) {
@@ -27021,7 +27176,8 @@ shell_dep_graph_validate(const shell_dep_graph_t *g) {
     }
     if (n->type == SHELL_NODE_CMD) {
       if ((n->cmd.kind != SHELL_COMMAND_SIMPLE &&
-           n->cmd.kind != SHELL_COMMAND_ARITHMETIC) ||
+           n->cmd.kind != SHELL_COMMAND_ARITHMETIC &&
+           n->cmd.kind != SHELL_COMMAND_CONDITIONAL) ||
           (n->cmd.kind == SHELL_COMMAND_ARITHMETIC &&
            (n->cmd.token_count != 0 || n->cmd.effective_command_known ||
             !n->cmd.arithmetic_expression ||
@@ -27029,6 +27185,15 @@ shell_dep_graph_validate(const shell_dep_graph_t *g) {
         r.valid = false;
         snprintf(r.errors[r.error_count++].msg, 96,
                  "CMD node %u: invalid arithmetic command metadata", i);
+        continue;
+      }
+      if (n->cmd.kind == SHELL_COMMAND_CONDITIONAL &&
+          (n->cmd.token_count || n->cmd.effective_command_known ||
+           !n->cmd.conditional_expression || !n->cmd.conditional_operand ||
+           n->cmd.conditional_truth > SHELL_CONDITIONAL_TRUE)) {
+        r.valid = false;
+        snprintf(r.errors[r.error_count++].msg, 96,
+                 "CMD node %u: invalid conditional metadata", i);
         continue;
       }
       if (n->cmd.token_count > SHELL_DEP_MAX_TOKENS) {

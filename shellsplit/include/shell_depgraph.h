@@ -192,10 +192,10 @@ typedef enum {
 typedef enum {
   SHELL_DEP_EDGE_FLAG_NONE = 0,
   /* This SUBST edge supplies bytes that the shell incorporates into a word
-   * before invoking its command. A caller can submit that later content to a
-   * separate Shellgate inspection. Other SUBST edges model dynamic descriptor
-   * routing, such as process substitution, and must not be treated as shell
-   * word evaluation. */
+   * for a command argument or conditional string operand. A caller can submit
+   * that later content to a separate Shellgate inspection. Other SUBST edges
+   * model dynamic descriptor routing, such as process substitution, and must
+   * not be treated as shell word evaluation. */
   SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD = 1 << 0,
   /* This SUBST edge supplies a FILE document's runtime pathname. The value
    * affects I/O topology but is not itself command-word content for a later
@@ -304,6 +304,13 @@ typedef enum {
   SHELL_ARITHMETIC_NONZERO,
 } shell_arithmetic_truth_t;
 
+/* Predicate truth before redirect/setup or expansion failure. */
+typedef enum {
+  SHELL_CONDITIONAL_UNKNOWN = 0,
+  SHELL_CONDITIONAL_FALSE,
+  SHELL_CONDITIONAL_TRUE,
+} shell_conditional_truth_t;
+
 /**
  * CMD node - an isolated shell command
  *
@@ -313,16 +320,21 @@ typedef enum {
  * Quoted empty arguments survive. This expansion does not reopen the lexical
  * assignment-prefix or reserved-word positions.
  * cwd_offset is the offset into graph->cwd_buf.data for the resolved working
- * directory. Arithmetic commands have no argv tokens; their expression span
- * borrows the original immutable input just as simple-command tokens do.
+ * directory. Arithmetic and conditional commands have no argv tokens; their
+ * spans borrow the original immutable input just as simple-command tokens do.
  */
 typedef struct {
   shell_command_kind_t kind;
+  /* Borrowed source spans for CONDITIONAL; never argv or pathname operands. */
+  const char *conditional_expression, *conditional_operand;
+  uint32_t conditional_expression_length, conditional_operand_length;
+  shell_conditional_truth_t conditional_truth;
   const char *arithmetic_expression; /* Borrowed content for ARITHMETIC. */
   uint32_t arithmetic_expression_length;
   shell_arithmetic_truth_t arithmetic_truth;
-  bool arithmetic_has_redirections; /* Explicit setup, including unused copies.
-                                     */
+  bool
+      has_redirections; /* Explicit setup for any kind, including unused copies.
+                         */
   const char *tokens[SHELL_DEP_MAX_TOKENS];
   uint32_t token_lens[SHELL_DEP_MAX_TOKENS];
   uint32_t token_count;

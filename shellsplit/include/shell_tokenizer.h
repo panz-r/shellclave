@@ -43,11 +43,13 @@ typedef enum {
 } shell_status_t;
 
 /* Command form is independent of the preceding connector. GROUP describes
- * container headers; flattened records use SIMPLE or ARITHMETIC. */
+ * container headers; flattened records use SIMPLE, ARITHMETIC or CONDITIONAL.
+ */
 typedef enum {
   SHELL_COMMAND_SIMPLE = 0,
   SHELL_COMMAND_GROUP,
   SHELL_COMMAND_ARITHMETIC,
+  SHELL_COMMAND_CONDITIONAL,
 } shell_command_kind_t;
 
 /**
@@ -110,7 +112,10 @@ typedef enum {
  * or semantic support; standalone keyword spellings remain lexical markers
  * even in ordinary argument positions.
  * Arithmetic commands and expansions use arithmetic syntax for their bodies;
+ * Conditional operands suppress pathname-glob features and control-word roles;
  * executable children establish their own shell-command feature context.
+ * Extglob alternatives are pattern data; active expansions within them still
+ * contribute their feature bits, including nested executable-child features.
  */
 typedef enum {
   SHELL_FEAT_NONE = 0,
@@ -122,7 +127,7 @@ typedef enum {
   SHELL_FEAT_HERESTRING = 1 << 5,       // <<< here-string (in subcommand)
   SHELL_FEAT_PROCESS_SUB = 1 << 6,      // <(cmd), >(cmd)
   SHELL_FEAT_LOOPS = 1 << 7,            // while, for, until loops
-  SHELL_FEAT_CONDITIONALS = 1 << 8,     // if/then/elif/else/fi
+  SHELL_FEAT_CONDITIONALS = 1 << 8,     // if/then/elif/else/fi and [[...]]
   SHELL_FEAT_CASE = 1 << 9,             // case/esac statements
   SHELL_FEAT_SUBSHELL_FILE = 1 << 10,   // $(<file) - read from file
   SHELL_FEAT_PIPELINE = 1 << 11,        // literal | or |& pipeline construct

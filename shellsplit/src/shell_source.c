@@ -1,4 +1,5 @@
 #include "shell_source.h"
+#include "shell_conditional_internal.h"
 #include "shell_keywords_internal.h"
 #include "shell_processor_internal.h"
 #include "shell_source_admission_internal.h"
@@ -328,6 +329,38 @@ static SHELL_NONNULL(1, 2) bool collect_body(source_collector_t *collector,
       continuation = false;
     }
     collector->header = current;
+    if (token.type == SHELL_TOKEN_CONDITIONAL_COMMAND) {
+      shell_conditional_t condition =
+          shell_conditional_parse(source, length, start);
+      if (condition.frame == SHELL_CONDITIONAL_INVALID ||
+          condition.frame == SHELL_CONDITIONAL_UNSUPPORTED) {
+        collector->failure = condition.frame == SHELL_CONDITIONAL_INVALID
+                                 ? SHELL_SOURCE_INVALID
+                                 : SHELL_SOURCE_UNSUPPORTED;
+        return false;
+      }
+      shell_source_header_t *header = &out->headers[current];
+      header->kind = SHELL_COMMAND_CONDITIONAL;
+      header->compound = true;
+      header->conditional_expression =
+          (shell_source_span_t){(uint32_t)(base + condition.content),
+                                (uint32_t)(condition.end - condition.content)};
+      header->conditional_operand =
+          (shell_source_span_t){(uint32_t)(base + condition.operand),
+                                (uint32_t)condition.operand_length};
+      if (condition.frame == SHELL_CONDITIONAL_INCOMPLETE) {
+        header->complete = false;
+        need(body, SHELL_SOURCE_NEEDS_CONDITIONAL, base + start);
+      }
+      if (condition.operand_length &&
+          !collect_expansions(
+              collector, body, base + condition.operand,
+              condition.operand_length, depth + group_count, false,
+              condition.frame == SHELL_CONDITIONAL_INCOMPLETE, false))
+        return false;
+      covered = condition.after;
+      continue;
+    }
     if (token.type == SHELL_TOKEN_ARITHMETIC_COMMAND) {
       const char *expression;
       size_t expression_length;

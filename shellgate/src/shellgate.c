@@ -1475,6 +1475,12 @@ static SHELL_NONNULL(1, 2, 3) uint32_t
     }
     if (node->type != SHELL_NODE_CMD)
       continue;
+    if (node->cmd.kind == SHELL_COMMAND_CONDITIONAL) {
+      const shell_dep_word_value_t *value =
+          shell_expand_lookup(cache, node->cmd.conditional_operand);
+      if (value && value->dynamic && !value->resolved)
+        flags[ni] |= SG_EXPANSION_UNRESOLVED_CONDITION;
+    }
     for (uint32_t token = 0; token < node->cmd.token_count; token++) {
       SG_EXPANSION_WORK();
       const shell_dep_word_value_t *value =
@@ -2950,7 +2956,7 @@ static SHELL_NONNULL(1, 2) void sg_control_reachability_prepare(
 typedef struct {
   uint32_t group_parent[SHELL_DEP_MAX_NODES];
   bool timing_edge[SHELL_DEP_MAX_NODES];
-  bool timing_compatible[SHELL_DEP_MAX_NODES];
+  bool neutral_compatible[SHELL_DEP_MAX_NODES];
   bool unsafe_group_ancestor[SHELL_DEP_MAX_NODES];
 } sg_policy_graph_summary_t;
 
@@ -2968,7 +2974,7 @@ static SHELL_NONNULL(1, 2) void sg_policy_graph_summarize(
   uint32_t next_group_sibling[SHELL_DEP_MAX_NODES];
   for (uint32_t node = 0; node < graph->node_count; node++) {
     summary->group_parent[node] = UINT32_MAX;
-    summary->timing_compatible[node] = true;
+    summary->neutral_compatible[node] = true;
     first_group_child[node] = UINT32_MAX;
     next_group_sibling[node] = UINT32_MAX;
   }
@@ -3014,9 +3020,11 @@ static SHELL_NONNULL(1, 2) void sg_policy_graph_summarize(
           (edge->type == SHELL_EDGE_GROUP && edge->to == endpoint &&
            graph->nodes[edge->from].type == SHELL_NODE_GROUP) ||
           edge->type == SHELL_EDGE_SEQ || edge->type == SHELL_EDGE_AND ||
-          edge->type == SHELL_EDGE_OR || edge->type == SHELL_EDGE_BACKGROUND;
+          edge->type == SHELL_EDGE_OR || edge->type == SHELL_EDGE_BACKGROUND ||
+          (graph->nodes[endpoint].cmd.kind == SHELL_COMMAND_CONDITIONAL &&
+           edge->type == SHELL_EDGE_SUBST && edge->to == endpoint);
       if (!allowed)
-        summary->timing_compatible[endpoint] = false;
+        summary->neutral_compatible[endpoint] = false;
     }
     if (edge->type == SHELL_EDGE_TIME && edge->to < graph->node_count)
       summary->timing_edge[edge->to] = true;
@@ -3056,22 +3064,23 @@ static SHELL_NONNULL(1, 2) void sg_policy_graph_summarize(
   }
 }
 
-/* Pure arithmetic and empty timing have execution endpoints without argv.
- * Arithmetic-owned redirects always require separate coverage. Enclosing
+/* Pure expression commands and empty timing have execution endpoints without
+ * argv. Expression-owned redirects require separate coverage. Enclosing
  * groups likewise cannot hide I/O without a contained argv policy subject. */
 static SHELL_NONNULL(1, 2) bool sg_argvless_command_is_policy_neutral(
     const shell_dep_graph_t *graph, const sg_policy_graph_summary_t *summary,
     uint32_t command_index) {
   uint32_t group = summary->group_parent[command_index];
   const shell_dep_cmd_t *command = &graph->nodes[command_index].cmd;
-  if (command->kind == SHELL_COMMAND_ARITHMETIC)
-    return !command->arithmetic_has_redirections &&
-           summary->timing_compatible[command_index] &&
+  if (command->kind == SHELL_COMMAND_ARITHMETIC ||
+      command->kind == SHELL_COMMAND_CONDITIONAL)
+    return !command->has_redirections &&
+           summary->neutral_compatible[command_index] &&
            (group == UINT32_MAX || !summary->unsafe_group_ancestor[group]);
   if (command->pipeline_time_mode == SHELL_PIPE_TIME_NONE)
     return false;
   return summary->timing_edge[command_index] &&
-         summary->timing_compatible[command_index] &&
+         summary->neutral_compatible[command_index] &&
          (group == UINT32_MAX || !summary->unsafe_group_ancestor[group]);
 }
 

@@ -20,7 +20,12 @@ extern "C" {
  * values are ignored for other statuses. Failed or malformed results fail the
  * enclosing operation.
  *
- * The application performs quote-sensitive composition, splitting and globbing
+ * CONDITIONAL requests instead require one final NUL-free string record,
+ * including 0:, for empty; suppress splitting, pathname and brace expansion.
+ * Join positional expansion results according to Bash conditional semantics.
+ *
+ * For argument and pathname purposes the application performs quote-sensitive
+ * composition, splitting and globbing
  * in Bash expansion order. It must return a result valid for every execution
  * state reaching this expansion point, accounting for earlier/scoped effects;
  * otherwise return UNRESOLVED. This library never executes an expansion.
@@ -52,6 +57,10 @@ typedef enum {
   SHELL_EXPAND_WORD_ARGUMENT = 0,
   SHELL_EXPAND_WORD_REDIRECT_PATH,
   SHELL_EXPAND_WORD_FILE_SUBSTITUTION_PATH,
+  /* One conditional string, without word splitting, globbing or brace
+   * expansion. RESOLVED requires one NUL-free record, including 0:, for an
+   * empty string. */
+  SHELL_EXPAND_WORD_CONDITIONAL,
 } shell_expand_word_purpose_t;
 
 /* Source/word/owner spans borrow immutable source for this operation.

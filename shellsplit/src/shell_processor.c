@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 #include "shell_processor.h"
 #include "alloc.h"
+#include "shell_conditional_internal.h"
 #include "shell_netstring.h"
 #include "shell_pipeline_internal.h"
 #include "shell_processor_internal.h"
@@ -27,6 +28,7 @@ static bool is_shell_operator_token(const shell_token_t *token) {
          token->type == SHELL_TOKEN_PIPE_TIME ||
          token->type == SHELL_TOKEN_PIPE_TIME_OPTION ||
          token->type == SHELL_TOKEN_ARITHMETIC_COMMAND ||
+         token->type == SHELL_TOKEN_CONDITIONAL_COMMAND ||
          token->type == SHELL_TOKEN_REDIRECT_IN ||
          token->type == SHELL_TOKEN_REDIRECT_OUT ||
          token->type == SHELL_TOKEN_REDIRECT_ERR ||
@@ -863,6 +865,15 @@ static SHELL_NONNULL(1, 3, 4) bool anomaly_collect_command_substitutions(
       heredoc_after = after;
       continue;
     }
+    if (token->type == SHELL_TOKEN_CONDITIONAL_COMMAND) {
+      shell_conditional_t condition =
+          shell_conditional_parse(token->start, token->length, 0);
+      if (!anomaly_collect_substitutions(token->start + condition.operand,
+                                         condition.operand_length, false,
+                                         collect))
+        return false;
+      continue;
+    }
     if (token->type == SHELL_TOKEN_ARITHMETIC ||
         token->type == SHELL_TOKEN_ARITHMETIC_COMMAND) {
       const char *content;
@@ -1605,6 +1616,19 @@ static SHELL_NONNULL(1, 2) void own_token_text(const shell_command_t *basic_cmd,
                 basic_cmd->start_pos, info->original_command);
   rebase_tokens(info->command_tokens, info->command_token_count,
                 basic_cmd->start_pos, info->original_command);
+  if (info->kind == SHELL_COMMAND_CONDITIONAL) {
+    for (size_t i = 0; i < info->shell_token_count; ++i) {
+      const shell_token_t *token = &info->shell_tokens[i];
+      if (token->type != SHELL_TOKEN_CONDITIONAL_COMMAND)
+        continue;
+      shell_conditional_t condition =
+          shell_conditional_parse(token->start, token->length, 0);
+      info->conditional_expression = token->start + condition.content;
+      info->conditional_expression_length = condition.end - condition.content;
+      info->conditional_operand = token->start + condition.operand;
+      info->conditional_operand_length = condition.operand_length;
+    }
+  }
   if (info->kind == SHELL_COMMAND_ARITHMETIC) {
     for (size_t i = 0; i < info->shell_token_count; ++i) {
       const shell_token_t *token = &info->shell_tokens[i];
@@ -2240,7 +2264,7 @@ static SHELL_NONNULL(1, 3, 5, 7, 8) shell_process_status_t
     shell_command_infos_free(one, count);
     return SHELL_PROCESS_EPARSE;
   }
-  if (!retain_empty && one[0].kind != SHELL_COMMAND_ARITHMETIC &&
+  if (!retain_empty && one[0].kind == SHELL_COMMAND_SIMPLE &&
       !command_info_has_arguments(&one[0])) {
     shell_command_infos_free(one, count);
     return SHELL_PROCESS_OK;
@@ -2724,7 +2748,7 @@ static SHELL_NONNULL(1, 4, 6, 7) shell_process_status_t
   size_t rendered_count = 0;
   for (size_t i = 0; i < count; i++) {
     if (shell_processed_command_word_count(&commands[i]) == 0) {
-      if (commands[i].kind == SHELL_COMMAND_ARITHMETIC ||
+      if (commands[i].kind != SHELL_COMMAND_SIMPLE ||
           shell_processed_command_is_empty_timing(&commands[i])) {
         *has_shell_features = true;
         continue;
@@ -2766,7 +2790,7 @@ static SHELL_NONNULL(1, 4, 6, 7) shell_process_status_t
   }
   char *position = encoded;
   for (size_t i = 0; i < count; i++) {
-    if (commands[i].kind == SHELL_COMMAND_ARITHMETIC ||
+    if (commands[i].kind != SHELL_COMMAND_SIMPLE ||
         shell_processed_command_is_empty_timing(&commands[i]))
       continue;
     size_t length = 0;

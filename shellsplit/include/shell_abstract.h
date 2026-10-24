@@ -22,17 +22,18 @@ extern "C" {
  * Abstract token kind used by downstream validation logic.
  */
 typedef enum {
-  SHELL_ABSTRACT_EV,   // Environment variable: $FOO → $EV_1
-  SHELL_ABSTRACT_PV,   // Positional: $1 → $PV_1
-  SHELL_ABSTRACT_SV,   // Special: $? → $SV_1
-  SHELL_ABSTRACT_AP,   // Absolute path: /etc → $AP_1
-  SHELL_ABSTRACT_RP,   // Relative path: ./foo → $RP_1
-  SHELL_ABSTRACT_HP,   // Home path: ~/file → $HP_1
-  SHELL_ABSTRACT_GB,   // Glob: *.txt → $GB_1
-  SHELL_ABSTRACT_CS,   // Command subst: $(cmd) → $CS_1
-  SHELL_ABSTRACT_AR,   // Arithmetic expansion or command → $AR_1
-  SHELL_ABSTRACT_STR,  // String: "foo" → $STR_1
-  SHELL_ABSTRACT_REDIR // Redirect target: > file → $RD_1
+  SHELL_ABSTRACT_EV,    // Environment variable: $FOO → $EV_1
+  SHELL_ABSTRACT_PV,    // Positional: $1 → $PV_1
+  SHELL_ABSTRACT_SV,    // Special: $? → $SV_1
+  SHELL_ABSTRACT_AP,    // Absolute path: /etc → $AP_1
+  SHELL_ABSTRACT_RP,    // Relative path: ./foo → $RP_1
+  SHELL_ABSTRACT_HP,    // Home path: ~/file → $HP_1
+  SHELL_ABSTRACT_GB,    // Glob: *.txt → $GB_1
+  SHELL_ABSTRACT_CS,    // Command subst: $(cmd) → $CS_1
+  SHELL_ABSTRACT_AR,    // Arithmetic expansion or command → $AR_1
+  SHELL_ABSTRACT_STR,   // String: "foo" → $STR_1
+  SHELL_ABSTRACT_REDIR, // Redirect target: > file → $RD_1
+  SHELL_ABSTRACT_CT,    // Conditional string command -> $CT_1
 } shell_abstract_type_t;
 
 /**
@@ -92,7 +93,7 @@ typedef struct {
     } glob;
 
     struct {
-      /* Owned, non-NULL string for CS, AR and STR elements, including an
+      /* Owned, non-NULL string for CS, AR, CT and STR elements, including an
        * empty string for an empty payload. Excludes the source delimiters;
        * physical continuations within the payload are preserved. */
       char *content;
@@ -170,9 +171,9 @@ typedef enum {
 
 /* Shellsplit abstracts modeled simple-command lists, pipelines, and
  * brace/subshell groups. Control compounds (including function declarations,
- * `select`, and `coproc`), shell-semantic array forms, and unmodeled Bash
- * `[[ … ]]`, dynamic/mutating arithmetic commands, `$"…"`, and `;&` / `;;&`
- * forms return SHELL_ABSTRACT_EPARSE. */
+ * `select`, and `coproc`), shell-semantic array forms, and wider Bash
+ * `[[ … ]]` predicates, dynamic/mutating arithmetic commands, `$"…"`, and `;&`
+ * / `;;&` forms return SHELL_ABSTRACT_EPARSE. */
 shell_abstract_status_t
 shell_abstract_command_parse(const char *command, size_t command_length,
                              shell_abstract_command_t **out)

@@ -1,3 +1,4 @@
+#include "shell_conditional_internal.h"
 #include "shell_source_admission_internal.h"
 #include "shell_source_internal.h"
 #include "shell_tokenizer_full_internal.h"
@@ -128,6 +129,16 @@ static SHELL_NONNULL(1) shell_source_status_t
       }
       /* An unfinished quoted delimiter is still a data island. Syntax
        * validation, not byte admission, decides whether it is complete. */
+    } else if (token.type == SHELL_TOKEN_CONDITIONAL_COMMAND) {
+      shell_conditional_t condition =
+          shell_conditional_parse(source, length, token.position);
+      if (condition.operand_length) {
+        shell_source_status_t status = word_byte_islands(
+            source + condition.operand, condition.operand_length, depth, false,
+            true, false);
+        if (status != SHELL_SOURCE_COMPLETE)
+          return status;
+      }
     } else if (token.type == SHELL_TOKEN_ARITHMETIC_COMMAND) {
       const char *content;
       size_t content_length;

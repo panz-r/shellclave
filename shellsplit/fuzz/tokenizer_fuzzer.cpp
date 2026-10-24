@@ -15,6 +15,7 @@
 #include "../tests/ansi_nul_cases.h"
 #include "../tests/ansi_parameter_cases.h"
 #include "../tests/arithmetic_cases.h"
+#include "../tests/conditional_cases.h"
 #include "../tests/depgraph_compare.h"
 #include "../tests/malformed_source_cases.h"
 #include "../tests/source_compare.h"
@@ -701,12 +702,15 @@ static int test_generated_document_boundary(uint8_t selector) {
 }
 
 static int test_fixed_oracles(void) {
+  /* Independent retained results belong on the heap: ASan reserves distinct
+   * stack slots for the many fixture scopes in this startup sweep. */
   for (const auto &fixture : shellsplit_test_substitution_status_cases) {
     for (unsigned success = 0; success < 2; success++) {
       std::string source =
           std::string(fixture.source) +
           (success ? " && echo >/etc/reached" : " || echo >/etc/reached");
-      shell_dep_graph_t graph = {};
+      std::unique_ptr<shell_dep_graph_t> graph_storage(new shell_dep_graph_t{});
+      shell_dep_graph_t &graph = *graph_storage;
       if (shell_dep_graph_parse(source.data(), source.size(), ".", nullptr,
                                 &graph) != SHELL_DEP_OK ||
           !shell_dep_graph_validate(&graph).valid)
@@ -733,7 +737,8 @@ static int test_fixed_oracles(void) {
       return fixed_oracle_failure(__LINE__);
   }
   for (const auto &fixture : shellsplit_test_expansion_time_routes) {
-    shell_dep_graph_t graph = {};
+    std::unique_ptr<shell_dep_graph_t> graph_storage(new shell_dep_graph_t{});
+    shell_dep_graph_t &graph = *graph_storage;
     if (shell_dep_graph_parse(fixture.source, std::strlen(fixture.source), ".",
                               nullptr, &graph) != SHELL_DEP_OK ||
         !shell_dep_graph_validate(&graph).valid)
@@ -781,7 +786,8 @@ static int test_fixed_oracles(void) {
       return fixed_oracle_failure(__LINE__);
   }
   for (const auto &fixture : shellsplit_test_expansion_setup) {
-    shell_dep_graph_t graph = {};
+    std::unique_ptr<shell_dep_graph_t> graph_storage(new shell_dep_graph_t{});
+    shell_dep_graph_t &graph = *graph_storage;
     if (shell_dep_graph_parse(fixture.source, std::strlen(fixture.source), ".",
                               nullptr, &graph) != SHELL_DEP_OK ||
         !shell_dep_graph_validate(&graph).valid)
@@ -819,7 +825,8 @@ static int test_fixed_oracles(void) {
     }
   }
   for (const auto &fixture : shellsplit_test_exec_continuations) {
-    shell_dep_graph_t graph = {};
+    std::unique_ptr<shell_dep_graph_t> graph_storage(new shell_dep_graph_t{});
+    shell_dep_graph_t &graph = *graph_storage;
     if (shell_dep_graph_parse(fixture.source, std::strlen(fixture.source), ".",
                               nullptr, &graph) != SHELL_DEP_OK ||
         !shell_dep_graph_validate(&graph).valid)
@@ -849,7 +856,8 @@ static int test_fixed_oracles(void) {
       return fixed_oracle_failure(__LINE__);
   }
   for (const auto &fixture : shellsplit_test_assignment_snapshots) {
-    shell_dep_graph_t graph = {};
+    std::unique_ptr<shell_dep_graph_t> graph_storage(new shell_dep_graph_t{});
+    shell_dep_graph_t &graph = *graph_storage;
     shell_dep_error_t error = shell_dep_graph_parse(
         fixture.source, std::strlen(fixture.source), ".", nullptr, &graph);
     if (fixture.resolved
@@ -862,7 +870,8 @@ static int test_fixed_oracles(void) {
     }
   }
   for (const auto &fixture : shellsplit_test_builtin_routes) {
-    shell_dep_graph_t graph = {};
+    std::unique_ptr<shell_dep_graph_t> graph_storage(new shell_dep_graph_t{});
+    shell_dep_graph_t &graph = *graph_storage;
     shell_dep_error_t error = shell_dep_graph_parse(
         fixture.source, std::strlen(fixture.source), ".", nullptr, &graph);
     if (fixture.resolved
@@ -871,7 +880,8 @@ static int test_fixed_oracles(void) {
       return fixed_oracle_failure(__LINE__);
   }
   for (const auto &fixture : shellsplit_test_ifs_routes) {
-    shell_dep_graph_t graph = {};
+    std::unique_ptr<shell_dep_graph_t> graph_storage(new shell_dep_graph_t{});
+    shell_dep_graph_t &graph = *graph_storage;
     shell_dep_error_t error = shell_dep_graph_parse(
         fixture.source, std::strlen(fixture.source), ".", nullptr, &graph);
     if (!fixture.supported) {
@@ -920,7 +930,8 @@ static int test_fixed_oracles(void) {
     shell_processed_commands_free(&processed);
     if (processed_ok != syntax_supported)
       return fixed_oracle_failure(__LINE__);
-    shell_dep_graph_t graph = {};
+    std::unique_ptr<shell_dep_graph_t> graph_storage(new shell_dep_graph_t{});
+    shell_dep_graph_t &graph = *graph_storage;
     shell_dep_error_t graph_error =
         shell_dep_graph_parse(fixture.source, length, ".", nullptr, &graph);
     if (fixture.supported ? graph_error != SHELL_DEP_OK ||
@@ -930,7 +941,8 @@ static int test_fixed_oracles(void) {
       return fixed_oracle_failure(__LINE__);
   }
   for (const auto &fixture : shellsplit_test_setup_time_outcomes) {
-    shell_dep_graph_t graph = {};
+    std::unique_ptr<shell_dep_graph_t> graph_storage(new shell_dep_graph_t{});
+    shell_dep_graph_t &graph = *graph_storage;
     if (shell_dep_graph_parse(fixture.source, std::strlen(fixture.source), ".",
                               nullptr, &graph) != SHELL_DEP_OK ||
         !shell_dep_graph_validate(&graph).valid)
@@ -967,7 +979,9 @@ static int test_fixed_oracles(void) {
   /* Some rows inspect different routes of the same retained graph. Reuse an
    * adjacent identical source rather than repeating its full semantic parse;
    * every row's independent route expectation is still checked below. */
-  shell_dep_graph_t cleanup_graph = {};
+  std::unique_ptr<shell_dep_graph_t> cleanup_graph_storage(
+      new shell_dep_graph_t{});
+  shell_dep_graph_t &cleanup_graph = *cleanup_graph_storage;
   const char *cleanup_source = nullptr;
   shell_dep_error_t cleanup_status = SHELL_DEP_OK;
   shell_dep_graph_validation_t cleanup_validation = {};
@@ -1050,14 +1064,16 @@ static int test_fixed_oracles(void) {
       return fixed_oracle_failure(__LINE__);
   }
   for (const char *source : shellsplit_test_invalidated_reallocation) {
-    shell_dep_graph_t graph = {};
+    std::unique_ptr<shell_dep_graph_t> graph_storage(new shell_dep_graph_t{});
+    shell_dep_graph_t &graph = *graph_storage;
     if (shell_dep_graph_parse(source, std::strlen(source), ".", nullptr,
                               &graph) != SHELL_DEP_EPARSE ||
         graph.node_count || graph.edge_count)
       return fixed_oracle_failure(__LINE__);
   }
   for (const auto &fixture : shellsplit_test_descriptor_outcomes) {
-    shell_dep_graph_t graph = {};
+    std::unique_ptr<shell_dep_graph_t> graph_storage(new shell_dep_graph_t{});
+    shell_dep_graph_t &graph = *graph_storage;
     if (shell_dep_graph_parse(fixture.source, std::strlen(fixture.source), ".",
                               nullptr, &graph) != SHELL_DEP_OK ||
         !shell_dep_graph_validate(&graph).valid)
@@ -1095,7 +1111,8 @@ static int test_fixed_oracles(void) {
       return fixed_oracle_failure(__LINE__);
   }
   for (const auto &fixture : shellsplit_test_scope_outcomes) {
-    shell_dep_graph_t graph = {};
+    std::unique_ptr<shell_dep_graph_t> graph_storage(new shell_dep_graph_t{});
+    shell_dep_graph_t &graph = *graph_storage;
     bool valid =
         shell_dep_graph_parse(fixture.source, std::strlen(fixture.source), ".",
                               nullptr, &graph) == SHELL_DEP_OK &&
@@ -1123,7 +1140,8 @@ static int test_fixed_oracles(void) {
       return fixed_oracle_failure(__LINE__);
   }
   for (const auto &fixture : shellsplit_test_cwd_reachability) {
-    shell_dep_graph_t graph = {};
+    std::unique_ptr<shell_dep_graph_t> graph_storage(new shell_dep_graph_t{});
+    shell_dep_graph_t &graph = *graph_storage;
     if (shell_dep_graph_parse(fixture.source, std::strlen(fixture.source),
                               "/workspace", nullptr, &graph) != SHELL_DEP_OK ||
         !shell_dep_graph_validate(&graph).valid)
@@ -1149,7 +1167,8 @@ static int test_fixed_oracles(void) {
       return fixed_oracle_failure(__LINE__);
   }
   for (const auto &fixture : shellsplit_test_skipped_dup_operands) {
-    shell_dep_graph_t graph = {};
+    std::unique_ptr<shell_dep_graph_t> graph_storage(new shell_dep_graph_t{});
+    shell_dep_graph_t &graph = *graph_storage;
     if (shell_dep_graph_parse(fixture.source, std::strlen(fixture.source), ".",
                               nullptr, &graph) != SHELL_DEP_OK ||
         !shell_dep_graph_validate(&graph).valid)
@@ -1202,7 +1221,8 @@ static int test_fixed_oracles(void) {
   };
   shell_dep_limits_t limits = SHELL_DEP_LIMITS_DEFAULT;
   for (const auto &item : cwd_files) {
-    shell_dep_graph_t graph = {};
+    std::unique_ptr<shell_dep_graph_t> graph_storage(new shell_dep_graph_t{});
+    shell_dep_graph_t &graph = *graph_storage;
     if (shell_dep_graph_parse(item.source, strlen(item.source), "/workspace",
                               &limits, &graph) != SHELL_DEP_OK ||
         !shell_dep_graph_validate(&graph).valid)
@@ -1245,7 +1265,8 @@ static int test_fixed_oracles(void) {
        false},
   };
   for (const auto &item : process_pipes) {
-    shell_dep_graph_t graph = {};
+    std::unique_ptr<shell_dep_graph_t> graph_storage(new shell_dep_graph_t{});
+    shell_dep_graph_t &graph = *graph_storage;
     if (shell_dep_graph_parse(item.source, strlen(item.source), ".", nullptr,
                               &graph) != SHELL_DEP_OK ||
         !shell_dep_graph_validate(&graph).valid)
@@ -1293,7 +1314,8 @@ static int test_fixed_oracles(void) {
             fast.count || fast.group_count || fast.status != SHELL_STATUS_ERROR)
           return fixed_oracle_failure(__LINE__);
       }
-      shell_dep_graph_t graph = {};
+      std::unique_ptr<shell_dep_graph_t> graph_storage(new shell_dep_graph_t{});
+      shell_dep_graph_t &graph = *graph_storage;
       if (shell_dep_graph_parse(source, length, ".", nullptr, &graph) !=
               SHELL_DEP_EPARSE ||
           graph.node_count || graph.edge_count || graph.cwd_buf.len)
@@ -1698,7 +1720,9 @@ static int test_fixed_oracles(void) {
   size_t pipe_both_count = 0;
   shell_command_info_t *pipe_both_infos = NULL;
   size_t pipe_both_info_count = 0;
-  shell_dep_graph_t pipe_both_graph = {};
+  std::unique_ptr<shell_dep_graph_t> pipe_both_graph_storage(
+      new shell_dep_graph_t{});
+  shell_dep_graph_t &pipe_both_graph = *pipe_both_graph_storage;
   bool pipe_both_ok =
       shell_parse_fast("printf x |& cat", strlen("printf x |& cat"), NULL,
                        &modern) == SHELL_OK &&
@@ -1814,7 +1838,9 @@ static int test_fixed_oracles(void) {
   shell_command_info_t *close_infos = NULL;
   size_t close_info_count = 0;
   shell_netstring_buffer_t close_netargv = {};
-  shell_dep_graph_t close_graph = {};
+  std::unique_ptr<shell_dep_graph_t> close_graph_storage(
+      new shell_dep_graph_t{});
+  shell_dep_graph_t &close_graph = *close_graph_storage;
   bool raw_close_suffix_ok =
       shell_tokenize_commands(raw_close_suffix, sizeof(raw_close_suffix) - 1,
                               &close_tokens,
@@ -1864,8 +1890,12 @@ static int test_fixed_oracles(void) {
   static const char named_close[] = "exec {fd}>out; exec {fd}>&-";
   static const char named_alias_close[] =
       "exec {fd}>out; exec {copy}>&$fd; exec {fd}>&-";
-  shell_dep_graph_t named_close_graph = {};
-  shell_dep_graph_t named_alias_close_graph = {};
+  std::unique_ptr<shell_dep_graph_t> named_close_graph_storage(
+      new shell_dep_graph_t{});
+  shell_dep_graph_t &named_close_graph = *named_close_graph_storage;
+  std::unique_ptr<shell_dep_graph_t> named_alias_close_graph_storage(
+      new shell_dep_graph_t{});
+  shell_dep_graph_t &named_alias_close_graph = *named_alias_close_graph_storage;
   bool named_close_ok =
       shell_dep_graph_parse(named_close, sizeof(named_close) - 1, ".", NULL,
                             &named_close_graph) == SHELL_DEP_OK &&
@@ -1903,7 +1933,9 @@ static int test_fixed_oracles(void) {
 
   static const char raw_close_group[] = "{ printf x; } >&-file";
   shell_processed_commands_t rejected_group = {};
-  shell_dep_graph_t rejected_graph = {};
+  std::unique_ptr<shell_dep_graph_t> rejected_graph_storage(
+      new shell_dep_graph_t{});
+  shell_dep_graph_t &rejected_graph = *rejected_graph_storage;
   bool raw_close_group_ok =
       shell_process_commands(raw_close_group, sizeof(raw_close_group) - 1, NULL,
                              &rejected_group) == SHELL_PROCESS_EPARSE &&
@@ -1934,7 +1966,8 @@ static int test_fixed_oracles(void) {
     shell_command_t *commands = NULL;
     size_t command_count = 0;
     shell_processed_commands_t processed = {};
-    shell_dep_graph_t graph = {};
+    std::unique_ptr<shell_dep_graph_t> graph_storage(new shell_dep_graph_t{});
+    shell_dep_graph_t &graph = *graph_storage;
     bool opaque_word_ok =
         shell_parse_fast(input, strlen(input), NULL, &parsed) == SHELL_OK &&
         parsed.count == 1 && parsed.cmds[0].type == SHELL_TYPE_SIMPLE &&
@@ -1977,7 +2010,8 @@ static int test_fixed_oracles(void) {
     shell_transformed_command_t **transformed = NULL;
     size_t transformed_count = 0;
     shell_abstract_command_t *abstract = NULL;
-    shell_dep_graph_t graph = {};
+    std::unique_ptr<shell_dep_graph_t> graph_storage(new shell_dep_graph_t{});
+    shell_dep_graph_t &graph = *graph_storage;
     bool parameter_brace_ok =
         shell_parse_fast(item.input, strlen(item.input), NULL, &parsed) ==
             SHELL_OK &&
@@ -2042,7 +2076,8 @@ static int test_fixed_oracles(void) {
       {"command <() /bin/echo /tmp/input", {"/bin/echo", "/tmp/input"}},
       {"$(printf program) /tmp/input", {"/tmp/input", nullptr}}};
   for (const auto &item : file_argument_cases) {
-    shell_dep_graph_t graph = {};
+    std::unique_ptr<shell_dep_graph_t> graph_storage(new shell_dep_graph_t{});
+    shell_dep_graph_t &graph = *graph_storage;
     if (shell_dep_graph_parse(item.source, strlen(item.source), "/workspace",
                               nullptr, &graph) != SHELL_DEP_OK ||
         !shell_dep_graph_validate(&graph).valid)
@@ -2075,7 +2110,8 @@ static int test_fixed_oracles(void) {
     shell_command_t *commands = NULL;
     size_t command_count = 0;
     shell_processed_commands_t processed = {};
-    shell_dep_graph_t graph = {};
+    std::unique_ptr<shell_dep_graph_t> graph_storage(new shell_dep_graph_t{});
+    shell_dep_graph_t &graph = *graph_storage;
     uint32_t pipe_count = 0;
     bool structural_word_ok =
         shell_parse_fast(input, strlen(input), NULL, &parsed) == SHELL_OK &&
@@ -2117,7 +2153,8 @@ static int test_fixed_oracles(void) {
     shell_command_t *commands = NULL;
     size_t command_count = 0;
     shell_processed_commands_t processed = {};
-    shell_dep_graph_t graph = {};
+    std::unique_ptr<shell_dep_graph_t> graph_storage(new shell_dep_graph_t{});
+    shell_dep_graph_t &graph = *graph_storage;
     uint32_t pipe_count = 0;
     bool redirect_fragment_ok =
         shell_parse_fast(item.input, strlen(item.input), NULL, &parsed) ==
@@ -2160,7 +2197,8 @@ static int test_fixed_oracles(void) {
   for (const auto &item : document_pipeline_cases) {
     shell_parse_result_t parsed = {};
     shell_processed_commands_t processed = {};
-    shell_dep_graph_t graph = {};
+    std::unique_ptr<shell_dep_graph_t> graph_storage(new shell_dep_graph_t{});
+    shell_dep_graph_t &graph = *graph_storage;
     bool document_pipeline_ok =
         shell_parse_fast(item.input, strlen(item.input), NULL, &parsed) ==
             SHELL_OK &&
@@ -2192,7 +2230,8 @@ static int test_fixed_oracles(void) {
   for (const char *input : named_document_cases) {
     shell_parse_result_t parsed = {};
     shell_processed_commands_t processed = {};
-    shell_dep_graph_t graph = {};
+    std::unique_ptr<shell_dep_graph_t> graph_storage(new shell_dep_graph_t{});
+    shell_dep_graph_t &graph = *graph_storage;
     bool named_document_ok =
         shell_parse_fast(input, strlen(input), NULL, &parsed) == SHELL_OK &&
         shell_process_commands(input, strlen(input), NULL, &processed) ==
@@ -2251,7 +2290,8 @@ static int test_fixed_oracles(void) {
   };
   for (const char *input : named_fd_route_cases) {
     shell_processed_commands_t processed = {};
-    shell_dep_graph_t graph = {};
+    std::unique_ptr<shell_dep_graph_t> graph_storage(new shell_dep_graph_t{});
+    shell_dep_graph_t &graph = *graph_storage;
     bool named_fd_ok = shell_process_commands(input, strlen(input), NULL,
                                               &processed) == SHELL_PROCESS_OK &&
                        processed.command_count >= 1 &&
@@ -2294,7 +2334,8 @@ static int test_fixed_oracles(void) {
                                      sizeof(non_joining_named_cases[0]);
        index++) {
     const char *input = non_joining_named_cases[index].input;
-    shell_dep_graph_t graph = {};
+    std::unique_ptr<shell_dep_graph_t> graph_storage(new shell_dep_graph_t{});
+    shell_dep_graph_t &graph = *graph_storage;
     if (shell_dep_graph_parse(input, std::strlen(input), "/tmp", nullptr,
                               &graph) != SHELL_DEP_OK ||
         !shell_dep_graph_validate(&graph).valid)
@@ -2327,7 +2368,8 @@ static int test_fixed_oracles(void) {
     shell_processed_commands_t processed = {};
     processed.commands = reinterpret_cast<shell_command_info_t *>(uintptr_t{1});
     processed.command_count = SIZE_MAX;
-    shell_dep_graph_t graph = {};
+    std::unique_ptr<shell_dep_graph_t> graph_storage(new shell_dep_graph_t{});
+    shell_dep_graph_t &graph = *graph_storage;
     bool named_fd_readonly_ok =
         shell_process_commands(input, std::strlen(input), nullptr,
                                &processed) == SHELL_PROCESS_EPARSE &&
@@ -2352,7 +2394,8 @@ static int test_fixed_oracles(void) {
     shell_processed_commands_t processed = {};
     processed.commands = reinterpret_cast<shell_command_info_t *>(uintptr_t{1});
     processed.command_count = SIZE_MAX;
-    shell_dep_graph_t graph = {};
+    std::unique_ptr<shell_dep_graph_t> graph_storage(new shell_dep_graph_t{});
+    shell_dep_graph_t &graph = *graph_storage;
     bool dynamic_current_shell_ok =
         shell_process_commands(input, std::strlen(input), nullptr,
                                &processed) == SHELL_PROCESS_EPARSE &&
@@ -2372,7 +2415,9 @@ static int test_fixed_oracles(void) {
    * legacy combined stdout-and-stderr redirect. */
   static const char braced_named_continuation[] =
       "exec {fd}>out; printf x >&$\\\n{fd}";
-  shell_dep_graph_t braced_named_graph = {};
+  std::unique_ptr<shell_dep_graph_t> braced_named_graph_storage(
+      new shell_dep_graph_t{});
+  shell_dep_graph_t &braced_named_graph = *braced_named_graph_storage;
   if (shell_dep_graph_parse(braced_named_continuation,
                             sizeof(braced_named_continuation) - 1, "/tmp",
                             nullptr, &braced_named_graph) != SHELL_DEP_OK ||
@@ -2422,7 +2467,8 @@ static int test_fixed_oracles(void) {
   };
   for (const auto &item : recursive_import_pruning_cases) {
     shell_processed_commands_t processed = {};
-    shell_dep_graph_t graph = {};
+    std::unique_ptr<shell_dep_graph_t> graph_storage(new shell_dep_graph_t{});
+    shell_dep_graph_t &graph = *graph_storage;
     bool recursive_import_ok =
         shell_process_commands(item.input, strlen(item.input), nullptr,
                                &processed) == SHELL_PROCESS_OK &&
@@ -2500,7 +2546,8 @@ static int test_fixed_oracles(void) {
   };
   for (const char *input : static_legacy_redirect_cases) {
     shell_processed_commands_t processed = {};
-    shell_dep_graph_t graph = {};
+    std::unique_ptr<shell_dep_graph_t> graph_storage(new shell_dep_graph_t{});
+    shell_dep_graph_t &graph = *graph_storage;
     bool static_redirect_ok =
         shell_process_commands(input, strlen(input), NULL, &processed) ==
             SHELL_PROCESS_OK &&
@@ -2524,7 +2571,8 @@ static int test_fixed_oracles(void) {
     shell_processed_commands_t processed = {};
     shell_command_info_t *flat = nullptr;
     size_t flat_count = 0;
-    shell_dep_graph_t graph = {};
+    std::unique_ptr<shell_dep_graph_t> graph_storage(new shell_dep_graph_t{});
+    shell_dep_graph_t &graph = *graph_storage;
     if (shell_process_commands(input, strlen(input), NULL, &processed) !=
             SHELL_PROCESS_EPARSE ||
         processed.commands != nullptr || processed.command_count != 0 ||
@@ -2562,7 +2610,8 @@ static int test_fixed_oracles(void) {
   };
   for (const combined_process_route_oracle &item :
        combined_process_route_cases) {
-    shell_dep_graph_t graph = {};
+    std::unique_ptr<shell_dep_graph_t> graph_storage(new shell_dep_graph_t{});
+    shell_dep_graph_t &graph = *graph_storage;
     if (shell_dep_graph_parse(item.input, strlen(item.input), "/tmp", NULL,
                               &graph) != SHELL_DEP_OK ||
         !shell_dep_graph_validate(&graph).valid)
@@ -2655,7 +2704,8 @@ static int test_fixed_oracles(void) {
       "exec {fd}<base; probe && { unset fd; }; echo \"$(cat <&$fd)\"",
   };
   for (const char *input : named_fd_snapshot_rejections) {
-    shell_dep_graph_t graph = {};
+    std::unique_ptr<shell_dep_graph_t> graph_storage(new shell_dep_graph_t{});
+    shell_dep_graph_t &graph = *graph_storage;
     if (shell_dep_graph_parse(input, strlen(input), "/tmp", NULL, &graph) !=
             SHELL_DEP_EPARSE ||
         graph.node_count != 0 || graph.edge_count != 0 ||
@@ -2672,7 +2722,8 @@ static int test_fixed_oracles(void) {
       "printf x >&`printf 2`",  "exec {fd}>out; fd+=shadow; printf x >&$fd",
   };
   for (const char *input : dynamic_legacy_redirect_rejections) {
-    shell_dep_graph_t graph = {};
+    std::unique_ptr<shell_dep_graph_t> graph_storage(new shell_dep_graph_t{});
+    shell_dep_graph_t &graph = *graph_storage;
     if (shell_dep_graph_parse(input, strlen(input), "/tmp", NULL, &graph) !=
             SHELL_DEP_EPARSE ||
         graph.node_count != 0 || graph.edge_count != 0 ||
@@ -2688,7 +2739,8 @@ static int test_fixed_oracles(void) {
   };
   for (const char *input : literal_named_fd_cases) {
     shell_processed_commands_t processed = {};
-    shell_dep_graph_t graph = {};
+    std::unique_ptr<shell_dep_graph_t> graph_storage(new shell_dep_graph_t{});
+    shell_dep_graph_t &graph = *graph_storage;
     bool ok = shell_process_commands(input, strlen(input), NULL, &processed) ==
                   SHELL_PROCESS_OK &&
               processed.command_count == 1 &&
@@ -2735,7 +2787,8 @@ static int test_fixed_oracles(void) {
   };
   for (const char *input : negated_document_cases) {
     shell_parse_result_t parsed = {};
-    shell_dep_graph_t graph = {};
+    std::unique_ptr<shell_dep_graph_t> graph_storage(new shell_dep_graph_t{});
+    shell_dep_graph_t &graph = *graph_storage;
     if (shell_parse_fast(input, strlen(input), NULL, &parsed) != SHELL_OK ||
         parsed.count != 1 || parsed.cmds[0].pipeline_negation_count == 0 ||
         shell_dep_graph_parse(input, strlen(input), "/tmp", NULL, &graph) !=
@@ -2780,7 +2833,8 @@ static int test_fixed_oracles(void) {
     const char *input = item.input;
     shell_parse_result_t parsed = {};
     shell_processed_commands_t processed = {};
-    shell_dep_graph_t graph = {};
+    std::unique_ptr<shell_dep_graph_t> graph_storage(new shell_dep_graph_t{});
+    shell_dep_graph_t &graph = *graph_storage;
     shell_error_t fast_status =
         shell_parse_fast(input, strlen(input), NULL, &parsed);
     shell_process_status_t process_status =
@@ -2814,7 +2868,8 @@ static int test_fixed_oracles(void) {
     static const char input[] = "time { time a | b; } | c";
     static const char outer_span[] = "{ time a | b; } | c";
     static const char inner_span[] = "a | b";
-    shell_dep_graph_t graph = {};
+    std::unique_ptr<shell_dep_graph_t> graph_storage(new shell_dep_graph_t{});
+    shell_dep_graph_t &graph = *graph_storage;
     if (shell_dep_graph_parse(input, sizeof(input) - 1, "/tmp", nullptr,
                               &graph) != SHELL_DEP_OK ||
         !shell_dep_graph_validate(&graph).valid)
@@ -3004,7 +3059,8 @@ static int test_fixed_oracles(void) {
        SHELL_DEP_FD_NONE, true, "base"},
   };
   for (const timed_route_oracle &item : timed_route_cases) {
-    shell_dep_graph_t graph = {};
+    std::unique_ptr<shell_dep_graph_t> graph_storage(new shell_dep_graph_t{});
+    shell_dep_graph_t &graph = *graph_storage;
     if (shell_dep_graph_parse(item.input, strlen(item.input), "/tmp", NULL,
                               &graph) != SHELL_DEP_OK ||
         !shell_dep_graph_validate(&graph).valid)
@@ -3054,7 +3110,8 @@ static int test_fixed_oracles(void) {
   }
 
   for (const char *input : shellsplit_test_enumeration_time_routes) {
-    shell_dep_graph_t graph = {};
+    std::unique_ptr<shell_dep_graph_t> graph_storage(new shell_dep_graph_t{});
+    shell_dep_graph_t &graph = *graph_storage;
     if (shell_dep_graph_parse(input, strlen(input), "/tmp", nullptr, &graph) !=
             SHELL_DEP_OK ||
         !shell_dep_graph_validate(&graph).valid)
@@ -3097,7 +3154,8 @@ static int test_fixed_oracles(void) {
       {"echo \"$(time true | time)\"", 3, 1, 1, SHELL_PIPE_TIME_DEFAULT},
   };
   for (const auto &item : ordinary_timed_stages) {
-    shell_dep_graph_t graph = {};
+    std::unique_ptr<shell_dep_graph_t> graph_storage(new shell_dep_graph_t{});
+    shell_dep_graph_t &graph = *graph_storage;
     if (test_tokenizer_state(item.input, strlen(item.input)) ||
         shell_dep_graph_parse(item.input, strlen(item.input), "/tmp", nullptr,
                               &graph) != SHELL_DEP_OK ||
@@ -3174,7 +3232,8 @@ static int test_fixed_oracles(void) {
       {"printf one <<<one\r\ntime -p <<<two cat", 2, 1, "3:cat,"},
   };
   for (const auto &item : document_stages) {
-    shell_dep_graph_t graph = {};
+    std::unique_ptr<shell_dep_graph_t> graph_storage(new shell_dep_graph_t{});
+    shell_dep_graph_t &graph = *graph_storage;
     if (test_tokenizer_state(item.input, strlen(item.input)) ||
         test_processor(item.input, strlen(item.input)) ||
         shell_dep_graph_parse(item.input, strlen(item.input), "/tmp", nullptr,
@@ -3218,7 +3277,8 @@ static int test_fixed_oracles(void) {
   for (const char *source : {"time { true; }", "time true; false", "{ true; }",
                              "true; false", "('[[[[[[[['|cmd[)"}) {
     shell_parse_result_t fast = {};
-    shell_dep_graph_t graph = {};
+    std::unique_ptr<shell_dep_graph_t> graph_storage(new shell_dep_graph_t{});
+    shell_dep_graph_t &graph = *graph_storage;
     shell_dep_limits_t limits;
     shell_limits_t strict = {SHELL_MAX_SUBCOMMANDS, true, nullptr, 0};
     if (!fuzz_source_limits(strlen(source), &strict) ||
@@ -3248,7 +3308,8 @@ static int test_fixed_oracles(void) {
       "echo \"$(time &)\"",
   };
   for (const char *input : empty_timing_stream_cases) {
-    shell_dep_graph_t graph = {};
+    std::unique_ptr<shell_dep_graph_t> graph_storage(new shell_dep_graph_t{});
+    shell_dep_graph_t &graph = *graph_storage;
     if (shell_dep_graph_parse(input, strlen(input), "/tmp", nullptr, &graph) !=
             SHELL_DEP_OK ||
         !shell_dep_graph_validate(&graph).valid)
@@ -3280,7 +3341,8 @@ static int test_fixed_oracles(void) {
         "cat <(time;)", "printf x > >(time;)", "echo \"$( (time;) )\"",
         "echo \"$(time (time;))\"", "echo \"$( (time;); : )\"",
         "cat <( (time;) )", "printf x > >( (time;) )"}) {
-    shell_dep_graph_t graph = {};
+    std::unique_ptr<shell_dep_graph_t> graph_storage(new shell_dep_graph_t{});
+    shell_dep_graph_t &graph = *graph_storage;
     if (shell_dep_graph_parse(input, strlen(input), "/tmp", nullptr, &graph) !=
             SHELL_DEP_EPARSE ||
         graph.node_count != 0 || graph.edge_count != 0)
@@ -3290,7 +3352,8 @@ static int test_fixed_oracles(void) {
   for (const char *input :
        {"cat <input < <(printf ignored >/dev/null)",
         "cat < <(printf old) < <(printf ignored >/dev/null)"}) {
-    shell_dep_graph_t graph = {};
+    std::unique_ptr<shell_dep_graph_t> graph_storage(new shell_dep_graph_t{});
+    shell_dep_graph_t &graph = *graph_storage;
     if (shell_dep_graph_parse(input, strlen(input), "/tmp", nullptr, &graph) !=
             SHELL_DEP_OK ||
         !shell_dep_graph_validate(&graph).valid)
@@ -3313,14 +3376,17 @@ static int test_fixed_oracles(void) {
 
   {
     static const char input[] = "exec 2>base; probe && exec 2>new; time true";
-    shell_dep_graph_t full = {};
+    std::unique_ptr<shell_dep_graph_t> full_storage(new shell_dep_graph_t{});
+    shell_dep_graph_t &full = *full_storage;
     if (shell_dep_graph_parse(input, sizeof(input) - 1, "/tmp", nullptr,
                               &full) != SHELL_DEP_OK)
       return fixed_oracle_failure(__LINE__);
     for (uint32_t max_edges = 0; max_edges <= full.edge_count; max_edges++) {
       shell_dep_limits_t limits = SHELL_DEP_LIMITS_DEFAULT;
       limits.max_edges = max_edges;
-      shell_dep_graph_t bounded = {};
+      std::unique_ptr<shell_dep_graph_t> bounded_storage(
+          new shell_dep_graph_t{});
+      shell_dep_graph_t &bounded = *bounded_storage;
       shell_dep_error_t status = shell_dep_graph_parse(
           input, sizeof(input) - 1, "/tmp", &limits, &bounded);
       if ((status != SHELL_DEP_OK && status != SHELL_DEP_ETRUNC) ||
@@ -3400,7 +3466,8 @@ static int test_fixed_oracles(void) {
     shell_command_t *full = nullptr;
     size_t full_count = 0;
     shell_processed_commands_t processed = {};
-    shell_dep_graph_t graph = {};
+    std::unique_ptr<shell_dep_graph_t> graph_storage(new shell_dep_graph_t{});
+    shell_dep_graph_t &graph = *graph_storage;
     shell_error_t fast_status =
         shell_parse_fast(input, strlen(input), nullptr, &fast);
     shell_tokenize_status_t full_status =
@@ -3450,7 +3517,9 @@ static int test_fixed_oracles(void) {
   for (const continued_list_oracle &item : continued_lists) {
     shell_parse_result_t continued_fast = {};
     shell_processed_commands_t continued_processed = {};
-    shell_dep_graph_t continued_graph = {};
+    std::unique_ptr<shell_dep_graph_t> continued_graph_storage(
+        new shell_dep_graph_t{});
+    shell_dep_graph_t &continued_graph = *continued_graph_storage;
     bool continued_ok =
         shell_parse_fast(item.input, strlen(item.input), NULL,
                          &continued_fast) == SHELL_OK &&
@@ -3497,7 +3566,8 @@ static int test_fixed_oracles(void) {
     shell_command_t *commands = NULL;
     size_t command_count = 0;
     shell_processed_commands_t processed = {};
-    shell_dep_graph_t graph = {};
+    std::unique_ptr<shell_dep_graph_t> graph_storage(new shell_dep_graph_t{});
+    shell_dep_graph_t &graph = *graph_storage;
     bool expansion_ok =
         shell_parse_fast(item.input, strlen(item.input), NULL, &fast) ==
             SHELL_OK &&
@@ -3648,7 +3718,9 @@ static int test_fixed_oracles(void) {
 
   static const char continued_group[] = "{ printf x; } \\\n|& { cat; }";
   shell_processed_commands_t continued_group_processed = {};
-  shell_dep_graph_t continued_group_graph = {};
+  std::unique_ptr<shell_dep_graph_t> continued_group_graph_storage(
+      new shell_dep_graph_t{});
+  shell_dep_graph_t &continued_group_graph = *continued_group_graph_storage;
   bool continued_group_ok =
       shell_process_commands(continued_group, sizeof(continued_group) - 1, NULL,
                              &continued_group_processed) == SHELL_PROCESS_OK &&
@@ -3730,7 +3802,8 @@ static int test_fixed_oracles(void) {
     shell_command_t *commands = NULL;
     size_t command_count = 0;
     shell_processed_commands_t processed = {};
-    shell_dep_graph_t graph = {};
+    std::unique_ptr<shell_dep_graph_t> graph_storage(new shell_dep_graph_t{});
+    shell_dep_graph_t &graph = *graph_storage;
     bool valid =
         shell_parse_fast(item.input, strlen(item.input), NULL, &parsed) ==
             SHELL_OK &&
@@ -3774,7 +3847,8 @@ static int test_fixed_oracles(void) {
     shell_transformed_command_t **transformed = NULL;
     size_t transformed_count = 0;
     shell_abstract_command_t *abstract = NULL;
-    shell_dep_graph_t graph = {};
+    std::unique_ptr<shell_dep_graph_t> graph_storage(new shell_dep_graph_t{});
+    shell_dep_graph_t &graph = *graph_storage;
     bool valid =
         shell_parse_fast(item.input, length, NULL, &parsed) == SHELL_OK &&
         parsed.count == 1 &&
@@ -3836,7 +3910,8 @@ static int test_fixed_oracles(void) {
         (shell_group_t *)(uintptr_t)1,        SIZE_MAX,
         (shell_group_io_op_t *)(uintptr_t)1,  SIZE_MAX,
     };
-    shell_dep_graph_t graph = {};
+    std::unique_ptr<shell_dep_graph_t> graph_storage(new shell_dep_graph_t{});
+    shell_dep_graph_t &graph = *graph_storage;
     bool invalid =
         shell_parse_fast(input, strlen(input), NULL, &parsed) == SHELL_EPARSE &&
         shell_tokenize_commands(input, strlen(input), &commands,
@@ -3865,7 +3940,8 @@ static int test_fixed_oracles(void) {
         (shell_group_t *)(uintptr_t)1,        SIZE_MAX,
         (shell_group_io_op_t *)(uintptr_t)1,  SIZE_MAX,
     };
-    shell_dep_graph_t graph = {};
+    std::unique_ptr<shell_dep_graph_t> graph_storage(new shell_dep_graph_t{});
+    shell_dep_graph_t &graph = *graph_storage;
     if (shell_process_commands(input, strlen(input), NULL, &processed) !=
             SHELL_PROCESS_OK ||
         processed.group_io_op_count != 1 ||
@@ -3880,7 +3956,9 @@ static int test_fixed_oracles(void) {
    * descriptor duplication. The graph resolver, which has the binding scope,
    * rejects this unbound reference rather than treating it as a filename. */
   shell_processed_commands_t deferred_named_fd = {};
-  shell_dep_graph_t deferred_named_graph = {};
+  std::unique_ptr<shell_dep_graph_t> deferred_named_graph_storage(
+      new shell_dep_graph_t{});
+  shell_dep_graph_t &deferred_named_graph = *deferred_named_graph_storage;
   const char *deferred_named_source = "{ printf x; } >&$destination";
   if (shell_process_commands(deferred_named_source,
                              strlen(deferred_named_source), NULL,
@@ -3907,7 +3985,9 @@ static int test_fixed_oracles(void) {
           (SHELL_FEAT_ANSI_C_QUOTE | SHELL_FEAT_EXTGLOB | SHELL_FEAT_ARRAY |
            SHELL_FEAT_COMBINED_REDIRECT))
     return fixed_oracle_failure(__LINE__);
-  shell_dep_graph_t modern_graph = {};
+  std::unique_ptr<shell_dep_graph_t> modern_graph_storage(
+      new shell_dep_graph_t{});
+  shell_dep_graph_t &modern_graph = *modern_graph_storage;
   if (shell_dep_graph_parse("cmd {trace}> trace.log &>> combined.log",
                             strlen("cmd {trace}> trace.log &>> combined.log"),
                             NULL, NULL, &modern_graph) != SHELL_DEP_OK ||
@@ -3980,7 +4060,8 @@ static int test_fixed_oracles(void) {
     shell_transformed_command_t **transformed = NULL;
     size_t transformed_count = 0;
     shell_abstract_command_t *abstract = NULL;
-    shell_dep_graph_t graph = {};
+    std::unique_ptr<shell_dep_graph_t> graph_storage(new shell_dep_graph_t{});
+    shell_dep_graph_t &graph = *graph_storage;
     bool rejected =
         shell_tokenize_commands(input, strlen(input), &lexical,
                                 &lexical_count) == SHELL_TOKENIZE_OK &&
@@ -4053,7 +4134,8 @@ static int test_fixed_oracles(void) {
     shell_transformed_command_t **transformed = NULL;
     size_t transformed_count = 0;
     shell_abstract_command_t *abstract = NULL;
-    shell_dep_graph_t graph = {};
+    std::unique_ptr<shell_dep_graph_t> graph_storage(new shell_dep_graph_t{});
+    shell_dep_graph_t &graph = *graph_storage;
     bool rejected =
         shell_tokenize_commands(input, strlen(input), &lexical,
                                 &lexical_count) == SHELL_TOKENIZE_OK &&
@@ -4134,7 +4216,8 @@ static int test_fixed_oracles(void) {
       {"{ cat; cat; } <<< \"two words\"", SHELL_DOC_HERESTRING, 2, 0},
   };
   for (const group_document_oracle &item : group_document_cases) {
-    shell_dep_graph_t graph = {};
+    std::unique_ptr<shell_dep_graph_t> graph_storage(new shell_dep_graph_t{});
+    shell_dep_graph_t &graph = *graph_storage;
     if (shell_dep_graph_parse(item.input, strlen(item.input), ".", NULL,
                               &graph) != SHELL_DEP_OK ||
         !shellsplit_test_depgraph_invariants(item.input, strlen(item.input),
@@ -4163,7 +4246,9 @@ static int test_fixed_oracles(void) {
   }
   static const char group_herestring_override[] =
       "{ cat; } 3>&1 <<< stale 0<<< $(printf live)";
-  shell_dep_graph_t group_herestring_graph = {};
+  std::unique_ptr<shell_dep_graph_t> group_herestring_graph_storage(
+      new shell_dep_graph_t{});
+  shell_dep_graph_t &group_herestring_graph = *group_herestring_graph_storage;
   if (shell_dep_graph_parse(group_herestring_override,
                             strlen(group_herestring_override), ".", NULL,
                             &group_herestring_graph) != SHELL_DEP_OK ||
@@ -4225,7 +4310,8 @@ static int test_fixed_oracles(void) {
       {"cat <(printf \\\\)", 2, 1},
   };
   for (const dep_oracle_case &item : dep_cases) {
-    shell_dep_graph_t graph = {};
+    std::unique_ptr<shell_dep_graph_t> graph_storage(new shell_dep_graph_t{});
+    shell_dep_graph_t &graph = *graph_storage;
     shell_dep_error_t status = shell_dep_graph_parse(
         item.input, strlen(item.input), ".", NULL, &graph);
     if (status != SHELL_DEP_OK ||
@@ -4262,7 +4348,8 @@ static int test_fixed_oracles(void) {
   };
   for (const brace_dynamic_redirect_oracle &item :
        brace_dynamic_redirect_cases) {
-    shell_dep_graph_t graph = {};
+    std::unique_ptr<shell_dep_graph_t> graph_storage(new shell_dep_graph_t{});
+    shell_dep_graph_t &graph = *graph_storage;
     bool graph_ok =
         shell_dep_graph_parse(item.input, strlen(item.input), "/tmp", NULL,
                               &graph) == SHELL_DEP_OK &&
@@ -4327,7 +4414,8 @@ static int test_fixed_oracles(void) {
       {"echo one | echo two", 2, SHELL_EDGE_PIPE, 0, false},
   };
   for (const composition_oracle &item : composition_cases) {
-    shell_dep_graph_t graph = {};
+    std::unique_ptr<shell_dep_graph_t> graph_storage(new shell_dep_graph_t{});
+    shell_dep_graph_t &graph = *graph_storage;
     if (shell_dep_graph_parse(item.input, strlen(item.input), ".", NULL,
                               &graph) != SHELL_DEP_OK)
       return fixed_oracle_failure(__LINE__);
@@ -4371,7 +4459,8 @@ static int test_fixed_oracles(void) {
     if (shell_parse_fast(input, strlen(input), NULL, &fast) != SHELL_EPARSE ||
         !(fast.status & SHELL_STATUS_ERROR))
       return fixed_oracle_failure(__LINE__);
-    shell_dep_graph_t graph = {};
+    std::unique_ptr<shell_dep_graph_t> graph_storage(new shell_dep_graph_t{});
+    shell_dep_graph_t &graph = *graph_storage;
     if (shell_dep_graph_parse(input, strlen(input), ".", NULL, &graph) !=
             SHELL_DEP_EPARSE ||
         graph.status != SHELL_DEP_STATUS_ERROR)
@@ -4382,7 +4471,8 @@ static int test_fixed_oracles(void) {
       "cat <(for ((i=0; i<1; i++)); do echo x; done)",
   };
   for (const char *input : unsupported_nested_structures) {
-    shell_dep_graph_t graph = {};
+    std::unique_ptr<shell_dep_graph_t> graph_storage(new shell_dep_graph_t{});
+    shell_dep_graph_t &graph = *graph_storage;
     if (shell_dep_graph_parse(input, strlen(input), ".", NULL, &graph) !=
             SHELL_DEP_EPARSE ||
         graph.status != SHELL_DEP_STATUS_ERROR || graph.node_count != 0 ||
@@ -4458,7 +4548,8 @@ static int test_fixed_oracles(void) {
     shell_netstring_buffer_t anomaly_commands = {};
     shell_netstring_buffer_t anomaly_types = {};
     size_t anomaly_count = 0;
-    shell_dep_graph_t graph = {};
+    std::unique_ptr<shell_dep_graph_t> graph_storage(new shell_dep_graph_t{});
+    shell_dep_graph_t &graph = *graph_storage;
     bool rejected =
         shell_parse_fast(input, length, NULL, &fast) == SHELL_EPARSE &&
         shell_tokenize_commands(input, length, &commands, &command_count) ==
@@ -4525,7 +4616,8 @@ static int test_fixed_oracles(void) {
     shell_netstring_buffer_t netargv = {};
     size_t netargv_count = 0;
     bool has_shell_features = false;
-    shell_dep_graph_t graph = {};
+    std::unique_ptr<shell_dep_graph_t> graph_storage(new shell_dep_graph_t{});
+    shell_dep_graph_t &graph = *graph_storage;
     bool accepted =
         shell_parse_fast(input, length, NULL, &fast) == SHELL_OK &&
         shell_tokenize_commands(input, length, &commands, &command_count) ==
@@ -4557,7 +4649,8 @@ static int test_fixed_oracles(void) {
       {"{ echo; } \\\n<<EOF\npayload\nEOF\n", SHELL_DOC_HEREDOC, true},
   };
   for (const redirect_owner_oracle &item : redirect_owners) {
-    shell_dep_graph_t graph = {};
+    std::unique_ptr<shell_dep_graph_t> graph_storage(new shell_dep_graph_t{});
+    shell_dep_graph_t &graph = *graph_storage;
     if (shell_dep_graph_parse(item.input, strlen(item.input), ".", NULL,
                               &graph) != SHELL_DEP_OK ||
         !shell_dep_graph_validate(&graph).valid)
@@ -5368,6 +5461,7 @@ static bool tokenizer_token_starts_command(const shell_token_t &token) {
   case SHELL_TOKEN_SPECIAL_VAR:
   case SHELL_TOKEN_ARITHMETIC:
   case SHELL_TOKEN_ARITHMETIC_COMMAND:
+  case SHELL_TOKEN_CONDITIONAL_COMMAND:
   case SHELL_TOKEN_GLOB:
   case SHELL_TOKEN_ANSI_C_QUOTED:
   case SHELL_TOKEN_EXTGLOB:
@@ -5553,6 +5647,8 @@ static int test_tokenizer_state(const char *input, size_t length) {
    * an unfinished quote/document for diagnostics, while the allocating API
    * rejects these specific unfinished lexical states. */
   bool lexical_complete = !state.in_quotes && !state.in_arithmetic &&
+                          !state.in_conditional && !state.conditional_invalid &&
+
                           state.brace_depth == 0 &&
                           state.brace_group_depth == 0 && !state.heredoc_error;
   shell_tokenize_status_t full_status =
@@ -5861,7 +5957,7 @@ processed_argv_matches_sequence(const shell_processed_commands_t &processed,
                                 size_t count) {
   size_t subjects = 0;
   for (size_t i = 0; i < processed.command_count; ++i)
-    subjects += processed.commands[i].kind != SHELL_COMMAND_ARITHMETIC;
+    subjects += processed.commands[i].kind == SHELL_COMMAND_SIMPLE;
   if (!sequence || subjects != count)
     return false;
   shell_netstring_iter_t records;
@@ -5870,7 +5966,7 @@ processed_argv_matches_sequence(const shell_processed_commands_t &processed,
       SHELL_NETSTRING_OK)
     return false;
   for (size_t command = 0; command < processed.command_count; command++) {
-    if (processed.commands[command].kind == SHELL_COMMAND_ARITHMETIC)
+    if (processed.commands[command].kind != SHELL_COMMAND_SIMPLE)
       continue;
     shell_netstring_buffer_t argv = {};
     bool matches =
@@ -5939,7 +6035,7 @@ static int test_processor(const char *input, size_t input_length) {
       shell_netstring_buffer_t netargv = {};
       structured_canonical =
           (processed.commands[i].command_token_count != 0 ||
-           processed.commands[i].kind == SHELL_COMMAND_ARITHMETIC) &&
+           processed.commands[i].kind != SHELL_COMMAND_SIMPLE) &&
           shell_render_netargv_buffer(&processed.commands[i], &limits,
                                       &netargv) == SHELL_PROCESS_OK &&
           netargv.data != NULL;
@@ -6019,7 +6115,7 @@ static int test_processor(const char *input, size_t input_length) {
 
   size_t policy_count = 0;
   for (size_t i = 0; i < command_count; ++i)
-    policy_count += infos[i].kind != SHELL_COMMAND_ARITHMETIC;
+    policy_count += infos[i].kind == SHELL_COMMAND_SIMPLE;
   if ((infos == NULL) != (command_count == 0) || (sequence.data == NULL) ||
       sequence_count != policy_count) {
     if (g_verbose)
@@ -8078,6 +8174,36 @@ static void run_fixed_oracles() {
         test_descriptor_move(static_cast<uint8_t>(i), input))
       abort();
   }
+  fixed_oracle_phase("conditional commands");
+  for (const char *source : conditional_invalid) {
+    size_t length = strlen(source);
+    shell_limits_t limits = {};
+    std::unique_ptr<shell_source_result_t> draft(new shell_source_result_t{});
+    if (!fuzz_source_limits(length, &limits) ||
+        shell_parse_draft(source, length, &limits, draft.get()) !=
+            SHELL_SOURCE_INVALID ||
+        draft->prefix.count || draft->prefix_length ||
+        fuzz_dep_graph_parse(source, length, ".", nullptr, &graph) !=
+            SHELL_DEP_EPARSE ||
+        graph.node_count || graph.edge_count || graph.cwd_buf.len) {
+      fprintf(stderr, "invalid conditional oracle failed: %s\n", source);
+      abort();
+    }
+  }
+  for (const auto &fixture : conditional_cases) {
+    size_t length = strlen(fixture.source);
+    if (test_tokenizer_state(fixture.source, length) ||
+        test_processor(fixture.source, length) ||
+        fuzz_dep_graph_parse(fixture.source, length, ".", nullptr, &graph) !=
+            SHELL_DEP_OK ||
+        !shell_dep_graph_validate(&graph).valid ||
+        graph.nodes[0].cmd.kind != SHELL_COMMAND_CONDITIONAL ||
+        graph.nodes[0].cmd.conditional_truth !=
+            static_cast<shell_conditional_truth_t>(fixture.truth)) {
+      fprintf(stderr, "conditional oracle failed: %s\n", fixture.source);
+      abort();
+    }
+  }
   fixed_oracle_phase("arithmetic commands");
   for (const auto &fixture : shellsplit_arithmetic_cases) {
     std::string source = std::string("((") + fixture.expression + "))";
@@ -8549,6 +8675,30 @@ static void run_fixed_oracles() {
     if (!valid) {
       fprintf(stderr, "array prefix oracle failed: %s\n", fixture.source);
       abort();
+    }
+  }
+  for (unsigned conditional = 0; conditional < 2; ++conditional) {
+    for (const auto &fixture : shellsplit_test_extglob_features) {
+      std::string source = conditional ? "[[ -n " : "printf ";
+      source += fixture.word;
+      if (conditional)
+        source += " ]]";
+      shell_parse_result_t parsed = {};
+      shell_limits_t limits = {SHELL_MAX_SUBCOMMANDS, true, nullptr, 0};
+      if (!fuzz_source_limits(source.size(), &limits) ||
+          shell_parse_fast(source.data(), source.size(), &limits, &parsed) !=
+              SHELL_OK)
+        abort();
+      uint32_t features = 0;
+      for (uint32_t c = 0; c < parsed.count; ++c)
+        features |= parsed.cmds[c].features;
+      uint32_t expected =
+          fixture.features | (conditional ? SHELL_FEAT_CONDITIONALS : 0);
+      if (parsed.count != 1 ||
+          (features & shellsplit_test_extglob_feature_mask) != expected) {
+        fprintf(stderr, "extglob feature oracle failed: %s\n", source.c_str());
+        abort();
+      }
     }
   }
   for (const auto &fixture : shellsplit_test_scoped_expansions) {

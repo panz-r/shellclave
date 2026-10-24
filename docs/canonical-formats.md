@@ -78,6 +78,13 @@ Each arithmetic command contributes exactly one stage, including adjacent
 operator/operand spellings such as `((1<<(2)))`. Genuine substitutions in
 following shell words and redirection operands keep their separate stages.
 
+Conditional commands have no argv-policy record. Their owned command metadata
+retains expression and operand spans. In anomaly sequences, one condition has
+raw record `0:,` and typed inner signature `0:,2:CT,`, framed as
+`8:0:,2:CT,,`. Executable substitutions retain separate stages in the existing
+analysis order. This marker is distinct from arithmetic's `AR` and an ordinary
+empty stage; existing serialized models remain readable.
+
 Use `shell_build_command_netseq_buffer()`, `shell_build_type_netseq_buffer()`,
 or `shell_build_anomaly_netseqs_buffer()` for binary sequence output. Pass
 their explicit lengths to the anomaly APIs.

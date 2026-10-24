@@ -43,6 +43,7 @@ typedef enum {
   SHELL_SOURCE_NEEDS_HEREDOC_BODY,
   SHELL_SOURCE_NEEDS_ESCAPE,
   SHELL_SOURCE_NEEDS_ARITHMETIC,
+  SHELL_SOURCE_NEEDS_CONDITIONAL,
 } shell_source_need_t;
 
 /* One header record. A simple-command span excludes its deferred heredoc data
@@ -50,9 +51,10 @@ typedef enum {
  * A compound record spans the compound and its trailing redirects, has no
  * ordinary words, and keeps its enclosed headers separate. Arithmetic headers
  * have kind ARITHMETIC, compound true and an expression span with no argv
- * words. Supported literal arithmetic has no nested headers; executable
- * substitutions in semantically unsupported arithmetic retain their lexical
- * headers. Container headers have kind GROUP.
+ * words. Unary string conditions have kind CONDITIONAL with separate
+ * expression and operand spans and no argv. Supported literal arithmetic has no
+ * nested headers; executable substitutions in semantically unsupported
+ * arithmetic retain their lexical headers. Container headers have kind GROUP.
  * words includes assignment prefixes; assignment_count identifies that initial
  * subset. first_redirect heads an ordered linked list in result.redirects;
  * follow next for redirect_count records (UINT32_MAX ends the list).
@@ -85,7 +87,9 @@ typedef enum {
 typedef struct {
   shell_source_span_t source;
   shell_command_kind_t kind;
-  shell_source_span_t arithmetic_expression; /* Content without delimiters. */
+  shell_source_span_t conditional_expression; /* Content without [[ and ]]. */
+  shell_source_span_t conditional_operand;    /* The sole string operand. */
+  shell_source_span_t arithmetic_expression;  /* Content without delimiters. */
   shell_source_span_t words[SHELL_DEP_MAX_TOKENS];
   uint32_t word_count, assignment_count;
   uint32_t first_redirect, redirect_count;
@@ -232,10 +236,11 @@ typedef struct shell_source_result {
  * qualification, not append-repairable input. Unfinished parameter heads, name
  * enumeration and pending backslash-LF continuations are INCOMPLETE;
  * unclassified selector failures are UNSUPPORTED. At received EOF, an unquoted
- * command-position unsupported keyword such as `if`, `function` or `[[` remains
+ * command-position reserved spelling such as `if`, `function` or `[[` remains
  * INCOMPLETE (NEEDS_COMMAND): an appended suffix can make it an ordinary word.
- * Its header is incomplete. Whitespace or an operator commits that keyword and
- * makes the source UNSUPPORTED. A closed substitution likewise commits its
+ * Its header is incomplete. Whitespace or an operator commits an unsupported
+ * keyword; a committed supported [[ uses NEEDS_CONDITIONAL while unfinished.
+ * A closed substitution likewise commits its
  * child's final word; appending outside its delimiter cannot repair it.
  * Quoted/escaped/suffixed lookalikes and words in argument or redirect-operand
  * positions are ordinary words. An assignment or redirection prefix also

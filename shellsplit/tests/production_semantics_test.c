@@ -2871,7 +2871,7 @@ static void test_modern_shell_syntax_boundaries(void) {
       "case value in x) : ;& esac",
       "case value in x) : ;;& esac",
       "[[ -f /tmp/x ]]",
-      "{ [[ -n value ]]; }",
+      "{ [[ -f value ]]; }",
       "echo $( [[ -f /tmp/x ]] )",
       "(( count += 1 ))",
       "! (( count ))",

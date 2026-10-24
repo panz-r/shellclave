@@ -3,6 +3,49 @@
 These notes describe changes relevant to existing consumers. The public headers
 define the current API; rebuild consumers after updating the library.
 
+## Unreleased: unary conditional commands
+
+`[[ word ]]`, `[[ -n word ]]` and `[[ -z word ]]` now have an explicit
+`SHELL_COMMAND_CONDITIONAL` kind. Repeated lexical negation is supported.
+Existing word expansions use conditional string semantics, with no splitting,
+globbing or brace expansion. Wider conditional predicates remain unsupported.
+
+Feature discovery now includes active expansions inside extglob words, for
+ordinary arguments and conditional operands alike. Gate rejection masks apply
+to those expansions and their executable children. Literal pattern alternatives
+retain their existing EXTGLOB classification without introducing pipeline or
+control-word features. Public feature-bit values and default masks are unchanged.
+
+Bare-word predicates reject a newline or comment before the closing delimiter,
+including in unfinished drafts. Explicit `-n`/`-z` predicates permit trailing
+newlines and comments; quoted newlines and escaped continuations retain their
+existing meanings. Comments inside supported conditions remain grammar trivia,
+including text resembling malformed substitutions or closing delimiters.
+Only actual operands contribute expansions and dependencies. Invalid input has
+no qualified analysis prefix.
+
+Retained headers, owned processor results and graph command metadata expose
+conditional expression and operand spans. Graphs expose `conditional_truth`
+independently of setup failure. Conditional entries have no argv; argv-only
+sequences omit them, while anomaly sequences use an empty executable and `CT`.
+Rebuild consumers for the new public layouts and appended enum values.
+
+The graph field `arithmetic_has_redirections` is now `has_redirections` and
+reports explicit setup for all command kinds. Update field accesses. Existing
+arithmetic expression and truth fields retain their meanings.
+
+Expansion callbacks handle the appended `SHELL_EXPAND_WORD_CONDITIONAL`
+purpose by returning exactly one NUL-free canonical string record; use `0:,`
+for empty. Return UNRESOLVED when a value cannot be established. Invalid
+framing or cardinality returns the existing expansion error. Conditional
+redirects precede operand expansion, including nested substitution execution.
+
+The existing `SHELL_FEAT_CONDITIONALS` bit now includes `[[ … ]]`; its default
+gate rejection remains enabled. Pure supported predicates are policy-neutral
+when enabled, while nested argv commands retain their policy requirements.
+Inspect the new `SG_EXPANSION_UNRESOLVED_CONDITION` bit alongside existing
+independent result signals. Resolution does not discharge substitution inspection.
+
 ## Unreleased: arithmetic commands
 
 Literal-only Bash arithmetic commands `(( expression ))` are now supported.

@@ -3687,12 +3687,121 @@ TEST(nested_feature_rejection_contract) {
       features |= parsed.cmds[j].features;
     ASSERT(((features & cases[i].feature) != 0) == cases[i].present);
   }
+  for (unsigned conditional = 0; conditional < 2; ++conditional) {
+    for (size_t i = 0; i < sizeof(shellsplit_test_extglob_features) /
+                               sizeof(shellsplit_test_extglob_features[0]);
+         ++i) {
+      char source[256];
+      snprintf(source, sizeof(source),
+               conditional ? "[[ -n %s ]]" : "printf %s",
+               shellsplit_test_extglob_features[i].word);
+      for (uint32_t bit = 1; bit <= SHELL_FEAT_COMBINED_REDIRECT; bit <<= 1) {
+        if (bit == SHELL_FEAT_CONDITIONALS)
+          continue;
+        ASSERT_SG_OK(sg_gate_set_reject_mask(gate, bit));
+        sg_result_t result;
+        ASSERT_SG_OK(eval_cmd(gate, source, &result));
+        ASSERT((result.verdict == SG_VERDICT_REJECT) ==
+               ((shellsplit_test_extglob_features[i].features & bit) != 0));
+      }
+    }
+  }
   ASSERT_SG_OK(sg_gate_set_reject_mask(gate, SG_REJECT_MASK_DEFAULT));
   sg_result_t result;
   ASSERT_SG_OK(eval_cmd(gate, cases[0].source, &result));
   ASSERT(result.verdict == SG_VERDICT_REJECT);
   ASSERT_SG_OK(eval_cmd(gate, cases[1].source, &result));
   ASSERT(result.verdict == SG_VERDICT_REJECT);
+  sg_gate_free(gate);
+}
+
+static SHELL_NONNULL(1, 2, 3, 4) shell_expand_status_t
+    conditional_value(const shell_expand_word_request_t *request,
+                      const char **value, size_t *length, void *context) {
+  if (request->purpose != SHELL_EXPAND_WORD_CONDITIONAL)
+    return SHELL_EXPAND_UNRESOLVED;
+  *value = context;
+  *length = strlen(context);
+  return SHELL_EXPAND_RESOLVED;
+}
+
+TEST(conditional_string_contract) {
+  sg_gate_t *gate = gate_with_rules((const char *[]){"printf *"}, 1);
+  ASSERT(gate != NULL);
+  ASSERT_SG_OK(sg_gate_set_stop_mode(gate, SG_EVAL_ALL));
+  sg_result_t result;
+  ASSERT_SG_OK(eval_cmd(gate, "[[ -n x ]]", &result));
+  ASSERT(result.verdict == SG_VERDICT_REJECT);
+  ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
+  static const char *const invalid_boundaries[] = {
+      "[[ x\n]]",    "[[ ! x\n]]",      "[[ ! ! x\n]]",
+      "[[ '-n'\n]]", "[[ x # note\n]]", "[[ x\n",
+  };
+  for (size_t i = 0;
+       i < sizeof(invalid_boundaries) / sizeof(invalid_boundaries[0]); ++i)
+    ASSERT(eval_cmd(gate, invalid_boundaries[i], &result) == SG_ERR_PARSE);
+  ASSERT_SG_OK(eval_cmd(gate, "[[ -z '' ]]", &result));
+  ASSERT(result.verdict == SG_VERDICT_ALLOW && result.subcommand_count == 0);
+  ASSERT_SG_OK(eval_cmd(gate, "[[ -n x # note\n]]", &result));
+  ASSERT(result.verdict == SG_VERDICT_ALLOW && result.subcommand_count == 0);
+  static const char *const commented[] = {
+      "[[ # $(|)\n-n x ]]",
+      "[[ ! # $(\n-n x ]]",
+      "[[ -n x # ` ' \" ]] <(cat) $comment $((7)) ${bad\n]]",
+  };
+  for (size_t i = 0; i < sizeof(commented) / sizeof(commented[0]); ++i) {
+    ASSERT_SG_OK(eval_cmd(gate, commented[i], &result));
+    ASSERT(result.verdict == SG_VERDICT_ALLOW && result.subcommand_count == 0);
+    ASSERT(!result.has_dynamic_substitution_io &&
+           !result.requires_substitution_evaluation &&
+           !result.unresolved_expansion_flags);
+  }
+  ASSERT_SG_OK(
+      eval_cmd(gate, "[[ # ' comment\n-n $(printf value) # $(|)\n]]", &result));
+  ASSERT(
+      result.verdict == SG_VERDICT_ALLOW_CONDITIONAL &&
+      result.subcommand_count == 1 && result.requires_substitution_evaluation &&
+      result.has_dynamic_substitution_io &&
+      (result.unresolved_expansion_flags & SG_EXPANSION_UNRESOLVED_CONDITION));
+  ASSERT(eval_cmd(gate, "[[ # ignored\n-n $(|) ]]", &result) == SG_ERR_PARSE);
+  ASSERT_SG_OK(eval_cmd(gate, "[[ -n $value ]]", &result));
+  ASSERT(result.verdict == SG_VERDICT_ALLOW && result.subcommand_count == 0);
+  ASSERT(result.unresolved_expansion_flags ==
+         SG_EXPANSION_UNRESOLVED_CONDITION);
+  ASSERT_SG_OK(eval_cmd(gate, "[[ -n $(printf value) ]]", &result));
+  ASSERT(result.verdict == SG_VERDICT_ALLOW_CONDITIONAL &&
+         result.subcommand_count == 1);
+  ASSERT(result.has_dynamic_substitution_io &&
+         result.requires_substitution_evaluation);
+  ASSERT(result.unresolved_expansion_flags & SG_EXPANSION_UNRESOLVED_CONDITION);
+  ASSERT_SG_OK(eval_cmd(gate, "[[ -n <(printf value) ]]", &result));
+  ASSERT(result.verdict == SG_VERDICT_ALLOW && result.subcommand_count == 1);
+  ASSERT(result.has_dynamic_substitution_io &&
+         !result.requires_substitution_evaluation);
+  ASSERT_SG_OK(eval_cmd(gate, "[[ -n x ]] >report", &result));
+  ASSERT(result.verdict == SG_VERDICT_UNDETERMINED && !result.subcommand_count);
+  ASSERT_SG_OK(eval_cmd(gate, "[[ -n $(printf value) ]] >report", &result));
+  ASSERT(result.verdict == SG_VERDICT_UNDETERMINED &&
+         result.subcommand_count == 1);
+  ASSERT_SG_OK(eval_cmd(gate, "{ [[ -n x ]]; } >report", &result));
+  ASSERT(result.verdict == SG_VERDICT_UNDETERMINED);
+  ASSERT_SG_OK(sg_gate_set_expand_word_netargv(gate, conditional_value, "0:,"));
+  ASSERT_SG_OK(eval_cmd(gate, "[[ -n $value ]]", &result));
+  ASSERT(result.verdict == SG_VERDICT_ALLOW &&
+         !result.unresolved_expansion_flags);
+  ASSERT(result.subcommand_count == 0);
+  ASSERT_SG_OK(
+      sg_gate_set_expand_word_netargv(gate, conditional_value, "1:x,"));
+  ASSERT_SG_OK(eval_cmd(gate, "[[ -n $value ]] && cat", &result));
+  ASSERT(result.verdict == SG_VERDICT_UNDETERMINED &&
+         result.subcommand_count == 1);
+  ASSERT_SG_OK(sg_gate_set_expand_word_netargv(gate, conditional_value, ""));
+  ASSERT(eval_cmd(gate, "[[ -n $value ]]", &result) == SG_ERR_EXPAND);
+  ASSERT_SG_OK(sg_gate_set_expand_word_netargv(gate, NULL, NULL));
+  ASSERT_SG_OK(sg_gate_enable_anomaly(gate, 100.0, NULL));
+  ASSERT_SG_OK(eval_cmd(gate, "[[ -z '' ]]", &result));
+  ASSERT(result.verdict == SG_VERDICT_ALLOW);
+  ASSERT(eval_cmd(gate, "[[ x == y ]]", &result) == SG_ERR_PARSE);
   sg_gate_free(gate);
 }
 
@@ -5404,16 +5513,16 @@ TEST(eval_input_contract_matrix) {
        SG_ERR_PARSE, SG_VERDICT_REJECT, false},
       {"nested unsupported construct", "echo $(case value in x)", SG_ERR_PARSE,
        SG_VERDICT_REJECT, false},
-      {"bash conditional command", "[[ -f /tmp/x ]]", SG_ERR_PARSE,
-       SG_VERDICT_REJECT, false},
+      {"bash conditional command", "[[ -f /tmp/x ]]", SG_OK, SG_VERDICT_REJECT,
+       false},
       {"bash arithmetic command", "(( count += 1 ))", SG_OK, SG_VERDICT_REJECT,
        false},
       {"continued bash arithmetic command", "(\\\n( count += 1 ))", SG_OK,
        SG_VERDICT_REJECT, false},
-      {"continued bash conditional command", "[\\\n[ -n value ]]", SG_ERR_PARSE,
+      {"continued bash conditional command", "[\\\n[ -n value ]]", SG_OK,
        SG_VERDICT_REJECT, false},
-      {"continued bash conditional delimiter", "[[\\\n -n value ]]",
-       SG_ERR_PARSE, SG_VERDICT_REJECT, false},
+      {"continued bash conditional delimiter", "[[\\\n -n value ]]", SG_OK,
+       SG_VERDICT_REJECT, false},
       {"time pipeline modifier", "time -p echo x", SG_OK,
        SG_VERDICT_UNDETERMINED, false},
       {"quoted array declaration builtin", "\"declare\" -a values",
@@ -15455,6 +15564,7 @@ int main(int argc, char **argv) {
   RUN(file_substitution_reject_mask_contract);
   RUN(nested_feature_rejection_contract);
   RUN(static_arithmetic_literal_contract);
+  RUN(conditional_string_contract);
   RUN(continued_expansion_policy_contract);
   RUN(continued_punctuation_policy_contract);
   RUN(dynamic_substitution_flow_contract);

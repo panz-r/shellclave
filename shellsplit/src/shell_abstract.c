@@ -2,6 +2,7 @@
 #include "shell_abstract.h"
 #include "alloc.h"
 #include "shell_ascii.h"
+#include "shell_conditional_internal.h"
 #include "shell_netstring.h"
 #include "shell_processor.h"
 #include "shell_processor_internal.h"
@@ -19,7 +20,7 @@
 /* --- Internal Helpers --- */
 
 static const char *SHELL_ABSTRACT_TYPE_NAMES[] = {
-    "EV", "PV", "SV", "AP", "RP", "HP", "GB", "CS", "AR", "STR", "RD"};
+    "EV", "PV", "SV", "AP", "RP", "HP", "GB", "CS", "AR", "STR", "RD", "CT"};
 
 static const char *SHELL_PATH_CATEGORY_NAMES[] = {
     "ROOT",    "ETC",  "VAR", "USR",   "HOME",     "TMP",
@@ -427,6 +428,8 @@ static shell_abstract_type_t get_abstract_type(shell_token_type_t tok_type,
   case SHELL_TOKEN_PROCESS_SUB:
     return SHELL_ABSTRACT_CS;
 
+  case SHELL_TOKEN_CONDITIONAL_COMMAND:
+    return SHELL_ABSTRACT_CT;
   case SHELL_TOKEN_ARITHMETIC:
   case SHELL_TOKEN_ARITHMETIC_COMMAND:
     return SHELL_ABSTRACT_AR;
@@ -559,6 +562,7 @@ static void free_abstract_element(shell_abstract_element_t *elem) {
     break;
   case SHELL_ABSTRACT_CS:
   case SHELL_ABSTRACT_AR:
+  case SHELL_ABSTRACT_CT:
   case SHELL_ABSTRACT_STR:
     free(elem->data.cmd_subst.content);
     break;
@@ -814,10 +818,14 @@ static SHELL_NONNULL(1) size_t
   return close - 1;
 }
 
-/* The balanced fragment's type is CS, AR or STR. Its payload may be empty;
+/* The balanced fragment's type is CS, AR, CT or STR. Its payload may be empty;
  * successful extraction always returns an owned string. */
 static SHELL_NONNULL(1) char *abstract_fragment_content_copy(
     const char *text, size_t length, shell_abstract_type_t type) {
+  if (type == SHELL_ABSTRACT_CT) {
+    shell_conditional_t condition = shell_conditional_parse(text, length, 0);
+    return strndup(text + condition.content, condition.end - condition.content);
+  }
   size_t start = abstract_fragment_content_start(text, length);
   size_t end = abstract_fragment_content_end(text, length, type);
   return strndup(text + start, end - start);
@@ -871,6 +879,12 @@ static SHELL_NONNULL(1, 2) void abstract_word_features(
     scan.scope.arithmetic_scope = true;
     scan.scope.suppress_process = true;
     command->has_arithmetic = true;
+  }
+  if (!redirect_operand && token->type == SHELL_TOKEN_CONDITIONAL_COMMAND) {
+    shell_conditional_t condition =
+        shell_conditional_parse(content, content_length, 0);
+    content += condition.operand;
+    content_length = condition.operand_length;
   }
   size_t start, after;
   shell_source_substitution_kind_t kind;
@@ -1060,6 +1074,7 @@ abstract_command_parse_impl(const char *command, size_t command_length,
   }
 
   // Indices for each abstract type
+  size_t idx_ct = 0;
   size_t idx_ev = 0, idx_pv = 0, idx_sv = 0;
   size_t idx_ap = 0, idx_rp = 0, idx_hp = 0;
   size_t idx_gb = 0, idx_cs = 0, idx_ar = 0, idx_str = 0, idx_rd = 0;
@@ -1213,6 +1228,9 @@ abstract_command_parse_impl(const char *command, size_t command_length,
       case SHELL_ABSTRACT_CS:
         idx = ++idx_cs;
         break;
+      case SHELL_ABSTRACT_CT:
+        idx = ++idx_ct;
+        break;
       case SHELL_ABSTRACT_AR:
         idx = ++idx_ar;
         break;
@@ -1278,6 +1296,7 @@ abstract_command_parse_impl(const char *command, size_t command_length,
 
       case SHELL_ABSTRACT_CS:
       case SHELL_ABSTRACT_AR:
+      case SHELL_ABSTRACT_CT:
       case SHELL_ABSTRACT_STR:
         elem->data.cmd_subst.content =
             abstract_fragment_content_copy(tok->start, tok->length, ab_type);
@@ -1312,6 +1331,7 @@ abstract_command_parse_impl(const char *command, size_t command_length,
         break;
       case SHELL_ABSTRACT_CS:
       case SHELL_ABSTRACT_AR:
+      case SHELL_ABSTRACT_CT:
       case SHELL_ABSTRACT_STR:
         detail_ok = elem->data.cmd_subst.content != NULL;
         break;
@@ -1355,6 +1375,8 @@ abstract_command_parse_impl(const char *command, size_t command_length,
           break;
         case SHELL_ABSTRACT_AR:
           abst->has_arithmetic = true;
+          break;
+        case SHELL_ABSTRACT_CT:
           break;
         case SHELL_ABSTRACT_STR:
           abst->has_strings = true;
@@ -1708,17 +1730,19 @@ static const char *token_abbreviation(const shell_token_t *token) {
     return "AR";
   case SHELL_ABSTRACT_REDIR:
     return "RD";
+  case SHELL_ABSTRACT_CT:
+    return "CT";
   case SHELL_ABSTRACT_STR:
   default:
     return "STR";
   }
 }
 
-/* An arithmetic stage has no executable. Its anomaly signature extends the
- * empty argv[0] sentinel with the established arithmetic type symbol. */
+/* Expression stages have no executable. Their anomaly signatures extend the
+ * empty argv[0] sentinel with the arithmetic or conditional type symbol. */
 static SHELL_NONNULL(1) size_t
     empty_stage_signature_length(const shell_command_t *stage) {
-  return stage->kind == SHELL_COMMAND_ARITHMETIC ? 8 : 3;
+  return stage->kind != SHELL_COMMAND_SIMPLE ? 8 : 3;
 }
 
 static shell_process_status_t
@@ -1828,8 +1852,11 @@ shell_build_type_netseq_impl(const char *command, size_t command_length,
       (void)shell_netstring_write_prefix(position, SIZE_MAX, 0, &argv0_prefix);
       position += argv0_prefix;
       *position++ = ',';
-      if (stages.commands[c].kind == SHELL_COMMAND_ARITHMETIC) {
-        memcpy(position, "2:AR,", 5);
+      if (stages.commands[c].kind != SHELL_COMMAND_SIMPLE) {
+        memcpy(position,
+               stages.commands[c].kind == SHELL_COMMAND_CONDITIONAL ? "2:CT,"
+                                                                    : "2:AR,",
+               5);
         position += 5;
       }
       *position++ = ',';
@@ -2026,8 +2053,11 @@ shell_process_status_t shell_build_anomaly_netseqs_from_stages(
                                          &prefix_length);
       type_position += prefix_length;
       *type_position++ = ',';
-      if (stages->commands[c].kind == SHELL_COMMAND_ARITHMETIC) {
-        memcpy(type_position, "2:AR,", 5);
+      if (stages->commands[c].kind != SHELL_COMMAND_SIMPLE) {
+        memcpy(type_position,
+               stages->commands[c].kind == SHELL_COMMAND_CONDITIONAL ? "2:CT,"
+                                                                     : "2:AR,",
+               5);
         type_position += 5;
       }
       *type_position++ = ',';

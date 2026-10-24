@@ -72,16 +72,16 @@ shell_processed_commands_parse(const char *command_line, size_t command_length,
 /* Ordered owned anomaly-analysis view of every supported executable simple
  * command plus each argv-less structural stage that still needs an explicit
  * anomaly boundary. The latter includes redirect-only commands and empty
- * Bash `time` pipelines, as well as arithmetic commands. Public netsequence
- * builders represent these stages with their
- * anomaly-only empty argv[0] sentinel, never as a policy subject. Nested
- * command and process substitutions precede their enclosing command; siblings
- * retain source order. This deterministic analysis order is intentionally not
- * a runtime scheduling claim for pipeline members. The entry boundary checks
- * the complete root's byte domain, syntax and supported semantics once;
- * collection constructs borrowed nested body records without revalidating
- * their descendants. Resource limits and allocation failures remain checked
- * during construction. Source storage stays immutable until return. */
+ * Bash `time` pipelines, as well as arithmetic and conditional commands. Public
+ * netsequence builders represent these stages with their anomaly-only empty
+ * argv[0] sentinel, never as a policy subject. Nested command and process
+ * substitutions precede their enclosing command; siblings retain source order.
+ * This deterministic analysis order is intentionally not a runtime scheduling
+ * claim for pipeline members. The entry boundary checks the complete root's
+ * byte domain, syntax and supported semantics once; collection constructs
+ * borrowed nested body records without revalidating their descendants. Resource
+ * limits and allocation failures remain checked during construction. Source
+ * storage stays immutable until return. */
 typedef struct {
   shell_command_t *commands;
   size_t count;

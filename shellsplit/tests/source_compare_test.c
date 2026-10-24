@@ -114,6 +114,10 @@ static void headers(void) {
 #define FIELDS(F)                                                              \
   F(source.start, 1, 2)                                                        \
   F(kind, SHELL_COMMAND_SIMPLE, SHELL_COMMAND_ARITHMETIC)                      \
+  F(conditional_expression.start, 0, 1)                                        \
+  F(conditional_expression.length, 0, 1)                                       \
+  F(conditional_operand.start, 0, 1)                                           \
+  F(conditional_operand.length, 0, 1)                                          \
   F(arithmetic_expression.start, 0, 2)                                         \
   F(arithmetic_expression.length, 0, 1)                                        \
   F(source.length, 50, 51)                                                     \

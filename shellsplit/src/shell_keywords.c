@@ -9,7 +9,10 @@ static const struct {
   size_t length;
   shell_keyword_t facts;
 } keywords[] = {
-    {"[[", 2, {SHELL_KEYWORD_TEST_OPEN, 0, SHELL_KEYWORD_DEPTH_NONE, 0}},
+    {"[[",
+     2,
+     {SHELL_KEYWORD_TEST_OPEN, SHELL_FEAT_CONDITIONALS,
+      SHELL_KEYWORD_DEPTH_NONE, 0}},
     {"]]", 2, {SHELL_KEYWORD_TEST_CLOSE, 0, SHELL_KEYWORD_DEPTH_NONE, 0}},
     {"case",
      4,

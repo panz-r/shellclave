@@ -1,3 +1,4 @@
+#include "shell_conditional_internal.h"
 #include "shell_expand_internal.h"
 #include "shell_netstring.h"
 #include "shell_source_internal.h"
@@ -121,8 +122,11 @@ shell_expand_resolve(const shell_dep_expand_request_t *request, void *context) {
   cache->offsets[offset] = (uint32_t)cache->count;
   /* Arguments and redirect operands share the argument-context expansion
    * rule; redirect purpose still controls resolver eligibility below. */
-  entry->value.dynamic = shell_source_argument_has_dynamic_syntax(
-      request->word, request->word_length);
+  entry->value.dynamic =
+      request->purpose == SHELL_EXPAND_WORD_CONDITIONAL
+          ? shell_conditional_word_dynamic(request->word, request->word_length)
+          : shell_source_argument_has_dynamic_syntax(request->word,
+                                                     request->word_length);
   if (!entry->value.dynamic || !request->eligible || !cache->expand)
     return &entry->value;
   shell_expand_word_request_t query = {
@@ -150,6 +154,11 @@ shell_expand_resolve(const shell_dep_expand_request_t *request, void *context) {
       !shell_expand_validate(&entry->value,
                              request->purpose != SHELL_EXPAND_WORD_ARGUMENT,
                              cache->measure_display)) {
+    cache->error = SHELL_DEP_EEXPAND;
+    return NULL;
+  }
+  if (request->purpose == SHELL_EXPAND_WORD_CONDITIONAL &&
+      entry->value.count != 1) {
     cache->error = SHELL_DEP_EEXPAND;
     return NULL;
   }

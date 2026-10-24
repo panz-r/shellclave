@@ -254,6 +254,7 @@ static void test_token_type_names(void) {
       "PIPE_TIME",
       "PIPE_TIME_OPTION",
       "ARITHMETIC_COMMAND",
+      "CONDITIONAL_COMMAND",
   };
   bool valid = sizeof(names) / sizeof(names[0]) == SHELL_TOKEN_TYPE_COUNT;
   for (size_t i = 0; valid && i < sizeof(names) / sizeof(names[0]); i++)
@@ -8160,14 +8161,14 @@ static void test_heredoc_expansion_semantic_contract(void) {
        valid);
 }
 
-/* `[[` and `((` are unsupported Bash compound commands, not external argv.
- * Their punctuation may be separated only by physical continuations, which
- * shell removes before recognizing the command. Every public semantic adapter
- * must reject that source atomically. */
+/* Wider conditional predicates and mutating arithmetic are unsupported
+ * compounds. Their punctuation may be separated only by physical continuations,
+ * which shell removes before recognizing the command. Every public semantic
+ * adapter must reject that source atomically. */
 static void test_continued_bash_compound_syntax_contract(void) {
   static const char *const unsupported[] = {
       "(\\\n( count += 1 ))", "(\\\n( count += 1 ))", "(\\\n( count += 1 ))",
-      "[\\\n[ -n value ]]",   "[\\\n[ -n value ]]",   "[[\\\n -n value ]]",
+      "[\\\n[ -f value ]]",   "[\\\n[ -f value ]]",   "[[\\\n -f value ]]",
   };
   bool valid = true;
   for (size_t i = 0; i < sizeof(unsupported) / sizeof(unsupported[0]); i++) {

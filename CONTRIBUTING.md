@@ -45,7 +45,9 @@ support classifications. Dependency-graph fuzz callers must provide both the
 fixed graph prefix from `shell_dep_workspace_size()` and the source-sized tail
 from `shell_source_workspace_size()`. Keep source operations independent so
 cached facts cannot conceal disagreement, and retain deterministic regressions
-outside the bounded smoke seeds.
+outside the bounded smoke seeds. Allocate large retained graph results on the
+heap in fixed sweeps; sanitizer instrumentation can reserve separate stack
+slots for sequential fixture scopes.
 
 Host-locale regressions require `localedef` and the `en_US` and `ISO-8859-1`
 locale sources (`locales` on Debian/Ubuntu). Tests generate private locale data
@@ -96,6 +98,11 @@ Source-byte admission belongs to `shell_source_admission.c`. It owns both the
 whole-source byte check and scoped admission of words, comments, substitutions,
 and heredocs. Retained draft collection remains in `shell_source.c`; lexical
 iteration and list grammar retain their own responsibilities.
+
+`shell_conditional.c` owns unary string-condition framing, primary grammar,
+operand spans and static emptiness facts. Consumers reuse those facts and the
+shared word-expansion primitives. Descriptor snapshots distinguish body-word
+expansion after compound setup from simple-command argv expansion before setup.
 
 `shell_keywords.c` defines keyword spellings and classification facts once.
 Its consumers separately interpret grammar eligibility, feature presence, and

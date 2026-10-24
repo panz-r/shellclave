@@ -31,9 +31,10 @@ Shellsplit exposes several levels of analysis:
 | Dependency-graph construction | Command, group, I/O, state, timing, and substitution relationships |
 
 Lexical feature detection can recognize syntax which semantic consumers reject.
-Control constructs, functions, arrays, and `[[ … ]]` commands remain
+Control constructs, functions, arrays, and wider conditional predicates remain
 unsupported. A feature flag is recognition, not a promise of semantic support.
-Shellgate's default mask also rejects arithmetic, heredocs, and here-strings;
+Shellgate's default mask also rejects arithmetic, conditional commands,
+heredocs, and here-strings;
 changing that mask enables only constructs the semantic model supports.
 
 Control flags recognize complete unquoted lexical words after removal of
@@ -44,6 +45,13 @@ keyword spellings remain lexical markers even in argument positions, so
 arithmetic text and document text do not supply outer control words.
 Executable substitutions are inspected in their own command context, including
 when nested in those data operands.
+
+Extglob words likewise contribute features from active variable, arithmetic,
+command, file and process substitutions and ANSI-C quotes. Literal alternatives
+such as `@(printf|cat)` contribute EXTGLOB without PIPELINE or control-word
+features. In `@($(printf x | cat))`, the executable child contributes SUBSHELL
+and PIPELINE. These rules apply to ordinary arguments and conditional operands;
+quoting and escaping continue to determine which expansions are active.
 
 Grammar recognition also requires an eligible, complete unquoted word before
 expansion. In `fi$(printf x)`, `fi` is a fragment of an ordinary command word,
@@ -138,6 +146,72 @@ subject likewise remains undetermined. Arithmetic appears in anomaly stages
 with one empty executable sentinel and an `AR` typed marker per command;
 comparison and shift operands add no executable stages or substitution flags.
 Applications inspect the expression and I/O through Shellsplit directly.
+
+### Unary string conditions
+
+Conditional commands support `[[ word ]]`, `[[ -n word ]]` and `[[ -z word ]]`,
+with repeated unquoted `!` negation. A bare word tests nonemptiness. Operators
+are recognized from shell syntax, including escaped line continuations, before
+expansion: `[[ '-n' ]]` tests a literal
+string, while `[[ -n ]]` is missing its required operand and is INVALID.
+Internal boolean combinations, parenthesized conditions, binary comparisons,
+patterns, regex and filesystem/variable-attribute predicates remain UNSUPPORTED.
+Lists and existing outer `&&`/`||` connectors compose supported conditions.
+
+Newlines and comments are permitted before a primary, after lexical `!`, and
+after the operand of an explicit `-n`/`-z` predicate. A bare operand requires
+the following token without an intervening newline or comment: `[[ x` followed
+by a newline is INVALID, including an unfinished draft. In contrast, `[[ -n x`
+followed by a newline remains INCOMPLETE until its closing delimiter arrives.
+Blanks and escaped line continuations remain permitted in both forms; quoted
+newlines inside an operand are string data. Comments are grammar trivia:
+expansion-like text within a comment contributes no executable children,
+expansion features or dependencies. Substitution validation examines the
+operand span, while the conditional parser owns comment and delimiter framing.
+
+The operand uses Bash's conditional string expansion. Word splitting, pathname
+expansion and brace expansion are suppressed; `*` and `{,}` remain literal
+strings. Ordinary leading tilde expansion remains dynamic. Existing supported
+parameter, arithmetic, command, backtick and process substitutions retain their
+source and dependencies. Their existing semantic restrictions still apply.
+Condition syntax and values use the fixed byte rules of the executor contract.
+
+Conditional metadata has kind `SHELL_COMMAND_CONDITIONAL`, expression and
+operand spans, and no argv. Graph `conditional_truth` is FALSE, TRUE or UNKNOWN
+before setup/expansion failure. Static effective operand values establish
+emptiness; dynamic values remain unknown unless supplied through the existing
+resolution callback. `SHELL_EXPAND_WORD_CONDITIONAL` requests one final NUL-free
+string record, including `0:,` for an empty value. The callback performs the
+conditional expansion and any joining of positional values; zero or multiple
+records are expansion errors. Callback data is never parsed as shell syntax.
+
+The predicate's truth refines subsequent continuations. A command substitution's
+exit status does not determine the string predicate: `[[ -n $(false) ]]` is
+false because its output is empty. Unresolved operand values retain both
+return outcomes. This model adds no runtime partial-execution recovery.
+
+Bash installs conditional redirects before expanding the operand. Nested
+substitutions therefore inherit those descriptors; a proven setup failure
+prevents their effects. For example, in `[[ -n $(cat) ]] <<<payload`, the nested `cat`
+receives the here-string. The condition itself
+consumes no stdin and produces no ordinary stdout. An unflagged process SUBST
+route into the conditional records its descriptor-resource dependency; the
+predicate tests the generated filename string without reading that stream.
+Redirect setup, diagnostic routes and process-descriptor lifetime remain
+distinct from byte use.
+
+Retained drafts expose the operand and executable children. An unfinished
+committed condition uses `SHELL_SOURCE_NEEDS_CONDITIONAL`; earlier complete
+top-level units can still qualify as an analysis prefix. A received final `[[`
+can acquire an ordinary-word suffix and retains NEEDS_COMMAND until committed.
+
+`SHELL_FEAT_CONDITIONALS` includes conditional commands, so the default gate
+mask rejects them. With the feature enabled, a condition is policy-neutral;
+its own redirects and uncovered enclosing-group I/O remain undetermined.
+Nested executables still require argv-policy matches. Unresolved condition
+values set `SG_EXPANSION_UNRESOLVED_CONDITION`, independently of unresolved
+argv/paths and substitution-inspection requirements. Anomaly sequences retain
+one empty executable with the `CT` marker per conditional stage.
 
 ## Source bytes, words, and canonical values
 
