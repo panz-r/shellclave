@@ -65,6 +65,19 @@ empty executable-name sentinel to anomaly sequences. Those stages are distinct
 from commands with policy-evaluable argv. A multi-argument executable stage
 remains one anomaly item; its arguments are nested in its type signature.
 
+Arithmetic commands have no argv-policy record. Argv-sequence builders omit
+them and report shell syntax through their feature output. Processed-command
+collections retain their explicit arithmetic kind and expression span; direct
+argv rendering produces an empty value. An arithmetic anomaly stage uses the
+empty executable sentinel in the raw sequence and the nested signature
+`0:,2:AR,` in the typed sequence (the complete outer record is `8:0:,2:AR,,`).
+This marker distinguishes arithmetic from other argv-less stages without
+inventing an executable command name.
+
+Each arithmetic command contributes exactly one stage, including adjacent
+operator/operand spellings such as `((1<<(2)))`. Genuine substitutions in
+following shell words and redirection operands keep their separate stages.
+
 Use `shell_build_command_netseq_buffer()`, `shell_build_type_netseq_buffer()`,
 or `shell_build_anomaly_netseqs_buffer()` for binary sequence output. Pass
 their explicit lengths to the anomaly APIs.

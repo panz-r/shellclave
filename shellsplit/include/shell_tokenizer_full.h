@@ -24,7 +24,7 @@ extern "C" {
  * - Subshells and command substitution
  * - Variables: $VAR, ${VAR}, $1, $#, $?, $$, $!, $@, $*, $-
  * - Globbing: *, ?, [abc]
- * - Arithmetic expansion: $((expr))
+ * - Arithmetic expansions $((expr)) and arithmetic commands ((expr))
  */
 
 /**
@@ -68,14 +68,15 @@ typedef enum {
   SHELL_TOKEN_REDIRECT_BOTH,        // Bash &> word
   SHELL_TOKEN_REDIRECT_BOTH_APPEND, // Bash &>> word
   SHELL_TOKEN_ANSI_C_QUOTED,        // Bash $'...'
-  SHELL_TOKEN_EXTGLOB,          // Bash ?(...), *(...), +(...), @(...), !(...)
-  SHELL_TOKEN_ARRAY_ASSIGNMENT, // Bash indexed/associative assignment
-  SHELL_TOKEN_CASE_TERMINATE,   // ;;
-  SHELL_TOKEN_CASE_FALLTHROUGH, // ;&
-  SHELL_TOKEN_CASE_TEST_NEXT,   // ;;&
-  SHELL_TOKEN_PIPE_BOTH,        // Bash |&
-  SHELL_TOKEN_PIPE_TIME,        // Bash reserved `time` pipeline modifier
-  SHELL_TOKEN_PIPE_TIME_OPTION, // `time`'s consumed -p or -- option
+  SHELL_TOKEN_EXTGLOB,            // Bash ?(...), *(...), +(...), @(...), !(...)
+  SHELL_TOKEN_ARRAY_ASSIGNMENT,   // Bash indexed/associative assignment
+  SHELL_TOKEN_CASE_TERMINATE,     // ;;
+  SHELL_TOKEN_CASE_FALLTHROUGH,   // ;&
+  SHELL_TOKEN_CASE_TEST_NEXT,     // ;;&
+  SHELL_TOKEN_PIPE_BOTH,          // Bash |&
+  SHELL_TOKEN_PIPE_TIME,          // Bash reserved `time` pipeline modifier
+  SHELL_TOKEN_PIPE_TIME_OPTION,   // `time`'s consumed -p or -- option
+  SHELL_TOKEN_ARITHMETIC_COMMAND, // Bash ((expression)), not an argv word
   SHELL_TOKEN_TYPE_COUNT
 } shell_token_type_t;
 
@@ -97,6 +98,7 @@ typedef struct {
  * Command structure (group of tokens representing one command)
  */
 typedef struct {
+  shell_command_kind_t kind;
   shell_token_t *tokens; // Array of tokens
   size_t token_count;    // Number of tokens
   /* Half-open source span for this flattened command. Every token is fully
@@ -109,7 +111,7 @@ typedef struct {
   bool has_variables;  // Contains variables ($VAR, ${VAR}, etc.)
   bool has_globs;      // Contains glob patterns (*, ?, [abc])
   bool has_subshells;  // Contains subshells ($(cmd), `cmd`)
-  bool has_arithmetic; // Contains arithmetic expansion ($((expr))
+  bool has_arithmetic; // Contains arithmetic expansion or command
   /* Lexical control metadata uses complete unquoted words outside redirect
    * operands. It does not establish supported control-flow semantics. */
   bool has_loops;        // Contains loop spellings (while, for, until, select)

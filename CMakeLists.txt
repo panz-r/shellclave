@@ -105,6 +105,7 @@ set(SHELLSPLIT_SOURCES
   shellsplit/src/env_screener.c
   shellsplit/src/relative_permutation_entropy.c
   shellsplit/src/shell_abstract.c
+  shellsplit/src/shell_arithmetic.c
   shellsplit/src/shell_depgraph.c
   shellsplit/src/shell_expand.c
   shellsplit/src/shell_heredoc.c
@@ -411,6 +412,10 @@ if(BUILD_TESTING)
         -DSHELLCLAVE_BASH=${SHELLCLAVE_BASH_EXECUTABLE}
         -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/test_bash_source_semantics.cmake)
     set_tests_properties(shellsplit_bash_source_semantics PROPERTIES LABELS shellsplit)
+    add_test(NAME shellsplit_bash_arithmetic_commands
+      COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_bash_arithmetic_commands.py"
+        --bash "${SHELLCLAVE_BASH_EXECUTABLE}" --probe $<TARGET_FILE:shellsplit_arithmetic_production_test>)
+    set_tests_properties(shellsplit_bash_arithmetic_commands PROPERTIES LABELS shellsplit TIMEOUT 45)
     add_test(NAME shellsplit_bash_source_status
       COMMAND "${Python3_EXECUTABLE}"
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_bash_source_status.py"
@@ -462,6 +467,10 @@ if(BUILD_TESTING)
   shellclave_add_production_test(shellsplit_production_semantics_test
     shellsplit/tests/production_semantics_test.c shellsplit)
   set_property(TEST shellsplit_semantics_test APPEND PROPERTY LABELS shellsplit)
+  shellclave_add_test(shellsplit_arithmetic_test shellsplit/tests/arithmetic_test.c shellsplit_test)
+  target_compile_definitions(shellsplit_arithmetic_test PRIVATE SHELLSPLIT_TEST_SOURCE_SCANS)
+  set_property(TEST shellsplit_arithmetic_test APPEND PROPERTY LABELS shellsplit)
+  shellclave_add_production_test(shellsplit_arithmetic_production_test shellsplit/tests/arithmetic_test.c shellsplit)
   shellclave_add_test(shellsplit_entropy_test shellsplit/tests/entropy_test.c shellsplit_test)
   shellclave_add_test(shellsplit_depgraph_test shellsplit/tests/test_depgraph.c shellsplit_test)
   shellclave_add_test(shellsplit_boundary_test shellsplit/tests/boundary_test.c shellsplit_test)

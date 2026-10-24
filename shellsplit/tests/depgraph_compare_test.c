@@ -53,6 +53,11 @@ static void test_nodes(void) {
   a.cmd.field = initial;                                                       \
   b.cmd.field = initial;
 #define CMD_FIELDS                                                             \
+  CMD_FIELD(kind, SHELL_COMMAND_SIMPLE, SHELL_COMMAND_ARITHMETIC)              \
+  CMD_FIELD(arithmetic_expression, NULL, "1")                                  \
+  CMD_FIELD(arithmetic_expression_length, 0, 1)                                \
+  CMD_FIELD(arithmetic_truth, SHELL_ARITHMETIC_UNKNOWN, SHELL_ARITHMETIC_ZERO) \
+  CMD_FIELD(arithmetic_has_redirections, false, true)                          \
   CMD_FIELD(effective_command_known, true, false)                              \
   CMD_FIELD(effective_command_token, 0, 1)                                     \
   CMD_FIELD(effective_command_wrapper, SHELL_DEP_COMMAND_DIRECT,               \

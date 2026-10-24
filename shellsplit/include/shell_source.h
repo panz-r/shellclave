@@ -42,12 +42,17 @@ typedef enum {
   SHELL_SOURCE_NEEDS_HEREDOC_HEADER,
   SHELL_SOURCE_NEEDS_HEREDOC_BODY,
   SHELL_SOURCE_NEEDS_ESCAPE,
+  SHELL_SOURCE_NEEDS_ARITHMETIC,
 } shell_source_need_t;
 
 /* One header record. A simple-command span excludes its deferred heredoc data
  * and following list operator. Nested source remains inside its word spelling.
  * A compound record spans the compound and its trailing redirects, has no
- * ordinary words, and keeps its enclosed headers separate.
+ * ordinary words, and keeps its enclosed headers separate. Arithmetic headers
+ * have kind ARITHMETIC, compound true and an expression span with no argv
+ * words. Supported literal arithmetic has no nested headers; executable
+ * substitutions in semantically unsupported arithmetic retain their lexical
+ * headers. Container headers have kind GROUP.
  * words includes assignment prefixes; assignment_count identifies that initial
  * subset. first_redirect heads an ordered linked list in result.redirects;
  * follow next for redirect_count records (UINT32_MAX ends the list).
@@ -79,6 +84,8 @@ typedef enum {
  */
 typedef struct {
   shell_source_span_t source;
+  shell_command_kind_t kind;
+  shell_source_span_t arithmetic_expression; /* Content without delimiters. */
   shell_source_span_t words[SHELL_DEP_MAX_TOKENS];
   uint32_t word_count, assignment_count;
   uint32_t first_redirect, redirect_count;
@@ -206,7 +213,8 @@ typedef struct shell_source_result {
  * tokens or expansions.
  * The whole-source NUL, prohibited control-byte and DEL checks still apply.
  * Parameter operands inherit the word data domain and their applicable quote
- * context. Executable children establish independent word contexts;
+ * context. Executable children establish independent word and comment
+ * contexts, including inside arithmetic commands and expansions;
  * arithmetic, substring arithmetic and selectors retain restricted code bytes,
  * including at unfinished EOF.
  * Heredoc literal text and parameter words retain their existing data domains.

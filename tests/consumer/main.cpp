@@ -151,6 +151,7 @@ static bool check_depgraph_workspace_api() {
       constexpr char malformed[] = "cat <<\n";
       constexpr char nul[] = "echo\0x";
       constexpr char nul_word[] = "pre$'a\\0b'post";
+      constexpr char arithmetic[] = "((2 + 3))";
       size_t effective_length = 0, binary_length = 0;
       ok = shell_parse_draft(quoted, sizeof(quoted) - 1, nullptr, draft) ==
                SHELL_SOURCE_COMPLETE &&
@@ -169,7 +170,16 @@ static bool check_depgraph_workspace_api() {
            effective_length == 8 &&
            shell_measure_decoded_word(nul_word, sizeof(nul_word) - 1,
                                       &binary_length) == SHELL_PROCESS_OK &&
-           binary_length == 10;
+           binary_length == 10 &&
+           shell_parse_draft(arithmetic, sizeof(arithmetic) - 1, nullptr,
+                             draft) == SHELL_SOURCE_COMPLETE &&
+           draft->header_count == 1 &&
+           draft->headers[0].kind == SHELL_COMMAND_ARITHMETIC &&
+           shell_dep_graph_parse_with_fast(arithmetic, sizeof(arithmetic) - 1,
+                                           ".", &limits, &draft->prefix,
+                                           &graph) == SHELL_DEP_OK &&
+           graph.nodes[0].cmd.kind == SHELL_COMMAND_ARITHMETIC &&
+           graph.nodes[0].cmd.arithmetic_truth == SHELL_ARITHMETIC_NONZERO;
     }
     std::free(draft);
   }

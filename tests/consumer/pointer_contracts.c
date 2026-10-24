@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "../../shellgate/src/sg_io.h"
+#include "../../shellsplit/src/shell_arithmetic_internal.h"
 #include "../../shellsplit/src/shell_depgraph_internal.h"
 #include "../../shellsplit/src/shell_keywords_internal.h"
 #include "../../shellsplit/src/shell_pipeline_internal.h"
@@ -18,7 +19,9 @@
 
 /* Compile-only access to private leaves: their required-pointer annotations
  * are checked without exporting test seams or executing invalid API calls. */
-#if TEST_BAD >= 29 && TEST_BAD <= 46
+#if TEST_BAD >= 29 && TEST_BAD <= 38
+#include "../../shellsplit/src/shell_arithmetic.c"
+#elif TEST_BAD >= 39 && TEST_BAD <= 46
 #include "../../shellsplit/src/shell_tokenizer_full.c"
 #elif (TEST_BAD >= 51 && TEST_BAD <= 53) ||                                    \
     (TEST_BAD >= 56 && TEST_BAD <= 75) || TEST_BAD == 148
@@ -134,28 +137,26 @@ void pointer_contracts(sg_gate_t *gate, st_policy_t *policy) {
   shell_command_t command = {0};
   (void)shell_transform_command(&command, NULL, NULL);
 #elif TEST_BAD == 29
-  arithmetic_skip_space(NULL);
+  skip_space(NULL);
 #elif TEST_BAD == 30
-  (void)arithmetic_match(NULL, "+");
+  (void)match(NULL, "+");
 #elif TEST_BAD == 31
-  static_arithmetic_parser_t parser = {.input = "1", .length = 1};
-  (void)arithmetic_match(&parser, NULL);
+  arithmetic_parser_t parser = {.source = "1", .length = 1, .valid = true};
+  (void)match(&parser, NULL);
 #elif TEST_BAD == 32
-  (void)arithmetic_parse_primary(NULL, 1);
+  (void)primary(NULL, 1);
 #elif TEST_BAD == 33
-  (void)arithmetic_parse_unary(NULL, 1);
+  (void)unary(NULL, 1);
 #elif TEST_BAD == 34
-  bool right_associative;
-  (void)arithmetic_binary_precedence(NULL, &right_associative);
+  (void)parse_binary(NULL, 1, 1);
 #elif TEST_BAD == 35
-  static_arithmetic_parser_t parser = {.input = "1", .length = 1};
-  (void)arithmetic_binary_precedence(&parser, NULL);
+  (void)multiply(1, 1, NULL);
 #elif TEST_BAD == 36
-  (void)arithmetic_parse_binary(NULL, 1, 1);
+  (void)conditional(NULL, 1);
 #elif TEST_BAD == 37
-  (void)arithmetic_parse_conditional(NULL, 1);
+  (void)parse_comma(NULL, 1);
 #elif TEST_BAD == 38
-  (void)arithmetic_parse_comma(NULL, 1);
+  (void)shell_arithmetic_analyze(NULL, 0);
 #elif TEST_BAD == 39
   semantic_pipeline_prefix_t prefix = semantic_pipeline_prefix_initial();
   (void)semantic_token_is_pipeline_prefix(NULL, 1, &token, &prefix);
@@ -175,7 +176,7 @@ void pointer_contracts(sg_gate_t *gate, st_policy_t *policy) {
 #elif TEST_BAD == 45
   (void)arithmetic_has_unsupported_semantics(NULL, 0);
 #elif TEST_BAD == 46
-  (void)arithmetic_has_unsupported_semantics_depth(NULL, 0, 1);
+  (void)substring_has_unsupported_semantics(NULL, 0);
 #elif TEST_BAD == 47
   (void)shell_source_bytes_valid(NULL, 0);
 #elif TEST_BAD == 48
@@ -555,6 +556,35 @@ void pointer_contracts(sg_gate_t *gate, st_policy_t *policy) {
   (void)shell_source_operation_bytes_admitted(NULL, 0);
 #elif TEST_BAD == 197
   shell_source_operation_note_admitted(NULL, 0);
+#elif TEST_BAD == 198
+  (void)shell_arithmetic_substring_supported(NULL, 0);
+#elif TEST_BAD == 199
+  size_t content_end;
+  (void)shell_source_arithmetic_command(NULL, 0, 0, &start, &content_end,
+                                        &after);
+#elif TEST_BAD == 200
+  (void)shell_source_arithmetic_command("((1))", 5, 0, NULL, &start, &after);
+#elif TEST_BAD == 201
+  (void)shell_source_arithmetic_command("((1))", 5, 0, &start, NULL, &after);
+#elif TEST_BAD == 202
+  (void)shell_source_arithmetic_command("((1))", 5, 0, &start, &after, NULL);
+#elif TEST_BAD == 203
+  shell_source_arithmetic_number_t number;
+  (void)shell_source_scan_arithmetic_number(NULL, 0, 0, &number);
+#elif TEST_BAD == 204
+  (void)shell_source_scan_arithmetic_number("1", 1, 0, NULL);
+#elif TEST_BAD == 205
+  const char *content;
+  shell_tokenizer_arithmetic_content(NULL, true, &content, &start);
+#elif TEST_BAD == 206
+  shell_token_t arithmetic = {
+      .type = SHELL_TOKEN_ARITHMETIC_COMMAND, .start = "((1))", .length = 5};
+  shell_tokenizer_arithmetic_content(&arithmetic, true, NULL, &start);
+#elif TEST_BAD == 207
+  const char *content;
+  shell_token_t arithmetic = {
+      .type = SHELL_TOKEN_ARITHMETIC_COMMAND, .start = "((1))", .length = 5};
+  shell_tokenizer_arithmetic_content(&arithmetic, true, &content, NULL);
 #else
   /* These NULL values have API meanings and must stay accepted. */
   (void)shell_netstring_iter_init(&iter, NULL, 0);

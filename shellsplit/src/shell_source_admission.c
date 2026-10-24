@@ -21,16 +21,18 @@ static SHELL_NONNULL(1, 4) void code_bytes(const char *source, size_t start,
   *valid = ascii_span(source, start, end) && *valid;
 }
 
-/* Executable substitutions establish independent source contexts, even inside
- * quotes or an expandable document. Indexed assignment prefixes keep their
- * subscript code domain; their separately tokenized values use ordinary word
- * data. */
+/* The containing construct establishes the root byte and expansion rules.
+ * Executable substitutions establish independent source contexts, including
+ * inside arithmetic, quotes or an expandable document. Indexed assignment
+ * prefixes keep their subscript code domain; their separately tokenized values
+ * use ordinary word data. */
 static SHELL_NONNULL(1) shell_source_status_t
     word_byte_islands(const char *word, size_t length, size_t depth,
-                      bool heredoc, bool word_data) {
+                      bool heredoc, bool word_data, bool arithmetic) {
   shell_source_substitution_scan_t scan = {
       .scope = {.heredoc = heredoc,
-                .suppress_process = heredoc,
+                .suppress_process = heredoc || arithmetic,
+                .arithmetic_scope = arithmetic,
                 .data_domain = heredoc,
                 .word_data = word_data},
       .code_visitor = code_bytes};
@@ -126,10 +128,19 @@ static SHELL_NONNULL(1) shell_source_status_t
       }
       /* An unfinished quoted delimiter is still a data island. Syntax
        * validation, not byte admission, decides whether it is complete. */
+    } else if (token.type == SHELL_TOKEN_ARITHMETIC_COMMAND) {
+      const char *content;
+      size_t content_length;
+      shell_tokenizer_arithmetic_content(&token, !lexer.in_arithmetic, &content,
+                                         &content_length);
+      shell_source_status_t status =
+          word_byte_islands(content, content_length, depth, false, false, true);
+      if (status != SHELL_SOURCE_COMPLETE)
+        return status;
     } else {
       shell_source_status_t status =
           word_byte_islands(token.start, token.length, depth, false,
-                            token.type != SHELL_TOKEN_ARRAY_ASSIGNMENT);
+                            token.type != SHELL_TOKEN_ARRAY_ASSIGNMENT, false);
       if (status != SHELL_SOURCE_COMPLETE)
         return status;
     }
@@ -144,7 +155,7 @@ static SHELL_NONNULL(1) shell_source_status_t
         if (!shell_source_heredoc_delimiter_is_quoted(&pending[h])) {
           shell_source_status_t status = word_byte_islands(
               source + body_start, frame.confirmed_end - body_start, depth,
-              true, true);
+              true, true, false);
           if (status != SHELL_SOURCE_COMPLETE)
             return status;
         }

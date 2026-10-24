@@ -1,5 +1,6 @@
 #include "shell_tokenizer_full.h"
 #include "alloc.h"
+#include "shell_arithmetic_internal.h"
 #include "shell_ascii.h"
 #include "shell_builtin_internal.h"
 #include "shell_keywords_internal.h"
@@ -13,8 +14,6 @@
 
 static SHELL_NONNULL(1) bool arithmetic_has_unsupported_semantics(
     const char *input, size_t length);
-static SHELL_NONNULL(1) bool arithmetic_has_unsupported_semantics_depth(
-    const char *input, size_t length, size_t nesting);
 static _Thread_local shell_semantic_token_observer_t semantic_token_observer;
 static _Thread_local shell_semantic_read_fd_observer_t
     semantic_read_fd_observer;
@@ -27,11 +26,22 @@ static bool unsupported_semantics_scan(const char *input, size_t input_length,
 static SHELL_NONNULL(1) bool unsupported_semantics_scan_impl(
     const char *input, size_t input_length, bool parenthesized_substitution);
 
-/* This is a static recognizer, not an arithmetic evaluator. Bound every
- * grammar recursion path so adversarial parenthesis, exponent, ternary, and
- * nested-expansion chains reject as unsupported instead of consuming the C
- * stack. The limit matches Shellsplit's other structural capacities. */
-#define SHELL_STATIC_ARITHMETIC_MAX_NESTING SHELL_MAX_SUBCOMMANDS
+void shell_tokenizer_arithmetic_content(const shell_token_t *token,
+                                        bool complete, const char **content,
+                                        size_t *content_length) {
+  size_t open = shell_source_logical_following(token->start, token->length, 0);
+  if (token->type == SHELL_TOKEN_ARITHMETIC)
+    open = shell_source_logical_following(token->start, token->length, open);
+  size_t end = token->length;
+  if (complete)
+    end = token->type == SHELL_TOKEN_ARITHMETIC_COMMAND
+              ? end - 2
+              : shell_source_skip_inline_continuations_backward(token->start,
+                                                                end - 1) -
+                    1;
+  *content = token->start + open + 1;
+  *content_length = end - open - 1;
+}
 
 /* Bash arithmetic accepts indexed and associative array references.  They do
  * not become ordinary scalar words merely because the outer lexer represents
@@ -60,247 +70,15 @@ bool shell_tokenizer_arithmetic_has_array_semantics(const char *input,
   return scan.has_arrays;
 }
 
-/* Arithmetic expansion evaluates source in the current shell. Bash can
- * recursively interpret variable values and command-substitution output as
- * arithmetic program text, so recognizing a few assignment spellings is not
- * enough to preserve named-FD state. Canonical Shellsplit entry points accept
- * only a deliberately small, statically pure arithmetic grammar: numeric
- * literals, nesting, and operators. Any identifier, quote, parameter, command
- * substitution, or unrecognized byte is dynamic or requires an evaluator we
- * do not have and is therefore unsupported. Physical line continuations are
- * removed before every decision. */
-typedef struct {
-  const char *input;
-  size_t length;
-  size_t position;
-} static_arithmetic_parser_t;
-
-/* Arithmetic leaves borrow one immutable source span. The required parser
- * has position <= length; matching text is a required terminated operator
- * spelling, and required output pointers reference distinct writable storage.
- * Grammar and nesting limits are checked here, not these caller constraints. */
-static SHELL_NONNULL(1) void arithmetic_skip_space(
-    static_arithmetic_parser_t *parser) {
-  for (;;) {
-    parser->position = shell_source_skip_escaped_line_endings(
-        parser->input, parser->length, parser->position);
-    if (parser->position >= parser->length ||
-        !shell_ascii_space((unsigned char)parser->input[parser->position]))
-      return;
-    parser->position++;
-  }
-}
-
-static SHELL_NONNULL(1, 2) bool arithmetic_match(
-    static_arithmetic_parser_t *parser, const char *text) {
-  size_t saved = parser->position;
-  for (size_t i = 0; text[i] != '\0'; i++) {
-    SHELL_SOURCE_WORD_SCAN(1);
-    size_t position = shell_source_skip_escaped_line_endings(
-        parser->input, parser->length, parser->position);
-    if (position >= parser->length || parser->input[position] != text[i]) {
-      parser->position = saved;
-      return false;
-    }
-    parser->position = position + 1;
-  }
-  return true;
-}
-
-static SHELL_NONNULL(1) bool arithmetic_parse_comma(
-    static_arithmetic_parser_t *parser, size_t nesting);
-
-static SHELL_NONNULL(1) bool arithmetic_parse_primary(
-    static_arithmetic_parser_t *parser, size_t nesting) {
-  if (nesting > SHELL_STATIC_ARITHMETIC_MAX_NESTING)
-    return false;
-  arithmetic_skip_space(parser);
-  if (parser->position >= parser->length)
-    return false;
-
-  if (shell_ascii_digit((unsigned char)parser->input[parser->position]))
-    return shell_source_skip_arithmetic_number(
-        parser->input, parser->length, parser->position, &parser->position);
-
-  if (parser->input[parser->position] == '$') {
-    /* Parse nested arithmetic on this same forward cursor. Balancing a
-     * complete nested suffix before parsing it again is quadratic. */
-    if (!arithmetic_match(parser, "$(("))
-      return false;
-    arithmetic_skip_space(parser);
-    bool empty = arithmetic_match(parser, ")");
-    if (!empty && (nesting == SHELL_STATIC_ARITHMETIC_MAX_NESTING ||
-                   !arithmetic_parse_comma(parser, nesting + 1)))
-      return false;
-    arithmetic_skip_space(parser);
-    return (empty || arithmetic_match(parser, ")")) &&
-           arithmetic_match(parser, ")");
-  }
-
-  if (!arithmetic_match(parser, "("))
-    return false;
-  arithmetic_skip_space(parser);
-  if (arithmetic_match(parser, ")"))
-    return false;
-  if (nesting == SHELL_STATIC_ARITHMETIC_MAX_NESTING ||
-      !arithmetic_parse_comma(parser, nesting + 1))
-    return false;
-  arithmetic_skip_space(parser);
-  return arithmetic_match(parser, ")");
-}
-
-static SHELL_NONNULL(1) bool arithmetic_parse_unary(
-    static_arithmetic_parser_t *parser, size_t nesting) {
-  if (nesting > SHELL_STATIC_ARITHMETIC_MAX_NESTING)
-    return false;
-  /* Prefix operators are linear syntax. Consume them iteratively rather than
-   * making a recursive call for every byte in an adversarial unary chain. */
-  for (;;) {
-    arithmetic_skip_space(parser);
-    if (!arithmetic_match(parser, "+") && !arithmetic_match(parser, "-") &&
-        !arithmetic_match(parser, "!") && !arithmetic_match(parser, "~"))
-      break;
-  }
-  return arithmetic_parse_primary(parser, nesting);
-}
-
-/* Return the literal-only binary operator at the current position. Assignment
- * and increment/decrement deliberately are not operators in this grammar:
- * both can mutate current-shell arithmetic state. */
-static SHELL_NONNULL(1, 2) unsigned int arithmetic_binary_precedence(
-    static_arithmetic_parser_t *p, bool *right_associative) {
-  *right_associative = false;
-  static const struct {
-    const char *text;
-    unsigned int precedence;
-    bool right_associative;
-  } operators[] = {
-      {"||", 1, false}, {"&&", 2, false}, {"|", 3, false},  {"^", 4, false},
-      {"&", 5, false},  {"==", 6, false}, {"!=", 6, false}, {"<=", 7, false},
-      {">=", 7, false}, {"<<", 8, false}, {">>", 8, false}, {"<", 7, false},
-      {">", 7, false},  {"+", 9, false},  {"-", 9, false},  {"**", 11, true},
-      {"*", 10, false}, {"/", 10, false}, {"%", 10, false}};
-  for (size_t i = 0; i < sizeof(operators) / sizeof(operators[0]); i++) {
-    size_t saved = p->position;
-    if (arithmetic_match(p, operators[i].text)) {
-      p->position = saved;
-      *right_associative = operators[i].right_associative;
-      return operators[i].precedence;
-    }
-  }
-  return 0;
-}
-
-static SHELL_NONNULL(1) bool arithmetic_parse_binary(
-    static_arithmetic_parser_t *parser, unsigned int minimum_precedence,
-    size_t nesting) {
-  if (nesting > SHELL_STATIC_ARITHMETIC_MAX_NESTING ||
-      !arithmetic_parse_unary(parser, nesting))
-    return false;
-  for (;;) {
-    arithmetic_skip_space(parser);
-    bool right_associative = false;
-    unsigned int precedence =
-        arithmetic_binary_precedence(parser, &right_associative);
-    if (precedence < minimum_precedence || precedence == 0)
-      return true;
-    /* The probe above intentionally did not consume. */
-    static const char *const operator_text[] = {
-        "||", "&&", "|", "^", "&", "==", "!=", "<=", ">=", "<<",
-        ">>", "<",  ">", "+", "-", "**", "*",  "/",  "%"};
-    bool consumed = false;
-    for (size_t i = 0; i < sizeof(operator_text) / sizeof(operator_text[0]);
-         i++) {
-      if (arithmetic_match(parser, operator_text[i])) {
-        consumed = true;
-        break;
-      }
-    }
-    if (!consumed || nesting == SHELL_STATIC_ARITHMETIC_MAX_NESTING ||
-        !arithmetic_parse_binary(
-            parser, precedence + (right_associative ? 0 : 1), nesting + 1))
-      return false;
-  }
-}
-
-static SHELL_NONNULL(1) bool arithmetic_parse_conditional(
-    static_arithmetic_parser_t *parser, size_t nesting) {
-  if (nesting > SHELL_STATIC_ARITHMETIC_MAX_NESTING ||
-      !arithmetic_parse_binary(parser, 1, nesting))
-    return false;
-  arithmetic_skip_space(parser);
-  if (!arithmetic_match(parser, "?"))
-    return true;
-  if (nesting == SHELL_STATIC_ARITHMETIC_MAX_NESTING ||
-      !arithmetic_parse_comma(parser, nesting + 1))
-    return false;
-  arithmetic_skip_space(parser);
-  return arithmetic_match(parser, ":") &&
-         arithmetic_parse_conditional(parser, nesting + 1);
-}
-
-static SHELL_NONNULL(1) bool arithmetic_parse_comma(
-    static_arithmetic_parser_t *parser, size_t nesting) {
-  if (nesting > SHELL_STATIC_ARITHMETIC_MAX_NESTING ||
-      !arithmetic_parse_conditional(parser, nesting))
-    return false;
-  for (;;) {
-    arithmetic_skip_space(parser);
-    if (!arithmetic_match(parser, ","))
-      return true;
-    if (!arithmetic_parse_conditional(parser, nesting))
-      return false;
-  }
-}
-
+/* Arithmetic grammar and proof belong to the shared private analyzer. */
 static SHELL_NONNULL(1) bool arithmetic_has_unsupported_semantics(
     const char *input, size_t length) {
-  return arithmetic_has_unsupported_semantics_depth(input, length, 1);
+  return !shell_arithmetic_analyze(input, length).supported;
 }
 
-static SHELL_NONNULL(1) bool arithmetic_has_unsupported_semantics_depth(
-    const char *input, size_t length, size_t nesting) {
-  if (nesting > SHELL_STATIC_ARITHMETIC_MAX_NESTING)
-    return true;
-  static_arithmetic_parser_t parser = {
-      .input = input,
-      .length = length,
-  };
-  arithmetic_skip_space(&parser);
-  /* Bash treats an empty arithmetic expansion as zero. */
-  if (parser.position == parser.length)
-    return false;
-  if (!arithmetic_parse_comma(&parser, nesting))
-    return true;
-  arithmetic_skip_space(&parser);
-  return parser.position != parser.length;
-}
-
-/* Offset and optional length share Bash's arithmetic grammar. Parse them on
- * one cursor so ternary colons remain owned by their expression, while a
- * surviving top-level colon separates the two operands. Whitespace-only
- * offsets and an omitted offset before a length mean zero; the lexical
- * boundary rejects the bare ${v:} spelling. An empty length means zero.
- * No evaluation is performed. */
 static SHELL_NONNULL(1) bool substring_has_unsupported_semantics(
     const char *input, size_t length) {
-  static_arithmetic_parser_t parser = {.input = input, .length = length};
-  arithmetic_skip_space(&parser);
-  if (parser.position < length && input[parser.position] != ':' &&
-      !arithmetic_parse_comma(&parser, 1))
-    return true;
-  arithmetic_skip_space(&parser);
-  if (parser.position == length)
-    return false;
-  if (!arithmetic_match(&parser, ":"))
-    return true;
-  arithmetic_skip_space(&parser);
-  if (parser.position == length)
-    return false;
-  if (!arithmetic_parse_comma(&parser, 1))
-    return true;
-  arithmetic_skip_space(&parser);
-  return parser.position != length;
+  return !shell_arithmetic_substring_supported(input, length);
 }
 
 /* A closing brace is a reserved word only when it is separated from adjacent
@@ -364,6 +142,17 @@ static bool brace_groups_valid(const char *input, size_t length) {
         return false;
       i = after - 1;
       continue;
+    }
+    if (c == '(') {
+      size_t content, end, after;
+      if (shell_source_arithmetic_command(input, length, i, &content, &end,
+                                          &after) ==
+          SHELL_ARITHMETIC_FRAME_COMPLETE) {
+        i = after - 1;
+        context_possible = false;
+        word_boundary = false;
+        continue;
+      }
     }
     if (c == '$' &&
         shell_source_logical_next_is(input, length, i, '\'', NULL)) {
@@ -1363,6 +1152,23 @@ static SHELL_NONNULL(1, 2) bool shell_tokenizer_next_raw(
     current_char = state->input[state->position];
   }
 
+  if (!state->in_quotes && state->lexical_command_position &&
+      current_char == '(') {
+    size_t content, end, after;
+    shell_arithmetic_frame_t frame = shell_source_arithmetic_command(
+        state->input, state->length, state->position, &content, &end, &after);
+    if (frame != SHELL_ARITHMETIC_FRAME_NONE) {
+      token->type = SHELL_TOKEN_ARITHMETIC_COMMAND;
+      token->start = state->input + state->position;
+      token->position = state->position;
+      token->length = after - state->position;
+      token->is_quoted = token->is_escaped = false;
+      state->position = after;
+      state->in_arithmetic = frame == SHELL_ARITHMETIC_FRAME_INCOMPLETE;
+      return shell_token_return_current_group_context(state, token);
+    }
+  }
+
   if (!state->in_quotes && current_char == '!' &&
       token_at_word_boundary(state) &&
       shell_source_match_pipeline_negator(state->input, state->length,
@@ -1732,6 +1538,13 @@ static bool shell_tokenizer_next_body(shell_tokenizer_state_t *state,
     return true;
   default:
     break;
+  }
+  if (token->type == SHELL_TOKEN_ARITHMETIC_COMMAND) {
+    state->lexical_command_position = false;
+    state->lexical_redirect_operand = false;
+    state->lexical_operand_end = token->position + token->length;
+    state->lexical_prefix = 0;
+    return true;
   }
   if (full_token_is_redirection(token)) {
     /* A redirect commits simple-command syntax even while argv[0] is still
@@ -2404,9 +2217,6 @@ static bool token_starts_bash_compound_command(const shell_token_t *token,
 
   size_t position = token->position;
   size_t after = 0;
-  if (shell_source_match_logical_punctuation(input, input_length, position,
-                                             "((", &after))
-    return true;
   /* Bash recognizes `[[` as a conditional command only when the delimiter
    * after it begins the condition. Keep a word such as `[[literal` lexical
    * data instead of rejecting a possible external command name. */
@@ -2744,6 +2554,20 @@ static SHELL_NONNULL(1) bool unsupported_semantics_scan_impl(
     if (shell_source_is_escaped_line_ending(input, token.position,
                                             token.position + token.length))
       continue;
+    if (token.type == SHELL_TOKEN_ARITHMETIC_COMMAND) {
+      if (state.in_arithmetic)
+        return true;
+      const char *content;
+      size_t content_length;
+      shell_tokenizer_arithmetic_content(&token, true, &content,
+                                         &content_length);
+      if (!shell_arithmetic_analyze(content, content_length).supported)
+        return true;
+      command_start = false;
+      pipeline_prefix.scanned = true;
+      pipeline_prefix.has_stage = true;
+      continue;
+    }
     /* Shellsplit deliberately does not execute or model case clauses.  The
      * clause terminators are meaningful only there, and Bash rejects them in
      * an ordinary command list.  Never reinterpret one as a plain separator.
@@ -3705,11 +3529,13 @@ static bool shell_list_validate_substitution_content(
 
 static SHELL_NONNULL(1) bool shell_list_validate_expansion_span(
     const char *input, size_t input_length, size_t recursion_depth,
-    bool require_complete, bool heredoc) {
+    bool require_complete, bool heredoc, bool arithmetic) {
   if (recursion_depth >= SHELL_MAX_SUBCOMMANDS)
     return false;
   shell_source_substitution_scan_t scan = {
-      .scope = {.heredoc = heredoc, .suppress_process = heredoc}};
+      .scope = {.heredoc = heredoc,
+                .suppress_process = heredoc || arithmetic,
+                .arithmetic_scope = arithmetic}};
   size_t start = 0;
   size_t after = 0;
   shell_source_substitution_kind_t kind;
@@ -3730,7 +3556,7 @@ static SHELL_NONNULL(1) bool shell_list_validate_substitution_span(
     const char *input, size_t input_length, size_t recursion_depth,
     bool require_complete) {
   return shell_list_validate_expansion_span(
-      input, input_length, recursion_depth, require_complete, false);
+      input, input_length, recursion_depth, require_complete, false, false);
 }
 
 /* Only the root quoting policy differs; nested operands retain scoped syntax.
@@ -3739,7 +3565,7 @@ static SHELL_NONNULL(1) bool shell_list_validate_heredoc_body_substitutions(
     const char *input, size_t input_length, size_t recursion_depth,
     bool require_complete) {
   return shell_list_validate_expansion_span(
-      input, input_length, recursion_depth, require_complete, true);
+      input, input_length, recursion_depth, require_complete, true, false);
 }
 
 typedef struct {
@@ -4065,6 +3891,30 @@ static SHELL_NONNULL(1) bool shell_tokenizer_list_syntax_valid_body(
         return false;
       /* A containing-group closer is handled below.  Separators clear this
        * state through their ordinary transition. */
+    }
+    if (token.type == SHELL_TOKEN_ARITHMETIC_COMMAND) {
+      if (!state.needs_stage || state.redirect_operand)
+        return false;
+      if (tokenizer.in_arithmetic) {
+        if (!draft)
+          return !require_complete;
+        draft->need = SHELL_SOURCE_NEEDS_ARITHMETIC;
+        draft->incomplete_at = (uint32_t)token.position;
+        break;
+      }
+      const char *content;
+      size_t content_length;
+      shell_tokenizer_arithmetic_content(&token, true, &content,
+                                         &content_length);
+      if (!shell_list_validate_expansion_span(content, content_length,
+                                              recursion_depth, require_complete,
+                                              false, true))
+        return false;
+      state.needs_stage = false;
+      state.pipeline_start = false;
+      state.assignment_prefix_open = false;
+      state.after_group = true;
+      continue;
     }
     if (!literal_token && (token.type == SHELL_TOKEN_GROUP_START ||
                            token.type == SHELL_TOKEN_SUBSHELL_START)) {
@@ -4544,6 +4394,7 @@ shell_tokenize_status_t shell_tokenize_prevalidated_commands(
                            token.type == SHELL_TOKEN_VARIABLE_QUOTED ||
                            token.type == SHELL_TOKEN_SPECIAL_VAR ||
                            token.type == SHELL_TOKEN_ARITHMETIC ||
+                           token.type == SHELL_TOKEN_ARITHMETIC_COMMAND ||
                            token.type == SHELL_TOKEN_GLOB ||
                            token.type == SHELL_TOKEN_ANSI_C_QUOTED ||
                            token.type == SHELL_TOKEN_EXTGLOB ||
@@ -4888,6 +4739,7 @@ shell_tokenize_status_t shell_tokenize_prevalidated_commands(
          token.type == SHELL_TOKEN_EXTGLOB ||
          token.type == SHELL_TOKEN_ARRAY_ASSIGNMENT ||
          token.type == SHELL_TOKEN_ARITHMETIC ||
+         token.type == SHELL_TOKEN_ARITHMETIC_COMMAND ||
          token.type == SHELL_TOKEN_PROCESS_SUB)) {
       /* The leading `!` is retained as the pipeline's syntax token, but it
        * does not occupy a simple-command slot. The first following word must
@@ -5006,6 +4858,10 @@ shell_tokenize_status_t shell_tokenize_prevalidated_commands(
     case SHELL_TOKEN_PIPE_BOTH:
       current_cmd->pipe_output_mode = SHELL_PIPE_MODE_STDOUT_AND_STDERR;
       break;
+    case SHELL_TOKEN_ARITHMETIC_COMMAND:
+      current_cmd->kind = SHELL_COMMAND_ARITHMETIC;
+      current_cmd->ends_group = true;
+      /* fall through */
     case SHELL_TOKEN_ARITHMETIC:
       current_cmd->has_arithmetic = true;
       break;
@@ -5162,6 +5018,8 @@ const char *shell_token_type_name(shell_token_type_t type) {
     return "PIPE_TIME";
   case SHELL_TOKEN_PIPE_TIME_OPTION:
     return "PIPE_TIME_OPTION";
+  case SHELL_TOKEN_ARITHMETIC_COMMAND:
+    return "ARITHMETIC_COMMAND";
   case SHELL_TOKEN_REDIRECT_IN:
     return "REDIRECT_IN";
   case SHELL_TOKEN_REDIRECT_OUT:

@@ -10,7 +10,8 @@
 #include <string.h>
 
 /* Bash grammar blanks are space/tab; only LF ends a source line. CR, VT and
- * FF remain word bytes. Numeric operands and arithmetic use separate rules. */
+ * FF remain word bytes. Arithmetic whitespace uses the same space/tab/LF set;
+ * builtin numeric operands have their own parsing rules. */
 static inline bool shell_source_blank(unsigned char byte) {
   return byte == ' ' || byte == '\t';
 }

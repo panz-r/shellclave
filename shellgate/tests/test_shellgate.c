@@ -3706,8 +3706,31 @@ TEST(static_arithmetic_literal_contract) {
       &result));
   ASSERT(result.verdict == SG_VERDICT_ALLOW && result.subcommand_count == 1);
   static const char *const invalid[] = {
-      "echo $((08))",  "echo $((2#))",   "echo $((2#2))", "echo $((65#1))",
-      "echo $((1 2))", "echo $((1 + ))", "echo $((0x))",
+      "echo $((08))",
+      "echo $((2#))",
+      "echo $((2#2))",
+      "echo $((65#1))",
+      "echo $((1 2))",
+      "echo $((1 + ))",
+      "echo $((0x))",
+      "((02#1))",
+      "((010#1))",
+      "((016#f))",
+      "((064#1))",
+      "echo $((02#1))",
+      "echo \"${value:02#1}\"",
+      "echo \"${value:0:02#1}\"",
+      "echo <<EOF\n$((02#1))\nEOF\n",
+      "((02#1)) || echo fallback",
+      "((02#1)) && echo success",
+      "((1\r)) || echo fallback",
+      "((1\v)) && echo success",
+      "echo before; ((1\f)) || echo fallback",
+      "echo $((1\r))",
+      "echo \"${value:\v}\"",
+      "echo \"${value:0:\f}\"",
+      "(( $(printf 1; : 日本) ))",
+      "(( `printf '%s' 日本` ))",
   };
   for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++)
     ASSERT(eval_cmd(gate, invalid[i], &result) == SG_ERR_PARSE &&
@@ -5383,10 +5406,10 @@ TEST(eval_input_contract_matrix) {
        SG_VERDICT_REJECT, false},
       {"bash conditional command", "[[ -f /tmp/x ]]", SG_ERR_PARSE,
        SG_VERDICT_REJECT, false},
-      {"bash arithmetic command", "(( count += 1 ))", SG_ERR_PARSE,
+      {"bash arithmetic command", "(( count += 1 ))", SG_OK, SG_VERDICT_REJECT,
+       false},
+      {"continued bash arithmetic command", "(\\\n( count += 1 ))", SG_OK,
        SG_VERDICT_REJECT, false},
-      {"continued bash arithmetic command", "(\\\n( count += 1 ))",
-       SG_ERR_PARSE, SG_VERDICT_REJECT, false},
       {"continued bash conditional command", "[\\\n[ -n value ]]", SG_ERR_PARSE,
        SG_VERDICT_REJECT, false},
       {"continued bash conditional delimiter", "[[\\\n -n value ]]",
@@ -6295,6 +6318,46 @@ TEST(ansi_nul_source_rejection) {
            result.subcommands[0].verdict == SG_VERDICT_REJECT &&
            result.subcommands[0].netargv == NULL);
   }
+  sg_gate_free(gate);
+}
+
+TEST(arithmetic_command_policy) {
+  const char *rules[] = {"printf *", "cat"};
+  sg_gate_t *gate = gate_with_rules(rules, 2);
+  ASSERT(gate != NULL);
+  ASSERT_SG_OK(sg_gate_set_stop_mode(gate, SG_EVAL_ALL));
+  sg_result_t result = {0};
+  ASSERT_SG_OK(eval_cmd(gate, "((1))", &result));
+  ASSERT(result.verdict == SG_VERDICT_REJECT);
+  ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
+  const char *neutral[] = {"((1))",      "((0))",      "((1/0))", "{ ((1)); }",
+                           "! ((1))",    "time ((1))", "((1)) &", "((1<<(2)))",
+                           "((8>>(1)))", "((1<(2)))"};
+  for (size_t i = 0; i < sizeof(neutral) / sizeof(neutral[0]); ++i) {
+    ASSERT_SG_OK(eval_cmd(gate, neutral[i], &result));
+    ASSERT(result.verdict == SG_VERDICT_ALLOW && result.subcommand_count == 0);
+  }
+  const char *io[] = {"((1)) >output",      "((1)) <input",
+                      "((1)) 2>&1",         "((1)) <<<payload",
+                      "{ ((1)); } >output", "((1)) {fd}>output"};
+  for (size_t i = 0; i < sizeof(io) / sizeof(io[0]); ++i) {
+    ASSERT_SG_OK(eval_cmd(gate, io[i], &result));
+    if (result.verdict != SG_VERDICT_UNDETERMINED)
+      fprintf(stderr, "arithmetic I/O policy: %s verdict %d\n", io[i],
+              result.verdict);
+    ASSERT(result.verdict == SG_VERDICT_UNDETERMINED &&
+           result.subcommand_count == 0);
+  }
+  ASSERT_SG_OK(eval_cmd(gate, "((1)) && printf yes", &result));
+  ASSERT(result.verdict == SG_VERDICT_ALLOW && result.subcommand_count == 1);
+  ASSERT_ST_OK(test_policy_replace_cpl(gate, true, "printf denied", false));
+  ASSERT_SG_OK(eval_cmd(gate, "((1)) >output; printf denied", &result));
+  ASSERT(result.verdict == SG_VERDICT_DENY);
+  ASSERT_EQ_INT(eval_cmd(gate, "((value++))", &result), SG_ERR_PARSE);
+  ASSERT(result.verdict == SG_VERDICT_REJECT);
+  ASSERT_SG_OK(sg_gate_set_reject_mask(gate, SHELL_FEAT_SUBSHELL));
+  ASSERT_SG_OK(eval_cmd(gate, "(( $x + $(printf 1) ))", &result));
+  ASSERT(result.verdict == SG_VERDICT_REJECT);
   sg_gate_free(gate);
 }
 
@@ -15460,6 +15523,7 @@ int main(int argc, char **argv) {
   RUN(binary_canonical_policy_mutations);
   RUN(binary_cpl_policy_contract);
   RUN(ansi_nul_source_rejection);
+  RUN(arithmetic_command_policy);
   RUN(nested_ansi_escape_policy);
   RUN(policy_replacement_failure_atomicity);
   RUN(policy_evaluation_allocation_failure);

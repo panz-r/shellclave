@@ -44,11 +44,13 @@ static SHELL_NONNULL(1) uint32_t
     return UINT32_MAX;
   }
   uint32_t id = out->header_count++;
-  out->headers[id] = (shell_source_header_t){.source = {(uint32_t)start, 0},
-                                             .first_redirect = UINT32_MAX,
-                                             .group_depth = (uint16_t)depth,
-                                             .complete = true,
-                                             .compound = compound};
+  out->headers[id] = (shell_source_header_t){
+      .source = {(uint32_t)start, 0},
+      .first_redirect = UINT32_MAX,
+      .group_depth = (uint16_t)depth,
+      .complete = true,
+      .compound = compound,
+      .kind = compound ? SHELL_COMMAND_GROUP : SHELL_COMMAND_SIMPLE};
   collector->last_redirect[id] = UINT32_MAX;
   return id;
 }
@@ -103,10 +105,13 @@ static SHELL_NONNULL(1, 2) shell_source_status_t
  * twice. Heredoc roots use their own quoting and EOF diagnostics. */
 static SHELL_NONNULL(1, 2) bool collect_expansions(
     source_collector_t *collector, source_body_t *owner, size_t base,
-    size_t length, size_t depth, bool heredoc, bool unfinished) {
+    size_t length, size_t depth, bool heredoc, bool unfinished,
+    bool arithmetic) {
   const char *word = collector->source + base;
   shell_source_substitution_scan_t scan = {
-      .scope = {.heredoc = heredoc, .suppress_process = heredoc}};
+      .scope = {.heredoc = heredoc,
+                .suppress_process = heredoc || arithmetic,
+                .arithmetic_scope = arithmetic}};
   size_t start, after;
   shell_source_substitution_kind_t kind;
   shell_source_scan_status_t terminal;
@@ -294,7 +299,7 @@ static SHELL_NONNULL(1, 2) bool collect_body(source_collector_t *collector,
           if (!(doc->content.flags & SHELL_DEP_DOC_FLAG_HEREDOC_LITERAL) &&
               !collect_expansions(collector, body, base + body_start,
                                   frame.confirmed_end - body_start,
-                                  depth + group_count, true, false))
+                                  depth + group_count, true, false, false))
             return false;
           body_start = frame.after;
           if (!frame.complete)
@@ -323,6 +328,28 @@ static SHELL_NONNULL(1, 2) bool collect_body(source_collector_t *collector,
       continuation = false;
     }
     collector->header = current;
+    if (token.type == SHELL_TOKEN_ARITHMETIC_COMMAND) {
+      const char *expression;
+      size_t expression_length;
+      shell_tokenizer_arithmetic_content(&token, !lexer.in_arithmetic,
+                                         &expression, &expression_length);
+      size_t content = (size_t)(expression - source);
+      size_t after = start + token.length;
+      out->headers[current].kind = SHELL_COMMAND_ARITHMETIC;
+      out->headers[current].compound = true;
+      out->headers[current].arithmetic_expression = (shell_source_span_t){
+          (uint32_t)(base + content), (uint32_t)expression_length};
+      if (lexer.in_arithmetic) {
+        out->headers[current].complete = false;
+        need(body, SHELL_SOURCE_NEEDS_ARITHMETIC, base + start);
+      }
+      if (!collect_expansions(collector, body, base + content,
+                              expression_length, depth + group_count, false,
+                              lexer.in_arithmetic, true))
+        return false;
+      covered = after;
+      continue;
+    }
     /* A leading process substitution is a word fragment, not a redirect.
      * Its following quote/expansion belongs to that same word. */
     bool process_word =
@@ -382,13 +409,13 @@ static SHELL_NONNULL(1, 2) bool collect_body(source_collector_t *collector,
           if (word.start != word.end) {
             if (!collect_expansions(collector, body, word.start,
                                     word.end - word.start, depth + group_count,
-                                    false, true))
+                                    false, true, false))
               return false;
             break;
           }
-        } else if (!collect_expansions(collector, body, word.start,
-                                       word.end - word.start,
-                                       depth + group_count, false, false))
+        } else if (!collect_expansions(
+                       collector, body, word.start, word.end - word.start,
+                       depth + group_count, false, false, false))
           return false;
       }
       covered = redirect_end;
@@ -432,7 +459,7 @@ static SHELL_NONNULL(1, 2) bool collect_body(source_collector_t *collector,
     if (!shell_tokenizer_word_end(source, length, &token, &word_end)) {
       out->headers[current].complete = false;
       if (!collect_expansions(collector, body, base + start, length - start,
-                              depth + group_count, false, true))
+                              depth + group_count, false, true, false))
         return false;
       break;
     }
@@ -466,7 +493,7 @@ static SHELL_NONNULL(1, 2) bool collect_body(source_collector_t *collector,
     header->words[header->word_count++] = (shell_source_span_t){
         (uint32_t)(base + start), (uint32_t)(word_end - start)};
     if (!collect_expansions(collector, body, base + start, word_end - start,
-                            depth + group_count, false, false))
+                            depth + group_count, false, false, false))
       return false;
     covered = word_end;
   }

@@ -45,6 +45,7 @@ static void ranges(void) {
 #define FIELDS(F)                                                              \
   F(start, 1, 2)                                                               \
   F(len, 4, 5)                                                                 \
+  F(kind, SHELL_COMMAND_SIMPLE, SHELL_COMMAND_ARITHMETIC)                      \
   F(type, SHELL_TYPE_SIMPLE, SHELL_TYPE_PIPELINE)                              \
   F(modifiers, SHELL_CMD_MOD_PIPE_TIMED, SHELL_CMD_MOD_NONE)                   \
   F(pipeline_negation_count, 0, 1)                                             \
@@ -112,6 +113,9 @@ static void headers(void) {
       shellsplit_test_header_difference;
 #define FIELDS(F)                                                              \
   F(source.start, 1, 2)                                                        \
+  F(kind, SHELL_COMMAND_SIMPLE, SHELL_COMMAND_ARITHMETIC)                      \
+  F(arithmetic_expression.start, 0, 2)                                         \
+  F(arithmetic_expression.length, 0, 1)                                        \
   F(source.length, 50, 51)                                                     \
   F(word_count, 2, 1)                                                          \
   F(assignment_count, 1, 0)                                                    \

@@ -10,6 +10,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "shell_depgraph.h"
+#include "shell_arithmetic_internal.h"
 #include "shell_ascii.h"
 #include "shell_builtin_internal.h"
 #include "shell_depgraph_internal.h"
@@ -630,6 +631,15 @@ static bool scan_tokens(const char *cmd, uint32_t range_start,
     if (pos >= end)
       break;
 
+    if (out->count == 0 && cmd[pos] == '(') {
+      size_t content, expression_end, after;
+      if (shell_source_arithmetic_command(cmd, end, pos, &content,
+                                          &expression_end, &after) ==
+          SHELL_ARITHMETIC_FRAME_COMPLETE) {
+        pos = (uint32_t)after;
+        continue;
+      }
+    }
     uint32_t tok_start = pos;
     uint32_t redirect_end = scan_redirect_token(cmd, pos, end);
     /* Inline document ranges remain separate for document construction, but
@@ -4803,7 +4813,8 @@ static SHELL_NONNULL(1, 2) bool dep_owner_persists_named_binding(
     uint32_t owner) {
   return graph->nodes[owner].type == SHELL_NODE_GROUP ||
          (graph->nodes[owner].type == SHELL_NODE_CMD &&
-          graph->nodes[owner].cmd.token_count != 0 &&
+          (graph->nodes[owner].cmd.token_count != 0 ||
+           graph->nodes[owner].cmd.kind == SHELL_COMMAND_ARITHMETIC) &&
           (context
                ->expansion_status[SHELL_MAX_GROUPS + context->node_range[owner]]
                .redirect_scopes &
@@ -21327,6 +21338,13 @@ static SHELL_NONNULL(1, 2, 4, 5, 6, 7, 8, 9, 10, 13, 15, 16,
         return SHELL_DEP_ETRUNC;
       diagnostic_cursor++;
     }
+    if (graph->nodes[owner].type == SHELL_NODE_CMD &&
+        graph->nodes[owner].cmd.kind == SHELL_COMMAND_ARITHMETIC &&
+        graph->nodes[owner].cmd.arithmetic_truth == SHELL_ARITHMETIC_UNKNOWN &&
+        context->owner_setup_stop[owner] == UINT32_MAX &&
+        !dep_record_diagnostic(&local_route_state, &workspace->route_journal,
+                               &flow_baseline))
+      return SHELL_DEP_ETRUNC;
     dep_prepare_fd_close_history(ops, op_count);
     if (graph->nodes[owner].type == SHELL_NODE_GROUP &&
         node_group[owner] != UINT32_MAX &&
@@ -21708,7 +21726,9 @@ static SHELL_NONNULL(1, 2, 4, 5, 6, 7, 8, 9, 10, 13, 15, 16,
     if (context->owner_setup_stop[owner] == UINT32_MAX &&
         owner_edges->effective_document[edge] && !setup_only_edges[edge] &&
         (original->type != SHELL_EDGE_READ || workspace->generic_read[owner] ||
-         !external_eligible[owner])) {
+         !external_eligible[owner]) &&
+        !(graph->nodes[owner].type == SHELL_NODE_CMD &&
+          graph->nodes[owner].cmd.kind == SHELL_COMMAND_ARITHMETIC)) {
       /* An argv-less stage has no body. Its explicit document binding still
        * represents reached redirect setup, unlike an inherited default use. */
       if (!external_eligible[owner])
@@ -21926,11 +21946,13 @@ static SHELL_NONNULL(1, 2, 4, 5, 6, 7, 8, 9, 10, 13, 15, 16,
       dep_route_state_t alternatives = workspace->owner_route_state[owner];
       /* A pipeline installs a real descriptor connection even for a null
        * stage. Retain that setup topology, but no default body stream. */
-      bool pipe_binding = external_eligible[owner] ||
-                          (resolved_owner[owner] &&
-                           control_execution[owner] != DEP_EXECUTION_NEVER &&
-                           graph->nodes[owner].type == SHELL_NODE_CMD &&
-                           graph->nodes[owner].cmd.token_count == 0);
+      bool pipe_binding =
+          external_eligible[owner] ||
+          (resolved_owner[owner] &&
+           control_execution[owner] != DEP_EXECUTION_NEVER &&
+           graph->nodes[owner].type == SHELL_NODE_CMD &&
+           graph->nodes[owner].cmd.token_count == 0 &&
+           graph->nodes[owner].cmd.kind != SHELL_COMMAND_ARITHMETIC);
       if (access == DEP_FD_ACCESS_READ && !workspace->generic_read[owner] &&
           graph->nodes[owner].type != SHELL_NODE_CMD)
         pipe_binding = false;
@@ -25194,7 +25216,17 @@ static SHELL_NONNULL(1, 6, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
 
     if (empty_timed_pipeline)
       tokens = (dep_token_list_t){0};
-    if (tokens.count == 0 && !empty_timed_pipeline &&
+    bool arithmetic_command = range->kind == SHELL_COMMAND_ARITHMETIC;
+    size_t arithmetic_content = 0, arithmetic_end = 0, arithmetic_after = 0;
+    shell_arithmetic_result_t arithmetic = {0};
+    if (arithmetic_command) {
+      (void)shell_source_arithmetic_command(cmd, cmd_len, range->start,
+                                            &arithmetic_content,
+                                            &arithmetic_end, &arithmetic_after);
+      arithmetic = shell_arithmetic_analyze(
+          cmd + arithmetic_content, arithmetic_end - arithmetic_content);
+    }
+    if (tokens.count == 0 && !empty_timed_pipeline && !arithmetic_command &&
         !shell_execution_document(&lexical_documents[si]))
       continue;
 
@@ -25204,6 +25236,10 @@ static SHELL_NONNULL(1, 6, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
     uint32_t command =
         dep_first_command_index(&tokens, &readonly_stop, &isolated_setup,
                                 &rejected_assignments, &argv_presence);
+    if (arithmetic_command) {
+      argv_presence = DEP_ARGV_PRESENT;
+      isolated_setup = false;
+    }
     uint32_t assignment_stop =
         argv_presence == DEP_ARGV_EMPTY ? readonly_stop : UINT32_MAX;
     uint32_t effective_command = command;
@@ -25324,6 +25360,23 @@ static SHELL_NONNULL(1, 6, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
         &observable, range->start, execution.end[si],
         &process_routes.observed_low[cmd_node_idx]);
     node->type = SHELL_NODE_CMD;
+    node->cmd.kind = range->kind;
+    node->cmd.arithmetic_expression = NULL;
+    node->cmd.arithmetic_expression_length = 0;
+    node->cmd.arithmetic_truth = SHELL_ARITHMETIC_UNKNOWN;
+    node->cmd.arithmetic_has_redirections =
+        arithmetic_command &&
+        (tokens.count != 0 ||
+         lexical_documents[si].type == SHELL_TYPE_HEREDOC ||
+         lexical_documents[si].type == SHELL_TYPE_HERESTRING);
+    if (arithmetic_command) {
+      node->cmd.arithmetic_expression = cmd + arithmetic_content;
+      node->cmd.arithmetic_expression_length =
+          (uint32_t)(arithmetic_end - arithmetic_content);
+      node->cmd.arithmetic_truth = !arithmetic.known  ? SHELL_ARITHMETIC_UNKNOWN
+                                   : arithmetic.value ? SHELL_ARITHMETIC_NONZERO
+                                                      : SHELL_ARITHMETIC_ZERO;
+    }
     node->cmd.pipe_stdin_source = UINT32_MAX;
     node->cmd.pipe_stdin_target = UINT32_MAX;
     node->cmd.pipe_stdout_source = UINT32_MAX;
@@ -25393,6 +25446,8 @@ static SHELL_NONNULL(1, 6, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
       if (argv_presence == DEP_ARGV_EMPTY &&
           (fd == 0 || fd == SHELL_DEP_FD_NAMED))
         expansion_status[source_event].isolated_setup = true;
+      if (arithmetic_command)
+        node->cmd.arithmetic_has_redirections = true;
       if (!add_document_read(out, max_nodes, max_edges, cmd_node_idx, kind,
                              name, name_len, value, value_len, fd, flags,
                              &out->status, &stage_document[fragment],
@@ -25815,6 +25870,10 @@ static SHELL_NONNULL(1, 6, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
               : DEP_STATUS_EITHER;
       if (effective_builtin)
         outcomes = dep_static_command_status(effective_builtin);
+      if (arithmetic_command)
+        outcomes = !arithmetic.known  ? DEP_STATUS_EITHER
+                   : arithmetic.value ? DEP_STATUS_MAY_SUCCEED
+                                      : DEP_STATUS_MAY_FAIL;
       if (expansion_status[source_event].redirect_scopes &
           DEP_REDIRECT_BAD_BUILTIN)
         outcomes = DEP_STATUS_MAY_FAIL;
@@ -26488,6 +26547,17 @@ void shell_dep_graph_dump(const shell_dep_graph_t *g, FILE *fp) {
         else
           fputs(" time-node=missing", fp);
       }
+      if (n->cmd.kind == SHELL_COMMAND_ARITHMETIC) {
+        fputs(" arithmetic=\"", fp);
+        dep_dump_escaped_span(fp, n->cmd.arithmetic_expression,
+                              n->cmd.arithmetic_expression_length);
+        fprintf(fp, "\" truth=%s redirects=%s",
+                n->cmd.arithmetic_truth == SHELL_ARITHMETIC_ZERO ? "zero"
+                : n->cmd.arithmetic_truth == SHELL_ARITHMETIC_NONZERO
+                    ? "nonzero"
+                    : "unknown",
+                n->cmd.arithmetic_has_redirections ? "yes" : "no");
+      }
       fprintf(fp, " tokens=[");
       for (uint32_t j = 0; j < n->cmd.token_count; j++) {
         if (j > 0)
@@ -26950,6 +27020,17 @@ shell_dep_graph_validate(const shell_dep_graph_t *g) {
       continue;
     }
     if (n->type == SHELL_NODE_CMD) {
+      if ((n->cmd.kind != SHELL_COMMAND_SIMPLE &&
+           n->cmd.kind != SHELL_COMMAND_ARITHMETIC) ||
+          (n->cmd.kind == SHELL_COMMAND_ARITHMETIC &&
+           (n->cmd.token_count != 0 || n->cmd.effective_command_known ||
+            !n->cmd.arithmetic_expression ||
+            n->cmd.arithmetic_truth > SHELL_ARITHMETIC_NONZERO))) {
+        r.valid = false;
+        snprintf(r.errors[r.error_count++].msg, 96,
+                 "CMD node %u: invalid arithmetic command metadata", i);
+        continue;
+      }
       if (n->cmd.token_count > SHELL_DEP_MAX_TOKENS) {
         r.valid = false;
         snprintf(r.errors[r.error_count++].msg, 96,

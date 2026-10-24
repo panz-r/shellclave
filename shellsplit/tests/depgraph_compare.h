@@ -65,6 +65,11 @@ static inline SHELL_NONNULL(1, 2) const
   SHELLSPLIT_COMPARE_FIELD(type);
   switch (a->type) {
   case SHELL_NODE_CMD:
+    SHELLSPLIT_COMPARE_FIELD(cmd.kind);
+    SHELLSPLIT_COMPARE_FIELD(cmd.arithmetic_expression);
+    SHELLSPLIT_COMPARE_FIELD(cmd.arithmetic_expression_length);
+    SHELLSPLIT_COMPARE_FIELD(cmd.arithmetic_truth);
+    SHELLSPLIT_COMPARE_FIELD(cmd.arithmetic_has_redirections);
     SHELLSPLIT_COMPARE_FIELD(cmd.token_count);
     for (uint32_t i = 0; i < a->cmd.token_count; i++) {
       SHELLSPLIT_COMPARE_FIELD(cmd.tokens[i]);

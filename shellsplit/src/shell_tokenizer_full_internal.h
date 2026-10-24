@@ -32,6 +32,19 @@ void shell_tokenizer_init_prechecked(shell_tokenizer_state_t *state,
  * not quote structural operators. */
 bool shell_token_is_literal(const shell_token_t *token) SHELL_NONNULL(1);
 
+/* Borrow the expression of a lexer-produced complete ARITHMETIC token or a
+ * complete/incomplete ARITHMETIC_COMMAND token. complete is the lexer's
+ * framing fact, not semantic support; it is true for ARITHMETIC tokens. An
+ * incomplete command token includes its full received tail. Source stays
+ * immutable and live. Output destinations are distinct and do not alias the
+ * token or its source. Only delimiter trivia
+ * is inspected: no balancing, allocation or correspondence check is repeated.
+ */
+void shell_tokenizer_arithmetic_content(const shell_token_t *token,
+                                        bool complete, const char **content,
+                                        size_t *content_length)
+    SHELL_NONNULL(1, 3, 4);
+
 static inline SHELL_NONNULL(1) bool full_token_is_redirection(
     const shell_token_t *token) {
   return token->type == SHELL_TOKEN_REDIRECT_IN ||

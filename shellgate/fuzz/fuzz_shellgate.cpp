@@ -2167,7 +2167,7 @@ void run_semantic_reference_oracles() {
       "echo \"$(time eval echo hidden)\"",
       "printf '%s' $\"localized\"",
       "echo $( [[ -f /tmp/x ]] )",
-      "{ (( 1 )); }",
+      "{ (( count )); }",
       "cat <<EOF\n$(while true; do :; done)\nEOF\n",
       "cat <<EOF\n`select item in one; do :; done`\nEOF\n",
       "cat <<EOF\n${items[0]}\nEOF\n",

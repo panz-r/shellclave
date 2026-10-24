@@ -3,6 +3,67 @@
 These notes describe changes relevant to existing consumers. The public headers
 define the current API; rebuild consumers after updating the library.
 
+## Unreleased: arithmetic commands
+
+Literal-only Bash arithmetic commands `(( expression ))` are now supported.
+They share numeric grammar with arithmetic expansions and substring operands.
+Checked constant proofs refine zero/nonzero status; uncertain evaluation keeps
+both outcomes. Dynamic and mutating arithmetic remains unsupported. Source
+framing remains distinct from arithmetic evaluation and its possible errors.
+
+Arithmetic whitespace now matches Bash's space/tab/LF set. CR, vertical tab
+and form feed no longer count as whitespace in commands, expansions or
+substring operands. Semantic consumers reject affected expressions with
+`SHELL_DEP_EPARSE` or `SHELL_PROCESS_EPARSE` and empty outputs, while balanced
+source framing remains COMPLETE. This prevents false success proofs from
+discarding reachable failure continuations. Ordinary word data and
+backslash-LF continuation handling are unchanged.
+
+The shared numeric scanner now rejects explicit bases with a leading zero,
+such as `02#1`, rather than deriving a false zero/nonzero proof. Graph
+construction returns `SHELL_DEP_EPARSE` and canonical-sequence builders return
+`SHELL_PROCESS_EPARSE`, with empty outputs in both cases. Valid leading zeros
+in the digits, such as `2#01`, retain their existing meaning; raw source framing
+remains COMPLETE.
+Feature discovery advances over consumed numeric prefixes even when they are
+invalid, keeping long malformed numbers from triggering repeated suffix scans.
+
+Arithmetic-command byte admission now follows scoped expansion rules.
+Executable children admit literal high bytes in words and comments, while the
+surrounding arithmetic code keeps its ASCII restriction. Admitted child data
+therefore preserves COMPLETE, INVALID and INCOMPLETE grammar outcomes and
+retained child headers. Arithmetic with executable substitutions remains
+semantically unsupported.
+
+Command forms now have a shared `shell_command_kind_t` discriminator. Fast
+ranges, tokenized and processed commands, retained headers and graph CMD
+metadata distinguish arithmetic from simple commands. Retained container
+headers use GROUP. Arithmetic headers and command metadata expose expression
+spans; graph CMD metadata additionally exposes expression truth and explicit
+redirect presence. Arithmetic is compound syntax without argv words, not a
+subshell scope. Rebuild C and C++ consumers for these public layout additions.
+
+Processed-command arrays now retain arithmetic entries with no command tokens.
+Group command intervals index that expanded collection. Argv-only sequence
+builders omit arithmetic and keep their counts limited to argv records;
+direct argv rendering returns an empty value. Anomaly sequences retain one
+arithmetic stage with an empty raw executable and typed `[empty, AR]` signature.
+Existing anomaly models remain readable; arithmetic introduces new sequences
+which applications can learn through the existing anomaly API.
+Arithmetic command bodies retain their arithmetic expansion context in feature
+discovery, abstraction and anomaly collection. Adjacent comparisons and shifts
+produce one arithmetic stage without phantom process-substitution commands.
+Fast feature flags also retain nested variables and executable-child features
+when the arithmetic expression is outside semantic support.
+
+`SHELL_FEAT_ARITH` now covers commands as well as expansions; the default gate
+mask remains restrictive. Enabling arithmetic makes a pure arithmetic command
+policy-neutral, while its explicit redirects or uncovered enclosing-group I/O
+leave policy classification undetermined. No arithmetic record is passed to
+Shelltype as a fictitious executable. Incomplete arithmetic has the appended
+`SHELL_SOURCE_NEEDS_ARITHMETIC` diagnostic kind. Existing token enum values
+remain stable, with the arithmetic-command token appended before TYPE_COUNT.
+
 ## Unreleased: typed source admission
 
 Comments now admit literal high bytes, including invalid UTF-8. Their existing

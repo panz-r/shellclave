@@ -45,7 +45,7 @@ class SourceStatusContract(unittest.TestCase):
             (b'"f"() { :; }', 4),
             (b"f\\ g() { :; }", 4),
             (b"[[ -f input ]]", 4),
-            (b"((1 + 2))", 4),
+            (b"((1 + 2))", 0),
             (b"echo ${x!}", 4),
             (b"echo ${x:}", 4),
             (b"echo $[1 + (2)]", 4),
@@ -89,6 +89,46 @@ class SourceStatusContract(unittest.TestCase):
             with self.subTest(source=source):
                 self.assertEqual(self.syntax(source), 0)
                 self.assertEqual(self.classify(source), expected)
+
+    def test_arithmetic_command_framing(self):
+        complete = [b"(( ))", b"((1 << 2))", b"((1+))",
+                    b"(( $(printf 1) ))", b"(( '1' ))",
+                    b"((printf ok); printf tail)", b"( (printf ok) )",
+                    b"(\\\n(1))", b"((1) )", b"time ! ((1)) >out",
+                    b"echo \"$( ((1 << 2)); printf ok)\"",
+                    b"cat <<EOF\n$( ((1 << 2)); printf ok)\nEOF\n"]
+        invalid = [b"((1)) word", b"((1))((2))", b"((1));;",
+                   b"(( $(printf &&) ))", b"((1)) > ;",
+                   b"echo ((1))", b"x=1 ((1))", b">out ((1))"]
+        for cases, syntax, status in ((complete, 0, 0), (invalid, 2, 2)):
+            for source in cases:
+                with self.subTest(source=source):
+                    self.assertEqual(self.syntax(source), syntax)
+                    self.assertEqual(self.classify(source), status)
+        for source in (b"((", b"((1", b"((1)", b"printf ok; ((1+"):
+            with self.subTest(source=source):
+                self.assertEqual(self.syntax(source), 2)
+                self.assertEqual(self.classify(source), 1)
+
+    def test_arithmetic_child_byte_domains(self):
+        cases = [
+            ("(( $(printf 1; : 日本) ))".encode(), 0, 0),
+            ("(( $(printf '%s' '日本') ))".encode(), 0, 0),
+            ("(( $(printf 1 #日本\n) ))".encode(), 0, 0),
+            ("(( `printf '%s' 日本` ))".encode(), 0, 0),
+            (b"(( $(printf '%s' \xff) ))", 0, 0),
+            (b"(( $(printf 1 #\xff\n) ))", 0, 0),
+            ("(( $(printf 日本 &&) ))".encode(), 2, 2),
+            ("(( $(printf 日本) )) word".encode(), 2, 2),
+            ("(( $(printf 日本".encode(), 2, 1),
+            ("(( `printf 日本".encode(), 2, 1),
+            ("((日本))".encode(), 0, 4),
+            ("((日本".encode(), 2, 4),
+        ]
+        for source, syntax, status in cases:
+            with self.subTest(source=source):
+                self.assertEqual(self.syntax(source), syntax)
+                self.assertEqual(self.classify(source), status)
 
     def test_keyword_fragments_are_ordinary_words(self):
         cases = [

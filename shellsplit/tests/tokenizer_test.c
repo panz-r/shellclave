@@ -253,6 +253,7 @@ static void test_token_type_names(void) {
       "PIPE_BOTH",
       "PIPE_TIME",
       "PIPE_TIME_OPTION",
+      "ARITHMETIC_COMMAND",
   };
   bool valid = sizeof(names) / sizeof(names[0]) == SHELL_TOKEN_TYPE_COUNT;
   for (size_t i = 0; valid && i < sizeof(names) / sizeof(names[0]); i++)
@@ -360,10 +361,12 @@ static void test_list_syntax_contract(void) {
     }
   }
 
-  char nesting[(SHELL_MAX_GROUPS + 1u) * 2u + 2u];
+  char nesting[(SHELL_MAX_GROUPS + 1u) * 3u + 2u];
   size_t position = 0;
-  for (size_t i = 0; i <= SHELL_MAX_GROUPS; i++)
+  for (size_t i = 0; i <= SHELL_MAX_GROUPS; i++) {
     nesting[position++] = '(';
+    nesting[position++] = ' ';
+  }
   nesting[position++] = ':';
   for (size_t i = 0; i <= SHELL_MAX_GROUPS; i++)
     nesting[position++] = ')';
@@ -6329,8 +6332,10 @@ static void test_static_arithmetic_depth_is_bounded(void) {
 
   /* Linear prefix syntax is no longer recursively parsed. */
   used = (size_t)snprintf(input, capacity, "echo $((");
-  while (used + 4 < capacity)
+  while (used + 5 < capacity) {
     input[used++] = '-';
+    input[used++] = ' ';
+  }
   input[used++] = '1';
   input[used++] = ')';
   input[used++] = ')';
@@ -10211,7 +10216,8 @@ int main(void) {
       {{"Edge: arithmetic operator family",
         "echo $((a+b)) $((c-d)) $((e*f)) $((g/h)) $((i%j)) $((k**l))", 1},
        EXPECT_ARITHMETIC},
-      {{"Edge: nested bare parentheses", "(((echo hello)))", 1}, 0},
+      {{"Edge: arithmetic command framing", "(((echo hello)))", 1},
+       EXPECT_ARITHMETIC},
       {{"Edge: alternating quote forms", "echo 'a\"b\"c' \"d'e'e\"", 1}, 0},
       {{"Edge: variable followed by bracket glob", "ls $FILE[0-9]", 1},
        EXPECT_VARIABLE | EXPECT_GLOB},

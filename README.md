@@ -87,6 +87,8 @@ their effects alongside the command.
 | `>report.txt` | No subject; `UNDETERMINED` | Redirection setup |
 | `VALUE=example` | No subject; `UNDETERMINED` | Shell-state assignment |
 | `# comment` | No subject; `ALLOW` | Policy-neutral source |
+| `(( 2 + 3 ))` | No subject; `ALLOW` when arithmetic is enabled | Expression truth and status |
+| `(( 1 )) >report.txt` | No subject; `UNDETERMINED` when arithmetic is enabled | File setup; no stdout byte flow |
 | `cd /tmp` | One subject: `cd /tmp`; requires a matching rule | CWD changes and command I/O |
 | `echo "$(whoami)"` | Two subjects: `echo` with its argument, and `whoami` | Generated shell-word content and substitution routes |
 
@@ -154,10 +156,10 @@ pre-push verification use that same reference.
 
 | Area | Current analysis support |
 |---|---|
-| Composition | Lists, `&&`, `\|\|`, pipelines including `\|&`, `!`, `time`, background execution |
+| Composition | Lists, `&&`, `\|\|`, pipelines including `\|&`, `!`, `time`, background execution, literal-only `(( expression ))` commands |
 | Groups and I/O | Brace and subshell groups, redirects, descriptor copies, moves and closes, named file descriptors, heredocs and here-strings |
 | Expansions | Quoting, parameters, substitutions, globs/extglob, arithmetic restricted to numeric literals and operators with bounded nesting |
-| Unsupported constructs | `if` constructs, loops, `case`, `select`, `coproc`, functions, arrays, `[[ … ]]`, `(( … ))`, and the builtin forms listed in the reference |
+| Unsupported constructs | `if` constructs, loops, `case`, `select`, `coproc`, functions, arrays, `[[ … ]]`, dynamic or mutating arithmetic, and the builtin forms listed in the reference |
 | Runtime uncertainty | Represents multiple possible outcomes and reports unresolved arguments and paths explicitly |
 
 Shellgate's default rejection mask additionally rejects arithmetic, heredocs,

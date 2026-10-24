@@ -16,6 +16,7 @@ static bool is_shell_syntax_token(shell_token_type_t type) {
   return type == SHELL_TOKEN_PIPE || type == SHELL_TOKEN_PIPE_BOTH ||
          type == SHELL_TOKEN_PIPE_NEGATE || type == SHELL_TOKEN_PIPE_TIME ||
          type == SHELL_TOKEN_PIPE_TIME_OPTION ||
+         type == SHELL_TOKEN_ARITHMETIC_COMMAND ||
          type == SHELL_TOKEN_REDIRECT_IN || type == SHELL_TOKEN_REDIRECT_OUT ||
          type == SHELL_TOKEN_REDIRECT_ERR ||
          type == SHELL_TOKEN_REDIRECT_APPEND ||
@@ -290,7 +291,8 @@ shell_transform_command(const shell_command_t *cmd,
   tcmd->tokens = NULL;
   tcmd->token_count = 0;
   tcmd->has_transformations = false;
-  tcmd->has_shell_syntax = cmd->has_groups || cmd->group_depth != 0 ||
+  tcmd->has_shell_syntax = cmd->kind == SHELL_COMMAND_ARITHMETIC ||
+                           cmd->has_groups || cmd->group_depth != 0 ||
                            cmd->pipeline_negation_count != 0 ||
                            cmd->pipeline_time_mode != SHELL_PIPE_TIME_NONE;
 
@@ -338,6 +340,7 @@ shell_transform_command(const shell_command_t *cmd,
       replacement = SUBSHELL_PLACEHOLDER;
       break;
     case SHELL_TOKEN_ARITHMETIC:
+    case SHELL_TOKEN_ARITHMETIC_COMMAND:
       type = SHELL_TRANSFORM_VARIABLE;
       replacement = VAR_PLACEHOLDER;
       break;

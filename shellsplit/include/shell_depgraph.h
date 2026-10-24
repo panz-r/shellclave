@@ -296,6 +296,14 @@ typedef enum {
   SHELL_DEP_COMMAND_EXEC = 3, /* `exec` replaces the shell with its target. */
 } shell_dep_command_wrapper_t;
 
+/* Expression truth before redirection/setup failures. UNKNOWN retains both
+ * return outcomes; ZERO means failure and NONZERO means success. */
+typedef enum {
+  SHELL_ARITHMETIC_UNKNOWN = 0,
+  SHELL_ARITHMETIC_ZERO,
+  SHELL_ARITHMETIC_NONZERO,
+} shell_arithmetic_truth_t;
+
 /**
  * CMD node - an isolated shell command
  *
@@ -305,9 +313,16 @@ typedef enum {
  * Quoted empty arguments survive. This expansion does not reopen the lexical
  * assignment-prefix or reserved-word positions.
  * cwd_offset is the offset into graph->cwd_buf.data for the resolved working
- * directory.
+ * directory. Arithmetic commands have no argv tokens; their expression span
+ * borrows the original immutable input just as simple-command tokens do.
  */
 typedef struct {
+  shell_command_kind_t kind;
+  const char *arithmetic_expression; /* Borrowed content for ARITHMETIC. */
+  uint32_t arithmetic_expression_length;
+  shell_arithmetic_truth_t arithmetic_truth;
+  bool arithmetic_has_redirections; /* Explicit setup, including unused copies.
+                                     */
   const char *tokens[SHELL_DEP_MAX_TOKENS];
   uint32_t token_lens[SHELL_DEP_MAX_TOKENS];
   uint32_t token_count;
@@ -786,7 +801,8 @@ typedef struct {
  * descriptor-route validation.
  * Unmodeled Bash `[[ …
  * ]]`,
- * `(( … ))`, `$"…"`, and `;&` / `;;&` forms are also rejected. Surviving
+ * dynamic or mutating arithmetic commands, `$"…"`, and `;&` / `;;&` forms
+ * are also rejected. Surviving
  * non-ASCII ANSI-C Unicode escapes are also rejected because their bytes
  * depend on an unmodeled execution locale. Escapes discarded after a decoded
  * NUL do not contribute a locale requirement. ASCII Unicode escapes and byte

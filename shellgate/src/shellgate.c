@@ -1697,7 +1697,7 @@ static const char *check_features(const shell_parse_result_t *fast,
     const char *name;
   } feats[] = {
       {SHELL_FEAT_SUBSHELL, "command substitution"},
-      {SHELL_FEAT_ARITH, "arithmetic expansion"},
+      {SHELL_FEAT_ARITH, "arithmetic"},
       {SHELL_FEAT_HEREDOC, "heredoc"},
       {SHELL_FEAT_HERESTRING, "herestring"},
       {SHELL_FEAT_PROCESS_SUB, "process substitution"},
@@ -3056,18 +3056,20 @@ static SHELL_NONNULL(1, 2) void sg_policy_graph_summarize(
   }
 }
 
-/* An empty Bash `time` pipeline has a zero-token CMD only so the structural
- * TIME edge has an execution endpoint. It is policy-neutral only when neither
- * that endpoint nor an enclosing command group performs I/O without a real
- * contained argv policy subject. List and containment edges otherwise merely
- * place the structural endpoint in the surrounding command. */
-static SHELL_NONNULL(1, 2) bool sg_argvless_command_is_empty_timing(
+/* Pure arithmetic and empty timing have execution endpoints without argv.
+ * Arithmetic-owned redirects always require separate coverage. Enclosing
+ * groups likewise cannot hide I/O without a contained argv policy subject. */
+static SHELL_NONNULL(1, 2) bool sg_argvless_command_is_policy_neutral(
     const shell_dep_graph_t *graph, const sg_policy_graph_summary_t *summary,
     uint32_t command_index) {
-  if (graph->nodes[command_index].cmd.pipeline_time_mode ==
-      SHELL_PIPE_TIME_NONE)
-    return false;
   uint32_t group = summary->group_parent[command_index];
+  const shell_dep_cmd_t *command = &graph->nodes[command_index].cmd;
+  if (command->kind == SHELL_COMMAND_ARITHMETIC)
+    return !command->arithmetic_has_redirections &&
+           summary->timing_compatible[command_index] &&
+           (group == UINT32_MAX || !summary->unsafe_group_ancestor[group]);
+  if (command->pipeline_time_mode == SHELL_PIPE_TIME_NONE)
+    return false;
   return summary->timing_edge[command_index] &&
          summary->timing_compatible[command_index] &&
          (group == UINT32_MAX || !summary->unsafe_group_ancestor[group]);
@@ -4250,8 +4252,8 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
       continue;
     if (node->cmd.token_count > 0) {
       cmd_count++;
-    } else if (!sg_argvless_command_is_empty_timing(&graph, &policy_graph,
-                                                    ni)) {
+    } else if (!sg_argvless_command_is_policy_neutral(&graph, &policy_graph,
+                                                      ni)) {
       /* A redirect-only simple command is valid shell syntax and remains in
        * the graph so its I/O effects are visible. It has no argv, though, so
        * the canonical argv policy model cannot authorize it. Shellsplit's

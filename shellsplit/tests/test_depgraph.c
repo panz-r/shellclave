@@ -410,7 +410,7 @@ TEST(supplied_fast_parser_contract) {
       "(( count += 1 ))",
       "printf '%s' $\"localized\"",
       "echo $( [[ -f /tmp/x ]] )",
-      "{ (( 1 )); }",
+      "{ (( count )); }",
   };
   for (size_t i = 0; i < sizeof(unsupported) / sizeof(unsupported[0]); i++) {
     const char *source = unsupported[i];

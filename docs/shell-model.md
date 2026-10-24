@@ -31,7 +31,7 @@ Shellsplit exposes several levels of analysis:
 | Dependency-graph construction | Command, group, I/O, state, timing, and substitution relationships |
 
 Lexical feature detection can recognize syntax which semantic consumers reject.
-Control constructs, functions, arrays, `[[ … ]]`, and `(( … ))` commands remain
+Control constructs, functions, arrays, and `[[ … ]]` commands remain
 unsupported. A feature flag is recognition, not a promise of semantic support.
 Shellgate's default mask also rejects arithmetic, heredocs, and here-strings;
 changing that mask enables only constructs the semantic model supports.
@@ -62,6 +62,82 @@ Shell-option mutations in submitted source are rejected. Supported arithmetic
 uses numeric literals, operators, and bounded nesting. Variable
 lookup, dynamic arithmetic, and mutation remain unsupported, including in
 substring offsets and lengths.
+
+Arithmetic whitespace consists of space, tab and LF. Backslash-LF continues
+the expression. CR, vertical tab and form feed remain significant bytes;
+semantic consumers reject expressions that use them as whitespace, including
+in skipped operands. Balanced source framing can still be COMPLETE. These
+restrictions apply to arithmetic commands, expansions and substring operands;
+the same bytes remain admitted as literal data in ordinary shell words.
+
+### Arithmetic commands
+
+`(( expression ))` supports the same literal-only arithmetic grammar as
+`$(( expression ))`: numeric constants, pure operators, parentheses and nested
+arithmetic expansions. Variable lookup, assignment, increment/decrement, arrays,
+quoted operands and executable substitutions remain semantically unsupported.
+Adjacent signs on literals, such as `1--2`, remain pure arithmetic; increment
+and decrement require an lvalue, which this grammar excludes.
+
+Numeric constants follow Bash's radix notation: a leading zero selects octal,
+or hexadecimal when followed by `x` or `X`, and cannot prefix an explicit base.
+Thus `2#01` is valid, while `02#1` is rejected by semantic consumers, including
+in skipped operands, arithmetic expansions, substring operands and expandable
+heredocs. Source framing can still classify these expressions as COMPLETE.
+
+The source APIs retain Bash's arithmetic-versus-nested-subshell distinction;
+`((printf ok); printf tail)` is a nested subshell command list.
+
+Comparisons and shifts keep their arithmetic meaning next to parenthesized
+operands: `((1<<(2)))` is one arithmetic command. Feature discovery inspects
+arithmetic content under the same rules as arithmetic expansions, including
+variables, arrays and executable children in semantically unsupported input.
+An executable child establishes its own shell-command context, so its pipelines
+and control words remain visible in lexical feature flags.
+
+Executable child words and comments retain their byte domains. Literal high
+bytes, including UTF-8 and invalid UTF-8, are admitted as ordinary child data.
+For example, `(( $(printf 1; : 日本) ))` has COMPLETE source framing and
+retains its child headers, while `(( $(printf 日本 &&) ))` is INVALID.
+Unfinished children retain INCOMPLETE recovery and earlier qualified prefixes.
+Arithmetic code itself retains restricted bytes, including at unfinished EOF.
+Arithmetic with executable substitutions remains outside semantic support even
+when its source framing is COMPLETE.
+
+Arithmetic is an explicit command kind with an expression span and no argv
+words. Retained headers mark it as compound. Graph CMD metadata exposes
+`SHELL_COMMAND_ARITHMETIC` and expression truth independently of redirect
+setup: ZERO means failure, NONZERO means success, and UNKNOWN retains both
+continuations. These facts select subsequent `&&`/`||` paths and compose with
+pipeline status, negation, grouping, timing and background execution.
+
+Constant proofs use checked signed 64-bit arithmetic. Overflow, oversized
+constants, division by zero, negative exponents and uncertain shifts remain
+unproven. Shifts are proved only for nonnegative operands, counts below 63,
+and representable results. Short-circuited operands are still checked for
+supported grammar but contribute no evaluation uncertainty. An uncertain
+arithmetic expansion remains uncertain even in a skipped operand, because
+expansion precedes evaluation of the enclosing expression. An uncertain
+evaluated operand also makes a later comma result uncertain. This is bounded
+analysis; runtime arithmetic errors do not introduce partial-execution recovery.
+Complete raw framing can therefore be COMPLETE even when semantic analysis
+declines the expression. An unfinished arithmetic command is INCOMPLETE with
+`SHELL_SOURCE_NEEDS_ARITHMETIC`.
+
+Arithmetic consumes no stdin and produces no ordinary stdout. Input/output
+redirects retain their setup effects even when no bytes use the installed
+descriptor. Possible expression diagnostics use the effective stderr route;
+redirect setup failures retain their own diagnostics. Named descriptors opened
+by arithmetic commands follow the existing current-shell persistence rules.
+
+Shellgate's default feature mask continues to reject arithmetic. When enabled,
+pure arithmetic is policy-neutral and contributes no argv-policy subject.
+Explicit arithmetic-owned redirects require separate coverage, including
+unused descriptor copies; I/O on an enclosing group without a real argv
+subject likewise remains undetermined. Arithmetic appears in anomaly stages
+with one empty executable sentinel and an `AR` typed marker per command;
+comparison and shift operands add no executable stages or substitution flags.
+Applications inspect the expression and I/O through Shellsplit directly.
 
 ## Source bytes, words, and canonical values
 

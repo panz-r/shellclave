@@ -3,6 +3,7 @@
 # and those disposable files must never become implicit smoke-test inputs.
 
 set(SHELLCLAVE_SHELLGATE_SMOKE_SEEDS
+  arithmetic_command.txt
   basic_commands.txt
   composition.txt
   malformed.txt
@@ -14,6 +15,8 @@ set(SHELLCLAVE_SHELLGATE_SMOKE_SEEDS
 
 set(SHELLCLAVE_SHELLSPLIT_SMOKE_SEEDS
   arithmetic.txt
+  arithmetic_command.txt
+  arithmetic_expansion_status.txt
   arithmetic_loop.txt
   assignment_and_export.txt
   associative_array_stream.txt

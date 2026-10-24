@@ -23,6 +23,7 @@ static inline SHELL_NONNULL(1, 2) const
   SHELLSPLIT_SOURCE_FIELD(start);
   SHELLSPLIT_SOURCE_FIELD(len);
   SHELLSPLIT_SOURCE_FIELD(type);
+  SHELLSPLIT_SOURCE_FIELD(kind);
   SHELLSPLIT_SOURCE_FIELD(modifiers);
   SHELLSPLIT_SOURCE_FIELD(pipeline_negation_count);
   SHELLSPLIT_SOURCE_FIELD(pipeline_time_mode);
@@ -60,6 +61,9 @@ static inline SHELL_NONNULL(1, 2) const
                                             const shell_source_header_t *b) {
   SHELLSPLIT_SOURCE_FIELD(source.start);
   SHELLSPLIT_SOURCE_FIELD(source.length);
+  SHELLSPLIT_SOURCE_FIELD(kind);
+  SHELLSPLIT_SOURCE_FIELD(arithmetic_expression.start);
+  SHELLSPLIT_SOURCE_FIELD(arithmetic_expression.length);
   SHELLSPLIT_SOURCE_FIELD(word_count);
   SHELLSPLIT_SOURCE_FIELD(assignment_count);
   SHELLSPLIT_SOURCE_FIELD(first_redirect);

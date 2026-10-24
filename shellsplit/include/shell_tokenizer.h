@@ -42,6 +42,14 @@ typedef enum {
   SHELL_STATUS_ERROR = 1 << 1,     // Parse error
 } shell_status_t;
 
+/* Command form is independent of the preceding connector. GROUP describes
+ * container headers; flattened records use SIMPLE or ARITHMETIC. */
+typedef enum {
+  SHELL_COMMAND_SIMPLE = 0,
+  SHELL_COMMAND_GROUP,
+  SHELL_COMMAND_ARITHMETIC,
+} shell_command_kind_t;
+
 /**
  * Subcommand type - the operator or structural marker associated with this
  * subcommand. These are a mutually exclusive token-type field; callers that
@@ -101,13 +109,15 @@ typedef enum {
  * control words. These flags do not establish a complete control-flow grammar
  * or semantic support; standalone keyword spellings remain lexical markers
  * even in ordinary argument positions.
+ * Arithmetic commands and expansions use arithmetic syntax for their bodies;
+ * executable children establish their own shell-command feature context.
  */
 typedef enum {
   SHELL_FEAT_NONE = 0,
   SHELL_FEAT_VARS = 1 << 0,             // $VAR, ${VAR}, $1, etc.
   SHELL_FEAT_GLOBS = 1 << 1,            // *, ?, [abc]
   SHELL_FEAT_SUBSHELL = 1 << 2,         // $(...), `...`
-  SHELL_FEAT_ARITH = 1 << 3,            // $((...))
+  SHELL_FEAT_ARITH = 1 << 3,            // $((...)) and ((...))
   SHELL_FEAT_HEREDOC = 1 << 4,          // << delimiter (in subcommand)
   SHELL_FEAT_HERESTRING = 1 << 5,       // <<< here-string (in subcommand)
   SHELL_FEAT_PROCESS_SUB = 1 << 6,      // <(cmd), >(cmd)
@@ -215,9 +225,10 @@ const char *shell_error_string(shell_error_t err);
  * Zero-copy subcommand - just indices into original command
  */
 typedef struct {
-  uint32_t start;     // Index in command string
-  uint32_t len;       // Length
-  uint16_t type;      // shell_cmd_type_t
+  uint32_t start; // Index in command string
+  uint32_t len;   // Length
+  uint16_t type;  // shell_cmd_type_t
+  shell_command_kind_t kind;
   uint16_t modifiers; // shell_cmd_modifier_t
   /* Number of leading `!` pipeline modifiers. `modifiers` retains the
    * compatible nonzero indication; callers derive the effective inversion

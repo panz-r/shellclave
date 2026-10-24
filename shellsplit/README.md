@@ -146,6 +146,13 @@ Graph nodes distinguish commands, groups, TIME operations, documents, endpoints,
 and inherited descriptor resources. Use the graph directly for routing and state
 analysis alongside policy evaluation.
 
+CMD nodes include ordinary argv commands and literal-only arithmetic commands.
+Check `cmd.kind`: arithmetic has no tokens and retains its expression span and
+ZERO/NONZERO/UNKNOWN truth fact. It can select later conditional-list paths
+without consuming stdin. Its explicit redirects retain setup effects. See
+[arithmetic commands](../docs/shell-model.md#arithmetic-commands) for the
+supported grammar, conservative proof limits and policy coverage.
+
 For `wc -l file.txt 2>&1`, the WRITE edge whose `source_fd` is 2 targets an
 inherited FD node numbered 1. In the plain command it targets FD 2. Source-order
 copies preserve the selected resource: `2>&1 >out` keeps stderr on inherited

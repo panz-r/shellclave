@@ -72,7 +72,8 @@ shell_processed_commands_parse(const char *command_line, size_t command_length,
 /* Ordered owned anomaly-analysis view of every supported executable simple
  * command plus each argv-less structural stage that still needs an explicit
  * anomaly boundary. The latter includes redirect-only commands and empty
- * Bash `time` pipelines; public netsequence builders represent it with their
+ * Bash `time` pipelines, as well as arithmetic commands. Public netsequence
+ * builders represent these stages with their
  * anomaly-only empty argv[0] sentinel, never as a policy subject. Nested
  * command and process substitutions precede their enclosing command; siblings
  * retain source order. This deterministic analysis order is intentionally not

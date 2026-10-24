@@ -14,6 +14,7 @@
 
 #include "../tests/ansi_nul_cases.h"
 #include "../tests/ansi_parameter_cases.h"
+#include "../tests/arithmetic_cases.h"
 #include "../tests/depgraph_compare.h"
 #include "../tests/malformed_source_cases.h"
 #include "../tests/source_compare.h"
@@ -4038,7 +4039,7 @@ static int test_fixed_oracles(void) {
       "typeset map[key]",
       "command -- declare \"arr[$(printf 0)]\"",
       "echo $( [[ -f /tmp/x ]] )",
-      "{ (( 1 )); }",
+      "{ (( count )); }",
       "cat <<EOF\n$(while true; do :; done)\nEOF\n",
       "cat <<EOF\n`select item in one; do :; done`\nEOF\n",
       "cat <<EOF\n${items[0]}\nEOF\n",
@@ -5366,6 +5367,7 @@ static bool tokenizer_token_starts_command(const shell_token_t &token) {
   case SHELL_TOKEN_VARIABLE_QUOTED:
   case SHELL_TOKEN_SPECIAL_VAR:
   case SHELL_TOKEN_ARITHMETIC:
+  case SHELL_TOKEN_ARITHMETIC_COMMAND:
   case SHELL_TOKEN_GLOB:
   case SHELL_TOKEN_ANSI_C_QUOTED:
   case SHELL_TOKEN_EXTGLOB:
@@ -5550,7 +5552,8 @@ static int test_tokenizer_state(const char *input, size_t length) {
   /* List grammar alone is not complete lexical validity: the iterator keeps
    * an unfinished quote/document for diagnostics, while the allocating API
    * rejects these specific unfinished lexical states. */
-  bool lexical_complete = !state.in_quotes && state.brace_depth == 0 &&
+  bool lexical_complete = !state.in_quotes && !state.in_arithmetic &&
+                          state.brace_depth == 0 &&
                           state.brace_group_depth == 0 && !state.heredoc_error;
   shell_tokenize_status_t full_status =
       shell_tokenize_commands(input, length, &commands, &command_count);
@@ -5856,14 +5859,19 @@ static bool
 processed_argv_matches_sequence(const shell_processed_commands_t &processed,
                                 const void *sequence, size_t sequence_length,
                                 size_t count) {
-  if (!sequence || processed.command_count != count)
+  size_t subjects = 0;
+  for (size_t i = 0; i < processed.command_count; ++i)
+    subjects += processed.commands[i].kind != SHELL_COMMAND_ARITHMETIC;
+  if (!sequence || subjects != count)
     return false;
   shell_netstring_iter_t records;
   shell_netstring_view_t record = {};
   if (shell_netstring_iter_init(&records, sequence, sequence_length) !=
       SHELL_NETSTRING_OK)
     return false;
-  for (size_t command = 0; command < count; command++) {
+  for (size_t command = 0; command < processed.command_count; command++) {
+    if (processed.commands[command].kind == SHELL_COMMAND_ARITHMETIC)
+      continue;
     shell_netstring_buffer_t argv = {};
     bool matches =
         shell_netstring_iter_next(&records, &record) == SHELL_NETSTRING_OK &&
@@ -5930,7 +5938,8 @@ static int test_processor(const char *input, size_t input_length) {
          i++) {
       shell_netstring_buffer_t netargv = {};
       structured_canonical =
-          processed.commands[i].command_token_count != 0 &&
+          (processed.commands[i].command_token_count != 0 ||
+           processed.commands[i].kind == SHELL_COMMAND_ARITHMETIC) &&
           shell_render_netargv_buffer(&processed.commands[i], &limits,
                                       &netargv) == SHELL_PROCESS_OK &&
           netargv.data != NULL;
@@ -6008,8 +6017,11 @@ static int test_processor(const char *input, size_t input_length) {
     return 0;
   }
 
+  size_t policy_count = 0;
+  for (size_t i = 0; i < command_count; ++i)
+    policy_count += infos[i].kind != SHELL_COMMAND_ARITHMETIC;
   if ((infos == NULL) != (command_count == 0) || (sequence.data == NULL) ||
-      sequence_count != command_count) {
+      sequence_count != policy_count) {
     if (g_verbose)
       fprintf(
           stderr, "processor output mismatch: infos=%p/%zu sequence=%p/%zu\n",
@@ -8066,12 +8078,87 @@ static void run_fixed_oracles() {
         test_descriptor_move(static_cast<uint8_t>(i), input))
       abort();
   }
+  fixed_oracle_phase("arithmetic commands");
+  for (const auto &fixture : shellsplit_arithmetic_cases) {
+    std::string source = std::string("((") + fixture.expression + "))";
+    if (test_tokenizer_state(source.data(), source.size()) ||
+        test_processor(source.data(), source.size()) ||
+        fuzz_dep_graph_parse(source.data(), source.size(), ".", nullptr,
+                             &graph) != SHELL_DEP_OK ||
+        !shell_dep_graph_validate(&graph).valid ||
+        graph.nodes[0].cmd.kind != SHELL_COMMAND_ARITHMETIC ||
+        graph.nodes[0].cmd.arithmetic_truth !=
+            (fixture.truth < 0 ? SHELL_ARITHMETIC_UNKNOWN
+             : fixture.truth   ? SHELL_ARITHMETIC_NONZERO
+                               : SHELL_ARITHMETIC_ZERO)) {
+      fprintf(stderr, "arithmetic command oracle failed: %s\n", source.c_str());
+      abort();
+    }
+    shell_netstring_buffer_t raw = {}, typed = {};
+    size_t stages = 0;
+    bool one_stage =
+        shell_build_anomaly_netseqs_buffer(source.data(), source.size(),
+                                           nullptr, &raw, &typed,
+                                           &stages) == SHELL_PROCESS_OK &&
+        stages == 1 && raw.length == 3 && memcmp(raw.data, "0:,", 3) == 0 &&
+        typed.length == 11 && memcmp(typed.data, "8:0:,2:AR,,", 11) == 0;
+    shell_netstring_buffer_free(&raw);
+    shell_netstring_buffer_free(&typed);
+    if (!one_stage) {
+      fprintf(stderr, "arithmetic anomaly oracle failed: %s\n", source.c_str());
+      abort();
+    }
+  }
+  fixed_oracle_phase("unsupported arithmetic");
+  for (const char *expression : shellsplit_arithmetic_unsupported) {
+    std::string source = std::string("((") + expression + "))";
+    shell_netstring_buffer_t raw = {}, typed = {};
+    size_t stages = 0;
+    bool rejected =
+        fuzz_dep_graph_parse(source.data(), source.size(), ".", nullptr,
+                             &graph) == SHELL_DEP_EPARSE &&
+        !graph.node_count && !graph.edge_count &&
+        shell_build_anomaly_netseqs_buffer(source.data(), source.size(),
+                                           nullptr, &raw, &typed,
+                                           &stages) == SHELL_PROCESS_EPARSE &&
+        !raw.data && !raw.length && !typed.data && !typed.length && !stages;
+    shell_netstring_buffer_free(&raw);
+    shell_netstring_buffer_free(&typed);
+    if (!rejected) {
+      fprintf(stderr, "unsupported arithmetic oracle failed: %s\n",
+              source.c_str());
+      abort();
+    }
+  }
   fixed_oracle_phase("word and syntax matrices");
   {
     auto *draft = static_cast<shell_source_result_t *>(
         malloc(sizeof(shell_source_result_t)));
     if (!draft)
       abort();
+    for (const auto &fixture : shellsplit_arithmetic_source_cases) {
+      size_t length = strlen(fixture.source);
+      shell_source_status_t status =
+          shell_parse_draft(fixture.source, length, nullptr, draft);
+      bool valid = status == fixture.status;
+      if (valid && status == SHELL_SOURCE_COMPLETE)
+        valid = draft->header_count >= 2 &&
+                draft->headers[0].kind == SHELL_COMMAND_ARITHMETIC &&
+                draft->headers[0].arithmetic_expression.start == 2 &&
+                draft->headers[0].arithmetic_expression.length == length - 4 &&
+                draft->headers[1].kind == SHELL_COMMAND_SIMPLE &&
+                draft->headers[1].complete;
+      else if (valid) {
+        valid = !draft->prefix_length && !draft->prefix.count;
+        if (status == SHELL_SOURCE_INCOMPLETE)
+          valid &= draft->need == SHELL_SOURCE_NEEDS_ARITHMETIC;
+      }
+      if (!valid) {
+        fprintf(stderr, "arithmetic byte-domain oracle failed (%d/%d): %s\n",
+                status, fixture.status, fixture.source);
+        abort();
+      }
+    }
     for (const auto &fixture : shellsplit_test_ansi_encoded_cases) {
       const char *source = fixture.source;
       size_t length = strlen(source);

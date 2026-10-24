@@ -26,6 +26,7 @@ static bool is_shell_operator_token(const shell_token_t *token) {
          token->type == SHELL_TOKEN_PIPE_NEGATE ||
          token->type == SHELL_TOKEN_PIPE_TIME ||
          token->type == SHELL_TOKEN_PIPE_TIME_OPTION ||
+         token->type == SHELL_TOKEN_ARITHMETIC_COMMAND ||
          token->type == SHELL_TOKEN_REDIRECT_IN ||
          token->type == SHELL_TOKEN_REDIRECT_OUT ||
          token->type == SHELL_TOKEN_REDIRECT_ERR ||
@@ -752,11 +753,15 @@ static SHELL_NONNULL(1, 6, 7) void anomaly_substitution_content(
   *content_length = after - body_start - 1;
 }
 
+/* The containing construct supplies root expansion rules. Executable children
+ * establish fresh command-body contexts through anomaly_collect_source(). */
 static SHELL_NONNULL(1, 5) bool anomaly_collect_expansions(
-    const char *source, size_t source_length, bool allow_process_substitution,
-    bool heredoc, shell_anomaly_stage_collect_t *collect) {
+    const char *source, size_t source_length, bool arithmetic, bool heredoc,
+    shell_anomaly_stage_collect_t *collect) {
   shell_source_substitution_scan_t scan = {
-      .scope = {.heredoc = heredoc, .suppress_process = heredoc}};
+      .scope = {.heredoc = heredoc,
+                .arithmetic_scope = arithmetic,
+                .suppress_process = arithmetic || heredoc}};
   size_t start = 0;
   size_t after = 0;
   shell_source_substitution_kind_t kind;
@@ -764,10 +769,6 @@ static SHELL_NONNULL(1, 5) bool anomaly_collect_expansions(
   while ((scan_status = shell_source_next_executable_substitution(
               source, source_length, &scan, &start, &after, &kind)) ==
          SHELL_SOURCE_SCAN_FOUND) {
-    if (!allow_process_substitution &&
-        (kind == SHELL_SOURCE_SUBST_PROCESS_INPUT ||
-         kind == SHELL_SOURCE_SUBST_PROCESS_OUTPUT))
-      continue;
     const char *content = NULL;
     size_t content_length = 0;
     anomaly_substitution_content(source, source_length, start, after, kind,
@@ -793,17 +794,18 @@ static SHELL_NONNULL(1, 5) bool anomaly_collect_expansions(
 }
 
 static SHELL_NONNULL(1, 4) bool anomaly_collect_substitutions(
-    const char *source, size_t source_length, bool allow_process_substitution,
+    const char *source, size_t source_length, bool arithmetic,
     shell_anomaly_stage_collect_t *collect) {
-  return anomaly_collect_expansions(source, source_length,
-                                    allow_process_substitution, false, collect);
+  return anomaly_collect_expansions(source, source_length, arithmetic, false,
+                                    collect);
 }
 
 /* Heredoc roots are data, while parameter patterns establish word quoting. */
 static SHELL_NONNULL(1, 3) bool anomaly_collect_heredoc_substitutions(
     const char *source, size_t source_length,
     shell_anomaly_stage_collect_t *collect) {
-  return anomaly_collect_expansions(source, source_length, true, true, collect);
+  return anomaly_collect_expansions(source, source_length, false, true,
+                                    collect);
 }
 
 static SHELL_NONNULL(1, 5) bool anomaly_collect_heredoc_body(
@@ -861,20 +863,18 @@ static SHELL_NONNULL(1, 3, 4) bool anomaly_collect_command_substitutions(
       heredoc_after = after;
       continue;
     }
-    if (token->type == SHELL_TOKEN_ARITHMETIC) {
-      size_t content_start = 0;
-      size_t content_length = 0;
-      size_t after = 0;
-      if (!shell_source_arithmetic_content(token->start, token->length, 0,
-                                           &content_start, &content_length,
-                                           &after) ||
-          after != token->length ||
-          !anomaly_collect_substitutions(token->start + content_start,
-                                         content_length, false, collect))
+    if (token->type == SHELL_TOKEN_ARITHMETIC ||
+        token->type == SHELL_TOKEN_ARITHMETIC_COMMAND) {
+      const char *content;
+      size_t content_length;
+      shell_tokenizer_arithmetic_content(token, true, &content,
+                                         &content_length);
+      if (!anomaly_collect_substitutions(content, content_length, true,
+                                         collect))
         return false;
       continue;
     }
-    if (!anomaly_collect_substitutions(token->start, token->length, true,
+    if (!anomaly_collect_substitutions(token->start, token->length, false,
                                        collect))
       return false;
   }
@@ -1571,6 +1571,7 @@ static bool process_single_command_internal(shell_command_t *basic_cmd,
     }
   }
 
+  info->kind = basic_cmd->kind;
   info->shell_tokens = shell_tokens;
   info->shell_token_count = shell_count;
   info->command_tokens = command_tokens;
@@ -1604,6 +1605,16 @@ static SHELL_NONNULL(1, 2) void own_token_text(const shell_command_t *basic_cmd,
                 basic_cmd->start_pos, info->original_command);
   rebase_tokens(info->command_tokens, info->command_token_count,
                 basic_cmd->start_pos, info->original_command);
+  if (info->kind == SHELL_COMMAND_ARITHMETIC) {
+    for (size_t i = 0; i < info->shell_token_count; ++i) {
+      const shell_token_t *token = &info->shell_tokens[i];
+      if (token->type != SHELL_TOKEN_ARITHMETIC_COMMAND)
+        continue;
+      shell_tokenizer_arithmetic_content(token, true,
+                                         &info->arithmetic_expression,
+                                         &info->arithmetic_expression_length);
+    }
+  }
 }
 
 /* Byte limits describe the flat records returned to the caller.  Structural
@@ -2229,7 +2240,8 @@ static SHELL_NONNULL(1, 3, 5, 7, 8) shell_process_status_t
     shell_command_infos_free(one, count);
     return SHELL_PROCESS_EPARSE;
   }
-  if (!retain_empty && !command_info_has_arguments(&one[0])) {
+  if (!retain_empty && one[0].kind != SHELL_COMMAND_ARITHMETIC &&
+      !command_info_has_arguments(&one[0])) {
     shell_command_infos_free(one, count);
     return SHELL_PROCESS_OK;
   }
@@ -2712,7 +2724,8 @@ static SHELL_NONNULL(1, 4, 6, 7) shell_process_status_t
   size_t rendered_count = 0;
   for (size_t i = 0; i < count; i++) {
     if (shell_processed_command_word_count(&commands[i]) == 0) {
-      if (shell_processed_command_is_empty_timing(&commands[i])) {
+      if (commands[i].kind == SHELL_COMMAND_ARITHMETIC ||
+          shell_processed_command_is_empty_timing(&commands[i])) {
         *has_shell_features = true;
         continue;
       }
@@ -2753,7 +2766,8 @@ static SHELL_NONNULL(1, 4, 6, 7) shell_process_status_t
   }
   char *position = encoded;
   for (size_t i = 0; i < count; i++) {
-    if (shell_processed_command_is_empty_timing(&commands[i]))
+    if (commands[i].kind == SHELL_COMMAND_ARITHMETIC ||
+        shell_processed_command_is_empty_timing(&commands[i]))
       continue;
     size_t length = 0;
     (void)measure_basic_netargv(&commands[i], &length);

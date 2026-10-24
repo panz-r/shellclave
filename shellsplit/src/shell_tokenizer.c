@@ -516,6 +516,19 @@ static SHELL_NONNULL(1,
       continue;
     }
     char c = p[i];
+    if (!in_single_quotes && !in_double_quotes && c == '(' &&
+        have_array_context && fast_lexical_token_at(&array_context, i) &&
+        array_context.token.type == SHELL_TOKEN_ARITHMETIC_COMMAND) {
+      *features |= SHELL_FEAT_ARITH;
+      const char *content;
+      size_t content_length;
+      shell_tokenizer_arithmetic_content(&array_context.token,
+                                         !array_context.state.in_arithmetic,
+                                         &content, &content_length);
+      detect_arithmetic_features(content, 0, content_length, features);
+      i = (uint32_t)(array_context.token.position + array_context.token.length);
+      continue;
+    }
 
     if (!in_single_quotes && !in_double_quotes && c == '#' &&
         have_array_context && !fast_lexical_token_contains(&array_context, i)) {
@@ -938,6 +951,15 @@ static SHELL_NONNULL(1, 2) void merge_heredoc_features(
 static void normalize_result_metadata(const char *cmd, size_t cmd_len,
                                       shell_parse_result_t *result) {
   for (uint32_t i = 0; i < result->count; i++) {
+    shell_tokenizer_state_t lexer;
+    shell_tokenizer_init_prechecked(&lexer, cmd + result->cmds[i].start,
+                                    result->cmds[i].len);
+    shell_token_t token;
+    if (shell_tokenizer_next(&lexer, &token) &&
+        token.type == SHELL_TOKEN_ARITHMETIC_COMMAND) {
+      result->cmds[i].kind = SHELL_COMMAND_ARITHMETIC;
+      result->cmds[i].features |= SHELL_FEAT_ARITH;
+    }
     if (result->cmds[i].type == SHELL_TYPE_SIMPLE &&
         (result->cmds[i].features & SHELL_FEAT_SUBSHELL)) {
       result->cmds[i].type = SHELL_TYPE_SUBSTITUTION;
@@ -1367,6 +1389,11 @@ static shell_error_t shell_parse_fast_impl(const char *cmd, size_t cmd_len,
       continue;
     }
     char c = cmd[pos];
+    if (!in_quotes && c == '(' && fast_lexical_token_at(&documents, pos) &&
+        documents.token.type == SHELL_TOKEN_ARITHMETIC_COMMAND) {
+      pos = (uint32_t)(documents.token.position + documents.token.length);
+      continue;
+    }
     /* The forward lexer has already established assignment eligibility and
      * its exact prefix span. Subscript operators and parentheses belong to
      * that word, not this enclosing command list. Reuse the token boundary;

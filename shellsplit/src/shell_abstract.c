@@ -428,6 +428,7 @@ static shell_abstract_type_t get_abstract_type(shell_token_type_t tok_type,
     return SHELL_ABSTRACT_CS;
 
   case SHELL_TOKEN_ARITHMETIC:
+  case SHELL_TOKEN_ARITHMETIC_COMMAND:
     return SHELL_ABSTRACT_AR;
 
   default:
@@ -789,6 +790,8 @@ static SHELL_NONNULL(1) size_t
   if (text[0] == '`' || text[0] == '\'' || text[0] == '"')
     return 1;
   size_t open = shell_source_logical_following(text, length, 0);
+  if (text[0] == '(' && text[open] == '(')
+    return open + 1;
   if (text[0] == '$' && text[open] == '(') {
     size_t next = shell_source_logical_following(text, length, open);
     if (next < length && text[next] == '(')
@@ -851,17 +854,28 @@ static SHELL_NONNULL(1, 2, 3, 4, 8) bool compound_abstract_append_fragment(
   return true;
 }
 
-/* Tokenization has validated this immutable word. Collect semantic features
- * independently of the non-overlapping display element which owns its source;
+/* Tokenization has validated this immutable word or arithmetic token. Collect
+ * features under its lexical expansion rules, so comparisons and shifts stay
+ * arithmetic even when their punctuation has a shell-substitution spelling.
+ * Features are independent of the display element which owns their source;
  * nested executable command bodies remain separate shell inspections. */
 static SHELL_NONNULL(1, 2) void abstract_word_features(
     shell_abstract_command_t *command, const shell_token_t *token,
     bool redirect_operand) {
   shell_source_substitution_scan_t scan = {0};
+  const char *content = token->start;
+  size_t content_length = token->length;
+  if (!redirect_operand && (token->type == SHELL_TOKEN_ARITHMETIC ||
+                            token->type == SHELL_TOKEN_ARITHMETIC_COMMAND)) {
+    shell_tokenizer_arithmetic_content(token, true, &content, &content_length);
+    scan.scope.arithmetic_scope = true;
+    scan.scope.suppress_process = true;
+    command->has_arithmetic = true;
+  }
   size_t start, after;
   shell_source_substitution_kind_t kind;
   while (shell_source_next_executable_substitution(
-             token->start, token->length, &scan, &start, &after, &kind) ==
+             content, content_length, &scan, &start, &after, &kind) ==
          SHELL_SOURCE_SCAN_FOUND)
     command->has_cmd_subst = true;
   if (!redirect_operand) {
@@ -1700,6 +1714,13 @@ static const char *token_abbreviation(const shell_token_t *token) {
   }
 }
 
+/* An arithmetic stage has no executable. Its anomaly signature extends the
+ * empty argv[0] sentinel with the established arithmetic type symbol. */
+static SHELL_NONNULL(1) size_t
+    empty_stage_signature_length(const shell_command_t *stage) {
+  return stage->kind == SHELL_COMMAND_ARITHMETIC ? 8 : 3;
+}
+
 static shell_process_status_t
 shell_build_type_netseq_impl(const char *command, size_t command_length,
                              const shell_process_limits_t *limits,
@@ -1725,11 +1746,9 @@ shell_build_type_netseq_impl(const char *command, size_t command_length,
     if (!shell_processed_word_iterator_next(&iterator, &word)) {
       /* A redirect-only simple command has no executable. Preserve it as an
        * anomaly-only netargv whose argv[0] is the canonical empty word. */
-      size_t inner_length = 0;
+      size_t inner_length = empty_stage_signature_length(&stages.commands[c]);
       size_t framed = 0;
-      if (shell_netstring_encoded_length(0, &inner_length) !=
-              SHELL_NETSTRING_OK ||
-          shell_netstring_encoded_length(inner_length, &framed) !=
+      if (shell_netstring_encoded_length(inner_length, &framed) !=
               SHELL_NETSTRING_OK ||
           outer_length > SIZE_MAX - framed) {
         status = SHELL_PROCESS_EOVERFLOW;
@@ -1800,16 +1819,19 @@ shell_build_type_netseq_impl(const char *command, size_t command_length,
     shell_processed_word_iterator_init(&iterator, &stages.commands[c]);
     shell_token_t word;
     if (!shell_processed_word_iterator_next(&iterator, &word)) {
-      size_t inner_length = 0;
+      size_t inner_length = empty_stage_signature_length(&stages.commands[c]);
       size_t outer_prefix = 0;
       size_t argv0_prefix = 0;
-      (void)shell_netstring_encoded_length(0, &inner_length);
       (void)shell_netstring_write_prefix(position, SIZE_MAX, inner_length,
                                          &outer_prefix);
       position += outer_prefix;
       (void)shell_netstring_write_prefix(position, SIZE_MAX, 0, &argv0_prefix);
       position += argv0_prefix;
       *position++ = ',';
+      if (stages.commands[c].kind == SHELL_COMMAND_ARITHMETIC) {
+        memcpy(position, "2:AR,", 5);
+        position += 5;
+      }
       *position++ = ',';
       continue;
     }
@@ -1899,13 +1921,12 @@ shell_process_status_t shell_build_anomaly_netseqs_from_stages(
     shell_token_t word;
     if (!shell_processed_word_iterator_next(&iterator, &word)) {
       size_t raw_record_length = 0;
-      size_t type_inner_length = 0;
+      size_t type_inner_length =
+          empty_stage_signature_length(&stages->commands[c]);
       size_t type_record_length = 0;
       if (shell_netstring_encoded_length(0, &raw_record_length) !=
               SHELL_NETSTRING_OK ||
           command_total > SIZE_MAX - raw_record_length ||
-          shell_netstring_encoded_length(0, &type_inner_length) !=
-              SHELL_NETSTRING_OK ||
           shell_netstring_encoded_length(
               type_inner_length, &type_record_length) != SHELL_NETSTRING_OK ||
           type_total > SIZE_MAX - type_record_length) {
@@ -1996,8 +2017,8 @@ shell_process_status_t shell_build_anomaly_netseqs_from_stages(
       raw_position += prefix_length;
       *raw_position++ = ',';
 
-      size_t type_inner_length = 0;
-      (void)shell_netstring_encoded_length(0, &type_inner_length);
+      size_t type_inner_length =
+          empty_stage_signature_length(&stages->commands[c]);
       (void)shell_netstring_write_prefix(type_position, SIZE_MAX,
                                          type_inner_length, &prefix_length);
       type_position += prefix_length;
@@ -2005,6 +2026,10 @@ shell_process_status_t shell_build_anomaly_netseqs_from_stages(
                                          &prefix_length);
       type_position += prefix_length;
       *type_position++ = ',';
+      if (stages->commands[c].kind == SHELL_COMMAND_ARITHMETIC) {
+        memcpy(type_position, "2:AR,", 5);
+        type_position += 5;
+      }
       *type_position++ = ',';
       continue;
     }

@@ -1539,6 +1539,17 @@ typedef enum {
   SHELL_SOURCE_DECL_MALFORMED,
 } shell_source_declaration_status_t;
 
+typedef enum {
+  SHELL_ARITHMETIC_FRAME_NONE,
+  SHELL_ARITHMETIC_FRAME_COMPLETE,
+  SHELL_ARITHMETIC_FRAME_INCOMPLETE,
+} shell_arithmetic_frame_t;
+
+static inline SHELL_NONNULL(1, 4, 5, 6) shell_arithmetic_frame_t
+    shell_source_arithmetic_command(const char *input, size_t length,
+                                    size_t start, size_t *content,
+                                    size_t *content_end, size_t *after);
+
 /* Walk a declaration line once. cursor initially names a source position and
  * advances past each real << delimiter; LINE_END leaves it at the surviving
  * newline (or length). Quoted text and expansion operands are opaque, so
@@ -1569,6 +1580,16 @@ static SHELL_NONNULL(1, 3, 4, 5, 6) inline shell_source_declaration_status_t
       if (continued == position)
         *word_boundary = false;
       continue;
+    }
+    if (c == '(') {
+      size_t content, end, after;
+      shell_arithmetic_frame_t frame = shell_source_arithmetic_command(
+          input, length, position, &content, &end, &after);
+      if (frame != SHELL_ARITHMETIC_FRAME_NONE) {
+        *cursor = after;
+        *word_boundary = false;
+        continue;
+      }
     }
     *word_boundary = shell_source_word_separator(c);
     if (shell_source_skip_extglob(input, length, position, cursor))
@@ -1855,29 +1876,153 @@ shell_source_skip_arithmetic_expansion_depth(const char *input, size_t length,
   return complete;
 }
 
+/* Arithmetic command framing is distinct from shell grouping. Bash falls
+ * back to nested subshells when the first balanced interior is not followed
+ * immediately by the second closing parenthesis. The bounded lexical index
+ * records nested interiors during the same forward walk, so fallback does
+ * not repeatedly balance every ancestor's suffix. Source is immutable;
+ * outputs are distinct writable offsets. INCOMPLETE owns the received tail. */
+static inline SHELL_NONNULL(1, 4, 5, 6) shell_arithmetic_frame_t
+    shell_source_arithmetic_command(const char *input, size_t length,
+                                    size_t start, size_t *content,
+                                    size_t *content_end, size_t *after) {
+  size_t second;
+  if (start >= length || input[start] != '(' ||
+      !shell_source_logical_next_is(input, length, start, '(', &second))
+    return SHELL_ARITHMETIC_FRAME_NONE;
+  *content = second + 1;
+  *content_end = *after = length;
+  size_t end = 0, height;
+  if (shell_source_index_get(input, length, second,
+                             SHELL_SOURCE_INDEX_ARITHMETIC_BODY, &end,
+                             &height)) {
+    if (end < length && input[end] == ')') {
+      *content_end = end - 1;
+      *after = end + 1;
+      return SHELL_ARITHMETIC_FRAME_COMPLETE;
+    }
+    return SHELL_ARITHMETIC_FRAME_NONE;
+  }
+  if (shell_source_index_get(input, length, second,
+                             SHELL_SOURCE_INDEX_UNCLOSED_ARITHMETIC_BODY, &end,
+                             &height) &&
+      end == length)
+    return SHELL_ARITHMETIC_FRAME_INCOMPLETE;
+  size_t opens[SHELL_MAX_SUBCOMMANDS];
+  size_t depth = 1;
+  opens[0] = second;
+  for (size_t position = second + 1; position < length;) {
+    SHELL_SOURCE_WORD_SCAN(1);
+    char c = input[position];
+    size_t next = 0;
+    if (c == '\\') {
+      position += position + 1 < length ? 2 : 1;
+      continue;
+    }
+    if (c == '$' &&
+        shell_source_logical_next_is(input, length, position, '\'', NULL)) {
+      if (!shell_source_skip_complete_ansi_c_quote(input, length, position,
+                                                   &next))
+        break;
+      position = next;
+      continue;
+    }
+    if (c == '\'' || c == '"' || c == '`') {
+      if (!shell_source_skip_complete_quoted_text(input, length, position, c,
+                                                  &next))
+        break;
+      position = next;
+      continue;
+    }
+    if (c == '$' &&
+        shell_source_dollar_arithmetic_open(input, length, position, NULL)) {
+      if (!shell_source_skip_arithmetic_expansion(input, length, position,
+                                                  &next))
+        break;
+      position = next;
+      continue;
+    }
+    if (c == '$') {
+      size_t open;
+      if (shell_source_dollar_parentheses_open(input, length, position,
+                                               &open)) {
+        if (!shell_source_find_balanced_parentheses(input, length, open, &next))
+          break;
+        position = next;
+        continue;
+      }
+      if (shell_source_logical_next_is(input, length, position, '{', NULL)) {
+        if (!shell_source_skip_parameter_expansion(input, length, position,
+                                                   &next))
+          break;
+        position = next;
+        continue;
+      }
+    }
+    if (c == '(') {
+      if (depth < SHELL_MAX_SUBCOMMANDS)
+        opens[depth] = position;
+      ++depth;
+    } else if (c == ')') {
+      --depth;
+      if (depth < SHELL_MAX_SUBCOMMANDS)
+        shell_source_index_put(input, length, opens[depth],
+                               SHELL_SOURCE_INDEX_ARITHMETIC_BODY, position + 1,
+                               1);
+      if (!depth) {
+        if (position + 1 < length && input[position + 1] == ')') {
+          *content_end = position;
+          *after = position + 2;
+          return SHELL_ARITHMETIC_FRAME_COMPLETE;
+        }
+        return SHELL_ARITHMETIC_FRAME_NONE;
+      }
+    }
+    ++position;
+  }
+  for (size_t i = 0; i < depth && i < SHELL_MAX_SUBCOMMANDS; ++i)
+    shell_source_index_put(input, length, opens[i],
+                           SHELL_SOURCE_INDEX_UNCLOSED_ARITHMETIC_BODY, length,
+                           1);
+  return SHELL_ARITHMETIC_FRAME_INCOMPLETE;
+}
+
 /* Skip one statically numeric Bash arithmetic literal after lexical
  * continuation removal. This is deliberately shared by semantic validation and
  * fast feature classification: a base literal must not turn its digit letters
  * into identifiers in only one of those paths.
  *
  * Bash accepts decimal, legacy-octal, hexadecimal, and `base#digits` integer
- * constants. The latter has bases 2 through 64; for bases up to 36 upper and
+ * constants. A leading zero selects octal (or hexadecimal with x/X), so it
+ * cannot prefix the base in `base#digits`; leading zeros in the digits remain
+ * valid. Explicit bases range from 2 through 64; for bases up to 36 upper and
  * lower case letters are equivalent, while bases above 36 use lower case,
  * upper case, `@`, and `_` as distinct digits. Invalid spellings are not
  * partially accepted as a shorter number, because their caller must reject
  * rather than reinterpret them as dynamic arithmetic source. */
-static inline bool shell_source_skip_arithmetic_number(const char *input,
-                                                       size_t length,
-                                                       size_t position,
-                                                       size_t *after) {
-  if (!input || !after)
-    return false;
+typedef struct {
+  size_t after, digits;
+  unsigned base;
+} shell_source_arithmetic_number_t;
 
+/* Required source is readable for length bytes. On success, number describes
+ * the validated digits and a radix in [2, 64], suitable for value conversion.
+ * On failure, after still marks a consumed digit prefix (at least the first
+ * digit when present); digits/base are unspecified. Feature discovery may skip
+ * that prefix to avoid retrying every suffix. Semantic consumers must reject
+ * the failed spelling, rather than treating the prefix as a valid number.
+ */
+static inline SHELL_NONNULL(1, 4) bool shell_source_scan_arithmetic_number(
+    const char *input, size_t length, size_t position,
+    shell_source_arithmetic_number_t *number) {
   position = shell_source_skip_escaped_line_endings(input, length, position);
+  number->after = position;
   if (position >= length || !shell_ascii_digit((unsigned char)input[position]))
     return false;
 
+  size_t start = position;
   unsigned char first = (unsigned char)input[position++];
+  number->after = position;
 
   /* Hexadecimal has priority over the leading-zero legacy-octal spelling. */
   if (first == '0') {
@@ -1885,8 +2030,10 @@ static inline bool shell_source_skip_arithmetic_number(const char *input,
         shell_source_skip_escaped_line_endings(input, length, position);
     if (prefix < length && (input[prefix] == 'x' || input[prefix] == 'X')) {
       position = prefix + 1;
+      size_t digits_start = position;
       size_t digits = 0;
       for (;;) {
+        SHELL_SOURCE_WORD_SCAN(1);
         size_t next =
             shell_source_skip_escaped_line_endings(input, length, position);
         if (next >= length || !shell_ascii_xdigit((unsigned char)input[next]))
@@ -1896,7 +2043,7 @@ static inline bool shell_source_skip_arithmetic_number(const char *input,
       }
       if (digits == 0)
         return false;
-      *after = position;
+      *number = (shell_source_arithmetic_number_t){position, digits_start, 16};
       return true;
     }
   }
@@ -1908,13 +2055,16 @@ static inline bool shell_source_skip_arithmetic_number(const char *input,
   bool base_too_large = false;
   bool legacy_octal = first == '0';
   for (;;) {
+    SHELL_SOURCE_WORD_SCAN(1);
     size_t next =
         shell_source_skip_escaped_line_endings(input, length, position);
     if (next >= length || !shell_ascii_digit((unsigned char)input[next]))
       break;
     unsigned char digit = (unsigned char)input[next] - (unsigned char)'0';
-    if (legacy_octal && digit > 7)
+    if (legacy_octal && digit > 7) {
+      number->after = position;
       return false;
+    }
     if (base > 64 / 10 || (base == 64 / 10 && digit > 64 % 10))
       base_too_large = true;
     else if (!base_too_large)
@@ -1922,17 +2072,21 @@ static inline bool shell_source_skip_arithmetic_number(const char *input,
     position = next + 1;
   }
 
+  number->after = position;
   size_t hash = shell_source_skip_escaped_line_endings(input, length, position);
   if (hash >= length || input[hash] != '#') {
-    *after = position;
+    *number = (shell_source_arithmetic_number_t){position, start,
+                                                 legacy_octal ? 8u : 10u};
     return true;
   }
-  if (base_too_large || base < 2 || base > 64)
+  if (legacy_octal || base_too_large || base < 2 || base > 64)
     return false;
 
   position = hash + 1;
+  size_t digits_start = position;
   size_t digits = 0;
   for (;;) {
+    SHELL_SOURCE_WORD_SCAN(1);
     size_t next =
         shell_source_skip_escaped_line_endings(input, length, position);
     if (next >= length)
@@ -1962,7 +2116,7 @@ static inline bool shell_source_skip_arithmetic_number(const char *input,
   }
   if (digits == 0)
     return false;
-  *after = position;
+  *number = (shell_source_arithmetic_number_t){position, digits_start, base};
   return true;
 }
 
@@ -2077,7 +2231,13 @@ static inline SHELL_NONNULL(
       pending_count = 0;
       position = line - 1;
     } else if (c == '(') {
-      depth++;
+      size_t content, end, arithmetic_after;
+      if (shell_source_arithmetic_command(input, length, position, &content,
+                                          &end, &arithmetic_after) ==
+          SHELL_ARITHMETIC_FRAME_COMPLETE)
+        position = arithmetic_after - 1;
+      else
+        depth++;
     } else if (c == ')') {
       depth--;
     }
@@ -4205,12 +4365,11 @@ static inline SHELL_NONNULL(3, 4, 5, 6) shell_source_scan_status_t
       if (scope->arithmetic_scope && !scope->in_single_quote &&
           !scope->in_double_quote) {
         if (shell_ascii_digit((unsigned char)c)) {
-          size_t number_after;
-          if (shell_source_skip_arithmetic_number(input, length, position,
-                                                  &number_after)) {
-            scan->position = number_after;
-            continue;
-          }
+          shell_source_arithmetic_number_t number;
+          shell_source_scan_arithmetic_number(input, length, position, &number);
+          /* Rejected spellings still consume a digit prefix. */
+          scan->position = number.after;
+          continue;
         }
         if (shell_ascii_alpha((unsigned char)c) || c == '_')
           scan->has_arithmetic_variables = true;

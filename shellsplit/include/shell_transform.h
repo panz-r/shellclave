@@ -106,8 +106,8 @@ shell_transform_status_t shell_transform_command(
  * Shellsplit only transforms modeled simple-command lists, pipelines, and
  * brace/subshell groups. Control compounds (including function declarations,
  * `select`, and `coproc`), shell-semantic array forms, and unmodeled Bash
- * `[[ … ]]`, `(( … ))`, `$"…"`, and `;&` / `;;&` forms return
- * SHELL_TRANSFORM_EPARSE.
+ * `[[ … ]]`, dynamic/mutating arithmetic commands, `$"…"`, and `;&` / `;;&`
+ * forms return SHELL_TRANSFORM_EPARSE.
  *
  * On failure, writable outputs are reset to NULL and zero.
  */
