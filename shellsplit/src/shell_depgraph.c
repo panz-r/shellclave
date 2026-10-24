@@ -279,7 +279,6 @@ size_t shell_dep_file_path_normalize(char *path, size_t length) {
 }
 
 typedef struct {
-  bool has_nul;
   unsigned char first;
 } dep_file_identity_measure_t;
 
@@ -288,8 +287,6 @@ static bool dep_file_identity_byte(unsigned char byte, size_t position,
   dep_file_identity_measure_t *measure = context;
   if (position == 0)
     measure->first = byte;
-  if (byte == 0)
-    measure->has_nul = true;
   return true;
 }
 
@@ -390,9 +387,10 @@ bool shell_dep_doc_file_identity_write(const shell_dep_graph_t *graph,
     return false;
   dep_file_identity_measure_t measure = {0};
   size_t path_len = 0;
-  if (shell_visit_decoded_word(doc->path, doc->path_len, dep_file_identity_byte,
-                               &measure, &path_len) != SHELL_PROCESS_OK ||
-      path_len == 0 || measure.has_nul)
+  if (shell_process_visit_word_value(doc->path, doc->path_len,
+                                     dep_file_identity_byte, &measure,
+                                     &path_len) != SHELL_PROCESS_OK ||
+      path_len == 0)
     return false;
   dep_file_identity_layout_t layout;
   if (!dep_file_identity_plan(graph, doc, measure.first, path_len,
@@ -401,9 +399,9 @@ bool shell_dep_doc_file_identity_write(const shell_dep_graph_t *graph,
   /* The measure pass validated the immutable word. Write it without another
    * measure pass, preserving destination atomicity on every failure above. */
   size_t decoded_len = 0;
-  (void)shell_visit_decoded_word(doc->path, doc->path_len,
-                                 dep_file_identity_write_byte,
-                                 destination + layout.prefix_len, &decoded_len);
+  (void)shell_process_visit_word_value(
+      doc->path, doc->path_len, dep_file_identity_write_byte,
+      destination + layout.prefix_len, &decoded_len);
   dep_file_identity_finish(doc, &layout, destination, written, absolute);
   return true;
 }
@@ -1246,9 +1244,9 @@ static bool decoded_path_indicator(unsigned char byte, size_t decoded_offset,
 static bool token_looks_like_path(const dep_token_t *tok) {
   bool found = false;
   size_t decoded_length = 0;
-  return shell_visit_decoded_word(tok->start, tok->len, decoded_path_indicator,
-                                  &found,
-                                  &decoded_length) == SHELL_PROCESS_OK &&
+  return shell_process_visit_word_value(tok->start, tok->len,
+                                        decoded_path_indicator, &found,
+                                        &decoded_length) == SHELL_PROCESS_OK &&
          found;
 }
 
@@ -1284,10 +1282,11 @@ static bool dep_redirect_is_legacy_combined_output(const dep_token_t *redirect,
              target->start, target->len) == SHELL_PROCESS_LEGACY_REDIRECT_PATH;
 }
 
-/* Decode a static cd operand into the bounded CWD resolver representation.
- * The resolver stores C strings, so decoded NUL and output overflow make the
- * destination unknowable rather than silently truncating or fabricating one.
+/* Decode an effective static cd operand into the bounded CWD representation.
+ * ANSI-C fragments have already applied their NUL truncation. Empty values and
+ * output overflow make the destination unknowable.
  * tok is a parser-owned word; destination has destination_size writable bytes.
+ * The immutable source and destination do not alias.
  * Runtime-dependent tilde expansion is not materialized as a symbolic HOME
  * string. truncated is an optional output for a static destination overflow. */
 static SHELL_NONNULL(1,
@@ -1303,7 +1302,7 @@ static SHELL_NONNULL(1,
     return false;
 
   size_t decoded_length = 0;
-  if (shell_measure_decoded_word(tok->start, tok->len, &decoded_length) !=
+  if (shell_process_measure_word_value(tok->start, tok->len, &decoded_length) !=
           SHELL_PROCESS_OK ||
       decoded_length == 0)
     return false;
@@ -1314,11 +1313,9 @@ static SHELL_NONNULL(1,
   }
 
   size_t written = 0;
-  if (shell_write_decoded_word(tok->start, tok->len, destination,
-                               destination_size - 1,
-                               &written) != SHELL_PROCESS_OK ||
-      written != decoded_length || memchr(destination, '\0', written) != NULL)
-    return false;
+  /* The preceding measure established the value and capacity. */
+  (void)shell_process_write_word_value(tok->start, tok->len, destination,
+                                       destination_size - 1, &written);
   destination[written] = '\0';
 
   return true;
@@ -5158,9 +5155,9 @@ static SHELL_NONNULL(1) uint8_t
       return 0;
   } else {
     size_t decoded;
-    if (shell_visit_decoded_word(effect->token.start, effect->token.len,
-                                 dep_variable_word_byte, &scan,
-                                 &decoded) != SHELL_PROCESS_OK)
+    if (shell_process_visit_word_value(effect->token.start, effect->token.len,
+                                       dep_variable_word_byte, &scan,
+                                       &decoded) != SHELL_PROCESS_OK)
       return 0;
   }
   return shell_builtin_variable_index(&scan.variable);
@@ -5190,9 +5187,9 @@ static SHELL_NONNULL(1, 2) const dep_fd_route_entry_t *dep_find_named_target(
             &ignored);
       } else {
         size_t ignored;
-        (void)shell_visit_decoded_word(token->start, token->len,
-                                       dep_named_route_target_byte, &target,
-                                       &ignored);
+        (void)shell_process_visit_word_value(token->start, token->len,
+                                             dep_named_route_target_byte,
+                                             &target, &ignored);
       }
       order = target.order;
       unsigned char trailing = 0;
@@ -5229,7 +5226,7 @@ static SHELL_NONNULL(1, 3) int dep_prefix_assignment_compare_word(
                                                &target, &ignored);
   } else {
     size_t ignored;
-    (void)shell_visit_decoded_word(
+    (void)shell_process_visit_word_value(
         word->start, word->len, dep_named_route_target_byte, &target, &ignored);
   }
   unsigned char trailing = 0;
@@ -5327,9 +5324,9 @@ static SHELL_NONNULL(1, 2) void dep_prepare_observed_effect(
             dep_named_assignment_target_byte, &target, &ignored);
       } else {
         size_t ignored;
-        (void)shell_visit_decoded_word(effect->token.start, effect->token.len,
-                                       dep_named_route_target_byte, &target,
-                                       &ignored);
+        (void)shell_process_visit_word_value(
+            effect->token.start, effect->token.len, dep_named_route_target_byte,
+            &target, &ignored);
       }
       order = target.order;
       unsigned char trailing;
@@ -5567,8 +5564,8 @@ static SHELL_NONNULL(1) bool dep_effect_is_ifs(const char *text,
         text, length, dep_named_assignment_target_byte, &target, &ignored);
   } else {
     size_t ignored;
-    (void)shell_visit_decoded_word(text, length, dep_named_route_target_byte,
-                                   &target, &ignored);
+    (void)shell_process_visit_word_value(
+        text, length, dep_named_route_target_byte, &target, &ignored);
   }
   return !target.order && target.name_position == 3;
 }
@@ -5586,8 +5583,8 @@ static SHELL_NONNULL(1, 2) bool dep_ifs_note_assignment(
   size_t ignored;
   bool known =
       !shell_source_argument_has_dynamic_syntax(word->start, word->len) &&
-      shell_visit_decoded_word(word->start, word->len, dep_ifs_value_byte,
-                               &scan, &ignored) == SHELL_PROCESS_OK;
+      shell_process_visit_word_value(word->start, word->len, dep_ifs_value_byte,
+                                     &scan, &ignored) == SHELL_PROCESS_OK;
   dep_ifs_note(mutations, known ? dep_ifs_known(scan.digits) : DEP_IFS_DIGITS,
                assignment.append);
   return true;
@@ -5940,9 +5937,9 @@ static SHELL_NONNULL(1, 2, 3, 4, 5, 6) void dep_prepare_named_mutations(
           bool known = (roles & SHELL_BUILTIN_ROLE_FORMAT) &&
                        !shell_source_argument_has_dynamic_syntax(word->start,
                                                                  word->len) &&
-                       shell_visit_decoded_word(word->start, word->len,
-                                                dep_ifs_value_byte, &scan,
-                                                &ignored) == SHELL_PROCESS_OK &&
+                       shell_process_visit_word_value(
+                           word->start, word->len, dep_ifs_value_byte, &scan,
+                           &ignored) == SHELL_PROCESS_OK &&
                        !scan.format;
           dep_ifs_note(mutations,
                        known ? dep_ifs_known(scan.digits) : DEP_IFS_DIGITS,
@@ -10693,8 +10690,8 @@ static SHELL_NONNULL(1, 2, 3, 4) shell_dep_error_t
   if (eligible && purpose != SHELL_EXPAND_WORD_ARGUMENT &&
       !(graph->nodes[document].doc.flags & SHELL_DEP_DOC_FLAG_DYNAMIC_NAME)) {
     size_t decoded_length;
-    if (shell_measure_decoded_word(word->start, word->len, &decoded_length) ==
-            SHELL_PROCESS_OK &&
+    if (shell_process_measure_word_value(word->start, word->len,
+                                         &decoded_length) == SHELL_PROCESS_OK &&
         decoded_length == 0)
       dep_record_file_failure(graph, context, word, owner, purpose, document);
     return SHELL_DEP_OK;
@@ -24490,6 +24487,9 @@ static SHELL_NONNULL(1, 6, 9, 10) shell_dep_error_t shell_dep_graph_parse_raw(
   }
   dep_observable_inventory_t observable = {.source = cmd,
                                            .source_length = cmd_len};
+  /* Inspect the complete immutable source, not only ranges retained by the
+   * supplied fast result. A truncated structural prefix cannot hide a later
+   * expansion whose semantics require unrepresentable translated source. */
   if (shell_tokenizer_inspect_semantics(
           cmd, cmd_len, dep_observe_descriptor_token, dep_observe_read_fd,
           dep_observe_process, &observable)) {

@@ -63,7 +63,8 @@ static SHELL_NONNULL(1) shell_source_status_t
   if (scan.exhausted)
     return SHELL_SOURCE_TRUNCATED;
   if (!valid || scan.has_backtick_escapes ||
-      status == SHELL_SOURCE_SCAN_MALFORMED)
+      status == SHELL_SOURCE_SCAN_MALFORMED ||
+      status == SHELL_SOURCE_SCAN_UNSUPPORTED)
     return SHELL_SOURCE_UNSUPPORTED;
   if (scan.unfinished.body_start)
     return source_byte_islands(word + scan.unfinished.body_start,

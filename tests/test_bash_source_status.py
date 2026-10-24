@@ -317,6 +317,15 @@ class SourceStatusContract(unittest.TestCase):
                   "$'日本\\444(printf child)'".encode(),
                   "$'日本\\540printf child\\540'".encode(),
                   "$'日本\\534'".encode(),
+                  "$'before\\0after'".encode(), "pre$'before\\0after'post".encode(),
+                  "$'\\0'".encode(), "$'\\0ignored'after".encode(),
+                  "$'a\\000b'".encode(), "$'a\\400b'".encode(),
+                  "$'a\\x00b'".encode(), "$'a\\c@b'".encode(),
+                  "$'a\\u0000b'".encode(), "$'a\\U00000000b'".encode(),
+                  "$'a\\0b'$'c\\0d'e".encode(), "$\\\n'a\\0b'c".encode(),
+                  "$'日本\\0ignored'語".encode(), "$'a\\0\\u65e5'".encode(),
+                  "$'a\\0\\U000065e5'".encode(), "$'a\\0\\c\\'discarded'X".encode(),
+                  "$'a\\0$(printf phantom)`printf phantom`*?{a,b}'".encode(),
                   "$'日本$(printf phantom)`printf phantom`*?'".encode(),
                   '"$\'日本\'"'.encode()]
         # A backslash control operand consumes its doubled spelling; an
@@ -379,6 +388,15 @@ class SourceStatusContract(unittest.TestCase):
             ("cat < <(printf %s $'日本')", "日本"),
             ("printf '%s' `printf %s $'日本'`", "日本"),
             ("cat <<$'日本'\npayload\n日本\n", "payload\n"),
+            ("value=pre$'a\\0b'post; printf '%s' \"$value\"", "preapost"),
+            ("unset v; printf '%s' ${v:-$'a\\0$(printf phantom)'}", "a"),
+            ('v=abc; printf \'%s\' "${v#$\'a\\0b\'}"', "bc"),
+            ('v=abc; printf \'%s\' "${v/$\'a\\0b\'/$\'z\\0t\'}"', "zbc"),
+            ('printf \'%s\' "$(printf %s $\'a\\0b\')"', "a"),
+            ("cat < <(printf %s $'a\\0b')", "a"),
+            ("cat <<$'END\\0ignored'\npayload\nEND\n", "payload\n"),
+            ("cat <<$'\\0ignored'\npayload\n\n", "payload\n"),
+            ("cat <<$'E\\0ignored'X$'Y\\0ignored'W\npayload\nEXYW\n", "payload\n"),
         ]
         for locale in ("C", "C.UTF-8"):
             environment = dict(os.environ, BASH_ENV="", ENV="", LC_ALL=locale)
@@ -396,6 +414,518 @@ class SourceStatusContract(unittest.TestCase):
             with self.subTest(source=source):
                 self.assertEqual(self.classify(source.encode()), 4)
         self.assertEqual(self.classify("printf $'日本'\ncat <<\n".encode()), 2)
+
+    def test_ansi_nul_parameter_boundary(self):
+        # Grammar recognition stays separate from unsupported Bash runtime
+        # substitution errors. Ordinary unquoted/pattern contexts are above.
+        cases = [b'printf "${v:-$\'a\\0b\'}"',
+                 b'printf "${v:+$\'a\\0b\'}"',
+                 b'printf "${v:-$\'a\\0$(printf phantom)\'}"']
+        patterns = (b"${v#INNER}", b"${v##INNER}", b"${v%INNER}",
+                    b"${v%%INNER}", b"${v/INNER/x}", b"${v/x/INNER}",
+                    b"${v^INNER}", b"${v^^INNER}", b"${v,INNER}",
+                    b"${v,,INNER}")
+        for pattern in patterns:
+            for operator in (b"-", b":-", b"+", b":+"):
+                inner = b"${u" + operator + b"$'a\\0b'}"
+                cases.append(b'printf %s "' +
+                             pattern.replace(b"INNER", inner) + b'"')
+        for source in cases:
+            with self.subTest(source=source):
+                self.assertEqual(self.syntax(source), 0)
+                self.assertEqual(self.classify(source), 0)
+                result = subprocess.run([self.probe, "--argv"], input=source,
+                                        capture_output=True, timeout=10)
+                self.assertNotEqual(result.returncode, 0)
+
+    def test_nested_parameter_quote_context(self):
+        cases = (
+            (b'printf %s "${v#${u:-$\'$(printf a >&2)\'}}"', b"abc", b"a"),
+            (b'printf %s "${v/x/${u:+$\'$(printf a >&2)\'}}"', b"abc", b"a"),
+            (b"printf %s ${v#${u:-$'$(printf a >&2)'}}", b"abc", b""),
+            (b'printf %s "${v#$\'$(printf a >&2)\'}"', b"abc", b""),
+            (b"cat <<EOF\n${v#${u:-$'a\\0b'}}\nEOF", b"bc\n", b""),
+            (b"cat <<EOF\n${v#${u:-$'$(printf a >&2)'}}\nEOF", b"abc\n", b"a"),
+            (b"cat <<EOF\n${v#${u:-$'a\\0$(printf a >&2)'}}\nEOF", b"bc\n", b""),
+            (b"cat <<EOF\n${v#${u:-$'$(printf a >&2)b\\0tail'}}\nEOF", b"abc\n", b"a"),
+            (b"cat <<EOF\n${v#${u:-$'$(printf a)b\\0tail'}}\nEOF", b"c\n", b""),
+            (b"cat <<EOF\n${v#${u:-$'${w:-$(printf a)}b\\0tail'}}\nEOF", b"c\n", b""),
+        )
+        for locale in ("C", "C.UTF-8"):
+            environment = dict(os.environ, BASH_ENV="", ENV="", LC_ALL=locale)
+            for source, output, diagnostic in cases:
+                with self.subTest(locale=locale, source=source):
+                    initial = (b"u=x; " if b"${u:+" in source
+                               else b"unset u; ")
+                    result = subprocess.run(
+                        [self.bash, "--noprofile", "--norc", "-p", "-c",
+                         b"readonly LC_ALL; unset w; v=abc; " + initial + source],
+                        env=environment, capture_output=True, timeout=10)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout, output)
+                    self.assertEqual(result.stderr, diagnostic)
+                    self.assertEqual(self.classify(source), 0)
+
+    def test_nested_ansi_escape_translation(self):
+        for locale in ("C", "C.UTF-8"):
+            environment = dict(os.environ, BASH_ENV="", ENV="", LC_ALL=locale)
+            for context in ("default", "pattern", "heredoc", "clipped"):
+                for depth in (1, 2):
+                    for count in range(9):
+                        operand = (b"${w:-" * depth + b"\\" * count +
+                                   b"$(printf child >&2)" + b"}" * depth)
+                        fragment = (b"$'" + operand +
+                                    (b"\\0$(printf phantom >&2)"
+                                     if context == "clipped" else b"") + b"'")
+                        if context == "default":
+                            source = b'printf %s "${v:-' + fragment + b'}"'
+                            initial = b"unset v u w; "
+                        else:
+                            word = b"${v#${u:-" + fragment + b"}}"
+                            source = (b'printf %s "' + word + b'"'
+                                      if context == "pattern" else
+                                      b"cat <<EOF\n" + word + b"\nEOF\n")
+                            initial = b"v=abc; unset u w; "
+                        with self.subTest(locale=locale, context=context,
+                                          depth=depth, count=count):
+                            result = subprocess.run(
+                                [self.bash, "--noprofile", "--norc", "-p", "-c",
+                                 b"readonly LC_ALL; " + initial + source],
+                                env=environment, capture_output=True, timeout=10)
+                            executed = count % 4 in (0, 3)
+                            self.assertEqual(result.returncode, 0, result.stderr)
+                            self.assertEqual(result.stderr,
+                                             b"child" if executed else b"")
+                            if context == "default":
+                                output = (b"\\" * ((count + 1) // 4) +
+                                          (b"" if executed else
+                                           b"$(printf child >&2)"))
+                            else:
+                                output = (b"abc" if context == "pattern"
+                                          else b"abc\n")
+                            self.assertEqual(result.stdout, output)
+                            self.assertEqual(self.classify(source), 0)
+
+    def test_parameter_word_expansion_phases(self):
+        for locale in ("C", "C.UTF-8"):
+            environment = dict(os.environ, BASH_ENV="", ENV="", LC_ALL=locale)
+            for context in ("heredoc-pattern", "shell-pattern-default",
+                            "quoted-default", "quoted-nested-pattern",
+                            "unquoted", "heredoc-direct-pattern"):
+                for opener, closer in ((b"$(", b")"), (b"`", b"`"),
+                                       (b"<(", b")"), (b">(", b")")):
+                    # Escaping only the opening backtick has different raw
+                    # pairing and can be a Bash substitution error.
+                    for count in range(1 if opener == b"`" else 9):
+                        for clipped in (False, True):
+                            if clipped and context in (
+                                    "shell-pattern-default", "quoted-default",
+                                    "quoted-nested-pattern"):
+                                # The existing double-quoted NUL contract
+                                # declines semantic evaluation separately.
+                                continue
+                            fragment = (b"$'" + b"\\" * count + opener +
+                                        b"printf child >&2" + closer +
+                                        (b"a\\0$(printf phantom >&2)"
+                                         if clipped else b"") + b"'")
+                            if context == "quoted-default":
+                                source = b'echo "${0:+' + fragment + b'}"'
+                            elif context == "heredoc-direct-pattern":
+                                source = (b"cat <<EOF\n${0#" + fragment +
+                                          b"}\nEOF\n")
+                            else:
+                                nested = (b"${0#" + fragment + b"}"
+                                          if context != "shell-pattern-default"
+                                          else fragment)
+                                word = b"${0#${0:+" + nested + b"}}"
+                                source = (b"cat <<EOF\n" + word + b"\nEOF\n"
+                                          if context == "heredoc-pattern" else
+                                          b"echo " + word if context == "unquoted"
+                                          else b'echo "' + word + b'"')
+                            active = (context in ("heredoc-pattern",
+                                                  "shell-pattern-default") or
+                                      context == "quoted-default" and
+                                      opener in (b"$(", b"`"))
+                            executed = active and count % 4 in (0, 3)
+                            with self.subTest(locale=locale, context=context,
+                                              opener=opener, count=count,
+                                              clipped=clipped):
+                                self.assertEqual(self.syntax(source), 0)
+                                result = subprocess.run(
+                                    [self.bash, "--noprofile", "--norc", "-p", "-c",
+                                     b"readonly LC_ALL; " + source,
+                                     b"shellclave-phase"],
+                                    env=environment, capture_output=True,
+                                    timeout=10)
+                                self.assertEqual(result.returncode, 0,
+                                                 result.stderr)
+                                self.assertEqual(result.stderr,
+                                                 b"child" if executed else b"")
+                                self.assertEqual(self.classify(source), 0)
+
+        for locale in ("C", "C.UTF-8"):
+            environment = dict(os.environ, BASH_ENV="", ENV="", LC_ALL=locale)
+            for source, executed in (
+                    (b'echo "${0#$\'<(printf child >&2)\\n\'}"', False),
+                    (b'echo "${0:+$\'<(printf child >&2)\\n\'}"', False),
+                    (b'echo "${0#${0:+$\'<(printf child >&2)\\n\'}}"', True)):
+                with self.subTest(locale=locale, source=source):
+                    result = subprocess.run(
+                        [self.bash, "--noprofile", "--norc", "-p", "-c",
+                         b"readonly LC_ALL; " + source, b"shellclave-phase"],
+                        env=environment, capture_output=True, timeout=10)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stderr, b"child" if executed else b"")
+                    self.assertEqual(self.classify(source), 0)
+            for word in (
+                    b"${0%${u:-${0%%$'$(printf child >&2)'}}}",
+                    b"${0#${u-${0/x/$'`printf child >&2`'}}}",
+                    b"${0#${0+${0^^$'$(printf child >&2)'}}}"):
+                source = b"cat <<EOF\n" + word + b"\nEOF\n"
+                with self.subTest(locale=locale, word=word):
+                    result = subprocess.run(
+                        [self.bash, "--noprofile", "--norc", "-p", "-c",
+                         b"readonly LC_ALL; unset u; " + source,
+                         b"shellclave-phase"],
+                        env=environment, capture_output=True, timeout=10)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stderr, b"child")
+                    self.assertEqual(self.classify(source), 0)
+
+    def test_quotes_in_reexpanded_ansi_values(self):
+        for locale in ("C", "C.UTF-8"):
+            environment = dict(os.environ, BASH_ENV="", ENV="", LC_ALL=locale)
+            for heredoc in (False, True):
+                for nested in (False, True):
+                    for clipped in (False, True) if heredoc else (False,):
+                        for opener in (b"<(", b">("):
+                            for count in range(9):
+                                value = (b'"' + b"\\" * count + opener +
+                                         b'printf child >&2)"')
+                                if nested:
+                                    value = b"${0:+" + value + b"}"
+                                fragment = (b"$'" + value +
+                                            (b"\\0tail" if clipped else b"") +
+                                            b"'")
+                                word = b"${0#${0:+" + fragment + b"}}"
+                                source = (b"cat <<EOF\n" + word + b"\nEOF\n"
+                                          if heredoc else b'echo "' + word + b'"')
+                                with self.subTest(locale=locale, source=source):
+                                    self.assertEqual(self.syntax(source), 0)
+                                    result = subprocess.run(
+                                        [self.bash, "--noprofile", "--norc",
+                                         "-p", "-c", b"readonly LC_ALL; " + source,
+                                         b"shellclave-quotes"], env=environment,
+                                        capture_output=True, timeout=10)
+                                    self.assertEqual(result.returncode, 0,
+                                                     result.stderr)
+                                    self.assertEqual(result.stderr, b"")
+                                    self.assertEqual(self.classify(source), 0)
+            for value in (
+                    b'"<(printf literal $(printf child >&2))"',
+                    b'">(printf literal `printf child >&2`)"',
+                    b'"<(printf literal)"<(printf child >&2)',
+                    b'">(printf literal)">(printf child >&2)'):
+                for heredoc in (False, True):
+                    fragment = b"$'" + value + (b"\\0tail" if heredoc else b"") + b"'"
+                    word = b"${0#${0:+" + fragment + b"}}"
+                    source = (b"cat <<EOF\n" + word + b"\nEOF\n"
+                              if heredoc else b'echo "' + word + b'"')
+                    with self.subTest(locale=locale, source=source):
+                        result = subprocess.run(
+                            [self.bash, "--noprofile", "--norc", "-p", "-c",
+                             b"readonly LC_ALL; " + source, b"shellclave-quotes"],
+                            env=environment, capture_output=True, timeout=10)
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertEqual(result.stderr, b"child")
+                        self.assertEqual(self.classify(source), 0)
+
+    def test_heredoc_word_pattern_phase_boundaries(self):
+        for locale in ("C", "C.UTF-8"):
+            environment = dict(os.environ, BASH_ENV="", ENV="", LC_ALL=locale)
+            for operator in (b"0:+", b"u:-"):
+                for opener, closer in ((b"$(", b")"), (b"`", b"`"),
+                                       (b"<(", b")"), (b">(", b")")):
+                    for clipped in (False, True):
+                        fragment = (b"$'" + opener + b"printf child >&2" +
+                                    closer + (b"\\0tail" if clipped else b"") +
+                                    b"'")
+                        word = (b"${" + operator + b"${0#${0:+" + fragment +
+                                b"}}}")
+                        source = b"cat <<EOF\n" + word + b"\nEOF\n"
+                        with self.subTest(locale=locale, operator=operator,
+                                          opener=opener, clipped=clipped):
+                            self.assertEqual(self.syntax(source), 0)
+                            result = subprocess.run(
+                                [self.bash, "--noprofile", "--norc", "-p",
+                                 "-c", b"readonly LC_ALL; unset u; " + source,
+                                 b"shellclave-phase"], env=environment,
+                                capture_output=True, timeout=10)
+                            self.assertEqual(result.returncode, 0, result.stderr)
+                            self.assertEqual(result.stderr, b"")
+                            self.assertEqual(self.classify(source), 0)
+
+            cases = (
+                (b"${0:+${0#${0#${0:+$'$(printf child >&2)'}}}}}", b""),
+                (b"${0#${0:+${0#${0#$'$(printf child >&2)'}}}}", b""),
+                (b"${0#${0:+${0:+${0#$'$(printf child >&2)'}}}}", b""),
+                (b"${0#${0:+${0#${0:+$'$(printf child >&2)'}}}}", b"child"),
+                (b"${0:+${0#${0:+$'$(printf literal >&2)'}}}"
+                 b"${0#${0:+${0#$'$(printf child >&2)'}}}", b"child"),
+                (b"${0:+$'$(printf direct >&2)'}", b"direct"),
+                (b"${0#${0:+${0#$'$(printf child >&2)'}}}", b"child"),
+            )
+            for word, diagnostic in cases:
+                source = b"cat <<EOF\n" + word + b"\nEOF\n"
+                with self.subTest(locale=locale, word=word):
+                    result = subprocess.run(
+                        [self.bash, "--noprofile", "--norc", "-p", "-c",
+                         b"readonly LC_ALL; " + source,
+                         b"shellclave-phase"], env=environment,
+                        capture_output=True, timeout=10)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stderr, diagnostic)
+                    self.assertEqual(self.classify(source), 0)
+
+    def test_heredoc_quote_inheritance_through_patterns(self):
+        for locale in ("C", "C.UTF-8"):
+            environment = dict(os.environ, BASH_ENV="", ENV="", LC_ALL=locale)
+            for opener, closer in ((b"$(", b")"), (b"`", b"`"),
+                                   (b"<(", b")"), (b">(", b")")):
+                child = opener + b"printf child >&2" + closer
+                for pattern in (b"0#", b"0##", b"0%", b"0%%", b"0/",
+                                b"0/x/", b"0^", b"0^^", b"0,", b"0,,"):
+                    for clipped in (False, True):
+                        fragment = (b"$'" + child +
+                                    (b"\\0tail" if clipped else b"") + b"'")
+                        word = (b'${0:+"${' + pattern + b"${0:+" + fragment +
+                                b'}}"}')
+                        source = b"cat <<EOF\n" + word + b"\nEOF\n"
+                        with self.subTest(locale=locale, source=source):
+                            self.assertEqual(self.syntax(source), 0)
+                            result = subprocess.run(
+                                [self.bash, "--noprofile", "--norc", "-p", "-c",
+                                 b"readonly LC_ALL; " + source,
+                                 b"shellclave-phase"], env=environment,
+                                capture_output=True, timeout=10)
+                            self.assertEqual(result.returncode, 0, result.stderr)
+                            self.assertEqual(result.stderr, b"")
+                            self.assertEqual(self.classify(source), 0)
+                fragment = b"$'" + child + b"'"
+                active = b"${0#${0:+${0#" + fragment + b"}}}"
+                quoted = b'${0:+"${0#${0:+' + fragment + b'}}"}'
+                controls = (
+                    (b'${0#"${0:+' + fragment + b'}"}',
+                     opener in (b"$(", b"`")),
+                    (b'${0:+"${0#"${0:+' + fragment + b'}"}"}',
+                     opener in (b"$(", b"`")),
+                    (b'${0:+"${0#${0:+' + child + b'}}"}', True),
+                    (quoted + active, True),
+                    (b'${0:+"${0##${0:+${0%${0:+' + fragment + b'}}}}"}',
+                     False),
+                )
+                for word, executed in controls:
+                    source = b"cat <<EOF\n" + word + b"\nEOF\n"
+                    with self.subTest(locale=locale, source=source):
+                        self.assertEqual(self.syntax(source), 0)
+                        result = subprocess.run(
+                            [self.bash, "--noprofile", "--norc", "-p", "-c",
+                             b"readonly LC_ALL; " + source, b"shellclave-phase"],
+                            env=environment, capture_output=True, timeout=10)
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertEqual(result.stderr,
+                                         b"child" if executed else b"")
+                        self.assertEqual(self.classify(source), 0)
+
+    def test_ansi_data_around_children(self):
+        for locale in ("C", "C.UTF-8"):
+            environment = dict(os.environ, BASH_ENV="", ENV="", LC_ALL=locale)
+            for escape in (b"\\n", b"\\t", b"\\x61"):
+                for before in (False, True):
+                    for opener, closer in ((b"$(", b")"), (b"`", b"`")):
+                        child = opener + b"printf child >&2" + closer
+                        fragment = (b"$'" + (escape if before else b"") +
+                                    child + (b"" if before else escape) + b"'")
+                        sources = (
+                            (b'echo "${0:+' + fragment + b'}"', True),
+                            (b'echo "${0#${0:+' + fragment + b'}}"', True),
+                            (b"cat <<EOF\n${0#${0:+${0#" + fragment +
+                             b"}}}\nEOF\n", True),
+                            (b'echo "${0#' + fragment + b'}"', False),
+                            (b"echo ${0#${0:+${0#" + fragment + b"}}}", False),
+                        )
+                        for source, executed in sources:
+                            with self.subTest(locale=locale, source=source):
+                                self.assertEqual(self.syntax(source), 0)
+                                result = subprocess.run(
+                                    [self.bash, "--noprofile", "--norc", "-p",
+                                     "-c", b"readonly LC_ALL; " + source,
+                                     b"shellclave-phase"], env=environment,
+                                    capture_output=True, timeout=10)
+                                self.assertEqual(result.returncode, 0,
+                                                 result.stderr)
+                                self.assertEqual(result.stderr,
+                                                 b"child" if executed else b"")
+                                self.assertEqual(self.classify(source), 0)
+            for child in (b"$(printf ch\\x69ld >&2)",
+                          b"`printf ch\\x69ld >&2`"):
+                for source in (
+                        b'echo "${0:+$\'' + child + b"'}\"",
+                        b'echo "${0#${0:+$\'' + child + b"'}}\"",
+                        b"cat <<EOF\n${0#${0:+${0#$'" + child +
+                        b"\\0tail'}}}\nEOF\n"):
+                    with self.subTest(locale=locale, source=source):
+                        self.assertEqual(self.syntax(source), 0)
+                        result = subprocess.run(
+                            [self.bash, "--noprofile", "--norc", "-p", "-c",
+                             b"readonly LC_ALL; " + source, b"shellclave-phase"],
+                            env=environment, capture_output=True, timeout=10)
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertEqual(result.stderr, b"child")
+                        self.assertEqual(self.classify(source), 4)
+
+    def test_ansi_child_source_translation(self):
+        for locale in ("C", "C.UTF-8"):
+            environment = dict(os.environ, BASH_ENV="", ENV="", LC_ALL=locale)
+            for context in ("default", "pattern", "clipped"):
+                for count in range(5):
+                    child = (b'$(echo "' + b"\\" * count +
+                             b'$(printf child >&2)")')
+                    fragment = (b"$'" + child +
+                                (b"\\0tail" if context == "clipped" else b"") +
+                                b"'")
+                    if context == "default":
+                        source = b'echo "${v:-' + fragment + b'}"'
+                        initial = b"unset v u; "
+                    else:
+                        word = b"${v#${u:-" + fragment + b"}}"
+                        source = (b'echo "' + word + b'"'
+                                  if context == "pattern" else
+                                  b"cat <<EOF\n" + word + b"\nEOF\n")
+                        initial = b"v=abc; unset u; "
+                    with self.subTest(locale=locale, context=context,
+                                      count=count):
+                        self.assertEqual(self.syntax(source), 0)
+                        result = subprocess.run(
+                            [self.bash, "--noprofile", "--norc", "-p", "-c",
+                             b"readonly LC_ALL; " + initial + source],
+                            env=environment, capture_output=True, timeout=10)
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertEqual(result.stderr,
+                                         b"child" if count % 4 in (0, 3) else b"")
+                        self.assertEqual(self.classify(source),
+                                         0 if count < 2 else 4)
+
+    def test_ansi_fragment_boundary_syntax(self):
+        joined = (
+            (b'echo "${0:+$\'$\'(printf child >&2)}"', b"child"),
+            (b'echo "${0#${0:+<$\'(printf child >&2)\'}}"', b"child"),
+            (b'echo "${0#${0:+>$\'(printf child >&2)\'}}"', b"child"),
+            (b'echo "${0:+$\'$\'$\'(printf child >&2)\'}"', b"child"),
+            (b'echo "${0:+$\'$\'$\'\'(printf child >&2)}"', b"child"),
+            (b'echo "${0:+$\'$\'""(printf child >&2)}"', b"child"),
+            (b'echo "${0:+$\'$\'\\\n(printf child >&2)}"', b"child"),
+            (b'echo "${0:+$\'$\'PATH}"', b""),
+            (b'echo "${0:+$\'$\'0}"', b""),
+            (b'echo "${0:+$\'$\'$\'{PATH}\'}"', b""),
+            (b'echo "${0:+$\'$\'$\'((1 + 2))\'}"', b""),
+            (b'echo "${0:+$\'${PATH:-\'value}}"', b""),
+            (b"cat <<EOF\n${0#${0:+$'$\\0tail'(printf child >&2)}}\n"
+             b"EOF\n", b"child"),
+        )
+        literal = (
+            b'echo "${0:+$\'\\$\'(printf child >&2)}"',
+            b'echo "${0:+$\'$\' (printf child >&2)}"',
+            b'echo "${0:+$$\'(printf child >&2)\'}"',
+        )
+        for locale in ("C", "C.UTF-8"):
+            environment = dict(os.environ, BASH_ENV="", ENV="", LC_ALL=locale)
+            for source, diagnostic in joined:
+                with self.subTest(locale=locale, source=source):
+                    self.assertEqual(self.syntax(source), 0)
+                    result = subprocess.run(
+                        [self.bash, "--noprofile", "--norc", "-p", "-c",
+                         b"readonly LC_ALL; " + source,
+                         b"shellclave-phase"], env=environment,
+                        capture_output=True, timeout=10)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stderr, diagnostic)
+                    self.assertEqual(self.classify(source), 4)
+            for source in literal:
+                with self.subTest(locale=locale, source=source):
+                    self.assertEqual(self.syntax(source), 0)
+                    result = subprocess.run(
+                        [self.bash, "--noprofile", "--norc", "-p", "-c",
+                         b"readonly LC_ALL; " + source,
+                         b"shellclave-phase"], env=environment,
+                        capture_output=True, timeout=10)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stderr, b"")
+                    self.assertEqual(self.classify(source), 0)
+
+    def test_empty_quotes_at_translated_boundaries(self):
+        contexts = (
+            (b'echo "${0:+%s}"', True),
+            (b'echo "${0#${0:+%s}}"', False),
+            (b'echo "${0#"${0:+%s}"}"', True),
+            (b'cat <<EOF\n${0#${0:+%s}}\nEOF\n', False),
+            (b'cat <<EOF\n${0#"${0:+%s}"}\nEOF\n', False),
+        )
+        for locale in ("C", "C.UTF-8"):
+            environment = dict(os.environ, BASH_ENV="", ENV="", LC_ALL=locale)
+            for prefix in (b"$", b"<", b">"):
+                for quotes in (b'""', b'""""', b'"\\\n"'):
+                    operand = (b"$'" + prefix + b"'" + quotes +
+                               b"(printf child >&2)")
+                    for template, shell_quoted_default in contexts:
+                        source = template.replace(b"%s", operand)
+                        reconstructed = shell_quoted_default and prefix == b"$"
+                        with self.subTest(locale=locale, source=source):
+                            self.assertEqual(self.syntax(source), 0)
+                            result = subprocess.run(
+                                [self.bash, "--noprofile", "--norc", "-p", "-c",
+                                 b"readonly LC_ALL; " + source,
+                                 b"shellclave-boundary"], env=environment,
+                                capture_output=True, timeout=10)
+                            self.assertEqual(result.returncode, 0, result.stderr)
+                            self.assertEqual(result.stderr,
+                                             b"child" if reconstructed else b"")
+                            self.assertEqual(self.classify(source),
+                                             4 if reconstructed else 0)
+
+    def test_quoted_heredoc_pattern_phases(self):
+        for locale in ("C", "C.UTF-8"):
+            environment = dict(os.environ, BASH_ENV="", ENV="", LC_ALL=locale)
+            for opener, closer in ((b"$(", b")"), (b"`", b"`"),
+                                   (b"<(", b")"), (b">(", b")")):
+                for clipped in (False, True):
+                    fragment = (b"$'" + opener + b"printf child >&2" + closer +
+                                (b"\\0tail" if clipped else b"") + b"'")
+                    inner = b"${0:+${0#" + fragment + b"}}"
+                    for quoted in (False, True):
+                        word = b"${0#" + (b'"' + inner + b'"'
+                                          if quoted else inner) + b"}"
+                        source = b"cat <<EOF\n" + word + b"\nEOF\n"
+                        with self.subTest(locale=locale, source=source):
+                            self.assertEqual(self.syntax(source), 0)
+                            result = subprocess.run(
+                                [self.bash, "--noprofile", "--norc", "-p", "-c",
+                                 b"readonly LC_ALL; " + source,
+                                 b"shellclave-phase"], env=environment,
+                                capture_output=True, timeout=10)
+                            self.assertEqual(result.returncode, 0, result.stderr)
+                            self.assertEqual(result.stderr,
+                                             b"" if quoted else b"child")
+                            self.assertEqual(self.classify(source), 0)
+            source = (b'cat <<EOF\n${0#"${0:+${0#$\'$(printf literal >&2)\'}}"}'
+                      b"${0#${0:+${0#$'$(printf child >&2)'}}}\nEOF\n")
+            result = subprocess.run(
+                [self.bash, "--noprofile", "--norc", "-p", "-c",
+                 b"readonly LC_ALL; " + source, b"shellclave-phase"],
+                env=environment, capture_output=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stderr, b"child")
+            self.assertEqual(self.classify(source), 0)
 
     def test_ansi_decoded_parameter_syntax(self):
         for locale in ("C", "C.UTF-8"):

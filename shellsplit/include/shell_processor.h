@@ -283,7 +283,10 @@ shell_visit_decoded_word(const char *text, size_t length,
 
 /** Visit a complete generic word only when its value is statically determined.
  * Quote removal, escapes, and ANSI-C quotes are decoded, and statically empty
- * process-substitution fragments are elided. Parameter, command, arithmetic,
+ * process-substitution fragments are elided. Unlike the binary decoded-word
+ * helpers, this visitor observes Bash's effective value: the first decoded NUL
+ * discards the remainder of that ANSI-C fragment, and later fragments resume.
+ * Parameter, command, arithmetic,
  * glob, brace, nonempty process, and tilde expansion make the word non-static.
  * A static zero-length payload does not determine whether argv retains the
  * word; quoted empty fragments preserve an argument. This context-free helper
@@ -291,7 +294,7 @@ shell_visit_decoded_word(const char *text, size_t length,
  * Bash's `name=~`); semantic consumers
  * must establish the word's expansion context separately. Returns false for
  * a dynamic, malformed, or invalid word. The visitor and decoded_length have
- * the same semantics as above. */
+ * the same successful-prefix and optional measurement semantics as above. */
 bool shell_visit_static_word(const char *text, size_t length,
                              shell_decoded_word_visitor_t visitor,
                              void *context, size_t *decoded_length)
@@ -317,7 +320,9 @@ shell_write_decoded_word(const char *text, size_t length, char *destination,
 
 /** Measure one isolated shell word for canonical argv. Ordinary shell quotes
  * and escapes are removed, and statically empty process-substitution fragments
- * contribute no bytes. Nonempty executable substitutions and arithmetic
+ * contribute no bytes. ANSI-C values stop at their first decoded NUL within
+ * each fragment; subsequent fragments still contribute bytes. Nonempty
+ * executable substitutions and arithmetic
  * fragments retain their exact source spelling so they remain inspectable and
  * syntactically unambiguous. Measuring zero bytes does not determine argv
  * presence; quoted empty fragments still preserve an argument. */
@@ -362,8 +367,8 @@ shell_write_netargv(const shell_command_info_t *info, char *destination,
 
 /** Encode one command's already-processed arguments as concatenated canonical
  * netstrings in owned byte storage. Payloads, including those decoded from
- * standalone decoded-word helpers, may contain NUL. Complete-command
- * processing rejects NUL-producing ANSI-C source by default. `buffer` must
+ * standalone decoded-word helpers, may contain NUL. Source-derived ANSI-C
+ * fragments use Bash's fragment-local truncation. `buffer` must
  * be empty (initialized to {0} or released with shell_netstring_buffer_free())
  * and is empty on failure.
  * Empty initialized output storage is a caller precondition. Release

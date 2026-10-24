@@ -36,6 +36,17 @@ directories, add large fuzz corpora, or globally suppress warnings. Run the
 ASan/UBSan configuration for changes that touch parsing, memory ownership,
 serialization, or concurrency; run TSan for policy/context synchronization.
 
+Differential parser oracles must provide sufficient source workspace to each
+compared path. Size strict fast-parser and lexical-iterator storage with
+`shell_source_workspace_size()`, and bind scratch for internal syntax and
+semantic predicates. Their Boolean results can reflect scratch exhaustion;
+check that resource outcome separately before interpreting them as syntax or
+support classifications. Dependency-graph fuzz callers must provide both the
+fixed graph prefix from `shell_dep_workspace_size()` and the source-sized tail
+from `shell_source_workspace_size()`. Keep source operations independent so
+cached facts cannot conceal disagreement, and retain deterministic regressions
+outside the bounded smoke seeds.
+
 Host-locale regressions require `localedef` and the `en_US` and `ISO-8859-1`
 locale sources (`locales` on Debian/Ubuntu). Tests generate private locale data
 in the build directory and remove it afterward; they do not change system

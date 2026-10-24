@@ -120,8 +120,120 @@ normalization use the same decoder; raw control bytes in source retain their
 admission restrictions.
 Arithmetic, substring arithmetic and selectors retain their restricted code
 domains even when their text contains ANSI-C quotes. Complete-command semantic
-APIs reject escapes decoding to NUL and locale-dependent non-ASCII `\u`/`\U`
-escapes. Double-quoted parameter operands retain their existing expansion
+APIs apply Bash's fragment-local NUL truncation: `$'before\0after'` contributes
+`before`, `pre$'a\0b'post` contributes `preapost`, and an argument spelled
+`$'\0'` remains present with an empty value. The complete quoted spelling still
+determines lexical boundaries and source offsets. Discarded text contributes
+no substitutions, builtin operands, or pathname bytes. Static file identities
+and Shellgate's static path-fragment checks use the effective concatenated
+value: discarded text cannot match a path fragment, while text after the
+closing quote can. Surviving non-ASCII
+`\u`/`\U` escapes remain locale-dependent and unsupported; an escape after
+the first NUL is discarded with the rest of that fragment.
+Double-quoted parameter defaults and alternates with decoded NUL, such as
+`"${v:-$'a\0b'}"` and `"${v#${u:-$'a\0b'}}"`, remain semantically
+unsupported. Pattern operands establish ordinary quoting for their own
+fragments, but nested defaults and alternates still inherit the enclosing
+double quote. Their translation can truncate parameter syntax and cause a
+runtime Bash substitution error. Source
+classification continues to distinguish recognized grammar from supported
+semantics; this restriction adds no execution or runtime-error model.
+Without decoded NUL, executable substitutions in those nested defaults remain
+visible: `"${v#${u:-$'$(printf child)'}}"` contains a conditional `printf`
+child. The direct pattern `"${v#$'$(printf literal)'}"` and the unquoted
+`${v#${u:-$'$(printf literal)'}}` instead contain literal ANSI-C data.
+The ANSI-C decoding phase also applies inside nested parameter words within
+that fragment. Before a raw `$()` opener, backslash counts congruent
+to 0 or 3 modulo 4 expose the opener after ANSI-C decoding and parameter-word
+expansion; residues 1 and 2 keep it literal. For example,
+`"${v:-$'${w:-\\\$(printf child)}'}"` contains a conditional `printf` child,
+whereas the same spelling with two backslashes leaves the command text literal.
+Nested operands retain their own quote and delimiter rules. After the fragment
+ends, subsequent text uses its containing parameter's ordinary expansion rules.
+That second expansion can concatenate a fragment value with neighboring text
+and form a parameter, arithmetic, command, or process-substitution opener that
+has no contiguous raw source span. Such reconstructed syntax is UNSUPPORTED,
+as is expansion framing that begins in a fragment and closes outside it. For
+example, `"${0:+$'$'(printf child)}"` and `"${0:+$'$'$'{PATH}'}"` are declined
+rather than publishing retained products that omit the decoded expansion.
+Quoted byte content, an escape that protects the candidate opener, or
+intervening whitespace remains a boundary and keeps the text literal. Empty
+double quotes are transparent in an inherited shell double-quoted default:
+`"${0:+$'$'""(printf child)}"` reconstructs a command substitution and is
+unsupported. Ordinary-word and heredoc operands preserve that quote boundary,
+so `"${0#${0:+$'$'""(printf child)}}"` is supported literal text with no child
+command. Empty ANSI-C fragments, including values truncated to empty by a
+decoded NUL, preserve a pending opener in re-expanded words. Detection carries
+only the possible final opener byte while walking fragments forward; it does
+not build decoded source or rescan prefixes.
+Parameter patterns establish ordinary shell-word parsing, which nested defaults
+and alternates inherit until an explicit double quote intervenes. For example,
+`"${0#${0:+$'<(printf child >&2)'}}"` contains a conditional process child;
+the direct double-quoted default `"${0:+$'<(printf literal >&2)'}"` keeps
+the process text literal. Raw process substitutions follow the same parsing
+context. Within re-expanded ANSI-C text, the backslash-residue rule also applies
+to `<(` and `>(`. Explicit double quotes suppress process substitution both
+inside nested operands and directly within the re-expanded ANSI-C value. For
+example, `"${0#${0:+$'"<(printf child >&2)"'}}"` contains no executable child.
+Command and backtick substitutions still expand within that quoted text:
+`"${0#${0:+$'"<(printf literal $(printf child))"'}}"` contains only the inner
+`printf child` command. Closing the quote restores process-substitution
+recognition for subsequent unquoted text in the same value.
+Executable children are parsed independently from their retained raw bodies.
+ANSI-C decoding must leave each such body byte-identical. A body containing
+paired backslashes, for example
+`"${v:-$'$(echo "\\\$(printf child)")'}"`, requires decoded source and is
+unsupported. A single backslash before raw `$()` is unchanged by ANSI-C
+decoding and remains supported; the child's own quoting then determines
+whether its nested dollar is literal. Other semantic restrictions still apply.
+Harmless data escapes outside an executable child's body do not require a
+translated child span. For example,
+`"${0#${0:+$'$(printf child >&2)\n'}}"` retains the `printf` child with its
+original source offsets; the trailing `\n` belongs to the surrounding word.
+The same distinction applies to backtick children and deferred heredoc words.
+An escape such as `\x69` inside `printf ch\x69ld`, however, changes the retained
+child body and remains unsupported, including before a discarded NUL tail.
+An unquoted heredoc body has its own expansion rules, not an enclosing shell
+double quote. A pattern reached directly from that heredoc phase establishes
+ordinary word parsing. A nested default or alternate below that pattern can
+then re-expand ANSI-C text. Re-expansion remains active for the next nested
+operand; a word continues the active path, while consecutive pattern operands
+require another intervening word before they regain it. In an unquoted heredoc,
+`${0#${0:+${0#$'$(printf child >&2)'}}}` therefore contains a conditional
+`printf` child, as do its backtick and process-substitution forms.
+
+The phase depends on every operand boundary, not merely on having a heredoc
+ancestor.
+If an ordinary heredoc parameter word is selected before entering a pattern,
+that pattern and its nested words cannot reactivate deferred heredoc expansion.
+For example, `${0:+${0#${0:+$'$(printf child >&2)'}}}` contains no child. The
+analogous ordinary unquoted or double-quoted shell word also keeps the
+innermost ANSI-C fragment literal.
+
+Within an active pattern-derived phase, decoded NUL truncates its ANSI-C
+fragment without making the enclosing parameter unsupported. The discarded
+tail contributes no child commands; complete substitutions before the NUL
+remain visible. A NUL cutting through an expansion within that prefix remains
+semantically unsupported because its translated source cannot be represented
+by the retained raw span. An explicit double quote around a nested parameter
+stops the deferred heredoc phase from reaching its pattern operands. For
+example, `${0#"${0:+${0#$'$(printf child >&2)'}}"}` in an unquoted heredoc
+contains no executable child. Immediate double-quoted defaults still expand
+their own raw command and backtick substitutions. A pattern within a quoted
+heredoc operand also resets the quote inheritance used by deeper defaults:
+`${0:+"${0#${0:+$'$(printf child >&2)'}}"}` contains no child. The analogous
+ordinary shell word `"${0#${0:+$'$(printf child >&2)'}}"` retains its child.
+An explicit quote introduced after the heredoc pattern establishes its own
+immediate expansion context, so `${0:+"${0#"${0:+$'$(printf child >&2)'}"}"}`
+contains the child. Ordinary raw substitutions in those deeper defaults also
+remain active. These distinctions apply to command, backtick and process
+substitutions, with process substitution suppressed inside an explicit quote.
+Closing the quoted operand
+restores the parent phase for subsequent unquoted operands. The scanner saves
+operand provenance separately from active ANSI-C fragment bounds, preserving
+exact child source spans and restoring the containing context when a scope
+closes.
+Other double-quoted parameter operands retain their existing expansion
 rules; encoded executable syntax requiring decoded source remains unsupported.
 Octal byte escapes are truncated modulo 256: `\444` produces the same `$`
 byte as `\044`. In a double-quoted parameter operand, ANSI-C decoding precedes
@@ -129,8 +241,11 @@ another expansion. A spelling such as `"${v:-$'日本\444(printf child)'}"`
 therefore returns UNSUPPORTED, just like its `\x24` equivalent. This preserves
 the graph's raw-source contract instead of omitting the decoded nested command.
 The same escape in an ordinary ANSI-C word remains literal word data.
-Isolated-word and canonical APIs preserve their documented byte-oriented
-behavior. Locale-translated `$"…"` source is unsupported.
+The standalone decoded-word APIs preserve binary bytes, including decoded NUL
+and its tail. `shell_visit_static_word()` instead exposes the effective static
+Bash value, including fragment truncation. Canonical source-derived argv uses
+that same effective value; directly supplied binary payloads retain their
+explicit lengths. Locale-translated `$"…"` source is unsupported.
 The source classifier also declines legacy `$[...]` arithmetic and function
 declarations, including Bash names beyond ordinary identifiers, rather than
 interpreting their punctuation as supported command-list grammar.

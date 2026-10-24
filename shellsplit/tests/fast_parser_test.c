@@ -1951,17 +1951,17 @@ static void test_source_scanner_contract(void) {
   bool decoded_nul = false;
   bool locale_dependent = false;
   position = 0;
-  test(
-      "ANSI-C NUL probe distinguishes malformed and inactive quotes",
-      shell_source_ansi_c_quote_facts("$'a\\0b'", 7, &position, &decoded_nul,
-                                      &locale_dependent) &&
-          decoded_nul && !locale_dependent && position == 7 &&
-          !shell_source_heredoc_word_has_unsupported_ansi_c(NULL, 0) &&
-          !shell_source_heredoc_word_has_unsupported_ansi_c("\\$'a\\0b'", 8) &&
-          !shell_source_heredoc_word_has_unsupported_ansi_c("\"$'a\\0b'\"",
-                                                            9) &&
-          !shell_source_heredoc_word_has_unsupported_ansi_c("'$'a\\0b''", 9) &&
-          shell_source_heredoc_word_has_unsupported_ansi_c("\\\n$'a\\0b'", 10));
+  test("ANSI-C NUL probe distinguishes malformed and inactive quotes",
+       shell_source_ansi_c_quote_facts("$'a\\0b'", 7, &position, &decoded_nul,
+                                       &locale_dependent) &&
+           decoded_nul && !locale_dependent && position == 7 &&
+           !shell_source_heredoc_word_has_unsupported_ansi_c(NULL, 0) &&
+           !shell_source_heredoc_word_has_unsupported_ansi_c("\\$'a\\0b'", 8) &&
+           !shell_source_heredoc_word_has_unsupported_ansi_c("\"$'a\\0b'\"",
+                                                             9) &&
+           !shell_source_heredoc_word_has_unsupported_ansi_c("'$'a\\0b''", 9) &&
+           !shell_source_heredoc_word_has_unsupported_ansi_c("\\\n$'a\\0b'",
+                                                             10));
   position = 0;
   test("ANSI-C syntax boundary rejects an unfinished quote",
        !shell_source_ansi_c_quote_facts("$'unterminated", 14, &position,

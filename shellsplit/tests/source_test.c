@@ -1,5 +1,8 @@
 #include "../src/shell_depgraph_internal.h"
+#include "../src/shell_processor_internal.h"
 #include "../src/shell_source_internal.h"
+#include "../src/shell_tokenizer_full_internal.h"
+#include "ansi_nul_cases.h"
 #include "ansi_parameter_cases.h"
 #include "control_word_cases.h"
 #include "shell_abstract.h"
@@ -30,6 +33,37 @@
 static shell_source_result_t draft;
 static shell_dep_graph_t graph;
 static shell_dep_limits_t limits;
+
+static void ignore_semantic_token(const shell_token_t *token, void *context) {
+  (void)token;
+  (void)context;
+}
+
+static void ignore_semantic_read(const char *word, uint32_t fd, unsigned kind,
+                                 const char *parameter, size_t parameter_length,
+                                 bool identity, void *context) {
+  (void)word;
+  (void)fd;
+  (void)kind;
+  (void)parameter;
+  (void)parameter_length;
+  (void)identity;
+  (void)context;
+}
+
+static void ignore_semantic_process(const char *word, size_t length,
+                                    void *context) {
+  (void)word;
+  (void)length;
+  (void)context;
+}
+
+static bool inspected_unsupported_semantics(const char *source, size_t length) {
+  unsigned context = 0;
+  return shell_tokenizer_inspect_semantics(
+      source, length, ignore_semantic_token, ignore_semantic_read,
+      ignore_semantic_process, &context);
+}
 
 static void parse(const char *source) {
   int error = shell_dep_graph_parse(source, strlen(source), "/workspace",
@@ -67,6 +101,10 @@ static void heredocs(void) {
       {"cat <<'EOF'\nalpha\r\nEOF\n", "alpha\r\n"},
       {"cat <<E'O'\\F\nalpha\nEOF", "alpha\n"},
       {"cat <<$'E\\x4fF'\nalpha\nEOF\n", "alpha\n"},
+      {"cat <<$'END\\0ignored'\npayload\nEND\n", "payload\n"},
+      {"cat <<$'\\0ignored'\npayload\n\n", "payload\n"},
+      {"cat <<$'E\\0ignored'X$'Y\\0ignored'W\npayload\nEXYW\n", "payload\n"},
+      {"cat <<$'END\\0\\u65e5'\npayload\nEND\n", "payload\n"},
       {"cat <<''\nalpha\n\n", "alpha\n"},
       {"cat <<EOF\n日本 語\nEOF\n", "日本 語\n"},
       {"cat <<EOF\n日本 $((1 + 2)) 語\nEOF\n", "日本 $((1 + 2)) 語\n"},
@@ -1307,9 +1345,9 @@ static void ansi_byte_source(void) {
     CHECK(!draft.prefix_length && !draft.prefix.count);
   }
   static const char *const unsupported[] = {
-      "printf $'日本\\0tail'",       "printf $'日本\\c\x80'",
-      "printf $'日本\\c\\'\\0tail'", "printf $'日本\\u65e5'",
-      "printf $'日本\\c\\'\\u65e5'", "printf $'日本\\U000065e5'",
+      "printf $'日本\\u65e5'",
+      "printf $'日本\\c\\'\\u65e5'",
+      "printf $'日本\\U000065e5'",
   };
   for (size_t c = 0; c < sizeof(unsupported) / sizeof(unsupported[0]); c++) {
     CHECK(shell_dep_graph_parse(unsupported[c], strlen(unsupported[c]),
@@ -1426,6 +1464,1108 @@ static void ansi_control_delimiters(void) {
           SHELL_SOURCE_UNSUPPORTED);
     CHECK(!draft.prefix_length && !draft.prefix.count);
   }
+}
+
+static void ansi_nul_words(void) {
+  for (size_t c = 0; c < sizeof(shellsplit_test_ansi_nul_words) /
+                             sizeof(shellsplit_test_ansi_nul_words[0]);
+       ++c) {
+    const char *word = shellsplit_test_ansi_nul_words[c].word;
+    const char *value = shellsplit_test_ansi_nul_words[c].value;
+    size_t expected = strlen(value), measured, written;
+    char bytes[256], source[512], encoded[512];
+    CHECK(shell_visit_static_word(word, strlen(word), NULL, NULL, &measured) &&
+          measured == expected);
+    CHECK(shell_measure_processed_word(word, strlen(word), &measured) ==
+              SHELL_PROCESS_OK &&
+          measured == expected);
+    CHECK(shell_write_processed_word(word, strlen(word), bytes, expected,
+                                     &written) == SHELL_PROCESS_OK &&
+          written == expected && !memcmp(bytes, value, expected));
+    if (expected) {
+      CHECK(shell_process_write_word_value(word, strlen(word), bytes,
+                                           expected - 1, &written) ==
+                SHELL_PROCESS_EOUTPUT_LIMIT &&
+            !written);
+    }
+    int length = snprintf(source, sizeof(source), "printf %%s %s", word);
+    int size = snprintf(encoded, sizeof(encoded), "6:printf,2:%%s,%zu:%s,",
+                        expected, value);
+    CHECK(length > 0 && (size_t)length < sizeof(source) && size > 0 &&
+          (size_t)size < sizeof(encoded));
+    CHECK(shell_parse_draft(source, (size_t)length, NULL, &draft) ==
+              SHELL_SOURCE_COMPLETE &&
+          draft.header_count == 1);
+    shell_processed_commands_t processed = {0};
+    shell_netstring_buffer_t argv = {0}, commands = {0}, types = {0};
+    size_t count;
+    CHECK(shell_process_commands(source, (size_t)length, NULL, &processed) ==
+              SHELL_PROCESS_OK &&
+          processed.command_count == 1);
+    CHECK(shell_render_netargv_buffer(&processed.commands[0], NULL, &argv) ==
+              SHELL_PROCESS_OK &&
+          argv.length == (size_t)size &&
+          !memcmp(argv.data, encoded, argv.length));
+    CHECK(shell_build_anomaly_netseqs_buffer(source, (size_t)length, NULL,
+                                             &commands, &types,
+                                             &count) == SHELL_PROCESS_OK &&
+          count == 1);
+    shell_netstring_buffer_free(&commands);
+    shell_netstring_buffer_free(&types);
+    shell_netstring_buffer_free(&argv);
+    shell_processed_commands_free(&processed);
+    for (unsigned supplied = 0; supplied < 2; ++supplied) {
+      CHECK((supplied
+                 ? shell_dep_graph_parse_with_fast(source, (size_t)length,
+                                                   "/workspace", &limits,
+                                                   &draft.prefix, &graph)
+                 : shell_dep_graph_parse(source, (size_t)length, "/workspace",
+                                         &limits, &graph)) == SHELL_DEP_OK);
+      CHECK(shell_dep_graph_validate(&graph).valid);
+      unsigned commands_seen = 0;
+      for (uint32_t n = 0; n < graph.node_count; ++n)
+        commands_seen += graph.nodes[n].type == SHELL_NODE_CMD;
+      CHECK(commands_seen == 1);
+      for (uint32_t e = 0; e < graph.edge_count; ++e)
+        CHECK(graph.edges[e].type != SHELL_EDGE_SUBST);
+    }
+  }
+  static const char *const unsupported[] = {
+      "printf \"${v:-$'a\\0b'}\"",
+      "printf \"${v:+$'a\\0b'}\"",
+      "printf \"${v:-$'a\\0$(printf phantom)'}\"",
+      "printf $'\\u65e5\\0tail'",
+      "e$'val\\0ignored' 'printf bypass'",
+      "export $'POSIXLY_CORRECT\\0ignored'=1",
+  };
+  for (size_t c = 0; c < sizeof(unsupported) / sizeof(unsupported[0]); ++c) {
+    CHECK(shell_dep_graph_parse(unsupported[c], strlen(unsupported[c]),
+                                "/workspace", &limits,
+                                &graph) == SHELL_DEP_EPARSE &&
+          !graph.node_count && !graph.edge_count);
+  }
+  static const char *const supported[] = {
+      "printf ${v:-$'a\\0$(printf phantom)'}",
+      "printf \"${v#$'a\\0b'}\"",
+      "printf \"${v/$'a\\0b'/$'c\\0d'}\"",
+      "printf $'a\\0$(printf phantom)'$(printf child)",
+  };
+  for (size_t c = 0; c < sizeof(supported) / sizeof(supported[0]); ++c) {
+    parse(supported[c]);
+    unsigned commands = 0;
+    for (uint32_t n = 0; n < graph.node_count; ++n)
+      commands += graph.nodes[n].type == SHELL_NODE_CMD;
+    CHECK(commands == (c == 3 ? 2u : 1u));
+  }
+  static const char received[] = "printf before; printf $'a\\0\\'tail'";
+  for (size_t cut = 0; cut <= sizeof(received) - 1; ++cut) {
+    shell_source_status_t status =
+        shell_parse_draft(received, cut, NULL, &draft);
+    CHECK(status == SHELL_SOURCE_COMPLETE || status == SHELL_SOURCE_INCOMPLETE);
+    if (draft.prefix_length) {
+      shell_parse_result_t fast;
+      CHECK(shell_parse_fast(received, draft.prefix_length, NULL, &fast) ==
+                SHELL_OK &&
+            shellsplit_test_parse_equal(&fast, &draft.prefix));
+    }
+  }
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+  size_t previous[4] = {0};
+  for (size_t count = 16; count <= 256; count *= 2) {
+    char source[8192] = "printf $'head\\0";
+    size_t length = strlen(source);
+    for (size_t i = 0; i < count; ++i) {
+      static const char discarded[] = "\\u65e5$(printf phantom)";
+      memcpy(source + length, discarded, sizeof(discarded) - 1);
+      length += sizeof(discarded) - 1;
+    }
+    memcpy(source + length, "'tail", 6);
+    length += 5;
+    for (unsigned operation = 0; operation < 4; ++operation) {
+      shellsplit_test_source_scan_reset();
+      if (operation == 0) {
+        shell_parse_result_t fast;
+        CHECK(shell_parse_fast(source, length, NULL, &fast) == SHELL_OK);
+      } else if (operation == 1) {
+        CHECK(shell_parse_draft(source, length, NULL, &draft) ==
+                  SHELL_SOURCE_COMPLETE &&
+              draft.header_count == 1);
+      } else if (operation == 2) {
+        shell_processed_commands_t processed = {0};
+        CHECK(shell_process_commands(source, length, NULL, &processed) ==
+              SHELL_PROCESS_OK);
+        shell_processed_commands_free(&processed);
+      } else {
+        CHECK(shell_dep_graph_parse(source, length, "/workspace", &limits,
+                                    &graph) == SHELL_DEP_OK);
+      }
+      size_t work = shellsplit_test_source_scan_work();
+      CHECK(work <= 256 * length + 4096 &&
+            (!previous[operation] || work <= 2 * previous[operation] + 4096));
+      previous[operation] = work;
+    }
+  }
+#endif
+}
+
+static void nested_ansi_quote_context(void) {
+  for (size_t c = 0; c < sizeof(shellsplit_test_nested_ansi_nul) /
+                             sizeof(shellsplit_test_nested_ansi_nul[0]);
+       ++c) {
+    const char *source = shellsplit_test_nested_ansi_nul[c];
+    size_t length = strlen(source);
+    CHECK(shell_parse_draft(source, length, NULL, &draft) ==
+              SHELL_SOURCE_COMPLETE &&
+          draft.prefix_length == length);
+    shell_parse_result_t fast;
+    CHECK(shell_parse_fast(source, length, NULL, &fast) == SHELL_OK);
+    shell_processed_commands_t processed = {0};
+    CHECK(shell_process_commands(source, length, NULL, &processed) ==
+              SHELL_PROCESS_EPARSE &&
+          !processed.commands && !processed.command_count);
+    shell_netstring_buffer_t commands = {0}, types = {0};
+    size_t count = SIZE_MAX;
+    CHECK(shell_build_anomaly_netseqs_buffer(source, length, NULL, &commands,
+                                             &types,
+                                             &count) == SHELL_PROCESS_EPARSE &&
+          !commands.data && !types.data && !count);
+    for (unsigned supplied = 0; supplied < 2; ++supplied) {
+      CHECK((supplied
+                 ? shell_dep_graph_parse_with_fast(source, length, "/workspace",
+                                                   &limits, &fast, &graph)
+                 : shell_dep_graph_parse(source, length, "/workspace", &limits,
+                                         &graph)) == SHELL_DEP_EPARSE);
+      CHECK(!graph.node_count && !graph.edge_count);
+    }
+  }
+
+  /* The immediate pattern operand uses ordinary quotes, but its nested
+   * default inherits the outer double quote and re-expands the ANSI-C word. */
+  static const char word[] = "\"${v#${u:-$'$(printf child >&2)'}}\"";
+  shell_source_substitution_scan_t scan = {0};
+  size_t start, after;
+  shell_source_substitution_kind_t kind;
+  CHECK(shell_source_next_word_expansion(word, sizeof(word) - 1, &scan, &start,
+                                         &after,
+                                         &kind) == SHELL_SOURCE_SCAN_FOUND);
+  CHECK(kind == SHELL_SOURCE_SUBST_COMMAND && scan.scope.conditional &&
+        start == (size_t)(strstr(word, "$(printf") - word) &&
+        after == start + strlen("$(printf child >&2)") &&
+        scan.scope.guard_start == (size_t)(strstr(word, "$'") - word) + 1 &&
+        scan.scope.guard_parent == (size_t)(strstr(word, "${u") - word) + 1);
+  CHECK(shell_source_next_word_expansion(word, sizeof(word) - 1, &scan, &start,
+                                         &after,
+                                         &kind) == SHELL_SOURCE_SCAN_DONE);
+
+  static const char source[] = "echo \"${v#${u:-$'$(printf child)'}}\"";
+  const char *child_start = strstr(source, "printf child");
+  CHECK(shell_parse_draft(source, sizeof(source) - 1, NULL, &draft) ==
+            SHELL_SOURCE_COMPLETE &&
+        draft.header_count == 2 &&
+        draft.headers[1].words[0].start == (size_t)(child_start - source));
+  for (unsigned supplied = 0; supplied < 2; ++supplied) {
+    CHECK((supplied
+               ? shell_dep_graph_parse_with_fast(source, sizeof(source) - 1,
+                                                 "/workspace", &limits,
+                                                 &draft.prefix, &graph)
+               : shell_dep_graph_parse(source, sizeof(source) - 1, "/workspace",
+                                       &limits, &graph)) == SHELL_DEP_OK);
+    CHECK(shell_dep_graph_validate(&graph).valid);
+    uint32_t child = UINT32_MAX, outer = UINT32_MAX;
+    for (uint32_t n = 0; n < graph.node_count; ++n) {
+      const shell_dep_node_t *node = &graph.nodes[n];
+      if (node->type != SHELL_NODE_CMD)
+        continue;
+      if (node->cmd.tokens[0] == child_start) {
+        child = n;
+        CHECK(node->cmd.token_count == 2 && node->cmd.token_lens[0] == 6 &&
+              node->cmd.token_lens[1] == 5 &&
+              node->cmd.tokens[1] == child_start + 7);
+      } else if (node->cmd.tokens[0] == source)
+        outer = n;
+    }
+    CHECK(child != UINT32_MAX && outer != UINT32_MAX);
+    bool stderr_route = false, captured = false;
+    for (uint32_t e = 0; e < graph.edge_count; ++e) {
+      const shell_dep_edge_t *edge = &graph.edges[e];
+      if (edge->from == child && edge->type == SHELL_EDGE_WRITE) {
+        const shell_dep_node_t *target = &graph.nodes[edge->to];
+        stderr_route |= edge->source_fd == 2 && target->type == SHELL_NODE_FD &&
+                        target->fd.number == 2;
+      }
+      captured |= edge->type == SHELL_EDGE_SUBST && edge->from == child &&
+                  edge->to == outer && edge->source_fd == 1 &&
+                  edge->target_fd == SHELL_DEP_FD_NONE &&
+                  edge->flags == SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD;
+    }
+    CHECK(stderr_route && captured);
+  }
+
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+  for (unsigned form = 0; form < 6; ++form) {
+    bool heredoc = form == 2 || form == 3 || form == 5;
+    bool rejected = form == 1 || form == 3;
+    size_t previous[4] = {0};
+    for (size_t depth = 4; depth <= 32; depth *= 2) {
+      char nested[4096];
+      strcpy(nested, heredoc ? "cat <<EOF\n" : "printf %s \"");
+      size_t length = strlen(nested);
+      for (size_t i = 0; i < depth; ++i) {
+        memcpy(nested + length, "${v#", 4);
+        length += 4;
+      }
+      const char *leaf = form == 1 ? "${u:-$'a\\0" : "${u:-$'";
+      memcpy(nested + length, leaf, strlen(leaf));
+      length += strlen(leaf);
+      if (form == 3 || form >= 4) {
+        for (size_t i = 0; i < depth / 2; ++i) {
+          memcpy(nested + length, "${w:-", 5);
+          length += 5;
+        }
+      }
+      memset(nested + length, 'x', depth * 32);
+      length += depth * 32;
+      if (form >= 4) {
+        /* Grow nesting and the translated run together. An ancestor search
+         * per backslash would make this work quadratic in source length. */
+        memset(nested + length, '\\', depth * 8 + 3);
+        length += depth * 8 + 3;
+      }
+      const char *suffix = form == 2   ? "$(printf child)\\0$(printf phantom)"
+                           : form == 3 ? "\\0"
+                                       : "$(printf child)";
+      memcpy(nested + length, suffix, strlen(suffix));
+      length += strlen(suffix);
+      if (form == 3 || form >= 4) {
+        memset(nested + length, '}', depth / 2);
+        length += depth / 2;
+      }
+      if (form == 5) {
+        const char *tail = "\\0$(printf phantom)";
+        memcpy(nested + length, tail, strlen(tail));
+        length += strlen(tail);
+      }
+      memcpy(nested + length, "'}", 2);
+      length += 2;
+      memset(nested + length, '}', depth);
+      length += depth;
+      strcpy(nested + length, heredoc ? "\nEOF\n" : "\"");
+      length += strlen(nested + length);
+      for (unsigned operation = 0; operation < 4; ++operation) {
+        shellsplit_test_source_scan_reset();
+        if (operation == 0) {
+          shell_parse_result_t fast;
+          CHECK(shell_parse_fast(nested, length, NULL, &fast) == SHELL_OK);
+        } else if (operation == 1) {
+          shell_source_status_t status =
+              shell_parse_draft(nested, length, NULL, &draft);
+          if (status != SHELL_SOURCE_COMPLETE ||
+              draft.header_count != (rejected ? 1u : 2u))
+            fprintf(stderr,
+                    "nested ANSI-C form=%u depth=%zu status=%d headers=%u\n",
+                    form, depth, status, draft.header_count);
+          CHECK(status == SHELL_SOURCE_COMPLETE &&
+                draft.header_count == (rejected ? 1u : 2u));
+        } else if (operation == 2) {
+          shell_processed_commands_t processed = {0};
+          CHECK(shell_process_commands(nested, length, NULL, &processed) ==
+                (rejected ? SHELL_PROCESS_EPARSE : SHELL_PROCESS_OK));
+          shell_processed_commands_free(&processed);
+        } else {
+          CHECK(shell_dep_graph_parse(nested, length, "/workspace", &limits,
+                                      &graph) ==
+                (rejected ? SHELL_DEP_EPARSE : SHELL_DEP_OK));
+        }
+        size_t work = shellsplit_test_source_scan_work();
+        CHECK(work <= 256 * length + 4096 &&
+              (!previous[operation] || work <= 2 * previous[operation] + 4096));
+        previous[operation] = work;
+      }
+    }
+  }
+#endif
+}
+
+static void nested_ansi_escape_context(void) {
+  static const char *const supported_semantics[] = {
+      "printf $'日本\\t語'",
+      "echo \"${v:-$'$(echo \"\\$(printf child)\")'}\"",
+  };
+  for (size_t c = 0;
+       c < sizeof(supported_semantics) / sizeof(supported_semantics[0]); ++c) {
+    const char *source = supported_semantics[c];
+    size_t length = strlen(source);
+    CHECK(!shell_tokenizer_has_unsupported_semantics(source, length));
+    CHECK(!inspected_unsupported_semantics(source, length));
+  }
+  static const char *const syntax_owned[] = {
+      "echo \"unfinished",
+      "echo )",
+  };
+  for (size_t c = 0; c < sizeof(syntax_owned) / sizeof(syntax_owned[0]); ++c) {
+    const char *source = syntax_owned[c];
+    size_t length = strlen(source);
+    CHECK(!shell_tokenizer_has_unsupported_semantics(source, length));
+    CHECK(!inspected_unsupported_semantics(source, length));
+  }
+  for (size_t c = 0;
+       c < sizeof(shellsplit_test_ansi_translated_children) /
+               sizeof(shellsplit_test_ansi_translated_children[0]);
+       ++c) {
+    const char *source = shellsplit_test_ansi_translated_children[c];
+    size_t length = strlen(source);
+    CHECK(shell_tokenizer_has_unsupported_semantics(source, length));
+    CHECK(inspected_unsupported_semantics(source, length));
+    CHECK(shell_parse_draft(source, length, NULL, &draft) ==
+              SHELL_SOURCE_UNSUPPORTED &&
+          !draft.prefix_length && !draft.prefix.count);
+    shell_parse_result_t fast;
+    CHECK(shell_parse_fast(source, length, NULL, &fast) == SHELL_OK);
+    shell_processed_commands_t processed = {0};
+    CHECK(shell_process_commands(source, length, NULL, &processed) ==
+              SHELL_PROCESS_EPARSE &&
+          !processed.commands && !processed.command_count);
+    for (unsigned supplied = 0; supplied < 2; ++supplied) {
+      CHECK((supplied
+                 ? shell_dep_graph_parse_with_fast(source, length, "/workspace",
+                                                   &limits, &fast, &graph)
+                 : shell_dep_graph_parse(source, length, "/workspace", &limits,
+                                         &graph)) == SHELL_DEP_EPARSE);
+      CHECK(!graph.node_count && !graph.edge_count);
+    }
+  }
+  for (size_t c = 0; c < sizeof(shellsplit_test_ansi_translated_joins) /
+                             sizeof(shellsplit_test_ansi_translated_joins[0]);
+       ++c) {
+    const char *source = shellsplit_test_ansi_translated_joins[c];
+    size_t length = strlen(source);
+    CHECK(shell_tokenizer_has_unsupported_semantics(source, length));
+    CHECK(inspected_unsupported_semantics(source, length));
+    CHECK(shell_parse_draft(source, length, NULL, &draft) ==
+              SHELL_SOURCE_UNSUPPORTED &&
+          !draft.prefix_length && !draft.prefix.count);
+    shell_parse_result_t fast;
+    CHECK(shell_parse_fast(source, length, NULL, &fast) == SHELL_OK);
+    shell_processed_commands_t processed = {0};
+    CHECK(shell_process_commands(source, length, NULL, &processed) ==
+              SHELL_PROCESS_EPARSE &&
+          !processed.commands && !processed.command_count);
+    for (unsigned supplied = 0; supplied < 2; ++supplied) {
+      CHECK((supplied
+                 ? shell_dep_graph_parse_with_fast(source, length, "/workspace",
+                                                   &limits, &fast, &graph)
+                 : shell_dep_graph_parse(source, length, "/workspace", &limits,
+                                         &graph)) == SHELL_DEP_EPARSE);
+      CHECK(!graph.node_count && !graph.edge_count);
+    }
+  }
+  {
+    const char *source = "echo \"${0:+$'$'(printf child >&2)}\"";
+    const char *open = strchr(source, '(');
+    CHECK(open &&
+          shell_parse_draft(source, (size_t)(open - source), NULL, &draft) ==
+              SHELL_SOURCE_INCOMPLETE &&
+          shell_parse_draft(source, (size_t)(open - source) + 1, NULL,
+                            &draft) == SHELL_SOURCE_UNSUPPORTED &&
+          !draft.prefix_length && !draft.prefix.count);
+  }
+  static const struct {
+    const char *body;
+    bool translated;
+  } child_bodies[] = {
+      {"", false},
+      {"echo literal", false},
+      {"echo \"\\$(printf child)\"", false},
+      {"echo \"\\\\$(printf child)\"", true},
+      {"echo \"\\\\\\$(printf child)\"", true},
+      {"printf \\n", true},
+      {"printf \\u65e5", true},
+  };
+  for (size_t c = 0; c < sizeof(child_bodies) / sizeof(child_bodies[0]); ++c)
+    CHECK(shell_source_ansi_child_needs_translation(
+              child_bodies[c].body, 0, strlen(child_bodies[c].body)) ==
+          child_bodies[c].translated);
+
+  for (size_t c = 0; c < sizeof(shellsplit_test_ansi_nested_runs) /
+                             sizeof(shellsplit_test_ansi_nested_runs[0]);
+       ++c) {
+    const char *source = shellsplit_test_ansi_nested_runs[c].source;
+    unsigned expected = shellsplit_test_ansi_nested_runs[c].children;
+    size_t length = strlen(source);
+    bool heredoc = source[0] == 'c';
+    const char *word = heredoc ? strchr(source, '\n') + 1 : source + 5;
+    size_t word_length =
+        heredoc ? (size_t)(strstr(word, "\nEOF") - word) : strlen(word);
+    const char *opener = strstr(word, "$(printf child");
+    size_t child_length = (size_t)(strchr(opener, ')') + 1 - opener);
+    shell_source_substitution_scan_t scan = {0};
+    scan.scope.heredoc = heredoc;
+    scan.scope.suppress_process = heredoc;
+    unsigned children = 0;
+    size_t start, after;
+    shell_source_substitution_kind_t kind;
+    shell_source_scan_status_t status;
+    while ((status = shell_source_next_word_expansion(word, word_length, &scan,
+                                                      &start, &after, &kind)) ==
+           SHELL_SOURCE_SCAN_FOUND) {
+      CHECK(kind == SHELL_SOURCE_SUBST_COMMAND && scan.scope.conditional &&
+            scan.scope.guard_start && scan.scope.guard_parent &&
+            start == (size_t)(opener - word) && after == start + child_length);
+      children++;
+    }
+    CHECK(status == SHELL_SOURCE_SCAN_DONE && !scan.scope_count &&
+          !scan.has_ansi_nul && children == expected);
+    CHECK(shell_parse_draft(source, length, NULL, &draft) ==
+              SHELL_SOURCE_COMPLETE &&
+          draft.prefix_length == length && draft.header_count == 1 + expected);
+    if (expected)
+      CHECK(draft.headers[1].words[0].start ==
+            (size_t)(strstr(source, "printf child") - source));
+    shell_processed_commands_t processed = {0};
+    CHECK(shell_process_commands(source, length, NULL, &processed) ==
+          SHELL_PROCESS_OK);
+    shell_processed_commands_free(&processed);
+    for (unsigned supplied = 0; supplied < 2; ++supplied) {
+      CHECK(
+          (supplied
+               ? shell_dep_graph_parse_with_fast(source, length, "/workspace",
+                                                 &limits, &draft.prefix, &graph)
+               : shell_dep_graph_parse(source, length, "/workspace", &limits,
+                                       &graph)) == SHELL_DEP_OK);
+      CHECK(shell_dep_graph_validate(&graph).valid);
+      uint32_t outer = UINT32_MAX, child = UINT32_MAX, document = UINT32_MAX;
+      unsigned commands = 0;
+      for (uint32_t n = 0; n < graph.node_count; ++n) {
+        const shell_dep_node_t *node = &graph.nodes[n];
+        if (node->type == SHELL_NODE_DOC && node->doc.kind == SHELL_DOC_HEREDOC)
+          document = n;
+        if (node->type != SHELL_NODE_CMD)
+          continue;
+        commands++;
+        if (node->cmd.tokens[0] == source)
+          outer = n;
+        else {
+          CHECK(node->cmd.tokens[0] == strstr(source, "printf child") &&
+                node->cmd.token_count == 2 && node->cmd.token_lens[0] == 6 &&
+                node->cmd.token_lens[1] == 5);
+          child = n;
+        }
+      }
+      CHECK(commands == 1 + expected && outer != UINT32_MAX &&
+            (child != UINT32_MAX) == (expected != 0));
+      bool captured = false, stderr_route = false, stdout_route = false;
+      for (uint32_t e = 0; e < graph.edge_count; ++e) {
+        const shell_dep_edge_t *edge = &graph.edges[e];
+        captured |= edge->type == SHELL_EDGE_SUBST && edge->from == child &&
+                    edge->to == (heredoc ? document : outer) &&
+                    edge->source_fd == 1 &&
+                    edge->flags == SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD;
+        if (edge->type == SHELL_EDGE_WRITE && edge->from == child &&
+            (edge->source_fd == 1 || edge->source_fd == 2)) {
+          const shell_dep_node_t *target = &graph.nodes[edge->to];
+          bool to_stderr =
+              target->type == SHELL_NODE_FD && target->fd.number == 2;
+          stderr_route |= edge->source_fd == 2 && to_stderr;
+          stdout_route |= edge->source_fd == 1 && to_stderr;
+        }
+      }
+      CHECK(captured ==
+                (expected &&
+                 !shellsplit_test_ansi_nested_runs[c].stdout_to_stderr) &&
+            stdout_route ==
+                (expected &&
+                 shellsplit_test_ansi_nested_runs[c].stdout_to_stderr) &&
+            stderr_route == (expected != 0));
+    }
+  }
+
+  /* Three slashes expose the first child after ANSI decoding. Outside that
+   * fragment two slashes expose the next child using ordinary shell rules.
+   * Exercise restoration both within the parameter and after its close. */
+  static const char *const restored[] = {
+      "echo \"${v:-$'${w:-\\\\\\$(printf before)}'\\\\$(printf after)}\"",
+      ("cat <<EOF\n${v#${u:-$'${w:-\\\\\\$(printf before)}\\0tail'"
+       "\\\\$(printf after)}}\nEOF\n"),
+      "echo \"${v#${u:-$'${w:-\\\\\\$(printf before)}'}}\" \\\\$(printf after)",
+      "cat <<EOF\n${0#${0:+${0#$'$(printf before)'}}}$(printf after)\nEOF\n",
+      "echo \"${0#${0:+$'<(printf before)'}}\" $(printf after)",
+  };
+  for (size_t c = 0; c < sizeof(restored) / sizeof(restored[0]); ++c) {
+    const char *source = restored[c];
+    size_t length = strlen(source);
+    CHECK(shell_parse_draft(source, length, NULL, &draft) ==
+              SHELL_SOURCE_COMPLETE &&
+          draft.header_count == 3);
+    CHECK(draft.headers[1].words[0].start ==
+              (size_t)(strstr(source, "printf before") - source) &&
+          draft.headers[2].words[0].start ==
+              (size_t)(strstr(source, "printf after") - source));
+    for (unsigned supplied = 0; supplied < 2; ++supplied) {
+      CHECK(
+          (supplied
+               ? shell_dep_graph_parse_with_fast(source, length, "/workspace",
+                                                 &limits, &draft.prefix, &graph)
+               : shell_dep_graph_parse(source, length, "/workspace", &limits,
+                                       &graph)) == SHELL_DEP_OK);
+      unsigned commands = 0;
+      for (uint32_t n = 0; n < graph.node_count; ++n)
+        commands += graph.nodes[n].type == SHELL_NODE_CMD;
+      CHECK(commands == 3 && shell_dep_graph_validate(&graph).valid);
+    }
+  }
+
+  /* One unknown escape survives ANSI decoding unchanged. The child's own
+   * double quote still protects its literal dollar: no grandchild exists. */
+  static const char *const unchanged_children[] = {
+      "echo \"${v:-$'$(echo \"\\$(printf child)\")'}\"",
+      "cat <<EOF\n${v#${u:-$'$(echo \"\\$(printf child)\")\\0tail'}}\nEOF\n",
+  };
+  for (size_t c = 0;
+       c < sizeof(unchanged_children) / sizeof(unchanged_children[0]); ++c) {
+    const char *source = unchanged_children[c];
+    size_t length = strlen(source);
+    CHECK(shell_parse_draft(source, length, NULL, &draft) ==
+              SHELL_SOURCE_COMPLETE &&
+          draft.header_count == 2);
+    for (unsigned supplied = 0; supplied < 2; ++supplied) {
+      CHECK(
+          (supplied
+               ? shell_dep_graph_parse_with_fast(source, length, "/workspace",
+                                                 &limits, &draft.prefix, &graph)
+               : shell_dep_graph_parse(source, length, "/workspace", &limits,
+                                       &graph)) == SHELL_DEP_OK);
+      unsigned commands = 0;
+      for (uint32_t n = 0; n < graph.node_count; ++n) {
+        const shell_dep_node_t *node = &graph.nodes[n];
+        if (node->type == SHELL_NODE_CMD) {
+          commands++;
+          CHECK(node->cmd.tokens[0] == source ||
+                node->cmd.tokens[0] == strstr(source, "$(echo") + 2);
+        }
+      }
+      CHECK(commands == 2 && shell_dep_graph_validate(&graph).valid);
+    }
+  }
+
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+  /* An outer ANSI-C pass checks its first-level child body once, including
+   * all nested commands. It must not repeat that walk for each descendant. */
+  for (unsigned form = 0; form < 4; ++form) {
+    size_t previous = 0;
+    bool heredoc = form >= 2, translated = (form & 1u) != 0;
+    for (size_t depth = 4; depth <= 32; depth *= 2) {
+      char word[4096];
+      strcpy(word, heredoc ? "${v#${u:-$'" : "\"${v:-$'");
+      size_t length = strlen(word), child_start = length;
+      for (size_t d = 0; d < depth; ++d) {
+        memcpy(word + length, "$(echo ", 7);
+        length += 7;
+      }
+      memset(word + length, 'x', depth * 32);
+      length += depth * 32;
+      if (translated) {
+        const char *literal = "\"\\\\$(printf child)\"";
+        memcpy(word + length, literal, strlen(literal));
+        length += strlen(literal);
+      }
+      memset(word + length, ')', depth);
+      length += depth;
+      size_t child_after = length;
+      strcpy(word + length, heredoc ? "\\0tail'}}" : "'}\"");
+      length += strlen(word + length);
+      shell_source_substitution_scan_t scan = {0};
+      scan.scope.heredoc = heredoc;
+      scan.scope.suppress_process = heredoc;
+      size_t start, after;
+      shell_source_substitution_kind_t kind;
+      shellsplit_test_source_scan_reset();
+      shell_source_scan_status_t status = shell_source_next_word_expansion(
+          word, length, &scan, &start, &after, &kind);
+      if (translated) {
+        CHECK(status == SHELL_SOURCE_SCAN_UNSUPPORTED && !scan.has_ansi_nul);
+      } else {
+        CHECK(status == SHELL_SOURCE_SCAN_FOUND &&
+              kind == SHELL_SOURCE_SUBST_COMMAND && start == child_start &&
+              after == child_after);
+        CHECK(shell_source_next_word_expansion(word, length, &scan, &start,
+                                               &after, &kind) ==
+              SHELL_SOURCE_SCAN_DONE);
+      }
+      size_t work = shellsplit_test_source_scan_work();
+      CHECK(work <= 32 * length + 512 &&
+            (!previous || work <= 2 * previous + 1024));
+      previous = work;
+    }
+  }
+#endif
+}
+
+static void parameter_word_phases(void) {
+  shell_dep_graph_t *ordinary = malloc(sizeof(*ordinary));
+  CHECK(ordinary);
+  for (size_t c = 0; c < sizeof(shellsplit_test_ansi_phase_cases) /
+                             sizeof(shellsplit_test_ansi_phase_cases[0]);
+       ++c) {
+    const char *source = shellsplit_test_ansi_phase_cases[c].source;
+    unsigned expected = shellsplit_test_ansi_phase_cases[c].children;
+    char opener = shellsplit_test_ansi_phase_cases[c].kind;
+    bool heredoc = source[0] == 'c';
+    const char *word = heredoc ? strchr(source, '\n') + 1 : source + 5;
+    size_t length = strlen(source);
+    size_t word_length =
+        heredoc ? (size_t)(strstr(word, "\nEOF") - word) : strlen(word);
+    const char *body = strstr(source, "printf child");
+    const char *closing = strchr(body, opener == '`' ? '`' : ')');
+    shell_source_substitution_kind_t expected_kind =
+        opener == '$'   ? SHELL_SOURCE_SUBST_COMMAND
+        : opener == '`' ? SHELL_SOURCE_SUBST_BACKTICK
+        : opener == '<' ? SHELL_SOURCE_SUBST_PROCESS_INPUT
+                        : SHELL_SOURCE_SUBST_PROCESS_OUTPUT;
+    shell_source_substitution_scan_t scan = {
+        .scope = {.heredoc = heredoc, .suppress_process = heredoc}};
+    size_t start, after;
+    shell_source_substitution_kind_t kind;
+    shell_source_scan_status_t status;
+    unsigned children = 0;
+    while ((status = shell_source_next_word_expansion(word, word_length, &scan,
+                                                      &start, &after, &kind)) ==
+           SHELL_SOURCE_SCAN_FOUND) {
+      CHECK(kind == expected_kind && scan.scope.conditional &&
+            scan.scope.guard_start &&
+            word + start == body - (opener == '`' ? 1 : 2) &&
+            word + after == closing + 1);
+      children++;
+    }
+    if (status != SHELL_SOURCE_SCAN_DONE || scan.scope_count ||
+        scan.has_ansi_nul || children != expected)
+      fprintf(stderr, "parameter phase case %zu: status=%d children=%u: %s\n",
+              c, status, children, source);
+    CHECK(status == SHELL_SOURCE_SCAN_DONE && !scan.scope_count &&
+          !scan.has_ansi_nul && children == expected);
+    CHECK(!shell_tokenizer_has_unsupported_semantics(source, length) &&
+          !inspected_unsupported_semantics(source, length));
+    CHECK(shell_parse_draft(source, length, NULL, &draft) ==
+              SHELL_SOURCE_COMPLETE &&
+          draft.prefix_length == length && draft.header_count == 1 + expected);
+    uint32_t features = 0;
+    for (uint32_t r = 0; r < draft.prefix.count; ++r)
+      features |= draft.prefix.cmds[r].features;
+    CHECK(((features & SHELL_FEAT_SUBSHELL) != 0) ==
+              (expected && (opener == '$' || opener == '`')) &&
+          ((features & SHELL_FEAT_PROCESS_SUB) != 0) ==
+              (expected && (opener == '<' || opener == '>')));
+    if (expected)
+      CHECK(draft.headers[1].words[0].start == (size_t)(body - source) &&
+            draft.headers[1].words[0].length == 6);
+    shell_processed_commands_t processed = {0};
+    CHECK(shell_process_commands(source, length, NULL, &processed) ==
+              SHELL_PROCESS_OK &&
+          processed.command_count == 1);
+    shell_processed_commands_free(&processed);
+    CHECK(shell_dep_graph_parse(source, length, "/workspace", &limits,
+                                ordinary) == SHELL_DEP_OK);
+    CHECK(shell_dep_graph_parse_with_fast(source, length, "/workspace", &limits,
+                                          &draft.prefix,
+                                          &graph) == SHELL_DEP_OK);
+    CHECK(shellsplit_test_graph_equal(ordinary, &graph) &&
+          shell_dep_graph_validate(&graph).valid);
+    unsigned commands = 0;
+    uint32_t child = UINT32_MAX;
+    for (uint32_t n = 0; n < graph.node_count; ++n) {
+      const shell_dep_node_t *node = &graph.nodes[n];
+      if (node->type == SHELL_NODE_CMD) {
+        commands++;
+        if (node->cmd.tokens[0] == body) {
+          child = n;
+          CHECK(node->cmd.token_count == 2 && node->cmd.token_lens[0] == 6 &&
+                node->cmd.token_lens[1] == 5 &&
+                node->cmd.tokens[1] == body + 7);
+        }
+      }
+    }
+    CHECK(commands == 1 + expected && (child != UINT32_MAX) == (expected != 0));
+    bool captured = false, stderr_route = false;
+    for (uint32_t e = 0; e < graph.edge_count; ++e) {
+      const shell_dep_edge_t *edge = &graph.edges[e];
+      if (edge->from != child)
+        continue;
+      if (edge->type == SHELL_EDGE_SUBST) {
+        captured = true;
+        const shell_dep_node_t *target = &graph.nodes[edge->to];
+        CHECK(edge->source_fd == 1 &&
+              edge->flags ==
+                  (opener == '<' ? 0 : SHELL_DEP_EDGE_FLAG_SUBST_SHELL_WORD));
+        CHECK(heredoc ? target->type == SHELL_NODE_DOC &&
+                            target->doc.kind == SHELL_DOC_HEREDOC
+                      : target->type == SHELL_NODE_CMD &&
+                            target->cmd.tokens[0] == source);
+      }
+      if (edge->type == SHELL_EDGE_WRITE && edge->source_fd == 2) {
+        const shell_dep_node_t *target = &graph.nodes[edge->to];
+        stderr_route |= target->type == SHELL_NODE_FD && target->fd.number == 2;
+      }
+    }
+    CHECK(captured == shellsplit_test_ansi_phase_cases[c].captured_stdout &&
+          stderr_route == (expected != 0));
+  }
+  free(ordinary);
+  static const char *const received[] = {
+      "echo before; cat <<EOF\n${0#${0:+${0#$'$(printf child)'}}}\nEOF\n",
+      ("echo before; cat <<EOF\n${0#${0:+${0#$'$(printf "
+       "child)\\0tail'}}}\nEOF\n"),
+      "echo before; echo \"${0#${0:+$'<(printf child)'}}\"",
+      "echo before; echo \"${0#${0:+$'$'\"\"(printf child >&2)}}\"",
+      "echo before; cat <<EOF\n${0#\"${0:+${0#$'$(printf child "
+      ">&2)'}}\"}\nEOF\n",
+      "echo before; cat <<EOF\n${0:+${0#${0:+$'$(printf child "
+      ">&2)'}}}\nEOF\n",
+      "echo before; cat <<EOF\n${0:+\"${0#${0:+$'$(printf child "
+      ">&2)'}}\"}\nEOF\n",
+      "echo before; cat <<EOF\n${0:+\"${0#\"${0:+$'$(printf child "
+      ">&2)'}\"}\"}\nEOF\n",
+      ("echo before; cat <<EOF\n${0:+\"${0#${0:+$'$(printf literal "
+       ">&2)'}}\"}${0#${0:+${0#$'$(printf child >&2)'}}}\nEOF\n"),
+      ("echo before; cat <<EOF\n${0:+${0#${0:+$'$(printf literal "
+       ">&2)'}}}${0#${0:+${0#$'$(printf child >&2)'}}}\nEOF\n"),
+  };
+  for (size_t c = 0; c < sizeof(received) / sizeof(received[0]); ++c) {
+    for (size_t cut = 0; cut <= strlen(received[c]); ++cut) {
+      shell_source_status_t status =
+          shell_parse_draft(received[c], cut, NULL, &draft);
+      CHECK(status == SHELL_SOURCE_COMPLETE ||
+            status == SHELL_SOURCE_INCOMPLETE);
+      if (draft.prefix_length) {
+        shell_parse_result_t fast;
+        CHECK(shell_parse_fast(received[c], draft.prefix_length, NULL, &fast) ==
+                  SHELL_OK &&
+              shellsplit_test_parse_equal(&fast, &draft.prefix));
+      }
+    }
+  }
+#ifdef SHELLSPLIT_TEST_SOURCE_SCANS
+  /* The reset at each heredoc pattern must use the saved local phase rather
+   * than search increasingly deep ancestors for a preceding explicit quote. */
+  {
+    size_t previous = 0;
+    for (size_t depth = 4; depth * 2 + 1 <= SHELL_MAX_SUBCOMMANDS; depth *= 2) {
+      char word[4096];
+      strcpy(word, "${0:+\"");
+      size_t length = strlen(word);
+      for (size_t d = 0; d < depth; ++d) {
+        memcpy(word + length, "${0#${0:+", 9);
+        length += 9;
+      }
+      const char *literal = "$'$(printf child >&2)\\0tail'";
+      memcpy(word + length, literal, strlen(literal));
+      length += strlen(literal);
+      for (size_t d = 0; d < depth; ++d) {
+        memcpy(word + length, "}}", 2);
+        length += 2;
+      }
+      memcpy(word + length, "\"}", 2);
+      length += 2;
+      shell_source_substitution_scan_t scan = {
+          .scope = {.heredoc = true, .suppress_process = true}};
+      size_t start, after;
+      shell_source_substitution_kind_t kind;
+      shellsplit_test_source_scan_reset();
+      CHECK(shell_source_next_word_expansion(word, length, &scan, &start,
+                                             &after,
+                                             &kind) == SHELL_SOURCE_SCAN_DONE &&
+            !scan.scope_count && !scan.has_ansi_nul);
+      size_t work = shellsplit_test_source_scan_work();
+      CHECK(work <= 64 * length + 1024 &&
+            (!previous || work <= 2 * previous + 1024));
+      previous = work;
+    }
+  }
+  /* Grow both nested phase transitions and escaped opener runs. Stack saved
+   * phase state must not require an ancestor search or a suffix reparse. */
+  for (unsigned form = 0; form < 4; ++form) {
+    size_t previous = 0;
+    for (size_t depth = 4; depth * 2 + 1 <= SHELL_MAX_SUBCOMMANDS; depth *= 2) {
+      char word[4096];
+      size_t length = 0;
+      for (size_t d = 0; d < depth; ++d) {
+        memcpy(word + length, "${0#${0:+", 9);
+        length += 9;
+      }
+      const char *pattern = "${0#$'";
+      memcpy(word + length, pattern, strlen(pattern));
+      length += strlen(pattern);
+      memset(word + length, '\\', depth * 4 + (form & 1u ? 2 : 3));
+      length += depth * 4 + (form & 1u ? 2 : 3);
+      size_t child = length;
+      const char *command =
+          form >= 2 ? "<(printf child >&2)" : "$(printf child >&2)";
+      memcpy(word + length, command, strlen(command));
+      length += strlen(command);
+      size_t child_after = length;
+      memcpy(word + length, "\\0tail'}", 8);
+      length += 8;
+      for (size_t d = 0; d < depth; ++d) {
+        memcpy(word + length, "}}", 2);
+        length += 2;
+      }
+      shell_source_substitution_scan_t scan = {
+          .scope = {.heredoc = true, .suppress_process = true}};
+      size_t start, after;
+      shell_source_substitution_kind_t kind;
+      shellsplit_test_source_scan_reset();
+      shell_source_scan_status_t status = shell_source_next_word_expansion(
+          word, length, &scan, &start, &after, &kind);
+      if (!(form & 1u)) {
+        CHECK(status == SHELL_SOURCE_SCAN_FOUND && start == child &&
+              after == child_after &&
+              kind == (form >= 2 ? SHELL_SOURCE_SUBST_PROCESS_INPUT
+                                 : SHELL_SOURCE_SUBST_COMMAND));
+        status = shell_source_next_word_expansion(word, length, &scan, &start,
+                                                  &after, &kind);
+      }
+      CHECK(status == SHELL_SOURCE_SCAN_DONE && !scan.has_ansi_nul &&
+            !scan.scope_count);
+      size_t work = shellsplit_test_source_scan_work();
+      CHECK(work <= 64 * length + 1024 &&
+            (!previous || work <= 2 * previous + 1024));
+      previous = work;
+    }
+  }
+  /* Harmless escapes and quoted process-looking text must not trigger a
+   * child-body rescan for each surrounding byte. Repeated quotes restore the
+   * context of the one real child. Framing and semantic consumers stay linear.
+   */
+  for (unsigned form = 0; form < 8; ++form) {
+    size_t previous[4] = {0};
+    bool heredoc = (form & 2u) != 0;
+    for (size_t count = 16; count <= 256; count *= 2) {
+      char source[16384];
+      const char *prefix =
+          heredoc ? "cat <<EOF\n${0#${0:+${0#$'" : "echo \"${0#${0:+$'";
+      size_t length = strlen(prefix);
+      memcpy(source, prefix, length);
+      for (unsigned side = 0; side < 2; ++side) {
+        for (size_t i = 0; i < count; ++i) {
+          const char *data =
+              form & 4u ? "\"<(literal)>(literal)\"" : "\\n\\t\\x61";
+          memcpy(source + length, data, strlen(data));
+          length += strlen(data);
+        }
+        if (!side) {
+          const char *child =
+              form & 1u ? "`printf child >&2`" : "$(printf child >&2)";
+          memcpy(source + length, child, strlen(child));
+          length += strlen(child);
+        }
+      }
+      const char *suffix = heredoc ? "\\0tail'}}}\nEOF\n" : "'}}\"";
+      memcpy(source + length, suffix, strlen(suffix));
+      length += strlen(suffix);
+      for (unsigned operation = 0; operation < 4; ++operation) {
+        shellsplit_test_source_scan_reset();
+        if (operation == 0) {
+          shell_parse_result_t fast;
+          CHECK(shell_parse_fast(source, length, NULL, &fast) == SHELL_OK);
+        } else if (operation == 1) {
+          CHECK(shell_parse_draft(source, length, NULL, &draft) ==
+                    SHELL_SOURCE_COMPLETE &&
+                draft.header_count == 2);
+        } else if (operation == 2) {
+          shell_processed_commands_t processed = {0};
+          CHECK(shell_process_commands(source, length, NULL, &processed) ==
+                SHELL_PROCESS_OK);
+          shell_processed_commands_free(&processed);
+        } else {
+          CHECK(shell_dep_graph_parse(source, length, "/workspace", &limits,
+                                      &graph) == SHELL_DEP_OK);
+        }
+        size_t work = shellsplit_test_source_scan_work();
+        CHECK(work <= 128 * length + 4096 &&
+              (!previous[operation] || work <= 2 * previous[operation] + 4096));
+        previous[operation] = work;
+      }
+    }
+  }
+  /* Empty quote chains are transparent only in shell double-quoted defaults.
+   * Ordinary-word and heredoc boundaries stay literal with the same linear
+   * traversal, including quote pairs containing only a continuation. */
+  for (unsigned form = 0; form < 4; ++form) {
+    const char *prefixes[] = {"echo \"${0:+$'$'", "echo \"${0#${0:+$'$'",
+                              "cat <<EOF\n${0#${0:+$'$'",
+                              "cat <<EOF\n${0#\"${0:+$'$'"};
+    const char *suffixes[] = {"(printf child >&2)}\"", "(printf child >&2)}}\"",
+                              "(printf child >&2)}}\nEOF\n",
+                              "(printf child >&2)}\"}\nEOF\n"};
+    size_t previous[4] = {0};
+    for (size_t count = 16; count <= 256; count *= 2) {
+      char source[8192];
+      size_t length = strlen(prefixes[form]);
+      memcpy(source, prefixes[form], length);
+      for (size_t i = 0; i < count; ++i) {
+        const char *pair = i & 1u ? "\"\"" : "\"\\\n\"";
+        memcpy(source + length, pair, strlen(pair));
+        length += strlen(pair);
+      }
+      memcpy(source + length, suffixes[form], strlen(suffixes[form]));
+      length += strlen(suffixes[form]);
+      for (unsigned operation = 0; operation < 4; ++operation) {
+        shellsplit_test_source_scan_reset();
+        if (operation == 0) {
+          shell_parse_result_t fast;
+          CHECK(shell_parse_fast(source, length, NULL, &fast) == SHELL_OK);
+        } else if (operation == 1) {
+          CHECK(shell_parse_draft(source, length, NULL, &draft) ==
+                    (form ? SHELL_SOURCE_COMPLETE : SHELL_SOURCE_UNSUPPORTED) &&
+                draft.header_count == 1 &&
+                (form ? draft.prefix_length == length
+                      : !draft.prefix_length && !draft.prefix.count));
+        } else if (operation == 2) {
+          shell_processed_commands_t processed = {0};
+          CHECK(shell_process_commands(source, length, NULL, &processed) ==
+                    (form ? SHELL_PROCESS_OK : SHELL_PROCESS_EPARSE) &&
+                (form ? processed.command_count == 1
+                      : !processed.commands && !processed.command_count));
+          shell_processed_commands_free(&processed);
+        } else {
+          CHECK(shell_dep_graph_parse(source, length, "/workspace", &limits,
+                                      &graph) ==
+                (form ? SHELL_DEP_OK : SHELL_DEP_EPARSE));
+          if (form) {
+            unsigned commands = 0;
+            for (uint32_t n = 0; n < graph.node_count; ++n)
+              commands += graph.nodes[n].type == SHELL_NODE_CMD;
+            CHECK(commands == 1 && shell_dep_graph_validate(&graph).valid);
+          } else {
+            CHECK(!graph.node_count && !graph.edge_count);
+          }
+        }
+        size_t work = shellsplit_test_source_scan_work();
+        CHECK(work <= 128 * length + 4096 &&
+              (!previous[operation] || work <= 2 * previous[operation] + 4096));
+        previous[operation] = work;
+      }
+    }
+  }
+  /* Quoted heredoc patterns and their unquoted siblings restore phase state
+   * at each scope pop. A wider word must not trigger ancestor searches. */
+  {
+    size_t previous = 0;
+    for (size_t count = 16; count <= 128; count *= 2) {
+      char word[16384];
+      size_t length = 0;
+      for (size_t i = 0; i < count; ++i) {
+        const char *operand =
+            i & 1u ? "${0#${0:+${0#$'$(printf child >&2)'}}}"
+                   : "${0#\"${0:+${0#$'$(printf literal >&2)'}}\"}";
+        memcpy(word + length, operand, strlen(operand));
+        length += strlen(operand);
+      }
+      shell_source_substitution_scan_t scan = {
+          .scope = {.heredoc = true, .suppress_process = true}};
+      size_t start, after;
+      unsigned children = 0;
+      shell_source_substitution_kind_t kind;
+      shell_source_scan_status_t status;
+      shellsplit_test_source_scan_reset();
+      while ((status = shell_source_next_word_expansion(
+                  word, length, &scan, &start, &after, &kind)) ==
+             SHELL_SOURCE_SCAN_FOUND) {
+        CHECK(kind == SHELL_SOURCE_SUBST_COMMAND &&
+              after - start == strlen("$(printf child >&2)") &&
+              !memcmp(word + start, "$(printf child >&2)", after - start));
+        children++;
+      }
+      CHECK(status == SHELL_SOURCE_SCAN_DONE && !scan.scope_count &&
+            children == count / 2);
+      size_t work = shellsplit_test_source_scan_work();
+      CHECK(work <= 64 * length + 1024 &&
+            (!previous || work <= 2 * previous + 1024));
+      previous = work;
+    }
+  }
+  /* A heredoc word followed by a pattern establishes a literal subtree.
+   * Growing later word/pattern pairs must neither reactivate the child nor
+   * search the ancestor stack to rediscover the original heredoc. */
+  {
+    size_t previous = 0;
+    for (size_t depth = 2; depth * 2 + 2 <= SHELL_MAX_SUBCOMMANDS; depth *= 2) {
+      char word[8192];
+      size_t length = 0;
+      memcpy(word + length, "${0:+", 5);
+      length += 5;
+      for (size_t d = 0; d < depth; ++d) {
+        memcpy(word + length, "${0#${0:+", 9);
+        length += 9;
+      }
+      const char *literal = "$'$(printf child >&2)\\0tail'";
+      memcpy(word + length, literal, strlen(literal));
+      length += strlen(literal);
+      for (size_t d = 0; d < depth; ++d) {
+        memcpy(word + length, "}}", 2);
+        length += 2;
+      }
+      word[length++] = '}';
+      shell_source_substitution_scan_t scan = {
+          .scope = {.heredoc = true, .suppress_process = true}};
+      size_t start, after;
+      shell_source_substitution_kind_t kind;
+      shellsplit_test_source_scan_reset();
+      CHECK(shell_source_next_word_expansion(word, length, &scan, &start,
+                                             &after,
+                                             &kind) == SHELL_SOURCE_SCAN_DONE &&
+            !scan.scope_count && !scan.has_ansi_nul);
+      size_t work = shellsplit_test_source_scan_work();
+      CHECK(work <= 64 * length + 1024 &&
+            (!previous || work <= 2 * previous + 1024));
+      previous = work;
+    }
+  }
+  /* Empty translated fragments preserve the preceding effective byte. Growing
+   * a chain must remain a forward walk, including fragment-local NUL tails. */
+  for (unsigned nul = 0; nul < 2; ++nul) {
+    size_t previous[4] = {0};
+    for (size_t count = 16; count <= 256; count *= 2) {
+      char source[8192];
+      const char *prefix =
+          nul ? "cat <<EOF\n${0#${0:+$'$'" : "echo \"${0:+$'$'";
+      size_t length = strlen(prefix);
+      memcpy(source, prefix, length);
+      const char *empty = nul ? "$'\\0tail'" : "$''";
+      for (size_t i = 0; i < count; ++i) {
+        memcpy(source + length, empty, strlen(empty));
+        length += strlen(empty);
+      }
+      const char *suffix =
+          nul ? "(printf child >&2)}}\nEOF\n" : "(printf child >&2)}\"";
+      memcpy(source + length, suffix, strlen(suffix));
+      length += strlen(suffix);
+      for (unsigned operation = 0; operation < 4; ++operation) {
+        shellsplit_test_source_scan_reset();
+        if (operation == 0) {
+          shell_parse_result_t fast;
+          CHECK(shell_parse_fast(source, length, NULL, &fast) == SHELL_OK);
+        } else if (operation == 1) {
+          CHECK(shell_parse_draft(source, length, NULL, &draft) ==
+                    SHELL_SOURCE_UNSUPPORTED &&
+                !draft.prefix_length && !draft.prefix.count);
+        } else if (operation == 2) {
+          shell_processed_commands_t processed = {0};
+          CHECK(shell_process_commands(source, length, NULL, &processed) ==
+                    SHELL_PROCESS_EPARSE &&
+                !processed.commands && !processed.command_count);
+          shell_processed_commands_free(&processed);
+        } else {
+          CHECK(shell_dep_graph_parse(source, length, "/workspace", &limits,
+                                      &graph) == SHELL_DEP_EPARSE);
+          CHECK(!graph.node_count && !graph.edge_count);
+        }
+        size_t work = shellsplit_test_source_scan_work();
+        CHECK(work <= 128 * length + 4096 &&
+              (!previous[operation] || work <= 2 * previous[operation] + 4096));
+        previous[operation] = work;
+      }
+    }
+  }
+#endif
 }
 
 static void comment_byte_source(void) {
@@ -1735,7 +2875,8 @@ static void ansi_parameter_runs(void) {
           shellsplit_test_source_scan_reset();
 #endif
           CHECK(shell_source_ansi_quote_has_encoded_syntax(
-                    source, ansi_start, length - 2, true) == (form == 2));
+                    source, ansi_start, length - 2, length - 3, true) ==
+                (form == 2));
 #ifdef SHELLSPLIT_TEST_SOURCE_SCANS
           size_t guard_work = shellsplit_test_source_scan_work();
           CHECK(guard_work >= length - ansi_start - 3 &&
@@ -1841,6 +2982,8 @@ static void quoted_byte_paths(void) {
        "/workspace/données/résumé.txt"},
       {"cd $'./données' && printf %s $'日本' >$'résumé.txt'", "$'résumé.txt'",
        "/workspace/données/résumé.txt"},
+      {"cd $'./données\\0ignored' && printf %s x >$'résumé.txt\\0ignored'",
+       "$'résumé.txt\\0ignored'", "/workspace/données/résumé.txt"},
       {"printf %s x >$'日本\\c\\\\X'", "$'日本\\c\\\\X'",
        "/workspace/日本\x1cX"},
       {"printf %s x >$'日本\\c\\'X'", "$'日本\\c\\'X'",
@@ -4660,6 +5803,10 @@ int main(void) {
   word_byte_source();
   ansi_byte_source();
   ansi_control_delimiters();
+  ansi_nul_words();
+  nested_ansi_quote_context();
+  nested_ansi_escape_context();
+  parameter_word_phases();
   comment_byte_source();
   comment_byte_work();
   quoted_byte_work();

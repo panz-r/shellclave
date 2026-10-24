@@ -193,7 +193,16 @@ typedef struct shell_source_result {
  * syntax. Comments and ordinary literal word fragments, unquoted, escaped or
  * quoted (including ANSI-C), admit high bytes without encoding validation or
  * normalization. ANSI-C escape decoding retains its separate semantic
- * restrictions. A comment ends at raw LF or EOF; its bytes do not supply
+ * restrictions. Decoded NUL truncates an ordinary ANSI-C fragment's value;
+ * retained spans still cover its full spelling. Double-quoted parameter
+ * defaults and alternates with decoded NUL remain semantically unsupported,
+ * including those nested inside pattern operands; syntax-only classification
+ * still recognizes their complete raw grammar. Parameter-word syntax assembled
+ * across an ANSI-C fragment boundary is UNSUPPORTED because it has no
+ * contiguous source span for retained headers and graphs. This includes an
+ * expansion opener split across fragments and expansion framing that extends
+ * beyond a translated fragment.
+ * A comment ends at raw LF or EOF; its bytes do not supply
  * tokens or expansions.
  * The whole-source NUL, prohibited control-byte and DEL checks still apply.
  * Parameter operands inherit the word data domain and their applicable quote

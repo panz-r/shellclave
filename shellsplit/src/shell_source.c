@@ -137,7 +137,8 @@ static SHELL_NONNULL(1, 2) bool collect_expansions(
     collector->failure = SHELL_SOURCE_TRUNCATED;
     return false;
   }
-  if (terminal == SHELL_SOURCE_SCAN_MALFORMED || scan.has_backtick_escapes)
+  if (terminal == SHELL_SOURCE_SCAN_MALFORMED ||
+      terminal == SHELL_SOURCE_SCAN_UNSUPPORTED || scan.has_backtick_escapes)
     return false;
   if (unfinished) {
     bool quoted =

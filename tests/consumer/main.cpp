@@ -150,6 +150,8 @@ static bool check_depgraph_workspace_api() {
       constexpr char unsupported[] = "if true; then :; fi";
       constexpr char malformed[] = "cat <<\n";
       constexpr char nul[] = "echo\0x";
+      constexpr char nul_word[] = "pre$'a\\0b'post";
+      size_t effective_length = 0, binary_length = 0;
       ok = shell_parse_draft(quoted, sizeof(quoted) - 1, nullptr, draft) ==
                SHELL_SOURCE_COMPLETE &&
            shell_parse_draft(unquoted, sizeof(unquoted) - 1, nullptr, draft) ==
@@ -161,7 +163,13 @@ static bool check_depgraph_workspace_api() {
            shell_parse_draft(malformed, sizeof(malformed) - 1, nullptr,
                              draft) == SHELL_SOURCE_INVALID &&
            shell_parse_draft(nul, sizeof(nul) - 1, nullptr, draft) ==
-               SHELL_SOURCE_INVALID_INPUT;
+               SHELL_SOURCE_INVALID_INPUT &&
+           shell_visit_static_word(nul_word, sizeof(nul_word) - 1, nullptr,
+                                   nullptr, &effective_length) &&
+           effective_length == 8 &&
+           shell_measure_decoded_word(nul_word, sizeof(nul_word) - 1,
+                                      &binary_length) == SHELL_PROCESS_OK &&
+           binary_length == 10;
     }
     std::free(draft);
   }

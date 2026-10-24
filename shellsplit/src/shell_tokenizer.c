@@ -734,6 +734,10 @@ static SHELL_NONNULL(1,
         i = (uint32_t)after;
         continue;
       }
+      /* Syntax validation owns the incomplete opener. Feature discovery must
+       * still advance past it instead of retrying the same `<(` or `>(`
+       * indefinitely on diagnostic input. */
+      i = (uint32_t)process_open + 1;
       continue;
     }
     bool arithmetic_paren =

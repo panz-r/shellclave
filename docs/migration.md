@@ -19,7 +19,7 @@ semantic consumers. Canonical values and source offsets preserve exact bytes.
 Parameter default and pattern operands admit the same literal data; variable
 names, arithmetic and subscripts retain their restricted code domains.
 ANSI-C fragments now admit the same literal bytes, including `$'日本\t語'`,
-with existing escape decoding. Non-ASCII Unicode escapes and decoded NUL keep
+with existing escape decoding. Surviving non-ASCII Unicode escapes keep
 their complete-command semantic restrictions; arithmetic and selectors keep
 their restricted code domains. Incomplete quotes retain draft recovery and
 original offsets. Newly admitted words proceed through the ordinary grammar
@@ -31,9 +31,88 @@ and heredoc delimiters. Wrapped octal bytes such as `\444` (`$`) and `\540`
 (backtick) return UNSUPPORTED when they introduce decoded syntax in parameter
 operands; semantic graph consumers reject those sources. Previously, such
 inputs could produce successful graphs missing the nested commands. Ordinary
-ANSI-C literal words retain their exact decoded bytes. Backslash runs in these
-parameter operands are scanned in linear work, including before raw command
-substitutions.
+ANSI-C literal words retain static value decoding, including the fragment-local
+NUL truncation described below. Backslash runs in these parameter operands are
+scanned in linear work, including before raw command substitutions.
+Nested parameter words within re-expanded ANSI-C fragments now retain the same
+two-phase backslash interpretation. This restores executable children omitted
+after three backslashes and removes phantom children reported after two,
+including within supported heredoc prefixes before decoded NUL. Exact source
+spans and conditional ownership are preserved; the correction adds no decoded
+source representation or runtime-error model.
+Executable child bodies changed by that first decoding phase now return
+UNSUPPORTED rather than publishing raw-source graphs with missing or phantom
+grandchildren. Byte-identical child bodies retain their existing support.
+For example, a single backslash before raw `$()` survives ANSI-C decoding;
+the child's own quote context still determines whether that dollar is literal.
+
+Deferred heredoc word expansion now preserves the parameter-operand path that
+activated it. A pattern rooted directly in an unquoted heredoc can activate the
+phase through a nested word. The next nested operand remains active; a word
+continues that path, while consecutive patterns require another intervening
+word before re-expansion resumes.
+For example, `${0#${0:+${0#$'$(printf child >&2)'}}}` retains the conditional
+`printf` child, including before a decoded NUL. By contrast, a pattern entered
+after an ordinary heredoc word does not reactivate the phase:
+`${0:+${0#${0:+$'$(printf child >&2)'}}}` contains no child. Process
+substitutions in active ordinary-word parameter operands and their re-expanded
+ANSI-C text are retained instead of being hidden by inherited quote
+suppression. Explicit double quotes within the re-expanded ANSI-C value now
+suppress process substitution as well; quoted `<(...)` and `>(...)` text no
+longer introduces phantom commands or policy subjects. Command and backtick
+substitutions inside that text remain visible.
+An explicit double quote around a nested parameter stops deferred heredoc
+expansion from reaching its pattern operands. The quoted heredoc expression
+`${0#"${0:+${0#$'$(printf child >&2)'}}"}` therefore has no child command;
+removing those quotes retains the child. Scope restoration preserves the phase
+of subsequent unquoted operands. Immediate double-quoted defaults continue to
+expand their raw command and backtick substitutions.
+Pattern entry now resets enclosing quote inheritance specifically for heredoc
+operands. A deeper default therefore cannot bypass the blocked heredoc phase
+by recovering an earlier explicit quote. For example,
+`${0:+"${0#${0:+$'$(printf child >&2)'}}"}` contributes no child command;
+previously its retained headers, graph and policy evaluation included a phantom
+`printf`. This correction also covers backticks and process substitutions,
+including literal ANSI-C fragments with NUL tails. Ordinary shell-word quote
+inheritance, newly introduced quotes after the pattern, raw substitutions and
+subsequent sibling expansion remain supported.
+These corrections apply to retained headers,
+graphs, feature discovery and policy subjects through the shared scanner;
+deny rules therefore see the previously missing commands. Public interfaces,
+workspace contracts and the restriction on child bodies requiring decoded
+source are unchanged.
+
+Harmless ANSI-C data escapes surrounding raw command/backtick substitutions
+no longer make the entire parameter operand UNSUPPORTED. For example,
+`echo "${0#${0:+$'$(printf child >&2)\n'}}"` now retains the byte-identical
+`printf` child. Escapes that change an executable child's body, introduce
+encoded expansion syntax, or violate the existing quote-framing restrictions
+remain unsupported. A complete raw child can now pass `shell_parse_fast()`
+while semantic consumers reject its translated body. Successful fast parsing
+establishes raw framing, not semantic support. Public interfaces and the
+retained graph's raw-source contract are unchanged.
+
+Parameter-word expansion now rejects syntax assembled across ANSI-C fragment
+boundaries. This includes command and process substitutions, parameter and
+arithmetic expansions, and framing that begins in a decoded fragment but ends
+in neighboring source. Previously, those forms could pass source admission
+while retained headers, graphs and policy subjects omitted the reconstructed
+expansion. `shell_parse_fast()` can still accept their complete raw framing;
+draft admission reports UNSUPPORTED and semantic consumers fail closed.
+Literal controls separated by quoted content, protective escaping or
+whitespace remain supported. Empty double quotes are transparent in inherited
+shell double-quoted defaults, but preserve a literal boundary in ordinary-word
+and heredoc operands. For example, `"${0#${0:+$'$'""(printf child)}}"` is
+supported with no child, while the direct default
+`"${0:+$'$'""(printf child)}"` still requires reconstructed source and remains
+unsupported. These transitions use bounded forward state with unchanged public
+results and workspace requirements.
+
+Complete-source semantic inspection propagates this translated-source outcome
+even when graph construction consumes a caller-supplied fast result. A
+permissive result truncated before a later translated expansion therefore
+produces a graph parse error with no partial graph; retained fast ranges cannot
+hide unsupported semantics elsewhere in the unchanged source span.
 
 ANSI-C control escapes now consume doubled backslash operands correctly and
 preserve apostrophes protected by the consumed backslash. For example,
@@ -43,6 +122,21 @@ This corrects canonical argument bytes and shared heredoc delimiter
 normalization. Public interfaces and source-admission restrictions are
 unchanged.
 
+Source-derived ANSI-C values now truncate each fragment at the first decoded
+NUL, then resume later word fragments. `pre$'a\0b'post` therefore contributes
+`preapost`, and an argument spelled `$'\0'` contributes one empty argument.
+Canonical argv, builtin recognition, descriptor operands, assignments, CWD/path
+facts and heredoc delimiters use this effective value. Retained source spans
+still include the entire spelling. Double-quoted parameter defaults and
+alternates containing decoded NUL remain semantically unsupported.
+
+`shell_visit_static_word()` now returns the effective static Bash value rather
+than a binary syntax projection. Callers that require the NUL and discarded
+bytes use `shell_visit_decoded_word()`, its measure/write counterparts, or
+`shell_decode_word()`, whose byte-preserving contracts are unchanged. Canonical
+payloads supplied directly remain binary-capable. Public signatures, result
+layouts and workspace contracts are unchanged.
+
 Control-feature detection now uses complete lexical words. Ordinary words such
 as `日本.if`, `日本''if`, `x-while` and `/tmp/in` no longer trigger false
 conditional, loop or case rejections under Shellgate's default feature mask.
@@ -51,7 +145,9 @@ operands and expansion/document data also stays out of outer control flags;
 executable substitutions retain their own flags. Standalone unquoted keyword
 spellings remain lexical markers, including in ordinary argument positions.
 The allocating tokenizer uses the same complete-word and redirect-operand
-boundaries for its lexical control metadata.
+boundaries for its lexical control metadata. Feature discovery now advances
+through an incomplete process-substitution opener; syntax validation reports
+the unfinished input instead of feature collection stalling on it.
 
 Single-quoted backslashes now retain their literal meaning at closing quotes,
 including before command separators. Source classification, structured

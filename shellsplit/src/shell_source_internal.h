@@ -675,64 +675,162 @@ static inline SHELL_NONNULL(1, 3) bool shell_source_decode_ansi_escape(
   return shell_source_ansi_emit(visitor, context, decoded);
 }
 
+typedef enum {
+  SHELL_SOURCE_ANSI_BYTES,
+  SHELL_SOURCE_ANSI_WORD,
+} shell_source_ansi_mode_t;
+
+typedef struct {
+  /* First NUL escape's source offset, or the closing quote. */
+  size_t value_end;
+  unsigned char first_byte;
+  bool has_nul;
+  bool locale_dependent;
+  bool has_value;
+} shell_source_ansi_facts_t;
+
+typedef struct {
+  shell_source_byte_visitor_t visitor;
+  void *context;
+  shell_source_ansi_facts_t *facts;
+  size_t source_position;
+  shell_source_ansi_mode_t mode;
+} shell_source_ansi_sink_t;
+
+static inline SHELL_NONNULL(2) bool shell_source_ansi_value_byte(
+    unsigned char byte, void *context) {
+  shell_source_ansi_sink_t *sink = (shell_source_ansi_sink_t *)context;
+  if (!byte && !sink->facts->has_nul) {
+    sink->facts->has_nul = true;
+    sink->facts->value_end = sink->source_position;
+  }
+  if (sink->mode == SHELL_SOURCE_ANSI_WORD && sink->facts->has_nul)
+    return true;
+  if (!sink->facts->has_value) {
+    sink->facts->first_byte = byte;
+    sink->facts->has_value = true;
+  }
+  return shell_source_ansi_emit(sink->visitor, sink->context, byte);
+}
+
 /* Required writable position <= length, advanced past the closing quote on
  * success. text supplies length immutable bytes (NULL only for length zero).
  * A NULL visitor requests validation without emitting bytes.
- * Optional locale_dependent accumulates into caller-initialized storage.
+ * Optional facts receives fragment-local facts, including on incomplete input.
+ * WORD suppresses the first decoded NUL and the rest of that fragment's value,
+ * but still consumes its complete lexical spelling. BYTES preserves every byte.
  * Non-ASCII Unicode escapes need Bash's execution locale; the internal byte
- * decoder retains UTF-8 for lexical delimiter recognition only. */
+ * decoder retains UTF-8 for lexical delimiter recognition only. In WORD mode,
+ * escapes in the discarded tail do not contribute locale requirements. */
 static inline SHELL_NONNULL(3) bool shell_source_decode_ansi_c_quote_impl(
     const char *text, size_t length, size_t *position,
     shell_source_byte_visitor_t visitor, void *context,
-    bool *locale_dependent) {
+    shell_source_ansi_mode_t mode, shell_source_ansi_facts_t *facts) {
+  shell_source_ansi_facts_t local = {.value_end = length};
+  shell_source_ansi_sink_t sink = {visitor, context, &local, 0, mode};
+  bool complete = false;
+  size_t quote = 0;
   if (*position >= length || text[*position] != '$')
-    return false;
-  size_t quote = shell_source_logical_following(text, length, *position);
+    goto done;
+  quote = shell_source_logical_following(text, length, *position);
   if (quote >= length || text[quote] != '\'')
-    return false;
+    goto done;
   *position = quote + 1;
   while (*position < length) {
     SHELL_SOURCE_WORD_SCAN(1);
+    sink.source_position = *position;
     unsigned char value = (unsigned char)text[(*position)++];
-    if (value == '\'')
-      return true;
+    if (value == '\'') {
+      if (!local.has_nul)
+        local.value_end = *position - 1;
+      complete = true;
+      break;
+    }
     if (value != '\\') {
-      if (!shell_source_ansi_emit(visitor, context, value))
-        return false;
+      if (!shell_source_ansi_value_byte(value, &sink))
+        break;
     } else if (*position == length ||
-               !shell_source_decode_ansi_escape(text, length, position, visitor,
-                                                context, locale_dependent))
-      return false;
+               !shell_source_decode_ansi_escape(
+                   text, length, position, shell_source_ansi_value_byte, &sink,
+                   mode == SHELL_SOURCE_ANSI_BYTES || !local.has_nul
+                       ? &local.locale_dependent
+                       : NULL))
+      break;
   }
-  return false;
+done:
+  if (facts)
+    *facts = local;
+  return complete;
 }
 
 static inline SHELL_NONNULL(3) bool shell_source_decode_ansi_c_quote(
     const char *text, size_t length, size_t *position,
     shell_source_byte_visitor_t visitor, void *context) {
-  return shell_source_decode_ansi_c_quote_impl(text, length, position, visitor,
-                                               context, NULL);
+  return shell_source_decode_ansi_c_quote_impl(
+      text, length, position, visitor, context, SHELL_SOURCE_ANSI_BYTES, NULL);
 }
 
-static inline bool shell_source_find_ansi_c_nul(unsigned char byte,
-                                                void *context) {
-  if (byte == '\0')
-    *(bool *)context = true;
-  return true;
+/* Effective ANSI-C fragment value for semantic consumers. Source extent and
+ * quote framing are retained even when a decoded NUL truncates the value. */
+static inline SHELL_NONNULL(3) bool shell_source_decode_ansi_c_word(
+    const char *text, size_t length, size_t *position,
+    shell_source_byte_visitor_t visitor, void *context) {
+  return shell_source_decode_ansi_c_quote_impl(
+      text, length, position, visitor, context, SHELL_SOURCE_ANSI_WORD, NULL);
 }
 
-/* Complete-command semantics cannot treat an ANSI-C NUL as ordinary argv:
- * Bash discards the rest of that quoted segment before executing the word.
- * Keep the byte-faithful decoder available to standalone and binary callers;
- * this probe lets semantic consumers reject the ambiguous source spelling. */
+/* Facts describe the effective fragment value. A NUL is supported in ordinary
+ * word contexts; double-quoted parameter defaults retain their separate
+ * unsupported semantics. Raw byte decoding remains available independently. */
 static inline SHELL_NONNULL(3, 4, 5) bool shell_source_ansi_c_quote_facts(
     const char *text, size_t length, size_t *position, bool *has_nul,
     bool *locale_dependent) {
-  *has_nul = false;
-  *locale_dependent = false;
-  return shell_source_decode_ansi_c_quote_impl(text, length, position,
-                                               shell_source_find_ansi_c_nul,
-                                               has_nul, locale_dependent);
+  shell_source_ansi_facts_t facts;
+  bool complete = shell_source_decode_ansi_c_quote_impl(
+      text, length, position, NULL, NULL, SHELL_SOURCE_ANSI_WORD, &facts);
+  *has_nul = facts.has_nul;
+  *locale_dependent = facts.locale_dependent;
+  return complete;
+}
+
+typedef struct {
+  const char *source;
+  size_t matched;
+} shell_source_ansi_source_match_t;
+
+/* The shared escape decoder emits no more bytes than its raw escape consumes;
+ * source therefore supplies every byte this comparison visits. */
+static inline SHELL_NONNULL(2) bool shell_source_ansi_match_source_byte(
+    unsigned char byte, void *context) {
+  shell_source_ansi_source_match_t *match =
+      (shell_source_ansi_source_match_t *)context;
+  if (byte != (unsigned char)match->source[match->matched])
+    return false;
+  match->matched++;
+  return true;
+}
+
+/* An executable child is parsed independently from its retained raw body.
+ * Its complete span must fit the active ANSI-C value, and escape decoding
+ * must leave that body byte-identical. Otherwise it requires decoded source.
+ * First-level child spans are disjoint: each body is walked once here, not
+ * once per nested command. Unknown escapes that preserve both bytes remain
+ * representable. input[start..after) is the prechecked complete raw body. */
+static inline SHELL_NONNULL(1) bool shell_source_ansi_child_needs_translation(
+    const char *input, size_t start, size_t after) {
+  for (size_t position = start; position < after;) {
+    SHELL_SOURCE_WORD_SCAN(1);
+    if (input[position++] != '\\')
+      continue;
+    size_t escape_start = position - 1;
+    shell_source_ansi_source_match_t match = {input + escape_start, 0};
+    if (!shell_source_decode_ansi_escape(input, after, &position,
+                                         shell_source_ansi_match_source_byte,
+                                         &match, NULL) ||
+        match.matched != position - escape_start)
+      return true;
+  }
+  return false;
 }
 
 typedef enum {
@@ -821,17 +919,16 @@ shell_source_heredoc_word_has_unsupported_ansi_c(const char *word,
     if (!shell_source_ansi_c_quote_facts(word, length, &position, &has_nul,
                                          &locale_dependent))
       return false;
-    if (has_nul || locale_dependent)
+    if (locale_dependent)
       return true;
   }
   return false;
 }
 
-/* Only raw, contiguous source bytes may become executable graph nodes. Bash
- * decodes ANSI-C escapes before expanding a double-quoted parameter word, so
- * an escape in a substitution body changes the command that actually runs.
- * The graph deliberately borrows the original source: reject such words
- * rather than giving a decoded command a misleading raw-source span. */
+/* Encoded expansion metabytes can change the framing of a re-expanded
+ * parameter word. Executable children must separately retain byte-identical
+ * bodies: their graph nodes borrow raw, contiguous source. Harmless data
+ * escapes outside those bodies do not invalidate a raw substitution. */
 static inline bool shell_source_ansi_expansion_metabyte(unsigned value) {
   return value == '$' || value == '\\' || value == '`' || value == '<' ||
          value == '>' || value == '(' || value == ')' || value == '{' ||
@@ -852,29 +949,26 @@ static inline SHELL_NONNULL(2) bool shell_source_ansi_syntax_byte(
   return true;
 }
 
-/* text[start..after) is a prechecked complete ANSI-C fragment. isolated means
+/* text[start..after) is a prechecked complete ANSI-C fragment; value_end is
+ * its effective source boundary from the shared decoder's facts. isolated means
  * it occupies the whole parameter operand. The raw-facts pass and escape pass
  * each move forward: a backslash run is consumed once, including its pairs.
- * Classify actual decoded bytes, including octal truncation modulo 256. */
+ * Classify actual decoded bytes, including octal truncation modulo 256.
+ * Child-body translation is checked on each executable span by the expansion
+ * iterator, not inferred from the presence of a raw opener elsewhere here. */
 static inline SHELL_NONNULL(1) bool shell_source_ansi_quote_has_encoded_syntax(
-    const char *text, size_t start, size_t after, bool isolated) {
+    const char *text, size_t start, size_t after, size_t value_end,
+    bool isolated) {
   size_t body_start = shell_source_logical_following(text, after, start) + 1;
-  bool has_raw_substitution = false;
   size_t raw_double_quotes = 0;
-  for (size_t i = body_start; i + 1 < after; i++) {
+  for (size_t i = body_start; i < value_end; i++) {
     SHELL_SOURCE_WORD_SCAN(1);
-    if (text[i] == '"') {
+    if (text[i] == '"')
       raw_double_quotes++;
-    } else {
-      has_raw_substitution |=
-          text[i] == '`' ||
-          (text[i] == '$' &&
-           shell_source_logical_next_is(text, after - 1, i, '(', NULL));
-    }
   }
   if (raw_double_quotes % 2 != 0)
     return true;
-  for (size_t position = body_start; position + 1 < after;) {
+  for (size_t position = body_start; position < value_end;) {
     SHELL_SOURCE_WORD_SCAN(1);
     if (text[position] != '\\') {
       position++;
@@ -882,22 +976,21 @@ static inline SHELL_NONNULL(1) bool shell_source_ansi_quote_has_encoded_syntax(
     }
     size_t escape_start = position;
     size_t slashes = position;
-    while (slashes + 1 < after && text[slashes] == '\\') {
+    while (slashes < value_end && text[slashes] == '\\') {
       SHELL_SOURCE_WORD_SCAN(1);
       slashes++;
     }
     /* Bash pairs backticks while parsing the ANSI-C word. Two or more
      * backslashes before a raw backtick can make that pairing ambiguous
      * across the later parameter-word expansion. */
-    if (slashes - position >= 2 && slashes + 1 < after && text[slashes] == '`')
+    if (slashes - position >= 2 && slashes < value_end && text[slashes] == '`')
       return true;
     bool before_raw_opener =
-        slashes + 1 < after &&
+        slashes < value_end &&
         (text[slashes] == '`' ||
-         (text[slashes] == '$' &&
-          shell_source_logical_next_is(text, after - 1, slashes, '(', NULL)));
-    if (has_raw_substitution && !before_raw_opener)
-      return true;
+         ((text[slashes] == '$' || text[slashes] == '<' ||
+           text[slashes] == '>') &&
+          shell_source_logical_next_is(text, value_end, slashes, '(', NULL)));
     size_t slash_count = slashes - position;
     if (slash_count >= 2 && !before_raw_opener)
       return true;
@@ -907,8 +1000,9 @@ static inline SHELL_NONNULL(1) bool shell_source_ansi_quote_has_encoded_syntax(
     if (text[position] == '\'' || text[position] == '"')
       return true;
     shell_source_ansi_syntax_byte_t decoded = {0, 0};
-    (void)shell_source_decode_ansi_escape(
-        text, after, &position, shell_source_ansi_syntax_byte, &decoded, NULL);
+    (void)shell_source_decode_ansi_escape(text, value_end, &position,
+                                          shell_source_ansi_syntax_byte,
+                                          &decoded, NULL);
     bool literal_byte = decoded.byte == '$' || decoded.byte == '<' ||
                         decoded.byte == '>' || decoded.byte == '(' ||
                         decoded.byte == ')';
@@ -916,7 +1010,7 @@ static inline SHELL_NONNULL(1) bool shell_source_ansi_quote_has_encoded_syntax(
      * Numeric escapes and escaped punctuation emit one decoded byte. */
     if (decoded.count == 1 &&
         shell_source_ansi_expansion_metabyte(decoded.byte) &&
-        !(isolated && escape_start == body_start && position == after - 1 &&
+        !(isolated && escape_start == body_start && position == value_end &&
           literal_byte))
       return true;
   }
@@ -2500,14 +2594,16 @@ static inline SHELL_NONNULL(
     }
     size_t next = shell_source_logical_following(input, length, position);
     if (c == '$' && next < length && input[next] == '\'') {
-      size_t quoted = 0;
-      if (!shell_source_skip_complete_ansi_c_quote(input, length, position,
-                                                   &quoted))
+      size_t quoted = position;
+      shell_source_ansi_facts_t facts;
+      if (!shell_source_decode_ansi_c_quote_impl(input, length, &quoted, NULL,
+                                                 NULL, SHELL_SOURCE_ANSI_WORD,
+                                                 &facts))
         return false;
       bool isolated =
           position == word_start && quoted < length && input[quoted] == '}';
       if (shell_source_ansi_quote_has_encoded_syntax(input, position, quoted,
-                                                     isolated))
+                                                     facts.value_end, isolated))
         return false;
       position = quoted;
       continue;
@@ -3115,16 +3211,17 @@ static inline bool shell_source_word_has_process_substitution(const char *input,
   return false;
 }
 
-/* Detect an executable substitution anywhere in one complete source word.
- * Command substitutions and backticks remain active inside double quotes;
- * process substitutions do not, except in parameter pattern operands, whose
- * quote rules are independent of the outer quotes. Single and ANSI-C quotes
- * are literal in ordinary words. Inside a double-quoted
- * default word, Bash re-expands decoded ANSI-C text; numeric escapes that
- * create unrepresentable source openers are rejected by the structural
- * parameter scanner above. Structural failures are distinct from exhaustion:
- * complete-source consumers must not mistake malformed input for no features.
- */
+/* Detect executable substitutions in one complete source word. Parameter
+ * patterns establish ordinary-word parsing, inherited by nested operands up
+ * to an explicit quote. A pattern-derived heredoc phase records both whether
+ * the current operand is re-expanded and which phase its next nested operand
+ * receives; a pattern entered from a direct heredoc word cannot manufacture
+ * that phase. Re-expanded ANSI-C fragments retain their own translation
+ * bounds; ordinary ANSI-C words are literal.
+ * Numeric escapes creating unrepresentable source openers are rejected by the
+ * structural parameter scanner above. Structural failures are distinct from
+ * exhaustion: complete-source consumers must not mistake malformed input for
+ * no features. */
 /* Stateful iterator for executable substitution spans in one complete shell
  * word. Scoped parameter operands and arithmetic expressions are traversed
  * without exposing their punctuation as outer shell syntax. */
@@ -3146,7 +3243,30 @@ typedef enum {
   SHELL_SOURCE_SCAN_FOUND,
   SHELL_SOURCE_SCAN_MALFORMED,
   SHELL_SOURCE_SCAN_INCOMPLETE,
+  /* Complete raw framing whose expansion syntax needs decoded source. This
+   * includes executable children with translated bodies and syntax assembled
+   * across decoded fragment boundaries. Unlike a clipped framing failure, it
+   * is not repaired by discarding a NUL tail. */
+  SHELL_SOURCE_SCAN_UNSUPPORTED,
 } shell_source_scan_status_t;
+
+/* Heredoc parameter expansion has two distinct routes into nested patterns.
+ * A pattern reached directly from the heredoc phase can activate a deferred
+ * word-expansion phase. A pattern reached after an ordinary heredoc parameter
+ * word cannot reactivate that phase. Keep the provenance explicit so deeper
+ * operands do not infer it merely from having a heredoc ancestor. */
+typedef enum {
+  SHELL_SOURCE_HEREDOC_PHASE_NONE = 0,
+  SHELL_SOURCE_HEREDOC_PHASE_ROOT,
+  SHELL_SOURCE_HEREDOC_PHASE_WORD,
+  SHELL_SOURCE_HEREDOC_PHASE_PATTERN,
+  /* Bash alternates these two active states at nested parameter boundaries.
+   * Both re-expand their current bytes. PRIMARY lends one active phase to the
+   * next operand; NESTED returns a word to PRIMARY but a pattern to PATTERN. */
+  SHELL_SOURCE_HEREDOC_PHASE_REEXPANDED_PRIMARY,
+  SHELL_SOURCE_HEREDOC_PHASE_REEXPANDED_NESTED,
+  SHELL_SOURCE_HEREDOC_PHASE_BLOCKED,
+} shell_source_heredoc_phase_t;
 
 static inline bool
 shell_source_arithmetic_content(const char *input, size_t length,
@@ -3155,10 +3275,29 @@ shell_source_arithmetic_content(const char *input, size_t length,
 
 typedef struct {
   bool in_single_quote;
+  /* Immediate word quoting also applies while traversing a re-expanded
+   * ANSI-C value. Its lexical extent is tracked separately by ansi_end. */
   bool in_double_quote;
   /* A parameter word inside double quotes retains expansion semantics even
-   * where apostrophes pair structurally to protect its closing brace. */
+   * where apostrophes pair structurally to protect its closing brace. This
+   * describes the current operand, not its enclosing shell quote. */
   bool inherited_double_quote;
+  /* Shell-word patterns retain the enclosing double quote for nested words.
+   * Heredoc patterns reset that inheritance: their exact operand phase owns
+   * re-expansion, including after an explicitly quoted heredoc operand.
+   * A new explicit quote inside the pattern can establish its own context. */
+  bool enclosing_double_quote;
+  /* A pattern starts ordinary shell-word parsing, even within an enclosing
+   * quote. Nested operands inherit that parsing context unless an explicit
+   * double quote intervenes. Process substitution follows this context,
+   * independently of inherited_double_quote's parameter expansion rules. */
+  bool ordinary_word;
+  /* Exact heredoc operand provenance. Direct words retain heredoc expansion
+   * rules; direct patterns can activate re-expansion in a nested word. Once a
+   * direct word enters a pattern, or an explicit quote intervenes, that
+   * subtree is blocked from regaining the deferred phase. Scope pops restore
+   * the parent value. */
+  shell_source_heredoc_phase_t heredoc_phase;
   /* Heredoc roots have literal quote bytes and limited backslash escapes.
    * Their parameter defaults inherit expansion semantics, but not ANSI-C or
    * locale quoting. Pattern operands establish ordinary word quoting. */
@@ -3187,10 +3326,24 @@ typedef struct {
   /* One-based operand offsets identify conditional execution without a
    * source-prefix rescan. Nonconditional nested scopes inherit this pair. */
   size_t guard_start, guard_parent;
-  /* In a double-quoted parameter default word, Bash expands the decoded
-   * contents of $'...' a second time. Keep its source boundary while walking
-   * the executable substitutions in that decoded word. */
+  /* Parameter defaults and deferred heredoc words can expand decoded $'...'
+   * text a second time. Keep its source boundary while walking executable
+   * substitutions; their quoting still belongs to the immediate operand. */
   size_t ansi_end;
+  /* Complete lexical end, including a discarded NUL tail. Re-expanded
+   * prefixes stop at ansi_end, then resume at ansi_after without rescanning. */
+  size_t ansi_after;
+  /* One-based stack slot of the enclosing re-expanded ANSI-C fragment, or
+   * zero. Its escape translation survives nested parameter/math scopes,
+   * independently of their local quote and closing-delimiter state. The
+   * owner's bounds also identify an optional discarded NUL tail. */
+  unsigned ansi_owner;
+  /* A possible expansion opener at the end of the effective word prefix.
+   * translated_prefix is set only after a decoded fragment boundary separates
+   * it from the next effective byte. This bounded state prevents reconstructed
+   * syntax without retaining or rescanning decoded source. */
+  char expansion_prefix;
+  bool translated_prefix;
   char closer; /* Zero at root, '}' for parameters, ')' for math, ']' for
                   arrays. */
   size_t parentheses;
@@ -3198,6 +3351,56 @@ typedef struct {
   size_t word_start;
   size_t expansion_start;
 } shell_source_expansion_scope_t;
+
+static inline bool
+shell_source_heredoc_phase_present(shell_source_heredoc_phase_t phase) {
+  return phase != SHELL_SOURCE_HEREDOC_PHASE_NONE;
+}
+
+/* BLOCKED retains heredoc ancestry for process-substitution suppression, but
+ * no longer lends heredoc word-expansion semantics to a nested parameter. */
+static inline bool
+shell_source_heredoc_phase_inherits_word(shell_source_heredoc_phase_t phase) {
+  return shell_source_heredoc_phase_present(phase) &&
+         phase != SHELL_SOURCE_HEREDOC_PHASE_BLOCKED;
+}
+
+static inline bool
+shell_source_heredoc_phase_reexpanded(shell_source_heredoc_phase_t phase) {
+  return phase == SHELL_SOURCE_HEREDOC_PHASE_REEXPANDED_PRIMARY ||
+         phase == SHELL_SOURCE_HEREDOC_PHASE_REEXPANDED_NESTED;
+}
+
+/* The selector and operator have already been classified. Transition once at
+ * the operand boundary; deeper scopes inherit this exact phase in O(1). */
+static inline shell_source_heredoc_phase_t
+shell_source_heredoc_operand_phase(shell_source_heredoc_phase_t phase,
+                                   shell_source_parameter_operand_t operand) {
+  if (phase == SHELL_SOURCE_HEREDOC_PHASE_NONE)
+    return phase;
+  if (operand == SHELL_SOURCE_PARAMETER_SUBSTRING)
+    return SHELL_SOURCE_HEREDOC_PHASE_BLOCKED;
+  if (operand == SHELL_SOURCE_PARAMETER_PATTERN) {
+    if (phase == SHELL_SOURCE_HEREDOC_PHASE_ROOT)
+      return SHELL_SOURCE_HEREDOC_PHASE_PATTERN;
+    if (phase == SHELL_SOURCE_HEREDOC_PHASE_WORD)
+      return SHELL_SOURCE_HEREDOC_PHASE_BLOCKED;
+    if (phase == SHELL_SOURCE_HEREDOC_PHASE_REEXPANDED_PRIMARY)
+      return SHELL_SOURCE_HEREDOC_PHASE_REEXPANDED_NESTED;
+    if (phase == SHELL_SOURCE_HEREDOC_PHASE_REEXPANDED_NESTED)
+      return SHELL_SOURCE_HEREDOC_PHASE_PATTERN;
+    return phase;
+  }
+  if (phase == SHELL_SOURCE_HEREDOC_PHASE_ROOT)
+    return SHELL_SOURCE_HEREDOC_PHASE_WORD;
+  if (phase == SHELL_SOURCE_HEREDOC_PHASE_PATTERN)
+    return SHELL_SOURCE_HEREDOC_PHASE_REEXPANDED_PRIMARY;
+  if (phase == SHELL_SOURCE_HEREDOC_PHASE_REEXPANDED_PRIMARY)
+    return SHELL_SOURCE_HEREDOC_PHASE_REEXPANDED_NESTED;
+  if (phase == SHELL_SOURCE_HEREDOC_PHASE_REEXPANDED_NESTED)
+    return SHELL_SOURCE_HEREDOC_PHASE_REEXPANDED_PRIMARY;
+  return phase;
+}
 
 /* Empty process substitutions produce no pathname in the reference Bash.
  * Classify a fragment at a known word position without balancing its suffix:
@@ -3289,6 +3492,8 @@ typedef struct {
   bool has_arithmetic_variables;
   bool has_arrays;
   bool has_ansi_c;
+  /* Unsupported NUL translation: double-quoted defaults, including nested
+   * ones, and heredoc ANSI-C prefixes cut inside an expansion. */
   bool has_ansi_nul;
   bool has_ansi_locale;
   bool has_locale_quote;
@@ -3321,6 +3526,98 @@ static inline SHELL_NONNULL(2) void shell_source_report_word_code(
   scan->code_start = end;
 }
 
+/* Borrow the active re-expanded ANSI-C scope, or NULL when absent. Fragment
+ * bounds stay on their owner instead of suppressing a child's delimiters.
+ * An unfinished lexical quote has no ansi_after and is not a new owner.
+ * The pointer remains valid only until the next scope mutation. */
+static inline SHELL_NONNULL(1) const shell_source_expansion_scope_t
+    *shell_source_active_ansi(const shell_source_substitution_scan_t *scan) {
+  const shell_source_expansion_scope_t *scope = &scan->scope;
+  if (scope->ansi_end && scope->ansi_after)
+    return scope;
+  return scope->ansi_owner ? &scan->scopes[scope->ansi_owner - 1] : NULL;
+}
+
+/* NUL clipping is independent of the inherited escape translation. */
+static inline SHELL_NONNULL(1) const shell_source_expansion_scope_t
+    *shell_source_clipped_ansi(const shell_source_substitution_scan_t *scan) {
+  const shell_source_expansion_scope_t *ansi = shell_source_active_ansi(scan);
+  return ansi && ansi->ansi_after > ansi->ansi_end + 1 ? ansi : NULL;
+}
+
+/* Requires an active clipped fragment from shell_source_clipped_ansi().
+ * A decoded prefix ending inside an expansion requires reconstructed source.
+ * Decline its semantics, but keep complete raw ANSI-C framing. Every popped
+ * scope is discarded once; there is no source-prefix or parent-stack search. */
+static inline SHELL_NONNULL(1) void shell_source_discard_clipped_ansi(
+    shell_source_substitution_scan_t *scan) {
+  shell_source_expansion_scope_t *scope = &scan->scope;
+  unsigned owner = scope->ansi_end && scope->ansi_after > scope->ansi_end + 1
+                       ? scan->scope_count
+                       : scope->ansi_owner - 1;
+  while (scan->scope_count > owner) {
+    if (scope->closer == ')')
+      --scan->arithmetic_depth;
+    *scope = scan->scopes[--scan->scope_count];
+  }
+  scan->has_ansi_nul = true;
+  scan->position = scope->ansi_after;
+  scope->ansi_end = scope->ansi_after = 0;
+  scan->unfinished.body_start = 0;
+}
+
+/* Owner identity for a child about to push the current scope. Translation
+ * context is inherited even without NUL; the stack slot is one-based. */
+static inline SHELL_NONNULL(1) unsigned shell_source_child_ansi_owner(
+    const shell_source_substitution_scan_t *scan) {
+  const shell_source_expansion_scope_t *scope = &scan->scope;
+  return scope->ansi_end && scope->ansi_after ? scan->scope_count + 1
+                                              : scope->ansi_owner;
+}
+
+static inline bool shell_source_process_substitution_enabled(
+    const shell_source_expansion_scope_t *scope) {
+  return !scope->in_double_quote &&
+         (scope->ordinary_word ||
+          (!scope->inherited_double_quote && !scope->suppress_process)) &&
+         !scope->arithmetic_scope;
+}
+
+/* Expansion openers assembled across decoded ANSI-C fragment boundaries have
+ * no contiguous immutable source span. Detect the bounded two-byte prefixes;
+ * complete framing remains available to lexical consumers, while semantic
+ * consumers decline source that would otherwise hide an expansion. */
+static inline bool
+shell_source_translated_expansion_join(char prefix, unsigned char byte,
+                                       bool process_enabled) {
+  if (prefix == '$')
+    return shell_ascii_alpha(byte) || shell_ascii_digit(byte) || byte == '_' ||
+           shell_source_parameter_is_special(byte) || byte == '(' ||
+           byte == '{' || byte == '[' || byte == '\'' || byte == '"';
+  return process_enabled && (prefix == '<' || prefix == '>') && byte == '(';
+}
+
+static inline void
+shell_source_clear_expansion_prefix(shell_source_expansion_scope_t *scope) {
+  scope->expansion_prefix = 0;
+  scope->translated_prefix = false;
+}
+
+static inline bool
+shell_source_accept_expansion_byte(shell_source_expansion_scope_t *scope,
+                                   unsigned char byte, bool process_enabled) {
+  if (scope->translated_prefix &&
+      shell_source_translated_expansion_join(scope->expansion_prefix, byte,
+                                             process_enabled))
+    return false;
+  scope->expansion_prefix =
+      byte == '$' || (process_enabled && (byte == '<' || byte == '>'))
+          ? (char)byte
+          : 0;
+  scope->translated_prefix = false;
+  return true;
+}
+
 /* The selector has already been structurally recognized. Record its parameter
  * category without copying a name or rescanning its operand. */
 static SHELL_NONNULL(1, 4) inline void shell_source_note_parameter(
@@ -3346,9 +3643,11 @@ static SHELL_NONNULL(1, 4) inline void shell_source_note_parameter(
  * Executable substitutions inside math precede its completion event; nested
  * arithmetic is owned by the outer math event and never emitted repeatedly.
  * MALFORMED reports invalid source syntax or nesting-limit failure;
- * INCOMPLETE reports an unfinished expansion at received EOF. Both reject
- * strict consumers; draft consumers distinguish them. Neither reports invalid
- * pointer arguments. Consume
+ * INCOMPLETE reports an unfinished expansion at received EOF. UNSUPPORTED
+ * reports a complete raw child whose body or extent needs translated source.
+ * All reject strict consumers; draft consumers distinguish incomplete input
+ * from unsupported representation. None reports invalid pointer arguments.
+ * Consume
  * through DONE before publishing results: a later malformed enclosing scope
  * can follow a complete substitution. Parameter and arithmetic scopes close
  * during forward traversal, never by balancing and revisiting their suffixes.
@@ -3360,13 +3659,32 @@ static SHELL_NONNULL(1, 4) inline void shell_source_note_parameter(
  */
 static inline SHELL_NONNULL(3, 4, 5, 6) shell_source_scan_status_t
     shell_source_next_word_expansion_body(
-        const char *input, size_t length,
+        const char *input, size_t source_length,
         shell_source_substitution_scan_t *scan, size_t *start, size_t *after,
         shell_source_substitution_kind_t *kind) {
-  while (scan->position < length) {
+  while (scan->position < source_length) {
     SHELL_SOURCE_WORD_SCAN(1);
     shell_source_expansion_scope_t *scope = &scan->scope;
     size_t position = scan->position;
+    const shell_source_expansion_scope_t *ansi = shell_source_active_ansi(scan);
+    const shell_source_expansion_scope_t *clipped =
+        shell_source_clipped_ansi(scan);
+    if (clipped && clipped != scope && position >= clipped->ansi_end) {
+      shell_source_discard_clipped_ansi(scan);
+      shell_source_report_word_code(input, scan, scan->position);
+      continue;
+    }
+    if (ansi && ansi != scope && position >= ansi->ansi_end)
+      return SHELL_SOURCE_SCAN_UNSUPPORTED;
+    if (scope->ansi_end && position >= scope->ansi_end) {
+      if (scope->expansion_prefix)
+        scope->translated_prefix = true;
+      scan->position = scope->ansi_after;
+      shell_source_report_word_code(input, scan, scan->position);
+      scope->ansi_end = scope->ansi_after = 0;
+      continue;
+    }
+    size_t length = clipped ? clipped->ansi_end : source_length;
     if (scope->selector_pending) {
       position =
           shell_source_skip_escaped_line_endings(input, length, position);
@@ -3380,6 +3698,8 @@ static inline SHELL_NONNULL(3, 4, 5, 6) shell_source_scan_status_t
         scope->selector_subscript = true;
         scan->has_arrays = true;
         shell_source_report_word_code(input, scan, position + 1);
+        shell_source_clear_expansion_prefix(scope);
+        unsigned ansi_owner = shell_source_child_ansi_owner(scan);
         scan->scopes[scan->scope_count++] = *scope;
         *scope = (shell_source_expansion_scope_t){
             .suppress_process = true,
@@ -3387,7 +3707,8 @@ static inline SHELL_NONNULL(3, 4, 5, 6) shell_source_scan_status_t
             .parentheses = 1,
             .conditional = scope->conditional,
             .guard_start = scope->guard_start,
-            .guard_parent = scope->guard_parent};
+            .guard_parent = scope->guard_parent,
+            .ansi_owner = ansi_owner};
         scan->position = position + 1;
         continue;
       }
@@ -3438,10 +3759,20 @@ static inline SHELL_NONNULL(3, 4, 5, 6) shell_source_scan_status_t
       scan->has_expansion_termination |=
           has_word && input[operator_position] == '?';
       shell_source_report_word_code(input, scan, word_start);
+      if (has_word)
+        scope->heredoc_phase =
+            shell_source_heredoc_operand_phase(scope->heredoc_phase, operand);
       if (operand == SHELL_SOURCE_PARAMETER_PATTERN) {
+        /* A heredoc pattern starts fresh word quoting. Do not let a later
+         * default recover the preceding quoted operand through a stale
+         * enclosing_double_quote, bypassing the saved heredoc phase.
+         * Ordinary shell patterns retain their enclosing quote instead. */
+        if (shell_source_heredoc_phase_present(scope->heredoc_phase))
+          scope->enclosing_double_quote = false;
         scope->inherited_double_quote = false;
         scope->suppress_process = false;
         scope->heredoc = false;
+        scope->ordinary_word = true;
       }
       if (operand == SHELL_SOURCE_PARAMETER_SUBSTRING) {
         if (word_start < length && input[word_start] == '}')
@@ -3460,12 +3791,6 @@ static inline SHELL_NONNULL(3, 4, 5, 6) shell_source_scan_status_t
       scan->position = word_start;
       continue;
     }
-    if (scope->ansi_end && position >= scope->ansi_end) {
-      scan->position = scope->ansi_end + 1;
-      shell_source_report_word_code(input, scan, scan->position);
-      scope->ansi_end = 0;
-      continue;
-    }
     char c = input[position];
     bool heredoc_root = scope->heredoc && scope->closer == 0;
     if (heredoc_root && c == '\\' && position + 1 < length) {
@@ -3474,16 +3799,24 @@ static inline SHELL_NONNULL(3, 4, 5, 6) shell_source_scan_status_t
           (next == '$' || next == '`' || next == '\\' || next == '\n') ? 2 : 1;
       continue;
     }
-    if (scope->ansi_end && c == '\\') {
+    if (ansi && c == '\\') {
+      if (position + 1 < ansi->ansi_end && input[position + 1] == '\n') {
+        scan->position = position + 2;
+        continue;
+      }
+      shell_source_clear_expansion_prefix(scope);
       size_t escaped = position;
-      while (escaped < scope->ansi_end && input[escaped] == '\\')
+      while (escaped < ansi->ansi_end && input[escaped] == '\\') {
+        SHELL_SOURCE_WORD_SCAN(1);
         escaped++;
+      }
       /* Every pair decodes to one backslash; an unpaired backslash
        * preceding an expansion opener survives ANSI decoding as another
        * backslash. Bash's second expansion sees an unescaped opener for
-       * residues 0 and 3. */
-      if (escaped < scope->ansi_end &&
-          (input[escaped] == '$' || input[escaped] == '`')) {
+       * residues 0 and 3, including inside nested parameter operands. */
+      if (escaped < ansi->ansi_end &&
+          (input[escaped] == '$' || input[escaped] == '`' ||
+           input[escaped] == '<' || input[escaped] == '>')) {
         size_t slashes = escaped - position;
         scan->position =
             slashes % 4 == 0 || slashes % 4 == 3 ? escaped : escaped + 1;
@@ -3493,26 +3826,24 @@ static inline SHELL_NONNULL(3, 4, 5, 6) shell_source_scan_status_t
       continue;
     }
     if (!scope->heredoc && !scope->in_single_quote && !scope->in_double_quote &&
-        !scope->inherited_double_quote && c == '$' &&
+        !scope->inherited_double_quote &&
+        !shell_source_heredoc_phase_reexpanded(scope->heredoc_phase) &&
+        c == '$' &&
         shell_source_logical_next_is(input, length, position, '\'', NULL)) {
       shell_source_report_word_code(input, scan, position);
-      size_t ansi_after = 0;
-      if (!shell_source_skip_complete_ansi_c_quote(input, length, position,
-                                                   &ansi_after)) {
+      size_t ansi_after = position;
+      shell_source_ansi_facts_t facts;
+      if (!shell_source_decode_ansi_c_quote_impl(
+              input, length, &ansi_after, NULL, NULL, SHELL_SOURCE_ANSI_WORD,
+              &facts)) {
         scope->ansi_end = length;
         return SHELL_SOURCE_SCAN_INCOMPLETE;
       }
       scan->has_ansi_c = true;
-      size_t nul_after = position;
-      bool has_nul = false;
-      bool locale_dependent = false;
-      (void)shell_source_ansi_c_quote_facts(input, length, &nul_after, &has_nul,
-                                            &locale_dependent);
-      scan->has_ansi_nul |= has_nul;
-      scan->has_ansi_locale |= locale_dependent;
+      scan->has_ansi_locale |= facts.locale_dependent;
       if (scope->closer == '}' &&
           shell_source_ansi_quote_has_encoded_syntax(
-              input, position, ansi_after,
+              input, position, ansi_after, facts.value_end,
               position == scope->word_start && ansi_after < length &&
                   input[ansi_after] == '}'))
         return SHELL_SOURCE_SCAN_MALFORMED;
@@ -3525,31 +3856,48 @@ static inline SHELL_NONNULL(3, 4, 5, 6) shell_source_scan_status_t
       continue;
     }
     if (!scope->heredoc && !scope->in_single_quote && !scope->in_double_quote &&
-        scope->inherited_double_quote && !scope->ansi_end && c == '$' &&
+        (scope->inherited_double_quote ||
+         shell_source_heredoc_phase_reexpanded(scope->heredoc_phase)) &&
+        !scope->ansi_end && c == '$' &&
         shell_source_logical_next_is(input, length, position, '\'', NULL)) {
-      size_t ansi_after = 0;
-      if (!shell_source_skip_complete_ansi_c_quote(input, length, position,
-                                                   &ansi_after)) {
+      size_t ansi_after = position;
+      shell_source_ansi_facts_t facts;
+      if (!shell_source_decode_ansi_c_quote_impl(
+              input, length, &ansi_after, NULL, NULL, SHELL_SOURCE_ANSI_WORD,
+              &facts)) {
         shell_source_report_word_code(input, scan, position);
         scope->ansi_end = length;
         return SHELL_SOURCE_SCAN_INCOMPLETE;
       }
       scan->has_ansi_c = true;
-      size_t nul_after = position;
-      bool has_nul = false;
-      bool locale_dependent = false;
-      (void)shell_source_ansi_c_quote_facts(input, length, &nul_after, &has_nul,
-                                            &locale_dependent);
-      scan->has_ansi_nul |= has_nul;
-      scan->has_ansi_locale |= locale_dependent;
+      scan->has_ansi_nul |= facts.has_nul && scope->enclosing_double_quote;
+      scan->has_ansi_locale |= facts.locale_dependent;
       if (scope->closer == '}' &&
           shell_source_ansi_quote_has_encoded_syntax(
-              input, position, ansi_after,
+              input, position, ansi_after, facts.value_end,
               position == scope->word_start && ansi_after < length &&
                   input[ansi_after] == '}'))
         return SHELL_SOURCE_SCAN_MALFORMED;
       shell_source_report_word_code(input, scan, position);
-      scope->ansi_end = ansi_after - 1;
+      if (scope->expansion_prefix) {
+        scope->translated_prefix = true;
+        if (facts.has_value &&
+            shell_source_translated_expansion_join(
+                scope->expansion_prefix, facts.first_byte,
+                shell_source_process_substitution_enabled(scope)))
+          return SHELL_SOURCE_SCAN_UNSUPPORTED;
+        if (facts.has_value)
+          shell_source_clear_expansion_prefix(scope);
+      }
+      if (facts.has_nul && scope->enclosing_double_quote) {
+        /* This unsupported translation need not expose partial execution.
+         * Raw grammar still consumes the complete fragment. */
+        scan->position = ansi_after;
+        shell_source_report_word_code(input, scan, ansi_after);
+        continue;
+      }
+      scope->ansi_end = facts.value_end;
+      scope->ansi_after = ansi_after;
       scan->position =
           shell_source_logical_following(input, length, position) + 1;
       continue;
@@ -3557,6 +3905,8 @@ static inline SHELL_NONNULL(3, 4, 5, 6) shell_source_scan_status_t
     if (c == '\\' && !scope->in_single_quote && position + 1 < length) {
       size_t continued =
           shell_source_skip_escaped_line_endings(input, length, position);
+      if (continued == position)
+        shell_source_clear_expansion_prefix(scope);
       scan->position =
           continued != position ? continued
           : scope->delimiter_quote == '\'' && input[position + 1] == '\''
@@ -3564,8 +3914,23 @@ static inline SHELL_NONNULL(3, 4, 5, 6) shell_source_scan_status_t
               : position + 2;
       continue;
     }
+    /* Empty quotes are transparent in an inherited shell double-quoted
+     * default. Ordinary-word and heredoc operands retain the quote boundary,
+     * even when it contributes no bytes; their normal quote transition clears
+     * a pending reconstructed opener. */
+    if (!heredoc_root && !scope->ansi_end && scope->translated_prefix &&
+        scope->inherited_double_quote && !scope->ordinary_word &&
+        !shell_source_heredoc_phase_present(scope->heredoc_phase) && c == '"') {
+      size_t close = shell_source_logical_following(input, length, position);
+      if (close < length && input[close] == '"') {
+        scan->position = close + 1;
+        shell_source_report_word_code(input, scan, scan->position);
+        continue;
+      }
+    }
     if (scope->inherited_double_quote && !scope->ansi_end &&
         (c == '\'' || c == '"')) {
+      shell_source_clear_expansion_prefix(scope);
       if (!scope->delimiter_quote)
         scope->delimiter_quote = c;
       else if (scope->delimiter_quote == c)
@@ -3573,13 +3938,14 @@ static inline SHELL_NONNULL(3, 4, 5, 6) shell_source_scan_status_t
     }
     if (!heredoc_root && c == '\'' && !scope->ansi_end &&
         !scope->in_double_quote && !scope->inherited_double_quote) {
+      shell_source_clear_expansion_prefix(scope);
       shell_source_report_word_code(input, scan, position);
       scope->in_single_quote = !scope->in_single_quote;
       scan->position++;
       continue;
     }
-    if (!heredoc_root && c == '"' && !scope->ansi_end &&
-        !scope->in_single_quote) {
+    if (!heredoc_root && c == '"' && !scope->in_single_quote) {
+      shell_source_clear_expansion_prefix(scope);
       shell_source_report_word_code(input, scan, position);
       scope->in_double_quote = !scope->in_double_quote;
       scan->position++;
@@ -3589,6 +3955,13 @@ static inline SHELL_NONNULL(3, 4, 5, 6) shell_source_scan_status_t
       scan->position++;
       continue;
     }
+    bool reexpanded_word =
+        ansi || scope->inherited_double_quote ||
+        shell_source_heredoc_phase_reexpanded(scope->heredoc_phase);
+    bool process_enabled = shell_source_process_substitution_enabled(scope);
+    if (reexpanded_word && !shell_source_accept_expansion_byte(
+                               scope, (unsigned char)c, process_enabled))
+      return SHELL_SOURCE_SCAN_UNSUPPORTED;
     /* Legacy arithmetic has its own bracket grammar. Do not let its spaces
      * and parentheses become outer list syntax or manufacture a syntax-error
      * judgment. Semantic consumers already decline unsupported arithmetic. */
@@ -3617,6 +3990,11 @@ static inline SHELL_NONNULL(3, 4, 5, 6) shell_source_scan_status_t
         scan->code_start = length;
         return SHELL_SOURCE_SCAN_INCOMPLETE;
       }
+      if (ansi && (substitution_after > ansi->ansi_end ||
+                   shell_source_ansi_child_needs_translation(
+                       input, position + 1, substitution_after - 1)))
+        return SHELL_SOURCE_SCAN_UNSUPPORTED;
+      shell_source_clear_expansion_prefix(scope);
       scan->code_start = substitution_after;
       *start = position;
       *after = substitution_after;
@@ -3645,13 +4023,24 @@ static inline SHELL_NONNULL(3, 4, 5, 6) shell_source_scan_status_t
         return SHELL_SOURCE_SCAN_MALFORMED;
       }
       shell_source_note_parameter(input, length, selector, scan);
+      shell_source_clear_expansion_prefix(scope);
+      unsigned ansi_owner = shell_source_child_ansi_owner(scan);
       scan->scopes[scan->scope_count++] = *scope;
       scan->position = head_after;
-      scope->suppress_process = scope->suppress_process ||
-                                scope->in_double_quote ||
-                                scope->inherited_double_quote;
-      scope->inherited_double_quote = (scope->inherited_double_quote ||
-                                       scope->in_double_quote || heredoc_root);
+      if (heredoc_root)
+        scope->heredoc_phase = SHELL_SOURCE_HEREDOC_PHASE_ROOT;
+      else if (scope->in_double_quote &&
+               shell_source_heredoc_phase_present(scope->heredoc_phase))
+        scope->heredoc_phase = SHELL_SOURCE_HEREDOC_PHASE_BLOCKED;
+      scope->ordinary_word &= !scope->in_double_quote;
+      scope->enclosing_double_quote |= scope->in_double_quote;
+      scope->suppress_process =
+          scope->suppress_process || scope->enclosing_double_quote ||
+          shell_source_heredoc_phase_present(scope->heredoc_phase) ||
+          scope->inherited_double_quote;
+      scope->inherited_double_quote =
+          (scope->inherited_double_quote || scope->enclosing_double_quote ||
+           shell_source_heredoc_phase_inherits_word(scope->heredoc_phase));
       scope->in_single_quote = false;
       scope->in_double_quote = false;
       scope->delimiter_quote = 0;
@@ -3661,6 +4050,8 @@ static inline SHELL_NONNULL(3, 4, 5, 6) shell_source_scan_status_t
       scope->selector_indirect = indirect;
       scope->selector_subscript = false;
       scope->ansi_end = 0;
+      scope->ansi_after = 0;
+      scope->ansi_owner = ansi_owner;
       scope->closer = '}';
       continue;
     }
@@ -3675,6 +4066,8 @@ static inline SHELL_NONNULL(3, 4, 5, 6) shell_source_scan_status_t
       scan->has_expansion_abort = true;
       scan->arithmetic_depth++;
       shell_source_report_word_code(input, scan, open + 1);
+      shell_source_clear_expansion_prefix(scope);
+      unsigned ansi_owner = shell_source_child_ansi_owner(scan);
       scan->scopes[scan->scope_count++] = *scope;
       scan->position = open + 1;
       *scope =
@@ -3682,6 +4075,7 @@ static inline SHELL_NONNULL(3, 4, 5, 6) shell_source_scan_status_t
                                            .conditional = scope->conditional,
                                            .guard_start = scope->guard_start,
                                            .guard_parent = scope->guard_parent,
+                                           .ansi_owner = ansi_owner,
                                            .arithmetic_scope = true,
                                            .closer = ')',
                                            .expansion_start = position,
@@ -3700,6 +4094,11 @@ static inline SHELL_NONNULL(3, 4, 5, 6) shell_source_scan_status_t
         scan->code_start = length;
         return SHELL_SOURCE_SCAN_INCOMPLETE;
       }
+      if (ansi && (substitution_after > ansi->ansi_end ||
+                   shell_source_ansi_child_needs_translation(
+                       input, open + 1, substitution_after - 1)))
+        return SHELL_SOURCE_SCAN_UNSUPPORTED;
+      shell_source_clear_expansion_prefix(scope);
       scan->code_start = substitution_after;
       *start = position;
       *after = substitution_after;
@@ -3707,9 +4106,7 @@ static inline SHELL_NONNULL(3, 4, 5, 6) shell_source_scan_status_t
       scan->position = substitution_after;
       return SHELL_SOURCE_SCAN_FOUND;
     }
-    if (!scope->in_double_quote && !scope->inherited_double_quote &&
-        !scope->suppress_process && !scope->arithmetic_scope &&
-        (c == '<' || c == '>') &&
+    if (process_enabled && (c == '<' || c == '>') &&
         shell_source_process_substitution_open(input, length, position,
                                                &open)) {
       size_t substitution_after = 0;
@@ -3723,6 +4120,11 @@ static inline SHELL_NONNULL(3, 4, 5, 6) shell_source_scan_status_t
         scan->code_start = length;
         return SHELL_SOURCE_SCAN_INCOMPLETE;
       }
+      if (ansi && (substitution_after > ansi->ansi_end ||
+                   shell_source_ansi_child_needs_translation(
+                       input, open + 1, substitution_after - 1)))
+        return SHELL_SOURCE_SCAN_UNSUPPORTED;
+      shell_source_clear_expansion_prefix(scope);
       scan->code_start = substitution_after;
       *start = position;
       *after = substitution_after;
@@ -3738,6 +4140,7 @@ static inline SHELL_NONNULL(3, 4, 5, 6) shell_source_scan_status_t
         size_t selector =
             shell_source_logical_following(input, length, position);
         shell_source_note_parameter(input, variable_after, selector, scan);
+        shell_source_clear_expansion_prefix(scope);
         scan->position = variable_after;
         continue;
       }
@@ -3830,11 +4233,21 @@ static inline SHELL_NONNULL(3, 4, 5, 6) shell_source_scan_status_t
                                      shell_source_substitution_scan_t *scan,
                                      size_t *start, size_t *after,
                                      shell_source_substitution_kind_t *kind) {
-  shell_source_scan_status_t status = shell_source_next_word_expansion_body(
-      input, length, scan, start, after, kind);
-  size_t end = status == SHELL_SOURCE_SCAN_INCOMPLETE ? length : scan->position;
-  shell_source_report_word_code(input, scan, end);
-  return status;
+  for (;;) {
+    shell_source_scan_status_t status = shell_source_next_word_expansion_body(
+        input, length, scan, start, after, kind);
+    if ((status == SHELL_SOURCE_SCAN_INCOMPLETE ||
+         status == SHELL_SOURCE_SCAN_MALFORMED) &&
+        !scan->exhausted && shell_source_clipped_ansi(scan)) {
+      shell_source_discard_clipped_ansi(scan);
+      shell_source_report_word_code(input, scan, scan->position);
+      continue;
+    }
+    size_t end =
+        status == SHELL_SOURCE_SCAN_INCOMPLETE ? length : scan->position;
+    shell_source_report_word_code(input, scan, end);
+    return status;
+  }
 }
 
 /* Compatibility adapter for consumers that need only executable command or
@@ -4611,22 +5024,8 @@ static SHELL_NONNULL(1) inline bool shell_source_brace_scan_step(
 
 typedef struct {
   size_t after;
-  bool complete, expands, own_expands, dynamic, valid, has_nul;
+  bool complete, expands, own_expands, dynamic, valid;
 } shell_source_brace_fragment_t;
-
-typedef struct {
-  shell_source_brace_fragment_t *fragment;
-  shell_source_glob_scan_t *glob;
-} shell_source_brace_ansi_context_t;
-
-static SHELL_NONNULL(2) inline bool shell_source_brace_ansi_byte(
-    unsigned char byte, void *context) {
-  shell_source_brace_ansi_context_t *ansi =
-      (shell_source_brace_ansi_context_t *)context;
-  ansi->fragment->has_nul = ansi->fragment->has_nul || byte == 0;
-  shell_source_glob_scan_step(ansi->glob, byte, true);
-  return true;
-}
 
 static SHELL_NONNULL(2) inline bool shell_source_glob_ansi_byte(
     unsigned char byte, void *context) {
@@ -4680,7 +5079,7 @@ static SHELL_NONNULL(1) inline bool shell_source_word_has_glob(
     }
     if (!quote && byte == '$' &&
         shell_source_logical_next_is(input, length, position, '\'', NULL)) {
-      if (!shell_source_decode_ansi_c_quote(
+      if (!shell_source_decode_ansi_c_word(
               input, length, &position, shell_source_glob_ansi_byte, &brackets))
         return false;
       continue;
@@ -4801,9 +5200,8 @@ static SHELL_NONNULL(1) inline shell_source_brace_fragment_t
     if (!quote && c == '$' &&
         shell_source_logical_next_is(input, length, position, '\'', NULL)) {
       shell_source_brace_scan_literal(&braces);
-      shell_source_brace_ansi_context_t ansi = {&result, &glob};
-      if (!shell_source_decode_ansi_c_quote(
-              input, length, &position, shell_source_brace_ansi_byte, &ansi)) {
+      if (!shell_source_decode_ansi_c_word(
+              input, length, &position, shell_source_glob_ansi_byte, &glob)) {
         result.valid = false;
         return result;
       }
@@ -4973,8 +5371,8 @@ shell_source_word_expansion(const char *input, size_t length,
         shell_source_logical_next_is(input, length, position, '\'', NULL)) {
       shell_source_brace_scan_literal(&braces);
       size_t after = position;
-      if (!shell_source_decode_ansi_c_quote(input, length, &after,
-                                            shell_source_glob_ansi_byte, &glob))
+      if (!shell_source_decode_ansi_c_word(input, length, &after,
+                                           shell_source_glob_ansi_byte, &glob))
         return (shell_source_word_expansion_t){.dynamic = true};
       position = after;
       if (prefix != PREFIX_VALUE)
@@ -5064,11 +5462,11 @@ static inline SHELL_NONNULL(1) bool shell_source_argument_has_dynamic_syntax(
 }
 
 /* Visit a complete word's literal projection without allocating: remove quotes,
- * decode ANSI-C fragments, and erase empty process fragments. Dynamic spelling
- * is not evaluated; callers requiring a static value use the wrapper below.
- * Shared projection keeps semantic option-prefix recognition and graph static
- * command/wrapper recognition aligned without confusing spelling with a value.
- * word is a required readable span (including length zero); visitor is
+ * decode effective ANSI-C values, and erase empty process fragments. Dynamic
+ * spelling is not evaluated; callers requiring a static value use the wrapper
+ * below. Shared projection keeps semantic option-prefix recognition and graph
+ * static command/wrapper recognition aligned without confusing spelling with a
+ * value. word is a required readable span (including length zero); visitor is
  * required. context is passed through and may be NULL if the visitor allows
  * it. The visitor must not modify the word. */
 static inline SHELL_NONNULL(1, 3) bool shell_source_visit_decoded_word(
@@ -5090,8 +5488,8 @@ static inline SHELL_NONNULL(1, 3) bool shell_source_visit_decoded_word(
     if (quote == '\0' && c == '$' &&
         shell_source_logical_next_is(word, word_length, position, '\'', NULL)) {
       size_t after = position;
-      if (!shell_source_decode_ansi_c_quote(word, word_length, &after, visitor,
-                                            context))
+      if (!shell_source_decode_ansi_c_word(word, word_length, &after, visitor,
+                                           context))
         return false;
       position = after - 1;
       continue;
@@ -5238,8 +5636,8 @@ static inline SHELL_NONNULL(1, 5) bool shell_source_scan_decoded_assignment(
         shell_source_logical_next_is(word, word_length, position, '\'', NULL)) {
       size_t after = position;
       scan.source_position = SIZE_MAX;
-      if (!shell_source_decode_ansi_c_quote(
-              word, word_length, &after, shell_source_assignment_emit, &scan))
+      if (!shell_source_decode_ansi_c_word(word, word_length, &after,
+                                           shell_source_assignment_emit, &scan))
         return false;
       if (scan.found) {
         *out = scan.result;

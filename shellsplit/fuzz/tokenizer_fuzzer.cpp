@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "../tests/ansi_nul_cases.h"
 #include "../tests/ansi_parameter_cases.h"
 #include "../tests/depgraph_compare.h"
 #include "../tests/malformed_source_cases.h"
@@ -234,9 +235,26 @@ static bool tokenizer_unsupported_semantics_rejected(const char *input,
   shell_dep_graph_t graph = {};
 
   bool source_only = false;
-  bool definitely_unsupported = shell_tokenizer_inspect_semantics(
-      input, length, tokenizer_observe_semantic_token,
-      tokenizer_observe_read_fd, tokenizer_observe_process, &source_only);
+  bool definitely_unsupported = false;
+  bool semantic_scan_complete = false;
+  size_t source_workspace_size = 0;
+  static std::vector<std::max_align_t> semantic_workspace;
+  if (shell_source_workspace_size(length, &source_workspace_size)) {
+    size_t unit = sizeof(std::max_align_t);
+    size_t units =
+        source_workspace_size / unit + (source_workspace_size % unit != 0);
+    if (semantic_workspace.size() < units)
+      semantic_workspace.resize(units);
+    shell_source_operation_begin(input, length);
+    shell_source_workspace_scope_t previous = shell_source_workspace_begin(
+        input, length, semantic_workspace.data(), source_workspace_size);
+    definitely_unsupported = shell_tokenizer_inspect_semantics(
+        input, length, tokenizer_observe_semantic_token,
+        tokenizer_observe_read_fd, tokenizer_observe_process, &source_only);
+    semantic_scan_complete = !shell_source_scratch_exhausted();
+    shell_source_workspace_end(previous);
+    shell_source_operation_end();
+  }
   const shell_dep_limits_t limits = SHELL_DEP_LIMITS_DEFAULT;
   shell_dep_error_t graph_status =
       fuzz_dep_graph_parse(input, length, ".", &limits, &graph);
@@ -244,12 +262,13 @@ static bool tokenizer_unsupported_semantics_rejected(const char *input,
    * still produce a complete validated graph or a valid rejection/truncation;
    * fixed oracles separately assert contextual acceptance and rejection. */
   bool graph_contract =
-      definitely_unsupported
-          ? graph_status == SHELL_DEP_EPARSE && graph.node_count == 0 &&
-                graph.edge_count == 0 && graph.status == SHELL_DEP_STATUS_ERROR
-          : graph_status != SHELL_DEP_EWORKSPACE &&
-                shellsplit_test_depgraph_invariants(input, length, graph_status,
-                                                    &graph, &limits);
+      semantic_scan_complete &&
+      (definitely_unsupported
+           ? graph_status == SHELL_DEP_EPARSE && graph.node_count == 0 &&
+                 graph.edge_count == 0 && graph.status == SHELL_DEP_STATUS_ERROR
+           : graph_status != SHELL_DEP_EWORKSPACE &&
+                 shellsplit_test_depgraph_invariants(
+                     input, length, graph_status, &graph, &limits));
   bool rejected =
       graph_contract &&
       shell_process_commands(input, length, nullptr, &processed) ==
@@ -340,10 +359,25 @@ static const char *kCwdStrategies[] = {
 constexpr int kCwdStrategiesN =
     sizeof(kCwdStrategies) / sizeof(kCwdStrategies[0]);
 
-/* Fuzzing is a caller too: keep resolver storage explicit and reuse it across
- * inputs instead of relying on the library to allocate a hidden multi-MiB
- * route table. */
+/* Fuzzing is a caller too: keep graph and source scratch explicit and reuse it
+ * across inputs instead of relying on hidden allocation. The graph's fixed
+ * prefix and source-sized tail are both part of its documented workspace. */
 static std::vector<std::max_align_t> g_depgraph_workspace;
+static std::vector<std::max_align_t> g_source_workspace;
+
+static bool fuzz_source_limits(size_t source_length,
+                               shell_limits_t *effective) {
+  size_t required = 0;
+  if (!shell_source_workspace_size(source_length, &required))
+    return false;
+  size_t units = required / sizeof(std::max_align_t) +
+                 (required % sizeof(std::max_align_t) != 0);
+  if (g_source_workspace.size() < units)
+    g_source_workspace.resize(units);
+  effective->workspace = g_source_workspace.data();
+  effective->workspace_size = required;
+  return true;
+}
 
 /* Existing reference fixtures describe internal document/pipe relations.
  * Boundary routing has a separate fixed oracle and is never projected out of
@@ -359,17 +393,22 @@ static bool internal_graph_relation(const shell_dep_graph_t &graph,
 }
 
 static bool fuzz_dep_limits(const shell_dep_limits_t *limits,
+                            size_t source_length,
                             shell_dep_limits_t *effective) {
   if (!effective)
     return false;
   *effective = limits ? *limits : SHELL_DEP_LIMITS_DEFAULT;
   if (effective->workspace)
     return true;
-  size_t required = 0;
+  size_t graph_size = 0;
+  size_t source_size = 0;
   size_t alignment = shell_dep_workspace_alignment();
-  if (!shell_dep_workspace_size(effective, &required) || alignment == 0 ||
+  if (!shell_dep_workspace_size(effective, &graph_size) ||
+      !shell_source_workspace_size(source_length, &source_size) ||
+      graph_size > SIZE_MAX - source_size || alignment == 0 ||
       alignment > alignof(std::max_align_t))
     return false;
+  size_t required = graph_size + source_size;
   size_t units =
       (required + sizeof(std::max_align_t) - 1) / sizeof(std::max_align_t);
   g_depgraph_workspace.resize(units);
@@ -383,7 +422,7 @@ static shell_dep_error_t fuzz_dep_graph_parse(const char *cmd, size_t cmd_len,
                                               const shell_dep_limits_t *limits,
                                               shell_dep_graph_t *out) {
   shell_dep_limits_t effective;
-  if (!fuzz_dep_limits(limits, &effective))
+  if (!fuzz_dep_limits(limits, cmd_len, &effective))
     return SHELL_DEP_EWORKSPACE;
   return shell_dep_graph_parse(cmd, cmd_len, initial_cwd, &effective, out);
 }
@@ -1315,10 +1354,20 @@ static int test_fixed_oracles(void) {
       "2>err <<EOF\nEOF\n",
       "cat <<A <<B\nA\nB\n",
       "printf x; <<A <<B\nA\nB\n",
+      /* Grouped delimiter printing needs more than the default scratch even
+       * before a document body arrives. Keep both incomplete and complete
+       * forms, and the CI text prefix before its first embedded NUL. */
+      "cat <<$(printf x)",
+      "cat <<$(printf x)\npayload\n$(printf x)\n",
+      "cat <<${x:-$(printf x)}\npayload\n${x:-$(printf x)}\n",
+      ("cat <<=$(printf '%s\\\\n' \"$i\" | tr -d '\\\\n'); "
+       "[[ \"$data\" == 3 ]] && con"),
   };
   for (const char *source : iterator_document_lists)
-    if (test_tokenizer_state(source, strlen(source)))
+    if (test_tokenizer_state(source, strlen(source))) {
+      fprintf(stderr, "fixed tokenizer document oracle failed: %s\n", source);
       return fixed_oracle_failure(__LINE__);
+    }
   /* Diagnostic function-like headers can leave an ordinary word in the
    * current flat record before an empty body/group. A later opener must not
    * erase that word's pending newline. No function semantics are accepted. */
@@ -2446,6 +2495,7 @@ static int test_fixed_oracles(void) {
       "printf x >&file[[[[[:unfinished",
       "printf x >&{[$'a']}",
       "printf x >&{[$'']}",
+      "printf x >&$'a\\0b'",
   };
   for (const char *input : static_legacy_redirect_cases) {
     shell_processed_commands_t processed = {};
@@ -2468,7 +2518,6 @@ static int test_fixed_oracles(void) {
   static const char *const invalid_static_legacy_redirects[] = {
       "printf x >&2147483648",
       "printf x >&00000000000000000000000000000000002147483648",
-      "printf x >&$'a\\0b'",
   };
   for (const char *input : invalid_static_legacy_redirects) {
     shell_processed_commands_t processed = {};
@@ -3162,15 +3211,18 @@ static int test_fixed_oracles(void) {
   }
 
   /* Consume real parser output unchanged. Fabricating omitted commands or
-   * groups violates the internal API contract and is not a runtime oracle. */
-  for (const char *source :
-       {"time { true; }", "time true; false", "{ true; }", "true; false"}) {
+   * groups violates the internal API contract and is not a runtime oracle.
+   * The boundary-heavy quoted word exceeds the default source scratch and
+   * keeps the fast/graph comparison resource-equivalent. */
+  for (const char *source : {"time { true; }", "time true; false", "{ true; }",
+                             "true; false", "('[[[[[[[['|cmd[)"}) {
     shell_parse_result_t fast = {};
     shell_dep_graph_t graph = {};
     shell_dep_limits_t limits;
-    const shell_limits_t strict = {SHELL_MAX_SUBCOMMANDS, true, nullptr, 0};
-    if (shell_parse_fast(source, strlen(source), &strict, &fast) != SHELL_OK ||
-        !fuzz_dep_limits(nullptr, &limits))
+    shell_limits_t strict = {SHELL_MAX_SUBCOMMANDS, true, nullptr, 0};
+    if (!fuzz_source_limits(strlen(source), &strict) ||
+        shell_parse_fast(source, strlen(source), &strict, &fast) != SHELL_OK ||
+        !fuzz_dep_limits(nullptr, strlen(source), &limits))
       return fixed_oracle_failure(__LINE__);
     shell_parse_result_t unchanged;
     /* This byte-for-byte snapshot checks immutability of one object, not
@@ -3480,8 +3532,8 @@ static int test_fixed_oracles(void) {
   }
 
   /* Standalone word decoding preserves bytes, including a NUL produced by an
-   * ANSI-C quote after an escaped LF. Complete-command semantics
-   * reject that source: Bash truncates the quoted segment at the NUL. Keep
+   * ANSI-C quote after an escaped LF. Complete-command semantics truncate
+   * that fragment and resume subsequent fragments. Keep
    * these distinct contracts outside the bounded smoke corpus. */
   static const char *const continued_ansi_words[] = {
       "$\\\n'\\x41\\0B'",
@@ -3511,13 +3563,13 @@ static int test_fixed_oracles(void) {
                sizeof(continued_ansi_expected)) == 0 &&
         command_length > 0 && (size_t)command_length < sizeof(command) &&
         shell_process_command(command, (size_t)command_length, nullptr, &infos,
-                              &info_count) == SHELL_PROCESS_EPARSE &&
-        infos == nullptr && info_count == 0 &&
+                              &info_count) == SHELL_PROCESS_OK &&
+        infos != nullptr && info_count == 1 &&
         shell_build_anomaly_netseqs_buffer(
             command, (size_t)command_length, nullptr, &command_netseq,
-            &type_netseq, &sequence_count) == SHELL_PROCESS_EPARSE &&
-        command_netseq.data == nullptr && type_netseq.data == nullptr &&
-        sequence_count == 0;
+            &type_netseq, &sequence_count) == SHELL_PROCESS_OK &&
+        command_netseq.data != nullptr && type_netseq.data != nullptr &&
+        sequence_count == 1;
     shell_netstring_buffer_free(&command_netseq);
     shell_netstring_buffer_free(&type_netseq);
     shell_command_infos_free(infos, info_count);
@@ -5204,8 +5256,10 @@ static int test_depgraph(const char *input, size_t length, const char *cwd) {
     if (i == 0) {
       /* The supplied path consumes the same strict parse as the public path.
        * Compare real results, not arbitrary source/metadata combinations. */
-      const shell_limits_t strict = {SHELL_MAX_SUBCOMMANDS, true, nullptr, 0};
+      shell_limits_t strict = {SHELL_MAX_SUBCOMMANDS, true, nullptr, 0};
       shell_parse_result_t fast = {};
+      if (!fuzz_source_limits(length, &strict))
+        return 1;
       shell_error_t fast_error =
           shell_parse_fast(input, length, &strict, &fast);
       if (fast_error == SHELL_OK || fast_error == SHELL_ETRUNC) {
@@ -5214,7 +5268,7 @@ static int test_depgraph(const char *input, size_t length, const char *cwd) {
          * check; independently constructed metadata uses field comparison. */
         memcpy(&unchanged, &fast, sizeof(unchanged));
         shell_dep_limits_t effective;
-        if (!fuzz_dep_limits(&limits[i], &effective))
+        if (!fuzz_dep_limits(&limits[i], length, &effective))
           return 1;
         shell_dep_graph_t supplied = {};
         shell_dep_error_t supplied_error = shell_dep_graph_parse_with_fast(
@@ -5370,9 +5424,34 @@ static bool tokenizer_token_is_line_continuation(const shell_token_t &token) {
 }
 
 static int test_tokenizer_state(const char *input, size_t length) {
-  shell_tokenizer_state_t state = {};
-  shell_tokenizer_init(&state, input, length, NULL);
+  size_t workspace_size;
+  if (!shell_source_workspace_size(length, &workspace_size))
+    return 1;
+  /* Reuse storage, but initialize independent operations for predicates and
+   * lexical iteration. All compared paths need sufficient delimiter/array
+   * scratch: exhaustion in a small default buffer is not a syntax result.
+   * The allocating tokenizer still runs in its own fresh source operation. */
+  static std::vector<std::max_align_t> workspace;
+  const size_t unit = sizeof(std::max_align_t);
+  const size_t units = workspace_size / unit + (workspace_size % unit != 0);
+  if (workspace.size() < units)
+    workspace.resize(units);
+  shell_source_operation_begin(input, length);
+  shell_source_workspace_scope_t previous = shell_source_workspace_begin(
+      input, length, workspace.data(), workspace_size);
   bool unsupported = shell_tokenizer_has_unsupported_semantics(input, length);
+  bool syntax_valid = shell_tokenizer_list_syntax_valid(input, length);
+  bool exhausted = shell_source_scratch_exhausted();
+  shell_source_workspace_end(previous);
+  shell_source_operation_end();
+  if (exhausted)
+    return 1;
+
+  shell_tokenizer_state_t state = {};
+  shell_limits_t limits = SHELL_LIMITS_DEFAULT;
+  limits.workspace = workspace.data();
+  limits.workspace_size = workspace_size;
+  shell_tokenizer_init(&state, input, length, &limits);
 
   size_t steps = 0;
   size_t previous_end = 0;
@@ -5468,7 +5547,6 @@ static int test_tokenizer_state(const char *input, size_t length) {
 
   shell_command_t *commands = NULL;
   size_t command_count = 0;
-  bool syntax_valid = shell_tokenizer_list_syntax_valid(input, length);
   /* List grammar alone is not complete lexical validity: the iterator keeps
    * an unfinished quote/document for diagnostics, while the allocating API
    * rejects these specific unfinished lexical states. */
@@ -6643,7 +6721,8 @@ static int test_substitution_case(const shell_substitution_fuzz_case_t &item,
 
   shell_dep_graph_validation_t validation = shell_dep_graph_validate(&graph);
   if (item.source_rejected) {
-    bool failed = fast_error != SHELL_EPARSE ||
+    bool failed = fast_error != (item.raw_complete ? SHELL_OK : SHELL_EPARSE) ||
+                  fast.count != (item.raw_complete ? 1u : 0u) ||
                   full_error != SHELL_TOKENIZE_OK ||
                   process_error != SHELL_PROCESS_EPARSE ||
                   netargv_error != SHELL_PROCESS_EPARSE ||
@@ -8016,9 +8095,127 @@ static void run_fixed_oracles() {
         abort();
       }
     }
+    for (const char *source : shellsplit_test_nested_ansi_nul) {
+      size_t length = strlen(source);
+      shell_processed_commands_t processed = {};
+      bool rejected =
+          shell_parse_draft(source, length, nullptr, draft) ==
+              SHELL_SOURCE_COMPLETE &&
+          draft->prefix_length == length &&
+          shell_process_commands(source, length, nullptr, &processed) ==
+              SHELL_PROCESS_EPARSE &&
+          !processed.commands && !processed.command_count &&
+          shell_dep_graph_parse_with_fast(source, length, "/workspace", nullptr,
+                                          &draft->prefix,
+                                          &graph) == SHELL_DEP_EPARSE &&
+          !graph.node_count && !graph.edge_count;
+      shell_processed_commands_free(&processed);
+      if (!rejected) {
+        fprintf(stderr, "nested ANSI-C quote oracle failed: %s\n", source);
+        abort();
+      }
+    }
+    for (const char *source : shellsplit_test_ansi_translated_children) {
+      size_t length = strlen(source);
+      shell_parse_result_t fast = {};
+      shell_processed_commands_t processed = {};
+      shell_dep_limits_t limits;
+      bool rejected =
+          fuzz_dep_limits(nullptr, length, &limits) &&
+          shell_parse_draft(source, length, nullptr, draft) ==
+              SHELL_SOURCE_UNSUPPORTED &&
+          !draft->prefix_length && !draft->prefix.count &&
+          shell_tokenizer_has_unsupported_semantics(source, length) &&
+          shell_parse_fast(source, length, nullptr, &fast) == SHELL_OK &&
+          shell_process_commands(source, length, nullptr, &processed) ==
+              SHELL_PROCESS_EPARSE &&
+          !processed.commands && !processed.command_count &&
+          shell_dep_graph_parse_with_fast(source, length, "/workspace", &limits,
+                                          &fast, &graph) == SHELL_DEP_EPARSE &&
+          !graph.node_count && !graph.edge_count;
+      shell_processed_commands_free(&processed);
+      if (!rejected) {
+        fprintf(stderr, "translated ANSI-C child oracle failed: %s\n", source);
+        abort();
+      }
+    }
+    for (const char *source : shellsplit_test_ansi_translated_joins) {
+      size_t length = strlen(source);
+      shell_parse_result_t fast = {};
+      shell_processed_commands_t processed = {};
+      shell_dep_limits_t limits;
+      bool rejected =
+          fuzz_dep_limits(nullptr, length, &limits) &&
+          shell_parse_draft(source, length, nullptr, draft) ==
+              SHELL_SOURCE_UNSUPPORTED &&
+          !draft->prefix_length && !draft->prefix.count &&
+          shell_tokenizer_has_unsupported_semantics(source, length) &&
+          shell_parse_fast(source, length, nullptr, &fast) == SHELL_OK &&
+          shell_process_commands(source, length, nullptr, &processed) ==
+              SHELL_PROCESS_EPARSE &&
+          !processed.commands && !processed.command_count &&
+          shell_dep_graph_parse_with_fast(source, length, "/workspace", &limits,
+                                          &fast, &graph) == SHELL_DEP_EPARSE &&
+          !graph.node_count && !graph.edge_count;
+      shell_processed_commands_free(&processed);
+      if (!rejected) {
+        fprintf(stderr, "translated ANSI-C join oracle failed: %s\n", source);
+        abort();
+      }
+    }
+    for (const auto &fixture : shellsplit_test_ansi_nested_runs) {
+      const char *source = fixture.source;
+      size_t length = strlen(source);
+      shell_dep_limits_t limits;
+      bool valid = fuzz_dep_limits(nullptr, length, &limits) &&
+                   shell_parse_draft(source, length, nullptr, draft) ==
+                       SHELL_SOURCE_COMPLETE &&
+                   draft->prefix_length == length &&
+                   draft->header_count == 1 + fixture.children &&
+                   shell_dep_graph_parse_with_fast(source, length, "/workspace",
+                                                   &limits, &draft->prefix,
+                                                   &graph) == SHELL_DEP_OK &&
+                   shellsplit_test_depgraph_invariants(
+                       source, length, SHELL_DEP_OK, &graph, &limits);
+      unsigned commands = 0, substitutions = 0;
+      for (uint32_t n = 0; n < graph.node_count; ++n)
+        commands += graph.nodes[n].type == SHELL_NODE_CMD;
+      for (uint32_t e = 0; e < graph.edge_count; ++e)
+        substitutions += graph.edges[e].type == SHELL_EDGE_SUBST;
+      if (!valid || commands != 1 + fixture.children ||
+          substitutions != (fixture.stdout_to_stderr ? 0 : fixture.children)) {
+        fprintf(stderr, "nested ANSI-C escape oracle failed: %s\n", source);
+        abort();
+      }
+    }
+    for (const auto &fixture : shellsplit_test_ansi_phase_cases) {
+      const char *source = fixture.source;
+      size_t length = strlen(source);
+      shell_dep_limits_t limits;
+      bool valid = fuzz_dep_limits(nullptr, length, &limits) &&
+                   shell_parse_draft(source, length, nullptr, draft) ==
+                       SHELL_SOURCE_COMPLETE &&
+                   draft->prefix_length == length &&
+                   draft->header_count == 1 + fixture.children &&
+                   shell_dep_graph_parse_with_fast(source, length, "/workspace",
+                                                   &limits, &draft->prefix,
+                                                   &graph) == SHELL_DEP_OK &&
+                   shellsplit_test_depgraph_invariants(
+                       source, length, SHELL_DEP_OK, &graph, &limits);
+      unsigned commands = 0, streams = 0;
+      for (uint32_t n = 0; n < graph.node_count; ++n)
+        commands += graph.nodes[n].type == SHELL_NODE_CMD;
+      for (uint32_t e = 0; e < graph.edge_count; ++e)
+        streams += graph.edges[e].type == SHELL_EDGE_SUBST;
+      if (!valid || commands != 1 + fixture.children ||
+          streams != fixture.captured_stdout) {
+        fprintf(stderr, "parameter word phase oracle failed: %s\n", source);
+        abort();
+      }
+    }
     free(draft);
   }
-  for (const auto &fixture : shellsplit_test_word_bytes) {
+  auto check_literal_word = [&graph](const auto &fixture) {
     char source[256], expected[256];
     int length =
         snprintf(source, sizeof(source), "printf %%s %s", fixture.word);
@@ -8052,7 +8249,11 @@ static void run_fixed_oracles() {
       fprintf(stderr, "literal word byte oracle failed: %s\n", source);
       abort();
     }
-  }
+  };
+  for (const auto &fixture : shellsplit_test_word_bytes)
+    check_literal_word(fixture);
+  for (const auto &fixture : shellsplit_test_ansi_nul_words)
+    check_literal_word(fixture);
   {
     static const char *const lists[] = {
         "printf 'é\\'; cat file; printf 'a\\'",

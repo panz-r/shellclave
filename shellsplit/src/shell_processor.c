@@ -76,7 +76,6 @@ typedef struct {
   bool all_digits;
   bool exact_dash;
   bool overflow;
-  bool has_nul;
 } static_fd_target_t;
 
 /* Required context is the live accumulator passed to the decoder visitor. */
@@ -84,11 +83,6 @@ static SHELL_NONNULL(3) bool static_fd_target_byte(unsigned char byte,
                                                    size_t offset,
                                                    void *context) {
   static_fd_target_t *target = context;
-  if (byte == '\0') {
-    target->has_nul = true;
-    return false;
-  }
-
   target->length++;
   if (offset != 0 || byte != '-')
     target->exact_dash = false;
@@ -125,10 +119,9 @@ shell_process_classify_static_fd_target(const char *text, size_t length,
       .exact_dash = true,
   };
   size_t decoded_length = 0;
-  if (shell_visit_decoded_word(text, move ? prefix_length : length,
-                               static_fd_target_byte, &target,
-                               &decoded_length) != SHELL_PROCESS_OK ||
-      target.has_nul || target.length != decoded_length)
+  if (shell_process_visit_word_value(text, move ? prefix_length : length,
+                                     static_fd_target_byte, &target,
+                                     &decoded_length) != SHELL_PROCESS_OK)
     return SHELL_PROCESS_FD_TARGET_INVALID;
   if (target.length == 0)
     return move ? SHELL_PROCESS_FD_TARGET_MOVE_INVALID
@@ -146,15 +139,11 @@ shell_process_classify_static_fd_target(const char *text, size_t length,
 
 typedef struct {
   bool path_forcing;
-  bool invalid;
 } legacy_output_literal_scan_t;
 
+/* Source admission and effective ANSI-C decoding guarantee a non-NUL byte. */
 static SHELL_NONNULL(1) void legacy_output_note_literal(
     legacy_output_literal_scan_t *scan, unsigned char byte) {
-  if (byte == '\0') {
-    scan->invalid = true;
-    return;
-  }
   if (byte != '-' && (byte < '0' || byte > '9'))
     scan->path_forcing = true;
 }
@@ -298,7 +287,7 @@ static SHELL_NONNULL(1) bool legacy_output_has_path_forcing_literal(
     }
     if (current == '$' &&
         shell_source_logical_next_is(text, length, position, '\'', NULL)) {
-      if (!shell_source_decode_ansi_c_quote(
+      if (!shell_source_decode_ansi_c_word(
               text, length, &position, legacy_output_note_ansi_literal, &scan))
         return false;
       logical_word_start = false;
@@ -382,7 +371,7 @@ static SHELL_NONNULL(1) bool legacy_output_has_path_forcing_literal(
     if (current == '{') {
       shell_source_brace_fragment_t fragment =
           shell_source_scan_brace_fragment(text, length, position);
-      if (!fragment.valid || fragment.has_nul)
+      if (!fragment.valid)
         return false;
       /* A literal outer brace survives even when an inner pair expands.
        * An unmatched opener is also literal, not a reason to retry its suffix.
@@ -397,8 +386,7 @@ static SHELL_NONNULL(1) bool legacy_output_has_path_forcing_literal(
     position++;
     logical_word_start = false;
   }
-  return !scan.invalid && !in_single_quote && !in_double_quote &&
-         scan.path_forcing;
+  return !in_single_quote && !in_double_quote && scan.path_forcing;
 }
 
 shell_process_legacy_redirect_target_t
@@ -431,10 +419,9 @@ shell_process_classify_legacy_output_target(const char *text, size_t length) {
       return SHELL_PROCESS_LEGACY_REDIRECT_DUPLICATION;
     case SHELL_PROCESS_FD_TARGET_INVALID:
     default:
-      /* An empty, NUL-bearing, or out-of-range target cannot be either a
-       * concrete pathname or a descriptor operation. Do not let a later
-       * consumer reinterpret an execution-time redirect failure as a valid
-       * combined-output route. */
+      /* Decoding failures and out-of-range descriptors cannot be reinterpreted
+       * as combined-output paths. An empty decoded word has pathname
+       * classification and is handled above. */
       return SHELL_PROCESS_LEGACY_REDIRECT_UNSUPPORTED;
     }
   }
@@ -1070,23 +1057,25 @@ static bool ansi_decode_emit(unsigned char byte, void *context) {
   return sink->error == SHELL_PROCESS_OK;
 }
 
-/* Decode one complete Bash $'...' fragment through the source-level decoder.
- * Canonical argv keeps decoded NUL bytes; heredoc matching uses the same
- * decoder with its distinct C-string delimiter rule. */
-static shell_process_status_t ansi_decode_quote(const char *text, size_t length,
-                                                size_t *position,
-                                                decoded_word_sink_t *sink) {
+/* Byte decoders retain binary payloads; semantic word consumers use Bash's
+ * fragment-local NUL truncation. Both modes share escape and framing rules. */
+static SHELL_NONNULL(1, 3, 4) shell_process_status_t
+    ansi_decode_quote(const char *text, size_t length, size_t *position,
+                      decoded_word_sink_t *sink,
+                      shell_source_ansi_mode_t mode) {
   sink->error = SHELL_PROCESS_OK;
-  bool locale_dependent = false;
+  shell_source_ansi_facts_t facts;
   if (shell_source_decode_ansi_c_quote_impl(
-          text, length, position, ansi_decode_emit, sink, &locale_dependent) &&
-      !locale_dependent)
+          text, length, position, ansi_decode_emit, sink, mode, &facts) &&
+      !facts.locale_dependent)
     return SHELL_PROCESS_OK;
   return sink->error == SHELL_PROCESS_OK ? SHELL_PROCESS_EPARSE : sink->error;
 }
 
-static shell_process_status_t decode_shell_word(const char *text, size_t length,
-                                                decoded_word_sink_t *sink) {
+static SHELL_NONNULL(1, 3) shell_process_status_t
+    decode_shell_word(const char *text, size_t length,
+                      decoded_word_sink_t *sink,
+                      shell_source_ansi_mode_t mode) {
   char quote = 0;
   for (size_t i = 0; i < length; i++) {
     char c = text[i];
@@ -1100,7 +1089,7 @@ static shell_process_status_t decode_shell_word(const char *text, size_t length,
         shell_source_logical_next_is(text, length, i, '\'', NULL)) {
       size_t position = i;
       shell_process_status_t status =
-          ansi_decode_quote(text, length, &position, sink);
+          ansi_decode_quote(text, length, &position, sink, mode);
       if (sink->stopped)
         return SHELL_PROCESS_OK;
       if (status != SHELL_PROCESS_OK)
@@ -1140,19 +1129,35 @@ static shell_process_status_t decode_shell_word(const char *text, size_t length,
   return SHELL_PROCESS_OK;
 }
 
-shell_process_status_t
-shell_visit_decoded_word(const char *text, size_t length,
-                         shell_decoded_word_visitor_t visitor, void *context,
-                         size_t *decoded_length) {
+static SHELL_NONNULL(1, 5) shell_process_status_t
+    visit_word_mode(const char *text, size_t length,
+                    shell_decoded_word_visitor_t visitor, void *context,
+                    size_t *decoded_length, shell_source_ansi_mode_t mode) {
   *decoded_length = 0;
 
   decoded_word_sink_t sink = {
       .visitor = visitor,
       .visitor_context = context,
   };
-  shell_process_status_t status = decode_shell_word(text, length, &sink);
+  shell_process_status_t status = decode_shell_word(text, length, &sink, mode);
   *decoded_length = sink.output_length;
   return status;
+}
+
+shell_process_status_t
+shell_visit_decoded_word(const char *text, size_t length,
+                         shell_decoded_word_visitor_t visitor, void *context,
+                         size_t *decoded_length) {
+  return visit_word_mode(text, length, visitor, context, decoded_length,
+                         SHELL_SOURCE_ANSI_BYTES);
+}
+
+shell_process_status_t
+shell_process_visit_word_value(const char *text, size_t length,
+                               shell_decoded_word_visitor_t visitor,
+                               void *context, size_t *decoded_length) {
+  return visit_word_mode(text, length, visitor, context, decoded_length,
+                         SHELL_SOURCE_ANSI_WORD);
 }
 
 bool shell_visit_static_word(const char *text, size_t length,
@@ -1161,14 +1166,21 @@ bool shell_visit_static_word(const char *text, size_t length,
   *decoded_length = 0;
   if (shell_source_word_has_dynamic_syntax(text, length))
     return false;
-  return shell_visit_decoded_word(text, length, visitor, context,
-                                  decoded_length) == SHELL_PROCESS_OK;
+  return shell_process_visit_word_value(text, length, visitor, context,
+                                        decoded_length) == SHELL_PROCESS_OK;
 }
 
 shell_process_status_t shell_measure_decoded_word(const char *text,
                                                   size_t length,
                                                   size_t *decoded_length) {
   return shell_visit_decoded_word(text, length, NULL, NULL, decoded_length);
+}
+
+shell_process_status_t
+shell_process_measure_word_value(const char *text, size_t length,
+                                 size_t *decoded_length) {
+  return shell_process_visit_word_value(text, length, NULL, NULL,
+                                        decoded_length);
 }
 
 shell_process_status_t shell_write_decoded_word(const char *text, size_t length,
@@ -1188,11 +1200,28 @@ shell_process_status_t shell_write_decoded_word(const char *text, size_t length,
       .destination = destination,
       .destination_size = destination_size,
   };
-  status = decode_shell_word(text, length, &sink);
+  status = decode_shell_word(text, length, &sink, SHELL_SOURCE_ANSI_BYTES);
   if (status != SHELL_PROCESS_OK)
     return status;
   *written = sink.output_length;
   return SHELL_PROCESS_OK;
+}
+
+shell_process_status_t shell_process_write_word_value(const char *text,
+                                                      size_t length,
+                                                      char *destination,
+                                                      size_t destination_size,
+                                                      size_t *written) {
+  *written = 0;
+  decoded_word_sink_t sink = {
+      .destination = destination,
+      .destination_size = destination_size,
+  };
+  shell_process_status_t status =
+      decode_shell_word(text, length, &sink, SHELL_SOURCE_ANSI_WORD);
+  if (status == SHELL_PROCESS_OK)
+    *written = sink.output_length;
+  return status;
 }
 
 static shell_process_status_t
@@ -1220,7 +1249,7 @@ render_processed_word(const char *text, size_t length, char *destination,
           .output_length = out,
       };
       shell_process_status_t status =
-          ansi_decode_quote(text, length, &i, &sink);
+          ansi_decode_quote(text, length, &i, &sink, SHELL_SOURCE_ANSI_WORD);
       if (status != SHELL_PROCESS_OK)
         return status;
       out = sink.output_length;
@@ -1347,7 +1376,7 @@ shell_process_status_t shell_decode_word(const char *text, size_t length,
       .destination = *decoded,
       .destination_size = *decoded_length,
   };
-  status = decode_shell_word(text, length, &sink);
+  status = decode_shell_word(text, length, &sink, SHELL_SOURCE_ANSI_BYTES);
   if (status != SHELL_PROCESS_OK) {
     free(*decoded);
     *decoded = NULL;
@@ -2818,7 +2847,8 @@ shell_process_status_t shell_build_command_netseq_from_stages(
       goto fail_commands;
     }
     size_t length = 0;
-    status = shell_measure_decoded_word(token.start, token.length, &length);
+    status =
+        shell_process_measure_word_value(token.start, token.length, &length);
     if (status != SHELL_PROCESS_OK)
       goto fail_commands;
     if (length == 0) {
@@ -2867,7 +2897,7 @@ shell_process_status_t shell_build_command_netseq_from_stages(
       goto fail_commands;
     }
     size_t length = 0;
-    (void)shell_measure_decoded_word(token.start, token.length, &length);
+    (void)shell_process_measure_word_value(token.start, token.length, &length);
     size_t prefix_length = 0;
     (void)shell_netstring_write_prefix(position, SIZE_MAX, length,
                                        &prefix_length);
@@ -2876,7 +2906,8 @@ shell_process_status_t shell_build_command_netseq_from_stages(
         .destination = position,
         .destination_size = length,
     };
-    status = decode_shell_word(token.start, token.length, &sink);
+    status = decode_shell_word(token.start, token.length, &sink,
+                               SHELL_SOURCE_ANSI_WORD);
     if (status != SHELL_PROCESS_OK || sink.output_length != length) {
       free(encoded);
       status = status == SHELL_PROCESS_OK ? SHELL_PROCESS_EPARSE : status;

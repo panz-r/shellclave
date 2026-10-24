@@ -3,6 +3,30 @@
 
 #include "shell_processor.h"
 
+/* Literal shell-word projection for semantic consumers: ANSI-C NUL truncates
+ * only its fragment, and later fragments resume. Dynamic expansions remain
+ * unevaluated, but quote and escape processing can change their spelling:
+ * ${v:-$'a\0b'} projects to ${v:-a}. Exact-source consumers and expansion
+ * callbacks use retained source spans; callers establish staticness separately.
+ * Source is an immutable isolated word; outputs are distinct writable storage.
+ * Visitor/context have the public decoded-word callback contract. A NULL
+ * visitor measures. The writer checks capacity during one forward fill;
+ * failures leave written zero and may modify destination bytes. Callers own
+ * unpublished output storage and discard it on failure. Standalone
+ * public byte decoders deliberately preserve their separate binary semantics.
+ */
+shell_process_status_t shell_process_visit_word_value(
+    const char *text, size_t length, shell_decoded_word_visitor_t visitor,
+    void *context, size_t *decoded_length) SHELL_NONNULL(1, 5);
+shell_process_status_t shell_process_measure_word_value(const char *text,
+                                                        size_t length,
+                                                        size_t *decoded_length)
+    SHELL_NONNULL(1, 3);
+shell_process_status_t
+shell_process_write_word_value(const char *text, size_t length,
+                               char *destination, size_t destination_size,
+                               size_t *written) SHELL_NONNULL(1, 3, 5);
+
 /* The actual shell word excludes operator-owned punctuation (notably the &
  * in <& and >&) and inline trivia. Completeness is lexical, not a claim that
  * the operand evaluates to a valid descriptor or pathname. In lexical mode,
@@ -124,7 +148,9 @@ shell_process_cstring_allocation_size(size_t content_length,
  * A final source move suffix is interpreted before prefix quote decoding;
  * MOVE_INVALID means that suffix selected move grammar with an empty or
  * nonnumeric static source. It is a known setup failure, never a pathname.
- * INVALID retains decoding, embedded-NUL, and descriptor-overflow rejection. */
+ * Source bytes are already admitted and the isolated word is immutable;
+ * length zero represents a missing word. INVALID retains decoding and
+ * descriptor-overflow rejection. */
 typedef enum {
   SHELL_PROCESS_FD_TARGET_PATH,
   SHELL_PROCESS_FD_TARGET_FD,
@@ -144,7 +170,9 @@ shell_process_classify_static_fd_target(const char *text, size_t length,
  * process substitutions are pathnames in either direction. A decoded literal
  * byte other than a digit or `-` proves that every expansion result is a
  * pathname; otherwise unresolved words which could evaluate to either form
- * are unsupported. */
+ * are unsupported. The immutable isolated operand spelling has already passed
+ * source byte admission; length zero denotes a missing operand. Operand syntax
+ * and supported forms are checked here. */
 typedef enum {
   SHELL_PROCESS_LEGACY_REDIRECT_PATH,
   SHELL_PROCESS_LEGACY_REDIRECT_DUPLICATION,

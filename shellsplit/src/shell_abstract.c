@@ -1741,8 +1741,8 @@ shell_build_type_netseq_impl(const char *command, size_t command_length,
     }
     size_t inner_length = 0;
     size_t decoded_length = 0;
-    status =
-        shell_measure_decoded_word(word.start, word.length, &decoded_length);
+    status = shell_process_measure_word_value(word.start, word.length,
+                                              &decoded_length);
     if (status != SHELL_PROCESS_OK)
       goto fail_type_netseq;
     if (decoded_length == 0) {
@@ -1815,7 +1815,8 @@ shell_build_type_netseq_impl(const char *command, size_t command_length,
     }
     size_t inner_length = 0;
     size_t decoded_length = 0;
-    (void)shell_measure_decoded_word(word.start, word.length, &decoded_length);
+    (void)shell_process_measure_word_value(word.start, word.length,
+                                           &decoded_length);
     (void)shell_netstring_encoded_length(decoded_length, &inner_length);
     shell_processed_word_iterator_t sizing = iterator;
     shell_token_t argument;
@@ -1833,8 +1834,8 @@ shell_build_type_netseq_impl(const char *command, size_t command_length,
                                        &executable_prefix);
     position += executable_prefix;
     size_t written = 0;
-    (void)shell_write_decoded_word(word.start, word.length, position,
-                                   decoded_length, &written);
+    (void)shell_process_write_word_value(word.start, word.length, position,
+                                         decoded_length, &written);
     position += written;
     *position++ = ',';
     while (shell_processed_word_iterator_next(&iterator, &argument)) {
@@ -1917,8 +1918,8 @@ shell_process_status_t shell_build_anomaly_netseqs_from_stages(
       continue;
     }
     size_t executable_length = 0;
-    status =
-        shell_measure_decoded_word(word.start, word.length, &executable_length);
+    status = shell_process_measure_word_value(word.start, word.length,
+                                              &executable_length);
     if (status != SHELL_PROCESS_OK || executable_length == 0) {
       if (status == SHELL_PROCESS_OK)
         status = SHELL_PROCESS_EPARSE;
@@ -2008,8 +2009,8 @@ shell_process_status_t shell_build_anomaly_netseqs_from_stages(
       continue;
     }
     size_t executable_length = 0;
-    (void)shell_measure_decoded_word(word.start, word.length,
-                                     &executable_length);
+    (void)shell_process_measure_word_value(word.start, word.length,
+                                           &executable_length);
     size_t type_inner_length = 0;
     (void)shell_netstring_encoded_length(executable_length, &type_inner_length);
     shell_processed_word_iterator_t sizing = iterator;
@@ -2025,8 +2026,8 @@ shell_process_status_t shell_build_anomaly_netseqs_from_stages(
                                        executable_length, &prefix_length);
     char *raw_payload = raw_position + prefix_length;
     size_t written = 0;
-    (void)shell_write_decoded_word(word.start, word.length, raw_payload,
-                                   executable_length, &written);
+    (void)shell_process_write_word_value(word.start, word.length, raw_payload,
+                                         executable_length, &written);
     raw_position = raw_payload + written;
     *raw_position++ = ',';
 
@@ -2037,8 +2038,8 @@ shell_process_status_t shell_build_anomaly_netseqs_from_stages(
     (void)shell_netstring_write_prefix(type_position, SIZE_MAX,
                                        executable_length, &prefix_length);
     char *type_payload = type_position + prefix_length;
-    (void)shell_write_decoded_word(word.start, word.length, type_payload,
-                                   executable_length, &written);
+    (void)shell_process_write_word_value(word.start, word.length, type_payload,
+                                         executable_length, &written);
     type_position = type_payload + written;
     *type_position++ = ',';
     while (shell_processed_word_iterator_next(&iterator, &argument)) {

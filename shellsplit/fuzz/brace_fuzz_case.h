@@ -618,6 +618,9 @@ struct shell_substitution_fuzz_case_t {
   /* Unsafe decoded source fails at semantic parsing, unlike graph-only
    * rejection of an otherwise valid lexical command. */
   bool source_rejected = false;
+  /* Semantic rejection need not reject raw framing. A translated child body
+   * can remain a complete lexical command with no supported semantic graph. */
+  bool raw_complete = true;
   /* Boundary redirects belong to GROUP rather than a member command. These
    * optional expectations let the Shellsplit fuzzer verify that ownership and
    * any surviving descriptor-specific pipe route exactly. */
@@ -1531,6 +1534,7 @@ shell_brace_fuzz_substitution_case(const uint8_t *data, size_t size) {
         false,
         1};
     item.source_rejected = true;
+    item.raw_complete = selector == 73;
     return item;
   }
   case 76: {

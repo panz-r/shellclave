@@ -786,9 +786,11 @@ typedef struct {
  * descriptor-route validation.
  * Unmodeled Bash `[[ …
  * ]]`,
- * `(( … ))`, `$"…"`, and `;&` / `;;&` forms are also rejected. Non-ASCII ANSI-C
- * Unicode escapes are also rejected because their bytes depend on an unmodeled
- * execution locale. ASCII Unicode escapes and byte escapes remain supported.
+ * `(( … ))`, `$"…"`, and `;&` / `;;&` forms are also rejected. Surviving
+ * non-ASCII ANSI-C Unicode escapes are also rejected because their bytes
+ * depend on an unmodeled execution locale. Escapes discarded after a decoded
+ * NUL do not contribute a locale requirement. ASCII Unicode escapes and byte
+ * escapes remain supported.
  * Active legacy backtick bodies requiring Bash's escape-layer removal return
  * SHELL_DEP_EPARSE: raw borrowed spans cannot model their decoded nested
  * source. This covers escapes before $, backticks, backslashes, and newlines,

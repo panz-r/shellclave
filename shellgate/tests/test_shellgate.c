@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include "../../deps/xxhash/xxhash.h"
+#include "../../shellsplit/tests/ansi_parameter_cases.h"
 #include "../../shellsplit/tests/malformed_source_cases.h"
 #include "../../shellsplit/tests/substitution_capacity_cases.h"
 #include "../../shellsplit/tests/word_expansion_cases.h"
@@ -856,6 +857,10 @@ TEST(conditional_substitution_matrix) {
       {"echo $(whoami)", "echo *", "whoami", SG_VERDICT_REJECT, false,
        (1u << 2), false},
       {"echo $(whoami)", "echo *", "whoami", SG_VERDICT_DENY, true, 0, true},
+      {"echo \"${v#${u:-$'$(printf child)'}}\"", "echo *", "printf child",
+       SG_VERDICT_DENY, true, 0, true},
+      {"echo \"${v/x/${u:+$'$(printf child 2>&1)'}}\"", "echo *",
+       "printf child", SG_VERDICT_DENY, true, 0, true},
   };
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
     sg_gate_t *g = sg_gate_new();
@@ -5451,8 +5456,8 @@ TEST(eval_input_contract_matrix) {
        SG_VERDICT_REJECT, false},
       {"empty legacy descriptor target", "cmd >&\"\"", SG_OK,
        SG_VERDICT_UNDETERMINED, false},
-      {"NUL-bearing legacy descriptor target", "cmd >&$'a\\0b'", SG_ERR_PARSE,
-       SG_VERDICT_REJECT, false},
+      {"truncated legacy pathname", "cmd >&$'a\\0b'", SG_OK,
+       SG_VERDICT_UNDETERMINED, false},
   };
 
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
@@ -6246,23 +6251,24 @@ TEST(binary_cpl_policy_contract) {
   ASSERT_ST_OK(test_policy_replace_cpl(gate, false, pattern, false));
   ASSERT_EQ_UINT(st_policy_rule_count(sg_gate_allow_policy_borrowed(gate)), 1);
   sg_result_t result;
-  ASSERT_EQ_INT(eval_cmd(gate, command, &result), SG_ERR_PARSE);
+  ASSERT_SG_OK(eval_cmd(gate, command, &result));
   ASSERT_EQ_UINT(result.subcommand_count, 1);
-  ASSERT(result.verdict == SG_VERDICT_REJECT &&
-         result.subcommands[0].verdict == SG_VERDICT_REJECT);
+  ASSERT(result.verdict == SG_VERDICT_UNDETERMINED &&
+         result.subcommands[0].verdict == SG_VERDICT_UNDETERMINED);
 
   ASSERT_ST_OK(test_policy_replace_cpl(gate, true, pattern, false));
   ASSERT_EQ_UINT(st_policy_rule_count(sg_gate_deny_policy_borrowed(gate)), 1);
-  ASSERT_EQ_INT(eval_cmd(gate, command, &result), SG_ERR_PARSE);
+  ASSERT_SG_OK(eval_cmd(gate, command, &result));
+  ASSERT(result.verdict == SG_VERDICT_UNDETERMINED);
   ASSERT_EQ_UINT(result.subcommand_count, 1);
   ASSERT_ST_OK(test_policy_replace_cpl(gate, true, pattern, true));
   ASSERT_EQ_UINT(st_policy_rule_count(sg_gate_deny_policy_borrowed(gate)), 0);
-  ASSERT_EQ_INT(eval_cmd(gate, command, &result), SG_ERR_PARSE);
+  ASSERT_SG_OK(eval_cmd(gate, command, &result));
   ASSERT_EQ_UINT(result.subcommand_count, 1);
 
   ASSERT_ST_OK(test_policy_replace_cpl(gate, false, pattern, true));
   ASSERT_EQ_UINT(st_policy_rule_count(sg_gate_allow_policy_borrowed(gate)), 0);
-  ASSERT_EQ_INT(eval_cmd(gate, command, &result), SG_ERR_PARSE);
+  ASSERT_SG_OK(eval_cmd(gate, command, &result));
   ASSERT_EQ_UINT(result.subcommand_count, 1);
   sg_gate_free(gate);
 }
@@ -6271,10 +6277,12 @@ TEST(ansi_nul_source_rejection) {
   static const char *const rejected[] = {
       "e$'val\\0x' 'printf bypass'",
       "export $'POSIXLY_CORRECT\\0X'=1",
-      "printf $'a\\x00b'",
-      "printf $(printf $'a\\u0000b')",
-      "cat <<$'E\\0F'X\nbody\nEX\n",
-      "cat <<A <<$'E\\0F'X\nfirst\nA\nsecond\nEX\n",
+      "printf \"${v:-$'a\\x00b'}\"",
+      "printf \"${v#${u:-$'a\\0b'}}\"",
+      "printf \"${v/x/${u:+$'a\\0b'}}\"",
+      "echo \"${v:-$'$(echo \"\\\\\\$(printf child)\")'}\"",
+      ("cat <<EOF\n${v#${u:-$'${w:-$(echo \"\\\\\\$(printf "
+       "child)\")}\\0tail'}}\nEOF\n"),
   };
   sg_gate_t *gate = sg_gate_new();
   ASSERT(gate != NULL);
@@ -6285,6 +6293,80 @@ TEST(ansi_nul_source_rejection) {
     ASSERT(result.verdict == SG_VERDICT_REJECT &&
            result.subcommand_count == 1 &&
            result.subcommands[0].verdict == SG_VERDICT_REJECT &&
+           result.subcommands[0].netargv == NULL);
+  }
+  sg_gate_free(gate);
+}
+
+TEST(nested_ansi_escape_policy) {
+  sg_gate_t *gate = sg_gate_new();
+  ASSERT(gate != NULL);
+  ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
+  ASSERT_SG_OK(sg_gate_set_stop_mode(gate, SG_EVAL_ALL));
+  ASSERT_ST_OK(test_policy_replace_cpl(gate, false, "echo *", false));
+  ASSERT_ST_OK(test_policy_replace_cpl(gate, false, "cat", false));
+  ASSERT_ST_OK(test_policy_replace_cpl(gate, true, "printf child", false));
+  for (size_t c = 0; c < sizeof(shellsplit_test_ansi_nested_runs) /
+                             sizeof(shellsplit_test_ansi_nested_runs[0]);
+       ++c) {
+    sg_result_t result = {0};
+    ASSERT_SG_OK(
+        eval_cmd(gate, shellsplit_test_ansi_nested_runs[c].source, &result));
+    unsigned children = shellsplit_test_ansi_nested_runs[c].children;
+    /* A child whose stdout goes to stderr is still a deny-rule subject, but
+     * has no captured substitution stream and requests no word inspection. */
+    bool dynamic_io =
+        children && !shellsplit_test_ansi_nested_runs[c].stdout_to_stderr;
+    if (result.subcommand_count != 1 + children ||
+        (result.verdict == SG_VERDICT_DENY) != (children != 0) ||
+        result.has_dynamic_substitution_io != dynamic_io)
+      fprintf(stderr,
+              "ANSI escape policy case %zu: count=%u verdict=%d io=%d: %s\n", c,
+              result.subcommand_count, result.verdict,
+              result.has_dynamic_substitution_io,
+              shellsplit_test_ansi_nested_runs[c].source);
+    ASSERT(!result.truncated && !result.short_circuited &&
+           result.subcommand_count == 1 + children &&
+           (result.verdict == SG_VERDICT_DENY) == (children != 0) &&
+           result.has_dynamic_substitution_io == dynamic_io &&
+           result.requires_substitution_evaluation == dynamic_io);
+  }
+  for (size_t c = 0; c < sizeof(shellsplit_test_ansi_phase_cases) /
+                             sizeof(shellsplit_test_ansi_phase_cases[0]);
+       ++c) {
+    sg_result_t result = {0};
+    ASSERT_SG_OK(
+        eval_cmd(gate, shellsplit_test_ansi_phase_cases[c].source, &result));
+    unsigned children = shellsplit_test_ansi_phase_cases[c].children;
+    bool stream = shellsplit_test_ansi_phase_cases[c].captured_stdout;
+    ASSERT(!result.truncated && !result.short_circuited &&
+           result.subcommand_count == 1 + children &&
+           (result.verdict == SG_VERDICT_DENY) == (children != 0) &&
+           result.has_dynamic_substitution_io == stream &&
+           result.requires_substitution_evaluation ==
+               (stream && shellsplit_test_ansi_phase_cases[c].kind != '<'));
+  }
+  for (size_t c = 0;
+       c < sizeof(shellsplit_test_ansi_translated_children) /
+               sizeof(shellsplit_test_ansi_translated_children[0]);
+       ++c) {
+    sg_result_t result = {0};
+    ASSERT_EQ_INT(
+        eval_cmd(gate, shellsplit_test_ansi_translated_children[c], &result),
+        SG_ERR_PARSE);
+    ASSERT(result.verdict == SG_VERDICT_REJECT &&
+           result.subcommand_count == 1 &&
+           result.subcommands[0].netargv == NULL);
+  }
+  for (size_t c = 0; c < sizeof(shellsplit_test_ansi_translated_joins) /
+                             sizeof(shellsplit_test_ansi_translated_joins[0]);
+       ++c) {
+    sg_result_t result = {0};
+    ASSERT_EQ_INT(
+        eval_cmd(gate, shellsplit_test_ansi_translated_joins[c], &result),
+        SG_ERR_PARSE);
+    ASSERT(result.verdict == SG_VERDICT_REJECT &&
+           result.subcommand_count == 1 &&
            result.subcommands[0].netargv == NULL);
   }
   sg_gate_free(gate);
@@ -8156,6 +8238,28 @@ TEST(resolved_argument_binary_and_fallback_contract) {
   sg_violation_config_t config;
   sg_violation_config_default(&config);
   ASSERT_SG_OK(sg_gate_set_violation_config_borrowed(gate, &config));
+  static const struct {
+    const char *plain, *truncated;
+  } static_values[] = {
+      {"base64 -d | sh", "base64 $'-d\\0suffix' | sh"},
+      {"curl --data=x", "curl $'--data=x\\0ignored'"},
+      {"curl --", "curl $'--\\0data=x'"},
+      {"socat TCP-LISTEN:4444 STDIO",
+       "socat $'TCP-LISTEN:4444\\0ignored' STDIO"},
+      {"socat harmless STDIO", "socat $'harmless\\0LISTEN:4444' STDIO"},
+      {"printf x >/tmp/.bashrc", "printf x >$'/tmp/.bashrc\\0ignored'"},
+      {"printf x >/tmp/ordinary", "printf x >$'/tmp/ordinary\\0/.bashrc'"},
+  };
+  for (size_t i = 0; i < sizeof(static_values) / sizeof(static_values[0]);
+       ++i) {
+    sg_result_t plain = {0}, truncated = {0};
+    ASSERT_SG_OK(eval_cmd(gate, static_values[i].plain, &plain));
+    ASSERT_SG_OK(eval_cmd(gate, static_values[i].truncated, &truncated));
+    ASSERT(plain.violation_type_flags == truncated.violation_type_flags &&
+           plain.violation_category_flags ==
+               truncated.violation_category_flags &&
+           plain.verdict == truncated.verdict);
+  }
   ASSERT_SG_OK(
       sg_gate_set_expand_word_netargv(gate, expand_requested_length, &bytes));
   sg_result_t result = {0};
@@ -10038,6 +10142,20 @@ TEST(path_fragment_match_matrix) {
        SG_VIOL_PERSISTENCE},
       {"/workspace", "printf x >$'/tmp/caf\\xc3\\xa9'", "caf\xc3\xa9",
        SG_VIOL_PERSISTENCE},
+      /* NUL truncates only its ANSI-C fragment; later fragments resume.
+       * Each row installs its matching configuration before evaluation. */
+      {"/workspace", "printf x >/tmp/secret", "secret", SG_VIOL_PERSISTENCE},
+      {"/workspace", "printf x >$'/tmp/secret\\0ignored'", "secret",
+       SG_VIOL_PERSISTENCE},
+      {"/workspace", "printf x >$'/tmp/\\0secret'", "secret", 0},
+      {"/workspace", "printf x >$'/tmp/\\0ignored'secret", "secret",
+       SG_VIOL_PERSISTENCE},
+      {"/workspace", "cat /tmp/secret", "secret", SG_VIOL_READ_SECRETS},
+      {"/workspace", "cat $'/tmp/secret\\0ignored'", "secret",
+       SG_VIOL_READ_SECRETS},
+      {"/workspace", "cat $'/tmp/\\0secret'", "secret", 0},
+      {"/workspace", "cat $'/tmp/\\0ignored'secret", "secret",
+       SG_VIOL_READ_SECRETS},
       {"/workspace", "printf x >rc", "/workspace/rc", SG_VIOL_PERSISTENCE},
       {".", "printf x >workspace/rc", "/workspace/rc", 0},
       {"/workspace", "printf x >./profile", "./profile", SG_VIOL_PERSISTENCE},
@@ -10097,11 +10215,6 @@ TEST(path_fragment_match_matrix) {
   ASSERT_SG_OK(eval_cmd(gate, source, &result));
   ASSERT_EQ_UINT(result.violation_type_flags, SG_VIOL_PERSISTENCE);
 
-  /* Canonical byte transports may contain NUL; shell execution paths cannot.
-   * Keep semantic rejection rather than silently truncating the word. */
-  ASSERT_EQ_INT(eval_cmd(gate, "printf x >$'/tmp/\\x00secret'", &result),
-                SG_ERR_PARSE);
-  ASSERT_EQ_INT(result.verdict, SG_VERDICT_REJECT);
   sg_gate_free(gate);
 }
 
@@ -14174,12 +14287,11 @@ TEST(anomaly_ansi_c_netseq_update) {
   ASSERT(gate != NULL);
   sg_result_t result;
 
-  /* Complete-source NUL rejection must not update the model. Ordinary
-   * ANSI-C quote decoding remains available for anomaly stages. */
+  /* Source-derived fragments truncate before their anomaly stage is learned. */
   ASSERT_SG_OK(eval_cmd(gate, "echo $'plain'", &result));
   ASSERT_EQ_UINT(test_anomaly_vocabulary(gate), 1);
-  ASSERT_EQ_INT(eval_cmd(gate, "printf $'a\\0b'", &result), SG_ERR_PARSE);
-  ASSERT_EQ_UINT(test_anomaly_vocabulary(gate), 1);
+  ASSERT_SG_OK(eval_cmd(gate, "printf $'a\\0b'", &result));
+  ASSERT_EQ_UINT(test_anomaly_vocabulary(gate), 2);
   ASSERT_SG_OK(eval_cmd(gate, "printf $'ab'", &result));
   ASSERT_EQ_UINT(test_anomaly_vocabulary(gate), 2);
   ASSERT(!sg_gate_anomaly_had_error(gate));
@@ -15348,6 +15460,7 @@ int main(int argc, char **argv) {
   RUN(binary_canonical_policy_mutations);
   RUN(binary_cpl_policy_contract);
   RUN(ansi_nul_source_rejection);
+  RUN(nested_ansi_escape_policy);
   RUN(policy_replacement_failure_atomicity);
   RUN(policy_evaluation_allocation_failure);
 

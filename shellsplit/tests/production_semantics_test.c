@@ -1811,8 +1811,8 @@ static void test_processed_command_conveniences(void) {
   shell_netstring_buffer_free(&rendered);
   shell_command_infos_free(infos, info_count);
 
-  /* The shipping library retains binary canonical argv supplied directly,
-   * while complete source with an ANSI-C NUL is rejected by default. */
+  /* Source words use fragment truncation; directly supplied canonical argv
+   * continues to preserve its binary payload. */
   static const char binary_source[] = "printf $'a\\0b'";
   shell_token_t binary_tokens[] = {
       {.type = SHELL_TOKEN_COMMAND, .start = "printf", .length = 6},
@@ -1830,8 +1830,8 @@ static void test_processed_command_conveniences(void) {
   infos = NULL;
   info_count = 0;
   CHECK(shell_process_command(binary_source, sizeof(binary_source) - 1, NULL,
-                              &infos, &info_count) == SHELL_PROCESS_EPARSE &&
-        infos == NULL && info_count == 0 &&
+                              &infos, &info_count) == SHELL_PROCESS_OK &&
+        infos != NULL && info_count == 1 &&
         shell_render_netargv_buffer(&binary_info, NULL, &binary_argv) ==
             SHELL_PROCESS_OK &&
         shell_netstring_validate(binary_argv.data, binary_argv.length,
@@ -1839,9 +1839,11 @@ static void test_processed_command_conveniences(void) {
         records == 2 && memchr(binary_argv.data, '\0', binary_argv.length) &&
         shell_build_netargv_sequence_buffer(
             binary_source, sizeof(binary_source) - 1, NULL, &binary_sequence,
-            &sequence_count, &has_features) == SHELL_PROCESS_EPARSE &&
-        sequence_count == 0 && !has_features && binary_sequence.data == NULL &&
-        binary_sequence.length == 0);
+            &sequence_count, &has_features) == SHELL_PROCESS_OK &&
+        sequence_count == 1 && !has_features &&
+        binary_sequence.length == strlen("13:6:printf,1:a,,") &&
+        !memcmp(binary_sequence.data, "13:6:printf,1:a,,",
+                binary_sequence.length));
   shell_command_infos_free(infos, info_count);
   shell_netstring_buffer_free(&binary_sequence);
   shell_netstring_buffer_free(&binary_argv);
@@ -1874,6 +1876,28 @@ static void test_processed_command_conveniences(void) {
                                    &decoded_length) == SHELL_PROCESS_OK &&
           decoded_length == 1 && decoded.length == 1 &&
           decoded.bytes[0] == 0x1c);
+  }
+
+  /* Semantic word projection leaves expansion unevaluated, but it can change
+   * its spelling. Exact syntax remains in the caller's source span. */
+  {
+    static const char source[] = "${v:-$'a\\0b'}";
+    static const char expected[] = "${v:-a}";
+    source_capture_t projection = {0};
+    size_t visited = SIZE_MAX, measured = SIZE_MAX, filled = SIZE_MAX;
+    char bytes[sizeof(expected) - 1];
+    CHECK(shell_process_visit_word_value(source, sizeof(source) - 1,
+                                         capture_decoded_byte, &projection,
+                                         &visited) == SHELL_PROCESS_OK &&
+          visited == sizeof(expected) - 1 && projection.length == visited &&
+          !memcmp(projection.bytes, expected, visited));
+    CHECK(shell_process_measure_word_value(source, sizeof(source) - 1,
+                                           &measured) == SHELL_PROCESS_OK &&
+          measured == visited);
+    CHECK(shell_process_write_word_value(source, sizeof(source) - 1, bytes,
+                                         sizeof(bytes),
+                                         &filled) == SHELL_PROCESS_OK &&
+          filled == measured && !memcmp(bytes, expected, filled));
   }
 
   /* A canonical policy argv requires a program word. Redirect-only source is
@@ -2036,7 +2060,7 @@ static void test_production_fd_target_contract(void) {
       {"2147483648", SHELL_PROCESS_FD_TARGET_INVALID, SHELL_PROCESS_FD_NONE},
       {"00000000000000000000000000000000002147483648",
        SHELL_PROCESS_FD_TARGET_INVALID, SHELL_PROCESS_FD_NONE},
-      {"$'a\\0b'", SHELL_PROCESS_FD_TARGET_INVALID, SHELL_PROCESS_FD_NONE},
+      {"$'a\\0b'", SHELL_PROCESS_FD_TARGET_PATH, SHELL_PROCESS_FD_NONE},
   };
   for (size_t i = 0; i < sizeof(target_cases) / sizeof(target_cases[0]); i++) {
     uint32_t descriptor = UINT32_MAX;
@@ -2114,8 +2138,13 @@ static void test_production_fd_target_contract(void) {
       {"00000000000000000000000000000000002147483648",
        SHELL_PROCESS_LEGACY_REDIRECT_UNSUPPORTED},
       {"\"\"", SHELL_PROCESS_LEGACY_REDIRECT_PATH},
-      {"$'a\\0b'", SHELL_PROCESS_LEGACY_REDIRECT_UNSUPPORTED},
-      {"$'a\\0b'$var", SHELL_PROCESS_LEGACY_REDIRECT_UNSUPPORTED},
+      {"$'a\\0b'", SHELL_PROCESS_LEGACY_REDIRECT_PATH},
+      {"$'a\\0b'$var", SHELL_PROCESS_LEGACY_REDIRECT_PATH},
+      {"$'path\\0ignored'$var", SHELL_PROCESS_LEGACY_REDIRECT_PATH},
+      {"$'123\\0path'$var", SHELL_PROCESS_LEGACY_REDIRECT_UNSUPPORTED},
+      {"$'\\0ignored'path$var", SHELL_PROCESS_LEGACY_REDIRECT_PATH},
+      {"$'\\0ignored'$var", SHELL_PROCESS_LEGACY_REDIRECT_UNSUPPORTED},
+      {"$'\\0ignored'", SHELL_PROCESS_LEGACY_REDIRECT_PATH},
   };
   for (size_t i = 0; i < sizeof(legacy_cases) / sizeof(legacy_cases[0]); i++)
     CHECK(shell_process_classify_legacy_output_target(
@@ -2192,7 +2221,6 @@ static void test_production_fd_target_contract(void) {
   static const char *const invalid_static_direct[] = {
       "printf x >&2147483648",
       "printf x >&00000000000000000000000000000000002147483648",
-      "printf x >&$'a\\0b'",
   };
   for (size_t i = 0;
        i < sizeof(invalid_static_direct) / sizeof(invalid_static_direct[0]);
@@ -2292,6 +2320,7 @@ static void test_production_fd_target_contract(void) {
       "printf x >&\\-file",
       "printf x >&$'-'file",
       "printf x >&\"quoted combined\"",
+      "printf x >&$'a\\0b'",
       "printf x {sink}>out >&\"${sink}\"",
       "printf x 0<&1 3>&-",
   };
@@ -2333,6 +2362,7 @@ static void test_production_fd_target_contract(void) {
       "{ printf x; } >&0000000000000000000000000000000000000001",
       "{ printf x; } >&$'0000000000000000000000000000000000000001'",
       "{ printf x; } >&123file",
+      "{ printf x; } >&$'a\\0b'",
       "{ printf x; } {sink}>out >& \"${sink}\"",
   };
   for (size_t i = 0; i < sizeof(group_cases) / sizeof(group_cases[0]); i++) {
@@ -2396,7 +2426,6 @@ static void test_production_fd_target_contract(void) {
       "{ printf x; } >&2147483648",
       "{ printf x; } >&00000000000000000000000000000000002147483648",
       "{ printf x; } >&$'2147483648'",
-      "{ printf x; } >&$'a\\0b'",
       "{ printf x; } >&-file",
       "{ printf x; } >&",
   };
@@ -4387,6 +4416,23 @@ static void test_complete_source_before_capacity(void) {
   shell_parse_result_t fast;
   CHECK(shell_parse_fast(valid, length, &strict[0], &fast) == SHELL_ETRUNC &&
         fast.count == SHELL_MAX_SUBCOMMANDS);
+  /* A supplied permissive prefix is structural metadata, not a waiver for
+   * complete-source semantic inspection. Reject translated syntax after the
+   * retained prefix instead of publishing a partial graph. */
+  static const char translated_after_prefix[] =
+      "printf first; echo \"${0:+$'$(printf ch\\x69ld >&2)'}\"";
+  const shell_limits_t one = {.max_subcommands = 1};
+  shell_parse_result_t prefix = {0};
+  CHECK(shell_parse_fast(translated_after_prefix,
+                         sizeof(translated_after_prefix) - 1, &one,
+                         &prefix) == SHELL_ETRUNC);
+  CHECK(prefix.count == 1 && (prefix.status & SHELL_STATUS_TRUNCATED));
+  shell_dep_graph_t rejected = {0};
+  CHECK(shell_dep_graph_parse_with_fast(
+            translated_after_prefix, sizeof(translated_after_prefix) - 1, ".",
+            NULL, &prefix, &rejected) == SHELL_DEP_EPARSE);
+  CHECK(rejected.status == SHELL_DEP_STATUS_ERROR && !rejected.node_count &&
+        !rejected.edge_count && !rejected.cwd_buf.len);
   static const char *const complete[] = {
       "cat <<'EOF'\n$(unfinished ' ${\nEOF\n",
       "echo ${value:-$(printf done)}",
@@ -4413,7 +4459,7 @@ static void test_forward_word_scanners(void) {
       {"[[.x.]]", true},       {"[[=x=]]", true},       {"[]a]", true},
       {"[!ab]", true},         {"[^^]", true},          {"[[:broken", false},
       {"{literal$}", false},   {"{${value}}", true},    {"[$'a']", true},
-      {"[$'']", false},        {"[$'\\x61']", true},    {"[$'\\0']", true},
+      {"[$'']", false},        {"[$'\\x61']", true},    {"[$'\\0']", false},
       {"[$'\\n']", true},      {"$'[a]'", false},       {"[$'ab']", true},
       {"[$']']", true},        {"[$'[]']", true},       {"{[$'a']}", true},
       {"{[$'']}", false},
@@ -4467,7 +4513,7 @@ static void test_forward_word_scanners(void) {
       {"{1..3}", SHELL_PROCESS_LEGACY_REDIRECT_UNSUPPORTED},
       {"{1..\\\n3}", SHELL_PROCESS_LEGACY_REDIRECT_UNSUPPORTED},
       {"{1,'2'}", SHELL_PROCESS_LEGACY_REDIRECT_UNSUPPORTED},
-      {"{$'a\\0b'}", SHELL_PROCESS_LEGACY_REDIRECT_UNSUPPORTED},
+      {"{$'a\\0b'}", SHELL_PROCESS_LEGACY_REDIRECT_PATH},
       {"{$'unterminated}", SHELL_PROCESS_LEGACY_REDIRECT_UNSUPPORTED},
       {"{$(broken}", SHELL_PROCESS_LEGACY_REDIRECT_UNSUPPORTED},
       {"{\\", SHELL_PROCESS_LEGACY_REDIRECT_UNSUPPORTED},
@@ -4476,7 +4522,7 @@ static void test_forward_word_scanners(void) {
       {"{prefix$'literal'}", SHELL_PROCESS_LEGACY_REDIRECT_PATH},
       {"{[$'a']}", SHELL_PROCESS_LEGACY_REDIRECT_PATH},
       {"{[$'']}", SHELL_PROCESS_LEGACY_REDIRECT_PATH},
-      {"{[$'\\0']}", SHELL_PROCESS_LEGACY_REDIRECT_UNSUPPORTED},
+      {"{[$'\\0']}", SHELL_PROCESS_LEGACY_REDIRECT_PATH},
       {"{`broken}", SHELL_PROCESS_LEGACY_REDIRECT_UNSUPPORTED},
       {"{$((broken}", SHELL_PROCESS_LEGACY_REDIRECT_UNSUPPORTED},
       {"{<(broken}", SHELL_PROCESS_LEGACY_REDIRECT_UNSUPPORTED},
@@ -5267,27 +5313,27 @@ static void test_source_helper_boundaries(void) {
 
   static const struct {
     const char *text;
-    bool complete, expands, own_expands, dynamic, valid, has_nul;
+    bool complete, expands, own_expands, dynamic, valid;
   } braces[] = {
-      {"{a,b}", true, true, true, false, true, false},
-      {"{{a,b}", false, true, false, false, true, false},
-      {"{1..3}", true, true, true, false, true, false},
-      {"{1...3}", true, false, false, false, true, false},
-      {"{'a,b'}", true, false, false, false, true, false},
-      {"{a\\,b}", true, false, false, false, true, false},
-      {"{a\\\n,b}", true, true, true, false, true, false},
-      {"{[ab]}", true, false, false, true, true, false},
-      {"{$'a'}", true, false, false, false, true, false},
-      {"{$'\\0'}", true, false, false, false, true, true},
-      {"{${value}}", true, false, false, true, true, false},
-      {"{`printf x`}", true, false, false, true, true, false},
-      {"{$((1 + 2))}", true, false, false, true, true, false},
-      {"{$(printf x)}", true, false, false, true, true, false},
-      {"{<(printf x)}", true, false, false, true, true, false},
-      {"{@(one|two)}", true, false, false, true, true, false},
-      {"{\\", false, false, false, false, false, false},
-      {"{'unfinished}", false, false, false, false, false, false},
-      {"{${unfinished", false, false, false, true, false, false},
+      {"{a,b}", true, true, true, false, true},
+      {"{{a,b}", false, true, false, false, true},
+      {"{1..3}", true, true, true, false, true},
+      {"{1...3}", true, false, false, false, true},
+      {"{'a,b'}", true, false, false, false, true},
+      {"{a\\,b}", true, false, false, false, true},
+      {"{a\\\n,b}", true, true, true, false, true},
+      {"{[ab]}", true, false, false, true, true},
+      {"{$'a'}", true, false, false, false, true},
+      {"{$'\\0'}", true, false, false, false, true},
+      {"{${value}}", true, false, false, true, true},
+      {"{`printf x`}", true, false, false, true, true},
+      {"{$((1 + 2))}", true, false, false, true, true},
+      {"{$(printf x)}", true, false, false, true, true},
+      {"{<(printf x)}", true, false, false, true, true},
+      {"{@(one|two)}", true, false, false, true, true},
+      {"{\\", false, false, false, false, false},
+      {"{'unfinished}", false, false, false, false, false},
+      {"{${unfinished", false, false, false, true, false},
   };
   for (size_t i = 0; i < sizeof(braces) / sizeof(braces[0]); i++) {
     shell_source_brace_fragment_t fragment = shell_source_scan_brace_fragment(
@@ -5297,8 +5343,7 @@ static void test_source_helper_boundaries(void) {
           fragment.expands == braces[i].expands &&
           fragment.own_expands == braces[i].own_expands &&
           fragment.dynamic == braces[i].dynamic &&
-          fragment.valid == braces[i].valid &&
-          fragment.has_nul == braces[i].has_nul);
+          fragment.valid == braces[i].valid);
   }
 
   static const char *const redirect_words[] = {

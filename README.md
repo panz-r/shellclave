@@ -169,7 +169,12 @@ Ordinary word content retains non-ASCII bytes in unquoted, escaped, and quoted
 fragments, including ANSI-C quotes and filenames. For example, `cat résumé.txt`
 and `printf '%s\n' $'日本\t語'` are supported. ANSI-C quotes preserve literal
 bytes alongside supported escapes; `\u` and `\U` escapes producing non-ASCII
-values remain unsupported. Values and offsets remain byte-based, with
+values before truncation remain unsupported. A decoded NUL ends that ANSI-C
+fragment's value: `pre$'a\0b'post` becomes `preapost`, and `$'\0'` in an
+argument position supplies an empty argument. Double-quoted parameter defaults
+and alternates with decoded NUL remain semantically unsupported, including
+those nested inside pattern operands.
+Values and offsets remain byte-based, with
 no UTF-8 validation or normalization. Analysis and token classification use
 fixed byte rules, independent of the application's locale. The executor uses a
 fixed C/POSIX or UTF-8 locale, established through the

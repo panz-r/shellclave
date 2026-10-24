@@ -7,10 +7,10 @@
 /* Private operand roles shared by source validation and named-FD mutation
  * analysis. Supply complete logical words in argv order, omitting redirects.
  * State is initialized once per effective builtin (after wrapper resolution).
- * The source boundary owns general word-feature checks, including ANSI-C NUL
- * rejection; builtin analysis does not duplicate those checks. These helpers
- * validate expansion cardinality/option grammar, not caller storage or the
- * correspondence between tokens and their immutable source. */
+ * The source boundary owns general word-feature checks and unsupported quote
+ * contexts; builtin operands use effective ANSI-C fragment values. These
+ * helpers validate expansion cardinality/option grammar, not caller storage or
+ * the correspondence between tokens and their immutable source. */
 enum {
   SHELL_BUILTIN_ROLE_TARGET = 1u,
   SHELL_BUILTIN_ROLE_UNSUPPORTED = 2u,
@@ -937,8 +937,8 @@ static inline SHELL_NONNULL(1, 3, 4) bool shell_builtin_visit_word_impl(
     if (!quote && byte == '$' &&
         shell_source_logical_next_is(word, length, position, '\'', NULL)) {
       shell_source_brace_scan_literal(&braces);
-      if (!shell_source_decode_ansi_c_quote(word, length, &position, literal,
-                                            context))
+      if (!shell_source_decode_ansi_c_word(word, length, &position, literal,
+                                           context))
         return false;
       start = false;
       continue;

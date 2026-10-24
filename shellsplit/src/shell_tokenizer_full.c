@@ -2121,8 +2121,8 @@ static SHELL_NONNULL(2) bool static_set_option_emit(unsigned char byte,
     uint32_t bit = UINT32_C(1) << i;
     changes |=
         set_options[i].short_option != 0 && byte == set_options[i].short_option;
-    /* Match payload bytes, never the name's terminator. Decoded ANSI-C NUL
-     * can occur here before its later lexical fragment rejects the source. */
+    /* Match payload bytes, never the name's terminator. An exhausted name
+     * drops out before the next byte advances its candidate offset. */
     if ((scan->names & bit) != 0 &&
         (!set_options[i].name || set_options[i].name[scan->position] == '\0' ||
          byte != (unsigned char)set_options[i].name[scan->position]))
@@ -2313,8 +2313,8 @@ static SHELL_NONNULL(1) bool word_has_array_designator_after(const char *input,
     if (!in_single && !in_double && c == '$' &&
         shell_source_logical_next_is(input, length, position, '\'', NULL)) {
       size_t after = position;
-      if (!shell_source_decode_ansi_c_quote(input, length, &after,
-                                            declaration_array_emit, &scan))
+      if (!shell_source_decode_ansi_c_word(input, length, &after,
+                                           declaration_array_emit, &scan))
         return false;
       position = after - 1;
       continue;
@@ -2469,12 +2469,13 @@ static SHELL_NONNULL(1) bool expansion_has_unsupported_semantics(
                                    kind != SHELL_SOURCE_SUBST_BACKTICK))
       return true;
   }
-  /* Malformed source is rejected by list validation, not relabelled as an
-   * unsupported construct by this feature predicate. */
-  (void)status;
-  return scan.has_arrays || scan.has_locale_quote || scan.has_ansi_nul ||
-         scan.has_ansi_locale || scan.has_parameter_write ||
-         scan.has_parameter_reevaluation;
+  /* Complete raw framing can still require decoded or reconstructed source
+   * which retained semantic products cannot represent. Preserve that
+   * terminal as unsupported. Malformed and incomplete source remain owned by
+   * their syntax-validation boundaries rather than being relabelled here. */
+  return status == SHELL_SOURCE_SCAN_UNSUPPORTED || scan.has_arrays ||
+         scan.has_locale_quote || scan.has_ansi_nul || scan.has_ansi_locale ||
+         scan.has_parameter_write || scan.has_parameter_reevaluation;
 }
 
 static SHELL_NONNULL(1) bool word_has_unsupported_semantics(const char *input,

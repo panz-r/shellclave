@@ -93,12 +93,12 @@ shell_build_type_netseq_buffer(const char *command_line, size_t command_length,
  * point to distinct storage. These are caller preconditions. On failure all
  * output destinations are cleared. Both outer netsequences
  * are canonical binary data and callers must use returned lengths rather than
- * strlen(). Complete-command processing rejects NUL-producing ANSI-C source
- * by default; this representation remains binary-capable. `command` and
- * `type` must point to distinct, empty buffers (initialized to {0} or released
- * with shell_netstring_buffer_free()). Distinct empty output objects are a
- * caller precondition. Both remain empty on failure. Release each successful
- * result before reusing it as an output argument. */
+ * strlen(). Source-derived ANSI-C values truncate at the first decoded NUL in
+ * each fragment; directly supplied payloads remain binary-capable. `command`
+ * and `type` must point to distinct, empty buffers (initialized to {0} or
+ * released with shell_netstring_buffer_free()). Distinct empty output objects
+ * are a caller precondition. Both remain empty on failure. Release each
+ * successful result before reusing it as an output argument. */
 shell_process_status_t shell_build_anomaly_netseqs_buffer(
     const char *command_line, size_t command_length,
     const shell_process_limits_t *limits, shell_netstring_buffer_t *command,

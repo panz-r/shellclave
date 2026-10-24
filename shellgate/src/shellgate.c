@@ -379,9 +379,9 @@ static SHELL_NONNULL(1, 2) void sg_path_fragment_compile(
 }
 
 /* Empty fragments match nothing. text is an explicit span, including any
- * embedded NUL decoded from ANSI-C quoting. For a nonempty fragment, state is
- * an unmatched prefix (< length); the caller stops advancing after a match.
- * No border is recomputed. */
+ * embedded NUL supplied through binary canonical data. For a nonempty fragment,
+ * state is an unmatched prefix (< length); the caller stops advancing after a
+ * match. No border is recomputed. */
 static SHELL_NONNULL(1, 2, 4) bool sg_path_fragment_advance(
     const sg_path_fragment_t *fragment, const char *text, size_t length,
     size_t *state) {
@@ -1936,18 +1936,12 @@ typedef struct {
   bool absolute;
 } sg_file_path_t;
 
-typedef struct {
-  char *decoded;
-  bool has_nul;
-} sg_path_decode_t;
-
 static SHELL_NONNULL(3) bool sg_path_decode_byte(unsigned char byte,
                                                  size_t position,
                                                  void *context) {
-  sg_path_decode_t *decode = context;
+  char *decoded = context;
   SG_PATH_DECODED();
-  decode->decoded[position] = (char)byte;
-  decode->has_nul |= byte == 0;
+  decoded[position] = (char)byte;
   return true;
 }
 
@@ -1984,17 +1978,16 @@ static SHELL_NONNULL(1, 2) sg_file_path_t
   size_t decoded_capacity = capacity / 2;
   char *identity = scratch + decoded_capacity;
   sg_file_path_t path = {.decoded = scratch, .identity = identity};
-  sg_path_decode_t decode = {.decoded = scratch};
   /* The graph has already classified this redirect operand in its shell
    * context. Decode once for spelling heuristics; unresolved dynamic paths
    * must never acquire a concrete identity from generic word classification. */
   bool is_static = !(doc->flags & SHELL_DEP_DOC_FLAG_DYNAMIC_NAME);
-  bool decoded = shell_visit_decoded_word(
-                     doc->path, doc->path_len, sg_path_decode_byte, &decode,
+  bool decoded = shell_process_visit_word_value(
+                     doc->path, doc->path_len, sg_path_decode_byte, scratch,
                      &path.decoded_length) == SHELL_PROCESS_OK;
   is_static = is_static && decoded;
   path.absolute = is_static && path.decoded_length != 0 && scratch[0] == '/';
-  path.known = is_static && path.decoded_length != 0 && !decode.has_nul &&
+  path.known = is_static && path.decoded_length != 0 &&
                (path.absolute || doc->cwd_known);
   if (path.known) {
     SG_PATH_IDENTITY(path.decoded_length);
@@ -2044,8 +2037,9 @@ static bool sg_decoded_word_prefix(const char *word, uint32_t word_len,
                                    bool require_more) {
   sg_static_prefix_t match = {prefix, prefix_len, 0, true};
   size_t decoded_len = 0;
-  return shell_visit_decoded_word(word, word_len, sg_static_prefix_byte, &match,
-                                  &decoded_len) == SHELL_PROCESS_OK &&
+  return shell_process_visit_word_value(word, word_len, sg_static_prefix_byte,
+                                        &match,
+                                        &decoded_len) == SHELL_PROCESS_OK &&
          match.matches && decoded_len >= prefix_len + (require_more ? 1u : 0u);
 }
 
@@ -2054,8 +2048,9 @@ static bool sg_word_option_value(const char *word, uint32_t word_len,
   size_t option_len = strlen(option);
   sg_static_prefix_t match = {option, option_len, 0, true};
   size_t decoded_len = 0;
-  return shell_visit_decoded_word(word, word_len, sg_static_prefix_byte, &match,
-                                  &decoded_len) == SHELL_PROCESS_OK &&
+  return shell_process_visit_word_value(word, word_len, sg_static_prefix_byte,
+                                        &match,
+                                        &decoded_len) == SHELL_PROCESS_OK &&
          match.matches && decoded_len > option_len && match.next_byte == '=';
 }
 
@@ -2159,8 +2154,9 @@ static bool sg_static_first_byte(unsigned char byte, size_t position,
 static bool sg_word_starts_dash(const char *word, uint32_t word_len) {
   sg_static_first_t first = {false};
   size_t decoded_len = 0;
-  return shell_visit_decoded_word(word, word_len, sg_static_first_byte, &first,
-                                  &decoded_len) == SHELL_PROCESS_OK &&
+  return shell_process_visit_word_value(word, word_len, sg_static_first_byte,
+                                        &first,
+                                        &decoded_len) == SHELL_PROCESS_OK &&
          decoded_len > 0 && first.starts_dash;
 }
 
@@ -2275,8 +2271,9 @@ static sg_argument_substrings_t sg_argument_substrings(sg_argument_t argument) {
   sg_argument_substrings_t facts = {0};
   if (!argument.decoded && !argument.dynamic) {
     size_t length;
-    (void)shell_visit_decoded_word(argument.data, argument.length,
-                                   sg_argument_substring_byte, &facts, &length);
+    (void)shell_process_visit_word_value(argument.data, argument.length,
+                                         sg_argument_substring_byte, &facts,
+                                         &length);
   } else
     for (size_t i = 0; i < argument.length; i++)
       (void)sg_argument_substring_byte((unsigned char)argument.data[i], i,

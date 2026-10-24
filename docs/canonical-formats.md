@@ -10,11 +10,15 @@ for applications that need to validate or traverse these records; it can expose
 NUL payload bytes. Canonical netargv, netsequences, and netpatterns support
 embedded NUL in their payloads. Keep the enclosing byte length throughout
 processing; NUL termination is not part of the canonical transport contract.
-Raw shell source rejects literal NUL bytes. Complete-command semantic
-APIs also reject ANSI-C quotes that decode to NUL, because Bash truncates the
-rest of that quoted segment at execution. Standalone word decoders remain
-byte-faithful, and canonical APIs still accept binary payloads supplied
-directly by an application or expansion callback.
+Raw shell source rejects literal NUL bytes. For source-derived argv, Bash's
+ANSI-C quoting rules truncate each fragment at its first decoded NUL and then
+resume subsequent fragments. For example, `pre$'a\0b'post` supplies
+`preapost`; `$'\0'` in an argument position supplies an empty argument.
+Standalone decoded-word helpers remain byte-faithful, while
+`shell_visit_static_word()` exposes the effective static Bash value. Canonical
+APIs also accept binary payloads supplied directly by an application or
+expansion callback. Keep these explicit-length binary values separate from
+source-derived fragment truncation.
 
 ## netargv
 

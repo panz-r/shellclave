@@ -81,10 +81,16 @@ shell_control_syntax_t shell_tokenizer_control_syntax(const char *input,
 /* Syntax that remains lexically visible but is outside Shellclave's
  * one-command semantic model. This includes active parameter writes, prompt
  * re-evaluation, actual indirect dereferencing, test/[ variable-name
- * re-evaluation and shell-option mutations;
- * ordinary parameter data and prefix-name enumeration remain supported.
+ * re-evaluation and shell-option mutations. Complete raw expansions whose
+ * meaning requires decoded child source or syntax reconstructed across
+ * fragments are unsupported too; malformed and incomplete framing retain
+ * their separate syntax classifications. Ordinary parameter data and
+ * prefix-name enumeration remain supported.
  * Source-only consumers conservatively reject read option ambiguities which
- * graph construction can resolve from captured descriptor-variable values. */
+ * graph construction can resolve from captured descriptor-variable values.
+ * Scratch exhaustion can also end inspection without an unsupported finding.
+ * Classification callers bind sufficient source scratch and check
+ * shell_source_scratch_exhausted() before ending their source operation. */
 bool shell_tokenizer_has_unsupported_semantics(const char *input,
                                                size_t input_length);
 
@@ -134,7 +140,10 @@ bool shell_tokenizer_inspect_semantics(
  * Validate the shell list operators exposed by the lexer. This is deliberately
  * narrower than complete shell grammar validation: it rejects impossible
  * operator chains while retaining the tokenizer's diagnostic tolerance for an
- * unfinished parenthesized group. */
+ * unfinished parenthesized group. These Boolean predicates also return false
+ * on source-scratch exhaustion. Internal callers needing a classification
+ * rather than bounded rejection establish an operation with sufficient
+ * scratch and inspect shell_source_scratch_exhausted() before ending it. */
 bool shell_tokenizer_list_syntax_valid(const char *input, size_t input_length);
 
 /* Whole-source byte-domain and strict syntax boundary for a complete one-shot

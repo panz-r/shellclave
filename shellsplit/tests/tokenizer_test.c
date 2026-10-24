@@ -671,8 +671,8 @@ static void test_source_scanner_boundaries(void) {
 
   /* Descriptor duplication evaluates a complete static word before deciding
    * whether it names an fd. Quoting therefore does not turn `>&"7"` into a
-   * filename redirect, while malformed and NUL-bearing words remain unusable
-   * as either an fd or a static pathname. */
+   * filename redirect. ANSI-C NUL truncation can leave a valid fd, close
+   * marker or pathname; malformed words remain unusable as any of them. */
   static const struct {
     const char *word;
     shell_process_fd_target_t target;
@@ -693,11 +693,13 @@ static void test_source_scanner_boundaries(void) {
       {"\"-\"", SHELL_PROCESS_FD_TARGET_CLOSE, SHELL_PROCESS_FD_NONE},
       {"path", SHELL_PROCESS_FD_TARGET_PATH, SHELL_PROCESS_FD_NONE},
       {"$name", SHELL_PROCESS_FD_TARGET_PATH, SHELL_PROCESS_FD_NONE},
-      {"$'a\\0b'", SHELL_PROCESS_FD_TARGET_INVALID, SHELL_PROCESS_FD_NONE},
+      {"$'a\\0b'", SHELL_PROCESS_FD_TARGET_PATH, SHELL_PROCESS_FD_NONE},
+      {"$'7\\0ignored'", SHELL_PROCESS_FD_TARGET_FD, 7},
+      {"$'-\\0ignored'", SHELL_PROCESS_FD_TARGET_CLOSE, SHELL_PROCESS_FD_NONE},
       {"abcdefghijklmnopqrstuvwxyzabcdefghi", SHELL_PROCESS_FD_TARGET_PATH,
        SHELL_PROCESS_FD_NONE},
       {"$'\\0'abcdefghijklmnopqrstuvwxyzabcdefghi",
-       SHELL_PROCESS_FD_TARGET_INVALID, SHELL_PROCESS_FD_NONE},
+       SHELL_PROCESS_FD_TARGET_PATH, SHELL_PROCESS_FD_NONE},
       {"", SHELL_PROCESS_FD_TARGET_INVALID, SHELL_PROCESS_FD_NONE},
   };
   for (size_t i = 0; valid && i < sizeof(fd_targets) / sizeof(fd_targets[0]);
@@ -1463,9 +1465,9 @@ static void test_expansion_line_continuation_contract(void) {
             written == sizeof(ansi_expected) &&
             memcmp(decoded, ansi_expected, sizeof(ansi_expected)) == 0 &&
             shell_process_validate_supported_source(
-                command, (size_t)command_length, NULL) == SHELL_PROCESS_EPARSE;
+                command, (size_t)command_length, NULL) == SHELL_PROCESS_OK;
   }
-  test("Continued ANSI-C NUL remains decodable but rejects complete source",
+  test("Continued ANSI-C NUL distinguishes binary decoding from shell values",
        valid);
 
   static const char continued_fd[] = "{ printf x; } >&$\\\n'7'";
@@ -1516,9 +1518,10 @@ static void test_redirect_operand_safety_contract(void) {
           0 &&
       shell_process_classify_static_fd_target(
           long_nul_target, sizeof(long_nul_target) - 1, &fd) ==
-          SHELL_PROCESS_FD_TARGET_INVALID &&
+          SHELL_PROCESS_FD_TARGET_PATH &&
       fd == SHELL_PROCESS_FD_NONE;
-  test("Redirect operands reject malformed, dynamic, and binary targets",
+  test("Redirect operands classify effective values after rejecting malformed "
+       "syntax",
        valid);
 }
 
@@ -2756,8 +2759,8 @@ static void test_modern_bash_syntax_contract(void) {
       .command_token_count = 2,
   };
   valid = shell_process_command("printf $'a\\0b'", strlen("printf $'a\\0b'"),
-                                NULL, &infos, &count) == SHELL_PROCESS_EPARSE &&
-          infos == NULL && count == 0 &&
+                                NULL, &infos, &count) == SHELL_PROCESS_OK &&
+          infos != NULL && count == 1 &&
           shell_render_netargv_buffer(&binary_info, NULL, &netargv) ==
               SHELL_PROCESS_OK;
   shell_netstring_iter_t iter;
@@ -2772,7 +2775,8 @@ static void test_modern_bash_syntax_contract(void) {
           shell_netstring_iter_next(&iter, &second) == SHELL_NETSTRING_DONE;
   shell_netstring_buffer_free(&netargv);
   shell_command_infos_free(infos, count);
-  test("Complete source rejects ANSI-C NUL; direct netargv remains binary",
+  test("Complete source truncates ANSI-C fragments; direct netargv remains "
+       "binary",
        valid);
 
   char ansi_bytes[3] = {0};
@@ -2870,7 +2874,6 @@ static void test_modern_bash_syntax_contract(void) {
   test("Canonical word decoding rejects locale-dependent escapes, not bytes",
        valid);
 
-  shell_netstring_buffer_t legacy = {0};
   shell_netstring_buffer_t argv_sequence = {0};
   shell_netstring_buffer_t command_sequence = {0};
   shell_netstring_buffer_t type_sequence = {0};
@@ -2882,40 +2885,34 @@ static void test_modern_bash_syntax_contract(void) {
   valid =
       shell_build_netargv_sequence_buffer(binary_source, strlen(binary_source),
                                           NULL, &argv_sequence, &sequence_count,
-                                          &features) == SHELL_PROCESS_EPARSE &&
-      argv_sequence.data == NULL && argv_sequence.length == 0 &&
-      sequence_count == 0 &&
-      shell_build_command_netseq_buffer(
-          binary_source, strlen(binary_source), NULL, &command_sequence,
-          &sequence_count) == SHELL_PROCESS_EPARSE &&
-      command_sequence.data == NULL && sequence_count == 0 &&
+                                          &features) == SHELL_PROCESS_OK &&
+      argv_sequence.length == strlen("11:2:ac,3:arg,,") &&
+      sequence_count == 1 &&
+      !memcmp(argv_sequence.data, "11:2:ac,3:arg,,", argv_sequence.length) &&
+      shell_build_command_netseq_buffer(binary_source, strlen(binary_source),
+                                        NULL, &command_sequence,
+                                        &sequence_count) == SHELL_PROCESS_OK &&
+      sequence_count == 1 && command_sequence.length == 5 &&
+      !memcmp(command_sequence.data, "2:ac,", 5) &&
       shell_build_type_netseq_buffer(binary_source, strlen(binary_source), NULL,
                                      &type_sequence,
-                                     &sequence_count) == SHELL_PROCESS_EPARSE &&
-      type_sequence.data == NULL && sequence_count == 0 &&
+                                     &sequence_count) == SHELL_PROCESS_OK &&
+      type_sequence.data != NULL && sequence_count == 1 &&
       shell_build_anomaly_netseqs_buffer(
           binary_source, strlen(binary_source), NULL, &anomaly_commands,
-          &anomaly_types, &sequence_count) == SHELL_PROCESS_EPARSE &&
-      anomaly_commands.data == NULL && anomaly_types.data == NULL &&
-      sequence_count == 0 &&
-      shell_build_netargv_sequence_buffer(binary_source, strlen(binary_source),
-                                          NULL, &legacy, &sequence_count,
-                                          &features) == SHELL_PROCESS_EPARSE &&
-      legacy.data == NULL &&
-      shell_build_command_netseq_buffer(binary_source, strlen(binary_source),
-                                        NULL, &legacy, &sequence_count) ==
-          SHELL_PROCESS_EPARSE &&
-      legacy.data == NULL &&
-      shell_build_type_netseq_buffer(binary_source, strlen(binary_source), NULL,
-                                     &legacy,
-                                     &sequence_count) == SHELL_PROCESS_EPARSE &&
-      legacy.data == NULL;
+          &anomaly_types, &sequence_count) == SHELL_PROCESS_OK &&
+      sequence_count == 1 &&
+      anomaly_commands.length == command_sequence.length &&
+      !memcmp(anomaly_commands.data, command_sequence.data,
+              command_sequence.length) &&
+      anomaly_types.length == type_sequence.length &&
+      !memcmp(anomaly_types.data, type_sequence.data, type_sequence.length);
   shell_netstring_buffer_free(&argv_sequence);
   shell_netstring_buffer_free(&command_sequence);
   shell_netstring_buffer_free(&type_sequence);
   shell_netstring_buffer_free(&anomaly_commands);
   shell_netstring_buffer_free(&anomaly_types);
-  test("Canonical sequence builders reject ANSI-C NUL source", valid);
+  test("Canonical sequence builders share effective ANSI-C word values", valid);
 
   infos = NULL;
   count = 0;
@@ -3704,27 +3701,32 @@ static void test_double_quoted_parameter_substitution_scope(void) {
            rejected.commands == NULL && rejected.command_count == 0);
   shell_processed_commands_free(&rejected);
 
-  static const char *const decoded_openers[] = {
-      "echo \"${x:-$'\\x24(printf hi)'}\"",
-      "echo \"${x:-$'\\044(printf hi)'}\"",
-      "echo \"${x:-$'\\u0024(printf hi)'}\"",
-      "echo \"${x:-$'\\U00000024(printf hi)'}\"",
-      "echo \"${x:-$'\\x5c$(printf hi)'}\"",
-      "echo \"${x:-$'\\x60printf hi\\x60'}\"",
-      "echo \"${x:-$'$\\x28printf hi)'}\"",
-      "echo \"${x:-$'\\x27$(printf hi)'}\"",
-      "echo \"${x:-$'\\\\`printf hi`'}\"",
-      "echo \"${x:-$'\\\\\\`printf hi`'}\"",
-      "echo \"${x:-$'$(printf\\x20X)'}\"",
-      "echo \"${x:-$'$(pr\\x69ntf X)'}\"",
-      "echo \"${x:-$'$(printf\\040X)'}\"",
-      "echo \"${x:-$'\\\\'$(printf hi)}\"",
-      "echo \"${x:-$'\\\"$(printf hi)'}\"",
-      "echo \"${x:-$'\\'$(printf hi)'}\"",
-      "echo \"${x:-$'\"$(printf hi)'}\"",
+  static const struct {
+    const char *source;
+    bool raw_complete;
+  } unsupported_ansi[] = {
+      {"echo \"${x:-$'\\x24(printf hi)'}\"", false},
+      {"echo \"${x:-$'\\044(printf hi)'}\"", false},
+      {"echo \"${x:-$'\\u0024(printf hi)'}\"", false},
+      {"echo \"${x:-$'\\U00000024(printf hi)'}\"", false},
+      {"echo \"${x:-$'\\x5c$(printf hi)'}\"", false},
+      {"echo \"${x:-$'\\x60printf hi\\x60'}\"", false},
+      {"echo \"${x:-$'$\\x28printf hi)'}\"", false},
+      {"echo \"${x:-$'\\x27$(printf hi)'}\"", false},
+      {"echo \"${x:-$'\\\\`printf hi`'}\"", false},
+      {"echo \"${x:-$'\\\\\\`printf hi`'}\"", false},
+      /* These raw children frame completely. Only the semantic boundary
+       * rejects the different source produced by decoding their bodies. */
+      {"echo \"${x:-$'$(printf\\x20X)'}\"", true},
+      {"echo \"${x:-$'$(pr\\x69ntf X)'}\"", true},
+      {"echo \"${x:-$'$(printf\\040X)'}\"", true},
+      {"echo \"${x:-$'\\\\'$(printf hi)}\"", false},
+      {"echo \"${x:-$'\\\"$(printf hi)'}\"", false},
+      {"echo \"${x:-$'\\'$(printf hi)'}\"", false},
+      {"echo \"${x:-$'\"$(printf hi)'}\"", false},
   };
   bool encoded_rejected = true;
-  for (size_t i = 0; i < sizeof(decoded_openers) / sizeof(decoded_openers[0]);
+  for (size_t i = 0; i < sizeof(unsupported_ansi) / sizeof(unsupported_ansi[0]);
        i++) {
     shell_processed_commands_t decoded = {0};
     shell_parse_result_t fast = {0};
@@ -3733,26 +3735,30 @@ static void test_double_quoted_parameter_substitution_scope(void) {
     shell_netstring_buffer_t raw = {0};
     shell_netstring_buffer_t typed = {0};
     size_t stages = 0;
-    size_t length = strlen(decoded_openers[i]);
-    shell_error_t fast_status =
-        shell_parse_fast(decoded_openers[i], length, NULL, &fast);
+    const char *source = unsupported_ansi[i].source;
+    size_t length = strlen(source);
+    shell_error_t fast_status = shell_parse_fast(source, length, NULL, &fast);
     shell_tokenize_status_t full_status =
-        shell_tokenize_commands(decoded_openers[i], length, &full, &full_count);
+        shell_tokenize_commands(source, length, &full, &full_count);
     shell_process_status_t process_status =
-        shell_process_commands(decoded_openers[i], length, NULL, &decoded);
+        shell_process_commands(source, length, NULL, &decoded);
     shell_process_status_t anomaly_status = shell_build_anomaly_netseqs_buffer(
-        decoded_openers[i], length, NULL, &raw, &typed, &stages);
+        source, length, NULL, &raw, &typed, &stages);
     /* The full tokenizer is lexical and may preserve an unsupported word or
      * reject its incomplete quote; semantic APIs must reject either way. */
     bool lexical_consistent =
         (full_status == SHELL_TOKENIZE_OK && full != NULL && full_count == 1) ||
-        (full_status == SHELL_TOKENIZE_EPARSE && full == NULL &&
+        (!unsupported_ansi[i].raw_complete &&
+         full_status == SHELL_TOKENIZE_EPARSE && full == NULL &&
          full_count == 0);
     bool case_valid =
-        fast_status == SHELL_EPARSE && fast.count == 0 && lexical_consistent &&
-        process_status == SHELL_PROCESS_EPARSE && decoded.commands == NULL &&
-        decoded.command_count == 0 && anomaly_status == SHELL_PROCESS_EPARSE &&
-        raw.data == NULL && typed.data == NULL && stages == 0;
+        fast_status ==
+            (unsupported_ansi[i].raw_complete ? SHELL_OK : SHELL_EPARSE) &&
+        fast.count == (unsupported_ansi[i].raw_complete ? 1u : 0u) &&
+        lexical_consistent && process_status == SHELL_PROCESS_EPARSE &&
+        decoded.commands == NULL && decoded.command_count == 0 &&
+        anomaly_status == SHELL_PROCESS_EPARSE && raw.data == NULL &&
+        typed.data == NULL && stages == 0;
     if (!case_valid)
       fprintf(stderr,
               "ANSI parameter case %zu: fast=%d full=%d process=%d "
@@ -3764,7 +3770,7 @@ static void test_double_quoted_parameter_substitution_scope(void) {
     shell_commands_free(full, full_count);
     shell_processed_commands_free(&decoded);
   }
-  test("ANSI-C encoded syntax in parameter words fails closed",
+  test("ANSI-C encoded syntax and translated child bodies fail closed",
        encoded_rejected);
 }
 
@@ -5920,6 +5926,7 @@ static void test_brace_group_grammar_matrix(void) {
       "echo < (printf value)",
       "echo >> (printf value)",
       "cat << (EOF",
+      "diff <(",
       "{ echo; } > (cat)",
       "3>/tmp/trace </tmp/in { echo one; }",
       "4<&0 ( echo one; )",
@@ -6423,8 +6430,7 @@ static void test_anomaly_sequences_represent_redirect_only_record(void) {
   shell_netstring_buffer_free(&command_netseq);
 
   /* The anomaly-only sentinel is still subject to each builder's ordinary
-   * output and source contracts. It is not a loophole that makes a tiny
-   * output limit succeed or accepts an ANSI-C NUL-bearing executable. */
+   * output and source contracts, including empty-executable rejection. */
   shell_process_limits_t raw_limit = {2, SIZE_MAX, 0};
   shell_process_limits_t type_limit = {3, SIZE_MAX, 0};
   shell_netstring_buffer_t command_buffer = {0};
@@ -6448,7 +6454,7 @@ static void test_anomaly_sequences_represent_redirect_only_record(void) {
               &count) == SHELL_PROCESS_EOUTPUT_LIMIT &&
           command_buffer.data == NULL && command_buffer.length == 0 &&
           type_buffer.data == NULL && type_buffer.length == 0 && count == 0;
-  const char *binary_input = "$'sentinel\\0binary'";
+  const char *binary_input = "$'\\0binary'";
   count = SIZE_MAX;
   valid = valid &&
           shell_build_anomaly_netseqs_buffer(
@@ -8269,16 +8275,8 @@ static void test_current_shell_metaprogramming_semantic_contract(void) {
       "e$'val\\0x' 'printf bypass'",
       "command e$'val\\x00x' 'printf bypass'",
       "export $'POSIXLY_CORRECT\\0X'=1",
-      "printf $'a\\000b'",
-      "printf $'a\\x00b'",
-      "printf $'a\\u0000b'",
       "printf $'\\u00e9'",
-      "printf $'a\\U00000000b'",
-      "printf $'a\\c@b'",
-      "printf $(printf $'a\\0b')",
-      "printf ${value:-$'a\\0b'}",
-      "cat <<$'E\\0F'X\nbody\nEX\n",
-      "cat <<A <<$'E\\0F'X\nfirst\nA\nsecond\nEX\n",
+      "printf \"${value:-$'a\\0b'}\"",
       "declare POSIXLY_CORRECT=1",
       "declare 'POSIXLY_CORRECT=1'",
       "export $'NAME\\x3dvalue'",
@@ -9294,6 +9292,11 @@ int main(void) {
            "{ printf '%s' $'日本\\t語'; } >$'résumé.txt'") &&
            process_command_allocation_failure_atomic(
                "printf '%s' $'\x80\xff' >$'résumé.txt'"));
+  test("ANSI-C NUL processing is allocation-failure atomic",
+       process_commands_allocation_failure_atomic(
+           "{ printf '%s' $'a\\0b'; } >$'out\\0ignored'") &&
+           process_command_allocation_failure_atomic(
+               "printf '%s' pre$'a\\0b'post $'\\0'"));
   test("Later timing prefixes are allocation-failure atomic",
        process_command_allocation_failure_atomic(
            "echo a; time -p echo b; time; ! echo c") &&
@@ -10561,7 +10564,7 @@ int main(void) {
 
   {
     static const char static_word[] = "c'ur'\\l$'\\x00'";
-    static const unsigned char expected[] = {'c', 'u', 'r', 'l', 0};
+    static const unsigned char expected[] = {'c', 'u', 'r', 'l'};
     unsigned char bytes[sizeof(expected)] = {0};
     decoded_word_capture_t capture = {
         .bytes = bytes,
@@ -10573,6 +10576,13 @@ int main(void) {
                                 capture_decoded_word_byte, &capture, &length) &&
         length == sizeof(expected) &&
         memcmp(bytes, expected, sizeof(expected)) == 0;
+    capture.stop_after = 1;
+    length = SIZE_MAX;
+    valid = valid &&
+            shell_visit_static_word(
+                "$'a\\0discarded'c", strlen("$'a\\0discarded'c"),
+                capture_decoded_word_byte, &capture, &length) &&
+            length == 1 && bytes[0] == 'a';
     length = SIZE_MAX;
     valid = valid &&
             !shell_visit_static_word("\"$command\"", strlen("\"$command\""),
@@ -11629,7 +11639,7 @@ int main(void) {
            command_netseq_matches("cat <(printf child)", "6:printf,3:cat,", 2));
 
   /* Direct canonical builders retain binary payloads, while complete source
-   * containing an ANSI-C NUL is unsupported by default. */
+   * uses Bash's fragment-local truncation. */
   {
     static const char source[] = "printf $'a\\0b'";
     shell_token_t tokens[] = {
@@ -11650,17 +11660,18 @@ int main(void) {
     shell_process_status_t status = shell_process_command(
         source, sizeof(source) - 1, NULL, &infos, &info_count);
     bool buffer_valid =
-        status == SHELL_PROCESS_EPARSE && infos == NULL && info_count == 0 &&
+        status == SHELL_PROCESS_OK && infos != NULL && info_count == 1 &&
         shell_render_netargv_buffer(&binary_info, NULL, &argv) ==
             SHELL_PROCESS_OK &&
         shell_netstring_validate(argv.data, argv.length, &record_count) ==
             SHELL_NETSTRING_OK &&
         record_count == 2 && memchr(argv.data, '\0', argv.length) != NULL &&
-        shell_build_netargv_sequence_buffer(
-            source, sizeof(source) - 1, NULL, &sequence, &sequence_count,
-            &features) == SHELL_PROCESS_EPARSE &&
-        sequence.data == NULL && sequence.length == 0 && sequence_count == 0 &&
-        !features;
+        shell_build_netargv_sequence_buffer(source, sizeof(source) - 1, NULL,
+                                            &sequence, &sequence_count,
+                                            &features) == SHELL_PROCESS_OK &&
+        sequence_count == 1 && !features &&
+        sequence.length == strlen("13:6:printf,1:a,,") &&
+        !memcmp(sequence.data, "13:6:printf,1:a,,", sequence.length);
     shell_netstring_buffer_free(&sequence);
     shell_netstring_buffer_free(&argv);
     shell_command_infos_free(infos, info_count);

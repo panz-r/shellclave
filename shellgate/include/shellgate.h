@@ -694,9 +694,10 @@ sg_error_t sg_gate_set_expand_word_netargv(sg_gate_t *gate,
                                            void *user_ctx) SHELL_NONNULL(1);
 
 /*
- * Stores a shallow copy of `config`. All strings referenced by its arrays
- * must remain valid and unchanged until the gate is destroyed or another
- * violation configuration is installed.
+ * Stores a shallow copy of `config`. Later edits to the caller's structure
+ * take effect only after another successful call, which rebuilds the matchers.
+ * All strings referenced by its arrays must remain valid and unchanged until
+ * the gate is destroyed or another violation configuration is installed.
  * Validates array counts and entries, and precomputes fragment matchers.
  * SG_ERR_INVALID (invalid arrays) and SG_ERR_MEMORY (matcher allocation or
  * size overflow) leave the installed configuration unchanged. Empty path
