@@ -53,13 +53,16 @@ typedef enum {
 } shell_command_kind_t;
 
 /* Normalized conditional predicate. Bare words use STRING_NONEMPTY; = and ==
- * share STRING_EQUAL. Lexical ! parity is represented separately. */
+ * share STRING_EQUAL for literal RHSs. Active static stars use PATTERN_MATCH
+ * or PATTERN_NOT_MATCH. Lexical ! parity is represented separately. */
 typedef enum {
   SHELL_CONDITIONAL_PREDICATE_NONE = 0,
   SHELL_CONDITIONAL_STRING_NONEMPTY,
   SHELL_CONDITIONAL_STRING_EMPTY,
   SHELL_CONDITIONAL_STRING_EQUAL,
   SHELL_CONDITIONAL_STRING_NOT_EQUAL,
+  SHELL_CONDITIONAL_PATTERN_MATCH,
+  SHELL_CONDITIONAL_PATTERN_NOT_MATCH,
 } shell_conditional_predicate_t;
 
 /**
@@ -121,16 +124,18 @@ typedef enum {
  * control words. These flags do not establish a complete control-flow grammar
  * or semantic support; standalone keyword spellings remain lexical markers
  * even in ordinary argument positions.
- * Arithmetic commands and expansions use arithmetic syntax for their bodies;
- * Conditional operands suppress pathname-glob features and control-word roles;
- * executable children establish their own shell-command feature context.
+ * Arithmetic commands and expansions use arithmetic syntax for their bodies.
+ * Conditional operands suppress pathname expansion and control-word roles.
+ * Ordinary operand glob detection is suppressed; supported active RHS stars
+ * set SHELL_FEAT_GLOBS for conditional pattern matching. Executable children
+ * establish their own shell-command feature context.
  * Extglob alternatives are pattern data; active expansions within them still
  * contribute their feature bits, including nested executable-child features.
  */
 typedef enum {
   SHELL_FEAT_NONE = 0,
   SHELL_FEAT_VARS = 1 << 0,             // $VAR, ${VAR}, $1, etc.
-  SHELL_FEAT_GLOBS = 1 << 1,            // *, ?, [abc]
+  SHELL_FEAT_GLOBS = 1 << 1,            // *, ?, [abc]; conditional RHS *
   SHELL_FEAT_SUBSHELL = 1 << 2,         // $(...), `...`
   SHELL_FEAT_ARITH = 1 << 3,            // $((...)) and ((...))
   SHELL_FEAT_HEREDOC = 1 << 4,          // << delimiter (in subcommand)
@@ -166,13 +171,18 @@ typedef struct {
   size_t workspace_size;
 } shell_limits_t;
 
-/* Capacity for operation-local delimiter normalization, including literal
- * command-fragment printing, and non-evicting subscript boundary facts.
- * Public iterators retain those facts in the buffer between next() calls.
+/* Sufficient capacity for operation-local source-analysis scratch: delimiter
+ * normalization (including literal command-fragment printing), non-evicting
+ * subscript boundary facts, and conditional-pattern evaluation. Pattern
+ * evaluation reserves projected units, a prefix table and decoded subject
+ * bytes as needed. Public iterators retain subscript facts in the buffer
+ * between next() calls.
  * No source is read and no storage is allocated.
  * Required output is cleared on arithmetic overflow (false). The buffer may
  * have any alignment and must not alias source or result storage. Existing
- * syntax/depth/output limits still apply independently of this byte bound. */
+ * syntax/depth/output limits still apply independently of this byte bound.
+ * Smaller buffers remain valid; reservations check capacity and arithmetic
+ * independently and report exhaustion through the consuming API. */
 bool shell_source_workspace_size(size_t source_length, size_t *workspace_size)
     SHELL_NONNULL(2);
 

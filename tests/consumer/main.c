@@ -295,7 +295,7 @@ static bool check_depgraph_workspace_api(void) {
                                            &graph) == SHELL_DEP_OK &&
            graph.nodes[0].cmd.kind == SHELL_COMMAND_ARITHMETIC &&
            graph.nodes[0].cmd.arithmetic_truth == SHELL_ARITHMETIC_NONZERO;
-      const char condition[] = "[[ 'x' == \"x\" ]]";
+      const char condition[] = "[[ 'file.txt' == *.txt ]]";
       ok = ok &&
            shell_parse_draft(condition, sizeof(condition) - 1, NULL, draft) ==
                SHELL_SOURCE_COMPLETE &&
@@ -307,9 +307,9 @@ static bool check_depgraph_workspace_api(void) {
            graph.nodes[0].cmd.conditional_truth == SHELL_CONDITIONAL_TRUE &&
            graph.nodes[0].cmd.conditional_operand_count == 2 &&
            graph.nodes[0].cmd.conditional_predicate ==
-               SHELL_CONDITIONAL_STRING_EQUAL &&
+               SHELL_CONDITIONAL_PATTERN_MATCH &&
            draft->headers[0].conditional_operand_count == 2 &&
-           graph.nodes[0].cmd.conditional_operand_lengths[1] == 3 &&
+           graph.nodes[0].cmd.conditional_operand_lengths[1] == 5 &&
            graph.nodes[0].cmd.token_count == 0;
     }
     free(draft);

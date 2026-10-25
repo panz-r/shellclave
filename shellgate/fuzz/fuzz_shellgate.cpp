@@ -194,7 +194,8 @@ void validate_result(const sg_result_t *result, sg_error_t error,
       result->violation_count > SG_MAX_VIOLATIONS ||
       result->suggestion_count > 2 || result->deny_suggestion_count > 2 ||
       (result->unresolved_expansion_flags &
-       ~(SG_EXPANSION_UNRESOLVED_ARGV | SG_EXPANSION_UNRESOLVED_PATH)) != 0 ||
+       ~(SG_EXPANSION_UNRESOLVED_ARGV | SG_EXPANSION_UNRESOLVED_PATH |
+         SG_EXPANSION_UNRESOLVED_CONDITION)) != 0 ||
       (error == SG_ERR_TRUNC && !result->truncated) ||
       (result->truncated && result->verdict != SG_VERDICT_UNDETERMINED) ||
       (error == SG_ERR_TRUNC &&
@@ -1044,6 +1045,22 @@ void run_semantic_reference_oracles() {
   if (sg_gate_set_violation_config_borrowed(option_gate, &expansion_config) !=
       SG_OK)
     invariant_failure("expansion control violation configuration failed");
+  /* Conditions have no argv-policy subjects, but their unresolved string
+   * operands still contribute aggregate flags accepted by validate_result. */
+  for (const char *source :
+       {"[[ $value == *.txt ]]", "[[ \"$left\" == \"$right\" ]]",
+        "[[ file.txt == *.txt ]]"}) {
+    auto &buffer = eval_buffer_for(g_eval_buffers.result, strlen(source));
+    sg_result_t result = {};
+    sg_error_t error = sg_gate_evaluate(option_gate, source, strlen(source),
+                                        buffer.data(), buffer.size(), &result);
+    uint32_t flags =
+        strchr(source, '$') ? SG_EXPANSION_UNRESOLVED_CONDITION : 0;
+    if (error != SG_OK || result.verdict != SG_VERDICT_ALLOW ||
+        result.subcommand_count || result.unresolved_expansion_flags != flags)
+      invariant_failure("conditional unresolved-string oracle mismatch");
+    validate_result(&result, error, buffer.data(), buffer.size());
+  }
   for (const char *source : {"wc -l file.txt", "wc -l file.txt 2>&1",
                              "wc -l file.txt 1>&0; wc -l other.txt"}) {
     auto &buffer = eval_buffer_for(g_eval_buffers.result, strlen(source));

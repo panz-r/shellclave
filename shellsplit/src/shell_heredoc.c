@@ -66,8 +66,11 @@ typedef struct {
 
 /* Two pieces per source byte cover words, operators, and wrappers. Each
  * allocation permits arbitrary caller alignment. The remaining 16 bytes per
- * source byte cover printed spelling, live decoded nested delimiters and one
- * decoded conditional operand. These temporary spans share operation scratch.
+ * source byte cover printed spelling, live decoded nested delimiters and
+ * conditional matching. A pattern uses at most two bytes per projected unit,
+ * sizeof(size_t) per byte of its longest literal run, one decoded subject,
+ * and size_t alignment padding; together these fit the 16-byte source factor.
+ * These temporary spans share operation scratch.
  * Subscript facts and the public iterator's private continuation record use
  * an additional boundary entry plus 64 bytes per source byte. This covers
  * arbitrary alignment and keeps persistent facts outside delimiter marks.

@@ -68,10 +68,7 @@ static SHELL_NONNULL(1, 4, 5) conditional_token_t
   return CONDITIONAL_TOKEN_NONE;
 }
 
-/* This increment admits only RHS words made entirely from quoted fragments.
- * Empty quotes count; continuations between fragments contribute no bytes.
- * An unquoted fragment remains outside the model even if it has no wildcard.
- * Framing has already established a complete shell word. */
+/* Fully quoted dynamic RHSs retain the one-final-string callback contract. */
 static SHELL_NONNULL(1) bool quoted_rhs(const char *s, size_t n, size_t p,
                                         size_t end) {
   bool quoted = false;
@@ -89,6 +86,67 @@ static SHELL_NONNULL(1) bool quoted_rhs(const char *s, size_t n, size_t p,
     p = after;
   }
   return quoted;
+}
+
+typedef struct {
+  unsigned char byte;
+  bool star;
+} pattern_unit_t;
+
+/* units is NULL during measurement, which determines the required capacity.
+ * Before emission, checked scratch reservations validate allocation arithmetic
+ * and available space; units then has room for the measured projection.
+ * Adjacent active stars collapse even across empty quoted fragments. */
+typedef struct {
+  pattern_unit_t *units;
+  size_t length, run, max_run;
+  bool has_star, previous_star;
+} pattern_builder_t;
+
+static SHELL_NONNULL(3) bool pattern_byte(unsigned char byte, bool quoted,
+                                          void *context) {
+  SHELL_SOURCE_WORD_SCAN(1);
+  pattern_builder_t *builder = context;
+  bool star = byte == '*' && !quoted;
+  if (star && builder->previous_star)
+    return true;
+  if (builder->units)
+    builder->units[builder->length] = (pattern_unit_t){byte, star};
+  builder->length++;
+  builder->has_star |= star;
+  builder->previous_star = star;
+  builder->run = star ? 0 : builder->run + 1;
+  if (builder->run > builder->max_run)
+    builder->max_run = builder->run;
+  return true;
+}
+
+/* This admission boundary accepts only literal bytes and active stars.
+ * Unquoted parentheses belong to wider extglob syntax in a complete word;
+ * quoted/escaped pattern metacharacters are ordinary literal bytes. */
+static SHELL_NONNULL(3) bool admit_pattern_byte(unsigned char byte, bool quoted,
+                                                void *context) {
+  if (!quoted && (byte == '?' || byte == '[' || byte == '(' || byte == ')'))
+    return false;
+  return pattern_byte(byte, quoted, context);
+}
+
+static SHELL_NONNULL(1, 5) bool comparison_rhs(
+    const char *s, size_t n, size_t p, size_t end,
+    shell_conditional_predicate_t *predicate) {
+  if (quoted_rhs(s, n, p, end))
+    return true;
+  if (shell_conditional_word_dynamic(s + p, end - p))
+    return false;
+  pattern_builder_t builder = {0};
+  if (!shell_source_visit_quoted_word(s + p, end - p, admit_pattern_byte,
+                                      &builder))
+    return false;
+  if (builder.has_star)
+    *predicate = *predicate == SHELL_CONDITIONAL_STRING_NOT_EQUAL
+                     ? SHELL_CONDITIONAL_PATTERN_NOT_MATCH
+                     : SHELL_CONDITIONAL_PATTERN_MATCH;
+  return true;
 }
 
 /* Capture even an unfinished operand so draft collection can retain its
@@ -204,7 +262,7 @@ shell_conditional_t shell_conditional_parse(const char *s, size_t n,
       }
       if (!operand(s, n, p, 1, &r, &end))
         return r;
-      if (!quoted_rhs(s, n, p, end)) {
+      if (!comparison_rhs(s, n, p, end, &r.predicate)) {
         r.frame = SHELL_CONDITIONAL_UNSUPPORTED;
         return r;
       }
@@ -275,6 +333,112 @@ static SHELL_NONNULL(2) bool compare_byte(unsigned char byte, void *context) {
   return true;
 }
 
+/* Precompiled units contain at least one star. prefix has max_run entries.
+ * data may be NULL only for an empty subject. Anchored ends reserve disjoint
+ * bytes; KMP finds each interior literal run at its earliest remaining match.
+ * Each subject byte is searched at most once across runs, with linear KMP
+ * fallback work. No locale state, recursion or wildcard backtracking is used.
+ */
+static SHELL_NONNULL(1, 5) bool match_pattern(const pattern_unit_t *units,
+                                              size_t count, const char *data,
+                                              size_t length, size_t *prefix) {
+  size_t first = 0, last = count;
+  while (!units[first].star)
+    first++;
+  while (!units[last - 1].star)
+    last--;
+  size_t suffix = count - last;
+  if (first > length || suffix > length - first)
+    return false;
+  for (size_t i = 0; i < first; ++i) {
+    SHELL_SOURCE_WORD_SCAN(1);
+    if (units[i].byte != (unsigned char)data[i])
+      return false;
+  }
+  size_t stop = length - suffix;
+  for (size_t i = 0; i < suffix; ++i) {
+    SHELL_SOURCE_WORD_SCAN(1);
+    if (units[last + i].byte != (unsigned char)data[stop + i])
+      return false;
+  }
+  size_t cursor = first;
+  for (size_t run = first + 1; run < last - 1;) {
+    size_t end = run;
+    while (!units[end].star)
+      end++;
+    size_t size = end - run;
+    prefix[0] = 0;
+    for (size_t i = 1, matched = 0; i < size; ++i) {
+      SHELL_SOURCE_WORD_SCAN(1);
+      while (matched && units[run + i].byte != units[run + matched].byte) {
+        SHELL_SOURCE_WORD_SCAN(1);
+        matched = prefix[matched - 1];
+      }
+      if (units[run + i].byte == units[run + matched].byte)
+        matched++;
+      prefix[i] = matched;
+    }
+    size_t matched = 0;
+    while (cursor < stop && matched < size) {
+      SHELL_SOURCE_WORD_SCAN(1);
+      unsigned char byte = (unsigned char)data[cursor++];
+      while (matched && byte != units[run + matched].byte) {
+        SHELL_SOURCE_WORD_SCAN(1);
+        matched = prefix[matched - 1];
+      }
+      if (byte == units[run + matched].byte)
+        matched++;
+    }
+    if (matched != size)
+      return false;
+    run = end + 1;
+  }
+  return true;
+}
+
+/* condition supplies an admitted static star pattern. The enclosing operation
+ * releases all temporary storage at its saved mark, including on failure. */
+static SHELL_NONNULL(1, 2, 3, 4) bool evaluate_pattern(
+    const char *source, const shell_conditional_t *condition,
+    const shell_conditional_value_t *left, bool *matched) {
+  const char *word = source + condition->operands[1];
+  size_t length = condition->operand_lengths[1];
+  pattern_builder_t measure = {0};
+  if (!shell_source_visit_quoted_word(word, length, pattern_byte, &measure))
+    return false;
+  /* Check each array reservation before emitting measured units. Callers may
+   * supply less scratch than the source workspace's sufficient size bound. */
+  pattern_unit_t *units = shell_source_scratch_take_array(
+      measure.length, sizeof(pattern_unit_t), _Alignof(pattern_unit_t));
+  if (!units)
+    return false;
+  size_t *prefix = shell_source_scratch_take_array(
+      measure.max_run, sizeof(size_t), _Alignof(size_t));
+  if (!prefix)
+    return false;
+  pattern_builder_t build = {.units = units};
+  if (!shell_source_visit_quoted_word(word, length, pattern_byte, &build))
+    return false;
+  shell_conditional_value_t subject = *left;
+  if (!subject.known) {
+    word = source + condition->operands[0];
+    length = condition->operand_lengths[0];
+    subject.length = 0;
+    if (!shell_source_visit_decoded_word(word, length, measure_byte,
+                                         &subject.length))
+      return false;
+    unsigned char *bytes = shell_source_scratch_take(subject.length);
+    if (!bytes)
+      return false;
+    subject.data = (const char *)bytes;
+    if (!shell_source_visit_decoded_word(word, length, write_byte, &bytes))
+      return false;
+  }
+  *matched =
+      match_pattern(units, build.length, subject.data, subject.length, prefix);
+  return true;
+}
+
 bool shell_conditional_evaluate(const char *source,
                                 const shell_conditional_t *condition,
                                 const shell_conditional_value_t values[2],
@@ -299,6 +463,16 @@ bool shell_conditional_evaluate(const char *source,
                                        condition->operand_lengths[i]))
       return false;
   size_t mark = shell_source_scratch_mark();
+  if (shell_conditional_pattern(condition->predicate)) {
+    bool matched;
+    bool known = evaluate_pattern(source, condition, &values[0], &matched);
+    shell_source_scratch_release(mark);
+    if (known)
+      *truth = (matched != (condition->predicate ==
+                            SHELL_CONDITIONAL_PATTERN_NOT_MATCH)) !=
+               condition->negated;
+    return known;
+  }
   unsigned stored = values[0].known ? 0 : 1;
   shell_conditional_value_t value = values[stored];
   if (!value.known) {

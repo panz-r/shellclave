@@ -56,6 +56,63 @@ static bool capture_decoded_byte(unsigned char byte, size_t offset,
     }                                                                          \
   } while (0)
 
+static void test_source_scratch_array_reservations(void) {
+  static const struct {
+    size_t count, element_size, alignment;
+  } cases[] = {
+      {SIZE_MAX / sizeof(size_t) + 1, sizeof(size_t), _Alignof(size_t)},
+      {SIZE_MAX, 1, 8},
+      {512, 1, 1},
+  };
+  const char source[] = "x";
+  unsigned char workspace[513];
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+    shell_source_operation_begin(source, 1);
+    shell_source_workspace_scope_t scope = shell_source_workspace_begin(
+        source, 1, workspace + 1, sizeof(workspace) - 1);
+    CHECK(!shell_source_scratch_exhausted());
+    CHECK(shell_source_scratch_take(1) != NULL);
+    size_t *values =
+        shell_source_scratch_take_array(3, sizeof(size_t), _Alignof(size_t));
+    CHECK(values != NULL && (uintptr_t)values % _Alignof(size_t) == 0);
+    for (size_t j = 0; j < 3; ++j)
+      values[j] = j + 17;
+    size_t mark = shell_source_scratch_mark();
+    CHECK(shell_source_scratch_take_array(0, sizeof(size_t), 1) != NULL);
+    CHECK(shell_source_scratch_mark() == mark);
+    void *empty = shell_source_scratch_take_array(0, sizeof(size_t), 8);
+    CHECK(empty != NULL && (uintptr_t)empty % 8 == 0);
+    CHECK(shell_source_scratch_mark() == mark + 7);
+    CHECK(!shell_source_scratch_exhausted());
+    mark = shell_source_scratch_mark();
+    CHECK(shell_source_scratch_take_array(cases[i].count, cases[i].element_size,
+                                          cases[i].alignment) == NULL);
+    CHECK(shell_source_scratch_mark() == mark);
+    CHECK(shell_source_scratch_exhausted());
+    for (size_t j = 0; j < 3; ++j)
+      CHECK(values[j] == j + 17);
+    shell_source_scratch_release(0);
+    CHECK(shell_source_scratch_mark() == 0);
+    CHECK(shell_source_scratch_exhausted());
+    shell_source_workspace_end(scope);
+    shell_source_operation_end();
+  }
+  shell_source_operation_begin(source, 1);
+  shell_source_workspace_scope_t scope = shell_source_workspace_begin(
+      source, 1, workspace + 1, sizeof(workspace) - 1);
+  CHECK(!shell_source_scratch_exhausted());
+  CHECK(shell_source_scratch_take(sizeof(workspace) - 1) != NULL);
+  size_t mark = shell_source_scratch_mark();
+  CHECK(shell_source_scratch_take_array(0, 1, 1) ==
+        workspace + sizeof(workspace));
+  CHECK(shell_source_scratch_mark() == mark);
+  CHECK(shell_source_scratch_take_array(0, 1, 8) == NULL);
+  CHECK(shell_source_scratch_mark() == mark);
+  CHECK(shell_source_scratch_exhausted());
+  shell_source_workspace_end(scope);
+  shell_source_operation_end();
+}
+
 static void test_logical_comment_boundaries(void) {
   const shell_limits_t strict = {.max_subcommands = SHELL_MAX_SUBCOMMANDS,
                                  .strict_mode = true};
@@ -6726,6 +6783,7 @@ static void test_adjacent_named_fd_boundaries(void) {
 }
 
 int main(void) {
+  test_source_scratch_array_reservations();
   test_quoted_literal_bytes();
   test_logical_comment_boundaries();
   test_comment_boundary_io();

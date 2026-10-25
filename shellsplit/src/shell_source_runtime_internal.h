@@ -109,6 +109,14 @@ shell_source_workspace_begin(const char *source, size_t length, void *buffer,
 void shell_source_workspace_end(shell_source_workspace_scope_t previous);
 size_t shell_source_scratch_mark(void);
 void *shell_source_scratch_take(size_t size);
+/* Reserve an aligned array within an active source operation. element_size
+ * must be positive and alignment a nonzero power of two. Zero count permits
+ * an empty span. Multiplication, padding overflow and capacity exhaustion
+ * return NULL, set sticky exhaustion and leave the scratch mark unchanged.
+ * Workspace sizing supplies capacity bounds; reservations check arithmetic
+ * independently, including when callers provide smaller buffers. */
+void *shell_source_scratch_take_array(size_t count, size_t element_size,
+                                      size_t alignment);
 void shell_source_scratch_release(size_t mark);
 bool shell_source_scratch_exhausted(void);
 /* Enter one borrowed lexical body, restoring its enclosing body on exit.

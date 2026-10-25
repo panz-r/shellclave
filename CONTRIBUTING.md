@@ -103,7 +103,9 @@ and heredocs. Retained draft collection remains in `shell_source.c`; lexical
 iteration and list grammar retain their own responsibilities.
 
 `shell_conditional.c` owns string-condition framing, unary/comparison grammar,
-ordered operand spans, quote restrictions and static predicate evaluation. Consumers reuse those facts and the
+ordered operand spans, pattern admission and static predicate evaluation.
+It owns the linear star-pattern matcher; the shared source-word projection
+owns decoding and quote provenance. Consumers reuse those facts and the
 shared word-expansion primitives. Descriptor snapshots distinguish body-word
 expansion after compound setup from simple-command argv expansion before setup.
 

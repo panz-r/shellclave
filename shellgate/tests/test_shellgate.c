@@ -3762,6 +3762,19 @@ TEST(conditional_string_contract) {
   ASSERT(result.verdict == SG_VERDICT_ALLOW && result.subcommand_count == 0);
   ASSERT_SG_OK(eval_cmd(gate, "[[ x == \"x\" ]]", &result));
   ASSERT(result.verdict == SG_VERDICT_ALLOW && !result.subcommand_count);
+  ASSERT_SG_OK(eval_cmd(gate, "[[ file.txt == *.txt ]]", &result));
+  ASSERT(result.verdict == SG_VERDICT_ALLOW && !result.subcommand_count &&
+         !result.unresolved_expansion_flags);
+  ASSERT_SG_OK(sg_gate_set_reject_mask(gate, SHELL_FEAT_GLOBS));
+  ASSERT_SG_OK(eval_cmd(gate, "[[ file.txt == *.txt ]]", &result));
+  ASSERT(result.verdict == SG_VERDICT_REJECT);
+  ASSERT_STR(result.deny_reason, "glob pattern not allowed");
+  ASSERT_SG_OK(eval_cmd(gate, "printf '%s' *.txt", &result));
+  ASSERT(result.verdict == SG_VERDICT_REJECT);
+  ASSERT_STR(result.deny_reason, "glob pattern not allowed");
+  ASSERT_SG_OK(eval_cmd(gate, "[[ '*' == '*' ]]", &result));
+  ASSERT(result.verdict == SG_VERDICT_ALLOW);
+  ASSERT_SG_OK(sg_gate_set_reject_mask(gate, 0));
   static const char *const comparisons[] = {
       "[[ $left == \"x\" ]]",
       "[[ x == \"$right\" ]]",
@@ -3770,6 +3783,7 @@ TEST(conditional_string_contract) {
       "[[ name=prefix:~ == 'name=prefix:~' ]]",
       "[[ arr[0]=~ == 'arr[0]=~' ]]",
       "[[ arr['0']+=~ == 'arr[0]+=~' ]]",
+      "[[ $left == *.txt ]]",
   };
   for (unsigned i = 0; i < sizeof(comparisons) / sizeof(comparisons[0]); ++i) {
     ASSERT_SG_OK(eval_cmd(gate, comparisons[i], &result));
@@ -3881,7 +3895,7 @@ TEST(conditional_string_contract) {
   ASSERT_SG_OK(sg_gate_enable_anomaly(gate, 100.0, NULL));
   ASSERT_SG_OK(eval_cmd(gate, "[[ -z '' ]]", &result));
   ASSERT(result.verdict == SG_VERDICT_ALLOW);
-  ASSERT(eval_cmd(gate, "[[ x == y ]]", &result) == SG_ERR_PARSE);
+  ASSERT(eval_cmd(gate, "[[ x == ? ]]", &result) == SG_ERR_PARSE);
   sg_gate_free(gate);
 }
 

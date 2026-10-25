@@ -99,7 +99,7 @@ shell_anomaly_stages_parse(const char *command_line, size_t command_length,
  * Construction still checks resource limits and allocation failures. stages
  * must be empty; it remains empty on failure. Source stays alive and unchanged
  * until the stages are freed. This is not valid for a partial/error graph.
- * source_limits optionally borrows delimiter scratch for this collection;
+ * source_limits optionally borrows source scratch for this collection;
  * only its workspace fields apply, with the ordinary non-aliasing contract. */
 shell_process_status_t shell_anomaly_stages_collect_prevalidated(
     const char *command_line, size_t command_length,

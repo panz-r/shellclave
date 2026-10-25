@@ -7,8 +7,8 @@ import unittest
 
 
 class ConditionalCommands(unittest.TestCase):
-    def bash_result(self, source, syntax=False):
-        environment = dict(os.environ, BASH_ENV="", ENV="", LC_ALL="C",
+    def bash_result(self, source, syntax=False, locale="C"):
+        environment = dict(os.environ, BASH_ENV="", ENV="", LC_ALL=locale,
                            HOME="/model-home")
         for name in ("BASHOPTS", "SHELLOPTS", "POSIXLY_CORRECT", "BASH_COMPAT"):
             environment.pop(name, None)
@@ -69,9 +69,10 @@ class ConditionalCommands(unittest.TestCase):
             with self.subTest(source=source):
                 self.assertNotEqual(self.bash_result(source, syntax=True).returncode, 0)
                 self.assertEqual(self.probe_result(source, "--status"), 2)
-        for source in ('[[ x == x ]]', '[[ x == ""x ]]',
-                       '[[ x == x"" ]]', '[[ x == $value ]]',
-                       '[[ x == "${value}"* ]]', '[[ x == \\x ]]'):
+        for source in ('[[ x == $value ]]', '[[ x == "${value}"* ]]',
+                       '[[ x == ? ]]', '[[ x == [xy] ]]',
+                       '[[ x == @(x|y) ]]', '[[ x == *(x) ]]',
+                       '[[ x == ~/* ]]'):
             with self.subTest(source=source):
                 self.assertEqual(self.bash_result(source, syntax=True).returncode, 0)
                 self.assertEqual(self.probe_result(source, "--status"), 4)
@@ -84,6 +85,47 @@ class ConditionalCommands(unittest.TestCase):
         result = self.bash_result(
             '[[ <(printf x) == "$(read -r -u63 -n1 value || exit 1; printf "%s" "$value" >&2)" ]] 2>&1')
         self.assertEqual(result.stdout, b"x")
+
+    def test_star_patterns(self):
+        cases = (
+            ('x', 'x', True), ('x', 'y', False),
+            ('x', '""x', True), ('x', 'x""', True), ('x', r'\x', True),
+            ('file.txt', '*.txt', True), ('file.c', '*.txt', False),
+            ('/workspace/a/b', '/workspace/*', True),
+            ('temporary-one', '"temporary-"*', True),
+            ('abc', 'a*b*c', True), ('abbc', 'a*b*c', True),
+            ('ab', 'a*b*c', False), ('a', 'a*a', False),
+            ('aa', 'a*a', True), ('aa', '*a*a*', True),
+            ('aba', 'a*b*a', True), ("''", '*', True),
+            ("''", "**''***", True), ("'.a/b\nc'", '*', True),
+            ("'*abc'", r'\**', True), ('abc', r'\**', False),
+            ("'a*bc'", "a$'*'*", True), ('x', "$'\\0tail'*", True),
+            ("'a?b.txt'", "'a?b'*", True), ("'a[b.txt'", r'a\[*', True),
+            ('日本.txt', '日本*', True),
+            ("$'\\xc3\\xa9'", "*$'\\xa9'", True),
+            ("$'\\xc3\\xa9'", "$'\\xc3'*$'\\xa9'", True),
+            ("$'\\xff.txt'", '*.txt', True),
+            ("'abc'", "*'\\'", False),
+            ("'a\\bc'", "*'\\'*", True),
+        )
+        available = subprocess.run(['locale', '-a'], capture_output=True,
+                                   text=True, check=True, timeout=10).stdout.splitlines()
+        utf8 = next((name for name in available
+                     if 'utf8' in name.lower().replace('-', '')), None)
+        self.assertIsNotNone(utf8, 'install a UTF-8 locale for Bash conformance')
+        self.assertEqual(self.bash_result(
+            "value=$'\\xc3\\xa9'; [[ ${#value} == 1 ]]", locale=utf8).returncode, 0)
+        # Matching must agree without consulting or changing the analyzer's locale.
+        for locale in ('C', utf8):
+            for left, right, matches in cases:
+                for operator in ('=', '==', '!='):
+                    for negate in ('', '! '):
+                        source = f'[[ {negate}{left} {operator} {right} ]]'
+                        with self.subTest(locale=locale, source=source):
+                            truth = (matches != (operator == '!=')) != bool(negate)
+                            self.assertEqual(self.bash_result(source, locale=locale).returncode,
+                                             0 if truth else 1)
+                            self.assertEqual(self.probe_result(source), 2 if truth else 1)
 
     def test_tilde_comparisons(self):
         cases = (
@@ -125,6 +167,9 @@ class ConditionalCommands(unittest.TestCase):
     def test_token_prefixes(self):
         pairs = (
             ('[[ x ]', ']'),
+            ('[[ file.txt == *.txt ]', ']'),
+            ('[[ file.txt == *\\', '\n.txt ]]'),
+            ('[[ file.txt == "file"* # comment\n]', ']'),
             ('[[ x ]\\', '\n]'),
             ('[[ x ]\\\n', ']'),
             ('[[ x \\', '\n]]'),
@@ -208,7 +253,7 @@ class ConditionalCommands(unittest.TestCase):
             with self.subTest(source=source):
                 self.assertNotEqual(self.bash_result(source, syntax=True).returncode, 0)
                 self.assertEqual(self.probe_result(source, "--status"), 2)
-        for source in ("[[ -f file ]]", "[[ -\\\nf file ]]", "[[ x == y ]]", "[[ x =~ y ]]",
+        for source in ("[[ -f file ]]", "[[ -\\\nf file ]]", "[[ x == ? ]]", "[[ x =~ y ]]",
                        "[[ 1 -eq 1 ]]", "[[ (x) ]]", "[[ x && y ]]",
                        "[[ x || y ]]"):
             with self.subTest(source=source):

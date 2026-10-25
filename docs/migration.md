@@ -3,13 +3,44 @@
 These notes describe changes relevant to existing consumers. The public headers
 define the current API; rebuild consumers after updating the library.
 
-## Unreleased: exact conditional string comparisons
+## Unreleased: static conditional star patterns
 
-Conditional commands now support `=`, `==` and `!=` with a right operand made
-entirely from single-, double- or ANSI-C-quoted fragments. Concatenation and
-escaped line continuations between fragments are supported. Unquoted and
-partially quoted right operands remain unsupported, even without wildcard
-characters. Keep the executor's default `nocasematch` setting disabled.
+Conditional comparisons now admit static unquoted literals, mixed quoting and
+active `*` patterns: `[[ "$mode" == release ]]`, `[[ "$file" == *.txt ]]` and
+`[[ "$name" != "temporary-"* ]]`. Quoted and escaped stars remain literal.
+Adjacent active stars have the same meaning as one star.
+
+The shared predicate enum appends PATTERN_MATCH and PATTERN_NOT_MATCH when the
+RHS contains active stars. Literal-only RHSs retain STRING_EQUAL and
+STRING_NOT_EQUAL, including newly admitted unquoted literals. Result layouts
+and existing enum values are unchanged. Active RHS stars set the existing glob
+feature metadata and are subject to Shellgate's glob rejection mask. All these
+conditional forms retain the CT anomaly signature.
+
+Existing fully quoted dynamic RHSs still request one final conditional string.
+New mixed/unquoted RHS forms must be static: unquoted dynamic patterns, mixed
+dynamic patterns such as `"$prefix"*`, `?`, bracket expressions and extglob
+remain unsupported. A dynamic left operand uses the existing CONDITIONAL
+callback; unresolved values retain UNKNOWN truth. No pattern encoding is
+expected from callbacks, and no filesystem expansion occurs.
+
+Matching uses quote-aware literal runs and linear searches over byte strings,
+independent of the host locale. Temporary pattern, prefix-table and subject
+storage uses the existing source workspace guarantee. Each array reservation
+checks multiplication, alignment padding and available capacity, including
+when a caller supplies a smaller workspace. Overflow and exhaustion propagate
+as the existing graph EWORKSPACE result without returning a partial graph.
+Include the source-sized tail even for pattern comparisons without heredocs.
+Rejections for `SHELL_FEAT_GLOBS` now report `glob pattern not allowed`;
+EWORKSPACE uses the diagnostic `Dependency workspace unavailable`.
+
+## Unreleased: ordered conditional comparison metadata
+
+Conditional commands support `=`, `==` and `!=` with literal or static
+star-pattern right operands as described above. Fully quoted dynamic operands
+retain literal comparison semantics. Concatenation and escaped line
+continuations are supported. Keep the executor's default `nocasematch`
+setting disabled.
 
 Replace singular `conditional_operand` and `conditional_operand_length` fields
 with `conditional_operands[2]`, `conditional_operand_lengths[2]` and
@@ -19,12 +50,14 @@ unary predicates have one operand; comparisons have two. Incomplete headers
 retain received operands. Nonconditional entries leave these fields zero.
 
 The shared `shell_conditional_predicate_t` describes normalized STRING_NONEMPTY,
-STRING_EMPTY, STRING_EQUAL and STRING_NOT_EQUAL predicates; `conditional_negated`
-records lexical `!` parity. Bare words normalize to STRING_NONEMPTY, and `=`/`==`
-to STRING_EQUAL. Rebuild consumers for changed public layouts. Existing CT
-anomaly records, callback purposes and feature masks are unchanged.
+STRING_EMPTY, STRING_EQUAL, STRING_NOT_EQUAL, PATTERN_MATCH and PATTERN_NOT_MATCH
+predicates; `conditional_negated` records lexical `!` parity. Bare words
+normalize to STRING_NONEMPTY. Literal `=`/`==` comparisons use STRING_EQUAL;
+active stars select the pattern predicates. Rebuild consumers for changed public
+layouts. Existing CT anomaly records, callback purposes and feature-bit
+assignments are unchanged.
 
-Each operand uses the existing CONDITIONAL callback purpose, requiring one
+Each dynamic operand uses the existing CONDITIONAL callback purpose, requiring one
 NUL-free string record without pattern escaping. Left operand expansions finish
 before right operand value requests and descriptor imports. Unresolved values
 on either side set the existing unresolved-condition flag; substitution

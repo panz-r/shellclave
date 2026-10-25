@@ -13112,7 +13112,7 @@ TEST(name_helpers) {
                     *doc_names[] = {"FILE", "HEREDOC", "HERESTRING", "ENVVAR"},
                     *error_names[] = {
                         "OK", "Invalid input", "Truncated (limits exceeded)",
-                        "Parse error", "Resolver workspace unavailable"};
+                        "Parse error", "Dependency workspace unavailable"};
   for (size_t i = 0; i < sizeof(edge_names) / sizeof(edge_names[0]); i++)
     ASSERT_STR_EQ(shell_dep_edge_type_name((shell_dep_edge_type_t)i),
                   edge_names[i]);

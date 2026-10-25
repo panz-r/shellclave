@@ -529,6 +529,8 @@ static SHELL_NONNULL(1,
         array_context.token.type == SHELL_TOKEN_CONDITIONAL_COMMAND) {
       *features |= SHELL_FEAT_CONDITIONALS;
       shell_conditional_t condition = shell_conditional_parse(p, len, i);
+      if (shell_conditional_pattern(condition.predicate))
+        *features |= SHELL_FEAT_GLOBS;
       for (unsigned operand = 0; operand < condition.operand_count; ++operand)
         if (condition.operand_lengths[operand])
           detect_features(p, (uint32_t)condition.operands[operand],

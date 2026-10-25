@@ -4964,6 +4964,7 @@ shell_tokenize_status_t shell_tokenize_prevalidated_commands(
       current_cmd->ends_group = true;
       shell_conditional_t condition =
           shell_conditional_parse(token.start, token.length, 0);
+      current_cmd->has_globs |= shell_conditional_pattern(condition.predicate);
       for (unsigned operand = 0; operand < condition.operand_count; ++operand) {
         shell_source_substitution_scan_t scan = {0};
         size_t start, after;

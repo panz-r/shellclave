@@ -883,6 +883,7 @@ static SHELL_NONNULL(1, 2) void abstract_word_features(
   if (!redirect_operand && token->type == SHELL_TOKEN_CONDITIONAL_COMMAND) {
     shell_conditional_t condition =
         shell_conditional_parse(content, content_length, 0);
+    command->has_globs |= shell_conditional_pattern(condition.predicate);
     for (unsigned operand = 0; operand < condition.operand_count; ++operand) {
       shell_token_t word = {.type = SHELL_TOKEN_ARGUMENT,
                             .start = content + condition.operands[operand],

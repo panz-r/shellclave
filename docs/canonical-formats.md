@@ -80,7 +80,7 @@ following shell words and redirection operands keep their separate stages.
 
 Conditional commands have no argv-policy record. Their owned command metadata
 retains expression and ordered operand spans with a normalized predicate.
-Unary and exact-comparison conditions share CT. In anomaly sequences, one condition has
+Unary, literal-comparison and star-pattern conditions share CT. In anomaly sequences, one condition has
 raw record `0:,` and typed inner signature `0:,2:CT,`, framed as
 `8:0:,2:CT,,`. Executable substitutions retain separate stages in the existing
 analysis order. This marker is distinct from arithmetic's `AR` and an ordinary

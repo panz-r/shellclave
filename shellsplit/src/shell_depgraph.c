@@ -3748,16 +3748,16 @@ static SHELL_NONNULL(1, 3) shell_source_workspace_scope_t
 bool shell_dep_resolved_workspace_size(size_t command_length,
                                        const shell_dep_limits_t *limits,
                                        size_t *workspace_size) {
-  size_t cache_size, graph_size, delimiter_size;
+  size_t cache_size, graph_size, source_scratch_size;
   *workspace_size = 0;
   size_t alignment = shell_dep_workspace_alignment();
   if (!shell_expand_cache_size(command_length, &cache_size) ||
       !shell_dep_workspace_size(limits, &graph_size) ||
-      !shell_source_workspace_size(command_length, &delimiter_size) ||
+      !shell_source_workspace_size(command_length, &source_scratch_size) ||
       cache_size > SIZE_MAX - graph_size - alignment ||
-      delimiter_size > SIZE_MAX - cache_size - graph_size - alignment)
+      source_scratch_size > SIZE_MAX - cache_size - graph_size - alignment)
     return false;
-  *workspace_size = cache_size + graph_size + alignment + delimiter_size;
+  *workspace_size = cache_size + graph_size + alignment + source_scratch_size;
   return true;
 }
 
@@ -27215,7 +27215,7 @@ shell_dep_graph_validate(const shell_dep_graph_t *g) {
            (n->cmd.conditional_operand_count == 2 &&
             !n->cmd.conditional_operands[1]) ||
            n->cmd.conditional_predicate < SHELL_CONDITIONAL_STRING_NONEMPTY ||
-           n->cmd.conditional_predicate > SHELL_CONDITIONAL_STRING_NOT_EQUAL ||
+           n->cmd.conditional_predicate > SHELL_CONDITIONAL_PATTERN_NOT_MATCH ||
            n->cmd.conditional_operand_count !=
                (n->cmd.conditional_predicate >= SHELL_CONDITIONAL_STRING_EQUAL
                     ? 2
@@ -27862,7 +27862,7 @@ const char *shell_dep_error_string(shell_dep_error_t err) {
   case SHELL_DEP_EPARSE:
     return "Parse error";
   case SHELL_DEP_EWORKSPACE:
-    return "Resolver workspace unavailable";
+    return "Dependency workspace unavailable";
   case SHELL_DEP_EEXPAND:
     return "Word resolution failed";
   default:

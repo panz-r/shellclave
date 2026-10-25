@@ -150,21 +150,33 @@ Applications inspect the expression and I/O through Shellsplit directly.
 ### String conditions
 
 Conditional commands support `[[ word ]]`, `[[ -n word ]]`, `[[ -z word ]]`,
-and exact comparisons with `=`, `==` and `!=`. Repeated unquoted `!` applies
-lexical negation. A bare word tests nonemptiness. Operators are recognized from shell syntax, including escaped line continuations, before
+and literal or static star-pattern comparisons with `=`, `==` and `!=`.
+Repeated unquoted `!` applies lexical negation. A bare word tests nonemptiness.
+Operators are recognized from shell syntax, including escaped line continuations, before
 expansion: `[[ '-n' ]]` tests a literal
 string, while `[[ -n ]]` is missing its required operand and is INVALID.
-Comparisons require a right operand made entirely of single-, double- or
-ANSI-C-quoted fragments. Concatenation and escaped line continuations between
-fragments are supported: `[[ xy == 'x'"y" ]]`. Unquoted or partially quoted right
-operands remain UNSUPPORTED, including `[[ x == x ]]` and `[[ x == ""x ]]`.
-This boundary preserves Bash's distinction between literal equality and an
-unquoted pattern. The executor keeps `nocasematch` disabled; exact comparisons
-use byte lengths and contents. `[[ x == "*" ]]` is false, while
-`[[ '*' == "*" ]]` is true. Lexical unary operators take precedence over binary
-comparison parsing.
+Static right operands may combine unquoted literals, single-, double- and
+ANSI-C-quoted fragments, escapes and active `*` characters. Concatenation and
+escaped line continuations are supported: `[[ xy == 'x'"y" ]]`,
+`[[ release == release ]]` and `[[ file.txt == *.txt ]]`.
+An active star matches any byte sequence, including empty strings, slashes and
+newlines; the whole subject must match. Quoted or escaped stars are literal:
+`[[ x == "*" ]]` is false, while `[[ '*' == "*" ]]` is true.
+Mixed quoting retains each fragment's meaning: `"file-"*` matches that prefix,
+and `$'*'*` matches a literal star followed by any suffix. Adjacent active
+stars are equivalent to one. Matching uses byte strings and bounded linear
+work under the fixed executor contract, independently of the host locale.
+The executor keeps `nocasematch` disabled. Lexical unary operators take
+precedence over binary comparison parsing.
 
-Internal boolean combinations, parenthesized conditions, patterns, regex,
+Fully quoted dynamic right operands retain literal comparison semantics.
+New mixed/unquoted forms must be static, so `$pattern`, `"$prefix"*`, runtime
+tilde prefixes and executable substitutions in those forms remain UNSUPPORTED.
+Quoted or escaped `?`, brackets and parentheses remain literal bytes. Unquoted
+`?`, `[`, and extglob syntax remain outside this increment, including an
+unmatched `[` that Bash would treat literally.
+
+Internal boolean combinations, parenthesized conditions, wider patterns, regex,
 ordering/numeric comparisons and filesystem/variable-attribute predicates
 remain UNSUPPORTED.
 Lists and existing outer `&&`/`||` connectors compose supported conditions.
@@ -183,8 +195,11 @@ expansion features or dependencies. Substitution validation examines the
 operand spans, while the conditional parser owns comment and delimiter framing.
 
 Operands use Bash's conditional string expansion. Word splitting, pathname
-expansion and brace expansion are suppressed; `*` and `{,}` remain literal
-strings. Tilde expansion remains dynamic both at the start of a word and in
+expansion and brace expansion are suppressed; `{,}` remains a literal string.
+Stars are literal in unary operands and comparison left operands. Active stars
+in supported comparison right operands perform pattern matching as described
+above; quoted and escaped stars remain literal.
+Tilde expansion remains dynamic both at the start of a word and in
 assignment-shaped operands such as `name=~`, `name+=~`, `name=prefix:~` and
 `arr[0]=~`. These operands are strings; they do not assign variables. Quoting or
 escaping a tilde, or quoting part of its prefix before the terminating slash,
@@ -201,15 +216,18 @@ Conditional metadata has kind `SHELL_COMMAND_CONDITIONAL`, an expression span,
 normalized `conditional_predicate`, lexical `conditional_negated` parity, and
 no argv. Complete unary conditions have one operand; comparisons have two.
 Drafts retain the received operands, including an unfinished final word. Bare
-words normalize to STRING_NONEMPTY and `=`/`==` to STRING_EQUAL; the expression
-preserves original spelling. Graph `conditional_truth` is FALSE, TRUE or UNKNOWN
+words normalize to STRING_NONEMPTY. Comparisons with literal-only RHSs use
+STRING_EQUAL or STRING_NOT_EQUAL; active static stars use PATTERN_MATCH or
+PATTERN_NOT_MATCH. The expression preserves original spelling. Graph
+`conditional_truth` is FALSE, TRUE or UNKNOWN
 before setup/expansion failure. Static effective operand values establish
 predicate truth; dynamic values remain unknown unless supplied through the existing
 resolution callback. `SHELL_EXPAND_WORD_CONDITIONAL` requests one final NUL-free
 string record, including `0:,` for an empty value. The callback performs the
 conditional expansion and any joining of positional values; zero or multiple
-records are expansion errors. Each comparison operand is queried separately;
-return ordinary final string bytes for both sides, without pattern escaping.
+records are expansion errors. Dynamic operands in literal comparisons are
+queried separately; static star patterns query only a dynamic left operand.
+Return ordinary final string bytes, without pattern escaping.
 Callback data is never parsed as shell syntax. An unresolved value on either
 side retains UNKNOWN comparison truth.
 
@@ -249,8 +267,9 @@ continue to reject incomplete source. A received final `[[` can acquire an
 ordinary-word suffix and retains NEEDS_COMMAND until committed.
 
 `SHELL_FEAT_CONDITIONALS` includes conditional commands, so the default gate
-mask rejects them. With the feature enabled, a condition is policy-neutral;
-its own redirects and uncovered enclosing-group I/O remain undetermined.
+mask rejects them. With the feature enabled, a condition is policy-neutral.
+Active RHS stars additionally set `SHELL_FEAT_GLOBS` and honor its rejection mask.
+The condition's own redirects and uncovered enclosing-group I/O remain undetermined.
 Nested executables still require argv-policy matches. Unresolved condition
 values in either operand set `SG_EXPANSION_UNRESOLVED_CONDITION`, independently of unresolved
 argv/paths and substitution-inspection requirements. Anomaly sequences retain
@@ -614,9 +633,10 @@ Subscript matching records nested matches and unfinished outcomes in private,
 non-evicting source workspace. Later candidates reuse those boundaries instead
 of rescanning overlapping suffixes. Source-byte scan work is linear, with
 ordered boundary lookups; ordinary declaration words never scan into following
-operands. `shell_source_workspace_size()` includes these records as well as
-delimiter normalization. Public iterators keep their supplied workspace
-exclusive until iteration ends; independent iterators require distinct buffers.
+operands. `shell_source_workspace_size()` includes these records and the other
+source-analysis scratch described below. Public iterators keep their supplied
+workspace exclusive until iteration ends; independent iterators require
+distinct buffers.
 
 Bash can terminate a pending heredoc implicitly at a closed substitution's
 EOF, with warnings. For example, `echo $(: <<EOF)` is valid Bash. The source
@@ -867,11 +887,14 @@ and race-free access require application filesystem checks.
 ## Workspace, lifetimes, and errors
 
 Bounded parsing and graph construction use caller-provided or documented small
-private scratch. `shell_source_workspace_size()` supplies a checked delimiter
-normalization bound. Graph construction adds that scratch to the fixed aligned
-`shell_dep_workspace_size()` prefix. Use `shell_dep_resolved_workspace_size()`
-when resolving words. Allocating higher-level APIs reserve their own temporary
-workspace and retain their failure-atomic output contracts.
+private scratch. `shell_source_workspace_size()` supplies a checked capacity
+bound for source analysis: delimiter normalization, persistent subscript
+boundaries and conditional-pattern evaluation. Graph construction adds that
+scratch to the fixed aligned `shell_dep_workspace_size()` prefix. Pattern
+comparisons can require this tail even without heredocs. Use
+`shell_dep_resolved_workspace_size()` when resolving words. Allocating
+higher-level APIs reserve their own temporary workspace and retain their
+failure-atomic output contracts.
 
 Source spans borrow immutable input. Supplied-fast graph construction requires
 the original source and unchanged parse result; their correspondence is a caller

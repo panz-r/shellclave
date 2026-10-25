@@ -1714,7 +1714,7 @@ static const char *check_features(const shell_parse_result_t *fast,
       {SHELL_FEAT_CONDITIONALS, "conditional"},
       {SHELL_FEAT_CASE, "case statement"},
       {SHELL_FEAT_VARS, "variable expansion"},
-      {SHELL_FEAT_GLOBS, "glob expansion"},
+      {SHELL_FEAT_GLOBS, "glob pattern"},
       {SHELL_FEAT_SUBSHELL_FILE, "file command substitution"},
       {SHELL_FEAT_PIPELINE, "pipeline"},
       {SHELL_FEAT_GROUP, "command group"},
@@ -2510,11 +2510,11 @@ static SHELL_NONNULL(2) bool sg_eval_workspace_size(size_t command_length,
                                                     size_t *required) {
   if (!shell_dep_workspace_size(NULL, required))
     return false;
-  size_t delimiter_size;
-  if (!shell_source_workspace_size(command_length, &delimiter_size) ||
-      delimiter_size > SIZE_MAX - *required)
+  size_t source_scratch_size;
+  if (!shell_source_workspace_size(command_length, &source_scratch_size) ||
+      source_scratch_size > SIZE_MAX - *required)
     return false;
-  *required += delimiter_size; /* Delimiter preparation in the graph tail. */
+  *required += source_scratch_size; /* Source analysis in the graph tail. */
   size_t overhead = sizeof(sg_graph_index_t);
   size_t cwd_space = SHELL_DEP_CWD_BUF_SIZE + 1u;
   if (command_length > (SIZE_MAX - overhead) / 4 - cwd_space)
@@ -4309,11 +4309,11 @@ sg_error_t sg_gate_evaluate(sg_gate_t *gate, const char *cmd, size_t cmd_len,
      * The stage order is not the dependency graph's node order. */
     shell_anomaly_stages_t stages = {0};
     /* Graph/path preparation is finished. Its temporary tail now supplies
-     * delimiter scratch; the graph index and expansion cache stay live. */
+     * source scratch; the graph index and expansion cache stay live. */
     shell_limits_t stage_limits = SHELL_LIMITS_DEFAULT;
     stage_limits.workspace = (char *)dep_workspace + sizeof(*graph_index);
     stage_limits.workspace_size = dep_workspace_size - sizeof(*graph_index);
-    /* Keep lexical facts and delimiter scratch alive through both collection
+    /* Keep lexical facts and source scratch alive through both collection
      * and rendering; nested words are still inspected by the renderers. */
     shell_source_operation_begin(cmd, cmd_len);
     shell_source_workspace_scope_t previous_source =

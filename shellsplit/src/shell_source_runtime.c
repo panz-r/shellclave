@@ -217,6 +217,21 @@ void *shell_source_scratch_take(size_t size) {
   return result;
 }
 
+void *shell_source_scratch_take_array(size_t count, size_t element_size,
+                                      size_t alignment) {
+  size_t padding = alignment - 1;
+  if (count > SIZE_MAX / element_size ||
+      count * element_size > SIZE_MAX - padding) {
+    source_operation.scratch_exhausted = true;
+    return NULL;
+  }
+  unsigned char *storage =
+      shell_source_scratch_take(count * element_size + padding);
+  if (!storage)
+    return NULL;
+  return storage + (-(uintptr_t)storage & (uintptr_t)padding);
+}
+
 void shell_source_scratch_release(size_t mark) {
   source_operation.scratch_used = mark;
 }

@@ -69,9 +69,10 @@ typedef enum {
    * does not establish a Bash syntax error. shell_parse_draft() supplies the
    * source-level classification; COMPLETE still permits semantic rejection. */
   SHELL_DEP_EPARSE = -3,
-  /* Caller-owned dependency-analysis workspace was absent, misaligned, or
-   * too small. It is required for compound-group descriptor snapshots and
-   * descriptor-route resolution. */
+  /* Dependency-analysis workspace was absent, misaligned, or too small, or a
+   * source-scratch reservation overflowed. Workspace supports compound-group
+   * descriptor snapshots, descriptor-route resolution and source analysis,
+   * including conditional-pattern evaluation. */
   SHELL_DEP_EWORKSPACE = -4,
   /* The expansion callback failed or returned malformed canonical bytes. */
   SHELL_DEP_EEXPAND = -5,
@@ -220,12 +221,15 @@ typedef enum {
  * Values from 2 through the buffer maximum are valid. A value of 1 is
  * rejected because even the NUL-terminated root path cannot fit; 0 selects
  * the default. `workspace` is caller-owned scratch storage used only while
- * parsing and resolving descriptor routes; it is never retained by the graph
- * and need not be initialized or cleared by the caller between parses.
+ * parsing, evaluating static predicates and resolving descriptor routes; it
+ * is never retained by the graph and need not be initialized or cleared by
+ * the caller between parses.
  * Bytes beyond shell_dep_workspace_size()'s fixed prefix serve as source
- * scratch for delimiter preparation and non-evicting subscript boundaries.
+ * scratch for delimiter normalization, non-evicting subscript boundaries and
+ * conditional-pattern evaluation.
  * shell_source_workspace_size(command_length, &bytes) gives a sufficient
- * extra capacity; larger inputs can require EWORKSPACE and a retry.
+ * extra capacity. Without this tail, source analysis can return EWORKSPACE
+ * even for inputs without heredocs; retry with sufficient source scratch.
  * The fixed prefix includes the operation's lexical index, independent of
  * parsing performed by application expansion callbacks, and temporary state
  * for reconstructing inherited descriptor routes at compound-group expansion
@@ -268,8 +272,8 @@ size_t shell_dep_workspace_alignment(void);
 
 /**
  * Return the fixed temporary workspace for lexical indexing, graph state and
- * descriptor-route resolution. Additional source-sized lexical scratch can
- * share its tail, as described by shell_dep_limits_t. `limits` may be NULL; the
+ * descriptor-route resolution. Additional source-analysis scratch can share
+ * its tail, as described by shell_dep_limits_t. `limits` may be NULL; the
  * current fixed-capacity implementation returns the same maximum size for every
  * valid limits configuration. The size is independent of command text, so
  * callers can reuse one buffer across evaluations. `workspace_size` is required
@@ -327,7 +331,8 @@ typedef struct {
   shell_command_kind_t kind;
   /* Borrowed CONDITIONAL spans in source/expansion order; never argv or
    * pathname operands. Predicate truth includes lexical negation. EQUAL and
-   * NOT_EQUAL require a fully quoted RHS and nocasematch disabled. */
+   * NOT_EQUAL compare literal strings; PATTERN_MATCH and PATTERN_NOT_MATCH use
+   * static RHS patterns with active stars. nocasematch must be disabled. */
   const char *conditional_expression;
   uint32_t conditional_expression_length;
   const char *conditional_operands[2];
@@ -1158,7 +1163,8 @@ shell_dep_error_t shell_dep_graph_parse_with_fast(
  * Uses shell_dep_workspace_alignment(). NULL limits selects defaults. Returns
  * false and clears size on arithmetic overflow; no source bytes are inspected.
  * The extra reservation includes bounded metadata, a source-offset index and
- * shell_source_workspace_size() bytes for delimiter preparation in that buffer.
+ * shell_source_workspace_size() bytes for source-analysis scratch, including
+ * conditional-pattern evaluation.
  * Source and expansion payloads otherwise remain borrowed. */
 bool shell_dep_resolved_workspace_size(size_t command_length,
                                        const shell_dep_limits_t *limits,

@@ -5621,6 +5621,21 @@ static inline SHELL_NONNULL(1) bool shell_source_argument_has_dynamic_syntax(
       input, length, SHELL_SOURCE_WORD_ARGUMENT);
 }
 
+typedef bool (*shell_source_quoted_byte_visitor_t)(unsigned char byte,
+                                                   bool quoted, void *context);
+
+typedef struct {
+  shell_source_quoted_byte_visitor_t visitor;
+  void *context;
+} shell_source_quoted_visitor_t;
+
+static inline SHELL_NONNULL(2) bool shell_source_visit_ansi_quoted_byte(
+    unsigned char byte, void *context) {
+  shell_source_quoted_visitor_t *visit =
+      (shell_source_quoted_visitor_t *)context;
+  return visit->visitor(byte, true, visit->context);
+}
+
 /* Visit a complete word's literal projection without allocating: remove quotes,
  * decode effective ANSI-C values, and erase empty process fragments. Dynamic
  * spelling is not evaluated; callers requiring a static value use the wrapper
@@ -5628,10 +5643,13 @@ static inline SHELL_NONNULL(1) bool shell_source_argument_has_dynamic_syntax(
  * static command/wrapper recognition aligned without confusing spelling with a
  * value. word is a required readable span (including length zero); visitor is
  * required. context is passed through and may be NULL if the visitor allows
- * it. The visitor must not modify the word. */
-static inline SHELL_NONNULL(1, 3) bool shell_source_visit_decoded_word(
-    const char *word, size_t word_length, shell_source_byte_visitor_t visitor,
-    void *context) {
+ * it. The visitor must not modify the word. quoted reports protection by a
+ * quote or escape, including every effective ANSI-C byte. Removed syntax and
+ * empty fragments emit no bytes. This projection does not evaluate expansions.
+ */
+static inline SHELL_NONNULL(1, 3) bool shell_source_visit_quoted_word(
+    const char *word, size_t word_length,
+    shell_source_quoted_byte_visitor_t visitor, void *context) {
   if (word_length == 0)
     return false;
 
@@ -5648,8 +5666,10 @@ static inline SHELL_NONNULL(1, 3) bool shell_source_visit_decoded_word(
     if (quote == '\0' && c == '$' &&
         shell_source_logical_next_is(word, word_length, position, '\'', NULL)) {
       size_t after = position;
-      if (!shell_source_decode_ansi_c_word(word, word_length, &after, visitor,
-                                           context))
+      shell_source_quoted_visitor_t visit = {visitor, context};
+      if (!shell_source_decode_ansi_c_word(word, word_length, &after,
+                                           shell_source_visit_ansi_quoted_byte,
+                                           &visit))
         return false;
       position = after - 1;
       continue;
@@ -5666,16 +5686,38 @@ static inline SHELL_NONNULL(1, 3) bool shell_source_visit_decoded_word(
       char next = word[position + 1];
       if (quote == '\0' || next == '$' || next == '`' || next == '"' ||
           next == '\\' || next == '\n') {
-        if (next != '\n' && !visitor((unsigned char)next, context))
+        if (next != '\n' && !visitor((unsigned char)next, true, context))
           return false;
         position++;
         continue;
       }
     }
-    if (!visitor((unsigned char)c, context))
+    if (!visitor((unsigned char)c, quote != 0, context))
       return false;
   }
   return quote == '\0';
+}
+
+typedef struct {
+  shell_source_byte_visitor_t visitor;
+  void *context;
+} shell_source_unquoted_visitor_t;
+
+static inline SHELL_NONNULL(3) bool shell_source_visit_without_quote(
+    unsigned char byte, bool quoted, void *context) {
+  (void)quoted;
+  shell_source_unquoted_visitor_t *visit =
+      (shell_source_unquoted_visitor_t *)context;
+  return visit->visitor(byte, visit->context);
+}
+
+/* Same projection and span contract, discarding quote provenance. */
+static inline SHELL_NONNULL(1, 3) bool shell_source_visit_decoded_word(
+    const char *word, size_t word_length, shell_source_byte_visitor_t visitor,
+    void *context) {
+  shell_source_unquoted_visitor_t visit = {visitor, context};
+  return shell_source_visit_quoted_word(
+      word, word_length, shell_source_visit_without_quote, &visit);
 }
 
 /* A decoded spelling is not a runtime value. Static consumers first exclude

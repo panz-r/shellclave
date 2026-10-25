@@ -30,6 +30,12 @@ typedef struct {
   bool negated;
 } shell_conditional_t;
 
+static inline bool
+shell_conditional_pattern(shell_conditional_predicate_t predicate) {
+  return predicate == SHELL_CONDITIONAL_PATTERN_MATCH ||
+         predicate == SHELL_CONDITIONAL_PATTERN_NOT_MATCH;
+}
+
 shell_conditional_t shell_conditional_parse(const char *source, size_t length,
                                             size_t start) SHELL_NONNULL(1);
 
@@ -53,7 +59,9 @@ typedef struct {
 
 /* Return whether truth is known. Scratch exhaustion remains observable through
  * the enclosing source operation. Uses operation scratch for one static value,
- * releasing it before return; never executes expansion or allocates a heap. */
+ * releasing it before return. Static star patterns use projected units and a
+ * KMP prefix table with linear matching work. Never executes expansion or
+ * allocates a heap. */
 bool shell_conditional_evaluate(const char *source,
                                 const shell_conditional_t *condition,
                                 const shell_conditional_value_t values[2],

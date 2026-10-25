@@ -168,10 +168,13 @@ failure continuations carry their own state facts. Check `cwd_known` before
 reading offsets and use a FILE document's own CWD for pathname interpretation.
 See [CWD and paths](../docs/shell-model.md#cwd-and-lexical-path-facts).
 
-String conditions (`[[ word ]]`, `[[ -n word ]]`, `[[ -z word ]]`, exact
-`[[ left == "right" ]]`/`=`/`!=` comparisons and their negations) have kind `SHELL_COMMAND_CONDITIONAL`, no argv, and retained
+String conditions (`[[ word ]]`, `[[ -n word ]]`, `[[ -z word ]]`, literal and
+static `*` comparisons with `=`/`==`/`!=`, and their negations) have kind
+`SHELL_COMMAND_CONDITIONAL`, no argv, and retained
 expression and ordered operand spans with normalized predicate metadata.
-Comparisons require a fully quoted right operand. The graph exposes TRUE/FALSE/UNKNOWN predicate truth
+Static RHSs preserve literal quoting and active stars; dynamic RHSs require
+full quoting. Active stars use PATTERN_MATCH/PATTERN_NOT_MATCH predicates and
+set glob feature metadata. The graph exposes TRUE/FALSE/UNKNOWN predicate truth
 and explicit redirect setup through `has_redirections`. Use the conditional
 expansion callback purpose to supply a final string value. Redirects are
 installed before nested operand substitutions; the condition body has no
@@ -181,17 +184,18 @@ stdin/stdout byte use. See [conditional semantics](../docs/shell-model.md#string
 
 Graph construction uses one temporary workspace. Allocating processor/tokenizer,
 abstraction, transformation, and sequence APIs manage their own source scratch.
-Allocation-free source APIs accept caller scratch for larger delimiters and
-non-evicting indexed-subscript boundary records. Obtain the sufficient capacity
-from `shell_source_workspace_size()` rather than estimating bytes. A public
-tokenizer retains facts between calls in its supplied buffer; independent live
-iterators require distinct buffers.
+Allocation-free APIs accept caller scratch for delimiter normalization,
+non-evicting indexed-subscript boundary records and conditional-pattern
+evaluation. Obtain the sufficient capacity from `shell_source_workspace_size()`
+rather than estimating bytes. A public tokenizer retains facts between calls
+in its supplied buffer; independent live iterators require distinct buffers.
 
-Dependency-graph parsing remains allocation-free, but route resolution uses
-caller-owned scratch storage. Measure its fixed prefix once, add the queried
-source-dependent delimiter capacity, and align one reusable allocation. Keep
-the command bytes, graph output, and workspace disjoint. Within an application
-function with an existing `command` span and `command_length`:
+Dependency-graph parsing uses caller-owned scratch for source analysis,
+static predicate evaluation and descriptor-route resolution. Measure its fixed
+prefix once, add the queried source-scratch capacity, and align one reusable
+allocation. Pattern comparisons can require this tail even without heredocs.
+Keep the command bytes, graph output, and workspace disjoint. Within an
+application function with an existing `command` span and `command_length`:
 
 ```c
 #include "shell_depgraph.h"
@@ -201,11 +205,11 @@ function with an existing `command` span and `command_length`:
 size_t workspace_size = 0;
 size_t alignment = shell_dep_workspace_alignment();
 shell_dep_workspace_size(NULL, &workspace_size);
-size_t delimiter_size;
-if (!shell_source_workspace_size(command_length, &delimiter_size) ||
-    delimiter_size > SIZE_MAX - workspace_size)
+size_t source_scratch_size;
+if (!shell_source_workspace_size(command_length, &source_scratch_size) ||
+    source_scratch_size > SIZE_MAX - workspace_size)
   return 1;
-workspace_size += delimiter_size;
+workspace_size += source_scratch_size;
 size_t padding = (alignment - workspace_size % alignment) % alignment;
 if (padding > SIZE_MAX - workspace_size)
   return 1;
@@ -226,11 +230,11 @@ if (error != SHELL_DEP_OK)
 ```
 
 `aligned_alloc()` requires an allocation size that is a multiple of the
-alignment; the example rounds up after adding delimiter scratch. Applications
+alignment; the example rounds up after adding source scratch. Applications
 with a different allocator can over-allocate and align manually. An absent,
 misaligned, or undersized workspace returns `SHELL_DEP_EWORKSPACE`. Use
-`shell_source_workspace_size()` instead of a flat-delimiter byte estimate:
-grouped delimiter fragments also need workspace-backed normalization pieces.
+`shell_source_workspace_size()` to cover delimiter normalization, persistent
+subscript facts and temporary conditional-pattern storage in the same tail.
 Command bytes, configuration, workspace, and graph output must obey the
 non-overlap requirements documented by the API.
 

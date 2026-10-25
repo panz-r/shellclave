@@ -125,8 +125,8 @@ basis is the pinned `bash -p -c ...`, with these preparations:
    Bash ignores `BASH_ENV`, `BASHOPTS`, and `SHELLOPTS` and declines imported
    environment functions.
 
-Keep `nocasematch` disabled so quoted-right-operand string comparisons retain
-exact byte equality. Extglob requires enabling `extglob` at executor startup,
+Keep `nocasematch` disabled so literal and star-pattern comparisons retain
+case-sensitive byte matching. Extglob requires enabling `extglob` at executor startup,
 before parsing source.
 An equivalent launcher must establish these same properties. The application
 owns executor selection; version checks run at the test/configuration boundary.

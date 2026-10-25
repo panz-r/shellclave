@@ -23,9 +23,12 @@ extern "C" {
  * CONDITIONAL requests instead require one final NUL-free string record,
  * including 0:, for empty; suppress splitting, pathname and brace expansion.
  * Join positional expansion results according to Bash conditional semantics.
- * Exact comparisons query each dynamic operand separately in source order;
+ * Literal comparisons query each dynamic operand separately in source order;
  * return ordinary final string bytes for both sides, without pattern escaping.
  * Left operand synchronous effects precede the right operand query.
+ * Static star-pattern comparisons query only a dynamic left operand. New
+ * mixed/unquoted RHS forms must be static; their quote protection and active
+ * stars come from source, rather than from callback string bytes.
  *
  * For argument and pathname purposes the application performs quote-sensitive
  * composition, splitting and globbing

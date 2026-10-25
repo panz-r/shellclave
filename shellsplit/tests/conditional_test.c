@@ -361,6 +361,77 @@ static void check_tilde_comparisons(void) {
         }
 }
 
+static void check_patterns(void) {
+  static const struct {
+    const char *source;
+    shell_conditional_predicate_t predicate;
+  } forms[] = {
+      {"[[ x == x ]]", SHELL_CONDITIONAL_STRING_EQUAL},
+      {"[[ '*' == \\* ]]", SHELL_CONDITIONAL_STRING_EQUAL},
+      {"[[ x == '*' ]]", SHELL_CONDITIONAL_STRING_EQUAL},
+      {"[[ x == * ]]", SHELL_CONDITIONAL_PATTERN_MATCH},
+      {"[[ x != x* ]]", SHELL_CONDITIONAL_PATTERN_NOT_MATCH},
+      {"[[ x == \"\"* ]]", SHELL_CONDITIONAL_PATTERN_MATCH},
+  };
+  for (size_t i = 0; i < sizeof(forms) / sizeof(forms[0]); ++i) {
+    parse(forms[i].source);
+    CHECK(graph->nodes[condition_node()].cmd.conditional_predicate ==
+          forms[i].predicate);
+    CHECK(shell_parse_draft(current, strlen(current), NULL, draft) ==
+          SHELL_SOURCE_COMPLETE);
+    CHECK(draft->headers[0].conditional_predicate == forms[i].predicate);
+    shell_processed_commands_t processed = {0};
+    CHECK(shell_process_commands(current, strlen(current), NULL, &processed) ==
+          SHELL_PROCESS_OK);
+    CHECK(processed.commands[0].conditional_predicate == forms[i].predicate);
+    shell_processed_commands_free(&processed);
+  }
+  static const char *const operators[] = {"=", "==", "!="};
+  for (unsigned op = 0; op < 3; ++op)
+    for (unsigned negate = 0; negate < 2; ++negate)
+      for (unsigned matches = 0; matches < 2; ++matches)
+        for (unsigned failure = 0; failure < 2; ++failure)
+          for (unsigned unresolved = 0; unresolved < 2; ++unresolved) {
+            char source[128];
+            snprintf(source, sizeof(source),
+                     "[[ %s$value %s \"file\"* ]] %s cat reached",
+                     negate ? "! " : "", operators[op], failure ? "||" : "&&");
+            current = source;
+            comparison_resolver_t resolver = {
+                .values = {matches ? "8:file.txt," : "6:xfile*,"},
+                .unresolved = {unresolved}};
+            CHECK(shell_dep_graph_parse_resolved(
+                      source, strlen(source), "/workspace", &limits, graph,
+                      resolve_comparison, &resolver, NULL) == SHELL_DEP_OK);
+            CHECK(resolver.calls == 1);
+            bool truth = (matches != (op == 2)) != (negate != 0);
+            CHECK(graph->nodes[condition_node()].cmd.conditional_truth ==
+                  (unresolved ? SHELL_CONDITIONAL_UNKNOWN
+                   : truth    ? SHELL_CONDITIONAL_TRUE
+                              : SHELL_CONDITIONAL_FALSE));
+            bool reads = false;
+            for (unsigned e = 0; e < graph->edge_count; ++e)
+              reads |= graph->edges[e].type == SHELL_EDGE_READ;
+            CHECK(reads == (unresolved || truth != (failure != 0)));
+          }
+
+  size_t fixed, previous_size = limits.workspace_size;
+  CHECK(shell_dep_workspace_size(NULL, &fixed));
+  limits.workspace_size = fixed;
+  char large_pattern[128] = "[[ x == *";
+  size_t offset = strlen(large_pattern);
+  memset(large_pattern + offset, 'x', 64);
+  strcpy(large_pattern + offset + 64, "* ]]");
+  current = large_pattern;
+  CHECK(shell_dep_graph_parse(current, strlen(current), "/workspace", &limits,
+                              graph) == SHELL_DEP_EWORKSPACE);
+  CHECK(!graph->node_count && !graph->edge_count);
+  limits.workspace_size = previous_size;
+  parse(large_pattern);
+  CHECK(graph->nodes[condition_node()].cmd.conditional_truth ==
+        SHELL_CONDITIONAL_FALSE);
+}
+
 static void check_token_prefixes(void) {
   for (size_t i = 0; i < sizeof(conditional_prefix_cases) /
                              sizeof(conditional_prefix_cases[0]);
@@ -479,6 +550,7 @@ int main(int argc, char **argv) {
   check_body_setup();
   check_comparisons();
   check_tilde_comparisons();
+  check_patterns();
   check_token_prefixes();
   for (size_t i = 0;
        i < sizeof(conditional_cases) / sizeof(conditional_cases[0]); ++i) {
@@ -502,6 +574,11 @@ int main(int argc, char **argv) {
     }
     parse(current);
     unsigned owner = condition_node();
+    bool pattern = graph->nodes[owner].cmd.conditional_predicate ==
+                       SHELL_CONDITIONAL_PATTERN_MATCH ||
+                   graph->nodes[owner].cmd.conditional_predicate ==
+                       SHELL_CONDITIONAL_PATTERN_NOT_MATCH;
+    CHECK(((fast.cmds[0].features & SHELL_FEAT_GLOBS) != 0) == pattern);
     CHECK(graph->nodes[owner].cmd.conditional_truth ==
           (shell_conditional_truth_t)conditional_cases[i].truth);
     CHECK(!graph->nodes[owner].cmd.token_count);
@@ -510,7 +587,7 @@ int main(int argc, char **argv) {
     CHECK(shell_tokenize_commands(current, strlen(current), &commands,
                                   &command_count) == SHELL_TOKENIZE_OK);
     CHECK(command_count == 1 && commands[0].has_conditionals &&
-          !commands[0].has_globs);
+          commands[0].has_globs == pattern);
     if (strstr(current, "$value"))
       CHECK(commands[0].has_variables);
     if (strstr(current, "$(printf"))
@@ -540,7 +617,7 @@ int main(int argc, char **argv) {
           SHELL_ABSTRACT_OK);
     CHECK(abstract->element_count == 1 &&
           abstract->elements[0]->type == SHELL_ABSTRACT_CT);
-    CHECK(!abstract->has_globs);
+    CHECK(abstract->has_globs == pattern);
     shell_abstract_command_free(abstract);
     shell_netstring_buffer_t raw = {0}, typed = {0};
     size_t stages;
@@ -695,6 +772,37 @@ int main(int argc, char **argv) {
   CHECK(!graph->node_count && !graph->edge_count);
 #ifdef SHELLSPLIT_TEST_SOURCE_SCANS
   size_t previous_work = 0;
+  /* A long near-match inside stars must not retry the literal run at every
+   * subject position. Both input and pattern grow, exposing quadratic search.
+   */
+  for (size_t length = 16; length <= 1024; length *= 2) {
+    char source[4096];
+    char *p = source;
+    memcpy(p, "[[ '", 4);
+    p += 4;
+    memset(p, 'a', length);
+    p += length;
+    memcpy(p, "' == *", 6);
+    p += 6;
+    memset(p, 'a', length / 2);
+    p += length / 2;
+    memcpy(p, "b* ]]", 6);
+    current = source;
+    size_t fixed, tail;
+    CHECK(shell_dep_workspace_size(NULL, &fixed));
+    CHECK(shell_source_workspace_size(strlen(source), &tail));
+    size_t previous_size = limits.workspace_size;
+    limits.workspace_size = fixed + tail;
+    shellsplit_test_source_scan_reset();
+    parse(source);
+    limits.workspace_size = previous_size;
+    CHECK(graph->nodes[condition_node()].cmd.conditional_truth ==
+          SHELL_CONDITIONAL_FALSE);
+    size_t work = shellsplit_test_source_scan_work();
+    CHECK(!previous_work || work <= previous_work * 3);
+    previous_work = work;
+  }
+  previous_work = 0;
   for (size_t terms = 16; terms <= 1024; terms *= 2) {
     char source[4096] = "[[ ";
     for (size_t i = 0; i < terms; ++i)
